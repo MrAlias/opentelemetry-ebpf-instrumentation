@@ -1,0 +1,344 @@
+# Unified workload-rules alternative.
+# Global OBI behavior is defined under `defaults`.
+# Workload-specific matching and refinement is defined under `workloads.rules`.
+
+file_format: "1.0-rc.1"
+
+resource: {}
+propagator: {}
+
+tracer_provider:
+  processors:
+    - batch:
+        max_queue_size: 4096
+        schedule_delay: 15000
+        exporter:
+          otlp_grpc:
+            endpoint: ""
+            tls:
+              insecure: false
+
+meter_provider:
+  readers:
+    - periodic:
+        interval: 60000
+        exporter:
+          otlp_grpc:
+            endpoint: ""
+            default_histogram_aggregation: explicit_bucket_histogram
+            tls:
+              insecure: false
+    - pull:
+        exporter:
+          prometheus/development:
+            port: 0
+
+extensions:
+  obi:
+    version: "2.0"
+    defaults:
+      instrumentation:
+        http:
+          enabled: { traces: true, metrics: true }
+          filters:
+            traces: {}
+            metrics: {}
+          track_request_headers: false
+          request_timeout: 0s
+          buffer_size: 0
+          routes:
+            unmatched: heuristic
+            patterns: []
+            ignored_patterns: []
+            ignore_mode: all
+            wildcard_char: "*"
+            max_path_segment_cardinality: 10
+            discovery:
+              timeout: 10s
+              disabled_languages: []
+              java:
+                delay: 1m0s
+          payload_extraction:
+            graphql: { enabled: false }
+            elasticsearch: { enabled: false }
+            aws: { enabled: false }
+            sqlpp:
+              enabled: false
+              endpoint_patterns: [/query/service]
+        grpc:
+          enabled: { traces: true, metrics: true }
+          filters: { traces: {}, metrics: {} }
+        sql:
+          enabled: { traces: true, metrics: true }
+          filters: { traces: {}, metrics: {} }
+          heuristic_detect: false
+          mysql:
+            buffer_size: 0
+            prepared_statements_cache_size: 1024
+          postgres:
+            buffer_size: 0
+            prepared_statements_cache_size: 1024
+        redis:
+          enabled: { traces: true, metrics: true }
+          filters: { traces: {}, metrics: {} }
+          db_cache:
+            enabled: false
+            max_size: 1000
+        kafka:
+          enabled: { traces: true, metrics: true }
+          filters: { traces: {}, metrics: {} }
+          buffer_size: 0
+          topic_uuid_cache_size: 1024
+        mongo:
+          enabled: { traces: true, metrics: true }
+          filters: { traces: {}, metrics: {} }
+          requests_cache_size: 1024
+        couchbase:
+          enabled: { traces: true, metrics: true }
+          filters: { traces: {}, metrics: {} }
+          db_cache_size: 1024
+        dns:
+          enabled: { traces: false, metrics: false }
+          filters: { traces: {}, metrics: {} }
+          request_timeout: 5s
+        gpu:
+          enabled: { traces: true, metrics: true }
+          filters: { traces: {}, metrics: {} }
+          enabled_mode: auto
+      runtimes:
+        go:
+          enabled: true
+          filter: {}
+        nodejs:
+          enabled: true
+          filter: {}
+        java:
+          enabled: true
+          filter: {}
+          debug:
+            enabled: false
+            bytecode_instrumentation: false
+          attach_timeout: 10s
+      network:
+        capture:
+          enabled: false
+          source: socket_filter
+          endpoint_identity:
+            agent_ip: ""
+            agent_ip_interface: external
+            agent_ip_family: any
+          selection:
+            interfaces:
+              include: []
+              exclude: [lo]
+            protocols:
+              include: []
+              exclude: []
+            cidrs: []
+            direction: both
+          filters:
+            traces: {}
+            metrics: {}
+          flow_lifecycle:
+            max_tracked_flows: 5000
+            active_timeout: 5s
+            deduplication:
+              strategy: first_come
+              first_come_ttl: 0s
+            sampling: 0
+          interface_discovery:
+            mode: watch
+            poll_interval: 10s
+          enrichment:
+            geo_ip:
+              ipinfo: { path: "" }
+              maxmind:
+                country_path: ""
+                asn_path: ""
+              cache:
+                size: 512
+                ttl: 1h0m0s
+            reverse_dns:
+              mode: none
+              cache:
+                size: 256
+                ttl: 1h0m0s
+          diagnostics:
+            print_flows: false
+      enrich:
+        enrichers:
+          kubernetes:
+            mode: autodetect
+            cluster_name: ""
+            auth:
+              kubeconfig_path: ""
+            informers:
+              initial_sync_timeout: 30s
+              resync_period: 30m0s
+              disabled: []
+            drop_external: false
+            metadata_cache:
+              address: ""
+              restrict_local_node: false
+              source_labels:
+                service_name: ""
+                service_namespace: ""
+          dns:
+            enabled: true
+        service_name:
+          cache:
+            size: 1024
+            ttl: 5m0s
+          rules:
+            - id: k8s-default
+              from: kubernetes
+              description: Default Kubernetes label mapping into canonical service identity.
+              map:
+                service.name: [app.kubernetes.io/name]
+                service.namespace: [app.kubernetes.io/part-of]
+                service.version: [app.kubernetes.io/version]
+          unresolved_hosts:
+            names:
+              default: unresolved
+              outgoing: outgoing
+              incoming: incoming
+        attributes:
+          rules:
+            - id: k8s-default-attributes
+              from: kubernetes
+              description: Default Kubernetes-derived attribute enrichment and selection.
+              add:
+                map:
+                  k8s.namespace.name: [kubernetes.namespace]
+                  k8s.pod.name: [kubernetes.pod.name]
+                  k8s.deployment.name: [kubernetes.workload.deployment]
+                  k8s.node.name: [kubernetes.node.name]
+            - id: dns-default-attributes
+              from: dns
+              description: Default DNS-based host and instance identity enrichment.
+              add:
+                map:
+                  host.name: [dns.host_name, dns.ptr_name]
+                  service.instance.id: [dns.host_name]
+                  server.address: [dns.resolved_ip]
+      correlation:
+        log_trace_annotation:
+          enabled: false
+          filter: {}
+          cache:
+            ttl: 30m0s
+            size: 128
+          async_writer:
+            workers: 8
+            channel_len: 500
+      operations:
+        limits:
+          network_packets: 5000
+          metric_span_names: 100
+        telemetry:
+          traces:
+            reporters_cache_len: 256
+          metrics:
+            ttl: 5m0s
+            reporters_cache_len: 256
+            prometheus:
+              allow_service_graph_self_references: false
+              span_metrics_service_cache_size: 10000
+              extra_resource_attributes: []
+              extra_span_resource_attributes: []
+        capture:
+          debug:
+            bpf: false
+            protocol_print: false
+          pid_filter:
+            disabled: false
+          batching:
+            wakeup_len: 500
+            batch_length: 100
+            batch_timeout: 1s
+          propagation:
+            context_propagation: disabled
+            override_bpfloop_enabled: false
+            disable_black_box_cp: false
+          traffic:
+            control_backend: auto
+            high_request_volume: false
+          transactions:
+            max_duration: 5m0s
+          bpf_filesystem:
+            path: /sys/fs/bpf/
+        logging:
+          level: INFO
+          format: ""
+          debug_trace_output: disabled
+        profiling:
+          port: 0
+        shutdown:
+          timeout: 10s
+        safety:
+          enforce_system_capabilities: false
+        runtime:
+          channels:
+            buffer_len: 50
+            send_timeout: 1m0s
+            panic_on_send_timeout: false
+        internal_metrics:
+          exporter: disabled
+          prometheus:
+            port: 0
+            path: /internal/metrics
+          bpf:
+            scrape_interval: 15s
+    workloads:
+      evaluation:
+        default_action: include
+        match_order: first_match_wins
+        poll_interval: 0s
+        min_process_age: 5s
+      rules:
+        - action: exclude
+          name: exclude-obi-and-collectors
+          match:
+            process:
+              exe_path_glob:
+                - "*/obi"
+                - "obi"
+                - "*otelcol"
+                - "*otelcol-contrib"
+                - "*otelcol-contrib[!/]*"
+        - action: exclude
+          name: exclude-system-namespaces
+          match:
+            kubernetes:
+              namespace_glob:
+                - kube-system
+                - kube-node-lease
+                - local-path-storage
+                - cert-manager
+                - monitoring
+                - gke-connect
+                - gke-gmp-system
+                - gke-managed-cim
+                - gke-managed-filestorecsi
+                - gke-managed-metrics-server
+                - gke-managed-system
+                - gke-system
+                - gke-managed-volumepopulator
+                - gatekeeper-system
+        - action: exclude
+          name: exclude-otlp-exporters
+          match:
+            process:
+              exports_otlp:
+                port: 4317
+                protocol: protobuf
+        - action: exclude
+          name: exclude-linux-system-paths
+          match:
+            process:
+              exe_path_glob:
+                - /lib/systemd/*
+                - /usr/lib/systemd/*
+                - /usr/libexec/*
+                - /sbin/*
+                - /usr/sbin/*

@@ -77,8 +77,9 @@ Each release includes:
 #### Download and Verify
 
 ```bash
-# Set your desired version (find latest at https://github.com/open-telemetry/opentelemetry-ebpf-instrumentation/releases)
-export VERSION=1.0.0
+# Set your desired version.
+# This example uses the current release documented in this repo: v0.9.0.
+export VERSION=0.9.0
 
 # Determine your architecture
 # For Intel/AMD 64-bit: amd64
@@ -186,7 +187,7 @@ OBI is also available as container images:
 
 ```bash
 # Set your desired version.
-export VERSION=v0.7.0
+export VERSION=v0.9.0
 
 # (Optional) Verify the signature of the container image
 cosign verify --certificate-identity-regexp 'https://github.com/open-telemetry/opentelemetry-ebpf-instrumentation/' --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' otel/ebpf-instrument:${VERSION}

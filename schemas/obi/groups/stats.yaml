@@ -39,6 +39,23 @@ groups:
               stability: development
         stability: development
         brief: Classification of why a TCP connection failed.
+      - id: network.tcp.handshake.role
+        type:
+          allow_custom_values: true
+          members:
+            - id: unknown
+              value: unknown
+              stability: development
+            - id: client
+              value: client
+              stability: development
+            - id: server
+              value: server
+              stability: development
+        stability: development
+        brief: >
+          Which side of the TCP handshake the failing endpoint played when
+          the failed-connection event was recorded.
 
   - id: metric.obi_stat_tcp_rtt
     type: metric
@@ -81,3 +98,4 @@ groups:
       - ref: src.zone
       - ref: dst.zone
       - ref: reason
+      - ref: network.tcp.handshake.role

@@ -97,6 +97,13 @@ To add a new application metric, follow these guidelines:
 
 In [pkg/export/attributes/attr_defs.go](../pkg/export/attributes/attr_defs.go) some `AttrReportGroup` type structures are defined for stat metrics in both the k8s and non-k8s environment: `statsAttributes` and `statsKubeAttributes`. Here too, ad hoc attributes can be added for each metric. There are attributes that default to true and others to false, but which can be enabled by the user during configuration.
 
+For `obi.stat.tcp.failed.connections`, OBI now exposes two stats-specific labels from [pkg/internal/statsolly/ebpf/stat_getters.go](../pkg/internal/statsolly/ebpf/stat_getters.go):
+
+- `reason`, enabled by default in the schema and exporters
+- `network.tcp.handshake.role`, optional and disabled by default in `attributes.select` to avoid unnecessary cardinality growth
+
+Prometheus StatsO11y histograms also inherit the same native-histogram defaults as the main Prometheus exporter via `DefaultNativeHistogramConfig` in [pkg/export/prom/prom.go](../pkg/export/prom/prom.go).
+
 ### Add a new stat metric
 
 To add a new metric, follow these guidelines:

@@ -72,14 +72,16 @@ through language-specific library instrumentation documented later in this file.
 | Memcached | All | ASCII text subset excluding `quit` and meta commands | Yes | No | Only the first key is recorded for multi-key retrieval; payload bytes are not captured |
 | Kafka | All | `produce`, `fetch` | Yes | No | Topic name lookup may fail for newer fetch API versions (`>= 13`) |
 | MQTT | `3.1.1/5.0` | `publish`, `subscribe` | No | No | Only the first topic filter is used for subscribe; payload not captured |
+| NATS | All | `publish`, `process` | No | No | Only `PUB`/`HPUB` and delivered `MSG`/`HMSG` frames are traced; control traffic is ignored |
 | AMQP | `1.0` | `publish`, `process` | No | No | Userspace heuristic only; only transfer performatives create spans |
 | GraphQL | All | All | Yes | No | None documented |
+| JSON-RPC | `2.0` | All | Yes | No | Requires HTTP payload capture enabled (`OTEL_EBPF_BPF_BUFFER_SIZE_HTTP`) and `OTEL_EBPF_HTTP_JSONRPC_ENABLED=true` |
 | Elasticsearch | `7.14+` | `/_search`, `/_msearch`, `/_bulk`, `/_doc` | Yes | No | None documented |
 | Opensearch | `3.0.0+` | `/_search`, `/_msearch`, `/_bulk`, `/_doc` | Yes | No | None documented |
 | AWS S3 | All | `CreateBucket`, `DeleteBucket`, `PutObject`, `DeleteObject`, `ListBuckets`, `ListObjects`, `GetObject` | Yes | No | None documented |
 | AWS SQS | All | All | Yes | No | None documented |
 | SQL++ | All | All | Yes | No | None documented |
-| GenAI | All | All | Yes | No | Supported vendors are OpenAI, Anthropic, Google AI Studio (Gemini), AWS Bedrock, Qwen (DashScope), generic embedding providers (Voyage AI, Cohere, Jina AI), Cohere (Rerank), Jina AI (Rerank), Voyage AI (Rerank), and Qwen (DashScope) (Rerank) |
+| GenAI | All | All | Yes | No | Supported vendors and protocols are OpenAI, Anthropic, Google AI Studio (Gemini), AWS Bedrock, Qwen (DashScope), generic embedding providers (Voyage AI, Cohere, Jina AI), Model Context Protocol (MCP), and rerank APIs from Cohere, Jina AI, Voyage AI, and Qwen (DashScope) |
 
 ## Runtime, Server, And Library Instrumentation
 
@@ -131,7 +133,7 @@ OBI currently documents the following statistical instrumentation support:
 | Metric | Scope | Notes |
 |:-------|:------|:------|
 | TCP RTT | Node-wide statistical metric collection | Calculated from the kernel TCP `srtt_us` field |
-| TCP Failed Connections | Node-wide statistical metric collection | Counts the TCP failed connections between 2 endpoints |
+| TCP Failed Connections | Node-wide statistical metric collection | Counts TCP connection-establishment failures; can also be labeled by failure `reason` and optional `network.tcp.handshake.role` |
 
 ## Context Propagation Frameworks
 

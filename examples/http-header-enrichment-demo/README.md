@@ -3,6 +3,8 @@
 This example demonstrates OBI's HTTP header enrichment feature introduced in
 [v0.7.0](https://github.com/open-telemetry/opentelemetry-ebpf-instrumentation/releases/tag/v0.7.0).
 
+The Compose example in this directory is pinned to the `v0.9.0` release.
+
 Header enrichment lets you attach HTTP request and response headers as span
 attributes — without any code changes to your applications. A policy-driven
 ruleset controls which headers are included, excluded, or obfuscated.
@@ -95,7 +97,7 @@ The OBI config files are in `configs/`:
 The active config and OBI image can be overridden with environment variables:
 
 ```sh
-OBI_IMAGE=otel/ebpf-instrument:v0.7.0 OBI_CONFIG_FILE=obi-config-v0.7.0.yml docker compose up -d --force-recreate obi
+OBI_IMAGE=otel/ebpf-instrument:v0.9.0 OBI_CONFIG_FILE=obi-config-v0.7.0.yml docker compose up -d --force-recreate obi
 ```
 
 ## Troubleshooting

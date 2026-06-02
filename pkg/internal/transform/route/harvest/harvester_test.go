@@ -5,9 +5,12 @@ package harvest
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,6 +22,16 @@ import (
 	"go.opentelemetry.io/obi/pkg/appolly/discover/exec"
 	"go.opentelemetry.io/obi/pkg/appolly/services"
 )
+
+type noopJavaAttacher struct{}
+
+func (noopJavaAttacher) Init() {}
+
+func (noopJavaAttacher) Cleanup() {}
+
+func (noopJavaAttacher) Attach(app.PID, []string, bool) (io.ReadCloser, error) {
+	return nil, nil
+}
 
 // successfulExtractRoutes simulates a successful route extraction
 func successfulExtractRoutes(app.PID) (*RouteHarvesterResult, error) {
@@ -202,6 +215,47 @@ func TestHarvestRoutes_MultipleTimeouts(t *testing.T) {
 		require.ErrorAs(t, err, &harvestErr, "iteration %d should return HarvestError", i)
 		assert.Equal(t, "route harvesting timed out", harvestErr.Message, "iteration %d should have timeout message", i)
 	}
+}
+
+func TestHarvestRoutes_BlockedJavaTimeoutDoesNotStartAdditionalExtractions(t *testing.T) {
+	harvester := NewRouteHarvester(&services.RouteHarvestingConfig{}, []services.RouteHarvesterLanguage{}, 10*time.Millisecond)
+	harvester.java.Attacher = noopJavaAttacher{}
+
+	blockCh := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			close(blockCh)
+		})
+	}
+	t.Cleanup(release)
+
+	var calls atomic.Int32
+	var finished atomic.Int32
+	harvester.javaExtractRoutes = func(app.PID) (*RouteHarvesterResult, error) {
+		calls.Add(1)
+		<-blockCh
+		finished.Add(1)
+		return &RouteHarvesterResult{Kind: PartialRoutes}, nil
+	}
+
+	fileInfo := createTestFileInfo(svc.InstrumentableJava)
+	for i := range 5 {
+		result, err := harvester.HarvestRoutes(fileInfo)
+
+		require.Error(t, err, "iteration %d should timeout", i)
+		assert.Nil(t, result, "iteration %d should return nil result", i)
+
+		var harvestErr *HarvestError
+		require.ErrorAs(t, err, &harvestErr, "iteration %d should return HarvestError", i)
+		assert.Equal(t, "route harvesting timed out", harvestErr.Message, "iteration %d should have timeout message", i)
+		assert.Equal(t, int32(1), calls.Load(), "iteration %d should not start another blocked Java extraction", i)
+	}
+
+	release()
+	require.Eventually(t, func() bool {
+		return finished.Load() == 1
+	}, time.Second, 10*time.Millisecond)
 }
 
 func TestHarvestNodejsRoutes_Successful(t *testing.T) {

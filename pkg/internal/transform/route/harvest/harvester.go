@@ -28,9 +28,17 @@ type RouteHarvester struct {
 	timeout  time.Duration
 	mux      *sync.Mutex
 
+	// Limits blocked Java extraction to one in-flight goroutine when attach cannot be canceled.
+	javaHarvestSemaphore chan struct{}
+
 	// testing related
 	javaExtractRoutes func(pid app.PID) (*RouteHarvesterResult, error)
 	nodeExtractRoutes func(pid app.PID) (*RouteHarvesterResult, error)
+}
+
+type routeHarvestResult struct {
+	r   *RouteHarvesterResult
+	err error
 }
 
 type RouteHarvesterResultKind uint8
@@ -72,6 +80,8 @@ func NewRouteHarvester(cfg *services.RouteHarvestingConfig, disabled []services.
 		timeout:  timeout,
 		cfg:      cfg,
 		mux:      &sync.Mutex{},
+
+		javaHarvestSemaphore: make(chan struct{}, 1),
 	}
 
 	h.javaExtractRoutes = h.java.ExtractRoutes
@@ -89,60 +99,24 @@ func (h *RouteHarvester) HarvestRoutes(fileInfo *exec.FileInfo) (*RouteHarvester
 	ctx, cancel := context.WithTimeout(context.Background(), h.timeout)
 	defer cancel()
 
-	// Channel to receive the result
-	type result struct {
-		r   *RouteHarvesterResult
-		err error
-	}
-
-	resultChan := make(chan result, 1)
-
-	// We need to fix this in the downstream library and then we can remove this code
-	if fileInfo.SDKLanguage() == svc.InstrumentableJava {
-		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
-		h.java.Attacher.Init()
-		defer h.java.Attacher.Cleanup()
-	}
+	resultChan := make(chan routeHarvestResult, 1)
 
 	// Run the harvesting in a goroutine
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				h.log.Error("route harvesting failed", "error", r)
-				resultChan <- result{err: &HarvestError{Message: "harvesting failed"}}
-			}
-		}()
-
-		switch fileInfo.SDKLanguage() {
-		case svc.InstrumentableJava:
-			if _, ok := h.disabled[svc.InstrumentableJava]; !ok {
-				r, err := h.javaExtractRoutes(fileInfo.Pid())
-				if err != nil {
-					resultChan <- result{err: err}
-					return
-				}
-				resultChan <- result{r: r}
-			} else {
-				resultChan <- result{r: nil}
-			}
-		case svc.InstrumentableNodejs:
-			if _, ok := h.disabled[svc.InstrumentableNodejs]; !ok {
-				r, err := h.nodeExtractRoutes(fileInfo.Pid())
-				if err != nil {
-					resultChan <- result{err: err}
-					return
-				}
-				h.log.Debug("found node js application routes", "routes", r.Routes)
-
-				resultChan <- result{r: r}
-			} else {
-				resultChan <- result{r: nil}
-			}
-		default:
-			resultChan <- result{r: nil}
+	switch fileInfo.SDKLanguage() {
+	case svc.InstrumentableJava:
+		if _, ok := h.disabled[svc.InstrumentableJava]; ok {
+			return nil, nil
 		}
-	}()
+		if !h.acquireJavaHarvest(ctx) {
+			h.log.Warn("route harvesting timed out", "timeout", h.timeout, "pid", fileInfo.Pid())
+			return nil, &HarvestError{Message: "route harvesting timed out"}
+		}
+		go h.harvestJavaRoutes(fileInfo.Pid(), resultChan)
+	case svc.InstrumentableNodejs:
+		go h.harvestNodejsRoutes(fileInfo.Pid(), resultChan)
+	default:
+		return nil, nil
+	}
 
 	// Wait for either completion or timeout
 	select {
@@ -151,6 +125,68 @@ func (h *RouteHarvester) HarvestRoutes(fileInfo *exec.FileInfo) (*RouteHarvester
 	case <-ctx.Done():
 		h.log.Warn("route harvesting timed out", "timeout", h.timeout, "pid", fileInfo.Pid())
 		return nil, &HarvestError{Message: "route harvesting timed out"}
+	}
+}
+
+func (h *RouteHarvester) acquireJavaHarvest(ctx context.Context) bool {
+	select {
+	case h.javaHarvestSemaphore <- struct{}{}:
+		if ctx.Err() != nil {
+			h.releaseJavaHarvest()
+			return false
+		}
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (h *RouteHarvester) releaseJavaHarvest() {
+	<-h.javaHarvestSemaphore
+}
+
+func (h *RouteHarvester) harvestJavaRoutes(pid app.PID, resultChan chan<- routeHarvestResult) {
+	defer func() {
+		if r := recover(); r != nil {
+			h.log.Error("route harvesting failed", "error", r)
+			resultChan <- routeHarvestResult{err: &HarvestError{Message: "harvesting failed"}}
+		}
+	}()
+	defer h.releaseJavaHarvest()
+
+	// Keep the attach lifecycle on one OS thread because jvmtools changes thread-local state.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	h.java.Attacher.Init()
+	defer h.java.Attacher.Cleanup()
+
+	r, err := h.javaExtractRoutes(pid)
+	if err != nil {
+		resultChan <- routeHarvestResult{err: err}
+		return
+	}
+	resultChan <- routeHarvestResult{r: r}
+}
+
+func (h *RouteHarvester) harvestNodejsRoutes(pid app.PID, resultChan chan<- routeHarvestResult) {
+	defer func() {
+		if r := recover(); r != nil {
+			h.log.Error("route harvesting failed", "error", r)
+			resultChan <- routeHarvestResult{err: &HarvestError{Message: "harvesting failed"}}
+		}
+	}()
+
+	if _, ok := h.disabled[svc.InstrumentableNodejs]; !ok {
+		r, err := h.nodeExtractRoutes(pid)
+		if err != nil {
+			resultChan <- routeHarvestResult{err: err}
+			return
+		}
+		h.log.Debug("found node js application routes", "routes", r.Routes)
+
+		resultChan <- routeHarvestResult{r: r}
+	} else {
+		resultChan <- routeHarvestResult{r: nil}
 	}
 }
 

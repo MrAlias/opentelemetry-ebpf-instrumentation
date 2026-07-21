@@ -802,6 +802,258 @@ test_scenario_failure_retains_after_evidence() {
   )
 }
 
+test_start_failure_retains_command_boundary() {
+  local -r fake_compose="$TEST_TMP_DIR/start-failure-compose"
+  local -r result_dir="$TEST_TMP_DIR/start-failure-result"
+  local status=0
+
+  printf '%s\n' \
+    '#!/usr/bin/env sh' \
+    'set -eu' \
+    'case "${1:-}" in' \
+    '  config)' \
+    '    if [ "${2:-}" = "--quiet" ]; then exit 0; fi' \
+    '    printf "services: {}\n"' \
+    '    ;;' \
+    '  up)' \
+    '    printf "compose-build-boundary-output\n"' \
+    '    exit 37' \
+    '    ;;' \
+    '  *) exit 64 ;;' \
+    'esac' >"$fake_compose"
+  chmod 0755 "$fake_compose"
+
+  (
+    RESULT_DIR="$result_dir"
+    RUN_STAGE="test"
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    COMPOSE=("$fake_compose")
+    SCENARIO="basic"
+    TRANSPORT="getsockopt"
+    COMMAND_TIMEOUT_SECONDS=5
+    STACK_STARTED=false
+    BRIDGE_RUNNING=false
+    mkdir -p -- "$RESULT_DIR" || return 1
+    verify_compose_project_ownership() {
+      return 0
+    }
+
+    if start_stack; then
+      printf 'failing Compose startup unexpectedly passed\n' >&2
+      return 1
+    else
+      status=$?
+    fi
+
+    [[ "$status" -eq 37 ]] || {
+      printf 'logged command returned %d, expected 37\n' "$status" >&2
+      return 1
+    }
+    [[ "$STACK_STARTED" == "true" && "$BRIDGE_RUNNING" == "false" ]] || return 1
+    grep -Fq 'compose-build-boundary-output' "$RESULT_DIR/compose-up.log" || return 1
+    grep -Fq 'exit_status=37' "$RESULT_DIR/compose-up.log" || return 1
+    grep -Fq 'capture_exit_status=0' "$RESULT_DIR/compose-up.log" || return 1
+    grep -Fq 'stage=compose-build-start' "$RESULT_DIR/failure-context.txt" || return 1
+    grep -Eq '^line=[1-9][0-9]*$' "$RESULT_DIR/failure-context.txt" || return 1
+    grep -Fq 'exit_status=37' "$RESULT_DIR/failure-context.txt" || return 1
+    grep -Fq "$fake_compose" "$RESULT_DIR/failure-context.txt" || return 1
+
+    write_run_status "$status" || return 1
+    grep -Fq '"failure_stage": "compose-build-start"' "$RESULT_DIR/run-status.json" || return 1
+  ) || {
+    printf 'logged failure evidence was incomplete\n' >&2
+    return 1
+  }
+}
+
+test_log_write_failure_is_not_ignored() {
+  local -r result_dir="$TEST_TMP_DIR/log-write-failure"
+  local expected_line=0
+  local status=0
+
+  (
+    RESULT_DIR="$result_dir"
+    RUN_STAGE="bridge-build"
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    mkdir -p -- "$RESULT_DIR" || return 1
+
+    expected_line=$((LINENO + 1))
+    if run_logged_bounded /dev/full 5 sh -c 'exit 0' 2>/dev/null; then
+      printf 'unwritable evidence sink was ignored\n' >&2
+      return 1
+    else
+      status=$?
+    fi
+
+    [[ "$status" -ne 0 ]] || return 1
+    grep -Fq 'stage=bridge-build' "$RESULT_DIR/failure-context.txt" || return 1
+    grep -Fqx "line=$expected_line" "$RESULT_DIR/failure-context.txt" || return 1
+    grep -Fq 'command=write\ /dev/full' "$RESULT_DIR/failure-context.txt" || return 1
+  ) || {
+    printf 'log write failure did not fail closed\n' >&2
+    return 1
+  }
+}
+
+footer_faulting_tee() {
+  local -r output="${!#}"
+
+  command tee "$@" || return
+  mv -- "$output" "$output.before-footer" || return
+  ln -s /dev/full "$output" || return
+  [[ -L "$output" && "$output" -ef /dev/full ]] || return 1
+  printf 'ready\n' >"$RESULT_DIR/footer-fault-ready" || return
+  return "${FOOTER_FAULT_STATUS:-0}"
+}
+
+test_footer_write_failure_preserves_first_failure() {
+  local -r command_result_dir="$TEST_TMP_DIR/footer-command-failure"
+  local -r capture_result_dir="$TEST_TMP_DIR/footer-capture-failure"
+
+  (
+    RESULT_DIR="$command_result_dir"
+    RUN_STAGE="compose-build-start"
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    FOOTER_FAULT_STATUS=0
+    mkdir -p -- "$RESULT_DIR" || return 1
+    tee() {
+      footer_faulting_tee "$@"
+    }
+
+    local expected_line=0
+    local status=0
+    expected_line=$((LINENO + 1))
+    if run_logged_bounded "$RESULT_DIR/command.log" 5 sh -c 'exit 37' 2>/dev/null; then
+      printf 'command and footer failures unexpectedly passed\n' >&2
+      return 1
+    else
+      status=$?
+    fi
+
+    [[ "$status" -eq 37 ]] || return 1
+    [[ -f "$RESULT_DIR/footer-fault-ready" ]] || return 1
+    [[ -L "$RESULT_DIR/command.log" && "$RESULT_DIR/command.log" -ef /dev/full ]] || return 1
+    grep -Fqx "line=$expected_line" "$RESULT_DIR/failure-context.txt" || return 1
+    grep -Fq 'exit_status=37' "$RESULT_DIR/failure-context.txt" || return 1
+    grep -Fq 'command=sh\ -c\ exit\\\ 37' "$RESULT_DIR/failure-context.txt" || return 1
+  ) || {
+    printf 'footer failure masked an earlier command failure\n' >&2
+    return 1
+  }
+
+  (
+    RESULT_DIR="$capture_result_dir"
+    RUN_STAGE="bridge-build"
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    FOOTER_FAULT_STATUS=23
+    mkdir -p -- "$RESULT_DIR" || return 1
+    tee() {
+      footer_faulting_tee "$@"
+    }
+
+    local expected_line=0
+    local status=0
+    expected_line=$((LINENO + 1))
+    if run_logged_bounded "$RESULT_DIR/capture.log" 5 sh -c 'exit 0' 2>/dev/null; then
+      printf 'capture and footer failures unexpectedly passed\n' >&2
+      return 1
+    else
+      status=$?
+    fi
+
+    [[ "$status" -eq 23 ]] || return 1
+    [[ -f "$RESULT_DIR/footer-fault-ready" ]] || return 1
+    [[ -L "$RESULT_DIR/capture.log" && "$RESULT_DIR/capture.log" -ef /dev/full ]] || return 1
+    grep -Fqx "line=$expected_line" "$RESULT_DIR/failure-context.txt" || return 1
+    grep -Fq 'exit_status=23' "$RESULT_DIR/failure-context.txt" || return 1
+    grep -Fq 'command=tee\ -a\ ' "$RESULT_DIR/failure-context.txt" || return 1
+  ) || {
+    printf 'footer failure masked an earlier capture failure\n' >&2
+    return 1
+  }
+}
+
+test_error_logging_preserves_primary_status() {
+  local -r result_dir="$TEST_TMP_DIR/error-log-failure"
+  local status=0
+
+  set +e
+  (
+    RESULT_DIR="$result_dir"
+    RUN_STAGE="traffic"
+    RUN_STATUS="failed"
+    ACCEPTANCE_EVIDENCE=false
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    mkdir -p -- "$RESULT_DIR" || return 1
+    trap 'status=$?; trap - ERR EXIT; write_run_status "$status"; exit "$status"' EXIT
+    trap 'on_error "$LINENO" "$?" "$BASH_COMMAND"' ERR
+    exec 2>&-
+    set -e
+    sh -c 'exit 37'
+  )
+  status=$?
+  set -e
+
+  if ((status == 0)); then
+    printf 'closed error log unexpectedly passed\n' >&2
+    return 1
+  fi
+
+  [[ "$status" -eq 37 ]] || return 1
+  grep -Fq 'exit_status=37' "$result_dir/failure-context.txt" || return 1
+  grep -Fq '"exit_status": 37' "$result_dir/run-status.json" || return 1
+}
+
+test_die_records_explicit_failure_boundary() {
+  local -r result_dir="$TEST_TMP_DIR/die-failure"
+  local expected_line=0
+  local status=0
+
+  set +e
+  (
+    RESULT_DIR="$result_dir"
+    RUN_STAGE="argument-validation"
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    mkdir -p -- "$RESULT_DIR" || exit 1
+
+    exec 2>&- || exit 1
+    set -e
+    printf '%d\n' "$((LINENO + 1))" >"$RESULT_DIR/expected-line.txt"
+    die "injected explicit failure"
+  ) >/dev/null 2>&1
+  status=$?
+  set -e
+
+  if ((status == 0)); then
+    printf 'explicit failure unexpectedly passed\n' >&2
+    return 1
+  fi
+
+  expected_line="$(<"$result_dir/expected-line.txt")" || return 1
+  [[ "$status" -eq 2 ]] || return 1
+  grep -Fq "line=$expected_line" "$result_dir/failure-context.txt" || return 1
+  grep -Fq 'exit_status=2' "$result_dir/failure-context.txt" || return 1
+  grep -Fq 'command=die:\ injected\ explicit\ failure' "$result_dir/failure-context.txt" || return 1
+}
+
 test_non_acceptance_reasons_are_recorded() {
   (
     ACCEPTANCE_EVIDENCE=true
@@ -869,6 +1121,11 @@ main() {
   test_restart_readiness_uses_log_cursor
   test_restart_failure_reaps_background_traffic
   test_scenario_failure_retains_after_evidence
+  test_start_failure_retains_command_boundary
+  test_log_write_failure_is_not_ignored
+  test_footer_write_failure_preserves_first_failure
+  test_error_logging_preserves_primary_status
+  test_die_records_explicit_failure_boundary
   test_non_acceptance_reasons_are_recorded
   test_release_source_uses_one_version_for_extension
   test_demo_diagnostics_are_loopback_only

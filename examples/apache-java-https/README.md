@@ -319,6 +319,12 @@ Every run retains a timestamped directory under `.runtime/results/` with:
   and the Java-service duplicate-suppression metric;
 - final receiver snapshot, Compose state, and component logs.
 
+Build and startup output is streamed to the terminal and retained in
+`bridge-build.log` and `compose-up.log`. A failed run also records the exact
+failure stage, source line, exit status, and shell-escaped command in
+`failure-context.txt`; `run-status.json` repeats the stage and line for
+machine-readable triage.
+
 Only a generated marker header is captured. The receiver rejects compressed or
 oversized requests, enforces configured count, per-string, and aggregate
 retained-byte ceilings, and strips arbitrary headers and bodies before writing
@@ -333,7 +339,9 @@ scenario is explicitly labeled non-acceptance evidence. Only a clean full
 
 ## Diagnostics
 
-If readiness fails, inspect the retained `compose.log` in this order:
+For an early failure, inspect `failure-context.txt`, then `bridge-build.log` or
+`compose-up.log` for the named stage. If readiness fails after startup, inspect
+the retained `compose.log` in this order:
 
 1. `trace-receiver` must listen on `127.0.0.1:14318`.
 2. Jetty must report HTTP/1.1 and the selected TLS protocol.

@@ -42,6 +42,11 @@ SOURCE_REVISION=""
 SOURCE_TRACKED_PATCH_SHA256=""
 SOURCE_TREE_SHA256=""
 RUN_INVOCATION=""
+RUN_STAGE="initialization"
+FAILURE_STAGE=""
+FAILURE_LINE=""
+FAILURE_STATUS=""
+FAILURE_COMMAND=""
 BRIDGE_BUILD_MODE="fresh"
 ACCEPTANCE_EVIDENCE=true
 ACCEPTANCE_EVIDENCE_REASON=""
@@ -133,10 +138,13 @@ bounded_decimal() {
   if [[ "$allow_zero" != "true" && "$normalized" == "0" ]]; then
     return 1
   fi
-  if (( ${#normalized} > ${#maximum} )) || {
-    (( ${#normalized} == ${#maximum} )) && [[ "$normalized" > "$maximum" ]]
-  }; then
+  if (( ${#normalized} > ${#maximum} )); then
     return 1
+  fi
+  if (( ${#normalized} == ${#maximum} )); then
+    # Equal-width decimal strings compare safely without arithmetic overflow.
+    # shellcheck disable=SC2071
+    [[ "$normalized" > "$maximum" ]] && return 1
   fi
   printf '%s\n' "$normalized"
 }
@@ -304,7 +312,10 @@ require_value() {
 }
 
 die() {
-  log_error "$*"
+  local -r line="${BASH_LINENO[0]:-0}"
+
+  record_failure "$RUN_STAGE" "$line" 2 "die: $*"
+  log_error "$*" || true
   exit 2
 }
 
@@ -337,6 +348,73 @@ run_bounded() {
   local -r seconds="$1"
   shift
   timeout --signal=TERM --kill-after=10s "${seconds}s" "$@"
+}
+
+record_failure() {
+  local -r stage="$1"
+  local -r line="$2"
+  local -r status="$3"
+  local -r command="$4"
+
+  if [[ -n "$FAILURE_STAGE" ]]; then
+    return 0
+  fi
+
+  FAILURE_STAGE="$stage"
+  FAILURE_LINE="$line"
+  FAILURE_STATUS="$status"
+  FAILURE_COMMAND="$command"
+
+  if [[ -n "${RESULT_DIR:-}" && -d "$RESULT_DIR" ]]; then
+    {
+      printf 'stage=%q\n' "$FAILURE_STAGE"
+      printf 'line=%q\n' "$FAILURE_LINE"
+      printf 'exit_status=%q\n' "$FAILURE_STATUS"
+      printf 'command=%q\n' "$FAILURE_COMMAND"
+    } >"$RESULT_DIR/failure-context.txt" || true
+  fi
+}
+
+run_logged_bounded() {
+  local -r output="$1"
+  local -r seconds="$2"
+  local -r caller_line="${BASH_LINENO[0]:-0}"
+  local command_status=0
+  local capture_status=0
+  local write_status=0
+  local rendered_command=""
+  local -a statuses=()
+  shift 2
+
+  printf -v rendered_command '%q ' "$@"
+  rendered_command="${rendered_command% }"
+  printf 'command=%s\n' "$rendered_command" >"$output" || write_status=$?
+  if ((write_status != 0)); then
+    record_failure "$RUN_STAGE" "$caller_line" "$write_status" "write $output"
+    return "$write_status"
+  fi
+
+  if run_bounded "$seconds" "$@" 2>&1 | tee -a "$output"; then
+    statuses=("${PIPESTATUS[@]}")
+  else
+    statuses=("${PIPESTATUS[@]}")
+  fi
+  command_status="${statuses[0]}"
+  capture_status="${statuses[1]}"
+  printf 'exit_status=%d\ncapture_exit_status=%d\n' \
+    "$command_status" "$capture_status" >>"$output" || write_status=$?
+  if ((command_status != 0)); then
+    record_failure "$RUN_STAGE" "$caller_line" "$command_status" "$rendered_command"
+    return "$command_status"
+  fi
+  if ((capture_status != 0)); then
+    record_failure "$RUN_STAGE" "$caller_line" "$capture_status" "tee -a $output"
+    return "$capture_status"
+  fi
+  if ((write_status != 0)); then
+    record_failure "$RUN_STAGE" "$caller_line" "$write_status" "append $output"
+    return "$write_status"
+  fi
 }
 
 capture_optional_command() {
@@ -424,13 +502,21 @@ safe_compose_down() {
 
 on_error() {
   local -r line="$1"
-  log_error "command failed at line $line"
+  local -r status="$2"
+  local -r command="$3"
+
+  record_failure "$RUN_STAGE" "$line" "$status" "$command"
+  log_error "command failed at line $line during $RUN_STAGE" || true
 }
 
 cleanup() {
   local -r status="$?"
   trap - ERR EXIT INT TERM
   set +e
+
+  if ((status != 0)) && [[ -z "$FAILURE_STAGE" ]]; then
+    record_failure "$RUN_STAGE" 0 "$status" "exit"
+  fi
 
   if [[ "$PRESSURE_ACTIVE" == "true" ]]; then
     cleanup_map_pressure || true
@@ -456,7 +542,7 @@ cleanup() {
 }
 
 install_traps() {
-  trap 'on_error "$LINENO"' ERR
+  trap 'on_error "$LINENO" "$?" "$BASH_COMMAND"' ERR
   trap cleanup EXIT
   trap 'exit 130' INT TERM
 }
@@ -662,12 +748,13 @@ prepare_bridge_artifacts() {
   export_dir="$TMP_DIR/export"
   mkdir -p -- "$export_dir"
   log_info "building OBI Java helper and external extension"
-  run_bounded "$COMMAND_TIMEOUT_SECONDS" \
+  RUN_STAGE="bridge-build"
+  run_logged_bounded "$RESULT_DIR/bridge-build.log" "$COMMAND_TIMEOUT_SECONDS" \
     docker build \
       --file "$REPO_ROOT/javaagent.Dockerfile" \
       --target export \
       --output "type=local,dest=$export_dir" \
-      "$REPO_ROOT"
+      "$REPO_ROOT" || return
 
   [[ -s "$export_dir/obi-java-agent.jar" ]] || die "Java build did not export obi-java-agent.jar"
   [[ -s "$export_dir/obi-otel-extension.jar" ]] || die "Java build did not export obi-otel-extension.jar"
@@ -703,28 +790,37 @@ export_compose_environment() {
 }
 
 start_stack() {
+  local start_status=0
+
+  RUN_STAGE="compose-ownership"
   verify_compose_project_ownership || {
     die "reserved Compose project ownership could not be verified"
   }
   log_info "validating resolved Compose configuration"
+  RUN_STAGE="compose-configuration"
   run_bounded 30 "${COMPOSE[@]}" config --quiet
   run_bounded 30 "${COMPOSE[@]}" config >"$RESULT_DIR/compose-resolved.yaml"
 
   log_info "building and starting the demo stack"
+  RUN_STAGE="compose-build-start"
   STACK_STARTED=true
   if [[ "$SCENARIO" == "uninstrumented" ]]; then
-    run_bounded "$COMMAND_TIMEOUT_SECONDS" \
+    run_logged_bounded "$RESULT_DIR/compose-up.log" "$COMMAND_TIMEOUT_SECONDS" \
       "${COMPOSE[@]}" up --build --detach \
-        trace-receiver java-backend apache-proxy
+        trace-receiver java-backend apache-proxy || start_status=$?
   else
-    run_bounded "$COMMAND_TIMEOUT_SECONDS" \
+    run_logged_bounded "$RESULT_DIR/compose-up.log" "$COMMAND_TIMEOUT_SECONDS" \
       "${COMPOSE[@]}" up --build --detach \
-        trace-receiver java-backend apache-proxy obi
-    if [[ "$TRANSPORT" != "disabled" ]]; then
-      BRIDGE_RUNNING=true
-    fi
+        trace-receiver java-backend apache-proxy obi || start_status=$?
+  fi
+  if ((start_status != 0)); then
+    return "$start_status"
+  fi
+  if [[ "$SCENARIO" != "uninstrumented" && "$TRANSPORT" != "disabled" ]]; then
+    BRIDGE_RUNNING=true
   fi
 
+  RUN_STAGE="readiness"
   wait_for_http "http://127.0.0.1:14318/healthz" "trace receiver"
   wait_for_http "http://127.0.0.1:18080/healthz" "verified Apache-to-Jetty HTTPS path"
   if [[ "$TRANSPORT" != "disabled" ]]; then
@@ -2456,15 +2552,19 @@ capture_evidence() {
 
 write_run_status() {
   local -r exit_status="$1"
+  local failure_stage="${FAILURE_STAGE:-none}"
+  local failure_line="${FAILURE_LINE:-0}"
   local status="failed"
 
   if ((exit_status == 0)) && [[ "$RUN_STATUS" == "passed" ]]; then
     status="passed"
   fi
-  printf '{\n  "status": "%s",\n  "exit_status": %d,\n  "acceptance_evidence": %s,\n  "evidence_directory": "%s"\n}\n' \
+  printf '{\n  "status": "%s",\n  "exit_status": %d,\n  "acceptance_evidence": %s,\n  "failure_stage": "%s",\n  "failure_line": %d,\n  "evidence_directory": "%s"\n}\n' \
     "$status" \
     "$exit_status" \
     "$ACCEPTANCE_EVIDENCE" \
+    "$failure_stage" \
+    "$failure_line" \
     "$RESULT_DIR" >"$RESULT_DIR/run-status.json"
 }
 
@@ -2477,6 +2577,7 @@ main() {
   printf -v RUN_INVOCATION '%q ' "$0" "$@"
   RUN_INVOCATION="${RUN_INVOCATION% }"
   install_traps
+  RUN_STAGE="argument-validation"
   parse_args "$@"
   check_dependencies
 
@@ -2485,17 +2586,27 @@ main() {
     return 0
   fi
 
+  RUN_STAGE="runtime-preparation"
   prepare_directories
+  RUN_STAGE="source-state"
   capture_source_state
+  RUN_STAGE="certificates"
   prepare_certificates
+  RUN_STAGE="official-agent"
   prepare_official_agent
+  RUN_STAGE="bridge-artifacts"
   prepare_bridge_artifacts
+  RUN_STAGE="compose-environment"
   export_compose_environment
+  RUN_STAGE="environment-evidence"
   capture_environment
   start_stack
+  RUN_STAGE="runtime-evidence"
   capture_runtime_evidence
+  RUN_STAGE="scenarios"
   execute_requested_scenarios
   RUN_STATUS="passed"
+  RUN_STAGE="complete"
   log_info "all requested assertions passed; evidence: $RESULT_DIR"
 }
 

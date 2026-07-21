@@ -102,6 +102,18 @@ func TestJavaRemoteParentExactLifecycleMapsDoNotEvict(t *testing.T) {
 	}
 }
 
+func TestJavaRemoteParentGenerationMapsArePerCPU(t *testing.T) {
+	spec, err := generictracer.LoadBpf()
+	require.NoError(t, err)
+
+	for _, name := range []string{
+		"incoming_trace_generation",
+		"java_remote_parent_generation",
+	} {
+		require.Equal(t, ebpf.PerCPUArray, spec.Maps[name].Type, name)
+	}
+}
+
 func TestJavaRemoteParentSocketAuthorityIsSocketLocal(t *testing.T) {
 	spec, err := tpinjector.LoadBpfJavaRemoteParent()
 	require.NoError(t, err)

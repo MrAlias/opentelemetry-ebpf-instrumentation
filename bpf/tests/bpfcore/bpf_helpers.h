@@ -73,6 +73,9 @@ static inline void *bpf_get_current_task(void) {
 static inline unsigned long long bpf_get_current_pid_tgid(void) {
     return 0;
 }
+static inline unsigned int bpf_get_smp_processor_id(void) {
+    return 0;
+}
 static inline long bpf_get_current_comm(void *buf, unsigned int sz) {
     return 0;
 }

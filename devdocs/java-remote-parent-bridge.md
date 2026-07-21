@@ -100,7 +100,7 @@ bytes; a different declared or supplied size is malformed.
 | 10 | 6 | reserved | Zero |
 | 16 | 16 | trace ID | Network-order trace ID bytes |
 | 32 | 8 | parent span ID | Network-order upstream span ID bytes |
-| 40 | 8 | generation | Monotonic request generation |
+| 40 | 8 | generation | Opaque nonzero per-CPU request token; not globally ordered |
 | 48 | 8 | observation time | Kernel monotonic nanoseconds |
 | 56 | 8 | reserved | Zero |
 

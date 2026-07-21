@@ -9,6 +9,7 @@
 #include <common/connection_info.h>
 #include <common/java_remote_parent.h>
 #include <common/map_sizing.h>
+#include <common/per_cpu_generation.h>
 #include <common/pin_internal.h>
 #include <common/scratch_mem.h>
 #include <common/sock_port_ns.h>
@@ -71,7 +72,7 @@ struct {
 } incoming_trace_ambiguity SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __type(key, u32);
     __type(value, u64);
     __uint(max_entries, 1);
@@ -119,11 +120,7 @@ static __always_inline u64 incoming_trace_next_generation() {
         return 0;
     }
 
-    u64 generation = __sync_fetch_and_add(counter, 1) + 1;
-    if (!generation) {
-        generation = __sync_fetch_and_add(counter, 1) + 1;
-    }
-    return generation;
+    return next_per_cpu_generation(counter, bpf_get_smp_processor_id());
 }
 
 static __always_inline u8 incoming_trace_publish_candidate(const tp_info_pid_t *candidate,

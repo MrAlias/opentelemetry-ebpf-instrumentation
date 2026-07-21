@@ -8,6 +8,7 @@
 
 #include <common/java_remote_parent.h>
 #include <common/map_sizing.h>
+#include <common/per_cpu_generation.h>
 #include <common/pin_internal.h>
 #include <common/scratch_mem.h>
 #include <common/trace_helpers.h>
@@ -128,7 +129,7 @@ struct {
 } java_remote_parent_terminal SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __type(key, u32);
     __type(value, u64);
     __uint(max_entries, 1);
@@ -167,15 +168,7 @@ static __always_inline u8 java_remote_parent_pid_key_equal(const pid_key_t *left
 static __always_inline u64 java_remote_parent_next_generation() {
     const u32 zero = 0;
     u64 *generation = bpf_map_lookup_elem(&java_remote_parent_generation, &zero);
-    if (!generation) {
-        return bpf_ktime_get_ns();
-    }
-
-    u64 next = __sync_fetch_and_add(generation, 1) + 1;
-    if (!next) {
-        next = __sync_fetch_and_add(generation, 1) + 1;
-    }
-    return next;
+    return next_per_cpu_generation(generation, bpf_get_smp_processor_id());
 }
 
 static __always_inline pid_key_t java_remote_parent_current_owner() {
@@ -192,6 +185,20 @@ static __always_inline java_remote_parent_key_t java_remote_parent_state_key(con
         .generation = generation,
     };
     return key;
+}
+
+static __always_inline u8
+java_remote_parent_generation_in_use(const java_remote_parent_key_t *key) {
+    if (bpf_map_lookup_elem(&java_remote_parent_state, key) ||
+        bpf_map_lookup_elem(&java_remote_parent_generation_index, key) ||
+        bpf_map_lookup_elem(&java_remote_parent_claims, key) ||
+        bpf_map_lookup_elem(&java_remote_parent_ambiguity, key)) {
+        return 1;
+    }
+
+    const java_remote_parent_terminal_t *terminal =
+        bpf_map_lookup_elem(&java_remote_parent_terminal, &key->owner);
+    return terminal && terminal->generation == key->generation;
 }
 
 static __always_inline u8 java_remote_parent_generation_index_matches(
@@ -452,10 +459,18 @@ static __always_inline u64 java_remote_parent_stage(const connection_info_t *con
     }
     const u64 now = bpf_ktime_get_ns();
     const u64 generation = java_remote_parent_next_generation();
+    if (!generation) {
+        java_remote_parent_stat_add(k_java_remote_parent_stat_stage_overload);
+        return 0;
+    }
     const u64 observed_monotime_ns = incoming->tp.ts ? incoming->tp.ts : now;
     const java_remote_parent_key_t key = java_remote_parent_state_key(&owner, generation);
     const connection_info_ns_t connection_key =
         connection_info_with_netns(connection, connection_netns);
+    if (java_remote_parent_generation_in_use(&key)) {
+        java_remote_parent_stat_add(k_java_remote_parent_stat_stage_ambiguous);
+        return 0;
+    }
 
     java_remote_parent_owner_t publishing = {
         .generation = generation,

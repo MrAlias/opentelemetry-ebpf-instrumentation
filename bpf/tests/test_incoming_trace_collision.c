@@ -398,6 +398,25 @@ static void test_map_pressure_fails_closed(void) {
     }
 }
 
+static void test_generation_collision_preserves_existing_candidate(void) {
+    reset();
+    connection_info_t connection = {};
+    const tp_info_pid_t existing = candidate(2, 10);
+    const tp_info_pid_t colliding = candidate(3, 20);
+    test_version_t *reserved = allocate_version(1);
+    reserved->candidate = (incoming_trace_candidate_t){
+        .candidate = existing,
+        .tcp_sequence = 50,
+    };
+
+    if (update_strict_incoming_trace(&connection, &colliding, 100, test_netns) !=
+            k_incoming_trace_update_failed ||
+        reserved->candidate.candidate.tp.span_id[0] != existing.tp.span_id[0] ||
+        find_head(&(connection_info_ns_t){.netns = test_netns})) {
+        fail("generation collision overwrote an existing candidate");
+    }
+}
+
 static void test_identical_tuple_is_isolated_by_network_namespace(void) {
     reset();
     connection_info_t connection = {};
@@ -512,6 +531,7 @@ int main(void) {
     test_newer_candidate_replaces_consumed_tombstone();
     test_late_old_candidate_makes_pending_new_request_ambiguous();
     test_map_pressure_fails_closed();
+    test_generation_collision_preserves_existing_candidate();
     test_identical_tuple_is_isolated_by_network_namespace();
     test_publication_during_claim_fails_closed();
     test_publication_during_invalidation_does_not_leak_marker();

@@ -38,9 +38,10 @@ RUN case "$BUILDARCH" in \
 # Build the Java OBI agent
 FROM gradle:9.6.1-jdk21-noble@sha256:d3e4ec60a75f6ada80f52e3c648ccfcbeaff4bc0d8e0f5ce55f81994763daf3c AS javaagent-builder
 
-WORKDIR /build
+WORKDIR /workspace/pkg/internal/java
 
 # Copy build files
+COPY LICENSE NOTICE /workspace/
 COPY pkg/internal/java .
 
 # Pre-built native library from jni-builder stage
@@ -48,7 +49,7 @@ COPY --from=jni-builder /build/target/classes/native/linux-amd64/libobijni.so ag
 COPY --from=jni-builder /build/target/classes/native/linux-aarch64/libobijni.so agent/target/classes/native/linux-aarch64/libobijni.so
 
 # Build the project (skip native lib compilation, already done above)
-RUN gradle build -x buildNativeLib-amd64 -x buildNativeLib-aarch64 --no-daemon
+RUN gradle build -x buildNativeLib-amd64 -x buildNativeLib-aarch64 -x nativeTest --no-daemon
 
 # Build the autoinstrumenter binary
 FROM ghcr.io/open-telemetry/obi-generator:${TAG} AS builder
@@ -71,7 +72,7 @@ COPY bpf/ bpf/
 COPY cmd/ cmd/
 COPY pkg/ pkg/
 COPY Makefile dependencies.Dockerfile ./
-COPY --from=javaagent-builder /build/build/obi-java-agent.jar /src/pkg/internal/java/embedded/obi-java-agent.jar
+COPY --from=javaagent-builder /workspace/pkg/internal/java/build/obi-java-agent.jar /src/pkg/internal/java/embedded/obi-java-agent.jar
 
 # Build
 RUN --mount=type=cache,target=/root/.cache/go-build \

@@ -7,6 +7,8 @@ on:
     branches: ["main", "release-*"]
     paths:
       - "pkg/internal/java/**"
+      - ".dockerignore"
+      - "javaagent.Dockerfile"
       - ".github/workflows/java-agent.yml"
   workflow_dispatch:
   workflow_call:
@@ -65,18 +67,19 @@ jobs:
           echo "image=$gradle_image" >> "$GITHUB_OUTPUT"
           echo "version=$gradle_version" >> "$GITHUB_OUTPUT"
 
+      - name: Set up JDK ${{ matrix.test-java }} for testing
+        id: test-jdk
+        uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5.5.0
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.test-java }}
+
       - name: Set up JDK for running Gradle
         id: gradle-jdk
         uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5.5.0
         with:
           distribution: temurin
           java-version-file: pkg/internal/java/.java-version
-
-      - name: Set up JDK ${{ matrix.test-java }} for testing
-        uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5.5.0
-        with:
-          distribution: temurin
-          java-version: ${{ matrix.test-java }}
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
@@ -91,22 +94,57 @@ jobs:
 
       - name: Check code formatting (Spotless)
         env:
-          GRADLE_OPTS: -Dorg.gradle.java.home=${{ steps.gradle-jdk.outputs.path }}
+          JAVA_HOME: ${{ steps.gradle-jdk.outputs.path }}
         run: gradle spotlessCheck --no-daemon --stacktrace
 
       - name: Build agent
         env:
-          GRADLE_OPTS: -Dorg.gradle.java.home=${{ steps.gradle-jdk.outputs.path }}
+          JAVA_HOME: ${{ steps.gradle-jdk.outputs.path }}
         run: gradle build -x test --no-daemon --stacktrace
+
+      - name: Verify Docker build ignores local Java outputs
+        if: matrix.test-java == 21
+        working-directory: .
+        run: |
+          set -euo pipefail
+
+          work_dir="$(mktemp -d)"
+          trap 'rm -rf "${work_dir}"' EXIT
+          mkdir -p "${work_dir}/clean-context" "${work_dir}/clean" "${work_dir}/dirty"
+          git archive HEAD | tar -x -C "${work_dir}/clean-context"
+
+          docker build \
+            --output "type=local,dest=${work_dir}/clean" \
+            --target export \
+            -f "${work_dir}/clean-context/javaagent.Dockerfile" \
+            "${work_dir}/clean-context"
+
+          mkdir -p pkg/internal/java/extension/build/untracked
+          printf 'must not affect Docker context\n' \
+            > pkg/internal/java/extension/build/untracked/context-marker
+          mkdir -p pkg/internal/java/loader/src/main/resources/agent
+          printf 'stale generated agent must not affect Docker context\n' \
+            > pkg/internal/java/loader/src/main/resources/agent/agent.zip
+          docker build \
+            --output "type=local,dest=${work_dir}/dirty" \
+            --target export \
+            -f javaagent.Dockerfile \
+            .
+
+          cmp "${work_dir}/clean/obi-java-agent.jar" "${work_dir}/dirty/obi-java-agent.jar"
+          cmp "${work_dir}/clean/obi-otel-extension.jar" \
+            "${work_dir}/dirty/obi-otel-extension.jar"
 
       - name: Run tests on JDK ${{ matrix.test-java }}
         env:
-          GRADLE_OPTS: -Dorg.gradle.java.home=${{ steps.gradle-jdk.outputs.path }}
+          JAVA_HOME: ${{ steps.gradle-jdk.outputs.path }}
+          OBI_TEST_JAVA_HOME: ${{ steps.test-jdk.outputs.path }}
+          OBI_TEST_JAVA_VERSION: ${{ matrix.test-java }}
         run: |
           cat > /tmp/obi-test-jvm.init.gradle <<'EOF'
           allprojects {
             tasks.withType(Test).configureEach {
-              executable = System.getenv("JAVA_HOME") + "/bin/java"
+              executable = System.getenv("OBI_TEST_JAVA_HOME") + "/bin/java"
             }
           }
           EOF
@@ -117,6 +155,8 @@ jobs:
         if: matrix.test-java == 21
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: obi-java-agent
-          path: pkg/internal/java/build/obi-java-agent.jar
+          name: obi-java-artifacts
+          path: |
+            pkg/internal/java/build/obi-java-agent.jar
+            pkg/internal/java/build/obi-otel-extension.jar
           retention-days: 7

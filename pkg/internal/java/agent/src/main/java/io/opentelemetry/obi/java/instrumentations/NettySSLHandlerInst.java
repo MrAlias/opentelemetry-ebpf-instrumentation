@@ -37,6 +37,7 @@ public class NettySSLHandlerInst {
   public static final class UnwrapAdvice {
     @Advice.OnMethodEnter(suppress = Throwable.class)
     public static void unwrap(@Advice.Argument(0) final Object ctx) {
+      SSLStorage.beginNettyConnectionScope();
       try {
         if (SSLStorage.getBootDebugOn().get(null).equals(true)) {
           System.err.println("[NettySSLHandlerInst] Netty SSL handler unwrap");
@@ -55,22 +56,17 @@ public class NettySSLHandlerInst {
                 SSLStorage.getBootNettyConnectionField()
                     .get(null); // static field, so null as instance
         threadLocal.set(c);
-      } catch (Exception x) {
-        System.err.println("[NettySSLHandlerInst] Failed unwrap enter: " + x.getMessage());
+      } catch (Throwable failure) {
+        SSLStorage.logNettyAdviceFailure("enter Netty unwrap", failure);
       }
     }
 
-    @Advice.OnMethodExit(suppress = Throwable.class)
-    public static void unwrap() {
+    @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
+    public static void unwrap(@Advice.Thrown Throwable throwable) {
       try {
-        @SuppressWarnings("unchecked")
-        ThreadLocal<Object> threadLocal =
-            (ThreadLocal<Object>)
-                SSLStorage.getBootNettyConnectionField()
-                    .get(null); // static field, so null as instance
-        threadLocal.remove();
-      } catch (Exception x) {
-        System.err.println("[NettySSLHandlerInst] Failed unwrap exit: " + x.getMessage());
+        SSLStorage.endNettyConnectionScope();
+      } catch (Throwable failure) {
+        SSLStorage.logNettyAdviceFailure("exit Netty unwrap", failure);
       }
     }
   }
@@ -78,6 +74,7 @@ public class NettySSLHandlerInst {
   public static final class WrapAdvice {
     @Advice.OnMethodEnter(suppress = Throwable.class)
     public static void wrap(@Advice.Argument(0) final Object ctx) {
+      SSLStorage.beginNettyConnectionScope();
       try {
         if (SSLStorage.getBootDebugOn().get(null).equals(true)) {
           System.err.println("[NettySSLHandlerInst] Netty SSL handler wrap");
@@ -97,22 +94,17 @@ public class NettySSLHandlerInst {
                 SSLStorage.getBootNettyConnectionField()
                     .get(null); // static field, so null as instance
         threadLocal.set(c);
-      } catch (Exception x) {
-        System.err.println("[NettySSLHandlerInst] Failed wrap enter: " + x.getMessage());
+      } catch (Throwable failure) {
+        SSLStorage.logNettyAdviceFailure("enter Netty wrap", failure);
       }
     }
 
-    @Advice.OnMethodExit(suppress = Throwable.class)
-    public static void wrap() {
+    @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
+    public static void wrap(@Advice.Thrown Throwable throwable) {
       try {
-        @SuppressWarnings("unchecked")
-        ThreadLocal<Object> threadLocal =
-            (ThreadLocal<Object>)
-                SSLStorage.getBootNettyConnectionField()
-                    .get(null); // static field, so null as instance
-        threadLocal.remove();
-      } catch (Exception x) {
-        System.err.println("[NettySSLHandlerInst] Failed wrap exit: " + x.getMessage());
+        SSLStorage.endNettyConnectionScope();
+      } catch (Throwable failure) {
+        SSLStorage.logNettyAdviceFailure("exit Netty wrap", failure);
       }
     }
   }

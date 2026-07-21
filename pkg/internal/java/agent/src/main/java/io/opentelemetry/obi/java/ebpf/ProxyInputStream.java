@@ -5,7 +5,7 @@
 
 package io.opentelemetry.obi.java.ebpf;
 
-import io.opentelemetry.obi.java.Agent;
+import io.opentelemetry.obi.java.BootstrapNative;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.Socket;
@@ -45,7 +45,7 @@ public class ProxyInputStream extends InputStream {
   void forwardRead(byte[] b, int off, int len) {
     NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize + len);
     writeReadPacket(p, socket, b, off, len);
-    Agent.NativeLib.ioctl(0, Agent.IOCTL_CMD, p.getAddress());
+    BootstrapNative.emitData(socket, p.getAddress(), true);
   }
 
   static int writeReadPacket(NativeMemory p, Socket socket, byte[] b, int off, int len) {

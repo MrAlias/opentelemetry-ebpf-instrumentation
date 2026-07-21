@@ -17,21 +17,23 @@ import org.junit.jupiter.api.Test;
 // ───────────────────────────────────────────────────────────────
 //   0        1B      0x01     OperationType.SEND.code
 //                           ┌─────────────────────────────┐
-//   1       36B      ...    |ConnectionInfo (36 bytes)    │ packetPrefixSize
-//                           │ (socket connection data)    │ = 1 + 36 + 4
+//   1       36B      ...    |ConnectionInfo (36 bytes)    │
+//                           │ (socket connection data)    │
 //                           └─────────────────────────────┘
 //  37        4B      0x01     Buffer length (int = 1)
+//  41        8B      0x00     Native data-signal nonce
 //                           ┌─────────────────────────────┐
-//  41        1B      0x2A   |Data byte: 42                │ Actual payload
+//  49        1B      0x2A   |Data byte: 42                │ Actual payload
 //                           └─────────────────────────────┘
 
-// Total size: 1 + 36 + 4 + 1 = 42 bytes
+// Total size: 1 + 36 + 4 + 8 + 1 = 50 bytes
 
 // Test assertions:
 // ───────────────────────────────────────────────────────────────
 // p.getByte(0)           → 1    (OperationType.SEND)
 // p.getInt(1 + 36)       → 1    (Buffer length at offset 37)
-// p.getByte(1 + 36 + 4)  → 42   (Data byte at offset 41)
+// p.getLong(1 + 36 + 4)  → 0    (Nonce initialized for native code)
+// p.getByte(packetPrefixSize) → 42 (Data byte at offset 49)
 
 class IOCTLPacketTest {
 
@@ -46,7 +48,8 @@ class IOCTLPacketTest {
 
     assertEquals(IOCTLPacket.packetPrefixSize, newOff);
     assertEquals(type.code, mem.getByte(0));
-    assertEquals(bufLen, mem.getInt(1 + 36));
+    assertEquals(bufLen, mem.getInt(IOCTLPacket.bufferLengthOffset));
+    assertEquals(0L, mem.getLong(IOCTLPacket.dataSignalOffset));
   }
 
   @Test
@@ -60,7 +63,8 @@ class IOCTLPacketTest {
 
     assertEquals(IOCTLPacket.packetPrefixSize, newOff);
     assertEquals(type.code, mem.getByte(0));
-    assertEquals(bufLen, mem.getInt(1 + 36));
+    assertEquals(bufLen, mem.getInt(IOCTLPacket.bufferLengthOffset));
+    assertEquals(0L, mem.getLong(IOCTLPacket.dataSignalOffset));
   }
 
   @Test
@@ -74,7 +78,8 @@ class IOCTLPacketTest {
 
     assertEquals(IOCTLPacket.packetPrefixSize, newOff);
     assertEquals(type.code, mem.getByte(0));
-    assertEquals(bufLen, mem.getInt(1 + 36));
+    assertEquals(bufLen, mem.getInt(IOCTLPacket.bufferLengthOffset));
+    assertEquals(0L, mem.getLong(IOCTLPacket.dataSignalOffset));
   }
 
   @Test

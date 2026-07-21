@@ -12,7 +12,21 @@ public enum OperationType {
   // virtual thread mounted on the calling carrier; payload = its logical id
   VT_MOUNT((byte) 4),
   // virtual thread unmounted from the calling carrier; payload unused
-  VT_UNMOUNT((byte) 5);
+  VT_UNMOUNT((byte) 5),
+  // capture the calling task's exact remote-parent generation under an opaque token
+  TASK_CAPTURE((byte) 6),
+  // discard an unused submission-time handoff token
+  TASK_CANCEL((byte) 7),
+  // link a worker through a captured token; token zero is fail-closed
+  TASK_LINK((byte) 8),
+  // snapshot only the calling worker's existing exact task relay under a new token
+  TASK_RELAY_CAPTURE((byte) 9),
+  // register a nonzero token that distinguishes this JVM from later PID reuse
+  PROCESS_REGISTER((byte) 10),
+  // the full-width virtual-thread id has permanently completed
+  VT_TERMINATE((byte) 11),
+  // fail closed by removing the calling logical task's inherited context
+  TASK_UNLINK((byte) 12);
 
   public final byte code;
 

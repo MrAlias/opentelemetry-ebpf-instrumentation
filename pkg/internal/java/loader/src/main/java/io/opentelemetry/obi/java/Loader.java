@@ -12,16 +12,26 @@ import java.net.URLClassLoader;
 import java.nio.file.Files;
 
 public class Loader {
-  public static void agentCaller(String function, String agentArgs, Instrumentation inst) {
-    String agentResourcePath = "agent/agent.zip";
+  private static Class<?> agentClass;
+  private static URLClassLoader agentClassLoader;
 
+  public static void agentCaller(String function, String agentArgs, Instrumentation inst) {
     try {
-      Class.forName("io.opentelemetry.obi.java.Agent", false, Loader.class.getClassLoader());
-      System.err.println("agent already loaded, ignoring load request.");
-      return;
-    } catch (ClassNotFoundException ignore) {
+      Class<?> mainClass = loadAgentClass();
+      java.lang.reflect.Method mainMethod =
+          mainClass.getMethod(function, String.class, Instrumentation.class);
+      mainMethod.invoke(null, agentArgs, inst);
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  private static synchronized Class<?> loadAgentClass() throws Exception {
+    if (agentClass != null) {
+      return agentClass;
     }
 
+    String agentResourcePath = "agent/agent.zip";
     File tempAgentJar;
     try (InputStream agentJarStream =
         Loader.class.getClassLoader().getResourceAsStream(agentResourcePath)) {
@@ -30,7 +40,6 @@ public class Loader {
       }
 
       tempAgentJar = Files.createTempFile("agent", ".jar").toFile();
-      tempAgentJar.deleteOnExit();
       try (OutputStream out = Files.newOutputStream(tempAgentJar.toPath())) {
         byte[] buffer = new byte[8192];
         int len;
@@ -38,22 +47,21 @@ public class Loader {
           out.write(buffer, 0, len);
         }
       }
-    } catch (IOException e) {
-      throw new RuntimeException(e);
     }
 
+    URLClassLoader loader =
+        new URLClassLoader(new URL[] {tempAgentJar.toURI().toURL()}, Loader.class.getClassLoader());
     try {
-      URL agentJarUrl = tempAgentJar.toURI().toURL();
-      try (URLClassLoader agentClassLoader =
-          new URLClassLoader(new URL[] {agentJarUrl}, Loader.class.getClassLoader())) {
-        Class<?> mainClass = agentClassLoader.loadClass("io.opentelemetry.obi.java.Agent");
-
-        java.lang.reflect.Method mainMethod =
-            mainClass.getMethod(function, String.class, Instrumentation.class);
-        mainMethod.invoke(null, agentArgs, inst);
+      agentClass = loader.loadClass("io.opentelemetry.obi.java.Agent");
+      agentClassLoader = loader;
+      tempAgentJar.deleteOnExit();
+      return agentClass;
+    } catch (Exception failure) {
+      loader.close();
+      if (!tempAgentJar.delete()) {
+        tempAgentJar.deleteOnExit();
       }
-    } catch (Exception e) {
-      throw new RuntimeException(e);
+      throw failure;
     }
   }
 

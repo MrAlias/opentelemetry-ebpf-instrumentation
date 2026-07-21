@@ -6,11 +6,18 @@
 package javaagent
 
 import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -21,6 +28,221 @@ import (
 	"go.opentelemetry.io/obi/pkg/ebpf"
 	"go.opentelemetry.io/obi/pkg/obi"
 )
+
+type blockingTestAttacher struct {
+	initialized bool
+	cleaned     bool
+	deadline    bool
+}
+
+type responseTestAttacher struct {
+	response string
+}
+
+type lifecycleTestAttacher struct {
+	responses    []string
+	active       bool
+	initCalls    int
+	attachCalls  int
+	cleanupCalls int
+}
+
+type testJavaAgentTarget struct {
+	readErr  error
+	chmodErr error
+	closeErr error
+	closed   bool
+}
+
+func (t *testJavaAgentTarget) ReadFrom(io.Reader) (int64, error) {
+	return 0, t.readErr
+}
+
+func (t *testJavaAgentTarget) Chmod(os.FileMode) error {
+	return t.chmodErr
+}
+
+func (t *testJavaAgentTarget) Close() error {
+	t.closed = true
+	return t.closeErr
+}
+
+func (a *responseTestAttacher) Init() {}
+
+func (a *responseTestAttacher) Cleanup() error { return nil }
+
+func (a *responseTestAttacher) AttachContext(
+	context.Context, int, []string, bool,
+) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader(a.response)), nil
+}
+
+func (a *lifecycleTestAttacher) Init() {
+	if a.active {
+		panic("attacher initialized before previous credentials were restored")
+	}
+	a.active = true
+	a.initCalls++
+}
+
+func (a *lifecycleTestAttacher) Cleanup() error {
+	if !a.active {
+		return errors.New("attacher cleanup without initialization")
+	}
+	a.active = false
+	a.cleanupCalls++
+	return nil
+}
+
+func (a *lifecycleTestAttacher) AttachContext(
+	context.Context, int, []string, bool,
+) (io.ReadCloser, error) {
+	if !a.active {
+		return nil, errors.New("attach without initialized credentials")
+	}
+	if a.attachCalls >= len(a.responses) {
+		return nil, errors.New("unexpected attach call")
+	}
+	response := a.responses[a.attachCalls]
+	a.attachCalls++
+	return io.NopCloser(strings.NewReader(response)), nil
+}
+
+func (a *blockingTestAttacher) Init() {
+	a.initialized = true
+}
+
+func (a *blockingTestAttacher) Cleanup() error {
+	a.cleaned = true
+	return nil
+}
+
+func (a *blockingTestAttacher) AttachContext(
+	ctx context.Context, _ int, _ []string, _ bool,
+) (io.ReadCloser, error) {
+	_, a.deadline = ctx.Deadline()
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestJavaInjectorAttachUsesConfiguredDeadlineAndCleansUp(t *testing.T) {
+	attacher := &blockingTestAttacher{}
+	originalFactory := newJavaAttacher
+	newJavaAttacher = func(*slog.Logger) javaAttacher { return attacher }
+	t.Cleanup(func() { newJavaAttacher = originalFactory })
+
+	injector := &JavaInjector{
+		cfg: &obi.Config{Java: obi.JavaConfig{Timeout: 10 * time.Millisecond}},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	ie := &ebpf.Instrumentable{
+		FileInfo: exec.New(exec.Init{Pid: 123}),
+		Type:     svc.InstrumentableJava,
+	}
+	ie.FileInfo.SetJavaAgentCapability(17)
+
+	started := time.Now()
+	err := injector.NewExecutable(ie)
+	require.ErrorContains(t, err, "java attach timed out")
+	assert.Less(t, time.Since(started), time.Second)
+	assert.True(t, attacher.initialized)
+	assert.True(t, attacher.deadline)
+	assert.True(t, attacher.cleaned)
+}
+
+func TestJavaInjectorPreparesStableProcessCapability(t *testing.T) {
+	injector := &JavaInjector{}
+	ie := &ebpf.Instrumentable{
+		FileInfo: exec.New(exec.Init{Pid: 123}),
+		Type:     svc.InstrumentableJava,
+	}
+
+	require.NoError(t, injector.PrepareExecutable(ie))
+	capability := ie.FileInfo.JavaAgentCapability()
+	require.NotZero(t, capability)
+	require.NoError(t, injector.PrepareExecutable(ie))
+	assert.Equal(t, capability, ie.FileInfo.JavaAgentCapability())
+}
+
+func TestAttachOptionsIncludeProcessCapability(t *testing.T) {
+	injector := &JavaInjector{cfg: &obi.Config{Java: obi.JavaConfig{}}}
+
+	opts, err := injector.attachOptsWithCapability(123, 42)
+	require.NoError(t, err)
+	assert.Contains(t, opts, "processCapability=42")
+}
+
+func TestAttachJDKAgentRequiresProtocolAcknowledgement(t *testing.T) {
+	tests := []struct {
+		name          string
+		response      string
+		errorContains string
+	}{
+		{name: "HotSpot success", response: "0\n"},
+		{name: "OpenJ9 success", response: "ATTACH_ACK\x00"},
+		{name: "HotSpot nonzero status", response: "17\n", errorContains: "status 17"},
+		{name: "agent nonzero return code", response: "0\nreturn code: 42\n", errorContains: "return code 42"},
+		{name: "empty HotSpot response", response: "", errorContains: "without a status"},
+		{name: "missing HotSpot status", response: "return code: 0\n", errorContains: "without a status"},
+		{name: "empty OpenJ9 response", response: "\x00", errorContains: "without ATTACH_ACK"},
+		{name: "truncated OpenJ9 response", response: "ATTACH_AC\x00", errorContains: "without ATTACH_ACK"},
+		{
+			name:          "oversized response",
+			response:      strings.Repeat("x", maxJVMAttachResponseBytes+1),
+			errorContains: "exceeds 65536 bytes",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			injector := &JavaInjector{
+				cfg: &obi.Config{},
+				log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			}
+			err := injector.attachJDKAgent(
+				context.Background(), &responseTestAttacher{response: test.response}, 123, "/agent.jar",
+			)
+			if test.errorContains == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, test.errorContains)
+		})
+	}
+}
+
+func TestJavaInjectorRestoresCredentialsAfterEveryAttachCommand(t *testing.T) {
+	attacher := &lifecycleTestAttacher{responses: []string{
+		"JDK 21\n",
+		"",
+		"0\n",
+	}}
+	injector := &JavaInjector{
+		cfg: &obi.Config{},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	supported, jdk8, err := injector.verifyJVMVersion(
+		context.Background(), attacher, 123,
+	)
+	require.NoError(t, err)
+	require.True(t, supported)
+	require.False(t, jdk8)
+	require.False(t, attacher.active)
+
+	loaded, err := injector.jdkAgentAlreadyLoaded(context.Background(), attacher, 123)
+	require.NoError(t, err)
+	require.False(t, loaded)
+	require.False(t, attacher.active)
+
+	require.NoError(t, injector.attachJDKAgent(
+		context.Background(), attacher, 123, "/agent.jar",
+	))
+	require.False(t, attacher.active)
+	require.Equal(t, 3, attacher.initCalls)
+	require.Equal(t, 3, attacher.attachCalls)
+	require.Equal(t, 3, attacher.cleanupCalls)
+}
 
 func TestJavaInjector_CopyAgent(t *testing.T) {
 	oldJavaAgentBytes := embeddedJavaAgentBytes
@@ -37,6 +259,7 @@ func TestJavaInjector_CopyAgent(t *testing.T) {
 		expectError   bool
 		errorContains string
 		verifyFile    bool
+		verifyOutside bool
 	}{
 		{
 			name: "successful copy to /tmp",
@@ -171,6 +394,31 @@ func TestJavaInjector_CopyAgent(t *testing.T) {
 			expectError: false,
 			verifyFile:  true,
 		},
+		{
+			name: "TMPDIR symlink component outside process root is rejected",
+			setupTempDir: func(t *testing.T, _ app.PID) string {
+				tmpDir := t.TempDir()
+				procRoot := filepath.Join(tmpDir, "proc", "root")
+				require.NoError(t, os.MkdirAll(filepath.Join(procRoot, "custom"), 0o755))
+
+				outsideDir := filepath.Join(tmpDir, "outside")
+				require.NoError(t, os.MkdirAll(outsideDir, 0o755))
+				require.NoError(t, os.WriteFile(
+					filepath.Join(outsideDir, ObiJavaAgentFileName),
+					[]byte("do not overwrite"),
+					0o644,
+				))
+				require.NoError(t, os.Symlink(outsideDir, filepath.Join(procRoot, "custom", "tmp")))
+				return tmpDir
+			},
+			envVars: map[string]string{
+				"TMPDIR": "/custom/tmp",
+			},
+			pid:           1000,
+			expectError:   true,
+			errorContains: "error accessing temp directory",
+			verifyOutside: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -234,8 +482,56 @@ func TestJavaInjector_CopyAgent(t *testing.T) {
 					}
 				}
 			}
+
+			if tt.verifyOutside {
+				outsideAgent := filepath.Join(tmpDir, "outside", ObiJavaAgentFileName)
+				content, readErr := os.ReadFile(outsideAgent)
+				require.NoError(t, readErr)
+				assert.Equal(t, []byte("do not overwrite"), content)
+			}
 		})
 	}
+}
+
+func TestPopulateJavaAgentTargetClosesOnEveryFailure(t *testing.T) {
+	testError := errors.New("injected target failure")
+	closeError := errors.New("injected close failure")
+
+	for _, test := range []struct {
+		name       string
+		target     *testJavaAgentTarget
+		wantDetail string
+	}{
+		{
+			name:       "write",
+			target:     &testJavaAgentTarget{readErr: testError},
+			wantDetail: "writing java agent",
+		},
+		{
+			name:       "permissions",
+			target:     &testJavaAgentTarget{chmodErr: testError},
+			wantDetail: "setting permissions",
+		},
+		{
+			name:       "close",
+			target:     &testJavaAgentTarget{closeErr: closeError},
+			wantDetail: "closing target",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := populateJavaAgentTarget(test.target, strings.NewReader("agent"))
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), test.wantDetail)
+			assert.True(t, test.target.closed)
+		})
+	}
+
+	target := &testJavaAgentTarget{readErr: testError, closeErr: closeError}
+	err := populateJavaAgentTarget(target, strings.NewReader("agent"))
+	require.ErrorIs(t, err, testError)
+	require.ErrorIs(t, err, closeError)
+	assert.True(t, target.closed)
 }
 
 func TestJavaInjector_FindTempDir(t *testing.T) {
@@ -427,6 +723,27 @@ func TestDirOK(t *testing.T) {
 			expected: false,
 		},
 		{
+			name: "symlink directory is rejected",
+			setupDirs: func(t *testing.T) (string, string) {
+				root := t.TempDir()
+				outside := t.TempDir()
+				require.NoError(t, os.Symlink(outside, filepath.Join(root, "linked")))
+				return root, "/linked"
+			},
+			expected: false,
+		},
+		{
+			name: "intermediate symlink directory is rejected",
+			setupDirs: func(t *testing.T) (string, string) {
+				root := t.TempDir()
+				outside := t.TempDir()
+				require.NoError(t, os.Mkdir(filepath.Join(outside, "nested"), 0o755))
+				require.NoError(t, os.Symlink(outside, filepath.Join(root, "linked")))
+				return root, "/linked/nested"
+			},
+			expected: false,
+		},
+		{
 			name: "directory with no permissions",
 			setupDirs: func(t *testing.T) (string, string) {
 				root := t.TempDir()
@@ -454,35 +771,68 @@ func TestDirOK(t *testing.T) {
 }
 
 func TestJavaInjector_AttachOpts(t *testing.T) {
+	serverUID := strconv.Itoa(os.Geteuid())
+	originalUIDMapReader := readUIDMapForPID
+	readUIDMapForPID = func(app.PID) ([]byte, error) {
+		return []byte("0 0 4294967295\n"), nil
+	}
+	t.Cleanup(func() { readUIDMapForPID = originalUIDMapReader })
+
 	tests := []struct {
-		name     string
-		debug    bool
-		debugBB  bool
-		expected string
+		name         string
+		debug        bool
+		debugBB      bool
+		remoteParent obi.JavaRemoteParentConfig
+		expected     string
 	}{
 		{
 			name:     "no options enabled",
 			debug:    false,
 			debugBB:  false,
-			expected: "",
+			expected: "=remoteParentTransport=disabled",
 		},
 		{
 			name:     "debug only",
 			debug:    true,
 			debugBB:  false,
-			expected: "=debug=true",
+			expected: "=debug=true,remoteParentTransport=disabled",
 		},
 		{
 			name:     "debugBB only",
 			debug:    false,
 			debugBB:  true,
-			expected: "=debugBB=true",
+			expected: "=debugBB=true,remoteParentTransport=disabled",
 		},
 		{
 			name:     "both options enabled",
 			debug:    true,
 			debugBB:  true,
-			expected: "=debug=true,debugBB=true",
+			expected: "=debug=true,debugBB=true,remoteParentTransport=disabled",
+		},
+		{
+			name: "remote parent options",
+			remoteParent: obi.JavaRemoteParentConfig{
+				Transport:  obi.JavaRemoteParentUnix,
+				SocketPath: "/run/obi/remote-parent.sock",
+				Timeout:    7 * time.Millisecond,
+			},
+			expected: "=remoteParentTransport=unix,remoteParentServerUid=" + serverUID + ",remoteParentSocket=/run/obi/remote-parent.sock,remoteParentTimeoutMillis=7",
+		},
+		{
+			name: "sub-millisecond timeout is rounded up",
+			remoteParent: obi.JavaRemoteParentConfig{
+				Transport: obi.JavaRemoteParentGetsockopt,
+				Timeout:   time.Microsecond,
+			},
+			expected: "=remoteParentTransport=getsockopt,remoteParentTimeoutMillis=1",
+		},
+		{
+			name: "timeout longer than one second is preserved",
+			remoteParent: obi.JavaRemoteParentConfig{
+				Transport: obi.JavaRemoteParentUnix,
+				Timeout:   1500 * time.Millisecond,
+			},
+			expected: "=remoteParentTransport=unix,remoteParentServerUid=" + serverUID + ",remoteParentTimeoutMillis=1500",
 		},
 	}
 
@@ -492,18 +842,294 @@ func TestJavaInjector_AttachOpts(t *testing.T) {
 				Java: obi.JavaConfig{
 					Debug:                tt.debug,
 					DebugInstrumentation: tt.debugBB,
+					RemoteParent:         tt.remoteParent,
 				},
 			}
 
 			injector := &JavaInjector{
-				cfg: cfg,
-				log: slog.With("component", "javaagent.Injector"),
+				cfg:                   cfg,
+				log:                   slog.With("component", "javaagent.Injector"),
+				remoteParentServerUID: os.Geteuid(),
 			}
 
-			result := injector.attachOpts()
+			result, err := injector.attachOptsWithCapability(123, 0)
+			require.NoError(t, err)
 			assert.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+func TestJavaInjectorAttachOptsPreservesConfiguredSocketAlias(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "run")
+	require.NoError(t, os.Mkdir(target, 0o700))
+	alias := filepath.Join(root, "var-run")
+	require.NoError(t, os.Symlink(target, alias))
+	socketPath := filepath.Join(alias, "obi", "bridge.sock")
+
+	cfg, err := obi.LoadConfig(bytes.NewBufferString(fmt.Sprintf(`
+executable_path: java
+trace_printer: text
+ebpf:
+  context_propagation: tcp
+javaagent:
+  remote_parent:
+    transport: unix
+    socket_path: %s
+`, socketPath)))
+	require.NoError(t, err)
+	require.NoError(t, cfg.Validate())
+	require.Equal(t, socketPath, cfg.Java.RemoteParent.SocketPath)
+
+	originalUIDMapReader := readUIDMapForPID
+	readUIDMapForPID = func(app.PID) ([]byte, error) {
+		return []byte("0 0 4294967295\n"), nil
+	}
+	t.Cleanup(func() { readUIDMapForPID = originalUIDMapReader })
+
+	injector := &JavaInjector{
+		cfg:                   cfg,
+		log:                   slog.With("component", "javaagent.Injector"),
+		remoteParentServerUID: os.Geteuid(),
+	}
+	opts, err := injector.attachOptsWithCapability(123, 0)
+	require.NoError(t, err)
+	assert.Contains(t, opts, "remoteParentSocket="+socketPath)
+	assert.NotContains(t, opts, "remoteParentSocket="+filepath.Join(target, "obi", "bridge.sock"))
+}
+
+func TestJavaInjector_RemoteParentServerUIDRemainsStable(t *testing.T) {
+	const serverUID = 1000
+	originalUIDMapReader := readUIDMapForPID
+	readUIDMapForPID = func(app.PID) ([]byte, error) {
+		return []byte("0 0 4294967295\n"), nil
+	}
+	t.Cleanup(func() { readUIDMapForPID = originalUIDMapReader })
+
+	injector := &JavaInjector{
+		cfg: &obi.Config{
+			Java: obi.JavaConfig{
+				RemoteParent: obi.JavaRemoteParentConfig{
+					Transport: obi.JavaRemoteParentUnix,
+				},
+			},
+		},
+		remoteParentServerUID: serverUID,
+	}
+
+	opts, err := injector.attachOptsWithCapability(123, 0)
+	require.NoError(t, err)
+	assert.Contains(t, opts, "remoteParentServerUid=1000")
+}
+
+func TestMapUID(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		uidMap        string
+		hostUID       int
+		want          uint64
+		errorContains string
+	}{
+		{
+			name:    "identity mapping",
+			uidMap:  "0 0 4294967295\n",
+			hostUID: 1000,
+			want:    1000,
+		},
+		{
+			name:    "translated mapping",
+			uidMap:  "0 100000 65536\n",
+			hostUID: 101234,
+			want:    1234,
+		},
+		{
+			name:    "selects matching range",
+			uidMap:  "0 100000 65536\n2000 2000 1\n",
+			hostUID: 2000,
+			want:    2000,
+		},
+		{
+			name:    "maximum target UID",
+			uidMap:  "4294967290 100 6\n",
+			hostUID: 105,
+			want:    4294967295,
+		},
+		{
+			name:          "unmapped host UID",
+			uidMap:        "0 100000 65536\n",
+			hostUID:       1000,
+			errorContains: "is not mapped",
+		},
+		{
+			name:          "malformed entry",
+			uidMap:        "0 100000\n",
+			hostUID:       1000,
+			errorContains: "invalid UID map entry",
+		},
+		{
+			name:          "zero length",
+			uidMap:        "0 0 0\n",
+			hostUID:       0,
+			errorContains: "mapping length is zero",
+		},
+		{
+			name:          "range exceeds UID space",
+			uidMap:        "4294967295 0 2\n",
+			hostUID:       0,
+			errorContains: "exceeds the UID address space",
+		},
+		{
+			name:          "negative host UID",
+			uidMap:        "0 0 1\n",
+			hostUID:       -1,
+			errorContains: "invalid host UID",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := mapUID(strings.NewReader(test.uidMap), test.hostUID)
+			if test.errorContains != "" {
+				require.ErrorContains(t, err, test.errorContains)
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, test.want, got)
+		})
+	}
+}
+
+func TestJavaInjectorAttachOptsTranslatesRemoteParentServerUID(t *testing.T) {
+	originalUIDMapReader := readUIDMapForPID
+	t.Cleanup(func() { readUIDMapForPID = originalUIDMapReader })
+
+	const targetPID app.PID = 123
+	readUIDMapForPID = func(pid app.PID) ([]byte, error) {
+		assert.Equal(t, targetPID, pid)
+		return []byte("0 100000 65536\n"), nil
+	}
+
+	injector := &JavaInjector{
+		cfg: &obi.Config{Java: obi.JavaConfig{RemoteParent: obi.JavaRemoteParentConfig{
+			Transport: obi.JavaRemoteParentUnix,
+		}}},
+		remoteParentServerUID: 101234,
+	}
+
+	opts, err := injector.attachOptsWithCapability(targetPID, 0)
+	require.NoError(t, err)
+	assert.Contains(t, opts, "remoteParentServerUid=1234")
+}
+
+func TestJavaInjectorAttachOptsFailsClosedForUnmappedRemoteParentUID(t *testing.T) {
+	originalUIDMapReader := readUIDMapForPID
+	t.Cleanup(func() { readUIDMapForPID = originalUIDMapReader })
+
+	readUIDMapForPID = func(app.PID) ([]byte, error) {
+		return []byte("0 100000 65536\n"), nil
+	}
+	injector := &JavaInjector{
+		cfg: &obi.Config{Java: obi.JavaConfig{RemoteParent: obi.JavaRemoteParentConfig{
+			Transport: obi.JavaRemoteParentUnix,
+		}}},
+		remoteParentServerUID: 1000,
+	}
+
+	_, err := injector.attachOptsWithCapability(123, 0)
+	require.ErrorContains(t, err, "host UID 1000 is not mapped")
+}
+
+func TestJavaInjectorAttachOptsFailsClosedWhenUIDMapCannotBeRead(t *testing.T) {
+	originalUIDMapReader := readUIDMapForPID
+	t.Cleanup(func() { readUIDMapForPID = originalUIDMapReader })
+
+	readUIDMapForPID = func(app.PID) ([]byte, error) {
+		return nil, os.ErrPermission
+	}
+	injector := &JavaInjector{
+		cfg: &obi.Config{Java: obi.JavaConfig{RemoteParent: obi.JavaRemoteParentConfig{
+			Transport: obi.JavaRemoteParentUnix,
+		}}},
+		remoteParentServerUID: 1000,
+	}
+
+	_, err := injector.attachOptsWithCapability(123, 0)
+	require.ErrorIs(t, err, os.ErrPermission)
+	require.ErrorContains(t, err, "read target UID map")
+}
+
+func TestJavaInjectorAttachOptsDoesNotMapUIDForForcedGetsockopt(t *testing.T) {
+	originalUIDMapReader := readUIDMapForPID
+	t.Cleanup(func() { readUIDMapForPID = originalUIDMapReader })
+
+	readUIDMapForPID = func(app.PID) ([]byte, error) {
+		return nil, errors.New("unexpected UID map read")
+	}
+	injector := &JavaInjector{
+		cfg: &obi.Config{Java: obi.JavaConfig{RemoteParent: obi.JavaRemoteParentConfig{
+			Transport: obi.JavaRemoteParentGetsockopt,
+		}}},
+		remoteParentServerUID: 1000,
+	}
+
+	opts, err := injector.attachOptsWithCapability(123, 0)
+	require.NoError(t, err)
+	assert.Equal(t, "=remoteParentTransport=getsockopt", opts)
+}
+
+func TestJavaInjectorAttachOptsDegradesAutoWhenUIDIsUnmapped(t *testing.T) {
+	originalUIDMapReader := readUIDMapForPID
+	t.Cleanup(func() { readUIDMapForPID = originalUIDMapReader })
+
+	readUIDMapForPID = func(app.PID) ([]byte, error) {
+		return []byte("0 100000 65536\n"), nil
+	}
+	injector := &JavaInjector{
+		cfg: &obi.Config{Java: obi.JavaConfig{RemoteParent: obi.JavaRemoteParentConfig{
+			Transport: obi.JavaRemoteParentAuto,
+		}}},
+		remoteParentServerUID: 1000,
+	}
+
+	opts, err := injector.attachOptsWithCapability(123, 0)
+	require.NoError(t, err)
+	assert.Equal(t, "=remoteParentTransport=getsockopt", opts)
+}
+
+func TestJavaInjectorAttachOptsDoesNotReadUIDMapWhenRemoteParentDisabled(t *testing.T) {
+	originalUIDMapReader := readUIDMapForPID
+	t.Cleanup(func() { readUIDMapForPID = originalUIDMapReader })
+
+	readUIDMapForPID = func(app.PID) ([]byte, error) {
+		return nil, errors.New("unexpected UID map read")
+	}
+	injector := &JavaInjector{
+		cfg:                   &obi.Config{},
+		remoteParentServerUID: 1000,
+	}
+
+	opts, err := injector.attachOptsWithCapability(123, 0)
+	require.NoError(t, err)
+	assert.NotContains(t, opts, "remoteParentServerUid")
+}
+
+func TestNewJavaInjector_CapturesRemoteParentServerUID(t *testing.T) {
+	originalEmbeddedBytes := embeddedJavaAgentBytes
+	embeddedJavaAgentBytes = []byte("test agent content")
+	t.Cleanup(func() {
+		embeddedJavaAgentBytes = originalEmbeddedBytes
+	})
+
+	injector, err := NewJavaInjector(&obi.Config{
+		Java: obi.JavaConfig{
+			Enabled: true,
+			RemoteParent: obi.JavaRemoteParentConfig{
+				Transport: obi.JavaRemoteParentUnix,
+			},
+		},
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, os.Geteuid(), injector.remoteParentServerUID)
 }
 
 func TestNewJavaInjector_Disabled(t *testing.T) {
@@ -515,6 +1141,73 @@ func TestNewJavaInjector_Disabled(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Nil(t, injector)
+}
+
+func TestNewJavaInjector_RejectsCommaInRemoteParentSocketPath(t *testing.T) {
+	for _, transport := range []obi.JavaRemoteParentTransport{"", obi.JavaRemoteParentUnix} {
+		injectionMode := "disabled"
+		if transport != "" {
+			injectionMode = "enabled"
+		}
+		t.Run(injectionMode, func(t *testing.T) {
+			injector, err := NewJavaInjector(&obi.Config{
+				Java: obi.JavaConfig{
+					Enabled: true,
+					RemoteParent: obi.JavaRemoteParentConfig{
+						Transport:  transport,
+						SocketPath: "/run/obi,remoteParentTransport=unix",
+					},
+				},
+			})
+
+			require.EqualError(t, err, "javaagent.remote_parent.socket_path must not contain a comma")
+			assert.Nil(t, injector)
+		})
+	}
+}
+
+func TestNewJavaInjector_RemoteParentTimeoutUpperBound(t *testing.T) {
+	originalEmbeddedBytes := embeddedJavaAgentBytes
+	embeddedJavaAgentBytes = []byte("test agent content")
+	t.Cleanup(func() {
+		embeddedJavaAgentBytes = originalEmbeddedBytes
+	})
+
+	for _, tc := range []struct {
+		name      string
+		timeout   time.Duration
+		wantError string
+	}{
+		{
+			name:    "maximum supported timeout",
+			timeout: time.Duration(maxJavaRemoteParentTimeoutMillis) * time.Millisecond,
+		},
+		{
+			name:      "timeout exceeding Java integer range",
+			timeout:   time.Duration(maxJavaRemoteParentTimeoutMillis+1) * time.Millisecond,
+			wantError: "javaagent.remote_parent.timeout must not exceed 2147483647ms",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			injector, err := NewJavaInjector(&obi.Config{
+				Java: obi.JavaConfig{
+					Enabled: true,
+					RemoteParent: obi.JavaRemoteParentConfig{
+						Transport: obi.JavaRemoteParentUnix,
+						Timeout:   tc.timeout,
+					},
+				},
+			})
+
+			if tc.wantError != "" {
+				require.EqualError(t, err, tc.wantError)
+				assert.Nil(t, injector)
+				return
+			}
+			require.NoError(t, err)
+			assert.NotNil(t, injector)
+		})
+	}
 }
 
 func TestNewJavaInjector_MissingEmbeddedAgent(t *testing.T) {

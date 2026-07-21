@@ -2,6 +2,8 @@
 # CMD: Default binary name is now "obi" (OpenTelemetry eBPF Instrumentation)
 CMD ?= obi
 JAVA_AGENT ?= obi-java-agent.jar
+JAVA_EXTENSION ?= obi-otel-extension.jar
+JAVA_EXTENSION_RELEASE_VERSION ?= $(RELEASE_VERSION)
 MAIN_GO_FILE ?= cmd/$(CMD)/main.go
 
 CACHE_CMD ?= k8s-cache
@@ -349,6 +351,7 @@ coverage-report-html: cov-exclude-generated
 JAVA_AGENT_DIR := pkg/internal/java
 JAVA_AGENT_EMBED_DIR := $(JAVA_AGENT_DIR)/embedded
 JAVA_AGENT_EMBED_PATH := $(JAVA_AGENT_EMBED_DIR)/$(JAVA_AGENT)
+JAVA_EXTENSION_EMBED_PATH := $(JAVA_AGENT_EMBED_DIR)/$(JAVA_EXTENSION)
 JAVA_AGENT_JAVA_VERSION := $(shell tr -d '[:space:]' < $(JAVA_AGENT_DIR)/.java-version)
 JAVA_AGENT_JAVA_HOME_CANDIDATES := /usr/lib/jvm/java-$(JAVA_AGENT_JAVA_VERSION)-openjdk /usr/lib/jvm/java-$(JAVA_AGENT_JAVA_VERSION)-openjdk-amd64
 JAVA_AGENT_JAVA_HOME_FALLBACK := $(shell ls -d /usr/lib/jvm/java-*-openjdk* 2>/dev/null | sort -V | tail -n 1)
@@ -361,12 +364,21 @@ java-build:
 	cd $(JAVA_AGENT_DIR) && $(JAVA_AGENT_GRADLE_ENV) gradle build -PnativeOnly=true
 	mkdir -p $(JAVA_AGENT_EMBED_DIR)
 	cp $(JAVA_AGENT_DIR)/build/$(JAVA_AGENT) $(JAVA_AGENT_EMBED_PATH)
+	cp $(JAVA_AGENT_DIR)/build/$(JAVA_EXTENSION) $(JAVA_EXTENSION_EMBED_PATH)
 
 .PHONY: java-docker-build
 java-docker-build:
-	@echo "### Building Java agent with Docker"
+	@echo "### Building Java agent and OpenTelemetry extension with Docker"
 	mkdir -p $(JAVA_AGENT_EMBED_DIR)
 	$(OCI_BIN) build --output type=local,dest=$(JAVA_AGENT_EMBED_DIR) --target=export -f javaagent.Dockerfile .
+	test -s $(JAVA_AGENT_EMBED_PATH)
+	test -s $(JAVA_EXTENSION_EMBED_PATH)
+
+.PHONY: java-release-extension
+java-release-extension: java-docker-build
+	@echo "### Staging OpenTelemetry Java extension release artifact"
+	mkdir -p $(RELEASE_DIR)
+	cp $(JAVA_EXTENSION_EMBED_PATH) $(RELEASE_DIR)/obi-otel-extension-$(JAVA_EXTENSION_RELEASE_VERSION).jar
 
 .PHONY: java-docker-sbom
 java-docker-sbom:
@@ -647,7 +659,7 @@ artifact: docker-generate java-docker-build compile
 	tar -C $$STAGING_DIR -czf bin/obi-$(RELEASE_VERSION)-$(GOOS)-$(GOARCH).tar.gz $(CMD) LICENSE NOTICE NOTICES
 
 .PHONY: release
-release: artifact
+release: artifact java-release-extension
 	@echo "### Moving artifacts to $(RELEASE_DIR) directory"
 	mkdir -p $(RELEASE_DIR)
 	mv bin/obi-$(RELEASE_VERSION)-$(GOOS)-$(GOARCH).tar.gz $(RELEASE_DIR)/
@@ -672,7 +684,8 @@ release: artifact
 
 .PHONY: release-source
 RELEASE_SOURCE_VERSION ?= $(shell git describe --tags --exact-match 2>/dev/null || git symbolic-ref --short -q HEAD || echo main)
-release-source: docker-generate java-docker-build
+release-source: JAVA_EXTENSION_RELEASE_VERSION := $(RELEASE_SOURCE_VERSION)
+release-source: docker-generate java-docker-build java-release-extension
 	@./scripts/release-source.sh --release-version "$(RELEASE_SOURCE_VERSION)" --release-dir "$(RELEASE_DIR)"
 	@$(MAKE) release-checksums RELEASE_VERSION=$(RELEASE_SOURCE_VERSION)
 
@@ -684,7 +697,9 @@ release-checksums:
 	files=$$(find . -maxdepth 1 \( \
 		-name 'obi-$(RELEASE_VERSION)-*.tar.gz' -o \
 		-name 'obi-$(RELEASE_VERSION)-*.cyclonedx.json' -o \
-		-name 'obi-java-agent-$(RELEASE_VERSION).cyclonedx.json' \
+		-name 'obi-java-agent-$(RELEASE_VERSION).cyclonedx.json' -o \
+		-name 'obi-otel-extension-$(RELEASE_VERSION).cyclonedx.json' -o \
+		-name 'obi-otel-extension-$(RELEASE_VERSION).jar' \
 	\) | sed 's|^\./||' | sort) && \
 	if [ -z "$$files" ]; then \
 		echo "ERROR: No release artifacts found for obi-$(RELEASE_VERSION) in $(RELEASE_DIR)"; \

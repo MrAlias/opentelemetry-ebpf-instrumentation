@@ -9,7 +9,9 @@ import io.opentelemetry.obi.java.instrumentations.data.Connection;
 import java.net.Socket;
 
 public class IOCTLPacket {
-  public static int packetPrefixSize = 1 + 36 + 4; // operation + connection_info_t + buf_len
+  public static final int bufferLengthOffset = 1 + 36;
+  public static final int dataSignalOffset = bufferLengthOffset + Integer.BYTES;
+  public static int packetPrefixSize = dataSignalOffset + Long.BYTES;
 
   public static int writePacketPrefix(
       NativeMemory mem, int off, OperationType type, Socket socket, int bufLen) {
@@ -26,6 +28,8 @@ public class IOCTLPacket {
     }
     mem.setInt(off, bufLen);
     off += 4;
+    mem.setLong(off, 0L);
+    off += Long.BYTES;
 
     return off;
   }
@@ -45,6 +49,8 @@ public class IOCTLPacket {
     }
     mem.setInt(off, bufLen);
     off += 4;
+    mem.setLong(off, 0L);
+    off += Long.BYTES;
 
     return off;
   }

@@ -102,6 +102,8 @@ pkg/internal/java/loader/build
 pkg/internal/java/loader/out
 pkg/internal/java/loader/src/main/resources/agent
 pkg/internal/java/.gradle
+pkg/internal/java/extension/build
+pkg/internal/java/embedded/obi-otel-extension.jar
 internal/test/integration/components/java_tls/netty_tls/target
 internal/test/integration/components/java_tls/sync_async_tls/target
 internal/test/integration/components/java_tls/jdk8/target

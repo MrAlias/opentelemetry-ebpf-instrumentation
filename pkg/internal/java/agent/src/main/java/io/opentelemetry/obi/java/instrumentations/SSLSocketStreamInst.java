@@ -5,7 +5,7 @@
 
 package io.opentelemetry.obi.java.instrumentations;
 
-import io.opentelemetry.obi.java.Agent;
+import io.opentelemetry.obi.java.BootstrapNative;
 import io.opentelemetry.obi.java.ebpf.IOCTLPacket;
 import io.opentelemetry.obi.java.ebpf.NativeMemory;
 import io.opentelemetry.obi.java.ebpf.OperationType;
@@ -110,7 +110,7 @@ public class SSLSocketStreamInst {
             NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize + len);
             int wOff = IOCTLPacket.writePacketPrefix(p, 0, OperationType.RECEIVE, socket, len);
             IOCTLPacket.writePacketBuffer(p, wOff, b, 0, len);
-            Agent.NativeLib.ioctl(0, Agent.IOCTL_CMD, p.getAddress());
+            BootstrapNative.emitData(socket, p.getAddress(), true);
           } catch (Throwable t) {
             if (SSLStorage.debugOn) {
               System.err.println("[SSLSocketStreamInst] Error in read advice: " + t.getMessage());
@@ -148,7 +148,7 @@ public class SSLSocketStreamInst {
             int wOff =
                 IOCTLPacket.writePacketPrefix(p, 0, OperationType.RECEIVE, socket, bytesRead);
             IOCTLPacket.writePacketBuffer(p, wOff, b, off, bytesRead);
-            Agent.NativeLib.ioctl(0, Agent.IOCTL_CMD, p.getAddress());
+            BootstrapNative.emitData(socket, p.getAddress(), true);
           } catch (Throwable t) {
             if (SSLStorage.debugOn) {
               System.err.println("[SSLSocketStreamInst] Error in read advice: " + t.getMessage());
@@ -182,7 +182,7 @@ public class SSLSocketStreamInst {
             NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize + b.length);
             int wOff = IOCTLPacket.writePacketPrefix(p, 0, OperationType.SEND, socket, b.length);
             IOCTLPacket.writePacketBuffer(p, wOff, b);
-            Agent.NativeLib.ioctl(0, Agent.IOCTL_CMD, p.getAddress());
+            BootstrapNative.emitData(socket, p.getAddress(), false);
           } catch (Throwable t) {
             if (SSLStorage.debugOn) {
               System.err.println("[SSLSocketStreamInst] Error in write advice: " + t.getMessage());
@@ -219,7 +219,7 @@ public class SSLSocketStreamInst {
             NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize + len);
             int wOff = IOCTLPacket.writePacketPrefix(p, 0, OperationType.SEND, socket, len);
             IOCTLPacket.writePacketBuffer(p, wOff, b, off, len);
-            Agent.NativeLib.ioctl(0, Agent.IOCTL_CMD, p.getAddress());
+            BootstrapNative.emitData(socket, p.getAddress(), false);
           } catch (Throwable t) {
             if (SSLStorage.debugOn) {
               System.err.println("[SSLSocketStreamInst] Error in write advice: " + t.getMessage());

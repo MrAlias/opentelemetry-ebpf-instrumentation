@@ -1,4 +1,5 @@
 import org.cyclonedx.model.Component
+import org.gradle.api.tasks.compile.JavaCompile
 
 plugins {
     java
@@ -42,6 +43,8 @@ repositories {
     mavenCentral()
 }
 
+val nettyProbe = configurations.create("nettyProbe")
+
 dependencies {
     implementation("net.bytebuddy:byte-buddy:1.18.10")
     implementation("net.bytebuddy:byte-buddy-agent:1.18.10")
@@ -49,14 +52,86 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter-api:5.14.4")
     testImplementation("org.junit.platform:junit-platform-launcher:1.14.4")
     testImplementation("org.awaitility:awaitility:4.3.0")
+    testImplementation("io.netty:netty-common:4.1.135.Final")
+    add(nettyProbe.name, "io.netty:netty-common:4.1.135.Final")
 
     testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.14.4")
 }
 
 tasks.register("prepareKotlinBuildScriptModel"){}
 
+val java21ProbeClasses = layout.buildDirectory.dir("classes/java21Probe")
+val lateAttachProbeClasses = layout.buildDirectory.dir("classes/lateAttachProbe")
+val nettyProbeClasses = layout.buildDirectory.dir("classes/nettyProbe")
+
+val compileLateAttachProbe by tasks.registering(JavaCompile::class) {
+    description = "Compile the isolated late-attach class-loader probe"
+    source(fileTree("src/test/javaProbe") { include("**/*.java") })
+    destinationDirectory.set(lateAttachProbeClasses)
+    classpath = files()
+    options.release.set(8)
+}
+
+val compileJava21Probe by tasks.registering(Exec::class) {
+    description = "Compile the packaged-agent Java 21 virtual-thread probe"
+    val testJavaVersion = providers.environmentVariable("OBI_TEST_JAVA_VERSION")
+        .orElse(JavaVersion.current().majorVersion)
+    val testJavaHome = providers.environmentVariable("OBI_TEST_JAVA_HOME")
+        .orElse(System.getProperty("java.home"))
+    val sources = fileTree("src/test/java21") { include("**/*.java") }
+
+    onlyIf { testJavaVersion.get() == "21" }
+    inputs.files(sources)
+    outputs.dir(java21ProbeClasses)
+    doFirst {
+        java21ProbeClasses.get().asFile.mkdirs()
+        commandLine(
+            file("${testJavaHome.get()}/bin/javac").absolutePath,
+            "--enable-preview",
+            "--release",
+            "21",
+            "-d",
+            java21ProbeClasses.get().asFile.absolutePath,
+            *sources.files.sorted().map { it.absolutePath }.toTypedArray(),
+        )
+    }
+}
+
+val compileNettyProbe by tasks.registering(JavaCompile::class) {
+    description = "Compile the packaged-agent Netty event-loop probe"
+    source(fileTree("src/test/javaNettyProbe") { include("**/*.java") })
+    destinationDirectory.set(nettyProbeClasses)
+    classpath = nettyProbe
+    options.release.set(8)
+}
+
 tasks.test {
     useJUnitPlatform()
+    dependsOn(
+        rootProject.tasks.named("copyLoaderJar"),
+        compileJava21Probe,
+        compileLateAttachProbe,
+        compileNettyProbe,
+    )
+    doFirst {
+        systemProperty(
+            "obi.test.packaged.agent",
+            rootProject.layout.buildDirectory.file("obi-java-agent.jar").get().asFile.absolutePath,
+        )
+        systemProperty(
+            "obi.test.java21.probe.classes",
+            java21ProbeClasses.get().asFile.absolutePath,
+        )
+        systemProperty(
+            "obi.test.late.attach.probe.classes",
+            lateAttachProbeClasses.get().asFile.absolutePath,
+        )
+        systemProperty(
+            "obi.test.netty.probe.classes",
+            nettyProbeClasses.get().asFile.absolutePath,
+        )
+        systemProperty("obi.test.netty.probe.classpath", nettyProbe.asPath)
+    }
 }
 
 // Automatic JNI header generation during compilation
@@ -101,6 +176,21 @@ tasks.register<Exec>("buildNativeLib-aarch64") {
     doLast {
         println("OBI JNI library built successfully")
     }
+}
+
+val nativeTest by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Build and run the native remote-parent transport tests"
+
+    dependsOn("compileJava")
+
+    workingDir = projectDir
+    environment("JAVA_HOME", System.getProperty("java.home"))
+    commandLine("make", "-f", "Makefile.jni", "test", "BUILD_DIR=build/jni-test")
+}
+
+tasks.check {
+    dependsOn(nativeTest)
 }
 
 // Clean native library

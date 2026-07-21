@@ -6,26 +6,14 @@
 package io.opentelemetry.obi.java.instrumentations;
 
 import io.opentelemetry.obi.java.ebpf.ThreadInfo;
+import io.opentelemetry.obi.java.instrumentations.data.SSLStorage;
 import net.bytebuddy.agent.builder.AgentBuilder;
 import net.bytebuddy.asm.Advice;
 import net.bytebuddy.description.type.TypeDescription;
 import net.bytebuddy.matcher.ElementMatcher;
 import net.bytebuddy.matcher.ElementMatchers;
 
-/**
- * Instruments java.lang.VirtualThread.mount()/unmount(): on every mount the agent reports (carrier
- * kernel thread -> this VT's logical thread id) through the ioctl channel (VT_MOUNT), and on every
- * unmount deletes that entry (VT_UNMOUNT), so eBPF can key correlation by the logical id instead of
- * the carrier tid. mount()/unmount() are unchanged across JDK 21..25; on JDKs without virtual
- * threads the type matcher never matches.
- *
- * <p>Both advices run at method EXIT. At mount() EXIT Thread.currentThread() is already the virtual
- * thread; at unmount() EXIT it is back to the carrier. gettid() returns the CARRIER's kernel tid in
- * both, which is exactly the map key.
- *
- * <p>The advice bodies must remain lock-free and non-blocking: a contended monitor or synchronized
- * I/O on the mount path deadlocks all carriers.
- */
+/** Instruments the JDK virtual-thread lifecycle without blocking a carrier thread. */
 public class VirtualThreadInst {
   public static ElementMatcher<? super TypeDescription> type() {
     return ElementMatchers.named("java.lang.VirtualThread");
@@ -38,15 +26,40 @@ public class VirtualThreadInst {
   public static AgentBuilder.Transformer transformer() {
     return (builder, type, classLoader, module, protectionDomain) ->
         builder
+            .visit(
+                Advice.to(StartAdvice.class)
+                    .on(ElementMatchers.named("start").and(ElementMatchers.takesArguments(1))))
             .visit(Advice.to(MountAdvice.class).on(ElementMatchers.named("mount")))
-            .visit(Advice.to(UnmountAdvice.class).on(ElementMatchers.named("unmount")));
+            .visit(Advice.to(UnmountAdvice.class).on(ElementMatchers.named("unmount")))
+            .visit(
+                Advice.to(RunAdvice.class)
+                    .on(
+                        ElementMatchers.named("run")
+                            .and(ElementMatchers.takesArgument(0, Runnable.class))))
+            .visit(Advice.to(AfterDoneAdvice.class).on(ElementMatchers.named("afterDone")));
+  }
+
+  @SuppressWarnings("unused")
+  public static final class StartAdvice {
+    @Advice.OnMethodEnter(suppress = Throwable.class)
+    public static void enter(@Advice.This Object virtualThread) {
+      SSLStorage.captureVirtualThread(virtualThread);
+    }
+
+    @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
+    public static void exit(@Advice.This Object virtualThread, @Advice.Thrown Throwable throwable) {
+      if (throwable != null) {
+        SSLStorage.untrackTask(virtualThread);
+      }
+    }
   }
 
   @SuppressWarnings("unused")
   public static final class MountAdvice {
     @Advice.OnMethodExit(suppress = Throwable.class)
-    public static void exit() {
-      ThreadInfo.onVirtualThreadMount();
+    public static void exit(@Advice.This Thread virtualThread) {
+      ThreadInfo.onVirtualThreadMount(virtualThread.getId());
+      SSLStorage.enterVirtualThreadScope(virtualThread);
     }
   }
 
@@ -55,6 +68,23 @@ public class VirtualThreadInst {
     @Advice.OnMethodExit(suppress = Throwable.class)
     public static void exit() {
       ThreadInfo.onVirtualThreadUnmount();
+    }
+  }
+
+  @SuppressWarnings("unused")
+  public static final class RunAdvice {
+    @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
+    public static void exit(@Advice.This Thread virtualThread) {
+      SSLStorage.exitVirtualThreadScope(virtualThread);
+      ThreadInfo.onVirtualThreadTerminate(virtualThread.getId());
+    }
+  }
+
+  @SuppressWarnings("unused")
+  public static final class AfterDoneAdvice {
+    @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
+    public static void exit(@Advice.This Object virtualThread) {
+      SSLStorage.untrackTask(virtualThread);
     }
   }
 }

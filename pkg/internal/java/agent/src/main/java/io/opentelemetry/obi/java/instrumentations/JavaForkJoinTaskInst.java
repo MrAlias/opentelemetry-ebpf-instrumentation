@@ -5,9 +5,9 @@
 
 package io.opentelemetry.obi.java.instrumentations;
 
-import io.opentelemetry.obi.java.Agent;
 import io.opentelemetry.obi.java.ebpf.ThreadInfo;
 import io.opentelemetry.obi.java.instrumentations.data.SSLStorage;
+import io.opentelemetry.obi.java.instrumentations.data.TaskContext;
 import java.util.concurrent.ForkJoinTask;
 import net.bytebuddy.agent.builder.AgentBuilder;
 import net.bytebuddy.asm.Advice;
@@ -16,6 +16,8 @@ import net.bytebuddy.matcher.ElementMatcher;
 import net.bytebuddy.matcher.ElementMatchers;
 
 public class JavaForkJoinTaskInst {
+  private static final int SUBMISSION_SKIPPED = -1;
+
   public static ElementMatcher<? super TypeDescription> type() {
     return ElementMatchers.isSubTypeOf(ForkJoinTask.class);
   }
@@ -49,23 +51,29 @@ public class JavaForkJoinTaskInst {
   @SuppressWarnings("unused")
   public static final class ForkAdvice {
     @Advice.OnMethodEnter(suppress = Throwable.class)
-    public static void enterJobSubmit(@Advice.This ForkJoinTask<?> task) {
+    public static int enterJobSubmit(@Advice.This ForkJoinTask<?> task) {
       // see RunnableInst, same reasoning
-      if (ThreadInfo.loomTaskOrVirtualThread(task)) {
-        return;
+      if (ThreadInfo.loomTask(task)) {
+        return SUBMISSION_SKIPPED;
       }
-      long threadId = Agent.NativeLib.gettid();
-      SSLStorage.trackTask(threadId, task);
+      long threadId = SSLStorage.currentThreadId();
+      int submission = SSLStorage.beginTaskSubmission(threadId, task);
       if (SSLStorage.bootDebugOn().equals(true)) {
         System.err.println("[ForkAdvice] " + threadId + "fork task = " + task.hashCode());
       }
+      return submission;
     }
 
     @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
     public static void exitJobSubmit(
-        @Advice.This ForkJoinTask<?> task, @Advice.Thrown Throwable throwable) {
-      if (throwable != null) {
+        @Advice.This ForkJoinTask<?> task,
+        @Advice.Thrown Throwable throwable,
+        @Advice.Enter int submission) {
+      if (throwable != null && submission == SSLStorage.SUBMISSION_OWNER) {
         SSLStorage.untrackTask(task);
+      }
+      if (submission != SUBMISSION_SKIPPED) {
+        SSLStorage.endTaskSubmission(task);
       }
     }
   }
@@ -73,14 +81,15 @@ public class JavaForkJoinTaskInst {
   @SuppressWarnings("unused")
   public static final class ForkJoinTaskAdvice {
     @Advice.OnMethodEnter(suppress = Throwable.class)
-    public static void enterJobSubmit(
+    public static boolean enterJobSubmit(
         @Advice.This ForkJoinTask<?> task, @Advice.Origin String method) {
       // see RunnableInst, same reasoning
-      if (ThreadInfo.loomTaskOrVirtualThread(task)) {
-        return;
+      if (ThreadInfo.loomTask(task)) {
+        return false;
       }
-      Long parentId = SSLStorage.parentThreadId(task);
-      long threadId = Agent.NativeLib.gettid();
+      TaskContext taskContext = SSLStorage.takeTaskContext(task);
+      Long parentId = taskContext == null ? null : taskContext.getParentThreadId();
+      long threadId = SSLStorage.currentThreadId();
       if (SSLStorage.bootDebugOn().equals(true)) {
         System.err.println(
             "[ForkJoinTaskAdvice] ("
@@ -92,10 +101,21 @@ public class JavaForkJoinTaskInst {
                 + ", thread = "
                 + threadId);
       }
-      if (parentId != null && parentId != threadId) {
-        ThreadInfo.sendTaskParentThreadContext(parentId);
+      if (parentId != null && (parentId != threadId || taskContext.getHandoffToken() != 0L)) {
+        return ThreadInfo.enterTaskParentThreadContext(
+            threadId, parentId, taskContext.getHandoffToken());
       }
-      SSLStorage.untrackTask(task);
+      if (taskContext != null) {
+        ThreadInfo.cancelTaskContext(taskContext);
+      }
+      return false;
+    }
+
+    @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
+    public static void exitJobSubmit(@Advice.Enter boolean linked) {
+      if (linked) {
+        ThreadInfo.restoreTaskParentThreadContext();
+      }
     }
   }
 }

@@ -9,6 +9,9 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import io.opentelemetry.obi.java.instrumentations.data.Connection;
 import io.opentelemetry.obi.java.instrumentations.data.SSLStorage;
+import java.io.ByteArrayOutputStream;
+import java.io.PrintStream;
+import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import org.junit.jupiter.api.AfterEach;
@@ -112,5 +115,25 @@ class NettyChannelExtractorTest {
     Object badCtx = new Object(); // No channel() method
     Connection c = NettyChannelExtractor.extractConnectionFromChannelHandlerContext(badCtx);
     assertNull(c);
+  }
+
+  @Test
+  void repeatedExtractorFailuresProduceOneDiagnostic() throws Exception {
+    Method reset = SSLStorage.class.getDeclaredMethod("resetNettyFailureLoggingForTest");
+    reset.setAccessible(true);
+    reset.invoke(null);
+    PrintStream originalError = System.err;
+    ByteArrayOutputStream output = new ByteArrayOutputStream();
+    try {
+      System.setErr(new PrintStream(output, true, "UTF-8"));
+      for (int i = 0; i < 10; i++) {
+        assertNull(NettyChannelExtractor.extractConnectionFromChannelHandlerContext(new Object()));
+      }
+    } finally {
+      System.setErr(originalError);
+      reset.invoke(null);
+    }
+
+    assertEquals(1, output.toString("UTF-8").split("Netty helper unavailable", -1).length - 1);
   }
 }

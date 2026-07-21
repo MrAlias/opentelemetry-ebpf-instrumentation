@@ -7,7 +7,7 @@ package io.opentelemetry.obi.java.instrumentations;
 
 import static io.opentelemetry.obi.java.instrumentations.util.ByteBufferExtractor.b;
 
-import io.opentelemetry.obi.java.Agent;
+import io.opentelemetry.obi.java.BootstrapNative;
 import io.opentelemetry.obi.java.ebpf.IOCTLPacket;
 import io.opentelemetry.obi.java.ebpf.NativeMemory;
 import io.opentelemetry.obi.java.ebpf.OperationType;
@@ -84,6 +84,7 @@ public class SocketChannelInst {
 
     @Advice.OnMethodExit(suppress = Throwable.class)
     public static void write(
+        @Advice.This final SocketChannel channel,
         @Advice.Argument(0) final ByteBuffer src,
         @Advice.Enter int savedPos,
         @Advice.FieldValue("localAddress") SocketAddress localSocket,
@@ -125,12 +126,13 @@ public class SocketChannelInst {
               inetSocketAddress.getAddress(),
               inetSocketAddress.getPort(),
               remoteSocketAddress.getAddress(),
-              remoteSocketAddress.getPort());
+              remoteSocketAddress.getPort(),
+              BootstrapNative.socketFileDescriptor(channel.socket()));
 
       NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize + unencrypted.len);
       int wOff = IOCTLPacket.writePacketPrefix(p, 0, OperationType.SEND, c, unencrypted.len);
       IOCTLPacket.writePacketBuffer(p, wOff, unencrypted.buf, 0, unencrypted.len);
-      Agent.NativeLib.ioctl(0, Agent.IOCTL_CMD, p.getAddress());
+      BootstrapNative.emitData(c.getSocketFileDescriptor(), p.getAddress(), false);
     }
   }
 
@@ -154,6 +156,7 @@ public class SocketChannelInst {
 
     @Advice.OnMethodExit(suppress = Throwable.class)
     public static void write(
+        @Advice.This final SocketChannel channel,
         @Advice.Argument(0) final ByteBuffer[] srcs,
         @Advice.Enter int[] savedSrcPositions,
         @Advice.FieldValue("localAddress") SocketAddress localSocket,
@@ -205,18 +208,20 @@ public class SocketChannelInst {
               inetSocketAddress.getAddress(),
               inetSocketAddress.getPort(),
               remoteSocketAddress.getAddress(),
-              remoteSocketAddress.getPort());
+              remoteSocketAddress.getPort(),
+              BootstrapNative.socketFileDescriptor(channel.socket()));
 
       NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize + unencrypted.len);
       int wOff = IOCTLPacket.writePacketPrefix(p, 0, OperationType.SEND, c, unencrypted.len);
       IOCTLPacket.writePacketBuffer(p, wOff, unencrypted.buf, 0, unencrypted.len);
-      Agent.NativeLib.ioctl(0, Agent.IOCTL_CMD, p.getAddress());
+      BootstrapNative.emitData(c.getSocketFileDescriptor(), p.getAddress(), false);
     }
   }
 
   public static final class ReadAdvice {
     @Advice.OnMethodExit(suppress = Throwable.class)
     public static void read(
+        @Advice.This final SocketChannel channel,
         @Advice.Argument(0) final ByteBuffer dst,
         @Advice.FieldValue("localAddress") SocketAddress localSocket,
         @Advice.FieldValue("remoteAddress") SocketAddress remoteSocket) {
@@ -233,7 +238,8 @@ public class SocketChannelInst {
               localSocketAddress.getAddress(),
               localSocketAddress.getPort(),
               remoteSocketAddress.getAddress(),
-              remoteSocketAddress.getPort());
+              remoteSocketAddress.getPort(),
+              BootstrapNative.socketFileDescriptor(channel.socket()));
 
       String bufKey = ByteBufferExtractor.keyFromUsedBuffer(dst);
       SSLStorage.setConnectionForBuf(bufKey, c);
@@ -246,6 +252,7 @@ public class SocketChannelInst {
   public static final class ReadAdviceArray {
     @Advice.OnMethodExit(suppress = Throwable.class)
     public static void read(
+        @Advice.This final SocketChannel channel,
         @Advice.Argument(0) final ByteBuffer[] dsts,
         @Advice.FieldValue("localAddress") SocketAddress localSocket,
         @Advice.FieldValue("remoteAddress") SocketAddress remoteSocket) {
@@ -262,7 +269,8 @@ public class SocketChannelInst {
               localSocketAddress.getAddress(),
               localSocketAddress.getPort(),
               remoteSocketAddress.getAddress(),
-              remoteSocketAddress.getPort());
+              remoteSocketAddress.getPort(),
+              BootstrapNative.socketFileDescriptor(channel.socket()));
 
       ByteBuffer dstBuffer =
           ByteBufferExtractor.flattenUsedByteBufferArray(dsts, ByteBufferExtractor.MAX_KEY_SIZE);

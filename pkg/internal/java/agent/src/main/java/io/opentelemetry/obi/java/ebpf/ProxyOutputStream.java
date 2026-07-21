@@ -5,7 +5,7 @@
 
 package io.opentelemetry.obi.java.ebpf;
 
-import io.opentelemetry.obi.java.Agent;
+import io.opentelemetry.obi.java.BootstrapNative;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.Socket;
@@ -29,7 +29,7 @@ public class ProxyOutputStream extends OutputStream {
       NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize + len);
       int wOff = IOCTLPacket.writePacketPrefix(p, 0, OperationType.SEND, socket, len);
       IOCTLPacket.writePacketBuffer(p, wOff, b, off, len);
-      Agent.NativeLib.ioctl(0, Agent.IOCTL_CMD, p.getAddress());
+      BootstrapNative.emitData(socket, p.getAddress(), false);
     }
   }
 

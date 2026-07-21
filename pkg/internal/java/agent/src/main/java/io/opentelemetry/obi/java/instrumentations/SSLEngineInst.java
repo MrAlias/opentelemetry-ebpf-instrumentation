@@ -7,7 +7,7 @@ package io.opentelemetry.obi.java.instrumentations;
 
 import static io.opentelemetry.obi.java.instrumentations.util.ByteBufferExtractor.b;
 
-import io.opentelemetry.obi.java.Agent;
+import io.opentelemetry.obi.java.BootstrapNative;
 import io.opentelemetry.obi.java.ebpf.IOCTLPacket;
 import io.opentelemetry.obi.java.ebpf.NativeMemory;
 import io.opentelemetry.obi.java.ebpf.OperationType;
@@ -106,16 +106,20 @@ public class SSLEngineInst {
         return;
       }
 
-      if (c == null) {
+      if (c == null || c.getSocketFileDescriptor() < 0) {
+        Connection correlated = null;
         if (SSLStorage.debugOn) {
           System.err.println("[SSLEngineInst] looking up connection for  " + srcBufKey);
         }
         if (srcBufKey != null) {
-          c = SSLStorage.getConnectionForBuf(srcBufKey);
+          correlated = SSLStorage.getConnectionForBuf(srcBufKey);
         }
 
-        if (c == null) {
-          c = (Connection) SSLStorage.nettyConnection.get();
+        if (correlated == null) {
+          correlated = (Connection) SSLStorage.nettyConnection.get();
+        }
+        if (correlated != null && (c == null || correlated.getSocketFileDescriptor() >= 0)) {
+          c = correlated;
         }
 
         if (c == null) {
@@ -155,7 +159,8 @@ public class SSLEngineInst {
         NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize + b.length);
         int wOff = IOCTLPacket.writePacketPrefix(p, 0, OperationType.RECEIVE, c, b.length);
         IOCTLPacket.writePacketBuffer(p, wOff, b);
-        Agent.NativeLib.ioctl(0, Agent.IOCTL_CMD, p.getAddress());
+        BootstrapNative.emitData(
+            c == null ? -1 : c.getSocketFileDescriptor(), p.getAddress(), true);
       }
     }
   }
@@ -207,16 +212,20 @@ public class SSLEngineInst {
 
       Connection c = SSLStorage.getConnectionForSession(engine);
 
-      if (c == null) {
+      if (c == null || c.getSocketFileDescriptor() < 0) {
+        Connection correlated = null;
         if (SSLStorage.debugOn) {
           System.err.println("[SSLEngineInst] looking up connection for array " + srcBufKey);
         }
         if (srcBufKey != null) {
-          c = SSLStorage.getConnectionForBuf(srcBufKey);
+          correlated = SSLStorage.getConnectionForBuf(srcBufKey);
         }
 
-        if (c == null) {
-          c = (Connection) SSLStorage.nettyConnection.get();
+        if (correlated == null) {
+          correlated = (Connection) SSLStorage.nettyConnection.get();
+        }
+        if (correlated != null && (c == null || correlated.getSocketFileDescriptor() >= 0)) {
+          c = correlated;
         }
 
         if (c == null) {
@@ -266,7 +275,8 @@ public class SSLEngineInst {
         NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize + len);
         int wOff = IOCTLPacket.writePacketPrefix(p, 0, OperationType.RECEIVE, c, len);
         IOCTLPacket.writePacketBuffer(p, wOff, b, 0, len);
-        Agent.NativeLib.ioctl(0, Agent.IOCTL_CMD, p.getAddress());
+        BootstrapNative.emitData(
+            c == null ? -1 : c.getSocketFileDescriptor(), p.getAddress(), true);
       }
     }
   }
@@ -294,54 +304,55 @@ public class SSLEngineInst {
       SSLStorage.unencrypted.set(new BytesWithLen(b, len));
     }
 
-    @Advice.OnMethodExit(suppress = Throwable.class)
+    @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
     public static void wrap(
         @Advice.This final javax.net.ssl.SSLEngine engine,
         @Advice.Argument(0) final ByteBuffer src,
         @Advice.Argument(1) final ByteBuffer dst,
-        @Advice.Return SSLEngineResult result) {
-      if (src == null || dst == null) {
-        SSLStorage.unencrypted.remove();
-        return;
-      }
-      if (engine.getSession().getId().length == 0) {
-        SSLStorage.unencrypted.remove();
-        return;
-      }
-
-      if (result.bytesConsumed() > 0) {
-        BytesWithLen bLen = SSLStorage.unencrypted.get();
-        if (bLen == null) {
+        @Advice.Return SSLEngineResult result,
+        @Advice.Thrown Throwable throwable) {
+      try {
+        if (throwable != null || src == null || dst == null || result == null) {
+          return;
+        }
+        if (engine.getSession().getId().length == 0) {
           return;
         }
 
-        if (SSLStorage.debugOn) {
-          System.err.println("[SSLEngineInst] wrap :" + java.util.Arrays.toString(bLen.buf));
-        }
-
-        Connection c = (Connection) SSLStorage.nettyConnection.get();
-        if (SSLStorage.debugOn) {
-          System.err.println(
-              "[SSLEngineInst] Found netty connection "
-                  + c
-                  + " thread "
-                  + Thread.currentThread().getName());
-        }
-        if (c != null) {
-          NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize + bLen.len);
-          int wOff = IOCTLPacket.writePacketPrefix(p, 0, OperationType.SEND, c, bLen.len);
-          IOCTLPacket.writePacketBuffer(p, wOff, bLen.buf, 0, bLen.len);
-          Agent.NativeLib.ioctl(0, Agent.IOCTL_CMD, p.getAddress());
-        } else {
-          String encrypted = ByteBufferExtractor.keyFromUsedBuffer(dst);
-          if (SSLStorage.debugOn) {
-            System.err.println("[SSLEngineInst] buf mapping on: " + encrypted);
+        if (result.bytesConsumed() > 0) {
+          BytesWithLen bLen = SSLStorage.unencrypted.get();
+          if (bLen == null) {
+            return;
           }
-          SSLStorage.setBufferMapping(encrypted, bLen);
-        }
-      }
 
-      SSLStorage.unencrypted.remove();
+          if (SSLStorage.debugOn) {
+            System.err.println("[SSLEngineInst] wrap :" + java.util.Arrays.toString(bLen.buf));
+          }
+
+          Connection c = (Connection) SSLStorage.nettyConnection.get();
+          if (SSLStorage.debugOn) {
+            System.err.println(
+                "[SSLEngineInst] Found netty connection "
+                    + c
+                    + " thread "
+                    + Thread.currentThread().getName());
+          }
+          if (c != null && c.getSocketFileDescriptor() >= 0) {
+            NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize + bLen.len);
+            int wOff = IOCTLPacket.writePacketPrefix(p, 0, OperationType.SEND, c, bLen.len);
+            IOCTLPacket.writePacketBuffer(p, wOff, bLen.buf, 0, bLen.len);
+            BootstrapNative.emitData(c.getSocketFileDescriptor(), p.getAddress(), false);
+          } else {
+            String encrypted = ByteBufferExtractor.keyFromUsedBuffer(dst);
+            if (SSLStorage.debugOn) {
+              System.err.println("[SSLEngineInst] buf mapping on: " + encrypted);
+            }
+            SSLStorage.setBufferMapping(encrypted, bLen);
+          }
+        }
+      } finally {
+        SSLStorage.unencrypted.remove();
+      }
     }
   }
 
@@ -364,58 +375,59 @@ public class SSLEngineInst {
       SSLStorage.unencrypted.set(new BytesWithLen(b, len));
     }
 
-    @Advice.OnMethodExit(suppress = Throwable.class)
+    @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
     public static void wrap(
         @Advice.This final javax.net.ssl.SSLEngine engine,
         @Advice.Argument(0) final ByteBuffer[] srcs,
         @Advice.Argument(1) final ByteBuffer dst,
-        @Advice.Return SSLEngineResult result) {
-      if (srcs == null || dst == null) {
-        SSLStorage.unencrypted.remove();
-        return;
-      }
-      if (srcs.length == 0 || engine.getSession().getId().length == 0) {
-        SSLStorage.unencrypted.remove();
-        return;
-      }
-
-      if (result.bytesConsumed() > 0) {
-        BytesWithLen bLen = SSLStorage.unencrypted.get();
-        if (bLen == null) {
+        @Advice.Return SSLEngineResult result,
+        @Advice.Thrown Throwable throwable) {
+      try {
+        if (throwable != null || srcs == null || dst == null || result == null) {
+          return;
+        }
+        if (srcs.length == 0 || engine.getSession().getId().length == 0) {
           return;
         }
 
-        if (SSLStorage.debugOn) {
-          System.err.println(
-              "[SSLEngineInst] wrap array :["
-                  + bLen.len
-                  + "]"
-                  + java.util.Arrays.toString(bLen.buf));
-        }
-
-        Connection c = (Connection) SSLStorage.nettyConnection.get();
-        if (SSLStorage.debugOn) {
-          System.err.println(
-              "[SSLEngineInst] Found netty connection "
-                  + c
-                  + " thread "
-                  + Thread.currentThread().getName());
-        }
-        if (c != null) {
-          NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize + bLen.len);
-          int wOff = IOCTLPacket.writePacketPrefix(p, 0, OperationType.SEND, c, bLen.len);
-          IOCTLPacket.writePacketBuffer(p, wOff, bLen.buf, 0, bLen.len);
-          Agent.NativeLib.ioctl(0, Agent.IOCTL_CMD, p.getAddress());
-        } else {
-          String encrypted = ByteBufferExtractor.keyFromUsedBuffer(dst);
-          if (SSLStorage.debugOn) {
-            System.err.println("[SSLEngineInst] buf array mapping on: " + encrypted);
+        if (result.bytesConsumed() > 0) {
+          BytesWithLen bLen = SSLStorage.unencrypted.get();
+          if (bLen == null) {
+            return;
           }
-          SSLStorage.setBufferMapping(encrypted, bLen);
-        }
-      }
 
-      SSLStorage.unencrypted.remove();
+          if (SSLStorage.debugOn) {
+            System.err.println(
+                "[SSLEngineInst] wrap array :["
+                    + bLen.len
+                    + "]"
+                    + java.util.Arrays.toString(bLen.buf));
+          }
+
+          Connection c = (Connection) SSLStorage.nettyConnection.get();
+          if (SSLStorage.debugOn) {
+            System.err.println(
+                "[SSLEngineInst] Found netty connection "
+                    + c
+                    + " thread "
+                    + Thread.currentThread().getName());
+          }
+          if (c != null && c.getSocketFileDescriptor() >= 0) {
+            NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize + bLen.len);
+            int wOff = IOCTLPacket.writePacketPrefix(p, 0, OperationType.SEND, c, bLen.len);
+            IOCTLPacket.writePacketBuffer(p, wOff, bLen.buf, 0, bLen.len);
+            BootstrapNative.emitData(c.getSocketFileDescriptor(), p.getAddress(), false);
+          } else {
+            String encrypted = ByteBufferExtractor.keyFromUsedBuffer(dst);
+            if (SSLStorage.debugOn) {
+              System.err.println("[SSLEngineInst] buf array mapping on: " + encrypted);
+            }
+            SSLStorage.setBufferMapping(encrypted, bLen);
+          }
+        }
+      } finally {
+        SSLStorage.unencrypted.remove();
+      }
     }
   }
 }

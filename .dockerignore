@@ -4,4 +4,9 @@ rootfs.qcow2
 rootfs.raw
 docker-disk.img
 internal/test/vm/lvh/out/
+pkg/internal/java/.gradle/
+pkg/internal/java/**/build/
+pkg/internal/java/**/target/
+pkg/internal/java/**/out/
+pkg/internal/java/loader/src/main/resources/agent/
 .git/objects/

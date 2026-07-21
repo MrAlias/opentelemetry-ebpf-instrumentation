@@ -1,9 +1,9 @@
 CC ?= gcc
-CFLAGS = -fPIC -O2 -Wall -Wextra -Wno-unused-parameter
+CFLAGS = -fPIC -O2 -Wall -Wextra -Wno-unused-parameter -pthread
 JAVA_HOME ?= $(shell java -XshowSettings:properties -version 2>&1 | grep 'java.home' | awk '{print $$3}')
 JNI_HEADERS_DIR = build/generated/jni-headers
 INCLUDES = -I$(JAVA_HOME)/include -I$(JAVA_HOME)/include/linux -I$(JNI_HEADERS_DIR) -Isrc/main/c
-LDFLAGS = -shared
+LDFLAGS = -shared -pthread
 
 SRC_DIR = src/main/c
 BUILD_DIR ?= build
@@ -13,8 +13,11 @@ LIB_NAME = libobijni.so
 SOURCES = $(SRC_DIR)/io_opentelemetry_obi_java_jni.c
 OBJECTS = $(BUILD_DIR)/io_opentelemetry_obi_java_jni.o
 TARGET = $(TARGET_DIR)/$(LIB_NAME)
+TEST_TARGET = $(BUILD_DIR)/remote_parent_jni_test
+BENCHMARK_TARGET = $(BUILD_DIR)/remote_parent_jni_benchmark
+BENCHMARK_ITERATIONS ?= 10000
 
-.PHONY: all clean
+.PHONY: all benchmark clean test
 
 all: $(TARGET)
 
@@ -30,6 +33,18 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 $(TARGET): $(OBJECTS) | $(TARGET_DIR)
 	$(CC) $(LDFLAGS) -o $@ $^
 	@echo "Built JNI library: $(TARGET)"
+
+test: CFLAGS += -DOBI_JNI_TESTING -fsanitize=address,undefined -fno-omit-frame-pointer
+test: LDFLAGS = -pthread -fsanitize=address,undefined
+test: $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCLUDES) $(SRC_DIR)/io_opentelemetry_obi_java_jni.c src/test/c/remote_parent_jni_test.c $(LDFLAGS) -o $(TEST_TARGET)
+	$(TEST_TARGET)
+
+benchmark: CFLAGS += -DOBI_JNI_TESTING
+benchmark: LDFLAGS = -pthread
+benchmark: $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCLUDES) $(SRC_DIR)/io_opentelemetry_obi_java_jni.c src/test/c/remote_parent_jni_benchmark.c $(LDFLAGS) -o $(BENCHMARK_TARGET)
+	$(BENCHMARK_TARGET) $(BENCHMARK_ITERATIONS)
 
 clean:
 	rm -rf $(BUILD_DIR)

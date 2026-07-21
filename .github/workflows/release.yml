@@ -358,6 +358,16 @@ jobs:
       - name: Generate Java agent SBOM
         run: make java-docker-sbom
 
+      - name: Validate OpenTelemetry Java extension artifact
+        env:
+          RELEASE_VERSION: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          extension="dist/obi-otel-extension-${RELEASE_VERSION}.jar"
+          test -s "${extension}"
+          unzip -Z1 "${extension}" | grep -Fx \
+            'META-INF/services/io.opentelemetry.sdk.autoconfigure.spi.ConfigurablePropagatorProvider'
+
       - name: Install Syft
         id: syft
         uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
@@ -373,11 +383,24 @@ jobs:
           set -euo pipefail
 
           embedded_java_agent="pkg/internal/java/embedded/obi-java-agent.jar"
+          extension="dist/obi-otel-extension-${RELEASE_VERSION}.jar"
+          extension_sbom="dist/obi-otel-extension-${RELEASE_VERSION}.cyclonedx.json"
           java_agent_placeholder="OBI_JAVA_AGENT_PLACEHOLDER"
           if [ ! -f "${embedded_java_agent}" ]; then
             echo "ERROR: expected embedded Java agent missing: ${embedded_java_agent}"
             exit 1
           fi
+          if [ ! -s "${extension}" ]; then
+            echo "ERROR: expected OpenTelemetry extension missing: ${extension}"
+            exit 1
+          fi
+
+          (
+            extension_stage="$(mktemp -d)"
+            trap 'rm -rf "${extension_stage}"' EXIT
+            cp "${extension}" "${extension_stage}/"
+            "${SYFT_CMD}" "dir:${extension_stage}" -o "cyclonedx-json=${extension_sbom}"
+          )
           # Fail if the embedded Java agent is still exactly the placeholder artifact.
           if [ "$(wc -c < "${embedded_java_agent}")" -eq "${#java_agent_placeholder}" ] && \
              printf '%s' "${java_agent_placeholder}" | cmp -s - "${embedded_java_agent}"; then
@@ -430,6 +453,7 @@ jobs:
             "dist/obi-${RELEASE_VERSION}-linux-arm64.cyclonedx.json"
             "dist/obi-${RELEASE_VERSION}-source-generated.cyclonedx.json"
             "dist/obi-java-agent-${RELEASE_VERSION}.cyclonedx.json"
+            "dist/obi-otel-extension-${RELEASE_VERSION}.cyclonedx.json"
           )
 
           for sbom in "${sboms[@]}"; do
@@ -493,6 +517,7 @@ jobs:
             --draft \
             dist/obi-*-linux-*.tar.gz \
             dist/obi-*-source-generated.tar.gz \
+            dist/*.jar \
             dist/*.cyclonedx.json \
             dist/SHA256SUMS \
             dist/*.bundle.json

@@ -27,7 +27,8 @@ class SSLSocketStreamInstTest {
     int end = IOCTLPacket.writePacketBuffer(packet, wOff, buffer, 0, bytesRead);
 
     assertEquals(IOCTLPacket.packetPrefixSize + bytesRead, end);
-    assertEquals(bytesRead, packet.getInt(IOCTLPacket.packetPrefixSize - Integer.BYTES));
+    assertEquals(bytesRead, packet.getInt(IOCTLPacket.bufferLengthOffset));
+    assertEquals(0L, packet.getLong(IOCTLPacket.dataSignalOffset));
     for (int i = 0; i < bytesRead; i++) {
       assertEquals(buffer[i], packet.getBuffer().get(IOCTLPacket.packetPrefixSize + i));
     }

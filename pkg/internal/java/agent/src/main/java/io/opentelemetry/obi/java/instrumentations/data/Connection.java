@@ -13,15 +13,26 @@ public class Connection {
   private final int localPort;
   private final InetAddress remoteAddress;
   private final int remotePort;
+  private final int socketFileDescriptor;
 
   private String bufferKey = null;
 
   public Connection(
       InetAddress localAddress, int localPort, InetAddress remoteAddress, int remotePort) {
+    this(localAddress, localPort, remoteAddress, remotePort, -1);
+  }
+
+  public Connection(
+      InetAddress localAddress,
+      int localPort,
+      InetAddress remoteAddress,
+      int remotePort,
+      int socketFileDescriptor) {
     this.localAddress = localAddress;
     this.localPort = localPort;
     this.remoteAddress = remoteAddress;
     this.remotePort = remotePort;
+    this.socketFileDescriptor = socketFileDescriptor;
   }
 
   public InetAddress getLocalAddress() {
@@ -38,6 +49,10 @@ public class Connection {
 
   public int getRemotePort() {
     return remotePort;
+  }
+
+  public int getSocketFileDescriptor() {
+    return socketFileDescriptor;
   }
 
   @Override

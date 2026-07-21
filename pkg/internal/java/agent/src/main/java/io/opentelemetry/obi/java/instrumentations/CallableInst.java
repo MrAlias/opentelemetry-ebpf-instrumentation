@@ -5,9 +5,10 @@
 
 package io.opentelemetry.obi.java.instrumentations;
 
-import io.opentelemetry.obi.java.Agent;
+import io.opentelemetry.obi.java.BootstrapNative;
 import io.opentelemetry.obi.java.ebpf.ThreadInfo;
 import io.opentelemetry.obi.java.instrumentations.data.SSLStorage;
+import io.opentelemetry.obi.java.instrumentations.data.TaskContext;
 import java.util.concurrent.Callable;
 import net.bytebuddy.agent.builder.AgentBuilder;
 import net.bytebuddy.asm.Advice;
@@ -44,14 +45,15 @@ public class CallableInst {
   @SuppressWarnings("unused")
   public static final class CallableAdvice {
     @Advice.OnMethodEnter(suppress = Throwable.class)
-    public static void enter(@Advice.This Callable<?> task) {
+    public static boolean enter(@Advice.This Callable<?> task) {
       // see RunnableInst, same reasoning
-      if (ThreadInfo.loomTaskOrVirtualThread(task)) {
-        return;
+      if (ThreadInfo.loomTask(task)) {
+        return false;
       }
-      Long parentId = SSLStorage.parentThreadId(task);
-      if (parentId != null) {
-        long threadId = Agent.NativeLib.gettid();
+      TaskContext taskContext = SSLStorage.takeTaskContext(task);
+      if (taskContext != null) {
+        long parentId = taskContext.getParentThreadId();
+        long threadId = BootstrapNative.gettid();
         if (SSLStorage.bootDebugOn().equals(true)) {
           System.err.println(
               "[CallableAdvice] task = "
@@ -61,11 +63,20 @@ public class CallableInst {
                   + ", thread = "
                   + threadId);
         }
-        if (parentId != threadId) {
-          ThreadInfo.sendTaskParentThreadContext(parentId);
+        if (parentId != threadId || taskContext.getHandoffToken() != 0L) {
+          return ThreadInfo.enterTaskParentThreadContext(
+              threadId, parentId, taskContext.getHandoffToken());
         }
+        ThreadInfo.cancelTaskContext(taskContext);
       }
-      SSLStorage.untrackTask(task);
+      return false;
+    }
+
+    @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
+    public static void exit(@Advice.Enter boolean linked) {
+      if (linked) {
+        ThreadInfo.restoreTaskParentThreadContext();
+      }
     }
   }
 }

@@ -9,15 +9,19 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	_ "embed"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"runtime"
+	"strconv"
 	"strings"
+
+	"golang.org/x/sys/unix"
 
 	"go.opentelemetry.io/obi/pkg/appolly/app"
 	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
@@ -28,8 +32,12 @@ import (
 )
 
 const (
-	ObiJavaAgentFileName      = "obi-java-agent.jar"
-	javaAgentEmbedPlaceholder = "OBI_JAVA_AGENT_PLACEHOLDER"
+	ObiJavaAgentFileName             = "obi-java-agent.jar"
+	javaAgentEmbedPlaceholder        = "OBI_JAVA_AGENT_PLACEHOLDER"
+	maxJavaRemoteParentTimeoutMillis = int64(1<<31 - 1)
+	maxJVMAttachResponseBytes        = 64 << 10
+	maxJavaAgentTempCreateAttempts   = 100
+	maxUID                           = uint64(1<<32 - 1)
 )
 
 //go:embed embedded/obi-java-agent.jar
@@ -44,21 +52,39 @@ func (e *JavaInjectError) Error() string {
 }
 
 type JavaInjector struct {
-	log *slog.Logger
-	cfg *obi.Config
+	log                   *slog.Logger
+	cfg                   *obi.Config
+	remoteParentServerUID int
+}
+
+type javaAttacher interface {
+	Init()
+	Cleanup() error
+	AttachContext(context.Context, int, []string, bool) (io.ReadCloser, error)
+}
+
+var newJavaAttacher = func(log *slog.Logger) javaAttacher {
+	return jvm.NewJAttacher(log)
 }
 
 func NewJavaInjector(cfg *obi.Config) (*JavaInjector, error) {
 	if !cfg.Java.Enabled {
 		return nil, nil
 	}
+	if strings.ContainsRune(cfg.Java.RemoteParent.SocketPath, ',') {
+		return nil, errors.New("javaagent.remote_parent.socket_path must not contain a comma")
+	}
+	if cfg.Java.RemoteParent.Timeout.Milliseconds() > maxJavaRemoteParentTimeoutMillis {
+		return nil, errors.New("javaagent.remote_parent.timeout must not exceed 2147483647ms")
+	}
 	if err := ensureEmbeddedAgent(); err != nil {
 		return nil, err
 	}
 
 	return &JavaInjector{
-		cfg: cfg,
-		log: slog.With("component", "javaagent.Injector"),
+		cfg:                   cfg,
+		log:                   slog.With("component", "javaagent.Injector"),
+		remoteParentServerUID: os.Geteuid(),
 	}, nil
 }
 
@@ -81,121 +107,194 @@ func tempDirPath(root, dir string) (string, bool) {
 	return fullDir, true
 }
 
-func dirOK(root, dir string) bool {
-	fullDir, ok := tempDirPath(root, dir)
-	if !ok {
-		return false
+func openRootDirectory(root string) (int, error) {
+	if root == "" {
+		return -1, errors.New("empty process root path")
 	}
 
-	info, err := os.Stat(fullDir)
-	return err == nil && info.IsDir()
+	// The final component is intentionally followed because /proc/<pid>/root is
+	// a kernel-provided link. Paths inside it are opened separately without following links.
+	return unix.Open(root, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 }
 
-func (i *JavaInjector) findTempDir(root string, ie *ebpf.Instrumentable) (string, error) {
+func targetPathComponents(path string) ([]string, bool) {
+	cleanPath := filepath.Clean(path)
+	if path == "" || !filepath.IsAbs(cleanPath) {
+		return nil, false
+	}
+	if cleanPath == string(filepath.Separator) {
+		return nil, true
+	}
+
+	components := strings.Split(strings.TrimPrefix(cleanPath, string(filepath.Separator)), string(filepath.Separator))
+	for _, component := range components {
+		if component == "" || component == "." || component == ".." {
+			return nil, false
+		}
+	}
+
+	return components, true
+}
+
+func openTargetDirectory(rootFD int, targetPath string) (int, error) {
+	components, ok := targetPathComponents(targetPath)
+	if !ok {
+		return -1, fmt.Errorf("invalid target directory %q", targetPath)
+	}
+
+	flags := unix.O_PATH | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
+	currentFD, err := unix.Openat(rootFD, ".", flags, 0)
+	if err != nil {
+		return -1, err
+	}
+
+	for _, component := range components {
+		nextFD, err := unix.Openat(currentFD, component, flags, 0)
+		_ = unix.Close(currentFD)
+		if err != nil {
+			return -1, err
+		}
+		currentFD = nextFD
+	}
+
+	return currentFD, nil
+}
+
+func dirOK(root, dir string) bool {
+	rootFD, err := openRootDirectory(root)
+	if err != nil {
+		return false
+	}
+	defer unix.Close(rootFD)
+
+	dirFD, err := openTargetDirectory(rootFD, dir)
+	if err != nil {
+		return false
+	}
+	_ = unix.Close(dirFD)
+
+	return true
+}
+
+func (i *JavaInjector) findTempDirAt(rootFD int, ie *ebpf.Instrumentable) (string, int, error) {
 	if tmpDir, ok := ie.FileInfo.ServiceAttrs().EnvVars["TMPDIR"]; ok {
-		if dirOK(root, tmpDir) {
-			return tmpDir, nil
+		if dirFD, err := openTargetDirectory(rootFD, tmpDir); err == nil {
+			return tmpDir, dirFD, nil
 		}
 	}
 
 	tmpDir := "/tmp"
-	if dirOK(root, tmpDir) {
-		return tmpDir, nil
+	if dirFD, err := openTargetDirectory(rootFD, tmpDir); err == nil {
+		return tmpDir, dirFD, nil
 	}
 
 	tmpDir = "/var/tmp"
-	if dirOK(root, tmpDir) {
-		return tmpDir, nil
+	if dirFD, err := openTargetDirectory(rootFD, tmpDir); err == nil {
+		return tmpDir, dirFD, nil
 	}
 
-	return "", errors.New("couldn't find suitable temp directory for injection")
+	return "", -1, errors.New("couldn't find suitable temp directory for injection")
+}
+
+func (i *JavaInjector) findTempDir(root string, ie *ebpf.Instrumentable) (string, error) {
+	rootFD, err := openRootDirectory(root)
+	if err != nil {
+		return "", errors.New("couldn't find suitable temp directory for injection")
+	}
+	defer unix.Close(rootFD)
+
+	tmpDir, dirFD, err := i.findTempDirAt(rootFD, ie)
+	if err != nil {
+		return "", err
+	}
+	_ = unix.Close(dirFD)
+
+	return tmpDir, nil
 }
 
 func (i *JavaInjector) NewExecutable(ie *ebpf.Instrumentable) error {
 	ctx, cancel := context.WithTimeout(context.Background(), i.cfg.Java.Timeout)
 	defer cancel()
 
-	// Channel to receive the result
-	type result struct {
-		attached bool
-		err      error
+	if ie.Type != svc.InstrumentableJava {
+		return nil
+	}
+	capability := ie.FileInfo.JavaAgentCapability()
+	if capability == 0 {
+		return &JavaInjectError{Message: "Java process capability was not prepared before attach"}
 	}
 
-	resultChan := make(chan result, 1)
+	attacher := newJavaAttacher(i.log)
+	ok, jdk8, err := i.verifyJVMVersion(ctx, attacher, ie.FileInfo.Pid())
+	if err != nil {
+		return i.attachError(ctx, ie, err)
+	}
+	if !ok {
+		return &JavaInjectError{Message: "unsupported Java version for OpenTelemetry eBPF instrumentation"}
+	}
 
-	attacher := jvm.NewJAttacher(i.log)
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+	var loaded bool
+	if jdk8 {
+		loaded, err = i.jdkAgentAlreadyLoadedHotspot8(ctx, attacher, ie.FileInfo.Pid())
+	} else {
+		loaded, err = i.jdkAgentAlreadyLoaded(ctx, attacher, ie.FileInfo.Pid())
+	}
+	if err != nil {
+		return i.attachError(ctx, ie, err)
+	}
+	if loaded {
+		i.log.Info("OpenTelemetry eBPF Java Agent already loaded, reconfiguring")
+	}
 
-	defer func() {
-		if err := attacher.Cleanup(); err != nil {
-			slog.Warn("error on JVM attach cleanup", "error", err)
-		}
-	}()
-
-	if ie.Type == svc.InstrumentableJava {
-		// Run the attach procedure in a goroutine, so that we can terminate on stuck attach
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					resultChan <- result{err: &JavaInjectError{Message: "attach failed"}}
-				}
-			}()
-
-			ok, jdk8 := i.verifyJVMVersion(attacher, ie.FileInfo.Pid())
-			if !ok {
-				resultChan <- result{err: &JavaInjectError{Message: "unsupported Java version for OpenTelemetry eBPF instrumentation"}}
-				return
-			}
-
-			var loaded bool
-			var err error
-			if jdk8 {
-				loaded, err = i.jdkAgentAlreadyLoadedHotspot8(attacher, ie.FileInfo.Pid())
-			} else {
-				loaded, err = i.jdkAgentAlreadyLoaded(attacher, ie.FileInfo.Pid())
-			}
-
-			if err != nil {
-				resultChan <- result{err: err}
-				return
-			}
-
-			if loaded {
-				i.log.Info("OpenTelemetry eBPF Java Agent already loaded, not reloading")
-				resultChan <- result{attached: false}
-				return
-			}
-
-			i.log.Info("injecting OpenTelemetry eBPF instrumentation for Java process", "pid", ie.FileInfo.Pid())
-
-			agentPath, err := i.copyAgent(ie)
-			if err != nil {
-				i.log.Error("failed to extract java agent", "pid", ie.FileInfo.Pid(), "error", err)
-				resultChan <- result{err: err}
-				return
-			}
-
-			if err = i.attachJDKAgent(attacher, ie.FileInfo.Pid(), agentPath); err != nil {
-				i.log.Error("couldn't attach OpenTelemetry eBPF Java Agent", "pid", ie.FileInfo.Pid(), "path", agentPath, "error", err)
-				resultChan <- result{err: err}
-				return
-			}
-
-			resultChan <- result{attached: true}
-		}()
-
-		// Wait for either completion or timeout
-		select {
-		case result := <-resultChan:
-			return result.err
-		case <-ctx.Done():
-			i.log.Warn("java attach timed out", "timeout", i.cfg.Java.Timeout, "pid", ie.FileInfo.Pid())
-			return &JavaInjectError{Message: "java attach timed out"}
-		}
+	i.log.Info("injecting OpenTelemetry eBPF instrumentation for Java process", "pid", ie.FileInfo.Pid())
+	agentPath, err := i.copyAgent(ie)
+	if err != nil {
+		i.log.Error("failed to extract java agent", "pid", ie.FileInfo.Pid(), "error", err)
+		return err
+	}
+	if err := i.attachJDKAgentWithCapability(
+		ctx, attacher, ie.FileInfo.Pid(), agentPath, capability,
+	); err != nil {
+		i.log.Error("couldn't attach OpenTelemetry eBPF Java Agent", "pid", ie.FileInfo.Pid(), "path", agentPath, "error", err)
+		return i.attachError(ctx, ie, err)
 	}
 
 	return nil
+}
+
+func (i *JavaInjector) PrepareExecutable(ie *ebpf.Instrumentable) error {
+	if ie == nil || ie.Type != svc.InstrumentableJava {
+		return nil
+	}
+	if ie.FileInfo == nil {
+		return errors.New("java process has no executable identity")
+	}
+	if ie.FileInfo.JavaAgentCapability() != 0 {
+		return nil
+	}
+
+	for range 4 {
+		var random [8]byte
+		if _, err := rand.Read(random[:]); err != nil {
+			return fmt.Errorf("generate Java process capability: %w", err)
+		}
+		capability := binary.LittleEndian.Uint64(random[:]) & uint64(1<<63-1)
+		if capability != 0 {
+			ie.FileInfo.SetJavaAgentCapability(capability)
+			return nil
+		}
+	}
+
+	return errors.New("generate nonzero Java process capability")
+}
+
+func (i *JavaInjector) attachError(ctx context.Context, ie *ebpf.Instrumentable, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		i.log.Warn("java attach timed out", "timeout", i.cfg.Java.Timeout, "pid", ie.FileInfo.Pid())
+		return &JavaInjectError{Message: "java attach timed out"}
+	}
+
+	return err
 }
 
 func ensureEmbeddedAgent() error {
@@ -209,12 +308,78 @@ func ensureEmbeddedAgent() error {
 // to be changed in tests
 var rootDirForPID func(app.PID) string = ebpfcommon.RootDirectoryForPID
 
+type javaAgentTarget interface {
+	ReadFrom(io.Reader) (int64, error)
+	Chmod(os.FileMode) error
+	Close() error
+}
+
+func populateJavaAgentTarget(target javaAgentTarget, source io.Reader) (resultErr error) {
+	defer func() {
+		if err := target.Close(); err != nil {
+			resultErr = errors.Join(
+				resultErr,
+				fmt.Errorf("error closing target OBI java agent: %w", err),
+			)
+		}
+	}()
+
+	if _, err := target.ReadFrom(source); err != nil {
+		return fmt.Errorf("error writing java agent to target location: %w", err)
+	}
+	if err := target.Chmod(0o644); err != nil {
+		return fmt.Errorf("error setting permissions on target OBI java agent: %w", err)
+	}
+
+	return nil
+}
+
+func createJavaAgentTempFile(dirFD int) (*os.File, string, error) {
+	for range maxJavaAgentTempCreateAttempts {
+		var suffix [8]byte
+		if _, err := rand.Read(suffix[:]); err != nil {
+			return nil, "", fmt.Errorf("generate temporary OBI java agent name: %w", err)
+		}
+
+		name := fmt.Sprintf("%s.tmp-%x", ObiJavaAgentFileName, suffix)
+		fd, err := unix.Openat(
+			dirFD,
+			name,
+			unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC,
+			0o600,
+		)
+		if errors.Is(err, unix.EEXIST) {
+			continue
+		}
+		if err != nil {
+			return nil, "", err
+		}
+
+		file := os.NewFile(uintptr(fd), name)
+		if file == nil {
+			_ = unix.Close(fd)
+			return nil, "", errors.New("create file handle for temporary OBI java agent")
+		}
+
+		return file, name, nil
+	}
+
+	return nil, "", fmt.Errorf("unable to allocate a unique OBI java agent name after %d attempts", maxJavaAgentTempCreateAttempts)
+}
+
 func (i *JavaInjector) copyAgent(ie *ebpf.Instrumentable) (string, error) {
 	root := rootDirForPID(ie.FileInfo.Pid())
-	tempDir, err := i.findTempDir(root, ie)
+	rootFD, err := openRootDirectory(root)
+	if err != nil {
+		return "", fmt.Errorf("error accessing process root: %w", err)
+	}
+	defer unix.Close(rootFD)
+
+	tempDir, tempDirFD, err := i.findTempDirAt(rootFD, ie)
 	if err != nil {
 		return "", fmt.Errorf("error accessing temp directory: %w", err)
 	}
+	defer unix.Close(tempDirFD)
 
 	fullTempDir, ok := tempDirPath(root, tempDir)
 	if !ok {
@@ -223,34 +388,23 @@ func (i *JavaInjector) copyAgent(ie *ebpf.Instrumentable) (string, error) {
 
 	i.log.Info("found injection directory for process", "pid", ie.FileInfo.Pid(), "path", fullTempDir)
 
-	agentPathHost := filepath.Join(fullTempDir, ObiJavaAgentFileName)
-
 	source := bytes.NewReader(embeddedJavaAgentBytes)
-	target, err := os.CreateTemp(fullTempDir, ObiJavaAgentFileName+".tmp-*")
+	target, tmpTargetName, err := createJavaAgentTempFile(tempDirFD)
 	if err != nil {
 		return "", fmt.Errorf("unable to create target OBI java agent: %w", err)
 	}
-	tmpTargetPath := target.Name()
 	cleanup := true
 	defer func() {
 		if cleanup {
-			_ = os.Remove(tmpTargetPath)
+			_ = unix.Unlinkat(tempDirFD, tmpTargetName, 0)
 		}
 	}()
 
-	if _, err = target.ReadFrom(source); err != nil {
-		return "", fmt.Errorf("error writing java agent to target location: %w", err)
+	if err := populateJavaAgentTarget(target, source); err != nil {
+		return "", err
 	}
 
-	if err = target.Chmod(0o644); err != nil {
-		return "", fmt.Errorf("error setting permissions on target OBI java agent: %w", err)
-	}
-
-	if err = target.Close(); err != nil {
-		return "", fmt.Errorf("error closing target OBI java agent: %w", err)
-	}
-
-	if err = os.Rename(tmpTargetPath, agentPathHost); err != nil {
+	if err = unix.Renameat(tempDirFD, tmpTargetName, tempDirFD, ObiJavaAgentFileName); err != nil {
 		return "", fmt.Errorf("unable to move target OBI java agent into place: %w", err)
 	}
 	cleanup = false
@@ -260,17 +414,139 @@ func (i *JavaInjector) copyAgent(ie *ebpf.Instrumentable) (string, error) {
 	return agentPathContainer, nil
 }
 
-func returnCodeLine(line string) (bool, error) {
-	if strings.Contains(line, "return code: 0") || strings.Contains(line, "ATTACH_ACK") {
-		return true, nil
-	} else if strings.Contains(line, "return code:") {
-		return true, fmt.Errorf("error executing command for the JVM %s", line)
-	}
-
-	return false, nil
+type attachResponseState struct {
+	firstLineSeen     bool
+	hotspotStatusSeen bool
+	openJ9ACKSeen     bool
 }
 
-func (i *JavaInjector) attachOpts() string {
+func (s *attachResponseState) parseLine(raw string) error {
+	line := strings.TrimSpace(strings.TrimSuffix(raw, "\x00"))
+	if line == "" {
+		return nil
+	}
+
+	if !s.firstLineSeen {
+		s.firstLineSeen = true
+		if status, err := strconv.Atoi(line); err == nil {
+			s.hotspotStatusSeen = true
+			if status != 0 {
+				return fmt.Errorf("java VM attach failed with status %d", status)
+			}
+			return nil
+		}
+	}
+
+	if line == "ATTACH_ACK" {
+		s.openJ9ACKSeen = true
+		return nil
+	}
+
+	const returnCodePrefix = "return code:"
+	if strings.HasPrefix(line, returnCodePrefix) {
+		code, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, returnCodePrefix)))
+		if err != nil {
+			return fmt.Errorf("invalid JVM agent return code %q", line)
+		}
+		if code != 0 {
+			return fmt.Errorf("java VM agent failed with return code %d", code)
+		}
+	}
+
+	return nil
+}
+
+func (s *attachResponseState) finish(openJ9 bool) error {
+	if openJ9 {
+		if !s.openJ9ACKSeen {
+			return errors.New("openJ9 attach response ended without ATTACH_ACK")
+		}
+		return nil
+	}
+	if !s.hotspotStatusSeen {
+		return errors.New("hotSpot attach response ended without a status")
+	}
+	return nil
+}
+
+func closeOnContext(ctx context.Context, closer io.Closer) func() {
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(done)
+		_ = closer.Close()
+	})
+
+	return func() {
+		if !stop() {
+			<-done
+		}
+	}
+}
+
+var readUIDMapForPID = func(pid app.PID) ([]byte, error) {
+	return os.ReadFile(filepath.Join("/proc", strconv.Itoa(int(pid)), "uid_map"))
+}
+
+func mapUID(uidMap io.Reader, hostUID int) (uint64, error) {
+	if hostUID < 0 {
+		return 0, fmt.Errorf("invalid host UID %d", hostUID)
+	}
+
+	hostUID64 := uint64(hostUID)
+	scanner := bufio.NewScanner(uidMap)
+	lineNumber := 0
+	for scanner.Scan() {
+		lineNumber++
+		fields := strings.Fields(scanner.Text())
+		if len(fields) != 3 {
+			return 0, fmt.Errorf("invalid UID map entry on line %d", lineNumber)
+		}
+
+		insideID, err := strconv.ParseUint(fields[0], 10, 32)
+		if err != nil {
+			return 0, fmt.Errorf("invalid target UID on line %d: %w", lineNumber, err)
+		}
+		outsideID, err := strconv.ParseUint(fields[1], 10, 32)
+		if err != nil {
+			return 0, fmt.Errorf("invalid host UID on line %d: %w", lineNumber, err)
+		}
+		length, err := strconv.ParseUint(fields[2], 10, 32)
+		if err != nil || length == 0 {
+			if err == nil {
+				err = errors.New("mapping length is zero")
+			}
+			return 0, fmt.Errorf("invalid UID range on line %d: %w", lineNumber, err)
+		}
+
+		uidSpaceSize := maxUID + 1
+		if outsideID+length > uidSpaceSize || insideID+length > uidSpaceSize {
+			return 0, fmt.Errorf("user ID range on line %d exceeds the UID address space", lineNumber)
+		}
+		if hostUID64 < outsideID || hostUID64-outsideID >= length {
+			continue
+		}
+
+		return insideID + hostUID64 - outsideID, nil
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, fmt.Errorf("read UID map: %w", err)
+	}
+
+	return 0, fmt.Errorf("host UID %d is not mapped into the target user namespace", hostUID)
+}
+
+func (i *JavaInjector) targetRemoteParentServerUID(pid app.PID) (uint64, error) {
+	uidMap, err := readUIDMapForPID(pid)
+	if err != nil {
+		return 0, fmt.Errorf("read target UID map: %w", err)
+	}
+
+	return mapUID(bytes.NewReader(uidMap), i.remoteParentServerUID)
+}
+
+func (i *JavaInjector) attachOptsWithCapability(
+	pid app.PID, processCapability uint64,
+) (string, error) {
 	var opts []string
 	if i.cfg.Java.Debug {
 		opts = append(opts, "debug=true")
@@ -279,72 +555,134 @@ func (i *JavaInjector) attachOpts() string {
 		opts = append(opts, "debugBB=true")
 	}
 
-	if len(opts) == 0 {
-		return ""
+	transport := i.cfg.Java.RemoteParent.Transport
+	if transport == "" {
+		transport = obi.JavaRemoteParentDisabled
+	}
+	var serverUIDOption string
+	if transport == obi.JavaRemoteParentUnix || transport == obi.JavaRemoteParentAuto {
+		serverUID, err := i.targetRemoteParentServerUID(pid)
+		if err != nil {
+			if transport == obi.JavaRemoteParentUnix {
+				return "", fmt.Errorf(
+					"map OBI UID %d into target JVM %d user namespace: %w",
+					i.remoteParentServerUID,
+					pid,
+					err,
+				)
+			}
+			if i.log != nil {
+				i.log.Warn(
+					"Java remote-parent Unix fallback unavailable in target user namespace; using sockopt only",
+					"pid", pid,
+					"error", err,
+				)
+			}
+			transport = obi.JavaRemoteParentGetsockopt
+		} else {
+			serverUIDOption = "remoteParentServerUid=" + strconv.FormatUint(serverUID, 10)
+		}
+	}
+	opts = append(opts, "remoteParentTransport="+string(transport))
+	if serverUIDOption != "" {
+		opts = append(opts, serverUIDOption)
+	}
+	if i.cfg.Java.RemoteParent.SocketPath != "" {
+		opts = append(opts, "remoteParentSocket="+i.cfg.Java.RemoteParent.SocketPath)
+	}
+	if i.cfg.Java.RemoteParent.Timeout > 0 {
+		timeoutMillis := max(i.cfg.Java.RemoteParent.Timeout.Milliseconds(), 1)
+		opts = append(opts, "remoteParentTimeoutMillis="+strconv.FormatInt(timeoutMillis, 10))
+	}
+	if processCapability != 0 {
+		opts = append(
+			opts,
+			"processCapability="+strconv.FormatUint(processCapability, 10),
+		)
 	}
 
-	return "=" + strings.Join(opts, ",")
+	return "=" + strings.Join(opts, ","), nil
 }
 
-func (i *JavaInjector) attachJDKAgent(attacher *jvm.JAttacher, pid app.PID, path string) error {
-	attacher.Init()
+func (i *JavaInjector) attachJDKAgent(
+	ctx context.Context, attacher javaAttacher, pid app.PID, path string,
+) (resultErr error) {
+	return i.attachJDKAgentWithCapability(ctx, attacher, pid, path, 0)
+}
 
-	defer func() {
-		if err := attacher.Cleanup(); err != nil {
-			slog.Warn("error on JVM attach cleanup", "error", err)
-		}
-	}()
-	out, err := attacher.Attach(int(pid), []string{"load", "instrument", "false", path + i.attachOpts()}, false)
+func (i *JavaInjector) attachJDKAgentWithCapability(
+	ctx context.Context,
+	attacher javaAttacher,
+	pid app.PID,
+	path string,
+	processCapability uint64,
+) (resultErr error) {
+	attachOpts, err := i.attachOptsWithCapability(pid, processCapability)
+	if err != nil {
+		return err
+	}
+
+	attacher.Init()
+	defer func() { resultErr = errors.Join(resultErr, attacher.Cleanup()) }()
+
+	out, err := attacher.AttachContext(
+		ctx, int(pid), []string{"load", "instrument", "false", path + attachOpts}, false,
+	)
 	if err != nil {
 		i.log.Error("error executing command for the JVM", "pid", pid, "error", err)
 		return err
 	}
-
-	defer out.Close()
+	if out == nil {
+		return errors.New("java VM attach returned no response")
+	}
+	defer func() { resultErr = errors.Join(resultErr, out.Close()) }()
+	defer closeOnContext(ctx, out)()
 
 	reader := bufio.NewReader(out)
 	buf := bytes.Buffer{}
+	response := attachResponseState{}
+	responseBytes := 0
 	for {
 		b, err := reader.ReadByte()
 		if err != nil {
 			if err == io.EOF { // hotspot terminates with EOF
-				_, err := returnCodeLine(buf.String())
-				if err != nil {
+				if err := response.parseLine(buf.String()); err != nil {
 					return err
 				}
-				break
+				return response.finish(false)
 			}
 			return fmt.Errorf("error reading line %w", err)
 		}
 
+		responseBytes++
+		if responseBytes > maxJVMAttachResponseBytes {
+			return fmt.Errorf("java VM attach response exceeds %d bytes", maxJVMAttachResponseBytes)
+		}
 		buf.WriteByte(b)
-		if b == '\n' {
-			if end, err := returnCodeLine(buf.String()); end {
+		switch b {
+		case '\n':
+			if err := response.parseLine(buf.String()); err != nil {
 				return err
 			}
 
 			buf.Reset()
-		} else if b == 0 { // j9 terminates with 0
-			if end, err := returnCodeLine(buf.String()); end {
+		case 0: // j9 terminates with 0
+			if err := response.parseLine(buf.String()); err != nil {
 				return err
 			}
-			break
+			return response.finish(true)
 		}
 	}
-
-	return nil
 }
 
-func (i *JavaInjector) jdkAgentAlreadyLoaded(attacher *jvm.JAttacher, pid app.PID) (bool, error) {
+func (i *JavaInjector) jdkAgentAlreadyLoaded(
+	ctx context.Context, attacher javaAttacher, pid app.PID,
+) (loaded bool, resultErr error) {
 	attacher.Init()
+	defer func() { resultErr = errors.Join(resultErr, attacher.Cleanup()) }()
 
-	defer func() {
-		if err := attacher.Cleanup(); err != nil {
-			slog.Warn("error on JVM attach cleanup", "error", err)
-		}
-	}()
 	// OpenJ9 doesn't support listing loaded classes
-	out, err := attacher.Attach(int(pid), []string{"jcmd", "VM.class_hierarchy"}, true)
+	out, err := attacher.AttachContext(ctx, int(pid), []string{"jcmd", "VM.class_hierarchy"}, true)
 	if err != nil {
 		i.log.Error("error executing command for the JVM", "pid", pid, "error", err)
 		return false, err
@@ -353,6 +691,8 @@ func (i *JavaInjector) jdkAgentAlreadyLoaded(attacher *jvm.JAttacher, pid app.PI
 	if out == nil {
 		return false, nil
 	}
+	defer func() { resultErr = errors.Join(resultErr, out.Close()) }()
+	defer closeOnContext(ctx, out)()
 
 	scanner := bufio.NewScanner(out)
 	for scanner.Scan() {
@@ -362,22 +702,23 @@ func (i *JavaInjector) jdkAgentAlreadyLoaded(attacher *jvm.JAttacher, pid app.PI
 			return true, nil
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		return false, fmt.Errorf("read loaded JVM classes: %w", err)
+	}
 
 	return false, nil
 }
 
 // Hotspot version 8 doesn't support VM.class_hierarchy, we use GC.class_histogram and look for the class itself
 // without the address
-func (i *JavaInjector) jdkAgentAlreadyLoadedHotspot8(attacher *jvm.JAttacher, pid app.PID) (bool, error) {
+func (i *JavaInjector) jdkAgentAlreadyLoadedHotspot8(
+	ctx context.Context, attacher javaAttacher, pid app.PID,
+) (loaded bool, resultErr error) {
 	attacher.Init()
+	defer func() { resultErr = errors.Join(resultErr, attacher.Cleanup()) }()
 
-	defer func() {
-		if err := attacher.Cleanup(); err != nil {
-			slog.Warn("error on JVM attach cleanup", "error", err)
-		}
-	}()
 	// OpenJ9 doesn't support listing loaded classes
-	out, err := attacher.Attach(int(pid), []string{"jcmd", "GC.class_histogram"}, true)
+	out, err := attacher.AttachContext(ctx, int(pid), []string{"jcmd", "GC.class_histogram"}, true)
 	if err != nil {
 		i.log.Error("error executing command for the JVM", "pid", pid, "error", err)
 		return false, err
@@ -386,6 +727,8 @@ func (i *JavaInjector) jdkAgentAlreadyLoadedHotspot8(attacher *jvm.JAttacher, pi
 	if out == nil {
 		return false, nil
 	}
+	defer func() { resultErr = errors.Join(resultErr, out.Close()) }()
+	defer closeOnContext(ctx, out)()
 
 	scanner := bufio.NewScanner(out)
 	for scanner.Scan() {
@@ -395,28 +738,31 @@ func (i *JavaInjector) jdkAgentAlreadyLoadedHotspot8(attacher *jvm.JAttacher, pi
 			return true, nil
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		return false, fmt.Errorf("read loaded JVM classes: %w", err)
+	}
 
 	return false, nil
 }
 
-func (i *JavaInjector) verifyJVMVersion(attacher *jvm.JAttacher, pid app.PID) (bool, bool) {
+func (i *JavaInjector) verifyJVMVersion(
+	ctx context.Context, attacher javaAttacher, pid app.PID,
+) (supported bool, jdk8 bool, resultErr error) {
 	attacher.Init()
+	defer func() { resultErr = errors.Join(resultErr, attacher.Cleanup()) }()
 
-	defer func() {
-		if err := attacher.Cleanup(); err != nil {
-			slog.Warn("error on JVM attach cleanup", "error", err)
-		}
-	}()
 	// OpenJ9 doesn't support VM.version command
-	out, err := attacher.Attach(int(pid), []string{"jcmd", "VM.version"}, true)
+	out, err := attacher.AttachContext(ctx, int(pid), []string{"jcmd", "VM.version"}, true)
 	if err != nil {
 		i.log.Error("error executing command for the JVM", "pid", pid, "error", err)
-		return false, false
+		return false, false, err
 	}
 
 	if out == nil {
-		return true, false
+		return true, false, nil
 	}
+	defer func() { resultErr = errors.Join(resultErr, out.Close()) }()
+	defer closeOnContext(ctx, out)()
 
 	scanner := bufio.NewScanner(out)
 	for scanner.Scan() {
@@ -424,12 +770,12 @@ func (i *JavaInjector) verifyJVMVersion(attacher *jvm.JAttacher, pid app.PID) (b
 		if strings.HasPrefix(line, "JDK ") {
 			// JDK 8 is special, failing to properly detect it can cause errors in applications if they are
 			// loaded more than once
-			return !strings.HasPrefix(line, "JDK 28"), strings.HasPrefix(line, "JDK 8")
+			return !strings.HasPrefix(line, "JDK 28"), strings.HasPrefix(line, "JDK 8"), nil
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		i.log.Error("error reading from scanner", "error", err)
+		return false, false, fmt.Errorf("read JVM version: %w", err)
 	}
 
-	return false, false
+	return false, false, nil
 }

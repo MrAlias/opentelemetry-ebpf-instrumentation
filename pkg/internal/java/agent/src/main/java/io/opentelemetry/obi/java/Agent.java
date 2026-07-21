@@ -8,14 +8,7 @@ package io.opentelemetry.obi.java;
 import static net.bytebuddy.dynamic.loading.ClassInjector.UsingInstrumentation.Target.BOOTSTRAP;
 import static net.bytebuddy.matcher.ElementMatchers.nameStartsWith;
 
-import io.opentelemetry.obi.java.ebpf.*;
 import io.opentelemetry.obi.java.instrumentations.*;
-import io.opentelemetry.obi.java.instrumentations.data.BytesWithLen;
-import io.opentelemetry.obi.java.instrumentations.data.Connection;
-import io.opentelemetry.obi.java.instrumentations.data.SSLStorage;
-import io.opentelemetry.obi.java.instrumentations.util.ByteBufferExtractor;
-import io.opentelemetry.obi.java.instrumentations.util.CappedConcurrentHashMap;
-import io.opentelemetry.obi.java.instrumentations.util.NettyChannelExtractor;
 import java.io.File;
 import java.io.InputStream;
 import java.lang.instrument.Instrumentation;
@@ -32,19 +25,47 @@ import net.bytebuddy.dynamic.loading.ClassInjector;
 import net.bytebuddy.utility.JavaModule;
 
 public class Agent {
-  public static int IOCTL_CMD = 0x0b10b1;
-
+  private static final String REMOTE_PARENT_BOOTSTRAP_CLASS =
+      "io.opentelemetry.obi.java.bridge.RemoteParentBootstrap";
   public static volatile boolean debugOn = false;
   private static final Logger logger = Logger.getLogger("Agent");
   private static volatile boolean agentLoaded = false;
-
-  public static class NativeLib {
-    // Used to send data to the eBPF side, both TLS traffic and thread Parent Context
-    public static native int ioctl(int fd, int cmd, long argp);
-
-    // Used to find the OS thread id for thread correlation.
-    public static native int gettid();
-  }
+  private static boolean agentInstallationInProgress = false;
+  private static final Set<String> BOOTSTRAP_HELPER_CLASS_NAMES =
+      Collections.unmodifiableSet(
+          new LinkedHashSet<>(
+              Arrays.asList(
+                  "io.opentelemetry.obi.java.BootstrapNative",
+                  "io.opentelemetry.obi.java.ebpf.ProxyOutputStream",
+                  "io.opentelemetry.obi.java.ebpf.ProxyInputStream",
+                  "io.opentelemetry.obi.java.ebpf.ConnectionInfo",
+                  "io.opentelemetry.obi.java.ebpf.ThreadInfo",
+                  "io.opentelemetry.obi.java.ebpf.ThreadInfo$TaskRelayState",
+                  "io.opentelemetry.obi.java.ebpf.ThreadInfo$TaskContextEmitter",
+                  "io.opentelemetry.obi.java.ebpf.IOCTLPacket",
+                  "io.opentelemetry.obi.java.ebpf.OperationType",
+                  "io.opentelemetry.obi.java.ebpf.NativeMemory",
+                  "io.opentelemetry.obi.java.instrumentations.data.BytesWithLen",
+                  "io.opentelemetry.obi.java.instrumentations.data.Connection",
+                  "io.opentelemetry.obi.java.instrumentations.data.SSLStorage",
+                  "io.opentelemetry.obi.java.instrumentations.data.TaskContext",
+                  "io.opentelemetry.obi.java.instrumentations.data.WeakIdentityTaskMap",
+                  "io.opentelemetry.obi.java.instrumentations.data.WeakIdentityTaskMap$Bucket",
+                  "io.opentelemetry.obi.java.instrumentations.data.WeakIdentityTaskMap$Entry",
+                  "io.opentelemetry.obi.java.instrumentations.util.ByteBufferExtractor",
+                  "io.opentelemetry.obi.java.instrumentations.util.CappedConcurrentHashMap",
+                  "io.opentelemetry.obi.java.instrumentations.util.NettyChannelExtractor",
+                  "io.opentelemetry.obi.java.bridge.RemoteParentStatus",
+                  "io.opentelemetry.obi.java.bridge.RemoteParentDiagnostics",
+                  "io.opentelemetry.obi.java.bridge.RemoteParentTransport",
+                  "io.opentelemetry.obi.java.bridge.RemoteParentRecord",
+                  "io.opentelemetry.obi.java.bridge.RemoteParentProvider",
+                  "io.opentelemetry.obi.java.bridge.RemoteParentBridge",
+                  "io.opentelemetry.obi.java.bridge.RemoteParentBridge$NoopProvider",
+                  "io.opentelemetry.obi.java.bridge.NativeRemoteParentProvider",
+                  "io.opentelemetry.obi.java.bridge.NativeRemoteParentProvider$ProcessRegistrar",
+                  "io.opentelemetry.obi.java.bridge.NativeRemoteParentProvider$TransportConfigurer",
+                  "io.opentelemetry.obi.java.bridge.RemoteParentBootstrap")));
 
   static AgentBuilder builder(Map<String, String> opts, Instrumentation inst) {
     AgentBuilder builder =
@@ -73,12 +94,12 @@ public class Agent {
     return builder;
   }
 
-  private static Map<String, String> parseArgs(String agentArgs) {
+  static Map<String, String> parseArgs(String agentArgs) {
     Map<String, String> opts = new HashMap<>();
     if (agentArgs != null && !agentArgs.isEmpty()) {
       String[] options = agentArgs.split(",");
       for (String option : options) {
-        String[] keyValue = option.split("=");
+        String[] keyValue = option.split("=", 2);
         if (keyValue.length == 2) {
           opts.put(keyValue[0], keyValue[1]);
         }
@@ -96,67 +117,103 @@ public class Agent {
   // Main agent load and instrumentation code, this gets invoked directly with -javaagent on the
   // command line
   public static void premain(String agentArgs, Instrumentation inst) {
+    install(agentArgs, inst);
+  }
+
+  private static boolean install(String agentArgs, Instrumentation inst) {
     String osName = System.getProperty("os.name").toLowerCase(Locale.getDefault());
     if (!osName.contains("linux")) {
       logger.info("OpenTelemetry eBPF Java Agent only supports Linux, ignoring load request");
-      return;
-    }
-
-    synchronized (Agent.class) {
-      // Check if agent is already loaded
-      if (agentLoaded) {
-        logger.info("OpenTelemetry eBPF Java Agent already loaded, skipping initialization");
-      }
-      agentLoaded = true;
+      return false;
     }
 
     Map<String, String> opts = parseArgs(agentArgs);
+    if (reconfigureExistingInstallation(opts)) {
+      return false;
+    }
+
+    if (!claimLocalInstallation()) {
+      synchronized (Agent.class) {
+        if (agentLoaded) {
+          initializeRemoteParentBridge(opts);
+          logger.info("OpenTelemetry eBPF Java Agent already loaded; transport reconfigured");
+        } else {
+          logger.info("OpenTelemetry eBPF Java Agent installation already in progress");
+        }
+        return false;
+      }
+    }
 
     if (optEnabled(opts, "debug")) {
       Agent.debugOn = true;
     }
 
+    boolean installationClaimed = false;
     try {
       initClassesThatNeedToBeBootstrapped();
       injectBootstrapClasses(inst);
+      installationClaimed = beginBootstrapInstallation();
+      if (!installationClaimed) {
+        clearLocalInstallationClaim(false);
+        initializeRemoteParentBridge(opts);
+        logger.info("OpenTelemetry eBPF Java Agent already installed; transport reconfigured");
+        return false;
+      }
+      initializeRemoteParentBridge(opts);
       if (Agent.debugOn) {
         setupInstrumentationsDebugging();
       }
-    } catch (Exception x) {
-      logger.log(Level.SEVERE, "Failed to load agent", x);
-      return;
-    }
 
-    builder(opts, inst)
-        .type(SSLSocketInst.type())
-        .transform(SSLSocketInst.transformer())
-        .type(SSLSocketStreamInst.inputStreamType())
-        .transform(SSLSocketStreamInst.inputStreamTransformer())
-        .type(SSLSocketStreamInst.outputStreamType())
-        .transform(SSLSocketStreamInst.outputStreamTransformer())
-        .type(SSLEngineInst.type())
-        .transform(SSLEngineInst.transformer())
-        .type(SocketChannelInst.type())
-        .transform(SocketChannelInst.transformer())
-        .type(NettySSLHandlerInst.type())
-        .transform(NettySSLHandlerInst.transformer())
-        .type(JavaExecutorInst.type())
-        .transform(JavaExecutorInst.transformer())
-        .type(CallableInst.type())
-        .transform(CallableInst.transformer())
-        .type(RunnableInst.type())
-        .transform(RunnableInst.transformer())
-        .type(JavaForkJoinTaskInst.type())
-        .transform(JavaForkJoinTaskInst.transformer())
-        .type(VirtualThreadInst.type())
-        .transform(VirtualThreadInst.transformer())
-        .installOn(inst);
+      builder(opts, inst)
+          .type(SSLSocketInst.type())
+          .transform(SSLSocketInst.transformer())
+          .type(SSLSocketStreamInst.inputStreamType())
+          .transform(SSLSocketStreamInst.inputStreamTransformer())
+          .type(SSLSocketStreamInst.outputStreamType())
+          .transform(SSLSocketStreamInst.outputStreamTransformer())
+          .type(SSLEngineInst.type())
+          .transform(SSLEngineInst.transformer())
+          .type(SocketChannelInst.type())
+          .transform(SocketChannelInst.transformer())
+          .type(NettySSLHandlerInst.type())
+          .transform(NettySSLHandlerInst.transformer())
+          .type(JavaExecutorInst.type())
+          .transform(JavaExecutorInst.transformer())
+          .type(NettyExecutorInst.type())
+          .transform(NettyExecutorInst.transformer())
+          .type(CallableInst.type())
+          .transform(CallableInst.transformer())
+          .type(RunnableInst.type())
+          .transform(RunnableInst.transformer())
+          .type(JavaForkJoinTaskInst.type())
+          .transform(JavaForkJoinTaskInst.transformer())
+          .type(FutureInst.type())
+          .transform(FutureInst.transformer())
+          .type(RejectedExecutionHandlerInst.type())
+          .transform(RejectedExecutionHandlerInst.transformer())
+          .type(BlockingQueueInst.type())
+          .transform(BlockingQueueInst.transformer())
+          .type(VirtualThreadInst.type())
+          .transform(VirtualThreadInst.transformer())
+          .installOn(inst);
+      completeBootstrapInstallation();
+      clearLocalInstallationClaim(true);
+      return true;
+    } catch (Throwable failure) {
+      if (installationClaimed) {
+        cancelBootstrapInstallation();
+      }
+      clearLocalInstallationClaim(false);
+      logger.log(Level.SEVERE, "Failed to load agent", failure);
+      return false;
+    }
   }
 
   // Needed for Dynamic Agent Injection
   public static void agentmain(String args, Instrumentation inst) {
-    premain(args, inst);
-    retransformLoadedClasses(inst);
+    if (install(args, inst)) {
+      retransformLoadedClasses(inst);
+    }
   }
 
   // Package-private for testing. Retransforms already-loaded classes that match the agent's
@@ -175,9 +232,13 @@ public class Agent {
           || SSLEngineInst.matches(clazz)
           || SocketChannelInst.matches(clazz)
           || JavaExecutorInst.matches(clazz)
+          || NettyExecutorInst.matches(clazz)
           || CallableInst.matches(clazz)
           || RunnableInst.matches(clazz)
           || JavaForkJoinTaskInst.matches(clazz)
+          || FutureInst.matches(clazz)
+          || RejectedExecutionHandlerInst.matches(clazz)
+          || BlockingQueueInst.matches(clazz)
           || NettySSLHandlerInst.matches(clazz)
           || VirtualThreadInst.matches(clazz)) {
         if (Agent.debugOn) {
@@ -200,24 +261,125 @@ public class Agent {
   }
 
   private static void initClassesThatNeedToBeBootstrapped() throws Exception {
-    // Load the helper classes
-    Class.forName(ProxyOutputStream.class.getName());
-    Class.forName(ProxyInputStream.class.getName());
-    Class.forName(ConnectionInfo.class.getName());
-    Class.forName(ThreadInfo.class.getName());
-    Class.forName(IOCTLPacket.class.getName());
-    Class.forName(OperationType.class.getName());
-    Class.forName(Agent.class.getName());
-    Class.forName(BytesWithLen.class.getName());
-    Class.forName(Connection.class.getName());
-    Class.forName(NettyChannelExtractor.class.getName());
-    Class.forName(SSLStorage.class.getName());
-    Class.forName(ByteBufferExtractor.class.getName());
-    Class.forName(NativeMemory.class.getName());
-    Class.forName(NativeLib.class.getName());
-    Class.forName(CappedConcurrentHashMap.class.getName());
+    for (String className : BOOTSTRAP_HELPER_CLASS_NAMES) {
+      Class.forName(className);
+    }
+  }
 
-    loadNativeLibraryFromJar();
+  private static void initializeRemoteParentBridge(Map<String, String> opts) {
+    String transport = opts.getOrDefault("remoteParentTransport", "disabled");
+    String socketPath =
+        opts.getOrDefault("remoteParentSocket", "/var/run/obi/java-remote-parent.sock");
+    int timeoutMillis =
+        boundedIntOption(opts, "remoteParentTimeoutMillis", 50, 1, Integer.MAX_VALUE);
+    long serverUid = boundedLongOption(opts, "remoteParentServerUid", 0L, 0L, 0xffff_ffffL);
+    long processCapability = boundedLongOption(opts, "processCapability", 0L, 1L, Long.MAX_VALUE);
+
+    try {
+      Class<?> bootstrap = Class.forName(REMOTE_PARENT_BOOTSTRAP_CLASS, true, null);
+      java.lang.reflect.Method initialize =
+          bootstrap.getMethod(
+              "initialize", String.class, String.class, int.class, long.class, long.class);
+      Object installed =
+          initialize.invoke(
+              null, transport, socketPath, timeoutMillis, serverUid, processCapability);
+      if (Boolean.TRUE.equals(installed)) {
+        logger.info("OBI remote-parent provider ready");
+      } else if (!"disabled".equalsIgnoreCase(transport)) {
+        logger.warning("OBI remote-parent bridge provider is not ready");
+      }
+      logger.info(
+          "OBI remote-parent diagnostics "
+              + bootstrap.getMethod("diagnosticsSnapshot").invoke(null));
+    } catch (Throwable t) {
+      logger.log(Level.WARNING, "OBI remote-parent bridge is unavailable", t);
+    }
+  }
+
+  private static boolean reconfigureExistingInstallation(Map<String, String> opts) {
+    try {
+      Class<?> bootstrap = Class.forName(REMOTE_PARENT_BOOTSTRAP_CLASS, true, null);
+      java.lang.reflect.Method claimed = bootstrap.getMethod("instrumentationInstallationClaimed");
+      if (!Boolean.TRUE.equals(claimed.invoke(null))) {
+        return false;
+      }
+      initializeRemoteParentBridge(opts);
+      logger.info("OpenTelemetry eBPF Java Agent already installed; transport reconfigured");
+      return true;
+    } catch (ClassNotFoundException ignored) {
+      return false;
+    } catch (Throwable failure) {
+      logger.log(
+          Level.WARNING,
+          "Unable to inspect the existing OpenTelemetry eBPF Java Agent installation; "
+              + "skipping duplicate installation",
+          failure);
+      return true;
+    }
+  }
+
+  private static boolean beginBootstrapInstallation() throws Exception {
+    Class<?> bootstrap = Class.forName(REMOTE_PARENT_BOOTSTRAP_CLASS, true, null);
+    return Boolean.TRUE.equals(
+        bootstrap.getMethod("beginInstrumentationInstallation").invoke(null));
+  }
+
+  private static void completeBootstrapInstallation() throws Exception {
+    Class<?> bootstrap = Class.forName(REMOTE_PARENT_BOOTSTRAP_CLASS, true, null);
+    bootstrap.getMethod("completeInstrumentationInstallation").invoke(null);
+  }
+
+  private static void cancelBootstrapInstallation() {
+    try {
+      Class<?> bootstrap = Class.forName(REMOTE_PARENT_BOOTSTRAP_CLASS, true, null);
+      bootstrap.getMethod("cancelInstrumentationInstallation").invoke(null);
+    } catch (Throwable failure) {
+      logger.log(Level.WARNING, "Unable to cancel the failed agent installation", failure);
+    }
+  }
+
+  static synchronized boolean claimLocalInstallation() {
+    if (agentLoaded || agentInstallationInProgress) {
+      return false;
+    }
+    agentInstallationInProgress = true;
+    return true;
+  }
+
+  static synchronized void clearLocalInstallationClaim(boolean installed) {
+    agentLoaded = installed;
+    agentInstallationInProgress = false;
+  }
+
+  static int boundedIntOption(
+      Map<String, String> opts, String name, int defaultValue, int minimum, int maximum) {
+    String value = opts.get(name);
+    if (value == null) {
+      return defaultValue;
+    }
+    try {
+      int parsed = Integer.parseInt(value);
+      return Math.max(minimum, Math.min(maximum, parsed));
+    } catch (NumberFormatException ignored) {
+      return defaultValue;
+    }
+  }
+
+  static long boundedLongOption(
+      Map<String, String> opts, String name, long defaultValue, long minimum, long maximum) {
+    String value = opts.get(name);
+    if (value == null) {
+      return defaultValue;
+    }
+    try {
+      long parsed = Long.parseLong(value);
+      if (parsed < minimum || parsed > maximum) {
+        return defaultValue;
+      }
+      return parsed;
+    } catch (NumberFormatException ignored) {
+      return defaultValue;
+    }
   }
 
   private static void injectBootstrapClasses(Instrumentation instrumentation) throws Exception {
@@ -234,9 +396,18 @@ public class Agent {
             ClassFileLocator.ForClassLoader.ofPlatformLoader(),
             ClassFileLocator.ForClassLoader.ofBootLoader());
 
+    Set<String> missingHelpers = new HashSet<>();
+    for (String className : BOOTSTRAP_HELPER_CLASS_NAMES) {
+      try {
+        Class.forName(className, false, null);
+      } catch (ClassNotFoundException ignored) {
+        missingHelpers.add(className);
+      }
+    }
+
     for (Class<?> clazz : instrumentation.getAllLoadedClasses()) {
       TypeDescription desc = new TypeDescription.ForLoadedType(clazz);
-      if (desc.getName().startsWith("io.opentelemetry.obi.")) {
+      if (missingHelpers.contains(desc.getName())) {
         try {
           byte[] bytes = locator.locate(desc.getName()).resolve();
           typeMap.put(desc, bytes);
@@ -244,23 +415,39 @@ public class Agent {
         }
       }
     }
+    if (typeMap.size() != missingHelpers.size()) {
+      throw new IllegalStateException("Unable to resolve every missing bootstrap helper class");
+    }
 
-    ClassInjector injector =
-        ClassInjector.UsingInstrumentation.of(tempDir, BOOTSTRAP, instrumentation);
-    injector.inject(typeMap);
+    if (!typeMap.isEmpty()) {
+      ClassInjector injector =
+          ClassInjector.UsingInstrumentation.of(tempDir, BOOTSTRAP, instrumentation);
+      injector.inject(typeMap);
+    }
     tempDir.delete();
 
     // After injecting into bootstrap, we need to ensure the native library is loaded
     // in the bootstrap classloader context
     try {
-      // Load the Agent class from bootstrap classloader (initialize = true), (null = bootstrap)
-      Class<?> bootstrapAgentClass = Class.forName("io.opentelemetry.obi.java.Agent", true, null);
-
-      // Call the static loadNativeLibraryFromJar method on the bootstrap version
+      Class<?> bootstrapNativeClass =
+          Class.forName("io.opentelemetry.obi.java.BootstrapNative", true, null);
       java.lang.reflect.Method loadMethod =
-          bootstrapAgentClass.getDeclaredMethod("loadNativeLibraryFromJar");
+          bootstrapNativeClass.getDeclaredMethod("loadNativeLibrary", String.class);
+      java.lang.reflect.Method loadedMethod =
+          bootstrapNativeClass.getDeclaredMethod("isNativeLibraryLoaded");
       loadMethod.setAccessible(true);
-      loadMethod.invoke(null);
+      loadedMethod.setAccessible(true);
+      if (!Boolean.TRUE.equals(loadedMethod.invoke(null))) {
+        String nativeLibrary = extractNativeLibraryFromJar();
+        try {
+          loadMethod.invoke(null, nativeLibrary);
+        } finally {
+          File extracted = new File(nativeLibrary);
+          if (!extracted.delete()) {
+            extracted.deleteOnExit();
+          }
+        }
+      }
 
       if (Agent.debugOn) {
         logger.info("Successfully loaded native library in bootstrap classloader");
@@ -279,26 +466,16 @@ public class Agent {
         Class.forName(name, true, null);
       }
 
-      // Arm ThreadInfo's preallocated VT emit buffers on the BOOTSTRAP copy
-      // (the one the VirtualThread advices resolve), now that its native
-      // library binding is in place: the mount path must never allocate
-      // direct memory (Bits.reserveMemory can System.gc/sleep).
-      // A failed warmup (e.g. direct-memory pressure throwing an Error) must
-      // not disable the whole agent: emitVtOp drops VT emits while the pool is
-      // unarmed (degrading to carrier-tid keying), so catch Throwable and continue.
-      try {
-        Class<?> bootstrapThreadInfo =
-            Class.forName(io.opentelemetry.obi.java.ebpf.ThreadInfo.class.getName(), true, null);
-        bootstrapThreadInfo.getDeclaredMethod("initVtEmitPool").invoke(null);
-      } catch (Throwable t) {
-        logger.severe("Failed to arm VT emit buffers, VT correlation disabled: " + t);
-      }
     } catch (Exception e) {
       if (Agent.debugOn) {
         logger.severe("Error initializing the JNI library" + e.getMessage());
       }
       throw e;
     }
+  }
+
+  static boolean isBootstrapHelperClassName(String className) {
+    return BOOTSTRAP_HELPER_CLASS_NAMES.contains(className);
   }
 
   // Picks the correct native library based on the
@@ -316,9 +493,7 @@ public class Agent {
     throw new IllegalStateException("Unsupported architecture: " + arch);
   }
 
-  // Package-private so it can be called from bootstrap classloader via reflection
-  static void loadNativeLibraryFromJar() throws Exception {
-    // Try to load from JAR
+  private static String extractNativeLibraryFromJar() throws Exception {
     InputStream libStream = Agent.class.getResourceAsStream(nativeLibraryResourcePath());
     if (libStream != null) {
       if (Agent.debugOn) {
@@ -327,7 +502,6 @@ public class Agent {
 
       // Extract to temp file
       File tempLib = File.createTempFile("libobijni", ".so");
-      tempLib.deleteOnExit();
 
       try (java.io.FileOutputStream out = new java.io.FileOutputStream(tempLib)) {
         byte[] buffer = new byte[8192];
@@ -346,11 +520,10 @@ public class Agent {
         logger.info("File readable: " + tempLib.canRead());
       }
 
-      // Load from temp file
-      System.load(tempLib.getAbsolutePath());
       if (Agent.debugOn) {
-        logger.info("Loaded native library from JAR: " + tempLib.getAbsolutePath());
+        logger.info("Extracted native library from JAR: " + tempLib.getAbsolutePath());
       }
+      return tempLib.getAbsolutePath();
     } else {
       throw new Exception("agent not found in jar file");
     }

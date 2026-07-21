@@ -491,6 +491,31 @@ static int transfer_all(int fd, unsigned char *buffer, size_t length,
   return 0;
 }
 
+static int exchange_unix_request(int fd, unsigned char *request,
+                                 unsigned char *response, int64_t deadline) {
+  int request_failed = 0;
+  if (transfer_all(fd, request, remote_parent_request_size, 1, deadline) != 0) {
+    if (errno != EPIPE && errno != ECONNRESET) {
+      return -1;
+    }
+    request_failed = 1;
+  }
+
+  if (transfer_all(fd, response, remote_parent_record_size, 0, deadline) != 0) {
+    return -1;
+  }
+
+  int status = response_status(response, remote_parent_record_size);
+  if (!request_failed) {
+    return status;
+  }
+  if (status == remote_parent_status_valid) {
+    status = remote_parent_status_malformed;
+  }
+  status_response(response, status);
+  return status;
+}
+
 static int unix_address(const struct remote_parent_config *config,
                         struct sockaddr_un *address, socklen_t *length) {
   size_t path_length =
@@ -621,12 +646,11 @@ static int call_unix_socket(const struct remote_parent_config *config,
   build_unix_request(request, operation, (uint32_t)syscall(SYS_gettid),
                      config->process_incarnation);
 
-  if (transfer_all(fd, request, sizeof(request), 1, deadline) != 0 ||
-      transfer_all(fd, response, remote_parent_record_size, 0, deadline) != 0) {
+  status = exchange_unix_request(fd, request, response, deadline);
+  if (status < 0) {
     status = errno_status(errno);
     goto done;
   }
-  status = response_status(response, remote_parent_record_size);
   response_complete = 1;
 
 done:
@@ -948,6 +972,14 @@ int obi_test_call_remote_parent(int operation, unsigned char *response) {
 int obi_test_call_remote_parent_on_socket(int operation, int socket_fd,
                                           unsigned char *response) {
   return call_remote_parent(operation, socket_fd, response);
+}
+
+int obi_test_exchange_unix_request(int fd, unsigned char *response,
+                                   int64_t deadline) {
+  unsigned char request[remote_parent_request_size];
+  build_unix_request(request, remote_parent_operation_take,
+                     (uint32_t)syscall(SYS_gettid), 1);
+  return exchange_unix_request(fd, request, response, deadline);
 }
 
 int obi_test_emit_data_on_socket(int socket_fd, unsigned char *packet) {

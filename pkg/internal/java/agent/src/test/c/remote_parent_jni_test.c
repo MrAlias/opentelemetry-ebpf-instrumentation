@@ -38,6 +38,8 @@ int obi_test_configure_remote_parent(int transport, const char *path,
 int obi_test_call_remote_parent(int operation, unsigned char *response);
 int obi_test_call_remote_parent_on_socket(int operation, int socket_fd,
                                           unsigned char *response);
+int obi_test_exchange_unix_request(int fd, unsigned char *response,
+                                   int64_t deadline);
 int obi_test_emit_data_on_socket(int socket_fd, unsigned char *packet);
 void obi_test_close_remote_parent(void);
 int obi_test_lock_remote_parent(void);
@@ -87,6 +89,7 @@ static pthread_mutex_t fake_negotiation_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct fake_negotiation fake_negotiations[fake_negotiation_capacity];
 
 static uint64_t read_u64_le(const unsigned char *buffer, size_t offset);
+static int64_t test_monotonic_millis(void);
 
 static void remember_fake_negotiation(int fd, uint64_t incarnation) {
   assert(pthread_mutex_lock(&fake_negotiation_lock) == 0);
@@ -761,6 +764,63 @@ static void test_unix_trickle_response_obeys_deadline(void) {
   obi_test_close_remote_parent();
 }
 
+static void test_unix_server_first_failure_response(void) {
+  int sockets[2];
+  assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0,
+                    sockets) == 0);
+
+  unsigned char expected[64];
+  obi_test_status_response(expected, 11);
+  assert(send(sockets[1], expected, sizeof(expected), MSG_NOSIGNAL) ==
+         (ssize_t)sizeof(expected));
+  close(sockets[1]);
+
+  unsigned char response[64];
+  assert(obi_test_exchange_unix_request(sockets[0], response,
+                                        test_monotonic_millis() + 100) == 11);
+  assert(memcmp(response, expected, sizeof(response)) == 0);
+  close(sockets[0]);
+}
+
+static void test_unix_server_first_valid_response_is_rejected(void) {
+  int sockets[2];
+  assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0,
+                    sockets) == 0);
+
+  unsigned char offered[64];
+  obi_test_status_response(offered, 1);
+  offered[16] = 1;
+  offered[32] = 1;
+  assert(send(sockets[1], offered, sizeof(offered), MSG_NOSIGNAL) ==
+         (ssize_t)sizeof(offered));
+  close(sockets[1]);
+
+  unsigned char response[64];
+  assert(obi_test_exchange_unix_request(sockets[0], response,
+                                        test_monotonic_millis() + 100) == 5);
+  unsigned char expected[64];
+  obi_test_status_response(expected, 5);
+  assert(memcmp(response, expected, sizeof(response)) == 0);
+  close(sockets[0]);
+}
+
+static void test_unix_server_first_truncated_response_fails_closed(void) {
+  int sockets[2];
+  assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0,
+                    sockets) == 0);
+
+  unsigned char response[64];
+  obi_test_status_response(response, 11);
+  assert(send(sockets[1], response, sizeof(response) - 1, MSG_NOSIGNAL) ==
+         (ssize_t)sizeof(response) - 1);
+  close(sockets[1]);
+
+  assert(obi_test_exchange_unix_request(sockets[0], response,
+                                        test_monotonic_millis() + 100) == -1);
+  assert(errno == EPROTO);
+  close(sockets[0]);
+}
+
 static void test_unix_socket_owner_must_match_configured_uid(void) {
   char path[sizeof(((struct sockaddr_un *)0)->sun_path)];
   snprintf(path, sizeof(path), "/tmp/obi-jni-owner-test-%ld.sock",
@@ -996,6 +1056,9 @@ int main(void) {
   test_exported_jni_transport_lifecycle();
   test_exported_jni_configuration_validation();
   test_unix_trickle_response_obeys_deadline();
+  test_unix_server_first_failure_response();
+  test_unix_server_first_valid_response_is_rejected();
+  test_unix_server_first_truncated_response_fails_closed();
   test_unix_socket_owner_must_match_configured_uid();
   test_reconfiguration_does_not_block_application_requests();
   test_concurrent_configure_call_and_close_are_memory_safe();

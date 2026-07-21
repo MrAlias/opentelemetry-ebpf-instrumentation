@@ -1316,8 +1316,17 @@ func fallbackRoundTrip(t *testing.T, socketPath string, request []byte) Record {
 	defer conn.Close()
 	require.NoError(t, conn.SetDeadline(time.Now().Add(time.Second)))
 	_, err = conn.Write(request)
-	require.NoError(t, err)
-	return readFallbackRecord(t, conn)
+	if err != nil {
+		require.True(t,
+			errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET),
+			"unexpected fallback request write error: %v", err,
+		)
+	}
+	record := readFallbackRecord(t, conn)
+	if err != nil {
+		require.NotEqual(t, StatusValid, record.Status)
+	}
+	return record
 }
 
 func readFallbackRecord(t *testing.T, reader io.Reader) Record {

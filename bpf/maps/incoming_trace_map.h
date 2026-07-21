@@ -41,7 +41,7 @@ _Static_assert(sizeof(incoming_trace_candidate_t) == 64, "incoming trace candida
 // bpf_spin_lock is not permitted by the verifier.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key, connection_info_ns_t);
+    __type(key, connection_info_netns_cookie_t);
     __type(value, u64);
     __uint(max_entries, MAX_CONCURRENT_REQUESTS);
     __uint(pinning, OBI_PIN_INTERNAL);
@@ -80,7 +80,7 @@ struct {
 } incoming_trace_generation SEC(".maps");
 
 SCRATCH_MEM_TYPED(incoming_trace_snapshot, tp_info_pid_t)
-SCRATCH_MEM_TYPED(incoming_trace_connection_key, connection_info_ns_t)
+SCRATCH_MEM_TYPED(incoming_trace_connection_key, connection_info_netns_cookie_t)
 SCRATCH_MEM_TYPED(incoming_trace_candidate_value, incoming_trace_candidate_t)
 
 enum incoming_trace_update_result : u8 {
@@ -102,14 +102,16 @@ static __always_inline s32 incoming_trace_sequence_order(u32 candidate, u32 refe
     return (s32)(candidate - reference);
 }
 
-static __always_inline connection_info_ns_t *
-incoming_trace_connection_key_for(const connection_info_t *connection, u32 netns) {
-    connection_info_ns_t *key = (connection_info_ns_t *)incoming_trace_connection_key_mem();
-    if (!key) {
+static __always_inline connection_info_netns_cookie_t *
+incoming_trace_connection_key_for(const connection_info_t *connection, u64 netns_cookie) {
+    connection_info_netns_cookie_t *key =
+        (connection_info_netns_cookie_t *)incoming_trace_connection_key_mem();
+    if (!key || !netns_cookie) {
         return NULL;
     }
     __builtin_memcpy(&key->connection, connection, sizeof(key->connection));
-    key->netns = netns;
+    key->reserved = 0;
+    key->netns_cookie = netns_cookie;
     return key;
 }
 
@@ -147,12 +149,43 @@ static __always_inline u8 incoming_trace_publish_candidate(const tp_info_pid_t *
     return 1;
 }
 
+static __always_inline void
+incoming_trace_poison_generation(connection_info_netns_cookie_t *connection_key, u64 generation) {
+    u64 *head = bpf_map_lookup_elem(&incoming_trace_heads, connection_key);
+    if (head && *head == generation) {
+        const u64 tombstone = 0;
+        bpf_map_update_elem(&incoming_trace_heads, connection_key, &tombstone, BPF_EXIST);
+        bpf_map_delete_elem(&incoming_trace_heads, connection_key);
+    }
+    bpf_map_delete_elem(&incoming_trace_candidates, &generation);
+    bpf_map_delete_elem(&incoming_trace_claims, &generation);
+    bpf_map_delete_elem(&incoming_trace_ambiguity, &generation);
+}
+
+static __always_inline enum incoming_trace_update_result incoming_trace_mark_ambiguous(
+    connection_info_netns_cookie_t *connection_key, u64 generation, u64 *ambiguous_generation) {
+    if (ambiguous_generation) {
+        *ambiguous_generation = generation;
+    }
+    const u8 ambiguous = 1;
+    if (bpf_map_update_elem(&incoming_trace_ambiguity, &generation, &ambiguous, BPF_ANY) != 0) {
+        incoming_trace_poison_generation(connection_key, generation);
+        return k_incoming_trace_update_failed;
+    }
+    return k_incoming_trace_ambiguous;
+}
+
 static __always_inline enum incoming_trace_update_result
-update_strict_incoming_trace(const connection_info_t *connection,
-                             const tp_info_pid_t *candidate,
-                             u32 tcp_sequence,
-                             u32 netns) {
-    connection_info_ns_t *connection_key = incoming_trace_connection_key_for(connection, netns);
+update_strict_incoming_trace_with_generation(const connection_info_t *connection,
+                                             const tp_info_pid_t *candidate,
+                                             u32 tcp_sequence,
+                                             u64 netns_cookie,
+                                             u64 *ambiguous_generation) {
+    if (ambiguous_generation) {
+        *ambiguous_generation = 0;
+    }
+    connection_info_netns_cookie_t *connection_key =
+        incoming_trace_connection_key_for(connection, netns_cookie);
     if (!connection_key) {
         return k_incoming_trace_update_failed;
     }
@@ -180,12 +213,14 @@ update_strict_incoming_trace(const connection_info_t *connection,
     const incoming_trace_candidate_t *current =
         bpf_map_lookup_elem(&incoming_trace_candidates, &current_generation);
     if (!current || *head != current_generation) {
-        const u8 ambiguous = 1;
-        bpf_map_update_elem(&incoming_trace_ambiguity, &current_generation, &ambiguous, BPF_ANY);
-        return k_incoming_trace_ambiguous;
+        return incoming_trace_mark_ambiguous(
+            connection_key, current_generation, ambiguous_generation);
     }
 
     if (bpf_map_lookup_elem(&incoming_trace_ambiguity, &current_generation)) {
+        if (ambiguous_generation) {
+            *ambiguous_generation = current_generation;
+        }
         return k_incoming_trace_ambiguous;
     }
     if (incoming_trace_same_candidate(&current->candidate, candidate) &&
@@ -193,15 +228,12 @@ update_strict_incoming_trace(const connection_info_t *connection,
         return k_incoming_trace_duplicate;
     }
     if (!bpf_map_lookup_elem(&incoming_trace_claims, &current_generation)) {
-        const u8 ambiguous = 1;
-        if (bpf_map_update_elem(
-                &incoming_trace_ambiguity, &current_generation, &ambiguous, BPF_ANY) != 0) {
-            return k_incoming_trace_update_failed;
-        }
-        return k_incoming_trace_ambiguous;
+        return incoming_trace_mark_ambiguous(
+            connection_key, current_generation, ambiguous_generation);
     }
     if (incoming_trace_sequence_order(tcp_sequence, current->tcp_sequence) <= 0) {
-        return k_incoming_trace_ambiguous;
+        return incoming_trace_mark_ambiguous(
+            connection_key, current_generation, ambiguous_generation);
     }
 
     u64 next_generation = 0;
@@ -221,16 +253,39 @@ update_strict_incoming_trace(const connection_info_t *connection,
 }
 
 static __always_inline enum incoming_trace_update_result
-update_incoming_trace(const connection_info_t *connection,
-                      const tp_info_pid_t *candidate,
-                      u32 tcp_sequence,
-                      u32 netns) {
+update_strict_incoming_trace(const connection_info_t *connection,
+                             const tp_info_pid_t *candidate,
+                             u32 tcp_sequence,
+                             u64 netns_cookie) {
+    return update_strict_incoming_trace_with_generation(
+        connection, candidate, tcp_sequence, netns_cookie, NULL);
+}
+
+static __always_inline enum incoming_trace_update_result
+update_incoming_trace_with_generation(const connection_info_t *connection,
+                                      const tp_info_pid_t *candidate,
+                                      u32 tcp_sequence,
+                                      u64 netns_cookie,
+                                      u64 *ambiguous_generation) {
     if (!java_remote_parent_enabled) {
+        if (ambiguous_generation) {
+            *ambiguous_generation = 0;
+        }
         return bpf_map_update_elem(&incoming_trace_map, connection, candidate, BPF_ANY) == 0
                    ? k_incoming_trace_inserted
                    : k_incoming_trace_update_failed;
     }
-    return update_strict_incoming_trace(connection, candidate, tcp_sequence, netns);
+    return update_strict_incoming_trace_with_generation(
+        connection, candidate, tcp_sequence, netns_cookie, ambiguous_generation);
+}
+
+static __always_inline enum incoming_trace_update_result
+update_incoming_trace(const connection_info_t *connection,
+                      const tp_info_pid_t *candidate,
+                      u32 tcp_sequence,
+                      u64 netns_cookie) {
+    return update_incoming_trace_with_generation(
+        connection, candidate, tcp_sequence, netns_cookie, NULL);
 }
 
 static __always_inline tp_info_pid_t *
@@ -250,8 +305,9 @@ legacy_consume_incoming_trace(const connection_info_t *connection) {
 }
 
 static __always_inline tp_info_pid_t *
-snapshot_strict_incoming_trace(const connection_info_t *connection, u32 netns) {
-    connection_info_ns_t *connection_key = incoming_trace_connection_key_for(connection, netns);
+snapshot_strict_incoming_trace(const connection_info_t *connection, u64 netns_cookie) {
+    connection_info_netns_cookie_t *connection_key =
+        incoming_trace_connection_key_for(connection, netns_cookie);
     if (!connection_key) {
         return NULL;
     }
@@ -286,36 +342,36 @@ snapshot_strict_incoming_trace(const connection_info_t *connection, u32 netns) {
 }
 
 static __always_inline tp_info_pid_t *
-snapshot_incoming_trace_in_netns(const connection_info_t *connection, u32 netns) {
+snapshot_incoming_trace_in_netns_cookie(const connection_info_t *connection, u64 netns_cookie) {
     if (!java_remote_parent_enabled) {
         return NULL;
     }
-    return snapshot_strict_incoming_trace(connection, netns);
+    return snapshot_strict_incoming_trace(connection, netns_cookie);
 }
 
 static __always_inline tp_info_pid_t *snapshot_incoming_trace(const connection_info_t *connection) {
-    return snapshot_incoming_trace_in_netns(connection, task_netns());
+    return snapshot_incoming_trace_in_netns_cookie(connection, task_netns_cookie());
 }
 
-static __always_inline u8 incoming_trace_pending_matches_in_netns(
-    const connection_info_t *connection, u32 netns, const tp_info_pid_t *candidate) {
-    if (!java_remote_parent_enabled) {
-        return 0;
-    }
-    connection_info_ns_t *connection_key = incoming_trace_connection_key_for(connection, netns);
+static __always_inline u8
+incoming_trace_claimed_generation_matches_in_netns_cookie(const connection_info_t *connection,
+                                                          u64 netns_cookie,
+                                                          u64 generation,
+                                                          const tp_info_pid_t *candidate) {
+    connection_info_netns_cookie_t *connection_key =
+        incoming_trace_connection_key_for(connection, netns_cookie);
     if (!connection_key) {
         return 0;
     }
     const u64 *head = bpf_map_lookup_elem(&incoming_trace_heads, connection_key);
-    if (!head || !*head) {
+    if (!head || !generation || *head != generation) {
         return 0;
     }
 
-    const u64 generation = *head;
     const incoming_trace_candidate_t *current =
         bpf_map_lookup_elem(&incoming_trace_candidates, &generation);
     if (!current || !incoming_trace_same_candidate(&current->candidate, candidate) ||
-        bpf_map_lookup_elem(&incoming_trace_claims, &generation) ||
+        !bpf_map_lookup_elem(&incoming_trace_claims, &generation) ||
         bpf_map_lookup_elem(&incoming_trace_ambiguity, &generation)) {
         return 0;
     }
@@ -324,14 +380,13 @@ static __always_inline u8 incoming_trace_pending_matches_in_netns(
     return head && *head == generation;
 }
 
-static __always_inline u8 incoming_trace_pending_matches(const connection_info_t *connection,
-                                                         const tp_info_pid_t *candidate) {
-    return incoming_trace_pending_matches_in_netns(connection, task_netns(), candidate);
-}
-
-static __always_inline tp_info_pid_t *
-consume_strict_incoming_trace(const connection_info_t *connection, u32 netns) {
-    connection_info_ns_t *connection_key = incoming_trace_connection_key_for(connection, netns);
+static __always_inline tp_info_pid_t *consume_strict_incoming_trace_with_generation(
+    const connection_info_t *connection, u64 netns_cookie, u64 *generation_out) {
+    if (generation_out) {
+        *generation_out = 0;
+    }
+    connection_info_netns_cookie_t *connection_key =
+        incoming_trace_connection_key_for(connection, netns_cookie);
     if (!connection_key) {
         return NULL;
     }
@@ -368,26 +423,49 @@ consume_strict_incoming_trace(const connection_info_t *connection, u32 netns) {
         bpf_map_delete_elem(&incoming_trace_claims, &generation);
         return NULL;
     }
+    if (generation_out) {
+        *generation_out = generation;
+    }
     return snapshot;
 }
 
 static __always_inline tp_info_pid_t *
-consume_incoming_trace_in_netns(const connection_info_t *connection, u32 netns) {
+consume_strict_incoming_trace(const connection_info_t *connection, u64 netns_cookie) {
+    return consume_strict_incoming_trace_with_generation(connection, netns_cookie, NULL);
+}
+
+static __always_inline tp_info_pid_t *consume_incoming_trace_in_netns_cookie_with_generation(
+    const connection_info_t *connection, u64 netns_cookie, u64 *generation_out) {
     if (!java_remote_parent_enabled) {
+        if (generation_out) {
+            *generation_out = 0;
+        }
         return legacy_consume_incoming_trace(connection);
     }
-    return consume_strict_incoming_trace(connection, netns);
+    return consume_strict_incoming_trace_with_generation(connection, netns_cookie, generation_out);
+}
+
+static __always_inline tp_info_pid_t *
+consume_incoming_trace_in_netns_cookie(const connection_info_t *connection, u64 netns_cookie) {
+    return consume_incoming_trace_in_netns_cookie_with_generation(connection, netns_cookie, NULL);
+}
+
+static __always_inline tp_info_pid_t *
+consume_incoming_trace_with_generation(const connection_info_t *connection, u64 *generation_out) {
+    return consume_incoming_trace_in_netns_cookie_with_generation(
+        connection, task_netns_cookie(), generation_out);
 }
 
 static __always_inline tp_info_pid_t *consume_incoming_trace(const connection_info_t *connection) {
-    return consume_incoming_trace_in_netns(connection, task_netns());
+    return consume_incoming_trace_with_generation(connection, NULL);
 }
 
 static __always_inline void invalidate_strict_incoming_trace(const connection_info_t *connection,
-                                                             u32 netns,
+                                                             u64 netns_cookie,
                                                              u64 observed_monotime_ns) {
     (void)observed_monotime_ns;
-    connection_info_ns_t *connection_key = incoming_trace_connection_key_for(connection, netns);
+    connection_info_netns_cookie_t *connection_key =
+        incoming_trace_connection_key_for(connection, netns_cookie);
     if (!connection_key) {
         return;
     }
@@ -396,8 +474,8 @@ static __always_inline void invalidate_strict_incoming_trace(const connection_in
         return;
     }
     const u64 generation = *head;
-    const u8 ambiguous = 1;
-    if (bpf_map_update_elem(&incoming_trace_ambiguity, &generation, &ambiguous, BPF_ANY) != 0) {
+    if (incoming_trace_mark_ambiguous(connection_key, generation, NULL) !=
+        k_incoming_trace_ambiguous) {
         return;
     }
     head = bpf_map_lookup_elem(&incoming_trace_heads, connection_key);
@@ -406,22 +484,23 @@ static __always_inline void invalidate_strict_incoming_trace(const connection_in
     }
 }
 
-static __always_inline void invalidate_incoming_trace_in_netns(const connection_info_t *connection,
-                                                               u32 netns,
-                                                               u64 observed_monotime_ns) {
+static __always_inline void invalidate_incoming_trace_in_netns_cookie(
+    const connection_info_t *connection, u64 netns_cookie, u64 observed_monotime_ns) {
     if (java_remote_parent_enabled) {
-        invalidate_strict_incoming_trace(connection, netns, observed_monotime_ns);
+        invalidate_strict_incoming_trace(connection, netns_cookie, observed_monotime_ns);
     }
 }
 
 static __always_inline void invalidate_incoming_trace(const connection_info_t *connection,
                                                       u64 observed_monotime_ns) {
-    invalidate_incoming_trace_in_netns(connection, task_netns(), observed_monotime_ns);
+    invalidate_incoming_trace_in_netns_cookie(
+        connection, task_netns_cookie(), observed_monotime_ns);
 }
 
 static __always_inline void delete_strict_incoming_trace(const connection_info_t *connection,
-                                                         u32 netns) {
-    connection_info_ns_t *connection_key = incoming_trace_connection_key_for(connection, netns);
+                                                         u64 netns_cookie) {
+    connection_info_netns_cookie_t *connection_key =
+        incoming_trace_connection_key_for(connection, netns_cookie);
     if (!connection_key) {
         return;
     }
@@ -437,12 +516,12 @@ static __always_inline void delete_strict_incoming_trace(const connection_info_t
     bpf_map_delete_elem(&incoming_trace_ambiguity, &generation);
 }
 
-static __always_inline void delete_incoming_trace_in_netns(const connection_info_t *connection,
-                                                           u32 netns) {
+static __always_inline void
+delete_incoming_trace_in_netns_cookie(const connection_info_t *connection, u64 netns_cookie) {
     bpf_map_delete_elem(&incoming_trace_map, connection);
-    delete_strict_incoming_trace(connection, netns);
+    delete_strict_incoming_trace(connection, netns_cookie);
 }
 
 static __always_inline void delete_incoming_trace(const connection_info_t *connection) {
-    delete_incoming_trace_in_netns(connection, task_netns());
+    delete_incoming_trace_in_netns_cookie(connection, task_netns_cookie());
 }

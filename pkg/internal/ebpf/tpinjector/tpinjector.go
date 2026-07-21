@@ -51,23 +51,27 @@ type Tracer struct {
 	javaRemoteParentError      error
 	javaRemoteParentMapsError  error
 	javaRemoteParentSweep      chan struct{}
+	javaRemoteParentEnabled    bool
+	javaRemoteParentSupportErr error
+	haveSockOpsNetnsCookie     func() error
 }
 
 func New(cfg *obi.Config, metrics imetrics.Reporter) *Tracer {
 	log := slog.With("component", "tpinjector")
 
 	return &Tracer{
-		log:                   log,
-		cfg:                   cfg,
-		metrics:               metrics,
-		javaRemoteParentSweep: make(chan struct{}, 1),
+		log:                    log,
+		cfg:                    cfg,
+		metrics:                metrics,
+		javaRemoteParentSweep:  make(chan struct{}, 1),
+		haveSockOpsNetnsCookie: javabridge.HaveSockOpsNetnsCookie,
 	}
 }
 
 func (p *Tracer) AllowPID(app.PID, uint32, *exec.FileInfo) {}
 
 func (p *Tracer) BlockPID(app.PID, uint32) {
-	if p.cfg == nil || !p.cfg.Java.RemoteParent.Enabled() {
+	if p.cfg == nil || !p.javaRemoteParentEnabled {
 		return
 	}
 	select {
@@ -81,7 +85,8 @@ func (p *Tracer) LoadSpecs() ([]*ebpfcommon.SpecBundle, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !p.cfg.Java.RemoteParent.Enabled() {
+	p.resolveJavaRemoteParentSupport()
+	if !p.javaRemoteParentEnabled {
 		javabridge.MinimizeDisabledMaps(spec)
 	}
 
@@ -132,6 +137,19 @@ func (p *Tracer) LoadSpecs() ([]*ebpfcommon.SpecBundle, error) {
 	return bundles, nil
 }
 
+func (p *Tracer) resolveJavaRemoteParentSupport() {
+	p.javaRemoteParentEnabled = false
+	p.javaRemoteParentSupportErr = nil
+	if p.cfg == nil || !p.cfg.Java.RemoteParent.Enabled() {
+		return
+	}
+	if err := p.haveSockOpsNetnsCookie(); err != nil {
+		p.javaRemoteParentSupportErr = err
+		return
+	}
+	p.javaRemoteParentEnabled = true
+}
+
 func (p *Tracer) constants() map[string]any {
 	flags := uint32(0)
 	if p.cfg.EBPF.ContextPropagation.HasHeaders() {
@@ -151,7 +169,7 @@ func (p *Tracer) constants() map[string]any {
 		"max_transaction_time":       uint64(p.cfg.EBPF.MaxTransactionTime.Nanoseconds()),
 		"inject_flags":               flags,
 		"g_bpf_debug":                p.cfg.EBPF.BpfDebug,
-		"java_remote_parent_enabled": p.cfg.Java.RemoteParent.Enabled(),
+		"java_remote_parent_enabled": p.javaRemoteParentEnabled,
 	}
 }
 
@@ -189,7 +207,7 @@ func (p *Tracer) Tracepoints() map[string]ebpfcommon.ProbeDesc {
 			Start: p.bpfFionreadFixupObjects.ObiFionreadFixupExit,
 		}
 	}
-	if p.cfg.Java.RemoteParent.Enabled() {
+	if p.javaRemoteParentEnabled {
 		tracepoints["sched/sched_process_exit"] = ebpfcommon.ProbeDesc{
 			Start:    p.bpfObjects.ObiJavaRemoteParentProcessExit,
 			Required: true,

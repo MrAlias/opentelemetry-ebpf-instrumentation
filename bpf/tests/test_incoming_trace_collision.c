@@ -27,7 +27,7 @@ static long test_map_delete(void *map, const void *key);
 enum { test_netns = 7, other_netns = 8, max_slots = 12 };
 
 typedef struct test_head {
-    connection_info_ns_t key;
+    connection_info_netns_cookie_t key;
     u64 generation;
     int present;
 } test_head_t;
@@ -44,11 +44,12 @@ static test_head_t heads[2];
 static test_version_t versions[max_slots];
 static tp_info_pid_t legacy_candidate;
 static tp_info_pid_t snapshot;
-static connection_info_ns_t connection_key_scratch;
+static connection_info_netns_cookie_t connection_key_scratch;
 static incoming_trace_candidate_t candidate_scratch;
 static u64 generation_counter;
 static int legacy_present;
 static int fail_candidate_insert;
+static int fail_ambiguity_insert;
 static u64 publish_during_claim;
 static u64 publish_during_ambiguity;
 static int invalidate_during_claim;
@@ -58,11 +59,12 @@ static void fail(const char *message) {
     exit(1);
 }
 
-static int same_connection_ns(const connection_info_ns_t *left, const connection_info_ns_t *right) {
+static int same_connection_ns(const connection_info_netns_cookie_t *left,
+                              const connection_info_netns_cookie_t *right) {
     return memcmp(left, right, sizeof(*left)) == 0;
 }
 
-static test_head_t *find_head(const connection_info_ns_t *key) {
+static test_head_t *find_head(const connection_info_netns_cookie_t *key) {
     for (size_t i = 0; i < sizeof(heads) / sizeof(heads[0]); i++) {
         if (heads[i].present && same_connection_ns(&heads[i].key, key)) {
             return &heads[i];
@@ -130,8 +132,9 @@ static void *test_map_lookup(void *map, const void *key) {
     return NULL;
 }
 
-static long
-test_update_head(const connection_info_ns_t *key, const u64 *generation, unsigned long long flags) {
+static long test_update_head(const connection_info_netns_cookie_t *key,
+                             const u64 *generation,
+                             unsigned long long flags) {
     test_head_t *head = find_head(key);
     if ((flags == BPF_NOEXIST && head) || (flags == BPF_EXIST && !head)) {
         return -1;
@@ -198,6 +201,9 @@ test_map_update(void *map, const void *key, const void *value, unsigned long lon
         return 0;
     }
     if (map == &incoming_trace_ambiguity) {
+        if (fail_ambiguity_insert) {
+            return -1;
+        }
         test_version_t *version = find_version(*(const u64 *)key);
         if (!version) {
             return -1;
@@ -263,11 +269,12 @@ static void reset(void) {
     memset(versions, 0, sizeof(versions));
     legacy_candidate = (tp_info_pid_t){};
     snapshot = (tp_info_pid_t){};
-    connection_key_scratch = (connection_info_ns_t){};
+    connection_key_scratch = (connection_info_netns_cookie_t){};
     candidate_scratch = (incoming_trace_candidate_t){};
     generation_counter = 0;
     legacy_present = 0;
     fail_candidate_insert = 0;
+    fail_ambiguity_insert = 0;
     publish_during_claim = 0;
     publish_during_ambiguity = 0;
     invalidate_during_claim = 0;
@@ -393,8 +400,50 @@ static void test_map_pressure_fails_closed(void) {
 
     if (update_strict_incoming_trace(&connection, &first, 100, test_netns) !=
             k_incoming_trace_update_failed ||
-        find_head(&(connection_info_ns_t){.netns = test_netns})) {
+        find_head(&(connection_info_netns_cookie_t){.netns_cookie = test_netns})) {
         fail("map pressure retained a selectable candidate");
+    }
+}
+
+static void test_ambiguity_marker_pressure_fails_closed(void) {
+    reset();
+    connection_info_t connection = {};
+    const tp_info_pid_t first = candidate(2, 10);
+    const tp_info_pid_t conflicting = candidate(3, 20);
+
+    update_strict_incoming_trace(&connection, &first, 100, test_netns);
+    fail_ambiguity_insert = 1;
+    u64 ambiguous_generation = 0;
+    if (update_strict_incoming_trace_with_generation(
+            &connection, &conflicting, 200, test_netns, &ambiguous_generation) !=
+            k_incoming_trace_update_failed ||
+        ambiguous_generation != 1 || snapshot_strict_incoming_trace(&connection, test_netns) ||
+        find_head(&(connection_info_netns_cookie_t){.netns_cookie = test_netns}) ||
+        find_version(ambiguous_generation)) {
+        fail("ambiguity marker pressure left a selectable generation");
+    }
+}
+
+static void test_conflict_after_claim_persists_ambiguity(void) {
+    reset();
+    connection_info_t connection = {};
+    const tp_info_pid_t first = candidate(2, 10);
+    const tp_info_pid_t conflicting = candidate(3, 20);
+
+    update_strict_incoming_trace(&connection, &first, 100, test_netns);
+    u64 generation = 0;
+    if (!consume_strict_incoming_trace_with_generation(&connection, test_netns, &generation) ||
+        !generation) {
+        fail("candidate was not claimed before the conflict");
+    }
+    u64 ambiguous_generation = 0;
+    if (update_strict_incoming_trace_with_generation(
+            &connection, &conflicting, 100, test_netns, &ambiguous_generation) !=
+            k_incoming_trace_ambiguous ||
+        ambiguous_generation != generation ||
+        incoming_trace_claimed_generation_matches_in_netns_cookie(
+            &connection, test_netns, generation, &first)) {
+        fail("conflict after claim did not persist exact-generation ambiguity");
     }
 }
 
@@ -412,7 +461,7 @@ static void test_generation_collision_preserves_existing_candidate(void) {
     if (update_strict_incoming_trace(&connection, &colliding, 100, test_netns) !=
             k_incoming_trace_update_failed ||
         reserved->candidate.candidate.tp.span_id[0] != existing.tp.span_id[0] ||
-        find_head(&(connection_info_ns_t){.netns = test_netns})) {
+        find_head(&(connection_info_netns_cookie_t){.netns_cookie = test_netns})) {
         fail("generation collision overwrote an existing candidate");
     }
 }
@@ -509,6 +558,19 @@ static void test_invalidation_during_claim_fails_closed(void) {
     }
 }
 
+static void test_zero_network_namespace_cookie_is_rejected(void) {
+    reset();
+    connection_info_t connection = {};
+    const tp_info_pid_t first = candidate(2, 10);
+
+    if (update_strict_incoming_trace(&connection, &first, 100, 0) !=
+            k_incoming_trace_update_failed ||
+        snapshot_strict_incoming_trace(&connection, 0) ||
+        consume_strict_incoming_trace(&connection, 0)) {
+        fail("zero network namespace cookie retained a selectable candidate");
+    }
+}
+
 static void test_disabled_path_retains_legacy_overwrite_and_delete(void) {
     reset();
     connection_info_t connection = {};
@@ -517,7 +579,7 @@ static void test_disabled_path_retains_legacy_overwrite_and_delete(void) {
 
     update_incoming_trace(&connection, &first, 100, test_netns);
     update_incoming_trace(&connection, &second, 200, test_netns);
-    tp_info_pid_t *taken = consume_incoming_trace_in_netns(&connection, other_netns);
+    tp_info_pid_t *taken = consume_incoming_trace_in_netns_cookie(&connection, other_netns);
     if (!taken || taken->tp.span_id[0] != 3 || legacy_present) {
         fail("disabled bridge changed legacy overwrite/delete behavior");
     }
@@ -531,11 +593,14 @@ int main(void) {
     test_newer_candidate_replaces_consumed_tombstone();
     test_late_old_candidate_makes_pending_new_request_ambiguous();
     test_map_pressure_fails_closed();
+    test_ambiguity_marker_pressure_fails_closed();
+    test_conflict_after_claim_persists_ambiguity();
     test_generation_collision_preserves_existing_candidate();
     test_identical_tuple_is_isolated_by_network_namespace();
     test_publication_during_claim_fails_closed();
     test_publication_during_invalidation_does_not_leak_marker();
     test_invalidation_during_claim_fails_closed();
+    test_zero_network_namespace_cookie_is_rejected();
     test_disabled_path_retains_legacy_overwrite_and_delete();
     return 0;
 }

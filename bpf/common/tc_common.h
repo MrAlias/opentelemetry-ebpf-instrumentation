@@ -137,6 +137,68 @@ static __always_inline u32 sk_msg_local_port(struct sk_msg_md *ctx) {
     return data;
 }
 
+static __always_inline u32 sk_ops_remote_ip4(struct bpf_sock_ops *ctx) {
+    u32 data;
+
+    asm("%[res] = *(u32 *)(%[base] + %[offset])"
+        : [res] "=r"(data)
+        : [base] "r"(ctx), [offset] "i"(offsetof(struct bpf_sock_ops, remote_ip4)), "m"(*ctx));
+
+    return data;
+}
+
+static __always_inline u32 sk_ops_local_ip4(struct bpf_sock_ops *ctx) {
+    u32 data;
+
+    asm("%[res] = *(u32 *)(%[base] + %[offset])"
+        : [res] "=r"(data)
+        : [base] "r"(ctx), [offset] "i"(offsetof(struct bpf_sock_ops, local_ip4)), "m"(*ctx));
+
+    return data;
+}
+
+static __always_inline void
+sk_ops_read_remote_ip6(struct bpf_sock_ops *ctx,
+                       u32 *res) { //NOLINT(readability-non-const-parameter)
+    asm("%[res0] = *(u32 *)(%[base] + %[offset] + 0)\n"
+        "%[res1] = *(u32 *)(%[base] + %[offset] + 4)\n"
+        "%[res2] = *(u32 *)(%[base] + %[offset] + 8)\n"
+        "%[res3] = *(u32 *)(%[base] + %[offset] + 12)\n"
+        : [res0] "=r"(res[0]), [res1] "=r"(res[1]), [res2] "=r"(res[2]), [res3] "=r"(res[3])
+        : [base] "r"(ctx), [offset] "i"(offsetof(struct bpf_sock_ops, remote_ip6)), "m"(*ctx));
+}
+
+static __always_inline void
+sk_ops_read_local_ip6(struct bpf_sock_ops *ctx,
+                      u32 *res) { //NOLINT(readability-non-const-parameter)
+    asm("%[res0] = *(u32 *)(%[base] + %[offset] + 0)\n"
+        "%[res1] = *(u32 *)(%[base] + %[offset] + 4)\n"
+        "%[res2] = *(u32 *)(%[base] + %[offset] + 8)\n"
+        "%[res3] = *(u32 *)(%[base] + %[offset] + 12)\n"
+        : [res0] "=r"(res[0]), [res1] "=r"(res[1]), [res2] "=r"(res[2]), [res3] "=r"(res[3])
+        : [base] "r"(ctx), [offset] "i"(offsetof(struct bpf_sock_ops, local_ip6)), "m"(*ctx));
+}
+
+static __always_inline u32 sk_ops_remote_port(struct bpf_sock_ops *ctx) {
+    u32 data;
+
+    asm("%[res] = *(u32 *)(%[base] + %[offset])"
+        : [res] "=r"(data)
+        : [base] "r"(ctx), [offset] "i"(offsetof(struct bpf_sock_ops, remote_port)), "m"(*ctx));
+
+    return data;
+}
+
+static __always_inline u32 sk_ops_local_port(struct bpf_sock_ops *ctx) {
+    u32 data;
+
+    asm("%[res] = *(u32 *)(%[base] + %[offset])"
+        : [res] "=r"(data)
+        : [base] "r"(ctx), [offset] "i"(offsetof(struct bpf_sock_ops, local_port)), "m"(*ctx));
+
+    return data;
+}
+
 // find the needle in the haystack, return the position of the first occurrence, return -1 if not found
 static __always_inline u32 bpf_memstr(const unsigned char *haystack,
                                       u32 haystack_len,

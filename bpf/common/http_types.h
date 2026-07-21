@@ -57,6 +57,7 @@ typedef struct call_protocol_args {
     u16 orig_dport;
     u16 _pad2;
     u32 _pad3;
+    u64 connection_netns_cookie;
     u64 u_buf;
     u64 self_ref_parent_id;
     lw_thread_t lw_thread;

@@ -28,14 +28,20 @@ static unsigned long long test_ktime_get_ns(void);
 #undef bpf_ktime_get_ns
 
 static connection_info_ns_t staged_key;
+static connection_info_netns_cookie_t cookie_staged_key;
+static java_remote_parent_connection_keys_t connection_keys_scratch;
+static java_remote_parent_connection_t connection_value_scratch;
 static java_remote_parent_connection_t staged_connection;
+static java_remote_parent_connection_t cookie_staged_connection;
 static java_remote_parent_owner_t indexed_owner;
 static java_remote_parent_key_t ambiguous_key;
 static java_remote_parent_response_t fallback_record;
 static int staged_present;
+static int cookie_staged_present;
 static int owner_present;
 static int ambiguity_present;
 static int fallback_present;
+static int claim_present;
 
 static void fail(const char *message) {
     fprintf(stderr, "FAIL: %s\n", message);
@@ -47,15 +53,29 @@ static int same_owner(const pid_key_t *left, const pid_key_t *right) {
 }
 
 static void *test_map_lookup(void *map, const void *key) {
+    if (map == &java_remote_parent_connection_keys_storage) {
+        return &connection_keys_scratch;
+    }
+    if (map == &java_remote_parent_connection_value_storage) {
+        return &connection_value_scratch;
+    }
     if (map == &java_remote_parent_connections && staged_present &&
         memcmp(key, &staged_key, sizeof(staged_key)) == 0) {
         return &staged_connection;
+    }
+    if (map == &java_remote_parent_cookie_connections && cookie_staged_present &&
+        memcmp(key, &cookie_staged_key, sizeof(cookie_staged_key)) == 0) {
+        return &cookie_staged_connection;
     }
     if (map == &java_remote_parent_owners && owner_present &&
         same_owner(key, &staged_connection.owner)) {
         return &indexed_owner;
     }
     if (map == &java_remote_parent_ambiguity && ambiguity_present &&
+        memcmp(key, &ambiguous_key, sizeof(ambiguous_key)) == 0) {
+        return &ambiguous_key.generation;
+    }
+    if (map == &java_remote_parent_claims && claim_present &&
         memcmp(key, &ambiguous_key, sizeof(ambiguous_key)) == 0) {
         return &ambiguous_key.generation;
     }
@@ -83,6 +103,11 @@ static long test_map_delete(void *map, const void *key) {
         staged_present = 0;
         return 0;
     }
+    if (map == &java_remote_parent_cookie_connections && cookie_staged_present &&
+        memcmp(key, &cookie_staged_key, sizeof(cookie_staged_key)) == 0) {
+        cookie_staged_present = 0;
+        return 0;
+    }
     if (map == &java_remote_parent_ambiguity && ambiguity_present &&
         memcmp(key, &ambiguous_key, sizeof(ambiguous_key)) == 0) {
         ambiguity_present = 0;
@@ -100,23 +125,33 @@ static unsigned long long test_ktime_get_ns(void) {
     return 123;
 }
 
-static void reset_state(const connection_info_t *connection, u32 netns) {
+static void reset_state(const connection_info_t *connection,
+                        u32 netns,
+                        u64 netns_cookie,
+                        u64 incoming_generation) {
     memset(&staged_connection, 0, sizeof(staged_connection));
     memset(&indexed_owner, 0, sizeof(indexed_owner));
     memset(&ambiguous_key, 0, sizeof(ambiguous_key));
     memset(&fallback_record, 0, sizeof(fallback_record));
 
     staged_key = connection_info_with_netns(connection, netns);
+    cookie_staged_key = connection_info_with_netns_cookie(connection, netns_cookie);
     staged_connection.owner = (pid_key_t){.tid = 7, .pid = 5, .ns = 3};
+    staged_connection.netns = netns;
     staged_connection.generation = 11;
+    staged_connection.netns_cookie = netns_cookie;
+    staged_connection.incoming_generation = incoming_generation;
+    cookie_staged_connection = staged_connection;
     indexed_owner.generation = staged_connection.generation;
     indexed_owner.lifecycle = k_java_remote_parent_lifecycle_active;
     java_remote_parent_init_response(
         &fallback_record, k_java_remote_parent_status_valid, staged_connection.generation, 1);
     staged_present = 1;
+    cookie_staged_present = 1;
     owner_present = 1;
     ambiguity_present = 0;
     fallback_present = 1;
+    claim_present = 0;
 }
 
 static void test_connection_close_invalidates_staged_generation(void) {
@@ -124,12 +159,12 @@ static void test_connection_close_invalidates_staged_generation(void) {
         .s_port = 1234,
         .d_port = 443,
     };
-    reset_state(&connection, 42);
+    reset_state(&connection, 42, 84, 21);
 
-    java_remote_parent_mark_connection_ambiguous_in_netns(&connection, 42);
+    java_remote_parent_mark_connection_ambiguous_in_netns_cookie(&connection, 84, 0);
 
-    if (staged_present) {
-        fail("connection close preserved its staged connection");
+    if (staged_present || cookie_staged_present) {
+        fail("sockops close preserved a staged connection index");
     }
     if (!ambiguity_present || ambiguous_key.generation != staged_connection.generation ||
         !same_owner(&ambiguous_key.owner, &staged_connection.owner)) {
@@ -145,18 +180,112 @@ static void test_orphaned_connection_close_removes_fallback(void) {
         .s_port = 1234,
         .d_port = 443,
     };
-    reset_state(&connection, 42);
+    reset_state(&connection, 42, 84, 21);
     owner_present = 0;
 
-    java_remote_parent_mark_connection_ambiguous_in_netns(&connection, 42);
+    java_remote_parent_mark_connection_ambiguous_in_netns_cookie(&connection, 84, 0);
 
-    if (staged_present || ambiguity_present || fallback_present) {
+    if (staged_present || cookie_staged_present || ambiguity_present || fallback_present) {
         fail("orphaned close did not fail closed");
+    }
+}
+
+static void test_other_incoming_generation_does_not_invalidate_stage(void) {
+    const connection_info_t connection = {
+        .s_port = 1234,
+        .d_port = 443,
+    };
+    reset_state(&connection, 42, 84, 21);
+
+    java_remote_parent_mark_connection_ambiguous_in_netns_cookie(&connection, 84, 22);
+
+    if (!staged_present || !cookie_staged_present || ambiguity_present) {
+        fail("another incoming generation invalidated the staged request");
+    }
+}
+
+static void test_matching_incoming_generation_invalidates_stage(void) {
+    const connection_info_t connection = {
+        .s_port = 1234,
+        .d_port = 443,
+    };
+    reset_state(&connection, 42, 84, 21);
+
+    java_remote_parent_mark_connection_ambiguous_in_netns_cookie(&connection, 84, 21);
+
+    if (staged_present || cookie_staged_present || !ambiguity_present) {
+        fail("matching incoming generation did not invalidate the staged request");
+    }
+}
+
+static void test_connection_match_requires_consistent_indexes(void) {
+    const connection_info_t connection = {
+        .s_port = 1234,
+        .d_port = 443,
+    };
+    reset_state(&connection, 42, 84, 21);
+
+    if (!java_remote_parent_connection_matches_in_netns(
+            &connection, 42, &staged_connection.owner, staged_connection.generation, 21)) {
+        fail("consistent connection indexes did not match");
+    }
+
+    cookie_staged_connection.incoming_generation++;
+    if (java_remote_parent_connection_matches_in_netns(
+            &connection, 42, &staged_connection.owner, staged_connection.generation, 21)) {
+        fail("inconsistent connection indexes matched");
+    }
+    cookie_staged_connection = staged_connection;
+    cookie_staged_present = 0;
+    if (java_remote_parent_connection_matches_in_netns(
+            &connection, 42, &staged_connection.owner, staged_connection.generation, 21)) {
+        fail("missing cookie connection index matched");
+    }
+}
+
+static void test_full_width_network_namespace_cookie_is_required(void) {
+    const connection_info_t connection = {
+        .s_port = 1234,
+        .d_port = 443,
+    };
+    const u64 staged_cookie = 0x10000002aULL;
+    const u64 colliding_low_bits = 0x20000002aULL;
+    reset_state(&connection, 42, staged_cookie, 21);
+
+    java_remote_parent_mark_connection_ambiguous_in_netns_cookie(
+        &connection, colliding_low_bits, 21);
+
+    if (!staged_present || !cookie_staged_present || ambiguity_present) {
+        fail("a low-32-bit namespace cookie collision invalidated the staged request");
+    }
+}
+
+static void test_claimed_stage_owns_close_race(void) {
+    const connection_info_t connection = {
+        .s_port = 1234,
+        .d_port = 443,
+    };
+    reset_state(&connection, 42, 84, 21);
+    ambiguous_key = (java_remote_parent_key_t){
+        .owner = staged_connection.owner,
+        .generation = staged_connection.generation,
+    };
+    claim_present = 1;
+
+    java_remote_parent_mark_connection_ambiguous_in_netns_cookie(&connection, 84, 0);
+
+    if (!staged_present || !cookie_staged_present || ambiguity_present || !fallback_present) {
+        fail("close raced incorrectly with an owned Java retrieval");
     }
 }
 
 int main(void) {
     test_connection_close_invalidates_staged_generation();
     test_orphaned_connection_close_removes_fallback();
+    test_other_incoming_generation_does_not_invalidate_stage();
+    test_matching_incoming_generation_invalidates_stage();
+    test_connection_match_requires_consistent_indexes();
+    test_full_width_network_namespace_cookie_is_required();
+    test_claimed_stage_owns_close_race();
     return 0;
 }

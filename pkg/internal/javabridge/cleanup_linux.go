@@ -40,21 +40,22 @@ func (m kernelCleanupMap) Iterate() cleanupIterator {
 }
 
 type cleanupMaps struct {
-	remoteParents  cleanupMap
-	tasks          cleanupMap
-	virtualThreads cleanupMap
-	vtIdentities   cleanupMap
-	incarnations   cleanupMap
-	connections    cleanupMap
-	ambiguity      cleanupMap
-	owners         cleanupMap
-	states         cleanupMap
-	generations    cleanupMap
-	terminals      cleanupMap
-	claims         cleanupMap
-	handoffs       cleanupMap
-	handoffClaims  cleanupMap
-	retired        cleanupMap
+	remoteParents     cleanupMap
+	tasks             cleanupMap
+	virtualThreads    cleanupMap
+	vtIdentities      cleanupMap
+	incarnations      cleanupMap
+	connections       cleanupMap
+	cookieConnections cleanupMap
+	ambiguity         cleanupMap
+	owners            cleanupMap
+	states            cleanupMap
+	generations       cleanupMap
+	terminals         cleanupMap
+	claims            cleanupMap
+	handoffs          cleanupMap
+	handoffClaims     cleanupMap
+	retired           cleanupMap
 }
 
 type Cleanup struct {
@@ -106,21 +107,22 @@ func NewCleanup(maps Maps, ttl time.Duration) *Cleanup {
 
 	return &Cleanup{
 		maps: cleanupMaps{
-			remoteParents:  wrap(maps.RemoteParents),
-			tasks:          wrap(maps.Tasks),
-			virtualThreads: wrap(maps.VirtualThreads),
-			vtIdentities:   wrap(maps.VTIdentities),
-			incarnations:   wrap(maps.Incarnations),
-			connections:    wrap(maps.Connections),
-			ambiguity:      wrap(maps.Ambiguity),
-			owners:         wrap(maps.Owners),
-			states:         wrap(maps.States),
-			generations:    wrap(maps.Generations),
-			terminals:      wrap(maps.Terminals),
-			claims:         wrap(maps.Claims),
-			handoffs:       wrap(maps.Handoffs),
-			handoffClaims:  wrap(maps.HandoffClaims),
-			retired:        wrap(maps.Retired),
+			remoteParents:     wrap(maps.RemoteParents),
+			tasks:             wrap(maps.Tasks),
+			virtualThreads:    wrap(maps.VirtualThreads),
+			vtIdentities:      wrap(maps.VTIdentities),
+			incarnations:      wrap(maps.Incarnations),
+			connections:       wrap(maps.Connections),
+			cookieConnections: wrap(maps.CookieConnections),
+			ambiguity:         wrap(maps.Ambiguity),
+			owners:            wrap(maps.Owners),
+			states:            wrap(maps.States),
+			generations:       wrap(maps.Generations),
+			terminals:         wrap(maps.Terminals),
+			claims:            wrap(maps.Claims),
+			handoffs:          wrap(maps.Handoffs),
+			handoffClaims:     wrap(maps.HandoffClaims),
+			retired:           wrap(maps.Retired),
 		},
 		ttl:         ttl,
 		monoTimeNow: timing.MonoTimeNow,
@@ -281,9 +283,48 @@ func (c *Cleanup) complete() bool {
 	return c.maps.remoteParents != nil && c.maps.tasks != nil &&
 		c.maps.virtualThreads != nil && c.maps.vtIdentities != nil &&
 		c.maps.incarnations != nil && c.maps.connections != nil &&
+		c.maps.cookieConnections != nil &&
 		c.maps.ambiguity != nil && c.maps.owners != nil && c.maps.states != nil &&
 		c.maps.generations != nil && c.maps.terminals != nil && c.maps.claims != nil &&
 		c.maps.handoffs != nil && c.maps.handoffClaims != nil && c.maps.retired != nil
+}
+
+func connectionCookieKey(
+	connectionKey connectionInfoNS,
+	connection connectionClaim,
+) connectionInfoNetNSCookie {
+	return connectionInfoNetNSCookie{
+		Connection:  connectionKey.Connection,
+		NetNSCookie: connection.NetNSCookie,
+	}
+}
+
+func validConnectionClaim(
+	connection connectionClaim,
+	owner Identity,
+	generation uint64,
+	netns uint32,
+) bool {
+	return connection.Owner == owner && connection.Reserved == 0 &&
+		connection.Generation == generation && connection.NetNSCookie != 0 &&
+		connection.IncomingGeneration != 0 && connection.NetNS == netns &&
+		connection.Reserved2 == 0
+}
+
+func (c *Cleanup) deleteConnectionIndexes(
+	connectionKey connectionInfoNS,
+	connection connectionClaim,
+) error {
+	cookieKey := connectionCookieKey(connectionKey, connection)
+	if _, err := cleanupDeleteExact(
+		c.maps.cookieConnections, cookieKey, connection,
+	); err != nil {
+		return fmt.Errorf("deleting cookie connection: %w", err)
+	}
+	if _, err := cleanupDeleteExact(c.maps.connections, connectionKey, connection); err != nil {
+		return fmt.Errorf("deleting connection: %w", err)
+	}
+	return nil
 }
 
 func (c *Cleanup) generationFallbackEvicted(
@@ -339,8 +380,19 @@ func (c *Cleanup) generationFallbackEvicted(
 		}
 		return false, fmt.Errorf("checking evicted generation connection: %w", err)
 	}
-	if connection.Owner != key.Owner || connection.Reserved != 0 ||
-		connection.Generation != key.Generation {
+	if !validConnectionClaim(connection, key.Owner, key.Generation, state.ConnectionNetNS) {
+		return false, nil
+	}
+	var cookieConnection connectionClaim
+	if err := c.maps.cookieConnections.Lookup(
+		connectionCookieKey(connectionKey, connection), &cookieConnection,
+	); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("checking evicted cookie connection: %w", err)
+	}
+	if cookieConnection != connection {
 		return false, nil
 	}
 
@@ -437,8 +489,8 @@ func (c *Cleanup) cleanupGenerationChecked(
 			var connection connectionClaim
 			if connectionErr := c.maps.connections.Lookup(&connectionKey, &connection); connectionErr == nil {
 				if connection.Owner == key.Owner && connection.Generation == key.Generation {
-					if _, deleteErr := cleanupDeleteExact(
-						c.maps.connections, connectionKey, connection,
+					if deleteErr := c.deleteConnectionIndexes(
+						connectionKey, connection,
 					); deleteErr != nil {
 						err = errors.Join(err, fmt.Errorf("deleting generation connection: %w", deleteErr))
 					}
@@ -636,8 +688,27 @@ func (c *Cleanup) sweepOrphans(
 		if _, cleaned := cleanedGenerations[key]; !cleaned {
 			continue
 		}
-		if _, deleteErr := cleanupDeleteExact(c.maps.connections, entry.key, entry.value); deleteErr != nil {
+		if deleteErr := c.deleteConnectionIndexes(entry.key, entry.value); deleteErr != nil {
 			result = errors.Join(result, fmt.Errorf("deleting orphan connection: %w", deleteErr))
+		}
+	}
+	cookieConnections, err := cleanupMapEntries[connectionInfoNetNSCookie, connectionClaim](
+		c.maps.cookieConnections,
+	)
+	if err != nil {
+		result = errors.Join(result, fmt.Errorf("iterating cookie generation connections: %w", err))
+	}
+	for _, entry := range cookieConnections {
+		key := stateKey{Owner: entry.value.Owner, Generation: entry.value.Generation}
+		if _, cleaned := cleanedGenerations[key]; !cleaned {
+			continue
+		}
+		if _, deleteErr := cleanupDeleteExact(
+			c.maps.cookieConnections, entry.key, entry.value,
+		); deleteErr != nil {
+			result = errors.Join(
+				result, fmt.Errorf("deleting orphan cookie connection: %w", deleteErr),
+			)
 		}
 	}
 
@@ -1138,8 +1209,8 @@ func (c *Cleanup) cleanupOrphanState(key stateKey, state stateValue) (bool, erro
 	var connection connectionClaim
 	if err := c.maps.connections.Lookup(&connectionKey, &connection); err == nil {
 		if connection.Owner == key.Owner && connection.Generation == key.Generation {
-			if _, deleteErr := cleanupDeleteExact(
-				c.maps.connections, connectionKey, connection,
+			if deleteErr := c.deleteConnectionIndexes(
+				connectionKey, connection,
 			); deleteErr != nil {
 				result = errors.Join(result, fmt.Errorf("deleting orphan connection: %w", deleteErr))
 			}

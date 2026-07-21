@@ -631,28 +631,42 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
             //dbg_print_http_connection_info(conn);
 
 #ifdef OBI_JAVA_REMOTE_PARENT_LIFECYCLE
+            java_remote_parent_incoming_t *java_incoming = NULL;
             if (java_remote_parent_enabled && java_remote_parent_data_hook_is_ready() &&
-                args->java && args->ssl && args->connection_netns) {
+                args->java && args->ssl && args->connection_netns &&
+                args->connection_netns_cookie) {
+                java_incoming = java_remote_parent_incoming_snapshot_mem();
+            }
+            found_tp = find_trace_for_server_request_with_incoming(
+                &args->pid_conn.conn,
+                &tp_p->tp,
+                EVENT_HTTP_REQUEST,
+                args->connection_netns_cookie,
+                java_incoming ? &java_incoming->candidate : NULL,
+                java_incoming ? &java_incoming->generation : NULL);
+            if (java_incoming && java_incoming->generation) {
+                u64 staged_generation = 0;
                 connection_info_t *java_connection = java_remote_parent_connection_snapshot_mem();
-                tp_info_pid_t *java_incoming = java_remote_parent_incoming_snapshot_mem();
-                if (java_connection && java_incoming) {
+                if (java_connection) {
                     __builtin_memcpy(
                         java_connection, &args->pid_conn.conn, sizeof(*java_connection));
                     sort_connection_info(java_connection);
-                    const tp_info_pid_t *incoming =
-                        snapshot_incoming_trace_in_netns(java_connection, args->connection_netns);
-                    if (incoming) {
-                        __builtin_memcpy(java_incoming, incoming, sizeof(*java_incoming));
-                        java_remote_parent_stage(
-                            java_connection, args->connection_netns, java_incoming);
-                    }
+                    staged_generation = java_remote_parent_stage(java_connection,
+                                                                 args->connection_netns,
+                                                                 args->connection_netns_cookie,
+                                                                 java_incoming->generation,
+                                                                 &java_incoming->candidate);
+                }
+                if (!staged_generation) {
+                    found_tp = 0;
+                    tp_p->tp.flags = 1;
                 }
             }
-#endif
-
+#else
             // For server requests, we first look for TCP info (setup by TC ingress) and then we fall back to black-box info.
             found_tp =
                 find_trace_for_server_request(&args->pid_conn.conn, &tp_p->tp, EVENT_HTTP_REQUEST);
+#endif
         }
     }
 

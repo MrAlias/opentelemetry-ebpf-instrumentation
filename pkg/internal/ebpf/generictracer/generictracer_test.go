@@ -87,6 +87,32 @@ func TestDelayedJavaDeletionPreservesReplacementAuthorization(t *testing.T) {
 	assert.Equal(t, replacement, tracer.javaAuthKeys[key][0])
 }
 
+func TestJavaAuthorizationDoesNotRequireRemoteParent(t *testing.T) {
+	original := findJavaNamespacedPIDs
+	identityCalls := 0
+	findJavaNamespacedPIDs = func(app.PID) ([]app.PID, error) {
+		identityCalls++
+		return nil, errors.New("stop before map update")
+	}
+	t.Cleanup(func() { findJavaNamespacedPIDs = original })
+
+	const pid = app.PID(9001)
+	fileInfo := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava},
+		Pid:     pid,
+	})
+	fileInfo.SetJavaAgentCapability(11)
+	tracer := &Tracer{
+		log:                     tlog(),
+		javaRemoteParentEnabled: false,
+	}
+	tracer.bpfObjects.JavaAuthorizedProcesses = &ebpf.Map{}
+
+	tracer.authorizeJavaProcess(pid, 1234, fileInfo)
+
+	assert.Equal(t, 1, identityCalls)
+}
+
 func TestJavaDataHookIsOptional(t *testing.T) {
 	tracer := &Tracer{cfg: &obi.Config{}}
 	assert.False(t, tracer.KProbes()["security_file_ioctl"].Required)
@@ -114,6 +140,60 @@ func TestJavaDataHookAttachResultPublishesReadiness(t *testing.T) {
 	attachResult(errors.New("missing security hook"))
 
 	assert.Equal(t, []uint32{1, 0}, states)
+}
+
+func TestJavaRemoteParentRequiresSockOpsNetnsCookie(t *testing.T) {
+	unsupported := errors.New("network namespace cookie helper unavailable")
+	tests := []struct {
+		name          string
+		transport     obi.JavaRemoteParentTransport
+		probeErr      error
+		expected      bool
+		expectedCalls int
+	}{
+		{name: "disabled", transport: obi.JavaRemoteParentDisabled},
+		{
+			name:          "supported",
+			transport:     obi.JavaRemoteParentUnix,
+			expected:      true,
+			expectedCalls: 1,
+		},
+		{
+			name:          "unsupported",
+			transport:     obi.JavaRemoteParentUnix,
+			probeErr:      unsupported,
+			expectedCalls: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := obi.DefaultConfig
+			cfg.Java.RemoteParent.Transport = tt.transport
+			tracer := New(nil, &cfg, nil)
+			probeCalls := 0
+			tracer.haveSockOpsNetnsCookie = func() error {
+				probeCalls++
+				return tt.probeErr
+			}
+
+			bundles, err := tracer.LoadSpecs()
+			require.NoError(t, err)
+			require.Len(t, bundles, 1)
+			assert.Equal(t, tt.expectedCalls, probeCalls)
+			assert.Equal(t, tt.expected, bundles[0].Constants["java_remote_parent_enabled"])
+
+			for _, name := range []string{"incoming_trace_heads", "incoming_trace_candidates"} {
+				mapSpec := bundles[0].Spec.Maps[name]
+				require.NotNil(t, mapSpec, name)
+				if tt.expected {
+					assert.Greater(t, mapSpec.MaxEntries, uint32(1), name)
+				} else {
+					assert.Equal(t, uint32(1), mapSpec.MaxEntries, name)
+				}
+			}
+		})
+	}
 }
 
 func TestParseJVMMemoryPoolRecordDecoratesServiceByPIDNamespace(t *testing.T) {

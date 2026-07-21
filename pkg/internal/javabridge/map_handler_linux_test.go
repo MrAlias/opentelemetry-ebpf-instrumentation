@@ -137,6 +137,13 @@ func TestMapHandlerKernelMapLayouts(t *testing.T) {
 	var connection connectionInfoNS
 	assert.Equal(t, uintptr(40), unsafe.Sizeof(connection))
 	assert.Equal(t, uintptr(36), unsafe.Offsetof(connection.NetNS))
+	var cookieConnection connectionInfoNetNSCookie
+	assert.Equal(t, uintptr(48), unsafe.Sizeof(cookieConnection))
+	assert.Equal(t, uintptr(40), unsafe.Offsetof(cookieConnection.NetNSCookie))
+	assert.Equal(t, uintptr(48), unsafe.Sizeof(connectionClaim{}))
+	assert.Equal(t, uintptr(24), unsafe.Offsetof(connectionClaim{}.NetNSCookie))
+	assert.Equal(t, uintptr(32), unsafe.Offsetof(connectionClaim{}.IncomingGeneration))
+	assert.Equal(t, uintptr(40), unsafe.Offsetof(connectionClaim{}.NetNS))
 
 	var state stateValue
 	assert.Equal(t, uintptr(128), unsafe.Sizeof(state))
@@ -150,6 +157,18 @@ func TestMapHandlerKernelMapLayouts(t *testing.T) {
 	assert.Equal(t, uintptr(32), unsafe.Sizeof(terminalValue{}))
 	assert.Equal(t, uintptr(32), unsafe.Sizeof(generationIndexValue{}))
 	assert.Equal(t, uintptr(24), unsafe.Sizeof(generationClaim{}))
+}
+
+func TestMapHandlerRejectsMissingOwnerMap(t *testing.T) {
+	identity := Identity{TID: 3, PID: 2, Namespace: 1}
+	handler := testMapHandler(
+		map[Identity]any{identity: validEncodedRecord(t, 10)},
+		nil,
+		nil,
+	)
+	handler.owners = nil
+
+	assert.Equal(t, StatusUnsupported, handler.Handle(identity, OperationTake).Status)
 }
 
 func TestMinimizeDisabledMapsPreservesVirtualThreadTracingCapacity(t *testing.T) {
@@ -754,6 +773,7 @@ func TestMapHandlerQuarantinesMalformedFallbackAndAllowsOwnerReuse(t *testing.T)
 	assert.Empty(t, handler.states.(*fakeBridgeMap).values)
 	assert.Empty(t, handler.generations.(*fakeBridgeMap).values)
 	assert.Empty(t, handler.connections.(*fakeBridgeMap).values)
+	assert.Empty(t, handler.cookieConnections.(*fakeBridgeMap).values)
 
 	handler.remoteParents.(*fakeBridgeMap).values[identity] = validEncodedRecord(t, 11)
 	seedOwnerState(handler, identity, 11)
@@ -942,23 +962,19 @@ func TestMapHandlerReleasesConnectionHandoff(t *testing.T) {
 	seedOwnerState(handler, identity, 10)
 	requestKey := stateKey{Owner: identity, Generation: 10}
 	state := handler.states.(*fakeBridgeMap).values[requestKey].(stateValue)
-	delete(handler.connections.(*fakeBridgeMap).values, connectionInfoNS{
-		Connection: state.Connection,
-		NetNS:      state.ConnectionNetNS,
-	})
+	clear(handler.connections.(*fakeBridgeMap).values)
+	clear(handler.cookieConnections.(*fakeBridgeMap).values)
 	state.Connection = connection
 	state.ConnectionNetNS = connectionNetNS
 	handler.states.(*fakeBridgeMap).values[requestKey] = state
-	handler.connections.(*fakeBridgeMap).values[connectionInfoNS{
+	seedConnectionClaim(handler, connectionInfoNS{
 		Connection: connection,
 		NetNS:      connectionNetNS,
-	}] = connectionClaim{
-		Owner:      identity,
-		Generation: 10,
-	}
+	}, identity, 10)
 
 	assert.Equal(t, StatusValid, handler.Handle(identity, OperationTake).Status)
 	assert.Empty(t, handler.connections.(*fakeBridgeMap).values)
+	assert.Empty(t, handler.cookieConnections.(*fakeBridgeMap).values)
 }
 
 func TestMapHandlerConnectionCleanupIsNetworkNamespaceScoped(t *testing.T) {
@@ -974,16 +990,15 @@ func TestMapHandlerConnectionCleanupIsNetworkNamespaceScoped(t *testing.T) {
 		Connection: state.Connection,
 		NetNS:      state.ConnectionNetNS + 1,
 	}
-	handler.connections.(*fakeBridgeMap).values[otherKey] = connectionClaim{
-		Owner:      Identity{TID: 99, PID: 98, Namespace: 97},
-		Generation: 11,
-	}
+	otherOwner := Identity{TID: 99, PID: 98, Namespace: 97}
+	seedConnectionClaim(handler, otherKey, otherOwner, 11)
+	otherClaim := handler.connections.(*fakeBridgeMap).values[otherKey].(connectionClaim)
+	otherCookieKey := connectionCookieKey(otherKey, otherClaim)
 
 	assert.Equal(t, StatusValid, handler.Handle(identity, OperationTake).Status)
-	assert.Equal(t, connectionClaim{
-		Owner:      Identity{TID: 99, PID: 98, Namespace: 97},
-		Generation: 11,
-	}, handler.connections.(*fakeBridgeMap).values[otherKey])
+	assert.Equal(t, otherClaim, handler.connections.(*fakeBridgeMap).values[otherKey])
+	assert.Equal(t, otherClaim,
+		handler.cookieConnections.(*fakeBridgeMap).values[otherCookieKey])
 }
 
 func TestMapHandlerHonorsClaimFromPrimaryTransport(t *testing.T) {
@@ -1265,17 +1280,51 @@ func TestMapHandlerRevalidatesBeforeDeletingReusableKeys(t *testing.T) {
 			NetNS:      17,
 		}
 		connections := handler.connections.(*fakeBridgeMap)
-		connections.values[key] = connectionClaim{Owner: identity, Generation: 10}
+		cookieConnections := handler.cookieConnections.(*fakeBridgeMap)
+		seedConnectionClaim(handler, key, identity, 10)
+		oldClaim := connections.values[key].(connectionClaim)
+		oldCookieKey := connectionCookieKey(key, oldClaim)
+		newClaim := oldClaim
+		newClaim.Generation = 11
+		newClaim.NetNSCookie++
+		newClaim.IncomingGeneration++
+		newCookieKey := connectionCookieKey(key, newClaim)
 		connections.afterLookup = func(count int) {
 			if count == 1 {
 				connections.mu.Lock()
-				connections.values[key] = connectionClaim{Owner: identity, Generation: 11}
+				connections.values[key] = newClaim
 				connections.mu.Unlock()
+				cookieConnections.mu.Lock()
+				delete(cookieConnections.values, oldCookieKey)
+				cookieConnections.values[newCookieKey] = newClaim
+				cookieConnections.mu.Unlock()
 			}
 		}
 
 		assert.True(t, handler.releaseConnection(identity, 10, key.Connection, key.NetNS))
-		assert.Equal(t, uint64(11), connections.values[key].(connectionClaim).Generation)
+		assert.Equal(t, newClaim, connections.values[key])
+		assert.Equal(t, newClaim, cookieConnections.values[newCookieKey])
+	})
+
+	t.Run("connection cookie deletion error", func(t *testing.T) {
+		handler := testMapHandler(nil, nil, nil)
+		key := connectionInfoNS{
+			Connection: connectionInfo{SourcePort: 12345, DestinationPort: 443},
+			NetNS:      17,
+		}
+		seedConnectionClaim(handler, key, identity, 10)
+		connections := handler.connections.(*fakeBridgeMap)
+		cookieConnections := handler.cookieConnections.(*fakeBridgeMap)
+		cookieConnections.deleteErr = errors.New("unexpected cookie connection deletion")
+
+		assert.False(t, handler.releaseConnection(identity, 10, key.Connection, key.NetNS))
+		assert.Contains(t, connections.values, key)
+		assert.NotEmpty(t, cookieConnections.values)
+
+		cookieConnections.deleteErr = nil
+		assert.True(t, handler.releaseConnection(identity, 10, key.Connection, key.NetNS))
+		assert.Empty(t, connections.values)
+		assert.Empty(t, cookieConnections.values)
 	})
 
 	t.Run("generation index", func(t *testing.T) {
@@ -1409,22 +1458,23 @@ func testMapHandler(remoteParents, tasks, ambiguity map[Identity]any) *MapHandle
 		ambiguity = make(map[Identity]any)
 	}
 	handler := &MapHandler{
-		remoteParents:  &fakeBridgeMap{values: identityValues(remoteParents)},
-		tasks:          &fakeBridgeMap{values: identityValues(tasks)},
-		virtualThreads: &fakeBridgeMap{values: make(map[any]any)},
-		vtIdentities:   &fakeBridgeMap{values: make(map[any]any)},
-		authorized:     &fakeBridgeMap{values: make(map[any]any)},
-		incarnations:   &fakeBridgeMap{values: make(map[any]any)},
-		connections:    &fakeBridgeMap{values: make(map[any]any)},
-		ambiguity:      &fakeBridgeMap{values: ambiguityValues(ambiguity, remoteParents)},
-		owners:         &fakeBridgeMap{values: make(map[any]any)},
-		states:         &fakeBridgeMap{values: make(map[any]any)},
-		generations:    &fakeBridgeMap{values: make(map[any]any)},
-		terminals:      &fakeBridgeMap{values: make(map[any]any)},
-		claims:         &fakeBridgeMap{values: make(map[any]any)},
-		ttl:            30 * time.Second,
-		monoTimeNow:    func() time.Duration { return 11 * time.Second },
-		consumed:       make(map[consumedIdentity]time.Duration),
+		remoteParents:     &fakeBridgeMap{values: identityValues(remoteParents)},
+		tasks:             &fakeBridgeMap{values: identityValues(tasks)},
+		virtualThreads:    &fakeBridgeMap{values: make(map[any]any)},
+		vtIdentities:      &fakeBridgeMap{values: make(map[any]any)},
+		authorized:        &fakeBridgeMap{values: make(map[any]any)},
+		incarnations:      &fakeBridgeMap{values: make(map[any]any)},
+		connections:       &fakeBridgeMap{values: make(map[any]any)},
+		cookieConnections: &fakeBridgeMap{values: make(map[any]any)},
+		ambiguity:         &fakeBridgeMap{values: ambiguityValues(ambiguity, remoteParents)},
+		owners:            &fakeBridgeMap{values: make(map[any]any)},
+		states:            &fakeBridgeMap{values: make(map[any]any)},
+		generations:       &fakeBridgeMap{values: make(map[any]any)},
+		terminals:         &fakeBridgeMap{values: make(map[any]any)},
+		claims:            &fakeBridgeMap{values: make(map[any]any)},
+		ttl:               30 * time.Second,
+		monoTimeNow:       func() time.Duration { return 11 * time.Second },
+		consumed:          make(map[consumedIdentity]time.Duration),
 	}
 	process := Identity{
 		TID:       2,
@@ -1512,6 +1562,8 @@ func seedOwnerStateWithIncarnation(
 		Connection: connection,
 		NetNS:      identity.Namespace,
 	}
+	seedConnectionClaim(handler, connectionKey, identity, generation)
+
 	handler.owners.(*fakeBridgeMap).values[identity] = ownerValue{
 		Generation:         generation,
 		ProcessIncarnation: processIncarnation,
@@ -1532,10 +1584,31 @@ func seedOwnerStateWithIncarnation(
 		ProcessIncarnation:  processIncarnation,
 		ObservedMonotonicNS: record.ObservedMonotonicNS,
 	}
-	handler.connections.(*fakeBridgeMap).values[connectionKey] = connectionClaim{
-		Owner:      identity,
-		Generation: generation,
+}
+
+func seedConnectionClaim(
+	handler *MapHandler,
+	connectionKey connectionInfoNS,
+	identity Identity,
+	generation uint64,
+) {
+	netnsCookie := uint64(connectionKey.NetNS)<<32 | generation | 1
+	incomingGeneration := generation + 1
+	if incomingGeneration == 0 {
+		incomingGeneration = 1
 	}
+	connectionValue := connectionClaim{
+		Owner:              identity,
+		Generation:         generation,
+		NetNSCookie:        netnsCookie,
+		IncomingGeneration: incomingGeneration,
+		NetNS:              connectionKey.NetNS,
+	}
+	handler.connections.(*fakeBridgeMap).values[connectionKey] = connectionValue
+	handler.cookieConnections.(*fakeBridgeMap).values[connectionInfoNetNSCookie{
+		Connection:  connectionKey.Connection,
+		NetNSCookie: netnsCookie,
+	}] = connectionValue
 }
 
 func validEncodedRecord(t *testing.T, generation uint64) [RecordSize]byte {

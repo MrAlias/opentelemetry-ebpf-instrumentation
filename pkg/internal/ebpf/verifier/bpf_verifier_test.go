@@ -28,6 +28,7 @@ import (
 	loggerbpf "go.opentelemetry.io/obi/pkg/internal/ebpf/logger"
 	tpinjectorbpf "go.opentelemetry.io/obi/pkg/internal/ebpf/tpinjector"
 	watcherbpf "go.opentelemetry.io/obi/pkg/internal/ebpf/watcher"
+	"go.opentelemetry.io/obi/pkg/internal/javabridge"
 	netollybpf "go.opentelemetry.io/obi/pkg/internal/netolly/ebpf"
 	rdnsxdpbpf "go.opentelemetry.io/obi/pkg/internal/rdns/ebpf/xdp"
 	statsolly "go.opentelemetry.io/obi/pkg/internal/statsolly/ebpf"
@@ -166,6 +167,12 @@ func TestBPFVerifierWithConstants(t *testing.T) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		t.Skipf("cannot remove memlock limit (insufficient privileges?): %v", err)
 	}
+	javaRemoteParentValues := []any{false}
+	if err := javabridge.HaveSockOpsNetnsCookie(); err == nil {
+		javaRemoteParentValues = append(javaRemoteParentValues, true)
+	} else {
+		t.Logf("skipping enabled Java remote-parent verifier paths: %v", err)
+	}
 
 	// netolly
 	netollyOpts := []constOption{
@@ -181,7 +188,7 @@ func TestBPFVerifierWithConstants(t *testing.T) {
 	forEachCombination(t, "generictracer/Bpf", generictracerbpf.LoadBpf, []constOption{
 		{"g_bpf_debug", []any{true, false}},
 		{"g_bpf_traceparent_enabled", []any{true, false}},
-		{"java_remote_parent_enabled", []any{true, false}},
+		{"java_remote_parent_enabled", javaRemoteParentValues},
 		{"filter_pids", []any{int32(0), int32(1)}},
 		{"high_request_volume", []any{uint32(0), uint32(1)}},
 		{"jvm_sampling_interval_ns", []any{uint64(0), uint64(1_000_000_000)}},
@@ -195,6 +202,7 @@ func TestBPFVerifierWithConstants(t *testing.T) {
 		{"g_bpf_debug", []any{true, false}},
 		{"g_bpf_traceparent_enabled", []any{true, false}},
 		{"g_bpf_header_propagation", []any{true, false}},
+		{"java_remote_parent_enabled", javaRemoteParentValues},
 		{"g_bpf_loop_enabled", []any{ebpfcommon.SupportsEBPFLoops(slog.Default(), false)}},
 		{"capture_header_buffer", []any{int32(0), int32(1)}},
 		{"high_request_volume", []any{uint32(0), uint32(1)}},
@@ -207,6 +215,7 @@ func TestBPFVerifierWithConstants(t *testing.T) {
 	// inject_flags is a bitmask: bit 0 = HTTP headers, bit 1 = TCP options.
 	forEachCombination(t, "tpinjector/Bpf", tpinjectorbpf.LoadBpf, []constOption{
 		{"g_bpf_debug", []any{true, false}},
+		{"java_remote_parent_enabled", javaRemoteParentValues},
 		{"filter_pids", []any{int32(0), int32(1)}},
 		{"inject_flags", []any{uint32(0), uint32(1), uint32(2), uint32(3)}},
 		{"max_transaction_time", []any{uint64(0), uint64(60_000_000_000)}},

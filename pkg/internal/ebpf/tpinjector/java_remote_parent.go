@@ -145,7 +145,7 @@ func (p *Tracer) loadJavaRemoteParentSpecs() {
 	p.javaRemoteParentMapsError = nil
 
 	transport := p.cfg.Java.RemoteParent.Transport
-	if !p.cfg.Java.RemoteParent.Enabled() {
+	if !p.javaRemoteParentEnabled {
 		return
 	}
 
@@ -179,7 +179,7 @@ func (p *Tracer) loadJavaRemoteParentSpecs() {
 }
 
 func (p *Tracer) loadJavaRemoteParentObjects(eventContext *ebpfcommon.EBPFEventContext) {
-	if !p.cfg.Java.RemoteParent.Enabled() || eventContext == nil ||
+	if !p.javaRemoteParentEnabled || eventContext == nil ||
 		p.javaRemoteParentMapsSpec == nil {
 		return
 	}
@@ -233,7 +233,7 @@ func (p *Tracer) javaRemoteParentConstants() map[string]any {
 	return map[string]any{
 		"filter_pids":                   filterPids,
 		"g_bpf_debug":                   p.cfg.EBPF.BpfDebug,
-		"java_remote_parent_enabled":    true,
+		"java_remote_parent_enabled":    p.javaRemoteParentEnabled,
 		"java_remote_parent_max_age_ns": uint64(p.cfg.Java.RemoteParent.TTL.Nanoseconds()),
 	}
 }
@@ -241,6 +241,14 @@ func (p *Tracer) javaRemoteParentConstants() map[string]any {
 func (p *Tracer) runJavaRemoteParent(ctx context.Context) func() {
 	if !p.cfg.Java.RemoteParent.Enabled() {
 		p.observeJavaRemoteParent("disabled", "select", javabridge.StatusDisabled, 1)
+		return func() {}
+	}
+	if p.javaRemoteParentSupportErr != nil {
+		p.log.Warn(
+			"Java remote-parent bridge unsupported by this kernel",
+			"error", p.javaRemoteParentSupportErr,
+		)
+		p.observeJavaRemoteParentUnsupported()
 		return func() {}
 	}
 
@@ -282,6 +290,16 @@ func (p *Tracer) runJavaRemoteParent(ctx context.Context) func() {
 			<-cleanupDone
 			p.closeJavaRemoteParentObjects()
 		})
+	}
+}
+
+func (p *Tracer) observeJavaRemoteParentUnsupported() {
+	transport := p.cfg.Java.RemoteParent.Transport
+	if transport == obi.JavaRemoteParentAuto || transport == obi.JavaRemoteParentGetsockopt {
+		p.observeJavaRemoteParent("getsockopt", "negotiate", javabridge.StatusUnsupported, 1)
+	}
+	if transport == obi.JavaRemoteParentAuto || transport == obi.JavaRemoteParentUnix {
+		p.observeJavaRemoteParent("unix", "negotiate", javabridge.StatusUnsupported, 1)
 	}
 }
 
@@ -512,22 +530,23 @@ func (p *Tracer) startJavaRemoteParentFallback(
 
 func (p *Tracer) javaRemoteParentMaps() javabridge.Maps {
 	return javabridge.Maps{
-		RemoteParents:  p.bpfJavaRemoteParentMaps.JavaRemoteParentFallback,
-		Tasks:          p.bpfJavaRemoteParentMaps.JavaRemoteParentTasks,
-		VirtualThreads: p.bpfJavaRemoteParentMaps.JavaVtThreads,
-		VTIdentities:   p.bpfJavaRemoteParentMaps.JavaVtIdentities,
-		Authorized:     p.bpfJavaRemoteParentMaps.JavaAuthorizedProcesses,
-		Incarnations:   p.bpfJavaRemoteParentMaps.JavaProcessIncarnations,
-		Connections:    p.bpfJavaRemoteParentMaps.JavaRemoteParentConnections,
-		Ambiguity:      p.bpfJavaRemoteParentMaps.JavaRemoteParentAmbiguity,
-		Owners:         p.bpfJavaRemoteParentMaps.JavaRemoteParentOwners,
-		States:         p.bpfJavaRemoteParentMaps.JavaRemoteParentState,
-		Generations:    p.bpfJavaRemoteParentMaps.JavaRemoteParentGenerationIndex,
-		Terminals:      p.bpfJavaRemoteParentMaps.JavaRemoteParentTerminal,
-		Claims:         p.bpfJavaRemoteParentMaps.JavaRemoteParentClaims,
-		Handoffs:       p.bpfJavaRemoteParentMaps.JavaRemoteParentHandoffs,
-		HandoffClaims:  p.bpfJavaRemoteParentMaps.JavaRemoteParentHandoffClaims,
-		Retired:        p.bpfJavaRemoteParentMaps.JavaRetiredProcesses,
+		RemoteParents:     p.bpfJavaRemoteParentMaps.JavaRemoteParentFallback,
+		Tasks:             p.bpfJavaRemoteParentMaps.JavaRemoteParentTasks,
+		VirtualThreads:    p.bpfJavaRemoteParentMaps.JavaVtThreads,
+		VTIdentities:      p.bpfJavaRemoteParentMaps.JavaVtIdentities,
+		Authorized:        p.bpfJavaRemoteParentMaps.JavaAuthorizedProcesses,
+		Incarnations:      p.bpfJavaRemoteParentMaps.JavaProcessIncarnations,
+		Connections:       p.bpfJavaRemoteParentMaps.JavaRemoteParentConnections,
+		CookieConnections: p.bpfJavaRemoteParentMaps.JavaRemoteParentCookieConnections,
+		Ambiguity:         p.bpfJavaRemoteParentMaps.JavaRemoteParentAmbiguity,
+		Owners:            p.bpfJavaRemoteParentMaps.JavaRemoteParentOwners,
+		States:            p.bpfJavaRemoteParentMaps.JavaRemoteParentState,
+		Generations:       p.bpfJavaRemoteParentMaps.JavaRemoteParentGenerationIndex,
+		Terminals:         p.bpfJavaRemoteParentMaps.JavaRemoteParentTerminal,
+		Claims:            p.bpfJavaRemoteParentMaps.JavaRemoteParentClaims,
+		Handoffs:          p.bpfJavaRemoteParentMaps.JavaRemoteParentHandoffs,
+		HandoffClaims:     p.bpfJavaRemoteParentMaps.JavaRemoteParentHandoffClaims,
+		Retired:           p.bpfJavaRemoteParentMaps.JavaRetiredProcesses,
 	}
 }
 

@@ -299,13 +299,14 @@ static __always_inline u8 already_tracked(const pid_connection_info_t *p_conn) {
 
 // Extracts what we need for connection_info_t from bpf_sock_ops if the
 // communication is IPv4
+// The accessors force immediate-offset reads from the original sockops context.
 static __always_inline connection_info_t sk_ops_extract_key_ip4(struct bpf_sock_ops *ops) {
     connection_info_t conn = {};
 
-    const u32 local_ip4 = ops->local_ip4;
-    const u32 remote_ip4 = ops->remote_ip4;
-    const u32 local_port = ops->local_port;
-    const u32 remote_port = bpf_ntohl(ops->remote_port);
+    const u32 local_ip4 = sk_ops_local_ip4(ops);
+    const u32 remote_ip4 = sk_ops_remote_ip4(ops);
+    const u32 local_port = sk_ops_local_port(ops);
+    const u32 remote_port = bpf_ntohl(sk_ops_remote_port(ops));
 
     __builtin_memcpy(conn.s_addr, ip4ip6_prefix, sizeof(ip4ip6_prefix));
     conn.s_ip[3] = local_ip4;
@@ -320,23 +321,14 @@ static __always_inline connection_info_t sk_ops_extract_key_ip4(struct bpf_sock_
 
 // Extracts what we need for connection_info_t from bpf_sock_ops if the
 // communication is IPv6
-// The order of copying the data from bpf_sock_ops matters and must match how
-// the struct is laid in vmlinux.h, otherwise the verifier thinks we are modifying
-// the context twice.
 static __always_inline connection_info_t sk_ops_extract_key_ip6(struct bpf_sock_ops *ops) {
     connection_info_t conn = {};
 
-    conn.d_ip[0] = ops->remote_ip6[0];
-    conn.d_ip[1] = ops->remote_ip6[1];
-    conn.d_ip[2] = ops->remote_ip6[2];
-    conn.d_ip[3] = ops->remote_ip6[3];
-    conn.s_ip[0] = ops->local_ip6[0];
-    conn.s_ip[1] = ops->local_ip6[1];
-    conn.s_ip[2] = ops->local_ip6[2];
-    conn.s_ip[3] = ops->local_ip6[3];
+    sk_ops_read_remote_ip6(ops, conn.d_ip);
+    sk_ops_read_local_ip6(ops, conn.s_ip);
 
-    const u32 local_port = ops->local_port;
-    const u32 remote_port = bpf_ntohl(ops->remote_port);
+    const u32 local_port = sk_ops_local_port(ops);
+    const u32 remote_port = bpf_ntohl(sk_ops_remote_port(ops));
 
     conn.d_port = remote_port;
     conn.s_port = local_port;
@@ -558,7 +550,10 @@ static __always_inline void bpf_sock_ops_parse_hdr_cb(struct bpf_sock_ops *skops
 
     const u8 exact_flags = ret == sizeof(opt) && opt.len == sizeof(opt);
     const u8 legacy = ret == sizeof(tcp_traceparent_legacy_option_t) && opt.len == ret;
-    if ((!exact_flags && !legacy) || !valid_trace(opt.trace_id) || !valid_span(opt.span_id)) {
+    tp_info_pid_t tp = {};
+    __builtin_memcpy(tp.tp.trace_id, opt.trace_id, sizeof(tp.tp.trace_id));
+    __builtin_memcpy(tp.tp.span_id, opt.span_id, sizeof(tp.tp.span_id));
+    if ((!exact_flags && !legacy) || !valid_trace(tp.tp.trace_id) || !valid_span(tp.tp.span_id)) {
         bpf_dbg_printk("ignoring malformed TCP traceparent option");
         return;
     }
@@ -571,14 +566,10 @@ static __always_inline void bpf_sock_ops_parse_hdr_cb(struct bpf_sock_ops *skops
         }
     }
 
-    tp_info_pid_t tp = {};
     tp.valid = 1;
     tp.tp.ts = bpf_ktime_get_ns();
     tp.tp.flags = exact_flags ? opt.flags : 0;
     tp.provenance = exact_flags ? k_tp_provenance_tcp_exact_flags : k_tp_provenance_tcp_legacy;
-
-    __builtin_memcpy(tp.tp.trace_id, opt.trace_id, sizeof(tp.tp.trace_id));
-    __builtin_memcpy(tp.tp.span_id, opt.span_id, sizeof(tp.tp.span_id));
 
     u32 tcp_sequence = 0;
     if (!tcp_sequence_from_sockops(skops, &tcp_sequence)) {
@@ -588,14 +579,25 @@ static __always_inline void bpf_sock_ops_parse_hdr_cb(struct bpf_sock_ops *skops
 
     connection_info_t conn = get_connection_info_ops(skops);
     sort_connection_info(&conn);
-    const u32 netns = sock_port_ns_from_sk((const struct sock *)(long)skops->sk).netns;
+    u64 netns_cookie = 0;
+    if (java_remote_parent_enabled) {
+        netns_cookie = bpf_get_netns_cookie(skops);
+        if (!netns_cookie) {
+            java_remote_parent_stat_add(k_java_remote_parent_stat_stage_overload);
+            return;
+        }
+    }
 
     dbg_print_http_connection_info(&conn);
-    const enum incoming_trace_update_result result =
-        update_incoming_trace(&conn, &tp, tcp_sequence, netns);
+    u64 ambiguous_generation = 0;
+    const enum incoming_trace_update_result result = update_incoming_trace_with_generation(
+        &conn, &tp, tcp_sequence, netns_cookie, &ambiguous_generation);
     if (java_remote_parent_enabled) {
+        if (ambiguous_generation) {
+            java_remote_parent_mark_connection_ambiguous_in_netns_cookie(
+                &conn, netns_cookie, ambiguous_generation);
+        }
         if (result == k_incoming_trace_ambiguous) {
-            java_remote_parent_mark_connection_ambiguous_in_netns(&conn, netns);
             java_remote_parent_stat_add(k_java_remote_parent_stat_stage_ambiguous);
         } else if (result == k_incoming_trace_update_failed) {
             java_remote_parent_stat_add(k_java_remote_parent_stat_stage_overload);
@@ -610,9 +612,11 @@ static __always_inline void bpf_sock_ops_state_cb(struct bpf_sock_ops *skops) {
 
     connection_info_t conn = get_connection_info_ops(skops);
     sort_connection_info(&conn);
-    const u32 netns = sock_port_ns_from_sk((const struct sock *)(long)skops->sk).netns;
-    delete_strict_incoming_trace(&conn, netns);
-    java_remote_parent_mark_connection_ambiguous_in_netns(&conn, netns);
+    const u64 netns_cookie = bpf_get_netns_cookie(skops);
+    if (netns_cookie) {
+        java_remote_parent_mark_connection_ambiguous_in_netns_cookie(&conn, netns_cookie, 0);
+        delete_strict_incoming_trace(&conn, netns_cookie);
+    }
 }
 
 // Tracks all outgoing sockets (BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB)

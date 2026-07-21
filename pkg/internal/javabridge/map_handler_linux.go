@@ -28,42 +28,44 @@ type bridgeMap interface {
 }
 
 type MapHandler struct {
-	remoteParents  bridgeMap
-	tasks          bridgeMap
-	virtualThreads bridgeMap
-	vtIdentities   bridgeMap
-	authorized     bridgeMap
-	incarnations   bridgeMap
-	connections    bridgeMap
-	ambiguity      bridgeMap
-	owners         bridgeMap
-	states         bridgeMap
-	generations    bridgeMap
-	terminals      bridgeMap
-	claims         bridgeMap
-	ttl            time.Duration
-	monoTimeNow    func() time.Duration
-	consumedMu     sync.Mutex
-	consumed       map[consumedIdentity]time.Duration
+	remoteParents     bridgeMap
+	tasks             bridgeMap
+	virtualThreads    bridgeMap
+	vtIdentities      bridgeMap
+	authorized        bridgeMap
+	incarnations      bridgeMap
+	connections       bridgeMap
+	cookieConnections bridgeMap
+	ambiguity         bridgeMap
+	owners            bridgeMap
+	states            bridgeMap
+	generations       bridgeMap
+	terminals         bridgeMap
+	claims            bridgeMap
+	ttl               time.Duration
+	monoTimeNow       func() time.Duration
+	consumedMu        sync.Mutex
+	consumed          map[consumedIdentity]time.Duration
 }
 
 type Maps struct {
-	RemoteParents  *ebpf.Map
-	Tasks          *ebpf.Map
-	VirtualThreads *ebpf.Map
-	VTIdentities   *ebpf.Map
-	Authorized     *ebpf.Map
-	Incarnations   *ebpf.Map
-	Connections    *ebpf.Map
-	Ambiguity      *ebpf.Map
-	Owners         *ebpf.Map
-	States         *ebpf.Map
-	Generations    *ebpf.Map
-	Terminals      *ebpf.Map
-	Claims         *ebpf.Map
-	Handoffs       *ebpf.Map
-	HandoffClaims  *ebpf.Map
-	Retired        *ebpf.Map
+	RemoteParents     *ebpf.Map
+	Tasks             *ebpf.Map
+	VirtualThreads    *ebpf.Map
+	VTIdentities      *ebpf.Map
+	Authorized        *ebpf.Map
+	Incarnations      *ebpf.Map
+	Connections       *ebpf.Map
+	CookieConnections *ebpf.Map
+	Ambiguity         *ebpf.Map
+	Owners            *ebpf.Map
+	States            *ebpf.Map
+	Generations       *ebpf.Map
+	Terminals         *ebpf.Map
+	Claims            *ebpf.Map
+	Handoffs          *ebpf.Map
+	HandoffClaims     *ebpf.Map
+	Retired           *ebpf.Map
 }
 
 type stateKey struct {
@@ -91,15 +93,25 @@ type connectionInfoNS struct {
 	NetNS      uint32
 }
 
+type connectionInfoNetNSCookie struct {
+	Connection  connectionInfo
+	Reserved    uint32
+	NetNSCookie uint64
+}
+
 type virtualThreadIdentity struct {
 	VirtualThreadID    uint64
 	ProcessIncarnation uint64
 }
 
 type connectionClaim struct {
-	Owner      Identity
-	Reserved   uint32
-	Generation uint64
+	Owner              Identity
+	Reserved           uint32
+	Generation         uint64
+	NetNSCookie        uint64
+	IncomingGeneration uint64
+	NetNS              uint32
+	Reserved2          uint32
 }
 
 type stateValue struct {
@@ -164,22 +176,23 @@ const (
 
 func NewMapHandler(maps Maps, ttl time.Duration) *MapHandler {
 	return &MapHandler{
-		remoteParents:  maps.RemoteParents,
-		tasks:          maps.Tasks,
-		virtualThreads: maps.VirtualThreads,
-		vtIdentities:   maps.VTIdentities,
-		authorized:     maps.Authorized,
-		incarnations:   maps.Incarnations,
-		connections:    maps.Connections,
-		ambiguity:      maps.Ambiguity,
-		owners:         maps.Owners,
-		states:         maps.States,
-		generations:    maps.Generations,
-		terminals:      maps.Terminals,
-		claims:         maps.Claims,
-		ttl:            ttl,
-		monoTimeNow:    timing.MonoTimeNow,
-		consumed:       make(map[consumedIdentity]time.Duration),
+		remoteParents:     maps.RemoteParents,
+		tasks:             maps.Tasks,
+		virtualThreads:    maps.VirtualThreads,
+		vtIdentities:      maps.VTIdentities,
+		authorized:        maps.Authorized,
+		incarnations:      maps.Incarnations,
+		connections:       maps.Connections,
+		cookieConnections: maps.CookieConnections,
+		ambiguity:         maps.Ambiguity,
+		owners:            maps.Owners,
+		states:            maps.States,
+		generations:       maps.Generations,
+		terminals:         maps.Terminals,
+		claims:            maps.Claims,
+		ttl:               ttl,
+		monoTimeNow:       timing.MonoTimeNow,
+		consumed:          make(map[consumedIdentity]time.Duration),
 	}
 }
 
@@ -207,8 +220,8 @@ func (h *MapHandler) handle(
 		return Record{Status: StatusTimeout}
 	}
 	if h.remoteParents == nil || h.tasks == nil || h.virtualThreads == nil || h.vtIdentities == nil || h.authorized == nil || h.incarnations == nil ||
-		h.connections == nil || h.ambiguity == nil || h.owners == nil ||
-		h.states == nil || h.generations == nil || h.terminals == nil || h.claims == nil {
+		h.connections == nil || h.cookieConnections == nil || h.ambiguity == nil ||
+		h.owners == nil || h.states == nil || h.generations == nil || h.terminals == nil || h.claims == nil {
 		return Record{Status: StatusUnsupported}
 	}
 	if operation != OperationTake && operation != OperationDiscard && operation != OperationNegotiate {
@@ -474,8 +487,23 @@ func (h *MapHandler) validatePublishedGeneration(
 		}
 		return stateValue{}, Record{}, StatusTransportError
 	}
-	if connection.Owner != owner || connection.Reserved != 0 ||
-		connection.Generation != record.Generation {
+	if !validConnectionClaim(connection, owner, record.Generation, state.ConnectionNetNS) {
+		return stateValue{}, Record{}, StatusAmbiguous
+	}
+	var cookieConnection connectionClaim
+	if err := h.cookieConnections.Lookup(
+		&connectionInfoNetNSCookie{
+			Connection:  state.Connection,
+			NetNSCookie: connection.NetNSCookie,
+		},
+		&cookieConnection,
+	); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return stateValue{}, Record{}, StatusAmbiguous
+		}
+		return stateValue{}, Record{}, StatusTransportError
+	}
+	if cookieConnection != connection {
 		return stateValue{}, Record{}, StatusAmbiguous
 	}
 
@@ -1220,6 +1248,13 @@ func (h *MapHandler) releaseConnection(
 	}
 	if claim.Owner != owner || claim.Generation != generation {
 		return true
+	}
+	cookieKey := connectionInfoNetNSCookie{
+		Connection:  connection,
+		NetNSCookie: claim.NetNSCookie,
+	}
+	if _, err := cleanupDeleteExact(h.cookieConnections, cookieKey, claim); err != nil {
+		return false
 	}
 	_, err := cleanupDeleteExact(h.connections, connectionKey, claim)
 	return err == nil

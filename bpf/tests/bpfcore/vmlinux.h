@@ -39,6 +39,7 @@ struct ns_common {
 
 struct net {
     struct ns_common ns;
+    u64 net_cookie;
 };
 
 struct pid_namespace {

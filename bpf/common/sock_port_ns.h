@@ -29,7 +29,26 @@ static __always_inline struct sock_port_ns sock_port_ns_from_sk(const struct soc
     return sock_port_ns_from_skc(skc);
 }
 
+static __always_inline u64 netns_cookie_from_net(const struct net *net) {
+    if (!net || !bpf_core_field_exists(net->net_cookie)) {
+        return 0;
+    }
+    return BPF_CORE_READ(net, net_cookie);
+}
+
+static __always_inline u64 sock_netns_cookie_from_sk(const struct sock *sk) {
+    const struct sock_common *skc = (const struct sock_common *)sk;
+    const struct net *net = BPF_CORE_READ(skc, skc_net.net);
+    return netns_cookie_from_net(net);
+}
+
 static __always_inline u32 task_netns() {
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
     return (u32)BPF_CORE_READ(task, nsproxy, net_ns, ns.inum);
+}
+
+static __always_inline u64 task_netns_cookie() {
+    const struct task_struct *task = (const struct task_struct *)bpf_get_current_task();
+    const struct net *net = BPF_CORE_READ(task, nsproxy, net_ns);
+    return netns_cookie_from_net(net);
 }

@@ -22,6 +22,34 @@ func TestCleanupKernelMapLayouts(t *testing.T) {
 	assert.Equal(t, uintptr(24), unsafe.Sizeof(generationClaim{}))
 }
 
+func TestCleanupCookieDeleteErrorPreservesConnectionLocator(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)},
+		nil,
+		nil,
+	)
+	cleanup := testCleanup(handler)
+	connections := cleanup.maps.connections.(*fakeBridgeMap)
+	cookieConnections := cleanup.maps.cookieConnections.(*fakeBridgeMap)
+	var connectionKey connectionInfoNS
+	var connection connectionClaim
+	for key, value := range connections.values {
+		connectionKey = key.(connectionInfoNS)
+		connection = value.(connectionClaim)
+	}
+	cookieConnections.deleteErr = errors.New("unexpected cookie connection deletion")
+
+	require.Error(t, cleanup.deleteConnectionIndexes(connectionKey, connection))
+	assert.Contains(t, connections.values, connectionKey)
+	assert.NotEmpty(t, cookieConnections.values)
+
+	cookieConnections.deleteErr = nil
+	require.NoError(t, cleanup.deleteConnectionIndexes(connectionKey, connection))
+	assert.Empty(t, connections.values)
+	assert.Empty(t, cookieConnections.values)
+}
+
 func TestCleanupStatsCountGenerationOnce(t *testing.T) {
 	owner := Identity{TID: 3, PID: 2, Namespace: 1}
 	handler := testMapHandler(
@@ -303,6 +331,7 @@ func TestCleanupInfersRetirementWhenExitMarkerIsMissing(t *testing.T) {
 	assert.Empty(t, cleanup.maps.states.(*fakeBridgeMap).values)
 	assert.Empty(t, cleanup.maps.generations.(*fakeBridgeMap).values)
 	assert.Empty(t, cleanup.maps.connections.(*fakeBridgeMap).values)
+	assert.Empty(t, cleanup.maps.cookieConnections.(*fakeBridgeMap).values)
 	assert.Equal(t, identity, cleanup.maps.virtualThreads.(*fakeBridgeMap).values[carrier])
 	assert.Equal(t, identity, cleanup.maps.vtIdentities.(*fakeBridgeMap).values[virtualOwner])
 }
@@ -371,6 +400,7 @@ func TestCleanupQuarantinesMalformedFallbackAndAllowsOwnerReuse(t *testing.T) {
 	assert.Empty(t, cleanup.maps.states.(*fakeBridgeMap).values)
 	assert.Empty(t, cleanup.maps.generations.(*fakeBridgeMap).values)
 	assert.Empty(t, cleanup.maps.connections.(*fakeBridgeMap).values)
+	assert.Empty(t, cleanup.maps.cookieConnections.(*fakeBridgeMap).values)
 
 	handler.remoteParents.(*fakeBridgeMap).values[owner] = validEncodedRecord(t, 11)
 	seedOwnerState(handler, owner, 11)
@@ -454,21 +484,22 @@ func testCleanup(handler *MapHandler) *Cleanup {
 	newMap := func() cleanupMap { return &fakeBridgeMap{values: make(map[any]any)} }
 	return &Cleanup{
 		maps: cleanupMaps{
-			remoteParents:  handler.remoteParents.(cleanupMap),
-			tasks:          handler.tasks.(cleanupMap),
-			virtualThreads: handler.virtualThreads.(cleanupMap),
-			vtIdentities:   handler.vtIdentities.(cleanupMap),
-			incarnations:   handler.incarnations.(cleanupMap),
-			connections:    handler.connections.(cleanupMap),
-			ambiguity:      handler.ambiguity.(cleanupMap),
-			owners:         handler.owners.(cleanupMap),
-			states:         handler.states.(cleanupMap),
-			generations:    handler.generations.(cleanupMap),
-			terminals:      handler.terminals.(cleanupMap),
-			claims:         handler.claims.(cleanupMap),
-			handoffs:       newMap(),
-			handoffClaims:  newMap(),
-			retired:        newMap(),
+			remoteParents:     handler.remoteParents.(cleanupMap),
+			tasks:             handler.tasks.(cleanupMap),
+			virtualThreads:    handler.virtualThreads.(cleanupMap),
+			vtIdentities:      handler.vtIdentities.(cleanupMap),
+			incarnations:      handler.incarnations.(cleanupMap),
+			connections:       handler.connections.(cleanupMap),
+			cookieConnections: handler.cookieConnections.(cleanupMap),
+			ambiguity:         handler.ambiguity.(cleanupMap),
+			owners:            handler.owners.(cleanupMap),
+			states:            handler.states.(cleanupMap),
+			generations:       handler.generations.(cleanupMap),
+			terminals:         handler.terminals.(cleanupMap),
+			claims:            handler.claims.(cleanupMap),
+			handoffs:          newMap(),
+			handoffClaims:     newMap(),
+			retired:           newMap(),
 		},
 		ttl:         handler.ttl,
 		monoTimeNow: handler.monoTimeNow,

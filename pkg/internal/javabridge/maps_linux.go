@@ -16,6 +16,7 @@ var disabledBridgeMapNames = [...]string{
 	"java_remote_parent_ambiguity",
 	"java_remote_parent_claims",
 	"java_remote_parent_connections",
+	"java_remote_parent_cookie_connections",
 	"java_remote_parent_data_acks",
 	"java_remote_parent_data_signals",
 	"java_remote_parent_fallback",

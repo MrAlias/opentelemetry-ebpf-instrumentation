@@ -185,7 +185,8 @@ static __always_inline int java_remote_parent_ack_data(struct bpf_sockopt *ctx) 
         !java_remote_parent_connection_matches_in_netns(&acknowledgement_copy.connection,
                                                         acknowledgement_copy.connection_netns,
                                                         &acknowledgement_copy.owner,
-                                                        acknowledgement_copy.generation)) {
+                                                        acknowledgement_copy.generation,
+                                                        0)) {
         return 1;
     }
 

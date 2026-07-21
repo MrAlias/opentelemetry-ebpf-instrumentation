@@ -57,18 +57,20 @@ var goChannelOffsetFields = [...]goexec.GoOffset{
 }
 
 type Tracer struct {
-	log                     *slog.Logger
-	pidsFilter              ebpfcommon.ServiceFilter
-	cfg                     *config.EBPFTracer
-	metrics                 imetrics.Reporter
-	bpfObjects              BpfObjects
-	closers                 []io.Closer
-	disabledRouteHarvesting bool
-	javaRemoteParentEnabled bool
-	supportsBPFLoop         bool
-	runtimeMetricTargetKeys map[runtimeMetricTargetKey]BpfPidInfo
-	goChannelOffsetsByIno   map[uint64]bool
-	currentBinaryIno        uint64
+	log                        *slog.Logger
+	pidsFilter                 ebpfcommon.ServiceFilter
+	cfg                        *config.EBPFTracer
+	metrics                    imetrics.Reporter
+	bpfObjects                 BpfObjects
+	closers                    []io.Closer
+	disabledRouteHarvesting    bool
+	javaRemoteParentConfigured bool
+	javaRemoteParentEnabled    bool
+	haveSockOpsNetnsCookie     func() error
+	supportsBPFLoop            bool
+	runtimeMetricTargetKeys    map[runtimeMetricTargetKey]BpfPidInfo
+	goChannelOffsetsByIno      map[uint64]bool
+	currentBinaryIno           uint64
 }
 
 func New(
@@ -88,15 +90,16 @@ func New(
 	}
 
 	return &Tracer{
-		log:                     log,
-		pidsFilter:              pidFilter,
-		cfg:                     &cfg.EBPF,
-		metrics:                 metrics,
-		disabledRouteHarvesting: disabledRouteHarvesting,
-		javaRemoteParentEnabled: cfg.Java.RemoteParent.Enabled(),
-		supportsBPFLoop:         ebpfcommon.SupportsEBPFLoops(log, cfg.EBPF.OverrideBPFLoopEnabled),
-		runtimeMetricTargetKeys: map[runtimeMetricTargetKey]BpfPidInfo{},
-		goChannelOffsetsByIno:   map[uint64]bool{},
+		log:                        log,
+		pidsFilter:                 pidFilter,
+		cfg:                        &cfg.EBPF,
+		metrics:                    metrics,
+		disabledRouteHarvesting:    disabledRouteHarvesting,
+		javaRemoteParentConfigured: cfg.Java.RemoteParent.Enabled(),
+		haveSockOpsNetnsCookie:     javabridge.HaveSockOpsNetnsCookie,
+		supportsBPFLoop:            ebpfcommon.SupportsEBPFLoops(log, cfg.EBPF.OverrideBPFLoopEnabled),
+		runtimeMetricTargetKeys:    map[runtimeMetricTargetKey]BpfPidInfo{},
+		goChannelOffsetsByIno:      map[uint64]bool{},
 	}
 }
 
@@ -130,6 +133,8 @@ func (p *Tracer) LoadSpecs() ([]*ebpfcommon.SpecBundle, error) {
 	}
 
 	ebpfcommon.FixupSpec(spec, p.cfg.OverrideBPFLoopEnabled)
+	p.javaRemoteParentEnabled = p.javaRemoteParentConfigured &&
+		p.haveSockOpsNetnsCookie() == nil
 	if !p.javaRemoteParentEnabled {
 		javabridge.MinimizeDisabledMaps(spec)
 	}

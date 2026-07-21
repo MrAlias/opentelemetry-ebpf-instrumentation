@@ -132,7 +132,9 @@ static __always_inline http_connection_metadata_t *connection_meta_by_direction(
     return meta;
 }
 
-static __always_inline int read_msghdr_buf(struct msghdr *msg, unsigned char *buf, size_t max_len) {
+// Keep iterator scratch out of syscall frames that reach the 512-byte BPF stack limit.
+static __noinline __attribute__((unused)) int
+read_msghdr_buf(struct msghdr *msg, unsigned char *buf, size_t max_len) {
     if (max_len == 0) {
         return 0;
     }

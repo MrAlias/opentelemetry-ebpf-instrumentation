@@ -49,11 +49,31 @@ typedef struct connection_info_ns {
 
 _Static_assert(sizeof(connection_info_ns_t) == 40, "namespaced connection key size mismatch");
 
+typedef struct connection_info_netns_cookie {
+    connection_info_t connection;
+    u32 reserved;
+    u64 netns_cookie;
+} connection_info_netns_cookie_t;
+
+_Static_assert(offsetof(connection_info_netns_cookie_t, netns_cookie) == 40,
+               "network namespace cookie offset mismatch");
+_Static_assert(sizeof(connection_info_netns_cookie_t) == 48,
+               "network namespace cookie key size mismatch");
+
 static __always_inline connection_info_ns_t
 connection_info_with_netns(const connection_info_t *connection, u32 netns) {
     const connection_info_ns_t key = {
         .connection = *connection,
         .netns = netns,
+    };
+    return key;
+}
+
+static __always_inline connection_info_netns_cookie_t
+connection_info_with_netns_cookie(const connection_info_t *connection, u64 netns_cookie) {
+    const connection_info_netns_cookie_t key = {
+        .connection = *connection,
+        .netns_cookie = netns_cookie,
     };
     return key;
 }

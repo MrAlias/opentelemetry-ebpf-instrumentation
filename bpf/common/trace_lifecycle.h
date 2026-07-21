@@ -58,17 +58,27 @@ static __always_inline void delete_client_trace_info(pid_connection_info_t *pid_
     bpf_map_delete_elem(&cp_support_connect_info, pid_conn);
 }
 
-static __always_inline u8 find_trace_for_server_request(connection_info_t *conn,
-                                                        tp_info_t *tp,
-                                                        const u8 type) {
+static __always_inline u8 find_trace_for_server_request_with_incoming(connection_info_t *conn,
+                                                                      tp_info_t *tp,
+                                                                      const u8 type,
+                                                                      u64 netns_cookie,
+                                                                      tp_info_pid_t *incoming,
+                                                                      u64 *incoming_generation) {
+    if (incoming_generation) {
+        *incoming_generation = 0;
+    }
     u8 found_tp = 0;
     connection_info_t sorted_conn = *conn;
     sort_connection_info(&sorted_conn);
-    tp_info_pid_t *existing_tp = consume_incoming_trace(&sorted_conn);
+    tp_info_pid_t *existing_tp = consume_incoming_trace_in_netns_cookie_with_generation(
+        &sorted_conn, netns_cookie, incoming_generation);
     if (existing_tp) {
         if (existing_tp->valid && valid_trace(existing_tp->tp.trace_id) &&
             valid_span(existing_tp->tp.span_id)) {
             found_tp = 1;
+            if (incoming && incoming_generation && *incoming_generation) {
+                __builtin_memcpy(incoming, existing_tp, sizeof(*incoming));
+            }
             bpf_dbg_printk("Found incoming (TCP/IP) tp for server request");
             __builtin_memcpy(tp->trace_id, existing_tp->tp.trace_id, sizeof(tp->trace_id));
             __builtin_memcpy(tp->parent_id, existing_tp->tp.span_id, sizeof(tp->parent_id));
@@ -76,6 +86,9 @@ static __always_inline u8 find_trace_for_server_request(connection_info_t *conn,
                 tp->flags = existing_tp->tp.flags;
             }
         } else {
+            if (incoming_generation) {
+                *incoming_generation = 0;
+            }
             bpf_dbg_printk("Ignoring ambiguous incoming (TCP/IP) tp for server request");
         }
     } else {
@@ -114,6 +127,13 @@ static __always_inline u8 find_trace_for_server_request(connection_info_t *conn,
     }
 
     return found_tp;
+}
+
+static __always_inline u8 find_trace_for_server_request(connection_info_t *conn,
+                                                        tp_info_t *tp,
+                                                        const u8 type) {
+    return find_trace_for_server_request_with_incoming(
+        conn, tp, type, task_netns_cookie(), NULL, NULL);
 }
 
 static __always_inline void server_or_client_trace(const u8 type,

@@ -42,6 +42,9 @@ const (
 // reports missing kernel features or capabilities as unsupported rather than
 // treating an unexecuted security scenario as a pass.
 func TestJavaRemoteParentPrimarySocketAuthority(t *testing.T) {
+	if err := javabridge.HaveSockOpsNetnsCookie(); err != nil {
+		t.Skipf("sockops network namespace cookies unsupported: %v", err)
+	}
 	if err := features.HaveProgramType(ebpf.CGroupSockopt); err != nil {
 		t.Skipf("cgroup sockopt BPF programs unsupported: %v", err)
 	}
@@ -294,6 +297,9 @@ func TestJavaRemoteParentUnauthorizedProcessHelper(t *testing.T) {
 }
 
 func TestJavaRemoteParentPrimaryRequiresAuthoritativeDataHook(t *testing.T) {
+	if err := javabridge.HaveSockOpsNetnsCookie(); err != nil {
+		t.Skipf("sockops network namespace cookies unsupported: %v", err)
+	}
 	if err := features.HaveProgramType(ebpf.CGroupSockopt); err != nil {
 		t.Skipf("cgroup sockopt BPF programs unsupported: %v", err)
 	}
@@ -953,6 +959,18 @@ func stageRemoteParentAt(
 		Connection: connection,
 		Netns:      netns,
 	}
+	netnsCookie := remoteParentTestNetNSCookie(netns, generation)
+	cookieConnectionKey := BpfJavaRemoteParentConnectionInfoNetnsCookieT{
+		Connection:  connection,
+		NetnsCookie: netnsCookie,
+	}
+	connectionValue := BpfJavaRemoteParentJavaRemoteParentConnectionT{
+		Owner:              owner,
+		Generation:         generation,
+		NetnsCookie:        netnsCookie,
+		IncomingGeneration: generation,
+		Netns:              netns,
+	}
 
 	require.NoError(t, maps.JavaRemoteParentState.Update(key,
 		BpfJavaRemoteParentJavaRemoteParentStateT{
@@ -969,11 +987,10 @@ func stageRemoteParentAt(
 			ProcessIncarnation: capability,
 			ObservedMonotimeNs: observed,
 		}, ebpf.UpdateNoExist))
-	require.NoError(t, maps.JavaRemoteParentConnections.Update(connectionKey,
-		BpfJavaRemoteParentJavaRemoteParentConnectionT{
-			Owner:      owner,
-			Generation: generation,
-		}, ebpf.UpdateNoExist))
+	require.NoError(t, maps.JavaRemoteParentConnections.Update(
+		connectionKey, connectionValue, ebpf.UpdateNoExist))
+	require.NoError(t, maps.JavaRemoteParentCookieConnections.Update(
+		cookieConnectionKey, connectionValue, ebpf.UpdateNoExist))
 	require.NoError(t, maps.JavaRemoteParentFallback.Update(owner, record, ebpf.UpdateNoExist))
 	require.NoError(t, maps.JavaRemoteParentOwners.Update(owner,
 		BpfJavaRemoteParentJavaRemoteParentOwnerT{
@@ -991,6 +1008,15 @@ func stageRemoteParentAt(
 		generation,
 		nonce,
 	)
+}
+
+func remoteParentTestNetNSCookie(netns uint32, generation uint64) uint64 {
+	cookie := uint64(netns)<<32 ^ generation
+	if cookie == 0 {
+		return 1
+	}
+
+	return cookie
 }
 
 func monotonicNowNS(t *testing.T) uint64 {

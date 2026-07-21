@@ -10,6 +10,7 @@
 #include <common/connection_info.h>
 #include <common/map_sizing.h>
 #include <common/pin_internal.h>
+#include <common/scratch_mem.h>
 #include <common/sock_port_ns.h>
 
 #include <maps/java_remote_parent_fallback.h>
@@ -42,6 +43,10 @@ typedef struct java_remote_parent_connection {
     pid_key_t owner;
     u32 reserved;
     u64 generation;
+    u64 netns_cookie;
+    u64 incoming_generation;
+    u32 netns;
+    u32 reserved2;
 } java_remote_parent_connection_t;
 
 typedef struct java_remote_parent_claim {
@@ -67,7 +72,7 @@ typedef struct java_remote_parent_data_ack {
     unsigned char reserved3[4];
 } java_remote_parent_data_ack_t;
 
-_Static_assert(sizeof(java_remote_parent_connection_t) == 24,
+_Static_assert(sizeof(java_remote_parent_connection_t) == 48,
                "java remote-parent connection size mismatch");
 _Static_assert(sizeof(java_remote_parent_owner_t) == 24, "java remote-parent owner size mismatch");
 _Static_assert(sizeof(java_remote_parent_claim_t) == 24, "java remote-parent claim size mismatch");
@@ -75,6 +80,28 @@ _Static_assert(sizeof(java_remote_parent_data_signal_key_t) == 24,
                "java remote-parent data-signal key size mismatch");
 _Static_assert(sizeof(java_remote_parent_data_ack_t) == 72,
                "java remote-parent data acknowledgement size mismatch");
+
+typedef struct java_remote_parent_connection_keys {
+    connection_info_ns_t netns;
+    connection_info_netns_cookie_t cookie;
+} java_remote_parent_connection_keys_t;
+
+SCRATCH_MEM_TYPED(java_remote_parent_connection_keys, java_remote_parent_connection_keys_t)
+SCRATCH_MEM_TYPED(java_remote_parent_connection_value, java_remote_parent_connection_t)
+
+static __always_inline java_remote_parent_connection_keys_t *java_remote_parent_connection_keys_for(
+    const connection_info_t *connection, u32 netns, u64 netns_cookie) {
+    java_remote_parent_connection_keys_t *keys = java_remote_parent_connection_keys_mem();
+    if (!keys || (!netns && !netns_cookie)) {
+        return NULL;
+    }
+    __builtin_memcpy(&keys->netns.connection, connection, sizeof(keys->netns.connection));
+    keys->netns.netns = netns;
+    __builtin_memcpy(&keys->cookie.connection, connection, sizeof(keys->cookie.connection));
+    keys->cookie.reserved = 0;
+    keys->cookie.netns_cookie = netns_cookie;
+    return keys;
+}
 
 enum java_remote_parent_data_hook_state : u32 {
     k_java_remote_parent_data_hook_unavailable = 0,
@@ -121,6 +148,14 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, connection_info_netns_cookie_t);
+    __type(value, java_remote_parent_connection_t);
+    __uint(max_entries, MAX_CONCURRENT_REQUESTS);
+    __uint(pinning, OBI_PIN_INTERNAL);
+} java_remote_parent_cookie_connections SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, java_remote_parent_key_t);
     __type(value, java_remote_parent_claim_t);
     __uint(max_entries, MAX_CONCURRENT_REQUESTS);
@@ -135,21 +170,46 @@ struct {
     __uint(pinning, OBI_PIN_INTERNAL);
 } java_remote_parent_owners SEC(".maps");
 
-static __always_inline u8 java_remote_parent_connection_matches_in_netns(
-    const connection_info_t *connection, u32 netns, const pid_key_t *owner, u64 generation) {
-    const connection_info_ns_t key = connection_info_with_netns(connection, netns);
+static __always_inline u8
+java_remote_parent_connection_matches_in_netns(const connection_info_t *connection,
+                                               u32 netns,
+                                               const pid_key_t *owner,
+                                               u64 generation,
+                                               u64 incoming_generation) {
+    java_remote_parent_connection_keys_t *keys =
+        java_remote_parent_connection_keys_for(connection, netns, 0);
+    if (!keys) {
+        return 0;
+    }
     const java_remote_parent_connection_t *staged =
-        bpf_map_lookup_elem(&java_remote_parent_connections, &key);
-    return staged && staged->generation == generation && staged->reserved == 0 &&
-           staged->owner.tid == owner->tid && staged->owner.pid == owner->pid &&
-           staged->owner.ns == owner->ns;
+        bpf_map_lookup_elem(&java_remote_parent_connections, &keys->netns);
+    if (!staged || staged->reserved != 0 || staged->reserved2 != 0 ||
+        staged->generation != generation || staged->netns != netns || !staged->netns_cookie ||
+        !staged->incoming_generation ||
+        (incoming_generation && staged->incoming_generation != incoming_generation) ||
+        staged->owner.tid != owner->tid || staged->owner.pid != owner->pid ||
+        staged->owner.ns != owner->ns) {
+        return 0;
+    }
+
+    __builtin_memcpy(&keys->cookie.connection, connection, sizeof(keys->cookie.connection));
+    keys->cookie.reserved = 0;
+    keys->cookie.netns_cookie = staged->netns_cookie;
+    const java_remote_parent_connection_t *cookie_staged =
+        bpf_map_lookup_elem(&java_remote_parent_cookie_connections, &keys->cookie);
+    return cookie_staged && cookie_staged->generation == generation &&
+           cookie_staged->reserved == 0 && cookie_staged->reserved2 == 0 &&
+           cookie_staged->netns == netns && cookie_staged->netns_cookie == staged->netns_cookie &&
+           cookie_staged->incoming_generation == staged->incoming_generation &&
+           cookie_staged->owner.tid == owner->tid && cookie_staged->owner.pid == owner->pid &&
+           cookie_staged->owner.ns == owner->ns;
 }
 
 static __always_inline u8 java_remote_parent_connection_matches(const connection_info_t *connection,
                                                                 const pid_key_t *owner,
                                                                 u64 generation) {
     return java_remote_parent_connection_matches_in_netns(
-        connection, task_netns(), owner, generation);
+        connection, task_netns(), owner, generation, 0);
 }
 
 enum java_remote_parent_stat : u32 {
@@ -285,6 +345,9 @@ static __always_inline u8 java_remote_parent_mark_generation_ambiguous(const pid
         .owner = *owner,
         .generation = generation,
     };
+    if (bpf_map_lookup_elem(&java_remote_parent_claims, &key)) {
+        return 1;
+    }
     const u64 observed_monotime_ns = bpf_ktime_get_ns();
     if (bpf_map_update_elem(&java_remote_parent_ambiguity, &key, &observed_monotime_ns, BPF_ANY) !=
         0) {
@@ -306,20 +369,98 @@ java_remote_parent_generation_ambiguous(const java_remote_parent_key_t *key) {
 }
 
 static __always_inline void
-java_remote_parent_mark_connection_ambiguous_in_netns(const connection_info_t *connection,
-                                                      u32 netns) {
-    const connection_info_ns_t key = connection_info_with_netns(connection, netns);
-    const java_remote_parent_connection_t *staged =
-        bpf_map_lookup_elem(&java_remote_parent_connections, &key);
-    if (!staged) {
+java_remote_parent_delete_connection_indexes(const connection_info_t *connection,
+                                             const java_remote_parent_connection_t *staged) {
+    if (!staged || !staged->netns || !staged->netns_cookie) {
         return;
     }
 
-    const java_remote_parent_connection_t copy = *staged;
-    bpf_map_delete_elem(&java_remote_parent_connections, &key);
-    if (!java_remote_parent_mark_generation_ambiguous(&copy.owner, copy.generation)) {
-        java_remote_parent_cleanup_fallback_generation(&copy.owner, copy.generation);
+    java_remote_parent_connection_t *copy = java_remote_parent_connection_value_mem();
+    if (!copy) {
+        return;
     }
+    if (copy != staged) {
+        __builtin_memcpy(copy, staged, sizeof(*copy));
+    }
+    java_remote_parent_connection_keys_t *keys =
+        java_remote_parent_connection_keys_for(connection, copy->netns, copy->netns_cookie);
+    if (!keys) {
+        return;
+    }
+    const java_remote_parent_connection_t *netns_staged =
+        bpf_map_lookup_elem(&java_remote_parent_connections, &keys->netns);
+    if (netns_staged && netns_staged->generation == copy->generation &&
+        netns_staged->owner.tid == copy->owner.tid && netns_staged->owner.pid == copy->owner.pid &&
+        netns_staged->owner.ns == copy->owner.ns) {
+        bpf_map_delete_elem(&java_remote_parent_connections, &keys->netns);
+    }
+
+    const java_remote_parent_connection_t *cookie_staged =
+        bpf_map_lookup_elem(&java_remote_parent_cookie_connections, &keys->cookie);
+    if (cookie_staged && cookie_staged->generation == copy->generation &&
+        cookie_staged->owner.tid == copy->owner.tid &&
+        cookie_staged->owner.pid == copy->owner.pid && cookie_staged->owner.ns == copy->owner.ns) {
+        bpf_map_delete_elem(&java_remote_parent_cookie_connections, &keys->cookie);
+    }
+}
+
+static __always_inline void
+java_remote_parent_invalidate_connection(const connection_info_t *connection,
+                                         const java_remote_parent_connection_t *staged,
+                                         u64 incoming_generation) {
+    if (!staged || !staged->netns || !staged->netns_cookie) {
+        return;
+    }
+
+    java_remote_parent_connection_t *copy = java_remote_parent_connection_value_mem();
+    if (!copy) {
+        return;
+    }
+    __builtin_memcpy(copy, staged, sizeof(*copy));
+    if (incoming_generation && copy->incoming_generation != incoming_generation) {
+        return;
+    }
+    const java_remote_parent_key_t key = {
+        .owner = copy->owner,
+        .generation = copy->generation,
+    };
+    const u8 marked = java_remote_parent_mark_generation_ambiguous(&copy->owner, copy->generation);
+    if (marked && !java_remote_parent_generation_ambiguous(&key)) {
+        return;
+    }
+
+    java_remote_parent_delete_connection_indexes(connection, copy);
+    if (!marked) {
+        java_remote_parent_cleanup_fallback_generation(&copy->owner, copy->generation);
+    }
+}
+
+static __always_inline void
+java_remote_parent_mark_connection_ambiguous_in_netns(const connection_info_t *connection,
+                                                      u32 netns) {
+    java_remote_parent_connection_keys_t *keys =
+        java_remote_parent_connection_keys_for(connection, netns, 0);
+    if (!keys) {
+        return;
+    }
+    const java_remote_parent_connection_t *staged =
+        bpf_map_lookup_elem(&java_remote_parent_connections, &keys->netns);
+    java_remote_parent_invalidate_connection(connection, staged, 0);
+}
+
+static __always_inline void java_remote_parent_mark_connection_ambiguous_in_netns_cookie(
+    const connection_info_t *connection, u64 netns_cookie, u64 incoming_generation) {
+    if (!netns_cookie) {
+        return;
+    }
+    java_remote_parent_connection_keys_t *keys =
+        java_remote_parent_connection_keys_for(connection, 0, netns_cookie);
+    if (!keys) {
+        return;
+    }
+    const java_remote_parent_connection_t *staged =
+        bpf_map_lookup_elem(&java_remote_parent_cookie_connections, &keys->cookie);
+    java_remote_parent_invalidate_connection(connection, staged, incoming_generation);
 }
 
 static __always_inline void

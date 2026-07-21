@@ -53,6 +53,10 @@ static u8 test_java_remote_parent_data_hook_is_ready(void);
 static const pid_key_t test_owner = {.tid = 7, .pid = 5, .ns = 3};
 static u64 generation_sequence;
 static java_remote_parent_terminal_t terminal;
+static connection_info_netns_cookie_t incoming_connection_key;
+static incoming_trace_candidate_t incoming_candidate;
+static u64 incoming_generation;
+static u8 incoming_claim;
 static u64 stats[k_java_remote_parent_stat_max];
 static int update_calls;
 static int delete_calls;
@@ -65,6 +69,18 @@ static void fail(const char *message) {
 static void *test_map_lookup(void *map, const void *key) {
     if (map == &java_remote_parent_generation) {
         return &generation_sequence;
+    }
+    if (map == &incoming_trace_connection_key_storage) {
+        return &incoming_connection_key;
+    }
+    if (map == &incoming_trace_heads) {
+        return &incoming_generation;
+    }
+    if (map == &incoming_trace_candidates && *(const u64 *)key == incoming_generation) {
+        return &incoming_candidate;
+    }
+    if (map == &incoming_trace_claims && *(const u64 *)key == incoming_generation) {
+        return &incoming_claim;
     }
     if (map == &java_remote_parent_terminal) {
         const pid_key_t *owner = key;
@@ -138,10 +154,13 @@ int main(void) {
     };
     incoming.tp.trace_id[0] = 1;
     incoming.tp.span_id[0] = 2;
+    incoming_generation = 21;
+    incoming_claim = 1;
+    incoming_candidate = (incoming_trace_candidate_t){.candidate = incoming};
 
-    if (java_remote_parent_stage(&connection, 42, &incoming) != 0 || generation_sequence != 1 ||
-        terminal.generation != 1 || update_calls != 0 || delete_calls != 0 ||
-        stats[k_java_remote_parent_stat_stage_ambiguous] != 1) {
+    if (java_remote_parent_stage(&connection, 42, 84, 21, &incoming) != 0 ||
+        generation_sequence != 1 || terminal.generation != 1 || update_calls != 0 ||
+        delete_calls != 0 || stats[k_java_remote_parent_stat_stage_ambiguous] != 1) {
         fail("wrapped generation replaced an exact terminal tombstone");
     }
 

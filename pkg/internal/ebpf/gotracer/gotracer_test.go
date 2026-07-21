@@ -4,6 +4,7 @@
 package gotracer
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -77,23 +78,40 @@ func TestProcessBinarySelectsRecordedChannelOffsetState(t *testing.T) {
 func TestJavaRemoteParentModeSelectsConsumerProtocolAndMapSizes(t *testing.T) {
 	disableContextPropagationForTest(t)
 
-	for _, enabled := range []bool{false, true} {
-		t.Run(fmt.Sprintf("enabled=%t", enabled), func(t *testing.T) {
+	unsupported := errors.New("network namespace cookie helper unavailable")
+	for _, tt := range []struct {
+		configured    bool
+		probeErr      error
+		expected      bool
+		expectedCalls int
+	}{
+		{configured: false, expected: false},
+		{configured: true, expected: true, expectedCalls: 1},
+		{configured: true, probeErr: unsupported, expected: false, expectedCalls: 1},
+	} {
+		name := fmt.Sprintf("configured=%t/supported=%t", tt.configured, tt.probeErr == nil)
+		t.Run(name, func(t *testing.T) {
+			probeCalls := 0
 			tracer := &Tracer{
-				log:                     slog.New(slog.NewTextHandler(io.Discard, nil)),
-				cfg:                     &config.EBPFTracer{},
-				javaRemoteParentEnabled: enabled,
+				log:                        slog.New(slog.NewTextHandler(io.Discard, nil)),
+				cfg:                        &config.EBPFTracer{},
+				javaRemoteParentConfigured: tt.configured,
+				haveSockOpsNetnsCookie: func() error {
+					probeCalls++
+					return tt.probeErr
+				},
 			}
 
 			bundles, err := tracer.LoadSpecs()
 			require.NoError(t, err)
 			require.Len(t, bundles, 1)
-			assert.Equal(t, enabled, bundles[0].Constants["java_remote_parent_enabled"])
+			assert.Equal(t, tt.expectedCalls, probeCalls)
+			assert.Equal(t, tt.expected, bundles[0].Constants["java_remote_parent_enabled"])
 
 			for _, name := range []string{"incoming_trace_heads", "incoming_trace_candidates"} {
 				mapSpec := bundles[0].Spec.Maps[name]
 				require.NotNil(t, mapSpec, name)
-				if enabled {
+				if tt.expected {
 					assert.Greater(t, mapSpec.MaxEntries, uint32(1), name)
 				} else {
 					assert.Equal(t, uint32(1), mapSpec.MaxEntries, name)

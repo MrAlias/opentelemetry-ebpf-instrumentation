@@ -142,6 +142,7 @@ func TestTracerJavaRemoteParentSpecSelection(t *testing.T) {
 	require.NoError(t, unixConfig.EBPF.ContextPropagation.UnmarshalText([]byte("tcp")))
 	unixConfig.Java.RemoteParent.Transport = obi.JavaRemoteParentUnix
 	unixTracer := New(&unixConfig, nil)
+	unixTracer.haveSockOpsNetnsCookie = func() error { return nil }
 	unixBundles, err := unixTracer.LoadSpecs()
 	require.NoError(t, err)
 	assert.NotNil(t, unixTracer.javaRemoteParentMapsSpec)
@@ -150,6 +151,7 @@ func TestTracerJavaRemoteParentSpecSelection(t *testing.T) {
 	autoConfig := unixConfig
 	autoConfig.Java.RemoteParent.Transport = obi.JavaRemoteParentAuto
 	autoTracer := New(&autoConfig, nil)
+	autoTracer.haveSockOpsNetnsCookie = func() error { return nil }
 	autoBundles, err := autoTracer.LoadSpecs()
 	require.NoError(t, err)
 	require.Len(t, autoBundles, len(unixBundles))
@@ -200,6 +202,12 @@ func TestDisabledJavaRemoteParentReportsSelectionOnce(t *testing.T) {
 	cfg := obi.DefaultConfig
 	cfg.Java.RemoteParent.Transport = obi.JavaRemoteParentDisabled
 	tracer := New(&cfg, reporter)
+	tracer.haveSockOpsNetnsCookie = func() error {
+		t.Fatal("disabled Java remote parent unexpectedly probed sockops helpers")
+		return nil
+	}
+	_, err := tracer.LoadSpecs()
+	require.NoError(t, err)
 
 	stop := tracer.runJavaRemoteParent(context.Background())
 	stop()
@@ -210,6 +218,41 @@ func TestDisabledJavaRemoteParentReportsSelectionOnce(t *testing.T) {
 		status:    "disabled",
 		count:     1,
 	}}, reporter.observations)
+}
+
+func TestUnsupportedJavaRemoteParentKeepsTPInjectorLoadable(t *testing.T) {
+	unsupported := errors.New("network namespace cookie helper unavailable")
+	reporter := &javaRemoteParentRecordingReporter{}
+	cfg := obi.DefaultConfig
+	require.NoError(t, cfg.EBPF.ContextPropagation.UnmarshalText([]byte("tcp")))
+	cfg.Java.RemoteParent.Transport = obi.JavaRemoteParentAuto
+	tracer := New(&cfg, reporter)
+	tracer.haveSockOpsNetnsCookie = func() error { return unsupported }
+
+	bundles, err := tracer.LoadSpecs()
+	require.NoError(t, err)
+	require.NotEmpty(t, bundles)
+	assert.Equal(t, false, bundles[0].Constants["java_remote_parent_enabled"])
+	require.ErrorIs(t, tracer.javaRemoteParentSupportErr, unsupported)
+	assert.Nil(t, tracer.javaRemoteParentMapsSpec)
+	assert.Nil(t, tracer.javaRemoteParentSpec)
+
+	stop := tracer.runJavaRemoteParent(context.Background())
+	stop()
+	assert.ElementsMatch(t, []javaRemoteParentObservation{
+		{
+			transport: "getsockopt",
+			operation: "negotiate",
+			status:    "unsupported",
+			count:     1,
+		},
+		{
+			transport: "unix",
+			operation: "negotiate",
+			status:    "unsupported",
+			count:     1,
+		},
+	}, reporter.observations)
 }
 
 func TestJavaRemoteParentCleanupStatsAreObserved(t *testing.T) {
@@ -425,6 +468,9 @@ func TestJavaRemoteParentProcessExitCleanupIsRequired(t *testing.T) {
 	cfg.Java.RemoteParent.Transport = obi.JavaRemoteParentUnix
 
 	tracer := New(&cfg, nil)
+	tracer.haveSockOpsNetnsCookie = func() error { return nil }
+	_, err := tracer.LoadSpecs()
+	require.NoError(t, err)
 	tracepoints := tracer.Tracepoints()
 	require.Contains(t, tracepoints, "sched/sched_process_exit")
 	assert.True(t, tracepoints["sched/sched_process_exit"].Required)

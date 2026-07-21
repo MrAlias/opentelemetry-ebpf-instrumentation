@@ -90,6 +90,9 @@ func TestJavaRemoteParentTransportBenchmark(t *testing.T) {
 	if os.Getenv(javaRemoteParentBenchmarkEnv) != "1" {
 		t.Skip("set OBI_JAVA_REMOTE_PARENT_BENCHMARK=1 to run the privileged transport benchmark")
 	}
+	if err := javabridge.HaveSockOpsNetnsCookie(); err != nil {
+		t.Skipf("sockops network namespace cookies unsupported: %v", err)
+	}
 	if err := features.HaveProgramType(ebpf.CGroupSockopt); err != nil {
 		t.Skipf("cgroup sockopt BPF programs unsupported: %v", err)
 	}
@@ -601,22 +604,23 @@ func unixBenchmarkJobs(
 
 func javaRemoteParentBenchmarkMaps(maps *BpfJavaRemoteParentMaps) javabridge.Maps {
 	return javabridge.Maps{
-		RemoteParents:  maps.JavaRemoteParentFallback,
-		Tasks:          maps.JavaRemoteParentTasks,
-		VirtualThreads: maps.JavaVtThreads,
-		VTIdentities:   maps.JavaVtIdentities,
-		Authorized:     maps.JavaAuthorizedProcesses,
-		Incarnations:   maps.JavaProcessIncarnations,
-		Connections:    maps.JavaRemoteParentConnections,
-		Ambiguity:      maps.JavaRemoteParentAmbiguity,
-		Owners:         maps.JavaRemoteParentOwners,
-		States:         maps.JavaRemoteParentState,
-		Generations:    maps.JavaRemoteParentGenerationIndex,
-		Terminals:      maps.JavaRemoteParentTerminal,
-		Claims:         maps.JavaRemoteParentClaims,
-		Handoffs:       maps.JavaRemoteParentHandoffs,
-		HandoffClaims:  maps.JavaRemoteParentHandoffClaims,
-		Retired:        maps.JavaRetiredProcesses,
+		RemoteParents:     maps.JavaRemoteParentFallback,
+		Tasks:             maps.JavaRemoteParentTasks,
+		VirtualThreads:    maps.JavaVtThreads,
+		VTIdentities:      maps.JavaVtIdentities,
+		Authorized:        maps.JavaAuthorizedProcesses,
+		Incarnations:      maps.JavaProcessIncarnations,
+		Connections:       maps.JavaRemoteParentConnections,
+		CookieConnections: maps.JavaRemoteParentCookieConnections,
+		Ambiguity:         maps.JavaRemoteParentAmbiguity,
+		Owners:            maps.JavaRemoteParentOwners,
+		States:            maps.JavaRemoteParentState,
+		Generations:       maps.JavaRemoteParentGenerationIndex,
+		Terminals:         maps.JavaRemoteParentTerminal,
+		Claims:            maps.JavaRemoteParentClaims,
+		Handoffs:          maps.JavaRemoteParentHandoffs,
+		HandoffClaims:     maps.JavaRemoteParentHandoffClaims,
+		Retired:           maps.JavaRetiredProcesses,
 	}
 }
 
@@ -667,7 +671,13 @@ func removeBenchmarkGeneration(
 		Connection: negotiation.Connection,
 		Netns:      negotiation.ConnectionNetns,
 	}
+	cookieConnectionKey := BpfJavaRemoteParentConnectionInfoNetnsCookieT{
+		Connection: negotiation.Connection,
+		NetnsCookie: remoteParentTestNetNSCookie(
+			negotiation.ConnectionNetns, generation),
+	}
 	deleteBenchmarkMapKey(t, maps.JavaRemoteParentConnections, connectionKey)
+	deleteBenchmarkMapKey(t, maps.JavaRemoteParentCookieConnections, cookieConnectionKey)
 	deleteBenchmarkMapKey(t, maps.JavaRemoteParentState, key)
 	deleteBenchmarkMapKey(t, maps.JavaRemoteParentFallback, owner)
 	deleteBenchmarkMapKey(t, maps.JavaRemoteParentAmbiguity, key)

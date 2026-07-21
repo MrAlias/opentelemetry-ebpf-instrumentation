@@ -687,10 +687,35 @@ static __always_inline bool is_conn_unreadable(const connection_info_t *conn) {
     return is_port_unreadable(conn->d_port) || is_port_unreadable(conn->s_port);
 }
 
+static __always_inline void java_remote_parent_close_socket(struct sock *sk) {
+    if (!java_remote_parent_enabled) {
+        return;
+    }
+
+    connection_info_t connection = {};
+    if (!parse_sock_info(sk, &connection)) {
+        return;
+    }
+    sort_connection_info(&connection);
+
+    const u64 netns_cookie = sock_netns_cookie_from_sk(sk);
+    if (netns_cookie) {
+        java_remote_parent_mark_connection_ambiguous_in_netns_cookie(&connection, netns_cookie, 0);
+        delete_strict_incoming_trace(&connection, netns_cookie);
+    } else {
+        const u32 netns = sock_port_ns_from_sk(sk).netns;
+        if (netns) {
+            java_remote_parent_mark_connection_ambiguous_in_netns(&connection, netns);
+        }
+    }
+}
+
 SEC("kprobe/tcp_close")
 int BPF_KPROBE(obi_kprobe_tcp_close, struct sock *sk, long timeout) {
     (void)ctx;
     (void)timeout;
+
+    java_remote_parent_close_socket(sk);
 
     const u64 id = bpf_get_current_pid_tgid();
 
@@ -741,7 +766,8 @@ int BPF_KPROBE(obi_kprobe_tcp_close, struct sock *sk, long timeout) {
         terminate_http_request_if_needed(&info);
         finish_ongoing_tcp_req(&info);
         bpf_map_delete_elem(&connection_tracker, &info.conn);
-        delete_incoming_trace_in_netns(&info.conn, sock_port_ns_from_sk(sk).netns);
+        const u64 netns_cookie = java_remote_parent_enabled ? sock_netns_cookie_from_sk(sk) : 0;
+        delete_incoming_trace_in_netns_cookie(&info.conn, netns_cookie);
     }
 
     bpf_map_delete_elem(&active_send_args, &id);

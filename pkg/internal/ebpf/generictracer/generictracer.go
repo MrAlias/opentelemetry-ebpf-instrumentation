@@ -41,22 +41,24 @@ import (
 //go:generate $BPF2GO -cc $BPF_CLANG -cflags $BPF_CFLAGS -target amd64,arm64 Bpf ../../../../bpf/generictracer/generictracer.c -- -I../../../../bpf
 
 type Tracer struct {
-	pidsFilter       ebpfcommon.ServiceFilter
-	cfg              *obi.Config
-	metrics          imetrics.Reporter
-	bpfObjects       BpfObjects
-	closers          []io.Closer
-	log              *slog.Logger
-	qdiscs           map[ifaces.Interface]*netlink.GenericQdisc
-	egressFilters    map[ifaces.Interface]*netlink.BpfFilter
-	ingressFilters   map[ifaces.Interface]*netlink.BpfFilter
-	instrumentedLibs ebpfcommon.InstrumentedLibsT
-	libsMux          sync.Mutex
-	iters            []*ebpfcommon.Iter
-	eventCtx         *ebpfcommon.EBPFEventContext
-	jvmUSDTManager   ebpfcommon.USDTSpecManager
-	javaAuthMu       sync.Mutex
-	javaAuthKeys     map[javaAuthorizationKey][]javaAuthorization
+	pidsFilter              ebpfcommon.ServiceFilter
+	cfg                     *obi.Config
+	metrics                 imetrics.Reporter
+	bpfObjects              BpfObjects
+	closers                 []io.Closer
+	log                     *slog.Logger
+	qdiscs                  map[ifaces.Interface]*netlink.GenericQdisc
+	egressFilters           map[ifaces.Interface]*netlink.BpfFilter
+	ingressFilters          map[ifaces.Interface]*netlink.BpfFilter
+	instrumentedLibs        ebpfcommon.InstrumentedLibsT
+	libsMux                 sync.Mutex
+	iters                   []*ebpfcommon.Iter
+	eventCtx                *ebpfcommon.EBPFEventContext
+	jvmUSDTManager          ebpfcommon.USDTSpecManager
+	javaAuthMu              sync.Mutex
+	javaAuthKeys            map[javaAuthorizationKey][]javaAuthorization
+	javaRemoteParentEnabled bool
+	haveSockOpsNetnsCookie  func() error
 }
 
 type javaAuthorizationKey struct {
@@ -82,17 +84,18 @@ func tlog() *slog.Logger {
 
 func New(pidFilter ebpfcommon.ServiceFilter, cfg *obi.Config, metrics imetrics.Reporter) *Tracer {
 	return &Tracer{
-		log:              tlog(),
-		cfg:              cfg,
-		metrics:          metrics,
-		pidsFilter:       pidFilter,
-		qdiscs:           map[ifaces.Interface]*netlink.GenericQdisc{},
-		egressFilters:    map[ifaces.Interface]*netlink.BpfFilter{},
-		ingressFilters:   map[ifaces.Interface]*netlink.BpfFilter{},
-		instrumentedLibs: make(ebpfcommon.InstrumentedLibsT),
-		libsMux:          sync.Mutex{},
-		iters:            []*ebpfcommon.Iter{},
-		javaAuthKeys:     make(map[javaAuthorizationKey][]javaAuthorization),
+		log:                    tlog(),
+		cfg:                    cfg,
+		metrics:                metrics,
+		pidsFilter:             pidFilter,
+		qdiscs:                 map[ifaces.Interface]*netlink.GenericQdisc{},
+		egressFilters:          map[ifaces.Interface]*netlink.BpfFilter{},
+		ingressFilters:         map[ifaces.Interface]*netlink.BpfFilter{},
+		instrumentedLibs:       make(ebpfcommon.InstrumentedLibsT),
+		libsMux:                sync.Mutex{},
+		iters:                  []*ebpfcommon.Iter{},
+		javaAuthKeys:           make(map[javaAuthorizationKey][]javaAuthorization),
+		haveSockOpsNetnsCookie: javabridge.HaveSockOpsNetnsCookie,
 	}
 }
 
@@ -258,7 +261,9 @@ func (p *Tracer) LoadSpecs() ([]*ebpfcommon.SpecBundle, error) {
 	}
 
 	ebpfcommon.FixupSpec(spec, p.cfg.EBPF.OverrideBPFLoopEnabled)
-	if !p.cfg.Java.RemoteParent.Enabled() {
+	p.javaRemoteParentEnabled = p.cfg.Java.RemoteParent.Enabled() &&
+		p.haveSockOpsNetnsCookie() == nil
+	if !p.javaRemoteParentEnabled {
 		javabridge.MinimizeDisabledMaps(spec)
 	}
 
@@ -364,7 +369,7 @@ func (p *Tracer) constants() map[string]any {
 
 	m["g_bpf_debug"] = p.cfg.EBPF.BpfDebug
 	m["g_bpf_traceparent_enabled"] = p.cfg.EBPF.TrackRequestHeaders || p.cfg.EBPF.ContextPropagation.IsEnabled()
-	m["java_remote_parent_enabled"] = p.cfg.Java.RemoteParent.Enabled()
+	m["java_remote_parent_enabled"] = p.javaRemoteParentEnabled
 	m["jvm_sampling_interval_ns"] = uint64(0)
 	if p.jvmRuntimeMetricsEnabled() {
 		m["jvm_sampling_interval_ns"] = uint64(p.cfg.JVMRuntimeMetrics.SamplingInterval.Nanoseconds())

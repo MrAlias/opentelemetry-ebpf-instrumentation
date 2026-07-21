@@ -61,8 +61,12 @@ static __always_inline u8 cmd_to_op(u8 cmd) {
     }
 }
 
-static __always_inline u8 java_connection_from_file(
-    struct file *file, u8 op, connection_info_t *connection, u16 *orig_dport, u32 *netns) {
+static __always_inline u8 java_connection_from_file(struct file *file,
+                                                    u8 op,
+                                                    connection_info_t *connection,
+                                                    u16 *orig_dport,
+                                                    u32 *netns,
+                                                    u64 *netns_cookie) {
     if (!file) {
         return 0;
     }
@@ -88,6 +92,7 @@ static __always_inline u8 java_connection_from_file(
         swap_connection_info_order(connection);
     }
     *netns = sock_port_ns_from_sk(sk).netns;
+    *netns_cookie = java_remote_parent_enabled ? sock_netns_cookie_from_sk(sk) : 0;
     return *netns != 0;
 }
 
@@ -353,13 +358,15 @@ static __always_inline int handle_java_ioctl(
     pid_connection_info_t p_conn = {0};
     u16 orig_dport = 0;
     u32 connection_netns = 0;
+    u64 connection_netns_cookie = 0;
     connection_info_t claimed = {0};
     if (bpf_probe_read_user(&claimed, sizeof(claimed), uarg + 1) != 0) {
         return 0;
     }
 
     if (file) {
-        if (!java_connection_from_file(file, op, &p_conn.conn, &orig_dport, &connection_netns)) {
+        if (!java_connection_from_file(
+                file, op, &p_conn.conn, &orig_dport, &connection_netns, &connection_netns_cookie)) {
             return 0;
         }
 
@@ -440,7 +447,7 @@ static __always_inline int handle_java_ioctl(
         const u64 zero = 0;
         bpf_map_update_elem(&active_ssl_connections, &p_conn, &zero, BPF_ANY);
         handle_java_buf_with_connection(
-            ctx, &p_conn, buf, max_len, op, orig_dport, connection_netns);
+            ctx, &p_conn, buf, max_len, op, orig_dport, connection_netns, connection_netns_cookie);
     }
 
     return 0;

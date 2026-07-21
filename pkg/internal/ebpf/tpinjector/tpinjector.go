@@ -17,7 +17,9 @@ import (
 	"go.opentelemetry.io/obi/pkg/appolly/app/request"
 	"go.opentelemetry.io/obi/pkg/appolly/discover/exec"
 	ebpfcommon "go.opentelemetry.io/obi/pkg/ebpf/common"
+	"go.opentelemetry.io/obi/pkg/export/imetrics"
 	"go.opentelemetry.io/obi/pkg/internal/goexec"
+	"go.opentelemetry.io/obi/pkg/internal/javabridge"
 	"go.opentelemetry.io/obi/pkg/obi"
 	"go.opentelemetry.io/obi/pkg/pipe/msg"
 )
@@ -25,37 +27,62 @@ import (
 //go:generate $BPF2GO -cc $BPF_CLANG -cflags $BPF_CFLAGS -target amd64,arm64 Bpf ../../../../bpf/tpinjector/tpinjector.c -- -I../../../../bpf -I../../../../bpf
 //go:generate $BPF2GO -cc $BPF_CLANG -cflags $BPF_CFLAGS -target amd64,arm64 BpfIter ../../../../bpf/tpinjector/sock_iter.c -- -I../../../../bpf -I../../../../bpf
 //go:generate $BPF2GO -cc $BPF_CLANG -cflags $BPF_CFLAGS -target amd64,arm64 BpfFionreadFixup ../../../../bpf/tpinjector/fionread_fixup.c -- -I../../../../bpf -I../../../../bpf
+//go:generate $BPF2GO -cc $BPF_CLANG -cflags $BPF_CFLAGS -target amd64,arm64 BpfJavaRemoteParent ../../../../bpf/javabridge/javabridge.c -- -I../../../../bpf -I../../../../bpf
+//go:generate $BPF2GO -cc $BPF_CLANG -cflags $BPF_CFLAGS -target amd64,arm64 BpfJavaRemoteParentMaps ../../../../bpf/javabridge/maps.c -- -I../../../../bpf -I../../../../bpf
 
 type Tracer struct {
-	cfg                     *obi.Config
-	bpfObjects              BpfObjects
-	bpfIterObjects          BpfIterObjects
-	bpfFionreadFixupObjects BpfFionreadFixupObjects
-	closers                 []io.Closer
-	log                     *slog.Logger
-	iters                   []*ebpfcommon.Iter
-	fionreadOnce            sync.Once
-	fionreadBroken          bool
-	fionreadFixupEnabled    bool
+	cfg                        *obi.Config
+	bpfObjects                 BpfObjects
+	bpfIterObjects             BpfIterObjects
+	bpfFionreadFixupObjects    BpfFionreadFixupObjects
+	bpfJavaRemoteParent        BpfJavaRemoteParentObjects
+	bpfJavaRemoteParentMaps    BpfJavaRemoteParentMapsObjects
+	closers                    []io.Closer
+	log                        *slog.Logger
+	metrics                    imetrics.Reporter
+	iters                      []*ebpfcommon.Iter
+	fionreadOnce               sync.Once
+	fionreadBroken             bool
+	fionreadFixupEnabled       bool
+	javaRemoteParentLoaded     bool
+	javaRemoteParentMapsLoaded bool
+	javaRemoteParentSpec       *ebpf.CollectionSpec
+	javaRemoteParentMapsSpec   *ebpf.CollectionSpec
+	javaRemoteParentError      error
+	javaRemoteParentMapsError  error
+	javaRemoteParentSweep      chan struct{}
 }
 
-func New(cfg *obi.Config) *Tracer {
+func New(cfg *obi.Config, metrics imetrics.Reporter) *Tracer {
 	log := slog.With("component", "tpinjector")
 
 	return &Tracer{
-		log: log,
-		cfg: cfg,
+		log:                   log,
+		cfg:                   cfg,
+		metrics:               metrics,
+		javaRemoteParentSweep: make(chan struct{}, 1),
 	}
 }
 
 func (p *Tracer) AllowPID(app.PID, uint32, *exec.FileInfo) {}
 
-func (p *Tracer) BlockPID(app.PID, uint32) {}
+func (p *Tracer) BlockPID(app.PID, uint32) {
+	if p.cfg == nil || !p.cfg.Java.RemoteParent.Enabled() {
+		return
+	}
+	select {
+	case p.javaRemoteParentSweep <- struct{}{}:
+	default:
+	}
+}
 
 func (p *Tracer) LoadSpecs() ([]*ebpfcommon.SpecBundle, error) {
 	spec, err := LoadBpf()
 	if err != nil {
 		return nil, err
+	}
+	if !p.cfg.Java.RemoteParent.Enabled() {
+		javabridge.MinimizeDisabledMaps(spec)
 	}
 
 	bundles := []*ebpfcommon.SpecBundle{{
@@ -100,6 +127,8 @@ func (p *Tracer) LoadSpecs() ([]*ebpfcommon.SpecBundle, error) {
 		}
 	}
 
+	p.loadJavaRemoteParentSpecs()
+
 	return bundles, nil
 }
 
@@ -118,10 +147,11 @@ func (p *Tracer) constants() map[string]any {
 	}
 
 	return map[string]any{
-		"filter_pids":          filterPids,
-		"max_transaction_time": uint64(p.cfg.EBPF.MaxTransactionTime.Nanoseconds()),
-		"inject_flags":         flags,
-		"g_bpf_debug":          p.cfg.EBPF.BpfDebug,
+		"filter_pids":                filterPids,
+		"max_transaction_time":       uint64(p.cfg.EBPF.MaxTransactionTime.Nanoseconds()),
+		"inject_flags":               flags,
+		"g_bpf_debug":                p.cfg.EBPF.BpfDebug,
+		"java_remote_parent_enabled": p.cfg.Java.RemoteParent.Enabled(),
 	}
 }
 
@@ -149,16 +179,26 @@ func (p *Tracer) KProbes() map[string]ebpfcommon.ProbeDesc {
 	return nil
 }
 
-// Tracepoints returns the FIONREAD fixup probes; not Required so a failed
-// attach cannot drop the tracer
 func (p *Tracer) Tracepoints() map[string]ebpfcommon.ProbeDesc {
-	if !p.fionreadFixupEnabled {
+	tracepoints := map[string]ebpfcommon.ProbeDesc{}
+	if p.fionreadFixupEnabled {
+		tracepoints["syscalls/sys_enter_ioctl"] = ebpfcommon.ProbeDesc{
+			Start: p.bpfFionreadFixupObjects.ObiFionreadFixupEnter,
+		}
+		tracepoints["syscalls/sys_exit_ioctl"] = ebpfcommon.ProbeDesc{
+			Start: p.bpfFionreadFixupObjects.ObiFionreadFixupExit,
+		}
+	}
+	if p.cfg.Java.RemoteParent.Enabled() {
+		tracepoints["sched/sched_process_exit"] = ebpfcommon.ProbeDesc{
+			Start:    p.bpfObjects.ObiJavaRemoteParentProcessExit,
+			Required: true,
+		}
+	}
+	if len(tracepoints) == 0 {
 		return nil
 	}
-	return map[string]ebpfcommon.ProbeDesc{
-		"syscalls/sys_enter_ioctl": {Start: p.bpfFionreadFixupObjects.ObiFionreadFixupEnter},
-		"syscalls/sys_exit_ioctl":  {Start: p.bpfFionreadFixupObjects.ObiFionreadFixupExit},
-	}
+	return tracepoints
 }
 
 func (p *Tracer) UProbes() map[string]map[string][]*ebpfcommon.ProbeDesc {
@@ -232,8 +272,10 @@ func (p *Tracer) AlreadyInstrumentedLib(uint64) bool {
 	return false
 }
 
-func (p *Tracer) Run(ctx context.Context, _ *ebpfcommon.EBPFEventContext, _ *msg.Queue[[]request.Span]) {
+func (p *Tracer) Run(ctx context.Context, eventContext *ebpfcommon.EBPFEventContext, _ *msg.Queue[[]request.Span]) {
 	p.log.Debug("tpinjector started")
+	p.loadJavaRemoteParentObjects(eventContext)
+	stopJavaRemoteParent := p.runJavaRemoteParent(ctx)
 
 	if p.fionreadFixupEnabled {
 		p.verifyFIONREADFix()
@@ -246,10 +288,18 @@ func (p *Tracer) Run(ctx context.Context, _ *ebpfcommon.EBPFEventContext, _ *msg
 	}
 
 	<-ctx.Done()
+	stopJavaRemoteParent()
+	for _, closer := range p.closers {
+		if err := closer.Close(); err != nil {
+			p.log.Debug("closing tpinjector probe", "error", err)
+		}
+	}
+	p.closers = nil
 
 	p.bpfObjects.Close()
 	p.bpfIterObjects.Close()
 	p.bpfFionreadFixupObjects.Close()
+	p.bpfJavaRemoteParent.Close()
 
 	p.log.Debug("tpinjector terminated")
 }

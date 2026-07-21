@@ -33,6 +33,10 @@
 
 #include <maps/active_ssl_connections.h>
 #include <maps/connection_tracker.h>
+#include <maps/incoming_trace_map.h>
+#ifdef OBI_JAVA_REMOTE_PARENT_LIFECYCLE
+#include <maps/java_remote_parent.h>
+#endif
 #include <maps/ongoing_http.h>
 #include <maps/tp_info_mem.h>
 #include <maps/tp_char_buf_mem.h>
@@ -626,6 +630,26 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
             //bpf_dbg_printk("Looking up existing trace for connection");
             //dbg_print_http_connection_info(conn);
 
+#ifdef OBI_JAVA_REMOTE_PARENT_LIFECYCLE
+            if (java_remote_parent_enabled && java_remote_parent_data_hook_is_ready() &&
+                args->java && args->ssl && args->connection_netns) {
+                connection_info_t *java_connection = java_remote_parent_connection_snapshot_mem();
+                tp_info_pid_t *java_incoming = java_remote_parent_incoming_snapshot_mem();
+                if (java_connection && java_incoming) {
+                    __builtin_memcpy(
+                        java_connection, &args->pid_conn.conn, sizeof(*java_connection));
+                    sort_connection_info(java_connection);
+                    const tp_info_pid_t *incoming =
+                        snapshot_incoming_trace_in_netns(java_connection, args->connection_netns);
+                    if (incoming) {
+                        __builtin_memcpy(java_incoming, incoming, sizeof(*java_incoming));
+                        java_remote_parent_stage(
+                            java_connection, args->connection_netns, java_incoming);
+                    }
+                }
+            }
+#endif
+
             // For server requests, we first look for TCP info (setup by TC ingress) and then we fall back to black-box info.
             found_tp =
                 find_trace_for_server_request(&args->pid_conn.conn, &tp_p->tp, EVENT_HTTP_REQUEST);
@@ -654,7 +678,7 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
     // for example can forward headers as-is, which can give us a stale
     // value.
     if (meta) {
-        if (meta->type == EVENT_HTTP_REQUEST && found_tp && args->ssl) {
+        if (meta->type == EVENT_HTTP_REQUEST && found_tp && args->ssl && !args->java) {
             bpf_dbg_printk("skipping headers parsing because of existing tp info for SSL call");
             args->skip_tp_parsing = 1;
         }

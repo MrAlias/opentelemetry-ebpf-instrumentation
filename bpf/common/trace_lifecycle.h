@@ -13,6 +13,9 @@
 
 #include <maps/cp_support_connect_info.h>
 #include <maps/incoming_trace_map.h>
+#ifdef OBI_JAVA_REMOTE_PARENT_LIFECYCLE
+#include <maps/java_remote_parent.h>
+#endif
 #include <maps/java_vt_threads.h>
 #include <maps/outgoing_trace_map.h>
 #include <maps/server_traces.h>
@@ -23,6 +26,11 @@
 
 static __always_inline void delete_server_trace(pid_connection_info_t *pid_conn,
                                                 trace_key_t *t_key) {
+#ifdef OBI_JAVA_REMOTE_PARENT_LIFECYCLE
+    if (java_remote_parent_enabled) {
+        java_remote_parent_cleanup(&t_key->p_key);
+    }
+#endif
     delete_trace_info_for_connection(&pid_conn->conn, TRACE_TYPE_SERVER);
     int res = bpf_map_delete_elem(&server_traces, t_key);
     bpf_dbg_printk("Deleting server span for id=%llx, pid=%d, ns=%x",
@@ -56,13 +64,20 @@ static __always_inline u8 find_trace_for_server_request(connection_info_t *conn,
     u8 found_tp = 0;
     connection_info_t sorted_conn = *conn;
     sort_connection_info(&sorted_conn);
-    tp_info_pid_t *existing_tp = bpf_map_lookup_elem(&incoming_trace_map, &sorted_conn);
+    tp_info_pid_t *existing_tp = consume_incoming_trace(&sorted_conn);
     if (existing_tp) {
-        found_tp = 1;
-        bpf_dbg_printk("Found incoming (TCP/IP) tp for server request");
-        __builtin_memcpy(tp->trace_id, existing_tp->tp.trace_id, sizeof(tp->trace_id));
-        __builtin_memcpy(tp->parent_id, existing_tp->tp.span_id, sizeof(tp->parent_id));
-        bpf_map_delete_elem(&incoming_trace_map, &sorted_conn);
+        if (existing_tp->valid && valid_trace(existing_tp->tp.trace_id) &&
+            valid_span(existing_tp->tp.span_id)) {
+            found_tp = 1;
+            bpf_dbg_printk("Found incoming (TCP/IP) tp for server request");
+            __builtin_memcpy(tp->trace_id, existing_tp->tp.trace_id, sizeof(tp->trace_id));
+            __builtin_memcpy(tp->parent_id, existing_tp->tp.span_id, sizeof(tp->parent_id));
+            if (existing_tp->provenance == k_tp_provenance_tcp_exact_flags) {
+                tp->flags = existing_tp->tp.flags;
+            }
+        } else {
+            bpf_dbg_printk("Ignoring ambiguous incoming (TCP/IP) tp for server request");
+        }
     } else {
         bpf_dbg_printk("Looking up tracemap for");
         dbg_print_http_connection_info(conn);

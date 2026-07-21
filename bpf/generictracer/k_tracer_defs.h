@@ -57,10 +57,12 @@ static __always_inline call_protocol_args_t *make_protocol_args(const pid_connec
     args->bytes_len = bytes_len;
     args->direction = direction;
     args->orig_dport = orig_dport;
+    args->connection_netns = task_netns();
     args->u_buf = (u64)u_buf;
     args->lw_thread = lw_thread;
     args->protocols = protocols;
     args->protocol_type = protocol_type_for_conn_info(info);
+    args->java = 0;
 
     args->pid_conn = *info;
     __builtin_memset(args->small_buf, 0, sizeof(args->small_buf));
@@ -90,6 +92,30 @@ static __always_inline void handle_buf_with_connection(void *ctx,
         return;
     }
 
+    bpf_tail_call(ctx, &jump_table, k_tail_handle_buf_with_args);
+}
+
+static __always_inline void handle_java_buf_with_connection(void *ctx,
+                                                            pid_connection_info_t *pid_conn,
+                                                            void *u_buf,
+                                                            int bytes_len,
+                                                            u8 direction,
+                                                            u16 orig_dport,
+                                                            u32 connection_netns) {
+    call_protocol_args_t *args = make_protocol_args(pid_conn,
+                                                    k_lw_thread_none,
+                                                    k_protocol_selector_all,
+                                                    u_buf,
+                                                    bytes_len,
+                                                    WITH_SSL,
+                                                    direction,
+                                                    orig_dport);
+    if (!args) {
+        return;
+    }
+
+    args->java = 1;
+    args->connection_netns = connection_netns;
     bpf_tail_call(ctx, &jump_table, k_tail_handle_buf_with_args);
 }
 

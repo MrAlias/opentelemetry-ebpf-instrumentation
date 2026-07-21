@@ -22,6 +22,7 @@ import (
 	"go.opentelemetry.io/obi/pkg/appolly/app"
 	"go.opentelemetry.io/obi/pkg/appolly/app/request"
 	jvmruntime "go.opentelemetry.io/obi/pkg/appolly/app/runtime"
+	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
 	"go.opentelemetry.io/obi/pkg/appolly/discover/exec"
 	"go.opentelemetry.io/obi/pkg/config"
 	ebpfcommon "go.opentelemetry.io/obi/pkg/ebpf/common"
@@ -29,8 +30,10 @@ import (
 	"go.opentelemetry.io/obi/pkg/ebpf/timing"
 	"go.opentelemetry.io/obi/pkg/export/imetrics"
 	"go.opentelemetry.io/obi/pkg/internal/goexec"
+	"go.opentelemetry.io/obi/pkg/internal/javabridge"
 	"go.opentelemetry.io/obi/pkg/internal/netns"
 	"go.opentelemetry.io/obi/pkg/internal/netolly/ifaces"
+	"go.opentelemetry.io/obi/pkg/internal/procs"
 	"go.opentelemetry.io/obi/pkg/obi"
 	"go.opentelemetry.io/obi/pkg/pipe/msg"
 )
@@ -52,6 +55,25 @@ type Tracer struct {
 	iters            []*ebpfcommon.Iter
 	eventCtx         *ebpfcommon.EBPFEventContext
 	jvmUSDTManager   ebpfcommon.USDTSpecManager
+	javaAuthMu       sync.Mutex
+	javaAuthKeys     map[javaAuthorizationKey][]javaAuthorization
+}
+
+type javaAuthorizationKey struct {
+	pid app.PID
+	ns  uint32
+}
+
+type javaAuthorization struct {
+	identity   javabridge.Identity
+	capability uint64
+}
+
+var findJavaNamespacedPIDs = procs.FindNamespacedPids
+
+var updateJavaRemoteParentDataHookReadiness = func(readiness *ebpf.Map, state uint32) error {
+	key := uint32(0)
+	return readiness.Update(&key, &state, ebpf.UpdateAny)
 }
 
 func tlog() *slog.Logger {
@@ -70,6 +92,7 @@ func New(pidFilter ebpfcommon.ServiceFilter, cfg *obi.Config, metrics imetrics.R
 		instrumentedLibs: make(ebpfcommon.InstrumentedLibsT),
 		libsMux:          sync.Mutex{},
 		iters:            []*ebpfcommon.Iter{},
+		javaAuthKeys:     make(map[javaAuthorizationKey][]javaAuthorization),
 	}
 }
 
@@ -127,6 +150,7 @@ func (p *Tracer) rebuildValidPids() {
 func (p *Tracer) AllowPID(pid app.PID, ns uint32, fi *exec.FileInfo) {
 	p.pidsFilter.AllowPID(pid, ns, fi, ebpfcommon.PIDTypeKProbes)
 	p.rebuildValidPids()
+	p.authorizeJavaProcess(pid, ns, fi)
 	// Override potential negative cache entry for this PID
 	if p.bpfObjects.PidCache != nil {
 		pidU32 := uint32(pid)
@@ -137,10 +161,88 @@ func (p *Tracer) AllowPID(pid app.PID, ns uint32, fi *exec.FileInfo) {
 func (p *Tracer) BlockPID(pid app.PID, ns uint32) {
 	p.pidsFilter.BlockPID(pid, ns)
 	p.rebuildValidPids()
+	p.deauthorizeJavaProcess(pid, ns)
 	// Remove from cache so next access re-evaluates
 	if p.bpfObjects.PidCache != nil {
 		pidU32 := uint32(pid)
 		_ = p.bpfObjects.PidCache.Delete(pidU32)
+	}
+}
+
+func javaProcessIdentity(pid app.PID, ns uint32) (javabridge.Identity, error) {
+	namespacePIDs, err := findJavaNamespacedPIDs(pid)
+	if err != nil {
+		return javabridge.Identity{}, err
+	}
+	if len(namespacePIDs) != 0 {
+		pid = namespacePIDs[len(namespacePIDs)-1]
+	}
+
+	namespacePID := uint32(pid)
+	return javabridge.Identity{TID: namespacePID, PID: namespacePID, Namespace: ns}, nil
+}
+
+func (p *Tracer) authorizeJavaProcess(pid app.PID, ns uint32, fi *exec.FileInfo) {
+	if fi == nil || pid != fi.Pid() || fi.SDKLanguage() != svc.InstrumentableJava {
+		return
+	}
+	capability := fi.JavaAgentCapability()
+	if capability == 0 || p.bpfObjects.JavaAuthorizedProcesses == nil {
+		return
+	}
+
+	identity, err := javaProcessIdentity(pid, ns)
+	if err != nil {
+		p.log.Warn("unable to resolve exact Java process identity", "pid", pid, "ns", ns, "error", err)
+		return
+	}
+	authorizationKey := javaAuthorizationKey{pid: pid, ns: ns}
+	p.javaAuthMu.Lock()
+	defer p.javaAuthMu.Unlock()
+	history := p.javaAuthKeys[authorizationKey]
+	if len(history) != 0 {
+		current := history[len(history)-1]
+		if current.identity == identity && current.capability == capability {
+			return
+		}
+	}
+
+	if err := p.bpfObjects.JavaAuthorizedProcesses.Update(&identity, capability, ebpf.UpdateAny); err != nil {
+		p.log.Warn("unable to authorize Java process", "pid", pid, "ns", ns, "error", err)
+		return
+	}
+
+	// Rotating an authorization invalidates any incarnation registered by an
+	// earlier OBI instance before the replacement agent configuration arrives.
+	if p.bpfObjects.JavaProcessIncarnations != nil {
+		_ = p.bpfObjects.JavaProcessIncarnations.Delete(&identity)
+	}
+	p.javaAuthKeys[authorizationKey] = append(
+		history,
+		javaAuthorization{identity: identity, capability: capability},
+	)
+}
+
+func (p *Tracer) deauthorizeJavaProcess(pid app.PID, ns uint32) {
+	p.javaAuthMu.Lock()
+	defer p.javaAuthMu.Unlock()
+	authorizationKey := javaAuthorizationKey{pid: pid, ns: ns}
+	history := p.javaAuthKeys[authorizationKey]
+	if len(history) == 0 {
+		return
+	}
+	authorization := history[0]
+	if len(history) > 1 {
+		p.javaAuthKeys[authorizationKey] = history[1:]
+		return
+	}
+	delete(p.javaAuthKeys, authorizationKey)
+
+	if p.bpfObjects.JavaProcessIncarnations != nil {
+		_ = p.bpfObjects.JavaProcessIncarnations.Delete(&authorization.identity)
+	}
+	if p.bpfObjects.JavaAuthorizedProcesses != nil {
+		_ = p.bpfObjects.JavaAuthorizedProcesses.Delete(&authorization.identity)
 	}
 }
 
@@ -156,6 +258,9 @@ func (p *Tracer) LoadSpecs() ([]*ebpfcommon.SpecBundle, error) {
 	}
 
 	ebpfcommon.FixupSpec(spec, p.cfg.EBPF.OverrideBPFLoopEnabled)
+	if !p.cfg.Java.RemoteParent.Enabled() {
+		javabridge.MinimizeDisabledMaps(spec)
+	}
 
 	return []*ebpfcommon.SpecBundle{{Spec: spec, Objects: &p.bpfObjects, Constants: p.constants()}}, nil
 }
@@ -191,6 +296,27 @@ func (p *Tracer) SetupTailCalls() {
 			p.log.Error("error loading info tail call jump table", "error", err)
 		}
 	}
+
+	p.setJavaRemoteParentDataHookReadiness(false)
+}
+
+func (p *Tracer) setJavaRemoteParentDataHookReadiness(ready bool) {
+	readiness := p.bpfObjects.JavaRemoteParentDataHookReadiness
+	if readiness == nil {
+		return
+	}
+
+	state := uint32(0)
+	if ready {
+		state = 1
+	}
+	if err := updateJavaRemoteParentDataHookReadiness(readiness, state); err != nil {
+		p.log.Warn("updating authoritative Java data-hook readiness", "ready", ready, "error", err)
+	}
+}
+
+func (p *Tracer) recordJavaDataHookAttachResult(err error) {
+	p.setJavaRemoteParentDataHookReadiness(err == nil)
 }
 
 func (p *Tracer) constants() map[string]any {
@@ -238,6 +364,7 @@ func (p *Tracer) constants() map[string]any {
 
 	m["g_bpf_debug"] = p.cfg.EBPF.BpfDebug
 	m["g_bpf_traceparent_enabled"] = p.cfg.EBPF.TrackRequestHeaders || p.cfg.EBPF.ContextPropagation.IsEnabled()
+	m["java_remote_parent_enabled"] = p.cfg.Java.RemoteParent.Enabled()
 	m["jvm_sampling_interval_ns"] = uint64(0)
 	if p.jvmRuntimeMetricsEnabled() {
 		m["jvm_sampling_interval_ns"] = uint64(p.cfg.JVMRuntimeMetrics.SamplingInterval.Nanoseconds())
@@ -328,6 +455,10 @@ func (p *Tracer) KProbes() map[string]ebpfcommon.ProbeDesc {
 			Required: true,
 			Start:    p.bpfObjects.ObiKprobeSysExit,
 		},
+		"do_exit": {
+			Required: false,
+			Start:    p.bpfObjects.ObiKprobeSysExit,
+		},
 		"unix_stream_recvmsg": {
 			Required: true,
 			Start:    p.bpfObjects.ObiKprobeUnixStreamRecvmsg,
@@ -345,6 +476,11 @@ func (p *Tracer) KProbes() map[string]ebpfcommon.ProbeDesc {
 		"sys_ioctl": {
 			Required: true,
 			Start:    p.bpfObjects.ObiKprobeSysIoctl,
+		},
+		"security_file_ioctl": {
+			Required:     false,
+			Start:        p.bpfObjects.ObiKprobeSecurityFileIoctl,
+			AttachResult: p.recordJavaDataHookAttachResult,
 		},
 	}
 

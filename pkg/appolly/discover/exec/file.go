@@ -47,6 +47,7 @@ type FileInfo struct {
 	dev            uint64
 	ino            uint64
 	ns             uint32
+	javaCapability uint64
 }
 
 func New(init Init) *FileInfo {
@@ -96,6 +97,18 @@ func (fi *FileInfo) SDKLanguage() svc.InstrumentableType {
 	fi.mu.RLock()
 	defer fi.mu.RUnlock()
 	return fi.service.SDKLanguage
+}
+
+func (fi *FileInfo) JavaAgentCapability() uint64 {
+	fi.mu.RLock()
+	defer fi.mu.RUnlock()
+	return fi.javaCapability
+}
+
+func (fi *FileInfo) SetJavaAgentCapability(capability uint64) {
+	fi.mu.Lock()
+	defer fi.mu.Unlock()
+	fi.javaCapability = capability
 }
 
 func (fi *FileInfo) ExportsOTelMetrics() bool {

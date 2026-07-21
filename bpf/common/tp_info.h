@@ -13,6 +13,12 @@ enum tp_flags : u8 {
     k_flag_sampled = 1,
 };
 
+enum tp_provenance : u8 {
+    k_tp_provenance_unknown = 0,
+    k_tp_provenance_tcp_legacy = 1,
+    k_tp_provenance_tcp_exact_flags = 2,
+};
+
 typedef struct tp_info {
     unsigned char trace_id[TRACE_ID_SIZE_BYTES];
     unsigned char span_id[SPAN_ID_SIZE_BYTES];
@@ -28,5 +34,5 @@ typedef struct tp_info_pid {
     u8 valid;
     u8 written;
     u8 req_type;
-    u8 _pad[1];
+    u8 provenance;
 } tp_info_pid_t;

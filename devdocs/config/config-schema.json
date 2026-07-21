@@ -1425,11 +1425,30 @@
           "x-env-var": "OTEL_EBPF_INTERNAL_METRICS_EXPORTER"
         },
         "prometheus": {
-          "$ref": "#/$defs/PrometheusConfig"
+          "$ref": "#/$defs/InternalPrometheusConfig"
         }
       },
       "type": "object",
       "description": "InternalMetricsConfig options for the different metrics exporters"
+    },
+    "InternalPrometheusConfig": {
+      "properties": {
+        "address": {
+          "type": "string",
+          "x-env-var": "OTEL_EBPF_INTERNAL_METRICS_PROMETHEUS_ADDRESS"
+        },
+        "path": {
+          "type": "string",
+          "default": "/internal/metrics",
+          "x-env-var": "OTEL_EBPF_INTERNAL_METRICS_PROMETHEUS_PATH"
+        },
+        "port": {
+          "type": "integer",
+          "default": 0,
+          "x-env-var": "OTEL_EBPF_INTERNAL_METRICS_PROMETHEUS_PORT"
+        }
+      },
+      "type": "object"
     },
     "JSONPathExpr": {
       "type": "string",
@@ -1494,6 +1513,57 @@
           "type": "boolean",
           "default": true,
           "x-env-var": "OTEL_EBPF_JAVAAGENT_ENABLED"
+        },
+        "remote_parent": {
+          "$ref": "#/$defs/JavaRemoteParentConfig"
+        }
+      },
+      "type": "object"
+    },
+    "JavaRemoteParentConfig": {
+      "properties": {
+        "socket_group_id": {
+          "type": "integer",
+          "default": -1,
+          "x-env-var": "OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_GROUP_ID"
+        },
+        "socket_path": {
+          "type": "string",
+          "default": "/var/run/obi/java-remote-parent.sock",
+          "x-env-var": "OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_PATH"
+        },
+        "timeout": {
+          "type": "string",
+          "pattern": "^[0-9]+(ms|s|m)$",
+          "default": "50ms",
+          "examples": [
+            "30s",
+            "5m",
+            "1ms"
+          ],
+          "x-env-var": "OTEL_EBPF_JAVA_REMOTE_PARENT_TIMEOUT"
+        },
+        "transport": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "disabled",
+            "getsockopt",
+            "unix"
+          ],
+          "default": "disabled",
+          "x-env-var": "OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT"
+        },
+        "ttl": {
+          "type": "string",
+          "pattern": "^[0-9]+(ms|s|m)$",
+          "default": "30s",
+          "examples": [
+            "30s",
+            "5m",
+            "1ms"
+          ],
+          "x-env-var": "OTEL_EBPF_JAVA_REMOTE_PARENT_TTL"
         }
       },
       "type": "object"
@@ -2253,7 +2323,7 @@
         },
         "path": {
           "type": "string",
-          "default": "/internal/metrics",
+          "default": "/metrics",
           "x-env-var": "OTEL_EBPF_PROMETHEUS_PATH"
         },
         "port": {

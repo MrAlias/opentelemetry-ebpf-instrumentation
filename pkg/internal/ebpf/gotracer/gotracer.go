@@ -34,6 +34,7 @@ import (
 	"go.opentelemetry.io/obi/pkg/ebpf/ringbuf"
 	"go.opentelemetry.io/obi/pkg/export/imetrics"
 	"go.opentelemetry.io/obi/pkg/internal/goexec"
+	"go.opentelemetry.io/obi/pkg/internal/javabridge"
 	"go.opentelemetry.io/obi/pkg/internal/procs"
 	"go.opentelemetry.io/obi/pkg/obi"
 	"go.opentelemetry.io/obi/pkg/pipe/msg"
@@ -63,6 +64,7 @@ type Tracer struct {
 	bpfObjects              BpfObjects
 	closers                 []io.Closer
 	disabledRouteHarvesting bool
+	javaRemoteParentEnabled bool
 	supportsBPFLoop         bool
 	runtimeMetricTargetKeys map[runtimeMetricTargetKey]BpfPidInfo
 	goChannelOffsetsByIno   map[uint64]bool
@@ -91,6 +93,7 @@ func New(
 		cfg:                     &cfg.EBPF,
 		metrics:                 metrics,
 		disabledRouteHarvesting: disabledRouteHarvesting,
+		javaRemoteParentEnabled: cfg.Java.RemoteParent.Enabled(),
 		supportsBPFLoop:         ebpfcommon.SupportsEBPFLoops(log, cfg.EBPF.OverrideBPFLoopEnabled),
 		runtimeMetricTargetKeys: map[runtimeMetricTargetKey]BpfPidInfo{},
 		goChannelOffsetsByIno:   map[uint64]bool{},
@@ -127,6 +130,9 @@ func (p *Tracer) LoadSpecs() ([]*ebpfcommon.SpecBundle, error) {
 	}
 
 	ebpfcommon.FixupSpec(spec, p.cfg.OverrideBPFLoopEnabled)
+	if !p.javaRemoteParentEnabled {
+		javabridge.MinimizeDisabledMaps(spec)
+	}
 
 	return []*ebpfcommon.SpecBundle{{
 		Spec:      spec,
@@ -142,21 +148,22 @@ func (p *Tracer) constants() map[string]any {
 	}
 
 	m := map[string]any{
-		"g_bpf_debug":               p.cfg.BpfDebug,
-		"g_bpf_header_propagation":  p.supportsContextPropagation(),
-		"wakeup_data_bytes":         uint32(p.cfg.WakeupLen) * uint32(unsafe.Sizeof(ebpfcommon.HTTPRequestTrace{})),
-		"disable_black_box_cp":      blackBoxCP,
-		"attr_type_invalid":         uint64(attribute.INVALID),
-		"attr_type_bool":            uint64(attribute.BOOL),
-		"attr_type_int64":           uint64(attribute.INT64),
-		"attr_type_float64":         uint64(attribute.FLOAT64),
-		"attr_type_string":          uint64(attribute.STRING),
-		"attr_type_boolslice":       uint64(attribute.BOOLSLICE),
-		"attr_type_int64slice":      uint64(attribute.INT64SLICE),
-		"attr_type_float64slice":    uint64(attribute.FLOAT64SLICE),
-		"attr_type_stringslice":     uint64(attribute.STRINGSLICE),
-		"g_bpf_traceparent_enabled": true,
-		"g_bpf_loop_enabled":        p.supportsBPFLoop,
+		"g_bpf_debug":                p.cfg.BpfDebug,
+		"g_bpf_header_propagation":   p.supportsContextPropagation(),
+		"wakeup_data_bytes":          uint32(p.cfg.WakeupLen) * uint32(unsafe.Sizeof(ebpfcommon.HTTPRequestTrace{})),
+		"disable_black_box_cp":       blackBoxCP,
+		"attr_type_invalid":          uint64(attribute.INVALID),
+		"attr_type_bool":             uint64(attribute.BOOL),
+		"attr_type_int64":            uint64(attribute.INT64),
+		"attr_type_float64":          uint64(attribute.FLOAT64),
+		"attr_type_string":           uint64(attribute.STRING),
+		"attr_type_boolslice":        uint64(attribute.BOOLSLICE),
+		"attr_type_int64slice":       uint64(attribute.INT64SLICE),
+		"attr_type_float64slice":     uint64(attribute.FLOAT64SLICE),
+		"attr_type_stringslice":      uint64(attribute.STRINGSLICE),
+		"g_bpf_traceparent_enabled":  true,
+		"g_bpf_loop_enabled":         p.supportsBPFLoop,
+		"java_remote_parent_enabled": p.javaRemoteParentEnabled,
 	}
 
 	if p.cfg.TrackRequestHeaders ||

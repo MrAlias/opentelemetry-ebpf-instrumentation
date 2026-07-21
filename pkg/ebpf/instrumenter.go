@@ -153,7 +153,9 @@ func (i *instrumenter) kprobes(p KprobesTracer) error {
 	for kfunc, kprobes := range p.KProbes() {
 		log.Debug("going to add kprobe to function", "function", kfunc, "probes", kprobes)
 
-		if err := i.kprobe(kfunc, kprobes); err != nil {
+		err := i.kprobe(kfunc, kprobes)
+		reportKprobeAttachResult(kprobes, err)
+		if err != nil {
 			if kprobes.Required {
 				if i.metrics != nil {
 					i.metrics.InstrumentationError(i.processName, imetrics.InstrumentationErrorAttachingKprobe)
@@ -167,6 +169,12 @@ func (i *instrumenter) kprobes(p KprobesTracer) error {
 	}
 
 	return nil
+}
+
+func reportKprobeAttachResult(probe ebpfcommon.ProbeDesc, err error) {
+	if probe.AttachResult != nil {
+		probe.AttachResult(err)
+	}
 }
 
 func (i *instrumenter) kprobe(funcName string, programs ebpfcommon.ProbeDesc) error {

@@ -51,10 +51,12 @@ typedef struct call_protocol_args {
     protocol_selector_t protocols;
     u8 skip_tp_parsing;
     u8 use_bpf_loop;
-    u8 pad[1];
+    u8 java;
     int bytes_len;
+    u32 connection_netns;
     u16 orig_dport;
     u16 _pad2;
+    u32 _pad3;
     u64 u_buf;
     u64 self_ref_parent_id;
     lw_thread_t lw_thread;

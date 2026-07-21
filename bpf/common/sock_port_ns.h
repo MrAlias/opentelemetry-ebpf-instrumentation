@@ -5,6 +5,7 @@
 
 #include <bpfcore/vmlinux.h>
 #include <bpfcore/bpf_core_read.h>
+#include <bpfcore/bpf_helpers.h>
 
 struct sock_port_ns {
     u32 netns;
@@ -26,4 +27,9 @@ static __always_inline struct sock_port_ns sock_port_ns_from_skc(const struct so
 static __always_inline struct sock_port_ns sock_port_ns_from_sk(const struct sock *sk) {
     struct sock_common *skc = (struct sock_common *)sk;
     return sock_port_ns_from_skc(skc);
+}
+
+static __always_inline u32 task_netns() {
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    return (u32)BPF_CORE_READ(task, nsproxy, net_ns, ns.inum);
 }

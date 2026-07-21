@@ -181,6 +181,7 @@ func TestBPFVerifierWithConstants(t *testing.T) {
 	forEachCombination(t, "generictracer/Bpf", generictracerbpf.LoadBpf, []constOption{
 		{"g_bpf_debug", []any{true, false}},
 		{"g_bpf_traceparent_enabled", []any{true, false}},
+		{"java_remote_parent_enabled", []any{true, false}},
 		{"filter_pids", []any{int32(0), int32(1)}},
 		{"high_request_volume", []any{uint32(0), uint32(1)}},
 		{"jvm_sampling_interval_ns", []any{uint64(0), uint64(1_000_000_000)}},

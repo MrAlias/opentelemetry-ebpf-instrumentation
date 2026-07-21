@@ -134,6 +134,10 @@ type ProbeDesc struct {
 
 	// Skip is set when an optional uprobe symbol was not resolved.
 	Skip bool
+
+	// AttachResult is called once after a kprobe attachment attempt. A nil
+	// error means every program in this descriptor was attached.
+	AttachResult func(error)
 }
 
 type USDTSpecManager struct {

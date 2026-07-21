@@ -59,6 +59,15 @@ func TestPrometheusReporterQueueBufferUtilization(t *testing.T) {
 	assert.InDelta(t, 0.9, gaugeValue("traces"), 0.001)
 }
 
+func TestPrometheusReporterJavaRemoteParent(t *testing.T) {
+	reporter := NewPrometheusReporter(&InternalMetricsConfig{}, nil, prometheus.NewRegistry())
+	reporter.JavaRemoteParent("unix", "take", "valid", 2)
+
+	var metric dto.Metric
+	require.NoError(t, reporter.javaRemoteParent.WithLabelValues("unix", "take", "valid").Write(&metric))
+	assert.InDelta(t, 2, metric.GetCounter().GetValue(), 0)
+}
+
 type noopEmbeddingReporter struct {
 	NoopReporter
 }

@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //go:build obi_bpf_ignore
+
+#define OBI_JAVA_REMOTE_PARENT_LIFECYCLE
+
 #include "iter_tcp.c"
 #include "java_tls.c"
 #include "jvm.c"

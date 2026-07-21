@@ -33,7 +33,11 @@ For trace-log correlation (log enricher / `traces_ctx_v1` map), see [trace-log-c
 Context propagation allows distributed tracing by injecting trace context (trace ID, span ID) into outgoing requests. The eBPF instrumentation supports two injection methods:
 
 1. **HTTP headers** (L7) - `Traceparent:` header in plaintext HTTP requests
-2. **TCP options** (L4) - Custom TCP option (kind 25) for any TCP traffic
+2. **TCP options** (L4) - Custom TCP option (kind 25) for any TCP traffic. The
+   legacy form is 26 bytes (`kind`, `length`, trace ID, span ID). When Java
+   remote-parent retrieval is enabled, senders use a 27-byte form that appends
+   exact trace flags. Updated receivers accept both forms; only the exact-flags
+   form is eligible for the Java bridge.
 
 ## Configuration
 

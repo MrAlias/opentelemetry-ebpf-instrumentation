@@ -199,6 +199,7 @@ func generateTracesWithAttributes(
 		// Set trace and span IDs
 		s.SetSpanID(spanID)
 		s.SetTraceID(traceID)
+		s.SetFlags(uint32(span.TraceFlags))
 		if span.ParentSpanID.IsValid() {
 			s.SetParentSpanID(pcommon.SpanID(span.ParentSpanID))
 		}

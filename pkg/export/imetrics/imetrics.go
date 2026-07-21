@@ -52,10 +52,10 @@ const (
 
 // InternalMetricsConfig options for the different metrics exporters
 type InternalMetricsConfig struct {
-	Prometheus              PrometheusConfig        `yaml:"prometheus,omitempty"`
-	AvoidedServices         AvoidedServicesConfig   `yaml:"avoided_services,omitempty"`
-	Exporter                InternalMetricsExporter `yaml:"exporter,omitempty" env:"OTEL_EBPF_INTERNAL_METRICS_EXPORTER" validate:"omitempty,oneof=disabled prometheus otel"`
-	BpfMetricScrapeInterval time.Duration           `yaml:"bpf_metric_scrape_interval" env:"OTEL_EBPF_BPF_METRIC_SCRAPE_INTERVAL" validate:"omitempty,gt=0"`
+	Prometheus              InternalPrometheusConfig `yaml:"prometheus,omitempty"`
+	AvoidedServices         AvoidedServicesConfig    `yaml:"avoided_services,omitempty"`
+	Exporter                InternalMetricsExporter  `yaml:"exporter,omitempty" env:"OTEL_EBPF_INTERNAL_METRICS_EXPORTER" validate:"omitempty,oneof=disabled prometheus otel"`
+	BpfMetricScrapeInterval time.Duration            `yaml:"bpf_metric_scrape_interval" env:"OTEL_EBPF_BPF_METRIC_SCRAPE_INTERVAL" validate:"omitempty,gt=0"`
 }
 
 // Reporter of internal metrics
@@ -102,6 +102,8 @@ type Reporter interface {
 	// QueueBufferUtilization shows the ratio [0-1] between the unread messages of an internal Go channel
 	// and its total capacity
 	QueueBufferUtilization(subscriber string, ratio float64)
+	// JavaRemoteParent records bounded bridge outcomes. Transport, operation, and status are finite enums.
+	JavaRemoteParent(transport, operation, status string, count uint64)
 }
 
 func IsBuiltinNoopReporter(reporter Reporter) bool {
@@ -139,3 +141,4 @@ func (n NoopReporter) BpfInternalMetricsScrapeInterval() time.Duration   { retur
 func (n NoopReporter) InformerLag(_ float64)                             {}
 func (n NoopReporter) BPFPacketStats(_, _ uint64)                        {}
 func (n NoopReporter) QueueBufferUtilization(_ string, _ float64)        {}
+func (n NoopReporter) JavaRemoteParent(_, _, _ string, _ uint64)         {}

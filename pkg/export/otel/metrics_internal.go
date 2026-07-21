@@ -52,6 +52,7 @@ type InternalMetricsReporter struct {
 	bpfIgnoredPacketCount instrument.Int64Counter
 
 	queueCapacityRatio instrument.Float64Gauge
+	javaRemoteParent   instrument.Int64Counter
 }
 
 func imlog() *slog.Logger {
@@ -217,6 +218,15 @@ func NewInternalMetricsReporter(ctx context.Context, ctxInfo *global.ContextInfo
 		return nil, err
 	}
 
+	javaRemoteParent, err := meter.Int64Counter(
+		attr.VendorPrefix+".java.remote.parent.operations",
+		instrument.WithDescription("Java remote-parent bridge outcomes by bounded transport, operation, and status"),
+		instrument.WithUnit("{operation}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	return &InternalMetricsReporter{
 		ctx:                              ctx,
 		tracerFlushes:                    tracerFlushes,
@@ -238,6 +248,7 @@ func NewInternalMetricsReporter(ctx context.Context, ctxInfo *global.ContextInfo
 		bpfPacketCount:                   bpfPacketCount,
 		bpfIgnoredPacketCount:            bpfIgnoredPacketCount,
 		queueCapacityRatio:               queueCapacityRatio,
+		javaRemoteParent:                 javaRemoteParent,
 	}, nil
 }
 
@@ -384,4 +395,12 @@ func (p *InternalMetricsReporter) BPFPacketStats(count, ignored uint64) {
 
 func (p *InternalMetricsReporter) QueueBufferUtilization(subscriber string, ratio float64) {
 	p.queueCapacityRatio.Record(p.ctx, ratio, instrument.WithAttributes(attribute.String("subscriber", subscriber)))
+}
+
+func (p *InternalMetricsReporter) JavaRemoteParent(transport, operation, status string, count uint64) {
+	p.javaRemoteParent.Add(p.ctx, int64(count), instrument.WithAttributes(
+		attribute.String("transport", transport),
+		attribute.String("operation", operation),
+		attribute.String("status", status),
+	))
 }

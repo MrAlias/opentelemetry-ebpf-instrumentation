@@ -7,6 +7,7 @@ package generictracer
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 	"unsafe"
@@ -26,6 +27,7 @@ import (
 	"go.opentelemetry.io/obi/pkg/export"
 	"go.opentelemetry.io/obi/pkg/export/otel/perapp"
 	ebpfconvenience "go.opentelemetry.io/obi/pkg/internal/ebpf/convenience"
+	"go.opentelemetry.io/obi/pkg/internal/javabridge"
 	"go.opentelemetry.io/obi/pkg/obi"
 	"go.opentelemetry.io/obi/pkg/pipe/msg"
 	"go.opentelemetry.io/obi/pkg/runtimemetrics"
@@ -49,6 +51,69 @@ func TestBitPositionCalculation(t *testing.T) {
 
 func makeKey(first, second uint32) uint64 {
 	return (uint64(first) << 32) | uint64(second)
+}
+
+func TestJavaProcessIdentityUsesInnermostNamespacePID(t *testing.T) {
+	original := findJavaNamespacedPIDs
+	findJavaNamespacedPIDs = func(app.PID) ([]app.PID, error) {
+		return []app.PID{9001, 42, 7}, nil
+	}
+	t.Cleanup(func() { findJavaNamespacedPIDs = original })
+
+	identity, err := javaProcessIdentity(9001, 1234)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(7), identity.TID)
+	assert.Equal(t, uint32(7), identity.PID)
+	assert.Equal(t, uint32(1234), identity.Namespace)
+}
+
+func TestDelayedJavaDeletionPreservesReplacementAuthorization(t *testing.T) {
+	key := javaAuthorizationKey{pid: 9001, ns: 1234}
+	old := javaAuthorization{
+		identity:   javabridge.Identity{TID: 7, PID: 7, Namespace: 1234},
+		capability: 11,
+	}
+	replacement := javaAuthorization{
+		identity:   old.identity,
+		capability: 22,
+	}
+	tracer := &Tracer{javaAuthKeys: map[javaAuthorizationKey][]javaAuthorization{
+		key: {old, replacement},
+	}}
+
+	tracer.deauthorizeJavaProcess(key.pid, key.ns)
+
+	require.Len(t, tracer.javaAuthKeys[key], 1)
+	assert.Equal(t, replacement, tracer.javaAuthKeys[key][0])
+}
+
+func TestJavaDataHookIsOptional(t *testing.T) {
+	tracer := &Tracer{cfg: &obi.Config{}}
+	assert.False(t, tracer.KProbes()["security_file_ioctl"].Required)
+}
+
+func TestJavaDataHookAttachResultPublishesReadiness(t *testing.T) {
+	originalUpdate := updateJavaRemoteParentDataHookReadiness
+	t.Cleanup(func() { updateJavaRemoteParentDataHookReadiness = originalUpdate })
+
+	var states []uint32
+	updateJavaRemoteParentDataHookReadiness = func(_ *ebpf.Map, state uint32) error {
+		states = append(states, state)
+		return nil
+	}
+
+	tracer := &Tracer{
+		cfg: &obi.Config{},
+		log: tlog(),
+	}
+	tracer.bpfObjects.JavaRemoteParentDataHookReadiness = &ebpf.Map{}
+	attachResult := tracer.KProbes()["security_file_ioctl"].AttachResult
+	require.NotNil(t, attachResult)
+
+	attachResult(nil)
+	attachResult(errors.New("missing security hook"))
+
+	assert.Equal(t, []uint32{1, 0}, states)
 }
 
 func TestParseJVMMemoryPoolRecordDecoratesServiceByPIDNamespace(t *testing.T) {

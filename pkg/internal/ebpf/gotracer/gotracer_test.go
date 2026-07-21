@@ -4,6 +4,7 @@
 package gotracer
 
 import (
+	"fmt"
 	"io"
 	"log/slog"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.opentelemetry.io/obi/pkg/appolly/discover/exec"
+	"go.opentelemetry.io/obi/pkg/config"
 	ebpfcommon "go.opentelemetry.io/obi/pkg/ebpf/common"
 	"go.opentelemetry.io/obi/pkg/internal/goexec"
 )
@@ -70,6 +72,35 @@ func TestProcessBinarySelectsRecordedChannelOffsetState(t *testing.T) {
 
 	tracer.ProcessBinary(nil)
 	assert.False(t, tracer.goChannelLinkProbesEnabled())
+}
+
+func TestJavaRemoteParentModeSelectsConsumerProtocolAndMapSizes(t *testing.T) {
+	disableContextPropagationForTest(t)
+
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("enabled=%t", enabled), func(t *testing.T) {
+			tracer := &Tracer{
+				log:                     slog.New(slog.NewTextHandler(io.Discard, nil)),
+				cfg:                     &config.EBPFTracer{},
+				javaRemoteParentEnabled: enabled,
+			}
+
+			bundles, err := tracer.LoadSpecs()
+			require.NoError(t, err)
+			require.Len(t, bundles, 1)
+			assert.Equal(t, enabled, bundles[0].Constants["java_remote_parent_enabled"])
+
+			for _, name := range []string{"incoming_trace_heads", "incoming_trace_candidates"} {
+				mapSpec := bundles[0].Spec.Maps[name]
+				require.NotNil(t, mapSpec, name)
+				if enabled {
+					assert.Greater(t, mapSpec.MaxEntries, uint32(1), name)
+				} else {
+					assert.Equal(t, uint32(1), mapSpec.MaxEntries, name)
+				}
+			}
+		})
+	}
 }
 
 func goChannelOffsets() *goexec.Offsets {

@@ -22,6 +22,7 @@
 #include <common/map_sizing.h>
 #include <common/pin_internal.h>
 #include <common/strings.h>
+#include <common/trace_helpers.h>
 #include <common/trace_util.h>
 #include <common/tracing.h>
 #include <common/tp_info.h>
@@ -253,12 +254,16 @@ server_trace_parent(void *goroutine_addr, tp_info_t *tp, tp_info_t *found_tp) {
 
             // First we look-up if we have information passed down to us from
             // TCP/IP context propagation.
-            tp_info_pid_t *existing_tp = bpf_map_lookup_elem(&incoming_trace_map, &conn);
+            tp_info_pid_t *existing_tp = consume_incoming_trace(&conn);
             if (existing_tp) {
-                bpf_dbg_printk("Found incoming (TCP) tp for server request");
-                found_info = 1;
-                tp_from_parent(tp, &existing_tp->tp);
-                bpf_map_delete_elem(&incoming_trace_map, &conn);
+                if (existing_tp->valid && valid_trace(existing_tp->tp.trace_id) &&
+                    valid_span(existing_tp->tp.span_id)) {
+                    bpf_dbg_printk("Found incoming (TCP) tp for server request");
+                    found_info = 1;
+                    tp_from_parent(tp, &existing_tp->tp);
+                } else {
+                    bpf_dbg_printk("Ignoring ambiguous incoming (TCP) tp for server request");
+                }
             } else {
                 // If not, we then look up the information in the black-box context map - same node.
                 bpf_dbg_printk("Looking up traceparent for connection info");

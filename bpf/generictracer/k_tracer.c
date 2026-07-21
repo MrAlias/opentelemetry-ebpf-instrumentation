@@ -50,6 +50,7 @@
 #include <maps/filter_ports.h>
 #include <maps/fd_to_connection.h>
 #include <maps/msg_buffers.h>
+#include <maps/java_remote_parent.h>
 #include <maps/sock_pids.h>
 #include <maps/unreadable_buffer_ports.h>
 #include <pid/pid.h>
@@ -740,6 +741,7 @@ int BPF_KPROBE(obi_kprobe_tcp_close, struct sock *sk, long timeout) {
         terminate_http_request_if_needed(&info);
         finish_ongoing_tcp_req(&info);
         bpf_map_delete_elem(&connection_tracker, &info.conn);
+        delete_incoming_trace_in_netns(&info.conn, sock_port_ns_from_sk(sk).netns);
     }
 
     bpf_map_delete_elem(&active_send_args, &id);
@@ -1364,8 +1366,9 @@ int BPF_KPROBE(obi_kprobe_sys_exit, int status) {
     (void)status;
 
     const u64 id = bpf_get_current_pid_tgid();
+    const u32 traced_pid = valid_pid(id);
 
-    if (!valid_pid(id)) {
+    if (!traced_pid && !java_remote_parent_enabled) {
         return 0;
     }
 
@@ -1377,18 +1380,35 @@ int BPF_KPROBE(obi_kprobe_sys_exit, int status) {
                    pid_from_pid_tgid(id),
                    valid_pid(id));
 
+    if (java_remote_parent_enabled) {
+        java_remote_parent_cleanup(&task.p_key);
+    }
+    trace_key_t vt_task = task;
+    const u8 vt_keyed = java_vt_translate_tid(&vt_task.p_key);
+    if (vt_keyed) {
+        if (java_remote_parent_enabled) {
+            java_remote_parent_cleanup(&vt_task.p_key);
+        }
+        bpf_map_delete_elem(&java_remote_parent_tasks, &vt_task.p_key);
+    }
+    bpf_map_delete_elem(&java_remote_parent_tasks, &task.p_key);
+
+    if (!traced_pid) {
+        return 0;
+    }
+
     bpf_map_delete_elem(&clone_map, &task.p_key);
     // This won't delete trace ids for traces with extra_id, like NodeJS. But,
     // we expect that it doesn't matter, since NodeJS main thread won't exit.
     bpf_map_delete_elem(&server_traces, &task);
-    trace_key_t vt_task = task;
-    if (java_vt_translate_tid(&vt_task.p_key)) {
+    if (vt_keyed) {
         bpf_map_delete_elem(&server_traces, &vt_task);
     }
     obi_ctx__del(id);
     // A carrier dying without VirtualThread.unmount() must not leave a
     // stale entry that would re-key a future thread reusing this tid.
     bpf_map_delete_elem(&java_vt_threads, &task.p_key);
+    bpf_map_delete_elem(&java_tasks, &task.p_key);
 
     return 0;
 }

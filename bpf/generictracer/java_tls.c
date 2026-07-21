@@ -10,6 +10,8 @@
 
 #include <common/connection_info.h>
 #include <common/protocol_defs.h>
+#include <common/sock_port_ns.h>
+#include <common/sockaddr.h>
 #include <common/trace_key.h>
 #include <common/trace_parent.h>
 
@@ -19,6 +21,7 @@
 #include <logger/bpf_dbg.h>
 
 #include <maps/active_ssl_connections.h>
+#include <maps/java_remote_parent.h>
 #include <maps/java_tasks.h>
 #include <maps/java_vt_threads.h>
 
@@ -33,6 +36,13 @@ enum {
     k_ioctl_java_threads = 3,
     k_ioctl_java_vt_mount = 4,   // virtual thread mounted on this carrier
     k_ioctl_java_vt_unmount = 5, // virtual thread unmounted from this carrier
+    k_ioctl_java_task_capture = 6,
+    k_ioctl_java_task_cancel = 7,
+    k_ioctl_java_task_link = 8,
+    k_ioctl_java_task_relay_capture = 9,
+    k_ioctl_java_process_register = 10,
+    k_ioctl_java_vt_terminate = 11,
+    k_ioctl_java_task_unlink = 12,
 };
 
 enum { k_ioctl_invalid_op = 0xff };
@@ -51,54 +61,80 @@ static __always_inline u8 cmd_to_op(u8 cmd) {
     }
 }
 
-SEC("kprobe/sys_ioctl")
-// unsigned int fd, unsigned int cmd, void *arg
-int BPF_KPROBE(obi_kprobe_sys_ioctl) {
-    const u64 id = bpf_get_current_pid_tgid();
-
-    if (!valid_pid(id)) {
+static __always_inline u8 java_connection_from_file(
+    struct file *file, u8 op, connection_info_t *connection, u16 *orig_dport, u32 *netns) {
+    if (!file) {
         return 0;
     }
 
-    bpf_dbg_printk("=== kprobe/sys_ioctl id=%d ===", id);
-
-    // unwrap the syscall arguments in __ctx
-    struct pt_regs *__ctx = (struct pt_regs *)PT_REGS_PARM1(ctx);
-
-    unsigned int fd = 0;
-    unsigned int cmd = 0;
-    void *arg = 0;
-
-    bpf_probe_read(&fd, sizeof(unsigned int), (void *)&PT_REGS_PARM1(__ctx));
-    bpf_probe_read(&cmd, sizeof(unsigned int), (void *)&PT_REGS_PARM2(__ctx));
-    bpf_probe_read(&arg, sizeof(void *), (void *)&PT_REGS_PARM3(__ctx));
-
-    // it must be fd == 0 if we are considering this request
-    if (fd) {
+    struct socket *socket = BPF_CORE_READ(file, private_data);
+    if (!socket || BPF_CORE_READ(socket, file) != file) {
+        return 0;
+    }
+    struct sock *sk = BPF_CORE_READ(socket, sk);
+    if (!sk || BPF_CORE_READ(sk, sk_protocol) != IPPROTO_TCP) {
+        return 0;
+    }
+    const u8 state = BPF_CORE_READ(sk, __sk_common.skc_state);
+    if ((state != TCP_ESTABLISHED && state != TCP_CLOSE_WAIT) || !parse_sock_info(sk, connection)) {
         return 0;
     }
 
-    // some other IOCTL by the app
-    if (cmd != k_ioctl_magic_id) {
+    // parse_sock_info is local-to-remote. The receive ABI is
+    // remote-to-local, so orient the kernel-derived tuple before comparing it
+    // with the advisory Java copy and before feeding the shared parser.
+    *orig_dport = connection->d_port;
+    if (op == TCP_RECV) {
+        swap_connection_info_order(connection);
+    }
+    *netns = sock_port_ns_from_sk(sk).netns;
+    return *netns != 0;
+}
+
+static __always_inline int handle_java_ioctl(
+    struct pt_regs *ctx, struct file *file, u64 id, unsigned char *uarg, u8 data_only) {
+    pid_key_t task = {0};
+    task_tid(&task);
+    if (!java_process_authorized_for(&task)) {
         return 0;
     }
-
-    bpf_dbg_printk("data=%llx", arg);
-
-    if (!arg) {
-        return 0;
-    }
-
-    unsigned char *uarg = arg;
 
     u8 op_cmd = 0;
     if (bpf_probe_read_user(&op_cmd, sizeof(op_cmd), uarg) != 0) {
+        return 0;
+    }
+    const u8 op = cmd_to_op(op_cmd);
+    const u8 data_operation = op != k_ioctl_invalid_op;
+    if (data_operation != data_only) {
+        return 0;
+    }
+    if (op_cmd != k_ioctl_java_process_register && !java_process_registered_for(&task)) {
         return 0;
     }
 
     // Control opcodes each handle themselves and return; the data opcodes
     // (send/recv) fall through to the connection/payload path below.
     switch (op_cmd) {
+    case k_ioctl_java_process_register: {
+        u64 incarnation = 0;
+        if (bpf_probe_read_user(&incarnation, sizeof(incarnation), uarg + 1) != 0 || !incarnation) {
+            return 0;
+        }
+
+        const pid_key_t process = java_process_key(&task);
+        if (java_process_capability_for(&process) != incarnation) {
+            return 0;
+        }
+        const u64 *previous = bpf_map_lookup_elem(&java_process_incarnations, &process);
+        if (java_remote_parent_enabled && previous && *previous != incarnation) {
+            java_remote_parent_cleanup(&task);
+            java_remote_parent_cleanup(&process);
+            bpf_map_delete_elem(&java_remote_parent_tasks, &task);
+            bpf_map_delete_elem(&java_tasks, &task);
+        }
+        java_register_process_incarnation(incarnation);
+        return 0;
+    }
     case k_ioctl_java_vt_mount: {
         // The agent reports, on every VirtualThread.mount(), the logical
         // thread id now mounted on this carrier; the current kernel thread
@@ -110,10 +146,57 @@ int BPF_KPROBE(obi_kprobe_sys_ioctl) {
 
         pid_key_t carrier = {0};
         task_tid(&carrier);
+        pid_key_t synthetic_owner = {0};
+        java_vt_identity_t mount_identity = {0};
+        enum java_vt_mount_result mount_result =
+            java_vt_prepare_mount(&carrier, vt_id, &synthetic_owner, &mount_identity);
+
+        if (mount_result == k_java_vt_mount_collision ||
+            mount_result == k_java_vt_mount_stale_incarnation) {
+            if (java_remote_parent_enabled) {
+                java_remote_parent_cleanup(&synthetic_owner);
+                bpf_map_delete_elem(&java_remote_parent_tasks, &synthetic_owner);
+                bpf_map_delete_elem(&java_tasks, &synthetic_owner);
+            }
+            if (mount_result == k_java_vt_mount_collision ||
+                !java_vt_replace_stale_identity(&synthetic_owner, &mount_identity)) {
+                bpf_map_delete_elem(&java_vt_threads, &carrier);
+                return 0;
+            }
+        } else if (mount_result != k_java_vt_mount_success) {
+            bpf_map_delete_elem(&java_vt_threads, &carrier);
+            return 0;
+        }
+
+        if (java_remote_parent_enabled) {
+            java_remote_parent_cleanup(&carrier);
+            bpf_map_delete_elem(&java_tasks, &carrier);
+        }
 
         bpf_dbg_printk("Java VT mount carrier=%d vt=%lld", carrier.tid, vt_id);
-        bpf_map_update_elem(&java_vt_threads, &carrier, &vt_id, BPF_ANY);
+        if (!java_vt_publish_mount(&carrier, &mount_identity)) {
+            bpf_map_delete_elem(&java_vt_threads, &carrier);
+        }
 
+        return 0;
+    }
+    case k_ioctl_java_vt_terminate: {
+        u64 vt_id = 0;
+        if (bpf_probe_read_user(&vt_id, sizeof(vt_id), uarg + 1) != 0) {
+            return 0;
+        }
+
+        pid_key_t carrier = {0};
+        pid_key_t owner = {0};
+        task_tid(&carrier);
+        if (!java_vt_terminate_identity(&carrier, vt_id, &owner)) {
+            return 0;
+        }
+        if (java_remote_parent_enabled) {
+            java_remote_parent_cleanup(&owner);
+            bpf_map_delete_elem(&java_remote_parent_tasks, &owner);
+            bpf_map_delete_elem(&java_tasks, &owner);
+        }
         return 0;
     }
     case k_ioctl_java_vt_unmount: {
@@ -125,29 +208,123 @@ int BPF_KPROBE(obi_kprobe_sys_ioctl) {
         task_tid(&carrier);
 
         bpf_dbg_printk("Java VT unmount carrier=%d", carrier.tid);
+        if (java_remote_parent_enabled) {
+            java_remote_parent_cleanup(&carrier);
+            bpf_map_delete_elem(&java_tasks, &carrier);
+        }
         bpf_map_delete_elem(&java_vt_threads, &carrier);
 
         return 0;
     }
-    case k_ioctl_java_threads: {
-        u64 parent_id = 0;
-        if (bpf_probe_read_user(&parent_id, sizeof(parent_id), uarg + 1) != 0) {
+    case k_ioctl_java_task_capture: {
+        u64 token = 0;
+        if (bpf_probe_read_user(&token, sizeof(token), uarg + 1) != 0) {
+            return 0;
+        }
+        if (java_remote_parent_enabled) {
+            java_remote_parent_capture_handoff(token);
+        }
+        return 0;
+    }
+    case k_ioctl_java_task_cancel: {
+        u64 token = 0;
+        if (bpf_probe_read_user(&token, sizeof(token), uarg + 1) != 0) {
+            return 0;
+        }
+        if (java_remote_parent_enabled) {
+            const pid_key_t execution = java_remote_parent_current_owner();
+            java_remote_parent_cancel_handoff(&execution, token);
+        }
+        return 0;
+    }
+    case k_ioctl_java_task_relay_capture: {
+        u64 token = 0;
+        if (bpf_probe_read_user(&token, sizeof(token), uarg + 1) != 0) {
+            return 0;
+        }
+        if (java_remote_parent_enabled) {
+            const pid_key_t execution = java_remote_parent_current_owner();
+            java_remote_parent_capture_relay(&execution, token);
+        }
+        return 0;
+    }
+    case k_ioctl_java_task_unlink: {
+        if (!java_remote_parent_enabled) {
             return 0;
         }
 
         pid_key_t child = {0};
         task_tid(&child);
+        pid_key_t logical_child = child;
+        java_vt_translate_tid(&logical_child);
+        java_remote_parent_unlink_task(&logical_child);
+        bpf_map_delete_elem(&java_tasks, &child);
+        obi_ctx__del(id);
+        return 0;
+    }
+    case k_ioctl_java_threads:
+    case k_ioctl_java_task_link: {
+        u64 parent_id = 0;
+        if (bpf_probe_read_user(&parent_id, sizeof(parent_id), uarg + 1) != 0) {
+            return 0;
+        }
+        u64 token = 0;
+        if (op_cmd == k_ioctl_java_task_link &&
+            bpf_probe_read_user(&token, sizeof(token), uarg + 1 + sizeof(parent_id)) != 0) {
+            return 0;
+        }
+
+        pid_key_t child = {0};
+        task_tid(&child);
+        pid_key_t logical_child = child;
+        java_vt_translate_tid(&logical_child);
         pid_key_t parent = child;
         const u32 parent_tid = tid_from_pid_tgid(parent_id);
         parent.tid = parent_tid;
 
+        if (java_remote_parent_enabled && op_cmd == k_ioctl_java_task_link) {
+            bpf_map_delete_elem(&java_tasks, &child);
+            obi_ctx__del(id);
+            java_remote_parent_link_handoff(&logical_child, token);
+            return 0;
+        }
+
         if (parent.tid == child.tid) {
+            if (java_remote_parent_enabled) {
+                if (op_cmd == k_ioctl_java_threads) {
+                    java_remote_parent_fail_handoff(&logical_child);
+                }
+                bpf_map_delete_elem(&java_tasks, &child);
+                obi_ctx__del(id);
+            }
             bpf_dbg_printk("self referencing thread %d, not recording", child.tid);
             return 0;
         }
 
+        if (java_remote_parent_enabled && op_cmd == k_ioctl_java_threads &&
+            java_remote_parent_task_mapping_would_cycle(&child, &parent)) {
+            java_remote_parent_mark_ambiguous(&child);
+            java_remote_parent_mark_ambiguous(&parent);
+            java_remote_parent_cancel_handoff(&logical_child, token);
+            java_remote_parent_unlink_task(&logical_child);
+            bpf_dbg_printk("cyclic Java thread mapping [%d] -> [%d]", child.tid, parent.tid);
+            return 0;
+        }
+
+        if (java_remote_parent_enabled && op_cmd == k_ioctl_java_threads) {
+            const pid_key_t *previous_parent = bpf_map_lookup_elem(&java_tasks, &child);
+            if (previous_parent && !java_remote_parent_pid_key_equal(previous_parent, &parent)) {
+                java_remote_parent_guard_owner_reuse(&child);
+            }
+        }
+
         bpf_dbg_printk("Java thread mapping [%d] -> [%d]", parent.tid, child.tid);
         bpf_map_update_elem(&java_tasks, &child, &parent, BPF_ANY);
+        if (java_remote_parent_enabled) {
+            if (op_cmd == k_ioctl_java_threads) {
+                java_remote_parent_fail_handoff(&logical_child);
+            }
+        }
 
         // Walk the java_tasks chain to find the parent's server trace and
         // refresh traces_ctx_v1 for this child thread.
@@ -166,8 +343,6 @@ int BPF_KPROBE(obi_kprobe_sys_ioctl) {
         break;
     }
 
-    const u8 op = cmd_to_op(op_cmd);
-
     if (op == k_ioctl_invalid_op) {
         bpf_dbg_printk("unknown cmd=%d", op_cmd);
         return 0;
@@ -176,34 +351,65 @@ int BPF_KPROBE(obi_kprobe_sys_ioctl) {
     bpf_dbg_printk("op=%d, cmd=%d", op, op_cmd);
 
     pid_connection_info_t p_conn = {0};
-    if (bpf_probe_read_user(&p_conn.conn, sizeof(p_conn.conn), uarg + 1) != 0) {
+    u16 orig_dport = 0;
+    u32 connection_netns = 0;
+    connection_info_t claimed = {0};
+    if (bpf_probe_read_user(&claimed, sizeof(claimed), uarg + 1) != 0) {
         return 0;
     }
-    d_print_http_connection_info(&p_conn.conn);
-    u16 orig_dport = 0;
-    // What we get from Java is correct, unlike the reversed information we
-    // get from the kernel probes. So we need to fake the orig_dport to match
-    // what the rest of the APIs expect.
-    if (op == TCP_RECV) {
-        orig_dport = p_conn.conn.s_port;
-    } else {
-        orig_dport = p_conn.conn.d_port;
-    }
 
-    sort_connection_info(&p_conn.conn);
-    p_conn.pid = pid_from_pid_tgid(id);
-
-    if (is_empty_connection_info(&p_conn.conn)) {
-        ssl_pid_connection_info_t *l = bpf_map_lookup_elem(&pid_tid_to_conn, &id);
-        bpf_dbg_printk("lookup for empty connection info: %llx", l);
-        if (l) {
-            p_conn = l->p_conn;
+    if (file) {
+        if (!java_connection_from_file(file, op, &p_conn.conn, &orig_dport, &connection_netns)) {
+            return 0;
         }
+
+        // The Java tuple is useful only as a stale-FD/mismatched-correlation
+        // guard. The authoritative tuple and network namespace come from the
+        // referenced live kernel socket.
+        if (!is_empty_connection_info(&claimed) &&
+            __builtin_memcmp(&claimed, &p_conn.conn, sizeof(claimed)) != 0) {
+            return 0;
+        }
+        sort_connection_info(&p_conn.conn);
+        p_conn.pid = pid_from_pid_tgid(id);
+    } else {
+        p_conn.conn = claimed;
+        // The fallback preserves Java TLS telemetry when the file-bearing
+        // hook is unavailable, but its user-claimed tuple is never eligible
+        // to stage remote-parent bridge state.
+        orig_dport = op == TCP_RECV ? p_conn.conn.s_port : p_conn.conn.d_port;
+        sort_connection_info(&p_conn.conn);
+        p_conn.pid = pid_from_pid_tgid(id);
+
+        if (is_empty_connection_info(&p_conn.conn)) {
+            const ssl_pid_connection_info_t *connection =
+                bpf_map_lookup_elem(&pid_tid_to_conn, &id);
+            if (connection) {
+                p_conn = connection->p_conn;
+            }
+        }
+    }
+    d_print_http_connection_info(&p_conn.conn);
+
+    if (java_remote_parent_enabled && java_remote_parent_data_hook_is_ready() && connection_netns &&
+        op == TCP_RECV) {
+        java_remote_parent_begin_data_receive();
     }
 
     u32 len = 0;
     if (bpf_probe_read_user(&len, sizeof(len), uarg + 1 + sizeof(connection_info_t)) != 0) {
         return 0;
+    }
+    u64 data_signal_nonce = 0;
+    if (bpf_probe_read_user(&data_signal_nonce,
+                            sizeof(data_signal_nonce),
+                            uarg + 1 + sizeof(connection_info_t) + sizeof(len)) != 0 ||
+        (connection_netns && !data_signal_nonce)) {
+        return 0;
+    }
+    if (java_remote_parent_enabled && java_remote_parent_data_hook_is_ready() && connection_netns &&
+        op == TCP_RECV) {
+        java_remote_parent_publish_data_signal(data_signal_nonce);
     }
 
     // Bound the parser-visible payload length before we touch the payload
@@ -214,7 +420,8 @@ int BPF_KPROBE(obi_kprobe_sys_ioctl) {
     bpf_dbg_printk("payload len=%d", max_len);
 
     if (max_len > 0) {
-        unsigned char *buf = uarg + 1 + sizeof(connection_info_t) + sizeof(u32);
+        unsigned char *buf =
+            uarg + 1 + sizeof(connection_info_t) + sizeof(u32) + sizeof(data_signal_nonce);
         // This path consumes one flat user pointer supplied from Java. The
         // security boundary here is "user memory vs. non-user memory", not
         // full range validation. We therefore verify that the claimed payload
@@ -232,8 +439,48 @@ int BPF_KPROBE(obi_kprobe_sys_ioctl) {
 
         const u64 zero = 0;
         bpf_map_update_elem(&active_ssl_connections, &p_conn, &zero, BPF_ANY);
-        handle_buf_with_connection(ctx, &p_conn, buf, max_len, WITH_SSL, op, orig_dport);
+        handle_java_buf_with_connection(
+            ctx, &p_conn, buf, max_len, op, orig_dport, connection_netns);
     }
 
     return 0;
+}
+
+SEC("kprobe/sys_ioctl")
+// unsigned int fd, unsigned int cmd, void *arg
+int BPF_KPROBE(obi_kprobe_sys_ioctl) {
+    const u64 id = bpf_get_current_pid_tgid();
+
+    // sys_ioctl is retained for control packets and as a telemetry-only
+    // fallback when the file-bearing hook could not be attached.
+    struct pt_regs *__ctx = (struct pt_regs *)PT_REGS_PARM1(ctx);
+    unsigned int cmd = 0;
+    void *arg = NULL;
+    bpf_probe_read(&cmd, sizeof(cmd), (void *)&PT_REGS_PARM2(__ctx));
+    bpf_probe_read(&arg, sizeof(arg), (void *)&PT_REGS_PARM3(__ctx));
+    if (cmd != k_ioctl_magic_id || !arg) {
+        return 0;
+    }
+
+    handle_java_ioctl(ctx, NULL, id, arg, 0);
+    if (!java_remote_parent_data_hook_is_ready()) {
+        return handle_java_ioctl(ctx, NULL, id, arg, 1);
+    }
+    return 0;
+}
+
+SEC("kprobe/security_file_ioctl")
+// struct file *file, unsigned int cmd, unsigned long arg
+int BPF_KPROBE(obi_kprobe_security_file_ioctl,
+               struct file *file,
+               unsigned int cmd,
+               unsigned long arg) {
+    if (cmd != k_ioctl_magic_id || !arg) {
+        return 0;
+    }
+    if (!java_remote_parent_data_hook_is_ready()) {
+        return 0;
+    }
+
+    return handle_java_ioctl(ctx, file, bpf_get_current_pid_tgid(), (unsigned char *)arg, 1);
 }

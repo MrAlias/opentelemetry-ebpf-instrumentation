@@ -21,9 +21,10 @@ import (
 // TODO: let users override it or create it from the batch_length value
 var pipelineBufferLengths = []float64{0, 10, 20, 40, 80, 160, 320}
 
-type PrometheusConfig struct {
-	Port int    `yaml:"port,omitempty" env:"OTEL_EBPF_INTERNAL_METRICS_PROMETHEUS_PORT" validate:"gte=0,lte=65535"`
-	Path string `yaml:"path,omitempty" env:"OTEL_EBPF_INTERNAL_METRICS_PROMETHEUS_PATH"`
+type InternalPrometheusConfig struct {
+	Address string `yaml:"address,omitempty" env:"OTEL_EBPF_INTERNAL_METRICS_PROMETHEUS_ADDRESS" validate:"omitempty,ip"`
+	Port    int    `yaml:"port,omitempty" env:"OTEL_EBPF_INTERNAL_METRICS_PROMETHEUS_PORT" validate:"gte=0,lte=65535"`
+	Path    string `yaml:"path,omitempty" env:"OTEL_EBPF_INTERNAL_METRICS_PROMETHEUS_PATH"`
 }
 
 // PrometheusReporter is an internal metrics Reporter that exports to Prometheus
@@ -54,6 +55,7 @@ type PrometheusReporter struct {
 	bpfIgnoredPacketCount prometheus.Counter
 
 	queueCapacityRatio *prometheus.GaugeVec
+	javaRemoteParent   *prometheus.CounterVec
 }
 
 func NewPrometheusReporter(cfg *InternalMetricsConfig, manager *connector.PrometheusManager, registry *prometheus.Registry) *PrometheusReporter {
@@ -145,6 +147,10 @@ func NewPrometheusReporter(cfg *InternalMetricsConfig, manager *connector.Promet
 			Name: attr.VendorPrefix + "_queue_capacity_ratio",
 			Help: "Ratio [0-1] between the unread messages of an internal Go channel and its total capacity",
 		}, []string{"subscriber"}),
+		javaRemoteParent: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: attr.VendorPrefix + "_java_remote_parent_operations_total",
+			Help: "Java remote-parent bridge outcomes by bounded transport, operation, and status",
+		}, []string{"transport", "operation", "status"}),
 	}
 	if !cfg.AvoidedServices.Disabled {
 		pr.avoidedServicesLimiter = avoidedsvc.NewLimiter(cfg.AvoidedServices.Limit)
@@ -176,6 +182,7 @@ func NewPrometheusReporter(cfg *InternalMetricsConfig, manager *connector.Promet
 		pr.bpfPacketCount,
 		pr.bpfIgnoredPacketCount,
 		pr.queueCapacityRatio,
+		pr.javaRemoteParent,
 	}
 	if pr.avoidedServices != nil {
 		metrics = append(metrics, pr.avoidedServices)
@@ -183,7 +190,12 @@ func NewPrometheusReporter(cfg *InternalMetricsConfig, manager *connector.Promet
 	if registry != nil {
 		registry.MustRegister(metrics...)
 	} else {
-		manager.Register(cfg.Prometheus.Port, cfg.Prometheus.Path, metrics...)
+		manager.RegisterAddress(
+			cfg.Prometheus.Address,
+			cfg.Prometheus.Port,
+			cfg.Prometheus.Path,
+			metrics...,
+		)
 	}
 
 	return pr
@@ -278,4 +290,8 @@ func (p *PrometheusReporter) BPFPacketStats(count, ignored uint64) {
 
 func (p *PrometheusReporter) QueueBufferUtilization(subscriber string, ratio float64) {
 	p.queueCapacityRatio.WithLabelValues(subscriber).Set(ratio)
+}
+
+func (p *PrometheusReporter) JavaRemoteParent(transport, operation, status string, count uint64) {
+	p.javaRemoteParent.WithLabelValues(transport, operation, status).Add(float64(count))
 }

@@ -84,6 +84,29 @@ func groupFromSpanAndAttributes(span *request.Span, attrs []attribute.KeyValue) 
 	return groups
 }
 
+func TestGenerateTracesPreservesTraceFlags(t *testing.T) {
+	start := time.Now()
+	span := &request.Span{
+		Type:         request.EventTypeHTTP,
+		RequestStart: start.UnixNano(),
+		Start:        start.UnixNano(),
+		End:          start.Add(time.Second).UnixNano(),
+		TraceFlags:   0x81,
+	}
+
+	traces := tracesgen.GenerateTracesWithAttributes(
+		cache,
+		&span.Service,
+		nil,
+		hostID,
+		groupFromSpanAndAttributes(span, nil),
+		reporterName,
+	)
+
+	exported := traces.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
+	assert.Equal(t, uint32(span.TraceFlags), exported.Flags())
+}
+
 func TestGenerateTracesSpanLinks(t *testing.T) {
 	start := time.Now()
 	traceID, err := trace.TraceIDFromHex("eae56fbbec9505c102e8aabfc6b5c481")

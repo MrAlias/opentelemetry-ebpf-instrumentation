@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -31,10 +32,15 @@ func log() *slog.Logger {
 type PrometheusManager struct {
 	mt      sync.Mutex
 	started bool
-	// key 1: port. Key 2: path
-	registries maps.Map2[int, string, *prometheus.Registry]
+	// key 1: listen endpoint. Key 2: path
+	registries maps.Map2[prometheusEndpoint, string, *prometheus.Registry]
 
 	metrics internalIntrumenter
+}
+
+type prometheusEndpoint struct {
+	address string
+	port    int
 }
 
 type internalIntrumenter interface {
@@ -50,18 +56,30 @@ func (pm *PrometheusManager) InstrumentWith(ii internalIntrumenter) {
 // Register a set of prometheus metrics to be accessible through an HTTP port/path.
 // This method is not thread-safe
 func (pm *PrometheusManager) Register(port int, path string, collectors ...prometheus.Collector) {
+	pm.RegisterAddress("", port, path, collectors...)
+}
+
+// RegisterAddress registers collectors on a specific listen address. An empty
+// address preserves the default all-interface behavior.
+func (pm *PrometheusManager) RegisterAddress(
+	address string,
+	port int,
+	path string,
+	collectors ...prometheus.Collector,
+) {
 	pm.mt.Lock()
 	defer pm.mt.Unlock()
 	log().Debug("registering Prometheus metrics collectors",
-		"len", len(collectors), "port", port, "path", path)
+		"len", len(collectors), "address", address, "port", port, "path", path)
 
 	if pm.registries == nil {
-		pm.registries = maps.Map2[int, string, *prometheus.Registry]{}
+		pm.registries = maps.Map2[prometheusEndpoint, string, *prometheus.Registry]{}
 	}
-	reg, ok := pm.registries.Get(port, path)
+	endpoint := prometheusEndpoint{address: address, port: port}
+	reg, ok := pm.registries.Get(endpoint, path)
 	if !ok {
 		reg = prometheus.NewRegistry()
-		pm.registries.Put(port, path, reg)
+		pm.registries.Put(endpoint, path, reg)
 	}
 	reg.MustRegister(collectors...)
 }
@@ -78,19 +96,20 @@ func (pm *PrometheusManager) StartHTTP(ctx context.Context) {
 
 	log := log()
 	// Creating a serve mux for each port
-	for port, paths := range pm.registries {
+	for endpoint, paths := range pm.registries {
 		mux := http.NewServeMux()
 		for path, registry := range paths {
-			log.With("port", port, "path", path).Info("opening prometheus scrape endpoint")
+			log.With("address", endpoint.address, "port", endpoint.port, "path", path).
+				Info("opening prometheus scrape endpoint")
 			promHandler := promhttp.HandlerFor(registry, promhttp.HandlerOpts{
 				Registry:          registry,
 				EnableOpenMetrics: true,
 			})
 			promHandler = wrapDebugHandler(log, promHandler)
-			promHandler = wrapInstrumentedHandler(pm.metrics, port, path, promHandler)
+			promHandler = wrapInstrumentedHandler(pm.metrics, endpoint.port, path, promHandler)
 			mux.Handle(path, promHandler)
 		}
-		listenAndServe(ctx, port, mux)
+		listenAndServe(ctx, endpoint, mux)
 	}
 }
 
@@ -117,10 +136,10 @@ func wrapDebugHandler(log *slog.Logger, promHandler http.Handler) http.HandlerFu
 	}
 }
 
-func listenAndServe(ctx context.Context, port int, handler http.Handler) {
+func listenAndServe(ctx context.Context, endpoint prometheusEndpoint, handler http.Handler) {
 	// TODO: support TLS configuration
-	server := http.Server{Addr: fmt.Sprintf(":%d", port), Handler: handler}
-	log := log().With("port", port)
+	server := http.Server{Addr: prometheusListenAddress(endpoint), Handler: handler}
+	log := log().With("address", endpoint.address, "port", endpoint.port)
 	go func() {
 		err := server.ListenAndServe()
 		if errors.Is(err, http.ErrServerClosed) {
@@ -139,4 +158,11 @@ func listenAndServe(ctx context.Context, port int, handler http.Handler) {
 			log.Warn("error closing HTTP server", "err", err.Error())
 		}
 	}()
+}
+
+func prometheusListenAddress(endpoint prometheusEndpoint) string {
+	if endpoint.address == "" {
+		return fmt.Sprintf(":%d", endpoint.port)
+	}
+	return net.JoinHostPort(endpoint.address, strconv.Itoa(endpoint.port))
 }

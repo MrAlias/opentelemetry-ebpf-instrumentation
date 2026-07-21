@@ -42,6 +42,22 @@ typedef struct connection_info {
     u16 d_port;
 } connection_info_t;
 
+typedef struct connection_info_ns {
+    connection_info_t connection;
+    u32 netns;
+} connection_info_ns_t;
+
+_Static_assert(sizeof(connection_info_ns_t) == 40, "namespaced connection key size mismatch");
+
+static __always_inline connection_info_ns_t
+connection_info_with_netns(const connection_info_t *connection, u32 netns) {
+    const connection_info_ns_t key = {
+        .connection = *connection,
+        .netns = netns,
+    };
+    return key;
+}
+
 typedef struct http_partial_connection_info {
     u8 s_addr[IP_V6_ADDR_LEN];
     u16 s_port;

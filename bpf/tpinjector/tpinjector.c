@@ -3,6 +3,7 @@
 
 #include <bpfcore/vmlinux.h>
 #include <bpfcore/bpf_builtins.h>
+#include <bpfcore/bpf_core_read.h>
 #include <bpfcore/bpf_helpers.h>
 #include <bpfcore/bpf_endian.h>
 
@@ -22,6 +23,7 @@
 #include <common/scratch_mem.h>
 #include <common/ssl_connection.h>
 #include <common/tc_common.h>
+#include <common/tcp_traceparent.h>
 #include <common/tp_info.h>
 #include <common/trace_helpers.h>
 #include <common/trace_parent.h>
@@ -33,6 +35,7 @@
 #include <logger/bpf_dbg.h>
 
 #include <maps/incoming_trace_map.h>
+#include <maps/java_remote_parent_shared.h>
 #include <maps/msg_buffers.h>
 #include <maps/outgoing_trace_map.h>
 #include <maps/sock_dir.h>
@@ -44,6 +47,43 @@
 #include <tpinjector/maps/sk_tp_info_pid_map.h>
 
 char __license[] SEC("license") = "Dual MIT/GPL";
+
+SEC("tracepoint/sched/sched_process_exit")
+int obi_java_remote_parent_process_exit(void *ctx) {
+    (void)ctx;
+
+    const struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    // do_exit decrements signal->live before sched_process_exit on all supported kernels.
+    if (BPF_CORE_READ(task, signal, live.counter) != 0) {
+        return 0;
+    }
+
+    pid_key_t current = {0};
+    task_tid(&current);
+    const pid_key_t process = java_process_key(&current);
+    const u64 *registered = bpf_map_lookup_elem(&java_process_incarnations, &process);
+    if (!registered || !*registered) {
+        bpf_map_delete_elem(&java_authorized_processes, &process);
+        return 0;
+    }
+
+    const u64 process_incarnation = *registered;
+    if (java_remote_parent_enabled) {
+        const java_retired_process_key_t key = {
+            .process = process,
+            .process_incarnation = process_incarnation,
+        };
+        const u64 observed_monotime_ns = bpf_ktime_get_ns();
+        bpf_map_update_elem(&java_retired_processes, &key, &observed_monotime_ns, BPF_NOEXIST);
+    }
+
+    registered = bpf_map_lookup_elem(&java_process_incarnations, &process);
+    if (registered && *registered == process_incarnation) {
+        bpf_map_delete_elem(&java_process_incarnations, &process);
+    }
+    bpf_map_delete_elem(&java_authorized_processes, &process);
+    return 0;
+}
 
 // =============================================================================
 // Tail-call chain map
@@ -97,10 +137,7 @@ enum {
 volatile const u32 inject_flags =
     k_inject_http_headers | k_inject_tcp_options; // default: both enabled
 
-// Kind 25 is unassigned per IANA TCP Parameters registry (released 2000-12-18)
-// Better than experimental options (253-254) which must not be shipped as defaults
-enum { k_tcp_option_kind_otel = 25 };
-
+// Kind 25 is unassigned per IANA TCP Parameters registry (released 2000-12-18).
 enum {
     k_tail_write_msg_traceparent,
     k_tail_find_existing_tp,
@@ -192,14 +229,8 @@ static __always_inline void mark_h2_socket(struct sk_msg_md *msg) {
 #define ENOMSG 42
 #endif
 
-struct tp_option {
-    u8 kind;
-    u8 len;
-    unsigned char trace_id[TRACE_ID_SIZE_BYTES];
-    unsigned char span_id[SPAN_ID_SIZE_BYTES];
-};
-
-static __always_inline const char *tp_string_from_opt(const struct tp_option *opt) {
+static __always_inline const char *tp_string_from_opt(const tcp_traceparent_option_t *opt,
+                                                      u8 flags) {
     unsigned char *buf = tp_str_buf_mem();
 
     if (!buf) {
@@ -225,7 +256,8 @@ static __always_inline const char *tp_string_from_opt(const struct tp_option *op
 
     *ptr++ = '-';
 
-    *ptr++ = '0';
+    encode_hex(ptr, &flags, sizeof(flags));
+    ptr += FLAGS_CHAR_LEN;
     *ptr++ = '\0';
 
     return (const char *)buf;
@@ -405,7 +437,11 @@ static __always_inline void bpf_sock_ops_passive_est_cb(struct bpf_sock_ops *sko
         return;
     }
 
-    bpf_sock_ops_set_flags(skops, BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG);
+    u8 flags = BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG;
+    if (java_remote_parent_enabled) {
+        flags |= BPF_SOCK_OPS_STATE_CB_FLAG;
+    }
+    bpf_sock_ops_set_flags(skops, flags);
 }
 
 static __always_inline void bpf_sock_ops_opt_len_cb(struct bpf_sock_ops *skops) {
@@ -421,7 +457,9 @@ static __always_inline void bpf_sock_ops_opt_len_cb(struct bpf_sock_ops *skops) 
         return;
     }
 
-    const long ret = bpf_reserve_hdr_opt(skops, sizeof(struct tp_option), 0);
+    const u32 option_size = java_remote_parent_enabled ? sizeof(tcp_traceparent_option_t)
+                                                       : sizeof(tcp_traceparent_legacy_option_t);
+    const long ret = bpf_reserve_hdr_opt(skops, option_size, 0);
 
     if (ret != 0) {
         bpf_dbg_printk("failed to reserve TCP option: %d", ret);
@@ -447,19 +485,40 @@ static __always_inline void bpf_sock_ops_write_hdr_cb(struct bpf_sock_ops *skops
     // (including during responses);
     bpf_sk_storage_delete(&sk_tp_info_pid_map, sk);
 
-    struct tp_option opt = {.kind = k_tcp_option_kind_otel, .len = sizeof(struct tp_option)};
+    if (!valid_trace(tp_pid->tp.trace_id) || !valid_span(tp_pid->tp.span_id)) {
+        bpf_dbg_printk("not writing invalid TCP traceparent option");
+        return;
+    }
+
+    tcp_traceparent_option_t opt = {
+        .kind = k_tcp_traceparent_option_kind,
+        .len = sizeof(tcp_traceparent_option_t),
+        .flags = tp_pid->tp.flags,
+    };
 
     __builtin_memcpy(opt.trace_id, tp_pid->tp.trace_id, sizeof(opt.trace_id));
     __builtin_memcpy(opt.span_id, tp_pid->tp.span_id, sizeof(opt.span_id));
 
-    const long ret = bpf_store_hdr_opt(skops, &opt, sizeof(opt), 0);
+    long ret = 0;
+    if (java_remote_parent_enabled) {
+        ret = bpf_store_hdr_opt(skops, &opt, sizeof(opt), 0);
+    } else {
+        tcp_traceparent_legacy_option_t legacy = {
+            .kind = k_tcp_traceparent_option_kind,
+            .len = sizeof(tcp_traceparent_legacy_option_t),
+        };
+        __builtin_memcpy(legacy.trace_id, opt.trace_id, sizeof(legacy.trace_id));
+        __builtin_memcpy(legacy.span_id, opt.span_id, sizeof(legacy.span_id));
+        ret = bpf_store_hdr_opt(skops, &legacy, sizeof(legacy), 0);
+    }
 
     if (ret != 0) {
         bpf_dbg_printk("failed to store option: %d", ret);
     }
 
     if (g_bpf_debug) {
-        const char *tp_str = tp_string_from_opt(&opt);
+        const char *tp_str =
+            tp_string_from_opt(&opt, java_remote_parent_enabled && ret == 0 ? tp_pid->tp.flags : 0);
 
         if (tp_str) {
             bpf_dbg_printk("written TP to TCP options: %s", tp_str);
@@ -467,13 +526,24 @@ static __always_inline void bpf_sock_ops_write_hdr_cb(struct bpf_sock_ops *skops
     }
 }
 
+static __always_inline u8 tcp_sequence_from_sockops(struct bpf_sock_ops *skops, u32 *sequence) {
+    const struct tcphdr *tcp = (const struct tcphdr *)(long)skops->skb_data;
+    const void *data_end = (const void *)(long)skops->skb_data_end;
+    if ((const void *)(tcp + 1) > data_end) {
+        return 0;
+    }
+
+    *sequence = bpf_ntohl(tcp->seq);
+    return 1;
+}
+
 static __always_inline void bpf_sock_ops_parse_hdr_cb(struct bpf_sock_ops *skops) {
     if (!(inject_flags & k_inject_tcp_options)) {
         return;
     }
 
-    struct tp_option opt = {};
-    opt.kind = k_tcp_option_kind_otel;
+    tcp_traceparent_option_t opt = {};
+    opt.kind = k_tcp_traceparent_option_kind;
 
     const long ret = bpf_load_hdr_opt(skops, &opt, sizeof(opt), 0);
 
@@ -486,8 +556,15 @@ static __always_inline void bpf_sock_ops_parse_hdr_cb(struct bpf_sock_ops *skops
         return;
     }
 
+    const u8 exact_flags = ret == sizeof(opt) && opt.len == sizeof(opt);
+    const u8 legacy = ret == sizeof(tcp_traceparent_legacy_option_t) && opt.len == ret;
+    if ((!exact_flags && !legacy) || !valid_trace(opt.trace_id) || !valid_span(opt.span_id)) {
+        bpf_dbg_printk("ignoring malformed TCP traceparent option");
+        return;
+    }
+
     if (g_bpf_debug) {
-        const char *tp_str = tp_string_from_opt(&opt);
+        const char *tp_str = tp_string_from_opt(&opt, exact_flags ? opt.flags : 0);
 
         if (tp_str) {
             bpf_dbg_printk("found TP in TCP options: %s", tp_str);
@@ -496,15 +573,46 @@ static __always_inline void bpf_sock_ops_parse_hdr_cb(struct bpf_sock_ops *skops
 
     tp_info_pid_t tp = {};
     tp.valid = 1;
+    tp.tp.ts = bpf_ktime_get_ns();
+    tp.tp.flags = exact_flags ? opt.flags : 0;
+    tp.provenance = exact_flags ? k_tp_provenance_tcp_exact_flags : k_tp_provenance_tcp_legacy;
 
     __builtin_memcpy(tp.tp.trace_id, opt.trace_id, sizeof(tp.tp.trace_id));
     __builtin_memcpy(tp.tp.span_id, opt.span_id, sizeof(tp.tp.span_id));
 
+    u32 tcp_sequence = 0;
+    if (!tcp_sequence_from_sockops(skops, &tcp_sequence)) {
+        bpf_dbg_printk("ignoring TCP traceparent option without a complete TCP header");
+        return;
+    }
+
     connection_info_t conn = get_connection_info_ops(skops);
     sort_connection_info(&conn);
+    const u32 netns = sock_port_ns_from_sk((const struct sock *)(long)skops->sk).netns;
 
     dbg_print_http_connection_info(&conn);
-    bpf_map_update_elem(&incoming_trace_map, &conn, &tp, BPF_ANY);
+    const enum incoming_trace_update_result result =
+        update_incoming_trace(&conn, &tp, tcp_sequence, netns);
+    if (java_remote_parent_enabled) {
+        if (result == k_incoming_trace_ambiguous) {
+            java_remote_parent_mark_connection_ambiguous_in_netns(&conn, netns);
+            java_remote_parent_stat_add(k_java_remote_parent_stat_stage_ambiguous);
+        } else if (result == k_incoming_trace_update_failed) {
+            java_remote_parent_stat_add(k_java_remote_parent_stat_stage_overload);
+        }
+    }
+}
+
+static __always_inline void bpf_sock_ops_state_cb(struct bpf_sock_ops *skops) {
+    if (!java_remote_parent_enabled || skops->args[1] != BPF_TCP_CLOSE) {
+        return;
+    }
+
+    connection_info_t conn = get_connection_info_ops(skops);
+    sort_connection_info(&conn);
+    const u32 netns = sock_port_ns_from_sk((const struct sock *)(long)skops->sk).netns;
+    delete_strict_incoming_trace(&conn, netns);
+    java_remote_parent_mark_connection_ambiguous_in_netns(&conn, netns);
 }
 
 // Tracks all outgoing sockets (BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB)
@@ -532,6 +640,9 @@ int obi_sockmap_tracker(struct bpf_sock_ops *skops) {
         break;
     case BPF_SOCK_OPS_PARSE_HDR_OPT_CB:
         bpf_sock_ops_parse_hdr_cb(skops);
+        break;
+    case BPF_SOCK_OPS_STATE_CB:
+        bpf_sock_ops_state_cb(skops);
         break;
     default:
         break;
@@ -1093,7 +1204,6 @@ int obi_packet_extender_find_existing_tp(struct sk_msg_md *msg) {
             assign_parent_tp(t_ctx, &tp_p->tp, span_id);
 
             tp_p->tp.ts = bpf_ktime_get_ns();
-            tp_p->tp.flags = 1;
             tp_p->valid = 1;
             tp_p->written = 1;
             tp_p->pid = t_ctx->p_conn.pid;

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"maps"
 	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"strings"
@@ -305,7 +306,7 @@ discovery:
 			AvoidedServices: imetrics.AvoidedServicesConfig{
 				Limit: avoidedsvc.DefaultLimit,
 			},
-			Prometheus: imetrics.PrometheusConfig{
+			Prometheus: imetrics.InternalPrometheusConfig{
 				Port: 3210,
 				Path: "/internal/metrics",
 			},
@@ -384,6 +385,13 @@ discovery:
 		Java: JavaConfig{
 			Enabled: true,
 			Timeout: 10 * time.Second,
+			RemoteParent: JavaRemoteParentConfig{
+				Transport:     JavaRemoteParentDisabled,
+				SocketPath:    "/var/run/obi/java-remote-parent.sock",
+				SocketGroupID: -1,
+				Timeout:       50 * time.Millisecond,
+				TTL:           30 * time.Second,
+			},
 		},
 		JVMRuntimeMetrics: JVMRuntimeMetricsConfig{
 			SamplingInterval: time.Second,
@@ -524,6 +532,86 @@ jvm_runtime_metrics:
 	err = cfg.Validate()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "jvm_runtime_metrics.sampling_interval")
+}
+
+func TestConfig_JavaRemoteParent(t *testing.T) {
+	cfg, err := LoadConfig(bytes.NewBufferString(`
+javaagent:
+  remote_parent:
+    transport: unix
+    socket_path: /run/obi/bridge.sock
+    socket_group_id: 1234
+    timeout: 7ms
+    ttl: 45s
+`))
+	require.NoError(t, err)
+	assert.Equal(t, JavaRemoteParentUnix, cfg.Java.RemoteParent.Transport)
+	assert.Equal(t, "/run/obi/bridge.sock", cfg.Java.RemoteParent.SocketPath)
+	assert.Equal(t, 1234, cfg.Java.RemoteParent.SocketGroupID)
+	assert.Equal(t, 7*time.Millisecond, cfg.Java.RemoteParent.Timeout)
+	assert.Equal(t, 45*time.Second, cfg.Java.RemoteParent.TTL)
+
+	t.Setenv("OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT", "getsockopt")
+	t.Setenv("OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_PATH", "/run/obi/env.sock")
+	cfg, err = LoadConfig(bytes.NewReader(nil))
+	require.NoError(t, err)
+	assert.Equal(t, JavaRemoteParentGetsockopt, cfg.Java.RemoteParent.Transport)
+	assert.Equal(t, "/run/obi/env.sock", cfg.Java.RemoteParent.SocketPath)
+}
+
+func TestConfigValidate_JavaRemoteParent(t *testing.T) {
+	cfg, err := LoadConfig(bytes.NewBufferString(`
+executable_path: java
+trace_printer: text
+ebpf:
+  context_propagation: tcp
+javaagent:
+  remote_parent:
+    transport: getsockopt
+    socket_path: ""
+`))
+	require.NoError(t, err)
+	require.NoError(t, cfg.Validate())
+
+	tests := map[string]string{
+		"transport":   "transport: invalid",
+		"socket path": "transport: unix\n    socket_path: relative.sock",
+		"timeout":     "transport: unix\n    timeout: 0s",
+		"timeout max": "transport: unix\n    timeout: 2147483648ms",
+		"socket gid":  "transport: unix\n    socket_group_id: -2",
+		"ttl":         "transport: unix\n    ttl: 0s",
+	}
+
+	for name, remoteParent := range tests {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := LoadConfig(bytes.NewBufferString("executable_path: java\ntrace_printer: text\nebpf:\n  context_propagation: tcp\njavaagent:\n  remote_parent:\n    " + remoteParent + "\n"))
+			require.NoError(t, err)
+			require.Error(t, cfg.Validate())
+		})
+	}
+}
+
+func TestConfigValidatePreservesJavaRemoteParentSocketAlias(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "run")
+	require.NoError(t, os.Mkdir(target, 0o700))
+	alias := filepath.Join(root, "var-run")
+	require.NoError(t, os.Symlink(target, alias))
+	socketPath := filepath.Join(alias, "obi", "bridge.sock")
+
+	cfg, err := LoadConfig(bytes.NewBufferString(fmt.Sprintf(`
+executable_path: java
+trace_printer: text
+ebpf:
+  context_propagation: tcp
+javaagent:
+  remote_parent:
+    transport: unix
+    socket_path: %s
+`, socketPath)))
+	require.NoError(t, err)
+	require.NoError(t, cfg.Validate())
+	assert.Equal(t, socketPath, cfg.Java.RemoteParent.SocketPath)
 }
 
 func TestConfig_ExponentialHistogramConfigFromEnv(t *testing.T) {

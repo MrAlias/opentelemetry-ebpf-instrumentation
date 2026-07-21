@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"time"
@@ -275,7 +276,7 @@ var DefaultConfig = Config{
 		AvoidedServices: imetrics.AvoidedServicesConfig{
 			Limit: avoidedsvc.DefaultLimit,
 		},
-		Prometheus: imetrics.PrometheusConfig{
+		Prometheus: imetrics.InternalPrometheusConfig{
 			Port: 0, // disabled by default
 			Path: "/internal/metrics",
 		},
@@ -338,6 +339,13 @@ var DefaultConfig = Config{
 	Java: JavaConfig{
 		Enabled: true,
 		Timeout: 10 * time.Second,
+		RemoteParent: JavaRemoteParentConfig{
+			Transport:     JavaRemoteParentDisabled,
+			SocketPath:    "/var/run/obi/java-remote-parent.sock",
+			SocketGroupID: -1,
+			Timeout:       50 * time.Millisecond,
+			TTL:           30 * time.Second,
+		},
 	},
 	JVMRuntimeMetrics: JVMRuntimeMetricsConfig{
 		SamplingInterval: time.Second,
@@ -650,10 +658,32 @@ type NodeJSConfig struct {
 }
 
 type JavaConfig struct {
-	Enabled              bool          `yaml:"enabled" env:"OTEL_EBPF_JAVAAGENT_ENABLED"`
-	Debug                bool          `yaml:"debug" env:"OTEL_EBPF_JAVAAGENT_DEBUG"`
-	DebugInstrumentation bool          `yaml:"debug_instrumentation" env:"OTEL_EBPF_JAVAAGENT_DEBUG_INSTRUMENTATION"`
-	Timeout              time.Duration `yaml:"attach_timeout" env:"OTEL_EBPF_JAVAAGENT_ATTACH_TIMEOUT" validate:"gte=0"`
+	Enabled              bool                   `yaml:"enabled" env:"OTEL_EBPF_JAVAAGENT_ENABLED"`
+	Debug                bool                   `yaml:"debug" env:"OTEL_EBPF_JAVAAGENT_DEBUG"`
+	DebugInstrumentation bool                   `yaml:"debug_instrumentation" env:"OTEL_EBPF_JAVAAGENT_DEBUG_INSTRUMENTATION"`
+	Timeout              time.Duration          `yaml:"attach_timeout" env:"OTEL_EBPF_JAVAAGENT_ATTACH_TIMEOUT" validate:"gte=0"`
+	RemoteParent         JavaRemoteParentConfig `yaml:"remote_parent"`
+}
+
+type JavaRemoteParentTransport string
+
+const (
+	JavaRemoteParentDisabled   JavaRemoteParentTransport = "disabled"
+	JavaRemoteParentAuto       JavaRemoteParentTransport = "auto"
+	JavaRemoteParentGetsockopt JavaRemoteParentTransport = "getsockopt"
+	JavaRemoteParentUnix       JavaRemoteParentTransport = "unix"
+)
+
+type JavaRemoteParentConfig struct {
+	Transport     JavaRemoteParentTransport `yaml:"transport" env:"OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT" validate:"omitempty,oneof=disabled auto getsockopt unix"`
+	SocketPath    string                    `yaml:"socket_path" env:"OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_PATH"`
+	SocketGroupID int                       `yaml:"socket_group_id" env:"OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_GROUP_ID" validate:"gte=-1"`
+	Timeout       time.Duration             `yaml:"timeout" env:"OTEL_EBPF_JAVA_REMOTE_PARENT_TIMEOUT" validate:"gte=0"`
+	TTL           time.Duration             `yaml:"ttl" env:"OTEL_EBPF_JAVA_REMOTE_PARENT_TTL" validate:"gte=0"`
+}
+
+func (c JavaRemoteParentConfig) Enabled() bool {
+	return c.Transport != "" && c.Transport != JavaRemoteParentDisabled
 }
 
 type JVMRuntimeMetricsConfig struct {
@@ -687,6 +717,29 @@ func (c *Config) Validate() error {
 
 	if c.JVMRuntimeMetrics.SamplingInterval <= 0 {
 		return ConfigError("jvm_runtime_metrics.sampling_interval must be greater than 0")
+	}
+
+	if c.Java.RemoteParent.Enabled() {
+		if !c.Java.Enabled {
+			return ConfigError("javaagent.remote_parent requires javaagent.enabled")
+		}
+		if !c.EBPF.ContextPropagation.HasTCP() {
+			return ConfigError("javaagent.remote_parent requires TCP context propagation")
+		}
+		if (c.Java.RemoteParent.Transport == JavaRemoteParentAuto ||
+			c.Java.RemoteParent.Transport == JavaRemoteParentUnix) &&
+			!filepath.IsAbs(c.Java.RemoteParent.SocketPath) {
+			return ConfigError("javaagent.remote_parent.socket_path must be an absolute path")
+		}
+		if c.Java.RemoteParent.Timeout <= 0 {
+			return ConfigError("javaagent.remote_parent.timeout must be greater than 0")
+		}
+		if c.Java.RemoteParent.Timeout > time.Duration(1<<31-1)*time.Millisecond {
+			return ConfigError("javaagent.remote_parent.timeout must not exceed 2147483647ms")
+		}
+		if c.Java.RemoteParent.TTL <= 0 {
+			return ConfigError("javaagent.remote_parent.ttl must be greater than 0")
+		}
 	}
 
 	if err := c.Discovery.Validate(); err != nil {

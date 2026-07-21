@@ -71,6 +71,22 @@ func TestGatherOffsets(t *testing.T) {
 	}
 }
 
+func TestReportKprobeAttachResult(t *testing.T) {
+	expected := errors.New("attach failed")
+	var observed error
+	reportKprobeAttachResult(ebpfcommon.ProbeDesc{
+		AttachResult: func(err error) { observed = err },
+	}, expected)
+
+	require.ErrorIs(t, observed, expected)
+
+	observed = expected
+	reportKprobeAttachResult(ebpfcommon.ProbeDesc{
+		AttachResult: func(err error) { observed = err },
+	}, nil)
+	assert.NoError(t, observed)
+}
+
 func TestGatherOffsetsResolvesSymbolSubstring(t *testing.T) {
 	reader := bytes.NewReader(testData())
 	assert.NotNil(t, reader)

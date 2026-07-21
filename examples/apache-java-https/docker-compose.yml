@@ -1,0 +1,160 @@
+x-demo-labels: &demo-labels
+  io.opentelemetry.obi.apache-java-https.owner: acceptance-demo-v1
+
+services:
+  socket-init:
+    image: httpd:2.4.68-alpine@sha256:1b766f17b84026429b7cb243317b142921b24432336e798bc881c43f45ed9567
+    network_mode: none
+    user: "0:0"
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - chown 0:0 /var/run/obi && chmod 0750 /var/run/obi
+    volumes:
+      - java-remote-parent-socket:/var/run/obi
+    labels: *demo-labels
+    restart: "no"
+
+  trace-receiver:
+    build:
+      context: ../..
+      dockerfile: examples/apache-java-https/tracecheck/Dockerfile
+    image: obi-apache-java-https-tracecheck:local
+    network_mode: host
+    environment:
+      LISTEN_ADDRESS: 127.0.0.1:14318
+      MAX_SPANS: "10000"
+      MAX_VALUE_BYTES: "4096"
+      MAX_RETAINED_BYTES: "67108864"
+    labels: *demo-labels
+    restart: "no"
+
+  java-backend:
+    build:
+      context: .
+      dockerfile: java/Dockerfile
+    image: obi-apache-java-https-backend:local
+    network_mode: host
+    environment:
+      HTTPS_PORT: "18443"
+      TLS_KEYSTORE_PATH: /run/obi-demo/certs/server.p12
+      TLS_KEYSTORE_PASSWORD: changeit
+      TLS_PROTOCOL: ${BACKEND_TLS_PROTOCOL:-TLSv1.3}
+      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS_VALUE--javaagent:/otel/official-javaagent.jar}
+      OTEL_JAVAAGENT_EXTENSIONS: ${OTEL_JAVAAGENT_EXTENSIONS_VALUE-/otel/obi-otel-extension.jar}
+      OTEL_PROPAGATORS: ${OTEL_PROPAGATORS_VALUE:-obi,tracecontext,baggage}
+      OTEL_OBI_REMOTE_PARENT_ENABLED: ${EXTENSION_ENABLED:-true}
+      OTEL_TRACES_SAMPLER: always_on
+      OTEL_SERVICE_NAME: java-backend
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://127.0.0.1:14318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_BSP_SCHEDULE_DELAY: "100"
+      OTEL_BSP_EXPORT_TIMEOUT: "5000"
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
+      OTEL_INSTRUMENTATION_HTTP_SERVER_CAPTURE_REQUEST_HEADERS: x-obi-demo-id
+      OTEL_INSTRUMENTATION_HTTP_SERVER_EXCLUDE_PATTERNS: /obi-diagnostics
+    volumes:
+      - ./.runtime/certs/server.p12:/run/obi-demo/certs/server.p12:ro
+      - java-remote-parent-socket:/var/run/obi
+    depends_on:
+      socket-init:
+        condition: service_completed_successfully
+      trace-receiver:
+        condition: service_started
+    labels: *demo-labels
+    restart: "no"
+
+  apache-proxy:
+    image: httpd:2.4.68-alpine@sha256:1b766f17b84026429b7cb243317b142921b24432336e798bc881c43f45ed9567
+    network_mode: host
+    environment:
+      BACKEND_TLS_PROTOCOL: ${BACKEND_TLS_PROTOCOL:-TLSv1.3}
+    volumes:
+      - ./apache/httpd.conf:/usr/local/apache2/conf/httpd.conf:ro
+      - ./.runtime/certs/ca.crt:/run/obi-demo/certs/ca.crt:ro
+    depends_on:
+      - java-backend
+    labels: *demo-labels
+    restart: "no"
+
+  obi:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        RELEASE_VERSION: apache-java-https-demo
+        RELEASE_REVISION: local
+    image: obi-apache-java-https:local
+    command:
+      - --config=/config/obi.yaml
+    network_mode: host
+    pid: host
+    privileged: true
+    environment:
+      OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT: ${BRIDGE_TRANSPORT:-getsockopt}
+      OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_PATH: /var/run/obi/java-remote-parent.sock
+      OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_GROUP_ID: "0"
+      OTEL_EBPF_JAVA_REMOTE_PARENT_TIMEOUT: 50ms
+      OTEL_EBPF_JAVA_REMOTE_PARENT_TTL: 30s
+      OTEL_EBPF_BPF_CONTEXT_PROPAGATION: ${CONTEXT_PROPAGATION:-tcp}
+    volumes:
+      - ./configs/obi.yaml:/config/obi.yaml:ro
+      - java-remote-parent-socket:/var/run/obi
+      - /sys/fs/cgroup:/sys/fs/cgroup:ro
+      - /sys/kernel/security:/sys/kernel/security:ro
+    depends_on:
+      apache-proxy:
+        condition: service_started
+      java-backend:
+        condition: service_started
+      socket-init:
+        condition: service_completed_successfully
+      trace-receiver:
+        condition: service_started
+    labels: *demo-labels
+    restart: "no"
+
+  scenario:
+    image: obi-apache-java-https-tracecheck:local
+    network_mode: host
+    entrypoint:
+      - /trace-scenario
+    profiles:
+      - tools
+    labels: *demo-labels
+
+  map-pressure:
+    image: obi-apache-java-https-tracecheck:local
+    network_mode: none
+    privileged: true
+    entrypoint:
+      - /map-pressure
+    profiles:
+      - tools
+    labels: *demo-labels
+
+  bridge-fault:
+    image: obi-apache-java-https-tracecheck:local
+    network_mode: none
+    user: "0:0"
+    environment:
+      FAULT_MODE: ${FAULT_MODE:-alternating}
+    entrypoint:
+      - /fault-bridge
+      - --socket
+      - /var/run/obi/java-remote-parent.sock
+    volumes:
+      - java-remote-parent-socket:/var/run/obi
+    profiles:
+      - tools
+    labels: *demo-labels
+
+volumes:
+  java-remote-parent-socket:
+    labels: *demo-labels
+
+networks:
+  default:
+    labels: *demo-labels

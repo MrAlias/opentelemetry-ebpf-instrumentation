@@ -69,10 +69,12 @@ Each release includes:
 - `obi-v<version>-linux-amd64.tar.gz` - Linux AMD64/x86_64 archive
 - `obi-v<version>-linux-arm64.tar.gz` - Linux ARM64 archive
 - `obi-v<version>-source-generated.tar.gz` - generated source archive
+- `obi-otel-extension-v<version>.jar` - external OpenTelemetry Java-agent propagator extension
 - `obi-v<version>-linux-amd64.cyclonedx.json` - CycloneDX SBOM for the AMD64 archive
 - `obi-v<version>-linux-arm64.cyclonedx.json` - CycloneDX SBOM for the ARM64 archive
 - `obi-v<version>-source-generated.cyclonedx.json` - CycloneDX SBOM for the source-generated archive
 - `obi-java-agent-v<version>.cyclonedx.json` - CycloneDX SBOM for the embedded Java agent and its Java dependencies
+- `obi-otel-extension-v<version>.cyclonedx.json` - CycloneDX SBOM for the external OpenTelemetry Java-agent extension
 - `SHA256SUMS` - Checksums for verification of the release archives and SBOM assets
 - `<asset>.bundle.json` - Sigstore bundle for each signed archive, SBOM, and `SHA256SUMS`
 
@@ -182,6 +184,9 @@ wget "${BASE_URL}/obi-${RELEASE_TAG}-linux-${ARCH}.cyclonedx.json"
 # SBOM for the embedded Java agent and its Java dependencies
 wget "${BASE_URL}/obi-java-agent-${RELEASE_TAG}.cyclonedx.json"
 
+# SBOM for the external OpenTelemetry Java-agent extension
+wget "${BASE_URL}/obi-otel-extension-${RELEASE_TAG}.cyclonedx.json"
+
 # Optional: verify the downloaded SBOM files against SHA256SUMS too
 sha256sum -c "${CHECKSUMS}" --ignore-missing
 ```
@@ -200,6 +205,9 @@ grype sbom:obi-v${VERSION}-linux-${ARCH}.cyclonedx.json
 
 # Inspect the Java agent dependency graph
 jq '.components[] | {name, version}' obi-java-agent-v${VERSION}.cyclonedx.json
+
+# Inspect the external extension inventory
+jq '.components[] | {name, version}' obi-otel-extension-v${VERSION}.cyclonedx.json
 ```
 
 #### Install to System

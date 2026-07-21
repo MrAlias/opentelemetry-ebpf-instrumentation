@@ -9,4 +9,5 @@ pkg/internal/java/**/build/
 pkg/internal/java/**/target/
 pkg/internal/java/**/out/
 pkg/internal/java/loader/src/main/resources/agent/
+examples/apache-java-https/.runtime/
 .git/objects/

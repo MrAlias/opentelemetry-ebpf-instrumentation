@@ -7,6 +7,7 @@ on:
     branches: ["main", "release-*"]
     paths:
       - "pkg/internal/java/**"
+      - "examples/apache-java-https/**"
       - ".dockerignore"
       - "javaagent.Dockerfile"
       - ".github/workflows/java-agent.yml"
@@ -92,6 +93,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
 
+      - name: Validate Apache-to-Java HTTPS harness
+        if: matrix.test-java == 21
+        working-directory: .
+        run: |
+          ./examples/apache-java-https/certs/generate_test.sh
+          ./examples/apache-java-https/scripts/run_test.sh
+          docker compose \
+            --project-name obi-apache-java-https \
+            --file examples/apache-java-https/docker-compose.yml \
+            config --quiet
+
       - name: Check code formatting (Spotless)
         env:
           JAVA_HOME: ${{ steps.gradle-jdk.outputs.path }}
@@ -150,6 +162,37 @@ jobs:
           EOF
 
           gradle test -I /tmp/obi-test-jvm.init.gradle --no-daemon --stacktrace
+
+      - name: Verify official Java agent compatibility
+        working-directory: .
+        env:
+          JAVA_HOME: ${{ steps.gradle-jdk.outputs.path }}
+          OBI_TEST_JAVA_HOME: ${{ steps.test-jdk.outputs.path }}
+        run: |
+          cat > /tmp/obi-agent-compatibility-jvm.init.gradle <<'EOF'
+          allprojects {
+            tasks.withType(Test).configureEach {
+              executable = System.getenv("OBI_TEST_JAVA_HOME") + "/bin/java"
+            }
+          }
+          EOF
+
+          ./examples/apache-java-https/scripts/download-agent.sh \
+            --distribution otel \
+            --output /tmp/obi-agent-compatibility/otel/artifacts
+          ./examples/apache-java-https/scripts/download-agent.sh \
+            --distribution splunk \
+            --output /tmp/obi-agent-compatibility/splunk/artifacts
+
+          OBI_TEST_OTEL_AGENT=/tmp/obi-agent-compatibility/otel/artifacts/official-javaagent.jar \
+          OBI_TEST_SPLUNK_AGENT=/tmp/obi-agent-compatibility/splunk/artifacts/official-javaagent.jar \
+            gradle \
+              -p pkg/internal/java \
+              :extension:test \
+              --tests '*OfficialAgentCompatibilityTest' \
+              -I /tmp/obi-agent-compatibility-jvm.init.gradle \
+              --no-daemon \
+              --stacktrace
 
       - name: Upload build artifacts
         if: matrix.test-java == 21

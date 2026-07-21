@@ -1,0 +1,5 @@
+.runtime/*
+!.runtime/artifacts/
+.runtime/artifacts/*
+!.runtime/artifacts/official-javaagent.jar
+!.runtime/artifacts/obi-otel-extension.jar

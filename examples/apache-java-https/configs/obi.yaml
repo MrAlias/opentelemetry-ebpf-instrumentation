@@ -1,0 +1,65 @@
+routes:
+  patterns:
+    - /healthz
+    - /api/echo
+    - /api/handoff
+    - /api/virtual
+    - /api/netty
+    - /api/dispatch
+    - /api/obi-flags
+  unmatched: path
+
+otel_traces_export:
+  endpoint: http://127.0.0.1:14318
+
+internal_metrics:
+  exporter: prometheus
+  bpf_metric_scrape_interval: 1s
+  prometheus:
+    address: 127.0.0.1
+    port: 18990
+    path: /internal/metrics
+
+attributes:
+  select:
+    "*":
+      include: ["*"]
+
+ebpf:
+  context_propagation: tcp
+  payload_extraction:
+    http:
+      enrichment:
+        enabled: true
+        policy:
+          default_action:
+            headers: exclude
+            body: exclude
+        rules:
+          - action: include
+            type: headers
+            scope: all
+            match:
+              patterns:
+                - X-OBI-Demo-ID
+              case_sensitive: false
+
+javaagent:
+  remote_parent:
+    transport: disabled
+    socket_path: /var/run/obi/java-remote-parent.sock
+    socket_group_id: 0
+    timeout: 50ms
+    ttl: 30s
+
+discovery:
+  exclude_otel_instrumented_services: true
+  instrument:
+    - namespace: apache-java-https
+      name: apache-proxy
+      open_ports: 18080
+    - namespace: apache-java-https
+      name: java-backend
+      open_ports: 18443
+
+log_level: info

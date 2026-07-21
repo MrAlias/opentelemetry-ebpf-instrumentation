@@ -1,0 +1,26 @@
+[ req ]
+prompt = no
+distinguished_name = server_dn
+
+[ server_dn ]
+CN = localhost
+O = OBI Apache Java HTTPS Demo
+
+[ v3_ca ]
+basicConstraints = critical, CA:true, pathlen:0
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always
+
+[ v3_server ]
+basicConstraints = critical, CA:false
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
+subjectAltName = @server_alt_names
+
+[ server_alt_names ]
+DNS.1 = localhost
+DNS.2 = java-backend
+IP.1 = 127.0.0.1

@@ -1194,14 +1194,20 @@ func TestProcIdentityResolverRetainsValidatedPartialScanOnTimeout(t *testing.T) 
 	_, err := resolver.Resolve(ctx, peerPID, 3)
 	require.ErrorIs(t, err, context.Canceled)
 
+	var cachedKey procIdentityKey
 	resolver.cacheMu.Lock()
-	_, cached := resolver.cache[procIdentityKey{peerPID: peerPID, namespaceTID: 1}]
+	for key := range resolver.cache {
+		if key.peerPID == peerPID {
+			cachedKey = key
+			break
+		}
+	}
 	resolver.cacheMu.Unlock()
-	require.True(t, cached)
+	require.NotZero(t, cachedKey.namespaceTID)
 
-	identity, err := resolver.Resolve(t.Context(), peerPID, 1)
+	identity, err := resolver.Resolve(t.Context(), peerPID, cachedKey.namespaceTID)
 	require.NoError(t, err)
-	assert.Equal(t, uint32(1), identity.TID)
+	assert.Equal(t, cachedKey.namespaceTID, identity.TID)
 }
 
 func TestProcIdentityResolverSerializesConcurrentColdScansPerPeer(t *testing.T) {

@@ -98,9 +98,10 @@ and zero-span-ID responses while valid W3C context remains authoritative.
 - Internet access for pinned container images, Maven dependencies, and the
   selected official Java agent.
 
-OBI uses host PID and network namespaces, mounts cgroup and security filesystems
-read-only, and runs privileged. Review the Compose file before granting those
-permissions.
+OBI uses host PID and network namespaces, mounts cgroup, security, tracefs, and
+debugfs read-only, and runs privileged. The tracing mounts let OBI resolve the
+kernel tracepoints required by TCP context propagation. Review the Compose file
+before granting those permissions.
 
 Validate the non-privileged harness logic before a run:
 

@@ -104,6 +104,8 @@ services:
       - java-remote-parent-socket:/var/run/obi
       - /sys/fs/cgroup:/sys/fs/cgroup:ro
       - /sys/kernel/security:/sys/kernel/security:ro
+      - /sys/kernel/tracing:/sys/kernel/tracing:ro
+      - /sys/kernel/debug:/sys/kernel/debug:ro
     depends_on:
       apache-proxy:
         condition: service_started

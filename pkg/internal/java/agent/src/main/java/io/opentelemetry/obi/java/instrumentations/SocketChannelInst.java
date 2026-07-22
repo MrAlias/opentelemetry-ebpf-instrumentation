@@ -32,7 +32,10 @@ public class SocketChannelInst {
         .and(ElementMatchers.not(ElementMatchers.isAbstract()))
         .and(ElementMatchers.not(ElementMatchers.isInterface()))
         .and(ElementMatchers.declaresField(ElementMatchers.named("localAddress")))
-        .and(ElementMatchers.declaresField(ElementMatchers.named("remoteAddress")));
+        .and(ElementMatchers.declaresField(ElementMatchers.named("remoteAddress")))
+        .and(
+            ElementMatchers.declaresField(
+                ElementMatchers.named("fdVal").and(ElementMatchers.fieldType(int.class))));
   }
 
   public static boolean matches(Class<?> clazz) {
@@ -84,11 +87,11 @@ public class SocketChannelInst {
 
     @Advice.OnMethodExit(suppress = Throwable.class)
     public static void write(
-        @Advice.This final SocketChannel channel,
         @Advice.Argument(0) final ByteBuffer src,
         @Advice.Enter int savedPos,
         @Advice.FieldValue("localAddress") SocketAddress localSocket,
-        @Advice.FieldValue("remoteAddress") SocketAddress remoteSocket) {
+        @Advice.FieldValue("remoteAddress") SocketAddress remoteSocket,
+        @Advice.FieldValue("fdVal") int socketFileDescriptor) {
 
       if (!(localSocket instanceof InetSocketAddress)
           || !(remoteSocket instanceof InetSocketAddress)) {
@@ -127,7 +130,7 @@ public class SocketChannelInst {
               inetSocketAddress.getPort(),
               remoteSocketAddress.getAddress(),
               remoteSocketAddress.getPort(),
-              BootstrapNative.socketFileDescriptor(channel.socket()));
+              socketFileDescriptor);
 
       NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize + unencrypted.len);
       int wOff = IOCTLPacket.writePacketPrefix(p, 0, OperationType.SEND, c, unencrypted.len);
@@ -156,11 +159,11 @@ public class SocketChannelInst {
 
     @Advice.OnMethodExit(suppress = Throwable.class)
     public static void write(
-        @Advice.This final SocketChannel channel,
         @Advice.Argument(0) final ByteBuffer[] srcs,
         @Advice.Enter int[] savedSrcPositions,
         @Advice.FieldValue("localAddress") SocketAddress localSocket,
-        @Advice.FieldValue("remoteAddress") SocketAddress remoteSocket) {
+        @Advice.FieldValue("remoteAddress") SocketAddress remoteSocket,
+        @Advice.FieldValue("fdVal") int socketFileDescriptor) {
       if (!(localSocket instanceof InetSocketAddress)
           || !(remoteSocket instanceof InetSocketAddress)
           || (srcs == null)) {
@@ -209,7 +212,7 @@ public class SocketChannelInst {
               inetSocketAddress.getPort(),
               remoteSocketAddress.getAddress(),
               remoteSocketAddress.getPort(),
-              BootstrapNative.socketFileDescriptor(channel.socket()));
+              socketFileDescriptor);
 
       NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize + unencrypted.len);
       int wOff = IOCTLPacket.writePacketPrefix(p, 0, OperationType.SEND, c, unencrypted.len);
@@ -221,10 +224,10 @@ public class SocketChannelInst {
   public static final class ReadAdvice {
     @Advice.OnMethodExit(suppress = Throwable.class)
     public static void read(
-        @Advice.This final SocketChannel channel,
         @Advice.Argument(0) final ByteBuffer dst,
         @Advice.FieldValue("localAddress") SocketAddress localSocket,
-        @Advice.FieldValue("remoteAddress") SocketAddress remoteSocket) {
+        @Advice.FieldValue("remoteAddress") SocketAddress remoteSocket,
+        @Advice.FieldValue("fdVal") int socketFileDescriptor) {
       if (!(localSocket instanceof InetSocketAddress)
           || !(remoteSocket instanceof InetSocketAddress)
           || (dst == null)) {
@@ -239,7 +242,7 @@ public class SocketChannelInst {
               localSocketAddress.getPort(),
               remoteSocketAddress.getAddress(),
               remoteSocketAddress.getPort(),
-              BootstrapNative.socketFileDescriptor(channel.socket()));
+              socketFileDescriptor);
 
       String bufKey = ByteBufferExtractor.keyFromUsedBuffer(dst);
       SSLStorage.setConnectionForBuf(bufKey, c);
@@ -252,10 +255,10 @@ public class SocketChannelInst {
   public static final class ReadAdviceArray {
     @Advice.OnMethodExit(suppress = Throwable.class)
     public static void read(
-        @Advice.This final SocketChannel channel,
         @Advice.Argument(0) final ByteBuffer[] dsts,
         @Advice.FieldValue("localAddress") SocketAddress localSocket,
-        @Advice.FieldValue("remoteAddress") SocketAddress remoteSocket) {
+        @Advice.FieldValue("remoteAddress") SocketAddress remoteSocket,
+        @Advice.FieldValue("fdVal") int socketFileDescriptor) {
       if (!(localSocket instanceof InetSocketAddress)
           || !(remoteSocket instanceof InetSocketAddress)
           || (dsts == null)) {
@@ -270,7 +273,7 @@ public class SocketChannelInst {
               localSocketAddress.getPort(),
               remoteSocketAddress.getAddress(),
               remoteSocketAddress.getPort(),
-              BootstrapNative.socketFileDescriptor(channel.socket()));
+              socketFileDescriptor);
 
       ByteBuffer dstBuffer =
           ByteBufferExtractor.flattenUsedByteBufferArray(dsts, ByteBufferExtractor.MAX_KEY_SIZE);

@@ -7,7 +7,7 @@
 #include <common/java_remote_parent.h>
 #include <common/tcp_traceparent.h>
 
-enum { BPF_ANY = 0, BPF_NOEXIST = 1 };
+enum { BPF_ANY = 0, BPF_NOEXIST = 1, BPF_EXIST = 2 };
 
 static long
 fallback_map_update(void *map, const void *key, const void *value, unsigned long long flags);
@@ -133,11 +133,26 @@ static void test_observation_age_fails_closed(void) {
     }
 }
 
+static void test_registered_process_reserves_incoming_claim_for_lifecycle(void) {
+    tp_info_pid_t incoming = {};
+    u64 generation = 0;
+
+    if (!java_remote_parent_incoming_claim_allowed(0, NULL, NULL) ||
+        java_remote_parent_incoming_claim_allowed(1, NULL, NULL) ||
+        java_remote_parent_incoming_claim_allowed(1, &incoming, NULL) ||
+        java_remote_parent_incoming_claim_allowed(1, NULL, &generation) ||
+        !java_remote_parent_incoming_claim_allowed(1, &incoming, &generation)) {
+        fprintf(stderr, "registered process incoming-claim reservation failed\n");
+        exit(1);
+    }
+}
+
 int main(void) {
     test_response_layout_and_zeroing();
     test_valid_context_fields();
     test_tcp_option_carries_flags();
     test_fallback_collision_does_not_overwrite();
     test_observation_age_fails_closed();
+    test_registered_process_reserves_incoming_claim_for_lifecycle();
     return 0;
 }

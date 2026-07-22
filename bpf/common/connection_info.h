@@ -96,6 +96,32 @@ typedef struct ssl_pid_connection_info {
     u8 _pad[6];
 } ssl_pid_connection_info_t;
 
+typedef struct ssl_pid_key {
+    u64 ssl;
+    u64 process_start_time;
+    u32 pid;
+    u32 _pad;
+} ssl_pid_key_t;
+
+typedef struct ssl_thread_key {
+    u64 pid_tgid;
+    u64 thread_start_time;
+} ssl_thread_key_t;
+
+static __always_inline ssl_thread_key_t ssl_thread_key(u64 pid_tgid, u64 thread_start_time) {
+    const ssl_thread_key_t key = {
+        .pid_tgid = pid_tgid,
+        .thread_start_time = thread_start_time,
+    };
+    return key;
+}
+
+_Static_assert(offsetof(ssl_pid_key_t, process_start_time) == 8,
+               "process-scoped SSL start time offset mismatch");
+_Static_assert(offsetof(ssl_pid_key_t, pid) == 16, "process-scoped SSL PID offset mismatch");
+_Static_assert(sizeof(ssl_pid_key_t) == 24, "process-scoped SSL key size mismatch");
+_Static_assert(sizeof(ssl_thread_key_t) == 16, "thread-scoped SSL key size mismatch");
+
 typedef struct connection_info_part {
     union {
         u8 addr[IP_V6_ADDR_LEN];

@@ -775,6 +775,7 @@ func assertConcurrentTakeIsOneShot(
 		nonce,
 	)
 	require.NoError(t, acknowledgeRemoteParentData(fd, nonce))
+	statsBefore := javaRemoteParentStats(t, maps.JavaRemoteParentStats)
 
 	type takeResult struct {
 		value  []byte
@@ -834,6 +835,11 @@ func assertConcurrentTakeIsOneShot(
 		)
 	}
 	require.Equal(t, 1, valid)
+	statsAfter := javaRemoteParentStats(t, maps.JavaRemoteParentStats)
+	assert.Equal(t,
+		statsBefore[javaRemoteParentStatHandoffValid]+1,
+		statsAfter[javaRemoteParentStatHandoffValid],
+	)
 	for _, worker := range workerKeys {
 		require.NoError(t, maps.JavaRemoteParentTasks.Delete(worker))
 	}

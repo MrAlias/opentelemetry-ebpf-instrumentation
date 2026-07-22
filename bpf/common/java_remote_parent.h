@@ -101,6 +101,11 @@ static __always_inline u8 java_remote_parent_observation_stale(u64 now,
     return now < observed_monotime_ns || (max_age_ns && now - observed_monotime_ns > max_age_ns);
 }
 
+static __always_inline u8 java_remote_parent_incoming_claim_allowed(
+    u8 process_registered, const tp_info_pid_t *incoming, const u64 *incoming_generation) {
+    return !process_registered || (incoming && incoming_generation);
+}
+
 static __always_inline void
 java_remote_parent_init_response(java_remote_parent_response_t *response,
                                  enum java_remote_parent_status status,

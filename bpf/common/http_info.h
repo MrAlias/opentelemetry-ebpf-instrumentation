@@ -11,6 +11,12 @@
 
 #define FULL_BUF_SIZE 256
 
+enum ssl_prewrite_local_state : u8 {
+    k_ssl_prewrite_local_none = 0,
+    k_ssl_prewrite_local_pending = 1,
+    k_ssl_prewrite_local_blocked = 2,
+};
+
 // Here we keep the information that is sent on the ring buffer
 typedef struct http_info {
     u8 flags; // Must be first, we use it to tell what kind of packet we have on the ring buffer
@@ -35,5 +41,14 @@ typedef struct http_info {
     u8 direction;
     u8 submitted;
     enum event_source_type event_source;
-    u8 _pad[2];
+    u8 ssl_prewrite_pending;
+    u8 _pad;
 } http_info_t;
+
+static __always_inline u8 ssl_prewrite_mark_local_blocked(http_info_t *info) {
+    if (!info || info->ssl_prewrite_pending == k_ssl_prewrite_local_blocked) {
+        return 0;
+    }
+    info->ssl_prewrite_pending = k_ssl_prewrite_local_blocked;
+    return 1;
+}

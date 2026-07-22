@@ -12,6 +12,7 @@
 #include <common/protocol_defs.h>
 #include <common/sock_port_ns.h>
 #include <common/sockaddr.h>
+#include <common/ssl_connection.h>
 #include <common/trace_key.h>
 #include <common/trace_parent.h>
 
@@ -43,6 +44,7 @@ enum {
     k_ioctl_java_process_register = 10,
     k_ioctl_java_vt_terminate = 11,
     k_ioctl_java_task_unlink = 12,
+    k_ioctl_java_tls_connection = 13,
 };
 
 enum { k_ioctl_invalid_op = 0xff };
@@ -109,7 +111,7 @@ static __always_inline int handle_java_ioctl(
         return 0;
     }
     const u8 op = cmd_to_op(op_cmd);
-    const u8 data_operation = op != k_ioctl_invalid_op;
+    const u8 data_operation = op != k_ioctl_invalid_op || op_cmd == k_ioctl_java_tls_connection;
     if (data_operation != data_only) {
         return 0;
     }
@@ -178,7 +180,7 @@ static __always_inline int handle_java_ioctl(
             bpf_map_delete_elem(&java_tasks, &carrier);
         }
 
-        bpf_dbg_printk("Java VT mount carrier=%d vt=%lld", carrier.tid, vt_id);
+        bpf_dbg_printk("Java virtual thread mount observed");
         if (!java_vt_publish_mount(&carrier, &mount_identity)) {
             bpf_map_delete_elem(&java_vt_threads, &carrier);
         }
@@ -212,7 +214,7 @@ static __always_inline int handle_java_ioctl(
         pid_key_t carrier = {0};
         task_tid(&carrier);
 
-        bpf_dbg_printk("Java VT unmount carrier=%d", carrier.tid);
+        bpf_dbg_printk("Java virtual thread unmount observed");
         if (java_remote_parent_enabled) {
             java_remote_parent_cleanup(&carrier);
             bpf_map_delete_elem(&java_tasks, &carrier);
@@ -267,6 +269,32 @@ static __always_inline int handle_java_ioctl(
         obi_ctx__del(id);
         return 0;
     }
+    case k_ioctl_java_tls_connection: {
+        if (!java_remote_parent_enabled) {
+            return 0;
+        }
+
+        connection_info_t claimed = {0};
+        if (bpf_probe_read_user(&claimed, sizeof(claimed), uarg + 1) != 0 ||
+            is_empty_connection_info(&claimed)) {
+            return 0;
+        }
+
+        pid_connection_info_t connection = {0};
+        u16 orig_dport = 0;
+        u32 connection_netns = 0;
+        u64 connection_netns_cookie = 0;
+        if (!java_connection_from_file(file,
+                                       TCP_RECV,
+                                       &connection.conn,
+                                       &orig_dport,
+                                       &connection_netns,
+                                       &connection_netns_cookie)) {
+            return 0;
+        }
+        mark_java_tls_connection(&claimed, &connection.conn, pid_from_pid_tgid(id));
+        return 0;
+    }
     case k_ioctl_java_threads:
     case k_ioctl_java_task_link: {
         u64 parent_id = 0;
@@ -302,7 +330,7 @@ static __always_inline int handle_java_ioctl(
                 bpf_map_delete_elem(&java_tasks, &child);
                 obi_ctx__del(id);
             }
-            bpf_dbg_printk("self referencing thread %d, not recording", child.tid);
+            bpf_dbg_printk("self-referencing Java thread mapping ignored");
             return 0;
         }
 
@@ -312,7 +340,7 @@ static __always_inline int handle_java_ioctl(
             java_remote_parent_mark_ambiguous(&parent);
             java_remote_parent_cancel_handoff(&logical_child, token);
             java_remote_parent_unlink_task(&logical_child);
-            bpf_dbg_printk("cyclic Java thread mapping [%d] -> [%d]", child.tid, parent.tid);
+            bpf_dbg_printk("cyclic Java thread mapping ignored");
             return 0;
         }
 
@@ -323,7 +351,7 @@ static __always_inline int handle_java_ioctl(
             }
         }
 
-        bpf_dbg_printk("Java thread mapping [%d] -> [%d]", parent.tid, child.tid);
+        bpf_dbg_printk("Java thread mapping recorded");
         bpf_map_update_elem(&java_tasks, &child, &parent, BPF_ANY);
         if (java_remote_parent_enabled) {
             if (op_cmd == k_ioctl_java_threads) {
@@ -390,7 +418,7 @@ static __always_inline int handle_java_ioctl(
 
         if (is_empty_connection_info(&p_conn.conn)) {
             const ssl_pid_connection_info_t *connection =
-                bpf_map_lookup_elem(&pid_tid_to_conn, &id);
+                lookup_pid_tid_connection(id, task_thread_start_time());
             if (connection) {
                 p_conn = connection->p_conn;
             }
@@ -445,7 +473,7 @@ static __always_inline int handle_java_ioctl(
         }
 
         const u64 zero = 0;
-        bpf_map_update_elem(&active_ssl_connections, &p_conn, &zero, BPF_ANY);
+        bpf_map_update_elem(&active_ssl_connections, &p_conn, &zero, BPF_NOEXIST);
         handle_java_buf_with_connection(
             ctx, &p_conn, buf, max_len, op, orig_dport, connection_netns, connection_netns_cookie);
     }

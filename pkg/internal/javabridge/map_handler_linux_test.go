@@ -181,6 +181,8 @@ func TestMinimizeDisabledMapsPreservesVirtualThreadTracingCapacity(t *testing.T)
 		"java_process_incarnations": {MaxEntries: 128},
 		"java_vt_identities":        {MaxEntries: 128},
 		"java_vt_threads":           {MaxEntries: 128},
+		"sk_ssl_prewrite_map":       {Type: ebpf.SkStorage},
+		"ssl_prewrite_tp":           {MaxEntries: 128},
 	}}
 
 	MinimizeDisabledMaps(spec)
@@ -190,9 +192,11 @@ func TestMinimizeDisabledMapsPreservesVirtualThreadTracingCapacity(t *testing.T)
 		"incoming_trace_candidates",
 		"incoming_trace_claims",
 		"incoming_trace_heads",
+		"ssl_prewrite_tp",
 	} {
 		assert.Equal(t, uint32(1), spec.Maps[name].MaxEntries, name)
 	}
+	assert.Equal(t, uint32(0), spec.Maps["sk_ssl_prewrite_map"].MaxEntries)
 	for _, name := range []string{
 		"java_authorized_processes",
 		"java_process_incarnations",

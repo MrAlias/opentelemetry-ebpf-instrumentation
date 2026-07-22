@@ -41,6 +41,12 @@ typedef struct protocol_selector {
 
 #define k_protocol_selector_all ((protocol_selector_t){.http = 1, .http2 = 1, .tcp = 1})
 
+enum call_protocol_flags : u32 {
+    k_call_protocol_flag_none = 0,
+    k_call_protocol_flag_ssl_prewrite = 1,
+    k_call_protocol_flag_ssl_postwrite_expected = 2,
+};
+
 typedef struct call_protocol_args {
     pid_connection_info_t pid_conn;
     enum protocol_type protocol_type;
@@ -56,9 +62,11 @@ typedef struct call_protocol_args {
     u32 connection_netns;
     u16 orig_dport;
     u16 _pad2;
-    u32 _pad3;
+    u32 flags;
     u64 connection_netns_cookie;
+    u64 ssl_ptr;
     u64 u_buf;
+    u64 ssl_handoff_id;
     u64 self_ref_parent_id;
     lw_thread_t lw_thread;
 } call_protocol_args_t;

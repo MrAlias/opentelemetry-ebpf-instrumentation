@@ -9,10 +9,15 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -25,6 +30,36 @@ import (
 
 // tpinjector has two BPF specs: the main tpinjector (spec 0) and the sock iterator (spec 1).
 const expectedSpecCount = 2
+
+func requireConnectionScopedSSLPrewriteMaps(t *testing.T, spec *ebpf.CollectionSpec) {
+	t.Helper()
+
+	require.NotContains(t, spec.Maps, "active_ssl_write_args")
+	for name, sizes := range map[string][2]uint32{
+		"ssl_prewrite_connection_ambiguity": {48, 16},
+		"ssl_prewrite_connection_claims":    {48, 40},
+		"ssl_prewrite_connection_owners":    {48, 40},
+	} {
+		mapSpec := spec.Maps[name]
+		require.NotNil(t, mapSpec, name)
+		require.Equal(t, ebpf.Hash, mapSpec.Type, name)
+		require.Equal(t, sizes[0], mapSpec.KeySize, name+" key size")
+		require.Equal(t, sizes[1], mapSpec.ValueSize, name+" value size")
+	}
+}
+
+func TestPacketExtenderAvoidsUnsupportedNetnsCookieHelper(t *testing.T) {
+	spec, err := LoadBpf()
+	require.NoError(t, err)
+	program := spec.Programs["obi_packet_extender"]
+	require.NotNil(t, program)
+
+	for _, instruction := range program.Instructions {
+		if instruction.IsBuiltinCall() {
+			require.NotEqual(t, asm.FnGetNetnsCookie, asm.BuiltinFunc(instruction.Constant))
+		}
+	}
+}
 
 func TestTracer_Constants(t *testing.T) {
 	tests := []struct {
@@ -145,6 +180,7 @@ func TestTracerJavaRemoteParentSpecSelection(t *testing.T) {
 	unixTracer.haveSockOpsNetnsCookie = func() error { return nil }
 	unixBundles, err := unixTracer.LoadSpecs()
 	require.NoError(t, err)
+	requireConnectionScopedSSLPrewriteMaps(t, unixBundles[0].Spec)
 	assert.NotNil(t, unixTracer.javaRemoteParentMapsSpec)
 	assert.Nil(t, unixTracer.javaRemoteParentSpec)
 
@@ -154,6 +190,7 @@ func TestTracerJavaRemoteParentSpecSelection(t *testing.T) {
 	autoTracer.haveSockOpsNetnsCookie = func() error { return nil }
 	autoBundles, err := autoTracer.LoadSpecs()
 	require.NoError(t, err)
+	requireConnectionScopedSSLPrewriteMaps(t, autoBundles[0].Spec)
 	require.Len(t, autoBundles, len(unixBundles))
 	assert.NotNil(t, autoTracer.javaRemoteParentMapsSpec)
 	assert.NotNil(t, autoTracer.javaRemoteParentSpec)
@@ -191,10 +228,62 @@ func TestJavaRemoteParentStatLabelsIdentifyTransport(t *testing.T) {
 		{transport: "getsockopt", operation: "negotiate", status: "missing"},
 		{transport: "getsockopt", operation: "negotiate", status: "unauthorized"},
 		{transport: "getsockopt", operation: "negotiate", status: "overload"},
+		{transport: "tcp", operation: "candidate", status: "ambiguous"},
+		{transport: "tcp", operation: "candidate", status: "overload"},
+		{transport: "tcp", operation: "handoff", status: "valid"},
+		{transport: "tcp", operation: "candidate", status: "valid"},
+		{transport: "tcp", operation: "candidate", status: "malformed"},
+		{transport: "tcp", operation: "inject", status: "valid"},
+		{transport: "tcp", operation: "inject", status: "missing"},
+		{transport: "tcp", operation: "inject", status: "stale"},
+		{transport: "tcp", operation: "inject", status: "ambiguous"},
+		{transport: "tcp", operation: "inject", status: "malformed"},
+		{transport: "tcp", operation: "inject", status: "overload"},
+		{transport: "tcp", operation: "inject", status: "segmented"},
 	}, javaRemoteParentStatLabels)
 	assert.Equal(t, "unauthorized", javaRemoteParentStatLabels[javaRemoteParentStatTakeUnauthorized].status)
 	assert.Equal(t, "valid", javaRemoteParentStatLabels[javaRemoteParentStatDiscardValid].status)
 	assert.Equal(t, "unauthorized", javaRemoteParentStatLabels[javaRemoteParentStatDiscardUnauthorized].status)
+}
+
+func TestJavaRemoteParentMetricCardinalityContract(t *testing.T) {
+	transports := map[string]struct{}{
+		"tcp":        {},
+		"getsockopt": {},
+		"unix":       {},
+		"disabled":   {},
+	}
+	operations := map[string]struct{}{
+		"stage":     {},
+		"candidate": {},
+		"handoff":   {},
+		"take":      {},
+		"discard":   {},
+		"negotiate": {},
+		"select":    {},
+		"cleanup":   {},
+		"evict":     {},
+		"inject":    {},
+	}
+	statuses := map[string]struct{}{}
+	for status := javabridge.StatusUnknown; status <= javabridge.StatusDisabled; status++ {
+		statuses[status.String()] = struct{}{}
+	}
+	statuses["segmented"] = struct{}{}
+
+	require.Len(t, transports, 4)
+	require.Len(t, operations, 10)
+	require.Len(t, statuses, 15)
+	assert.Equal(t, 600, len(transports)*len(operations)*len(statuses))
+
+	seen := map[javaRemoteParentStatLabel]struct{}{}
+	for _, label := range javaRemoteParentStatLabels {
+		assert.Contains(t, transports, label.transport)
+		assert.Contains(t, operations, label.operation)
+		assert.Contains(t, statuses, label.status)
+		assert.NotContains(t, seen, label)
+		seen[label] = struct{}{}
+	}
 }
 
 func TestDisabledJavaRemoteParentReportsSelectionOnce(t *testing.T) {
@@ -206,8 +295,9 @@ func TestDisabledJavaRemoteParentReportsSelectionOnce(t *testing.T) {
 		t.Fatal("disabled Java remote parent unexpectedly probed sockops helpers")
 		return nil
 	}
-	_, err := tracer.LoadSpecs()
+	bundles, err := tracer.LoadSpecs()
 	require.NoError(t, err)
+	requireConnectionScopedSSLPrewriteMaps(t, bundles[0].Spec)
 
 	stop := tracer.runJavaRemoteParent(context.Background())
 	stop()
@@ -232,6 +322,7 @@ func TestUnsupportedJavaRemoteParentKeepsTPInjectorLoadable(t *testing.T) {
 	bundles, err := tracer.LoadSpecs()
 	require.NoError(t, err)
 	require.NotEmpty(t, bundles)
+	requireConnectionScopedSSLPrewriteMaps(t, bundles[0].Spec)
 	assert.Equal(t, false, bundles[0].Constants["java_remote_parent_enabled"])
 	require.ErrorIs(t, tracer.javaRemoteParentSupportErr, unsupported)
 	assert.Nil(t, tracer.javaRemoteParentMapsSpec)
@@ -474,4 +565,183 @@ func TestJavaRemoteParentProcessExitCleanupIsRequired(t *testing.T) {
 	tracepoints := tracer.Tracepoints()
 	require.Contains(t, tracepoints, "sched/sched_process_exit")
 	assert.True(t, tracepoints["sched/sched_process_exit"].Required)
+
+	disabledConfig := obi.DefaultConfig
+	require.NoError(t, disabledConfig.EBPF.ContextPropagation.UnmarshalText([]byte("tcp")))
+	disabled := New(&disabledConfig, nil)
+	_, err = disabled.LoadSpecs()
+	require.NoError(t, err)
+	assert.NotContains(t, disabled.Tracepoints(), "sched/sched_process_exit")
+}
+
+func TestJavaRemoteParentBridgeModeProductionOrdering(t *testing.T) {
+	source := readTPInjectorSource(t)
+
+	packetExtender := sourceSection(
+		t,
+		source,
+		"int obi_packet_extender(struct sk_msg_md *msg)",
+		"int obi_packet_extender_write_msg_tp(struct sk_msg_md *msg)",
+	)
+	genericGate := sourcePosition(
+		t,
+		packetExtender,
+		"if (!tcp_traceparent_generic_injection_allowed(java_remote_parent_enabled))",
+	)
+	genericGateExit := genericGate + sourcePosition(
+		t,
+		packetExtender[genericGate:],
+		"return SK_PASS;",
+	)
+	legacyLookup := sourcePosition(t, packetExtender, "get_tp_info_pid(&e_key)")
+	goGRPCHandling := sourcePosition(t, packetExtender, "is_go_grpc_client_conn")
+	protocolDetection := sourcePosition(t, packetExtender, "protocol_detector(msg, id, &conn)")
+	http2Handling := sourcePosition(t, packetExtender, "wrap_http2_traceparent")
+	assert.Less(t, genericGate, legacyLookup)
+	assert.Less(t, genericGate, goGRPCHandling)
+	assert.Less(t, genericGate, protocolDetection)
+	assert.Less(t, genericGate, http2Handling)
+	genericDisabled := packetExtender[genericGate:genericGateExit]
+	assert.Contains(t, genericDisabled, "monitored_pid || is_go_grpc_client_conn")
+	assert.Contains(t, genericDisabled, "bpf_msg_pull_data(msg, 0, msg->size, 0)")
+	assert.Contains(t, genericDisabled, "fill_msg_buffers(msg, &t_ctx->p_conn, &e_key)")
+	assert.NotContains(t, genericDisabled, "protocol_detector")
+	assert.NotContains(t, genericDisabled, "bpf_tail_call_static")
+	assert.NotContains(t, genericDisabled, "bpf_msg_push_data")
+	assert.NotContains(t, genericDisabled, "schedule_write_tcp_option")
+	assert.NotContains(t, genericDisabled, "write_http_traceparent")
+
+	prewriteHandling := sourceSection(
+		t,
+		source,
+		"static __always_inline bool handle_ssl_prewrite",
+		"// Sock_msg program which detects packets",
+	)
+	assert.Contains(t, prewriteHandling, "ssl_prewrite_connection_owners")
+	assert.Contains(t, prewriteHandling, "ssl_prewrite_connection_ambiguity")
+	assert.NotContains(t, prewriteHandling, "active_ssl_write_args")
+
+	localCommit := sourceSection(
+		t,
+		source,
+		"commit_ssl_prewrite_transport_local",
+		"static __always_inline u8 ssl_prewrite_opt_len_matches_segment",
+	)
+	assert.Contains(
+		t,
+		localCommit,
+		"info->ssl_prewrite_pending != k_ssl_prewrite_local_pending",
+	)
+
+	existingParent := sourceSection(
+		t,
+		source,
+		"static __always_inline bool handle_existing_tp_pid",
+		"static __always_inline bool handle_ssl_prewrite",
+	)
+	legacySchedule := sourcePosition(t, existingParent, "schedule_write_tcp_option(msg, tp_pid, 0)")
+	invalidParent := sourcePosition(
+		t,
+		existingParent,
+		"if (!(action & k_tcp_traceparent_existing_parent_continue_plaintext))",
+	)
+	assert.Less(t, legacySchedule, invalidParent)
+	assert.Contains(
+		t,
+		existingParent[:invalidParent],
+		"tcp_traceparent_existing_parent_action",
+	)
+
+	optionLength := sourceSection(
+		t,
+		source,
+		"static __always_inline void bpf_sock_ops_opt_len_cb",
+		"static __always_inline void bpf_sock_ops_write_hdr_cb",
+	)
+	legacyDecision := sourcePosition(
+		t,
+		optionLength,
+		"tcp_traceparent_legacy_opt_len_action(java_remote_parent_enabled, tp_pid != NULL)",
+	)
+	legacyReservation := sourcePosition(
+		t,
+		optionLength,
+		"bpf_reserve_hdr_opt(skops, option_size, 0);",
+	)
+	assert.Less(t, legacyDecision, legacyReservation)
+	assert.NotContains(
+		t,
+		optionLength[legacyDecision:],
+		"bpf_reserve_hdr_opt(skops, option_size, 0) != 0",
+	)
+
+	targetPosition := sourceSection(
+		t,
+		source,
+		"static __always_inline enum tcp_traceparent_target_position ssl_prewrite_write_target_position",
+		"static __always_inline void bpf_sock_ops_opt_len_cb",
+	)
+	assert.Contains(t, targetPosition, "(const void *)(tcp + 1) > data_end")
+	assert.Contains(t, targetPosition, "tcp_traceparent_write_packet_valid")
+	assert.NotContains(t, targetPosition, "(const void *)tcp + tcp_header_len > data_end")
+
+	optionWrite := sourceSection(
+		t,
+		source,
+		"static __always_inline void bpf_sock_ops_write_hdr_cb",
+		"static __always_inline u8 tcp_sequence_from_sockops",
+	)
+	exactOwnerCheck := sourcePosition(
+		t,
+		optionWrite,
+		"if (!ssl_prewrite_connection_has_exact_owner(prewrite, &owner->key))",
+	)
+	localCommitCall := sourcePosition(t, optionWrite, "commit_ssl_prewrite_transport_local(prewrite)")
+	finalExactOwnerCheck := localCommitCall + sourcePosition(
+		t,
+		optionWrite[localCommitCall:],
+		"if (!ssl_prewrite_connection_has_exact_owner(prewrite, &owner->key))",
+	)
+	prewriteStore := sourcePosition(t, optionWrite, "bpf_store_hdr_opt(skops, &opt, sizeof(opt), 0)")
+	assert.Less(t, exactOwnerCheck, localCommitCall)
+	assert.Less(t, localCommitCall, finalExactOwnerCheck)
+	assert.Less(t, finalExactOwnerCheck, prewriteStore)
+	writeGuard := sourcePosition(
+		t,
+		optionWrite,
+		"if (!tcp_traceparent_legacy_option_allowed(java_remote_parent_enabled))",
+	)
+	legacyOption := sourcePosition(t, optionWrite, "tcp_traceparent_legacy_option_t opt")
+	legacyStore := legacyOption + sourcePosition(
+		t,
+		optionWrite[legacyOption:],
+		"bpf_store_hdr_opt(skops, &opt, sizeof(opt), 0)",
+	)
+	assert.Less(t, writeGuard, legacyOption)
+	assert.Less(t, writeGuard, legacyStore)
+}
+
+func readTPInjectorSource(t *testing.T) string {
+	t.Helper()
+	_, testFile, _, ok := runtime.Caller(0)
+	require.True(t, ok)
+	path := filepath.Join(filepath.Dir(testFile), "../../../../bpf/tpinjector/tpinjector.c")
+	contents, err := os.ReadFile(path)
+	require.NoError(t, err)
+	return string(contents)
+}
+
+func sourceSection(t *testing.T, source, startMarker, endMarker string) string {
+	t.Helper()
+	start := sourcePosition(t, source, startMarker)
+	endOffset := sourcePosition(t, source[start:], endMarker)
+	require.Positive(t, endOffset)
+	return source[start : start+endOffset]
+}
+
+func sourcePosition(t *testing.T, source, marker string) int {
+	t.Helper()
+	position := strings.Index(source, marker)
+	require.NotEqualf(t, -1, position, "missing source marker %q", marker)
+	return position
 }

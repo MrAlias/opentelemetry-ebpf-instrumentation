@@ -370,6 +370,7 @@ func (p *Tracer) constants() map[string]any {
 	m["g_bpf_debug"] = p.cfg.EBPF.BpfDebug
 	m["g_bpf_traceparent_enabled"] = p.cfg.EBPF.TrackRequestHeaders || p.cfg.EBPF.ContextPropagation.IsEnabled()
 	m["java_remote_parent_enabled"] = p.javaRemoteParentEnabled
+	m["ssl_prewrite_max_age_ns"] = uint64(p.cfg.Java.RemoteParent.TTL.Nanoseconds())
 	m["jvm_sampling_interval_ns"] = uint64(0)
 	if p.jvmRuntimeMetricsEnabled() {
 		m["jvm_sampling_interval_ns"] = uint64(p.cfg.JVMRuntimeMetrics.SamplingInterval.Nanoseconds())
@@ -503,11 +504,23 @@ func (p *Tracer) KProbes() map[string]ebpfcommon.ProbeDesc {
 		}
 	}
 
+	if p.javaRemoteParentEnabled {
+		kp["sk_psock_msg_verdict"] = ebpfcommon.ProbeDesc{
+			Required: true,
+			Start:    p.bpfObjects.ObiKprobeSkPsockMsgVerdict,
+		}
+	}
+
 	return kp
 }
 
 func (p *Tracer) Tracepoints() map[string]ebpfcommon.ProbeDesc {
-	return nil
+	return map[string]ebpfcommon.ProbeDesc{
+		"sched/sched_process_exit": {
+			Required: true,
+			Start:    p.bpfObjects.ObiSslProcessExit,
+		},
+	}
 }
 
 func (p *Tracer) UProbes() map[string]map[string][]*ebpfcommon.ProbeDesc {
@@ -541,6 +554,7 @@ func (p *Tracer) UProbes() map[string]map[string][]*ebpfcommon.ProbeDesc {
 			"SSL_shutdown": {{
 				Required: false,
 				Start:    p.bpfObjects.ObiUprobeSslShutdown,
+				End:      p.bpfObjects.ObiUretprobeSslShutdown,
 			}},
 		},
 		"libSystem.Security.Cryptography.Native.OpenSsl.so": {
@@ -551,12 +565,13 @@ func (p *Tracer) UProbes() map[string]map[string][]*ebpfcommon.ProbeDesc {
 			}},
 			"CryptoNative_SslWrite": {{
 				Required: false,
-				Start:    p.bpfObjects.ObiUprobeSslWrite,
-				End:      p.bpfObjects.ObiUretprobeSslWrite,
+				Start:    p.bpfObjects.ObiUprobeCryptoNativeSslWrite,
+				End:      p.bpfObjects.ObiUretprobeCryptoNativeSslWrite,
 			}},
 			"CryptoNative_SslShutdown": {{
 				Required: false,
-				Start:    p.bpfObjects.ObiUprobeSslShutdown,
+				Start:    p.bpfObjects.ObiUprobeCryptoNativeSslShutdown,
+				End:      p.bpfObjects.ObiUretprobeCryptoNativeSslShutdown,
 			}},
 		},
 		"nginx": {

@@ -558,6 +558,25 @@ static void test_invalidation_during_claim_fails_closed(void) {
     }
 }
 
+static void test_disallowed_claim_preserves_candidate(void) {
+    reset();
+    connection_info_t connection = {};
+    const tp_info_pid_t first = candidate(2, 10);
+    update_strict_incoming_trace(&connection, &first, 100, test_netns);
+
+    u64 generation = 99;
+    if (consume_strict_incoming_trace_with_generation_if_allowed(
+            &connection, test_netns, &generation, 0) ||
+        generation || !snapshot_strict_incoming_trace(&connection, test_netns)) {
+        fail("disallowed consumer changed the pending candidate");
+    }
+
+    tp_info_pid_t *taken = consume_strict_incoming_trace(&connection, test_netns);
+    if (!taken || taken->tp.span_id[0] != first.tp.span_id[0]) {
+        fail("lifecycle consumer could not claim the reserved candidate");
+    }
+}
+
 static void test_zero_network_namespace_cookie_is_rejected(void) {
     reset();
     connection_info_t connection = {};
@@ -600,6 +619,7 @@ int main(void) {
     test_publication_during_claim_fails_closed();
     test_publication_during_invalidation_does_not_leak_marker();
     test_invalidation_during_claim_fails_closed();
+    test_disallowed_claim_preserves_candidate();
     test_zero_network_namespace_cookie_is_rejected();
     test_disabled_path_retains_legacy_overwrite_and_delete();
     return 0;

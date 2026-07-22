@@ -103,7 +103,7 @@ int obi_rb_obj_call_init_kw(struct pt_regs *ctx) {
         //bpf_printk("rb_obj_call_init_kw <==> ary %llx, item %llx, thread %s", ary, item, buf);
         return 0;
     } else if (!obi_bpf_memcmp(buf, PUMA_SRV, sizeof(PUMA_SRV) - 1)) {
-        ssl_pid_connection_info_t *info = bpf_map_lookup_elem(&pid_tid_to_conn, &id);
+        ssl_pid_connection_info_t *info = lookup_pid_tid_connection(id, task_thread_start_time());
         if (!info) {
             bpf_dbg_printk("rb_obj_call_init_kw no connection info for id %lld", id);
             return 0;

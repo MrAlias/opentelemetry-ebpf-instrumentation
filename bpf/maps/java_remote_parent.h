@@ -628,7 +628,8 @@ typedef struct java_remote_parent_resolution {
     java_remote_parent_owner_t indexed;
     u8 found;
     u8 ambiguous;
-    unsigned char reserved[6];
+    u8 via_task;
+    unsigned char reserved[5];
 } java_remote_parent_resolution_t;
 
 static __always_inline void
@@ -691,6 +692,11 @@ java_remote_parent_resolve(const pid_key_t *start, u64 max_age_ns) {
             java_remote_parent_mark_ambiguous(&copy.owner);
         } else if (!resolution.found) {
             java_remote_parent_resolve_exact(&resolution, &copy.owner, copy.generation, 1);
+        }
+        if (resolution.found && !resolution.ambiguous &&
+            java_remote_parent_pid_key_equal(&resolution.key.owner, &copy.owner) &&
+            resolution.key.generation == copy.generation) {
+            resolution.via_task = 1;
         }
     } else if (!resolution.found) {
         java_remote_parent_resolve_exact(&resolution, start, 0, 1);
@@ -1129,6 +1135,9 @@ java_remote_parent_retrieve_for_connection(java_remote_parent_response_t *respon
 
     if (copied_valid) {
         java_remote_parent_retrieval_stat(0, k_java_remote_parent_status_valid);
+        if (resolution.via_task) {
+            java_remote_parent_stat_add(k_java_remote_parent_stat_handoff_valid);
+        }
         return k_java_remote_parent_status_valid;
     }
     if (discard && lifecycle == k_java_remote_parent_lifecycle_discarded) {

@@ -277,7 +277,8 @@ int obi_uprobe_task_init(struct pt_regs *ctx) {
     if (parent_state && parent_state->conn.port) {
         task_state.conn = parent_state->conn;
     } else {
-        const ssl_pid_connection_info_t *info = bpf_map_lookup_elem(&pid_tid_to_conn, &id);
+        const ssl_pid_connection_info_t *info =
+            lookup_pid_tid_connection(id, task_thread_start_time());
         if (info) {
             connection_info_part_t conn_part = {};
             const u32 host_pid = pid_from_pid_tgid(id);

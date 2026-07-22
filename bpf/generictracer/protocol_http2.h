@@ -10,6 +10,7 @@
 #include <common/iov_iter.h>
 #include <common/http_buf_size.h>
 #include <common/ringbuf.h>
+#include <common/ssl_connection.h>
 #include <common/trace_lifecycle.h>
 #include <common/trace_parent.h>
 
@@ -493,7 +494,6 @@ int obi_protocol_http2_grpc_handle_end_frame(void *ctx) {
         void *offset = (unsigned char *)g_ctx->args.u_buf + buf_pos;
         http2_grpc_end(&g_ctx->stream, &g_ctx->prev_info, offset);
 
-        bpf_map_delete_elem(&active_ssl_connections, &g_ctx->args.pid_conn);
     } else {
         // Wrong-direction end flag (e.g. a CLIENT request's own HEADERS
         // carries END_STREAM=1). Keep ongoing_http2_grpc so the correct

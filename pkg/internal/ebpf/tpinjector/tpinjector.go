@@ -170,6 +170,7 @@ func (p *Tracer) constants() map[string]any {
 		"inject_flags":               flags,
 		"g_bpf_debug":                p.cfg.EBPF.BpfDebug,
 		"java_remote_parent_enabled": p.javaRemoteParentEnabled,
+		"ssl_prewrite_max_age_ns":    uint64(p.cfg.Java.RemoteParent.TTL.Nanoseconds()),
 	}
 }
 

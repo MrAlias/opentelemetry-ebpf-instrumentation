@@ -192,8 +192,18 @@ func TestJavaRemoteParentRequiresSockOpsNetnsCookie(t *testing.T) {
 					assert.Equal(t, uint32(1), mapSpec.MaxEntries, name)
 				}
 			}
+			writeArgs := bundles[0].Spec.Maps["active_ssl_write_args"]
+			require.NotNil(t, writeArgs)
+			assert.Equal(t, uint32(16), writeArgs.KeySize)
+			assert.Equal(t, ebpf.LRUHash, writeArgs.Type)
 		})
 	}
+}
+
+func TestSSLProcessExitCleanupIsAlwaysAttached(t *testing.T) {
+	tracepoints := (&Tracer{}).Tracepoints()
+	require.Contains(t, tracepoints, "sched/sched_process_exit")
+	assert.True(t, tracepoints["sched/sched_process_exit"].Required)
 }
 
 func TestParseJVMMemoryPoolRecordDecoratesServiceByPIDNamespace(t *testing.T) {

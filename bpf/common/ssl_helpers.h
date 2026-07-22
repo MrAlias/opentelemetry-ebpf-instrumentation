@@ -9,21 +9,25 @@
 #include <common/connection_info.h>
 #include <common/protocol_defs.h>
 #include <common/sockaddr.h>
+#include <common/ssl_connection.h>
 
 #include <logger/bpf_dbg.h>
 
 #include <maps/active_ssl_connections.h>
 #include <maps/active_ssl_read_args.h>
 #include <maps/active_ssl_write_args.h>
-#include <maps/ssl_to_conn.h>
 
 static __always_inline void set_active_ssl_connection(ssl_pid_connection_info_t *ssl_conn,
                                                       void *ssl) {
+    const u64 process_start_time = task_process_start_time();
+    if (!process_start_time) {
+        return;
+    }
     bpf_dbg_printk("Correlating SSL %llx to connection", ssl);
     dbg_print_http_connection_info(&ssl_conn->p_conn.conn);
 
     bpf_map_update_elem(&active_ssl_connections, &ssl_conn->p_conn, &ssl, BPF_ANY);
-    bpf_map_update_elem(&ssl_to_conn, &ssl, ssl_conn, BPF_ANY);
+    update_ssl_connection((u64)ssl, ssl_conn, process_start_time, BPF_ANY);
 }
 
 static __always_inline void *unconnected_ssl_from_args(u64 id, u8 direction) {
@@ -33,7 +37,12 @@ static __always_inline void *unconnected_ssl_from_args(u64 id, u8 direction) {
     if (direction == TCP_RECV) {
         ssl_args = bpf_map_lookup_elem(&active_ssl_read_args, &id);
     } else if (direction == TCP_SEND) {
-        ssl_args = bpf_map_lookup_elem(&active_ssl_write_args, &id);
+        const u64 thread_start_time = task_thread_start_time();
+        if (!thread_start_time) {
+            return 0;
+        }
+        const ssl_thread_key_t key = ssl_thread_key(id, thread_start_time);
+        ssl_args = bpf_map_lookup_elem(&active_ssl_write_args, &key);
     } else {
         bpf_dbg_printk("unknown ssl connection direction, this is a bug");
     }

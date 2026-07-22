@@ -17,6 +17,7 @@ enum tp_provenance : u8 {
     k_tp_provenance_unknown = 0,
     k_tp_provenance_tcp_legacy = 1,
     k_tp_provenance_tcp_exact_flags = 2,
+    k_tp_provenance_ssl_prewrite = 3,
 };
 
 typedef struct tp_info {
@@ -36,3 +37,9 @@ typedef struct tp_info_pid {
     u8 req_type;
     u8 provenance;
 } tp_info_pid_t;
+
+static __always_inline void set_client_trace_parent(tp_info_t *child, const tp_info_t *parent) {
+    __builtin_memcpy(child->trace_id, parent->trace_id, sizeof(child->trace_id));
+    __builtin_memcpy(child->parent_id, parent->span_id, sizeof(child->parent_id));
+    child->flags = parent->flags;
+}

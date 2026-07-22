@@ -70,8 +70,19 @@ static __always_inline u8 find_trace_for_server_request_with_incoming(connection
     u8 found_tp = 0;
     connection_info_t sorted_conn = *conn;
     sort_connection_info(&sorted_conn);
-    tp_info_pid_t *existing_tp = consume_incoming_trace_in_netns_cookie_with_generation(
-        &sorted_conn, netns_cookie, incoming_generation);
+    u8 incoming_claim_allowed = 1;
+#ifdef OBI_JAVA_REMOTE_PARENT_LIFECYCLE
+    if (java_remote_parent_enabled) {
+        pid_key_t task = {0};
+        task_tid(&task);
+        // Incarnations are published only by capability-authorized registration. Reusing that
+        // map keeps these tail programs within the kernel's 64-map reference limit.
+        incoming_claim_allowed = java_remote_parent_incoming_claim_allowed(
+            java_process_incarnation_for(&task) != 0, incoming, incoming_generation);
+    }
+#endif
+    tp_info_pid_t *existing_tp = consume_incoming_trace_in_netns_cookie_with_generation_if_allowed(
+        &sorted_conn, netns_cookie, incoming_generation, incoming_claim_allowed);
     if (existing_tp) {
         if (existing_tp->valid && valid_trace(existing_tp->tp.trace_id) &&
             valid_span(existing_tp->tp.span_id)) {

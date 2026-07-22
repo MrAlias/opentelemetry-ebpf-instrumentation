@@ -355,8 +355,7 @@ find_trace_for_client_request_with_t_key(const pid_connection_info_t *p_conn,
             return 0;
         }
 
-        __builtin_memcpy(tp->trace_id, server_tp->tp.trace_id, sizeof(tp->trace_id));
-        __builtin_memcpy(tp->parent_id, server_tp->tp.span_id, sizeof(tp->parent_id));
+        set_client_trace_parent(tp, &server_tp->tp);
         return 1;
     }
 

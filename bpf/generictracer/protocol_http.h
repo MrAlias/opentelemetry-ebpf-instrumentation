@@ -18,6 +18,7 @@
 #include <common/ringbuf.h>
 #include <common/runtime.h>
 #include <common/scratch_mem.h>
+#include <common/ssl_args.h>
 #include <common/trace_helpers.h>
 #include <common/trace_lifecycle.h>
 #include <common/trace_parent.h>
@@ -28,10 +29,12 @@
 #include <generictracer/k_tracer_tailcall.h>
 #include <generictracer/large_buf_tailcall.h>
 #include <generictracer/protocol_common.h>
+#include <generictracer/ssl_connection.h>
 
 #include <logger/bpf_dbg.h>
 
 #include <maps/active_ssl_connections.h>
+#include <maps/active_ssl_write_args.h>
 #include <maps/connection_tracker.h>
 #include <maps/incoming_trace_map.h>
 #ifdef OBI_JAVA_REMOTE_PARENT_LIFECYCLE
@@ -42,6 +45,7 @@
 #include <maps/tp_char_buf_mem.h>
 
 volatile const u32 high_request_volume;
+volatile const u64 ssl_prewrite_max_age_ns;
 
 SCRATCH_MEM_SIZED(http_previous_trace_id, TRACE_ID_SIZE_BYTES);
 
@@ -139,8 +143,6 @@ static __always_inline void finish_http(http_info_t *info, pid_connection_info_t
         if (info->delayed) {
             bpf_map_delete_elem(&ongoing_http, pid_conn);
         }
-
-        bpf_map_delete_elem(&active_ssl_connections, pid_conn);
     }
 }
 
@@ -243,11 +245,9 @@ static __always_inline void cleanup_http_request_data(pid_connection_info_t *pid
     }
 }
 
-static __always_inline void terminate_http_request_if_needed(pid_connection_info_t *pid_conn) {
-    http_info_t *info = bpf_map_lookup_elem(&ongoing_http, pid_conn);
-    cleanup_http_request_data(pid_conn, info);
-    bpf_map_delete_elem(&active_ssl_connections, pid_conn);
-}
+#define OBI_HTTP_TERMINATION_CONTEXT
+#include <generictracer/http_termination.h>
+#undef OBI_HTTP_TERMINATION_CONTEXT
 
 static __always_inline void process_http_request(http_info_t *info,
                                                  int len,
@@ -332,6 +332,15 @@ static __always_inline void handle_http_response(unsigned char *small_buf,
                                                  int orig_len,
                                                  lw_thread_t lw_thread) {
     process_http_response(info, small_buf);
+    if (info->type == EVENT_HTTP_CLIENT && info->ssl == WITH_SSL && info->direction == TCP_SEND) {
+        mark_ssl_prewrite_connection_reusable(pid_conn,
+                                              task_netns_cookie(),
+                                              info->type,
+                                              info->ssl,
+                                              info->direction,
+                                              info->start_monotime_ns,
+                                              &info->tp);
+    }
     cleanup_http_request_data(pid_conn, info);
 
     // Generic Go events cannot be delayed since we don't probe on net_close.
@@ -445,12 +454,89 @@ int obi_continue2_protocol_http(struct pt_regs *ctx) {
     return __obi_continue2_protocol_http(ctx, args, info, meta);
 }
 
+static __noinline int publish_http_trace(call_protocol_args_t *args,
+                                         http_connection_metadata_t *meta,
+                                         tp_info_pid_t *tp_p,
+                                         u8 ssl_prewrite) {
+    if (!meta) {
+        return 0;
+    }
+    if (ssl_prewrite) {
+        if (meta->type != EVENT_HTTP_CLIENT) {
+            java_remote_parent_stat_add(k_java_remote_parent_stat_inject_malformed);
+            return 0;
+        }
+        http_info_t *info = bpf_map_lookup_elem(&ongoing_http, &args->pid_conn);
+        if (!info || !info->ssl_prewrite_pending || info->start_monotime_ns) {
+            java_remote_parent_stat_add(k_java_remote_parent_stat_inject_malformed);
+            return 0;
+        }
+
+        tp_p->valid = 1;
+        tp_p->provenance = k_tp_provenance_ssl_prewrite;
+        info->tp = tp_p->tp;
+        bpf_probe_read(info->buf, FULL_BUF_SIZE, (void *)args->u_buf);
+        process_http_request(
+            info, args->bytes_len, meta, args->direction, args->orig_dport, args->lw_thread);
+
+        const u64 pid_tgid = bpf_get_current_pid_tgid();
+        const u64 thread_start_time = task_thread_start_time();
+        const enum ssl_prewrite_publish_result result =
+            update_ssl_prewrite(&args->pid_conn,
+                                args->orig_dport,
+                                args->connection_netns_cookie,
+                                args->ssl_ptr,
+                                args->u_buf,
+                                (u32)args->bytes_len,
+                                thread_start_time,
+                                pid_tgid,
+                                args->ssl_handoff_id,
+                                tp_p->tp.ts,
+                                tp_p);
+        if (result != k_ssl_prewrite_publish_valid) {
+            java_remote_parent_stat_add(result == k_ssl_prewrite_publish_ambiguous
+                                            ? k_java_remote_parent_stat_inject_ambiguous
+                                            : k_java_remote_parent_stat_inject_overload);
+            cleanup_http_info(&args->pid_conn);
+            return 0;
+        }
+
+        const ssl_thread_key_t thread_key = ssl_thread_key(pid_tgid, thread_start_time);
+        ssl_args_t *ssl_args = bpf_map_lookup_elem(&active_ssl_write_args, &thread_key);
+        if (!ssl_args || ssl_args->ssl != args->ssl_ptr || ssl_args->buf != args->u_buf ||
+            ssl_args->handoff_id != args->ssl_handoff_id) {
+            java_remote_parent_stat_add(k_java_remote_parent_stat_inject_malformed);
+            block_ssl_prewrite_connection(
+                &args->pid_conn.conn, args->connection_netns_cookie, bpf_ktime_get_ns());
+            reset_ssl_prewrite(pid_tgid, thread_start_time, args->ssl_handoff_id);
+            cleanup_http_info(&args->pid_conn);
+            return 0;
+        }
+        ssl_args->flags |= FLAG_SSL_PREWRITE_PUBLISHED;
+        return 1;
+    }
+
+    const u32 type = trace_type_from_meta(meta);
+    set_trace_info_for_connection(&args->pid_conn.conn, type, tp_p);
+    server_or_client_trace(meta->type,
+                           &args->pid_conn.conn,
+                           args->lw_thread,
+                           tp_p,
+                           args->ssl,
+                           args->orig_dport,
+                           0,
+                           BPF_ANY);
+    return 0;
+}
+
 static __always_inline int
 __obi_continue_protocol_http_tp(struct pt_regs *ctx,
                                 call_protocol_args_t *args,
                                 http_info_t *info,
                                 http_connection_metadata_t *meta,
+                                u8 ssl_prewrite,
                                 unsigned char *(*tp_loop_fn)(unsigned char *, const u16)) {
+    u8 ssl_prewrite_published = 0;
     tp_info_pid_t *tp_p = (tp_info_pid_t *)tp_info_mem();
     if (!tp_p) {
         goto done;
@@ -466,16 +552,7 @@ __obi_continue_protocol_http_tp(struct pt_regs *ctx,
                 tp_p->valid = 1;
                 tp_p->pid = args->pid_conn.pid;
                 tp_p->req_type = meta->type;
-                const u32 type = trace_type_from_meta(meta);
-                set_trace_info_for_connection(&args->pid_conn.conn, type, tp_p);
-                server_or_client_trace(meta->type,
-                                       &args->pid_conn.conn,
-                                       args->lw_thread,
-                                       tp_p,
-                                       args->ssl,
-                                       args->orig_dport,
-                                       0,
-                                       BPF_ANY);
+                ssl_prewrite_published = publish_http_trace(args, meta, tp_p, ssl_prewrite);
             }
             goto done;
         }
@@ -491,7 +568,7 @@ __obi_continue_protocol_http_tp(struct pt_regs *ctx,
 
             unsigned char *res = tp_loop_fn(buf, buf_len);
             if (res) {
-                bpf_dbg_printk("Found traceparent in headers [%s] overriding what was before", res);
+                bpf_dbg_printk("Found traceparent in headers");
                 unsigned char *t_id = extract_trace_id(res);
                 unsigned char *s_id = extract_span_id(res);
                 unsigned char *f_id = extract_flags(res);
@@ -515,11 +592,6 @@ __obi_continue_protocol_http_tp(struct pt_regs *ctx,
                     __builtin_memset(tp_p->tp.parent_id, 0, sizeof(tp_p->tp.parent_id));
                 }
 
-                if (g_bpf_debug) {
-                    unsigned char tp_buf[TP_MAX_VAL_LENGTH];
-                    make_tp_string(tp_buf, &tp_p->tp);
-                    bpf_dbg_printk("new tp: %s", tp_buf);
-                }
             } else {
                 bpf_dbg_printk("No additional traceparent in headers, using what was made before");
             }
@@ -528,25 +600,20 @@ __obi_continue_protocol_http_tp(struct pt_regs *ctx,
         }
     }
 
-    if (meta) {
-        const u32 type = trace_type_from_meta(meta);
-        set_trace_info_for_connection(&args->pid_conn.conn, type, tp_p);
-        // TODO: If the user code setup traceparent manually, don't interfere and add
-        // something else with TC L7. The main challenge is that with kprobes, the
-        // sock_msg program has already punched a hole in the HTTP headers and has made
-        // the HTTP header invalid. We need to add more smarts there or pull the
-        // sock msg information here and mark it so that we don't override the span_id.
-        server_or_client_trace(meta->type,
-                               &args->pid_conn.conn,
-                               args->lw_thread,
-                               tp_p,
-                               args->ssl,
-                               args->orig_dport,
-                               0,
-                               BPF_ANY);
-    }
+    // TODO: If the user code setup traceparent manually, don't interfere and add
+    // something else with TC L7. The main challenge is that with kprobes, the
+    // sock_msg program has already punched a hole in the HTTP headers and has made
+    // the HTTP header invalid. We need to add more smarts there or pull the
+    // sock msg information here and mark it so that we don't override the span_id.
+    ssl_prewrite_published = publish_http_trace(args, meta, tp_p, ssl_prewrite);
 
 done:
+    if (ssl_prewrite) {
+        if (!ssl_prewrite_published) {
+            cleanup_http_info(&args->pid_conn);
+        }
+        return 0;
+    }
     if (tp_loop_fn == bpf_strstr_tp_loop) {
         return __obi_continue2_protocol_http(ctx, args, info, meta);
     } else {
@@ -563,21 +630,28 @@ int obi_continue_protocol_http_tp(struct pt_regs *ctx) {
         return 0;
     }
 
+    const u8 ssl_prewrite = args->flags & k_call_protocol_flag_ssl_prewrite;
     http_info_t *info = bpf_map_lookup_elem(&ongoing_http, &args->pid_conn);
-    if (!info) {
+    if (!info && !ssl_prewrite) {
         return 0;
     }
 
     http_connection_metadata_t *meta =
         connection_meta_by_direction(args->direction, PACKET_TYPE_REQUEST);
 
-    return __obi_continue_protocol_http_tp(ctx, args, info, meta, bpf_strstr_tp_loop__legacy);
+    if (args->use_bpf_loop) {
+        return __obi_continue_protocol_http_tp(
+            ctx, args, info, meta, ssl_prewrite, bpf_strstr_tp_loop);
+    }
+    return __obi_continue_protocol_http_tp(
+        ctx, args, info, meta, ssl_prewrite, bpf_strstr_tp_loop__legacy);
 }
 
 static __always_inline int
 __obi_continue_protocol_http(struct pt_regs *ctx,
                              call_protocol_args_t *args,
                              http_info_t *info,
+                             u8 ssl_prewrite,
                              unsigned char *(*tp_loop_fn)(unsigned char *, const u16)) {
     http_connection_metadata_t *meta =
         connection_meta_by_direction(args->direction, PACKET_TYPE_REQUEST);
@@ -591,8 +665,8 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
 
     tp_info_pid_t *tp_p = bpf_map_lookup_elem(&outgoing_trace_map, &e_key);
 
-    if (tp_p && tp_p->req_type == EVENT_HTTP_CLIENT && tp_p->written &&
-        tp_p->pid == args->pid_conn.pid) {
+    if (!ssl_prewrite && tp_p && tp_p->valid && tp_p->req_type == EVENT_HTTP_CLIENT &&
+        tp_p->written && tp_p->pid == args->pid_conn.pid) {
         bpf_dbg_printk("found tp info previously set by sock msg");
         // we've already got a tp_info_pid_t setup by the sockmsg program, use
         // that instead
@@ -615,6 +689,7 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
     tp_p->pid = args->pid_conn
                     .pid; // used for avoiding finding stale server requests with client port reuse
     tp_p->req_type = (meta) ? meta->type : 0;
+    tp_p->provenance = k_tp_provenance_unknown;
 
     urand_bytes(tp_p->tp.span_id, SPAN_ID_SIZE_BYTES);
 
@@ -678,12 +753,6 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
         bpf_dbg_printk("Using old traceparent id");
     }
 
-    if (g_bpf_debug) {
-        unsigned char tp_buf[TP_MAX_VAL_LENGTH];
-        make_tp_string(tp_buf, &tp_p->tp);
-        bpf_dbg_printk("tp: %s", tp_buf);
-    }
-
     args->skip_tp_parsing = 0;
 
     // If we receive SSL request, we know that OBI definitely didn't
@@ -698,14 +767,17 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
         }
     }
 
-    if (tp_loop_fn == bpf_strstr_tp_loop) {
-        return __obi_continue_protocol_http_tp(ctx, args, info, meta, tp_loop_fn);
-    } else {
-        bpf_tail_call(ctx, &jump_table, k_tail_continue_protocol_http_tp);
-        return 0;
+    bpf_tail_call(ctx, &jump_table, k_tail_continue_protocol_http_tp);
+    if (ssl_prewrite) {
+        cleanup_http_info(&args->pid_conn);
     }
+    return 0;
 
 skip_tp:
+    if (ssl_prewrite) {
+        cleanup_http_info(&args->pid_conn);
+        return 0;
+    }
     if (tp_loop_fn == bpf_strstr_tp_loop) {
         return __obi_continue2_protocol_http(ctx, args, info, meta);
     } else {
@@ -722,12 +794,13 @@ int obi_continue_protocol_http_legacy(struct pt_regs *ctx) {
         return 0;
     }
 
+    const u8 ssl_prewrite = args->flags & k_call_protocol_flag_ssl_prewrite;
     http_info_t *info = bpf_map_lookup_elem(&ongoing_http, &args->pid_conn);
-    if (!info) {
+    if (!info && !ssl_prewrite) {
         return 0;
     }
 
-    return __obi_continue_protocol_http(ctx, args, info, bpf_strstr_tp_loop__legacy);
+    return __obi_continue_protocol_http(ctx, args, info, ssl_prewrite, bpf_strstr_tp_loop__legacy);
 }
 
 // k_tail_continue_protocol_http (new kernels)
@@ -738,22 +811,40 @@ int obi_continue_protocol_http(struct pt_regs *ctx) {
         return 0;
     }
 
+    const u8 ssl_prewrite = args->flags & k_call_protocol_flag_ssl_prewrite;
     http_info_t *info = bpf_map_lookup_elem(&ongoing_http, &args->pid_conn);
-    if (!info) {
+    if (!info && !ssl_prewrite) {
         return 0;
     }
 
     if (args->use_bpf_loop) {
-        return __obi_continue_protocol_http(ctx, args, info, bpf_strstr_tp_loop);
+        return __obi_continue_protocol_http(ctx, args, info, ssl_prewrite, bpf_strstr_tp_loop);
     }
 
-    return __obi_continue_protocol_http(ctx, args, info, bpf_strstr_tp_loop__legacy);
+    return __obi_continue_protocol_http(ctx, args, info, ssl_prewrite, bpf_strstr_tp_loop__legacy);
 }
+
+#include <generictracer/ssl_prewrite_request.h>
 
 static __always_inline int
 __obi_protocol_http(struct pt_regs *ctx, unsigned char *(*tp_loop_fn)(unsigned char *, const u16)) {
     call_protocol_args_t *args = protocol_args();
     if (!args) {
+        return 0;
+    }
+
+    if (args->flags & k_call_protocol_flag_ssl_prewrite) {
+        if (!args->ssl || args->direction != TCP_SEND || args->packet_type != PACKET_TYPE_REQUEST) {
+            return 0;
+        }
+
+        if (!prepare_ssl_prewrite_request(args)) {
+            return 0;
+        }
+
+        args->use_bpf_loop = tp_loop_fn == bpf_strstr_tp_loop;
+        bpf_tail_call(ctx, &jump_table, k_tail_continue_protocol_http);
+        cleanup_http_info(&args->pid_conn);
         return 0;
     }
 

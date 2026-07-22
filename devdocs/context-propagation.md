@@ -35,9 +35,11 @@ Context propagation allows distributed tracing by injecting trace context (trace
 1. **HTTP headers** (L7) - `Traceparent:` header in plaintext HTTP requests
 2. **TCP options** (L4) - Custom TCP option (kind 25) for any TCP traffic. The
    legacy form is 26 bytes (`kind`, `length`, trace ID, span ID). When Java
-   remote-parent retrieval is enabled, senders use a 27-byte form that appends
-   exact trace flags. Updated receivers accept both forms; only the exact-flags
-   form is eligible for the Java bridge.
+   remote-parent retrieval is enabled, only a request-owned TLS prewrite may
+   emit the 27-byte form that appends exact trace flags. Ports-only legacy TCP
+   candidates and generic `sk_msg` payload mutation are suppressed in that
+   mode. Updated receivers accept both forms; only the exact-flags form is
+   eligible for the Java bridge.
 
 ## Configuration
 
@@ -61,6 +63,14 @@ Examples:
 The order in which BPF programs execute varies depending on whether Go uprobes or SSL detection is involved:
 
 #### Scenario A: Go HTTP or SSL/TLS (uprobes involved)
+
+The legacy flow below applies when Java remote-parent retrieval is disabled.
+When it is enabled, native SSL uses an exact prewrite identity keyed by the
+thread incarnation and handoff ID. `sk_msg` and sockops validate that identity,
+the connection, the network namespace, the write buffer, and the target TCP
+sequence before emitting the 27-byte option. Missing or evicted exact state
+emits no TCP parent and does not mutate payload bytes; it never falls back to
+`outgoing_trace_map`.
 
 1. **uprobes** (Go HTTP client or SSL detection)
    - Populate `outgoing_trace_map` with initial trace context
@@ -104,6 +114,8 @@ The `written` flag implements mutual exclusion through the natural execution ord
 #### Case 1: Traffic in sockmap with Go/SSL uprobes
 
 **For SSL/TLS:**
+
+This is the bridge-disabled legacy path:
 
 ```
 1. Uprobe sets valid=0, written=0 in outgoing_trace_map
@@ -296,8 +308,9 @@ Sockets are added to `sock_dir` in two ways:
 
 3. **SSL/TLS uses TCP options, not HTTP headers**:
    - Can't inject into encrypted payload
-   - TCP options work before TLS handshake
-   - tpinjector deletes entry early to skip HTTP detection
+   - Bridge-disabled mode uses the legacy TCP-option coordination above
+   - Bridge-enabled mode permits only the exact TLS prewrite TCP option and
+     suppresses ports-only fallback and generic payload mutation
 
 4. **Execution order varies by scenario**:
    - Go/SSL: uprobes → tpinjector → kprobe

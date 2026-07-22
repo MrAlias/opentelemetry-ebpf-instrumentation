@@ -9,12 +9,21 @@
 #include <common/connection_info.h>
 #include <common/map_sizing.h>
 #include <common/pin_internal.h>
-#include <common/ssl_args.h>
+
+typedef struct ssl_shutdown_args {
+    u64 ssl;
+    u64 stack_pointer;
+    u32 depth;
+    u8 api;
+    u8 nested_api;
+    u8 unsafe_nested;
+    u8 tail_wrapper;
+} ssl_shutdown_args_t;
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, MAX_CONCURRENT_SHARED_REQUESTS);
     __type(key, ssl_thread_key_t);
-    __type(value, ssl_args_t);
+    __type(value, ssl_shutdown_args_t);
+    __uint(max_entries, MAX_CONCURRENT_REQUESTS);
     __uint(pinning, OBI_PIN_INTERNAL);
-} active_ssl_write_args SEC(".maps");
+} active_ssl_shutdown_args SEC(".maps");

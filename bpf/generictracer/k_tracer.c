@@ -59,6 +59,8 @@
 
 SCRATCH_MEM_TYPED(backup_buffer, backup_buffer_t)
 
+volatile const u64 ssl_prewrite_max_age_ns = 30ULL * 1000 * 1000 * 1000;
+
 // Used by accept to grab the sock details
 SEC("kprobe/security_socket_accept")
 int BPF_KPROBE(obi_kprobe_security_socket_accept, struct socket *sock, struct socket *newsock) {
@@ -139,7 +141,7 @@ int BPF_KRETPROBE(obi_kretprobe_sys_accept4, s32 fd) {
         info.orig_dport = orig_dport;
 
         // to support SSL on missing handshake
-        bpf_map_update_elem(&pid_tid_to_conn, &id, &info, BPF_ANY);
+        update_pid_tid_connection(id, task_thread_start_time(), &info, BPF_ANY);
 
         const fd_key key = {.pid_tgid = id, .fd = fd};
 
@@ -355,7 +357,7 @@ int BPF_KRETPROBE(obi_kretprobe_sys_connect, int res) {
         sort_connection_info(&info.p_conn.conn);
         info.orig_dport = orig_dport;
 
-        bpf_map_update_elem(&pid_tid_to_conn, &id, &info, BPF_ANY); // Support SSL lookup
+        update_pid_tid_connection(id, task_thread_start_time(), &info, BPF_ANY);
 
         setup_cp_support_conn_info(&info.p_conn, true);
 
@@ -387,33 +389,71 @@ tcp_send_ssl_check(u64 id, void *ssl, pid_connection_info_t *p_conn, u16 orig_dp
     if (!ssl) {
         return;
     }
-    ssl_pid_connection_info_t *s_conn = bpf_map_lookup_elem(&ssl_to_conn, &ssl);
+    const u32 pid = pid_from_pid_tgid(id);
+    const u64 process_start_time = task_process_start_time();
+    ssl_pid_connection_info_t *s_conn = lookup_ssl_connection((u64)ssl, pid, process_start_time);
     if (s_conn) {
-        finish_possible_delayed_tls_http_request(&s_conn->p_conn, ssl);
+        finish_possible_delayed_tls_http_request(&s_conn->p_conn);
     }
     ssl_pid_connection_info_t ssl_conn = {
         .orig_dport = orig_dport,
     };
     __builtin_memcpy(&ssl_conn.p_conn, p_conn, sizeof(pid_connection_info_t));
-    bpf_map_update_elem(&ssl_to_conn, &ssl, &ssl_conn, BPF_ANY);
+    update_ssl_connection((u64)ssl, &ssl_conn, process_start_time, BPF_ANY);
 }
 
 static __always_inline void
 setup_connection_to_pid_mapping(u64 id, pid_connection_info_t *p_conn, u16 orig_dport) {
-    ssl_pid_connection_info_t *prev_info = bpf_map_lookup_elem(&pid_tid_to_conn, &id);
+    const u64 thread_start_time = task_thread_start_time();
+    ssl_pid_connection_info_t *prev_info = lookup_pid_tid_connection(id, thread_start_time);
     // We only update here when we don't know the direction if we haven't previously
     // set the information in sys_accept or sys_connect
-    if (!prev_info || (prev_info->p_conn.conn.d_port != p_conn->conn.d_port) ||
-        (prev_info->p_conn.conn.s_port != p_conn->conn.s_port)) {
+    if (!ssl_connection_mapping_matches(prev_info, p_conn)) {
         ssl_pid_connection_info_t ssl_conn = {0};
         ssl_conn.orig_dport = orig_dport;
         ssl_conn.p_conn = *p_conn;
 
-        bpf_map_update_elem(&pid_tid_to_conn, &id, &ssl_conn, BPF_ANY);
+        update_pid_tid_connection(id, thread_start_time, &ssl_conn, BPF_ANY);
     }
 }
 
 // Main HTTP read and write operations are handled with tcp_sendmsg and tcp_recvmsg
+
+SEC("kprobe/sk_psock_msg_verdict")
+int BPF_KPROBE(obi_kprobe_sk_psock_msg_verdict, struct sock *sk) {
+    (void)ctx;
+
+    if (!java_remote_parent_enabled || !sk) {
+        return 0;
+    }
+
+    const u64 id = bpf_get_current_pid_tgid();
+    if (!valid_pid(id)) {
+        return 0;
+    }
+
+    pid_connection_info_t connection = {.pid = pid_from_pid_tgid(id)};
+    if (!parse_sock_info(sk, &connection.conn)) {
+        return 0;
+    }
+
+    const u16 destination_port = connection.conn.d_port;
+    sort_connection_info(&connection.conn);
+
+    const u64 netns_cookie = sock_netns_cookie_from_sk(sk);
+    if (!netns_cookie) {
+        return 0;
+    }
+
+    const u32 tcp_sequence = BPF_CORE_READ((const struct tcp_sock *)sk, write_seq);
+    capture_ssl_prewrite_tcp_sequence(&connection,
+                                      destination_port,
+                                      netns_cookie,
+                                      bpf_ktime_get_ns(),
+                                      ssl_prewrite_max_age_ns,
+                                      tcp_sequence);
+    return 0;
+}
 
 // The size argument here will be always the total response size.
 // However, the return value of tcp_sendmsg tells us how much it sent. When the
@@ -491,7 +531,7 @@ int BPF_KPROBE(obi_kprobe_tcp_sendmsg, struct sock *sk, struct msghdr *msg, size
                                                           (size_t)k_kprobes_http2_buf_size)
                                                     : m_buf->real_size;
                                 m_buf->pos = size;
-                                bpf_dbg_printk("msg_buffer: size=%d, buf=[%s]", size, buf);
+                                bpf_dbg_printk("msg_buffer: size=%d", size);
                             } else {
                                 size = 0;
                             }
@@ -502,15 +542,20 @@ int BPF_KPROBE(obi_kprobe_tcp_sendmsg, struct sock *sk, struct msghdr *msg, size
                     // and see if on the kretprobe we'll have a backup buffer setup for us
                     // by the socket filter program.
                     if (!size) {
-                        s_args.size = -1;
-                        bpf_map_update_elem(&active_send_args, &id, &s_args, BPF_ANY);
                         // At this point send_msg couldn't read the buffer, likely it's
                         // kernel bvec. We inform the socket filter that it needs to capture
                         // the buffer for us by storing into the backup buffers map, and
                         // then the return probe on send_msg will finish the work.
-                        backup_buffer_t backup_buf = {0};
+                        backup_buffer_t *backup_buf = backup_buffer_mem();
+                        if (!backup_buf) {
+                            return 0;
+                        }
+                        __builtin_memset(backup_buf, 0, sizeof(*backup_buf));
+
+                        s_args.size = -1;
+                        bpf_map_update_elem(&active_send_args, &id, &s_args, BPF_ANY);
                         bpf_map_update_elem(
-                            &sock_filter_buffers, &s_args.p_conn.conn, &backup_buf, BPF_ANY);
+                            &sock_filter_buffers, &s_args.p_conn.conn, backup_buf, BPF_ANY);
 
                         bpf_dbg_printk("can't find iovec ptr in msghdr, not tracking sendmsg");
                         return 0;
@@ -605,7 +650,7 @@ int BPF_KPROBE(obi_kprobe_tcp_rate_check_app_limited, struct sock *sk) {
                                          : m_buf->real_size;
                     m_buf->pos = size;
                     s_args.size = size;
-                    bpf_dbg_printk("msg_buffer: size %d, buf=[%s]", size, buf);
+                    bpf_dbg_printk("msg_buffer: size %d", size);
                     const u64 sock_p = (u64)sk;
                     bpf_map_update_elem(&active_send_args, &id, &s_args, BPF_ANY);
                     bpf_map_update_elem(&active_send_sock_args, &sock_p, &s_args, BPF_ANY);
@@ -700,6 +745,13 @@ static __always_inline void java_remote_parent_close_socket(struct sock *sk) {
 
     const u64 netns_cookie = sock_netns_cookie_from_sk(sk);
     if (netns_cookie) {
+        const pid_connection_info_t process_connection = {
+            .conn = connection,
+            .pid = pid_from_pid_tgid(bpf_get_current_pid_tgid()),
+        };
+        if (ssl_prewrite_connection_should_cleanup(&process_connection, netns_cookie)) {
+            cleanup_ssl_prewrite_connection(&connection, netns_cookie);
+        }
         java_remote_parent_mark_connection_ambiguous_in_netns_cookie(&connection, netns_cookie, 0);
         delete_strict_incoming_trace(&connection, netns_cookie);
     } else {
@@ -715,13 +767,13 @@ int BPF_KPROBE(obi_kprobe_tcp_close, struct sock *sk, long timeout) {
     (void)ctx;
     (void)timeout;
 
-    java_remote_parent_close_socket(sk);
-
     const u64 id = bpf_get_current_pid_tgid();
 
     if (!valid_pid(id)) {
         return 0;
     }
+
+    java_remote_parent_close_socket(sk);
 
     u64 sock_p = (u64)sk;
 
@@ -1304,7 +1356,7 @@ int obi_socket_flt_buf(struct __sk_buff *skb) {
     if (capture_buf) {
         read_skb_bytes(skb, t_ctx->tcp.hdr_len, (void *)capture_buf, k_backup_buffer_len);
 
-        bpf_d_printk("captured fallback buffer %s", capture_buf);
+        bpf_d_printk("captured fallback buffer");
     }
 
     return 0;

@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
+	ebpfconvenience "go.opentelemetry.io/obi/pkg/internal/ebpf/convenience"
 	"go.opentelemetry.io/obi/pkg/internal/ebpf/generictracer"
 	"go.opentelemetry.io/obi/pkg/internal/ebpf/gotracer"
 	"go.opentelemetry.io/obi/pkg/internal/ebpf/tpinjector"
@@ -31,23 +32,122 @@ func TestJavaRemoteParentSharedMapSpecsAreCompatible(t *testing.T) {
 	primarySpec, err := tpinjector.LoadBpfJavaRemoteParent()
 	require.NoError(t, err)
 
-	t.Run("enabled", func(t *testing.T) {
-		assertSharedMapSpecs(t, genericSpec, tpSpec)
-		assertSharedMapSpecs(t, genericSpec, bridgeSpec)
-		assertSharedMapSpecs(t, genericSpec, primarySpec)
-		assertSharedMapSpecs(t, genericSpec, goSpec)
-	})
+	for _, enabled := range []bool{true, false} {
+		name := "disabled"
+		if enabled {
+			name = "enabled"
+		}
+		t.Run(name, func(t *testing.T) {
+			specs := map[string]*ebpf.CollectionSpec{
+				"generic": genericSpec.Copy(),
+				"tp":      tpSpec.Copy(),
+				"go":      goSpec.Copy(),
+				"bridge":  bridgeSpec.Copy(),
+				"primary": primarySpec.Copy(),
+			}
+			for _, spec := range specs {
+				if !enabled {
+					javabridge.MinimizeDisabledMaps(spec)
+				}
+			}
+			for loader, spec := range specs {
+				if loader == "generic" {
+					continue
+				}
+				assertSharedMapSpecs(t, specs["generic"], spec)
+			}
+			for loader, spec := range specs {
+				writeArgs := spec.Maps["active_ssl_write_args"]
+				if writeArgs == nil {
+					continue
+				}
+				require.Equal(t, ebpf.LRUHash, writeArgs.Type, loader)
+				require.Equal(t, uint32(16), writeArgs.KeySize, loader)
+				require.Equal(t, uint32(64), writeArgs.ValueSize, loader)
+			}
+		})
+	}
+}
 
-	t.Run("disabled", func(t *testing.T) {
-		genericDisabled := genericSpec.Copy()
-		tpDisabled := tpSpec.Copy()
-		goDisabled := goSpec.Copy()
-		javabridge.MinimizeDisabledMaps(genericDisabled)
-		javabridge.MinimizeDisabledMaps(tpDisabled)
-		javabridge.MinimizeDisabledMaps(goDisabled)
-		assertSharedMapSpecs(t, genericDisabled, tpDisabled)
-		assertSharedMapSpecs(t, genericDisabled, goDisabled)
-	})
+func TestSSLPrewriteMapSpecsAreCompatible(t *testing.T) {
+	genericSpec, err := generictracer.LoadBpf()
+	require.NoError(t, err)
+	tpSpec, err := tpinjector.LoadBpf()
+	require.NoError(t, err)
+
+	genericMap := genericSpec.Maps["ssl_prewrite_tp"]
+	tpMap := tpSpec.Maps["ssl_prewrite_tp"]
+	require.NotNil(t, genericMap)
+	require.NotNil(t, tpMap)
+	require.Equal(t, genericMap.Type, tpMap.Type)
+	require.Equal(t, genericMap.KeySize, tpMap.KeySize)
+	require.Equal(t, genericMap.ValueSize, tpMap.ValueSize)
+	require.Equal(t, genericMap.MaxEntries, tpMap.MaxEntries)
+	require.Equal(t, genericMap.Flags, tpMap.Flags)
+	require.Equal(t, genericMap.Pinning, tpMap.Pinning)
+	require.Equal(t, ebpf.LRUHash, genericMap.Type)
+	require.Equal(t, uint32(24), genericMap.KeySize)
+	require.Equal(t, uint32(152), genericMap.ValueSize)
+	require.Equal(t, ebpfconvenience.PinInternal, genericMap.Pinning)
+
+	storage := tpSpec.Maps["sk_ssl_prewrite_map"]
+	require.NotNil(t, storage)
+	require.Equal(t, ebpf.SkStorage, storage.Type)
+	require.Equal(t, uint32(unix.BPF_F_NO_PREALLOC), storage.Flags)
+	require.Equal(t, ebpfconvenience.PinInternal, storage.Pinning)
+	require.Zero(t, storage.MaxEntries)
+
+	ongoingHTTP := genericSpec.Maps["ongoing_http"]
+	tpOngoingHTTP := tpSpec.Maps["ongoing_http"]
+	require.NotNil(t, ongoingHTTP)
+	require.NotNil(t, tpOngoingHTTP)
+	assertMapSpecEqual(t, "ongoing_http", ongoingHTTP, tpOngoingHTTP)
+	require.Equal(t, ebpfconvenience.PinInternal, ongoingHTTP.Pinning)
+
+	for name, sizes := range map[string][2]uint32{
+		"ssl_prewrite_connection_ambiguity": {48, 16},
+		"ssl_prewrite_connection_claims":    {48, 40},
+		"ssl_prewrite_connection_owners":    {48, 40},
+		"ssl_to_conn":                       {24, 48},
+		"ssl_prewrite_tp":                   {24, 152},
+	} {
+		genericShared := genericSpec.Maps[name]
+		tpShared := tpSpec.Maps[name]
+		require.NotNil(t, genericShared, name)
+		require.NotNil(t, tpShared, name)
+		require.Equal(t, sizes[0], genericShared.KeySize, name+" key size")
+		require.Equal(t, sizes[1], genericShared.ValueSize, name+" value size")
+		assertMapSpecEqual(t, name, genericShared, tpShared)
+	}
+	require.NotContains(t, tpSpec.Maps, "active_ssl_write_args")
+	for _, name := range []string{
+		"ssl_prewrite_connection_ambiguity",
+		"ssl_prewrite_connection_claims",
+		"ssl_prewrite_connection_owners",
+	} {
+		require.Equal(t, ebpf.Hash, genericSpec.Maps[name].Type, name)
+	}
+	activeWriteArgs := genericSpec.Maps["active_ssl_write_args"]
+	require.NotNil(t, activeWriteArgs)
+	require.Equal(t, ebpf.LRUHash, activeWriteArgs.Type)
+	require.Equal(t, uint32(16), activeWriteArgs.KeySize)
+	require.Equal(t, uint32(64), activeWriteArgs.ValueSize)
+	shutdownArgs := genericSpec.Maps["active_ssl_shutdown_args"]
+	require.NotNil(t, shutdownArgs)
+	require.Equal(t, ebpf.LRUHash, shutdownArgs.Type)
+	require.Equal(t, uint32(16), shutdownArgs.KeySize)
+	require.Equal(t, uint32(24), shutdownArgs.ValueSize)
+	require.Equal(t, ebpfconvenience.PinInternal, shutdownArgs.Pinning)
+}
+
+func assertMapSpecEqual(t *testing.T, name string, left, right *ebpf.MapSpec) {
+	t.Helper()
+	require.Equal(t, left.Type, right.Type, name+" type")
+	require.Equal(t, left.KeySize, right.KeySize, name+" key size")
+	require.Equal(t, left.ValueSize, right.ValueSize, name+" value size")
+	require.Equal(t, left.MaxEntries, right.MaxEntries, name+" max entries")
+	require.Equal(t, left.Flags, right.Flags, name+" flags")
+	require.Equal(t, left.Pinning, right.Pinning, name+" pinning")
 }
 
 func assertSharedMapSpecs(t *testing.T, left, right *ebpf.CollectionSpec) {
@@ -58,6 +158,10 @@ func assertSharedMapSpecs(t *testing.T, left, right *ebpf.CollectionSpec) {
 			continue
 		}
 		if name != "incoming_trace_map" &&
+			name != "active_ssl_write_args" &&
+			name != "ssl_prewrite_tp" &&
+			!strings.HasPrefix(name, "ssl_prewrite_connection_") &&
+			name != "ssl_to_conn" &&
 			!strings.HasPrefix(name, "incoming_trace_") &&
 			!strings.HasPrefix(name, "java_remote_parent_") &&
 			name != "java_authorized_processes" &&
@@ -70,12 +174,7 @@ func assertSharedMapSpecs(t *testing.T, left, right *ebpf.CollectionSpec) {
 		leftMap := left.Maps[name]
 		require.NotNil(t, leftMap, name+" missing")
 		compared++
-		require.Equal(t, leftMap.Type, rightMap.Type, name+" type")
-		require.Equal(t, leftMap.KeySize, rightMap.KeySize, name+" key size")
-		require.Equal(t, leftMap.ValueSize, rightMap.ValueSize, name+" value size")
-		require.Equal(t, leftMap.MaxEntries, rightMap.MaxEntries, name+" max entries")
-		require.Equal(t, leftMap.Flags, rightMap.Flags, name+" flags")
-		require.Equal(t, leftMap.Pinning, rightMap.Pinning, name+" pinning")
+		assertMapSpecEqual(t, name, leftMap, rightMap)
 	}
 	require.Positive(t, compared)
 }

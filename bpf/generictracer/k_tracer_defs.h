@@ -59,8 +59,10 @@ static __always_inline call_protocol_args_t *make_protocol_args(const pid_connec
     args->bytes_len = bytes_len;
     args->direction = direction;
     args->orig_dport = orig_dport;
+    args->flags = k_call_protocol_flag_none;
     args->connection_netns = task_netns();
-    args->connection_netns_cookie = java_remote_parent_enabled ? task_netns_cookie() : 0;
+    args->connection_netns_cookie = (ssl || java_remote_parent_enabled) ? task_netns_cookie() : 0;
+    args->ssl_ptr = 0;
     args->u_buf = (u64)u_buf;
     args->lw_thread = lw_thread;
     args->protocols = protocols;
@@ -95,6 +97,26 @@ static __always_inline void handle_buf_with_connection(void *ctx,
         return;
     }
 
+    bpf_tail_call(ctx, &jump_table, k_tail_handle_buf_with_args);
+}
+
+static __always_inline void handle_ssl_prewrite_with_connection(void *ctx,
+                                                                pid_connection_info_t *pid_conn,
+                                                                void *u_buf,
+                                                                int bytes_len,
+                                                                u16 orig_dport,
+                                                                u64 ssl_ptr,
+                                                                u64 handoff_id) {
+    const protocol_selector_t protocols = {.http = 1};
+    call_protocol_args_t *args = make_protocol_args(
+        pid_conn, k_lw_thread_none, protocols, u_buf, bytes_len, WITH_SSL, TCP_SEND, orig_dport);
+    if (!args) {
+        return;
+    }
+
+    args->flags = k_call_protocol_flag_ssl_prewrite;
+    args->ssl_ptr = ssl_ptr;
+    args->ssl_handoff_id = handoff_id;
     bpf_tail_call(ctx, &jump_table, k_tail_handle_buf_with_args);
 }
 

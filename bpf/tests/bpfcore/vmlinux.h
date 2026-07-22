@@ -59,6 +59,7 @@ struct nsproxy {
 struct task_struct {
     int pid;
     int tgid;
+    u64 start_time;
     struct task_struct *group_leader;
     struct task_struct *real_parent;
     struct nsproxy *nsproxy;

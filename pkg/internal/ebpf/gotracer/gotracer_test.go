@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"testing"
 
+	"github.com/cilium/ebpf"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -107,6 +108,11 @@ func TestJavaRemoteParentModeSelectsConsumerProtocolAndMapSizes(t *testing.T) {
 			require.Len(t, bundles, 1)
 			assert.Equal(t, tt.expectedCalls, probeCalls)
 			assert.Equal(t, tt.expected, bundles[0].Constants["java_remote_parent_enabled"])
+			writeArgs := bundles[0].Spec.Maps["active_ssl_write_args"]
+			require.NotNil(t, writeArgs)
+			assert.Equal(t, uint32(16), writeArgs.KeySize)
+			assert.Equal(t, uint32(64), writeArgs.ValueSize)
+			assert.Equal(t, ebpf.LRUHash, writeArgs.Type)
 
 			for _, name := range []string{"incoming_trace_heads", "incoming_trace_candidates"} {
 				mapSpec := bundles[0].Spec.Maps[name]

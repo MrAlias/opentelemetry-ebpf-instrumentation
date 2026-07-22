@@ -269,3 +269,32 @@ func TestBPFVerifierWithConstants(t *testing.T) {
 		{"stats_wakeup_data_bytes", []any{uint32(0), uint32(1 << 20)}},
 	})
 }
+
+func TestBPFVerifierProductionProfiles(t *testing.T) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Skipf("cannot remove memlock limit (insufficient privileges?): %v", err)
+	}
+	if err := javabridge.HaveSockOpsNetnsCookie(); err != nil {
+		t.Skipf("Java remote-parent verifier paths are unavailable: %v", err)
+	}
+
+	loadAndVerify(t, "generictracer/apache-java-https", generictracerbpf.LoadBpf, map[string]any{
+		"wakeup_data_bytes":           uint32(232_000),
+		"filter_pids":                 int32(1),
+		"capture_header_buffer":       int32(1),
+		"high_request_volume":         uint32(0),
+		"disable_black_box_cp":        uint32(0),
+		"http_max_captured_bytes":     uint32(8_192),
+		"tcp_max_captured_bytes":      uint32(0),
+		"mysql_max_captured_bytes":    uint32(0),
+		"kafka_max_captured_bytes":    uint32(0),
+		"postgres_max_captured_bytes": uint32(0),
+		"mssql_max_captured_bytes":    uint32(0),
+		"max_transaction_time":        uint64(300_000_000_000),
+		"g_bpf_debug":                 false,
+		"g_bpf_traceparent_enabled":   true,
+		"java_remote_parent_enabled":  true,
+		"ssl_prewrite_max_age_ns":     uint64(30_000_000_000),
+		"jvm_sampling_interval_ns":    uint64(0),
+	})
+}

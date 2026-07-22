@@ -74,27 +74,29 @@ force_sent_event(u64 id, u64 *sock_p, pid_connection_info_t *p_conn, const bool 
     if (s_args) {
         if (should_ignore_unreadable(&s_args->p_conn, unreadable)) {
             bpf_dbg_printk("ignoring force finish because of marked unreadable port");
-            return;
+            terminate_http_request_if_needed(&s_args->p_conn);
+        } else {
+            bpf_dbg_printk("Checking if we need to finish the request per thread id");
+            force_terminate_http_request(&s_args->p_conn);
         }
-        bpf_dbg_printk("Checking if we need to finish the request per thread id");
-        force_finish_possible_delayed_http_request(&s_args->p_conn);
     } // see if we match on another thread, but same sock *
     s_args = (send_args_t *)bpf_map_lookup_elem(&active_send_sock_args, sock_p);
     if (s_args) {
         if (should_ignore_unreadable(&s_args->p_conn, unreadable)) {
             bpf_dbg_printk("ignoring force finish because of marked unreadable port");
-            return;
+            terminate_http_request_if_needed(&s_args->p_conn);
+        } else {
+            bpf_dbg_printk("Checking if we need to finish the request per socket");
+            force_terminate_http_request(&s_args->p_conn);
         }
-        bpf_dbg_printk("Checking if we need to finish the request per socket");
-        force_finish_possible_delayed_http_request(&s_args->p_conn);
     }
 
     if (!is_empty_connection_info(&p_conn->conn)) {
         if (should_ignore_unreadable(p_conn, unreadable)) {
             bpf_dbg_printk("ignoring force finish because of marked unreadable port");
-            return;
+        } else {
+            bpf_dbg_printk("Checking if we need to finish the request per connection info");
+            force_terminate_http_request(p_conn);
         }
-        bpf_dbg_printk("Checking if we need to finish the request per connection info");
-        force_finish_possible_delayed_http_request(p_conn);
     }
 }

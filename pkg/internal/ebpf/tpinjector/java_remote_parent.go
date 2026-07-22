@@ -23,10 +23,11 @@ import (
 )
 
 const (
-	javaRemoteParentStatCount               = 23
+	javaRemoteParentStatCount               = 35
 	javaRemoteParentStatTakeUnauthorized    = 8
 	javaRemoteParentStatDiscardValid        = 12
 	javaRemoteParentStatDiscardUnauthorized = 16
+	javaRemoteParentStatHandoffValid        = 25
 	javaRemoteParentPollInterval            = 10 * time.Second
 	javaRemoteParentReadinessPollInterval   = 100 * time.Millisecond
 )
@@ -134,6 +135,18 @@ var javaRemoteParentStatLabels = [javaRemoteParentStatCount]javaRemoteParentStat
 	{transport: "getsockopt", operation: "negotiate", status: "missing"},
 	{transport: "getsockopt", operation: "negotiate", status: "unauthorized"},
 	{transport: "getsockopt", operation: "negotiate", status: "overload"},
+	{transport: "tcp", operation: "candidate", status: "ambiguous"},
+	{transport: "tcp", operation: "candidate", status: "overload"},
+	{transport: "tcp", operation: "handoff", status: "valid"},
+	{transport: "tcp", operation: "candidate", status: "valid"},
+	{transport: "tcp", operation: "candidate", status: "malformed"},
+	{transport: "tcp", operation: "inject", status: "valid"},
+	{transport: "tcp", operation: "inject", status: "missing"},
+	{transport: "tcp", operation: "inject", status: "stale"},
+	{transport: "tcp", operation: "inject", status: "ambiguous"},
+	{transport: "tcp", operation: "inject", status: "malformed"},
+	{transport: "tcp", operation: "inject", status: "overload"},
+	{transport: "tcp", operation: "inject", status: "segmented"},
 }
 
 func (p *Tracer) loadJavaRemoteParentSpecs() {

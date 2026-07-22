@@ -27,11 +27,16 @@ var disabledBridgeMapNames = [...]string{
 	"java_remote_parent_state",
 	"java_remote_parent_tasks",
 	"java_remote_parent_terminal",
+	"sk_ssl_prewrite_map",
+	"ssl_prewrite_tp",
 }
 
 func MinimizeDisabledMaps(spec *ebpf.CollectionSpec) {
 	for _, name := range disabledBridgeMapNames {
 		if bridgeMap := spec.Maps[name]; bridgeMap != nil {
+			if bridgeMap.Type == ebpf.SkStorage {
+				continue
+			}
 			bridgeMap.MaxEntries = 1
 		}
 	}

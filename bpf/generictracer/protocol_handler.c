@@ -27,15 +27,18 @@ int obi_handle_buf_with_args(void *ctx) {
         return 0;
     }
 
-    bpf_dbg_printk("=== kprobe buf=[%s], pid=%d, len=%d ===",
-                   args->small_buf,
-                   args->pid_conn.pid,
-                   args->bytes_len);
+    bpf_dbg_printk("=== kprobe pid=%d, len=%d ===", args->pid_conn.pid, args->bytes_len);
 
     if (args->protocols.http && is_http(args->small_buf, MIN_HTTP_SIZE, &args->packet_type)) {
         bpf_tail_call(ctx, &jump_table, k_tail_protocol_http);
-    } else if ((args->protocol_type != k_protocol_type_http) &&
-               is_http2_or_grpc(args->small_buf, MIN_HTTP2_SIZE)) {
+    }
+
+    if (args->flags & k_call_protocol_flag_ssl_prewrite) {
+        return 0;
+    }
+
+    if ((args->protocol_type != k_protocol_type_http) &&
+        is_http2_or_grpc(args->small_buf, MIN_HTTP2_SIZE)) {
         // check after the main if condition to avoid sending the undesired http2 to the tcp parsers
         if (!args->protocols.http2) {
             return 0;
@@ -122,7 +125,7 @@ int obi_handle_buf_with_args(void *ctx) {
                     unsigned char *buf = (unsigned char *)tp_char_buf_mem();
                     if (buf) {
                         bpf_probe_read(buf, TP_SIZE, (unsigned char *)args->u_buf);
-                        bpf_dbg_printk("Found traceparent buf=[%s]", buf);
+                        bpf_dbg_printk("Found traceparent continuation");
                         unsigned char *t_id = extract_trace_id(buf);
                         unsigned char *s_id = extract_span_id(buf);
                         unsigned char *f_id = extract_flags(buf);

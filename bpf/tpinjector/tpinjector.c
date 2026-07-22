@@ -3,6 +3,7 @@
 
 #include <bpfcore/vmlinux.h>
 #include <bpfcore/bpf_builtins.h>
+#include <bpfcore/compiler.h>
 #include <bpfcore/bpf_core_read.h>
 #include <bpfcore/bpf_helpers.h>
 #include <bpfcore/bpf_endian.h>
@@ -37,13 +38,16 @@
 #include <maps/incoming_trace_map.h>
 #include <maps/java_remote_parent_shared.h>
 #include <maps/msg_buffers.h>
+#include <maps/ongoing_http.h>
 #include <maps/outgoing_trace_map.h>
 #include <maps/sock_dir.h>
+#include <maps/ssl_prewrite_tp.h>
 #include <maps/tp_info_mem.h>
 #include <maps/tracked_sock_cookies.h>
 
 #include <tpinjector/h2_parse.h>
 #include <tpinjector/maps/sk_h2_conn_flag.h>
+#include <tpinjector/maps/sk_ssl_prewrite_map.h>
 #include <tpinjector/maps/sk_tp_info_pid_map.h>
 
 char __license[] SEC("license") = "Dual MIT/GPL";
@@ -136,6 +140,7 @@ enum {
 
 volatile const u32 inject_flags =
     k_inject_http_headers | k_inject_tcp_options; // default: both enabled
+volatile const u64 ssl_prewrite_max_age_ns = 30ULL * 1000 * 1000 * 1000;
 
 // Kind 25 is unassigned per IANA TCP Parameters registry (released 2000-12-18).
 enum {
@@ -197,7 +202,6 @@ typedef struct tailcall_ctx {
 } tailcall_ctx;
 
 SCRATCH_MEM(tailcall_ctx);
-SCRATCH_MEM_SIZED(tp_str_buf, 64);
 
 // Resume detect_h2 at next_pos for the next batched HEADERS frame.
 // Bumps the per-packet frame counter, then tail-calls back into detect_h2.
@@ -228,50 +232,6 @@ static __always_inline void mark_h2_socket(struct sk_msg_md *msg) {
 #ifndef ENOMSG
 #define ENOMSG 42
 #endif
-
-static __always_inline const char *tp_string_from_opt(const tcp_traceparent_option_t *opt,
-                                                      u8 flags) {
-    unsigned char *buf = tp_str_buf_mem();
-
-    if (!buf) {
-        return NULL;
-    }
-
-    unsigned char *ptr = buf;
-
-    // Version
-    *ptr++ = '0';
-    *ptr++ = '0';
-    *ptr++ = '-';
-
-    // Trace ID
-    encode_hex(ptr, opt->trace_id, TRACE_ID_SIZE_BYTES);
-    ptr += TRACE_ID_CHAR_LEN;
-
-    *ptr++ = '-';
-
-    // SpanID
-    encode_hex(ptr, opt->span_id, SPAN_ID_SIZE_BYTES);
-    ptr += SPAN_ID_CHAR_LEN;
-
-    *ptr++ = '-';
-
-    encode_hex(ptr, &flags, sizeof(flags));
-    ptr += FLAGS_CHAR_LEN;
-    *ptr++ = '\0';
-
-    return (const char *)buf;
-}
-
-static __always_inline void print_tp(const char *msg, const tp_info_t *tp) {
-    if (!g_bpf_debug) {
-        return;
-    }
-
-    unsigned char tp_buf_str[TP_MAX_VAL_LENGTH];
-    make_tp_string(tp_buf_str, tp);
-    bpf_dbg_printk("%s: %s", msg, tp_buf_str);
-}
 
 // This is setup here for Go and SSL tracking.
 // Essentially, when the Go or the OpenSSL userspace
@@ -421,7 +381,11 @@ static __always_inline void bpf_sock_ops_active_est_cb(struct bpf_sock_ops *skop
     if (bpf_sock_hash_update(skops, &sock_dir, (void *)&cookie, BPF_ANY) == 0) {
         bpf_map_update_elem(&tracked_sock_cookies, &cookie, &(u8){1}, BPF_ANY);
     }
-    bpf_sock_ops_set_flags(skops, BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG);
+    u32 flags = BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG;
+    if (java_remote_parent_enabled) {
+        flags |= BPF_SOCK_OPS_STATE_CB_FLAG;
+    }
+    bpf_sock_ops_set_flags(skops, flags);
 }
 
 static __always_inline void bpf_sock_ops_passive_est_cb(struct bpf_sock_ops *skops) {
@@ -436,27 +400,244 @@ static __always_inline void bpf_sock_ops_passive_est_cb(struct bpf_sock_ops *sko
     bpf_sock_ops_set_flags(skops, flags);
 }
 
+static __always_inline ssl_prewrite_value_t *
+ssl_prewrite_for_socket_key(const ssl_prewrite_socket_value_t *owner) {
+    if (!owner) {
+        return NULL;
+    }
+    return bpf_map_lookup_elem(&ssl_prewrite_tp, &owner->key);
+}
+
+static __always_inline u8 ssl_prewrite_socket_owner_matches_value(
+    const ssl_prewrite_socket_value_t *owner, const ssl_prewrite_value_t *prewrite) {
+    return owner && prewrite &&
+           __builtin_memcmp(&prewrite->trace, &owner->trace, sizeof(prewrite->trace)) == 0;
+}
+
+static __always_inline ssl_prewrite_value_t *
+ssl_prewrite_for_socket_owner(const ssl_prewrite_socket_value_t *owner) {
+    ssl_prewrite_value_t *prewrite = ssl_prewrite_for_socket_key(owner);
+    return ssl_prewrite_socket_owner_matches_value(owner, prewrite) ? prewrite : NULL;
+}
+
+static __always_inline void finish_ssl_prewrite_transport(struct bpf_sock *sk,
+                                                          const ssl_prewrite_socket_value_t *owner,
+                                                          enum ssl_prewrite_transport_phase phase,
+                                                          enum java_remote_parent_stat stat) {
+    ssl_prewrite_value_t *prewrite = ssl_prewrite_for_socket_key(owner);
+    if (!prewrite) {
+        java_remote_parent_stat_add(k_java_remote_parent_stat_inject_missing);
+    } else if (!ssl_prewrite_socket_owner_matches_value(owner, prewrite)) {
+        java_remote_parent_stat_add(k_java_remote_parent_stat_inject_malformed);
+    } else if (!ssl_prewrite_transport_terminal(prewrite->transport_phase)) {
+        prewrite->transport_phase = phase;
+        java_remote_parent_stat_add(stat);
+        cleanup_completed_ssl_prewrite(&owner->key);
+    } else {
+        cleanup_completed_ssl_prewrite(&owner->key);
+    }
+    bpf_sk_storage_delete(&sk_ssl_prewrite_map, sk);
+}
+
+static __always_inline u8
+ssl_prewrite_socket_owner_is_live(struct bpf_sock *sk, const ssl_prewrite_socket_value_t *owner) {
+    ssl_prewrite_value_t *prewrite = ssl_prewrite_for_socket_owner(owner);
+    const u64 now = bpf_ktime_get_ns();
+    const u8 valid = ssl_prewrite_shared_value_valid(prewrite, now, ssl_prewrite_max_age_ns);
+    const u8 proven_failed = ssl_prewrite_owner_proven_failed(prewrite);
+    if (valid && !proven_failed && !ssl_prewrite_transport_terminal(prewrite->transport_phase)) {
+        return 1;
+    }
+
+    if (prewrite && ssl_prewrite_transport_terminal(prewrite->transport_phase)) {
+        cleanup_completed_ssl_prewrite(&owner->key);
+        bpf_sk_storage_delete(&sk_ssl_prewrite_map, sk);
+    } else {
+        enum java_remote_parent_stat failure_stat = k_java_remote_parent_stat_inject_malformed;
+        if (!prewrite) {
+            failure_stat = k_java_remote_parent_stat_inject_missing;
+        } else if (proven_failed || ssl_prewrite_expired(prewrite, now, ssl_prewrite_max_age_ns)) {
+            failure_stat = k_java_remote_parent_stat_inject_stale;
+        }
+        finish_ssl_prewrite_transport(sk, owner, k_ssl_prewrite_transport_overload, failure_stat);
+    }
+    return 0;
+}
+
+enum ssl_prewrite_local_commit_result : u8 {
+    k_ssl_prewrite_local_commit_missing = 0,
+    k_ssl_prewrite_local_commit_valid = 1,
+    k_ssl_prewrite_local_commit_malformed = 2,
+};
+
+static __always_inline enum ssl_prewrite_local_commit_result
+commit_ssl_prewrite_transport_local(const ssl_prewrite_value_t *prewrite) {
+    if (!prewrite || !prewrite->ssl || prewrite->trace.pid != prewrite->connection.pid ||
+        prewrite->trace.req_type != EVENT_HTTP_CLIENT ||
+        prewrite->trace.provenance != k_tp_provenance_ssl_prewrite ||
+        !valid_trace(prewrite->trace.tp.trace_id) || !valid_span(prewrite->trace.tp.span_id)) {
+        return k_ssl_prewrite_local_commit_malformed;
+    }
+    http_info_t *info = bpf_map_lookup_elem(&ongoing_http, &prewrite->connection);
+    if (!info) {
+        return k_ssl_prewrite_local_commit_missing;
+    }
+    if (info->ssl_prewrite_pending != k_ssl_prewrite_local_pending ||
+        !ssl_prewrite_transport_local_fields_match(
+            prewrite, info->type, info->ssl, info->direction, info->start_monotime_ns, &info->tp)) {
+        return k_ssl_prewrite_local_commit_malformed;
+    }
+    info->ssl_prewrite_pending = k_ssl_prewrite_local_none;
+    return k_ssl_prewrite_local_commit_valid;
+}
+
+static __always_inline u8 ssl_prewrite_opt_len_matches_segment(
+    const struct bpf_sock_ops *skops, const ssl_prewrite_value_t *prewrite) {
+    return prewrite && prewrite->target_tcp_sequence_valid && skops->skb_len > 0 &&
+           !(skops->skb_tcp_flags & (TCPHDR_SYN | TCPHDR_RST)) &&
+           tcp_traceparent_len_may_contain_target(
+               skops->snd_nxt, skops->skb_len, prewrite->target_tcp_sequence);
+}
+
+static __always_inline enum tcp_traceparent_target_position ssl_prewrite_write_target_position(
+    struct bpf_sock_ops *skops, const ssl_prewrite_value_t *prewrite, u32 *header_len) {
+    const struct tcphdr *tcp = (const struct tcphdr *)(long)skops->skb_data;
+    const void *data_end = (const void *)(long)skops->skb_data_end;
+    _Static_assert(sizeof(*tcp) == k_tcp_base_header_bytes, "unexpected TCP base header size");
+    if (header_len) {
+        *header_len = 0;
+    }
+    if (!prewrite || !header_len || !prewrite->target_tcp_sequence_valid ||
+        (const void *)(tcp + 1) > data_end || (skops->skb_tcp_flags & (TCPHDR_SYN | TCPHDR_RST))) {
+        return k_tcp_traceparent_target_invalid;
+    }
+
+    const u32 tcp_header_len = (u32)tcp->doff * 4;
+    // WRITE_HDR_OPT exposes data_end only through options preceding the reserved BPF option.
+    if (!tcp_traceparent_write_packet_valid(skops->skb_len, tcp_header_len)) {
+        return k_tcp_traceparent_target_invalid;
+    }
+
+    const u32 sequence = bpf_ntohl(tcp->seq);
+    *header_len = tcp_header_len;
+    return tcp_traceparent_target_position(
+        sequence, skops->skb_len - tcp_header_len, prewrite->target_tcp_sequence);
+}
+
 static __always_inline void bpf_sock_ops_opt_len_cb(struct bpf_sock_ops *skops) {
     struct bpf_sock *sk = skops->sk;
-
     if (!sk) {
         return;
     }
 
+    const ssl_prewrite_socket_value_t *owner =
+        bpf_sk_storage_get(&sk_ssl_prewrite_map, sk, NULL, 0);
+    if (owner) {
+        ssl_prewrite_value_t *prewrite = ssl_prewrite_for_socket_owner(owner);
+        if (!prewrite) {
+            finish_ssl_prewrite_transport(sk,
+                                          owner,
+                                          k_ssl_prewrite_transport_overload,
+                                          k_java_remote_parent_stat_inject_missing);
+            return;
+        }
+        const u64 now = bpf_ktime_get_ns();
+        if (ssl_prewrite_expired(prewrite, now, ssl_prewrite_max_age_ns)) {
+            finish_ssl_prewrite_transport(sk,
+                                          owner,
+                                          k_ssl_prewrite_transport_overload,
+                                          k_java_remote_parent_stat_inject_stale);
+            return;
+        }
+        if (!ssl_prewrite_shared_value_structurally_valid(prewrite)) {
+            finish_ssl_prewrite_transport(sk,
+                                          owner,
+                                          k_ssl_prewrite_transport_overload,
+                                          k_java_remote_parent_stat_inject_malformed);
+            return;
+        }
+        if (!ssl_prewrite_connection_has_exact_owner(prewrite, &owner->key)) {
+            finish_ssl_prewrite_transport(sk,
+                                          owner,
+                                          k_ssl_prewrite_transport_overload,
+                                          k_java_remote_parent_stat_inject_ambiguous);
+            return;
+        }
+        if (prewrite->write_outcome == k_ssl_prewrite_write_failed ||
+            prewrite->arbitration == k_ssl_prewrite_arbitration_write_failed ||
+            prewrite->arbitration == k_ssl_prewrite_arbitration_failed_transport) {
+            finish_ssl_prewrite_transport(sk,
+                                          owner,
+                                          k_ssl_prewrite_transport_overload,
+                                          k_java_remote_parent_stat_inject_stale);
+            return;
+        }
+        if (prewrite->transport_phase != k_ssl_prewrite_transport_scheduled) {
+            if (ssl_prewrite_transport_terminal(prewrite->transport_phase)) {
+                cleanup_completed_ssl_prewrite(&owner->key);
+                bpf_sk_storage_delete(&sk_ssl_prewrite_map, sk);
+            } else {
+                finish_ssl_prewrite_transport(sk,
+                                              owner,
+                                              k_ssl_prewrite_transport_overload,
+                                              k_java_remote_parent_stat_inject_ambiguous);
+            }
+            return;
+        }
+
+        if (!ssl_prewrite_ready_to_reserve(prewrite, now, ssl_prewrite_max_age_ns)) {
+            finish_ssl_prewrite_transport(sk,
+                                          owner,
+                                          k_ssl_prewrite_transport_overload,
+                                          k_java_remote_parent_stat_inject_ambiguous);
+            return;
+        }
+
+        if (skops->args[0] & BPF_WRITE_HDR_TCP_CURRENT_MSS) {
+            if (bpf_reserve_hdr_opt(skops, tcp_traceparent_option_size(1, 1), 0) != 0) {
+                finish_ssl_prewrite_transport(sk,
+                                              owner,
+                                              k_ssl_prewrite_transport_overload,
+                                              k_java_remote_parent_stat_inject_overload);
+            }
+            return;
+        }
+
+        if (!ssl_prewrite_opt_len_matches_segment(skops, prewrite)) {
+            if (tcp_sequence_before(prewrite->target_tcp_sequence, skops->snd_nxt)) {
+                finish_ssl_prewrite_transport(sk,
+                                              owner,
+                                              k_ssl_prewrite_transport_overload,
+                                              k_java_remote_parent_stat_inject_ambiguous);
+            }
+            return;
+        }
+
+        bpf_sk_storage_delete(&sk_tp_info_pid_map, sk);
+        if (bpf_reserve_hdr_opt(skops, sizeof(tcp_traceparent_option_t), 0) != 0) {
+            java_remote_parent_stat_add(k_java_remote_parent_stat_inject_overload);
+            return;
+        }
+        prewrite->transport_phase = k_ssl_prewrite_transport_reserved;
+        return;
+    }
+
     tp_info_pid_t *tp_pid = bpf_sk_storage_get(&sk_tp_info_pid_map, sk, NULL, 0);
-
-    if (!tp_pid) {
+    const enum tcp_traceparent_legacy_opt_len_action action =
+        tcp_traceparent_legacy_opt_len_action(java_remote_parent_enabled, tp_pid != NULL);
+    if (action == k_tcp_traceparent_legacy_opt_len_none) {
         return;
     }
-
-    const u32 option_size = java_remote_parent_enabled ? sizeof(tcp_traceparent_option_t)
-                                                       : sizeof(tcp_traceparent_legacy_option_t);
-    const long ret = bpf_reserve_hdr_opt(skops, option_size, 0);
-
-    if (ret != 0) {
-        bpf_dbg_printk("failed to reserve TCP option: %d", ret);
+    if (action == k_tcp_traceparent_legacy_opt_len_delete) {
+        bpf_sk_storage_delete(&sk_tp_info_pid_map, sk);
         return;
     }
+    const u8 option_size = tcp_traceparent_option_size(java_remote_parent_enabled, 0);
+    if (!option_size) {
+        bpf_sk_storage_delete(&sk_tp_info_pid_map, sk);
+        return;
+    }
+    bpf_reserve_hdr_opt(skops, option_size, 0);
 }
 
 static __always_inline void bpf_sock_ops_write_hdr_cb(struct bpf_sock_ops *skops) {
@@ -466,15 +647,164 @@ static __always_inline void bpf_sock_ops_write_hdr_cb(struct bpf_sock_ops *skops
         return;
     }
 
-    const tp_info_pid_t *tp_pid = bpf_sk_storage_get(&sk_tp_info_pid_map, sk, NULL, 0);
+    const ssl_prewrite_socket_value_t *owner =
+        bpf_sk_storage_get(&sk_ssl_prewrite_map, sk, NULL, 0);
+    if (owner) {
+        ssl_prewrite_value_t *prewrite = ssl_prewrite_for_socket_owner(owner);
+        if (!prewrite) {
+            finish_ssl_prewrite_transport(sk,
+                                          owner,
+                                          k_ssl_prewrite_transport_overload,
+                                          k_java_remote_parent_stat_inject_missing);
+            return;
+        }
+        const u64 now = bpf_ktime_get_ns();
+        if (ssl_prewrite_expired(prewrite, now, ssl_prewrite_max_age_ns)) {
+            finish_ssl_prewrite_transport(sk,
+                                          owner,
+                                          k_ssl_prewrite_transport_overload,
+                                          k_java_remote_parent_stat_inject_stale);
+            return;
+        }
+        if (!ssl_prewrite_shared_value_structurally_valid(prewrite)) {
+            finish_ssl_prewrite_transport(sk,
+                                          owner,
+                                          k_ssl_prewrite_transport_overload,
+                                          k_java_remote_parent_stat_inject_malformed);
+            return;
+        }
+        if (!ssl_prewrite_connection_has_exact_owner(prewrite, &owner->key)) {
+            finish_ssl_prewrite_transport(sk,
+                                          owner,
+                                          k_ssl_prewrite_transport_overload,
+                                          k_java_remote_parent_stat_inject_ambiguous);
+            return;
+        }
+        if (prewrite->transport_phase == k_ssl_prewrite_transport_scheduled) {
+            return;
+        }
+        if (prewrite->transport_phase != k_ssl_prewrite_transport_reserved) {
+            if (ssl_prewrite_transport_terminal(prewrite->transport_phase)) {
+                cleanup_completed_ssl_prewrite(&owner->key);
+                bpf_sk_storage_delete(&sk_ssl_prewrite_map, sk);
+            } else {
+                finish_ssl_prewrite_transport(sk,
+                                              owner,
+                                              k_ssl_prewrite_transport_overload,
+                                              k_java_remote_parent_stat_inject_ambiguous);
+            }
+            return;
+        }
+        if (prewrite->write_outcome == k_ssl_prewrite_write_failed ||
+            prewrite->arbitration == k_ssl_prewrite_arbitration_write_failed ||
+            prewrite->arbitration == k_ssl_prewrite_arbitration_failed_transport) {
+            finish_ssl_prewrite_transport(sk,
+                                          owner,
+                                          k_ssl_prewrite_transport_overload,
+                                          k_java_remote_parent_stat_inject_stale);
+            return;
+        }
+        if (!ssl_prewrite_ready_to_emit(prewrite, now, ssl_prewrite_max_age_ns)) {
+            finish_ssl_prewrite_transport(sk,
+                                          owner,
+                                          k_ssl_prewrite_transport_overload,
+                                          k_java_remote_parent_stat_inject_ambiguous);
+            return;
+        }
+        u32 tcp_header_len = 0;
+        const enum tcp_traceparent_target_position target_position =
+            ssl_prewrite_write_target_position(skops, prewrite, &tcp_header_len);
+        const enum tcp_traceparent_write_action write_action = tcp_traceparent_write_packet_action(
+            target_position, skops->skb_len, tcp_header_len, skops->mss_cache);
+        if (write_action == k_tcp_traceparent_write_retry) {
+            prewrite->transport_phase = k_ssl_prewrite_transport_scheduled;
+            return;
+        }
+        if (write_action == k_tcp_traceparent_write_segmented) {
+            finish_ssl_prewrite_transport(sk,
+                                          owner,
+                                          k_ssl_prewrite_transport_overload,
+                                          k_java_remote_parent_stat_inject_segmented);
+            return;
+        }
+        if (write_action != k_tcp_traceparent_write_emit) {
+            finish_ssl_prewrite_transport(sk,
+                                          owner,
+                                          k_ssl_prewrite_transport_overload,
+                                          k_java_remote_parent_stat_inject_ambiguous);
+            return;
+        }
 
-    if (!tp_pid) {
-        bpf_dbg_printk("tp info not found");
+        prewrite->transport_phase = k_ssl_prewrite_transport_emitting;
+        ssl_prewrite_mark_transport_may_emit(prewrite);
+        const u32 arbitration = ssl_prewrite_arbitration_state(prewrite);
+        if (!ssl_prewrite_transport_may_emit(arbitration)) {
+            finish_ssl_prewrite_transport(sk,
+                                          owner,
+                                          k_ssl_prewrite_transport_overload,
+                                          arbitration == k_ssl_prewrite_arbitration_failed_transport
+                                              ? k_java_remote_parent_stat_inject_stale
+                                              : k_java_remote_parent_stat_inject_ambiguous);
+            return;
+        }
+        const enum ssl_prewrite_local_commit_result local_commit =
+            commit_ssl_prewrite_transport_local(prewrite);
+        if (local_commit != k_ssl_prewrite_local_commit_valid) {
+            finish_ssl_prewrite_transport(sk,
+                                          owner,
+                                          k_ssl_prewrite_transport_overload,
+                                          local_commit == k_ssl_prewrite_local_commit_missing
+                                              ? k_java_remote_parent_stat_inject_missing
+                                              : k_java_remote_parent_stat_inject_malformed);
+            return;
+        }
+
+        if (!ssl_prewrite_connection_has_exact_owner(prewrite, &owner->key)) {
+            finish_ssl_prewrite_transport(sk,
+                                          owner,
+                                          k_ssl_prewrite_transport_overload,
+                                          k_java_remote_parent_stat_inject_ambiguous);
+            return;
+        }
+
+        tcp_traceparent_option_t opt = {
+            .kind = k_tcp_traceparent_option_kind,
+            .len = sizeof(tcp_traceparent_option_t),
+            .flags = owner->trace.tp.flags,
+        };
+        __builtin_memcpy(opt.trace_id, owner->trace.tp.trace_id, sizeof(opt.trace_id));
+        __builtin_memcpy(opt.span_id, owner->trace.tp.span_id, sizeof(opt.span_id));
+
+        const long ret = bpf_store_hdr_opt(skops, &opt, sizeof(opt), 0);
+        finish_ssl_prewrite_transport(sk,
+                                      owner,
+                                      ret == 0 ? k_ssl_prewrite_transport_accepted
+                                               : k_ssl_prewrite_transport_overload,
+                                      ret == 0 ? k_java_remote_parent_stat_inject_valid
+                                               : k_java_remote_parent_stat_inject_overload);
+        bpf_dbg_printk("TCP traceparent option write result=%d", ret);
         return;
     }
 
-    // cleanup the storage to prevent it from being written more than once
-    // (including during responses);
+    const tp_info_pid_t *stored = bpf_sk_storage_get(&sk_tp_info_pid_map, sk, NULL, 0);
+    if (!stored) {
+        bpf_dbg_printk("tp info not found");
+        return;
+    }
+    if (!tcp_traceparent_legacy_option_allowed(java_remote_parent_enabled)) {
+        bpf_sk_storage_delete(&sk_tp_info_pid_map, sk);
+        return;
+    }
+
+    tp_info_pid_t *tp_pid = (tp_info_pid_t *)tp_info_mem();
+    if (!tp_pid) {
+        bpf_sk_storage_delete(&sk_tp_info_pid_map, sk);
+        return;
+    }
+    *tp_pid = *stored;
+
+    // Cleanup prevents the option from being written more than once, including
+    // on response packets.
     bpf_sk_storage_delete(&sk_tp_info_pid_map, sk);
 
     if (!valid_trace(tp_pid->tp.trace_id) || !valid_span(tp_pid->tp.span_id)) {
@@ -482,40 +812,21 @@ static __always_inline void bpf_sock_ops_write_hdr_cb(struct bpf_sock_ops *skops
         return;
     }
 
-    tcp_traceparent_option_t opt = {
+    tcp_traceparent_legacy_option_t opt = {
         .kind = k_tcp_traceparent_option_kind,
-        .len = sizeof(tcp_traceparent_option_t),
-        .flags = tp_pid->tp.flags,
+        .len = sizeof(tcp_traceparent_legacy_option_t),
     };
 
     __builtin_memcpy(opt.trace_id, tp_pid->tp.trace_id, sizeof(opt.trace_id));
     __builtin_memcpy(opt.span_id, tp_pid->tp.span_id, sizeof(opt.span_id));
 
-    long ret = 0;
-    if (java_remote_parent_enabled) {
-        ret = bpf_store_hdr_opt(skops, &opt, sizeof(opt), 0);
-    } else {
-        tcp_traceparent_legacy_option_t legacy = {
-            .kind = k_tcp_traceparent_option_kind,
-            .len = sizeof(tcp_traceparent_legacy_option_t),
-        };
-        __builtin_memcpy(legacy.trace_id, opt.trace_id, sizeof(legacy.trace_id));
-        __builtin_memcpy(legacy.span_id, opt.span_id, sizeof(legacy.span_id));
-        ret = bpf_store_hdr_opt(skops, &legacy, sizeof(legacy), 0);
-    }
+    const long ret = bpf_store_hdr_opt(skops, &opt, sizeof(opt), 0);
 
     if (ret != 0) {
         bpf_dbg_printk("failed to store option: %d", ret);
     }
 
-    if (g_bpf_debug) {
-        const char *tp_str =
-            tp_string_from_opt(&opt, java_remote_parent_enabled && ret == 0 ? tp_pid->tp.flags : 0);
-
-        if (tp_str) {
-            bpf_dbg_printk("written TP to TCP options: %s", tp_str);
-        }
-    }
+    bpf_dbg_printk("TCP traceparent option write result=%d", ret);
 }
 
 static __always_inline u8 tcp_sequence_from_sockops(struct bpf_sock_ops *skops, u32 *sequence) {
@@ -545,6 +856,9 @@ static __always_inline void bpf_sock_ops_parse_hdr_cb(struct bpf_sock_ops *skops
 
     if (ret < 0) {
         bpf_dbg_printk("error parsing TCP option: %d", ret);
+        if (java_remote_parent_enabled) {
+            java_remote_parent_stat_add(k_java_remote_parent_stat_candidate_malformed);
+        }
         return;
     }
 
@@ -555,16 +869,13 @@ static __always_inline void bpf_sock_ops_parse_hdr_cb(struct bpf_sock_ops *skops
     __builtin_memcpy(tp.tp.span_id, opt.span_id, sizeof(tp.tp.span_id));
     if ((!exact_flags && !legacy) || !valid_trace(tp.tp.trace_id) || !valid_span(tp.tp.span_id)) {
         bpf_dbg_printk("ignoring malformed TCP traceparent option");
+        if (java_remote_parent_enabled) {
+            java_remote_parent_stat_add(k_java_remote_parent_stat_candidate_malformed);
+        }
         return;
     }
 
-    if (g_bpf_debug) {
-        const char *tp_str = tp_string_from_opt(&opt, exact_flags ? opt.flags : 0);
-
-        if (tp_str) {
-            bpf_dbg_printk("found TP in TCP options: %s", tp_str);
-        }
-    }
+    bpf_dbg_printk("found valid TCP traceparent option");
 
     tp.valid = 1;
     tp.tp.ts = bpf_ktime_get_ns();
@@ -574,6 +885,9 @@ static __always_inline void bpf_sock_ops_parse_hdr_cb(struct bpf_sock_ops *skops
     u32 tcp_sequence = 0;
     if (!tcp_sequence_from_sockops(skops, &tcp_sequence)) {
         bpf_dbg_printk("ignoring TCP traceparent option without a complete TCP header");
+        if (java_remote_parent_enabled) {
+            java_remote_parent_stat_add(k_java_remote_parent_stat_candidate_malformed);
+        }
         return;
     }
 
@@ -583,7 +897,7 @@ static __always_inline void bpf_sock_ops_parse_hdr_cb(struct bpf_sock_ops *skops
     if (java_remote_parent_enabled) {
         netns_cookie = bpf_get_netns_cookie(skops);
         if (!netns_cookie) {
-            java_remote_parent_stat_add(k_java_remote_parent_stat_stage_overload);
+            java_remote_parent_stat_add(k_java_remote_parent_stat_candidate_overload);
             return;
         }
     }
@@ -598,9 +912,11 @@ static __always_inline void bpf_sock_ops_parse_hdr_cb(struct bpf_sock_ops *skops
                 &conn, netns_cookie, ambiguous_generation);
         }
         if (result == k_incoming_trace_ambiguous) {
-            java_remote_parent_stat_add(k_java_remote_parent_stat_stage_ambiguous);
+            java_remote_parent_stat_add(k_java_remote_parent_stat_candidate_ambiguous);
         } else if (result == k_incoming_trace_update_failed) {
-            java_remote_parent_stat_add(k_java_remote_parent_stat_stage_overload);
+            java_remote_parent_stat_add(k_java_remote_parent_stat_candidate_overload);
+        } else {
+            java_remote_parent_stat_add(k_java_remote_parent_stat_candidate_valid);
         }
     }
 }
@@ -610,10 +926,23 @@ static __always_inline void bpf_sock_ops_state_cb(struct bpf_sock_ops *skops) {
         return;
     }
 
+    struct bpf_sock *sk = skops->sk;
+    if (sk) {
+        const ssl_prewrite_socket_value_t *owner =
+            bpf_sk_storage_get(&sk_ssl_prewrite_map, sk, NULL, 0);
+        if (owner) {
+            finish_ssl_prewrite_transport(
+                sk, owner, k_ssl_prewrite_transport_closed, k_java_remote_parent_stat_inject_stale);
+        }
+    }
+
     connection_info_t conn = get_connection_info_ops(skops);
     sort_connection_info(&conn);
     const u64 netns_cookie = bpf_get_netns_cookie(skops);
     if (netns_cookie) {
+        if (ssl_prewrite_connection_tracked(&conn, netns_cookie)) {
+            cleanup_ssl_prewrite_connection(&conn, netns_cookie);
+        }
         java_remote_parent_mark_connection_ambiguous_in_netns_cookie(&conn, netns_cookie, 0);
         delete_strict_incoming_trace(&conn, netns_cookie);
     }
@@ -811,7 +1140,7 @@ make_tp_string_skb(unsigned char *buf, const tp_info_t *tp, const unsigned char 
     *buf++ = '\r';
     *buf++ = '\n';
 
-    bpf_dbg_printk("tp_string=%s", tp_string);
+    bpf_dbg_printk("traceparent string prepared");
 }
 
 static __always_inline void
@@ -908,7 +1237,14 @@ static __always_inline bool write_msg_traceparent(struct sk_msg_md *msg, const t
     return extend_and_write_tp(msg, write_offset, tp);
 }
 
-static __always_inline void schedule_write_tcp_option(struct sk_msg_md *msg, tp_info_pid_t *tp_p) {
+static __always_inline void
+schedule_write_tcp_option(struct sk_msg_md *msg, tp_info_pid_t *tp_p, u8 report_suppression) {
+    if (!tcp_traceparent_legacy_option_allowed(java_remote_parent_enabled)) {
+        if (report_suppression) {
+            java_remote_parent_stat_add(k_java_remote_parent_stat_inject_ambiguous);
+        }
+        return;
+    }
     struct bpf_sock *sk = msg->sk;
 
     if (!sk) {
@@ -922,10 +1258,96 @@ static __always_inline void schedule_write_tcp_option(struct sk_msg_md *msg, tp_
         return;
     }
 
-    // associate it also with this socket for the tcp options program
     *stp = *tp_p;
-
     tp_p->written = 1;
+}
+
+static __always_inline bool ssl_prewrite_socket_had_owner(struct sk_msg_md *msg) {
+    struct bpf_sock *sk = msg->sk;
+    if (!sk) {
+        return false;
+    }
+
+    const ssl_prewrite_socket_value_t *owner =
+        bpf_sk_storage_get(&sk_ssl_prewrite_map, sk, NULL, 0);
+    if (!owner) {
+        return false;
+    }
+    ssl_prewrite_socket_owner_is_live(sk, owner);
+    return true;
+}
+
+static __always_inline u8 ssl_prewrite_socket_has_exact_owner(struct sk_msg_md *msg,
+                                                              const ssl_prewrite_key_t *key,
+                                                              const tp_info_pid_t *trace) {
+    struct bpf_sock *sk = msg->sk;
+    if (!sk) {
+        return 0;
+    }
+    const ssl_prewrite_socket_value_t *owner =
+        bpf_sk_storage_get(&sk_ssl_prewrite_map, sk, NULL, 0);
+    return ssl_prewrite_socket_owner_matches(owner, key, trace);
+}
+
+static __always_inline void
+clear_legacy_ssl_parent(struct sk_msg_md *msg, const egress_key_t *e_key, u8 report_suppression) {
+    if (get_tp_info_pid(e_key) && report_suppression) {
+        java_remote_parent_stat_add(k_java_remote_parent_stat_inject_ambiguous);
+        report_suppression = 0;
+    }
+    clear_tp_info_pid(e_key);
+
+    struct bpf_sock *sk = msg->sk;
+    if (sk) {
+        if (bpf_sk_storage_get(&sk_tp_info_pid_map, sk, NULL, 0) && report_suppression) {
+            java_remote_parent_stat_add(k_java_remote_parent_stat_inject_ambiguous);
+        }
+        bpf_sk_storage_delete(&sk_tp_info_pid_map, sk);
+    }
+}
+
+static __always_inline enum ssl_prewrite_transport_phase schedule_ssl_prewrite_tcp_option(
+    struct sk_msg_md *msg, const ssl_prewrite_key_t *key, tp_info_pid_t *tp_p) {
+    struct bpf_sock *sk = msg->sk;
+    if (!sk) {
+        java_remote_parent_stat_add(k_java_remote_parent_stat_inject_overload);
+        return k_ssl_prewrite_transport_overload;
+    }
+
+    bpf_sk_storage_delete(&sk_tp_info_pid_map, sk);
+
+    const ssl_prewrite_socket_value_t *existing =
+        bpf_sk_storage_get(&sk_ssl_prewrite_map, sk, NULL, 0);
+    if (existing) {
+        if (ssl_prewrite_socket_owner_matches(existing, key, tp_p)) {
+            return k_ssl_prewrite_transport_scheduled;
+        }
+        if (ssl_prewrite_socket_owner_is_live(sk, existing)) {
+            java_remote_parent_stat_add(k_java_remote_parent_stat_inject_ambiguous);
+            return k_ssl_prewrite_transport_occupied;
+        }
+    }
+
+    ssl_prewrite_socket_value_t *candidate = ssl_prewrite_socket_value_mem();
+    if (!candidate) {
+        java_remote_parent_stat_add(k_java_remote_parent_stat_inject_overload);
+        return k_ssl_prewrite_transport_overload;
+    }
+    __builtin_memset(candidate, 0, sizeof(*candidate));
+    candidate->key = *key;
+    candidate->trace = *tp_p;
+
+    const ssl_prewrite_socket_value_t *stored =
+        bpf_sk_storage_get(&sk_ssl_prewrite_map, sk, candidate, BPF_SK_STORAGE_GET_F_CREATE);
+    if (!stored) {
+        java_remote_parent_stat_add(k_java_remote_parent_stat_inject_overload);
+        return k_ssl_prewrite_transport_overload;
+    }
+    if (!ssl_prewrite_socket_owner_matches(stored, key, tp_p)) {
+        java_remote_parent_stat_add(k_java_remote_parent_stat_inject_ambiguous);
+        return k_ssl_prewrite_transport_occupied;
+    }
+    return k_ssl_prewrite_transport_scheduled;
 }
 
 static __always_inline void write_http_traceparent(struct sk_msg_md *msg, tp_info_pid_t *tp_pid) {
@@ -977,12 +1399,20 @@ static __always_inline bool handle_existing_tp_pid(struct sk_msg_md *msg,
                                                    const pid_connection_info_t *p_conn,
                                                    const egress_key_t *e_key,
                                                    tp_info_pid_t *tp_pid) {
-    if (inject_flags & k_inject_tcp_options) {
-        schedule_write_tcp_option(msg, tp_pid);
+    const u8 legacy_identity_valid = tp_pid->pid == p_conn->pid &&
+                                     valid_trace(tp_pid->tp.trace_id) &&
+                                     valid_span(tp_pid->tp.span_id);
+    const u8 action = tcp_traceparent_existing_parent_action(java_remote_parent_enabled,
+                                                             inject_flags & k_inject_tcp_options,
+                                                             tp_pid->valid,
+                                                             legacy_identity_valid);
+    if (action & k_tcp_traceparent_existing_parent_schedule_legacy) {
+        schedule_write_tcp_option(msg, tp_pid, 0);
     }
 
-    // valid==0: SSL or junk — drop it and stop tracking
-    if (tp_pid->valid == 0) {
+    // valid==0 is the bridge-disabled SSL marker. It may use the legacy TCP
+    // option above, but it must not enter plaintext protocol handling.
+    if (!(action & k_tcp_traceparent_existing_parent_continue_plaintext)) {
         clear_tp_info_pid(e_key);
         return true;
     }
@@ -992,6 +1422,10 @@ static __always_inline bool handle_existing_tp_pid(struct sk_msg_md *msg,
 
     const bool is_http = protocol_detector(msg, id, &p_conn->conn);
     if (is_http) {
+        if ((inject_flags & k_inject_tcp_options) &&
+            !tcp_traceparent_legacy_option_allowed(java_remote_parent_enabled)) {
+            schedule_write_tcp_option(msg, tp_pid, !(inject_flags & k_inject_http_headers));
+        }
         if (inject_flags & k_inject_http_headers) {
             write_http_traceparent(msg, tp_pid);
         } else {
@@ -1002,6 +1436,96 @@ static __always_inline bool handle_existing_tp_pid(struct sk_msg_md *msg,
 
     clear_tp_info_pid(e_key);
     return false;
+}
+
+static __always_inline enum java_remote_parent_stat
+ssl_prewrite_validation_failure_stat(enum ssl_prewrite_validation_result validation) {
+    switch (validation) {
+    case k_ssl_prewrite_validation_missing:
+        return k_java_remote_parent_stat_inject_missing;
+    case k_ssl_prewrite_validation_stale:
+        return k_java_remote_parent_stat_inject_stale;
+    case k_ssl_prewrite_validation_malformed:
+        return k_java_remote_parent_stat_inject_malformed;
+    default:
+        return k_java_remote_parent_stat_inject_ambiguous;
+    }
+}
+
+static __always_inline bool handle_ssl_prewrite(struct sk_msg_md *msg,
+                                                const pid_connection_info_t *p_conn,
+                                                u16 destination_port,
+                                                u64 netns_cookie) {
+    // BPF_FUNC_get_netns_cookie is unavailable to SK_MSG before Linux 5.15.
+    // Match the task namespace used by the generic tracer on supported kernels.
+    if (!netns_cookie) {
+        return false;
+    }
+    connection_info_netns_cookie_t *connection_key =
+        ssl_prewrite_connection_key(&p_conn->conn, netns_cookie);
+    if (!connection_key) {
+        return true;
+    }
+    if (bpf_map_lookup_elem(&ssl_prewrite_connection_ambiguity, connection_key)) {
+        return true;
+    }
+    const ssl_prewrite_connection_owner_t *connection_owner =
+        bpf_map_lookup_elem(&ssl_prewrite_connection_owners, connection_key);
+    if (!connection_owner) {
+        return false;
+    }
+    if (connection_owner->state != k_ssl_prewrite_connection_owner_published) {
+        return true;
+    }
+    const ssl_prewrite_key_t key = connection_owner->key;
+    ssl_prewrite_value_t *value = bpf_map_lookup_elem(&ssl_prewrite_tp, &key);
+    if (!value) {
+        block_ssl_prewrite_connection(&p_conn->conn, netns_cookie, bpf_ktime_get_ns());
+        java_remote_parent_stat_add(k_java_remote_parent_stat_inject_missing);
+        return true;
+    }
+
+    if (!ssl_prewrite_value_matches(value, p_conn, destination_port, netns_cookie)) {
+        block_ssl_prewrite_connection(&p_conn->conn, netns_cookie, bpf_ktime_get_ns());
+        value->transport_phase = k_ssl_prewrite_transport_overload;
+        java_remote_parent_stat_add(k_java_remote_parent_stat_inject_malformed);
+        return true;
+    }
+    if (ssl_prewrite_transport_terminal(value->transport_phase)) {
+        return true;
+    }
+    const u64 now = bpf_ktime_get_ns();
+    const enum ssl_prewrite_validation_result validation =
+        ssl_prewrite_schedule_validation(value, now, ssl_prewrite_max_age_ns);
+    if (value->transport_phase == k_ssl_prewrite_transport_none &&
+        validation != k_ssl_prewrite_validation_ready) {
+        value->transport_phase = k_ssl_prewrite_transport_overload;
+        java_remote_parent_stat_add(ssl_prewrite_validation_failure_stat(validation));
+        return true;
+    }
+    if (value->transport_phase != k_ssl_prewrite_transport_none &&
+        (validation == k_ssl_prewrite_validation_missing ||
+         validation == k_ssl_prewrite_validation_stale ||
+         validation == k_ssl_prewrite_validation_malformed)) {
+        value->transport_phase = k_ssl_prewrite_transport_overload;
+        java_remote_parent_stat_add(ssl_prewrite_validation_failure_stat(validation));
+        return true;
+    }
+
+    tp_info_pid_t *trace = &value->trace;
+    if (value->transport_phase == k_ssl_prewrite_transport_none) {
+        value->transport_phase = (inject_flags & k_inject_tcp_options)
+                                     ? schedule_ssl_prewrite_tcp_option(msg, &key, trace)
+                                     : k_ssl_prewrite_transport_overload;
+        if (!(inject_flags & k_inject_tcp_options)) {
+            java_remote_parent_stat_add(k_java_remote_parent_stat_inject_overload);
+        }
+    } else if (!ssl_prewrite_transport_terminal(value->transport_phase) &&
+               !ssl_prewrite_socket_has_exact_owner(msg, &key, trace)) {
+        value->transport_phase = k_ssl_prewrite_transport_overload;
+        java_remote_parent_stat_add(k_java_remote_parent_stat_inject_ambiguous);
+    }
+    return true;
 }
 
 // Sock_msg program which detects packets where it should add space for
@@ -1033,6 +1557,40 @@ int obi_packet_extender(struct sk_msg_md *msg) {
     t_ctx->h2_frames = 0;
     t_ctx->h2_tp_retries = 0;
 
+    const u32 monitored_pid = valid_pid(id);
+    const bool had_ssl_prewrite_owner =
+        java_remote_parent_enabled && ssl_prewrite_socket_had_owner(msg);
+    if (had_ssl_prewrite_owner && !monitored_pid) {
+        clear_legacy_ssl_parent(msg, &e_key, false);
+        return SK_PASS;
+    }
+
+    if (java_remote_parent_enabled && monitored_pid) {
+        const u64 netns_cookie = task_netns_cookie();
+        if (handle_ssl_prewrite(msg, &t_ctx->p_conn, conn.d_port, netns_cookie)) {
+            clear_legacy_ssl_parent(msg, &e_key, false);
+            return SK_PASS;
+        }
+        if (had_ssl_prewrite_owner) {
+            clear_legacy_ssl_parent(msg, &e_key, false);
+            return SK_PASS;
+        }
+        if (is_ssl_connection(&t_ctx->p_conn)) {
+            clear_legacy_ssl_parent(msg, &e_key, false);
+            return SK_PASS;
+        }
+    }
+
+    if (!tcp_traceparent_generic_injection_allowed(java_remote_parent_enabled)) {
+        clear_legacy_ssl_parent(msg, &e_key, monitored_pid != 0);
+
+        if (monitored_pid || is_go_grpc_client_conn(&t_ctx->p_conn)) {
+            bpf_msg_pull_data(msg, 0, msg->size, 0);
+            fill_msg_buffers(msg, &t_ctx->p_conn, &e_key);
+        }
+        return SK_PASS;
+    }
+
     // skip H2 here — it uses HPACK for per-stream traceparents
     tp_info_pid_t *tp_pid = get_tp_info_pid(&e_key);
     if (tp_pid && !is_h2_socket(msg) &&
@@ -1046,7 +1604,7 @@ int obi_packet_extender(struct sk_msg_md *msg) {
         return SK_PASS;
     }
 
-    if (!valid_pid(id)) {
+    if (!monitored_pid) {
         return SK_PASS;
     }
 
@@ -1096,8 +1654,7 @@ int obi_packet_extender_write_msg_tp(struct sk_msg_md *msg) {
         bpf_d_printk("failed to write traceparent [%s]", __FUNCTION__);
     }
 
-    print_tp("written TP to headers", &tp_p->tp);
-    bpf_dbg_printk("BUF=[%s]", msg->data);
+    bpf_dbg_printk("wrote traceparent header");
 
     return SK_PASS;
 }
@@ -1213,12 +1770,12 @@ int obi_packet_extender_find_existing_tp(struct sk_msg_md *msg) {
             tp_p->pid = t_ctx->p_conn.pid;
             tp_p->req_type = EVENT_HTTP_CLIENT;
 
-            print_tp("found TP in headers", &tp_p->tp);
+            bpf_dbg_printk("found valid traceparent header");
 
             set_tp_info_pid(&t_ctx->e_key, tp_p);
 
             if (inject_flags & k_inject_tcp_options) {
-                schedule_write_tcp_option(msg, tp_p);
+                schedule_write_tcp_option(msg, tp_p, 0);
             }
 
             return SK_PASS;
@@ -1263,7 +1820,7 @@ int obi_packet_extender_create_tp(struct sk_msg_md *msg) {
     set_tp_info_pid(&t_ctx->e_key, tp_p);
 
     if (inject_flags & k_inject_tcp_options) {
-        schedule_write_tcp_option(msg, tp_p);
+        schedule_write_tcp_option(msg, tp_p, !(inject_flags & k_inject_http_headers));
     }
 
     if (inject_flags & k_inject_http_headers) {
@@ -1699,7 +2256,7 @@ int obi_packet_extender_write_h2_tp(struct sk_msg_md *msg) {
 
     bpf_msg_pull_data(msg, 0, msg->size, 0);
 
-    print_tp("h2: written TP to HPACK", &tp_p->tp);
+    bpf_dbg_printk("wrote HTTP/2 traceparent field");
 
     // bpf_msg_push_data shifted bytes after inject_offset right by
     // k_h2_tp_hpack_size, so the next batched HEADERS frame is now at

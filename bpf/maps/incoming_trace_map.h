@@ -380,10 +380,13 @@ incoming_trace_claimed_generation_matches_in_netns_cookie(const connection_info_
     return head && *head == generation;
 }
 
-static __always_inline tp_info_pid_t *consume_strict_incoming_trace_with_generation(
-    const connection_info_t *connection, u64 netns_cookie, u64 *generation_out) {
+static __always_inline tp_info_pid_t *consume_strict_incoming_trace_with_generation_if_allowed(
+    const connection_info_t *connection, u64 netns_cookie, u64 *generation_out, u8 claim_allowed) {
     if (generation_out) {
         *generation_out = 0;
+    }
+    if (!claim_allowed) {
+        return NULL;
     }
     connection_info_netns_cookie_t *connection_key =
         incoming_trace_connection_key_for(connection, netns_cookie);
@@ -429,20 +432,34 @@ static __always_inline tp_info_pid_t *consume_strict_incoming_trace_with_generat
     return snapshot;
 }
 
+static __always_inline tp_info_pid_t *consume_strict_incoming_trace_with_generation(
+    const connection_info_t *connection, u64 netns_cookie, u64 *generation_out) {
+    return consume_strict_incoming_trace_with_generation_if_allowed(
+        connection, netns_cookie, generation_out, 1);
+}
+
 static __always_inline tp_info_pid_t *
 consume_strict_incoming_trace(const connection_info_t *connection, u64 netns_cookie) {
     return consume_strict_incoming_trace_with_generation(connection, netns_cookie, NULL);
 }
 
-static __always_inline tp_info_pid_t *consume_incoming_trace_in_netns_cookie_with_generation(
-    const connection_info_t *connection, u64 netns_cookie, u64 *generation_out) {
+static __always_inline tp_info_pid_t *
+consume_incoming_trace_in_netns_cookie_with_generation_if_allowed(
+    const connection_info_t *connection, u64 netns_cookie, u64 *generation_out, u8 claim_allowed) {
     if (!java_remote_parent_enabled) {
         if (generation_out) {
             *generation_out = 0;
         }
         return legacy_consume_incoming_trace(connection);
     }
-    return consume_strict_incoming_trace_with_generation(connection, netns_cookie, generation_out);
+    return consume_strict_incoming_trace_with_generation_if_allowed(
+        connection, netns_cookie, generation_out, claim_allowed);
+}
+
+static __always_inline tp_info_pid_t *consume_incoming_trace_in_netns_cookie_with_generation(
+    const connection_info_t *connection, u64 netns_cookie, u64 *generation_out) {
+    return consume_incoming_trace_in_netns_cookie_with_generation_if_allowed(
+        connection, netns_cookie, generation_out, 1);
 }
 
 static __always_inline tp_info_pid_t *

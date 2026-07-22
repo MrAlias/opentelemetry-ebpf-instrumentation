@@ -236,7 +236,19 @@ enum java_remote_parent_stat : u32 {
     k_java_remote_parent_stat_negotiate_missing = 20,
     k_java_remote_parent_stat_negotiate_unauthorized = 21,
     k_java_remote_parent_stat_negotiate_overload = 22,
-    k_java_remote_parent_stat_max = 23,
+    k_java_remote_parent_stat_candidate_ambiguous = 23,
+    k_java_remote_parent_stat_candidate_overload = 24,
+    k_java_remote_parent_stat_handoff_valid = 25,
+    k_java_remote_parent_stat_candidate_valid = 26,
+    k_java_remote_parent_stat_candidate_malformed = 27,
+    k_java_remote_parent_stat_inject_valid = 28,
+    k_java_remote_parent_stat_inject_missing = 29,
+    k_java_remote_parent_stat_inject_stale = 30,
+    k_java_remote_parent_stat_inject_ambiguous = 31,
+    k_java_remote_parent_stat_inject_malformed = 32,
+    k_java_remote_parent_stat_inject_overload = 33,
+    k_java_remote_parent_stat_inject_segmented = 34,
+    k_java_remote_parent_stat_max = 35,
 };
 
 struct {

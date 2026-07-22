@@ -1037,7 +1037,7 @@ java_duplicate_suppression_present() {
   local -r metrics="$1"
 
   awk '
-    $0 ~ /^otel_ebpf_avoided_services/ &&
+    $0 ~ /^obi_avoided_services/ &&
     $0 ~ /service_name="java-backend"/ &&
     $0 ~ /service_namespace="apache-java-https"/ &&
     $0 ~ /telemetry_type="traces"/ && $2 > 0 { found = 1 }
@@ -1056,7 +1056,7 @@ bridge_success_total() {
   local -r metrics="$1"
 
   awk '
-    $0 ~ /^otel_ebpf_java_remote_parent_operations_total/ &&
+    $0 ~ /^obi_java_remote_parent_operations_total/ &&
     $0 ~ /operation="(take|discard)"/ &&
     $0 ~ /status="valid"/ &&
     $0 ~ /transport="(getsockopt|unix)"/ {
@@ -1194,7 +1194,7 @@ wait_for_pressure_map_state() {
     if fetch_obi_metrics "$metrics" 2>/dev/null; then
       resolved="$(pressure_map_metric \
         "$metrics" \
-        otel_ebpf_bpf_map_entries_total \
+        obi_bpf_map_entries_total \
         "$PRESSURE_MAP_ID")"
       entries="${resolved#* }"
       if [[ "$entries" =~ ^[0-9]+$ ]]; then
@@ -1233,7 +1233,7 @@ monitor_map_pressure() {
     fi
     resolved="$(pressure_map_metric \
       "$metrics" \
-      otel_ebpf_bpf_map_entries_total \
+      obi_bpf_map_entries_total \
       "$PRESSURE_MAP_ID")"
     entries="${resolved#* }"
     if [[ ! "$entries" =~ ^[0-9]+$ || "$entries" != "$PRESSURE_MAP_MAX_ENTRIES" ]]; then
@@ -2245,8 +2245,8 @@ write_metrics_delta() {
   unsorted="$(mktemp "$RESULT_DIR/.metrics-delta.XXXXXX")"
   awk '
     function wanted(metric) {
-      return metric ~ /^otel_ebpf_java_remote_parent_operations_total/ ||
-        metric ~ /^otel_ebpf_bpf_map_(entries|max_entries)_total/
+      return metric ~ /^obi_java_remote_parent_operations_total/ ||
+        metric ~ /^obi_bpf_map_(entries|max_entries)_total/
     }
     FNR == NR {
       if ($0 !~ /^#/ && NF == 2 && wanted($1)) {
@@ -2304,7 +2304,7 @@ assert_bridge_metric_delta() {
       sub("\".*$", "", value)
       return value
     }
-    /^otel_ebpf_java_remote_parent_operations_total/ {
+    /^obi_java_remote_parent_operations_total/ {
       operation = label($0, "operation")
       status = label($0, "status")
       transport = label($0, "transport")

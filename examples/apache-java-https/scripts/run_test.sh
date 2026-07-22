@@ -407,12 +407,12 @@ test_metrics_delta_reports_counters_and_map_occupancy() {
   local delta="$TEST_TMP_DIR/metrics.delta"
 
   cat >"$before" <<'EOF'
-otel_ebpf_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 2
-otel_ebpf_bpf_map_entries_total{map_id="1",map_name="java_remote_parent_state",map_type="hash"} 7
+obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 2
+obi_bpf_map_entries_total{map_id="1",map_name="java_remote_parent_state",map_type="hash"} 7
 EOF
   cat >"$after" <<'EOF'
-otel_ebpf_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 5
-otel_ebpf_bpf_map_entries_total{map_id="1",map_name="java_remote_parent_state",map_type="hash"} 1
+obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 5
+obi_bpf_map_entries_total{map_id="1",map_name="java_remote_parent_state",map_type="hash"} 1
 EOF
   RESULT_DIR="$TEST_TMP_DIR"
   write_metrics_delta "$before" "$after" "$delta"
@@ -432,13 +432,13 @@ test_metric_boundary_helpers_are_reason_coded() {
   local pressure=""
 
   cat >"$metrics" <<'EOF'
-otel_ebpf_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 2
-otel_ebpf_java_remote_parent_operations_total{operation="discard",status="valid",transport="unix"} 3
-otel_ebpf_java_remote_parent_operations_total{operation="take",status="missing",transport="getsockopt"} 99
-otel_ebpf_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} 99
-otel_ebpf_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7
-otel_ebpf_bpf_map_max_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 10000
-otel_ebpf_avoided_services{otel_metric_overflow="false",service_name="java-backend",service_namespace="apache-java-https",telemetry_type="traces"} 1
+obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 2
+obi_java_remote_parent_operations_total{operation="discard",status="valid",transport="unix"} 3
+obi_java_remote_parent_operations_total{operation="take",status="missing",transport="getsockopt"} 99
+obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} 99
+obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7
+obi_bpf_map_max_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 10000
+obi_avoided_services{otel_metric_overflow="false",service_name="java-backend",service_namespace="apache-java-https",telemetry_type="traces"} 1
 EOF
 
   [[ "$(bridge_success_total "$metrics")" == "5" ]] || {
@@ -447,7 +447,7 @@ EOF
   }
   pressure="$(pressure_map_metric \
     "$metrics" \
-    otel_ebpf_bpf_map_max_entries_total)"
+    obi_bpf_map_max_entries_total)"
   [[ "$pressure" == "41 10000" ]] || {
     printf 'could not resolve pressure map metadata: %s\n' "$pressure" >&2
     return 1
@@ -468,7 +468,7 @@ test_pressure_monitor_requires_full_occupancy() {
     : >"$PRESSURE_MONITOR_OUTPUT"
     fetch_obi_metrics() {
       printf '%s\n' \
-        'otel_ebpf_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 9' >"$1"
+        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 9' >"$1"
     }
     if (monitor_map_pressure); then
       printf 'pressure monitor accepted below-full occupancy\n' >&2
@@ -486,7 +486,7 @@ test_pressure_monitor_requires_full_occupancy() {
     PRESSURE_MAP_MAX_ENTRIES=10
     fetch_obi_metrics() {
       printf '%s\n' \
-        'otel_ebpf_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 10' >"$1"
+        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 10' >"$1"
     }
     start_map_pressure_monitor
     local monitor_pid="$PRESSURE_MONITOR_PID"
@@ -515,11 +515,11 @@ test_bridge_metric_delta_requires_exact_one_shot_results() {
   local -r delta="$TEST_TMP_DIR/w3c-metrics.delta"
 
   cat >"$delta" <<'EOF'
-otel_ebpf_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=3 after=5 delta=2
-otel_ebpf_java_remote_parent_operations_total{operation="negotiate",status="missing",transport="getsockopt"} before=3 after=5 delta=2
-otel_ebpf_java_remote_parent_operations_total{operation="discard",status="valid",transport="getsockopt"} before=1 after=1 delta=0
-otel_ebpf_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} before=3 after=5 delta=2
-otel_ebpf_java_remote_parent_operations_total{operation="take",status="missing",transport="getsockopt"} before=0 after=0 delta=0
+obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=3 after=5 delta=2
+obi_java_remote_parent_operations_total{operation="negotiate",status="missing",transport="getsockopt"} before=3 after=5 delta=2
+obi_java_remote_parent_operations_total{operation="discard",status="valid",transport="getsockopt"} before=1 after=1 delta=0
+obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} before=3 after=5 delta=2
+obi_java_remote_parent_operations_total{operation="take",status="missing",transport="getsockopt"} before=0 after=0 delta=0
 EOF
   assert_bridge_metric_delta "$delta" getsockopt 2 0 || {
     printf 'bridge metric delta rejected exact one-shot results\n' >&2

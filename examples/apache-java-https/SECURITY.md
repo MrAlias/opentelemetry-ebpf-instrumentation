@@ -91,9 +91,10 @@ or credential topology; do not mark it pass.
   parsing, short I/O deadlines, a fixed counter, and no request identity
   logging.
 - Java diagnostics are requested directly from the verified Jetty TLS endpoint
-  before and after each scenario. The endpoint is excluded from server
-  instrumentation, snapshots are stored separately from OBI metrics, and the
-  runner requires exact deltas with zero unexpected retrieval results.
+  before and after each bridge scenario. The runner stores snapshots separately
+  from OBI metrics and accounts for exactly one self-observed missing lookup;
+  another missing result still fails the scenario. Fault-injection scenarios do
+  not probe diagnostics because doing so would consume a fault response.
 - Compose project names are restricted to the reserved demo namespace. Every
   container, volume, and network has an ownership sentinel, and the runner
   verifies all project-labeled resources before startup or destructive cleanup.

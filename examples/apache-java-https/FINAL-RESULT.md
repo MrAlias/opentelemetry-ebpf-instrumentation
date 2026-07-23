@@ -75,13 +75,13 @@ the final column.
 | #28 Java extraction matrix | stock-agent paths for no state, W3C-only, OBI-only, matching/conflicting W3C, sampled/unsampled flags, malformed-W3C fallback, stale/malformed OBI fallback, redispatch, async, keepalive, and parallel; exact one-shot transport and Java diagnostics | execute privileged paths and retain the resulting evidence |
 | #31 deterministic traffic/assertions | exact IDs/remote flags, marker selection, W3C precedence/fallback/no-state, keepalive, concurrency, and two distinct controls | retain successful privileged-run artifacts |
 | #33 final report | this result template and automatic environment/evidence bundle | populate every row from real runs |
-| #34 stress | keepalive, explicit HTTP/1.1 pipelining, parallel/churn, stable Jetty connection IDs, deterministic frontend ephemeral-port reuse, observed frontend/Jetty fd reuse, slow body, cancellation/retry, and live map pressure/eviction assets | execute privileged runs and retain the scenario connection/trace evidence |
+| #34 stress | keepalive, explicit HTTP/1.1 pipelining, parallel/churn, stable Jetty connection IDs, deterministic frontend ephemeral-port reuse, observed frontend/Jetty fd reuse, slow body, deterministic split/coalesced TLS receive-boundary fixtures for TLS 1.2/1.3, cancellation/retry, and live map pressure/eviction assets | execute privileged runs and retain the scenario connection/trace evidence |
 | #35 handoff | servlet async/redispatch, executor hops/faults, Java 21 virtual-thread, and real Netty event-loop/worker assets | execute privileged runs and retain exact-parent evidence |
 | #36 fail-open | OBI absent at JVM start, late attach/recovery, live valid-W3C traffic spanning an enforced OBI stop/restart, bridge/extension disabled and extension-absent controls, true uninstrumented equivalence, and named bounded Unix response faults | execute privileged runs and retain each per-fault diagnostic delta |
 | #37 benchmark | predeclared matrix, repeated bounded workload, and resource/map snapshots | execute on fixed hardware and add sustained latency/throughput evidence |
 | #38 compatibility | explicit untested matrix | execute each claimed kernel/cgroup/architecture/JVM/agent/TLS/transport cell |
 | #39 diagnostics | bounded sanitized receiver, exact per-scenario take/status/flag/selection deltas, zero unexpected retrieval results, runtime topology, and suppression evidence | execute runs and verify every remaining core reason/cardinality bound under negative tests |
-| #40 security | threat/abuse matrix and topology guidance only | execute same-cgroup, sibling-container, forged-identity, UDS replacement/flood, and side-channel cases |
+| #40 security | same-cgroup and sibling-container primary controls, concurrent Unix forged/repeated/flood abuse with an exact-parent victim, UDS replacement, permissive-directory refusal, exact diagnostics schema, and post-abuse recovery | execute privileged runs and retain every topology, metric, response, and sanitized-log artifact |
 
 Until those rows have attached evidence, they remain `untested`; a plan or
 template is not a successful validation result.

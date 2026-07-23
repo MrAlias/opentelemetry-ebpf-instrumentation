@@ -97,6 +97,16 @@ before changing that status.
   --transport unix \
   --agent otel \
   --tls TLSv1.3
+
+./examples/apache-java-https/run.sh \
+  --transport getsockopt \
+  --agent otel \
+  --tls TLSv1.2
+
+./examples/apache-java-https/run.sh \
+  --transport unix \
+  --agent otel \
+  --tls TLSv1.2
 ```
 
 Attach the result directories, `bpftool feature probe` output, cgroup mount

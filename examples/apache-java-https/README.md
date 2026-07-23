@@ -3,6 +3,11 @@
 This example is a vendor-neutral, machine-verifiable proof of the OBI Java
 remote-parent bridge. It runs this fixed topology on a Linux Docker host:
 
+It is the executable evidence harness for
+[issue #2](https://github.com/MrAlias/opentelemetry-ebpf-instrumentation/issues/2)
+and its bridge architecture, implementation, integration, and validation
+sub-issues.
+
 ```text
 trace-scenario
     |
@@ -45,8 +50,17 @@ For an OBI-derived parent, it requires all of the following:
 2. a nonzero Java parent span ID;
 3. exactly one `apache-proxy` inbound server span;
 4. exactly one `apache-proxy` client span whose span ID equals the Java parent
-   and whose parent is that inbound Apache span;
+   and which descends from that inbound Apache span through only the retained
+   in-process ancestry;
 5. an exact trace ID match across that chain.
+
+The pipelining stress is the only exception to item 3. Coalesced HTTP/1.1
+requests are intentionally sent in one buffered write, while OBI can retain
+only one in-flight inbound request per connection. The assertion therefore
+accepts zero or one marker-correlated inbound Apache span. When that span is
+absent, the Apache client span must be a root; when present, the normal ancestry
+check still applies. Every marker must still have one exact Apache client to
+Java remote-parent link, and multiple inbound candidates are rejected.
 
 All selected spans must have the scenario's exact endpoint and exact random
 marker value in addition to the expected `service.name` and span kind. Prefix,
@@ -160,6 +174,9 @@ From the repository root:
 The default `all` suite runs, in order:
 
 - an exact OBI-derived parent check;
+- bounded primary and fallback abuse controls that keep legitimate exact-parent
+  traffic active, distinguish the same-cgroup attacker from a sibling
+  container, reject a world-accessible Unix directory, and prove recovery;
 - sequential requests over one reused backend connection;
 - bodyless HTTP/1.1 requests written as one pipeline before any response read;
 - parallel requests that force multiple backend connections;
@@ -167,7 +184,11 @@ The default `all` suite runs, in order:
 - closed and reopened connections that reuse one frontend ephemeral port and
   require observed frontend and Jetty file-descriptor reuse across distinct
   stable Jetty connection IDs;
-- request bodies paced in small writes on the client-to-Apache hop;
+- 64 KiB request bodies paced in small writes, with monotonic backend counters
+  requiring multiple decrypted Java receive callbacks per request;
+- deterministic split and coalesced plaintext callback shapes in the opt-in
+  Netty TLS fixture, reached from exact-parented Apache-to-Java requests and
+  validated under the selected TLS 1.2 or TLS 1.3 backend protocol;
 - a canceled request followed by a successful retry;
 - live handoff-claim LRU saturation and eviction during concurrent traffic;
 - servlet async and executor handoff across varied hop counts, cancellation,
@@ -191,6 +212,14 @@ Run the fallback transport and TLS version separately:
 
 ```bash
 ./examples/apache-java-https/run.sh --transport unix --tls TLSv1.2
+```
+
+The `tls-boundary` target runs both the split and coalesced cases. Run it once
+per declared protocol when iterating on that boundary:
+
+```bash
+./examples/apache-java-https/run.sh --scenario tls-boundary --tls TLSv1.2
+./examples/apache-java-https/run.sh --scenario tls-boundary --tls TLSv1.3
 ```
 
 Exercise the Splunk distribution without changing the backend:
@@ -253,15 +282,19 @@ unrelated containers, or retained result directories.
 Before traffic begins, the orchestrator uses bounded waits for:
 
 - the local OTLP receiver health endpoint;
-- Apache's `/healthz` request through the verified HTTPS Jetty path;
 - OBI log `Java remote parent bridge ready`;
 - helper log `OBI remote-parent provider ready`;
-- extension log `OBI remote-parent propagator enabled`.
+- extension log `OBI remote-parent propagator enabled`;
+- injected-instrumentation log `OBI Java instrumentation ready`;
+- Apache's `/healthz` request through the verified HTTPS Jetty path, with the
+  backend connection closed before measured traffic begins.
 
 The bridge-disabled control skips OBI/helper bridge readiness but still
-requires the official agent and external-extension readiness. The
+requires external-extension and injected-instrumentation readiness. The
 late-attach control requires the official agent and extension to remain healthy
-while OBI is absent, then waits for helper readiness after OBI starts. Separate
+while OBI is absent, then waits for provider and injected-instrumentation
+readiness after OBI starts. It preserves the JVM and recycles only Apache so no
+pre-attach backend TLS connection enters the recovery scenario. Separate
 controls run with the extension absent and disabled. The uninstrumented control
 requires that the official agent, extension, and OBI are absent. Every build,
 Compose operation, HTTP request, and trace wait has a deadline.
@@ -330,9 +363,11 @@ Only a generated marker header is captured. The receiver rejects compressed or
 oversized requests, enforces configured count, per-string, and aggregate
 retained-byte ceilings, and strips arbitrary headers and bodies before writing
 evidence. Any receiver eviction or rejection is reason-coded and invalidates
-the scenario. Java diagnostics are fetched only after each post-scenario OBI
-metric snapshot and delta, so the diagnostic request cannot change the
-reason-coded interval attributed to that scenario.
+the scenario. Java diagnostics are fetched after each post-scenario OBI metric
+snapshot. Their delta requires exactly one self-observed missing lookup, so the
+diagnostic request cannot mask another missing lookup in the reason-coded
+interval attributed to that scenario. Fault-injection scenarios skip the probe
+so it cannot consume a synthetic fault response.
 
 A dirty source tree, `--skip-bridge-build`, or an individually targeted
 scenario is explicitly labeled non-acceptance evidence. Only a clean full
@@ -349,7 +384,8 @@ the retained `compose.log` in this order:
 3. Apache must load `mod_ssl` and verify the generated CA and hostname.
 4. OBI must discover ports `18080` and `18443`, then report its selected
    remote-parent transport.
-5. The JVM must report both helper and extension readiness messages.
+5. The JVM must report provider, extension, and injected-instrumentation
+   readiness messages.
 6. A failed scenario JSON shows the last sanitized span graph, including the
    exact unmatched trace/parent boundary.
 
@@ -367,9 +403,16 @@ not change transport.
 - Pipelining is exercised only on the plaintext HTTP/1.1 client-to-Apache hop.
   The scenario writes every request before reading a response and fails unless
   every response and exact parent is returned.
-- The slow-body control paces writes only on the client-to-Apache hop. It does
-  not prove how Apache/OpenSSL segments plaintext into backend TLS records or
-  how many Java receive callbacks observe that plaintext.
+- The final serial request, and every parallel request, sends `Connection:
+  close` and asks the backend to close its response. This preserves earlier
+  backend reuse while giving OBI a TCP close boundary that finishes delayed TLS
+  spans before trace assertions.
+- Readiness and metric-boundary health probes also ask Jetty to close the
+  backend connection, preventing probe state from entering a measured scenario.
+- The slow-body control proves that each measured request after the baseline
+  crosses at least two decrypted Java receive callbacks and that those
+  callbacks account for at least the full 64 KiB body. It does not infer exact
+  Apache/OpenSSL TLS record boundaries from the client-side write pattern.
 - Servlet, executor, Netty-worker, and virtual-thread scenarios begin after the
   stock server instrumentation has extracted the parent. They validate
   post-extraction ownership cleanup and reuse, not an unproven

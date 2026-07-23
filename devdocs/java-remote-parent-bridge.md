@@ -19,7 +19,24 @@ request.
    connection. A second unconsumed candidate for the same connection marks the
    connection ambiguous instead of replacing the first candidate.
 3. The existing Java TLS receive advice synchronously reports decrypted bytes
-   before it returns them to the HTTP implementation.
+   before it returns them to the HTTP implementation. `SSLEngine` correlation
+   prefers the exact connection scoped by the current Netty operation. The
+   generic `SocketChannel` fallback uses the exact `ByteBuffer` object from a
+   verified positive read; it never derives ownership from attacker-controlled
+   ciphertext. Duplicate and sliced buffer objects therefore miss rather than
+   aliasing their backing storage. The weak, bounded identity map does not retain
+   application buffers. Session-owner and marker caches likewise use bounded weak
+   identity keys so custom TLS engines and their defining class loaders can be
+   reclaimed. Capacity saturation rejects new identities; correlation fails
+   closed and an unrecorded marker remains eligible for retry. Marker attempts are
+   reserved atomically against the exact connection-owner generation before JNI,
+   so concurrent and failed calls still respect the bounded burst and retry
+   interval. A live buffer observed on distinct connection-owner generations
+   remains ambiguous. A tentative handoff is claimed once only after an
+   established session consumes ciphertext and advances a destination buffer with
+   plaintext. Socket cleanup invalidates every outstanding handoff and cached
+   session owner for the exact tuple and file descriptor. Conflicts and stale
+   generations fail closed.
 4. When OBI recognizes an HTTP/1.1 server request, it moves the raw TCP
    candidate to the current Java logical execution identity. This is separate
    from both `incoming_trace_map` and the public `traces_ctx_v1` map.
@@ -188,6 +205,10 @@ The authoritative identities and transitions are:
 
 | State | Key/owner | Transition | Cleanup |
 | --- | --- | --- | --- |
+| Active TLS write | Host PID/TID and thread start time | Native SSL write entry | Matching return, wrapper replacement, thread exit, LRU eviction, restart |
+| Provisional TLS request | Sorted connection tuple and process | HTTP/1.1 recognized before native SSL write | Write outcome, transport commit, next-request stale recovery, connection lifecycle, LRU eviction, restart |
+| Shared TLS prewrite | Host PID/TID, thread start time, unique handoff ID | Provisional request publishes an exact parent | Write and transport terminal outcomes, LRU eviction, restart |
+| TLS socket owner | Socket-local exact handoff key and trace | Exact prewrite reaches `sk_msg` | Option terminal outcome, socket close, stale or malformed recovery, restart |
 | TCP candidate | Sorted connection tuple | Valid inbound TCP option | HTTP parse take, ambiguity, LRU eviction, restart |
 | Java request | PID namespace, process ID, logical TID | Parsed Java TLS HTTP/1.1 request | Take, discard, completion, stale sweep, exact process retirement, restart |
 | Task handoff | Process, PID namespace, opaque submission token | Java submission capture | Exact one-shot link, cancellation, rejection, stale sweep, bounded-map eviction |
@@ -246,6 +267,55 @@ request mapping ambiguous, all affected candidates are dropped. This may
 disconnect a trace but cannot attach a request to the wrong trace. HTTP/2 needs
 a stream identity and is explicitly unsupported.
 
+### Outbound TLS prewrite lifecycle
+
+The sender bridge does not consume a ports-only `outgoing_trace_map` value. A
+native SSL write entry creates an active identity from the host PID/TID, the
+kernel thread start time, and a nonzero handoff ID. Before the write, HTTP
+parsing creates a provisional client request and publishes a shared value with
+the exact connection, network namespace, SSL pointer, buffer, byte count,
+trace, and observation time. `sk_msg` accepts only that identity and records
+the exact socket owner before sockops can reserve or write the 27-byte option.
+The native write return and sockops callbacks use additive arbitration states,
+so every ordering converges on the exact parent or no parent.
+
+Only the exact prewrite path may schedule a TCP traceparent option while this
+bridge is enabled. Sockops deletes legacy ports-only option state without
+emitting it, even if map pressure removed every active-write, TLS-connection,
+provisional-request, and shared-handoff entry. Generic `sk_msg` payload
+mutation is also disabled in this mode because, after all TLS markers are lost,
+an arbitrary encrypted fragment cannot be proved to be plaintext solely from
+HTTP-looking bytes. A request that cannot establish the exact handoff therefore
+gets no injected parent. Positive exact-handoff failures retain their
+reason-coded diagnostics; observed legacy state suppressed at this boundary is
+counted as ambiguous. Packets with no ownership evidence are not mislabeled as
+TLS misses. Bridge-disabled deployments retain legacy 26-byte TCP options and
+plaintext header injection.
+
+The active-write, TLS-connection, provisional-request, and shared-prewrite
+maps are fixed-capacity LRU maps. Their capacity is a physical memory bound;
+the configured TTL is a logical eligibility bound, not a promise that an idle
+LRU slot is deleted at the TTL instant. Normal returns, terminal sockops
+outcomes, socket and thread lifecycle hooks, connection reuse, and restart
+remove state. Entries left by a missed return or callback may remain physically
+present until reuse or LRU pressure. They cannot be selected after expiry.
+
+If a shared handoff is evicted, its exact lookup is a reason-coded miss and the
+socket cannot fall back to a legacy parent. If a provisional local owner is
+stranded, a new request blocks through the TTL boundary, records ambiguity
+once, then deletes the stale owner and retries publication after the TTL. An
+active-write insertion failure is reported as overload. Missing, stale,
+malformed, segmented, ambiguous, and overload transport outcomes use fixed
+diagnostic labels.
+
+Supported OpenSSL wrapper pairs replace the outer active entry with a fresh
+inner identity without reporting an error. Unrecognized nesting is marked
+unsafe and cannot publish. A failed, zero-length, short, or oversized native
+write poisons the handoff; transport emission is suppressed unless arbitration
+proves emission had already become unavoidable. In that case the local request
+is retained so userspace never observes a remote parent without the matching
+client span.
+
 OBI restart removes unpinned process state and reopens the fallback endpoint.
 The helper treats transport loss as a miss and may renegotiate after bounded
 backoff. Renegotiation succeeds only after the JVM re-registers its process
@@ -271,12 +341,14 @@ to `disabled`. The extension independently requires
 `OTEL_OBI_REMOTE_PARENT_ENABLED=true`; merely placing `obi` in the propagator
 list does not enable native retrieval.
 
-TCP senders use the legacy 26-byte option while the bridge is disabled and the
-27-byte exact-flags option while it is enabled. New receivers accept both, but
-the bridge accepts only the exact-flags form. Upgrade receivers first with the
-bridge disabled, then enable the bridge across senders. Disable it before
-downgrading during rollback; old receivers are not required to understand the
-27-byte option.
+TCP senders use the legacy 26-byte option while the bridge is disabled. While
+it is enabled, only a request-owned TLS prewrite emits the 27-byte exact-flags
+option; unowned legacy TCP candidates and generic payload injection fail open.
+Enable the bridge only for deployments using the exact TLS sender path. New
+receivers accept both, but the bridge accepts only the exact-flags form. Upgrade
+receivers first with the bridge disabled, then enable the bridge across
+senders. Disable it before downgrading during rollback; old receivers are not
+required to understand the 27-byte option.
 
 Diagnostics use only bounded transport, operation, status, and lifecycle
 values. They never include trace IDs, span IDs, headers, bodies, credentials,
@@ -290,18 +362,19 @@ power-of-two occurrences so repeated transport faults do not produce per-request
 log volume.
 
 The OBI operation counter has four possible `transport` values (`tcp`,
-`getsockopt`, `unix`, and `disabled`), seven possible `operation` values
-(`stage`, `take`, `discard`, `negotiate`, `select`, `cleanup`, and `evict`), and
-fourteen fixed ABI status values. Its absolute Cartesian cardinality bound is
-therefore 392, while the implementation emits only the meaningful
-combinations. `auto` is never a metric label; selection records the concrete
-transport. Failures before a fallback request can be decoded are reported as
+`getsockopt`, `unix`, and `disabled`), ten possible `operation` values
+(`stage`, `candidate`, `handoff`, `inject`, `take`, `discard`, `negotiate`,
+`select`, `cleanup`, and `evict`), and fifteen fixed status values. Its absolute
+Cartesian cardinality bound is therefore 600, while the implementation emits
+only the meaningful combinations. `auto` is never a metric label; selection records the
+concrete transport. Failures before a fallback request can be decoded are reported as
 `negotiate`, so malformed or unauthenticated input cannot introduce another
 operation label. Cleanup and fallback-map eviction are emitted as counted
 `tcp` lifecycle operations and never contain map keys. The Java snapshot has
-48 fixed keys: twenty configuration, registration, lookup, extraction, and
-trace-flag counters plus take and discard counters for each of the fourteen
-statuses. Neither surface derives a label or key from request data.
+50 fixed keys: twenty-two configuration, registration, lookup, extraction,
+trace-flag, and decrypted-read counters plus take and discard counters for each
+of the fourteen statuses. Neither surface derives a label or key from request
+data.
 
 The transport rationale and fallback gates are recorded in
 [ADR 001](adr/001-java-remote-parent-transport.md).

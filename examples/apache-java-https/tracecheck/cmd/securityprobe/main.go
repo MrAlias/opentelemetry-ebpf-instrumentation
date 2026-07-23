@@ -44,6 +44,7 @@ const (
 	obiUnrelatedOption = 0x4aff
 	requestDeadline    = 750 * time.Millisecond
 	probeTimeout       = 60 * time.Second
+	maxProbeTimeout    = time.Hour
 	primaryInterval    = time.Millisecond
 	heldConnections    = 48
 	repeatedAttempts   = 16
@@ -88,8 +89,8 @@ func mainExitCode(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "security probe mode %q is unsupported\n", mode)
 		return 2
 	}
-	if timeout < time.Second || timeout > time.Minute {
-		fmt.Fprintln(stderr, "security probe timeout must be between 1s and 1m")
+	if timeout < time.Second || timeout > maxProbeTimeout {
+		fmt.Fprintln(stderr, "security probe timeout must be between 1s and 1h")
 		return 2
 	}
 

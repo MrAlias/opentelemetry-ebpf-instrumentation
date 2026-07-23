@@ -43,6 +43,12 @@ payloads.
   permissions and peer credentials.
 - Send fixed malformed, truncated, oversized, repeated, and wrong-version
   messages; never fuzz without a duration and size bound.
+- Concurrent attacker probes use separate, repeat-aware deadlines derived from
+  the runner's bounded scenario, publication, identity, and release work, with
+  a hard one-hour ceiling. While they are active, phase capture is limited to
+  the metrics needed for attribution. The runner signals and reaps both probes
+  immediately after legitimate traffic settles. Repeat and readiness settings
+  whose derived deadline exceeds the ceiling are rejected before startup.
 - Keep a legitimate marked request pending while unauthorized consumers race,
   then require the legitimate exact parent assertion to pass.
 - Fill the discovered live handoff-claim LRU to its reported capacity plus one,

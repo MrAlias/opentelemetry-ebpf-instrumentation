@@ -498,6 +498,8 @@ test_metric_boundary_helpers_are_reason_coded() {
 obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 2
 obi_java_remote_parent_operations_total{operation="discard",status="valid",transport="unix"} 3
 obi_java_remote_parent_operations_total{operation="take",status="missing",transport="getsockopt"} 99
+obi_java_remote_parent_operations_total{operation="take",status="unauthorized",transport="getsockopt"} 11
+obi_java_remote_parent_operations_total{operation="take",status="unauthorized",transport="unix"} 12
 obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} 99
 obi_java_remote_parent_operations_total{operation="report",status="valid",transport="tcp"} 7
 obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7
@@ -523,6 +525,22 @@ EOF
     printf 'bridge fingerprint included the report generation\n' >&2
     return 1
   }
+  ALLOW_PRIMARY_SECURITY_METRICS=true
+  fingerprint="$(bridge_metric_fingerprint "$metrics")"
+  sed -i 's/status="unauthorized",transport="getsockopt"} 11/status="unauthorized",transport="getsockopt"} 13/' "$metrics"
+  [[ "$(bridge_metric_fingerprint "$metrics")" == "$fingerprint" ]] || {
+    printf 'bridge fingerprint included allowed primary-security noise\n' >&2
+    return 1
+  }
+  ALLOW_PRIMARY_SECURITY_METRICS=false
+  ALLOW_UNIX_SECURITY_METRICS=true
+  fingerprint="$(bridge_metric_fingerprint "$metrics")"
+  sed -i 's/status="unauthorized",transport="unix"} 12/status="unauthorized",transport="unix"} 14/' "$metrics"
+  [[ "$(bridge_metric_fingerprint "$metrics")" == "$fingerprint" ]] || {
+    printf 'bridge fingerprint included allowed Unix-security noise\n' >&2
+    return 1
+  }
+  ALLOW_UNIX_SECURITY_METRICS=false
   pressure="$(pressure_map_metric \
     "$metrics" \
     obi_bpf_map_max_entries_total)"
@@ -541,10 +559,12 @@ test_bridge_metric_wait_requires_quiescent_report() {
     local -i fetches=0
     RESULT_DIR="$TEST_TMP_DIR/bridge-metric-wait"
     mkdir -p -- "$RESULT_DIR"
+    ALLOW_PRIMARY_SECURITY_METRICS=true
     fetch_obi_metrics() {
       ((fetches += 1))
       printf '%s\n' \
         "obi_java_remote_parent_operations_total{operation=\"take\",status=\"valid\",transport=\"unix\"} $((fetches >= 2 ? 1 : 0))" \
+        "obi_java_remote_parent_operations_total{operation=\"take\",status=\"unauthorized\",transport=\"getsockopt\"} $fetches" \
         "obi_java_remote_parent_operations_total{operation=\"stage\",status=\"valid\",transport=\"tcp\"} $((fetches >= 2 ? 1 : 0))" \
         "obi_java_remote_parent_operations_total{operation=\"inject\",status=\"ambiguous\",transport=\"tcp\"} $((fetches >= 2 ? 1 : 0))" \
         "obi_java_remote_parent_operations_total{operation=\"report\",status=\"valid\",transport=\"tcp\"} $((fetches == 1 ? 5 : fetches < 4 ? 6 : 7))" \
@@ -563,6 +583,89 @@ test_bridge_metric_wait_requires_quiescent_report() {
     }
     [[ "$(bridge_stage_total "$RESULT_DIR/settled.prom")" == "1" ]] || {
       printf 'bridge wait did not retain the completed reporter snapshot\n' >&2
+      return 1
+    }
+  )
+}
+
+test_security_probe_window_covers_metric_fences() {
+  (
+    local -i configured_same_cgroup=0
+    local -i configured_sibling=0
+    local -i required_same_cgroup=0
+    local -i required_sibling=0
+    local -i readiness_timeout=0
+    local -i repeat_count=0
+
+    while read -r readiness_timeout repeat_count; do
+      READINESS_TIMEOUT_SECONDS="$readiness_timeout"
+      REPEAT_COUNT="$repeat_count"
+      configure_security_probe_timeouts
+      configured_same_cgroup="${PRIMARY_SECURITY_SAME_CGROUP_TIMEOUT%s}"
+      configured_sibling="${SECURITY_PROBE_TIMEOUT%s}"
+      required_same_cgroup=$((
+        (2 * readiness_timeout) + 143 + (repeat_count * 232)
+      ))
+      required_sibling=$((required_same_cgroup + readiness_timeout + 408))
+      ((configured_same_cgroup > required_same_cgroup)) || return 1
+      ((configured_sibling > required_sibling)) || return 1
+      ((configured_sibling > configured_same_cgroup)) || return 1
+      ((configured_sibling <= MAX_SECURITY_PROBE_TIMEOUT_SECONDS)) || return 1
+    done <<'EOF'
+90 1
+120 1
+90 10
+223 10
+EOF
+    if (
+      READINESS_TIMEOUT_SECONDS="$MAX_SHELL_INTEGER"
+      REPEAT_COUNT=1
+      configure_security_probe_timeouts
+    ) >/dev/null 2>&1; then
+      return 1
+    fi
+    if (
+      READINESS_TIMEOUT_SECONDS=224
+      REPEAT_COUNT=10
+      configure_security_probe_timeouts
+    ) >/dev/null 2>&1; then
+      return 1
+    fi
+    READINESS_TIMEOUT_SECONDS=224
+    REPEAT_COUNT=10
+    SCENARIO=basic
+    TRANSPORT=getsockopt
+    TLS_PROTOCOL=TLSv1.3
+    export_compose_environment
+    [[ "$PRIMARY_SECURITY_SAME_CGROUP_TIMEOUT" == "60s" &&
+      "$SECURITY_PROBE_TIMEOUT" == "60s" ]] || return 1
+    [[ "${PRIMARY_SECURITY_PROBE_PATH##*/}" == "security-probe" ]] || return 1
+  ) || {
+    printf 'security probe deadlines did not cover both bounded lifetimes\n' >&2
+    return 1
+  }
+}
+
+test_primary_security_quiescence_restores_policy() {
+  (
+    local observed_policy=""
+    local wait_status=0
+
+    ALLOW_PRIMARY_SECURITY_METRICS=false
+    wait_for_bridge_metrics_quiescent() {
+      observed_policy="$ALLOW_PRIMARY_SECURITY_METRICS"
+      return 23
+    }
+    if wait_for_primary_security_metrics_quiescent \
+      "$TEST_TMP_DIR/security-settled.prom" "security publication"; then
+      printf 'primary security quiescence ignored the underlying wait failure\n' >&2
+      return 1
+    else
+      wait_status=$?
+    fi
+    [[ "$wait_status" -eq 23 && "$observed_policy" == "true" && \
+      "$ALLOW_PRIMARY_SECURITY_METRICS" == "false" ]] || {
+      printf 'primary security quiescence did not scope and restore its policy\n' >&2
       return 1
     }
   )
@@ -832,13 +935,14 @@ test_permissive_unix_directory_control_refuses_and_restores() {
           return 1
           ;;
         *" logs --no-color "*)
-          printf 'must not be group writable or world accessible\n'
+          if [[ "$directory_mode" == "0777" ]]; then
+            printf 'java bridge socket ancestor is writable without the sticky bit\n'
+          else
+            printf 'Java remote parent bridge ready\n'
+          fi
           ;;
       esac
       printf '%s\n' "$*" >>"$observed"
-    }
-    wait_for_log() {
-      printf 'wait:%s\n' "$2" >>"$observed"
     }
     assert_selected_transport() {
       SELECTED_TRANSPORT=unix
@@ -868,8 +972,9 @@ test_permissive_unix_directory_control_refuses_and_restores() {
     printf 'permissive Unix directory control did not refuse and restore safely\n' >&2
     return 1
   }
-  grep -Fq 'wait:must not be group writable or world accessible' "$observed"
-  grep -Fq 'wait:Java remote parent bridge ready' "$observed"
+  grep -Fq "$UNIX_PERMISSION_REFUSAL_PATTERN" \
+    "$result_dir/security-permissive-directory-obi.log"
+  grep -Fq 'logs --no-color --since security-cursor obi' "$observed"
 }
 
 write_diagnostics_fixture() {
@@ -1081,6 +1186,150 @@ test_scenario_fences_metrics_around_diagnostics() {
     printf 'OBI-flags scenario did not preserve sampled and unsampled takes\n' >&2
     return 1
   }
+}
+
+test_scenario_supports_metrics_only_security_evidence() {
+  local -r call_log="$TEST_TMP_DIR/scenario-metrics-only.calls"
+
+  (
+    RESULT_DIR="$TEST_TMP_DIR/scenario-metrics-only"
+    mkdir -p -- "$RESULT_DIR"
+    BRIDGE_RUNNING=true
+    COMPOSE=(docker compose)
+    REPEAT_COUNT=1
+    REQUEST_COUNT=0
+    SCENARIO_SEED=1
+    SCENARIO_VARIANT=""
+    SELECTED_TRANSPORT=getsockopt
+    TLS_PROTOCOL=TLSv1.3
+    flush_bridge_metric_boundary() {
+      return 0
+    }
+    capture_phase_evidence() {
+      return 99
+    }
+    capture_metric_phase_evidence() {
+      printf 'metrics:%s\n' "$1" >>"$call_log"
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+      printf '# empty\n' >"$RESULT_DIR/phases/$1/obi-metrics.prom"
+    }
+    run_bounded() {
+      printf 'scenario\n' >>"$call_log"
+      printf '{"status":"passed"}\n'
+    }
+    wait_for_bridge_metrics_quiescent() {
+      printf 'wait:%s:%s\n' "$1" "$2" >>"$call_log"
+    }
+    assert_bridge_metric_delta() {
+      printf 'assert\n' >>"$call_log"
+    }
+
+    run_scenario basic false metrics >/dev/null
+    [[ "$(<"$call_log")" == \
+      $'metrics:basic-before\nscenario\nwait:1:1\nmetrics:basic-after\nassert' ]]
+  ) || {
+    printf 'metrics-only security scenario skipped attribution or used slow evidence\n' >&2
+    return 1
+  }
+
+  (
+    RESULT_DIR="$TEST_TMP_DIR/scenario-metrics-only-failure"
+    mkdir -p -- "$RESULT_DIR"
+    BRIDGE_RUNNING=true
+    COMPOSE=(docker compose)
+    REPEAT_COUNT=1
+    REQUEST_COUNT=0
+    SCENARIO_SEED=1
+    SCENARIO_VARIANT=""
+    SELECTED_TRANSPORT=getsockopt
+    TLS_PROTOCOL=TLSv1.3
+    flush_bridge_metric_boundary() {
+      return 0
+    }
+    capture_metric_phase_evidence() {
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+      : >"$RESULT_DIR/phases/$1/obi-metrics.prom"
+      return 1
+    }
+    run_bounded() {
+      printf '{"status":"passed"}\n'
+    }
+    wait_for_bridge_metrics_quiescent() {
+      return 0
+    }
+    assert_bridge_metric_delta() {
+      return 0
+    }
+
+    if run_scenario basic false metrics >/dev/null; then
+      return 1
+    fi
+    grep -Fq '"metric_status": 1' "$RESULT_DIR/scenario-basic-status.json"
+  ) || {
+    printf 'metrics-only evidence failure did not fail the scenario\n' >&2
+    return 1
+  }
+}
+
+test_security_controls_select_metrics_only_evidence() {
+  local primary_control=""
+  local unix_control=""
+
+  primary_control="$(declare -f run_primary_security_control)"
+  unix_control="$(declare -f run_unix_security_control)"
+  [[ "$primary_control" == *'run_scenario concurrency false metrics'* &&
+    "$unix_control" == *'run_scenario concurrency false metrics'* ]] || {
+    printf 'a concurrent security control selected full phase evidence\n' >&2
+    return 1
+  }
+}
+
+test_scenario_records_metric_boundary_failure() {
+  (
+    local scenario_status=0
+
+    RESULT_DIR="$TEST_TMP_DIR/scenario-boundary-failure"
+    mkdir -p -- "$RESULT_DIR"
+    BRIDGE_RUNNING=true
+    COMPOSE=(docker compose)
+    REPEAT_COUNT=1
+    REQUEST_COUNT=0
+    SCENARIO_SEED=1
+    SCENARIO_VARIANT=""
+    SELECTED_TRANSPORT=getsockopt
+    TLS_PROTOCOL=TLSv1.3
+    flush_bridge_metric_boundary() {
+      return 1
+    }
+    capture_phase_evidence() {
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+      printf '# empty\n' >"$RESULT_DIR/phases/$1/obi-metrics.prom"
+    }
+    run_bounded() {
+      printf '{"status":"passed"}\n'
+    }
+    wait_for_bridge_metrics_quiescent() {
+      return 0
+    }
+    assert_bridge_metric_delta() {
+      return 0
+    }
+
+    if run_scenario basic false >/dev/null; then
+      printf 'scenario ignored a failed metric boundary\n' >&2
+      return 1
+    else
+      scenario_status=$?
+    fi
+    [[ "$scenario_status" -eq 1 ]] || {
+      printf 'metric-boundary failure returned %d, expected 1\n' "$scenario_status" >&2
+      return 1
+    }
+    grep -Fq '"metric_status": 1' "$RESULT_DIR/scenario-basic-status.json" || {
+      printf 'scenario did not retain its metric-boundary failure\n' >&2
+      return 1
+    }
+  )
 }
 
 test_java_diagnostics_parser_uses_base36() {
@@ -1836,6 +2085,8 @@ main() {
   test_metrics_delta_reports_counters_and_map_occupancy
   test_metric_boundary_helpers_are_reason_coded
   test_bridge_metric_wait_requires_quiescent_report
+  test_security_probe_window_covers_metric_fences
+  test_primary_security_quiescence_restores_policy
   test_pressure_monitor_requires_full_occupancy
   test_bridge_take_count_includes_cancelled_request
   test_bridge_metric_delta_requires_exact_one_shot_results
@@ -1847,6 +2098,9 @@ main() {
   test_java_diagnostics_delta_is_exact
   test_fault_scenario_does_not_probe_java_diagnostics
   test_scenario_fences_metrics_around_diagnostics
+  test_scenario_supports_metrics_only_security_evidence
+  test_security_controls_select_metrics_only_evidence
+  test_scenario_records_metric_boundary_failure
   test_java_diagnostics_parser_uses_base36
   test_restart_fault_diagnostics_require_overlap
   test_pipeline_dependencies_are_declared

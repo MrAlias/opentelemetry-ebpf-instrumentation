@@ -262,7 +262,7 @@ func TestMainRejectsUnboundedOrInvalidInvocation(t *testing.T) {
 		{"--socket", "relative.sock"},
 		{"--mode", "unknown"},
 		{"--timeout", "999ms"},
-		{"--timeout", "61s"},
+		{"--timeout", "1h1s"},
 		{"positional"},
 	} {
 		var stdout bytes.Buffer
@@ -270,6 +270,12 @@ func TestMainRejectsUnboundedOrInvalidInvocation(t *testing.T) {
 		assert.Equal(t, 2, mainExitCode(args, &stdout, &stderr), args)
 		assert.Empty(t, stdout.String(), args)
 		assert.NotEmpty(t, stderr.String(), args)
+	}
+}
+
+func TestMaxProbeTimeoutMatchesRunnerSafetyBound(t *testing.T) {
+	if maxProbeTimeout != time.Hour {
+		t.Fatalf("maxProbeTimeout = %s, want 1h", maxProbeTimeout)
 	}
 }
 

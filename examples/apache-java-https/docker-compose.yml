@@ -164,7 +164,7 @@ services:
       - --mode
       - ${SECURITY_PROBE_MODE:-abuse}
       - --timeout
-      - 60s
+      - ${SECURITY_PROBE_TIMEOUT:-60s}
     volumes:
       - java-remote-parent-socket:/var/run/obi
     profiles:

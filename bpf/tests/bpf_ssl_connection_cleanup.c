@@ -927,7 +927,112 @@ static void test_prewrite_transport_accepts_delayed_success_and_rejects_local_mi
                   "transport rejects a mismatched local trace");
 }
 
+static void test_http_request_start_preserves_its_direction(void) {
+    http_info_t info = {0};
+
+    assert_int_eq(1,
+                  http_info_begin_request(&info, PACKET_TYPE_REQUEST, TCP_SEND),
+                  "a fresh request records its direction");
+    assert_int_eq(TCP_SEND, info.direction, "an outbound request records send direction");
+
+    info.start_monotime_ns = 10;
+    assert_int_eq(0,
+                  http_info_begin_request(&info, PACKET_TYPE_RESPONSE, TCP_RECV),
+                  "a response does not start a request");
+    assert_int_eq(TCP_SEND, info.direction, "a response preserves the initiating direction");
+    assert_int_eq(0,
+                  http_info_begin_request(&info, PACKET_TYPE_REQUEST, TCP_RECV),
+                  "a continuation does not restart an active request");
+    assert_int_eq(TCP_SEND, info.direction, "a continuation preserves the initiating direction");
+}
+
+static void test_http_response_status_requires_decimal_digits(void) {
+    unsigned char response[] = "HTTP/1.1 200";
+    const unsigned char invalid[][3] = {
+        {'/', '0', '0'},
+        {'2', ':', '0'},
+        {'2', '0', '/'},
+    };
+
+    assert_int_eq(k_http_response_status_final_min,
+                  parse_http_response_status(response),
+                  "a valid final response status parses");
+    assert_int_eq(1,
+                  http_response_status_is_final(parse_http_response_status(response)),
+                  "a valid success response is final");
+
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        __builtin_memcpy(
+            &response[k_http_response_status_position], invalid[i], sizeof(invalid[i]));
+        assert_int_eq(0,
+                      parse_http_response_status(response),
+                      "every response status byte must be a decimal digit");
+    }
+
+    __builtin_memcpy(&response[k_http_response_status_position], "101", 3);
+    assert_int_eq(0,
+                  http_response_status_is_final(parse_http_response_status(response)),
+                  "an upgrade response is not final for keepalive reuse");
+    __builtin_memcpy(&response[k_http_response_status_position], "102", 3);
+    assert_int_eq(0,
+                  parse_http_response_status(response),
+                  "an interim response keeps the request available for its final response");
+    __builtin_memcpy(&response[k_http_response_status_position], "099", 3);
+    assert_int_eq(
+        0, parse_http_response_status(response), "a response below the valid range is rejected");
+    __builtin_memcpy(&response[k_http_response_status_position], "600", 3);
+    assert_int_eq(
+        0, parse_http_response_status(response), "an out-of-range response status is rejected");
+}
+
 static void test_response_completion_is_required_for_connection_reuse(void) {
+    enum { k_test_invalid_tcp_direction = TCP_SEND + 1 };
+    const struct {
+        u8 request_type;
+        u8 ssl;
+        u8 request_direction;
+        u8 response_direction;
+        u16 response_status;
+        const char *message;
+    } rejected[] = {
+        {EVENT_HTTP_CLIENT,
+         WITH_SSL,
+         TCP_SEND,
+         TCP_RECV,
+         k_http_response_status_switching_protocols,
+         "an informational upgrade response cannot enable reuse"},
+        {EVENT_HTTP_CLIENT,
+         WITH_SSL,
+         TCP_SEND,
+         TCP_SEND,
+         k_http_response_status_final_min,
+         "a send-side response cannot enable reuse"},
+        {EVENT_HTTP_CLIENT,
+         WITH_SSL,
+         TCP_SEND,
+         k_test_invalid_tcp_direction,
+         k_http_response_status_final_min,
+         "an invalid response direction cannot enable reuse"},
+        {EVENT_HTTP_CLIENT,
+         WITH_SSL,
+         TCP_RECV,
+         TCP_RECV,
+         k_http_response_status_final_min,
+         "a receive-side request cannot enable reuse"},
+        {EVENT_HTTP_REQUEST,
+         WITH_SSL,
+         TCP_SEND,
+         TCP_RECV,
+         k_http_response_status_final_min,
+         "a server response cannot enable client reuse"},
+        {EVENT_HTTP_CLIENT,
+         NO_SSL,
+         TCP_SEND,
+         TCP_RECV,
+         k_http_response_status_final_min,
+         "a plaintext response cannot enable TLS reuse"},
+    };
+
     reset();
     seed_ssl_prewrite(101, 11, 7);
     test_prewrite.target_tcp_sequence = 123;
@@ -941,6 +1046,8 @@ static void test_response_completion_is_required_for_connection_reuse(void) {
                                           EVENT_HTTP_CLIENT,
                                           WITH_SSL,
                                           TCP_SEND,
+                                          TCP_RECV,
+                                          k_http_response_status_final_min,
                                           10,
                                           &trace);
     assert_int_eq(k_ssl_prewrite_reuse_ready,
@@ -948,6 +1055,19 @@ static void test_response_completion_is_required_for_connection_reuse(void) {
                   "the exact client response enables reuse");
 
     test_prewrite.reuse_state = k_ssl_prewrite_reuse_none;
+    for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+        mark_ssl_prewrite_connection_reusable(&test_prewrite.connection,
+                                              test_prewrite.netns_cookie,
+                                              rejected[i].request_type,
+                                              rejected[i].ssl,
+                                              rejected[i].request_direction,
+                                              rejected[i].response_direction,
+                                              rejected[i].response_status,
+                                              10,
+                                              &trace);
+        assert_int_eq(k_ssl_prewrite_reuse_none, test_prewrite.reuse_state, rejected[i].message);
+    }
+
     tp_info_t foreign_trace = trace;
     foreign_trace.span_id[0]++;
     mark_ssl_prewrite_connection_reusable(&test_prewrite.connection,
@@ -955,6 +1075,8 @@ static void test_response_completion_is_required_for_connection_reuse(void) {
                                           EVENT_HTTP_CLIENT,
                                           WITH_SSL,
                                           TCP_SEND,
+                                          TCP_RECV,
+                                          k_http_response_status_final_min,
                                           10,
                                           &foreign_trace);
     assert_int_eq(k_ssl_prewrite_reuse_none,
@@ -968,6 +1090,8 @@ static void test_response_completion_is_required_for_connection_reuse(void) {
                                           EVENT_HTTP_CLIENT,
                                           WITH_SSL,
                                           TCP_SEND,
+                                          TCP_RECV,
+                                          k_http_response_status_final_min,
                                           10,
                                           &trace);
     assert_int_eq(k_ssl_prewrite_reuse_none,
@@ -985,10 +1109,21 @@ static void test_connection_replacement_requires_response_completion(void) {
     ssl_prewrite_value_t next = test_prewrite;
     next.observed_monotime_ns++;
     const ssl_prewrite_key_t next_key = ssl_prewrite_key(202, 22, 8);
+    const tp_info_t trace = test_prewrite.trace.tp;
+
+    mark_ssl_prewrite_connection_reusable(&test_prewrite.connection,
+                                          test_prewrite.netns_cookie,
+                                          EVENT_HTTP_CLIENT,
+                                          WITH_SSL,
+                                          TCP_SEND,
+                                          TCP_RECV,
+                                          k_http_response_status_final_min - 1,
+                                          10,
+                                          &trace);
 
     assert_int_eq(k_ssl_prewrite_publish_ambiguous,
                   publish_ssl_prewrite_connection_owner(&next_key, &next),
-                  "accepted transport without a response remains non-reusable");
+                  "a non-final response remains non-reusable");
     assert_int_eq(k_ssl_prewrite_connection_owner_blocked,
                   test_connection_owner.state,
                   "unsafe replacement blocks the connection");
@@ -999,9 +1134,24 @@ static void test_connection_replacement_requires_response_completion(void) {
     test_prewrite.target_tcp_sequence_valid = 1;
     test_prewrite.transport_phase = k_ssl_prewrite_transport_accepted;
     test_prewrite.write_outcome = k_ssl_prewrite_write_succeeded;
-    test_prewrite.reuse_state = k_ssl_prewrite_reuse_ready;
+    const tp_info_t prior_trace = test_prewrite.trace.tp;
+    mark_ssl_prewrite_connection_reusable(&test_prewrite.connection,
+                                          test_prewrite.netns_cookie,
+                                          EVENT_HTTP_CLIENT,
+                                          WITH_SSL,
+                                          TCP_SEND,
+                                          TCP_RECV,
+                                          k_http_response_status_final_min,
+                                          10,
+                                          &prior_trace);
+    assert_int_eq(k_ssl_prewrite_reuse_ready,
+                  test_prewrite.reuse_state,
+                  "an exact completed response makes the prior owner reusable");
     next = test_prewrite;
     next.observed_monotime_ns++;
+    next.reuse_state = k_ssl_prewrite_reuse_none;
+    next.trace.tp.span_id[0]++;
+    const tp_info_t next_trace = next.trace.tp;
 
     assert_int_eq(k_ssl_prewrite_publish_valid,
                   publish_ssl_prewrite_connection_owner(&next_key, &next),
@@ -1010,6 +1160,35 @@ static void test_connection_replacement_requires_response_completion(void) {
                   ssl_prewrite_connection_owner_matches(&test_connection_owner, &next_key),
                   "replacement publishes only the next exact owner");
     assert_int_eq(1, test_prewrite_delete_count, "replacement retires the previous shared value");
+
+    test_prewrite = next;
+    test_prewrite_key = next_key;
+    test_prewrite_present = 1;
+    mark_ssl_prewrite_connection_reusable(&test_prewrite.connection,
+                                          test_prewrite.netns_cookie,
+                                          EVENT_HTTP_CLIENT,
+                                          WITH_SSL,
+                                          TCP_SEND,
+                                          TCP_RECV,
+                                          k_http_response_status_final_min,
+                                          10,
+                                          &prior_trace);
+    assert_int_eq(k_ssl_prewrite_reuse_none,
+                  test_prewrite.reuse_state,
+                  "a delayed prior response cannot complete the replacement owner");
+
+    mark_ssl_prewrite_connection_reusable(&test_prewrite.connection,
+                                          test_prewrite.netns_cookie,
+                                          EVENT_HTTP_CLIENT,
+                                          WITH_SSL,
+                                          TCP_SEND,
+                                          TCP_RECV,
+                                          k_http_response_status_final_min,
+                                          10,
+                                          &next_trace);
+    assert_int_eq(k_ssl_prewrite_reuse_ready,
+                  test_prewrite.reuse_state,
+                  "the replacement owner accepts only its exact response");
 }
 
 static void test_connection_tracking_requires_existing_bridge_state(void) {
@@ -1337,6 +1516,8 @@ int main(void) {
     test_prewrite_schedule_validation_classifies_every_failure_domain();
     test_prewrite_structural_validation_rejects_malformed_trace_state();
     test_prewrite_transport_accepts_delayed_success_and_rejects_local_mismatch();
+    test_http_request_start_preserves_its_direction();
+    test_http_response_status_requires_decimal_digits();
     test_response_completion_is_required_for_connection_reuse();
     test_connection_replacement_requires_response_completion();
     test_connection_tracking_requires_existing_bridge_state();

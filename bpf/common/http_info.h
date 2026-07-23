@@ -45,6 +45,14 @@ typedef struct http_info {
     u8 _pad;
 } http_info_t;
 
+static __always_inline u8 http_info_begin_request(http_info_t *info, u8 packet_type, u8 direction) {
+    if (!info || packet_type != PACKET_TYPE_REQUEST || info->status || info->start_monotime_ns) {
+        return 0;
+    }
+    info->direction = direction;
+    return 1;
+}
+
 static __always_inline u8 ssl_prewrite_mark_local_blocked(http_info_t *info) {
     if (!info || info->ssl_prewrite_pending == k_ssl_prewrite_local_blocked) {
         return 0;

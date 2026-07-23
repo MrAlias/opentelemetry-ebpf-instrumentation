@@ -8,6 +8,7 @@
 #include <bpfcore/compiler.h>
 
 #include <common/connection_info.h>
+#include <common/http_status.h>
 #include <common/ssl_args.h>
 #include <common/tp_info.h>
 
@@ -218,9 +219,12 @@ mark_ssl_prewrite_connection_reusable(const pid_connection_info_t *connection,
                                       u8 request_type,
                                       u8 ssl,
                                       u8 direction,
+                                      u8 response_direction,
+                                      u16 response_status,
                                       u64 start_monotime_ns,
                                       const tp_info_t *trace) {
-    if (!connection || !netns_cookie ||
+    if (!connection || !netns_cookie || response_direction != TCP_RECV ||
+        !http_response_status_is_final(response_status) ||
         ssl_prewrite_connection_is_ambiguous(&connection->conn, netns_cookie)) {
         return;
     }

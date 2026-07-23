@@ -312,32 +312,25 @@ static __always_inline void process_http_request(http_info_t *info,
 static __always_inline void process_http_response(http_info_t *info, const unsigned char *buf) {
     info->resp_len = 0;
     info->end_monotime_ns = bpf_ktime_get_ns();
-
-    u16 status = 0;
-
-    status += (buf[RESPONSE_STATUS_POS] - '0') * 100;
-    status += (buf[RESPONSE_STATUS_POS + 1] - '0') * 10;
-    status += (buf[RESPONSE_STATUS_POS + 2] - '0');
-
-    if (status == 100 || status == 103 || status > MAX_HTTP_STATUS) {
-        status = 0;
-    }
-
-    info->status = status;
+    info->status = parse_http_response_status(buf);
 }
 
 static __always_inline void handle_http_response(unsigned char *small_buf,
                                                  pid_connection_info_t *pid_conn,
                                                  http_info_t *info,
                                                  int orig_len,
+                                                 u8 response_direction,
                                                  lw_thread_t lw_thread) {
     process_http_response(info, small_buf);
-    if (info->type == EVENT_HTTP_CLIENT && info->ssl == WITH_SSL && info->direction == TCP_SEND) {
+    if (info->type == EVENT_HTTP_CLIENT && info->ssl == WITH_SSL && info->direction == TCP_SEND &&
+        response_direction == TCP_RECV && http_response_status_is_final(info->status)) {
         mark_ssl_prewrite_connection_reusable(pid_conn,
                                               task_netns_cookie(),
                                               info->type,
                                               info->ssl,
                                               info->direction,
+                                              response_direction,
+                                              info->status,
                                               info->start_monotime_ns,
                                               &info->tp);
     }
@@ -884,17 +877,18 @@ __obi_protocol_http(struct pt_regs *ctx, unsigned char *(*tp_loop_fn)(unsigned c
                    pid_from_pid_tgid(bpf_get_current_pid_tgid()),
                    still_reading(info));
 
-    info->direction = args->direction;
-    if (args->packet_type == PACKET_TYPE_REQUEST && (info->status == 0) &&
-        (info->start_monotime_ns == 0)) {
-
+    if (http_info_begin_request(info, args->packet_type, args->direction)) {
         args->use_bpf_loop = tp_loop_fn == bpf_strstr_tp_loop;
         bpf_tail_call(ctx, &jump_table, k_tail_continue_protocol_http);
 
         return 0;
     } else if ((args->packet_type == PACKET_TYPE_RESPONSE) && (info->status == 0)) {
-        handle_http_response(
-            args->small_buf, &args->pid_conn, info, args->bytes_len, args->lw_thread);
+        handle_http_response(args->small_buf,
+                             &args->pid_conn,
+                             info,
+                             args->bytes_len,
+                             args->direction,
+                             args->lw_thread);
         http_send_large_buffer(ctx,
                                info,
                                &args->pid_conn,

@@ -9,13 +9,12 @@
 #include <common/connection_info.h>
 #include <common/http_buf_size.h>
 #include <common/http_info.h>
+#include <common/http_status.h>
 #include <common/lw_thread.h>
 #include <common/tp_info.h>
 
-#define MIN_HTTP_SIZE 12      // HTTP/1.1 CCC is the smallest valid request we can have
-#define MIN_HTTP_REQ_SIZE 9   // OPTIONS / is the largest
-#define RESPONSE_STATUS_POS 9 // HTTP/1.1 <--
-#define MAX_HTTP_STATUS 599
+#define MIN_HTTP_SIZE 12    // HTTP/1.1 CCC is the smallest valid request we can have
+#define MIN_HTTP_REQ_SIZE 9 // OPTIONS / is the largest
 
 // 100K and above we try to track the response actual time with kretprobes
 #define KPROBES_LARGE_RESPONSE_LEN 100000

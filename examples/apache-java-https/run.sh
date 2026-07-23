@@ -3076,6 +3076,126 @@ capture_bpf_evidence() {
   capture_optional_command "$RESULT_DIR/bpftool-maps.txt" 30 bpftool map show
 }
 
+capture_apache_tls_runtime_evidence() {
+  # shellcheck disable=SC2016 # The script expands only inside apache-proxy.
+  run_logged_bounded "$RESULT_DIR/apache-openssl-version.txt" 30 \
+    "${COMPOSE[@]}" exec --no-TTY apache-proxy /bin/sh -eu -c '
+      module_path=/usr/local/apache2/modules/mod_ssl.so
+      libssl_path=/usr/lib/libssl.so.3
+      libcrypto_path=/usr/lib/libcrypto.so.3
+      newline="
+"
+
+      fail() {
+        printf "apache_tls_runtime_error=%s\n" "$1" >&2
+        exit 1
+      }
+
+      httpd_version_output=
+      if httpd_version_output="$(httpd -v 2>&1)"; then
+        :
+      else
+        printf "%s\n" "$httpd_version_output" >&2
+        fail httpd-version-command
+      fi
+      httpd_version_line=${httpd_version_output%%"$newline"*}
+      case "$httpd_version_line" in
+        "Server version: Apache/"?*) ;;
+        *) fail httpd-version-invalid ;;
+      esac
+      apache_version=${httpd_version_line#"Server version: "}
+
+      httpd_modules=
+      if httpd_modules="$(httpd -M 2>&1)"; then
+        :
+      else
+        printf "%s\n" "$httpd_modules" >&2
+        fail httpd-modules-command
+      fi
+      case "
+$httpd_modules
+" in
+        *"
+ ssl_module (shared)
+"*) ;;
+        *) fail ssl-module-not-loaded ;;
+      esac
+
+      mod_ssl_scan=
+      if mod_ssl_scan="$(scanelf -n -B -F "%n %F" "$module_path" 2>&1)"; then
+        :
+      else
+        printf "%s\n" "$mod_ssl_scan" >&2
+        fail mod-ssl-scan-command
+      fi
+      case "$mod_ssl_scan" in
+        *" $module_path") ;;
+        *) fail mod-ssl-path-mismatch ;;
+      esac
+      mod_ssl_needed=${mod_ssl_scan%" $module_path"}
+      case "$mod_ssl_needed" in
+        ""|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._,+-]*) fail mod-ssl-needed-invalid ;;
+      esac
+      case ",$mod_ssl_needed," in
+        *,libssl.so.3,*) ;;
+        *) fail mod-ssl-libssl-missing ;;
+      esac
+      case ",$mod_ssl_needed," in
+        *,libcrypto.so.3,*) ;;
+        *) fail mod-ssl-libcrypto-missing ;;
+      esac
+
+      libssl_owner_record=
+      if libssl_owner_record="$(apk info --who-owns "$libssl_path" 2>&1)"; then
+        :
+      else
+        printf "%s\n" "$libssl_owner_record" >&2
+        fail libssl-owner-command
+      fi
+      case "$libssl_owner_record" in
+        "$libssl_path is owned by libssl3-"*) ;;
+        *) fail libssl-owner-invalid ;;
+      esac
+      libssl_owner="${libssl_owner_record#"$libssl_path is owned by "}"
+      case "$libssl_owner" in
+        *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._+-]*) fail libssl-owner-invalid ;;
+      esac
+      case "$libssl_owner" in
+        libssl3-?*) ;;
+        *) fail libssl-owner-invalid ;;
+      esac
+
+      libcrypto_owner_record=
+      if libcrypto_owner_record="$(apk info --who-owns "$libcrypto_path" 2>&1)"; then
+        :
+      else
+        printf "%s\n" "$libcrypto_owner_record" >&2
+        fail libcrypto-owner-command
+      fi
+      case "$libcrypto_owner_record" in
+        "$libcrypto_path is owned by libcrypto3-"*) ;;
+        *) fail libcrypto-owner-invalid ;;
+      esac
+      libcrypto_owner="${libcrypto_owner_record#"$libcrypto_path is owned by "}"
+      case "$libcrypto_owner" in
+        *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._+-]*) fail libcrypto-owner-invalid ;;
+      esac
+      case "$libcrypto_owner" in
+        libcrypto3-?*) ;;
+        *) fail libcrypto-owner-invalid ;;
+      esac
+
+      printf "apache_version=%s\n" "$apache_version"
+      printf "apache_ssl_module=ssl_module (shared)\n"
+      printf "apache_mod_ssl_path=%s\n" "$module_path"
+      printf "apache_mod_ssl_needed=%s\n" "$mod_ssl_needed"
+      printf "openssl_libssl_path=%s\n" "$libssl_path"
+      printf "openssl_libssl_owner=%s\n" "$libssl_owner"
+      printf "openssl_libcrypto_path=%s\n" "$libcrypto_path"
+      printf "openssl_libcrypto_owner=%s\n" "$libcrypto_owner"
+    '
+}
+
 capture_runtime_evidence() {
   local container_ids_output=""
   local container_id=""
@@ -3115,8 +3235,7 @@ capture_runtime_evidence() {
     "${COMPOSE[@]}" exec --no-TTY java-backend java -version
   capture_optional_command "$RESULT_DIR/apache-version.txt" 30 \
     "${COMPOSE[@]}" exec --no-TTY apache-proxy httpd -v
-  capture_optional_command "$RESULT_DIR/apache-openssl-version.txt" 30 \
-    "${COMPOSE[@]}" exec --no-TTY apache-proxy openssl version
+  capture_apache_tls_runtime_evidence || return
   capture_optional_command "$RESULT_DIR/obi-startup.log" 30 \
     "${COMPOSE[@]}" logs --no-color --tail 2000 obi
   capture_optional_command "$RESULT_DIR/java-startup.log" 30 \

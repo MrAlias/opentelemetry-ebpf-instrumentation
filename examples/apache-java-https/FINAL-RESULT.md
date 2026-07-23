@@ -54,11 +54,12 @@ link that bundle or its sanitized CI artifact.
 ```
 
 Record the repository revision, host/kernel/cgroup mode, architecture, Docker
-version, Apache/OpenSSL version, JVM version, agent metadata, command line,
-result directory, and every unsupported cell. A negative result is complete
-only when it names the last correct boundary and exact failure (attach, map,
-transport, JNI, classloader, extraction, or assertion) and records both forced
-transport outcomes.
+version, Apache version, loaded TLS module, `mod_ssl` OpenSSL dependencies and
+package owners, JVM version, agent metadata, command line, result directory,
+and every unsupported cell. A negative result is complete only when it names
+the last correct boundary and exact failure (attach, map, transport, JNI,
+classloader, extraction, or assertion) and records both forced transport
+outcomes.
 
 ## Issue coverage and remaining evidence gaps
 

@@ -1362,6 +1362,193 @@ test_restart_fault_diagnostics_require_overlap() {
   fi
 }
 
+test_apache_tls_runtime_evidence_is_required() {
+  local -r fake_bin="$TEST_TMP_DIR/apache-tls-runtime-bin"
+  local -r fake_compose="$fake_bin/fake-compose"
+  local -r fake_httpd="$fake_bin/httpd"
+  local -r fake_scanelf="$fake_bin/scanelf"
+  local -r fake_apk="$fake_bin/apk"
+  local -r successful_result="$TEST_TMP_DIR/apache-tls-runtime-success"
+  local -a failure_modes=(
+    httpd-version-fail
+    httpd-version-invalid
+    httpd-version-empty
+    httpd-modules-fail
+    no-ssl-module
+    near-ssl-module
+    scanelf-fail
+    wrong-scanelf-path
+    malformed-needed
+    missing-libssl
+    missing-libcrypto
+    apk-fail-libssl
+    apk-invalid-libssl
+    apk-empty-libssl
+    apk-fail-libcrypto
+    apk-invalid-libcrypto
+    apk-multiline-libcrypto
+  )
+  local mode=""
+  local expected_error=""
+  local failure_result=""
+  local evidence=""
+
+  mkdir -p -- "$fake_bin" "$successful_result"
+  cat >"$fake_compose" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ "$#" -eq 7 && "$1" == "exec" && "$2" == "--no-TTY" && "$3" == "apache-proxy" &&
+  "$4" == "/bin/sh" && "$5" == "-eu" && "$6" == "-c" && -n "$7" ]] || exit 64
+shift 3
+exec "$@"
+EOF
+  cat >"$fake_httpd" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ "$#" -eq 1 ]] || exit 64
+case "$1:$FAKE_TLS_MODE" in
+  -v:httpd-version-fail) printf 'injected httpd version failure\n' >&2; exit 16 ;;
+  -v:httpd-version-invalid) printf 'unexpected version output\n' ;;
+  -v:httpd-version-empty) printf 'Server version: Apache/\n' ;;
+  -v:*) printf 'Server version: Apache/2.4.68 (Unix)\nServer built: test fixture\n' ;;
+  -M:httpd-modules-fail) printf 'injected httpd module failure\n' >&2; exit 17 ;;
+  -M:no-ssl-module) printf 'Loaded Modules:\n core_module (static)\n' ;;
+  -M:near-ssl-module) printf 'Loaded Modules:\n not_ssl_module (shared)\n' ;;
+  -M:*) printf 'Loaded Modules:\n ssl_module (shared)\n' ;;
+  *) exit 64 ;;
+esac
+EOF
+  cat >"$fake_scanelf" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ "$#" -eq 5 && "$1" == "-n" && "$2" == "-B" && "$3" == "-F" &&
+  "$4" == "%n %F" && "$5" == "/usr/local/apache2/modules/mod_ssl.so" ]] || exit 64
+case "$FAKE_TLS_MODE" in
+  scanelf-fail) printf 'injected scanelf failure\n' >&2; exit 18 ;;
+  wrong-scanelf-path) printf 'libssl.so.3,libcrypto.so.3 /tmp/not-mod-ssl.so\n' ;;
+  malformed-needed) printf 'libssl.so.3,libcrypto.so.3 forged /usr/local/apache2/modules/mod_ssl.so\n' ;;
+  missing-libssl) printf 'libcrypto.so.3,libc.musl-x86_64.so.1 /usr/local/apache2/modules/mod_ssl.so\n' ;;
+  missing-libcrypto) printf 'libssl.so.3,libc.musl-x86_64.so.1 /usr/local/apache2/modules/mod_ssl.so\n' ;;
+  *) printf 'libssl.so.3,libcrypto.so.3,libc.musl-x86_64.so.1 /usr/local/apache2/modules/mod_ssl.so\n' ;;
+esac
+EOF
+  cat >"$fake_apk" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ "$#" -eq 3 && "$1" == "info" && "$2" == "--who-owns" ]] || exit 64
+case "$3:$FAKE_TLS_MODE" in
+  /usr/lib/libssl.so.3:apk-fail-libssl) printf 'injected libssl owner failure\n' >&2; exit 19 ;;
+  /usr/lib/libssl.so.3:apk-invalid-libssl) printf '/usr/lib/libssl.so.3 is owned by unexpected-1.0-r0\n' ;;
+  /usr/lib/libssl.so.3:apk-empty-libssl) printf '/usr/lib/libssl.so.3 is owned by libssl3-\n' ;;
+  /usr/lib/libssl.so.3:*) printf '/usr/lib/libssl.so.3 is owned by libssl3-3.5.7-r0\n' ;;
+  /usr/lib/libcrypto.so.3:apk-fail-libcrypto) printf 'injected libcrypto owner failure\n' >&2; exit 20 ;;
+  /usr/lib/libcrypto.so.3:apk-invalid-libcrypto) printf '/usr/lib/libcrypto.so.3 is owned by unexpected-1.0-r0\n' ;;
+  /usr/lib/libcrypto.so.3:apk-multiline-libcrypto) printf '/usr/lib/libcrypto.so.3 is owned by libcrypto3-3.5.7-r0\nforged\n' ;;
+  /usr/lib/libcrypto.so.3:*) printf '/usr/lib/libcrypto.so.3 is owned by libcrypto3-3.5.7-r0\n' ;;
+  *) exit 64 ;;
+esac
+EOF
+  chmod 0755 "$fake_compose" "$fake_httpd" "$fake_scanelf" "$fake_apk"
+
+  (
+    export PATH="$fake_bin:$PATH"
+    export FAKE_TLS_MODE=success
+    RESULT_DIR="$successful_result"
+    RUN_STAGE=runtime-evidence
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    COMPOSE=("$fake_compose")
+    capture_apache_tls_runtime_evidence >/dev/null
+  ) || {
+    printf 'valid Apache TLS runtime evidence was rejected\n' >&2
+    return 1
+  }
+
+  evidence="$successful_result/apache-openssl-version.txt"
+  grep -Fqx 'apache_version=Apache/2.4.68 (Unix)' "$evidence"
+  [[ "$(grep -Fxc 'apache_ssl_module=ssl_module (shared)' "$evidence")" -eq 1 ]]
+  grep -Fqx 'apache_mod_ssl_path=/usr/local/apache2/modules/mod_ssl.so' "$evidence"
+  grep -Fqx 'apache_mod_ssl_needed=libssl.so.3,libcrypto.so.3,libc.musl-x86_64.so.1' "$evidence"
+  grep -Fqx 'openssl_libssl_path=/usr/lib/libssl.so.3' "$evidence"
+  grep -Fqx 'openssl_libssl_owner=libssl3-3.5.7-r0' "$evidence"
+  grep -Fqx 'openssl_libcrypto_path=/usr/lib/libcrypto.so.3' "$evidence"
+  grep -Fqx 'openssl_libcrypto_owner=libcrypto3-3.5.7-r0' "$evidence"
+  grep -Fqx 'exit_status=0' "$evidence"
+  grep -Fqx 'capture_exit_status=0' "$evidence"
+
+  for mode in "${failure_modes[@]}"; do
+    failure_result="$TEST_TMP_DIR/apache-tls-runtime-$mode"
+    mkdir -p -- "$failure_result"
+    case "$mode" in
+      httpd-version-fail) expected_error=httpd-version-command ;;
+      httpd-version-invalid) expected_error=httpd-version-invalid ;;
+      httpd-version-empty) expected_error=httpd-version-invalid ;;
+      httpd-modules-fail) expected_error=httpd-modules-command ;;
+      no-ssl-module) expected_error=ssl-module-not-loaded ;;
+      near-ssl-module) expected_error=ssl-module-not-loaded ;;
+      scanelf-fail) expected_error=mod-ssl-scan-command ;;
+      wrong-scanelf-path) expected_error=mod-ssl-path-mismatch ;;
+      malformed-needed) expected_error=mod-ssl-needed-invalid ;;
+      missing-libssl) expected_error=mod-ssl-libssl-missing ;;
+      missing-libcrypto) expected_error=mod-ssl-libcrypto-missing ;;
+      apk-fail-libssl) expected_error=libssl-owner-command ;;
+      apk-invalid-libssl) expected_error=libssl-owner-invalid ;;
+      apk-empty-libssl) expected_error=libssl-owner-invalid ;;
+      apk-fail-libcrypto) expected_error=libcrypto-owner-command ;;
+      apk-invalid-libcrypto) expected_error=libcrypto-owner-invalid ;;
+      apk-multiline-libcrypto) expected_error=libcrypto-owner-invalid ;;
+    esac
+
+    if (
+      export PATH="$fake_bin:$PATH"
+      export FAKE_TLS_MODE="$mode"
+      RESULT_DIR="$failure_result"
+      RUN_STAGE=runtime-evidence
+      FAILURE_STAGE=""
+      FAILURE_LINE=""
+      FAILURE_STATUS=""
+      FAILURE_COMMAND=""
+      COMPOSE=("$fake_compose")
+      capture_apache_tls_runtime_evidence >/dev/null 2>&1
+    ); then
+      printf 'invalid Apache TLS runtime evidence passed: %s\n' "$mode" >&2
+      return 1
+    fi
+
+    evidence="$failure_result/apache-openssl-version.txt"
+    grep -Fqx "apache_tls_runtime_error=$expected_error" "$evidence" || return 1
+    grep -Eq '^exit_status=[1-9][0-9]*$' "$evidence" || return 1
+    grep -Fqx 'capture_exit_status=0' "$evidence" || return 1
+    if grep -Eq '^apache_ssl_module=' "$evidence"; then
+      printf 'failed Apache TLS evidence emitted canonical success records: %s\n' "$mode" >&2
+      return 1
+    fi
+  done
+
+  (
+    local status=0
+
+    RESULT_DIR="$TEST_TMP_DIR/apache-tls-runtime-propagation"
+    mkdir -p -- "$RESULT_DIR"
+    COMPOSE=(fake-compose)
+    capture_host_topology() { return 0; }
+    capture_bpf_evidence() { return 0; }
+    capture_optional_command() { return 0; }
+    run_bounded() { return 0; }
+    capture_apache_tls_runtime_evidence() { return 37; }
+
+    if capture_runtime_evidence; then
+      printf 'Apache TLS runtime evidence failure was suppressed\n' >&2
+      return 1
+    else
+      status=$?
+    fi
+    [[ "$status" -eq 37 ]]
+  ) || return 1
+}
+
 test_pipeline_dependencies_are_declared() {
   local definition=""
 
@@ -2103,6 +2290,7 @@ main() {
   test_scenario_records_metric_boundary_failure
   test_java_diagnostics_parser_uses_base36
   test_restart_fault_diagnostics_require_overlap
+  test_apache_tls_runtime_evidence_is_required
   test_pipeline_dependencies_are_declared
   test_runtime_environment_line_matching
   test_instrumented_readiness_precedes_https_traffic

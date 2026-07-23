@@ -331,8 +331,9 @@ Every run retains a timestamped directory under `.runtime/results/` with:
 - repository revision, dirty status, tracked-patch digest, complete source
   manifest, source-tree digest, and patch identity;
 - kernel, architecture, cgroup/BTF state, `bpftool` feature/program/map output
-  (including command status when unavailable), Docker, Compose, OpenSSL, mode,
-  and TLS version;
+  (including command status when unavailable), Docker, Compose, Apache TLS
+  module state, `mod_ssl` library dependencies, OpenSSL package ownership,
+  mode, and TLS version;
 - resolved Compose configuration and running container topology;
 - container image IDs, configured image references, available repository
   digests, and Apache/JVM version output;

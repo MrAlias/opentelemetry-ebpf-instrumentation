@@ -81,6 +81,11 @@ and added as new rows. “Latest” is not a matrix cell.
 | --- | --- | --- | --- |
 | `httpd:2.4.68-alpine` image pinned in Compose | untested | untested | HTTP/1.1 only |
 
+Every run must retain `apache-openssl-version.txt` proving that Apache loaded
+`ssl_module`, that `mod_ssl.so` links to `libssl.so.3` and `libcrypto.so.3`,
+and that Alpine attributes those exact runtime libraries to the expected
+OpenSSL packages. Missing or malformed runtime evidence fails the run.
+
 Backend HTTP/2 is currently **unsupported**, not silently untested. If support
 is later proposed, it needs a separate topology and exact concurrency evidence
 before changing that status.

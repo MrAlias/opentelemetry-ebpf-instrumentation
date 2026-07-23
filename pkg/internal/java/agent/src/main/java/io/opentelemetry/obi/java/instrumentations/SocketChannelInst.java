@@ -17,6 +17,7 @@ import io.opentelemetry.obi.java.instrumentations.data.SSLStorage;
 import io.opentelemetry.obi.java.instrumentations.util.ByteBufferExtractor;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
+import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
 import net.bytebuddy.agent.builder.AgentBuilder;
@@ -26,6 +27,9 @@ import net.bytebuddy.matcher.ElementMatcher;
 import net.bytebuddy.matcher.ElementMatchers;
 
 public class SocketChannelInst {
+  private static final long INVALID_READ_STATE = -1;
+  private static final long FRESH_FILL_READ_STATE = 1L << Integer.SIZE;
+
   public static ElementMatcher<? super TypeDescription> type() {
     return ElementMatchers.isSubTypeOf(SocketChannel.class)
         .and(ElementMatchers.not(ElementMatchers.isAbstract()))
@@ -222,14 +226,22 @@ public class SocketChannelInst {
 
   public static final class ReadAdvice {
     @Advice.OnMethodEnter(suppress = Throwable.class)
-    public static int read(@Advice.Argument(0) final ByteBuffer dst) {
-      return dst == null ? -1 : b(dst).position();
+    public static long read(@Advice.Argument(0) final ByteBuffer dst) {
+      if (dst == null) {
+        return INVALID_READ_STATE;
+      }
+      Buffer unwrapped = b(dst);
+      int position = unwrapped.position();
+      return Integer.toUnsignedLong(position)
+          | (position == 0 && unwrapped.limit() == unwrapped.capacity()
+              ? FRESH_FILL_READ_STATE
+              : 0);
     }
 
     @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
     public static void read(
         @Advice.Argument(0) final ByteBuffer dst,
-        @Advice.Enter int initialPosition,
+        @Advice.Enter long initialState,
         @Advice.Return int readBytes,
         @Advice.Thrown Throwable throwable,
         @Advice.FieldValue("localAddress") SocketAddress localSocket,
@@ -240,8 +252,8 @@ public class SocketChannelInst {
           || dst == null
           || throwable != null
           || readBytes <= 0
-          || initialPosition < 0
-          || b(dst).position() - initialPosition != readBytes) {
+          || initialState == INVALID_READ_STATE
+          || b(dst).position() - (int) initialState != readBytes) {
         return;
       }
       InetSocketAddress localSocketAddress = (InetSocketAddress) localSocket;
@@ -255,7 +267,7 @@ public class SocketChannelInst {
               remoteSocketAddress.getPort(),
               socketFileDescriptor);
 
-      SSLStorage.setConnectionForReadBuffer(dst, c);
+      SSLStorage.setConnectionForReadBuffer(dst, c, (initialState & FRESH_FILL_READ_STATE) != 0);
       if (SSLStorage.debugOn) {
         System.err.println("[SocketChannelInst] Setting connection for read buffer");
       }
@@ -271,12 +283,22 @@ public class SocketChannelInst {
       if (dsts == null || offset < 0 || length < 0 || offset > dsts.length - length) {
         return null;
       }
-      int[] positions = new int[dsts.length];
+      long[] states = new long[dsts.length];
       ByteBuffer[] buffers = dsts.clone();
       for (int i = offset; i < offset + length; i++) {
-        positions[i] = buffers[i] == null ? -1 : b(buffers[i]).position();
+        if (buffers[i] == null) {
+          states[i] = INVALID_READ_STATE;
+          continue;
+        }
+        Buffer unwrapped = b(buffers[i]);
+        int position = unwrapped.position();
+        states[i] =
+            Integer.toUnsignedLong(position)
+                | (position == 0 && unwrapped.limit() == unwrapped.capacity()
+                    ? FRESH_FILL_READ_STATE
+                    : 0);
       }
-      return new Object[] {buffers, positions, offset, length};
+      return new Object[] {buffers, states, offset, length};
     }
 
     @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
@@ -297,10 +319,10 @@ public class SocketChannelInst {
         return;
       }
       ByteBuffer[] buffers = (ByteBuffer[]) saved[0];
-      int[] positions = (int[]) saved[1];
+      long[] states = (long[]) saved[1];
       int offset = (Integer) saved[2];
       int length = (Integer) saved[3];
-      if (dsts.length != buffers.length || positions.length != buffers.length) {
+      if (dsts.length != buffers.length || states.length != buffers.length) {
         return;
       }
 
@@ -312,8 +334,8 @@ public class SocketChannelInst {
         if (buffers[i] == null) {
           continue;
         }
-        int delta = b(buffers[i]).position() - positions[i];
-        if (positions[i] < 0 || delta < 0) {
+        int delta = b(buffers[i]).position() - (int) states[i];
+        if (states[i] == INVALID_READ_STATE || delta < 0) {
           return;
         }
         advanced += delta;
@@ -334,8 +356,9 @@ public class SocketChannelInst {
               socketFileDescriptor);
 
       for (int i = offset; i < offset + length; i++) {
-        if (buffers[i] != null && b(buffers[i]).position() > positions[i]) {
-          SSLStorage.setConnectionForReadBuffer(buffers[i], c);
+        if (buffers[i] != null && b(buffers[i]).position() > (int) states[i]) {
+          SSLStorage.setConnectionForReadBuffer(
+              buffers[i], c, (states[i] & FRESH_FILL_READ_STATE) != 0);
         }
       }
 

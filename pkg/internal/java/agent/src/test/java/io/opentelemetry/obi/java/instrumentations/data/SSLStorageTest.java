@@ -595,7 +595,7 @@ class SSLStorageTest {
   }
 
   @Test
-  void scopedOwnerMakesARefreshedHandoffAmbiguous() throws Exception {
+  void scopedOwnerDoesNotPoisonARefreshedHandoff() throws Exception {
     SSLEngine engine = new DummySSLEngine(new byte[] {1});
     Connection scoped = connection(2734, 7178, 35);
     ByteBuffer source = ByteBuffer.allocate(8);
@@ -610,18 +610,39 @@ class SSLStorageTest {
         scoped,
         SSLStorage.claimConnectionForUnwrap(
             engine, source, captured, expected, owner, scoped, 1, 1));
-    SSLStorage.setConnectionForReadBuffer(source, scoped);
-    assertNull(SSLStorage.getConnectionForReadBuffer(source));
-    assertNull(
+    Object refreshed = SSLStorage.captureReadBufferHandoff(source);
+    SSLStorage.nettyConnection.remove();
+    assertSame(scoped, SSLStorage.getConnectionForReadBuffer(source));
+    assertSame(
+        scoped,
         SSLStorage.claimConnectionForUnwrap(
-            new DummySSLEngine(new byte[] {2}),
-            source,
-            SSLStorage.captureReadBufferHandoff(source),
-            null,
-            null,
-            null,
-            1,
-            1));
+            new DummySSLEngine(new byte[] {2}), source, refreshed, null, null, null, 1, 1));
+    SSLStorage.cleanupConnection(scoped);
+  }
+
+  @Test
+  void staleScopedHandoffCannotPoisonAConsumedGeneration() throws Exception {
+    SSLEngine engine = new DummySSLEngine(new byte[] {1});
+    Connection scoped = connection(2744, 7188, 53);
+    ByteBuffer source = ByteBuffer.allocate(8);
+    SSLStorage.setConnectionForReadBuffer(source, scoped);
+    Object captured = SSLStorage.captureReadBufferHandoff(source);
+    SSLStorage.nettyConnection.set(scoped);
+    Connection expected = SSLStorage.resolveConnectionForUnwrap(engine, captured);
+    Object owner = SSLStorage.captureConnectionOwnerForUnwrap(engine, expected);
+
+    assertSame(
+        scoped,
+        SSLStorage.claimConnectionForUnwrap(
+            engine, source, captured, expected, owner, scoped, 1, 1));
+    assertSame(
+        scoped,
+        SSLStorage.claimConnectionForUnwrap(
+            engine, source, captured, expected, owner, scoped, 1, 1));
+
+    SSLStorage.nettyConnection.remove();
+    SSLStorage.setConnectionForReadBuffer(source, scoped);
+    assertSame(scoped, SSLStorage.getConnectionForReadBuffer(source));
     SSLStorage.cleanupConnection(scoped);
   }
 
@@ -675,7 +696,7 @@ class SSLStorageTest {
     Connection second = connection(5235, 9679, 14);
     SSLStorage.setConnectionForReadBuffer(source, first);
     SSLStorage.cleanupConnection(first);
-    SSLStorage.setConnectionForReadBuffer(source, second);
+    SSLStorage.setConnectionForReadBuffer(source, second, true);
 
     Object handoff = SSLStorage.captureReadBufferHandoff(source);
 
@@ -696,7 +717,7 @@ class SSLStorageTest {
     SSLStorage.setConnectionForReadBuffer(source, first);
     Object stale = SSLStorage.captureReadBufferHandoff(source);
     SSLStorage.cleanupConnection(first);
-    SSLStorage.setConnectionForReadBuffer(source, second);
+    SSLStorage.setConnectionForReadBuffer(source, second, true);
     Object current = SSLStorage.captureReadBufferHandoff(source);
 
     assertNull(
@@ -711,7 +732,7 @@ class SSLStorageTest {
   }
 
   @Test
-  void staleHandoffMakesRefreshedGenerationAmbiguous() throws Exception {
+  void staleHandoffCannotPoisonRefreshedGeneration() throws Exception {
     ByteBuffer source = ByteBuffer.allocate(8);
     Connection connection = connection(6234, 1678, 15);
     SSLStorage.setConnectionForReadBuffer(source, connection);
@@ -723,8 +744,9 @@ class SSLStorageTest {
     assertNull(
         SSLStorage.claimConnectionForUnwrap(
             new DummySSLEngine(new byte[] {1}), source, stale, null, null, null, 1, 1));
-    assertNull(SSLStorage.getConnectionForReadBuffer(source));
-    assertNull(
+    assertSame(connection, SSLStorage.getConnectionForReadBuffer(source));
+    assertSame(
+        connection,
         SSLStorage.claimConnectionForUnwrap(
             new DummySSLEngine(new byte[] {2}), source, current, null, null, null, 1, 1));
     SSLStorage.cleanupConnection(connection);
@@ -745,6 +767,52 @@ class SSLStorageTest {
         SSLStorage.claimConnectionForUnwrap(
             new DummySSLEngine(new byte[] {2}), source, handoff, null, null, null, 1, 1));
     SSLStorage.cleanupConnection(connection);
+  }
+
+  @Test
+  void staleClaimingHandoffCannotPoisonAConsumedGeneration() throws Exception {
+    ByteBuffer source = ByteBuffer.allocate(8);
+    Connection connection = connection(7239, 2683, 54);
+    SSLStorage.setConnectionForReadBuffer(source, connection);
+    SSLStorage.BufferHandoff available =
+        (SSLStorage.BufferHandoff) SSLStorage.captureReadBufferHandoff(source);
+    SSLStorage.BufferHandoff staleClaiming =
+        new SSLStorage.BufferHandoff(available, SSLStorage.BUFFER_HANDOFF_CLAIMING);
+
+    assertSame(
+        connection,
+        SSLStorage.claimConnectionForUnwrap(
+            new DummySSLEngine(new byte[] {1}), source, available, null, null, null, 1, 1));
+    assertNull(
+        SSLStorage.claimConnectionForUnwrap(
+            new DummySSLEngine(new byte[] {2}), source, staleClaiming, null, null, null, 1, 1));
+
+    SSLStorage.setConnectionForReadBuffer(source, connection);
+    assertSame(connection, SSLStorage.getConnectionForReadBuffer(source));
+    SSLStorage.cleanupConnection(connection);
+  }
+
+  @Test
+  void completedReadHandoffCanCrossThreadsWithoutOverlap() throws Exception {
+    ExecutorService executor = Executors.newSingleThreadExecutor();
+    try {
+      ByteBuffer source = ByteBuffer.allocate(8);
+      Connection connection = connection(7244, 2688, 52);
+      SSLStorage.setConnectionForReadBuffer(source, connection);
+      Object handoff = SSLStorage.captureReadBufferHandoff(source);
+      SSLEngine engine = new DummySSLEngine(new byte[] {1});
+
+      Future<Connection> claimed =
+          executor.submit(
+              () ->
+                  SSLStorage.claimConnectionForUnwrap(
+                      engine, source, handoff, null, null, null, 1, 1));
+
+      assertSame(connection, claimed.get(5, java.util.concurrent.TimeUnit.SECONDS));
+      SSLStorage.cleanupConnection(connection);
+    } finally {
+      executor.shutdownNow();
+    }
   }
 
   @Test
@@ -820,7 +888,7 @@ class SSLStorageTest {
   }
 
   @Test
-  void successfulClaimMakesDistinctOwnerReuseAmbiguous() throws Exception {
+  void successfulClaimMakesDistinctOwnerNonemptyReuseAmbiguous() throws Exception {
     ByteBuffer source = ByteBuffer.allocate(8);
     Connection firstOwner = connection(7294, 2738, 41);
     Connection secondOwner = connection(7295, 2739, 42);
@@ -845,6 +913,81 @@ class SSLStorageTest {
             null,
             1,
             1));
+    SSLStorage.cleanupConnection(firstOwner);
+    SSLStorage.cleanupConnection(secondOwner);
+  }
+
+  @Test
+  void freshPooledBufferReadAllowsDistinctActiveOwnerReuse() throws Exception {
+    ByteBuffer source = ByteBuffer.allocate(8);
+    Connection firstOwner = connection(7304, 2748, 46);
+    Connection secondOwner = connection(7305, 2749, 47);
+    SSLEngine firstEngine = new DummySSLEngine(new byte[] {1});
+    SSLStorage.setConnectionForReadBuffer(source, firstOwner);
+    Object stale = SSLStorage.captureReadBufferHandoff(source);
+
+    assertSame(
+        firstOwner,
+        SSLStorage.claimConnectionForUnwrap(firstEngine, source, stale, null, null, null, 1, 1));
+
+    SSLStorage.setConnectionForReadBuffer(source, secondOwner, true);
+    Object current = SSLStorage.captureReadBufferHandoff(source);
+
+    assertNull(
+        SSLStorage.claimConnectionForUnwrap(firstEngine, source, stale, null, null, null, 1, 1));
+    assertSame(secondOwner, SSLStorage.getConnectionForReadBuffer(source));
+    assertSame(
+        secondOwner,
+        SSLStorage.claimConnectionForUnwrap(
+            new DummySSLEngine(new byte[] {2}), source, current, null, null, null, 1, 1));
+    SSLStorage.cleanupConnection(firstOwner);
+    SSLStorage.cleanupConnection(secondOwner);
+  }
+
+  @Test
+  void freshPooledBufferReadReplacesAHandshakeOnlyOwner() throws Exception {
+    ByteBuffer source = ByteBuffer.allocate(8);
+    Connection handshakeOwner = connection(7309, 2753, 50);
+    Connection applicationOwner = connection(7310, 2754, 51);
+    SSLEngine handshakingEngine = new DummySSLEngine();
+    SSLStorage.setConnectionForReadBuffer(source, handshakeOwner);
+    Object handshake = SSLStorage.captureReadBufferHandoff(source);
+
+    assertNull(
+        SSLStorage.claimConnectionForUnwrap(
+            handshakingEngine, source, handshake, null, null, null, 1, 1));
+    assertSame(handshakeOwner, SSLStorage.getConnectionForReadBuffer(source));
+
+    SSLStorage.setConnectionForReadBuffer(source, applicationOwner, true);
+    Object application = SSLStorage.captureReadBufferHandoff(source);
+
+    assertSame(applicationOwner, SSLStorage.getConnectionForReadBuffer(source));
+    assertSame(
+        applicationOwner,
+        SSLStorage.claimConnectionForUnwrap(
+            new DummySSLEngine(new byte[] {1}), source, application, null, null, null, 1, 1));
+    SSLStorage.cleanupConnection(handshakeOwner);
+    SSLStorage.cleanupConnection(applicationOwner);
+  }
+
+  @Test
+  void nonemptyDistinctOwnerReuseStaysAmbiguousUntilAFreshRead() throws Exception {
+    ByteBuffer source = ByteBuffer.allocate(8);
+    Connection firstOwner = connection(7314, 2758, 48);
+    Connection secondOwner = connection(7315, 2759, 49);
+    SSLStorage.setConnectionForReadBuffer(source, firstOwner);
+    SSLStorage.setConnectionForReadBuffer(source, secondOwner);
+
+    assertNull(SSLStorage.getConnectionForReadBuffer(source));
+
+    SSLStorage.setConnectionForReadBuffer(source, secondOwner, true);
+    Object current = SSLStorage.captureReadBufferHandoff(source);
+
+    assertSame(secondOwner, SSLStorage.getConnectionForReadBuffer(source));
+    assertSame(
+        secondOwner,
+        SSLStorage.claimConnectionForUnwrap(
+            new DummySSLEngine(new byte[] {2}), source, current, null, null, null, 1, 1));
     SSLStorage.cleanupConnection(firstOwner);
     SSLStorage.cleanupConnection(secondOwner);
   }

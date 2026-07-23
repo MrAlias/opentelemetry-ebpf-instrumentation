@@ -46,11 +46,9 @@ public class SSLStorage {
       new CappedConcurrentHashMap<>(MAX_CONCURRENT);
 
   private static final int BUFFER_HANDOFF_AVAILABLE = 0;
-  private static final int BUFFER_HANDOFF_CLAIMING = 1;
+  static final int BUFFER_HANDOFF_CLAIMING = 1;
   private static final int BUFFER_HANDOFF_CONSUMED = 2;
   private static final int BUFFER_HANDOFF_AMBIGUOUS = 3;
-  private static final BufferHandoff AMBIGUOUS_BUFFER_HANDOFF =
-      new BufferHandoff(null, BUFFER_HANDOFF_AMBIGUOUS);
   private static final WeakIdentityConcurrentMap<BufferHandoff> readBufferConnections =
       new WeakIdentityConcurrentMap<>(MAX_CONCURRENT);
   private static final CappedConcurrentHashMap<ExactConnection, ConnectionOwner> activeConnections =
@@ -145,7 +143,7 @@ public class SSLStorage {
 
     if (cached != null && cached.getSocketFileDescriptor() >= 0) {
       BufferHandoff correlated = asBufferHandoff(handoff);
-      if (correlated == AMBIGUOUS_BUFFER_HANDOFF
+      if ((correlated != null && correlated.state == BUFFER_HANDOFF_AMBIGUOUS)
           || (correlated != null && correlated.state == BUFFER_HANDOFF_CLAIMING)
           || (correlated != null
               && (!isActive(correlated.owner)
@@ -209,12 +207,12 @@ public class SSLStorage {
     if (candidate == null) {
       return expected;
     }
-    if (candidate == AMBIGUOUS_BUFFER_HANDOFF || buffer == null) {
+    if (candidate.state == BUFFER_HANDOFF_AMBIGUOUS || buffer == null) {
       return null;
     }
 
     if (candidate.state == BUFFER_HANDOFF_CLAIMING) {
-      makeCurrentBufferHandoffAmbiguous(buffer);
+      makeCurrentBufferHandoffAmbiguous(buffer, candidate);
       return null;
     }
 
@@ -248,7 +246,7 @@ public class SSLStorage {
       ByteBuffer buffer,
       BufferHandoff candidate,
       ConnectionOwner expectedOwner) {
-    BufferHandoff claiming = new BufferHandoff(candidate.owner, BUFFER_HANDOFF_CLAIMING);
+    BufferHandoff claiming = new BufferHandoff(candidate, BUFFER_HANDOFF_CLAIMING);
     if (!readBufferConnections.replace(buffer, candidate, claiming)) {
       makeFailedTakeAmbiguous(buffer, candidate);
       return null;
@@ -297,7 +295,7 @@ public class SSLStorage {
         return null;
       }
 
-      BufferHandoff consumed = new BufferHandoff(candidate.owner, BUFFER_HANDOFF_CONSUMED);
+      BufferHandoff consumed = new BufferHandoff(claiming, BUFFER_HANDOFF_CONSUMED);
       if (!readBufferConnections.replace(buffer, claiming, consumed)) {
         return null;
       }
@@ -309,7 +307,7 @@ public class SSLStorage {
       return candidate.owner.connection;
     } finally {
       if (!accepted) {
-        makeCurrentBufferHandoffAmbiguous(buffer);
+        makeCurrentBufferHandoffAmbiguous(buffer, claiming);
         if (installedSessionOwner) {
           sslConnections.remove(session, candidate.owner);
         }
@@ -410,6 +408,11 @@ public class SSLStorage {
   }
 
   public static void setConnectionForReadBuffer(ByteBuffer buffer, Connection connection) {
+    setConnectionForReadBuffer(buffer, connection, false);
+  }
+
+  public static void setConnectionForReadBuffer(
+      ByteBuffer buffer, Connection connection, boolean freshFillAtReadEntry) {
     if (buffer == null || connection == null || connection.getSocketFileDescriptor() < 0) {
       return;
     }
@@ -431,14 +434,18 @@ public class SSLStorage {
           return;
         }
       }
-      if (observed == AMBIGUOUS_BUFFER_HANDOFF) {
-        return;
+      BufferHandoff replacement;
+      if (observed.state == BUFFER_HANDOFF_CLAIMING) {
+        replacement = new BufferHandoff(candidate, BUFFER_HANDOFF_AMBIGUOUS);
+      } else if (freshFillAtReadEntry) {
+        replacement = candidate;
+      } else if (observed.state == BUFFER_HANDOFF_AMBIGUOUS) {
+        replacement = new BufferHandoff(candidate, BUFFER_HANDOFF_AMBIGUOUS);
+      } else if (observed.owner == owner) {
+        replacement = candidate;
+      } else {
+        replacement = new BufferHandoff(candidate, BUFFER_HANDOFF_AMBIGUOUS);
       }
-      BufferHandoff replacement =
-          observed.state != BUFFER_HANDOFF_CLAIMING
-                  && (observed.owner == owner || !isActive(observed.owner))
-              ? candidate
-              : AMBIGUOUS_BUFFER_HANDOFF;
       if (readBufferConnections.replace(buffer, observed, replacement)) {
         return;
       }
@@ -509,7 +516,10 @@ public class SSLStorage {
     BufferHandoff captured = asBufferHandoff(handoff);
     while (buffer != null) {
       BufferHandoff current = readBufferConnections.get(buffer);
-      if (current == null || current == AMBIGUOUS_BUFFER_HANDOFF) {
+      if (current == null
+          || current.state == BUFFER_HANDOFF_AMBIGUOUS
+          || captured == null
+          || current.generation != captured.generation) {
         return;
       }
       if (current == captured
@@ -517,14 +527,20 @@ public class SSLStorage {
           && current.state == BUFFER_HANDOFF_CONSUMED) {
         return;
       }
+      if (current.state == BUFFER_HANDOFF_CONSUMED
+          && current.owner == owner
+          && captured.owner == owner) {
+        return;
+      }
       if (current == captured
           && current.owner == owner
           && current.state == BUFFER_HANDOFF_AVAILABLE) {
-        BufferHandoff consumed = new BufferHandoff(owner, BUFFER_HANDOFF_CONSUMED);
+        BufferHandoff consumed = new BufferHandoff(current, BUFFER_HANDOFF_CONSUMED);
         if (readBufferConnections.replace(buffer, current, consumed)) {
           return;
         }
-      } else if (readBufferConnections.replace(buffer, current, AMBIGUOUS_BUFFER_HANDOFF)) {
+      } else if (readBufferConnections.replace(
+          buffer, current, new BufferHandoff(current, BUFFER_HANDOFF_AMBIGUOUS))) {
         return;
       }
     }
@@ -533,25 +549,36 @@ public class SSLStorage {
   private static void makeFailedTakeAmbiguous(ByteBuffer buffer, BufferHandoff candidate) {
     while (buffer != null) {
       BufferHandoff current = readBufferConnections.get(buffer);
-      if (current == null || current == AMBIGUOUS_BUFFER_HANDOFF) {
+      if (current == null || current.state == BUFFER_HANDOFF_AMBIGUOUS) {
+        return;
+      }
+      if (current.generation != candidate.generation) {
         return;
       }
       if (current.state == BUFFER_HANDOFF_CONSUMED && current.owner == candidate.owner) {
         return;
       }
-      if (readBufferConnections.replace(buffer, current, AMBIGUOUS_BUFFER_HANDOFF)) {
+      if (readBufferConnections.replace(
+          buffer, current, new BufferHandoff(current, BUFFER_HANDOFF_AMBIGUOUS))) {
         return;
       }
     }
   }
 
-  private static void makeCurrentBufferHandoffAmbiguous(ByteBuffer buffer) {
+  private static void makeCurrentBufferHandoffAmbiguous(
+      ByteBuffer buffer, BufferHandoff candidate) {
     while (buffer != null) {
       BufferHandoff current = readBufferConnections.get(buffer);
-      if (current == null || current == AMBIGUOUS_BUFFER_HANDOFF) {
+      if (current == null
+          || current.state == BUFFER_HANDOFF_AMBIGUOUS
+          || current.generation != candidate.generation) {
         return;
       }
-      if (readBufferConnections.replace(buffer, current, AMBIGUOUS_BUFFER_HANDOFF)) {
+      if (current.state == BUFFER_HANDOFF_CONSUMED && current.owner == candidate.owner) {
+        return;
+      }
+      if (readBufferConnections.replace(
+          buffer, current, new BufferHandoff(current, BUFFER_HANDOFF_AMBIGUOUS))) {
         return;
       }
     }
@@ -952,10 +979,18 @@ public class SSLStorage {
   static final class BufferHandoff {
     private final ConnectionOwner owner;
     private final int state;
+    private final BufferHandoff generation;
 
     BufferHandoff(ConnectionOwner owner, int state) {
       this.owner = owner;
       this.state = state;
+      this.generation = this;
+    }
+
+    BufferHandoff(BufferHandoff handoff, int state) {
+      this.owner = handoff.owner;
+      this.state = state;
+      this.generation = handoff.generation;
     }
   }
 

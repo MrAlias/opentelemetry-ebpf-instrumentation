@@ -31,12 +31,18 @@ request.
    closed and an unrecorded marker remains eligible for retry. Marker attempts are
    reserved atomically against the exact connection-owner generation before JNI,
    so concurrent and failed calls still respect the bounded burst and retry
-   interval. A live buffer observed on distinct connection-owner generations
-   remains ambiguous. A tentative handoff is claimed once only after an
-   established session consumes ciphertext and advances a destination buffer with
-   plaintext. Socket cleanup invalidates every outstanding handoff and cached
-   session owner for the exact tuple and file descriptor. Conflicts and stale
-   generations fail closed.
+   interval. A positive socket read beginning in fresh-fill state (position zero
+   with the full capacity writable) starts a new ownership generation, allowing
+   frameworks to reuse a drained pooled buffer. Reuse with retained ciphertext or
+   a concurrent claim remains ambiguous. A tentative handoff is claimed once only
+   after an established session consumes ciphertext and advances a destination
+   buffer with plaintext. Socket cleanup invalidates every outstanding handoff and
+   cached session owner for the exact tuple and file descriptor. Conflicts and
+   stale generations fail closed. The ownership contract requires exclusive
+   mutable access to an exact `ByteBuffer` from socket read through its
+   corresponding unwrap or release. A buffer can cross threads with a happens-before
+   handoff, but concurrent mutation or reuse of a live alias across connections is
+   unsupported by both this correlation and `ByteBuffer` itself.
 4. When OBI recognizes an HTTP/1.1 server request, it moves the raw TCP
    candidate to the current Java logical execution identity. This is separate
    from both `incoming_trace_map` and the public `traces_ctx_v1` map.

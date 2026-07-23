@@ -804,7 +804,10 @@ public class SSLStorage {
     long threadId = currentThreadId();
     boolean linked =
         ThreadInfo.enterTaskParentThreadContext(
-            threadId, context.getParentThreadId(), context.getHandoffToken());
+            threadId,
+            context.getParentThreadId(),
+            context.getHandoffToken(),
+            context.getRemoteParentSocketContext());
     if (linked) {
       scopes.pop();
       scopes.push(Boolean.TRUE);
@@ -867,7 +870,10 @@ public class SSLStorage {
     long parentThreadId = context.getParentThreadId();
     if (parentThreadId != threadId || context.getHandoffToken() != 0L) {
       return ThreadInfo.enterTaskParentThreadContext(
-          threadId, parentThreadId, context.getHandoffToken());
+          threadId,
+          parentThreadId,
+          context.getHandoffToken(),
+          context.getRemoteParentSocketContext());
     }
     ThreadInfo.cancelTaskContext(context);
     return false;
@@ -889,7 +895,10 @@ public class SSLStorage {
     }
     boolean linked =
         ThreadInfo.enterTaskParentThreadContext(
-            currentThreadId(), context.getParentThreadId(), context.getHandoffToken());
+            currentThreadId(),
+            context.getParentThreadId(),
+            context.getHandoffToken(),
+            context.getRemoteParentSocketContext());
     virtualThreadTaskScope.set(linked);
   }
 

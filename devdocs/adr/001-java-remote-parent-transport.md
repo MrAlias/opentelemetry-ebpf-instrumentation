@@ -153,15 +153,24 @@ Connection-only correlation is insufficient for pipelined, coalesced, or
 multiplexed requests. Ambiguous HTTP/1.1 inputs deliberately miss. HTTP/2 is
 unsupported until a stream-safe identity exists.
 
-The primary helper retains the accepted socket descriptor only on the Java
-thread that reported the decrypted receive and clears it after one take or
-discard. A framework that moves from TLS receive to server extraction on a
-different thread before the stock server instrumenter runs is therefore an
-explicit primary-transport miss unless that exact pre-extraction timing gains
-a separately proven socket handoff. Executor, servlet, Netty, and virtual-
-thread work scheduled after the server span starts does not establish such a
-handoff. This unsupported timing fails open; it never falls back to a dummy
-socket or a connection-only guess.
+Each accepted socket descriptor is stored in a fresh, one-shot Java holder.
+Exact executor, ForkJoin, Netty, and virtual-thread task captures share that
+holder with the generation-bound task token. Task entry masks any prior worker
+binding, task exit restores it, and take or discard atomically consumes the
+shared descriptor before transport readiness, buffer acquisition, or native
+lookup. Cancellation and rejection detach the task without invalidating a
+holder that another exact alias may still claim. This supports instrumented
+task ownership across a TLS-receive-to-extraction thread change without
+duplicating or retaining the application socket. Packaged-agent probes prove
+the task-scope mechanism; a framework-specific pre-extraction claim still
+requires retained privileged trace evidence.
+
+The descriptor is only a lookup handle. Socket-local negotiation and the exact
+task generation still authorize retrieval, so close or numeric descriptor
+reuse can cause a miss but cannot select a newer connection's parent. A
+framework handoff outside the instrumented task surfaces remains an explicit
+primary-transport miss and never falls back to a dummy socket or a
+connection-only guess.
 
 ## Rollout and evidence
 

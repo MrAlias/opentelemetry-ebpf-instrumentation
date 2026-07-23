@@ -217,7 +217,7 @@ The authoritative identities and transitions are:
 | TLS socket owner | Socket-local exact handoff key and trace | Exact prewrite reaches `sk_msg` | Option terminal outcome, socket close, stale or malformed recovery, restart |
 | TCP candidate | Sorted connection tuple | Valid inbound TCP option | HTTP parse take, ambiguity, LRU eviction, restart |
 | Java request | PID namespace, process ID, logical TID | Parsed Java TLS HTTP/1.1 request | Take, discard, completion, stale sweep, exact process retirement, restart |
-| Task handoff | Process, PID namespace, opaque submission token | Java submission capture | Exact one-shot link, cancellation, rejection, stale sweep, bounded-map eviction |
+| Task handoff | Process, PID namespace, opaque submission token, shared one-shot accepted-socket holder | Java submission capture | Exact one-shot link, cancellation, rejection, task-scope restoration, stale sweep, bounded-map eviction |
 | Virtual thread | Stable virtual-thread identity across carrier mounts | Mount translates the carrier to the virtual-thread ID | Take, discard, virtual-thread termination, bounded-map eviction, restart |
 | Consumed | Original Java request key and generation | Atomic take or discard | TTL sweep, bounded-map eviction, restart |
 
@@ -227,12 +227,16 @@ one-shot across both transports. A second caller sees `already consumed`.
 Executor submission captures the exact owner and generation under a nonzero,
 per-JVM token. Execution consumes that token once, including when submission
 and execution use the same carrier thread, and installs a flattened link for
-the child. Cancellation, rejection, duplicate task-object submission, missing
-tokens, generation change, and post-link validation all fail closed. Legacy
-thread links remain available to existing instrumentation but cannot select a
-remote parent while this bridge is enabled. A stale task link, missed virtual
-thread ownership, or multiple candidates produces `ambiguous` or a miss. It
-does not choose one candidate.
+the child. The corresponding Java task context shares a one-shot accepted-
+socket holder. Nested task scopes save and restore holder references while an
+atomic claim prevents sibling tasks or restored scopes from reusing the
+descriptor. A task with no holder masks stale worker state. Cancellation,
+rejection, duplicate task-object submission, missing tokens, generation
+change, and post-link validation all fail closed. Legacy thread links remain
+available to existing instrumentation but cannot select a remote parent while
+this bridge is enabled. A stale task link, missed virtual thread ownership, or
+multiple candidates produces `ambiguous` or a miss. It does not choose one
+candidate.
 
 An ordinary virtual-thread unmount removes only the carrier-to-virtual-thread
 translation. Logical request and task ownership remains keyed by the stable

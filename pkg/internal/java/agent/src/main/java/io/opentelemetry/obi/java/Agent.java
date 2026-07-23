@@ -52,6 +52,7 @@ public class Agent {
                   "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ConnectionOwner",
                   "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ExactConnection",
                   "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$TlsConnectionMarkerAttempt",
+                  "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext",
                   "io.opentelemetry.obi.java.instrumentations.data.TaskContext",
                   "io.opentelemetry.obi.java.instrumentations.data.WeakIdentityConcurrentMap",
                   "io.opentelemetry.obi.java.instrumentations.data.WeakIdentityConcurrentMap$IdentityWeakReference",

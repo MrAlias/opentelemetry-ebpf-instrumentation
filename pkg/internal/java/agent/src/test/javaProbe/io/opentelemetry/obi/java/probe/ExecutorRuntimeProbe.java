@@ -17,6 +17,7 @@ import java.util.concurrent.FutureTask;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public final class ExecutorRuntimeProbe {
   private static final List<Event> EVENTS = Collections.synchronizedList(new ArrayList<Event>());
@@ -25,9 +26,21 @@ public final class ExecutorRuntimeProbe {
 
   public static void main(String[] args) throws Exception {
     installEventRecorder();
+    verifyDirectSameThreadOwnership();
     verifyNestedExecutorHandoffs();
     verifyCancellationTimeoutAndRejectionCleanup();
     System.out.println("executor-agent-probe passed");
+  }
+
+  private static void verifyDirectSameThreadOwnership() {
+    try {
+      setSocketFileDescriptor(70);
+      require(socketFileDescriptor() == 70, "same-thread socket ownership was not visible");
+      require(takeSocketFileDescriptor() == 70, "same-thread socket ownership was not claimed");
+      require(takeSocketFileDescriptor() == -1, "same-thread socket ownership was claimed twice");
+    } finally {
+      clearSocketFileDescriptor();
+    }
   }
 
   private static void installEventRecorder() throws Exception {
@@ -58,15 +71,24 @@ public final class ExecutorRuntimeProbe {
     ExecutorService first = Executors.newFixedThreadPool(2);
     ExecutorService second = Executors.newFixedThreadPool(2);
     CountDownLatch complete = new CountDownLatch(1);
+    AtomicInteger claimedDescriptor = new AtomicInteger(-2);
     NamedTask[] tasks = new NamedTask[3];
-    tasks[2] = new NamedTask("third", complete::countDown);
+    tasks[2] =
+        new NamedTask(
+            "third",
+            () -> {
+              claimedDescriptor.set(takeSocketFileDescriptor());
+              complete.countDown();
+            });
     tasks[1] = new NamedTask("second", () -> first.execute(tasks[2]));
     tasks[0] = new NamedTask("first", () -> second.execute(tasks[1]));
     int start = eventCount();
 
     try {
+      setSocketFileDescriptor(71);
       first.execute(tasks[0]);
       require(complete.await(5, TimeUnit.SECONDS), "nested executor chain did not complete");
+      require(claimedDescriptor.get() == 71, "nested executor lost accepted socket ownership");
       awaitNoContext(tasks[0]);
       awaitNoContext(tasks[1]);
       awaitNoContext(tasks[2]);
@@ -76,7 +98,46 @@ public final class ExecutorRuntimeProbe {
       require(count(events, "TASK_CAPTURE") == 3, "nested captures were not exact: " + events);
       require(count(events, "TASK_LINK") >= 6, "nested links were not restored: " + events);
       require(hasLinkedCapture(events), "nested handoff tokens were not linked: " + events);
+
+      CountDownLatch secondComplete = new CountDownLatch(1);
+      AtomicInteger secondDescriptor = new AtomicInteger(-2);
+      NamedTask secondHop =
+          new NamedTask(
+              "second-run-worker",
+              () -> {
+                secondDescriptor.set(takeSocketFileDescriptor());
+                secondComplete.countDown();
+              });
+      NamedTask firstHop = new NamedTask("second-run-submitter", () -> second.execute(secondHop));
+      setSocketFileDescriptor(72);
+      first.execute(firstHop);
+      require(secondComplete.await(5, TimeUnit.SECONDS), "second executor chain did not complete");
+      require(secondDescriptor.get() == 72, "fresh socket ownership was not propagated");
+
+      CountDownLatch reuseComplete = new CountDownLatch(2);
+      AtomicInteger leakedDescriptors = new AtomicInteger();
+      first.execute(
+          new NamedTask(
+              "first-reuse",
+              () -> {
+                if (socketFileDescriptor() != -1) {
+                  leakedDescriptors.incrementAndGet();
+                }
+                reuseComplete.countDown();
+              }));
+      second.execute(
+          new NamedTask(
+              "second-reuse",
+              () -> {
+                if (socketFileDescriptor() != -1) {
+                  leakedDescriptors.incrementAndGet();
+                }
+                reuseComplete.countDown();
+              }));
+      require(reuseComplete.await(5, TimeUnit.SECONDS), "worker reuse probes did not complete");
+      require(leakedDescriptors.get() == 0, "executor worker reused accepted socket ownership");
     } finally {
+      clearSocketFileDescriptor();
       shutdown(first);
       shutdown(second);
     }
@@ -96,8 +157,10 @@ public final class ExecutorRuntimeProbe {
     require(workerBlocked.await(5, TimeUnit.SECONDS), "executor worker did not block");
     int start = eventCount();
 
+    setSocketFileDescriptor(73);
     FutureTask<Void> cancelled = new FutureTask<Void>(new NamedTask("cancelled", () -> {}), null);
     executor.execute(cancelled);
+    clearSocketFileDescriptor();
     require(taskContext(cancelled) != null, "queued cancellation task was not tracked");
     require(cancelled.cancel(false), "queued task was not cancelled");
     awaitNoContext(cancelled);
@@ -116,14 +179,28 @@ public final class ExecutorRuntimeProbe {
     ExecutorService rejectedExecutor = Executors.newSingleThreadExecutor();
     rejectedExecutor.shutdown();
     NamedTask rejected = new NamedTask("rejected", () -> {});
+    setSocketFileDescriptor(74);
     try {
       rejectedExecutor.execute(rejected);
       throw new AssertionError("shutdown executor accepted a task");
     } catch (RejectedExecutionException expected) {
+    } finally {
+      clearSocketFileDescriptor();
     }
     awaitNoContext(rejected);
 
     releaseWorker.countDown();
+    CountDownLatch reuseComplete = new CountDownLatch(1);
+    AtomicInteger reusedDescriptor = new AtomicInteger(-2);
+    executor.execute(
+        new NamedTask(
+            "post-cancellation-reuse",
+            () -> {
+              reusedDescriptor.set(socketFileDescriptor());
+              reuseComplete.countDown();
+            }));
+    require(reuseComplete.await(5, TimeUnit.SECONDS), "post-cancellation probe did not complete");
+    require(reusedDescriptor.get() == -1, "cancelled task leaked socket ownership to its worker");
     shutdown(executor);
     require(
         count(snapshotSince(start), "TASK_CANCEL") >= 3,
@@ -158,6 +235,39 @@ public final class ExecutorRuntimeProbe {
     Class<?> storage =
         Class.forName("io.opentelemetry.obi.java.instrumentations.data.SSLStorage", true, null);
     return storage.getMethod("taskContext", Object.class).invoke(null, task);
+  }
+
+  private static void setSocketFileDescriptor(int socketFileDescriptor) {
+    invokeThreadInfo(
+        "setRemoteParentSocketFileDescriptor",
+        new Class<?>[] {int.class},
+        new Object[] {Integer.valueOf(socketFileDescriptor)});
+  }
+
+  private static int socketFileDescriptor() {
+    return ((Integer)
+            invokeThreadInfo("remoteParentSocketFileDescriptor", new Class<?>[0], new Object[0]))
+        .intValue();
+  }
+
+  private static int takeSocketFileDescriptor() {
+    return ((Integer)
+            invokeThreadInfo(
+                "takeRemoteParentSocketFileDescriptor", new Class<?>[0], new Object[0]))
+        .intValue();
+  }
+
+  private static void clearSocketFileDescriptor() {
+    invokeThreadInfo("clearRemoteParentSocketFileDescriptor", new Class<?>[0], new Object[0]);
+  }
+
+  private static Object invokeThreadInfo(String name, Class<?>[] parameterTypes, Object[] values) {
+    try {
+      Class<?> threadInfo = Class.forName("io.opentelemetry.obi.java.ebpf.ThreadInfo", true, null);
+      return threadInfo.getMethod(name, parameterTypes).invoke(null, values);
+    } catch (ReflectiveOperationException failure) {
+      throw new AssertionError(failure);
+    }
   }
 
   private static void await(CountDownLatch latch) {

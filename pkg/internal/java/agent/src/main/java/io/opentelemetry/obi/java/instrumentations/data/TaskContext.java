@@ -9,10 +9,17 @@ package io.opentelemetry.obi.java.instrumentations.data;
 public final class TaskContext {
   private final long parentThreadId;
   private final long handoffToken;
+  private final RemoteParentSocketContext remoteParentSocketContext;
 
   public TaskContext(long parentThreadId, long handoffToken) {
+    this(parentThreadId, handoffToken, null);
+  }
+
+  public TaskContext(
+      long parentThreadId, long handoffToken, RemoteParentSocketContext remoteParentSocketContext) {
     this.parentThreadId = parentThreadId;
     this.handoffToken = handoffToken;
+    this.remoteParentSocketContext = remoteParentSocketContext;
   }
 
   public long getParentThreadId() {
@@ -21,5 +28,9 @@ public final class TaskContext {
 
   public long getHandoffToken() {
     return handoffToken;
+  }
+
+  public RemoteParentSocketContext getRemoteParentSocketContext() {
+    return remoteParentSocketContext;
   }
 }

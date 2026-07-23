@@ -10,16 +10,26 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.opentelemetry.obi.java.ebpf.ThreadInfo;
+import io.opentelemetry.obi.java.instrumentations.data.TaskContext;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReferenceArray;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 class NativeRemoteParentProviderTest {
+  @AfterEach
+  void resetThreadInfo() throws Exception {
+    ThreadInfo.setRemoteParentEnabled(false);
+    ThreadInfo.clearRemoteParentSocketFileDescriptor();
+    setTaskContextEmitter(null);
+  }
+
   @Test
   void circuitBreaksTransportOverload() {
     assertTrue(NativeRemoteParentProvider.requiresReconfiguration(RemoteParentStatus.UNKNOWN));
@@ -134,7 +144,7 @@ class NativeRemoteParentProviderTest {
   }
 
   @Test
-  void clearsSocketFileDescriptorWhenTransportIsUnavailable() {
+  void consumesSocketOwnershipWhenTransportIsUnavailable() throws Exception {
     NativeRemoteParentProvider provider =
         new NativeRemoteParentProvider(
             RemoteParentTransport.DISABLED,
@@ -144,10 +154,11 @@ class NativeRemoteParentProviderTest {
             (transport, path, timeout, uid, processIncarnation) -> RemoteParentStatus.DISABLED,
             () -> true);
 
-    ThreadInfo.setRemoteParentSocketFileDescriptor(17);
+    TaskContext alias = captureSocketAlias(17);
     provider.takeRemoteParent();
 
     assertEquals(-1, ThreadInfo.remoteParentSocketFileDescriptor());
+    assertEquals(-1, alias.getRemoteParentSocketContext().peek());
     provider.close();
   }
 
@@ -162,23 +173,45 @@ class NativeRemoteParentProviderTest {
       buffers.set(i, null);
     }
 
-    ThreadInfo.setRemoteParentSocketFileDescriptor(18);
+    TaskContext alias = captureSocketAlias(18);
     RemoteParentRecord record = provider.takeRemoteParent();
 
     assertEquals(RemoteParentStatus.OVERLOAD, record.getStatus());
     assertEquals(-1, ThreadInfo.remoteParentSocketFileDescriptor());
+    assertEquals(-1, alias.getRemoteParentSocketContext().peek());
     provider.close();
   }
 
   @Test
-  void clearsSocketFileDescriptorAfterNativeTerminalPath() {
+  void consumesSocketOwnershipAfterNativeTerminalPath() throws Exception {
     NativeRemoteParentProvider provider = readyProvider();
 
-    ThreadInfo.setRemoteParentSocketFileDescriptor(1_000_000);
+    TaskContext alias = captureSocketAlias(1_000_000);
     provider.discardRemoteParent();
 
     assertEquals(-1, ThreadInfo.remoteParentSocketFileDescriptor());
+    assertEquals(-1, alias.getRemoteParentSocketContext().peek());
     provider.close();
+  }
+
+  private static TaskContext captureSocketAlias(int socketFileDescriptor) throws Exception {
+    setTaskContextEmitter((proxy, method, args) -> null);
+    ThreadInfo.setRemoteParentEnabled(true);
+    ThreadInfo.setRemoteParentSocketFileDescriptor(socketFileDescriptor);
+    return ThreadInfo.captureTaskContext(101L);
+  }
+
+  private static void setTaskContextEmitter(java.lang.reflect.InvocationHandler handler)
+      throws Exception {
+    Class<?> emitter =
+        Class.forName("io.opentelemetry.obi.java.ebpf.ThreadInfo$TaskContextEmitter");
+    Method setter = ThreadInfo.class.getDeclaredMethod("setTaskContextEmitterForTest", emitter);
+    setter.setAccessible(true);
+    Object value =
+        handler == null
+            ? null
+            : Proxy.newProxyInstance(emitter.getClassLoader(), new Class<?>[] {emitter}, handler);
+    setter.invoke(null, value);
   }
 
   private static NativeRemoteParentProvider readyProvider() {

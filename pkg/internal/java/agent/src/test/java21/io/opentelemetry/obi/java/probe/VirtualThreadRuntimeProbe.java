@@ -21,6 +21,7 @@ import java.util.concurrent.FutureTask;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.StructuredTaskScope;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 
@@ -70,6 +71,7 @@ public final class VirtualThreadRuntimeProbe {
       AtomicReference<Thread> firstCarrier = new AtomicReference<>();
       AtomicReference<Thread> secondCarrier = new AtomicReference<>();
       AtomicReference<Thread> virtualThreadReference = new AtomicReference<>();
+      AtomicInteger claimedDescriptor = new AtomicInteger(-2);
       Field carrierThread =
           Class.forName("java.lang.VirtualThread").getDeclaredField("carrierThread");
       carrierThread.setAccessible(true);
@@ -85,11 +87,13 @@ public final class VirtualThreadRuntimeProbe {
                   parked.countDown();
                   LockSupport.park();
                   secondCarrier.set((Thread) carrierThread.get(current));
+                  claimedDescriptor.set(takeSocketFileDescriptor());
                 } catch (IllegalAccessException failure) {
                   throw new AssertionError(failure);
                 }
               });
       virtualThreadReference.set(virtualThread);
+      setSocketFileDescriptor(91);
       virtualThread.start();
       require(parked.await(5, TimeUnit.SECONDS), "virtual thread did not reach park");
       awaitOperationSince(start, "VT_UNMOUNT");
@@ -100,6 +104,9 @@ public final class VirtualThreadRuntimeProbe {
       require(firstCarrier.get() != null, "first carrier was not recorded");
       require(secondCarrier.get() != null, "second carrier was not recorded");
       require(firstCarrier.get() != secondCarrier.get(), "virtual thread did not migrate carriers");
+      require(
+          claimedDescriptor.get() == 91,
+          "virtual thread lost socket ownership across carrier migration");
       require(scheduler.executionsOnFirst() > 0, "first carrier did not run a continuation");
       require(scheduler.executionsOnSecond() > 0, "second carrier did not run a continuation");
 
@@ -114,7 +121,12 @@ public final class VirtualThreadRuntimeProbe {
       require(taskContext(virtualThread) == null, "completed virtual thread retained task context");
 
       int reuseStart = EVENTS.size();
-      Thread reuse = newVirtualThread(scheduler, "obi-carrier-reuse-probe", () -> {});
+      AtomicInteger reusedDescriptor = new AtomicInteger(-2);
+      Thread reuse =
+          newVirtualThread(
+              scheduler,
+              "obi-carrier-reuse-probe",
+              () -> reusedDescriptor.set(socketFileDescriptor()));
       reuse.start();
       reuse.join(TimeUnit.SECONDS.toMillis(5));
       require(!reuse.isAlive(), "carrier-reuse virtual thread did not terminate");
@@ -122,6 +134,7 @@ public final class VirtualThreadRuntimeProbe {
       require(
           scheduler.executionsOnFirst() + scheduler.executionsOnSecond() >= 3,
           "the existing carrier pair was not reused");
+      require(reusedDescriptor.get() == -1, "reused carrier exposed prior socket ownership");
       List<Event> reuseEvents = snapshotSince(reuseStart);
       require(
           count(reuseEvents, "TASK_CAPTURE") == 1,
@@ -133,6 +146,7 @@ public final class VirtualThreadRuntimeProbe {
           hasExactTaskLink(reuseEvents), "carrier reuse handoff token mismatch: " + reuseEvents);
       require(taskContext(reuse) == null, "reused carrier retained task context");
     } finally {
+      clearSocketFileDescriptor();
       scheduler.close();
     }
   }
@@ -140,12 +154,15 @@ public final class VirtualThreadRuntimeProbe {
   private static void verifyStructuredTaskScopeDirectStart() throws Exception {
     int start = EVENTS.size();
     AtomicReference<Thread> child = new AtomicReference<>();
+    AtomicInteger claimedDescriptor = new AtomicInteger(-2);
+    setSocketFileDescriptor(92);
     try (StructuredTaskScope.ShutdownOnFailure scope =
         new StructuredTaskScope.ShutdownOnFailure()) {
       scope.fork(
           () -> {
             child.set(Thread.currentThread());
             LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(10));
+            claimedDescriptor.set(takeSocketFileDescriptor());
             return null;
           });
       scope.join().throwIfFailed();
@@ -154,6 +171,8 @@ public final class VirtualThreadRuntimeProbe {
     Thread structuredChild = child.get();
     require(
         structuredChild != null && structuredChild.isVirtual(), "structured child was not virtual");
+    require(
+        claimedDescriptor.get() == 92, "structured virtual thread lost accepted socket ownership");
     List<Event> events = snapshotSince(start);
     require(
         count(events, "TASK_CAPTURE") == 1,
@@ -164,6 +183,7 @@ public final class VirtualThreadRuntimeProbe {
     require(
         hasExactTaskLink(events), "StructuredTaskScope direct start was not captured: " + events);
     require(taskContext(structuredChild) == null, "structured child retained task context");
+    clearSocketFileDescriptor();
   }
 
   private static void verifyCancellationAndMixedPlatformHandoff() throws Exception {
@@ -180,7 +200,9 @@ public final class VirtualThreadRuntimeProbe {
                 parked.countDown();
                 LockSupport.park();
               });
+      setSocketFileDescriptor(93);
       cancelled.start();
+      clearSocketFileDescriptor();
       require(parked.await(5, TimeUnit.SECONDS), "cancelled virtual thread did not reach park");
       awaitOperationSince(cancellationStart, "VT_UNMOUNT");
       cancelled.interrupt();
@@ -199,14 +221,30 @@ public final class VirtualThreadRuntimeProbe {
           "cancelled virtual-thread handoff was not exact: " + cancellationEvents);
       require(taskContext(cancelled) == null, "cancelled virtual thread retained task context");
 
+      AtomicInteger cancellationReuseDescriptor = new AtomicInteger(-2);
+      Thread cancellationReuse =
+          newVirtualThread(
+              scheduler,
+              "obi-cancellation-reuse-probe",
+              () -> cancellationReuseDescriptor.set(socketFileDescriptor()));
+      cancellationReuse.start();
+      cancellationReuse.join(TimeUnit.SECONDS.toMillis(5));
+      require(!cancellationReuse.isAlive(), "cancellation reuse probe did not terminate");
+      require(
+          cancellationReuseDescriptor.get() == -1,
+          "cancelled virtual thread leaked socket ownership to a successor");
+
       int mixedStart = EVENTS.size();
       AtomicReference<FutureTask<Void>> platformTask = new AtomicReference<>();
+      AtomicInteger platformDescriptor = new AtomicInteger(-2);
       Thread mixed =
           newVirtualThread(
               scheduler,
               "obi-mixed-probe",
               () -> {
-                FutureTask<Void> task = new FutureTask<>(() -> {}, null);
+                FutureTask<Void> task =
+                    new FutureTask<>(
+                        () -> platformDescriptor.set(takeSocketFileDescriptor()), null);
                 platformTask.set(task);
                 platformExecutor.execute(task);
                 try {
@@ -215,9 +253,13 @@ public final class VirtualThreadRuntimeProbe {
                   throw new AssertionError(failure);
                 }
               });
+      setSocketFileDescriptor(94);
       mixed.start();
       mixed.join(TimeUnit.SECONDS.toMillis(5));
       require(!mixed.isAlive(), "mixed platform/virtual handoff did not terminate");
+      require(
+          platformDescriptor.get() == 94,
+          "virtual-to-platform handoff lost accepted socket ownership");
 
       List<Event> mixedEvents = snapshotSince(mixedStart);
       require(
@@ -228,6 +270,7 @@ public final class VirtualThreadRuntimeProbe {
       require(taskContext(mixed) == null, "mixed virtual thread retained task context");
       require(taskContext(platformTask.get()) == null, "mixed platform task retained context");
     } finally {
+      clearSocketFileDescriptor();
       platformExecutor.shutdownNow();
       require(
           platformExecutor.awaitTermination(5, TimeUnit.SECONDS),
@@ -240,10 +283,25 @@ public final class VirtualThreadRuntimeProbe {
     final int threadCount = 32;
     AlternatingExecutor scheduler = new AlternatingExecutor();
     List<Thread> threads = new ArrayList<>();
+    AtomicInteger claimedDescriptors = new AtomicInteger();
+    AtomicInteger unexpectedDescriptors = new AtomicInteger();
     int start = EVENTS.size();
     try {
+      setSocketFileDescriptor(95);
       for (int index = 0; index < threadCount; index++) {
-        Thread thread = newVirtualThread(scheduler, "obi-concurrent-" + index, Thread::yield);
+        Thread thread =
+            newVirtualThread(
+                scheduler,
+                "obi-concurrent-" + index,
+                () -> {
+                  Thread.yield();
+                  int descriptor = takeSocketFileDescriptor();
+                  if (descriptor == 95) {
+                    claimedDescriptors.incrementAndGet();
+                  } else if (descriptor != -1) {
+                    unexpectedDescriptors.incrementAndGet();
+                  }
+                });
         threads.add(thread);
         thread.start();
       }
@@ -261,7 +319,11 @@ public final class VirtualThreadRuntimeProbe {
           count(events, "VT_TERMINATE") == threadCount,
           "concurrent terminations were not exact: " + events);
       require(allCapturesLinked(events), "a concurrent handoff token was not linked: " + events);
+      require(claimedDescriptors.get() == 1, "concurrent aliases did not claim exactly once");
+      require(
+          unexpectedDescriptors.get() == 0, "concurrent alias observed an unexpected descriptor");
     } finally {
+      clearSocketFileDescriptor();
       scheduler.close();
     }
   }
@@ -280,6 +342,39 @@ public final class VirtualThreadRuntimeProbe {
     Class<?> storage =
         Class.forName("io.opentelemetry.obi.java.instrumentations.data.SSLStorage", true, null);
     return storage.getMethod("taskContext", Object.class).invoke(null, task);
+  }
+
+  private static void setSocketFileDescriptor(int socketFileDescriptor) {
+    invokeThreadInfo(
+        "setRemoteParentSocketFileDescriptor",
+        new Class<?>[] {int.class},
+        new Object[] {Integer.valueOf(socketFileDescriptor)});
+  }
+
+  private static int socketFileDescriptor() {
+    return ((Integer)
+            invokeThreadInfo("remoteParentSocketFileDescriptor", new Class<?>[0], new Object[0]))
+        .intValue();
+  }
+
+  private static int takeSocketFileDescriptor() {
+    return ((Integer)
+            invokeThreadInfo(
+                "takeRemoteParentSocketFileDescriptor", new Class<?>[0], new Object[0]))
+        .intValue();
+  }
+
+  private static void clearSocketFileDescriptor() {
+    invokeThreadInfo("clearRemoteParentSocketFileDescriptor", new Class<?>[0], new Object[0]);
+  }
+
+  private static Object invokeThreadInfo(String name, Class<?>[] parameterTypes, Object[] values) {
+    try {
+      Class<?> threadInfo = Class.forName("io.opentelemetry.obi.java.ebpf.ThreadInfo", true, null);
+      return threadInfo.getMethod(name, parameterTypes).invoke(null, values);
+    } catch (ReflectiveOperationException failure) {
+      throw new AssertionError(failure);
+    }
   }
 
   private static void awaitOperationSince(int start, String operation) throws Exception {

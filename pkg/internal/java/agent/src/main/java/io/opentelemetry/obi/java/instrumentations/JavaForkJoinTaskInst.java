@@ -103,7 +103,10 @@ public class JavaForkJoinTaskInst {
       }
       if (parentId != null && (parentId != threadId || taskContext.getHandoffToken() != 0L)) {
         return ThreadInfo.enterTaskParentThreadContext(
-            threadId, parentId, taskContext.getHandoffToken());
+            threadId,
+            parentId,
+            taskContext.getHandoffToken(),
+            taskContext.getRemoteParentSocketContext());
       }
       if (taskContext != null) {
         ThreadInfo.cancelTaskContext(taskContext);

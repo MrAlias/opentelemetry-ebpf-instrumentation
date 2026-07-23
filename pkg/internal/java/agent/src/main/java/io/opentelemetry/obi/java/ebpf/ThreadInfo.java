@@ -6,6 +6,7 @@
 package io.opentelemetry.obi.java.ebpf;
 
 import io.opentelemetry.obi.java.BootstrapNative;
+import io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext;
 import io.opentelemetry.obi.java.instrumentations.data.TaskContext;
 import java.security.SecureRandom;
 import java.util.concurrent.atomic.AtomicLong;
@@ -16,7 +17,8 @@ public class ThreadInfo {
   static final int MAX_TASK_RELAY_DEPTH = 64;
 
   private static final ThreadLocal<TaskRelayState> taskRelayState = new ThreadLocal<>();
-  private static final ThreadLocal<Integer> remoteParentSocketFileDescriptor = new ThreadLocal<>();
+  private static final ThreadLocal<RemoteParentSocketContext> remoteParentSocketContext =
+      new ThreadLocal<>();
   private static final AtomicLong nextTaskToken = new AtomicLong(initialTaskToken());
   private static volatile LongSupplier processIncarnationSource = ThreadInfo::newProcessIncarnation;
   private static volatile long processIncarnation = initialProcessIncarnation();
@@ -47,7 +49,7 @@ public class ThreadInfo {
 
     long token = newTaskToken();
     emitTaskContextOp(OperationType.TASK_CAPTURE, token, 0L);
-    return new TaskContext(parentThreadId, token);
+    return new TaskContext(parentThreadId, token, remoteParentSocketContext.get());
   }
 
   public static void cancelTaskContext(TaskContext context) {
@@ -69,19 +71,28 @@ public class ThreadInfo {
 
   public static boolean enterTaskParentThreadContext(
       long threadId, long parentId, long handoffToken) {
+    return enterTaskParentThreadContext(threadId, parentId, handoffToken, null);
+  }
+
+  public static boolean enterTaskParentThreadContext(
+      long threadId, long parentId, long handoffToken, RemoteParentSocketContext socketContext) {
     if (onVirtualThread() && handoffToken == 0L) {
-      cancelTaskHandoff(handoffToken);
+      rejectTaskEntry(handoffToken);
       return false;
     }
 
     TaskRelayState state = taskRelayState.get();
     if (parentId <= 0 || (parentId == threadId && handoffToken == 0L)) {
-      cancelTaskHandoff(handoffToken);
+      rejectTaskEntry(handoffToken);
       return false;
     }
     if (!remoteParentEnabled && state == null) {
-      cancelTaskHandoff(handoffToken);
-      sendParentThreadContext(parentId);
+      try {
+        cancelTaskHandoff(handoffToken);
+        sendParentThreadContext(parentId);
+      } finally {
+        remoteParentSocketContext.remove();
+      }
       return false;
     }
 
@@ -96,7 +107,9 @@ public class ThreadInfo {
     }
 
     long restoreToken = state.isEmpty() ? 0L : captureRelayToken();
-    long target = state.enter(threadId, parentId, restoreToken, handoffToken != 0L);
+    long target =
+        state.enter(
+            threadId, parentId, restoreToken, handoffToken != 0L, remoteParentSocketContext.get());
     if (target == NO_TASK_RELAY_CHANGE) {
       failClosedTaskEntry(handoffToken, restoreToken);
       if (state.isEmpty()) {
@@ -107,8 +120,10 @@ public class ThreadInfo {
 
     try {
       emitTaskContextOp(OperationType.TASK_LINK, target, handoffToken);
+      setRemoteParentSocketContext(socketContext);
       return true;
     } catch (Throwable failure) {
+      remoteParentSocketContext.remove();
       state.exit();
       cancelTaskHandoff(handoffToken);
       cancelTaskHandoff(restoreToken);
@@ -128,11 +143,16 @@ public class ThreadInfo {
     long threadId = state.threadId();
     long target = state.exit();
     long restoreToken = state.exitToken();
+    RemoteParentSocketContext previousSocketContext = state.exitSocketContext();
     if (state.isEmpty()) {
       taskRelayState.remove();
     }
-    if (target != NO_TASK_RELAY_CHANGE) {
-      emitTaskContextOp(OperationType.TASK_LINK, target, restoreToken);
+    try {
+      if (target != NO_TASK_RELAY_CHANGE) {
+        emitTaskContextOp(OperationType.TASK_LINK, target, restoreToken);
+      }
+    } finally {
+      setRemoteParentSocketContext(previousSocketContext);
     }
   }
 
@@ -146,19 +166,25 @@ public class ThreadInfo {
 
   public static void setRemoteParentSocketFileDescriptor(int socketFileDescriptor) {
     if (socketFileDescriptor >= 0) {
-      remoteParentSocketFileDescriptor.set(socketFileDescriptor);
+      remoteParentSocketContext.set(new RemoteParentSocketContext(socketFileDescriptor));
     } else {
-      remoteParentSocketFileDescriptor.remove();
+      remoteParentSocketContext.remove();
     }
   }
 
   public static int remoteParentSocketFileDescriptor() {
-    Integer socketFileDescriptor = remoteParentSocketFileDescriptor.get();
-    return socketFileDescriptor == null ? -1 : socketFileDescriptor;
+    RemoteParentSocketContext context = remoteParentSocketContext.get();
+    return context == null ? -1 : context.peek();
+  }
+
+  public static int takeRemoteParentSocketFileDescriptor() {
+    RemoteParentSocketContext context = remoteParentSocketContext.get();
+    remoteParentSocketContext.remove();
+    return context == null ? -1 : context.take();
   }
 
   public static void clearRemoteParentSocketFileDescriptor() {
-    remoteParentSocketFileDescriptor.remove();
+    remoteParentSocketContext.remove();
   }
 
   public static boolean registerProcessIncarnation() {
@@ -282,8 +308,25 @@ public class ThreadInfo {
     try {
       emitTaskContextOp(OperationType.TASK_UNLINK, 0L, 0L);
     } finally {
+      remoteParentSocketContext.remove();
       cancelTaskHandoff(handoffToken);
       cancelTaskHandoff(restoreToken);
+    }
+  }
+
+  private static void rejectTaskEntry(long handoffToken) {
+    try {
+      cancelTaskHandoff(handoffToken);
+    } finally {
+      remoteParentSocketContext.remove();
+    }
+  }
+
+  private static void setRemoteParentSocketContext(RemoteParentSocketContext context) {
+    if (context == null || context.peek() < 0) {
+      remoteParentSocketContext.remove();
+    } else {
+      remoteParentSocketContext.set(context);
     }
   }
 
@@ -310,10 +353,21 @@ public class ThreadInfo {
     private long currentParent;
     private long[] previousParents = new long[4];
     private long[] previousTokens = new long[4];
+    private RemoteParentSocketContext[] previousSocketContexts = new RemoteParentSocketContext[4];
     private long exitToken;
+    private RemoteParentSocketContext exitSocketContext;
     private int depth;
 
     long enter(long currentThreadId, long parentId, long restoreToken, boolean exactTokenHandoff) {
+      return enter(currentThreadId, parentId, restoreToken, exactTokenHandoff, null);
+    }
+
+    long enter(
+        long currentThreadId,
+        long parentId,
+        long restoreToken,
+        boolean exactTokenHandoff,
+        RemoteParentSocketContext previousSocketContext) {
       if (parentId <= 0
           || depth >= MAX_TASK_RELAY_DEPTH
           || (!exactTokenHandoff && hasParent(parentId))) {
@@ -330,9 +384,15 @@ public class ThreadInfo {
         long[] expandedTokens = new long[previousTokens.length * 2];
         System.arraycopy(previousTokens, 0, expandedTokens, 0, previousTokens.length);
         previousTokens = expandedTokens;
+        RemoteParentSocketContext[] expandedSocketContexts =
+            new RemoteParentSocketContext[previousSocketContexts.length * 2];
+        System.arraycopy(
+            previousSocketContexts, 0, expandedSocketContexts, 0, previousSocketContexts.length);
+        previousSocketContexts = expandedSocketContexts;
       }
       previousParents[depth] = currentParent;
       previousTokens[depth] = restoreToken;
+      previousSocketContexts[depth] = previousSocketContext;
       depth++;
       currentParent = parentId;
       return parentId;
@@ -345,8 +405,10 @@ public class ThreadInfo {
 
       long previous = previousParents[--depth];
       exitToken = previousTokens[depth];
+      exitSocketContext = previousSocketContexts[depth];
       previousParents[depth] = 0L;
       previousTokens[depth] = 0L;
+      previousSocketContexts[depth] = null;
       currentParent = previous;
       return previous == 0 ? threadId : previous;
     }
@@ -377,6 +439,10 @@ public class ThreadInfo {
 
     long exitToken() {
       return exitToken;
+    }
+
+    RemoteParentSocketContext exitSocketContext() {
+      return exitSocketContext;
     }
   }
 

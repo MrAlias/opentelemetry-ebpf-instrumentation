@@ -87,6 +87,9 @@ class AgentOptionsTest {
             "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ExactConnection"));
     assertTrue(
         Agent.isBootstrapHelperClassName(
+            "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext"));
+    assertTrue(
+        Agent.isBootstrapHelperClassName(
             "io.opentelemetry.obi.java.instrumentations.data.WeakIdentityConcurrentMap"));
     assertTrue(
         Agent.isBootstrapHelperClassName(

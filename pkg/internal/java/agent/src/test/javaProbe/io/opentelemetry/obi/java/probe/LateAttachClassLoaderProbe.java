@@ -28,6 +28,8 @@ public final class LateAttachClassLoaderProbe {
       "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ConnectionOwner";
   private static final String EXACT_CONNECTION_CLASS =
       "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ExactConnection";
+  private static final String REMOTE_PARENT_SOCKET_CONTEXT_CLASS =
+      "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext";
   private static final String WEAK_IDENTITY_MAP_CLASS =
       "io.opentelemetry.obi.java.instrumentations.data.WeakIdentityConcurrentMap";
   private static final String WEAK_IDENTITY_REFERENCE_CLASS =
@@ -77,6 +79,7 @@ public final class LateAttachClassLoaderProbe {
     assertBootstrapClass(BUFFER_HANDOFF_CLASS);
     assertBootstrapClass(CONNECTION_OWNER_CLASS);
     assertBootstrapClass(EXACT_CONNECTION_CLASS);
+    assertBootstrapClass(REMOTE_PARENT_SOCKET_CONTEXT_CLASS);
     assertBootstrapClass(WEAK_IDENTITY_MAP_CLASS);
     assertBootstrapClass(WEAK_IDENTITY_REFERENCE_CLASS);
     if ((Integer) remoteParentStatus.invoke(null) != STATUS_MISSING) {

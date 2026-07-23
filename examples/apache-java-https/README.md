@@ -414,10 +414,12 @@ not change transport.
   crosses at least two decrypted Java receive callbacks and that those
   callbacks account for at least the full 64 KiB body. It does not infer exact
   Apache/OpenSSL TLS record boundaries from the client-side write pattern.
-- Servlet, executor, Netty-worker, and virtual-thread scenarios begin after the
-  stock server instrumentation has extracted the parent. They validate
-  post-extraction ownership cleanup and reuse, not an unproven
-  receive-to-pre-extraction framework handoff.
+- The helper carries accepted-socket ownership through exact executor,
+  ForkJoin, Netty-worker, and virtual-thread task contexts. Packaged-agent tests
+  cover nested hops, cancellation, worker reuse, and Java 21 carrier migration.
+  The Compose servlet scenarios still begin after stock server extraction, so
+  a retained privileged run is required before claiming a specific framework's
+  receive-to-pre-extraction path.
 - The fd/port-reuse scenario is Linux-only. It reuses one client ephemeral port
   across closed frontend connections and asks the demo backend to resolve its
   accepted socket descriptor from `/proc/self`. A synchronized weak-key map

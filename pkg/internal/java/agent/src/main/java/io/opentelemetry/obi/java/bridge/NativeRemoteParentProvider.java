@@ -82,17 +82,18 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
   }
 
   private RemoteParentRecord callAndClearSocket(boolean take) {
+    int socketFileDescriptor = ThreadInfo.takeRemoteParentSocketFileDescriptor();
     try {
       if (!ensureReady()) {
         return RemoteParentRecord.statusOnly(transportStatus);
       }
-      return call(take);
+      return call(take, socketFileDescriptor);
     } finally {
       ThreadInfo.clearRemoteParentSocketFileDescriptor();
     }
   }
 
-  private RemoteParentRecord call(boolean take) {
+  private RemoteParentRecord call(boolean take, int socketFileDescriptor) {
     int start = ((int) Thread.currentThread().getId()) & (BUFFER_POOL_SIZE - 1);
     for (int i = 0; i < BUFFER_POOL_SIZE; i++) {
       int slot = (start + i) & (BUFFER_POOL_SIZE - 1);
@@ -101,7 +102,6 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
         continue;
       }
       try {
-        int socketFileDescriptor = ThreadInfo.remoteParentSocketFileDescriptor();
         if (take) {
           BootstrapNative.takeRemoteParent(socketFileDescriptor, response);
         } else {

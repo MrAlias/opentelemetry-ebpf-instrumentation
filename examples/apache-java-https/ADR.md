@@ -2,7 +2,7 @@
 
 - Status: accepted for proof of concept
 - Scope: Apache/OpenSSL outbound HTTPS to an auto-instrumented Jetty server
-- Last updated: 2026-07-21
+- Last updated: 2026-07-22
 
 ## Decision
 
@@ -39,9 +39,9 @@ forking the upstream agent or requiring a proprietary backend.
   caller-supplied PID or marker.
 - Primary retrieval uses the accepted backend socket; a dummy socket is never
   a request-data carrier.
-- A TLS-receive-to-extraction thread change before server span creation is an
-  explicit primary miss unless that exact timing has a proven socket handoff;
-  the example's application handoffs occur after extraction.
+- Exact executor, ForkJoin, Netty, and virtual-thread task captures share a
+  one-shot accepted-socket holder with the generation-bound task token. Unknown
+  framework handoffs still fail open instead of using a connection-only guess.
 - The marker header exists only in the verifier; it is not an input to bridge
   lookup.
 - Unix callers are authenticated from kernel peer credentials.

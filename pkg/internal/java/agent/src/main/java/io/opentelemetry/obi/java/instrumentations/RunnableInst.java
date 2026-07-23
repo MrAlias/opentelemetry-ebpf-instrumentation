@@ -55,7 +55,10 @@ public class RunnableInst {
         }
         if (parentId != threadId || taskContext.getHandoffToken() != 0L) {
           return ThreadInfo.enterTaskParentThreadContext(
-              threadId, parentId, taskContext.getHandoffToken());
+              threadId,
+              parentId,
+              taskContext.getHandoffToken(),
+              taskContext.getRemoteParentSocketContext());
         }
         ThreadInfo.cancelTaskContext(taskContext);
       }

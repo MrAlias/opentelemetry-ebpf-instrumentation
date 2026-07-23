@@ -7,11 +7,13 @@ package io.opentelemetry.obi.java.ebpf;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.opentelemetry.obi.java.instrumentations.JavaExecutorInst;
 import io.opentelemetry.obi.java.instrumentations.VirtualThreadInst;
+import io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext;
 import io.opentelemetry.obi.java.instrumentations.data.SSLStorage;
 import io.opentelemetry.obi.java.instrumentations.data.TaskContext;
 import io.opentelemetry.obi.java.instrumentations.data.WeakIdentityTaskMapTestAccess;
@@ -74,6 +76,151 @@ class ThreadInfoTest {
 
     ThreadInfo.clearRemoteParentSocketFileDescriptor();
     assertEquals(-1, ThreadInfo.remoteParentSocketFileDescriptor());
+  }
+
+  @Test
+  void taskSocketDescriptorIsClaimedOnceAndNotRestored() {
+    enableRemoteParentWithNoopEmitter();
+    ThreadInfo.setRemoteParentSocketFileDescriptor(18);
+    TaskContext context = ThreadInfo.captureTaskContext(101L);
+    ThreadInfo.clearRemoteParentSocketFileDescriptor();
+
+    assertEquals(18, context.getRemoteParentSocketContext().peek());
+    assertTrue(
+        ThreadInfo.enterTaskParentThreadContext(
+            900L,
+            context.getParentThreadId(),
+            context.getHandoffToken(),
+            context.getRemoteParentSocketContext()));
+    assertEquals(18, ThreadInfo.takeRemoteParentSocketFileDescriptor());
+    assertEquals(-1, ThreadInfo.takeRemoteParentSocketFileDescriptor());
+
+    ThreadInfo.restoreTaskParentThreadContext();
+
+    assertEquals(-1, ThreadInfo.remoteParentSocketFileDescriptor());
+    assertEquals(-1, context.getRemoteParentSocketContext().peek());
+  }
+
+  @Test
+  void nestedTaskScopesRestoreOnlyUnconsumedSocketOwnership() {
+    enableRemoteParentWithNoopEmitter();
+    ThreadInfo.setRemoteParentSocketFileDescriptor(99);
+    RemoteParentSocketContext outer = new RemoteParentSocketContext(19);
+    RemoteParentSocketContext inner = new RemoteParentSocketContext(20);
+
+    assertTrue(ThreadInfo.enterTaskParentThreadContext(900L, 101L, 11L, outer));
+    assertTrue(ThreadInfo.enterTaskParentThreadContext(900L, 202L, 22L, inner));
+    assertEquals(20, ThreadInfo.takeRemoteParentSocketFileDescriptor());
+
+    ThreadInfo.restoreTaskParentThreadContext();
+    assertEquals(19, ThreadInfo.takeRemoteParentSocketFileDescriptor());
+    ThreadInfo.restoreTaskParentThreadContext();
+
+    assertEquals(99, ThreadInfo.takeRemoteParentSocketFileDescriptor());
+  }
+
+  @Test
+  void nestedAliasesDoNotResurrectConsumedSocketOwnership() {
+    enableRemoteParentWithNoopEmitter();
+    ThreadInfo.setRemoteParentSocketFileDescriptor(99);
+    RemoteParentSocketContext shared = new RemoteParentSocketContext(20);
+
+    assertTrue(ThreadInfo.enterTaskParentThreadContext(900L, 101L, 11L, shared));
+    assertTrue(ThreadInfo.enterTaskParentThreadContext(900L, 202L, 22L, shared));
+    assertEquals(20, ThreadInfo.takeRemoteParentSocketFileDescriptor());
+
+    ThreadInfo.restoreTaskParentThreadContext();
+    assertEquals(-1, ThreadInfo.remoteParentSocketFileDescriptor());
+    ThreadInfo.restoreTaskParentThreadContext();
+
+    assertEquals(99, ThreadInfo.takeRemoteParentSocketFileDescriptor());
+  }
+
+  @Test
+  void taskWithoutSocketOwnershipCannotInheritAWorkerDescriptor() {
+    enableRemoteParentWithNoopEmitter();
+    ThreadInfo.setRemoteParentSocketFileDescriptor(99);
+
+    assertTrue(ThreadInfo.enterTaskParentThreadContext(900L, 101L, 11L, null));
+    assertEquals(-1, ThreadInfo.remoteParentSocketFileDescriptor());
+    ThreadInfo.restoreTaskParentThreadContext();
+
+    assertEquals(99, ThreadInfo.takeRemoteParentSocketFileDescriptor());
+  }
+
+  @Test
+  void concurrentTaskAliasesCanClaimSocketOwnershipOnlyOnce() throws Exception {
+    enableRemoteParentWithNoopEmitter();
+    RemoteParentSocketContext socketContext = new RemoteParentSocketContext(21);
+    CountDownLatch ready = new CountDownLatch(2);
+    CountDownLatch start = new CountDownLatch(1);
+    CountDownLatch complete = new CountDownLatch(2);
+    AtomicInteger linked = new AtomicInteger();
+    AtomicInteger claimed = new AtomicInteger();
+    AtomicInteger unexpected = new AtomicInteger();
+
+    Thread first =
+        socketClaimingTask(
+            901L, 31L, socketContext, ready, start, complete, linked, claimed, unexpected);
+    Thread second =
+        socketClaimingTask(
+            902L, 32L, socketContext, ready, start, complete, linked, claimed, unexpected);
+    first.start();
+    second.start();
+
+    assertTrue(ready.await(5, TimeUnit.SECONDS));
+    start.countDown();
+    assertTrue(complete.await(5, TimeUnit.SECONDS));
+    first.join(TimeUnit.SECONDS.toMillis(5));
+    second.join(TimeUnit.SECONDS.toMillis(5));
+
+    assertFalse(first.isAlive());
+    assertFalse(second.isAlive());
+    assertEquals(2, linked.get());
+    assertEquals(1, claimed.get());
+    assertEquals(0, unexpected.get());
+    assertEquals(-1, socketContext.peek());
+  }
+
+  @Test
+  void taskCancellationDetachesWithoutInvalidatingAnotherAlias() {
+    enableRemoteParentWithNoopEmitter();
+    ThreadInfo.setRemoteParentSocketFileDescriptor(22);
+    TaskContext context = ThreadInfo.captureTaskContext(101L);
+
+    ThreadInfo.cancelTaskContext(context);
+    ThreadInfo.clearRemoteParentSocketFileDescriptor();
+
+    assertEquals(22, context.getRemoteParentSocketContext().take());
+  }
+
+  @Test
+  void reusedNumericDescriptorCreatesIndependentOwnership() {
+    enableRemoteParentWithNoopEmitter();
+    ThreadInfo.setRemoteParentSocketFileDescriptor(23);
+    TaskContext first = ThreadInfo.captureTaskContext(101L);
+    ThreadInfo.clearRemoteParentSocketFileDescriptor();
+    ThreadInfo.setRemoteParentSocketFileDescriptor(23);
+    TaskContext second = ThreadInfo.captureTaskContext(101L);
+    ThreadInfo.clearRemoteParentSocketFileDescriptor();
+
+    assertNotSame(first.getRemoteParentSocketContext(), second.getRemoteParentSocketContext());
+    assertEquals(23, first.getRemoteParentSocketContext().take());
+    assertEquals(23, second.getRemoteParentSocketContext().take());
+    ThreadInfo.cancelTaskContext(first);
+    ThreadInfo.cancelTaskContext(second);
+  }
+
+  @Test
+  void failClosedNestedEntryDetachesOuterSocketOwnership() {
+    enableRemoteParentWithNoopEmitter();
+    RemoteParentSocketContext socketContext = new RemoteParentSocketContext(24);
+    assertTrue(ThreadInfo.enterTaskParentThreadContext(900L, 101L, 11L, socketContext));
+
+    assertFalse(ThreadInfo.enterTaskParentThreadContext(900L, 101L));
+    assertEquals(-1, ThreadInfo.remoteParentSocketFileDescriptor());
+
+    ThreadInfo.restoreTaskParentThreadContext();
   }
 
   @Test
@@ -489,8 +636,10 @@ class ThreadInfoTest {
     ThreadInfo.setRemoteParentEnabled(true);
     setStorageThreadIdProvider(() -> 900L);
     Runnable task = () -> {};
+    ThreadInfo.setRemoteParentSocketFileDescriptor(17);
     SSLStorage.trackTask(101L, task);
     long handoffToken = SSLStorage.taskContext(task).getHandoffToken();
+    ThreadInfo.setRemoteParentSocketFileDescriptor(99);
 
     boolean outerBefore = JavaExecutorInst.BeforeExecuteAdvice.enter();
     boolean nestedBefore = JavaExecutorInst.BeforeExecuteAdvice.enter();
@@ -499,6 +648,7 @@ class ThreadInfoTest {
 
     assertNull(SSLStorage.taskContext(task));
     assertTrue(ThreadInfo.hasTaskRelayState());
+    assertEquals(17, ThreadInfo.takeRemoteParentSocketFileDescriptor());
 
     boolean outerAfter = JavaExecutorInst.AfterExecuteAdvice.enter();
     boolean nestedAfter = JavaExecutorInst.AfterExecuteAdvice.enter();
@@ -506,6 +656,7 @@ class ThreadInfoTest {
     JavaExecutorInst.AfterExecuteAdvice.exit(outerAfter);
 
     assertFalse(ThreadInfo.hasTaskRelayState());
+    assertEquals(99, ThreadInfo.takeRemoteParentSocketFileDescriptor());
     assertEquals(3, emitted.size());
     assertEquals(OperationType.TASK_CAPTURE, emitted.get(0).operation);
     assertEquals(OperationType.TASK_LINK, emitted.get(1).operation);
@@ -526,6 +677,55 @@ class ThreadInfoTest {
     } catch (ReflectiveOperationException failure) {
       throw new AssertionError(failure);
     }
+  }
+
+  private static void enableRemoteParentWithNoopEmitter() {
+    ThreadInfo.setTaskContextEmitterForTest((operation, value, token) -> {});
+    ThreadInfo.setRemoteParentEnabled(true);
+  }
+
+  private static Thread socketClaimingTask(
+      long threadId,
+      long token,
+      RemoteParentSocketContext socketContext,
+      CountDownLatch ready,
+      CountDownLatch start,
+      CountDownLatch complete,
+      AtomicInteger linked,
+      AtomicInteger claimed,
+      AtomicInteger unexpected) {
+    return new Thread(
+        () -> {
+          boolean entered =
+              ThreadInfo.enterTaskParentThreadContext(threadId, 101L, token, socketContext);
+          if (entered) {
+            linked.incrementAndGet();
+          }
+          ready.countDown();
+          try {
+            if (!start.await(5, TimeUnit.SECONDS)) {
+              unexpected.incrementAndGet();
+              return;
+            }
+            int descriptor = ThreadInfo.takeRemoteParentSocketFileDescriptor();
+            if (descriptor == 21) {
+              claimed.incrementAndGet();
+            } else if (descriptor != -1) {
+              unexpected.incrementAndGet();
+            }
+          } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            unexpected.incrementAndGet();
+          } finally {
+            if (entered) {
+              ThreadInfo.restoreTaskParentThreadContext();
+            }
+            if (ThreadInfo.remoteParentSocketFileDescriptor() != -1) {
+              unexpected.incrementAndGet();
+            }
+            complete.countDown();
+          }
+        });
   }
 
   private static final class EmittedOp {

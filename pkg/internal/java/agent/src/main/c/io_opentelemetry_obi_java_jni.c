@@ -233,7 +233,8 @@ static int response_status(unsigned char *response, size_t length) {
     return remote_parent_status_malformed;
   }
   if (response[8] == remote_parent_status_valid &&
-      (bytes_zero(response, 16, 32) || bytes_zero(response, 32, 40))) {
+      (bytes_zero(response, 16, 32) || bytes_zero(response, 32, 40) ||
+       read_u64_le(response, 40) == 0 || read_u64_le(response, 48) == 0)) {
     status_response(response, remote_parent_status_malformed);
     return remote_parent_status_malformed;
   }

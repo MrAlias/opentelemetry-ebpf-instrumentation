@@ -358,6 +358,15 @@ static void test_status_response(void) {
   assert(obi_test_response_status(response, sizeof(response)) == 10);
 }
 
+static void init_valid_response(unsigned char *response) {
+  obi_test_status_response(response, 1);
+  response[9] = 0xff;
+  response[16] = 1;
+  response[32] = 1;
+  response[40] = 1;
+  response[48] = 1;
+}
+
 static void test_response_validation(void) {
   unsigned char response[64];
   obi_test_status_response(response, 1);
@@ -385,11 +394,24 @@ static void test_response_validation(void) {
   obi_test_status_response(response, 1);
   assert(obi_test_response_status(response, sizeof(response)) == 5);
 
-  obi_test_status_response(response, 1);
-  response[9] = 0xff;
-  response[16] = 1;
-  response[32] = 1;
+  init_valid_response(response);
   assert(obi_test_response_status(response, sizeof(response)) == 1);
+
+  init_valid_response(response);
+  memset(response + 16, 0, 16);
+  assert(obi_test_response_status(response, sizeof(response)) == 5);
+
+  init_valid_response(response);
+  memset(response + 32, 0, 8);
+  assert(obi_test_response_status(response, sizeof(response)) == 5);
+
+  init_valid_response(response);
+  response[40] = 0;
+  assert(obi_test_response_status(response, sizeof(response)) == 5);
+
+  init_valid_response(response);
+  response[48] = 0;
+  assert(obi_test_response_status(response, sizeof(response)) == 5);
 }
 
 static void test_request_vector(void) {

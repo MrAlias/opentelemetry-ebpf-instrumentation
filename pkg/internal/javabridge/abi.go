@@ -116,6 +116,9 @@ func (r Record) MarshalBinary() ([]byte, error) {
 	if r.Status < StatusValid || r.Status > StatusDisabled {
 		return nil, fmt.Errorf("unknown Java bridge status %d", r.Status)
 	}
+	if r.Status == StatusValid && !r.IsValidRemoteParent() {
+		return nil, errors.New("valid Java bridge record has an invalid payload")
+	}
 
 	buf := make([]byte, RecordSize)
 	copy(buf[0:4], recordMagic[:])
@@ -161,12 +164,19 @@ func UnmarshalRecord(buf []byte) (Record, error) {
 	}
 	copy(record.TraceID[:], buf[16:32])
 	copy(record.SpanID[:], buf[32:40])
+	if record.Status == StatusValid && !record.IsValidRemoteParent() {
+		return Record{}, errors.New("valid Java bridge record has an invalid payload")
+	}
 
 	return record, nil
 }
 
 func (r Record) IsValidRemoteParent() bool {
-	return r.Status == StatusValid && !allZero(r.TraceID[:]) && !allZero(r.SpanID[:])
+	return r.Status == StatusValid &&
+		!allZero(r.TraceID[:]) &&
+		!allZero(r.SpanID[:]) &&
+		r.Generation != 0 &&
+		r.ObservedMonotonicNS != 0
 }
 
 type Request struct {

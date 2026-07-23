@@ -147,15 +147,34 @@ Status values are stable within ABI version 1:
 | 13 | disabled | The bridge is intentionally disabled |
 
 A `valid` record additionally requires a nonzero 16-byte trace ID, a nonzero
-8-byte span ID, supported magic/version/size, and zero reserved bytes. All
-other statuses fail open and leave the input OpenTelemetry `Context`
-unchanged. Version 1 excludes trace state and baggage because the TCP option
-does not carry either value. Standard W3C extraction remains authoritative for
-them.
+8-byte span ID, a nonzero generation, a nonzero observation time, supported
+magic/version/size, and zero reserved bytes. All other statuses fail open and
+leave the input OpenTelemetry `Context` unchanged. Version 1 excludes trace
+state and baggage because the TCP option does not carry either value. Standard
+W3C extraction remains authoritative for them.
 
-Changing the meaning, size, or offset of an existing field requires a new ABI
-version. Independently versioned OBI, helper, and extension components
-negotiate version 1 and return `version mismatch` rather than guessing.
+Compatibility within the fixed version 1 envelope is explicit:
+
+| Change or input | Version 1 behavior |
+| --- | --- |
+| Unknown trace-flag bits | Preserved; only the standard sampled bit changes OpenTelemetry sampling state |
+| Supplied byte length other than 64 | `malformed`, before magic or version interpretation |
+| Unknown version in an exactly 64-byte record with valid magic | `version mismatch`, before declared-size interpretation |
+| Version 1 record with a declared size other than 64 | `malformed` |
+| New status, nonzero reserved bytes, or changed validity rules | Requires a new ABI version |
+| Changed field meaning, size, offset, byte order, or added trace state/baggage | Requires a new ABI version |
+| Internal transport, lookup, or cleanup changes that preserve the envelope | Compatible without an ABI change |
+
+The extension checks the bootstrap bridge API version before use, and the
+bootstrap bridge checks the provider ABI version before installation. Socket
+negotiation authenticates the process and accepted socket; it does not translate
+result-record versions. JNI and Java validate every returned record. A supplied
+length other than 64 is `malformed`. After exact framing and valid magic, an
+unknown version returns `version mismatch` before the declared size is checked.
+The failing operation is not retried or switched between transports. Either
+status marks the native provider unavailable so a later operation may perform
+the normal bounded reconfiguration; both transports still expose the same
+record contract.
 
 ## Unix fallback request
 

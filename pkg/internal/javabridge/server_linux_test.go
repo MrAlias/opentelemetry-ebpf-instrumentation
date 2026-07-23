@@ -122,6 +122,17 @@ type recordingHandler struct {
 	record      Record
 }
 
+func validTestRecord() Record {
+	record := Record{
+		Status:              StatusValid,
+		Generation:          1,
+		ObservedMonotonicNS: 2,
+	}
+	record.TraceID[15] = 1
+	record.SpanID[7] = 1
+	return record
+}
+
 type observedOutcome struct {
 	operation Operation
 	status    Status
@@ -142,9 +153,7 @@ func (h *recordingHandler) HandleAuthenticated(
 func TestFallbackServerAuthenticatesAndHandlesRequest(t *testing.T) {
 	socketPath := filepath.Join(t.TempDir(), "bridge.sock")
 	identity := Identity{TID: 7, PID: 5, Namespace: 3}
-	handler := &recordingHandler{record: Record{Status: StatusValid}}
-	handler.record.TraceID[15] = 1
-	handler.record.SpanID[7] = 1
+	handler := &recordingHandler{record: validTestRecord()}
 	server, err := NewServer(ServerOptions{
 		SocketPath: socketPath,
 		SocketGID:  -1,
@@ -572,7 +581,7 @@ func TestFallbackServerDoesNotConsumeAfterResolutionCancellation(t *testing.T) {
 		identity: Identity{TID: 7, PID: 5, Namespace: 3},
 		started:  make(chan struct{}),
 	}
-	handler := &recordingHandler{record: Record{Status: StatusValid}}
+	handler := &recordingHandler{record: validTestRecord()}
 	server, err := NewServer(ServerOptions{
 		SocketPath: socketPath,
 		SocketGID:  -1,
@@ -638,7 +647,7 @@ func TestFallbackServerReportsIdentityResolutionOverload(t *testing.T) {
 
 func TestFallbackServerPreAuthAdmissionLimitsOnePeerAndRecovers(t *testing.T) {
 	socketPath := filepath.Join(t.TempDir(), "bridge.sock")
-	handler := &recordingHandler{record: Record{Status: StatusValid}}
+	handler := &recordingHandler{record: validTestRecord()}
 	observed := make(chan observedOutcome, 8)
 	server, err := NewServer(ServerOptions{
 		SocketPath:    socketPath,

@@ -322,13 +322,6 @@ func (h *MapHandler) handle(
 		}
 		return Record{Status: StatusMalformed}
 	}
-	if record.Generation == 0 || record.ObservedMonotonicNS == 0 {
-		committed := h.consume(ctx, []resolvedCandidate{candidate}, lifecycleDiscarded)
-		if !committed && requestCanceled(ctx) {
-			return Record{Status: StatusTimeout}
-		}
-		return Record{Status: StatusMalformed}
-	}
 	if candidate.Generation == 0 {
 		return Record{Status: StatusAmbiguous}
 	}

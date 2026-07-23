@@ -112,10 +112,62 @@ func TestValidRemoteParentRejectsZeroIDs(t *testing.T) {
 	assert.False(t, record.IsValidRemoteParent())
 
 	record.SpanID[7] = 1
+	assert.False(t, record.IsValidRemoteParent())
+
+	record.Generation = 1
+	assert.False(t, record.IsValidRemoteParent())
+
+	record.ObservedMonotonicNS = 1
 	assert.True(t, record.IsValidRemoteParent())
 
 	record.Status = StatusMalformed
 	assert.False(t, record.IsValidRemoteParent())
+}
+
+func TestValidRecordRejectsIncompletePayload(t *testing.T) {
+	valid := Record{
+		Status:              StatusValid,
+		Generation:          1,
+		ObservedMonotonicNS: 2,
+	}
+	valid.TraceID[15] = 1
+	valid.SpanID[7] = 1
+
+	tests := map[string]func(*Record){
+		"zero trace ID": func(record *Record) { record.TraceID = [TraceIDSize]byte{} },
+		"zero span ID":  func(record *Record) { record.SpanID = [SpanIDSize]byte{} },
+		"zero generation": func(record *Record) {
+			record.Generation = 0
+		},
+		"zero observation time": func(record *Record) {
+			record.ObservedMonotonicNS = 0
+		},
+	}
+
+	encoded, err := valid.MarshalBinary()
+	require.NoError(t, err)
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			candidate := valid
+			mutate(&candidate)
+			_, err := candidate.MarshalBinary()
+			require.Error(t, err)
+
+			candidateBytes := append([]byte(nil), encoded...)
+			switch name {
+			case "zero trace ID":
+				clear(candidateBytes[16:32])
+			case "zero span ID":
+				clear(candidateBytes[32:40])
+			case "zero generation":
+				clear(candidateBytes[40:48])
+			case "zero observation time":
+				clear(candidateBytes[48:56])
+			}
+			_, err = UnmarshalRecord(candidateBytes)
+			require.Error(t, err)
+		})
+	}
 }
 
 func TestRequestGoldenVector(t *testing.T) {
@@ -137,7 +189,12 @@ func TestRequestGoldenVector(t *testing.T) {
 func TestSampledAndUnsampledRoundTrip(t *testing.T) {
 	for _, flags := range []byte{0, 1} {
 		t.Run(string(rune('0'+flags)), func(t *testing.T) {
-			record := Record{Status: StatusValid, Flags: flags}
+			record := Record{
+				Status:              StatusValid,
+				Flags:               flags,
+				Generation:          1,
+				ObservedMonotonicNS: 2,
+			}
 			record.TraceID[15] = 1
 			record.SpanID[7] = 1
 

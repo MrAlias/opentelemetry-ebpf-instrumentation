@@ -8,13 +8,15 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd -P)"
 SCRIPT_NAME="$(basename -- "${BASH_SOURCE[0]}")"
 MAX_SHELL_INTEGER="9223372036854775807"
+BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS=35
 PROJECT_NAMESPACE="obi-apache-java-https"
 PROJECT_SENTINEL_LABEL="io.opentelemetry.obi.apache-java-https.owner"
 PROJECT_SENTINEL_VALUE="acceptance-demo-v1"
 APACHE_HTTPS_HEALTH_ENDPOINT="http://127.0.0.1:18080/healthz?close=1"
 PRIMARY_SECURITY_PROBE_PATH="/tmp/obi-security-probe"
 PRIMARY_SECURITY_PID_PATH="/tmp/obi-security-probe.pid"
-readonly SCRIPT_DIR REPO_ROOT SCRIPT_NAME MAX_SHELL_INTEGER PROJECT_NAMESPACE
+readonly SCRIPT_DIR REPO_ROOT SCRIPT_NAME MAX_SHELL_INTEGER
+readonly BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS PROJECT_NAMESPACE
 readonly PROJECT_SENTINEL_LABEL PROJECT_SENTINEL_VALUE APACHE_HTTPS_HEALTH_ENDPOINT
 readonly PRIMARY_SECURITY_PROBE_PATH PRIMARY_SECURITY_PID_PATH
 
@@ -1144,46 +1146,103 @@ bridge_success_total() {
   ' "$metrics"
 }
 
-wait_for_bridge_metric_total() {
-  local -r minimum="$1"
-  local -r output="$2"
-  local -r description="$3"
+bridge_stage_total() {
+  local -r metrics="$1"
+
+  awk '
+    $0 ~ /^obi_java_remote_parent_operations_total/ &&
+    $0 ~ /operation="stage"/ &&
+    $0 ~ /status="valid"/ &&
+    $0 ~ /transport="tcp"/ {
+      total += $2
+    }
+    END { printf "%.0f\n", total }
+  ' "$metrics"
+}
+
+bridge_report_total() {
+  local -r metrics="$1"
+
+  awk '
+    $0 ~ /^obi_java_remote_parent_operations_total/ &&
+    $0 ~ /operation="report"/ &&
+    $0 ~ /status="valid"/ &&
+    $0 ~ /transport="tcp"/ {
+      total += $2
+    }
+    END { printf "%.0f\n", total }
+  ' "$metrics"
+}
+
+bridge_metric_fingerprint() {
+  local -r metrics="$1"
+
+  awk '
+    $0 ~ /^obi_java_remote_parent_operations_total/ &&
+    $0 ~ /operation="(stage|candidate|handoff|take|discard|negotiate|inject)"/ {
+      print
+    }
+  ' "$metrics" | LC_ALL=C sort | sha256sum | awk '{print $1}'
+}
+
+wait_for_bridge_metrics_quiescent() {
+  local -r minimum_success="$1"
+  local -r minimum_stage="$2"
+  local -r output="$3"
+  local -r description="$4"
   local candidate=""
-  local total=""
+  local fingerprint=""
+  local previous_fingerprint=""
+  local report=""
+  local stage=""
+  local success=""
   local -i elapsed=0
+  local -i previous_report=-1
 
   candidate="$(mktemp "$RESULT_DIR/.bridge-metrics.XXXXXX")"
-  while ((elapsed < 20)); do
+  while ((elapsed < BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS)); do
     if fetch_obi_metrics "$candidate" 2>/dev/null; then
-      total="$(bridge_success_total "$candidate")"
-      if [[ "$total" =~ ^[0-9]+$ ]] && ((total >= minimum)); then
-        install -m 0644 "$candidate" "$output"
-        rm -f -- "$candidate"
-        return 0
+      success="$(bridge_success_total "$candidate")"
+      stage="$(bridge_stage_total "$candidate")"
+      report="$(bridge_report_total "$candidate")"
+      fingerprint="$(bridge_metric_fingerprint "$candidate")"
+      if [[ "$success" =~ ^[0-9]+$ && "$stage" =~ ^[0-9]+$ &&
+        "$report" =~ ^[0-9]+$ ]] && ((report > previous_report)); then
+        if [[ -n "$previous_fingerprint" && "$fingerprint" == "$previous_fingerprint" ]] &&
+          ((success >= minimum_success && stage >= minimum_stage)); then
+          install -m 0644 "$candidate" "$output"
+          rm -f -- "$candidate"
+          return 0
+        fi
+        previous_report="$report"
+        previous_fingerprint="$fingerprint"
       fi
     fi
     sleep 1
     ((elapsed += 1))
   done
   rm -f -- "$candidate"
-  log_error "timed out waiting for $description (minimum $minimum, last ${total:-unavailable})"
+  log_error "timed out waiting for $description (minimum success=$minimum_success stage=$minimum_stage, last success=${success:-unavailable} stage=${stage:-unavailable} report=${report:-unavailable})"
   return 1
 }
 
 flush_bridge_metric_boundary() {
   local -r label="$1"
   local current=""
-  local before=""
+  local before_stage=""
+  local before_success=""
 
   [[ "$BRIDGE_RUNNING" == "true" ]] || return 0
   current="$(mktemp "$RESULT_DIR/.bridge-boundary.XXXXXX")"
   fetch_obi_metrics "$current"
-  before="$(bridge_success_total "$current")"
+  before_success="$(bridge_success_total "$current")"
+  before_stage="$(bridge_stage_total "$current")"
   curl --fail --silent --show-error --max-time 5 \
     "$APACHE_HTTPS_HEALTH_ENDPOINT" >/dev/null
   rm -f -- "$current"
-  wait_for_bridge_metric_total \
-    "$((before + 1))" \
+  wait_for_bridge_metrics_quiescent \
+    "$((before_success + 1))" \
+    "$((before_stage + 1))" \
     "$RESULT_DIR/metrics-boundary-$label.prom" \
     "$label pre-scenario bridge metric boundary"
 }
@@ -1261,11 +1320,10 @@ scenario_java_missing_count() {
 
 scenario_bridge_missing_count() {
   local -r name="$1"
-  local -r diagnostics_enabled="$2"
-  local -r transport="$3"
+  local -r transport="$2"
 
-  if [[ "$transport" == "unix" ]]; then
-    scenario_java_missing_count "$name" "$diagnostics_enabled"
+  if [[ "$transport" == "unix" && "$name" == "tls-boundary" ]]; then
+    printf '3\n'
     return
   fi
   printf '0\n'
@@ -1420,7 +1478,7 @@ start_map_pressure() {
   PRESSURE_ACTIVE=false
   fill_output="$RESULT_DIR/map-pressure-$label-fill.json"
   run_bounded 60 \
-    "${COMPOSE[@]}" run --rm --no-deps map-pressure \
+    "${COMPOSE[@]}" run --rm --no-deps --no-TTY map-pressure \
       --seed "$PRESSURE_SEED" \
       --mode fill | tee "$fill_output"
   PRESSURE_MAP_ID="$(sed -n -E 's/.*"map_id":([0-9]+).*/\1/p' "$fill_output")"
@@ -1466,7 +1524,7 @@ cleanup_map_pressure() {
     )
   fi
   if run_bounded 60 \
-    "${COMPOSE[@]}" run --rm --no-deps map-pressure \
+    "${COMPOSE[@]}" run --rm --no-deps --no-TTY map-pressure \
       "${map_arguments[@]}" \
       --seed "$PRESSURE_SEED" \
       --mode cleanup | tee "$cleanup_output"; then
@@ -1504,7 +1562,9 @@ run_scenario() {
   local stderr_output=""
   local before_phase=""
   local after_phase=""
+  local before_stage=0
   local before_success=0
+  local expected_stage=0
   local expected_success=0
   local expected_requests=0
   local expected_sampled=0
@@ -1527,8 +1587,7 @@ run_scenario() {
     log_error "scenario diagnostics mode must be true or false"
     return 1
   }
-  expected_bridge_missing="$(scenario_bridge_missing_count \
-    "$name" "$diagnostics_enabled" "$SELECTED_TRANSPORT")"
+  expected_bridge_missing="$(scenario_bridge_missing_count "$name" "$SELECTED_TRANSPORT")"
   expected_java_missing="$(scenario_java_missing_count "$name" "$diagnostics_enabled")"
   if [[ "$name" == "w3c-fault" ]]; then
     request_arguments=(--requests "$FAULT_REQUEST_COUNT")
@@ -1555,14 +1614,24 @@ run_scenario() {
 
     log_info "running $label scenario"
     flush_bridge_metric_boundary "$label"
-    capture_phase_evidence "$before_phase"
     if [[ "$name" != "w3c-fault" && "$diagnostics_enabled" == "true" ]]; then
       capture_java_diagnostics "$before_phase"
+      if [[ "$BRIDGE_RUNNING" == "true" ]] &&
+        ! wait_for_bridge_metrics_quiescent \
+          0 \
+          0 \
+          "$RESULT_DIR/metrics-diagnostics-$label.prom" \
+          "$label pre-scenario diagnostics quiescence"; then
+        metric_status=1
+      fi
     fi
+    capture_phase_evidence "$before_phase"
     bridge_was_running="$BRIDGE_RUNNING"
     expected_requests="$(scenario_bridge_take_count "$name")"
     if [[ "$bridge_was_running" == "true" ]]; then
       before_success="$(bridge_success_total \
+        "$RESULT_DIR/phases/$before_phase/obi-metrics.prom")"
+      before_stage="$(bridge_stage_total \
         "$RESULT_DIR/phases/$before_phase/obi-metrics.prom")"
     fi
     if [[ "$name" == "pressure" ]]; then
@@ -1574,7 +1643,7 @@ run_scenario() {
     fi
     if ((scenario_status == 0)); then
       if run_bounded 120 \
-        "${COMPOSE[@]}" run --rm --no-deps scenario \
+        "${COMPOSE[@]}" run --rm --no-deps --no-TTY scenario \
           --scenario "$name" \
           --expected-tls "$TLS_PROTOCOL" \
           --seed "$SCENARIO_SEED" \
@@ -1592,8 +1661,10 @@ run_scenario() {
     fi
     if [[ "$bridge_was_running" == "true" ]]; then
       expected_success="$((before_success + expected_requests))"
-      if ! wait_for_bridge_metric_total \
+      expected_stage="$((before_stage + expected_requests))"
+      if ! wait_for_bridge_metrics_quiescent \
         "$expected_success" \
+        "$expected_stage" \
         "$RESULT_DIR/metrics-after-$label.prom" \
         "$label scenario-attributable bridge operations"; then
         metric_status=1
@@ -1800,7 +1871,7 @@ run_restart_during_traffic_control() (
   capture_phase_evidence "$before_phase"
   capture_java_diagnostics "$before_phase"
   timeout --signal=TERM --kill-after=10s 180s \
-    "${COMPOSE[@]}" run --rm --no-deps scenario \
+    "${COMPOSE[@]}" run --rm --no-deps --no-TTY scenario \
       --scenario restart-fault \
       --requests 32 \
       --expected-tls "$TLS_PROTOCOL" \
@@ -3139,6 +3210,7 @@ assert_bridge_metric_delta() {
         status == "unauthorized" && transport == "getsockopt" && selected == "getsockopt")
       allowed = allowed || (operation == "candidate" && status == "ambiguous" && transport == "tcp")
       allowed = allowed || (operation == "cleanup" && status == "valid" && transport == "tcp")
+      allowed = allowed || (operation == "report" && status == "valid" && transport == "tcp")
       if (delta != 0 && !allowed) {
         printf "unexpected bridge operation result: %s\n", $0 > "/dev/stderr"
         failed = 1

@@ -491,6 +491,7 @@ EOF
 
 test_metric_boundary_helpers_are_reason_coded() {
   local metrics="$TEST_TMP_DIR/bridge-metrics.prom"
+  local fingerprint=""
   local pressure=""
 
   cat >"$metrics" <<'EOF'
@@ -498,6 +499,7 @@ obi_java_remote_parent_operations_total{operation="take",status="valid",transpor
 obi_java_remote_parent_operations_total{operation="discard",status="valid",transport="unix"} 3
 obi_java_remote_parent_operations_total{operation="take",status="missing",transport="getsockopt"} 99
 obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} 99
+obi_java_remote_parent_operations_total{operation="report",status="valid",transport="tcp"} 7
 obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7
 obi_bpf_map_max_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 10000
 obi_avoided_services{otel_metric_overflow="false",service_name="java-backend",service_namespace="apache-java-https",telemetry_type="traces"} 1
@@ -505,6 +507,20 @@ EOF
 
   [[ "$(bridge_success_total "$metrics")" == "5" ]] || {
     printf 'bridge success total included a non-success or non-transport counter\n' >&2
+    return 1
+  }
+  [[ "$(bridge_stage_total "$metrics")" == "99" ]] || {
+    printf 'bridge stage total did not isolate the valid stage counter\n' >&2
+    return 1
+  }
+  [[ "$(bridge_report_total "$metrics")" == "7" ]] || {
+    printf 'bridge report total did not isolate the completed publication marker\n' >&2
+    return 1
+  }
+  fingerprint="$(bridge_metric_fingerprint "$metrics")"
+  sed -i 's/operation="report",status="valid",transport="tcp"} 7/operation="report",status="valid",transport="tcp"} 8/' "$metrics"
+  [[ "$(bridge_metric_fingerprint "$metrics")" == "$fingerprint" ]] || {
+    printf 'bridge fingerprint included the report generation\n' >&2
     return 1
   }
   pressure="$(pressure_map_metric \
@@ -518,6 +534,38 @@ EOF
     printf 'could not prove Java duplicate trace suppression\n' >&2
     return 1
   }
+}
+
+test_bridge_metric_wait_requires_quiescent_report() {
+  (
+    local -i fetches=0
+    RESULT_DIR="$TEST_TMP_DIR/bridge-metric-wait"
+    mkdir -p -- "$RESULT_DIR"
+    fetch_obi_metrics() {
+      ((fetches += 1))
+      printf '%s\n' \
+        "obi_java_remote_parent_operations_total{operation=\"take\",status=\"valid\",transport=\"unix\"} $((fetches >= 2 ? 1 : 0))" \
+        "obi_java_remote_parent_operations_total{operation=\"stage\",status=\"valid\",transport=\"tcp\"} $((fetches >= 2 ? 1 : 0))" \
+        "obi_java_remote_parent_operations_total{operation=\"inject\",status=\"ambiguous\",transport=\"tcp\"} $((fetches >= 2 ? 1 : 0))" \
+        "obi_java_remote_parent_operations_total{operation=\"report\",status=\"valid\",transport=\"tcp\"} $((fetches == 1 ? 5 : fetches < 4 ? 6 : 7))" \
+        >"$1"
+    }
+    sleep() {
+      :
+    }
+
+    wait_for_bridge_metrics_quiescent \
+      1 1 "$RESULT_DIR/settled.prom" "delayed reporter quiescence"
+
+    [[ "$fetches" -eq 4 ]] || {
+      printf 'bridge wait returned before a stable completed report: fetches=%d\n' "$fetches" >&2
+      return 1
+    }
+    [[ "$(bridge_stage_total "$RESULT_DIR/settled.prom")" == "1" ]] || {
+      printf 'bridge wait did not retain the completed reporter snapshot\n' >&2
+      return 1
+    }
+  )
 }
 
 test_pressure_monitor_requires_full_occupancy() {
@@ -571,24 +619,24 @@ test_bridge_take_count_includes_cancelled_request() {
     printf 'timeout/retry bridge take count omitted the cancelled request\n' >&2
     return 1
   }
-  [[ "$(scenario_bridge_missing_count basic true getsockopt)" == "0" &&
+  [[ "$(scenario_bridge_missing_count basic getsockopt)" == "0" &&
     "$(scenario_java_missing_count basic true)" == "1" ]] || {
     printf 'getsockopt diagnostics miss expectations were conflated\n' >&2
     return 1
   }
-  [[ "$(scenario_bridge_missing_count basic true unix)" == "1" &&
+  [[ "$(scenario_bridge_missing_count basic unix)" == "0" &&
     "$(scenario_java_missing_count basic true)" == "1" ]] || {
-    printf 'Unix diagnostics miss expectations did not include the transport lookup\n' >&2
+    printf 'Unix metric baseline did not exclude the before-diagnostics lookup\n' >&2
     return 1
   }
-  [[ "$(scenario_bridge_missing_count tls-boundary true getsockopt)" == "0" &&
+  [[ "$(scenario_bridge_missing_count tls-boundary getsockopt)" == "0" &&
     "$(scenario_java_missing_count tls-boundary true)" == "4" ]] || {
     printf 'getsockopt TLS-boundary miss expectations were not local-only\n' >&2
     return 1
   }
-  [[ "$(scenario_bridge_missing_count tls-boundary true unix)" == "4" &&
+  [[ "$(scenario_bridge_missing_count tls-boundary unix)" == "3" &&
     "$(scenario_java_missing_count tls-boundary true)" == "4" ]] || {
-    printf 'Unix TLS-boundary miss expectations omitted transport lookups\n' >&2
+    printf 'Unix TLS-boundary miss expectations included baseline diagnostics\n' >&2
     return 1
   }
 }
@@ -600,6 +648,7 @@ test_bridge_metric_delta_requires_exact_one_shot_results() {
 obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=3 after=5 delta=2
 obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} before=3 after=5 delta=2
 obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=3 after=5 delta=2
+obi_java_remote_parent_operations_total{operation="report",status="valid",transport="tcp"} before=3 after=5 delta=2
 obi_java_remote_parent_operations_total{operation="candidate",status="ambiguous",transport="tcp"} before=1 after=3 delta=2
 obi_java_remote_parent_operations_total{operation="cleanup",status="valid",transport="tcp"} before=0 after=16 delta=16
 obi_java_remote_parent_operations_total{operation="negotiate",status="missing",transport="getsockopt"} before=3 after=5 delta=2
@@ -628,6 +677,14 @@ EOF
   }
 
   sed -i 's/status="missing",transport="getsockopt"} before=0 after=1 delta=1/status="missing",transport="getsockopt"} before=0 after=0 delta=0/' "$delta"
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="inject",status="ambiguous",transport="tcp"} before=0 after=1 delta=1' \
+    >>"$delta"
+  if assert_bridge_metric_delta "$delta" getsockopt 2 0 >/dev/null 2>&1; then
+    printf 'bridge metric delta accepted an ambiguous injection\n' >&2
+    return 1
+  fi
+  sed -i '/operation="inject",status="ambiguous",transport="tcp"/d' "$delta"
   printf '%s\n' \
     'obi_java_remote_parent_operations_total{operation="candidate",status="overload",transport="tcp"} before=0 after=1 delta=1' \
     >>"$delta"
@@ -944,6 +1001,86 @@ test_fault_scenario_does_not_probe_java_diagnostics() {
     printf 'scenario consumed a diagnostics probe while probes were disabled\n' >&2
     return 1
   fi
+}
+
+test_scenario_fences_metrics_around_diagnostics() {
+  run_accounting_case() (
+    local -r name="$1"
+    local -r requests="$2"
+    local -r wanted_valid="$3"
+    local -r wanted_missing="$4"
+    local -r wanted_sampled="$5"
+    local -r wanted_unsampled="$6"
+    local -r wanted_standard="$7"
+    local -r call_log="$TEST_TMP_DIR/scenario-$name.calls"
+    local boundary_ran=false
+    local expected_requests=0
+
+    RESULT_DIR="$TEST_TMP_DIR/scenario-$name"
+    mkdir -p -- "$RESULT_DIR"
+    BRIDGE_RUNNING=true
+    COMPOSE=(docker compose)
+    REPEAT_COUNT=1
+    REQUEST_COUNT="$requests"
+    SCENARIO_SEED=1
+    SCENARIO_VARIANT=""
+    SELECTED_TRANSPORT=getsockopt
+    TLS_PROTOCOL=TLSv1.3
+    capture_java_diagnostics() {
+      printf 'diagnostics:%s\n' "$1" >>"$call_log"
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+      printf 'fixture\n' >"$RESULT_DIR/phases/$1/java-diagnostics.txt"
+    }
+    flush_bridge_metric_boundary() {
+      boundary_ran=true
+      printf 'boundary:%s\n' "$1" >>"$call_log"
+    }
+    capture_phase_evidence() {
+      printf 'evidence:%s\n' "$1" >>"$call_log"
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+      printf '# empty\n' >"$RESULT_DIR/phases/$1/obi-metrics.prom"
+    }
+    run_bounded() {
+      printf 'scenario\n' >>"$call_log"
+      printf '{"status":"passed"}\n'
+    }
+    wait_for_bridge_metrics_quiescent() {
+      printf 'wait:%s:%s\n' "$1" "$2" >>"$call_log"
+    }
+    assert_bridge_metric_delta() {
+      return 0
+    }
+    write_java_diagnostics_delta() {
+      : >"$3"
+    }
+    assert_java_diagnostics_delta() {
+      [[ "$boundary_ran" == "true" &&
+        "$2" == "$wanted_valid" && "$3" == "0" && "$4" == "0" &&
+        "$5" == "$wanted_missing" && "$6" == "$wanted_sampled" &&
+        "$7" == "$wanted_unsampled" && "$8" == "$wanted_standard" &&
+        "${9:-}" == "" && "${10:-0}" == "0" ]]
+    }
+
+    run_scenario "$name" >/dev/null || return $?
+
+    expected_requests="$(scenario_bridge_take_count "$name")"
+    [[ "$(<"$call_log")" == "$(printf \
+      'boundary:%s\ndiagnostics:%s-before\nwait:0:0\nevidence:%s-before\nscenario\nwait:%d:%d\nevidence:%s-after\ndiagnostics:%s-after' \
+      "$name" "$name" "$name" "$expected_requests" "$expected_requests" "$name" "$name")" ]]
+  )
+
+  run_accounting_case basic 1 1 1 1 0 0 || {
+    printf 'basic scenario did not fence metrics around diagnostics\n' >&2
+    return 1
+  }
+  run_accounting_case tls-boundary 0 2 4 2 0 0 || {
+    printf 'TLS-boundary scenario did not fence metrics around diagnostics\n' >&2
+    return 1
+  }
+  run_accounting_case obi-flags 4 4 1 2 2 0 || {
+    printf 'OBI-flags scenario did not preserve sampled and unsampled takes\n' >&2
+    return 1
+  }
 }
 
 test_java_diagnostics_parser_uses_base36() {
@@ -1282,7 +1419,7 @@ test_restart_failure_reaps_background_traffic() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 case " $* " in
-  *" run --rm --no-deps scenario "*)
+  *" run --rm --no-deps --no-TTY scenario "*)
     printf '%d\n' "$$" >"$RESTART_TRAFFIC_PID_FILE"
     trap 'printf "terminated\n" >"$RESTART_TRAFFIC_TERM_FILE"; exit 0' TERM INT
     while true; do sleep 1; done
@@ -1698,6 +1835,7 @@ main() {
   test_agent_download_rejects_symlink_output
   test_metrics_delta_reports_counters_and_map_occupancy
   test_metric_boundary_helpers_are_reason_coded
+  test_bridge_metric_wait_requires_quiescent_report
   test_pressure_monitor_requires_full_occupancy
   test_bridge_take_count_includes_cancelled_request
   test_bridge_metric_delta_requires_exact_one_shot_results
@@ -1708,6 +1846,7 @@ main() {
   test_java_diagnostics_schema_is_exact
   test_java_diagnostics_delta_is_exact
   test_fault_scenario_does_not_probe_java_diagnostics
+  test_scenario_fences_metrics_around_diagnostics
   test_java_diagnostics_parser_uses_base36
   test_restart_fault_diagnostics_require_overlap
   test_pipeline_dependencies_are_declared

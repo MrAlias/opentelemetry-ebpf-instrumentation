@@ -38,6 +38,37 @@ typedef struct tp_info_pid {
     u8 provenance;
 } tp_info_pid_t;
 
+static __always_inline u8 valid_span(const unsigned char *span_id) {
+    return *((u64 *)span_id) != 0;
+}
+
+static __always_inline u8 valid_trace(const unsigned char *trace_id) {
+    return *((u64 *)trace_id) != 0 || *((u64 *)(trace_id + 8)) != 0;
+}
+
+static __always_inline u8 apply_incoming_trace_candidate(tp_info_t *server,
+                                                         const tp_info_pid_t *candidate,
+                                                         tp_info_pid_t *handoff,
+                                                         u64 *generation) {
+    if (!candidate->valid || !valid_trace(candidate->tp.trace_id) ||
+        !valid_span(candidate->tp.span_id)) {
+        if (generation) {
+            *generation = 0;
+        }
+        return 0;
+    }
+
+    if (handoff && generation && *generation) {
+        __builtin_memcpy(handoff, candidate, sizeof(*handoff));
+    }
+    __builtin_memcpy(server->trace_id, candidate->tp.trace_id, sizeof(server->trace_id));
+    __builtin_memcpy(server->parent_id, candidate->tp.span_id, sizeof(server->parent_id));
+    if (candidate->provenance == k_tp_provenance_tcp_exact_flags) {
+        server->flags = candidate->tp.flags;
+    }
+    return 1;
+}
+
 static __always_inline void set_client_trace_parent(tp_info_t *child, const tp_info_t *parent) {
     __builtin_memcpy(child->trace_id, parent->trace_id, sizeof(child->trace_id));
     __builtin_memcpy(child->parent_id, parent->span_id, sizeof(child->parent_id));

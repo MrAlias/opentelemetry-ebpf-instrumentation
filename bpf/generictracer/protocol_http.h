@@ -726,11 +726,11 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
                     __builtin_memcpy(
                         java_connection, &args->pid_conn.conn, sizeof(*java_connection));
                     sort_connection_info(java_connection);
-                    staged_generation = java_remote_parent_stage(java_connection,
-                                                                 args->connection_netns,
-                                                                 args->connection_netns_cookie,
-                                                                 java_incoming->generation,
-                                                                 &java_incoming->candidate);
+                    staged_generation =
+                        java_remote_parent_stage_incoming(java_connection,
+                                                          args->connection_netns,
+                                                          args->connection_netns_cookie,
+                                                          java_incoming);
                 }
                 if (!staged_generation) {
                     found_tp = 0;

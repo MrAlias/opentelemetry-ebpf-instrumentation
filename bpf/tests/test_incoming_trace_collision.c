@@ -24,7 +24,31 @@ static long test_map_delete(void *map, const void *key);
 #undef bpf_map_update_elem
 #undef bpf_map_delete_elem
 
-enum { test_netns = 7, other_netns = 8, max_slots = 12 };
+enum {
+    test_netns = 7,
+    other_netns = 8,
+    max_slots = 12,
+    test_source_port = 1234,
+    test_destination_port = 443,
+    test_trace_seed = 0x10,
+    test_span_seed = 0x30,
+    test_generated_flags = 0x40,
+    test_generated_span_seed = 0xd0,
+    test_future_sampled_flags = 0x81,
+    test_candidate_timestamp = 100,
+    test_tcp_sequence = 200,
+    test_legacy_poison = 0xa5,
+    test_staging_poison = 0x5a,
+    test_server_poison = 0x6b,
+};
+
+enum invalid_parent_case {
+    invalid_parent_valid_bit,
+    invalid_parent_all_zero_ids,
+    invalid_parent_zero_trace_id,
+    invalid_parent_zero_span_id,
+    invalid_parent_case_count,
+};
 
 typedef struct test_head {
     connection_info_netns_cookie_t key;
@@ -37,7 +61,10 @@ typedef struct test_version {
     incoming_trace_candidate_t candidate;
     u8 claim;
     u8 ambiguous;
-    int present;
+    int allocated;
+    int candidate_present;
+    int claim_present;
+    int ambiguity_present;
 } test_version_t;
 
 static test_head_t heads[2];
@@ -53,10 +80,30 @@ static int fail_ambiguity_insert;
 static u64 publish_during_claim;
 static u64 publish_during_ambiguity;
 static int invalidate_during_claim;
+static connection_info_t expected_legacy_connection;
+static int check_legacy_connection;
+static int legacy_connection_mismatch;
+static int legacy_update_flags_mismatch;
+static int legacy_lookup_calls;
+static int legacy_update_calls;
+static int legacy_delete_calls;
+static int strict_head_delete_calls;
+static int strict_candidate_delete_calls;
+static int strict_claim_delete_calls;
+static int strict_ambiguity_delete_calls;
+static u64 expected_strict_delete_generation;
+static int strict_delete_generation_mismatch;
 
 static void fail(const char *message) {
     fprintf(stderr, "FAIL: %s\n", message);
     exit(1);
+}
+
+static void check_legacy_key(const connection_info_t *connection) {
+    if (check_legacy_connection &&
+        memcmp(connection, &expected_legacy_connection, sizeof(*connection)) != 0) {
+        legacy_connection_mismatch = 1;
+    }
 }
 
 static int same_connection_ns(const connection_info_netns_cookie_t *left,
@@ -75,7 +122,7 @@ static test_head_t *find_head(const connection_info_netns_cookie_t *key) {
 
 static test_version_t *find_version(u64 generation) {
     for (size_t i = 0; i < max_slots; i++) {
-        if (versions[i].present && versions[i].generation == generation) {
+        if (versions[i].allocated && versions[i].generation == generation) {
             return &versions[i];
         }
     }
@@ -88,13 +135,19 @@ static test_version_t *allocate_version(u64 generation) {
         return existing;
     }
     for (size_t i = 0; i < max_slots; i++) {
-        if (!versions[i].present) {
+        if (!versions[i].allocated) {
             versions[i].generation = generation;
-            versions[i].present = 1;
+            versions[i].allocated = 1;
             return &versions[i];
         }
     }
     return NULL;
+}
+
+static void release_version_if_empty(test_version_t *version) {
+    if (!version->candidate_present && !version->claim_present && !version->ambiguity_present) {
+        memset(version, 0, sizeof(*version));
+    }
 }
 
 static void *test_map_lookup(void *map, const void *key) {
@@ -107,17 +160,19 @@ static void *test_map_lookup(void *map, const void *key) {
     }
     if (map == &incoming_trace_candidates) {
         test_version_t *version = find_version(*(const u64 *)key);
-        return version ? &version->candidate : NULL;
+        return version && version->candidate_present ? &version->candidate : NULL;
     }
     if (map == &incoming_trace_claims) {
         test_version_t *version = find_version(*(const u64 *)key);
-        return version && version->claim ? &version->claim : NULL;
+        return version && version->claim_present ? &version->claim : NULL;
     }
     if (map == &incoming_trace_ambiguity) {
         test_version_t *version = find_version(*(const u64 *)key);
-        return version && version->ambiguous ? &version->ambiguous : NULL;
+        return version && version->ambiguity_present ? &version->ambiguous : NULL;
     }
     if (map == &incoming_trace_map) {
+        legacy_lookup_calls++;
+        check_legacy_key(key);
         return legacy_present ? &legacy_candidate : NULL;
     }
     if (map == &incoming_trace_snapshot_storage) {
@@ -157,6 +212,11 @@ static long test_update_head(const connection_info_netns_cookie_t *key,
 static long
 test_map_update(void *map, const void *key, const void *value, unsigned long long flags) {
     if (map == &incoming_trace_map) {
+        legacy_update_calls++;
+        check_legacy_key(key);
+        if (flags != BPF_ANY) {
+            legacy_update_flags_mismatch = 1;
+        }
         if (flags == BPF_NOEXIST && legacy_present) {
             return -1;
         }
@@ -169,19 +229,23 @@ test_map_update(void *map, const void *key, const void *value, unsigned long lon
     }
     if (map == &incoming_trace_candidates) {
         const u64 generation = *(const u64 *)key;
-        if (fail_candidate_insert || (flags == BPF_NOEXIST && find_version(generation))) {
+        test_version_t *version = find_version(generation);
+        if (fail_candidate_insert ||
+            (flags == BPF_NOEXIST && version && version->candidate_present)) {
             return -1;
         }
-        test_version_t *version = allocate_version(generation);
+        version = allocate_version(generation);
         if (!version) {
             return -1;
         }
         version->candidate = *(const incoming_trace_candidate_t *)value;
+        version->candidate_present = 1;
         return 0;
     }
     if (map == &incoming_trace_claims) {
         test_version_t *version = find_version(*(const u64 *)key);
-        if (!version || (flags == BPF_NOEXIST && version->claim)) {
+        if (!version || !version->candidate_present ||
+            (flags == BPF_NOEXIST && version->claim_present)) {
             return -1;
         }
         if (publish_during_claim) {
@@ -195,9 +259,11 @@ test_map_update(void *map, const void *key, const void *value, unsigned long lon
         }
         if (invalidate_during_claim) {
             version->ambiguous = 1;
+            version->ambiguity_present = 1;
             invalidate_during_claim = 0;
         }
         version->claim = *(const u8 *)value;
+        version->claim_present = 1;
         return 0;
     }
     if (map == &incoming_trace_ambiguity) {
@@ -209,6 +275,7 @@ test_map_update(void *map, const void *key, const void *value, unsigned long lon
             return -1;
         }
         version->ambiguous = *(const u8 *)value;
+        version->ambiguity_present = 1;
         if (publish_during_ambiguity) {
             for (size_t i = 0; i < sizeof(heads) / sizeof(heads[0]); i++) {
                 if (heads[i].present && heads[i].generation == version->generation) {
@@ -225,43 +292,72 @@ test_map_update(void *map, const void *key, const void *value, unsigned long lon
 
 static long test_map_delete(void *map, const void *key) {
     if (map == &incoming_trace_map) {
+        legacy_delete_calls++;
+        check_legacy_key(key);
         legacy_present = 0;
+        memset(&legacy_candidate, test_legacy_poison, sizeof(legacy_candidate));
         return 0;
     }
     if (map == &incoming_trace_heads) {
+        strict_head_delete_calls++;
         test_head_t *head = find_head(key);
         if (head) {
             head->present = 0;
         }
         return 0;
     }
-    test_version_t *version = find_version(*(const u64 *)key);
+    if (map == &incoming_trace_candidates) {
+        strict_candidate_delete_calls++;
+    } else if (map == &incoming_trace_claims) {
+        strict_claim_delete_calls++;
+    } else if (map == &incoming_trace_ambiguity) {
+        strict_ambiguity_delete_calls++;
+    }
+
+    const u64 generation = *(const u64 *)key;
+    if (expected_strict_delete_generation && generation != expected_strict_delete_generation) {
+        strict_delete_generation_mismatch = 1;
+    }
+
+    test_version_t *version = find_version(generation);
     if (!version) {
         return 0;
     }
     if (map == &incoming_trace_candidates) {
-        version->present = 0;
+        version->candidate_present = 0;
     } else if (map == &incoming_trace_claims) {
-        version->claim = 0;
+        version->claim_present = 0;
     } else if (map == &incoming_trace_ambiguity) {
-        version->ambiguous = 0;
+        version->ambiguity_present = 0;
     }
+    release_version_if_empty(version);
     return 0;
 }
 
-static tp_info_pid_t candidate(unsigned char span_seed, u64 timestamp) {
+static tp_info_pid_t candidate_with_flags(unsigned char trace_seed,
+                                          unsigned char span_seed,
+                                          unsigned char flags,
+                                          u64 timestamp) {
     tp_info_pid_t value = {
         .tp =
             {
                 .ts = timestamp,
-                .flags = 1,
+                .flags = flags,
             },
         .valid = 1,
         .provenance = k_tp_provenance_tcp_exact_flags,
     };
-    value.tp.trace_id[0] = 1;
-    value.tp.span_id[0] = span_seed;
+    for (u32 index = 0; index < sizeof(value.tp.trace_id); index++) {
+        value.tp.trace_id[index] = trace_seed + index;
+    }
+    for (u32 index = 0; index < sizeof(value.tp.span_id); index++) {
+        value.tp.span_id[index] = span_seed + index;
+    }
     return value;
+}
+
+static tp_info_pid_t candidate(unsigned char span_seed, u64 timestamp) {
+    return candidate_with_flags(1, span_seed, k_flag_sampled, timestamp);
 }
 
 static void reset(void) {
@@ -278,6 +374,19 @@ static void reset(void) {
     publish_during_claim = 0;
     publish_during_ambiguity = 0;
     invalidate_during_claim = 0;
+    expected_legacy_connection = (connection_info_t){};
+    check_legacy_connection = 0;
+    legacy_connection_mismatch = 0;
+    legacy_update_flags_mismatch = 0;
+    legacy_lookup_calls = 0;
+    legacy_update_calls = 0;
+    legacy_delete_calls = 0;
+    strict_head_delete_calls = 0;
+    strict_candidate_delete_calls = 0;
+    strict_claim_delete_calls = 0;
+    strict_ambiguity_delete_calls = 0;
+    expected_strict_delete_generation = 0;
+    strict_delete_generation_mismatch = 0;
 }
 
 static void test_duplicate_is_idempotent(void) {
@@ -457,6 +566,7 @@ static void test_generation_collision_preserves_existing_candidate(void) {
         .candidate = existing,
         .tcp_sequence = 50,
     };
+    reserved->candidate_present = 1;
 
     if (update_strict_incoming_trace(&connection, &colliding, 100, test_netns) !=
             k_incoming_trace_update_failed ||
@@ -505,13 +615,14 @@ static void test_publication_during_claim_fails_closed(void) {
         .candidate = second,
         .tcp_sequence = 200,
     };
+    next->candidate_present = 1;
     publish_during_claim = next_generation;
 
     if (consume_strict_incoming_trace(&connection, test_netns)) {
         fail("consumer returned a candidate across a concurrent publication");
     }
     test_version_t *old = find_version(1);
-    if (!old || old->claim) {
+    if (!old || old->claim_present) {
         fail("failed publication validation leaked an old-generation claim");
     }
     tp_info_pid_t *taken = consume_strict_incoming_trace(&connection, test_netns);
@@ -533,11 +644,12 @@ static void test_publication_during_invalidation_does_not_leak_marker(void) {
         .candidate = second,
         .tcp_sequence = 200,
     };
+    next->candidate_present = 1;
     publish_during_ambiguity = next_generation;
     invalidate_strict_incoming_trace(&connection, test_netns, 30);
 
     test_version_t *old = find_version(1);
-    if (!old || old->ambiguous) {
+    if (!old || old->ambiguity_present) {
         fail("concurrent invalidation leaked an old-generation marker");
     }
     tp_info_pid_t *taken = consume_strict_incoming_trace(&connection, test_netns);
@@ -590,17 +702,176 @@ static void test_zero_network_namespace_cookie_is_rejected(void) {
     }
 }
 
+static void test_handoff_candidate_preserves_raw_tcp_parent(void) {
+    const unsigned char exact_flags[] = {0, k_flag_sampled, test_future_sampled_flags};
+
+    for (size_t flag_index = 0; flag_index < sizeof(exact_flags) / sizeof(exact_flags[0]);
+         flag_index++) {
+        reset();
+        const connection_info_t connection = {
+            .s_port = test_source_port,
+            .d_port = test_destination_port,
+        };
+        const tp_info_pid_t raw = candidate_with_flags(
+            test_trace_seed, test_span_seed, exact_flags[flag_index], test_candidate_timestamp);
+        if (update_strict_incoming_trace(&connection, &raw, test_tcp_sequence, test_netns) !=
+            k_incoming_trace_inserted) {
+            fail("raw TCP parent was not published");
+        }
+
+        u64 incoming_generation = 0;
+        tp_info_pid_t *consumed = consume_strict_incoming_trace_with_generation(
+            &connection, test_netns, &incoming_generation);
+        if (!consumed || !incoming_generation) {
+            fail("raw TCP parent was not claimed for handoff");
+        }
+        const u64 claimed_generation = incoming_generation;
+
+        tp_info_t server = {.flags = test_generated_flags};
+        for (u32 index = 0; index < sizeof(server.span_id); index++) {
+            server.span_id[index] = test_generated_span_seed + index;
+        }
+        const tp_info_t generated_server = server;
+        tp_info_pid_t staged = {};
+        if (!apply_incoming_trace_candidate(&server, consumed, &staged, &incoming_generation)) {
+            fail("valid raw TCP parent was rejected for handoff");
+        }
+        if (memcmp(&staged, &raw, sizeof(staged)) != 0 ||
+            memcmp(server.trace_id, raw.tp.trace_id, sizeof(server.trace_id)) != 0 ||
+            memcmp(server.parent_id, raw.tp.span_id, sizeof(server.parent_id)) != 0 ||
+            memcmp(server.span_id, generated_server.span_id, sizeof(server.span_id)) != 0 ||
+            memcmp(staged.tp.span_id, generated_server.span_id, sizeof(staged.tp.span_id)) == 0 ||
+            server.flags != exact_flags[flag_index]) {
+            fail("handoff candidate did not preserve the exact raw TCP parent");
+        }
+        if (consume_strict_incoming_trace(&connection, test_netns)) {
+            fail("raw TCP parent could be claimed more than once");
+        }
+
+        const connection_info_netns_cookie_t key = {
+            .connection = connection,
+            .netns_cookie = test_netns,
+        };
+        test_version_t *claimed = find_version(claimed_generation);
+        if (!claimed || !claimed->candidate_present || !claimed->claim_present) {
+            fail("claimed raw TCP parent lost independent map state");
+        }
+        claimed->ambiguous = 1;
+        claimed->ambiguity_present = 1;
+        expected_strict_delete_generation = claimed_generation;
+        delete_strict_incoming_trace(&connection, test_netns);
+        if (find_head(&key) || find_version(claimed_generation) || strict_head_delete_calls != 1 ||
+            strict_candidate_delete_calls != 1 || strict_claim_delete_calls != 1 ||
+            strict_ambiguity_delete_calls != 1 || strict_delete_generation_mismatch) {
+            fail("raw TCP parent state survived explicit deletion");
+        }
+    }
+}
+
+static void test_legacy_tcp_parent_preserves_server_flags(void) {
+    const tp_info_pid_t raw = candidate_with_flags(
+        test_trace_seed, test_span_seed, test_future_sampled_flags, test_candidate_timestamp);
+    tp_info_pid_t legacy = raw;
+    legacy.provenance = k_tp_provenance_tcp_legacy;
+    tp_info_t server = {.flags = test_generated_flags};
+
+    if (!apply_incoming_trace_candidate(&server, &legacy, NULL, NULL) ||
+        memcmp(server.trace_id, legacy.tp.trace_id, sizeof(server.trace_id)) != 0 ||
+        memcmp(server.parent_id, legacy.tp.span_id, sizeof(server.parent_id)) != 0 ||
+        server.flags != test_generated_flags) {
+        fail("legacy TCP parent changed OBI trace-parent behavior");
+    }
+}
+
+static void test_invalid_tcp_parents_are_not_staged(void) {
+    for (enum invalid_parent_case invalid_case = invalid_parent_valid_bit;
+         invalid_case < invalid_parent_case_count;
+         invalid_case++) {
+        reset();
+        const connection_info_t connection = {
+            .s_port = test_source_port,
+            .d_port = test_destination_port,
+        };
+        tp_info_pid_t raw = candidate_with_flags(
+            test_trace_seed, test_span_seed, k_flag_sampled, test_candidate_timestamp);
+        if (invalid_case == invalid_parent_valid_bit) {
+            raw.valid = 0;
+        } else if (invalid_case == invalid_parent_all_zero_ids) {
+            memset(raw.tp.trace_id, 0, sizeof(raw.tp.trace_id));
+            memset(raw.tp.span_id, 0, sizeof(raw.tp.span_id));
+        } else if (invalid_case == invalid_parent_zero_trace_id) {
+            memset(raw.tp.trace_id, 0, sizeof(raw.tp.trace_id));
+        } else {
+            memset(raw.tp.span_id, 0, sizeof(raw.tp.span_id));
+        }
+        if (update_strict_incoming_trace(&connection, &raw, test_tcp_sequence, test_netns) !=
+            k_incoming_trace_inserted) {
+            fail("invalid candidate setup failed");
+        }
+
+        u64 incoming_generation = 0;
+        tp_info_pid_t *consumed = consume_strict_incoming_trace_with_generation(
+            &connection, test_netns, &incoming_generation);
+        const connection_info_netns_cookie_t key = {
+            .connection = connection,
+            .netns_cookie = test_netns,
+        };
+        const test_head_t *head = find_head(&key);
+        if (!head) {
+            fail("invalid candidate lost its cleanup key");
+        }
+        const u64 published_generation = head->generation;
+
+        tp_info_t server;
+        memset(&server, test_server_poison, sizeof(server));
+        server.flags = test_generated_flags;
+        const tp_info_t original_server = server;
+        tp_info_pid_t staged;
+        memset(&staged, test_staging_poison, sizeof(staged));
+        const tp_info_pid_t original_staged = staged;
+        u64 stage_generation = incoming_generation ? incoming_generation : published_generation;
+        const tp_info_pid_t *stage_candidate = consumed ? consumed : &raw;
+        if (apply_incoming_trace_candidate(&server, stage_candidate, &staged, &stage_generation) ||
+            stage_generation || memcmp(&server, &original_server, sizeof(server)) != 0 ||
+            memcmp(&staged, &original_staged, sizeof(staged)) != 0) {
+            fail("invalid TCP parent was staged as valid");
+        }
+
+        expected_strict_delete_generation = published_generation;
+        delete_strict_incoming_trace(&connection, test_netns);
+        if (find_head(&key) || find_version(published_generation) ||
+            strict_head_delete_calls != 1 || strict_candidate_delete_calls != 1 ||
+            strict_claim_delete_calls != 1 || strict_ambiguity_delete_calls != 1 ||
+            strict_delete_generation_mismatch) {
+            fail("invalid TCP parent state survived explicit deletion");
+        }
+    }
+}
+
 static void test_disabled_path_retains_legacy_overwrite_and_delete(void) {
     reset();
-    connection_info_t connection = {};
+    const connection_info_t connection = {
+        .s_port = test_source_port,
+        .d_port = test_destination_port,
+    };
     const tp_info_pid_t first = candidate(2, 10);
     const tp_info_pid_t second = candidate(3, 20);
+    expected_legacy_connection = connection;
+    check_legacy_connection = 1;
 
-    update_incoming_trace(&connection, &first, 100, test_netns);
-    update_incoming_trace(&connection, &second, 200, test_netns);
+    if (update_incoming_trace(&connection, &first, 100, test_netns) != k_incoming_trace_inserted ||
+        update_incoming_trace(&connection, &second, 200, test_netns) != k_incoming_trace_inserted) {
+        fail("legacy incoming parent update failed");
+    }
     tp_info_pid_t *taken = consume_incoming_trace_in_netns_cookie(&connection, other_netns);
-    if (!taken || taken->tp.span_id[0] != 3 || legacy_present) {
+    if (taken != &snapshot || memcmp(taken, &second, sizeof(second)) != 0 || legacy_present ||
+        legacy_update_calls != 2 || legacy_lookup_calls != 1 || legacy_delete_calls != 1 ||
+        legacy_connection_mismatch || legacy_update_flags_mismatch) {
         fail("disabled bridge changed legacy overwrite/delete behavior");
+    }
+    if (consume_incoming_trace_in_netns_cookie(&connection, test_netns) ||
+        legacy_lookup_calls != 2 || legacy_delete_calls != 1) {
+        fail("legacy incoming parent was not deleted after one lookup");
     }
 }
 
@@ -621,6 +892,9 @@ int main(void) {
     test_invalidation_during_claim_fails_closed();
     test_disallowed_claim_preserves_candidate();
     test_zero_network_namespace_cookie_is_rejected();
+    test_handoff_candidate_preserves_raw_tcp_parent();
+    test_legacy_tcp_parent_preserves_server_flags();
+    test_invalid_tcp_parents_are_not_staged();
     test_disabled_path_retains_legacy_overwrite_and_delete();
     return 0;
 }

@@ -623,6 +623,18 @@ static __always_inline u64 java_remote_parent_stage(const connection_info_t *con
     return generation;
 }
 
+static __always_inline u64
+java_remote_parent_stage_incoming(const connection_info_t *connection,
+                                  u32 connection_netns,
+                                  u64 connection_netns_cookie,
+                                  const java_remote_parent_incoming_t *incoming) {
+    return java_remote_parent_stage(connection,
+                                    connection_netns,
+                                    connection_netns_cookie,
+                                    incoming->generation,
+                                    &incoming->candidate);
+}
+
 typedef struct java_remote_parent_resolution {
     java_remote_parent_key_t key;
     java_remote_parent_owner_t indexed;

@@ -84,22 +84,10 @@ static __always_inline u8 find_trace_for_server_request_with_incoming(connection
     tp_info_pid_t *existing_tp = consume_incoming_trace_in_netns_cookie_with_generation_if_allowed(
         &sorted_conn, netns_cookie, incoming_generation, incoming_claim_allowed);
     if (existing_tp) {
-        if (existing_tp->valid && valid_trace(existing_tp->tp.trace_id) &&
-            valid_span(existing_tp->tp.span_id)) {
+        if (apply_incoming_trace_candidate(tp, existing_tp, incoming, incoming_generation)) {
             found_tp = 1;
-            if (incoming && incoming_generation && *incoming_generation) {
-                __builtin_memcpy(incoming, existing_tp, sizeof(*incoming));
-            }
             bpf_dbg_printk("Found incoming (TCP/IP) tp for server request");
-            __builtin_memcpy(tp->trace_id, existing_tp->tp.trace_id, sizeof(tp->trace_id));
-            __builtin_memcpy(tp->parent_id, existing_tp->tp.span_id, sizeof(tp->parent_id));
-            if (existing_tp->provenance == k_tp_provenance_tcp_exact_flags) {
-                tp->flags = existing_tp->tp.flags;
-            }
         } else {
-            if (incoming_generation) {
-                *incoming_generation = 0;
-            }
             bpf_dbg_printk("Ignoring ambiguous incoming (TCP/IP) tp for server request");
         }
     } else {

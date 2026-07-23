@@ -12,14 +12,15 @@ import (
 type AssertionMode string
 
 const (
-	ModeBridge         AssertionMode = "bridge"
-	ModeDisabled       AssertionMode = "disabled"
-	ModeUninstrumented AssertionMode = "uninstrumented"
-	ModeW3C            AssertionMode = "w3c"
-	ModeW3CMatch       AssertionMode = "w3c-match"
-	ModeW3CNoOBI       AssertionMode = "w3c-no-obi"
-	ModeW3CResilience  AssertionMode = "w3c-resilience"
-	ModeFailOpen       AssertionMode = "fail-open"
+	ModeBridge          AssertionMode = "bridge"
+	ModePipelinedBridge AssertionMode = "pipelined-bridge"
+	ModeDisabled        AssertionMode = "disabled"
+	ModeUninstrumented  AssertionMode = "uninstrumented"
+	ModeW3C             AssertionMode = "w3c"
+	ModeW3CMatch        AssertionMode = "w3c-match"
+	ModeW3CNoOBI        AssertionMode = "w3c-no-obi"
+	ModeW3CResilience   AssertionMode = "w3c-resilience"
+	ModeFailOpen        AssertionMode = "fail-open"
 )
 
 type Expectation struct {
@@ -77,6 +78,7 @@ func AssertSnapshot(snapshot Snapshot, expectation Expectation) error {
 	}
 
 	var apacheServer Span
+	hasApacheServer := false
 	if expectation.Mode != ModeFailOpen &&
 		expectation.Mode != ModeW3CNoOBI &&
 		expectation.Mode != ModeW3CResilience {
@@ -85,7 +87,14 @@ func AssertSnapshot(snapshot Snapshot, expectation Expectation) error {
 			expectation.ApacheService,
 			expectation.Marker,
 		)
-		if len(apacheServers) != 1 {
+		if expectation.Mode == ModePipelinedBridge && len(apacheServers) > 1 {
+			return fmt.Errorf(
+				"expected at most one Apache inbound server span for pipelined marker %s, got %d",
+				expectation.Marker,
+				len(apacheServers),
+			)
+		}
+		if expectation.Mode != ModePipelinedBridge && len(apacheServers) != 1 {
 			return fmt.Errorf(
 				"expected exactly one Apache inbound server span for %s with marker %s, got %d",
 				expectation.Endpoint,
@@ -93,15 +102,18 @@ func AssertSnapshot(snapshot Snapshot, expectation Expectation) error {
 				len(apacheServers),
 			)
 		}
-		apacheServer = apacheServers[0]
-		if !MatchesEndpoint(apacheServer, expectation.Endpoint) {
-			return fmt.Errorf("apache server span for marker %s did not match endpoint %s", expectation.Marker, expectation.Endpoint)
-		}
-		if expectation.W3CTraceID == "" && !isZeroID(apacheServer.ParentSpanID) {
-			return fmt.Errorf(
-				"expected Apache inbound span to be a root without an external W3C parent, got parent %s",
-				apacheServer.ParentSpanID,
-			)
+		if len(apacheServers) == 1 {
+			hasApacheServer = true
+			apacheServer = apacheServers[0]
+			if !MatchesEndpoint(apacheServer, expectation.Endpoint) {
+				return fmt.Errorf("apache server span for marker %s did not match endpoint %s", expectation.Marker, expectation.Endpoint)
+			}
+			if expectation.W3CTraceID == "" && !isZeroID(apacheServer.ParentSpanID) {
+				return fmt.Errorf(
+					"expected Apache inbound span to be a root without an external W3C parent, got parent %s",
+					apacheServer.ParentSpanID,
+				)
+			}
 		}
 	} else if expectation.Mode != ModeW3CResilience {
 		for _, span := range snapshot.Spans {
@@ -116,7 +128,7 @@ func AssertSnapshot(snapshot Snapshot, expectation Expectation) error {
 	}
 
 	switch expectation.Mode {
-	case ModeBridge, ModeW3CMatch:
+	case ModeBridge, ModePipelinedBridge, ModeW3CMatch:
 		if remote, known := ParentRemote(javaSpan); !known || !remote {
 			return fmt.Errorf(
 				"expected Java server span parent to be explicitly remote, flags=%d",
@@ -150,13 +162,21 @@ func AssertSnapshot(snapshot Snapshot, expectation Expectation) error {
 				matchingParent.SpanID,
 			)
 		}
-		if apacheServer.TraceID != matchingParent.TraceID || matchingParent.ParentSpanID != apacheServer.SpanID {
+		if hasApacheServer && !spanDescendsFrom(snapshot.Spans, matchingParent, apacheServer) {
 			return fmt.Errorf(
-				"expected Apache client %s/%s to be a child of inbound span %s/%s",
+				"expected Apache client %s/%s to descend from inbound span %s/%s",
 				matchingParent.TraceID,
 				matchingParent.SpanID,
 				apacheServer.TraceID,
 				apacheServer.SpanID,
+			)
+		}
+		if !hasApacheServer && !isZeroID(matchingParent.ParentSpanID) {
+			return fmt.Errorf(
+				"expected disconnected pipelined Apache client %s/%s to be a root, got parent %s",
+				matchingParent.TraceID,
+				matchingParent.SpanID,
+				matchingParent.ParentSpanID,
 			)
 		}
 		if expectation.W3CTraceID != "" {
@@ -217,10 +237,9 @@ func AssertSnapshot(snapshot Snapshot, expectation Expectation) error {
 				)
 			}
 			candidate := apacheClients[0]
-			if !strings.EqualFold(candidate.TraceID, apacheServer.TraceID) ||
-				!strings.EqualFold(candidate.ParentSpanID, apacheServer.SpanID) {
+			if !spanDescendsFrom(snapshot.Spans, candidate, apacheServer) {
 				return fmt.Errorf(
-					"expected conflicting OBI candidate %s/%s to be a child of Apache inbound span %s/%s",
+					"expected conflicting OBI candidate %s/%s to descend from Apache inbound span %s/%s",
 					candidate.TraceID,
 					candidate.SpanID,
 					apacheServer.TraceID,
@@ -287,11 +306,75 @@ func selectRequestSpans(spans []Span, serviceName, kind, endpoint, marker string
 		if span.ServiceName == serviceName &&
 			strings.EqualFold(span.Kind, kind) &&
 			MatchesEndpoint(span, endpoint) &&
-			MatchesMarker(span, marker) {
+			(!hasMarkerAttribute(span) || MatchesMarker(span, marker)) {
 			selected = append(selected, span)
 		}
 	}
 	return selected
+}
+
+func spanDescendsFrom(spans []Span, descendant, ancestor Span) bool {
+	if !strings.EqualFold(descendant.TraceID, ancestor.TraceID) {
+		return false
+	}
+	if !strings.EqualFold(descendant.ServiceName, ancestor.ServiceName) {
+		return false
+	}
+
+	parents := make(map[spanIdentity]Span, len(spans))
+	duplicates := make(map[spanIdentity]struct{})
+	for _, span := range spans {
+		if !strings.EqualFold(span.TraceID, descendant.TraceID) {
+			continue
+		}
+		identity := makeSpanIdentity(span.TraceID, span.SpanID)
+		if _, duplicate := duplicates[identity]; duplicate {
+			continue
+		}
+		if _, exists := parents[identity]; exists {
+			delete(parents, identity)
+			duplicates[identity] = struct{}{}
+			continue
+		}
+		parents[identity] = span
+	}
+
+	descendantIdentity := makeSpanIdentity(descendant.TraceID, descendant.SpanID)
+	ancestorIdentity := makeSpanIdentity(ancestor.TraceID, ancestor.SpanID)
+	if _, duplicate := duplicates[descendantIdentity]; duplicate {
+		return false
+	}
+	if _, duplicate := duplicates[ancestorIdentity]; duplicate {
+		return false
+	}
+
+	seen := make(map[spanIdentity]struct{}, len(parents))
+	foundAncestor := false
+	parentID := descendant.ParentSpanID
+	for !isZeroID(parentID) {
+		identity := makeSpanIdentity(descendant.TraceID, parentID)
+		if _, duplicate := duplicates[identity]; duplicate {
+			return false
+		}
+		if _, exists := seen[identity]; exists {
+			return false
+		}
+		seen[identity] = struct{}{}
+
+		parent, exists := parents[identity]
+		if !exists {
+			return foundAncestor
+		}
+		if !foundAncestor && !strings.EqualFold(parent.ServiceName, ancestor.ServiceName) {
+			return false
+		}
+		if identity == ancestorIdentity {
+			foundAncestor = true
+		}
+		parentID = parent.ParentSpanID
+	}
+
+	return foundAncestor
 }
 
 func isZeroID(id string) bool {

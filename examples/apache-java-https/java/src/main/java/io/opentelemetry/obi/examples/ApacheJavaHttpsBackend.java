@@ -89,6 +89,16 @@ public final class ApacheJavaHttpsBackend {
     if (!tlsProtocol.equals("TLSv1.2") && !tlsProtocol.equals("TLSv1.3")) {
       throw new IllegalArgumentException("TLS_PROTOCOL must be TLSv1.2 or TLSv1.3");
     }
+    boolean tlsBoundaryEnabled =
+        parseFlag(
+            environment("TLS_RECEIVE_BOUNDARY_FIXTURE_ENABLED", "0"),
+            false,
+            "TLS_RECEIVE_BOUNDARY_FIXTURE_ENABLED");
+    TlsReceiveBoundaryFixture tlsBoundaryFixture =
+        tlsBoundaryEnabled
+            ? TlsReceiveBoundaryFixture.start(
+                Path.of(keyStorePath), keyStorePassword, tlsProtocol)
+            : null;
 
     Server server = new Server();
     SslContextFactory.Server sslContext = new SslContextFactory.Server();
@@ -118,16 +128,29 @@ public final class ApacheJavaHttpsBackend {
     context.addServlet(new ServletHolder(new NettyHandoffServlet(tlsProtocol)), "/api/netty");
     context.addServlet(new ServletHolder(new VirtualThreadServlet(tlsProtocol)), "/api/virtual");
     context.addServlet(new ServletHolder(new BridgeDiagnosticsServlet()), "/obi-diagnostics");
+    if (tlsBoundaryFixture != null) {
+      context.addServlet(
+          new ServletHolder(new TlsReceiveBoundaryServlet(tlsBoundaryFixture, tlsProtocol)),
+          "/api/tls-boundary");
+    }
     server.setHandler(context);
 
-    Runtime.getRuntime().addShutdownHook(new Thread(() -> stop(server), "jetty-shutdown"));
-    server.start();
-    System.out.printf(
-        Locale.ROOT,
-        "Jetty HTTPS backend ready on 127.0.0.1:%d with %s and HTTP/1.1%n",
-        port,
-        tlsProtocol);
-    server.join();
+    Runtime.getRuntime()
+        .addShutdownHook(
+            new Thread(() -> stop(server, tlsBoundaryFixture), "jetty-shutdown"));
+    try {
+      server.start();
+      System.out.printf(
+          Locale.ROOT,
+          "Jetty HTTPS backend ready on 127.0.0.1:%d with %s and HTTP/1.1%n",
+          port,
+          tlsProtocol);
+      server.join();
+    } finally {
+      if (tlsBoundaryFixture != null) {
+        tlsBoundaryFixture.close();
+      }
+    }
   }
 
   private static final class HealthServlet extends HttpServlet {
@@ -185,9 +208,6 @@ public final class ApacheJavaHttpsBackend {
         }
       }
 
-      if ("1".equals(request.getParameter("close"))) {
-        response.setHeader("Connection", "close");
-      }
       writeResponse(response, request, marker, configuredProtocol);
     }
 
@@ -414,6 +434,75 @@ public final class ApacheJavaHttpsBackend {
     }
   }
 
+  private static final class TlsReceiveBoundaryServlet extends HttpServlet {
+    private final TlsReceiveBoundaryFixture fixture;
+    private final String configuredProtocol;
+
+    private TlsReceiveBoundaryServlet(
+        TlsReceiveBoundaryFixture fixture, String configuredProtocol) {
+      this.fixture = fixture;
+      this.configuredProtocol = configuredProtocol;
+    }
+
+    @Override
+    protected void doGet(HttpServletRequest request, HttpServletResponse response)
+        throws IOException {
+      String marker = validatedMarker(request, response);
+      if (marker == null) {
+        return;
+      }
+
+      TlsReceiveBoundaryFixture.Mode mode;
+      try {
+        mode = TlsReceiveBoundaryFixture.Mode.parse(request.getParameter("mode"));
+      } catch (IllegalArgumentException invalid) {
+        response.sendError(HttpServletResponse.SC_BAD_REQUEST, invalid.getMessage());
+        return;
+      }
+
+      TlsReceiveBoundaryFixture.Evidence evidence;
+      String fixtureMarker = "fixture-" + marker;
+      if (fixtureMarker.length() > 128) {
+        fixtureMarker = "fixture-" + Integer.toUnsignedString(marker.hashCode(), 36);
+      }
+      try {
+        evidence = fixture.exercise(mode, fixtureMarker);
+      } catch (IOException | IllegalStateException failure) {
+        response.sendError(
+            HttpServletResponse.SC_SERVICE_UNAVAILABLE,
+            "TLS receive-boundary fixture did not complete");
+        return;
+      }
+
+      response.setStatus(
+          evidence.passed() ? HttpServletResponse.SC_OK : HttpServletResponse.SC_CONFLICT);
+      response.setContentType("application/json");
+      response.setCharacterEncoding("US-ASCII");
+      response.setHeader("Cache-Control", "no-store");
+      Object cipherAttribute = request.getAttribute("jakarta.servlet.request.cipher_suite");
+      String cipher = cipherAttribute == null ? "" : cipherAttribute.toString();
+      try (PrintWriter writer = response.getWriter()) {
+        writer.printf(
+            Locale.ROOT,
+            "{\"marker\":\"%s\",\"secure\":%s,\"protocol\":\"%s\","
+                + "\"tls_protocol\":\"%s\",\"tls_cipher\":\"%s\","
+                + "\"backend_connection_id\":%d,\"backend_remote_port\":%d,"
+                + "\"tls_read_events\":%d,\"tls_read_bytes\":%d,"
+                + "\"tls_boundary\":%s}%n",
+            jsonEscape(marker),
+            request.isSecure(),
+            jsonEscape(request.getProtocol()),
+            jsonEscape(negotiatedProtocol(request, configuredProtocol)),
+            jsonEscape(cipher),
+            backendConnectionID(request),
+            request.getRemotePort(),
+            bridgeCounter("tlsReadEvents"),
+            bridgeCounter("tlsReadBytes"),
+            evidence.toJson().trim());
+      }
+    }
+  }
+
   private static void dispatchHandoff(
       AsyncContext async,
       HttpServletRequest request,
@@ -635,18 +724,24 @@ public final class ApacheJavaHttpsBackend {
     if ("1".equals(request.getParameter("socket_identity"))) {
       backendSocketFD = backendSocketFileDescriptor(request);
     }
+    long tlsReadEvents = bridgeCounter("tlsReadEvents");
+    long tlsReadBytes = bridgeCounter("tlsReadBytes");
 
     response.setStatus(HttpServletResponse.SC_OK);
     response.setContentType("application/json");
     response.setCharacterEncoding("UTF-8");
     response.setHeader("Cache-Control", "no-store");
+    if ("1".equals(request.getParameter("close"))) {
+      response.setHeader("Connection", "close");
+    }
     try (PrintWriter writer = response.getWriter()) {
       writer.printf(
           Locale.ROOT,
           "{\"marker\":\"%s\",\"secure\":%s,\"protocol\":\"%s\","
               + "\"tls_protocol\":\"%s\",\"tls_cipher\":\"%s\","
               + "\"backend_connection_id\":%d,\"backend_remote_port\":%d,"
-              + "\"backend_socket_fd\":%d}%n",
+              + "\"backend_socket_fd\":%d,\"tls_read_events\":%d,"
+              + "\"tls_read_bytes\":%d}%n",
           jsonEscape(marker),
           request.isSecure(),
           jsonEscape(request.getProtocol()),
@@ -654,7 +749,20 @@ public final class ApacheJavaHttpsBackend {
           jsonEscape(cipher),
           backendConnectionID,
           request.getRemotePort(),
-          backendSocketFD);
+          backendSocketFD,
+          tlsReadEvents,
+          tlsReadBytes);
+    }
+  }
+
+  private static long bridgeCounter(String method) {
+    try {
+      Class<?> bridge =
+          Class.forName("io.opentelemetry.obi.java.bridge.RemoteParentBootstrap", true, null);
+      Object value = bridge.getMethod(method).invoke(null);
+      return value instanceof Number ? ((Number) value).longValue() : -1L;
+    } catch (ReflectiveOperationException | LinkageError failure) {
+      return -1L;
     }
   }
 
@@ -831,7 +939,7 @@ public final class ApacheJavaHttpsBackend {
     return value.replace("\\", "\\\\").replace("\"", "\\\"");
   }
 
-  private static void stop(Server server) {
+  private static void stop(Server server, TlsReceiveBoundaryFixture tlsBoundaryFixture) {
     try {
       server.stop();
     } catch (Exception exception) {
@@ -843,6 +951,9 @@ public final class ApacheJavaHttpsBackend {
       NETTY_EVENT_LOOP.shutdownGracefully(0, 5, TimeUnit.SECONDS).syncUninterruptibly();
       if (VIRTUAL_EXECUTOR != null) {
         VIRTUAL_EXECUTOR.shutdownNow();
+      }
+      if (tlsBoundaryFixture != null) {
+        tlsBoundaryFixture.close();
       }
     }
   }

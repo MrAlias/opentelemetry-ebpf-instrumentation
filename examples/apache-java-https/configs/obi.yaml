@@ -27,6 +27,8 @@ attributes:
 
 ebpf:
   context_propagation: tcp
+  buffer_sizes:
+    http: 8192
   payload_extraction:
     http:
       enrichment:

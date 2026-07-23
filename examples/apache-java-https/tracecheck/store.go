@@ -104,12 +104,11 @@ func (s *Store) Snapshot(marker string) Snapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	spans := make([]Span, 0, len(s.spans))
+	retained := make([]Span, 0, len(s.spans))
 	for _, stored := range s.spans {
-		if MatchesMarker(stored.span, marker) {
-			spans = append(spans, cloneSpan(stored.span))
-		}
+		retained = append(retained, cloneSpan(stored.span))
 	}
+	spans := spansForMarker(retained, marker)
 	sortSpans(spans)
 
 	return Snapshot{
@@ -125,6 +124,74 @@ func (s *Store) Snapshot(marker string) Snapshot {
 		MaxValueBytes:             s.maxValueBytes,
 		Spans:                     spans,
 	}
+}
+
+func spansForMarker(spans []Span, marker string) []Span {
+	if marker == "" {
+		return spans
+	}
+
+	byIdentity := make(map[spanIdentity]Span, len(spans))
+	duplicates := make(map[spanIdentity]struct{})
+	for _, span := range spans {
+		identity := makeSpanIdentity(span.TraceID, span.SpanID)
+		if _, duplicate := duplicates[identity]; duplicate {
+			continue
+		}
+		if _, exists := byIdentity[identity]; exists {
+			delete(byIdentity, identity)
+			duplicates[identity] = struct{}{}
+			continue
+		}
+		byIdentity[identity] = span
+	}
+
+	included := make(map[spanIdentity]struct{}, len(spans))
+	for _, span := range spans {
+		if !MatchesMarker(span, marker) {
+			continue
+		}
+		identity := makeSpanIdentity(span.TraceID, span.SpanID)
+		if _, duplicate := duplicates[identity]; duplicate {
+			continue
+		}
+
+		current := span
+		for {
+			identity = makeSpanIdentity(current.TraceID, current.SpanID)
+			if _, duplicate := duplicates[identity]; duplicate {
+				break
+			}
+			if _, exists := included[identity]; exists {
+				break
+			}
+			included[identity] = struct{}{}
+
+			if isZeroID(current.ParentSpanID) {
+				break
+			}
+			parent, exists := byIdentity[makeSpanIdentity(current.TraceID, current.ParentSpanID)]
+			if !exists {
+				break
+			}
+			if hasMarkerAttribute(parent) && !MatchesMarker(parent, marker) {
+				break
+			}
+			current = parent
+		}
+	}
+
+	selected := make([]Span, 0, len(included))
+	for _, span := range spans {
+		identity := makeSpanIdentity(span.TraceID, span.SpanID)
+		if _, duplicate := duplicates[identity]; duplicate {
+			continue
+		}
+		if _, exists := included[identity]; exists {
+			selected = append(selected, span)
+		}
+	}
+	return selected
 }
 
 func (s *Store) recordDrop(reason *uint64) {

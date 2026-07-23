@@ -2,7 +2,7 @@ FROM maven:3.9.12-eclipse-temurin-21@sha256:c3c9d3ac4ce8431a3995c0318b8d390f448e
 
 WORKDIR /build
 COPY java/pom.xml ./pom.xml
-RUN --mount=type=cache,target=/root/.m2 mvn --batch-mode --no-transfer-progress dependency:go-offline
+RUN --mount=type=cache,target=/root/.m2 mvn --batch-mode --no-transfer-progress dependency:resolve
 COPY java/src/ ./src/
 RUN --mount=type=cache,target=/root/.m2 mvn --batch-mode --no-transfer-progress package
 

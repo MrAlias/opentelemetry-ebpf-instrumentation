@@ -41,6 +41,7 @@ services:
       TLS_KEYSTORE_PATH: /run/obi-demo/certs/server.p12
       TLS_KEYSTORE_PASSWORD: changeit
       TLS_PROTOCOL: ${BACKEND_TLS_PROTOCOL:-TLSv1.3}
+      TLS_RECEIVE_BOUNDARY_FIXTURE_ENABLED: "1"
       JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS_VALUE--javaagent:/otel/official-javaagent.jar}
       OTEL_JAVAAGENT_EXTENSIONS: ${OTEL_JAVAAGENT_EXTENSIONS_VALUE-/otel/obi-otel-extension.jar}
       OTEL_PROPAGATORS: ${OTEL_PROPAGATORS_VALUE:-obi,tracecontext,baggage}
@@ -54,7 +55,6 @@ services:
       OTEL_METRICS_EXPORTER: none
       OTEL_LOGS_EXPORTER: none
       OTEL_INSTRUMENTATION_HTTP_SERVER_CAPTURE_REQUEST_HEADERS: x-obi-demo-id
-      OTEL_INSTRUMENTATION_HTTP_SERVER_EXCLUDE_PATTERNS: /obi-diagnostics
     volumes:
       - ./.runtime/certs/server.p12:/run/obi-demo/certs/server.p12:ro
       - java-remote-parent-socket:/var/run/obi
@@ -147,6 +147,24 @@ services:
       - /fault-bridge
       - --socket
       - /var/run/obi/java-remote-parent.sock
+    volumes:
+      - java-remote-parent-socket:/var/run/obi
+    profiles:
+      - tools
+    labels: *demo-labels
+
+  security-probe:
+    image: obi-apache-java-https-tracecheck:local
+    network_mode: none
+    user: "0:0"
+    entrypoint:
+      - /security-probe
+      - --socket
+      - /var/run/obi/java-remote-parent.sock
+      - --mode
+      - ${SECURITY_PROBE_MODE:-abuse}
+      - --timeout
+      - 60s
     volumes:
       - java-remote-parent-socket:/var/run/obi
     profiles:

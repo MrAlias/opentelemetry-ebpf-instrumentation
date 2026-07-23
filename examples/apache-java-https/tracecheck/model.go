@@ -36,6 +36,11 @@ type Span struct {
 	EndUnixNano   uint64            `json:"end_unix_nano"`
 }
 
+type spanIdentity struct {
+	traceID string
+	spanID  string
+}
+
 // Snapshot contains all bounded receiver state relevant to an assertion.
 type Snapshot struct {
 	Marker                    string `json:"marker,omitempty"`
@@ -102,12 +107,30 @@ func MatchesMarker(span Span, marker string) bool {
 	if marker == "" {
 		return true
 	}
+	matched := false
 	for key, value := range span.Attributes {
-		if isMarkerAttribute(key) && value == marker {
+		if !isMarkerAttribute(key) {
+			continue
+		}
+		if value != marker {
+			return false
+		}
+		matched = true
+	}
+	return matched
+}
+
+func hasMarkerAttribute(span Span) bool {
+	for key := range span.Attributes {
+		if isMarkerAttribute(key) {
 			return true
 		}
 	}
 	return false
+}
+
+func makeSpanIdentity(traceID, spanID string) spanIdentity {
+	return spanIdentity{traceID: strings.ToLower(traceID), spanID: strings.ToLower(spanID)}
 }
 
 func MatchesEndpoint(span Span, endpoint string) bool {

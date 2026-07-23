@@ -30,6 +30,82 @@ func TestStoreIsBoundedAndFiltersMarkers(t *testing.T) {
 	}
 }
 
+func TestStoreMarkerSnapshotRetainsParentChain(t *testing.T) {
+	const marker = "bridge-request"
+	store := NewStore(10, 1024, 4096)
+	store.Add([]Span{
+		{TraceID: "trace", SpanID: "server"},
+		{TraceID: "trace", SpanID: "processing", ParentSpanID: "server"},
+		{
+			TraceID:      "trace",
+			SpanID:       "client",
+			ParentSpanID: "processing",
+			Attributes:   map[string]string{"http.request.header.x_obi_demo_id": marker},
+		},
+		{TraceID: "trace", SpanID: "unrelated", ParentSpanID: "server"},
+	})
+
+	snapshot := store.Snapshot(marker)
+	if len(snapshot.Spans) != 3 {
+		t.Fatalf("expected marker span and two ancestors, got %#v", snapshot.Spans)
+	}
+	for _, spanID := range []string{"server", "processing", "client"} {
+		found := false
+		for _, span := range snapshot.Spans {
+			if span.SpanID == spanID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("missing ancestor %q from %#v", spanID, snapshot.Spans)
+		}
+	}
+}
+
+func TestStoreMarkerSnapshotStopsAtDifferentRequestMarker(t *testing.T) {
+	store := NewStore(10, 1024, 4096)
+	store.Add([]Span{
+		{
+			TraceID:    "trace",
+			SpanID:     "wrong-parent",
+			Attributes: map[string]string{"http.request.header.x_obi_demo_id": "other"},
+		},
+		{
+			TraceID:      "trace",
+			SpanID:       "client",
+			ParentSpanID: "wrong-parent",
+			Attributes:   map[string]string{"http.request.header.x_obi_demo_id": "wanted"},
+		},
+	})
+
+	snapshot := store.Snapshot("wanted")
+	if len(snapshot.Spans) != 1 || snapshot.Spans[0].SpanID != "client" {
+		t.Fatalf("different-request ancestor leaked into snapshot: %#v", snapshot.Spans)
+	}
+}
+
+func TestStoreMarkerSnapshotRejectsConflictingDuplicateSeed(t *testing.T) {
+	store := NewStore(10, 1024, 4096)
+	store.Add([]Span{
+		{
+			TraceID:    "trace",
+			SpanID:     "duplicate",
+			Attributes: map[string]string{"http.request.header.x_obi_demo_id": "wanted"},
+		},
+		{
+			TraceID:    "trace",
+			SpanID:     "duplicate",
+			Attributes: map[string]string{"http.request.header.x_obi_demo_id": "other"},
+		},
+	})
+
+	snapshot := store.Snapshot("wanted")
+	if len(snapshot.Spans) != 0 {
+		t.Fatalf("conflicting duplicate leaked into marker snapshot: %#v", snapshot.Spans)
+	}
+}
+
 func TestStoreRejectsOversizedStringValues(t *testing.T) {
 	store := NewStore(10, 4, 1024)
 	store.Add([]Span{{SpanID: "12345"}})
@@ -121,12 +197,14 @@ func TestAssertSnapshotBridge(t *testing.T) {
 		"http.request.header.x_obi_demo_id": marker,
 		"url.path":                          "/api/echo",
 	}
-	snapshot := Snapshot{Spans: []Span{
+	spans := []Span{
 		{ServiceName: "apache-proxy", Kind: "SERVER", TraceID: "trace", SpanID: "apache-server", Attributes: requestAttributes},
-		{ServiceName: "apache-proxy", Kind: "CLIENT", TraceID: "trace", SpanID: "parent", ParentSpanID: "apache-server", Attributes: requestAttributes},
+		{ServiceName: "apache-proxy", Kind: "CLIENT", TraceID: "trace", SpanID: "parent", ParentSpanID: "apache-server", Attributes: map[string]string{"url.path": "/api/echo"}},
 		{ServiceName: "java-backend", Kind: "SERVER", TraceID: "trace", SpanID: "server", ParentSpanID: "parent", Flags: spanFlagsParentRemoteKnown | spanFlagsParentRemote, Attributes: requestAttributes},
-	}}
-	snapshot.Marker = marker
+	}
+	store := NewStore(10, 1024, 4096)
+	store.Add(spans)
+	snapshot := store.Snapshot(marker)
 
 	err := AssertSnapshot(snapshot, Expectation{
 		Mode:          ModeBridge,

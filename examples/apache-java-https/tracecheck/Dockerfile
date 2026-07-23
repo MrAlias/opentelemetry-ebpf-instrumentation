@@ -16,10 +16,14 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -trimpath -o /out/fault-bridge \
     ./examples/apache-java-https/tracecheck/cmd/faultbridge
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath -o /out/security-probe \
+    ./examples/apache-java-https/tracecheck/cmd/securityprobe
 
 FROM scratch
 COPY --from=builder /out/trace-receiver /trace-receiver
 COPY --from=builder /out/trace-scenario /trace-scenario
 COPY --from=builder /out/map-pressure /map-pressure
 COPY --from=builder /out/fault-bridge /fault-bridge
+COPY --from=builder /out/security-probe /security-probe
 ENTRYPOINT ["/trace-receiver"]

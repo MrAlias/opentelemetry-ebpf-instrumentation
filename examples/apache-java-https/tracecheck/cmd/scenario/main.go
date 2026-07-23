@@ -55,6 +55,7 @@ type requestCase struct {
 	VirtualCancel   bool   `json:"virtual_cancel,omitempty"`
 	NettyCancel     bool   `json:"netty_cancel,omitempty"`
 	DispatchRounds  int    `json:"dispatch_rounds,omitempty"`
+	TLSBoundaryMode string `json:"tls_boundary_mode,omitempty"`
 	DelayMillis     int    `json:"-"`
 	SlowBodyBytes   int    `json:"-"`
 	CloseConnection bool   `json:"-"`
@@ -62,22 +63,38 @@ type requestCase struct {
 }
 
 type backendResponse struct {
-	Marker              string `json:"marker"`
-	Secure              bool   `json:"secure"`
-	Protocol            string `json:"protocol"`
-	TLSProtocol         string `json:"tls_protocol"`
-	TLSCipher           string `json:"tls_cipher"`
-	BackendConnectionID uint64 `json:"backend_connection_id"`
-	BackendRemotePort   int    `json:"backend_remote_port"`
-	BackendSocketFD     int    `json:"backend_socket_fd,omitempty"`
-	Workload            string `json:"workload,omitempty"`
-	HandoffHops         string `json:"handoff_hops,omitempty"`
-	HandoffFault        string `json:"handoff_fault,omitempty"`
-	VirtualMixed        string `json:"virtual_mixed,omitempty"`
-	VirtualCancel       string `json:"virtual_cancel,omitempty"`
-	NettyCancel         string `json:"netty_cancel,omitempty"`
-	DispatchRounds      string `json:"dispatch_rounds,omitempty"`
-	DispatchInvocations string `json:"dispatch_invocations,omitempty"`
+	Marker              string               `json:"marker"`
+	Secure              bool                 `json:"secure"`
+	Protocol            string               `json:"protocol"`
+	TLSProtocol         string               `json:"tls_protocol"`
+	TLSCipher           string               `json:"tls_cipher"`
+	BackendConnectionID uint64               `json:"backend_connection_id"`
+	BackendRemotePort   int                  `json:"backend_remote_port"`
+	BackendSocketFD     int                  `json:"backend_socket_fd,omitempty"`
+	TLSReadEvents       int64                `json:"tls_read_events"`
+	TLSReadBytes        int64                `json:"tls_read_bytes"`
+	Workload            string               `json:"workload,omitempty"`
+	HandoffHops         string               `json:"handoff_hops,omitempty"`
+	HandoffFault        string               `json:"handoff_fault,omitempty"`
+	VirtualMixed        string               `json:"virtual_mixed,omitempty"`
+	VirtualCancel       string               `json:"virtual_cancel,omitempty"`
+	NettyCancel         string               `json:"netty_cancel,omitempty"`
+	DispatchRounds      string               `json:"dispatch_rounds,omitempty"`
+	DispatchInvocations string               `json:"dispatch_invocations,omitempty"`
+	TLSBoundary         *tlsBoundaryEvidence `json:"tls_boundary,omitempty"`
+}
+
+type tlsBoundaryEvidence struct {
+	Mode                             string `json:"mode"`
+	Passed                           bool   `json:"passed"`
+	ShapeExact                       bool   `json:"shape_exact"`
+	ExpectedPlaintextCallbackLengths []int  `json:"expected_plaintext_callback_lengths"`
+	ActualPlaintextCallbackLengths   []int  `json:"actual_plaintext_callback_lengths"`
+	RequestOrder                     []int  `json:"request_order"`
+	ResponseOrder                    []int  `json:"response_order"`
+	BuffersForwardedUnchanged        bool   `json:"buffers_forwarded_unchanged"`
+	HandoffBeforeParse               bool   `json:"handoff_before_parse"`
+	ConnectionClosed                 bool   `json:"connection_closed"`
 }
 
 type caseResult struct {
@@ -170,7 +187,7 @@ func parseFlags() config {
 	var cfg config
 	flag.StringVar(&cfg.baseURL, "base-url", "http://127.0.0.1:18080", "Apache base URL")
 	flag.StringVar(&cfg.receiverURL, "receiver-url", "http://127.0.0.1:14318", "trace receiver base URL")
-	flag.StringVar(&cfg.scenario, "scenario", "basic", "basic, keepalive, pipelining, concurrency, connection-churn, fd-port-reuse, slow-body, timeout-retry, pressure, handoff, virtual-thread, netty, dispatch, w3c, w3c-match, obi-flags, w3c-fault, w3c-only, restart-fault, fail-open, restart, disabled, or uninstrumented")
+	flag.StringVar(&cfg.scenario, "scenario", "basic", "basic, keepalive, pipelining, concurrency, connection-churn, fd-port-reuse, slow-body, tls-boundary, timeout-retry, pressure, handoff, virtual-thread, netty, dispatch, w3c, w3c-match, obi-flags, w3c-fault, w3c-only, restart-fault, fail-open, restart, disabled, or uninstrumented")
 	flag.IntVar(&cfg.requestCount, "requests", 0, "number of requests (zero selects a scenario default)")
 	flag.DurationVar(&cfg.timeout, "timeout", 45*time.Second, "whole-scenario timeout")
 	flag.StringVar(&cfg.expectedTLS, "expected-tls", "TLSv1.3", "backend TLS protocol")
@@ -186,7 +203,7 @@ func parseFlags() config {
 	validScenarios := map[string]bool{
 		"basic": true, "keepalive": true, "pipelining": true, "concurrency": true,
 		"connection-churn": true, "fd-port-reuse": true,
-		"slow-body": true, "timeout-retry": true,
+		"slow-body": true, "tls-boundary": true, "timeout-retry": true,
 		"pressure": true,
 		"handoff":  true, "virtual-thread": true, "netty": true, "dispatch": true,
 		"w3c": true, "w3c-match": true, "obi-flags": true, "w3c-fault": true,
@@ -249,6 +266,9 @@ func run(ctx context.Context, cfg config) (*runResult, error) {
 	if err := validateConnectionShape(cfg.scenario, responses, evidence); err != nil {
 		return result, err
 	}
+	if err := validateTLSReadShape(cfg.scenario, requests, responses); err != nil {
+		return result, err
+	}
 
 	snapshots, err := awaitAssertions(ctx, cfg, requests)
 	for i := range snapshots {
@@ -291,14 +311,23 @@ func makeRequests(cfg config) ([]requestCase, error) {
 			count = 128
 		case "handoff", "virtual-thread", "netty", "dispatch":
 			count = 4
-		case "w3c", "obi-flags", "w3c-fault":
+		case "w3c", "obi-flags", "w3c-fault", "tls-boundary":
 			count = 2
 		default:
 			count = 1
 		}
 	}
-	if (cfg.scenario == "pipelining" || cfg.scenario == "fd-port-reuse") && count < 2 {
+	if (cfg.scenario == "keepalive" || cfg.scenario == "pipelining") && count < 3 {
+		return nil, fmt.Errorf("scenario %s requires at least three requests", cfg.scenario)
+	}
+	if cfg.scenario == "fd-port-reuse" && count < 2 {
 		return nil, fmt.Errorf("scenario %s requires at least two requests", cfg.scenario)
+	}
+	if cfg.scenario == "slow-body" && count < 2 {
+		return nil, fmt.Errorf("scenario %s requires at least two requests", cfg.scenario)
+	}
+	if cfg.scenario == "tls-boundary" && count != 2 {
+		return nil, fmt.Errorf("scenario %s requires exactly two requests", cfg.scenario)
 	}
 
 	requests := make([]requestCase, count)
@@ -319,7 +348,7 @@ func makeRequests(cfg config) ([]requestCase, error) {
 			requests[i].ObserveSocket = true
 		}
 		if cfg.scenario == "slow-body" {
-			requests[i].SlowBodyBytes = 4096
+			requests[i].SlowBodyBytes = 64 << 10
 		}
 		if cfg.scenario == "pressure" {
 			requests[i].Endpoint = "/api/handoff"
@@ -344,6 +373,14 @@ func makeRequests(cfg config) ([]requestCase, error) {
 		if cfg.scenario == "dispatch" {
 			requests[i].Endpoint = "/api/dispatch"
 			requests[i].DispatchRounds = 1 + i%8
+		}
+		if cfg.scenario == "tls-boundary" {
+			requests[i].Endpoint = "/api/tls-boundary"
+			if i == 0 {
+				requests[i].TLSBoundaryMode = "split"
+			} else {
+				requests[i].TLSBoundaryMode = "coalesced"
+			}
 		}
 		switch cfg.scenario {
 		case "w3c":
@@ -384,6 +421,13 @@ func makeRequests(cfg config) ([]requestCase, error) {
 				return nil, err
 			}
 		}
+	}
+	if parallelScenario(cfg.scenario) {
+		for i := range requests {
+			requests[i].CloseConnection = true
+		}
+	} else {
+		requests[len(requests)-1].CloseConnection = true
 	}
 	return requests, nil
 }
@@ -835,6 +879,11 @@ func newHTTPRequest(ctx context.Context, cfg config, requestCase requestCase) (*
 		query.Set("rounds", strconv.Itoa(requestCase.DispatchRounds))
 		requestURL.RawQuery = query.Encode()
 	}
+	if requestCase.Endpoint == "/api/tls-boundary" {
+		query := requestURL.Query()
+		query.Set("mode", requestCase.TLSBoundaryMode)
+		requestURL.RawQuery = query.Encode()
+	}
 
 	method := http.MethodGet
 	var requestBody io.Reader
@@ -982,8 +1031,55 @@ func validateWorkloadResponse(request requestCase, response backendResponse) err
 				response.DispatchInvocations,
 			)
 		}
+	case "/api/tls-boundary":
+		return validateTLSBoundaryResponse(request, response)
 	}
 	return nil
+}
+
+func validateTLSBoundaryResponse(request requestCase, response backendResponse) error {
+	evidence := response.TLSBoundary
+	if evidence == nil {
+		return errors.New("TLS boundary response omitted fixture evidence")
+	}
+	if evidence.Mode != request.TLSBoundaryMode || !evidence.Passed || !evidence.ShapeExact ||
+		!equalInts(evidence.ExpectedPlaintextCallbackLengths, evidence.ActualPlaintextCallbackLengths) ||
+		!evidence.BuffersForwardedUnchanged || !evidence.HandoffBeforeParse ||
+		!evidence.ConnectionClosed {
+		return fmt.Errorf("TLS boundary evidence failed for mode %s: %+v", request.TLSBoundaryMode, evidence)
+	}
+
+	expectedOrder := []int{1}
+	expectedCallbacks := 2
+	if request.TLSBoundaryMode == "coalesced" {
+		expectedOrder = []int{1, 2}
+		expectedCallbacks = 1
+	}
+	if len(evidence.ExpectedPlaintextCallbackLengths) != expectedCallbacks ||
+		!equalInts(evidence.RequestOrder, expectedOrder) ||
+		!equalInts(evidence.ResponseOrder, expectedOrder) {
+		return fmt.Errorf("TLS boundary evidence had the wrong deterministic shape for mode %s: %+v", request.TLSBoundaryMode, evidence)
+	}
+	for _, length := range evidence.ExpectedPlaintextCallbackLengths {
+		if length <= 0 || length > tlsBoundaryMaxHTTPBytes {
+			return fmt.Errorf("TLS boundary callback length is out of bounds: %d", length)
+		}
+	}
+	return nil
+}
+
+const tlsBoundaryMaxHTTPBytes = 16 * 1024
+
+func equalInts(left, right []int) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func exerciseTimeoutCancellation(ctx context.Context, cfg config) (faultResult, error) {
@@ -1040,6 +1136,8 @@ func expectationFor(cfg config, request requestCase) tracecheck.Expectation {
 	expectedTraceFlags := request.W3CTraceFlags
 	javaTraceFlags := ""
 	switch cfg.scenario {
+	case "pipelining":
+		mode = tracecheck.ModePipelinedBridge
 	case "disabled":
 		mode = tracecheck.ModeDisabled
 	case "uninstrumented":
@@ -1075,10 +1173,21 @@ func expectationFor(cfg config, request requestCase) tracecheck.Expectation {
 	}
 }
 
+type snapshotFetcher func(context.Context, string, string) (tracecheck.Snapshot, error)
+
 func awaitAssertions(
 	ctx context.Context,
 	cfg config,
 	requests []requestCase,
+) ([]tracecheck.Snapshot, error) {
+	return awaitAssertionsWithFetcher(ctx, cfg, requests, fetchSnapshot)
+}
+
+func awaitAssertionsWithFetcher(
+	ctx context.Context,
+	cfg config,
+	requests []requestCase,
+	fetch snapshotFetcher,
 ) ([]tracecheck.Snapshot, error) {
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
@@ -1088,16 +1197,29 @@ func awaitAssertions(
 
 	for {
 		valid := true
+		var firstPassErr error
+		var lastPassErr error
+		failedMarkers := 0
 		for i := range requests {
-			snapshot, err := fetchSnapshot(ctx, cfg.receiverURL, requests[i].Marker)
+			snapshot, err := fetch(ctx, cfg.receiverURL, requests[i].Marker)
 			if err == nil {
 				snapshots[i] = snapshot
 				err = tracecheck.AssertSnapshot(snapshot, expectationFor(cfg, requests[i]))
 			}
 			if err != nil {
 				valid = false
-				lastErr = fmt.Errorf("marker %s: %w", requests[i].Marker, err)
-				break
+				failedMarkers++
+				markerErr := fmt.Errorf("marker %s: %w", requests[i].Marker, err)
+				if firstPassErr == nil {
+					firstPassErr = markerErr
+				}
+				lastPassErr = markerErr
+			}
+		}
+		if firstPassErr != nil {
+			lastErr = firstPassErr
+			if failedMarkers > 1 {
+				lastErr = fmt.Errorf("first result: %w; last result: %w", firstPassErr, lastPassErr)
 			}
 		}
 
@@ -1141,6 +1263,40 @@ func fetchSnapshot(ctx context.Context, receiverURL, marker string) (tracecheck.
 	return snapshot, nil
 }
 
+func validateTLSReadShape(
+	scenario string,
+	requests []requestCase,
+	responses []backendResponse,
+) error {
+	if scenario != "slow-body" {
+		return nil
+	}
+	if len(requests) < 2 || len(responses) != len(requests) {
+		return errors.New("slow-body TLS read evidence requires at least two complete requests")
+	}
+
+	for index := 1; index < len(responses); index++ {
+		previous := responses[index-1]
+		current := responses[index]
+		if previous.TLSReadEvents < 0 || previous.TLSReadBytes < 0 ||
+			current.TLSReadEvents < 0 || current.TLSReadBytes < 0 {
+			return errors.New("backend TLS read diagnostics are unavailable")
+		}
+		readEvents := current.TLSReadEvents - previous.TLSReadEvents
+		readBytes := current.TLSReadBytes - previous.TLSReadBytes
+		if readEvents < 2 || readBytes < int64(requests[index].SlowBodyBytes) {
+			return fmt.Errorf(
+				"request %d did not prove split decrypted reads: events=%d bytes=%d body=%d",
+				index,
+				readEvents,
+				readBytes,
+				requests[index].SlowBodyBytes,
+			)
+		}
+	}
+	return nil
+}
+
 func validateConnectionShape(
 	scenario string,
 	responses []backendResponse,
@@ -1155,8 +1311,8 @@ func validateConnectionShape(
 	}
 	switch scenario {
 	case "keepalive":
-		if len(connectionIDs) != 1 {
-			return fmt.Errorf("expected one reused Apache-to-Jetty connection, observed backend connection IDs %v", sortedConnectionIDs(connectionIDs))
+		if err := validateReuseBeforeTerminalClose(responses, connectionIDs); err != nil {
+			return err
 		}
 	case "concurrency":
 		if len(responses) > 1 && len(connectionIDs) < 2 {
@@ -1171,6 +1327,9 @@ func validateConnectionShape(
 			evidence.PipelinedRequests != len(responses) ||
 			evidence.RequestsWrittenBeforeFirstRead != len(responses) {
 			return fmt.Errorf("pipeline evidence is incomplete: %+v", evidence)
+		}
+		if err := validateReuseBeforeTerminalClose(responses, connectionIDs); err != nil {
+			return err
 		}
 	case "fd-port-reuse":
 		if evidence == nil {
@@ -1192,6 +1351,34 @@ func validateConnectionShape(
 			return fmt.Errorf("expected one Jetty descriptor to be reused across distinct stable Jetty connections: %+v", evidence)
 		}
 	}
+	return nil
+}
+
+func validateReuseBeforeTerminalClose(
+	responses []backendResponse,
+	connectionIDs map[uint64]struct{},
+) error {
+	if len(responses) < 3 {
+		return errors.New("expected at least two requests before the terminal backend close")
+	}
+
+	reusedID := responses[0].BackendConnectionID
+	for _, response := range responses[1 : len(responses)-1] {
+		if response.BackendConnectionID != reusedID {
+			return fmt.Errorf(
+				"expected pre-terminal requests to reuse backend connection %d, observed backend connection IDs %v",
+				reusedID,
+				sortedConnectionIDs(connectionIDs),
+			)
+		}
+	}
+	if len(connectionIDs) > 2 {
+		return fmt.Errorf(
+			"expected at most one terminal backend connection, observed backend connection IDs %v",
+			sortedConnectionIDs(connectionIDs),
+		)
+	}
+
 	return nil
 }
 
@@ -1224,7 +1411,8 @@ func validateDistinctParents(scenario, javaService string, cases []caseResult) e
 }
 
 func distinctParentScenario(scenario string) bool {
-	return parallelScenario(scenario) || scenario == "pipelining" || scenario == "fd-port-reuse"
+	return parallelScenario(scenario) || scenario == "pipelining" ||
+		scenario == "fd-port-reuse" || scenario == "tls-boundary"
 }
 
 func parallelScenario(scenario string) bool {

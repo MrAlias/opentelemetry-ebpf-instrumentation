@@ -2,12 +2,16 @@
 # Copyright The OpenTelemetry Authors
 # SPDX-License-Identifier: Apache-2.0
 
+# This harness intentionally overrides sourced run.sh globals and functions in isolated subshells.
+# shellcheck disable=SC2016,SC2030,SC2031,SC2034,SC2329
+
 set -Eeuo pipefail
 
 TEST_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly TEST_SCRIPT_DIR
 
 # shellcheck source=../run.sh
+# shellcheck disable=SC1091 # Resolved from BASH_SOURCE at runtime.
 source "$TEST_SCRIPT_DIR/../run.sh"
 
 TEST_TMP_DIR=""
@@ -201,8 +205,12 @@ test_benchmark_controls_are_bounded() {
     printf 'accepted a non-numeric scenario seed\n' >&2
     return 1
   fi
-  if (parse_args --scenario pipelining --requests 1) >/dev/null 2>&1; then
-    printf 'accepted a pipeline with fewer than two requests\n' >&2
+  if (parse_args --scenario keepalive --requests 2) >/dev/null 2>&1; then
+    printf 'accepted keepalive without two pre-terminal requests\n' >&2
+    return 1
+  fi
+  if (parse_args --scenario pipelining --requests 2) >/dev/null 2>&1; then
+    printf 'accepted a pipeline without two pre-terminal requests\n' >&2
     return 1
   fi
   if (parse_args --scenario fd-port-reuse --requests 1) >/dev/null 2>&1; then
@@ -213,10 +221,11 @@ test_benchmark_controls_are_bounded() {
 
 test_all_suite_includes_every_scenario() {
   local -r actual="$TEST_TMP_DIR/all-scenarios.txt"
-  local -r expected=$'basic\nkeepalive\npipelining\nconcurrency\nconnection-churn\nfd-port-reuse\nslow-body\ntimeout-retry\npressure\nhandoff\nvirtual-thread\nnetty\ndispatch\nw3c\nw3c-match\nobi-flags\nfail-open\nw3c-only\nrestart\nrestart-fault\ndisabled\nw3c-only\nw3c-only\nuninstrumented'
+  local -r expected=$'basic\nsecurity\nkeepalive\npipelining\nconcurrency\nconnection-churn\nfd-port-reuse\nslow-body\ntls-boundary\ntimeout-retry\npressure\nhandoff\nvirtual-thread\nnetty\ndispatch\nw3c\nw3c-match\nobi-flags\nfail-open\nw3c-only\nrestart\nrestart-fault\ndisabled\nw3c-only\nw3c-only\nuninstrumented'
 
   (
     SCENARIO=all
+    SELECTED_TRANSPORT=getsockopt
     run_scenario() {
       printf '%s\n' "$1" >>"$actual"
     }
@@ -230,6 +239,9 @@ test_all_suite_includes_every_scenario() {
     }
     record_unsupported_scenario() {
       return 0
+    }
+    run_primary_security_control() {
+      run_scenario security
     }
     run_disabled_control() {
       run_scenario disabled
@@ -259,6 +271,7 @@ test_unix_all_suite_includes_fault_control() {
   (
     SCENARIO=all
     TRANSPORT=unix
+    SELECTED_TRANSPORT=unix
     run_scenario() {
       printf '%s\n' "$1" >>"$actual"
     }
@@ -267,6 +280,9 @@ test_unix_all_suite_includes_fault_control() {
     }
     run_w3c_fault_control() {
       run_scenario w3c-fault
+    }
+    run_unix_security_control() {
+      run_scenario security
     }
     run_late_attach_control() {
       run_scenario fail-open
@@ -289,8 +305,9 @@ test_unix_all_suite_includes_fault_control() {
     execute_requested_scenarios
   )
 
-  [[ "$(<"$actual")" == *$'obi-flags\nw3c-fault\nfail-open'* ]] || {
-    printf 'Unix all suite omitted the bounded W3C fault control\n' >&2
+  [[ "$(<"$actual")" == *$'basic\nsecurity\nkeepalive'* && \
+    "$(<"$actual")" == *$'obi-flags\nw3c-fault\nfail-open'* ]] || {
+    printf 'Unix all suite omitted the security or bounded W3C fault control\n' >&2
     return 1
   }
 }
@@ -310,6 +327,50 @@ test_w3c_fault_requires_forced_unix() {
     parse_args --transport unix --scenario w3c-fault --requests 3
   ) >/dev/null 2>&1; then
     printf 'accepted an invalid W3C fault request count\n' >&2
+    return 1
+  fi
+}
+
+test_security_accepts_enabled_transports() {
+  local transport=""
+
+  for transport in getsockopt unix auto; do
+    (
+      TRANSPORT=getsockopt
+      SCENARIO=all
+      parse_args --transport "$transport" --scenario security
+      [[ "$TRANSPORT" == "$transport" && "$SCENARIO" == "security" ]]
+    ) || {
+      printf 'rejected the security control for %s transport\n' "$transport" >&2
+      return 1
+    }
+  done
+  if (
+    TRANSPORT=getsockopt
+    SCENARIO=all
+    parse_args --transport disabled --scenario security
+  ) >/dev/null 2>&1; then
+    printf 'accepted the security control with disabled transport\n' >&2
+    return 1
+  fi
+}
+
+test_tls_boundary_requires_both_deterministic_modes() {
+  (
+    SCENARIO=all
+    REQUEST_COUNT=0
+    parse_args --scenario tls-boundary --requests 2
+    [[ "$SCENARIO" == "tls-boundary" && "$REQUEST_COUNT" == "2" ]]
+  ) || {
+    printf 'rejected the exact two-case TLS boundary scenario\n' >&2
+    return 1
+  }
+  if (
+    SCENARIO=all
+    REQUEST_COUNT=0
+    parse_args --scenario tls-boundary --requests 1
+  ) >/dev/null 2>&1; then
+    printf 'accepted a TLS boundary run without both deterministic modes\n' >&2
     return 1
   fi
 }
@@ -392,10 +453,11 @@ test_bridge_artifact_metadata() {
 
 test_agent_download_rejects_symlink_output() {
   local -r download_script="$TEST_SCRIPT_DIR/download-agent.sh"
+  local -r download_root="$TEST_TMP_DIR/agent-download"
 
-  mkdir -p -- "$TEST_TMP_DIR/real-artifacts"
-  ln -s -- "$TEST_TMP_DIR/real-artifacts" "$TEST_TMP_DIR/artifacts"
-  if "$download_script" --distribution otel --output "$TEST_TMP_DIR/artifacts" >/dev/null 2>&1; then
+  mkdir -p -- "$download_root/real-artifacts"
+  ln -s -- "$download_root/real-artifacts" "$download_root/artifacts"
+  if "$download_script" --distribution otel --output "$download_root/artifacts" >/dev/null 2>&1; then
     printf 'agent downloader accepted a symlink output directory\n' >&2
     return 1
   fi
@@ -481,7 +543,7 @@ test_pressure_monitor_requires_full_occupancy() {
   (
     RESULT_DIR="$TEST_TMP_DIR/pressure-monitor-success"
     mkdir -p -- "$RESULT_DIR"
-    PRESSURE_LABEL=pressure-test
+    PRESSURE_LABEL="pressure-test"
     PRESSURE_MAP_ID=41
     PRESSURE_MAP_MAX_ENTRIES=10
     fetch_obi_metrics() {
@@ -509,13 +571,37 @@ test_bridge_take_count_includes_cancelled_request() {
     printf 'timeout/retry bridge take count omitted the cancelled request\n' >&2
     return 1
   }
+  [[ "$(scenario_bridge_missing_count basic true getsockopt)" == "0" &&
+    "$(scenario_java_missing_count basic true)" == "1" ]] || {
+    printf 'getsockopt diagnostics miss expectations were conflated\n' >&2
+    return 1
+  }
+  [[ "$(scenario_bridge_missing_count basic true unix)" == "1" &&
+    "$(scenario_java_missing_count basic true)" == "1" ]] || {
+    printf 'Unix diagnostics miss expectations did not include the transport lookup\n' >&2
+    return 1
+  }
+  [[ "$(scenario_bridge_missing_count tls-boundary true getsockopt)" == "0" &&
+    "$(scenario_java_missing_count tls-boundary true)" == "4" ]] || {
+    printf 'getsockopt TLS-boundary miss expectations were not local-only\n' >&2
+    return 1
+  }
+  [[ "$(scenario_bridge_missing_count tls-boundary true unix)" == "4" &&
+    "$(scenario_java_missing_count tls-boundary true)" == "4" ]] || {
+    printf 'Unix TLS-boundary miss expectations omitted transport lookups\n' >&2
+    return 1
+  }
 }
 
 test_bridge_metric_delta_requires_exact_one_shot_results() {
   local -r delta="$TEST_TMP_DIR/w3c-metrics.delta"
 
   cat >"$delta" <<'EOF'
+obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=3 after=5 delta=2
+obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} before=3 after=5 delta=2
 obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=3 after=5 delta=2
+obi_java_remote_parent_operations_total{operation="candidate",status="ambiguous",transport="tcp"} before=1 after=3 delta=2
+obi_java_remote_parent_operations_total{operation="cleanup",status="valid",transport="tcp"} before=0 after=16 delta=16
 obi_java_remote_parent_operations_total{operation="negotiate",status="missing",transport="getsockopt"} before=3 after=5 delta=2
 obi_java_remote_parent_operations_total{operation="discard",status="valid",transport="getsockopt"} before=1 after=1 delta=0
 obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} before=3 after=5 delta=2
@@ -525,11 +611,208 @@ EOF
     printf 'bridge metric delta rejected exact one-shot results\n' >&2
     return 1
   }
+  sed -i 's/operation="inject",status="valid",transport="tcp"} before=3 after=5 delta=2/operation="inject",status="valid",transport="tcp"} before=3 after=6 delta=3/' "$delta"
+  if assert_bridge_metric_delta "$delta" getsockopt 2 0 >/dev/null 2>&1; then
+    printf 'bridge metric delta accepted a duplicate injection\n' >&2
+    return 1
+  fi
+  sed -i 's/operation="inject",status="valid",transport="tcp"} before=3 after=6 delta=3/operation="inject",status="valid",transport="tcp"} before=3 after=5 delta=2/' "$delta"
   sed -i 's/status="missing",transport="getsockopt"} before=0 after=0 delta=0/status="missing",transport="getsockopt"} before=0 after=1 delta=1/' "$delta"
   if assert_bridge_metric_delta "$delta" getsockopt 2 0 >/dev/null 2>&1; then
     printf 'bridge metric delta accepted an unexpected lookup result\n' >&2
     return 1
   fi
+  assert_bridge_metric_delta "$delta" getsockopt 2 0 1 || {
+    printf 'bridge metric delta rejected the exact diagnostics self-probe miss\n' >&2
+    return 1
+  }
+
+  sed -i 's/status="missing",transport="getsockopt"} before=0 after=1 delta=1/status="missing",transport="getsockopt"} before=0 after=0 delta=0/' "$delta"
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="candidate",status="overload",transport="tcp"} before=0 after=1 delta=1' \
+    >>"$delta"
+  if assert_bridge_metric_delta "$delta" getsockopt 2 0 >/dev/null 2>&1; then
+    printf 'bridge metric delta accepted candidate overload\n' >&2
+    return 1
+  fi
+}
+
+test_primary_security_metrics_are_explicitly_scoped() {
+  local -r delta="$TEST_TMP_DIR/primary-security-metrics.delta"
+  local -r sibling_delta="$TEST_TMP_DIR/primary-security-sibling-metrics.delta"
+
+  cat >"$delta" <<'EOF'
+obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=3 after=5 delta=2
+obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} before=3 after=5 delta=2
+obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=3 after=5 delta=2
+obi_java_remote_parent_operations_total{operation="negotiate",status="missing",transport="getsockopt"} before=3 after=5 delta=2
+obi_java_remote_parent_operations_total{operation="negotiate",status="unauthorized",transport="getsockopt"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} before=3 after=5 delta=2
+obi_java_remote_parent_operations_total{operation="take",status="unauthorized",transport="getsockopt"} before=4 after=12 delta=8
+EOF
+  if (
+    ALLOW_PRIMARY_SECURITY_METRICS=false
+    assert_bridge_metric_delta "$delta" getsockopt 2 0
+  ) >/dev/null 2>&1; then
+    printf 'bridge metrics accepted abuse traffic without the scoped policy\n' >&2
+    return 1
+  fi
+  (
+    ALLOW_PRIMARY_SECURITY_METRICS=true
+    assert_bridge_metric_delta "$delta" getsockopt 2 0
+  ) || {
+    printf 'bridge metrics rejected explicitly scoped primary abuse traffic\n' >&2
+    return 1
+  }
+  assert_primary_security_metric_delta "$delta" negotiate 1
+  assert_primary_security_metric_delta "$delta" take 8
+  if assert_primary_security_metric_delta "$delta" take 9 >/dev/null 2>&1; then
+    printf 'primary security metrics accepted an unmet minimum\n' >&2
+    return 1
+  fi
+
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} before=3 after=5 delta=2' \
+    >"$sibling_delta"
+  assert_primary_security_metric_delta "$sibling_delta" negotiate 0 0
+  assert_primary_security_metric_delta "$sibling_delta" take 0 0
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="take",status="unauthorized",transport="getsockopt"} before=0 after=1 delta=1' \
+    >>"$sibling_delta"
+  if assert_primary_security_metric_delta "$sibling_delta" take 0 0 >/dev/null 2>&1; then
+    printf 'sibling security control accepted an intercepted take\n' >&2
+    return 1
+  fi
+}
+
+test_primary_security_identity_requires_same_cgroup_and_nonroot_user() {
+  local -r java_cgroup="$TEST_TMP_DIR/primary-java.cgroup"
+  local -r probe_cgroup="$TEST_TMP_DIR/primary-probe.cgroup"
+  local -r probe_status="$TEST_TMP_DIR/primary-probe.status"
+
+  printf '0::/demo/java\n' >"$java_cgroup"
+  printf '0::/demo/java\n' >"$probe_cgroup"
+  cat >"$probe_status" <<'EOF'
+Name:	security-probe
+Uid:	65534	65534	65534	65534
+Gid:	65534	65534	65534	65534
+EOF
+  assert_primary_security_cgroup_identity \
+    "$java_cgroup" "$probe_cgroup" "$probe_status"
+
+  printf '0::/demo/sibling\n' >"$probe_cgroup"
+  if assert_primary_security_cgroup_identity \
+    "$java_cgroup" "$probe_cgroup" "$probe_status" >/dev/null 2>&1; then
+    printf 'primary security identity accepted a sibling cgroup\n' >&2
+    return 1
+  fi
+
+  printf '0::/demo/java\n' >"$probe_cgroup"
+  sed -i 's/65534/0/g' "$probe_status"
+  if assert_primary_security_cgroup_identity \
+    "$java_cgroup" "$probe_cgroup" "$probe_status" >/dev/null 2>&1; then
+    printf 'primary security identity accepted a root probe\n' >&2
+    return 1
+  fi
+}
+
+test_unix_security_metrics_require_explicit_race_scope() {
+  local -r delta="$TEST_TMP_DIR/unix-security-race-metrics.delta"
+
+  cat >"$delta" <<'EOF'
+obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=3 after=5 delta=2
+obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} before=3 after=5 delta=2
+obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=3 after=5 delta=2
+obi_java_remote_parent_operations_total{operation="take",status="valid",transport="unix"} before=3 after=5 delta=2
+obi_java_remote_parent_operations_total{operation="take",status="unauthorized",transport="unix"} before=4 after=12 delta=8
+EOF
+  if (
+    ALLOW_UNIX_SECURITY_METRICS=false
+    assert_bridge_metric_delta "$delta" unix 2 0
+  ) >/dev/null 2>&1; then
+    printf 'bridge metrics accepted Unix abuse without the scoped race policy\n' >&2
+    return 1
+  fi
+  (
+    ALLOW_UNIX_SECURITY_METRICS=true
+    assert_bridge_metric_delta "$delta" unix 2 0
+  ) || {
+    printf 'bridge metrics rejected explicitly scoped Unix abuse traffic\n' >&2
+    return 1
+  }
+  assert_security_metric_delta "$delta" take unauthorized unix 8 8
+}
+
+test_permissive_unix_directory_control_refuses_and_restores() {
+  local -r result_dir="$TEST_TMP_DIR/permissive-directory-control"
+  local -r observed="$result_dir/observed"
+
+  mkdir -p -- "$result_dir"
+  (
+    RESULT_DIR="$result_dir"
+    COMPOSE=(test-compose)
+    BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=unix
+    UNIX_SECURITY_DIRECTORY_RELAXED=false
+    directory_mode=0750
+    run_bounded() {
+      shift
+      case " $* " in
+        *" chmod 0777 /var/run/obi "*)
+          directory_mode=0777
+          ;;
+        *" chmod 0750 /var/run/obi "*)
+          directory_mode=0750
+          ;;
+        *" ls -ld /var/run/obi "*)
+          if [[ "$directory_mode" == "0777" ]]; then
+            printf 'drwxrwxrwx 2 root root 40 Jul 22 00:00 /var/run/obi\n'
+          else
+            printf 'drwxr-x--- 2 root root 40 Jul 22 00:00 /var/run/obi\n'
+          fi
+          ;;
+        *" test -S /var/run/obi/java-remote-parent.sock "*)
+          return 1
+          ;;
+        *" logs --no-color "*)
+          printf 'must not be group writable or world accessible\n'
+          ;;
+      esac
+      printf '%s\n' "$*" >>"$observed"
+    }
+    wait_for_log() {
+      printf 'wait:%s\n' "$2" >>"$observed"
+    }
+    assert_selected_transport() {
+      SELECTED_TRANSPORT=unix
+    }
+    date() {
+      printf 'security-cursor\n'
+    }
+    curl() {
+      local output=""
+      while (($# > 0)); do
+        if [[ "$1" == "--output" ]]; then
+          output="$2"
+          shift 2
+          continue
+        fi
+        shift
+      done
+      printf '{"marker":"security-permissive-directory"}\n' >"$output"
+      printf '200\n'
+    }
+
+    run_unix_permissive_directory_control
+    [[ "$directory_mode" == "0750" ]]
+    [[ "$UNIX_SECURITY_DIRECTORY_RELAXED" == "false" ]]
+    [[ "$BRIDGE_RUNNING" == "true" ]]
+  ) || {
+    printf 'permissive Unix directory control did not refuse and restore safely\n' >&2
+    return 1
+  }
+  grep -Fq 'wait:must not be group writable or world accessible' "$observed"
+  grep -Fq 'wait:Java remote parent bridge ready' "$observed"
 }
 
 write_diagnostics_fixture() {
@@ -542,7 +825,7 @@ write_diagnostics_fixture() {
   local -r standard="$7"
   local -r fault_status="${8:-}"
   local -r fault_count="${9:-0}"
-  local snapshot="provider_reject=0,provider_ver=0,lookup_missing=0,lookup_version=0,lookup_error=0,record_version=0,invoke_error=0,discard_standard=$standard,extract_fields=0,extract_invalid=0,extract_error=0,registration_fail=0,take_sampled=$sampled,take_unsampled=$unsampled"
+  local snapshot="cfg_on=0,cfg_off=0,provider_ok=0,provider_reject=0,provider_ver=0,extension_reg=0,lookup_ready=0,lookup_missing=0,lookup_version=0,lookup_error=0,record_version=0,invoke_error=0,discard_standard=$standard,extract_fields=0,extract_invalid=0,extract_error=0,registration_ok=0,registration_fail=0,take_sampled=$sampled,take_unsampled=$unsampled,tls_reads=0,tls_bytes=0"
   local status=""
   local value=0
 
@@ -559,32 +842,108 @@ write_diagnostics_fixture() {
   printf '%s\n' "$snapshot" >"$output"
 }
 
+test_java_diagnostics_schema_is_exact() {
+  local -r snapshot="$TEST_TMP_DIR/java-diagnostics-schema.txt"
+
+  write_diagnostics_fixture "$snapshot" 0 0 0 0 0 0
+  assert_sanitized_java_diagnostics "$snapshot"
+
+  sed -i 's/cfg_on=0/secret=0/' "$snapshot"
+  if assert_sanitized_java_diagnostics "$snapshot" >/dev/null 2>&1; then
+    printf 'Java diagnostics accepted an unknown fixed-shape field\n' >&2
+    return 1
+  fi
+
+  write_diagnostics_fixture "$snapshot" 0 0 0 0 0 0
+  sed -i 's/$/,request_id=0/' "$snapshot"
+  if assert_sanitized_java_diagnostics "$snapshot" >/dev/null 2>&1; then
+    printf 'Java diagnostics accepted an appended side-channel field\n' >&2
+    return 1
+  fi
+}
+
 test_java_diagnostics_delta_is_exact() {
   local -r before="$TEST_TMP_DIR/java-before.txt"
   local -r after="$TEST_TMP_DIR/java-after.txt"
   local -r delta="$TEST_TMP_DIR/java.delta"
 
   write_diagnostics_fixture "$before" 0 0 0 0 0 0
-  write_diagnostics_fixture "$after" 2 0 0 1 1 1
+  write_diagnostics_fixture "$after" 2 0 0 1 1 1 missing 1
   write_java_diagnostics_delta "$before" "$after" "$delta"
-  assert_java_diagnostics_delta "$delta" 2 0 0 1 1 1 || {
+  assert_java_diagnostics_delta "$delta" 2 0 0 1 1 1 1 || {
     printf 'Java diagnostics rejected exact expected deltas\n' >&2
     return 1
   }
 
+  sed -i 's/t_missing before=0 after=1 delta=1/t_missing before=0 after=2 delta=2/' "$delta"
+  if assert_java_diagnostics_delta "$delta" 2 0 0 1 1 1 1 >/dev/null 2>&1; then
+    printf 'Java diagnostics accepted an additional missing lookup\n' >&2
+    return 1
+  fi
+  sed -i 's/t_missing before=0 after=2 delta=2/t_missing before=0 after=1 delta=1/' "$delta"
+
   sed -i 's/d_missing before=0 after=0 delta=0/d_missing before=0 after=1 delta=1/' "$delta"
-  if assert_java_diagnostics_delta "$delta" 2 0 0 1 1 1 >/dev/null 2>&1; then
+  if assert_java_diagnostics_delta "$delta" 2 0 0 1 1 1 1 >/dev/null 2>&1; then
     printf 'Java diagnostics accepted an unexpected duplicate result\n' >&2
+    return 1
+  fi
+
+  write_diagnostics_fixture "$after" 2 0 0 1 1 1
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  if assert_java_diagnostics_delta "$delta" 2 0 0 1 1 1 1 >/dev/null 2>&1; then
+    printf 'Java diagnostics omitted the expected self-observed lookup\n' >&2
     return 1
   fi
 
   write_diagnostics_fixture "$before" 0 0 0 0 0 0
   write_diagnostics_fixture "$after" 0 0 0 0 0 0 transport_error 1
   write_java_diagnostics_delta "$before" "$after" "$delta"
-  assert_java_diagnostics_delta "$delta" 0 0 0 0 0 0 transport_error 1 || {
+  assert_java_diagnostics_delta "$delta" 0 0 0 0 0 0 0 transport_error 1 || {
     printf 'Java diagnostics rejected an attributable fault status\n' >&2
     return 1
   }
+}
+
+test_fault_scenario_does_not_probe_java_diagnostics() {
+  local -r diagnostics_calls="$TEST_TMP_DIR/fault-diagnostics.calls"
+
+  (
+    RESULT_DIR="$TEST_TMP_DIR/fault-scenario"
+    mkdir -p -- "$RESULT_DIR"
+    BRIDGE_RUNNING=false
+    COMPOSE=(docker compose)
+    FAULT_MODE=alternating
+    FAULT_REQUEST_COUNT=2
+    REPEAT_COUNT=1
+    REQUEST_COUNT=0
+    SCENARIO_SEED=1
+    TLS_PROTOCOL=TLSv1.3
+    capture_phase_evidence() {
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+      printf '# empty\n' >"$RESULT_DIR/phases/$1/obi-metrics.prom"
+    }
+    capture_java_diagnostics() {
+      printf '%s\n' "$1" >>"$diagnostics_calls"
+      return 1
+    }
+    flush_bridge_metric_boundary() {
+      return 0
+    }
+    run_bounded() {
+      printf '{"status":"passed"}\n'
+    }
+
+    run_scenario w3c-fault >/dev/null
+    run_scenario basic false >/dev/null
+  ) || {
+    printf 'scenario failed with diagnostics probes explicitly disabled\n' >&2
+    return 1
+  }
+
+  if [[ -e "$diagnostics_calls" ]]; then
+    printf 'scenario consumed a diagnostics probe while probes were disabled\n' >&2
+    return 1
+  fi
 }
 
 test_java_diagnostics_parser_uses_base36() {
@@ -640,6 +999,231 @@ test_runtime_environment_line_matching() {
     printf 'runtime contract accepted a partial environment entry\n' >&2
     return 1
   fi
+}
+
+test_instrumented_readiness_precedes_https_traffic() {
+  local -r result_dir="$TEST_TMP_DIR/readiness-order"
+  local -r observed="$result_dir/observed"
+  local -r expected="$result_dir/expected"
+
+  mkdir -p -- "$result_dir"
+  (
+    RESULT_DIR="$result_dir"
+    SCENARIO=basic
+    TRANSPORT=getsockopt
+    COMMAND_TIMEOUT_SECONDS=5
+    STACK_STARTED=false
+    BRIDGE_RUNNING=false
+    COMPOSE=(test-compose)
+    verify_compose_project_ownership() {
+      return 0
+    }
+    run_bounded() {
+      return 0
+    }
+    run_logged_bounded() {
+      return 0
+    }
+    wait_for_http() {
+      printf 'http:%s\n' "$2" >>"$observed"
+    }
+    wait_for_log() {
+      printf 'log:%s\n' "$3" >>"$observed"
+    }
+    assert_selected_transport() {
+      printf 'transport\n' >>"$observed"
+    }
+    assert_runtime_contract() {
+      printf 'runtime\n' >>"$observed"
+    }
+
+    start_stack
+  ) || {
+    printf 'instrumented readiness-order probe failed\n' >&2
+    return 1
+  }
+
+  printf '%s\n' \
+    'http:trace receiver' \
+    'log:OBI remote-parent bridge' \
+    'log:injected Java helper' \
+    'log:external OTel extension' \
+    'transport' \
+    'log:injected Java instrumentation' \
+    'http:verified Apache-to-Jetty HTTPS path' \
+    'runtime' >"$expected"
+  cmp -s -- "$expected" "$observed" || {
+    printf 'instrumented HTTPS traffic ran before bridge readiness\n' >&2
+    diff -u -- "$expected" "$observed" >&2 || true
+    return 1
+  }
+}
+
+test_https_health_probes_close_the_backend_connection() {
+  [[ "$APACHE_HTTPS_HEALTH_ENDPOINT" == *'?close=1' ]] || {
+    printf 'HTTPS health probes can retain a backend connection\n' >&2
+    return 1
+  }
+  if grep -Fq '"http://127.0.0.1:18080/healthz"' "$TEST_SCRIPT_DIR/../run.sh"; then
+    printf 'a measured-path health probe bypasses the closing endpoint\n' >&2
+    return 1
+  fi
+}
+
+test_recreated_stack_readiness_uses_log_cursor() {
+  local -r observed="$TEST_TMP_DIR/recreate-readiness.observed"
+  local -r expected="$TEST_TMP_DIR/recreate-readiness.expected"
+
+  (
+    COMPOSE=(test-compose)
+    BRIDGE_RUNNING=false
+    date() {
+      printf 'recreate-cursor\n'
+    }
+    run_bounded() {
+      printf 'compose:%s\n' "$*" >>"$observed"
+    }
+    wait_for_log() {
+      printf 'log:%s:%s\n' "$3" "${4:-}" >>"$observed"
+    }
+    assert_selected_transport() {
+      printf 'transport\n' >>"$observed"
+    }
+    wait_for_http() {
+      printf 'http:%s\n' "$2" >>"$observed"
+    }
+
+    recreate_instrumented_stack tcp restoration
+  ) || {
+    printf 'recreated stack readiness-order probe failed\n' >&2
+    return 1
+  }
+
+  printf '%s\n' \
+    'compose:180 test-compose up --detach --force-recreate java-backend apache-proxy obi' \
+    'log:restoration OBI remote-parent bridge:recreate-cursor' \
+    'log:restoration injected Java helper:recreate-cursor' \
+    'log:restoration external OTel extension:recreate-cursor' \
+    'log:restoration injected Java instrumentation:recreate-cursor' \
+    'transport' \
+    'http:restoration HTTPS path' >"$expected"
+  cmp -s -- "$expected" "$observed" || {
+    printf 'recreated stack used stale readiness evidence\n' >&2
+    diff -u -- "$expected" "$observed" >&2 || true
+    return 1
+  }
+}
+
+test_disabled_control_waits_for_instrumentation() {
+  local -r result_dir="$TEST_TMP_DIR/disabled-readiness"
+  local -r observed="$result_dir/observed"
+  local -r expected="$result_dir/expected"
+
+  mkdir -p -- "$result_dir"
+  (
+    RESULT_DIR="$result_dir"
+    COMPOSE=(test-compose)
+    date() {
+      printf 'disabled-cursor\n'
+    }
+    run_bounded() {
+      printf 'compose:%s\n' "$*" >>"$observed"
+    }
+    wait_for_log() {
+      printf 'log:%s:%s\n' "$3" "${4:-}" >>"$observed"
+    }
+    wait_for_http() {
+      printf 'http:%s\n' "$2" >>"$observed"
+    }
+    assert_runtime_contract() {
+      printf 'runtime:%s\n' "$1" >>"$observed"
+    }
+    run_scenario() {
+      printf 'scenario:%s\n' "$1" >>"$observed"
+    }
+
+    run_disabled_control
+  ) || {
+    printf 'disabled-control readiness-order probe failed\n' >&2
+    return 1
+  }
+
+  printf '%s\n' \
+    'compose:30 test-compose config' \
+    'compose:120 test-compose up --detach --force-recreate java-backend apache-proxy obi' \
+    'log:disabled-control external extension:disabled-cursor' \
+    'log:disabled-control Java instrumentation:disabled-cursor' \
+    'http:disabled-control HTTPS path' \
+    'runtime:disabled' \
+    'scenario:disabled' >"$expected"
+  cmp -s -- "$expected" "$observed" || {
+    printf 'disabled control used stale instrumentation readiness\n' >&2
+    diff -u -- "$expected" "$observed" >&2 || true
+    return 1
+  }
+}
+
+test_late_attach_recycles_only_apache_after_readiness() {
+  local -r observed="$TEST_TMP_DIR/late-attach.observed"
+  local -r expected="$TEST_TMP_DIR/late-attach.expected"
+
+  (
+    COMPOSE=(test-compose)
+    date() {
+      printf 'late-attach-cursor\n'
+    }
+    stop_obi_for_no_state_control() {
+      BRIDGE_RUNNING=false
+      printf 'stop-obi:%s\n' "$1" >>"$observed"
+    }
+    run_bounded() {
+      printf 'compose:%s\n' "$*" >>"$observed"
+    }
+    wait_for_log() {
+      printf 'log:%s:%s\n' "$3" "${4:-}" >>"$observed"
+    }
+    wait_for_http() {
+      printf 'http:%s\n' "$2" >>"$observed"
+    }
+    assert_runtime_contract() {
+      printf 'runtime:%s\n' "$1" >>"$observed"
+    }
+    assert_selected_transport() {
+      printf 'transport\n' >>"$observed"
+    }
+    run_scenario() {
+      printf 'scenario:%s:%s\n' "$1" "$SCENARIO_VARIANT" >>"$observed"
+    }
+
+    run_late_attach_control
+  ) || {
+    printf 'late-attach readiness-order probe failed\n' >&2
+    return 1
+  }
+
+  printf '%s\n' \
+    'stop-obi:late-attach' \
+    'compose:120 test-compose up --detach --force-recreate java-backend apache-proxy' \
+    'http:OBI-absent HTTPS path' \
+    'log:OBI-absent external extension:' \
+    'runtime:obi-absent' \
+    'scenario:fail-open:obi-absent' \
+    'scenario:w3c-only:obi-absent' \
+    'compose:120 test-compose up --detach obi' \
+    'log:late-attach OBI remote-parent bridge:late-attach-cursor' \
+    'log:late-attached Java helper:late-attach-cursor' \
+    'log:late-attached Java instrumentation:late-attach-cursor' \
+    'transport' \
+    'compose:60 test-compose stop --timeout 10 apache-proxy' \
+    'compose:120 test-compose up --detach --force-recreate --no-deps apache-proxy' \
+    'log:late-attach Apache instrumentation:late-attach-cursor' \
+    'http:late-attach recovered HTTPS path' \
+    'scenario:restart:late-attach-recovery' >"$expected"
+  cmp -s -- "$expected" "$observed" || {
+    printf 'late attach did not isolate the post-attach Apache pool\n' >&2
+    diff -u -- "$expected" "$observed" >&2 || true
+    return 1
+  }
 }
 
 test_control_response_normalizes_connection_diagnostics() {
@@ -1089,6 +1673,9 @@ test_demo_diagnostics_are_loopback_only() {
   grep -Fq '<Location "/obi-diagnostics">' "$apache_config"
   grep -Fq 'Require all denied' "$apache_config"
   grep -Fq 'address: 127.0.0.1' "$obi_config"
+  grep -Fqx '  buffer_sizes:' "$obi_config"
+  grep -Fqx '    http: 8192' "$obi_config"
+  grep -Fqx '                - X-OBI-Demo-ID' "$obi_config"
 }
 
 main() {
@@ -1103,6 +1690,8 @@ main() {
   test_all_suite_includes_every_scenario
   test_unix_all_suite_includes_fault_control
   test_w3c_fault_requires_forced_unix
+  test_security_accepts_enabled_transports
+  test_tls_boundary_requires_both_deterministic_modes
   test_w3c_match_selects_header_and_tcp_propagation
   test_runtime_directory_rejects_symlink
   test_bridge_artifact_metadata
@@ -1112,11 +1701,22 @@ main() {
   test_pressure_monitor_requires_full_occupancy
   test_bridge_take_count_includes_cancelled_request
   test_bridge_metric_delta_requires_exact_one_shot_results
+  test_primary_security_metrics_are_explicitly_scoped
+  test_primary_security_identity_requires_same_cgroup_and_nonroot_user
+  test_unix_security_metrics_require_explicit_race_scope
+  test_permissive_unix_directory_control_refuses_and_restores
+  test_java_diagnostics_schema_is_exact
   test_java_diagnostics_delta_is_exact
+  test_fault_scenario_does_not_probe_java_diagnostics
   test_java_diagnostics_parser_uses_base36
   test_restart_fault_diagnostics_require_overlap
   test_pipeline_dependencies_are_declared
   test_runtime_environment_line_matching
+  test_instrumented_readiness_precedes_https_traffic
+  test_https_health_probes_close_the_backend_connection
+  test_recreated_stack_readiness_uses_log_cursor
+  test_disabled_control_waits_for_instrumentation
+  test_late_attach_recycles_only_apache_after_readiness
   test_control_response_normalizes_connection_diagnostics
   test_restart_readiness_uses_log_cursor
   test_restart_failure_reaps_background_traffic

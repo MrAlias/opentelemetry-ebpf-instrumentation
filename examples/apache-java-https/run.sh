@@ -11,8 +11,12 @@ MAX_SHELL_INTEGER="9223372036854775807"
 PROJECT_NAMESPACE="obi-apache-java-https"
 PROJECT_SENTINEL_LABEL="io.opentelemetry.obi.apache-java-https.owner"
 PROJECT_SENTINEL_VALUE="acceptance-demo-v1"
+APACHE_HTTPS_HEALTH_ENDPOINT="http://127.0.0.1:18080/healthz?close=1"
+PRIMARY_SECURITY_PROBE_PATH="/tmp/obi-security-probe"
+PRIMARY_SECURITY_PID_PATH="/tmp/obi-security-probe.pid"
 readonly SCRIPT_DIR REPO_ROOT SCRIPT_NAME MAX_SHELL_INTEGER PROJECT_NAMESPACE
-readonly PROJECT_SENTINEL_LABEL PROJECT_SENTINEL_VALUE
+readonly PROJECT_SENTINEL_LABEL PROJECT_SENTINEL_VALUE APACHE_HTTPS_HEALTH_ENDPOINT
+readonly PRIMARY_SECURITY_PROBE_PATH PRIMARY_SECURITY_PID_PATH
 
 RUNTIME_DIR="$SCRIPT_DIR/.runtime"
 ARTIFACT_DIR="$RUNTIME_DIR/artifacts"
@@ -67,6 +71,16 @@ PRESSURE_MONITOR_OUTPUT=""
 FAULT_MODE="alternating"
 FAULT_REQUEST_COUNT=2
 SCENARIO_VARIANT=""
+SECURITY_PROBE_MODE="abuse"
+ALLOW_PRIMARY_SECURITY_METRICS=false
+ALLOW_UNIX_SECURITY_METRICS=false
+PRIMARY_SECURITY_EXEC_PID=""
+PRIMARY_SECURITY_HOST_PROBE=""
+PRIMARY_SECURITY_JAVA_CONTAINER=""
+PRIMARY_SECURITY_NAMESPACE_PID=""
+PRIMARY_SECURITY_SIBLING_CONTAINER=""
+UNIX_SECURITY_DIRECTORY_RELAXED=false
+UNIX_SECURITY_RACE_CONTAINER=""
 
 declare -a COMPOSE=(docker compose --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE")
 
@@ -82,10 +96,11 @@ Options:
   --agent NAME            otel or splunk. Default: otel
   --tls VERSION           TLSv1.2 or TLSv1.3. Default: TLSv1.3
   --scenario NAME         all, basic, keepalive, pipelining, concurrency,
-                          connection-churn, fd-port-reuse, slow-body, timeout-retry,
+                          connection-churn, fd-port-reuse, slow-body, tls-boundary,
+                          timeout-retry,
                           pressure, handoff, virtual-thread, netty, dispatch,
                           w3c, w3c-match, obi-flags, w3c-fault, w3c-only,
-                          restart-fault, fail-open, restart, disabled, or
+                          security, restart-fault, fail-open, restart, disabled, or
                           uninstrumented.
                           Default: all
   --requests COUNT        Requests per scenario (1-1000); scenario default
@@ -101,11 +116,13 @@ Options:
   -h, --help              Show this help text.
 
 The all scenario runs basic, keepalive, HTTP/1.1 pipelining, concurrency,
-connection churn, fd/ephemeral-port reuse, slow-body, timeout/retry, pressure,
+connection churn, fd/ephemeral-port reuse, slow-body, deterministic TLS receive
+boundaries, timeout/retry, pressure,
 executor/virtual-thread/Netty handoff, async redispatch, W3C
 precedence/match/flags/fault/no-state controls, late attach, OBI restart during
-traffic, bridge/extension-disabled, extension-absent, and uninstrumented
-controls. Evidence is retained under:
+traffic, bounded primary or fallback transport abuse controls, Unix endpoint
+replacement when that transport is selected, bridge/extension-disabled,
+extension-absent, and uninstrumented controls. Evidence is retained under:
   $RESULTS_ROOT
 EOF
 }
@@ -262,7 +279,7 @@ parse_args() {
       ;;
   esac
   case "$SCENARIO" in
-    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|timeout-retry|pressure|handoff|virtual-thread|netty|dispatch|w3c|w3c-match|obi-flags|w3c-fault|w3c-only|restart-fault|fail-open|restart|disabled|uninstrumented)
+    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|timeout-retry|pressure|handoff|virtual-thread|netty|dispatch|w3c|w3c-match|obi-flags|w3c-fault|w3c-only|security|restart-fault|fail-open|restart|disabled|uninstrumented)
       ;;
     *)
       die "unsupported scenario: $SCENARIO"
@@ -297,8 +314,16 @@ parse_args() {
   if [[ "$SCENARIO" == "w3c-fault" && "$REQUEST_COUNT" != "0" && "$REQUEST_COUNT" != "2" ]]; then
     die "the w3c-fault scenario requires exactly two requests"
   fi
-  if [[ ( "$SCENARIO" == "pipelining" || "$SCENARIO" == "fd-port-reuse" ) && "$REQUEST_COUNT" == "1" ]]; then
-    die "the $SCENARIO scenario requires at least two requests"
+  if [[ ( "$SCENARIO" == "keepalive" || "$SCENARIO" == "pipelining" ) &&
+    "$REQUEST_COUNT" != "0" && "$REQUEST_COUNT" -lt 3 ]]; then
+    die "the $SCENARIO scenario requires at least three requests"
+  fi
+  if [[ "$SCENARIO" == "fd-port-reuse" && "$REQUEST_COUNT" == "1" ]]; then
+    die "the fd-port-reuse scenario requires at least two requests"
+  fi
+  if [[ "$SCENARIO" == "tls-boundary" && "$REQUEST_COUNT" != "0" && \
+    "$REQUEST_COUNT" != "2" ]]; then
+    die "the tls-boundary scenario requires exactly two requests"
   fi
   if [[ "$SCENARIO" != "all" && "$CLEANUP_ONLY" == "false" ]]; then
     mark_non_acceptance "targeted-scenario"
@@ -333,7 +358,7 @@ mark_non_acceptance() {
 check_dependencies() {
   local -a missing=()
   local command_name=""
-  for command_name in awk cmp curl cut docker find git grep install mv openssl sed sha256sum sort tee timeout wc; do
+  for command_name in awk cmp curl cut docker find git grep install mv openssl sed sha256sum sort tail tee timeout wc; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
       missing+=("$command_name")
     fi
@@ -509,6 +534,55 @@ on_error() {
   log_error "command failed at line $line during $RUN_STAGE" || true
 }
 
+cleanup_security_processes() {
+  if [[ -n "$PRIMARY_SECURITY_JAVA_CONTAINER" && \
+    "$PRIMARY_SECURITY_NAMESPACE_PID" =~ ^[1-9][0-9]*$ ]]; then
+    # Expanded by the container shell, not this process.
+    # shellcheck disable=SC2016
+    run_bounded 10 docker exec "$PRIMARY_SECURITY_JAVA_CONTAINER" \
+      /bin/sh -ec '
+        if read -r name <"/proc/$1/comm" && [ "$name" = security-probe ]; then
+          kill -TERM "$1" 2>/dev/null || true
+        fi
+      ' sh \
+      "$PRIMARY_SECURITY_NAMESPACE_PID" >/dev/null 2>&1 || true
+  fi
+  if [[ "$PRIMARY_SECURITY_EXEC_PID" =~ ^[1-9][0-9]*$ ]]; then
+    if kill -0 "$PRIMARY_SECURITY_EXEC_PID" 2>/dev/null; then
+      kill -TERM "$PRIMARY_SECURITY_EXEC_PID" 2>/dev/null || true
+    fi
+    wait "$PRIMARY_SECURITY_EXEC_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$PRIMARY_SECURITY_SIBLING_CONTAINER" ]]; then
+    run_bounded 10 docker kill "$PRIMARY_SECURITY_SIBLING_CONTAINER" \
+      >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$PRIMARY_SECURITY_JAVA_CONTAINER" ]]; then
+    run_bounded 10 docker exec "$PRIMARY_SECURITY_JAVA_CONTAINER" \
+      rm -f -- "$PRIMARY_SECURITY_PROBE_PATH" "$PRIMARY_SECURITY_PID_PATH" \
+      >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$PRIMARY_SECURITY_HOST_PROBE" ]]; then
+    rm -f -- "$PRIMARY_SECURITY_HOST_PROBE" || true
+  fi
+  if [[ -n "$UNIX_SECURITY_RACE_CONTAINER" ]]; then
+    run_bounded 10 docker kill "$UNIX_SECURITY_RACE_CONTAINER" \
+      >/dev/null 2>&1 || true
+  fi
+  if [[ "$UNIX_SECURITY_DIRECTORY_RELAXED" == "true" ]]; then
+    run_bounded 10 "${COMPOSE[@]}" exec --no-TTY java-backend \
+      chmod 0750 /var/run/obi >/dev/null 2>&1 || true
+  fi
+
+  PRIMARY_SECURITY_EXEC_PID=""
+  PRIMARY_SECURITY_HOST_PROBE=""
+  PRIMARY_SECURITY_JAVA_CONTAINER=""
+  PRIMARY_SECURITY_NAMESPACE_PID=""
+  PRIMARY_SECURITY_SIBLING_CONTAINER=""
+  UNIX_SECURITY_DIRECTORY_RELAXED=false
+  UNIX_SECURITY_RACE_CONTAINER=""
+}
+
 cleanup() {
   local -r status="$?"
   trap - ERR EXIT INT TERM
@@ -521,6 +595,7 @@ cleanup() {
   if [[ "$PRESSURE_ACTIVE" == "true" ]]; then
     cleanup_map_pressure || true
   fi
+  cleanup_security_processes
   if [[ -n "${RESULT_DIR:-}" && -d "$RESULT_DIR" ]]; then
     capture_evidence
     write_run_status "$status"
@@ -822,7 +897,6 @@ start_stack() {
 
   RUN_STAGE="readiness"
   wait_for_http "http://127.0.0.1:14318/healthz" "trace receiver"
-  wait_for_http "http://127.0.0.1:18080/healthz" "verified Apache-to-Jetty HTTPS path"
   if [[ "$TRANSPORT" != "disabled" ]]; then
     wait_for_log obi "Java remote parent bridge ready" "OBI remote-parent bridge"
     wait_for_log java-backend "OBI remote-parent provider ready" "injected Java helper"
@@ -831,6 +905,10 @@ start_stack() {
   elif [[ "$SCENARIO" != "uninstrumented" ]]; then
     wait_for_log java-backend "OBI remote-parent propagator enabled" "external OTel extension"
   fi
+  if [[ "$SCENARIO" != "uninstrumented" ]]; then
+    wait_for_log java-backend "OBI Java instrumentation ready" "injected Java instrumentation"
+  fi
+  wait_for_http "$APACHE_HTTPS_HEALTH_ENDPOINT" "verified Apache-to-Jetty HTTPS path"
   assert_runtime_contract
 }
 
@@ -1102,7 +1180,7 @@ flush_bridge_metric_boundary() {
   fetch_obi_metrics "$current"
   before="$(bridge_success_total "$current")"
   curl --fail --silent --show-error --max-time 5 \
-    "http://127.0.0.1:18080/healthz" >/dev/null
+    "$APACHE_HTTPS_HEALTH_ENDPOINT" >/dev/null
   rm -f -- "$current"
   wait_for_bridge_metric_total \
     "$((before + 1))" \
@@ -1115,6 +1193,10 @@ scenario_request_count() {
 
   if [[ "$name" == "w3c-fault" ]]; then
     printf '%d\n' "$FAULT_REQUEST_COUNT"
+    return
+  fi
+  if [[ "$name" == "tls-boundary" ]]; then
+    printf '2\n'
     return
   fi
   if ((REQUEST_COUNT > 0)); then
@@ -1161,6 +1243,32 @@ scenario_bridge_take_count() {
     count="$((count + 1))"
   fi
   printf '%d\n' "$count"
+}
+
+scenario_java_missing_count() {
+  local -r name="$1"
+  local -r diagnostics_enabled="$2"
+  local count=0
+
+  if [[ "$name" != "w3c-fault" && "$diagnostics_enabled" == "true" ]]; then
+    count=1
+  fi
+  if [[ "$name" == "tls-boundary" ]]; then
+    count="$((count + 3))"
+  fi
+  printf '%d\n' "$count"
+}
+
+scenario_bridge_missing_count() {
+  local -r name="$1"
+  local -r diagnostics_enabled="$2"
+  local -r transport="$3"
+
+  if [[ "$transport" == "unix" ]]; then
+    scenario_java_missing_count "$name" "$diagnostics_enabled"
+    return
+  fi
+  printf '0\n'
 }
 
 pressure_map_metric() {
@@ -1389,6 +1497,7 @@ cleanup_map_pressure() {
 
 run_scenario() {
   local -r name="$1"
+  local -r diagnostics_enabled="${2:-true}"
   local run_number=0
   local label=""
   local output=""
@@ -1404,6 +1513,8 @@ run_scenario() {
   local expected_valid=0
   local expected_stale=0
   local expected_malformed=0
+  local expected_bridge_missing=0
+  local expected_java_missing=0
   local expected_fault_status=""
   local expected_fault_count=0
   local bridge_was_running=false
@@ -1412,8 +1523,17 @@ run_scenario() {
   local status_name="passed"
   local -a request_arguments=()
 
+  [[ "$diagnostics_enabled" == "true" || "$diagnostics_enabled" == "false" ]] || {
+    log_error "scenario diagnostics mode must be true or false"
+    return 1
+  }
+  expected_bridge_missing="$(scenario_bridge_missing_count \
+    "$name" "$diagnostics_enabled" "$SELECTED_TRANSPORT")"
+  expected_java_missing="$(scenario_java_missing_count "$name" "$diagnostics_enabled")"
   if [[ "$name" == "w3c-fault" ]]; then
     request_arguments=(--requests "$FAULT_REQUEST_COUNT")
+  elif [[ "$name" == "tls-boundary" ]]; then
+    request_arguments=(--requests 2)
   elif (( REQUEST_COUNT > 0 )); then
     request_arguments=(--requests "$REQUEST_COUNT")
   fi
@@ -1436,7 +1556,9 @@ run_scenario() {
     log_info "running $label scenario"
     flush_bridge_metric_boundary "$label"
     capture_phase_evidence "$before_phase"
-    capture_java_diagnostics "$before_phase"
+    if [[ "$name" != "w3c-fault" && "$diagnostics_enabled" == "true" ]]; then
+      capture_java_diagnostics "$before_phase"
+    fi
     bridge_was_running="$BRIDGE_RUNNING"
     expected_requests="$(scenario_bridge_take_count "$name")"
     if [[ "$bridge_was_running" == "true" ]]; then
@@ -1478,7 +1600,9 @@ run_scenario() {
       fi
     fi
     capture_phase_evidence "$after_phase"
-    capture_java_diagnostics "$after_phase"
+    if [[ "$name" != "w3c-fault" && "$diagnostics_enabled" == "true" ]]; then
+      capture_java_diagnostics "$after_phase"
+    fi
     write_metrics_delta \
       "$RESULT_DIR/phases/$before_phase/obi-metrics.prom" \
       "$RESULT_DIR/phases/$after_phase/obi-metrics.prom" \
@@ -1488,11 +1612,12 @@ run_scenario() {
         "$RESULT_DIR/phases/$after_phase/obi-metrics.delta" \
         "$SELECTED_TRANSPORT" \
         "$expected_requests" \
-        0; then
+        0 \
+        "$expected_bridge_missing"; then
         metric_status=1
       fi
     fi
-    if [[ "$bridge_was_running" == "true" || "$name" == "w3c-fault" ]]; then
+    if [[ "$bridge_was_running" == "true" && "$diagnostics_enabled" == "true" ]]; then
       if ! write_java_diagnostics_delta \
         "$RESULT_DIR/phases/$before_phase/java-diagnostics.txt" \
         "$RESULT_DIR/phases/$after_phase/java-diagnostics.txt" \
@@ -1519,37 +1644,13 @@ run_scenario() {
             expected_sampled="$((expected_requests / 2))"
             expected_unsampled="$(((expected_requests + 1) / 2))"
             ;;
-          w3c-fault)
-            expected_valid=0
-            expected_sampled=0
-            case "$FAULT_MODE" in
-              alternating)
-                expected_stale="$(((expected_requests + 1) / 2))"
-                expected_malformed="$((expected_requests / 2))"
-                ;;
-              timeout|overload|version-mismatch)
-                expected_fault_status="${FAULT_MODE//-/_}"
-                expected_fault_count="$expected_requests"
-                ;;
-              disconnect|truncated)
-                expected_fault_status="transport_error"
-                expected_fault_count="$expected_requests"
-                ;;
-              bad-magic|bad-size|zero-trace-id|zero-span-id)
-                expected_malformed="$expected_requests"
-                ;;
-              *)
-                log_error "unsupported active fault mode: $FAULT_MODE"
-                metric_status=1
-                ;;
-            esac
-            ;;
         esac
         if ! assert_java_diagnostics_delta \
           "$RESULT_DIR/phases/$after_phase/java-diagnostics.delta" \
           "$expected_valid" \
           "$expected_stale" \
           "$expected_malformed" \
+          "$expected_java_missing" \
           "$expected_sampled" \
           "$expected_unsampled" \
           "$expected_standard" \
@@ -1605,6 +1706,7 @@ run_w3c_only_control() {
 
 run_late_attach_control() {
   local attach_since=""
+  local apache_since=""
 
   stop_obi_for_no_state_control "late-attach"
   export EXTENSION_ENABLED=true
@@ -1614,7 +1716,7 @@ run_late_attach_control() {
   log_info "recreating the JVM while OBI is absent"
   run_bounded 120 \
     "${COMPOSE[@]}" up --detach --force-recreate java-backend apache-proxy
-  wait_for_http "http://127.0.0.1:18080/healthz" "OBI-absent HTTPS path"
+  wait_for_http "$APACHE_HTTPS_HEALTH_ENDPOINT" "OBI-absent HTTPS path"
   wait_for_log \
     java-backend \
     "OBI remote-parent propagator enabled" \
@@ -1639,8 +1741,26 @@ run_late_attach_control() {
     "OBI remote-parent provider ready" \
     "late-attached Java helper" \
     "$attach_since"
+  wait_for_log \
+    java-backend \
+    "OBI Java instrumentation ready" \
+    "late-attached Java instrumentation" \
+    "$attach_since"
   BRIDGE_RUNNING=true
   assert_selected_transport
+  log_info "recycling Apache connections created before late attach"
+  run_bounded 60 "${COMPOSE[@]}" stop --timeout 10 apache-proxy
+  apache_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')"
+  run_bounded 120 \
+    "${COMPOSE[@]}" up --detach --force-recreate --no-deps apache-proxy
+  wait_for_log \
+    obi \
+    "cmd=/usr/local/apache2/bin/httpd" \
+    "late-attach Apache instrumentation" \
+    "$apache_since"
+  wait_for_http \
+    "$APACHE_HTTPS_HEALTH_ENDPOINT" \
+    "late-attach recovered HTTPS path"
   SCENARIO_VARIANT="late-attach-recovery"
   run_scenario restart
   SCENARIO_VARIANT=""
@@ -1656,6 +1776,7 @@ run_restart_during_traffic_control() (
   local scenario_pid=""
   local scenario_status=0
 
+  # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
   cleanup_restart_traffic() {
     local -r status="$?"
     trap - EXIT
@@ -1756,7 +1877,7 @@ run_extension_controls() {
   export OTEL_PROPAGATORS_VALUE="tracecontext,baggage"
   run_bounded 120 \
     "${COMPOSE[@]}" up --detach --force-recreate java-backend apache-proxy
-  wait_for_http "http://127.0.0.1:18080/healthz" "extension-absent HTTPS path"
+  wait_for_http "$APACHE_HTTPS_HEALTH_ENDPOINT" "extension-absent HTTPS path"
   assert_runtime_contract extension-absent
   SCENARIO_VARIANT="extension-absent"
   run_scenario w3c-only
@@ -1767,7 +1888,7 @@ run_extension_controls() {
   export OTEL_PROPAGATORS_VALUE="obi,tracecontext,baggage"
   run_bounded 120 \
     "${COMPOSE[@]}" up --detach --force-recreate java-backend apache-proxy
-  wait_for_http "http://127.0.0.1:18080/healthz" "extension-disabled HTTPS path"
+  wait_for_http "$APACHE_HTTPS_HEALTH_ENDPOINT" "extension-disabled HTTPS path"
   wait_for_log \
     java-backend \
     "OBI remote-parent propagator disabled by compatibility gate" \
@@ -1794,7 +1915,6 @@ recreate_instrumented_stack() {
   run_bounded 180 \
     "${COMPOSE[@]}" up --detach --force-recreate \
       java-backend apache-proxy obi
-  wait_for_http "http://127.0.0.1:18080/healthz" "$label HTTPS path"
   wait_for_log \
     obi \
     "Java remote parent bridge ready" \
@@ -1810,8 +1930,14 @@ recreate_instrumented_stack() {
     "OBI remote-parent propagator enabled" \
     "$label external OTel extension" \
     "$recreate_since"
+  wait_for_log \
+    java-backend \
+    "OBI Java instrumentation ready" \
+    "$label injected Java instrumentation" \
+    "$recreate_since"
   BRIDGE_RUNNING=true
   assert_selected_transport
+  wait_for_http "$APACHE_HTTPS_HEALTH_ENDPOINT" "$label HTTPS path"
 }
 
 run_w3c_match_control() {
@@ -1884,6 +2010,625 @@ run_w3c_fault_control() {
   recreate_instrumented_stack "tcp" "post-fault bridge recovery"
 }
 
+assert_sanitized_java_diagnostics() {
+  local -r input="$1"
+  local snapshot=""
+  local entry=""
+  local name=""
+  local value=""
+  local -a entries=()
+  local -a expected_names=(
+    cfg_on cfg_off provider_ok provider_reject provider_ver extension_reg
+    lookup_ready lookup_missing lookup_version lookup_error record_version
+    invoke_error discard_standard extract_fields extract_invalid extract_error
+    registration_ok registration_fail take_sampled take_unsampled tls_reads tls_bytes
+    t_unknown d_unknown t_valid d_valid t_missing d_missing t_stale d_stale
+    t_unsupported d_unsupported t_malformed d_malformed
+    t_version_mismatch d_version_mismatch t_ambiguous d_ambiguous
+    t_unauthorized d_unauthorized t_already_consumed d_already_consumed
+    t_timeout d_timeout t_overload d_overload
+    t_transport_error d_transport_error t_disabled d_disabled
+  )
+  local index=0
+
+  IFS= read -r snapshot <"$input" || true
+  IFS=',' read -r -a entries <<<"$snapshot"
+  if (( ${#entries[@]} != ${#expected_names[@]} )); then
+    log_error "Java diagnostics did not contain the exact fixed counter schema"
+    return 1
+  fi
+  for entry in "${entries[@]}"; do
+    [[ "$entry" =~ ^[a-z_]+=[0-9a-z]+$ ]] || {
+      log_error "Java diagnostics contained a non-counter field"
+      return 1
+    }
+    name="${entry%%=*}"
+    value="${entry#*=}"
+    if [[ "$name" != "${expected_names[$index]}" ]] || (( ${#value} > 6 )); then
+      log_error "Java diagnostics contained an unknown, reordered, or unbounded counter"
+      return 1
+    fi
+    ((index += 1))
+  done
+}
+
+background_process_is_running() {
+  local -r process_pid="$1"
+  local state=""
+
+  [[ "$process_pid" =~ ^[1-9][0-9]*$ && -r "/proc/$process_pid/stat" ]] || return 1
+  state="$(sed -E 's/^[0-9]+ \(.*\) ([A-Z]) .*/\1/' "/proc/$process_pid/stat")"
+  [[ "$state" != "Z" ]]
+}
+
+wait_for_background_log() {
+  local -r process_pid="$1"
+  local -r output="$2"
+  local -r pattern="$3"
+  local -r description="$4"
+  local -i elapsed=0
+  local -i attempts=$((READINESS_TIMEOUT_SECONDS * 10))
+
+  while ((elapsed < attempts)); do
+    if grep -Fq "$pattern" "$output" 2>/dev/null; then
+      log_info "$description is ready"
+      return 0
+    fi
+    if ! background_process_is_running "$process_pid"; then
+      log_error "$description exited before emitting: $pattern"
+      return 1
+    fi
+    sleep 0.1
+    ((elapsed += 1))
+  done
+  log_error "timed out waiting for $description output: $pattern"
+  return 1
+}
+
+wait_for_background_process() {
+  local -r process_pid="$1"
+  local -r timeout_seconds="$2"
+  local -i elapsed=0
+  local -i attempts=$((timeout_seconds * 10))
+  local process_status=0
+
+  while ((elapsed < attempts)); do
+    if ! background_process_is_running "$process_pid"; then
+      if wait "$process_pid"; then
+        return 0
+      else
+        process_status=$?
+        return "$process_status"
+      fi
+    fi
+    sleep 0.1
+    ((elapsed += 1))
+  done
+  return 124
+}
+
+wait_for_primary_security_namespace_pid() {
+  local -r java_container="$1"
+  local candidate=""
+  local -i elapsed=0
+  local -i attempts=$((READINESS_TIMEOUT_SECONDS * 10))
+
+  while ((elapsed < attempts)); do
+    candidate="$(run_bounded 5 docker exec "$java_container" \
+      cat "$PRIMARY_SECURITY_PID_PATH" 2>/dev/null || true)"
+    if [[ "$candidate" =~ ^[1-9][0-9]*$ ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+    sleep 0.1
+    ((elapsed += 1))
+  done
+  log_error "timed out waiting for the Java-container security probe PID"
+  return 1
+}
+
+assert_primary_security_cgroup_identity() {
+  local -r java_cgroup="$1"
+  local -r probe_cgroup="$2"
+  local -r probe_status="$3"
+
+  [[ -s "$java_cgroup" && -s "$probe_cgroup" ]] || {
+    log_error "primary security cgroup evidence was empty"
+    return 1
+  }
+  cmp -s -- "$java_cgroup" "$probe_cgroup" || {
+    log_error "primary security probe did not share the Java container cgroup"
+    return 1
+  }
+  awk '
+    $1 == "Uid:" {
+      found_uid = 1
+      for (field = 2; field <= 5; field++) {
+        if ($field != 65534) {
+          failed = 1
+        }
+      }
+    }
+    $1 == "Gid:" {
+      found_gid = 1
+      for (field = 2; field <= 5; field++) {
+        if ($field != 65534) {
+          failed = 1
+        }
+      }
+    }
+    END {
+      exit failed || !found_uid || !found_gid ? 1 : 0
+    }
+  ' "$probe_status" || {
+    log_error "primary security probe did not run with the unprivileged 65534:65534 identity"
+    return 1
+  }
+}
+
+run_primary_security_control() {
+  local -r sibling_output="$RESULT_DIR/security-primary-sibling.log"
+  local -r sibling_identity="$RESULT_DIR/security-primary-sibling.json"
+  local -r same_cgroup_output="$RESULT_DIR/security-primary-same-cgroup.log"
+  local -r same_cgroup_identity="$RESULT_DIR/security-primary-same-cgroup.txt"
+  local -r java_cgroup="$RESULT_DIR/security-primary-java.cgroup"
+  local -r probe_cgroup="$RESULT_DIR/security-primary-probe.cgroup"
+  local -r probe_status="$RESULT_DIR/security-primary-probe.status"
+  local -r sibling_cgroup="$RESULT_DIR/security-primary-sibling.cgroup"
+  local -r sibling_delta="$RESULT_DIR/phases/security-primary-sibling-ready/obi-metrics.delta"
+  local -r initial_delta="$RESULT_DIR/phases/security-primary-probe-ready/obi-metrics.delta"
+  local host_probe=""
+  local java_container=""
+  local java_host_pid=""
+  local sibling_host_pid=""
+  local same_cgroup_exit=0
+  local sibling_exit=""
+  local network_mode=""
+  local pid_mode=""
+  local previous_variant=""
+  local previous_metric_policy=""
+  local run_number=0
+  local phase_label=""
+
+  [[ "$SELECTED_TRANSPORT" == "getsockopt" ]] || {
+    log_error "the primary security control requires the selected getsockopt transport"
+    return 1
+  }
+
+  capture_java_diagnostics "security-primary-diagnostics-before"
+  assert_sanitized_java_diagnostics \
+    "$RESULT_DIR/phases/security-primary-diagnostics-before/java-diagnostics.txt"
+  capture_phase_evidence "security-primary-before"
+  SECURITY_PROBE_MODE="primary"
+  export SECURITY_PROBE_MODE
+  log_info "starting the isolated sibling-container getsockopt control"
+  run_bounded 60 \
+    "${COMPOSE[@]}" up --detach --no-deps --force-recreate security-probe
+  wait_for_log \
+    security-probe \
+    "security probe primary ready" \
+    "getsockopt sibling-container security barrier"
+  PRIMARY_SECURITY_SIBLING_CONTAINER="$(run_bounded 10 \
+    "${COMPOSE[@]}" ps --all --quiet security-probe)"
+  [[ -n "$PRIMARY_SECURITY_SIBLING_CONTAINER" ]] || {
+    log_error "could not resolve the sibling security probe container"
+    return 1
+  }
+  run_bounded 10 docker inspect \
+    --format '{"id":{{json .Id}},"user":{{json .Config.User}},"network_mode":{{json .HostConfig.NetworkMode}},"pid_mode":{{json .HostConfig.PidMode}},"host_pid":{{json .State.Pid}}}' \
+    "$PRIMARY_SECURITY_SIBLING_CONTAINER" >"$sibling_identity"
+  network_mode="$(run_bounded 10 docker inspect --format '{{.HostConfig.NetworkMode}}' \
+    "$PRIMARY_SECURITY_SIBLING_CONTAINER")"
+  pid_mode="$(run_bounded 10 docker inspect --format '{{.HostConfig.PidMode}}' \
+    "$PRIMARY_SECURITY_SIBLING_CONTAINER")"
+  [[ "$network_mode" == "none" && -z "$pid_mode" ]] || {
+    log_error "sibling security probe did not run in isolated network and PID namespaces"
+    return 1
+  }
+
+  java_container="$(run_bounded 10 "${COMPOSE[@]}" ps --quiet java-backend)"
+  [[ -n "$java_container" ]] || {
+    log_error "could not resolve the Java backend container"
+    return 1
+  }
+  java_host_pid="$(run_bounded 10 docker inspect --format '{{.State.Pid}}' "$java_container")"
+  sibling_host_pid="$(run_bounded 10 docker inspect --format '{{.State.Pid}}' \
+    "$PRIMARY_SECURITY_SIBLING_CONTAINER")"
+  if [[ ! "$java_host_pid" =~ ^[1-9][0-9]*$ || \
+    ! "$sibling_host_pid" =~ ^[1-9][0-9]*$ || \
+    ! -r "/proc/$java_host_pid/cgroup" || ! -r "/proc/$sibling_host_pid/cgroup" ]]; then
+    log_error "could not resolve host cgroups for the Java and sibling containers"
+    return 1
+  fi
+  install -m 0644 "/proc/$sibling_host_pid/cgroup" "$sibling_cgroup"
+  if cmp -s -- "/proc/$java_host_pid/cgroup" "$sibling_cgroup"; then
+    log_error "sibling security probe unexpectedly shared the Java container cgroup"
+    return 1
+  fi
+
+  capture_phase_evidence "security-primary-sibling-ready"
+  write_metrics_delta \
+    "$RESULT_DIR/phases/security-primary-before/obi-metrics.prom" \
+    "$RESULT_DIR/phases/security-primary-sibling-ready/obi-metrics.prom" \
+    "$sibling_delta"
+  assert_primary_security_metric_delta "$sibling_delta" negotiate 0 0
+  assert_primary_security_metric_delta "$sibling_delta" take 0 0
+
+  host_probe="$(mktemp "$RESULT_DIR/.security-primary-probe.XXXXXX")"
+  PRIMARY_SECURITY_HOST_PROBE="$host_probe"
+  run_bounded 15 docker cp \
+    "$PRIMARY_SECURITY_SIBLING_CONTAINER:/security-probe" "$host_probe"
+  PRIMARY_SECURITY_JAVA_CONTAINER="$java_container"
+  run_bounded 10 docker exec "$java_container" \
+    rm -f -- "$PRIMARY_SECURITY_PROBE_PATH" "$PRIMARY_SECURITY_PID_PATH"
+  run_bounded 15 docker cp "$host_probe" \
+    "$java_container:$PRIMARY_SECURITY_PROBE_PATH"
+  rm -f -- "$host_probe"
+  host_probe=""
+  PRIMARY_SECURITY_HOST_PROBE=""
+  run_bounded 10 docker exec "$java_container" \
+    chmod 0755 "$PRIMARY_SECURITY_PROBE_PATH"
+
+  : >"$same_cgroup_output"
+  docker exec --user 65534:65534 "$java_container" /bin/sh -ec '
+    umask 077
+    printf "%s\n" "$$" >"$1"
+    exec "$2" --mode primary --timeout 60s
+  ' sh "$PRIMARY_SECURITY_PID_PATH" "$PRIMARY_SECURITY_PROBE_PATH" \
+    >"$same_cgroup_output" 2>&1 &
+  PRIMARY_SECURITY_EXEC_PID=$!
+  wait_for_background_log \
+    "$PRIMARY_SECURITY_EXEC_PID" \
+    "$same_cgroup_output" \
+    "security probe primary ready" \
+    "same-cgroup getsockopt security probe"
+  PRIMARY_SECURITY_NAMESPACE_PID="$(wait_for_primary_security_namespace_pid \
+    "$java_container")"
+
+  run_bounded 10 docker exec "$java_container" \
+    cat /proc/1/cgroup >"$java_cgroup"
+  run_bounded 10 docker exec "$java_container" \
+    cat "/proc/$PRIMARY_SECURITY_NAMESPACE_PID/cgroup" >"$probe_cgroup"
+  run_bounded 10 docker exec "$java_container" \
+    cat "/proc/$PRIMARY_SECURITY_NAMESPACE_PID/status" >"$probe_status"
+  assert_primary_security_cgroup_identity \
+    "$java_cgroup" "$probe_cgroup" "$probe_status"
+  {
+    printf 'java_container=%s\n' "$java_container"
+    printf 'java_host_pid=%s\n' "$java_host_pid"
+    printf 'probe_namespace_pid=%s\n' "$PRIMARY_SECURITY_NAMESPACE_PID"
+    printf 'requested_user=65534:65534\n'
+    printf 'cgroup_match=true\n'
+    printf '\n/proc/1/cgroup:\n'
+    cat "$java_cgroup"
+    printf '\n/proc/%s/cgroup:\n' "$PRIMARY_SECURITY_NAMESPACE_PID"
+    cat "$probe_cgroup"
+    printf '\n/proc/%s/status identity:\n' "$PRIMARY_SECURITY_NAMESPACE_PID"
+    awk '/^(Name|Pid|PPid|Uid|Gid|Groups|NoNewPrivs):/ { print }' "$probe_status"
+  } >"$same_cgroup_identity"
+
+  capture_phase_evidence "security-primary-probe-ready"
+  write_metrics_delta \
+    "$RESULT_DIR/phases/security-primary-sibling-ready/obi-metrics.prom" \
+    "$RESULT_DIR/phases/security-primary-probe-ready/obi-metrics.prom" \
+    "$initial_delta"
+  assert_primary_security_metric_delta "$initial_delta" negotiate 1
+  assert_primary_security_metric_delta "$initial_delta" take 5
+
+  previous_variant="$SCENARIO_VARIANT"
+  previous_metric_policy="$ALLOW_PRIMARY_SECURITY_METRICS"
+  SCENARIO_VARIANT="security-primary-victim"
+  ALLOW_PRIMARY_SECURITY_METRICS=true
+  if ! run_scenario concurrency false; then
+    SCENARIO_VARIANT="$previous_variant"
+    ALLOW_PRIMARY_SECURITY_METRICS="$previous_metric_policy"
+    return 1
+  fi
+  SCENARIO_VARIANT="$previous_variant"
+  ALLOW_PRIMARY_SECURITY_METRICS="$previous_metric_policy"
+
+  for ((run_number = 1; run_number <= REPEAT_COUNT; run_number++)); do
+    phase_label="concurrency-security-primary-victim"
+    if ((REPEAT_COUNT > 1)); then
+      printf -v phase_label '%s-run-%02d' "$phase_label" "$run_number"
+    fi
+    assert_primary_security_metric_delta \
+      "$RESULT_DIR/phases/$phase_label-after/obi-metrics.delta" take 1
+  done
+
+  background_process_is_running "$PRIMARY_SECURITY_EXEC_PID" || {
+    log_error "same-cgroup primary security probe exited before release"
+    return 1
+  }
+  # Expanded by the container shell, not this process.
+  # shellcheck disable=SC2016
+  run_bounded 10 docker exec "$java_container" /bin/sh -ec '
+    read -r name <"/proc/$1/comm"
+    [ "$name" = security-probe ]
+    kill -USR1 "$1"
+  ' sh "$PRIMARY_SECURITY_NAMESPACE_PID"
+  if wait_for_background_process "$PRIMARY_SECURITY_EXEC_PID" 15; then
+    same_cgroup_exit=0
+  else
+    same_cgroup_exit=$?
+  fi
+  [[ "$same_cgroup_exit" == "0" ]] || {
+    log_error "same-cgroup primary security probe exited with status $same_cgroup_exit"
+    return 1
+  }
+  PRIMARY_SECURITY_EXEC_PID=""
+  PRIMARY_SECURITY_NAMESPACE_PID=""
+  if ! grep -Fq '"status":"passed","mode":"primary"' "$same_cgroup_output" || \
+    ! grep -Eq '"attempts":[1-9][0-9]*' "$same_cgroup_output" || \
+    ! grep -Fq '"name":"repeated-retrieval","outcome":"native-unsupported"' \
+      "$same_cgroup_output"; then
+    log_error "same-cgroup primary security probe did not emit bounded native-result evidence"
+    return 1
+  fi
+
+  run_bounded 15 docker kill --signal SIGUSR1 \
+    "$PRIMARY_SECURITY_SIBLING_CONTAINER" >/dev/null
+  sibling_exit="$(run_bounded 60 docker wait "$PRIMARY_SECURITY_SIBLING_CONTAINER")"
+  [[ "$sibling_exit" == "0" ]] || {
+    log_error "sibling security probe exited with status $sibling_exit"
+    return 1
+  }
+  run_bounded 15 "${COMPOSE[@]}" logs --no-color security-probe >"$sibling_output"
+  PRIMARY_SECURITY_SIBLING_CONTAINER=""
+  if ! grep -Fq '"status":"passed","mode":"primary"' "$sibling_output" || \
+    ! grep -Eq '"attempts":[1-9][0-9]*' "$sibling_output" || \
+    ! grep -Fq '"name":"wrong-process-negotiation","outcome":"native-unsupported"' \
+      "$sibling_output" || \
+    ! grep -Fq '"name":"repeated-retrieval","outcome":"native-unsupported"' \
+      "$sibling_output"; then
+    log_error "sibling security probe did not emit honest native-result evidence"
+    return 1
+  fi
+
+  run_bounded 10 docker exec "$java_container" \
+    rm -f -- "$PRIMARY_SECURITY_PROBE_PATH" "$PRIMARY_SECURITY_PID_PATH"
+  PRIMARY_SECURITY_JAVA_CONTAINER=""
+  capture_java_diagnostics "security-primary-diagnostics-after"
+  assert_sanitized_java_diagnostics \
+    "$RESULT_DIR/phases/security-primary-diagnostics-after/java-diagnostics.txt"
+
+  previous_variant="$SCENARIO_VARIANT"
+  SCENARIO_VARIANT="security-primary-recovery"
+  if ! run_scenario basic false; then
+    SCENARIO_VARIANT="$previous_variant"
+    return 1
+  fi
+  SCENARIO_VARIANT="$previous_variant"
+  printf '{"status":"passed","scenario":"security","mode":"primary","same_cgroup_probe":"%s","sibling_probe":"%s","cgroup_match":true,"unauthorized_classification":"metrics_verified","post_abuse_recovery":"passed","unix_only_cases":"not_applicable"}\n' \
+    "$(basename -- "$same_cgroup_output")" \
+    "$(basename -- "$sibling_output")" \
+    >"$RESULT_DIR/scenario-security-status.json"
+}
+
+run_unix_permissive_directory_control() {
+  local -r response_body="$RESULT_DIR/security-permissive-directory-response.json"
+  local -r response_status="$RESULT_DIR/security-permissive-directory-response.status"
+  local -r mode_evidence="$RESULT_DIR/security-permissive-directory-mode.txt"
+  local -r obi_log="$RESULT_DIR/security-permissive-directory-obi.log"
+  local failure_since=""
+  local recovery_since=""
+
+  log_info "proving the Unix bridge refuses a world-accessible socket directory"
+  BRIDGE_RUNNING=false
+  run_bounded 30 "${COMPOSE[@]}" stop --timeout 10 obi
+  run_bounded 10 "${COMPOSE[@]}" exec --no-TTY java-backend \
+    chmod 0777 /var/run/obi
+  UNIX_SECURITY_DIRECTORY_RELAXED=true
+  run_bounded 10 "${COMPOSE[@]}" exec --no-TTY java-backend \
+    /bin/sh -ec 'ls -ld /var/run/obi' >"$mode_evidence"
+  grep -Eq '^drwxrwxrwx' "$mode_evidence" || {
+    log_error "could not prove the Unix socket directory was made world accessible"
+    return 1
+  }
+
+  failure_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')"
+  run_bounded 60 "${COMPOSE[@]}" up --detach --no-deps --force-recreate obi
+  wait_for_log \
+    obi \
+    "must not be group writable or world accessible" \
+    "permissive Unix directory refusal" \
+    "$failure_since"
+  if run_bounded 10 "${COMPOSE[@]}" exec --no-TTY java-backend \
+    /bin/sh -ec 'test -S /var/run/obi/java-remote-parent.sock'; then
+    log_error "Unix bridge created a socket in a permissive directory"
+    return 1
+  fi
+
+  curl --fail --silent --show-error --max-time 10 \
+    --header 'x-obi-demo-id: security-permissive-directory' \
+    --output "$response_body" \
+    --write-out '%{http_code}\n' \
+    "http://127.0.0.1:18080/api/echo?close=1" >"$response_status"
+  if [[ "$(<"$response_status")" != "200" ]] || \
+    ! grep -Fq '"marker":"security-permissive-directory"' "$response_body"; then
+    log_error "application traffic did not fail open while the Unix directory was rejected"
+    return 1
+  fi
+  run_bounded 15 "${COMPOSE[@]}" logs --no-color --since "$failure_since" \
+    obi >"$obi_log"
+
+  run_bounded 30 "${COMPOSE[@]}" stop --timeout 10 obi
+  run_bounded 10 "${COMPOSE[@]}" exec --no-TTY java-backend \
+    chmod 0750 /var/run/obi
+  run_bounded 10 "${COMPOSE[@]}" exec --no-TTY java-backend \
+    /bin/sh -ec 'ls -ld /var/run/obi' >>"$mode_evidence"
+  tail -n 1 "$mode_evidence" | grep -Eq '^drwxr-x---' || {
+    log_error "could not prove the Unix socket directory permissions were restored"
+    return 1
+  }
+  UNIX_SECURITY_DIRECTORY_RELAXED=false
+  recovery_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')"
+  run_bounded 60 "${COMPOSE[@]}" up --detach --no-deps --force-recreate obi
+  wait_for_log \
+    obi \
+    "Java remote parent bridge ready" \
+    "post-permission Unix bridge recovery" \
+    "$recovery_since"
+  assert_selected_transport
+  [[ "$SELECTED_TRANSPORT" == "unix" ]] || {
+    log_error "post-permission recovery did not restore the Unix transport"
+    return 1
+  }
+  BRIDGE_RUNNING=true
+}
+
+run_unix_security_control() {
+  local -r abuse_output="$RESULT_DIR/security-abuse.json"
+  local -r endpoint_output="$RESULT_DIR/security-endpoint.log"
+  local -r security_logs="$RESULT_DIR/security-sanitized-logs.txt"
+  local security_since=""
+  local restart_since=""
+  local probe_container=""
+  local probe_exit=""
+  local previous_variant=""
+  local previous_metric_policy=""
+  local run_number=0
+  local phase_label=""
+
+  [[ "$TRANSPORT" == "unix" && "$SELECTED_TRANSPORT" == "unix" ]] || {
+    log_error "the security control requires the forced Unix transport"
+    return 1
+  }
+
+  security_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')"
+  capture_java_diagnostics "security-before"
+  assert_sanitized_java_diagnostics \
+    "$RESULT_DIR/phases/security-before/java-diagnostics.txt"
+
+  SECURITY_PROBE_MODE="abuse-race"
+  export SECURITY_PROBE_MODE
+  log_info "starting bounded Unix abuse while legitimate exact-parent traffic remains active"
+  run_bounded 60 \
+    "${COMPOSE[@]}" up --detach --no-deps --force-recreate security-probe
+  wait_for_log \
+    security-probe \
+    "security probe abuse race ready" \
+    "Unix abuse race barrier"
+  UNIX_SECURITY_RACE_CONTAINER="$(run_bounded 10 \
+    "${COMPOSE[@]}" ps --all --quiet security-probe)"
+  [[ -n "$UNIX_SECURITY_RACE_CONTAINER" ]] || {
+    log_error "could not resolve the Unix abuse-race container"
+    return 1
+  }
+
+  previous_variant="$SCENARIO_VARIANT"
+  previous_metric_policy="$ALLOW_UNIX_SECURITY_METRICS"
+  SCENARIO_VARIANT="security-unix-victim"
+  ALLOW_UNIX_SECURITY_METRICS=true
+  if ! run_scenario concurrency false; then
+    SCENARIO_VARIANT="$previous_variant"
+    ALLOW_UNIX_SECURITY_METRICS="$previous_metric_policy"
+    return 1
+  fi
+  SCENARIO_VARIANT="$previous_variant"
+  ALLOW_UNIX_SECURITY_METRICS="$previous_metric_policy"
+
+  for ((run_number = 1; run_number <= REPEAT_COUNT; run_number++)); do
+    phase_label="concurrency-security-unix-victim"
+    if ((REPEAT_COUNT > 1)); then
+      printf -v phase_label '%s-run-%02d' "$phase_label" "$run_number"
+    fi
+    assert_security_metric_delta \
+      "$RESULT_DIR/phases/$phase_label-after/obi-metrics.delta" \
+      take unauthorized unix 1
+  done
+
+  run_bounded 15 docker kill --signal SIGUSR1 \
+    "$UNIX_SECURITY_RACE_CONTAINER" >/dev/null
+  probe_exit="$(run_bounded 60 docker wait "$UNIX_SECURITY_RACE_CONTAINER")"
+  [[ "$probe_exit" == "0" ]] || {
+    log_error "Unix abuse-race probe exited with status $probe_exit"
+    return 1
+  }
+  run_bounded 15 \
+    "${COMPOSE[@]}" logs --no-color security-probe >"$abuse_output"
+  UNIX_SECURITY_RACE_CONTAINER=""
+  if ! grep -Fq '"status":"passed","mode":"abuse-race"' "$abuse_output" || \
+    ! grep -Eq '"attempts":[1-9][0-9]*' "$abuse_output" || \
+    ! grep -Fq '"name":"concurrent-repeated-unauthorized","outcome":"bounded"' \
+      "$abuse_output"; then
+    log_error "Unix abuse-race probe did not emit explicit bounded pass evidence"
+    return 1
+  fi
+
+  SECURITY_PROBE_MODE="endpoint"
+  export SECURITY_PROBE_MODE
+  log_info "installing a bounded replacement endpoint around an OBI restart"
+  run_bounded 60 \
+    "${COMPOSE[@]}" up --detach --no-deps --force-recreate security-probe
+  wait_for_log \
+    security-probe \
+    "security probe replacement ready" \
+    "security endpoint replacement barrier"
+  probe_container="$(run_bounded 10 "${COMPOSE[@]}" ps --all --quiet security-probe)"
+  [[ -n "$probe_container" ]] || {
+    log_error "could not resolve the security probe container"
+    return 1
+  }
+
+  restart_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')"
+  BRIDGE_RUNNING=false
+  run_bounded 60 "${COMPOSE[@]}" restart --timeout 10 obi
+  wait_for_log \
+    obi \
+    "refusing to replace non-socket Java bridge path" \
+    "replacement endpoint fail-closed restart" \
+    "$restart_since"
+  run_bounded 15 "${COMPOSE[@]}" kill --signal SIGUSR1 security-probe
+  probe_exit="$(run_bounded 60 docker wait "$probe_container")"
+  [[ "$probe_exit" == "0" ]] || {
+    log_error "security endpoint probe exited with status $probe_exit"
+    return 1
+  }
+  run_bounded 15 \
+    "${COMPOSE[@]}" logs --no-color security-probe >"$endpoint_output"
+  grep -Fq '"status":"passed","mode":"endpoint"' "$endpoint_output" || {
+    log_error "security endpoint probe did not emit explicit pass evidence"
+    return 1
+  }
+
+  wait_for_log \
+    obi \
+    "Java remote-parent fallback transport recovered" \
+    "post-replacement Unix bridge recovery" \
+    "$restart_since"
+  BRIDGE_RUNNING=true
+  SELECTED_TRANSPORT="unix"
+
+  capture_java_diagnostics "security-after"
+  assert_sanitized_java_diagnostics \
+    "$RESULT_DIR/phases/security-after/java-diagnostics.txt"
+  run_bounded 15 \
+    "${COMPOSE[@]}" logs --no-color --since "$security_since" \
+      obi java-backend security-probe >"$security_logs"
+  if grep -Fq 'OBI_SECURITY_PROBE_PAYLOAD_CANARY' \
+    "$abuse_output" "$endpoint_output" "$security_logs" \
+    "$RESULT_DIR/phases/security-before/java-diagnostics.txt" \
+    "$RESULT_DIR/phases/security-after/java-diagnostics.txt"; then
+    log_error "security diagnostics disclosed the probe payload canary"
+    return 1
+  fi
+
+  run_unix_permissive_directory_control
+
+  previous_variant="$SCENARIO_VARIANT"
+  SCENARIO_VARIANT="security-recovery"
+  if ! run_scenario basic false; then
+    SCENARIO_VARIANT="$previous_variant"
+    return 1
+  fi
+  SCENARIO_VARIANT="$previous_variant"
+  printf '{"status":"passed","scenario":"security","mode":"unix","abuse_race":"%s","concurrent_victim":"passed","endpoint":"%s","permissive_directory":"refused","post_abuse_recovery":"passed","primary_only_cases":"not_applicable"}\n' \
+    "$(basename -- "$abuse_output")" \
+    "$(basename -- "$endpoint_output")" \
+    >"$RESULT_DIR/scenario-security-status.json"
+}
+
 record_unsupported_scenario() {
   local -r name="$1"
   local -r reason="$2"
@@ -1896,7 +2641,24 @@ record_unsupported_scenario() {
     >"$RESULT_DIR/scenario-$name-status.json"
 }
 
+run_security_control() {
+  case "$SELECTED_TRANSPORT" in
+    getsockopt)
+      run_primary_security_control
+      ;;
+    unix)
+      run_unix_security_control
+      ;;
+    *)
+      log_error "security control cannot run with selected transport ${SELECTED_TRANSPORT:-unknown}"
+      return 1
+      ;;
+  esac
+}
+
 run_disabled_control() {
+  local recreate_since=""
+
   log_info "recreating Java and OBI with only the remote-parent bridge disabled"
   BRIDGE_RUNNING=false
   export BRIDGE_TRANSPORT=disabled
@@ -1905,11 +2667,21 @@ run_disabled_control() {
   export OTEL_JAVAAGENT_EXTENSIONS_VALUE="/otel/obi-otel-extension.jar"
   export OTEL_PROPAGATORS_VALUE="obi,tracecontext,baggage"
   run_bounded 30 "${COMPOSE[@]}" config >"$RESULT_DIR/compose-disabled-control.yaml"
+  recreate_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')"
   run_bounded 120 \
     "${COMPOSE[@]}" up --detach --force-recreate \
       java-backend apache-proxy obi
-  wait_for_http "http://127.0.0.1:18080/healthz" "disabled-control HTTPS path"
-  wait_for_log java-backend "OBI remote-parent propagator enabled" "disabled-control external extension"
+  wait_for_log \
+    java-backend \
+    "OBI remote-parent propagator enabled" \
+    "disabled-control external extension" \
+    "$recreate_since"
+  wait_for_log \
+    java-backend \
+    "OBI Java instrumentation ready" \
+    "disabled-control Java instrumentation" \
+    "$recreate_since"
+  wait_for_http "$APACHE_HTTPS_HEALTH_ENDPOINT" "disabled-control HTTPS path"
   assert_runtime_contract disabled
   run_scenario disabled
 }
@@ -1928,7 +2700,7 @@ run_uninstrumented_control() {
   run_bounded 120 \
     "${COMPOSE[@]}" up --detach --force-recreate \
       java-backend apache-proxy
-  wait_for_http "http://127.0.0.1:18080/healthz" "uninstrumented-control HTTPS path"
+  wait_for_http "$APACHE_HTTPS_HEALTH_ENDPOINT" "uninstrumented-control HTTPS path"
   assert_runtime_contract uninstrumented
   capture_control_response "uninstrumented-control"
   cmp \
@@ -1975,12 +2747,14 @@ execute_requested_scenarios() {
   case "$SCENARIO" in
     all)
       run_scenario basic
+      run_security_control
       run_scenario keepalive
       run_scenario pipelining
       run_scenario concurrency
       run_scenario connection-churn
       run_scenario fd-port-reuse
       run_scenario slow-body
+      run_scenario tls-boundary
       run_scenario timeout-retry
       run_scenario pressure
       run_scenario handoff
@@ -2027,6 +2801,9 @@ execute_requested_scenarios() {
       ;;
     w3c-fault)
       run_w3c_fault_control
+      ;;
+    security)
+      run_security_control
       ;;
     uninstrumented)
       run_scenario uninstrumented
@@ -2293,11 +3070,15 @@ assert_bridge_metric_delta() {
   local -r transport="$2"
   local -r expected_takes="$3"
   local -r expected_discards="$4"
+  local -r expected_missing="${5:-0}"
 
   awk \
     -v selected="$transport" \
     -v wanted_takes="$expected_takes" \
-    -v wanted_discards="$expected_discards" '
+    -v wanted_discards="$expected_discards" \
+    -v wanted_missing="$expected_missing" \
+    -v allow_primary_security="$ALLOW_PRIMARY_SECURITY_METRICS" \
+    -v allow_unix_security="$ALLOW_UNIX_SECURITY_METRICS" '
     function label(line, name, value) {
       value = line
       sub("^.*" name "=\"", "", value)
@@ -2321,29 +3102,111 @@ assert_bridge_metric_delta() {
         next
       }
       if (operation == "take" || operation == "discard") {
+        security_allowed = allow_primary_security == "true" &&
+          operation == "take" && status == "unauthorized" &&
+          transport == "getsockopt" && selected == "getsockopt"
+        security_allowed = security_allowed || (allow_unix_security == "true" &&
+          operation == "take" && status == "unauthorized" &&
+          transport == "unix" && selected == "unix")
         if (transport == selected && status == "valid") {
           if (operation == "take") {
             takes += delta
           } else {
             discards += delta
           }
-        } else if (delta != 0) {
+        } else if (transport == selected && operation == "take" && status == "missing") {
+          missing += delta
+        } else if (delta != 0 && !security_allowed) {
           printf "unexpected bridge retrieval result: %s\n", $0 > "/dev/stderr"
           failed = 1
         }
         next
       }
-      allowed = operation == "stage" && transport == "tcp" && status == "valid"
+      if (transport == "tcp" && status == "valid") {
+        if (operation == "candidate") {
+          candidates += delta
+        } else if (operation == "inject") {
+          injections += delta
+        } else if (operation == "stage") {
+          stages += delta
+        }
+      }
+      allowed = operation == "candidate" && transport == "tcp" && status == "valid"
+      allowed = allowed || (operation == "inject" && transport == "tcp" && status == "valid")
+      allowed = allowed || (operation == "stage" && transport == "tcp" && status == "valid")
       allowed = allowed || (operation == "negotiate" && status == "missing" && transport == selected)
+      allowed = allowed || (allow_primary_security == "true" && operation == "negotiate" &&
+        status == "unauthorized" && transport == "getsockopt" && selected == "getsockopt")
+      allowed = allowed || (operation == "candidate" && status == "ambiguous" && transport == "tcp")
+      allowed = allowed || (operation == "cleanup" && status == "valid" && transport == "tcp")
       if (delta != 0 && !allowed) {
         printf "unexpected bridge operation result: %s\n", $0 > "/dev/stderr"
         failed = 1
       }
     }
     END {
-      if (takes != wanted_takes || discards != wanted_discards) {
-        printf "expected %s take/valid=%d discard/valid=%d, got take=%d discard=%d\n",
-          selected, wanted_takes, wanted_discards, takes, discards > "/dev/stderr"
+      if (candidates != wanted_takes || injections != wanted_takes || stages != wanted_takes ||
+          takes != wanted_takes || discards != wanted_discards || missing != wanted_missing) {
+        printf "expected lifecycle=%d/%d/%d %s take/valid=%d discard/valid=%d take/missing=%d, got lifecycle=%d/%d/%d take=%d discard=%d missing=%d\n",
+          wanted_takes, wanted_takes, wanted_takes, selected,
+          wanted_takes, wanted_discards, wanted_missing,
+          candidates, injections, stages, takes, discards, missing > "/dev/stderr"
+        failed = 1
+      }
+      exit failed ? 1 : 0
+    }
+  ' "$input"
+}
+
+assert_primary_security_metric_delta() {
+  local -r input="$1"
+  local -r operation="$2"
+  local -r minimum="$3"
+  local -r maximum="${4:-}"
+
+  assert_security_metric_delta \
+    "$input" "$operation" unauthorized getsockopt "$minimum" "$maximum"
+}
+
+assert_security_metric_delta() {
+  local -r input="$1"
+  local -r operation="$2"
+  local -r status="$3"
+  local -r transport="$4"
+  local -r minimum="$5"
+  local -r maximum="${6:-}"
+
+  awk \
+    -v wanted_operation="$operation" \
+    -v wanted_status="$status" \
+    -v wanted_transport="$transport" \
+    -v minimum="$minimum" \
+    -v maximum="$maximum" '
+    index($0, "operation=\"" wanted_operation "\"") &&
+    index($0, "status=\"" wanted_status "\"") &&
+    index($0, "transport=\"" wanted_transport "\"") {
+      for (field = 1; field <= NF; field++) {
+        if ($field ~ /^delta=/) {
+          value = $field
+          sub(/^delta=/, "", value)
+          if (value !~ /^[0-9]+$/) {
+            printf "invalid security metric delta: %s\n", $0 > "/dev/stderr"
+            failed = 1
+          } else {
+            total += value
+          }
+        }
+      }
+    }
+    END {
+      if (total < minimum) {
+        printf "expected %s/%s %s delta >= %d, got %d\n",
+          wanted_operation, wanted_status, wanted_transport, minimum, total > "/dev/stderr"
+        failed = 1
+      }
+      if (maximum != "" && total > maximum) {
+        printf "expected %s/%s %s delta <= %d, got %d\n",
+          wanted_operation, wanted_status, wanted_transport, maximum, total > "/dev/stderr"
         failed = 1
       }
       exit failed ? 1 : 0
@@ -2429,11 +3292,12 @@ assert_java_diagnostics_delta() {
   local -r expected_valid="$2"
   local -r expected_stale="$3"
   local -r expected_malformed="$4"
-  local -r expected_sampled="$5"
-  local -r expected_unsampled="$6"
-  local -r expected_standard="$7"
-  local -r expected_fault_status="${8:-}"
-  local -r expected_fault_count="${9:-0}"
+  local -r expected_missing="$5"
+  local -r expected_sampled="$6"
+  local -r expected_unsampled="$7"
+  local -r expected_standard="$8"
+  local -r expected_fault_status="${9:-}"
+  local -r expected_fault_count="${10:-0}"
   local name=""
   local actual=""
   local expected=""
@@ -2448,6 +3312,7 @@ assert_java_diagnostics_delta() {
     expected=0
     case "$name" in
       t_valid) expected="$expected_valid" ;;
+      t_missing) expected="$expected_missing" ;;
       t_stale) expected="$expected_stale" ;;
       t_malformed) expected="$expected_malformed" ;;
       "t_$expected_fault_status") expected="$expected_fault_count" ;;

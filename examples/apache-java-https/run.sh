@@ -19,6 +19,7 @@ MAX_SECURITY_PROBE_TIMEOUT_SECONDS=3600
 PROJECT_NAMESPACE="obi-apache-java-https"
 PROJECT_SENTINEL_LABEL="io.opentelemetry.obi.apache-java-https.owner"
 PROJECT_SENTINEL_VALUE="acceptance-demo-v1"
+APACHE_EXPECTED_PROCESS_COUNT=9
 APACHE_HTTPS_HEALTH_ENDPOINT="http://127.0.0.1:18080/healthz?close=1"
 PRIMARY_SECURITY_PROBE_PATH="/tmp/security-probe"
 PRIMARY_SECURITY_PID_PATH="/tmp/security-probe.pid"
@@ -30,7 +31,8 @@ readonly SECURITY_PROBE_SAME_CGROUP_FIXED_BUDGET_SECONDS
 readonly SECURITY_PROBE_SIBLING_FIXED_BUDGET_SECONDS
 readonly SECURITY_PROBE_TIMEOUT_SLACK_SECONDS
 readonly MAX_SECURITY_PROBE_TIMEOUT_SECONDS PROJECT_NAMESPACE
-readonly PROJECT_SENTINEL_LABEL PROJECT_SENTINEL_VALUE APACHE_HTTPS_HEALTH_ENDPOINT
+readonly PROJECT_SENTINEL_LABEL PROJECT_SENTINEL_VALUE APACHE_EXPECTED_PROCESS_COUNT
+readonly APACHE_HTTPS_HEALTH_ENDPOINT
 readonly PRIMARY_SECURITY_PROBE_PATH PRIMARY_SECURITY_PID_PATH
 readonly UNIX_PERMISSION_REFUSAL_PATTERN
 
@@ -965,9 +967,163 @@ start_stack() {
   fi
   if [[ "$SCENARIO" != "uninstrumented" ]]; then
     wait_for_log java-backend "OBI Java instrumentation ready" "injected Java instrumentation"
+    wait_for_apache_instrumentation startup
   fi
   wait_for_http "$APACHE_HTTPS_HEALTH_ENDPOINT" "verified Apache-to-Jetty HTTPS path"
   assert_runtime_contract
+}
+
+remaining_timeout_seconds() {
+  local -r deadline="$1"
+  local -r maximum="$2"
+  local -i remaining=0
+
+  [[ "$deadline" =~ ^[1-9][0-9]*$ && "$maximum" =~ ^[1-9][0-9]*$ ]] || return 1
+  ((remaining = deadline - SECONDS, remaining > 0)) || return 1
+  if ((remaining > maximum)); then
+    remaining="$maximum"
+  fi
+  printf '%d\n' "$remaining"
+}
+
+apache_process_count() {
+  local -r deadline="$1"
+  local container_id=""
+  local command_timeout=""
+
+  command_timeout="$(remaining_timeout_seconds "$deadline" 10)" || return 1
+  container_id="$(run_bounded "$command_timeout" \
+    "${COMPOSE[@]}" ps --quiet apache-proxy 2>/dev/null)" || return 1
+  [[ "$container_id" =~ ^[0-9a-f]+$ ]] || return 1
+  command_timeout="$(remaining_timeout_seconds "$deadline" 10)" || return 1
+  run_bounded "$command_timeout" \
+    docker top "$container_id" -eo pid,comm 2>/dev/null | awk '
+    $2 == "httpd" { count++ }
+    END { print count + 0 }
+  '
+}
+
+instrumented_apache_process_count() {
+  local -r metrics="$1"
+
+  awk '
+    $1 ~ /^obi_instrumented_processes\{/ &&
+    $1 ~ /[{,]process_name="httpd"[,}]/ {
+      matches++
+      if ($2 !~ /^[0-9]+$/) {
+        invalid = 1
+      } else {
+        value = $2
+      }
+    }
+    END {
+      if (matches != 1 || invalid) {
+        exit 1
+      }
+      print value + 0
+    }
+  ' "$metrics"
+}
+
+wait_for_apache_instrumentation() {
+  local -r label="$1"
+  local metrics=""
+  local metrics_timeout=""
+  local process_count=0
+  local instrumented_count=0
+  local -i consecutive_matches=0
+  local -i deadline=0
+
+  [[ "$label" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || {
+    log_error "refusing invalid Apache readiness label: $label"
+    return 1
+  }
+  metrics="$(mktemp "$RESULT_DIR/.apache-readiness.XXXXXX")"
+  deadline="$((SECONDS + READINESS_TIMEOUT_SECONDS))"
+  while ((SECONDS < deadline)); do
+    process_count=0
+    if process_count="$(apache_process_count "$deadline" 2>/dev/null)"; then
+      :
+    else
+      process_count=0
+    fi
+    instrumented_count=0
+    metrics_timeout="$(remaining_timeout_seconds "$deadline" 5)" || break
+    if fetch_obi_metrics "$metrics" "$metrics_timeout" 2>/dev/null &&
+      instrumented_count="$(instrumented_apache_process_count "$metrics")"; then
+      :
+    else
+      instrumented_count=0
+    fi
+    if ((SECONDS < deadline)) &&
+      [[ "$process_count" == "$APACHE_EXPECTED_PROCESS_COUNT" &&
+      "$instrumented_count" == "$APACHE_EXPECTED_PROCESS_COUNT" ]]; then
+      ((consecutive_matches += 1))
+      if ((consecutive_matches == 2)); then
+        install -m 0644 "$metrics" "$RESULT_DIR/apache-instrumentation-$label.prom"
+        {
+          printf 'expected_processes=%d\n' "$APACHE_EXPECTED_PROCESS_COUNT"
+          printf 'observed_processes=%s\n' "$process_count"
+          printf 'instrumented_processes=%s\n' "$instrumented_count"
+        } >"$RESULT_DIR/apache-instrumentation-$label.txt"
+        rm -f -- "$metrics"
+        log_info "all $APACHE_EXPECTED_PROCESS_COUNT Apache processes are instrumented"
+        return 0
+      fi
+    else
+      consecutive_matches=0
+    fi
+    if ((SECONDS < deadline)); then
+      sleep 1
+    fi
+  done
+  rm -f -- "$metrics"
+  log_error "Apache instrumentation readiness expected $APACHE_EXPECTED_PROCESS_COUNT processes, got processes=${process_count:-unavailable} instrumented=${instrumented_count:-unavailable}"
+  return 1
+}
+
+wait_for_apache_instrumentation_drain() {
+  local -r label="$1"
+  local metrics=""
+  local metrics_timeout=""
+  local instrumented_count=""
+  local -i consecutive_matches=0
+  local -i deadline=0
+
+  [[ "$label" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || {
+    log_error "refusing invalid Apache drain label: $label"
+    return 1
+  }
+  metrics="$(mktemp "$RESULT_DIR/.apache-drain.XXXXXX")"
+  deadline="$((SECONDS + READINESS_TIMEOUT_SECONDS))"
+  while ((SECONDS < deadline)); do
+    metrics_timeout="$(remaining_timeout_seconds "$deadline" 5)" || break
+    instrumented_count=""
+    if fetch_obi_metrics "$metrics" "$metrics_timeout" 2>/dev/null &&
+      instrumented_count="$(instrumented_apache_process_count "$metrics")" &&
+      ((SECONDS < deadline)) &&
+      [[ "$instrumented_count" == "0" ]]; then
+      ((consecutive_matches += 1))
+      if ((consecutive_matches == 2)); then
+        install -m 0644 "$metrics" "$RESULT_DIR/apache-instrumentation-drain-$label.prom"
+        {
+          printf 'expected_instrumented_processes=0\n'
+          printf 'instrumented_processes=%s\n' "$instrumented_count"
+        } >"$RESULT_DIR/apache-instrumentation-drain-$label.txt"
+        rm -f -- "$metrics"
+        log_info "Apache instrumentation drained before $label replacement"
+        return 0
+      fi
+    else
+      consecutive_matches=0
+    fi
+    if ((SECONDS < deadline)); then
+      sleep 1
+    fi
+  done
+  rm -f -- "$metrics"
+  log_error "Apache instrumentation did not drain before $label replacement, got instrumented=${instrumented_count:-unavailable}"
+  return 1
 }
 
 wait_for_http() {
@@ -1182,8 +1338,10 @@ java_duplicate_suppression_present() {
 
 fetch_obi_metrics() {
   local -r output="$1"
+  local -r timeout_seconds="${2:-5}"
 
-  curl --fail --silent --show-error --max-time 5 \
+  [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || return 1
+  curl --fail --silent --show-error --max-time "$timeout_seconds" \
     "http://127.0.0.1:18990/internal/metrics" >"$output"
 }
 
@@ -1922,6 +2080,7 @@ run_late_attach_control() {
   assert_selected_transport
   log_info "recycling Apache connections created before late attach"
   run_bounded 60 "${COMPOSE[@]}" stop --timeout 10 apache-proxy
+  wait_for_apache_instrumentation_drain late-attach
   apache_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')"
   run_bounded 120 \
     "${COMPOSE[@]}" up --detach --force-recreate --no-deps apache-proxy
@@ -1930,6 +2089,7 @@ run_late_attach_control() {
     "cmd=/usr/local/apache2/bin/httpd" \
     "late-attach Apache instrumentation" \
     "$apache_since"
+  wait_for_apache_instrumentation late-attach
   wait_for_http \
     "$APACHE_HTTPS_HEALTH_ENDPOINT" \
     "late-attach recovered HTTPS path"
@@ -2021,6 +2181,7 @@ run_restart_during_traffic_control() (
     "$restart_since" || return $?
   BRIDGE_RUNNING=true
   assert_selected_transport
+  wait_for_apache_instrumentation restart-fault-recovery
   capture_phase_evidence "$after_phase"
   capture_java_diagnostics "$after_phase"
   write_java_diagnostics_delta \
@@ -2110,6 +2271,7 @@ recreate_instrumented_stack() {
     "$recreate_since"
   BRIDGE_RUNNING=true
   assert_selected_transport
+  wait_for_apache_instrumentation recreate-instrumented
   wait_for_http "$APACHE_HTTPS_HEALTH_ENDPOINT" "$label HTTPS path"
 }
 
@@ -2652,11 +2814,17 @@ run_unix_permissive_directory_control() {
     "Java remote parent bridge ready" \
     "post-permission Unix bridge recovery" \
     "$recovery_since"
+  wait_for_log \
+    java-backend \
+    "OBI remote-parent provider ready" \
+    "post-permission Java bridge provider" \
+    "$recovery_since"
   assert_selected_transport
   [[ "$SELECTED_TRANSPORT" == "unix" ]] || {
     log_error "post-permission recovery did not restore the Unix transport"
     return 1
   }
+  wait_for_apache_instrumentation unix-permission-recovery
   BRIDGE_RUNNING=true
 }
 
@@ -2864,6 +3032,7 @@ run_disabled_control() {
     "OBI Java instrumentation ready" \
     "disabled-control Java instrumentation" \
     "$recreate_since"
+  wait_for_apache_instrumentation disabled-control
   wait_for_http "$APACHE_HTTPS_HEALTH_ENDPOINT" "disabled-control HTTPS path"
   assert_runtime_contract disabled
   run_scenario disabled
@@ -2972,8 +3141,14 @@ execute_requested_scenarios() {
         "Java remote parent bridge ready" \
         "restarted OBI remote-parent bridge" \
         "$restart_since"
+      wait_for_log \
+        java-backend \
+        "OBI remote-parent provider ready" \
+        "restarted Java bridge provider" \
+        "$restart_since"
       BRIDGE_RUNNING=true
       assert_selected_transport
+      wait_for_apache_instrumentation restart
       run_scenario restart
       ;;
     restart-fault)

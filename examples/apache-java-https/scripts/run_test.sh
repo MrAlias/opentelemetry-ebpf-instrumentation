@@ -951,6 +951,12 @@ test_permissive_unix_directory_control_refuses_and_restores() {
     assert_selected_transport() {
       SELECTED_TRANSPORT=unix
     }
+    wait_for_log() {
+      printf 'log:%s:%s\n' "$3" "${4:-}" >>"$observed"
+    }
+    wait_for_apache_instrumentation() {
+      printf 'apache:%s\n' "$1" >>"$observed"
+    }
     date() {
       printf 'security-cursor\n'
     }
@@ -968,10 +974,10 @@ test_permissive_unix_directory_control_refuses_and_restores() {
       printf '200\n'
     }
 
-    run_unix_permissive_directory_control
-    [[ "$directory_mode" == "0750" ]]
-    [[ "$UNIX_SECURITY_DIRECTORY_RELAXED" == "false" ]]
-    [[ "$BRIDGE_RUNNING" == "true" ]]
+    run_unix_permissive_directory_control || return 1
+    [[ "$directory_mode" == "0750" ]] || return 1
+    [[ "$UNIX_SECURITY_DIRECTORY_RELAXED" == "false" ]] || return 1
+    [[ "$BRIDGE_RUNNING" == "true" ]] || return 1
   ) || {
     printf 'permissive Unix directory control did not refuse and restore safely\n' >&2
     return 1
@@ -979,6 +985,17 @@ test_permissive_unix_directory_control_refuses_and_restores() {
   grep -Fq "$UNIX_PERMISSION_REFUSAL_PATTERN" \
     "$result_dir/security-permissive-directory-obi.log"
   grep -Fq 'logs --no-color --since security-cursor obi' "$observed"
+  awk '
+    /up --detach --no-deps --force-recreate obi/ { recovery = NR }
+    $0 == "log:post-permission Java bridge provider:security-cursor" { provider = NR }
+    $0 == "apache:unix-permission-recovery" { readiness = NR }
+    END {
+      exit recovery > 0 && provider > recovery && readiness > provider ? 0 : 1
+    }
+  ' "$observed" || {
+    printf 'Unix permission recovery resumed before Apache instrumentation readiness\n' >&2
+    return 1
+  }
 }
 
 write_diagnostics_fixture() {
@@ -1752,6 +1769,9 @@ test_instrumented_readiness_precedes_https_traffic() {
     assert_runtime_contract() {
       printf 'runtime\n' >>"$observed"
     }
+    wait_for_apache_instrumentation() {
+      printf 'apache:%s\n' "$1" >>"$observed"
+    }
 
     start_stack
   ) || {
@@ -1766,6 +1786,7 @@ test_instrumented_readiness_precedes_https_traffic() {
     'log:external OTel extension' \
     'transport' \
     'log:injected Java instrumentation' \
+    'apache:startup' \
     'http:verified Apache-to-Jetty HTTPS path' \
     'runtime' >"$expected"
   cmp -s -- "$expected" "$observed" || {
@@ -1773,6 +1794,276 @@ test_instrumented_readiness_precedes_https_traffic() {
     diff -u -- "$expected" "$observed" >&2 || true
     return 1
   }
+}
+
+test_apache_readiness_requires_the_full_pool() {
+  local -r result_dir="$TEST_TMP_DIR/apache-readiness"
+
+  mkdir -p -- "$result_dir"
+  (
+    RESULT_DIR="$result_dir"
+    READINESS_TIMEOUT_SECONDS=4
+    local -i metric_calls=0
+    apache_process_count() {
+      printf '%d\n' "$APACHE_EXPECTED_PROCESS_COUNT"
+    }
+    fetch_obi_metrics() {
+      ((metric_calls += 1))
+      if ((metric_calls == 1)); then
+        printf 'obi_instrumented_processes{process_name="httpd"} 8\n' >"$1"
+      else
+        printf 'obi_instrumented_processes{process_name="httpd"} 9\n' >"$1"
+      fi
+    }
+    sleep() {
+      SECONDS="$((SECONDS + 1))"
+    }
+
+    wait_for_apache_instrumentation test || return 1
+    ((metric_calls == 3)) || return 1
+    grep -Fqx 'expected_processes=9' \
+      "$RESULT_DIR/apache-instrumentation-test.txt" || return 1
+    grep -Fqx 'observed_processes=9' "$RESULT_DIR/apache-instrumentation-test.txt" || return 1
+    grep -Fqx 'instrumented_processes=9' \
+      "$RESULT_DIR/apache-instrumentation-test.txt" || return 1
+  ) || {
+    printf 'Apache readiness did not require two full-pool observations\n' >&2
+    return 1
+  }
+
+  if (
+    RESULT_DIR="$result_dir"
+    READINESS_TIMEOUT_SECONDS=2
+    apache_process_count() {
+      printf '8\n'
+    }
+    fetch_obi_metrics() {
+      printf 'obi_instrumented_processes{process_name="httpd"} 8\n' >"$1"
+    }
+    sleep() {
+      SECONDS="$((SECONDS + 1))"
+    }
+
+    wait_for_apache_instrumentation incomplete
+  ) >/dev/null 2>&1; then
+    printf 'Apache readiness accepted an undersized process pool\n' >&2
+    return 1
+  fi
+}
+
+test_apache_instrumented_process_metric_is_exact() {
+  local -r metrics="$TEST_TMP_DIR/apache-instrumented-processes.prom"
+
+  printf 'obi_instrumented_processes{process_name="httpd"} 9\n' >"$metrics"
+  [[ "$(instrumented_apache_process_count "$metrics")" == "9" ]] || {
+    printf 'Apache process metric rejected one exact integer series\n' >&2
+    return 1
+  }
+
+  printf 'obi_instrumented_processes{process_name="httpd"} 9.4\n' >"$metrics"
+  if instrumented_apache_process_count "$metrics" >/dev/null 2>&1; then
+    printf 'Apache process metric rounded a fractional value\n' >&2
+    return 1
+  fi
+
+  printf 'obi_instrumented_processes{process_name="httpd"} NaN\n' >"$metrics"
+  if instrumented_apache_process_count "$metrics" >/dev/null 2>&1; then
+    printf 'Apache process metric accepted a malformed value\n' >&2
+    return 1
+  fi
+
+  printf '%s\n' \
+    'obi_instrumented_processes{process_name="httpd"} 4' \
+    'obi_instrumented_processes{process_name="httpd",source="duplicate"} 5' \
+    >"$metrics"
+  if instrumented_apache_process_count "$metrics" >/dev/null 2>&1; then
+    printf 'Apache process metric accepted duplicate matching series\n' >&2
+    return 1
+  fi
+
+  printf 'obi_instrumented_processes{process_name="java"} 1\n' >"$metrics"
+  if instrumented_apache_process_count "$metrics" >/dev/null 2>&1; then
+    printf 'Apache process metric accepted a missing httpd series\n' >&2
+    return 1
+  fi
+}
+
+test_apache_readiness_uses_elapsed_deadline() {
+  local -r result_dir="$TEST_TMP_DIR/apache-readiness-deadline"
+
+  mkdir -p -- "$result_dir"
+  (
+    RESULT_DIR="$result_dir"
+    READINESS_TIMEOUT_SECONDS=2
+    SECONDS=0
+    local -i metric_calls=0
+    local -i sleep_calls=0
+    apache_process_count() {
+      printf '%d\n' "$APACHE_EXPECTED_PROCESS_COUNT"
+    }
+    fetch_obi_metrics() {
+      ((metric_calls += 1))
+      printf 'obi_instrumented_processes{process_name="httpd"} 9\n' >"$1"
+      SECONDS="$((SECONDS + READINESS_TIMEOUT_SECONDS))"
+    }
+    sleep() {
+      ((sleep_calls += 1))
+    }
+
+    if wait_for_apache_instrumentation deadline >/dev/null 2>&1; then
+      printf 'Apache readiness accepted one sample after its deadline\n' >&2
+      return 1
+    fi
+    ((metric_calls == 1)) || return 1
+    ((sleep_calls == 0)) || return 1
+  ) || {
+    printf 'Apache readiness did not enforce an elapsed-time deadline\n' >&2
+    return 1
+  }
+}
+
+test_apache_instrumentation_drain_is_a_generation_boundary() {
+  local -r result_dir="$TEST_TMP_DIR/apache-instrumentation-drain"
+
+  mkdir -p -- "$result_dir"
+  (
+    RESULT_DIR="$result_dir"
+    READINESS_TIMEOUT_SECONDS=5
+    SECONDS=0
+    local -i metric_calls=0
+    fetch_obi_metrics() {
+      ((metric_calls += 1))
+      if ((metric_calls == 1)); then
+        printf 'obi_instrumented_processes{process_name="httpd"} 9\n' >"$1"
+      else
+        printf 'obi_instrumented_processes{process_name="httpd"} 0\n' >"$1"
+      fi
+    }
+    sleep() {
+      SECONDS="$((SECONDS + 1))"
+    }
+
+    wait_for_apache_instrumentation_drain test || return 1
+    ((metric_calls == 3)) || return 1
+    grep -Fqx 'expected_instrumented_processes=0' \
+      "$RESULT_DIR/apache-instrumentation-drain-test.txt" || return 1
+    grep -Fqx 'instrumented_processes=0' \
+      "$RESULT_DIR/apache-instrumentation-drain-test.txt" || return 1
+  ) || {
+    printf 'Apache instrumentation drain did not require a stable zero boundary\n' >&2
+    return 1
+  }
+
+  if (
+    RESULT_DIR="$result_dir"
+    READINESS_TIMEOUT_SECONDS=2
+    SECONDS=0
+    fetch_obi_metrics() {
+      printf 'obi_instrumented_processes{process_name="httpd"} 9\n' >"$1"
+    }
+    sleep() {
+      SECONDS="$((SECONDS + 1))"
+    }
+
+    wait_for_apache_instrumentation_drain stale
+  ) >/dev/null 2>&1; then
+    printf 'Apache instrumentation drain accepted a stale old generation\n' >&2
+    return 1
+  fi
+}
+
+test_apache_process_count_uses_docker_compatible_columns() {
+  local -r calls="$TEST_TMP_DIR/apache-process-count.calls"
+
+  (
+    COMPOSE=(docker compose)
+    run_bounded() {
+      printf '%s\n' "$*" >>"$calls"
+      if [[ "$2 $3 $4 $5" == "docker compose ps --quiet" ]]; then
+        printf '0123456789abcdef\n'
+      elif [[ "$2 $3 $5 $6" == "docker top -eo pid,comm" ]]; then
+        printf 'PID COMMAND\n'
+        printf '101 httpd\n'
+        printf '102 httpd\n'
+        printf '103 java\n'
+      else
+        return 64
+      fi
+    }
+
+    [[ "$(apache_process_count "$((SECONDS + 60))")" == "2" ]] || return 1
+    grep -Fqx '10 docker top 0123456789abcdef -eo pid,comm' "$calls" || return 1
+  ) || {
+    printf 'Apache process count did not request Docker-compatible PID and command columns\n' >&2
+    return 1
+  }
+}
+
+test_apache_readiness_rejects_failed_process_inspection() {
+  local -r result_dir="$TEST_TMP_DIR/apache-process-inspection-failure"
+
+  mkdir -p -- "$result_dir"
+  if (
+    RESULT_DIR="$result_dir"
+    READINESS_TIMEOUT_SECONDS=2
+    SECONDS=0
+    COMPOSE=(docker compose)
+    run_bounded() {
+      local pid=0
+
+      if [[ "$2 $3 $4 $5" == "docker compose ps --quiet" ]]; then
+        printf '0123456789abcdef\n'
+      elif [[ "$2 $3 $5 $6" == "docker top -eo pid,comm" ]]; then
+        printf 'PID COMMAND\n'
+        for pid in {101..109}; do
+          printf '%d httpd\n' "$pid"
+        done
+        return 42
+      else
+        return 64
+      fi
+    }
+    fetch_obi_metrics() {
+      printf 'obi_instrumented_processes{process_name="httpd"} 9\n' >"$1"
+    }
+    sleep() {
+      SECONDS="$((SECONDS + 1))"
+    }
+
+    wait_for_apache_instrumentation failed-inspection
+  ) >/dev/null 2>&1; then
+    printf 'Apache readiness accepted rows from a failed Docker process inspection\n' >&2
+    return 1
+  fi
+}
+
+test_apache_pool_bounds_pressure() {
+  local -r apache_config="$TEST_SCRIPT_DIR/../apache/httpd.conf"
+  local -i server_limit=0
+  local -i start_servers=0
+  local -i threads_per_child=0
+  local -i max_request_workers=0
+  local -i min_spare_threads=0
+  local -i max_spare_threads=0
+  local -i max_connections_per_child=0
+  local -i pressure_requests=0
+
+  server_limit="$(awk '$1 == "ServerLimit" { print $2 }' "$apache_config")"
+  start_servers="$(awk '$1 == "StartServers" { print $2 }' "$apache_config")"
+  threads_per_child="$(awk '$1 == "ThreadsPerChild" { print $2 }' "$apache_config")"
+  max_request_workers="$(awk '$1 == "MaxRequestWorkers" { print $2 }' "$apache_config")"
+  min_spare_threads="$(awk '$1 == "MinSpareThreads" { print $2 }' "$apache_config")"
+  max_spare_threads="$(awk '$1 == "MaxSpareThreads" { print $2 }' "$apache_config")"
+  max_connections_per_child="$(awk '$1 == "MaxConnectionsPerChild" { print $2 }' "$apache_config")"
+  pressure_requests="$(scenario_request_count pressure)"
+
+  ((start_servers == server_limit))
+  ((APACHE_EXPECTED_PROCESS_COUNT == start_servers + 1))
+  ((start_servers * threads_per_child == max_request_workers))
+  ((max_request_workers > pressure_requests))
+  ((min_spare_threads <= max_request_workers - pressure_requests))
+  ((max_spare_threads == max_request_workers))
+  ((max_connections_per_child == 0))
 }
 
 test_https_health_probes_close_the_backend_connection() {
@@ -1808,6 +2099,9 @@ test_recreated_stack_readiness_uses_log_cursor() {
     wait_for_http() {
       printf 'http:%s\n' "$2" >>"$observed"
     }
+    wait_for_apache_instrumentation() {
+      printf 'apache:%s\n' "$1" >>"$observed"
+    }
 
     recreate_instrumented_stack tcp restoration
   ) || {
@@ -1822,6 +2116,7 @@ test_recreated_stack_readiness_uses_log_cursor() {
     'log:restoration external OTel extension:recreate-cursor' \
     'log:restoration injected Java instrumentation:recreate-cursor' \
     'transport' \
+    'apache:recreate-instrumented' \
     'http:restoration HTTPS path' >"$expected"
   cmp -s -- "$expected" "$observed" || {
     printf 'recreated stack used stale readiness evidence\n' >&2
@@ -1854,6 +2149,9 @@ test_disabled_control_waits_for_instrumentation() {
     assert_runtime_contract() {
       printf 'runtime:%s\n' "$1" >>"$observed"
     }
+    wait_for_apache_instrumentation() {
+      printf 'apache:%s\n' "$1" >>"$observed"
+    }
     run_scenario() {
       printf 'scenario:%s\n' "$1" >>"$observed"
     }
@@ -1869,6 +2167,7 @@ test_disabled_control_waits_for_instrumentation() {
     'compose:120 test-compose up --detach --force-recreate java-backend apache-proxy obi' \
     'log:disabled-control external extension:disabled-cursor' \
     'log:disabled-control Java instrumentation:disabled-cursor' \
+    'apache:disabled-control' \
     'http:disabled-control HTTPS path' \
     'runtime:disabled' \
     'scenario:disabled' >"$expected"
@@ -1907,6 +2206,12 @@ test_late_attach_recycles_only_apache_after_readiness() {
     assert_selected_transport() {
       printf 'transport\n' >>"$observed"
     }
+    wait_for_apache_instrumentation() {
+      printf 'apache:%s\n' "$1" >>"$observed"
+    }
+    wait_for_apache_instrumentation_drain() {
+      printf 'apache-drain:%s\n' "$1" >>"$observed"
+    }
     run_scenario() {
       printf 'scenario:%s:%s\n' "$1" "$SCENARIO_VARIANT" >>"$observed"
     }
@@ -1931,8 +2236,10 @@ test_late_attach_recycles_only_apache_after_readiness() {
     'log:late-attached Java instrumentation:late-attach-cursor' \
     'transport' \
     'compose:60 test-compose stop --timeout 10 apache-proxy' \
+    'apache-drain:late-attach' \
     'compose:120 test-compose up --detach --force-recreate --no-deps apache-proxy' \
     'log:late-attach Apache instrumentation:late-attach-cursor' \
+    'apache:late-attach' \
     'http:late-attach recovered HTTPS path' \
     'scenario:restart:late-attach-recovery' >"$expected"
   cmp -s -- "$expected" "$observed" || {
@@ -1982,6 +2289,139 @@ test_restart_readiness_uses_log_cursor() {
     wait_for_log obi "new bridge ready" restart "2026-07-21T00:00:00.000000000Z"
   ) >/dev/null 2>&1 || {
     printf 'restart readiness did not pass a post-restart log cursor\n' >&2
+    return 1
+  }
+}
+
+test_standalone_restart_waits_for_apache_instrumentation() {
+  local -r observed="$TEST_TMP_DIR/restart-readiness.observed"
+  local -r expected="$TEST_TMP_DIR/restart-readiness.expected"
+
+  (
+    SCENARIO=restart
+    COMPOSE=(test-compose)
+    date() {
+      printf 'restart-cursor\n'
+    }
+    run_bounded() {
+      printf 'compose:%s\n' "$*" >>"$observed"
+    }
+    wait_for_log() {
+      printf 'log:%s:%s\n' "$3" "${4:-}" >>"$observed"
+    }
+    assert_selected_transport() {
+      printf 'transport\n' >>"$observed"
+    }
+    wait_for_apache_instrumentation() {
+      printf 'apache:%s\n' "$1" >>"$observed"
+    }
+    run_scenario() {
+      printf 'scenario:%s\n' "$1" >>"$observed"
+    }
+
+    execute_requested_scenarios
+  ) || {
+    printf 'standalone restart readiness-order probe failed\n' >&2
+    return 1
+  }
+
+  printf '%s\n' \
+    'compose:60 test-compose restart --timeout 10 obi' \
+    'log:restarted OBI remote-parent bridge:restart-cursor' \
+    'log:restarted Java bridge provider:restart-cursor' \
+    'transport' \
+    'apache:restart' \
+    'scenario:restart' >"$expected"
+  cmp -s -- "$expected" "$observed" || {
+    printf 'standalone restart resumed before Apache instrumentation readiness\n' >&2
+    diff -u -- "$expected" "$observed" >&2 || true
+    return 1
+  }
+}
+
+test_restart_fault_recovery_waits_for_apache_instrumentation() {
+  local -r fake_compose="$TEST_TMP_DIR/restart-success-compose"
+  local -r ready="$TEST_TMP_DIR/restart-success.ready"
+  local -r observed="$TEST_TMP_DIR/restart-success.observed"
+
+  cat >"$fake_compose" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf 'compose:%s\n' "$*" >>"$RESTART_SUCCESS_OBSERVED"
+case " $* " in
+  *" run --rm --no-deps --no-TTY scenario "*)
+    while [[ ! -e "$RESTART_SUCCESS_READY" ]]; do
+      sleep 0.01
+    done
+    printf '{}\n'
+    ;;
+  *" up --detach obi "*)
+    : >"$RESTART_SUCCESS_READY"
+    ;;
+esac
+EOF
+  chmod 0755 "$fake_compose"
+
+  (
+    export RESTART_SUCCESS_READY="$ready"
+    export RESTART_SUCCESS_OBSERVED="$observed"
+    RESULT_DIR="$TEST_TMP_DIR/restart-success-result"
+    COMPOSE=("$fake_compose")
+    BRIDGE_RUNNING=true
+    SCENARIO_VARIANT=""
+    mkdir -p -- "$RESULT_DIR"
+    date() {
+      printf 'restart-success-cursor\n'
+    }
+    sleep() {
+      return 0
+    }
+    wait_for_log() {
+      printf 'log:%s\n' "$3" >>"$observed"
+    }
+    assert_selected_transport() {
+      printf 'transport\n' >>"$observed"
+    }
+    wait_for_apache_instrumentation() {
+      printf 'apache:%s\n' "$1" >>"$observed"
+    }
+    capture_phase_evidence() {
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+      printf 'capture:%s\n' "$1" >>"$observed"
+    }
+    capture_java_diagnostics() {
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+      printf 'fixture\n' >"$RESULT_DIR/phases/$1/java-diagnostics.txt"
+      printf 'diagnostics:%s\n' "$1" >>"$observed"
+    }
+    write_java_diagnostics_delta() {
+      : >"$3"
+      printf 'delta\n' >>"$observed"
+    }
+    assert_restart_fault_diagnostics() {
+      printf 'diagnostics-assertion\n' >>"$observed"
+    }
+    run_scenario() {
+      printf 'scenario:%s:%s\n' "$1" "$SCENARIO_VARIANT" >>"$observed"
+    }
+
+    run_restart_during_traffic_control
+  ) || {
+    printf 'restart-fault recovery readiness-order probe failed\n' >&2
+    return 1
+  }
+
+  awk '
+    $0 == "log:Java bridge recovered during restart traffic" { provider = NR }
+    $0 == "apache:restart-fault-recovery" { readiness = NR }
+    $0 == "capture:restart-fault-after" { capture = NR }
+    $0 == "scenario:restart:restart-recovery" { scenario = NR }
+    END {
+      exit provider > 0 && readiness > provider && capture > readiness &&
+        scenario > capture ? 0 : 1
+    }
+  ' "$observed" || {
+    printf 'restart-fault recovery resumed before Apache instrumentation readiness\n' >&2
     return 1
   }
 }
@@ -2444,12 +2884,21 @@ main() {
   test_pipeline_dependencies_are_declared
   test_runtime_environment_line_matching
   test_instrumented_readiness_precedes_https_traffic
+  test_apache_readiness_requires_the_full_pool
+  test_apache_instrumented_process_metric_is_exact
+  test_apache_readiness_uses_elapsed_deadline
+  test_apache_instrumentation_drain_is_a_generation_boundary
+  test_apache_process_count_uses_docker_compatible_columns
+  test_apache_readiness_rejects_failed_process_inspection
+  test_apache_pool_bounds_pressure
   test_https_health_probes_close_the_backend_connection
   test_recreated_stack_readiness_uses_log_cursor
   test_disabled_control_waits_for_instrumentation
   test_late_attach_recycles_only_apache_after_readiness
   test_control_response_normalizes_connection_diagnostics
   test_restart_readiness_uses_log_cursor
+  test_standalone_restart_waits_for_apache_instrumentation
+  test_restart_fault_recovery_waits_for_apache_instrumentation
   test_restart_failure_reaps_background_traffic
   test_scenario_failure_retains_after_evidence
   test_start_failure_retains_command_boundary

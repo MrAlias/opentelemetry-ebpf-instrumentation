@@ -42,25 +42,51 @@ public class CappedConcurrentHashMap<K, V> {
     if (key == null || value == null) {
       return null;
     }
-
     V prev = map.put(key, value);
 
-    // We are adding a new key, check for overflow and remove an
-    // element
     if (prev == null) {
-      // This can overflow, but that's OK, the modulo still works with
-      // negative numbers because our floorMod implementation uses the
-      // sign of the divisor (ring.length())
-      long i = index.getAndIncrement();
-      int slot = (int) floorMod(i, ring.length());
-
-      K oldKey = ring.getAndSet(slot, key);
-      if (oldKey != null && !oldKey.equals(key)) {
-        map.remove(oldKey);
-      }
+      recordNewKey(key);
     }
 
     return prev;
+  }
+
+  public V putIfAbsent(K key, V value) {
+    if (key == null || value == null) {
+      return null;
+    }
+    V prev = map.putIfAbsent(key, value);
+    if (prev == null) {
+      recordNewKey(key);
+    }
+    return prev;
+  }
+
+  public boolean replace(K key, V oldValue, V newValue) {
+    if (key == null || oldValue == null || newValue == null) {
+      return false;
+    }
+    return map.replace(key, oldValue, newValue);
+  }
+
+  public boolean remove(K key, V value) {
+    if (key == null || value == null) {
+      return false;
+    }
+    return map.remove(key, value);
+  }
+
+  private void recordNewKey(K key) {
+    // This can overflow, but that's OK, the modulo still works with
+    // negative numbers because our floorMod implementation uses the
+    // sign of the divisor (ring.length()).
+    long i = index.getAndIncrement();
+    int slot = (int) floorMod(i, ring.length());
+
+    K oldKey = ring.getAndSet(slot, key);
+    if (oldKey != null && !oldKey.equals(key)) {
+      map.remove(oldKey);
+    }
   }
 
   // This is simple enough, and it's the source of the poor LRU properties of

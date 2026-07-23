@@ -48,7 +48,13 @@ public class Agent {
                   "io.opentelemetry.obi.java.instrumentations.data.BytesWithLen",
                   "io.opentelemetry.obi.java.instrumentations.data.Connection",
                   "io.opentelemetry.obi.java.instrumentations.data.SSLStorage",
+                  "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$BufferHandoff",
+                  "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ConnectionOwner",
+                  "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ExactConnection",
+                  "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$TlsConnectionMarkerAttempt",
                   "io.opentelemetry.obi.java.instrumentations.data.TaskContext",
+                  "io.opentelemetry.obi.java.instrumentations.data.WeakIdentityConcurrentMap",
+                  "io.opentelemetry.obi.java.instrumentations.data.WeakIdentityConcurrentMap$IdentityWeakReference",
                   "io.opentelemetry.obi.java.instrumentations.data.WeakIdentityTaskMap",
                   "io.opentelemetry.obi.java.instrumentations.data.WeakIdentityTaskMap$Bucket",
                   "io.opentelemetry.obi.java.instrumentations.data.WeakIdentityTaskMap$Entry",
@@ -117,7 +123,9 @@ public class Agent {
   // Main agent load and instrumentation code, this gets invoked directly with -javaagent on the
   // command line
   public static void premain(String agentArgs, Instrumentation inst) {
-    install(agentArgs, inst);
+    if (install(agentArgs, inst)) {
+      logger.info("OBI Java instrumentation ready");
+    }
   }
 
   private static boolean install(String agentArgs, Instrumentation inst) {
@@ -213,6 +221,7 @@ public class Agent {
   public static void agentmain(String args, Instrumentation inst) {
     if (install(args, inst)) {
       retransformLoadedClasses(inst);
+      logger.info("OBI Java instrumentation ready");
     }
   }
 

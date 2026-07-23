@@ -81,6 +81,14 @@ public final class RemoteParentBootstrap {
     return RemoteParentBridge.diagnosticsSnapshot();
   }
 
+  public static long tlsReadEvents() {
+    return RemoteParentBridge.tlsReadEvents();
+  }
+
+  public static long tlsReadBytes() {
+    return RemoteParentBridge.tlsReadBytes();
+  }
+
   private static void clearProvider() {
     ThreadInfo.setRemoteParentEnabled(false);
     ThreadInfo.clearRemoteParentSocketFileDescriptor();

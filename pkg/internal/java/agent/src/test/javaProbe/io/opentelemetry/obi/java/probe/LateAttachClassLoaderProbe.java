@@ -8,12 +8,30 @@ package io.opentelemetry.obi.java.probe;
 import java.lang.management.ManagementFactory;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Method;
+import java.net.InetAddress;
 import java.net.URL;
 import java.net.URLClassLoader;
+import javax.net.ssl.SSLEngine;
 
 /** Standalone process probe for consumer-before-agent startup and class-loader reclamation. */
 public final class LateAttachClassLoaderProbe {
   private static final String BRIDGE_CLASS = "io.opentelemetry.obi.java.bridge.RemoteParentBridge";
+  private static final String CONNECTION_CLASS =
+      "io.opentelemetry.obi.java.instrumentations.data.Connection";
+  private static final String SSL_STORAGE_CLASS =
+      "io.opentelemetry.obi.java.instrumentations.data.SSLStorage";
+  private static final String TLS_MARKER_ATTEMPT_CLASS =
+      "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$TlsConnectionMarkerAttempt";
+  private static final String BUFFER_HANDOFF_CLASS =
+      "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$BufferHandoff";
+  private static final String CONNECTION_OWNER_CLASS =
+      "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ConnectionOwner";
+  private static final String EXACT_CONNECTION_CLASS =
+      "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ExactConnection";
+  private static final String WEAK_IDENTITY_MAP_CLASS =
+      "io.opentelemetry.obi.java.instrumentations.data.WeakIdentityConcurrentMap";
+  private static final String WEAK_IDENTITY_REFERENCE_CLASS =
+      "io.opentelemetry.obi.java.instrumentations.data.WeakIdentityConcurrentMap$IdentityWeakReference";
   private static final int STATUS_MISSING = 2;
 
   private LateAttachClassLoaderProbe() {}
@@ -44,6 +62,8 @@ public final class LateAttachClassLoaderProbe {
     Class<?> consumer =
         Class.forName("io.opentelemetry.obi.java.probe.IsolatedBridgeConsumer", true, loader);
     Method remoteParentStatus = consumer.getMethod("remoteParentStatus");
+    Method newEngine = consumer.getMethod("newEngine");
+    SSLEngine engine = (SSLEngine) newEngine.invoke(null);
     if ((Integer) remoteParentStatus.invoke(null) != -1) {
       throw new AssertionError("isolated consumer unexpectedly found the bridge before attachment");
     }
@@ -53,16 +73,56 @@ public final class LateAttachClassLoaderProbe {
     if (bridge.getClassLoader() != null) {
       throw new AssertionError("remote-parent bridge is not bootstrap-defined");
     }
+    assertBootstrapClass(TLS_MARKER_ATTEMPT_CLASS);
+    assertBootstrapClass(BUFFER_HANDOFF_CLASS);
+    assertBootstrapClass(CONNECTION_OWNER_CLASS);
+    assertBootstrapClass(EXACT_CONNECTION_CLASS);
+    assertBootstrapClass(WEAK_IDENTITY_MAP_CLASS);
+    assertBootstrapClass(WEAK_IDENTITY_REFERENCE_CLASS);
     if ((Integer) remoteParentStatus.invoke(null) != STATUS_MISSING) {
       throw new AssertionError("pre-existing isolated consumer did not discover the late bridge");
     }
+    cacheEngineInBootstrapStorage(engine);
 
     WeakReference<ClassLoader> reference = new WeakReference<ClassLoader>(loader);
+    engine = null;
+    newEngine = null;
     remoteParentStatus = null;
     consumer = null;
     loader.close();
     loader = null;
     return reference;
+  }
+
+  private static void cacheEngineInBootstrapStorage(SSLEngine engine) throws Exception {
+    Class<?> connectionClass = Class.forName(CONNECTION_CLASS, true, null);
+    Object connection =
+        connectionClass
+            .getConstructor(InetAddress.class, int.class, InetAddress.class, int.class, int.class)
+            .newInstance(
+                InetAddress.getLoopbackAddress(), 1234, InetAddress.getLoopbackAddress(), 5678, 7);
+    Class<?> storage = Class.forName(SSL_STORAGE_CLASS, true, null);
+    storage
+        .getMethod("setConnectionForSession", SSLEngine.class, connectionClass)
+        .invoke(null, engine, connection);
+    Object cached =
+        storage.getMethod("getConnectionForSession", SSLEngine.class).invoke(null, engine);
+    if (cached != connection) {
+      throw new AssertionError("isolated TLS engine was not cached by the bootstrap helper");
+    }
+
+    Method claimMarker =
+        storage.getMethod(
+            "claimTlsConnectionMarkerAttempt", SSLEngine.class, connectionClass, long.class);
+    for (int attempt = 0; attempt < 8; attempt++) {
+      boolean claimed = (Boolean) claimMarker.invoke(null, engine, connection, 11L);
+      if (!claimed) {
+        throw new AssertionError("isolated TLS engine marker burst ended early");
+      }
+    }
+    if ((Boolean) claimMarker.invoke(null, engine, connection, 11L)) {
+      throw new AssertionError("isolated TLS engine marker was not cached by the bootstrap helper");
+    }
   }
 
   private static void attachAgent(String agentPath) throws Exception {
@@ -76,6 +136,12 @@ public final class LateAttachClassLoaderProbe {
           .invoke(attached, agentPath, "remoteParentTransport=disabled");
     } finally {
       virtualMachine.getMethod("detach").invoke(attached);
+    }
+  }
+
+  private static void assertBootstrapClass(String className) throws Exception {
+    if (Class.forName(className, false, null).getClassLoader() != null) {
+      throw new AssertionError(className + " is not bootstrap-defined");
     }
   }
 

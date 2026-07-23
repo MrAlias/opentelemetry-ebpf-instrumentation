@@ -35,7 +35,9 @@ public final class RemoteParentDiagnostics {
   private static final int REGISTRATION_FAILED = 17;
   private static final int TAKE_SAMPLED = 18;
   private static final int TAKE_UNSAMPLED = 19;
-  private static final int TAKE_STATUS_BASE = 20;
+  private static final int TLS_READ_EVENTS = 20;
+  private static final int TLS_READ_BYTES = 21;
+  private static final int TAKE_STATUS_BASE = 22;
   private static final int DISCARD_STATUS_BASE = TAKE_STATUS_BASE + RemoteParentStatus.DISABLED + 1;
   private static final int COUNTER_COUNT = DISCARD_STATUS_BASE + RemoteParentStatus.DISABLED + 1;
   static final long MAX_COUNTER_VALUE = 999_999_999L;
@@ -119,6 +121,22 @@ public final class RemoteParentDiagnostics {
     increment(REGISTRATION_FAILED, "registration_" + STATUS_NAMES[normalized]);
   }
 
+  static void tlsRead(int bytes) {
+    if (bytes <= 0) {
+      return;
+    }
+    increment(TLS_READ_EVENTS, null);
+    add(TLS_READ_BYTES, bytes, null);
+  }
+
+  static long tlsReadEvents() {
+    return counters.get(TLS_READ_EVENTS);
+  }
+
+  static long tlsReadBytes() {
+    return counters.get(TLS_READ_BYTES);
+  }
+
   static void extensionEvent(int event, long count) {
     int counter;
     String failureReason = null;
@@ -181,6 +199,8 @@ public final class RemoteParentDiagnostics {
     append(snapshot, "registration_fail", counters.get(REGISTRATION_FAILED));
     append(snapshot, "take_sampled", counters.get(TAKE_SAMPLED));
     append(snapshot, "take_unsampled", counters.get(TAKE_UNSAMPLED));
+    append(snapshot, "tls_reads", counters.get(TLS_READ_EVENTS));
+    append(snapshot, "tls_bytes", counters.get(TLS_READ_BYTES));
     for (int status = RemoteParentStatus.UNKNOWN; status <= RemoteParentStatus.DISABLED; status++) {
       append(snapshot, "t_" + STATUS_NAMES[status], counters.get(TAKE_STATUS_BASE + status));
       append(snapshot, "d_" + STATUS_NAMES[status], counters.get(DISCARD_STATUS_BASE + status));

@@ -19,7 +19,6 @@ import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
-import java.util.Arrays;
 import net.bytebuddy.agent.builder.AgentBuilder;
 import net.bytebuddy.asm.Advice;
 import net.bytebuddy.description.type.TypeDescription;
@@ -222,15 +221,27 @@ public class SocketChannelInst {
   }
 
   public static final class ReadAdvice {
-    @Advice.OnMethodExit(suppress = Throwable.class)
+    @Advice.OnMethodEnter(suppress = Throwable.class)
+    public static int read(@Advice.Argument(0) final ByteBuffer dst) {
+      return dst == null ? -1 : b(dst).position();
+    }
+
+    @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
     public static void read(
         @Advice.Argument(0) final ByteBuffer dst,
+        @Advice.Enter int initialPosition,
+        @Advice.Return int readBytes,
+        @Advice.Thrown Throwable throwable,
         @Advice.FieldValue("localAddress") SocketAddress localSocket,
         @Advice.FieldValue("remoteAddress") SocketAddress remoteSocket,
         @Advice.FieldValue("fdVal") int socketFileDescriptor) {
       if (!(localSocket instanceof InetSocketAddress)
           || !(remoteSocket instanceof InetSocketAddress)
-          || (dst == null)) {
+          || dst == null
+          || throwable != null
+          || readBytes <= 0
+          || initialPosition < 0
+          || b(dst).position() - initialPosition != readBytes) {
         return;
       }
       InetSocketAddress localSocketAddress = (InetSocketAddress) localSocket;
@@ -244,26 +255,73 @@ public class SocketChannelInst {
               remoteSocketAddress.getPort(),
               socketFileDescriptor);
 
-      String bufKey = ByteBufferExtractor.keyFromUsedBuffer(dst);
-      SSLStorage.setConnectionForBuf(bufKey, c);
+      SSLStorage.setConnectionForReadBuffer(dst, c);
       if (SSLStorage.debugOn) {
-        System.err.println("[SocketChannelInst] Setting connection for: " + bufKey);
+        System.err.println("[SocketChannelInst] Setting connection for read buffer");
       }
     }
   }
 
   public static final class ReadAdviceArray {
-    @Advice.OnMethodExit(suppress = Throwable.class)
+    @Advice.OnMethodEnter(suppress = Throwable.class)
+    public static Object[] read(
+        @Advice.Argument(0) final ByteBuffer[] dsts,
+        @Advice.Argument(1) int offset,
+        @Advice.Argument(2) int length) {
+      if (dsts == null || offset < 0 || length < 0 || offset > dsts.length - length) {
+        return null;
+      }
+      int[] positions = new int[dsts.length];
+      ByteBuffer[] buffers = dsts.clone();
+      for (int i = offset; i < offset + length; i++) {
+        positions[i] = buffers[i] == null ? -1 : b(buffers[i]).position();
+      }
+      return new Object[] {buffers, positions, offset, length};
+    }
+
+    @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
     public static void read(
         @Advice.Argument(0) final ByteBuffer[] dsts,
+        @Advice.Enter Object[] saved,
+        @Advice.Return long readBytes,
+        @Advice.Thrown Throwable throwable,
         @Advice.FieldValue("localAddress") SocketAddress localSocket,
         @Advice.FieldValue("remoteAddress") SocketAddress remoteSocket,
         @Advice.FieldValue("fdVal") int socketFileDescriptor) {
       if (!(localSocket instanceof InetSocketAddress)
           || !(remoteSocket instanceof InetSocketAddress)
-          || (dsts == null)) {
+          || dsts == null
+          || saved == null
+          || throwable != null
+          || readBytes <= 0) {
         return;
       }
+      ByteBuffer[] buffers = (ByteBuffer[]) saved[0];
+      int[] positions = (int[]) saved[1];
+      int offset = (Integer) saved[2];
+      int length = (Integer) saved[3];
+      if (dsts.length != buffers.length || positions.length != buffers.length) {
+        return;
+      }
+
+      long advanced = 0;
+      for (int i = offset; i < offset + length; i++) {
+        if (dsts[i] != buffers[i]) {
+          return;
+        }
+        if (buffers[i] == null) {
+          continue;
+        }
+        int delta = b(buffers[i]).position() - positions[i];
+        if (positions[i] < 0 || delta < 0) {
+          return;
+        }
+        advanced += delta;
+      }
+      if (advanced != readBytes) {
+        return;
+      }
+
       InetSocketAddress localSocketAddress = (InetSocketAddress) localSocket;
       InetSocketAddress remoteSocketAddress = (InetSocketAddress) remoteSocket;
 
@@ -275,13 +333,14 @@ public class SocketChannelInst {
               remoteSocketAddress.getPort(),
               socketFileDescriptor);
 
-      ByteBuffer dstBuffer =
-          ByteBufferExtractor.flattenUsedByteBufferArray(dsts, ByteBufferExtractor.MAX_KEY_SIZE);
-      String bufKey = Arrays.toString(dstBuffer.array());
-      SSLStorage.setConnectionForBuf(bufKey, c);
+      for (int i = offset; i < offset + length; i++) {
+        if (buffers[i] != null && b(buffers[i]).position() > positions[i]) {
+          SSLStorage.setConnectionForReadBuffer(buffers[i], c);
+        }
+      }
 
       if (SSLStorage.debugOn) {
-        System.err.println("[SocketChannelInst] Setting connection for: " + bufKey);
+        System.err.println("[SocketChannelInst] Setting connection for read buffer array");
       }
     }
   }
@@ -290,9 +349,11 @@ public class SocketChannelInst {
     @Advice.OnMethodEnter(suppress = Throwable.class)
     public static void cleanup(
         @Advice.FieldValue("localAddress") SocketAddress localSocket,
-        @Advice.FieldValue("remoteAddress") SocketAddress remoteSocket) {
+        @Advice.FieldValue("remoteAddress") SocketAddress remoteSocket,
+        @Advice.FieldValue("fdVal") int socketFileDescriptor) {
       if (!(localSocket instanceof InetSocketAddress)
-          || !(remoteSocket instanceof InetSocketAddress)) {
+          || !(remoteSocket instanceof InetSocketAddress)
+          || socketFileDescriptor < 0) {
         return;
       }
       InetSocketAddress localSocketAddress = (InetSocketAddress) localSocket;
@@ -303,17 +364,13 @@ public class SocketChannelInst {
               localSocketAddress.getAddress(),
               localSocketAddress.getPort(),
               remoteSocketAddress.getAddress(),
-              remoteSocketAddress.getPort());
-
-      Connection tracked = SSLStorage.getActiveConnection(c);
+              remoteSocketAddress.getPort(),
+              socketFileDescriptor);
 
       if (SSLStorage.debugOn) {
-        System.err.println("[SocketChannelInst] Cleanup connection " + tracked);
+        System.err.println("[SocketChannelInst] Cleanup connection " + c);
       }
-
-      if (tracked != null) {
-        SSLStorage.cleanupConnectionBufMapping(tracked);
-      }
+      SSLStorage.cleanupConnection(c);
     }
   }
 }

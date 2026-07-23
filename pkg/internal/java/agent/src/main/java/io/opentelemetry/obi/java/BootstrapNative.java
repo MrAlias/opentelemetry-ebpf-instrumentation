@@ -5,8 +5,13 @@
 
 package io.opentelemetry.obi.java;
 
+import io.opentelemetry.obi.java.ebpf.IOCTLPacket;
+import io.opentelemetry.obi.java.ebpf.NativeMemory;
 import io.opentelemetry.obi.java.ebpf.ThreadInfo;
+import io.opentelemetry.obi.java.instrumentations.data.Connection;
+import io.opentelemetry.obi.java.instrumentations.data.SSLStorage;
 import java.net.Socket;
+import javax.net.ssl.SSLEngine;
 
 /** Bootstrap-safe JNI entry points used by instrumented JDK classes. */
 public final class BootstrapNative {
@@ -51,6 +56,26 @@ public final class BootstrapNative {
         ThreadInfo.clearRemoteParentSocketFileDescriptor();
       }
     }
+  }
+
+  public static void markTlsConnection(Connection connection) {
+    if (connection == null || connection.getSocketFileDescriptor() < 0) {
+      return;
+    }
+    NativeMemory packet = new NativeMemory(IOCTLPacket.tlsConnectionMarkerSize);
+    IOCTLPacket.writeTlsConnectionMarker(packet, 0, connection);
+    ioctl(connection.getSocketFileDescriptor(), IOCTL_CMD, packet.getAddress());
+  }
+
+  public static void markTlsConnectionIfDue(SSLEngine engine, Connection connection) {
+    if (!ThreadInfo.isRemoteParentEnabled()) {
+      return;
+    }
+    long processIncarnation = ThreadInfo.processIncarnation();
+    if (!SSLStorage.claimTlsConnectionMarkerAttempt(engine, connection, processIncarnation)) {
+      return;
+    }
+    markTlsConnection(connection);
   }
 
   private static native int emitDataOnSocket(int socketFileDescriptor, long argp);

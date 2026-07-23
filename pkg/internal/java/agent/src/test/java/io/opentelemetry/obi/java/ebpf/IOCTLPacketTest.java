@@ -8,6 +8,7 @@ package io.opentelemetry.obi.java.ebpf;
 import static org.junit.jupiter.api.Assertions.*;
 
 import io.opentelemetry.obi.java.instrumentations.data.Connection;
+import java.net.InetAddress;
 import org.junit.jupiter.api.Test;
 
 // Memory Layout of Pointer p (after pos.write(new byte[] {42}))
@@ -94,5 +95,24 @@ class IOCTLPacketTest {
     for (int i = 0; i < buf.length; i++) {
       assertEquals(buf[i], mem.getByte(off + i));
     }
+  }
+
+  @Test
+  void testWriteTlsConnectionMarker() throws Exception {
+    NativeMemory mem = new NativeMemory(IOCTLPacket.tlsConnectionMarkerSize, true);
+    InetAddress local = InetAddress.getByAddress(new byte[] {127, 0, 0, 1});
+    InetAddress remote = InetAddress.getByAddress(new byte[] {127, 0, 0, 2});
+    Connection connection = new Connection(local, 1234, remote, 5678, 7);
+
+    int newOff = IOCTLPacket.writeTlsConnectionMarker(mem, 0, connection);
+
+    assertEquals(IOCTLPacket.tlsConnectionMarkerSize, newOff);
+    assertEquals(OperationType.TLS_CONNECTION.code, mem.getByte(0));
+    for (int i = 0; i < 4; i++) {
+      assertEquals(remote.getAddress()[i], mem.getByte(1 + 12 + i));
+      assertEquals(local.getAddress()[i], mem.getByte(1 + 16 + 12 + i));
+    }
+    assertEquals((short) connection.getRemotePort(), mem.getShort(1 + 32));
+    assertEquals((short) connection.getLocalPort(), mem.getShort(1 + 34));
   }
 }

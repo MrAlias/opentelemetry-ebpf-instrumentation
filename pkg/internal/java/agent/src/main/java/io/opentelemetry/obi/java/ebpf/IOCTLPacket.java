@@ -9,7 +9,9 @@ import io.opentelemetry.obi.java.instrumentations.data.Connection;
 import java.net.Socket;
 
 public class IOCTLPacket {
-  public static final int bufferLengthOffset = 1 + 36;
+  public static final int connectionInfoSize = 36;
+  public static final int tlsConnectionMarkerSize = 1 + connectionInfoSize;
+  public static final int bufferLengthOffset = tlsConnectionMarkerSize;
   public static final int dataSignalOffset = bufferLengthOffset + Integer.BYTES;
   public static int packetPrefixSize = dataSignalOffset + Long.BYTES;
 
@@ -64,6 +66,11 @@ public class IOCTLPacket {
 
   public static int writePacketBuffer(NativeMemory mem, int off, byte[] buf) {
     return writePacketBuffer(mem, off, buf, 0, buf.length);
+  }
+
+  public static int writeTlsConnectionMarker(NativeMemory mem, int off, Connection conn) {
+    mem.setByte(off, OperationType.TLS_CONNECTION.code);
+    return ConnectionInfo.writeRecvConnectionInfo(mem, off + 1, conn);
   }
 
   public static int writePacket(NativeMemory mem, int off, OperationType type, long parentId) {

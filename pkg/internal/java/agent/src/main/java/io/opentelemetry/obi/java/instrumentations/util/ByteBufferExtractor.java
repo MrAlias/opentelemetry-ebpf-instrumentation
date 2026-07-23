@@ -111,6 +111,57 @@ public class ByteBufferExtractor {
     return dstBuffer;
   }
 
+  public static ByteBuffer fromProducedBuffer(ByteBuffer dst, int initialPosition, int len) {
+    if (dst == null || initialPosition < 0 || b(dst).position() < initialPosition) {
+      return ByteBuffer.allocate(0);
+    }
+    int produced = Math.min(len, b(dst).position() - initialPosition);
+    if (produced <= 0) {
+      return ByteBuffer.allocate(0);
+    }
+    ByteBuffer duplicate = dst.duplicate();
+    b(duplicate).position(initialPosition);
+    b(duplicate).limit(initialPosition + produced);
+    return fromFreshBuffer(duplicate, produced);
+  }
+
+  public static ByteBuffer fromProducedBufferArray(
+      ByteBuffer[] dsts, ByteBuffer[] expectedBuffers, int[] initialPositions, int len) {
+    ByteBuffer dstBuffer = ByteBuffer.allocate(Math.max(0, Math.min(len, MAX_SIZE)));
+    if (dsts == null
+        || expectedBuffers == null
+        || initialPositions == null
+        || dsts.length != expectedBuffers.length
+        || dsts.length != initialPositions.length) {
+      return dstBuffer;
+    }
+
+    for (int i = 0; i < dsts.length; i++) {
+      if (dsts[i] != expectedBuffers[i]
+          || (dsts[i] != null
+              && (initialPositions[i] < 0 || b(dsts[i]).position() < initialPositions[i]))) {
+        return dstBuffer;
+      }
+    }
+
+    for (int i = 0; i < dsts.length && b(dstBuffer).hasRemaining(); i++) {
+      if (dsts[i] == null) {
+        continue;
+      }
+
+      int finalPosition = b(dsts[i]).position();
+      ByteBuffer produced = dsts[i].duplicate();
+      b(produced).limit(finalPosition);
+      b(produced).position(initialPositions[i]);
+      if (b(produced).remaining() > b(dstBuffer).remaining()) {
+        b(produced).limit(b(produced).position() + b(dstBuffer).remaining());
+      }
+      dstBuffer.put(produced);
+    }
+
+    return dstBuffer;
+  }
+
   // same concept as reading used bytes, except we produce a string from
   // the values that we'll be using as unique keys
   public static String keyFromUsedBuffer(ByteBuffer buf) {

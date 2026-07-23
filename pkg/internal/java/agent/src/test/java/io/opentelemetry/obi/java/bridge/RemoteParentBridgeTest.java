@@ -75,6 +75,8 @@ class RemoteParentBridgeTest {
     RemoteParentBridge.recordExtensionEvent(2, 1L);
     RemoteParentBridge.recordExtensionEvent(3, 2L);
     RemoteParentBridge.recordExtensionEvent(8, 1L);
+    RemoteParentBridge.recordTlsRead(17);
+    RemoteParentBridge.recordTlsRead(0);
 
     String snapshot = RemoteParentBridge.diagnosticsSnapshot();
     assertTrue(snapshot.matches("[a-z0-9_=,]+"));
@@ -89,6 +91,10 @@ class RemoteParentBridgeTest {
     assertTrue(snapshot.contains("extension_reg=1"));
     assertTrue(snapshot.contains("lookup_ready=1"));
     assertTrue(snapshot.contains("lookup_missing=2"));
+    assertTrue(snapshot.contains("tls_reads=1"));
+    assertTrue(snapshot.contains("tls_bytes=h"));
+    assertEquals(1L, RemoteParentBridge.tlsReadEvents());
+    assertEquals(17L, RemoteParentBridge.tlsReadBytes());
     RemoteParentDiagnostics.registration(RemoteParentStatus.UNAUTHORIZED);
     RemoteParentDiagnostics.registration(RemoteParentStatus.VALID);
     snapshot = RemoteParentBridge.diagnosticsSnapshot();

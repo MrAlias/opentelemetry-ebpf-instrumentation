@@ -9,11 +9,13 @@ import io.opentelemetry.obi.java.ebpf.ThreadInfo;
 import io.opentelemetry.obi.java.instrumentations.util.CappedConcurrentHashMap;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
 import java.util.IdentityHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.LongSupplier;
 import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLSession;
 
 public class SSLStorage {
   public static final int SUBMISSION_NESTED = 0;
@@ -34,15 +36,24 @@ public class SSLStorage {
   private static final AtomicBoolean nettyFailureLogged = new AtomicBoolean();
 
   private static final int MAX_CONCURRENT = 10_000;
-  private static final CappedConcurrentHashMap<SSLEngine, Connection> sslConnections =
-      new CappedConcurrentHashMap<>(MAX_CONCURRENT);
+  static final int TLS_CONNECTION_MARKER_BURST_ATTEMPTS = 8;
+  static final long TLS_CONNECTION_MARKER_RETRY_NANOS = 1_000_000_000L;
+  private static final WeakIdentityConcurrentMap<ConnectionOwner> sslConnections =
+      new WeakIdentityConcurrentMap<>(MAX_CONCURRENT);
+  private static final WeakIdentityConcurrentMap<TlsConnectionMarkerAttempt> tlsConnectionMarkers =
+      new WeakIdentityConcurrentMap<>(MAX_CONCURRENT);
   private static final CappedConcurrentHashMap<String, BytesWithLen> bufToBuf =
       new CappedConcurrentHashMap<>(MAX_CONCURRENT);
 
-  private static final CappedConcurrentHashMap<String, Connection> bufConn =
-      new CappedConcurrentHashMap<>(MAX_CONCURRENT);
-
-  private static final CappedConcurrentHashMap<Connection, Connection> activeConnections =
+  private static final int BUFFER_HANDOFF_AVAILABLE = 0;
+  private static final int BUFFER_HANDOFF_CLAIMING = 1;
+  private static final int BUFFER_HANDOFF_CONSUMED = 2;
+  private static final int BUFFER_HANDOFF_AMBIGUOUS = 3;
+  private static final BufferHandoff AMBIGUOUS_BUFFER_HANDOFF =
+      new BufferHandoff(null, BUFFER_HANDOFF_AMBIGUOUS);
+  private static final WeakIdentityConcurrentMap<BufferHandoff> readBufferConnections =
+      new WeakIdentityConcurrentMap<>(MAX_CONCURRENT);
+  private static final CappedConcurrentHashMap<ExactConnection, ConnectionOwner> activeConnections =
       new CappedConcurrentHashMap<>(MAX_CONCURRENT);
 
   private static final WeakIdentityTaskMap tasks = new WeakIdentityTaskMap(MAX_CONCURRENT);
@@ -53,6 +64,7 @@ public class SSLStorage {
   private static final ThreadLocal<ArrayDeque<Boolean>> executorTaskScopes = new ThreadLocal<>();
   private static final ThreadLocal<Boolean> virtualThreadTaskScope = new ThreadLocal<>();
   private static volatile LongSupplier threadIdProviderForTest;
+  private static volatile LongSupplier tlsConnectionMarkerClockForTest;
   private static final Object NO_NETTY_CONNECTION = new Object();
   private static final ThreadLocal<ArrayDeque<Object>> nettyConnectionScopes = new ThreadLocal<>();
 
@@ -88,34 +100,465 @@ public class SSLStorage {
   }
 
   public static Connection getConnectionForSession(SSLEngine session) {
-    return sslConnections.get(session);
+    ConnectionOwner owner = connectionOwnerForSession(session);
+    return owner == null ? null : owner.connection;
   }
 
   public static void setConnectionForSession(SSLEngine session, Connection c) {
-    sslConnections.put(session, c);
+    if (session == null || c == null || c.getSocketFileDescriptor() < 0) {
+      return;
+    }
+    ConnectionOwner owner = activeConnectionOwner(c);
+    if (owner != null) {
+      sslConnections.put(session, owner);
+    }
   }
 
-  public static Connection getConnectionForBuf(String buf) {
-    return bufConn.get(buf);
+  public static Connection resolveConnectionForUnwrap(SSLEngine session, Object handoff) {
+    if (session == null) {
+      return null;
+    }
+
+    ConnectionOwner cachedOwner = connectionOwnerForSession(session);
+    Connection cached = cachedOwner == null ? null : cachedOwner.connection;
+    Object scopedValue = nettyConnection.get();
+    Connection scoped = scopedValue instanceof Connection ? (Connection) scopedValue : null;
+
+    if (scoped != null) {
+      if (scoped.getSocketFileDescriptor() >= 0) {
+        ConnectionOwner scopedOwner = activeConnectionOwner(scoped);
+        if (scopedOwner == null) {
+          return null;
+        }
+        sslConnections.put(session, scopedOwner);
+        return connectionOwnerForSession(session) == scopedOwner ? scopedOwner.connection : null;
+      }
+      if (cached != null && cached.getSocketFileDescriptor() >= 0 && cached.equals(scoped)) {
+        return cached;
+      }
+      return null;
+    }
+
+    if (!hasEstablishedSession(session)) {
+      return cached != null && cached.getSocketFileDescriptor() >= 0 ? cached : null;
+    }
+
+    if (cached != null && cached.getSocketFileDescriptor() >= 0) {
+      BufferHandoff correlated = asBufferHandoff(handoff);
+      if (correlated == AMBIGUOUS_BUFFER_HANDOFF
+          || (correlated != null && correlated.state == BUFFER_HANDOFF_CLAIMING)
+          || (correlated != null
+              && (!isActive(correlated.owner)
+                  || !sameExactConnection(cached, correlated.owner.connection)))) {
+        return null;
+      }
+      return cached;
+    }
+
+    return null;
   }
 
-  public static boolean connectionUntracked(Connection c) {
-    return activeConnections.get(c) == null;
+  public static Connection claimConnectionForUnwrap(
+      SSLEngine session,
+      ByteBuffer buffer,
+      Object handoff,
+      Connection expected,
+      Object expectedOwnerToken,
+      Connection scopedAtEntry,
+      int bytesConsumed,
+      int plaintextLength) {
+    if (session == null || plaintextLength <= 0) {
+      return null;
+    }
+
+    if (!hasEstablishedSession(session)) {
+      return null;
+    }
+
+    ConnectionOwner expectedOwner = asConnectionOwner(expectedOwnerToken);
+    Connection scopedNow = currentScopedConnection();
+    if (scopedAtEntry != null || scopedNow != null) {
+      if (scopedAtEntry == null
+          || scopedNow == null
+          || expected == null
+          || expectedOwner == null
+          || scopedAtEntry != scopedNow
+          || !scopedConnectionMatchesExpected(expected, scopedAtEntry)
+          || !isActive(expectedOwner)
+          || expectedOwner.connection != expected
+          || connectionOwnerForSession(session) != expectedOwner) {
+        return null;
+      }
+      consumeScopedBufferHandoff(buffer, handoff, expectedOwner);
+      return connectionOwnerForSession(session) == expectedOwner ? expected : null;
+    }
+
+    if (expected != null
+        && (expectedOwner == null
+            || !isActive(expectedOwner)
+            || expectedOwner.connection != expected
+            || connectionOwnerForSession(session) != expectedOwner)) {
+      return null;
+    }
+
+    if (bytesConsumed <= 0) {
+      return expected;
+    }
+
+    BufferHandoff candidate = asBufferHandoff(handoff);
+    if (candidate == null) {
+      return expected;
+    }
+    if (candidate == AMBIGUOUS_BUFFER_HANDOFF || buffer == null) {
+      return null;
+    }
+
+    if (candidate.state == BUFFER_HANDOFF_CLAIMING) {
+      makeCurrentBufferHandoffAmbiguous(buffer);
+      return null;
+    }
+
+    if (candidate.state == BUFFER_HANDOFF_CONSUMED) {
+      return expectedOwner != null
+              && candidate.owner == expectedOwner
+              && readBufferConnections.get(buffer) == candidate
+              && connectionOwnerForSession(session) == expectedOwner
+          ? expected
+          : null;
+    }
+
+    if (candidate.state != BUFFER_HANDOFF_AVAILABLE
+        || !isActive(candidate.owner)
+        || (expectedOwner != null && candidate.owner != expectedOwner)) {
+      return null;
+    }
+
+    if (expectedOwner == null) {
+      ConnectionOwner currentOwner = connectionOwnerForSession(session);
+      if (currentOwner != null && currentOwner != candidate.owner) {
+        return null;
+      }
+    }
+
+    return claimAvailableBufferHandoff(session, buffer, candidate, expectedOwner);
   }
 
-  public static Connection getActiveConnection(Connection c) {
-    return activeConnections.get(c);
+  private static Connection claimAvailableBufferHandoff(
+      SSLEngine session,
+      ByteBuffer buffer,
+      BufferHandoff candidate,
+      ConnectionOwner expectedOwner) {
+    BufferHandoff claiming = new BufferHandoff(candidate.owner, BUFFER_HANDOFF_CLAIMING);
+    if (!readBufferConnections.replace(buffer, candidate, claiming)) {
+      makeFailedTakeAmbiguous(buffer, candidate);
+      return null;
+    }
+
+    boolean accepted = false;
+    boolean installedSessionOwner = false;
+    try {
+      if (!isActive(candidate.owner)) {
+        return null;
+      }
+
+      if (expectedOwner != null) {
+        if (candidate.owner != expectedOwner
+            || connectionOwnerForSession(session) != expectedOwner) {
+          return null;
+        }
+      } else {
+        while (true) {
+          if (!isActive(candidate.owner)) {
+            return null;
+          }
+          if (sslConnections.putIfAbsent(session, candidate.owner)) {
+            installedSessionOwner = true;
+            break;
+          }
+          ConnectionOwner cachedOwner = sslConnections.get(session);
+          if (cachedOwner == null) {
+            return null;
+          }
+          if (!isActive(cachedOwner)) {
+            sslConnections.remove(session, cachedOwner);
+            if (cachedOwner == candidate.owner) {
+              return null;
+            }
+            continue;
+          }
+          if (cachedOwner != candidate.owner) {
+            return null;
+          }
+          break;
+        }
+      }
+
+      if (connectionOwnerForSession(session) != candidate.owner) {
+        return null;
+      }
+
+      BufferHandoff consumed = new BufferHandoff(candidate.owner, BUFFER_HANDOFF_CONSUMED);
+      if (!readBufferConnections.replace(buffer, claiming, consumed)) {
+        return null;
+      }
+      if (connectionOwnerForSession(session) != candidate.owner) {
+        return null;
+      }
+
+      accepted = true;
+      return candidate.owner.connection;
+    } finally {
+      if (!accepted) {
+        makeCurrentBufferHandoffAmbiguous(buffer);
+        if (installedSessionOwner) {
+          sslConnections.remove(session, candidate.owner);
+        }
+      }
+    }
   }
 
-  public static void setConnectionForBuf(String buf, Connection c) {
-    c.setBufferKey(buf);
-    bufConn.put(buf, c);
-    activeConnections.put(c, c);
+  private static boolean sameExactConnection(Connection first, Connection second) {
+    return first.equals(second)
+        && first.getSocketFileDescriptor() == second.getSocketFileDescriptor();
   }
 
-  public static void cleanupConnectionBufMapping(Connection c) {
-    bufConn.remove(c.getBufferKey());
-    activeConnections.remove(c);
+  private static boolean scopedConnectionMatchesExpected(Connection expected, Connection scoped) {
+    if (scoped.getSocketFileDescriptor() >= 0) {
+      return sameExactConnection(expected, scoped);
+    }
+    return expected.getSocketFileDescriptor() >= 0 && expected.equals(scoped);
+  }
+
+  private static boolean hasEstablishedSession(SSLEngine session) {
+    try {
+      SSLSession established = session.getSession();
+      return established != null && established.getId().length != 0;
+    } catch (Throwable ignored) {
+      return false;
+    }
+  }
+
+  public static boolean claimTlsConnectionMarkerAttempt(
+      SSLEngine session, Connection connection, long processIncarnation) {
+    if (session == null
+        || connection == null
+        || connection.getSocketFileDescriptor() < 0
+        || processIncarnation <= 0) {
+      return false;
+    }
+    ConnectionOwner owner = connectionOwnerForSession(session);
+    if (owner == null || owner.connection != connection) {
+      return false;
+    }
+
+    long now = tlsConnectionMarkerNanos();
+    while (true) {
+      if (!isActive(owner) || connectionOwnerForSession(session) != owner) {
+        return false;
+      }
+
+      TlsConnectionMarkerAttempt current = tlsConnectionMarkers.get(session);
+      boolean matching = current != null && current.matches(owner, processIncarnation);
+      if (matching
+          && current.attempts >= TLS_CONNECTION_MARKER_BURST_ATTEMPTS
+          && now - current.nextAttemptNanos < 0) {
+        return false;
+      }
+
+      int attempts =
+          matching
+              ? current.attempts == Integer.MAX_VALUE ? Integer.MAX_VALUE : current.attempts + 1
+              : 1;
+      TlsConnectionMarkerAttempt next =
+          new TlsConnectionMarkerAttempt(
+              owner, processIncarnation, attempts, now + TLS_CONNECTION_MARKER_RETRY_NANOS);
+      boolean reserved;
+      if (current == null) {
+        reserved = tlsConnectionMarkers.putIfAbsent(session, next);
+        if (!reserved && tlsConnectionMarkers.get(session) == null) {
+          return false;
+        }
+      } else {
+        reserved = tlsConnectionMarkers.replace(session, current, next);
+      }
+      if (!reserved) {
+        continue;
+      }
+
+      if (isActive(owner) && connectionOwnerForSession(session) == owner) {
+        return true;
+      }
+      tlsConnectionMarkers.remove(session, next);
+      return false;
+    }
+  }
+
+  private static long tlsConnectionMarkerNanos() {
+    LongSupplier clock = tlsConnectionMarkerClockForTest;
+    return clock == null ? System.nanoTime() : clock.getAsLong();
+  }
+
+  public static Object captureReadBufferHandoff(ByteBuffer buffer) {
+    return readBufferConnections.get(buffer);
+  }
+
+  public static Connection getConnectionForReadBuffer(ByteBuffer buffer) {
+    BufferHandoff handoff = asBufferHandoff(captureReadBufferHandoff(buffer));
+    return handoff == null || handoff.state != BUFFER_HANDOFF_AVAILABLE || !isActive(handoff.owner)
+        ? null
+        : handoff.owner.connection;
+  }
+
+  public static void setConnectionForReadBuffer(ByteBuffer buffer, Connection connection) {
+    if (buffer == null || connection == null || connection.getSocketFileDescriptor() < 0) {
+      return;
+    }
+
+    ConnectionOwner owner = activeConnectionOwner(connection);
+    if (owner == null) {
+      return;
+    }
+
+    BufferHandoff candidate = new BufferHandoff(owner, BUFFER_HANDOFF_AVAILABLE);
+    while (true) {
+      BufferHandoff observed = readBufferConnections.get(buffer);
+      if (observed == null) {
+        if (readBufferConnections.putIfAbsent(buffer, candidate)) {
+          return;
+        }
+        observed = readBufferConnections.get(buffer);
+        if (observed == null) {
+          return;
+        }
+      }
+      if (observed == AMBIGUOUS_BUFFER_HANDOFF) {
+        return;
+      }
+      BufferHandoff replacement =
+          observed.state != BUFFER_HANDOFF_CLAIMING
+                  && (observed.owner == owner || !isActive(observed.owner))
+              ? candidate
+              : AMBIGUOUS_BUFFER_HANDOFF;
+      if (readBufferConnections.replace(buffer, observed, replacement)) {
+        return;
+      }
+    }
+  }
+
+  public static void cleanupConnection(Connection connection) {
+    if (connection == null || connection.getSocketFileDescriptor() < 0) {
+      return;
+    }
+    ExactConnection key = new ExactConnection(connection);
+    ConnectionOwner owner = activeConnections.get(key);
+    if (owner != null && activeConnections.remove(key, owner)) {
+      owner.active = false;
+    }
+  }
+
+  private static ConnectionOwner activeConnectionOwner(Connection connection) {
+    ExactConnection key = new ExactConnection(connection);
+    while (true) {
+      ConnectionOwner owner = activeConnections.get(key);
+      if (owner != null) {
+        return owner;
+      }
+      ConnectionOwner candidate = new ConnectionOwner(key);
+      owner = activeConnections.putIfAbsent(key, candidate);
+      if (owner != null) {
+        return owner;
+      }
+      return activeConnections.get(key) == candidate ? candidate : null;
+    }
+  }
+
+  private static boolean isActive(ConnectionOwner owner) {
+    return owner != null && owner.active && activeConnections.get(owner.key) == owner;
+  }
+
+  private static ConnectionOwner connectionOwnerForSession(SSLEngine session) {
+    if (session == null) {
+      return null;
+    }
+    ConnectionOwner owner = sslConnections.get(session);
+    if (isActive(owner)) {
+      return owner;
+    }
+    if (owner != null) {
+      sslConnections.remove(session, owner);
+    }
+    return null;
+  }
+
+  private static BufferHandoff asBufferHandoff(Object handoff) {
+    return handoff instanceof BufferHandoff ? (BufferHandoff) handoff : null;
+  }
+
+  public static Object captureConnectionOwnerForUnwrap(SSLEngine session, Connection connection) {
+    ConnectionOwner owner = connectionOwnerForSession(session);
+    return owner != null && owner.connection == connection ? owner : null;
+  }
+
+  public static Connection currentScopedConnection() {
+    Object value = nettyConnection.get();
+    return value instanceof Connection ? (Connection) value : null;
+  }
+
+  private static void consumeScopedBufferHandoff(
+      ByteBuffer buffer, Object handoff, ConnectionOwner owner) {
+    BufferHandoff captured = asBufferHandoff(handoff);
+    while (buffer != null) {
+      BufferHandoff current = readBufferConnections.get(buffer);
+      if (current == null || current == AMBIGUOUS_BUFFER_HANDOFF) {
+        return;
+      }
+      if (current == captured
+          && current.owner == owner
+          && current.state == BUFFER_HANDOFF_CONSUMED) {
+        return;
+      }
+      if (current == captured
+          && current.owner == owner
+          && current.state == BUFFER_HANDOFF_AVAILABLE) {
+        BufferHandoff consumed = new BufferHandoff(owner, BUFFER_HANDOFF_CONSUMED);
+        if (readBufferConnections.replace(buffer, current, consumed)) {
+          return;
+        }
+      } else if (readBufferConnections.replace(buffer, current, AMBIGUOUS_BUFFER_HANDOFF)) {
+        return;
+      }
+    }
+  }
+
+  private static void makeFailedTakeAmbiguous(ByteBuffer buffer, BufferHandoff candidate) {
+    while (buffer != null) {
+      BufferHandoff current = readBufferConnections.get(buffer);
+      if (current == null || current == AMBIGUOUS_BUFFER_HANDOFF) {
+        return;
+      }
+      if (current.state == BUFFER_HANDOFF_CONSUMED && current.owner == candidate.owner) {
+        return;
+      }
+      if (readBufferConnections.replace(buffer, current, AMBIGUOUS_BUFFER_HANDOFF)) {
+        return;
+      }
+    }
+  }
+
+  private static void makeCurrentBufferHandoffAmbiguous(ByteBuffer buffer) {
+    while (buffer != null) {
+      BufferHandoff current = readBufferConnections.get(buffer);
+      if (current == null || current == AMBIGUOUS_BUFFER_HANDOFF) {
+        return;
+      }
+      if (readBufferConnections.replace(buffer, current, AMBIGUOUS_BUFFER_HANDOFF)) {
+        return;
+      }
+    }
+  }
+
+  private static ConnectionOwner asConnectionOwner(Object owner) {
+    return owner instanceof ConnectionOwner ? (ConnectionOwner) owner : null;
   }
 
   public static void setBufferMapping(String encrypted, BytesWithLen plain) {
@@ -481,5 +924,75 @@ public class SSLStorage {
 
   static void setThreadIdProviderForTest(LongSupplier provider) {
     threadIdProviderForTest = provider;
+  }
+
+  static void setTlsConnectionMarkerClockForTest(LongSupplier clock) {
+    tlsConnectionMarkerClockForTest = clock;
+  }
+
+  static final class TlsConnectionMarkerAttempt {
+    private final ConnectionOwner owner;
+    private final long processIncarnation;
+    private final int attempts;
+    private final long nextAttemptNanos;
+
+    TlsConnectionMarkerAttempt(
+        ConnectionOwner owner, long processIncarnation, int attempts, long nextAttemptNanos) {
+      this.owner = owner;
+      this.processIncarnation = processIncarnation;
+      this.attempts = attempts;
+      this.nextAttemptNanos = nextAttemptNanos;
+    }
+
+    private boolean matches(ConnectionOwner candidate, long candidateIncarnation) {
+      return owner == candidate && processIncarnation == candidateIncarnation;
+    }
+  }
+
+  static final class BufferHandoff {
+    private final ConnectionOwner owner;
+    private final int state;
+
+    BufferHandoff(ConnectionOwner owner, int state) {
+      this.owner = owner;
+      this.state = state;
+    }
+  }
+
+  static final class ConnectionOwner {
+    private final ExactConnection key;
+    private final Connection connection;
+    private volatile boolean active = true;
+
+    ConnectionOwner(ExactConnection key) {
+      this.key = key;
+      this.connection = key.connection;
+    }
+  }
+
+  static final class ExactConnection {
+    private final Connection connection;
+    private final int hash;
+
+    ExactConnection(Connection connection) {
+      this.connection = connection;
+      this.hash = 31 * connection.hashCode() + connection.getSocketFileDescriptor();
+    }
+
+    @Override
+    public int hashCode() {
+      return hash;
+    }
+
+    @Override
+    public boolean equals(Object other) {
+      if (this == other) {
+        return true;
+      }
+      if (!(other instanceof ExactConnection)) {
+        return false;
+      }
+      return sameExactConnection(connection, ((ExactConnection) other).connection);
+    }
   }
 }

@@ -8,6 +8,7 @@ package io.opentelemetry.obi.java.instrumentations;
 import static io.opentelemetry.obi.java.instrumentations.util.ByteBufferExtractor.b;
 
 import io.opentelemetry.obi.java.BootstrapNative;
+import io.opentelemetry.obi.java.bridge.RemoteParentBridge;
 import io.opentelemetry.obi.java.ebpf.IOCTLPacket;
 import io.opentelemetry.obi.java.ebpf.NativeMemory;
 import io.opentelemetry.obi.java.ebpf.OperationType;
@@ -72,19 +73,21 @@ public class SSLEngineInst {
       if (dst == null) {
         return null;
       }
-      if (engine.getSession().getId().length == 0) {
-        return null;
-      }
 
       int savedPos = b(dst).position();
-      // Capture the buffer key from src BEFORE unwrap() modifies the buffer content
-      // in-place. TLS 1.3 (AES-GCM) decrypts directly in the source buffer's backing
-      // array, so after unwrap() the bytes no longer match what SocketChannelInst stored.
-      String srcBufKey =
-          (src != null && b(src).hasRemaining())
-              ? ByteBufferExtractor.keyFromFreshBuffer(src)
-              : null;
-      return new Object[] {savedPos, srcBufKey};
+      Object handoff = SSLStorage.captureReadBufferHandoff(src);
+      Connection scoped = SSLStorage.currentScopedConnection();
+
+      if (SSLStorage.debugOn) {
+        System.err.println("[SSLEngineInst] looking up connection for read buffer");
+      }
+      Connection c = SSLStorage.resolveConnectionForUnwrap(engine, handoff);
+      Object owner = SSLStorage.captureConnectionOwnerForUnwrap(engine, c);
+
+      if (SSLStorage.debugOn && c != null) {
+        System.err.println("[SSLEngineInst] unwrap found connection " + c);
+      }
+      return new Object[] {savedPos, c, handoff, owner, scoped};
     }
 
     @Advice.OnMethodExit(suppress = Throwable.class)
@@ -98,69 +101,52 @@ public class SSLEngineInst {
         return;
       }
       int savedPos = (Integer) saved[0];
-      String srcBufKey = (String) saved[1];
+      Connection c = (Connection) saved[1];
+      Object handoff = saved[2];
+      Object owner = saved[3];
+      Connection scoped = (Connection) saved[4];
 
-      Connection c = SSLStorage.getConnectionForSession(engine);
-
-      if (src == null || dst == null) {
+      if (src == null || dst == null || result == null) {
         return;
-      }
-
-      if (c == null || c.getSocketFileDescriptor() < 0) {
-        Connection correlated = null;
-        if (SSLStorage.debugOn) {
-          System.err.println("[SSLEngineInst] looking up connection for  " + srcBufKey);
-        }
-        if (srcBufKey != null) {
-          correlated = SSLStorage.getConnectionForBuf(srcBufKey);
-        }
-
-        if (correlated == null) {
-          correlated = (Connection) SSLStorage.nettyConnection.get();
-        }
-        if (correlated != null && (c == null || correlated.getSocketFileDescriptor() >= 0)) {
-          c = correlated;
-        }
-
-        if (c == null) {
-          if (SSLStorage.debugOn) {
-            System.err.println("[SSLEngineInst] Can't find connection " + engine);
-          }
-        } else {
-          SSLStorage.setConnectionForSession(engine, c);
-        }
-      }
-
-      if (SSLStorage.debugOn) {
-        if (c != null) {
-          System.err.println("[SSLEngineInst] unwrap found connection " + c);
-        }
       }
 
       if (engine.getSession().getId().length == 0) {
         return;
       }
 
-      if (result.bytesProduced() > 0 && b(dst).limit() >= result.bytesProduced()) {
-        if (savedPos == -1) {
-          return;
-        }
+      ByteBuffer dstBuffer =
+          ByteBufferExtractor.fromProducedBuffer(dst, savedPos, result.bytesProduced());
 
-        ByteBuffer dup = dst.duplicate();
-        b(dup).position(savedPos);
-        ByteBuffer dstBuffer = ByteBufferExtractor.fromFreshBuffer(dup, result.bytesProduced());
+      byte[] b = dstBuffer.array();
+      int len = b(dstBuffer).position();
+      if (len == 0) {
+        return;
+      }
 
-        byte[] b = dstBuffer.array();
+      c =
+          SSLStorage.claimConnectionForUnwrap(
+              engine, src, handoff, c, owner, scoped, result.bytesConsumed(), len);
+      if (c == null) {
+        return;
+      }
 
+      if (SSLStorage.debugOn) {
+        System.err.println("[SSLEngineInst] unwrap:" + java.util.Arrays.toString(b));
+      }
+
+      NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize + len);
+      int wOff = IOCTLPacket.writePacketPrefix(p, 0, OperationType.RECEIVE, c, len);
+      IOCTLPacket.writePacketBuffer(p, wOff, b, 0, len);
+      try {
+        BootstrapNative.markTlsConnectionIfDue(engine, c);
+      } catch (Throwable failure) {
         if (SSLStorage.debugOn) {
-          System.err.println("[SSLEngineInst] unwrap:" + java.util.Arrays.toString(b));
+          System.err.println("[SSLEngineInst] failed to mark TLS connection: " + failure);
         }
-
-        NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize + b.length);
-        int wOff = IOCTLPacket.writePacketPrefix(p, 0, OperationType.RECEIVE, c, b.length);
-        IOCTLPacket.writePacketBuffer(p, wOff, b);
-        BootstrapNative.emitData(
-            c == null ? -1 : c.getSocketFileDescriptor(), p.getAddress(), true);
+      }
+      int emitStatus = BootstrapNative.emitData(c.getSocketFileDescriptor(), p.getAddress(), true);
+      if (emitStatus >= 0) {
+        RemoteParentBridge.recordTlsRead(len);
       }
     }
   }
@@ -171,102 +157,77 @@ public class SSLEngineInst {
         @Advice.This final javax.net.ssl.SSLEngine engine,
         @Advice.Argument(0) final ByteBuffer src,
         @Advice.Argument(1) final ByteBuffer[] dsts) {
-      if (dsts == null) {
-        return null;
-      }
-      if (dsts.length == 0 || engine.getSession().getId().length == 0) {
+      if (dsts == null || dsts.length == 0) {
         return null;
       }
 
       int[] positions = new int[dsts.length];
+      ByteBuffer[] buffers = dsts.clone();
       for (int i = 0; i < dsts.length; i++) {
-        if (dsts[i] == null) {
+        if (buffers[i] == null) {
           positions[i] = -1;
           continue;
         }
-        positions[i] = b(dsts[i]).position();
+        positions[i] = b(buffers[i]).position();
       }
 
-      // Capture the buffer key from src BEFORE unwrap() modifies the buffer content
-      // in-place. TLS 1.3 (AES-GCM) decrypts directly in the source buffer's backing
-      // array, so after unwrap() the bytes no longer match what SocketChannelInst stored.
-      String srcBufKey =
-          (src != null && b(src).hasRemaining())
-              ? ByteBufferExtractor.keyFromFreshBuffer(src)
-              : null;
+      Object handoff = SSLStorage.captureReadBufferHandoff(src);
+      Connection scoped = SSLStorage.currentScopedConnection();
 
-      return new Object[] {positions, srcBufKey};
+      if (SSLStorage.debugOn) {
+        System.err.println("[SSLEngineInst] looking up connection for read buffer array");
+      }
+      Connection c = SSLStorage.resolveConnectionForUnwrap(engine, handoff);
+      Object owner = SSLStorage.captureConnectionOwnerForUnwrap(engine, c);
+
+      if (SSLStorage.debugOn && c != null) {
+        System.err.println("[SSLEngineInst] unwrap array found connection " + c);
+      }
+      return new Object[] {positions, buffers, c, handoff, owner, scoped};
     }
 
     @Advice.OnMethodExit(suppress = Throwable.class)
     public static void unwrap(
         @Advice.This final javax.net.ssl.SSLEngine engine,
         @Advice.Enter Object[] saved,
+        @Advice.Argument(0) final ByteBuffer src,
         @Advice.Argument(1) final ByteBuffer[] dsts,
         @Advice.Return SSLEngineResult result) {
-      if (dsts == null || saved == null) {
+      if (src == null || dsts == null || saved == null || result == null) {
         return;
       }
       int[] savedDstPositions = (int[]) saved[0];
-      String srcBufKey = (String) saved[1];
-
-      Connection c = SSLStorage.getConnectionForSession(engine);
-
-      if (c == null || c.getSocketFileDescriptor() < 0) {
-        Connection correlated = null;
-        if (SSLStorage.debugOn) {
-          System.err.println("[SSLEngineInst] looking up connection for array " + srcBufKey);
-        }
-        if (srcBufKey != null) {
-          correlated = SSLStorage.getConnectionForBuf(srcBufKey);
-        }
-
-        if (correlated == null) {
-          correlated = (Connection) SSLStorage.nettyConnection.get();
-        }
-        if (correlated != null && (c == null || correlated.getSocketFileDescriptor() >= 0)) {
-          c = correlated;
-        }
-
-        if (c == null) {
-          if (SSLStorage.debugOn) {
-            System.err.println("[SSLEngineInst] Can't find connection for dst array");
-          }
-        } else {
-          SSLStorage.setConnectionForSession(engine, c);
-        }
-      }
-
-      if (SSLStorage.debugOn) {
-        if (c != null) {
-          System.err.println("[SSLEngineInst] unwrap array found connection " + c);
-        }
-      }
+      ByteBuffer[] savedDstBuffers = (ByteBuffer[]) saved[1];
+      Connection c = (Connection) saved[2];
+      Object handoff = saved[3];
+      Object owner = saved[4];
+      Connection scoped = (Connection) saved[5];
 
       if (dsts.length == 0 || engine.getSession().getId().length == 0) {
         return;
       }
 
       if (result.bytesProduced() > 0) {
-        if (savedDstPositions == null) {
+        if (savedDstPositions == null || savedDstBuffers == null) {
           return;
         }
 
-        ByteBuffer[] dups = new ByteBuffer[dsts.length];
-        for (int i = 0; i < dsts.length; i++) {
-          if (dsts[i] == null) {
-            continue;
-          }
-          if (savedDstPositions[i] != -1) {
-            dups[i] = dsts[i].duplicate();
-            b(dups[i]).position(savedDstPositions[i]);
-          }
-        }
-
-        ByteBuffer dstBuffer = ByteBufferExtractor.flattenFreshByteBufferArray(dups);
+        ByteBuffer dstBuffer =
+            ByteBufferExtractor.fromProducedBufferArray(
+                dsts, savedDstBuffers, savedDstPositions, result.bytesProduced());
 
         byte[] b = dstBuffer.array();
         int len = b(dstBuffer).position();
+        if (len == 0) {
+          return;
+        }
+
+        c =
+            SSLStorage.claimConnectionForUnwrap(
+                engine, src, handoff, c, owner, scoped, result.bytesConsumed(), len);
+        if (c == null) {
+          return;
+        }
 
         if (SSLStorage.debugOn) {
           System.err.println("[SSLEngineInst] unwrap array:" + java.util.Arrays.toString(b));
@@ -275,8 +236,18 @@ public class SSLEngineInst {
         NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize + len);
         int wOff = IOCTLPacket.writePacketPrefix(p, 0, OperationType.RECEIVE, c, len);
         IOCTLPacket.writePacketBuffer(p, wOff, b, 0, len);
-        BootstrapNative.emitData(
-            c == null ? -1 : c.getSocketFileDescriptor(), p.getAddress(), true);
+        try {
+          BootstrapNative.markTlsConnectionIfDue(engine, c);
+        } catch (Throwable failure) {
+          if (SSLStorage.debugOn) {
+            System.err.println("[SSLEngineInst] failed to mark TLS connection: " + failure);
+          }
+        }
+        int emitStatus =
+            BootstrapNative.emitData(c.getSocketFileDescriptor(), p.getAddress(), true);
+        if (emitStatus >= 0) {
+          RemoteParentBridge.recordTlsRead(len);
+        }
       }
     }
   }

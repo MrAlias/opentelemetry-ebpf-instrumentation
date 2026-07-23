@@ -13,6 +13,77 @@ import org.junit.jupiter.api.Test;
 class ByteBufferExtractorTest {
 
   @Test
+  void testFromProducedBufferArrayCopiesOnlyAdvancedPositionsAndReportedLength() {
+    ByteBuffer first = ByteBuffer.allocate(8);
+    first.put(new byte[] {90, 91});
+    int firstInitialPosition = first.position();
+    first.put(new byte[] {1, 2});
+    first.put(7, (byte) 99);
+
+    ByteBuffer second = ByteBuffer.allocate(8);
+    second.put((byte) 92);
+    int secondInitialPosition = second.position();
+    second.put(new byte[] {3, 4, 5});
+    second.put(7, (byte) 98);
+
+    ByteBuffer result =
+        ByteBufferExtractor.fromProducedBufferArray(
+            new ByteBuffer[] {first, second},
+            new ByteBuffer[] {first, second},
+            new int[] {firstInitialPosition, secondInitialPosition},
+            4);
+
+    assertEquals(4, result.position());
+    result.flip();
+    byte[] copied = new byte[result.remaining()];
+    result.get(copied);
+    assertArrayEquals(new byte[] {1, 2, 3, 4}, copied);
+    assertEquals(4, first.position());
+    assertEquals(4, second.position());
+    assertEquals(8, first.limit());
+    assertEquals(8, second.limit());
+  }
+
+  @Test
+  void testFromProducedBufferCapsReportedLengthToActualAdvance() {
+    ByteBuffer destination = ByteBuffer.allocate(8);
+    destination.put((byte) 90);
+    int initialPosition = destination.position();
+    destination.put(new byte[] {1, 2});
+
+    ByteBuffer result = ByteBufferExtractor.fromProducedBuffer(destination, initialPosition, 5);
+
+    assertEquals(2, result.position());
+    assertArrayEquals(new byte[] {1, 2}, result.array());
+  }
+
+  @Test
+  void testFromProducedBufferRejectsReportedOutputWithoutAdvance() {
+    ByteBuffer destination = ByteBuffer.allocate(8);
+
+    ByteBuffer result = ByteBufferExtractor.fromProducedBuffer(destination, 0, 5);
+
+    assertEquals(0, result.position());
+    assertEquals(0, result.capacity());
+  }
+
+  @Test
+  void testFromProducedBufferArrayRejectsReplacedDestination() {
+    ByteBuffer first = ByteBuffer.allocate(8);
+    ByteBuffer second = ByteBuffer.allocate(8);
+    ByteBuffer[] expected = {first, second};
+    int[] positions = {0, 0};
+    first.put((byte) 1);
+    second.put((byte) 2);
+    ByteBuffer[] replaced = {ByteBuffer.allocate(8), second};
+
+    ByteBuffer result =
+        ByteBufferExtractor.fromProducedBufferArray(replaced, expected, positions, 2);
+
+    assertEquals(0, result.position());
+  }
+
+  @Test
   void testFlattenUsedByteBufferArray_NullInput() {
     ByteBuffer result = ByteBufferExtractor.flattenUsedByteBufferArray(null, 10);
     assertEquals(0, result.position());

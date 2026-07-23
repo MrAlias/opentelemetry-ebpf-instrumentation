@@ -7,12 +7,15 @@ package io.opentelemetry.obi.java.instrumentations.data;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import io.opentelemetry.obi.java.ebpf.ThreadInfo;
 import io.opentelemetry.obi.java.instrumentations.BlockingQueueInst;
 import io.opentelemetry.obi.java.instrumentations.FutureInst;
 import io.opentelemetry.obi.java.instrumentations.JavaExecutorInst;
 import io.opentelemetry.obi.java.instrumentations.RunnableInst;
+import io.opentelemetry.obi.java.instrumentations.SSLEngineInst;
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
+import java.lang.reflect.Proxy;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
@@ -27,15 +30,38 @@ import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.RejectedExecutionHandler;
 import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.atomic.AtomicLong;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLEngineResult;
 import javax.net.ssl.SSLException;
+import javax.net.ssl.SSLSession;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 class SSLStorageTest {
 
   static class DummySSLEngine extends SSLEngine {
+    private final SSLSession session;
+
+    DummySSLEngine() {
+      this(new byte[0]);
+    }
+
+    DummySSLEngine(byte[] sessionId) {
+      byte[] id = sessionId.clone();
+      session =
+          (SSLSession)
+              Proxy.newProxyInstance(
+                  SSLSession.class.getClassLoader(),
+                  new Class<?>[] {SSLSession.class},
+                  (proxy, method, args) -> {
+                    if (method.getName().equals("getId")) {
+                      return id.clone();
+                    }
+                    throw new UnsupportedOperationException(method.getName());
+                  });
+    }
+
     @Override
     public String getPeerHost() {
       return null;
@@ -139,8 +165,8 @@ class SSLStorageTest {
     }
 
     @Override
-    public javax.net.ssl.SSLSession getSession() {
-      return null;
+    public SSLSession getSession() {
+      return session;
     }
 
     @Override
@@ -166,12 +192,30 @@ class SSLStorageTest {
     }
   }
 
+  static final class EqualSSLEngine extends DummySSLEngine {
+    EqualSSLEngine() {
+      super(new byte[] {1});
+    }
+
+    @Override
+    public boolean equals(Object other) {
+      return other instanceof EqualSSLEngine;
+    }
+
+    @Override
+    public int hashCode() {
+      return 1;
+    }
+  }
+
   @AfterEach
   void cleanup() {
     // Clean up thread locals
     SSLStorage.unencrypted.remove();
     SSLStorage.nettyConnection.remove();
     SSLStorage.setThreadIdProviderForTest(null);
+    SSLStorage.setTlsConnectionMarkerClockForTest(null);
+    ThreadInfo.setRemoteParentEnabled(false);
   }
 
   @Test
@@ -179,50 +223,830 @@ class SSLStorageTest {
     SSLEngine engine = new DummySSLEngine();
     Connection conn =
         new Connection(
-            InetAddress.getByName("127.0.0.1"), 1234, InetAddress.getByName("1.2.3.4"), 5678);
+            InetAddress.getByName("127.0.0.1"), 1234, InetAddress.getByName("1.2.3.4"), 5678, 6);
 
     assertNull(SSLStorage.getConnectionForSession(engine));
     SSLStorage.setConnectionForSession(engine, conn);
     assertEquals(conn, SSLStorage.getConnectionForSession(engine));
+    SSLStorage.cleanupConnection(conn);
+    assertNull(SSLStorage.getConnectionForSession(engine));
   }
 
   @Test
-  void testBufConnectionMapping() throws Exception {
-    String bufKey = "buf123";
-    Connection conn =
-        new Connection(
-            InetAddress.getByName("127.0.0.2"), 4321, InetAddress.getByName("5.6.7.8"), 8765);
+  void equalTlsEnginesKeepIndependentSessionAndMarkerState() throws Exception {
+    SSLEngine firstEngine = new EqualSSLEngine();
+    SSLEngine secondEngine = new EqualSSLEngine();
+    Connection first = connection(1254, 5698, 17);
+    Connection second = connection(1255, 5699, 18);
+    assertEquals(firstEngine, secondEngine);
 
-    assertNull(SSLStorage.getConnectionForBuf(bufKey));
-    SSLStorage.setConnectionForBuf(bufKey, conn);
-    assertEquals(conn, SSLStorage.getConnectionForBuf(bufKey));
-    assertEquals(bufKey, conn.getBufferKey());
+    SSLStorage.setConnectionForSession(firstEngine, first);
+    SSLStorage.setConnectionForSession(secondEngine, second);
+    assertSame(first, SSLStorage.getConnectionForSession(firstEngine));
+    assertSame(second, SSLStorage.getConnectionForSession(secondEngine));
+
+    for (int attempt = 0; attempt < SSLStorage.TLS_CONNECTION_MARKER_BURST_ATTEMPTS; attempt++) {
+      assertTrue(SSLStorage.claimTlsConnectionMarkerAttempt(firstEngine, first, 11));
+    }
+    assertFalse(SSLStorage.claimTlsConnectionMarkerAttempt(firstEngine, first, 11));
+    assertTrue(SSLStorage.claimTlsConnectionMarkerAttempt(secondEngine, second, 11));
+
+    SSLStorage.cleanupConnection(first);
+    SSLStorage.cleanupConnection(second);
   }
 
   @Test
-  void testActiveConnectionTracking() throws Exception {
-    Connection conn =
+  void testTlsConnectionMarkerRetriesAreBounded() {
+    SSLEngine engine = new DummySSLEngine();
+    AtomicLong now = new AtomicLong(100L);
+    SSLStorage.setTlsConnectionMarkerClockForTest(now::get);
+    Connection first =
         new Connection(
-            InetAddress.getByName("127.0.0.3"), 1111, InetAddress.getByName("8.8.8.8"), 2222);
+            InetAddress.getLoopbackAddress(), 1234, InetAddress.getLoopbackAddress(), 5678, 7);
 
-    assertTrue(SSLStorage.connectionUntracked(conn));
-    SSLStorage.setConnectionForBuf("bufX", conn);
-    assertFalse(SSLStorage.connectionUntracked(conn));
-    assertEquals(conn, SSLStorage.getActiveConnection(conn));
+    assertFalse(SSLStorage.claimTlsConnectionMarkerAttempt(null, first, 11));
+    assertFalse(SSLStorage.claimTlsConnectionMarkerAttempt(engine, null, 11));
+    assertFalse(
+        SSLStorage.claimTlsConnectionMarkerAttempt(
+            engine,
+            new Connection(
+                InetAddress.getLoopbackAddress(), 1234, InetAddress.getLoopbackAddress(), 5678, -1),
+            11));
+    assertFalse(SSLStorage.claimTlsConnectionMarkerAttempt(engine, first, 0));
+    SSLStorage.setConnectionForSession(engine, first);
+
+    for (int attempt = 0; attempt < SSLStorage.TLS_CONNECTION_MARKER_BURST_ATTEMPTS; attempt++) {
+      assertTrue(SSLStorage.claimTlsConnectionMarkerAttempt(engine, first, 11));
+    }
+    assertFalse(SSLStorage.claimTlsConnectionMarkerAttempt(engine, first, 11));
+    for (int unwrap = 0; unwrap < 1_000_000; unwrap++) {
+      assertFalse(SSLStorage.claimTlsConnectionMarkerAttempt(engine, first, 11));
+    }
+
+    now.addAndGet(SSLStorage.TLS_CONNECTION_MARKER_RETRY_NANOS - 1);
+    assertFalse(SSLStorage.claimTlsConnectionMarkerAttempt(engine, first, 11));
+    now.incrementAndGet();
+    assertTrue(SSLStorage.claimTlsConnectionMarkerAttempt(engine, first, 11));
+    assertFalse(SSLStorage.claimTlsConnectionMarkerAttempt(engine, first, 11));
+    SSLStorage.cleanupConnection(first);
   }
 
   @Test
-  void testCleanupConnectionBufMapping() throws Exception {
-    String bufKey = "bufY";
-    Connection conn =
+  void testTlsConnectionMarkerChangesResetRetries() {
+    SSLEngine engine = new DummySSLEngine();
+    AtomicLong now = new AtomicLong(100L);
+    SSLStorage.setTlsConnectionMarkerClockForTest(now::get);
+    Connection first =
         new Connection(
-            InetAddress.getByName("127.0.0.4"), 3333, InetAddress.getByName("9.9.9.9"), 4444);
+            InetAddress.getLoopbackAddress(), 1234, InetAddress.getLoopbackAddress(), 5678, 7);
+    Connection changedDescriptor =
+        new Connection(
+            InetAddress.getLoopbackAddress(), 1234, InetAddress.getLoopbackAddress(), 5678, 8);
+    Connection changedTuple =
+        new Connection(
+            InetAddress.getLoopbackAddress(), 1235, InetAddress.getLoopbackAddress(), 5678, 8);
 
-    SSLStorage.setConnectionForBuf(bufKey, conn);
-    assertEquals(conn, SSLStorage.getConnectionForBuf(bufKey));
-    SSLStorage.cleanupConnectionBufMapping(conn);
-    assertNull(SSLStorage.getConnectionForBuf(bufKey));
-    assertNull(SSLStorage.getActiveConnection(conn));
+    exhaustTlsConnectionMarkerBurst(engine, first, 11);
+    assertFalse(SSLStorage.claimTlsConnectionMarkerAttempt(engine, first, 11));
+    exhaustTlsConnectionMarkerBurst(engine, changedDescriptor, 11);
+    assertFalse(SSLStorage.claimTlsConnectionMarkerAttempt(engine, changedDescriptor, 11));
+    exhaustTlsConnectionMarkerBurst(engine, changedTuple, 11);
+    assertFalse(SSLStorage.claimTlsConnectionMarkerAttempt(engine, changedTuple, 11));
+    exhaustTlsConnectionMarkerBurst(engine, changedTuple, 12);
+    assertFalse(SSLStorage.claimTlsConnectionMarkerAttempt(engine, changedTuple, 12));
+    SSLStorage.cleanupConnection(first);
+    SSLStorage.cleanupConnection(changedDescriptor);
+    SSLStorage.cleanupConnection(changedTuple);
+  }
+
+  @Test
+  void reusedExactTlsConnectionGetsAFreshMarkerOwnerGeneration() throws Exception {
+    SSLEngine engine = new DummySSLEngine();
+    AtomicLong now = new AtomicLong(100L);
+    SSLStorage.setTlsConnectionMarkerClockForTest(now::get);
+    Connection first = connection(1284, 5728, 19);
+    exhaustTlsConnectionMarkerBurst(engine, first, 11);
+    assertFalse(SSLStorage.claimTlsConnectionMarkerAttempt(engine, first, 11));
+
+    SSLStorage.cleanupConnection(first);
+    Connection reused = connection(1284, 5728, 19);
+
+    exhaustTlsConnectionMarkerBurst(engine, reused, 11);
+    assertFalse(SSLStorage.claimTlsConnectionMarkerAttempt(engine, reused, 11));
+    SSLStorage.cleanupConnection(reused);
+  }
+
+  @Test
+  void concurrentTlsMarkerClaimsReserveExactlyOneBurst() throws Exception {
+    int callers = SSLStorage.TLS_CONNECTION_MARKER_BURST_ATTEMPTS * 4;
+    SSLEngine engine = new DummySSLEngine();
+    Connection connection = connection(1294, 5738, 20);
+    SSLStorage.setConnectionForSession(engine, connection);
+    SSLStorage.setTlsConnectionMarkerClockForTest(() -> 100L);
+    CountDownLatch ready = new CountDownLatch(callers);
+    CountDownLatch start = new CountDownLatch(1);
+    ExecutorService executor = Executors.newFixedThreadPool(callers);
+    java.util.ArrayList<Future<Boolean>> claims = new java.util.ArrayList<>();
+
+    try {
+      for (int caller = 0; caller < callers; caller++) {
+        claims.add(
+            executor.submit(
+                () -> {
+                  ready.countDown();
+                  assertTrue(start.await(5, java.util.concurrent.TimeUnit.SECONDS));
+                  return SSLStorage.claimTlsConnectionMarkerAttempt(engine, connection, 11);
+                }));
+      }
+      assertTrue(ready.await(5, java.util.concurrent.TimeUnit.SECONDS));
+      start.countDown();
+
+      int reserved = 0;
+      for (Future<Boolean> claim : claims) {
+        if (claim.get(5, java.util.concurrent.TimeUnit.SECONDS)) {
+          reserved++;
+        }
+      }
+      assertEquals(SSLStorage.TLS_CONNECTION_MARKER_BURST_ATTEMPTS, reserved);
+      assertFalse(SSLStorage.claimTlsConnectionMarkerAttempt(engine, connection, 11));
+    } finally {
+      start.countDown();
+      executor.shutdownNow();
+      SSLStorage.cleanupConnection(connection);
+    }
+  }
+
+  private static void exhaustTlsConnectionMarkerBurst(
+      SSLEngine engine, Connection connection, long processIncarnation) {
+    SSLStorage.setConnectionForSession(engine, connection);
+    for (int attempt = 0; attempt < SSLStorage.TLS_CONNECTION_MARKER_BURST_ATTEMPTS; attempt++) {
+      assertTrue(
+          SSLStorage.claimTlsConnectionMarkerAttempt(engine, connection, processIncarnation));
+    }
+  }
+
+  @Test
+  void tentativeReadBufferIsNotClaimedBeforeHandshake() throws Exception {
+    SSLEngine engine = new DummySSLEngine();
+    ByteBuffer source = ByteBuffer.wrap(new byte[] {1, 2, 3});
+    Connection connection = connection(1234, 5678, 7);
+    SSLStorage.setConnectionForReadBuffer(source, connection);
+
+    Object handoff = SSLStorage.captureReadBufferHandoff(source);
+
+    assertNotNull(handoff);
+    assertNull(SSLStorage.resolveConnectionForUnwrap(engine, handoff));
+    assertNull(
+        SSLStorage.claimConnectionForUnwrap(engine, source, handoff, null, null, null, 1, 1));
+    assertNull(SSLStorage.getConnectionForSession(engine));
+    SSLStorage.cleanupConnection(connection);
+  }
+
+  @Test
+  void scopedConnectionWinsBeforeHandshake() throws Exception {
+    SSLEngine engine = new DummySSLEngine();
+    Connection connection = connection(2234, 6678, 8);
+    SSLStorage.nettyConnection.set(connection);
+
+    Object[] saved =
+        SSLEngineInst.UnwrapAdvice.unwrap(
+            engine, ByteBuffer.wrap(new byte[] {4, 5, 6}), ByteBuffer.allocate(8));
+
+    assertNotNull(saved);
+    assertSame(connection, saved[1]);
+    assertSame(connection, SSLStorage.getConnectionForSession(engine));
+    SSLStorage.cleanupConnection(connection);
+  }
+
+  @Test
+  void scopedConnectionReplacesStaleSessionOwner() throws Exception {
+    SSLEngine engine = new DummySSLEngine(new byte[] {1});
+    Connection stale = connection(2334, 6778, 25);
+    Connection scoped = connection(2335, 6779, 26);
+    SSLStorage.setConnectionForSession(engine, stale);
+    SSLStorage.nettyConnection.set(scoped);
+
+    Object[] saved =
+        SSLEngineInst.UnwrapAdvice.unwrap(
+            engine, ByteBuffer.wrap(new byte[] {7, 8, 9}), ByteBuffer.allocate(8));
+
+    assertNotNull(saved);
+    assertSame(scoped, saved[1]);
+    assertSame(scoped, SSLStorage.getConnectionForSession(engine));
+    SSLStorage.cleanupConnection(stale);
+    SSLStorage.cleanupConnection(scoped);
+  }
+
+  @Test
+  void changedScopedConnectionAtExitFailsClosed() throws Exception {
+    SSLEngine engine = new DummySSLEngine(new byte[] {1});
+    Connection first = connection(2434, 6878, 29);
+    Connection second = connection(2435, 6879, 30);
+    ByteBuffer source = ByteBuffer.allocate(8);
+    ByteBuffer destination = ByteBuffer.allocate(8);
+    SSLStorage.nettyConnection.set(first);
+    Object[] saved = SSLEngineInst.UnwrapAdvice.unwrap(engine, source, destination);
+    destination.put((byte) 1);
+
+    SSLStorage.nettyConnection.set(second);
+    SSLEngineInst.UnwrapAdvice.unwrap(
+        engine,
+        saved,
+        source,
+        destination,
+        new SSLEngineResult(
+            SSLEngineResult.Status.OK, SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING, 1, 1));
+
+    assertSame(first, SSLStorage.getConnectionForSession(engine));
+    SSLStorage.cleanupConnection(first);
+    SSLStorage.cleanupConnection(second);
+  }
+
+  @Test
+  void sameExactReplacementScopedConnectionAtExitFailsClosed() throws Exception {
+    SSLEngine engine = new DummySSLEngine(new byte[] {1});
+    Connection first = connection(2484, 6928, 36);
+    Connection replacement = connection(2484, 6928, 36);
+    ByteBuffer source = ByteBuffer.allocate(8);
+    SSLStorage.nettyConnection.set(first);
+    Connection expected = SSLStorage.resolveConnectionForUnwrap(engine, null);
+    Object owner = SSLStorage.captureConnectionOwnerForUnwrap(engine, expected);
+
+    SSLStorage.nettyConnection.set(replacement);
+
+    assertNull(
+        SSLStorage.claimConnectionForUnwrap(engine, source, null, expected, owner, first, 1, 1));
+    assertSame(first, SSLStorage.getConnectionForSession(engine));
+    SSLStorage.cleanupConnection(first);
+  }
+
+  @Test
+  void stableFileDescriptorlessScopedConnectionUsesCachedExactOwner() throws Exception {
+    SSLEngine engine = new DummySSLEngine(new byte[] {1});
+    Connection cached = connection(2514, 6958, 39);
+    Connection scope = connection(2514, 6958, -1);
+    SSLStorage.setConnectionForSession(engine, cached);
+    SSLStorage.nettyConnection.set(scope);
+    Connection expected = SSLStorage.resolveConnectionForUnwrap(engine, null);
+    Object owner = SSLStorage.captureConnectionOwnerForUnwrap(engine, expected);
+
+    assertSame(
+        cached,
+        SSLStorage.claimConnectionForUnwrap(
+            engine, ByteBuffer.allocate(8), null, expected, owner, scope, 1, 1));
+    SSLStorage.cleanupConnection(cached);
+  }
+
+  @Test
+  void fileDescriptorlessReplacementScopedConnectionAtExitFailsClosed() throws Exception {
+    SSLEngine engine = new DummySSLEngine(new byte[] {1});
+    Connection cached = connection(2534, 6978, 37);
+    Connection firstScope = connection(2534, 6978, -1);
+    Connection replacementScope = connection(2534, 6978, -1);
+    SSLStorage.setConnectionForSession(engine, cached);
+    SSLStorage.nettyConnection.set(firstScope);
+    Connection expected = SSLStorage.resolveConnectionForUnwrap(engine, null);
+    Object owner = SSLStorage.captureConnectionOwnerForUnwrap(engine, expected);
+
+    SSLStorage.nettyConnection.set(replacementScope);
+
+    assertNull(
+        SSLStorage.claimConnectionForUnwrap(
+            engine, ByteBuffer.allocate(8), null, expected, owner, firstScope, 1, 1));
+    assertSame(cached, SSLStorage.getConnectionForSession(engine));
+    SSLStorage.cleanupConnection(cached);
+  }
+
+  @Test
+  void clearedFileDescriptorlessScopedConnectionAtExitFailsClosed() throws Exception {
+    SSLEngine engine = new DummySSLEngine(new byte[] {1});
+    Connection cached = connection(2584, 7028, 38);
+    Connection scope = connection(2584, 7028, -1);
+    SSLStorage.setConnectionForSession(engine, cached);
+    SSLStorage.nettyConnection.set(scope);
+    Connection expected = SSLStorage.resolveConnectionForUnwrap(engine, null);
+    Object owner = SSLStorage.captureConnectionOwnerForUnwrap(engine, expected);
+
+    SSLStorage.nettyConnection.remove();
+
+    assertNull(
+        SSLStorage.claimConnectionForUnwrap(
+            engine, ByteBuffer.allocate(8), null, expected, owner, scope, 1, 1));
+    assertSame(cached, SSLStorage.getConnectionForSession(engine));
+    SSLStorage.cleanupConnection(cached);
+  }
+
+  @Test
+  void exitOnlyScopedConnectionDoesNotClaimTentativeBuffer() throws Exception {
+    SSLEngine engine = new DummySSLEngine(new byte[] {1});
+    Connection readOwner = connection(2534, 6978, 31);
+    Connection lateScope = connection(2535, 6979, 32);
+    ByteBuffer source = ByteBuffer.allocate(8);
+    ByteBuffer destination = ByteBuffer.allocate(8);
+    SSLStorage.setConnectionForReadBuffer(source, readOwner);
+    Object[] saved = SSLEngineInst.UnwrapAdvice.unwrap(engine, source, destination);
+    destination.put((byte) 1);
+
+    SSLStorage.nettyConnection.set(lateScope);
+    SSLEngineInst.UnwrapAdvice.unwrap(
+        engine,
+        saved,
+        source,
+        destination,
+        new SSLEngineResult(
+            SSLEngineResult.Status.OK, SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING, 1, 1));
+
+    assertNull(SSLStorage.getConnectionForSession(engine));
+    assertSame(readOwner, SSLStorage.getConnectionForReadBuffer(source));
+    SSLStorage.cleanupConnection(readOwner);
+    SSLStorage.cleanupConnection(lateScope);
+  }
+
+  @Test
+  void scopedOwnerMakesAConflictingReadHandoffAmbiguous() throws Exception {
+    SSLEngine engine = new DummySSLEngine(new byte[] {1});
+    Connection scoped = connection(2634, 7078, 33);
+    Connection conflicting = connection(2635, 7079, 34);
+    ByteBuffer source = ByteBuffer.allocate(8);
+    SSLStorage.setConnectionForReadBuffer(source, conflicting);
+    Object handoff = SSLStorage.captureReadBufferHandoff(source);
+    SSLStorage.nettyConnection.set(scoped);
+    Connection expected = SSLStorage.resolveConnectionForUnwrap(engine, handoff);
+    Object owner = SSLStorage.captureConnectionOwnerForUnwrap(engine, expected);
+
+    assertSame(
+        scoped,
+        SSLStorage.claimConnectionForUnwrap(
+            engine, source, handoff, expected, owner, scoped, 1, 1));
+    SSLStorage.setConnectionForReadBuffer(source, conflicting);
+    assertNull(SSLStorage.getConnectionForReadBuffer(source));
+    assertNull(
+        SSLStorage.claimConnectionForUnwrap(
+            new DummySSLEngine(new byte[] {2}),
+            source,
+            SSLStorage.captureReadBufferHandoff(source),
+            null,
+            null,
+            null,
+            1,
+            1));
+    SSLStorage.cleanupConnection(scoped);
+    SSLStorage.cleanupConnection(conflicting);
+  }
+
+  @Test
+  void scopedOwnerMakesARefreshedHandoffAmbiguous() throws Exception {
+    SSLEngine engine = new DummySSLEngine(new byte[] {1});
+    Connection scoped = connection(2734, 7178, 35);
+    ByteBuffer source = ByteBuffer.allocate(8);
+    SSLStorage.setConnectionForReadBuffer(source, scoped);
+    Object captured = SSLStorage.captureReadBufferHandoff(source);
+    SSLStorage.nettyConnection.set(scoped);
+    Connection expected = SSLStorage.resolveConnectionForUnwrap(engine, captured);
+    Object owner = SSLStorage.captureConnectionOwnerForUnwrap(engine, expected);
+    SSLStorage.setConnectionForReadBuffer(source, scoped);
+
+    assertSame(
+        scoped,
+        SSLStorage.claimConnectionForUnwrap(
+            engine, source, captured, expected, owner, scoped, 1, 1));
+    SSLStorage.setConnectionForReadBuffer(source, scoped);
+    assertNull(SSLStorage.getConnectionForReadBuffer(source));
+    assertNull(
+        SSLStorage.claimConnectionForUnwrap(
+            new DummySSLEngine(new byte[] {2}),
+            source,
+            SSLStorage.captureReadBufferHandoff(source),
+            null,
+            null,
+            null,
+            1,
+            1));
+    SSLStorage.cleanupConnection(scoped);
+  }
+
+  @Test
+  void identicalCiphertextInDistinctBuffersKeepsExactOwners() throws Exception {
+    ByteBuffer firstBuffer = ByteBuffer.wrap(new byte[] {23, 3, 3, 0, 42});
+    ByteBuffer secondBuffer = ByteBuffer.wrap(new byte[] {23, 3, 3, 0, 42});
+    Connection first = connection(3234, 7678, 9);
+    Connection second = connection(3235, 7679, 10);
+    SSLEngine firstEngine = new DummySSLEngine(new byte[] {1});
+    SSLEngine secondEngine = new DummySSLEngine(new byte[] {2});
+    SSLStorage.setConnectionForReadBuffer(firstBuffer, first);
+    SSLStorage.setConnectionForReadBuffer(secondBuffer, second);
+
+    Object firstHandoff = SSLStorage.captureReadBufferHandoff(firstBuffer);
+    Object secondHandoff = SSLStorage.captureReadBufferHandoff(secondBuffer);
+
+    assertSame(
+        first,
+        SSLStorage.claimConnectionForUnwrap(
+            firstEngine, firstBuffer, firstHandoff, null, null, null, 1, 1));
+    assertSame(
+        second,
+        SSLStorage.claimConnectionForUnwrap(
+            secondEngine, secondBuffer, secondHandoff, null, null, null, 1, 1));
+    SSLStorage.cleanupConnection(first);
+    SSLStorage.cleanupConnection(second);
+  }
+
+  @Test
+  void bufferAliasesFailClosed() throws Exception {
+    ByteBuffer heap = ByteBuffer.allocate(8);
+    ByteBuffer direct = ByteBuffer.allocateDirect(8);
+    Connection heapConnection = connection(4234, 8678, 11);
+    Connection directConnection = connection(4235, 8679, 12);
+    SSLStorage.setConnectionForReadBuffer(heap, heapConnection);
+    SSLStorage.setConnectionForReadBuffer(direct, directConnection);
+
+    assertSame(heapConnection, SSLStorage.getConnectionForReadBuffer(heap));
+    assertNull(SSLStorage.getConnectionForReadBuffer(heap.duplicate()));
+    assertSame(directConnection, SSLStorage.getConnectionForReadBuffer(direct));
+    assertNull(SSLStorage.getConnectionForReadBuffer(direct.duplicate()));
+    SSLStorage.cleanupConnection(heapConnection);
+    SSLStorage.cleanupConnection(directConnection);
+  }
+
+  @Test
+  void inactiveOwnerAllowsPooledBufferReuse() throws Exception {
+    ByteBuffer source = ByteBuffer.allocate(8);
+    Connection first = connection(5234, 9678, 13);
+    Connection second = connection(5235, 9679, 14);
+    SSLStorage.setConnectionForReadBuffer(source, first);
+    SSLStorage.cleanupConnection(first);
+    SSLStorage.setConnectionForReadBuffer(source, second);
+
+    Object handoff = SSLStorage.captureReadBufferHandoff(source);
+
+    assertNotNull(handoff);
+    assertSame(second, SSLStorage.getConnectionForReadBuffer(source));
+    assertSame(
+        second,
+        SSLStorage.claimConnectionForUnwrap(
+            new DummySSLEngine(new byte[] {1}), source, handoff, null, null, null, 1, 1));
+    SSLStorage.cleanupConnection(second);
+  }
+
+  @Test
+  void lateStaleClaimCannotTakeInactiveOwnerReplacement() throws Exception {
+    ByteBuffer source = ByteBuffer.allocate(8);
+    Connection first = connection(5244, 9688, 44);
+    Connection second = connection(5245, 9689, 45);
+    SSLStorage.setConnectionForReadBuffer(source, first);
+    Object stale = SSLStorage.captureReadBufferHandoff(source);
+    SSLStorage.cleanupConnection(first);
+    SSLStorage.setConnectionForReadBuffer(source, second);
+    Object current = SSLStorage.captureReadBufferHandoff(source);
+
+    assertNull(
+        SSLStorage.claimConnectionForUnwrap(
+            new DummySSLEngine(new byte[] {1}), source, stale, null, null, null, 1, 1));
+    assertSame(second, SSLStorage.getConnectionForReadBuffer(source));
+    assertSame(
+        second,
+        SSLStorage.claimConnectionForUnwrap(
+            new DummySSLEngine(new byte[] {2}), source, current, null, null, null, 1, 1));
+    SSLStorage.cleanupConnection(second);
+  }
+
+  @Test
+  void staleHandoffMakesRefreshedGenerationAmbiguous() throws Exception {
+    ByteBuffer source = ByteBuffer.allocate(8);
+    Connection connection = connection(6234, 1678, 15);
+    SSLStorage.setConnectionForReadBuffer(source, connection);
+    Object stale = SSLStorage.captureReadBufferHandoff(source);
+
+    SSLStorage.setConnectionForReadBuffer(source, connection);
+    Object current = SSLStorage.captureReadBufferHandoff(source);
+
+    assertNull(
+        SSLStorage.claimConnectionForUnwrap(
+            new DummySSLEngine(new byte[] {1}), source, stale, null, null, null, 1, 1));
+    assertNull(SSLStorage.getConnectionForReadBuffer(source));
+    assertNull(
+        SSLStorage.claimConnectionForUnwrap(
+            new DummySSLEngine(new byte[] {2}), source, current, null, null, null, 1, 1));
+    SSLStorage.cleanupConnection(connection);
+  }
+
+  @Test
+  void handoffCanOnlyBeClaimedOnce() throws Exception {
+    ByteBuffer source = ByteBuffer.allocate(8);
+    Connection connection = connection(7234, 2678, 16);
+    SSLStorage.setConnectionForReadBuffer(source, connection);
+    Object handoff = SSLStorage.captureReadBufferHandoff(source);
+
+    assertSame(
+        connection,
+        SSLStorage.claimConnectionForUnwrap(
+            new DummySSLEngine(new byte[] {1}), source, handoff, null, null, null, 1, 1));
+    assertNull(
+        SSLStorage.claimConnectionForUnwrap(
+            new DummySSLEngine(new byte[] {2}), source, handoff, null, null, null, 1, 1));
+    SSLStorage.cleanupConnection(connection);
+  }
+
+  @Test
+  void concurrentHandoffClaimsHaveAtMostOneSessionWinner() throws Exception {
+    ExecutorService executor = Executors.newFixedThreadPool(2);
+    try {
+      for (int iteration = 0; iteration < 32; iteration++) {
+        ByteBuffer source = ByteBuffer.allocate(8);
+        Connection connection = connection(7200 + iteration, 8200 + iteration, 100 + iteration);
+        SSLEngine firstEngine = new DummySSLEngine(new byte[] {1});
+        SSLEngine secondEngine = new DummySSLEngine(new byte[] {2});
+        SSLStorage.setConnectionForReadBuffer(source, connection);
+        Object handoff = SSLStorage.captureReadBufferHandoff(source);
+        CountDownLatch ready = new CountDownLatch(2);
+        CountDownLatch start = new CountDownLatch(1);
+
+        Callable<Connection> firstClaim =
+            () -> {
+              ready.countDown();
+              assertTrue(start.await(5, java.util.concurrent.TimeUnit.SECONDS));
+              return SSLStorage.claimConnectionForUnwrap(
+                  firstEngine, source, handoff, null, null, null, 1, 1);
+            };
+        Callable<Connection> secondClaim =
+            () -> {
+              ready.countDown();
+              assertTrue(start.await(5, java.util.concurrent.TimeUnit.SECONDS));
+              return SSLStorage.claimConnectionForUnwrap(
+                  secondEngine, source, handoff, null, null, null, 1, 1);
+            };
+
+        Future<Connection> first = executor.submit(firstClaim);
+        Future<Connection> second = executor.submit(secondClaim);
+        assertTrue(ready.await(5, java.util.concurrent.TimeUnit.SECONDS));
+        start.countDown();
+        Connection firstResult = first.get(5, java.util.concurrent.TimeUnit.SECONDS);
+        Connection secondResult = second.get(5, java.util.concurrent.TimeUnit.SECONDS);
+
+        assertTrue(firstResult == null || firstResult == connection);
+        assertTrue(secondResult == null || secondResult == connection);
+        assertTrue(firstResult == null || secondResult == null);
+        assertSame(firstResult, SSLStorage.getConnectionForSession(firstEngine));
+        assertSame(secondResult, SSLStorage.getConnectionForSession(secondEngine));
+        assertNull(SSLStorage.getConnectionForReadBuffer(source));
+        SSLStorage.cleanupConnection(connection);
+      }
+    } finally {
+      executor.shutdownNow();
+    }
+  }
+
+  @Test
+  void successfulClaimAllowsSameOwnerReadToRearm() throws Exception {
+    ByteBuffer source = ByteBuffer.allocate(8);
+    Connection connection = connection(7284, 2728, 40);
+    SSLStorage.setConnectionForReadBuffer(source, connection);
+    Object first = SSLStorage.captureReadBufferHandoff(source);
+
+    assertSame(
+        connection,
+        SSLStorage.claimConnectionForUnwrap(
+            new DummySSLEngine(new byte[] {1}), source, first, null, null, null, 1, 1));
+    assertNull(SSLStorage.getConnectionForReadBuffer(source));
+
+    SSLStorage.setConnectionForReadBuffer(source, connection);
+    Object second = SSLStorage.captureReadBufferHandoff(source);
+
+    assertSame(
+        connection,
+        SSLStorage.claimConnectionForUnwrap(
+            new DummySSLEngine(new byte[] {2}), source, second, null, null, null, 1, 1));
+    SSLStorage.cleanupConnection(connection);
+  }
+
+  @Test
+  void successfulClaimMakesDistinctOwnerReuseAmbiguous() throws Exception {
+    ByteBuffer source = ByteBuffer.allocate(8);
+    Connection firstOwner = connection(7294, 2738, 41);
+    Connection secondOwner = connection(7295, 2739, 42);
+    SSLStorage.setConnectionForReadBuffer(source, firstOwner);
+    Object first = SSLStorage.captureReadBufferHandoff(source);
+
+    assertSame(
+        firstOwner,
+        SSLStorage.claimConnectionForUnwrap(
+            new DummySSLEngine(new byte[] {1}), source, first, null, null, null, 1, 1));
+
+    SSLStorage.setConnectionForReadBuffer(source, secondOwner);
+
+    assertNull(SSLStorage.getConnectionForReadBuffer(source));
+    assertNull(
+        SSLStorage.claimConnectionForUnwrap(
+            new DummySSLEngine(new byte[] {2}),
+            source,
+            SSLStorage.captureReadBufferHandoff(source),
+            null,
+            null,
+            null,
+            1,
+            1));
+    SSLStorage.cleanupConnection(firstOwner);
+    SSLStorage.cleanupConnection(secondOwner);
+  }
+
+  @Test
+  void handoffRequiresCiphertextConsumptionAndActualPlaintext() throws Exception {
+    ByteBuffer source = ByteBuffer.allocate(8);
+    Connection connection = connection(7334, 2778, 24);
+    SSLEngine engine = new DummySSLEngine(new byte[] {1});
+    SSLStorage.setConnectionForReadBuffer(source, connection);
+    Object handoff = SSLStorage.captureReadBufferHandoff(source);
+
+    assertNull(
+        SSLStorage.claimConnectionForUnwrap(engine, source, handoff, null, null, null, 0, 1));
+    assertNull(
+        SSLStorage.claimConnectionForUnwrap(engine, source, handoff, null, null, null, 1, 0));
+    assertNull(SSLStorage.getConnectionForSession(engine));
+    assertSame(
+        connection,
+        SSLStorage.claimConnectionForUnwrap(engine, source, handoff, null, null, null, 1, 1));
+    SSLStorage.cleanupConnection(connection);
+  }
+
+  @Test
+  void cachedOwnerCanEmitBufferedPlaintextWithoutClaimingTheCurrentSource() throws Exception {
+    SSLEngine engine = new DummySSLEngine(new byte[] {1});
+    Connection connection = connection(7434, 2878, 28);
+    ByteBuffer source = ByteBuffer.allocate(8);
+    SSLStorage.setConnectionForSession(engine, connection);
+    Object owner = SSLStorage.captureConnectionOwnerForUnwrap(engine, connection);
+
+    assertSame(
+        connection,
+        SSLStorage.claimConnectionForUnwrap(engine, source, null, connection, owner, null, 0, 1));
+    SSLStorage.cleanupConnection(connection);
+    assertNull(
+        SSLStorage.claimConnectionForUnwrap(engine, source, null, connection, owner, null, 0, 1));
+  }
+
+  @Test
+  void cleanupInvalidatesAllOutstandingBuffersAndSessionCache() throws Exception {
+    ByteBuffer first = ByteBuffer.allocate(8);
+    ByteBuffer second = ByteBuffer.allocate(8);
+    Connection connection = connection(8234, 3678, 17);
+    SSLEngine engine = new DummySSLEngine(new byte[] {1});
+    SSLStorage.setConnectionForReadBuffer(first, connection);
+    SSLStorage.setConnectionForReadBuffer(second, connection);
+    Object firstHandoff = SSLStorage.captureReadBufferHandoff(first);
+    Object secondHandoff = SSLStorage.captureReadBufferHandoff(second);
+    assertSame(
+        connection,
+        SSLStorage.claimConnectionForUnwrap(engine, first, firstHandoff, null, null, null, 1, 1));
+
+    SSLStorage.cleanupConnection(connection);
+
+    assertNull(SSLStorage.getConnectionForSession(engine));
+    assertNull(
+        SSLStorage.claimConnectionForUnwrap(
+            new DummySSLEngine(new byte[] {2}), second, secondHandoff, null, null, null, 1, 1));
+  }
+
+  @Test
+  void reusedExactDescriptorGetsANewSessionOwnerGeneration() throws Exception {
+    SSLEngine engine = new DummySSLEngine(new byte[] {1});
+    Connection firstGeneration = connection(8334, 3778, 27);
+    SSLStorage.setConnectionForSession(engine, firstGeneration);
+    SSLStorage.cleanupConnection(firstGeneration);
+    Connection secondGeneration = connection(8334, 3778, 27);
+    ByteBuffer source = ByteBuffer.allocate(8);
+    SSLStorage.setConnectionForReadBuffer(source, secondGeneration);
+    Object handoff = SSLStorage.captureReadBufferHandoff(source);
+
+    assertNull(SSLStorage.getConnectionForSession(engine));
+    assertSame(
+        secondGeneration,
+        SSLStorage.claimConnectionForUnwrap(engine, source, handoff, null, null, null, 1, 1));
+    assertSame(secondGeneration, SSLStorage.getConnectionForSession(engine));
+    SSLStorage.cleanupConnection(secondGeneration);
+  }
+
+  @Test
+  void cleanupOfOldDescriptorDoesNotInvalidateCurrentDescriptor() throws Exception {
+    ByteBuffer oldBuffer = ByteBuffer.allocate(8);
+    ByteBuffer currentBuffer = ByteBuffer.allocate(8);
+    Connection oldOwner = connection(9234, 4678, 18);
+    Connection currentOwner = connection(9234, 4678, 19);
+    SSLStorage.setConnectionForReadBuffer(oldBuffer, oldOwner);
+    SSLStorage.setConnectionForReadBuffer(currentBuffer, currentOwner);
+    Object oldHandoff = SSLStorage.captureReadBufferHandoff(oldBuffer);
+    Object currentHandoff = SSLStorage.captureReadBufferHandoff(currentBuffer);
+
+    SSLStorage.cleanupConnection(oldOwner);
+
+    assertNull(
+        SSLStorage.claimConnectionForUnwrap(
+            new DummySSLEngine(new byte[] {1}), oldBuffer, oldHandoff, null, null, null, 1, 1));
+    assertSame(
+        currentOwner,
+        SSLStorage.claimConnectionForUnwrap(
+            new DummySSLEngine(new byte[] {2}),
+            currentBuffer,
+            currentHandoff,
+            null,
+            null,
+            null,
+            1,
+            1));
+    SSLStorage.cleanupConnection(currentOwner);
+  }
+
+  @Test
+  void conflictingTentativeOwnerDoesNotReplaceSessionOwner() throws Exception {
+    SSLEngine engine = new DummySSLEngine(new byte[] {1});
+    ByteBuffer source = ByteBuffer.allocate(8);
+    Connection cached = connection(10234, 5678, 20);
+    Connection conflicting = connection(10235, 5679, 21);
+    Connection later = connection(10236, 5680, 43);
+    SSLStorage.setConnectionForSession(engine, cached);
+    SSLStorage.setConnectionForReadBuffer(source, conflicting);
+    Object handoff = SSLStorage.captureReadBufferHandoff(source);
+
+    assertNull(SSLStorage.resolveConnectionForUnwrap(engine, handoff));
+    assertSame(cached, SSLStorage.getConnectionForSession(engine));
+    assertNull(
+        SSLStorage.claimConnectionForUnwrap(engine, source, handoff, null, null, null, 1, 1));
+    assertSame(cached, SSLStorage.getConnectionForSession(engine));
+    assertSame(conflicting, SSLStorage.getConnectionForReadBuffer(source));
+
+    SSLStorage.setConnectionForReadBuffer(source, later);
+
+    assertNull(SSLStorage.getConnectionForReadBuffer(source));
+    assertNull(
+        SSLStorage.claimConnectionForUnwrap(
+            new DummySSLEngine(new byte[] {2}),
+            source,
+            SSLStorage.captureReadBufferHandoff(source),
+            null,
+            null,
+            null,
+            1,
+            1));
+    SSLStorage.cleanupConnection(cached);
+    SSLStorage.cleanupConnection(conflicting);
+    SSLStorage.cleanupConnection(later);
+  }
+
+  @Test
+  void underflowDoesNotClaimTentativeOwner() throws Exception {
+    SSLEngine engine = new DummySSLEngine(new byte[] {1});
+    ByteBuffer source = ByteBuffer.wrap(new byte[] {23, 3, 3, 0, 43});
+    ByteBuffer destination = ByteBuffer.allocate(8);
+    Connection connection = connection(11234, 6678, 22);
+    SSLStorage.setConnectionForReadBuffer(source, connection);
+
+    Object[] saved = SSLEngineInst.UnwrapAdvice.unwrap(engine, source, destination);
+    SSLEngineInst.UnwrapAdvice.unwrap(
+        engine,
+        saved,
+        source,
+        destination,
+        new SSLEngineResult(
+            SSLEngineResult.Status.BUFFER_UNDERFLOW,
+            SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING,
+            0,
+            0));
+
+    assertNull(saved[1]);
+    assertNull(SSLStorage.getConnectionForSession(engine));
+    assertSame(connection, SSLStorage.getConnectionForReadBuffer(source));
+    SSLStorage.cleanupConnection(connection);
+  }
+
+  @Test
+  void reportedPlaintextWithoutDestinationAdvanceDoesNotClaim() throws Exception {
+    SSLEngine engine = new DummySSLEngine(new byte[] {1});
+    ByteBuffer source = ByteBuffer.allocate(8);
+    ByteBuffer destination = ByteBuffer.allocate(8);
+    Connection connection = connection(12234, 7678, 23);
+    SSLStorage.setConnectionForReadBuffer(source, connection);
+
+    Object[] saved = SSLEngineInst.UnwrapAdvice.unwrap(engine, source, destination);
+    SSLEngineInst.UnwrapAdvice.unwrap(
+        engine,
+        saved,
+        source,
+        destination,
+        new SSLEngineResult(
+            SSLEngineResult.Status.OK, SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING, 1, 1));
+
+    assertNull(SSLStorage.getConnectionForSession(engine));
+    assertSame(connection, SSLStorage.getConnectionForReadBuffer(source));
+    SSLStorage.cleanupConnection(connection);
+  }
+
+  private static Connection connection(int localPort, int remotePort, int fileDescriptor)
+      throws Exception {
+    return new Connection(
+        InetAddress.getByName("127.0.0.1"),
+        localPort,
+        InetAddress.getByName("127.0.0.2"),
+        remotePort,
+        fileDescriptor);
   }
 
   @Test

@@ -26,7 +26,9 @@ public enum OperationType {
   // the full-width virtual-thread id has permanently completed
   VT_TERMINATE((byte) 11),
   // fail closed by removing the calling logical task's inherited context
-  TASK_UNLINK((byte) 12);
+  TASK_UNLINK((byte) 12),
+  // identify a correlated live socket as TLS before application data arrives
+  TLS_CONNECTION((byte) 13);
 
   public final byte code;
 

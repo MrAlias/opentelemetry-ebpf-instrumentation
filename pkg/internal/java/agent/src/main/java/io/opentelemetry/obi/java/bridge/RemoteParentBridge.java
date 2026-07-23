@@ -100,6 +100,18 @@ public final class RemoteParentBridge {
     RemoteParentDiagnostics.extensionEvent(event, count);
   }
 
+  public static void recordTlsRead(int bytes) {
+    RemoteParentDiagnostics.tlsRead(bytes);
+  }
+
+  public static long tlsReadEvents() {
+    return RemoteParentDiagnostics.tlsReadEvents();
+  }
+
+  public static long tlsReadBytes() {
+    return RemoteParentDiagnostics.tlsReadBytes();
+  }
+
   public static String diagnosticsSnapshot() {
     return RemoteParentDiagnostics.snapshot();
   }

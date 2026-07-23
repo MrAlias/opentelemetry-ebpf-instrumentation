@@ -222,6 +222,19 @@ class CappedConcurrentHashMapTest {
   }
 
   @Test
+  void testConditionalOperations() {
+    CappedConcurrentHashMap<String, Integer> map = new CappedConcurrentHashMap<>(5);
+
+    assertNull(map.putIfAbsent("key", 100));
+    assertEquals(100, map.putIfAbsent("key", 200));
+    assertFalse(map.replace("key", 200, 300));
+    assertTrue(map.replace("key", 100, 300));
+    assertFalse(map.remove("key", 100));
+    assertTrue(map.remove("key", 300));
+    assertNull(map.get("key"));
+  }
+
+  @Test
   void testPut_MultipleElements_WithinCapacity() {
     CappedConcurrentHashMap<String, Integer> map = new CappedConcurrentHashMap<>(5);
     for (int i = 0; i < 5; i++) {

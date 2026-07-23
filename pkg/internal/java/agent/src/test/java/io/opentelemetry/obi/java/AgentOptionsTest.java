@@ -73,6 +73,24 @@ class AgentOptionsTest {
     assertTrue(
         Agent.isBootstrapHelperClassName(
             "io.opentelemetry.obi.java.bridge.RemoteParentBridge$NoopProvider"));
+    assertTrue(
+        Agent.isBootstrapHelperClassName(
+            "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$TlsConnectionMarkerAttempt"));
+    assertTrue(
+        Agent.isBootstrapHelperClassName(
+            "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$BufferHandoff"));
+    assertTrue(
+        Agent.isBootstrapHelperClassName(
+            "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ConnectionOwner"));
+    assertTrue(
+        Agent.isBootstrapHelperClassName(
+            "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ExactConnection"));
+    assertTrue(
+        Agent.isBootstrapHelperClassName(
+            "io.opentelemetry.obi.java.instrumentations.data.WeakIdentityConcurrentMap"));
+    assertTrue(
+        Agent.isBootstrapHelperClassName(
+            "io.opentelemetry.obi.java.instrumentations.data.WeakIdentityConcurrentMap$IdentityWeakReference"));
     assertFalse(Agent.isBootstrapHelperClassName(UntrustedSamePackageClass.class.getName()));
     assertFalse(Agent.isBootstrapHelperClassName(Agent.class.getName()));
     assertFalse(
@@ -88,6 +106,12 @@ class AgentOptionsTest {
         "io.opentelemetry.obi.java.instrumentations.data.WeakIdentityTaskMap$Bucket");
     assertNoAccessMarkerConstructor(
         "io.opentelemetry.obi.java.instrumentations.data.WeakIdentityTaskMap$Entry");
+    assertNoAccessMarkerConstructor(
+        "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$TlsConnectionMarkerAttempt");
+    assertNoAccessMarkerConstructor(
+        "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$BufferHandoff");
+    assertNoAccessMarkerConstructor(
+        "io.opentelemetry.obi.java.instrumentations.data.WeakIdentityConcurrentMap$IdentityWeakReference");
   }
 
   private static void assertNoAccessMarkerConstructor(String className) throws Exception {

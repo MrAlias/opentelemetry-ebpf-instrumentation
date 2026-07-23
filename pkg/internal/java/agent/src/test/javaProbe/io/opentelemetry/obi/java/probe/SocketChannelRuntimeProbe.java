@@ -42,7 +42,7 @@ public final class SocketChannelRuntimeProbe {
           throw new IllegalStateException("SocketChannel instrumentation changed the payload");
         }
 
-        Object connection = capturedConnection(bufferKey(received));
+        Object connection = capturedConnection(received);
         capturedSocketFileDescriptor = socketFileDescriptor(connection);
         int concreteSocketFileDescriptor = concreteSocketFileDescriptor(client);
         if (capturedSocketFileDescriptor != concreteSocketFileDescriptor) {
@@ -65,19 +65,11 @@ public final class SocketChannelRuntimeProbe {
     System.out.println("socket-channel-agent-probe passed fd=" + capturedSocketFileDescriptor);
   }
 
-  private static String bufferKey(ByteBuffer buffer) throws Exception {
-    Class<?> extractor =
-        Class.forName(
-            "io.opentelemetry.obi.java.instrumentations.util.ByteBufferExtractor", true, null);
-    Method keyFromUsedBuffer = extractor.getMethod("keyFromUsedBuffer", ByteBuffer.class);
-    return (String) keyFromUsedBuffer.invoke(null, buffer);
-  }
-
-  private static Object capturedConnection(String bufferKey) throws Exception {
+  private static Object capturedConnection(ByteBuffer buffer) throws Exception {
     Class<?> storage =
         Class.forName("io.opentelemetry.obi.java.instrumentations.data.SSLStorage", true, null);
-    Method getConnection = storage.getMethod("getConnectionForBuf", String.class);
-    Object connection = getConnection.invoke(null, bufferKey);
+    Method getConnection = storage.getMethod("getConnectionForReadBuffer", ByteBuffer.class);
+    Object connection = getConnection.invoke(null, buffer);
     if (connection == null) {
       throw new IllegalStateException("SocketChannel instrumentation did not capture a connection");
     }

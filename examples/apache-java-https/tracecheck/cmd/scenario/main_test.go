@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"testing"
@@ -145,6 +146,13 @@ func TestStressScenarioRequestsHaveBoundedShapes(t *testing.T) {
 		check    func(*testing.T, requestCase)
 	}{
 		{
+			scenario: "keepalive",
+			count:    10,
+			check: func(t *testing.T, request requestCase) {
+				assert.False(t, request.CloseConnection)
+			},
+		},
+		{
 			scenario: "connection-churn",
 			count:    32,
 			check: func(t *testing.T, request requestCase) {
@@ -280,7 +288,21 @@ func TestRequestsCloseBackendConnectionsAfterEvidence(t *testing.T) {
 		requests, err := makeRequests(config{scenario: scenario, seed: 1})
 		require.NoError(t, err)
 		for i := range requests {
-			assert.Equal(t, i == len(requests)-1, requests[i].CloseConnection, scenario)
+			terminal := i == len(requests)-1
+			expectedCloseQuery := ""
+			if terminal {
+				expectedCloseQuery = "1"
+			}
+			assert.Equal(t, terminal, requests[i].CloseConnection, scenario)
+
+			request, err := newHTTPRequest(
+				context.Background(),
+				config{baseURL: "https://example.test"},
+				requests[i],
+			)
+			require.NoError(t, err)
+			assert.Equal(t, terminal, request.Close, scenario)
+			assert.Equal(t, expectedCloseQuery, request.URL.Query().Get("close"), scenario)
 		}
 	}
 
@@ -457,21 +479,48 @@ func TestFDPortReuseEvidenceRequiresBothReusedIdentities(t *testing.T) {
 }
 
 func TestConnectionShapeUsesStableBackendIdentifiers(t *testing.T) {
-	keepalive := []backendResponse{
-		{BackendConnectionID: 1, BackendRemotePort: 41000},
-		{BackendConnectionID: 1, BackendRemotePort: 41001},
-		{BackendConnectionID: 2, BackendRemotePort: 41002},
+	const keepaliveCount = 10
+	identity := backendResponse{
+		BackendConnectionID: 1,
+		BackendRemotePort:   41000,
+		TLSProtocol:         "TLSv1.3",
+		TLSCipher:           "TLS_AES_256_GCM_SHA384",
+	}
+	keepalive := make([]backendResponse, keepaliveCount)
+	for index := range keepalive {
+		keepalive[index] = identity
 	}
 	require.NoError(t, validateConnectionShape("keepalive", keepalive, nil))
-
-	allReused := append([]backendResponse(nil), keepalive...)
-	allReused[len(allReused)-1].BackendConnectionID = 1
-	require.NoError(t, validateConnectionShape("keepalive", allReused, nil))
+	require.NoError(t, validateConnectionShape("keepalive", keepalive[:3], nil))
 	require.Error(t, validateConnectionShape("keepalive", keepalive[:2], nil))
 
-	brokenKeepalive := append([]backendResponse(nil), keepalive...)
-	brokenKeepalive[1].BackendConnectionID = 3
-	require.Error(t, validateConnectionShape("keepalive", brokenKeepalive, nil))
+	tests := []struct {
+		name   string
+		mutate func([]backendResponse)
+	}{
+		{name: "connection ID", mutate: func(responses []backendResponse) {
+			responses[4].BackendConnectionID++
+		}},
+		{name: "terminal remote port", mutate: func(responses []backendResponse) {
+			responses[len(responses)-1].BackendRemotePort++
+		}},
+		{name: "terminal TLS protocol", mutate: func(responses []backendResponse) {
+			responses[len(responses)-1].TLSProtocol = "TLSv1.2"
+		}},
+		{name: "terminal TLS cipher", mutate: func(responses []backendResponse) {
+			responses[len(responses)-1].TLSCipher = "different"
+		}},
+		{name: "terminal connection", mutate: func(responses []backendResponse) {
+			responses[len(responses)-1].BackendConnectionID++
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			broken := append([]backendResponse(nil), keepalive...)
+			test.mutate(broken)
+			require.Error(t, validateConnectionShape("keepalive", broken, nil))
+		})
+	}
 
 	churn := []backendResponse{
 		{BackendConnectionID: 1, BackendRemotePort: 41000},
@@ -508,4 +557,23 @@ func TestReuseAndPipelineScenariosRejectSharedParents(t *testing.T) {
 
 	require.Error(t, validateDistinctParents("pipelining", "java-backend", cases))
 	require.Error(t, validateDistinctParents("fd-port-reuse", "java-backend", cases))
+	require.Error(t, validateDistinctParents("keepalive", "java-backend", cases))
+
+	unique := make([]caseResult, 10)
+	for index := range unique {
+		unique[index] = caseResult{
+			Request: requestCase{Marker: fmt.Sprintf("keepalive-%02d", index)},
+			Trace: tracecheck.Snapshot{Spans: []tracecheck.Span{{
+				ServiceName:  "java-backend",
+				Kind:         "SERVER",
+				TraceID:      fmt.Sprintf("trace-%02d", index),
+				ParentSpanID: fmt.Sprintf("parent-%02d", index),
+			}}},
+		}
+	}
+	require.NoError(t, validateDistinctParents("keepalive", "java-backend", unique))
+
+	unique[len(unique)-1].Trace.Spans[0].TraceID = unique[0].Trace.Spans[0].TraceID
+	unique[len(unique)-1].Trace.Spans[0].ParentSpanID = unique[0].Trace.Spans[0].ParentSpanID
+	require.Error(t, validateDistinctParents("keepalive", "java-backend", unique))
 }

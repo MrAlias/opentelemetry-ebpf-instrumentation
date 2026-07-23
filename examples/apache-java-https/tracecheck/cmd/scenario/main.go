@@ -1311,7 +1311,7 @@ func validateConnectionShape(
 	}
 	switch scenario {
 	case "keepalive":
-		if err := validateReuseBeforeTerminalClose(responses, connectionIDs); err != nil {
+		if err := validateKeepaliveConnection(responses); err != nil {
 			return err
 		}
 	case "concurrency":
@@ -1350,6 +1350,35 @@ func validateConnectionShape(
 		if evidence.ReusedBackendFileDescriptor == 0 {
 			return fmt.Errorf("expected one Jetty descriptor to be reused across distinct stable Jetty connections: %+v", evidence)
 		}
+	}
+	return nil
+}
+
+func validateKeepaliveConnection(responses []backendResponse) error {
+	if len(responses) < 3 {
+		return errors.New("expected at least two requests before the terminal backend close")
+	}
+
+	expected := responses[0]
+	for index, response := range responses[1:] {
+		if response.BackendConnectionID == expected.BackendConnectionID &&
+			response.BackendRemotePort == expected.BackendRemotePort &&
+			response.TLSProtocol == expected.TLSProtocol &&
+			response.TLSCipher == expected.TLSCipher {
+			continue
+		}
+		return fmt.Errorf(
+			"expected keepalive request %d to reuse backend TLS connection id=%d remote_port=%d protocol=%q cipher=%q, got id=%d remote_port=%d protocol=%q cipher=%q",
+			index+1,
+			expected.BackendConnectionID,
+			expected.BackendRemotePort,
+			expected.TLSProtocol,
+			expected.TLSCipher,
+			response.BackendConnectionID,
+			response.BackendRemotePort,
+			response.TLSProtocol,
+			response.TLSCipher,
+		)
 	}
 	return nil
 }
@@ -1411,7 +1440,7 @@ func validateDistinctParents(scenario, javaService string, cases []caseResult) e
 }
 
 func distinctParentScenario(scenario string) bool {
-	return parallelScenario(scenario) || scenario == "pipelining" ||
+	return parallelScenario(scenario) || scenario == "keepalive" || scenario == "pipelining" ||
 		scenario == "fd-port-reuse" || scenario == "tls-boundary"
 }
 

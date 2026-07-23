@@ -718,6 +718,10 @@ test_bridge_take_count_includes_cancelled_request() {
     printf 'basic bridge take count did not match its request count\n' >&2
     return 1
   }
+  [[ "$(scenario_bridge_take_count keepalive)" == "10" ]] || {
+    printf 'keepalive bridge take count did not retain its acceptance default\n' >&2
+    return 1
+  }
   [[ "$(scenario_bridge_take_count timeout-retry)" == "2" ]] || {
     printf 'timeout/retry bridge take count omitted the cancelled request\n' >&2
     return 1
@@ -1117,12 +1121,14 @@ test_scenario_fences_metrics_around_diagnostics() {
     local -r wanted_sampled="$5"
     local -r wanted_unsampled="$6"
     local -r wanted_standard="$7"
+    local -r wanted_request_argument="$8"
     local -r call_log="$TEST_TMP_DIR/scenario-$name.calls"
     local boundary_ran=false
     local expected_requests=0
 
     RESULT_DIR="$TEST_TMP_DIR/scenario-$name"
     mkdir -p -- "$RESULT_DIR"
+    : >"$call_log"
     BRIDGE_RUNNING=true
     COMPOSE=(docker compose)
     REPEAT_COUNT=1
@@ -1146,7 +1152,19 @@ test_scenario_fences_metrics_around_diagnostics() {
       printf '# empty\n' >"$RESULT_DIR/phases/$1/obi-metrics.prom"
     }
     run_bounded() {
-      printf 'scenario\n' >>"$call_log"
+      local request_argument=default
+      while (( $# > 0 )); do
+        if [[ "$1" == "--requests" ]]; then
+          if (( $# < 2 )); then
+            return 1
+          fi
+          request_argument="$2"
+          shift 2
+          continue
+        fi
+        shift
+      done
+      printf 'scenario:%s\n' "$request_argument" >>"$call_log"
       printf '{"status":"passed"}\n'
     }
     wait_for_bridge_metrics_quiescent() {
@@ -1170,19 +1188,28 @@ test_scenario_fences_metrics_around_diagnostics() {
 
     expected_requests="$(scenario_bridge_take_count "$name")"
     [[ "$(<"$call_log")" == "$(printf \
-      'boundary:%s\ndiagnostics:%s-before\nwait:0:0\nevidence:%s-before\nscenario\nwait:%d:%d\nevidence:%s-after\ndiagnostics:%s-after' \
-      "$name" "$name" "$name" "$expected_requests" "$expected_requests" "$name" "$name")" ]]
+      'boundary:%s\ndiagnostics:%s-before\nwait:0:0\nevidence:%s-before\nscenario:%s\nwait:%d:%d\nevidence:%s-after\ndiagnostics:%s-after' \
+      "$name" "$name" "$name" "$wanted_request_argument" \
+      "$expected_requests" "$expected_requests" "$name" "$name")" ]]
   )
 
-  run_accounting_case basic 1 1 1 1 0 0 || {
+  run_accounting_case basic 1 1 1 1 0 0 1 || {
     printf 'basic scenario did not fence metrics around diagnostics\n' >&2
     return 1
   }
-  run_accounting_case tls-boundary 0 2 4 2 0 0 || {
+  run_accounting_case keepalive 0 10 1 10 0 0 default || {
+    printf 'keepalive scenario did not account for all acceptance requests\n' >&2
+    return 1
+  }
+  run_accounting_case keepalive 7 7 1 7 0 0 7 || {
+    printf 'targeted keepalive request count was not forwarded and accounted\n' >&2
+    return 1
+  }
+  run_accounting_case tls-boundary 0 2 4 2 0 0 2 || {
     printf 'TLS-boundary scenario did not fence metrics around diagnostics\n' >&2
     return 1
   }
-  run_accounting_case obi-flags 4 4 1 2 2 0 || {
+  run_accounting_case obi-flags 4 4 1 2 2 0 4 || {
     printf 'OBI-flags scenario did not preserve sampled and unsampled takes\n' >&2
     return 1
   }

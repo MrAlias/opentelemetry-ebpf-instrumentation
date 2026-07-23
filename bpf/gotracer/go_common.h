@@ -325,6 +325,8 @@ static __always_inline u8 client_trace_parent(void *goroutine_addr, tp_info_t *t
 
     // May get overridden when decoding existing traceparent or finding a server span, but otherwise we set sample ON
     tp_i->flags = k_flag_sampled;
+    // We set the time of the current client trace parent
+    tp_i->ts = bpf_ktime_get_ns();
 
     go_addr_key_t g_key = {};
     go_addr_key_from_id(&g_key, goroutine_addr);
@@ -343,8 +345,15 @@ static __always_inline u8 client_trace_parent(void *goroutine_addr, tp_info_t *t
         tp_info_t *tp = tp_info_from_parent_go(&g_key, 0);
 
         if (tp) {
-            tp_from_parent(tp_i, tp);
-        } else {
+            if (should_be_in_same_transaction(tp, tp_i)) {
+                tp_from_parent(tp_i, tp);
+                found_trace_id = 1;
+            } else {
+                bpf_dbg_printk("Parent and child are too far apart, ignoring parent trace_id");
+            }
+        }
+
+        if (!found_trace_id) {
             urand_bytes(tp_i->trace_id, TRACE_ID_SIZE_BYTES);
         }
 

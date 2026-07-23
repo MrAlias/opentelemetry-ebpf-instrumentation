@@ -3,10 +3,10 @@ import org.gradle.api.tasks.compile.JavaCompile
 
 plugins {
     java
-    id("com.gradleup.shadow") version "9.4.3"
+    id("com.gradleup.shadow") version "9.6.0"
     id("com.github.jk1.dependency-license-report") version "3.1.4"
     id("me.champeau.jmh") version "0.7.3"
-    id("org.cyclonedx.bom") version "3.2.4"
+    id("org.cyclonedx.bom") version "3.3.0"
     id("com.diffplug.spotless")
 }
 
@@ -46,8 +46,8 @@ repositories {
 val nettyProbe = configurations.create("nettyProbe")
 
 dependencies {
-    implementation("net.bytebuddy:byte-buddy:1.18.10")
-    implementation("net.bytebuddy:byte-buddy-agent:1.18.10")
+    implementation("net.bytebuddy:byte-buddy:1.18.11")
+    implementation("net.bytebuddy:byte-buddy-agent:1.18.11")
 
     testImplementation("org.junit.jupiter:junit-jupiter-api:5.14.4")
     testImplementation("org.junit.platform:junit-platform-launcher:1.14.4")

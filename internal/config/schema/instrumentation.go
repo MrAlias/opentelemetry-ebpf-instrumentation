@@ -38,13 +38,14 @@ type ProtocolEnablement struct {
 // HTTPInstrumentation describes HTTP capture, filtering, route, and payload
 // extraction settings.
 type HTTPInstrumentation struct {
-	Enabled             ProtocolEnablement `yaml:"enabled"`
-	Filters             SignalFilters      `yaml:"filters"`
-	TrackRequestHeaders bool               `yaml:"track_request_headers"`
-	RequestTimeout      Duration           `yaml:"request_timeout"`
-	BufferSize          uint32             `yaml:"buffer_size"`
-	Routes              HTTPRoutes         `yaml:"routes"`
-	PayloadExtraction   PayloadExtraction  `yaml:"payload_extraction"`
+	Enabled                   ProtocolEnablement `yaml:"enabled"`
+	Filters                   SignalFilters      `yaml:"filters"`
+	TrackRequestHeaders       bool               `yaml:"track_request_headers"`
+	RequestTimeout            Duration           `yaml:"request_timeout"`
+	GoHTTPClientBufferTimeout Duration           `yaml:"go_http_client_buffer_timeout"`
+	BufferSize                uint32             `yaml:"buffer_size"`
+	Routes                    HTTPRoutes         `yaml:"routes"`
+	PayloadExtraction         PayloadExtraction  `yaml:"payload_extraction"`
 }
 
 // HTTPRoutes describes global HTTP route normalization and discovery settings.
@@ -162,9 +163,10 @@ type AttributeFilter struct {
 // PayloadExtraction describes HTTP payload extractor enablement and enrichment
 // settings.
 type PayloadExtraction struct {
-	Enabled    []string       `yaml:"enabled"`
-	SQLPP      SQLPPPayload   `yaml:"sqlpp"`
-	Enrichment HTTPEnrichment `yaml:"enrichment"`
+	Enabled          []string                `yaml:"enabled"`
+	SQLPP            SQLPPPayload            `yaml:"sqlpp"`
+	Enrichment       HTTPEnrichment          `yaml:"enrichment"`
+	OpenAICompatible OpenAICompatiblePayload `yaml:"openai_compatible"`
 }
 
 // SQLPPPayload describes SQL++ payload extraction settings.
@@ -189,4 +191,10 @@ type HTTPEnrichmentPolicy struct {
 type HTTPEnrichmentDefaultAction struct {
 	Headers config.HTTPParsingAction `yaml:"headers"`
 	Body    config.HTTPParsingAction `yaml:"body"`
+}
+
+// OpenAICompatiblePayload describes OpenAI-compatible gateway payload extraction
+// settings.
+type OpenAICompatiblePayload struct {
+	Gateways []config.OpenAICompatibleGateway `yaml:"gateways"`
 }

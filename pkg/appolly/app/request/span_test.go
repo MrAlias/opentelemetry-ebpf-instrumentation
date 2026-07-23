@@ -167,6 +167,9 @@ func TestTraceName(t *testing.T) {
 		{name: "SQL client", span: &Span{Type: EventTypeSQLClient, Method: "SELECT", Path: "users"}, expected: "SELECT users"},
 		{name: "SQL server", span: &Span{Type: EventTypeSQLServer, Method: "SELECT", Path: "users"}, expected: "SELECT users"},
 		{name: "SQL no table", span: &Span{Type: EventTypeSQLClient, Method: "BEGIN"}, expected: "BEGIN"},
+		{name: "SQL no table with namespace", span: &Span{Type: EventTypeSQLClient, Method: "SELECT", DBNamespace: "mydb"}, expected: "SELECT mydb"},
+		{name: "SQL table wins over namespace", span: &Span{Type: EventTypeSQLClient, Method: "SELECT", Path: "users", DBNamespace: "mydb"}, expected: "SELECT users"},
+		{name: "SQL query summary wins", span: &Span{Type: EventTypeSQLClient, Method: "SELECT", DBQuerySummary: "SELECT users orders", DBNamespace: "mydb"}, expected: "SELECT users orders"},
 		{name: "SQL empty", span: &Span{Type: EventTypeSQLClient}, expected: "SQL"},
 
 		// Redis spans
@@ -572,7 +575,13 @@ func TestSerializeJSONSpans(t *testing.T) {
 		},
 		{
 			eventType: EventTypeRedisClient,
-			attribs:   map[string]any{},
+			attribs: map[string]any{
+				"serverAddr": "hostname",
+				"serverPort": "5678",
+				"operation":  "method",
+				"statement":  "statement",
+				"query":      "path",
+			},
 		},
 		{
 			eventType: EventTypeKafkaClient,
@@ -801,33 +810,33 @@ func TestDetectsOTelExport(t *testing.T) {
 			exports: false,
 		},
 		{
-			name: "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT != span.PeerPort doesn't export",
+			name: "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT != span.HostPort doesn't export",
 			span: Span{
-				Type: EventTypeGRPCClient, PeerPort: 8080, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Type: EventTypeGRPCClient, HostPort: 8080, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
 				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "http://localhost:4317"}},
 			},
 			exports: false,
 		},
 		{
-			name: "OTEL_EXPORTER_OTLP_ENDPOINT != span.PeerPort doesn't export",
+			name: "OTEL_EXPORTER_OTLP_ENDPOINT != span.HostPort doesn't export",
 			span: Span{
-				Type: EventTypeGRPCClient, PeerPort: 8080, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Type: EventTypeGRPCClient, HostPort: 8080, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
 				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4317"}},
 			},
 			exports: false,
 		},
 		{
-			name: "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT == span.PeerPort export",
+			name: "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT == span.HostPort export",
 			span: Span{
-				Type: EventTypeGRPCClient, PeerPort: 9090, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Type: EventTypeGRPCClient, HostPort: 9090, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
 				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "http://localhost:9090"}},
 			},
 			exports: true,
 		},
 		{
-			name: "OTEL_EXPORTER_OTLP_ENDPOINT == span.PeerPort export",
+			name: "OTEL_EXPORTER_OTLP_ENDPOINT == span.HostPort export",
 			span: Span{
-				Type: EventTypeGRPCClient, PeerPort: 9090, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Type: EventTypeGRPCClient, HostPort: 9090, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
 				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:9090", "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "http/protobuf"}},
 			},
 			exports: true,
@@ -835,14 +844,14 @@ func TestDetectsOTelExport(t *testing.T) {
 		{
 			name: fmt.Sprintf("no otel metrics environment sends to %x export", defaultOtlpGRPCPort),
 			span: Span{
-				Type: EventTypeGRPCClient, PeerPort: 4317, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Type: EventTypeGRPCClient, HostPort: 4317, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
 				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "http/protobuf"}},
 			},
 			exports: true,
 		},
 		{
 			name:    fmt.Sprintf("no otel environment sends to anything other the %d doesn't export", defaultOtlpGRPCPort),
-			span:    Span{Type: EventTypeGRPCClient, PeerPort: 8080, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0},
+			span:    Span{Type: EventTypeGRPCClient, HostPort: 8080, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0},
 			exports: false,
 		},
 	}
@@ -933,33 +942,33 @@ func TestDetectsOTelExport(t *testing.T) {
 			exports: false,
 		},
 		{
-			name: "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT != span.PeerPort doesn't export",
+			name: "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT != span.HostPort doesn't export",
 			span: Span{
-				Type: EventTypeGRPCClient, PeerPort: 8080, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Type: EventTypeGRPCClient, HostPort: 8080, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
 				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "http://localhost:4317"}},
 			},
 			exports: false,
 		},
 		{
-			name: "OTEL_EXPORTER_OTLP_ENDPOINT != span.PeerPort doesn't export",
+			name: "OTEL_EXPORTER_OTLP_ENDPOINT != span.HostPort doesn't export",
 			span: Span{
-				Type: EventTypeGRPCClient, PeerPort: 8080, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Type: EventTypeGRPCClient, HostPort: 8080, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
 				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4317"}},
 			},
 			exports: false,
 		},
 		{
-			name: "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT == span.PeerPort export",
+			name: "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT == span.HostPort export",
 			span: Span{
-				Type: EventTypeGRPCClient, PeerPort: 9090, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Type: EventTypeGRPCClient, HostPort: 9090, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
 				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "http://localhost:9090"}},
 			},
 			exports: true,
 		},
 		{
-			name: "OTEL_EXPORTER_OTLP_ENDPOINT == span.PeerPort export",
+			name: "OTEL_EXPORTER_OTLP_ENDPOINT == span.HostPort export",
 			span: Span{
-				Type: EventTypeGRPCClient, PeerPort: 9090, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Type: EventTypeGRPCClient, HostPort: 9090, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
 				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:9090", "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL": "http/protobuf"}},
 			},
 			exports: true,
@@ -967,14 +976,14 @@ func TestDetectsOTelExport(t *testing.T) {
 		{
 			name: fmt.Sprintf("no otel traces environment sends to %d export", defaultOtlpGRPCPort),
 			span: Span{
-				Type: EventTypeGRPCClient, PeerPort: 4317, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+				Type: EventTypeGRPCClient, HostPort: 4317, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
 				Service: svc.Attrs{EnvVars: map[string]string{"OTEL_EXPORTER_OTLP_METRICS_PROTOCOL": "http/protobuf"}},
 			},
 			exports: true,
 		},
 		{
 			name:    fmt.Sprintf("no otel environment sends to anything other the %d doesn't export", defaultOtlpGRPCPort),
-			span:    Span{Type: EventTypeGRPCClient, PeerPort: 8080, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0},
+			span:    Span{Type: EventTypeGRPCClient, HostPort: 8080, Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0},
 			exports: false,
 		},
 	}
@@ -1908,4 +1917,155 @@ func TestSpan_GenAIResponseModel(t *testing.T) {
 		result := span.GenAIResponseModel()
 		assert.Equal(t, "anthropic.claude-3-5-sonnet-20241022-v1:0", result)
 	})
+}
+
+func TestSpan_GenAIProviderName_OpenAICompatible(t *testing.T) {
+	t.Run("configured provider name", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				OpenAICompatible: &VendorOpenAI{
+					ProviderName: "litellm",
+				},
+			},
+		}
+		result := span.GenAIProviderName()
+		assert.Equal(t, "litellm", result)
+	})
+
+	t.Run("empty provider fallback to custom", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				OpenAICompatible: &VendorOpenAI{},
+			},
+		}
+		result := span.GenAIProviderName()
+		assert.Equal(t, "custom", result)
+	})
+}
+
+func TestSpan_GenAIOperationName_OpenAICompatible(t *testing.T) {
+	tests := []struct {
+		name   string
+		opName string
+		want   string
+	}{
+		{name: "chat", opName: ChatOperationName, want: ChatOperationName},
+		{name: "text_completion", opName: CompletionOperationName, want: CompletionOperationName},
+		{name: "embeddings", opName: EmbeddingOperationName, want: EmbeddingOperationName},
+		{name: "empty", opName: "", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			span := &Span{
+				GenAI: &GenAI{
+					OpenAICompatible: &VendorOpenAI{
+						OperationName: tt.opName,
+					},
+				},
+			}
+			assert.Equal(t, tt.want, span.GenAIOperationName())
+		})
+	}
+}
+
+func TestSpan_GenAIInputTokens_OpenAICompatible(t *testing.T) {
+	t.Run("input_tokens present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				OpenAICompatible: &VendorOpenAI{
+					Usage: OpenAIUsage{InputTokens: 42},
+				},
+			},
+		}
+		assert.Equal(t, 42, span.GenAIInputTokens())
+	})
+
+	t.Run("prompt_tokens fallback", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				OpenAICompatible: &VendorOpenAI{
+					Usage: OpenAIUsage{PromptTokens: 99},
+				},
+			},
+		}
+		assert.Equal(t, 99, span.GenAIInputTokens())
+	})
+
+	t.Run("no usage", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				OpenAICompatible: &VendorOpenAI{},
+			},
+		}
+		assert.Equal(t, 0, span.GenAIInputTokens())
+	})
+}
+
+func TestSpan_GenAIOutputTokens_OpenAICompatible(t *testing.T) {
+	t.Run("output_tokens present", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				OpenAICompatible: &VendorOpenAI{
+					Usage: OpenAIUsage{OutputTokens: 55},
+				},
+			},
+		}
+		assert.Equal(t, 55, span.GenAIOutputTokens())
+	})
+
+	t.Run("completion_tokens fallback", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				OpenAICompatible: &VendorOpenAI{
+					Usage: OpenAIUsage{CompletionTokens: 77},
+				},
+			},
+		}
+		assert.Equal(t, 77, span.GenAIOutputTokens())
+	})
+
+	t.Run("no usage", func(t *testing.T) {
+		span := &Span{
+			GenAI: &GenAI{
+				OpenAICompatible: &VendorOpenAI{},
+			},
+		}
+		assert.Equal(t, 0, span.GenAIOutputTokens())
+	})
+}
+
+func TestSpan_GenAIRequestModel_OpenAICompatible(t *testing.T) {
+	span := &Span{
+		GenAI: &GenAI{
+			OpenAICompatible: &VendorOpenAI{
+				Request: OpenAIInput{Model: "gpt-4o-mini"},
+			},
+		},
+	}
+	assert.Equal(t, "gpt-4o-mini", span.GenAIRequestModel())
+}
+
+func TestSpan_GenAIResponseModel_OpenAICompatible(t *testing.T) {
+	tests := []struct {
+		name          string
+		responseModel string
+		requestModel  string
+		want          string
+	}{
+		{name: "response model present", responseModel: "gpt-4o-mini-2024-07-18", requestModel: "gpt-4o-mini", want: "gpt-4o-mini-2024-07-18"},
+		{name: "fallback to request model", responseModel: "", requestModel: "gpt-4o-mini", want: "gpt-4o-mini"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			span := &Span{
+				GenAI: &GenAI{
+					OpenAICompatible: &VendorOpenAI{
+						ResponseModel: tt.responseModel,
+						Request:       OpenAIInput{Model: tt.requestModel},
+					},
+				},
+			}
+			assert.Equal(t, tt.want, span.GenAIResponseModel())
+		})
+	}
 }

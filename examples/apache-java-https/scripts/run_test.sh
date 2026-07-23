@@ -1549,6 +1549,122 @@ EOF
   ) || return 1
 }
 
+test_bounded_commands_close_stdin() {
+  local -r probe="$TEST_TMP_DIR/stdin-probe"
+  local -r stderr_output="$TEST_TMP_DIR/stdin-probe.stderr"
+  local output=""
+  local status=0
+
+  cat >"$probe" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+if IFS= read -r unexpected; then
+  printf 'unexpected stdin: %s\n' "$unexpected" >&2
+  exit 64
+fi
+printf 'stdout-evidence\n'
+printf 'stderr-evidence\n' >&2
+exit "${STDIN_PROBE_STATUS:-0}"
+EOF
+  chmod 0755 "$probe"
+
+  if output="$(
+    printf 'must-not-reach-bounded-command\n' |
+      run_bounded 5 env STDIN_PROBE_STATUS=23 "$probe" 2>"$stderr_output"
+  )"; then
+    printf 'bounded command exit status was suppressed\n' >&2
+    return 1
+  else
+    status=$?
+  fi
+  [[ "$status" -eq 23 ]] || {
+    printf 'bounded command returned %d, expected 23\n' "$status" >&2
+    return 1
+  }
+  [[ "$output" == "stdout-evidence" ]] || {
+    printf 'bounded command stdout was not preserved\n' >&2
+    return 1
+  }
+  grep -Fqx 'stderr-evidence' "$stderr_output" || {
+    printf 'bounded command stderr was not preserved\n' >&2
+    return 1
+  }
+}
+
+test_optional_evidence_closes_stdin() {
+  local -r probe="$TEST_TMP_DIR/optional-stdin-probe"
+  local -r evidence="$TEST_TMP_DIR/optional-stdin-evidence.txt"
+
+  cat >"$probe" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+if IFS= read -r unexpected; then
+  printf 'unexpected stdin: %s\n' "$unexpected" >&2
+  exit 64
+fi
+printf 'stdout-evidence\n'
+printf 'stderr-evidence\n' >&2
+exit 23
+EOF
+  chmod 0755 "$probe"
+
+  printf 'must-not-reach-optional-command\n' |
+    capture_optional_command "$evidence" 5 "$probe"
+  grep -Fqx 'stdout-evidence' "$evidence"
+  grep -Fqx 'stderr-evidence' "$evidence"
+  grep -Fqx 'exit_status=23' "$evidence"
+}
+
+test_compose_commands_close_stdin() {
+  local -r runner="$TEST_SCRIPT_DIR/../run.sh"
+  local logical_commands=""
+  local command=""
+  local prefix=""
+  local -a compose_commands=()
+
+  logical_commands="$(awk '
+    {
+      sub(/[[:space:]]+$/, "")
+      if (continuing) {
+        logical = logical " " $0
+      } else {
+        logical = $0
+      }
+      if (logical ~ /\\$/) {
+        sub(/\\$/, "", logical)
+        continuing = 1
+        next
+      }
+      print logical
+      continuing = 0
+    }
+    END {
+      if (continuing) {
+        print logical
+      }
+    }
+  ' "$runner")"
+  mapfile -t compose_commands < <(
+    grep -E '"\$\{COMPOSE\[@\]\}" (exec|run)' <<<"$logical_commands" || true
+  )
+  ((${#compose_commands[@]} > 0)) || {
+    printf 'no Compose exec/run commands were audited\n' >&2
+    return 1
+  }
+
+  for command in "${compose_commands[@]}"; do
+    prefix="${command%%\"\$\{COMPOSE\[@\]\}\"*}"
+    if [[ "$prefix" =~ (^|[[:space:]])(run_bounded|run_logged_bounded|capture_optional_command)[[:space:]] ]]; then
+      continue
+    fi
+    if [[ "$prefix" =~ (^|[[:space:]])timeout[[:space:]] && "$command" == *"</dev/null"* ]]; then
+      continue
+    fi
+    printf 'Compose command can retain stdin: %s\n' "$command" >&2
+    return 1
+  done
+}
+
 test_pipeline_dependencies_are_declared() {
   local definition=""
 
@@ -1856,6 +1972,10 @@ test_restart_failure_reaps_background_traffic() {
 set -Eeuo pipefail
 case " $* " in
   *" run --rm --no-deps --no-TTY scenario "*)
+    if IFS= read -r unexpected; then
+      printf 'unexpected stdin: %s\n' "$unexpected" >&2
+      exit 64
+    fi
     printf '%d\n' "$$" >"$RESTART_TRAFFIC_PID_FILE"
     trap 'printf "terminated\n" >"$RESTART_TRAFFIC_TERM_FILE"; exit 0' TERM INT
     while true; do sleep 1; done
@@ -1866,7 +1986,7 @@ esac
 EOF
   chmod 0755 "$fake_compose"
 
-  if (
+  if printf 'must-not-reach-restart-traffic\n' | (
     export RESTART_TRAFFIC_PID_FILE="$traffic_pid_file"
     export RESTART_TRAFFIC_TERM_FILE="$traffic_term_file"
     RESULT_DIR="$TEST_TMP_DIR/restart-failure"
@@ -2291,6 +2411,9 @@ main() {
   test_java_diagnostics_parser_uses_base36
   test_restart_fault_diagnostics_require_overlap
   test_apache_tls_runtime_evidence_is_required
+  test_bounded_commands_close_stdin
+  test_optional_evidence_closes_stdin
+  test_compose_commands_close_stdin
   test_pipeline_dependencies_are_declared
   test_runtime_environment_line_matching
   test_instrumented_readiness_precedes_https_traffic

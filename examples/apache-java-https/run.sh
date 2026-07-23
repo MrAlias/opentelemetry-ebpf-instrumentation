@@ -390,7 +390,7 @@ check_dependencies() {
 run_bounded() {
   local -r seconds="$1"
   shift
-  timeout --signal=TERM --kill-after=10s "${seconds}s" "$@"
+  timeout --signal=TERM --kill-after=10s "${seconds}s" "$@" </dev/null
 }
 
 record_failure() {
@@ -1978,6 +1978,7 @@ run_restart_during_traffic_control() (
       --expected-tls "$TLS_PROTOCOL" \
       --seed "$SCENARIO_SEED" \
       --timeout 120s \
+      </dev/null \
       >"$output" \
       2> >(tee "$stderr_output" >&2) &
   scenario_pid=$!

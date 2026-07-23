@@ -29,8 +29,10 @@ type fakeBridgeMap struct {
 	lookupErr   error
 	updateErr   error
 	deleteErr   error
+	iterateErr  error
 	afterLookup func(int)
 	afterUpdate func(any, any)
+	afterDelete func(any)
 }
 
 type fakeCleanupEntry struct {
@@ -41,6 +43,7 @@ type fakeCleanupEntry struct {
 type fakeCleanupIterator struct {
 	entries []fakeCleanupEntry
 	index   int
+	err     error
 }
 
 func (i *fakeCleanupIterator) Next(keyOut, valueOut any) bool {
@@ -54,7 +57,7 @@ func (i *fakeCleanupIterator) Next(keyOut, valueOut any) bool {
 	return true
 }
 
-func (i *fakeCleanupIterator) Err() error { return nil }
+func (i *fakeCleanupIterator) Err() error { return i.err }
 
 func (m *fakeBridgeMap) Iterate() cleanupIterator {
 	m.mu.Lock()
@@ -63,7 +66,7 @@ func (m *fakeBridgeMap) Iterate() cleanupIterator {
 	for key, value := range m.values {
 		entries = append(entries, fakeCleanupEntry{key: key, value: value})
 	}
-	return &fakeCleanupIterator{entries: entries}
+	return &fakeCleanupIterator{entries: entries, err: m.iterateErr}
 }
 
 func (m *fakeBridgeMap) Lookup(key, valueOut any) error {
@@ -113,15 +116,22 @@ func (m *fakeBridgeMap) Update(key, value any, flags ebpf.MapUpdateFlags) error 
 
 func (m *fakeBridgeMap) Delete(key any) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.deleteErr != nil {
-		return m.deleteErr
+		err := m.deleteErr
+		m.mu.Unlock()
+		return err
 	}
 	mapKey := indirectValue(key)
 	if _, exists := m.values[mapKey]; !exists {
+		m.mu.Unlock()
 		return ebpf.ErrKeyNotExist
 	}
 	delete(m.values, mapKey)
+	afterDelete := m.afterDelete
+	m.mu.Unlock()
+	if afterDelete != nil {
+		afterDelete(mapKey)
+	}
 	return nil
 }
 
@@ -173,16 +183,19 @@ func TestMapHandlerRejectsMissingOwnerMap(t *testing.T) {
 
 func TestMinimizeDisabledMapsPreservesVirtualThreadTracingCapacity(t *testing.T) {
 	spec := &ebpf.CollectionSpec{Maps: map[string]*ebpf.MapSpec{
-		"incoming_trace_ambiguity":  {MaxEntries: 128},
-		"incoming_trace_candidates": {MaxEntries: 128},
-		"incoming_trace_claims":     {MaxEntries: 128},
-		"incoming_trace_heads":      {MaxEntries: 128},
-		"java_authorized_processes": {MaxEntries: 128},
-		"java_process_incarnations": {MaxEntries: 128},
-		"java_vt_identities":        {MaxEntries: 128},
-		"java_vt_threads":           {MaxEntries: 128},
-		"sk_ssl_prewrite_map":       {Type: ebpf.SkStorage},
-		"ssl_prewrite_tp":           {MaxEntries: 128},
+		"incoming_trace_ambiguity":          {MaxEntries: 128},
+		"incoming_trace_candidates":         {MaxEntries: 128},
+		"incoming_trace_claims":             {MaxEntries: 128},
+		"incoming_trace_heads":              {MaxEntries: 128},
+		"java_authorized_processes":         {MaxEntries: 128},
+		"java_process_incarnations":         {MaxEntries: 128},
+		"java_vt_identities":                {MaxEntries: 128},
+		"java_vt_threads":                   {MaxEntries: 128},
+		"sk_ssl_prewrite_map":               {Type: ebpf.SkStorage},
+		"ssl_prewrite_connection_ambiguity": {MaxEntries: 128},
+		"ssl_prewrite_connection_claims":    {MaxEntries: 128},
+		"ssl_prewrite_connection_owners":    {MaxEntries: 128},
+		"ssl_prewrite_tp":                   {MaxEntries: 128},
 	}}
 
 	MinimizeDisabledMaps(spec)
@@ -192,6 +205,9 @@ func TestMinimizeDisabledMapsPreservesVirtualThreadTracingCapacity(t *testing.T)
 		"incoming_trace_candidates",
 		"incoming_trace_claims",
 		"incoming_trace_heads",
+		"ssl_prewrite_connection_ambiguity",
+		"ssl_prewrite_connection_claims",
+		"ssl_prewrite_connection_owners",
 		"ssl_prewrite_tp",
 	} {
 		assert.Equal(t, uint32(1), spec.Maps[name].MaxEntries, name)

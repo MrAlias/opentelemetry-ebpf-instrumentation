@@ -49,23 +49,27 @@ type MapHandler struct {
 }
 
 type Maps struct {
-	RemoteParents     *ebpf.Map
-	Tasks             *ebpf.Map
-	VirtualThreads    *ebpf.Map
-	VTIdentities      *ebpf.Map
-	Authorized        *ebpf.Map
-	Incarnations      *ebpf.Map
-	Connections       *ebpf.Map
-	CookieConnections *ebpf.Map
-	Ambiguity         *ebpf.Map
-	Owners            *ebpf.Map
-	States            *ebpf.Map
-	Generations       *ebpf.Map
-	Terminals         *ebpf.Map
-	Claims            *ebpf.Map
-	Handoffs          *ebpf.Map
-	HandoffClaims     *ebpf.Map
-	Retired           *ebpf.Map
+	RemoteParents                  *ebpf.Map
+	Tasks                          *ebpf.Map
+	VirtualThreads                 *ebpf.Map
+	VTIdentities                   *ebpf.Map
+	Authorized                     *ebpf.Map
+	Incarnations                   *ebpf.Map
+	Connections                    *ebpf.Map
+	CookieConnections              *ebpf.Map
+	Ambiguity                      *ebpf.Map
+	Owners                         *ebpf.Map
+	States                         *ebpf.Map
+	Generations                    *ebpf.Map
+	Terminals                      *ebpf.Map
+	Claims                         *ebpf.Map
+	Handoffs                       *ebpf.Map
+	HandoffClaims                  *ebpf.Map
+	Retired                        *ebpf.Map
+	SSLPrewriteTP                  *ebpf.Map
+	SSLPrewriteConnectionAmbiguity *ebpf.Map
+	SSLPrewriteConnectionClaims    *ebpf.Map
+	SSLPrewriteConnectionOwners    *ebpf.Map
 }
 
 type stateKey struct {

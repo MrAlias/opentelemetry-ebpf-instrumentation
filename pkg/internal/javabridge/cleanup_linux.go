@@ -40,22 +40,26 @@ func (m kernelCleanupMap) Iterate() cleanupIterator {
 }
 
 type cleanupMaps struct {
-	remoteParents     cleanupMap
-	tasks             cleanupMap
-	virtualThreads    cleanupMap
-	vtIdentities      cleanupMap
-	incarnations      cleanupMap
-	connections       cleanupMap
-	cookieConnections cleanupMap
-	ambiguity         cleanupMap
-	owners            cleanupMap
-	states            cleanupMap
-	generations       cleanupMap
-	terminals         cleanupMap
-	claims            cleanupMap
-	handoffs          cleanupMap
-	handoffClaims     cleanupMap
-	retired           cleanupMap
+	remoteParents                  cleanupMap
+	tasks                          cleanupMap
+	virtualThreads                 cleanupMap
+	vtIdentities                   cleanupMap
+	incarnations                   cleanupMap
+	connections                    cleanupMap
+	cookieConnections              cleanupMap
+	ambiguity                      cleanupMap
+	owners                         cleanupMap
+	states                         cleanupMap
+	generations                    cleanupMap
+	terminals                      cleanupMap
+	claims                         cleanupMap
+	handoffs                       cleanupMap
+	handoffClaims                  cleanupMap
+	retired                        cleanupMap
+	sslPrewrite                    cleanupMap
+	sslPrewriteConnectionAmbiguity cleanupMap
+	sslPrewriteConnectionClaims    cleanupMap
+	sslPrewriteConnectionOwners    cleanupMap
 }
 
 type Cleanup struct {
@@ -107,22 +111,26 @@ func NewCleanup(maps Maps, ttl time.Duration) *Cleanup {
 
 	return &Cleanup{
 		maps: cleanupMaps{
-			remoteParents:     wrap(maps.RemoteParents),
-			tasks:             wrap(maps.Tasks),
-			virtualThreads:    wrap(maps.VirtualThreads),
-			vtIdentities:      wrap(maps.VTIdentities),
-			incarnations:      wrap(maps.Incarnations),
-			connections:       wrap(maps.Connections),
-			cookieConnections: wrap(maps.CookieConnections),
-			ambiguity:         wrap(maps.Ambiguity),
-			owners:            wrap(maps.Owners),
-			states:            wrap(maps.States),
-			generations:       wrap(maps.Generations),
-			terminals:         wrap(maps.Terminals),
-			claims:            wrap(maps.Claims),
-			handoffs:          wrap(maps.Handoffs),
-			handoffClaims:     wrap(maps.HandoffClaims),
-			retired:           wrap(maps.Retired),
+			remoteParents:                  wrap(maps.RemoteParents),
+			tasks:                          wrap(maps.Tasks),
+			virtualThreads:                 wrap(maps.VirtualThreads),
+			vtIdentities:                   wrap(maps.VTIdentities),
+			incarnations:                   wrap(maps.Incarnations),
+			connections:                    wrap(maps.Connections),
+			cookieConnections:              wrap(maps.CookieConnections),
+			ambiguity:                      wrap(maps.Ambiguity),
+			owners:                         wrap(maps.Owners),
+			states:                         wrap(maps.States),
+			generations:                    wrap(maps.Generations),
+			terminals:                      wrap(maps.Terminals),
+			claims:                         wrap(maps.Claims),
+			handoffs:                       wrap(maps.Handoffs),
+			handoffClaims:                  wrap(maps.HandoffClaims),
+			retired:                        wrap(maps.Retired),
+			sslPrewrite:                    wrap(maps.SSLPrewriteTP),
+			sslPrewriteConnectionAmbiguity: wrap(maps.SSLPrewriteConnectionAmbiguity),
+			sslPrewriteConnectionClaims:    wrap(maps.SSLPrewriteConnectionClaims),
+			sslPrewriteConnectionOwners:    wrap(maps.SSLPrewriteConnectionOwners),
 		},
 		ttl:         ttl,
 		monoTimeNow: timing.MonoTimeNow,
@@ -144,9 +152,10 @@ func (c *Cleanup) SweepWithStats() (CleanupStats, error) {
 	}
 
 	now := c.monoTimeNow()
-	retiredEntries, err := cleanupMapEntries[retiredProcessKey, uint64](c.maps.retired)
-	if err != nil {
-		return stats, fmt.Errorf("iterating retired Java processes: %w", err)
+	err := c.sweepSSLPrewrite(now)
+	retiredEntries, retiredErr := cleanupMapEntries[retiredProcessKey, uint64](c.maps.retired)
+	if retiredErr != nil {
+		return stats, errors.Join(err, fmt.Errorf("iterating retired Java processes: %w", retiredErr))
 	}
 	retired := make(map[retiredProcessKey]struct{}, len(retiredEntries))
 	for _, entry := range retiredEntries {
@@ -286,7 +295,9 @@ func (c *Cleanup) complete() bool {
 		c.maps.cookieConnections != nil &&
 		c.maps.ambiguity != nil && c.maps.owners != nil && c.maps.states != nil &&
 		c.maps.generations != nil && c.maps.terminals != nil && c.maps.claims != nil &&
-		c.maps.handoffs != nil && c.maps.handoffClaims != nil && c.maps.retired != nil
+		c.maps.handoffs != nil && c.maps.handoffClaims != nil && c.maps.retired != nil &&
+		c.maps.sslPrewrite != nil && c.maps.sslPrewriteConnectionAmbiguity != nil &&
+		c.maps.sslPrewriteConnectionClaims != nil && c.maps.sslPrewriteConnectionOwners != nil
 }
 
 func connectionCookieKey(

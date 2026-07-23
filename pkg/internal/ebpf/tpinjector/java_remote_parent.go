@@ -560,6 +560,11 @@ func (p *Tracer) javaRemoteParentMaps() javabridge.Maps {
 		Handoffs:          p.bpfJavaRemoteParentMaps.JavaRemoteParentHandoffs,
 		HandoffClaims:     p.bpfJavaRemoteParentMaps.JavaRemoteParentHandoffClaims,
 		Retired:           p.bpfJavaRemoteParentMaps.JavaRetiredProcesses,
+		SSLPrewriteTP:     p.bpfJavaRemoteParentMaps.SslPrewriteTp,
+		SSLPrewriteConnectionAmbiguity: p.bpfJavaRemoteParentMaps.
+			SslPrewriteConnectionAmbiguity,
+		SSLPrewriteConnectionClaims: p.bpfJavaRemoteParentMaps.SslPrewriteConnectionClaims,
+		SSLPrewriteConnectionOwners: p.bpfJavaRemoteParentMaps.SslPrewriteConnectionOwners,
 	}
 }
 

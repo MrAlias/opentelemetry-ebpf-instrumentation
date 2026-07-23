@@ -15,6 +15,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -22,6 +23,7 @@
 #include <unistd.h>
 
 void obi_test_status_response(unsigned char *response, int status);
+int obi_test_named_status(const char *name);
 int obi_test_response_status(unsigned char *response, size_t length);
 int obi_test_errno_status(int error);
 int obi_test_probe_succeeded(int status);
@@ -342,6 +344,398 @@ static const struct JNINativeInterface_ fake_jni_functions = {
 static JNIEnv fake_jni_environment = &fake_jni_functions;
 
 static JNIEnv *fake_jni(void) { return &fake_jni_environment; }
+
+enum {
+  corpus_line_capacity = 512,
+  corpus_wire_capacity = 80,
+};
+
+enum corpus_case {
+  corpus_valid_sampled,
+  corpus_valid_unsampled,
+  corpus_valid_future_flags,
+  corpus_status_only,
+  corpus_all_zero_ids,
+  corpus_zero_trace_id,
+  corpus_zero_span_id,
+  corpus_zero_generation,
+  corpus_zero_observation,
+  corpus_zero_length,
+  corpus_pre_magic_truncated,
+  corpus_truncated,
+  corpus_bad_magic,
+  corpus_declared_smaller,
+  corpus_declared_larger,
+  corpus_reserved_prefix,
+  corpus_reserved_suffix,
+  corpus_unknown_status_zero,
+  corpus_unknown_status_14,
+  corpus_unknown_version,
+  corpus_unknown_version_bad_size,
+  corpus_future_larger_v1,
+  corpus_future_larger_unknown_version,
+};
+
+struct corpus_spec {
+  const char *name;
+  const char *status_name;
+  int accepted;
+  size_t wire_size;
+  enum corpus_case kind;
+};
+
+static const struct corpus_spec corpus_specs[] = {
+    {"valid_sampled", "valid", 1, 64, corpus_valid_sampled},
+    {"valid_unsampled", "valid", 1, 64, corpus_valid_unsampled},
+    {"valid_future_flags", "valid", 1, 64, corpus_valid_future_flags},
+    {"status_missing", "missing", 1, 64, corpus_status_only},
+    {"status_stale", "stale", 1, 64, corpus_status_only},
+    {"status_unsupported", "unsupported", 1, 64, corpus_status_only},
+    {"status_malformed", "malformed", 1, 64, corpus_status_only},
+    {"status_version_mismatch", "version_mismatch", 1, 64, corpus_status_only},
+    {"status_ambiguous", "ambiguous", 1, 64, corpus_status_only},
+    {"status_unauthorized", "unauthorized", 1, 64, corpus_status_only},
+    {"status_already_consumed", "already_consumed", 1, 64, corpus_status_only},
+    {"status_timeout", "timeout", 1, 64, corpus_status_only},
+    {"status_overload", "overload", 1, 64, corpus_status_only},
+    {"status_transport_error", "transport_error", 1, 64, corpus_status_only},
+    {"status_disabled", "disabled", 1, 64, corpus_status_only},
+    {"all_zero_ids", "malformed", 0, 64, corpus_all_zero_ids},
+    {"zero_trace_id", "malformed", 0, 64, corpus_zero_trace_id},
+    {"zero_span_id", "malformed", 0, 64, corpus_zero_span_id},
+    {"zero_generation", "malformed", 0, 64, corpus_zero_generation},
+    {"zero_observation_time", "malformed", 0, 64, corpus_zero_observation},
+    {"zero_length", "malformed", 0, 0, corpus_zero_length},
+    {"pre_magic_truncated", "malformed", 0, 3, corpus_pre_magic_truncated},
+    {"truncated", "malformed", 0, 63, corpus_truncated},
+    {"bad_magic", "malformed", 0, 64, corpus_bad_magic},
+    {"declared_smaller", "malformed", 0, 64, corpus_declared_smaller},
+    {"declared_larger", "malformed", 0, 64, corpus_declared_larger},
+    {"reserved_prefix", "malformed", 0, 64, corpus_reserved_prefix},
+    {"reserved_suffix", "malformed", 0, 64, corpus_reserved_suffix},
+    {"unknown_status_zero", "malformed", 0, 64, corpus_unknown_status_zero},
+    {"unknown_status_14", "malformed", 0, 64, corpus_unknown_status_14},
+    {"unknown_version", "version_mismatch", 0, 64, corpus_unknown_version},
+    {"unknown_version_bad_declared_size", "version_mismatch", 0, 64,
+     corpus_unknown_version_bad_size},
+    {"future_larger_v1", "malformed", 0, 80, corpus_future_larger_v1},
+    {"future_larger_unknown_version", "malformed", 0, 80,
+     corpus_future_larger_unknown_version},
+};
+
+static _Noreturn void corpus_fail(const char *path, size_t line,
+                                  const char *message) {
+  fprintf(stderr, "%s:%zu: %s\n", path, line, message);
+  exit(1);
+}
+
+static int corpus_name_valid(const char *name) {
+  if (name[0] < 'a' || name[0] > 'z') {
+    return 0;
+  }
+  for (size_t index = 1; name[index] != '\0'; index++) {
+    char value = name[index];
+    if ((value < 'a' || value > 'z') && (value < '0' || value > '9') &&
+        value != '_') {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int split_corpus_fields(char *line, char **fields, size_t field_count) {
+  char *cursor = line;
+  for (size_t index = 0; index + 1 < field_count; index++) {
+    fields[index] = cursor;
+    char *separator = strchr(cursor, '|');
+    if (separator == NULL) {
+      return 0;
+    }
+    *separator = '\0';
+    cursor = separator + 1;
+  }
+  fields[field_count - 1] = cursor;
+  return strchr(cursor, '|') == NULL;
+}
+
+static int corpus_hex_nibble(char value) {
+  if (value >= '0' && value <= '9') {
+    return value - '0';
+  }
+  if (value >= 'a' && value <= 'f') {
+    return value - 'a' + 10;
+  }
+  return -1;
+}
+
+static size_t decode_corpus_wire(const char *path, size_t line,
+                                 const char *encoded, unsigned char *decoded) {
+  if (encoded[0] == '\0') {
+    corpus_fail(path, line, "wire bytes are missing");
+  }
+  if (strcmp(encoded, "-") == 0) {
+    return 0;
+  }
+
+  size_t encoded_length = strlen(encoded);
+  if ((encoded_length & 1) != 0 || encoded_length > corpus_wire_capacity * 2) {
+    corpus_fail(path, line, "invalid wire length");
+  }
+
+  size_t decoded_length = encoded_length / 2;
+  for (size_t index = 0; index < decoded_length; index++) {
+    int high = corpus_hex_nibble(encoded[index * 2]);
+    int low = corpus_hex_nibble(encoded[index * 2 + 1]);
+    if (high < 0 || low < 0) {
+      corpus_fail(path, line, "wire bytes must be lower-case hexadecimal");
+    }
+    decoded[index] = (unsigned char)((high << 4) | low);
+  }
+  return decoded_length;
+}
+
+static int parse_corpus_status(const char *path, size_t line,
+                               const char *encoded) {
+  errno = 0;
+  char *end = NULL;
+  unsigned long value = strtoul(encoded, &end, 10);
+  if (errno != 0 || end == encoded || *end != '\0' || value < 1 || value > 13) {
+    corpus_fail(path, line, "invalid expected status");
+  }
+  return (int)value;
+}
+
+static size_t find_corpus_spec(const char *path, size_t line,
+                               const char *name) {
+  for (size_t index = 0; index < sizeof(corpus_specs) / sizeof(corpus_specs[0]);
+       index++) {
+    if (strcmp(corpus_specs[index].name, name) == 0) {
+      return index;
+    }
+  }
+  corpus_fail(path, line, "unknown vector name");
+  return 0;
+}
+
+static void corpus_valid_wire(unsigned char *wire, unsigned char flags) {
+  obi_test_status_response(wire, obi_test_named_status("valid"));
+  wire[9] = flags;
+  for (size_t index = 0; index < 16; index++) {
+    wire[16 + index] = (unsigned char)index;
+  }
+  for (size_t index = 0; index < 8; index++) {
+    wire[32 + index] = (unsigned char)(index + 16);
+    wire[40 + index] =
+        (unsigned char)(UINT64_C(0x0102030405060708) >> (index * 8));
+    wire[48 + index] =
+        (unsigned char)(UINT64_C(0x1112131415161718) >> (index * 8));
+  }
+}
+
+static size_t expected_corpus_wire(const struct corpus_spec *spec,
+                                   unsigned char *wire) {
+  memset(wire, 0, corpus_wire_capacity);
+  int status = obi_test_named_status(spec->status_name);
+  if (status < 0) {
+    return corpus_wire_capacity + 1;
+  }
+  if (spec->kind == corpus_status_only) {
+    obi_test_status_response(wire, status);
+    return spec->wire_size;
+  }
+
+  unsigned char flags = 0x01;
+  if (spec->kind == corpus_valid_unsampled) {
+    flags = 0x00;
+  } else if (spec->kind == corpus_valid_future_flags) {
+    flags = 0x81;
+  }
+  corpus_valid_wire(wire, flags);
+
+  switch (spec->kind) {
+  case corpus_valid_sampled:
+  case corpus_valid_unsampled:
+  case corpus_valid_future_flags:
+    break;
+  case corpus_all_zero_ids:
+    memset(wire + 16, 0, 24);
+    break;
+  case corpus_zero_trace_id:
+    memset(wire + 16, 0, 16);
+    break;
+  case corpus_zero_span_id:
+    memset(wire + 32, 0, 8);
+    break;
+  case corpus_zero_generation:
+    memset(wire + 40, 0, 8);
+    break;
+  case corpus_zero_observation:
+    memset(wire + 48, 0, 8);
+    break;
+  case corpus_zero_length:
+    return 0;
+  case corpus_pre_magic_truncated:
+  case corpus_truncated:
+    break;
+  case corpus_bad_magic:
+    wire[0] = 'X';
+    break;
+  case corpus_declared_smaller:
+    wire[6] = 63;
+    break;
+  case corpus_declared_larger:
+    wire[6] = corpus_wire_capacity;
+    break;
+  case corpus_reserved_prefix:
+    wire[10] = 1;
+    break;
+  case corpus_reserved_suffix:
+    wire[56] = 1;
+    break;
+  case corpus_unknown_status_zero:
+  case corpus_unknown_status_14:
+    obi_test_status_response(wire, obi_test_named_status("missing"));
+    wire[8] = spec->kind == corpus_unknown_status_14 ? 14 : 0;
+    break;
+  case corpus_unknown_version:
+    wire[4] = 2;
+    break;
+  case corpus_unknown_version_bad_size:
+    wire[4] = 2;
+    wire[6] = corpus_wire_capacity;
+    break;
+  case corpus_future_larger_v1:
+    wire[6] = corpus_wire_capacity;
+    break;
+  case corpus_future_larger_unknown_version:
+    wire[4] = 2;
+    wire[6] = corpus_wire_capacity;
+    break;
+  case corpus_status_only:
+    break;
+  }
+  return spec->wire_size;
+}
+
+static void assert_corpus_wire(const char *path, size_t line,
+                               const struct corpus_spec *spec,
+                               const unsigned char *wire, size_t wire_length) {
+  unsigned char expected[corpus_wire_capacity];
+  size_t expected_length = expected_corpus_wire(spec, expected);
+  if (expected_length != wire_length ||
+      memcmp(expected, wire, wire_length) != 0) {
+    corpus_fail(path, line, "wire bytes do not match the required case");
+  }
+}
+
+static void test_remote_parent_corpus(const char *path) {
+  FILE *file = fopen(path, "rb");
+  if (file == NULL) {
+    corpus_fail(path, 0, "cannot open corpus");
+  }
+
+  int seen[sizeof(corpus_specs) / sizeof(corpus_specs[0])] = {0};
+  size_t vector_count = 0;
+  size_t line_number = 0;
+  int stage = 0;
+  char line[corpus_line_capacity];
+  while (fgets(line, sizeof(line), file) != NULL) {
+    line_number++;
+    size_t length = strlen(line);
+    if (length == sizeof(line) - 1 && line[length - 1] != '\n' && !feof(file)) {
+      corpus_fail(path, line_number, "line is too long");
+    }
+    while (length > 0 &&
+           (line[length - 1] == '\n' || line[length - 1] == '\r')) {
+      line[--length] = '\0';
+    }
+    if (length == 0 || line[0] == '#') {
+      continue;
+    }
+    if (stage == 0) {
+      if (strcmp(line, "format|1") != 0) {
+        corpus_fail(path, line_number, "unsupported corpus format");
+      }
+      stage++;
+      continue;
+    }
+    if (stage == 1) {
+      if (strcmp(line, "name|outcome|status_name|status|wire_hex") != 0) {
+        corpus_fail(path, line_number, "invalid corpus header");
+      }
+      stage++;
+      continue;
+    }
+
+    char *fields[5];
+    if (!split_corpus_fields(line, fields, 5)) {
+      corpus_fail(path, line_number, "expected five fields");
+    }
+    if (!corpus_name_valid(fields[0])) {
+      corpus_fail(path, line_number, "invalid vector name");
+    }
+    size_t spec_index = find_corpus_spec(path, line_number, fields[0]);
+    const struct corpus_spec *spec = &corpus_specs[spec_index];
+    if (seen[spec_index]) {
+      corpus_fail(path, line_number, "duplicate vector name");
+    }
+    seen[spec_index] = 1;
+
+    const char *outcome = spec->accepted ? "accept" : "reject";
+    if (strcmp(fields[1], outcome) != 0) {
+      corpus_fail(path, line_number, "unexpected outcome");
+    }
+    if (strcmp(fields[2], spec->status_name) != 0) {
+      corpus_fail(path, line_number, "unexpected symbolic status");
+    }
+    int named_status = obi_test_named_status(spec->status_name);
+    int expected_status = parse_corpus_status(path, line_number, fields[3]);
+    if (named_status < 0 || expected_status != named_status) {
+      corpus_fail(path, line_number, "symbolic and numeric status differ");
+    }
+
+    unsigned char response[corpus_wire_capacity] = {0};
+    size_t response_length =
+        decode_corpus_wire(path, line_number, fields[4], response);
+    assert_corpus_wire(path, line_number, spec, response, response_length);
+
+    unsigned char original[corpus_wire_capacity];
+    memcpy(original, response, sizeof(original));
+    int actual_status = obi_test_response_status(response, response_length);
+    if (actual_status != expected_status) {
+      corpus_fail(path, line_number, "unexpected response status");
+    }
+    if (spec->accepted) {
+      if (memcmp(response, original, response_length) != 0) {
+        corpus_fail(path, line_number, "accepted record was modified");
+      }
+    } else {
+      unsigned char normalized[64];
+      obi_test_status_response(normalized, expected_status);
+      if (memcmp(response, normalized, sizeof(normalized)) != 0) {
+        corpus_fail(path, line_number, "rejected record was not normalized");
+      }
+    }
+    vector_count++;
+  }
+
+  if (ferror(file)) {
+    corpus_fail(path, line_number, "error reading corpus");
+  }
+  if (fclose(file) != 0) {
+    corpus_fail(path, line_number, "error closing corpus");
+  }
+  if (stage != 2 ||
+      vector_count != sizeof(corpus_specs) / sizeof(corpus_specs[0])) {
+    corpus_fail(path, line_number,
+                "corpus format, header, or vectors are missing");
+  }
+  for (size_t index = 0; index < sizeof(seen) / sizeof(seen[0]); index++) {
+    if (!seen[index]) {
+      corpus_fail(path, line_number, "required vector is missing");
+    }
+  }
+}
 
 static void test_status_response(void) {
   unsigned char response[64];
@@ -1059,7 +1453,12 @@ static void test_final_close_waits_for_contention_and_releases_resources(void) {
   assert(count_open_fds() == baseline_fds);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+  if (argc != 2) {
+    fprintf(stderr, "usage: %s CORPUS\n", argv[0]);
+    return 1;
+  }
+  test_remote_parent_corpus(argv[1]);
   test_status_response();
   test_response_validation();
   test_request_vector();

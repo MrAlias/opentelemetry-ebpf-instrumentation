@@ -17,6 +17,7 @@ on:
       - "internal/**"
       - "pkg/**"
       - "scripts/**"
+      - "testdata/java-remote-parent-v1-vectors.txt"
       - "Makefile"
   workflow_call:
     inputs:
@@ -44,6 +45,9 @@ jobs:
           persist-credentials: false
 
       - uses: ./.github/actions/generate-bpf
+
+      - name: Verify Java remote-parent ABI vectors
+        run: make -C bpf/tests check-java-remote-parent
 
   matrix:
     name: Build test matrix

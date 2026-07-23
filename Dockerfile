@@ -42,6 +42,7 @@ WORKDIR /workspace/pkg/internal/java
 
 # Copy build files
 COPY LICENSE NOTICE /workspace/
+COPY testdata/java-remote-parent-v1-vectors.txt /workspace/testdata/java-remote-parent-v1-vectors.txt
 COPY pkg/internal/java .
 
 # Pre-built native library from jni-builder stage

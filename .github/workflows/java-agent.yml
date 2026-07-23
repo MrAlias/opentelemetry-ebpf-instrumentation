@@ -7,6 +7,7 @@ on:
     branches: ["main", "release-*"]
     paths:
       - "pkg/internal/java/**"
+      - "testdata/java-remote-parent-v1-vectors.txt"
       - "examples/apache-java-https/**"
       - ".dockerignore"
       - "javaagent.Dockerfile"

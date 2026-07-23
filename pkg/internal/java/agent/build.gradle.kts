@@ -63,6 +63,8 @@ tasks.register("prepareKotlinBuildScriptModel"){}
 val java21ProbeClasses = layout.buildDirectory.dir("classes/java21Probe")
 val lateAttachProbeClasses = layout.buildDirectory.dir("classes/lateAttachProbe")
 val nettyProbeClasses = layout.buildDirectory.dir("classes/nettyProbe")
+val remoteParentVectors =
+    rootProject.file("../../../testdata/java-remote-parent-v1-vectors.txt")
 
 val compileLateAttachProbe by tasks.registering(JavaCompile::class) {
     description = "Compile the isolated late-attach class-loader probe"
@@ -107,6 +109,7 @@ val compileNettyProbe by tasks.registering(JavaCompile::class) {
 
 tasks.test {
     useJUnitPlatform()
+    inputs.file(remoteParentVectors)
     dependsOn(
         rootProject.tasks.named("copyLoaderJar"),
         compileJava21Probe,
@@ -114,6 +117,10 @@ tasks.test {
         compileNettyProbe,
     )
     doFirst {
+        systemProperty(
+            "obi.test.remote.parent.vectors",
+            remoteParentVectors.absolutePath,
+        )
         systemProperty(
             "obi.test.packaged.agent",
             rootProject.layout.buildDirectory.file("obi-java-agent.jar").get().asFile.absolutePath,
@@ -183,10 +190,18 @@ val nativeTest by tasks.registering(Exec::class) {
     description = "Build and run the native remote-parent transport tests"
 
     dependsOn("compileJava")
+    inputs.file(remoteParentVectors)
 
     workingDir = projectDir
     environment("JAVA_HOME", System.getProperty("java.home"))
-    commandLine("make", "-f", "Makefile.jni", "test", "BUILD_DIR=build/jni-test")
+    commandLine(
+        "make",
+        "-f",
+        "Makefile.jni",
+        "test",
+        "BUILD_DIR=build/jni-test",
+        "REMOTE_PARENT_VECTORS=${remoteParentVectors.absolutePath}",
+    )
 }
 
 tasks.check {

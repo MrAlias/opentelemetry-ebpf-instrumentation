@@ -32,10 +32,13 @@ enum {
   remote_parent_status_unknown = 0,
   remote_parent_status_valid = 1,
   remote_parent_status_missing = 2,
+  remote_parent_status_stale = 3,
   remote_parent_status_unsupported = 4,
   remote_parent_status_malformed = 5,
   remote_parent_status_version_mismatch = 6,
+  remote_parent_status_ambiguous = 7,
   remote_parent_status_unauthorized = 8,
+  remote_parent_status_already_consumed = 9,
   remote_parent_status_timeout = 10,
   remote_parent_status_overload = 11,
   remote_parent_status_transport_error = 12,
@@ -926,6 +929,49 @@ static void close_remote_parent(void) {
 }
 
 #ifdef OBI_JNI_TESTING
+int obi_test_named_status(const char *name) {
+  if (strcmp(name, "valid") == 0) {
+    return remote_parent_status_valid;
+  }
+  if (strcmp(name, "missing") == 0) {
+    return remote_parent_status_missing;
+  }
+  if (strcmp(name, "stale") == 0) {
+    return remote_parent_status_stale;
+  }
+  if (strcmp(name, "unsupported") == 0) {
+    return remote_parent_status_unsupported;
+  }
+  if (strcmp(name, "malformed") == 0) {
+    return remote_parent_status_malformed;
+  }
+  if (strcmp(name, "version_mismatch") == 0) {
+    return remote_parent_status_version_mismatch;
+  }
+  if (strcmp(name, "ambiguous") == 0) {
+    return remote_parent_status_ambiguous;
+  }
+  if (strcmp(name, "unauthorized") == 0) {
+    return remote_parent_status_unauthorized;
+  }
+  if (strcmp(name, "already_consumed") == 0) {
+    return remote_parent_status_already_consumed;
+  }
+  if (strcmp(name, "timeout") == 0) {
+    return remote_parent_status_timeout;
+  }
+  if (strcmp(name, "overload") == 0) {
+    return remote_parent_status_overload;
+  }
+  if (strcmp(name, "transport_error") == 0) {
+    return remote_parent_status_transport_error;
+  }
+  if (strcmp(name, "disabled") == 0) {
+    return remote_parent_status_disabled;
+  }
+  return -1;
+}
+
 void obi_test_status_response(unsigned char *response, int status) {
   status_response(response, status);
 }

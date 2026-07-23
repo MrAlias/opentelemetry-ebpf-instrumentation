@@ -165,6 +165,14 @@ Compatibility within the fixed version 1 envelope is explicit:
 | Changed field meaning, size, offset, byte order, or added trace state/baggage | Requires a new ABI version |
 | Internal transport, lookup, or cleanup changes that preserve the envelope | Compatible without an ABI change |
 
+The [shared ABI corpus](../testdata/java-remote-parent-v1-vectors.txt) is consumed
+by the BPF C producer test and the Go, JNI, and Java consumers. It covers every
+version 1 status, sampled and unsampled contexts, future trace-flag bits, zero
+identifiers, invalid framing, version precedence, truncation, and larger future
+records. Trace and span IDs have fixed binary widths in this envelope, so an
+all-zero trace ID or span ID is the malformed identifier representation; a
+wrong-width textual identifier cannot be represented on this wire.
+
 The extension checks the bootstrap bridge API version before use, and the
 bootstrap bridge checks the provider ABI version before installation. Socket
 negotiation authenticates the process and accepted socket; it does not translate

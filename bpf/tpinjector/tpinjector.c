@@ -1289,19 +1289,12 @@ static __always_inline u8 ssl_prewrite_socket_has_exact_owner(struct sk_msg_md *
     return ssl_prewrite_socket_owner_matches(owner, key, trace);
 }
 
-static __always_inline void
-clear_legacy_ssl_parent(struct sk_msg_md *msg, const egress_key_t *e_key, u8 report_suppression) {
-    if (get_tp_info_pid(e_key) && report_suppression) {
-        java_remote_parent_stat_add(k_java_remote_parent_stat_inject_ambiguous);
-        report_suppression = 0;
-    }
+static __always_inline void clear_legacy_ssl_parent(struct sk_msg_md *msg,
+                                                    const egress_key_t *e_key) {
     clear_tp_info_pid(e_key);
 
     struct bpf_sock *sk = msg->sk;
     if (sk) {
-        if (bpf_sk_storage_get(&sk_tp_info_pid_map, sk, NULL, 0) && report_suppression) {
-            java_remote_parent_stat_add(k_java_remote_parent_stat_inject_ambiguous);
-        }
         bpf_sk_storage_delete(&sk_tp_info_pid_map, sk);
     }
 }
@@ -1561,28 +1554,28 @@ int obi_packet_extender(struct sk_msg_md *msg) {
     const bool had_ssl_prewrite_owner =
         java_remote_parent_enabled && ssl_prewrite_socket_had_owner(msg);
     if (had_ssl_prewrite_owner && !monitored_pid) {
-        clear_legacy_ssl_parent(msg, &e_key, false);
+        clear_legacy_ssl_parent(msg, &e_key);
         return SK_PASS;
     }
 
     if (java_remote_parent_enabled && monitored_pid) {
         const u64 netns_cookie = task_netns_cookie();
         if (handle_ssl_prewrite(msg, &t_ctx->p_conn, conn.d_port, netns_cookie)) {
-            clear_legacy_ssl_parent(msg, &e_key, false);
+            clear_legacy_ssl_parent(msg, &e_key);
             return SK_PASS;
         }
         if (had_ssl_prewrite_owner) {
-            clear_legacy_ssl_parent(msg, &e_key, false);
+            clear_legacy_ssl_parent(msg, &e_key);
             return SK_PASS;
         }
         if (is_ssl_connection(&t_ctx->p_conn)) {
-            clear_legacy_ssl_parent(msg, &e_key, false);
+            clear_legacy_ssl_parent(msg, &e_key);
             return SK_PASS;
         }
     }
 
     if (!tcp_traceparent_generic_injection_allowed(java_remote_parent_enabled)) {
-        clear_legacy_ssl_parent(msg, &e_key, monitored_pid != 0);
+        clear_legacy_ssl_parent(msg, &e_key);
 
         if (monitored_pid || is_go_grpc_client_conn(&t_ctx->p_conn)) {
             bpf_msg_pull_data(msg, 0, msg->size, 0);

@@ -287,10 +287,11 @@ mutation is also disabled in this mode because, after all TLS markers are lost,
 an arbitrary encrypted fragment cannot be proved to be plaintext solely from
 HTTP-looking bytes. A request that cannot establish the exact handoff therefore
 gets no injected parent. Positive exact-handoff failures retain their
-reason-coded diagnostics; observed legacy state suppressed at this boundary is
-counted as ambiguous. Packets with no ownership evidence are not mislabeled as
-TLS misses. Bridge-disabled deployments retain legacy 26-byte TCP options and
-plaintext header injection.
+reason-coded diagnostics. Legacy ports-only and socket state is cleared without
+an injection outcome because it has no request generation and cannot prove an
+exact injection attempt. Packets with no ownership evidence are not mislabeled
+as TLS misses. Bridge-disabled deployments retain legacy 26-byte TCP options
+and plaintext header injection.
 
 The active-write, TLS-connection, provisional-request, and shared-prewrite
 maps are fixed-capacity LRU maps. Their capacity is a physical memory bound;

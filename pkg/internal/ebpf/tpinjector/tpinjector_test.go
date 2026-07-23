@@ -721,6 +721,21 @@ func TestJavaRemoteParentBridgeModeProductionOrdering(t *testing.T) {
 	assert.Less(t, writeGuard, legacyStore)
 }
 
+func TestJavaRemoteParentLegacyCleanupHasNoInjectionOutcome(t *testing.T) {
+	source := readTPInjectorSource(t)
+	cleanup := sourceSection(
+		t,
+		source,
+		"clear_legacy_ssl_parent(struct sk_msg_md *msg",
+		"static __always_inline enum ssl_prewrite_transport_phase schedule_ssl_prewrite_tcp_option",
+	)
+
+	assert.Contains(t, cleanup, "clear_tp_info_pid(e_key)")
+	assert.Contains(t, cleanup, "bpf_sk_storage_delete(&sk_tp_info_pid_map, sk)")
+	assert.NotContains(t, cleanup, "java_remote_parent_stat_add")
+	assert.NotContains(t, cleanup, "report_suppression")
+}
+
 func readTPInjectorSource(t *testing.T) string {
 	t.Helper()
 	_, testFile, _, ok := runtime.Caller(0)

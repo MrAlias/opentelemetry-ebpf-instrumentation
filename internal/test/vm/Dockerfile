@@ -12,6 +12,7 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 RUN apk update && apk add --no-cache \
     agetty \
     bash \
+    bpftool \
     ca-certificates \
     docker \
     docker-cli-compose \

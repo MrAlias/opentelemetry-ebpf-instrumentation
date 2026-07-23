@@ -1,0 +1,145 @@
+name: Java remote-parent RHEL kernel sockopt preflight
+run-name: Java remote-parent RHEL 9.6 kernel sockopt @ ${{ inputs.ref || github.sha }}
+
+on:
+  push:
+    branches: [agent/java-remote-parent-bridge]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref (commit, branch, or tag) to validate"
+        required: true
+        type: string
+
+concurrency:
+  group: java-remote-parent-rhel-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: RHEL 9.6 kernel sockopt preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout selected ref
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/free-disk
+        with:
+          docker-prune: 'false'
+
+      - name: Generate BPF artifacts
+        uses: ./.github/actions/generate-bpf
+        with:
+          artifact-name: java-remote-parent-bpf-${{ github.run_id }}
+          cache-key-prefix: go-build-java-remote-parent-rhel
+
+      - name: Run Java bridge ABI tests
+        run: |
+          set -Eeuo pipefail
+          output_dir=testoutput/java-remote-parent-rhel9.6-kernel-sockopt
+          test_pattern='^(TestRecord|TestRequest|TestSampled|TestVersion|TestValidRemoteParent)'
+          mkdir -p "$output_dir"
+          git rev-parse HEAD \
+            | tee "$output_dir/source-commit.txt"
+          go test -list "$test_pattern" ./pkg/internal/javabridge \
+            | awk '/^Test/ { print }' \
+            | tee "$output_dir/abi-selected-tests.txt"
+          mapfile -t selected_tests < "$output_dir/abi-selected-tests.txt"
+          if (( ${#selected_tests[@]} == 0 )); then
+            printf '%s\n' 'ABI test pattern selected no tests' >&2
+            exit 1
+          fi
+          go test \
+            -count=1 \
+            -v \
+            -run "$test_pattern" \
+            ./pkg/internal/javabridge 2>&1 \
+            | tee "$output_dir/abi-tests.log"
+          if grep -Eq -- '^[[:space:]]*--- SKIP:' "$output_dir/abi-tests.log"; then
+            printf '%s\n' 'A selected ABI test skipped' >&2
+            exit 1
+          fi
+          for test_name in "${selected_tests[@]}"; do
+            if ! grep -Fq -- "--- PASS: ${test_name} " "$output_dir/abi-tests.log"; then
+              printf 'Selected ABI test did not report PASS: %s\n' "$test_name" >&2
+              exit 1
+            fi
+          done
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-utils qemu-system-x86
+
+      - name: Read pinned RHEL 9.6 kernel metadata
+        id: kernel-metadata
+        run: |
+          set -Eeuo pipefail
+          lvh_tag="$(yq '.kernels[] | select(.id == "rhel9.6") | .lvh_tag' internal/test/vm/kernels.yaml)"
+          digest="$(yq '.kernels[] | select(.id == "rhel9.6") | .digest' internal/test/vm/kernels.yaml)"
+          if [[ -z "$lvh_tag" || "$lvh_tag" == "null" ]]; then
+            printf '%s\n' 'Missing rhel9.6 LVH tag' >&2
+            exit 1
+          fi
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf 'Invalid rhel9.6 LVH digest: %s\n' "$digest" >&2
+            exit 1
+          fi
+          printf 'lvh_tag=%s\n' "$lvh_tag" >> "$GITHUB_OUTPUT"
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          printf 'RHEL 9.6 LVH tag: %s\ndigest: %s\n' "$lvh_tag" "$digest"
+
+      - name: Resolve digest-pinned RHEL 9.6 kernel
+        id: kernel
+        uses: ./.github/actions/setup-lvh-kernel
+        with:
+          kernel-id: rhel9.6
+          lvh-tag: ${{ steps.kernel-metadata.outputs.lvh_tag }}
+
+      - name: Verify resolved RHEL kernel digest
+        env:
+          EXPECTED_LVH_DIGEST: ${{ steps.kernel-metadata.outputs.digest }}
+        run: |
+          set -Eeuo pipefail
+          buildinfo=internal/test/vm/lvh/out/vmlinuz-rhel9.6-amd64.buildinfo
+          resolved_digest="$(yq '.lvh_digest' "$buildinfo")"
+          if [[ "$resolved_digest" != "$EXPECTED_LVH_DIGEST" ]]; then
+            printf 'Resolved LVH digest %s, expected %s\n' \
+              "$resolved_digest" "$EXPECTED_LVH_DIGEST" >&2
+            exit 1
+          fi
+
+      - name: Run kernel sockopt preflight in VM
+        env:
+          KERNEL: ${{ steps.kernel.outputs.kernel }}
+          MODULES_DIR: ${{ steps.kernel.outputs.modules-dir }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p testoutput/java-remote-parent-rhel9.6-kernel-sockopt
+          sudo make -C internal/test/vm \
+            WORKDIR="$(pwd)" \
+            KERNEL="$KERNEL" \
+            MODULES_DIR="$MODULES_DIR" \
+            ARCH=amd64 \
+            TARGET_TEST=run-java-remote-parent-rhel-kernel-sockopt-vm \
+            2>&1 | tee testoutput/java-remote-parent-rhel9.6-kernel-sockopt/vm-console.log
+          test -f testoutput/success
+
+      - name: Upload RHEL kernel sockopt preflight evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: java-remote-parent-rhel9.6-kernel-sockopt-${{ github.run_id }}
+          path: |
+            internal/test/vm/lvh/out/vmlinuz-rhel9.6-amd64.buildinfo
+            internal/test/vm/lvh/out/vmlinuz-rhel9.6-amd64.config
+            testoutput/java-remote-parent-rhel9.6-kernel-sockopt
+          if-no-files-found: error
+          retention-days: 14

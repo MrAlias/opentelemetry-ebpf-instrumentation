@@ -333,6 +333,11 @@ run-bpf-verifier-vm:
 	@echo "### Running BPF verifier tests"
 	go test -count=1 -timeout 20m -parallel 8 -tags=bpf_verifier_tests ./pkg/internal/ebpf/verifier/...
 
+.PHONY: run-java-remote-parent-rhel-kernel-sockopt-vm
+run-java-remote-parent-rhel-kernel-sockopt-vm:
+	@echo "### Running the Java remote-parent kernel sockopt preflight on RHEL"
+	bash internal/test/vm/run-java-remote-parent-rhel.sh
+
 .PHONY: cov-exclude-generated
 cov-exclude-generated:
 	grep -vE $(EXCLUDE_COVERAGE_FILES) $(TEST_OUTPUT)/cover.all.txt > $(TEST_OUTPUT)/cover.txt

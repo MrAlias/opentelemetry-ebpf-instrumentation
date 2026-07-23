@@ -241,9 +241,43 @@ func TestJavaRemoteParentStatLabelsIdentifyTransport(t *testing.T) {
 		{transport: "tcp", operation: "inject", status: "overload"},
 		{transport: "tcp", operation: "inject", status: "segmented"},
 	}, javaRemoteParentStatLabels)
+	assert.Equal(t, javaRemoteParentStatLabel{
+		transport: "tcp", operation: "stage", status: "valid",
+	}, javaRemoteParentStatLabels[javaRemoteParentStatStageValid])
 	assert.Equal(t, "unauthorized", javaRemoteParentStatLabels[javaRemoteParentStatTakeUnauthorized].status)
 	assert.Equal(t, "valid", javaRemoteParentStatLabels[javaRemoteParentStatDiscardValid].status)
 	assert.Equal(t, "unauthorized", javaRemoteParentStatLabels[javaRemoteParentStatDiscardUnauthorized].status)
+	assert.Equal(t, javaRemoteParentStatLabel{
+		transport: "tcp", operation: "inject", status: "ambiguous",
+	}, javaRemoteParentStatLabels[javaRemoteParentStatInjectAmbiguous])
+}
+
+func TestJavaRemoteParentReportMetricCompletesStatPublication(t *testing.T) {
+	reporter := &javaRemoteParentRecordingReporter{}
+	tracer := &Tracer{metrics: reporter}
+	var previous [javaRemoteParentStatCount]uint64
+	var current [javaRemoteParentStatCount]uint64
+	current[javaRemoteParentStatStageValid] = 1
+	current[javaRemoteParentStatInjectAmbiguous] = 2
+
+	tracer.reportJavaRemoteParentStatDeltas(previous, current)
+	tracer.reportJavaRemoteParentStatDeltas(current, current)
+
+	assert.Equal(t, []javaRemoteParentObservation{
+		{transport: "tcp", operation: "stage", status: "valid", count: 1},
+		{transport: "tcp", operation: "inject", status: "ambiguous", count: 2},
+		{transport: "tcp", operation: "report", status: "valid", count: 1},
+		{transport: "tcp", operation: "report", status: "valid", count: 1},
+	}, reporter.observations)
+}
+
+func TestJavaRemoteParentMetricsUseConfiguredBPFInterval(t *testing.T) {
+	reporter := &javaRemoteParentRecordingReporter{bpfMetricInterval: time.Second}
+	tracer := &Tracer{metrics: reporter}
+	assert.Equal(t, time.Second, tracer.javaRemoteParentMetricsPollInterval())
+
+	reporter.bpfMetricInterval = 0
+	assert.Equal(t, javaRemoteParentPollInterval, tracer.javaRemoteParentMetricsPollInterval())
 }
 
 func TestJavaRemoteParentMetricCardinalityContract(t *testing.T) {
@@ -264,6 +298,7 @@ func TestJavaRemoteParentMetricCardinalityContract(t *testing.T) {
 		"cleanup":   {},
 		"evict":     {},
 		"inject":    {},
+		"report":    {},
 	}
 	statuses := map[string]struct{}{}
 	for status := javabridge.StatusUnknown; status <= javabridge.StatusDisabled; status++ {
@@ -272,9 +307,9 @@ func TestJavaRemoteParentMetricCardinalityContract(t *testing.T) {
 	statuses["segmented"] = struct{}{}
 
 	require.Len(t, transports, 4)
-	require.Len(t, operations, 10)
+	require.Len(t, operations, 11)
 	require.Len(t, statuses, 15)
-	assert.Equal(t, 600, len(transports)*len(operations)*len(statuses))
+	assert.Equal(t, 660, len(transports)*len(operations)*len(statuses))
 
 	seen := map[javaRemoteParentStatLabel]struct{}{}
 	for _, label := range javaRemoteParentStatLabels {
@@ -536,7 +571,12 @@ type javaRemoteParentObservation struct {
 
 type javaRemoteParentRecordingReporter struct {
 	imetrics.NoopReporter
-	observations []javaRemoteParentObservation
+	bpfMetricInterval time.Duration
+	observations      []javaRemoteParentObservation
+}
+
+func (r *javaRemoteParentRecordingReporter) BpfInternalMetricsScrapeInterval() time.Duration {
+	return r.bpfMetricInterval
 }
 
 func (r *javaRemoteParentRecordingReporter) JavaRemoteParent(

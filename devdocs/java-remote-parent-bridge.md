@@ -369,15 +369,17 @@ power-of-two occurrences so repeated transport faults do not produce per-request
 log volume.
 
 The OBI operation counter has four possible `transport` values (`tcp`,
-`getsockopt`, `unix`, and `disabled`), ten possible `operation` values
+`getsockopt`, `unix`, and `disabled`), eleven possible `operation` values
 (`stage`, `candidate`, `handoff`, `inject`, `take`, `discard`, `negotiate`,
-`select`, `cleanup`, and `evict`), and fifteen fixed status values. Its absolute
-Cartesian cardinality bound is therefore 600, while the implementation emits
+`select`, `cleanup`, `evict`, and `report`), and fifteen fixed status values. Its
+absolute Cartesian cardinality bound is therefore 660, while the implementation emits
 only the meaningful combinations. `auto` is never a metric label; selection records the
 concrete transport. Failures before a fallback request can be decoded are reported as
 `negotiate`, so malformed or unauthenticated input cannot introduce another
 operation label. Cleanup and fallback-map eviction are emitted as counted
-`tcp` lifecycle operations and never contain map keys. The Java snapshot has
+`tcp` lifecycle operations and never contain map keys. A `tcp/report/valid`
+marker is emitted after each successful BPF counter pass at the configured BPF
+metric interval so observers can identify complete publications. The Java snapshot has
 50 fixed keys: twenty-two configuration, registration, lookup, extraction,
 trace-flag, and decrypted-read counters plus take and discard counters for each
 of the fourteen statuses. Neither surface derives a label or key from request

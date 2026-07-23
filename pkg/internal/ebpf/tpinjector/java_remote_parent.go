@@ -24,10 +24,12 @@ import (
 
 const (
 	javaRemoteParentStatCount               = 35
+	javaRemoteParentStatStageValid          = 0
 	javaRemoteParentStatTakeUnauthorized    = 8
 	javaRemoteParentStatDiscardValid        = 12
 	javaRemoteParentStatDiscardUnauthorized = 16
 	javaRemoteParentStatHandoffValid        = 25
+	javaRemoteParentStatInjectAmbiguous     = 31
 	javaRemoteParentPollInterval            = 10 * time.Second
 	javaRemoteParentReadinessPollInterval   = 100 * time.Millisecond
 )
@@ -622,23 +624,13 @@ func (p *Tracer) reportJavaRemoteParentStats(ctx context.Context) {
 			p.log.Debug("reading Java remote-parent counters", "error", err)
 			return
 		}
-		for index, value := range current {
-			delta := value
-			if value >= previous[index] {
-				delta = value - previous[index]
-			}
-			if delta != 0 {
-				label := javaRemoteParentStatLabels[index]
-				p.metrics.JavaRemoteParent(
-					label.transport, label.operation, label.status, delta,
-				)
-			}
-		}
+		p.reportJavaRemoteParentStatDeltas(previous, current)
 		previous = current
 	}
 
 	report()
-	ticker := time.NewTicker(javaRemoteParentPollInterval)
+	interval := p.javaRemoteParentMetricsPollInterval()
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -649,6 +641,33 @@ func (p *Tracer) reportJavaRemoteParentStats(ctx context.Context) {
 			report()
 		}
 	}
+}
+
+func (p *Tracer) javaRemoteParentMetricsPollInterval() time.Duration {
+	interval := p.metrics.BpfInternalMetricsScrapeInterval()
+	if interval <= 0 {
+		return javaRemoteParentPollInterval
+	}
+	return interval
+}
+
+func (p *Tracer) reportJavaRemoteParentStatDeltas(
+	previous, current [javaRemoteParentStatCount]uint64,
+) {
+	for index, value := range current {
+		delta := value
+		if value >= previous[index] {
+			delta = value - previous[index]
+		}
+		if delta != 0 {
+			label := javaRemoteParentStatLabels[index]
+			p.metrics.JavaRemoteParent(
+				label.transport, label.operation, label.status, delta,
+			)
+		}
+	}
+	// Publish the marker after every successful pass, including passes with no counter changes.
+	p.metrics.JavaRemoteParent("tcp", "report", javabridge.StatusValid.String(), 1)
 }
 
 func readJavaRemoteParentStats(stats *ebpf.Map) ([javaRemoteParentStatCount]uint64, error) {

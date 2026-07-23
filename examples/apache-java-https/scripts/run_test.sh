@@ -1049,6 +1049,7 @@ test_java_diagnostics_delta_is_exact() {
   local -r before="$TEST_TMP_DIR/java-before.txt"
   local -r after="$TEST_TMP_DIR/java-after.txt"
   local -r delta="$TEST_TMP_DIR/java.delta"
+  local invalid_delta=""
 
   write_diagnostics_fixture "$before" 0 0 0 0 0 0
   write_diagnostics_fixture "$after" 2 0 0 1 1 1 missing 1
@@ -1058,12 +1059,92 @@ test_java_diagnostics_delta_is_exact() {
     return 1
   }
 
-  sed -i 's/t_missing before=0 after=1 delta=1/t_missing before=0 after=2 delta=2/' "$delta"
+  sed -i '/^d_disabled /d' "$delta"
   if assert_java_diagnostics_delta "$delta" 2 0 0 1 1 1 1 >/dev/null 2>&1; then
-    printf 'Java diagnostics accepted an additional missing lookup\n' >&2
+    printf 'Java diagnostics accepted an omitted delta record\n' >&2
     return 1
   fi
-  sed -i 's/t_missing before=0 after=2 delta=2/t_missing before=0 after=1 delta=1/' "$delta"
+
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  sed -i '/^t_valid /p' "$delta"
+  if assert_java_diagnostics_delta "$delta" 2 0 0 1 1 1 1 >/dev/null 2>&1; then
+    printf 'Java diagnostics accepted a duplicate delta record\n' >&2
+    return 1
+  fi
+
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  sed -i 's/^d_disabled /d_unexpected /' "$delta"
+  if assert_java_diagnostics_delta "$delta" 2 0 0 1 1 1 1 >/dev/null 2>&1; then
+    printf 'Java diagnostics accepted an unknown delta record\n' >&2
+    return 1
+  fi
+
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  sed -i 's/t_missing before=0/t_missing before=invalid/' "$delta"
+  if assert_java_diagnostics_delta "$delta" 2 0 0 1 1 1 1 >/dev/null 2>&1; then
+    printf 'Java diagnostics accepted a malformed counter value\n' >&2
+    return 1
+  fi
+
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  sed -i 's/t_missing before=0 after=1 delta=1/t_missing before=0 after=2 delta=1/' "$delta"
+  if assert_java_diagnostics_delta "$delta" 2 0 0 1 1 1 1 >/dev/null 2>&1; then
+    printf 'Java diagnostics accepted an inconsistent counter delta\n' >&2
+    return 1
+  fi
+
+  for invalid_delta in expected_missing 1+0 -1 01 1000000000; do
+    write_java_diagnostics_delta "$before" "$after" "$delta"
+    sed -i \
+      "s/t_missing before=0 after=1 delta=1/t_missing before=0 after=1 delta=$invalid_delta/" \
+      "$delta"
+    if assert_java_diagnostics_delta "$delta" 2 0 0 1 1 1 1 >/dev/null 2>&1; then
+      printf 'Java diagnostics accepted non-canonical delta=%s\n' "$invalid_delta" >&2
+      return 1
+    fi
+  done
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+
+  sed -i \
+    -e 's/t_missing before=0 after=1 delta=1/t_missing before=0 after=0 delta=0/' \
+    -e 's/t_already_consumed before=0 after=0 delta=0/t_already_consumed before=0 after=1 delta=1/' \
+    "$delta"
+  assert_java_diagnostics_delta "$delta" 2 0 0 1 1 1 1 || {
+    printf 'Java diagnostics rejected an already-consumed self lookup\n' >&2
+    return 1
+  }
+
+  sed -i 's/t_missing before=0 after=0 delta=0/t_missing before=0 after=1 delta=1/' "$delta"
+  if assert_java_diagnostics_delta "$delta" 2 0 0 1 1 1 1 >/dev/null 2>&1; then
+    printf 'Java diagnostics accepted an additional absence lookup\n' >&2
+    return 1
+  fi
+
+  write_diagnostics_fixture "$after" 2 0 0 1 1 1 missing 4
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  assert_java_diagnostics_delta "$delta" 2 0 0 4 1 1 1 || {
+    printf 'Java diagnostics rejected exact TLS-boundary misses\n' >&2
+    return 1
+  }
+  sed -i \
+    -e 's/t_missing before=0 after=4 delta=4/t_missing before=0 after=3 delta=3/' \
+    -e 's/t_already_consumed before=0 after=0 delta=0/t_already_consumed before=0 after=1 delta=1/' \
+    "$delta"
+  assert_java_diagnostics_delta "$delta" 2 0 0 4 1 1 1 || {
+    printf 'Java diagnostics rejected a TLS-boundary self lookup on a consumed task\n' >&2
+    return 1
+  }
+  sed -i \
+    -e 's/t_missing before=0 after=3 delta=3/t_missing before=0 after=2 delta=2/' \
+    -e 's/t_already_consumed before=0 after=1 delta=1/t_already_consumed before=0 after=2 delta=2/' \
+    "$delta"
+  if assert_java_diagnostics_delta "$delta" 2 0 0 4 1 1 1 >/dev/null 2>&1; then
+    printf 'Java diagnostics allowed self lookup tolerance to hide a TLS-boundary miss\n' >&2
+    return 1
+  fi
+
+  write_diagnostics_fixture "$after" 2 0 0 1 1 1 missing 1
+  write_java_diagnostics_delta "$before" "$after" "$delta"
 
   sed -i 's/d_missing before=0 after=0 delta=0/d_missing before=0 after=1 delta=1/' "$delta"
   if assert_java_diagnostics_delta "$delta" 2 0 0 1 1 1 1 >/dev/null 2>&1; then
@@ -1079,6 +1160,14 @@ test_java_diagnostics_delta_is_exact() {
   fi
 
   write_diagnostics_fixture "$before" 0 0 0 0 0 0
+  write_diagnostics_fixture "$after" 0 0 0 0 0 0 already_consumed 1
+  sed -i 's/t_missing=0/t_missing=1/' "$after"
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  assert_java_diagnostics_delta "$delta" 0 0 0 1 0 0 0 already_consumed 1 || {
+    printf 'Java diagnostics rejected an attributable already-consumed fault\n' >&2
+    return 1
+  }
+
   write_diagnostics_fixture "$after" 0 0 0 0 0 0 transport_error 1
   write_java_diagnostics_delta "$before" "$after" "$delta"
   assert_java_diagnostics_delta "$delta" 0 0 0 0 0 0 0 transport_error 1 || {
@@ -1394,11 +1483,60 @@ test_restart_fault_diagnostics_require_overlap() {
 
   write_diagnostics_fixture "$before" 0 0 0 0 0 0
   write_diagnostics_fixture "$after" k 0 0 k 0 k timeout c
+  sed -i 's/t_missing=0/t_missing=1/' "$after"
   write_java_diagnostics_delta "$before" "$after" "$delta"
   assert_restart_fault_diagnostics "$delta" 32 "$result"
-  grep -Fqx 'take_fail_open=12' "$result"
+  grep -Fqx 'observed_take_total=33' "$result"
+  grep -Fqx 'workload_valid_min=19' "$result"
+  grep -Fqx 'workload_valid_max=20' "$result"
+  grep -Fqx 'workload_fail_open_min=12' "$result"
+  grep -Fqx 'workload_fail_open_max=13' "$result"
+
+  write_diagnostics_fixture "$after" k 0 0 k 0 k timeout c
+  sed -i 's/t_already_consumed=0/t_already_consumed=1/' "$after"
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  assert_restart_fault_diagnostics "$delta" 32 "$result" || {
+    printf 'restart diagnostics rejected an already-consumed self lookup\n' >&2
+    return 1
+  }
+  grep -Fqx 'observed_take_total=33' "$result"
+  grep -Fqx 'workload_valid_min=19' "$result"
+  grep -Fqx 'workload_valid_max=20' "$result"
+  grep -Fqx 'workload_fail_open_min=12' "$result"
+  grep -Fqx 'workload_fail_open_max=13' "$result"
+
+  sed -i 's/t_missing=0/t_missing=1/' "$after"
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  if assert_restart_fault_diagnostics "$delta" 32 "$result" >/dev/null 2>&1; then
+    printf 'restart diagnostics accepted an additional take result\n' >&2
+    return 1
+  fi
+
+  write_diagnostics_fixture "$after" k 0 0 k 0 k timeout d
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  if assert_restart_fault_diagnostics "$delta" 32 "$result" >/dev/null 2>&1; then
+    printf 'restart diagnostics accepted a run without a diagnostics-eligible result\n' >&2
+    return 1
+  fi
+
+  write_diagnostics_fixture "$after" 6 0 0 6 0 6 timeout k
+  sed -i 's/t_missing=0/t_missing=1/' "$after"
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  sed -i '/^t_valid /p' "$delta"
+  if assert_restart_fault_diagnostics "$delta" 32 "$result" >/dev/null 2>&1; then
+    printf 'restart diagnostics accepted duplicate rows that forged the take total\n' >&2
+    return 1
+  fi
+
+  write_diagnostics_fixture "$after" 1 0 0 1 0 0 missing w
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  if assert_restart_fault_diagnostics "$delta" 32 "$result" >/dev/null 2>&1; then
+    printf 'restart diagnostics accepted an attribution-ambiguous single valid result\n' >&2
+    return 1
+  fi
 
   write_diagnostics_fixture "$after" w 0 0 w 0 w
+  sed -i 's/t_missing=0/t_missing=1/' "$after"
   write_java_diagnostics_delta "$before" "$after" "$delta"
   if assert_restart_fault_diagnostics "$delta" 32 "$result" >/dev/null 2>&1; then
     printf 'restart diagnostics accepted a run without an observed bridge fault\n' >&2

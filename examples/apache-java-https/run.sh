@@ -8,6 +8,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd -P)"
 SCRIPT_NAME="$(basename -- "${BASH_SOURCE[0]}")"
 MAX_SHELL_INTEGER="9223372036854775807"
+JAVA_DIAGNOSTIC_COUNTER_MAX="999999999"
 BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS=35
 SCENARIO_RUN_TIMEOUT_SECONDS=120
 # Sum explicit metric, readiness, Docker, release, and final-attempt overrun bounds.
@@ -24,7 +25,7 @@ APACHE_HTTPS_HEALTH_ENDPOINT="http://127.0.0.1:18080/healthz?close=1"
 PRIMARY_SECURITY_PROBE_PATH="/tmp/security-probe"
 PRIMARY_SECURITY_PID_PATH="/tmp/security-probe.pid"
 UNIX_PERMISSION_REFUSAL_PATTERN="writable without the sticky bit"
-readonly SCRIPT_DIR REPO_ROOT SCRIPT_NAME MAX_SHELL_INTEGER
+readonly SCRIPT_DIR REPO_ROOT SCRIPT_NAME MAX_SHELL_INTEGER JAVA_DIAGNOSTIC_COUNTER_MAX
 readonly BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS SCENARIO_RUN_TIMEOUT_SECONDS
 readonly SECURITY_PROBE_SCENARIO_BUDGET_SECONDS
 readonly SECURITY_PROBE_SAME_CGROUP_FIXED_BUDGET_SECONDS
@@ -3763,18 +3764,72 @@ java_diagnostic_delta() {
   local -r input="$1"
   local -r wanted="$2"
 
-  awk -v wanted="$wanted" '
+  awk -v wanted="$wanted" -v maximum="$JAVA_DIAGNOSTIC_COUNTER_MAX" '
     $1 == wanted {
       for (field = 1; field <= NF; field++) {
         if ($field ~ /^delta=/) {
           sub(/^delta=/, "", $field)
+          if ($field !~ /^(0|[1-9][0-9]*)$/ ||
+              length($field) > length(maximum) ||
+              (length($field) == length(maximum) && $field > maximum)) {
+            invalid = 1
+            exit
+          }
           print $field
           found = 1
           exit
         }
       }
     }
-    END { if (!found) exit 1 }
+    END { if (!found || invalid) exit 1 }
+  ' "$input"
+}
+
+assert_java_diagnostics_delta_schema() {
+  local -r input="$1"
+
+  awk -v maximum="$JAVA_DIAGNOSTIC_COUNTER_MAX" '
+    BEGIN {
+      fixed_names = "provider_reject provider_ver lookup_missing lookup_version lookup_error "
+      fixed_names = fixed_names "record_version invoke_error discard_standard extract_fields "
+      fixed_names = fixed_names "extract_invalid extract_error registration_fail take_sampled "
+      fixed_names = fixed_names "take_unsampled"
+      fixed_count = split(fixed_names, fixed)
+      for (position = 1; position <= fixed_count; position++) {
+        expected[++expected_count] = fixed[position]
+      }
+      status_names = "unknown valid missing stale unsupported malformed version_mismatch "
+      status_names = status_names "ambiguous unauthorized already_consumed timeout overload "
+      status_names = status_names "transport_error disabled"
+      status_count = split(status_names, statuses)
+      for (position = 1; position <= status_count; position++) {
+        expected[++expected_count] = "t_" statuses[position]
+        expected[++expected_count] = "d_" statuses[position]
+      }
+    }
+    function bounded(value) {
+      return value ~ /^(0|[1-9][0-9]*)$/ &&
+        length(value) <= length(maximum) &&
+        (length(value) < length(maximum) || value <= maximum)
+    }
+    {
+      if (NF != 4 || FNR > expected_count || $1 != expected[FNR]) {
+        invalid = 1
+        next
+      }
+      before = $2
+      after = $3
+      delta = $4
+      if (sub(/^before=/, "", before) != 1 ||
+          sub(/^after=/, "", after) != 1 ||
+          sub(/^delta=/, "", delta) != 1 ||
+          !bounded(before) || !bounded(after) || !bounded(delta) ||
+          after + 0 < before + 0 ||
+          delta + 0 != (after + 0) - (before + 0)) {
+        invalid = 1
+      }
+    }
+    END { if (invalid || FNR != expected_count) exit 1 }
   ' "$input"
 }
 
@@ -3792,18 +3847,41 @@ assert_java_diagnostics_delta() {
   local name=""
   local actual=""
   local expected=""
+  local actual_missing=0
+  local actual_already_consumed=0
+  local expected_missing_fault=0
+  local expected_already_consumed_fault=0
+  local absence_missing=0
+  local absence_already_consumed=0
   local -a failure_counters=(
     provider_reject provider_ver lookup_missing lookup_version lookup_error
     record_version invoke_error extract_fields extract_invalid extract_error
     registration_fail
   )
 
+  if ! assert_java_diagnostics_delta_schema "$input"; then
+    log_error "Java diagnostics delta did not contain the exact counter schema"
+    return 1
+  fi
+
+  case "$expected_fault_status" in
+    missing) expected_missing_fault="$expected_fault_count" ;;
+    already_consumed) expected_already_consumed_fault="$expected_fault_count" ;;
+  esac
+
   while IFS= read -r name; do
     actual="$(java_diagnostic_delta "$input" "$name")" || return 1
     expected=0
     case "$name" in
       t_valid) expected="$expected_valid" ;;
-      t_missing) expected="$expected_missing" ;;
+      t_missing)
+        actual_missing="$actual"
+        continue
+        ;;
+      t_already_consumed)
+        actual_already_consumed="$actual"
+        continue
+        ;;
       t_stale) expected="$expected_stale" ;;
       t_malformed) expected="$expected_malformed" ;;
       "t_$expected_fault_status") expected="$expected_fault_count" ;;
@@ -3813,6 +3891,21 @@ assert_java_diagnostics_delta() {
       return 1
     fi
   done < <(awk '$1 ~ /^[td]_/ { print $1 }' "$input")
+
+  if ((actual_missing < expected_missing_fault ||
+    actual_already_consumed < expected_already_consumed_fault)); then
+    log_error \
+      "Java diagnostics did not report the expected attributable absence fault"
+    return 1
+  fi
+  absence_missing="$((actual_missing - expected_missing_fault))"
+  absence_already_consumed="$((actual_already_consumed - expected_already_consumed_fault))"
+  if ((absence_missing + absence_already_consumed != expected_missing ||
+    absence_already_consumed > 1)); then
+    log_error \
+      "Java diagnostics expected absence total=$expected_missing with at most one already-consumed lookup after attributable faults, got missing=$absence_missing already_consumed=$absence_already_consumed"
+    return 1
+  fi
 
   for name in "${failure_counters[@]}"; do
     actual="$(java_diagnostic_delta "$input" "$name")" || return 1
@@ -3844,6 +3937,7 @@ assert_restart_fault_diagnostics() {
   local take_total=0
   local discard_total=0
   local valid=0
+  local diagnostics_eligible=0
   local failure_total=0
   local take_sampled=""
   local discard_standard=""
@@ -3853,12 +3947,19 @@ assert_restart_fault_diagnostics() {
     registration_fail
   )
 
+  if ! assert_java_diagnostics_delta_schema "$input"; then
+    log_error "restart fault Java diagnostics delta did not contain the exact counter schema"
+    return 1
+  fi
+
   while IFS= read -r name; do
     actual="$(java_diagnostic_delta "$input" "$name")" || return 1
     if [[ "$name" == t_* ]]; then
       take_total="$((take_total + actual))"
       if [[ "$name" == "t_valid" ]]; then
         valid="$actual"
+      elif [[ "$name" == "t_missing" || "$name" == "t_already_consumed" ]]; then
+        diagnostics_eligible="$((diagnostics_eligible + actual))"
       fi
     else
       discard_total="$((discard_total + actual))"
@@ -3871,8 +3972,10 @@ assert_restart_fault_diagnostics() {
   take_sampled="$(java_diagnostic_delta "$input" take_sampled)" || return 1
   discard_standard="$(java_diagnostic_delta "$input" discard_standard)" || return 1
 
-  if ((take_total != expected_requests || valid == 0 || valid == take_total)); then
-    log_error "restart fault expected $expected_requests takes with both valid and fail-open results, got total=$take_total valid=$valid"
+  if ((take_total != expected_requests + 1 || diagnostics_eligible == 0 ||
+    valid < 2 || valid >= expected_requests)); then
+    log_error \
+      "restart fault expected $expected_requests workload takes plus one probe with conservatively provable valid and fail-open workload results, got total=$take_total valid=$valid diagnostics_eligible=$diagnostics_eligible"
     return 1
   fi
   if ((discard_total != 0)); then
@@ -3886,9 +3989,12 @@ assert_restart_fault_diagnostics() {
   {
     printf 'status=passed\n'
     printf 'requests=%d\n' "$expected_requests"
-    printf 'take_total=%d\n' "$take_total"
-    printf 'take_valid=%d\n' "$valid"
-    printf 'take_fail_open=%d\n' "$((take_total - valid))"
+    printf 'observed_take_total=%d\n' "$take_total"
+    printf 'observed_take_valid=%d\n' "$valid"
+    printf 'workload_valid_min=%d\n' "$((valid - 1))"
+    printf 'workload_valid_max=%d\n' "$valid"
+    printf 'workload_fail_open_min=%d\n' "$((expected_requests - valid))"
+    printf 'workload_fail_open_max=%d\n' "$((expected_requests - valid + 1))"
     printf 'failure_total=%d\n' "$failure_total"
     printf 'take_sampled=%d\n' "$take_sampled"
     printf 'discard_standard=%d\n' "$discard_standard"

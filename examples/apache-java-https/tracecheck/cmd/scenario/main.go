@@ -30,15 +30,16 @@ import (
 )
 
 type config struct {
-	baseURL       string
-	receiverURL   string
-	scenario      string
-	requestCount  int
-	timeout       time.Duration
-	expectedTLS   string
-	seed          int64
-	apacheService string
-	javaService   string
+	baseURL           string
+	receiverURL       string
+	scenario          string
+	requestCount      int
+	timeout           time.Duration
+	expectedTLS       string
+	seed              int64
+	apacheService     string
+	javaService       string
+	restartControlDir string
 }
 
 type requestCase struct {
@@ -48,6 +49,7 @@ type requestCase struct {
 	W3CParentSpanID string `json:"w3c_parent_span_id,omitempty"`
 	W3CTraceFlags   string `json:"w3c_trace_flags,omitempty"`
 	W3CCase         string `json:"w3c_case,omitempty"`
+	RestartPhase    string `json:"restart_phase,omitempty"`
 	InvalidW3C      bool   `json:"invalid_w3c,omitempty"`
 	HandoffHops     int    `json:"handoff_hops,omitempty"`
 	HandoffFault    string `json:"handoff_fault,omitempty"`
@@ -160,10 +162,16 @@ type runResult struct {
 }
 
 const (
-	assertionQuiescence     = 6 * time.Second
-	matchingW3CTraceID      = "000102030405060708090a0b0c0d0e0f"
-	matchingW3CParentSpanID = "1011121314151617"
-	matchingW3CTraceFlags   = "01"
+	assertionQuiescence           = 6 * time.Second
+	matchingW3CTraceID            = "000102030405060708090a0b0c0d0e0f"
+	matchingW3CParentSpanID       = "1011121314151617"
+	matchingW3CTraceFlags         = "01"
+	restartBeforeStopRequests     = 1
+	restartWhileStoppedRequests   = 7
+	restartAfterStartRequestIndex = restartBeforeStopRequests + restartWhileStoppedRequests
+	restartPhaseBeforeStop        = "before-stop"
+	restartPhaseWhileStopped      = "obi-stopped"
+	restartPhaseAfterRestart      = "after-restart"
 )
 
 func main() {
@@ -212,6 +220,7 @@ func parseFlags() config {
 	flag.Int64Var(&cfg.seed, "seed", 1, "deterministic request and W3C identifier seed")
 	flag.StringVar(&cfg.apacheService, "apache-service", "apache-proxy", "Apache service.name")
 	flag.StringVar(&cfg.javaService, "java-service", "java-backend", "Java service.name")
+	flag.StringVar(&cfg.restartControlDir, "restart-control-dir", "", "shared restart-fault control directory")
 	flag.Parse()
 
 	if flag.NArg() != 0 {
@@ -239,6 +248,14 @@ func parseFlags() config {
 	}
 	if cfg.timeout <= 0 || cfg.timeout > 10*time.Minute {
 		fmt.Fprintln(os.Stderr, "timeout must be positive and at most 10m")
+		os.Exit(2)
+	}
+	if cfg.scenario == "restart-fault" && cfg.restartControlDir == "" {
+		fmt.Fprintln(os.Stderr, "restart-fault requires --restart-control-dir")
+		os.Exit(2)
+	}
+	if cfg.scenario != "restart-fault" && cfg.restartControlDir != "" {
+		fmt.Fprintln(os.Stderr, "--restart-control-dir requires restart-fault")
 		os.Exit(2)
 	}
 	return cfg
@@ -356,6 +373,13 @@ func makeRequests(cfg config) ([]requestCase, error) {
 	if cfg.scenario == "tls-boundary" && count != 2 {
 		return nil, fmt.Errorf("scenario %s requires exactly two requests", cfg.scenario)
 	}
+	if cfg.scenario == "restart-fault" && count <= restartAfterStartRequestIndex {
+		return nil, fmt.Errorf(
+			"scenario %s requires at least %d requests",
+			cfg.scenario,
+			restartAfterStartRequestIndex+1,
+		)
+	}
 
 	requests := make([]requestCase, count)
 	for i := range requests {
@@ -447,6 +471,14 @@ func makeRequests(cfg config) ([]requestCase, error) {
 			}
 		case "restart-fault":
 			requests[i].DelayMillis = 75
+			switch {
+			case i < restartBeforeStopRequests:
+				requests[i].RestartPhase = restartPhaseBeforeStop
+			case i < restartAfterStartRequestIndex:
+				requests[i].RestartPhase = restartPhaseWhileStopped
+			default:
+				requests[i].RestartPhase = restartPhaseAfterRestart
+			}
 			if err := addW3CContext(random, &requests[i], "01", "valid-w3c-during-obi-restart"); err != nil {
 				return nil, err
 			}
@@ -510,9 +542,37 @@ func sendRequests(
 
 	responses := make([]backendResponse, len(requests))
 	latencies := make([]int64, len(requests))
+	var control *restartControl
+	if cfg.scenario == "restart-fault" {
+		var err error
+		control, err = newRestartControl(cfg.restartControlDir)
+		if err != nil {
+			return responses, latencies, 0, nil, err
+		}
+	}
 	trafficStart := time.Now()
 	if !parallelScenario(cfg.scenario) {
 		for i := range requests {
+			if control != nil {
+				switch i {
+				case restartBeforeStopRequests:
+					if err := control.checkpoint(
+						ctx,
+						restartSignalPreStopReady,
+						restartReleaseOBIStopped,
+					); err != nil {
+						return responses, latencies, time.Since(trafficStart), nil, err
+					}
+				case restartAfterStartRequestIndex:
+					if err := control.checkpoint(
+						ctx,
+						restartSignalStoppedTrafficComplete,
+						restartReleaseOBIReady,
+					); err != nil {
+						return responses, latencies, time.Since(trafficStart), nil, err
+					}
+				}
+			}
 			if cfg.scenario == "restart-fault" && i > 0 {
 				select {
 				case <-ctx.Done():
@@ -527,6 +587,11 @@ func sendRequests(
 				return responses, latencies, time.Since(trafficStart), nil, fmt.Errorf("request %d: %w", i, err)
 			}
 			responses[i] = response
+		}
+		if control != nil {
+			if err := control.publish(restartSignalPostRestartTrafficComplete); err != nil {
+				return responses, latencies, time.Since(trafficStart), nil, err
+			}
 		}
 		return responses, latencies, time.Since(trafficStart), nil, nil
 	}

@@ -340,15 +340,33 @@ func TestRestartFaultRequestsUseStandardParents(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, requests, 32)
 
-	for _, request := range requests {
+	for index, request := range requests {
 		assert.NotEmpty(t, request.W3CTraceID)
 		assert.NotEmpty(t, request.W3CParentSpanID)
 		assert.Equal(t, 75, request.DelayMillis)
+		switch {
+		case index < restartBeforeStopRequests:
+			assert.Equal(t, restartPhaseBeforeStop, request.RestartPhase)
+		case index < restartAfterStartRequestIndex:
+			assert.Equal(t, restartPhaseWhileStopped, request.RestartPhase)
+		default:
+			assert.Equal(t, restartPhaseAfterRestart, request.RestartPhase)
+		}
 		assert.Equal(t, tracecheck.ModeW3CResilience, expectationFor(
 			config{scenario: "restart-fault"},
 			request,
 		).Mode)
 	}
+}
+
+func TestRestartFaultRequiresTrafficAfterRestart(t *testing.T) {
+	_, err := makeRequests(config{
+		scenario:     "restart-fault",
+		requestCount: restartAfterStartRequestIndex,
+		seed:         42,
+	})
+
+	require.ErrorContains(t, err, "requires at least")
 }
 
 func TestStressScenarioRequestsHaveBoundedShapes(t *testing.T) {

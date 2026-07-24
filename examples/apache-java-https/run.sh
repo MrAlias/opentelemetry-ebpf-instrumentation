@@ -44,6 +44,12 @@ APACHE_HTTPS_HEALTH_ENDPOINT="http://127.0.0.1:18080/healthz?close=1"
 PRIMARY_SECURITY_PROBE_PATH="/tmp/security-probe"
 PRIMARY_SECURITY_PID_PATH="/tmp/security-probe.pid"
 UNIX_PERMISSION_REFUSAL_PATTERN="writable without the sticky bit"
+RESTART_CONTROL_CONTAINER_DIR="/run/obi-demo/restart-control"
+RESTART_SIGNAL_PRE_STOP_READY="pre-stop-ready"
+RESTART_SIGNAL_STOPPED_TRAFFIC_COMPLETE="stopped-traffic-complete"
+RESTART_SIGNAL_POST_RESTART_TRAFFIC_COMPLETE="post-restart-traffic-complete"
+RESTART_RELEASE_OBI_STOPPED="obi-stopped"
+RESTART_RELEASE_OBI_READY="obi-ready"
 readonly SCRIPT_DIR REPO_ROOT SCRIPT_NAME MAX_SHELL_INTEGER MAX_UINT32_DECIMAL
 readonly MAX_UINT64_DECIMAL JAVA_DIAGNOSTIC_COUNTER_MAX
 readonly BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS SCENARIO_RUN_TIMEOUT_SECONDS
@@ -63,6 +69,10 @@ readonly PROJECT_SENTINEL_LABEL PROJECT_SENTINEL_VALUE APACHE_EXPECTED_PROCESS_C
 readonly APACHE_HTTPS_HEALTH_ENDPOINT
 readonly PRIMARY_SECURITY_PROBE_PATH PRIMARY_SECURITY_PID_PATH
 readonly UNIX_PERMISSION_REFUSAL_PATTERN
+readonly RESTART_CONTROL_CONTAINER_DIR
+readonly RESTART_SIGNAL_PRE_STOP_READY RESTART_SIGNAL_STOPPED_TRAFFIC_COMPLETE
+readonly RESTART_SIGNAL_POST_RESTART_TRAFFIC_COMPLETE
+readonly RESTART_RELEASE_OBI_STOPPED RESTART_RELEASE_OBI_READY
 
 RUNTIME_DIR="$SCRIPT_DIR/.runtime"
 ARTIFACT_DIR="$RUNTIME_DIR/artifacts"
@@ -3060,12 +3070,116 @@ run_late_attach_control() {
   SCENARIO_VARIANT=""
 }
 
+prepare_restart_control_directory() {
+  local -r directory="$1"
+
+  if [[ -e "$directory" || -L "$directory" ]]; then
+    log_error "restart control path already exists: $directory"
+    return 1
+  fi
+  if ! mkdir -- "$directory"; then
+    log_error "could not create restart control directory: $directory"
+    return 1
+  fi
+  [[ -d "$directory" && ! -L "$directory" ]] || {
+    log_error "restart control path is not a real directory: $directory"
+    return 1
+  }
+}
+
+record_restart_control_event() {
+  local -r directory="$1"
+  local -r event="$2"
+  local -r events="$directory/events.log"
+
+  if [[ -L "$events" || ( -e "$events" && ! -f "$events" ) ]]; then
+    log_error "restart control event target is not a regular file: $events"
+    return 1
+  fi
+  printf '%s %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" "$event" >>"$events"
+}
+
+publish_restart_control_release() {
+  local -r directory="$1"
+  local -r name="$2"
+  local -r target="$directory/$name"
+  local temporary=""
+
+  [[ "$name" =~ ^[a-z][a-z-]{0,63}$ ]] || {
+    log_error "invalid restart control release name: $name"
+    return 1
+  }
+  [[ -d "$directory" && ! -L "$directory" ]] || {
+    log_error "restart control directory changed before release: $directory"
+    return 1
+  }
+  if [[ -e "$target" || -L "$target" ]]; then
+    log_error "restart control release already exists: $target"
+    return 1
+  fi
+  temporary="$(mktemp "$directory/.$name.XXXXXX")" || return $?
+  if ! printf '%s\n' "$name" >"$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  if ! chmod 0644 -- "$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  if ! ln -- "$temporary" "$target"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  if ! rm -f -- "$temporary"; then
+    log_error "could not remove temporary restart release: $temporary"
+    return 1
+  fi
+  record_restart_control_event "$directory" "released:$name"
+}
+
+wait_for_restart_control_signal() {
+  local -r directory="$1"
+  local -r name="$2"
+  local -r description="$3"
+  local -r scenario_pid="$4"
+  local -r path="$directory/$name"
+  local -i started_at="$SECONDS"
+
+  [[ "$name" =~ ^[a-z][a-z-]{0,63}$ ]] || {
+    log_error "invalid restart control signal name: $name"
+    return 1
+  }
+  while ((SECONDS - started_at < READINESS_TIMEOUT_SECONDS)); do
+    if [[ -e "$path" || -L "$path" ]]; then
+      if [[ -L "$path" || ! -f "$path" ]]; then
+        log_error "restart control signal is not a regular file: $path"
+        return 1
+      fi
+      if ! cmp -s -- "$path" <(printf '%s\n' "$name"); then
+        log_error "restart control signal has invalid contents: $path"
+        return 1
+      fi
+      record_restart_control_event "$directory" "observed:$name" || return $?
+      log_info "$description is complete"
+      return 0
+    fi
+    if ! kill -0 "$scenario_pid" 2>/dev/null; then
+      log_error "$description traffic ended before publishing $name"
+      return 1
+    fi
+    sleep 0.1
+  done
+  log_error "timed out waiting for $description signal: $name"
+  return 1
+}
+
 run_restart_during_traffic_control() (
   local -r label="restart-fault"
   local -r output="$RESULT_DIR/scenario-$label.json"
   local -r stderr_output="$RESULT_DIR/scenario-$label.stderr.log"
   local -r before_phase="$label-before"
   local -r after_phase="$label-after"
+  local -r control_dir="$RESULT_DIR/restart-control"
   local restart_since=""
   local scenario_pid=""
   local scenario_status=0
@@ -3090,42 +3204,58 @@ run_restart_during_traffic_control() (
     log_error "restart-during-traffic control requires a running bridge"
     return 1
   }
+  prepare_restart_control_directory "$control_dir" || return $?
   log_info "running valid-W3C traffic while OBI restarts"
   capture_phase_evidence "$before_phase"
   capture_java_diagnostics "$before_phase"
   timeout --signal=TERM --kill-after=10s 180s \
-    "${COMPOSE[@]}" run --rm --no-deps --no-TTY scenario \
+    "${COMPOSE[@]}" run --rm --no-deps --no-TTY \
+      --volume "$control_dir:$RESTART_CONTROL_CONTAINER_DIR:rw" \
+      scenario \
       --scenario restart-fault \
       --requests 32 \
       --expected-tls "$TLS_PROTOCOL" \
       --seed "$SCENARIO_SEED" \
+      --restart-control-dir "$RESTART_CONTROL_CONTAINER_DIR" \
       --timeout 120s \
       </dev/null \
       >"$output" \
       2> >(tee "$stderr_output" >&2) &
   scenario_pid=$!
-  sleep 1
-  if ! kill -0 "$scenario_pid" 2>/dev/null; then
-    if wait "$scenario_pid"; then
-      scenario_status=0
-    else
-      scenario_status=$?
-    fi
-    scenario_pid=""
-    log_error "restart fault traffic ended before OBI restart, status=$scenario_status"
-    return 1
-  fi
+  wait_for_restart_control_signal \
+    "$control_dir" \
+    "$RESTART_SIGNAL_PRE_STOP_READY" \
+    "pre-stop restart traffic" \
+    "$scenario_pid" || return $?
 
   restart_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')"
   run_bounded 60 "${COMPOSE[@]}" stop --timeout 5 obi || return $?
   BRIDGE_RUNNING=false
-  sleep 1
+  publish_restart_control_release \
+    "$control_dir" \
+    "$RESTART_RELEASE_OBI_STOPPED" || return $?
+  wait_for_restart_control_signal \
+    "$control_dir" \
+    "$RESTART_SIGNAL_STOPPED_TRAFFIC_COMPLETE" \
+    "traffic while OBI was stopped" \
+    "$scenario_pid" || return $?
   run_bounded 120 "${COMPOSE[@]}" up --detach obi || return $?
   wait_for_log \
     obi \
     "Java remote parent bridge ready" \
     "OBI bridge restarted during traffic" \
     "$restart_since" || return $?
+  BRIDGE_RUNNING=true
+  assert_selected_transport || return $?
+  wait_for_apache_instrumentation restart-fault-recovery || return $?
+  publish_restart_control_release \
+    "$control_dir" \
+    "$RESTART_RELEASE_OBI_READY" || return $?
+  wait_for_restart_control_signal \
+    "$control_dir" \
+    "$RESTART_SIGNAL_POST_RESTART_TRAFFIC_COMPLETE" \
+    "traffic after OBI recovery" \
+    "$scenario_pid" || return $?
   if wait "$scenario_pid"; then
     scenario_status=0
   else
@@ -3141,9 +3271,6 @@ run_restart_during_traffic_control() (
     "OBI remote-parent provider ready" \
     "Java bridge recovered during restart traffic" \
     "$restart_since" || return $?
-  BRIDGE_RUNNING=true
-  assert_selected_transport
-  wait_for_apache_instrumentation restart-fault-recovery
   capture_phase_evidence "$after_phase"
   capture_java_diagnostics "$after_phase"
   write_java_diagnostics_delta \
@@ -3154,7 +3281,7 @@ run_restart_during_traffic_control() (
     "$RESULT_DIR/phases/$after_phase/java-diagnostics.delta" \
     32 \
     "$RESULT_DIR/restart-fault-diagnostics.txt"
-  printf '{"status":"passed","scenario":"restart-fault","result":"%s","after_phase":"phases/%s"}\n' \
+  printf '{"status":"passed","scenario":"restart-fault","result":"%s","after_phase":"phases/%s","restart_control":"restart-control/events.log"}\n' \
     "$(basename -- "$output")" \
     "$after_phase" >"$RESULT_DIR/scenario-$label-status.json"
 

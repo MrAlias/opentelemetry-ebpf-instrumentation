@@ -4190,42 +4190,64 @@ test_standalone_restart_waits_for_apache_instrumentation() {
 
 test_restart_fault_recovery_waits_for_apache_instrumentation() {
   local -r fake_compose="$TEST_TMP_DIR/restart-success-compose"
-  local -r ready="$TEST_TMP_DIR/restart-success.ready"
+  local -r provider_ready="$TEST_TMP_DIR/restart-success.provider-ready"
   local -r observed="$TEST_TMP_DIR/restart-success.observed"
+  local -r result_dir="$TEST_TMP_DIR/restart-success-result"
 
   cat >"$fake_compose" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 printf 'compose:%s\n' "$*" >>"$RESTART_SUCCESS_OBSERVED"
 case " $* " in
-  *" run --rm --no-deps --no-TTY scenario "*)
-    while [[ ! -e "$RESTART_SUCCESS_READY" ]]; do
+  *" scenario --scenario restart-fault "*)
+    control="$RESTART_SUCCESS_CONTROL"
+    printf 'traffic:before-stop\n' >>"$RESTART_SUCCESS_OBSERVED"
+    printf 'pre-stop-ready\n' >"$control/.pre-stop-ready"
+    mv -- "$control/.pre-stop-ready" "$control/pre-stop-ready"
+    for _ in {1..500}; do
+      [[ -f "$control/obi-stopped" ]] && break
       sleep 0.01
     done
+    cmp -s -- "$control/obi-stopped" <(printf 'obi-stopped\n')
+    printf 'traffic:obi-stopped\n' >>"$RESTART_SUCCESS_OBSERVED"
+    printf 'stopped-traffic-complete\n' >"$control/.stopped-traffic-complete"
+    mv -- "$control/.stopped-traffic-complete" "$control/stopped-traffic-complete"
+    for _ in {1..500}; do
+      [[ -f "$control/obi-ready" ]] && break
+      sleep 0.01
+    done
+    cmp -s -- "$control/obi-ready" <(printf 'obi-ready\n')
+    printf 'traffic:after-restart\n' >>"$RESTART_SUCCESS_OBSERVED"
+    : >"$RESTART_SUCCESS_PROVIDER_READY"
+    printf 'post-restart-traffic-complete\n' >"$control/.post-restart-traffic-complete"
+    mv -- \
+      "$control/.post-restart-traffic-complete" \
+      "$control/post-restart-traffic-complete"
     printf '{}\n'
-    ;;
-  *" up --detach obi "*)
-    : >"$RESTART_SUCCESS_READY"
     ;;
 esac
 EOF
   chmod 0755 "$fake_compose"
 
   (
-    export RESTART_SUCCESS_READY="$ready"
+    export RESTART_SUCCESS_CONTROL="$result_dir/restart-control"
     export RESTART_SUCCESS_OBSERVED="$observed"
-    RESULT_DIR="$TEST_TMP_DIR/restart-success-result"
+    export RESTART_SUCCESS_PROVIDER_READY="$provider_ready"
+    RESULT_DIR="$result_dir"
     COMPOSE=("$fake_compose")
     BRIDGE_RUNNING=true
+    READINESS_TIMEOUT_SECONDS=5
     SCENARIO_VARIANT=""
+    SCENARIO_SEED=1
+    TLS_PROTOCOL=TLSv1.3
     mkdir -p -- "$RESULT_DIR"
     date() {
       printf 'restart-success-cursor\n'
     }
-    sleep() {
-      return 0
-    }
     wait_for_log() {
+      if [[ "$3" == "Java bridge recovered during restart traffic" ]]; then
+        [[ -f "$provider_ready" ]] || return 1
+      fi
       printf 'log:%s\n' "$3" >>"$observed"
     }
     assert_selected_transport() {
@@ -4261,18 +4283,88 @@ EOF
   }
 
   awk '
-    $0 == "log:Java bridge recovered during restart traffic" { provider = NR }
+    $0 == "traffic:before-stop" { before = NR }
+    $0 == "compose:stop --timeout 5 obi" { stopped = NR }
+    $0 == "traffic:obi-stopped" { outage = NR }
+    $0 == "compose:up --detach obi" { started = NR }
+    $0 == "log:OBI bridge restarted during traffic" { bridge = NR }
+    $0 == "transport" { transport = NR }
     $0 == "apache:restart-fault-recovery" { readiness = NR }
+    $0 == "traffic:after-restart" { recovered = NR }
+    $0 == "log:Java bridge recovered during restart traffic" { provider = NR }
     $0 == "capture:restart-fault-after" { capture = NR }
     $0 == "scenario:restart:restart-recovery" { scenario = NR }
     END {
-      exit provider > 0 && readiness > provider && capture > readiness &&
-        scenario > capture ? 0 : 1
+      exit before > 0 && stopped > before && outage > stopped &&
+        started > outage && bridge > started && transport > bridge &&
+        readiness > transport && recovered > readiness && provider > recovered &&
+        capture > provider && scenario > capture ? 0 : 1
     }
   ' "$observed" || {
-    printf 'restart-fault recovery resumed before Apache instrumentation readiness\n' >&2
+    printf 'restart-fault recovery lifecycle was not causally ordered\n' >&2
     return 1
   }
+  awk '
+    $2 == "observed:pre-stop-ready" { pre = NR }
+    $2 == "released:obi-stopped" { stopped = NR }
+    $2 == "observed:stopped-traffic-complete" { outage = NR }
+    $2 == "released:obi-ready" { ready = NR }
+    $2 == "observed:post-restart-traffic-complete" { recovered = NR }
+    END {
+      exit pre > 0 && stopped > pre && outage > stopped &&
+        ready > outage && recovered > ready ? 0 : 1
+    }
+  ' "$result_dir/restart-control/events.log" || {
+    printf 'restart-fault control evidence omitted a lifecycle phase\n' >&2
+    return 1
+  }
+}
+
+test_restart_fault_rejects_traffic_ending_before_first_barrier() {
+  local -r fake_compose="$TEST_TMP_DIR/restart-ended-compose"
+  local -r observed="$TEST_TMP_DIR/restart-ended.observed"
+  local status=0
+
+  cat >"$fake_compose" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf '%s\n' "$*" >>"$RESTART_ENDED_OBSERVED"
+case " $* " in
+  *" scenario --scenario restart-fault "*) printf '{}\n' ;;
+esac
+EOF
+  chmod 0755 "$fake_compose"
+
+  if (
+    export RESTART_ENDED_OBSERVED="$observed"
+    RESULT_DIR="$TEST_TMP_DIR/restart-ended-result"
+    mkdir -p -- "$RESULT_DIR"
+    COMPOSE=("$fake_compose")
+    BRIDGE_RUNNING=true
+    READINESS_TIMEOUT_SECONDS=2
+    TLS_PROTOCOL=TLSv1.3
+    SCENARIO_SEED=1
+    capture_phase_evidence() {
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+    }
+    capture_java_diagnostics() {
+      printf 'unavailable\n' >"$RESULT_DIR/phases/$1/java-diagnostics.txt"
+    }
+    run_restart_during_traffic_control
+  ) >/dev/null 2>&1; then
+    printf 'restart control accepted traffic that ended before its first barrier\n' >&2
+    return 1
+  else
+    status=$?
+  fi
+  [[ "$status" -eq 1 ]] || {
+    printf 'ended restart traffic returned %d, expected status 1\n' "$status" >&2
+    return 1
+  }
+  if grep -Fq 'stop --timeout 5 obi' "$observed"; then
+    printf 'restart control stopped OBI without active pre-stop traffic\n' >&2
+    return 1
+  fi
 }
 
 test_restart_failure_reaps_background_traffic() {
@@ -4287,13 +4379,17 @@ test_restart_failure_reaps_background_traffic() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 case " $* " in
-  *" run --rm --no-deps --no-TTY scenario "*)
+  *" scenario --scenario restart-fault "*)
     if IFS= read -r unexpected; then
       printf 'unexpected stdin: %s\n' "$unexpected" >&2
       exit 64
     fi
     printf '%d\n' "$$" >"$RESTART_TRAFFIC_PID_FILE"
     trap 'printf "terminated\n" >"$RESTART_TRAFFIC_TERM_FILE"; exit 0' TERM INT
+    printf 'pre-stop-ready\n' >"$RESTART_FAILURE_CONTROL/.pre-stop-ready"
+    mv -- \
+      "$RESTART_FAILURE_CONTROL/.pre-stop-ready" \
+      "$RESTART_FAILURE_CONTROL/pre-stop-ready"
     while true; do sleep 1; done
     ;;
   *" stop --timeout 5 obi "*) exit 23 ;;
@@ -4306,9 +4402,11 @@ EOF
     export RESTART_TRAFFIC_PID_FILE="$traffic_pid_file"
     export RESTART_TRAFFIC_TERM_FILE="$traffic_term_file"
     RESULT_DIR="$TEST_TMP_DIR/restart-failure"
+    export RESTART_FAILURE_CONTROL="$RESULT_DIR/restart-control"
     mkdir -p -- "$RESULT_DIR"
     COMPOSE=("$fake_compose")
     BRIDGE_RUNNING=true
+    READINESS_TIMEOUT_SECONDS=5
     TLS_PROTOCOL=TLSv1.3
     SCENARIO_SEED=1
     capture_phase_evidence() {
@@ -4771,6 +4869,7 @@ main() {
   test_restart_readiness_uses_log_cursor
   test_standalone_restart_waits_for_apache_instrumentation
   test_restart_fault_recovery_waits_for_apache_instrumentation
+  test_restart_fault_rejects_traffic_ending_before_first_barrier
   test_restart_failure_reaps_background_traffic
   test_scenario_failure_retains_after_evidence
   test_start_failure_retains_command_boundary

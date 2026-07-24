@@ -292,6 +292,8 @@ func (p *Tracer) SetupTailCalls() {
 		p.bpfObjects.ObiProtocolHttp2GrpcHandleStartFrameServerFinalize, // 12
 		// Large buffer multi-batch emission
 		p.bpfObjects.ObiLargeBufEmitContinue, // 13  k_tail_large_buf_emit_continue
+		// Traceparent validation
+		p.bpfObjects.ObiContinueProtocolHttpTpValidate, // 14
 	} {
 		if prog == nil {
 			continue

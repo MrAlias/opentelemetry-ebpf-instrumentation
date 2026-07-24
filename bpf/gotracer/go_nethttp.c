@@ -462,7 +462,7 @@ int obi_uprobe_readMimeHeader(struct pt_regs *ctx) {
 
     bpf_dbg_printk("tp=%llx", tp_ptr);
 
-    if (!tp_ptr) {
+    if (!tp_ptr || !is_valid_traceparent(tp_ptr)) {
         return 0;
     }
 
@@ -495,12 +495,17 @@ int obi_uprobe_readContinuedLineSliceReturns(struct pt_regs *ctx) {
     };
 
     const u32 w3c_value_start = sizeof(traceparent) - 1;
+    if (safe_len < w3c_value_start + W3C_VAL_LENGTH) {
+        return 0;
+    }
 
     server_http_func_invocation_t *inv = bpf_map_lookup_elem(&ongoing_http_server_requests, &g_key);
 
     unsigned char *traceparent_start =
         match_header(temp, safe_len, traceparent, w3c_value_start, W3C_VAL_LENGTH);
-    if (traceparent_start) {
+    const u32 traceparent_value_len = safe_len - w3c_value_start;
+    if (traceparent_start &&
+        is_valid_traceparent_field_value(traceparent_start, traceparent_value_len)) {
         handle_traceparent_header(inv, &g_key, traceparent_start);
     }
 

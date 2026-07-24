@@ -10,18 +10,42 @@
 #include <common/globals.h>
 #include <common/http_buf_size.h>
 
-// 55+13
-#define TRACE_PARENT_HEADER_LEN 68
+enum : u8 {
+    k_ascii_lowercase_bit = 0x20,
+    k_traceparent_header_prefix_len = 13,
+    k_traceparent_version_len = 2,
+    k_traceparent_trace_id_len = 32,
+    k_traceparent_span_id_len = 16,
+    k_traceparent_flags_len = 2,
+    k_traceparent_value_dash1 = k_traceparent_version_len,
+    k_traceparent_value_trace_id = k_traceparent_value_dash1 + 1,
+    k_traceparent_value_dash2 = k_traceparent_value_trace_id + k_traceparent_trace_id_len,
+    k_traceparent_value_span_id = k_traceparent_value_dash2 + 1,
+    k_traceparent_value_dash3 = k_traceparent_value_span_id + k_traceparent_span_id_len,
+    k_traceparent_value_flags = k_traceparent_value_dash3 + 1,
+    k_traceparent_value_len = k_traceparent_value_flags + k_traceparent_flags_len,
+    k_traceparent_header_cr = k_traceparent_header_prefix_len + k_traceparent_value_len,
+    k_traceparent_header_lf = k_traceparent_header_cr + 1,
+    k_traceparent_header_len = k_traceparent_header_lf + 1,
+};
+
+#define TRACE_PARENT_HEADER_LEN k_traceparent_header_len
 
 struct callback_ctx {
     unsigned char *buf;
     u32 pos;
-    u8 _pad[4];
+    u8 line_start;
+    u8 _pad[3];
 };
 
 enum : u32 {
     k_tp_pos_not_found = 0xFFFFFFFFU,
     k_tp_max_scan_loops = TRACE_BUF_SIZE - TRACE_PARENT_HEADER_LEN,
+    k_tp_legacy_max_scan_loops = 350,
+};
+
+enum : u16 {
+    k_tp_pos_unset = 0xFFFF,
 };
 
 static unsigned char *hex = (unsigned char *)"0123456789abcdef";
@@ -73,13 +97,83 @@ static __always_inline void encode_hex(unsigned char *dst, const unsigned char *
 }
 
 static __always_inline bool is_traceparent(const unsigned char *p) {
-    if (((p[0] == 'T') || (p[0] == 't')) && (p[1] == 'r') && (p[2] == 'a') && (p[3] == 'c') &&
-        (p[4] == 'e') && ((p[5] == 'p') || (p[5] == 'P')) && (p[6] == 'a') && (p[7] == 'r') &&
-        (p[8] == 'e') && (p[9] == 'n') && (p[10] == 't') && (p[11] == ':') && (p[12] == ' ')) {
+    if (((p[0] | k_ascii_lowercase_bit) == 't') && ((p[1] | k_ascii_lowercase_bit) == 'r') &&
+        ((p[2] | k_ascii_lowercase_bit) == 'a') && ((p[3] | k_ascii_lowercase_bit) == 'c') &&
+        ((p[4] | k_ascii_lowercase_bit) == 'e') && ((p[5] | k_ascii_lowercase_bit) == 'p') &&
+        ((p[6] | k_ascii_lowercase_bit) == 'a') && ((p[7] | k_ascii_lowercase_bit) == 'r') &&
+        ((p[8] | k_ascii_lowercase_bit) == 'e') && ((p[9] | k_ascii_lowercase_bit) == 'n') &&
+        ((p[10] | k_ascii_lowercase_bit) == 't') && (p[11] == ':') && (p[12] == ' ')) {
         return true;
     }
 
     return false;
+}
+
+static __always_inline u8 invalid_traceparent_hex(unsigned char value) {
+    return (reverse_hex[value & 0xff] >> 4) |
+           ((value & k_ascii_lowercase_bit) ^ k_ascii_lowercase_bit);
+}
+
+static __noinline bool is_valid_traceparent_value(const unsigned char *value) {
+    if (value[0] == 'f' && value[1] == 'f') {
+        return false;
+    }
+
+    u8 invalid_hex = invalid_traceparent_hex(value[0]) | invalid_traceparent_hex(value[1]) |
+                     invalid_traceparent_hex(value[k_traceparent_value_flags]) |
+                     invalid_traceparent_hex(value[k_traceparent_value_flags + 1]);
+    invalid_hex |= value[k_traceparent_value_dash1] ^ '-';
+    invalid_hex |= value[k_traceparent_value_dash2] ^ '-';
+    invalid_hex |= value[k_traceparent_value_dash3] ^ '-';
+
+    u8 trace_id_nonzero = 0;
+#pragma clang loop unroll(disable)
+    for (u8 i = 0; i < k_traceparent_trace_id_len; i++) {
+        const unsigned char current = value[k_traceparent_value_trace_id + i];
+        invalid_hex |= invalid_traceparent_hex(current);
+        trace_id_nonzero |= current ^ '0';
+    }
+
+    u8 span_id_nonzero = 0;
+#pragma clang loop unroll(disable)
+    for (u8 i = 0; i < k_traceparent_span_id_len; i++) {
+        const unsigned char current = value[k_traceparent_value_span_id + i];
+        invalid_hex |= invalid_traceparent_hex(current);
+        span_id_nonzero |= current ^ '0';
+    }
+    return invalid_hex == 0 && trace_id_nonzero != 0 && span_id_nonzero != 0;
+}
+
+static __always_inline bool is_valid_traceparent_field_value(const unsigned char *value,
+                                                             const u32 value_len) {
+    if (value_len < k_traceparent_value_len || !is_valid_traceparent_value(value)) {
+        return false;
+    }
+    if (value[0] == '0' && value[1] == '0') {
+        return value_len == k_traceparent_value_len;
+    }
+    return value_len == k_traceparent_value_len ||
+           (value_len > k_traceparent_value_len + 1 && value[k_traceparent_value_len] == '-');
+}
+
+static __always_inline bool is_valid_traceparent(const unsigned char *header) {
+    if (!is_traceparent(header)) {
+        return false;
+    }
+
+    const unsigned char *value = &header[k_traceparent_header_prefix_len];
+    if (!is_valid_traceparent_value(value)) {
+        return false;
+    }
+
+    const bool line_ended =
+        header[k_traceparent_header_cr] == '\r' && header[k_traceparent_header_lf] == '\n';
+    if (value[0] == '0' && value[1] == '0') {
+        return line_ended;
+    }
+    const unsigned char extension = header[k_traceparent_header_lf];
+    return line_ended || (header[k_traceparent_header_cr] == '-' && extension != '\0' &&
+                          extension != '\r' && extension != '\n');
 }
 
 static __always_inline bool is_eoh(const unsigned char *p) {
@@ -94,11 +188,16 @@ static int tp_match(u32 index, void *data) {
     struct callback_ctx *ctx = data;
     unsigned char *s = &(ctx->buf[index]);
 
-    if (is_traceparent(s)) {
+    if (is_eoh(s)) {
+        return 1;
+    }
+
+    if (ctx->line_start && is_traceparent(s)) {
         ctx->pos = index;
         return 1;
     }
 
+    ctx->line_start = *s == '\n';
     return 0;
 }
 
@@ -108,6 +207,14 @@ static __always_inline u32 traceparent_scan_loop_count(const u16 buf_len) {
     }
 
     return min((u32)buf_len - TRACE_PARENT_HEADER_LEN + 1, k_tp_max_scan_loops);
+}
+
+static __always_inline bool traceparent_header_fits(const int buf_len) {
+    return buf_len >= TRACE_PARENT_HEADER_LEN;
+}
+
+static __always_inline u16 traceparent_legacy_scan_loop_count(const u16 buf_len) {
+    return min(traceparent_scan_loop_count(buf_len), k_tp_legacy_max_scan_loops);
 }
 
 static __always_inline unsigned char *bpf_strstr_tp_loop(unsigned char *buf, const u16 buf_len) {
@@ -121,12 +228,47 @@ static __always_inline unsigned char *bpf_strstr_tp_loop(unsigned char *buf, con
         return NULL;
     }
 
-    struct callback_ctx data = {.buf = buf, .pos = k_tp_pos_not_found};
+    struct callback_ctx data = {.buf = buf, .pos = k_tp_pos_not_found, .line_start = true};
 
     bpf_loop(nr_loops, tp_match, &data, 0);
 
     if (data.pos != k_tp_pos_not_found) {
         return (data.pos > (TRACE_BUF_SIZE - TRACE_PARENT_HEADER_LEN)) ? NULL : &buf[data.pos];
+    }
+
+    return NULL;
+}
+
+static __always_inline unsigned char *traceparent_find_legacy(unsigned char *buf,
+                                                              const u16 buf_len) {
+    if (buf_len < TRACE_PARENT_HEADER_LEN) {
+        return NULL;
+    }
+
+    // Limited best-effort search to stay within insns limit
+    const u16 nr_loops = traceparent_legacy_scan_loop_count(buf_len);
+    bool line_start = true;
+
+    for (u16 i = 0; i < k_tp_legacy_max_scan_loops; i++) {
+        if (i >= nr_loops) {
+            return NULL;
+        }
+
+        // buf is null terminated
+        if (*buf == '\0') {
+            return NULL;
+        }
+
+        if (is_eoh(buf)) {
+            return NULL;
+        }
+
+        if (line_start && is_traceparent(buf)) {
+            return buf;
+        }
+
+        line_start = *buf == '\n';
+        ++buf;
     }
 
     return NULL;
@@ -138,36 +280,5 @@ static __always_inline unsigned char *bpf_strstr_tp_loop__legacy(unsigned char *
         return NULL;
     }
 
-    if (buf_len < TRACE_PARENT_HEADER_LEN) {
-        return NULL;
-    }
-
-    // Limited best-effort search to stay within insns limit
-    const u16 k_besteffort_max_loops = 350;
-
-    for (u16 i = 0; i < k_besteffort_max_loops; i++) {
-        // buf is null terminated
-        if (*buf == '\0') {
-            return NULL;
-        }
-
-        if (is_traceparent(buf)) {
-            // here we validate if the actual traceparent value is complete,
-            // i.e. we haven't hit any incomplete traceparent - notice that
-            // everything here is constant (13 is the offset from
-            // 'Traceparent: ' and TRACE_PARENT_HEADER_LEN is also a constant
-            // - this allows the 5.10 kernel to prune this instead of tripping
-            for (u8 j = 13; j < TRACE_PARENT_HEADER_LEN; j++) {
-                if (buf[j] == '\0') {
-                    return NULL;
-                }
-            }
-
-            return buf;
-        }
-
-        ++buf;
-    }
-
-    return NULL;
+    return traceparent_find_legacy(buf, buf_len);
 }

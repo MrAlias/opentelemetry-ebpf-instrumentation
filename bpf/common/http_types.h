@@ -60,7 +60,7 @@ typedef struct call_protocol_args {
     int bytes_len;
     u32 connection_netns;
     u16 orig_dport;
-    u16 _pad2;
+    u16 traceparent_pos;
     u32 flags;
     u64 connection_netns_cookie;
     u64 ssl_ptr;

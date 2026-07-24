@@ -121,29 +121,31 @@ int obi_handle_buf_with_args(void *ctx) {
                 // scan for the incoming 'Traceparent' header. If they are not reassembled
                 // we'll see something like this:
                 // [before the injected header],[70 bytes for 'Traceparent...'],[the rest].
-                if (reading && is_traceparent(args->small_buf)) {
+                if (reading && traceparent_header_fits(args->bytes_len) &&
+                    is_traceparent(args->small_buf)) {
                     unsigned char *buf = (unsigned char *)tp_char_buf_mem();
-                    if (buf) {
-                        bpf_probe_read(buf, TP_SIZE, (unsigned char *)args->u_buf);
-                        bpf_dbg_printk("Found traceparent continuation");
-                        unsigned char *t_id = extract_trace_id(buf);
-                        unsigned char *s_id = extract_span_id(buf);
-                        unsigned char *f_id = extract_flags(buf);
+                    if (buf && bpf_probe_read(buf, TP_SIZE, (unsigned char *)args->u_buf) == 0) {
+                        if (is_valid_traceparent(buf)) {
+                            bpf_dbg_printk("Found traceparent continuation");
+                            unsigned char *t_id = extract_trace_id(buf);
+                            unsigned char *s_id = extract_span_id(buf);
+                            unsigned char *f_id = extract_flags(buf);
 
-                        decode_hex(info->tp.trace_id, t_id, TRACE_ID_CHAR_LEN);
-                        decode_hex((unsigned char *)&info->tp.flags, f_id, FLAGS_CHAR_LEN);
-                        decode_hex(info->tp.parent_id, s_id, SPAN_ID_CHAR_LEN);
+                            decode_hex(info->tp.trace_id, t_id, TRACE_ID_CHAR_LEN);
+                            decode_hex((unsigned char *)&info->tp.flags, f_id, FLAGS_CHAR_LEN);
+                            decode_hex(info->tp.parent_id, s_id, SPAN_ID_CHAR_LEN);
 
-                        trace_key_t t_key = {0};
-                        trace_key_from_pid_tid(&t_key);
+                            trace_key_t t_key = {0};
+                            trace_key_from_pid_tid(&t_key);
 
-                        tp_info_pid_t *existing = bpf_map_lookup_elem(&server_traces, &t_key);
-                        if (existing) {
-                            existing->tp = info->tp;
-                            set_trace_info_for_connection(
-                                &args->pid_conn.conn, TRACE_TYPE_SERVER, existing);
-                        } else {
-                            bpf_dbg_printk("Didn't find existing trace, this might be a bug!");
+                            tp_info_pid_t *existing = bpf_map_lookup_elem(&server_traces, &t_key);
+                            if (existing) {
+                                existing->tp = info->tp;
+                                set_trace_info_for_connection(
+                                    &args->pid_conn.conn, TRACE_TYPE_SERVER, existing);
+                            } else {
+                                bpf_dbg_printk("Didn't find existing trace, this might be a bug!");
+                            }
                         }
                     }
                 }

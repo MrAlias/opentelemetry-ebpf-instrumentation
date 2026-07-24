@@ -522,6 +522,25 @@ static __noinline int publish_http_trace(call_protocol_args_t *args,
     return 0;
 }
 
+static __always_inline int __obi_complete_protocol_http_tp(struct pt_regs *ctx,
+                                                           call_protocol_args_t *args,
+                                                           http_info_t *info,
+                                                           http_connection_metadata_t *meta,
+                                                           u8 ssl_prewrite,
+                                                           u8 ssl_prewrite_published) {
+    if (ssl_prewrite) {
+        if (!ssl_prewrite_published) {
+            cleanup_http_info(&args->pid_conn);
+        }
+        return 0;
+    }
+    if (args->use_bpf_loop) {
+        return __obi_continue2_protocol_http(ctx, args, info, meta);
+    }
+    bpf_tail_call_static(ctx, &jump_table, k_tail_continue2_protocol_http);
+    return 0;
+}
+
 static __always_inline int
 __obi_continue_protocol_http_tp(struct pt_regs *ctx,
                                 call_protocol_args_t *args,
@@ -529,10 +548,9 @@ __obi_continue_protocol_http_tp(struct pt_regs *ctx,
                                 http_connection_metadata_t *meta,
                                 u8 ssl_prewrite,
                                 unsigned char *(*tp_loop_fn)(unsigned char *, const u16)) {
-    u8 ssl_prewrite_published = 0;
     tp_info_pid_t *tp_p = (tp_info_pid_t *)tp_info_mem();
     if (!tp_p) {
-        goto done;
+        return __obi_complete_protocol_http_tp(ctx, args, info, meta, ssl_prewrite, 0);
     }
 
     if (g_bpf_traceparent_enabled && !args->skip_tp_parsing) {
@@ -545,51 +563,38 @@ __obi_continue_protocol_http_tp(struct pt_regs *ctx,
                 tp_p->valid = 1;
                 tp_p->pid = args->pid_conn.pid;
                 tp_p->req_type = meta->type;
-                ssl_prewrite_published = publish_http_trace(args, meta, tp_p, ssl_prewrite);
+                const u8 ssl_prewrite_published =
+                    publish_http_trace(args, meta, tp_p, ssl_prewrite);
+                return __obi_complete_protocol_http_tp(
+                    ctx, args, info, meta, ssl_prewrite, ssl_prewrite_published);
             }
-            goto done;
+            return __obi_complete_protocol_http_tp(ctx, args, info, meta, ssl_prewrite, 0);
         }
 
         unsigned char *buf = (unsigned char *)tp_char_buf_mem();
-        if (buf) {
-            u16 buf_len = args->bytes_len;
-            bpf_clamp_umax(buf_len, TRACE_BUF_SIZE - 1);
+        if (!buf) {
+            return __obi_complete_protocol_http_tp(ctx, args, info, meta, ssl_prewrite, 0);
+        }
 
-            bpf_probe_read(buf, buf_len, (void *)args->u_buf);
-            // null terminate to make proper string
-            buf[buf_len] = '\0';
+        u16 buf_len = args->bytes_len;
+        bpf_clamp_umax(buf_len, TRACE_BUF_SIZE - 1);
 
-            unsigned char *res = tp_loop_fn(buf, buf_len);
-            if (res) {
-                bpf_dbg_printk("Found traceparent in headers");
-                unsigned char *t_id = extract_trace_id(res);
-                unsigned char *s_id = extract_span_id(res);
-                unsigned char *f_id = extract_flags(res);
-                const bool is_client = meta && meta->type == EVENT_HTTP_CLIENT;
-                unsigned char *previous_trace_id = NULL;
+        bpf_probe_read(buf, buf_len, (void *)args->u_buf);
+        // null terminate to make proper string
+        buf[buf_len] = '\0';
 
-                if (is_client && valid_trace(tp_p->tp.trace_id)) {
-                    previous_trace_id = (unsigned char *)http_previous_trace_id_mem();
-                    if (previous_trace_id) {
-                        __builtin_memcpy(previous_trace_id, tp_p->tp.trace_id, TRACE_ID_SIZE_BYTES);
-                    }
-                }
-
-                decode_hex(tp_p->tp.trace_id, t_id, TRACE_ID_CHAR_LEN);
-                decode_hex((unsigned char *)&tp_p->tp.flags, f_id, FLAGS_CHAR_LEN);
-                if (meta && meta->type != EVENT_HTTP_CLIENT) {
-                    decode_hex(tp_p->tp.parent_id, s_id, SPAN_ID_CHAR_LEN);
-                } else if (previous_trace_id &&
-                           bpf_memcmp(previous_trace_id, tp_p->tp.trace_id, TRACE_ID_SIZE_BYTES) !=
-                               0) {
-                    __builtin_memset(tp_p->tp.parent_id, 0, sizeof(tp_p->tp.parent_id));
-                }
-
-            } else {
-                bpf_dbg_printk("No additional traceparent in headers, using what was made before");
+        args->traceparent_pos = k_tp_pos_unset;
+        unsigned char *res = tp_loop_fn(buf, buf_len);
+        if (res) {
+            const u64 traceparent_pos = res - buf;
+            const u16 scan_loops = args->use_bpf_loop ? (u16)traceparent_scan_loop_count(buf_len)
+                                                      : traceparent_legacy_scan_loop_count(buf_len);
+            if (traceparent_pos < scan_loops) {
+                args->traceparent_pos = (u16)traceparent_pos;
+                bpf_tail_call_static(ctx, &jump_table, k_tail_continue_protocol_http_tp_validate);
             }
         } else {
-            goto done;
+            bpf_dbg_printk("No additional traceparent in headers, using what was made before");
         }
     }
 
@@ -598,21 +603,76 @@ __obi_continue_protocol_http_tp(struct pt_regs *ctx,
     // sock_msg program has already punched a hole in the HTTP headers and has made
     // the HTTP header invalid. We need to add more smarts there or pull the
     // sock msg information here and mark it so that we don't override the span_id.
-    ssl_prewrite_published = publish_http_trace(args, meta, tp_p, ssl_prewrite);
+    const u8 ssl_prewrite_published = publish_http_trace(args, meta, tp_p, ssl_prewrite);
+    return __obi_complete_protocol_http_tp(
+        ctx, args, info, meta, ssl_prewrite, ssl_prewrite_published);
+}
 
-done:
-    if (ssl_prewrite) {
-        if (!ssl_prewrite_published) {
-            cleanup_http_info(&args->pid_conn);
+// k_tail_continue_protocol_http_tp_validate
+SEC("kprobe/http")
+int obi_continue_protocol_http_tp_validate(struct pt_regs *ctx) {
+    call_protocol_args_t *args = protocol_args();
+    if (!args) {
+        return 0;
+    }
+
+    const u8 ssl_prewrite = args->flags & k_call_protocol_flag_ssl_prewrite;
+    http_info_t *info = bpf_map_lookup_elem(&ongoing_http, &args->pid_conn);
+    if (!info && !ssl_prewrite) {
+        return 0;
+    }
+
+    http_connection_metadata_t *meta =
+        connection_meta_by_direction(args->direction, PACKET_TYPE_REQUEST);
+    tp_info_pid_t *tp_p = (tp_info_pid_t *)tp_info_mem();
+    if (!tp_p) {
+        return __obi_complete_protocol_http_tp(ctx, args, info, meta, ssl_prewrite, 0);
+    }
+
+    unsigned char *buf = (unsigned char *)tp_char_buf_mem();
+    if (!buf) {
+        return __obi_complete_protocol_http_tp(ctx, args, info, meta, ssl_prewrite, 0);
+    }
+
+    u16 buf_len = args->bytes_len;
+    bpf_clamp_umax(buf_len, TRACE_BUF_SIZE - 1);
+    const u16 scan_loops = args->use_bpf_loop ? (u16)traceparent_scan_loop_count(buf_len)
+                                              : traceparent_legacy_scan_loop_count(buf_len);
+    u16 traceparent_pos = args->traceparent_pos;
+    if (traceparent_pos != k_tp_pos_unset && traceparent_pos < scan_loops) {
+        bpf_clamp_umax(traceparent_pos, k_tp_max_scan_loops - 1);
+        unsigned char *res = &buf[traceparent_pos];
+        if (is_valid_traceparent(res)) {
+            bpf_dbg_printk("Found traceparent in headers");
+            unsigned char *t_id = extract_trace_id(res);
+            unsigned char *s_id = extract_span_id(res);
+            unsigned char *f_id = extract_flags(res);
+            const bool is_client = meta && meta->type == EVENT_HTTP_CLIENT;
+            unsigned char *previous_trace_id = NULL;
+
+            if (is_client && valid_trace(tp_p->tp.trace_id)) {
+                previous_trace_id = (unsigned char *)http_previous_trace_id_mem();
+                if (previous_trace_id) {
+                    __builtin_memcpy(previous_trace_id, tp_p->tp.trace_id, TRACE_ID_SIZE_BYTES);
+                }
+            }
+
+            decode_hex(tp_p->tp.trace_id, t_id, TRACE_ID_CHAR_LEN);
+            decode_hex((unsigned char *)&tp_p->tp.flags, f_id, FLAGS_CHAR_LEN);
+            if (meta && meta->type != EVENT_HTTP_CLIENT) {
+                decode_hex(tp_p->tp.parent_id, s_id, SPAN_ID_CHAR_LEN);
+            } else if (previous_trace_id &&
+                       bpf_memcmp(previous_trace_id, tp_p->tp.trace_id, TRACE_ID_SIZE_BYTES) != 0) {
+                __builtin_memset(tp_p->tp.parent_id, 0, sizeof(tp_p->tp.parent_id));
+            }
+        } else {
+            bpf_dbg_printk("Ignoring malformed traceparent header");
         }
-        return 0;
     }
-    if (tp_loop_fn == bpf_strstr_tp_loop) {
-        return __obi_continue2_protocol_http(ctx, args, info, meta);
-    } else {
-        bpf_tail_call(ctx, &jump_table, k_tail_continue2_protocol_http);
-        return 0;
-    }
+
+    const u8 ssl_prewrite_published = publish_http_trace(args, meta, tp_p, ssl_prewrite);
+    return __obi_complete_protocol_http_tp(
+        ctx, args, info, meta, ssl_prewrite, ssl_prewrite_published);
 }
 
 // k_tail_continue_protocol_http_tp

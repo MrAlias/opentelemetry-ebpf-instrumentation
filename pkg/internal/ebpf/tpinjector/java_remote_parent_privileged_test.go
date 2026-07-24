@@ -762,8 +762,11 @@ func assertConcurrentTakeIsOneShot(
 ) {
 	t.Helper()
 
-	const generation = uint64(45)
-	const nonce = uint64(0x98a9bacbdcedfe0f)
+	const (
+		concurrentTakeWorkers = 2
+		generation            = uint64(45)
+		nonce                 = uint64(0x98a9bacbdcedfe0f)
+	)
 	stageRemoteParent(t,
 		maps,
 		process,
@@ -782,10 +785,10 @@ func assertConcurrentTakeIsOneShot(
 		length int
 		err    error
 	}
-	ready := make(chan uint32, 2)
+	ready := make(chan uint32, concurrentTakeWorkers)
 	start := make(chan struct{})
-	results := make(chan takeResult, 2)
-	for range 2 {
+	results := make(chan takeResult, concurrentTakeWorkers)
+	for range concurrentTakeWorkers {
 		go func() {
 			runtime.LockOSThread()
 			defer runtime.UnlockOSThread()
@@ -801,14 +804,26 @@ func assertConcurrentTakeIsOneShot(
 	}
 
 	observed := monotonicNowNS(t)
-	workerKeys := make([]BpfJavaRemoteParentPidKeyT, 0, 2)
-	for range 2 {
+	workerKeys := make([]BpfJavaRemoteParentPidKeyT, 0, concurrentTakeWorkers)
+	for range concurrentTakeWorkers {
 		worker := BpfJavaRemoteParentPidKeyT{
 			Tid: <-ready,
 			Pid: process.Pid,
 			Ns:  process.Ns,
 		}
 		workerKeys = append(workerKeys, worker)
+	}
+
+	stateKey := BpfJavaRemoteParentJavaRemoteParentKeyT{
+		Owner:      owner,
+		Generation: generation,
+	}
+	var state BpfJavaRemoteParentJavaRemoteParentStateT
+	require.NoError(t, maps.JavaRemoteParentState.Lookup(stateKey, &state))
+	state.Aliases = uint32(len(workerKeys))
+	require.NoError(t, maps.JavaRemoteParentState.Update(stateKey, state, ebpf.UpdateExist))
+
+	for _, worker := range workerKeys {
 		require.NoError(t, maps.JavaRemoteParentTasks.Update(worker,
 			BpfJavaRemoteParentJavaRemoteParentTaskT{
 				Owner:              owner,
@@ -819,7 +834,7 @@ func assertConcurrentTakeIsOneShot(
 	close(start)
 
 	valid := 0
-	for range 2 {
+	for range concurrentTakeWorkers {
 		result := <-results
 		require.NoError(t, result.err)
 		require.Equal(t, int(javabridge.RecordSize), result.length)

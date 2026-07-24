@@ -299,7 +299,7 @@ test_benchmark_controls_are_bounded() {
 
 test_all_suite_includes_every_scenario() {
   local -r actual="$TEST_TMP_DIR/all-scenarios.txt"
-  local -r expected=$'basic\nsecurity\nkeepalive\npipelining\nconcurrency\nconnection-churn\nfd-port-reuse\nslow-body\ntls-boundary\ntimeout-retry\npressure\nhandoff\nvirtual-thread\nnetty\ndispatch\nw3c\nw3c-match\nobi-flags\nfail-open\nw3c-only\nrestart\nrestart-fault\ndisabled\nw3c-only\nw3c-only\nuninstrumented'
+  local -r expected=$'basic\nsecurity\nkeepalive\npipelining\nconcurrency\nconnection-churn\nfd-port-reuse\nslow-body\ntls-boundary\ntimeout-retry\npressure\nhandoff\nvirtual-thread\nnetty\ndispatch\nw3c\nw3c-match\nobi-flags\nfail-open\nw3c-only\nrestart\nrestart-fault\nhelper-attach-failure\ndisabled\nw3c-only\nw3c-only\nuninstrumented'
 
   (
     SCENARIO=all
@@ -326,6 +326,9 @@ test_all_suite_includes_every_scenario() {
     }
     run_restart_during_traffic_control() {
       run_scenario restart-fault
+    }
+    run_helper_attach_failure_control() {
+      run_scenario helper-attach-failure
     }
     run_extension_controls() {
       run_scenario w3c-only
@@ -373,6 +376,9 @@ test_unix_all_suite_includes_fault_control() {
     run_restart_during_traffic_control() {
       run_scenario restart-fault
     }
+    run_helper_attach_failure_control() {
+      run_scenario helper-attach-failure
+    }
     run_extension_controls() {
       run_scenario w3c-only
       run_scenario w3c-only
@@ -384,10 +390,52 @@ test_unix_all_suite_includes_fault_control() {
   )
 
   [[ "$(<"$actual")" == *$'basic\nsecurity\nkeepalive'* && \
-    "$(<"$actual")" == *$'obi-flags\nw3c-fault\nfail-open'* ]] || {
+    "$(<"$actual")" == *$'obi-flags\nw3c-fault\nfail-open'* &&
+    "$(<"$actual")" == *$'restart\nrestart-fault\nhelper-attach-failure'* ]] || {
     printf 'Unix all suite omitted the security or bounded W3C fault control\n' >&2
     return 1
   }
+}
+
+test_helper_attach_failure_dispatch_and_seed_are_exact() {
+  local -r actual="$TEST_TMP_DIR/helper-attach-dispatch.txt"
+
+  (
+    SCENARIO=helper-attach-failure
+    run_helper_attach_failure_control() {
+      printf 'helper-attach-failure\n' >"$actual"
+    }
+    run_scenario() {
+      printf 'unexpected:%s\n' "$1" >"$actual"
+      return 1
+    }
+    execute_requested_scenarios
+  )
+  [[ "$(<"$actual")" == "helper-attach-failure" ]] || {
+    printf 'standalone helper attach failure scenario used the wrong dispatch\n' >&2
+    return 1
+  }
+  [[ "$(next_scenario_seed 41)" == "42" &&
+    "$(next_scenario_seed "$MAX_SHELL_INTEGER")" == "0" ]] || {
+    printf 'helper attach failure alternate seed is not bounded and distinct\n' >&2
+    return 1
+  }
+  if next_scenario_seed invalid >/dev/null 2>&1; then
+    printf 'helper attach failure seed accepted malformed input\n' >&2
+    return 1
+  fi
+  (
+    parse_args --transport getsockopt --scenario helper-attach-failure
+  ) || {
+    printf 'helper attach failure scenario rejected an enabled transport\n' >&2
+    return 1
+  }
+  if (
+    parse_args --transport disabled --scenario helper-attach-failure
+  ) >/dev/null 2>&1; then
+    printf 'helper attach failure scenario accepted the disabled transport\n' >&2
+    return 1
+  fi
 }
 
 test_w3c_fault_requires_forced_unix() {
@@ -687,6 +735,7 @@ EOF
   cat >"$after" <<'EOF'
 obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 5
 obi_bpf_map_entries_total{map_id="1",map_name="java_remote_parent_state",map_type="hash"} 1
+obi_instrumentation_errors_total{error_type="attaching_java_agent",process_name="java"} 1
 EOF
   RESULT_DIR="$TEST_TMP_DIR"
   write_metrics_delta "$before" "$after" "$delta"
@@ -697,6 +746,215 @@ EOF
   }
   [[ "$(<"$delta")" == *'map_name="java_remote_parent_state"'*'delta=-6'* ]] || {
     printf 'metrics delta omitted the map occupancy change\n' >&2
+    return 1
+  }
+  [[ "$(<"$delta")" == *'error_type="attaching_java_agent"'*'delta=1'* ]] || {
+    printf 'metrics delta omitted the Java attach-error counter change\n' >&2
+    return 1
+  }
+}
+
+test_java_attach_error_metric_is_exact_unique() {
+  local -r metrics="$TEST_TMP_DIR/java-attach-errors.prom"
+
+  cat >"$metrics" <<'EOF'
+obi_instrumentation_errors_total{error_type="other",process_name="java"} 9
+obi_instrumentation_errors_total{error_type="attaching_java_agent",process_name="python"} 8
+obi_instrumentation_errors_total_extra{error_type="attaching_java_agent",process_name="java"} 7
+EOF
+  [[ "$(java_attach_error_total "$metrics")" == "absent" ]] || {
+    printf 'attach-error parser did not distinguish an absent exact series\n' >&2
+    return 1
+  }
+
+  printf '%s\n' \
+    'obi_instrumentation_errors_total{error_type="attaching_java_agent",process_name="java"} 3' \
+    >>"$metrics"
+  [[ "$(java_attach_error_total "$metrics")" == "3" ]] || {
+    printf 'attach-error parser rejected the exact series\n' >&2
+    return 1
+  }
+
+  printf '%s\n' \
+    'obi_instrumentation_errors_total{process_name="java",error_type="attaching_java_agent"} 3' \
+    >>"$metrics"
+  if java_attach_error_total "$metrics" >/dev/null 2>&1; then
+    printf 'attach-error parser accepted duplicate target series\n' >&2
+    return 1
+  fi
+
+  for invalid in \
+    'obi_instrumentation_errors_total{error_type="attaching_java_agent",process_name="java",extra="x"} 1' \
+    'obi_instrumentation_errors_total{error_type="attaching_java_agent",process_name="java"} -1' \
+    'obi_instrumentation_errors_total{error_type="attaching_java_agent",process_name="java"} 1.5' \
+    'obi_instrumentation_errors_total{error_type="attaching_java_agent",process_name="java"} NaN' \
+    'obi_instrumentation_errors_total{error_type="attaching_java_agent",process_name="java"} 9223372036854775808' \
+    'obi_instrumentation_errors_total{error_type="attaching_java_agent",process_name="java"} 1 extra'; do
+    printf '%s\n' "$invalid" >"$metrics"
+    if java_attach_error_total "$metrics" >/dev/null 2>&1; then
+      printf 'attach-error parser accepted malformed target: %s\n' "$invalid" >&2
+      return 1
+    fi
+  done
+}
+
+test_java_attach_error_wait_requires_exact_stability() {
+  (
+    local -i fetches=0
+    RESULT_DIR="$TEST_TMP_DIR/java-attach-wait-success"
+    READINESS_TIMEOUT_SECONDS=5
+    mkdir -p -- "$RESULT_DIR"
+    fetch_obi_metrics() {
+      ((fetches += 1))
+      if ((fetches == 1)); then
+        printf '# absent\n' >"$1"
+      else
+        printf '%s\n' \
+          'obi_instrumentation_errors_total{error_type="attaching_java_agent",process_name="java"} 1' \
+          >"$1"
+      fi
+    }
+    sleep() {
+      :
+    }
+
+    wait_for_java_attach_error_total \
+      1 absent "$RESULT_DIR/stable.prom" "test attach failure" 3
+    [[ "$fetches" == "4" && "$(java_attach_error_total "$RESULT_DIR/stable.prom")" == "1" ]]
+    [[ "$(wc -l <"$RESULT_DIR/stable-samples.log")" == "4" ]]
+  ) || {
+    printf 'attach-error wait did not require absent-to-one stability\n' >&2
+    return 1
+  }
+
+  (
+    local -i fetches=0
+    RESULT_DIR="$TEST_TMP_DIR/java-attach-wait-gap"
+    READINESS_TIMEOUT_SECONDS=5
+    mkdir -p -- "$RESULT_DIR"
+    fetch_obi_metrics() {
+      ((fetches += 1))
+      if ((fetches == 2)); then
+        return 1
+      fi
+      printf '%s\n' \
+        'obi_instrumentation_errors_total{error_type="attaching_java_agent",process_name="java"} 1' \
+        >"$1"
+    }
+    sleep() {
+      :
+    }
+
+    wait_for_java_attach_error_total \
+      1 1 "$RESULT_DIR/stable.prom" "gapped attach metric" 2
+    [[ "$fetches" == "4" ]]
+  ) || {
+    printf 'attach-error wait counted non-consecutive successful scrapes\n' >&2
+    return 1
+  }
+
+  run_failure_case() (
+    local -r first="$1"
+    local -r second="$2"
+    local -r baseline="$3"
+    local -r expected="$4"
+    local -i fetches=0
+    RESULT_DIR="$TEST_TMP_DIR/java-attach-wait-failure-$first-$second"
+    READINESS_TIMEOUT_SECONDS=5
+    mkdir -p -- "$RESULT_DIR"
+    fetch_obi_metrics() {
+      local state=""
+
+      ((fetches += 1))
+      if ((fetches == 1)); then
+        state="$first"
+      else
+        state="$second"
+      fi
+      if [[ "$state" == "absent" ]]; then
+        printf '# absent\n' >"$1"
+      elif [[ "$state" == "duplicate" ]]; then
+        printf '%s\n' \
+          'obi_instrumentation_errors_total{error_type="attaching_java_agent",process_name="java"} 1' \
+          'obi_instrumentation_errors_total{process_name="java",error_type="attaching_java_agent"} 1' \
+          >"$1"
+      else
+        printf 'obi_instrumentation_errors_total{error_type="attaching_java_agent",process_name="java"} %s\n' \
+          "$state" >"$1"
+      fi
+    }
+    sleep() {
+      :
+    }
+    ! wait_for_java_attach_error_total \
+      "$expected" "$baseline" "$RESULT_DIR/rejected.prom" "rejected attach metric" 2
+  )
+
+  run_failure_case 1 absent absent 1 || {
+    printf 'attach-error wait accepted disappearance after observation\n' >&2
+    return 1
+  }
+  run_failure_case 2 2 absent 1 || {
+    printf 'attach-error wait accepted an overshoot\n' >&2
+    return 1
+  }
+  run_failure_case 2 1 1 2 || {
+    printf 'attach-error wait accepted a reset after observation\n' >&2
+    return 1
+  }
+  run_failure_case duplicate duplicate absent 1 || {
+    printf 'attach-error wait accepted duplicate target series\n' >&2
+    return 1
+  }
+}
+
+test_log_pid_count_requires_an_exact_numeric_token() {
+  local -r log="$TEST_TMP_DIR/exact-pid.log"
+  local -r message="unable to attach java agent"
+
+  printf '%s\n' \
+    "level=WARN msg=\"$message\" pid=42420" \
+    "level=WARN msg=\"$message\" pid=4242 component=test" \
+    >"$log"
+  assert_log_message_for_pid_count "$log" "$message" 4242 1 || {
+    printf 'log PID matcher did not accept the exact numeric token\n' >&2
+    return 1
+  }
+  if assert_log_message_for_pid_count "$log" "$message" 424 1 >/dev/null 2>&1; then
+    printf 'log PID matcher accepted a numeric prefix\n' >&2
+    return 1
+  fi
+  if assert_log_message_for_pid_count "$log" "$message" invalid 0 >/dev/null 2>&1; then
+    printf 'log PID matcher accepted a malformed PID\n' >&2
+    return 1
+  fi
+}
+
+test_helper_unavailable_metric_boundary_preserves_counters() {
+  (
+    local -r observed="$TEST_TMP_DIR/helper-boundary-observed"
+    RESULT_DIR="$TEST_TMP_DIR/helper-boundary"
+    BRIDGE_RUNNING=true
+    mkdir -p -- "$RESULT_DIR"
+    fetch_obi_metrics() {
+      printf '%s\n' \
+        'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 5' \
+        'obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} 7' \
+        >"$1"
+    }
+    curl() {
+      :
+    }
+    wait_for_bridge_metrics_quiescent() {
+      printf '%s %s\n' "$1" "$2" >>"$observed"
+    }
+
+    flush_bridge_metric_boundary normal
+    flush_bridge_metric_boundary helper 0 0
+    [[ "$(<"$observed")" == $'6 8\n5 7' ]]
+    ! flush_bridge_metric_boundary invalid -1 1
+  ) || {
+    printf 'helper-unavailable metric boundary did not preserve success and stage\n' >&2
     return 1
   }
 }
@@ -2042,6 +2300,7 @@ EOF
 
 test_bridge_metric_delta_requires_exact_one_shot_results() {
   local -r delta="$TEST_TMP_DIR/w3c-metrics.delta"
+  local -r helper_delta="$TEST_TMP_DIR/helper-attach-metrics.delta"
 
   cat >"$delta" <<'EOF'
 obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=3 after=5 delta=2
@@ -2089,6 +2348,32 @@ EOF
     >>"$delta"
   if assert_bridge_metric_delta "$delta" getsockopt 2 0 >/dev/null 2>&1; then
     printf 'bridge metric delta accepted candidate overload\n' >&2
+    return 1
+  fi
+
+  cat >"$helper_delta" <<'EOF'
+obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=3 after=4 delta=1
+obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} before=3 after=4 delta=1
+obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=3 after=3 delta=0
+obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} before=3 after=3 delta=0
+obi_java_remote_parent_operations_total{operation="discard",status="valid",transport="getsockopt"} before=1 after=1 delta=0
+EOF
+  assert_bridge_metric_delta "$helper_delta" getsockopt 0 0 0 1 0 || {
+    printf 'bridge metric delta rejected upstream injection without a Java helper\n' >&2
+    return 1
+  }
+  sed -i 's/operation="stage",status="valid",transport="tcp"} before=3 after=3 delta=0/operation="stage",status="valid",transport="tcp"} before=3 after=4 delta=1/' \
+    "$helper_delta"
+  if assert_bridge_metric_delta "$helper_delta" getsockopt 0 0 0 1 0 >/dev/null 2>&1; then
+    printf 'bridge metric delta accepted helper-unavailable staging\n' >&2
+    return 1
+  fi
+  sed -i 's/operation="stage",status="valid",transport="tcp"} before=3 after=4 delta=1/operation="stage",status="valid",transport="tcp"} before=3 after=3 delta=0/' \
+    "$helper_delta"
+  sed -i 's/operation="take",status="valid",transport="getsockopt"} before=3 after=3 delta=0/operation="take",status="valid",transport="getsockopt"} before=3 after=4 delta=1/' \
+    "$helper_delta"
+  if assert_bridge_metric_delta "$helper_delta" getsockopt 0 0 0 1 0 >/dev/null 2>&1; then
+    printf 'bridge metric delta accepted a Java take without a helper\n' >&2
     return 1
   fi
 }
@@ -2599,6 +2884,69 @@ test_fault_scenario_does_not_probe_java_diagnostics() {
 
   if [[ -e "$diagnostics_calls" ]]; then
     printf 'scenario consumed a diagnostics probe while probes were disabled\n' >&2
+    return 1
+  fi
+}
+
+test_helper_unavailable_scenario_injects_without_staging_or_retrieval() {
+  local -r calls="$TEST_TMP_DIR/helper-unavailable-scenario.calls"
+
+  (
+    RESULT_DIR="$TEST_TMP_DIR/helper-unavailable-scenario"
+    BRIDGE_RUNNING=true
+    COMPOSE=(test-compose)
+    REPEAT_COUNT=1
+    REQUEST_COUNT=99
+    SCENARIO_SEED=7
+    SCENARIO_VARIANT=""
+    SELECTED_TRANSPORT=getsockopt
+    TLS_PROTOCOL=TLSv1.3
+    mkdir -p -- "$RESULT_DIR"
+    : >"$calls"
+    flush_bridge_metric_boundary() {
+      printf 'boundary:%s:%s:%s\n' "$1" "${2:-1}" "${3:-1}" >>"$calls"
+    }
+    capture_java_diagnostics() {
+      printf 'unexpected-diagnostics:%s\n' "$1" >>"$calls"
+      return 1
+    }
+    capture_phase_evidence() {
+      printf 'evidence:%s\n' "$1" >>"$calls"
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+      printf '%s\n' \
+        'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 4' \
+        'obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} 7' \
+        >"$RESULT_DIR/phases/$1/obi-metrics.prom"
+    }
+    run_bounded() {
+      printf 'scenario:%s\n' "$*" >>"$calls"
+      printf '{"status":"passed"}\n'
+    }
+    wait_for_bridge_metrics_quiescent() {
+      printf 'wait:%s:%s\n' "$1" "$2" >>"$calls"
+    }
+    write_metrics_delta() {
+      : >"$3"
+    }
+    assert_bridge_metric_delta() {
+      printf 'assert:%s:%s:%s:%s:%s:%s\n' \
+        "$2" "$3" "$4" "$5" "$6" "$7" >>"$calls"
+    }
+
+    run_scenario helper-attach-failure false full none helper-unavailable >/dev/null
+  ) || {
+    printf 'helper-unavailable scenario orchestration failed\n' >&2
+    return 1
+  }
+
+  grep -Fqx 'boundary:helper-attach-failure:0:0' "$calls"
+  grep -Fq 'scenario:' "$calls"
+  grep -Fq -- '--scenario helper-attach-failure' "$calls"
+  grep -Fq -- '--requests 1' "$calls"
+  grep -Fqx 'wait:4:7' "$calls"
+  grep -Fqx 'assert:getsockopt:0:0:0:1:0' "$calls"
+  if grep -Fq 'unexpected-diagnostics' "$calls"; then
+    printf 'helper-unavailable scenario attempted Java helper diagnostics\n' >&2
     return 1
   fi
 }
@@ -3631,6 +3979,85 @@ test_extension_disabled_runtime_requires_explicit_false() {
   )
 }
 
+test_helper_attach_runtime_requires_exact_dynamic_disable() {
+  local -r result_dir="$TEST_TMP_DIR/helper-attach-runtime"
+  local runtime_environment=""
+
+  mkdir -p -- "$result_dir"
+  (
+    local -i duplicate_suppression_calls=0
+
+    RESULT_DIR="$result_dir"
+    COMPOSE=(test-compose)
+    run_bounded() {
+      case "$*" in
+        *"test-compose ps --quiet java-backend")
+          printf 'java-container\n'
+          ;;
+        *"docker inspect --format "*" java-container")
+          printf '%s\n' "$runtime_environment"
+          ;;
+        *"test-compose ps --quiet obi")
+          printf 'obi-container\n'
+          ;;
+        *"docker inspect --format "*" obi-container")
+          printf 'true host\n'
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+    }
+    wait_for_java_duplicate_suppression() {
+      ((duplicate_suppression_calls += 1))
+      : >"$1"
+    }
+    log_error() {
+      return 0
+    }
+
+    runtime_environment=$'JAVA_TOOL_OPTIONS=-javaagent:/otel/official-javaagent.jar -XX:-EnableDynamicAgentLoading\nOTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar\nOTEL_OBI_REMOTE_PARENT_ENABLED=true'
+    assert_runtime_contract helper-attach-fault || {
+      printf 'helper attach contract rejected the exact dynamic-loading-disabled runtime\n' >&2
+      return 1
+    }
+    [[ "$duplicate_suppression_calls" == "0" ]] || {
+      printf 'helper attach fault contract required an injected-helper metric\n' >&2
+      return 1
+    }
+    grep -Fqx 'java_agent=official' \
+      "$result_dir/runtime-assertions-helper-attach-fault.txt"
+    grep -Fqx 'dynamic_agent_loading=disabled' \
+      "$result_dir/runtime-assertions-helper-attach-fault.txt"
+    grep -Fqx 'extension=enabled' \
+      "$result_dir/runtime-assertions-helper-attach-fault.txt"
+
+    runtime_environment=$'JAVA_TOOL_OPTIONS=-javaagent:/otel/official-javaagent.jar\nOTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar\nOTEL_OBI_REMOTE_PARENT_ENABLED=true'
+    SCENARIO=helper-attach-failure
+    assert_runtime_contract || {
+      printf 'helper attach scenario rejected its initial healthy runtime\n' >&2
+      return 1
+    }
+    [[ "$duplicate_suppression_calls" == "1" ]] || {
+      printf 'healthy helper attach contract skipped duplicate suppression\n' >&2
+      return 1
+    }
+
+    for runtime_environment in \
+      $'JAVA_TOOL_OPTIONS=-javaagent:/otel/official-javaagent.jar\nOTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar\nOTEL_OBI_REMOTE_PARENT_ENABLED=true' \
+      $'JAVA_TOOL_OPTIONS=-javaagent:/otel/official-javaagent.jar -XX:+EnableDynamicAgentLoading\nOTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar\nOTEL_OBI_REMOTE_PARENT_ENABLED=true' \
+      $'JAVA_TOOL_OPTIONS=-XX:-EnableDynamicAgentLoading -javaagent:/otel/official-javaagent.jar\nOTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar\nOTEL_OBI_REMOTE_PARENT_ENABLED=true' \
+      $'JAVA_TOOL_OPTIONS=-javaagent:/otel/official-javaagent.jar -XX:-EnableDynamicAgentLoading -Xmx256m\nOTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar\nOTEL_OBI_REMOTE_PARENT_ENABLED=true' \
+      $'JAVA_TOOL_OPTIONS=-javaagent:/otel/official-javaagent.jar -XX:-EnableDynamicAgentLoading\nOTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar\nOTEL_OBI_REMOTE_PARENT_ENABLED=false'; do
+      if assert_runtime_contract helper-attach-fault >/dev/null 2>&1; then
+        printf 'helper attach contract accepted a non-exact runtime: %s\n' \
+          "$runtime_environment" >&2
+        return 1
+      fi
+    done
+  )
+}
+
 test_instrumented_readiness_precedes_https_traffic() {
   local -r result_dir="$TEST_TMP_DIR/readiness-order"
   local -r observed="$result_dir/observed"
@@ -4211,10 +4638,10 @@ test_control_response_normalizes_connection_diagnostics() {
   local -r uninstrumented_normalized="$TEST_TMP_DIR/uninstrumented-control.normalized.json"
 
   printf '%s\n' \
-    '{"marker":"instrumentation-control","backend_connection_id":17,"backend_remote_port":41000,"backend_socket_fd":0}' \
+    '{"marker":"instrumentation-control","backend_connection_id":17,"backend_remote_port":41000,"backend_socket_fd":21,"tls_read_events":7,"tls_read_bytes":4096,"tls_protocol":"TLSv1.3","secure":true}' \
     >"$instrumented"
   printf '%s\n' \
-    '{"marker":"instrumentation-control","backend_connection_id":3,"backend_remote_port":42000,"backend_socket_fd":0}' \
+    '{"marker":"instrumentation-control","backend_connection_id":3,"backend_remote_port":42000,"backend_socket_fd":-1,"tls_read_events":-1,"tls_read_bytes":-1,"tls_protocol":"TLSv1.3","secure":true}' \
     >"$uninstrumented"
 
   normalize_control_response "$instrumented" "$instrumented_normalized"
@@ -4225,6 +4652,255 @@ test_control_response_normalizes_connection_diagnostics() {
   }
   grep -Fq '"backend_connection_id":0' "$instrumented_normalized"
   grep -Fq '"backend_remote_port":0' "$instrumented_normalized"
+  grep -Fq '"backend_socket_fd":0' "$instrumented_normalized"
+  grep -Fq '"tls_read_events":0' "$instrumented_normalized"
+  grep -Fq '"tls_read_bytes":0' "$instrumented_normalized"
+  grep -Fq '"tls_protocol":"TLSv1.3"' "$instrumented_normalized"
+}
+
+test_helper_attach_failure_control_restores_and_preserves_status() {
+  run_case() (
+    local -r mode="$1"
+    local -r expected_status="$2"
+    local -r result_dir="$TEST_TMP_DIR/helper-attach-control-$mode"
+    local -r observed="$result_dir/observed.log"
+    local -i fault_probe_calls=0
+    local status=0
+
+    RESULT_DIR="$result_dir"
+    CERT_DIR="$result_dir/certs"
+    COMPOSE=(test-compose)
+    BRIDGE_RUNNING=true
+    TRANSPORT=getsockopt
+    SELECTED_TRANSPORT=getsockopt
+    CONTEXT_PROPAGATION=tcp
+    SCENARIO_SEED=11
+    SCENARIO_VARIANT=""
+    TLS_PROTOCOL=TLSv1.3
+    JAVA_TOOL_OPTIONS_VALUE="-javaagent:/otel/official-javaagent.jar"
+    mkdir -p -- "$RESULT_DIR" "$CERT_DIR"
+    : >"$observed"
+
+    log_info() {
+      printf 'info:%s\n' "$*" >>"$observed"
+    }
+    log_warn() {
+      printf 'warn:%s\n' "$*" >>"$observed"
+      [[ "$mode" != "failure" ]] || return 17
+    }
+    log_error() {
+      printf 'error:%s\n' "$*" >>"$observed"
+      [[ "$mode" != "failure" ]] || return 18
+    }
+    run_disabled_control() {
+      printf 'disabled:%s:%s\n' "$SCENARIO_VARIANT" "$SCENARIO_SEED" >>"$observed"
+    }
+    recreate_instrumented_stack() {
+      printf 'recreate:%s:%s:%s\n' "$1" "$2" "$3" >>"$observed"
+      if [[ "$2" == "helper attach failure cleanup" && "$mode" == "failure" ]]; then
+        return 29
+      fi
+    }
+    capture_control_response() {
+      printf 'response:%s\n' "$1" >>"$observed"
+      printf '{"status":"ok"}\n' >"$RESULT_DIR/$1-response.json"
+      printf '{"status":"ok"}\n' >"$RESULT_DIR/$1-response.normalized.json"
+      printf '200\n' >"$RESULT_DIR/$1-response.status"
+    }
+    capture_service_runtime_identity() {
+      local -r service="$1"
+      local -r output="$2"
+      local container_id="$service-fixed"
+      local host_pid=4242
+      local started_at="2026-07-24T18:00:00Z"
+
+      if [[ "$service" == "java-backend" && "$output" == *"-recovery.txt" ]]; then
+        container_id="java-recovered"
+        host_pid=4343
+        started_at="2026-07-24T18:01:00Z"
+      elif [[ "$service" == "java-backend" ]]; then
+        container_id="java-failed"
+      fi
+      printf 'identity:%s:%s\n' "$service" "$(basename -- "$output")" >>"$observed"
+      printf 'container_id=%s\nhost_pid=%s\nstarted_at=%s\n' \
+        "$container_id" "$host_pid" "$started_at" >"$output"
+    }
+    fetch_obi_metrics() {
+      printf '# attach error absent\n' >"$1"
+      printf 'metrics-before\n' >>"$observed"
+    }
+    run_bounded() {
+      printf 'bounded:options=%s:%s\n' "$JAVA_TOOL_OPTIONS_VALUE" "$*" >>"$observed"
+    }
+    date() {
+      printf 'helper-attach-cursor\n'
+    }
+    wait_for_log() {
+      printf 'wait-log:%s:%s:%s\n' "$1" "$3" "${4:-}" >>"$observed"
+    }
+    wait_for_http() {
+      printf 'wait-http:%s\n' "$2" >>"$observed"
+    }
+    wait_for_java_attach_error_total() {
+      printf 'metric-wait:%s:%s:%s:%s\n' "$1" "$2" "$4" "${5:-}" >>"$observed"
+      printf '%s\n' \
+        "obi_instrumentation_errors_total{error_type=\"attaching_java_agent\",process_name=\"java\"} $1" \
+        >"$3"
+    }
+    write_metrics_delta() {
+      printf 'metric-delta\n' >>"$observed"
+      : >"$3"
+    }
+    assert_selected_transport() {
+      printf 'transport:%s\n' "${1:-}" >>"$observed"
+    }
+    wait_for_apache_instrumentation() {
+      printf 'apache:%s\n' "$1" >>"$observed"
+    }
+    run_scenario() {
+      printf 'scenario:%s:%s:%s:%s:%s:%s\n' \
+        "$1" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "$SCENARIO_VARIANT" \
+        >>"$observed"
+      if [[ "$SCENARIO_VARIANT" == "helper-unavailable" ]]; then
+        ((fault_probe_calls += 1))
+      fi
+      if [[ "$mode" == "failure" && "$fault_probe_calls" == "2" ]]; then
+        return 23
+      fi
+    }
+    capture_service_logs_since() {
+      printf 'logs:%s:%s\n' "$1" "$2" >>"$observed"
+      if [[ "$1" == "obi" ]]; then
+        printf '%s\n' \
+          'level=INFO msg="injecting OpenTelemetry eBPF instrumentation for Java process" pid=4242' \
+          "level=ERROR msg=\"couldn't attach OpenTelemetry eBPF Java Agent\" pid=4242" \
+          "level=WARN msg=\"unable to attach java agent to process, Java TLS telemetry will not work\" pid=4242" \
+          >"$3"
+      else
+        printf '%s\n' \
+          'OBI remote-parent compatibility distribution=otel,supported=true' \
+          'OBI remote-parent propagator enabled' \
+          'reason=bridge_lookup_missing' \
+          >"$3"
+      fi
+    }
+    curl() {
+      printf 'unavailable\n'
+    }
+    assert_runtime_contract() {
+      printf 'runtime:%s\n' "$1" >>"$observed"
+    }
+    capture_java_diagnostics() {
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+      printf 'diagnostics\n' >"$RESULT_DIR/phases/$1/java-diagnostics.txt"
+    }
+    assert_sanitized_java_diagnostics() {
+      printf 'diagnostics-assert:%s\n' "$1" >>"$observed"
+    }
+
+    set +e
+    (
+      set -Eeuo pipefail
+      run_helper_attach_failure_control
+    )
+    status=$?
+    set -e
+    [[ "$status" == "$expected_status" ]] || {
+      printf 'helper attach control mode=%s returned %d, wanted %d\n' \
+        "$mode" "$status" "$expected_status" >&2
+      return 1
+    }
+    awk '
+      /^runtime:helper-attach-fault$/ && !runtime { runtime = NR }
+      /^logs:obi:helper-attach-cursor$/ && !obi_log { obi_log = NR }
+      /^logs:java-backend:helper-attach-cursor$/ && !java_log { java_log = NR }
+      /^scenario:helper-attach-failure:/ && !scenario { scenario = NR }
+      END {
+        exit !(runtime && obi_log && java_log && scenario &&
+          runtime < scenario && obi_log < scenario && java_log < scenario)
+      }
+    ' "$observed" || {
+      printf 'helper attach control did not preserve fault evidence before traffic\n' >&2
+      return 1
+    }
+    [[ -s "$RESULT_DIR/helper-attach-failure-obi.log" &&
+      -s "$RESULT_DIR/helper-attach-failure-java.log" ]] || {
+      printf 'helper attach control did not retain the fault logs\n' >&2
+      return 1
+    }
+
+    if [[ "$mode" == "success" ]]; then
+      grep -Fqx 'disabled:helper-attach-bridge-disabled:12' "$observed"
+      grep -Fq \
+        "bounded:options=$HELPER_ATTACH_FAILURE_JAVA_TOOL_OPTIONS:30 test-compose config" \
+        "$observed"
+      grep -Fq \
+        "bounded:options=$HELPER_ATTACH_FAILURE_JAVA_TOOL_OPTIONS:180 test-compose up --detach --force-recreate java-backend apache-proxy" \
+        "$observed"
+      grep -Fqx \
+        'scenario:helper-attach-failure:false:full:none:helper-unavailable:helper-unavailable' \
+        "$observed"
+      grep -Fqx \
+        'scenario:w3c:false:full:none:helper-unavailable:helper-unavailable' \
+        "$observed"
+      [[ "$(grep -c ':helper-unavailable:helper-unavailable$' "$observed")" == "2" ]]
+      grep -Fqx \
+        'scenario:basic:::::helper-attach-recovery' \
+        "$observed"
+      grep -Fq \
+        'bounded:options=-javaagent:/otel/official-javaagent.jar:180 test-compose up --detach --force-recreate java-backend apache-proxy' \
+        "$observed"
+      grep -Fqx 'apache:helper-attach-recovery' "$observed"
+      if grep -Fq 'helper attach failure cleanup' "$observed"; then
+        printf 'successful helper attach control ran EXIT restoration\n' >&2
+        return 1
+      fi
+    else
+      [[ "$(grep -c ':helper-unavailable:helper-unavailable$' "$observed")" == "2" ]]
+      grep -Fqx \
+        'recreate:tcp:helper attach failure cleanup:getsockopt' \
+        "$observed" || {
+        printf 'failed helper attach control omitted cleanup restoration\n' >&2
+        return 1
+      }
+      grep -Fq 'could not restore the instrumented stack' "$observed" || {
+        printf 'restoration failure was not retained as evidence\n' >&2
+        return 1
+      }
+    fi
+  )
+
+  run_case success 0
+  run_case failure 23
+
+  (
+    local -r marker="$TEST_TMP_DIR/helper-attach-precondition-restored"
+    local status=0
+
+    BRIDGE_RUNNING=false
+    TRANSPORT=getsockopt
+    CONTEXT_PROPAGATION=tcp
+    SCENARIO_SEED=1
+    RESULT_DIR="$TEST_TMP_DIR/helper-attach-precondition"
+    mkdir -p -- "$RESULT_DIR"
+    log_error() {
+      :
+    }
+    recreate_instrumented_stack() {
+      : >"$marker"
+    }
+    set +e
+    (
+      set -Eeuo pipefail
+      run_helper_attach_failure_control
+    )
+    status=$?
+    set -e
+    [[ "$status" == "1" && ! -e "$marker" ]] || {
+      printf 'helper attach precondition failure mutated the Compose stack\n' >&2
+      return 1
+    }
+  )
 }
 
 test_restart_readiness_uses_log_cursor() {
@@ -4903,6 +5579,7 @@ main() {
   test_benchmark_controls_are_bounded
   test_all_suite_includes_every_scenario
   test_unix_all_suite_includes_fault_control
+  test_helper_attach_failure_dispatch_and_seed_are_exact
   test_w3c_fault_requires_forced_unix
   test_security_accepts_enabled_transports
   test_tls_boundary_requires_both_deterministic_modes
@@ -4914,6 +5591,10 @@ main() {
   test_bridge_artifact_metadata
   test_agent_download_rejects_symlink_output
   test_metrics_delta_reports_counters_and_map_occupancy
+  test_java_attach_error_metric_is_exact_unique
+  test_java_attach_error_wait_requires_exact_stability
+  test_log_pid_count_requires_an_exact_numeric_token
+  test_helper_unavailable_metric_boundary_preserves_counters
   test_metric_boundary_helpers_are_reason_coded
   test_pressure_map_metric_requires_exact_unique_series
   test_bridge_metric_wait_requires_quiescent_report
@@ -4943,6 +5624,7 @@ main() {
   test_java_diagnostics_schema_is_exact
   test_java_diagnostics_delta_is_exact
   test_fault_scenario_does_not_probe_java_diagnostics
+  test_helper_unavailable_scenario_injects_without_staging_or_retrieval
   test_scenario_fences_metrics_around_diagnostics
   test_pressure_scenario_reconciles_roots_with_bridge_and_java_counts
   test_pressure_failure_retains_wrong_parent_counts_and_cleans_up
@@ -4960,6 +5642,7 @@ main() {
   test_pipeline_dependencies_are_declared
   test_runtime_environment_line_matching
   test_extension_disabled_runtime_requires_explicit_false
+  test_helper_attach_runtime_requires_exact_dynamic_disable
   test_instrumented_readiness_precedes_https_traffic
   test_apache_readiness_requires_the_full_pool
   test_apache_instrumented_process_metric_is_exact
@@ -4974,6 +5657,7 @@ main() {
   test_extension_disabled_control_uses_configuration_log
   test_late_attach_recycles_only_apache_after_readiness
   test_control_response_normalizes_connection_diagnostics
+  test_helper_attach_failure_control_restores_and_preserves_status
   test_restart_readiness_uses_log_cursor
   test_standalone_restart_waits_for_apache_instrumentation
   test_restart_fault_recovery_waits_for_apache_instrumentation

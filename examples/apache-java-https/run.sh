@@ -12,6 +12,8 @@ MAX_UINT32_DECIMAL="4294967295"
 MAX_UINT64_DECIMAL="18446744073709551615"
 JAVA_DIAGNOSTIC_COUNTER_MAX="999999999"
 BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS=35
+JAVA_ATTACH_FAILURE_QUIET_SAMPLES=15
+HELPER_ATTACH_FAILURE_JAVA_TOOL_OPTIONS="-javaagent:/otel/official-javaagent.jar -XX:-EnableDynamicAgentLoading"
 SCENARIO_RUN_TIMEOUT_SECONDS=120
 PRESSURE_STATE_TIMEOUT_SECONDS=10
 PRESSURE_MONITOR_METRICS_TIMEOUT_SECONDS=5
@@ -53,6 +55,8 @@ RESTART_RELEASE_OBI_READY="obi-ready"
 readonly SCRIPT_DIR REPO_ROOT SCRIPT_NAME MAX_SHELL_INTEGER MAX_UINT32_DECIMAL
 readonly MAX_UINT64_DECIMAL JAVA_DIAGNOSTIC_COUNTER_MAX
 readonly BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS SCENARIO_RUN_TIMEOUT_SECONDS
+readonly JAVA_ATTACH_FAILURE_QUIET_SAMPLES
+readonly HELPER_ATTACH_FAILURE_JAVA_TOOL_OPTIONS
 readonly PRESSURE_STATE_TIMEOUT_SECONDS PRESSURE_MONITOR_METRICS_TIMEOUT_SECONDS
 readonly PRESSURE_MONITOR_POLL_INTERVAL_SECONDS PRESSURE_MONITOR_COMPLETION_SLACK_SECONDS
 readonly PRESSURE_MONITOR_COMPLETION_TIMEOUT_SECONDS
@@ -169,8 +173,8 @@ Options:
                           timeout-retry,
                           pressure, handoff, virtual-thread, netty, dispatch,
                           w3c, w3c-match, obi-flags, w3c-fault, w3c-only,
-                          security, restart-fault, fail-open, restart, disabled, or
-                          uninstrumented.
+                          security, restart-fault, helper-attach-failure,
+                          fail-open, restart, disabled, or uninstrumented.
                           Default: all
   --requests COUNT        Requests per scenario (1-1000); scenario default
                           when omitted.
@@ -189,9 +193,10 @@ connection churn, fd/ephemeral-port reuse, slow-body, deterministic TLS receive
 boundaries, timeout/retry, pressure,
 executor/virtual-thread/Netty handoff, async redispatch, W3C
 precedence/match/flags/fault/no-state controls, late attach, OBI restart during
-traffic, bounded primary or fallback transport abuse controls, Unix endpoint
-replacement when that transport is selected, bridge/extension-disabled,
-extension-absent, and uninstrumented controls. Evidence is retained under:
+traffic, helper attach failure, bounded primary or fallback transport abuse
+controls, Unix endpoint replacement when that transport is selected,
+bridge/extension-disabled, extension-absent, and uninstrumented controls.
+Evidence is retained under:
   $RESULTS_ROOT
 EOF
 }
@@ -348,7 +353,7 @@ parse_args() {
       ;;
   esac
   case "$SCENARIO" in
-    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|timeout-retry|pressure|handoff|virtual-thread|netty|dispatch|w3c|w3c-match|obi-flags|w3c-fault|w3c-only|security|restart-fault|fail-open|restart|disabled|uninstrumented)
+    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|timeout-retry|pressure|handoff|virtual-thread|netty|dispatch|w3c|w3c-match|obi-flags|w3c-fault|w3c-only|security|restart-fault|helper-attach-failure|fail-open|restart|disabled|uninstrumented)
       ;;
     *)
       die "unsupported scenario: $SCENARIO"
@@ -1300,6 +1305,7 @@ assert_runtime_contract() {
   local obi_container=""
   local obi_identity=""
   local java_agent="absent"
+  local dynamic_agent_loading="not-configured"
   local extension="absent"
 
   java_container="$(run_bounded 10 "${COMPOSE[@]}" ps --quiet java-backend)"
@@ -1313,6 +1319,12 @@ assert_runtime_contract() {
     "$java_environment" \
     "JAVA_TOOL_OPTIONS=-javaagent:/otel/official-javaagent.jar"; then
     java_agent="official"
+    dynamic_agent_loading="enabled"
+  elif environment_has_line \
+    "$java_environment" \
+    "JAVA_TOOL_OPTIONS=$HELPER_ATTACH_FAILURE_JAVA_TOOL_OPTIONS"; then
+    java_agent="official"
+    dynamic_agent_loading="disabled"
   fi
   if environment_has_line \
     "$java_environment" \
@@ -1335,7 +1347,8 @@ assert_runtime_contract() {
       return 1
     }
   elif [[ "$mode" == "obi-absent" ]]; then
-    [[ "$java_agent" == "official" && "$extension" == "enabled" ]] || {
+    [[ "$java_agent" == "official" && "$dynamic_agent_loading" == "enabled" &&
+      "$extension" == "enabled" ]] || {
       log_error "OBI-absent control requires the official agent and enabled extension"
       return 1
     }
@@ -1344,7 +1357,7 @@ assert_runtime_contract() {
       return 1
     }
   elif [[ "$mode" == "extension-absent" || "$mode" == "extension-disabled" ]]; then
-    [[ "$java_agent" == "official" ]] || {
+    [[ "$java_agent" == "official" && "$dynamic_agent_loading" == "enabled" ]] || {
       log_error "$mode control requires the official Java agent"
       return 1
     }
@@ -1356,8 +1369,30 @@ assert_runtime_contract() {
       log_error "$mode control unexpectedly started OBI"
       return 1
     }
+  elif [[ "$mode" == "helper-attach-fault" ]]; then
+    [[ "$java_agent" == "official" && "$dynamic_agent_loading" == "disabled" &&
+      "$extension" == "enabled" ]] || {
+      log_error "helper attach failure control requires the exact dynamic-loading-disabled official agent and enabled extension"
+      return 1
+    }
+    obi_container="$(run_bounded 10 "${COMPOSE[@]}" ps --quiet obi)"
+    [[ -n "$obi_container" ]] || {
+      log_error "OBI container identity is unavailable"
+      return 1
+    }
+    obi_identity="$(run_bounded 10 docker inspect \
+      --format '{{.HostConfig.Privileged}} {{.HostConfig.PidMode}}' "$obi_container")"
+    [[ "$obi_identity" == "true host" ]] || {
+      log_error "OBI runtime must be privileged with the host PID namespace, got: $obi_identity"
+      return 1
+    }
+    [[ -r /sys/kernel/btf/vmlinux ]] || {
+      log_error "host vmlinux BTF is not readable"
+      return 1
+    }
   else
-    [[ "$java_agent" == "official" && "$extension" == "enabled" ]] || {
+    [[ "$java_agent" == "official" && "$dynamic_agent_loading" == "enabled" &&
+      "$extension" == "enabled" ]] || {
       log_error "Java runtime does not have the expected official agent and extension opt-in"
       return 1
     }
@@ -1384,6 +1419,7 @@ assert_runtime_contract() {
     printf 'status=passed\n'
     printf 'java_container=%s\n' "$java_container"
     printf 'java_agent=%s\n' "$java_agent"
+    printf 'dynamic_agent_loading=%s\n' "$dynamic_agent_loading"
     printf 'extension=%s\n' "$extension"
     printf 'obi_container=%s\n' "${obi_container:-absent}"
     printf 'obi_privileged_pid_mode=%s\n' "${obi_identity:-absent}"
@@ -1431,6 +1467,107 @@ fetch_obi_metrics() {
   [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || return 1
   curl --fail --silent --show-error --max-time "$timeout_seconds" \
     "http://127.0.0.1:18990/internal/metrics" >"$output"
+}
+
+java_attach_error_total() {
+  local -r metrics="$1"
+  local metric=""
+  local labels=""
+  local raw_value=""
+  local extra=""
+  local value=""
+  local found=false
+
+  while read -r metric raw_value extra; do
+    [[ "$metric" == 'obi_instrumentation_errors_total{'*'}' ]] || continue
+    labels="${metric#*\{}"
+    labels="${labels%\}}"
+    if [[ "$labels" == 'error_type="attaching_java_agent",process_name="java"' ||
+      "$labels" == 'process_name="java",error_type="attaching_java_agent"' ]]; then
+      [[ "$found" == "false" && -z "$extra" ]] || return 1
+      value="$(bounded_decimal "$raw_value" "$MAX_SHELL_INTEGER" true)" || return 1
+      found=true
+    elif [[ "$labels" == *'error_type="attaching_java_agent"'* &&
+      "$labels" == *'process_name="java"'* ]]; then
+      return 1
+    fi
+  done <"$metrics"
+
+  if [[ "$found" == "true" ]]; then
+    printf '%s\n' "$value"
+  else
+    printf 'absent\n'
+  fi
+}
+
+wait_for_java_attach_error_total() {
+  local -r expected="$1"
+  local -r baseline="$2"
+  local -r output="$3"
+  local -r description="$4"
+  local -r required_samples="${5:-$JAVA_ATTACH_FAILURE_QUIET_SAMPLES}"
+  local -r samples_output="${output%.prom}-samples.log"
+  local candidate=""
+  local state=""
+  local baseline_value=""
+  local observed=false
+  local -i stable_samples=0
+  local -i started_at="$SECONDS"
+
+  bounded_decimal "$expected" "$MAX_SHELL_INTEGER" true >/dev/null || return 1
+  bounded_decimal "$required_samples" "$MAX_SHELL_INTEGER" false >/dev/null || return 1
+  if [[ "$baseline" == "absent" ]]; then
+    baseline_value=0
+  else
+    baseline_value="$(bounded_decimal "$baseline" "$MAX_SHELL_INTEGER" true)" || return 1
+  fi
+  ((expected >= baseline_value && expected - baseline_value <= 1)) || return 1
+
+  candidate="$(mktemp "$RESULT_DIR/.java-attach-errors.XXXXXX")"
+  : >"$samples_output"
+  while ((SECONDS - started_at < READINESS_TIMEOUT_SECONDS)); do
+    if ! fetch_obi_metrics "$candidate" 2>/dev/null; then
+      printf '%(%Y-%m-%dT%H:%M:%SZ)T unavailable\n' -1 >>"$samples_output"
+      stable_samples=0
+      sleep 1
+      continue
+    fi
+    if ! state="$(java_attach_error_total "$candidate")"; then
+      rm -f -- "$candidate"
+      log_error "$description produced a malformed or duplicate attach-error metric"
+      return 1
+    fi
+    printf '%(%Y-%m-%dT%H:%M:%SZ)T %s\n' -1 "$state" >>"$samples_output"
+
+    if [[ "$state" == "absent" ]]; then
+      if [[ "$baseline" != "absent" || "$observed" == "true" || "$expected" == "0" ]]; then
+        rm -f -- "$candidate"
+        log_error "$description attach-error metric disappeared or reset"
+        return 1
+      fi
+      stable_samples=0
+    elif ((state > expected || state < baseline_value)); then
+      rm -f -- "$candidate"
+      log_error "$description attach-error metric escaped the expected range baseline=$baseline_value expected=$expected observed=$state"
+      return 1
+    elif ((state == expected)); then
+      observed=true
+      ((stable_samples += 1))
+      if ((stable_samples >= required_samples)); then
+        install -m 0644 "$candidate" "$output"
+        rm -f -- "$candidate"
+        return 0
+      fi
+    elif [[ "$observed" == "true" ]]; then
+      rm -f -- "$candidate"
+      log_error "$description attach-error metric reset after reaching $expected"
+      return 1
+    fi
+    sleep 1
+  done
+  rm -f -- "$candidate"
+  log_error "timed out waiting for $description attach-error total=$expected"
+  return 1
 }
 
 bridge_success_total() {
@@ -1604,21 +1741,40 @@ wait_for_primary_security_metrics_quiescent() {
 
 flush_bridge_metric_boundary() {
   local -r label="$1"
+  local -r expected_success_increment="${2:-1}"
+  local -r expected_stage_increment="${3:-1}"
   local current=""
   local before_stage=""
   local before_success=""
 
   [[ "$BRIDGE_RUNNING" == "true" ]] || return 0
+  bounded_decimal \
+    "$expected_success_increment" "$MAX_SHELL_INTEGER" true >/dev/null || return 1
+  bounded_decimal \
+    "$expected_stage_increment" "$MAX_SHELL_INTEGER" true >/dev/null || return 1
   current="$(mktemp "$RESULT_DIR/.bridge-boundary.XXXXXX")"
   fetch_obi_metrics "$current"
   before_success="$(bridge_success_total "$current")"
   before_stage="$(bridge_stage_total "$current")"
+  bounded_decimal "$before_success" "$MAX_SHELL_INTEGER" true >/dev/null || {
+    rm -f -- "$current"
+    return 1
+  }
+  bounded_decimal "$before_stage" "$MAX_SHELL_INTEGER" true >/dev/null || {
+    rm -f -- "$current"
+    return 1
+  }
+  ((before_success <= MAX_SHELL_INTEGER - expected_success_increment &&
+    before_stage <= MAX_SHELL_INTEGER - expected_stage_increment)) || {
+    rm -f -- "$current"
+    return 1
+  }
   curl --fail --silent --show-error --max-time 5 \
     "$APACHE_HTTPS_HEALTH_ENDPOINT" >/dev/null
   rm -f -- "$current"
   wait_for_bridge_metrics_quiescent \
-    "$((before_success + 1))" \
-    "$((before_stage + 1))" \
+    "$((before_success + expected_success_increment))" \
+    "$((before_stage + expected_stage_increment))" \
     "$RESULT_DIR/metrics-boundary-$label.prom" \
     "$label pre-scenario bridge metric boundary"
 }
@@ -2645,6 +2801,7 @@ run_scenario() {
   local -r diagnostics_enabled="${2:-true}"
   local -r phase_evidence="${3:-full}"
   local -r fixture_mode="${4:-none}"
+  local -r retrieval_mode="${5:-normal}"
   local run_number=0
   local label=""
   local output=""
@@ -2665,6 +2822,8 @@ run_scenario() {
   local baseline_bridge_missing=0
   local baseline_java_missing=0
   local expected_bridge_valid=0
+  local expected_bridge_lifecycle=0
+  local expected_bridge_stage=0
   local expected_bridge_missing=0
   local expected_java_missing=0
   local pressure_hits=0
@@ -2697,15 +2856,28 @@ run_scenario() {
     log_error "scenario fixture mode must be none or matching"
     return 1
   }
+  [[ "$retrieval_mode" == "normal" || "$retrieval_mode" == "helper-unavailable" ]] || {
+    log_error "scenario retrieval mode must be normal or helper-unavailable"
+    return 1
+  }
   if [[ "$fixture_mode" == "matching" && \
     ( "$name" != "w3c-match" || "$diagnostics_enabled" != "true" ) ]]; then
     log_error "the matching fixture requires the diagnostic w3c-match scenario"
     return 1
   fi
+  if [[ "$retrieval_mode" == "helper-unavailable" && \
+    ( "$fixture_mode" != "none" || "$diagnostics_enabled" != "false" ||
+    ( "$name" != "helper-attach-failure" && "$name" != "w3c" ) ) ]]; then
+    log_error "helper-unavailable retrieval requires a non-diagnostic helper-attach-failure or w3c scenario"
+    return 1
+  fi
   baseline_bridge_missing="$(scenario_bridge_missing_count "$name" "$SELECTED_TRANSPORT")"
   baseline_java_missing="$(scenario_java_missing_count "$name" "$diagnostics_enabled")"
   expected_requests="$(scenario_bridge_take_count "$name")"
-  if [[ "$name" == "w3c-fault" ]]; then
+  if [[ "$retrieval_mode" == "helper-unavailable" ]]; then
+    expected_requests=1
+    request_arguments=(--requests 1)
+  elif [[ "$name" == "w3c-fault" ]]; then
     request_arguments=(--requests "$FAULT_REQUEST_COUNT")
   elif [[ "$name" == "tls-boundary" ]]; then
     request_arguments=(--requests 2)
@@ -2718,6 +2890,12 @@ run_scenario() {
     metric_status=0
     status_name="passed"
     expected_bridge_valid="$expected_requests"
+    expected_bridge_lifecycle="$expected_requests"
+    expected_bridge_stage="$expected_requests"
+    if [[ "$retrieval_mode" == "helper-unavailable" ]]; then
+      expected_bridge_valid=0
+      expected_bridge_stage=0
+    fi
     expected_bridge_missing="$baseline_bridge_missing"
     expected_java_missing="$baseline_java_missing"
     pressure_hits=0
@@ -2752,7 +2930,11 @@ run_scenario() {
         scenario_status="$fixture_status"
       fi
     fi
-    if ! flush_bridge_metric_boundary "$label"; then
+    if [[ "$retrieval_mode" == "helper-unavailable" ]]; then
+      if ! flush_bridge_metric_boundary "$label" 0 0; then
+        metric_status=1
+      fi
+    elif ! flush_bridge_metric_boundary "$label"; then
       metric_status=1
     fi
     if [[ "$name" != "w3c-fault" && "$diagnostics_enabled" == "true" ]]; then
@@ -2862,9 +3044,13 @@ run_scenario() {
         metric_status=1
       fi
     fi
+    if [[ "$retrieval_mode" == "normal" ]]; then
+      expected_bridge_lifecycle="$expected_bridge_valid"
+      expected_bridge_stage="$expected_bridge_valid"
+    fi
     if [[ "$bridge_was_running" == "true" ]]; then
       expected_success="$((before_success + expected_bridge_valid))"
-      expected_stage="$((before_stage + expected_bridge_valid))"
+      expected_stage="$((before_stage + expected_bridge_stage))"
       if ! wait_for_bridge_metrics_quiescent \
         "$expected_success" \
         "$expected_stage" \
@@ -2904,7 +3090,9 @@ run_scenario() {
         "$SELECTED_TRANSPORT" \
         "$expected_bridge_valid" \
         0 \
-        "$expected_bridge_missing"; then
+        "$expected_bridge_missing" \
+        "$expected_bridge_lifecycle" \
+        "$expected_bridge_stage"; then
         metric_status=1
       fi
     fi
@@ -3372,6 +3560,414 @@ recreate_instrumented_stack() {
   wait_for_apache_instrumentation recreate-instrumented
   wait_for_http "$APACHE_HTTPS_HEALTH_ENDPOINT" "$label HTTPS path"
 }
+
+capture_service_runtime_identity() {
+  local -r service="$1"
+  local -r output="$2"
+  local container_id=""
+  local inspected_id=""
+  local host_pid=""
+  local started_at=""
+  local extra=""
+
+  container_id="$(run_bounded 10 "${COMPOSE[@]}" ps --quiet "$service")"
+  [[ -n "$container_id" ]] || {
+    log_error "$service container identity is unavailable"
+    return 1
+  }
+  read -r inspected_id host_pid started_at extra <<<"$(run_bounded 10 docker inspect \
+    --format '{{.Id}} {{.State.Pid}} {{.State.StartedAt}}' "$container_id")"
+  [[ "$inspected_id" == "$container_id" && "$host_pid" =~ ^[1-9][0-9]*$ &&
+    -n "$started_at" && "$started_at" != "0001-01-01T00:00:00Z" &&
+    -z "$extra" ]] || {
+    log_error "$service runtime identity is invalid"
+    return 1
+  }
+  {
+    printf 'container_id=%s\n' "$container_id"
+    printf 'host_pid=%s\n' "$host_pid"
+    printf 'started_at=%s\n' "$started_at"
+  } >"$output"
+}
+
+runtime_identity_field() {
+  local -r identity="$1"
+  local -r name="$2"
+  local value=""
+  local -i matches=0
+  local line=""
+
+  while IFS= read -r line; do
+    if [[ "$line" == "$name="* ]]; then
+      value="${line#*=}"
+      ((matches += 1))
+    fi
+  done <"$identity"
+  [[ "$matches" == "1" && -n "$value" ]] || return 1
+  printf '%s\n' "$value"
+}
+
+assert_runtime_identity_replaced() {
+  local -r before="$1"
+  local -r after="$2"
+  local before_container=""
+  local before_started=""
+  local after_container=""
+  local after_started=""
+
+  before_container="$(runtime_identity_field "$before" container_id)" || return 1
+  before_started="$(runtime_identity_field "$before" started_at)" || return 1
+  after_container="$(runtime_identity_field "$after" container_id)" || return 1
+  after_started="$(runtime_identity_field "$after" started_at)" || return 1
+  [[ "$before_container" != "$after_container" && "$before_started" != "$after_started" ]] || {
+    log_error "Java recovery did not replace the failed JVM generation"
+    return 1
+  }
+}
+
+capture_service_logs_since() {
+  local -r service="$1"
+  local -r since="$2"
+  local -r output="$3"
+
+  run_bounded 30 \
+    "${COMPOSE[@]}" logs --no-color --since "$since" "$service" >"$output"
+}
+
+assert_log_message_count() {
+  local -r input="$1"
+  local -r message="$2"
+  local -r expected="$3"
+  local count=""
+
+  count="$(awk -v message="$message" \
+    'index($0, message) != 0 { count++ } END { print count + 0 }' "$input")"
+  [[ "$count" == "$expected" ]] || {
+    log_error "expected $expected log lines containing '$message', got $count"
+    return 1
+  }
+}
+
+assert_log_message_for_pid_count() {
+  local -r input="$1"
+  local -r message="$2"
+  local -r host_pid="$3"
+  local -r expected="$4"
+  local count=""
+
+  bounded_decimal "$host_pid" "$MAX_SHELL_INTEGER" false >/dev/null || return 1
+  count="$(awk -v message="$message" -v pid="$host_pid" \
+    'index($0, message) != 0 &&
+      $0 ~ ("(^|[[:space:]])pid=" pid "([^0-9]|$)") { count++ }
+    END { print count + 0 }' \
+    "$input")"
+  [[ "$count" == "$expected" ]] || {
+    log_error "expected $expected log lines containing '$message' for pid=$host_pid, got $count"
+    return 1
+  }
+}
+
+next_scenario_seed() {
+  local -r current="$1"
+
+  bounded_decimal "$current" "$MAX_SHELL_INTEGER" true >/dev/null || return 1
+  if [[ "$current" == "$MAX_SHELL_INTEGER" ]]; then
+    printf '0\n'
+  else
+    printf '%d\n' "$((current + 1))"
+  fi
+}
+
+next_java_attach_error_total() {
+  local -r baseline="$1"
+  local current=0
+
+  if [[ "$baseline" != "absent" ]]; then
+    current="$(bounded_decimal "$baseline" "$MAX_SHELL_INTEGER" true)" || return 1
+  fi
+  ((current < MAX_SHELL_INTEGER)) || return 1
+  printf '%d\n' "$((current + 1))"
+}
+
+recover_helper_attach_failure_stack() {
+  local -r propagation="$1"
+  local -r label="$2"
+  local -r transport="$3"
+  local recovery_since=""
+
+  CONTEXT_PROPAGATION="$propagation"
+  export CONTEXT_PROPAGATION
+  BRIDGE_TRANSPORT="$transport"
+  export BRIDGE_TRANSPORT
+  export EXTENSION_ENABLED=true
+  export JAVA_TOOL_OPTIONS_VALUE="-javaagent:/otel/official-javaagent.jar"
+  export OTEL_JAVAAGENT_EXTENSIONS_VALUE="/otel/obi-otel-extension.jar"
+  export OTEL_PROPAGATORS_VALUE="obi,tracecontext,baggage"
+  recovery_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')"
+  log_info "replacing the failed JVM for $label propagation=$propagation"
+  run_bounded 180 \
+    "${COMPOSE[@]}" up --detach --force-recreate java-backend apache-proxy
+  wait_for_log \
+    java-backend \
+    "OBI remote-parent provider ready" \
+    "$label injected Java helper" \
+    "$recovery_since"
+  wait_for_log \
+    java-backend \
+    "OBI remote-parent propagator enabled" \
+    "$label external OTel extension" \
+    "$recovery_since"
+  wait_for_log \
+    java-backend \
+    "OBI Java instrumentation ready" \
+    "$label injected Java instrumentation" \
+    "$recovery_since"
+  BRIDGE_RUNNING=true
+  assert_selected_transport "$transport"
+  wait_for_apache_instrumentation "$label"
+  wait_for_http "$APACHE_HTTPS_HEALTH_ENDPOINT" "$label HTTPS path"
+}
+
+run_helper_attach_failure_control() (
+  local -r original_transport="$TRANSPORT"
+  local -r original_propagation="$CONTEXT_PROPAGATION"
+  local -r original_seed="$SCENARIO_SEED"
+  local alternate_seed=""
+  local attach_baseline=""
+  local expected_attach_total=""
+  local failed_java_pid=""
+  local fault_since=""
+  local restore_required=false
+  local -r obi_log="$RESULT_DIR/helper-attach-failure-obi.log"
+  local -r java_log="$RESULT_DIR/helper-attach-failure-java.log"
+  local -r baseline_metrics="$RESULT_DIR/helper-attach-failure-metrics-before.prom"
+  local -r fault_metrics="$RESULT_DIR/helper-attach-failure-metrics-after.prom"
+  local -r quiet_metrics="$RESULT_DIR/helper-attach-failure-metrics-quiet.prom"
+  local -r recovery_metrics="$RESULT_DIR/helper-attach-failure-metrics-recovery.prom"
+  local -r obi_identity_before="$RESULT_DIR/helper-attach-failure-obi-before.txt"
+  local -r obi_identity_fault="$RESULT_DIR/helper-attach-failure-obi-fault.txt"
+  local -r obi_identity_recovery="$RESULT_DIR/helper-attach-failure-obi-recovery.txt"
+  local -r java_identity_fault="$RESULT_DIR/helper-attach-failure-java-fault.txt"
+  local -r java_identity_after="$RESULT_DIR/helper-attach-failure-java-after-traffic.txt"
+  local -r java_identity_recovery="$RESULT_DIR/helper-attach-failure-java-recovery.txt"
+
+  # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
+  restore_helper_attach_failure_stack() {
+    local -r status="$?"
+    local restore_status=0
+
+    trap - EXIT
+    set +e
+    if [[ "$restore_required" == "true" ]]; then
+      log_warn \
+        "restoring the normal instrumented stack after helper attach failure control" || true
+      (
+        set -Eeuo pipefail
+        recreate_instrumented_stack \
+          "$original_propagation" \
+          "helper attach failure cleanup" \
+          "$original_transport"
+      )
+      restore_status=$?
+      if ((restore_status != 0)); then
+        log_error \
+          "could not restore the instrumented stack after helper attach failure control" || true
+      fi
+    fi
+    if ((status == 0 && restore_status != 0)); then
+      exit "$restore_status"
+    fi
+    exit "$status"
+  }
+
+  trap restore_helper_attach_failure_stack EXIT
+  [[ "$BRIDGE_RUNNING" == "true" ]] || {
+    log_error "helper attach failure control requires a healthy running bridge"
+    return 1
+  }
+  alternate_seed="$(next_scenario_seed "$original_seed")"
+
+  restore_required=true
+  SCENARIO_VARIANT="helper-attach-bridge-disabled"
+  SCENARIO_SEED="$alternate_seed"
+  run_disabled_control
+  capture_control_response "helper-attach-bridge-disabled"
+  SCENARIO_VARIANT=""
+
+  recreate_instrumented_stack \
+    "$original_propagation" \
+    "helper attach failure preparation" \
+    "$original_transport"
+  capture_service_runtime_identity obi "$obi_identity_before"
+  fetch_obi_metrics "$baseline_metrics"
+  attach_baseline="$(java_attach_error_total "$baseline_metrics")" || {
+    log_error "helper attach failure baseline metric is malformed"
+    return 1
+  }
+  expected_attach_total="$(next_java_attach_error_total "$attach_baseline")" || {
+    log_error "helper attach failure baseline metric cannot be incremented"
+    return 1
+  }
+
+  export BRIDGE_TRANSPORT="$original_transport"
+  export EXTENSION_ENABLED=true
+  export JAVA_TOOL_OPTIONS_VALUE="$HELPER_ATTACH_FAILURE_JAVA_TOOL_OPTIONS"
+  export OTEL_JAVAAGENT_EXTENSIONS_VALUE="/otel/obi-otel-extension.jar"
+  export OTEL_PROPAGATORS_VALUE="obi,tracecontext,baggage"
+  run_bounded 30 "${COMPOSE[@]}" config \
+    >"$RESULT_DIR/compose-helper-attach-failure.yaml"
+  fault_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')"
+  log_info "replacing the JVM with dynamic agent loading disabled"
+  run_bounded 180 \
+    "${COMPOSE[@]}" up --detach --force-recreate java-backend apache-proxy
+  wait_for_log \
+    java-backend \
+    "OBI remote-parent propagator enabled" \
+    "helper attach failure external OTel extension" \
+    "$fault_since"
+  wait_for_http \
+    "$APACHE_HTTPS_HEALTH_ENDPOINT" \
+    "helper attach failure HTTPS path"
+  capture_service_runtime_identity java-backend "$java_identity_fault"
+  failed_java_pid="$(runtime_identity_field "$java_identity_fault" host_pid)"
+
+  wait_for_log \
+    obi \
+    "couldn't attach OpenTelemetry eBPF Java Agent" \
+    "rejected dynamic Java helper attach" \
+    "$fault_since"
+  wait_for_log \
+    obi \
+    "unable to attach java agent to process, Java TLS telemetry will not work" \
+    "attributed Java helper attach failure" \
+    "$fault_since"
+  wait_for_java_attach_error_total \
+    "$expected_attach_total" \
+    "$attach_baseline" \
+    "$fault_metrics" \
+    "helper attach failure"
+  write_metrics_delta \
+    "$baseline_metrics" \
+    "$fault_metrics" \
+    "$RESULT_DIR/helper-attach-failure-metrics.delta"
+
+  capture_service_runtime_identity obi "$obi_identity_fault"
+  cmp -- "$obi_identity_before" "$obi_identity_fault"
+  BRIDGE_RUNNING=true
+  assert_selected_transport "$original_transport"
+  wait_for_apache_instrumentation helper-attach-failure
+  capture_service_logs_since obi "$fault_since" "$obi_log"
+  capture_service_logs_since java-backend "$fault_since" "$java_log"
+  assert_runtime_contract helper-attach-fault
+
+  capture_control_response "helper-attach-failure"
+  cmp \
+    "$RESULT_DIR/helper-attach-bridge-disabled-response.normalized.json" \
+    "$RESULT_DIR/helper-attach-failure-response.normalized.json"
+  cmp \
+    "$RESULT_DIR/helper-attach-bridge-disabled-response.status" \
+    "$RESULT_DIR/helper-attach-failure-response.status"
+
+  SCENARIO_VARIANT="helper-unavailable"
+  run_scenario helper-attach-failure false full none helper-unavailable
+  run_scenario w3c false full none helper-unavailable
+  SCENARIO_VARIANT=""
+  capture_service_runtime_identity java-backend "$java_identity_after"
+  cmp -- "$java_identity_fault" "$java_identity_after"
+  wait_for_java_attach_error_total \
+    "$expected_attach_total" \
+    "$expected_attach_total" \
+    "$quiet_metrics" \
+    "helper attach failure quiet window" \
+    3
+
+  capture_service_logs_since obi "$fault_since" "$obi_log"
+  capture_service_logs_since java-backend "$fault_since" "$java_log"
+  assert_log_message_count \
+    "$obi_log" \
+    "injecting OpenTelemetry eBPF instrumentation for Java process" \
+    1
+  assert_log_message_count \
+    "$obi_log" \
+    "couldn't attach OpenTelemetry eBPF Java Agent" \
+    1
+  assert_log_message_count \
+    "$obi_log" \
+    "unable to attach java agent to process, Java TLS telemetry will not work" \
+    1
+  assert_log_message_for_pid_count \
+    "$obi_log" \
+    "injecting OpenTelemetry eBPF instrumentation for Java process" \
+    "$failed_java_pid" \
+    1
+  assert_log_message_for_pid_count \
+    "$obi_log" \
+    "couldn't attach OpenTelemetry eBPF Java Agent" \
+    "$failed_java_pid" \
+    1
+  assert_log_message_for_pid_count \
+    "$obi_log" \
+    "unable to attach java agent to process, Java TLS telemetry will not work" \
+    "$failed_java_pid" \
+    1
+  assert_log_message_count \
+    "$java_log" \
+    "OBI remote-parent propagator enabled" \
+    1
+  assert_log_message_count "$java_log" "OBI remote-parent compatibility " 1
+  grep -F "OBI remote-parent compatibility " "$java_log" |
+    grep -Fq "supported=true"
+  if grep -Fq "OBI remote-parent provider ready" "$java_log" ||
+    grep -Fq "OBI Java instrumentation ready" "$java_log"; then
+    log_error "helper attach failure JVM unexpectedly loaded the injected helper"
+    return 1
+  fi
+  grep -Fq "reason=bridge_lookup_missing" "$java_log"
+
+  curl --fail --silent --show-error --max-time 5 \
+    --cacert "$CERT_DIR/ca.crt" \
+    "https://127.0.0.1:18443/obi-diagnostics" \
+    >"$RESULT_DIR/helper-attach-failure-java-diagnostics.txt"
+  cmp -s \
+    "$RESULT_DIR/helper-attach-failure-java-diagnostics.txt" \
+    <(printf 'unavailable\n') || {
+    log_error "helper attach failure diagnostics did not report unavailable"
+    return 1
+  }
+  recover_helper_attach_failure_stack \
+    "$original_propagation" \
+    "helper-attach-recovery" \
+    "$original_transport"
+  restore_required=false
+  capture_service_runtime_identity java-backend "$java_identity_recovery"
+  assert_runtime_identity_replaced "$java_identity_fault" "$java_identity_recovery"
+  capture_service_runtime_identity obi "$obi_identity_recovery"
+  cmp -- "$obi_identity_before" "$obi_identity_recovery"
+  wait_for_java_attach_error_total \
+    "$expected_attach_total" \
+    "$expected_attach_total" \
+    "$recovery_metrics" \
+    "helper attach recovery" \
+    3
+  capture_java_diagnostics helper-attach-recovery
+  assert_sanitized_java_diagnostics \
+    "$RESULT_DIR/phases/helper-attach-recovery/java-diagnostics.txt"
+  capture_control_response "helper-attach-recovery"
+  cmp \
+    "$RESULT_DIR/helper-attach-bridge-disabled-response.normalized.json" \
+    "$RESULT_DIR/helper-attach-recovery-response.normalized.json"
+  cmp \
+    "$RESULT_DIR/helper-attach-bridge-disabled-response.status" \
+    "$RESULT_DIR/helper-attach-recovery-response.status"
+
+  SCENARIO_VARIANT="helper-attach-recovery"
+  run_scenario basic
+  SCENARIO_VARIANT=""
+  SCENARIO_SEED="$original_seed"
+
+  trap - EXIT
+  return 0
+)
 
 reset_matching_bridge_environment() {
   FAULT_MODE="alternating"
@@ -4284,6 +4880,9 @@ normalize_control_response() {
   sed -E \
     -e 's/"backend_connection_id":[0-9]+/"backend_connection_id":0/' \
     -e 's/"backend_remote_port":[0-9]+/"backend_remote_port":0/' \
+    -e 's/"backend_socket_fd":-?[0-9]+/"backend_socket_fd":0/' \
+    -e 's/"tls_read_events":-?[0-9]+/"tls_read_events":0/' \
+    -e 's/"tls_read_bytes":-?[0-9]+/"tls_read_bytes":0/' \
     "$input" >"$output"
 }
 
@@ -4317,6 +4916,7 @@ execute_requested_scenarios() {
       fi
       run_late_attach_control
       run_restart_during_traffic_control
+      run_helper_attach_failure_control
       run_disabled_control
       run_extension_controls
       run_uninstrumented_control
@@ -4347,6 +4947,9 @@ execute_requested_scenarios() {
       ;;
     restart-fault)
       run_restart_during_traffic_control
+      ;;
+    helper-attach-failure)
+      run_helper_attach_failure_control
       ;;
     w3c-match)
       run_w3c_match_control
@@ -4707,6 +5310,7 @@ write_metrics_delta() {
   awk '
     function wanted(metric) {
       return metric ~ /^obi_java_remote_parent_operations_total/ ||
+        metric ~ /^obi_instrumentation_errors_total/ ||
         metric ~ /^obi_bpf_map_(entries|max_entries)_total/
     }
     FNR == NR {
@@ -4918,12 +5522,16 @@ assert_bridge_metric_delta() {
   local -r expected_takes="$3"
   local -r expected_discards="$4"
   local -r expected_missing="${5:-0}"
+  local -r expected_upstream="${6:-$expected_takes}"
+  local -r expected_stage="${7:-$expected_upstream}"
 
   awk \
     -v selected="$transport" \
     -v wanted_takes="$expected_takes" \
     -v wanted_discards="$expected_discards" \
     -v wanted_missing="$expected_missing" \
+    -v wanted_upstream="$expected_upstream" \
+    -v wanted_stage="$expected_stage" \
     -v allow_primary_security="$ALLOW_PRIMARY_SECURITY_METRICS" \
     -v allow_unix_security="$ALLOW_UNIX_SECURITY_METRICS" '
     function label(line, name, value) {
@@ -4993,10 +5601,11 @@ assert_bridge_metric_delta() {
       }
     }
     END {
-      if (candidates != wanted_takes || injections != wanted_takes || stages != wanted_takes ||
+      if (candidates != wanted_upstream || injections != wanted_upstream ||
+          stages != wanted_stage ||
           takes != wanted_takes || discards != wanted_discards || missing != wanted_missing) {
         printf "expected lifecycle=%d/%d/%d %s take/valid=%d discard/valid=%d take/missing=%d, got lifecycle=%d/%d/%d take=%d discard=%d missing=%d\n",
-          wanted_takes, wanted_takes, wanted_takes, selected,
+          wanted_upstream, wanted_upstream, wanted_stage, selected,
           wanted_takes, wanted_discards, wanted_missing,
           candidates, injections, stages, takes, discards, missing > "/dev/stderr"
         failed = 1

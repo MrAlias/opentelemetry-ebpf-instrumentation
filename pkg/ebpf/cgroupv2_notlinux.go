@@ -15,3 +15,7 @@ import (
 func AttachCgroupSockOps(_ *ebpf.Program, _ ebpf.AttachType) (link.Link, error) {
 	return nil, errors.New("cgroupv2 not supported on this platform")
 }
+
+func AttachCgroupSockOpsLink(_ *ebpf.Program, _ ebpf.AttachType) (*link.RawLink, error) {
+	return nil, errors.New("cgroupv2 not supported on this platform")
+}

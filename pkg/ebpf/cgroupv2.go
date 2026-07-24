@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
 
 	"github.com/cilium/ebpf"
@@ -120,4 +121,52 @@ func AttachCgroupSockOps(prog *ebpf.Program, attach ebpf.AttachType) (link.Link,
 		Program: prog,
 		Attach:  attach,
 	})
+}
+
+// AttachCgroupSockOpsLink attaches a sockops program using a cgroup BPF link.
+// Unlike AttachCgroupSockOps, it does not fall back to a legacy program
+// attachment that can outlive the process after an unclean shutdown.
+func AttachCgroupSockOpsLink(
+	prog *ebpf.Program,
+	attach ebpf.AttachType,
+) (*link.RawLink, error) {
+	return attachCgroupSockOpsLink(
+		cgroupV2Once(),
+		prog,
+		attach,
+		os.Open,
+		link.AttachRawLink,
+	)
+}
+
+func attachCgroupSockOpsLink(
+	r cgroupV2Result,
+	prog *ebpf.Program,
+	attach ebpf.AttachType,
+	openCgroup func(string) (*os.File, error),
+	attachLink func(link.RawLinkOptions) (*link.RawLink, error),
+) (*link.RawLink, error) {
+	if r.err != nil {
+		return nil, r.err
+	}
+
+	target := r.mfd
+	if r.path != "" {
+		cgroup, err := openCgroup(r.path)
+		if err != nil {
+			return nil, fmt.Errorf("opening cgroup %q: %w", r.path, err)
+		}
+		defer cgroup.Close()
+		target = int(cgroup.Fd())
+	}
+
+	cgroupLink, err := attachLink(link.RawLinkOptions{
+		Target:  target,
+		Program: prog,
+		Attach:  attach,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("attaching cgroup sockops link: %w", err)
+	}
+	return cgroupLink, nil
 }

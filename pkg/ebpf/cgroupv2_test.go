@@ -7,9 +7,11 @@ package ebpf
 
 import (
 	"errors"
+	"os"
 	"testing"
 
 	cebpf "github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
@@ -115,7 +117,7 @@ func TestResolveCgroupV2(t *testing.T) {
 				require.NoError(t, result.err)
 			}
 			for _, cause := range tt.expectedCauses {
-				assert.ErrorIs(t, result.err, cause)
+				require.ErrorIs(t, result.err, cause)
 			}
 			assert.Equal(
 				t,
@@ -124,4 +126,114 @@ func TestResolveCgroupV2(t *testing.T) {
 			)
 		})
 	}
+}
+
+func TestAttachCgroupSockOpsLink(t *testing.T) {
+	t.Run("resolver error", func(t *testing.T) {
+		resolveErr := errors.New("resolve cgroup")
+		openCalled := false
+		attachCalled := false
+
+		_, err := attachCgroupSockOpsLink(
+			cgroupV2Result{mfd: -1, err: resolveErr},
+			nil,
+			cebpf.AttachCGroupGetsockopt,
+			func(string) (*os.File, error) {
+				openCalled = true
+				return nil, nil
+			},
+			func(link.RawLinkOptions) (*link.RawLink, error) {
+				attachCalled = true
+				return nil, nil
+			},
+		)
+
+		require.ErrorIs(t, err, resolveErr)
+		assert.False(t, openCalled)
+		assert.False(t, attachCalled)
+	})
+
+	t.Run("path", func(t *testing.T) {
+		path := t.TempDir()
+		program := new(cebpf.Program)
+		var target int
+
+		_, err := attachCgroupSockOpsLink(
+			cgroupV2Result{path: path, mfd: -1},
+			program,
+			cebpf.AttachCGroupSetsockopt,
+			os.Open,
+			func(options link.RawLinkOptions) (*link.RawLink, error) {
+				target = options.Target
+				assert.Same(t, program, options.Program)
+				assert.Equal(t, cebpf.AttachCGroupSetsockopt, options.Attach)
+				_, err := unix.FcntlInt(uintptr(target), unix.F_GETFD, 0)
+				require.NoError(t, err)
+				return nil, nil
+			},
+		)
+
+		require.NoError(t, err)
+		_, err = unix.FcntlInt(uintptr(target), unix.F_GETFD, 0)
+		require.ErrorIs(t, err, unix.EBADF)
+	})
+
+	t.Run("anonymous mount", func(t *testing.T) {
+		const mountFD = 42
+		program := new(cebpf.Program)
+		openCalled := false
+
+		_, err := attachCgroupSockOpsLink(
+			cgroupV2Result{mfd: mountFD},
+			program,
+			cebpf.AttachCGroupGetsockopt,
+			func(string) (*os.File, error) {
+				openCalled = true
+				return nil, nil
+			},
+			func(options link.RawLinkOptions) (*link.RawLink, error) {
+				assert.Equal(t, mountFD, options.Target)
+				assert.Same(t, program, options.Program)
+				assert.Equal(t, cebpf.AttachCGroupGetsockopt, options.Attach)
+				return nil, nil
+			},
+		)
+
+		require.NoError(t, err)
+		assert.False(t, openCalled)
+	})
+
+	t.Run("open error", func(t *testing.T) {
+		_, err := attachCgroupSockOpsLink(
+			cgroupV2Result{path: "/cgroup", mfd: -1},
+			nil,
+			cebpf.AttachCGroupGetsockopt,
+			func(string) (*os.File, error) {
+				return nil, unix.EPERM
+			},
+			func(link.RawLinkOptions) (*link.RawLink, error) {
+				t.Fatal("attach called after open failure")
+				return nil, nil
+			},
+		)
+
+		require.ErrorIs(t, err, unix.EPERM)
+	})
+
+	t.Run("attach error", func(t *testing.T) {
+		_, err := attachCgroupSockOpsLink(
+			cgroupV2Result{mfd: 42},
+			nil,
+			cebpf.AttachCGroupGetsockopt,
+			func(string) (*os.File, error) {
+				t.Fatal("open called for anonymous mount")
+				return nil, nil
+			},
+			func(link.RawLinkOptions) (*link.RawLink, error) {
+				return nil, cebpf.ErrNotSupported
+			},
+		)
+
+		require.ErrorIs(t, err, cebpf.ErrNotSupported)
+	})
 }

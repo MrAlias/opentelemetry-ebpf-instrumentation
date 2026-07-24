@@ -18,6 +18,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/link"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
@@ -463,10 +464,40 @@ func TestJavaRemoteParentPartialSockoptAttachClosesFirstLink(t *testing.T) {
 
 	link, err := attachJavaRemoteParentSockopt(nil, nil)
 	require.Error(t, err)
-	assert.ErrorIs(t, err, attachErr)
-	assert.ErrorIs(t, err, closeErr)
+	require.ErrorIs(t, err, attachErr)
+	require.ErrorIs(t, err, closeErr)
 	assert.Nil(t, link)
 	assert.Equal(t, 1, getLink.closeCalls)
+}
+
+func TestJavaRemoteParentDefaultSockoptAttachersUseCgroupLinks(t *testing.T) {
+	originalLink := attachJavaRemoteParentCgroupLink
+	originalGet := attachCgroupGetsockopt
+	originalSet := attachCgroupSetsockopt
+	t.Cleanup(func() {
+		attachJavaRemoteParentCgroupLink = originalLink
+		attachCgroupGetsockopt = originalGet
+		attachCgroupSetsockopt = originalSet
+	})
+
+	attachErr := errors.New("link attach attempted")
+	var attachTypes []ebpf.AttachType
+	attachJavaRemoteParentCgroupLink = func(
+		_ *ebpf.Program,
+		attach ebpf.AttachType,
+	) (*link.RawLink, error) {
+		attachTypes = append(attachTypes, attach)
+		return nil, attachErr
+	}
+
+	_, err := originalGet(nil)
+	require.ErrorIs(t, err, attachErr)
+	_, err = originalSet(nil)
+	require.ErrorIs(t, err, attachErr)
+	require.Equal(t, []ebpf.AttachType{
+		ebpf.AttachCGroupGetsockopt,
+		ebpf.AttachCGroupSetsockopt,
+	}, attachTypes)
 }
 
 func TestJavaRemoteParentFailedFirstAttachSkipsSecondAttach(t *testing.T) {
@@ -487,7 +518,7 @@ func TestJavaRemoteParentFailedFirstAttachSkipsSecondAttach(t *testing.T) {
 	}
 
 	link, err := attachJavaRemoteParentSockopt(nil, nil)
-	assert.ErrorIs(t, err, attachErr)
+	require.ErrorIs(t, err, attachErr)
 	assert.Nil(t, link)
 }
 
@@ -514,8 +545,8 @@ func TestJavaRemoteParentSockoptCloseCombinesLinkErrors(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, links)
 	err = links.Close()
-	assert.ErrorIs(t, err, getCloseErr)
-	assert.ErrorIs(t, err, setCloseErr)
+	require.ErrorIs(t, err, getCloseErr)
+	require.ErrorIs(t, err, setCloseErr)
 	assert.Equal(t, 1, getLink.closeCalls)
 	assert.Equal(t, 1, setLink.closeCalls)
 }

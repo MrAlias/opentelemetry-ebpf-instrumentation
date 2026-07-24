@@ -44,11 +44,12 @@ var (
 	haveCgroupSockopt = func() error {
 		return features.HaveProgramType(ebpf.CGroupSockopt)
 	}
-	attachCgroupGetsockopt = func(program *ebpf.Program) (io.Closer, error) {
-		return obiebpf.AttachCgroupSockOps(program, ebpf.AttachCGroupGetsockopt)
+	attachJavaRemoteParentCgroupLink = obiebpf.AttachCgroupSockOpsLink
+	attachCgroupGetsockopt           = func(program *ebpf.Program) (io.Closer, error) {
+		return attachJavaRemoteParentCgroupLink(program, ebpf.AttachCGroupGetsockopt)
 	}
 	attachCgroupSetsockopt = func(program *ebpf.Program) (io.Closer, error) {
-		return obiebpf.AttachCgroupSockOps(program, ebpf.AttachCGroupSetsockopt)
+		return attachJavaRemoteParentCgroupLink(program, ebpf.AttachCGroupSetsockopt)
 	}
 	validateCgroupSockoptSpec = func(spec *ebpf.CollectionSpec, constants map[string]any) error {
 		testSpec := spec.Copy()

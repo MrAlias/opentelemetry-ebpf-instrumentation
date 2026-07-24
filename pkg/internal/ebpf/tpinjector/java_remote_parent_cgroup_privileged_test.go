@@ -394,8 +394,14 @@ func attachJavaRemoteParentFixtureAt(
 	path string,
 	programs *BpfJavaRemoteParentPrograms,
 ) (io.Closer, error) {
-	getsockoptLink, err := link.AttachCgroup(link.CgroupOptions{
-		Path:    path,
+	cgroup, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer cgroup.Close()
+
+	getsockoptLink, err := link.AttachRawLink(link.RawLinkOptions{
+		Target:  int(cgroup.Fd()),
 		Attach:  ebpf.AttachCGroupGetsockopt,
 		Program: programs.ObiJavaRemoteParentGetsockopt,
 	})
@@ -403,8 +409,8 @@ func attachJavaRemoteParentFixtureAt(
 		return nil, err
 	}
 
-	setsockoptLink, err := link.AttachCgroup(link.CgroupOptions{
-		Path:    path,
+	setsockoptLink, err := link.AttachRawLink(link.RawLinkOptions{
+		Target:  int(cgroup.Fd()),
 		Attach:  ebpf.AttachCGroupSetsockopt,
 		Program: programs.ObiJavaRemoteParentSetsockopt,
 	})

@@ -178,10 +178,28 @@ func TestAttachJDKAgentRequiresProtocolAcknowledgement(t *testing.T) {
 		response      string
 		errorContains string
 	}{
-		{name: "HotSpot success", response: "0\n"},
+		{name: "HotSpot success", response: "0\nreturn code: 0\n"},
+		{name: "HotSpot 8 success", response: "0\n0\n"},
 		{name: "OpenJ9 success", response: "ATTACH_ACK\x00"},
 		{name: "HotSpot nonzero status", response: "17\n", errorContains: "status 17"},
 		{name: "agent nonzero return code", response: "0\nreturn code: 42\n", errorContains: "return code 42"},
+		{name: "HotSpot 8 agent nonzero return code", response: "0\n42\n", errorContains: "return code 42"},
+		{
+			name: "dynamic loading disabled",
+			response: "0\nDynamic agent loading is not enabled. " +
+				"Use -XX:+EnableDynamicAgentLoading to launch target VM.\n",
+			errorContains: "Dynamic agent loading is not enabled",
+		},
+		{
+			name:          "agent load error response",
+			response:      "0\ninstrument was not loaded.\n",
+			errorContains: "instrument was not loaded",
+		},
+		{
+			name:          "missing agent result",
+			response:      "0\n",
+			errorContains: "without an agent result",
+		},
 		{name: "empty HotSpot response", response: "", errorContains: "without a status"},
 		{name: "missing HotSpot status", response: "return code: 0\n", errorContains: "without a status"},
 		{name: "empty OpenJ9 response", response: "\x00", errorContains: "without ATTACH_ACK"},
@@ -215,7 +233,7 @@ func TestJavaInjectorRestoresCredentialsAfterEveryAttachCommand(t *testing.T) {
 	attacher := &lifecycleTestAttacher{responses: []string{
 		"JDK 21\n",
 		"",
-		"0\n",
+		"0\nreturn code: 0\n",
 	}}
 	injector := &JavaInjector{
 		cfg: &obi.Config{},

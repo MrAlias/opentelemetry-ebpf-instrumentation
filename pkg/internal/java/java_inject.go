@@ -415,9 +415,10 @@ func (i *JavaInjector) copyAgent(ie *ebpf.Instrumentable) (string, error) {
 }
 
 type attachResponseState struct {
-	firstLineSeen     bool
-	hotspotStatusSeen bool
-	openJ9ACKSeen     bool
+	firstLineSeen          bool
+	hotspotStatusSeen      bool
+	hotspotAgentResultSeen bool
+	openJ9ACKSeen          bool
 }
 
 func (s *attachResponseState) parseLine(raw string) error {
@@ -435,6 +436,27 @@ func (s *attachResponseState) parseLine(raw string) error {
 			}
 			return nil
 		}
+	}
+
+	if s.hotspotStatusSeen {
+		if s.hotspotAgentResultSeen {
+			return fmt.Errorf("java VM attach returned unexpected response %q", line)
+		}
+
+		codeText := line
+		const returnCodePrefix = "return code:"
+		if strings.HasPrefix(line, returnCodePrefix) {
+			codeText = strings.TrimSpace(strings.TrimPrefix(line, returnCodePrefix))
+		}
+		code, err := strconv.Atoi(codeText)
+		if err != nil {
+			return fmt.Errorf("java VM agent failed with response %q", line)
+		}
+		s.hotspotAgentResultSeen = true
+		if code != 0 {
+			return fmt.Errorf("java VM agent failed with return code %d", code)
+		}
+		return nil
 	}
 
 	if line == "ATTACH_ACK" {
@@ -465,6 +487,9 @@ func (s *attachResponseState) finish(openJ9 bool) error {
 	}
 	if !s.hotspotStatusSeen {
 		return errors.New("hotSpot attach response ended without a status")
+	}
+	if !s.hotspotAgentResultSeen {
+		return errors.New("hotSpot attach response ended without an agent result")
 	}
 	return nil
 }

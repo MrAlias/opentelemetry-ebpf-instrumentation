@@ -414,8 +414,11 @@ the retained `compose.log` in this order:
    remote-parent transport.
 5. The JVM must report provider, extension, and injected-instrumentation
    readiness messages.
-6. A failed scenario JSON shows the last sanitized span graph, including the
-   exact unmatched trace/parent boundary.
+6. A failed scenario JSON shows sanitized span graphs from the latest polling
+   pass. A marker whose fetch fails or completes after the polling deadline has
+   an empty graph instead of reusing an older graph; pressure evidence
+   classifies it as unresolved. A fetched assertion failure retains its exact
+   unmatched trace/parent boundary.
 
 For `unix`, verify that the scoped `java-remote-parent-socket` volume is owned
 by `root:root`, has mode `0750`, and is mounted by both OBI and Java at

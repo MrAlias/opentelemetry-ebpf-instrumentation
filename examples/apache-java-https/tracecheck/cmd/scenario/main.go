@@ -1264,38 +1264,61 @@ func awaitAssertionsWithFetcher(
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	snapshots := make([]tracecheck.Snapshot, len(requests))
+	semanticErrors := make([]error, len(requests))
 	var validSince time.Time
 	var lastErr error
 
 	for {
-		valid := true
-		var firstPassErr error
-		var lastPassErr error
-		failedMarkers := 0
+		passSnapshots := make([]tracecheck.Snapshot, len(requests))
+		passAttempted := false
+		var passErrors markerErrorSummary
 		for i := range requests {
-			snapshot, err := fetch(ctx, cfg.receiverURL, requests[i].Marker)
-			if err == nil {
-				snapshots[i] = snapshot
-				err = tracecheck.AssertSnapshot(snapshot, expectationFor(cfg, requests[i]))
-			}
-			if err != nil {
-				valid = false
-				failedMarkers++
-				markerErr := fmt.Errorf("marker %s: %w", requests[i].Marker, err)
-				if firstPassErr == nil {
-					firstPassErr = markerErr
+			if err := ctx.Err(); err != nil {
+				currentErr := lastErr
+				if passAttempted {
+					currentErr = passErrors.err()
 				}
-				lastPassErr = markerErr
+				return snapshotsForAssertionDeadline(
+						snapshots,
+						passSnapshots,
+						passAttempted,
+					), traceAssertionDeadlineError(
+						err,
+						currentErr,
+						summarizeMarkerErrors(semanticErrors),
+					)
 			}
-		}
-		if firstPassErr != nil {
-			lastErr = firstPassErr
-			if failedMarkers > 1 {
-				lastErr = fmt.Errorf("first result: %w; last result: %w", firstPassErr, lastPassErr)
+			passAttempted = true
+			snapshot, fetchErr := fetch(ctx, cfg.receiverURL, requests[i].Marker)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				if fetchErr != nil {
+					passErrors.add(fmt.Errorf("marker %s: %w", requests[i].Marker, fetchErr))
+				}
+				return passSnapshots, traceAssertionDeadlineError(
+					ctxErr,
+					passErrors.err(),
+					summarizeMarkerErrors(semanticErrors),
+				)
 			}
-		}
+			if fetchErr != nil {
+				passErrors.add(fmt.Errorf("marker %s: %w", requests[i].Marker, fetchErr))
+				continue
+			}
 
-		if valid {
+			passSnapshots[i] = snapshot
+			assertionErr := tracecheck.AssertSnapshot(snapshot, expectationFor(cfg, requests[i]))
+			if assertionErr == nil {
+				semanticErrors[i] = nil
+				continue
+			}
+			markerErr := fmt.Errorf("marker %s: %w", requests[i].Marker, assertionErr)
+			semanticErrors[i] = markerErr
+			passErrors.add(markerErr)
+		}
+		snapshots = passSnapshots
+		lastErr = passErrors.err()
+
+		if lastErr == nil {
 			if validSince.IsZero() {
 				validSince = time.Now()
 			}
@@ -1308,9 +1331,73 @@ func awaitAssertionsWithFetcher(
 
 		select {
 		case <-ctx.Done():
-			return snapshots, fmt.Errorf("trace assertion deadline: %w (last result: %w)", ctx.Err(), lastErr)
+			return snapshots, traceAssertionDeadlineError(
+				ctx.Err(),
+				lastErr,
+				summarizeMarkerErrors(semanticErrors),
+			)
 		case <-ticker.C:
 		}
+	}
+}
+
+func snapshotsForAssertionDeadline(
+	completed []tracecheck.Snapshot,
+	current []tracecheck.Snapshot,
+	currentAttempted bool,
+) []tracecheck.Snapshot {
+	if currentAttempted {
+		return current
+	}
+	return completed
+}
+
+type markerErrorSummary struct {
+	first error
+	last  error
+	count int
+}
+
+func (summary *markerErrorSummary) add(err error) {
+	if summary.first == nil {
+		summary.first = err
+	}
+	summary.last = err
+	summary.count++
+}
+
+func (summary markerErrorSummary) err() error {
+	if summary.count <= 1 {
+		return summary.first
+	}
+	return fmt.Errorf("first result: %w; last result: %w", summary.first, summary.last)
+}
+
+func summarizeMarkerErrors(errs []error) error {
+	var summary markerErrorSummary
+	for _, err := range errs {
+		if err != nil {
+			summary.add(err)
+		}
+	}
+	return summary.err()
+}
+
+func traceAssertionDeadlineError(ctxErr, currentErr, semanticErr error) error {
+	switch {
+	case currentErr != nil && semanticErr != nil:
+		return fmt.Errorf(
+			"trace assertion deadline: %w (current result: %w; active semantic result: %w)",
+			ctxErr,
+			currentErr,
+			semanticErr,
+		)
+	case currentErr != nil:
+		return fmt.Errorf("trace assertion deadline: %w (current result: %w)", ctxErr, currentErr)
+	case semanticErr != nil:
+		return fmt.Errorf("trace assertion deadline: %w (active semantic result: %w)", ctxErr, semanticErr)
+	default:
+		return fmt.Errorf("trace assertion deadline: %w", ctxErr)
 	}
 }
 

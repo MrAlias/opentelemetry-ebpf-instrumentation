@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -118,23 +119,194 @@ func TestRunResultEncodingKeepsPressureCountsOnSeparateLines(t *testing.T) {
 
 func TestAwaitAssertionsFetchesMarkersAfterAnEarlierFailure(t *testing.T) {
 	seen := map[string]int{}
+	requests := []requestCase{{Marker: "first"}, {Marker: "second"}, {Marker: "third"}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	markerErrors := map[string]error{
+		"first":  errors.New("first unavailable"),
+		"second": errors.New("second unavailable"),
+		"third":  errors.New("third unavailable"),
+	}
 	fetch := func(_ context.Context, _ string, marker string) (tracecheck.Snapshot, error) {
 		seen[marker]++
-		return tracecheck.Snapshot{}, errors.New("snapshot unavailable")
+		if marker == requests[len(requests)-1].Marker {
+			cancel()
+		}
+		return tracecheck.Snapshot{}, markerErrors[marker]
 	}
-
-	requests := []requestCase{{Marker: "first"}, {Marker: "second"}, {Marker: "third"}}
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
 
 	_, err := awaitAssertionsWithFetcher(ctx, config{}, requests, fetch)
 
-	require.Error(t, err)
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, err, markerErrors["first"])
+	require.ErrorIs(t, err, markerErrors["third"])
 	require.ErrorContains(t, err, "first result: marker first")
 	require.ErrorContains(t, err, "last result: marker third")
 	for _, request := range requests {
-		assert.Positive(t, seen[request.Marker], "marker %s was not fetched", request.Marker)
+		assert.Equal(t, 1, seen[request.Marker], "marker %s fetch count", request.Marker)
 	}
+}
+
+func TestAwaitAssertionsPreservesSemanticFailureAcrossFetchDeadline(t *testing.T) {
+	wrong := pressureCase("wrong", "trace-wanted", "client-wanted", "trace-foreign", "foreign")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	fetches := 0
+	fetch := func(_ context.Context, _ string, _ string) (tracecheck.Snapshot, error) {
+		fetches++
+		if fetches == 1 {
+			return wrong.Trace, nil
+		}
+		cancel()
+		return tracecheck.Snapshot{}, ctx.Err()
+	}
+	cfg := config{
+		scenario:      "pressure",
+		apacheService: "apache-proxy",
+		javaService:   "java-backend",
+	}
+
+	snapshots, err := awaitAssertionsWithFetcher(ctx, cfg, []requestCase{wrong.Request}, fetch)
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorContains(t, err, "current result: marker wrong: context canceled")
+	require.ErrorContains(t, err, "active semantic result: marker wrong")
+	require.ErrorContains(t, err, "identify Apache client span")
+	assert.Equal(t, 2, fetches)
+	require.Len(t, snapshots, 1)
+	assert.Equal(t, tracecheck.Snapshot{}, snapshots[0])
+}
+
+func TestAwaitAssertionsClearsResolvedMarkerWithoutReusingFailedFetch(t *testing.T) {
+	exactA := pressureCase("fresh-a", "trace-a", "client-a", "trace-a", "client-a")
+	wrongA := pressureCase("fresh-a", "trace-a", "client-a", "trace-foreign", "foreign")
+	exactB := pressureCase("fresh-b", "trace-b", "client-b", "trace-b", "client-b")
+	cfg := config{
+		scenario:      "pressure",
+		apacheService: "apache-proxy",
+		javaService:   "java-backend",
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	fetches := 0
+	receiverErr := errors.New("receiver unavailable")
+	fetch := func(_ context.Context, _ string, _ string) (tracecheck.Snapshot, error) {
+		fetches++
+		switch fetches {
+		case 1:
+			return wrongA.Trace, nil
+		case 2:
+			return exactB.Trace, nil
+		case 3:
+			return exactA.Trace, nil
+		default:
+			cancel()
+			return tracecheck.Snapshot{}, receiverErr
+		}
+	}
+
+	requests := []requestCase{exactA.Request, exactB.Request}
+	snapshots, err := awaitAssertionsWithFetcher(ctx, cfg, requests, fetch)
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, err, receiverErr)
+	require.NotContains(t, err.Error(), "identify Apache client span")
+	require.NotContains(t, err.Error(), "%!w")
+	assert.Equal(t, 4, fetches)
+	require.Len(t, snapshots, 2)
+	assert.Equal(t, exactA.Trace, snapshots[0])
+	assert.Equal(t, tracecheck.Snapshot{}, snapshots[1])
+	cases := []caseResult{
+		{Request: exactA.Request, Trace: snapshots[0]},
+		{Request: exactB.Request, Trace: snapshots[1]},
+	}
+	summary := summarizePressureCorrelation(cfg, cases)
+	assert.Equal(t, pressureCorrelationSummary{ExactHitCount: 1, UnresolvedCount: 1}, summary)
+	assert.Equal(t, tracecheck.PressureParentExactHit, cases[0].PressureParentOutcome)
+	assert.Equal(t, tracecheck.PressureParentUnresolved, cases[1].PressureParentOutcome)
+
+	var output bytes.Buffer
+	require.NoError(t, encodeRunResult(&output, &runResult{
+		Status:              "failed",
+		PressureCorrelation: &summary,
+		Cases:               cases,
+	}))
+	assert.Contains(t, output.String(), "\n    \"exact_hit_count\": 1,\n")
+	assert.Contains(t, output.String(), "\n    \"unresolved_count\": 1\n")
+	assert.Contains(t, output.String(), "\"pressure_parent_outcome\": \"unresolved\"")
+	var decoded runResult
+	require.NoError(t, json.Unmarshal(output.Bytes(), &decoded))
+	require.NotNil(t, decoded.PressureCorrelation)
+	assert.Equal(t, 1, decoded.PressureCorrelation.ExactHitCount)
+	assert.Equal(t, 1, decoded.PressureCorrelation.UnresolvedCount)
+	require.Len(t, decoded.Cases, 2)
+	assert.Equal(t, tracecheck.PressureParentExactHit, decoded.Cases[0].PressureParentOutcome)
+	assert.Equal(t, tracecheck.PressureParentUnresolved, decoded.Cases[1].PressureParentOutcome)
+}
+
+func TestAwaitAssertionsRejectsSnapshotFetchedAfterCancellation(t *testing.T) {
+	exact := pressureCase("canceled", "trace-exact", "client-exact", "trace-exact", "client-exact")
+	cfg := config{
+		scenario:      "pressure",
+		apacheService: "apache-proxy",
+		javaService:   "java-backend",
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fetches := 0
+	fetch := func(_ context.Context, _ string, _ string) (tracecheck.Snapshot, error) {
+		fetches++
+		cancel()
+		return exact.Trace, nil
+	}
+
+	snapshots, err := awaitAssertionsWithFetcher(ctx, cfg, []requestCase{exact.Request}, fetch)
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, 1, fetches)
+	require.Len(t, snapshots, 1)
+	assert.Equal(t, tracecheck.Snapshot{}, snapshots[0])
+}
+
+func TestSnapshotsForAssertionDeadlineUsesAttemptedPassOnly(t *testing.T) {
+	completed := []tracecheck.Snapshot{{Marker: "completed"}}
+	current := []tracecheck.Snapshot{{Marker: "current"}}
+
+	assert.Equal(t, completed, snapshotsForAssertionDeadline(completed, current, false))
+	assert.Equal(t, current, snapshotsForAssertionDeadline(completed, current, true))
+}
+
+func TestTraceAssertionDeadlineErrorPreservesEqualMessageCauses(t *testing.T) {
+	currentCause := errors.New("same message")
+	semanticCause := errors.New("same message")
+	currentErr := fmt.Errorf("marker: %w", currentCause)
+	semanticErr := fmt.Errorf("marker: %w", semanticCause)
+
+	err := traceAssertionDeadlineError(context.Canceled, currentErr, semanticErr)
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, err, currentCause)
+	require.ErrorIs(t, err, semanticCause)
+	require.ErrorContains(t, err, "current result")
+	require.ErrorContains(t, err, "active semantic result")
+}
+
+func TestAwaitAssertionsDoesNotFetchWithCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	fetches := 0
+	fetch := func(_ context.Context, _ string, _ string) (tracecheck.Snapshot, error) {
+		fetches++
+		return tracecheck.Snapshot{}, nil
+	}
+
+	_, err := awaitAssertionsWithFetcher(ctx, config{}, []requestCase{{Marker: "canceled"}}, fetch)
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.NotContains(t, err.Error(), "current result")
+	require.NotContains(t, err.Error(), "active semantic result")
+	require.NotContains(t, err.Error(), "%!w")
+	assert.Zero(t, fetches)
 }
 
 func TestOBIFlagsRequestsCoverSampledAndUnsampledParents(t *testing.T) {

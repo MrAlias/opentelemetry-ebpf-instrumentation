@@ -14,6 +14,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/features"
+	"golang.org/x/sys/unix"
 
 	obiebpf "go.opentelemetry.io/obi/pkg/ebpf"
 	ebpfcommon "go.opentelemetry.io/obi/pkg/ebpf/common"
@@ -340,7 +341,12 @@ func (p *Tracer) runJavaRemoteParentTransports(
 
 	if p.javaRemoteParentError != nil {
 		p.log.Warn("Java remote-parent getsockopt transport unavailable", "error", p.javaRemoteParentError)
-		p.observeJavaRemoteParent("getsockopt", "negotiate", javabridge.StatusUnsupported, 1)
+		p.observeJavaRemoteParent(
+			"getsockopt",
+			"negotiate",
+			javaRemoteParentPrimaryFailureStatus(p.javaRemoteParentError),
+			1,
+		)
 	}
 	server, serverDone := p.startJavaRemoteParentFallback(ctx, handler)
 	selected := obi.JavaRemoteParentUnix
@@ -415,6 +421,16 @@ func (p *Tracer) runJavaRemoteParentTransports(
 			retryDelay = javaRemoteParentRetryInitial
 		}
 	}
+}
+
+func javaRemoteParentPrimaryFailureStatus(err error) javabridge.Status {
+	if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+		return javabridge.StatusTransportError
+	}
+	if errors.Is(err, ebpf.ErrNotSupported) {
+		return javabridge.StatusUnsupported
+	}
+	return javabridge.StatusTransportError
 }
 
 func nextJavaRemoteParentRetryDelay(current time.Duration) time.Duration {

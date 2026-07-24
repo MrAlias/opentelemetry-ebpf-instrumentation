@@ -20,6 +20,7 @@ import (
 	"github.com/cilium/ebpf/asm"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 
 	"go.opentelemetry.io/obi/pkg/appolly/services"
 	"go.opentelemetry.io/obi/pkg/config"
@@ -433,12 +434,13 @@ func TestJavaRemoteParentWaitsForLateDataHookReadiness(t *testing.T) {
 }
 
 type javaRemoteParentTestCloser struct {
-	closed bool
+	closeCalls int
+	err        error
 }
 
 func (c *javaRemoteParentTestCloser) Close() error {
-	c.closed = true
-	return nil
+	c.closeCalls++
+	return c.err
 }
 
 func TestJavaRemoteParentPartialSockoptAttachClosesFirstLink(t *testing.T) {
@@ -449,18 +451,73 @@ func TestJavaRemoteParentPartialSockoptAttachClosesFirstLink(t *testing.T) {
 		attachCgroupSetsockopt = originalSet
 	})
 
-	getLink := &javaRemoteParentTestCloser{}
+	attachErr := errors.New("setsockopt attach failed")
+	closeErr := errors.New("getsockopt close failed")
+	getLink := &javaRemoteParentTestCloser{err: closeErr}
 	attachCgroupGetsockopt = func(*ebpf.Program) (io.Closer, error) {
 		return getLink, nil
 	}
 	attachCgroupSetsockopt = func(*ebpf.Program) (io.Closer, error) {
-		return nil, errors.New("setsockopt attach failed")
+		return nil, attachErr
 	}
 
 	link, err := attachJavaRemoteParentSockopt(nil, nil)
 	require.Error(t, err)
+	assert.ErrorIs(t, err, attachErr)
+	assert.ErrorIs(t, err, closeErr)
 	assert.Nil(t, link)
-	assert.True(t, getLink.closed)
+	assert.Equal(t, 1, getLink.closeCalls)
+}
+
+func TestJavaRemoteParentFailedFirstAttachSkipsSecondAttach(t *testing.T) {
+	originalGet := attachCgroupGetsockopt
+	originalSet := attachCgroupSetsockopt
+	t.Cleanup(func() {
+		attachCgroupGetsockopt = originalGet
+		attachCgroupSetsockopt = originalSet
+	})
+
+	attachErr := errors.New("getsockopt attach failed")
+	attachCgroupGetsockopt = func(*ebpf.Program) (io.Closer, error) {
+		return nil, attachErr
+	}
+	attachCgroupSetsockopt = func(*ebpf.Program) (io.Closer, error) {
+		t.Fatal("setsockopt attach attempted after getsockopt attach failed")
+		return nil, nil
+	}
+
+	link, err := attachJavaRemoteParentSockopt(nil, nil)
+	assert.ErrorIs(t, err, attachErr)
+	assert.Nil(t, link)
+}
+
+func TestJavaRemoteParentSockoptCloseCombinesLinkErrors(t *testing.T) {
+	originalGet := attachCgroupGetsockopt
+	originalSet := attachCgroupSetsockopt
+	t.Cleanup(func() {
+		attachCgroupGetsockopt = originalGet
+		attachCgroupSetsockopt = originalSet
+	})
+
+	getCloseErr := errors.New("getsockopt close failed")
+	setCloseErr := errors.New("setsockopt close failed")
+	getLink := &javaRemoteParentTestCloser{err: getCloseErr}
+	setLink := &javaRemoteParentTestCloser{err: setCloseErr}
+	attachCgroupGetsockopt = func(*ebpf.Program) (io.Closer, error) {
+		return getLink, nil
+	}
+	attachCgroupSetsockopt = func(*ebpf.Program) (io.Closer, error) {
+		return setLink, nil
+	}
+
+	links, err := attachJavaRemoteParentSockopt(nil, nil)
+	require.NoError(t, err)
+	require.NotNil(t, links)
+	err = links.Close()
+	assert.ErrorIs(t, err, getCloseErr)
+	assert.ErrorIs(t, err, setCloseErr)
+	assert.Equal(t, 1, getLink.closeCalls)
+	assert.Equal(t, 1, setLink.closeCalls)
 }
 
 type javaRemoteParentRestartTestServer struct {
@@ -474,6 +531,158 @@ func (s *javaRemoteParentRestartTestServer) Serve(ctx context.Context) error {
 
 func (s *javaRemoteParentRestartTestServer) Close() error {
 	return s.close()
+}
+
+func TestJavaRemoteParentPrimaryFailureStatus(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		err      error
+		expected javabridge.Status
+	}{
+		{
+			name:     "operation not permitted",
+			err:      unix.EPERM,
+			expected: javabridge.StatusTransportError,
+		},
+		{
+			name:     "wrapped permission denied",
+			err:      errors.Join(errors.New("cgroup attach failed"), unix.EACCES),
+			expected: javabridge.StatusTransportError,
+		},
+		{
+			name:     "permission denial takes precedence over feature absence",
+			err:      errors.Join(ebpf.ErrNotSupported, unix.EPERM),
+			expected: javabridge.StatusTransportError,
+		},
+		{
+			name:     "kernel feature unavailable",
+			err:      ebpf.ErrNotSupported,
+			expected: javabridge.StatusUnsupported,
+		},
+		{
+			name:     "wrapped kernel feature unavailable",
+			err:      errors.Join(errors.New("feature probe"), ebpf.ErrNotSupported),
+			expected: javabridge.StatusUnsupported,
+		},
+		{
+			name:     "inconclusive feature probe",
+			err:      errors.New("kernel helper probe failed"),
+			expected: javabridge.StatusTransportError,
+		},
+		{
+			name:     "resource exhaustion",
+			err:      unix.ENOMEM,
+			expected: javabridge.StatusTransportError,
+		},
+		{
+			name: "opaque cgroup path permission failure",
+			err: errors.New(
+				"can't open cgroup: open /sys/fs/cgroup: permission denied",
+			),
+			expected: javabridge.StatusTransportError,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, javaRemoteParentPrimaryFailureStatus(tt.err))
+		})
+	}
+}
+
+func TestJavaRemoteParentAutoFallsBackOnPrimaryPermissionFailure(t *testing.T) {
+	originalGet := attachCgroupGetsockopt
+	originalSet := attachCgroupSetsockopt
+	originalReadiness := readJavaRemoteParentDataHookReadiness
+	originalServer := newJavaRemoteParentFallbackServer
+	t.Cleanup(func() {
+		attachCgroupGetsockopt = originalGet
+		attachCgroupSetsockopt = originalSet
+		readJavaRemoteParentDataHookReadiness = originalReadiness
+		newJavaRemoteParentFallbackServer = originalServer
+	})
+
+	for _, tt := range []struct {
+		name string
+		err  error
+	}{
+		{name: "operation not permitted", err: unix.EPERM},
+		{name: "permission denied", err: unix.EACCES},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			setsockoptCalled := false
+			attachCgroupGetsockopt = func(*ebpf.Program) (io.Closer, error) {
+				return nil, tt.err
+			}
+			attachCgroupSetsockopt = func(*ebpf.Program) (io.Closer, error) {
+				setsockoptCalled = true
+				return nil, nil
+			}
+			readJavaRemoteParentDataHookReadiness = func(*ebpf.Map) (bool, error) {
+				return true, nil
+			}
+
+			started := make(chan struct{})
+			serverClosed := false
+			newJavaRemoteParentFallbackServer = func(
+				javabridge.ServerOptions,
+				javabridge.Handler,
+			) (javaRemoteParentFallbackServer, error) {
+				return &javaRemoteParentRestartTestServer{
+					serve: func(ctx context.Context) error {
+						close(started)
+						<-ctx.Done()
+						return ctx.Err()
+					},
+					close: func() error {
+						serverClosed = true
+						return nil
+					},
+				}, nil
+			}
+
+			reporter := &javaRemoteParentRecordingReporter{}
+			cfg := obi.DefaultConfig
+			cfg.Java.RemoteParent.Transport = obi.JavaRemoteParentAuto
+			tracer := New(&cfg, reporter)
+			tracer.javaRemoteParentLoaded = true
+			tracer.bpfJavaRemoteParentMaps.JavaRemoteParentDataHookReadiness = &ebpf.Map{}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				tracer.runJavaRemoteParentTransports(ctx, nil)
+			}()
+
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				t.Fatal("fallback transport did not start")
+			}
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("transport shutdown did not complete")
+			}
+
+			assert.False(t, setsockoptCalled)
+			assert.True(t, serverClosed)
+			assert.Equal(t, []javaRemoteParentObservation{
+				{
+					transport: "getsockopt",
+					operation: "negotiate",
+					status:    "transport_error",
+					count:     1,
+				},
+				{
+					transport: "unix",
+					operation: "select",
+					status:    "valid",
+					count:     1,
+				},
+			}, reporter.observations)
+		})
+	}
 }
 
 func TestJavaRemoteParentFallbackRecoversAfterServeFailure(t *testing.T) {

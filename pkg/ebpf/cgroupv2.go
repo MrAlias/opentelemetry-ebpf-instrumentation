@@ -7,6 +7,7 @@ package ebpf // import "go.opentelemetry.io/obi/pkg/ebpf"
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 
@@ -34,27 +35,55 @@ type cgroupV2Result struct {
 
 var cgroupV2Once = sync.OnceValue(func() cgroupV2Result {
 	log := slog.With("component", "ebpf.cgroupv2")
-	if enabled, err := v2.Enabled(); err == nil && enabled {
-		return cgroupV2Result{path: cgroupFSRoot, mfd: -1}
+	result := resolveCgroupV2(v2.Enabled, isCgroup2Mount, fsmountCgroupV2)
+	if result.err != nil {
+		log.Warn("could not resolve cgroupv2", "error", result.err)
+	} else if result.path == "" {
+		log.Info("self-mounted cgroup2 hierarchy via fsmount", "mfd", result.mfd)
 	}
-	if isCgroup2Mount(cgroupV2Hybrid) {
-		return cgroupV2Result{path: cgroupV2Hybrid, mfd: -1}
-	}
-	mfd, err := fsmountCgroupV2()
-	if err != nil {
-		log.Warn("could not self-mount cgroupv2", "error", err)
-		return cgroupV2Result{mfd: -1, err: errNoCgroupV2}
-	}
-	log.Info("self-mounted cgroup2 hierarchy via fsmount", "mfd", mfd)
-	return cgroupV2Result{mfd: mfd}
+	return result
 })
 
-func isCgroup2Mount(path string) bool {
+func resolveCgroupV2(
+	enabled func() (bool, error),
+	isMount func(string) (bool, error),
+	selfMount func() (int, error),
+) cgroupV2Result {
+	unified, unifiedErr := enabled()
+	if unifiedErr == nil && unified {
+		return cgroupV2Result{path: cgroupFSRoot, mfd: -1}
+	}
+
+	hybrid, hybridErr := isMount(cgroupV2Hybrid)
+	if hybridErr == nil && hybrid {
+		return cgroupV2Result{path: cgroupV2Hybrid, mfd: -1}
+	}
+
+	mfd, mountErr := selfMount()
+	if mountErr == nil {
+		return cgroupV2Result{mfd: mfd}
+	}
+
+	cause := errors.Join(unifiedErr, hybridErr, mountErr)
+	resultErr := fmt.Errorf("%w: %w", errNoCgroupV2, cause)
+	if errors.Is(cause, ebpf.ErrNotSupported) ||
+		errors.Is(mountErr, unix.ENODEV) ||
+		errors.Is(mountErr, unix.ENOSYS) ||
+		errors.Is(mountErr, unix.EOPNOTSUPP) {
+		resultErr = fmt.Errorf("%w: %w", resultErr, ebpf.ErrNotSupported)
+	}
+	return cgroupV2Result{
+		mfd: -1,
+		err: resultErr,
+	}
+}
+
+func isCgroup2Mount(path string) (bool, error) {
 	var st unix.Statfs_t
 	if err := unix.Statfs(path, &st); err != nil {
-		return false
+		return false, err
 	}
-	return st.Type == cgroup2Magic
+	return st.Type == cgroup2Magic, nil
 }
 
 // fsmountCgroupV2 creates an anonymous cgroupv2 mount via fsopen+fsmount.

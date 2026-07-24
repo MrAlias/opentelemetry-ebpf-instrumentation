@@ -17,14 +17,18 @@ public final class ObiConfigurablePropagatorProvider implements ConfigurableProp
 
   @Override
   public TextMapPropagator getPropagator(ConfigProperties config) {
-    boolean enabled = config.getBoolean(ENABLED_PROPERTY, false);
-    AgentCompatibility compatibility = AgentCompatibility.inspect();
+    return getPropagator(config.getBoolean(ENABLED_PROPERTY, false), AgentCompatibility.inspect());
+  }
+
+  TextMapPropagator getPropagator(boolean configuredEnabled, AgentCompatibility compatibility) {
     logger.info("OBI remote-parent compatibility " + compatibility.snapshot());
-    if (enabled && !compatibility.isSupported()) {
+    boolean enabled = configuredEnabled;
+    if (!configuredEnabled) {
+      logger.info("OBI remote-parent propagator disabled by configuration");
+    } else if (!compatibility.isSupported()) {
       logger.warning("OBI remote-parent propagator disabled by compatibility gate");
       enabled = false;
-    }
-    if (enabled) {
+    } else {
       logger.info("OBI remote-parent propagator enabled");
     }
     return new ObiRemoteParentPropagator(enabled, new BootstrapBridgeAccess());

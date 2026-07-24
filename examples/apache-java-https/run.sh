@@ -1317,9 +1317,11 @@ assert_runtime_contract() {
   if environment_has_line \
     "$java_environment" \
     "OTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar"; then
-    extension="disabled"
+    extension="invalid"
     if environment_has_line "$java_environment" "OTEL_OBI_REMOTE_PARENT_ENABLED=true"; then
       extension="enabled"
+    elif environment_has_line "$java_environment" "OTEL_OBI_REMOTE_PARENT_ENABLED=false"; then
+      extension="disabled"
     fi
   fi
 
@@ -3291,6 +3293,8 @@ run_restart_during_traffic_control() (
 )
 
 run_extension_controls() {
+  local disabled_since=""
+
   stop_obi_for_no_state_control "extension-controls"
   export JAVA_TOOL_OPTIONS_VALUE="-javaagent:/otel/official-javaagent.jar"
 
@@ -3309,14 +3313,16 @@ run_extension_controls() {
   export EXTENSION_ENABLED=false
   export OTEL_JAVAAGENT_EXTENSIONS_VALUE="/otel/obi-otel-extension.jar"
   export OTEL_PROPAGATORS_VALUE="obi,tracecontext,baggage"
+  disabled_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')"
   run_bounded 120 \
     "${COMPOSE[@]}" up --detach --force-recreate java-backend apache-proxy
   wait_for_http "$APACHE_HTTPS_HEALTH_ENDPOINT" "extension-disabled HTTPS path"
+  assert_runtime_contract extension-disabled
   wait_for_log \
     java-backend \
-    "OBI remote-parent propagator disabled by compatibility gate" \
-    "disabled external extension"
-  assert_runtime_contract extension-disabled
+    "OBI remote-parent propagator disabled by configuration" \
+    "disabled external extension" \
+    "$disabled_since"
   SCENARIO_VARIANT="extension-disabled"
   run_scenario w3c-only
   SCENARIO_VARIANT=""

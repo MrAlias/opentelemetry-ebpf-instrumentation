@@ -6,6 +6,7 @@
 package io.opentelemetry.obi.java.extension;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.ByteArrayOutputStream;
@@ -56,10 +57,45 @@ class OfficialAgentCompatibilityTest {
     command.add("-javaagent:" + agent.getAbsolutePath());
     command.add("-Dotel.javaagent.extensions=" + extension.getAbsolutePath());
     command.add("-Dotel.propagators=obi,tracecontext,baggage");
-    command.add("-Dotel.obi.remote.parent.enabled=true");
     command.add("-Dotel.traces.exporter=none");
     command.add("-Dotel.metrics.exporter=none");
     command.add("-Dotel.logs.exporter=none");
+
+    String text = runAgent(command, true);
+    assertTrue(text.contains("OBI remote-parent compatibility"), text);
+    assertTrue(text.contains(distribution), text);
+    assertTrue(text.contains(version), text);
+    assertTrue(text.contains("api_version=1.62.0"), text);
+    assertTrue(text.contains("api_version_source=agent_spi_alignment"), text);
+    assertTrue(text.contains("spi_version=1.62.0"), text);
+    assertTrue(text.contains("extension_version=" + extensionVersion), text);
+    assertTrue(text.contains("provider=obi,supported=true,reason=compatible"), text);
+    assertTrue(text.contains("OBI remote-parent propagator enabled"), text);
+    assertTrue(text.contains("api_loader=bootstrap"), text);
+    assertTrue(
+        text.contains("spi_loader=io.opentelemetry.javaagent.bootstrap.AgentClassLoader"), text);
+    assertTrue(
+        text.contains("extension_loader=io.opentelemetry.javaagent.tooling.ExtensionClassLoader"),
+        text);
+    assertFalse(text.contains("OBI remote-parent propagator disabled by compatibility gate"), text);
+    assertFalse(text.contains("OBI remote-parent propagator disabled by configuration"), text);
+
+    String disabledText = runAgent(command, false);
+    assertTrue(disabledText.contains("OBI remote-parent compatibility"), disabledText);
+    assertTrue(
+        disabledText.contains("provider=obi,supported=true,reason=compatible"), disabledText);
+    assertTrue(
+        disabledText.contains("OBI remote-parent propagator disabled by configuration"),
+        disabledText);
+    assertFalse(disabledText.contains("OBI remote-parent propagator enabled"), disabledText);
+    assertFalse(
+        disabledText.contains("OBI remote-parent propagator disabled by compatibility gate"),
+        disabledText);
+  }
+
+  private static String runAgent(List<String> baseCommand, boolean enabled) throws Exception {
+    List<String> command = new ArrayList<>(baseCommand);
+    command.add("-Dotel.obi.remote.parent.enabled=" + enabled);
     command.add("-version");
 
     Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
@@ -80,21 +116,7 @@ class OfficialAgentCompatibilityTest {
 
     String text = new String(output.toByteArray(), StandardCharsets.UTF_8);
     assertEquals(0, process.exitValue(), text);
-    assertTrue(text.contains("OBI remote-parent compatibility"), text);
-    assertTrue(text.contains(distribution), text);
-    assertTrue(text.contains(version), text);
-    assertTrue(text.contains("api_version=1.62.0"), text);
-    assertTrue(text.contains("api_version_source=agent_spi_alignment"), text);
-    assertTrue(text.contains("spi_version=1.62.0"), text);
-    assertTrue(text.contains("extension_version=" + extensionVersion), text);
-    assertTrue(text.contains("provider=obi,supported=true,reason=compatible"), text);
-    assertTrue(text.contains("OBI remote-parent propagator enabled"), text);
-    assertTrue(text.contains("api_loader=bootstrap"), text);
-    assertTrue(
-        text.contains("spi_loader=io.opentelemetry.javaagent.bootstrap.AgentClassLoader"), text);
-    assertTrue(
-        text.contains("extension_loader=io.opentelemetry.javaagent.tooling.ExtensionClassLoader"),
-        text);
+    return text;
   }
 
   private static Thread copyOutput(InputStream input, ByteArrayOutputStream output) {

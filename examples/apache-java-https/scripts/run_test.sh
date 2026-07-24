@@ -3583,6 +3583,54 @@ test_runtime_environment_line_matching() {
   fi
 }
 
+test_extension_disabled_runtime_requires_explicit_false() {
+  local -r result_dir="$TEST_TMP_DIR/extension-disabled-runtime"
+  local runtime_environment=""
+
+  mkdir -p -- "$result_dir"
+  (
+    RESULT_DIR="$result_dir"
+    COMPOSE=(test-compose)
+    run_bounded() {
+      case "$*" in
+        *"test-compose ps --quiet java-backend")
+          printf 'java-container\n'
+          ;;
+        *"docker inspect --format "*" java-container")
+          printf '%s\n' "$runtime_environment"
+          ;;
+        *"test-compose ps --quiet obi")
+          return 0
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+    }
+    log_error() {
+      return 0
+    }
+
+    runtime_environment=$'JAVA_TOOL_OPTIONS=-javaagent:/otel/official-javaagent.jar\nOTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar'
+    if assert_runtime_contract extension-disabled; then
+      printf 'extension-disabled contract accepted a missing false setting\n' >&2
+      return 1
+    fi
+
+    runtime_environment+=$'\nOTEL_OBI_REMOTE_PARENT_ENABLED=disabled'
+    if assert_runtime_contract extension-disabled; then
+      printf 'extension-disabled contract accepted a malformed false setting\n' >&2
+      return 1
+    fi
+
+    runtime_environment=$'JAVA_TOOL_OPTIONS=-javaagent:/otel/official-javaagent.jar\nOTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar\nOTEL_OBI_REMOTE_PARENT_ENABLED=false'
+    assert_runtime_contract extension-disabled || {
+      printf 'extension-disabled contract rejected the exact false setting\n' >&2
+      return 1
+    }
+  )
+}
+
 test_instrumented_readiness_precedes_https_traffic() {
   local -r result_dir="$TEST_TMP_DIR/readiness-order"
   local -r observed="$result_dir/observed"
@@ -4022,6 +4070,64 @@ test_disabled_control_waits_for_instrumentation() {
     'scenario:disabled' >"$expected"
   cmp -s -- "$expected" "$observed" || {
     printf 'disabled control used stale instrumentation readiness\n' >&2
+    diff -u -- "$expected" "$observed" >&2 || true
+    return 1
+  }
+}
+
+test_extension_disabled_control_uses_configuration_log() {
+  local -r observed="$TEST_TMP_DIR/extension-disabled.observed"
+  local -r expected="$TEST_TMP_DIR/extension-disabled.expected"
+
+  (
+    COMPOSE=(test-compose)
+    date() {
+      printf 'cursor\n' >>"$observed"
+      printf 'extension-disabled-cursor\n'
+    }
+    stop_obi_for_no_state_control() {
+      printf 'stop-obi:%s\n' "$1" >>"$observed"
+    }
+    run_bounded() {
+      printf 'compose:%s:extension=%s:enabled=%s:propagators=%s\n' \
+        "$*" \
+        "$OTEL_JAVAAGENT_EXTENSIONS_VALUE" \
+        "$EXTENSION_ENABLED" \
+        "$OTEL_PROPAGATORS_VALUE" >>"$observed"
+    }
+    wait_for_http() {
+      printf 'http:%s\n' "$2" >>"$observed"
+    }
+    assert_runtime_contract() {
+      printf 'runtime:%s\n' "$1" >>"$observed"
+    }
+    wait_for_log() {
+      printf 'log:%s:%s:%s\n' "$2" "$3" "${4:-}" >>"$observed"
+    }
+    run_scenario() {
+      printf 'scenario:%s:%s\n' "$SCENARIO_VARIANT" "$1" >>"$observed"
+    }
+
+    run_extension_controls
+  ) || {
+    printf 'extension-disabled lifecycle probe failed\n' >&2
+    return 1
+  }
+
+  printf '%s\n' \
+    'stop-obi:extension-controls' \
+    'compose:120 test-compose up --detach --force-recreate java-backend apache-proxy:extension=:enabled=false:propagators=tracecontext,baggage' \
+    'http:extension-absent HTTPS path' \
+    'runtime:extension-absent' \
+    'scenario:extension-absent:w3c-only' \
+    'cursor' \
+    'compose:120 test-compose up --detach --force-recreate java-backend apache-proxy:extension=/otel/obi-otel-extension.jar:enabled=false:propagators=obi,tracecontext,baggage' \
+    'http:extension-disabled HTTPS path' \
+    'runtime:extension-disabled' \
+    'log:OBI remote-parent propagator disabled by configuration:disabled external extension:extension-disabled-cursor' \
+    'scenario:extension-disabled:w3c-only' >"$expected"
+  cmp -s -- "$expected" "$observed" || {
+    printf 'extension-disabled control used the wrong lifecycle predicate\n' >&2
     diff -u -- "$expected" "$observed" >&2 || true
     return 1
   }
@@ -4853,6 +4959,7 @@ main() {
   test_compose_commands_close_stdin
   test_pipeline_dependencies_are_declared
   test_runtime_environment_line_matching
+  test_extension_disabled_runtime_requires_explicit_false
   test_instrumented_readiness_precedes_https_traffic
   test_apache_readiness_requires_the_full_pool
   test_apache_instrumented_process_metric_is_exact
@@ -4864,6 +4971,7 @@ main() {
   test_https_health_probes_close_the_backend_connection
   test_recreated_stack_readiness_uses_log_cursor
   test_disabled_control_waits_for_instrumentation
+  test_extension_disabled_control_uses_configuration_log
   test_late_attach_recycles_only_apache_after_readiness
   test_control_response_normalizes_connection_diagnostics
   test_restart_readiness_uses_log_cursor

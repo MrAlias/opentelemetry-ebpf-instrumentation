@@ -32,11 +32,19 @@ final class ObiSelectionRecordingPropagator implements TextMapPropagator {
   @Override
   public <C> Context extract(Context context, C carrier, TextMapGetter<C> getter) {
     Context input = context == null ? Context.root() : context;
+    Span previousSpan = Span.fromContext(input);
     ObiContextCandidate previous = input.get(ObiContextCandidate.KEY);
     Context extracted = delegate.extract(input, carrier, getter);
-    ObiContextCandidate candidate = extracted.get(ObiContextCandidate.KEY);
-    if (candidate != null && candidate != previous) {
-      candidate.recordSelection(Span.fromContext(extracted));
+    if (previous != null) {
+      ObiContextCandidate selected =
+          previous.followSelection(previousSpan, Span.fromContext(extracted));
+      if (selected != null) {
+        extracted = extracted.with(ObiContextCandidate.KEY, selected);
+        BridgeAccess selection = previous.claimSelection();
+        if (selection != null) {
+          selection.recordStandardParentWon();
+        }
+      }
     }
     return extracted;
   }

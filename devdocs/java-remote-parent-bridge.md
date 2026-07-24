@@ -81,11 +81,22 @@ sequenceDiagram
     Agent->>Agent: Record final selection and start one server span
 ```
 
-The extension wraps the completed stock composite only to compare the final
-selected `Span` object with the OBI candidate and increment the fixed
-`discard_standard` diagnostic. It does not inspect carrier bytes or duplicate
-the stock W3C parser. The transport value has already been resolved by the
-one-shot take in either branch.
+The OpenTelemetry SDK applies the extension's customizer to each configured
+propagator before composing them. Each wrapper compares the `Span` selected by
+its delegate with both the `Span` in the input context and an active OBI
+candidate. A delegate that preserves the input span, even while adding baggage,
+leaves the candidate unresolved for later propagators. The first different
+valid selection made directly from the candidate increments the fixed
+`discard_standard` diagnostic exactly once. Each selected context receives a
+branch-local marker while the original accounting claim remains shared, so
+repeated and concurrent extraction can follow different valid W3C results
+without duplicate accounting. An inherited candidate marker on a different
+valid span is rebound before the current execution's transport is discarded.
+Callers that continue with the returned context recognize the rebound marker;
+concurrent executions still discard independently because each can own a
+different request transport. The extension does not inspect carrier bytes or
+duplicate the stock W3C parser. The transport value has already been resolved by
+the one-shot take in either branch.
 
 The extension is loaded when the JVM starts. The OBI helper may attach later;
 the extension retries bootstrap-bridge discovery with bounded backoff and does

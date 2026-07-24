@@ -7,9 +7,11 @@ package io.opentelemetry.obi.java.extension;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.opentelemetry.api.baggage.Baggage;
 import io.opentelemetry.api.baggage.propagation.W3CBaggagePropagator;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.SpanContext;
@@ -19,9 +21,16 @@ import io.opentelemetry.api.trace.propagation.W3CTraceContextPropagator;
 import io.opentelemetry.context.Context;
 import io.opentelemetry.context.propagation.TextMapGetter;
 import io.opentelemetry.context.propagation.TextMapPropagator;
+import io.opentelemetry.context.propagation.TextMapSetter;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
@@ -30,6 +39,8 @@ class ObiRemoteParentPropagatorTest {
   private static final String OBI_PARENT_ID = "1011121314151617";
   private static final String W3C_TRACE_ID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
   private static final String W3C_PARENT_ID = "bbbbbbbbbbbbbbbb";
+  private static final String ALTERNATE_TRACE_ID = "cccccccccccccccccccccccccccccccc";
+  private static final String ALTERNATE_PARENT_ID = "dddddddddddddddd";
 
   @Test
   void installsExactRemoteParent() {
@@ -49,11 +60,10 @@ class ObiRemoteParentPropagatorTest {
   void validW3cParentWinsAfterObiCandidateInConfiguredOrder() {
     RecordingBridge bridge = new RecordingBridge();
     TextMapPropagator composite =
-        new ObiSelectionRecordingPropagator(
-            TextMapPropagator.composite(
-                new ObiRemoteParentPropagator(true, bridge),
-                W3CTraceContextPropagator.getInstance(),
-                W3CBaggagePropagator.getInstance()));
+        TextMapPropagator.composite(
+            new ObiSelectionRecordingPropagator(new ObiRemoteParentPropagator(true, bridge)),
+            new ObiSelectionRecordingPropagator(W3CTraceContextPropagator.getInstance()),
+            new ObiSelectionRecordingPropagator(W3CBaggagePropagator.getInstance()));
     Map<String, String> carrier = new HashMap<>();
     carrier.put("traceparent", "00-" + W3C_TRACE_ID + "-" + W3C_PARENT_ID + "-00");
 
@@ -69,19 +79,19 @@ class ObiRemoteParentPropagatorTest {
   }
 
   @Test
-  void matchingW3cParentStillWinsAndConsumesObiCandidate() {
+  void matchingW3cParentWinsOnlyOnceAcrossRepeatedExtraction() {
     RecordingBridge bridge = new RecordingBridge(1, W3C_TRACE_ID, W3C_PARENT_ID);
     TextMapPropagator composite =
-        new ObiSelectionRecordingPropagator(
-            TextMapPropagator.composite(
-                new ObiRemoteParentPropagator(true, bridge),
-                W3CTraceContextPropagator.getInstance()));
+        TextMapPropagator.composite(
+            new ObiSelectionRecordingPropagator(new ObiRemoteParentPropagator(true, bridge)),
+            new ObiSelectionRecordingPropagator(W3CTraceContextPropagator.getInstance()));
     Map<String, String> carrier =
         Collections.singletonMap("traceparent", "00-" + W3C_TRACE_ID + "-" + W3C_PARENT_ID + "-01");
 
-    SpanContext parent =
-        Span.fromContext(composite.extract(Context.root(), carrier, MapGetter.INSTANCE))
-            .getSpanContext();
+    Context extracted = composite.extract(Context.root(), carrier, MapGetter.INSTANCE);
+    Context repeated = composite.extract(extracted, carrier, MapGetter.INSTANCE);
+    Context repeatedAgain = composite.extract(repeated, carrier, MapGetter.INSTANCE);
+    SpanContext parent = Span.fromContext(repeatedAgain).getSpanContext();
 
     assertEquals(W3C_TRACE_ID, parent.getTraceId());
     assertEquals(W3C_PARENT_ID, parent.getSpanId());
@@ -92,13 +102,57 @@ class ObiRemoteParentPropagatorTest {
   }
 
   @Test
+  void concurrentConflictingW3cSelectionsRemainBranchLocal() throws Exception {
+    RecordingBridge bridge = new RecordingBridge();
+    TextMapPropagator obi =
+        new ObiSelectionRecordingPropagator(new ObiRemoteParentPropagator(true, bridge));
+    TextMapPropagator w3c =
+        new ObiSelectionRecordingPropagator(
+            new ExtractionBarrierPropagator(
+                W3CTraceContextPropagator.getInstance(), new CountDownLatch(2)));
+    Map<String, String> firstCarrier =
+        Collections.singletonMap("traceparent", "00-" + W3C_TRACE_ID + "-" + W3C_PARENT_ID + "-01");
+    Map<String, String> secondCarrier =
+        Collections.singletonMap(
+            "traceparent", "00-" + ALTERNATE_TRACE_ID + "-" + ALTERNATE_PARENT_ID + "-01");
+    Context candidate = obi.extract(Context.root(), Collections.emptyMap(), MapGetter.INSTANCE);
+    ExecutorService executor = Executors.newFixedThreadPool(2);
+
+    try {
+      Future<Context> first =
+          executor.submit(() -> w3c.extract(candidate, firstCarrier, MapGetter.INSTANCE));
+      Future<Context> second =
+          executor.submit(() -> w3c.extract(candidate, secondCarrier, MapGetter.INSTANCE));
+      Context firstSelected = first.get(5, TimeUnit.SECONDS);
+      Context secondSelected = second.get(5, TimeUnit.SECONDS);
+
+      assertNotSame(Span.fromContext(firstSelected), Span.fromContext(secondSelected));
+      assertFalse(
+          Span.fromContext(firstSelected)
+              .getSpanContext()
+              .equals(Span.fromContext(secondSelected).getSpanContext()));
+
+      obi.extract(firstSelected, firstCarrier, MapGetter.INSTANCE);
+      obi.extract(secondSelected, secondCarrier, MapGetter.INSTANCE);
+      obi.extract(secondSelected, secondCarrier, MapGetter.INSTANCE);
+      obi.extract(firstSelected, firstCarrier, MapGetter.INSTANCE);
+    } finally {
+      executor.shutdownNow();
+      assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+    }
+
+    assertEquals(1, bridge.takeCalls.get());
+    assertEquals(0, bridge.discardCalls.get());
+    assertEquals(1, bridge.standardParentCalls.get());
+  }
+
+  @Test
   void invalidW3cParentLeavesObiCandidate() {
     RecordingBridge bridge = new RecordingBridge();
     TextMapPropagator composite =
-        new ObiSelectionRecordingPropagator(
-            TextMapPropagator.composite(
-                new ObiRemoteParentPropagator(true, bridge),
-                W3CTraceContextPropagator.getInstance()));
+        TextMapPropagator.composite(
+            new ObiSelectionRecordingPropagator(new ObiRemoteParentPropagator(true, bridge)),
+            new ObiSelectionRecordingPropagator(W3CTraceContextPropagator.getInstance()));
     Map<String, String> carrier = Collections.singletonMap("traceparent", "invalid");
 
     Context extracted = composite.extract(Context.root(), carrier, MapGetter.INSTANCE);
@@ -109,6 +163,221 @@ class ObiRemoteParentPropagatorTest {
     assertEquals(1, bridge.takeCalls.get());
     assertEquals(0, bridge.discardCalls.get());
     assertEquals(0, bridge.standardParentCalls.get());
+  }
+
+  @Test
+  void unchangedIntermediatePropagatorDoesNotHideLaterW3cParent() {
+    RecordingBridge bridge = new RecordingBridge();
+    TextMapPropagator composite =
+        TextMapPropagator.composite(
+            new ObiSelectionRecordingPropagator(new ObiRemoteParentPropagator(true, bridge)),
+            new ObiSelectionRecordingPropagator(W3CBaggagePropagator.getInstance()),
+            new ObiSelectionRecordingPropagator(W3CTraceContextPropagator.getInstance()));
+    Map<String, String> carrier = new HashMap<>();
+    carrier.put("traceparent", "00-" + W3C_TRACE_ID + "-" + W3C_PARENT_ID + "-01");
+
+    SpanContext parent =
+        Span.fromContext(composite.extract(Context.root(), carrier, MapGetter.INSTANCE))
+            .getSpanContext();
+
+    assertEquals(W3C_TRACE_ID, parent.getTraceId());
+    assertEquals(W3C_PARENT_ID, parent.getSpanId());
+    assertEquals(1, bridge.standardParentCalls.get());
+  }
+
+  @Test
+  void contextChangingIntermediatePropagatorDoesNotHideLaterW3cParent() {
+    RecordingBridge bridge = new RecordingBridge();
+    TextMapPropagator obi =
+        new ObiSelectionRecordingPropagator(new ObiRemoteParentPropagator(true, bridge));
+    TextMapPropagator baggage =
+        new ObiSelectionRecordingPropagator(W3CBaggagePropagator.getInstance());
+    TextMapPropagator w3c =
+        new ObiSelectionRecordingPropagator(W3CTraceContextPropagator.getInstance());
+    Map<String, String> carrier = new HashMap<>();
+    carrier.put("baggage", "key=value");
+    carrier.put("traceparent", "00-" + W3C_TRACE_ID + "-" + W3C_PARENT_ID + "-01");
+
+    Context candidate = obi.extract(Context.root(), carrier, MapGetter.INSTANCE);
+    Context withBaggage = baggage.extract(candidate, carrier, MapGetter.INSTANCE);
+
+    assertNotSame(candidate, withBaggage);
+    assertEquals("value", Baggage.fromContext(withBaggage).getEntryValue("key"));
+    assertEquals(0, bridge.standardParentCalls.get());
+
+    Context extracted = w3c.extract(withBaggage, carrier, MapGetter.INSTANCE);
+    SpanContext parent = Span.fromContext(extracted).getSpanContext();
+
+    assertEquals(W3C_TRACE_ID, parent.getTraceId());
+    assertEquals(W3C_PARENT_ID, parent.getSpanId());
+    assertEquals(1, bridge.standardParentCalls.get());
+  }
+
+  @Test
+  void inheritedCandidateRetiresOnceForAnUnchangedServerParent() {
+    RecordingBridge bridge = new RecordingBridge();
+    TextMapPropagator composite =
+        TextMapPropagator.composite(
+            new ObiSelectionRecordingPropagator(new ObiRemoteParentPropagator(true, bridge)),
+            new ObiSelectionRecordingPropagator(W3CTraceContextPropagator.getInstance()));
+    Context candidate =
+        composite.extract(Context.root(), Collections.emptyMap(), MapGetter.INSTANCE);
+    SpanContext serverSpanContext =
+        SpanContext.create(
+            ALTERNATE_TRACE_ID,
+            ALTERNATE_PARENT_ID,
+            TraceFlags.getSampled(),
+            TraceState.getDefault());
+    Context serverContext = candidate.with(Span.wrap(serverSpanContext));
+
+    Context extracted =
+        composite.extract(serverContext, Collections.emptyMap(), MapGetter.INSTANCE);
+    Context repeated = composite.extract(extracted, Collections.emptyMap(), MapGetter.INSTANCE);
+    Map<String, String> carrier =
+        Collections.singletonMap("traceparent", "00-" + W3C_TRACE_ID + "-" + W3C_PARENT_ID + "-01");
+    Context laterW3c = composite.extract(repeated, carrier, MapGetter.INSTANCE);
+
+    assertNotSame(serverContext, extracted);
+    assertSame(Span.fromContext(serverContext), Span.fromContext(extracted));
+    assertSame(extracted, repeated);
+    assertNotSame(Span.fromContext(repeated), Span.fromContext(laterW3c));
+    assertEquals(W3C_TRACE_ID, Span.fromContext(laterW3c).getSpanContext().getTraceId());
+    assertEquals(W3C_PARENT_ID, Span.fromContext(laterW3c).getSpanContext().getSpanId());
+    assertEquals(1, bridge.takeCalls.get());
+    assertEquals(1, bridge.discardCalls.get());
+    assertEquals(0, bridge.standardParentCalls.get());
+    assertEquals(1, bridge.standardDiscardDiagnostics());
+  }
+
+  @Test
+  void concurrentInheritedCandidatesDiscardEachExecutionTransport() throws Exception {
+    CountDownLatch discardEntered = new CountDownLatch(2);
+    CountDownLatch releaseDiscard = new CountDownLatch(1);
+    RecordingBridge bridge = new BlockingDiscardBridge(discardEntered, releaseDiscard);
+    TextMapPropagator composite =
+        TextMapPropagator.composite(
+            new ObiSelectionRecordingPropagator(new ObiRemoteParentPropagator(true, bridge)),
+            new ObiSelectionRecordingPropagator(W3CTraceContextPropagator.getInstance()));
+    Context candidate =
+        composite.extract(Context.root(), Collections.emptyMap(), MapGetter.INSTANCE);
+    SpanContext serverSpanContext =
+        SpanContext.create(
+            W3C_TRACE_ID, W3C_PARENT_ID, TraceFlags.getSampled(), TraceState.getDefault());
+    Context serverContext = candidate.with(Span.wrap(serverSpanContext));
+    ExecutorService executor = Executors.newFixedThreadPool(2);
+
+    try {
+      Future<Context> first =
+          executor.submit(
+              () -> composite.extract(serverContext, Collections.emptyMap(), MapGetter.INSTANCE));
+      Future<Context> second =
+          executor.submit(
+              () -> composite.extract(serverContext, Collections.emptyMap(), MapGetter.INSTANCE));
+      assertTrue(discardEntered.await(5, TimeUnit.SECONDS));
+
+      releaseDiscard.countDown();
+      Context firstExtracted = first.get(5, TimeUnit.SECONDS);
+      Context secondExtracted = second.get(5, TimeUnit.SECONDS);
+      assertNotSame(serverContext, firstExtracted);
+      assertSame(Span.fromContext(serverContext), Span.fromContext(firstExtracted));
+      assertNotSame(serverContext, secondExtracted);
+      assertSame(Span.fromContext(serverContext), Span.fromContext(secondExtracted));
+    } finally {
+      releaseDiscard.countDown();
+      executor.shutdownNow();
+      assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+    }
+
+    assertEquals(1, bridge.takeCalls.get());
+    assertEquals(2, bridge.discardCalls.get());
+    assertEquals(0, bridge.standardParentCalls.get());
+    assertEquals(2, bridge.standardDiscardDiagnostics());
+  }
+
+  @Test
+  void concurrentRetirementAndSelectionAccountIndependently() throws Exception {
+    CountDownLatch discardEntered = new CountDownLatch(1);
+    CountDownLatch releaseDiscard = new CountDownLatch(1);
+    RecordingBridge bridge = new BlockingDiscardBridge(discardEntered, releaseDiscard);
+    TextMapPropagator obi =
+        new ObiSelectionRecordingPropagator(new ObiRemoteParentPropagator(true, bridge));
+    TextMapPropagator w3c =
+        new ObiSelectionRecordingPropagator(W3CTraceContextPropagator.getInstance());
+    Context candidate = obi.extract(Context.root(), Collections.emptyMap(), MapGetter.INSTANCE);
+    SpanContext serverSpanContext =
+        SpanContext.create(
+            ALTERNATE_TRACE_ID,
+            ALTERNATE_PARENT_ID,
+            TraceFlags.getSampled(),
+            TraceState.getDefault());
+    Context serverContext = candidate.with(Span.wrap(serverSpanContext));
+    Map<String, String> carrier =
+        Collections.singletonMap("traceparent", "00-" + W3C_TRACE_ID + "-" + W3C_PARENT_ID + "-01");
+    ExecutorService executor = Executors.newSingleThreadExecutor();
+
+    try {
+      Future<Context> retirement =
+          executor.submit(() -> obi.extract(serverContext, carrier, MapGetter.INSTANCE));
+      assertTrue(discardEntered.await(5, TimeUnit.SECONDS));
+
+      Context selected = w3c.extract(candidate, carrier, MapGetter.INSTANCE);
+      assertEquals(W3C_TRACE_ID, Span.fromContext(selected).getSpanContext().getTraceId());
+
+      releaseDiscard.countDown();
+      retirement.get(5, TimeUnit.SECONDS);
+    } finally {
+      releaseDiscard.countDown();
+      executor.shutdownNow();
+      assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+    }
+
+    assertEquals(1, bridge.takeCalls.get());
+    assertEquals(1, bridge.discardCalls.get());
+    assertEquals(1, bridge.standardParentCalls.get());
+    assertEquals(2, bridge.standardDiscardDiagnostics());
+  }
+
+  @Test
+  void selectionDoesNotSuppressConcurrentRetirement() throws Exception {
+    CountDownLatch selectionEntered = new CountDownLatch(1);
+    CountDownLatch releaseSelection = new CountDownLatch(1);
+    RecordingBridge bridge = new BlockingSelectionBridge(selectionEntered, releaseSelection);
+    TextMapPropagator obi =
+        new ObiSelectionRecordingPropagator(new ObiRemoteParentPropagator(true, bridge));
+    TextMapPropagator w3c =
+        new ObiSelectionRecordingPropagator(W3CTraceContextPropagator.getInstance());
+    Context candidate = obi.extract(Context.root(), Collections.emptyMap(), MapGetter.INSTANCE);
+    SpanContext serverSpanContext =
+        SpanContext.create(
+            ALTERNATE_TRACE_ID,
+            ALTERNATE_PARENT_ID,
+            TraceFlags.getSampled(),
+            TraceState.getDefault());
+    Context serverContext = candidate.with(Span.wrap(serverSpanContext));
+    Map<String, String> carrier =
+        Collections.singletonMap("traceparent", "00-" + W3C_TRACE_ID + "-" + W3C_PARENT_ID + "-01");
+    ExecutorService executor = Executors.newSingleThreadExecutor();
+
+    try {
+      Future<Context> selection =
+          executor.submit(() -> w3c.extract(candidate, carrier, MapGetter.INSTANCE));
+      assertTrue(selectionEntered.await(5, TimeUnit.SECONDS));
+
+      Context retired = obi.extract(serverContext, carrier, MapGetter.INSTANCE);
+      assertSame(Span.fromContext(serverContext), Span.fromContext(retired));
+
+      releaseSelection.countDown();
+      selection.get(5, TimeUnit.SECONDS);
+    } finally {
+      releaseSelection.countDown();
+      executor.shutdownNow();
+      assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+    }
+
+    assertEquals(1, bridge.takeCalls.get());
+    assertEquals(1, bridge.discardCalls.get());
+    assertEquals(1, bridge.standardParentCalls.get());
+    assertEquals(2, bridge.standardDiscardDiagnostics());
   }
 
   @Test
@@ -166,7 +435,7 @@ class ObiRemoteParentPropagatorTest {
   }
 
   @Test
-  void repeatedExtractionTakesCandidateOnlyOnce() {
+  void repeatedExtractionDoesNotDiscardOwnCandidate() {
     RecordingBridge bridge = new RecordingBridge();
     ObiRemoteParentPropagator propagator = new ObiRemoteParentPropagator(true, bridge);
 
@@ -175,7 +444,7 @@ class ObiRemoteParentPropagatorTest {
 
     assertSame(first, repeated);
     assertEquals(1, bridge.takeCalls.get());
-    assertEquals(1, bridge.discardCalls.get());
+    assertEquals(0, bridge.discardCalls.get());
   }
 
   @Test
@@ -186,6 +455,7 @@ class ObiRemoteParentPropagatorTest {
 
     Context input = first.with(Span.wrap(Span.fromContext(first).getSpanContext()));
     assertSame(input, propagator.extract(input, null, null));
+    assertEquals(1, bridge.calls.get());
 
     AtomicInteger extractionFailures = new AtomicInteger();
     ObiRemoteParentPropagator malformed =
@@ -240,7 +510,7 @@ class ObiRemoteParentPropagatorTest {
     }
   }
 
-  private static final class RecordingBridge implements BridgeAccess {
+  private static class RecordingBridge implements BridgeAccess {
     private final AtomicInteger takeCalls = new AtomicInteger();
     private final AtomicInteger discardCalls = new AtomicInteger();
     private final AtomicInteger discardReason = new AtomicInteger();
@@ -274,6 +544,83 @@ class ObiRemoteParentPropagatorTest {
     @Override
     public void recordStandardParentWon() {
       standardParentCalls.incrementAndGet();
+    }
+
+    private int standardDiscardDiagnostics() {
+      return discardCalls.get() + standardParentCalls.get();
+    }
+  }
+
+  private static final class BlockingDiscardBridge extends RecordingBridge {
+    private final CountDownLatch entered;
+    private final CountDownLatch release;
+
+    private BlockingDiscardBridge(CountDownLatch entered, CountDownLatch release) {
+      this.entered = entered;
+      this.release = release;
+    }
+
+    @Override
+    public void discardRemoteParent(int reason) {
+      super.discardRemoteParent(reason);
+      entered.countDown();
+      await(release);
+    }
+  }
+
+  private static final class BlockingSelectionBridge extends RecordingBridge {
+    private final CountDownLatch entered;
+    private final CountDownLatch release;
+
+    private BlockingSelectionBridge(CountDownLatch entered, CountDownLatch release) {
+      this.entered = entered;
+      this.release = release;
+    }
+
+    @Override
+    public void recordStandardParentWon() {
+      super.recordStandardParentWon();
+      entered.countDown();
+      await(release);
+    }
+  }
+
+  private static final class ExtractionBarrierPropagator implements TextMapPropagator {
+    private final TextMapPropagator delegate;
+    private final CountDownLatch extracted;
+
+    private ExtractionBarrierPropagator(TextMapPropagator delegate, CountDownLatch extracted) {
+      this.delegate = delegate;
+      this.extracted = extracted;
+    }
+
+    @Override
+    public Collection<String> fields() {
+      return delegate.fields();
+    }
+
+    @Override
+    public <C> void inject(Context context, C carrier, TextMapSetter<C> setter) {
+      delegate.inject(context, carrier, setter);
+    }
+
+    @Override
+    public <C> Context extract(Context context, C carrier, TextMapGetter<C> getter) {
+      Context result = delegate.extract(context, carrier, getter);
+      extracted.countDown();
+      await(extracted);
+      return result;
+    }
+  }
+
+  private static void await(CountDownLatch latch) {
+    try {
+      if (!latch.await(5, TimeUnit.SECONDS)) {
+        throw new AssertionError("timed out waiting for concurrent extraction");
+      }
+    } catch (InterruptedException error) {
+      Thread.currentThread().interrupt();
+      throw new AssertionError(error);
     }
   }
 

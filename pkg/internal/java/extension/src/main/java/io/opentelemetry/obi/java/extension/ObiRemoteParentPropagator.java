@@ -40,9 +40,20 @@ public final class ObiRemoteParentPropagator implements TextMapPropagator {
       return input;
     }
 
-    if (Span.fromContext(input).getSpanContext().isValid()) {
+    Span selected = Span.fromContext(input);
+    if (selected.getSpanContext().isValid()) {
+      ObiContextCandidate candidate = input.get(ObiContextCandidate.KEY);
+      if (candidate == null) {
+        bridge.discardRemoteParent(BridgeAccess.DISCARD_STANDARD_PARENT);
+        return input;
+      }
+      if (candidate.isActiveSpan(selected)) {
+        return input;
+      }
+
+      Context rebound = input.with(ObiContextCandidate.KEY, candidate.rebind(selected));
       bridge.discardRemoteParent(BridgeAccess.DISCARD_STANDARD_PARENT);
-      return input;
+      return rebound;
     }
 
     BridgeResult result = bridge.takeRemoteParent();

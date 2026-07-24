@@ -1432,6 +1432,8 @@ wait_for_java_duplicate_suppression() {
   local metrics=""
   local -i elapsed=0
 
+  run_bounded 10 curl --fail --silent --show-error \
+    "$APACHE_HTTPS_HEALTH_ENDPOINT" >/dev/null
   metrics="$(mktemp "$RESULT_DIR/.duplicate-suppression.XXXXXX")"
   while ((elapsed < 20)); do
     if fetch_obi_metrics "$metrics" 2>/dev/null && \
@@ -3255,6 +3257,8 @@ run_late_attach_control() {
   wait_for_http \
     "$APACHE_HTTPS_HEALTH_ENDPOINT" \
     "late-attach recovered HTTPS path"
+  wait_for_java_duplicate_suppression \
+    "$RESULT_DIR/duplicate-suppression-late-attach-recovery.prom"
   SCENARIO_VARIANT="late-attach-recovery"
   run_scenario restart
   SCENARIO_VARIANT=""
@@ -3438,6 +3442,8 @@ run_restart_during_traffic_control() (
   BRIDGE_RUNNING=true
   assert_selected_transport || return $?
   wait_for_apache_instrumentation restart-fault-recovery || return $?
+  wait_for_java_duplicate_suppression \
+    "$RESULT_DIR/duplicate-suppression-restart-fault-recovery.prom"
   publish_restart_control_release \
     "$control_dir" \
     "$RESTART_RELEASE_OBI_READY" || return $?
@@ -3470,6 +3476,7 @@ run_restart_during_traffic_control() (
   assert_restart_fault_diagnostics \
     "$RESULT_DIR/phases/$after_phase/java-diagnostics.delta" \
     32 \
+    2 \
     "$RESULT_DIR/restart-fault-diagnostics.txt"
   printf '{"status":"passed","scenario":"restart-fault","result":"%s","after_phase":"phases/%s","restart_control":"restart-control/events.log"}\n' \
     "$(basename -- "$output")" \
@@ -3559,6 +3566,8 @@ recreate_instrumented_stack() {
   assert_selected_transport "$transport"
   wait_for_apache_instrumentation recreate-instrumented
   wait_for_http "$APACHE_HTTPS_HEALTH_ENDPOINT" "$label HTTPS path"
+  wait_for_java_duplicate_suppression \
+    "$RESULT_DIR/duplicate-suppression-${label// /-}.prom"
 }
 
 capture_service_runtime_identity() {
@@ -4615,6 +4624,8 @@ run_unix_permissive_directory_control() {
     return 1
   }
   wait_for_apache_instrumentation unix-permission-recovery
+  wait_for_java_duplicate_suppression \
+    "$RESULT_DIR/duplicate-suppression-unix-permission-recovery.prom"
   BRIDGE_RUNNING=true
 }
 
@@ -4943,6 +4954,8 @@ execute_requested_scenarios() {
       BRIDGE_RUNNING=true
       assert_selected_transport
       wait_for_apache_instrumentation restart
+      wait_for_java_duplicate_suppression \
+        "$RESULT_DIR/duplicate-suppression-restart.prom"
       run_scenario restart
       ;;
     restart-fault)
@@ -5896,7 +5909,8 @@ assert_java_diagnostics_delta() {
 assert_restart_fault_diagnostics() {
   local -r input="$1"
   local -r expected_requests="$2"
-  local -r output="$3"
+  local -r expected_non_workload_takes="$3"
+  local -r output="$4"
   local name=""
   local actual=""
   local take_total=0
@@ -5905,7 +5919,10 @@ assert_restart_fault_diagnostics() {
   local diagnostics_eligible=0
   local failure_total=0
   local take_sampled=""
+  local take_unsampled=""
   local discard_standard=""
+  local workload_valid_min=0
+  local workload_valid_max=0
   local -a failure_counters=(
     provider_reject provider_ver lookup_missing lookup_version lookup_error
     record_version invoke_error extract_fields extract_invalid extract_error
@@ -5935,33 +5952,52 @@ assert_restart_fault_diagnostics() {
     failure_total="$((failure_total + actual))"
   done
   take_sampled="$(java_diagnostic_delta "$input" take_sampled)" || return 1
+  take_unsampled="$(java_diagnostic_delta "$input" take_unsampled)" || return 1
   discard_standard="$(java_diagnostic_delta "$input" discard_standard)" || return 1
 
-  if ((take_total != expected_requests + 1 || diagnostics_eligible == 0 ||
-    valid < 2 || valid >= expected_requests)); then
+  if ((take_total != expected_requests + expected_non_workload_takes ||
+    diagnostics_eligible == 0 ||
+    valid <= expected_non_workload_takes ||
+    valid >= expected_requests)); then
     log_error \
-      "restart fault expected $expected_requests workload takes plus one probe with conservatively provable valid and fail-open workload results, got total=$take_total valid=$valid diagnostics_eligible=$diagnostics_eligible"
+      "restart fault expected $expected_requests workload takes plus $expected_non_workload_takes probes with conservatively provable valid and fail-open workload results, got total=$take_total valid=$valid diagnostics_eligible=$diagnostics_eligible"
     return 1
   fi
   if ((discard_total != 0)); then
     log_error "restart fault produced unexpected discard status count=$discard_total"
     return 1
   fi
-  if ((failure_total > expected_requests || take_sampled > expected_requests || discard_standard > expected_requests)); then
-    log_error "restart fault diagnostics exceeded the request bound"
+  if ((failure_total > expected_requests + expected_non_workload_takes)); then
+    log_error "restart fault diagnostics exceeded the failure request bound"
+    return 1
+  fi
+  if ((take_sampled + take_unsampled != valid)); then
+    log_error \
+      "restart fault diagnostics reported sampled totals inconsistent with valid takes"
+    return 1
+  fi
+  workload_valid_min="$((valid - expected_non_workload_takes))"
+  workload_valid_max="$valid"
+  if ((discard_standard < workload_valid_min ||
+    discard_standard > workload_valid_max)); then
+    log_error \
+      "restart fault diagnostics reported standard discards outside the valid workload bounds"
     return 1
   fi
   {
     printf 'status=passed\n'
     printf 'requests=%d\n' "$expected_requests"
+    printf 'non_workload_takes=%d\n' "$expected_non_workload_takes"
     printf 'observed_take_total=%d\n' "$take_total"
     printf 'observed_take_valid=%d\n' "$valid"
-    printf 'workload_valid_min=%d\n' "$((valid - 1))"
-    printf 'workload_valid_max=%d\n' "$valid"
+    printf 'workload_valid_min=%d\n' "$workload_valid_min"
+    printf 'workload_valid_max=%d\n' "$workload_valid_max"
     printf 'workload_fail_open_min=%d\n' "$((expected_requests - valid))"
-    printf 'workload_fail_open_max=%d\n' "$((expected_requests - valid + 1))"
+    printf 'workload_fail_open_max=%d\n' \
+      "$((expected_requests - valid + expected_non_workload_takes))"
     printf 'failure_total=%d\n' "$failure_total"
     printf 'take_sampled=%d\n' "$take_sampled"
+    printf 'take_unsampled=%d\n' "$take_unsampled"
     printf 'discard_standard=%d\n' "$discard_standard"
   } >"$output"
 }

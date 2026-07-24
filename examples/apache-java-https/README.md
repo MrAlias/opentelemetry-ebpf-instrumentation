@@ -378,7 +378,9 @@ Every run retains a timestamped directory under `.runtime/results/` with:
   steady-recovery gate, with canonical cleanup/recovery evidence promoted only
   when the complete gate passes;
 - per-mode runtime assertions for the official-agent/extension/OBI topology
-  and the Java-service duplicate-suppression metric;
+  and the Java-service duplicate-suppression metric; after each OBI
+  create/restart, a non-measured health request drives behavioral detection
+  and asserted traffic starts only after the new process reports suppression;
 - final receiver snapshot, Compose state, and component logs.
 
 Build and startup output is streamed to the terminal and retained in
@@ -395,7 +397,10 @@ the scenario. Java diagnostics are fetched after each post-scenario OBI metric
 snapshot. Their delta requires exactly one self-observed missing lookup, so the
 diagnostic request cannot mask another missing lookup in the reason-coded
 interval attributed to that scenario. Fault-injection scenarios skip the probe
-so it cannot consume a synthetic fault response.
+so it cannot consume a synthetic fault response. The restart-fault interval
+also includes the headerless readiness request used to re-establish duplicate
+suppression, so it requires exactly two non-workload takes and reports
+conservative workload attribution bounds.
 
 A dirty source tree, `--skip-bridge-build`, or an individually targeted
 scenario is explicitly labeled non-acceptance evidence. Only a clean full

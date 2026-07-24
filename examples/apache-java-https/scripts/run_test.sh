@@ -1024,6 +1024,36 @@ EOF
   }
 }
 
+test_duplicate_suppression_wait_primes_java_export() {
+  local -r result_dir="$TEST_TMP_DIR/duplicate-suppression-wait"
+  local -r observed="$result_dir/observed"
+  local -r metrics="$result_dir/suppression.prom"
+
+  mkdir -p -- "$result_dir"
+  (
+    RESULT_DIR="$result_dir"
+    run_bounded() {
+      printf '%s\n' "$*" >>"$observed"
+    }
+    fetch_obi_metrics() {
+      printf '%s\n' \
+        'obi_avoided_services{service_name="java-backend",service_namespace="apache-java-https",telemetry_type="traces"} 1' \
+        >"$1"
+    }
+
+    wait_for_java_duplicate_suppression "$metrics"
+  ) || {
+    printf 'duplicate suppression readiness did not become ready\n' >&2
+    return 1
+  }
+  grep -Fq "10 curl --fail --silent --show-error $APACHE_HTTPS_HEALTH_ENDPOINT" \
+    "$observed" || {
+    printf 'duplicate suppression readiness did not prime a Java export\n' >&2
+    return 1
+  }
+  java_duplicate_suppression_present "$metrics"
+}
+
 test_pressure_map_metric_requires_exact_unique_series() {
   local -r metrics="$TEST_TMP_DIR/pressure-map-metric.prom"
 
@@ -2627,6 +2657,10 @@ test_permissive_unix_directory_control_refuses_and_restores() {
     wait_for_apache_instrumentation() {
       printf 'apache:%s\n' "$1" >>"$observed"
     }
+    wait_for_java_duplicate_suppression() {
+      printf 'suppression:%s\n' "$(basename -- "$1")" >>"$observed"
+      : >"$1"
+    }
     date() {
       printf 'security-cursor\n'
     }
@@ -2659,11 +2693,15 @@ test_permissive_unix_directory_control_refuses_and_restores() {
     /up --detach --no-deps --force-recreate obi/ { recovery = NR }
     $0 == "log:post-permission Java bridge provider:security-cursor" { provider = NR }
     $0 == "apache:unix-permission-recovery" { readiness = NR }
+    $0 == "suppression:duplicate-suppression-unix-permission-recovery.prom" {
+      suppression = NR
+    }
     END {
-      exit recovery > 0 && provider > recovery && readiness > provider ? 0 : 1
+      exit recovery > 0 && provider > recovery && readiness > provider &&
+        suppression > readiness ? 0 : 1
     }
   ' "$observed" || {
-    printf 'Unix permission recovery resumed before Apache instrumentation readiness\n' >&2
+    printf 'Unix permission recovery resumed before duplicate suppression readiness\n' >&2
     return 1
   }
 }
@@ -3542,62 +3580,87 @@ test_restart_fault_diagnostics_require_overlap() {
 
   write_diagnostics_fixture "$before" 0 0 0 0 0 0
   write_diagnostics_fixture "$after" k 0 0 k 0 k timeout c
-  sed -i 's/t_missing=0/t_missing=1/' "$after"
+  sed -i 's/t_missing=0/t_missing=2/' "$after"
   write_java_diagnostics_delta "$before" "$after" "$delta"
-  assert_restart_fault_diagnostics "$delta" 32 "$result"
-  grep -Fqx 'observed_take_total=33' "$result"
-  grep -Fqx 'workload_valid_min=19' "$result"
+  assert_restart_fault_diagnostics "$delta" 32 2 "$result"
+  grep -Fqx 'non_workload_takes=2' "$result"
+  grep -Fqx 'observed_take_total=34' "$result"
+  grep -Fqx 'workload_valid_min=18' "$result"
   grep -Fqx 'workload_valid_max=20' "$result"
   grep -Fqx 'workload_fail_open_min=12' "$result"
-  grep -Fqx 'workload_fail_open_max=13' "$result"
+  grep -Fqx 'workload_fail_open_max=14' "$result"
 
-  write_diagnostics_fixture "$after" k 0 0 k 0 k timeout c
-  sed -i 's/t_already_consumed=0/t_already_consumed=1/' "$after"
+  write_diagnostics_fixture "$after" k 0 0 j 0 k timeout c
+  sed -i 's/t_missing=0/t_missing=2/' "$after"
   write_java_diagnostics_delta "$before" "$after" "$delta"
-  assert_restart_fault_diagnostics "$delta" 32 "$result" || {
+  if assert_restart_fault_diagnostics "$delta" 32 2 "$result" >/dev/null 2>&1; then
+    printf 'restart diagnostics accepted sampled totals below valid takes\n' >&2
+    return 1
+  fi
+
+  write_diagnostics_fixture "$after" k 0 0 k 0 h timeout c
+  sed -i 's/t_missing=0/t_missing=2/' "$after"
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  if assert_restart_fault_diagnostics "$delta" 32 2 "$result" >/dev/null 2>&1; then
+    printf 'restart diagnostics accepted standard discards below valid workload bounds\n' >&2
+    return 1
+  fi
+
+  write_diagnostics_fixture "$after" k 0 0 k 0 l timeout c
+  sed -i 's/t_missing=0/t_missing=2/' "$after"
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  if assert_restart_fault_diagnostics "$delta" 32 2 "$result" >/dev/null 2>&1; then
+    printf 'restart diagnostics accepted standard discards above valid workload bounds\n' >&2
+    return 1
+  fi
+
+  write_diagnostics_fixture "$after" k 0 0 k 0 i timeout c
+  sed -i 's/t_already_consumed=0/t_already_consumed=2/' "$after"
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  assert_restart_fault_diagnostics "$delta" 32 2 "$result" || {
     printf 'restart diagnostics rejected an already-consumed self lookup\n' >&2
     return 1
   }
-  grep -Fqx 'observed_take_total=33' "$result"
-  grep -Fqx 'workload_valid_min=19' "$result"
+  grep -Fqx 'observed_take_total=34' "$result"
+  grep -Fqx 'workload_valid_min=18' "$result"
   grep -Fqx 'workload_valid_max=20' "$result"
   grep -Fqx 'workload_fail_open_min=12' "$result"
-  grep -Fqx 'workload_fail_open_max=13' "$result"
+  grep -Fqx 'workload_fail_open_max=14' "$result"
 
   sed -i 's/t_missing=0/t_missing=1/' "$after"
   write_java_diagnostics_delta "$before" "$after" "$delta"
-  if assert_restart_fault_diagnostics "$delta" 32 "$result" >/dev/null 2>&1; then
+  if assert_restart_fault_diagnostics "$delta" 32 2 "$result" >/dev/null 2>&1; then
     printf 'restart diagnostics accepted an additional take result\n' >&2
     return 1
   fi
 
-  write_diagnostics_fixture "$after" k 0 0 k 0 k timeout d
+  write_diagnostics_fixture "$after" k 0 0 k 0 k timeout e
   write_java_diagnostics_delta "$before" "$after" "$delta"
-  if assert_restart_fault_diagnostics "$delta" 32 "$result" >/dev/null 2>&1; then
+  if assert_restart_fault_diagnostics "$delta" 32 2 "$result" >/dev/null 2>&1; then
     printf 'restart diagnostics accepted a run without a diagnostics-eligible result\n' >&2
     return 1
   fi
 
-  write_diagnostics_fixture "$after" 6 0 0 6 0 6 timeout k
+  write_diagnostics_fixture "$after" 6 0 0 6 0 6 timeout l
   sed -i 's/t_missing=0/t_missing=1/' "$after"
   write_java_diagnostics_delta "$before" "$after" "$delta"
   sed -i '/^t_valid /p' "$delta"
-  if assert_restart_fault_diagnostics "$delta" 32 "$result" >/dev/null 2>&1; then
+  if assert_restart_fault_diagnostics "$delta" 32 2 "$result" >/dev/null 2>&1; then
     printf 'restart diagnostics accepted duplicate rows that forged the take total\n' >&2
     return 1
   fi
 
-  write_diagnostics_fixture "$after" 1 0 0 1 0 0 missing w
+  write_diagnostics_fixture "$after" 1 0 0 1 0 0 missing x
   write_java_diagnostics_delta "$before" "$after" "$delta"
-  if assert_restart_fault_diagnostics "$delta" 32 "$result" >/dev/null 2>&1; then
+  if assert_restart_fault_diagnostics "$delta" 32 2 "$result" >/dev/null 2>&1; then
     printf 'restart diagnostics accepted an attribution-ambiguous single valid result\n' >&2
     return 1
   fi
 
   write_diagnostics_fixture "$after" w 0 0 w 0 w
-  sed -i 's/t_missing=0/t_missing=1/' "$after"
+  sed -i 's/t_missing=0/t_missing=2/' "$after"
   write_java_diagnostics_delta "$before" "$after" "$delta"
-  if assert_restart_fault_diagnostics "$delta" 32 "$result" >/dev/null 2>&1; then
+  if assert_restart_fault_diagnostics "$delta" 32 2 "$result" >/dev/null 2>&1; then
     printf 'restart diagnostics accepted a run without an observed bridge fault\n' >&2
     return 1
   fi
@@ -4426,6 +4489,9 @@ test_recreated_stack_readiness_uses_log_cursor() {
     wait_for_apache_instrumentation() {
       printf 'apache:%s\n' "$1" >>"$observed"
     }
+    wait_for_java_duplicate_suppression() {
+      printf 'suppression:%s\n' "$(basename -- "$1")" >>"$observed"
+    }
 
     recreate_instrumented_stack tcp restoration unix
   ) || {
@@ -4441,7 +4507,8 @@ test_recreated_stack_readiness_uses_log_cursor() {
     'log:restoration injected Java instrumentation:recreate-cursor' \
     'transport:unix:unix' \
     'apache:recreate-instrumented' \
-    'http:restoration HTTPS path' >"$expected"
+    'http:restoration HTTPS path' \
+    'suppression:duplicate-suppression-restoration.prom' >"$expected"
   cmp -s -- "$expected" "$observed" || {
     printf 'recreated stack used stale readiness evidence\n' >&2
     diff -u -- "$expected" "$observed" >&2 || true
@@ -4594,6 +4661,9 @@ test_late_attach_recycles_only_apache_after_readiness() {
     wait_for_apache_instrumentation_drain() {
       printf 'apache-drain:%s\n' "$1" >>"$observed"
     }
+    wait_for_java_duplicate_suppression() {
+      printf 'suppression:%s\n' "$(basename -- "$1")" >>"$observed"
+    }
     run_scenario() {
       printf 'scenario:%s:%s\n' "$1" "$SCENARIO_VARIANT" >>"$observed"
     }
@@ -4623,6 +4693,7 @@ test_late_attach_recycles_only_apache_after_readiness() {
     'log:late-attach Apache instrumentation:late-attach-cursor' \
     'apache:late-attach' \
     'http:late-attach recovered HTTPS path' \
+    'suppression:duplicate-suppression-late-attach-recovery.prom' \
     'scenario:restart:late-attach-recovery' >"$expected"
   cmp -s -- "$expected" "$observed" || {
     printf 'late attach did not isolate the post-attach Apache pool\n' >&2
@@ -4946,6 +5017,9 @@ test_standalone_restart_waits_for_apache_instrumentation() {
     wait_for_apache_instrumentation() {
       printf 'apache:%s\n' "$1" >>"$observed"
     }
+    wait_for_java_duplicate_suppression() {
+      printf 'suppression:%s\n' "$(basename -- "$1")" >>"$observed"
+    }
     run_scenario() {
       printf 'scenario:%s\n' "$1" >>"$observed"
     }
@@ -4962,6 +5036,7 @@ test_standalone_restart_waits_for_apache_instrumentation() {
     'log:restarted Java bridge provider:restart-cursor' \
     'transport' \
     'apache:restart' \
+    'suppression:duplicate-suppression-restart.prom' \
     'scenario:restart' >"$expected"
   cmp -s -- "$expected" "$observed" || {
     printf 'standalone restart resumed before Apache instrumentation readiness\n' >&2
@@ -5038,6 +5113,9 @@ EOF
     wait_for_apache_instrumentation() {
       printf 'apache:%s\n' "$1" >>"$observed"
     }
+    wait_for_java_duplicate_suppression() {
+      printf 'suppression:%s\n' "$(basename -- "$1")" >>"$observed"
+    }
     capture_phase_evidence() {
       mkdir -p -- "$RESULT_DIR/phases/$1"
       printf 'capture:%s\n' "$1" >>"$observed"
@@ -5075,11 +5153,15 @@ EOF
     $0 == "traffic:after-restart" { recovered = NR }
     $0 == "log:Java bridge recovered during restart traffic" { provider = NR }
     $0 == "capture:restart-fault-after" { capture = NR }
+    $0 == "suppression:duplicate-suppression-restart-fault-recovery.prom" {
+      suppression = NR
+    }
     $0 == "scenario:restart:restart-recovery" { scenario = NR }
     END {
       exit before > 0 && stopped > before && outage > stopped &&
         started > outage && bridge > started && transport > bridge &&
-        readiness > transport && recovered > readiness && provider > recovered &&
+        readiness > transport && suppression > readiness &&
+        recovered > suppression && provider > recovered &&
         capture > provider && scenario > capture ? 0 : 1
     }
   ' "$observed" || {
@@ -5596,6 +5678,7 @@ main() {
   test_log_pid_count_requires_an_exact_numeric_token
   test_helper_unavailable_metric_boundary_preserves_counters
   test_metric_boundary_helpers_are_reason_coded
+  test_duplicate_suppression_wait_primes_java_export
   test_pressure_map_metric_requires_exact_unique_series
   test_bridge_metric_wait_requires_quiescent_report
   test_security_probe_window_covers_metric_fences

@@ -149,6 +149,10 @@ In practice this means:
 - Short-lived processes (jobs, lambdas) that finish before exporting will
   always produce duplicates.
 - The first few requests of a long-lived process are duplicated.
+- Restarting OBI repeats the window because the detection flag is in-memory.
+  Readiness checks that require duplicate-free telemetry must first drive one
+  non-measured request and observe the new OBI process's
+  `obi_avoided_services{telemetry_type="traces"}` signal.
 
 ### 2. Suppression is all-or-nothing per service
 

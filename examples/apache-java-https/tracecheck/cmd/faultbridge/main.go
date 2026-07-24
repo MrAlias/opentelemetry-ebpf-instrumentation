@@ -35,12 +35,14 @@ const (
 	requestTimeout   = 500 * time.Millisecond
 	timeoutDelay     = 200 * time.Millisecond
 	maxTakeRequests  = uint32(10_000)
+	maxMatchingTakes = uint64(1_000)
 	defaultFaultMode = "alternating"
 )
 
 type faultServer struct {
-	mode  string
-	takes atomic.Uint32
+	mode               string
+	matchingValidTakes uint32
+	takes              atomic.Uint32
 }
 
 type faultResponse struct {
@@ -56,8 +58,10 @@ func main() {
 func mainExitCode() int {
 	var socketPath string
 	var mode string
+	var matchingValidTakes uint64
 	flag.StringVar(&socketPath, "socket", "/var/run/obi/java-remote-parent.sock", "Unix socket path")
 	flag.StringVar(&mode, "mode", environmentOrDefault("FAULT_MODE", defaultFaultMode), "fault mode")
+	flag.Uint64Var(&matchingValidTakes, "matching-valid-takes", 1, "valid takes returned by matching mode")
 	flag.Parse()
 	if flag.NArg() != 0 || !filepath.IsAbs(socketPath) {
 		fmt.Fprintln(os.Stderr, "fault bridge requires an absolute --socket and no positional arguments")
@@ -67,10 +71,21 @@ func mainExitCode() int {
 		fmt.Fprintf(os.Stderr, "fault bridge mode %q is unsupported\n", mode)
 		return 2
 	}
+	if !validMatchingTakeCount(mode, matchingValidTakes) {
+		fmt.Fprintf(
+			os.Stderr,
+			"fault bridge matching-valid-takes must be between 1 and %d in matching mode\n",
+			maxMatchingTakes,
+		)
+		return 2
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	if err := serve(ctx, socketPath, &faultServer{mode: mode}); err != nil {
+	if err := serve(ctx, socketPath, &faultServer{
+		mode:               mode,
+		matchingValidTakes: uint32(matchingValidTakes),
+	}); err != nil {
 		fmt.Fprintf(os.Stderr, "fault bridge failed: %v\n", err)
 		return 1
 	}
@@ -99,7 +114,12 @@ func serve(ctx context.Context, socketPath string, server *faultServer) error {
 		}
 	}()
 	defer close(done)
-	fmt.Printf("fault bridge ready socket=%s mode=%s\n", socketPath, server.mode)
+	fmt.Printf(
+		"fault bridge ready socket=%s mode=%s matching_valid_takes=%d\n",
+		socketPath,
+		server.mode,
+		server.matchingValidTakes,
+	)
 
 	for {
 		connection, err := listener.AcceptUnix()
@@ -193,6 +213,11 @@ func (s *faultServer) response(operation byte) faultResponse {
 	}
 
 	switch s.mode {
+	case "matching":
+		if count == 1 || count > s.matchingValidTakes+1 {
+			return responseWithStatus(statusMissing)
+		}
+		return faultResponse{payload: validRecord(), status: statusName(statusValid)}
 	case defaultFaultMode:
 		if count%2 != 0 {
 			return responseWithStatus(statusStale)
@@ -246,16 +271,21 @@ func statusRecord(status byte) []byte {
 
 func validRecord() []byte {
 	record := statusRecord(statusValid)
-	record[16] = 1
-	record[32] = 1
-	binary.LittleEndian.PutUint64(record[40:48], 1)
-	binary.LittleEndian.PutUint64(record[48:56], 1)
+	record[9] = 1
+	copy(record[16:32], []byte{
+		0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+		0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+	})
+	copy(record[32:40], []byte{0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17})
+	binary.LittleEndian.PutUint64(record[40:48], 0x0102030405060708)
+	binary.LittleEndian.PutUint64(record[48:56], 0x1112131415161718)
 	return record
 }
 
 func validFaultMode(mode string) bool {
 	switch mode {
 	case defaultFaultMode,
+		"matching",
 		"timeout",
 		"disconnect",
 		"overload",
@@ -269,6 +299,10 @@ func validFaultMode(mode string) bool {
 	default:
 		return false
 	}
+}
+
+func validMatchingTakeCount(mode string, count uint64) bool {
+	return mode != "matching" || count >= 1 && count <= maxMatchingTakes
 }
 
 func environmentOrDefault(name, fallback string) string {
@@ -294,6 +328,8 @@ func operationName(operation byte) string {
 
 func statusName(status byte) string {
 	switch status {
+	case statusValid:
+		return "valid"
 	case statusMissing:
 		return "missing"
 	case statusStale:

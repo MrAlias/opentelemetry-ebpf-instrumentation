@@ -375,13 +375,147 @@ test_tls_boundary_requires_both_deterministic_modes() {
   fi
 }
 
-test_w3c_match_selects_header_and_tcp_propagation() {
-  (
-    SCENARIO=w3c-match
+test_w3c_match_uses_controlled_unix_fixture() {
+  run_control_case() (
+    local -r scenario="$1"
+    local -r keep_running="$2"
+    local -r observed="$3"
+
+    SCENARIO="$scenario"
+    KEEP_RUNNING="$keep_running"
+    TRANSPORT=getsockopt
+    SELECTED_TRANSPORT=getsockopt
+    BRIDGE_RUNNING=true
     export_compose_environment
-    [[ "$CONTEXT_PROPAGATION" == "headers,tcp" ]]
+    printf 'propagation:%s\n' "$CONTEXT_PROPAGATION" >>"$observed"
+    recreate_instrumented_stack() {
+      SELECTED_TRANSPORT="$3"
+      BRIDGE_RUNNING=true
+      printf 'recreate:%s:%s:%s\n' "$1" "$2" "$3" >>"$observed"
+    }
+    stop_obi_for_no_state_control() {
+      BRIDGE_RUNNING=false
+      printf 'stop:%s\n' "$1" >>"$observed"
+    }
+    run_scenario() {
+      printf 'scenario:%s:%s:%s:%s\n' "$1" "$2" "$3" "$4" >>"$observed"
+    }
+
+    run_w3c_match_control
+  )
+
+  local -r expected="$TEST_TMP_DIR/w3c-match-control.expected"
+  local observed=""
+
+  printf '%s\n' \
+    'propagation:tcp' \
+    'recreate:tcp:matching W3C and OBI preparation:unix' \
+    'stop:w3c-match' \
+    'scenario:w3c-match:true:full:matching' \
+    'recreate:tcp:post-match bridge restoration:getsockopt' >"$expected"
+  for observed in \
+    "$TEST_TMP_DIR/w3c-match-control-all.observed" \
+    "$TEST_TMP_DIR/w3c-match-control-keep.observed"; do
+    if [[ "$observed" == *-all.observed ]]; then
+      run_control_case all false "$observed"
+    else
+      run_control_case w3c-match true "$observed"
+    fi
+    cmp -s -- "$expected" "$observed" || {
+      printf 'W3C match fixture lifecycle changed for %s\n' "$observed" >&2
+      diff -u -- "$expected" "$observed" >&2 || true
+      return 1
+    }
+  done
+}
+
+test_matching_bridge_sequence_is_exact() {
+  local -r fixture_log="$TEST_TMP_DIR/matching-bridge.log"
+
+  printf '%s\n' \
+    'bridge-fault | fault bridge operation=negotiate status=missing take_count=0' \
+    'bridge-fault | fault bridge operation=take status=missing take_count=1' \
+    'bridge-fault | fault bridge operation=take status=valid take_count=2' \
+    'bridge-fault | fault bridge operation=take status=valid take_count=3' \
+    'bridge-fault | fault bridge operation=take status=missing take_count=4' \
+    >"$fixture_log"
+  matching_bridge_sequence_is_exact "$fixture_log" 2 || {
+    printf 'matching bridge rejected its exact bounded sequence\n' >&2
+    return 1
+  }
+
+  sed -i 's/status=valid take_count=3/status=missing take_count=3/' "$fixture_log"
+  if matching_bridge_sequence_is_exact "$fixture_log" 2; then
+    printf 'matching bridge accepted an out-of-order response\n' >&2
+    return 1
+  fi
+}
+
+test_matching_bridge_start_failure_is_cleaned_up() {
+  local -r call_log="$TEST_TMP_DIR/matching-bridge-start-failure.calls"
+
+  (
+    local start_status=0
+
+    BRIDGE_RUNNING=false
+    MATCHING_BRIDGE_RUNNING=false
+    COMPOSE=(docker compose)
+    RESULT_DIR="$TEST_TMP_DIR/matching-bridge-start-failure"
+    mkdir -p -- "$RESULT_DIR"
+    run_bounded() {
+      printf '%s\n' "$*" >>"$call_log"
+      if [[ "$*" == *' up '* ]]; then
+        return 42
+      fi
+    }
+
+    if start_matching_bridge w3c-match 1; then
+      return 1
+    else
+      start_status=$?
+    fi
+    [[ "$start_status" == "42" ]] || return 1
+    [[ "$MATCHING_BRIDGE_RUNNING" == "false" ]] || return 1
+    [[ "$FAULT_MODE" == "alternating" && "$MATCHING_VALID_TAKES" == "1" ]] || return 1
   ) || {
-    printf 'W3C match did not select isolated headers and TCP propagation\n' >&2
+    printf 'matching bridge partial startup was not cleaned up\n' >&2
+    return 1
+  }
+
+  [[ "$(<"$call_log")" == $'60 docker compose up --detach --no-deps --force-recreate bridge-fault\n30 docker compose stop --timeout 5 bridge-fault' ]] || {
+    printf 'matching bridge startup failure did not issue a bounded stop\n' >&2
+    return 1
+  }
+}
+
+test_cleanup_stops_matching_bridge_when_stack_is_kept() {
+  local -r call_log="$TEST_TMP_DIR/matching-bridge-exit-cleanup.calls"
+
+  (
+    PRESSURE_ACTIVE=false
+    RESULT_DIR=""
+    STACK_STARTED=true
+    KEEP_RUNNING=true
+    MATCHING_BRIDGE_RUNNING=true
+    TMP_DIR=""
+    COMPOSE=(docker compose)
+    cleanup_security_processes() { :; }
+    run_bounded() {
+      printf '%s\n' "$*" >>"$call_log"
+    }
+    safe_compose_down() {
+      printf 'unexpected compose down\n' >>"$call_log"
+      return 1
+    }
+
+    cleanup
+  ) || {
+    printf 'exit cleanup failed while retaining the main stack\n' >&2
+    return 1
+  }
+
+  [[ "$(<"$call_log")" == '30 docker compose stop --timeout 5 bridge-fault' ]] || {
+    printf 'exit cleanup did not stop only the transient matching bridge\n' >&2
     return 1
   }
 }
@@ -2271,6 +2405,126 @@ test_scenario_fences_metrics_around_diagnostics() {
   }
 }
 
+test_scenario_controls_matching_fixture_lifecycle() {
+  run_fixture_case() (
+    local -r command_status="$1"
+    local -r call_log="$2"
+    local -r fixture_start_status="${3:-0}"
+    local expected_status="$command_status"
+    local observed_status=0
+    local request_argument=default
+
+    RESULT_DIR="$TEST_TMP_DIR/matching-fixture-$command_status"
+    mkdir -p -- "$RESULT_DIR"
+    : >"$call_log"
+    BRIDGE_RUNNING=false
+    COMPOSE=(docker compose)
+    REPEAT_COUNT=1
+    REQUEST_COUNT=3
+    SCENARIO_SEED=1
+    SCENARIO_VARIANT=""
+    SELECTED_TRANSPORT=unix
+    TLS_PROTOCOL=TLSv1.3
+    start_matching_bridge() {
+      [[ "$BRIDGE_RUNNING" == "false" && "$1" == "w3c-match" && "$2" == "3" ]] || return 1
+      printf 'start:%s:%s\n' "$1" "$2" >>"$call_log"
+      return "$fixture_start_status"
+    }
+    stop_matching_bridge() {
+      printf 'stop:%s:%s\n' "$1" "$2" >>"$call_log"
+    }
+    flush_bridge_metric_boundary() {
+      printf 'boundary:%s\n' "$1" >>"$call_log"
+    }
+    capture_java_diagnostics() {
+      printf 'diagnostics:%s\n' "$1" >>"$call_log"
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+      printf 'fixture\n' >"$RESULT_DIR/phases/$1/java-diagnostics.txt"
+    }
+    capture_phase_evidence() {
+      printf 'evidence:%s\n' "$1" >>"$call_log"
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+      printf '# empty\n' >"$RESULT_DIR/phases/$1/obi-metrics.prom"
+    }
+    run_bounded() {
+      request_argument=default
+      while (($# > 0)); do
+        if [[ "$1" == "--requests" ]]; then
+          request_argument="$2"
+          shift 2
+          continue
+        fi
+        shift
+      done
+      printf 'scenario:%s\n' "$request_argument" >>"$call_log"
+      if ((command_status != 0)); then
+        return "$command_status"
+      fi
+      printf '{"status":"passed"}\n'
+    }
+    wait_for_bridge_metrics_quiescent() {
+      printf 'unexpected bridge wait\n' >>"$call_log"
+      return 1
+    }
+    assert_bridge_metric_delta() {
+      printf 'unexpected bridge assertion\n' >>"$call_log"
+      return 1
+    }
+    write_java_diagnostics_delta() {
+      : >"$3"
+    }
+    assert_java_diagnostics_delta() {
+      printf 'java:%s:%s:%s:%s:%s:%s:%s:%s:%s\n' \
+        "$2" "$3" "$4" "$5" "$6" "$7" "$8" "${9:-none}" "${10:-0}" \
+        >>"$call_log"
+      [[ "$2" == "3" && "$3" == "0" && "$4" == "0" && "$5" == "1" && \
+        "$6" == "3" && "$7" == "0" && "$8" == "3" && \
+        "${9:-}" == "" && "${10:-0}" == "0" ]]
+    }
+
+    if run_scenario w3c-match true full matching >/dev/null; then
+      observed_status=0
+    else
+      observed_status=$?
+    fi
+    if ((fixture_start_status != 0)); then
+      expected_status="$fixture_start_status"
+    fi
+    [[ "$observed_status" == "$expected_status" ]]
+  )
+
+  local -r success_log="$TEST_TMP_DIR/matching-fixture-success.calls"
+  local -r failure_log="$TEST_TMP_DIR/matching-fixture-failure.calls"
+  local -r start_failure_log="$TEST_TMP_DIR/matching-fixture-start-failure.calls"
+
+  run_fixture_case 0 "$success_log" || {
+    printf 'controlled matching fixture success path failed\n' >&2
+    return 1
+  }
+  [[ "$(<"$success_log")" == $'start:w3c-match:3\nboundary:w3c-match\ndiagnostics:w3c-match-before\nevidence:w3c-match-before\nscenario:3\nevidence:w3c-match-after\ndiagnostics:w3c-match-after\njava:3:0:0:1:3:0:3:none:0\nstop:w3c-match:3' ]] || {
+    printf 'controlled matching fixture was not fenced around diagnostics\n' >&2
+    return 1
+  }
+
+  run_fixture_case 17 "$failure_log" || {
+    printf 'controlled matching fixture failure path changed status\n' >&2
+    return 1
+  }
+  [[ "$(tail -n 1 "$failure_log")" == "stop:w3c-match:3" ]] || {
+    printf 'controlled matching fixture leaked after scenario failure\n' >&2
+    return 1
+  }
+
+  run_fixture_case 0 "$start_failure_log" 42 || {
+    printf 'controlled matching fixture flattened its startup status\n' >&2
+    return 1
+  }
+  if grep -Eq '^(scenario|stop):' "$start_failure_log"; then
+    printf 'controlled matching fixture ran traffic or normal stop after startup failure\n' >&2
+    return 1
+  fi
+}
+
 test_scenario_supports_metrics_only_security_evidence() {
   local -r call_log="$TEST_TMP_DIR/scenario-metrics-only.calls"
 
@@ -3182,7 +3436,7 @@ test_recreated_stack_readiness_uses_log_cursor() {
       printf 'log:%s:%s\n' "$3" "${4:-}" >>"$observed"
     }
     assert_selected_transport() {
-      printf 'transport\n' >>"$observed"
+      printf 'transport:%s:%s\n' "$1" "$BRIDGE_TRANSPORT" >>"$observed"
     }
     wait_for_http() {
       printf 'http:%s\n' "$2" >>"$observed"
@@ -3191,7 +3445,7 @@ test_recreated_stack_readiness_uses_log_cursor() {
       printf 'apache:%s\n' "$1" >>"$observed"
     }
 
-    recreate_instrumented_stack tcp restoration
+    recreate_instrumented_stack tcp restoration unix
   ) || {
     printf 'recreated stack readiness-order probe failed\n' >&2
     return 1
@@ -3203,7 +3457,7 @@ test_recreated_stack_readiness_uses_log_cursor() {
     'log:restoration injected Java helper:recreate-cursor' \
     'log:restoration external OTel extension:recreate-cursor' \
     'log:restoration injected Java instrumentation:recreate-cursor' \
-    'transport' \
+    'transport:unix:unix' \
     'apache:recreate-instrumented' \
     'http:restoration HTTPS path' >"$expected"
   cmp -s -- "$expected" "$observed" || {
@@ -3940,7 +4194,10 @@ main() {
   test_w3c_fault_requires_forced_unix
   test_security_accepts_enabled_transports
   test_tls_boundary_requires_both_deterministic_modes
-  test_w3c_match_selects_header_and_tcp_propagation
+  test_w3c_match_uses_controlled_unix_fixture
+  test_matching_bridge_sequence_is_exact
+  test_matching_bridge_start_failure_is_cleaned_up
+  test_cleanup_stops_matching_bridge_when_stack_is_kept
   test_runtime_directory_rejects_symlink
   test_bridge_artifact_metadata
   test_agent_download_rejects_symlink_output
@@ -3972,6 +4229,7 @@ main() {
   test_java_diagnostics_delta_is_exact
   test_fault_scenario_does_not_probe_java_diagnostics
   test_scenario_fences_metrics_around_diagnostics
+  test_scenario_controls_matching_fixture_lifecycle
   test_scenario_supports_metrics_only_security_evidence
   test_security_controls_select_metrics_only_evidence
   test_scenario_records_metric_boundary_failure

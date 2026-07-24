@@ -51,17 +51,30 @@ func TestW3COnlyRequestRecordsNoOBIControl(t *testing.T) {
 	assert.False(t, requests[0].InvalidW3C)
 }
 
-func TestW3CMatchUsesInjectedHeadersWithoutClientContext(t *testing.T) {
+func TestW3CMatchSendsCanonicalStandardParent(t *testing.T) {
 	requests, err := makeRequests(config{scenario: "w3c-match", seed: 42})
 	require.NoError(t, err)
 	require.Len(t, requests, 1)
 
 	assert.Equal(t, "matching-w3c-and-obi", requests[0].W3CCase)
-	assert.Empty(t, requests[0].W3CTraceID)
+	assert.Equal(t, matchingW3CTraceID, requests[0].W3CTraceID)
+	assert.Equal(t, matchingW3CParentSpanID, requests[0].W3CParentSpanID)
+	assert.Equal(t, matchingW3CTraceFlags, requests[0].W3CTraceFlags)
 	assert.Equal(t, tracecheck.ModeW3CMatch, expectationFor(
 		config{scenario: "w3c-match"},
 		requests[0],
 	).Mode)
+
+	request, err := newHTTPRequest(
+		context.Background(),
+		config{baseURL: "https://example.test"},
+		requests[0],
+	)
+	require.NoError(t, err)
+	assert.Equal(t,
+		"00-"+matchingW3CTraceID+"-"+matchingW3CParentSpanID+"-"+matchingW3CTraceFlags,
+		request.Header.Get("traceparent"),
+	)
 }
 
 func TestPipeliningUsesFailClosedInboundPolicy(t *testing.T) {

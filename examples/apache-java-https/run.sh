@@ -101,6 +101,7 @@ BRIDGE_BUILD_MODE="fresh"
 ACCEPTANCE_EVIDENCE=true
 ACCEPTANCE_EVIDENCE_REASON=""
 BRIDGE_RUNNING=false
+MATCHING_BRIDGE_RUNNING=false
 SELECTED_TRANSPORT=""
 CONTEXT_PROPAGATION="tcp"
 RUN_STATUS="failed"
@@ -125,6 +126,7 @@ PRESSURE_MONITOR_STATUS=0
 PRESSURE_TAKE_TARGET=""
 FAULT_MODE="alternating"
 FAULT_REQUEST_COUNT=2
+MATCHING_VALID_TAKES=1
 SCENARIO_VARIANT=""
 SECURITY_PROBE_MODE="abuse"
 SECURITY_PROBE_TIMEOUT="60s"
@@ -658,6 +660,15 @@ cleanup() {
     write_run_status "$status"
     log_info "retained run evidence: $RESULT_DIR"
   fi
+  if [[ "$MATCHING_BRIDGE_RUNNING" == "true" ]]; then
+    log_warn "stopping the transient controlled matching bridge"
+    if run_bounded 30 "${COMPOSE[@]}" stop --timeout 5 bridge-fault; then
+      MATCHING_BRIDGE_RUNNING=false
+    else
+      log_error "could not stop the transient controlled matching bridge"
+    fi
+    reset_matching_bridge_environment
+  fi
   if [[ "$STACK_STARTED" == "true" && "$KEEP_RUNNING" == "false" ]]; then
     log_info "stopping scoped Compose project $PROJECT_NAME"
     if ! safe_compose_down >/dev/null 2>&1; then
@@ -944,9 +955,6 @@ export_compose_environment() {
   export BRIDGE_TRANSPORT="$TRANSPORT"
   export BACKEND_TLS_PROTOCOL="$TLS_PROTOCOL"
   CONTEXT_PROPAGATION="tcp"
-  if [[ "$SCENARIO" == "w3c-match" ]]; then
-    CONTEXT_PROPAGATION="headers,tcp"
-  fi
   export CONTEXT_PROPAGATION
   if [[ "$SCENARIO" == "uninstrumented" ]]; then
     export EXTENSION_ENABLED=false
@@ -1205,16 +1213,17 @@ wait_for_log() {
 }
 
 assert_selected_transport() {
+  local -r expected="${1:-$TRANSPORT}"
   local logs=""
 
-  case "$TRANSPORT" in
+  case "$expected" in
     getsockopt|unix)
       logs="$(run_bounded 10 "${COMPOSE[@]}" logs --no-color --tail 500 obi 2>/dev/null || true)"
-      [[ "$logs" == *"transport=$TRANSPORT"* ]] || {
-        log_error "OBI did not report the forced $TRANSPORT transport"
+      [[ "$logs" == *"transport=$expected"* ]] || {
+        log_error "OBI did not report the forced $expected transport"
         return 1
       }
-      SELECTED_TRANSPORT="$TRANSPORT"
+      SELECTED_TRANSPORT="$expected"
       ;;
     auto)
       logs="$(run_bounded 10 "${COMPOSE[@]}" logs --no-color --tail 500 obi 2>/dev/null || true)"
@@ -2546,6 +2555,7 @@ run_scenario() {
   local -r name="$1"
   local -r diagnostics_enabled="${2:-true}"
   local -r phase_evidence="${3:-full}"
+  local -r fixture_mode="${4:-none}"
   local run_number=0
   local label=""
   local output=""
@@ -2568,6 +2578,8 @@ run_scenario() {
   local expected_fault_status=""
   local expected_fault_count=0
   local bridge_was_running=false
+  local controlled_bridge_was_running=false
+  local fixture_status=0
   local scenario_status=0
   local metric_status=0
   local status_name="passed"
@@ -2581,8 +2593,18 @@ run_scenario() {
     log_error "scenario phase evidence must be full or metrics"
     return 1
   }
+  [[ "$fixture_mode" == "none" || "$fixture_mode" == "matching" ]] || {
+    log_error "scenario fixture mode must be none or matching"
+    return 1
+  }
+  if [[ "$fixture_mode" == "matching" && \
+    ( "$name" != "w3c-match" || "$diagnostics_enabled" != "true" ) ]]; then
+    log_error "the matching fixture requires the diagnostic w3c-match scenario"
+    return 1
+  fi
   expected_bridge_missing="$(scenario_bridge_missing_count "$name" "$SELECTED_TRANSPORT")"
   expected_java_missing="$(scenario_java_missing_count "$name" "$diagnostics_enabled")"
+  expected_requests="$(scenario_bridge_take_count "$name")"
   if [[ "$name" == "w3c-fault" ]]; then
     request_arguments=(--requests "$FAULT_REQUEST_COUNT")
   elif [[ "$name" == "tls-boundary" ]]; then
@@ -2591,6 +2613,10 @@ run_scenario() {
     request_arguments=(--requests "$REQUEST_COUNT")
   fi
   for ((run_number = 1; run_number <= REPEAT_COUNT; run_number++)); do
+    controlled_bridge_was_running=false
+    scenario_status=0
+    metric_status=0
+    status_name="passed"
     label="$name"
     if [[ "$name" == "w3c-fault" ]]; then
       label="$name-$FAULT_MODE"
@@ -2607,6 +2633,14 @@ run_scenario() {
     after_phase="$label-after"
 
     log_info "running $label scenario"
+    if [[ "$fixture_mode" == "matching" ]]; then
+      if start_matching_bridge "$label" "$expected_requests"; then
+        controlled_bridge_was_running=true
+      else
+        fixture_status=$?
+        scenario_status="$fixture_status"
+      fi
+    fi
     if ! flush_bridge_metric_boundary "$label"; then
       metric_status=1
     fi
@@ -2629,7 +2663,6 @@ run_scenario() {
       capture_phase_evidence "$before_phase"
     fi
     bridge_was_running="$BRIDGE_RUNNING"
-    expected_requests="$(scenario_bridge_take_count "$name")"
     if [[ "$bridge_was_running" == "true" ]]; then
       before_success="$(bridge_success_total \
         "$RESULT_DIR/phases/$before_phase/obi-metrics.prom")"
@@ -2699,7 +2732,8 @@ run_scenario() {
         metric_status=1
       fi
     fi
-    if [[ "$bridge_was_running" == "true" && "$diagnostics_enabled" == "true" ]]; then
+    if [[ "$diagnostics_enabled" == "true" && \
+      ( "$bridge_was_running" == "true" || "$controlled_bridge_was_running" == "true" ) ]]; then
       if ! write_java_diagnostics_delta \
         "$RESULT_DIR/phases/$before_phase/java-diagnostics.txt" \
         "$RESULT_DIR/phases/$after_phase/java-diagnostics.txt" \
@@ -2741,6 +2775,10 @@ run_scenario() {
           metric_status=1
         fi
       fi
+    fi
+    if [[ "$controlled_bridge_was_running" == "true" ]] && \
+      ! stop_matching_bridge "$label" "$expected_requests"; then
+      metric_status=1
     fi
     if ((scenario_status != 0 || metric_status != 0)); then
       status_name="failed"
@@ -2988,10 +3026,13 @@ run_extension_controls() {
 recreate_instrumented_stack() {
   local -r propagation="$1"
   local -r label="$2"
+  local -r transport="${3:-$TRANSPORT}"
   local recreate_since=""
 
   CONTEXT_PROPAGATION="$propagation"
   export CONTEXT_PROPAGATION
+  BRIDGE_TRANSPORT="$transport"
+  export BRIDGE_TRANSPORT
   export EXTENSION_ENABLED=true
   export JAVA_TOOL_OPTIONS_VALUE="-javaagent:/otel/official-javaagent.jar"
   export OTEL_JAVAAGENT_EXTENSIONS_VALUE="/otel/obi-otel-extension.jar"
@@ -3022,18 +3063,114 @@ recreate_instrumented_stack() {
     "$label injected Java instrumentation" \
     "$recreate_since"
   BRIDGE_RUNNING=true
-  assert_selected_transport
+  assert_selected_transport "$transport"
   wait_for_apache_instrumentation recreate-instrumented
   wait_for_http "$APACHE_HTTPS_HEALTH_ENDPOINT" "$label HTTPS path"
 }
 
-run_w3c_match_control() {
-  if [[ "$SCENARIO" == "all" ]]; then
-    recreate_instrumented_stack "headers,tcp" "matching W3C and OBI"
+reset_matching_bridge_environment() {
+  FAULT_MODE="alternating"
+  MATCHING_VALID_TAKES=1
+  export FAULT_MODE MATCHING_VALID_TAKES
+}
+
+matching_bridge_sequence_is_exact() {
+  local -r input="$1"
+  local -r expected_valid="$2"
+
+  awk -v expected_valid="$expected_valid" '
+    /operation=take status=/ {
+      count++
+      status = count == 1 || count == expected_valid + 2 ? "missing" : "valid"
+      pattern = "operation=take status=" status " take_count=" count "([^0-9]|$)"
+      if ($0 !~ pattern) {
+        invalid = 1
+      }
+    }
+    END {
+      exit invalid || count != expected_valid + 2 ? 1 : 0
+    }
+  ' "$input"
+}
+
+start_matching_bridge() {
+  local -r label="$1"
+  local -r expected_valid="$2"
+  local start_status=0
+
+  [[ "$BRIDGE_RUNNING" == "false" ]] || {
+    log_error "refusing to start the controlled matching bridge while OBI is running"
+    return 1
+  }
+  bounded_decimal "$expected_valid" 1000 false >/dev/null || {
+    log_error "matching bridge valid-take count is invalid: $expected_valid"
+    return 1
+  }
+  FAULT_MODE="matching"
+  MATCHING_VALID_TAKES="$expected_valid"
+  export FAULT_MODE MATCHING_VALID_TAKES
+  log_info "starting controlled matching bridge for $label valid_takes=$expected_valid"
+  MATCHING_BRIDGE_RUNNING=true
+  if run_bounded 60 \
+    "${COMPOSE[@]}" up --detach --no-deps --force-recreate bridge-fault; then
+    :
+  else
+    start_status=$?
+    if run_bounded 30 "${COMPOSE[@]}" stop --timeout 5 bridge-fault; then
+      MATCHING_BRIDGE_RUNNING=false
+    fi
+    reset_matching_bridge_environment
+    return "$start_status"
   fi
-  run_scenario w3c-match
-  if [[ "$SCENARIO" == "all" ]]; then
-    recreate_instrumented_stack "tcp" "TCP-only bridge restoration"
+  if wait_for_log \
+    bridge-fault \
+    "mode=matching matching_valid_takes=$expected_valid" \
+    "$label controlled matching bridge"; then
+    :
+  else
+    start_status=$?
+    if run_bounded 30 "${COMPOSE[@]}" stop --timeout 5 bridge-fault; then
+      MATCHING_BRIDGE_RUNNING=false
+    fi
+    reset_matching_bridge_environment
+    return "$start_status"
+  fi
+}
+
+stop_matching_bridge() {
+  local -r label="$1"
+  local -r expected_valid="$2"
+  local -r fixture_log="$RESULT_DIR/$label-matching-bridge.log"
+  local status=0
+
+  if ! run_bounded 15 \
+    "${COMPOSE[@]}" logs --no-color bridge-fault >"$fixture_log"; then
+    log_error "could not capture the controlled matching bridge log for $label"
+    status=1
+  elif ! matching_bridge_sequence_is_exact "$fixture_log" "$expected_valid"; then
+    log_error "matching bridge sequence for $label was not missing, $expected_valid valid, missing"
+    status=1
+  fi
+  if ! run_bounded 30 "${COMPOSE[@]}" stop --timeout 5 bridge-fault; then
+    log_error "could not stop the controlled matching bridge for $label"
+    status=1
+  else
+    MATCHING_BRIDGE_RUNNING=false
+  fi
+  reset_matching_bridge_environment
+  return "$status"
+}
+
+run_w3c_match_control() {
+  local -r original_transport="$TRANSPORT"
+
+  if [[ "$SELECTED_TRANSPORT" != "unix" ]]; then
+    recreate_instrumented_stack "tcp" "matching W3C and OBI preparation" unix
+  fi
+  stop_obi_for_no_state_control "w3c-match"
+  run_scenario w3c-match true full matching
+  if [[ "$SCENARIO" == "all" || "$KEEP_RUNNING" == "true" ]]; then
+    recreate_instrumented_stack "tcp" "post-match bridge restoration" "$original_transport"
   fi
 }
 

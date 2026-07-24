@@ -150,7 +150,12 @@ type runResult struct {
 	Cases               []caseResult        `json:"cases"`
 }
 
-const assertionQuiescence = 6 * time.Second
+const (
+	assertionQuiescence     = 6 * time.Second
+	matchingW3CTraceID      = "000102030405060708090a0b0c0d0e0f"
+	matchingW3CParentSpanID = "1011121314151617"
+	matchingW3CTraceFlags   = "01"
+)
 
 func main() {
 	os.Exit(mainExitCode())
@@ -393,6 +398,9 @@ func makeRequests(cfg config) ([]requestCase, error) {
 				requests[i].W3CCase = "malformed-w3c-valid-obi"
 			}
 		case "w3c-match":
+			requests[i].W3CTraceID = matchingW3CTraceID
+			requests[i].W3CParentSpanID = matchingW3CParentSpanID
+			requests[i].W3CTraceFlags = matchingW3CTraceFlags
 			requests[i].W3CCase = "matching-w3c-and-obi"
 		case "obi-flags":
 			requests[i].Endpoint = "/api/obi-flags"
@@ -1151,7 +1159,6 @@ func expectationFor(cfg config, request requestCase) tracecheck.Expectation {
 		}
 	case "w3c-match":
 		mode = tracecheck.ModeW3CMatch
-		expectedTraceFlags = "01"
 	case "obi-flags":
 		javaTraceFlags = "01"
 	case "w3c-fault":

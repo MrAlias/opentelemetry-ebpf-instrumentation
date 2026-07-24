@@ -147,6 +147,8 @@ services:
       - /fault-bridge
       - --socket
       - /var/run/obi/java-remote-parent.sock
+      - --matching-valid-takes
+      - ${MATCHING_VALID_TAKES:-1}
     volumes:
       - java-remote-parent-socket:/var/run/obi
     profiles:

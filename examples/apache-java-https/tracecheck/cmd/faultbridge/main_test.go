@@ -5,6 +5,7 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -19,6 +20,23 @@ func TestFaultSequenceIsBoundedAndDeterministic(t *testing.T) {
 	assert.Equal(t, "malformed", server.response(operationTake).status)
 	assert.Equal(t, "stale", server.response(operationTake).status)
 	assert.EqualValues(t, 3, server.takes.Load())
+}
+
+func TestMatchingSequenceBracketsCanonicalCandidates(t *testing.T) {
+	server := &faultServer{mode: "matching", matchingValidTakes: 2}
+
+	assert.Equal(t, "missing", server.response(operationProbe).status)
+	assert.Equal(t, "missing", server.response(operationDrop).status)
+	assert.Equal(t, "missing", server.response(operationTake).status)
+	first := server.response(operationTake)
+	second := server.response(operationTake)
+	assert.Equal(t, "missing", server.response(operationTake).status)
+
+	assert.Equal(t, "valid", first.status)
+	assert.Equal(t, "valid", second.status)
+	assert.Equal(t, statusValid, first.payload[8])
+	assert.Equal(t, statusValid, second.payload[8])
+	assert.EqualValues(t, 4, server.takes.Load())
 }
 
 func TestFaultModesReturnDeterministicResponses(t *testing.T) {
@@ -78,8 +96,17 @@ func TestMalformedRecordModesCorruptOneField(t *testing.T) {
 
 func TestFaultModeValidation(t *testing.T) {
 	assert.True(t, validFaultMode(defaultFaultMode))
+	assert.True(t, validFaultMode("matching"))
 	assert.True(t, validFaultMode("timeout"))
 	assert.False(t, validFaultMode("unknown"))
+}
+
+func TestMatchingTakeCountValidation(t *testing.T) {
+	assert.True(t, validMatchingTakeCount(defaultFaultMode, 0))
+	assert.False(t, validMatchingTakeCount("matching", 0))
+	assert.True(t, validMatchingTakeCount("matching", 1))
+	assert.True(t, validMatchingTakeCount("matching", maxMatchingTakes))
+	assert.False(t, validMatchingTakeCount("matching", maxMatchingTakes+1))
 }
 
 func TestParseRequestRejectsMalformedEnvelope(t *testing.T) {
@@ -100,6 +127,13 @@ func TestStatusRecordIsProtocolSized(t *testing.T) {
 	assert.Equal(t, recordVersion, binary.LittleEndian.Uint16(record[4:6]))
 	assert.EqualValues(t, recordSize, binary.LittleEndian.Uint16(record[6:8]))
 	assert.Equal(t, statusStale, record[8])
+}
+
+func TestValidRecordMatchesCanonicalSampledVector(t *testing.T) {
+	const canonical = "4f42494a010040000101000000000000000102030405060708090a0b0c0d0e0f" +
+		"1011121314151617080706050403020118171615141312110000000000000000"
+
+	assert.Equal(t, canonical, hex.EncodeToString(validRecord()))
 }
 
 func validRequest(operation byte) []byte {

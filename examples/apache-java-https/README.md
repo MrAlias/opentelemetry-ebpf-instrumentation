@@ -86,7 +86,7 @@ The checked-in #28 matrix is explicit about which layer proves each case:
 | no W3C and no OBI state | `fail-open`: OBI stopped, one Java root | privileged run |
 | valid W3C only | `w3c-only`: OBI stopped, exact remote W3C parent | privileged run |
 | valid OBI only | `basic`: exact Apache client parent | privileged run |
-| matching W3C and OBI | `w3c-match`: isolated header+TCP injection with exact candidate IDs | privileged run |
+| matching W3C and OBI | `w3c-match`: controlled Unix bridge candidate plus an identical W3C header, exact Java parent, and one standard-parent discard | privileged run |
 | conflicting valid W3C and OBI | `w3c`: exact W3C parent, distinct Apache candidate, one discard | privileged run |
 | malformed W3C and valid OBI | `w3c`: exact Apache client parent, one take | privileged run |
 | valid W3C and no OBI | `w3c-only` plus named Unix fault modes | privileged run |
@@ -100,6 +100,10 @@ Unit tests alone do not mark a stock-agent E2E row as passed. The Unix-only
 fault control supplies bounded stale, malformed, timeout, disconnect,
 overload, truncated, wrong-magic, wrong-size, version-mismatch, zero-trace-ID,
 and zero-span-ID responses while valid W3C context remains authoritative.
+The matching control uses the canonical sampled ABI vector as a bounded Unix
+bridge fixture and supplies the same IDs in a real `traceparent` header. This
+isolates extraction precedence without enabling generic payload header mutation
+on the production Java TLS bridge path.
 
 ## Prerequisites
 

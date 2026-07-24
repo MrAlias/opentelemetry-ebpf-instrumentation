@@ -281,6 +281,47 @@ func TestAssertSnapshotW3CWithoutOBI(t *testing.T) {
 	}
 }
 
+func TestAssertSnapshotW3CMatchUsesExactParentWithoutApacheSpans(t *testing.T) {
+	const marker = "w3c-match-00-deadbeef"
+	requestAttributes := map[string]string{
+		"http.request.header.x_obi_demo_id": marker,
+		"url.path":                          "/api/echo",
+	}
+	expectation := Expectation{
+		Mode:            ModeW3CMatch,
+		ApacheService:   "apache-proxy",
+		JavaService:     "java-backend",
+		Endpoint:        "/api/echo",
+		Marker:          marker,
+		W3CTraceID:      "000102030405060708090a0b0c0d0e0f",
+		W3CParentSpanID: "1011121314151617",
+		W3CTraceFlags:   "01",
+	}
+	snapshot := Snapshot{Marker: marker, Spans: []Span{{
+		ServiceName:  "java-backend",
+		Kind:         "SERVER",
+		TraceID:      expectation.W3CTraceID,
+		SpanID:       "server",
+		ParentSpanID: expectation.W3CParentSpanID,
+		Flags:        spanFlagsParentRemoteKnown | spanFlagsParentRemote | 1,
+		Attributes:   requestAttributes,
+	}}}
+
+	if err := AssertSnapshot(snapshot, expectation); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot.Spans = append(snapshot.Spans, Span{
+		ServiceName: "apache-proxy",
+		Kind:        "CLIENT",
+		SpanID:      "unexpected-apache",
+		Attributes:  requestAttributes,
+	})
+	if err := AssertSnapshot(snapshot, expectation); err == nil {
+		t.Fatal("expected an Apache span to invalidate the controlled matching fixture")
+	}
+}
+
 func TestAssertSnapshotW3CResilienceAllowsChangingOBIAvailability(t *testing.T) {
 	const marker = "restart-fault-00-deadbeef"
 	requestAttributes := map[string]string{

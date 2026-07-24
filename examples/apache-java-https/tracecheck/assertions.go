@@ -81,6 +81,7 @@ func AssertSnapshot(snapshot Snapshot, expectation Expectation) error {
 	hasApacheServer := false
 	if expectation.Mode != ModeFailOpen &&
 		expectation.Mode != ModeW3CNoOBI &&
+		expectation.Mode != ModeW3CMatch &&
 		expectation.Mode != ModeW3CResilience {
 		apacheServers := selectMarkerServerSpans(
 			snapshot.Spans,
@@ -128,7 +129,7 @@ func AssertSnapshot(snapshot Snapshot, expectation Expectation) error {
 	}
 
 	switch expectation.Mode {
-	case ModeBridge, ModePipelinedBridge, ModeW3CMatch:
+	case ModeBridge, ModePipelinedBridge:
 		if remote, known := ParentRemote(javaSpan); !known || !remote {
 			return fmt.Errorf(
 				"expected Java server span parent to be explicitly remote, flags=%d",
@@ -202,7 +203,7 @@ func AssertSnapshot(snapshot Snapshot, expectation Expectation) error {
 		if !isZeroID(javaSpan.ParentSpanID) {
 			return fmt.Errorf("expected Java root span, got parent %s", javaSpan.ParentSpanID)
 		}
-	case ModeW3C, ModeW3CNoOBI, ModeW3CResilience:
+	case ModeW3C, ModeW3CMatch, ModeW3CNoOBI, ModeW3CResilience:
 		if remote, known := ParentRemote(javaSpan); !known || !remote {
 			return fmt.Errorf(
 				"expected W3C Java server parent to be explicitly remote, flags=%d",

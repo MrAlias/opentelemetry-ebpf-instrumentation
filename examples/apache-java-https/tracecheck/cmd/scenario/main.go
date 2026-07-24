@@ -1095,6 +1095,7 @@ func exerciseTimeoutCancellation(ctx context.Context, cfg config) (faultResult, 
 	defer cancel()
 	request := requestCase{
 		Marker:      fmt.Sprintf("timeout-retry-cancelled-%d", cfg.seed),
+		Endpoint:    "/api/echo",
 		DelayMillis: 500,
 	}
 	started := time.Now()
@@ -1103,7 +1104,7 @@ func exerciseTimeoutCancellation(ctx context.Context, cfg config) (faultResult, 
 	if err == nil {
 		return fault, errors.New("cancellation control unexpectedly completed")
 	}
-	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(timedContext.Err(), context.DeadlineExceeded) {
+	if !errors.Is(err, context.DeadlineExceeded) {
 		return fault, fmt.Errorf("cancellation control failed for the wrong reason: %w", err)
 	}
 	fault.Outcome = "deadline-exceeded-as-expected"

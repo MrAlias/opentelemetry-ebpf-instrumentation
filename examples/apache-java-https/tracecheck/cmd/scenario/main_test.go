@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -322,6 +323,64 @@ func TestPacedReaderEmitsExactlyTheConfiguredBody(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, body, 129)
 	assert.Zero(t, reader.remaining)
+}
+
+func TestTimeoutCancellationReachesDelayedEchoEndpoint(t *testing.T) {
+	type observedRequest struct {
+		path   string
+		delay  string
+		marker string
+	}
+
+	observed := make(chan observedRequest, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/echo", func(_ http.ResponseWriter, request *http.Request) {
+		observed <- observedRequest{
+			path:   request.URL.Path,
+			delay:  request.URL.Query().Get("delay_ms"),
+			marker: request.Header.Get(tracecheck.MarkerHeader),
+		}
+		<-request.Context().Done()
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	fault, err := exerciseTimeoutCancellation(context.Background(), config{
+		baseURL: server.URL,
+		seed:    42,
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, "client-timeout", fault.Kind)
+	assert.Equal(t, "deadline-exceeded-as-expected", fault.Outcome)
+	assert.Positive(t, fault.ElapsedNanos)
+	var request observedRequest
+	select {
+	case request = <-observed:
+	case <-time.After(time.Second):
+		require.FailNow(t, "delayed echo endpoint did not observe the cancellation control")
+	}
+	assert.Equal(t, observedRequest{
+		path:   "/api/echo",
+		delay:  "500",
+		marker: "timeout-retry-cancelled-42",
+	}, request)
+}
+
+func TestTimeoutCancellationRejectsImmediateHTTPFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		http.NotFound(response, request)
+	}))
+	defer server.Close()
+
+	fault, err := exerciseTimeoutCancellation(context.Background(), config{
+		baseURL: server.URL,
+		seed:    42,
+	})
+
+	require.ErrorContains(t, err, "cancellation control failed for the wrong reason")
+	require.ErrorContains(t, err, "unexpected HTTP status 404")
+	assert.Equal(t, "failed", fault.Outcome)
 }
 
 func TestNettyRequestsCoverCancelledAndUncancelledWork(t *testing.T) {

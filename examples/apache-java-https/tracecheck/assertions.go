@@ -306,7 +306,7 @@ func selectRequestSpans(spans []Span, serviceName, kind, endpoint, marker string
 		if span.ServiceName == serviceName &&
 			strings.EqualFold(span.Kind, kind) &&
 			MatchesEndpoint(span, endpoint) &&
-			(!hasMarkerAttribute(span) || MatchesMarker(span, marker)) {
+			MatchesMarker(span, marker) {
 			selected = append(selected, span)
 		}
 	}

@@ -378,6 +378,39 @@ static __always_inline u8 finish_ssl_prewrite(u64 id,
 }
 
 static __always_inline void
+emit_ssl_prewrite_large_buffer_init(void *ctx, u64 id, const ssl_args_t *args, u32 written_bytes) {
+    const u64 thread_start_time = task_thread_start_time();
+    if (!args || !thread_start_time || !args->handoff_id) {
+        return;
+    }
+
+    const ssl_prewrite_key_t key = ssl_prewrite_key(id, thread_start_time, args->handoff_id);
+    ssl_prewrite_value_t *value = bpf_map_lookup_elem(&ssl_prewrite_tp, &key);
+    if (!ssl_prewrite_postwrite_value_structurally_valid(value) ||
+        value->write_outcome != k_ssl_prewrite_write_succeeded ||
+        value->trace.pid != pid_from_pid_tgid(id) ||
+        !ssl_prewrite_postwrite_matches(value, args->ssl, args->buf, written_bytes)) {
+        return;
+    }
+
+    http_info_t *info = bpf_map_lookup_elem(&ongoing_http, &value->connection);
+    if (!info || info->ssl_prewrite_pending == k_ssl_prewrite_local_blocked ||
+        !ssl_prewrite_transport_local_fields_match(
+            value, info->type, info->ssl, info->direction, info->start_monotime_ns, &info->tp)) {
+        return;
+    }
+
+    http_send_large_buffer(ctx,
+                           info,
+                           &value->connection,
+                           (void *)args->buf,
+                           written_bytes,
+                           PACKET_TYPE_REQUEST,
+                           TCP_SEND,
+                           k_large_buf_action_init);
+}
+
+static __always_inline void
 handle_ssl_buf(void *ctx, u64 id, ssl_args_t *args, int bytes_len, u8 direction) {
     if (!args) {
         return;
@@ -402,6 +435,9 @@ handle_ssl_buf(void *ctx, u64 id, ssl_args_t *args, int bytes_len, u8 direction)
                 const ssl_pid_key_t key =
                     ssl_pid_key(args->ssl, pid_from_pid_tgid(id), process_start_time);
                 bpf_map_delete_elem(&ssl_to_pid_tid, &key);
+            }
+            if (bytes_len > 0) {
+                emit_ssl_prewrite_large_buffer_init(ctx, id, args, written_bytes);
             }
             return;
         }

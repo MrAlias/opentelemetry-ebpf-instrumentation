@@ -125,6 +125,54 @@ func TestTCPLargeBuffers(t *testing.T) {
 	verifyLargeBuffer(firstEvent.Tp.TraceId, firstEvent.PacketType, firstEvent.Direction, firstEvent.ConnInfo, firstBuf+"foobar")
 }
 
+func TestTCPLargeBufferRejectsOrphanAppend(t *testing.T) {
+	pctx := NewEBPFParseContext(nil, nil, nil)
+	event := TCPLargeBufferHeader{
+		PacketType: packetTypeRequest,
+		Direction:  directionSend,
+		Action:     largeBufferActionAppend,
+		Kind:       uint8(KindLayerApp),
+		ConnInfo:   BpfConnectionInfoT{D_port: 443},
+	}
+	event.Tp.TraceId = [16]uint8{'o', 'r', 'p', 'h', 'a', 'n'}
+
+	body := "request body"
+	event.Len = uint32(len(body))
+	_, _, err := appendTCPLargeBuffer(pctx, toRingbufRecord(t, event, body))
+	require.NoError(t, err)
+
+	_, ok := extractTCPLargeBuffer(
+		pctx,
+		event.Tp.TraceId,
+		event.PacketType,
+		event.Direction,
+		event.ConnInfo,
+		ProtocolTypeHTTP,
+	)
+	require.False(t, ok)
+
+	header := "POST /api/echo HTTP/1.1\r\nContent-Length: 12\r\n\r\n"
+	event.Action = largeBufferActionInit
+	event.Len = uint32(len(header))
+	_, _, err = appendTCPLargeBuffer(pctx, toRingbufRecord(t, event, header))
+	require.NoError(t, err)
+	event.Action = largeBufferActionAppend
+	event.Len = uint32(len(body))
+	_, _, err = appendTCPLargeBuffer(pctx, toRingbufRecord(t, event, body))
+	require.NoError(t, err)
+
+	buf, ok := extractTCPLargeBuffer(
+		pctx,
+		event.Tp.TraceId,
+		event.PacketType,
+		event.Direction,
+		event.ConnInfo,
+		ProtocolTypeHTTP,
+	)
+	require.True(t, ok)
+	require.Equal(t, header+body, string(buf.UnsafeView()))
+}
+
 func toRingbufRecord(t *testing.T, event TCPLargeBufferHeader, buf string) *ringbuf.Record {
 	var fixedPart bytes.Buffer
 	if err := binary.Write(&fixedPart, binary.LittleEndian, event); err != nil {

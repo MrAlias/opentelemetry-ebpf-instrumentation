@@ -199,7 +199,7 @@ func TestAssertSnapshotBridge(t *testing.T) {
 	}
 	spans := []Span{
 		{ServiceName: "apache-proxy", Kind: "SERVER", TraceID: "trace", SpanID: "apache-server", Attributes: requestAttributes},
-		{ServiceName: "apache-proxy", Kind: "CLIENT", TraceID: "trace", SpanID: "parent", ParentSpanID: "apache-server", Attributes: map[string]string{"url.path": "/api/echo"}},
+		{ServiceName: "apache-proxy", Kind: "CLIENT", TraceID: "trace", SpanID: "parent", ParentSpanID: "apache-server", Attributes: requestAttributes},
 		{ServiceName: "java-backend", Kind: "SERVER", TraceID: "trace", SpanID: "server", ParentSpanID: "parent", Flags: spanFlagsParentRemoteKnown | spanFlagsParentRemote, Attributes: requestAttributes},
 	}
 	store := NewStore(10, 1024, 4096)

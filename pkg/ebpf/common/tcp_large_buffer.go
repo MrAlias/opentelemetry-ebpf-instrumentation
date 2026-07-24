@@ -72,9 +72,7 @@ func appendTCPLargeBuffer(parseCtx *EBPFParseContext, record *ringbuf.Record) (r
 		initFunc(chunk)
 	case largeBufferActionAppend:
 		lb, ok := parseCtx.largeBuffers.Get(key)
-		if !ok {
-			initFunc(chunk)
-		} else {
+		if ok {
 			lb.AppendChunk(chunk)
 		}
 	default:

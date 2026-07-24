@@ -70,6 +70,21 @@ func TestAssertSnapshotRejectsConflictingBridgeCandidateMarker(t *testing.T) {
 	assert.ErrorContains(t, AssertSnapshot(snapshot, expectation), "exactly one Apache client candidate")
 }
 
+func TestAssertSnapshotRequiresBridgeCandidateMarker(t *testing.T) {
+	snapshot := bridgeSnapshot(testRemoteSpanFlags)
+	snapshot.Spans[0].ParentSpanID = ""
+	delete(snapshot.Spans[1].Attributes, "http.request.header.x-obi-demo-id")
+	expectation := Expectation{
+		Mode:          ModeBridge,
+		ApacheService: "apache",
+		JavaService:   "java",
+		Endpoint:      testEndpoint,
+		Marker:        testMarker,
+	}
+
+	assert.ErrorContains(t, AssertSnapshot(snapshot, expectation), "exactly one Apache client candidate")
+}
+
 func TestAssertSnapshotRequiresApacheRootWithoutExternalW3C(t *testing.T) {
 	snapshot := bridgeSnapshot(testRemoteSpanFlags)
 	snapshot.Spans[0].ParentSpanID = ""
@@ -245,7 +260,8 @@ func bridgeSnapshot(candidateFlags uint32) Snapshot {
 		"http.request.header.x-obi-demo-id": testMarker,
 	}
 	clientAttributes := map[string]string{
-		"url.full": "https://java" + testEndpoint,
+		"http.request.header.x-obi-demo-id": testMarker,
+		"url.full":                          "https://java" + testEndpoint,
 	}
 	return Snapshot{
 		Marker: testMarker,

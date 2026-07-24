@@ -12,6 +12,11 @@
 #include <common/event_defs.h>
 #include <common/tp_info.h>
 
+enum test_large_buf_action : u8 {
+    k_large_buf_action_init = 0,
+    k_large_buf_action_append = 1,
+};
+
 enum ssl_prewrite_local_state : u8 {
     k_ssl_prewrite_local_none = 0,
     k_ssl_prewrite_local_pending = 1,
@@ -43,6 +48,34 @@ extern int test_terminate_http_count;
 extern pid_connection_info_t test_terminated_connection;
 extern int test_http_info_available;
 extern u8 test_http_will_complete;
+extern int test_large_buffer_init_count;
+extern pid_connection_info_t test_large_buffer_connection;
+extern u64 test_large_buffer_address;
+extern u32 test_large_buffer_bytes_len;
+extern u8 test_large_buffer_packet_type;
+extern u8 test_large_buffer_direction;
+extern u8 test_large_buffer_action;
+
+static __always_inline int http_send_large_buffer(void *ctx,
+                                                  http_info_t *req,
+                                                  const pid_connection_info_t *pid_conn,
+                                                  const void *u_buf,
+                                                  u32 bytes_len,
+                                                  u8 packet_type,
+                                                  u8 direction,
+                                                  u8 action) {
+    (void)ctx;
+    (void)req;
+
+    test_large_buffer_init_count++;
+    test_large_buffer_connection = *pid_conn;
+    test_large_buffer_address = (u64)u_buf;
+    test_large_buffer_bytes_len = bytes_len;
+    test_large_buffer_packet_type = packet_type;
+    test_large_buffer_direction = direction;
+    test_large_buffer_action = action;
+    return 0;
+}
 
 static __always_inline u8 http_will_complete(http_info_t *info, unsigned char *buf, u32 len) {
     (void)info;

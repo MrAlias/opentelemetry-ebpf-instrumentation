@@ -517,6 +517,7 @@ func TestToRequestTraceLargeBuffers(t *testing.T) {
 		withLargeBuf bool
 		primaryBuf   string
 		largeRequest string
+		largeAction  uint8
 		expectedPath string
 	}{
 		{
@@ -531,6 +532,14 @@ func TestToRequestTraceLargeBuffers(t *testing.T) {
 			primaryBuf:   "GET /short HTTP/1.1\r\n\r\n",
 			largeRequest: "GET /from-large-buffer HTTP/1.1\r\nHost: example.com\r\n\r\n",
 			expectedPath: "/from-large-buffer",
+		},
+		{
+			name:         "orphan body append falls back to primary buffer",
+			withLargeBuf: true,
+			primaryBuf:   "POST /slow HTTP/1.1\r\nContent-Length: 12\r\n\r\n",
+			largeRequest: "request body",
+			largeAction:  largeBufferActionAppend,
+			expectedPath: "/slow",
 		},
 	}
 
@@ -555,7 +564,7 @@ func TestToRequestTraceLargeBuffers(t *testing.T) {
 				lbHdr := TCPLargeBufferHeader{
 					PacketType: packetTypeRequest,
 					Len:        uint32(len(tc.largeRequest)),
-					Action:     largeBufferActionInit,
+					Action:     tc.largeAction,
 					Kind:       uint8(KindLayerApp),
 				}
 				lbHdr.Tp.TraceId = traceID

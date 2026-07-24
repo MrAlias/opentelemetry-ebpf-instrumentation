@@ -65,6 +65,13 @@ int test_delete_server_trace_count;
 pid_connection_info_t test_deleted_server_connection;
 trace_key_t test_deleted_server_key;
 u8 test_http_will_complete;
+int test_large_buffer_init_count;
+pid_connection_info_t test_large_buffer_connection;
+u64 test_large_buffer_address;
+u32 test_large_buffer_bytes_len;
+u8 test_large_buffer_packet_type;
+u8 test_large_buffer_direction;
+u8 test_large_buffer_action;
 
 static int ssl_pid_tid_delete_count;
 static int pid_tid_delete_count;
@@ -304,6 +311,13 @@ static void reset(void) {
     test_deleted_server_connection = (pid_connection_info_t){};
     test_deleted_server_key = (trace_key_t){};
     test_http_will_complete = 0;
+    test_large_buffer_init_count = 0;
+    test_large_buffer_connection = (pid_connection_info_t){};
+    test_large_buffer_address = 0;
+    test_large_buffer_bytes_len = 0;
+    test_large_buffer_packet_type = 0;
+    test_large_buffer_direction = 0;
+    test_large_buffer_action = k_large_buf_action_init;
     ssl_pid_tid_delete_count = 0;
     pid_tid_delete_count = 0;
     ssl_to_conn_update_count = 0;
@@ -406,6 +420,81 @@ static ssl_args_t seed_finish_prewrite(enum ssl_prewrite_transport_phase phase, 
     test_prewrite.trace.provenance = k_tp_provenance_ssl_prewrite;
     test_prewrite.trace.tp = test_http_info.tp;
     return args;
+}
+
+static void test_successful_published_write_initializes_large_buffer(void) {
+    reset();
+    ssl_args_t args =
+        seed_finish_prewrite(k_ssl_prewrite_transport_none, k_ssl_prewrite_arbitration_none);
+
+    handle_ssl_buf(NULL, 0x2a00000001ULL, &args, 64, TCP_SEND);
+
+    assert_int_eq(1, test_large_buffer_init_count, "successful prewrite initializes one buffer");
+    assert_u64_eq(args.buf, test_large_buffer_address, "buffer init uses the staged header");
+    assert_int_eq(64, (int)test_large_buffer_bytes_len, "buffer init uses the written length");
+    assert_int_eq(
+        PACKET_TYPE_REQUEST, test_large_buffer_packet_type, "buffer init records a request");
+    assert_int_eq(TCP_SEND, test_large_buffer_direction, "buffer init records send direction");
+    assert_int_eq(
+        k_large_buf_action_init, test_large_buffer_action, "buffer init does not append an orphan");
+    assert_int_eq(0, test_parser_call_count, "published write is not parsed a second time");
+    if (memcmp(&test_large_buffer_connection,
+               &test_http_connection,
+               sizeof(test_http_connection)) != 0) {
+        fprintf(stderr, "FAIL: buffer init uses the published connection\n");
+        exit(1);
+    }
+}
+
+static void test_terminal_transport_success_initializes_after_local_commit(void) {
+    reset();
+    ssl_args_t args = seed_finish_prewrite(k_ssl_prewrite_transport_accepted,
+                                           k_ssl_prewrite_arbitration_transport_may_emit);
+
+    handle_ssl_buf(NULL, 0x2a00000001ULL, &args, 64, TCP_SEND);
+
+    assert_int_eq(0, test_http_info.ssl_prewrite_pending, "terminal transport commits local state");
+    assert_int_eq(
+        1, test_large_buffer_init_count, "committed prewrite still initializes its request buffer");
+}
+
+static void test_failed_published_writes_do_not_initialize_large_buffer(void) {
+    reset();
+    ssl_args_t args =
+        seed_finish_prewrite(k_ssl_prewrite_transport_none, k_ssl_prewrite_arbitration_none);
+    handle_ssl_buf(NULL, 0x2a00000001ULL, &args, 0, TCP_SEND);
+    assert_int_eq(0, test_large_buffer_init_count, "failed write emits no buffer init");
+
+    reset();
+    args = seed_finish_prewrite(k_ssl_prewrite_transport_none, k_ssl_prewrite_arbitration_none);
+    handle_ssl_buf(NULL, 0x2a00000001ULL, &args, 32, TCP_SEND);
+    assert_int_eq(0, test_large_buffer_init_count, "short write emits no buffer init");
+
+    reset();
+    args = seed_finish_prewrite(k_ssl_prewrite_transport_none, k_ssl_prewrite_arbitration_none);
+    handle_ssl_buf(NULL, 0x2a00000001ULL, &args, 65, TCP_SEND);
+    assert_int_eq(0, test_large_buffer_init_count, "oversized write emits no buffer init");
+}
+
+static void test_foreign_or_missing_prewrite_does_not_initialize_large_buffer(void) {
+    reset();
+    ssl_args_t args =
+        seed_finish_prewrite(k_ssl_prewrite_transport_none, k_ssl_prewrite_arbitration_none);
+    test_http_info.tp.span_id[0]++;
+    handle_ssl_buf(NULL, 0x2a00000001ULL, &args, 64, TCP_SEND);
+    assert_int_eq(0, test_large_buffer_init_count, "foreign local request emits no buffer init");
+
+    reset();
+    args = seed_finish_prewrite(k_ssl_prewrite_transport_none, k_ssl_prewrite_arbitration_none);
+    test_http_info.ssl_prewrite_pending = k_ssl_prewrite_local_blocked;
+    handle_ssl_buf(NULL, 0x2a00000001ULL, &args, 64, TCP_SEND);
+    assert_int_eq(0, test_large_buffer_init_count, "blocked local request emits no buffer init");
+
+    reset();
+    args = ssl_args();
+    args.flags = FLAG_SSL_PREWRITE_PUBLISHED;
+    handle_ssl_buf(NULL, 0x2a00000001ULL, &args, 64, TCP_SEND);
+    assert_int_eq(0, test_large_buffer_init_count, "missing prewrite emits no buffer init");
 }
 
 static void test_successful_prewrite_waits_for_delayed_transport(void) {
@@ -1303,6 +1392,10 @@ static void test_missing_args_noops(void) {
 }
 
 int main(void) {
+    test_successful_published_write_initializes_large_buffer();
+    test_terminal_transport_success_initializes_after_local_commit();
+    test_failed_published_writes_do_not_initialize_large_buffer();
+    test_foreign_or_missing_prewrite_does_not_initialize_large_buffer();
     test_successful_prewrite_waits_for_delayed_transport();
     test_failed_prewrite_without_transport_discards_local_state();
     test_transport_first_failure_retains_and_commits_local_state();

@@ -120,7 +120,8 @@ type connectionClaim struct {
 
 type stateValue struct {
 	Lifecycle           uint8
-	Reserved            [7]byte
+	Reserved            [3]byte
+	Aliases             uint32
 	ObservedMonotonicNS uint64
 	Connection          connectionInfo
 	ConnectionNetNS     uint32
@@ -140,6 +141,8 @@ type resolvedCandidate struct {
 	Generation         uint64
 	ProcessIncarnation uint64
 	Lifecycle          uint8
+	StateOnly          bool
+	Encoded            [RecordSize]byte
 }
 
 type ownerValue struct {
@@ -284,12 +287,9 @@ func (h *MapHandler) handle(
 	if candidate.Lifecycle != 0 {
 		return Record{Status: statusForLifecycle(candidate.Lifecycle)}
 	}
-	var encoded [RecordSize]byte
-	if err := h.remoteParents.Lookup(&owner, &encoded); err != nil {
-		if errors.Is(err, ebpf.ErrKeyNotExist) {
-			return Record{Status: StatusAlreadyConsumed}
-		}
-		return Record{Status: StatusTransportError}
+	encoded, status := h.readCandidate(candidate)
+	if status != StatusValid {
+		return Record{Status: status}
 	}
 
 	record, err := UnmarshalRecord(encoded[:])
@@ -329,7 +329,7 @@ func (h *MapHandler) handle(
 		return Record{Status: StatusStale}
 	}
 	if _, _, status := h.validatePublishedGeneration(
-		owner, record, encoded, processIncarnation, StatusMissing, false,
+		owner, record, encoded, processIncarnation, StatusMissing, false, candidate.StateOnly,
 	); status != StatusValid {
 		return Record{Status: status}
 	}
@@ -368,7 +368,7 @@ func (h *MapHandler) handle(
 	}
 
 	state, claimedRecord, status := h.validatePublishedGeneration(
-		owner, record, encoded, processIncarnation, StatusAlreadyConsumed, false,
+		owner, record, encoded, processIncarnation, StatusAlreadyConsumed, false, candidate.StateOnly,
 	)
 	if status != StatusValid {
 		if status == StatusAlreadyConsumed || status == StatusTransportError {
@@ -402,6 +402,29 @@ func (h *MapHandler) handle(
 	return record
 }
 
+func (h *MapHandler) readCandidate(candidate resolvedCandidate) ([RecordSize]byte, Status) {
+	if candidate.StateOnly {
+		key := stateKey{Owner: candidate.Owner, Generation: candidate.Generation}
+		var state stateValue
+		if err := h.states.Lookup(&key, &state); err != nil {
+			if errors.Is(err, ebpf.ErrKeyNotExist) {
+				return [RecordSize]byte{}, StatusAlreadyConsumed
+			}
+			return [RecordSize]byte{}, StatusTransportError
+		}
+		return state.Response, StatusValid
+	}
+
+	var encoded [RecordSize]byte
+	if err := h.remoteParents.Lookup(&candidate.Owner, &encoded); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return [RecordSize]byte{}, StatusAlreadyConsumed
+		}
+		return [RecordSize]byte{}, StatusTransportError
+	}
+	return encoded, StatusValid
+}
+
 func (h *MapHandler) validatePublishedGeneration(
 	owner Identity,
 	record Record,
@@ -409,6 +432,7 @@ func (h *MapHandler) validatePublishedGeneration(
 	processIncarnation uint64,
 	ownerMissingStatus Status,
 	allowAmbiguous bool,
+	stateOnly bool,
 ) (stateValue, Record, Status) {
 	if current, status := h.processIncarnation(owner); status != StatusValid {
 		return stateValue{}, Record{}, status
@@ -416,24 +440,26 @@ func (h *MapHandler) validatePublishedGeneration(
 		return stateValue{}, Record{}, StatusAmbiguous
 	}
 
-	var indexed ownerValue
-	if err := h.owners.Lookup(&owner, &indexed); err != nil {
-		if errors.Is(err, ebpf.ErrKeyNotExist) {
+	if !stateOnly {
+		var indexed ownerValue
+		if err := h.owners.Lookup(&owner, &indexed); err != nil {
+			if errors.Is(err, ebpf.ErrKeyNotExist) {
+				return stateValue{}, Record{}, ownerMissingStatus
+			}
+			return stateValue{}, Record{}, StatusTransportError
+		}
+		if indexed.Generation != record.Generation || indexed.Reserved != ([7]byte{}) {
+			return stateValue{}, Record{}, StatusAlreadyConsumed
+		}
+		if indexed.ProcessIncarnation != processIncarnation {
+			return stateValue{}, Record{}, StatusAmbiguous
+		}
+		if indexed.Lifecycle == lifecyclePublishing {
 			return stateValue{}, Record{}, ownerMissingStatus
 		}
-		return stateValue{}, Record{}, StatusTransportError
-	}
-	if indexed.Generation != record.Generation || indexed.Reserved != ([7]byte{}) {
-		return stateValue{}, Record{}, StatusAlreadyConsumed
-	}
-	if indexed.ProcessIncarnation != processIncarnation {
-		return stateValue{}, Record{}, StatusAmbiguous
-	}
-	if indexed.Lifecycle == lifecyclePublishing {
-		return stateValue{}, Record{}, ownerMissingStatus
-	}
-	if indexed.Lifecycle != lifecycleActive {
-		return stateValue{}, Record{}, StatusAlreadyConsumed
+		if indexed.Lifecycle != lifecycleActive {
+			return stateValue{}, Record{}, StatusAlreadyConsumed
+		}
 	}
 
 	key := stateKey{Owner: owner, Generation: record.Generation}
@@ -446,7 +472,8 @@ func (h *MapHandler) validatePublishedGeneration(
 	}
 	if state.Lifecycle != lifecycleActive ||
 		state.ProcessIncarnation != processIncarnation ||
-		state.Reserved != ([7]byte{}) ||
+		state.Reserved != ([3]byte{}) ||
+		(stateOnly && state.Aliases == 0) ||
 		state.ObservedMonotonicNS == 0 {
 		return stateValue{}, Record{}, StatusAmbiguous
 	}
@@ -504,12 +531,14 @@ func (h *MapHandler) validatePublishedGeneration(
 		return stateValue{}, Record{}, StatusAmbiguous
 	}
 
-	var claimed [RecordSize]byte
-	if err := h.remoteParents.Lookup(&owner, &claimed); err != nil {
-		if errors.Is(err, ebpf.ErrKeyNotExist) {
-			return stateValue{}, Record{}, StatusAmbiguous
+	claimed := state.Response
+	if !stateOnly {
+		if err := h.remoteParents.Lookup(&owner, &claimed); err != nil {
+			if errors.Is(err, ebpf.ErrKeyNotExist) {
+				return stateValue{}, Record{}, StatusAmbiguous
+			}
+			return stateValue{}, Record{}, StatusTransportError
 		}
-		return stateValue{}, Record{}, StatusTransportError
 	}
 	claimedRecord, err := UnmarshalRecord(claimed[:])
 	if err != nil || claimed != encoded || claimed != state.Response ||
@@ -688,19 +717,23 @@ func (h *MapHandler) resolveOwner(
 	processIncarnation uint64,
 	includeTerminal bool,
 ) (resolvedCandidate, bool, bool) {
+	if expectedGeneration != 0 {
+		return h.resolveTaskGeneration(
+			owner, expectedGeneration, processIncarnation, includeTerminal,
+		)
+	}
+
 	var encoded [RecordSize]byte
 	if err := h.remoteParents.Lookup(&owner, &encoded); err == nil {
-		generation := expectedGeneration
+		generation := uint64(0)
 		if record, decodeErr := UnmarshalRecord(encoded[:]); decodeErr == nil {
 			generation = record.Generation
-			if expectedGeneration != 0 && generation != expectedGeneration {
-				return resolvedCandidate{}, false, false
-			}
 		}
 		return resolvedCandidate{
 			Owner:              owner,
 			Generation:         generation,
 			ProcessIncarnation: processIncarnation,
+			Encoded:            encoded,
 		}, true, false
 	} else if !errors.Is(err, ebpf.ErrKeyNotExist) {
 		return resolvedCandidate{}, false, true
@@ -715,6 +748,74 @@ func (h *MapHandler) resolveOwner(
 	}
 	if terminal.Generation == 0 || terminal.Reserved != ([7]byte{}) ||
 		(expectedGeneration != 0 && terminal.Generation != expectedGeneration) {
+		return resolvedCandidate{}, false, false
+	}
+	if terminal.ProcessIncarnation != processIncarnation {
+		return resolvedCandidate{
+			Owner:              owner,
+			Generation:         terminal.Generation,
+			ProcessIncarnation: processIncarnation,
+			Lifecycle:          lifecycleAmbiguous,
+		}, true, false
+	}
+	return resolvedCandidate{
+		Owner:              owner,
+		Generation:         terminal.Generation,
+		ProcessIncarnation: processIncarnation,
+		Lifecycle:          terminal.Lifecycle,
+	}, true, false
+}
+
+func (h *MapHandler) resolveTaskGeneration(
+	owner Identity,
+	expectedGeneration uint64,
+	processIncarnation uint64,
+	includeTerminal bool,
+) (resolvedCandidate, bool, bool) {
+	key := stateKey{Owner: owner, Generation: expectedGeneration}
+	var state stateValue
+	if err := h.states.Lookup(&key, &state); err == nil {
+		if state.Lifecycle != lifecycleActive || state.Reserved != ([3]byte{}) ||
+			state.Aliases == 0 || state.ProcessIncarnation != processIncarnation ||
+			state.ObservedMonotonicNS == 0 {
+			return resolvedCandidate{
+				Owner:              owner,
+				Generation:         expectedGeneration,
+				ProcessIncarnation: processIncarnation,
+				Lifecycle:          lifecycleAmbiguous,
+			}, true, false
+		}
+		record, decodeErr := UnmarshalRecord(state.Response[:])
+		if decodeErr != nil || record.Generation != expectedGeneration ||
+			record.ObservedMonotonicNS != state.ObservedMonotonicNS ||
+			!record.IsValidRemoteParent() {
+			return resolvedCandidate{
+				Owner:              owner,
+				Generation:         expectedGeneration,
+				ProcessIncarnation: processIncarnation,
+				Lifecycle:          lifecycleAmbiguous,
+			}, true, false
+		}
+		return resolvedCandidate{
+			Owner:              owner,
+			Generation:         expectedGeneration,
+			ProcessIncarnation: processIncarnation,
+			StateOnly:          true,
+			Encoded:            state.Response,
+		}, true, false
+	} else if !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return resolvedCandidate{}, false, true
+	}
+	if !includeTerminal {
+		return resolvedCandidate{}, false, false
+	}
+
+	var terminal terminalValue
+	if err := h.terminals.Lookup(&owner, &terminal); err != nil {
+		return resolvedCandidate{}, false, !errors.Is(err, ebpf.ErrKeyNotExist)
+	}
+	if terminal.Generation == 0 || terminal.Reserved != ([7]byte{}) ||
+		terminal.Generation != expectedGeneration {
 		return resolvedCandidate{}, false, false
 	}
 	if terminal.ProcessIncarnation != processIncarnation {
@@ -765,14 +866,29 @@ func (h *MapHandler) markAmbiguous(candidate resolvedCandidate) bool {
 			_ = h.ambiguity.Delete(&key)
 			return false
 		}
-		_ = h.ambiguity.Delete(&key)
+		if !h.preservedTaskGeneration(candidate) {
+			_ = h.ambiguity.Delete(&key)
+		}
 		return true
 	}
 	if indexed.Generation != candidate.Generation ||
 		indexed.ProcessIncarnation != candidate.ProcessIncarnation {
-		_ = h.ambiguity.Delete(&key)
+		if !h.preservedTaskGeneration(candidate) {
+			_ = h.ambiguity.Delete(&key)
+		}
 	}
 	return true
+}
+
+func (h *MapHandler) preservedTaskGeneration(candidate resolvedCandidate) bool {
+	key := stateKey{Owner: candidate.Owner, Generation: candidate.Generation}
+	var state stateValue
+	if err := h.states.Lookup(&key, &state); err != nil {
+		return false
+	}
+	return state.Lifecycle == lifecycleActive && state.Reserved == ([3]byte{}) &&
+		state.Aliases > 0 && state.ProcessIncarnation == candidate.ProcessIncarnation &&
+		state.ObservedMonotonicNS > 0
 }
 
 func (h *MapHandler) processIncarnation(identity Identity) (uint64, Status) {
@@ -899,10 +1015,7 @@ func (h *MapHandler) consume(
 		if candidate.ProcessIncarnation == 0 {
 			continue
 		}
-		var encoded [RecordSize]byte
-		if err := h.remoteParents.Lookup(&candidate.Owner, &encoded); err != nil {
-			continue
-		}
+		encoded := candidate.Encoded
 		record, err := UnmarshalRecord(encoded[:])
 		if err != nil {
 			quarantined, _ := h.quarantineMalformedFallback(
@@ -921,6 +1034,7 @@ func (h *MapHandler) consume(
 			candidate.ProcessIncarnation,
 			StatusMissing,
 			true,
+			candidate.StateOnly,
 		); status != StatusValid {
 			continue
 		}
@@ -944,6 +1058,7 @@ func (h *MapHandler) consume(
 			candidate.ProcessIncarnation,
 			StatusAlreadyConsumed,
 			true,
+			candidate.StateOnly,
 		); status != StatusValid {
 			_ = h.claims.Delete(&key)
 			continue
@@ -1116,15 +1231,17 @@ func (h *MapHandler) finish(
 	if ownerErr != nil && !errors.Is(ownerErr, ebpf.ErrKeyNotExist) {
 		return false
 	}
-	if ownerErr == nil &&
-		(generation != indexed.Generation ||
-			processIncarnation != indexed.ProcessIncarnation) {
-		return false
-	}
 
 	var state stateValue
 	stateErr := h.states.Lookup(&key, &state)
 	if stateErr != nil && !errors.Is(stateErr, ebpf.ErrKeyNotExist) {
+		return false
+	}
+	ownsGeneration := ownerErr == nil && generation == indexed.Generation &&
+		processIncarnation == indexed.ProcessIncarnation
+	if ownerErr == nil && !ownsGeneration &&
+		(stateErr != nil || state.ProcessIncarnation != processIncarnation ||
+			state.Lifecycle != lifecycleActive || state.Reserved != ([3]byte{})) {
 		return false
 	}
 	observedMonotonicNS := record.ObservedMonotonicNS
@@ -1164,7 +1281,7 @@ func (h *MapHandler) finish(
 	if !h.deleteGenerationIndex(key, processIncarnation) {
 		return false
 	}
-	if ownerErr == nil {
+	if ownsGeneration {
 		if !h.deleteOwnerGeneration(owner, generation, processIncarnation) {
 			return false
 		}

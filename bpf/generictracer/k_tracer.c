@@ -1467,9 +1467,9 @@ int BPF_KPROBE(obi_kprobe_sys_exit, int status) {
         if (java_remote_parent_enabled) {
             java_remote_parent_cleanup(&vt_task.p_key);
         }
-        bpf_map_delete_elem(&java_remote_parent_tasks, &vt_task.p_key);
+        java_remote_parent_unlink_task(&vt_task.p_key);
     }
-    bpf_map_delete_elem(&java_remote_parent_tasks, &task.p_key);
+    java_remote_parent_unlink_task(&task.p_key);
 
     if (!traced_pid) {
         return 0;

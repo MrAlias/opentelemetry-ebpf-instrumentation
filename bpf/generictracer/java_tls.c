@@ -136,7 +136,7 @@ static __always_inline int handle_java_ioctl(
         if (java_remote_parent_enabled && previous && *previous != incarnation) {
             java_remote_parent_cleanup(&task);
             java_remote_parent_cleanup(&process);
-            bpf_map_delete_elem(&java_remote_parent_tasks, &task);
+            java_remote_parent_unlink_task(&task);
             bpf_map_delete_elem(&java_tasks, &task);
         }
         java_register_process_incarnation(incarnation);
@@ -162,7 +162,7 @@ static __always_inline int handle_java_ioctl(
             mount_result == k_java_vt_mount_stale_incarnation) {
             if (java_remote_parent_enabled) {
                 java_remote_parent_cleanup(&synthetic_owner);
-                bpf_map_delete_elem(&java_remote_parent_tasks, &synthetic_owner);
+                java_remote_parent_unlink_task(&synthetic_owner);
                 bpf_map_delete_elem(&java_tasks, &synthetic_owner);
             }
             if (mount_result == k_java_vt_mount_collision ||
@@ -201,7 +201,7 @@ static __always_inline int handle_java_ioctl(
         }
         if (java_remote_parent_enabled) {
             java_remote_parent_cleanup(&owner);
-            bpf_map_delete_elem(&java_remote_parent_tasks, &owner);
+            java_remote_parent_unlink_task(&owner);
             bpf_map_delete_elem(&java_tasks, &owner);
         }
         return 0;

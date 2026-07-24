@@ -368,7 +368,7 @@ func (c *Cleanup) generationFallbackEvicted(
 		}
 		return false, fmt.Errorf("checking evicted generation state: %w", err)
 	}
-	if state.Lifecycle != lifecycleActive || state.Reserved != ([7]byte{}) ||
+	if state.Lifecycle != lifecycleActive || state.Reserved != ([3]byte{}) ||
 		state.ProcessIncarnation != index.ProcessIncarnation ||
 		state.ObservedMonotonicNS != index.ObservedMonotonicNS {
 		return false, nil
@@ -404,6 +404,9 @@ func (c *Cleanup) generationFallbackEvicted(
 		return false, fmt.Errorf("checking evicted cookie connection: %w", err)
 	}
 	if cookieConnection != connection {
+		return false, nil
+	}
+	if state.Aliases > 0 {
 		return false, nil
 	}
 
@@ -471,14 +474,26 @@ func (c *Cleanup) cleanupGenerationChecked(
 		_, _ = cleanupDeleteExact(c.maps.claims, key, claim)
 	}()
 
-	owner, locked, lockErr := c.lockGenerationOwner(key, index.ProcessIncarnation)
-	if lockErr != nil {
-		return false, lockErr
+	preservedState, preserved, preservedErr := c.preservedGenerationWithoutCursor(key, index)
+	if preservedErr != nil {
+		return false, preservedErr
 	}
-	if !locked {
+	if requireEvicted && preserved && preservedState.Aliases > 0 {
 		return false, nil
 	}
-	if requireEvicted {
+	var owner ownerValue
+	if !preserved {
+		var locked bool
+		var lockErr error
+		owner, locked, lockErr = c.lockGenerationOwner(key, index.ProcessIncarnation)
+		if lockErr != nil {
+			return false, lockErr
+		}
+		if !locked {
+			return false, nil
+		}
+	}
+	if requireEvicted && !preserved {
 		evicted, evictionErr := c.generationFallbackEvicted(key, index)
 		if evictionErr != nil {
 			return false, evictionErr
@@ -537,10 +552,55 @@ func (c *Cleanup) cleanupGenerationChecked(
 	if !deleted {
 		return false, nil
 	}
-	if _, deleteErr := cleanupDeleteExact(c.maps.owners, key.Owner, owner); deleteErr != nil {
-		return true, fmt.Errorf("deleting generation owner: %w", deleteErr)
+	if !preserved {
+		if _, deleteErr := cleanupDeleteExact(c.maps.owners, key.Owner, owner); deleteErr != nil {
+			return true, fmt.Errorf("deleting generation owner: %w", deleteErr)
+		}
 	}
 	return deleted, nil
+}
+
+func (c *Cleanup) preservedGenerationWithoutCursor(
+	key stateKey,
+	index generationIndexValue,
+) (stateValue, bool, error) {
+	var state stateValue
+	if err := c.maps.states.Lookup(&key, &state); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return stateValue{}, false, nil
+		}
+		return stateValue{}, false, fmt.Errorf("checking preserved generation state: %w", err)
+	}
+	if state.Lifecycle != lifecycleActive || state.Reserved != ([3]byte{}) ||
+		state.ProcessIncarnation != index.ProcessIncarnation ||
+		state.ObservedMonotonicNS != index.ObservedMonotonicNS {
+		return stateValue{}, false, nil
+	}
+
+	var owner ownerValue
+	if err := c.maps.owners.Lookup(&key.Owner, &owner); err == nil {
+		if owner.Generation == key.Generation &&
+			owner.ProcessIncarnation == index.ProcessIncarnation {
+			return stateValue{}, false, nil
+		}
+	} else if !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return stateValue{}, false, fmt.Errorf("checking preserved generation owner: %w", err)
+	}
+
+	var encoded [RecordSize]byte
+	if err := c.maps.remoteParents.Lookup(&key.Owner, &encoded); err == nil {
+		record, decodeErr := UnmarshalRecord(encoded[:])
+		if decodeErr != nil {
+			return stateValue{}, false, nil
+		}
+		if record.Generation == key.Generation {
+			return stateValue{}, false, nil
+		}
+	} else if !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return stateValue{}, false, fmt.Errorf("checking preserved generation fallback: %w", err)
+	}
+
+	return state, true, nil
 }
 
 func (c *Cleanup) claimGenerationCleanup(
@@ -1204,12 +1264,25 @@ func (c *Cleanup) cleanupOrphanState(key stateKey, state stateValue) (bool, erro
 	defer func() {
 		_, _ = cleanupDeleteExact(c.maps.claims, key, claim)
 	}()
-	owner, locked, lockErr := c.lockGenerationOwner(key, state.ProcessIncarnation)
-	if lockErr != nil {
-		return false, lockErr
+	_, preserved, preservedErr := c.preservedGenerationWithoutCursor(key, generationIndexValue{
+		Process:             javaProcessIdentity(key.Owner),
+		ProcessIncarnation:  state.ProcessIncarnation,
+		ObservedMonotonicNS: state.ObservedMonotonicNS,
+	})
+	if preservedErr != nil {
+		return false, preservedErr
 	}
-	if !locked {
-		return false, nil
+	var owner ownerValue
+	if !preserved {
+		var locked bool
+		var lockErr error
+		owner, locked, lockErr = c.lockGenerationOwner(key, state.ProcessIncarnation)
+		if lockErr != nil {
+			return false, lockErr
+		}
+		if !locked {
+			return false, nil
+		}
 	}
 
 	var result error
@@ -1245,8 +1318,10 @@ func (c *Cleanup) cleanupOrphanState(key stateKey, state stateValue) (bool, erro
 	if result != nil {
 		return stateDeleted, result
 	}
-	if _, err := cleanupDeleteExact(c.maps.owners, key.Owner, owner); err != nil {
-		result = errors.Join(result, fmt.Errorf("deleting orphan generation owner: %w", err))
+	if !preserved {
+		if _, err := cleanupDeleteExact(c.maps.owners, key.Owner, owner); err != nil {
+			result = errors.Join(result, fmt.Errorf("deleting orphan generation owner: %w", err))
+		}
 	}
 	return stateDeleted, result
 }

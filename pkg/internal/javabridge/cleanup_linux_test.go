@@ -121,6 +121,101 @@ func TestCleanupStatsDoNotClassifyExpiredGenerationAsEvicted(t *testing.T) {
 	assert.Equal(t, CleanupStats{Cleaned: 1}, stats)
 }
 
+func TestCleanupAliasedGenerationDoesNotLookEvicted(t *testing.T) {
+	for _, detachOwner := range []bool{false, true} {
+		name := "active owner"
+		if detachOwner {
+			name = "detached owner"
+		}
+		t.Run(name, func(t *testing.T) {
+			owner := Identity{TID: 3, PID: 2, Namespace: 1}
+			child := Identity{TID: 4, PID: 2, Namespace: 1}
+			handler := testMapHandler(
+				map[Identity]any{owner: validEncodedRecord(t, 10)},
+				map[Identity]any{child: activeTaskLink(owner, 10)},
+				nil,
+			)
+			if detachOwner {
+				delete(handler.owners.(*fakeBridgeMap).values, owner)
+			}
+			delete(handler.remoteParents.(*fakeBridgeMap).values, owner)
+			cleanup := testCleanup(handler)
+
+			stats, err := cleanup.SweepWithStats()
+			require.NoError(t, err)
+			assert.Equal(t, CleanupStats{}, stats)
+			assert.Contains(t, cleanup.maps.generations.(*fakeBridgeMap).values, stateKey{
+				Owner: owner, Generation: 10,
+			})
+		})
+	}
+}
+
+func TestCleanupExpiredPreservedGenerationLeavesReusedOwner(t *testing.T) {
+	for _, orphan := range []bool{false, true} {
+		indexName := "indexed"
+		if orphan {
+			indexName = "orphaned index"
+		}
+		for _, released := range []bool{false, true} {
+			aliasName := "live alias"
+			if released {
+				aliasName = "released alias"
+			}
+			t.Run(indexName+"/"+aliasName, func(t *testing.T) {
+				owner := Identity{TID: 3, PID: 2, Namespace: 1}
+				child := Identity{TID: 4, PID: 2, Namespace: 1}
+				oldKey := stateKey{Owner: owner, Generation: 10}
+				handler := testMapHandler(
+					map[Identity]any{owner: validEncodedRecord(t, 10)},
+					map[Identity]any{child: activeTaskLink(owner, 10)},
+					nil,
+				)
+				delete(handler.owners.(*fakeBridgeMap).values, owner)
+				delete(handler.remoteParents.(*fakeBridgeMap).values, owner)
+				if released {
+					delete(handler.tasks.(*fakeBridgeMap).values, child)
+					state := handler.states.(*fakeBridgeMap).values[oldKey].(stateValue)
+					state.Aliases = 0
+					handler.states.(*fakeBridgeMap).values[oldKey] = state
+				}
+				if orphan {
+					delete(handler.generations.(*fakeBridgeMap).values, oldKey)
+				}
+
+				next := validEncodedRecord(t, 11)
+				record, err := UnmarshalRecord(next[:])
+				require.NoError(t, err)
+				record.ObservedMonotonicNS = uint64(40 * time.Second)
+				encoded, err := record.MarshalBinary()
+				require.NoError(t, err)
+				handler.remoteParents.(*fakeBridgeMap).values[owner] = [RecordSize]byte(encoded)
+				seedOwnerState(handler, owner, 11)
+
+				cleanup := testCleanup(handler)
+				cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+				stats, err := cleanup.SweepWithStats()
+				require.NoError(t, err)
+				assert.Equal(t, CleanupStats{Cleaned: 1}, stats)
+				assert.NotContains(t, cleanup.maps.states.(*fakeBridgeMap).values, oldKey)
+				assert.Contains(t, cleanup.maps.states.(*fakeBridgeMap).values, stateKey{
+					Owner: owner, Generation: 11,
+				})
+				assert.Equal(
+					t,
+					uint64(11),
+					cleanup.maps.owners.(*fakeBridgeMap).values[owner].(ownerValue).Generation,
+				)
+				var fallback [RecordSize]byte
+				require.NoError(t, cleanup.maps.remoteParents.Lookup(&owner, &fallback))
+				preserved, err := UnmarshalRecord(fallback[:])
+				require.NoError(t, err)
+				assert.Equal(t, uint64(11), preserved.Generation)
+			})
+		}
+	}
+}
+
 func TestCleanupStatsDoNotClassifyPublishingGenerationAsEvicted(t *testing.T) {
 	owner := Identity{TID: 3, PID: 2, Namespace: 1}
 	handler := testMapHandler(

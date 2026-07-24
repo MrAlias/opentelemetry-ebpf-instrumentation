@@ -157,6 +157,7 @@ func TestMapHandlerKernelMapLayouts(t *testing.T) {
 
 	var state stateValue
 	assert.Equal(t, uintptr(128), unsafe.Sizeof(state))
+	assert.Equal(t, uintptr(4), unsafe.Offsetof(state.Aliases))
 	assert.Equal(t, uintptr(16), unsafe.Offsetof(state.Connection))
 	assert.Equal(t, uintptr(52), unsafe.Offsetof(state.ConnectionNetNS))
 	assert.Equal(t, uintptr(56), unsafe.Offsetof(state.ProcessIncarnation))
@@ -359,6 +360,81 @@ func TestMapHandlerResolvesOneExecutorParent(t *testing.T) {
 	assert.Equal(t, StatusValid, handler.Handle(child, OperationTake).Status)
 }
 
+func TestMapHandlerLinkedParentSurvivesOwnerReuse(t *testing.T) {
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)},
+		map[Identity]any{child: activeTaskLink(owner, 10)},
+		nil,
+	)
+
+	delete(handler.owners.(*fakeBridgeMap).values, owner)
+	delete(handler.remoteParents.(*fakeBridgeMap).values, owner)
+	handler.remoteParents.(*fakeBridgeMap).values[owner] = validEncodedRecord(t, 11)
+	seedOwnerState(handler, owner, 11)
+
+	linked := handler.Handle(child, OperationTake)
+	assert.Equal(t, StatusValid, linked.Status)
+	assert.Equal(t, uint64(10), linked.Generation)
+	assert.NotContains(t, handler.states.(*fakeBridgeMap).values, stateKey{
+		Owner: owner, Generation: 10,
+	})
+	assert.Contains(t, handler.states.(*fakeBridgeMap).values, stateKey{
+		Owner: owner, Generation: 11,
+	})
+	assert.Equal(t, uint64(11), handler.owners.(*fakeBridgeMap).values[owner].(ownerValue).Generation)
+
+	direct := handler.Handle(owner, OperationTake)
+	assert.Equal(t, StatusValid, direct.Status)
+	assert.Equal(t, uint64(11), direct.Generation)
+}
+
+func TestMapHandlerLinkedParentRequiresCompletePreservedState(t *testing.T) {
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+
+	tests := []struct {
+		name      string
+		configure func(*MapHandler, stateKey)
+	}{
+		{
+			name: "aliases",
+			configure: func(handler *MapHandler, key stateKey) {
+				state := handler.states.(*fakeBridgeMap).values[key].(stateValue)
+				state.Aliases = 0
+				handler.states.(*fakeBridgeMap).values[key] = state
+			},
+		},
+		{
+			name: "generation index",
+			configure: func(handler *MapHandler, key stateKey) {
+				delete(handler.generations.(*fakeBridgeMap).values, key)
+			},
+		},
+		{
+			name: "connection",
+			configure: func(handler *MapHandler, _ stateKey) {
+				clear(handler.connections.(*fakeBridgeMap).values)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler := testMapHandler(
+				map[Identity]any{owner: validEncodedRecord(t, 10)},
+				map[Identity]any{child: activeTaskLink(owner, 10)},
+				nil,
+			)
+			key := stateKey{Owner: owner, Generation: 10}
+			test.configure(handler, key)
+
+			assert.NotEqual(t, StatusValid, handler.Handle(child, OperationTake).Status)
+		})
+	}
+}
+
 func TestMapHandlerRejectsConflictingResolution(t *testing.T) {
 	child := Identity{TID: 4, PID: 2, Namespace: 1}
 	parent := Identity{TID: 3, PID: 2, Namespace: 1}
@@ -478,6 +554,10 @@ func TestMapHandlerRejectsStaleOrReusedExecutorLink(t *testing.T) {
 			tasks.mu.Lock()
 			tasks.values[child] = replacement
 			tasks.mu.Unlock()
+			key := stateKey{Owner: owner, Generation: replacement.Generation}
+			state := handler.states.(*fakeBridgeMap).values[key].(stateValue)
+			state.Aliases = 1
+			handler.states.(*fakeBridgeMap).values[key] = state
 		}
 
 		assert.Equal(t, StatusMissing, handler.Handle(child, OperationTake).Status)
@@ -1512,6 +1592,19 @@ func testMapHandler(remoteParents, tasks, ambiguity map[Identity]any) *MapHandle
 		if err == nil && record.Generation != 0 {
 			seedOwnerState(handler, identity, record.Generation)
 		}
+	}
+	for _, value := range tasks {
+		link, ok := value.(taskLink)
+		if !ok || link.Generation == 0 {
+			continue
+		}
+		key := stateKey{Owner: link.Owner, Generation: link.Generation}
+		state, ok := handler.states.(*fakeBridgeMap).values[key].(stateValue)
+		if !ok {
+			continue
+		}
+		state.Aliases++
+		handler.states.(*fakeBridgeMap).values[key] = state
 	}
 	return handler
 }

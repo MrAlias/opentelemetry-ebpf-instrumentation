@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 
 readonly OUTPUT_DIR="${TEST_OUTPUT:-testoutput}/java-remote-parent-rhel9.6-kernel-sockopt"
-readonly PRIVILEGED_TEST_PATTERN='^(TestJavaRemoteParentPrimarySocketAuthority|TestJavaRemoteParentPrimaryRequiresAuthoritativeDataHook)$'
+readonly PRIVILEGED_TEST_PATTERN='^(TestJavaRemoteParentPrimarySocketAuthority|TestJavaRemoteParentPrimaryRequiresAuthoritativeDataHook|TestJavaRemoteParentNestedCgroupLifecycle)$'
 readonly BENCHMARK_TEST_PATTERN='^TestJavaRemoteParentTransportBenchmark$'
 
 fail() {
@@ -71,7 +71,7 @@ collect_kernel_evidence() {
 run_sockopt_authority_tests() {
     local -r output_file="$OUTPUT_DIR/privileged-tests.log"
 
-    go test \
+    OBI_REQUIRE_CGROUP_TOPOLOGY=1 go test \
         -count=1 \
         -timeout=10m \
         -v \
@@ -83,6 +83,8 @@ run_sockopt_authority_tests() {
         TestJavaRemoteParentPrimarySocketAuthority
     require_test_passed "$output_file" \
         TestJavaRemoteParentPrimaryRequiresAuthoritativeDataHook
+    require_test_passed "$output_file" \
+        TestJavaRemoteParentNestedCgroupLifecycle
 }
 
 run_transport_benchmark() {

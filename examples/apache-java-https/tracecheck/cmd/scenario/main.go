@@ -213,7 +213,7 @@ func parseFlags() config {
 	var cfg config
 	flag.StringVar(&cfg.baseURL, "base-url", "http://127.0.0.1:18080", "Apache base URL")
 	flag.StringVar(&cfg.receiverURL, "receiver-url", "http://127.0.0.1:14318", "trace receiver base URL")
-	flag.StringVar(&cfg.scenario, "scenario", "basic", "basic, keepalive, pipelining, concurrency, connection-churn, fd-port-reuse, slow-body, tls-boundary, timeout-retry, pressure, handoff, virtual-thread, netty, dispatch, w3c, w3c-match, obi-flags, w3c-fault, w3c-only, restart-fault, fail-open, restart, disabled, or uninstrumented")
+	flag.StringVar(&cfg.scenario, "scenario", "basic", "basic, keepalive, pipelining, concurrency, connection-churn, fd-port-reuse, slow-body, tls-boundary, timeout-retry, pressure, handoff, virtual-thread, netty, dispatch, w3c, w3c-match, obi-flags, w3c-fault, w3c-only, helper-attach-failure, restart-fault, fail-open, restart, disabled, or uninstrumented")
 	flag.IntVar(&cfg.requestCount, "requests", 0, "number of requests (zero selects a scenario default)")
 	flag.DurationVar(&cfg.timeout, "timeout", 45*time.Second, "whole-scenario timeout")
 	flag.StringVar(&cfg.expectedTLS, "expected-tls", "TLSv1.3", "backend TLS protocol")
@@ -234,7 +234,7 @@ func parseFlags() config {
 		"pressure": true,
 		"handoff":  true, "virtual-thread": true, "netty": true, "dispatch": true,
 		"w3c": true, "w3c-match": true, "obi-flags": true, "w3c-fault": true,
-		"w3c-only": true, "restart-fault": true,
+		"w3c-only": true, "helper-attach-failure": true, "restart-fault": true,
 		"disabled": true, "uninstrumented": true,
 		"fail-open": true, "restart": true,
 	}
@@ -372,6 +372,9 @@ func makeRequests(cfg config) ([]requestCase, error) {
 	}
 	if cfg.scenario == "tls-boundary" && count != 2 {
 		return nil, fmt.Errorf("scenario %s requires exactly two requests", cfg.scenario)
+	}
+	if cfg.scenario == "helper-attach-failure" && count != 1 {
+		return nil, fmt.Errorf("scenario %s requires exactly one request", cfg.scenario)
 	}
 	if cfg.scenario == "restart-fault" && count <= restartAfterStartRequestIndex {
 		return nil, fmt.Errorf(
@@ -1242,6 +1245,8 @@ func expectationFor(cfg config, request requestCase) tracecheck.Expectation {
 		mode = tracecheck.ModeUninstrumented
 	case "fail-open":
 		mode = tracecheck.ModeFailOpen
+	case "helper-attach-failure":
+		mode = tracecheck.ModeHelperAttachFailure
 	case "w3c":
 		if !request.InvalidW3C {
 			mode = tracecheck.ModeW3C

@@ -12,16 +12,17 @@ import (
 type AssertionMode string
 
 const (
-	ModeBridge          AssertionMode = "bridge"
-	ModePipelinedBridge AssertionMode = "pipelined-bridge"
-	ModePressure        AssertionMode = "pressure"
-	ModeDisabled        AssertionMode = "disabled"
-	ModeUninstrumented  AssertionMode = "uninstrumented"
-	ModeW3C             AssertionMode = "w3c"
-	ModeW3CMatch        AssertionMode = "w3c-match"
-	ModeW3CNoOBI        AssertionMode = "w3c-no-obi"
-	ModeW3CResilience   AssertionMode = "w3c-resilience"
-	ModeFailOpen        AssertionMode = "fail-open"
+	ModeBridge              AssertionMode = "bridge"
+	ModePipelinedBridge     AssertionMode = "pipelined-bridge"
+	ModePressure            AssertionMode = "pressure"
+	ModeDisabled            AssertionMode = "disabled"
+	ModeUninstrumented      AssertionMode = "uninstrumented"
+	ModeW3C                 AssertionMode = "w3c"
+	ModeW3CMatch            AssertionMode = "w3c-match"
+	ModeW3CNoOBI            AssertionMode = "w3c-no-obi"
+	ModeW3CResilience       AssertionMode = "w3c-resilience"
+	ModeHelperAttachFailure AssertionMode = "helper-attach-failure"
+	ModeFailOpen            AssertionMode = "fail-open"
 )
 
 type PressureParentOutcome string
@@ -143,7 +144,6 @@ func AssertSnapshot(snapshot Snapshot, expectation Expectation) error {
 		apacheClients := selectRequestSpans(
 			snapshot.Spans,
 			expectation.ApacheService,
-			"CLIENT",
 			expectation.Endpoint,
 			expectation.Marker,
 		)
@@ -215,6 +215,60 @@ func AssertSnapshot(snapshot Snapshot, expectation Expectation) error {
 		if !isZeroID(javaSpan.ParentSpanID) {
 			return fmt.Errorf("expected Java root span, got parent %s", javaSpan.ParentSpanID)
 		}
+	case ModeHelperAttachFailure:
+		if err := assertNonzeroSpanIdentity(javaSpan, "Java server span"); err != nil {
+			return err
+		}
+		if err := assertNonzeroSpanIdentity(apacheServer, "Apache inbound server span"); err != nil {
+			return err
+		}
+		apacheClients := selectMarkerClientSpans(
+			snapshot.Spans,
+			expectation.ApacheService,
+			expectation.Marker,
+		)
+		if len(apacheClients) != 1 {
+			return fmt.Errorf(
+				"expected exactly one Apache client candidate for marker %s, got %d",
+				expectation.Marker,
+				len(apacheClients),
+			)
+		}
+		candidate := apacheClients[0]
+		if !MatchesEndpoint(candidate, expectation.Endpoint) {
+			return fmt.Errorf(
+				"apache client candidate for marker %s did not match endpoint %s",
+				expectation.Marker,
+				expectation.Endpoint,
+			)
+		}
+		if err := assertNonzeroSpanIdentity(candidate, "Apache client candidate"); err != nil {
+			return err
+		}
+		if !spanDescendsFrom(snapshot.Spans, candidate, apacheServer) {
+			return fmt.Errorf(
+				"expected Apache client %s/%s to descend from inbound span %s/%s",
+				candidate.TraceID,
+				candidate.SpanID,
+				apacheServer.TraceID,
+				apacheServer.SpanID,
+			)
+		}
+		if !isZeroID(javaSpan.ParentSpanID) {
+			return fmt.Errorf("expected Java root span, got parent %s", javaSpan.ParentSpanID)
+		}
+		if remote, _ := ParentRemote(javaSpan); remote {
+			return fmt.Errorf(
+				"expected Java root span to be local, flags=%d",
+				javaSpan.Flags,
+			)
+		}
+		if strings.EqualFold(javaSpan.TraceID, candidate.TraceID) {
+			return fmt.Errorf(
+				"expected Java root trace %s to be distinct from Apache candidate trace",
+				javaSpan.TraceID,
+			)
+		}
 	case ModeW3C, ModeW3CMatch, ModeW3CNoOBI, ModeW3CResilience:
 		if remote, known := ParentRemote(javaSpan); !known || !remote {
 			return fmt.Errorf(
@@ -238,7 +292,6 @@ func AssertSnapshot(snapshot Snapshot, expectation Expectation) error {
 			apacheClients := selectRequestSpans(
 				snapshot.Spans,
 				expectation.ApacheService,
-				"CLIENT",
 				expectation.Endpoint,
 				expectation.Marker,
 			)
@@ -295,7 +348,6 @@ func ClassifyPressureParent(
 	apacheClients := selectRequestSpans(
 		snapshot.Spans,
 		expectation.ApacheService,
-		"CLIENT",
 		expectation.Endpoint,
 		expectation.Marker,
 	)
@@ -418,17 +470,39 @@ func selectMarkerServerSpans(spans []Span, serviceName, marker string) []Span {
 	return selected
 }
 
-func selectRequestSpans(spans []Span, serviceName, kind, endpoint, marker string) []Span {
+func selectMarkerClientSpans(spans []Span, serviceName, marker string) []Span {
 	var selected []Span
 	for _, span := range spans {
 		if span.ServiceName == serviceName &&
-			strings.EqualFold(span.Kind, kind) &&
+			strings.EqualFold(span.Kind, "CLIENT") &&
+			MatchesMarker(span, marker) {
+			selected = append(selected, span)
+		}
+	}
+	return selected
+}
+
+func selectRequestSpans(spans []Span, serviceName, endpoint, marker string) []Span {
+	var selected []Span
+	for _, span := range spans {
+		if span.ServiceName == serviceName &&
+			strings.EqualFold(span.Kind, "CLIENT") &&
 			MatchesEndpoint(span, endpoint) &&
 			MatchesMarker(span, marker) {
 			selected = append(selected, span)
 		}
 	}
 	return selected
+}
+
+func assertNonzeroSpanIdentity(span Span, description string) error {
+	if isZeroID(span.TraceID) {
+		return fmt.Errorf("%s has a zero trace ID", description)
+	}
+	if isZeroID(span.SpanID) {
+		return fmt.Errorf("%s has a zero span ID", description)
+	}
+	return nil
 }
 
 func spanDescendsFrom(spans []Span, descendant, ancestor Span) bool {

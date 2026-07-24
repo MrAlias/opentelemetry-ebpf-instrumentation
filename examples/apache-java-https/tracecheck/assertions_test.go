@@ -187,6 +187,132 @@ func TestAssertSnapshotRequiresW3CCandidateGraphAndFlags(t *testing.T) {
 	assert.ErrorContains(t, AssertSnapshot(snapshot, expectation), "candidate span: expected trace flags 01")
 }
 
+func TestAssertSnapshotHelperAttachFailureRequiresLocalJavaRoot(t *testing.T) {
+	expectation := Expectation{
+		Mode:          ModeHelperAttachFailure,
+		ApacheService: "apache",
+		JavaService:   "java",
+		Endpoint:      testEndpoint,
+		Marker:        testMarker,
+	}
+	snapshot := bridgeSnapshot(testRemoteSpanFlags)
+	snapshot.Spans[0].ParentSpanID = ""
+	snapshot.Spans[2].TraceID = "ffeeddccbbaa99887766554433221100"
+	snapshot.Spans[2].ParentSpanID = ""
+	snapshot.Spans[2].Flags = 0x101
+
+	require.NoError(t, AssertSnapshot(snapshot, expectation))
+
+	withBridgeParent := snapshot
+	withBridgeParent.Spans = append([]Span(nil), snapshot.Spans...)
+	withBridgeParent.Spans[2].ParentSpanID = testApacheClientID
+	require.ErrorContains(t, AssertSnapshot(withBridgeParent, expectation), "expected Java root span")
+
+	remoteRoot := snapshot
+	remoteRoot.Spans = append([]Span(nil), snapshot.Spans...)
+	remoteRoot.Spans[2].Flags = testRemoteSpanFlags
+	require.ErrorContains(t, AssertSnapshot(remoteRoot, expectation), "to be local")
+
+	sharedTrace := snapshot
+	sharedTrace.Spans = append([]Span(nil), snapshot.Spans...)
+	sharedTrace.Spans[2].TraceID = testTraceID
+	require.ErrorContains(t, AssertSnapshot(sharedTrace, expectation), "distinct from Apache candidate trace")
+
+	orphanedCandidate := snapshot
+	orphanedCandidate.Spans = append([]Span(nil), snapshot.Spans...)
+	orphanedCandidate.Spans[1].ParentSpanID = testExternalSpanID
+	require.ErrorContains(t, AssertSnapshot(orphanedCandidate, expectation), "descend from inbound span")
+
+	duplicateCandidate := snapshot
+	duplicateCandidate.Spans = append([]Span(nil), snapshot.Spans...)
+	extra := duplicateCandidate.Spans[1]
+	extra.SpanID = "445566778899aabb"
+	duplicateCandidate.Spans = append(duplicateCandidate.Spans, extra)
+	require.ErrorContains(t, AssertSnapshot(duplicateCandidate, expectation), "exactly one Apache client candidate")
+
+	wrongEndpointCandidate := snapshot
+	wrongEndpointCandidate.Spans = append([]Span(nil), snapshot.Spans...)
+	extra = wrongEndpointCandidate.Spans[1]
+	extra.SpanID = "445566778899aabb"
+	extra.Attributes = map[string]string{
+		"http.request.header.x-obi-demo-id": testMarker,
+		"url.full":                          "https://java/api/other",
+	}
+	wrongEndpointCandidate.Spans = append(wrongEndpointCandidate.Spans, extra)
+	require.ErrorContains(t, AssertSnapshot(wrongEndpointCandidate, expectation), "exactly one Apache client candidate")
+
+	duplicateApacheServer := snapshot
+	duplicateApacheServer.Spans = append([]Span(nil), snapshot.Spans...)
+	extra = duplicateApacheServer.Spans[0]
+	extra.SpanID = "5566778899aabbcc"
+	duplicateApacheServer.Spans = append(duplicateApacheServer.Spans, extra)
+	require.ErrorContains(t, AssertSnapshot(duplicateApacheServer, expectation), "exactly one Apache inbound server span")
+
+	duplicateJavaServer := snapshot
+	duplicateJavaServer.Spans = append([]Span(nil), snapshot.Spans...)
+	extra = duplicateJavaServer.Spans[2]
+	extra.SpanID = "66778899aabbccdd"
+	duplicateJavaServer.Spans = append(duplicateJavaServer.Spans, extra)
+	require.ErrorContains(t, AssertSnapshot(duplicateJavaServer, expectation), "exactly one Java server span")
+
+	for _, testCase := range []struct {
+		name   string
+		index  int
+		trace  string
+		spanID string
+		want   string
+	}{
+		{
+			name:  "zero Apache server trace ID",
+			index: 0,
+			trace: "00000000000000000000000000000000",
+			want:  "Apache inbound server span has a zero trace ID",
+		},
+		{
+			name:   "zero Apache server span ID",
+			index:  0,
+			spanID: "0000000000000000",
+			want:   "Apache inbound server span has a zero span ID",
+		},
+		{
+			name:  "zero Apache client trace ID",
+			index: 1,
+			trace: "00000000000000000000000000000000",
+			want:  "Apache client candidate has a zero trace ID",
+		},
+		{
+			name:   "zero Apache client span ID",
+			index:  1,
+			spanID: "0000000000000000",
+			want:   "Apache client candidate has a zero span ID",
+		},
+		{
+			name:  "zero Java server trace ID",
+			index: 2,
+			trace: "00000000000000000000000000000000",
+			want:  "Java server span has a zero trace ID",
+		},
+		{
+			name:   "zero Java server span ID",
+			index:  2,
+			spanID: "0000000000000000",
+			want:   "Java server span has a zero span ID",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			malformed := snapshot
+			malformed.Spans = append([]Span(nil), snapshot.Spans...)
+			if testCase.trace != "" {
+				malformed.Spans[testCase.index].TraceID = testCase.trace
+			}
+			if testCase.spanID != "" {
+				malformed.Spans[testCase.index].SpanID = testCase.spanID
+			}
+			require.ErrorContains(t, AssertSnapshot(malformed, expectation), testCase.want)
+		})
+	}
+}
+
 func TestAssertSnapshotCanProveUnsampledCandidateWithSampledJavaChild(t *testing.T) {
 	snapshot := bridgeSnapshot(0x300)
 	snapshot.Spans[0].Flags = 0x300

@@ -52,6 +52,23 @@ func TestW3COnlyRequestRecordsNoOBIControl(t *testing.T) {
 	assert.False(t, requests[0].InvalidW3C)
 }
 
+func TestHelperAttachFailureUsesOneRequestWithoutW3C(t *testing.T) {
+	cfg := config{scenario: "helper-attach-failure", seed: 42}
+	requests, err := makeRequests(cfg)
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+
+	assert.Empty(t, requests[0].W3CTraceID)
+	assert.Empty(t, requests[0].W3CParentSpanID)
+	assert.Empty(t, requests[0].W3CTraceFlags)
+	assert.Empty(t, requests[0].W3CCase)
+	assert.False(t, requests[0].InvalidW3C)
+	assert.Equal(t, tracecheck.ModeHelperAttachFailure, expectationFor(cfg, requests[0]).Mode)
+
+	_, err = makeRequests(config{scenario: "helper-attach-failure", requestCount: 2, seed: 42})
+	require.ErrorContains(t, err, "requires exactly one request")
+}
+
 func TestW3CMatchSendsCanonicalStandardParent(t *testing.T) {
 	requests, err := makeRequests(config{scenario: "w3c-match", seed: 42})
 	require.NoError(t, err)

@@ -43,6 +43,7 @@ const (
 	InstrumentationErrorAttachingSockFilter            = "attaching_sock_filter"
 	InstrumentationErrorAttachingSockMsg               = "attaching_sock_msg"
 	InstrumentationErrorAttachingCgroup                = "attaching_cgroup"
+	InstrumentationErrorAttachingJavaAgent             = "attaching_java_agent"
 	InstrumentationErrorAttachingKprobe                = "attaching_kprobe"
 	InstrumentationErrorAttachingUprobe                = "attaching_uprobe"
 	InstrumentationErrorSymbolNotFound                 = "symbol_not_found"

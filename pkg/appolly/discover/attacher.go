@@ -133,9 +133,7 @@ func (ta *traceAttacher) attacherLoop(_ context.Context) (swarm.RunFunc, error) 
 					ta.processInstances.Inc(instr.Obj.FileInfo.Ino())
 					if ok := ta.getTracer(&instr.Obj); ok {
 						if javaPrepared {
-							if err := ta.javaInjector.NewExecutable(&instr.Obj); err != nil {
-								ta.log.Warn("unable to attach java agent to process, Java TLS telemetry will not work", "pid", instr.Obj.FileInfo.Pid(), "error", err)
-							}
+							ta.handleJavaAttachResult(&instr.Obj, ta.javaInjector.NewExecutable(&instr.Obj))
 						}
 						ta.OutputTracerEvents.Send(Event[*ebpf.Instrumentable]{Type: EventCreated, Obj: &instr.Obj})
 					}
@@ -149,6 +147,22 @@ func (ta *traceAttacher) attacherLoop(_ context.Context) (swarm.RunFunc, error) 
 			}
 		})
 	}, nil
+}
+
+func (ta *traceAttacher) handleJavaAttachResult(ie *ebpf.Instrumentable, err error) {
+	if err == nil {
+		return
+	}
+
+	ta.Metrics.InstrumentationError(
+		ie.FileInfo.ExecutableName(),
+		imetrics.InstrumentationErrorAttachingJavaAgent,
+	)
+	ta.log.Warn(
+		"unable to attach java agent to process, Java TLS telemetry will not work",
+		"pid", ie.FileInfo.Pid(),
+		"error", err,
+	)
 }
 
 //nolint:cyclop

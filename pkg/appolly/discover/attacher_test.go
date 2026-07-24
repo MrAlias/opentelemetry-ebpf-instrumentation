@@ -5,7 +5,9 @@ package discover
 
 import (
 	"context"
+	"errors"
 	"io"
+	"log/slog"
 	"testing"
 
 	cebpf "github.com/cilium/ebpf"
@@ -34,6 +36,23 @@ type blockedPID struct {
 type recordingTracer struct {
 	allowed []blockedPID
 	blocked []blockedPID
+}
+
+type instrumentationErrorRecord struct {
+	processName string
+	errorType   string
+}
+
+type instrumentationErrorRecorder struct {
+	imetrics.NoopReporter
+	records []instrumentationErrorRecord
+}
+
+func (r *instrumentationErrorRecorder) InstrumentationError(processName, errorType string) {
+	r.records = append(r.records, instrumentationErrorRecord{
+		processName: processName,
+		errorType:   errorType,
+	})
 }
 
 func (r *recordingTracer) AllowPID(pid app.PID, ns uint32, _ *execpkg.FileInfo) {
@@ -66,6 +85,29 @@ func (r *recordingTracer) Required() bool                                       
 func (r *recordingTracer) SetEventContext(*ebpfcommon.EBPFEventContext)           {}
 func (r *recordingTracer) Capabilities() ebpfcommon.TracerCapability              { return 0 }
 func (r *recordingTracer) Run(context.Context, *ebpfcommon.EBPFEventContext, *msg.Queue[[]request.Span]) {
+}
+
+func TestTraceAttacherReportsJavaAttachFailure(t *testing.T) {
+	reporter := &instrumentationErrorRecorder{}
+	attacher := &traceAttacher{
+		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics: reporter,
+	}
+	instrumentable := &ebpf.Instrumentable{
+		FileInfo: execpkg.New(execpkg.Init{
+			CmdExePath: "/usr/bin/java",
+			Pid:        42,
+		}),
+	}
+
+	attacher.handleJavaAttachResult(instrumentable, nil)
+	assert.Empty(t, reporter.records)
+
+	attacher.handleJavaAttachResult(instrumentable, errors.New("dynamic agent loading disabled"))
+	require.Equal(t, []instrumentationErrorRecord{{
+		processName: "java",
+		errorType:   imetrics.InstrumentationErrorAttachingJavaAgent,
+	}}, reporter.records)
 }
 
 func TestSyntheticDeletePath_TraceAttacherDeletesTracer(t *testing.T) {

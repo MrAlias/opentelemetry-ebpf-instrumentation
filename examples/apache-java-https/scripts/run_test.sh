@@ -554,6 +554,31 @@ EOF
   }
 }
 
+test_pressure_map_metric_requires_exact_unique_series() {
+  local -r metrics="$TEST_TMP_DIR/pressure-map-metric.prom"
+
+  printf '%s\n' \
+    'obi_bpf_map_entries_total_shadow{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 9' \
+    >"$metrics"
+  if pressure_map_metric "$metrics" obi_bpf_map_entries_total 41 >/dev/null; then
+    printf 'pressure-map resolver accepted a prefixed metric name\n' >&2
+    return 1
+  fi
+
+  printf '%s\n' \
+    'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7' \
+    >>"$metrics"
+  [[ "$(pressure_map_metric "$metrics" obi_bpf_map_entries_total 41)" == "41 7" ]]
+
+  printf '%s\n' \
+    'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 8' \
+    >>"$metrics"
+  if pressure_map_metric "$metrics" obi_bpf_map_entries_total 41 >/dev/null; then
+    printf 'pressure-map resolver accepted duplicate exact-map series\n' >&2
+    return 1
+  fi
+}
+
 test_bridge_metric_wait_requires_quiescent_report() {
   (
     local -i fetches=0
@@ -671,24 +696,112 @@ test_primary_security_quiescence_restores_policy() {
   )
 }
 
-test_pressure_monitor_requires_full_occupancy() {
+test_bridge_take_attempt_total_is_transport_scoped() {
+  local -r metrics="$TEST_TMP_DIR/bridge-take-attempts.prom"
+  local -r previous_transport="$SELECTED_TRANSPORT"
+  local zero_total=""
+
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 5' \
+    'obi_java_remote_parent_operations_total{operation="take",status="missing",transport="getsockopt"} 2' \
+    'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="unix"} 11' \
+    'obi_java_remote_parent_operations_total_extra{operation="take",status="valid",transport="getsockopt"} 99' \
+    'obi_java_remote_parent_operations_total{operation="discard",status="valid",transport="getsockopt"} 13' \
+    >"$metrics"
+
+  SELECTED_TRANSPORT=getsockopt
+  [[ "$(bridge_take_attempt_total "$metrics")" == "7" ]]
+  SELECTED_TRANSPORT=unix
+  [[ "$(bridge_take_attempt_total "$metrics")" == "11" ]]
+  SELECTED_TRANSPORT=auto
+  if bridge_take_attempt_total "$metrics" >/dev/null; then
+    SELECTED_TRANSPORT="$previous_transport"
+    printf 'bridge take attempts accepted an unresolved transport\n' >&2
+    return 1
+  fi
+
+  SELECTED_TRANSPORT=getsockopt
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} invalid' \
+    >>"$metrics"
+  if bridge_take_attempt_total "$metrics" >/dev/null; then
+    SELECTED_TRANSPORT="$previous_transport"
+    printf 'bridge take attempts accepted a malformed counter\n' >&2
+    return 1
+  fi
+
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 0' \
+    >"$metrics"
+  zero_total="$(bridge_take_attempt_total "$metrics")"
+  [[ "$zero_total" == "0" ]]
+
+  printf '%s\n' \
+    "obi_java_remote_parent_operations_total{operation=\"take\",status=\"valid\",transport=\"getsockopt\"} $MAX_SHELL_INTEGER" \
+    'obi_java_remote_parent_operations_total{operation="take",status="missing",transport="getsockopt"} 1' \
+    >"$metrics"
+  if bridge_take_attempt_total "$metrics" >/dev/null; then
+    SELECTED_TRANSPORT="$previous_transport"
+    printf 'bridge take attempts accepted a counter sum outside the bounded range\n' >&2
+    return 1
+  fi
+  SELECTED_TRANSPORT="$previous_transport"
+}
+
+test_pressure_monitor_uses_prefill_baseline() {
+  local -i required_completion_timeout="$((
+    (PRESSURE_MONITOR_METRICS_TIMEOUT_SECONDS * 2) +
+    PRESSURE_MONITOR_POLL_INTERVAL_SECONDS +
+    PRESSURE_MONITOR_COMPLETION_SLACK_SECONDS
+  ))"
+
+  if ((PRESSURE_MONITOR_COMPLETION_SLACK_SECONDS <= 0 ||
+    PRESSURE_MONITOR_COMPLETION_TIMEOUT_SECONDS < required_completion_timeout)); then
+    printf 'pressure monitor completion timeout does not cover the next bounded sample\n' >&2
+    return 1
+  fi
+
   (
     RESULT_DIR="$TEST_TMP_DIR/pressure-monitor-failure"
     mkdir -p -- "$RESULT_DIR"
     PRESSURE_MAP_ID=41
     PRESSURE_MAP_MAX_ENTRIES=10
+    PRESSURE_MAP_BASELINE_ENTRIES=7
+    PRESSURE_TAKE_TARGET=5
+    SELECTED_TRANSPORT=getsockopt
     PRESSURE_MONITOR_OUTPUT="$RESULT_DIR/monitor.log"
     : >"$PRESSURE_MONITOR_OUTPUT"
     fetch_obi_metrics() {
       printf '%s\n' \
-        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 9' >"$1"
+        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7' >"$1"
     }
     if (monitor_map_pressure); then
-      printf 'pressure monitor accepted below-full occupancy\n' >&2
+      printf 'pressure monitor accepted occupancy at the pre-fill baseline\n' >&2
       return 1
     fi
-    grep -Fq 'status=failed reason=occupancy map_id=41 expected=10 actual=9' \
+    grep -Fq 'status=failed reason=occupancy map_id=41 baseline=7 max_entries=10 actual=7' \
       "$PRESSURE_MONITOR_OUTPUT"
+  )
+
+  (
+    RESULT_DIR="$TEST_TMP_DIR/pressure-monitor-overflow"
+    mkdir -p -- "$RESULT_DIR"
+    PRESSURE_MAP_ID=41
+    PRESSURE_MAP_MAX_ENTRIES=10
+    PRESSURE_MAP_BASELINE_ENTRIES=7
+    PRESSURE_TAKE_TARGET=5
+    SELECTED_TRANSPORT=getsockopt
+    PRESSURE_MONITOR_OUTPUT="$RESULT_DIR/monitor.log"
+    : >"$PRESSURE_MONITOR_OUTPUT"
+    fetch_obi_metrics() {
+      printf '%s\n' \
+        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 18446744073709551625' >"$1"
+    }
+    if (monitor_map_pressure); then
+      printf 'pressure monitor accepted an overflowing occupancy value\n' >&2
+      return 1
+    fi
+    grep -Fq 'actual=18446744073709551625' "$PRESSURE_MONITOR_OUTPUT"
   )
 
   (
@@ -697,9 +810,13 @@ test_pressure_monitor_requires_full_occupancy() {
     PRESSURE_LABEL="pressure-test"
     PRESSURE_MAP_ID=41
     PRESSURE_MAP_MAX_ENTRIES=10
+    PRESSURE_MAP_BASELINE_ENTRIES=7
+    PRESSURE_TAKE_TARGET=5
+    SELECTED_TRANSPORT=getsockopt
     fetch_obi_metrics() {
       printf '%s\n' \
-        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 10' >"$1"
+        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 9' \
+        'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 5' >"$1"
     }
     start_map_pressure_monitor
     local monitor_pid="$PRESSURE_MONITOR_PID"
@@ -708,7 +825,840 @@ test_pressure_monitor_requires_full_occupancy() {
       printf 'pressure monitor was not terminated and reaped\n' >&2
       return 1
     fi
-    grep -Fq 'status=full ' "$PRESSURE_MONITOR_OUTPUT"
+    grep -Fq 'status=pressured ' "$PRESSURE_MONITOR_OUTPUT"
+    grep -Fq 'status=traffic-complete ' "$PRESSURE_MONITOR_OUTPUT"
+    [[ -f "$PRESSURE_MONITOR_FINAL_OUTPUT" ]]
+  )
+
+  (
+    RESULT_DIR="$TEST_TMP_DIR/pressure-monitor-incomplete"
+    mkdir -p -- "$RESULT_DIR"
+    true &
+    PRESSURE_MONITOR_PID=$!
+    PRESSURE_MONITOR_OUTPUT="$RESULT_DIR/monitor.log"
+    PRESSURE_MONITOR_FINAL_OUTPUT="$RESULT_DIR/terminal.prom"
+    printf '%s\n' \
+      'status=pressured observed_at=2026-01-01T00:00:00Z map_id=41 baseline=7 max_entries=10 entries=9' \
+      >"$PRESSURE_MONITOR_OUTPUT"
+    if stop_map_pressure_monitor; then
+      printf 'pressure monitor accepted evidence without bridge-traffic completion\n' >&2
+      return 1
+    fi
+  )
+
+  (
+    local fetch_calls=0
+    local fixture_take_total=4
+
+    RESULT_DIR="$TEST_TMP_DIR/pressure-monitor-stop-race"
+    mkdir -p -- "$RESULT_DIR"
+    PRESSURE_LABEL="pressure-test"
+    PRESSURE_MAP_ID=41
+    PRESSURE_MAP_MAX_ENTRIES=10
+    PRESSURE_MAP_BASELINE_ENTRIES=7
+    PRESSURE_TAKE_TARGET=5
+    SELECTED_TRANSPORT=getsockopt
+    fetch_obi_metrics() {
+      fetch_calls="$((fetch_calls + 1))"
+      if ((fetch_calls > 1)); then
+        fixture_take_total=5
+      fi
+      printf '%s\n' \
+        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 9' \
+        "obi_java_remote_parent_operations_total{operation=\"take\",status=\"valid\",transport=\"getsockopt\"} $fixture_take_total" >"$1"
+    }
+    start_map_pressure_monitor
+    stop_map_pressure_monitor
+    grep -Fq 'status=traffic-complete ' "$PRESSURE_MONITOR_OUTPUT"
+    [[ -f "$PRESSURE_MONITOR_FINAL_OUTPUT" ]]
+  )
+}
+
+pressure_prepare_result() {
+  local -r token_base="$1"
+
+  printf '{"status":"passed","mode":"prepare","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"LRUHash","max_entries":10,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":%s,"touched":0}\n' \
+    "$token_base"
+}
+
+pressure_fill_result() {
+  local -r token_base="$1"
+
+  printf '{"status":"passed","mode":"fill","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"LRUHash","max_entries":10,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":%s,"touched":11,"evicted_entries":2}\n' \
+    "$token_base"
+}
+
+pressure_cleanup_result() {
+  local -r token_base="$1"
+
+  printf '{"status":"passed","mode":"cleanup","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"LRUHash","max_entries":10,"process_map_id":0,"process_pid":101,"process_namespace":202,"token_base":%s,"touched":9,"cleanup_verified":true,"verified_absent_entries":11}\n' \
+    "$token_base"
+}
+
+pressure_state_result() {
+  local -r comparison="$1"
+  local -r output="$2"
+  local -r required_matches="${4:-1}"
+  local sample_output=""
+  local -i index=0
+
+  printf 'comparison=%s output=%s\n' "$comparison" "$output" >"$output"
+  if ((required_matches > 1)); then
+    for ((index = 1; index <= required_matches; index++)); do
+      printf -v sample_output '%s-sample-%02d.prom' "${output%.prom}" "$index"
+      printf 'comparison=%s sample=%d\n' "$comparison" "$index" >"$sample_output"
+    done
+    printf 'comparison=%s matches=%d\n' \
+      "$comparison" "$required_matches" >"${output%.prom}-samples.log"
+  fi
+}
+
+test_pressure_state_uses_baseline_and_retains_steady_recovery() {
+  (
+    RESULT_DIR="$TEST_TMP_DIR/pressure-state"
+    mkdir -p -- "$RESULT_DIR"
+    PRESSURE_MAP_ID=41
+    PRESSURE_MAP_MAX_ENTRIES=10
+    PRESSURE_MAP_BASELINE_ENTRIES=7
+    sleep() {
+      return 0
+    }
+    fetch_obi_metrics() {
+      printf '%s\n' \
+        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 8' >"$1"
+    }
+    wait_for_pressure_map_state pressured "$RESULT_DIR/pressured.prom" 1 1 1
+    grep -Fq '} 8' "$RESULT_DIR/pressured.prom"
+  )
+
+  (
+    local fetch_count=0
+    local entries=0
+
+    RESULT_DIR="$TEST_TMP_DIR/pressure-recovery"
+    mkdir -p -- "$RESULT_DIR"
+    PRESSURE_MAP_ID=41
+    PRESSURE_MAP_MAX_ENTRIES=10
+    PRESSURE_MAP_BASELINE_ENTRIES=2
+    sleep() {
+      return 0
+    }
+    fetch_obi_metrics() {
+      ((fetch_count += 1))
+      case "$fetch_count" in
+        1) entries=3 ;;
+        2) entries=2 ;;
+        3) entries=3 ;;
+        *) entries=2 ;;
+      esac
+      printf 'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash",sample="%d"} %s\n' \
+        "$fetch_count" "$entries" >"$1"
+    }
+    wait_for_pressure_map_state recovered "$RESULT_DIR/recovered.prom" 5 2 5
+    [[ "$fetch_count" -eq 5 ]] || {
+      printf 'steady recovery did not require consecutive baseline samples\n' >&2
+      return 1
+    }
+    grep -Fq '} 2' "$RESULT_DIR/recovered.prom"
+    grep -Fq 'sample="4"' "$RESULT_DIR/recovered-sample-01.prom"
+    grep -Fq 'sample="5"' "$RESULT_DIR/recovered-sample-02.prom"
+    grep -Eq '^attempt=3 .* matched=false consecutive=0$' \
+      "$RESULT_DIR/recovered-samples.log"
+  )
+}
+
+test_pressure_state_has_attempt_and_wall_clock_bounds() {
+  (
+    local fetch_count=0
+
+    RESULT_DIR="$TEST_TMP_DIR/pressure-attempt-bound"
+    mkdir -p -- "$RESULT_DIR"
+    PRESSURE_MAP_ID=41
+    PRESSURE_MAP_MAX_ENTRIES=10
+    PRESSURE_MAP_BASELINE_ENTRIES=2
+    sleep() {
+      return 0
+    }
+    fetch_obi_metrics() {
+      ((fetch_count += 1))
+      return 1
+    }
+    if wait_for_pressure_map_state \
+      recovered "$RESULT_DIR/recovered.prom" 60 2 3 >/dev/null 2>&1; then
+      printf 'pressure state ignored its attempt cap\n' >&2
+      return 1
+    fi
+    [[ "$fetch_count" -eq 3 ]] || {
+      printf 'pressure state attempt cap used %d fetches, wanted 3\n' "$fetch_count" >&2
+      return 1
+    }
+  )
+
+  (
+    local -i started=0
+    local -i elapsed=0
+
+    RESULT_DIR="$TEST_TMP_DIR/pressure-deadline-bound"
+    mkdir -p -- "$RESULT_DIR"
+    PRESSURE_MAP_ID=41
+    PRESSURE_MAP_MAX_ENTRIES=10
+    PRESSURE_MAP_BASELINE_ENTRIES=2
+    fetch_obi_metrics() {
+      command sleep "$2"
+      return 1
+    }
+    started="$SECONDS"
+    if wait_for_pressure_map_state \
+      recovered "$RESULT_DIR/recovered.prom" 2 2 10 >/dev/null 2>&1; then
+      printf 'pressure deadline accepted unavailable metrics\n' >&2
+      return 1
+    fi
+    elapsed="$((SECONDS - started))"
+    ((elapsed >= 2 && elapsed <= 3)) || {
+      printf 'pressure deadline elapsed %d seconds, wanted 2-3\n' "$elapsed" >&2
+      return 1
+    }
+  )
+}
+
+test_pressure_state_fails_closed_on_evidence_write_error() {
+  (
+    RESULT_DIR="$TEST_TMP_DIR/pressure-evidence-write"
+    mkdir -p -- "$RESULT_DIR"
+    PRESSURE_MAP_ID=41
+    PRESSURE_MAP_MAX_ENTRIES=10
+    PRESSURE_MAP_BASELINE_ENTRIES=2
+    fetch_obi_metrics() {
+      printf '%s\n' \
+        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 3' >"$1"
+    }
+    install() {
+      return 1
+    }
+    if wait_for_pressure_map_state \
+      pressured "$RESULT_DIR/pressured.prom" 1 1 1 >/dev/null 2>&1; then
+      printf 'pressure state accepted a failed evidence install\n' >&2
+      return 1
+    fi
+  )
+}
+
+test_map_pressure_prepare_fill_cleanup_transaction() {
+  (
+    local -r token_base="18446744073709551605"
+    local -r command_log="$TEST_TMP_DIR/pressure-transaction.commands"
+    local -r state_log="$TEST_TMP_DIR/pressure-transaction.states"
+
+    RESULT_DIR="$TEST_TMP_DIR/pressure-transaction"
+    mkdir -p -- "$RESULT_DIR"
+    COMPOSE=(fake-compose)
+    SCENARIO_SEED=1
+    printf '%s\n' \
+      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7' \
+      'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 3' \
+      >"$RESULT_DIR/before.prom"
+    SELECTED_TRANSPORT=getsockopt
+    run_bounded() {
+      printf '%s\n' "$*" >>"$command_log"
+      case " $* " in
+        *' --mode prepare '*) pressure_prepare_result "$token_base" ;;
+        *' --mode fill '*) pressure_fill_result "$token_base" ;;
+        *' --mode cleanup '*) pressure_cleanup_result "$token_base" ;;
+        *) return 64 ;;
+      esac
+    }
+    wait_for_pressure_map_state() {
+      printf '%s\n' "$*" >>"$state_log"
+      pressure_state_result "$@"
+    }
+    start_map_pressure_monitor() {
+      return 0
+    }
+
+    SELECTED_TRANSPORT=getsockopt
+    start_map_pressure pressure-test "$RESULT_DIR/before.prom" 5 >/dev/null
+    [[ "$PRESSURE_TAKE_TARGET" == "8" ]] || return 1
+    [[ "$PRESSURE_ACTIVE" == "true" && \
+      "$PRESSURE_MAP_BASELINE_ENTRIES" == "7" && \
+      "$PRESSURE_PROCESS_MAP_ID" == "42" && \
+      "$PRESSURE_TOKEN_BASE" == "$token_base" && \
+      "$PRESSURE_TOUCHED_ENTRIES" == "11" && \
+      "$PRESSURE_EVICTED_ENTRIES" == "2" ]] || {
+      printf 'map-pressure start did not retain its prepared identity and fill evidence\n' >&2
+      return 1
+    }
+    cleanup_map_pressure >/dev/null
+    [[ "$PRESSURE_ACTIVE" == "false" ]] || {
+      printf 'verified map-pressure cleanup did not clear active state\n' >&2
+      return 1
+    }
+    [[ "$(wc -l <"$command_log")" -eq 3 ]]
+    sed -n '1p' "$command_log" | grep -Fq -- '--mode prepare'
+    sed -n '2p' "$command_log" | grep -Fq -- \
+      "--map-id 41 --expected-max-entries 10 --expected-process-map-id 42 --process-pid 101 --process-namespace 202 --token-base $token_base --seed 1 --mode fill"
+    sed -n '3p' "$command_log" | grep -Fq -- \
+      "--map-id 41 --expected-max-entries 10 --process-pid 101 --process-namespace 202 --token-base $token_base --seed 1 --mode cleanup"
+    grep -Fq 'pressured ' "$state_log"
+    grep -Fq 'recovered ' "$state_log"
+    [[ -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01.json" && \
+      -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01.stderr.log" && \
+      -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01.status" && \
+      -f "$RESULT_DIR/map-pressure-pressure-test-cleanup.json" ]]
+    grep -Fq 'validation_status=passed' \
+      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01.status"
+    grep -Fq 'recovery_status=passed' \
+      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01.status"
+  )
+}
+
+test_map_pressure_pre_mutation_failures_do_not_fill() {
+  (
+    local -r command_log="$TEST_TMP_DIR/pressure-bad-prepare.commands"
+
+    RESULT_DIR="$TEST_TMP_DIR/pressure-bad-prepare"
+    mkdir -p -- "$RESULT_DIR"
+    COMPOSE=(fake-compose)
+    SCENARIO_SEED=1
+    : >"$RESULT_DIR/before.prom"
+    run_bounded() {
+      printf '%s\n' "$*" >>"$command_log"
+      pressure_prepare_result 700
+      pressure_prepare_result 701
+    }
+
+    SELECTED_TRANSPORT=getsockopt
+    if start_map_pressure pressure-test "$RESULT_DIR/before.prom" 1 >/dev/null 2>&1; then
+      printf 'map-pressure start accepted duplicate prepare records\n' >&2
+      return 1
+    fi
+    [[ "$PRESSURE_ACTIVE" == "false" && "$(wc -l <"$command_log")" -eq 1 ]]
+    if grep -Fq -- '--mode fill' "$command_log" || \
+      grep -Fq -- '--mode cleanup' "$command_log"; then
+      printf 'map-pressure mutated state after invalid prepare evidence\n' >&2
+      return 1
+    fi
+  )
+
+  (
+    local -r command_log="$TEST_TMP_DIR/pressure-missing-baseline.commands"
+
+    RESULT_DIR="$TEST_TMP_DIR/pressure-missing-baseline"
+    mkdir -p -- "$RESULT_DIR"
+    COMPOSE=(fake-compose)
+    SCENARIO_SEED=1
+    printf '%s\n' \
+      'obi_bpf_map_entries_total{map_id="99",map_name="java_remote_par",map_type="lru_hash"} 7' \
+      >"$RESULT_DIR/before.prom"
+    run_bounded() {
+      printf '%s\n' "$*" >>"$command_log"
+      pressure_prepare_result 700
+    }
+
+    SELECTED_TRANSPORT=getsockopt
+    if start_map_pressure pressure-test "$RESULT_DIR/before.prom" 1 >/dev/null 2>&1; then
+      printf 'map-pressure start accepted a missing exact-map baseline\n' >&2
+      return 1
+    fi
+    [[ "$PRESSURE_ACTIVE" == "false" && "$(wc -l <"$command_log")" -eq 1 ]]
+    if grep -Fq -- '--mode fill' "$command_log" || \
+      grep -Fq -- '--mode cleanup' "$command_log"; then
+      printf 'map-pressure mutated state without an exact-map baseline\n' >&2
+      return 1
+    fi
+  )
+}
+
+test_map_pressure_fill_failure_uses_prepared_cleanup_identity() {
+  (
+    local -r token_base="18446744073709551605"
+    local -r command_log="$TEST_TMP_DIR/pressure-fill-failure.commands"
+    local start_status=0
+
+    RESULT_DIR="$TEST_TMP_DIR/pressure-fill-failure"
+    mkdir -p -- "$RESULT_DIR"
+    COMPOSE=(fake-compose)
+    SCENARIO_SEED=1
+    printf '%s\n' \
+      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7' \
+      >"$RESULT_DIR/before.prom"
+    run_bounded() {
+      printf '%s\n' "$*" >>"$command_log"
+      case " $* " in
+        *' --mode prepare '*) pressure_prepare_result "$token_base" ;;
+        *' --mode fill '*) printf 'fill interrupted\n' >&2; return 23 ;;
+        *' --mode cleanup '*) pressure_cleanup_result "$token_base" ;;
+        *) return 64 ;;
+      esac
+    }
+    wait_for_pressure_map_state() {
+      pressure_state_result "$@"
+    }
+
+    SELECTED_TRANSPORT=getsockopt
+    if start_map_pressure pressure-test "$RESULT_DIR/before.prom" 1 >/dev/null 2>&1; then
+      printf 'map-pressure start accepted a failed fill command\n' >&2
+      return 1
+    else
+      start_status=$?
+    fi
+    [[ "$start_status" -eq 23 && "$PRESSURE_ACTIVE" == "false" ]]
+    sed -n '3p' "$command_log" | grep -Fq -- \
+      "--map-id 41 --expected-max-entries 10 --process-pid 101 --process-namespace 202 --token-base $token_base --seed 1 --mode cleanup"
+    grep -Fq 'fill interrupted' "$RESULT_DIR/map-pressure-pressure-test-fill.stderr.log"
+  )
+
+  (
+    local -r token_base="18446744073709551605"
+    local -r command_log="$TEST_TMP_DIR/pressure-fill-mismatch.commands"
+
+    RESULT_DIR="$TEST_TMP_DIR/pressure-fill-mismatch"
+    mkdir -p -- "$RESULT_DIR"
+    COMPOSE=(fake-compose)
+    SCENARIO_SEED=1
+    printf '%s\n' \
+      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7' \
+      >"$RESULT_DIR/before.prom"
+    run_bounded() {
+      printf '%s\n' "$*" >>"$command_log"
+      case " $* " in
+        *' --mode prepare '*) pressure_prepare_result "$token_base" ;;
+        *' --mode fill '*) pressure_fill_result 700 ;;
+        *' --mode cleanup '*) pressure_cleanup_result "$token_base" ;;
+        *) return 64 ;;
+      esac
+    }
+    wait_for_pressure_map_state() {
+      pressure_state_result "$@"
+    }
+
+    SELECTED_TRANSPORT=getsockopt
+    if start_map_pressure pressure-test "$RESULT_DIR/before.prom" 1 >/dev/null 2>&1; then
+      printf 'map-pressure start accepted mismatched fill identity\n' >&2
+      return 1
+    fi
+    [[ "$PRESSURE_ACTIVE" == "false" && "$(wc -l <"$command_log")" -eq 3 ]]
+  )
+}
+
+test_map_pressure_cleanup_retries_keep_immutable_artifacts() {
+  (
+    local -r token_base="18446744073709551605"
+    local cleanup_calls=0
+
+    RESULT_DIR="$TEST_TMP_DIR/pressure-cleanup-retry"
+    mkdir -p -- "$RESULT_DIR"
+    COMPOSE=(fake-compose)
+    SCENARIO_SEED=1
+    printf '%s\n' \
+      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7' \
+      >"$RESULT_DIR/before.prom"
+    run_bounded() {
+      case " $* " in
+        *' --mode prepare '*) pressure_prepare_result "$token_base" ;;
+        *' --mode fill '*) pressure_fill_result "$token_base" ;;
+        *' --mode cleanup '*)
+          ((cleanup_calls += 1))
+          case "$cleanup_calls" in
+            1)
+              printf 'transient cleanup failure\n' >&2
+              return 23
+              ;;
+            2)
+              pressure_cleanup_result 700
+              ;;
+            *)
+              pressure_cleanup_result "$token_base"
+              ;;
+          esac
+          ;;
+        *) return 64 ;;
+      esac
+    }
+    wait_for_pressure_map_state() {
+      pressure_state_result "$@"
+    }
+    start_map_pressure_monitor() {
+      return 0
+    }
+
+    SELECTED_TRANSPORT=getsockopt
+    start_map_pressure pressure-test "$RESULT_DIR/before.prom" 1 >/dev/null
+    cleanup_map_pressure_with_retries >/dev/null 2>&1
+    [[ "$PRESSURE_ACTIVE" == "false" && "$PRESSURE_CLEANUP_ATTEMPT" -eq 3 ]]
+    grep -Fq 'command_status=23' \
+      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01.status"
+    grep -Fq 'validation_status=not-run' \
+      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01.status"
+    grep -Fq '"token_base":700' \
+      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-02.json"
+    grep -Fq 'validation_status=failed' \
+      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-02.status"
+    grep -Fq "\"token_base\":$token_base" \
+      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-03.json"
+    grep -Fq 'validation_status=passed' \
+      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-03.status"
+    grep -Fq "\"token_base\":$token_base" \
+      "$RESULT_DIR/map-pressure-pressure-test-cleanup.json"
+  )
+
+  (
+    local helper_called=false
+
+    RESULT_DIR="$TEST_TMP_DIR/pressure-cleanup-exhausted"
+    mkdir -p -- "$RESULT_DIR"
+    PRESSURE_ACTIVE=true
+    PRESSURE_CLEANUP_ATTEMPT="$PRESSURE_CLEANUP_MAX_ATTEMPTS"
+    PRESSURE_MONITOR_PID=""
+    run_map_pressure_helper() {
+      helper_called=true
+    }
+    if cleanup_map_pressure_with_retries >/dev/null 2>&1; then
+      printf 'map-pressure cleanup exceeded its attempt cap\n' >&2
+      return 1
+    fi
+    [[ "$helper_called" == "false" && "$PRESSURE_ACTIVE" == "true" ]]
+  )
+
+  (
+    local -r token_base="700"
+    local recovery_calls=0
+
+    RESULT_DIR="$TEST_TMP_DIR/pressure-cleanup-recovery-failure"
+    mkdir -p -- "$RESULT_DIR"
+    COMPOSE=(fake-compose)
+    SCENARIO_SEED=1
+    printf '%s\n' \
+      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7' \
+      >"$RESULT_DIR/before.prom"
+    run_bounded() {
+      case " $* " in
+        *' --mode prepare '*) pressure_prepare_result "$token_base" ;;
+        *' --mode fill '*) pressure_fill_result "$token_base" ;;
+        *' --mode cleanup '*) pressure_cleanup_result "$token_base" ;;
+        *) return 64 ;;
+      esac
+    }
+    wait_for_pressure_map_state() {
+      if [[ "$1" == "recovered" ]]; then
+        ((recovery_calls += 1))
+        pressure_state_result "$@"
+        if ((recovery_calls == 1)); then
+          return 37
+        fi
+        return 0
+      fi
+      pressure_state_result "$@"
+    }
+    start_map_pressure_monitor() {
+      return 0
+    }
+
+    SELECTED_TRANSPORT=getsockopt
+    start_map_pressure pressure-test "$RESULT_DIR/before.prom" 1 >/dev/null
+    cleanup_map_pressure_with_retries >/dev/null 2>&1
+    [[ "$PRESSURE_ACTIVE" == "false" && "$PRESSURE_CLEANUP_ATTEMPT" -eq 2 ]]
+    grep -Fq 'command_status=0' \
+      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01.status"
+    grep -Fq 'validation_status=passed' \
+      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01.status"
+    grep -Fq 'recovery_status=failed' \
+      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01.status"
+    [[ -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01-recovered-sample-01.prom" && \
+      -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01-recovered-sample-02.prom" && \
+      -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01-recovered-samples.log" ]]
+    grep -Fq 'recovery_status=passed' \
+      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-02.status"
+    grep -Fq 'cleanup-attempt-02-recovered.prom' \
+      "$RESULT_DIR/map-pressure-pressure-test-recovered.prom"
+  )
+
+  (
+    local -r token_base="700"
+    local cleanup_status=0
+
+    RESULT_DIR="$TEST_TMP_DIR/pressure-cleanup-recovery-exhausted"
+    mkdir -p -- "$RESULT_DIR"
+    COMPOSE=(fake-compose)
+    SCENARIO_SEED=1
+    printf '%s\n' \
+      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7' \
+      >"$RESULT_DIR/before.prom"
+    run_bounded() {
+      case " $* " in
+        *' --mode prepare '*) pressure_prepare_result "$token_base" ;;
+        *' --mode fill '*) pressure_fill_result "$token_base" ;;
+        *' --mode cleanup '*) pressure_cleanup_result "$token_base" ;;
+        *) return 64 ;;
+      esac
+    }
+    wait_for_pressure_map_state() {
+      pressure_state_result "$@"
+      if [[ "$1" == "recovered" ]]; then
+        return 37
+      fi
+    }
+    start_map_pressure_monitor() {
+      return 0
+    }
+
+    SELECTED_TRANSPORT=getsockopt
+    start_map_pressure pressure-test "$RESULT_DIR/before.prom" 1 >/dev/null
+    if cleanup_map_pressure_with_retries >/dev/null 2>&1; then
+      printf 'map-pressure cleanup accepted exhausted recovery failures\n' >&2
+      return 1
+    else
+      cleanup_status=$?
+    fi
+    [[ "$cleanup_status" -eq 37 && \
+      "$PRESSURE_ACTIVE" == "true" && \
+      "$PRESSURE_CLEANUP_ATTEMPT" -eq "$PRESSURE_CLEANUP_MAX_ATTEMPTS" ]]
+    [[ -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-03.json" && \
+      -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-03.status" ]]
+    [[ ! -e "$RESULT_DIR/map-pressure-pressure-test-cleanup.json" && \
+      ! -e "$RESULT_DIR/map-pressure-pressure-test-cleanup.stderr.log" && \
+      ! -e "$RESULT_DIR/map-pressure-pressure-test-recovered.prom" && \
+      ! -e "$RESULT_DIR/map-pressure-pressure-test-recovered-sample-01.prom" && \
+      ! -e "$RESULT_DIR/map-pressure-pressure-test-recovered-sample-02.prom" && \
+      ! -e "$RESULT_DIR/map-pressure-pressure-test-recovered-samples.log" ]]
+  )
+
+  (
+    local -r token_base="700"
+    local cleanup_calls=0
+    local cleanup_status=0
+
+    RESULT_DIR="$TEST_TMP_DIR/pressure-cleanup-monitor-failure"
+    mkdir -p -- "$RESULT_DIR"
+    COMPOSE=(fake-compose)
+    SCENARIO_SEED=1
+    printf '%s\n' \
+      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7' \
+      >"$RESULT_DIR/before.prom"
+    run_bounded() {
+      case " $* " in
+        *' --mode prepare '*) pressure_prepare_result "$token_base" ;;
+        *' --mode fill '*) pressure_fill_result "$token_base" ;;
+        *' --mode cleanup '*)
+          ((cleanup_calls += 1))
+          if ((cleanup_calls == 1)); then
+            return 23
+          fi
+          pressure_cleanup_result "$token_base"
+          ;;
+        *) return 64 ;;
+      esac
+    }
+    wait_for_pressure_map_state() {
+      pressure_state_result "$@"
+    }
+    start_map_pressure_monitor() {
+      return 0
+    }
+    stop_map_pressure_monitor() {
+      PRESSURE_MONITOR_PID=""
+      return 29
+    }
+
+    SELECTED_TRANSPORT=getsockopt
+    start_map_pressure pressure-test "$RESULT_DIR/before.prom" 1 >/dev/null
+    PRESSURE_MONITOR_PID=123
+    if cleanup_map_pressure_with_retries >/dev/null 2>&1; then
+      printf 'map-pressure cleanup erased a monitor failure during retry\n' >&2
+      return 1
+    else
+      cleanup_status=$?
+    fi
+    [[ "$cleanup_status" -eq 29 && \
+      "$PRESSURE_MONITOR_STATUS" -eq 29 && \
+      "$PRESSURE_ACTIVE" == "false" && \
+      "$PRESSURE_CLEANUP_ATTEMPT" -eq 2 ]]
+    grep -Fq 'monitor_status=29' \
+      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-02.status"
+  )
+}
+
+test_map_pressure_result_contract_is_single_record_and_exact() {
+  local -r output="$TEST_TMP_DIR/pressure-result.json"
+
+  pressure_prepare_result 700 >"$output"
+  pressure_result_has_contract "$output" prepare
+  [[ "$(pressure_result_uint "$output" token_base)" == "700" ]]
+
+  pressure_prepare_result 700 >>"$output"
+  if pressure_result_has_contract "$output" prepare; then
+    printf 'map-pressure contract accepted duplicate records\n' >&2
+    return 1
+  fi
+
+  pressure_prepare_result 700 >"$output"
+  sed -i 's/"status":"passed"/"status":"failed"/' "$output"
+  if pressure_result_has_contract "$output" prepare; then
+    printf 'map-pressure contract accepted failed status\n' >&2
+    return 1
+  fi
+
+  pressure_prepare_result 700 >"$output"
+  sed -i 's/"kernel_name":"java_remote_par"/"kernel_name":"wrong"/' "$output"
+  if pressure_result_has_contract "$output" prepare; then
+    printf 'map-pressure contract accepted wrong static map identity\n' >&2
+    return 1
+  fi
+}
+
+test_map_pressure_helper_capture_preserves_status_and_streams() {
+  (
+    local -r output="$TEST_TMP_DIR/pressure-helper.stdout"
+    local -r stderr_output="$TEST_TMP_DIR/pressure-helper.stderr"
+    local helper_status=0
+
+    RESULT_DIR="$TEST_TMP_DIR"
+    COMPOSE=(fake-compose)
+    run_bounded() {
+      printf 'complete stdout\n'
+      printf 'complete stderr\n' >&2
+      return 23
+    }
+    if run_map_pressure_helper \
+      "$output" "$stderr_output" 5 --mode prepare >/dev/null 2>&1; then
+      printf 'map-pressure helper capture lost the command failure\n' >&2
+      return 1
+    else
+      helper_status=$?
+    fi
+    [[ "$helper_status" -eq 23 ]]
+    [[ "$(<"$output")" == "complete stdout" ]]
+    [[ "$(<"$stderr_output")" == "complete stderr" ]]
+  )
+
+  (
+    local -r call_marker="$TEST_TMP_DIR/pressure-helper-open.called"
+    local helper_status=0
+
+    RESULT_DIR="$TEST_TMP_DIR"
+    COMPOSE=(fake-compose)
+    run_bounded() {
+      : >"$call_marker"
+    }
+    if run_map_pressure_helper \
+      "$TEST_TMP_DIR/missing/stdout" \
+      "$TEST_TMP_DIR/missing/stderr" \
+      5 \
+      --mode prepare >/dev/null 2>&1; then
+      printf 'map-pressure helper ignored a capture-open failure\n' >&2
+      return 1
+    else
+      helper_status=$?
+    fi
+    ((helper_status != 0))
+    [[ ! -e "$call_marker" ]]
+  )
+}
+
+test_map_pressure_canonical_promotion_rolls_back_partial_files() {
+  (
+    local -r token_base="700"
+    local destination=""
+
+    RESULT_DIR="$TEST_TMP_DIR/pressure-cleanup-promotion-failure"
+    mkdir -p -- "$RESULT_DIR"
+    COMPOSE=(fake-compose)
+    SCENARIO_SEED=1
+    printf '%s\n' \
+      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7' \
+      >"$RESULT_DIR/before.prom"
+    run_bounded() {
+      case " $* " in
+        *' --mode prepare '*) pressure_prepare_result "$token_base" ;;
+        *' --mode fill '*) pressure_fill_result "$token_base" ;;
+        *' --mode cleanup '*) pressure_cleanup_result "$token_base" ;;
+        *) return 64 ;;
+      esac
+    }
+    wait_for_pressure_map_state() {
+      pressure_state_result "$@"
+    }
+    start_map_pressure_monitor() {
+      return 0
+    }
+    install() {
+      destination="${!#}"
+      if [[ "$destination" == "$RESULT_DIR/map-pressure-pressure-test-cleanup.stderr.log" ]]; then
+        printf 'partial\n' >"$destination"
+        return 1
+      fi
+      command install "$@"
+    }
+
+    SELECTED_TRANSPORT=getsockopt
+    start_map_pressure pressure-test "$RESULT_DIR/before.prom" 1 >/dev/null
+    if cleanup_map_pressure >/dev/null 2>&1; then
+      printf 'map-pressure cleanup accepted a partial canonical promotion\n' >&2
+      return 1
+    fi
+    [[ "$PRESSURE_ACTIVE" == "true" ]]
+    [[ ! -e "$RESULT_DIR/map-pressure-pressure-test-cleanup.json" && \
+      ! -e "$RESULT_DIR/map-pressure-pressure-test-cleanup.stderr.log" && \
+      ! -e "$RESULT_DIR/map-pressure-pressure-test-recovered.prom" && \
+      ! -e "$RESULT_DIR/map-pressure-pressure-test-recovered-sample-01.prom" && \
+      ! -e "$RESULT_DIR/map-pressure-pressure-test-recovered-sample-02.prom" && \
+      ! -e "$RESULT_DIR/map-pressure-pressure-test-recovered-samples.log" ]]
+    [[ -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01.json" && \
+      -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01.status" ]]
+  )
+
+  (
+    local -r token_base="700"
+    local destination=""
+
+    RESULT_DIR="$TEST_TMP_DIR/pressure-recovery-promotion-failure"
+    mkdir -p -- "$RESULT_DIR"
+    COMPOSE=(fake-compose)
+    SCENARIO_SEED=1
+    printf '%s\n' \
+      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7' \
+      >"$RESULT_DIR/before.prom"
+    run_bounded() {
+      case " $* " in
+        *' --mode prepare '*) pressure_prepare_result "$token_base" ;;
+        *' --mode fill '*) pressure_fill_result "$token_base" ;;
+        *' --mode cleanup '*) pressure_cleanup_result "$token_base" ;;
+        *) return 64 ;;
+      esac
+    }
+    wait_for_pressure_map_state() {
+      pressure_state_result "$@"
+    }
+    start_map_pressure_monitor() {
+      return 0
+    }
+    install() {
+      destination="${!#}"
+      if [[ "$destination" == "$RESULT_DIR/map-pressure-pressure-test-recovered-sample-02.prom" ]]; then
+        printf 'partial\n' >"$destination"
+        return 1
+      fi
+      command install "$@"
+    }
+
+    SELECTED_TRANSPORT=getsockopt
+    start_map_pressure pressure-test "$RESULT_DIR/before.prom" 1 >/dev/null
+    if cleanup_map_pressure >/dev/null 2>&1; then
+      printf 'map-pressure cleanup accepted a partial recovery promotion\n' >&2
+      return 1
+    fi
+    [[ "$PRESSURE_ACTIVE" == "true" ]]
+    [[ ! -e "$RESULT_DIR/map-pressure-pressure-test-cleanup.json" && \
+      ! -e "$RESULT_DIR/map-pressure-pressure-test-cleanup.stderr.log" && \
+      ! -e "$RESULT_DIR/map-pressure-pressure-test-recovered.prom" && \
+      ! -e "$RESULT_DIR/map-pressure-pressure-test-recovered-sample-01.prom" && \
+      ! -e "$RESULT_DIR/map-pressure-pressure-test-recovered-sample-02.prom" && \
+      ! -e "$RESULT_DIR/map-pressure-pressure-test-recovered-samples.log" ]]
+    [[ -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01-recovered.prom" && \
+      -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01-recovered-sample-01.prom" && \
+      -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01-recovered-sample-02.prom" && \
+      -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01-recovered-samples.log" ]]
+    grep -Fq 'recovery_status=failed' \
+      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01.status"
   )
 }
 
@@ -2996,10 +3946,22 @@ main() {
   test_agent_download_rejects_symlink_output
   test_metrics_delta_reports_counters_and_map_occupancy
   test_metric_boundary_helpers_are_reason_coded
+  test_pressure_map_metric_requires_exact_unique_series
   test_bridge_metric_wait_requires_quiescent_report
   test_security_probe_window_covers_metric_fences
   test_primary_security_quiescence_restores_policy
-  test_pressure_monitor_requires_full_occupancy
+  test_bridge_take_attempt_total_is_transport_scoped
+  test_pressure_monitor_uses_prefill_baseline
+  test_pressure_state_uses_baseline_and_retains_steady_recovery
+  test_pressure_state_has_attempt_and_wall_clock_bounds
+  test_pressure_state_fails_closed_on_evidence_write_error
+  test_map_pressure_prepare_fill_cleanup_transaction
+  test_map_pressure_pre_mutation_failures_do_not_fill
+  test_map_pressure_fill_failure_uses_prepared_cleanup_identity
+  test_map_pressure_cleanup_retries_keep_immutable_artifacts
+  test_map_pressure_result_contract_is_single_record_and_exact
+  test_map_pressure_helper_capture_preserves_status_and_streams
+  test_map_pressure_canonical_promotion_rolls_back_partial_files
   test_bridge_take_count_includes_cancelled_request
   test_bridge_metric_delta_requires_exact_one_shot_results
   test_primary_security_metrics_are_explicitly_scoped

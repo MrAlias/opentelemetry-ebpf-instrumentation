@@ -28,29 +28,32 @@ const (
 )
 
 type config struct {
-	mapID              uint
-	expectedMaxEntries uint
-	mode               string
-	seed               uint
-	processPID         uint
-	processNamespace   uint
-	tokenBase          uint64
+	mapID                uint
+	expectedMaxEntries   uint
+	expectedProcessMapID uint
+	mode                 string
+	seed                 uint
+	processPID           uint
+	processNamespace     uint
+	tokenBase            uint64
 }
 
 type result struct {
-	Status           string `json:"status"`
-	Mode             string `json:"mode"`
-	MapID            uint   `json:"map_id"`
-	MapName          string `json:"map_name"`
-	KernelName       string `json:"kernel_name"`
-	MapType          string `json:"map_type"`
-	MaxEntries       uint32 `json:"max_entries"`
-	ProcessMapID     uint   `json:"process_map_id"`
-	ProcessPID       uint32 `json:"process_pid"`
-	ProcessNamespace uint32 `json:"process_namespace"`
-	TokenBase        uint64 `json:"token_base"`
-	Touched          uint32 `json:"touched"`
-	FirstEvicted     bool   `json:"first_evicted,omitempty"`
+	Status                string `json:"status"`
+	Mode                  string `json:"mode"`
+	MapID                 uint   `json:"map_id"`
+	MapName               string `json:"map_name"`
+	KernelName            string `json:"kernel_name"`
+	MapType               string `json:"map_type"`
+	MaxEntries            uint32 `json:"max_entries"`
+	ProcessMapID          uint   `json:"process_map_id"`
+	ProcessPID            uint32 `json:"process_pid"`
+	ProcessNamespace      uint32 `json:"process_namespace"`
+	TokenBase             uint64 `json:"token_base"`
+	Touched               uint32 `json:"touched"`
+	EvictedEntries        uint32 `json:"evicted_entries,omitempty"`
+	CleanupVerified       bool   `json:"cleanup_verified,omitempty"`
+	VerifiedAbsentEntries uint32 `json:"verified_absent_entries,omitempty"`
 }
 
 type processIdentity struct {
@@ -81,42 +84,79 @@ func parseFlags() (config, error) {
 	var cfg config
 	flag.UintVar(&cfg.mapID, "map-id", 0, "live eBPF map ID")
 	flag.UintVar(&cfg.expectedMaxEntries, "expected-max-entries", 0, "expected live map capacity")
-	flag.StringVar(&cfg.mode, "mode", "fill", "fill or cleanup")
-	flag.UintVar(&cfg.seed, "seed", 1, "deterministic synthetic key seed")
-	flag.UintVar(&cfg.processPID, "process-pid", 0, "captured live JVM process ID for cleanup")
+	flag.UintVar(&cfg.expectedProcessMapID, "expected-process-map-id", 0, "prepared process map ID")
+	flag.StringVar(&cfg.mode, "mode", "prepare", "prepare, fill, or cleanup")
+	flag.UintVar(&cfg.seed, "seed", 1, "per-run synthetic token namespace seed")
+	flag.UintVar(&cfg.processPID, "process-pid", 0, "prepared live JVM process ID")
 	flag.UintVar(
 		&cfg.processNamespace,
 		"process-namespace",
 		0,
-		"captured live JVM PID namespace for cleanup",
+		"prepared live JVM PID namespace",
 	)
-	flag.Uint64Var(&cfg.tokenBase, "token-base", 0, "captured synthetic token base for cleanup")
+	flag.Uint64Var(&cfg.tokenBase, "token-base", 0, "prepared synthetic token base")
 	flag.Parse()
 
 	if flag.NArg() != 0 {
 		return config{}, errors.New("unexpected positional arguments")
 	}
-	if cfg.expectedMaxEntries > maxPressureEntries {
-		return config{}, fmt.Errorf(
-			"expected-max-entries must not exceed %d",
-			maxPressureEntries,
-		)
-	}
-	if cfg.mode != "fill" && cfg.mode != "cleanup" {
-		return config{}, errors.New("mode must be fill or cleanup")
-	}
-	if cfg.mode == "fill" &&
-		(cfg.processPID != 0 || cfg.processNamespace != 0 || cfg.tokenBase != 0) {
-		return config{}, errors.New("cleanup identity flags are only valid in cleanup mode")
-	}
-	if cfg.mode == "cleanup" &&
-		(cfg.processPID == 0 || cfg.processNamespace == 0 || cfg.tokenBase == 0) {
-		return config{}, errors.New("cleanup requires process-pid, process-namespace, and token-base")
+	if err := validateConfig(cfg); err != nil {
+		return config{}, err
 	}
 	return cfg, nil
 }
 
+func validateConfig(cfg config) error {
+	if cfg.expectedMaxEntries > maxPressureEntries {
+		return fmt.Errorf(
+			"expected-max-entries must not exceed %d",
+			maxPressureEntries,
+		)
+	}
+	if uint64(cfg.mapID) > uint64(^uint32(0)) {
+		return errors.New("map-id exceeds 32 bits")
+	}
+	if uint64(cfg.processPID) > uint64(^uint32(0)) {
+		return errors.New("process-pid exceeds 32 bits")
+	}
+	if uint64(cfg.expectedProcessMapID) > uint64(^uint32(0)) {
+		return errors.New("expected-process-map-id exceeds 32 bits")
+	}
+	if uint64(cfg.processNamespace) > uint64(^uint32(0)) {
+		return errors.New("process-namespace exceeds 32 bits")
+	}
+	if cfg.mode != "prepare" && cfg.mode != "fill" && cfg.mode != "cleanup" {
+		return errors.New("mode must be prepare, fill, or cleanup")
+	}
+	if cfg.mode == "prepare" &&
+		(cfg.mapID != 0 || cfg.expectedMaxEntries != 0 || cfg.expectedProcessMapID != 0 ||
+			cfg.processPID != 0 || cfg.processNamespace != 0 || cfg.tokenBase != 0) {
+		return errors.New("map and process identity flags are not valid in prepare mode")
+	}
+	if cfg.mode == "fill" &&
+		(cfg.mapID == 0 || cfg.expectedMaxEntries == 0 || cfg.expectedProcessMapID == 0 ||
+			cfg.processPID == 0 || cfg.processNamespace == 0 || cfg.tokenBase == 0) {
+		return errors.New(
+			"fill requires map-id, expected-max-entries, expected-process-map-id, process-pid, process-namespace, and token-base",
+		)
+	}
+	if cfg.mode == "cleanup" &&
+		(cfg.mapID == 0 || cfg.expectedMaxEntries == 0 || cfg.processPID == 0 ||
+			cfg.processNamespace == 0 || cfg.tokenBase == 0) {
+		return errors.New(
+			"cleanup requires map-id, expected-max-entries, process-pid, process-namespace, and token-base",
+		)
+	}
+	if cfg.mode == "cleanup" && cfg.expectedProcessMapID != 0 {
+		return errors.New("expected-process-map-id is not valid in cleanup mode")
+	}
+	return nil
+}
+
 func run(cfg config) (result, error) {
+	if err := validateConfig(cfg); err != nil {
+		return result{}, err
+	}
 	target, mapID, err := openTargetMap(ebpf.MapID(cfg.mapID))
 	if err != nil {
 		return result{}, err
@@ -130,30 +170,47 @@ func run(cfg config) (result, error) {
 	if err := validateTarget(info, uint32(cfg.expectedMaxEntries)); err != nil {
 		return result{}, err
 	}
+	entryCount := info.MaxEntries + 1
 	var identity processIdentity
 	var processMapID ebpf.MapID
 	tokenBase := cfg.tokenBase
-	if cfg.mode == "fill" {
+	if cfg.mode == "prepare" || cfg.mode == "fill" {
 		processes, discoveredMapID, openErr := openProcessMap()
 		if openErr != nil {
 			return result{}, openErr
 		}
 		defer processes.Close()
+		if cfg.mode == "fill" {
+			if err := validatePreparedProcessMapID(
+				ebpf.MapID(cfg.expectedProcessMapID),
+				discoveredMapID,
+			); err != nil {
+				return result{}, err
+			}
+		}
 		identity, err = readProcessIdentity(processes)
 		if err != nil {
 			return result{}, err
 		}
 		processMapID = discoveredMapID
-		tokenBase, err = newTokenBase(uint64(cfg.seed), info.MaxEntries+1)
-		if err != nil {
+		if cfg.mode == "prepare" {
+			tokenBase, err = newTokenBase(uint64(cfg.seed), entryCount)
+			if err != nil {
+				return result{}, err
+			}
+		} else if err := validatePreparedProcessIdentity(
+			uint32(cfg.processPID),
+			uint32(cfg.processNamespace),
+			identity,
+		); err != nil {
 			return result{}, err
 		}
 	} else {
 		identity.pid = uint32(cfg.processPID)
 		identity.namespace = uint32(cfg.processNamespace)
-		if uint(identity.pid) != cfg.processPID || uint(identity.namespace) != cfg.processNamespace {
-			return result{}, errors.New("cleanup process identity exceeds 32 bits")
-		}
+	}
+	if err := validateTokenBase(tokenBase, entryCount); err != nil {
+		return result{}, err
 	}
 
 	output := result{
@@ -169,7 +226,9 @@ func run(cfg config) (result, error) {
 		ProcessNamespace: identity.namespace,
 		TokenBase:        tokenBase,
 	}
-	entryCount := info.MaxEntries + 1
+	if cfg.mode == "prepare" {
+		return output, nil
+	}
 	filledEntries := uint32(0)
 	cleanupFailedFill := func() {
 		for index := uint32(0); index < filledEntries; index++ {
@@ -203,18 +262,79 @@ func run(cfg config) (result, error) {
 	}
 
 	if cfg.mode == "fill" {
-		_, firstErr := target.LookupBytes(syntheticKey(identity, tokenBase, 0))
-		if !errors.Is(firstErr, ebpf.ErrKeyNotExist) {
+		output.EvictedEntries, err = countEvictedSyntheticEntries(
+			identity,
+			tokenBase,
+			entryCount,
+			func(key []byte) error {
+				var value [targetValueSize]byte
+				return target.Lookup(key, &value)
+			},
+		)
+		if err != nil {
 			cleanupFailedFill()
-			return result{}, fmt.Errorf("oldest synthetic entry was not evicted: %w", firstErr)
+			return result{}, err
 		}
-		if _, err := target.LookupBytes(syntheticKey(identity, tokenBase, info.MaxEntries)); err != nil {
-			cleanupFailedFill()
-			return result{}, fmt.Errorf("newest synthetic entry is missing: %w", err)
+	} else {
+		output.VerifiedAbsentEntries, err = verifySyntheticEntriesAbsent(
+			identity,
+			tokenBase,
+			entryCount,
+			func(key []byte) error {
+				var value [targetValueSize]byte
+				return target.Lookup(key, &value)
+			},
+		)
+		if err != nil {
+			return result{}, err
 		}
-		output.FirstEvicted = true
+		output.CleanupVerified = true
 	}
 	return output, nil
+}
+
+func countEvictedSyntheticEntries(
+	identity processIdentity,
+	tokenBase uint64,
+	entryCount uint32,
+	lookup func([]byte) error,
+) (uint32, error) {
+	evictedEntries := uint32(0)
+	for index := uint32(0); index < entryCount; index++ {
+		err := lookup(syntheticKey(identity, tokenBase, index))
+		switch {
+		case err == nil:
+		case errors.Is(err, ebpf.ErrKeyNotExist):
+			evictedEntries++
+		default:
+			return 0, fmt.Errorf("lookup synthetic entry %d: %w", index, err)
+		}
+	}
+	if evictedEntries == 0 {
+		return 0, errors.New("no synthetic entries were evicted")
+	}
+	return evictedEntries, nil
+}
+
+func verifySyntheticEntriesAbsent(
+	identity processIdentity,
+	tokenBase uint64,
+	entryCount uint32,
+	lookup func([]byte) error,
+) (uint32, error) {
+	absentEntries := uint32(0)
+	for index := uint32(0); index < entryCount; index++ {
+		err := lookup(syntheticKey(identity, tokenBase, index))
+		switch {
+		case errors.Is(err, ebpf.ErrKeyNotExist):
+			absentEntries++
+		case err == nil:
+			return 0, fmt.Errorf("synthetic entry %d remains after cleanup", index)
+		default:
+			return 0, fmt.Errorf("verify synthetic entry %d cleanup: %w", index, err)
+		}
+	}
+	return absentEntries, nil
 }
 
 func openProcessMap() (*ebpf.Map, ebpf.MapID, error) {
@@ -408,13 +528,45 @@ func syntheticToken(tokenBase uint64, index uint32) uint64 {
 	return tokenBase + uint64(index)
 }
 
+func validateTokenBase(tokenBase uint64, entryCount uint32) error {
+	if tokenBase == 0 || entryCount == 0 {
+		return errors.New("token-base is outside the bounded synthetic entry range")
+	}
+	lastIndex := uint64(entryCount - 1)
+	if tokenBase > ^uint64(0)-lastIndex {
+		return errors.New("token-base is outside the bounded synthetic entry range")
+	}
+	return nil
+}
+
 func newTokenBase(seed uint64, entryCount uint32) (uint64, error) {
+	if entryCount == 0 {
+		return 0, errors.New("synthetic entry count must be positive")
+	}
 	var source [8]byte
 	if _, err := rand.Read(source[:]); err != nil {
 		return 0, fmt.Errorf("generate synthetic token namespace: %w", err)
 	}
-	maximumBase := ^uint64(0) - uint64(entryCount)
+	maximumBase := ^uint64(0) - uint64(entryCount-1)
 	return (binary.LittleEndian.Uint64(source[:])^seed)%maximumBase + 1, nil
+}
+
+func validatePreparedProcessIdentity(
+	expectedPID uint32,
+	expectedNamespace uint32,
+	identity processIdentity,
+) error {
+	if identity.pid != expectedPID || identity.namespace != expectedNamespace {
+		return errors.New("prepared JVM process identity changed before fill")
+	}
+	return nil
+}
+
+func validatePreparedProcessMapID(expected, actual ebpf.MapID) error {
+	if actual != expected {
+		return errors.New("prepared JVM process map changed before fill")
+	}
+	return nil
 }
 
 func claimValue(observedMonotimeNS, incarnation uint64) []byte {

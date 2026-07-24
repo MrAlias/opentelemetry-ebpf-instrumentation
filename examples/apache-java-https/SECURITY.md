@@ -23,7 +23,7 @@ payloads.
 | oversized/repeated/flooded Unix request | bounded CPU/memory/logging | untested |
 | malformed/zero trace or span ID | discarded; Java request remains healthy | untested |
 | stale entry past TTL | miss; never a parent | untested |
-| live handoff-map pressure/eviction | proven eviction; zero wrong parents; recovered occupancy | untested |
+| live handoff-map pressure/eviction | order-independent eviction; zero wrong parents; exact-key cleanup and steady-baseline recovery | untested |
 | OBI absent or delayed | Java root span and healthy response | untested |
 | OBI restart with old endpoint/fd | no stale parent; recovery only if claimed | untested |
 | helper absent/disabled | ordinary official-agent behavior | untested |
@@ -52,11 +52,17 @@ payloads.
 - Keep a legitimate marked request pending while unauthorized consumers race,
   then require the legitimate exact parent assertion to pass.
 - Fill the discovered live handoff-claim LRU to its reported capacity plus one,
-  derive synthetic keys and fresh values from the one unambiguous live JVM
-  PID/namespace/incarnation, prove the oldest deterministic key was evicted,
-  monitor exact-map occupancy once per second throughout marked async traffic,
-  and remove only those deterministic keys afterward. Evidence never records
-  the incarnation capability.
+  after retaining its exact map and JVM cleanup identity and arming cleanup.
+  Derive synthetic keys and fresh values from the one unambiguous live JVM
+  PID/namespace/incarnation, scan every synthetic key to prove at least one
+  order-independent eviction, and monitor exact-map occupancy above its
+  pre-fill baseline once per second through the selected transport's exact
+  expected bridge-take total, retaining the terminal metric sample independently
+  of later trace polling. Remove only those deterministic keys, verify every one
+  is absent, then retain two consecutive at-or-below-baseline samples within a
+  bounded TTL-aware recovery deadline. Promote canonical cleanup evidence only
+  after that recovery gate passes. Evidence never records the incarnation
+  capability.
 - Restart only the `obi` service and preserve old descriptors long enough to
   test stale endpoint behavior.
 - Run `fd-port-reuse` to reuse one client ephemeral port across reconnects,
@@ -89,8 +95,8 @@ or credential topology; do not mark it pass.
   It refuses ambiguous matches, bounds accepted capacity, uses fresh monotonic
   timestamps, and never emits the incarnation capability. Cleanup uses the
   captured non-secret PID, namespace, and random per-run token base to
-  reconstruct only its synthetic keys, including after the JVM identity entry
-  disappears.
+  reconstruct only its synthetic keys, verifies each key is absent afterward,
+  and remains possible after the JVM identity entry disappears.
 - The Unix fault responder is an acceptance-only, single-request-at-a-time
   service with named stale/malformed, timeout, disconnect, overload,
   truncation, envelope, version, and zero-ID modes. It uses strict request ABI

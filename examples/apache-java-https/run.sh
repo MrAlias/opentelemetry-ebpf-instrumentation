@@ -8,9 +8,28 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd -P)"
 SCRIPT_NAME="$(basename -- "${BASH_SOURCE[0]}")"
 MAX_SHELL_INTEGER="9223372036854775807"
+MAX_UINT32_DECIMAL="4294967295"
+MAX_UINT64_DECIMAL="18446744073709551615"
 JAVA_DIAGNOSTIC_COUNTER_MAX="999999999"
 BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS=35
 SCENARIO_RUN_TIMEOUT_SECONDS=120
+PRESSURE_STATE_TIMEOUT_SECONDS=10
+PRESSURE_MONITOR_METRICS_TIMEOUT_SECONDS=5
+PRESSURE_MONITOR_POLL_INTERVAL_SECONDS=1
+PRESSURE_MONITOR_COMPLETION_SLACK_SECONDS=4
+PRESSURE_MONITOR_COMPLETION_TIMEOUT_SECONDS="$((
+  (PRESSURE_MONITOR_METRICS_TIMEOUT_SECONDS * 2) +
+  PRESSURE_MONITOR_POLL_INTERVAL_SECONDS +
+  PRESSURE_MONITOR_COMPLETION_SLACK_SECONDS
+))"
+# The recovery deadline covers the configured 30-second bridge TTL without delaying an earlier recovery.
+PRESSURE_ENTRY_TTL_SECONDS=30
+PRESSURE_RECOVERY_TIMEOUT_SECONDS="$((PRESSURE_ENTRY_TTL_SECONDS * 2))"
+PRESSURE_RECOVERY_CONSECUTIVE_SAMPLES=2
+PRESSURE_HELPER_TIMEOUT_SECONDS=60
+PRESSURE_CLEANUP_MAX_ATTEMPTS=3
+PRESSURE_CLEANUP_DEADLINE_SECONDS=180
+PRESSURE_MAX_ENTRIES=50000
 # Sum explicit metric, readiness, Docker, release, and final-attempt overrun bounds.
 SECURITY_PROBE_SCENARIO_BUDGET_SECONDS=232
 SECURITY_PROBE_SAME_CGROUP_FIXED_BUDGET_SECONDS=143
@@ -25,8 +44,16 @@ APACHE_HTTPS_HEALTH_ENDPOINT="http://127.0.0.1:18080/healthz?close=1"
 PRIMARY_SECURITY_PROBE_PATH="/tmp/security-probe"
 PRIMARY_SECURITY_PID_PATH="/tmp/security-probe.pid"
 UNIX_PERMISSION_REFUSAL_PATTERN="writable without the sticky bit"
-readonly SCRIPT_DIR REPO_ROOT SCRIPT_NAME MAX_SHELL_INTEGER JAVA_DIAGNOSTIC_COUNTER_MAX
+readonly SCRIPT_DIR REPO_ROOT SCRIPT_NAME MAX_SHELL_INTEGER MAX_UINT32_DECIMAL
+readonly MAX_UINT64_DECIMAL JAVA_DIAGNOSTIC_COUNTER_MAX
 readonly BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS SCENARIO_RUN_TIMEOUT_SECONDS
+readonly PRESSURE_STATE_TIMEOUT_SECONDS PRESSURE_MONITOR_METRICS_TIMEOUT_SECONDS
+readonly PRESSURE_MONITOR_POLL_INTERVAL_SECONDS PRESSURE_MONITOR_COMPLETION_SLACK_SECONDS
+readonly PRESSURE_MONITOR_COMPLETION_TIMEOUT_SECONDS
+readonly PRESSURE_ENTRY_TTL_SECONDS
+readonly PRESSURE_RECOVERY_TIMEOUT_SECONDS PRESSURE_RECOVERY_CONSECUTIVE_SAMPLES
+readonly PRESSURE_HELPER_TIMEOUT_SECONDS PRESSURE_CLEANUP_MAX_ATTEMPTS
+readonly PRESSURE_CLEANUP_DEADLINE_SECONDS PRESSURE_MAX_ENTRIES
 readonly SECURITY_PROBE_SCENARIO_BUDGET_SECONDS
 readonly SECURITY_PROBE_SAME_CGROUP_FIXED_BUDGET_SECONDS
 readonly SECURITY_PROBE_SIBLING_FIXED_BUDGET_SECONDS
@@ -80,13 +107,22 @@ RUN_STATUS="failed"
 PRESSURE_ACTIVE=false
 PRESSURE_MAP_ID=""
 PRESSURE_MAP_MAX_ENTRIES=""
+PRESSURE_MAP_BASELINE_ENTRIES=""
+PRESSURE_EVICTED_ENTRIES=""
+PRESSURE_TOUCHED_ENTRIES=""
+PRESSURE_CLEANUP_ATTEMPT=0
+PRESSURE_CLEANUP_DEADLINE=0
 PRESSURE_SEED=""
 PRESSURE_LABEL=""
+PRESSURE_PROCESS_MAP_ID=""
 PRESSURE_PROCESS_PID=""
 PRESSURE_PROCESS_NAMESPACE=""
 PRESSURE_TOKEN_BASE=""
 PRESSURE_MONITOR_PID=""
 PRESSURE_MONITOR_OUTPUT=""
+PRESSURE_MONITOR_FINAL_OUTPUT=""
+PRESSURE_MONITOR_STATUS=0
+PRESSURE_TAKE_TARGET=""
 FAULT_MODE="alternating"
 FAULT_REQUEST_COUNT=2
 SCENARIO_VARIANT=""
@@ -614,7 +650,7 @@ cleanup() {
   fi
 
   if [[ "$PRESSURE_ACTIVE" == "true" ]]; then
-    cleanup_map_pressure || true
+    cleanup_map_pressure_with_retries || true
   fi
   cleanup_security_processes
   if [[ -n "${RESULT_DIR:-}" && -d "$RESULT_DIR" ]]; then
@@ -1360,6 +1396,31 @@ bridge_success_total() {
   ' "$metrics"
 }
 
+bridge_take_attempt_total() {
+  local -r metrics="$1"
+  local -r transport="$SELECTED_TRANSPORT"
+  local metric=""
+  local labels=""
+  local raw_value=""
+  local value=""
+  local extra=""
+  local -i total=0
+
+  [[ "$transport" == "getsockopt" || "$transport" == "unix" ]] || return 1
+  while read -r metric raw_value extra; do
+    [[ "$metric" == 'obi_java_remote_parent_operations_total{'*'}' ]] || continue
+    labels=",${metric#*\{}"
+    labels="${labels%\}},"
+    [[ "$labels" == *',operation="take",'* &&
+      "$labels" == *",transport=\"$transport\","* ]] || continue
+    [[ -z "$extra" ]] || return 1
+    value="$(bounded_decimal "$raw_value" "$MAX_SHELL_INTEGER" true)" || return 1
+    ((total <= MAX_SHELL_INTEGER - value)) || return 1
+    total="$((total + value))"
+  done <"$metrics"
+  printf '%s\n' "$total"
+}
+
 bridge_stage_total() {
   local -r metrics="$1"
 
@@ -1576,85 +1637,379 @@ pressure_map_metric() {
   local -r map_id="${3:-}"
 
   awk -v wanted_metric="$metric_name" -v wanted_id="$map_id" '
-    $0 ~ ("^" wanted_metric) && $0 ~ /map_name="java_remote_par"/ {
+    $1 ~ ("^" wanted_metric "\\{") && $1 ~ /map_name="java_remote_par"/ {
       id = $1
       sub(/^.*map_id="/, "", id)
       sub(/".*$/, "", id)
       if (wanted_id == "" || id == wanted_id) {
-        printf "%s %s\n", id, $2
-        exit
+        matches++
+        selected_id = id
+        selected_value = $2
       }
     }
+    END {
+      if (matches != 1) {
+        exit 1
+      }
+      printf "%s %s\n", selected_id, selected_value
+    }
   ' "$metrics"
+}
+
+run_map_pressure_helper() {
+  local -r output="$1"
+  local -r stderr_output="$2"
+  local -r timeout_seconds="$3"
+  local command_status=0
+  local replay_status=0
+  shift 3
+
+  bounded_decimal "$timeout_seconds" "$MAX_SHELL_INTEGER" false >/dev/null || {
+    log_error "map-pressure helper timeout must be a positive integer"
+    return 2
+  }
+  if run_bounded "$timeout_seconds" \
+    "${COMPOSE[@]}" run --rm --no-deps --no-TTY map-pressure \
+      "$@" >"$output" 2>"$stderr_output"; then
+    command_status=0
+  else
+    command_status=$?
+  fi
+  if [[ -s "$stderr_output" ]]; then
+    if sed -n 'p' "$stderr_output" >&2; then
+      :
+    else
+      replay_status=$?
+    fi
+  fi
+  if [[ -s "$output" ]]; then
+    if sed -n 'p' "$output"; then
+      :
+    else
+      replay_status=$?
+    fi
+  fi
+  if ((command_status != 0)); then
+    return "$command_status"
+  fi
+  return "$replay_status"
+}
+
+pressure_result_record() {
+  local -r input="$1"
+  local -a records=()
+
+  [[ -f "$input" && ! -L "$input" ]] || return 1
+  mapfile -t records <"$input"
+  ((${#records[@]} == 1)) || return 1
+  printf '%s\n' "${records[0]}"
+}
+
+pressure_result_has_contract() {
+  local -r input="$1"
+  local -r mode="$2"
+  local -r decimal='(0|[1-9][0-9]*)'
+  local record=""
+  local pattern=""
+
+  record="$(pressure_result_record "$input")" || return 1
+  case "$mode" in
+    prepare)
+      pattern='^\{"status":"passed","mode":"prepare","map_id":'"$decimal"',"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"LRUHash","max_entries":'"$decimal"',"process_map_id":'"$decimal"',"process_pid":'"$decimal"',"process_namespace":'"$decimal"',"token_base":'"$decimal"',"touched":0\}$'
+      ;;
+    fill)
+      pattern='^\{"status":"passed","mode":"fill","map_id":'"$decimal"',"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"LRUHash","max_entries":'"$decimal"',"process_map_id":'"$decimal"',"process_pid":'"$decimal"',"process_namespace":'"$decimal"',"token_base":'"$decimal"',"touched":'"$decimal"',"evicted_entries":'"$decimal"'\}$'
+      ;;
+    cleanup)
+      pattern='^\{"status":"passed","mode":"cleanup","map_id":'"$decimal"',"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"LRUHash","max_entries":'"$decimal"',"process_map_id":0,"process_pid":'"$decimal"',"process_namespace":'"$decimal"',"token_base":'"$decimal"',"touched":'"$decimal"',"cleanup_verified":true,"verified_absent_entries":'"$decimal"'\}$'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  [[ "$record" =~ $pattern ]]
+}
+
+pressure_result_uint() {
+  local -r input="$1"
+  local -r field="$2"
+  local record=""
+  local marker=""
+  local value=""
+
+  [[ "$field" =~ ^[a-z_]+$ ]] || return 1
+  record="$(pressure_result_record "$input")" || return 1
+  marker="\"$field\":"
+  [[ "$record" == *"$marker"* ]] || return 1
+  value="${record#*"$marker"}"
+  value="${value%%,*}"
+  value="${value%\}}"
+  [[ "$value" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  printf '%s\n' "$value"
+}
+
+pressure_result_bool() {
+  local -r input="$1"
+  local -r field="$2"
+  local record=""
+  local marker=""
+  local value=""
+
+  [[ "$field" =~ ^[a-z_]+$ ]] || return 1
+  record="$(pressure_result_record "$input")" || return 1
+  marker="\"$field\":"
+  [[ "$record" == *"$marker"* ]] || return 1
+  value="${record#*"$marker"}"
+  value="${value%%,*}"
+  value="${value%\}}"
+  [[ "$value" == "true" || "$value" == "false" ]] || return 1
+  printf '%s\n' "$value"
+}
+
+pressure_result_bounded_uint() {
+  local -r input="$1"
+  local -r field="$2"
+  local -r maximum="$3"
+  local -r allow_zero="$4"
+  local value=""
+
+  value="$(pressure_result_uint "$input" "$field")" || return 1
+  bounded_decimal "$value" "$maximum" "$allow_zero"
+}
+
+record_pressure_cleanup_status() {
+  local -r output="$1"
+  local -r command_status="$2"
+  local -r validation_status="$3"
+  local -r recovery_status="$4"
+
+  {
+    printf 'command_status=%s\n' "$command_status"
+    printf 'validation_status=%s\n' "$validation_status"
+    printf 'recovery_status=%s\n' "$recovery_status"
+    printf 'monitor_status=%s\n' "${PRESSURE_MONITOR_STATUS:-0}"
+  } >"$output"
 }
 
 wait_for_pressure_map_state() {
   local -r comparison="$1"
   local -r output="$2"
+  local timeout_seconds="${3:-$PRESSURE_STATE_TIMEOUT_SECONDS}"
+  local required_matches="${4:-1}"
+  local maximum_attempts="${5:-}"
   local metrics=""
+  local metrics_timeout=""
   local resolved=""
+  local resolved_map_id=""
   local entries=""
-  local -i elapsed=0
+  local matched=false
+  local samples_log=""
+  local sample_output=""
+  local match_file=""
+  local -a match_files=()
+  local -a published_samples=()
+  local -i attempts=0
+  local -i consecutive_matches=0
+  local -i deadline=0
+  local -i index=0
 
-  metrics="$(mktemp "$RESULT_DIR/.pressure-state.XXXXXX")"
-  while ((elapsed < 10)); do
-    if fetch_obi_metrics "$metrics" 2>/dev/null; then
+  if [[ "$comparison" != "pressured" && "$comparison" != "recovered" ]]; then
+    log_error "unknown handoff-claim map state comparison: $comparison"
+    return 1
+  fi
+  timeout_seconds="$(bounded_decimal "$timeout_seconds" "$MAX_SHELL_INTEGER" false)" || {
+    log_error "handoff-claim map state bounds must be positive integers"
+    return 1
+  }
+  required_matches="$(bounded_decimal "$required_matches" "$MAX_SHELL_INTEGER" false)" || {
+    log_error "handoff-claim map state bounds must be positive integers"
+    return 1
+  }
+  if [[ -z "$maximum_attempts" ]]; then
+    if [[ "$timeout_seconds" == "$MAX_SHELL_INTEGER" ]]; then
+      maximum_attempts="$MAX_SHELL_INTEGER"
+    else
+      maximum_attempts="$((timeout_seconds + 1))"
+    fi
+  fi
+  maximum_attempts="$(bounded_decimal "$maximum_attempts" "$MAX_SHELL_INTEGER" false)" || {
+    log_error "handoff-claim map state bounds must be positive integers"
+    return 1
+  }
+  if ((required_matches > maximum_attempts)); then
+    log_error "handoff-claim map state matches must not exceed the attempt cap"
+    return 1
+  fi
+  metrics="$(mktemp "$RESULT_DIR/.pressure-state.XXXXXX")" || return 1
+  if ((required_matches > 1)); then
+    samples_log="${output%.prom}-samples.log"
+    if ! : >"$samples_log"; then
+      rm -f -- "$metrics"
+      return 1
+    fi
+  fi
+  deadline="$((SECONDS + timeout_seconds))"
+  while ((attempts < maximum_attempts && SECONDS < deadline)); do
+    ((attempts += 1))
+    resolved=""
+    resolved_map_id=""
+    entries=""
+    metrics_timeout="$(remaining_timeout_seconds "$deadline" 5)" || break
+    matched=false
+    if fetch_obi_metrics "$metrics" "$metrics_timeout" 2>/dev/null; then
       resolved="$(pressure_map_metric \
         "$metrics" \
         obi_bpf_map_entries_total \
         "$PRESSURE_MAP_ID")"
+      resolved_map_id="${resolved%% *}"
       entries="${resolved#* }"
-      if [[ "$entries" =~ ^[0-9]+$ ]]; then
-        if [[ "$comparison" == "full" ]] && ((entries >= PRESSURE_MAP_MAX_ENTRIES)); then
-          install -m 0644 "$metrics" "$output"
-          rm -f -- "$metrics"
-          return 0
-        fi
-        if [[ "$comparison" == "below-full" ]] && ((entries < PRESSURE_MAP_MAX_ENTRIES)); then
-          install -m 0644 "$metrics" "$output"
-          rm -f -- "$metrics"
-          return 0
+      if [[ "$resolved_map_id" == "$PRESSURE_MAP_ID" ]] && \
+        entries="$(bounded_decimal "$entries" "$PRESSURE_MAP_MAX_ENTRIES" true)" && \
+        ((SECONDS < deadline)); then
+        if [[ "$comparison" == "pressured" ]] &&
+          ((entries > PRESSURE_MAP_BASELINE_ENTRIES && entries <= PRESSURE_MAP_MAX_ENTRIES)); then
+          matched=true
+        elif [[ "$comparison" == "recovered" ]] &&
+          ((entries <= PRESSURE_MAP_BASELINE_ENTRIES)); then
+          matched=true
         fi
       fi
     fi
-    sleep 1
-    ((elapsed += 1))
+    if [[ "$matched" == "true" ]]; then
+      ((consecutive_matches += 1))
+      if ((required_matches > 1)); then
+        match_file="$(mktemp "$RESULT_DIR/.pressure-match.XXXXXX")" || {
+          rm -f -- "$metrics" "${match_files[@]}"
+          return 1
+        }
+        if ! install -m 0600 "$metrics" "$match_file"; then
+          rm -f -- "$metrics" "$match_file" "${match_files[@]}"
+          return 1
+        fi
+        match_files+=("$match_file")
+      fi
+    else
+      if ((${#match_files[@]} > 0)); then
+        rm -f -- "${match_files[@]}"
+        match_files=()
+      fi
+      consecutive_matches=0
+    fi
+    if [[ -n "$samples_log" ]]; then
+      if ! printf 'attempt=%d observed_at=%(%Y-%m-%dT%H:%M:%SZ)T entries=%s matched=%s consecutive=%d\n' \
+        "$attempts" \
+        -1 \
+        "${entries:-unavailable}" \
+        "$matched" \
+        "$consecutive_matches" >>"$samples_log"; then
+        rm -f -- "$metrics" "${match_files[@]}"
+        return 1
+      fi
+    fi
+    if ((consecutive_matches >= required_matches)); then
+      if ((required_matches > 1)); then
+        for ((index = 0; index < required_matches; index++)); do
+          printf -v sample_output \
+            '%s-sample-%02d.prom' "${output%.prom}" "$((index + 1))"
+          if ! install -m 0644 "${match_files[$index]}" "$sample_output"; then
+            rm -f -- "$metrics" "$output" "${match_files[@]}" "${published_samples[@]}"
+            return 1
+          fi
+          published_samples+=("$sample_output")
+        done
+        if ! install -m 0644 "${match_files[$((required_matches - 1))]}" "$output"; then
+          rm -f -- "$metrics" "$output" "${match_files[@]}" "${published_samples[@]}"
+          return 1
+        fi
+      elif ! install -m 0644 "$metrics" "$output"; then
+        rm -f -- "$metrics"
+        return 1
+      fi
+      rm -f -- "$metrics" "${match_files[@]}"
+      return 0
+    fi
+    if ((attempts < maximum_attempts && SECONDS < deadline)); then
+      sleep 1
+    fi
   done
-  rm -f -- "$metrics"
-  log_error "timed out waiting for handoff-claim map state $comparison"
+  rm -f -- "$metrics" "${match_files[@]}"
+  log_error "timed out waiting for handoff-claim map state $comparison, actual=${entries:-unavailable} baseline=${PRESSURE_MAP_BASELINE_ENTRIES:-unavailable} attempts=$attempts"
   return 1
 }
 
 monitor_map_pressure() {
   local metrics=""
   local resolved=""
+  local resolved_map_id=""
   local entries=""
+  local raw_entries=""
+  local take_total=""
 
   metrics="$(mktemp "$RESULT_DIR/.pressure-monitor.XXXXXX")"
   trap '[[ -z "${metrics:-}" ]] || rm -f -- "$metrics"; exit 0' TERM INT
   trap '[[ -z "${metrics:-}" ]] || rm -f -- "$metrics"' EXIT
   while true; do
-    if ! fetch_obi_metrics "$metrics" 2>/dev/null; then
+    if ! fetch_obi_metrics \
+      "$metrics" "$PRESSURE_MONITOR_METRICS_TIMEOUT_SECONDS" 2>/dev/null; then
       printf 'status=failed reason=metrics-unavailable\n' >>"$PRESSURE_MONITOR_OUTPUT"
       return 1
     fi
-    resolved="$(pressure_map_metric \
+    if resolved="$(pressure_map_metric \
       "$metrics" \
       obi_bpf_map_entries_total \
-      "$PRESSURE_MAP_ID")"
-    entries="${resolved#* }"
-    if [[ ! "$entries" =~ ^[0-9]+$ || "$entries" != "$PRESSURE_MAP_MAX_ENTRIES" ]]; then
-      printf 'status=failed reason=occupancy map_id=%s expected=%s actual=%s\n' \
+      "$PRESSURE_MAP_ID")"; then
+      resolved_map_id="${resolved%% *}"
+      raw_entries="${resolved#* }"
+    else
+      resolved_map_id=""
+      raw_entries=""
+    fi
+    entries="$(bounded_decimal \
+      "$raw_entries" \
+      "$PRESSURE_MAP_MAX_ENTRIES" \
+      true)" || entries=""
+    if [[ "$resolved_map_id" != "$PRESSURE_MAP_ID" || -z "$entries" ]] ||
+      ((entries <= PRESSURE_MAP_BASELINE_ENTRIES)); then
+      printf 'status=failed reason=occupancy map_id=%s baseline=%s max_entries=%s actual=%s\n' \
         "$PRESSURE_MAP_ID" \
+        "$PRESSURE_MAP_BASELINE_ENTRIES" \
         "$PRESSURE_MAP_MAX_ENTRIES" \
-        "${entries:-unavailable}" >>"$PRESSURE_MONITOR_OUTPUT"
+        "${raw_entries:-unavailable}" >>"$PRESSURE_MONITOR_OUTPUT"
       return 1
     fi
-    printf 'status=full observed_at=%(%Y-%m-%dT%H:%M:%SZ)T map_id=%s entries=%s\n' \
+    printf 'status=pressured observed_at=%(%Y-%m-%dT%H:%M:%SZ)T map_id=%s baseline=%s max_entries=%s entries=%s\n' \
       -1 \
       "$PRESSURE_MAP_ID" \
+      "$PRESSURE_MAP_BASELINE_ENTRIES" \
+      "$PRESSURE_MAP_MAX_ENTRIES" \
       "$entries" >>"$PRESSURE_MONITOR_OUTPUT"
-    sleep 1
+    take_total="$(bridge_take_attempt_total "$metrics")" || take_total=""
+    take_total="$(bounded_decimal "$take_total" "$MAX_SHELL_INTEGER" true)" || \
+      take_total=""
+    if [[ -z "$take_total" ]] || ((take_total > PRESSURE_TAKE_TARGET)); then
+      printf 'status=failed reason=traffic-count transport=%s actual=%s target=%s\n' \
+        "$SELECTED_TRANSPORT" \
+        "${take_total:-unavailable}" \
+        "$PRESSURE_TAKE_TARGET" >>"$PRESSURE_MONITOR_OUTPUT"
+      return 1
+    fi
+    if ((take_total == PRESSURE_TAKE_TARGET)); then
+      if ! install -m 0644 "$metrics" "$PRESSURE_MONITOR_FINAL_OUTPUT"; then
+        printf 'status=failed reason=terminal-evidence\n' >>"$PRESSURE_MONITOR_OUTPUT"
+        return 1
+      fi
+      printf 'status=traffic-complete observed_at=%(%Y-%m-%dT%H:%M:%SZ)T map_id=%s baseline=%s max_entries=%s entries=%s transport=%s take_total=%s target=%s\n' \
+        -1 \
+        "$PRESSURE_MAP_ID" \
+        "$PRESSURE_MAP_BASELINE_ENTRIES" \
+        "$PRESSURE_MAP_MAX_ENTRIES" \
+        "$entries" \
+        "$SELECTED_TRANSPORT" \
+        "$take_total" \
+        "$PRESSURE_TAKE_TARGET" >>"$PRESSURE_MONITOR_OUTPUT"
+      return 0
+    fi
+    sleep "$PRESSURE_MONITOR_POLL_INTERVAL_SECONDS"
   done
 }
 
@@ -1662,11 +2017,12 @@ start_map_pressure_monitor() {
   local -i elapsed=0
 
   PRESSURE_MONITOR_OUTPUT="$RESULT_DIR/map-pressure-${PRESSURE_LABEL}-monitor.log"
+  PRESSURE_MONITOR_FINAL_OUTPUT="$RESULT_DIR/map-pressure-${PRESSURE_LABEL}-traffic-complete.prom"
   : >"$PRESSURE_MONITOR_OUTPUT"
   monitor_map_pressure &
   PRESSURE_MONITOR_PID=$!
   while ((elapsed < 50)); do
-    if grep -q '^status=full ' "$PRESSURE_MONITOR_OUTPUT"; then
+    if grep -q '^status=pressured ' "$PRESSURE_MONITOR_OUTPUT"; then
       return 0
     fi
     if ! kill -0 "$PRESSURE_MONITOR_PID" 2>/dev/null; then
@@ -1681,14 +2037,29 @@ start_map_pressure_monitor() {
     ((elapsed += 1))
   done
   stop_map_pressure_monitor || true
-  log_error "handoff-claim map occupancy monitor did not record a full sample"
+  log_error "handoff-claim map occupancy monitor did not record a pressured sample"
   return 1
 }
 
 stop_map_pressure_monitor() {
   local status=0
+  local -i elapsed=0
+  local -i maximum_waits="$((PRESSURE_MONITOR_COMPLETION_TIMEOUT_SECONDS * 10))"
 
   [[ -n "$PRESSURE_MONITOR_PID" ]] || return 0
+  if kill -0 "$PRESSURE_MONITOR_PID" 2>/dev/null; then
+    while ((elapsed < maximum_waits)); do
+      if [[ -n "$PRESSURE_MONITOR_OUTPUT" ]] && \
+        grep -Eq '^status=(traffic-complete|failed) ' "$PRESSURE_MONITOR_OUTPUT"; then
+        break
+      fi
+      if ! kill -0 "$PRESSURE_MONITOR_PID" 2>/dev/null; then
+        break
+      fi
+      sleep 0.1
+      elapsed="$((elapsed + 1))"
+    done
+  fi
   if kill -0 "$PRESSURE_MONITOR_PID" 2>/dev/null; then
     kill -TERM "$PRESSURE_MONITOR_PID" 2>/dev/null || true
   fi
@@ -1703,94 +2074,471 @@ stop_map_pressure_monitor() {
     return "$status"
   fi
   if [[ -z "$PRESSURE_MONITOR_OUTPUT" ]] || \
-    ! grep -q '^status=full ' "$PRESSURE_MONITOR_OUTPUT" || \
+    ! grep -q '^status=pressured ' "$PRESSURE_MONITOR_OUTPUT" || \
+    [[ "$(grep -c '^status=traffic-complete ' "$PRESSURE_MONITOR_OUTPUT" || true)" != "1" ]] || \
+    [[ -z "$PRESSURE_MONITOR_FINAL_OUTPUT" || \
+      ! -f "$PRESSURE_MONITOR_FINAL_OUTPUT" || \
+      -L "$PRESSURE_MONITOR_FINAL_OUTPUT" ]] || \
     grep -q '^status=failed ' "$PRESSURE_MONITOR_OUTPUT"; then
-    log_error "handoff-claim map occupancy monitor did not prove continuous full occupancy"
+    log_error "handoff-claim map occupancy monitor did not prove pressure through bridge-traffic completion"
     return 1
   fi
 }
 
 start_map_pressure() {
   local -r label="$1"
+  local -r baseline_metrics="$2"
+  local -r expected_take_count="$3"
+  local prepare_output=""
+  local prepare_stderr=""
   local fill_output=""
+  local fill_stderr=""
+  local resolved=""
+  local baseline_map_id=""
+  local baseline_entries=""
+  local baseline_take_total=""
+  local prepare_map_id=""
+  local prepare_max_entries=""
+  local prepare_process_map_id=""
+  local prepare_process_pid=""
+  local prepare_process_namespace=""
+  local prepare_token_base=""
+  local fill_map_id=""
+  local fill_max_entries=""
+  local fill_process_map_id=""
+  local fill_process_pid=""
+  local fill_process_namespace=""
+  local fill_token_base=""
+  local fill_touched=""
+  local fill_evicted=""
+  local prepare_status=0
+  local fill_status=0
+  local start_status=0
+  local -i synthetic_entry_count=0
 
+  if [[ "$PRESSURE_ACTIVE" == "true" ]]; then
+    log_error "refusing to start map pressure while a prior cleanup is pending"
+    return 1
+  fi
   PRESSURE_LABEL="$label"
   PRESSURE_SEED="$SCENARIO_SEED"
   PRESSURE_ACTIVE=false
-  fill_output="$RESULT_DIR/map-pressure-$label-fill.json"
-  run_bounded 60 \
-    "${COMPOSE[@]}" run --rm --no-deps --no-TTY map-pressure \
-      --seed "$PRESSURE_SEED" \
-      --mode fill | tee "$fill_output"
-  PRESSURE_MAP_ID="$(sed -n -E 's/.*"map_id":([0-9]+).*/\1/p' "$fill_output")"
-  PRESSURE_MAP_MAX_ENTRIES="$(sed -n -E 's/.*"max_entries":([0-9]+).*/\1/p' "$fill_output")"
-  PRESSURE_PROCESS_PID="$(sed -n -E 's/.*"process_pid":([0-9]+).*/\1/p' "$fill_output")"
-  PRESSURE_PROCESS_NAMESPACE="$(sed -n -E 's/.*"process_namespace":([0-9]+).*/\1/p' "$fill_output")"
-  PRESSURE_TOKEN_BASE="$(sed -n -E 's/.*"token_base":([0-9]+).*/\1/p' "$fill_output")"
-  [[ "$PRESSURE_MAP_ID" =~ ^[1-9][0-9]*$ && \
-    "$PRESSURE_MAP_MAX_ENTRIES" =~ ^[1-9][0-9]*$ && \
-    "$PRESSURE_PROCESS_PID" =~ ^[1-9][0-9]*$ && \
-    "$PRESSURE_PROCESS_NAMESPACE" =~ ^[1-9][0-9]*$ && \
-    "$PRESSURE_TOKEN_BASE" =~ ^[1-9][0-9]*$ ]] || {
-    log_error "map-pressure helper omitted live map, capacity, or JVM identity metadata"
+  PRESSURE_MAP_ID=""
+  PRESSURE_MAP_MAX_ENTRIES=""
+  PRESSURE_MAP_BASELINE_ENTRIES=""
+  PRESSURE_EVICTED_ENTRIES=""
+  PRESSURE_TOUCHED_ENTRIES=""
+  PRESSURE_CLEANUP_ATTEMPT=0
+  PRESSURE_CLEANUP_DEADLINE=0
+  PRESSURE_PROCESS_MAP_ID=""
+  PRESSURE_PROCESS_PID=""
+  PRESSURE_PROCESS_NAMESPACE=""
+  PRESSURE_TOKEN_BASE=""
+  PRESSURE_MONITOR_PID=""
+  PRESSURE_MONITOR_OUTPUT=""
+  PRESSURE_MONITOR_FINAL_OUTPUT=""
+  PRESSURE_MONITOR_STATUS=0
+  PRESSURE_TAKE_TARGET=""
+  prepare_output="$RESULT_DIR/map-pressure-$label-prepare.json"
+  prepare_stderr="$RESULT_DIR/map-pressure-$label-prepare.stderr.log"
+  if run_map_pressure_helper \
+    "$prepare_output" \
+    "$prepare_stderr" \
+    "$PRESSURE_HELPER_TIMEOUT_SECONDS" \
+    --seed "$PRESSURE_SEED" \
+    --mode prepare; then
+    prepare_status=0
+  else
+    prepare_status=$?
+  fi
+  if ((prepare_status != 0)); then
+    return "$prepare_status"
+  fi
+  if ! pressure_result_has_contract "$prepare_output" prepare; then
+    log_error "map-pressure prepare output does not match the exact evidence contract"
+    return 1
+  fi
+  prepare_map_id="$(pressure_result_bounded_uint \
+    "$prepare_output" map_id "$MAX_UINT32_DECIMAL" false)" || {
+    log_error "map-pressure prepare returned an invalid map ID"
     return 1
   }
+  prepare_max_entries="$(pressure_result_bounded_uint \
+    "$prepare_output" max_entries "$PRESSURE_MAX_ENTRIES" false)" || {
+    log_error "map-pressure prepare returned an invalid map capacity"
+    return 1
+  }
+  prepare_process_map_id="$(pressure_result_bounded_uint \
+    "$prepare_output" process_map_id "$MAX_UINT32_DECIMAL" false)" || {
+    log_error "map-pressure prepare returned an invalid process-map ID"
+    return 1
+  }
+  prepare_process_pid="$(pressure_result_bounded_uint \
+    "$prepare_output" process_pid "$MAX_UINT32_DECIMAL" false)" || {
+    log_error "map-pressure prepare returned an invalid process ID"
+    return 1
+  }
+  prepare_process_namespace="$(pressure_result_bounded_uint \
+    "$prepare_output" process_namespace "$MAX_UINT32_DECIMAL" false)" || {
+    log_error "map-pressure prepare returned an invalid process namespace"
+    return 1
+  }
+  prepare_token_base="$(pressure_result_bounded_uint \
+    "$prepare_output" token_base "$MAX_UINT64_DECIMAL" false)" || {
+    log_error "map-pressure prepare returned an invalid token base"
+    return 1
+  }
+
+  resolved="$(pressure_map_metric \
+    "$baseline_metrics" \
+    obi_bpf_map_entries_total \
+    "$prepare_map_id")"
+  baseline_map_id="${resolved%% *}"
+  baseline_entries="${resolved#* }"
+  if [[ "$baseline_map_id" != "$prepare_map_id" ]] || \
+    ! baseline_entries="$(bounded_decimal \
+      "$baseline_entries" \
+      "$((prepare_max_entries - 1))" \
+      true)"; then
+    log_error "pre-fill handoff-claim occupancy is unavailable or not below capacity"
+    return 1
+  fi
+  baseline_take_total="$(bridge_take_attempt_total "$baseline_metrics")" || {
+    log_error "pre-fill bridge take count is unavailable"
+    return 1
+  }
+  baseline_take_total="$(bounded_decimal \
+    "$baseline_take_total" "$MAX_SHELL_INTEGER" true)" || {
+    log_error "pre-fill bridge take count is invalid"
+    return 1
+  }
+  if ! bounded_decimal \
+    "$expected_take_count" "$MAX_SHELL_INTEGER" false >/dev/null || \
+    ((baseline_take_total > MAX_SHELL_INTEGER - expected_take_count)); then
+    log_error "pressure bridge take target is outside the bounded counter range"
+    return 1
+  fi
+
+  PRESSURE_MAP_ID="$prepare_map_id"
+  PRESSURE_MAP_MAX_ENTRIES="$prepare_max_entries"
+  PRESSURE_MAP_BASELINE_ENTRIES="$baseline_entries"
+  PRESSURE_PROCESS_MAP_ID="$prepare_process_map_id"
+  PRESSURE_PROCESS_PID="$prepare_process_pid"
+  PRESSURE_PROCESS_NAMESPACE="$prepare_process_namespace"
+  PRESSURE_TOKEN_BASE="$prepare_token_base"
+  PRESSURE_TAKE_TARGET="$((baseline_take_total + expected_take_count))"
   PRESSURE_ACTIVE=true
-  wait_for_pressure_map_state \
-    full \
-    "$RESULT_DIR/map-pressure-$label-saturated.prom" && \
-    start_map_pressure_monitor
+
+  fill_output="$RESULT_DIR/map-pressure-$label-fill.json"
+  fill_stderr="$RESULT_DIR/map-pressure-$label-fill.stderr.log"
+  if run_map_pressure_helper \
+    "$fill_output" \
+    "$fill_stderr" \
+    "$PRESSURE_HELPER_TIMEOUT_SECONDS" \
+    --map-id "$PRESSURE_MAP_ID" \
+    --expected-max-entries "$PRESSURE_MAP_MAX_ENTRIES" \
+    --expected-process-map-id "$PRESSURE_PROCESS_MAP_ID" \
+    --process-pid "$PRESSURE_PROCESS_PID" \
+    --process-namespace "$PRESSURE_PROCESS_NAMESPACE" \
+    --token-base "$PRESSURE_TOKEN_BASE" \
+    --seed "$PRESSURE_SEED" \
+    --mode fill; then
+    fill_status=0
+  else
+    fill_status=$?
+  fi
+  if ((fill_status != 0)); then
+    cleanup_map_pressure_with_retries || true
+    return "$fill_status"
+  fi
+  if ! pressure_result_has_contract "$fill_output" fill; then
+    log_error "map-pressure fill output does not match the exact evidence contract"
+    cleanup_map_pressure_with_retries || true
+    return 1
+  fi
+  fill_map_id="$(pressure_result_bounded_uint \
+    "$fill_output" map_id "$MAX_UINT32_DECIMAL" false)" || fill_map_id=""
+  fill_max_entries="$(pressure_result_bounded_uint \
+    "$fill_output" max_entries "$PRESSURE_MAX_ENTRIES" false)" || fill_max_entries=""
+  fill_process_map_id="$(pressure_result_bounded_uint \
+    "$fill_output" process_map_id "$MAX_UINT32_DECIMAL" false)" || fill_process_map_id=""
+  fill_process_pid="$(pressure_result_bounded_uint \
+    "$fill_output" process_pid "$MAX_UINT32_DECIMAL" false)" || fill_process_pid=""
+  fill_process_namespace="$(pressure_result_bounded_uint \
+    "$fill_output" process_namespace "$MAX_UINT32_DECIMAL" false)" || \
+    fill_process_namespace=""
+  fill_token_base="$(pressure_result_bounded_uint \
+    "$fill_output" token_base "$MAX_UINT64_DECIMAL" false)" || fill_token_base=""
+  fill_touched="$(pressure_result_bounded_uint \
+    "$fill_output" touched "$((PRESSURE_MAX_ENTRIES + 1))" false)" || fill_touched=""
+  fill_evicted="$(pressure_result_bounded_uint \
+    "$fill_output" evicted_entries "$((PRESSURE_MAX_ENTRIES + 1))" false)" || \
+    fill_evicted=""
+  synthetic_entry_count="$((PRESSURE_MAP_MAX_ENTRIES + 1))"
+  if [[ "$fill_map_id" != "$PRESSURE_MAP_ID" || \
+    "$fill_max_entries" != "$PRESSURE_MAP_MAX_ENTRIES" || \
+    "$fill_process_map_id" != "$PRESSURE_PROCESS_MAP_ID" || \
+    "$fill_process_pid" != "$PRESSURE_PROCESS_PID" || \
+    "$fill_process_namespace" != "$PRESSURE_PROCESS_NAMESPACE" || \
+    "$fill_token_base" != "$PRESSURE_TOKEN_BASE" || \
+    "$fill_touched" != "$synthetic_entry_count" || \
+    -z "$fill_evicted" ]] || ((fill_evicted >= fill_touched)); then
+    log_error "map-pressure fill did not echo its prepared identity or prove order-independent eviction"
+    cleanup_map_pressure_with_retries || true
+    return 1
+  fi
+  PRESSURE_TOUCHED_ENTRIES="$fill_touched"
+  PRESSURE_EVICTED_ENTRIES="$fill_evicted"
+  log_info "map pressure armed map_id=$PRESSURE_MAP_ID baseline=$PRESSURE_MAP_BASELINE_ENTRIES max_entries=$PRESSURE_MAP_MAX_ENTRIES touched=$PRESSURE_TOUCHED_ENTRIES evicted=$PRESSURE_EVICTED_ENTRIES"
+
+  if wait_for_pressure_map_state \
+    pressured \
+    "$RESULT_DIR/map-pressure-$label-pressured.prom" \
+    "$PRESSURE_STATE_TIMEOUT_SECONDS" \
+    1; then
+    start_status=0
+  else
+    start_status=$?
+    cleanup_map_pressure_with_retries || true
+    return "$start_status"
+  fi
+  if start_map_pressure_monitor; then
+    return 0
+  else
+    start_status=$?
+  fi
+  cleanup_map_pressure_with_retries || true
+  return "$start_status"
+}
+
+cleanup_map_pressure_with_retries() {
+  local cleanup_status=1
+
+  [[ "$PRESSURE_ACTIVE" == "true" ]] || return 0
+  while [[ "$PRESSURE_ACTIVE" == "true" ]] && \
+    ((PRESSURE_CLEANUP_ATTEMPT < PRESSURE_CLEANUP_MAX_ATTEMPTS)); do
+    if cleanup_map_pressure; then
+      return 0
+    else
+      cleanup_status=$?
+    fi
+    if [[ "$PRESSURE_ACTIVE" != "true" ]] || \
+      ((PRESSURE_CLEANUP_DEADLINE > 0 && SECONDS >= PRESSURE_CLEANUP_DEADLINE)); then
+      break
+    fi
+  done
+  return "$cleanup_status"
 }
 
 cleanup_map_pressure() {
   local cleanup_output=""
+  local cleanup_stderr=""
+  local cleanup_status_output=""
+  local cleanup_prefix=""
+  local cleanup_tag=""
+  local canonical_cleanup_output=""
+  local canonical_cleanup_stderr=""
+  local cleanup_map_id=""
+  local cleanup_max_entries=""
+  local cleanup_process_map_id=""
+  local cleanup_process_pid=""
+  local cleanup_process_namespace=""
+  local cleanup_token_base=""
+  local cleanup_touched=""
+  local cleanup_verified=""
+  local verified_absent=""
+  local helper_timeout=""
+  local recovery_timeout=""
+  local attempt_recovery_output=""
+  local canonical_recovery_output=""
+  local recovery_sample_source=""
+  local recovery_sample_output=""
+  local recovery_samples_log=""
+  local canonical_samples_log=""
+  local -a published_recovery=()
   local monitor_status=0
+  local command_status=0
   local cleanup_status=0
-  local -a map_arguments=()
+  local validation_status="not-run"
+  local recovery_status="not-run"
+  local -i synthetic_entry_count=0
+  local -i recovery_index=0
 
   [[ "$PRESSURE_ACTIVE" == "true" ]] || return 0
-  if stop_map_pressure_monitor; then
-    monitor_status=0
-  else
-    monitor_status=$?
-  fi
-  cleanup_output="$RESULT_DIR/map-pressure-${PRESSURE_LABEL:-exit}-cleanup.json"
-  if [[ -n "$PRESSURE_MAP_ID" && -n "$PRESSURE_MAP_MAX_ENTRIES" ]]; then
-    map_arguments=(
-      --map-id "$PRESSURE_MAP_ID"
-      --expected-max-entries "$PRESSURE_MAP_MAX_ENTRIES"
-      --process-pid "$PRESSURE_PROCESS_PID"
-      --process-namespace "$PRESSURE_PROCESS_NAMESPACE"
-      --token-base "$PRESSURE_TOKEN_BASE"
-    )
-  fi
-  if run_bounded 60 \
-    "${COMPOSE[@]}" run --rm --no-deps --no-TTY map-pressure \
-      "${map_arguments[@]}" \
-      --seed "$PRESSURE_SEED" \
-      --mode cleanup | tee "$cleanup_output"; then
-    cleanup_status=0
-  else
-    cleanup_status=$?
-  fi
-  if ((cleanup_status == 0)) && \
-    [[ -n "$PRESSURE_MAP_ID" && -n "$PRESSURE_MAP_MAX_ENTRIES" ]]; then
-    if wait_for_pressure_map_state \
-      below-full \
-      "$RESULT_DIR/map-pressure-${PRESSURE_LABEL:-exit}-recovered.prom"; then
-      cleanup_status=0
+  if [[ -n "$PRESSURE_MONITOR_PID" ]]; then
+    if stop_map_pressure_monitor; then
+      :
     else
-      cleanup_status=$?
+      monitor_status=$?
+      if ((PRESSURE_MONITOR_STATUS == 0)); then
+        PRESSURE_MONITOR_STATUS="$monitor_status"
+      fi
     fi
   fi
-  if ((cleanup_status == 0)); then
-    PRESSURE_ACTIVE=false
+  if ((PRESSURE_CLEANUP_DEADLINE == 0)); then
+    PRESSURE_CLEANUP_DEADLINE="$((SECONDS + PRESSURE_CLEANUP_DEADLINE_SECONDS))"
   fi
-  if ((monitor_status != 0)); then
-    return "$monitor_status"
+  if ((PRESSURE_CLEANUP_ATTEMPT >= PRESSURE_CLEANUP_MAX_ATTEMPTS)); then
+    log_error "map-pressure cleanup exhausted its bounded attempt count"
+    return 1
+  fi
+  helper_timeout="$(remaining_timeout_seconds \
+    "$PRESSURE_CLEANUP_DEADLINE" \
+    "$PRESSURE_HELPER_TIMEOUT_SECONDS")" || {
+    log_error "map-pressure cleanup exceeded its bounded deadline"
+    return 1
+  }
+  ((PRESSURE_CLEANUP_ATTEMPT += 1))
+  printf -v cleanup_tag '%02d' "$PRESSURE_CLEANUP_ATTEMPT"
+  cleanup_prefix="$RESULT_DIR/map-pressure-${PRESSURE_LABEL:-exit}-cleanup-attempt-$cleanup_tag"
+  cleanup_output="$cleanup_prefix.json"
+  cleanup_stderr="$cleanup_prefix.stderr.log"
+  cleanup_status_output="$cleanup_prefix.status"
+
+  if run_map_pressure_helper \
+    "$cleanup_output" \
+    "$cleanup_stderr" \
+    "$helper_timeout" \
+    --map-id "$PRESSURE_MAP_ID" \
+    --expected-max-entries "$PRESSURE_MAP_MAX_ENTRIES" \
+    --process-pid "$PRESSURE_PROCESS_PID" \
+    --process-namespace "$PRESSURE_PROCESS_NAMESPACE" \
+    --token-base "$PRESSURE_TOKEN_BASE" \
+    --seed "$PRESSURE_SEED" \
+    --mode cleanup; then
+    command_status=0
+  else
+    command_status=$?
+  fi
+  if ((command_status != 0)); then
+    record_pressure_cleanup_status \
+      "$cleanup_status_output" "$command_status" "$validation_status" "$recovery_status" || true
+    return "$command_status"
+  fi
+  if ! pressure_result_has_contract "$cleanup_output" cleanup; then
+    validation_status=failed
+  else
+    cleanup_map_id="$(pressure_result_bounded_uint \
+      "$cleanup_output" map_id "$MAX_UINT32_DECIMAL" false)" || cleanup_map_id=""
+    cleanup_max_entries="$(pressure_result_bounded_uint \
+      "$cleanup_output" max_entries "$PRESSURE_MAX_ENTRIES" false)" || \
+      cleanup_max_entries=""
+    cleanup_process_map_id="$(pressure_result_bounded_uint \
+      "$cleanup_output" process_map_id "$MAX_UINT32_DECIMAL" true)" || \
+      cleanup_process_map_id=""
+    cleanup_process_pid="$(pressure_result_bounded_uint \
+      "$cleanup_output" process_pid "$MAX_UINT32_DECIMAL" false)" || \
+      cleanup_process_pid=""
+    cleanup_process_namespace="$(pressure_result_bounded_uint \
+      "$cleanup_output" process_namespace "$MAX_UINT32_DECIMAL" false)" || \
+      cleanup_process_namespace=""
+    cleanup_token_base="$(pressure_result_bounded_uint \
+      "$cleanup_output" token_base "$MAX_UINT64_DECIMAL" false)" || \
+      cleanup_token_base=""
+    cleanup_touched="$(pressure_result_bounded_uint \
+      "$cleanup_output" touched "$((PRESSURE_MAX_ENTRIES + 1))" true)" || \
+      cleanup_touched=""
+    cleanup_verified="$(pressure_result_bool \
+      "$cleanup_output" cleanup_verified)" || cleanup_verified=""
+    verified_absent="$(pressure_result_bounded_uint \
+      "$cleanup_output" verified_absent_entries "$((PRESSURE_MAX_ENTRIES + 1))" false)" || \
+      verified_absent=""
+    synthetic_entry_count="$((PRESSURE_MAP_MAX_ENTRIES + 1))"
+    if [[ "$cleanup_map_id" == "$PRESSURE_MAP_ID" && \
+      "$cleanup_max_entries" == "$PRESSURE_MAP_MAX_ENTRIES" && \
+      "$cleanup_process_map_id" == "0" && \
+      "$cleanup_process_pid" == "$PRESSURE_PROCESS_PID" && \
+      "$cleanup_process_namespace" == "$PRESSURE_PROCESS_NAMESPACE" && \
+      "$cleanup_token_base" == "$PRESSURE_TOKEN_BASE" && \
+      -n "$cleanup_touched" && \
+      "$cleanup_verified" == "true" && \
+      "$verified_absent" == "$synthetic_entry_count" ]] && \
+      ((cleanup_touched <= synthetic_entry_count)); then
+      validation_status=passed
+    else
+      validation_status=failed
+    fi
+  fi
+  if [[ "$validation_status" != "passed" ]]; then
+    log_error "map-pressure cleanup did not echo its prepared identity and verify every synthetic key absent"
+    record_pressure_cleanup_status \
+      "$cleanup_status_output" "$command_status" "$validation_status" "$recovery_status" || true
+    return 1
+  fi
+  canonical_cleanup_output="$RESULT_DIR/map-pressure-${PRESSURE_LABEL:-exit}-cleanup.json"
+  canonical_cleanup_stderr="$RESULT_DIR/map-pressure-${PRESSURE_LABEL:-exit}-cleanup.stderr.log"
+  recovery_timeout="$(remaining_timeout_seconds \
+    "$PRESSURE_CLEANUP_DEADLINE" \
+    "$PRESSURE_RECOVERY_TIMEOUT_SECONDS")" || {
+    record_pressure_cleanup_status \
+      "$cleanup_status_output" "$command_status" "$validation_status" failed || true
+    return 1
+  }
+  attempt_recovery_output="$cleanup_prefix-recovered.prom"
+  if wait_for_pressure_map_state \
+    recovered \
+    "$attempt_recovery_output" \
+    "$recovery_timeout" \
+    "$PRESSURE_RECOVERY_CONSECUTIVE_SAMPLES" \
+    "$((recovery_timeout + 1))"; then
+    recovery_status=passed
+  else
+    cleanup_status=$?
+    recovery_status=failed
+  fi
+  if [[ "$recovery_status" == "passed" ]]; then
+    canonical_recovery_output="$RESULT_DIR/map-pressure-${PRESSURE_LABEL:-exit}-recovered.prom"
+    for ((recovery_index = 1; \
+      recovery_index <= PRESSURE_RECOVERY_CONSECUTIVE_SAMPLES; \
+      recovery_index++)); do
+      printf -v recovery_sample_source \
+        '%s-sample-%02d.prom' "${attempt_recovery_output%.prom}" "$recovery_index"
+      printf -v recovery_sample_output \
+        '%s-sample-%02d.prom' "${canonical_recovery_output%.prom}" "$recovery_index"
+      published_recovery+=("$recovery_sample_output")
+      if ! install -m 0644 "$recovery_sample_source" "$recovery_sample_output"; then
+        recovery_status=failed
+        cleanup_status=1
+        break
+      fi
+    done
+    recovery_samples_log="${attempt_recovery_output%.prom}-samples.log"
+    canonical_samples_log="${canonical_recovery_output%.prom}-samples.log"
+    if [[ "$recovery_status" == "passed" ]] && \
+      ! install -m 0644 "$attempt_recovery_output" "$canonical_recovery_output"; then
+      recovery_status=failed
+      cleanup_status=1
+    fi
+    if [[ "$recovery_status" == "passed" ]] && \
+      ! install -m 0644 "$recovery_samples_log" "$canonical_samples_log"; then
+      recovery_status=failed
+      cleanup_status=1
+    fi
+    if [[ "$recovery_status" == "passed" ]] && \
+      { ! install -m 0644 "$cleanup_output" "$canonical_cleanup_output" || \
+        ! install -m 0644 "$cleanup_stderr" "$canonical_cleanup_stderr"; }; then
+      validation_status=failed
+      cleanup_status=1
+    fi
+    if [[ "$recovery_status" != "passed" || "$validation_status" != "passed" ]]; then
+      rm -f -- \
+        "$canonical_cleanup_output" \
+        "$canonical_cleanup_stderr" \
+        "$canonical_recovery_output" \
+        "$canonical_samples_log" \
+        "${published_recovery[@]}"
+    fi
   fi
   if ((cleanup_status != 0)); then
+    record_pressure_cleanup_status \
+      "$cleanup_status_output" "$command_status" "$validation_status" "$recovery_status" || true
     return "$cleanup_status"
+  fi
+  PRESSURE_ACTIVE=false
+  record_pressure_cleanup_status \
+    "$cleanup_status_output" "$command_status" "$validation_status" "$recovery_status" || return 1
+  if ((PRESSURE_MONITOR_STATUS != 0)); then
+    return "$PRESSURE_MONITOR_STATUS"
   fi
 }
 
@@ -1889,8 +2637,11 @@ run_scenario() {
         "$RESULT_DIR/phases/$before_phase/obi-metrics.prom")"
     fi
     if [[ "$name" == "pressure" ]]; then
-      if start_map_pressure "$label"; then
-        capture_phase_evidence "$label-saturated"
+      if start_map_pressure \
+        "$label" \
+        "$RESULT_DIR/phases/$before_phase/obi-metrics.prom" \
+        "$expected_requests"; then
+        capture_phase_evidence "$label-pressured"
       else
         scenario_status=$?
       fi
@@ -1909,7 +2660,7 @@ run_scenario() {
       fi
     fi
     if [[ "$name" == "pressure" && "$PRESSURE_ACTIVE" == "true" ]]; then
-      if ! cleanup_map_pressure; then
+      if ! cleanup_map_pressure_with_retries; then
         metric_status=1
       fi
     fi

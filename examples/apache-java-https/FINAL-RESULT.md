@@ -34,7 +34,7 @@ link that bundle or its sanitized CI artifact.
 | Java 21 virtual-thread handoff | untested | mixed/canceled workloads and distinct exact parents |
 | Netty event-loop to worker handoff | untested | real event-loop/cancellation headers and exact parents |
 | Repeated servlet async redispatch | untested | invocation-count headers, one Java server span, and one bridge take |
-| Live handoff-map pressure | untested | exact map/JVM identity, fresh values, proven eviction, continuous full-occupancy samples, exact parents, recovery |
+| Live handoff-map pressure | untested | exact map/JVM identity, fresh values, scanned order-independent eviction, above-baseline samples through independently counted bridge-traffic completion, exact parents, verified synthetic cleanup, steady-baseline recovery |
 | OBI absent at JVM start and late attach | untested | root/W3C behavior while absent, helper-ready log after OBI starts, exact-parent recovery without JVM restart |
 | Bridge-disabled control | untested | official agent/extension present, HTTP success, one Java root |
 | Extension absent and disabled controls | untested | official agent retained, exact W3C parent, healthy response in both topologies |

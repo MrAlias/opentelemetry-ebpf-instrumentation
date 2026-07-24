@@ -190,7 +190,8 @@ The default `all` suite runs, in order:
   Netty TLS fixture, reached from exact-parented Apache-to-Java requests and
   validated under the selected TLS 1.2 or TLS 1.3 backend protocol;
 - a canceled request followed by a successful retry;
-- live handoff-claim LRU saturation and eviction during concurrent traffic;
+- order-independent handoff-claim LRU eviction under sustained concurrent
+  pressure;
 - servlet async and executor handoff across varied hop counts, cancellation,
   rejection, and timeout paths;
 - Java 21 virtual-thread migration, mixed execution, and cancellation paths;
@@ -347,9 +348,14 @@ Every run retains a timestamped directory under `.runtime/results/` with:
 - before/after OBI metrics, Java bridge diagnostics, scoped container
   CPU/memory/PID samples, process RSS/thread/fd counts, and reason-coded metric
   deltas for every scenario repetition;
-- live pressure-helper output naming the exact BPF map ID, capacity, and
-  non-secret JVM PID/namespace identity, plus once-per-second full-occupancy
-  monitoring throughout traffic and saturated/recovered samples;
+- live pressure-helper output naming the exact BPF map ID, capacity, non-secret
+  JVM PID/namespace identity, complete fill count, and scanned eviction count;
+  a read-only preparation record retained before mutation; once-per-second
+  above-prefill-baseline monitoring through an independently counted exact
+  bridge-take completion boundary and its terminal metric sample; exact
+  synthetic-key cleanup verification; and both samples from the final
+  steady-recovery gate, with canonical cleanup/recovery evidence promoted only
+  when the complete gate passes;
 - per-mode runtime assertions for the official-agent/extension/OBI topology
   and the Java-service duplicate-suppression metric;
 - final receiver snapshot, Compose state, and component logs.

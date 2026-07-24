@@ -56,16 +56,23 @@ count, repetitions, and seed for every mode:
 Repeat with `--transport unix`; use the full `all` suite for the disabled,
 uninstrumented, W3C/no-state, miss, timeout, async-handoff, redispatch,
 virtual-thread, Netty, and restart controls. The pressure helper discovers the
-live handoff-claim LRU, fills its reported capacity plus one, proves eviction,
-uses fresh monotonic claim values tied to the one unambiguous live JVM
-incarnation, and checks the exact map remains full once per second during 128
-concurrent marked handoff requests. It stops and reaps that monitor before
-removing only the deterministic keys reconstructed from the captured PID,
-namespace, and non-secret per-run token base, then waits for below-full
-occupancy. The incarnation capability is never written to evidence. For a
-production-style sustained benchmark, keep the stack with `--keep` and add a
-fixed-duration external load generator; do not compare that result directly
-with the bounded runner.
+live handoff-claim LRU and records the exact map and JVM cleanup identity before
+mutation. It then arms cleanup, fills the reported capacity plus one, scans all
+synthetic keys to prove order-independent eviction, and uses fresh monotonic
+claim values tied to the one unambiguous live JVM incarnation. During 128
+concurrent marked handoff requests it checks once per second that exact-map
+occupancy remains above the pre-fill baseline without requiring exact capacity.
+The monitor retains an independent terminal sample and stops when the selected
+transport's exact expected bridge-take total proves that request traffic, rather
+than later trace polling, is complete. It is reaped before removing only the
+deterministic keys reconstructed from the captured PID, namespace, and
+non-secret per-run token base, verifies every synthetic key is absent, then
+retains two consecutive at-or-below-baseline samples within a bounded TTL-aware
+recovery deadline. Canonical cleanup evidence is promoted only after that
+recovery gate passes. The incarnation capability is never written to evidence.
+For a production-style sustained benchmark, keep the stack with `--keep` and
+add a fixed-duration external load generator; do not compare that result
+directly with the bounded runner.
 
 Record at minimum:
 

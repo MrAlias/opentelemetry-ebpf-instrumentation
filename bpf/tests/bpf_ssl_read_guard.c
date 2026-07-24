@@ -81,6 +81,8 @@ static int test_ssl_conn_available;
 static int test_ssl_conn_update_error;
 static u64 test_ssl_ptr;
 static ssl_pid_key_t test_updated_ssl_key;
+static ssl_pid_key_t test_deleted_ssl_key;
+static ssl_pid_key_t test_deleted_ssl_owner_key;
 static pid_connection_info_t test_active_ssl_connection;
 static u64 test_active_ssl_ptr;
 static int test_active_ssl_available;
@@ -119,6 +121,17 @@ static void assert_int_eq(int expected, int actual, const char *message) {
 static void assert_u16_eq(u16 expected, u16 actual, const char *message) {
     if (expected != actual) {
         fprintf(stderr, "FAIL: %s\n  expected %u, got %u\n", message, expected, actual);
+        exit(1);
+    }
+}
+
+static void assert_u64_eq(u64 expected, u64 actual, const char *message) {
+    if (expected != actual) {
+        fprintf(stderr,
+                "FAIL: %s\n  expected %llu, got %llu\n",
+                message,
+                (unsigned long long)expected,
+                (unsigned long long)actual);
         exit(1);
     }
 }
@@ -172,7 +185,7 @@ static void *test_map_lookup(void *map, const void *key) {
     if (map == &ssl_to_conn) {
         const ssl_pid_key_t *ssl_key = key;
         if (test_ssl_conn_available && ssl_key->ssl == test_ssl_ptr &&
-            ssl_key->pid == test_ssl_conn.p_conn.pid) {
+            ssl_key->pid == test_ssl_conn.p_conn.pid && ssl_key->process_start_time == 77) {
             return &test_ssl_conn;
         }
         return NULL;
@@ -190,7 +203,7 @@ static void *test_map_lookup(void *map, const void *key) {
     if (map == &ssl_to_pid_tid) {
         const ssl_pid_key_t *ssl_key = key;
         if (test_mapped_pid_tid_available && ssl_key->ssl == test_ssl_ptr &&
-            ssl_key->pid == (u32)(test_mapped_pid_tid >> 32)) {
+            ssl_key->pid == (u32)(test_mapped_pid_tid >> 32) && ssl_key->process_start_time == 77) {
             test_ssl_owner = (ssl_thread_key_t){
                 .pid_tgid = test_mapped_pid_tid,
                 .thread_start_time = 88,
@@ -234,12 +247,12 @@ static long test_map_update(void *map, const void *key, const void *val, unsigne
 }
 
 static long test_map_delete(void *map, const void *key) {
-    (void)key;
-
     if (map == &ssl_to_pid_tid) {
         ssl_pid_tid_delete_count++;
+        __builtin_memcpy(&test_deleted_ssl_owner_key, key, sizeof(test_deleted_ssl_owner_key));
     } else if (map == &ssl_to_conn) {
         ssl_to_conn_delete_count++;
+        __builtin_memcpy(&test_deleted_ssl_key, key, sizeof(test_deleted_ssl_key));
         test_ssl_conn_available = 0;
     } else if (map == &active_ssl_connections) {
         active_ssl_delete_count++;
@@ -306,6 +319,8 @@ static void reset(void) {
     test_ssl_conn_update_error = 0;
     test_ssl_ptr = 0x1234;
     test_updated_ssl_key = (ssl_pid_key_t){};
+    test_deleted_ssl_key = (ssl_pid_key_t){};
+    test_deleted_ssl_owner_key = (ssl_pid_key_t){};
     test_active_ssl_connection = (pid_connection_info_t){};
     test_active_ssl_ptr = 0;
     test_active_ssl_available = 0;
@@ -856,6 +871,129 @@ static void test_promoted_connection_is_cleaned_before_pointer_reuse(void) {
     assert_u16_eq(9443, test_last_orig_dport, "reused pointer uses the new connection");
 }
 
+static void test_ssl_reallocation_promotes_fresh_thread_connection(void) {
+    reset();
+    seed_existing_ssl_connection(443);
+    test_ssl_conn.p_conn.conn = (connection_info_t){.s_port = 49152, .d_port = 443};
+    test_active_ssl_connection = test_ssl_conn.p_conn;
+    test_mapped_pid_tid = 0x2a00000001ULL;
+    test_mapped_pid_tid_available = 1;
+    test_pid_tid_conn = (ssl_pid_connection_info_t){
+        .p_conn = {.conn = {.s_port = 49153, .d_port = 443}, .pid = 42},
+        .orig_dport = 8443,
+    };
+
+    retire_ssl_pointer_generation(test_ssl_ptr, 0x2a00000001ULL, 77, 88);
+
+    assert_int_eq(1, ssl_to_conn_delete_count, "allocation retires the stale reverse cache");
+    assert_int_eq(1, ssl_pid_tid_delete_count, "allocation retires the stale SSL thread owner");
+    assert_int_eq(1, active_ssl_delete_count, "allocation retires the matching forward owner");
+    assert_int_eq(0, pid_tid_delete_count, "allocation preserves the fresh connect hint");
+    assert_u64_eq(test_ssl_ptr, test_deleted_ssl_key.ssl, "reverse deletion uses the SSL pointer");
+    assert_int_eq(42, (int)test_deleted_ssl_key.pid, "reverse deletion uses the process ID");
+    assert_u64_eq(77,
+                  test_deleted_ssl_key.process_start_time,
+                  "reverse deletion uses the process generation");
+    assert_u64_eq(
+        test_ssl_ptr, test_deleted_ssl_owner_key.ssl, "owner deletion uses the SSL pointer");
+    assert_int_eq(42, (int)test_deleted_ssl_owner_key.pid, "owner deletion uses the process ID");
+    assert_u64_eq(77,
+                  test_deleted_ssl_owner_key.process_start_time,
+                  "owner deletion uses the process generation");
+
+    ssl_args_t args = ssl_args();
+    handle_ssl_prewrite(NULL, 0x2a00000001ULL, &args, 64);
+
+    assert_int_eq(1, test_prewrite_parser_call_count, "the reallocated SSL enters parsing");
+    assert_int_eq(1, ssl_to_conn_update_count, "the fresh connection is promoted");
+    assert_int_eq(1, pid_tid_delete_count, "promotion consumes the fresh connect hint");
+    assert_u16_eq(49153, test_last_connection.conn.s_port, "the fresh tuple is selected");
+    assert_u16_eq(8443, test_last_orig_dport, "the fresh destination port is preserved");
+}
+
+static void test_ssl_reallocation_discards_stale_current_thread_connection(void) {
+    reset();
+    seed_existing_ssl_connection(443);
+    test_ssl_conn.p_conn.conn = (connection_info_t){.s_port = 49152, .d_port = 443};
+    test_active_ssl_connection = test_ssl_conn.p_conn;
+    test_mapped_pid_tid = 0x2a00000001ULL;
+    test_mapped_pid_tid_available = 1;
+    test_pid_tid_conn = test_ssl_conn;
+
+    retire_ssl_pointer_generation(test_ssl_ptr, 0x2a00000001ULL, 77, 88);
+
+    assert_int_eq(1, pid_tid_delete_count, "allocation retires the matching current hint");
+    assert_u64_eq(
+        0x2a00000001ULL, test_deleted_pid_tid, "allocation deletes the exact current thread hint");
+
+    ssl_args_t args = ssl_args();
+    handle_ssl_prewrite(NULL, 0x2a00000001ULL, &args, 64);
+
+    assert_int_eq(0, ssl_to_conn_update_count, "a stale current hint is not republished");
+    assert_int_eq(0, test_prewrite_parser_call_count, "a stale current hint is not parsed");
+}
+
+static void test_ssl_reallocation_discards_stale_recorded_owner_connection(void) {
+    reset();
+    seed_existing_ssl_connection(443);
+    test_ssl_conn.p_conn.conn = (connection_info_t){.s_port = 49152, .d_port = 443};
+    test_active_ssl_connection = test_ssl_conn.p_conn;
+    test_mapped_pid_tid = 0x2a00000002ULL;
+    test_mapped_pid_tid_available = 1;
+    test_pid_tid_conn = test_ssl_conn;
+
+    retire_ssl_pointer_generation(test_ssl_ptr, 0x2a00000001ULL, 77, 88);
+
+    assert_int_eq(1, pid_tid_delete_count, "allocation retires the matching recorded owner hint");
+    assert_u64_eq(0x2a00000002ULL,
+                  test_deleted_pid_tid,
+                  "allocation deletes the exact recorded owner thread hint");
+
+    ssl_args_t args = ssl_args();
+    handle_ssl_prewrite(NULL, 0x2a00000001ULL, &args, 64);
+
+    assert_int_eq(0, ssl_to_conn_update_count, "a stale recorded owner hint is not republished");
+    assert_int_eq(0, test_prewrite_parser_call_count, "a stale recorded owner hint is not parsed");
+}
+
+static void test_ssl_reallocation_preserves_foreign_forward_owner(void) {
+    reset();
+    seed_existing_ssl_connection(443);
+    test_active_ssl_ptr = test_ssl_ptr + 1;
+
+    retire_ssl_pointer_generation(test_ssl_ptr, 0x2a00000001ULL, 77, 88);
+
+    assert_int_eq(1, ssl_to_conn_delete_count, "allocation retires the stale reverse cache");
+    assert_int_eq(1, ssl_pid_tid_delete_count, "allocation retires the stale thread owner");
+    assert_int_eq(0, active_ssl_delete_count, "allocation preserves another SSL forward owner");
+    assert_int_eq(1, test_active_ssl_available, "the foreign forward owner remains available");
+}
+
+static void test_ssl_reallocation_without_reverse_is_idempotent(void) {
+    reset();
+
+    retire_ssl_pointer_generation(test_ssl_ptr, 0x2a00000001ULL, 77, 88);
+    retire_ssl_pointer_generation(test_ssl_ptr, 0x2a00000001ULL, 77, 88);
+
+    assert_int_eq(2, ssl_to_conn_delete_count, "exact missing reverse cleanup is idempotent");
+    assert_int_eq(2, ssl_pid_tid_delete_count, "exact missing thread-owner cleanup is idempotent");
+    assert_int_eq(
+        0, active_ssl_delete_count, "missing reverse state cannot select a forward owner");
+}
+
+static void test_invalid_ssl_reallocation_noops(void) {
+    reset();
+
+    retire_ssl_pointer_generation(0, 0x2a00000001ULL, 77, 88);
+    retire_ssl_pointer_generation(test_ssl_ptr, 0, 77, 88);
+    retire_ssl_pointer_generation(test_ssl_ptr, 0x2a00000001ULL, 0, 88);
+
+    assert_int_eq(0, ssl_to_conn_delete_count, "invalid allocation does not touch reverse state");
+    assert_int_eq(
+        0, ssl_pid_tid_delete_count, "invalid allocation does not touch thread ownership");
+    assert_int_eq(0, active_ssl_delete_count, "invalid allocation does not touch forward state");
+}
+
 static void test_failed_promotion_preserves_source_connection(void) {
     reset();
     test_mapped_pid_tid = 0x2a00000002ULL;
@@ -1190,6 +1328,12 @@ int main(void) {
     test_prewrite_caches_and_releases_cross_thread_connection();
     test_prewrite_then_write_return_does_not_leak_source_connection();
     test_promoted_connection_is_cleaned_before_pointer_reuse();
+    test_ssl_reallocation_promotes_fresh_thread_connection();
+    test_ssl_reallocation_discards_stale_current_thread_connection();
+    test_ssl_reallocation_discards_stale_recorded_owner_connection();
+    test_ssl_reallocation_preserves_foreign_forward_owner();
+    test_ssl_reallocation_without_reverse_is_idempotent();
+    test_invalid_ssl_reallocation_noops();
     test_failed_promotion_preserves_source_connection();
     test_failed_forward_publication_rolls_back_reverse_mapping();
     test_delayed_tls_request_stays_open_on_next_tls_operation();

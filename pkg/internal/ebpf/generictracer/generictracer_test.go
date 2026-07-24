@@ -118,6 +118,18 @@ func TestJavaDataHookIsOptional(t *testing.T) {
 	assert.False(t, tracer.KProbes()["security_file_ioctl"].Required)
 }
 
+func TestSSLAllocationProbeFencesPointerReuse(t *testing.T) {
+	program := &ebpf.Program{}
+	tracer := &Tracer{cfg: &obi.Config{}}
+	tracer.bpfObjects.ObiUretprobeSslNew = program
+
+	probes := tracer.UProbes()["libssl.so"]["SSL_new"]
+	require.Len(t, probes, 1)
+	assert.False(t, probes[0].Required)
+	assert.Nil(t, probes[0].Start)
+	assert.Same(t, program, probes[0].End)
+}
+
 func TestJavaDataHookAttachResultPublishesReadiness(t *testing.T) {
 	originalUpdate := updateJavaRemoteParentDataHookReadiness
 	t.Cleanup(func() { updateJavaRemoteParentDataHookReadiness = originalUpdate })

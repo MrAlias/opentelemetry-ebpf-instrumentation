@@ -526,6 +526,10 @@ func (p *Tracer) Tracepoints() map[string]ebpfcommon.ProbeDesc {
 func (p *Tracer) UProbes() map[string]map[string][]*ebpfcommon.ProbeDesc {
 	m := map[string]map[string][]*ebpfcommon.ProbeDesc{
 		"libssl.so": {
+			"SSL_new": {{
+				Required: false,
+				End:      p.bpfObjects.ObiUretprobeSslNew,
+			}},
 			"SSL_read": {{
 				Required: false,
 				Start:    p.bpfObjects.ObiUprobeSslRead,

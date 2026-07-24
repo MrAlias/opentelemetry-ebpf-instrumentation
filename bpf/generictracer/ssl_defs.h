@@ -16,6 +16,7 @@
 #include <generictracer/ssl_connection.h>
 
 #include <generictracer/maps/pid_tid_to_conn.h>
+#include <generictracer/maps/ssl_to_pid_tid.h>
 #include <maps/ssl_to_conn.h>
 
 #include <logger/bpf_dbg.h>
@@ -118,6 +119,66 @@ static __always_inline void finish_real_tls_http_request_on_shutdown(
     u64 id, u64 ssl_ptr, u64 process_start_time, pid_connection_info_t *real_connection) {
     discard_fallback_ssl_http_request(id, ssl_ptr, process_start_time, real_connection);
     finish_tls_http_request_on_shutdown(real_connection);
+}
+
+static __always_inline void retire_matching_ssl_thread_connection(
+    u64 pid_tgid, u64 thread_start_time, const pid_connection_info_t *stale_connection) {
+    if (!pid_tgid || !thread_start_time || !stale_connection ||
+        pid_from_pid_tgid(pid_tgid) != stale_connection->pid) {
+        return;
+    }
+
+    const ssl_pid_connection_info_t *thread_connection =
+        lookup_pid_tid_connection(pid_tgid, thread_start_time);
+    if (ssl_connection_mapping_matches(thread_connection, stale_connection)) {
+        delete_pid_tid_connection(pid_tgid, thread_start_time);
+    }
+}
+
+static __always_inline void
+retire_ssl_pointer_generation(u64 ssl_ptr, u64 id, u64 process_start_time, u64 thread_start_time) {
+    const u32 pid = pid_from_pid_tgid(id);
+    if (!ssl_ptr || !pid || !process_start_time) {
+        return;
+    }
+
+    // A successful allocation starts a new pointer generation. Preserve a
+    // different thread hint because connect may have completed before SSL_new.
+    const ssl_pid_key_t key = ssl_pid_key(ssl_ptr, pid, process_start_time);
+    const ssl_pid_connection_info_t *cached =
+        lookup_ssl_connection(ssl_ptr, pid, process_start_time);
+    pid_connection_info_t stale_connection = {};
+    const u8 had_cached = cached != NULL;
+    if (cached) {
+        bpf_probe_read(&stale_connection, sizeof(stale_connection), &cached->p_conn);
+    }
+
+    ssl_thread_key_t stale_owner = {};
+    const ssl_thread_key_t *owner = bpf_map_lookup_elem(&ssl_to_pid_tid, &key);
+    u8 had_owner = 0;
+    if (owner && pid_from_pid_tgid(owner->pid_tgid) == pid && owner->thread_start_time) {
+        bpf_probe_read(&stale_owner, sizeof(stale_owner), owner);
+        had_owner = 1;
+    }
+
+    delete_ssl_connection(ssl_ptr, pid, process_start_time);
+    bpf_map_delete_elem(&ssl_to_pid_tid, &key);
+
+    if (!had_cached) {
+        return;
+    }
+
+    retire_matching_ssl_thread_connection(id, thread_start_time, &stale_connection);
+    if (had_owner &&
+        (stale_owner.pid_tgid != id || stale_owner.thread_start_time != thread_start_time)) {
+        retire_matching_ssl_thread_connection(
+            stale_owner.pid_tgid, stale_owner.thread_start_time, &stale_connection);
+    }
+
+    const u64 *active_owner = is_ssl_connection(&stale_connection);
+    if (active_owner && *active_owner == ssl_ptr) {
+        bpf_map_delete_elem(&active_ssl_connections, &stale_connection);
+    }
 }
 
 static __always_inline ssl_pid_connection_info_t *

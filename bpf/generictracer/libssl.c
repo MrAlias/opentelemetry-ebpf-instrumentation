@@ -182,6 +182,20 @@ int obi_ssl_process_exit(void *ctx) {
     return 0;
 }
 
+SEC("uretprobe/libssl.so:SSL_new")
+int BPF_URETPROBE(obi_uretprobe_ssl_new, void *ssl) {
+    (void)ctx;
+
+    const u64 id = bpf_get_current_pid_tgid();
+    if (!ssl || !valid_pid(id)) {
+        return 0;
+    }
+
+    retire_ssl_pointer_generation(
+        (u64)ssl, id, task_process_start_time(), task_thread_start_time());
+    return 0;
+}
+
 // SSL read and read_ex are more less the same, but some frameworks use one or the other.
 // SSL_read_ex sets an argument pointer with the number of bytes read, while SSL_read returns
 // the number of bytes read.

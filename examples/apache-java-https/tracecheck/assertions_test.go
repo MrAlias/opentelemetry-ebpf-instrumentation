@@ -38,6 +38,68 @@ func TestAssertSnapshotRequiresExactBridgeTraceFlags(t *testing.T) {
 	assert.ErrorContains(t, AssertSnapshot(snapshot, expectation), "match Apache candidate flags")
 }
 
+func TestAssertSnapshotPressureClassifiesOnlyExplicitRootsAsMisses(t *testing.T) {
+	expectation := Expectation{
+		Mode:          ModePressure,
+		ApacheService: "apache",
+		JavaService:   "java",
+		Endpoint:      testEndpoint,
+		Marker:        testMarker,
+	}
+
+	exact := bridgeSnapshot(testRemoteSpanFlags)
+	exact.Spans[0].ParentSpanID = ""
+	require.NoError(t, AssertSnapshot(exact, expectation))
+	exactOutcome, err := ClassifyPressureParent(exact, expectation)
+	require.NoError(t, err)
+	assert.Equal(t, PressureParentExactHit, exactOutcome)
+
+	missing := bridgeSnapshot(testRemoteSpanFlags)
+	missing.Spans[0].ParentSpanID = ""
+	missing.Spans[2].TraceID = "ffeeddccbbaa99887766554433221100"
+	missing.Spans[2].ParentSpanID = ""
+	missing.Spans[2].Flags = 0x103
+	require.NoError(t, AssertSnapshot(missing, expectation))
+	missingOutcome, err := ClassifyPressureParent(missing, expectation)
+	require.NoError(t, err)
+	assert.Equal(t, PressureParentExplicitRoot, missingOutcome)
+
+	bridgeExpectation := expectation
+	bridgeExpectation.Mode = ModeBridge
+	require.Error(t, AssertSnapshot(missing, bridgeExpectation))
+
+	sharedTraceRoot := missing
+	sharedTraceRoot.Spans = append([]Span(nil), missing.Spans...)
+	sharedTraceRoot.Spans[2].TraceID = testTraceID
+	require.ErrorContains(t, AssertSnapshot(sharedTraceRoot, expectation), "distinct from Apache candidate trace")
+	sharedOutcome, err := ClassifyPressureParent(sharedTraceRoot, expectation)
+	require.Error(t, err)
+	assert.Equal(t, PressureParentWrong, sharedOutcome)
+
+	remoteRoot := missing
+	remoteRoot.Spans = append([]Span(nil), missing.Spans...)
+	remoteRoot.Spans[2].Flags = testRemoteSpanFlags
+	require.ErrorContains(t, AssertSnapshot(remoteRoot, expectation), "root to be local")
+	remoteOutcome, err := ClassifyPressureParent(remoteRoot, expectation)
+	require.Error(t, err)
+	assert.Equal(t, PressureParentWrong, remoteOutcome)
+
+	wrong := bridgeSnapshot(testRemoteSpanFlags)
+	wrong.Spans[0].ParentSpanID = ""
+	wrong.Spans[2].ParentSpanID = testExternalSpanID
+	require.ErrorContains(t, AssertSnapshot(wrong, expectation), "identify Apache client span")
+	wrongOutcome, err := ClassifyPressureParent(wrong, expectation)
+	require.Error(t, err)
+	assert.Equal(t, PressureParentWrong, wrongOutcome)
+
+	unresolved := exact
+	unresolved.Spans = append([]Span(nil), exact.Spans...)
+	unresolved.Spans = unresolved.Spans[:2]
+	unresolvedOutcome, err := ClassifyPressureParent(unresolved, expectation)
+	require.Error(t, err)
+	assert.Equal(t, PressureParentUnresolved, unresolvedOutcome)
+}
+
 func TestAssertSnapshotRejectsAdditionalBridgeCandidate(t *testing.T) {
 	snapshot := bridgeSnapshot(testRemoteSpanFlags)
 	snapshot.Spans[0].ParentSpanID = ""

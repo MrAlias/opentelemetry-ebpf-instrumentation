@@ -98,10 +98,18 @@ type tlsBoundaryEvidence struct {
 }
 
 type caseResult struct {
-	Request      requestCase         `json:"request"`
-	Response     backendResponse     `json:"response"`
-	LatencyNanos int64               `json:"latency_nanos"`
-	Trace        tracecheck.Snapshot `json:"trace"`
+	Request               requestCase                      `json:"request"`
+	Response              backendResponse                  `json:"response"`
+	LatencyNanos          int64                            `json:"latency_nanos"`
+	PressureParentOutcome tracecheck.PressureParentOutcome `json:"pressure_parent_outcome,omitempty"`
+	Trace                 tracecheck.Snapshot              `json:"trace"`
+}
+
+type pressureCorrelationSummary struct {
+	ExactHitCount     int `json:"exact_hit_count"`
+	ExplicitRootCount int `json:"explicit_root_count"`
+	WrongParentCount  int `json:"wrong_parent_count"`
+	UnresolvedCount   int `json:"unresolved_count"`
 }
 
 type latencySummary struct {
@@ -136,18 +144,19 @@ type socketObservation struct {
 }
 
 type runResult struct {
-	Status              string              `json:"status"`
-	Scenario            string              `json:"scenario"`
-	Seed                int64               `json:"seed"`
-	StartedAt           time.Time           `json:"started_at"`
-	FinishedAt          time.Time           `json:"finished_at"`
-	RequestCount        int                 `json:"request_count"`
-	TrafficElapsedNanos int64               `json:"traffic_elapsed_nanos"`
-	ThroughputPerSecond float64             `json:"throughput_per_second"`
-	Latency             latencySummary      `json:"latency"`
-	Faults              []faultResult       `json:"faults,omitempty"`
-	ConnectionEvidence  *connectionEvidence `json:"connection_evidence,omitempty"`
-	Cases               []caseResult        `json:"cases"`
+	Status              string                      `json:"status"`
+	Scenario            string                      `json:"scenario"`
+	Seed                int64                       `json:"seed"`
+	StartedAt           time.Time                   `json:"started_at"`
+	FinishedAt          time.Time                   `json:"finished_at"`
+	RequestCount        int                         `json:"request_count"`
+	TrafficElapsedNanos int64                       `json:"traffic_elapsed_nanos"`
+	ThroughputPerSecond float64                     `json:"throughput_per_second"`
+	Latency             latencySummary              `json:"latency"`
+	Faults              []faultResult               `json:"faults,omitempty"`
+	ConnectionEvidence  *connectionEvidence         `json:"connection_evidence,omitempty"`
+	PressureCorrelation *pressureCorrelationSummary `json:"pressure_correlation,omitempty"`
+	Cases               []caseResult                `json:"cases"`
 }
 
 const (
@@ -172,20 +181,24 @@ func mainExitCode() int {
 		if result != nil {
 			result.Status = "failed"
 			result.FinishedAt = time.Now().UTC()
-			_ = json.NewEncoder(os.Stdout).Encode(result)
+			_ = encodeRunResult(os.Stdout, result)
 		}
 		return 1
 	}
 
 	result.Status = "passed"
 	result.FinishedAt = time.Now().UTC()
-	encoder := json.NewEncoder(os.Stdout)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(result); err != nil {
+	if err := encodeRunResult(os.Stdout, result); err != nil {
 		fmt.Fprintf(os.Stderr, "encode scenario result: %v\n", err)
 		return 1
 	}
 	return 0
+}
+
+func encodeRunResult(writer io.Writer, result *runResult) error {
+	encoder := json.NewEncoder(writer)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(result)
 }
 
 func parseFlags() config {
@@ -275,12 +288,21 @@ func run(ctx context.Context, cfg config) (*runResult, error) {
 		return result, err
 	}
 
-	snapshots, err := awaitAssertions(ctx, cfg, requests)
+	snapshots, assertionErr := awaitAssertions(ctx, cfg, requests)
 	for i := range snapshots {
 		result.Cases[i].Trace = snapshots[i]
 	}
-	if err != nil {
-		return result, err
+	var pressureErr error
+	if cfg.scenario == "pressure" {
+		summary := summarizePressureCorrelation(cfg, result.Cases)
+		result.PressureCorrelation = &summary
+		pressureErr = validatePressureCorrelation(summary, len(requests))
+	}
+	if assertionErr != nil {
+		return result, assertionErr
+	}
+	if pressureErr != nil {
+		return result, pressureErr
 	}
 	if err := validateDistinctParents(cfg.scenario, cfg.javaService, result.Cases); err != nil {
 		return result, err
@@ -1147,6 +1169,8 @@ func expectationFor(cfg config, request requestCase) tracecheck.Expectation {
 	switch cfg.scenario {
 	case "pipelining":
 		mode = tracecheck.ModePipelinedBridge
+	case "pressure":
+		mode = tracecheck.ModePressure
 	case "disabled":
 		mode = tracecheck.ModeDisabled
 	case "uninstrumented":
@@ -1179,6 +1203,46 @@ func expectationFor(cfg config, request requestCase) tracecheck.Expectation {
 		W3CTraceFlags:   expectedTraceFlags,
 		JavaTraceFlags:  javaTraceFlags,
 	}
+}
+
+func summarizePressureCorrelation(
+	cfg config,
+	cases []caseResult,
+) pressureCorrelationSummary {
+	var summary pressureCorrelationSummary
+	for index := range cases {
+		outcome, _ := tracecheck.ClassifyPressureParent(
+			cases[index].Trace,
+			expectationFor(cfg, cases[index].Request),
+		)
+		cases[index].PressureParentOutcome = outcome
+		switch outcome {
+		case tracecheck.PressureParentExactHit:
+			summary.ExactHitCount++
+		case tracecheck.PressureParentExplicitRoot:
+			summary.ExplicitRootCount++
+		case tracecheck.PressureParentWrong:
+			summary.WrongParentCount++
+		case tracecheck.PressureParentUnresolved:
+			summary.UnresolvedCount++
+		}
+	}
+	return summary
+}
+
+func validatePressureCorrelation(summary pressureCorrelationSummary, requestCount int) error {
+	if summary.WrongParentCount != 0 || summary.UnresolvedCount != 0 ||
+		summary.ExactHitCount+summary.ExplicitRootCount != requestCount {
+		return fmt.Errorf(
+			"pressure correlation expected exact hits plus explicit roots=%d with wrong=0 unresolved=0, got exact_hits=%d explicit_roots=%d wrong=%d unresolved=%d",
+			requestCount,
+			summary.ExactHitCount,
+			summary.ExplicitRootCount,
+			summary.WrongParentCount,
+			summary.UnresolvedCount,
+		)
+	}
+	return nil
 }
 
 type snapshotFetcher func(context.Context, string, string) (tracecheck.Snapshot, error)

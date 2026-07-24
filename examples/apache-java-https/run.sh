@@ -123,7 +123,7 @@ PRESSURE_MONITOR_PID=""
 PRESSURE_MONITOR_OUTPUT=""
 PRESSURE_MONITOR_FINAL_OUTPUT=""
 PRESSURE_MONITOR_STATUS=0
-PRESSURE_TAKE_TARGET=""
+PRESSURE_INJECT_TARGET=""
 FAULT_MODE="alternating"
 FAULT_REQUEST_COUNT=2
 MATCHING_VALID_TAKES=1
@@ -1460,6 +1460,29 @@ bridge_take_attempt_total() {
   printf '%s\n' "$total"
 }
 
+bridge_inject_attempt_total() {
+  local -r metrics="$1"
+  local metric=""
+  local labels=""
+  local raw_value=""
+  local value=""
+  local extra=""
+  local -i total=0
+
+  while read -r metric raw_value extra; do
+    [[ "$metric" == 'obi_java_remote_parent_operations_total{'*'}' ]] || continue
+    labels=",${metric#*\{}"
+    labels="${labels%\}},"
+    [[ "$labels" == *',operation="inject",'* &&
+      "$labels" == *',transport="tcp",'* ]] || continue
+    [[ -z "$extra" ]] || return 1
+    value="$(bounded_decimal "$raw_value" "$MAX_SHELL_INTEGER" true)" || return 1
+    ((total <= MAX_SHELL_INTEGER - value)) || return 1
+    total="$((total + value))"
+  done <"$metrics"
+  printf '%s\n' "$total"
+}
+
 bridge_stage_total() {
   local -r metrics="$1"
 
@@ -1805,6 +1828,32 @@ pressure_result_bool() {
   printf '%s\n' "$value"
 }
 
+pressure_scenario_count() {
+  local -r input="$1"
+  local -r field="$2"
+  local -r maximum="${3:-$MAX_SHELL_INTEGER}"
+  local value=""
+
+  [[ -f "$input" && ! -L "$input" && "$field" =~ ^[a-z_]+$ ]] || return 1
+  value="$(awk -v wanted="\"$field\":" '
+    $1 == wanted {
+      value = $2
+      sub(/,$/, "", value)
+      if (NF != 2 || value !~ /^(0|[1-9][0-9]*)$/) {
+        invalid = 1
+      }
+      matches++
+    }
+    END {
+      if (invalid || matches != 1) {
+        exit 1
+      }
+      print value
+    }
+  ' "$input")" || return 1
+  bounded_decimal "$value" "$maximum" true
+}
+
 pressure_result_bounded_uint() {
   local -r input="$1"
   local -r field="$2"
@@ -1982,7 +2031,7 @@ monitor_map_pressure() {
   local resolved_map_id=""
   local entries=""
   local raw_entries=""
-  local take_total=""
+  local inject_total=""
 
   metrics="$(mktemp "$RESULT_DIR/.pressure-monitor.XXXXXX")"
   trap '[[ -z "${metrics:-}" ]] || rm -f -- "$metrics"; exit 0' TERM INT
@@ -2022,30 +2071,28 @@ monitor_map_pressure() {
       "$PRESSURE_MAP_BASELINE_ENTRIES" \
       "$PRESSURE_MAP_MAX_ENTRIES" \
       "$entries" >>"$PRESSURE_MONITOR_OUTPUT"
-    take_total="$(bridge_take_attempt_total "$metrics")" || take_total=""
-    take_total="$(bounded_decimal "$take_total" "$MAX_SHELL_INTEGER" true)" || \
-      take_total=""
-    if [[ -z "$take_total" ]] || ((take_total > PRESSURE_TAKE_TARGET)); then
-      printf 'status=failed reason=traffic-count transport=%s actual=%s target=%s\n' \
-        "$SELECTED_TRANSPORT" \
-        "${take_total:-unavailable}" \
-        "$PRESSURE_TAKE_TARGET" >>"$PRESSURE_MONITOR_OUTPUT"
+    inject_total="$(bridge_inject_attempt_total "$metrics")" || inject_total=""
+    inject_total="$(bounded_decimal "$inject_total" "$MAX_SHELL_INTEGER" true)" || \
+      inject_total=""
+    if [[ -z "$inject_total" ]] || ((inject_total > PRESSURE_INJECT_TARGET)); then
+      printf 'status=failed reason=traffic-count operation=inject transport=tcp actual=%s target=%s\n' \
+        "${inject_total:-unavailable}" \
+        "$PRESSURE_INJECT_TARGET" >>"$PRESSURE_MONITOR_OUTPUT"
       return 1
     fi
-    if ((take_total == PRESSURE_TAKE_TARGET)); then
+    if ((inject_total == PRESSURE_INJECT_TARGET)); then
       if ! install -m 0644 "$metrics" "$PRESSURE_MONITOR_FINAL_OUTPUT"; then
         printf 'status=failed reason=terminal-evidence\n' >>"$PRESSURE_MONITOR_OUTPUT"
         return 1
       fi
-      printf 'status=traffic-complete observed_at=%(%Y-%m-%dT%H:%M:%SZ)T map_id=%s baseline=%s max_entries=%s entries=%s transport=%s take_total=%s target=%s\n' \
+      printf 'status=traffic-complete observed_at=%(%Y-%m-%dT%H:%M:%SZ)T map_id=%s baseline=%s max_entries=%s entries=%s operation=inject transport=tcp inject_total=%s target=%s\n' \
         -1 \
         "$PRESSURE_MAP_ID" \
         "$PRESSURE_MAP_BASELINE_ENTRIES" \
         "$PRESSURE_MAP_MAX_ENTRIES" \
         "$entries" \
-        "$SELECTED_TRANSPORT" \
-        "$take_total" \
-        "$PRESSURE_TAKE_TARGET" >>"$PRESSURE_MONITOR_OUTPUT"
+        "$inject_total" \
+        "$PRESSURE_INJECT_TARGET" >>"$PRESSURE_MONITOR_OUTPUT"
       return 0
     fi
     sleep "$PRESSURE_MONITOR_POLL_INTERVAL_SECONDS"
@@ -2127,7 +2174,7 @@ stop_map_pressure_monitor() {
 start_map_pressure() {
   local -r label="$1"
   local -r baseline_metrics="$2"
-  local -r expected_take_count="$3"
+  local -r expected_inject_count="$3"
   local prepare_output=""
   local prepare_stderr=""
   local fill_output=""
@@ -2135,7 +2182,7 @@ start_map_pressure() {
   local resolved=""
   local baseline_map_id=""
   local baseline_entries=""
-  local baseline_take_total=""
+  local baseline_inject_total=""
   local prepare_map_id=""
   local prepare_max_entries=""
   local prepare_process_map_id=""
@@ -2177,7 +2224,7 @@ start_map_pressure() {
   PRESSURE_MONITOR_OUTPUT=""
   PRESSURE_MONITOR_FINAL_OUTPUT=""
   PRESSURE_MONITOR_STATUS=0
-  PRESSURE_TAKE_TARGET=""
+  PRESSURE_INJECT_TARGET=""
   prepare_output="$RESULT_DIR/map-pressure-$label-prepare.json"
   prepare_stderr="$RESULT_DIR/map-pressure-$label-prepare.stderr.log"
   if run_map_pressure_helper \
@@ -2242,19 +2289,19 @@ start_map_pressure() {
     log_error "pre-fill handoff-claim occupancy is unavailable or not below capacity"
     return 1
   fi
-  baseline_take_total="$(bridge_take_attempt_total "$baseline_metrics")" || {
-    log_error "pre-fill bridge take count is unavailable"
+  baseline_inject_total="$(bridge_inject_attempt_total "$baseline_metrics")" || {
+    log_error "pre-fill bridge inject count is unavailable"
     return 1
   }
-  baseline_take_total="$(bounded_decimal \
-    "$baseline_take_total" "$MAX_SHELL_INTEGER" true)" || {
-    log_error "pre-fill bridge take count is invalid"
+  baseline_inject_total="$(bounded_decimal \
+    "$baseline_inject_total" "$MAX_SHELL_INTEGER" true)" || {
+    log_error "pre-fill bridge inject count is invalid"
     return 1
   }
   if ! bounded_decimal \
-    "$expected_take_count" "$MAX_SHELL_INTEGER" false >/dev/null || \
-    ((baseline_take_total > MAX_SHELL_INTEGER - expected_take_count)); then
-    log_error "pressure bridge take target is outside the bounded counter range"
+    "$expected_inject_count" "$MAX_SHELL_INTEGER" false >/dev/null || \
+    ((baseline_inject_total > MAX_SHELL_INTEGER - expected_inject_count)); then
+    log_error "pressure bridge inject target is outside the bounded counter range"
     return 1
   fi
 
@@ -2265,7 +2312,7 @@ start_map_pressure() {
   PRESSURE_PROCESS_PID="$prepare_process_pid"
   PRESSURE_PROCESS_NAMESPACE="$prepare_process_namespace"
   PRESSURE_TOKEN_BASE="$prepare_token_base"
-  PRESSURE_TAKE_TARGET="$((baseline_take_total + expected_take_count))"
+  PRESSURE_INJECT_TARGET="$((baseline_inject_total + expected_inject_count))"
   PRESSURE_ACTIVE=true
 
   fill_output="$RESULT_DIR/map-pressure-$label-fill.json"
@@ -2603,8 +2650,19 @@ run_scenario() {
   local expected_valid=0
   local expected_stale=0
   local expected_malformed=0
+  local baseline_bridge_missing=0
+  local baseline_java_missing=0
+  local expected_bridge_valid=0
   local expected_bridge_missing=0
   local expected_java_missing=0
+  local pressure_hits=0
+  local pressure_roots=0
+  local pressure_wrong=0
+  local pressure_unresolved=0
+  local pressure_trace_json="null"
+  local pressure_bridge_json="null"
+  local pressure_java_json="null"
+  local pressure_status_json="null"
   local expected_fault_status=""
   local expected_fault_count=0
   local bridge_was_running=false
@@ -2632,8 +2690,8 @@ run_scenario() {
     log_error "the matching fixture requires the diagnostic w3c-match scenario"
     return 1
   fi
-  expected_bridge_missing="$(scenario_bridge_missing_count "$name" "$SELECTED_TRANSPORT")"
-  expected_java_missing="$(scenario_java_missing_count "$name" "$diagnostics_enabled")"
+  baseline_bridge_missing="$(scenario_bridge_missing_count "$name" "$SELECTED_TRANSPORT")"
+  baseline_java_missing="$(scenario_java_missing_count "$name" "$diagnostics_enabled")"
   expected_requests="$(scenario_bridge_take_count "$name")"
   if [[ "$name" == "w3c-fault" ]]; then
     request_arguments=(--requests "$FAULT_REQUEST_COUNT")
@@ -2647,6 +2705,17 @@ run_scenario() {
     scenario_status=0
     metric_status=0
     status_name="passed"
+    expected_bridge_valid="$expected_requests"
+    expected_bridge_missing="$baseline_bridge_missing"
+    expected_java_missing="$baseline_java_missing"
+    pressure_hits=0
+    pressure_roots=0
+    pressure_wrong=0
+    pressure_unresolved=0
+    pressure_trace_json="null"
+    pressure_bridge_json="null"
+    pressure_java_json="null"
+    pressure_status_json="null"
     label="$name"
     if [[ "$name" == "w3c-fault" ]]; then
       label="$name-$FAULT_MODE"
@@ -2722,14 +2791,68 @@ run_scenario() {
         scenario_status=$?
       fi
     fi
+    if [[ "$name" == "pressure" ]]; then
+      if [[ -s "$output" && -f "$output" && ! -L "$output" ]]; then
+        pressure_hits="$(pressure_scenario_count \
+          "$output" exact_hit_count "$expected_requests")" || pressure_hits=""
+        pressure_roots="$(pressure_scenario_count \
+          "$output" explicit_root_count "$expected_requests")" || pressure_roots=""
+        pressure_wrong="$(pressure_scenario_count \
+          "$output" wrong_parent_count "$expected_requests")" || pressure_wrong=""
+        pressure_unresolved="$(pressure_scenario_count \
+          "$output" unresolved_count "$expected_requests")" || \
+          pressure_unresolved=""
+      else
+        pressure_hits=""
+        pressure_roots=""
+        pressure_wrong=""
+        pressure_unresolved=""
+      fi
+      if [[ -n "$pressure_hits" && -n "$pressure_roots" && \
+        -n "$pressure_wrong" && -n "$pressure_unresolved" ]]; then
+        printf -v pressure_trace_json \
+          '{"exact_hit_count":%d,"explicit_root_count":%d,"wrong_parent_count":%d,"unresolved_count":%d}' \
+          "$pressure_hits" \
+          "$pressure_roots" \
+          "$pressure_wrong" \
+          "$pressure_unresolved"
+        printf -v pressure_java_json \
+          '{"take_valid_count":%d,"attributable_absence_count":%d,"diagnostic_self_miss_count":%d}' \
+          "$((pressure_hits + pressure_wrong))" \
+          "$pressure_roots" \
+          "$baseline_java_missing"
+      fi
+      if [[ -z "$pressure_hits" || -z "$pressure_roots" || \
+        -z "$pressure_wrong" || -z "$pressure_unresolved" ]] || \
+        ((pressure_hits + pressure_roots + pressure_wrong +
+          pressure_unresolved != expected_requests)); then
+        log_error "pressure scenario did not report complete bounded parent outcomes"
+        expected_bridge_valid=0
+        expected_bridge_missing="$baseline_bridge_missing"
+        expected_java_missing="$baseline_java_missing"
+        if ((scenario_status == 0)); then
+          scenario_status=1
+        fi
+      else
+        expected_bridge_valid="$((pressure_hits + pressure_wrong))"
+        expected_bridge_missing="$baseline_bridge_missing"
+        expected_java_missing="$((baseline_java_missing + pressure_roots))"
+        if ((scenario_status == 0 &&
+          (pressure_wrong != 0 || pressure_unresolved != 0 ||
+          pressure_hits + pressure_roots != expected_requests))); then
+          log_error "pressure scenario reported a wrong or unresolved parent"
+          scenario_status=1
+        fi
+      fi
+    fi
     if [[ "$name" == "pressure" && "$PRESSURE_ACTIVE" == "true" ]]; then
       if ! cleanup_map_pressure_with_retries; then
         metric_status=1
       fi
     fi
     if [[ "$bridge_was_running" == "true" ]]; then
-      expected_success="$((before_success + expected_requests))"
-      expected_stage="$((before_stage + expected_requests))"
+      expected_success="$((before_success + expected_bridge_valid))"
+      expected_stage="$((before_stage + expected_bridge_valid))"
       if ! wait_for_bridge_metrics_quiescent \
         "$expected_success" \
         "$expected_stage" \
@@ -2753,10 +2876,21 @@ run_scenario() {
       "$RESULT_DIR/phases/$after_phase/obi-metrics.prom" \
       "$RESULT_DIR/phases/$after_phase/obi-metrics.delta"
     if [[ "$bridge_was_running" == "true" ]]; then
-      if ! assert_bridge_metric_delta \
+      if [[ "$name" == "pressure" && -n "$pressure_hits" &&
+        -n "$pressure_roots" && -n "$pressure_wrong" && -n "$pressure_unresolved" ]]; then
+        pressure_bridge_json="$(pressure_bridge_reconciliation \
+          "$RESULT_DIR/phases/$after_phase/obi-metrics.delta" \
+          "$SELECTED_TRANSPORT" \
+          "$expected_bridge_valid" \
+          "$pressure_roots" \
+          "$expected_requests")" || {
+          pressure_bridge_json="null"
+          metric_status=1
+        }
+      elif ! assert_bridge_metric_delta \
         "$RESULT_DIR/phases/$after_phase/obi-metrics.delta" \
         "$SELECTED_TRANSPORT" \
-        "$expected_requests" \
+        "$expected_bridge_valid" \
         0 \
         "$expected_bridge_missing"; then
         metric_status=1
@@ -2771,10 +2905,10 @@ run_scenario() {
         log_error "could not parse Java diagnostics for $label"
         metric_status=1
       else
-        expected_sampled="$expected_requests"
+        expected_sampled="$expected_bridge_valid"
         expected_unsampled=0
         expected_standard=0
-        expected_valid="$expected_requests"
+        expected_valid="$expected_bridge_valid"
         expected_stale=0
         expected_malformed=0
         expected_fault_status=""
@@ -2813,11 +2947,19 @@ run_scenario() {
     if ((scenario_status != 0 || metric_status != 0)); then
       status_name="failed"
     fi
-    printf '{\n  "status": "%s",\n  "scenario": "%s",\n  "exit_status": %d,\n  "metric_status": %d,\n  "result": "%s",\n  "stderr": "%s",\n  "after_phase": "%s"\n}\n' \
+    if [[ "$name" == "pressure" && "$pressure_trace_json" != "null" ]]; then
+      printf -v pressure_status_json \
+        '{"trace":%s,"bridge":%s,"java_reconciliation_target":%s}' \
+        "$pressure_trace_json" \
+        "$pressure_bridge_json" \
+        "$pressure_java_json"
+    fi
+    printf '{\n  "status": "%s",\n  "scenario": "%s",\n  "exit_status": %d,\n  "metric_status": %d,\n  "pressure_correlation": %s,\n  "result": "%s",\n  "stderr": "%s",\n  "after_phase": "%s"\n}\n' \
       "$status_name" \
       "$name" \
       "$scenario_status" \
       "$metric_status" \
+      "$pressure_status_json" \
       "$(basename -- "$output")" \
       "$(basename -- "$stderr_output")" \
       "phases/$after_phase" >"$RESULT_DIR/scenario-$label-status.json"
@@ -4471,6 +4613,169 @@ metric_delta_operation_total() {
       }
     }
     END { printf "%.0f\n", total }
+  ' "$input"
+}
+
+pressure_bridge_reconciliation() {
+  local -r input="$1"
+  local -r transport="$2"
+  local -r expected_valid="$3"
+  local -r expected_roots="$4"
+  local -r expected_requests="$5"
+
+  [[ -f "$input" && ! -L "$input" &&
+    ( "$transport" == "getsockopt" || "$transport" == "unix" ) &&
+    "$expected_valid" =~ ^(0|[1-9][0-9]*)$ &&
+    "$expected_roots" =~ ^(0|[1-9][0-9]*)$ &&
+    "$expected_requests" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+
+  awk \
+    -v selected="$transport" \
+    -v wanted_valid="$expected_valid" \
+    -v wanted_roots="$expected_roots" \
+    -v wanted_requests="$expected_requests" '
+    function label(line, name, value) {
+      value = line
+      sub("^.*" name "=\"", "", value)
+      sub("\".*$", "", value)
+      return value
+    }
+    function upstream_status(status) {
+      return status == "missing" || status == "stale" || status == "ambiguous" ||
+        status == "malformed" || status == "overload" || status == "segmented"
+    }
+    function retrieval_status(status) {
+      return status == "missing" || status == "stale" || status == "unsupported" ||
+        status == "malformed" || status == "version_mismatch" ||
+        status == "ambiguous" || status == "unauthorized" ||
+        status == "already_consumed" || status == "timeout" ||
+        status == "overload" || status == "transport_error" || status == "disabled"
+    }
+    function unexpected(kind, line) {
+      printf "unexpected pressure bridge %s: %s\n", kind, line > "/dev/stderr"
+      failed = 1
+    }
+    /^obi_java_remote_parent_operations_total/ {
+      operation = label($0, "operation")
+      status = label($0, "status")
+      transport = label($0, "transport")
+      delta = ""
+      delta_fields = 0
+      for (field = 1; field <= NF; field++) {
+        if ($field ~ /^delta=/) {
+          delta = $field
+          sub(/^delta=/, "", delta)
+          delta_fields++
+        }
+      }
+      if (delta_fields != 1 || delta !~ /^(0|[1-9][0-9]*)$/) {
+        unexpected("metric delta", $0)
+        next
+      }
+      if (operation == "inject" && transport == "tcp") {
+        inject_total += delta
+        if (status == "valid") {
+          inject_valid += delta
+        } else if (upstream_status(status)) {
+          inject_fail += delta
+          upstream_reason[status] += delta
+        } else if (delta != 0) {
+          unexpected("inject result", $0)
+        }
+        next
+      }
+      if (operation == "candidate" && transport == "tcp") {
+        candidate_total += delta
+        if (status == "valid") {
+          candidate_valid += delta
+        } else if (status == "ambiguous" || status == "malformed" || status == "overload") {
+          candidate_fail += delta
+          upstream_reason[status] += delta
+        } else if (delta != 0) {
+          unexpected("candidate result", $0)
+        }
+        next
+      }
+      if (operation == "stage" && transport == "tcp") {
+        stage_total += delta
+        if (status == "valid") {
+          stage_valid += delta
+        } else if (status == "ambiguous" || status == "malformed" || status == "overload") {
+          stage_fail += delta
+          upstream_reason[status] += delta
+        } else if (delta != 0) {
+          unexpected("stage result", $0)
+        }
+        next
+      }
+      if (operation == "take") {
+        if (transport != selected) {
+          if (delta != 0) {
+            unexpected("non-selected retrieval result", $0)
+          }
+        } else {
+          retrieval_total += delta
+          if (status == "valid") {
+            retrieval_valid += delta
+          } else if (retrieval_status(status)) {
+            retrieval_fail += delta
+            retrieval_reason[status] += delta
+          } else if (delta != 0) {
+            unexpected("retrieval result", $0)
+          }
+        }
+        next
+      }
+      if (operation == "handoff" && transport == "tcp") {
+        if (status == "valid") {
+          handoff_valid += delta
+        } else if (delta != 0) {
+          unexpected("handoff result", $0)
+        }
+        next
+      }
+      allowed = operation == "negotiate" && status == "missing" && transport == selected
+      allowed = allowed || (operation == "cleanup" && status == "valid" && transport == "tcp")
+      allowed = allowed || (operation == "report" && status == "valid" && transport == "tcp")
+      if (delta != 0 && !allowed) {
+        unexpected("operation result", $0)
+      }
+    }
+    END {
+      upstream_fail = inject_fail + candidate_fail + stage_fail
+      if (inject_total != wanted_requests || inject_valid != candidate_total ||
+          candidate_valid != stage_total || retrieval_valid != wanted_valid ||
+          handoff_valid > retrieval_valid ||
+          wanted_valid + wanted_roots != wanted_requests) {
+        printf "pressure bridge pipeline mismatch: requests=%d inject=%d/%d candidate=%d/%d stage=%d/%d retrieval=%d/%d handoff=%d expected_valid=%d roots=%d\n",
+          wanted_requests, inject_valid, inject_total, candidate_valid, candidate_total,
+          stage_valid, stage_total, retrieval_valid, retrieval_total,
+          handoff_valid, wanted_valid, wanted_roots > "/dev/stderr"
+        failed = 1
+      }
+      if (selected == "getsockopt") {
+        if (stage_valid != retrieval_total ||
+            upstream_fail + retrieval_fail != wanted_roots) {
+          printf "getsockopt pressure root mismatch: upstream_failures=%d retrieval_failures=%d roots=%d stage_valid=%d retrieval_total=%d\n",
+            upstream_fail, retrieval_fail, wanted_roots, stage_valid, retrieval_total > "/dev/stderr"
+          failed = 1
+        }
+      } else if (retrieval_total != wanted_requests || retrieval_fail != wanted_roots ||
+                 upstream_fail > wanted_roots) {
+        printf "unix pressure root mismatch: upstream_failures=%d retrieval_failures=%d roots=%d retrieval_total=%d requests=%d\n",
+          upstream_fail, retrieval_fail, wanted_roots, retrieval_total,
+          wanted_requests > "/dev/stderr"
+        failed = 1
+      }
+      if (failed) {
+        exit 1
+      }
+      printf "{\"transport\":\"%s\",\"phase_outcome_counts\":{\"inject\":%d,\"candidate\":%d,\"stage\":%d,\"retrieval\":%d},", selected, inject_total, candidate_total, stage_total, retrieval_total
+      printf "\"auxiliary_outcome_counts\":{\"handoff\":%d},", handoff_valid
+      printf "\"retrieval_valid_count\":%d,\"upstream_failure_count\":%d,\"retrieval_failure_count\":%d,", retrieval_valid, upstream_fail, retrieval_fail
+      printf "\"upstream_failure_reason_counts\":{\"missing\":%d,\"stale\":%d,\"ambiguous\":%d,\"malformed\":%d,\"overload\":%d,\"segmented\":%d},", upstream_reason["missing"], upstream_reason["stale"], upstream_reason["ambiguous"], upstream_reason["malformed"], upstream_reason["overload"], upstream_reason["segmented"]
+      printf "\"retrieval_failure_reason_counts\":{\"missing\":%d,\"stale\":%d,\"unsupported\":%d,\"malformed\":%d,\"version_mismatch\":%d,\"ambiguous\":%d,\"unauthorized\":%d,\"already_consumed\":%d,\"timeout\":%d,\"overload\":%d,\"transport_error\":%d,\"disabled\":%d}}\n", retrieval_reason["missing"], retrieval_reason["stale"], retrieval_reason["unsupported"], retrieval_reason["malformed"], retrieval_reason["version_mismatch"], retrieval_reason["ambiguous"], retrieval_reason["unauthorized"], retrieval_reason["already_consumed"], retrieval_reason["timeout"], retrieval_reason["overload"], retrieval_reason["transport_error"], retrieval_reason["disabled"]
+    }
   ' "$input"
 }
 

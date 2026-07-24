@@ -90,6 +90,32 @@ func TestPipeliningUsesFailClosedInboundPolicy(t *testing.T) {
 	).Mode)
 }
 
+func TestPressureUsesReasonCodedParentPolicy(t *testing.T) {
+	expectation := expectationFor(
+		config{scenario: "pressure"},
+		requestCase{Marker: "pressure", Endpoint: "/api/handoff"},
+	)
+
+	assert.Equal(t, tracecheck.ModePressure, expectation.Mode)
+}
+
+func TestRunResultEncodingKeepsPressureCountsOnSeparateLines(t *testing.T) {
+	var output bytes.Buffer
+	result := &runResult{
+		Status: "failed",
+		PressureCorrelation: &pressureCorrelationSummary{
+			ExactHitCount:     7,
+			ExplicitRootCount: 2,
+			WrongParentCount:  1,
+		},
+	}
+
+	require.NoError(t, encodeRunResult(&output, result))
+	assert.Contains(t, output.String(), "\n    \"exact_hit_count\": 7,\n")
+	assert.Contains(t, output.String(), "\n    \"explicit_root_count\": 2,\n")
+	assert.Contains(t, output.String(), "\n    \"wrong_parent_count\": 1,\n")
+}
+
 func TestAwaitAssertionsFetchesMarkersAfterAnEarlierFailure(t *testing.T) {
 	seen := map[string]int{}
 	fetch := func(_ context.Context, _ string, marker string) (tracecheck.Snapshot, error) {
@@ -648,4 +674,87 @@ func TestReuseAndPipelineScenariosRejectSharedParents(t *testing.T) {
 	unique[len(unique)-1].Trace.Spans[0].TraceID = unique[0].Trace.Spans[0].TraceID
 	unique[len(unique)-1].Trace.Spans[0].ParentSpanID = unique[0].Trace.Spans[0].ParentSpanID
 	require.Error(t, validateDistinctParents("keepalive", "java-backend", unique))
+}
+
+func TestPressureCorrelationCountsExactMissingWrongAndUnresolved(t *testing.T) {
+	cfg := config{
+		scenario:      "pressure",
+		apacheService: "apache-proxy",
+		javaService:   "java-backend",
+	}
+	cases := []caseResult{
+		pressureCase("exact", "trace-exact", "client-exact", "trace-exact", "client-exact"),
+		pressureCase("missing", "trace-candidate", "client-missing", "trace-root", ""),
+		pressureCase("wrong", "trace-wanted", "client-wanted", "trace-foreign", "foreign"),
+		{Request: requestCase{Marker: "unresolved", Endpoint: "/api/handoff"}},
+	}
+
+	summary := summarizePressureCorrelation(cfg, cases)
+
+	assert.Equal(t, pressureCorrelationSummary{
+		ExactHitCount:     1,
+		ExplicitRootCount: 1,
+		WrongParentCount:  1,
+		UnresolvedCount:   1,
+	}, summary)
+	assert.Equal(t, tracecheck.PressureParentExactHit, cases[0].PressureParentOutcome)
+	assert.Equal(t, tracecheck.PressureParentExplicitRoot, cases[1].PressureParentOutcome)
+	assert.Equal(t, tracecheck.PressureParentWrong, cases[2].PressureParentOutcome)
+	assert.Equal(t, tracecheck.PressureParentUnresolved, cases[3].PressureParentOutcome)
+	require.Error(t, validatePressureCorrelation(summary, len(cases)))
+
+	valid := pressureCorrelationSummary{ExactHitCount: 3, ExplicitRootCount: 1}
+	require.NoError(t, validatePressureCorrelation(valid, 4))
+	require.NoError(t, validatePressureCorrelation(
+		pressureCorrelationSummary{ExplicitRootCount: 4},
+		4,
+	))
+}
+
+func pressureCase(
+	marker string,
+	candidateTraceID string,
+	candidateSpanID string,
+	javaTraceID string,
+	javaParentSpanID string,
+) caseResult {
+	attributes := map[string]string{
+		"http.request.header.x-obi-demo-id": marker,
+		"http.route":                        "/api/handoff",
+	}
+	javaFlags := uint32(0x301)
+	if javaParentSpanID == "" {
+		javaFlags = 0x101
+	}
+	apacheServerSpanID := "server-" + marker
+	return caseResult{
+		Request: requestCase{Marker: marker, Endpoint: "/api/handoff"},
+		Trace: tracecheck.Snapshot{Marker: marker, Spans: []tracecheck.Span{
+			{
+				ServiceName: "apache-proxy",
+				Kind:        "SERVER",
+				TraceID:     candidateTraceID,
+				SpanID:      apacheServerSpanID,
+				Attributes:  attributes,
+			},
+			{
+				ServiceName:  "apache-proxy",
+				Kind:         "CLIENT",
+				TraceID:      candidateTraceID,
+				SpanID:       candidateSpanID,
+				ParentSpanID: apacheServerSpanID,
+				Flags:        0x301,
+				Attributes:   attributes,
+			},
+			{
+				ServiceName:  "java-backend",
+				Kind:         "SERVER",
+				TraceID:      javaTraceID,
+				SpanID:       "java-" + marker,
+				ParentSpanID: javaParentSpanID,
+				Flags:        javaFlags,
+				Attributes:   attributes,
+			},
+		}},
+	}
 }

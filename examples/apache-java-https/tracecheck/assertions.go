@@ -14,6 +14,7 @@ type AssertionMode string
 const (
 	ModeBridge          AssertionMode = "bridge"
 	ModePipelinedBridge AssertionMode = "pipelined-bridge"
+	ModePressure        AssertionMode = "pressure"
 	ModeDisabled        AssertionMode = "disabled"
 	ModeUninstrumented  AssertionMode = "uninstrumented"
 	ModeW3C             AssertionMode = "w3c"
@@ -21,6 +22,15 @@ const (
 	ModeW3CNoOBI        AssertionMode = "w3c-no-obi"
 	ModeW3CResilience   AssertionMode = "w3c-resilience"
 	ModeFailOpen        AssertionMode = "fail-open"
+)
+
+type PressureParentOutcome string
+
+const (
+	PressureParentExactHit     PressureParentOutcome = "exact_hit"
+	PressureParentExplicitRoot PressureParentOutcome = "explicit_root"
+	PressureParentWrong        PressureParentOutcome = "wrong_parent"
+	PressureParentUnresolved   PressureParentOutcome = "unresolved"
 )
 
 type Expectation struct {
@@ -129,16 +139,7 @@ func AssertSnapshot(snapshot Snapshot, expectation Expectation) error {
 	}
 
 	switch expectation.Mode {
-	case ModeBridge, ModePipelinedBridge:
-		if remote, known := ParentRemote(javaSpan); !known || !remote {
-			return fmt.Errorf(
-				"expected Java server span parent to be explicitly remote, flags=%d",
-				javaSpan.Flags,
-			)
-		}
-		if isZeroID(javaSpan.ParentSpanID) {
-			return fmt.Errorf("java server span %s is a root span", javaSpan.SpanID)
-		}
+	case ModeBridge, ModePipelinedBridge, ModePressure:
 		apacheClients := selectRequestSpans(
 			snapshot.Spans,
 			expectation.ApacheService,
@@ -154,15 +155,6 @@ func AssertSnapshot(snapshot Snapshot, expectation Expectation) error {
 			)
 		}
 		matchingParent := apacheClients[0]
-		if matchingParent.TraceID != javaSpan.TraceID || matchingParent.SpanID != javaSpan.ParentSpanID {
-			return fmt.Errorf(
-				"expected Java parent %s/%s to identify Apache client span %s/%s",
-				javaSpan.TraceID,
-				javaSpan.ParentSpanID,
-				matchingParent.TraceID,
-				matchingParent.SpanID,
-			)
-		}
 		if hasApacheServer && !spanDescendsFrom(snapshot.Spans, matchingParent, apacheServer) {
 			return fmt.Errorf(
 				"expected Apache client %s/%s to descend from inbound span %s/%s",
@@ -188,16 +180,36 @@ func AssertSnapshot(snapshot Snapshot, expectation Expectation) error {
 		if err := assertExpectedTraceFlags(matchingParent, expectation.W3CTraceFlags); err != nil {
 			return fmt.Errorf("apache candidate span: %w", err)
 		}
-		if expectation.JavaTraceFlags != "" {
-			if err := assertExpectedTraceFlags(javaSpan, expectation.JavaTraceFlags); err != nil {
-				return fmt.Errorf("java server span: %w", err)
+		if expectation.Mode == ModePressure {
+			outcome, err := classifyPressureParent(javaSpan, matchingParent, expectation)
+			if err != nil {
+				return err
 			}
-		} else if TraceFlags(javaSpan) != TraceFlags(matchingParent) {
+			if outcome == PressureParentExactHit ||
+				outcome == PressureParentExplicitRoot {
+				return nil
+			}
+		}
+		if remote, known := ParentRemote(javaSpan); !known || !remote {
 			return fmt.Errorf(
-				"expected Java trace flags %02x to match Apache candidate flags %02x",
-				TraceFlags(javaSpan),
-				TraceFlags(matchingParent),
+				"expected Java server span parent to be explicitly remote, flags=%d",
+				javaSpan.Flags,
 			)
+		}
+		if isZeroID(javaSpan.ParentSpanID) {
+			return fmt.Errorf("java server span %s is a root span", javaSpan.SpanID)
+		}
+		if matchingParent.TraceID != javaSpan.TraceID || matchingParent.SpanID != javaSpan.ParentSpanID {
+			return fmt.Errorf(
+				"expected Java parent %s/%s to identify Apache client span %s/%s",
+				javaSpan.TraceID,
+				javaSpan.ParentSpanID,
+				matchingParent.TraceID,
+				matchingParent.SpanID,
+			)
+		}
+		if err := assertBridgeTraceFlags(javaSpan, matchingParent, expectation); err != nil {
+			return err
 		}
 	case ModeDisabled, ModeFailOpen:
 		if !isZeroID(javaSpan.ParentSpanID) {
@@ -262,6 +274,111 @@ func AssertSnapshot(snapshot Snapshot, expectation Expectation) error {
 		return fmt.Errorf("unsupported assertion mode %q", expectation.Mode)
 	}
 
+	return nil
+}
+
+func ClassifyPressureParent(
+	snapshot Snapshot,
+	expectation Expectation,
+) (PressureParentOutcome, error) {
+	if expectation.Mode != ModePressure {
+		return PressureParentUnresolved, fmt.Errorf(
+			"pressure parent classification requires pressure mode, got %q",
+			expectation.Mode,
+		)
+	}
+	javaSpans := selectMarkerServerSpans(
+		snapshot.Spans,
+		expectation.JavaService,
+		expectation.Marker,
+	)
+	apacheClients := selectRequestSpans(
+		snapshot.Spans,
+		expectation.ApacheService,
+		"CLIENT",
+		expectation.Endpoint,
+		expectation.Marker,
+	)
+	if len(javaSpans) != 1 || len(apacheClients) != 1 {
+		return PressureParentUnresolved, fmt.Errorf(
+			"pressure parent classification requires one Java server and one Apache client, got Java=%d Apache=%d",
+			len(javaSpans),
+			len(apacheClients),
+		)
+	}
+
+	javaSpan := javaSpans[0]
+	matchingParent := apacheClients[0]
+	if !MatchesEndpoint(javaSpan, expectation.Endpoint) {
+		return PressureParentUnresolved, fmt.Errorf(
+			"pressure Java server span did not match endpoint %s",
+			expectation.Endpoint,
+		)
+	}
+	outcome, relationshipErr := classifyPressureParent(javaSpan, matchingParent, expectation)
+	if assertionErr := AssertSnapshot(snapshot, expectation); assertionErr != nil {
+		if outcome == PressureParentWrong {
+			return outcome, assertionErr
+		}
+		return PressureParentUnresolved, assertionErr
+	}
+	return outcome, relationshipErr
+}
+
+func classifyPressureParent(
+	javaSpan Span,
+	matchingParent Span,
+	expectation Expectation,
+) (PressureParentOutcome, error) {
+	if isZeroID(javaSpan.ParentSpanID) {
+		if remote, _ := ParentRemote(javaSpan); remote {
+			return PressureParentWrong, fmt.Errorf(
+				"expected pressure Java root to be local, flags=%d",
+				javaSpan.Flags,
+			)
+		}
+		if strings.EqualFold(javaSpan.TraceID, matchingParent.TraceID) {
+			return PressureParentWrong, fmt.Errorf(
+				"expected pressure Java root trace %s to be distinct from Apache candidate trace",
+				javaSpan.TraceID,
+			)
+		}
+		return PressureParentExplicitRoot, nil
+	}
+	if strings.EqualFold(matchingParent.TraceID, javaSpan.TraceID) &&
+		strings.EqualFold(matchingParent.SpanID, javaSpan.ParentSpanID) {
+		if remote, known := ParentRemote(javaSpan); !known || !remote {
+			return PressureParentWrong, fmt.Errorf(
+				"expected pressure Java hit parent to be explicitly remote, flags=%d",
+				javaSpan.Flags,
+			)
+		}
+		if err := assertBridgeTraceFlags(javaSpan, matchingParent, expectation); err != nil {
+			return PressureParentWrong, err
+		}
+		return PressureParentExactHit, nil
+	}
+	return PressureParentWrong, fmt.Errorf(
+		"expected Java parent %s/%s to identify Apache client span %s/%s",
+		javaSpan.TraceID,
+		javaSpan.ParentSpanID,
+		matchingParent.TraceID,
+		matchingParent.SpanID,
+	)
+}
+
+func assertBridgeTraceFlags(javaSpan, matchingParent Span, expectation Expectation) error {
+	if expectation.JavaTraceFlags != "" {
+		if err := assertExpectedTraceFlags(javaSpan, expectation.JavaTraceFlags); err != nil {
+			return fmt.Errorf("java server span: %w", err)
+		}
+	} else if TraceFlags(javaSpan) != TraceFlags(matchingParent) {
+		return fmt.Errorf(
+			"expected Java trace flags %02x to match Apache candidate flags %02x",
+			TraceFlags(javaSpan),
+			TraceFlags(matchingParent),
+		)
+	}
 	return nil
 }
 

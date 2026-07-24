@@ -960,6 +960,28 @@ test_bridge_take_attempt_total_is_transport_scoped() {
   SELECTED_TRANSPORT="$previous_transport"
 }
 
+test_bridge_inject_attempt_total_is_reason_agnostic() {
+  local -r metrics="$TEST_TMP_DIR/bridge-inject-attempts.prom"
+
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} 4' \
+    'obi_java_remote_parent_operations_total{operation="inject",status="ambiguous",transport="tcp"} 1' \
+    'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 99' \
+    >"$metrics"
+  [[ "$(bridge_inject_attempt_total "$metrics")" == "5" ]] || {
+    printf 'bridge inject attempts did not retain reason-coded failures\n' >&2
+    return 1
+  }
+
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} invalid' \
+    >>"$metrics"
+  if bridge_inject_attempt_total "$metrics" >/dev/null 2>&1; then
+    printf 'bridge inject attempts accepted a malformed counter\n' >&2
+    return 1
+  fi
+}
+
 test_pressure_monitor_uses_prefill_baseline() {
   local -i required_completion_timeout="$((
     (PRESSURE_MONITOR_METRICS_TIMEOUT_SECONDS * 2) +
@@ -979,7 +1001,7 @@ test_pressure_monitor_uses_prefill_baseline() {
     PRESSURE_MAP_ID=41
     PRESSURE_MAP_MAX_ENTRIES=10
     PRESSURE_MAP_BASELINE_ENTRIES=7
-    PRESSURE_TAKE_TARGET=5
+    PRESSURE_INJECT_TARGET=5
     SELECTED_TRANSPORT=getsockopt
     PRESSURE_MONITOR_OUTPUT="$RESULT_DIR/monitor.log"
     : >"$PRESSURE_MONITOR_OUTPUT"
@@ -1001,7 +1023,7 @@ test_pressure_monitor_uses_prefill_baseline() {
     PRESSURE_MAP_ID=41
     PRESSURE_MAP_MAX_ENTRIES=10
     PRESSURE_MAP_BASELINE_ENTRIES=7
-    PRESSURE_TAKE_TARGET=5
+    PRESSURE_INJECT_TARGET=5
     SELECTED_TRANSPORT=getsockopt
     PRESSURE_MONITOR_OUTPUT="$RESULT_DIR/monitor.log"
     : >"$PRESSURE_MONITOR_OUTPUT"
@@ -1017,18 +1039,77 @@ test_pressure_monitor_uses_prefill_baseline() {
   )
 
   (
+    RESULT_DIR="$TEST_TMP_DIR/pressure-monitor-traffic-overshoot"
+    mkdir -p -- "$RESULT_DIR"
+    PRESSURE_MAP_ID=41
+    PRESSURE_MAP_MAX_ENTRIES=10
+    PRESSURE_MAP_BASELINE_ENTRIES=7
+    PRESSURE_INJECT_TARGET=5
+    PRESSURE_MONITOR_OUTPUT="$RESULT_DIR/monitor.log"
+    : >"$PRESSURE_MONITOR_OUTPUT"
+    fetch_obi_metrics() {
+      printf '%s\n' \
+        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 9' \
+        'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} 6' >"$1"
+    }
+    if monitor_map_pressure; then
+      printf 'pressure monitor accepted more inject outcomes than requests\n' >&2
+      return 1
+    fi
+    grep -Fq 'reason=traffic-count operation=inject transport=tcp actual=6 target=5' \
+      "$PRESSURE_MONITOR_OUTPUT"
+  )
+
+  (
+    local fetch_calls=0
+
+    RESULT_DIR="$TEST_TMP_DIR/pressure-monitor-report-only"
+    mkdir -p -- "$RESULT_DIR"
+    PRESSURE_MAP_ID=41
+    PRESSURE_MAP_MAX_ENTRIES=10
+    PRESSURE_MAP_BASELINE_ENTRIES=7
+    PRESSURE_INJECT_TARGET=5
+    PRESSURE_MONITOR_OUTPUT="$RESULT_DIR/monitor.log"
+    : >"$PRESSURE_MONITOR_OUTPUT"
+    fetch_obi_metrics() {
+      fetch_calls="$((fetch_calls + 1))"
+      if ((fetch_calls < 3)); then
+        printf '%s\n' \
+          'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 9' \
+          'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} 4' \
+          "obi_java_remote_parent_operations_total{operation=\"report\",status=\"valid\",transport=\"tcp\"} $fetch_calls" >"$1"
+      else
+        printf '%s\n' \
+          'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7' \
+          'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} 4' \
+          'obi_java_remote_parent_operations_total{operation="report",status="valid",transport="tcp"} 3' >"$1"
+      fi
+    }
+    if monitor_map_pressure; then
+      printf 'pressure monitor treated report growth as traffic completion\n' >&2
+      return 1
+    fi
+    if grep -q '^status=traffic-complete ' "$PRESSURE_MONITOR_OUTPUT"; then
+      printf 'pressure monitor published terminal evidence before inject completion\n' >&2
+      return 1
+    fi
+    grep -Fq 'status=failed reason=occupancy' "$PRESSURE_MONITOR_OUTPUT"
+  )
+
+  (
     RESULT_DIR="$TEST_TMP_DIR/pressure-monitor-success"
     mkdir -p -- "$RESULT_DIR"
     PRESSURE_LABEL="pressure-test"
     PRESSURE_MAP_ID=41
     PRESSURE_MAP_MAX_ENTRIES=10
     PRESSURE_MAP_BASELINE_ENTRIES=7
-    PRESSURE_TAKE_TARGET=5
+    PRESSURE_INJECT_TARGET=5
     SELECTED_TRANSPORT=getsockopt
     fetch_obi_metrics() {
       printf '%s\n' \
         'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 9' \
-        'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 5' >"$1"
+        'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} 4' \
+        'obi_java_remote_parent_operations_total{operation="inject",status="ambiguous",transport="tcp"} 1' >"$1"
     }
     start_map_pressure_monitor
     local monitor_pid="$PRESSURE_MONITOR_PID"
@@ -1060,7 +1141,7 @@ test_pressure_monitor_uses_prefill_baseline() {
 
   (
     local fetch_calls=0
-    local fixture_take_total=4
+    local fixture_inject_total=4
 
     RESULT_DIR="$TEST_TMP_DIR/pressure-monitor-stop-race"
     mkdir -p -- "$RESULT_DIR"
@@ -1068,16 +1149,16 @@ test_pressure_monitor_uses_prefill_baseline() {
     PRESSURE_MAP_ID=41
     PRESSURE_MAP_MAX_ENTRIES=10
     PRESSURE_MAP_BASELINE_ENTRIES=7
-    PRESSURE_TAKE_TARGET=5
+    PRESSURE_INJECT_TARGET=5
     SELECTED_TRANSPORT=getsockopt
     fetch_obi_metrics() {
       fetch_calls="$((fetch_calls + 1))"
       if ((fetch_calls > 1)); then
-        fixture_take_total=5
+        fixture_inject_total=5
       fi
       printf '%s\n' \
         'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 9' \
-        "obi_java_remote_parent_operations_total{operation=\"take\",status=\"valid\",transport=\"getsockopt\"} $fixture_take_total" >"$1"
+        "obi_java_remote_parent_operations_total{operation=\"inject\",status=\"valid\",transport=\"tcp\"} $fixture_inject_total" >"$1"
     }
     start_map_pressure_monitor
     stop_map_pressure_monitor
@@ -1267,7 +1348,7 @@ test_map_pressure_prepare_fill_cleanup_transaction() {
     SCENARIO_SEED=1
     printf '%s\n' \
       'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7' \
-      'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 3' \
+      'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} 3' \
       >"$RESULT_DIR/before.prom"
     SELECTED_TRANSPORT=getsockopt
     run_bounded() {
@@ -1289,7 +1370,7 @@ test_map_pressure_prepare_fill_cleanup_transaction() {
 
     SELECTED_TRANSPORT=getsockopt
     start_map_pressure pressure-test "$RESULT_DIR/before.prom" 5 >/dev/null
-    [[ "$PRESSURE_TAKE_TARGET" == "8" ]] || return 1
+    [[ "$PRESSURE_INJECT_TARGET" == "8" ]] || return 1
     [[ "$PRESSURE_ACTIVE" == "true" && \
       "$PRESSURE_MAP_BASELINE_ENTRIES" == "7" && \
       "$PRESSURE_PROCESS_MAP_ID" == "42" && \
@@ -1910,6 +1991,55 @@ test_bridge_take_count_includes_cancelled_request() {
   }
 }
 
+test_pressure_scenario_counts_are_unique_and_bounded() {
+  local -r result="$TEST_TMP_DIR/pressure-scenario-result.json"
+
+  cat >"$result" <<'EOF'
+{
+  "pressure_correlation": {
+    "exact_hit_count": 127,
+    "explicit_root_count": 1,
+    "wrong_parent_count": 0,
+    "unresolved_count": 0
+  }
+}
+EOF
+  [[ "$(pressure_scenario_count "$result" exact_hit_count)" == "127" &&
+    "$(pressure_scenario_count "$result" explicit_root_count)" == "1" &&
+    "$(pressure_scenario_count "$result" wrong_parent_count)" == "0" &&
+    "$(pressure_scenario_count "$result" unresolved_count)" == "0" ]] || {
+    printf 'pressure scenario result counts were not parsed exactly\n' >&2
+    return 1
+  }
+  if pressure_scenario_count "$result" absent_count >/dev/null 2>&1; then
+    printf 'pressure scenario result accepted a missing count\n' >&2
+    return 1
+  fi
+  sed -i 's/"unresolved_count": 0/"unresolved_count": 1.0/' "$result"
+  if pressure_scenario_count "$result" unresolved_count >/dev/null 2>&1; then
+    printf 'pressure scenario result accepted a nondecimal count\n' >&2
+    return 1
+  fi
+  sed -i 's/"unresolved_count": 1.0/"unresolved_count": 0/' "$result"
+
+  printf '  "explicit_root_count": 1,\n' >>"$result"
+  if pressure_scenario_count "$result" explicit_root_count >/dev/null 2>&1; then
+    printf 'pressure scenario result accepted a duplicate count\n' >&2
+    return 1
+  fi
+  sed -i '$d' "$result"
+  sed -i 's/"wrong_parent_count": 0/"wrong_parent_count": -1/' "$result"
+  if pressure_scenario_count "$result" wrong_parent_count >/dev/null 2>&1; then
+    printf 'pressure scenario result accepted a negative count\n' >&2
+    return 1
+  fi
+  sed -i 's/"wrong_parent_count": -1/"wrong_parent_count": 129/' "$result"
+  if pressure_scenario_count "$result" wrong_parent_count 128 >/dev/null 2>&1; then
+    printf 'pressure scenario result accepted a count above the request bound\n' >&2
+    return 1
+  fi
+}
+
 test_bridge_metric_delta_requires_exact_one_shot_results() {
   local -r delta="$TEST_TMP_DIR/w3c-metrics.delta"
 
@@ -1961,6 +2091,99 @@ EOF
     printf 'bridge metric delta accepted candidate overload\n' >&2
     return 1
   fi
+}
+
+test_pressure_bridge_reconciliation_preserves_failure_reasons() {
+  local -r getsockopt_delta="$TEST_TMP_DIR/pressure-getsockopt.delta"
+  local -r stage_delta="$TEST_TMP_DIR/pressure-stage.delta"
+  local -r take_delta="$TEST_TMP_DIR/pressure-take.delta"
+  local -r unix_delta="$TEST_TMP_DIR/pressure-unix.delta"
+  local reconciliation=""
+
+  cat >"$getsockopt_delta" <<'EOF'
+obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} before=2 after=3 delta=1
+obi_java_remote_parent_operations_total{operation="inject",status="ambiguous",transport="tcp"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=2 after=3 delta=1
+obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=2 after=3 delta=1
+obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} before=2 after=3 delta=1
+obi_java_remote_parent_operations_total{operation="handoff",status="valid",transport="tcp"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="take",status="missing",transport="getsockopt"} before=0 after=0 delta=0
+obi_java_remote_parent_operations_total{operation="negotiate",status="missing",transport="getsockopt"} before=7 after=11 delta=4
+obi_java_remote_parent_operations_total{operation="cleanup",status="valid",transport="tcp"} before=0 after=9 delta=9
+obi_java_remote_parent_operations_total{operation="report",status="valid",transport="tcp"} before=3 after=7 delta=4
+EOF
+  reconciliation="$(pressure_bridge_reconciliation \
+    "$getsockopt_delta" getsockopt 1 1 2)" || {
+    printf 'pressure bridge rejected the observed getsockopt injection-drop shape\n' >&2
+    return 1
+  }
+  [[ "$reconciliation" == *'"upstream_failure_count":1'* &&
+    "$reconciliation" == *'"retrieval_failure_count":0'* &&
+    "$reconciliation" == *'"auxiliary_outcome_counts":{"handoff":1}'* &&
+    "$reconciliation" == *'"ambiguous":1'* ]] || {
+    printf 'pressure bridge did not preserve the injection failure reason and handoff count\n' >&2
+    return 1
+  }
+
+  sed -i 's/operation="handoff",status="valid",transport="tcp"} before=0 after=1 delta=1/operation="handoff",status="valid",transport="tcp"} before=0 after=2 delta=2/' \
+    "$getsockopt_delta"
+  if pressure_bridge_reconciliation \
+    "$getsockopt_delta" getsockopt 1 1 2 >/dev/null 2>&1; then
+    printf 'pressure bridge accepted more task handoffs than valid retrievals\n' >&2
+    return 1
+  fi
+  sed -i 's/operation="handoff",status="valid",transport="tcp"} before=0 after=2 delta=2/operation="handoff",status="valid",transport="tcp"} before=0 after=1 delta=1/' \
+    "$getsockopt_delta"
+
+  sed -i 's/operation="inject",status="ambiguous",transport="tcp"} before=0 after=1 delta=1/operation="inject",status="ambiguous",transport="tcp"} before=0 after=0 delta=0/' \
+    "$getsockopt_delta"
+  if pressure_bridge_reconciliation \
+    "$getsockopt_delta" getsockopt 1 1 2 >/dev/null 2>&1; then
+    printf 'pressure bridge accepted an unreported root\n' >&2
+    return 1
+  fi
+
+  cat >"$stage_delta" <<'EOF'
+obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} before=0 after=2 delta=2
+obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=0 after=2 delta=2
+obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="stage",status="overload",transport="tcp"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} before=0 after=1 delta=1
+EOF
+  pressure_bridge_reconciliation "$stage_delta" getsockopt 1 1 2 >/dev/null || {
+    printf 'pressure bridge rejected a reason-coded stage failure\n' >&2
+    return 1
+  }
+
+  cat >"$take_delta" <<'EOF'
+obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} before=0 after=2 delta=2
+obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=0 after=2 delta=2
+obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=0 after=2 delta=2
+obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="take",status="stale",transport="getsockopt"} before=0 after=1 delta=1
+EOF
+  pressure_bridge_reconciliation "$take_delta" getsockopt 1 1 2 >/dev/null || {
+    printf 'pressure bridge rejected a reason-coded retrieval failure\n' >&2
+    return 1
+  }
+
+  cat >"$unix_delta" <<'EOF'
+obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="inject",status="ambiguous",transport="tcp"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="take",status="valid",transport="unix"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="take",status="missing",transport="unix"} before=0 after=1 delta=1
+EOF
+  reconciliation="$(pressure_bridge_reconciliation "$unix_delta" unix 1 1 2)" || {
+    printf 'pressure bridge rejected Unix retrieval after an upstream drop\n' >&2
+    return 1
+  }
+  [[ "$reconciliation" == *'"upstream_failure_count":1'* &&
+    "$reconciliation" == *'"retrieval_failure_count":1'* ]] || {
+    printf 'pressure bridge hid overlapping Unix upstream and retrieval reasons\n' >&2
+    return 1
+  }
 }
 
 test_primary_security_metrics_are_explicitly_scoped() {
@@ -2481,6 +2704,212 @@ test_scenario_fences_metrics_around_diagnostics() {
     printf 'OBI-flags scenario did not preserve sampled and unsampled takes\n' >&2
     return 1
   }
+}
+
+test_pressure_scenario_reconciles_roots_with_bridge_and_java_counts() {
+  local -r call_log="$TEST_TMP_DIR/scenario-pressure-accounting.calls"
+  local -r result_dir="$TEST_TMP_DIR/scenario-pressure-accounting"
+
+  (
+    RESULT_DIR="$result_dir"
+    mkdir -p -- "$RESULT_DIR"
+    : >"$call_log"
+    BRIDGE_RUNNING=true
+    COMPOSE=(docker compose)
+    REPEAT_COUNT=1
+    REQUEST_COUNT=10
+    SCENARIO_SEED=1
+    SCENARIO_VARIANT=""
+    SELECTED_TRANSPORT=getsockopt
+    TLS_PROTOCOL=TLSv1.3
+    PRESSURE_ACTIVE=false
+    flush_bridge_metric_boundary() { :; }
+    capture_java_diagnostics() {
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+      printf 'fixture\n' >"$RESULT_DIR/phases/$1/java-diagnostics.txt"
+    }
+    capture_phase_evidence() {
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+      printf '# empty\n' >"$RESULT_DIR/phases/$1/obi-metrics.prom"
+    }
+    start_map_pressure() {
+      [[ "$1" == "pressure" && "$3" == "10" ]] || return 1
+      PRESSURE_ACTIVE=true
+    }
+    cleanup_map_pressure_with_retries() {
+      PRESSURE_ACTIVE=false
+    }
+    run_bounded() {
+      cat <<'EOF'
+{
+  "status": "passed",
+  "pressure_correlation": {
+    "exact_hit_count": 7,
+    "explicit_root_count": 3,
+    "wrong_parent_count": 0,
+    "unresolved_count": 0
+  }
+}
+EOF
+    }
+    wait_for_bridge_metrics_quiescent() {
+      printf 'wait:%s:%s\n' "$1" "$2" >>"$call_log"
+    }
+    write_metrics_delta() {
+      : >"$3"
+    }
+    pressure_bridge_reconciliation() {
+      printf 'bridge:%s:%s:%s:%s\n' "$2" "$3" "$4" "$5" >>"$call_log"
+      [[ "$2" == "getsockopt" && "$3" == "7" && "$4" == "3" && "$5" == "10" ]] || \
+        return 1
+      printf '%s\n' \
+        '{"transport":"getsockopt","retrieval_valid_count":7,"upstream_failure_count":3,"retrieval_failure_count":0,"upstream_failure_reason_counts":{"ambiguous":3}}'
+    }
+    write_java_diagnostics_delta() {
+      : >"$3"
+    }
+    assert_java_diagnostics_delta() {
+      printf 'java:%s:%s:%s:%s:%s:%s:%s\n' \
+        "$2" "$3" "$4" "$5" "$6" "$7" "$8" >>"$call_log"
+      [[ "$2" == "7" && "$3" == "0" && "$4" == "0" && "$5" == "4" &&
+        "$6" == "7" && "$7" == "0" && "$8" == "0" ]]
+    }
+
+    run_scenario pressure >/dev/null
+    [[ "$PRESSURE_ACTIVE" == "false" ]]
+    [[ "$(<"$call_log")" == $'wait:0:0\nwait:7:7\nbridge:getsockopt:7:3:10\njava:7:0:0:4:7:0:0' ]]
+  ) || {
+    printf 'pressure scenario did not reconcile explicit roots across evidence layers\n' >&2
+    return 1
+  }
+  grep -Fq '"retrieval_valid_count":7' \
+    "$result_dir/scenario-pressure-status.json" || return 1
+  grep -Fq '"attributable_absence_count":3' \
+    "$result_dir/scenario-pressure-status.json" || return 1
+}
+
+test_pressure_failure_retains_wrong_parent_counts_and_cleans_up() {
+  local -r result_dir="$TEST_TMP_DIR/scenario-pressure-wrong-parent"
+  local scenario_status=0
+
+  if (
+    RESULT_DIR="$result_dir"
+    mkdir -p -- "$RESULT_DIR"
+    BRIDGE_RUNNING=true
+    COMPOSE=(docker compose)
+    REPEAT_COUNT=1
+    REQUEST_COUNT=10
+    SCENARIO_SEED=1
+    SCENARIO_VARIANT=""
+    SELECTED_TRANSPORT=getsockopt
+    TLS_PROTOCOL=TLSv1.3
+    PRESSURE_ACTIVE=false
+    flush_bridge_metric_boundary() { :; }
+    capture_java_diagnostics() {
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+      printf 'fixture\n' >"$RESULT_DIR/phases/$1/java-diagnostics.txt"
+    }
+    capture_phase_evidence() {
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+      printf '# empty\n' >"$RESULT_DIR/phases/$1/obi-metrics.prom"
+    }
+    start_map_pressure() {
+      PRESSURE_ACTIVE=true
+    }
+    cleanup_map_pressure_with_retries() {
+      PRESSURE_ACTIVE=false
+    }
+    run_bounded() {
+      cat <<'EOF'
+{
+  "status": "failed",
+  "pressure_correlation": {
+    "exact_hit_count": 7,
+    "explicit_root_count": 2,
+    "wrong_parent_count": 1,
+    "unresolved_count": 0
+  }
+}
+EOF
+      return 17
+    }
+    wait_for_bridge_metrics_quiescent() { :; }
+    write_metrics_delta() { : >"$3"; }
+    pressure_bridge_reconciliation() {
+      printf '%s\n' \
+        '{"transport":"getsockopt","retrieval_valid_count":8,"upstream_failure_count":2,"retrieval_failure_count":0}'
+    }
+    write_java_diagnostics_delta() { : >"$3"; }
+    assert_java_diagnostics_delta() { :; }
+
+    if run_scenario pressure >/dev/null; then
+      return 1
+    else
+      scenario_status=$?
+    fi
+    [[ "$scenario_status" == "17" && "$PRESSURE_ACTIVE" == "false" ]]
+  ); then
+    :
+  else
+    printf 'pressure wrong-parent failure did not retain status or clean up\n' >&2
+    return 1
+  fi
+  grep -Fq '"exit_status": 17' "$result_dir/scenario-pressure-status.json" || {
+    printf 'pressure wrong-parent command status was not retained\n' >&2
+    return 1
+  }
+  grep -Fq '"wrong_parent_count":1' "$result_dir/scenario-pressure-status.json" || {
+    printf 'pressure wrong-parent count was not retained\n' >&2
+    return 1
+  }
+}
+
+test_pressure_empty_result_fails_closed_and_cleans_up() {
+  local -r result_dir="$TEST_TMP_DIR/scenario-pressure-empty"
+  local scenario_status=0
+
+  (
+    RESULT_DIR="$result_dir"
+    mkdir -p -- "$RESULT_DIR"
+    BRIDGE_RUNNING=false
+    COMPOSE=(docker compose)
+    REPEAT_COUNT=1
+    REQUEST_COUNT=2
+    SCENARIO_SEED=1
+    SCENARIO_VARIANT=""
+    SELECTED_TRANSPORT=getsockopt
+    TLS_PROTOCOL=TLSv1.3
+    PRESSURE_ACTIVE=false
+    flush_bridge_metric_boundary() { :; }
+    capture_java_diagnostics() {
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+      printf 'fixture\n' >"$RESULT_DIR/phases/$1/java-diagnostics.txt"
+    }
+    capture_phase_evidence() {
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+      printf '# empty\n' >"$RESULT_DIR/phases/$1/obi-metrics.prom"
+    }
+    start_map_pressure() {
+      PRESSURE_ACTIVE=true
+    }
+    cleanup_map_pressure_with_retries() {
+      PRESSURE_ACTIVE=false
+    }
+    run_bounded() { :; }
+    write_metrics_delta() { : >"$3"; }
+
+    if run_scenario pressure >/dev/null 2>&1; then
+      return 1
+    else
+      scenario_status=$?
+    fi
+    [[ "$scenario_status" == "1" && "$PRESSURE_ACTIVE" == "false" ]]
+  ) || {
+    printf 'pressure scenario accepted empty result evidence or skipped cleanup\n' >&2
+    return 1
+  }
+  grep -Fq '"status": "failed"' "$result_dir/scenario-pressure-status.json"
+  grep -Fq '"pressure_correlation": null' "$result_dir/scenario-pressure-status.json"
 }
 
 test_scenario_controls_matching_fixture_lifecycle() {
@@ -4287,6 +4716,7 @@ main() {
   test_security_probe_window_covers_metric_fences
   test_primary_security_quiescence_restores_policy
   test_bridge_take_attempt_total_is_transport_scoped
+  test_bridge_inject_attempt_total_is_reason_agnostic
   test_pressure_monitor_uses_prefill_baseline
   test_pressure_state_uses_baseline_and_retains_steady_recovery
   test_pressure_state_has_attempt_and_wall_clock_bounds
@@ -4299,7 +4729,9 @@ main() {
   test_map_pressure_helper_capture_preserves_status_and_streams
   test_map_pressure_canonical_promotion_rolls_back_partial_files
   test_bridge_take_count_includes_cancelled_request
+  test_pressure_scenario_counts_are_unique_and_bounded
   test_bridge_metric_delta_requires_exact_one_shot_results
+  test_pressure_bridge_reconciliation_preserves_failure_reasons
   test_primary_security_metrics_are_explicitly_scoped
   test_primary_security_identity_requires_same_cgroup_and_nonroot_user
   test_unix_security_metrics_require_explicit_race_scope
@@ -4308,6 +4740,9 @@ main() {
   test_java_diagnostics_delta_is_exact
   test_fault_scenario_does_not_probe_java_diagnostics
   test_scenario_fences_metrics_around_diagnostics
+  test_pressure_scenario_reconciles_roots_with_bridge_and_java_counts
+  test_pressure_failure_retains_wrong_parent_counts_and_cleans_up
+  test_pressure_empty_result_fails_closed_and_cleans_up
   test_scenario_controls_matching_fixture_lifecycle
   test_scenario_supports_metrics_only_security_evidence
   test_security_controls_select_metrics_only_evidence

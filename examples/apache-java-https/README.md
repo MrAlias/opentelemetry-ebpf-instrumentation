@@ -62,6 +62,19 @@ absent, the Apache client span must be a root; when present, the normal ancestry
 check still applies. Every marker must still have one exact Apache client to
 Java remote-parent link, and multiple inbound candidates are rejected.
 
+The pressure scenario is the only exception to item 2. After the complete
+Apache candidate graph is present, it classifies each Java span as an exact hit
+or an explicit root. A root must have a zero parent, no remote-parent bit, and a
+trace distinct from the Apache candidate. Every nonzero parent must still match
+the exact candidate. The result records each outcome and aggregate exact-hit,
+explicit-root, wrong-parent, and unresolved counts. Exact hits plus explicit
+roots must equal the request count, and wrong-parent and unresolved counts must
+both be zero. Aggregate bridge metrics preserve the actual upstream and
+retrieval failure reasons, while Java diagnostics account for valid retrievals,
+roots, and the independent diagnostic self-probe. Transport-aware conservation
+checks reconcile those layers without treating every root as a bridge
+`take/missing` result.
+
 All selected spans must have the scenario's exact endpoint and exact random
 marker value in addition to the expected `service.name` and span kind. Prefix,
 substring, wrong-route, and cross-request matches are rejected.
@@ -195,7 +208,8 @@ The default `all` suite runs, in order:
   validated under the selected TLS 1.2 or TLS 1.3 backend protocol;
 - a canceled request followed by a successful retry;
 - order-independent handoff-claim LRU eviction under sustained concurrent
-  pressure;
+  pressure, with exact hits and explicit roots counted separately and
+  reconciled across trace, bridge, and Java diagnostics;
 - servlet async and executor handoff across varied hop counts, cancellation,
   rejection, and timeout paths;
 - Java 21 virtual-thread migration, mixed execution, and cancellation paths;
@@ -355,8 +369,11 @@ Every run retains a timestamped directory under `.runtime/results/` with:
 - live pressure-helper output naming the exact BPF map ID, capacity, non-secret
   JVM PID/namespace identity, complete fill count, and scanned eviction count;
   a read-only preparation record retained before mutation; once-per-second
-  above-prefill-baseline monitoring through an independently counted exact
-  bridge-take completion boundary and its terminal metric sample; exact
+  above-prefill-baseline monitoring through an independently counted aggregate
+  TCP-inject outcome boundary and its terminal metric sample; exact per-request
+  and aggregate parent outcomes with zero wrong or unresolved parents; actual
+  reason-coded upstream and retrieval failures; and transport-aware aggregate
+  reconciliation with Java diagnostics;
   synthetic-key cleanup verification; and both samples from the final
   steady-recovery gate, with canonical cleanup/recovery evidence promoted only
   when the complete gate passes;

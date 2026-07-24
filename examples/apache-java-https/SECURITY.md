@@ -23,7 +23,7 @@ payloads.
 | oversized/repeated/flooded Unix request | bounded CPU/memory/logging | untested |
 | malformed/zero trace or span ID | discarded; Java request remains healthy | untested |
 | stale entry past TTL | miss; never a parent | untested |
-| live handoff-map pressure/eviction | order-independent eviction; zero wrong parents; exact-key cleanup and steady-baseline recovery | untested |
+| live handoff-map pressure/eviction | order-independent eviction; exact hits, explicit roots, and actual upstream/retrieval reason counts reconciled by transport; zero wrong or unresolved parents; exact-key cleanup and steady-baseline recovery | untested |
 | OBI absent or delayed | Java root span and healthy response | untested |
 | OBI restart with old endpoint/fd | no stale parent; recovery only if claimed | untested |
 | helper absent/disabled | ordinary official-agent behavior | untested |
@@ -56,11 +56,14 @@ payloads.
   Derive synthetic keys and fresh values from the one unambiguous live JVM
   PID/namespace/incarnation, scan every synthetic key to prove at least one
   order-independent eviction, and monitor exact-map occupancy above its
-  pre-fill baseline once per second through the selected transport's exact
-  expected bridge-take total, retaining the terminal metric sample independently
-  of later trace polling. Remove only those deterministic keys, verify every one
-  is absent, then retain two consecutive at-or-below-baseline samples within a
-  bounded TTL-aware recovery deadline. Promote canonical cleanup evidence only
+  pre-fill baseline once per second through the exact aggregate TCP-inject
+  outcome total, retaining the terminal metric sample independently of later
+  trace polling. Remove only those deterministic keys, verify every one is
+  absent, then retain two consecutive at-or-below-baseline samples within a
+  bounded TTL-aware recovery deadline. Classify every nonzero Java parent as an
+  exact hit and only a true Java root as an explicit root, then reconcile those
+  outcomes with the actual bridge upstream/retrieval reasons and Java counts
+  using transport-aware conservation. Promote canonical cleanup evidence only
   after that recovery gate passes. Evidence never records the incarnation
   capability.
 - Restart only the `obi` service and preserve old descriptors long enough to
@@ -105,8 +108,11 @@ or credential topology; do not mark it pass.
 - Java diagnostics are requested directly from the verified Jetty TLS endpoint
   before and after each bridge scenario. The runner stores snapshots separately
   from OBI metrics and accounts for exactly one self-observed missing lookup;
-  another missing result still fails the scenario. Fault-injection scenarios do
-  not probe diagnostics because doing so would consume a fault response.
+  another missing result fails unless aggregate pressure trace evidence reports
+  a corresponding explicit root and the bridge reason counts conserve the same
+  request total. Diagnostics do not carry request markers, so this is an
+  aggregate reconciliation. Fault-injection scenarios do not probe diagnostics
+  because doing so would consume a fault response.
 - Compose project names are restricted to the reserved demo namespace. Every
   container, volume, and network has an ownership sentinel, and the runner
   verifies all project-labeled resources before startup or destructive cleanup.

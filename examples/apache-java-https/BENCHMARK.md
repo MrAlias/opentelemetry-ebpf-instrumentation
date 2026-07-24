@@ -62,14 +62,20 @@ synthetic keys to prove order-independent eviction, and uses fresh monotonic
 claim values tied to the one unambiguous live JVM incarnation. During 128
 concurrent marked handoff requests it checks once per second that exact-map
 occupancy remains above the pre-fill baseline without requiring exact capacity.
-The monitor retains an independent terminal sample and stops when the selected
-transport's exact expected bridge-take total proves that request traffic, rather
-than later trace polling, is complete. It is reaped before removing only the
+The monitor retains an independent terminal sample and stops when the exact
+aggregate TCP-inject outcome total proves that outbound request publication,
+rather than later trace polling, is complete. It is reaped before removing only the
 deterministic keys reconstructed from the captured PID, namespace, and
 non-secret per-run token base, verifies every synthetic key is absent, then
 retains two consecutive at-or-below-baseline samples within a bounded TTL-aware
 recovery deadline. Canonical cleanup evidence is promoted only after that
 recovery gate passes. The incarnation capability is never written to evidence.
+Pressure results report exact hits and explicit Java roots separately: every
+nonzero parent must identify the exact Apache client, exact hits plus roots must
+equal the request count, and wrong-parent and unresolved counts must be zero.
+Stable bridge deltas retain upstream and retrieval failures by reason. A
+transport-aware conservation check reconciles those aggregate bridge outcomes
+and the Java diagnostic counts with the trace outcomes.
 For a production-style sustained benchmark, keep the stack with `--keep` and
 add a fixed-duration external load generator; do not compare that result
 directly with the bounded runner.

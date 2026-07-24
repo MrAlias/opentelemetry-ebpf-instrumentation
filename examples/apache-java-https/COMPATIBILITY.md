@@ -116,5 +116,8 @@ before changing that status.
 
 Attach the result directories, `bpftool feature probe` output, cgroup mount
 layout, `uname -a`, container image IDs, and any reason-coded miss/drop
-counters. A pass requires zero wrong parents; an explicit miss may be reported
-only in a test whose expected outcome permits it.
+counters. A pass requires zero wrong parents. Under live map pressure, an
+explicit Java root is permitted only when the transport-aware bridge pipeline
+conserves the full request count, retains the actual upstream and retrieval
+failure reasons, and reconciles with the aggregate Java diagnostics. Other
+tests may report a miss only when their expected outcome permits it.

@@ -53,6 +53,7 @@ test_project_name_validation() {
 test_compose_cleanup_requires_ownership_sentinel() {
   local -r fake_bin="$TEST_TMP_DIR/fake-docker-bin"
   local -r docker_log="$TEST_TMP_DIR/fake-docker.log"
+  local -r docker_down_marker="$TEST_TMP_DIR/fake-docker-down"
   local -r fake_docker="$fake_bin/docker"
 
   mkdir -p -- "$fake_bin"
@@ -61,9 +62,9 @@ test_compose_cleanup_requires_ownership_sentinel() {
 set -Eeuo pipefail
 printf '%s\n' "$*" >>"$FAKE_DOCKER_LOG"
 case "$1 $2" in
-  "container ls") printf 'demo-container\n' ;;
-  "volume ls") printf 'demo-volume\n' ;;
-  "network ls") printf 'demo-network\n' ;;
+  "container ls") [[ -e "$FAKE_DOCKER_DOWN_MARKER" ]] || printf 'demo-container\n' ;;
+  "volume ls") [[ -e "$FAKE_DOCKER_DOWN_MARKER" ]] || printf 'demo-volume\n' ;;
+  "network ls") [[ -e "$FAKE_DOCKER_DOWN_MARKER" ]] || printf 'demo-network\n' ;;
   "container inspect"|"volume inspect"|"network inspect")
     if [[ "$FAKE_DOCKER_MODE" == "foreign" && "$1" == "container" ]]; then
       printf 'someone-else\n'
@@ -71,7 +72,15 @@ case "$1 $2" in
       printf 'acceptance-demo-v1\n'
     fi
     ;;
-  "compose --project-name") ;;
+  "compose --project-name")
+    [[ "$*" == *" --profile * down --volumes --remove-orphans --timeout 10" ]] || {
+      printf 'cleanup omitted all Compose profiles: %s\n' "$*" >&2
+      exit 65
+    }
+    if [[ "$FAKE_DOCKER_MODE" != "leftover" ]]; then
+      : >"$FAKE_DOCKER_DOWN_MARKER"
+    fi
+    ;;
   *) printf 'unexpected fake Docker arguments: %s\n' "$*" >&2; exit 64 ;;
 esac
 EOF
@@ -80,6 +89,7 @@ EOF
   (
     export PATH="$fake_bin:$PATH"
     export FAKE_DOCKER_LOG="$docker_log"
+    export FAKE_DOCKER_DOWN_MARKER="$docker_down_marker"
     export FAKE_DOCKER_MODE=owned
     PROJECT_NAME="obi-apache-java-https-test"
     COMPOSE=(docker compose --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE")
@@ -93,11 +103,17 @@ EOF
     printf 'ownership verification omitted stopped project containers\n' >&2
     return 1
   }
+  grep -Fq ' --profile * down --volumes --remove-orphans --timeout 10' "$docker_log" || {
+    printf 'cleanup did not activate every Compose profile\n' >&2
+    return 1
+  }
 
   : >"$docker_log"
+  rm -f -- "$docker_down_marker"
   if (
     export PATH="$fake_bin:$PATH"
     export FAKE_DOCKER_LOG="$docker_log"
+    export FAKE_DOCKER_DOWN_MARKER="$docker_down_marker"
     export FAKE_DOCKER_MODE=foreign
     PROJECT_NAME="obi-apache-java-https-test"
     COMPOSE=(docker compose --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE")
@@ -110,6 +126,68 @@ EOF
     printf 'cleanup invoked Compose down after ownership verification failed\n' >&2
     return 1
   fi
+
+  : >"$docker_log"
+  rm -f -- "$docker_down_marker"
+  if (
+    export PATH="$fake_bin:$PATH"
+    export FAKE_DOCKER_LOG="$docker_log"
+    export FAKE_DOCKER_DOWN_MARKER="$docker_down_marker"
+    export FAKE_DOCKER_MODE=leftover
+    PROJECT_NAME="obi-apache-java-https-test"
+    COMPOSE=(docker compose --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE")
+    safe_compose_down
+  ) >/dev/null 2>&1; then
+    printf 'cleanup accepted project resources left behind by Compose\n' >&2
+    return 1
+  fi
+}
+
+test_cleanup_failure_changes_successful_run_status() {
+  local -r result_dir="$TEST_TMP_DIR/cleanup-failure-result"
+  local cleanup_status=0
+
+  mkdir -- "$result_dir"
+  if (
+    PRESSURE_ACTIVE=false
+    RESULT_DIR="$result_dir"
+    STACK_STARTED=true
+    KEEP_RUNNING=false
+    MATCHING_BRIDGE_RUNNING=false
+    TMP_DIR=""
+    RUN_STATUS=passed
+    ACCEPTANCE_EVIDENCE=true
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    cleanup_security_processes() { :; }
+    capture_evidence() { :; }
+    safe_compose_down() { return 17; }
+
+    cleanup
+  ) >/dev/null 2>&1; then
+    printf 'cleanup failure preserved a successful process exit\n' >&2
+    return 1
+  else
+    cleanup_status=$?
+  fi
+  [[ "$cleanup_status" == "17" ]] || {
+    printf 'cleanup failure returned status %s instead of 17\n' "$cleanup_status" >&2
+    return 1
+  }
+  grep -Fq '"status": "failed"' "$result_dir/run-status.json" || {
+    printf 'cleanup failure retained a passed run status\n' >&2
+    return 1
+  }
+  grep -Fq '"exit_status": 17' "$result_dir/run-status.json" || {
+    printf 'cleanup failure status was absent from run-status.json\n' >&2
+    return 1
+  }
+  grep -Fq '"failure_stage": "compose-cleanup"' "$result_dir/run-status.json" || {
+    printf 'cleanup failure stage was absent from run-status.json\n' >&2
+    return 1
+  }
 }
 
 test_acceptance_requires_fresh_bridge_build() {
@@ -4184,6 +4262,7 @@ main() {
   TEST_TMP_DIR="$(mktemp -d)"
   test_project_name_validation
   test_compose_cleanup_requires_ownership_sentinel
+  test_cleanup_failure_changes_successful_run_status
   test_acceptance_requires_fresh_bridge_build
   test_custom_all_request_count_is_non_acceptance
   test_numeric_options_reject_overflow

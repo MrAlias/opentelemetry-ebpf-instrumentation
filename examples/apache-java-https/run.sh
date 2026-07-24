@@ -576,12 +576,31 @@ verify_compose_project_ownership() {
   done
 }
 
+verify_compose_project_absent() {
+  local resource_kind=""
+  local resources_output=""
+
+  for resource_kind in container volume network; do
+    resources_output="$(compose_resource_ids "$resource_kind")" || {
+      log_error "could not enumerate $resource_kind resources after cleaning Compose project $PROJECT_NAME"
+      return 1
+    }
+    if [[ -n "$resources_output" ]]; then
+      log_error "Compose project $PROJECT_NAME retained $resource_kind resources after cleanup"
+      return 1
+    fi
+  done
+}
+
 safe_compose_down() {
   verify_compose_project_ownership || {
     log_error "refusing destructive cleanup for unverified Compose project $PROJECT_NAME"
     return 1
   }
-  run_bounded 60 "${COMPOSE[@]}" down --volumes --remove-orphans --timeout 10
+  run_bounded 60 \
+    "${COMPOSE[@]}" --profile '*' \
+    down --volumes --remove-orphans --timeout 10 || return
+  verify_compose_project_absent
 }
 
 on_error() {
@@ -644,6 +663,8 @@ cleanup_security_processes() {
 
 cleanup() {
   local -r status="$?"
+  local final_status="$status"
+  local cleanup_status=0
   trap - ERR EXIT INT TERM
   set +e
 
@@ -657,8 +678,6 @@ cleanup() {
   cleanup_security_processes
   if [[ -n "${RESULT_DIR:-}" && -d "$RESULT_DIR" ]]; then
     capture_evidence
-    write_run_status "$status"
-    log_info "retained run evidence: $RESULT_DIR"
   fi
   if [[ "$MATCHING_BRIDGE_RUNNING" == "true" ]]; then
     log_warn "stopping the transient controlled matching bridge"
@@ -671,17 +690,28 @@ cleanup() {
   fi
   if [[ "$STACK_STARTED" == "true" && "$KEEP_RUNNING" == "false" ]]; then
     log_info "stopping scoped Compose project $PROJECT_NAME"
-    if ! safe_compose_down >/dev/null 2>&1; then
+    if safe_compose_down >/dev/null 2>&1; then
+      :
+    else
+      cleanup_status=$?
       log_error "Compose project cleanup was refused or failed"
+      if ((final_status == 0)); then
+        final_status="$cleanup_status"
+        record_failure "compose-cleanup" 0 "$cleanup_status" "safe_compose_down"
+      fi
     fi
   elif [[ "$STACK_STARTED" == "true" ]]; then
     log_warn "leaving Compose project $PROJECT_NAME running by request"
+  fi
+  if [[ -n "${RESULT_DIR:-}" && -d "$RESULT_DIR" ]]; then
+    write_run_status "$final_status"
+    log_info "retained run evidence: $RESULT_DIR"
   fi
   if [[ -n "${TMP_DIR:-}" && -d "$TMP_DIR" ]]; then
     rm -rf -- "$TMP_DIR"
   fi
 
-  exit "$status"
+  exit "$final_status"
 }
 
 install_traps() {

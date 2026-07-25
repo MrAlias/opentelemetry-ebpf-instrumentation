@@ -1,0 +1,119 @@
+{
+  "status": "passed",
+  "scenario": "disabled",
+  "seed": 2,
+  "started_at": "2026-07-25T08:37:31.977414773Z",
+  "finished_at": "2026-07-25T08:37:49.997203479Z",
+  "request_count": 1,
+  "traffic_elapsed_nanos": 16697453,
+  "throughput_per_second": 59.8893735469715,
+  "latency": {
+    "p50_nanos": 16696702,
+    "p95_nanos": 16696702,
+    "p99_nanos": 16696702
+  },
+  "cases": [
+    {
+      "request": {
+        "marker": "disabled-00-e85717e5b11c6e22",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "disabled-00-e85717e5b11c6e22",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 3,
+        "backend_remote_port": 48830,
+        "tls_read_events": 4,
+        "tls_read_bytes": 799
+      },
+      "latency_nanos": 16696702,
+      "trace": {
+        "marker": "disabled-00-e85717e5b11c6e22",
+        "received_batches": 2,
+        "received_spans": 13,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 2324,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "05a9f7a3d7cc379fef69eba724578084",
+            "span_id": "b62c1d2a5e7d03f3",
+            "flags": 259,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "disabled-00-e85717e5b11c6e22",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1784968651993773504,
+            "end_unix_nano": 1784968651995583444
+          },
+          {
+            "trace_id": "fbc2ba26cf027bbbf130503123847386",
+            "span_id": "606c97b8999faa42",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "disabled-00-e85717e5b11c6e22",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1784968651979029519,
+            "end_unix_nano": 1784968651995011053
+          },
+          {
+            "trace_id": "fbc2ba26cf027bbbf130503123847386",
+            "span_id": "2330b5bb147d33a0",
+            "parent_span_id": "606c97b8999faa42",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1784968651979186163,
+            "end_unix_nano": 1784968651995011053
+          },
+          {
+            "trace_id": "fbc2ba26cf027bbbf130503123847386",
+            "span_id": "667aed0f5345f6b7",
+            "parent_span_id": "2330b5bb147d33a0",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "disabled-00-e85717e5b11c6e22",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1"
+            },
+            "start_unix_nano": 1784968651979362392,
+            "end_unix_nano": 1784968651994797717
+          }
+        ]
+      }
+    }
+  ]
+}

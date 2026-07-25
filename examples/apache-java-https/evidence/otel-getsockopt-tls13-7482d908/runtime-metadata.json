@@ -1,0 +1,34 @@
+{
+  "evidence_id": "otel-getsockopt-tls13-7482d908",
+  "source_revision": "7482d90807afd849575a8f8dda67e255daf0680d",
+  "sanitized": true,
+  "host": {
+    "architecture": "x86_64",
+    "kernel_release": "6.17.0-1019-aws",
+    "cgroup_filesystem": "cgroup2fs",
+    "vmlinux_btf": "readable",
+    "docker_version": "29.6.2",
+    "compose_version": "5.3.1"
+  },
+  "apache": {
+    "version": "2.4.68",
+    "ssl_module_loaded": true,
+    "openssl_runtime": "3.5.7",
+    "health_status": 200
+  },
+  "backend": {
+    "java_runtime": "Eclipse Temurin 21.0.10+7",
+    "tls_protocol": "TLSv1.3",
+    "http_protocol": "HTTP/1.1",
+    "official_agent_distribution": "opentelemetry",
+    "official_agent_version": "2.28.1",
+    "extension_version": "0.1.0",
+    "extension_separately_loaded": true,
+    "dynamic_helper_attached": true,
+    "remote_parent_provider_ready": true
+  },
+  "bridge": {
+    "transport": "getsockopt",
+    "ready": true
+  }
+}

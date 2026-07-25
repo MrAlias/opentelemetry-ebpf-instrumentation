@@ -1,9 +1,9 @@
 # Compatibility evidence matrix
 
-All cells below are **untested** until a run artifact from that exact cell is
-attached. Kernel or distribution version inference is not evidence. Runtime
-feature detection must name the selected transport; `auto` cannot stand in for
-forced primary and fallback tests.
+Cells without a linked run artifact remain **untested**. Kernel or distribution
+version inference is not evidence. Runtime feature detection must name the
+selected transport; `auto` cannot stand in for forced primary and fallback
+tests.
 
 Each result must be one of `pass`, `fail`, `unsupported`, or `untested` and
 include revision, kernel, architecture, cgroup mode, JVM, agent, Apache,
@@ -27,6 +27,13 @@ stack while varying this table.
 | supported kernel | nested/delegated v2 | untested | untested | untested |
 | supported kernel | sibling containers | untested | untested | untested |
 
+The following additional host is directly observed. It is not a substitute for
+any representative kernel row above.
+
+| Environment | Cgroup topology | `getsockopt` | `unix` | `auto` | Evidence |
+| --- | --- | --- | --- | --- | --- |
+| Linux 6.17.0-1019-aws (distribution not recorded) | unified v2 | pass | untested | untested | [clean full OpenTelemetry/TLS 1.3 run](evidence/otel-getsockopt-tls13-7482d908/README.md) |
+
 RHEL 8 support may only be reported from direct execution on the documented
 backport. If a required cgroup hook is absent, report forced `getsockopt` as
 `unsupported` with feature-detection evidence and test the Unix fallback.
@@ -38,7 +45,7 @@ agent, TLS 1.3, and both forced transports.
 
 | Architecture | `getsockopt` | `unix` | Evidence |
 | --- | --- | --- | --- |
-| `amd64` | untested | untested | not recorded |
+| `amd64` | pass | untested | [Linux 6.17/OpenTelemetry/TLS 1.3](evidence/otel-getsockopt-tls13-7482d908/README.md) |
 | `arm64` | untested | untested | not recorded |
 
 ## JVM and official agent
@@ -70,7 +77,7 @@ Compose run for a matrix cell below.
 | 8 | untested | untested | configured official-agent smoke; no privileged run recorded |
 | 11 | untested | untested | configured official-agent smoke; no privileged run recorded |
 | 17 | untested | untested | configured official-agent smoke; no privileged run recorded |
-| 21 | untested | untested | configured official-agent smoke; no privileged run recorded |
+| 21 | pass | untested | [Temurin 21/OpenTelemetry/`amd64` privileged run](evidence/otel-getsockopt-tls13-7482d908/README.md) |
 
 Additional agent releases must be selected deliberately, pinned by checksum,
 and added as new rows. “Latest” is not a matrix cell.
@@ -79,12 +86,15 @@ and added as new rows. “Latest” is not a matrix cell.
 
 | Apache / OpenSSL | TLS 1.2 | TLS 1.3 | Backend HTTP |
 | --- | --- | --- | --- |
-| `httpd:2.4.68-alpine` image pinned in Compose | untested | untested | HTTP/1.1 only |
+| `httpd:2.4.68-alpine` image pinned in Compose | untested | [pass graph](evidence/otel-getsockopt-tls13-7482d908/scenario-basic.json), [runtime](evidence/otel-getsockopt-tls13-7482d908/apache-openssl-runtime.txt) | HTTP/1.1 only |
 
-Every run must retain `apache-openssl-version.txt` proving that Apache loaded
+Every run must produce `apache-openssl-version.txt` proving that Apache loaded
 `ssl_module`, that `mod_ssl.so` links to `libssl.so.3` and `libcrypto.so.3`,
 and that Alpine attributes those exact runtime libraries to the expected
-OpenSSL packages. Missing or malformed runtime evidence fails the run.
+OpenSSL packages. A public retained subset may publish the allowlisted result
+as `apache-openssl-runtime.txt`, but the TLS pass also requires a linked
+scenario response naming the negotiated protocol and cipher. Missing or
+malformed runtime evidence fails the run.
 
 Backend HTTP/2 is currently **unsupported**, not silently untested. If support
 is later proposed, it needs a separate topology and exact concurrency evidence
@@ -121,3 +131,9 @@ explicit Java root is permitted only when the transport-aware bridge pipeline
 conserves the full request count, retains the actual upstream and retrieval
 failure reasons, and reconciles with the aggregate Java diagnostics. Other
 tests may report a miss only when their expected outcome permits it.
+
+The narrowest directly demonstrated configuration is currently the exact Linux
+6.17.0-1019-aws, unified-cgroup-v2, `amd64`, Temurin 21, OpenTelemetry 2.28.1,
+forced-`getsockopt`, Apache 2.4.68, OpenSSL 3.5.7, TLS 1.3 cell linked above.
+The distribution was not recorded independently, and no broader compatibility
+claim follows from that result.

@@ -1,0 +1,37 @@
+{
+  "status": "passed",
+  "transport": "getsockopt",
+  "same_cgroup": {
+    "topology": "probe executed in the backend container",
+    "requested_user": "65534:65534",
+    "backend_cgroup": "0::/",
+    "probe_cgroup": "0::/",
+    "cgroup_match": true,
+    "attempts": 25318,
+    "cases": [
+      {"name": "standard-option", "outcome": "preserved"},
+      {"name": "unrelated-name", "outcome": "not-intercepted"},
+      {"name": "unrelated-level", "outcome": "not-intercepted"},
+      {"name": "wrong-process-negotiation", "outcome": "native-unsupported"},
+      {"name": "retrieval-sizes", "outcome": "bounded"},
+      {"name": "repeated-retrieval", "outcome": "native-unsupported"}
+    ]
+  },
+  "sibling": {
+    "topology": "separate sibling container",
+    "requested_user": "0:0",
+    "network_mode": "none",
+    "pid_namespace": "container-private",
+    "attempts": 27953,
+    "cases": [
+      {"name": "standard-option", "outcome": "preserved"},
+      {"name": "unrelated-name", "outcome": "not-intercepted"},
+      {"name": "unrelated-level", "outcome": "not-intercepted"},
+      {"name": "wrong-process-negotiation", "outcome": "native-unsupported"},
+      {"name": "retrieval-sizes", "outcome": "bounded"},
+      {"name": "repeated-retrieval", "outcome": "native-unsupported"}
+    ]
+  },
+  "legitimate_victim_result": "scenario-concurrency-security-primary-victim.json",
+  "post_abuse_recovery_result": "scenario-basic-security-primary-recovery.json"
+}

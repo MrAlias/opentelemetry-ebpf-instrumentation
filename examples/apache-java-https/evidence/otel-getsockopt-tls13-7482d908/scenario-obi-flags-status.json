@@ -1,0 +1,9 @@
+{
+  "status": "passed",
+  "scenario": "obi-flags",
+  "exit_status": 0,
+  "metric_status": 0,
+  "pressure_correlation": null,
+  "result": "scenario-obi-flags.json",
+  "after_phase": "phases/obi-flags-after"
+}

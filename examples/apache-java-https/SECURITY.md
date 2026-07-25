@@ -1,39 +1,42 @@
 # Security and abuse-case matrix
 
-Status: **untested**
+Status: **partial — retained primary scenarios passed; remaining primary and
+Unix cases untested**
 
 The PoC crosses a kernel/JVM trust boundary and exposes a local Unix fallback.
 Passing the happy path is insufficient. Every negative cell must preserve
 application availability, avoid consuming another request's context, finish
 within a bounded deadline, and produce a low-cardinality reason code without
 logging trace IDs, headers, bodies, credentials, PID/TID labels, or socket
-payloads.
+payloads. Primary `pass` entries below refer only to the exact retained
+[OpenTelemetry/`getsockopt`/TLS 1.3 run](evidence/otel-getsockopt-tls13-7482d908/README.md).
 
-| Abuse or fault | Required result | Status |
-| --- | --- | --- |
-| unrelated process in same cgroup calls take | denied; legitimate Java take still succeeds | untested |
-| sibling container/PID namespace calls take | denied by current identity/peer credentials | untested |
-| forged caller PID/TID in Unix request | ignored; kernel peer identity is authoritative | untested |
-| repeated unauthorized take attempts | bounded/rate-limited; context remains available | untested |
-| wrong socket identity or fd reuse | closed/reopened fixed-port traffic; reused Jetty fd across distinct stable Jetty connection IDs; distinct exact parents; zero wrong parents | untested |
-| unrelated socket option/level | original kernel behavior preserved | untested |
-| Unix socket path replacement | startup fails closed or uses protected endpoint | untested |
-| permissive Unix directory mode | rejected or prominently diagnosed | untested |
-| malformed/truncated versioned request | rejected without crash or parent | untested |
-| oversized/repeated/flooded Unix request | bounded CPU/memory/logging | untested |
-| malformed/zero trace or span ID | discarded; Java request remains healthy | untested |
-| stale entry past TTL | miss; never a parent | untested |
-| live handoff-map pressure/eviction | order-independent eviction; exact hits, explicit roots, and actual upstream/retrieval reason counts reconciled by transport; zero wrong or unresolved parents; exact-key cleanup and steady-baseline recovery | untested |
-| OBI absent or delayed | Java root span and healthy response | untested |
-| OBI restart with old endpoint/fd | no stale parent; recovery only if claimed | untested |
-| helper absent/disabled | ordinary official-agent behavior | untested |
-| extension absent/disabled | ordinary official-agent behavior | untested |
-| both transports unavailable | bounded fail-open, no retry storm | untested |
-| ABI version/length mismatch | rejected with version reason | untested |
-| valid W3C plus conflicting OBI context | W3C exact IDs win; OBI entry discarded | untested |
-| valid W3C with no OBI state | exact W3C parent; bounded no-state lookup; no Apache span | untested |
-| repeated async redispatch | one Java server span; one request-scoped parent | untested |
-| diagnostic endpoint/log scrape | no raw context/request data or scenario-counter contamination | untested |
+| Abuse or fault | Required result | Primary `getsockopt` | Unix | Evidence or remaining work |
+| --- | --- | --- | --- | --- |
+| unrelated process in same cgroup calls take | denied; legitimate Java take still succeeds | pass | untested | [sanitized probe topology and result](evidence/otel-getsockopt-tls13-7482d908/security-primary-probes.json) and [victim](evidence/otel-getsockopt-tls13-7482d908/scenario-concurrency-security-primary-victim.json) |
+| sibling container/PID namespace calls take | denied by current identity/peer credentials | pass | untested | [sanitized sibling topology and result](evidence/otel-getsockopt-tls13-7482d908/security-primary-probes.json) and [recovery](evidence/otel-getsockopt-tls13-7482d908/scenario-basic-security-primary-recovery.json) |
+| forged caller PID/TID in Unix request | ignored; kernel peer identity is authoritative | not applicable | untested | execute the Unix security suite |
+| repeated unauthorized take attempts | bounded/rate-limited; context remains available | untested | untested | retained probes show bounded completion and recovery, but do not independently prove rate limiting |
+| wrong socket identity | rejected without consuming another request's context | untested | untested | retain a targeted wrong-socket result |
+| fd reuse | closed/reopened fixed-port traffic; reused Jetty fd across distinct stable Jetty connection IDs; distinct exact parents; zero wrong parents | pass | untested | [reuse graph and connection evidence](evidence/otel-getsockopt-tls13-7482d908/scenario-fd-port-reuse.json) |
+| unrelated socket option/level | original kernel behavior preserved | pass | not applicable | [primary probe cases](evidence/otel-getsockopt-tls13-7482d908/security-primary-probes.json) |
+| Unix socket path replacement | startup fails closed or uses protected endpoint | not applicable | untested | execute the Unix security suite |
+| permissive Unix directory mode | rejected or prominently diagnosed | not applicable | untested | execute the Unix security suite |
+| malformed/truncated versioned request | rejected without crash or parent | untested | untested | retain clean full transport-specific evidence |
+| oversized/repeated/flooded Unix request | bounded CPU/memory/logging | not applicable | untested | execute the Unix security suite |
+| malformed/zero trace or span ID | discarded; Java request remains healthy | untested | untested | retain clean full transport-specific evidence |
+| stale entry past TTL | miss; never a parent | untested | untested | retain clean full transport-specific evidence |
+| live handoff-map pressure/eviction | order-independent eviction; exact hits, explicit roots, and actual upstream/retrieval reason counts reconciled by transport; zero wrong or unresolved parents; exact-key cleanup and steady-baseline recovery | pass | untested | [pressure status](evidence/otel-getsockopt-tls13-7482d908/scenario-pressure-status.json) and [sanitized pressure summary](evidence/otel-getsockopt-tls13-7482d908/map-pressure-summary.json) |
+| OBI absent or delayed | Java root span and healthy response | pass | untested | [OBI-absent](evidence/otel-getsockopt-tls13-7482d908/scenario-fail-open-obi-absent.json) and [late-attach recovery](evidence/otel-getsockopt-tls13-7482d908/scenario-restart-late-attach-recovery.json) |
+| OBI restart with old endpoint/fd | no stale parent; recovery only if claimed | pass | untested | [restart traffic](evidence/otel-getsockopt-tls13-7482d908/scenario-restart-fault.json) and [events](evidence/otel-getsockopt-tls13-7482d908/restart-control/events.log) |
+| helper absent/disabled | ordinary official-agent behavior | pass | untested | [helper failure](evidence/otel-getsockopt-tls13-7482d908/scenario-helper-attach-failure-helper-unavailable.json) and [bridge disabled](evidence/otel-getsockopt-tls13-7482d908/scenario-disabled.json) |
+| extension absent/disabled | ordinary official-agent behavior | pass | untested | [extension absent](evidence/otel-getsockopt-tls13-7482d908/scenario-w3c-only-extension-absent.json) and [disabled](evidence/otel-getsockopt-tls13-7482d908/scenario-w3c-only-extension-disabled.json) |
+| both transports unavailable | bounded fail-open, no retry storm | pass | untested | [OBI-absent root](evidence/otel-getsockopt-tls13-7482d908/scenario-fail-open-obi-absent.json) and [W3C-only](evidence/otel-getsockopt-tls13-7482d908/scenario-w3c-only-obi-absent.json) |
+| ABI version/length mismatch | rejected with version reason | untested | untested | retain clean full transport-specific evidence |
+| valid W3C plus conflicting OBI context | W3C exact IDs win; OBI entry discarded | pass | untested | [conflict graph and counters](evidence/otel-getsockopt-tls13-7482d908/scenario-w3c.json) |
+| valid W3C with no OBI state | exact W3C parent; bounded no-state lookup; no Apache span | pass | untested | [W3C-only graph](evidence/otel-getsockopt-tls13-7482d908/scenario-w3c-only-obi-absent.json) |
+| repeated async redispatch | one Java server span; one request-scoped parent | pass | untested | [redispatch graph](evidence/otel-getsockopt-tls13-7482d908/scenario-dispatch.json) |
+| diagnostic endpoint/log scrape | no raw context/request data or scenario-counter contamination | pass | untested | retained fixed-schema `phases/*/{java-diagnostics,obi-metrics}.delta` and [public-bundle sanitization record](evidence/otel-getsockopt-tls13-7482d908/SANITIZATION.md) |
 
 ## Test topology
 

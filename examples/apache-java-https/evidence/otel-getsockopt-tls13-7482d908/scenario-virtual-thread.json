@@ -1,0 +1,445 @@
+{
+  "status": "passed",
+  "scenario": "virtual-thread",
+  "seed": 1,
+  "started_at": "2026-07-25T08:30:32.323721113Z",
+  "finished_at": "2026-07-25T08:30:47.763134096Z",
+  "request_count": 4,
+  "traffic_elapsed_nanos": 35497706,
+  "throughput_per_second": 112.68333790358172,
+  "latency": {
+    "p50_nanos": 35310878,
+    "p95_nanos": 35443891,
+    "p99_nanos": 35443891
+  },
+  "cases": [
+    {
+      "request": {
+        "marker": "virtual-thread-00-84aca3ab04bf90af",
+        "endpoint": "/api/virtual"
+      },
+      "response": {
+        "marker": "virtual-thread-00-84aca3ab04bf90af",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 253,
+        "backend_remote_port": 49742,
+        "tls_read_events": 7524,
+        "tls_read_bytes": 608290,
+        "workload": "virtual-thread",
+        "virtual_mixed": "0",
+        "virtual_cancel": "0"
+      },
+      "latency_nanos": 35230920,
+      "trace": {
+        "marker": "virtual-thread-00-84aca3ab04bf90af",
+        "received_batches": 2,
+        "received_spans": 24,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 5214,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "3193ef063406b694fbe2912f28447676",
+            "span_id": "c2318ffa0fb8c6c6",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/virtual",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "virtual-thread-00-84aca3ab04bf90af",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/virtual",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/virtual"
+            },
+            "start_unix_nano": 1784968232325747024,
+            "end_unix_nano": 1784968232359991706
+          },
+          {
+            "trace_id": "3193ef063406b694fbe2912f28447676",
+            "span_id": "13070265c694dadc",
+            "parent_span_id": "c2318ffa0fb8c6c6",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1784968232325812608,
+            "end_unix_nano": 1784968232359991706
+          },
+          {
+            "trace_id": "3193ef063406b694fbe2912f28447676",
+            "span_id": "ccdbc11522598290",
+            "parent_span_id": "13070265c694dadc",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/virtual",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "virtual-thread-00-84aca3ab04bf90af",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/virtual?cancel=0\u0026close=1\u0026mixed=0"
+            },
+            "start_unix_nano": 1784968232326062851,
+            "end_unix_nano": 1784968232359714359
+          },
+          {
+            "trace_id": "3193ef063406b694fbe2912f28447676",
+            "span_id": "ef9117748f346831",
+            "parent_span_id": "ccdbc11522598290",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/virtual",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "virtual-thread-00-84aca3ab04bf90af",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/virtual",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/virtual"
+            },
+            "start_unix_nano": 1784968232333419872,
+            "end_unix_nano": 1784968232361037270
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "virtual-thread-01-81258b8b3c2ef39c",
+        "endpoint": "/api/virtual",
+        "virtual_mixed": true
+      },
+      "response": {
+        "marker": "virtual-thread-01-81258b8b3c2ef39c",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 255,
+        "backend_remote_port": 49726,
+        "tls_read_events": 7524,
+        "tls_read_bytes": 608290,
+        "workload": "virtual-thread",
+        "virtual_mixed": "1",
+        "virtual_cancel": "0"
+      },
+      "latency_nanos": 35310878,
+      "trace": {
+        "marker": "virtual-thread-01-81258b8b3c2ef39c",
+        "received_batches": 2,
+        "received_spans": 24,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 5214,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "1b47aeb3bae77cd8a00701fc405f5b36",
+            "span_id": "a14e0afe872b5466",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/virtual",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "virtual-thread-01-81258b8b3c2ef39c",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/virtual",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/virtual"
+            },
+            "start_unix_nano": 1784968232325713963,
+            "end_unix_nano": 1784968232360032481
+          },
+          {
+            "trace_id": "1b47aeb3bae77cd8a00701fc405f5b36",
+            "span_id": "8b9d0edde715a327",
+            "parent_span_id": "a14e0afe872b5466",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1784968232325789373,
+            "end_unix_nano": 1784968232360032481
+          },
+          {
+            "trace_id": "1b47aeb3bae77cd8a00701fc405f5b36",
+            "span_id": "a363c3ecc9327ca2",
+            "parent_span_id": "8b9d0edde715a327",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/virtual",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "virtual-thread-01-81258b8b3c2ef39c",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/virtual?cancel=0\u0026close=1\u0026mixed=1"
+            },
+            "start_unix_nano": 1784968232326019716,
+            "end_unix_nano": 1784968232359682543
+          },
+          {
+            "trace_id": "1b47aeb3bae77cd8a00701fc405f5b36",
+            "span_id": "5ceb613acb0c63d9",
+            "parent_span_id": "a363c3ecc9327ca2",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/virtual",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "virtual-thread-01-81258b8b3c2ef39c",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/virtual",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/virtual"
+            },
+            "start_unix_nano": 1784968232332241888,
+            "end_unix_nano": 1784968232360096728
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "virtual-thread-02-69181de3112db607",
+        "endpoint": "/api/virtual",
+        "virtual_cancel": true
+      },
+      "response": {
+        "marker": "virtual-thread-02-69181de3112db607",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 252,
+        "backend_remote_port": 49716,
+        "tls_read_events": 7524,
+        "tls_read_bytes": 608290,
+        "workload": "virtual-thread",
+        "virtual_mixed": "0",
+        "virtual_cancel": "1"
+      },
+      "latency_nanos": 35338277,
+      "trace": {
+        "marker": "virtual-thread-02-69181de3112db607",
+        "received_batches": 2,
+        "received_spans": 24,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 5214,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "ac62e640e34d4dcdb6939dc718751a83",
+            "span_id": "c48ab801d0082869",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/virtual",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "virtual-thread-02-69181de3112db607",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/virtual",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/virtual"
+            },
+            "start_unix_nano": 1784968232325510254,
+            "end_unix_nano": 1784968232359962963
+          },
+          {
+            "trace_id": "ac62e640e34d4dcdb6939dc718751a83",
+            "span_id": "475bc67f594d612f",
+            "parent_span_id": "c48ab801d0082869",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1784968232325683554,
+            "end_unix_nano": 1784968232359962963
+          },
+          {
+            "trace_id": "ac62e640e34d4dcdb6939dc718751a83",
+            "span_id": "2e382e8652a37a2d",
+            "parent_span_id": "475bc67f594d612f",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/virtual",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "virtual-thread-02-69181de3112db607",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/virtual?cancel=1\u0026close=1\u0026mixed=0"
+            },
+            "start_unix_nano": 1784968232325827984,
+            "end_unix_nano": 1784968232359632144
+          },
+          {
+            "trace_id": "ac62e640e34d4dcdb6939dc718751a83",
+            "span_id": "58d3c008d3cd2e10",
+            "parent_span_id": "2e382e8652a37a2d",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/virtual",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "virtual-thread-02-69181de3112db607",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/virtual",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/virtual"
+            },
+            "start_unix_nano": 1784968232332097756,
+            "end_unix_nano": 1784968232360183868
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "virtual-thread-03-99a46ecb47f6e500",
+        "endpoint": "/api/virtual",
+        "virtual_mixed": true,
+        "virtual_cancel": true
+      },
+      "response": {
+        "marker": "virtual-thread-03-99a46ecb47f6e500",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 254,
+        "backend_remote_port": 49718,
+        "tls_read_events": 7524,
+        "tls_read_bytes": 608290,
+        "workload": "virtual-thread",
+        "virtual_mixed": "1",
+        "virtual_cancel": "1"
+      },
+      "latency_nanos": 35443891,
+      "trace": {
+        "marker": "virtual-thread-03-99a46ecb47f6e500",
+        "received_batches": 2,
+        "received_spans": 24,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 5214,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "b80f59fdeabc60742128fb97f40c2a6b",
+            "span_id": "c7dd39230802cd07",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/virtual",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "virtual-thread-03-99a46ecb47f6e500",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/virtual",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/virtual"
+            },
+            "start_unix_nano": 1784968232325509978,
+            "end_unix_nano": 1784968232359999276
+          },
+          {
+            "trace_id": "b80f59fdeabc60742128fb97f40c2a6b",
+            "span_id": "ffe62065d139e16e",
+            "parent_span_id": "c7dd39230802cd07",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1784968232325636947,
+            "end_unix_nano": 1784968232359999276
+          },
+          {
+            "trace_id": "b80f59fdeabc60742128fb97f40c2a6b",
+            "span_id": "274722831a753c03",
+            "parent_span_id": "ffe62065d139e16e",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/virtual",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "virtual-thread-03-99a46ecb47f6e500",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/virtual?cancel=1\u0026close=1\u0026mixed=1"
+            },
+            "start_unix_nano": 1784968232325953765,
+            "end_unix_nano": 1784968232359634213
+          },
+          {
+            "trace_id": "b80f59fdeabc60742128fb97f40c2a6b",
+            "span_id": "696f2fe9787f4d97",
+            "parent_span_id": "274722831a753c03",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/virtual",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "virtual-thread-03-99a46ecb47f6e500",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/virtual",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/virtual"
+            },
+            "start_unix_nano": 1784968232333139060,
+            "end_unix_nano": 1784968232360175124
+          }
+        ]
+      }
+    }
+  ]
+}

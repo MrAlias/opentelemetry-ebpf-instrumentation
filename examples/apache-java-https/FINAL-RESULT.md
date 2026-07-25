@@ -1,47 +1,48 @@
 # Final result record
 
-Status: **untested**
+Status: **partial — OpenTelemetry/`getsockopt`/TLS 1.3 passed**
 
-This file is a checked-in evidence template. No privileged eBPF/Compose run was
-performed merely by adding the example, so no acceptance item is marked pass.
-Replace `untested` only from a retained `.runtime/results/<run-id>/` bundle and
-link that bundle or its sanitized CI artifact.
+The clean full run
+[otel-getsockopt-tls13-7482d908](evidence/otel-getsockopt-tls13-7482d908/README.md)
+is retained with source revision, environment, scenario graphs, diagnostic
+deltas, and checksums. It proves only its exact matrix cell. Rows requiring a
+different transport, TLS version, agent, or environment remain `untested`.
 
-| Acceptance item | Status | Required evidence |
+| Acceptance item | Status | Evidence or remaining requirement |
 | --- | --- | --- |
-| Apache 2.4 proxies to Jetty over verified HTTPS | untested | `/healthz` body, Apache log, certificate metadata |
-| Backend protocol is HTTP/1.1 | untested | scenario response `protocol` |
+| Apache 2.4 proxies to Jetty over verified HTTPS | pass | [runtime and certificate evidence](evidence/otel-getsockopt-tls13-7482d908/README.md#retained-proof) |
+| Backend protocol is HTTP/1.1 | pass | [basic response and trace graph](evidence/otel-getsockopt-tls13-7482d908/scenario-basic.json) |
 | TLS 1.2 | untested | forced run and response `tls_protocol`/cipher |
-| TLS 1.3 | untested | forced run and response `tls_protocol`/cipher |
-| Official OpenTelemetry agent | untested | version, URL, checksum, startup log |
+| TLS 1.3 | pass | [basic response and trace graph](evidence/otel-getsockopt-tls13-7482d908/scenario-basic.json) |
+| Official OpenTelemetry agent | pass | [version, URL, and checksum](evidence/otel-getsockopt-tls13-7482d908/official-javaagent.json) |
 | Official Splunk agent | untested | version, URL, checksum, startup log |
-| OBI helper is dynamically attached | untested | exact helper readiness log |
-| External extension is separately loaded | untested | exact extension readiness log |
-| Forced `getsockopt` bridge | untested | exact trace/parent graph and transport log |
+| OBI helper is dynamically attached | pass | [startup and late-attach recovery](evidence/otel-getsockopt-tls13-7482d908/README.md#retained-proof) |
+| External extension is separately loaded | pass | [sanitized runtime metadata](evidence/otel-getsockopt-tls13-7482d908/runtime-metadata.json) |
+| Forced `getsockopt` bridge | pass | [exact trace/parent graph and run identity](evidence/otel-getsockopt-tls13-7482d908/README.md) |
 | Forced Unix fallback | untested | exact trace/parent graph and transport log |
-| Remote parent flag | untested | OTLP `HAS_IS_REMOTE` and `IS_REMOTE` bits on exact Java parent |
-| W3C-only, no OBI state | untested | OBI absent, exact remote W3C parent, no Apache spans |
-| Conflicting W3C context wins | untested | exact IDs/flags, distinct Apache candidate graph, one take and one `discard_standard` selection |
-| Matching W3C and OBI context | untested | isolated header+TCP injection, exact candidate parent/flags, one-shot counters |
-| Sampled and unsampled OBI-only context | untested | stripped backend W3C header, exact Apache flags, `take_sampled`/`take_unsampled` deltas |
+| Remote parent flag | pass | [basic exact-parent graph](evidence/otel-getsockopt-tls13-7482d908/scenario-basic.json) |
+| W3C-only, no OBI state | pass | [OBI-absent W3C graph](evidence/otel-getsockopt-tls13-7482d908/scenario-w3c-only-obi-absent.json) |
+| Conflicting W3C context wins | pass | [precedence graph and counters](evidence/otel-getsockopt-tls13-7482d908/scenario-w3c.json) |
+| Matching W3C and OBI context | pass | [matching-context graph](evidence/otel-getsockopt-tls13-7482d908/scenario-w3c-match.json) |
+| Sampled and unsampled OBI-only take outcomes | pass | [lookup classification graph and diagnostics](evidence/otel-getsockopt-tls13-7482d908/scenario-obi-flags.json) |
 | Valid W3C through Unix bridge faults | untested | named bounded responder modes, exact W3C parent/flags, exact attributable deltas |
-| Invalid W3C falls through to OBI | untested | exact OBI parent plus take delta |
-| Sequential backend keepalive | untested | one stable Jetty connection ID, zero wrong parents |
-| HTTP/1.1 pipelining | untested | one frontend connection, all requests written before the first response read, distinct exact parents, zero wrong parents |
-| Parallel requests/connections | untested | multiple stable Jetty connection IDs, distinct exact parents |
-| FD and ephemeral-port reuse | untested | fixed frontend source port across reconnects, reused frontend fd, reused Jetty fd across distinct stable Jetty connection IDs, distinct exact parents, zero wrong parents |
-| Servlet/executor handoff | untested | varied hops/faults and distinct exact parents |
-| Java 21 virtual-thread handoff | untested | mixed/canceled workloads and distinct exact parents |
-| Netty event-loop to worker handoff | untested | real event-loop/cancellation headers and exact parents |
-| Repeated servlet async redispatch | untested | invocation-count headers, one Java server span, and one bridge take |
-| Live handoff-map pressure | untested | exact map/JVM identity, fresh values, scanned order-independent eviction, above-baseline samples through aggregate TCP-inject completion, exact hits plus explicit roots, transport-aware upstream/retrieval reason conservation, zero wrong/unresolved parents, verified synthetic cleanup, steady-baseline recovery |
-| OBI absent at JVM start and late attach | untested | root/W3C behavior while absent, helper-ready log after OBI starts, exact-parent recovery without JVM restart |
-| Bridge-disabled control | untested | official agent/extension present, HTTP success, one Java root |
-| Extension absent and disabled controls | untested | official agent retained, exact W3C parent, healthy response in both topologies |
-| Uninstrumented control | untested | OBI/agent absent, equivalent HTTP response, zero marker spans |
-| Java SDK duplicate suppression | untested | avoided-service metric plus successful exact-parent bridge |
-| No duplicate Java server span | untested | exactly one span for every marker |
-| No vendor UI or backend | untested | resolved Compose topology |
+| Invalid W3C falls through to OBI | pass | [fallback graph and counters](evidence/otel-getsockopt-tls13-7482d908/scenario-w3c.json) |
+| Sequential backend keepalive | pass | [keepalive graph and connection evidence](evidence/otel-getsockopt-tls13-7482d908/scenario-keepalive.json) |
+| HTTP/1.1 pipelining | pass | [pipelining graph and connection evidence](evidence/otel-getsockopt-tls13-7482d908/scenario-pipelining.json) |
+| Parallel requests/connections | pass | [concurrency graph and connection evidence](evidence/otel-getsockopt-tls13-7482d908/scenario-concurrency.json) |
+| FD and ephemeral-port reuse | pass | [reuse graph and connection evidence](evidence/otel-getsockopt-tls13-7482d908/scenario-fd-port-reuse.json) |
+| Servlet/executor handoff | pass | [executor-handoff graph](evidence/otel-getsockopt-tls13-7482d908/scenario-handoff.json) |
+| Java 21 virtual-thread handoff | pass | [virtual-thread graph](evidence/otel-getsockopt-tls13-7482d908/scenario-virtual-thread.json) |
+| Netty event-loop to worker handoff | pass | [Netty handoff graph](evidence/otel-getsockopt-tls13-7482d908/scenario-netty.json) |
+| Repeated servlet async redispatch | pass | [redispatch graph](evidence/otel-getsockopt-tls13-7482d908/scenario-dispatch.json) |
+| Live handoff-map pressure | pass | [pressure accounting](evidence/otel-getsockopt-tls13-7482d908/scenario-pressure-status.json), [cleanup and recovery](evidence/otel-getsockopt-tls13-7482d908/map-pressure-summary.json) |
+| OBI absent at JVM start and late attach | pass | [absence, late attach, and recovery evidence](evidence/otel-getsockopt-tls13-7482d908/README.md#retained-proof) |
+| Bridge-disabled control | pass | [bridge-disabled graph](evidence/otel-getsockopt-tls13-7482d908/scenario-disabled.json) |
+| Extension absent and disabled controls | pass | [extension-control graphs](evidence/otel-getsockopt-tls13-7482d908/README.md#retained-proof) |
+| Uninstrumented control | pass | [zero-span control](evidence/otel-getsockopt-tls13-7482d908/scenario-uninstrumented.json) |
+| Java SDK duplicate suppression | pass | [allowlisted suppression metric](evidence/otel-getsockopt-tls13-7482d908/duplicate-suppression.json) |
+| No duplicate Java server span | pass | [all scenario graphs and statuses](evidence/otel-getsockopt-tls13-7482d908/README.md#retained-proof) |
+| No vendor UI or backend | pass | [sanitized runtime image inventory](evidence/otel-getsockopt-tls13-7482d908/runtime-images.json) |
 
 ## Reproduction commands
 
@@ -63,26 +64,25 @@ outcomes.
 
 ## Issue coverage and remaining evidence gaps
 
-The runner now implements the issue #28 extraction matrix listed below,
-including exact one-shot operation and selection counters. Those cases remain
-`untested` until a privileged run supplies retained evidence. Other issues can
-still require both implementation work and execution, as listed explicitly in
-the final column.
+The retained primary run now proves the applicable issue #28 extraction cases,
+including exact one-shot operation and selection counters. Unix, TLS 1.2,
+Splunk, benchmark, and external compatibility requirements remain open as
+listed in the final column.
 
 | Issue | Asset coverage | Still required before pass |
 | --- | --- | --- |
-| #19 Java SDK suppression | runtime assertion for the exact Java avoided-service metric followed by exact-parent bridge traffic | retain successful privileged-run evidence for both invariants |
-| #27 agent compatibility | pinned official OTel/Splunk downloads and selectable Compose startup | execute both artifacts and any additional supported-version cells |
-| #28 Java extraction matrix | stock-agent paths for no state, W3C-only, OBI-only, matching/conflicting W3C, sampled/unsampled flags, malformed-W3C fallback, reason-coded OBI fault fallback, redispatch, async, keepalive, and parallel; exact one-shot transport and Java diagnostics | execute privileged paths and retain the resulting evidence |
-| #31 deterministic traffic/assertions | exact IDs/remote flags, marker selection, W3C precedence/fallback/no-state, keepalive, concurrency, and two distinct controls | retain successful privileged-run artifacts |
-| #33 final report | this result template and automatic environment/evidence bundle | populate every row from real runs |
-| #34 stress | keepalive, explicit HTTP/1.1 pipelining, parallel/churn, stable Jetty connection IDs, deterministic frontend ephemeral-port reuse, observed frontend/Jetty fd reuse, slow body, deterministic split/coalesced TLS receive-boundary fixtures for TLS 1.2/1.3, cancellation/retry, and live map pressure/eviction assets | execute privileged runs and retain the scenario connection/trace evidence |
-| #35 handoff | one-shot accepted-socket task propagation plus packaged nested-executor, cancellation/reuse, Java 21 carrier-migration, servlet async/redispatch, and real Netty event-loop/worker assets | execute privileged runs and retain exact-parent evidence for the framework scenarios |
-| #36 fail-open | OBI absent at JVM start, late attach/recovery, live valid-W3C traffic spanning an enforced OBI stop/restart, bridge/extension disabled and extension-absent controls, true uninstrumented equivalence, and named bounded Unix response faults with response-bound Java diagnostic attribution | execute privileged runs and retain each per-fault diagnostic delta |
+| #19 Java SDK suppression | primary avoided-service metric plus exact-parent traffic passed | retain any additional supported transport/agent cells required by the final support statement |
+| #27 agent compatibility | tested revision `7482d908` OpenTelemetry cell passed; pinned Splunk artifact is selectable | execute Splunk and the declared JVM/architecture matrix |
+| #28 Java extraction matrix | applicable primary OpenTelemetry cases passed with exact graphs and one-shot counters | execute a clean full Unix run, Splunk at a named source revision, end-to-end child flag semantics, and the missing Netty pre-extraction integration |
+| #31 deterministic traffic/assertions | primary OpenTelemetry cell passed with exact IDs, flags, controls, and status records | retain the remaining advertised cells |
+| #33 final report | primary cell populated from a retained bundle | complete benchmark, compatibility, fallback, TLS 1.2, and Splunk outcomes |
+| #34 stress | primary TLS 1.3 stress, reuse, receive-boundary, pressure, cleanup, and recovery cases passed | execute forced Unix and TLS 1.2 cells |
+| #35 handoff | executor, virtual-thread, Netty worker, and redispatch scenarios passed in the retained primary run | add the stock Netty receive-to-pre-extraction integration and remaining matrix evidence |
+| #36 fail-open | primary absence, restart, attach, disabled, and recovery controls passed | execute and retain the clean full Unix fault suite |
 | #37 benchmark | predeclared matrix, repeated bounded workload, and resource/map snapshots | execute on fixed hardware and add sustained latency/throughput evidence |
 | #38 compatibility | explicit untested matrix | execute each claimed kernel/cgroup/architecture/JVM/agent/TLS/transport cell |
-| #39 diagnostics | bounded sanitized receiver, exact per-scenario take/status/flag/selection deltas, fixed-schema response-bound fault attribution, zero unexpected retrieval results, runtime topology, and suppression evidence | execute runs and verify every remaining core reason/cardinality bound under negative tests |
-| #40 security | same-cgroup and sibling-container primary controls, concurrent Unix forged/repeated/flood abuse with an exact-parent victim, UDS replacement, permissive-directory refusal, exact diagnostics schema, and post-abuse recovery | execute privileged runs and retain every topology, metric, response, and sanitized-log artifact |
+| #39 diagnostics | primary per-scenario counters, cardinality checks, and suppression evidence passed | execute the Unix negative/fault matrix |
+| #40 security | retained primary same-cgroup/sibling probes, exact-parent victim, and recovery passed | execute the remaining primary negative cases and the Unix forged/flood/path/permission matrix |
 
-Until those rows have attached evidence, they remain `untested`; a plan or
-template is not a successful validation result.
+Unexecuted rows remain `untested`; a plan or template is not a successful
+validation result.

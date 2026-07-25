@@ -1,0 +1,6 @@
+{
+  "ca_sha256": "D4:D2:7E:64:15:60:1B:AD:6A:BE:73:C3:1B:3C:7F:7F:E8:35:0D:F5:41:EA:B9:1D:02:EE:F4:F1:9F:3D:FD:10",
+  "server_sha256": "E6:1E:76:30:99:A7:37:B9:8E:FE:AB:D3:48:7F:52:B1:E6:2E:A9:65:5E:C3:34:51:ED:A9:3D:9D:E5:10:03:8D",
+  "server_dates": "notBefore=Jul 24 17:27:44 2026 GMT;notAfter=Jul 26 17:27:44 2026 GMT;",
+  "sans": ["DNS:localhost", "DNS:java-backend", "IP:127.0.0.1"]
+}

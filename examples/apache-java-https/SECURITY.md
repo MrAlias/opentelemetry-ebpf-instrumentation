@@ -106,13 +106,16 @@ or credential topology; do not mark it pass.
   parsing, short I/O deadlines, a fixed counter, and no request identity
   logging.
 - Java diagnostics are requested directly from the verified Jetty TLS endpoint
-  before and after each bridge scenario. The runner stores snapshots separately
-  from OBI metrics and accounts for exactly one self-observed missing lookup;
-  another missing result fails unless aggregate pressure trace evidence reports
-  a corresponding explicit root and the bridge reason counts conserve the same
-  request total. Diagnostics do not carry request markers, so this is an
-  aggregate reconciliation. Fault-injection scenarios do not probe diagnostics
-  because doing so would consume a fault response.
+  before and after each ordinary bridge scenario. The runner stores snapshots
+  separately from OBI metrics and accounts for exactly one self-observed
+  missing lookup; another missing result fails unless aggregate pressure trace
+  evidence reports a corresponding explicit root and the bridge reason counts
+  conserve the same request total. Diagnostics do not carry request markers,
+  so this is an aggregate reconciliation. The serial fault-injection suite
+  instead opts in to the same fixed, sanitized snapshot on the existing
+  pre-control health response and each terminal scenario response after Java
+  extraction. Exact chained deltas attribute the normalized Java fault status
+  without issuing another request that could consume a synthetic response.
 - Compose project names are restricted to the reserved demo namespace. Every
   container, volume, and network has an ownership sentinel, and the runner
   verifies all project-labeled resources before startup or destructive cleanup.

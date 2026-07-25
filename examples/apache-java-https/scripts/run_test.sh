@@ -2735,6 +2735,7 @@ write_diagnostics_fixture() {
 
 test_java_diagnostics_schema_is_exact() {
   local -r snapshot="$TEST_TMP_DIR/java-diagnostics-schema.txt"
+  local invalid_value=""
 
   write_diagnostics_fixture "$snapshot" 0 0 0 0 0 0
   assert_sanitized_java_diagnostics "$snapshot"
@@ -2749,6 +2750,23 @@ test_java_diagnostics_schema_is_exact() {
   sed -i 's/$/,request_id=0/' "$snapshot"
   if assert_sanitized_java_diagnostics "$snapshot" >/dev/null 2>&1; then
     printf 'Java diagnostics accepted an appended side-channel field\n' >&2
+    return 1
+  fi
+
+  for invalid_value in 00 A gjdgxr gjdgxs unavailable; do
+    write_diagnostics_fixture "$snapshot" 0 0 0 0 0 0
+    sed -i "s/cfg_on=0/cfg_on=$invalid_value/" "$snapshot"
+    if assert_sanitized_java_diagnostics "$snapshot" >/dev/null 2>&1; then
+      printf 'Java diagnostics accepted noncanonical or saturated value=%s\n' \
+        "$invalid_value" >&2
+      return 1
+    fi
+  done
+
+  write_diagnostics_fixture "$snapshot" 0 0 0 0 0 0
+  printf 'unexpected=0\n' >>"$snapshot"
+  if assert_sanitized_java_diagnostics "$snapshot" >/dev/null 2>&1; then
+    printf 'Java diagnostics accepted an additional snapshot line\n' >&2
     return 1
   fi
 }
@@ -2884,8 +2902,333 @@ test_java_diagnostics_delta_is_exact() {
   }
 }
 
-test_fault_scenario_does_not_probe_java_diagnostics() {
+test_java_diagnostics_header_is_exact_and_piggybacked() {
+  local -r result_dir="$TEST_TMP_DIR/java-diagnostics-boundary"
+  local -r calls="$result_dir/curl.calls"
+  local -r expected="$result_dir/expected.txt"
+  local -r output="$result_dir/baseline.txt"
+  local headers=""
+  local invalid_output=""
+  local snapshot=""
+
+  mkdir -p -- "$result_dir"
+  write_diagnostics_fixture "$expected" 1 0 0 1 0 0
+  snapshot="$(<"$expected")"
+  (
+    RESULT_DIR="$result_dir"
+    BRIDGE_RUNNING=true
+    fetch_obi_metrics() {
+      printf '%s\n' \
+        'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 5' \
+        'obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} 7' \
+        >"$1"
+    }
+    curl() {
+      local header_output=""
+      local argument=""
+
+      printf '%s\n' "$*" >>"$calls"
+      while (( $# > 0 )); do
+        argument="$1"
+        shift
+        if [[ "$argument" == "--dump-header" ]]; then
+          (( $# > 0 )) || return 1
+          header_output="$1"
+          shift
+        fi
+      done
+      [[ -n "$header_output" ]] || return 1
+      printf 'HTTP/1.1 200 OK\r\nX-OBI-Java-Diagnostics: %s\r\n\r\n' \
+        "$snapshot" >"$header_output"
+    }
+    wait_for_bridge_metrics_quiescent() {
+      [[ "$1" == "6" && "$2" == "8" ]]
+    }
+
+    flush_bridge_metric_boundary fault-baseline 1 1 "$output"
+  ) || {
+    printf 'diagnostics baseline was not captured on the metric-boundary request\n' >&2
+    return 1
+  }
+
+  cmp -s -- "$expected" "$output" || {
+    printf 'metric-boundary diagnostics header was not persisted exactly\n' >&2
+    return 1
+  }
+  [[ "$(wc -l <"$calls")" == "1" ]] || {
+    printf 'diagnostics baseline issued more than one health request\n' >&2
+    return 1
+  }
+  grep -Fq \
+    "$APACHE_HTTPS_HEALTH_ENDPOINT&bridge_diagnostics=1" "$calls" || {
+    printf 'diagnostics baseline did not opt in on the existing health request\n' >&2
+    return 1
+  }
+  if grep -Fq '/obi-diagnostics' "$calls"; then
+    printf 'diagnostics baseline used the direct diagnostics endpoint\n' >&2
+    return 1
+  fi
+
+  headers="$result_dir/headers.txt"
+  printf 'HTTP/1.1 200 OK\r\n\r\n' >"$headers"
+  invalid_output="$result_dir/missing.txt"
+  if extract_java_diagnostics_header "$headers" "$invalid_output" >/dev/null 2>&1; then
+    printf 'diagnostics baseline accepted a missing response header\n' >&2
+    return 1
+  fi
+  printf 'X-OBI-Java-Diagnostics: %s\r\nX-OBI-Java-Diagnostics: %s\r\n' \
+    "$snapshot" "$snapshot" >"$headers"
+  invalid_output="$result_dir/duplicate.txt"
+  if extract_java_diagnostics_header "$headers" "$invalid_output" >/dev/null 2>&1; then
+    printf 'diagnostics baseline accepted duplicate response headers\n' >&2
+    return 1
+  fi
+  printf 'X-OBI-Java-Diagnostics: unavailable\r\n' >"$headers"
+  invalid_output="$result_dir/unavailable.txt"
+  if extract_java_diagnostics_header "$headers" "$invalid_output" >/dev/null 2>&1; then
+    printf 'diagnostics baseline accepted unavailable response diagnostics\n' >&2
+    return 1
+  fi
+
+  printf 'X-OBI-Java-Diagnostics: %s\r\n' "$snapshot" >"$headers"
+  invalid_output="$result_dir/existing.txt"
+  printf 'sentinel\n' >"$invalid_output"
+  if extract_java_diagnostics_header "$headers" "$invalid_output" >/dev/null 2>&1 ||
+    [[ "$(<"$invalid_output")" != "sentinel" ]]; then
+    printf 'diagnostics baseline overwrote an existing artifact\n' >&2
+    return 1
+  fi
+  invalid_output="$result_dir/symlink.txt"
+  ln -s -- "$expected" "$invalid_output"
+  if extract_java_diagnostics_header "$headers" "$invalid_output" >/dev/null 2>&1 ||
+    [[ ! -L "$invalid_output" ]]; then
+    printf 'diagnostics baseline followed or replaced a symlink artifact\n' >&2
+    return 1
+  fi
+}
+
+test_pre_stop_diagnostics_failure_does_not_stop_obi() {
+  local -r calls="$TEST_TMP_DIR/pre-stop-diagnostics.calls"
+  local -r baseline="$TEST_TMP_DIR/pre-stop-diagnostics.txt"
+
+  (
+    BRIDGE_RUNNING=true
+    flush_bridge_metric_boundary() {
+      return 1
+    }
+    capture_phase_evidence() {
+      printf 'evidence:%s\n' "$1" >>"$calls"
+    }
+    run_bounded() {
+      printf 'stop:%s\n' "$*" >>"$calls"
+    }
+
+    if stop_obi_for_no_state_control w3c-fault "$baseline" >/dev/null 2>&1; then
+      return 1
+    fi
+    [[ "$BRIDGE_RUNNING" == "true" ]]
+  ) || {
+    printf 'OBI stop proceeded after the diagnostics boundary failed\n' >&2
+    return 1
+  }
+  [[ ! -e "$calls" ]] || {
+    printf 'OBI stop side effects ran after the diagnostics boundary failed\n' >&2
+    return 1
+  }
+
+  (
+    BRIDGE_RUNNING=true
+    flush_bridge_metric_boundary() {
+      return 0
+    }
+    capture_phase_evidence() {
+      printf 'evidence:%s\n' "$1" >>"$calls"
+    }
+    run_bounded() {
+      printf 'stop:%s\n' "$*" >>"$calls"
+    }
+
+    if stop_obi_for_no_state_control w3c-fault "$baseline" >/dev/null 2>&1; then
+      return 1
+    fi
+    [[ "$BRIDGE_RUNNING" == "true" ]]
+  ) || {
+    printf 'OBI stop accepted a missing diagnostics baseline artifact\n' >&2
+    return 1
+  }
+  [[ ! -e "$calls" ]] || {
+    printf 'OBI stop side effects ran without a diagnostics baseline artifact\n' >&2
+    return 1
+  }
+
+  write_diagnostics_fixture "$baseline" 0 0 0 0 0 0
+  if (
+    local stop_status=0
+
+    BRIDGE_RUNNING=true
+    COMPOSE=(docker compose)
+    flush_bridge_metric_boundary() {
+      return 0
+    }
+    capture_phase_evidence() {
+      printf 'evidence:%s\n' "$1" >>"$calls"
+    }
+    run_bounded() {
+      printf 'stop:%s\n' "$*" >>"$calls"
+      return 23
+    }
+
+    if stop_obi_for_no_state_control w3c-fault "$baseline" >/dev/null 2>&1; then
+      return 1
+    else
+      stop_status=$?
+    fi
+    [[ "$stop_status" == "23" && "$BRIDGE_RUNNING" == "true" ]]
+  ); then
+    :
+  else
+    printf 'OBI stop failure was masked or mutated bridge state\n' >&2
+    return 1
+  fi
+  grep -Fqx 'evidence:w3c-fault-obi-running' "$calls"
+  grep -Fq 'stop:60 docker compose stop --timeout 10 obi' "$calls"
+}
+
+test_fault_diagnostics_result_is_single_sanitized_snapshot() {
+  local -r expected="$TEST_TMP_DIR/fault-result-expected.txt"
+  local -r result="$TEST_TMP_DIR/fault-result.json"
+  local output=""
+  local snapshot=""
+  local malformed=""
+
+  write_diagnostics_fixture "$expected" 0 1 1 0 0 0
+  snapshot="$(<"$expected")"
+  printf '{\n  "status": "passed",\n  "fault_diagnostics_after": "%s"\n}\n' \
+    "$snapshot" >"$result"
+  output="$TEST_TMP_DIR/fault-result-valid.txt"
+  extract_fault_diagnostics_after "$result" "$output"
+  cmp -s -- "$expected" "$output" || {
+    printf 'fault result did not preserve its terminal diagnostics snapshot\n' >&2
+    return 1
+  }
+
+  printf '{\n  "status": "passed"\n}\n' >"$result"
+  output="$TEST_TMP_DIR/fault-result-missing.txt"
+  if extract_fault_diagnostics_after "$result" "$output" >/dev/null 2>&1; then
+    printf 'fault result accepted missing terminal diagnostics\n' >&2
+    return 1
+  fi
+  printf '{\n  "fault_diagnostics_after": "%s",\n  "fault_diagnostics_after": "%s"\n}\n' \
+    "$snapshot" "$snapshot" >"$result"
+  output="$TEST_TMP_DIR/fault-result-duplicate.txt"
+  if extract_fault_diagnostics_after "$result" "$output" >/dev/null 2>&1; then
+    printf 'fault result accepted duplicate terminal diagnostics\n' >&2
+    return 1
+  fi
+  printf '{\n  "fault_diagnostics_after": "unavailable"\n}\n' >"$result"
+  output="$TEST_TMP_DIR/fault-result-unavailable.txt"
+  if extract_fault_diagnostics_after "$result" "$output" >/dev/null 2>&1; then
+    printf 'fault result accepted unavailable terminal diagnostics\n' >&2
+    return 1
+  fi
+  malformed="${snapshot/cfg_on=0/cfg_on=00}"
+  printf '{\n  "fault_diagnostics_after": "%s"\n}\n' "$malformed" >"$result"
+  output="$TEST_TMP_DIR/fault-result-malformed.txt"
+  if extract_fault_diagnostics_after "$result" "$output" >/dev/null 2>&1; then
+    printf 'fault result accepted malformed terminal diagnostics\n' >&2
+    return 1
+  fi
+}
+
+test_w3c_fault_diagnostics_mappings_are_exact() {
+  local -r before="$TEST_TMP_DIR/w3c-fault-before.txt"
+  local -r after="$TEST_TMP_DIR/w3c-fault-after.txt"
+  local -r delta="$TEST_TMP_DIR/w3c-fault.delta"
+  local mode=""
+  local status=""
+  local request_count=""
+  local stale=0
+  local malformed=0
+  local -a cases=(
+    "alternating stale-malformed 2"
+    "timeout timeout 1"
+    "disconnect transport_error 1"
+    "overload overload 1"
+    "truncated transport_error 1"
+    "bad-magic malformed 1"
+    "bad-size malformed 1"
+    "version-mismatch version_mismatch 1"
+    "zero-trace-id malformed 1"
+    "zero-span-id malformed 1"
+  )
+  local test_case=""
+
+  for test_case in "${cases[@]}"; do
+    read -r mode status request_count <<<"$test_case"
+    stale=0
+    malformed=0
+    write_diagnostics_fixture "$before" 0 0 0 0 0 0
+    case "$status" in
+      stale-malformed)
+        stale=1
+        malformed=1
+        write_diagnostics_fixture "$after" 0 "$stale" "$malformed" 0 0 0
+        ;;
+      malformed)
+        write_diagnostics_fixture "$after" 0 0 "$request_count" 0 0 0
+        ;;
+      *)
+        write_diagnostics_fixture "$after" 0 0 0 0 0 0 "$status" "$request_count"
+        ;;
+    esac
+    write_java_diagnostics_delta "$before" "$after" "$delta"
+    assert_w3c_fault_diagnostics_delta "$delta" "$mode" "$request_count" || {
+      printf 'W3C fault diagnostics rejected exact mapping mode=%s status=%s\n' \
+        "$mode" "$status" >&2
+      return 1
+    }
+  done
+
+  write_diagnostics_fixture "$before" 0 0 0 0 0 0
+  write_diagnostics_fixture "$after" 0 0 0 0 0 0 timeout 1
+  sed -i 's/lookup_error=0/lookup_error=1/' "$after"
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  if assert_w3c_fault_diagnostics_delta "$delta" timeout 1 >/dev/null 2>&1; then
+    printf 'W3C fault diagnostics accepted an unexpected counter delta\n' >&2
+    return 1
+  fi
+
+  write_diagnostics_fixture "$before" 0 0 0 0 0 0 timeout 1
+  write_diagnostics_fixture "$after" 0 0 0 0 0 0
+  if write_java_diagnostics_delta "$before" "$after" "$delta" >/dev/null 2>&1; then
+    printf 'W3C fault diagnostics accepted a nonmonotonic counter\n' >&2
+    return 1
+  fi
+
+  write_diagnostics_fixture "$before" 0 0 0 0 0 0
+  write_diagnostics_fixture "$after" 0 0 0 0 0 0
+  sed -i 's/cfg_on=0/cfg_on=1/' "$before"
+  if write_java_diagnostics_delta "$before" "$after" "$delta" >/dev/null 2>&1; then
+    printf 'W3C fault diagnostics accepted a nonmonotonic lifecycle counter\n' >&2
+    return 1
+  fi
+}
+
+test_fault_scenario_chains_in_band_diagnostics_without_direct_probe() {
   local -r diagnostics_calls="$TEST_TMP_DIR/fault-diagnostics.calls"
+  local -r scenario_calls="$TEST_TMP_DIR/fault-scenario.calls"
+  local -r scenario_count="$TEST_TMP_DIR/fault-scenario.count"
+  local -r baseline="$TEST_TMP_DIR/fault-baseline.txt"
+  local -r after_one="$TEST_TMP_DIR/fault-after-one.txt"
+  local -r after_two="$TEST_TMP_DIR/fault-after-two.txt"
+  local snapshot_one=""
+  local snapshot_two=""
+
+  write_diagnostics_fixture "$baseline" 0 0 0 0 0 0
+  write_diagnostics_fixture "$after_one" 0 1 1 0 0 0
+  write_diagnostics_fixture "$after_two" 0 2 2 0 0 0
+  snapshot_one="$(<"$after_one")"
+  snapshot_two="$(<"$after_two")"
 
   (
     RESULT_DIR="$TEST_TMP_DIR/fault-scenario"
@@ -2894,9 +3237,107 @@ test_fault_scenario_does_not_probe_java_diagnostics() {
     COMPOSE=(docker compose)
     FAULT_MODE=alternating
     FAULT_REQUEST_COUNT=2
+    W3C_FAULT_DIAGNOSTICS_PREVIOUS="$baseline"
+    REPEAT_COUNT=2
+    REQUEST_COUNT=0
+    SCENARIO_SEED=1
+    SCENARIO_VARIANT=""
+    SELECTED_TRANSPORT=unix
+    TLS_PROTOCOL=TLSv1.3
+    : >"$scenario_count"
+    capture_phase_evidence() {
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+      printf '# empty\n' >"$RESULT_DIR/phases/$1/obi-metrics.prom"
+    }
+    capture_java_diagnostics() {
+      printf '%s\n' "$1" >>"$diagnostics_calls"
+      return 1
+    }
+    flush_bridge_metric_boundary() {
+      return 0
+    }
+    run_bounded() {
+      local count=0
+
+      printf '%s\n' "$*" >>"$scenario_calls"
+      count="$(<"$scenario_count")"
+      count="$((count + 1))"
+      printf '%s\n' "$count" >"$scenario_count"
+      if [[ "$count" == "1" ]]; then
+        printf '{\n  "status": "passed",\n  "fault_diagnostics_after": "%s"\n}\n' \
+          "$snapshot_one"
+      else
+        printf '{\n  "status": "passed",\n  "fault_diagnostics_after": "%s"\n}\n' \
+          "$snapshot_two"
+      fi
+    }
+    sleep() {
+      printf 'sleep:%s\n' "$1" >>"$scenario_calls"
+    }
+
+    run_scenario w3c-fault >/dev/null
+    [[ "$W3C_FAULT_DIAGNOSTICS_PREVIOUS" == \
+      "$RESULT_DIR/phases/w3c-fault-alternating-run-02-after/java-diagnostics.txt" ]]
+  ) || {
+    printf 'fault scenario did not chain response-bound diagnostics\n' >&2
+    return 1
+  }
+
+  if [[ -e "$diagnostics_calls" ]]; then
+    printf 'fault scenario used a direct Java diagnostics probe\n' >&2
+    return 1
+  fi
+  [[ "$(grep -c -- '--fault-mode alternating' "$scenario_calls")" == "2" ]] || {
+    printf 'fault scenario did not pass its strict fault mode on every run\n' >&2
+    return 1
+  }
+  if grep -Fq '/obi-diagnostics' "$scenario_calls"; then
+    printf 'fault scenario command used the direct diagnostics endpoint\n' >&2
+    return 1
+  fi
+  grep -Fqx \
+    't_stale before=0 after=1 delta=1' \
+    "$TEST_TMP_DIR/fault-scenario/phases/w3c-fault-alternating-run-01-after/java-diagnostics.delta"
+  grep -Fqx \
+    't_stale before=1 after=2 delta=1' \
+    "$TEST_TMP_DIR/fault-scenario/phases/w3c-fault-alternating-run-02-after/java-diagnostics.delta"
+  ((JAVA_PROVIDER_RETRY_SETTLE_SECONDS >= 2)) || {
+    printf 'Java provider retry settle interval is below two seconds\n' >&2
+    return 1
+  }
+  grep -Fqx \
+    "sleep:$JAVA_PROVIDER_RETRY_SETTLE_SECONDS" "$scenario_calls" || {
+    printf 'repeated fault runs did not wait for the provider retry interval\n' >&2
+    return 1
+  }
+}
+
+test_fault_scenario_failure_retains_in_band_diagnostics() {
+  local -r result_dir="$TEST_TMP_DIR/fault-scenario-failure"
+  local -r baseline="$TEST_TMP_DIR/fault-failure-baseline.txt"
+  local -r after="$TEST_TMP_DIR/fault-failure-after.txt"
+  local -r diagnostics_calls="$TEST_TMP_DIR/fault-failure-diagnostics.calls"
+  local -r scenario_calls="$TEST_TMP_DIR/fault-failure-scenario.calls"
+  local snapshot=""
+
+  write_diagnostics_fixture "$baseline" 0 0 0 0 0 0
+  write_diagnostics_fixture "$after" 0 0 0 0 0 0 timeout 1
+  snapshot="$(<"$after")"
+  (
+    local scenario_status=0
+
+    RESULT_DIR="$result_dir"
+    mkdir -p -- "$RESULT_DIR"
+    BRIDGE_RUNNING=false
+    COMPOSE=(docker compose)
+    FAULT_MODE=timeout
+    FAULT_REQUEST_COUNT=1
+    W3C_FAULT_DIAGNOSTICS_PREVIOUS="$baseline"
     REPEAT_COUNT=1
     REQUEST_COUNT=0
     SCENARIO_SEED=1
+    SCENARIO_VARIANT=""
+    SELECTED_TRANSPORT=unix
     TLS_PROTOCOL=TLSv1.3
     capture_phase_evidence() {
       mkdir -p -- "$RESULT_DIR/phases/$1"
@@ -2910,20 +3351,138 @@ test_fault_scenario_does_not_probe_java_diagnostics() {
       return 0
     }
     run_bounded() {
-      printf '{"status":"passed"}\n'
+      printf '%s\n' "$*" >>"$scenario_calls"
+      printf '{\n  "status": "failed",\n  "fault_diagnostics_after": "%s"\n}\n' \
+        "$snapshot"
+      return 17
     }
 
-    run_scenario w3c-fault >/dev/null
-    run_scenario basic false >/dev/null
+    if run_scenario w3c-fault >/dev/null; then
+      return 1
+    else
+      scenario_status=$?
+    fi
+    [[ "$scenario_status" == "17" ]]
+    [[ "$W3C_FAULT_DIAGNOSTICS_PREVIOUS" == \
+      "$RESULT_DIR/phases/w3c-fault-timeout-after/java-diagnostics.txt" ]]
   ) || {
-    printf 'scenario failed with diagnostics probes explicitly disabled\n' >&2
+    printf 'fault scenario failure did not retain its in-band diagnostics\n' >&2
     return 1
   }
 
-  if [[ -e "$diagnostics_calls" ]]; then
-    printf 'scenario consumed a diagnostics probe while probes were disabled\n' >&2
+  [[ ! -e "$diagnostics_calls" ]] || {
+    printf 'failed fault scenario used a direct Java diagnostics probe\n' >&2
+    return 1
+  }
+  grep -Fq -- '--fault-mode timeout' "$scenario_calls"
+  grep -Fqx \
+    't_timeout before=0 after=1 delta=1' \
+    "$result_dir/phases/w3c-fault-timeout-after/java-diagnostics.delta"
+  grep -Fq '"exit_status": 17' "$result_dir/scenario-w3c-fault-timeout-status.json"
+  grep -Fq '"metric_status": 0' "$result_dir/scenario-w3c-fault-timeout-status.json"
+}
+
+test_w3c_fault_control_preserves_scenario_failure_in_conditional() {
+  local -r result_dir="$TEST_TMP_DIR/fault-control-scenario-failure"
+  local -r calls="$result_dir/calls"
+  local control_status=0
+
+  mkdir -p -- "$result_dir"
+  if (
+    RESULT_DIR="$result_dir"
+    TRANSPORT=unix
+    SELECTED_TRANSPORT=unix
+    COMPOSE=(docker compose)
+    REPEAT_COUNT=1
+    FAULT_BRIDGE_RUNNING=false
+    stop_obi_for_no_state_control() {
+      printf 'stop-obi:%s:%s\n' "$1" "$2" >>"$calls"
+    }
+    run_bounded() {
+      printf 'bounded:%s\n' "$*" >>"$calls"
+    }
+    wait_for_log() {
+      printf 'wait:%s\n' "$*" >>"$calls"
+    }
+    run_scenario() {
+      printf 'scenario:%s:%s\n' "$1" "$FAULT_MODE" >>"$calls"
+      return 17
+    }
+    sleep() {
+      printf 'unexpected-sleep:%s\n' "$1" >>"$calls"
+      return 1
+    }
+    recreate_instrumented_stack() {
+      printf 'unexpected-recreate:%s\n' "$*" >>"$calls"
+      return 1
+    }
+
+    if run_w3c_fault_control; then
+      return 1
+    else
+      control_status=$?
+    fi
+    printf 'fault-bridge-running:%s\n' "$FAULT_BRIDGE_RUNNING" >>"$calls"
+    return "$control_status"
+  ); then
+    printf 'W3C fault control masked a scenario failure in a conditional\n' >&2
+    return 1
+  else
+    control_status=$?
+  fi
+  [[ "$control_status" == "17" ]] || {
+    printf 'W3C fault control returned %s instead of scenario status 17\n' \
+      "$control_status" >&2
+    return 1
+  }
+  [[ "$(grep -c '^scenario:' "$calls")" == "1" ]] || {
+    printf 'W3C fault control continued after its scenario failed\n' >&2
+    return 1
+  }
+  if grep -Eq '^unexpected-(sleep|recreate):' "$calls"; then
+    printf 'W3C fault control ran post-failure operations\n' >&2
     return 1
   fi
+  grep -Fq \
+    'bounded:15 docker compose logs --no-color bridge-fault' "$calls" || {
+    printf 'W3C fault control did not capture the failed responder log\n' >&2
+    return 1
+  }
+  grep -Fq \
+    'bounded:30 docker compose stop --timeout 5 bridge-fault' "$calls" || {
+    printf 'W3C fault control did not stop the failed responder\n' >&2
+    return 1
+  }
+  grep -Fqx 'fault-bridge-running:false' "$calls" || {
+    printf 'W3C fault control retained an active responder marker\n' >&2
+    return 1
+  }
+  [[ -f "$result_dir/w3c-fault-alternating-bridge.log" ]] || {
+    printf 'W3C fault control omitted the failed responder artifact\n' >&2
+    return 1
+  }
+}
+
+test_final_java_diagnostics_skip_active_fault_bridge() {
+  local -r calls="$TEST_TMP_DIR/final-java-diagnostics.calls"
+
+  (
+    FAULT_BRIDGE_RUNNING=true
+    log_warn() {
+      :
+    }
+    capture_java_diagnostics() {
+      printf '%s\n' "$1" >>"$calls"
+    }
+
+    capture_final_java_diagnostics
+    FAULT_BRIDGE_RUNNING=false
+    capture_final_java_diagnostics
+  )
+  [[ "$(<"$calls")" == "final" ]] || {
+    printf 'final evidence probed Java while the fault responder was active\n' >&2
+    return 1
+  }
 }
 
 test_helper_unavailable_scenario_injects_without_staging_or_retrieval() {
@@ -3560,6 +4119,108 @@ test_scenario_records_metric_boundary_failure() {
       return 1
     }
   )
+}
+
+test_bridge_metric_boundary_fails_closed_on_fetch_failure() {
+  local -r result_dir="$TEST_TMP_DIR/bridge-boundary-fetch-failure"
+  local -r unexpected="$result_dir/unexpected"
+  local boundary_status=0
+
+  mkdir -p -- "$result_dir"
+  (
+    RESULT_DIR="$result_dir"
+    BRIDGE_RUNNING=true
+    fetch_obi_metrics() {
+      return 23
+    }
+    bridge_success_total() {
+      : >"$unexpected"
+      printf '0\n'
+    }
+    bridge_stage_total() {
+      : >"$unexpected"
+      printf '0\n'
+    }
+
+    if flush_bridge_metric_boundary test; then
+      return 1
+    else
+      boundary_status=$?
+    fi
+    [[ "$boundary_status" -eq 1 ]]
+  ) || {
+    printf 'bridge metric boundary did not fail closed on fetch failure\n' >&2
+    return 1
+  }
+  [[ ! -e "$unexpected" ]] || {
+    printf 'bridge metric boundary parsed a failed metric fetch\n' >&2
+    return 1
+  }
+  if compgen -G "$result_dir/.bridge-boundary.*" >/dev/null; then
+    printf 'bridge metric boundary retained a failed fetch temporary file\n' >&2
+    return 1
+  fi
+}
+
+test_scenario_records_required_evidence_failures() {
+  local failure_point=""
+
+  for failure_point in before after delta; do
+    if ! (
+      local scenario_status=0
+
+      RESULT_DIR="$TEST_TMP_DIR/scenario-evidence-failure-$failure_point"
+      mkdir -p -- "$RESULT_DIR"
+      BRIDGE_RUNNING=true
+      COMPOSE=(docker compose)
+      REPEAT_COUNT=1
+      REQUEST_COUNT=0
+      SCENARIO_SEED=1
+      SCENARIO_VARIANT=""
+      SELECTED_TRANSPORT=getsockopt
+      TLS_PROTOCOL=TLSv1.3
+      flush_bridge_metric_boundary() {
+        return 0
+      }
+      capture_phase_evidence() {
+        mkdir -p -- "$RESULT_DIR/phases/$1"
+        printf '# empty\n' >"$RESULT_DIR/phases/$1/obi-metrics.prom"
+        case "$failure_point:$1" in
+          before:basic-before|after:basic-after)
+            return 23
+            ;;
+        esac
+      }
+      run_bounded() {
+        printf '{"status":"passed"}\n'
+      }
+      wait_for_bridge_metrics_quiescent() {
+        return 0
+      }
+      write_metrics_delta() {
+        if [[ "$failure_point" == "delta" ]]; then
+          return 23
+        fi
+        : >"$3"
+      }
+      assert_bridge_metric_delta() {
+        return 0
+      }
+
+      if run_scenario basic false >/dev/null; then
+        return 1
+      else
+        scenario_status=$?
+      fi
+      [[ "$scenario_status" -eq 1 ]] || return 1
+      grep -Fq \
+        '"metric_status": 1' "$RESULT_DIR/scenario-basic-status.json"
+    ); then
+      printf 'scenario masked the required %s evidence failure\n' \
+        "$failure_point" >&2
+      return 1
+    fi
+  done
 }
 
 test_java_diagnostics_parser_uses_base36() {
@@ -5713,7 +6374,14 @@ main() {
   test_permissive_unix_directory_control_refuses_and_restores
   test_java_diagnostics_schema_is_exact
   test_java_diagnostics_delta_is_exact
-  test_fault_scenario_does_not_probe_java_diagnostics
+  test_java_diagnostics_header_is_exact_and_piggybacked
+  test_pre_stop_diagnostics_failure_does_not_stop_obi
+  test_fault_diagnostics_result_is_single_sanitized_snapshot
+  test_w3c_fault_diagnostics_mappings_are_exact
+  test_fault_scenario_chains_in_band_diagnostics_without_direct_probe
+  test_fault_scenario_failure_retains_in_band_diagnostics
+  test_w3c_fault_control_preserves_scenario_failure_in_conditional
+  test_final_java_diagnostics_skip_active_fault_bridge
   test_helper_unavailable_scenario_injects_without_staging_or_retrieval
   test_scenario_fences_metrics_around_diagnostics
   test_pressure_scenario_reconciles_roots_with_bridge_and_java_counts
@@ -5723,6 +6391,8 @@ main() {
   test_scenario_supports_metrics_only_security_evidence
   test_security_controls_select_metrics_only_evidence
   test_scenario_records_metric_boundary_failure
+  test_bridge_metric_boundary_fails_closed_on_fetch_failure
+  test_scenario_records_required_evidence_failures
   test_java_diagnostics_parser_uses_base36
   test_restart_fault_diagnostics_require_overlap
   test_apache_tls_runtime_evidence_is_required

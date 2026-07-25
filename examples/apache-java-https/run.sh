@@ -12,6 +12,7 @@ MAX_UINT32_DECIMAL="4294967295"
 MAX_UINT64_DECIMAL="18446744073709551615"
 JAVA_DIAGNOSTIC_COUNTER_MAX="999999999"
 BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS=35
+JAVA_PROVIDER_RETRY_SETTLE_SECONDS=2
 JAVA_ATTACH_FAILURE_QUIET_SAMPLES=15
 HELPER_ATTACH_FAILURE_JAVA_TOOL_OPTIONS="-javaagent:/otel/official-javaagent.jar -XX:-EnableDynamicAgentLoading"
 SCENARIO_RUN_TIMEOUT_SECONDS=120
@@ -55,6 +56,7 @@ RESTART_RELEASE_OBI_READY="obi-ready"
 readonly SCRIPT_DIR REPO_ROOT SCRIPT_NAME MAX_SHELL_INTEGER MAX_UINT32_DECIMAL
 readonly MAX_UINT64_DECIMAL JAVA_DIAGNOSTIC_COUNTER_MAX
 readonly BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS SCENARIO_RUN_TIMEOUT_SECONDS
+readonly JAVA_PROVIDER_RETRY_SETTLE_SECONDS
 readonly JAVA_ATTACH_FAILURE_QUIET_SAMPLES
 readonly HELPER_ATTACH_FAILURE_JAVA_TOOL_OPTIONS
 readonly PRESSURE_STATE_TIMEOUT_SECONDS PRESSURE_MONITOR_METRICS_TIMEOUT_SECONDS
@@ -116,6 +118,7 @@ ACCEPTANCE_EVIDENCE=true
 ACCEPTANCE_EVIDENCE_REASON=""
 BRIDGE_RUNNING=false
 MATCHING_BRIDGE_RUNNING=false
+FAULT_BRIDGE_RUNNING=false
 SELECTED_TRANSPORT=""
 CONTEXT_PROPAGATION="tcp"
 RUN_STATUS="failed"
@@ -140,6 +143,7 @@ PRESSURE_MONITOR_STATUS=0
 PRESSURE_INJECT_TARGET=""
 FAULT_MODE="alternating"
 FAULT_REQUEST_COUNT=2
+W3C_FAULT_DIAGNOSTICS_PREVIOUS=""
 MATCHING_VALID_TAKES=1
 SCENARIO_VARIANT=""
 SECURITY_PROBE_MODE="abuse"
@@ -693,6 +697,12 @@ cleanup() {
   cleanup_security_processes
   if [[ -n "${RESULT_DIR:-}" && -d "$RESULT_DIR" ]]; then
     capture_evidence
+  fi
+  if [[ "$FAULT_BRIDGE_RUNNING" == "true" ]]; then
+    log_warn "stopping the transient W3C fault bridge"
+    if ! stop_w3c_fault_bridge; then
+      log_error "could not stop the transient W3C fault bridge"
+    fi
   fi
   if [[ "$MATCHING_BRIDGE_RUNNING" == "true" ]]; then
     log_warn "stopping the transient controlled matching bridge"
@@ -1745,17 +1755,28 @@ flush_bridge_metric_boundary() {
   local -r label="$1"
   local -r expected_success_increment="${2:-1}"
   local -r expected_stage_increment="${3:-1}"
+  local -r diagnostics_output="${4:-}"
   local current=""
+  local response_headers=""
+  local health_endpoint="$APACHE_HTTPS_HEALTH_ENDPOINT"
   local before_stage=""
   local before_success=""
 
   [[ "$BRIDGE_RUNNING" == "true" ]] || return 0
+  if [[ -n "$diagnostics_output" && \
+    ( -e "$diagnostics_output" || -L "$diagnostics_output" ) ]]; then
+    log_error "refusing to overwrite bridge-boundary diagnostics: $diagnostics_output"
+    return 1
+  fi
   bounded_decimal \
     "$expected_success_increment" "$MAX_SHELL_INTEGER" true >/dev/null || return 1
   bounded_decimal \
     "$expected_stage_increment" "$MAX_SHELL_INTEGER" true >/dev/null || return 1
-  current="$(mktemp "$RESULT_DIR/.bridge-boundary.XXXXXX")"
-  fetch_obi_metrics "$current"
+  current="$(mktemp "$RESULT_DIR/.bridge-boundary.XXXXXX")" || return 1
+  if ! fetch_obi_metrics "$current"; then
+    rm -f -- "$current"
+    return 1
+  fi
   before_success="$(bridge_success_total "$current")"
   before_stage="$(bridge_stage_total "$current")"
   bounded_decimal "$before_success" "$MAX_SHELL_INTEGER" true >/dev/null || {
@@ -1771,8 +1792,29 @@ flush_bridge_metric_boundary() {
     rm -f -- "$current"
     return 1
   }
-  curl --fail --silent --show-error --max-time 5 \
-    "$APACHE_HTTPS_HEALTH_ENDPOINT" >/dev/null
+  if [[ -n "$diagnostics_output" ]]; then
+    response_headers="$(mktemp "$RESULT_DIR/.bridge-boundary-headers.XXXXXX")" || {
+      rm -f -- "$current"
+      return 1
+    }
+    health_endpoint="${health_endpoint}&bridge_diagnostics=1"
+    if ! curl --fail --silent --show-error --max-time 5 \
+      --dump-header "$response_headers" \
+      "$health_endpoint" >/dev/null; then
+      rm -f -- "$current" "$response_headers"
+      return 1
+    fi
+    if ! extract_java_diagnostics_header "$response_headers" "$diagnostics_output"; then
+      rm -f -- "$current" "$response_headers"
+      log_error "bridge-boundary response did not contain one valid Java diagnostics header"
+      return 1
+    fi
+    rm -f -- "$response_headers"
+  elif ! curl --fail --silent --show-error --max-time 5 \
+    "$health_endpoint" >/dev/null; then
+    rm -f -- "$current"
+    return 1
+  fi
   rm -f -- "$current"
   wait_for_bridge_metrics_quiescent \
     "$((before_success + expected_success_increment))" \
@@ -2838,6 +2880,8 @@ run_scenario() {
   local pressure_status_json="null"
   local expected_fault_status=""
   local expected_fault_count=0
+  local fault_diagnostics_after=""
+  local fault_diagnostics_delta=""
   local bridge_was_running=false
   local controlled_bridge_was_running=false
   local fixture_status=0
@@ -2943,7 +2987,9 @@ run_scenario() {
       metric_status=1
     fi
     if [[ "$name" != "w3c-fault" && "$diagnostics_enabled" == "true" ]]; then
-      capture_java_diagnostics "$before_phase"
+      if ! capture_java_diagnostics "$before_phase"; then
+        metric_status=1
+      fi
       if [[ "$BRIDGE_RUNNING" == "true" ]] &&
         ! wait_for_bridge_metrics_quiescent \
           0 \
@@ -2957,8 +3003,8 @@ run_scenario() {
       if ! capture_metric_phase_evidence "$before_phase"; then
         metric_status=1
       fi
-    else
-      capture_phase_evidence "$before_phase"
+    elif ! capture_phase_evidence "$before_phase"; then
+      metric_status=1
     fi
     bridge_was_running="$BRIDGE_RUNNING"
     if [[ "$bridge_was_running" == "true" ]]; then
@@ -2972,7 +3018,9 @@ run_scenario() {
         "$label" \
         "$RESULT_DIR/phases/$before_phase/obi-metrics.prom" \
         "$expected_requests"; then
-        capture_phase_evidence "$label-pressured"
+        if ! capture_phase_evidence "$label-pressured"; then
+          metric_status=1
+        fi
       else
         scenario_status=$?
       fi
@@ -3068,16 +3116,45 @@ run_scenario() {
       if ! capture_metric_phase_evidence "$after_phase"; then
         metric_status=1
       fi
-    else
-      capture_phase_evidence "$after_phase"
+    elif ! capture_phase_evidence "$after_phase"; then
+      metric_status=1
     fi
     if [[ "$name" != "w3c-fault" && "$diagnostics_enabled" == "true" ]]; then
-      capture_java_diagnostics "$after_phase"
+      if ! capture_java_diagnostics "$after_phase"; then
+        metric_status=1
+      fi
     fi
-    write_metrics_delta \
+    if [[ "$name" == "w3c-fault" ]]; then
+      fault_diagnostics_after="$RESULT_DIR/phases/$after_phase/java-diagnostics.txt"
+      fault_diagnostics_delta="$RESULT_DIR/phases/$after_phase/java-diagnostics.delta"
+      if [[ -z "$W3C_FAULT_DIAGNOSTICS_PREVIOUS" ]]; then
+        log_error "W3C fault diagnostics baseline is unavailable for $label"
+        metric_status=1
+      elif ! extract_fault_diagnostics_after "$output" "$fault_diagnostics_after"; then
+        log_error "could not extract terminal W3C fault diagnostics for $label"
+        metric_status=1
+      elif ! write_java_diagnostics_delta \
+        "$W3C_FAULT_DIAGNOSTICS_PREVIOUS" \
+        "$fault_diagnostics_after" \
+        "$fault_diagnostics_delta"; then
+        log_error "could not compute chained W3C fault diagnostics for $label"
+        metric_status=1
+      elif ! assert_w3c_fault_diagnostics_delta \
+        "$fault_diagnostics_delta" \
+        "$FAULT_MODE" \
+        "$FAULT_REQUEST_COUNT"; then
+        log_error "W3C fault diagnostics were not exactly attributable for $label"
+        metric_status=1
+      else
+        W3C_FAULT_DIAGNOSTICS_PREVIOUS="$fault_diagnostics_after"
+      fi
+    fi
+    if ! write_metrics_delta \
       "$RESULT_DIR/phases/$before_phase/obi-metrics.prom" \
       "$RESULT_DIR/phases/$after_phase/obi-metrics.prom" \
-      "$RESULT_DIR/phases/$after_phase/obi-metrics.delta"
+      "$RESULT_DIR/phases/$after_phase/obi-metrics.delta"; then
+      metric_status=1
+    fi
     if [[ "$bridge_was_running" == "true" ]]; then
       if [[ "$name" == "pressure" && -n "$pressure_hits" &&
         -n "$pressure_roots" && -n "$pressure_wrong" && -n "$pressure_unresolved" ]]; then
@@ -3159,7 +3236,7 @@ run_scenario() {
         "$pressure_bridge_json" \
         "$pressure_java_json"
     fi
-    printf '{\n  "status": "%s",\n  "scenario": "%s",\n  "exit_status": %d,\n  "metric_status": %d,\n  "pressure_correlation": %s,\n  "result": "%s",\n  "stderr": "%s",\n  "after_phase": "%s"\n}\n' \
+    if ! printf '{\n  "status": "%s",\n  "scenario": "%s",\n  "exit_status": %d,\n  "metric_status": %d,\n  "pressure_correlation": %s,\n  "result": "%s",\n  "stderr": "%s",\n  "after_phase": "%s"\n}\n' \
       "$status_name" \
       "$name" \
       "$scenario_status" \
@@ -3167,7 +3244,9 @@ run_scenario() {
       "$pressure_status_json" \
       "$(basename -- "$output")" \
       "$(basename -- "$stderr_output")" \
-      "phases/$after_phase" >"$RESULT_DIR/scenario-$label-status.json"
+      "phases/$after_phase" >"$RESULT_DIR/scenario-$label-status.json"; then
+      return 1
+    fi
     log_info "$label status=$status_name evidence=$RESULT_DIR/scenario-$label-status.json"
     if ((scenario_status != 0)); then
       return "$scenario_status"
@@ -3176,18 +3255,37 @@ run_scenario() {
       return "$metric_status"
     fi
     if [[ "$name" == "w3c-fault" ]] && ((run_number < REPEAT_COUNT)); then
-      sleep 1
+      sleep "$JAVA_PROVIDER_RETRY_SETTLE_SECONDS" || return 1
     fi
   done
 }
 
 stop_obi_for_no_state_control() {
   local -r label="$1"
+  local -r diagnostics_output="${2:-}"
+  local stop_status=0
 
-  flush_bridge_metric_boundary "$label"
-  capture_phase_evidence "$label-obi-running"
+  if ! flush_bridge_metric_boundary "$label" 1 1 "$diagnostics_output"; then
+    log_error "could not establish the $label pre-stop bridge boundary"
+    return 1
+  fi
+  if [[ -n "$diagnostics_output" && \
+    ( ! -f "$diagnostics_output" || -L "$diagnostics_output" ) ]]; then
+    log_error "$label pre-stop Java diagnostics snapshot is unavailable"
+    return 1
+  fi
+  if ! capture_phase_evidence "$label-obi-running"; then
+    log_error "could not capture the $label pre-stop evidence"
+    return 1
+  fi
   log_info "stopping OBI for the $label control"
-  run_bounded 60 "${COMPOSE[@]}" stop --timeout 10 obi
+  if run_bounded 60 "${COMPOSE[@]}" stop --timeout 10 obi; then
+    :
+  else
+    stop_status=$?
+    log_error "could not stop OBI for the $label control"
+    return "$stop_status"
+  fi
   BRIDGE_RUNNING=false
 }
 
@@ -4087,12 +4185,61 @@ run_w3c_match_control() {
   fi
 }
 
+capture_w3c_fault_bridge_log() {
+  local -r fault_log="$1"
+  local capture_status=0
+
+  if run_bounded 15 \
+    "${COMPOSE[@]}" logs --no-color bridge-fault >"$fault_log"; then
+    return 0
+  else
+    capture_status=$?
+  fi
+  log_error "could not capture the W3C fault bridge log"
+  return "$capture_status"
+}
+
+stop_w3c_fault_bridge() {
+  local stop_status=0
+
+  [[ "$FAULT_BRIDGE_RUNNING" == "true" ]] || return 0
+  if run_bounded 30 "${COMPOSE[@]}" stop --timeout 5 bridge-fault; then
+    FAULT_BRIDGE_RUNNING=false
+    return 0
+  else
+    stop_status=$?
+  fi
+  return "$stop_status"
+}
+
+abort_w3c_fault_mode() {
+  local -r primary_status="$1"
+  local -r fault_log="$2"
+  local -r capture_log="$3"
+  local cleanup_status=0
+
+  if [[ "$capture_log" == "true" ]] && \
+    ! capture_w3c_fault_bridge_log "$fault_log"; then
+    cleanup_status=1
+  fi
+  if ! stop_w3c_fault_bridge; then
+    log_error "could not stop the W3C fault bridge after a mode failure"
+    cleanup_status=1
+  fi
+  if ((primary_status != 0)); then
+    return "$primary_status"
+  fi
+  return "$cleanup_status"
+}
+
 run_w3c_fault_control() {
+  local -r diagnostics_baseline="$RESULT_DIR/w3c-fault-java-diagnostics-baseline.txt"
   local fault_log=""
   local expected_requests=""
   local stale=""
   local malformed=""
   local observed=""
+  local control_status=0
   local -a fault_modes=(
     alternating timeout disconnect overload truncated bad-magic bad-size
     version-mismatch zero-trace-id zero-span-id
@@ -4102,7 +4249,11 @@ run_w3c_fault_control() {
     log_error "the W3C malformed/stale control requires the forced Unix transport"
     return 1
   }
-  stop_obi_for_no_state_control "w3c-fault"
+  W3C_FAULT_DIAGNOSTICS_PREVIOUS=""
+  if ! stop_obi_for_no_state_control "w3c-fault" "$diagnostics_baseline"; then
+    return 1
+  fi
+  W3C_FAULT_DIAGNOSTICS_PREVIOUS="$diagnostics_baseline"
   for FAULT_MODE in "${fault_modes[@]}"; do
     FAULT_REQUEST_COUNT=1
     if [[ "$FAULT_MODE" == "alternating" ]]; then
@@ -4111,14 +4262,39 @@ run_w3c_fault_control() {
     export FAULT_MODE
     fault_log="$RESULT_DIR/w3c-fault-$FAULT_MODE-bridge.log"
     log_info "starting bounded Unix fault responder mode=$FAULT_MODE"
-    run_bounded 60 \
-      "${COMPOSE[@]}" up --detach --no-deps --force-recreate bridge-fault
-    wait_for_log \
+    FAULT_BRIDGE_RUNNING=true
+    if run_bounded 60 \
+      "${COMPOSE[@]}" up --detach --no-deps --force-recreate bridge-fault; then
+      :
+    else
+      control_status=$?
+      abort_w3c_fault_mode "$control_status" "$fault_log" true || return $?
+      return 1
+    fi
+    if wait_for_log \
       bridge-fault \
       "mode=$FAULT_MODE" \
-      "Unix fault responder mode=$FAULT_MODE"
-    run_scenario w3c-fault
-    run_bounded 15 "${COMPOSE[@]}" logs --no-color bridge-fault >"$fault_log"
+      "Unix fault responder mode=$FAULT_MODE"; then
+      :
+    else
+      control_status=$?
+      abort_w3c_fault_mode "$control_status" "$fault_log" true || return $?
+      return 1
+    fi
+    if run_scenario w3c-fault; then
+      :
+    else
+      control_status=$?
+      abort_w3c_fault_mode "$control_status" "$fault_log" true || return $?
+      return 1
+    fi
+    if capture_w3c_fault_bridge_log "$fault_log"; then
+      :
+    else
+      control_status=$?
+      abort_w3c_fault_mode "$control_status" "$fault_log" false || return $?
+      return 1
+    fi
     expected_requests="$(scenario_request_count w3c-fault)"
     expected_requests="$((expected_requests * REPEAT_COUNT))"
     if [[ "$FAULT_MODE" == "alternating" ]]; then
@@ -4127,6 +4303,7 @@ run_w3c_fault_control() {
       if [[ "$stale" != "$(((expected_requests + 1) / 2))" || \
         "$malformed" != "$((expected_requests / 2))" ]]; then
         log_error "fault responder expected stale=$(((expected_requests + 1) / 2)) malformed=$((expected_requests / 2)), got stale=$stale malformed=$malformed"
+        abort_w3c_fault_mode 1 "$fault_log" false || return $?
         return 1
       fi
     else
@@ -4135,16 +4312,109 @@ run_w3c_fault_control() {
         "$fault_log")"
       if [[ "$observed" != "$expected_requests" ]]; then
         log_error "fault responder mode=$FAULT_MODE expected requests=$expected_requests, got $observed"
+        abort_w3c_fault_mode 1 "$fault_log" false || return $?
         return 1
       fi
     fi
-    sleep 1
+    if ! sleep "$JAVA_PROVIDER_RETRY_SETTLE_SECONDS"; then
+      abort_w3c_fault_mode 1 "$fault_log" false || return $?
+      return 1
+    fi
   done
-  run_bounded 30 "${COMPOSE[@]}" stop --timeout 5 bridge-fault
+  stop_w3c_fault_bridge || return $?
   FAULT_MODE="alternating"
   FAULT_REQUEST_COUNT=2
+  W3C_FAULT_DIAGNOSTICS_PREVIOUS=""
   export FAULT_MODE
   recreate_instrumented_stack "tcp" "post-fault bridge recovery"
+}
+
+extract_java_diagnostics_header() {
+  local -r headers="$1"
+  local -r output="$2"
+  local candidate=""
+
+  [[ -f "$headers" && ! -L "$headers" && \
+    ! -e "$output" && ! -L "$output" ]] || return 1
+  candidate="$(mktemp "$RESULT_DIR/.java-diagnostics-header.XXXXXX")" || return 1
+  if ! awk '
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      separator = index(line, ":")
+      if (separator == 0) {
+        next
+      }
+      name = substr(line, 1, separator - 1)
+      if (tolower(name) != "x-obi-java-diagnostics") {
+        next
+      }
+      matches++
+      value = substr(line, separator + 1)
+      sub(/^[ \t]+/, "", value)
+      sub(/[ \t]+$/, "", value)
+      selected = value
+    }
+    END {
+      if (matches != 1 || selected == "") {
+        exit 1
+      }
+      print selected
+    }
+  ' "$headers" >"$candidate"; then
+    rm -f -- "$candidate"
+    return 1
+  fi
+  if ! assert_sanitized_java_diagnostics "$candidate"; then
+    rm -f -- "$candidate"
+    return 1
+  fi
+  if ! install -m 0644 "$candidate" "$output"; then
+    rm -f -- "$candidate"
+    return 1
+  fi
+  rm -f -- "$candidate"
+}
+
+extract_fault_diagnostics_after() {
+  local -r input="$1"
+  local -r output="$2"
+  local candidate=""
+
+  [[ -f "$input" && ! -L "$input" && \
+    ! -e "$output" && ! -L "$output" ]] || return 1
+  candidate="$(mktemp "$RESULT_DIR/.fault-diagnostics.XXXXXX")" || return 1
+  if ! awk '
+    index($0, "\"fault_diagnostics_after\"") {
+      matches++
+      line = $0
+      if (line !~ /^[[:space:]]*"fault_diagnostics_after"[[:space:]]*:[[:space:]]*"[0-9a-z_=,]+"[[:space:]]*,?[[:space:]]*$/) {
+        invalid = 1
+        next
+      }
+      sub(/^[[:space:]]*"fault_diagnostics_after"[[:space:]]*:[[:space:]]*"/, "", line)
+      sub(/"[[:space:]]*,?[[:space:]]*$/, "", line)
+      selected = line
+    }
+    END {
+      if (invalid || matches != 1 || selected == "") {
+        exit 1
+      }
+      print selected
+    }
+  ' "$input" >"$candidate"; then
+    rm -f -- "$candidate"
+    return 1
+  fi
+  if ! assert_sanitized_java_diagnostics "$candidate"; then
+    rm -f -- "$candidate"
+    return 1
+  fi
+  if ! install -m 0644 "$candidate" "$output"; then
+    rm -f -- "$candidate"
+    return 1
+  fi
+  rm -f -- "$candidate"
 }
 
 assert_sanitized_java_diagnostics() {
@@ -4154,6 +4424,7 @@ assert_sanitized_java_diagnostics() {
   local name=""
   local value=""
   local -a entries=()
+  local -a snapshots=()
   local -a expected_names=(
     cfg_on cfg_off provider_ok provider_reject provider_ver extension_reg
     lookup_ready lookup_missing lookup_version lookup_error record_version
@@ -4166,16 +4437,23 @@ assert_sanitized_java_diagnostics() {
     t_timeout d_timeout t_overload d_overload
     t_transport_error d_transport_error t_disabled d_disabled
   )
+  local decoded=0
   local index=0
 
-  IFS= read -r snapshot <"$input" || true
+  [[ -f "$input" && ! -L "$input" ]] || return 1
+  mapfile -t snapshots <"$input"
+  if (( ${#snapshots[@]} != 1 )); then
+    log_error "Java diagnostics did not contain exactly one snapshot"
+    return 1
+  fi
+  snapshot="${snapshots[0]}"
   IFS=',' read -r -a entries <<<"$snapshot"
   if (( ${#entries[@]} != ${#expected_names[@]} )); then
     log_error "Java diagnostics did not contain the exact fixed counter schema"
     return 1
   fi
   for entry in "${entries[@]}"; do
-    [[ "$entry" =~ ^[a-z_]+=[0-9a-z]+$ ]] || {
+    [[ "$entry" =~ ^[a-z_]+=(0|[1-9a-z][0-9a-z]*)$ ]] || {
       log_error "Java diagnostics contained a non-counter field"
       return 1
     }
@@ -4183,6 +4461,11 @@ assert_sanitized_java_diagnostics() {
     value="${entry#*=}"
     if [[ "$name" != "${expected_names[$index]}" ]] || (( ${#value} > 6 )); then
       log_error "Java diagnostics contained an unknown, reordered, or unbounded counter"
+      return 1
+    fi
+    decoded="$((36#$value))"
+    if ((decoded >= JAVA_DIAGNOSTIC_COUNTER_MAX)); then
+      log_error "Java diagnostics contained an out-of-range or saturated counter"
       return 1
     fi
     ((index += 1))
@@ -5716,6 +5999,12 @@ write_java_diagnostics_delta() {
   local name=""
   local before_value=""
   local after_value=""
+  local before_snapshot=""
+  local after_snapshot=""
+  local before_encoded=""
+  local after_encoded=""
+  local -a before_entries=()
+  local -a after_entries=()
   local -a names=(
     provider_reject provider_ver lookup_missing lookup_version lookup_error
     record_version invoke_error discard_standard extract_fields extract_invalid
@@ -5726,7 +6015,19 @@ write_java_diagnostics_delta() {
     unauthorized already_consumed timeout overload transport_error disabled
   )
   local status=""
+  local index=0
 
+  assert_sanitized_java_diagnostics "$before" || return 1
+  assert_sanitized_java_diagnostics "$after" || return 1
+  IFS= read -r before_snapshot <"$before"
+  IFS= read -r after_snapshot <"$after"
+  IFS=',' read -r -a before_entries <<<"$before_snapshot"
+  IFS=',' read -r -a after_entries <<<"$after_snapshot"
+  for ((index = 0; index < ${#before_entries[@]}; index++)); do
+    before_encoded="${before_entries[$index]#*=}"
+    after_encoded="${after_entries[$index]#*=}"
+    ((36#$after_encoded >= 36#$before_encoded)) || return 1
+  done
   for status in "${statuses[@]}"; do
     names+=("t_$status" "d_$status")
   done
@@ -5739,6 +6040,57 @@ write_java_diagnostics_delta() {
       "$name" "$before_value" "$after_value" "$((after_value - before_value))" \
       >>"$output"
   done
+}
+
+assert_w3c_fault_diagnostics_delta() {
+  local -r input="$1"
+  local -r fault_mode="$2"
+  local -r expected_requests="$3"
+  local expected_stale=0
+  local expected_malformed=0
+  local expected_fault_status=""
+  local expected_fault_count=0
+
+  bounded_decimal "$expected_requests" 1000 false >/dev/null || return 1
+  case "$fault_mode" in
+    alternating)
+      expected_stale="$(((expected_requests + 1) / 2))"
+      expected_malformed="$((expected_requests / 2))"
+      ;;
+    timeout)
+      expected_fault_status=timeout
+      expected_fault_count="$expected_requests"
+      ;;
+    disconnect|truncated)
+      expected_fault_status=transport_error
+      expected_fault_count="$expected_requests"
+      ;;
+    overload)
+      expected_fault_status=overload
+      expected_fault_count="$expected_requests"
+      ;;
+    bad-magic|bad-size|zero-trace-id|zero-span-id)
+      expected_malformed="$expected_requests"
+      ;;
+    version-mismatch)
+      expected_fault_status=version_mismatch
+      expected_fault_count="$expected_requests"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  assert_java_diagnostics_delta \
+    "$input" \
+    0 \
+    "$expected_stale" \
+    "$expected_malformed" \
+    0 \
+    0 \
+    0 \
+    0 \
+    "$expected_fault_status" \
+    "$expected_fault_count"
 }
 
 java_diagnostic_delta() {
@@ -6005,10 +6357,18 @@ assert_restart_fault_diagnostics() {
   } >"$output"
 }
 
+capture_final_java_diagnostics() {
+  if [[ "$FAULT_BRIDGE_RUNNING" == "true" ]]; then
+    log_warn "skipping final Java diagnostics while the W3C fault bridge is active"
+    return 0
+  fi
+  capture_java_diagnostics "final"
+}
+
 capture_evidence() {
   if [[ "$STACK_STARTED" == "true" ]]; then
     capture_phase_evidence "final"
-    capture_java_diagnostics "final"
+    capture_final_java_diagnostics
   fi
   run_bounded 30 "${COMPOSE[@]}" ps --all >"$RESULT_DIR/compose-ps.txt" 2>&1 || true
   run_bounded 30 "${COMPOSE[@]}" logs --no-color --tail 10000 >"$RESULT_DIR/compose.log" 2>&1 || true

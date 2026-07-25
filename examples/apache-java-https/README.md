@@ -402,14 +402,19 @@ Only a generated marker header is captured. The receiver rejects compressed or
 oversized requests, enforces configured count, per-string, and aggregate
 retained-byte ceilings, and strips arbitrary headers and bodies before writing
 evidence. Any receiver eviction or rejection is reason-coded and invalidates
-the scenario. Java diagnostics are fetched after each post-scenario OBI metric
-snapshot. Their delta requires exactly one self-observed missing lookup, so the
-diagnostic request cannot mask another missing lookup in the reason-coded
-interval attributed to that scenario. Fault-injection scenarios skip the probe
-so it cannot consume a synthetic fault response. The restart-fault interval
-also includes the headerless readiness request used to re-establish duplicate
-suppression, so it requires exactly two non-workload takes and reports
-conservative workload attribution bounds.
+the scenario. For ordinary scenarios, Java diagnostics are fetched after each
+post-scenario OBI metric snapshot. Their delta requires exactly one
+self-observed missing lookup, so the diagnostic request cannot mask another
+missing lookup in the reason-coded interval attributed to that scenario. A
+fault-injection request instead opts in to the same fixed snapshot on its
+response after Java extraction. The runner captures its baseline from the
+existing pre-control health request, validates the exact bounded schema, and
+chains response-to-response deltas while the fault suite remains serial. This
+avoids an extra bridge take and requires exactly the normalized Java status for
+each injected mode with no unexpected retrieval result. The restart-fault
+interval also includes the headerless readiness request used to re-establish
+duplicate suppression, so it requires exactly two non-workload takes and
+reports conservative workload attribution bounds.
 
 A dirty source tree, `--skip-bridge-build`, or an individually targeted
 scenario is explicitly labeled non-acceptance evidence. Only a clean full

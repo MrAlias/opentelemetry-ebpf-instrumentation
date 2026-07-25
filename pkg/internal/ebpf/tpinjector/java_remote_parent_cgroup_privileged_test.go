@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -34,11 +35,18 @@ import (
 )
 
 const (
-	javaRemoteParentCgroupHelperEnv    = "OBI_JAVA_REMOTE_PARENT_CGROUP_HELPER"
-	javaRemoteParentCgroupCapability   = "OBI_JAVA_REMOTE_PARENT_CGROUP_CAPABILITY"
-	javaRemoteParentCgroupAttached     = "OBI_JAVA_REMOTE_PARENT_CGROUP_ATTACHED"
-	javaRemoteParentCgroupTestRequired = "OBI_REQUIRE_CGROUP_TOPOLOGY"
-	cgroup2FilesystemMagic             = 0x63677270
+	javaRemoteParentCgroupHelperEnv     = "OBI_JAVA_REMOTE_PARENT_CGROUP_HELPER"
+	javaRemoteParentCgroupCapability    = "OBI_JAVA_REMOTE_PARENT_CGROUP_CAPABILITY"
+	javaRemoteParentCgroupAttached      = "OBI_JAVA_REMOTE_PARENT_CGROUP_ATTACHED"
+	javaRemoteParentCgroupControllerEnv = "OBI_JAVA_REMOTE_PARENT_CGROUP_CONTROLLER"
+	javaRemoteParentCgroupPathEnv       = "OBI_JAVA_REMOTE_PARENT_CGROUP_PATH"
+	javaRemoteParentCgroupTestRequired  = "OBI_REQUIRE_CGROUP_TOPOLOGY"
+	cgroup2FilesystemMagic              = 0x63677270
+
+	javaRemoteParentControllerGetsockoptFD = 3
+	javaRemoteParentControllerSetsockoptFD = 4
+	javaRemoteParentControllerReadyFD      = 5
+	javaRemoteParentControllerHoldFD       = 6
 )
 
 type javaRemoteParentCgroupTopology struct {
@@ -55,6 +63,13 @@ type cgroupV2Mount struct {
 	root       string
 	mountPoint string
 	writable   bool
+}
+
+type javaRemoteParentCgroupLinkController struct {
+	command    *exec.Cmd
+	holdWriter *os.File
+	output     bytes.Buffer
+	waited     bool
 }
 
 func TestJavaRemoteParentNestedCgroupLifecycle(t *testing.T) {
@@ -78,6 +93,99 @@ func TestJavaRemoteParentNestedCgroupLifecycle(t *testing.T) {
 
 	const secondCapability = uint64(0xfedcba6547382910)
 	runJavaRemoteParentCgroupGeneration(t, topology, secondCapability)
+}
+
+func TestJavaRemoteParentCgroupLinkProcessDeathCleanup(t *testing.T) {
+	current := requireJavaRemoteParentCgroupTopology(t)
+	topology := newJavaRemoteParentCgroupTopology(t, current)
+	require.Empty(t, queryCgroupProgramIDs(
+		t, topology.parent, ebpf.AttachCGroupGetsockopt,
+	))
+	require.Empty(t, queryCgroupProgramIDs(
+		t, topology.parent, ebpf.AttachCGroupSetsockopt,
+	))
+
+	objects := loadJavaRemoteParentFixture(t)
+	objectsOpen := true
+	defer func() {
+		if objectsOpen {
+			assert.NoError(t, objects.Close())
+		}
+	}()
+	setJavaRemoteParentDataHookReadiness(t, objects.JavaRemoteParentDataHookReadiness, true)
+	mapIdentities := javaRemoteParentMapIdentities(
+		t, &objects.BpfJavaRemoteParentMaps,
+	)
+	getID := javaRemoteParentProgramID(t, objects.ObiJavaRemoteParentGetsockopt)
+	setID := javaRemoteParentProgramID(t, objects.ObiJavaRemoteParentSetsockopt)
+
+	controller := startJavaRemoteParentCgroupLinkController(
+		t, topology.parent, &objects.BpfJavaRemoteParentPrograms,
+	)
+	require.Equal(
+		t,
+		[]ebpf.ProgramID{getID},
+		queryCgroupProgramIDs(t, topology.parent, ebpf.AttachCGroupGetsockopt),
+	)
+	require.Equal(
+		t,
+		[]ebpf.ProgramID{setID},
+		queryCgroupProgramIDs(t, topology.parent, ebpf.AttachCGroupSetsockopt),
+	)
+
+	const firstCapability = uint64(0x3141592653589793)
+	runJavaRemoteParentCgroupWorkload(
+		t, topology, &objects.BpfJavaRemoteParentMaps, firstCapability, true,
+	)
+
+	controller.kill(t)
+	requireCgroupProgramsDetached(t, topology.parent)
+	require.Equal(t, getID, javaRemoteParentProgramID(
+		t, objects.ObiJavaRemoteParentGetsockopt,
+	))
+	require.Equal(t, setID, javaRemoteParentProgramID(
+		t, objects.ObiJavaRemoteParentSetsockopt,
+	))
+	requireJavaRemoteParentMapsPresent(t, mapIdentities)
+
+	const detachedCapability = uint64(0x2718281828459045)
+	runJavaRemoteParentCgroupWorkload(
+		t, topology, nil, detachedCapability, false,
+	)
+
+	links, err := attachJavaRemoteParentFixtureAt(
+		topology.parent, &objects.BpfJavaRemoteParentPrograms,
+	)
+	require.NoError(t, err)
+	linksOpen := true
+	defer func() {
+		if linksOpen {
+			assert.NoError(t, links.Close())
+		}
+	}()
+	require.Equal(
+		t,
+		[]ebpf.ProgramID{getID},
+		queryCgroupProgramIDs(t, topology.parent, ebpf.AttachCGroupGetsockopt),
+	)
+	require.Equal(
+		t,
+		[]ebpf.ProgramID{setID},
+		queryCgroupProgramIDs(t, topology.parent, ebpf.AttachCGroupSetsockopt),
+	)
+
+	const secondCapability = uint64(0x1618033988749894)
+	runJavaRemoteParentCgroupWorkload(
+		t, topology, &objects.BpfJavaRemoteParentMaps, secondCapability, true,
+	)
+
+	require.NoError(t, links.Close())
+	linksOpen = false
+	requireCgroupProgramsDetached(t, topology.parent)
+
+	require.NoError(t, objects.Close())
+	objectsOpen = false
+	requireJavaRemoteParentMapsReleased(t, mapIdentities)
 }
 
 func TestJavaRemoteParentCgroupV2MountPath(t *testing.T) {
@@ -124,6 +232,57 @@ func TestJavaRemoteParentCgroupV2MountPath(t *testing.T) {
 			require.Equal(t, test.path, path)
 		})
 	}
+}
+
+func TestJavaRemoteParentCgroupLinkControllerHelper(t *testing.T) {
+	if os.Getenv(javaRemoteParentCgroupControllerEnv) != "1" {
+		return
+	}
+
+	cgroupPath := os.Getenv(javaRemoteParentCgroupPathEnv)
+	require.NotEmpty(t, cgroupPath)
+
+	getsockopt, err := ebpf.NewProgramFromFD(
+		javaRemoteParentControllerGetsockoptFD,
+	)
+	require.NoError(t, err)
+	defer getsockopt.Close()
+	setsockopt, err := ebpf.NewProgramFromFD(
+		javaRemoteParentControllerSetsockoptFD,
+	)
+	require.NoError(t, err)
+	defer setsockopt.Close()
+
+	ready := os.NewFile(
+		javaRemoteParentControllerReadyFD,
+		"java-remote-parent-cgroup-controller-ready",
+	)
+	require.NotNil(t, ready)
+	defer ready.Close()
+	hold := os.NewFile(
+		javaRemoteParentControllerHoldFD,
+		"java-remote-parent-cgroup-controller-hold",
+	)
+	require.NotNil(t, hold)
+	defer hold.Close()
+
+	links, err := attachJavaRemoteParentFixtureAt(
+		cgroupPath,
+		&BpfJavaRemoteParentPrograms{
+			ObiJavaRemoteParentGetsockopt: getsockopt,
+			ObiJavaRemoteParentSetsockopt: setsockopt,
+		},
+	)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, links.Close())
+	}()
+
+	_, err = ready.Write([]byte{1})
+	require.NoError(t, err)
+	require.NoError(t, ready.Close())
+	_, err = io.Copy(io.Discard, hold)
+	require.NoError(t, err)
 }
 
 func TestJavaRemoteParentCgroupWorkloadHelper(t *testing.T) {
@@ -266,6 +425,139 @@ func requireJavaRemoteParentCgroupTopology(t *testing.T) string {
 		t, "locate writable cgroup v2 mount", errors.Join(unavailable...),
 	)
 	return ""
+}
+
+func startJavaRemoteParentCgroupLinkController(
+	t *testing.T,
+	path string,
+	programs *BpfJavaRemoteParentPrograms,
+) *javaRemoteParentCgroupLinkController {
+	t.Helper()
+
+	getsockopt := duplicateJavaRemoteParentProgram(
+		t, programs.ObiJavaRemoteParentGetsockopt, "getsockopt",
+	)
+	defer getsockopt.Close()
+	setsockopt := duplicateJavaRemoteParentProgram(
+		t, programs.ObiJavaRemoteParentSetsockopt, "setsockopt",
+	)
+	defer setsockopt.Close()
+
+	readyReader, readyWriter, err := os.Pipe()
+	require.NoError(t, err)
+	defer readyReader.Close()
+	defer readyWriter.Close()
+	holdReader, holdWriter, err := os.Pipe()
+	require.NoError(t, err)
+	defer holdReader.Close()
+
+	controller := &javaRemoteParentCgroupLinkController{
+		holdWriter: holdWriter,
+	}
+	t.Cleanup(func() {
+		controller.cleanup()
+	})
+
+	controller.command = exec.Command(
+		os.Args[0],
+		"-test.run=^TestJavaRemoteParentCgroupLinkControllerHelper$",
+		"-test.v",
+	)
+	controller.command.Env = append(
+		os.Environ(),
+		javaRemoteParentCgroupControllerEnv+"=1",
+		javaRemoteParentCgroupPathEnv+"="+path,
+	)
+	controller.command.ExtraFiles = []*os.File{
+		getsockopt,
+		setsockopt,
+		readyWriter,
+		holdReader,
+	}
+	controller.command.Stdout = &controller.output
+	controller.command.Stderr = &controller.output
+
+	require.NoError(t, controller.command.Start())
+	require.NoError(t, getsockopt.Close())
+	require.NoError(t, setsockopt.Close())
+	require.NoError(t, readyWriter.Close())
+	require.NoError(t, holdReader.Close())
+
+	require.NoError(t, readyReader.SetReadDeadline(time.Now().Add(15*time.Second)))
+	var ready [1]byte
+	if _, err := io.ReadFull(readyReader, ready[:]); err != nil {
+		_ = controller.command.Process.Kill()
+		waitErr := controller.command.Wait()
+		controller.waited = true
+		t.Fatalf(
+			"cgroup link controller did not become ready: %v (wait: %v)\n%s",
+			err,
+			waitErr,
+			controller.output.String(),
+		)
+	}
+	require.Equal(t, byte(1), ready[0])
+	return controller
+}
+
+func duplicateJavaRemoteParentProgram(
+	t *testing.T,
+	program *ebpf.Program,
+	name string,
+) *os.File {
+	t.Helper()
+
+	duplicate, err := unix.FcntlInt(
+		uintptr(program.FD()),
+		unix.F_DUPFD_CLOEXEC,
+		javaRemoteParentControllerGetsockoptFD,
+	)
+	require.NoError(t, err)
+	file := os.NewFile(
+		uintptr(duplicate),
+		"java-remote-parent-"+name+"-program",
+	)
+	if file == nil {
+		require.NoError(t, unix.Close(duplicate))
+		t.Fatal("wrap duplicated Java remote-parent program fd")
+	}
+	return file
+}
+
+func (c *javaRemoteParentCgroupLinkController) kill(t *testing.T) {
+	t.Helper()
+
+	require.False(t, c.waited)
+	require.NoError(t, c.command.Process.Kill())
+	waitErr := c.command.Wait()
+	c.waited = true
+	require.NoError(t, c.holdWriter.Close())
+	c.holdWriter = nil
+
+	var exitError *exec.ExitError
+	require.ErrorAsf(
+		t,
+		waitErr,
+		&exitError,
+		"cgroup link controller exited without SIGKILL:\n%s",
+		c.output.String(),
+	)
+	status, ok := exitError.Sys().(syscall.WaitStatus)
+	require.True(t, ok)
+	require.True(t, status.Signaled())
+	require.Equal(t, syscall.SIGKILL, status.Signal())
+}
+
+func (c *javaRemoteParentCgroupLinkController) cleanup() {
+	if c.command != nil && c.command.Process != nil && !c.waited {
+		_ = c.command.Process.Kill()
+		_ = c.command.Wait()
+		c.waited = true
+	}
+	if c.holdWriter != nil {
+		_ = c.holdWriter.Close()
+		c.holdWriter = nil
+	}
 }
 
 func newJavaRemoteParentCgroupTopology(
@@ -448,6 +740,35 @@ func queryCgroupProgramIDs(
 	return ids
 }
 
+func requireCgroupProgramsDetached(
+	t *testing.T,
+	path string,
+) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	var getsockopt []ebpf.ProgramID
+	var setsockopt []ebpf.ProgramID
+	for time.Now().Before(deadline) {
+		getsockopt = queryCgroupProgramIDs(
+			t, path, ebpf.AttachCGroupGetsockopt,
+		)
+		setsockopt = queryCgroupProgramIDs(
+			t, path, ebpf.AttachCGroupSetsockopt,
+		)
+		if len(getsockopt) == 0 && len(setsockopt) == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf(
+		"cgroup programs remained attached to %q: getsockopt=%v setsockopt=%v",
+		path,
+		getsockopt,
+		setsockopt,
+	)
+}
+
 func javaRemoteParentProgramID(t *testing.T, program *ebpf.Program) ebpf.ProgramID {
 	t.Helper()
 
@@ -528,6 +849,19 @@ func requireJavaRemoteParentMapsReleased(
 	}
 	sort.Strings(names)
 	t.Fatalf("Java remote-parent maps remained open: %s", strings.Join(names, ", "))
+}
+
+func requireJavaRemoteParentMapsPresent(
+	t *testing.T,
+	identities []javaRemoteParentMapIdentity,
+) {
+	t.Helper()
+
+	for _, identity := range identities {
+		bridgeMap, err := ebpf.NewMapFromID(identity.id)
+		require.NoErrorf(t, err, "open Java remote-parent map %q", identity.name)
+		require.NoError(t, bridgeMap.Close())
+	}
 }
 
 func runJavaRemoteParentCgroupWorkload(

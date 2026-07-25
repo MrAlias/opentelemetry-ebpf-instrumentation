@@ -54,7 +54,7 @@ type sslPrewriteRoot struct {
 	hasAmbiguity bool
 }
 
-func (c *Cleanup) sweepSSLPrewrite(now time.Duration) error {
+func (c *Cleanup) sweepSSLPrewrite() error {
 	retention := c.ttl
 	if retention < sslPrewriteMinimumFenceAge {
 		retention = sslPrewriteMinimumFenceAge
@@ -67,8 +67,9 @@ func (c *Cleanup) sweepSSLPrewrite(now time.Duration) error {
 	if err != nil {
 		result = errors.Join(result, fmt.Errorf("iterating SSL prewrite connection claims: %w", err))
 	}
+	claimsNow := c.monoTimeNow()
 	for _, entry := range claims {
-		if !sslPrewriteOwnerStale(now, retention, entry.value) {
+		if !sslPrewriteOwnerStale(claimsNow, retention, entry.value) {
 			continue
 		}
 		if _, deleteErr := cleanupDeleteExact(
@@ -110,11 +111,14 @@ func (c *Cleanup) sweepSSLPrewrite(now time.Duration) error {
 		roots[entry.key] = root
 	}
 
+	rootsNow := c.monoTimeNow()
 	for key, root := range roots {
-		if !sslPrewriteRootStale(now, retention, root) {
+		if !sslPrewriteRootStale(rootsNow, retention, root) {
 			continue
 		}
-		if cleanupErr := c.cleanupSSLPrewriteRoot(key, root, now, retention); cleanupErr != nil {
+		if cleanupErr := c.cleanupSSLPrewriteRoot(
+			key, root, rootsNow, retention,
+		); cleanupErr != nil {
 			result = errors.Join(result, cleanupErr)
 		}
 	}

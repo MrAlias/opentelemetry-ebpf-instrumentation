@@ -185,6 +185,47 @@ func TestSSLPrewriteCleanupSweepsStaleClaimsFirst(t *testing.T) {
 	assert.Equal(t, map[any]any{freshKey: fresh}, claims.values)
 }
 
+func TestSSLPrewriteCleanupPreservesEntriesObservedDuringEnumeration(t *testing.T) {
+	cleanup := testSSLCleanup(9*time.Second, 30*time.Second)
+	now := 9 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+
+	claimKey := testSSLConnectionKey(1)
+	rootKey := testSSLConnectionKey(2)
+	prewriteKey := sslPrewriteKey{PIDTGID: 3, ThreadStartTime: 4, HandoffID: 5}
+	claim := sslPrewriteConnectionOwner{
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		State:               sslPrewriteOwnerClosing,
+	}
+	owner := sslPrewriteConnectionOwner{
+		Key:                 prewriteKey,
+		ObservedMonotonicNS: uint64(20 * time.Second),
+		State:               sslPrewriteOwnerPublished,
+	}
+	var value sslPrewriteValue
+	value[0] = 1
+
+	claims := cleanup.maps.sslPrewriteConnectionClaims.(*fakeBridgeMap)
+	owners := cleanup.maps.sslPrewriteConnectionOwners.(*fakeBridgeMap)
+	prewrites := cleanup.maps.sslPrewrite.(*fakeBridgeMap)
+	ambiguity := cleanup.maps.sslPrewriteConnectionAmbiguity.(*fakeBridgeMap)
+	claims.values[claimKey] = claim
+	owners.values[rootKey] = owner
+	prewrites.values[prewriteKey] = value
+	claims.afterIterate = func() {
+		now = 11 * time.Second
+	}
+	ambiguity.afterIterate = func() {
+		now = 21 * time.Second
+	}
+
+	require.NoError(t, cleanup.Sweep())
+	assert.Equal(t, claim, claims.values[claimKey])
+	assert.Equal(t, owner, owners.values[rootKey])
+	assert.Equal(t, value, prewrites.values[prewriteKey])
+	assert.Empty(t, ambiguity.values)
+}
+
 func TestSSLPrewriteCleanupRestoresFenceWhenClaimSignalsClose(t *testing.T) {
 	cleanup := testSSLCleanup(3*time.Second, time.Second)
 	key := testSSLConnectionKey(1)
@@ -213,17 +254,17 @@ func TestSSLPrewriteCleanupRestoresFenceWhenClaimSignalsClose(t *testing.T) {
 func TestSSLPrewriteCleanupUsesPublicationTimeForClosingFence(t *testing.T) {
 	cleanup := testCleanup(testMapHandler(nil, nil, nil))
 	cleanup.ttl = time.Second
-	times := []time.Duration{3 * time.Second, 4 * time.Second, 5 * time.Second}
-	cleanup.monoTimeNow = func() time.Duration {
-		now := times[0]
-		times = times[1:]
-		return now
-	}
+	now := 3 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
 	key := testSSLConnectionKey(1)
 	owners := cleanup.maps.sslPrewriteConnectionOwners.(*fakeBridgeMap)
+	claims := cleanup.maps.sslPrewriteConnectionClaims.(*fakeBridgeMap)
 	owners.values[key] = sslPrewriteConnectionOwner{
 		ObservedMonotonicNS: uint64(time.Second),
 		State:               sslPrewriteOwnerBlocked,
+	}
+	claims.afterUpdate = func(any, any) {
+		now = 5 * time.Second
 	}
 
 	require.NoError(t, cleanup.Sweep())
@@ -231,7 +272,6 @@ func TestSSLPrewriteCleanupUsesPublicationTimeForClosingFence(t *testing.T) {
 		ObservedMonotonicNS: uint64(5 * time.Second),
 		State:               sslPrewriteClosing,
 	}, cleanup.maps.sslPrewriteConnectionAmbiguity.(*fakeBridgeMap).values[key])
-	assert.Empty(t, times)
 }
 
 func TestSSLPrewriteCleanupReportsMapErrors(t *testing.T) {

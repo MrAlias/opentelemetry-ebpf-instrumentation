@@ -23,16 +23,17 @@ import (
 const testProcessIncarnation = uint64(0x123456789abcdef0)
 
 type fakeBridgeMap struct {
-	mu          sync.Mutex
-	values      map[any]any
-	lookupCount int
-	lookupErr   error
-	updateErr   error
-	deleteErr   error
-	iterateErr  error
-	afterLookup func(int)
-	afterUpdate func(any, any)
-	afterDelete func(any)
+	mu           sync.Mutex
+	values       map[any]any
+	lookupCount  int
+	lookupErr    error
+	updateErr    error
+	deleteErr    error
+	iterateErr   error
+	afterIterate func()
+	afterLookup  func(int)
+	afterUpdate  func(any, any)
+	afterDelete  func(any)
 }
 
 type fakeCleanupEntry struct {
@@ -61,12 +62,17 @@ func (i *fakeCleanupIterator) Err() error { return i.err }
 
 func (m *fakeBridgeMap) Iterate() cleanupIterator {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	entries := make([]fakeCleanupEntry, 0, len(m.values))
 	for key, value := range m.values {
 		entries = append(entries, fakeCleanupEntry{key: key, value: value})
 	}
-	return &fakeCleanupIterator{entries: entries, err: m.iterateErr}
+	err := m.iterateErr
+	afterIterate := m.afterIterate
+	m.mu.Unlock()
+	if afterIterate != nil {
+		afterIterate()
+	}
+	return &fakeCleanupIterator{entries: entries, err: err}
 }
 
 func (m *fakeBridgeMap) Lookup(key, valueOut any) error {

@@ -69,6 +69,75 @@ func TestCleanupStatsCountGenerationOnce(t *testing.T) {
 	assert.Equal(t, CleanupStats{}, stats)
 }
 
+func TestCleanupPreservesGenerationObservedDuringEnumeration(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	encoded := validEncodedRecordObservedAt(t, 10, 10*time.Second)
+	handler := testMapHandler(map[Identity]any{owner: encoded}, nil, nil)
+	cleanup := testCleanup(handler)
+	now := 9 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+
+	remoteParents := cleanup.maps.remoteParents.(*fakeBridgeMap)
+	owners := cleanup.maps.owners.(*fakeBridgeMap)
+	states := cleanup.maps.states.(*fakeBridgeMap)
+	generations := cleanup.maps.generations.(*fakeBridgeMap)
+	connections := cleanup.maps.connections.(*fakeBridgeMap)
+	cookieConnections := cleanup.maps.cookieConnections.(*fakeBridgeMap)
+	generations.afterIterate = func() {
+		now = 11 * time.Second
+	}
+
+	stats, err := cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Equal(t, encoded, remoteParents.values[owner])
+	assert.Contains(t, owners.values, owner)
+	assert.Contains(t, states.values, stateKey{Owner: owner, Generation: 10})
+	assert.Contains(t, generations.values, stateKey{Owner: owner, Generation: 10})
+	assert.Len(t, connections.values, 1)
+	assert.Len(t, cookieConnections.values, 1)
+
+	generations.afterIterate = nil
+	now = 41 * time.Second
+	stats, err = cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{Cleaned: 1}, stats)
+	assert.Empty(t, remoteParents.values)
+	assert.Empty(t, owners.values)
+	assert.Empty(t, states.values)
+	assert.Empty(t, generations.values)
+	assert.Empty(t, connections.values)
+	assert.Empty(t, cookieConnections.values)
+}
+
+func TestCleanupPreservesOrphanFallbackObservedDuringEnumeration(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	encoded := validEncodedRecordObservedAt(t, 10, 10*time.Second)
+	handler := testMapHandler(nil, nil, nil)
+	cleanup := testCleanup(handler)
+	now := 9 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+
+	remoteParents := cleanup.maps.remoteParents.(*fakeBridgeMap)
+	remoteParents.values[owner] = encoded
+	remoteParents.afterIterate = func() {
+		now = 11 * time.Second
+	}
+
+	stats, err := cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Equal(t, encoded, remoteParents.values[owner])
+	assert.Empty(t, cleanup.maps.owners.(*fakeBridgeMap).values)
+
+	remoteParents.afterIterate = nil
+	now = 41 * time.Second
+	stats, err = cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{Cleaned: 1}, stats)
+	assert.Empty(t, remoteParents.values)
+}
+
 func TestCleanupStatsDetectFallbackEviction(t *testing.T) {
 	for _, test := range []struct {
 		name      string
@@ -603,4 +672,20 @@ func testCleanup(handler *MapHandler) *Cleanup {
 		ttl:         handler.ttl,
 		monoTimeNow: handler.monoTimeNow,
 	}
+}
+
+func validEncodedRecordObservedAt(
+	t *testing.T,
+	generation uint64,
+	observed time.Duration,
+) [RecordSize]byte {
+	t.Helper()
+	encoded := validEncodedRecord(t, generation)
+	record, err := UnmarshalRecord(encoded[:])
+	require.NoError(t, err)
+	record.ObservedMonotonicNS = uint64(observed)
+	updated, err := record.MarshalBinary()
+	require.NoError(t, err)
+	copy(encoded[:], updated)
+	return encoded
 }

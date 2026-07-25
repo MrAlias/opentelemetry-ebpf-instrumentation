@@ -151,8 +151,7 @@ func (c *Cleanup) SweepWithStats() (CleanupStats, error) {
 		return stats, errors.New("java remote-parent cleanup maps are incomplete")
 	}
 
-	now := c.monoTimeNow()
-	err := c.sweepSSLPrewrite(now)
+	err := c.sweepSSLPrewrite()
 	retiredEntries, retiredErr := cleanupMapEntries[retiredProcessKey, uint64](c.maps.retired)
 	if retiredErr != nil {
 		return stats, errors.Join(err, fmt.Errorf("iterating retired Java processes: %w", retiredErr))
@@ -179,6 +178,7 @@ func (c *Cleanup) SweepWithStats() (CleanupStats, error) {
 	if generationErr != nil {
 		err = errors.Join(err, fmt.Errorf("iterating Java remote-parent generations: %w", generationErr))
 	}
+	generationNow := c.monoTimeNow()
 	cleanedGenerations := make(map[stateKey]struct{})
 	for _, entry := range generationEntries {
 		processRetired, retirementErr := c.processRetired(
@@ -188,7 +188,7 @@ func (c *Cleanup) SweepWithStats() (CleanupStats, error) {
 			err = errors.Join(err, retirementErr)
 			continue
 		}
-		expired := cleanupExpired(now, entry.value.ObservedMonotonicNS, c.ttl)
+		expired := cleanupExpired(generationNow, entry.value.ObservedMonotonicNS, c.ttl)
 		evicted := false
 		if !processRetired && !expired {
 			evicted, retirementErr = c.generationFallbackEvicted(entry.key, entry.value)
@@ -216,7 +216,7 @@ func (c *Cleanup) SweepWithStats() (CleanupStats, error) {
 		}
 	}
 
-	if sweepErr := c.sweepOrphans(now, retired, cleanedGenerations, &stats); sweepErr != nil {
+	if sweepErr := c.sweepOrphans(retired, cleanedGenerations, &stats); sweepErr != nil {
 		err = errors.Join(err, sweepErr)
 	}
 	if err != nil {
@@ -716,7 +716,6 @@ func (c *Cleanup) deleteTerminal(key stateKey, processIncarnation uint64) error 
 }
 
 func (c *Cleanup) sweepOrphans(
-	now time.Duration,
 	retired map[retiredProcessKey]struct{},
 	cleanedGenerations map[stateKey]struct{},
 	stats *CleanupStats,
@@ -727,6 +726,7 @@ func (c *Cleanup) sweepOrphans(
 	if err != nil {
 		result = errors.Join(result, fmt.Errorf("iterating generation states: %w", err))
 	}
+	statesNow := c.monoTimeNow()
 	for _, entry := range states {
 		processRetired, retirementErr := c.processRetired(
 			retired,
@@ -737,7 +737,8 @@ func (c *Cleanup) sweepOrphans(
 			result = errors.Join(result, retirementErr)
 			continue
 		}
-		if !processRetired && !cleanupExpired(now, entry.value.ObservedMonotonicNS, c.ttl) {
+		if !processRetired &&
+			!cleanupExpired(statesNow, entry.value.ObservedMonotonicNS, c.ttl) {
 			continue
 		}
 		cleaned, cleanupErr := c.cleanupOrphanState(entry.key, entry.value)
@@ -791,6 +792,7 @@ func (c *Cleanup) sweepOrphans(
 	if err != nil {
 		result = errors.Join(result, fmt.Errorf("iterating task handoff claims: %w", err))
 	}
+	handoffClaimsNow := c.monoTimeNow()
 	for _, entry := range handoffClaims {
 		process := Identity{
 			TID:       entry.key.PID,
@@ -804,7 +806,8 @@ func (c *Cleanup) sweepOrphans(
 			result = errors.Join(result, retirementErr)
 			continue
 		}
-		if !processRetired && !cleanupExpired(now, entry.value.ObservedMonotonicNS, c.ttl) {
+		if !processRetired &&
+			!cleanupExpired(handoffClaimsNow, entry.value.ObservedMonotonicNS, c.ttl) {
 			continue
 		}
 		cleanupSafe, safetyErr := c.processCleanupSafe(
@@ -832,6 +835,7 @@ func (c *Cleanup) sweepOrphans(
 	if err != nil {
 		result = errors.Join(result, fmt.Errorf("iterating terminal generations: %w", err))
 	}
+	terminalsNow := c.monoTimeNow()
 	for _, entry := range terminals {
 		generation := stateKey{Owner: entry.key, Generation: entry.value.Generation}
 		_, cleaned := cleanedGenerations[generation]
@@ -845,7 +849,7 @@ func (c *Cleanup) sweepOrphans(
 			continue
 		}
 		if !cleaned && !processRetired &&
-			!cleanupExpired(now, entry.value.ObservedMonotonicNS, c.ttl) {
+			!cleanupExpired(terminalsNow, entry.value.ObservedMonotonicNS, c.ttl) {
 			continue
 		}
 		cleaned, cleanupErr := c.cleanupOrphanOwner(entry.key, ownerValue{
@@ -865,9 +869,10 @@ func (c *Cleanup) sweepOrphans(
 	if err != nil {
 		result = errors.Join(result, fmt.Errorf("iterating ambiguity markers: %w", err))
 	}
+	ambiguityNow := c.monoTimeNow()
 	for _, entry := range ambiguity {
 		_, generationCleaned := cleanedGenerations[entry.key]
-		if !generationCleaned && !cleanupExpired(now, entry.value, c.ttl) {
+		if !generationCleaned && !cleanupExpired(ambiguityNow, entry.value, c.ttl) {
 			continue
 		}
 		deleted, deleteErr := cleanupDeleteExact(c.maps.ambiguity, entry.key, entry.value)
@@ -883,9 +888,10 @@ func (c *Cleanup) sweepOrphans(
 	if err != nil {
 		result = errors.Join(result, fmt.Errorf("iterating generation claims: %w", err))
 	}
+	claimsNow := c.monoTimeNow()
 	for _, entry := range claims {
 		if entry.value.Reserved != ([7]byte{}) ||
-			!cleanupExpired(now, entry.value.ObservedMonotonicNS, c.ttl) {
+			!cleanupExpired(claimsNow, entry.value.ObservedMonotonicNS, c.ttl) {
 			continue
 		}
 		_, generationCleaned := cleanedGenerations[entry.key]
@@ -941,6 +947,7 @@ func (c *Cleanup) sweepOrphans(
 	if err != nil {
 		result = errors.Join(result, fmt.Errorf("iterating fallback parents: %w", err))
 	}
+	parentsNow := c.monoTimeNow()
 	for _, entry := range parents {
 		record, decodeErr := UnmarshalRecord(entry.value[:])
 		if decodeErr != nil {
@@ -968,7 +975,7 @@ func (c *Cleanup) sweepOrphans(
 		_, cleaned := cleanedGenerations[stateKey{
 			Owner: entry.key, Generation: record.Generation,
 		}]
-		if cleaned || !cleanupExpired(now, record.ObservedMonotonicNS, c.ttl) {
+		if cleaned || !cleanupExpired(parentsNow, record.ObservedMonotonicNS, c.ttl) {
 			continue
 		}
 		key := stateKey{Owner: entry.key, Generation: record.Generation}

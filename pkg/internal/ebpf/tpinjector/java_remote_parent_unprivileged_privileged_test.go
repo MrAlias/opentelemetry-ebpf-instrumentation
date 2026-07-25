@@ -6,9 +6,11 @@
 package tpinjector
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,8 +21,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
+
+	"go.opentelemetry.io/obi/pkg/obi"
 )
 
 const (
@@ -29,6 +34,12 @@ const (
 	javaRemoteParentUnprivilegedPhase   = "load"
 	javaRemoteParentUnprivilegedID      = 65534
 	javaRemoteParentLoadDeniedEvidence  = "OBI_JAVA_REMOTE_PARENT_UNPRIVILEGED_LOAD_DENIED=EPERM"
+	javaRemoteParentProbeReasonEvidence = "OBI_JAVA_REMOTE_PARENT_UNPRIVILEGED_PROBE_DIAGNOSTIC=" +
+		"transport=getsockopt,operation=availability,status=permission_denied," +
+		"stage=probe,reason=permission_denied"
+	javaRemoteParentLoadReasonEvidence = "OBI_JAVA_REMOTE_PARENT_UNPRIVILEGED_LOAD_DIAGNOSTIC=" +
+		"transport=getsockopt,operation=availability,status=load_denied," +
+		"stage=load,reason=load_denied"
 )
 
 func TestJavaRemoteParentBridgeLoadRequiresPrivileges(t *testing.T) {
@@ -63,6 +74,8 @@ func TestJavaRemoteParentBridgeLoadRequiresPrivileges(t *testing.T) {
 		output,
 	)
 	require.Contains(t, string(output), javaRemoteParentLoadDeniedEvidence)
+	require.Contains(t, string(output), javaRemoteParentProbeReasonEvidence)
+	require.Contains(t, string(output), javaRemoteParentLoadReasonEvidence)
 	t.Logf("unprivileged Java bridge load evidence:\n%s", output)
 }
 
@@ -144,6 +157,7 @@ func requireJavaRemoteParentLoadDenied(t *testing.T) {
 	requireJavaRemoteParentUnprivilegedThread(t)
 	requireJavaRemoteParentUnprivilegedProcess(t)
 	requireNoJavaRemoteParentBPFDescriptors(t)
+	requireJavaRemoteParentProbeDenied(t)
 
 	spec := javaRemoteParentFixtureSpec(t)
 	var objects BpfJavaRemoteParentObjects
@@ -153,7 +167,67 @@ func requireJavaRemoteParentLoadDenied(t *testing.T) {
 	}
 	require.ErrorIs(t, err, unix.EPERM)
 	requireNoJavaRemoteParentBPFDescriptors(t)
+
+	reporter := &javaRemoteParentRecordingReporter{}
+	var logs bytes.Buffer
+	cfg := obi.DefaultConfig
+	tracer := New(&cfg, reporter)
+	tracer.log = slog.New(slog.NewTextHandler(&logs, nil))
+	tracer.reportJavaRemoteParentTransportUnavailable(
+		"Java remote-parent getsockopt transport unavailable",
+		"getsockopt",
+		javaRemoteParentStageLoad,
+		err,
+	)
+
+	require.Equal(t, []javaRemoteParentObservation{{
+		transport: "getsockopt",
+		operation: javaRemoteParentAvailabilityOperation,
+		status:    javaRemoteParentStatusLoadDenied,
+		count:     1,
+	}}, reporter.observations)
+	require.Contains(t, logs.String(), "stage=load")
+	require.Contains(t, logs.String(), "reason=load_denied")
 	t.Log(javaRemoteParentLoadDeniedEvidence)
+	t.Log(javaRemoteParentLoadReasonEvidence)
+}
+
+func requireJavaRemoteParentProbeDenied(t *testing.T) {
+	t.Helper()
+
+	err := haveCgroupSockopt()
+	require.Error(t, err)
+	require.True(
+		t,
+		errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES),
+		"expected probe permission error, got %v",
+		err,
+	)
+	var verifierErr *ebpf.VerifierError
+	require.ErrorAs(t, err, &verifierErr)
+	require.Empty(t, verifierErr.Log)
+
+	reporter := &javaRemoteParentRecordingReporter{}
+	var logs bytes.Buffer
+	cfg := obi.DefaultConfig
+	tracer := New(&cfg, reporter)
+	tracer.log = slog.New(slog.NewTextHandler(&logs, nil))
+	tracer.reportJavaRemoteParentTransportUnavailable(
+		"Java remote-parent getsockopt transport unavailable",
+		"getsockopt",
+		javaRemoteParentStageProbe,
+		err,
+	)
+
+	require.Equal(t, []javaRemoteParentObservation{{
+		transport: "getsockopt",
+		operation: javaRemoteParentAvailabilityOperation,
+		status:    javaRemoteParentStatusPermissionDenied,
+		count:     1,
+	}}, reporter.observations)
+	require.Contains(t, logs.String(), "stage=probe")
+	require.Contains(t, logs.String(), "reason=permission_denied")
+	t.Log(javaRemoteParentProbeReasonEvidence)
 }
 
 func requireJavaRemoteParentUnprivilegedThread(t *testing.T) {

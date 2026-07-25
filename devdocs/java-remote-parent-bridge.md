@@ -411,21 +411,44 @@ power-of-two occurrences so repeated transport faults do not produce per-request
 log volume.
 
 The OBI operation counter has four possible `transport` values (`tcp`,
-`getsockopt`, `unix`, and `disabled`), eleven possible `operation` values
+`getsockopt`, `unix`, and `disabled`), twelve possible `operation` values
 (`stage`, `candidate`, `handoff`, `inject`, `take`, `discard`, `negotiate`,
-`select`, `cleanup`, `evict`, and `report`), and fifteen fixed status values. Its
-absolute Cartesian cardinality bound is therefore 660, while the implementation emits
-only the meaningful combinations. `auto` is never a metric label; selection records the
-concrete transport. Failures before a fallback request can be decoded are reported as
-`negotiate`, so malformed or unauthenticated input cannot introduce another
-operation label. Cleanup and fallback-map eviction are emitted as counted
-`tcp` lifecycle operations and never contain map keys. A `tcp/report/valid`
-marker is emitted after each successful BPF counter pass at the configured BPF
-metric interval so observers can identify complete publications. The Java snapshot has
-50 fixed keys: twenty-two configuration, registration, lookup, extraction,
-trace-flag, and decrypted-read counters plus take and discard counters for each
-of the fourteen statuses. Neither surface derives a label or key from request
-data.
+`availability`, `select`, `cleanup`, `evict`, and `report`), and eighteen fixed
+status values. Its absolute Cartesian cardinality bound is therefore 864,
+while the implementation emits only the meaningful combinations. `auto` is
+never a metric label; selection records the concrete transport. Failures
+before a fallback request can be decoded are
+reported as `negotiate`, so malformed or unauthenticated input cannot introduce
+another operation label. Local startup and transport-transition failures use
+`availability`; they cannot be confused with an unauthorized caller. Cleanup
+and fallback-map eviction are emitted as counted `tcp` lifecycle operations
+and never contain map keys. A `tcp/report/valid` marker is emitted after each
+successful BPF counter pass at the configured BPF metric interval so observers
+can identify complete publications. The Java snapshot has 50 fixed keys:
+twenty-two configuration, registration, lookup, extraction, trace-flag, and
+decrypted-read counters plus take and discard counters for each of the fourteen
+statuses. Neither surface derives a label or key from request data.
+
+Each availability warning includes fixed `stage` and `reason` fields, and the
+corresponding operation counter uses `operation="availability"` with the same
+reason in its `status` label. A verifier error is `verifier_rejected`. An
+`EPERM` or `EACCES` while loading BPF objects is `load_denied`, because the
+kernel can use those errors for missing capabilities, LSM policy, or a memlock
+limit; the bridge does not guess among them. Permission errors from a feature
+probe or from later attach, readiness, listener, or server stages are
+`permission_denied`. Deadline failures are `timeout`; memory, capacity, buffer,
+process file-descriptor, and system file-descriptor exhaustion are `overload`;
+a missing cgroup path, device, map, or readiness state is `missing`; and
+unavailable kernel programs, helpers, syscalls, or socket options are
+`unsupported`. Other failures are `transport_error`.
+
+The fixed stages are `probe`, `load`, `attach`, `readiness`, `listen`, and
+`serve`. Classification preserves the primary attach failure separately from a
+rollback-close failure, recognizes verifier errors with kernel verifier output
+before their wrapped errno, and recognizes explicit unsupported causes before
+incidental missing probe paths. These rules keep local privilege failures
+distinct from `negotiate/unauthorized`, `take/unauthorized`, and
+`discard/unauthorized` results caused by rejected Java callers.
 
 The transport rationale and fallback gates are recorded in
 [ADR 001](adr/001-java-remote-parent-transport.md).

@@ -6,9 +6,11 @@
 package tpinjector
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -205,6 +207,75 @@ func TestTracerJavaRemoteParentSpecSelection(t *testing.T) {
 	assert.Contains(t, constants, "g_bpf_debug")
 }
 
+func TestJavaRemoteParentSpecFailurePreservesStage(t *testing.T) {
+	originalProbe := haveCgroupSockopt
+	originalValidation := validateCgroupSockoptSpec
+	t.Cleanup(func() {
+		haveCgroupSockopt = originalProbe
+		validateCgroupSockoptSpec = originalValidation
+	})
+
+	cfg := obi.DefaultConfig
+	require.NoError(t, cfg.EBPF.ContextPropagation.UnmarshalText([]byte("tcp")))
+	cfg.Java.RemoteParent.Transport = obi.JavaRemoteParentAuto
+
+	t.Run("program type probe", func(t *testing.T) {
+		probeErr := errors.Join(errors.New("cgroup sockopt probe"), ebpf.ErrNotSupported)
+		haveCgroupSockopt = func() error { return probeErr }
+
+		tracer := New(&cfg, nil)
+		tracer.haveSockOpsNetnsCookie = func() error { return nil }
+		_, err := tracer.LoadSpecs()
+		require.NoError(t, err)
+		require.ErrorIs(t, tracer.javaRemoteParentError, probeErr)
+		assert.Equal(t, javaRemoteParentStageProbe, tracer.javaRemoteParentErrorStage)
+	})
+
+	t.Run("program validation", func(t *testing.T) {
+		verifierErr := &ebpf.VerifierError{
+			Cause: unix.EACCES,
+			Log:   []string{"R0 invalid verifier state"},
+		}
+		haveCgroupSockopt = func() error { return nil }
+		validateCgroupSockoptSpec = func(*ebpf.CollectionSpec, map[string]any) error {
+			return verifierErr
+		}
+
+		reporter := &javaRemoteParentRecordingReporter{}
+		var logs bytes.Buffer
+		tracer := New(&cfg, reporter)
+		tracer.log = slog.New(slog.NewTextHandler(&logs, nil))
+		tracer.haveSockOpsNetnsCookie = func() error { return nil }
+		_, err := tracer.LoadSpecs()
+		require.NoError(t, err)
+		require.ErrorIs(t, tracer.javaRemoteParentError, verifierErr)
+		assert.Equal(t, javaRemoteParentStageLoad, tracer.javaRemoteParentErrorStage)
+		assert.Equal(
+			t,
+			javaRemoteParentStatusVerifierRejected,
+			javaRemoteParentAvailabilityReason(
+				tracer.javaRemoteParentErrorStage,
+				tracer.javaRemoteParentError,
+			),
+		)
+		tracer.reportJavaRemoteParentTransportUnavailable(
+			"Java remote-parent getsockopt transport unavailable",
+			"getsockopt",
+			tracer.javaRemoteParentErrorStage,
+			tracer.javaRemoteParentError,
+		)
+		assert.Equal(t, []javaRemoteParentObservation{{
+			transport: "getsockopt",
+			operation: javaRemoteParentAvailabilityOperation,
+			status:    javaRemoteParentStatusVerifierRejected,
+			count:     1,
+		}}, reporter.observations)
+		assert.Contains(t, logs.String(), "stage=load")
+		assert.Contains(t, logs.String(), "reason=verifier_rejected")
+		assert.NotContains(t, logs.String(), "reason=permission_denied")
+	})
+}
+
 func TestJavaRemoteParentStatLabelsIdentifyTransport(t *testing.T) {
 	assert.Equal(t, [javaRemoteParentStatCount]javaRemoteParentStatLabel{
 		{transport: "tcp", operation: "stage", status: "valid"},
@@ -290,28 +361,41 @@ func TestJavaRemoteParentMetricCardinalityContract(t *testing.T) {
 		"disabled":   {},
 	}
 	operations := map[string]struct{}{
-		"stage":     {},
-		"candidate": {},
-		"handoff":   {},
-		"take":      {},
-		"discard":   {},
-		"negotiate": {},
-		"select":    {},
-		"cleanup":   {},
-		"evict":     {},
-		"inject":    {},
-		"report":    {},
+		"stage":        {},
+		"candidate":    {},
+		"handoff":      {},
+		"take":         {},
+		"discard":      {},
+		"negotiate":    {},
+		"availability": {},
+		"select":       {},
+		"cleanup":      {},
+		"evict":        {},
+		"inject":       {},
+		"report":       {},
 	}
 	statuses := map[string]struct{}{}
 	for status := javabridge.StatusUnknown; status <= javabridge.StatusDisabled; status++ {
 		statuses[status.String()] = struct{}{}
 	}
 	statuses["segmented"] = struct{}{}
+	statuses[javaRemoteParentStatusLoadDenied] = struct{}{}
+	statuses[javaRemoteParentStatusPermissionDenied] = struct{}{}
+	statuses[javaRemoteParentStatusVerifierRejected] = struct{}{}
+	stages := map[javaRemoteParentAvailabilityStage]struct{}{
+		javaRemoteParentStageProbe:     {},
+		javaRemoteParentStageLoad:      {},
+		javaRemoteParentStageAttach:    {},
+		javaRemoteParentStageReadiness: {},
+		javaRemoteParentStageListen:    {},
+		javaRemoteParentStageServe:     {},
+	}
 
 	require.Len(t, transports, 4)
-	require.Len(t, operations, 11)
-	require.Len(t, statuses, 15)
-	assert.Equal(t, 660, len(transports)*len(operations)*len(statuses))
+	require.Len(t, operations, 12)
+	require.Len(t, statuses, 18)
+	require.Len(t, stages, 6)
+	assert.Equal(t, 864, len(transports)*len(operations)*len(statuses))
 
 	seen := map[javaRemoteParentStatLabel]struct{}{}
 	for _, label := range javaRemoteParentStatLabels {
@@ -325,6 +409,7 @@ func TestJavaRemoteParentMetricCardinalityContract(t *testing.T) {
 
 func TestDisabledJavaRemoteParentReportsSelectionOnce(t *testing.T) {
 	reporter := &javaRemoteParentRecordingReporter{}
+	var logs bytes.Buffer
 	cfg := obi.DefaultConfig
 	cfg.Java.RemoteParent.Transport = obi.JavaRemoteParentDisabled
 	tracer := New(&cfg, reporter)
@@ -336,6 +421,7 @@ func TestDisabledJavaRemoteParentReportsSelectionOnce(t *testing.T) {
 	require.NoError(t, err)
 	requireConnectionScopedSSLPrewriteMaps(t, bundles[0].Spec)
 
+	tracer.log = slog.New(slog.NewTextHandler(&logs, nil))
 	stop := tracer.runJavaRemoteParent(context.Background())
 	stop()
 
@@ -345,15 +431,21 @@ func TestDisabledJavaRemoteParentReportsSelectionOnce(t *testing.T) {
 		status:    "disabled",
 		count:     1,
 	}}, reporter.observations)
+	assert.Empty(t, logs.String())
 }
 
 func TestUnsupportedJavaRemoteParentKeepsTPInjectorLoadable(t *testing.T) {
-	unsupported := errors.New("network namespace cookie helper unavailable")
+	unsupported := errors.Join(
+		errors.New("network namespace cookie helper unavailable"),
+		ebpf.ErrNotSupported,
+	)
 	reporter := &javaRemoteParentRecordingReporter{}
+	var logs bytes.Buffer
 	cfg := obi.DefaultConfig
 	require.NoError(t, cfg.EBPF.ContextPropagation.UnmarshalText([]byte("tcp")))
 	cfg.Java.RemoteParent.Transport = obi.JavaRemoteParentAuto
 	tracer := New(&cfg, reporter)
+	tracer.log = slog.New(slog.NewTextHandler(&logs, nil))
 	tracer.haveSockOpsNetnsCookie = func() error { return unsupported }
 
 	bundles, err := tracer.LoadSpecs()
@@ -370,17 +462,82 @@ func TestUnsupportedJavaRemoteParentKeepsTPInjectorLoadable(t *testing.T) {
 	assert.ElementsMatch(t, []javaRemoteParentObservation{
 		{
 			transport: "getsockopt",
-			operation: "negotiate",
+			operation: "availability",
 			status:    "unsupported",
 			count:     1,
 		},
 		{
 			transport: "unix",
-			operation: "negotiate",
+			operation: "availability",
 			status:    "unsupported",
 			count:     1,
 		},
 	}, reporter.observations)
+	assert.Contains(t, logs.String(), "stage=probe")
+	assert.Contains(t, logs.String(), "reason=unsupported")
+}
+
+func TestUnavailableJavaRemoteParentMapsReportSelectedTransports(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		transport    obi.JavaRemoteParentTransport
+		observations []javaRemoteParentObservation
+	}{
+		{
+			name:      "automatic",
+			transport: obi.JavaRemoteParentAuto,
+			observations: []javaRemoteParentObservation{
+				{
+					transport: "getsockopt",
+					operation: "availability",
+					status:    "missing",
+					count:     1,
+				},
+				{
+					transport: "unix",
+					operation: "availability",
+					status:    "missing",
+					count:     1,
+				},
+			},
+		},
+		{
+			name:      "getsockopt",
+			transport: obi.JavaRemoteParentGetsockopt,
+			observations: []javaRemoteParentObservation{{
+				transport: "getsockopt",
+				operation: "availability",
+				status:    "missing",
+				count:     1,
+			}},
+		},
+		{
+			name:      "unix",
+			transport: obi.JavaRemoteParentUnix,
+			observations: []javaRemoteParentObservation{{
+				transport: "unix",
+				operation: "availability",
+				status:    "missing",
+				count:     1,
+			}},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			reporter := &javaRemoteParentRecordingReporter{}
+			var logs bytes.Buffer
+			cfg := obi.DefaultConfig
+			cfg.Java.RemoteParent.Transport = tt.transport
+			tracer := New(&cfg, reporter)
+			tracer.log = slog.New(slog.NewTextHandler(&logs, nil))
+
+			stop := tracer.runJavaRemoteParent(context.Background())
+			stop()
+
+			assert.ElementsMatch(t, tt.observations, reporter.observations)
+			assert.Contains(t, logs.String(), "stage=load")
+			assert.Contains(t, logs.String(), "reason=missing")
+		})
+	}
 }
 
 func TestJavaRemoteParentCleanupStatsAreObserved(t *testing.T) {
@@ -466,6 +623,10 @@ func TestJavaRemoteParentPartialSockoptAttachClosesFirstLink(t *testing.T) {
 	require.Error(t, err)
 	require.ErrorIs(t, err, attachErr)
 	require.ErrorIs(t, err, closeErr)
+	var partialErr *javaRemoteParentSockoptAttachError
+	require.ErrorAs(t, err, &partialErr)
+	assert.Same(t, attachErr, partialErr.attach)
+	assert.Same(t, closeErr, partialErr.rollback)
 	assert.Nil(t, link)
 	assert.Equal(t, 1, getLink.closeCalls)
 }
@@ -564,57 +725,190 @@ func (s *javaRemoteParentRestartTestServer) Close() error {
 	return s.close()
 }
 
-func TestJavaRemoteParentPrimaryFailureStatus(t *testing.T) {
+func TestJavaRemoteParentAvailabilityReason(t *testing.T) {
 	for _, tt := range []struct {
 		name     string
+		stage    javaRemoteParentAvailabilityStage
 		err      error
-		expected javabridge.Status
+		expected string
 	}{
 		{
-			name:     "operation not permitted",
+			name:     "BPF load denied",
+			stage:    javaRemoteParentStageLoad,
 			err:      unix.EPERM,
-			expected: javabridge.StatusTransportError,
+			expected: javaRemoteParentStatusLoadDenied,
 		},
 		{
-			name:     "wrapped permission denied",
+			name:     "wrapped BPF load denied",
+			stage:    javaRemoteParentStageLoad,
+			err:      errors.Join(errors.New("loading maps"), unix.EACCES),
+			expected: javaRemoteParentStatusLoadDenied,
+		},
+		{
+			name:  "verifier rejection",
+			stage: javaRemoteParentStageLoad,
+			err: &ebpf.VerifierError{
+				Cause: unix.EACCES,
+				Log:   []string{"R0 invalid verifier state"},
+			},
+			expected: javaRemoteParentStatusVerifierRejected,
+		},
+		{
+			name:  "probe denial without verifier output",
+			stage: javaRemoteParentStageProbe,
+			err: &ebpf.VerifierError{
+				Cause: unix.EACCES,
+			},
+			expected: javaRemoteParentStatusPermissionDenied,
+		},
+		{
+			name:  "load denial without verifier output",
+			stage: javaRemoteParentStageLoad,
+			err: &ebpf.VerifierError{
+				Cause: unix.EPERM,
+			},
+			expected: javaRemoteParentStatusLoadDenied,
+		},
+		{
+			name:     "attach operation not permitted",
+			stage:    javaRemoteParentStageAttach,
+			err:      unix.EPERM,
+			expected: javaRemoteParentStatusPermissionDenied,
+		},
+		{
+			name:     "wrapped attach permission denied",
+			stage:    javaRemoteParentStageAttach,
 			err:      errors.Join(errors.New("cgroup attach failed"), unix.EACCES),
-			expected: javabridge.StatusTransportError,
+			expected: javaRemoteParentStatusPermissionDenied,
 		},
 		{
 			name:     "permission denial takes precedence over feature absence",
+			stage:    javaRemoteParentStageAttach,
 			err:      errors.Join(ebpf.ErrNotSupported, unix.EPERM),
-			expected: javabridge.StatusTransportError,
+			expected: javaRemoteParentStatusPermissionDenied,
+		},
+		{
+			name:  "rollback denial does not mask unsupported attach",
+			stage: javaRemoteParentStageAttach,
+			err: &javaRemoteParentSockoptAttachError{
+				attach:   ebpf.ErrNotSupported,
+				rollback: unix.EACCES,
+			},
+			expected: javabridge.StatusUnsupported.String(),
+		},
+		{
+			name:     "deadline exceeded",
+			stage:    javaRemoteParentStageListen,
+			err:      context.DeadlineExceeded,
+			expected: javabridge.StatusTimeout.String(),
+		},
+		{
+			name:     "system timeout",
+			stage:    javaRemoteParentStageListen,
+			err:      unix.ETIMEDOUT,
+			expected: javabridge.StatusTimeout.String(),
+		},
+		{
+			name:     "buffer exhaustion",
+			stage:    javaRemoteParentStageListen,
+			err:      unix.ENOBUFS,
+			expected: javabridge.StatusOverload.String(),
+		},
+		{
+			name:     "memory exhaustion",
+			stage:    javaRemoteParentStageLoad,
+			err:      unix.ENOMEM,
+			expected: javabridge.StatusOverload.String(),
+		},
+		{
+			name:     "capacity exhaustion",
+			stage:    javaRemoteParentStageLoad,
+			err:      unix.ENOSPC,
+			expected: javabridge.StatusOverload.String(),
+		},
+		{
+			name:     "process file descriptor exhaustion",
+			stage:    javaRemoteParentStageListen,
+			err:      unix.EMFILE,
+			expected: javabridge.StatusOverload.String(),
+		},
+		{
+			name:     "system file descriptor exhaustion",
+			stage:    javaRemoteParentStageListen,
+			err:      unix.ENFILE,
+			expected: javabridge.StatusOverload.String(),
+		},
+		{
+			name:     "unavailable without an error",
+			stage:    javaRemoteParentStageReadiness,
+			err:      nil,
+			expected: javabridge.StatusMissing.String(),
+		},
+		{
+			name:     "missing path",
+			stage:    javaRemoteParentStageAttach,
+			err:      unix.ENOENT,
+			expected: javabridge.StatusMissing.String(),
+		},
+		{
+			name:     "missing device",
+			stage:    javaRemoteParentStageAttach,
+			err:      unix.ENODEV,
+			expected: javabridge.StatusMissing.String(),
+		},
+		{
+			name:     "unsupported hierarchy takes precedence over probe path absence",
+			stage:    javaRemoteParentStageAttach,
+			err:      errors.Join(ebpf.ErrNotSupported, unix.ENOENT),
+			expected: javabridge.StatusUnsupported.String(),
 		},
 		{
 			name:     "kernel feature unavailable",
+			stage:    javaRemoteParentStageProbe,
 			err:      ebpf.ErrNotSupported,
-			expected: javabridge.StatusUnsupported,
+			expected: javabridge.StatusUnsupported.String(),
 		},
 		{
 			name:     "wrapped kernel feature unavailable",
+			stage:    javaRemoteParentStageProbe,
 			err:      errors.Join(errors.New("feature probe"), ebpf.ErrNotSupported),
-			expected: javabridge.StatusUnsupported,
+			expected: javabridge.StatusUnsupported.String(),
+		},
+		{
+			name:     "socket option unavailable",
+			stage:    javaRemoteParentStageProbe,
+			err:      unix.ENOPROTOOPT,
+			expected: javabridge.StatusUnsupported.String(),
+		},
+		{
+			name:     "operation unsupported",
+			stage:    javaRemoteParentStageProbe,
+			err:      unix.EOPNOTSUPP,
+			expected: javabridge.StatusUnsupported.String(),
+		},
+		{
+			name:     "system call unavailable",
+			stage:    javaRemoteParentStageProbe,
+			err:      unix.ENOSYS,
+			expected: javabridge.StatusUnsupported.String(),
 		},
 		{
 			name:     "inconclusive feature probe",
+			stage:    javaRemoteParentStageProbe,
 			err:      errors.New("kernel helper probe failed"),
-			expected: javabridge.StatusTransportError,
+			expected: javabridge.StatusTransportError.String(),
 		},
 		{
-			name:     "resource exhaustion",
-			err:      unix.ENOMEM,
-			expected: javabridge.StatusTransportError,
-		},
-		{
-			name: "opaque cgroup path permission failure",
+			name:  "opaque cgroup path permission failure",
+			stage: javaRemoteParentStageAttach,
 			err: errors.New(
 				"can't open cgroup: open /sys/fs/cgroup: permission denied",
 			),
-			expected: javabridge.StatusTransportError,
+			expected: javabridge.StatusTransportError.String(),
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.expected, javaRemoteParentPrimaryFailureStatus(tt.err))
+			assert.Equal(t, tt.expected, javaRemoteParentAvailabilityReason(tt.stage, tt.err))
 		})
 	}
 }
@@ -639,6 +933,7 @@ func TestJavaRemoteParentAutoFallsBackOnPrimaryPermissionFailure(t *testing.T) {
 		{name: "permission denied", err: unix.EACCES},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			var logs bytes.Buffer
 			setsockoptCalled := false
 			attachCgroupGetsockopt = func(*ebpf.Program) (io.Closer, error) {
 				return nil, tt.err
@@ -674,6 +969,7 @@ func TestJavaRemoteParentAutoFallsBackOnPrimaryPermissionFailure(t *testing.T) {
 			cfg := obi.DefaultConfig
 			cfg.Java.RemoteParent.Transport = obi.JavaRemoteParentAuto
 			tracer := New(&cfg, reporter)
+			tracer.log = slog.New(slog.NewTextHandler(&logs, nil))
 			tracer.javaRemoteParentLoaded = true
 			tracer.bpfJavaRemoteParentMaps.JavaRemoteParentDataHookReadiness = &ebpf.Map{}
 
@@ -701,8 +997,8 @@ func TestJavaRemoteParentAutoFallsBackOnPrimaryPermissionFailure(t *testing.T) {
 			assert.Equal(t, []javaRemoteParentObservation{
 				{
 					transport: "getsockopt",
-					operation: "negotiate",
-					status:    "transport_error",
+					operation: "availability",
+					status:    "permission_denied",
 					count:     1,
 				},
 				{
@@ -712,6 +1008,8 @@ func TestJavaRemoteParentAutoFallsBackOnPrimaryPermissionFailure(t *testing.T) {
 					count:     1,
 				},
 			}, reporter.observations)
+			assert.Contains(t, logs.String(), "stage=attach")
+			assert.Contains(t, logs.String(), "reason=permission_denied")
 		})
 	}
 }
@@ -788,7 +1086,7 @@ func TestJavaRemoteParentFallbackRecoversAfterServeFailure(t *testing.T) {
 	assert.Equal(t, 2, closed)
 	assert.Contains(t, reporter.observations, javaRemoteParentObservation{
 		transport: "unix",
-		operation: "negotiate",
+		operation: "availability",
 		status:    "transport_error",
 		count:     1,
 	})

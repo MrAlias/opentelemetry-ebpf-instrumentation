@@ -35,6 +35,22 @@ const (
 	javaRemoteParentReadinessPollInterval   = 100 * time.Millisecond
 )
 
+type javaRemoteParentAvailabilityStage string
+
+const (
+	javaRemoteParentAvailabilityOperation  = "availability"
+	javaRemoteParentStatusLoadDenied       = "load_denied"
+	javaRemoteParentStatusPermissionDenied = "permission_denied"
+	javaRemoteParentStatusVerifierRejected = "verifier_rejected"
+
+	javaRemoteParentStageProbe     javaRemoteParentAvailabilityStage = "probe"
+	javaRemoteParentStageLoad      javaRemoteParentAvailabilityStage = "load"
+	javaRemoteParentStageAttach    javaRemoteParentAvailabilityStage = "attach"
+	javaRemoteParentStageReadiness javaRemoteParentAvailabilityStage = "readiness"
+	javaRemoteParentStageListen    javaRemoteParentAvailabilityStage = "listen"
+	javaRemoteParentStageServe     javaRemoteParentAvailabilityStage = "serve"
+)
+
 type javaRemoteParentFallbackServer interface {
 	Serve(context.Context) error
 	Close() error
@@ -91,6 +107,22 @@ type javaRemoteParentSockoptLinks struct {
 	setsockopt io.Closer
 }
 
+type javaRemoteParentSockoptAttachError struct {
+	attach   error
+	rollback error
+}
+
+func (e *javaRemoteParentSockoptAttachError) Error() string {
+	return errors.Join(e.attach, e.rollback).Error()
+}
+
+func (e *javaRemoteParentSockoptAttachError) Unwrap() []error {
+	if e.rollback == nil {
+		return []error{e.attach}
+	}
+	return []error{e.attach, e.rollback}
+}
+
 func (l javaRemoteParentSockoptLinks) Close() error {
 	return errors.Join(l.getsockopt.Close(), l.setsockopt.Close())
 }
@@ -103,7 +135,10 @@ func attachJavaRemoteParentSockopt(getsockopt, setsockopt *ebpf.Program) (io.Clo
 
 	setLink, err := attachCgroupSetsockopt(setsockopt)
 	if err != nil {
-		return nil, errors.Join(err, getLink.Close())
+		return nil, &javaRemoteParentSockoptAttachError{
+			attach:   err,
+			rollback: getLink.Close(),
+		}
 	}
 
 	return javaRemoteParentSockoptLinks{getsockopt: getLink, setsockopt: setLink}, nil
@@ -159,6 +194,7 @@ func (p *Tracer) loadJavaRemoteParentSpecs() {
 	p.javaRemoteParentSpec = nil
 	p.javaRemoteParentMapsSpec = nil
 	p.javaRemoteParentError = nil
+	p.javaRemoteParentErrorStage = ""
 	p.javaRemoteParentMapsError = nil
 
 	transport := p.cfg.Java.RemoteParent.Transport
@@ -178,17 +214,20 @@ func (p *Tracer) loadJavaRemoteParentSpecs() {
 
 	if err := haveCgroupSockopt(); err != nil {
 		p.javaRemoteParentError = err
+		p.javaRemoteParentErrorStage = javaRemoteParentStageProbe
 		return
 	}
 
 	spec, err := LoadBpfJavaRemoteParent()
 	if err != nil {
 		p.javaRemoteParentError = err
+		p.javaRemoteParentErrorStage = javaRemoteParentStageLoad
 		return
 	}
 	constants := p.javaRemoteParentConstants()
 	if err := validateCgroupSockoptSpec(spec, constants); err != nil {
 		p.javaRemoteParentError = err
+		p.javaRemoteParentErrorStage = javaRemoteParentStageLoad
 		return
 	}
 
@@ -236,6 +275,7 @@ func (p *Tracer) loadJavaRemoteParentObjects(eventContext *ebpfcommon.EBPFEventC
 		nil,
 	); err != nil {
 		p.javaRemoteParentError = err
+		p.javaRemoteParentErrorStage = javaRemoteParentStageLoad
 		return
 	}
 	p.javaRemoteParentLoaded = true
@@ -261,20 +301,20 @@ func (p *Tracer) runJavaRemoteParent(ctx context.Context) func() {
 		return func() {}
 	}
 	if p.javaRemoteParentSupportErr != nil {
-		p.log.Warn(
-			"Java remote-parent bridge unsupported by this kernel",
-			"error", p.javaRemoteParentSupportErr,
+		p.reportJavaRemoteParentTransportsUnavailable(
+			"Java remote-parent bridge unavailable",
+			javaRemoteParentStageProbe,
+			p.javaRemoteParentSupportErr,
 		)
-		p.observeJavaRemoteParentUnsupported()
 		return func() {}
 	}
 
 	if p.javaRemoteParentMapsError != nil || !p.javaRemoteParentMapsLoaded {
-		p.log.Warn(
+		p.reportJavaRemoteParentTransportsUnavailable(
 			"Java remote-parent shared maps unavailable",
-			"error", p.javaRemoteParentMapsError,
+			javaRemoteParentStageLoad,
+			p.javaRemoteParentMapsError,
 		)
-		p.observeJavaRemoteParent("unix", "negotiate", javabridge.StatusUnsupported, 1)
 		return func() {}
 	}
 	maps := p.javaRemoteParentMaps()
@@ -310,14 +350,50 @@ func (p *Tracer) runJavaRemoteParent(ctx context.Context) func() {
 	}
 }
 
-func (p *Tracer) observeJavaRemoteParentUnsupported() {
+func (p *Tracer) reportJavaRemoteParentTransportsUnavailable(
+	message string,
+	stage javaRemoteParentAvailabilityStage,
+	err error,
+) {
+	reason := p.logJavaRemoteParentUnavailable(message, stage, err)
 	transport := p.cfg.Java.RemoteParent.Transport
 	if transport == obi.JavaRemoteParentAuto || transport == obi.JavaRemoteParentGetsockopt {
-		p.observeJavaRemoteParent("getsockopt", "negotiate", javabridge.StatusUnsupported, 1)
+		p.observeJavaRemoteParentResult(
+			"getsockopt", javaRemoteParentAvailabilityOperation, reason, 1,
+		)
 	}
 	if transport == obi.JavaRemoteParentAuto || transport == obi.JavaRemoteParentUnix {
-		p.observeJavaRemoteParent("unix", "negotiate", javabridge.StatusUnsupported, 1)
+		p.observeJavaRemoteParentResult(
+			"unix", javaRemoteParentAvailabilityOperation, reason, 1,
+		)
 	}
+}
+
+func (p *Tracer) reportJavaRemoteParentTransportUnavailable(
+	message string,
+	transport string,
+	stage javaRemoteParentAvailabilityStage,
+	err error,
+) {
+	reason := p.logJavaRemoteParentUnavailable(message, stage, err)
+	p.observeJavaRemoteParentResult(
+		transport, javaRemoteParentAvailabilityOperation, reason, 1,
+	)
+}
+
+func (p *Tracer) logJavaRemoteParentUnavailable(
+	message string,
+	stage javaRemoteParentAvailabilityStage,
+	err error,
+) string {
+	reason := javaRemoteParentAvailabilityReason(stage, err)
+	p.log.Warn(
+		message,
+		"stage", string(stage),
+		"reason", reason,
+		"error", err,
+	)
+	return reason
 }
 
 func (p *Tracer) runJavaRemoteParentTransports(
@@ -337,16 +413,16 @@ func (p *Tracer) runJavaRemoteParentTransports(
 		)
 		if err != nil {
 			p.javaRemoteParentError = err
+			p.javaRemoteParentErrorStage = javaRemoteParentStageAttach
 		}
 	}
 
 	if p.javaRemoteParentError != nil {
-		p.log.Warn("Java remote-parent getsockopt transport unavailable", "error", p.javaRemoteParentError)
-		p.observeJavaRemoteParent(
+		p.reportJavaRemoteParentTransportUnavailable(
+			"Java remote-parent getsockopt transport unavailable",
 			"getsockopt",
-			"negotiate",
-			javaRemoteParentPrimaryFailureStatus(p.javaRemoteParentError),
-			1,
+			p.javaRemoteParentErrorStage,
+			p.javaRemoteParentError,
 		)
 	}
 	server, serverDone := p.startJavaRemoteParentFallback(ctx, handler)
@@ -402,9 +478,11 @@ func (p *Tracer) runJavaRemoteParentTransports(
 			server = nil
 			serverDone = nil
 			recoveringFallback = true
-			p.log.Warn("Java remote-parent fallback transport stopped", "error", serveErr)
-			p.observeJavaRemoteParent(
-				"unix", "negotiate", javabridge.StatusTransportError, 1,
+			p.reportJavaRemoteParentTransportUnavailable(
+				"Java remote-parent fallback transport stopped",
+				"unix",
+				javaRemoteParentStageServe,
+				serveErr,
 			)
 			retryDelay = nextJavaRemoteParentRetryDelay(retryDelay)
 		case <-retry:
@@ -424,14 +502,41 @@ func (p *Tracer) runJavaRemoteParentTransports(
 	}
 }
 
-func javaRemoteParentPrimaryFailureStatus(err error) javabridge.Status {
+func javaRemoteParentAvailabilityReason(
+	stage javaRemoteParentAvailabilityStage,
+	err error,
+) string {
+	var attachErr *javaRemoteParentSockoptAttachError
+	if errors.As(err, &attachErr) {
+		err = attachErr.attach
+	}
+
+	var verifierErr *ebpf.VerifierError
+	if errors.As(err, &verifierErr) && len(verifierErr.Log) > 0 {
+		return javaRemoteParentStatusVerifierRejected
+	}
 	if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
-		return javabridge.StatusTransportError
+		if stage == javaRemoteParentStageLoad {
+			return javaRemoteParentStatusLoadDenied
+		}
+		return javaRemoteParentStatusPermissionDenied
 	}
-	if errors.Is(err, ebpf.ErrNotSupported) {
-		return javabridge.StatusUnsupported
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, unix.ETIMEDOUT) {
+		return javabridge.StatusTimeout.String()
 	}
-	return javabridge.StatusTransportError
+	if errors.Is(err, unix.ENOBUFS) || errors.Is(err, unix.ENOMEM) ||
+		errors.Is(err, unix.ENOSPC) || errors.Is(err, unix.EMFILE) ||
+		errors.Is(err, unix.ENFILE) {
+		return javabridge.StatusOverload.String()
+	}
+	if errors.Is(err, ebpf.ErrNotSupported) || errors.Is(err, unix.ENOPROTOOPT) ||
+		errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.ENOSYS) {
+		return javabridge.StatusUnsupported.String()
+	}
+	if err == nil || errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ENODEV) {
+		return javabridge.StatusMissing.String()
+	}
+	return javabridge.StatusTransportError.String()
 }
 
 func nextJavaRemoteParentRetryDelay(current time.Duration) time.Duration {
@@ -481,14 +586,11 @@ func (p *Tracer) waitForJavaRemoteParentDataHook(ctx context.Context) bool {
 		}
 		if !reportedUnavailable {
 			reportedUnavailable = true
-			p.log.Warn("Java remote-parent transports waiting for authoritative data hook", "error", err)
-			transport := p.cfg.Java.RemoteParent.Transport
-			if transport == obi.JavaRemoteParentAuto || transport == obi.JavaRemoteParentGetsockopt {
-				p.observeJavaRemoteParent("getsockopt", "negotiate", javabridge.StatusUnsupported, 1)
-			}
-			if transport == obi.JavaRemoteParentAuto || transport == obi.JavaRemoteParentUnix {
-				p.observeJavaRemoteParent("unix", "negotiate", javabridge.StatusUnsupported, 1)
-			}
+			p.reportJavaRemoteParentTransportsUnavailable(
+				"Java remote-parent transports waiting for authoritative data hook",
+				javaRemoteParentStageReadiness,
+				err,
+			)
 		}
 
 		select {
@@ -532,8 +634,12 @@ func (p *Tracer) startJavaRemoteParentFallback(
 	}
 	ready, err := p.javaRemoteParentDataHookReady()
 	if err != nil || !ready {
-		p.log.Warn("Java remote-parent fallback transport blocked by unavailable data hook", "error", err)
-		p.observeJavaRemoteParent("unix", "negotiate", javabridge.StatusUnsupported, 1)
+		p.reportJavaRemoteParentTransportUnavailable(
+			"Java remote-parent fallback transport blocked by unavailable data hook",
+			"unix",
+			javaRemoteParentStageReadiness,
+			err,
+		)
 		return nil, nil
 	}
 	server, err := newJavaRemoteParentFallbackServer(javabridge.ServerOptions{
@@ -546,8 +652,12 @@ func (p *Tracer) startJavaRemoteParentFallback(
 		},
 	}, handler)
 	if err != nil {
-		p.log.Warn("Java remote-parent fallback transport unavailable", "error", err)
-		p.observeJavaRemoteParent("unix", "negotiate", javabridge.StatusTransportError, 1)
+		p.reportJavaRemoteParentTransportUnavailable(
+			"Java remote-parent fallback transport unavailable",
+			"unix",
+			javaRemoteParentStageListen,
+			err,
+		)
 		return nil, nil
 	}
 
@@ -715,7 +825,16 @@ func (p *Tracer) observeJavaRemoteParent(
 	status javabridge.Status,
 	count uint64,
 ) {
+	p.observeJavaRemoteParentResult(transport, operation, status.String(), count)
+}
+
+func (p *Tracer) observeJavaRemoteParentResult(
+	transport string,
+	operation string,
+	status string,
+	count uint64,
+) {
 	if p.metrics != nil {
-		p.metrics.JavaRemoteParent(transport, operation, status.String(), count)
+		p.metrics.JavaRemoteParent(transport, operation, status, count)
 	}
 }

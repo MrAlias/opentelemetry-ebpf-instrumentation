@@ -49,6 +49,7 @@ type Tracer struct {
 	javaRemoteParentSpec       *ebpf.CollectionSpec
 	javaRemoteParentMapsSpec   *ebpf.CollectionSpec
 	javaRemoteParentError      error
+	javaRemoteParentErrorStage javaRemoteParentAvailabilityStage
 	javaRemoteParentMapsError  error
 	javaRemoteParentSweep      chan struct{}
 	javaRemoteParentEnabled    bool

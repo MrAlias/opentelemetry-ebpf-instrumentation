@@ -337,6 +337,21 @@ func TestJavaRemoteParentPrimaryRequiresAuthoritativeDataHook(t *testing.T) {
 func loadJavaRemoteParentFixture(t *testing.T) BpfJavaRemoteParentObjects {
 	t.Helper()
 
+	spec := javaRemoteParentFixtureSpec(t)
+
+	var objects BpfJavaRemoteParentObjects
+	if err := spec.LoadAndAssign(&objects, nil); err != nil {
+		if errors.Is(err, unix.EPERM) {
+			t.Skipf("insufficient capability to load Java bridge BPF programs: %v", err)
+		}
+		require.NoError(t, err)
+	}
+	return objects
+}
+
+func javaRemoteParentFixtureSpec(t *testing.T) *ebpf.CollectionSpec {
+	t.Helper()
+
 	spec, err := LoadBpfJavaRemoteParent()
 	require.NoError(t, err)
 	for _, mapSpec := range spec.Maps {
@@ -349,14 +364,7 @@ func loadJavaRemoteParentFixture(t *testing.T) BpfJavaRemoteParentObjects {
 		"java_remote_parent_max_age_ns": uint64((30 * time.Second).Nanoseconds()),
 	}))
 
-	var objects BpfJavaRemoteParentObjects
-	if err := spec.LoadAndAssign(&objects, nil); err != nil {
-		if errors.Is(err, unix.EPERM) {
-			t.Skipf("insufficient capability to load Java bridge BPF programs: %v", err)
-		}
-		require.NoError(t, err)
-	}
-	return objects
+	return spec
 }
 
 func attachJavaRemoteParentFixture(t *testing.T, programs *BpfJavaRemoteParentPrograms) {

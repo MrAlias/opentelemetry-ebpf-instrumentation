@@ -376,6 +376,12 @@ fallback deadline, including time spent acquiring a transport configuration.
 The OBI bridge is opt-in:
 
 ```yaml
+executable_path: java
+trace_printer: text
+
+ebpf:
+  context_propagation: tcp
+
 javaagent:
   remote_parent:
     transport: auto
@@ -398,6 +404,102 @@ receivers accept both, but the bridge accepts only the exact-flags form. Upgrade
 receivers first with the bridge disabled, then enable the bridge across
 senders. Disable it before downgrading during rollback; old receivers are not
 required to understand the 27-byte option.
+
+### OBI privileges and cgroup placement
+
+The primary transport adds no Java-process privilege. The JVM receives no BPF
+map file descriptor, bpffs mount, BPF capability, or cgroup handle. It uses
+ordinary socket calls for the primary transport and needs only connect access
+to the configured socket group for the Unix fallback.
+
+OBI retains its existing application-observability capability requirements.
+On Linux 5.9 and newer, a least-privilege capability-based deployment needs
+`CAP_BPF`; `CAP_CHECKPOINT_RESTORE`, `CAP_DAC_READ_SEARCH`, `CAP_SYS_PTRACE`,
+`CAP_PERFMON`, and `CAP_NET_RAW` for application discovery and tracing; and
+`CAP_NET_ADMIN` because the bridge requires TCP context propagation. Linux 5.9
+and 5.10 also need `CAP_SYS_RESOURCE`. Every pre-5.11 kernel needs
+`CAP_SYS_RESOURCE` when OBI must raise the hard `RLIMIT_MEMLOCK`; starting OBI
+with an unlimited hard limit avoids that raise. `CAP_SYS_ADMIN` does not
+substitute for this resource-limit capability.
+
+Linux 5.8 cannot grant `CAP_CHECKPOINT_RESTORE`, which was introduced in 5.9,
+although the current application-observability preflight checks it; use the
+`CAP_SYS_ADMIN` privileged shortcut on 5.8. The pre-5.8 compatibility path also
+requires `CAP_SYS_ADMIN`. On either path, retain the separate pre-5.11
+`CAP_SYS_RESOURCE` or unlimited-hard-memlock requirement above. The capability
+check enforces the configured OBI feature requirements, but its
+`CAP_SYS_ADMIN` shortcut does not predict that resource-limit requirement or
+whether cgroup resolution will need the conditional anonymous mount described
+below. Do not copy the PoC's blanket `privileged` setting into a
+least-privilege deployment.
+
+OBI resolves one cgroup v2 attachment target in this order:
+
+1. `/sys/fs/cgroup` when it is the unified v2 hierarchy;
+2. `/sys/fs/cgroup/unified` in hybrid mode;
+3. an anonymous cgroup v2 mount created with `fsopen` and `fsmount` when
+   neither fixed path exposes cgroup v2.
+
+The set- and get-sockopt programs attach to that hierarchy root with BPF links.
+The selected target must be an ancestor of every Java workload whose accepted
+sockets use the primary bridge. Descendant and delegated sub-cgroups inherit
+the programs, including sub-cgroups created after OBI starts.
+
+For a fixed-path target, the directory exposed in OBI's mount namespace must
+be the host root or another delegated ancestor containing all target Java
+workloads. It can be an inherited or bind-mounted hierarchy even when OBI uses
+a private cgroup namespace. A read-only cgroup mount is sufficient to open
+that target.
+
+For an anonymous mount, its filesystem root is OBI's cgroup namespace root.
+That root must therefore be the host root or another delegated ancestor
+containing all target Java workloads. A private cgroup namespace rooted only
+at the OBI container cannot cover sibling application containers through this
+route. In both cases, the OBI process still needs permission to load and attach
+the BPF programs.
+
+In hybrid mode only the v2 hierarchy is used. When neither fixed path above
+exposes cgroup v2, OBI attempts the anonymous v2 mount, even if a cgroup v2
+hierarchy is visible at another path. Creating that mount with `fsopen`,
+`fsconfig`, and `fsmount` requires `CAP_SYS_ADMIN`; this is an additional
+runtime requirement that the normal split-capability preflight does not
+predict. Prefer exposing the appropriate v2 hierarchy at `/sys/fs/cgroup` or
+`/sys/fs/cgroup/unified`. Otherwise grant that capability only to OBI or force
+`unix`. The primary transport is unavailable if the kernel or OBI's namespaces
+and privileges cannot create the mount, so a `cgroup v1` label alone is neither
+support nor failure evidence.
+
+Multiple OBI instances, or another cgroup sockopt program at an ancestor or
+descendant, can compete for the same calls; deploy one bridge owner per
+effective hierarchy or force the Unix transport. The readiness exchange
+detects a hook that blocks or rewrites its probe, but it cannot prove that a
+competing program will never affect a later application socket. BPF link file
+descriptors remain owned by OBI and close on normal shutdown, partial attach
+rollback, or process death, so the bridge does not leave a pinned cgroup
+program behind.
+
+Availability diagnostics identify the failed boundary without inferring
+support from a kernel version. The bounded stage and reason identify the
+boundary class; the warning message and error distinguish a bridge-wide shared
+prerequisite from the primary transport:
+
+| Stage and reason | Operator check |
+| --- | --- |
+| `probe/unsupported` | Inspect the named runtime probe. Missing `CGroupSockopt` permits `unix`; missing TCP producer support disables both transports. |
+| `probe/permission_denied` | Check the OBI capabilities and LSM policy for the named feature probe. |
+| `load/load_denied` | Identify the shared-map or primary-object load, then check capabilities, LSM policy, and the applicable memlock limit. |
+| `load/verifier_rejected` | Identify the rejected object, retain verifier output, and treat that kernel/object combination as incompatible. |
+| `attach/missing` | Check that either fixed path exposes cgroup v2 or that OBI can create the anonymous mount in its namespaces. |
+| `attach/permission_denied` | Check target ancestry, cgroup delegation, conditional self-mount capability, BPF attach permission, and LSM policy. |
+| `readiness/missing` | Check that the TCP data hook and shared bridge maps loaded successfully. |
+
+After shared maps and the TCP producer are ready, `auto` records a
+primary-specific probe, object-load, or attach failure and selects the Unix
+fallback. A bridge-wide producer or shared-map failure leaves both transports
+unavailable. Forced `getsockopt` records its failure and leaves Java extraction
+fail-open without silently changing transports.
+
+### Diagnostics
 
 Diagnostics use only bounded transport, operation, status, and lifecycle
 values. They never include trace IDs, span IDs, headers, bodies, credentials,

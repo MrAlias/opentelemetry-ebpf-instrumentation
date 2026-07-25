@@ -147,7 +147,7 @@ func TestAssertSnapshotRequiresBridgeCandidateMarker(t *testing.T) {
 	assert.ErrorContains(t, AssertSnapshot(snapshot, expectation), "exactly one Apache client candidate")
 }
 
-func TestAssertSnapshotRequiresApacheRootWithoutExternalW3C(t *testing.T) {
+func TestAssertSnapshotRequiresApacheRootWithoutValidW3C(t *testing.T) {
 	snapshot := bridgeSnapshot(testRemoteSpanFlags)
 	snapshot.Spans[0].ParentSpanID = ""
 	expectation := Expectation{
@@ -160,7 +160,7 @@ func TestAssertSnapshotRequiresApacheRootWithoutExternalW3C(t *testing.T) {
 
 	require.NoError(t, AssertSnapshot(snapshot, expectation))
 	snapshot.Spans[0].ParentSpanID = testExternalSpanID
-	assert.ErrorContains(t, AssertSnapshot(snapshot, expectation), "root without an external W3C parent")
+	assert.ErrorContains(t, AssertSnapshot(snapshot, expectation), "without valid W3C context to be a root")
 }
 
 func TestAssertSnapshotRequiresW3CCandidateGraphAndFlags(t *testing.T) {

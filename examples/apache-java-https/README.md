@@ -325,6 +325,7 @@ OBI accepts these environment overrides (the YAML equivalents are in
 
 | Setting | Value in this demo |
 | --- | --- |
+| `OTEL_EBPF_BPF_DISABLE_BLACK_BOX_CP` | `true` |
 | `OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT` | `disabled`, `auto`, `getsockopt`, or `unix` |
 | `OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_PATH` | `/var/run/obi/java-remote-parent.sock` |
 | `OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_GROUP_ID` | `0` (the demo JVM runs as root) |
@@ -345,7 +346,11 @@ keeps the official agent and extension enabled while disabling only the OBI
 transport. The uninstrumented control removes the agent and stops OBI.
 
 OBI context propagation is `tcp`, not `headers` or `all`. That prevents OBI
-HTTP header injection from hiding whether the Java bridge works.
+HTTP header injection from hiding whether the Java bridge works. The fixture
+also disables legacy black-box correlation so unrelated loopback connections
+cannot be joined when an ephemeral source port is reused. Exact incoming TCP
+candidates are consumed before that fallback is gated, so the Java bridge
+remains enabled.
 
 ## Evidence
 

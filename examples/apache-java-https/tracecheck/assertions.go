@@ -122,7 +122,7 @@ func AssertSnapshot(snapshot Snapshot, expectation Expectation) error {
 			}
 			if expectation.W3CTraceID == "" && !isZeroID(apacheServer.ParentSpanID) {
 				return fmt.Errorf(
-					"expected Apache inbound span to be a root without an external W3C parent, got parent %s",
+					"expected Apache inbound span without valid W3C context to be a root, got parent %s",
 					apacheServer.ParentSpanID,
 				)
 			}

@@ -5649,6 +5649,13 @@ test_demo_diagnostics_are_loopback_only() {
   grep -Fqx '                - X-OBI-Demo-ID' "$obi_config"
 }
 
+test_demo_uses_only_explicit_tcp_context() {
+  local -r obi_config="$TEST_SCRIPT_DIR/../configs/obi.yaml"
+
+  grep -Fqx '  context_propagation: tcp' "$obi_config"
+  grep -Fqx '  disable_black_box_cp: true' "$obi_config"
+}
+
 main() {
   TEST_TMP_DIR="$(mktemp -d)"
   test_project_name_validation
@@ -5755,6 +5762,7 @@ main() {
   test_non_acceptance_reasons_are_recorded
   test_release_source_uses_one_version_for_extension
   test_demo_diagnostics_are_loopback_only
+  test_demo_uses_only_explicit_tcp_context
   printf 'demo harness tests passed\n'
 }
 

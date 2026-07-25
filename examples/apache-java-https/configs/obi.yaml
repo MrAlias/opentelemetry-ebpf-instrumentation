@@ -27,6 +27,7 @@ attributes:
 
 ebpf:
   context_propagation: tcp
+  disable_black_box_cp: true
   buffer_sizes:
     http: 8192
   payload_extraction:

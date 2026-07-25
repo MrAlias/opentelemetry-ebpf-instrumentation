@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 
 readonly OUTPUT_DIR="${TEST_OUTPUT:-testoutput}/java-remote-parent-rhel9.6-kernel-sockopt"
-readonly PRIVILEGED_TEST_PATTERN='^(TestJavaRemoteParentPrimarySocketAuthority|TestJavaRemoteParentPrimaryRequiresAuthoritativeDataHook|TestJavaRemoteParentNestedCgroupLifecycle|TestJavaRemoteParentCgroupLinkProcessDeathCleanup)$'
+readonly PRIVILEGED_TEST_PATTERN='^(TestJavaRemoteParentPrimarySocketAuthority|TestJavaRemoteParentPrimaryRequiresAuthoritativeDataHook|TestJavaRemoteParentNestedCgroupLifecycle|TestJavaRemoteParentCgroupLinkProcessDeathCleanup|TestJavaRemoteParentCgroupPartialAttachRollback)$'
 readonly BENCHMARK_TEST_PATTERN='^TestJavaRemoteParentTransportBenchmark$'
 
 fail() {
@@ -87,6 +87,8 @@ run_sockopt_authority_tests() {
         TestJavaRemoteParentNestedCgroupLifecycle
     require_test_passed "$output_file" \
         TestJavaRemoteParentCgroupLinkProcessDeathCleanup
+    require_test_passed "$output_file" \
+        TestJavaRemoteParentCgroupPartialAttachRollback
 }
 
 run_transport_benchmark() {

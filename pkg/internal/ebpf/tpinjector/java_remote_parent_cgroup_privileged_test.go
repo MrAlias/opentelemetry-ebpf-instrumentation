@@ -188,6 +188,139 @@ func TestJavaRemoteParentCgroupLinkProcessDeathCleanup(t *testing.T) {
 	requireJavaRemoteParentMapsReleased(t, mapIdentities)
 }
 
+func TestJavaRemoteParentCgroupPartialAttachRollback(t *testing.T) {
+	current := requireJavaRemoteParentCgroupTopology(t)
+	topology := newJavaRemoteParentCgroupTopology(t, current)
+
+	objects := loadJavaRemoteParentFixture(t)
+	objectsOpen := true
+	defer func() {
+		if objectsOpen {
+			assert.NoError(t, objects.Close())
+		}
+	}()
+	mapIdentities := javaRemoteParentMapIdentities(
+		t, &objects.BpfJavaRemoteParentMaps,
+	)
+	getID := javaRemoteParentProgramID(t, objects.ObiJavaRemoteParentGetsockopt)
+	setID := javaRemoteParentProgramID(t, objects.ObiJavaRemoteParentSetsockopt)
+
+	cgroup, err := os.Open(topology.parent)
+	require.NoError(t, err)
+	defer cgroup.Close()
+	target := int(cgroup.Fd())
+
+	// A legacy single-program attachment conflicts with cgroup links'
+	// multi-program mode and forces the second bridge attach to fail.
+	require.NoError(t, link.RawAttachProgram(link.RawAttachProgramOptions{
+		Target:  target,
+		Program: objects.ObiJavaRemoteParentSetsockopt,
+		Attach:  ebpf.AttachCGroupSetsockopt,
+		Flags:   0,
+	}))
+	blockerAttached := true
+	defer func() {
+		if blockerAttached {
+			assert.NoError(t, link.RawDetachProgram(link.RawDetachProgramOptions{
+				Target:  target,
+				Program: objects.ObiJavaRemoteParentSetsockopt,
+				Attach:  ebpf.AttachCGroupSetsockopt,
+			}))
+		}
+	}()
+
+	require.Empty(t, queryCgroupProgramIDs(
+		t, topology.parent, ebpf.AttachCGroupGetsockopt,
+	))
+	require.Equal(
+		t,
+		[]ebpf.ProgramID{setID},
+		queryCgroupProgramIDs(t, topology.parent, ebpf.AttachCGroupSetsockopt),
+	)
+
+	originalGet := attachCgroupGetsockopt
+	originalSet := attachCgroupSetsockopt
+	defer func() {
+		attachCgroupGetsockopt = originalGet
+		attachCgroupSetsockopt = originalSet
+	}()
+	getAttachCalls := 0
+	setAttachCalls := 0
+	getAttachSucceeded := false
+	var getIDsBeforeSet []ebpf.ProgramID
+	var getQueryErr error
+	var setAttachErr error
+	attachCgroupGetsockopt = func(program *ebpf.Program) (io.Closer, error) {
+		getAttachCalls++
+		cgroupLink, err := link.AttachRawLink(link.RawLinkOptions{
+			Target:  target,
+			Program: program,
+			Attach:  ebpf.AttachCGroupGetsockopt,
+		})
+		getAttachSucceeded = err == nil
+		return cgroupLink, err
+	}
+	attachCgroupSetsockopt = func(program *ebpf.Program) (io.Closer, error) {
+		setAttachCalls++
+		getIDsBeforeSet, getQueryErr = cgroupProgramIDs(
+			topology.parent, ebpf.AttachCGroupGetsockopt,
+		)
+		var cgroupLink *link.RawLink
+		cgroupLink, setAttachErr = link.AttachRawLink(link.RawLinkOptions{
+			Target:  target,
+			Program: program,
+			Attach:  ebpf.AttachCGroupSetsockopt,
+		})
+		return cgroupLink, setAttachErr
+	}
+
+	links, err := attachJavaRemoteParentSockopt(
+		objects.ObiJavaRemoteParentGetsockopt,
+		objects.ObiJavaRemoteParentSetsockopt,
+	)
+	if links != nil {
+		defer func() {
+			assert.NoError(t, links.Close())
+		}()
+	}
+	require.Equal(t, 1, getAttachCalls)
+	require.Equal(t, 1, setAttachCalls)
+	require.True(t, getAttachSucceeded)
+	require.NoError(t, getQueryErr)
+	require.Equal(t, []ebpf.ProgramID{getID}, getIDsBeforeSet)
+	require.ErrorIs(t, setAttachErr, unix.EPERM)
+	require.ErrorIs(t, err, unix.EPERM)
+	require.Nil(t, links)
+	require.Empty(t, queryCgroupProgramIDs(
+		t, topology.parent, ebpf.AttachCGroupGetsockopt,
+	))
+	require.Equal(
+		t,
+		[]ebpf.ProgramID{setID},
+		queryCgroupProgramIDs(t, topology.parent, ebpf.AttachCGroupSetsockopt),
+	)
+	require.Equal(t, getID, javaRemoteParentProgramID(
+		t, objects.ObiJavaRemoteParentGetsockopt,
+	))
+
+	require.NoError(t, link.RawDetachProgram(link.RawDetachProgramOptions{
+		Target:  target,
+		Program: objects.ObiJavaRemoteParentSetsockopt,
+		Attach:  ebpf.AttachCGroupSetsockopt,
+	}))
+	blockerAttached = false
+	require.Empty(t, queryCgroupProgramIDs(
+		t, topology.parent, ebpf.AttachCGroupGetsockopt,
+	))
+	require.Empty(t, queryCgroupProgramIDs(
+		t, topology.parent, ebpf.AttachCGroupSetsockopt,
+	))
+
+	require.NoError(t, objects.Close())
+	objectsOpen = false
+	requireJavaRemoteParentMapsReleased(t, mapIdentities)
+}
+
 func TestJavaRemoteParentCgroupV2MountPath(t *testing.T) {
 	mounts, err := parseCgroupV2MountInfo(
 		"36 30 0:30 /delegated /custom\\040cgroup rw,nosuid - cgroup2 cgroup2 rw\n",
@@ -723,21 +856,34 @@ func queryCgroupProgramIDs(
 ) []ebpf.ProgramID {
 	t.Helper()
 
-	cgroup, err := os.Open(path)
+	ids, err := cgroupProgramIDs(path, attach)
 	require.NoError(t, err)
+	return ids
+}
+
+func cgroupProgramIDs(
+	path string,
+	attach ebpf.AttachType,
+) ([]ebpf.ProgramID, error) {
+	cgroup, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
 	defer cgroup.Close()
 
 	result, err := link.QueryPrograms(link.QueryOptions{
 		Target: int(cgroup.Fd()),
 		Attach: attach,
 	})
-	require.NoError(t, err)
+	if err != nil {
+		return nil, err
+	}
 
 	ids := make([]ebpf.ProgramID, 0, len(result.Programs))
 	for _, program := range result.Programs {
 		ids = append(ids, program.ID)
 	}
-	return ids
+	return ids, nil
 }
 
 func requireCgroupProgramsDetached(

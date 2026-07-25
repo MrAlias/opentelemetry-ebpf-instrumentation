@@ -334,11 +334,15 @@ OBI accepts these environment overrides (the YAML equivalents are in
 The official agent loads the external extension with
 `OTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar`. The propagator order
 is `obi,tracecontext,baggage`, and the explicit opt-in is
-`OTEL_OBI_REMOTE_PARENT_ENABLED=true`. Valid W3C context therefore wins and the
-OBI candidate is discarded; invalid W3C context falls through to OBI. The
-bridge-disabled control keeps the official agent and extension enabled while
-disabling only the OBI transport. The uninstrumented control removes the agent
-and stops OBI.
+`OTEL_OBI_REMOTE_PARENT_ENABLED=true`. The equivalent system properties are
+`otel.javaagent.extensions`, `otel.propagators`, and
+`otel.obi.remote.parent.enabled`. Valid W3C context therefore wins and the OBI
+candidate is discarded; invalid W3C context falls through to OBI. The opt-in
+is disabled when unset or empty and otherwise accepts only case-insensitive
+`true` or `false`; another value fails open by disabling OBI extraction and
+logs one fixed warning without echoing the value. The bridge-disabled control
+keeps the official agent and extension enabled while disabling only the OBI
+transport. The uninstrumented control removes the agent and stops OBI.
 
 OBI context propagation is `tcp`, not `headers` or `all`. That prevents OBI
 HTTP header injection from hiding whether the Java bridge works.

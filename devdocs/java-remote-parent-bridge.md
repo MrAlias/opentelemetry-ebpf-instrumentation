@@ -53,10 +53,20 @@ request.
    replaces the OBI candidate. An absent or invalid header leaves the OBI
    candidate unchanged. `baggage` continues to use the stock implementation.
 
-The required order is:
+The environment-variable form is:
 
 ```text
+OTEL_JAVAAGENT_EXTENSIONS=/path/to/obi-otel-extension.jar
 OTEL_PROPAGATORS=obi,tracecontext,baggage
+OTEL_OBI_REMOTE_PARENT_ENABLED=true
+```
+
+The equivalent system properties are:
+
+```text
+-Dotel.javaagent.extensions=/path/to/obi-otel-extension.jar
+-Dotel.propagators=obi,tracecontext,baggage
+-Dotel.obi.remote.parent.enabled=true
 ```
 
 ```mermaid
@@ -98,9 +108,12 @@ different request transport. The extension does not inspect carrier bytes or
 duplicate the stock W3C parser. The transport value has already been resolved by
 the one-shot take in either branch.
 
-The extension is loaded when the JVM starts. The OBI helper may attach later;
-the extension retries bootstrap-bridge discovery with bounded backoff and does
-not permanently cache helper absence.
+The official-agent extension loader loads the extension only when the JVM
+starts; OBI does not hot-load it into an already running JVM. Changing the
+extension path or propagator list therefore requires a JVM restart. After the
+extension is loaded, the OBI helper may attach later or restart without another
+JVM restart; the extension retries bootstrap-bridge discovery with bounded
+backoff and does not permanently cache helper absence.
 
 The primary transport uses paired cgroup `setsockopt` and `getsockopt` hooks.
 A connected loopback socket is used only to probe hook availability. For each
@@ -393,8 +406,12 @@ javaagent:
 
 `transport` is one of `disabled`, `auto`, `getsockopt`, or `unix` and defaults
 to `disabled`. The extension independently requires
+`otel.obi.remote.parent.enabled=true` or
 `OTEL_OBI_REMOTE_PARENT_ENABLED=true`; merely placing `obi` in the propagator
-list does not enable native retrieval.
+list does not enable native retrieval. An unset or empty opt-in defaults to
+`false`; otherwise it accepts only case-insensitive `true` or `false`. Any
+other value disables native retrieval without failing Java-agent startup and
+emits one fixed corrective warning without echoing the configured value.
 
 TCP senders use the legacy 26-byte option while the bridge is disabled. While
 it is enabled, only a request-owned TLS prewrite emits the 27-byte exact-flags

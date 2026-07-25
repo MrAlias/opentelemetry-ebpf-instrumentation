@@ -91,14 +91,54 @@ class OfficialAgentCompatibilityTest {
     assertFalse(
         disabledText.contains("OBI remote-parent propagator disabled by compatibility gate"),
         disabledText);
+
+    String invalidValue = "sensitive-invalid-value";
+    assertInvalidConfiguration(runAgent(command, invalidValue), invalidValue);
+    assertInvalidConfiguration(runAgentWithEnvironment(command, invalidValue), invalidValue);
+  }
+
+  private static void assertInvalidConfiguration(String invalidText, String invalidValue) {
+    assertTrue(
+        invalidText.contains(ObiConfigurablePropagatorProvider.INVALID_ENABLED_PROPERTY_MESSAGE),
+        invalidText);
+    assertEquals(
+        1,
+        occurrences(
+            invalidText, ObiConfigurablePropagatorProvider.INVALID_ENABLED_PROPERTY_MESSAGE),
+        invalidText);
+    assertFalse(invalidText.contains(invalidValue), invalidText);
+    assertFalse(invalidText.contains("OBI remote-parent propagator enabled"), invalidText);
+    assertFalse(
+        invalidText.contains("OBI remote-parent propagator disabled by compatibility gate"),
+        invalidText);
+    assertFalse(
+        invalidText.contains("OBI remote-parent propagator disabled by configuration"),
+        invalidText);
   }
 
   private static String runAgent(List<String> baseCommand, boolean enabled) throws Exception {
+    return runAgent(baseCommand, Boolean.toString(enabled));
+  }
+
+  private static String runAgent(List<String> baseCommand, String enabled) throws Exception {
     List<String> command = new ArrayList<>(baseCommand);
     command.add("-Dotel.obi.remote.parent.enabled=" + enabled);
     command.add("-version");
 
-    Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
+    return runAgent(new ProcessBuilder(command));
+  }
+
+  private static String runAgentWithEnvironment(List<String> baseCommand, String enabled)
+      throws Exception {
+    List<String> command = new ArrayList<>(baseCommand);
+    command.add("-version");
+    ProcessBuilder processBuilder = new ProcessBuilder(command);
+    processBuilder.environment().put("OTEL_OBI_REMOTE_PARENT_ENABLED", enabled);
+    return runAgent(processBuilder);
+  }
+
+  private static String runAgent(ProcessBuilder processBuilder) throws Exception {
+    Process process = processBuilder.redirectErrorStream(true).start();
     ByteArrayOutputStream output = new ByteArrayOutputStream();
     Thread reader = copyOutput(process.getInputStream(), output);
     try {
@@ -117,6 +157,16 @@ class OfficialAgentCompatibilityTest {
     String text = new String(output.toByteArray(), StandardCharsets.UTF_8);
     assertEquals(0, process.exitValue(), text);
     return text;
+  }
+
+  private static int occurrences(String text, String value) {
+    int count = 0;
+    int offset = 0;
+    while ((offset = text.indexOf(value, offset)) >= 0) {
+      count++;
+      offset += value.length();
+    }
+    return count;
   }
 
   private static Thread copyOutput(InputStream input, ByteArrayOutputStream output) {

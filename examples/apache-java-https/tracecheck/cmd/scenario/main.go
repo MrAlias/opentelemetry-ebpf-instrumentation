@@ -33,6 +33,7 @@ type config struct {
 	baseURL           string
 	receiverURL       string
 	scenario          string
+	faultMode         string
 	requestCount      int
 	timeout           time.Duration
 	expectedTLS       string
@@ -43,25 +44,28 @@ type config struct {
 }
 
 type requestCase struct {
-	Marker          string `json:"marker"`
-	Endpoint        string `json:"endpoint"`
-	W3CTraceID      string `json:"w3c_trace_id,omitempty"`
-	W3CParentSpanID string `json:"w3c_parent_span_id,omitempty"`
-	W3CTraceFlags   string `json:"w3c_trace_flags,omitempty"`
-	W3CCase         string `json:"w3c_case,omitempty"`
-	RestartPhase    string `json:"restart_phase,omitempty"`
-	InvalidW3C      bool   `json:"invalid_w3c,omitempty"`
-	HandoffHops     int    `json:"handoff_hops,omitempty"`
-	HandoffFault    string `json:"handoff_fault,omitempty"`
-	VirtualMixed    bool   `json:"virtual_mixed,omitempty"`
-	VirtualCancel   bool   `json:"virtual_cancel,omitempty"`
-	NettyCancel     bool   `json:"netty_cancel,omitempty"`
-	DispatchRounds  int    `json:"dispatch_rounds,omitempty"`
-	TLSBoundaryMode string `json:"tls_boundary_mode,omitempty"`
-	DelayMillis     int    `json:"-"`
-	SlowBodyBytes   int    `json:"-"`
-	CloseConnection bool   `json:"-"`
-	ObserveSocket   bool   `json:"-"`
+	Marker             string `json:"marker"`
+	Endpoint           string `json:"endpoint"`
+	W3CTraceID         string `json:"w3c_trace_id,omitempty"`
+	W3CParentSpanID    string `json:"w3c_parent_span_id,omitempty"`
+	W3CTraceFlags      string `json:"w3c_trace_flags,omitempty"`
+	W3CCase            string `json:"w3c_case,omitempty"`
+	InjectedFaultMode  string `json:"injected_fault_mode,omitempty"`
+	ExpectedJavaStatus string `json:"expected_java_status,omitempty"`
+	RestartPhase       string `json:"restart_phase,omitempty"`
+	InvalidW3C         bool   `json:"invalid_w3c,omitempty"`
+	HandoffHops        int    `json:"handoff_hops,omitempty"`
+	HandoffFault       string `json:"handoff_fault,omitempty"`
+	VirtualMixed       bool   `json:"virtual_mixed,omitempty"`
+	VirtualCancel      bool   `json:"virtual_cancel,omitempty"`
+	NettyCancel        bool   `json:"netty_cancel,omitempty"`
+	DispatchRounds     int    `json:"dispatch_rounds,omitempty"`
+	TLSBoundaryMode    string `json:"tls_boundary_mode,omitempty"`
+	DelayMillis        int    `json:"-"`
+	SlowBodyBytes      int    `json:"-"`
+	CloseConnection    bool   `json:"-"`
+	ObserveSocket      bool   `json:"-"`
+	BridgeDiagnostics  bool   `json:"-"`
 }
 
 type backendResponse struct {
@@ -84,6 +88,7 @@ type backendResponse struct {
 	DispatchRounds      string               `json:"dispatch_rounds,omitempty"`
 	DispatchInvocations string               `json:"dispatch_invocations,omitempty"`
 	TLSBoundary         *tlsBoundaryEvidence `json:"tls_boundary,omitempty"`
+	BridgeDiagnostics   string               `json:"-"`
 }
 
 type tlsBoundaryEvidence struct {
@@ -146,19 +151,20 @@ type socketObservation struct {
 }
 
 type runResult struct {
-	Status              string                      `json:"status"`
-	Scenario            string                      `json:"scenario"`
-	Seed                int64                       `json:"seed"`
-	StartedAt           time.Time                   `json:"started_at"`
-	FinishedAt          time.Time                   `json:"finished_at"`
-	RequestCount        int                         `json:"request_count"`
-	TrafficElapsedNanos int64                       `json:"traffic_elapsed_nanos"`
-	ThroughputPerSecond float64                     `json:"throughput_per_second"`
-	Latency             latencySummary              `json:"latency"`
-	Faults              []faultResult               `json:"faults,omitempty"`
-	ConnectionEvidence  *connectionEvidence         `json:"connection_evidence,omitempty"`
-	PressureCorrelation *pressureCorrelationSummary `json:"pressure_correlation,omitempty"`
-	Cases               []caseResult                `json:"cases"`
+	Status                string                      `json:"status"`
+	Scenario              string                      `json:"scenario"`
+	Seed                  int64                       `json:"seed"`
+	StartedAt             time.Time                   `json:"started_at"`
+	FinishedAt            time.Time                   `json:"finished_at"`
+	RequestCount          int                         `json:"request_count"`
+	TrafficElapsedNanos   int64                       `json:"traffic_elapsed_nanos"`
+	ThroughputPerSecond   float64                     `json:"throughput_per_second"`
+	Latency               latencySummary              `json:"latency"`
+	Faults                []faultResult               `json:"faults,omitempty"`
+	ConnectionEvidence    *connectionEvidence         `json:"connection_evidence,omitempty"`
+	PressureCorrelation   *pressureCorrelationSummary `json:"pressure_correlation,omitempty"`
+	FaultDiagnosticsAfter string                      `json:"fault_diagnostics_after,omitempty"`
+	Cases                 []caseResult                `json:"cases"`
 }
 
 const (
@@ -172,7 +178,71 @@ const (
 	restartPhaseBeforeStop        = "before-stop"
 	restartPhaseWhileStopped      = "obi-stopped"
 	restartPhaseAfterRestart      = "after-restart"
+	bridgeDiagnosticsHeader       = "X-OBI-Java-Diagnostics"
+	maxJavaDiagnosticsCounter     = uint64(999_999_999)
 )
+
+var javaDiagnosticsFieldNames = [...]string{
+	"cfg_on",
+	"cfg_off",
+	"provider_ok",
+	"provider_reject",
+	"provider_ver",
+	"extension_reg",
+	"lookup_ready",
+	"lookup_missing",
+	"lookup_version",
+	"lookup_error",
+	"record_version",
+	"invoke_error",
+	"discard_standard",
+	"extract_fields",
+	"extract_invalid",
+	"extract_error",
+	"registration_ok",
+	"registration_fail",
+	"take_sampled",
+	"take_unsampled",
+	"tls_reads",
+	"tls_bytes",
+	"t_unknown",
+	"d_unknown",
+	"t_valid",
+	"d_valid",
+	"t_missing",
+	"d_missing",
+	"t_stale",
+	"d_stale",
+	"t_unsupported",
+	"d_unsupported",
+	"t_malformed",
+	"d_malformed",
+	"t_version_mismatch",
+	"d_version_mismatch",
+	"t_ambiguous",
+	"d_ambiguous",
+	"t_unauthorized",
+	"d_unauthorized",
+	"t_already_consumed",
+	"d_already_consumed",
+	"t_timeout",
+	"d_timeout",
+	"t_overload",
+	"d_overload",
+	"t_transport_error",
+	"d_transport_error",
+	"t_disabled",
+	"d_disabled",
+}
+
+var maxJavaDiagnosticsSnapshotLength = func() int {
+	length := len(javaDiagnosticsFieldNames) - 1
+	maxValueLength := len(strconv.FormatUint(maxJavaDiagnosticsCounter, 36))
+	for _, name := range javaDiagnosticsFieldNames {
+		length += len(name) + 1 + maxValueLength
+	}
+	return length
+}()
 
 func main() {
 	os.Exit(mainExitCode())
@@ -214,6 +284,7 @@ func parseFlags() config {
 	flag.StringVar(&cfg.baseURL, "base-url", "http://127.0.0.1:18080", "Apache base URL")
 	flag.StringVar(&cfg.receiverURL, "receiver-url", "http://127.0.0.1:14318", "trace receiver base URL")
 	flag.StringVar(&cfg.scenario, "scenario", "basic", "basic, keepalive, pipelining, concurrency, connection-churn, fd-port-reuse, slow-body, tls-boundary, timeout-retry, pressure, handoff, virtual-thread, netty, dispatch, w3c, w3c-match, obi-flags, w3c-fault, w3c-only, helper-attach-failure, restart-fault, fail-open, restart, disabled, or uninstrumented")
+	flag.StringVar(&cfg.faultMode, "fault-mode", "", "w3c-fault mode")
 	flag.IntVar(&cfg.requestCount, "requests", 0, "number of requests (zero selects a scenario default)")
 	flag.DurationVar(&cfg.timeout, "timeout", 45*time.Second, "whole-scenario timeout")
 	flag.StringVar(&cfg.expectedTLS, "expected-tls", "TLSv1.3", "backend TLS protocol")
@@ -258,7 +329,49 @@ func parseFlags() config {
 		fmt.Fprintln(os.Stderr, "--restart-control-dir requires restart-fault")
 		os.Exit(2)
 	}
+	if err := validateFaultMode(cfg); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
 	return cfg
+}
+
+func validateFaultMode(cfg config) error {
+	if cfg.scenario != "w3c-fault" {
+		if cfg.faultMode != "" {
+			return errors.New("--fault-mode requires w3c-fault")
+		}
+		return nil
+	}
+	if cfg.faultMode == "" {
+		return errors.New("w3c-fault requires --fault-mode")
+	}
+	if _, ok := expectedJavaFaultStatus(cfg.faultMode, 0); !ok {
+		return fmt.Errorf("invalid --fault-mode %q", cfg.faultMode)
+	}
+	return nil
+}
+
+func expectedJavaFaultStatus(faultMode string, requestIndex int) (string, bool) {
+	switch faultMode {
+	case "alternating":
+		if requestIndex%2 == 0 {
+			return "stale", true
+		}
+		return "malformed", true
+	case "timeout":
+		return "timeout", true
+	case "disconnect", "truncated":
+		return "transport_error", true
+	case "overload":
+		return "overload", true
+	case "bad-magic", "bad-size", "zero-trace-id", "zero-span-id":
+		return "malformed", true
+	case "version-mismatch":
+		return "version_mismatch", true
+	default:
+		return "", false
+	}
 }
 
 func run(ctx context.Context, cfg config) (*runResult, error) {
@@ -291,6 +404,9 @@ func run(ctx context.Context, cfg config) (*runResult, error) {
 	result.TrafficElapsedNanos = elapsed.Nanoseconds()
 	if elapsed > 0 {
 		result.ThroughputPerSecond = float64(len(requests)) / elapsed.Seconds()
+	}
+	if cfg.scenario == "w3c-fault" {
+		result.FaultDiagnosticsAfter = responses[len(responses)-1].BridgeDiagnostics
 	}
 	result.Latency = summarizeLatencies(latencies)
 	for i := range requests {
@@ -329,6 +445,10 @@ func run(ctx context.Context, cfg config) (*runResult, error) {
 }
 
 func makeRequests(cfg config) ([]requestCase, error) {
+	if err := validateFaultMode(cfg); err != nil {
+		return nil, err
+	}
+
 	seed := uint64(cfg.seed)
 	var randomSeed [32]byte
 	for index := range 4 {
@@ -461,11 +581,18 @@ func makeRequests(cfg config) ([]requestCase, error) {
 				return nil, err
 			}
 		case "w3c-fault":
-			fault := "stale"
-			if i%2 != 0 {
-				fault = "malformed"
+			expectedStatus, ok := expectedJavaFaultStatus(cfg.faultMode, i)
+			if !ok {
+				return nil, fmt.Errorf("invalid --fault-mode %q", cfg.faultMode)
 			}
-			if err := addW3CContext(random, &requests[i], "01", "valid-w3c-"+fault+"-obi"); err != nil {
+			requests[i].InjectedFaultMode = cfg.faultMode
+			requests[i].ExpectedJavaStatus = expectedStatus
+			caseName := fmt.Sprintf(
+				"valid-w3c-injected-%s-java-%s",
+				cfg.faultMode,
+				expectedStatus,
+			)
+			if err := addW3CContext(random, &requests[i], "01", caseName); err != nil {
 				return nil, err
 			}
 		case "w3c-only":
@@ -486,6 +613,9 @@ func makeRequests(cfg config) ([]requestCase, error) {
 				return nil, err
 			}
 		}
+	}
+	if cfg.scenario == "w3c-fault" {
+		requests[len(requests)-1].BridgeDiagnostics = true
 	}
 	if parallelScenario(cfg.scenario) {
 		for i := range requests {
@@ -955,6 +1085,11 @@ func newHTTPRequest(ctx context.Context, cfg config, requestCase requestCase) (*
 		query.Set("socket_identity", "1")
 		requestURL.RawQuery = query.Encode()
 	}
+	if cfg.scenario == "w3c-fault" && requestCase.BridgeDiagnostics {
+		query := requestURL.Query()
+		query.Set("bridge_diagnostics", "1")
+		requestURL.RawQuery = query.Encode()
+	}
 	if requestCase.HandoffHops > 0 {
 		query := requestURL.Query()
 		query.Set("hops", strconv.Itoa(requestCase.HandoffHops))
@@ -1041,11 +1176,19 @@ func decodeBackendResponse(
 	if response.StatusCode != http.StatusOK {
 		return backendResponse{}, fmt.Errorf("unexpected HTTP status %d: %s", response.StatusCode, strings.TrimSpace(string(body)))
 	}
+	diagnostics, err := javaDiagnosticsFromHeader(
+		response.Header,
+		cfg.scenario == "w3c-fault" && requestCase.BridgeDiagnostics,
+	)
+	if err != nil {
+		return backendResponse{}, err
+	}
 
 	var backend backendResponse
 	if err := json.Unmarshal(body, &backend); err != nil {
 		return backendResponse{}, fmt.Errorf("decode backend response: %w", err)
 	}
+	backend.BridgeDiagnostics = diagnostics
 	backend.Workload = response.Header.Get("X-OBI-Workload")
 	backend.HandoffHops = response.Header.Get("X-OBI-Handoff-Hops")
 	backend.HandoffFault = response.Header.Get("X-OBI-Handoff-Fault")
@@ -1076,6 +1219,86 @@ func decodeBackendResponse(
 		return backendResponse{}, err
 	}
 	return backend, nil
+}
+
+func javaDiagnosticsFromHeader(header http.Header, requested bool) (string, error) {
+	values := header.Values(bridgeDiagnosticsHeader)
+	if !requested {
+		if len(values) != 0 {
+			return "", fmt.Errorf("unexpected %s response header", bridgeDiagnosticsHeader)
+		}
+		return "", nil
+	}
+	if len(values) != 1 {
+		return "", fmt.Errorf(
+			"expected exactly one %s response header, got %d",
+			bridgeDiagnosticsHeader,
+			len(values),
+		)
+	}
+	return sanitizeJavaDiagnostics(values[0])
+}
+
+func sanitizeJavaDiagnostics(snapshot string) (string, error) {
+	if snapshot == "unavailable" {
+		return "", errors.New("java bridge diagnostics are unavailable")
+	}
+	if len(snapshot) > maxJavaDiagnosticsSnapshotLength {
+		return "", fmt.Errorf(
+			"java bridge diagnostics exceed %d bytes",
+			maxJavaDiagnosticsSnapshotLength,
+		)
+	}
+	if strings.ContainsAny(snapshot, "\r\n") {
+		return "", errors.New("java bridge diagnostics contain a newline")
+	}
+
+	fields := strings.Split(snapshot, ",")
+	if len(fields) != len(javaDiagnosticsFieldNames) {
+		return "", fmt.Errorf(
+			"java bridge diagnostics expected %d fields, got %d",
+			len(javaDiagnosticsFieldNames),
+			len(fields),
+		)
+	}
+
+	seen := make(map[string]struct{}, len(fields))
+	sanitized := make([]string, len(fields))
+	for index, field := range fields {
+		name, value, ok := strings.Cut(field, "=")
+		if !ok || name == "" || value == "" {
+			return "", fmt.Errorf("java bridge diagnostics field %d is malformed", index)
+		}
+		if _, duplicate := seen[name]; duplicate {
+			return "", fmt.Errorf("java bridge diagnostics field %q is duplicated", name)
+		}
+		seen[name] = struct{}{}
+		if name != javaDiagnosticsFieldNames[index] {
+			return "", fmt.Errorf(
+				"java bridge diagnostics field %d expected %q, got %q",
+				index,
+				javaDiagnosticsFieldNames[index],
+				name,
+			)
+		}
+		counter, err := strconv.ParseUint(value, 36, 64)
+		if err != nil || strconv.FormatUint(counter, 36) != value {
+			return "", fmt.Errorf(
+				"java bridge diagnostics field %q has invalid base36 value %q",
+				name,
+				value,
+			)
+		}
+		if counter >= maxJavaDiagnosticsCounter {
+			return "", fmt.Errorf(
+				"java bridge diagnostics field %q reached the saturation ceiling %d",
+				name,
+				maxJavaDiagnosticsCounter,
+			)
+		}
+		sanitized[index] = name + "=" + strconv.FormatUint(counter, 36)
+	}
+	return strings.Join(sanitized, ","), nil
 }
 
 func boolFlag(value bool) string {

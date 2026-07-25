@@ -5,6 +5,8 @@ package io.opentelemetry.obi.examples;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -13,6 +15,25 @@ import java.util.concurrent.FutureTask;
 import org.junit.jupiter.api.Test;
 
 class ApacheJavaHttpsBackendTest {
+  @Test
+  void sharedResponseDiagnosticsRequireStrictOptIn() {
+    assertEquals("X-OBI-Java-Diagnostics", ApacheJavaHttpsBackend.BRIDGE_DIAGNOSTICS_HEADER);
+    assertEquals("bridge_diagnostics", ApacheJavaHttpsBackend.BRIDGE_DIAGNOSTICS_PARAMETER);
+    String diagnostics = ApacheJavaHttpsBackend.bridgeDiagnosticsHeaderValue(new String[] {"1"});
+    assertNotNull(diagnostics);
+    assertFalse(diagnostics.contains("\r"));
+    assertFalse(diagnostics.contains("\n"));
+    assertNull(ApacheJavaHttpsBackend.bridgeDiagnosticsHeaderValue(null));
+    assertNull(ApacheJavaHttpsBackend.bridgeDiagnosticsHeaderValue(new String[] {}));
+    assertNull(ApacheJavaHttpsBackend.bridgeDiagnosticsHeaderValue(new String[] {""}));
+    assertNull(ApacheJavaHttpsBackend.bridgeDiagnosticsHeaderValue(new String[] {"0"}));
+    assertNull(ApacheJavaHttpsBackend.bridgeDiagnosticsHeaderValue(new String[] {"true"}));
+    assertNull(ApacheJavaHttpsBackend.bridgeDiagnosticsHeaderValue(new String[] {" 1"}));
+    assertNull(ApacheJavaHttpsBackend.bridgeDiagnosticsHeaderValue(new String[] {"1 "}));
+    assertNull(ApacheJavaHttpsBackend.bridgeDiagnosticsHeaderValue(new String[] {"1", "1"}));
+    assertNull(ApacheJavaHttpsBackend.bridgeDiagnosticsHeaderValue(new String[] {"1", "0"}));
+  }
+
   @Test
   void handoffCountIsBounded() {
     assertEquals(2, ApacheJavaHttpsBackend.parseHops(null));

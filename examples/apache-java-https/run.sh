@@ -2880,7 +2880,10 @@ run_scenario() {
     expected_requests=1
     request_arguments=(--requests 1)
   elif [[ "$name" == "w3c-fault" ]]; then
-    request_arguments=(--requests "$FAULT_REQUEST_COUNT")
+    request_arguments=(
+      --requests "$FAULT_REQUEST_COUNT"
+      --fault-mode "$FAULT_MODE"
+    )
   elif [[ "$name" == "tls-boundary" ]]; then
     request_arguments=(--requests 2)
   elif (( REQUEST_COUNT > 0 )); then

@@ -48,6 +48,8 @@ import org.eclipse.jetty.servlet.ServletHolder;
 import org.eclipse.jetty.util.ssl.SslContextFactory;
 
 public final class ApacheJavaHttpsBackend {
+  static final String BRIDGE_DIAGNOSTICS_HEADER = "X-OBI-Java-Diagnostics";
+  static final String BRIDGE_DIAGNOSTICS_PARAMETER = "bridge_diagnostics";
   private static final int DEFAULT_PORT = 18443;
   private static final int MAX_DELAY_MILLIS = 1000;
   private static final int MAX_BODY_BYTES = 64 * 1024;
@@ -731,6 +733,11 @@ public final class ApacheJavaHttpsBackend {
     response.setContentType("application/json");
     response.setCharacterEncoding("UTF-8");
     response.setHeader("Cache-Control", "no-store");
+    String diagnostics =
+        bridgeDiagnosticsHeaderValue(request.getParameterValues(BRIDGE_DIAGNOSTICS_PARAMETER));
+    if (diagnostics != null) {
+      response.setHeader(BRIDGE_DIAGNOSTICS_HEADER, diagnostics);
+    }
     if ("1".equals(request.getParameter("close"))) {
       response.setHeader("Connection", "close");
     }
@@ -753,6 +760,12 @@ public final class ApacheJavaHttpsBackend {
           tlsReadEvents,
           tlsReadBytes);
     }
+  }
+
+  static String bridgeDiagnosticsHeaderValue(String[] optIn) {
+    return optIn != null && optIn.length == 1 && "1".equals(optIn[0])
+        ? bridgeDiagnostics()
+        : null;
   }
 
   private static long bridgeCounter(String method) {

@@ -13,6 +13,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -339,17 +341,191 @@ func TestOBIFlagsRequestsCoverSampledAndUnsampledParents(t *testing.T) {
 	assert.Equal(t, "01", expectationFor(config{scenario: "obi-flags"}, requests[0]).JavaTraceFlags)
 }
 
-func TestW3CFaultRequestsAreValidStandardParents(t *testing.T) {
-	requests, err := makeRequests(config{scenario: "w3c-fault", seed: 42})
-	require.NoError(t, err)
-	require.Len(t, requests, 2)
+func TestW3CFaultModeIsRequiredAndScenarioScoped(t *testing.T) {
+	require.ErrorContains(t, validateFaultMode(config{scenario: "w3c-fault"}), "requires --fault-mode")
+	require.ErrorContains(t, validateFaultMode(
+		config{scenario: "w3c-fault", faultMode: "matching"},
+	), "invalid --fault-mode")
+	require.ErrorContains(t, validateFaultMode(
+		config{scenario: "basic", faultMode: "timeout"},
+	), "--fault-mode requires w3c-fault")
+	require.NoError(t, validateFaultMode(config{scenario: "basic"}))
 
-	assert.Equal(t, "valid-w3c-stale-obi", requests[0].W3CCase)
-	assert.Equal(t, "valid-w3c-malformed-obi", requests[1].W3CCase)
-	assert.Equal(t, tracecheck.ModeW3CNoOBI, expectationFor(
-		config{scenario: "w3c-fault"},
-		requests[0],
-	).Mode)
+	for _, faultMode := range []string{
+		"alternating",
+		"timeout",
+		"disconnect",
+		"overload",
+		"truncated",
+		"bad-magic",
+		"bad-size",
+		"version-mismatch",
+		"zero-trace-id",
+		"zero-span-id",
+	} {
+		assert.NoError(t, validateFaultMode(
+			config{scenario: "w3c-fault", faultMode: faultMode},
+		), faultMode)
+	}
+}
+
+func TestW3CFaultRequestsDescribeInjectedAndNormalizedOutcomes(t *testing.T) {
+	tests := []struct {
+		faultMode string
+		statuses  []string
+	}{
+		{faultMode: "alternating", statuses: []string{"stale", "malformed"}},
+		{faultMode: "timeout", statuses: []string{"timeout", "timeout"}},
+		{faultMode: "disconnect", statuses: []string{"transport_error", "transport_error"}},
+		{faultMode: "overload", statuses: []string{"overload", "overload"}},
+		{faultMode: "truncated", statuses: []string{"transport_error", "transport_error"}},
+		{faultMode: "bad-magic", statuses: []string{"malformed", "malformed"}},
+		{faultMode: "bad-size", statuses: []string{"malformed", "malformed"}},
+		{faultMode: "version-mismatch", statuses: []string{"version_mismatch", "version_mismatch"}},
+		{faultMode: "zero-trace-id", statuses: []string{"malformed", "malformed"}},
+		{faultMode: "zero-span-id", statuses: []string{"malformed", "malformed"}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.faultMode, func(t *testing.T) {
+			cfg := config{scenario: "w3c-fault", faultMode: test.faultMode, seed: 42}
+			requests, err := makeRequests(cfg)
+			require.NoError(t, err)
+			require.Len(t, requests, 2)
+
+			for index, requestCase := range requests {
+				assert.Equal(t, test.faultMode, requestCase.InjectedFaultMode)
+				assert.Equal(t, test.statuses[index], requestCase.ExpectedJavaStatus)
+				assert.Equal(
+					t,
+					"valid-w3c-injected-"+test.faultMode+"-java-"+test.statuses[index],
+					requestCase.W3CCase,
+				)
+				assert.Equal(t, "01", requestCase.W3CTraceFlags)
+				assert.Equal(t, tracecheck.ModeW3CNoOBI, expectationFor(cfg, requestCase).Mode)
+				assert.Equal(t, index == len(requests)-1, requestCase.BridgeDiagnostics)
+
+				request, requestErr := newHTTPRequest(
+					context.Background(),
+					config{baseURL: "https://example.test", scenario: "w3c-fault"},
+					requestCase,
+				)
+				require.NoError(t, requestErr)
+				expectedOptIn := ""
+				if index == len(requests)-1 {
+					expectedOptIn = "1"
+				}
+				assert.Equal(t, expectedOptIn, request.URL.Query().Get("bridge_diagnostics"))
+			}
+		})
+	}
+}
+
+func TestBridgeDiagnosticsHeaderIsRequiredOnlyForOptedInRequest(t *testing.T) {
+	snapshot := javaDiagnosticsSnapshot(t, 0)
+	header := make(http.Header)
+
+	diagnostics, err := javaDiagnosticsFromHeader(header, false)
+	require.NoError(t, err)
+	assert.Empty(t, diagnostics)
+	_, err = javaDiagnosticsFromHeader(header, true)
+	require.ErrorContains(t, err, "expected exactly one")
+
+	header.Add(bridgeDiagnosticsHeader, snapshot)
+	diagnostics, err = javaDiagnosticsFromHeader(header, true)
+	require.NoError(t, err)
+	assert.Equal(t, snapshot, diagnostics)
+	_, err = javaDiagnosticsFromHeader(header, false)
+	require.ErrorContains(t, err, "unexpected")
+
+	header.Add(bridgeDiagnosticsHeader, snapshot)
+	_, err = javaDiagnosticsFromHeader(header, true)
+	require.ErrorContains(t, err, "expected exactly one")
+}
+
+func TestJavaDiagnosticsSnapshotValidationIsExactAndBounded(t *testing.T) {
+	require.Len(t, javaDiagnosticsFieldNames, 50)
+	valid := javaDiagnosticsSnapshot(t, maxJavaDiagnosticsCounter-1)
+	sanitized, err := sanitizeJavaDiagnostics(valid)
+	require.NoError(t, err)
+	assert.Equal(t, valid, sanitized)
+	assert.LessOrEqual(t, len(valid), maxJavaDiagnosticsSnapshotLength)
+
+	fields := strings.Split(javaDiagnosticsSnapshot(t, 0), ",")
+	duplicate := append([]string(nil), fields...)
+	duplicate[1] = duplicate[0]
+	reordered := append([]string(nil), fields...)
+	reordered[0], reordered[1] = reordered[1], reordered[0]
+	uppercase := append([]string(nil), fields...)
+	uppercase[0] = javaDiagnosticsFieldNames[0] + "=A"
+	leadingZero := append([]string(nil), fields...)
+	leadingZero[0] = javaDiagnosticsFieldNames[0] + "=00"
+	saturated := append([]string(nil), fields...)
+	saturated[0] = javaDiagnosticsFieldNames[0] + "=" +
+		strconv.FormatUint(maxJavaDiagnosticsCounter, 36)
+
+	tests := []struct {
+		name     string
+		snapshot string
+		want     string
+	}{
+		{name: "unavailable", snapshot: "unavailable", want: "unavailable"},
+		{name: "newline", snapshot: strings.Join(fields, ",") + "\n", want: "newline"},
+		{name: "carriage return", snapshot: strings.Join(fields, ",") + "\r", want: "newline"},
+		{name: "missing", snapshot: strings.Join(fields[:len(fields)-1], ","), want: "expected 50 fields"},
+		{name: "extra", snapshot: strings.Join(append(fields, "extra=0"), ","), want: "expected 50 fields"},
+		{name: "duplicate", snapshot: strings.Join(duplicate, ","), want: "duplicated"},
+		{name: "reordered", snapshot: strings.Join(reordered, ","), want: "expected"},
+		{name: "uppercase", snapshot: strings.Join(uppercase, ","), want: "invalid base36"},
+		{name: "leading zero", snapshot: strings.Join(leadingZero, ","), want: "invalid base36"},
+		{name: "saturated", snapshot: strings.Join(saturated, ","), want: "saturation ceiling"},
+		{
+			name:     "oversized",
+			snapshot: strings.Repeat("x", maxJavaDiagnosticsSnapshotLength+1),
+			want:     "exceed",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, validationErr := sanitizeJavaDiagnostics(test.snapshot)
+			require.ErrorContains(t, validationErr, test.want)
+		})
+	}
+}
+
+func TestFaultDiagnosticsAreExposedOnlyAtTheTopLevel(t *testing.T) {
+	snapshot := javaDiagnosticsSnapshot(t, 0)
+	var output bytes.Buffer
+	require.NoError(t, encodeRunResult(&output, &runResult{
+		Status:                "passed",
+		Scenario:              "w3c-fault",
+		FaultDiagnosticsAfter: snapshot,
+		Cases: []caseResult{{
+			Request: requestCase{
+				Marker:            "fault",
+				BridgeDiagnostics: true,
+			},
+			Response: backendResponse{BridgeDiagnostics: snapshot},
+		}},
+	}))
+
+	assert.Contains(t, output.String(), `"fault_diagnostics_after": "`+snapshot+`"`)
+	assert.Equal(t, 1, strings.Count(output.String(), snapshot))
+	assert.NotContains(t, output.String(), `"bridge_diagnostics"`)
+}
+
+func TestNonFaultRequestCannotOptInToBridgeDiagnostics(t *testing.T) {
+	request, err := newHTTPRequest(
+		context.Background(),
+		config{baseURL: "https://example.test", scenario: "basic"},
+		requestCase{
+			Marker:            "basic",
+			Endpoint:          "/api/echo",
+			BridgeDiagnostics: true,
+		},
+	)
+	require.NoError(t, err)
+	assert.Empty(t, request.URL.Query().Get("bridge_diagnostics"))
 }
 
 func TestRestartFaultRequestsUseStandardParents(t *testing.T) {
@@ -374,6 +550,16 @@ func TestRestartFaultRequestsUseStandardParents(t *testing.T) {
 			request,
 		).Mode)
 	}
+}
+
+func javaDiagnosticsSnapshot(t *testing.T, value uint64) string {
+	t.Helper()
+	encoded := strconv.FormatUint(value, 36)
+	fields := make([]string, len(javaDiagnosticsFieldNames))
+	for index, name := range javaDiagnosticsFieldNames {
+		fields[index] = name + "=" + encoded
+	}
+	return strings.Join(fields, ",")
 }
 
 func TestRestartFaultRequiresTrafficAfterRestart(t *testing.T) {

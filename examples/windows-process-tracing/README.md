@@ -24,9 +24,10 @@ generation through the process hook, captures bounded request and response
 headers, parses an incoming W3C `traceparent`, creates a child span, and
 exports it through the normal OBI OTLP pdata path.
 
-The final client uses the ordinary OpenTelemetry Go SDK and standard
-`otelhttp.Transport`. It creates and exports a real CLIENT span, injects that
-span's W3C context into the request, and does not construct OBI telemetry.
+The final client uses the ordinary OpenTelemetry Go SDK with a manually
+started CLIENT span and a standard `http.Transport`. It exports the span,
+injects that span's W3C context into the request, and does not construct OBI
+telemetry.
 Three consecutive fresh VM runs proved that OBI extracted that context and
 exported the SERVER child:
 
@@ -38,7 +39,7 @@ exported the SERVER child:
 
 Each request was `GET /linked-final-N` on `127.0.0.1:18080` and returned
 HTTP 204. The Collector also reported the expected server address, port, and
-target PID. The OBI SERVER resource and scope were:
+target PID. The OBI SERVER resource identity was:
 
 ```text
 service.name:          obi-windows-http-target.exe
@@ -46,6 +47,9 @@ telemetry.sdk.name:    opentelemetry
 telemetry.distro.name: opentelemetry-ebpf-instrumentation
 otel.scope.name:       go.opentelemetry.io/obi
 ```
+
+`otel.scope.name` is OBI's reporter resource attribute. The SERVER span's
+actual pdata instrumentation scope name, version, and schema URL are empty.
 
 The independent CLIENT resource used
 `service.name=obi-windows-http-client`, carried no

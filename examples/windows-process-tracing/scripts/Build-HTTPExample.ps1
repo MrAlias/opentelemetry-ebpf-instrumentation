@@ -7,7 +7,7 @@ param(
 
     [string]$NtosEbpfExtSource = 'C:\src\ntosebpfext',
 
-    [string]$ExpectedEbpfForWindowsCommit = '09fb1397e560513e3710269920346c9c9c60afbd',
+    [string]$ExpectedEbpfForWindowsCommit = '76cf8b306b03398ade6f519e4d00e9ae5c1e0f4b',
 
     [string]$ExpectedNtosEbpfExtCommit = 'bb41d8b10c488a28d98c874b1b1a55f40f22dc44',
 

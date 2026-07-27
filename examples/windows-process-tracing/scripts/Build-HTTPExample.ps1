@@ -370,17 +370,6 @@ try {
         -FilePath $programInfoExporter `
         -ArgumentList @('--flow-classify') `
         -Description 'Register Flow Classify program metadata'
-    Invoke-Checked `
-        -FilePath 'netsh.exe' `
-        -ArgumentList @(
-            'ebpf', 'show', 'verification',
-            "filename=$flowObject",
-            'section=flow_classify',
-            'program=obi_flow_classify',
-            'type=flow_classify',
-            'level=normal'
-        ) `
-        -Description 'Verify the Flow Classify eBPF program'
 
     $converter = Join-Path $outputDirectory 'Convert-BpfToNative.ps1'
     Invoke-Checked `

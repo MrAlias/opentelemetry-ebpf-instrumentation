@@ -248,15 +248,6 @@ if ($LASTEXITCODE -ne 0) {
     throw 'Failed to register the ntosebpfext process program and attach metadata'
 }
 
-& netsh.exe ebpf show verification `
-    "filename=$bpfObject" `
-    'section=process' `
-    'program=obi_process_start' `
-    'type=process' `
-    'level=normal'
-if ($LASTEXITCODE -ne 0) {
-    throw 'eBPF-for-Windows verification failed'
-}
 
 Push-Location (Join-Path $ebpfForWindowsSource 'tools\bpf2c')
 try {

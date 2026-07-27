@@ -1,6 +1,8 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
+//go:build !windows
+
 package tracesgen // import "go.opentelemetry.io/obi/pkg/export/otel/tracesgen"
 
 import (
@@ -11,17 +13,14 @@ import (
 	"math"
 	"strconv"
 	"strings"
-	"time"
 
 	expirable2 "github.com/hashicorp/golang-lru/v2/expirable"
 	"golang.org/x/sys/unix"
 
-	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
-	trace2 "go.opentelemetry.io/otel/trace"
 
 	"go.opentelemetry.io/obi/pkg/appolly/app/request"
 	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
@@ -29,7 +28,6 @@ import (
 	"go.opentelemetry.io/obi/pkg/export/attributes"
 	attr "go.opentelemetry.io/obi/pkg/export/attributes/names"
 	"go.opentelemetry.io/obi/pkg/export/instrumentations"
-	"go.opentelemetry.io/obi/pkg/export/otel/idgen"
 	"go.opentelemetry.io/obi/pkg/export/otel/otelcfg"
 )
 
@@ -43,19 +41,6 @@ var (
 	openAIAPITypeKey                   = attribute.Key("openai.api.type")
 	awsBedrockGuardrailIDKey           = attribute.Key("aws.bedrock.guardrail.id")
 )
-
-type TraceSpanAndAttributes struct {
-	Span       *request.Span
-	Attributes []attribute.KeyValue
-}
-
-type SpanAttr struct {
-	ValLength uint16
-	Vtype     uint8
-	Reserved  uint8
-	Key       [32]uint8
-	Value     [128]uint8
-}
 
 // UserSelectedAttributes must remain public for collectors embedding OBI
 func UserSelectedAttributes(selectorCfg *attributes.SelectorConfig) (map[attr.Name]struct{}, error) {
@@ -156,133 +141,15 @@ func generateTracesWithAttributes(
 	attrSelector attributes.Selection,
 	extraResAttrs ...attribute.KeyValue,
 ) ptrace.Traces {
-	traces := ptrace.NewTraces()
-	rs := traces.ResourceSpans().AppendEmpty()
 	resourceAttrs := TraceAppResourceAttrs(cache, nodeMeta, svc)
 	resourceAttrs = append(resourceAttrs, envResourceAttrs...)
 	resourceAttrs = otelcfg.FilterResourceAttrs(resourceAttrs, attrSelector)
-	resourceAttrsMap := AttrsToMap(resourceAttrs)
-	resourceAttrsMap.PutStr(string(semconv.OTelScopeNameKey), reporterName)
 	extraResAttrs = otelcfg.FilterResourceAttrs(extraResAttrs, attrSelector)
-	addAttrsToMap(extraResAttrs, resourceAttrsMap)
-	resourceAttrsMap.MoveTo(rs.Resource().Attributes())
-
-	for _, spanWithAttributes := range spans {
-		span := spanWithAttributes.Span
-		attrs := spanWithAttributes.Attributes
-
-		ss := rs.ScopeSpans().AppendEmpty()
-
-		t := span.Timings()
-		start := spanStartTime(t)
-		hasSubSpans := t.Start.After(start)
-
-		traceID := pcommon.TraceID(span.TraceID)
-		spanID := pcommon.SpanID(idgen.RandomSpanID())
-		// This should never happen
-		if traceID.IsEmpty() {
-			traceID = pcommon.TraceID(idgen.RandomTraceID())
-		}
-
-		if hasSubSpans {
-			createSubSpans(span, spanID, traceID, &ss, t)
-		} else if span.SpanID.IsValid() {
-			spanID = pcommon.SpanID(span.SpanID)
-		}
-
-		// Create a parent span for the whole request session
-		s := ss.Spans().AppendEmpty()
-		s.SetName(span.TraceName())
-		s.SetKind(ptrace.SpanKind(spanKind(span)))
-		s.SetStartTimestamp(pcommon.NewTimestampFromTime(start))
-
-		// Set trace and span IDs
-		s.SetSpanID(spanID)
-		s.SetTraceID(traceID)
-		if span.ParentSpanID.IsValid() {
-			s.SetParentSpanID(pcommon.SpanID(span.ParentSpanID))
-		}
-
-		// Set span attributes
-		m := AttrsToMap(attrs)
-		// db.response.error is not a spec attribute, we use it only for
-		// populating the span status message if it's allowed
-		// we fetch it's value and remove it from the final span attributes
-		var dbResponseError string
-		if dbErr, ok := m.Get(string(attr.DBResponseError.OTEL())); ok {
-			dbResponseError = request.SpanDBStatusMessage(span, dbErr.AsString())
-		}
-		m.Remove(string(attr.DBResponseError.OTEL()))
-		m.MoveTo(s.Attributes())
-
-		// Set status code
-		statusCode := CodeToStatusCode(request.SpanStatusCode(span))
-		s.Status().SetCode(statusCode)
-		var statusMessage string
-		if span.IsDBSpan() {
-			statusMessage = dbResponseError
-		} else {
-			statusMessage = request.SpanStatusMessage(span)
-		}
-		if statusMessage != "" {
-			s.Status().SetMessage(statusMessage)
-		}
-		if !hasSubSpans {
-			appendSpanLinks(s, span.Links)
-		}
-		s.SetEndTimestamp(pcommon.NewTimestampFromTime(t.End))
-
-		// Create individual execute_tool child spans per tool call (OTel GenAI semconv compliance)
-		if toolCalls := getSpanToolCalls(span); len(toolCalls) > 0 {
-			createToolCallSpans(toolCalls, spanID, traceID, &ss, start, t.End)
-		}
-	}
-	return traces
+	return generateTracesFromResourceAttributes(resourceAttrs, extraResAttrs, spans, reporterName)
 }
 
 func SpanDiscarded(span *request.Span, is instrumentations.InstrumentationSelection) bool {
 	return request.IgnoreTraces(span) || span.Service.ExportsOTelTraces() || !acceptSpan(is, span)
-}
-
-// createSubSpans creates the internal spans for a request.Span
-func createSubSpans(span *request.Span, parentSpanID pcommon.SpanID, traceID pcommon.TraceID, ss *ptrace.ScopeSpans, t request.Timings) {
-	// Create a child span showing the queue time
-	spQ := ss.Spans().AppendEmpty()
-	spQ.SetName("in queue")
-	spQ.SetStartTimestamp(pcommon.NewTimestampFromTime(t.RequestStart))
-	spQ.SetKind(ptrace.SpanKindInternal)
-	spQ.SetEndTimestamp(pcommon.NewTimestampFromTime(t.Start))
-	spQ.SetTraceID(traceID)
-	spQ.SetSpanID(pcommon.SpanID(idgen.RandomSpanID()))
-	spQ.SetParentSpanID(parentSpanID)
-
-	// Create a child span showing the processing time
-	spP := ss.Spans().AppendEmpty()
-	spP.SetName("processing")
-	spP.SetStartTimestamp(pcommon.NewTimestampFromTime(t.Start))
-	spP.SetKind(ptrace.SpanKindInternal)
-	spP.SetEndTimestamp(pcommon.NewTimestampFromTime(t.End))
-	spP.SetTraceID(traceID)
-	if span.SpanID.IsValid() {
-		spP.SetSpanID(pcommon.SpanID(span.SpanID))
-	} else {
-		spP.SetSpanID(pcommon.SpanID(idgen.RandomSpanID()))
-	}
-	spP.SetParentSpanID(parentSpanID)
-	appendSpanLinks(spP, span.Links)
-}
-
-func appendSpanLinks(dst ptrace.Span, links []request.SpanLink) {
-	for _, spanLink := range links {
-		if !spanLink.TraceID.IsValid() || !spanLink.SpanID.IsValid() {
-			continue
-		}
-
-		link := dst.Links().AppendEmpty()
-		link.SetTraceID(pcommon.TraceID(spanLink.TraceID))
-		link.SetSpanID(pcommon.SpanID(spanLink.SpanID))
-		link.SetFlags(uint32(spanLink.TraceFlags))
-	}
 }
 
 var emptyUID = svc.UID{}
@@ -301,47 +168,6 @@ func TraceAppResourceAttrs(cache *expirable2.LRU[svc.UID, []attribute.KeyValue],
 	cache.Add(service.UID, attrs)
 
 	return attrs
-}
-
-// AttrsToMap converts a slice of attribute.KeyValue to a pcommon.Map
-func AttrsToMap(attrs []attribute.KeyValue) pcommon.Map {
-	m := pcommon.NewMap()
-	addAttrsToMap(attrs, m)
-	return m
-}
-
-func addAttrsToMap(attrs []attribute.KeyValue, dst pcommon.Map) {
-	dst.EnsureCapacity(dst.Len() + len(attrs))
-	for _, attr := range attrs {
-		switch v := attr.Value.AsInterface().(type) {
-		case string:
-			dst.PutStr(string(attr.Key), v)
-		case int64:
-			dst.PutInt(string(attr.Key), v)
-		case float64:
-			dst.PutDouble(string(attr.Key), v)
-		case bool:
-			dst.PutBool(string(attr.Key), v)
-		case []string:
-			s := dst.PutEmptySlice(string(attr.Key))
-			for _, val := range v {
-				s.AppendEmpty().SetStr(val)
-			}
-		}
-	}
-}
-
-// CodeToStatusCode converts a codes.Code to a ptrace.StatusCode
-func CodeToStatusCode(code string) ptrace.StatusCode {
-	switch code {
-	case request.StatusCodeUnset:
-		return ptrace.StatusCodeUnset
-	case request.StatusCodeError:
-		return ptrace.StatusCodeError
-	case request.StatusCodeOk:
-		return ptrace.StatusCodeOk
-	}
-	return ptrace.StatusCodeUnset
 }
 
 func acceptSpan(is instrumentations.InstrumentationSelection, span *request.Span) bool {
@@ -389,55 +215,6 @@ var (
 	messagingSystemAMQP = attribute.String(string(attr.MessagingSystem), "amqp")
 	spanMetricsSkip     = attribute.Bool(string(attr.SkipSpanMetrics), true)
 )
-
-// getSpanToolCalls extracts tool calls from a GenAI span regardless of vendor.
-func getSpanToolCalls(span *request.Span) []request.ToolCall {
-	if span.GenAI == nil {
-		return nil
-	}
-	switch {
-	case span.GenAI.OpenAI != nil:
-		return span.GenAI.OpenAI.ToolCalls
-	case span.GenAI.Anthropic != nil:
-		return span.GenAI.Anthropic.ToolCalls
-	case span.GenAI.Gemini != nil:
-		return span.GenAI.Gemini.ToolCalls
-	case span.GenAI.Qwen != nil:
-		return span.GenAI.Qwen.ToolCalls
-	case span.GenAI.Ollama != nil:
-		return span.GenAI.Ollama.ToolCalls
-	case span.GenAI.OpenAICompatible != nil:
-		return span.GenAI.OpenAICompatible.ToolCalls
-	default:
-		return nil
-	}
-}
-
-// createToolCallSpans creates individual execute_tool child spans for each tool call,
-// following the OTel GenAI semantic conventions where gen_ai.tool.name is a single string
-// per span rather than an aggregated string array.
-func createToolCallSpans(toolCalls []request.ToolCall, parentSpanID pcommon.SpanID, traceID pcommon.TraceID, ss *ptrace.ScopeSpans, start, end time.Time) {
-	for _, tc := range toolCalls {
-		if tc.Name == "" {
-			continue
-		}
-		sp := ss.Spans().AppendEmpty()
-		sp.SetName("execute_tool " + tc.Name)
-		sp.SetKind(ptrace.SpanKindInternal)
-		sp.SetTraceID(traceID)
-		sp.SetSpanID(pcommon.SpanID(idgen.RandomSpanID()))
-		sp.SetParentSpanID(parentSpanID)
-		sp.SetStartTimestamp(pcommon.NewTimestampFromTime(start))
-		sp.SetEndTimestamp(pcommon.NewTimestampFromTime(end))
-
-		attrs := sp.Attributes()
-		attrs.PutStr(string(semconv.GenAIOperationNameKey), "execute_tool")
-		attrs.PutStr(string(attr.GenAIToolName), tc.Name)
-		if tc.ID != "" {
-			attrs.PutStr(string(attr.GenAIToolCallID), tc.ID)
-		}
-	}
-}
 
 // mcpAttributes returns MCP span attributes following the OTEL MCP semantic conventions.
 // Tool call arguments and results are gated behind their own optionalAttrs
@@ -546,41 +323,7 @@ func traceAttributesSelectorInternal(span *request.Span, optionalAttrs map[attr.
 
 	switch span.Type {
 	case request.EventTypeHTTP:
-		attrs = []attribute.KeyValue{
-			request.HTTPResponseStatusCode(span.Status),
-			request.ClientAddr(request.PeerAsClient(span)),
-			request.ServerAddr(request.SpanHost(span)),
-			request.ServerPort(span.HostPort),
-			request.HTTPRequestBodySize(int(span.RequestBodyLength())),
-			request.HTTPResponseBodySize(span.ResponseBodyLength()),
-		}
-		if span.Method != "" {
-			attrs = append(attrs, request.HTTPRequestMethod(span.Method))
-		}
-		if span.Path != "" {
-			attrs = append(attrs, request.HTTPUrlPath(span.Path))
-		}
-		scheme := request.HTTPScheme(span)
-		if scheme != "" {
-			attrs = append(attrs, semconv.URLScheme(scheme))
-		}
-		if span.Route != "" {
-			attrs = append(attrs, semconv.HTTPRoute(span.Route))
-		}
-		if span.SubType == request.HTTPSubtypeGraphQL && span.GraphQL != nil {
-			if _, ok := optionalAttrs[attr.GraphQLDocument]; ok {
-				attrs = append(attrs, semconv.GraphQLDocument(span.GraphQL.Document))
-			}
-			attrs = append(attrs, semconv.GraphQLOperationName(span.GraphQL.OperationName))
-			attrs = append(attrs, request.GraphqlOperationType(span.GraphQL.OperationType))
-		}
-		if _, ok := optionalAttrs[attr.HTTPUrlQuery]; ok {
-			if idx := strings.IndexByte(span.FullPath, '?'); idx >= 0 {
-				if qs := scrubQuery(span.FullPath[idx+1:], redactSet); qs != "" {
-					attrs = append(attrs, request.HTTPUrlQuery(qs))
-				}
-			}
-		}
+		attrs = httpServerTraceAttributes(span, optionalAttrs, redactSet)
 		attrs = append(attrs, mcpAttributes(span, optionalAttrs)...)
 		attrs = append(attrs, jsonRPCAttributes(span)...)
 		attrs = append(attrs, httpEnrichmentAttributes(span)...)
@@ -1609,31 +1352,6 @@ func traceAttributesSelectorInternal(span *request.Span, optionalAttrs map[attr.
 // TraceAttributesSelector returns the []attribute.KeyValue for a single span.
 func TraceAttributesSelector(span *request.Span, optionalAttrs map[attr.Name]struct{}, redactKeys ...string) []attribute.KeyValue {
 	return traceAttributesSelectorInternal(span, optionalAttrs, buildRedactSet(redactKeys))
-}
-
-func spanKind(span *request.Span) trace2.SpanKind {
-	switch span.Type {
-	case request.EventTypeHTTP, request.EventTypeGRPC, request.EventTypeRedisServer, request.EventTypeKafkaServer, request.EventTypeMQTTServer, request.EventTypeNATSServer, request.EventTypeSunRPCServer, request.EventTypeMemcachedServer, request.EventTypeSQLServer:
-		return trace2.SpanKindServer
-	case request.EventTypeHTTPClient, request.EventTypeGRPCClient, request.EventTypeSQLClient, request.EventTypeRedisClient, request.EventTypeMongoClient, request.EventTypeCouchbaseClient, request.EventTypeMemcachedClient, request.EventTypeSunRPCClient, request.EventTypeAerospikeClient, request.EventTypeFailedConnect:
-		return trace2.SpanKindClient
-	case request.EventTypeKafkaClient, request.EventTypeMQTTClient, request.EventTypeNATSClient, request.EventTypeAMQPClient:
-		switch span.Method {
-		case request.MessagingPublish:
-			return trace2.SpanKindProducer
-		case request.MessagingProcess:
-			return trace2.SpanKindConsumer
-		}
-	}
-	return trace2.SpanKindInternal
-}
-
-func spanStartTime(t request.Timings) time.Time {
-	realStart := t.RequestStart
-	if t.Start.Before(realStart) {
-		realStart = t.Start
-	}
-	return realStart
 }
 
 func manualSpanAttributes(span *request.Span) []attribute.KeyValue {

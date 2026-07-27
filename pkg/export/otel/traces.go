@@ -50,7 +50,7 @@ import (
 	"go.opentelemetry.io/obi/pkg/pipe/swarm/swarms"
 )
 
-const reporterName = "go.opentelemetry.io/obi"
+const reporterName = tracesgen.ReporterName
 
 func otlog() *slog.Logger {
 	return slog.With("component", "otel.TracesReceiver")

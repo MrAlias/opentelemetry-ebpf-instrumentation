@@ -31,8 +31,8 @@ import (
 	"go.opentelemetry.io/obi/pkg/appolly/meta"
 	"go.opentelemetry.io/obi/pkg/config"
 	"go.opentelemetry.io/obi/pkg/export/attributes"
-	attr "go.opentelemetry.io/obi/pkg/export/attributes/names"
 	"go.opentelemetry.io/obi/pkg/export/expire"
+	"go.opentelemetry.io/obi/pkg/export/otel/resourceattrs"
 )
 
 // Protocol values for the OTEL_EXPORTER_OTLP_PROTOCOL, OTEL_EXPORTER_OTLP_TRACES_PROTOCOL and
@@ -94,7 +94,9 @@ func omitFieldsForYAML(input any, omitFields map[string]struct{}) map[string]any
 }
 
 func GetAppResourceAttrs(nodeMeta *meta.NodeMeta, service *svc.Attrs, attrSelector ...attributes.Selection) []attribute.KeyValue {
-	attrs := resourceAttrs(nodeMeta, service)
+	hostID := nodeMeta.HostID
+	attrs := resourceattrs.ForService(service, semconv.OSTypeLinux, &hostID)
+	attrs = appendNodeMetadata(attrs, nodeMeta)
 	attrs = append(attrs, semconv.ServiceInstanceID(service.UID.Instance))
 	return FilterResourceAttrs(attrs, attrSelector...)
 }
@@ -137,30 +139,12 @@ func GetResourceAttrs(nodeMeta *meta.NodeMeta, service *svc.Attrs, attrSelector 
 }
 
 func resourceAttrs(nodeMeta *meta.NodeMeta, service *svc.Attrs) []attribute.KeyValue {
-	attrs := []attribute.KeyValue{
-		semconv.ServiceName(service.UID.Name),
-		// SpanMetrics requires an extra attribute besides service name
-		// to generate the traces.target.info / traces_target_info metric,
-		// so the service is visible in the ServicesList
-		// This attribute also allows that App O11y plugin shows this app as a Go application.
-		semconv.TelemetrySDKLanguageKey.String(service.SDKLanguage.String()),
-		semconv.TelemetrySDKNameKey.String(attr.VendorSDKName),
-		semconv.TelemetrySDKVersion(attr.VendorSDKVersion),
-		semconv.TelemetryDistroName(attr.TelemetryDistroName),
-		semconv.TelemetryDistroVersion(attr.TelemetryDistroVersion),
-		semconv.HostName(service.HostName),
-		semconv.HostID(nodeMeta.HostID),
-		semconv.OSTypeLinux,
-	}
+	hostID := nodeMeta.HostID
+	attrs := resourceattrs.ForService(service, semconv.OSTypeLinux, &hostID)
+	return appendNodeMetadata(attrs, nodeMeta)
+}
 
-	if service.UID.Namespace != "" {
-		attrs = append(attrs, semconv.ServiceNamespace(service.UID.Namespace))
-	}
-
-	for k, v := range service.Metadata {
-		attrs = append(attrs, k.OTEL().String(v))
-	}
-
+func appendNodeMetadata(attrs []attribute.KeyValue, nodeMeta *meta.NodeMeta) []attribute.KeyValue {
 	for _, entry := range nodeMeta.Metadata {
 		attrs = append(attrs, entry.Key.OTEL().String(entry.Value))
 	}

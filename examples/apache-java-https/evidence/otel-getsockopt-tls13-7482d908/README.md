@@ -57,8 +57,10 @@ is expected for a forced primary-transport run and is not reported as a pass.
 Every retained scenario result contains sanitized synthetic traffic and the
 bounded trace graph used by the assertion. The status records capture the
 runner exit and metric assertion results; references to intentionally omitted
-stderr logs were removed. No private keys, request bodies, credentials, raw
-headers, baggage, tracestate, or JVM-incarnation capability are retained.
+stderr logs were removed. No private keys, request bodies, credentials,
+baggage, tracestate, or JVM-incarnation capability are retained. The only
+retained request-header attribute is the bounded synthetic `x-obi-demo-id`
+marker used to join each test request to its trace graph.
 
 The full `.runtime` bundle contained bulk metric snapshots and operational
 logs. They are intentionally omitted. Retained OBI metric files contain only

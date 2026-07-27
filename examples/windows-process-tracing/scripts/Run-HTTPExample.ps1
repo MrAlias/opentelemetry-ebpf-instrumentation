@@ -5,8 +5,6 @@ param(
 
     [string]$Collector = 'C:\src\obi-artifacts\collector\otelcol-contrib.exe',
 
-    [string]$Traceparent = '00-0123456789abcdef0123456789abcdef-0123456789abcdef-01',
-
     [string]$RequestPath = '/linked',
 
     [int]$Port = 18080,
@@ -25,6 +23,7 @@ $processProgram = Join-Path $StageDirectory 'obi_process_start.sys'
 $flowProgram = Join-Path $StageDirectory 'obi_flow_classify.sys'
 $obiExecutable = Join-Path $StageDirectory 'obi.exe'
 $targetExecutable = Join-Path $StageDirectory 'obi-windows-http-target.exe'
+$clientExecutable = Join-Path $StageDirectory 'obi-windows-http-client.exe'
 $collectorConfig = Join-Path $StageDirectory 'collector.yaml'
 $collectorStdout = Join-Path $EvidenceDirectory 'collector.stdout.log'
 $collectorStderr = Join-Path $EvidenceDirectory 'collector.stderr.log'
@@ -32,8 +31,8 @@ $obiStdout = Join-Path $EvidenceDirectory 'obi.stdout.log'
 $obiStderr = Join-Path $EvidenceDirectory 'obi.stderr.log'
 $targetStdout = Join-Path $EvidenceDirectory 'target.stdout.log'
 $targetStderr = Join-Path $EvidenceDirectory 'target.stderr.log'
-$responsePath = Join-Path $EvidenceDirectory 'response.txt'
-$clientStages = Join-Path $EvidenceDirectory 'client-stages.log'
+$clientStdout = Join-Path $EvidenceDirectory 'client.stdout.log'
+$clientStderr = Join-Path $EvidenceDirectory 'client.stderr.log'
 $liveStatePath = Join-Path $EvidenceDirectory 'ebpf-live.txt'
 $cleanupStatePath = Join-Path $EvidenceDirectory 'ebpf-cleanup.txt'
 $summaryPath = Join-Path $EvidenceDirectory 'acceptance.json'
@@ -118,50 +117,36 @@ function Assert-CleanEbpfState {
     }
 }
 
-function Send-RawRequest {
-    $request = "GET $RequestPath HTTP/1.1`r`n" +
-        "Host: 127.0.0.1:$Port`r`n" +
-        "traceparent: $Traceparent`r`n" +
-        "Connection: close`r`n`r`n"
-    $client = [Net.Sockets.TcpClient]::new()
-    try {
-        "connect-start $(Get-Date -Format o)" |
-            Add-Content -LiteralPath $clientStages -Encoding UTF8
-        $connect = $client.ConnectAsync('127.0.0.1', $Port)
-        if (-not $connect.Wait(5000)) {
-            throw "TCP connect to 127.0.0.1:$Port timed out"
-        }
-        "connect-complete $(Get-Date -Format o)" |
-            Add-Content -LiteralPath $clientStages -Encoding UTF8
-        $stream = $client.GetStream()
-        $stream.ReadTimeout = 5000
-        $stream.WriteTimeout = 5000
-        $bytes = [Text.Encoding]::ASCII.GetBytes($request)
-        "write-start bytes=$($bytes.Length) $(Get-Date -Format o)" |
-            Add-Content -LiteralPath $clientStages -Encoding UTF8
-        $stream.Write($bytes, 0, $bytes.Length)
-        "write-complete $(Get-Date -Format o)" |
-            Add-Content -LiteralPath $clientStages -Encoding UTF8
+function Get-CollectorSpanBlock {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Log,
 
-        $buffer = New-Object byte[] 4096
-        $response = New-Object IO.MemoryStream
-        do {
-            "read-start $(Get-Date -Format o)" |
-                Add-Content -LiteralPath $clientStages -Encoding UTF8
-            $count = $stream.Read($buffer, 0, $buffer.Length)
-            "read-complete bytes=$count $(Get-Date -Format o)" |
-                Add-Content -LiteralPath $clientStages -Encoding UTF8
-            if ($count -le 0) {
-                break
-            }
-            $response.Write($buffer, 0, $count)
-            $responseText = [Text.Encoding]::ASCII.GetString($response.ToArray())
-        } until ($responseText.Contains("`r`n`r`n"))
+        [Parameter(Mandatory)]
+        [string]$SpanId
+    )
 
-        $responseText
-    } finally {
-        $client.Dispose()
+    $spanMatch = [Regex]::Match(
+        $Log,
+        '(?m)^\s*ID\s+:\s*' + [Regex]::Escape($SpanId) + '\s*$'
+    )
+    if (-not $spanMatch.Success) {
+        throw "Collector output has no span with ID $SpanId"
     }
+
+    $start = $Log.LastIndexOf('ResourceSpans #', $spanMatch.Index, [StringComparison]::Ordinal)
+    if ($start -lt 0) {
+        throw "Collector span $SpanId has no resource block"
+    }
+    $next = $Log.IndexOf(
+        'ResourceSpans #',
+        $spanMatch.Index + $spanMatch.Length,
+        [StringComparison]::Ordinal
+    )
+    if ($next -lt 0) {
+        return $Log.Substring($start)
+    }
+    return $Log.Substring($start, $next - $start)
 }
 
 foreach ($requiredPath in @(
@@ -170,7 +155,8 @@ foreach ($requiredPath in @(
     $processProgram,
     $flowProgram,
     $obiExecutable,
-    $targetExecutable
+    $targetExecutable,
+    $clientExecutable
 )) {
     if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
         throw "Required file does not exist: $requiredPath"
@@ -178,15 +164,6 @@ foreach ($requiredPath in @(
 }
 if ($Port -lt 1 -or $Port -gt 65535) {
     throw "Port must be between 1 and 65535: $Port"
-}
-if ($Traceparent -notmatch '^00-([0-9a-f]{32})-([0-9a-f]{16})-(00|01)$') {
-    throw "Traceparent must be a lowercase W3C version 00 value: $Traceparent"
-}
-
-$expectedTraceId = $Matches[1]
-$expectedParentSpanId = $Matches[2]
-if ($expectedTraceId -eq ('0' * 32) -or $expectedParentSpanId -eq ('0' * 16)) {
-    throw 'Traceparent IDs must be nonzero'
 }
 if (Test-Path -LiteralPath $EvidenceDirectory) {
     throw "Evidence directory already exists: $EvidenceDirectory"
@@ -197,6 +174,7 @@ New-Item -ItemType Directory -Path $EvidenceDirectory | Out-Null
 $collectorProcess = $null
 $obiProcess = $null
 $targetProcess = $null
+$clientProcess = $null
 $completed = $false
 
 try {
@@ -245,8 +223,28 @@ try {
         -Path $obiStdout `
         -Pattern 'configured Windows HTTP target from native process event'
 
-    Send-RawRequest |
-        Set-Content -LiteralPath $responsePath -Encoding Ascii -NoNewline
+    $targetUrl = "http://127.0.0.1:$Port$RequestPath"
+    $clientArguments = @(
+        '-otlp-endpoint', 'http://127.0.0.1:4318/v1/traces',
+        '-url', $targetUrl,
+        '-timeout', '15s'
+    )
+    $clientProcess = Start-Process -FilePath $clientExecutable `
+        -ArgumentList $clientArguments `
+        -RedirectStandardOutput $clientStdout `
+        -RedirectStandardError $clientStderr `
+        -PassThru
+    if (-not $clientProcess.WaitForExit(20000)) {
+        throw 'Instrumented HTTP client did not exit after the request'
+    }
+    $clientProcess.Refresh()
+    if ($null -ne $clientProcess.ExitCode -and $clientProcess.ExitCode -ne 0) {
+        throw "Instrumented HTTP client failed: $(Get-Content -Raw -LiteralPath $clientStderr)"
+    }
+    $clientResult = Get-Content -Raw -LiteralPath $clientStdout | ConvertFrom-Json
+    if ($clientResult.span_kind -ne 'client' -or $clientResult.status_code -ne 204) {
+        throw "Instrumented HTTP client returned an unexpected result: $($clientResult | ConvertTo-Json -Compress)"
+    }
 
     if (-not $targetProcess.WaitForExit(10000)) {
         throw 'HTTP target did not exit after the request'
@@ -256,6 +254,7 @@ try {
     }
     $targetProcess.Refresh()
     $obiProcess.Refresh()
+    $clientProcess.Refresh()
 
     if ($null -ne $targetProcess.ExitCode -and $targetProcess.ExitCode -ne 0) {
         throw "HTTP target failed: $(Get-Content -Raw -LiteralPath $targetStderr)"
@@ -264,7 +263,6 @@ try {
         throw "OBI failed: $(Get-Content -Raw -LiteralPath $obiStdout)"
     }
 
-    Start-Sleep -Seconds 2
     $obiLog = Get-Content -Raw -LiteralPath $obiStdout
     $targetLog = Get-Content -Raw -LiteralPath $targetStdout
     $expectedTargetLog = "served GET $RequestPath status=204"
@@ -274,11 +272,6 @@ try {
     if ($obiLog -notmatch 'OpenTelemetry eBPF Instrumentation successfully exiting') {
         throw "OBI did not report a successful exit: $obiLog"
     }
-    $collectorLog = @(
-        Get-Content -Raw -LiteralPath $collectorStdout
-        Get-Content -Raw -LiteralPath $collectorStderr
-    ) -join "`n"
-    $response = Get-Content -Raw -LiteralPath $responsePath
 
     $exportMatch = [Regex]::Match(
         $obiLog,
@@ -294,56 +287,108 @@ try {
     $actualTraceId = $exportMatch.Groups[1].Value
     $actualParentSpanId = $exportMatch.Groups[2].Value
     $actualSpanId = $exportMatch.Groups[3].Value
-    if ($actualTraceId -ne $expectedTraceId) {
-        throw "OBI trace ID mismatch: $actualTraceId"
+    if ($actualTraceId -ne $clientResult.trace_id) {
+        throw "OBI trace ID $actualTraceId does not match client trace ID $($clientResult.trace_id)"
     }
-    if ($actualParentSpanId -ne $expectedParentSpanId) {
-        throw "OBI parent span ID mismatch: $actualParentSpanId"
+    if ($actualParentSpanId -ne $clientResult.span_id) {
+        throw "OBI parent ID $actualParentSpanId does not match client span ID $($clientResult.span_id)"
     }
-    if ($actualSpanId -eq ('0' * 16) -or $actualSpanId -eq $expectedParentSpanId) {
+    if ($actualSpanId -eq ('0' * 16) -or $actualSpanId -eq $clientResult.span_id) {
         throw "OBI generated an invalid server span ID: $actualSpanId"
     }
 
-    $collectorChecks = @(
-        [Regex]::Escape($expectedTraceId),
-        [Regex]::Escape($expectedParentSpanId),
-        [Regex]::Escape($actualSpanId),
-        'Kind\s*:\s*Server',
+    Wait-LogPattern -Process $collectorProcess `
+        -Path $collectorStderr `
+        -Pattern ([Regex]::Escape($clientResult.span_id))
+    Wait-LogPattern -Process $collectorProcess `
+        -Path $collectorStderr `
+        -Pattern ([Regex]::Escape($actualSpanId))
+
+    $collectorLog = @(
+        Get-Content -Raw -LiteralPath $collectorStdout
+        Get-Content -Raw -LiteralPath $collectorStderr
+    ) -join "`n"
+    $clientBlock = Get-CollectorSpanBlock -Log $collectorLog -SpanId $clientResult.span_id
+    $serverBlock = Get-CollectorSpanBlock -Log $collectorLog -SpanId $actualSpanId
+
+    $clientChecks = @(
+        'service\.name.*obi-windows-http-client',
+        'telemetry\.sdk\.language.*go',
         'telemetry\.sdk\.name.*opentelemetry',
-        'telemetry\.distro\.name.*opentelemetry-ebpf-instrumentation',
+        'InstrumentationScope\s+go\.opentelemetry\.io/obi/examples/windows-http-client',
+        'Trace ID\s*:\s*' + [Regex]::Escape($clientResult.trace_id),
+        'ID\s*:\s*' + [Regex]::Escape($clientResult.span_id),
+        'Kind\s*:\s*Client',
         'http\.request\.method.*GET',
-        'http\.response\.status_code.*204',
-        'url\.path.*/linked'
+        'http\.response\.status_code.*204'
     )
-    foreach ($check in $collectorChecks) {
-        if ($collectorLog -notmatch $check) {
-            throw "Collector output is missing expected value: $check"
+    foreach ($check in $clientChecks) {
+        if ($clientBlock -notmatch $check) {
+            throw "Collector client span is missing expected value: $check"
         }
     }
-    if ($response -notmatch '^HTTP/1\.1 204 No Content') {
-        throw "Unexpected HTTP response: $response"
+    if ($clientBlock -match 'telemetry\.distro\.name') {
+        throw 'The ordinary SDK client span unexpectedly carries OBI distribution identity'
     }
 
+    $serverChecks = @(
+        'service\.name.*obi-windows-http-target\.exe',
+        'telemetry\.sdk\.name.*opentelemetry',
+        'telemetry\.distro\.name.*opentelemetry-ebpf-instrumentation',
+        'otel\.scope\.name.*go\.opentelemetry\.io/obi',
+        'Trace ID\s*:\s*' + [Regex]::Escape($actualTraceId),
+        'Parent ID\s*:\s*' + [Regex]::Escape($clientResult.span_id),
+        'ID\s*:\s*' + [Regex]::Escape($actualSpanId),
+        'Kind\s*:\s*Server',
+        'http\.request\.method.*GET',
+        'http\.response\.status_code.*204',
+        'url\.path.*' + [Regex]::Escape($RequestPath),
+        'server\.address.*127\.0\.0\.1',
+        'server\.port.*' + $Port,
+        'process\.pid.*Int\([1-9][0-9]*\)'
+    )
+    foreach ($check in $serverChecks) {
+        if ($serverBlock -notmatch $check) {
+            throw "Collector OBI server span is missing expected value: $check"
+        }
+    }
+
+    $artifactHashes = [ordered]@{}
+    foreach ($artifact in @(
+        $obiExecutable,
+        $processProgram,
+        $flowProgram,
+        $targetExecutable,
+        $clientExecutable
+    )) {
+        $artifactHashes[(Split-Path -Leaf $artifact)] =
+            (Get-FileHash -Algorithm SHA256 -LiteralPath $artifact).Hash
+    }
     $summary = [ordered]@{
         accepted = $true
-        traceparent = $Traceparent
         trace_id = $actualTraceId
-        parent_span_id = $actualParentSpanId
-        span_id = $actualSpanId
+        client_span_id = $clientResult.span_id
+        server_parent_span_id = $actualParentSpanId
+        server_span_id = $actualSpanId
         method = 'GET'
         path = $RequestPath
         status_code = 204
-        span_kind = 'SERVER'
-        telemetry_sdk_name = 'opentelemetry'
-        telemetry_distro_name = 'opentelemetry-ebpf-instrumentation'
+        client_span_kind = 'CLIENT'
+        server_span_kind = 'SERVER'
+        client_service_name = 'obi-windows-http-client'
+        server_service_name = 'obi-windows-http-target.exe'
+        server_telemetry_sdk_name = 'opentelemetry'
+        server_telemetry_distro_name = 'opentelemetry-ebpf-instrumentation'
+        server_otel_scope_name = 'go.opentelemetry.io/obi'
+        artifact_sha256 = $artifactHashes
         evidence_directory = $EvidenceDirectory
     }
     $summary |
-        ConvertTo-Json |
+        ConvertTo-Json -Depth 5 |
         Set-Content -LiteralPath $summaryPath -Encoding UTF8
     $completed = $true
 } finally {
-    foreach ($process in @($targetProcess, $obiProcess, $collectorProcess)) {
+    foreach ($process in @($clientProcess, $targetProcess, $obiProcess, $collectorProcess)) {
         if ($null -ne $process -and -not $process.HasExited) {
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
         }

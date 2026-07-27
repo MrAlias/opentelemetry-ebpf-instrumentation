@@ -385,7 +385,6 @@ try {
             '-OutDir', $outputDirectory,
             '-Platform', 'x64',
             '-Configuration', 'Debug',
-            '-KernelMode', $true,
             '-Verbose'
         ) `
         -Description 'Build the native Flow Classify program'

@@ -246,6 +246,8 @@ try {
         throw "64-bit MSBuild not found: $msbuild"
     }
 
+    $msbuildDirectory = Split-Path -Parent $msbuild
+
     $wdkPackage = Get-ChildItem `
         (Join-Path $ebpfForWindowsSource 'packages') `
         -Directory `
@@ -265,7 +267,7 @@ try {
     }
     $wdkBin = Join-Path $wdkVersionDirectory.FullName 'x64'
     $ebpfBuildDirectory = Join-Path $ebpfForWindowsSource 'x64\Debug'
-    $env:Path = "$ebpfBuildDirectory;$wdkBin;$originalPath"
+    $env:Path = "$ebpfBuildDirectory;$wdkBin;$msbuildDirectory;$originalPath"
     $env:VisualStudioVersion = '17.0'
     $env:CL = '/wd4875 /wd4090'
 

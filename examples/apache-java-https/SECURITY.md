@@ -84,6 +84,10 @@ or credential topology; do not mark it pass.
 ## Local demo hardening
 
 - OTLP and application listeners bind only to loopback.
+- Apache denies proxied access to both Java diagnostic endpoints. The harness
+  reads them directly over the loopback-only backend listener, and the
+  transport endpoint returns either the fixed seven-field configuration
+  snapshot or `unavailable` when the diagnostics facade cannot be loaded.
 - The backend certificate is verified by a generated local CA and hostname.
 - Runtime private keys and the Unix socket live under ignored `.runtime/`
   paths; every Docker build context excludes the certificate directory, and

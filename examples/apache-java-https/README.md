@@ -303,6 +303,9 @@ Before traffic begins, the orchestrator uses bounded waits for:
 - the local OTLP receiver health endpoint;
 - OBI log `Java remote parent bridge ready`;
 - helper log `OBI remote-parent provider ready`;
+- Jetty log `Jetty HTTPS backend ready on 127.0.0.1:18443`;
+- the Java backend's loopback-only transport-configuration endpoint, whose
+  fixed snapshot must prove the requested and selected transport;
 - extension log `OBI remote-parent propagator enabled`;
 - injected-instrumentation log `OBI Java instrumentation ready`;
 - Apache's `/healthz` request through the verified HTTPS Jetty path, with the
@@ -412,9 +415,15 @@ existing pre-control health request, validates the exact bounded schema, and
 chains response-to-response deltas while the fault suite remains serial. This
 avoids an extra bridge take and requires exactly the normalized Java status for
 each injected mode with no unexpected retrieval result. The restart-fault
-interval also includes the headerless readiness request used to re-establish
-duplicate suppression, so it requires exactly two non-workload takes and
-reports conservative workload attribution bounds.
+interval also includes the after-restart diagnostics snapshot, the
+duplicate-suppression readiness request, and the single post-readiness
+transport-configuration request, so it requires exactly three non-workload
+takes and reports conservative workload attribution bounds. The transport
+request is not retried because every processed retry would add another take; a
+failed request fails the scenario. After the provider retry interval, that
+duplicate-suppression request must produce a post-restart provider-ready log
+before the transport snapshot is captured and traffic resumes, preventing a
+pre-restart snapshot from satisfying the gate.
 
 A dirty source tree, `--skip-bridge-build`, or an individually targeted
 scenario is explicitly labeled non-acceptance evidence. Only a clean full
@@ -429,10 +438,15 @@ the retained `compose.log` in this order:
 1. `trace-receiver` must listen on `127.0.0.1:14318`.
 2. Jetty must report HTTP/1.1 and the selected TLS protocol.
 3. Apache must load `mod_ssl` and verify the generated CA and hostname.
-4. OBI must discover ports `18080` and `18443`, then report its selected
-   remote-parent transport.
+4. OBI must discover ports `18080` and `18443`, then report bridge
+   availability.
 5. The JVM must report provider, extension, and injected-instrumentation
-   readiness messages.
+   readiness messages. Its loopback-only `/obi-transport-configuration`
+   endpoint must return a fixed snapshot that proves the requested and selected
+   transport; the harness retains that exact snapshot as
+   `java-selected-transport-configuration.txt`. The current-generation
+   `java-transport-configuration.txt` is cleared before helper or bridge
+   generation changes, without deleting the retained positive evidence.
 6. A failed scenario JSON shows sanitized span graphs from the latest polling
    pass. A marker whose fetch fails or completes after the polling deadline has
    an empty graph instead of reusing an older graph; pressure evidence

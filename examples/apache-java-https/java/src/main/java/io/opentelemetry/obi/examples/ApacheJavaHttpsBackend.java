@@ -122,19 +122,7 @@ public final class ApacheJavaHttpsBackend {
 
     ServletContextHandler context = new ServletContextHandler();
     context.setContextPath("/");
-    context.addServlet(new ServletHolder(new HealthServlet(tlsProtocol)), "/healthz");
-    context.addServlet(new ServletHolder(new EchoServlet(tlsProtocol)), "/api/echo");
-    context.addServlet(new ServletHolder(new EchoServlet(tlsProtocol)), "/api/obi-flags");
-    context.addServlet(new ServletHolder(new DispatchServlet(tlsProtocol)), "/api/dispatch");
-    context.addServlet(new ServletHolder(new HandoffServlet(tlsProtocol)), "/api/handoff");
-    context.addServlet(new ServletHolder(new NettyHandoffServlet(tlsProtocol)), "/api/netty");
-    context.addServlet(new ServletHolder(new VirtualThreadServlet(tlsProtocol)), "/api/virtual");
-    context.addServlet(new ServletHolder(new BridgeDiagnosticsServlet()), "/obi-diagnostics");
-    if (tlsBoundaryFixture != null) {
-      context.addServlet(
-          new ServletHolder(new TlsReceiveBoundaryServlet(tlsBoundaryFixture, tlsProtocol)),
-          "/api/tls-boundary");
-    }
+    configureServlets(context, tlsProtocol, tlsBoundaryFixture);
     server.setHandler(context);
 
     Runtime.getRuntime()
@@ -152,6 +140,28 @@ public final class ApacheJavaHttpsBackend {
       if (tlsBoundaryFixture != null) {
         tlsBoundaryFixture.close();
       }
+    }
+  }
+
+  static void configureServlets(
+      ServletContextHandler context,
+      String tlsProtocol,
+      TlsReceiveBoundaryFixture tlsBoundaryFixture) {
+    context.addServlet(new ServletHolder(new HealthServlet(tlsProtocol)), "/healthz");
+    context.addServlet(new ServletHolder(new EchoServlet(tlsProtocol)), "/api/echo");
+    context.addServlet(new ServletHolder(new EchoServlet(tlsProtocol)), "/api/obi-flags");
+    context.addServlet(new ServletHolder(new DispatchServlet(tlsProtocol)), "/api/dispatch");
+    context.addServlet(new ServletHolder(new HandoffServlet(tlsProtocol)), "/api/handoff");
+    context.addServlet(new ServletHolder(new NettyHandoffServlet(tlsProtocol)), "/api/netty");
+    context.addServlet(new ServletHolder(new VirtualThreadServlet(tlsProtocol)), "/api/virtual");
+    context.addServlet(new ServletHolder(new BridgeDiagnosticsServlet()), "/obi-diagnostics");
+    context.addServlet(
+        new ServletHolder(new TransportConfigurationServlet()),
+        "/obi-transport-configuration");
+    if (tlsBoundaryFixture != null) {
+      context.addServlet(
+          new ServletHolder(new TlsReceiveBoundaryServlet(tlsBoundaryFixture, tlsProtocol)),
+          "/api/tls-boundary");
     }
   }
 
@@ -436,6 +446,30 @@ public final class ApacheJavaHttpsBackend {
     }
   }
 
+  static final class TransportConfigurationServlet extends HttpServlet {
+    private final ClassLoader bridgeClassLoader;
+
+    TransportConfigurationServlet() {
+      this(null);
+    }
+
+    TransportConfigurationServlet(ClassLoader bridgeClassLoader) {
+      this.bridgeClassLoader = bridgeClassLoader;
+    }
+
+    @Override
+    protected void doGet(HttpServletRequest request, HttpServletResponse response)
+        throws IOException {
+      response.setStatus(HttpServletResponse.SC_OK);
+      response.setContentType("text/plain");
+      response.setCharacterEncoding("US-ASCII");
+      response.setHeader("Cache-Control", "no-store");
+      try (PrintWriter writer = response.getWriter()) {
+        writer.println(bridgeTransportConfiguration(bridgeClassLoader));
+      }
+    }
+  }
+
   private static final class TlsReceiveBoundaryServlet extends HttpServlet {
     private final TlsReceiveBoundaryFixture fixture;
     private final String configuredProtocol;
@@ -706,6 +740,20 @@ public final class ApacheJavaHttpsBackend {
       Class<?> bridge =
           Class.forName("io.opentelemetry.obi.java.bridge.RemoteParentBootstrap", true, null);
       Object snapshot = bridge.getMethod("diagnosticsSnapshot").invoke(null);
+      return snapshot == null ? "unavailable" : snapshot.toString();
+    } catch (ReflectiveOperationException | LinkageError failure) {
+      return "unavailable";
+    }
+  }
+
+  private static String bridgeTransportConfiguration(ClassLoader bridgeClassLoader) {
+    try {
+      Class<?> diagnostics =
+          Class.forName(
+              "io.opentelemetry.obi.java.bridge.RemoteParentTransportDiagnosticsV1",
+              true,
+              bridgeClassLoader);
+      Object snapshot = diagnostics.getMethod("snapshot").invoke(null);
       return snapshot == null ? "unavailable" : snapshot.toString();
     } catch (ReflectiveOperationException | LinkageError failure) {
       return "unavailable";

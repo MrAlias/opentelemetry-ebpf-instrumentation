@@ -2,8 +2,13 @@
 
 Cells without a linked run artifact remain **untested**. Kernel or distribution
 version inference is not evidence. Runtime feature detection must name the
-selected transport; `auto` cannot stand in for forced primary and fallback
-tests.
+selected transport in the JVM's fixed transport-configuration snapshot; OBI's
+bridge-readiness log proves availability, not Java selection. This snapshot is
+retained as `java-selected-transport-configuration.txt` and is required for new
+evidence produced after the V2 diagnostics contract was introduced. Older
+linked bundles remain historical results for their recorded revisions, but do
+not establish V2 selection at the current revision. `auto` cannot stand in for
+forced primary and fallback tests.
 
 Each result must be one of `pass`, `fail`, `unsupported`, or `untested` and
 include revision, kernel, architecture, cgroup mode, JVM, agent, Apache,

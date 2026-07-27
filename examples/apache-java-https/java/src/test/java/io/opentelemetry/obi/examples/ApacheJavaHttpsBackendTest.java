@@ -10,11 +10,118 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import jakarta.servlet.http.HttpServletResponse;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.lang.reflect.Proxy;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.FutureTask;
+import org.eclipse.jetty.servlet.ServletContextHandler;
+import org.eclipse.jetty.servlet.ServletMapping;
 import org.junit.jupiter.api.Test;
 
 class ApacheJavaHttpsBackendTest {
+  private static final String TRANSPORT_CONFIGURATION =
+      "version=2,status=1,requested=2,selected=2,attempted=2,getsockopt=0,unix=1";
+
+  @Test
+  void diagnosticServletPathsAreExact() {
+    ServletContextHandler context = new ServletContextHandler();
+    ApacheJavaHttpsBackend.configureServlets(context, "TLSv1.3", null);
+
+    Map<String, String> expected =
+        Map.of(
+            "/obi-diagnostics",
+            ApacheJavaHttpsBackend.class.getName() + "$BridgeDiagnosticsServlet",
+            "/obi-transport-configuration",
+            ApacheJavaHttpsBackend.class.getName() + "$TransportConfigurationServlet");
+    Set<String> diagnosticServletClasses = Set.copyOf(expected.values());
+    Map<String, String> diagnosticServlets = new HashMap<>();
+    for (ServletMapping mapping : context.getServletHandler().getServletMappings()) {
+      String servletClass =
+          context
+              .getServletHandler()
+              .getServlet(mapping.getServletName())
+              .getHeldClass()
+              .getName();
+      if (!diagnosticServletClasses.contains(servletClass)) {
+        continue;
+      }
+      for (String path : mapping.getPathSpecs()) {
+        assertNull(diagnosticServlets.put(path, servletClass));
+      }
+    }
+    assertEquals(expected, diagnosticServlets);
+  }
+
+  @Test
+  void transportConfigurationServletUsesInjectedDiagnosticsSnapshot() throws Exception {
+    ServletResponseCapture response =
+        capture(
+            new ApacheJavaHttpsBackend.TransportConfigurationServlet(
+                ApacheJavaHttpsBackendTest.class.getClassLoader()));
+
+    assertEquals(
+        TRANSPORT_CONFIGURATION + System.lineSeparator(), response.body());
+    assertEquals(
+        Map.of(
+            "status",
+            Integer.toString(HttpServletResponse.SC_OK),
+            "content-type",
+            "text/plain",
+            "character-encoding",
+            "US-ASCII",
+            "Cache-Control",
+            "no-store"),
+        response.metadata());
+  }
+
+  @Test
+  void transportConfigurationServletUsesBootstrapLoaderByDefault() throws Exception {
+    ServletResponseCapture response =
+        capture(new ApacheJavaHttpsBackend.TransportConfigurationServlet());
+
+    assertEquals("unavailable" + System.lineSeparator(), response.body());
+  }
+
+  private static ServletResponseCapture capture(
+      ApacheJavaHttpsBackend.TransportConfigurationServlet servlet) throws Exception {
+    StringWriter body = new StringWriter();
+    PrintWriter writer = new PrintWriter(body);
+    Map<String, String> responseMetadata = new HashMap<>();
+    HttpServletResponse response =
+        (HttpServletResponse)
+            Proxy.newProxyInstance(
+                ApacheJavaHttpsBackendTest.class.getClassLoader(),
+                new Class<?>[] {HttpServletResponse.class},
+                (proxy, method, arguments) -> {
+                  switch (method.getName()) {
+                    case "setStatus":
+                      responseMetadata.put("status", arguments[0].toString());
+                      return null;
+                    case "setContentType":
+                      responseMetadata.put("content-type", arguments[0].toString());
+                      return null;
+                    case "setCharacterEncoding":
+                      responseMetadata.put("character-encoding", arguments[0].toString());
+                      return null;
+                    case "setHeader":
+                      responseMetadata.put(arguments[0].toString(), arguments[1].toString());
+                      return null;
+                    case "getWriter":
+                      return writer;
+                    default:
+                      throw new AssertionError("unexpected response method: " + method.getName());
+                  }
+                });
+
+    servlet.doGet(null, response);
+    return new ServletResponseCapture(body.toString(), Map.copyOf(responseMetadata));
+  }
+
   @Test
   void sharedResponseDiagnosticsRequireStrictOptIn() {
     assertEquals("X-OBI-Java-Diagnostics", ApacheJavaHttpsBackend.BRIDGE_DIAGNOSTICS_HEADER);
@@ -145,4 +252,6 @@ class ApacheJavaHttpsBackendTest {
       return 1;
     }
   }
+
+  private record ServletResponseCapture(String body, Map<String, String> metadata) {}
 }

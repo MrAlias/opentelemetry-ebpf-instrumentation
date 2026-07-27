@@ -143,16 +143,35 @@ EOF
   fi
 }
 
-test_cleanup_failure_changes_successful_run_status() {
-  local -r result_dir="$TEST_TMP_DIR/cleanup-failure-result"
-  local cleanup_status=0
+test_successful_cleanup_invalidates_current_transport_before_down() {
+  local -r results_root="$TEST_TMP_DIR/cleanup-success-results"
+  local -r result_dir="$results_root/current"
+  local -r prior_result="$results_root/prior"
+  local -r foreign_result="$results_root/foreign"
+  local -r down_marker="$result_dir/down"
 
-  mkdir -- "$result_dir"
-  if (
+  mkdir -p -- "$result_dir" "$prior_result" "$foreign_result"
+  printf 'compose_project=obi-apache-java-https-test\n' \
+    >"$result_dir/environment.txt"
+  printf 'compose_project=obi-apache-java-https-test\n' \
+    >"$prior_result/environment.txt"
+  printf 'compose_project=another-project\n' \
+    >"$foreign_result/environment.txt"
+  printf 'current\n' >"$result_dir/java-transport-configuration.txt"
+  printf 'retained\n' >"$result_dir/java-selected-transport-configuration.txt"
+  printf 'prior-current\n' >"$prior_result/java-transport-configuration.txt"
+  printf 'prior-retained\n' >"$prior_result/java-selected-transport-configuration.txt"
+  printf 'foreign-current\n' >"$foreign_result/java-transport-configuration.txt"
+  printf 'foreign-retained\n' >"$foreign_result/java-selected-transport-configuration.txt"
+  (
     PRESSURE_ACTIVE=false
+    RESULTS_ROOT="$results_root"
     RESULT_DIR="$result_dir"
+    PROJECT_NAME="obi-apache-java-https-test"
     STACK_STARTED=true
     KEEP_RUNNING=false
+    BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=getsockopt
     MATCHING_BRIDGE_RUNNING=false
     TMP_DIR=""
     RUN_STATUS=passed
@@ -163,7 +182,120 @@ test_cleanup_failure_changes_successful_run_status() {
     FAILURE_COMMAND=""
     cleanup_security_processes() { :; }
     capture_evidence() { :; }
-    safe_compose_down() { return 17; }
+    safe_compose_down() {
+      [[ "$BRIDGE_RUNNING" == "false" &&
+        -z "$SELECTED_TRANSPORT" &&
+        ! -e "$RESULT_DIR/java-transport-configuration.txt" &&
+        -e "$RESULT_DIR/java-selected-transport-configuration.txt" &&
+        ! -e "$prior_result/java-transport-configuration.txt" &&
+        -e "$prior_result/java-selected-transport-configuration.txt" &&
+        -e "$foreign_result/java-transport-configuration.txt" ]] || return 19
+      : >"$down_marker"
+    }
+
+    cleanup
+  ) >/dev/null 2>&1 || {
+    printf 'successful cleanup did not invalidate current transport state\n' >&2
+    return 1
+  }
+  [[ -e "$down_marker" &&
+    ! -e "$result_dir/java-transport-configuration.txt" &&
+    "$(<"$result_dir/java-selected-transport-configuration.txt")" == "retained" &&
+    ! -e "$prior_result/java-transport-configuration.txt" &&
+    "$(<"$prior_result/java-selected-transport-configuration.txt")" == \
+      "prior-retained" &&
+    "$(<"$foreign_result/java-transport-configuration.txt")" == \
+      "foreign-current" ]] || {
+    printf 'successful cleanup retained stale current-generation selection evidence\n' >&2
+    return 1
+  }
+}
+
+test_cleanup_refuses_down_when_transport_invalidation_fails() {
+  local -r result_dir="$TEST_TMP_DIR/cleanup-invalidation-failure-result"
+  local -r down_marker="$result_dir/down"
+  local cleanup_status=0
+
+  mkdir -- "$result_dir"
+  printf 'current\n' >"$result_dir/java-transport-configuration.txt"
+  printf 'retained\n' >"$result_dir/java-selected-transport-configuration.txt"
+  if (
+    PRESSURE_ACTIVE=false
+    RESULTS_ROOT="$TEST_TMP_DIR/cleanup-invalidation-failure-results"
+    RESULT_DIR="$result_dir"
+    STACK_STARTED=true
+    KEEP_RUNNING=false
+    BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=getsockopt
+    MATCHING_BRIDGE_RUNNING=false
+    TMP_DIR=""
+    RUN_STATUS=passed
+    ACCEPTANCE_EVIDENCE=true
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    cleanup_security_processes() { :; }
+    capture_evidence() { :; }
+    invalidate_selected_transport() { return 29; }
+    safe_compose_down() { : >"$down_marker"; }
+
+    cleanup
+  ) >/dev/null 2>&1; then
+    printf 'cleanup ignored transport invalidation failure\n' >&2
+    return 1
+  else
+    cleanup_status=$?
+  fi
+  [[ "$cleanup_status" == "29" &&
+    ! -e "$down_marker" &&
+    "$(<"$result_dir/java-transport-configuration.txt")" == "current" &&
+    "$(<"$result_dir/java-selected-transport-configuration.txt")" == "retained" ]] || {
+    printf 'cleanup mutated the stack after transport invalidation failed\n' >&2
+    return 1
+  }
+  grep -Fq '"exit_status": 29' "$result_dir/run-status.json" || {
+    printf 'transport invalidation failure was absent from run-status.json\n' >&2
+    return 1
+  }
+  grep -Fq '"failure_stage": "compose-cleanup"' "$result_dir/run-status.json" || {
+    printf 'transport invalidation failure omitted its cleanup stage\n' >&2
+    return 1
+  }
+}
+
+test_cleanup_failure_changes_successful_run_status() {
+  local -r result_dir="$TEST_TMP_DIR/cleanup-failure-result"
+  local cleanup_status=0
+
+  mkdir -- "$result_dir"
+  printf 'current\n' >"$result_dir/java-transport-configuration.txt"
+  printf 'retained\n' >"$result_dir/java-selected-transport-configuration.txt"
+  if (
+    PRESSURE_ACTIVE=false
+    RESULTS_ROOT="$TEST_TMP_DIR/cleanup-failure-results"
+    RESULT_DIR="$result_dir"
+    STACK_STARTED=true
+    KEEP_RUNNING=false
+    BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=getsockopt
+    MATCHING_BRIDGE_RUNNING=false
+    TMP_DIR=""
+    RUN_STATUS=passed
+    ACCEPTANCE_EVIDENCE=true
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    cleanup_security_processes() { :; }
+    capture_evidence() { :; }
+    safe_compose_down() {
+      [[ "$BRIDGE_RUNNING" == "false" &&
+        -z "$SELECTED_TRANSPORT" &&
+        ! -e "$RESULT_DIR/java-transport-configuration.txt" &&
+        -e "$RESULT_DIR/java-selected-transport-configuration.txt" ]] || return 19
+      return 23
+    }
 
     cleanup
   ) >/dev/null 2>&1; then
@@ -172,20 +304,324 @@ test_cleanup_failure_changes_successful_run_status() {
   else
     cleanup_status=$?
   fi
-  [[ "$cleanup_status" == "17" ]] || {
-    printf 'cleanup failure returned status %s instead of 17\n' "$cleanup_status" >&2
+  [[ "$cleanup_status" == "23" ]] || {
+    printf 'cleanup failure returned status %s instead of 23\n' "$cleanup_status" >&2
+    return 1
+  }
+  [[ ! -e "$result_dir/java-transport-configuration.txt" &&
+    "$(<"$result_dir/java-selected-transport-configuration.txt")" == "retained" ]] || {
+    printf 'cleanup retained stale current-generation selection evidence\n' >&2
     return 1
   }
   grep -Fq '"status": "failed"' "$result_dir/run-status.json" || {
     printf 'cleanup failure retained a passed run status\n' >&2
     return 1
   }
-  grep -Fq '"exit_status": 17' "$result_dir/run-status.json" || {
+  grep -Fq '"exit_status": 23' "$result_dir/run-status.json" || {
     printf 'cleanup failure status was absent from run-status.json\n' >&2
     return 1
   }
   grep -Fq '"failure_stage": "compose-cleanup"' "$result_dir/run-status.json" || {
     printf 'cleanup failure stage was absent from run-status.json\n' >&2
+    return 1
+  }
+}
+
+test_run_status_publication_failure_changes_successful_exit() {
+  local -r result_dir="$TEST_TMP_DIR/run-status-publication-failure"
+  local -r cleanup_log="$result_dir/cleanup.log"
+  local cleanup_status=0
+
+  mkdir -p -- "$result_dir"
+  if (
+    PRESSURE_ACTIVE=false
+    FAULT_BRIDGE_RUNNING=false
+    MATCHING_BRIDGE_RUNNING=false
+    STACK_STARTED=false
+    RESULT_DIR="$result_dir"
+    TMP_DIR=""
+    RUN_STATUS=passed
+    ACCEPTANCE_EVIDENCE=true
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    capture_evidence() { :; }
+    cleanup_security_processes() { :; }
+    write_run_status() { return 29; }
+
+    cleanup
+  ) >"$cleanup_log" 2>&1; then
+    printf 'run-status publication failure preserved a successful exit\n' >&2
+    return 1
+  else
+    cleanup_status=$?
+  fi
+  [[ "$cleanup_status" == "29" ]] || {
+    printf 'run-status publication returned %s instead of 29\n' \
+      "$cleanup_status" >&2
+    return 1
+  }
+  if grep -Fq 'retained run evidence' "$cleanup_log"; then
+    printf 'cleanup claimed evidence retention after run-status publication failed\n' >&2
+    return 1
+  fi
+}
+
+test_cleanup_only_invalidates_matching_project_evidence_before_down() {
+  local -r results_root="$TEST_TMP_DIR/cleanup-only-results"
+  local -r matching_result="$results_root/matching"
+  local -r foreign_result="$results_root/foreign"
+  local -r ambiguous_result="$results_root/ambiguous"
+  local -r nested_result="$results_root/parent/nested"
+  local -r symlink_target="$TEST_TMP_DIR/cleanup-only-symlink-target"
+  local -r down_marker="$TEST_TMP_DIR/cleanup-only-down"
+
+  mkdir -p -- \
+    "$matching_result" \
+    "$foreign_result" \
+    "$ambiguous_result" \
+    "$nested_result" \
+    "$symlink_target"
+  printf 'compose_project=obi-apache-java-https-test\n' \
+    >"$matching_result/environment.txt"
+  printf 'compose_project=another-project\n' \
+    >"$foreign_result/environment.txt"
+  printf '%s\n' \
+    'compose_project=obi-apache-java-https-test' \
+    'compose_project=another-project' \
+    >"$ambiguous_result/environment.txt"
+  printf 'compose_project=obi-apache-java-https-test\n' \
+    >"$nested_result/environment.txt"
+  printf 'compose_project=obi-apache-java-https-test\n' \
+    >"$symlink_target/environment.txt"
+  ln -s -- "$symlink_target" "$results_root/symlink"
+  for result in \
+    "$matching_result" \
+    "$foreign_result" \
+    "$nested_result" \
+    "$symlink_target"; do
+    printf 'current\n' >"$result/java-transport-configuration.txt"
+    printf 'retained\n' >"$result/java-selected-transport-configuration.txt"
+  done
+  printf 'retained\n' \
+    >"$ambiguous_result/java-selected-transport-configuration.txt"
+
+  (
+    RESULTS_ROOT="$results_root"
+    RESULT_DIR=""
+    PROJECT_NAME="obi-apache-java-https-test"
+    BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=unix
+    safe_compose_down() {
+      [[ "$BRIDGE_RUNNING" == "false" &&
+        -z "$SELECTED_TRANSPORT" &&
+        ! -e "$matching_result/java-transport-configuration.txt" &&
+        -e "$matching_result/java-selected-transport-configuration.txt" &&
+        -e "$foreign_result/java-transport-configuration.txt" &&
+        ! -e "$ambiguous_result/java-transport-configuration.txt" &&
+        -e "$nested_result/java-transport-configuration.txt" &&
+        -e "$symlink_target/java-transport-configuration.txt" ]] || return 31
+      : >"$down_marker"
+    }
+
+    cleanup_only
+  ) || {
+    printf 'cleanup-only did not invalidate matching project evidence\n' >&2
+    return 1
+  }
+  [[ -e "$down_marker" &&
+    ! -e "$matching_result/java-transport-configuration.txt" &&
+    "$(<"$matching_result/java-selected-transport-configuration.txt")" == "retained" &&
+    "$(<"$foreign_result/java-transport-configuration.txt")" == "current" &&
+    "$(<"$ambiguous_result/java-selected-transport-configuration.txt")" == "retained" &&
+    "$(<"$nested_result/java-transport-configuration.txt")" == "current" &&
+    "$(<"$symlink_target/java-transport-configuration.txt")" == "current" ]] || {
+    printf 'cleanup-only invalidated evidence outside the exact project scope\n' >&2
+    return 1
+  }
+}
+
+test_cleanup_only_refuses_untrusted_current_evidence_identity() {
+  local mode=""
+  local results_root=""
+  local result_dir=""
+  local down_marker=""
+  local expected_status=0
+  local cleanup_status=0
+
+  for mode in missing ambiguous duplicate opaque; do
+    results_root="$TEST_TMP_DIR/cleanup-only-untrusted-$mode"
+    result_dir="$results_root/result"
+    down_marker="$results_root/down"
+    mkdir -p -- "$result_dir"
+    case "$mode" in
+      missing)
+        expected_status=1
+        ;;
+      ambiguous)
+        expected_status=2
+        printf '%s\n' \
+          'compose_project=obi-apache-java-https-test' \
+          'compose_project=another-project' \
+          >"$result_dir/environment.txt"
+        ;;
+      duplicate)
+        expected_status=2
+        printf '%s\n' \
+          'compose_project=obi-apache-java-https-test' \
+          'compose_project=obi-apache-java-https-test' \
+          >"$result_dir/environment.txt"
+        ;;
+      opaque)
+        expected_status=1
+        printf 'compose_project=obi-apache-java-https-test\n' \
+          >"$result_dir/environment.txt"
+        ;;
+    esac
+    printf 'current\n' >"$result_dir/java-transport-configuration.txt"
+    printf 'retained\n' >"$result_dir/java-selected-transport-configuration.txt"
+    if [[ "$mode" == "opaque" ]]; then
+      chmod 000 -- "$result_dir"
+    fi
+
+    if (
+      RESULTS_ROOT="$results_root"
+      RESULT_DIR=""
+      PROJECT_NAME="obi-apache-java-https-test"
+      BRIDGE_RUNNING=true
+      SELECTED_TRANSPORT=unix
+      safe_compose_down() {
+        : >"$down_marker"
+      }
+
+      cleanup_only
+    ) >/dev/null 2>&1; then
+      printf 'cleanup-only accepted %s current evidence identity\n' "$mode" >&2
+      return 1
+    else
+      cleanup_status=$?
+    fi
+    if [[ "$mode" == "opaque" ]]; then
+      chmod 0700 -- "$result_dir"
+    fi
+    [[ "$cleanup_status" == "$expected_status" &&
+      ! -e "$down_marker" &&
+      "$(<"$result_dir/java-transport-configuration.txt")" == "current" &&
+      "$(<"$result_dir/java-selected-transport-configuration.txt")" == "retained" ]] || {
+      printf 'cleanup-only mutated state after %s identity failure\n' "$mode" >&2
+      return 1
+    }
+  done
+}
+
+test_cleanup_only_refuses_down_when_project_evidence_invalidation_fails() {
+  local -r results_root="$TEST_TMP_DIR/cleanup-only-failure-results"
+  local -r result_dir="$results_root/matching"
+  local -r down_marker="$TEST_TMP_DIR/cleanup-only-failure-down"
+  local cleanup_status=0
+
+  mkdir -p -- "$result_dir"
+  printf 'compose_project=obi-apache-java-https-test\n' \
+    >"$result_dir/environment.txt"
+  printf 'current\n' >"$result_dir/java-transport-configuration.txt"
+  printf 'retained\n' >"$result_dir/java-selected-transport-configuration.txt"
+
+  if (
+    RESULTS_ROOT="$results_root"
+    RESULT_DIR=""
+    PROJECT_NAME="obi-apache-java-https-test"
+    BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=unix
+    rm() {
+      return 29
+    }
+    safe_compose_down() {
+      : >"$down_marker"
+    }
+
+    if cleanup_only; then
+      return 1
+    else
+      cleanup_status=$?
+    fi
+    [[ "$cleanup_status" == "29" &&
+      "$BRIDGE_RUNNING" == "true" &&
+      "$SELECTED_TRANSPORT" == "unix" ]] || return 1
+    return "$cleanup_status"
+  ) >/dev/null 2>&1; then
+    printf 'cleanup-only ignored project evidence invalidation failure\n' >&2
+    return 1
+  else
+    cleanup_status=$?
+  fi
+  [[ "$cleanup_status" == "29" &&
+    ! -e "$down_marker" &&
+    "$(<"$result_dir/java-transport-configuration.txt")" == "current" &&
+    "$(<"$result_dir/java-selected-transport-configuration.txt")" == "retained" ]] || {
+    printf 'cleanup-only mutated Compose after evidence invalidation failed\n' >&2
+    return 1
+  }
+}
+
+test_cleanup_only_fails_closed_on_project_matcher_error() {
+  local -r results_root="$TEST_TMP_DIR/cleanup-only-matcher-results"
+  local -r result_dir="$results_root/matching"
+  local -r down_marker="$TEST_TMP_DIR/cleanup-only-matcher-down"
+  local cleanup_status=0
+
+  mkdir -p -- "$result_dir"
+  printf 'compose_project=obi-apache-java-https-test\n' \
+    >"$result_dir/environment.txt"
+  printf 'current\n' >"$result_dir/java-transport-configuration.txt"
+  printf 'retained\n' >"$result_dir/java-selected-transport-configuration.txt"
+
+  if (
+    RESULTS_ROOT="$results_root"
+    RESULT_DIR=""
+    PROJECT_NAME="obi-apache-java-https-test"
+    BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=unix
+    result_evidence_matches_project() {
+      return 42
+    }
+    safe_compose_down() {
+      : >"$down_marker"
+    }
+
+    cleanup_only
+  ) >/dev/null 2>&1; then
+    printf 'cleanup-only treated a matcher error as an unrelated project\n' >&2
+    return 1
+  else
+    cleanup_status=$?
+  fi
+  [[ "$cleanup_status" == "42" &&
+    ! -e "$down_marker" &&
+    "$(<"$result_dir/java-transport-configuration.txt")" == "current" &&
+    "$(<"$result_dir/java-selected-transport-configuration.txt")" == "retained" ]] || {
+    printf 'cleanup-only continued after project matcher failure\n' >&2
+    return 1
+  }
+}
+
+test_main_propagates_cleanup_only_failure() {
+  local cleanup_status=0
+
+  if (
+    install_traps() { :; }
+    parse_args() { CLEANUP_ONLY=true; }
+    check_dependencies() { :; }
+    cleanup_only() { return 29; }
+
+    run_demo --cleanup-only
+  ) >/dev/null 2>&1; then
+    printf 'main ignored cleanup-only failure\n' >&2
+    return 1
+  else
+    cleanup_status=$?
+  fi
+  [[ "$cleanup_status" == "29" ]] || {
+    printf 'main returned %s instead of cleanup-only status 29\n' \
+      "$cleanup_status" >&2
     return 1
   }
 }
@@ -237,6 +673,224 @@ test_numeric_options_reject_overflow() {
     [[ "$REPEAT_COUNT" == "2" && "$SCENARIO_SEED" == "0" ]]
   ) || {
     printf 'bounded numeric options were not normalized to decimal\n' >&2
+    return 1
+  }
+}
+
+test_transport_configuration_parser_is_exact() {
+  local expected=""
+  local configuration=""
+  local selected=""
+
+  while IFS='|' read -r expected configuration selected; do
+    [[ "$(selected_transport_from_configuration "$configuration" "$expected")" == "$selected" ]] || {
+      printf 'rejected valid %s transport configuration: %s\n' "$expected" "$configuration" >&2
+      return 1
+    }
+  done <<'EOF'
+getsockopt|version=2,status=1,requested=1,selected=1,attempted=1,getsockopt=1,unix=0|getsockopt
+auto|version=2,status=1,requested=0,selected=1,attempted=1,getsockopt=1,unix=0|getsockopt
+unix|version=2,status=1,requested=2,selected=2,attempted=2,getsockopt=0,unix=1|unix
+auto|version=2,status=1,requested=0,selected=2,attempted=3,getsockopt=4,unix=1|unix
+EOF
+
+  while IFS='|' read -r expected configuration; do
+    if selected_transport_from_configuration "$configuration" "$expected" >/dev/null; then
+      printf 'accepted invalid %s transport configuration: %s\n' "$expected" "$configuration" >&2
+      return 1
+    fi
+  done <<'EOF'
+auto|version=1,status=1,requested=0,selected=255,attempted=0,getsockopt=0,unix=0
+auto|version=2,status=6,requested=0,selected=255,attempted=0,getsockopt=0,unix=0
+auto|version=2,status=1,requested=1,selected=1,attempted=1,getsockopt=1,unix=0
+auto|version=2,status=1,requested=0,selected=2,attempted=3,getsockopt=1,unix=1
+getsockopt|version=2,status=1,requested=1,selected=2,attempted=2,getsockopt=0,unix=1
+unix|version=2,status=1,requested=2,selected=2,attempted=2,getsockopt=0,unix=01
+unix|version=2,status=1,requested=2,selected=2,attempted=2,getsockopt=0,unix=1,extra=0
+unix|status=1,version=2,requested=2,selected=2,attempted=2,getsockopt=0,unix=1
+EOF
+}
+
+test_selected_transport_uses_java_diagnostics() {
+  local -r result_dir="$TEST_TMP_DIR/java-transport-configuration"
+  local -r curl_attempts="$result_dir/curl-attempts"
+  local -r successful_configuration="version=2,status=1,requested=0,selected=2,attempted=3,getsockopt=4,unix=1"
+  local -r replacement_configuration="version=2,status=1,requested=0,selected=1,attempted=1,getsockopt=1,unix=0"
+
+  mkdir -p -- "$result_dir/certs"
+  (
+    local publication_status=0
+
+    RESULT_DIR="$result_dir"
+    CERT_DIR="$result_dir/certs"
+    TRANSPORT=auto
+    SELECTED_TRANSPORT=""
+    CURL_MODE=success
+    INSTALL_MODE=success
+    TRANSPORT_CONFIGURATION_RESPONSE="$successful_configuration"
+    curl() {
+      local -i attempt_count=0
+
+      [[ "$*" == \
+        "--fail --silent --show-error --max-time 5 --max-filesize $TRANSPORT_CONFIGURATION_MAX_BYTES --cacert $CERT_DIR/ca.crt https://127.0.0.1:18443/obi-transport-configuration --output $RESULT_DIR/java-transport-configuration.txt" ]] ||
+        return 64
+      if [[ "$CURL_MODE" == "transient" ]]; then
+        printf 'attempt\n' >>"$curl_attempts"
+        attempt_count="$(wc -l <"$curl_attempts")"
+        if ((attempt_count == 1)); then
+          [[ -z "$SELECTED_TRANSPORT" &&
+            ! -e "$RESULT_DIR/java-transport-configuration.txt" ]] || return 65
+          return 7
+        fi
+      fi
+      case "$CURL_MODE" in
+        nul)
+          printf '%s\n\0' "$TRANSPORT_CONFIGURATION_RESPONSE" \
+            >"$RESULT_DIR/java-transport-configuration.txt"
+          ;;
+        oversized)
+          printf '%0300d\n' 0 >"$RESULT_DIR/java-transport-configuration.txt"
+          return 63
+          ;;
+        oversized-raw)
+          printf '%0300d\n' 0 >"$RESULT_DIR/java-transport-configuration.txt"
+          ;;
+        crlf)
+          printf '%s\r\n' "$TRANSPORT_CONFIGURATION_RESPONSE" \
+            >"$RESULT_DIR/java-transport-configuration.txt"
+          ;;
+        no-final-newline)
+          printf '%s' "$TRANSPORT_CONFIGURATION_RESPONSE" \
+            >"$RESULT_DIR/java-transport-configuration.txt"
+          ;;
+        trailing-nonblank)
+          printf '%s\nunexpected\n' "$TRANSPORT_CONFIGURATION_RESPONSE" \
+            >"$RESULT_DIR/java-transport-configuration.txt"
+          ;;
+        trailing-blank)
+          printf '%s\n\n' "$TRANSPORT_CONFIGURATION_RESPONSE" \
+            >"$RESULT_DIR/java-transport-configuration.txt"
+          ;;
+        *)
+          printf '%s\n' "$TRANSPORT_CONFIGURATION_RESPONSE" \
+            >"$RESULT_DIR/java-transport-configuration.txt"
+          ;;
+      esac
+    }
+    install() {
+      if [[ "$INSTALL_MODE" == "failure" ]]; then
+        : >"${@: -1}"
+        return 29
+      fi
+      command install "$@"
+    }
+
+    assert_selected_transport auto
+    [[ "$SELECTED_TRANSPORT" == "unix" ]]
+    [[ "$(<"$RESULT_DIR/java-transport-configuration.txt")" == "$successful_configuration" ]]
+    [[ "$(<"$RESULT_DIR/java-selected-transport-configuration.txt")" == \
+      "$successful_configuration" ]]
+
+    TRANSPORT_CONFIGURATION_RESPONSE="$replacement_configuration"
+    INSTALL_MODE=failure
+    if assert_selected_transport auto >/dev/null 2>&1; then
+      printf 'readiness ignored retained transport publication failure\n' >&2
+      return 1
+    else
+      publication_status=$?
+    fi
+    [[ "$publication_status" == "29" ]] || return 1
+    [[ -z "$SELECTED_TRANSPORT" &&
+      "$(<"$RESULT_DIR/java-transport-configuration.txt")" == \
+        "$replacement_configuration" &&
+      "$(<"$RESULT_DIR/java-selected-transport-configuration.txt")" == \
+        "$successful_configuration" ]] || return 1
+    if compgen -G \
+      "$RESULT_DIR/.java-selected-transport-configuration.*" >/dev/null; then
+      printf 'readiness left a failed retained transport temporary file\n' >&2
+      return 1
+    fi
+    INSTALL_MODE=success
+    TRANSPORT_CONFIGURATION_RESPONSE="$successful_configuration"
+
+    CURL_MODE=transient
+    rm -f -- "$curl_attempts"
+    if assert_selected_transport auto >/dev/null 2>&1; then
+      printf 'readiness retried a failed transport request with unaccounted side effects\n' >&2
+      return 1
+    fi
+    [[ -z "$SELECTED_TRANSPORT" &&
+      ! -e "$RESULT_DIR/java-transport-configuration.txt" ]]
+    [[ "$(wc -l <"$curl_attempts")" == "1" ]]
+    [[ "$(<"$RESULT_DIR/java-selected-transport-configuration.txt")" == \
+      "$successful_configuration" ]]
+
+    assert_selected_transport auto
+    [[ "$SELECTED_TRANSPORT" == "unix" ]]
+    [[ "$(wc -l <"$curl_attempts")" == "2" ]]
+
+    CURL_MODE=success
+    TRANSPORT_CONFIGURATION_RESPONSE="version=2,status=12,requested=0,selected=255,attempted=3,getsockopt=4,unix=12"
+    if assert_selected_transport auto >/dev/null 2>&1; then
+      printf 'readiness accepted a failed Java transport configuration\n' >&2
+      return 1
+    fi
+    [[ -z "$SELECTED_TRANSPORT" ]]
+    [[ "$(<"$RESULT_DIR/java-transport-configuration.txt")" == \
+      "version=2,status=12,requested=0,selected=255,attempted=3,getsockopt=4,unix=12" ]]
+    [[ "$(<"$RESULT_DIR/java-selected-transport-configuration.txt")" == \
+      "$successful_configuration" ]]
+
+    TRANSPORT_CONFIGURATION_RESPONSE="application log OBI remote-parent transport configuration version=2,status=1,requested=0,selected=1,attempted=1,getsockopt=1,unix=0"
+    if assert_selected_transport auto >/dev/null 2>&1; then
+      printf 'readiness accepted an application-forged transport configuration\n' >&2
+      return 1
+    fi
+    [[ -z "$SELECTED_TRANSPORT" && ! -e "$RESULT_DIR/java-transport-configuration.txt" ]]
+
+    TRANSPORT_CONFIGURATION_RESPONSE="$successful_configuration"
+    for CURL_MODE in \
+      nul oversized oversized-raw crlf no-final-newline trailing-blank trailing-nonblank; do
+      if assert_selected_transport auto >/dev/null 2>&1; then
+        printf 'readiness accepted a %s Java transport response\n' "$CURL_MODE" >&2
+        return 1
+      fi
+      [[ -z "$SELECTED_TRANSPORT" &&
+        ! -e "$RESULT_DIR/java-transport-configuration.txt" ]] || return 1
+    done
+    [[ "$(<"$RESULT_DIR/java-selected-transport-configuration.txt")" == \
+      "$successful_configuration" ]]
+  ) || {
+    printf 'readiness did not use the direct Java transport configuration\n' >&2
+    return 1
+  }
+}
+
+test_transport_configuration_file_size_boundary_is_exact() {
+  local -r configuration_file="$TEST_TMP_DIR/transport-configuration-size.txt"
+
+  (
+    transport_configuration_values() {
+      return 0
+    }
+
+    printf '%0254d\n' 0 >"$configuration_file"
+    transport_configuration_from_file "$configuration_file" >/dev/null
+    [[ "$(wc -c <"$configuration_file")" == "255" ]]
+
+    printf '%0255d\n' 0 >"$configuration_file"
+    transport_configuration_from_file "$configuration_file" >/dev/null
+    [[ "$(wc -c <"$configuration_file")" == "$TRANSPORT_CONFIGURATION_MAX_BYTES" ]]
+
+    printf '%0256d\n' 0 >"$configuration_file"
+    if transport_configuration_from_file "$configuration_file" >/dev/null 2>&1; then
+      printf 'transport configuration accepted more than %d bytes\n' \
+        "$TRANSPORT_CONFIGURATION_MAX_BYTES" >&2
+      return 1
+    fi
+    [[ "$(wc -c <"$configuration_file")" == "257" ]]
+  ) || {
+    printf 'transport configuration byte boundary was not exact\n' >&2
     return 1
   }
 }
@@ -393,6 +1047,95 @@ test_unix_all_suite_includes_fault_control() {
     "$(<"$actual")" == *$'obi-flags\nw3c-fault\nfail-open'* &&
     "$(<"$actual")" == *$'restart\nrestart-fault\nhelper-attach-failure'* ]] || {
     printf 'Unix all suite omitted the security or bounded W3C fault control\n' >&2
+    return 1
+  }
+}
+
+test_run_demo_preserves_strict_scenario_execution() {
+  local -r first_observed="$TEST_TMP_DIR/run-demo-first-scenario"
+  local -r nested_observed="$TEST_TMP_DIR/run-demo-nested-scenario"
+  local demo_status=0
+
+  set +e
+  (
+    set -Eeuo pipefail
+    install_traps() { :; }
+    parse_args() {
+      CLEANUP_ONLY=false
+      SCENARIO=all
+      TRANSPORT=getsockopt
+    }
+    check_dependencies() { :; }
+    prepare_directories() { :; }
+    capture_source_state() { :; }
+    prepare_certificates() { :; }
+    prepare_official_agent() { :; }
+    prepare_bridge_artifacts() { :; }
+    export_compose_environment() { :; }
+    capture_environment() { :; }
+    start_stack() { :; }
+    capture_runtime_evidence() { :; }
+    run_scenario() {
+      printf 'scenario:%s:%s\n' "$1" "$RUN_STATUS" >>"$first_observed"
+      [[ "$1" != "basic" ]] || return 17
+    }
+    run_security_control() {
+      printf 'continued-security\n' >>"$first_observed"
+    }
+
+    RUN_STATUS=failed
+    run_demo
+    printf 'continued-main:%s\n' "$RUN_STATUS" >>"$first_observed"
+  )
+  demo_status=$?
+  set -e
+  [[ "$demo_status" == "17" &&
+    "$(<"$first_observed")" == "scenario:basic:failed" ]] || {
+    printf 'run_demo continued after the first scenario failed\n' >&2
+    return 1
+  }
+
+  set +e
+  (
+    set -Eeuo pipefail
+    install_traps() { :; }
+    parse_args() {
+      CLEANUP_ONLY=false
+      SCENARIO=all
+      TRANSPORT=getsockopt
+    }
+    check_dependencies() { :; }
+    prepare_directories() { :; }
+    capture_source_state() { :; }
+    prepare_certificates() { :; }
+    prepare_official_agent() { :; }
+    prepare_bridge_artifacts() { :; }
+    export_compose_environment() { :; }
+    capture_environment() { :; }
+    start_stack() { :; }
+    capture_runtime_evidence() { :; }
+    run_scenario() {
+      printf 'scenario:%s\n' "$1" >>"$nested_observed"
+    }
+    injected_security_failure() {
+      return 23
+    }
+    run_primary_security_control() {
+      printf 'security-entered\n' >>"$nested_observed"
+      injected_security_failure
+      printf 'security-continued\n' >>"$nested_observed"
+    }
+
+    RUN_STATUS=failed
+    SELECTED_TRANSPORT=getsockopt
+    run_demo
+    printf 'continued-main:%s\n' "$RUN_STATUS" >>"$nested_observed"
+  )
+  demo_status=$?
+  set -e
+  [[ "$demo_status" == "23" &&
+    "$(<"$nested_observed")" == $'scenario:basic\nsecurity-entered' ]] || {
+    printf 'run_demo suppressed a nested scenario failure\n' >&2
     return 1
   }
 }
@@ -727,6 +1470,7 @@ test_metrics_delta_reports_counters_and_map_occupancy() {
   local before="$TEST_TMP_DIR/metrics-before.prom"
   local after="$TEST_TMP_DIR/metrics-after.prom"
   local delta="$TEST_TMP_DIR/metrics.delta"
+  local delta_status=0
 
   cat >"$before" <<'EOF'
 obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 2
@@ -750,6 +1494,20 @@ EOF
   }
   [[ "$(<"$delta")" == *'error_type="attaching_java_agent"'*'delta=1'* ]] || {
     printf 'metrics delta omitted the Java attach-error counter change\n' >&2
+    return 1
+  }
+
+  if (
+    sort() { return 29; }
+    write_metrics_delta "$before" "$after" "$delta.failed"
+  ) >/dev/null 2>&1; then
+    printf 'metrics delta ignored sort failure\n' >&2
+    return 1
+  else
+    delta_status=$?
+  fi
+  [[ "$delta_status" == "29" ]] || {
+    printf 'metrics delta returned %s instead of sort status 29\n' "$delta_status" >&2
     return 1
   }
 }
@@ -1052,6 +1810,56 @@ test_duplicate_suppression_wait_primes_java_export() {
     return 1
   }
   java_duplicate_suppression_present "$metrics"
+
+  local failure_status=0
+  if (
+    RESULT_DIR="$result_dir"
+    run_bounded() { return 23; }
+
+    wait_for_java_duplicate_suppression "$result_dir/prime-failure.prom"
+  ) >/dev/null 2>&1; then
+    printf 'duplicate suppression ignored Java export prime failure\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "23" ]] || return 1
+
+  if (
+    RESULT_DIR="$result_dir"
+    run_bounded() { return 0; }
+    fetch_obi_metrics() {
+      printf '%s\n' \
+        'obi_avoided_services{service_name="java-backend",service_namespace="apache-java-https",telemetry_type="traces"} 1' \
+        >"$1"
+    }
+    install() { return 29; }
+
+    wait_for_java_duplicate_suppression "$result_dir/install-failure.prom"
+  ) >/dev/null 2>&1; then
+    printf 'duplicate suppression ignored evidence install failure\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "29" &&
+    ! -e "$result_dir/install-failure.prom" ]] || return 1
+
+  if (
+    RESULT_DIR="$result_dir"
+    run_bounded() { return 0; }
+    fetch_obi_metrics() { return 1; }
+    sleep() { return 31; }
+
+    wait_for_java_duplicate_suppression "$result_dir/sleep-failure.prom"
+  ) >/dev/null 2>&1; then
+    printf 'duplicate suppression ignored retry sleep failure\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "31" &&
+    ! -e "$result_dir/sleep-failure.prom" ]] || return 1
 }
 
 test_pressure_map_metric_requires_exact_unique_series() {
@@ -1111,6 +1919,36 @@ test_bridge_metric_wait_requires_quiescent_report() {
       return 1
     }
   )
+
+  local publication_status=0
+  if (
+    local -i fetches=0
+    RESULT_DIR="$TEST_TMP_DIR/bridge-metric-publication-failure"
+    mkdir -p -- "$RESULT_DIR"
+    fetch_obi_metrics() {
+      ((fetches += 1))
+      printf '%s\n' \
+        'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="unix"} 1' \
+        'obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} 1' \
+        "obi_java_remote_parent_operations_total{operation=\"report\",status=\"valid\",transport=\"tcp\"} $fetches" \
+        >"$1"
+    }
+    sleep() { :; }
+    install() { return 29; }
+
+    wait_for_bridge_metrics_quiescent \
+      1 1 "$RESULT_DIR/settled.prom" "publication failure"
+  ) >/dev/null 2>&1; then
+    printf 'bridge metric wait ignored evidence publication failure\n' >&2
+    return 1
+  else
+    publication_status=$?
+  fi
+  [[ "$publication_status" == "29" ]] || {
+    printf 'bridge metric publication returned %s instead of 29\n' \
+      "$publication_status" >&2
+    return 1
+  }
 }
 
 test_security_probe_window_covers_metric_fences() {
@@ -2610,8 +3448,12 @@ EOF
 test_permissive_unix_directory_control_refuses_and_restores() {
   local -r result_dir="$TEST_TMP_DIR/permissive-directory-control"
   local -r observed="$result_dir/observed"
+  local -r provider_ready="$result_dir/provider-ready"
+  local -r date_calls="$result_dir/date-calls"
 
   mkdir -p -- "$result_dir"
+  printf 'current\n' >"$result_dir/java-transport-configuration.txt"
+  printf 'retained\n' >"$result_dir/java-selected-transport-configuration.txt"
   (
     RESULT_DIR="$result_dir"
     COMPOSE=(test-compose)
@@ -2622,6 +3464,13 @@ test_permissive_unix_directory_control_refuses_and_restores() {
     run_bounded() {
       shift
       case " $* " in
+        *" stop --timeout 10 obi "*)
+          [[ "$BRIDGE_RUNNING" == "false" &&
+            -z "$SELECTED_TRANSPORT" &&
+            ! -e "$RESULT_DIR/java-transport-configuration.txt" &&
+            -e "$RESULT_DIR/java-selected-transport-configuration.txt" ]] ||
+            return 31
+          ;;
         *" chmod 0777 /var/run/obi "*)
           directory_mode=0777
           ;;
@@ -2650,19 +3499,48 @@ test_permissive_unix_directory_control_refuses_and_restores() {
     }
     assert_selected_transport() {
       SELECTED_TRANSPORT=unix
+      printf 'transport\n' >>"$observed"
+    }
+    wait_for_http() {
+      printf 'http:%s\n' "$2" >>"$observed"
+    }
+    sleep() {
+      printf 'sleep:%s\n' "$1" >>"$observed"
     }
     wait_for_log() {
+      if [[ "$3" == "post-permission Java bridge provider" ]]; then
+        [[ -f "$provider_ready" ]] || return 1
+      fi
       printf 'log:%s:%s\n' "$3" "${4:-}" >>"$observed"
     }
     wait_for_apache_instrumentation() {
       printf 'apache:%s\n' "$1" >>"$observed"
     }
     wait_for_java_duplicate_suppression() {
+      : >"$provider_ready"
       printf 'suppression:%s\n' "$(basename -- "$1")" >>"$observed"
       : >"$1"
     }
     date() {
-      printf 'security-cursor\n'
+      local -i call_count=0
+
+      printf 'call\n' >>"$date_calls"
+      call_count="$(wc -l <"$date_calls")"
+      case "$call_count" in
+        1)
+          printf 'cursor:security-failure\n' >>"$observed"
+          printf 'security-failure-cursor\n'
+          ;;
+        2)
+          printf 'cursor:security-recovery\n' >>"$observed"
+          printf 'security-recovery-cursor\n'
+          ;;
+        3)
+          printf 'cursor:security-provider\n' >>"$observed"
+          printf 'security-provider-cursor\n'
+          ;;
+        *) return 1 ;;
+      esac
     }
     curl() {
       local output=""
@@ -2688,20 +3566,175 @@ test_permissive_unix_directory_control_refuses_and_restores() {
   }
   grep -Fq "$UNIX_PERMISSION_REFUSAL_PATTERN" \
     "$result_dir/security-permissive-directory-obi.log"
-  grep -Fq 'logs --no-color --since security-cursor obi' "$observed"
+  grep -Fq 'logs --no-color --since security-failure-cursor obi' "$observed"
   awk '
     /up --detach --no-deps --force-recreate obi/ { recovery = NR }
-    $0 == "log:post-permission Java bridge provider:security-cursor" { provider = NR }
+    $0 == "log:post-permission Unix bridge recovery:security-recovery-cursor" {
+      bridge = NR
+    }
+    $0 == "cursor:security-provider" { provider_cursor = NR }
+    $0 == "http:post-permission Java provider probe" { probe = NR }
+    $0 ~ /^sleep:[0-9]+$/ { settle = NR }
+    $0 == "transport" { transport = NR }
+    $0 == "log:post-permission Java bridge provider:security-provider-cursor" {
+      provider = NR
+    }
     $0 == "apache:unix-permission-recovery" { readiness = NR }
     $0 == "suppression:duplicate-suppression-unix-permission-recovery.prom" {
       suppression = NR
     }
     END {
-      exit recovery > 0 && provider > recovery && readiness > provider &&
-        suppression > readiness ? 0 : 1
+      exit recovery > 0 && bridge > recovery &&
+        provider_cursor > bridge && readiness > provider_cursor &&
+        probe > readiness && settle > probe && suppression > settle &&
+        provider > suppression && transport > provider ? 0 : 1
     }
   ' "$observed" || {
     printf 'Unix permission recovery resumed before duplicate suppression readiness\n' >&2
+    return 1
+  }
+  grep -Fqx "sleep:$JAVA_PROVIDER_RETRY_SETTLE_SECONDS" "$observed"
+  [[ ! -e "$result_dir/java-transport-configuration.txt" &&
+    "$(<"$result_dir/java-selected-transport-configuration.txt")" == "retained" ]] || {
+    printf 'Unix permission control retained stale current transport evidence\n' >&2
+    return 1
+  }
+}
+
+test_permissive_unix_directory_rejects_socket_probe_error() {
+  local -r result_dir="$TEST_TMP_DIR/permissive-directory-probe-error"
+  local control_status=0
+
+  mkdir -p -- "$result_dir"
+  printf 'current\n' >"$result_dir/java-transport-configuration.txt"
+  printf 'retained\n' >"$result_dir/java-selected-transport-configuration.txt"
+  if (
+    RESULT_DIR="$result_dir"
+    COMPOSE=(test-compose)
+    BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=unix
+    UNIX_SECURITY_DIRECTORY_RELAXED=false
+    date() { printf 'probe-error-cursor\n'; }
+    wait_for_log() { return 0; }
+    run_bounded() {
+      case " $* " in
+        *" ls -ld /var/run/obi "*)
+          printf 'drwxrwxrwx 2 root root 40 Jul 22 00:00 /var/run/obi\n'
+          ;;
+        *" test -S /var/run/obi/java-remote-parent.sock "*)
+          return 42
+          ;;
+      esac
+    }
+
+    run_unix_permissive_directory_control
+  ) >/dev/null 2>&1; then
+    printf 'Unix permission control treated a failed socket probe as absence\n' >&2
+    return 1
+  else
+    control_status=$?
+  fi
+  [[ "$control_status" == "42" &&
+    ! -e "$result_dir/security-permissive-directory-response.json" ]] || {
+    printf 'Unix permission control continued after socket probe failure\n' >&2
+    return 1
+  }
+}
+
+test_unix_endpoint_restart_invalidates_before_stack_mutation() {
+  local -r success_dir="$TEST_TMP_DIR/unix-endpoint-invalidation"
+  local -r failure_dir="$TEST_TMP_DIR/unix-endpoint-invalidation-failure"
+  local -r success_marker="$success_dir/restart"
+  local -r failure_marker="$failure_dir/restart"
+  local control_status=0
+
+  run_unix_endpoint_probe() (
+    local -r result_dir="$1"
+    local -r mutation_marker="$2"
+    local -r invalidation_failure="$3"
+    local -r date_calls="$result_dir/date-calls"
+
+    RESULT_DIR="$result_dir"
+    TRANSPORT=unix
+    SELECTED_TRANSPORT=unix
+    BRIDGE_RUNNING=true
+    COMPOSE=(test-compose)
+    REPEAT_COUNT=1
+    SCENARIO_VARIANT=""
+    ALLOW_UNIX_SECURITY_METRICS=false
+    UNIX_SECURITY_RACE_CONTAINER=""
+    mkdir -p -- "$RESULT_DIR"
+    printf 'current\n' >"$RESULT_DIR/java-transport-configuration.txt"
+    printf 'retained\n' >"$RESULT_DIR/java-selected-transport-configuration.txt"
+    if [[ "$invalidation_failure" == "true" ]]; then
+      rm() { return 29; }
+    fi
+    date() {
+      local call_count=0
+
+      printf 'call\n' >>"$date_calls"
+      call_count="$(wc -l <"$date_calls")"
+      printf 'cursor-%s\n' "$call_count"
+    }
+    capture_java_diagnostics() { return 0; }
+    assert_sanitized_java_diagnostics() { return 0; }
+    assert_security_metric_delta() { return 0; }
+    wait_for_log() { return 0; }
+    run_scenario() { return 0; }
+    run_bounded() {
+      case " $* " in
+        *" ps --all --quiet security-probe "*)
+          printf 'security-probe-container\n'
+          ;;
+        *" docker wait security-probe-container "*)
+          printf '0\n'
+          ;;
+        *" logs --no-color security-probe "*)
+          printf '%s\n' \
+            '{"status":"passed","mode":"abuse-race","attempts":1,"name":"concurrent-repeated-unauthorized","outcome":"bounded"}'
+          ;;
+        *" restart --timeout 10 obi "*)
+          [[ "$BRIDGE_RUNNING" == "false" &&
+            -z "$SELECTED_TRANSPORT" &&
+            ! -e "$RESULT_DIR/java-transport-configuration.txt" &&
+            "$(<"$RESULT_DIR/java-selected-transport-configuration.txt")" == "retained" ]] ||
+            return 31
+          : >"$mutation_marker"
+          return 41
+          ;;
+      esac
+    }
+
+    run_unix_security_control
+  )
+
+  if run_unix_endpoint_probe "$success_dir" "$success_marker" false \
+    >/dev/null 2>&1; then
+    printf 'Unix endpoint control ignored the restart-boundary failure\n' >&2
+    return 1
+  else
+    control_status=$?
+  fi
+  [[ "$control_status" == "41" &&
+    -e "$success_marker" &&
+    ! -e "$success_dir/java-transport-configuration.txt" &&
+    "$(<"$success_dir/java-selected-transport-configuration.txt")" == "retained" ]] || {
+    printf 'Unix endpoint control restarted before transport invalidation\n' >&2
+    return 1
+  }
+
+  if run_unix_endpoint_probe "$failure_dir" "$failure_marker" true \
+    >/dev/null 2>&1; then
+    printf 'Unix endpoint control ignored transport invalidation failure\n' >&2
+    return 1
+  else
+    control_status=$?
+  fi
+  [[ "$control_status" == "29" &&
+    ! -e "$failure_marker" &&
+    "$(<"$failure_dir/java-transport-configuration.txt")" == "current" &&
+    "$(<"$failure_dir/java-selected-transport-configuration.txt")" == "retained" ]] || {
+    printf 'Unix endpoint control mutated the stack after invalidation failed\n' >&2
     return 1
   }
 }
@@ -3010,6 +4043,8 @@ test_java_diagnostics_header_is_exact_and_piggybacked() {
 test_pre_stop_diagnostics_failure_does_not_stop_obi() {
   local -r calls="$TEST_TMP_DIR/pre-stop-diagnostics.calls"
   local -r baseline="$TEST_TMP_DIR/pre-stop-diagnostics.txt"
+  local -r result_dir="$TEST_TMP_DIR/pre-stop-diagnostics-result"
+  local -r invalidation_stop="$result_dir/invalidation-stop"
 
   (
     BRIDGE_RUNNING=true
@@ -3062,10 +4097,15 @@ test_pre_stop_diagnostics_failure_does_not_stop_obi() {
   }
 
   write_diagnostics_fixture "$baseline" 0 0 0 0 0 0
+  mkdir -p -- "$result_dir"
+  printf 'current\n' >"$result_dir/java-transport-configuration.txt"
+  printf 'retained\n' >"$result_dir/java-selected-transport-configuration.txt"
   if (
     local stop_status=0
 
+    RESULT_DIR="$result_dir"
     BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=getsockopt
     COMPOSE=(docker compose)
     flush_bridge_metric_boundary() {
       return 0
@@ -3083,15 +4123,61 @@ test_pre_stop_diagnostics_failure_does_not_stop_obi() {
     else
       stop_status=$?
     fi
-    [[ "$stop_status" == "23" && "$BRIDGE_RUNNING" == "true" ]]
+    [[ "$stop_status" == "23" &&
+      "$BRIDGE_RUNNING" == "false" &&
+      -z "$SELECTED_TRANSPORT" &&
+      ! -e "$RESULT_DIR/java-transport-configuration.txt" &&
+      -e "$RESULT_DIR/java-selected-transport-configuration.txt" ]]
   ); then
     :
   else
-    printf 'OBI stop failure was masked or mutated bridge state\n' >&2
+    printf 'OBI stop failure retained stale current-generation bridge state\n' >&2
     return 1
   fi
   grep -Fqx 'evidence:w3c-fault-obi-running' "$calls"
   grep -Fq 'stop:60 docker compose stop --timeout 10 obi' "$calls"
+
+  printf 'current\n' >"$result_dir/java-transport-configuration.txt"
+  if (
+    local stop_status=0
+
+    RESULT_DIR="$result_dir"
+    BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=getsockopt
+    COMPOSE=(docker compose)
+    flush_bridge_metric_boundary() {
+      return 0
+    }
+    capture_phase_evidence() {
+      return 0
+    }
+    rm() {
+      return 29
+    }
+    run_bounded() {
+      : >"$invalidation_stop"
+    }
+
+    if stop_obi_for_no_state_control w3c-fault "$baseline" >/dev/null 2>&1; then
+      return 1
+    else
+      stop_status=$?
+    fi
+    [[ "$stop_status" == "29" &&
+      "$BRIDGE_RUNNING" == "true" &&
+      "$SELECTED_TRANSPORT" == "getsockopt" &&
+      "$(<"$RESULT_DIR/java-transport-configuration.txt")" == "current" &&
+      "$(<"$RESULT_DIR/java-selected-transport-configuration.txt")" == "retained" ]]
+  ); then
+    :
+  else
+    printf 'OBI stop ignored current transport invalidation failure\n' >&2
+    return 1
+  fi
+  [[ ! -e "$invalidation_stop" ]] || {
+    printf 'OBI stop mutated Compose after transport invalidation failed\n' >&2
+    return 1
+  }
 }
 
 test_fault_diagnostics_result_is_single_sanitized_snapshot() {
@@ -4241,63 +5327,63 @@ test_restart_fault_diagnostics_require_overlap() {
 
   write_diagnostics_fixture "$before" 0 0 0 0 0 0
   write_diagnostics_fixture "$after" k 0 0 k 0 k timeout c
-  sed -i 's/t_missing=0/t_missing=2/' "$after"
+  sed -i 's/t_missing=0/t_missing=3/' "$after"
   write_java_diagnostics_delta "$before" "$after" "$delta"
-  assert_restart_fault_diagnostics "$delta" 32 2 "$result"
-  grep -Fqx 'non_workload_takes=2' "$result"
-  grep -Fqx 'observed_take_total=34' "$result"
-  grep -Fqx 'workload_valid_min=18' "$result"
+  assert_restart_fault_diagnostics "$delta" 32 3 "$result"
+  grep -Fqx 'non_workload_takes=3' "$result"
+  grep -Fqx 'observed_take_total=35' "$result"
+  grep -Fqx 'workload_valid_min=17' "$result"
   grep -Fqx 'workload_valid_max=20' "$result"
   grep -Fqx 'workload_fail_open_min=12' "$result"
-  grep -Fqx 'workload_fail_open_max=14' "$result"
+  grep -Fqx 'workload_fail_open_max=15' "$result"
 
   write_diagnostics_fixture "$after" k 0 0 j 0 k timeout c
-  sed -i 's/t_missing=0/t_missing=2/' "$after"
+  sed -i 's/t_missing=0/t_missing=3/' "$after"
   write_java_diagnostics_delta "$before" "$after" "$delta"
-  if assert_restart_fault_diagnostics "$delta" 32 2 "$result" >/dev/null 2>&1; then
+  if assert_restart_fault_diagnostics "$delta" 32 3 "$result" >/dev/null 2>&1; then
     printf 'restart diagnostics accepted sampled totals below valid takes\n' >&2
     return 1
   fi
 
-  write_diagnostics_fixture "$after" k 0 0 k 0 h timeout c
-  sed -i 's/t_missing=0/t_missing=2/' "$after"
+  write_diagnostics_fixture "$after" k 0 0 k 0 g timeout c
+  sed -i 's/t_missing=0/t_missing=3/' "$after"
   write_java_diagnostics_delta "$before" "$after" "$delta"
-  if assert_restart_fault_diagnostics "$delta" 32 2 "$result" >/dev/null 2>&1; then
+  if assert_restart_fault_diagnostics "$delta" 32 3 "$result" >/dev/null 2>&1; then
     printf 'restart diagnostics accepted standard discards below valid workload bounds\n' >&2
     return 1
   fi
 
   write_diagnostics_fixture "$after" k 0 0 k 0 l timeout c
-  sed -i 's/t_missing=0/t_missing=2/' "$after"
+  sed -i 's/t_missing=0/t_missing=3/' "$after"
   write_java_diagnostics_delta "$before" "$after" "$delta"
-  if assert_restart_fault_diagnostics "$delta" 32 2 "$result" >/dev/null 2>&1; then
+  if assert_restart_fault_diagnostics "$delta" 32 3 "$result" >/dev/null 2>&1; then
     printf 'restart diagnostics accepted standard discards above valid workload bounds\n' >&2
     return 1
   fi
 
   write_diagnostics_fixture "$after" k 0 0 k 0 i timeout c
-  sed -i 's/t_already_consumed=0/t_already_consumed=2/' "$after"
+  sed -i 's/t_already_consumed=0/t_already_consumed=3/' "$after"
   write_java_diagnostics_delta "$before" "$after" "$delta"
-  assert_restart_fault_diagnostics "$delta" 32 2 "$result" || {
+  assert_restart_fault_diagnostics "$delta" 32 3 "$result" || {
     printf 'restart diagnostics rejected an already-consumed self lookup\n' >&2
     return 1
   }
-  grep -Fqx 'observed_take_total=34' "$result"
-  grep -Fqx 'workload_valid_min=18' "$result"
+  grep -Fqx 'observed_take_total=35' "$result"
+  grep -Fqx 'workload_valid_min=17' "$result"
   grep -Fqx 'workload_valid_max=20' "$result"
   grep -Fqx 'workload_fail_open_min=12' "$result"
-  grep -Fqx 'workload_fail_open_max=14' "$result"
+  grep -Fqx 'workload_fail_open_max=15' "$result"
 
   sed -i 's/t_missing=0/t_missing=1/' "$after"
   write_java_diagnostics_delta "$before" "$after" "$delta"
-  if assert_restart_fault_diagnostics "$delta" 32 2 "$result" >/dev/null 2>&1; then
+  if assert_restart_fault_diagnostics "$delta" 32 3 "$result" >/dev/null 2>&1; then
     printf 'restart diagnostics accepted an additional take result\n' >&2
     return 1
   fi
 
-  write_diagnostics_fixture "$after" k 0 0 k 0 k timeout e
+  write_diagnostics_fixture "$after" k 0 0 k 0 k timeout f
   write_java_diagnostics_delta "$before" "$after" "$delta"
-  if assert_restart_fault_diagnostics "$delta" 32 2 "$result" >/dev/null 2>&1; then
+  if assert_restart_fault_diagnostics "$delta" 32 3 "$result" >/dev/null 2>&1; then
     printf 'restart diagnostics accepted a run without a diagnostics-eligible result\n' >&2
     return 1
   fi
@@ -4306,22 +5392,22 @@ test_restart_fault_diagnostics_require_overlap() {
   sed -i 's/t_missing=0/t_missing=1/' "$after"
   write_java_diagnostics_delta "$before" "$after" "$delta"
   sed -i '/^t_valid /p' "$delta"
-  if assert_restart_fault_diagnostics "$delta" 32 2 "$result" >/dev/null 2>&1; then
+  if assert_restart_fault_diagnostics "$delta" 32 3 "$result" >/dev/null 2>&1; then
     printf 'restart diagnostics accepted duplicate rows that forged the take total\n' >&2
     return 1
   fi
 
   write_diagnostics_fixture "$after" 1 0 0 1 0 0 missing x
   write_java_diagnostics_delta "$before" "$after" "$delta"
-  if assert_restart_fault_diagnostics "$delta" 32 2 "$result" >/dev/null 2>&1; then
+  if assert_restart_fault_diagnostics "$delta" 32 3 "$result" >/dev/null 2>&1; then
     printf 'restart diagnostics accepted an attribution-ambiguous single valid result\n' >&2
     return 1
   fi
 
   write_diagnostics_fixture "$after" w 0 0 w 0 w
-  sed -i 's/t_missing=0/t_missing=2/' "$after"
+  sed -i 's/t_missing=0/t_missing=3/' "$after"
   write_java_diagnostics_delta "$before" "$after" "$delta"
-  if assert_restart_fault_diagnostics "$delta" 32 2 "$result" >/dev/null 2>&1; then
+  if assert_restart_fault_diagnostics "$delta" 32 3 "$result" >/dev/null 2>&1; then
     printf 'restart diagnostics accepted a run without an observed bridge fault\n' >&2
     return 1
   fi
@@ -4661,6 +5747,8 @@ test_extension_disabled_runtime_requires_explicit_false() {
 
   mkdir -p -- "$result_dir"
   (
+    local obi_status=0
+
     RESULT_DIR="$result_dir"
     COMPOSE=(test-compose)
     run_bounded() {
@@ -4672,7 +5760,7 @@ test_extension_disabled_runtime_requires_explicit_false() {
           printf '%s\n' "$runtime_environment"
           ;;
         *"test-compose ps --quiet obi")
-          return 0
+          return "$obi_status"
           ;;
         *)
           return 1
@@ -4700,6 +5788,12 @@ test_extension_disabled_runtime_requires_explicit_false() {
       printf 'extension-disabled contract rejected the exact false setting\n' >&2
       return 1
     }
+
+    obi_status=42
+    if assert_runtime_contract extension-disabled; then
+      printf 'extension-disabled contract treated failed OBI enumeration as absence\n' >&2
+      return 1
+    fi
   )
 }
 
@@ -4782,6 +5876,115 @@ test_helper_attach_runtime_requires_exact_dynamic_disable() {
   )
 }
 
+test_start_stack_invalidates_project_evidence_before_compose_up() {
+  local -r results_root="$TEST_TMP_DIR/start-stack-invalidation"
+  local -r result_dir="$results_root/current"
+  local -r prior_result="$results_root/prior"
+  local -r foreign_result="$results_root/foreign"
+  local -r observed="$results_root/observed"
+  local -r failure_root="$TEST_TMP_DIR/start-stack-invalidation-failure"
+  local -r failure_result="$failure_root/current"
+  local -r failure_observed="$failure_root/observed"
+  local start_status=0
+
+  mkdir -p -- "$result_dir" "$prior_result" "$foreign_result"
+  printf 'compose_project=obi-apache-java-https-test\n' \
+    >"$result_dir/environment.txt"
+  printf 'compose_project=obi-apache-java-https-test\n' \
+    >"$prior_result/environment.txt"
+  printf 'compose_project=another-project\n' \
+    >"$foreign_result/environment.txt"
+  for result in "$result_dir" "$prior_result" "$foreign_result"; do
+    printf 'current\n' >"$result/java-transport-configuration.txt"
+    printf 'retained\n' >"$result/java-selected-transport-configuration.txt"
+  done
+
+  if (
+    RESULTS_ROOT="$results_root"
+    RESULT_DIR="$result_dir"
+    PROJECT_NAME="obi-apache-java-https-test"
+    SCENARIO=basic
+    TRANSPORT=getsockopt
+    SELECTED_TRANSPORT=unix
+    STACK_STARTED=false
+    BRIDGE_RUNNING=false
+    COMMAND_TIMEOUT_SECONDS=5
+    COMPOSE=(test-compose)
+    verify_compose_project_ownership() { return 0; }
+    run_bounded() { return 0; }
+    date() {
+      printf 'cursor\n' >>"$observed"
+      printf 'startup-cursor\n'
+    }
+    run_logged_bounded() {
+      [[ -z "$SELECTED_TRANSPORT" &&
+        ! -e "$result_dir/java-transport-configuration.txt" &&
+        ! -e "$prior_result/java-transport-configuration.txt" &&
+        "$(<"$result_dir/java-selected-transport-configuration.txt")" == "retained" &&
+        "$(<"$prior_result/java-selected-transport-configuration.txt")" == "retained" &&
+        "$(<"$foreign_result/java-transport-configuration.txt")" == "current" &&
+        "$(<"$foreign_result/java-selected-transport-configuration.txt")" == "retained" ]] ||
+        return 31
+      printf 'compose-up\n' >>"$observed"
+      return 41
+    }
+
+    start_stack
+  ) >/dev/null 2>&1; then
+    printf 'startup ignored the injected Compose-up boundary failure\n' >&2
+    return 1
+  else
+    start_status=$?
+  fi
+  [[ "$start_status" == "41" &&
+    "$(<"$observed")" == $'cursor\ncompose-up' ]] || {
+    printf 'startup did not invalidate project evidence before Compose up\n' >&2
+    return 1
+  }
+
+  mkdir -p -- "$failure_result"
+  printf 'compose_project=obi-apache-java-https-test\n' \
+    >"$failure_result/environment.txt"
+  printf 'current\n' >"$failure_result/java-transport-configuration.txt"
+  printf 'retained\n' >"$failure_result/java-selected-transport-configuration.txt"
+  if (
+    RESULTS_ROOT="$failure_root"
+    RESULT_DIR="$failure_result"
+    PROJECT_NAME="obi-apache-java-https-test"
+    SCENARIO=basic
+    TRANSPORT=getsockopt
+    SELECTED_TRANSPORT=unix
+    STACK_STARTED=false
+    BRIDGE_RUNNING=false
+    COMMAND_TIMEOUT_SECONDS=5
+    COMPOSE=(test-compose)
+    verify_compose_project_ownership() { return 0; }
+    run_bounded() { return 0; }
+    rm() { return 29; }
+    date() {
+      printf 'cursor\n' >>"$failure_observed"
+      printf 'startup-cursor\n'
+    }
+    run_logged_bounded() {
+      printf 'compose-up\n' >>"$failure_observed"
+    }
+
+    start_stack
+  ) >/dev/null 2>&1; then
+    printf 'startup ignored project evidence invalidation failure\n' >&2
+    return 1
+  else
+    start_status=$?
+  fi
+  [[ "$start_status" == "29" &&
+    ! -e "$failure_observed" &&
+    "$(<"$failure_result/java-transport-configuration.txt")" == "current" &&
+    "$(<"$failure_result/java-selected-transport-configuration.txt")" == "retained" ]] || {
+    printf 'startup mutated the stack after evidence invalidation failed\n' >&2
+    return 1
+  }
+}
+
 test_instrumented_readiness_precedes_https_traffic() {
   local -r result_dir="$TEST_TMP_DIR/readiness-order"
   local -r observed="$result_dir/observed"
@@ -4803,12 +6006,18 @@ test_instrumented_readiness_precedes_https_traffic() {
       return 0
     }
     run_logged_bounded() {
+      printf 'compose:up\n' >>"$observed"
       return 0
+    }
+    date() {
+      printf 'cursor:startup\n' >>"$observed"
+      printf 'startup-cursor\n'
     }
     wait_for_http() {
       printf 'http:%s\n' "$2" >>"$observed"
     }
     wait_for_log() {
+      [[ "${4:-}" == "startup-cursor" ]] || return 1
       printf 'log:%s\n' "$3" >>"$observed"
     }
     assert_selected_transport() {
@@ -4820,6 +6029,9 @@ test_instrumented_readiness_precedes_https_traffic() {
     wait_for_apache_instrumentation() {
       printf 'apache:%s\n' "$1" >>"$observed"
     }
+    assert_apache_denies_java_diagnostics() {
+      printf 'diagnostic-denials\n' >>"$observed"
+    }
 
     start_stack
   ) || {
@@ -4828,24 +6040,64 @@ test_instrumented_readiness_precedes_https_traffic() {
   }
 
   printf '%s\n' \
+    'cursor:startup' \
+    'compose:up' \
     'http:trace receiver' \
     'log:OBI remote-parent bridge' \
     'log:injected Java helper' \
     'log:external OTel extension' \
+    'log:Jetty HTTPS backend' \
     'transport' \
     'log:injected Java instrumentation' \
     'apache:startup' \
     'http:verified Apache-to-Jetty HTTPS path' \
+    'diagnostic-denials' \
     'runtime' >"$expected"
   cmp -s -- "$expected" "$observed" || {
     printf 'instrumented HTTPS traffic ran before bridge readiness\n' >&2
     diff -u -- "$expected" "$observed" >&2 || true
     return 1
   }
+
+  local denial_status=0
+  if (
+    RESULT_DIR="$result_dir"
+    SCENARIO=basic
+    TRANSPORT=getsockopt
+    COMMAND_TIMEOUT_SECONDS=5
+    STACK_STARTED=false
+    BRIDGE_RUNNING=false
+    COMPOSE=(test-compose)
+    verify_compose_project_ownership() { return 0; }
+    run_bounded() { return 0; }
+    run_logged_bounded() { return 0; }
+    date() { printf 'startup-cursor\n'; }
+    wait_for_http() { return 0; }
+    wait_for_log() { return 0; }
+    assert_selected_transport() { return 0; }
+    wait_for_apache_instrumentation() { return 0; }
+    assert_apache_denies_java_diagnostics() { return 37; }
+    assert_runtime_contract() {
+      : >"$result_dir/runtime-after-denial-failure"
+    }
+
+    start_stack
+  ) >/dev/null 2>&1; then
+    printf 'startup ignored Apache diagnostic denial failure\n' >&2
+    return 1
+  else
+    denial_status=$?
+  fi
+  [[ "$denial_status" == "37" &&
+    ! -e "$result_dir/runtime-after-denial-failure" ]] || {
+    printf 'startup mutated runtime evidence after diagnostic denial failure\n' >&2
+    return 1
+  }
 }
 
 test_apache_readiness_requires_the_full_pool() {
   local -r result_dir="$TEST_TMP_DIR/apache-readiness"
+  local publication_status=0
 
   mkdir -p -- "$result_dir"
   (
@@ -4897,6 +6149,34 @@ test_apache_readiness_requires_the_full_pool() {
     printf 'Apache readiness accepted an undersized process pool\n' >&2
     return 1
   fi
+
+  if (
+    RESULT_DIR="$result_dir"
+    READINESS_TIMEOUT_SECONDS=3
+    SECONDS=0
+    apache_process_count() {
+      printf '%d\n' "$APACHE_EXPECTED_PROCESS_COUNT"
+    }
+    fetch_obi_metrics() {
+      printf 'obi_instrumented_processes{process_name="httpd"} 9\n' >"$1"
+    }
+    sleep() {
+      SECONDS="$((SECONDS + 1))"
+    }
+    install() { return 29; }
+
+    wait_for_apache_instrumentation publication
+  ) >/dev/null 2>&1; then
+    printf 'Apache readiness ignored evidence publication failure\n' >&2
+    return 1
+  else
+    publication_status=$?
+  fi
+  [[ "$publication_status" == "29" ]] || {
+    printf 'Apache readiness publication returned %s instead of 29\n' \
+      "$publication_status" >&2
+    return 1
+  }
 }
 
 test_apache_instrumented_process_metric_is_exact() {
@@ -4972,6 +6252,7 @@ test_apache_readiness_uses_elapsed_deadline() {
 
 test_apache_instrumentation_drain_is_a_generation_boundary() {
   local -r result_dir="$TEST_TMP_DIR/apache-instrumentation-drain"
+  local publication_status=0
 
   mkdir -p -- "$result_dir"
   (
@@ -5018,6 +6299,31 @@ test_apache_instrumentation_drain_is_a_generation_boundary() {
     printf 'Apache instrumentation drain accepted a stale old generation\n' >&2
     return 1
   fi
+
+  if (
+    RESULT_DIR="$result_dir"
+    READINESS_TIMEOUT_SECONDS=3
+    SECONDS=0
+    fetch_obi_metrics() {
+      printf 'obi_instrumented_processes{process_name="httpd"} 0\n' >"$1"
+    }
+    sleep() {
+      SECONDS="$((SECONDS + 1))"
+    }
+    install() { return 29; }
+
+    wait_for_apache_instrumentation_drain publication
+  ) >/dev/null 2>&1; then
+    printf 'Apache drain ignored evidence publication failure\n' >&2
+    return 1
+  else
+    publication_status=$?
+  fi
+  [[ "$publication_status" == "29" ]] || {
+    printf 'Apache drain publication returned %s instead of 29\n' \
+      "$publication_status" >&2
+    return 1
+  }
 }
 
 test_apache_process_count_uses_docker_compatible_columns() {
@@ -5128,14 +6434,24 @@ test_https_health_probes_close_the_backend_connection() {
 test_recreated_stack_readiness_uses_log_cursor() {
   local -r observed="$TEST_TMP_DIR/recreate-readiness.observed"
   local -r expected="$TEST_TMP_DIR/recreate-readiness.expected"
+  local -r result_dir="$TEST_TMP_DIR/recreate-readiness-result"
 
+  mkdir -p -- "$result_dir"
+  printf 'current\n' >"$result_dir/java-transport-configuration.txt"
+  printf 'retained\n' >"$result_dir/java-selected-transport-configuration.txt"
   (
+    RESULT_DIR="$result_dir"
     COMPOSE=(test-compose)
-    BRIDGE_RUNNING=false
+    BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=unix
     date() {
       printf 'recreate-cursor\n'
     }
     run_bounded() {
+      [[ "$BRIDGE_RUNNING" == "false" &&
+        -z "$SELECTED_TRANSPORT" &&
+        ! -e "$RESULT_DIR/java-transport-configuration.txt" &&
+        -e "$RESULT_DIR/java-selected-transport-configuration.txt" ]] || return 31
       printf 'compose:%s\n' "$*" >>"$observed"
     }
     wait_for_log() {
@@ -5159,6 +6475,11 @@ test_recreated_stack_readiness_uses_log_cursor() {
     printf 'recreated stack readiness-order probe failed\n' >&2
     return 1
   }
+  [[ ! -e "$result_dir/java-transport-configuration.txt" &&
+    "$(<"$result_dir/java-selected-transport-configuration.txt")" == "retained" ]] || {
+    printf 'recreated stack retained stale current-generation selection evidence\n' >&2
+    return 1
+  }
 
   printf '%s\n' \
     'compose:180 test-compose up --detach --force-recreate java-backend apache-proxy obi' \
@@ -5166,6 +6487,7 @@ test_recreated_stack_readiness_uses_log_cursor() {
     'log:restoration injected Java helper:recreate-cursor' \
     'log:restoration external OTel extension:recreate-cursor' \
     'log:restoration injected Java instrumentation:recreate-cursor' \
+    'log:restoration Jetty HTTPS backend:recreate-cursor' \
     'transport:unix:unix' \
     'apache:recreate-instrumented' \
     'http:restoration HTTPS path' \
@@ -5181,15 +6503,26 @@ test_disabled_control_waits_for_instrumentation() {
   local -r result_dir="$TEST_TMP_DIR/disabled-readiness"
   local -r observed="$result_dir/observed"
   local -r expected="$result_dir/expected"
+  local -r failure_marker="$result_dir/failure-mutation"
+  local control_status=0
 
   mkdir -p -- "$result_dir"
+  printf 'current\n' >"$result_dir/java-transport-configuration.txt"
+  printf 'retained\n' >"$result_dir/java-selected-transport-configuration.txt"
   (
     RESULT_DIR="$result_dir"
     COMPOSE=(test-compose)
+    BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=getsockopt
     date() {
       printf 'disabled-cursor\n'
     }
     run_bounded() {
+      [[ "$BRIDGE_RUNNING" == "false" &&
+        -z "$SELECTED_TRANSPORT" &&
+        ! -e "$RESULT_DIR/java-transport-configuration.txt" &&
+        "$(<"$RESULT_DIR/java-selected-transport-configuration.txt")" == "retained" ]] ||
+        return 31
       printf 'compose:%s\n' "$*" >>"$observed"
     }
     wait_for_log() {
@@ -5213,6 +6546,11 @@ test_disabled_control_waits_for_instrumentation() {
     printf 'disabled-control readiness-order probe failed\n' >&2
     return 1
   }
+  [[ ! -e "$result_dir/java-transport-configuration.txt" &&
+    "$(<"$result_dir/java-selected-transport-configuration.txt")" == "retained" ]] || {
+    printf 'disabled control retained stale current transport evidence\n' >&2
+    return 1
+  }
 
   printf '%s\n' \
     'compose:30 test-compose config' \
@@ -5226,6 +6564,245 @@ test_disabled_control_waits_for_instrumentation() {
   cmp -s -- "$expected" "$observed" || {
     printf 'disabled control used stale instrumentation readiness\n' >&2
     diff -u -- "$expected" "$observed" >&2 || true
+    return 1
+  }
+
+  printf 'current\n' >"$result_dir/java-transport-configuration.txt"
+  if (
+    RESULT_DIR="$result_dir"
+    COMPOSE=(test-compose)
+    BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=getsockopt
+    rm() { return 29; }
+    run_bounded() {
+      : >"$failure_marker"
+    }
+
+    run_disabled_control
+  ) >/dev/null 2>&1; then
+    printf 'disabled control ignored transport invalidation failure\n' >&2
+    return 1
+  else
+    control_status=$?
+  fi
+  [[ "$control_status" == "29" &&
+    ! -e "$failure_marker" &&
+    "$(<"$result_dir/java-transport-configuration.txt")" == "current" &&
+    "$(<"$result_dir/java-selected-transport-configuration.txt")" == "retained" ]] || {
+    printf 'disabled control mutated the stack after invalidation failed\n' >&2
+    return 1
+  }
+}
+
+test_uninstrumented_control_invalidates_before_stack_mutation() {
+  local -r result_dir="$TEST_TMP_DIR/uninstrumented-invalidation"
+  local -r mutation_marker="$result_dir/mutation"
+  local -r failure_marker="$result_dir/failure-mutation"
+  local control_status=0
+
+  mkdir -p -- "$result_dir"
+  printf 'current\n' >"$result_dir/java-transport-configuration.txt"
+  printf 'retained\n' >"$result_dir/java-selected-transport-configuration.txt"
+  if (
+    RESULT_DIR="$result_dir"
+    COMPOSE=(test-compose)
+    BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=getsockopt
+    capture_control_response() { return 0; }
+    run_bounded() {
+      [[ "$BRIDGE_RUNNING" == "false" &&
+        -z "$SELECTED_TRANSPORT" &&
+        ! -e "$RESULT_DIR/java-transport-configuration.txt" &&
+        "$(<"$RESULT_DIR/java-selected-transport-configuration.txt")" == "retained" ]] ||
+        return 31
+      : >"$mutation_marker"
+      return 41
+    }
+
+    run_uninstrumented_control
+  ) >/dev/null 2>&1; then
+    printf 'uninstrumented control ignored the mutation-boundary failure\n' >&2
+    return 1
+  else
+    control_status=$?
+  fi
+  [[ "$control_status" == "41" &&
+    -e "$mutation_marker" &&
+    ! -e "$result_dir/java-transport-configuration.txt" &&
+    "$(<"$result_dir/java-selected-transport-configuration.txt")" == "retained" ]] || {
+    printf 'uninstrumented control did not invalidate before stopping OBI\n' >&2
+    return 1
+  }
+
+  printf 'current\n' >"$result_dir/java-transport-configuration.txt"
+  if (
+    RESULT_DIR="$result_dir"
+    COMPOSE=(test-compose)
+    BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=getsockopt
+    capture_control_response() { return 0; }
+    rm() { return 29; }
+    run_bounded() {
+      : >"$failure_marker"
+    }
+
+    run_uninstrumented_control
+  ) >/dev/null 2>&1; then
+    printf 'uninstrumented control ignored transport invalidation failure\n' >&2
+    return 1
+  else
+    control_status=$?
+  fi
+  [[ "$control_status" == "29" &&
+    ! -e "$failure_marker" &&
+    "$(<"$result_dir/java-transport-configuration.txt")" == "current" &&
+    "$(<"$result_dir/java-selected-transport-configuration.txt")" == "retained" ]] || {
+    printf 'uninstrumented control mutated the stack after invalidation failed\n' >&2
+    return 1
+  }
+}
+
+test_standalone_restart_invalidates_before_stack_mutation() {
+  local -r result_dir="$TEST_TMP_DIR/restart-invalidation"
+  local -r mutation_marker="$result_dir/mutation"
+  local -r failure_marker="$result_dir/failure-mutation"
+  local -r cursor_failure_marker="$result_dir/cursor-failure-mutation"
+  local -r readiness_observed="$result_dir/readiness-failure"
+  local restart_status=0
+
+  mkdir -p -- "$result_dir"
+  printf 'current\n' >"$result_dir/java-transport-configuration.txt"
+  printf 'retained\n' >"$result_dir/java-selected-transport-configuration.txt"
+  if (
+    RESULT_DIR="$result_dir"
+    SCENARIO=restart
+    COMPOSE=(test-compose)
+    BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=getsockopt
+    date() { printf 'restart-cursor\n'; }
+    run_bounded() {
+      [[ "$BRIDGE_RUNNING" == "false" &&
+        -z "$SELECTED_TRANSPORT" &&
+        ! -e "$RESULT_DIR/java-transport-configuration.txt" &&
+        "$(<"$RESULT_DIR/java-selected-transport-configuration.txt")" == "retained" ]] ||
+        return 31
+      : >"$mutation_marker"
+      return 41
+    }
+
+    execute_requested_scenarios
+  ) >/dev/null 2>&1; then
+    printf 'standalone restart ignored the mutation-boundary failure\n' >&2
+    return 1
+  else
+    restart_status=$?
+  fi
+  [[ "$restart_status" == "41" &&
+    -e "$mutation_marker" &&
+    ! -e "$result_dir/java-transport-configuration.txt" &&
+    "$(<"$result_dir/java-selected-transport-configuration.txt")" == "retained" ]] || {
+    printf 'standalone restart did not invalidate before restarting OBI\n' >&2
+    return 1
+  }
+
+  printf 'current\n' >"$result_dir/java-transport-configuration.txt"
+  if (
+    RESULT_DIR="$result_dir"
+    SCENARIO=restart
+    COMPOSE=(test-compose)
+    BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=getsockopt
+    date() { printf 'restart-cursor\n'; }
+    rm() { return 29; }
+    run_bounded() {
+      : >"$failure_marker"
+    }
+
+    execute_requested_scenarios
+  ) >/dev/null 2>&1; then
+    printf 'standalone restart ignored transport invalidation failure\n' >&2
+    return 1
+  else
+    restart_status=$?
+  fi
+  [[ "$restart_status" == "29" &&
+    ! -e "$failure_marker" &&
+    "$(<"$result_dir/java-transport-configuration.txt")" == "current" &&
+    "$(<"$result_dir/java-selected-transport-configuration.txt")" == "retained" ]] || {
+    printf 'standalone restart mutated the stack after invalidation failed\n' >&2
+    return 1
+  }
+
+  if (
+    RESULT_DIR="$result_dir"
+    SCENARIO=restart
+    COMPOSE=(test-compose)
+    BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=getsockopt
+    date() { return 42; }
+    invalidate_selected_transport() {
+      : >"$cursor_failure_marker"
+    }
+    run_bounded() {
+      : >"$cursor_failure_marker"
+    }
+
+    execute_requested_scenarios
+  ) >/dev/null 2>&1; then
+    printf 'standalone restart ignored log-cursor failure\n' >&2
+    return 1
+  else
+    restart_status=$?
+  fi
+  [[ "$restart_status" == "42" && ! -e "$cursor_failure_marker" ]] || {
+    printf 'standalone restart mutated state after log-cursor failure\n' >&2
+    return 1
+  }
+
+  printf 'current\n' >"$result_dir/java-transport-configuration.txt"
+  if (
+    RESULT_DIR="$result_dir"
+    SCENARIO=restart
+    COMPOSE=(test-compose)
+    BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=getsockopt
+    date() { printf 'restart-cursor\n'; }
+    run_bounded() {
+      printf 'restart\n' >>"$readiness_observed"
+    }
+    wait_for_log() {
+      printf 'wait\n' >>"$readiness_observed"
+      return 43
+    }
+    wait_for_apache_instrumentation() {
+      printf 'continued-apache\n' >>"$readiness_observed"
+    }
+    wait_for_http() {
+      printf 'continued-http\n' >>"$readiness_observed"
+    }
+    sleep() {
+      printf 'continued-sleep\n' >>"$readiness_observed"
+    }
+    wait_for_java_duplicate_suppression() {
+      printf 'continued-suppression\n' >>"$readiness_observed"
+    }
+    assert_selected_transport() {
+      printf 'continued-transport\n' >>"$readiness_observed"
+    }
+    run_scenario() {
+      printf 'continued-scenario\n' >>"$readiness_observed"
+    }
+
+    execute_requested_scenarios
+  ) >/dev/null 2>&1; then
+    printf 'standalone restart ignored post-restart readiness failure\n' >&2
+    return 1
+  else
+    restart_status=$?
+  fi
+  [[ "$restart_status" == "43" &&
+    "$(<"$readiness_observed")" == $'restart\nwait' ]] || {
+    printf 'standalone restart continued after readiness failure\n' >&2
     return 1
   }
 }
@@ -5390,6 +6967,78 @@ test_control_response_normalizes_connection_diagnostics() {
   grep -Fq '"tls_protocol":"TLSv1.3"' "$instrumented_normalized"
 }
 
+test_required_read_failures_do_not_publish_evidence() {
+  local -r response_dir="$TEST_TMP_DIR/control-response-read-failure"
+  local -r identity_dir="$TEST_TMP_DIR/runtime-identity-read-failure"
+  local -r normalize_marker="$response_dir/normalized"
+  local -r inspect_marker="$identity_dir/inspected"
+  local read_status=0
+
+  mkdir -p -- "$response_dir" "$identity_dir"
+  if (
+    RESULT_DIR="$response_dir"
+    curl() {
+      local output=""
+
+      while (($# > 0)); do
+        if [[ "$1" == "--output" ]]; then
+          output="$2"
+          shift 2
+          continue
+        fi
+        shift
+      done
+      printf '{"marker":"instrumentation-control"}\n' >"$output"
+      printf '200\n'
+      return 23
+    }
+    normalize_control_response() {
+      : >"$normalize_marker"
+    }
+
+    capture_control_response read-failure
+  ) >/dev/null 2>&1; then
+    printf 'control response ignored a failed partial HTTP read\n' >&2
+    return 1
+  else
+    read_status=$?
+  fi
+  [[ "$read_status" == "23" && ! -e "$normalize_marker" ]] || {
+    printf 'control response published evidence after a failed read\n' >&2
+    return 1
+  }
+
+  if (
+    COMPOSE=(test-compose)
+    run_bounded() {
+      case " $* " in
+        *" ps --quiet java-backend "*)
+          printf 'java-container\n'
+          return 23
+          ;;
+        *" docker inspect "*)
+          : >"$inspect_marker"
+          printf 'java-container 101 2026-07-27T00:00:00Z\n'
+          ;;
+      esac
+    }
+
+    capture_service_runtime_identity \
+      java-backend "$identity_dir/identity.txt"
+  ) >/dev/null 2>&1; then
+    printf 'runtime identity ignored a failed container lookup\n' >&2
+    return 1
+  else
+    read_status=$?
+  fi
+  [[ "$read_status" == "23" &&
+    ! -e "$inspect_marker" &&
+    ! -e "$identity_dir/identity.txt" ]] || {
+    printf 'runtime identity published evidence after a failed lookup\n' >&2
+    return 1
+  }
+}
+
 test_helper_attach_failure_control_restores_and_preserves_status() {
   run_case() (
     local -r mode="$1"
@@ -5411,6 +7060,7 @@ test_helper_attach_failure_control_restores_and_preserves_status() {
     TLS_PROTOCOL=TLSv1.3
     JAVA_TOOL_OPTIONS_VALUE="-javaagent:/otel/official-javaagent.jar"
     mkdir -p -- "$RESULT_DIR" "$CERT_DIR"
+    printf 'stale-selection\n' >"$RESULT_DIR/java-transport-configuration.txt"
     : >"$observed"
 
     log_info() {
@@ -5494,6 +7144,9 @@ test_helper_attach_failure_control_restores_and_preserves_status() {
         "$1" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "$SCENARIO_VARIANT" \
         >>"$observed"
       if [[ "$SCENARIO_VARIANT" == "helper-unavailable" ]]; then
+        [[ -z "$SELECTED_TRANSPORT" &&
+          ! -e "$RESULT_DIR/java-transport-configuration.txt" ]] || return 31
+        printf 'fault-selection:absent\n' >>"$observed"
         ((fault_probe_calls += 1))
       fi
       if [[ "$mode" == "failure" && "$fault_probe_calls" == "2" ]]; then
@@ -5560,8 +7213,14 @@ test_helper_attach_failure_control_restores_and_preserves_status() {
       printf 'helper attach control did not retain the fault logs\n' >&2
       return 1
     }
+    [[ "$(grep -c '^fault-selection:absent$' "$observed")" == "2" ]] || {
+      printf 'helper attach control retained stale transport selection evidence\n' >&2
+      return 1
+    }
 
     if [[ "$mode" == "success" ]]; then
+      [[ "$(grep -c '^transport:' "$observed")" == "1" ]]
+      grep -Fqx 'transport:getsockopt' "$observed"
       grep -Fqx 'disabled:helper-attach-bridge-disabled:12' "$observed"
       grep -Fq \
         "bounded:options=$HELPER_ATTACH_FAILURE_JAVA_TOOL_OPTIONS:30 test-compose config" \
@@ -5588,6 +7247,10 @@ test_helper_attach_failure_control_restores_and_preserves_status() {
         return 1
       fi
     else
+      if grep -q '^transport:' "$observed"; then
+        printf 'helper-unavailable phase required a Java-selected transport\n' >&2
+        return 1
+      fi
       [[ "$(grep -c ':helper-unavailable:helper-unavailable$' "$observed")" == "2" ]]
       grep -Fqx \
         'recreate:tcp:helper attach failure cleanup:getsockopt' \
@@ -5656,21 +7319,77 @@ test_restart_readiness_uses_log_cursor() {
   }
 }
 
+test_failed_log_read_cannot_satisfy_readiness() {
+  if (
+    COMPOSE=(test-compose)
+    READINESS_TIMEOUT_SECONDS=1
+    SECONDS=0
+    run_bounded() {
+      printf 'new bridge ready\n'
+      return 42
+    }
+    sleep() {
+      SECONDS="$((SECONDS + 1))"
+    }
+
+    wait_for_log obi "new bridge ready" restart "restart-cursor"
+  ) >/dev/null 2>&1; then
+    printf 'failed partial log read satisfied readiness\n' >&2
+    return 1
+  fi
+}
+
 test_standalone_restart_waits_for_apache_instrumentation() {
   local -r observed="$TEST_TMP_DIR/restart-readiness.observed"
   local -r expected="$TEST_TMP_DIR/restart-readiness.expected"
+  local -r result_dir="$TEST_TMP_DIR/restart-readiness-result"
+  local -r provider_ready="$result_dir/provider-ready"
+  local -r date_calls="$result_dir/date-calls"
 
+  mkdir -p -- "$result_dir"
+  printf 'current\n' >"$result_dir/java-transport-configuration.txt"
+  printf 'retained\n' >"$result_dir/java-selected-transport-configuration.txt"
   (
+    RESULT_DIR="$result_dir"
     SCENARIO=restart
     COMPOSE=(test-compose)
+    BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=getsockopt
     date() {
-      printf 'restart-cursor\n'
+      local -i call_count=0
+
+      printf 'call\n' >>"$date_calls"
+      call_count="$(wc -l <"$date_calls")"
+      case "$call_count" in
+        1)
+          printf 'cursor:restart\n' >>"$observed"
+          printf 'restart-cursor\n'
+          ;;
+        2)
+          printf 'cursor:provider\n' >>"$observed"
+          printf 'restart-provider-cursor\n'
+          ;;
+        *) return 1 ;;
+      esac
     }
     run_bounded() {
+      [[ "$BRIDGE_RUNNING" == "false" &&
+        -z "$SELECTED_TRANSPORT" &&
+        ! -e "$RESULT_DIR/java-transport-configuration.txt" &&
+        -e "$RESULT_DIR/java-selected-transport-configuration.txt" ]] || return 31
       printf 'compose:%s\n' "$*" >>"$observed"
     }
     wait_for_log() {
+      if [[ "$3" == "restarted Java bridge provider" ]]; then
+        [[ -f "$provider_ready" ]] || return 1
+      fi
       printf 'log:%s:%s\n' "$3" "${4:-}" >>"$observed"
+    }
+    wait_for_http() {
+      printf 'http:%s\n' "$2" >>"$observed"
+    }
+    sleep() {
+      printf 'sleep:%s\n' "$1" >>"$observed"
     }
     assert_selected_transport() {
       printf 'transport\n' >>"$observed"
@@ -5679,6 +7398,7 @@ test_standalone_restart_waits_for_apache_instrumentation() {
       printf 'apache:%s\n' "$1" >>"$observed"
     }
     wait_for_java_duplicate_suppression() {
+      : >"$provider_ready"
       printf 'suppression:%s\n' "$(basename -- "$1")" >>"$observed"
     }
     run_scenario() {
@@ -5690,14 +7410,23 @@ test_standalone_restart_waits_for_apache_instrumentation() {
     printf 'standalone restart readiness-order probe failed\n' >&2
     return 1
   }
+  [[ ! -e "$result_dir/java-transport-configuration.txt" &&
+    "$(<"$result_dir/java-selected-transport-configuration.txt")" == "retained" ]] || {
+    printf 'standalone restart retained stale current-generation selection evidence\n' >&2
+    return 1
+  }
 
   printf '%s\n' \
+    'cursor:restart' \
     'compose:60 test-compose restart --timeout 10 obi' \
     'log:restarted OBI remote-parent bridge:restart-cursor' \
-    'log:restarted Java bridge provider:restart-cursor' \
-    'transport' \
+    'cursor:provider' \
     'apache:restart' \
+    'http:restarted Java provider probe' \
+    "sleep:$JAVA_PROVIDER_RETRY_SETTLE_SECONDS" \
     'suppression:duplicate-suppression-restart.prom' \
+    'log:restarted Java bridge provider:restart-provider-cursor' \
+    'transport' \
     'scenario:restart' >"$expected"
   cmp -s -- "$expected" "$observed" || {
     printf 'standalone restart resumed before Apache instrumentation readiness\n' >&2
@@ -5711,12 +7440,18 @@ test_restart_fault_recovery_waits_for_apache_instrumentation() {
   local -r provider_ready="$TEST_TMP_DIR/restart-success.provider-ready"
   local -r observed="$TEST_TMP_DIR/restart-success.observed"
   local -r result_dir="$TEST_TMP_DIR/restart-success-result"
+  local -r date_calls="$result_dir/date-calls"
 
   cat >"$fake_compose" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 printf 'compose:%s\n' "$*" >>"$RESTART_SUCCESS_OBSERVED"
 case " $* " in
+  *" stop --timeout 5 obi "*)
+    [[ ! -e "$RESTART_SUCCESS_RESULT_DIR/java-transport-configuration.txt" ]]
+    [[ "$(<"$RESTART_SUCCESS_RESULT_DIR/java-selected-transport-configuration.txt")" == "retained" ]]
+    printf 'transport-invalidated\n' >>"$RESTART_SUCCESS_OBSERVED"
+    ;;
   *" scenario --scenario restart-fault "*)
     control="$RESTART_SUCCESS_CONTROL"
     printf 'traffic:before-stop\n' >>"$RESTART_SUCCESS_OBSERVED"
@@ -5736,7 +7471,6 @@ case " $* " in
     done
     cmp -s -- "$control/obi-ready" <(printf 'obi-ready\n')
     printf 'traffic:after-restart\n' >>"$RESTART_SUCCESS_OBSERVED"
-    : >"$RESTART_SUCCESS_PROVIDER_READY"
     printf 'post-restart-traffic-complete\n' >"$control/.post-restart-traffic-complete"
     mv -- \
       "$control/.post-restart-traffic-complete" \
@@ -5751,6 +7485,7 @@ EOF
     export RESTART_SUCCESS_CONTROL="$result_dir/restart-control"
     export RESTART_SUCCESS_OBSERVED="$observed"
     export RESTART_SUCCESS_PROVIDER_READY="$provider_ready"
+    export RESTART_SUCCESS_RESULT_DIR="$result_dir"
     RESULT_DIR="$result_dir"
     COMPOSE=("$fake_compose")
     BRIDGE_RUNNING=true
@@ -5758,23 +7493,42 @@ EOF
     SCENARIO_VARIANT=""
     SCENARIO_SEED=1
     TLS_PROTOCOL=TLSv1.3
+    restart_log_cursor=""
     mkdir -p -- "$RESULT_DIR"
+    printf 'current\n' >"$RESULT_DIR/java-transport-configuration.txt"
+    printf 'retained\n' >"$RESULT_DIR/java-selected-transport-configuration.txt"
     date() {
-      printf 'restart-success-cursor\n'
+      local -i call_count=0
+      local cursor=""
+
+      printf 'call\n' >>"$date_calls"
+      call_count="$(wc -l <"$date_calls")"
+      printf -v cursor 'restart-success-cursor-%d' "$call_count"
+      printf 'cursor:%s\n' "$cursor" >>"$observed"
+      printf '%s\n' "$cursor"
     }
     wait_for_log() {
-      if [[ "$3" == "Java bridge recovered during restart traffic" ]]; then
-        [[ -f "$provider_ready" ]] || return 1
+      if [[ "$3" == "OBI bridge restarted during traffic" ]]; then
+        restart_log_cursor="${4:-}"
       fi
-      printf 'log:%s\n' "$3" >>"$observed"
+      if [[ "$3" == "Java bridge reconfigured before restart traffic resumes" ]]; then
+        [[ -f "$provider_ready" &&
+          -n "$restart_log_cursor" &&
+          "${4:-}" != "$restart_log_cursor" ]] || return 1
+      fi
+      printf 'log:%s:%s\n' "$3" "${4:-}" >>"$observed"
     }
     assert_selected_transport() {
       printf 'transport\n' >>"$observed"
+    }
+    sleep() {
+      printf 'sleep:%s\n' "$1" >>"$observed"
     }
     wait_for_apache_instrumentation() {
       printf 'apache:%s\n' "$1" >>"$observed"
     }
     wait_for_java_duplicate_suppression() {
+      : >"$provider_ready"
       printf 'suppression:%s\n' "$(basename -- "$1")" >>"$observed"
     }
     capture_phase_evidence() {
@@ -5791,6 +7545,10 @@ EOF
       printf 'delta\n' >>"$observed"
     }
     assert_restart_fault_diagnostics() {
+      [[ "$1" == "$RESULT_DIR/phases/restart-fault-after/java-diagnostics.delta" &&
+        "$2" == "32" &&
+        "$3" == "3" &&
+        "$4" == "$RESULT_DIR/restart-fault-diagnostics.txt" ]] || return 1
       printf 'diagnostics-assertion\n' >>"$observed"
     }
     run_scenario() {
@@ -5805,28 +7563,51 @@ EOF
 
   awk '
     $0 == "traffic:before-stop" { before = NR }
+    $0 == "transport-invalidated" { invalidated = NR }
     $0 == "compose:stop --timeout 5 obi" { stopped = NR }
     $0 == "traffic:obi-stopped" { outage = NR }
     $0 == "compose:up --detach obi" { started = NR }
-    $0 == "log:OBI bridge restarted during traffic" { bridge = NR }
+    /^cursor:/ { cursor_line[substr($0, 8)] = NR }
+    /^log:OBI bridge restarted during traffic:/ {
+      bridge = NR
+      restart_cursor = substr($0, length("log:OBI bridge restarted during traffic:") + 1)
+    }
+    $0 ~ /^sleep:[0-9]+$/ { settle = NR }
+    /^log:Java bridge reconfigured before restart traffic resumes:/ {
+      provider = NR
+      provider_cursor = substr($0, length("log:Java bridge reconfigured before restart traffic resumes:") + 1)
+    }
     $0 == "transport" { transport = NR }
     $0 == "apache:restart-fault-recovery" { readiness = NR }
     $0 == "traffic:after-restart" { recovered = NR }
-    $0 == "log:Java bridge recovered during restart traffic" { provider = NR }
     $0 == "capture:restart-fault-after" { capture = NR }
     $0 == "suppression:duplicate-suppression-restart-fault-recovery.prom" {
       suppression = NR
     }
     $0 == "scenario:restart:restart-recovery" { scenario = NR }
     END {
-      exit before > 0 && stopped > before && outage > stopped &&
-        started > outage && bridge > started && transport > bridge &&
-        readiness > transport && suppression > readiness &&
-        recovered > suppression && provider > recovered &&
-        capture > provider && scenario > capture ? 0 : 1
+      exit before > 0 && stopped > before && invalidated > stopped &&
+        outage > invalidated &&
+        cursor_line[restart_cursor] > before &&
+        cursor_line[restart_cursor] < stopped &&
+        started > outage && bridge > started &&
+        settle > bridge && cursor_line[provider_cursor] > settle &&
+        readiness > cursor_line[provider_cursor] && suppression > readiness &&
+        provider > suppression && transport > provider &&
+        recovered > transport && capture > recovered &&
+        scenario > capture ? 0 : 1
     }
   ' "$observed" || {
     printf 'restart-fault recovery lifecycle was not causally ordered\n' >&2
+    return 1
+  }
+  grep -Fqx "sleep:$JAVA_PROVIDER_RETRY_SETTLE_SECONDS" "$observed" || {
+    printf 'restart-fault recovery skipped the Java provider retry interval\n' >&2
+    return 1
+  }
+  [[ ! -e "$result_dir/java-transport-configuration.txt" &&
+    "$(<"$result_dir/java-selected-transport-configuration.txt")" == "retained" ]] || {
+    printf 'restart-fault retained stale current transport evidence\n' >&2
     return 1
   }
   awk '
@@ -5896,6 +7677,7 @@ test_restart_failure_reaps_background_traffic() {
   local -r fake_compose="$TEST_TMP_DIR/restart-failure-compose"
   local -r traffic_pid_file="$TEST_TMP_DIR/restart-traffic.pid"
   local -r traffic_term_file="$TEST_TMP_DIR/restart-traffic.terminated"
+  local -r result_dir="$TEST_TMP_DIR/restart-failure"
   local status=0
   local traffic_pid=""
   local -i elapsed=0
@@ -5922,11 +7704,14 @@ case " $* " in
 esac
 EOF
   chmod 0755 "$fake_compose"
+  mkdir -p -- "$result_dir"
+  printf 'current\n' >"$result_dir/java-transport-configuration.txt"
+  printf 'retained\n' >"$result_dir/java-selected-transport-configuration.txt"
 
   if printf 'must-not-reach-restart-traffic\n' | (
     export RESTART_TRAFFIC_PID_FILE="$traffic_pid_file"
     export RESTART_TRAFFIC_TERM_FILE="$traffic_term_file"
-    RESULT_DIR="$TEST_TMP_DIR/restart-failure"
+    RESULT_DIR="$result_dir"
     export RESTART_FAILURE_CONTROL="$RESULT_DIR/restart-control"
     mkdir -p -- "$RESULT_DIR"
     COMPOSE=("$fake_compose")
@@ -5950,6 +7735,11 @@ EOF
   fi
   [[ "$status" -eq 23 ]] || {
     printf 'restart control returned %d, expected injected status 23\n' "$status" >&2
+    return 1
+  }
+  [[ ! -e "$result_dir/java-transport-configuration.txt" &&
+    "$(<"$result_dir/java-selected-transport-configuration.txt")" == "retained" ]] || {
+    printf 'failed restart retained stale current-generation selection evidence\n' >&2
     return 1
   }
   [[ -s "$traffic_pid_file" ]] || {
@@ -6302,12 +8092,116 @@ test_demo_diagnostics_are_loopback_only() {
   local -r obi_config="$TEST_SCRIPT_DIR/../configs/obi.yaml"
 
   grep -Fqx 'Listen 127.0.0.1:18080' "$apache_config"
-  grep -Fq '<Location "/obi-diagnostics">' "$apache_config"
-  grep -Fq 'Require all denied' "$apache_config"
+  awk '
+    $0 == "<LocationMatch \"^/obi-(diagnostics|transport-configuration)\">" {
+      blocks += 1
+      in_block = 1
+      next
+    }
+    /^<Location/ &&
+    ($0 ~ /obi-diagnostics/ || $0 ~ /obi-transport-configuration/) {
+      unexpected += 1
+      next
+    }
+    in_block && $0 == "    Require all denied" {
+      denials += 1
+      next
+    }
+    in_block && $0 == "</LocationMatch>" {
+      closes += 1
+      in_block = 0
+      next
+    }
+    in_block && $0 !~ /^[[:space:]]*$/ {
+      unexpected += 1
+    }
+    END {
+      exit blocks == 1 && denials == 1 && closes == 1 &&
+        unexpected == 0 && !in_block ? 0 : 1
+    }
+  ' "$apache_config"
   grep -Fq 'address: 127.0.0.1' "$obi_config"
   grep -Fqx '  buffer_sizes:' "$obi_config"
   grep -Fqx '    http: 8192' "$obi_config"
   grep -Fqx '                - X-OBI-Demo-ID' "$obi_config"
+}
+
+test_apache_diagnostic_denial_matrix_is_exact() {
+  local -r observed="$TEST_TMP_DIR/apache-diagnostic-denials"
+  local exposed_path=""
+  local method=""
+  local path=""
+
+  (
+    curl() {
+      local request_method=GET
+      local request_path=""
+      local path_as_is=false
+      local status=403
+
+      while (($# > 0)); do
+        case "$1" in
+          --path-as-is)
+            path_as_is=true
+            shift
+            ;;
+          --head)
+            request_method=HEAD
+            shift
+            ;;
+          --request)
+            request_method="$2"
+            shift 2
+            ;;
+          http://127.0.0.1:18080/*)
+            request_path="${1#http://127.0.0.1:18080}"
+            shift
+            ;;
+          --max-time|--output|--write-out)
+            shift 2
+            ;;
+          *)
+            shift
+            ;;
+        esac
+      done
+      [[ "$path_as_is" == "true" ]] || return 1
+      printf '%s %s\n' "$request_method" "$request_path" >>"$observed"
+      if [[ -n "$exposed_path" && "$request_path" == "$exposed_path" ]]; then
+        status=200
+      fi
+      printf '%d' "$status"
+    }
+
+    assert_apache_denies_java_diagnostics
+    [[ "$(wc -l <"$observed")" == "48" ]] || return 1
+    for path in \
+      /obi-diagnostics \
+      /obi-diagnostics/ \
+      /obi-diagnostics/child \
+      '/obi-diagnostics?probe=1' \
+      '/obi-diagnostics;matrix=1' \
+      /obi-diagnostics%3Bmatrix=1 \
+      /obi-transport-configuration \
+      /obi-transport-configuration/ \
+      /obi-transport-configuration/child \
+      '/obi-transport-configuration?probe=1' \
+      '/obi-transport-configuration;matrix=1' \
+      /obi-transport-configuration%3Bmatrix=1; do
+      for method in GET HEAD OPTIONS POST; do
+        grep -Fqx "$method $path" "$observed" || return 1
+      done
+    done
+
+    : >"$observed"
+    exposed_path='/obi-transport-configuration;matrix=1'
+    if assert_apache_denies_java_diagnostics >/dev/null 2>&1; then
+      return 1
+    fi
+  ) || {
+    printf 'Apache diagnostic denial matrix was incomplete\n' >&2
+    return 1
+  }
 }
 
 test_demo_uses_only_explicit_tcp_context() {
@@ -6321,14 +8215,26 @@ main() {
   TEST_TMP_DIR="$(mktemp -d)"
   test_project_name_validation
   test_compose_cleanup_requires_ownership_sentinel
+  test_successful_cleanup_invalidates_current_transport_before_down
+  test_cleanup_refuses_down_when_transport_invalidation_fails
   test_cleanup_failure_changes_successful_run_status
+  test_run_status_publication_failure_changes_successful_exit
+  test_cleanup_only_invalidates_matching_project_evidence_before_down
+  test_cleanup_only_refuses_untrusted_current_evidence_identity
+  test_cleanup_only_refuses_down_when_project_evidence_invalidation_fails
+  test_cleanup_only_fails_closed_on_project_matcher_error
+  test_main_propagates_cleanup_only_failure
   test_acceptance_requires_fresh_bridge_build
   test_custom_all_request_count_is_non_acceptance
   test_numeric_options_reject_overflow
+  test_transport_configuration_parser_is_exact
+  test_selected_transport_uses_java_diagnostics
+  test_transport_configuration_file_size_boundary_is_exact
   test_control_modes_are_distinct
   test_benchmark_controls_are_bounded
   test_all_suite_includes_every_scenario
   test_unix_all_suite_includes_fault_control
+  test_run_demo_preserves_strict_scenario_execution
   test_helper_attach_failure_dispatch_and_seed_are_exact
   test_w3c_fault_requires_forced_unix
   test_security_accepts_enabled_transports
@@ -6372,6 +8278,8 @@ main() {
   test_primary_security_identity_requires_same_cgroup_and_nonroot_user
   test_unix_security_metrics_require_explicit_race_scope
   test_permissive_unix_directory_control_refuses_and_restores
+  test_permissive_unix_directory_rejects_socket_probe_error
+  test_unix_endpoint_restart_invalidates_before_stack_mutation
   test_java_diagnostics_schema_is_exact
   test_java_diagnostics_delta_is_exact
   test_java_diagnostics_header_is_exact_and_piggybacked
@@ -6403,6 +8311,7 @@ main() {
   test_runtime_environment_line_matching
   test_extension_disabled_runtime_requires_explicit_false
   test_helper_attach_runtime_requires_exact_dynamic_disable
+  test_start_stack_invalidates_project_evidence_before_compose_up
   test_instrumented_readiness_precedes_https_traffic
   test_apache_readiness_requires_the_full_pool
   test_apache_instrumented_process_metric_is_exact
@@ -6414,11 +8323,15 @@ main() {
   test_https_health_probes_close_the_backend_connection
   test_recreated_stack_readiness_uses_log_cursor
   test_disabled_control_waits_for_instrumentation
+  test_uninstrumented_control_invalidates_before_stack_mutation
+  test_standalone_restart_invalidates_before_stack_mutation
   test_extension_disabled_control_uses_configuration_log
   test_late_attach_recycles_only_apache_after_readiness
   test_control_response_normalizes_connection_diagnostics
+  test_required_read_failures_do_not_publish_evidence
   test_helper_attach_failure_control_restores_and_preserves_status
   test_restart_readiness_uses_log_cursor
+  test_failed_log_read_cannot_satisfy_readiness
   test_standalone_restart_waits_for_apache_instrumentation
   test_restart_fault_recovery_waits_for_apache_instrumentation
   test_restart_fault_rejects_traffic_ending_before_first_barrier
@@ -6432,6 +8345,7 @@ main() {
   test_non_acceptance_reasons_are_recorded
   test_release_source_uses_one_version_for_extension
   test_demo_diagnostics_are_loopback_only
+  test_apache_diagnostic_denial_matrix_is_exact
   test_demo_uses_only_explicit_tcp_context
   printf 'demo harness tests passed\n'
 }

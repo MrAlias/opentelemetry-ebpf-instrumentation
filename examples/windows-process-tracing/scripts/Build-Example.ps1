@@ -138,6 +138,7 @@ try {
 
     $obiExecutable = Join-Path $outputDirectory 'obi.exe'
     $targetExecutable = Join-Path $outputDirectory 'obi-windows-target.exe'
+    $httpClientExecutable = Join-Path $outputDirectory 'obi-windows-http-client.exe'
     $sourceDescription = (& git.exe describe --tags --always --dirty).Trim()
     $linkerFlags = @(
         "-X=go.opentelemetry.io/obi/pkg/buildinfo.Version=$ReleaseVersion"
@@ -159,6 +160,17 @@ try {
         ./examples/windows-process-tracing/target
     if ($LASTEXITCODE -ne 0) {
         throw 'deterministic target build failed'
+    }
+
+    & go.exe test ./examples/windows-process-tracing/http-client
+    if ($LASTEXITCODE -ne 0) {
+        throw 'HTTP client unit tests failed'
+    }
+
+    & go.exe build -trimpath -o $httpClientExecutable `
+        ./examples/windows-process-tracing/http-client
+    if ($LASTEXITCODE -ne 0) {
+        throw 'instrumented HTTP client build failed'
     }
 
     $obiBuildInfo = @(& go.exe version -m $obiExecutable)
@@ -336,12 +348,14 @@ Write-Host "OBI version:     $ReleaseVersion"
 Write-Host "OBI revision:    $ReleaseRevision"
 Write-Host "OBI:             $obiExecutable"
 Write-Host "Target:          $targetExecutable"
+Write-Host "HTTP client:     $httpClientExecutable"
 Write-Host "Process program: $processProgram"
 Write-Host "Signature:       $($signature.Status), $($signature.SignerCertificate.Subject)"
 Write-Host "Signer SHA-1:    $($signature.SignerCertificate.Thumbprint)"
 Get-FileHash -Algorithm SHA256 `
     (Join-Path $outputDirectory 'obi.exe'), `
     (Join-Path $outputDirectory 'obi-windows-target.exe'), `
+    (Join-Path $outputDirectory 'obi-windows-http-client.exe'), `
     $bpfObject, `
     $processProgram
 

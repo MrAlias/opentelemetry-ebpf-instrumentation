@@ -274,9 +274,9 @@ try {
     foreach ($project in $kernelProjects) {
         Invoke-Checked `
             -FilePath $msbuild `
-            -ArgumentList @(
+            -ArgumentList (@(
                 (Join-Path $ebpfForWindowsSource $project)
-            ) + $commonMsBuildArguments `
+            ) + $commonMsBuildArguments) `
             -Description "Build eBPF-for-Windows $project"
     }
 
@@ -290,10 +290,10 @@ try {
     foreach ($project in $userProjects) {
         Invoke-Checked `
             -FilePath $msbuild `
-            -ArgumentList @(
+            -ArgumentList (@(
                 (Join-Path $ebpfForWindowsSource $project),
                 '/p:PlatformToolset=v145'
-            ) + $commonMsBuildArguments `
+            ) + $commonMsBuildArguments) `
             -Description "Build eBPF-for-Windows $project"
     }
 

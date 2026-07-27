@@ -51,7 +51,7 @@ exit status 0, and `acceptance_evidence=true`.
 | Bridge/extension disabled and uninstrumented controls | [bridge disabled](scenario-disabled.json), [extension absent](scenario-w3c-only-extension-absent.json), [extension disabled](scenario-w3c-only-extension-disabled.json), [uninstrumented](scenario-uninstrumented.json) |
 | Low-cardinality diagnostics and duplicate suppression | `phases/*/{java-diagnostics,obi-metrics}.delta`, [allowlisted suppression metric](duplicate-suppression.json), and every `scenario-*-status.json` |
 
-The ten retained Unix fault cases cover alternating stale/malformed replies,
+The ten retained Unix fault modes cover alternating stale/malformed replies,
 timeout, disconnect, overload, truncation, bad magic, bad size, version
 mismatch, zero trace ID, and zero span ID. Each case preserves the Java
 classification and a successful standard W3C fallback graph. The Unix server
@@ -125,8 +125,10 @@ does not establish compatibility with any other kernel.
   claim that the exported child preserves the same sampled flag after the
   configured SDK sampler runs.
 - The run covers bounded OBI/JVM absence and restart windows, not permanent
-  process-lifetime absence or genuine PID/TID reuse. It observes the ten fault
-  classifications listed above, not every theoretical diagnostic category.
+  process-lifetime absence or genuine PID/TID reuse. It exercises the ten
+  injected fault modes listed above and observes six distinct Java
+  classifications—`stale`, `malformed`, `transport_error`, `overload`,
+  `timeout`, and `version_mismatch`—not every theoretical diagnostic category.
 - Directory mode/ownership and peer rejection were asserted, but this public
   subset does not retain a live-socket `stat` record proving exact socket mode
   or ownership.

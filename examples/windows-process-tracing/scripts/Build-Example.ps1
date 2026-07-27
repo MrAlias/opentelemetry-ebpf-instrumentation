@@ -323,19 +323,11 @@ if ($signature.Status -eq 'Valid') {
 elseif ($signature.Status -eq 'UnknownError' -and
     $signature.StatusMessage -like '*terminated in a root certificate which is not trusted*' -and
     $signature.SignerCertificate.Subject -like '*WDKTestCert*') {
-    $bootConfiguration = & bcdedit.exe /enum '{current}' 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw 'Failed to read the Windows boot test-signing configuration'
-    }
-    $bootConfigurationText = $bootConfiguration -join [Environment]::NewLine
-    if ($bootConfigurationText -notmatch '(?im)^\s*testsigning\s+Yes\s*$') {
-        throw 'The WDK test certificate is untrusted and Windows test-signing mode is not enabled'
-    }
-
     Write-Warning @'
 The native eBPF driver has an embedded WDK test signature whose self-signed
-root is not trusted for production. Windows test-signing mode is enabled.
-This is acceptable only for this development proof of concept.
+root is not trusted for production. The deployment target must have Windows
+test-signing mode enabled. This is acceptable only for this development proof
+of concept.
 '@
 }
 else {

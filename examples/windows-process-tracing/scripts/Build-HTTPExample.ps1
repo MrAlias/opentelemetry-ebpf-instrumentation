@@ -294,7 +294,6 @@ try {
         -Description 'Restore the kernel cxplat SDK package'
 
     $commonMsBuildArguments = @(
-        '/t:Rebuild',
         '/m:1',
         '/p:Configuration=Debug',
         '/p:Platform=x64',
@@ -312,7 +311,8 @@ try {
         Invoke-Checked `
             -FilePath $msbuild `
             -ArgumentList (@(
-                (Join-Path $ebpfForWindowsSource $project)
+                (Join-Path $ebpfForWindowsSource $project),
+                '/t:Rebuild'
             ) + $commonMsBuildArguments) `
             -Description "Build eBPF-for-Windows $project"
     }
@@ -329,6 +329,7 @@ try {
             -FilePath $msbuild `
             -ArgumentList (@(
                 (Join-Path $ebpfForWindowsSource $project),
+                '/t:Build',
                 '/p:PlatformToolset=v145'
             ) + $commonMsBuildArguments) `
             -Description "Build eBPF-for-Windows $project"

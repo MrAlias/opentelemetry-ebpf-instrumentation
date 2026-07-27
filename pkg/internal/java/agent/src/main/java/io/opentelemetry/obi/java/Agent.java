@@ -70,6 +70,7 @@ public class Agent {
                   "io.opentelemetry.obi.java.bridge.RemoteParentProvider",
                   "io.opentelemetry.obi.java.bridge.RemoteParentBridge",
                   "io.opentelemetry.obi.java.bridge.RemoteParentBridge$NoopProvider",
+                  "io.opentelemetry.obi.java.bridge.RemoteParentTransportDiagnosticsV1",
                   "io.opentelemetry.obi.java.bridge.NativeRemoteParentProvider",
                   "io.opentelemetry.obi.java.bridge.NativeRemoteParentProvider$ProcessRegistrar",
                   "io.opentelemetry.obi.java.bridge.NativeRemoteParentProvider$TransportConfigurer",

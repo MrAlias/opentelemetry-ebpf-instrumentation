@@ -529,6 +529,39 @@ remains below one KiB at saturation. Failures are logged on the first and
 power-of-two occurrences so repeated transport faults do not produce per-request
 log volume.
 
+`RemoteParentTransportDiagnosticsV1.snapshot()` separately exposes a fixed
+configuration-state snapshot as seven decimal fields:
+`version`, `status`, `requested`, `selected`, `attempted`, `getsockopt`, and
+`unix`. Transport values are `0` for auto, `1` for getsockopt, `2` for Unix,
+`3` for disabled, and `255` for none. The two low bits of `attempted` record
+getsockopt and Unix probes. Probe and final statuses use the fourteen bridge
+status values. A selected transport requires its attempted probe to have a
+valid normalized outcome. Failed attempts select none while retaining each
+attempted probe's terminal status. The provider publishes the packed result
+atomically before its readiness status and retains it when a data-path failure
+triggers backoff; a completed reprobe replaces the whole result. This snapshot
+describes configuration, not proof that a request used the selected transport.
+
+The normal state is the last complete native configuration attempt. Fixed
+synthetic states make preflight and compatibility failures explicit: no
+provider reports disabled; a provider from before this API reports unknown;
+failed process registration reports unauthorized without probe attempts; a
+provider invocation failure reports transport error; and an unavailable
+snapshot API reports version mismatch. These states use `255` for an unknown
+requested or selected transport and zero for unattempted probe outcomes.
+
+The native V2 result has one unsigned byte per field. From least to most
+significant byte these are final status, requested transport, selected
+transport, attempted mask, getsockopt status, Unix status, format version `2`,
+and magic `0x4f`. The existing V1 JNI method and symbol remain available. If a
+mixed-generation bootstrap class or native library lacks V2, the helper calls
+V1 once and publishes a version `1` snapshot with unknown probe outcomes;
+selection remains unknown for legacy `auto`. The outer loader retains the first
+nested helper generation loaded into a JVM. Reattaching a newer JAR therefore
+cannot add the diagnostics facade to an installation that predates it; that JVM
+must restart with the current helper generation. If the facade is present but
+the bootstrap bridge lacks its snapshot method, it reports version mismatch.
+
 The OBI operation counter has four possible `transport` values (`tcp`,
 `getsockopt`, `unix`, and `disabled`), twelve possible `operation` values
 (`stage`, `candidate`, `handoff`, `inject`, `take`, `discard`, `negotiate`,
@@ -546,7 +579,7 @@ successful BPF counter pass at the configured BPF metric interval so observers
 can identify complete publications. The Java snapshot has 50 fixed keys:
 twenty-two configuration, registration, lookup, extraction, trace-flag, and
 decrypted-read counters plus take and discard counters for each of the fourteen
-statuses. Neither surface derives a label or key from request data.
+statuses. None of these surfaces derives a label or key from request data.
 
 Each availability warning includes fixed `stage` and `reason` fields, and the
 corresponding operation counter uses `operation="availability"` with the same

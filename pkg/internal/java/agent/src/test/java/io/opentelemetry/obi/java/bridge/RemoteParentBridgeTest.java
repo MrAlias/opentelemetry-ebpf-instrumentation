@@ -32,6 +32,9 @@ class RemoteParentBridgeTest {
   void isNoopUntilAProviderRegisters() {
     assertEquals(RemoteParentStatus.MISSING, RemoteParentBridge.takeRemoteParent().getStatus());
     assertEquals(RemoteParentStatus.MISSING, RemoteParentBridge.discardRemoteParent().getStatus());
+    assertEquals(
+        "version=2,status=13,requested=3,selected=3,attempted=0,getsockopt=0,unix=0",
+        RemoteParentBridge.transportConfigurationSnapshot());
   }
 
   @Test
@@ -43,6 +46,31 @@ class RemoteParentBridgeTest {
     assertEquals(
         RemoteParentStatus.ALREADY_CONSUMED, RemoteParentBridge.takeRemoteParent().getStatus());
     assertEquals(RemoteParentStatus.MISSING, RemoteParentBridge.discardRemoteParent().getStatus());
+    assertEquals(
+        "version=2,status=1,requested=0,selected=2,attempted=3,getsockopt=4,unix=1",
+        RemoteParentBridge.transportConfigurationSnapshot());
+  }
+
+  @Test
+  void defaultsTransportConfigurationForExistingProviders() {
+    assertTrue(RemoteParentBridge.installProviderForTest(new DefaultConfigurationProvider()));
+
+    assertEquals(
+        "version=2,status=0,requested=255,selected=255,attempted=0,getsockopt=0,unix=0",
+        RemoteParentBridge.transportConfigurationSnapshot());
+  }
+
+  @Test
+  void sanitizesUnavailableProviderConfigurations() {
+    assertTrue(RemoteParentBridge.installProviderForTest(new FutureConfigurationProvider()));
+    assertEquals(
+        "version=2,status=6,requested=255,selected=255,attempted=0,getsockopt=0,unix=0",
+        RemoteParentBridge.transportConfigurationSnapshot());
+
+    assertTrue(RemoteParentBridge.installProviderForTest(new ThrowingConfigurationProvider()));
+    assertEquals(
+        "version=2,status=12,requested=255,selected=255,attempted=0,getsockopt=0,unix=0",
+        RemoteParentBridge.transportConfigurationSnapshot());
   }
 
   @Test
@@ -127,6 +155,11 @@ class RemoteParentBridgeTest {
     }
 
     @Override
+    public long transportConfiguration() {
+      return 0x4f02010403020001L;
+    }
+
+    @Override
     public RemoteParentRecord takeRemoteParent() {
       int status =
           takes.getAndIncrement() == 0
@@ -167,5 +200,39 @@ class RemoteParentBridgeTest {
 
     @Override
     public void close() {}
+  }
+
+  private static class DefaultConfigurationProvider implements RemoteParentProvider {
+    @Override
+    public int abiVersion() {
+      return RemoteParentRecord.ABI_VERSION;
+    }
+
+    @Override
+    public RemoteParentRecord takeRemoteParent() {
+      return RemoteParentRecord.statusOnly(RemoteParentStatus.MISSING);
+    }
+
+    @Override
+    public RemoteParentRecord discardRemoteParent() {
+      return RemoteParentRecord.statusOnly(RemoteParentStatus.MISSING);
+    }
+
+    @Override
+    public void close() {}
+  }
+
+  private static final class FutureConfigurationProvider extends DefaultConfigurationProvider {
+    @Override
+    public long transportConfiguration() {
+      return 0x4f03000101010001L;
+    }
+  }
+
+  private static final class ThrowingConfigurationProvider extends DefaultConfigurationProvider {
+    @Override
+    public long transportConfiguration() {
+      throw new IllegalStateException("unavailable");
+    }
   }
 }

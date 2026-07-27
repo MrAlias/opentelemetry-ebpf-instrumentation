@@ -116,6 +116,18 @@ public final class RemoteParentBridge {
     return RemoteParentDiagnostics.snapshot();
   }
 
+  public static String transportConfigurationSnapshot() {
+    long configuration;
+    try {
+      configuration = provider.get().transportConfiguration();
+    } catch (Throwable ignored) {
+      configuration =
+          RemoteParentTransportConfiguration.failure(
+              RemoteParentTransportConfiguration.NONE, RemoteParentStatus.TRANSPORT_ERROR);
+    }
+    return RemoteParentTransportConfiguration.snapshot(configuration);
+  }
+
   public static boolean removeProvider(RemoteParentProvider expected) {
     if (expected == null || !provider.compareAndSet(expected, NOOP)) {
       return false;
@@ -141,6 +153,11 @@ public final class RemoteParentBridge {
     @Override
     public int abiVersion() {
       return RemoteParentRecord.ABI_VERSION;
+    }
+
+    @Override
+    public long transportConfiguration() {
+      return RemoteParentTransportConfiguration.disabled();
     }
 
     @Override

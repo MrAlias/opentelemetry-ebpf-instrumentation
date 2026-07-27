@@ -70,9 +70,13 @@ maintains the Unix service after the shared maps and data hook are ready. Its
 acknowledgement of the Java helper's choice or proof that a request used that
 transport. The helper probes `getsockopt` first on a connected probe socket
 and, if that fails, probes Unix. Forced modes probe only the requested
-transport; the helper's concrete choice is not currently exported. When OBI's
-UID cannot be mapped into a target JVM user namespace, attach rejects forced
-Unix and narrows `auto` to `getsockopt` for that JVM.
+transport. A separate fixed Java configuration snapshot exports the requested
+and selected transport, attempted-probe mask, both probe outcomes, and final
+status from one completed native attempt. Fixed disabled, unknown,
+pre-registration failure, invocation failure, and version-mismatch sentinels
+cover states without a completed native attempt. The snapshot does not prove
+request use. When OBI's UID cannot be mapped into a target JVM user namespace,
+attach rejects forced Unix and narrows `auto` to `getsockopt` for that JVM.
 
 For `getsockopt`, each decrypted receive negotiates the actual application
 socket before one take or discard. Unix retrieval instead sends one
@@ -82,8 +86,8 @@ fail the current request open. After the one-second backoff, a later request is
 eligible to reprobe the originally requested mode; `auto` may then choose a
 different transport. Transport-labelled operation evidence comes from OBI's
 aggregate `take` and `discard` counters. Java diagnostics classify statuses but
-do not export the selected transport, so forced configuration and trace
-assertions are required to connect those aggregates to a run.
+export configuration selection separately from the monotonic counters, so
+trace assertions remain necessary to prove request use.
 
 ## Alternatives
 
@@ -115,8 +119,8 @@ criterion from
 | Candidate | Java privilege and attack surface | Restart and version skew | Latency, allocation, and backpressure | Maintenance and diagnostics | `bpf_probe_write_user` | Decision |
 | --- | --- | --- | --- | --- | --- | --- |
 | Cgroup sockopt on accepted application socket | Ordinary socket syscalls; no BPF access | Optional object, explicit ABI, socket renegotiation, and request-triggered reprobe after backoff | Latency: synchronous syscall, untested; allocation: reused Java buffers focused, retained allocation untested; backpressure: 64-slot provider pool returns overload, syscall has no configured deadline | Maintenance: separate BPF/JNI ABI; diagnostics: reason-coded OBI counters and Java status counters | No | Primary |
-| Cgroup getsockopt on a dummy socket | Ordinary probe socket; no BPF access | Recreated by a request-triggered reprobe after backoff | Latency and allocation: socket-pair setup plus negotiate/health untested; backpressure: not applicable to the data path | Maintenance: small native probe surface; diagnostics: probe status, without selected-transport export | No | Probe only |
-| Credential-checked Unix socket | Access to one endpoint; peer UID remains in the trust boundary | Reconnectable, versioned framing, and request-triggered reprobe after backoff | Latency and allocation: comparative evidence untested; backpressure: absolute RPC deadline, bounded server admission, and 64-slot provider pool | Maintenance: server, framing, `/proc`, credentials, and path handling; diagnostics: reason-coded OBI counters and Java status counters | No | Fallback |
+| Cgroup getsockopt on a dummy socket | Ordinary probe socket; no BPF access | Recreated by a request-triggered reprobe after backoff | Latency and allocation: socket-pair setup plus negotiate/health untested; backpressure: not applicable to the data path | Maintenance: small native probe surface; diagnostics: selected transport and both probe outcomes in one fixed Java result | No | Probe only |
+| Credential-checked Unix socket | Access to one endpoint; peer UID remains in the trust boundary | Reconnectable, versioned framing, and request-triggered reprobe after backoff | Latency and allocation: comparative evidence untested; backpressure: absolute RPC deadline, bounded server admission, and 64-slot provider pool | Maintenance: server, framing, `/proc`, credentials, and path handling; diagnostics: reason-coded OBI counters plus fixed Java selection and probe outcomes | No | Fallback |
 | Brokered BPF map FD | Grants a BPF map capability to the application | Revocation and map-version skew are difficult | Latency, allocation, and backpressure: all untested | Maintenance: FD broker plus internal map ABI; diagnostics: new broker and access-status reporting required | No | Reject |
 | Direct bpffs lookup | Grants bpffs and BPF permissions | Stale pins and mixed map versions need cleanup | Latency, allocation, and backpressure: all untested | Maintenance: mounts, permissions, pins, and internal map ABI; diagnostics: new access and stale-pin reporting required | No | Reject |
 | Shared memory | Requires a cross-process shared mapping; Java write authority depends on the design | Stale mappings and restart ownership are complex | Latency, allocation, and backpressure: all untested | Maintenance: ownership, version, and corruption protocol; diagnostics: new integrity and ownership reporting required | No | Reject |

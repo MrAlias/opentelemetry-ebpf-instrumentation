@@ -256,6 +256,30 @@ try {
     $env:VisualStudioVersion = '17.0'
     $env:CL = '/wd4875 /wd4090'
 
+    Invoke-Checked `
+        -FilePath $msbuild `
+        -ArgumentList @(
+            (Join-Path $ebpfForWindowsSource 'scripts\setup_build\setup_build.vcxproj'),
+            '/t:Build',
+            '/m:1',
+            '/p:Configuration=Debug',
+            '/p:Platform=x64',
+            '/p:PlatformToolset=v145',
+            "/p:SolutionDir=$ebpfForWindowsSource\",
+            '/verbosity:minimal'
+        ) `
+        -Description 'Generate eBPF-for-Windows build metadata'
+    Invoke-Checked `
+        -FilePath $msbuild `
+        -ArgumentList @(
+            (Join-Path $ebpfForWindowsSource `
+                'external\usersim\cxplat\src\cxplat_winkernel\cxplat_winkernel.vcxproj'),
+            '/t:restore',
+            '/p:Platform=x64',
+            '/verbosity:minimal'
+        ) `
+        -Description 'Restore the kernel cxplat SDK package'
+
     $commonMsBuildArguments = @(
         '/t:Rebuild',
         '/m:1',

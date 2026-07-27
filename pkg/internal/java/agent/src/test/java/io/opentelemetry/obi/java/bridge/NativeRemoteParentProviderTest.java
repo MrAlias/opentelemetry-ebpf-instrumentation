@@ -7,6 +7,7 @@ package io.opentelemetry.obi.java.bridge;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.opentelemetry.obi.java.ebpf.ThreadInfo;
@@ -17,8 +18,16 @@ import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicReferenceArray;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -58,9 +67,11 @@ class NativeRemoteParentProviderTest {
             0,
             (transport, path, timeout, uid, processIncarnation) -> {
               events.add("configure");
-              return configurationAttempts.getAndIncrement() == 0
-                  ? RemoteParentStatus.UNSUPPORTED
-                  : RemoteParentStatus.VALID;
+              int status =
+                  configurationAttempts.getAndIncrement() == 0
+                      ? RemoteParentStatus.UNSUPPORTED
+                      : RemoteParentStatus.VALID;
+              return configurationResult(transport, status);
             },
             () -> {
               events.add("register");
@@ -71,6 +82,9 @@ class NativeRemoteParentProviderTest {
     assertEquals(1, configurationAttempts.get());
     assertEquals(1, registrations.get());
     assertEquals(Arrays.asList("register", "configure"), events);
+    assertEquals(
+        RemoteParentStatus.UNSUPPORTED,
+        RemoteParentTransportConfiguration.status(provider.transportConfiguration()));
     makeRetryEligible(provider);
 
     provider.takeRemoteParent();
@@ -78,6 +92,9 @@ class NativeRemoteParentProviderTest {
     assertEquals(2, configurationAttempts.get());
     assertEquals(2, registrations.get());
     assertEquals(Arrays.asList("register", "configure", "register", "configure"), events);
+    assertEquals(
+        RemoteParentTransport.GETSOCKOPT,
+        RemoteParentTransportConfiguration.selected(provider.transportConfiguration()));
     provider.close();
   }
 
@@ -93,13 +110,16 @@ class NativeRemoteParentProviderTest {
             0,
             (transport, path, timeout, uid, processIncarnation) -> {
               configurationAttempts.incrementAndGet();
-              return RemoteParentStatus.VALID;
+              return configurationResult(transport, RemoteParentStatus.VALID);
             },
             () -> registrations.incrementAndGet() > 1);
 
     assertFalse(provider.isReady());
     assertEquals(1, registrations.get());
     assertEquals(0, configurationAttempts.get());
+    assertEquals(
+        RemoteParentStatus.UNAUTHORIZED,
+        RemoteParentTransportConfiguration.status(provider.transportConfiguration()));
     makeRetryEligible(provider);
 
     assertTrue(ensureReady(provider));
@@ -122,7 +142,7 @@ class NativeRemoteParentProviderTest {
             0,
             (transport, path, timeout, uid, processIncarnation) -> {
               configurationAttempts.incrementAndGet();
-              return RemoteParentStatus.VALID;
+              return configurationResult(transport, RemoteParentStatus.VALID);
             },
             () -> {
               registrations.incrementAndGet();
@@ -135,12 +155,145 @@ class NativeRemoteParentProviderTest {
 
     markUnavailable(provider, RemoteParentStatus.UNAUTHORIZED);
     assertFalse(provider.isReady());
+    assertEquals(
+        RemoteParentStatus.VALID,
+        RemoteParentTransportConfiguration.status(provider.transportConfiguration()));
     makeRetryEligible(provider);
 
     assertTrue(ensureReady(provider));
     assertEquals(2, registrations.get());
     assertEquals(2, configurationAttempts.get());
     provider.close();
+  }
+
+  @Test
+  void publishesOnlyCompleteTransportConfigurationsDuringRecovery() throws Exception {
+    AtomicInteger attempts = new AtomicInteger();
+    NativeRemoteParentProvider provider =
+        new NativeRemoteParentProvider(
+            RemoteParentTransport.AUTO,
+            "/tmp/obi-java.sock",
+            50,
+            0,
+            (transport, path, timeout, uid, processIncarnation) ->
+                attempts.getAndIncrement() == 0 ? 0x4f02000101010001L : 0x4f02010403020001L,
+            () -> true);
+    AtomicBoolean reading = new AtomicBoolean(true);
+    AtomicReference<Long> unexpected = new AtomicReference<>();
+    CountDownLatch primaryObserved = new CountDownLatch(1);
+    CountDownLatch fallbackObserved = new CountDownLatch(1);
+    Thread reader =
+        new Thread(
+            () -> {
+              while (reading.get()) {
+                long configuration = provider.transportConfiguration();
+                if (configuration == 0x4f02000101010001L) {
+                  primaryObserved.countDown();
+                } else if (configuration == 0x4f02010403020001L) {
+                  fallbackObserved.countDown();
+                } else {
+                  unexpected.compareAndSet(null, configuration);
+                }
+              }
+            });
+    reader.setDaemon(true);
+    reader.start();
+
+    try {
+      assertTrue(primaryObserved.await(5, TimeUnit.SECONDS));
+      markUnavailable(provider, RemoteParentStatus.UNAUTHORIZED);
+      makeRetryEligible(provider);
+      assertTrue(ensureReady(provider));
+      assertTrue(fallbackObserved.await(5, TimeUnit.SECONDS));
+    } finally {
+      reading.set(false);
+      reader.join(TimeUnit.SECONDS.toMillis(5));
+      provider.close();
+    }
+    assertFalse(reader.isAlive());
+    assertNull(unexpected.get());
+    assertEquals(2, attempts.get());
+    assertEquals(0x4f02010403020001L, provider.transportConfiguration());
+  }
+
+  @Test
+  void diagnosticLoggingCannotInterruptInstallationOrRecovery() throws Exception {
+    Logger providerLogger = Logger.getLogger(NativeRemoteParentProvider.class.getName());
+    Level previousLevel = providerLogger.getLevel();
+    AtomicReference<Throwable> loggingFailure =
+        new AtomicReference<>(new IllegalStateException("broken application log handler"));
+    Handler throwingHandler =
+        new Handler() {
+          @Override
+          public void publish(LogRecord record) {
+            Throwable failure = loggingFailure.get();
+            if (failure instanceof Error) {
+              throw (Error) failure;
+            }
+            throw (RuntimeException) failure;
+          }
+
+          @Override
+          public void flush() {}
+
+          @Override
+          public void close() {}
+        };
+    throwingHandler.setLevel(Level.ALL);
+    providerLogger.setLevel(Level.ALL);
+    providerLogger.addHandler(throwingHandler);
+    NativeRemoteParentProvider provider = null;
+    try {
+      AtomicInteger attempts = new AtomicInteger();
+      provider =
+          new NativeRemoteParentProvider(
+              RemoteParentTransport.AUTO,
+              "/tmp/obi-java.sock",
+              50,
+              0,
+              (transport, path, timeout, uid, processIncarnation) ->
+                  attempts.getAndIncrement() == 0 ? 0x4f02000101010001L : 0x4f02010403020001L,
+              () -> true);
+
+      assertTrue(provider.isReady());
+      loggingFailure.set(new AssertionError("broken application log handler"));
+      markUnavailable(provider, RemoteParentStatus.UNAUTHORIZED);
+      makeRetryEligible(provider);
+
+      assertTrue(ensureReady(provider));
+      assertEquals(2, attempts.get());
+      assertEquals(0x4f02010403020001L, provider.transportConfiguration());
+    } finally {
+      providerLogger.removeHandler(throwingHandler);
+      providerLogger.setLevel(previousLevel);
+      if (provider != null) {
+        provider.close();
+      }
+    }
+  }
+
+  @Test
+  void fallsBackToLegacyConfigurationWhenV2SymbolIsUnavailable() {
+    AtomicInteger legacyCalls = new AtomicInteger();
+
+    long configuration =
+        NativeRemoteParentProvider.configureNativeTransport(
+            RemoteParentTransport.AUTO,
+            () -> {
+              throw new UnsatisfiedLinkError("missing V2 symbol");
+            },
+            () -> {
+              legacyCalls.incrementAndGet();
+              return RemoteParentStatus.VALID;
+            });
+
+    assertEquals(1, legacyCalls.get());
+    assertEquals(1, RemoteParentTransportConfiguration.version(configuration));
+    assertEquals(
+        RemoteParentStatus.VALID, RemoteParentTransportConfiguration.status(configuration));
+    assertEquals(
+        RemoteParentTransportConfiguration.NONE,
+        RemoteParentTransportConfiguration.selected(configuration));
   }
 
   @Test
@@ -151,7 +304,8 @@ class NativeRemoteParentProviderTest {
             "/tmp/obi-java.sock",
             50,
             0,
-            (transport, path, timeout, uid, processIncarnation) -> RemoteParentStatus.DISABLED,
+            (transport, path, timeout, uid, processIncarnation) ->
+                configurationResult(transport, RemoteParentStatus.DISABLED),
             () -> true);
 
     TaskContext alias = captureSocketAlias(17);
@@ -220,8 +374,30 @@ class NativeRemoteParentProviderTest {
         "/tmp/obi-java.sock",
         50,
         0,
-        (transport, path, timeout, uid, processIncarnation) -> RemoteParentStatus.VALID,
+        (transport, path, timeout, uid, processIncarnation) ->
+            configurationResult(transport, RemoteParentStatus.VALID),
         () -> true);
+  }
+
+  private static long configurationResult(int requested, int status) {
+    if (status == RemoteParentStatus.VALID) {
+      if (requested == RemoteParentTransport.AUTO) {
+        return 0x4f02000101010001L;
+      }
+      if (requested == RemoteParentTransport.GETSOCKOPT) {
+        return 0x4f02000101010101L;
+      }
+      if (requested == RemoteParentTransport.UNIX) {
+        return 0x4f02010002020201L;
+      }
+    }
+    if (status == RemoteParentStatus.DISABLED && requested == RemoteParentTransport.DISABLED) {
+      return RemoteParentTransportConfiguration.disabled();
+    }
+    if (status == RemoteParentStatus.UNSUPPORTED && requested == RemoteParentTransport.AUTO) {
+      return 0x4f02000401ff0004L;
+    }
+    return RemoteParentTransportConfiguration.failure(requested, status);
   }
 
   private static void makeRetryEligible(NativeRemoteParentProvider provider) throws Exception {

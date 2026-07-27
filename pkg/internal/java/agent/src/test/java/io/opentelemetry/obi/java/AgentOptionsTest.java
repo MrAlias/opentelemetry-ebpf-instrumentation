@@ -75,6 +75,9 @@ class AgentOptionsTest {
             "io.opentelemetry.obi.java.bridge.RemoteParentBridge$NoopProvider"));
     assertTrue(
         Agent.isBootstrapHelperClassName(
+            "io.opentelemetry.obi.java.bridge.RemoteParentTransportConfiguration"));
+    assertTrue(
+        Agent.isBootstrapHelperClassName(
             "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$TlsConnectionMarkerAttempt"));
     assertTrue(
         Agent.isBootstrapHelperClassName(

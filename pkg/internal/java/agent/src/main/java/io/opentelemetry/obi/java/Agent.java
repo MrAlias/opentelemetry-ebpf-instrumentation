@@ -65,6 +65,7 @@ public class Agent {
                   "io.opentelemetry.obi.java.bridge.RemoteParentStatus",
                   "io.opentelemetry.obi.java.bridge.RemoteParentDiagnostics",
                   "io.opentelemetry.obi.java.bridge.RemoteParentTransport",
+                  "io.opentelemetry.obi.java.bridge.RemoteParentTransportConfiguration",
                   "io.opentelemetry.obi.java.bridge.RemoteParentRecord",
                   "io.opentelemetry.obi.java.bridge.RemoteParentProvider",
                   "io.opentelemetry.obi.java.bridge.RemoteParentBridge",

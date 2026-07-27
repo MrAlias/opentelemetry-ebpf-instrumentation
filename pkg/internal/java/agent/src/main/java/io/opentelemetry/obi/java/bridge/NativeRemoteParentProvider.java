@@ -8,6 +8,8 @@ package io.opentelemetry.obi.java.bridge;
 import io.opentelemetry.obi.java.BootstrapNative;
 import io.opentelemetry.obi.java.ebpf.ThreadInfo;
 import java.util.concurrent.atomic.AtomicReferenceArray;
+import java.util.function.IntSupplier;
+import java.util.function.LongSupplier;
 import java.util.logging.Logger;
 
 public final class NativeRemoteParentProvider implements RemoteParentProvider {
@@ -25,6 +27,7 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
   private final ProcessRegistrar processRegistrar;
 
   private volatile int transportStatus;
+  private volatile long transportConfiguration;
   private volatile long nextConfigurationAttemptNanos;
   private volatile boolean closed;
 
@@ -35,7 +38,7 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
         unixSocketPath,
         timeoutMillis,
         serverUid,
-        BootstrapNative::configureRemoteParentTransport,
+        NativeRemoteParentProvider::configureNativeTransport,
         ThreadInfo::registerProcessIncarnation);
   }
 
@@ -52,6 +55,7 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
     this.serverUid = serverUid;
     this.transportConfigurer = transportConfigurer;
     this.processRegistrar = processRegistrar;
+    this.transportConfiguration = RemoteParentTransportConfiguration.unknown(transport);
     for (int i = 0; i < BUFFER_POOL_SIZE; i++) {
       buffers.set(i, new byte[RemoteParentRecord.RECORD_SIZE]);
     }
@@ -61,6 +65,11 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
   @Override
   public int abiVersion() {
     return RemoteParentRecord.ABI_VERSION;
+  }
+
+  @Override
+  public long transportConfiguration() {
+    return transportConfiguration;
   }
 
   boolean isReady() {
@@ -144,7 +153,7 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
         return false;
       }
       if (configureTransport() == RemoteParentStatus.VALID) {
-        logger.info("OBI remote-parent provider ready");
+        logInfo("OBI remote-parent provider ready");
         return true;
       }
       return false;
@@ -152,12 +161,13 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
   }
 
   private int configureTransport() {
-    int status;
+    long configuration;
     try {
       if (isEnabled() && !processRegistrar.register()) {
-        status = RemoteParentStatus.UNAUTHORIZED;
+        configuration =
+            RemoteParentTransportConfiguration.failure(transport, RemoteParentStatus.UNAUTHORIZED);
       } else {
-        status =
+        configuration =
             transportConfigurer.configure(
                 transport,
                 unixSocketPath,
@@ -166,15 +176,61 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
                 ThreadInfo.processIncarnation());
       }
     } catch (Throwable ignored) {
-      status = RemoteParentStatus.TRANSPORT_ERROR;
+      configuration =
+          RemoteParentTransportConfiguration.failure(transport, RemoteParentStatus.TRANSPORT_ERROR);
     }
+    configuration = RemoteParentTransportConfiguration.normalize(configuration, transport);
+    int status = RemoteParentTransportConfiguration.status(configuration);
     if (isEnabled()) {
       RemoteParentDiagnostics.registration(status);
     }
+    boolean changed = configuration != transportConfiguration;
+    transportConfiguration = configuration;
     transportStatus = status;
     nextConfigurationAttemptNanos =
         status == RemoteParentStatus.VALID ? 0 : System.nanoTime() + RETRY_NANOS;
+    if (changed) {
+      logTransportConfiguration(configuration);
+    }
     return status;
+  }
+
+  private static void logTransportConfiguration(long configuration) {
+    logInfo(
+        "OBI remote-parent transport configuration "
+            + RemoteParentTransportConfiguration.snapshot(configuration));
+  }
+
+  private static void logInfo(String message) {
+    try {
+      logger.info(message);
+    } catch (Throwable ignored) {
+    }
+  }
+
+  private static long configureNativeTransport(
+      int transport,
+      String unixSocketPath,
+      int timeoutMillis,
+      long serverUid,
+      long processIncarnation) {
+    return configureNativeTransport(
+        transport,
+        () ->
+            BootstrapNative.configureRemoteParentTransportV2(
+                transport, unixSocketPath, timeoutMillis, serverUid, processIncarnation),
+        () ->
+            BootstrapNative.configureRemoteParentTransport(
+                transport, unixSocketPath, timeoutMillis, serverUid, processIncarnation));
+  }
+
+  static long configureNativeTransport(
+      int transport, LongSupplier versionTwoConfigurer, IntSupplier legacyConfigurer) {
+    try {
+      return versionTwoConfigurer.getAsLong();
+    } catch (NoSuchMethodError | UnsatisfiedLinkError unavailable) {
+      return RemoteParentTransportConfiguration.legacy(transport, legacyConfigurer.getAsInt());
+    }
   }
 
   private void markUnavailable(int status) {
@@ -211,7 +267,7 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
   }
 
   interface TransportConfigurer {
-    int configure(
+    long configure(
         int transport,
         String unixSocketPath,
         int timeoutMillis,

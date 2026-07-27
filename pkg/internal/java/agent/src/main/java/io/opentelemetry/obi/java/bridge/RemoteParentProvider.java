@@ -9,6 +9,10 @@ package io.opentelemetry.obi.java.bridge;
 public interface RemoteParentProvider {
   int abiVersion();
 
+  default long transportConfiguration() {
+    return RemoteParentTransportConfiguration.unknown();
+  }
+
   RemoteParentRecord takeRemoteParent();
 
   RemoteParentRecord discardRemoteParent();

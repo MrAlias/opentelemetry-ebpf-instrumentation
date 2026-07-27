@@ -87,6 +87,11 @@ obi_flow_classify(ebpf_flow_classify_t* context)
 {
     uint32_t key = 0;
 
+    if (context->version != EBPF_FLOW_CLASSIFY_CONTEXT_VERSION ||
+        context->size < sizeof(*context)) {
+        return EBPF_FLOW_CLASSIFY_ALLOW;
+    }
+
     if (context->state == EBPF_FLOW_STATE_NEW && !is_target_flow(context)) {
         return EBPF_FLOW_CLASSIFY_ALLOW;
     }

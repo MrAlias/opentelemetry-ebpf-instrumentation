@@ -336,6 +336,7 @@ try {
         'telemetry\.sdk\.name.*opentelemetry',
         'telemetry\.distro\.name.*opentelemetry-ebpf-instrumentation',
         'otel\.scope\.name.*go\.opentelemetry\.io/obi',
+        '(?m)^InstrumentationScope[ \t]*$',
         'Trace ID\s*:\s*' + [Regex]::Escape($actualTraceId),
         'Parent ID\s*:\s*' + [Regex]::Escape($clientResult.span_id),
         'ID\s*:\s*' + [Regex]::Escape($actualSpanId),
@@ -379,7 +380,8 @@ try {
         server_service_name = 'obi-windows-http-target.exe'
         server_telemetry_sdk_name = 'opentelemetry'
         server_telemetry_distro_name = 'opentelemetry-ebpf-instrumentation'
-        server_otel_scope_name = 'go.opentelemetry.io/obi'
+        server_obi_reporter_resource_scope_name = 'go.opentelemetry.io/obi'
+        server_instrumentation_scope_name = ''
         artifact_sha256 = $artifactHashes
         evidence_directory = $EvidenceDirectory
     }

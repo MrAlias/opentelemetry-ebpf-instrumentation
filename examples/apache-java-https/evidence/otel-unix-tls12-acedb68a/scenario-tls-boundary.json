@@ -1,0 +1,258 @@
+{
+  "status": "passed",
+  "scenario": "tls-boundary",
+  "seed": 1,
+  "started_at": "2026-07-27T16:33:56.549439934Z",
+  "finished_at": "2026-07-27T16:34:28.986040398Z",
+  "request_count": 2,
+  "traffic_elapsed_nanos": 433184871,
+  "throughput_per_second": 4.616966412938276,
+  "latency": {
+    "p50_nanos": 54488760,
+    "p95_nanos": 378694803,
+    "p99_nanos": 378694803
+  },
+  "cases": [
+    {
+      "request": {
+        "marker": "tls-boundary-00-84aca3ab04bf90af",
+        "endpoint": "/api/tls-boundary",
+        "tls_boundary_mode": "split"
+      },
+      "response": {
+        "marker": "tls-boundary-00-84aca3ab04bf90af",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.2",
+        "tls_cipher": "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+        "backend_connection_id": 116,
+        "backend_remote_port": 39234,
+        "tls_read_events": 7373,
+        "tls_read_bytes": 565269,
+        "tls_boundary": {
+          "mode": "split",
+          "passed": true,
+          "shape_exact": true,
+          "expected_plaintext_callback_lengths": [
+            26,
+            128
+          ],
+          "actual_plaintext_callback_lengths": [
+            26,
+            128
+          ],
+          "request_order": [
+            1
+          ],
+          "response_order": [
+            1
+          ],
+          "buffers_forwarded_unchanged": true,
+          "handoff_before_parse": true,
+          "connection_closed": true
+        }
+      },
+      "latency_nanos": 378694803,
+      "trace": {
+        "marker": "tls-boundary-00-84aca3ab04bf90af",
+        "received_batches": 4,
+        "received_spans": 15,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 3719,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "7a09c5cda5658b0922ec2c1136b01507",
+            "span_id": "07f300d67bed1096",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/tls-boundary",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "tls-boundary-00-84aca3ab04bf90af",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/tls-boundary",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/tls-boundary"
+            },
+            "start_unix_nano": 1785170036551057421,
+            "end_unix_nano": 1785170036928985748
+          },
+          {
+            "trace_id": "7a09c5cda5658b0922ec2c1136b01507",
+            "span_id": "be2f45523884644c",
+            "parent_span_id": "07f300d67bed1096",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785170036551132780,
+            "end_unix_nano": 1785170036928985748
+          },
+          {
+            "trace_id": "7a09c5cda5658b0922ec2c1136b01507",
+            "span_id": "76700bb80a6d2d93",
+            "parent_span_id": "be2f45523884644c",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/tls-boundary",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "tls-boundary-00-84aca3ab04bf90af",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/tls-boundary?mode=split"
+            },
+            "start_unix_nano": 1785170036551286302,
+            "end_unix_nano": 1785170036928882391
+          },
+          {
+            "trace_id": "7a09c5cda5658b0922ec2c1136b01507",
+            "span_id": "485c813ee7bc47ef",
+            "parent_span_id": "76700bb80a6d2d93",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/tls-boundary",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "tls-boundary-00-84aca3ab04bf90af",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/tls-boundary",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/tls-boundary"
+            },
+            "start_unix_nano": 1785170036557460846,
+            "end_unix_nano": 1785170036928898110
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "tls-boundary-01-81258b8b3c2ef39c",
+        "endpoint": "/api/tls-boundary",
+        "tls_boundary_mode": "coalesced"
+      },
+      "response": {
+        "marker": "tls-boundary-01-81258b8b3c2ef39c",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.2",
+        "tls_cipher": "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+        "backend_connection_id": 116,
+        "backend_remote_port": 39234,
+        "tls_read_events": 7375,
+        "tls_read_bytes": 565887,
+        "tls_boundary": {
+          "mode": "coalesced",
+          "passed": true,
+          "shape_exact": true,
+          "expected_plaintext_callback_lengths": [
+            313
+          ],
+          "actual_plaintext_callback_lengths": [
+            313
+          ],
+          "request_order": [
+            1,
+            2
+          ],
+          "response_order": [
+            1,
+            2
+          ],
+          "buffers_forwarded_unchanged": true,
+          "handoff_before_parse": true,
+          "connection_closed": true
+        }
+      },
+      "latency_nanos": 54488760,
+      "trace": {
+        "marker": "tls-boundary-01-81258b8b3c2ef39c",
+        "received_batches": 4,
+        "received_spans": 15,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 3719,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "69f876ad5427cdca720dc8422b5ec6ad",
+            "span_id": "ec838f26c0c57726",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/tls-boundary",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "tls-boundary-01-81258b8b3c2ef39c",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/tls-boundary",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/tls-boundary"
+            },
+            "start_unix_nano": 1785170036929615339,
+            "end_unix_nano": 1785170036983677904
+          },
+          {
+            "trace_id": "69f876ad5427cdca720dc8422b5ec6ad",
+            "span_id": "52bbeaa892538493",
+            "parent_span_id": "ec838f26c0c57726",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/tls-boundary",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "tls-boundary-01-81258b8b3c2ef39c",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/tls-boundary?close=1\u0026mode=coalesced"
+            },
+            "start_unix_nano": 1785170036929739362,
+            "end_unix_nano": 1785170036983596704
+          },
+          {
+            "trace_id": "69f876ad5427cdca720dc8422b5ec6ad",
+            "span_id": "0127b22b604ebec6",
+            "parent_span_id": "52bbeaa892538493",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/tls-boundary",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "tls-boundary-01-81258b8b3c2ef39c",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/tls-boundary",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/tls-boundary"
+            },
+            "start_unix_nano": 1785170036931671206,
+            "end_unix_nano": 1785170036983693388
+          }
+        ]
+      }
+    }
+  ]
+}

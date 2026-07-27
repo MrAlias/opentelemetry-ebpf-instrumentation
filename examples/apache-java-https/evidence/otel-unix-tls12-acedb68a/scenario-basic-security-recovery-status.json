@@ -1,0 +1,9 @@
+{
+  "status": "passed",
+  "scenario": "basic",
+  "exit_status": 0,
+  "metric_status": 0,
+  "pressure_correlation": null,
+  "result": "scenario-basic-security-recovery.json",
+  "after_phase": "phases/basic-security-recovery-after"
+}

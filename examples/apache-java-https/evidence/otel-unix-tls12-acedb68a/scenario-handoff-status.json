@@ -1,0 +1,9 @@
+{
+  "status": "passed",
+  "scenario": "handoff",
+  "exit_status": 0,
+  "metric_status": 0,
+  "pressure_correlation": null,
+  "result": "scenario-handoff.json",
+  "after_phase": "phases/handoff-after"
+}

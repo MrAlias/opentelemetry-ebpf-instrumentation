@@ -1,0 +1,37 @@
+{
+  "status": "passed",
+  "scenario_status": "scenario-pressure-status.json",
+  "map": {
+    "name": "java_remote_parent_handoff_claims",
+    "type": "LRUHash",
+    "max_entries": 10000,
+    "baseline_entries": 18
+  },
+  "fill": {
+    "synthetic_entries_requested": 10001,
+    "evicted_entries_observed": 4080,
+    "peak_entries_observed": 5929,
+    "traffic_complete_entries": 5832
+  },
+  "traffic": {
+    "requests": 128,
+    "exact_parent_hits": 128,
+    "explicit_roots": 0,
+    "wrong_parents": 0,
+    "unresolved_parents": 0,
+    "retrieval_valid": 128,
+    "upstream_failures": 0,
+    "retrieval_failures": 0
+  },
+  "cleanup": {
+    "entries_removed": 5409,
+    "synthetic_entries_verified_absent": 10001,
+    "verified": true
+  },
+  "recovery": {
+    "observed_samples": 23,
+    "final_entries": [0, 0],
+    "consecutive_at_or_below_baseline_samples": 2,
+    "verified": true
+  }
+}

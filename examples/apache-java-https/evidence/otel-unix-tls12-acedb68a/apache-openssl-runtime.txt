@@ -1,0 +1,10 @@
+apache_version=Apache/2.4.68 (Unix)
+apache_ssl_module=ssl_module (shared)
+apache_mod_ssl_path=/usr/local/apache2/modules/mod_ssl.so
+apache_mod_ssl_needed=libssl.so.3,libcrypto.so.3,libc.musl-x86_64.so.1
+openssl_libssl_path=/usr/lib/libssl.so.3
+openssl_libssl_owner=libssl3-3.5.7-r0
+openssl_libcrypto_path=/usr/lib/libcrypto.so.3
+openssl_libcrypto_owner=libcrypto3-3.5.7-r0
+exit_status=0
+capture_exit_status=0

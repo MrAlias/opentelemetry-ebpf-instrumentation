@@ -1,0 +1,7 @@
+{
+  "status": "passed",
+  "scenario": "restart-fault",
+  "result": "scenario-restart-fault.json",
+  "after_phase": "phases/restart-fault-after",
+  "restart_control": "restart-control/events.log"
+}

@@ -1,0 +1,13 @@
+status=passed
+requests=32
+non_workload_takes=2
+observed_take_total=34
+observed_take_valid=26
+workload_valid_min=24
+workload_valid_max=26
+workload_fail_open_min=6
+workload_fail_open_max=8
+failure_total=0
+take_sampled=26
+take_unsampled=0
+discard_standard=25

@@ -1,0 +1,439 @@
+{
+  "status": "passed",
+  "scenario": "netty",
+  "seed": 1,
+  "started_at": "2026-07-27T16:36:56.465737697Z",
+  "finished_at": "2026-07-27T16:37:13.084484863Z",
+  "request_count": 4,
+  "traffic_elapsed_nanos": 15379163,
+  "throughput_per_second": 260.09217796833286,
+  "latency": {
+    "p50_nanos": 15298108,
+    "p95_nanos": 15353417,
+    "p99_nanos": 15353417
+  },
+  "cases": [
+    {
+      "request": {
+        "marker": "netty-00-84aca3ab04bf90af",
+        "endpoint": "/api/netty"
+      },
+      "response": {
+        "marker": "netty-00-84aca3ab04bf90af",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.2",
+        "tls_cipher": "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+        "backend_connection_id": 260,
+        "backend_remote_port": 38452,
+        "tls_read_events": 7532,
+        "tls_read_bytes": 610305,
+        "workload": "netty-eventloop-worker",
+        "netty_cancel": "0"
+      },
+      "latency_nanos": 15324196,
+      "trace": {
+        "marker": "netty-00-84aca3ab04bf90af",
+        "received_batches": 2,
+        "received_spans": 24,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 5010,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "a12a16c453051e8b5ff4ece5e3b4b412",
+            "span_id": "f6e92f2ad11cce7d",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/netty",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "netty-00-84aca3ab04bf90af",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/netty",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/netty"
+            },
+            "start_unix_nano": 1785170216467271669,
+            "end_unix_nano": 1785170216481755430
+          },
+          {
+            "trace_id": "a12a16c453051e8b5ff4ece5e3b4b412",
+            "span_id": "0e7c906dab198236",
+            "parent_span_id": "f6e92f2ad11cce7d",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785170216467363446,
+            "end_unix_nano": 1785170216481755430
+          },
+          {
+            "trace_id": "a12a16c453051e8b5ff4ece5e3b4b412",
+            "span_id": "664367d690112ea4",
+            "parent_span_id": "0e7c906dab198236",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/netty",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "netty-00-84aca3ab04bf90af",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/netty?cancel=0\u0026close=1"
+            },
+            "start_unix_nano": 1785170216467566979,
+            "end_unix_nano": 1785170216481489625
+          },
+          {
+            "trace_id": "a12a16c453051e8b5ff4ece5e3b4b412",
+            "span_id": "6fb3c0dc695ae415",
+            "parent_span_id": "664367d690112ea4",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/netty",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "netty-00-84aca3ab04bf90af",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/netty",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/netty"
+            },
+            "start_unix_nano": 1785170216474487686,
+            "end_unix_nano": 1785170216481721340
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "netty-01-81258b8b3c2ef39c",
+        "endpoint": "/api/netty",
+        "netty_cancel": true
+      },
+      "response": {
+        "marker": "netty-01-81258b8b3c2ef39c",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.2",
+        "tls_cipher": "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+        "backend_connection_id": 261,
+        "backend_remote_port": 38436,
+        "tls_read_events": 7532,
+        "tls_read_bytes": 610305,
+        "workload": "netty-eventloop-worker",
+        "netty_cancel": "1"
+      },
+      "latency_nanos": 15298108,
+      "trace": {
+        "marker": "netty-01-81258b8b3c2ef39c",
+        "received_batches": 2,
+        "received_spans": 24,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 5010,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "8ec3603ff2438d99b85685b247ac09c1",
+            "span_id": "9181942b5a731fde",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/netty",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "netty-01-81258b8b3c2ef39c",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/netty",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/netty"
+            },
+            "start_unix_nano": 1785170216467154338,
+            "end_unix_nano": 1785170216481732793
+          },
+          {
+            "trace_id": "8ec3603ff2438d99b85685b247ac09c1",
+            "span_id": "b9331cf25433ec72",
+            "parent_span_id": "9181942b5a731fde",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785170216467283136,
+            "end_unix_nano": 1785170216481732793
+          },
+          {
+            "trace_id": "8ec3603ff2438d99b85685b247ac09c1",
+            "span_id": "96202b16220cdb5b",
+            "parent_span_id": "b9331cf25433ec72",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/netty",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "netty-01-81258b8b3c2ef39c",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/netty?cancel=1\u0026close=1"
+            },
+            "start_unix_nano": 1785170216467495534,
+            "end_unix_nano": 1785170216481466424
+          },
+          {
+            "trace_id": "8ec3603ff2438d99b85685b247ac09c1",
+            "span_id": "ee1743bb33d027db",
+            "parent_span_id": "96202b16220cdb5b",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/netty",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "netty-01-81258b8b3c2ef39c",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/netty",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/netty"
+            },
+            "start_unix_nano": 1785170216474487900,
+            "end_unix_nano": 1785170216481724850
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "netty-02-69181de3112db607",
+        "endpoint": "/api/netty"
+      },
+      "response": {
+        "marker": "netty-02-69181de3112db607",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.2",
+        "tls_cipher": "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+        "backend_connection_id": 259,
+        "backend_remote_port": 38468,
+        "tls_read_events": 7532,
+        "tls_read_bytes": 610305,
+        "workload": "netty-eventloop-worker",
+        "netty_cancel": "0"
+      },
+      "latency_nanos": 15274671,
+      "trace": {
+        "marker": "netty-02-69181de3112db607",
+        "received_batches": 2,
+        "received_spans": 24,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 5010,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "6ba1ea31669c43617d1069134844cf71",
+            "span_id": "780ee4480dda7fdb",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/netty",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "netty-02-69181de3112db607",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/netty",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/netty"
+            },
+            "start_unix_nano": 1785170216467308108,
+            "end_unix_nano": 1785170216481777835
+          },
+          {
+            "trace_id": "6ba1ea31669c43617d1069134844cf71",
+            "span_id": "0acb2cdf688f009d",
+            "parent_span_id": "780ee4480dda7fdb",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785170216467412493,
+            "end_unix_nano": 1785170216481777835
+          },
+          {
+            "trace_id": "6ba1ea31669c43617d1069134844cf71",
+            "span_id": "4973823b4d0e055b",
+            "parent_span_id": "0acb2cdf688f009d",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/netty",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "netty-02-69181de3112db607",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/netty?cancel=0\u0026close=1"
+            },
+            "start_unix_nano": 1785170216467635242,
+            "end_unix_nano": 1785170216481505049
+          },
+          {
+            "trace_id": "6ba1ea31669c43617d1069134844cf71",
+            "span_id": "ae96e6eab0e18234",
+            "parent_span_id": "4973823b4d0e055b",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/netty",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "netty-02-69181de3112db607",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/netty",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/netty"
+            },
+            "start_unix_nano": 1785170216474395490,
+            "end_unix_nano": 1785170216481722955
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "netty-03-99a46ecb47f6e500",
+        "endpoint": "/api/netty",
+        "netty_cancel": true
+      },
+      "response": {
+        "marker": "netty-03-99a46ecb47f6e500",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.2",
+        "tls_cipher": "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+        "backend_connection_id": 262,
+        "backend_remote_port": 38422,
+        "tls_read_events": 7532,
+        "tls_read_bytes": 610305,
+        "workload": "netty-eventloop-worker",
+        "netty_cancel": "1"
+      },
+      "latency_nanos": 15353417,
+      "trace": {
+        "marker": "netty-03-99a46ecb47f6e500",
+        "received_batches": 2,
+        "received_spans": 24,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 5010,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "75b0b9cdfd377fd5c159fa441d2a6cb1",
+            "span_id": "2deeb919b2b6d646",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/netty",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "netty-03-99a46ecb47f6e500",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/netty",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/netty"
+            },
+            "start_unix_nano": 1785170216467159781,
+            "end_unix_nano": 1785170216481823709
+          },
+          {
+            "trace_id": "75b0b9cdfd377fd5c159fa441d2a6cb1",
+            "span_id": "c3a6120b89d4e3de",
+            "parent_span_id": "2deeb919b2b6d646",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785170216467235240,
+            "end_unix_nano": 1785170216481823709
+          },
+          {
+            "trace_id": "75b0b9cdfd377fd5c159fa441d2a6cb1",
+            "span_id": "a41df5bc2d239fa9",
+            "parent_span_id": "c3a6120b89d4e3de",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/netty",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "netty-03-99a46ecb47f6e500",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/netty?cancel=1\u0026close=1"
+            },
+            "start_unix_nano": 1785170216467384532,
+            "end_unix_nano": 1785170216481517142
+          },
+          {
+            "trace_id": "75b0b9cdfd377fd5c159fa441d2a6cb1",
+            "span_id": "1f2e82a5d91082ad",
+            "parent_span_id": "a41df5bc2d239fa9",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/netty",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "netty-03-99a46ecb47f6e500",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/netty",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/netty"
+            },
+            "start_unix_nano": 1785170216474483991,
+            "end_unix_nano": 1785170216481706866
+          }
+        ]
+      }
+    }
+  ]
+}

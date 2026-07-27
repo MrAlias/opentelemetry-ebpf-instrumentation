@@ -1,0 +1,6 @@
+{
+  "obi_java_agent_sha256": "a617d342a44964b15a1aff54deb59ec08f8849425474caefe397320d39d5b7b8",
+  "obi_otel_extension_sha256": "d16c6d6b649c49ec8e0b6c71ff935ad033667f7927074bd86160dc697670d71f",
+  "source_revision": "acedb68a01e5e3a5205ca1a462c345ecb184e5e7",
+  "source_tree_sha256": "c19f34dfb9a841b15ee19f95b52571d833d102e894f607ba39452b7fae5f3af7"
+}

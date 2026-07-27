@@ -1,0 +1,45 @@
+{
+  "status": "passed",
+  "transport": "unix",
+  "abuse_race": {
+    "attempts": 27620,
+    "cases": [
+      {"name": "peer-identity", "outcome": "unauthorized"},
+      {"name": "forged-identity", "outcome": "unauthorized"},
+      {"name": "malformed", "outcome": "malformed"},
+      {"name": "truncated", "outcome": "malformed"},
+      {"name": "version-mismatch", "outcome": "version_mismatch"},
+      {"name": "oversized", "outcome": "unauthorized"},
+      {"name": "repeated-frame", "outcome": "unauthorized"},
+      {"name": "repeated-unauthorized", "outcome": "bounded"},
+      {"name": "high-rate-admission", "outcome": "overload-and-recovery"},
+      {"name": "concurrent-repeated-unauthorized", "outcome": "bounded"}
+    ]
+  },
+  "endpoint_replacement": {
+    "cases": [
+      {"name": "replacement-fail-closed", "outcome": "inaccessible"},
+      {"name": "old-client-fd", "outcome": "closed"},
+      {"name": "replacement-preserved", "outcome": "unchanged"}
+    ]
+  },
+  "permissive_directory": {
+    "unsafe_mode": "0777",
+    "safe_mode": "0750",
+    "owner": "root:root",
+    "listener_outcome": "refused",
+    "fail_open_https_status": 200,
+    "fail_open_tls_protocol": "TLSv1.2"
+  },
+  "canary": {
+    "disclosed": false,
+    "verification": "runner_asserted_against_omitted_logs"
+  },
+  "metrics": {
+    "unauthorized_take_delta": 24502,
+    "concurrent_legitimate_take_valid_delta": 16,
+    "post_recovery_take_valid_delta": 1
+  },
+  "legitimate_victim_result": "scenario-concurrency-security-unix-victim.json",
+  "post_abuse_recovery_result": "scenario-basic-security-recovery.json"
+}

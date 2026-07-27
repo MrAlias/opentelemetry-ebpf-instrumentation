@@ -7,7 +7,7 @@ param(
 
     [string]$NtosEbpfExtSource = 'C:\src\ntosebpfext',
 
-    [string]$ExpectedEbpfForWindowsCommit = 'fe1ed176d2410569995a953fccdd3a7bad6f7136',
+    [string]$ExpectedEbpfForWindowsCommit = '09fb1397e560513e3710269920346c9c9c60afbd',
 
     [string]$ExpectedNtosEbpfExtCommit = 'bb41d8b10c488a28d98c874b1b1a55f40f22dc44',
 
@@ -69,12 +69,18 @@ if ($LASTEXITCODE -ne 0 -or -not $ebpfForWindowsCommit) {
 if ($ebpfForWindowsCommit -ne $ExpectedEbpfForWindowsCommit) {
     throw "eBPF-for-Windows commit $ebpfForWindowsCommit does not match expected $ExpectedEbpfForWindowsCommit"
 }
-$ebpfTrackedChanges = & git.exe -C $ebpfForWindowsSource status --porcelain=v1 --untracked-files=no
+$sourceStatusArguments = @(
+    'status'
+    '--porcelain=v1'
+    '--untracked-files=all'
+    '--ignore-submodules=none'
+)
+$ebpfTrackedChanges = & git.exe -C $ebpfForWindowsSource @sourceStatusArguments
 if ($LASTEXITCODE -ne 0) {
     throw 'Failed to inspect the eBPF-for-Windows source state'
 }
 if ($ebpfTrackedChanges) {
-    throw 'The eBPF-for-Windows source has tracked changes'
+    throw 'The eBPF-for-Windows source must be clean, including all submodules'
 }
 
 $ntosEbpfExtCommit = (& git.exe -C $ntosEbpfExtSource rev-parse HEAD).Trim()
@@ -84,12 +90,12 @@ if ($LASTEXITCODE -ne 0 -or -not $ntosEbpfExtCommit) {
 if ($ntosEbpfExtCommit -ne $ExpectedNtosEbpfExtCommit) {
     throw "ntosebpfext commit $ntosEbpfExtCommit does not match expected $ExpectedNtosEbpfExtCommit"
 }
-$ntosTrackedChanges = & git.exe -C $ntosEbpfExtSource status --porcelain=v1 --untracked-files=no
+$ntosTrackedChanges = & git.exe -C $ntosEbpfExtSource @sourceStatusArguments
 if ($LASTEXITCODE -ne 0) {
     throw 'Failed to inspect the ntosebpfext source state'
 }
 if ($ntosTrackedChanges) {
-    throw 'The ntosebpfext source has tracked changes'
+    throw 'The ntosebpfext source must be clean, including all submodules'
 }
 
 if ($nativeTools -match '\s') {

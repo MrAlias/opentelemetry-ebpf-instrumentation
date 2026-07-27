@@ -24,48 +24,64 @@ generation through the process hook, captures bounded request and response
 headers, parses an incoming W3C `traceparent`, creates a child span, and
 exports it through the normal OBI OTLP pdata path.
 
-Three consecutive VM runs passed. The final run propagated:
+The final client uses the ordinary OpenTelemetry Go SDK and standard
+`otelhttp.Transport`. It creates and exports a real CLIENT span, injects that
+span's W3C context into the request, and does not construct OBI telemetry.
+Three consecutive fresh VM runs proved that OBI extracted that context and
+exported the SERVER child:
+
+| Run | Trace ID | CLIENT span ID | SERVER parent ID | SERVER span ID |
+| --- | --- | --- | --- | --- |
+| 1 | `c9cce1fdc6c2f5b03d31a9c18a62976b` | `b8eb553960d02070` | `b8eb553960d02070` | `39f4b035a73bd08f` |
+| 2 | `67f02d1e9a20c643610f84487881265d` | `919d495419d72404` | `919d495419d72404` | `c686b443856b9b9c` |
+| 3 | `445a5f5e209a93daf232f04be86154a3` | `00e6c54c2130f97e` | `00e6c54c2130f97e` | `064d9957e88a49b0` |
+
+Each request was `GET /linked-final-N` on `127.0.0.1:18080` and returned
+HTTP 204. The Collector also reported the expected server address, port, and
+target PID. The OBI SERVER resource and scope were:
 
 ```text
-traceparent:    00-33333333333333333333333333333333-4444444444444444-01
-trace_id:       33333333333333333333333333333333
-parent_span_id: 4444444444444444
-span_id:        65055631de58cf74
-name:           GET
-kind:           SERVER
-url.path:       /linked-repeat
-status:         204
-```
-
-The resource retained canonical OBI identity:
-
-```text
+service.name:          obi-windows-http-target.exe
 telemetry.sdk.name:    opentelemetry
 telemetry.distro.name: opentelemetry-ebpf-instrumentation
-service.name:          obi-windows-http-target.exe
-os.type:               windows
+otel.scope.name:       go.opentelemetry.io/obi
 ```
 
-The accepted evidence, including Collector output, raw OBI events, live native
-program state, post-run empty program/map/link tables, VM service state, driver
-signature, and hashes, is in the three
-`artifacts/evidence/windows-http-20260727T01*Z/` directories.
+The independent CLIENT resource used
+`service.name=obi-windows-http-client`, carried no
+`telemetry.distro.name`, and used instrumentation scope
+`go.opentelemetry.io/obi/examples/windows-http-client`. These differences,
+along with the OBI raw-event log and native program state, distinguish the
+ordinary SDK span from the OBI-generated SERVER span.
 
-| Artifact | SHA-256 |
+The accepted source commits and deployed artifact hashes were:
+
+| Item | Commit or SHA-256 |
 | --- | --- |
-| `NetEbpfExt.sys` | `64738D4D2CE72E8206241436D2594901912BA9D2C645D8133D13329622C4262F` |
-| `netebpfext.cat` | `0E2195EBC5E21AF43D48C6296404BD7FFFAE3A2096EA786EF8EF1665BDE5474D` |
-| HTTP `obi.exe` | `84522E056DFDDBCD8338231E7928AC141E8F2FE192FD1A5EF73556D9D4961FD4` |
-| `obi_flow_classify.sys` | `D7A8113B2D6D009E09BDABA04249532C20B2EE9D08B86224E842BCC164276540` |
+| OBI source | `19eca98156fef1d7649a8c0f91b4067a0ca8bbda` |
+| eBPF-for-Windows source | `11dbf943eddbe6101e3ebb861d3e31ca9df85215` |
+| `NetEbpfExt.sys` | `F3B2148D9778D270DB7C2E01847AAF8B15B767517672BC7E8E12E26313E13314` |
+| HTTP `obi.exe` | `DAE0AA790E47210032E3CCDFD86B7354F4205F70892946C5F115BF3563C8B1AC` |
+| `obi_flow_classify.sys` | `B76F0137307B49EA5A85E10187CA6B04FB9AACE106CD5D9FDDA749BDC3EA590D` |
+| HTTP client | `15E97D980A3D6DED4ECF5D331DC405E67997479B1B64D28F053AECB68802C42B` |
+| HTTP target | `4E9AF304EE9780233DE0346D1F60F8F6389E696F532B4F8DCC4201A487FCA684` |
 
-Run the accepted trace from an elevated PowerShell after deploying the
-coherent runtime with `scripts/Deploy-FlowClassifyRuntime.ps1`:
+The ignored evidence bundle is
+`artifacts/evidence-linked-final-20260727T181918Z/`. It contains raw and
+sanitized Collector output, client, target, OBI, build, deployment, cleanup,
+VM-state, crash-analysis, rollback, and checksum evidence. All three runs
+ended with empty program, map, and link tables. The four eBPF services remained
+running, Packet Monitor was stopped, and no bugcheck occurred after the
+corrected driver was deployed.
+
+Run a fresh trace from elevated PowerShell after deploying the coherent
+runtime with `scripts/Deploy-FlowClassifyRuntime.ps1`:
 
 ```powershell
 .\scripts\Run-HTTPExample.ps1 `
-    -StageDirectory C:\src\obi-http-flowclassify-stage `
-    -RequestPath /linked-repeat `
-    -Traceparent 00-33333333333333333333333333333333-4444444444444444-01
+    -StageDirectory C:\src\obi-linked-5cd44de5 `
+    -RequestPath /linked-final-4 `
+    -EvidenceDirectory C:\src\obi-linked-5cd44de5\evidence\linked-final-4
 ```
 
 This remains a development PoC: it supports bounded plaintext HTTP/1.1 headers

@@ -33,9 +33,9 @@ exported the SERVER child:
 
 | Run | Trace ID | CLIENT span ID | SERVER parent ID | SERVER span ID |
 | --- | --- | --- | --- | --- |
-| 1 | `c9cce1fdc6c2f5b03d31a9c18a62976b` | `b8eb553960d02070` | `b8eb553960d02070` | `39f4b035a73bd08f` |
-| 2 | `67f02d1e9a20c643610f84487881265d` | `919d495419d72404` | `919d495419d72404` | `c686b443856b9b9c` |
-| 3 | `445a5f5e209a93daf232f04be86154a3` | `00e6c54c2130f97e` | `00e6c54c2130f97e` | `064d9957e88a49b0` |
+| 1 | `3cda6d782806fad1d52dcf1a9d0bc182` | `feb0a877506443a1` | `feb0a877506443a1` | `d7f8d636a72a63b4` |
+| 2 | `4ce8083cdef38528c25490eb08fd64b0` | `d60444a195dbe41d` | `d60444a195dbe41d` | `31fea55a87d11bd1` |
+| 3 | `17f089d1b9c08d8143312e67562acd0e` | `77bfb3a555c1bada` | `77bfb3a555c1bada` | `d2664f24725e04bc` |
 
 Each request was `GET /linked-final-N` on `127.0.0.1:18080` and returned
 HTTP 204. The Collector also reported the expected server address, port, and
@@ -62,16 +62,17 @@ The accepted source commits and deployed artifact hashes were:
 
 | Item | Commit or SHA-256 |
 | --- | --- |
-| OBI source | `19eca98156fef1d7649a8c0f91b4067a0ca8bbda` |
-| eBPF-for-Windows source | `11dbf943eddbe6101e3ebb861d3e31ca9df85215` |
-| `NetEbpfExt.sys` | `F3B2148D9778D270DB7C2E01847AAF8B15B767517672BC7E8E12E26313E13314` |
-| HTTP `obi.exe` | `DAE0AA790E47210032E3CCDFD86B7354F4205F70892946C5F115BF3563C8B1AC` |
-| `obi_flow_classify.sys` | `B76F0137307B49EA5A85E10187CA6B04FB9AACE106CD5D9FDDA749BDC3EA590D` |
-| HTTP client | `15E97D980A3D6DED4ECF5D331DC405E67997479B1B64D28F053AECB68802C42B` |
-| HTTP target | `4E9AF304EE9780233DE0346D1F60F8F6389E696F532B4F8DCC4201A487FCA684` |
+| OBI source | `218a0d200a1ba4f1c6d54a2102884fe9ebbbe178` |
+| eBPF-for-Windows source | `09fb1397e560513e3710269920346c9c9c60afbd` |
+| ntosebpfext source | `bb41d8b10c488a28d98c874b1b1a55f40f22dc44` |
+| `NetEbpfExt.sys` | `43D44F666D268D6A182D61D85CCB4118BF16B28B8F2E017AF987C6FCD5424C66` |
+| HTTP `obi.exe` | `5363C1D2973D9C06AB7ADB3DF5A84837998BF4EC428A9E67CABBF25042342F95` |
+| `obi_flow_classify.sys` | `DB34E037CDB4D7FC04D3619F88199B8E61FD738569618056C13C2D16B0102EB8` |
+| HTTP client | `0FE5C97299822EDAE497DC061440CE38CC9461C6978DFC3347C45D3456E6BD22` |
+| HTTP target | `3C7650516B6D965612BFFA67FAB3EB030E14D9A6EFDC6FD270A8B3C83965983F` |
 
 The ignored evidence bundle is
-`artifacts/evidence-linked-final-20260727T181918Z/`. It contains raw and
+`artifacts/evidence-linked-reviewed-20260727T221638Z/`. It contains raw and
 sanitized Collector output, client, target, OBI, build, deployment, cleanup,
 VM-state, crash-analysis, rollback, and checksum evidence. All three runs
 ended with empty program, map, and link tables. The four eBPF services remained
@@ -83,9 +84,9 @@ runtime with `scripts/Deploy-FlowClassifyRuntime.ps1`:
 
 ```powershell
 .\scripts\Run-HTTPExample.ps1 `
-    -StageDirectory C:\src\obi-linked-5cd44de5 `
+    -StageDirectory C:\src\obi-linked-reviewed-218a0d20 `
     -RequestPath /linked-final-4 `
-    -EvidenceDirectory C:\src\obi-linked-5cd44de5\evidence\linked-final-4
+    -EvidenceDirectory C:\src\obi-linked-reviewed-218a0d20\evidence\linked-final-4
 ```
 
 This remains a development PoC: it supports bounded plaintext HTTP/1.1 headers

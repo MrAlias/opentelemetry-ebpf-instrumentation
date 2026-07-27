@@ -44,7 +44,19 @@ function Invoke-Checked {
         [string]$Description
     )
 
-    $displayArguments = @($ArgumentList | ForEach-Object {
+    $commandPath = $FilePath
+    $commandArguments = $ArgumentList
+    if ([IO.Path]::GetExtension($FilePath) -ieq '.ps1') {
+        $commandPath = 'powershell.exe'
+        $commandArguments = @(
+            '-NoLogo',
+            '-NoProfile',
+            '-ExecutionPolicy', 'Bypass',
+            '-File', $FilePath
+        ) + $ArgumentList
+    }
+
+    $displayArguments = @($commandArguments | ForEach-Object {
             $argument = $_.ToString()
             if ($argument -match '\s') {
                 '"{0}"' -f $argument.Replace('"', '\"')
@@ -54,11 +66,11 @@ function Invoke-Checked {
         })
     $commands.Add([ordered]@{
             description = $Description
-            command = ('"{0}" {1}' -f $FilePath, ($displayArguments -join ' '))
+            command = ('"{0}" {1}' -f $commandPath, ($displayArguments -join ' '))
             working_directory = (Get-Location).Path
         })
 
-    & $FilePath @ArgumentList
+    & $commandPath @commandArguments
     if ($LASTEXITCODE -ne 0) {
         throw "$Description failed with exit code $LASTEXITCODE"
     }

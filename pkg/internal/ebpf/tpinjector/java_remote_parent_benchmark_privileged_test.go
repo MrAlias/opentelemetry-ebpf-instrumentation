@@ -459,6 +459,14 @@ func runPrimaryOneShotBenchmark(
 			t, maps, process, owner, capability, negotiation, pair.client, nextGeneration,
 		)
 		observed := monotonicNowNS(t)
+		stateKey := BpfJavaRemoteParentJavaRemoteParentKeyT{
+			Owner:      owner,
+			Generation: generation,
+		}
+		var state BpfJavaRemoteParentJavaRemoteParentStateT
+		require.NoError(t, maps.JavaRemoteParentState.Lookup(stateKey, &state))
+		state.Aliases = uint32(len(workers))
+		require.NoError(t, maps.JavaRemoteParentState.Update(stateKey, state, ebpf.UpdateExist))
 		for _, worker := range workers {
 			require.NoError(t, maps.JavaRemoteParentTasks.Update(
 				worker.owner,

@@ -352,6 +352,16 @@ try {
         ) `
         -Description 'Build OBI, target, client, and process probe'
 
+    Invoke-Checked `
+        -FilePath 'go.exe' `
+        -ArgumentList @(
+            'build',
+            '-trimpath',
+            '-o', (Join-Path $outputDirectory 'obi-windows-http-target.exe'),
+            './examples/windows-process-tracing/http-target'
+        ) `
+        -Description 'Build the deterministic HTTP target'
+
     $clang = 'C:\Program Files\LLVM\bin\clang.exe'
     Invoke-Checked `
         -FilePath $clang `
@@ -519,6 +529,7 @@ Copy-Item -LiteralPath $runtimeDirectory -Destination $packageDirectory -Recurse
 foreach ($file in @(
         'obi.exe',
         'obi-windows-target.exe',
+        'obi-windows-http-target.exe',
         'obi-windows-http-client.exe',
         'obi_process_start.sys',
         'obi_flow_classify.sys',

@@ -47,6 +47,11 @@ enum {
   remote_parent_transport_getsockopt = 1,
   remote_parent_transport_unix = 2,
   remote_parent_transport_disabled = 3,
+  remote_parent_transport_none = 255,
+  remote_parent_config_result_version = 2,
+  remote_parent_config_result_magic = 0x4f,
+  remote_parent_attempt_getsockopt = 1,
+  remote_parent_attempt_unix = 2,
   remote_parent_operation_take = 1,
   remote_parent_operation_discard = 2,
   remote_parent_operation_negotiate = 3,
@@ -68,6 +73,15 @@ struct remote_parent_config {
   uint64_t process_incarnation;
   _Atomic unsigned int references;
   char unix_socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+};
+
+struct remote_parent_config_result {
+  int status;
+  unsigned char requested_transport;
+  unsigned char selected_transport;
+  unsigned char attempted_transports;
+  unsigned char getsockopt_status;
+  unsigned char unix_status;
 };
 
 static pthread_mutex_t remote_parent_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -741,31 +755,70 @@ new_remote_parent_config(const char *path, int timeout_millis, uid_t server_uid,
   return config;
 }
 
-static int configure_remote_parent(int requested_transport, const char *path,
-                                   int timeout_millis, uid_t server_uid,
-                                   uint64_t process_incarnation) {
+static struct remote_parent_config_result
+new_remote_parent_config_result(int requested_transport) {
+  struct remote_parent_config_result result = {
+      .status = remote_parent_status_unknown,
+      .requested_transport = remote_parent_transport_none,
+      .selected_transport = remote_parent_transport_none,
+      .attempted_transports = 0,
+      .getsockopt_status = remote_parent_status_unknown,
+      .unix_status = remote_parent_status_unknown,
+  };
+  if (requested_transport >= remote_parent_transport_auto &&
+      requested_transport <= remote_parent_transport_disabled) {
+    result.requested_transport = (unsigned char)requested_transport;
+  }
+  return result;
+}
+
+static uint64_t
+pack_remote_parent_config_result(struct remote_parent_config_result result) {
+  return ((uint64_t)(unsigned int)result.status & UINT64_C(0xff)) |
+         ((uint64_t)result.requested_transport << 8) |
+         ((uint64_t)result.selected_transport << 16) |
+         ((uint64_t)result.attempted_transports << 24) |
+         ((uint64_t)result.getsockopt_status << 32) |
+         ((uint64_t)result.unix_status << 40) |
+         ((uint64_t)remote_parent_config_result_version << 48) |
+         ((uint64_t)remote_parent_config_result_magic << 56);
+}
+
+static struct remote_parent_config_result
+configure_remote_parent_result(int requested_transport, const char *path,
+                               int timeout_millis, uid_t server_uid,
+                               uint64_t process_incarnation) {
+  struct remote_parent_config_result result =
+      new_remote_parent_config_result(requested_transport);
+
   int64_t start = monotonic_millis();
   int64_t deadline = deadline_after_millis(start, timeout_millis);
   if (deadline < 0) {
-    return remote_parent_status_transport_error;
+    result.status = remote_parent_status_transport_error;
+    return result;
   }
 
   if (requested_transport == remote_parent_transport_disabled) {
-    int status = swap_remote_parent_config(NULL, timeout_millis, deadline);
-    return status == remote_parent_status_valid ? remote_parent_status_disabled
-                                                : status;
+    result.status = swap_remote_parent_config(NULL, timeout_millis, deadline);
+    if (result.status == remote_parent_status_valid) {
+      result.status = remote_parent_status_disabled;
+      result.selected_transport = remote_parent_transport_disabled;
+    }
+    return result;
   }
 
   errno = 0;
   struct remote_parent_config *candidate = new_remote_parent_config(
       path, timeout_millis, server_uid, process_incarnation);
   if (candidate == NULL) {
-    return errno == EINVAL ? remote_parent_status_malformed
-                           : remote_parent_status_overload;
+    result.status = errno == EINVAL ? remote_parent_status_malformed
+                                    : remote_parent_status_overload;
+    return result;
   }
 
   if (requested_transport == remote_parent_transport_auto ||
       requested_transport == remote_parent_transport_getsockopt) {
+    result.attempted_transports |= remote_parent_attempt_getsockopt;
     int probe = remote_parent_status_unsupported;
     if (connected_tcp_probe_pair(&candidate->dummy_socket,
                                  &candidate->dummy_peer_socket) == 0) {
@@ -778,12 +831,15 @@ static int configure_remote_parent(int requested_transport, const char *path,
       }
       if (probe_succeeded(probe)) {
         candidate->transport = remote_parent_transport_getsockopt;
-        int status =
+        result.getsockopt_status = remote_parent_status_valid;
+        result.status =
             swap_remote_parent_config(candidate, timeout_millis, deadline);
-        if (status != remote_parent_status_valid) {
+        if (result.status != remote_parent_status_valid) {
           release_remote_parent_config(candidate);
+        } else {
+          result.selected_transport = remote_parent_transport_getsockopt;
         }
-        return status;
+        return result;
       }
       close(candidate->dummy_socket);
       candidate->dummy_socket = -1;
@@ -792,37 +848,48 @@ static int configure_remote_parent(int requested_transport, const char *path,
     } else {
       probe = errno_status(errno);
     }
+    result.getsockopt_status = (unsigned char)failed_probe_status(probe);
     if (requested_transport == remote_parent_transport_getsockopt) {
       release_remote_parent_config(candidate);
-      return failed_probe_status(probe);
+      result.status = result.getsockopt_status;
+      return result;
     }
   }
 
   if ((requested_transport == remote_parent_transport_auto ||
        requested_transport == remote_parent_transport_unix) &&
       candidate->unix_socket_path[0] != '\0') {
+    result.attempted_transports |= remote_parent_attempt_unix;
     if (verify_unix_path(candidate) != 0) {
-      int status = errno_status(errno);
+      result.unix_status = (unsigned char)errno_status(errno);
+      result.status = result.unix_status;
       release_remote_parent_config(candidate);
-      return status;
+      return result;
     }
     unsigned char response[remote_parent_record_size];
     int probe = call_unix_socket(candidate, remote_parent_operation_negotiate,
                                  response, deadline);
     if (!probe_succeeded(probe)) {
+      result.unix_status = (unsigned char)failed_probe_status(probe);
+      result.status = result.unix_status;
       release_remote_parent_config(candidate);
-      return failed_probe_status(probe);
+      return result;
     }
+    result.unix_status = remote_parent_status_valid;
     candidate->transport = remote_parent_transport_unix;
-    int status = swap_remote_parent_config(candidate, timeout_millis, deadline);
-    if (status != remote_parent_status_valid) {
+    result.status =
+        swap_remote_parent_config(candidate, timeout_millis, deadline);
+    if (result.status != remote_parent_status_valid) {
       release_remote_parent_config(candidate);
+    } else {
+      result.selected_transport = remote_parent_transport_unix;
     }
-    return status;
+    return result;
   }
 
   release_remote_parent_config(candidate);
-  return remote_parent_status_unsupported;
+  result.status = remote_parent_status_unsupported;
+  return result;
 }
 
 static int call_remote_parent(int operation, int socket_fd,
@@ -1008,8 +1075,17 @@ void obi_test_build_task_context_packet(unsigned char *packet, int operation,
 int obi_test_configure_remote_parent(int transport, const char *path,
                                      int timeout_millis, uid_t server_uid,
                                      uint64_t process_incarnation) {
-  return configure_remote_parent(transport, path, timeout_millis, server_uid,
-                                 process_incarnation);
+  return configure_remote_parent_result(transport, path, timeout_millis,
+                                        server_uid, process_incarnation)
+      .status;
+}
+
+uint64_t obi_test_configure_remote_parent_v2(int transport, const char *path,
+                                             int timeout_millis,
+                                             uid_t server_uid,
+                                             uint64_t process_incarnation) {
+  return pack_remote_parent_config_result(configure_remote_parent_result(
+      transport, path, timeout_millis, server_uid, process_incarnation));
 }
 
 int obi_test_call_remote_parent(int operation, unsigned char *response) {
@@ -1127,6 +1203,36 @@ Java_io_opentelemetry_obi_java_BootstrapNative_emitTaskContextOp(
   return ioctl(0, obi_ioctl_magic, packet);
 }
 
+static struct remote_parent_config_result
+configure_remote_parent_jni(JNIEnv *env, jclass clazz, jint transport,
+                            jstring unix_path, jint timeout_millis,
+                            jlong server_uid, jlong process_incarnation) {
+  struct remote_parent_config_result result =
+      new_remote_parent_config_result(transport);
+  if (!timeout_valid(timeout_millis) || server_uid < 0 ||
+      (uint64_t)(uid_t)server_uid != (uint64_t)server_uid ||
+      process_incarnation == 0) {
+    result.status = remote_parent_status_malformed;
+    return result;
+  }
+
+  const char *path = NULL;
+  if (unix_path != NULL) {
+    path = (*env)->GetStringUTFChars(env, unix_path, NULL);
+    if (path == NULL) {
+      result.status = remote_parent_status_transport_error;
+      return result;
+    }
+  }
+  result = configure_remote_parent_result(transport, path, timeout_millis,
+                                          (uid_t)server_uid,
+                                          (uint64_t)process_incarnation);
+  if (path != NULL) {
+    (*env)->ReleaseStringUTFChars(env, unix_path, path);
+  }
+  return result;
+}
+
 /*
  * Class:     io_opentelemetry_obi_java_BootstrapNative
  * Method:    configureRemoteParentTransport
@@ -1136,26 +1242,24 @@ JNIEXPORT jint JNICALL
 Java_io_opentelemetry_obi_java_BootstrapNative_configureRemoteParentTransport(
     JNIEnv *env, jclass clazz, jint transport, jstring unix_path,
     jint timeout_millis, jlong server_uid, jlong process_incarnation) {
-  if (!timeout_valid(timeout_millis) || server_uid < 0 ||
-      (uint64_t)(uid_t)server_uid != (uint64_t)server_uid ||
-      process_incarnation == 0) {
-    return remote_parent_status_malformed;
-  }
+  return configure_remote_parent_jni(env, clazz, transport, unix_path,
+                                     timeout_millis, server_uid,
+                                     process_incarnation)
+      .status;
+}
 
-  const char *path = NULL;
-  if (unix_path != NULL) {
-    path = (*env)->GetStringUTFChars(env, unix_path, NULL);
-    if (path == NULL) {
-      return remote_parent_status_transport_error;
-    }
-  }
-  int status =
-      configure_remote_parent(transport, path, timeout_millis,
-                              (uid_t)server_uid, (uint64_t)process_incarnation);
-  if (path != NULL) {
-    (*env)->ReleaseStringUTFChars(env, unix_path, path);
-  }
-  return status;
+/*
+ * Class:     io_opentelemetry_obi_java_BootstrapNative
+ * Method:    configureRemoteParentTransportV2
+ * Signature: (ILjava/lang/String;IJJ)J
+ */
+JNIEXPORT jlong JNICALL
+Java_io_opentelemetry_obi_java_BootstrapNative_configureRemoteParentTransportV2(
+    JNIEnv *env, jclass clazz, jint transport, jstring unix_path,
+    jint timeout_millis, jlong server_uid, jlong process_incarnation) {
+  return (jlong)pack_remote_parent_config_result(configure_remote_parent_jni(
+      env, clazz, transport, unix_path, timeout_millis, server_uid,
+      process_incarnation));
 }
 
 static jint remote_parent_response(JNIEnv *env, jbyteArray output,

@@ -37,6 +37,10 @@ void obi_test_build_task_context_packet(unsigned char *packet, int operation,
 int obi_test_configure_remote_parent(int transport, const char *path,
                                      int timeout_millis, uid_t server_uid,
                                      uint64_t process_incarnation);
+uint64_t obi_test_configure_remote_parent_v2(int transport, const char *path,
+                                             int timeout_millis,
+                                             uid_t server_uid,
+                                             uint64_t process_incarnation);
 int obi_test_call_remote_parent(int operation, unsigned char *response);
 int obi_test_call_remote_parent_on_socket(int operation, int socket_fd,
                                           unsigned char *response);
@@ -48,6 +52,9 @@ int obi_test_lock_remote_parent(void);
 int obi_test_unlock_remote_parent(void);
 
 jint Java_io_opentelemetry_obi_java_BootstrapNative_configureRemoteParentTransport(
+    JNIEnv *env, jclass clazz, jint transport, jstring unix_path,
+    jint timeout_millis, jlong server_uid, jlong process_incarnation);
+jlong Java_io_opentelemetry_obi_java_BootstrapNative_configureRemoteParentTransportV2(
     JNIEnv *env, jclass clazz, jint transport, jstring unix_path,
     jint timeout_millis, jlong server_uid, jlong process_incarnation);
 jint Java_io_opentelemetry_obi_java_BootstrapNative_takeRemoteParent(
@@ -880,6 +887,44 @@ static void test_peer_credentials(void) {
   assert(!obi_test_peer_credentials_allowed(0, current_uid, foreign_uid));
 }
 
+static void test_configuration_result_layout(void) {
+  fake_setsockopt_error = 0;
+  fake_health_error = 0;
+  fake_health_mismatch = 0;
+  reset_transport_observations();
+
+  uint64_t result =
+      obi_test_configure_remote_parent_v2(0, "", 50, geteuid(), 1);
+  assert(result == UINT64_C(0x4f02000101010001));
+  assert(atomic_load(&observed_setsockopt_calls) == 1);
+  assert(atomic_load(&observed_getsockopt_calls) == 1);
+  obi_test_close_remote_parent();
+
+  fake_setsockopt_error = EACCES;
+  result = obi_test_configure_remote_parent_v2(1, "", 50, geteuid(), 1);
+  assert(result == UINT64_C(0x4f02000801ff0108));
+  fake_setsockopt_error = 0;
+
+  result = obi_test_configure_remote_parent_v2(3, "", 50, geteuid(), 1);
+  assert(result == UINT64_C(0x4f0200000003030d));
+
+  result = obi_test_configure_remote_parent_v2(4, "", 50, geteuid(), 1);
+  assert(result == UINT64_C(0x4f02000000ffff04));
+
+  char overlong_path[sizeof(((struct sockaddr_un *)0)->sun_path) + 1];
+  memset(overlong_path, 'x', sizeof(overlong_path) - 1);
+  overlong_path[sizeof(overlong_path) - 1] = '\0';
+  assert(obi_test_configure_remote_parent(4, "", 50, geteuid(), 1) == 4);
+  assert(obi_test_configure_remote_parent(4, overlong_path, 50, geteuid(), 1) ==
+         5);
+
+  assert(obi_test_lock_remote_parent() == 0);
+  result = obi_test_configure_remote_parent_v2(1, "", 1, geteuid(), 1);
+  assert(result == UINT64_C(0x4f02000101ff010a));
+  assert(obi_test_unlock_remote_parent() == 0);
+  obi_test_close_remote_parent();
+}
+
 static void test_sockopt_negotiate_and_health_probe(void) {
   fake_setsockopt_error = 0;
   fake_health_error = 0;
@@ -1024,6 +1069,13 @@ static void test_exported_jni_transport_lifecycle(void) {
           env, NULL, 1, (jstring)&path, 20, geteuid(), 42) == 1);
   assert(path.releases == 1);
 
+  assert(
+      (uint64_t)
+          Java_io_opentelemetry_obi_java_BootstrapNative_configureRemoteParentTransportV2(
+              env, NULL, 0, (jstring)&path, 20, geteuid(), 42) ==
+      UINT64_C(0x4f02000101010001));
+  assert(path.releases == 2);
+
   fake_getsockopt_status = 1;
   memset(response.bytes, 0xff, sizeof(response.bytes));
   assert(Java_io_opentelemetry_obi_java_BootstrapNative_takeRemoteParent(
@@ -1123,6 +1175,61 @@ struct trickle_server {
   char path[sizeof(((struct sockaddr_un *)0)->sun_path)];
 };
 
+static void start_unix_test_server(struct trickle_server *server,
+                                   const char *name) {
+  snprintf(server->path, sizeof(server->path), "/tmp/obi-jni-%s-%ld.sock", name,
+           (long)getpid());
+  unlink(server->path);
+
+  server->listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  assert(server->listener >= 0);
+  struct sockaddr_un address = {.sun_family = AF_UNIX};
+  memcpy(address.sun_path, server->path, strlen(server->path) + 1);
+  assert(bind(server->listener, (struct sockaddr *)&address, sizeof(address)) ==
+         0);
+  assert(listen(server->listener, 1) == 0);
+}
+
+static void *run_probe_server(void *argument) {
+  struct trickle_server *server = argument;
+  int client = accept(server->listener, NULL, NULL);
+  assert(client >= 0);
+
+  unsigned char request[24];
+  size_t received = 0;
+  while (received < sizeof(request)) {
+    ssize_t count =
+        recv(client, request + received, sizeof(request) - received, 0);
+    assert(count > 0);
+    received += (size_t)count;
+  }
+
+  unsigned char response[64];
+  obi_test_status_response(response, 2);
+  assert(send(client, response, sizeof(response), MSG_NOSIGNAL) ==
+         (ssize_t)sizeof(response));
+
+  close(client);
+  close(server->listener);
+  unlink(server->path);
+  return NULL;
+}
+
+static void test_configuration_result_auto_fallback(void) {
+  struct trickle_server server = {0};
+  start_unix_test_server(&server, "fallback");
+
+  fake_setsockopt_error = ENOPROTOOPT;
+  pthread_t thread;
+  assert(pthread_create(&thread, NULL, run_probe_server, &server) == 0);
+  uint64_t result =
+      obi_test_configure_remote_parent_v2(0, server.path, 50, geteuid(), 1);
+  assert(result == UINT64_C(0x4f02010403020001));
+  assert(pthread_join(thread, NULL) == 0);
+  fake_setsockopt_error = 0;
+  obi_test_close_remote_parent();
+}
+
 static void *run_trickle_server(void *argument) {
   struct trickle_server *server = argument;
   int client = accept(server->listener, NULL, NULL);
@@ -1160,17 +1267,7 @@ static void *run_trickle_server(void *argument) {
 
 static void test_unix_trickle_response_obeys_deadline(void) {
   struct trickle_server server = {0};
-  snprintf(server.path, sizeof(server.path), "/tmp/obi-jni-test-%ld.sock",
-           (long)getpid());
-  unlink(server.path);
-
-  server.listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  assert(server.listener >= 0);
-  struct sockaddr_un address = {.sun_family = AF_UNIX};
-  memcpy(address.sun_path, server.path, strlen(server.path) + 1);
-  assert(bind(server.listener, (struct sockaddr *)&address, sizeof(address)) ==
-         0);
-  assert(listen(server.listener, 1) == 0);
+  start_unix_test_server(&server, "trickle");
 
   pthread_t thread;
   assert(pthread_create(&thread, NULL, run_trickle_server, &server) == 0);
@@ -1467,6 +1564,7 @@ int main(int argc, char **argv) {
   test_probe_status();
   test_timeout_validation();
   test_peer_credentials();
+  test_configuration_result_layout();
   test_sockopt_negotiate_and_health_probe();
   test_forced_setsockopt_preserves_failure();
   test_forced_getsockopt_health_preserves_failure();
@@ -1476,6 +1574,7 @@ int main(int argc, char **argv) {
   test_retrieval_never_renegotiates_socket();
   test_exported_jni_transport_lifecycle();
   test_exported_jni_configuration_validation();
+  test_configuration_result_auto_fallback();
   test_unix_trickle_response_obeys_deadline();
   test_unix_server_first_failure_response();
   test_unix_server_first_valid_response_is_rejected();

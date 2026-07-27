@@ -91,6 +91,13 @@ public final class BootstrapNative {
       long serverUid,
       long processIncarnation);
 
+  public static native long configureRemoteParentTransportV2(
+      int transport,
+      String unixSocketPath,
+      int timeoutMillis,
+      long serverUid,
+      long processIncarnation);
+
   public static native int takeRemoteParent(int socketFileDescriptor, byte[] response);
 
   public static native int discardRemoteParent(int socketFileDescriptor, byte[] response);

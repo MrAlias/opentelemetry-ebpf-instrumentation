@@ -4,15 +4,12 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -143,7 +140,13 @@ func run(ctx context.Context, opts options) (result, error) {
 		return result{}, err
 	}
 
-	response, err := sendRequest(spanCtx, request)
+	httpClient := &http.Client{
+		Timeout: opts.timeout,
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+		},
+	}
+	response, err := httpClient.Do(request)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
@@ -185,41 +188,6 @@ func run(ctx context.Context, opts options) (result, error) {
 		SpanKind:   trace.SpanKindClient.String(),
 		Service:    clientServiceName,
 	}, nil
-}
-
-func sendRequest(ctx context.Context, request *http.Request) (*http.Response, error) {
-	connection, err := (&net.Dialer{}).DialContext(ctx, "tcp", request.URL.Host)
-	if err != nil {
-		return nil, fmt.Errorf("connect to HTTP target: %w", err)
-	}
-	defer connection.Close()
-
-	if deadline, ok := ctx.Deadline(); ok {
-		if err := connection.SetDeadline(deadline); err != nil {
-			return nil, fmt.Errorf("set HTTP connection deadline: %w", err)
-		}
-	}
-
-	var wire bytes.Buffer
-	if err := request.Write(&wire); err != nil {
-		return nil, fmt.Errorf("serialize HTTP request: %w", err)
-	}
-	for payload := wire.Bytes(); len(payload) > 0; {
-		written, err := connection.Write(payload)
-		if err != nil {
-			return nil, fmt.Errorf("send HTTP request: %w", err)
-		}
-		if written == 0 {
-			return nil, io.ErrShortWrite
-		}
-		payload = payload[written:]
-	}
-
-	response, err := http.ReadResponse(bufio.NewReader(connection), request)
-	if err != nil {
-		return nil, fmt.Errorf("read HTTP response headers: %w", err)
-	}
-	return response, nil
 }
 
 func newRequest(ctx context.Context, target string, propagator propagation.TextMapPropagator) (*http.Request, error) {

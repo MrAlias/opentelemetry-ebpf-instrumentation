@@ -33,13 +33,13 @@ exported the SERVER child:
 
 | Run | Trace ID | CLIENT span ID | SERVER parent ID | SERVER span ID |
 | --- | --- | --- | --- | --- |
-| 1 | `3cda6d782806fad1d52dcf1a9d0bc182` | `feb0a877506443a1` | `feb0a877506443a1` | `d7f8d636a72a63b4` |
-| 2 | `4ce8083cdef38528c25490eb08fd64b0` | `d60444a195dbe41d` | `d60444a195dbe41d` | `31fea55a87d11bd1` |
-| 3 | `17f089d1b9c08d8143312e67562acd0e` | `77bfb3a555c1bada` | `77bfb3a555c1bada` | `d2664f24725e04bc` |
+| 1 | `c5d444889e4bdd0850e1c86d86667fdd` | `fabcf96981b13bba` | `fabcf96981b13bba` | `a53830dab0a5ccec` |
+| 2 | `a6c8546945264656845020ab27faa3e7` | `787b3cf7cbfb39e5` | `787b3cf7cbfb39e5` | `2fa1b5b4efd9b928` |
+| 3 | `291e9f45c946bb2d7637397ca29f37bd` | `351116e3307d3d66` | `351116e3307d3d66` | `1303f3226fcee83f` |
 
-Each request was `GET /linked-final-N` on `127.0.0.1:18080` and returned
-HTTP 204. The Collector also reported the expected server address, port, and
-target PID. The OBI SERVER resource identity was:
+Each request was `GET /linked-final-reviewed-N` on `127.0.0.1:18080` and
+returned HTTP 204. The Collector also reported the expected server address,
+port, and target PID. The OBI SERVER resource identity was:
 
 ```text
 service.name:          obi-windows-http-target.exe
@@ -62,35 +62,56 @@ The accepted source commits and deployed artifact hashes were:
 
 | Item | Commit or SHA-256 |
 | --- | --- |
-| OBI source | `218a0d200a1ba4f1c6d54a2102884fe9ebbbe178` |
-| eBPF-for-Windows source | `09fb1397e560513e3710269920346c9c9c60afbd` |
+| OBI package source | `f92f89765a560ba11bad7d9917d137001d83e923` |
+| eBPF-for-Windows source | `76cf8b306b03398ade6f519e4d00e9ae5c1e0f4b` |
 | ntosebpfext source | `bb41d8b10c488a28d98c874b1b1a55f40f22dc44` |
-| `NetEbpfExt.sys` | `43D44F666D268D6A182D61D85CCB4118BF16B28B8F2E017AF987C6FCD5424C66` |
-| HTTP `obi.exe` | `5363C1D2973D9C06AB7ADB3DF5A84837998BF4EC428A9E67CABBF25042342F95` |
-| `obi_flow_classify.sys` | `DB34E037CDB4D7FC04D3619F88199B8E61FD738569618056C13C2D16B0102EB8` |
-| HTTP client | `0FE5C97299822EDAE497DC061440CE38CC9461C6978DFC3347C45D3456E6BD22` |
-| HTTP target | `3C7650516B6D965612BFFA67FAB3EB030E14D9A6EFDC6FD270A8B3C83965983F` |
+| `NetEbpfExt.sys` | `EF6471392CC97CDF57B5765F36A2DC3A25BF1753D435CAF35A1E4CBE171B2FEA` |
+| HTTP `obi.exe` | `CB773E87BCFD94793EC4A73B9E0DC33A29E37A315B33CC96449757CFAC248EDE` |
+| `obi_flow_classify.sys` | `00CE01908D12CADC2852AD5569F2ABAD37D6474F08491E85B4D71F34BB4123A6` |
+| HTTP client | `90474CE1BDDB633CF671FDF0600FA12F66FBB8E44AD25E0A1CCABCE2BB3F1590` |
+| HTTP target | `73A2872F9E69BBBE1D86F0C3E472665235E0F3F5BD6387852EAD549908C38C1E` |
 
 The ignored evidence bundle is
-`artifacts/evidence-linked-reviewed-20260727T221638Z/`. It contains raw and
-sanitized Collector output, client, target, OBI, build, deployment, cleanup,
-VM-state, crash-analysis, rollback, and checksum evidence. All three runs
-ended with empty program, map, and link tables. The four eBPF services remained
-running, Packet Monitor was stopped, and no bugcheck occurred after the
-corrected driver was deployed.
+`artifacts/evidence-linked-reviewed-final-20260727T230349Z/`. It contains raw
+and sanitized Collector output, client, target, OBI, build, deployment,
+cleanup, VM-state, rollback-rehearsal, review, and checksum evidence. All
+three runs ended with empty program, map, and link tables. The four eBPF
+services remained running, Packet Monitor was stopped, and no bugcheck
+occurred after the corrected driver was deployed.
 
-Run a fresh trace from elevated PowerShell after deploying the coherent
-runtime with `scripts/Deploy-FlowClassifyRuntime.ps1`:
+Build the coherent package from this example directory on the development
+workstation:
 
 ```powershell
-.\scripts\Run-HTTPExample.ps1 `
-    -StageDirectory C:\src\obi-linked-reviewed-218a0d20 `
-    -RequestPath /linked-final-4 `
-    -EvidenceDirectory C:\src\obi-linked-reviewed-218a0d20\evidence\linked-final-4
+.\scripts\Build-HTTPExample.ps1 `
+    -EbpfForWindowsSource C:\src\ebpf-for-windows `
+    -NtosEbpfExtSource C:\src\ntosebpfext `
+    -OutputDirectory C:\src\obi-http-build
 ```
 
-This remains a development PoC: it supports bounded plaintext HTTP/1.1 headers
-only, does not capture bodies or TLS plaintext, and uses test-signed drivers.
+Copy the complete `C:\src\obi-http-build\vm-package` directory to a fresh
+directory on the development VM. From elevated PowerShell on that VM, deploy
+the matching runtime and run a fresh trace:
+
+```powershell
+$stage = 'C:\src\obi-http-stage'
+
+& "$stage\Deploy-FlowClassifyRuntime.ps1" -StageDirectory $stage
+
+& "$stage\Run-HTTPExample.ps1" `
+    -StageDirectory $stage `
+    -RequestPath /linked-review `
+    -EvidenceDirectory "$stage\evidence\linked-review"
+```
+
+The deployment script requires that no eBPF objects are loaded and that no
+Flow Classify provider entry already exists. It retains the installed runtime,
+provider registry, service, and certificate state needed for rollback.
+
+HTTP tracing is deliberately one-shot; HTTP mode rejects `-once=false`.
+This remains a bounded development PoC: it supports plaintext HTTP/1.1 headers
+only, does not capture bodies or TLS plaintext, has not been concurrency
+stress-tested, and uses test-signed drivers. It is not production-qualified.
 
 ## Proven result
 

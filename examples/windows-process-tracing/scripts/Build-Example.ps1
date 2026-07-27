@@ -281,6 +281,7 @@ if (-not $visualStudio) {
 $devShellModule = Join-Path $visualStudio 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
 Import-Module $devShellModule
 Enter-VsDevShell -VsInstallPath $visualStudio -SkipAutomaticLocation -DevCmdArguments '-arch=x64'
+$env:VisualStudioVersion = '17.0'
 
 if (Test-Path -LiteralPath $processProgram) {
     Remove-Item -LiteralPath $processProgram -Force

@@ -107,7 +107,6 @@ type windowsHTTPTracer struct {
 	exporter   windowsProcessTracer
 	config     *ebpf.Map
 	targetPort uint16
-	detachFlow func() error
 
 	mu          sync.Mutex
 	generations map[uint64]processGeneration
@@ -190,7 +189,6 @@ func runWindowsHTTPTrace(ctx context.Context, opts windowsProcessOptions) error 
 		},
 		config:      flowConfig,
 		targetPort:  uint16(opts.targetPort),
-		detachFlow:  flowLink.Close,
 		generations: map[uint64]processGeneration{},
 		flows:       map[httpFlowKey]*httpFlowState{},
 	}
@@ -337,14 +335,6 @@ func (t *windowsHTTPTracer) readHTTPFlows(ctx context.Context, reader *ringbuf.R
 		}
 		if !complete {
 			continue
-		}
-
-		if t.exporter.options.once && t.detachFlow != nil {
-			if err := t.detachFlow(); err != nil {
-				return fmt.Errorf("detach Flow Classify link before OTLP export: %w", err)
-			}
-			t.detachFlow = nil
-			slog.Info("detached native Flow Classify link before one-shot OTLP export")
 		}
 
 		traceID, spanID, err := t.exporter.export(ctx, span)

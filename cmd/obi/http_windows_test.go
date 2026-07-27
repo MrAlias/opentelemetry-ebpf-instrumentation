@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"net"
 	"net/http"
 	"strings"
@@ -21,6 +22,27 @@ import (
 )
 
 const validTraceparent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+
+func TestWindowsHTTPRequiresOneShot(t *testing.T) {
+	options := windowsProcessOptions{
+		programPath:      "process.sys",
+		flowProgramPath:  "flow.sys",
+		targetExecutable: "target.exe",
+		targetPort:       18080,
+		otlpEndpoint:     "http://127.0.0.1:4318/v1/traces",
+		once:             false,
+	}
+
+	if err := options.validate(); !errors.Is(err, errHTTPRequiresOneShot) {
+		t.Fatalf("validate error = %v, want %v", err, errHTTPRequiresOneShot)
+	}
+
+	options.flowProgramPath = ""
+	options.targetPort = 0
+	if err := options.validate(); err != nil {
+		t.Fatalf("process-only continuous mode validation failed: %v", err)
+	}
+}
 
 func TestParseTraceparent(t *testing.T) {
 	headers := http.Header{}

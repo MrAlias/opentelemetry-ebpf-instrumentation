@@ -50,9 +50,10 @@ const (
 )
 
 var (
-	errMissingFlowProgram = errors.New("-flow-program or OTEL_EBPF_WINDOWS_FLOW_PROGRAM is required for HTTP tracing")
-	errInvalidTargetPort  = errors.New("-target-port must be between 1 and 65535 for HTTP tracing")
-	errMalformedFlowEvent = errors.New("malformed Flow Classify event")
+	errMissingFlowProgram  = errors.New("-flow-program or OTEL_EBPF_WINDOWS_FLOW_PROGRAM is required for HTTP tracing")
+	errInvalidTargetPort   = errors.New("-target-port must be between 1 and 65535 for HTTP tracing")
+	errHTTPRequiresOneShot = errors.New("native Windows HTTP tracing requires -once=true")
+	errMalformedFlowEvent  = errors.New("malformed Flow Classify event")
 )
 
 type flowFilterConfig struct {

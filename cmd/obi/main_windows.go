@@ -79,6 +79,9 @@ func (o windowsProcessOptions) validate() error {
 		if o.targetPort < 1 || o.targetPort > 65535 {
 			return errInvalidTargetPort
 		}
+		if !o.once {
+			return errHTTPRequiresOneShot
+		}
 	}
 	parsed, err := url.ParseRequestURI(o.otlpEndpoint)
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {

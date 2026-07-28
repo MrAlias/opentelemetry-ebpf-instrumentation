@@ -1103,6 +1103,13 @@ static void test_exported_jni_transport_lifecycle(void) {
              env, NULL, 59, (jbyteArray)&response) == 2);
   assert(response.bytes[8] == 2);
 
+  for (int status = 2; status <= 13; status++) {
+    fake_getsockopt_status = status;
+    assert(Java_io_opentelemetry_obi_java_BootstrapNative_takeRemoteParent(
+               env, NULL, 59, (jbyteArray)&response) == status);
+    assert(response.bytes[8] == status);
+  }
+
   fake_getsockopt_status = 3;
   assert(Java_io_opentelemetry_obi_java_BootstrapNative_discardRemoteParent(
              env, NULL, 59, (jbyteArray)&response) == 3);

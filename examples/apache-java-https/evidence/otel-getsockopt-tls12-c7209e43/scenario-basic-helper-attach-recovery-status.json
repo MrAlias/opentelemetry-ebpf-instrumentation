@@ -1,0 +1,9 @@
+{
+  "status": "passed",
+  "scenario": "basic",
+  "exit_status": 0,
+  "metric_status": 0,
+  "pressure_correlation": null,
+  "result": "scenario-basic-helper-attach-recovery.json",
+  "after_phase": "phases/basic-helper-attach-recovery-after"
+}

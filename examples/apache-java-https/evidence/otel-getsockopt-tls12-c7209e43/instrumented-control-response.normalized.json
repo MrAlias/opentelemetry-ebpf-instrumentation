@@ -1,0 +1,1 @@
+{"marker":"instrumentation-control","secure":true,"protocol":"HTTP/1.1","tls_protocol":"TLSv1.2","tls_cipher":"TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384","backend_connection_id":0,"backend_remote_port":0,"backend_socket_fd":0,"tls_read_events":0,"tls_read_bytes":0}

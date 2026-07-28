@@ -1,0 +1,10 @@
+obi_java_remote_parent_operations_total{operation="availability",status="valid",transport="getsockopt"} delta=0
+obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} delta=0
+obi_java_remote_parent_operations_total{operation="cleanup",status="valid",transport="tcp"} delta=2
+obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} delta=0
+obi_java_remote_parent_operations_total{operation="negotiate",status="missing",transport="getsockopt"} delta=2
+obi_java_remote_parent_operations_total{operation="negotiate",status="unauthorized",transport="getsockopt"} delta=1
+obi_java_remote_parent_operations_total{operation="report",status="valid",transport="tcp"} delta=5
+obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} delta=0
+obi_java_remote_parent_operations_total{operation="take",status="unauthorized",transport="getsockopt"} delta=1691
+obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} delta=0

@@ -1,0 +1,449 @@
+{
+  "status": "passed",
+  "scenario": "handoff",
+  "seed": 1,
+  "started_at": "2026-07-28T18:43:38.752872433Z",
+  "finished_at": "2026-07-28T18:43:55.169014537Z",
+  "request_count": 4,
+  "traffic_elapsed_nanos": 12222044,
+  "throughput_per_second": 327.27749957372106,
+  "latency": {
+    "p50_nanos": 10793502,
+    "p95_nanos": 12175772,
+    "p99_nanos": 12175772
+  },
+  "cases": [
+    {
+      "request": {
+        "marker": "handoff-00-84aca3ab04bf90af",
+        "endpoint": "/api/handoff",
+        "handoff_hops": 1,
+        "handoff_fault": "none"
+      },
+      "response": {
+        "marker": "handoff-00-84aca3ab04bf90af",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.2",
+        "tls_cipher": "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+        "backend_connection_id": 248,
+        "backend_remote_port": 52672,
+        "tls_read_events": 7516,
+        "tls_read_bytes": 606674,
+        "workload": "servlet-async-executor",
+        "handoff_hops": "1",
+        "handoff_fault": "none"
+      },
+      "latency_nanos": 7907205,
+      "trace": {
+        "marker": "handoff-00-84aca3ab04bf90af",
+        "received_batches": 2,
+        "received_spans": 24,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 5141,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "9eed57c3ada97da4a5a825e529981031",
+            "span_id": "e6bb4e707154c499",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/handoff",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "handoff-00-84aca3ab04bf90af",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/handoff",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/handoff"
+            },
+            "start_unix_nano": 1785264218754443870,
+            "end_unix_nano": 1785264218761589262
+          },
+          {
+            "trace_id": "9eed57c3ada97da4a5a825e529981031",
+            "span_id": "8d4615132710e456",
+            "parent_span_id": "e6bb4e707154c499",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785264218754586433,
+            "end_unix_nano": 1785264218761589262
+          },
+          {
+            "trace_id": "9eed57c3ada97da4a5a825e529981031",
+            "span_id": "c2166a6f4d7e0805",
+            "parent_span_id": "8d4615132710e456",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/handoff",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "handoff-00-84aca3ab04bf90af",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/handoff?close=1\u0026fault=none\u0026hops=1"
+            },
+            "start_unix_nano": 1785264218754868000,
+            "end_unix_nano": 1785264218761400966
+          },
+          {
+            "trace_id": "9eed57c3ada97da4a5a825e529981031",
+            "span_id": "1093af26f752b87d",
+            "parent_span_id": "c2166a6f4d7e0805",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/handoff",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "handoff-00-84aca3ab04bf90af",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/handoff",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/handoff"
+            },
+            "start_unix_nano": 1785264218760443987,
+            "end_unix_nano": 1785264218761642195
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "handoff-01-81258b8b3c2ef39c",
+        "endpoint": "/api/handoff",
+        "handoff_hops": 2,
+        "handoff_fault": "cancel"
+      },
+      "response": {
+        "marker": "handoff-01-81258b8b3c2ef39c",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.2",
+        "tls_cipher": "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+        "backend_connection_id": 249,
+        "backend_remote_port": 52674,
+        "tls_read_events": 7516,
+        "tls_read_bytes": 606674,
+        "workload": "servlet-async-executor",
+        "handoff_hops": "2",
+        "handoff_fault": "cancel"
+      },
+      "latency_nanos": 10793502,
+      "trace": {
+        "marker": "handoff-01-81258b8b3c2ef39c",
+        "received_batches": 2,
+        "received_spans": 24,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 5141,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "f1d7aeba9a298d2229fa9789fd06280d",
+            "span_id": "b00a3107ef30afbd",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/handoff",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "handoff-01-81258b8b3c2ef39c",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/handoff",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/handoff"
+            },
+            "start_unix_nano": 1785264218754452732,
+            "end_unix_nano": 1785264218764709325
+          },
+          {
+            "trace_id": "f1d7aeba9a298d2229fa9789fd06280d",
+            "span_id": "8ca427d0fcc411be",
+            "parent_span_id": "b00a3107ef30afbd",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785264218754584496,
+            "end_unix_nano": 1785264218764709325
+          },
+          {
+            "trace_id": "f1d7aeba9a298d2229fa9789fd06280d",
+            "span_id": "cde2f12f147b3ee1",
+            "parent_span_id": "8ca427d0fcc411be",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/handoff",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "handoff-01-81258b8b3c2ef39c",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/handoff?close=1\u0026fault=cancel\u0026hops=2"
+            },
+            "start_unix_nano": 1785264218754928858,
+            "end_unix_nano": 1785264218764528729
+          },
+          {
+            "trace_id": "f1d7aeba9a298d2229fa9789fd06280d",
+            "span_id": "f0a9ec8ee6be1c54",
+            "parent_span_id": "cde2f12f147b3ee1",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/handoff",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "handoff-01-81258b8b3c2ef39c",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/handoff",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/handoff"
+            },
+            "start_unix_nano": 1785264218761467348,
+            "end_unix_nano": 1785264218764726607
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "handoff-02-69181de3112db607",
+        "endpoint": "/api/handoff",
+        "handoff_hops": 3,
+        "handoff_fault": "reject"
+      },
+      "response": {
+        "marker": "handoff-02-69181de3112db607",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.2",
+        "tls_cipher": "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+        "backend_connection_id": 250,
+        "backend_remote_port": 52688,
+        "tls_read_events": 7516,
+        "tls_read_bytes": 606674,
+        "workload": "servlet-async-executor",
+        "handoff_hops": "3",
+        "handoff_fault": "reject"
+      },
+      "latency_nanos": 11082538,
+      "trace": {
+        "marker": "handoff-02-69181de3112db607",
+        "received_batches": 2,
+        "received_spans": 24,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 5141,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "704cce75dc65c677805040e478820d2c",
+            "span_id": "ccac55adc8b3d464",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/handoff",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "handoff-02-69181de3112db607",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/handoff",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/handoff"
+            },
+            "start_unix_nano": 1785264218754580673,
+            "end_unix_nano": 1785264218765123483
+          },
+          {
+            "trace_id": "704cce75dc65c677805040e478820d2c",
+            "span_id": "d21d9122a269e9b5",
+            "parent_span_id": "ccac55adc8b3d464",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785264218754635070,
+            "end_unix_nano": 1785264218765123483
+          },
+          {
+            "trace_id": "704cce75dc65c677805040e478820d2c",
+            "span_id": "3c513f80fd9b1119",
+            "parent_span_id": "d21d9122a269e9b5",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/handoff",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "handoff-02-69181de3112db607",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/handoff?close=1\u0026fault=reject\u0026hops=3"
+            },
+            "start_unix_nano": 1785264218755001441,
+            "end_unix_nano": 1785264218764928766
+          },
+          {
+            "trace_id": "704cce75dc65c677805040e478820d2c",
+            "span_id": "b40c19ff5e0f79d7",
+            "parent_span_id": "3c513f80fd9b1119",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/handoff",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "handoff-02-69181de3112db607",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/handoff",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/handoff"
+            },
+            "start_unix_nano": 1785264218760443964,
+            "end_unix_nano": 1785264218765038796
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "handoff-03-99a46ecb47f6e500",
+        "endpoint": "/api/handoff",
+        "handoff_hops": 4,
+        "handoff_fault": "timeout"
+      },
+      "response": {
+        "marker": "handoff-03-99a46ecb47f6e500",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.2",
+        "tls_cipher": "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+        "backend_connection_id": 251,
+        "backend_remote_port": 52666,
+        "tls_read_events": 7516,
+        "tls_read_bytes": 606674,
+        "workload": "servlet-async-executor",
+        "handoff_hops": "4",
+        "handoff_fault": "timeout"
+      },
+      "latency_nanos": 12175772,
+      "trace": {
+        "marker": "handoff-03-99a46ecb47f6e500",
+        "received_batches": 2,
+        "received_spans": 24,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 5141,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "b8ae39164453e13fa9d60fc1324dc999",
+            "span_id": "79a87b982ec0dfcb",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/handoff",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "handoff-03-99a46ecb47f6e500",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/handoff",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/handoff"
+            },
+            "start_unix_nano": 1785264218754452945,
+            "end_unix_nano": 1785264218766162263
+          },
+          {
+            "trace_id": "b8ae39164453e13fa9d60fc1324dc999",
+            "span_id": "45926243e7daef82",
+            "parent_span_id": "79a87b982ec0dfcb",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785264218754533811,
+            "end_unix_nano": 1785264218766162263
+          },
+          {
+            "trace_id": "b8ae39164453e13fa9d60fc1324dc999",
+            "span_id": "0fafd9d30aa0b7a7",
+            "parent_span_id": "45926243e7daef82",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/handoff",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "handoff-03-99a46ecb47f6e500",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/handoff?close=1\u0026fault=timeout\u0026hops=4"
+            },
+            "start_unix_nano": 1785264218754705024,
+            "end_unix_nano": 1785264218765980247
+          },
+          {
+            "trace_id": "b8ae39164453e13fa9d60fc1324dc999",
+            "span_id": "b42c33497bc13eaf",
+            "parent_span_id": "0fafd9d30aa0b7a7",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/handoff",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "handoff-03-99a46ecb47f6e500",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/handoff",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/handoff"
+            },
+            "start_unix_nano": 1785264218760443926,
+            "end_unix_nano": 1785264218766119824
+          }
+        ]
+      }
+    }
+  ]
+}

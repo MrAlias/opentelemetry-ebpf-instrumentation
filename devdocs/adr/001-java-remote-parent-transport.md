@@ -106,7 +106,7 @@ criterion from
 
 | Candidate | Request correlation | Synchronous before span | Kernel, cgroup, and namespace portability | Dynamic helper and static extension | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| Cgroup sockopt on accepted application socket | Socket-local negotiation plus kernel tuple, network namespace, execution, and generation | Yes; one take or discard | Requires cgroup v2 sockopt and SockOps support, netns cookies, and hierarchy-root attachment; broader matrix untested | Dynamic helper: attach and reconfiguration supported; static extension: configured at JVM start and transport-agnostic | **retained**: [forced primary run](../../examples/apache-java-https/evidence/otel-getsockopt-tls13-c9d14356/README.md) |
+| Cgroup sockopt on accepted application socket | Socket-local negotiation plus kernel tuple, network namespace, execution, and generation | Yes; one take or discard | Requires cgroup v2 sockopt and SockOps support, netns cookies, and hierarchy-root attachment; broader matrix untested | Dynamic helper: attach and reconfiguration supported; static extension: configured at JVM start and transport-agnostic | **retained**: [forced primary TLS 1.3 run](../../examples/apache-java-https/evidence/otel-getsockopt-tls13-c9d14356/README.md) and [source-exact TLS 1.2 run](../../examples/apache-java-https/evidence/otel-getsockopt-tls12-c7209e43/README.md) |
 | Cgroup getsockopt on a dummy socket | Current execution, without accepted-connection ownership | Mechanically yes, but cannot authorize the request connection | Same cgroup sockopt requirements as the primary | Dynamic helper: probe and reprobe supported; static extension: does not consume dummy-socket data | **focused**: [JNI probe tests](../../pkg/internal/java/agent/src/test/c/remote_parent_jni_test.c) |
 | Credential-checked Unix socket | Peer process, validated logical TID, process capability, and generation | Yes; one deadline-bounded RPC | Shares the producer's cgroup v2 SockOps and netns-cookie requirements; additionally requires a shared Unix endpoint and readable peer `/proc` identity across namespaces | Dynamic helper: attach, reconnect, and reconfiguration supported; static extension: configured at JVM start and transport-agnostic | **retained**: [forced Unix run](../../examples/apache-java-https/evidence/otel-unix-tls12-bd1c9327/README.md) |
 | Brokered BPF map FD | Application chooses a map key; no socket-local request authority | Yes | Requires transferable map FDs and stable namespace/lifetime handling | Dynamic helper: must receive and revoke the FD; static extension: bridge API could remain, but the helper couples to map ABI | **analysis**, **untested** |
@@ -137,8 +137,8 @@ external readers; it does not publish a per-request trace ID or span ID and
 therefore cannot carry this remote parent.
 
 The retained runs establish the listed acceptance assertions and bounded
-failure cases for one forced primary cell and one forced fallback cell. They do
-not contain a representative primary-versus-fallback latency or allocation
+failure cases for two forced primary cells and one forced fallback cell. They
+do not contain a representative primary-versus-fallback latency or allocation
 comparison. The
 [benchmark matrix](../../examples/apache-java-https/BENCHMARK.md) remains
 **untested**, so this PoC decision is not a performance or production-support
@@ -240,11 +240,11 @@ connection-only guess.
 The default is `disabled`. The proof-of-concept runner can exercise
 `getsockopt`, `unix`, `auto`, and disabled or absence controls. The
 [retained evidence index](../../examples/apache-java-https/evidence/README.md)
-contains four forced `getsockopt` full runs: the current V2-schema
-OpenTelemetry run and its bounded inbound-Netty fixture, two historical
-OpenTelemetry runs, and the Splunk 2.28.0 V2-schema run; it also contains two
-forced Unix full runs, including the current V2-schema
-Unix/TLS 1.2 run.
+contains five forced `getsockopt` full runs: the V2-schema OpenTelemetry TLS
+1.3 run with its bounded inbound-Netty fixture, the source-exact V2-schema
+OpenTelemetry TLS 1.2 run, two historical OpenTelemetry runs, and the Splunk
+2.28.0 V2-schema run; it also contains two forced Unix full runs, including
+the current V2-schema Unix/TLS 1.2 run.
 Disabled and absence behavior is retained only as controls within those
 runs; no `auto` acceptance run is retained. Raw results are written under
 `examples/apache-java-https/.runtime/results/`; sanitized durable artifacts

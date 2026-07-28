@@ -1,0 +1,9 @@
+{
+  "status": "passed",
+  "scenario": "concurrency",
+  "exit_status": 0,
+  "metric_status": 0,
+  "pressure_correlation": null,
+  "result": "scenario-concurrency-security-primary-victim.json",
+  "after_phase": "phases/concurrency-security-primary-victim-after"
+}

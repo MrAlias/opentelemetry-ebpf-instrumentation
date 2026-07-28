@@ -1,0 +1,5 @@
+apache_version=Apache/2.4.68 (Unix)
+ssl_module_loaded=true
+mod_ssl_requires=libssl.so.3,libcrypto.so.3,libc.musl-x86_64.so.1
+libssl_package=libssl3-3.5.7-r0
+libcrypto_package=libcrypto3-3.5.7-r0

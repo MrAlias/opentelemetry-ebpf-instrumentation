@@ -9,9 +9,9 @@ application availability, avoid consuming another request's context, finish
 within a bounded deadline, and produce a low-cardinality reason code without
 logging trace IDs, headers, bodies, credentials, PID/TID labels, or socket
 payloads. Primary and Unix `pass` entries below refer only to the exact
-retained [OpenTelemetry/`getsockopt`/TLS 1.3](evidence/otel-getsockopt-tls13-c9d14356/README.md)
-and [OpenTelemetry/Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/README.md)
-runs.
+retained [OpenTelemetry/`getsockopt`/TLS 1.3](evidence/otel-getsockopt-tls13-c9d14356/README.md),
+[OpenTelemetry/`getsockopt`/TLS 1.2](evidence/otel-getsockopt-tls12-c7209e43/README.md),
+and [OpenTelemetry/Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/README.md) runs.
 
 | Abuse or fault | Required result | Primary `getsockopt` | Unix | Evidence or remaining work |
 | --- | --- | --- | --- | --- |

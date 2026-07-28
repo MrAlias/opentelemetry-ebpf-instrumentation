@@ -1,0 +1,9 @@
+{
+  "status": "passed",
+  "scenario": "fd-port-reuse",
+  "exit_status": 0,
+  "metric_status": 0,
+  "pressure_correlation": null,
+  "result": "scenario-fd-port-reuse.json",
+  "after_phase": "phases/fd-port-reuse-after"
+}

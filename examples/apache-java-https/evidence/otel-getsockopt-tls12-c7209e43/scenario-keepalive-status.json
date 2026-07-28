@@ -1,0 +1,9 @@
+{
+  "status": "passed",
+  "scenario": "keepalive",
+  "exit_status": 0,
+  "metric_status": 0,
+  "pressure_correlation": null,
+  "result": "scenario-keepalive.json",
+  "after_phase": "phases/keepalive-after"
+}

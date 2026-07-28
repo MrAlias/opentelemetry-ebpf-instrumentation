@@ -1,10 +1,11 @@
 # Final result record
 
-Status: **partial — two OpenTelemetry transport/TLS cells and one Splunk primary cell passed**
+Status: **partial — three OpenTelemetry transport/TLS cells and one Splunk primary cell passed**
 
 The clean full
-[getsockopt/TLS 1.3](evidence/otel-getsockopt-tls13-c9d14356/README.md) and
-[Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/README.md), and
+[getsockopt/TLS 1.3](evidence/otel-getsockopt-tls13-c9d14356/README.md),
+[getsockopt/TLS 1.2](evidence/otel-getsockopt-tls12-c7209e43/README.md), and
+[Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/README.md), and the
 [Splunk getsockopt/TLS 1.3](evidence/splunk-getsockopt-tls13-47237792/README.md)
 runs are retained with source revision, environment, scenario graphs,
 diagnostic deltas, and checksums. The refreshed OpenTelemetry primary run also
@@ -17,12 +18,13 @@ remain `untested`. A row's `pass` applies only to its linked retained evidence.
 | Apache 2.4 proxies to Jetty over verified HTTPS | pass | [runtime and certificate evidence](evidence/otel-getsockopt-tls13-c9d14356/README.md#retained-proof) |
 | Backend protocol is HTTP/1.1 | pass | [basic response and trace graph](evidence/otel-getsockopt-tls13-c9d14356/scenario-basic.json) |
 | Forced Unix/TLS 1.2 | pass | [forced Unix response and trace graph](evidence/otel-unix-tls12-bd1c9327/scenario-basic.json) |
+| Forced `getsockopt`/TLS 1.2 | pass | [OpenTelemetry graph](evidence/otel-getsockopt-tls12-c7209e43/scenario-basic.json) |
 | Forced `getsockopt`/TLS 1.3 | pass | [OpenTelemetry graph](evidence/otel-getsockopt-tls13-c9d14356/scenario-basic.json) and [Splunk graph](evidence/splunk-getsockopt-tls13-47237792/scenario-basic.json) |
 | Official OpenTelemetry agent in retained cells | pass | [version, URL, and checksum](evidence/otel-unix-tls12-bd1c9327/official-javaagent.json) |
 | Official Splunk agent | pass | [pinned version, URL, and checksum](evidence/splunk-getsockopt-tls13-47237792/official-javaagent.json), [runtime metadata](evidence/splunk-getsockopt-tls13-47237792/runtime-metadata.json), and [full acceptance](evidence/splunk-getsockopt-tls13-47237792/README.md) |
 | OBI helper is dynamically attached | pass | [startup and late-attach recovery](evidence/otel-getsockopt-tls13-c9d14356/README.md#retained-proof) |
 | External extension is separately loaded | pass | [sanitized runtime metadata](evidence/otel-getsockopt-tls13-c9d14356/runtime-metadata.json) |
-| Forced `getsockopt` bridge | pass | [exact trace/parent graph and run identity](evidence/otel-getsockopt-tls13-c9d14356/README.md) |
+| Forced `getsockopt` bridge | pass | [TLS 1.3](evidence/otel-getsockopt-tls13-c9d14356/README.md) and [TLS 1.2](evidence/otel-getsockopt-tls12-c7209e43/README.md) exact trace/parent graphs and run identities |
 | Java V2 transport configuration | pass | [getsockopt](evidence/otel-getsockopt-tls13-c9d14356/java-selected-transport-configuration.txt) and [Unix](evidence/otel-unix-tls12-bd1c9327/java-selected-transport-configuration.txt) snapshots; exact trace assertions independently prove request use |
 | Forced Unix fallback | pass | [exact trace/parent graph and V2 selection](evidence/otel-unix-tls12-bd1c9327/README.md#retained-proof) |
 | Remote parent flag | pass | [basic exact-parent graph](evidence/otel-getsockopt-tls13-c9d14356/scenario-basic.json) |
@@ -80,11 +82,11 @@ column.
 | Issue | Asset coverage | Still required before pass |
 | --- | --- | --- |
 | #19 Java SDK suppression | retained getsockopt and Unix avoided-service metrics plus exact-parent traffic passed | retain any additional supported agent cells required by the final support statement |
-| #27 agent compatibility | OpenTelemetry cells at `c9d14356` and `bd1c9327`, plus Splunk 2.28.0 at `47237792`, passed their named cells | execute the declared JVM/architecture matrix and remaining agent cells |
+| #27 agent compatibility | OpenTelemetry cells at `c9d14356`, `c7209e43`, and `bd1c9327`, plus Splunk 2.28.0 at `47237792`, passed their named cells | execute the declared JVM/architecture matrix and remaining agent cells |
 | #28 Java extraction matrix | applicable getsockopt and Unix OpenTelemetry cases, plus Splunk getsockopt/TLS 1.3, passed with exact graphs and one-shot counters | execute remaining agent, transport, and child-semantics cells |
 | #31 deterministic traffic/assertions | retained OpenTelemetry and Splunk primary cells passed with exact IDs, flags, controls, and status records | retain the remaining advertised cells |
-| #33 final report | two OpenTelemetry matrix cells and one Splunk primary cell are populated from retained bundles | complete benchmark and compatibility outcomes |
-| #34 stress | retained TLS 1.3 primary and TLS 1.2 Unix stress, reuse, TLS-boundary-fixture, pressure, cleanup, and recovery cases passed | execute remaining advertised cells |
+| #33 final report | three OpenTelemetry matrix cells and one Splunk primary cell are populated from retained bundles | complete benchmark and compatibility outcomes |
+| #34 stress | retained TLS 1.3 and TLS 1.2 primary, and TLS 1.2 Unix stress, reuse, TLS-boundary-fixture, pressure, cleanup, and recovery cases passed | execute remaining advertised cells |
 | #35 handoff | executor, virtual-thread, Netty worker, redispatch, and bounded inbound-Netty receive-to-extraction scenarios passed in the retained primary run | execute the remaining framework and environment matrix evidence |
 | #36 fail-open | retained primary and Unix absence, restart, attach, disabled, fault, and recovery controls passed | retain any additional advertised cells |
 | #37 benchmark | predeclared matrix, repeated bounded workload, and resource/map snapshots | execute on fixed hardware and add sustained latency/throughput evidence |

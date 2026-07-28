@@ -1,0 +1,4 @@
+{
+  "status": "unsupported",
+  "reason": "requires forced Unix transport"
+}

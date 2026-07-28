@@ -35,6 +35,14 @@ public class NettyChannelExtractor {
         System.err.println("[NettyChannelExtractor] Netty channel localAddress: " + localAddress);
         System.err.println("[NettyChannelExtractor] Netty channel remoteAddress: " + remoteAddress);
       }
+      Object lifecycleKey = channelLifecycleKey(channel);
+      if (lifecycleKey == channel && !SSLStorage.isNettyCloseHookAvailable(channel)) {
+        return null;
+      }
+      Connection cached = SSLStorage.getConnectionForChannel(lifecycleKey);
+      if (cached != null) {
+        return cached;
+      }
       c =
           new Connection(
               localAddress.getAddress(),
@@ -42,11 +50,24 @@ public class NettyChannelExtractor {
               remoteAddress.getAddress(),
               remoteAddress.getPort(),
               socketFileDescriptor(channel));
+      c = SSLStorage.associateConnectionWithChannel(lifecycleKey, c);
     } catch (Throwable failure) {
       SSLStorage.logNettyAdviceFailure("extract Netty channel data", failure);
     }
 
     return c;
+  }
+
+  public static Object channelLifecycleKey(Object channel) {
+    if (channel == null) {
+      return null;
+    }
+    try {
+      Object javaChannel = invokeNoArg(channel, "javaChannel");
+      return javaChannel instanceof SocketChannel ? javaChannel : channel;
+    } catch (Throwable ignored) {
+      return channel;
+    }
   }
 
   private static int socketFileDescriptor(Object channel) {
@@ -62,6 +83,10 @@ public class NettyChannelExtractor {
         }
       }
 
+    } catch (Throwable ignored) {
+    }
+
+    try {
       Object javaChannel = invokeNoArg(channel, "javaChannel");
       if (javaChannel instanceof SocketChannel) {
         return BootstrapNative.socketFileDescriptor(((SocketChannel) javaChannel).socket());

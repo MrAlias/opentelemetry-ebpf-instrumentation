@@ -11,6 +11,7 @@ import static net.bytebuddy.matcher.ElementMatchers.nameStartsWith;
 import io.opentelemetry.obi.java.instrumentations.*;
 import java.io.File;
 import java.io.InputStream;
+import java.lang.instrument.ClassFileTransformer;
 import java.lang.instrument.Instrumentation;
 import java.lang.reflect.Field;
 import java.nio.file.Files;
@@ -22,6 +23,8 @@ import net.bytebuddy.agent.builder.AgentBuilder;
 import net.bytebuddy.description.type.TypeDescription;
 import net.bytebuddy.dynamic.ClassFileLocator;
 import net.bytebuddy.dynamic.loading.ClassInjector;
+import net.bytebuddy.matcher.ElementMatcher;
+import net.bytebuddy.pool.TypePool;
 import net.bytebuddy.utility.JavaModule;
 
 public class Agent {
@@ -49,8 +52,11 @@ public class Agent {
                   "io.opentelemetry.obi.java.instrumentations.data.Connection",
                   "io.opentelemetry.obi.java.instrumentations.data.SSLStorage",
                   "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$BufferHandoff",
+                  "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ChannelState",
                   "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ConnectionOwner",
                   "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ExactConnection",
+                  "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$NettyConnectionScope",
+                  "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$NettyHandlerScope",
                   "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$TlsConnectionMarkerAttempt",
                   "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext",
                   "io.opentelemetry.obi.java.instrumentations.data.TaskContext",
@@ -101,6 +107,17 @@ public class Agent {
     }
 
     return builder;
+  }
+
+  static ElementMatcher<? super TypeDescription> safelyMatches(
+      ElementMatcher<? super TypeDescription> matcher) {
+    return type -> {
+      try {
+        return matcher.matches(type);
+      } catch (TypePool.Resolution.NoSuchTypeException ignored) {
+        return false;
+      }
+    };
   }
 
   static Map<String, String> parseArgs(String agentArgs) {
@@ -160,6 +177,7 @@ public class Agent {
     }
 
     boolean installationClaimed = false;
+    ClassFileTransformer nettyTransformer = null;
     try {
       initClassesThatNeedToBeBootstrapped();
       injectBootstrapClasses(inst);
@@ -175,42 +193,47 @@ public class Agent {
         setupInstrumentationsDebugging();
       }
 
+      nettyTransformer = NettySSLHandlerInst.install(inst);
       builder(opts, inst)
-          .type(SSLSocketInst.type())
+          .type(safelyMatches(SSLSocketInst.type()))
           .transform(SSLSocketInst.transformer())
-          .type(SSLSocketStreamInst.inputStreamType())
+          .type(safelyMatches(SSLSocketStreamInst.inputStreamType()))
           .transform(SSLSocketStreamInst.inputStreamTransformer())
-          .type(SSLSocketStreamInst.outputStreamType())
+          .type(safelyMatches(SSLSocketStreamInst.outputStreamType()))
           .transform(SSLSocketStreamInst.outputStreamTransformer())
-          .type(SSLEngineInst.type())
+          .type(safelyMatches(SSLEngineInst.type()))
           .transform(SSLEngineInst.transformer())
-          .type(SocketChannelInst.type())
+          .type(safelyMatches(SocketChannelInst.type()))
           .transform(SocketChannelInst.transformer())
-          .type(NettySSLHandlerInst.type())
-          .transform(NettySSLHandlerInst.transformer())
-          .type(JavaExecutorInst.type())
+          .type(safelyMatches(JavaExecutorInst.type()))
           .transform(JavaExecutorInst.transformer())
-          .type(NettyExecutorInst.type())
+          .type(safelyMatches(NettyExecutorInst.type()))
           .transform(NettyExecutorInst.transformer())
-          .type(CallableInst.type())
+          .type(safelyMatches(CallableInst.type()))
           .transform(CallableInst.transformer())
-          .type(RunnableInst.type())
+          .type(safelyMatches(RunnableInst.type()))
           .transform(RunnableInst.transformer())
-          .type(JavaForkJoinTaskInst.type())
+          .type(safelyMatches(JavaForkJoinTaskInst.type()))
           .transform(JavaForkJoinTaskInst.transformer())
-          .type(FutureInst.type())
+          .type(safelyMatches(FutureInst.type()))
           .transform(FutureInst.transformer())
-          .type(RejectedExecutionHandlerInst.type())
+          .type(safelyMatches(RejectedExecutionHandlerInst.type()))
           .transform(RejectedExecutionHandlerInst.transformer())
-          .type(BlockingQueueInst.type())
+          .type(safelyMatches(BlockingQueueInst.type()))
           .transform(BlockingQueueInst.transformer())
-          .type(VirtualThreadInst.type())
+          .type(safelyMatches(VirtualThreadInst.type()))
           .transform(VirtualThreadInst.transformer())
           .installOn(inst);
       completeBootstrapInstallation();
       clearLocalInstallationClaim(true);
       return true;
     } catch (Throwable failure) {
+      if (nettyTransformer != null) {
+        try {
+          inst.removeTransformer(nettyTransformer);
+        } catch (Throwable ignored) {
+        }
+      }
       if (installationClaimed) {
         cancelBootstrapInstallation();
       }

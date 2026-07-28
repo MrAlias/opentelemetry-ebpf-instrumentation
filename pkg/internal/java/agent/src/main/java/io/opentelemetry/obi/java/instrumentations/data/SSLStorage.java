@@ -7,6 +7,7 @@ package io.opentelemetry.obi.java.instrumentations.data;
 
 import io.opentelemetry.obi.java.ebpf.ThreadInfo;
 import io.opentelemetry.obi.java.instrumentations.util.CappedConcurrentHashMap;
+import io.opentelemetry.obi.java.instrumentations.util.NettyChannelExtractor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
@@ -36,6 +37,10 @@ public class SSLStorage {
   private static final AtomicBoolean nettyFailureLogged = new AtomicBoolean();
 
   private static final int MAX_CONCURRENT = 10_000;
+  private static final int CHANNEL_LIFECYCLE_LOCK_STRIPES = 64;
+  private static final int CHANNEL_LIFECYCLE_LOCK_MASK = CHANNEL_LIFECYCLE_LOCK_STRIPES - 1;
+  private static final String NETTY_ABSTRACT_CHANNEL_CLASS_NAME =
+      "io.netty.channel.AbstractChannel";
   static final int TLS_CONNECTION_MARKER_BURST_ATTEMPTS = 8;
   static final long TLS_CONNECTION_MARKER_RETRY_NANOS = 1_000_000_000L;
   private static final WeakIdentityConcurrentMap<ConnectionOwner> sslConnections =
@@ -51,6 +56,10 @@ public class SSLStorage {
   private static final int BUFFER_HANDOFF_AMBIGUOUS = 3;
   private static final WeakIdentityConcurrentMap<BufferHandoff> readBufferConnections =
       new WeakIdentityConcurrentMap<>(MAX_CONCURRENT);
+  private static final WeakIdentityConcurrentMap<ChannelState> channelStates =
+      new WeakIdentityConcurrentMap<>(MAX_CONCURRENT);
+  private static final WeakIdentityConcurrentMap<Object> nettyCloseHookLoaders =
+      new WeakIdentityConcurrentMap<>(MAX_CONCURRENT);
   private static final CappedConcurrentHashMap<ExactConnection, ConnectionOwner> activeConnections =
       new CappedConcurrentHashMap<>(MAX_CONCURRENT);
 
@@ -64,7 +73,15 @@ public class SSLStorage {
   private static volatile LongSupplier threadIdProviderForTest;
   private static volatile LongSupplier tlsConnectionMarkerClockForTest;
   private static final Object NO_NETTY_CONNECTION = new Object();
+  private static final Object NETTY_CLOSE_HOOK_AVAILABLE = new Object();
+  private static final AtomicBoolean channelStateCapacityExhausted = new AtomicBoolean();
+  private static final AtomicBoolean channelStateCapacityLogged = new AtomicBoolean();
+  private static final AtomicBoolean bootstrapNettyCloseHookAvailable = new AtomicBoolean();
+  // Agent-owned locks avoid taking monitors held by application or JDK socket code.
+  private static final Object[] channelLifecycleLocks = channelLifecycleLocks();
   private static final ThreadLocal<ArrayDeque<Object>> nettyConnectionScopes = new ThreadLocal<>();
+  private static final ThreadLocal<ArrayDeque<NettyHandlerScope>> nettyHandlerScopes =
+      new ThreadLocal<>();
 
   public static final ThreadLocal<BytesWithLen> unencrypted = new ThreadLocal<>();
 
@@ -97,6 +114,75 @@ public class SSLStorage {
     }
   }
 
+  public static void beginNettyHandlerScope(Object context) {
+    try {
+      NettyHandlerScope scope = new NettyHandlerScope();
+      ArrayDeque<NettyHandlerScope> scopes = nettyHandlerScopes.get();
+      if (scopes == null) {
+        scopes = new ArrayDeque<>();
+        nettyHandlerScopes.set(scopes);
+      }
+      scopes.push(scope);
+      beginNettyConnectionScope();
+      scope.started = true;
+    } catch (Throwable failure) {
+      logNettyHandlerScopeFailure("begin Netty SSL handler scope", failure);
+      return;
+    }
+
+    try {
+      if (debugOn) {
+        System.err.println("[NettySSLHandlerInst] Netty SSL handler scope");
+      }
+      if (context != null) {
+        setCurrentNettyConnection(
+            NettyChannelExtractor.extractConnectionFromChannelHandlerContext(context));
+      }
+    } catch (Throwable failure) {
+      logNettyHandlerScopeFailure("enter Netty SSL handler scope", failure);
+    }
+  }
+
+  public static void endNettyHandlerScope() {
+    try {
+      ArrayDeque<NettyHandlerScope> scopes = nettyHandlerScopes.get();
+      if (scopes == null || scopes.isEmpty()) {
+        return;
+      }
+      NettyHandlerScope scope = scopes.pop();
+      if (scopes.isEmpty()) {
+        nettyHandlerScopes.remove();
+      }
+      if (scope.started) {
+        endNettyConnectionScope();
+      }
+    } catch (Throwable failure) {
+      logNettyHandlerScopeFailure("end Netty SSL handler scope", failure);
+    }
+  }
+
+  private static void logNettyHandlerScopeFailure(String operation, Throwable failure) {
+    try {
+      logNettyAdviceFailure(operation, failure);
+    } catch (Throwable ignored) {
+    }
+  }
+
+  public static boolean setCurrentNettyConnection(Object connection) {
+    if (!(connection instanceof Connection)
+        || ((Connection) connection).getSocketFileDescriptor() < 0) {
+      return false;
+    }
+
+    ConnectionOwner owner = asConnectionOwner(((Connection) connection).getOwnerToken());
+    if (!isActive(owner) || owner.connection != connection) {
+      return false;
+    }
+
+    nettyConnection.set(new NettyConnectionScope(owner));
+    return true;
+  }
+
   public static Connection getConnectionForSession(SSLEngine session) {
     ConnectionOwner owner = connectionOwnerForSession(session);
     return owner == null ? null : owner.connection;
@@ -120,11 +206,15 @@ public class SSLStorage {
     ConnectionOwner cachedOwner = connectionOwnerForSession(session);
     Connection cached = cachedOwner == null ? null : cachedOwner.connection;
     Object scopedValue = nettyConnection.get();
-    Connection scoped = scopedValue instanceof Connection ? (Connection) scopedValue : null;
+    Connection scoped = currentScopedConnection();
+
+    if (hasInvalidFdScopedConnection(scopedValue)) {
+      return null;
+    }
 
     if (scoped != null) {
       if (scoped.getSocketFileDescriptor() >= 0) {
-        ConnectionOwner scopedOwner = activeConnectionOwner(scoped);
+        ConnectionOwner scopedOwner = currentScopedConnectionOwner(scopedValue);
         if (scopedOwner == null) {
           return null;
         }
@@ -174,7 +264,11 @@ public class SSLStorage {
     }
 
     ConnectionOwner expectedOwner = asConnectionOwner(expectedOwnerToken);
+    Object scopedValue = nettyConnection.get();
     Connection scopedNow = currentScopedConnection();
+    if (hasInvalidFdScopedConnection(scopedValue)) {
+      return null;
+    }
     if (scopedAtEntry != null || scopedNow != null) {
       if (scopedAtEntry == null
           || scopedNow == null
@@ -452,31 +546,274 @@ public class SSLStorage {
     }
   }
 
-  public static void cleanupConnection(Connection connection) {
+  public static Connection associateConnectionWithChannel(Object channel, Connection connection) {
     if (connection == null || connection.getSocketFileDescriptor() < 0) {
+      return null;
+    }
+    if (channel == null) {
+      return connection;
+    }
+
+    synchronized (channelLifecycleLock(channel)) {
+      ChannelState state = channelStates.get(channel);
+      if (state == null) {
+        if (channelStateCapacityExhausted.get()) {
+          return null;
+        }
+        state = new ChannelState();
+        if (!channelStates.putIfAbsent(channel, state)) {
+          state = channelStates.get(channel);
+          if (state == null) {
+            markChannelStateCapacityExhausted();
+            return null;
+          }
+        }
+      }
+      if (state.closed) {
+        return null;
+      }
+
+      if (state.owner != null) {
+        return isActive(state.owner) && sameExactConnection(state.owner.connection, connection)
+            ? state.owner.connection
+            : null;
+      }
+
+      ConnectionOwner owner = newChannelConnectionOwner(connection);
+      if (owner == null || !isActive(owner)) {
+        state.closed = true;
+        return null;
+      }
+      state.owner = owner;
+      return owner.connection;
+    }
+  }
+
+  public static Connection getConnectionForChannel(Object channel) {
+    if (channel == null) {
+      return null;
+    }
+
+    synchronized (channelLifecycleLock(channel)) {
+      ChannelState state = channelStates.get(channel);
+      return state == null || state.closed || !isActive(state.owner)
+          ? null
+          : state.owner.connection;
+    }
+  }
+
+  public static Connection associateConnectionWithSocketChannel(
+      Object channel, Connection connection) {
+    return associateConnectionWithChannel(channel, connection);
+  }
+
+  public static Connection getConnectionForSocketChannel(Object channel) {
+    return getConnectionForChannel(channel);
+  }
+
+  public static void cleanupConnection(Connection connection) {
+    cleanupConnection(null, connection);
+  }
+
+  public static void cleanupConnection(Object channel, Connection connection) {
+    cleanupConnection(channel, connection, true);
+  }
+
+  public static void cleanupConnection(Object channel, Connection connection, boolean terminal) {
+    if (!terminal) {
       return;
     }
+
+    if (channel != null) {
+      closeChannel(channel, connection);
+      return;
+    }
+
+    if (connection != null && connection.getSocketFileDescriptor() >= 0) {
+      cleanupConnectionOwnerFor(connection);
+    }
+  }
+
+  public static void closeNettyChannel(Object channel) {
+    try {
+      closeChannel(NettyChannelExtractor.channelLifecycleKey(channel), null);
+    } catch (Throwable failure) {
+      logNettyHandlerScopeFailure("close Netty channel", failure);
+    }
+  }
+
+  public static void registerNettyCloseHook(Object channel) {
+    try {
+      Class<?> abstractChannelClass = nettyAbstractChannelClass(channel);
+      if (abstractChannelClass == null) {
+        return;
+      }
+      ClassLoader loader = abstractChannelClass.getClassLoader();
+      if (loader == null) {
+        bootstrapNettyCloseHookAvailable.set(true);
+        return;
+      }
+      if (!nettyCloseHookLoaders.putIfAbsent(loader, NETTY_CLOSE_HOOK_AVAILABLE)
+          && nettyCloseHookLoaders.get(loader) == null) {
+        logNettyAdviceFailure(
+            "register Netty terminal close hook",
+            new IllegalStateException("Netty close-hook loader capacity exhausted"));
+      }
+    } catch (Throwable failure) {
+      logNettyAdviceFailure("register Netty terminal close hook", failure);
+    }
+  }
+
+  public static boolean isNettyCloseHookAvailable(Object channel) {
+    try {
+      Class<?> abstractChannelClass = nettyAbstractChannelClass(channel);
+      if (abstractChannelClass == null) {
+        return false;
+      }
+      ClassLoader loader = abstractChannelClass.getClassLoader();
+      return loader == null
+          ? bootstrapNettyCloseHookAvailable.get()
+          : nettyCloseHookLoaders.get(loader) != null;
+    } catch (Throwable failure) {
+      logNettyAdviceFailure("resolve Netty terminal close hook", failure);
+      return false;
+    }
+  }
+
+  private static Class<?> nettyAbstractChannelClass(Object channel) {
+    if (channel == null) {
+      return null;
+    }
+    Class<?> channelClass = channel.getClass();
+    for (Class<?> type = channelClass; type != null; type = type.getSuperclass()) {
+      if (NETTY_ABSTRACT_CHANNEL_CLASS_NAME.equals(type.getName())) {
+        return type;
+      }
+    }
+    return null;
+  }
+
+  private static void closeChannel(Object channel, Connection connection) {
+    if (channel == null) {
+      return;
+    }
+
+    synchronized (channelLifecycleLock(channel)) {
+      ChannelState state = channelStates.get(channel);
+      if (state == null) {
+        ChannelState closedState = new ChannelState();
+        closedState.closed = true;
+        if (channelStates.putIfAbsent(channel, closedState)) {
+          cleanupCanonicalConnectionOwner(connection);
+          return;
+        }
+        state = channelStates.get(channel);
+        if (state == null) {
+          markChannelStateCapacityExhausted();
+          cleanupCanonicalConnectionOwner(connection);
+          return;
+        }
+      }
+      if (state.closed) {
+        return;
+      }
+      state.closed = true;
+      cleanupConnectionOwner(state.owner);
+    }
+  }
+
+  private static void cleanupConnectionOwnerFor(Connection connection) {
+    ConnectionOwner knownOwner = asConnectionOwner(connection.getOwnerToken());
+    if (knownOwner != null) {
+      cleanupConnectionOwner(knownOwner);
+      return;
+    }
+
     ExactConnection key = new ExactConnection(connection);
     ConnectionOwner owner = activeConnections.get(key);
-    if (owner != null && activeConnections.remove(key, owner)) {
-      owner.active = false;
+    if (owner != null) {
+      cleanupConnectionOwner(owner);
+    }
+  }
+
+  private static void cleanupCanonicalConnectionOwner(Connection connection) {
+    if (connection == null) {
+      return;
+    }
+    ConnectionOwner owner = asConnectionOwner(connection.getOwnerToken());
+    if (owner != null && owner.connection == connection) {
+      cleanupConnectionOwner(owner);
+    }
+  }
+
+  private static void markChannelStateCapacityExhausted() {
+    channelStateCapacityExhausted.set(true);
+    if (channelStateCapacityLogged.compareAndSet(false, true)) {
+      System.err.println(
+          "[SSLStorage] Netty channel correlation capacity exhausted; new TLS correlations will"
+              + " fail closed");
     }
   }
 
   private static ConnectionOwner activeConnectionOwner(Connection connection) {
+    ConnectionOwner knownOwner = asConnectionOwner(connection.getOwnerToken());
+    if (knownOwner != null) {
+      return isActive(knownOwner) ? knownOwner : null;
+    }
+
     ExactConnection key = new ExactConnection(connection);
     while (true) {
       ConnectionOwner owner = activeConnections.get(key);
       if (owner != null) {
-        return owner;
+        connection.setOwnerToken(owner);
+        return isActive(owner) ? owner : null;
       }
       ConnectionOwner candidate = new ConnectionOwner(key);
       owner = activeConnections.putIfAbsent(key, candidate);
       if (owner != null) {
-        return owner;
+        continue;
       }
-      return activeConnections.get(key) == candidate ? candidate : null;
+      return isActive(candidate) ? candidate : null;
     }
+  }
+
+  private static ConnectionOwner newChannelConnectionOwner(Connection connection) {
+    ConnectionOwner knownOwner = asConnectionOwner(connection.getOwnerToken());
+    if (knownOwner != null) {
+      return isActive(knownOwner) && knownOwner.connection == connection ? knownOwner : null;
+    }
+
+    ExactConnection key = new ExactConnection(connection);
+    while (true) {
+      ConnectionOwner owner = activeConnections.get(key);
+      if (owner != null) {
+        cleanupConnectionOwner(owner);
+        continue;
+      }
+      ConnectionOwner candidate = new ConnectionOwner(key);
+      owner = activeConnections.putIfAbsent(key, candidate);
+      if (owner == null) {
+        return isActive(candidate) ? candidate : null;
+      }
+    }
+  }
+
+  private static void cleanupConnectionOwner(ConnectionOwner owner) {
+    if (owner != null && activeConnections.remove(owner.key, owner)) {
+      owner.active = false;
+    }
+  }
+
+  private static Object[] channelLifecycleLocks() {
+    Object[] locks = new Object[CHANNEL_LIFECYCLE_LOCK_STRIPES];
+    for (int index = 0; index < locks.length; index++) {
+      locks[index] = new Object();
+    }
+    return locks;
+  }
+
+  private static Object channelLifecycleLock(Object channel) {
+    return channelLifecycleLocks[System.identityHashCode(channel) & CHANNEL_LIFECYCLE_LOCK_MASK];
   }
 
   private static boolean isActive(ConnectionOwner owner) {
@@ -508,7 +845,44 @@ public class SSLStorage {
 
   public static Connection currentScopedConnection() {
     Object value = nettyConnection.get();
-    return value instanceof Connection ? (Connection) value : null;
+    if (value instanceof NettyConnectionScope) {
+      ConnectionOwner owner = ((NettyConnectionScope) value).owner;
+      return isActive(owner) ? owner.connection : null;
+    }
+    if (!(value instanceof Connection)) {
+      return null;
+    }
+    Connection connection = (Connection) value;
+    if (connection.getSocketFileDescriptor() < 0) {
+      return connection;
+    }
+    ConnectionOwner owner = asConnectionOwner(connection.getOwnerToken());
+    return isActive(owner) && owner.connection == connection ? connection : null;
+  }
+
+  private static ConnectionOwner currentScopedConnectionOwner(Object value) {
+    if (value instanceof NettyConnectionScope) {
+      ConnectionOwner owner = ((NettyConnectionScope) value).owner;
+      return isActive(owner) ? owner : null;
+    }
+    if (!(value instanceof Connection) || ((Connection) value).getSocketFileDescriptor() < 0) {
+      return null;
+    }
+    Connection connection = (Connection) value;
+    ConnectionOwner owner = asConnectionOwner(connection.getOwnerToken());
+    return isActive(owner) && owner.connection == connection ? owner : null;
+  }
+
+  private static boolean hasInvalidFdScopedConnection(Object value) {
+    if (value instanceof NettyConnectionScope) {
+      return !isActive(((NettyConnectionScope) value).owner);
+    }
+    if (!(value instanceof Connection)) {
+      return false;
+    }
+    Connection connection = (Connection) value;
+    return connection.getSocketFileDescriptor() >= 0
+        && currentScopedConnectionOwner(connection) == null;
   }
 
   private static void consumeScopedBufferHandoff(
@@ -1011,7 +1385,29 @@ public class SSLStorage {
     ConnectionOwner(ExactConnection key) {
       this.key = key;
       this.connection = key.connection;
+      this.connection.setOwnerToken(this);
     }
+  }
+
+  private static final class ChannelState {
+    private ConnectionOwner owner;
+    private boolean closed;
+
+    ChannelState() {}
+  }
+
+  private static final class NettyConnectionScope {
+    private final ConnectionOwner owner;
+
+    NettyConnectionScope(ConnectionOwner owner) {
+      this.owner = owner;
+    }
+  }
+
+  private static final class NettyHandlerScope {
+    private boolean started;
+
+    NettyHandlerScope() {}
   }
 
   static final class ExactConnection {

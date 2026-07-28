@@ -300,7 +300,7 @@ public class SSLEngineInst {
             System.err.println("[SSLEngineInst] wrap :" + java.util.Arrays.toString(bLen.buf));
           }
 
-          Connection c = (Connection) SSLStorage.nettyConnection.get();
+          Connection c = SSLStorage.currentScopedConnection();
           if (SSLStorage.debugOn) {
             System.err.println(
                 "[SSLEngineInst] Found netty connection "
@@ -375,7 +375,7 @@ public class SSLEngineInst {
                     + java.util.Arrays.toString(bLen.buf));
           }
 
-          Connection c = (Connection) SSLStorage.nettyConnection.get();
+          Connection c = SSLStorage.currentScopedConnection();
           if (SSLStorage.debugOn) {
             System.err.println(
                 "[SSLEngineInst] Found netty connection "

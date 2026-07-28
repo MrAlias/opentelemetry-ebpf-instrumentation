@@ -18,6 +18,7 @@ import java.io.PrintStream;
 import java.lang.reflect.Proxy;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
+import java.nio.channels.SocketChannel;
 import java.util.Arrays;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
@@ -406,7 +407,7 @@ class SSLStorageTest {
   void scopedConnectionWinsBeforeHandshake() throws Exception {
     SSLEngine engine = new DummySSLEngine();
     Connection connection = connection(2234, 6678, 8);
-    SSLStorage.nettyConnection.set(connection);
+    installNettyScope(connection);
 
     Object[] saved =
         SSLEngineInst.UnwrapAdvice.unwrap(
@@ -424,7 +425,7 @@ class SSLStorageTest {
     Connection stale = connection(2334, 6778, 25);
     Connection scoped = connection(2335, 6779, 26);
     SSLStorage.setConnectionForSession(engine, stale);
-    SSLStorage.nettyConnection.set(scoped);
+    installNettyScope(scoped);
 
     Object[] saved =
         SSLEngineInst.UnwrapAdvice.unwrap(
@@ -444,11 +445,11 @@ class SSLStorageTest {
     Connection second = connection(2435, 6879, 30);
     ByteBuffer source = ByteBuffer.allocate(8);
     ByteBuffer destination = ByteBuffer.allocate(8);
-    SSLStorage.nettyConnection.set(first);
+    installNettyScope(first);
     Object[] saved = SSLEngineInst.UnwrapAdvice.unwrap(engine, source, destination);
     destination.put((byte) 1);
 
-    SSLStorage.nettyConnection.set(second);
+    installNettyScope(second);
     SSLEngineInst.UnwrapAdvice.unwrap(
         engine,
         saved,
@@ -468,7 +469,7 @@ class SSLStorageTest {
     Connection first = connection(2484, 6928, 36);
     Connection replacement = connection(2484, 6928, 36);
     ByteBuffer source = ByteBuffer.allocate(8);
-    SSLStorage.nettyConnection.set(first);
+    installNettyScope(first);
     Connection expected = SSLStorage.resolveConnectionForUnwrap(engine, null);
     Object owner = SSLStorage.captureConnectionOwnerForUnwrap(engine, expected);
 
@@ -547,7 +548,7 @@ class SSLStorageTest {
     Object[] saved = SSLEngineInst.UnwrapAdvice.unwrap(engine, source, destination);
     destination.put((byte) 1);
 
-    SSLStorage.nettyConnection.set(lateScope);
+    installNettyScope(lateScope);
     SSLEngineInst.UnwrapAdvice.unwrap(
         engine,
         saved,
@@ -570,7 +571,7 @@ class SSLStorageTest {
     ByteBuffer source = ByteBuffer.allocate(8);
     SSLStorage.setConnectionForReadBuffer(source, conflicting);
     Object handoff = SSLStorage.captureReadBufferHandoff(source);
-    SSLStorage.nettyConnection.set(scoped);
+    installNettyScope(scoped);
     Connection expected = SSLStorage.resolveConnectionForUnwrap(engine, handoff);
     Object owner = SSLStorage.captureConnectionOwnerForUnwrap(engine, expected);
 
@@ -601,7 +602,7 @@ class SSLStorageTest {
     ByteBuffer source = ByteBuffer.allocate(8);
     SSLStorage.setConnectionForReadBuffer(source, scoped);
     Object captured = SSLStorage.captureReadBufferHandoff(source);
-    SSLStorage.nettyConnection.set(scoped);
+    assertTrue(SSLStorage.setCurrentNettyConnection(scoped));
     Connection expected = SSLStorage.resolveConnectionForUnwrap(engine, captured);
     Object owner = SSLStorage.captureConnectionOwnerForUnwrap(engine, expected);
     SSLStorage.setConnectionForReadBuffer(source, scoped);
@@ -627,7 +628,7 @@ class SSLStorageTest {
     ByteBuffer source = ByteBuffer.allocate(8);
     SSLStorage.setConnectionForReadBuffer(source, scoped);
     Object captured = SSLStorage.captureReadBufferHandoff(source);
-    SSLStorage.nettyConnection.set(scoped);
+    assertTrue(SSLStorage.setCurrentNettyConnection(scoped));
     Connection expected = SSLStorage.resolveConnectionForUnwrap(engine, captured);
     Object owner = SSLStorage.captureConnectionOwnerForUnwrap(engine, expected);
 
@@ -1099,6 +1100,116 @@ class SSLStorageTest {
   }
 
   @Test
+  void repeatedSocketChannelCleanupDoesNotInvalidateAReusedExactConnection() throws Exception {
+    Connection first = connection(9434, 4878, 28);
+    Connection reused = connection(9434, 4878, 28);
+    try (SocketChannel firstChannel = SocketChannel.open();
+        SocketChannel reusedChannel = SocketChannel.open()) {
+      assertSame(first, SSLStorage.associateConnectionWithSocketChannel(firstChannel, first));
+      SSLStorage.cleanupConnection(firstChannel, first);
+      assertNull(SSLStorage.getConnectionForSocketChannel(firstChannel));
+
+      assertSame(reused, SSLStorage.associateConnectionWithSocketChannel(reusedChannel, reused));
+      SSLStorage.cleanupConnection(firstChannel, first);
+
+      assertSame(reused, SSLStorage.getConnectionForSocketChannel(reusedChannel));
+      SSLStorage.cleanupConnection(reusedChannel, reused);
+    }
+  }
+
+  @Test
+  void uncachedSocketChannelCleanupInvalidatesOnlyItsCanonicalOwner() throws Exception {
+    Connection closed = connection(9435, 4879, 30);
+    Connection lateClose = connection(9435, 4879, 30);
+    Connection reused = connection(9435, 4879, 30);
+    DummySSLEngine engine = new DummySSLEngine(new byte[] {3});
+    ByteBuffer reusedBuffer = ByteBuffer.allocate(8);
+    SSLStorage.setConnectionForSession(engine, closed);
+
+    try (SocketChannel channel = SocketChannel.open()) {
+      SSLStorage.cleanupConnection(channel, closed);
+      assertNull(SSLStorage.getConnectionForSession(engine));
+
+      SSLStorage.setConnectionForReadBuffer(reusedBuffer, reused);
+      SSLStorage.cleanupConnection(new Object(), lateClose);
+
+      assertSame(reused, SSLStorage.getConnectionForReadBuffer(reusedBuffer));
+      assertNull(SSLStorage.associateConnectionWithSocketChannel(channel, reused));
+      assertNull(SSLStorage.getConnectionForSocketChannel(channel));
+      SSLStorage.cleanupConnection(reused);
+    }
+  }
+
+  @Test
+  void nonterminalSocketChannelCleanupPreservesTheOpenConnection() throws Exception {
+    Connection first = connection(9436, 4880, 31);
+    DummySSLEngine engine = new DummySSLEngine(new byte[] {4});
+    try (SocketChannel channel = SocketChannel.open()) {
+      SSLStorage.setConnectionForSession(engine, first);
+      assertSame(first, SSLStorage.associateConnectionWithSocketChannel(channel, first));
+      SSLStorage.cleanupConnection(channel, first, false);
+
+      assertSame(first, SSLStorage.getConnectionForSession(engine));
+      assertSame(first, SSLStorage.getConnectionForSocketChannel(channel));
+
+      SSLStorage.cleanupConnection(channel, first);
+      assertNull(SSLStorage.getConnectionForSession(engine));
+      assertNull(SSLStorage.getConnectionForSocketChannel(channel));
+    }
+  }
+
+  @Test
+  void closedNettyScopeCannotReactivateAReusedExactConnection() throws Exception {
+    Connection closed = connection(9534, 4978, 29);
+    Connection reused = connection(9534, 4978, 29);
+    ByteBuffer closedBuffer = ByteBuffer.allocate(8);
+    ByteBuffer reusedBuffer = ByteBuffer.allocate(8);
+    DummySSLEngine reusedEngine = new DummySSLEngine(new byte[] {1});
+
+    SSLStorage.setConnectionForReadBuffer(closedBuffer, closed);
+    assertTrue(SSLStorage.setCurrentNettyConnection(closed));
+    SSLStorage.cleanupConnection(closed);
+
+    SSLStorage.setConnectionForReadBuffer(reusedBuffer, reused);
+    SSLStorage.setConnectionForSession(reusedEngine, reused);
+
+    assertNull(SSLStorage.currentScopedConnection());
+    assertNull(SSLStorage.resolveConnectionForUnwrap(reusedEngine, null));
+    assertSame(reused, SSLStorage.getConnectionForReadBuffer(reusedBuffer));
+    SSLStorage.nettyConnection.remove();
+    SSLStorage.cleanupConnection(reused);
+  }
+
+  @Test
+  void lateSameChannelConnectionCannotReplaceItsActiveOwner() throws Exception {
+    Connection first = connection(9544, 4988, 33);
+    Connection conflicting = connection(9544, 4988, 34);
+    Object channel = new Object();
+
+    assertSame(first, SSLStorage.associateConnectionWithChannel(channel, first));
+    assertNull(SSLStorage.associateConnectionWithChannel(channel, conflicting));
+    assertSame(first, SSLStorage.getConnectionForChannel(channel));
+
+    SSLStorage.cleanupConnection(channel, conflicting);
+  }
+
+  @Test
+  void staleRawNettyScopeCannotBindToAReusedExactConnection() throws Exception {
+    Connection stale = connection(9554, 4998, 35);
+    Connection reused = connection(9554, 4998, 35);
+    ByteBuffer buffer = ByteBuffer.allocate(8);
+
+    SSLStorage.nettyConnection.set(stale);
+    SSLStorage.cleanupConnection(stale);
+    SSLStorage.setConnectionForReadBuffer(buffer, reused);
+
+    assertNull(SSLStorage.currentScopedConnection());
+    assertNull(SSLStorage.resolveConnectionForUnwrap(new DummySSLEngine(new byte[] {1}), null));
+    SSLStorage.nettyConnection.remove();
+    SSLStorage.cleanupConnection(reused);
+  }
+
+  @Test
   void conflictingTentativeOwnerDoesNotReplaceSessionOwner() throws Exception {
     SSLEngine engine = new DummySSLEngine(new byte[] {1});
     ByteBuffer source = ByteBuffer.allocate(8);
@@ -1180,6 +1291,11 @@ class SSLStorageTest {
     assertNull(SSLStorage.getConnectionForSession(engine));
     assertSame(connection, SSLStorage.getConnectionForReadBuffer(source));
     SSLStorage.cleanupConnection(connection);
+  }
+
+  private static void installNettyScope(Connection connection) {
+    SSLStorage.setConnectionForReadBuffer(ByteBuffer.allocate(1), connection);
+    assertTrue(SSLStorage.setCurrentNettyConnection(connection));
   }
 
   private static Connection connection(int localPort, int remotePort, int fileDescriptor)

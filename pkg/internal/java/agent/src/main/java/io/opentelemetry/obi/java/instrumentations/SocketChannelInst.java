@@ -71,12 +71,17 @@ public class SocketChannelInst {
                             .and(ElementMatchers.takesArguments(3))
                             .and(ElementMatchers.takesArgument(0, ByteBuffer[].class))))
             .visit(
-                Advice.to(CleanupAdvice.class)
+                Advice.to(KillAdvice.class)
                     .on(
-                        ElementMatchers.named("shutdownInput")
-                            .or(ElementMatchers.named("shutdownOutput"))
-                            .or(ElementMatchers.named("kill"))
-                            .or(ElementMatchers.named("tryClose"))));
+                        ElementMatchers.named("kill")
+                            .and(ElementMatchers.takesArguments(0))
+                            .and(ElementMatchers.returns(void.class))))
+            .visit(
+                Advice.to(TryCloseAdvice.class)
+                    .on(
+                        ElementMatchers.named("tryClose")
+                            .and(ElementMatchers.takesArguments(0))
+                            .and(ElementMatchers.returns(boolean.class))));
   }
 
   public static final class WriteAdvice {
@@ -240,6 +245,7 @@ public class SocketChannelInst {
 
     @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
     public static void read(
+        @Advice.This Object channel,
         @Advice.Argument(0) final ByteBuffer dst,
         @Advice.Enter long initialState,
         @Advice.Return int readBytes,
@@ -266,6 +272,10 @@ public class SocketChannelInst {
               remoteSocketAddress.getAddress(),
               remoteSocketAddress.getPort(),
               socketFileDescriptor);
+      c = SSLStorage.associateConnectionWithChannel(channel, c);
+      if (c == null) {
+        return;
+      }
 
       SSLStorage.setConnectionForReadBuffer(dst, c, (initialState & FRESH_FILL_READ_STATE) != 0);
       if (SSLStorage.debugOn) {
@@ -303,6 +313,7 @@ public class SocketChannelInst {
 
     @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
     public static void read(
+        @Advice.This Object channel,
         @Advice.Argument(0) final ByteBuffer[] dsts,
         @Advice.Enter Object[] saved,
         @Advice.Return long readBytes,
@@ -354,6 +365,10 @@ public class SocketChannelInst {
               remoteSocketAddress.getAddress(),
               remoteSocketAddress.getPort(),
               socketFileDescriptor);
+      c = SSLStorage.associateConnectionWithChannel(channel, c);
+      if (c == null) {
+        return;
+      }
 
       for (int i = offset; i < offset + length; i++) {
         if (buffers[i] != null && b(buffers[i]).position() > (int) states[i]) {
@@ -368,32 +383,72 @@ public class SocketChannelInst {
     }
   }
 
-  public static final class CleanupAdvice {
+  public static final class KillAdvice {
     @Advice.OnMethodEnter(suppress = Throwable.class)
-    public static void cleanup(
+    public static Connection capture(
         @Advice.FieldValue("localAddress") SocketAddress localSocket,
         @Advice.FieldValue("remoteAddress") SocketAddress remoteSocket,
         @Advice.FieldValue("fdVal") int socketFileDescriptor) {
       if (!(localSocket instanceof InetSocketAddress)
           || !(remoteSocket instanceof InetSocketAddress)
           || socketFileDescriptor < 0) {
-        return;
+        return null;
       }
       InetSocketAddress localSocketAddress = (InetSocketAddress) localSocket;
       InetSocketAddress remoteSocketAddress = (InetSocketAddress) remoteSocket;
 
-      Connection c =
-          new Connection(
-              localSocketAddress.getAddress(),
-              localSocketAddress.getPort(),
-              remoteSocketAddress.getAddress(),
-              remoteSocketAddress.getPort(),
-              socketFileDescriptor);
+      return new Connection(
+          localSocketAddress.getAddress(),
+          localSocketAddress.getPort(),
+          remoteSocketAddress.getAddress(),
+          remoteSocketAddress.getPort(),
+          socketFileDescriptor);
+    }
+
+    @Advice.OnMethodExit(suppress = Throwable.class)
+    public static void cleanup(@Advice.This Object channel, @Advice.Enter Connection connection) {
+      if (SSLStorage.debugOn) {
+        System.err.println("[SocketChannelInst] Cleanup connection " + connection);
+      }
+      SSLStorage.cleanupConnection(channel, connection);
+    }
+  }
+
+  public static final class TryCloseAdvice {
+    @Advice.OnMethodEnter(suppress = Throwable.class)
+    public static Connection capture(
+        @Advice.FieldValue("localAddress") SocketAddress localSocket,
+        @Advice.FieldValue("remoteAddress") SocketAddress remoteSocket,
+        @Advice.FieldValue("fdVal") int socketFileDescriptor) {
+      if (!(localSocket instanceof InetSocketAddress)
+          || !(remoteSocket instanceof InetSocketAddress)
+          || socketFileDescriptor < 0) {
+        return null;
+      }
+      InetSocketAddress localSocketAddress = (InetSocketAddress) localSocket;
+      InetSocketAddress remoteSocketAddress = (InetSocketAddress) remoteSocket;
+
+      return new Connection(
+          localSocketAddress.getAddress(),
+          localSocketAddress.getPort(),
+          remoteSocketAddress.getAddress(),
+          remoteSocketAddress.getPort(),
+          socketFileDescriptor);
+    }
+
+    @Advice.OnMethodExit(suppress = Throwable.class)
+    public static void cleanup(
+        @Advice.This Object channel,
+        @Advice.Enter Connection connection,
+        @Advice.Return boolean closed) {
+      if (!closed) {
+        return;
+      }
 
       if (SSLStorage.debugOn) {
-        System.err.println("[SocketChannelInst] Cleanup connection " + c);
+        System.err.println("[SocketChannelInst] Cleanup connection " + connection);
       }
-      SSLStorage.cleanupConnection(c);
+      SSLStorage.cleanupConnection(channel, connection);
     }
   }
 }

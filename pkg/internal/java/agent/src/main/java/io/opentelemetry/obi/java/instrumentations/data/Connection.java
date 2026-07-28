@@ -16,6 +16,7 @@ public class Connection {
   private final int socketFileDescriptor;
 
   private String bufferKey = null;
+  private volatile Object ownerToken;
 
   public Connection(
       InetAddress localAddress, int localPort, InetAddress remoteAddress, int remotePort) {
@@ -77,5 +78,13 @@ public class Connection {
 
   public void setBufferKey(String bufferKey) {
     this.bufferKey = bufferKey;
+  }
+
+  Object getOwnerToken() {
+    return ownerToken;
+  }
+
+  void setOwnerToken(Object ownerToken) {
+    this.ownerToken = ownerToken;
   }
 }

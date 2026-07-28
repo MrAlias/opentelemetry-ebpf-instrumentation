@@ -7,10 +7,16 @@ package io.opentelemetry.obi.java;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.opentelemetry.obi.java.instrumentations.SSLEngineInst;
 import java.lang.reflect.Constructor;
 import java.util.Map;
+import javax.net.ssl.SSLContext;
+import net.bytebuddy.description.type.TypeDescription;
+import net.bytebuddy.matcher.ElementMatcher;
+import net.bytebuddy.pool.TypePool;
 import org.junit.jupiter.api.Test;
 
 class AgentOptionsTest {
@@ -87,10 +93,19 @@ class AgentOptionsTest {
             "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$BufferHandoff"));
     assertTrue(
         Agent.isBootstrapHelperClassName(
+            "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ChannelState"));
+    assertTrue(
+        Agent.isBootstrapHelperClassName(
             "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ConnectionOwner"));
     assertTrue(
         Agent.isBootstrapHelperClassName(
             "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ExactConnection"));
+    assertTrue(
+        Agent.isBootstrapHelperClassName(
+            "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$NettyConnectionScope"));
+    assertTrue(
+        Agent.isBootstrapHelperClassName(
+            "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$NettyHandlerScope"));
     assertTrue(
         Agent.isBootstrapHelperClassName(
             "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext"));
@@ -120,7 +135,45 @@ class AgentOptionsTest {
     assertNoAccessMarkerConstructor(
         "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$BufferHandoff");
     assertNoAccessMarkerConstructor(
+        "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ChannelState");
+    assertNoAccessMarkerConstructor(
+        "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$NettyConnectionScope");
+    assertNoAccessMarkerConstructor(
+        "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$NettyHandlerScope");
+    assertNoAccessMarkerConstructor(
         "io.opentelemetry.obi.java.instrumentations.data.WeakIdentityConcurrentMap$IdentityWeakReference");
+  }
+
+  @Test
+  void skipsUnresolvableTypeMatcher() {
+    ElementMatcher<TypeDescription> matcher =
+        type -> {
+          throw new TypePool.Resolution.NoSuchTypeException("unavailable helper");
+        };
+
+    assertFalse(
+        Agent.safelyMatches(matcher).matches(new TypeDescription.ForLoadedType(Object.class)));
+  }
+
+  @Test
+  void retainsOtherTypeMatcherFailures() {
+    ElementMatcher<TypeDescription> matcher =
+        type -> {
+          throw new IllegalStateException("unexpected matcher failure");
+        };
+
+    assertThrows(
+        IllegalStateException.class,
+        () ->
+            Agent.safelyMatches(matcher).matches(new TypeDescription.ForLoadedType(Object.class)));
+  }
+
+  @Test
+  void retainsGenericSslEngineMatching() throws Exception {
+    TypeDescription type =
+        new TypeDescription.ForLoadedType(SSLContext.getDefault().createSSLEngine().getClass());
+
+    assertTrue(Agent.safelyMatches(SSLEngineInst.type()).matches(type));
   }
 
   private static void assertNoAccessMarkerConstructor(String className) throws Exception {

@@ -12,6 +12,7 @@ import io.opentelemetry.obi.java.instrumentations.data.SSLStorage;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.nio.channels.SocketChannel;
 import org.junit.jupiter.api.Test;
 
 class SocketChannelInstTest {
@@ -24,7 +25,7 @@ class SocketChannelInstTest {
     long initialPosition = SocketChannelInst.ReadAdvice.read(read);
     read.put(new byte[] {1, 2});
 
-    SocketChannelInst.ReadAdvice.read(read, initialPosition, 2, null, LOCAL, REMOTE, 7);
+    SocketChannelInst.ReadAdvice.read(null, read, initialPosition, 2, null, LOCAL, REMOTE, 7);
 
     Connection connection = SSLStorage.getConnectionForReadBuffer(read);
     assertNotNull(connection);
@@ -35,22 +36,22 @@ class SocketChannelInstTest {
   @Test
   void scalarReadRejectsZeroEofExceptionAndInconsistentAdvance() {
     ByteBuffer zero = ByteBuffer.allocate(8);
-    SocketChannelInst.ReadAdvice.read(zero, 0, 0, null, LOCAL, REMOTE, 8);
+    SocketChannelInst.ReadAdvice.read(null, zero, 0, 0, null, LOCAL, REMOTE, 8);
     assertNull(SSLStorage.getConnectionForReadBuffer(zero));
 
     ByteBuffer eof = ByteBuffer.allocate(8);
-    SocketChannelInst.ReadAdvice.read(eof, 0, -1, null, LOCAL, REMOTE, 8);
+    SocketChannelInst.ReadAdvice.read(null, eof, 0, -1, null, LOCAL, REMOTE, 8);
     assertNull(SSLStorage.getConnectionForReadBuffer(eof));
 
     ByteBuffer failed = ByteBuffer.allocate(8);
     failed.put((byte) 1);
     SocketChannelInst.ReadAdvice.read(
-        failed, 0, 1, new IOException("read failed"), LOCAL, REMOTE, 8);
+        null, failed, 0, 1, new IOException("read failed"), LOCAL, REMOTE, 8);
     assertNull(SSLStorage.getConnectionForReadBuffer(failed));
 
     ByteBuffer inconsistent = ByteBuffer.allocate(8);
     inconsistent.put((byte) 1);
-    SocketChannelInst.ReadAdvice.read(inconsistent, 0, 2, null, LOCAL, REMOTE, 8);
+    SocketChannelInst.ReadAdvice.read(null, inconsistent, 0, 2, null, LOCAL, REMOTE, 8);
     assertNull(SSLStorage.getConnectionForReadBuffer(inconsistent));
   }
 
@@ -59,14 +60,14 @@ class SocketChannelInstTest {
     ByteBuffer read = ByteBuffer.allocate(8);
     long firstPosition = SocketChannelInst.ReadAdvice.read(read);
     read.put((byte) 1);
-    SocketChannelInst.ReadAdvice.read(read, firstPosition, 1, null, LOCAL, REMOTE, 11);
+    SocketChannelInst.ReadAdvice.read(null, read, firstPosition, 1, null, LOCAL, REMOTE, 11);
     Connection first = SSLStorage.getConnectionForReadBuffer(read);
     assertNotNull(first);
 
     read.clear();
     long secondPosition = SocketChannelInst.ReadAdvice.read(read);
     read.put((byte) 2);
-    SocketChannelInst.ReadAdvice.read(read, secondPosition, 1, null, LOCAL, REMOTE, 12);
+    SocketChannelInst.ReadAdvice.read(null, read, secondPosition, 1, null, LOCAL, REMOTE, 12);
 
     Connection second = SSLStorage.getConnectionForReadBuffer(read);
     assertNotNull(second);
@@ -80,13 +81,13 @@ class SocketChannelInstTest {
     ByteBuffer read = ByteBuffer.allocate(8);
     long firstPosition = SocketChannelInst.ReadAdvice.read(read);
     read.put((byte) 1);
-    SocketChannelInst.ReadAdvice.read(read, firstPosition, 1, null, LOCAL, REMOTE, 13);
+    SocketChannelInst.ReadAdvice.read(null, read, firstPosition, 1, null, LOCAL, REMOTE, 13);
     Connection first = SSLStorage.getConnectionForReadBuffer(read);
     assertNotNull(first);
 
     long secondPosition = SocketChannelInst.ReadAdvice.read(read);
     read.put((byte) 2);
-    SocketChannelInst.ReadAdvice.read(read, secondPosition, 1, null, LOCAL, REMOTE, 14);
+    SocketChannelInst.ReadAdvice.read(null, read, secondPosition, 1, null, LOCAL, REMOTE, 14);
 
     assertNull(SSLStorage.getConnectionForReadBuffer(read));
     SSLStorage.cleanupConnection(first);
@@ -99,7 +100,7 @@ class SocketChannelInstTest {
     long firstState = SocketChannelInst.ReadAdvice.read(read);
     read.put((byte) 1);
     read.limit(4);
-    SocketChannelInst.ReadAdvice.read(read, firstState, 1, null, LOCAL, REMOTE, 17);
+    SocketChannelInst.ReadAdvice.read(null, read, firstState, 1, null, LOCAL, REMOTE, 17);
     Connection first = SSLStorage.getConnectionForReadBuffer(read);
     assertNotNull(first);
 
@@ -108,7 +109,7 @@ class SocketChannelInstTest {
     long secondState = SocketChannelInst.ReadAdvice.read(read);
     read.put((byte) 2);
     read.limit(read.capacity());
-    SocketChannelInst.ReadAdvice.read(read, secondState, 1, null, LOCAL, REMOTE, 18);
+    SocketChannelInst.ReadAdvice.read(null, read, secondState, 1, null, LOCAL, REMOTE, 18);
 
     assertNull(SSLStorage.getConnectionForReadBuffer(read));
     SSLStorage.cleanupConnection(first);
@@ -125,7 +126,7 @@ class SocketChannelInstTest {
     first.put(new byte[] {1, 2});
     second.put((byte) 3);
 
-    SocketChannelInst.ReadAdviceArray.read(buffers, saved, 3, null, LOCAL, REMOTE, 9);
+    SocketChannelInst.ReadAdviceArray.read(null, buffers, saved, 3, null, LOCAL, REMOTE, 9);
 
     assertNull(SSLStorage.getConnectionForReadBuffer(skipped));
     Connection firstConnection = SSLStorage.getConnectionForReadBuffer(first);
@@ -145,7 +146,7 @@ class SocketChannelInstTest {
     Object[] firstSaved = SocketChannelInst.ReadAdviceArray.read(buffers, 0, 2);
     firstBuffer.put((byte) 1);
     secondBuffer.put((byte) 2);
-    SocketChannelInst.ReadAdviceArray.read(buffers, firstSaved, 2, null, LOCAL, REMOTE, 15);
+    SocketChannelInst.ReadAdviceArray.read(null, buffers, firstSaved, 2, null, LOCAL, REMOTE, 15);
     Connection first = SSLStorage.getConnectionForReadBuffer(firstBuffer);
     assertNotNull(first);
 
@@ -154,7 +155,7 @@ class SocketChannelInstTest {
     Object[] secondSaved = SocketChannelInst.ReadAdviceArray.read(buffers, 0, 2);
     firstBuffer.put((byte) 3);
     secondBuffer.put((byte) 4);
-    SocketChannelInst.ReadAdviceArray.read(buffers, secondSaved, 2, null, LOCAL, REMOTE, 16);
+    SocketChannelInst.ReadAdviceArray.read(null, buffers, secondSaved, 2, null, LOCAL, REMOTE, 16);
 
     Connection second = SSLStorage.getConnectionForReadBuffer(firstBuffer);
     assertNotNull(second);
@@ -171,7 +172,8 @@ class SocketChannelInstTest {
     Object[] replacedSaved = SocketChannelInst.ReadAdviceArray.read(replaced, 0, 1);
     replaced[0] = ByteBuffer.allocate(8);
     replaced[0].put((byte) 1);
-    SocketChannelInst.ReadAdviceArray.read(replaced, replacedSaved, 1, null, LOCAL, REMOTE, 10);
+    SocketChannelInst.ReadAdviceArray.read(
+        null, replaced, replacedSaved, 1, null, LOCAL, REMOTE, 10);
     assertNull(SSLStorage.getConnectionForReadBuffer(replaced[0]));
     assertNull(SSLStorage.getConnectionForReadBuffer(original));
 
@@ -179,8 +181,78 @@ class SocketChannelInstTest {
     ByteBuffer[] buffers = {inconsistent};
     Object[] saved = SocketChannelInst.ReadAdviceArray.read(buffers, 0, 1);
     inconsistent.put((byte) 1);
-    SocketChannelInst.ReadAdviceArray.read(buffers, saved, 2, null, LOCAL, REMOTE, 10);
+    SocketChannelInst.ReadAdviceArray.read(null, buffers, saved, 2, null, LOCAL, REMOTE, 10);
     assertNull(SSLStorage.getConnectionForReadBuffer(inconsistent));
+  }
+
+  @Test
+  void scalarReadPublishesTheExactSocketChannelConnection() throws IOException {
+    try (SocketChannel channel = SocketChannel.open()) {
+      ByteBuffer read = ByteBuffer.allocate(8);
+      long initialPosition = SocketChannelInst.ReadAdvice.read(read);
+      read.put((byte) 1);
+
+      SocketChannelInst.ReadAdvice.read(channel, read, initialPosition, 1, null, LOCAL, REMOTE, 19);
+
+      Connection connection = SSLStorage.getConnectionForSocketChannel(channel);
+      assertNotNull(connection);
+      assertEquals(19, connection.getSocketFileDescriptor());
+      SSLStorage.cleanupConnection(channel, connection);
+      assertNull(SSLStorage.getConnectionForSocketChannel(channel));
+    }
+  }
+
+  @Test
+  void socketCleanupKeepsHalfClosedConnectionsAvailableUntilTerminalClose() throws IOException {
+    try (SocketChannel channel = SocketChannel.open()) {
+      Connection connection = connection(20);
+      assertSame(connection, SSLStorage.associateConnectionWithSocketChannel(channel, connection));
+
+      SocketChannelInst.TryCloseAdvice.cleanup(
+          channel,
+          SocketChannelInst.TryCloseAdvice.capture(
+              LOCAL, REMOTE, connection.getSocketFileDescriptor()),
+          false);
+
+      assertSame(connection, SSLStorage.getConnectionForSocketChannel(channel));
+
+      SocketChannelInst.TryCloseAdvice.cleanup(
+          channel,
+          SocketChannelInst.TryCloseAdvice.capture(
+              LOCAL, REMOTE, connection.getSocketFileDescriptor()),
+          true);
+
+      assertNull(SSLStorage.getConnectionForSocketChannel(channel));
+    }
+  }
+
+  @Test
+  void terminalKillClosesTheChannelStateWithoutATupleCapture() throws IOException {
+    try (SocketChannel channel = SocketChannel.open()) {
+      Connection connection = connection(22);
+      assertSame(connection, SSLStorage.associateConnectionWithChannel(channel, connection));
+
+      SocketChannelInst.KillAdvice.cleanup(channel, null);
+
+      assertNull(SSLStorage.getConnectionForChannel(channel));
+      assertNull(SSLStorage.associateConnectionWithChannel(channel, connection));
+    }
+  }
+
+  @Test
+  void scalarReadSkipsPublicationAfterTerminalChannelClose() throws IOException {
+    try (SocketChannel channel = SocketChannel.open()) {
+      Connection connection = connection(21);
+      assertSame(connection, SSLStorage.associateConnectionWithSocketChannel(channel, connection));
+      SSLStorage.cleanupConnection(channel, connection);
+
+      ByteBuffer read = ByteBuffer.allocate(8);
+      long initialPosition = SocketChannelInst.ReadAdvice.read(read);
+      read.put((byte) 1);
+      SocketChannelInst.ReadAdvice.read(channel, read, initialPosition, 1, null, LOCAL, REMOTE, 21);
+
+      assertNull(SSLStorage.getConnectionForReadBuffer(read));
+    }
   }
 
   private static Connection connection(int fileDescriptor) {

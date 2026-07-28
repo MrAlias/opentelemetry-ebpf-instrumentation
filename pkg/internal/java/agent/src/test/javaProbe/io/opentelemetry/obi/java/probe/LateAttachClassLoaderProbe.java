@@ -24,10 +24,16 @@ public final class LateAttachClassLoaderProbe {
       "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$TlsConnectionMarkerAttempt";
   private static final String BUFFER_HANDOFF_CLASS =
       "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$BufferHandoff";
+  private static final String CHANNEL_STATE_CLASS =
+      "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ChannelState";
   private static final String CONNECTION_OWNER_CLASS =
       "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ConnectionOwner";
   private static final String EXACT_CONNECTION_CLASS =
       "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ExactConnection";
+  private static final String NETTY_CONNECTION_SCOPE_CLASS =
+      "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$NettyConnectionScope";
+  private static final String NETTY_HANDLER_SCOPE_CLASS =
+      "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$NettyHandlerScope";
   private static final String REMOTE_PARENT_SOCKET_CONTEXT_CLASS =
       "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext";
   private static final String WEAK_IDENTITY_MAP_CLASS =
@@ -77,8 +83,11 @@ public final class LateAttachClassLoaderProbe {
     }
     assertBootstrapClass(TLS_MARKER_ATTEMPT_CLASS);
     assertBootstrapClass(BUFFER_HANDOFF_CLASS);
+    assertBootstrapClass(CHANNEL_STATE_CLASS);
     assertBootstrapClass(CONNECTION_OWNER_CLASS);
     assertBootstrapClass(EXACT_CONNECTION_CLASS);
+    assertBootstrapClass(NETTY_CONNECTION_SCOPE_CLASS);
+    assertBootstrapClass(NETTY_HANDLER_SCOPE_CLASS);
     assertBootstrapClass(REMOTE_PARENT_SOCKET_CONTEXT_CLASS);
     assertBootstrapClass(WEAK_IDENTITY_MAP_CLASS);
     assertBootstrapClass(WEAK_IDENTITY_REFERENCE_CLASS);
@@ -114,6 +123,18 @@ public final class LateAttachClassLoaderProbe {
       throw new AssertionError("isolated TLS engine was not cached by the bootstrap helper");
     }
 
+    storage.getMethod("beginNettyConnectionScope").invoke(null);
+    try {
+      if (!(Boolean)
+          storage.getMethod("setCurrentNettyConnection", Object.class).invoke(null, connection)) {
+        throw new AssertionError("bootstrap helper did not install the Netty connection scope");
+      }
+      if (storage.getMethod("currentScopedConnection").invoke(null) != connection) {
+        throw new AssertionError("bootstrap helper did not resolve the Netty connection scope");
+      }
+    } finally {
+      storage.getMethod("endNettyConnectionScope").invoke(null);
+    }
     Method claimMarker =
         storage.getMethod(
             "claimTlsConnectionMarkerAttempt", SSLEngine.class, connectionClass, long.class);

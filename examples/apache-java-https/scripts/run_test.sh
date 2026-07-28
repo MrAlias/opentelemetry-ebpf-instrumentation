@@ -3976,6 +3976,68 @@ test_java_diagnostics_delta_is_exact() {
   }
 }
 
+test_pressure_unix_already_consumed_diagnostics_are_exact() {
+  local -r before="$TEST_TMP_DIR/pressure-unix-before.txt"
+  local -r after="$TEST_TMP_DIR/pressure-unix-after.txt"
+  local -r delta="$TEST_TMP_DIR/pressure-unix.delta"
+  local bridge_json='{"transport":"unix","retrieval_failure_count":2,"retrieval_failure_reason_counts":{"missing":0,"stale":0,"unsupported":0,"malformed":0,"version_mismatch":0,"ambiguous":0,"unauthorized":0,"already_consumed":2,"timeout":0,"overload":0,"transport_error":0,"disabled":0}}'
+
+  pressure_unix_already_consumed_roots_are_reconciled "$bridge_json" 2 || {
+    printf 'pressure reconciliation rejected exact Unix already-consumed roots\n' >&2
+    return 1
+  }
+  if pressure_unix_already_consumed_roots_are_reconciled \
+    "${bridge_json/\"already_consumed\":2/\"already_consumed\":1}" 2; then
+    printf 'pressure reconciliation accepted a mismatched Unix already-consumed count\n' >&2
+    return 1
+  fi
+  if pressure_unix_already_consumed_roots_are_reconciled \
+    "${bridge_json/\"missing\":0/\"missing\":1}" 2; then
+    printf 'pressure reconciliation accepted an additional Unix retrieval failure reason\n' >&2
+    return 1
+  fi
+  if pressure_unix_already_consumed_roots_are_reconciled \
+    $'null\n'"$bridge_json" 2; then
+    printf 'pressure reconciliation accepted multiple reconciliation documents\n' >&2
+    return 1
+  fi
+
+  write_diagnostics_fixture "$before" 0 0 0 0 0 0
+  write_diagnostics_fixture "$after" 3i 0 0 3i 0 0 already_consumed 2
+  sed -i 's/t_missing=0/t_missing=1/' "$after"
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+
+  if assert_java_diagnostics_delta "$delta" 126 0 0 3 126 0 0 \
+    >/dev/null 2>&1; then
+    printf 'generic diagnostics validation accepted multiple un-attributed already-consumed results\n' >&2
+    return 1
+  fi
+  assert_pressure_unix_already_consumed_diagnostics_delta \
+    "$delta" 126 1 126 0 0 2 || {
+    printf 'pressure diagnostics rejected exact Unix already-consumed roots\n' >&2
+    return 1
+  }
+
+  sed -i \
+    's/t_already_consumed before=0 after=2 delta=2/t_already_consumed before=0 after=3 delta=3/' \
+    "$delta"
+  if assert_pressure_unix_already_consumed_diagnostics_delta \
+    "$delta" 126 1 126 0 0 2 >/dev/null 2>&1; then
+    printf 'pressure diagnostics accepted an extra already-consumed result\n' >&2
+    return 1
+  fi
+
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  sed -i \
+    's/t_missing before=0 after=1 delta=1/t_missing before=0 after=2 delta=2/' \
+    "$delta"
+  if assert_pressure_unix_already_consumed_diagnostics_delta \
+    "$delta" 126 1 126 0 0 2 >/dev/null 2>&1; then
+    printf 'pressure diagnostics accepted an extra missing result\n' >&2
+    return 1
+  fi
+}
+
 test_java_diagnostics_header_is_exact_and_piggybacked() {
   local -r result_dir="$TEST_TMP_DIR/java-diagnostics-boundary"
   local -r calls="$result_dir/curl.calls"
@@ -4858,6 +4920,85 @@ EOF
     "$result_dir/scenario-pressure-status.json" || return 1
   grep -Fq '"attributable_absence_count":3' \
     "$result_dir/scenario-pressure-status.json" || return 1
+}
+
+test_pressure_unix_scenario_uses_strict_already_consumed_reconciliation() {
+  local -r call_log="$TEST_TMP_DIR/scenario-pressure-unix-accounting.calls"
+  local -r result_dir="$TEST_TMP_DIR/scenario-pressure-unix-accounting"
+
+  (
+    RESULT_DIR="$result_dir"
+    mkdir -p -- "$RESULT_DIR"
+    : >"$call_log"
+    BRIDGE_RUNNING=true
+    COMPOSE=(docker compose)
+    REPEAT_COUNT=1
+    REQUEST_COUNT=128
+    SCENARIO_SEED=1
+    SCENARIO_VARIANT=""
+    SELECTED_TRANSPORT=unix
+    TLS_PROTOCOL=TLSv1.2
+    PRESSURE_ACTIVE=false
+    scenario_bridge_missing_count() { printf '0\n'; }
+    scenario_java_missing_count() { printf '1\n'; }
+    scenario_bridge_take_count() { printf '128\n'; }
+    flush_bridge_metric_boundary() { :; }
+    capture_java_diagnostics() {
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+      printf 'fixture\n' >"$RESULT_DIR/phases/$1/java-diagnostics.txt"
+    }
+    capture_phase_evidence() {
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+      printf '# empty\n' >"$RESULT_DIR/phases/$1/obi-metrics.prom"
+    }
+    start_map_pressure() {
+      [[ "$1" == "pressure" && "$3" == "128" ]] || return 1
+      PRESSURE_ACTIVE=true
+    }
+    cleanup_map_pressure_with_retries() {
+      PRESSURE_ACTIVE=false
+    }
+    run_bounded() {
+      cat <<'EOF'
+{
+  "status": "passed",
+  "pressure_correlation": {
+    "exact_hit_count": 126,
+    "explicit_root_count": 2,
+    "wrong_parent_count": 0,
+    "unresolved_count": 0
+  }
+}
+EOF
+    }
+    wait_for_bridge_metrics_quiescent() { :; }
+    write_metrics_delta() { : >"$3"; }
+    pressure_bridge_reconciliation() {
+      printf '%s\n' '{"transport":"unix","retrieval_valid_count":126,"retrieval_failure_count":2,"retrieval_failure_reason_counts":{"missing":0,"stale":0,"unsupported":0,"malformed":0,"version_mismatch":0,"ambiguous":0,"unauthorized":0,"already_consumed":2,"timeout":0,"overload":0,"transport_error":0,"disabled":0}}'
+    }
+    write_java_diagnostics_delta() { : >"$3"; }
+    assert_pressure_unix_already_consumed_diagnostics_delta() {
+      printf 'strict:%s:%s:%s:%s:%s:%s\n' \
+        "$2" "$3" "$4" "$5" "$6" "$7" >>"$call_log"
+      [[ "$2" == "126" && "$3" == "1" && "$4" == "126" && \
+        "$5" == "0" && "$6" == "0" && "$7" == "2" ]]
+    }
+    assert_java_diagnostics_delta() {
+      printf 'generic\n' >>"$call_log"
+      return 1
+    }
+
+    run_scenario pressure >/dev/null
+    [[ "$PRESSURE_ACTIVE" == "false" ]]
+  ) || {
+    printf 'Unix pressure scenario did not use strict already-consumed reconciliation\n' >&2
+    return 1
+  }
+  grep -Fqx 'strict:126:1:126:0:0:2' "$call_log"
+  if grep -Fqx 'generic' "$call_log"; then
+    printf 'Unix pressure scenario used generic diagnostics instead of strict reconciliation\n' >&2
+    return 1
+  fi
 }
 
 test_pressure_failure_retains_wrong_parent_counts_and_cleans_up() {
@@ -5761,8 +5902,9 @@ test_pipeline_dependencies_are_declared() {
   local definition=""
 
   definition="$(declare -f check_dependencies)"
-  [[ "$definition" == *" mv "* && "$definition" == *" tee "* ]] || {
-    printf 'runner dependency check omitted mv or tee\n' >&2
+  [[ "$definition" == *" jq "* && "$definition" == *" mv "* && \
+    "$definition" == *" tee "* ]] || {
+    printf 'runner dependency check omitted jq, mv, or tee\n' >&2
     return 1
   }
 }
@@ -8331,6 +8473,7 @@ main() {
   test_unix_endpoint_restart_invalidates_before_stack_mutation
   test_java_diagnostics_schema_is_exact
   test_java_diagnostics_delta_is_exact
+  test_pressure_unix_already_consumed_diagnostics_are_exact
   test_java_diagnostics_header_is_exact_and_piggybacked
   test_pre_stop_diagnostics_failure_does_not_stop_obi
   test_fault_diagnostics_result_is_single_sanitized_snapshot
@@ -8342,6 +8485,7 @@ main() {
   test_helper_unavailable_scenario_injects_without_staging_or_retrieval
   test_scenario_fences_metrics_around_diagnostics
   test_pressure_scenario_reconciles_roots_with_bridge_and_java_counts
+  test_pressure_unix_scenario_uses_strict_already_consumed_reconciliation
   test_pressure_failure_retains_wrong_parent_counts_and_cleans_up
   test_pressure_empty_result_fails_closed_and_cleans_up
   test_scenario_controls_matching_fixture_lifecycle

@@ -123,7 +123,7 @@ on the production Java TLS bridge path.
 - Docker Engine with Compose v2 and permission to run privileged containers.
 - A kernel supported by OBI (normally Linux 5.8+ with BTF, or a documented
   RHEL 8 backport).
-- `bash`, `curl`, `git`, `openssl`, `sha256sum`, and GNU `timeout`.
+- `bash`, `curl`, `git`, `jq`, `openssl`, `sha256sum`, and GNU `timeout`.
 - Free loopback ports `14318`, `18080`, and `18443`.
 - Internet access for pinned container images, Maven dependencies, and the
   selected official Java agent.

@@ -438,7 +438,7 @@ mark_non_acceptance() {
 check_dependencies() {
   local -a missing=()
   local command_name=""
-  for command_name in awk cmp curl cut docker find git grep install mv openssl sed sha256sum sort tail tee timeout wc; do
+  for command_name in awk cmp curl cut docker find git grep install jq mv openssl sed sha256sum sort tail tee timeout wc; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
       missing+=("$command_name")
     fi
@@ -3234,6 +3234,7 @@ run_scenario() {
   local pressure_bridge_json="null"
   local pressure_java_json="null"
   local pressure_status_json="null"
+  local pressure_unix_already_consumed_reconciled=false
   local expected_fault_status=""
   local expected_fault_count=0
   local fault_diagnostics_after=""
@@ -3317,6 +3318,7 @@ run_scenario() {
     pressure_bridge_json="null"
     pressure_java_json="null"
     pressure_status_json="null"
+    pressure_unix_already_consumed_reconciled=false
     label="$name"
     if [[ "$name" == "w3c-fault" ]]; then
       label="$name-$FAULT_MODE"
@@ -3529,6 +3531,11 @@ run_scenario() {
           pressure_bridge_json="null"
           metric_status=1
         }
+        if [[ "$SELECTED_TRANSPORT" == "unix" && "$pressure_roots" != "0" ]] && \
+          pressure_unix_already_consumed_roots_are_reconciled \
+            "$pressure_bridge_json" "$pressure_roots"; then
+          pressure_unix_already_consumed_reconciled=true
+        fi
       elif ! assert_bridge_metric_delta \
         "$RESULT_DIR/phases/$after_phase/obi-metrics.delta" \
         "$SELECTED_TRANSPORT" \
@@ -3570,7 +3577,19 @@ run_scenario() {
             expected_unsampled="$(((expected_requests + 1) / 2))"
             ;;
         esac
-        if ! assert_java_diagnostics_delta \
+        if [[ "$name" == "pressure" && \
+          "$pressure_unix_already_consumed_reconciled" == "true" ]]; then
+          if ! assert_pressure_unix_already_consumed_diagnostics_delta \
+            "$RESULT_DIR/phases/$after_phase/java-diagnostics.delta" \
+            "$expected_valid" \
+            "$baseline_java_missing" \
+            "$expected_sampled" \
+            "$expected_unsampled" \
+            "$expected_standard" \
+            "$pressure_roots"; then
+            metric_status=1
+          fi
+        elif ! assert_java_diagnostics_delta \
           "$RESULT_DIR/phases/$after_phase/java-diagnostics.delta" \
           "$expected_valid" \
           "$expected_stale" \
@@ -6269,6 +6288,60 @@ pressure_bridge_reconciliation() {
       printf "\"retrieval_failure_reason_counts\":{\"missing\":%d,\"stale\":%d,\"unsupported\":%d,\"malformed\":%d,\"version_mismatch\":%d,\"ambiguous\":%d,\"unauthorized\":%d,\"already_consumed\":%d,\"timeout\":%d,\"overload\":%d,\"transport_error\":%d,\"disabled\":%d}}\n", retrieval_reason["missing"], retrieval_reason["stale"], retrieval_reason["unsupported"], retrieval_reason["malformed"], retrieval_reason["version_mismatch"], retrieval_reason["ambiguous"], retrieval_reason["unauthorized"], retrieval_reason["already_consumed"], retrieval_reason["timeout"], retrieval_reason["overload"], retrieval_reason["transport_error"], retrieval_reason["disabled"]
     }
   ' "$input"
+}
+
+pressure_unix_already_consumed_roots_are_reconciled() {
+  local -r reconciliation="$1"
+  local -r expected_roots="$2"
+
+  [[ "$expected_roots" =~ ^[1-9][0-9]*$ ]] || return 1
+  jq -e -s --argjson expected_roots "$expected_roots" '
+    length == 1 and
+    (.[0] |
+      .transport == "unix" and
+      .retrieval_failure_count == $expected_roots and
+      (.retrieval_failure_reason_counts | type == "object") and
+      .retrieval_failure_reason_counts.already_consumed == $expected_roots and
+      ([.retrieval_failure_reason_counts | to_entries[] |
+        select(.key != "already_consumed" and .value != 0)] | length == 0)
+    )
+  ' <<<"$reconciliation" >/dev/null
+}
+
+assert_pressure_unix_already_consumed_diagnostics_delta() {
+  local -r input="$1"
+  local -r expected_valid="$2"
+  local -r expected_missing="$3"
+  local -r expected_sampled="$4"
+  local -r expected_unsampled="$5"
+  local -r expected_standard="$6"
+  local -r expected_roots="$7"
+  local actual_missing=""
+  local actual_already_consumed=""
+
+  [[ "$expected_roots" =~ ^[1-9][0-9]*$ ]] || return 1
+  assert_java_diagnostics_delta \
+    "$input" \
+    "$expected_valid" \
+    0 \
+    0 \
+    "$expected_missing" \
+    "$expected_sampled" \
+    "$expected_unsampled" \
+    "$expected_standard" \
+    already_consumed \
+    "$expected_roots" || return $?
+
+  actual_missing="$(java_diagnostic_delta "$input" t_missing)" || return $?
+  actual_already_consumed="$(
+    java_diagnostic_delta "$input" t_already_consumed
+  )" || return $?
+  if [[ "$actual_missing" != "$expected_missing" || \
+    "$actual_already_consumed" != "$expected_roots" ]]; then
+    log_error \
+      "pressure diagnostics expected missing=$expected_missing already_consumed=$expected_roots, got missing=$actual_missing already_consumed=$actual_already_consumed"
+    return 1
+  fi
 }
 
 assert_bridge_metric_delta() {

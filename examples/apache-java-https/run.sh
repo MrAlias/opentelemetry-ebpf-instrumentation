@@ -3843,7 +3843,6 @@ run_restart_during_traffic_control() (
   local -r after_phase="$label-after"
   local -r control_dir="$RESULT_DIR/restart-control"
   local restart_since=""
-  local provider_since=""
   local scenario_pid=""
   local scenario_status=0
 
@@ -3891,7 +3890,6 @@ run_restart_during_traffic_control() (
     "pre-stop restart traffic" \
     "$scenario_pid" || return $?
 
-  restart_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" || return $?
   invalidate_selected_transport || return $?
   BRIDGE_RUNNING=false
   run_bounded 60 "${COMPOSE[@]}" stop --timeout 5 obi || return $?
@@ -3903,6 +3901,7 @@ run_restart_during_traffic_control() (
     "$RESTART_SIGNAL_STOPPED_TRAFFIC_COMPLETE" \
     "traffic while OBI was stopped" \
     "$scenario_pid" || return $?
+  restart_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" || return $?
   run_bounded 120 "${COMPOSE[@]}" up --detach obi || return $?
   wait_for_log \
     obi \
@@ -3910,7 +3909,6 @@ run_restart_during_traffic_control() (
     "OBI bridge restarted during traffic" \
     "$restart_since" || return $?
   sleep "$JAVA_PROVIDER_RETRY_SETTLE_SECONDS" || return $?
-  provider_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" || return $?
   BRIDGE_RUNNING=true
   wait_for_apache_instrumentation restart-fault-recovery || return $?
   wait_for_java_duplicate_suppression \
@@ -3919,7 +3917,7 @@ run_restart_during_traffic_control() (
     java-backend \
     "OBI remote-parent provider ready" \
     "Java bridge reconfigured before restart traffic resumes" \
-    "$provider_since" || return $?
+    "$restart_since" || return $?
   assert_selected_transport || return $?
   publish_restart_control_release \
     "$control_dir" \
@@ -5254,7 +5252,6 @@ run_unix_permissive_directory_control() {
   local -r obi_log="$RESULT_DIR/security-permissive-directory-obi.log"
   local failure_since=""
   local recovery_since=""
-  local provider_since=""
   local socket_status=0
 
   log_info "proving the Unix bridge refuses a world-accessible socket directory"
@@ -5323,7 +5320,6 @@ run_unix_permissive_directory_control() {
     "Java remote parent bridge ready" \
     "post-permission Unix bridge recovery" \
     "$recovery_since" || return $?
-  provider_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" || return $?
   BRIDGE_RUNNING=true
   wait_for_apache_instrumentation unix-permission-recovery || return $?
   wait_for_http \
@@ -5336,7 +5332,7 @@ run_unix_permissive_directory_control() {
     java-backend \
     "OBI remote-parent provider ready" \
     "post-permission Java bridge provider" \
-    "$provider_since" || return $?
+    "$recovery_since" || return $?
   assert_selected_transport || return $?
   [[ "$SELECTED_TRANSPORT" == "unix" ]] || {
     log_error "post-permission recovery did not restore the Unix transport"
@@ -5351,7 +5347,6 @@ run_unix_security_control() {
   local -r security_logs="$RESULT_DIR/security-sanitized-logs.txt"
   local security_since=""
   local restart_since=""
-  local provider_since=""
   local probe_container=""
   local probe_exit=""
   local canary_status=0
@@ -5462,7 +5457,6 @@ run_unix_security_control() {
     "Java remote-parent fallback transport recovered" \
     "post-replacement Unix bridge recovery" \
     "$restart_since" || return $?
-  provider_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" || return $?
   BRIDGE_RUNNING=true
   wait_for_http \
     "$APACHE_HTTPS_HEALTH_ENDPOINT" \
@@ -5475,7 +5469,7 @@ run_unix_security_control() {
     java-backend \
     "OBI remote-parent provider ready" \
     "post-replacement Java bridge provider" \
-    "$provider_since" || return $?
+    "$restart_since" || return $?
   assert_selected_transport unix || return $?
 
   capture_java_diagnostics "security-after"
@@ -5636,7 +5630,6 @@ normalize_control_response() {
 
 execute_requested_scenarios() {
   local restart_since=""
-  local provider_since=""
 
   case "$SCENARIO" in
     all)
@@ -5687,7 +5680,6 @@ execute_requested_scenarios() {
         "Java remote parent bridge ready" \
         "restarted OBI remote-parent bridge" \
         "$restart_since" || return $?
-      provider_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" || return $?
       BRIDGE_RUNNING=true
       wait_for_apache_instrumentation restart || return $?
       wait_for_http \
@@ -5700,7 +5692,7 @@ execute_requested_scenarios() {
         java-backend \
         "OBI remote-parent provider ready" \
         "restarted Java bridge provider" \
-        "$provider_since" || return $?
+        "$restart_since" || return $?
       assert_selected_transport || return $?
       run_scenario restart
       ;;

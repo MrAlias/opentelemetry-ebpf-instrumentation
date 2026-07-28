@@ -3445,6 +3445,22 @@ EOF
   assert_security_metric_delta "$delta" take unauthorized unix 8 8
 }
 
+test_unix_security_provider_wait_uses_restart_cursor() {
+  local unix_control=""
+
+  unix_control="$(declare -f run_unix_security_control)"
+  [[ "$unix_control" != *'provider_since'* ]] || {
+    printf 'Unix security control captured the provider log cursor after restart recovery\n' >&2
+    return 1
+  }
+  grep -Fq \
+    'post-replacement Java bridge provider" "$restart_since" || return $?' \
+    <<<"$unix_control" || {
+    printf 'Unix security control did not scope provider readiness to the restart\n' >&2
+    return 1
+  }
+}
+
 test_permissive_unix_directory_control_refuses_and_restores() {
   local -r result_dir="$TEST_TMP_DIR/permissive-directory-control"
   local -r observed="$result_dir/observed"
@@ -3487,6 +3503,12 @@ test_permissive_unix_directory_control_refuses_and_restores() {
         *" test -S /var/run/obi/java-remote-parent.sock "*)
           return 1
           ;;
+        *" up --detach --no-deps --force-recreate obi "*)
+          if [[ "$directory_mode" == "0750" ]]; then
+            : >"$provider_ready"
+            printf 'provider-ready\n' >>"$observed"
+          fi
+          ;;
         *" logs --no-color "*)
           if [[ "$directory_mode" == "0777" ]]; then
             printf 'java bridge socket ancestor is writable without the sticky bit\n'
@@ -3509,7 +3531,7 @@ test_permissive_unix_directory_control_refuses_and_restores() {
     }
     wait_for_log() {
       if [[ "$3" == "post-permission Java bridge provider" ]]; then
-        [[ -f "$provider_ready" ]] || return 1
+        [[ -f "$provider_ready" && "$4" == "security-recovery-cursor" ]] || return 1
       fi
       printf 'log:%s:%s\n' "$3" "${4:-}" >>"$observed"
     }
@@ -3517,7 +3539,7 @@ test_permissive_unix_directory_control_refuses_and_restores() {
       printf 'apache:%s\n' "$1" >>"$observed"
     }
     wait_for_java_duplicate_suppression() {
-      : >"$provider_ready"
+      [[ -f "$provider_ready" ]] || return 1
       printf 'suppression:%s\n' "$(basename -- "$1")" >>"$observed"
       : >"$1"
     }
@@ -3534,10 +3556,6 @@ test_permissive_unix_directory_control_refuses_and_restores() {
         2)
           printf 'cursor:security-recovery\n' >>"$observed"
           printf 'security-recovery-cursor\n'
-          ;;
-        3)
-          printf 'cursor:security-provider\n' >>"$observed"
-          printf 'security-provider-cursor\n'
           ;;
         *) return 1 ;;
       esac
@@ -3569,14 +3587,15 @@ test_permissive_unix_directory_control_refuses_and_restores() {
   grep -Fq 'logs --no-color --since security-failure-cursor obi' "$observed"
   awk '
     /up --detach --no-deps --force-recreate obi/ { recovery = NR }
+    $0 == "cursor:security-recovery" { recovery_cursor = NR }
     $0 == "log:post-permission Unix bridge recovery:security-recovery-cursor" {
       bridge = NR
     }
-    $0 == "cursor:security-provider" { provider_cursor = NR }
+    $0 == "provider-ready" { provider_ready = NR }
     $0 == "http:post-permission Java provider probe" { probe = NR }
     $0 ~ /^sleep:[0-9]+$/ { settle = NR }
     $0 == "transport" { transport = NR }
-    $0 == "log:post-permission Java bridge provider:security-provider-cursor" {
+    $0 == "log:post-permission Java bridge provider:security-recovery-cursor" {
       provider = NR
     }
     $0 == "apache:unix-permission-recovery" { readiness = NR }
@@ -3584,8 +3603,9 @@ test_permissive_unix_directory_control_refuses_and_restores() {
       suppression = NR
     }
     END {
-      exit recovery > 0 && bridge > recovery &&
-        provider_cursor > bridge && readiness > provider_cursor &&
+      exit recovery > 0 && recovery_cursor > 0 &&
+        provider_ready > recovery_cursor && provider_ready < recovery &&
+        bridge > recovery && readiness > bridge &&
         probe > readiness && settle > probe && suppression > settle &&
         provider > suppression && transport > provider ? 0 : 1
     }
@@ -7365,10 +7385,6 @@ test_standalone_restart_waits_for_apache_instrumentation() {
           printf 'cursor:restart\n' >>"$observed"
           printf 'restart-cursor\n'
           ;;
-        2)
-          printf 'cursor:provider\n' >>"$observed"
-          printf 'restart-provider-cursor\n'
-          ;;
         *) return 1 ;;
       esac
     }
@@ -7378,10 +7394,14 @@ test_standalone_restart_waits_for_apache_instrumentation() {
         ! -e "$RESULT_DIR/java-transport-configuration.txt" &&
         -e "$RESULT_DIR/java-selected-transport-configuration.txt" ]] || return 31
       printf 'compose:%s\n' "$*" >>"$observed"
+      if [[ " $* " == *" restart --timeout 10 obi "* ]]; then
+        : >"$provider_ready"
+        printf 'provider-ready\n' >>"$observed"
+      fi
     }
     wait_for_log() {
       if [[ "$3" == "restarted Java bridge provider" ]]; then
-        [[ -f "$provider_ready" ]] || return 1
+        [[ -f "$provider_ready" && "$4" == "restart-cursor" ]] || return 1
       fi
       printf 'log:%s:%s\n' "$3" "${4:-}" >>"$observed"
     }
@@ -7398,7 +7418,7 @@ test_standalone_restart_waits_for_apache_instrumentation() {
       printf 'apache:%s\n' "$1" >>"$observed"
     }
     wait_for_java_duplicate_suppression() {
-      : >"$provider_ready"
+      [[ -f "$provider_ready" ]] || return 1
       printf 'suppression:%s\n' "$(basename -- "$1")" >>"$observed"
     }
     run_scenario() {
@@ -7419,13 +7439,13 @@ test_standalone_restart_waits_for_apache_instrumentation() {
   printf '%s\n' \
     'cursor:restart' \
     'compose:60 test-compose restart --timeout 10 obi' \
+    'provider-ready' \
     'log:restarted OBI remote-parent bridge:restart-cursor' \
-    'cursor:provider' \
     'apache:restart' \
     'http:restarted Java provider probe' \
     "sleep:$JAVA_PROVIDER_RETRY_SETTLE_SECONDS" \
     'suppression:duplicate-suppression-restart.prom' \
-    'log:restarted Java bridge provider:restart-provider-cursor' \
+    'log:restarted Java bridge provider:restart-cursor' \
     'transport' \
     'scenario:restart' >"$expected"
   cmp -s -- "$expected" "$observed" || {
@@ -7451,6 +7471,10 @@ case " $* " in
     [[ ! -e "$RESTART_SUCCESS_RESULT_DIR/java-transport-configuration.txt" ]]
     [[ "$(<"$RESTART_SUCCESS_RESULT_DIR/java-selected-transport-configuration.txt")" == "retained" ]]
     printf 'transport-invalidated\n' >>"$RESTART_SUCCESS_OBSERVED"
+    ;;
+  *" up --detach obi "*)
+    : >"$RESTART_SUCCESS_PROVIDER_READY"
+    printf 'provider-ready\n' >>"$RESTART_SUCCESS_OBSERVED"
     ;;
   *" scenario --scenario restart-fault "*)
     control="$RESTART_SUCCESS_CONTROL"
@@ -7497,15 +7521,17 @@ EOF
     mkdir -p -- "$RESULT_DIR"
     printf 'current\n' >"$RESULT_DIR/java-transport-configuration.txt"
     printf 'retained\n' >"$RESULT_DIR/java-selected-transport-configuration.txt"
+    record_restart_control_event() {
+      printf 'event-timestamp %s\n' "$2" >>"$1/events.log"
+    }
     date() {
       local -i call_count=0
-      local cursor=""
 
       printf 'call\n' >>"$date_calls"
       call_count="$(wc -l <"$date_calls")"
-      printf -v cursor 'restart-success-cursor-%d' "$call_count"
-      printf 'cursor:%s\n' "$cursor" >>"$observed"
-      printf '%s\n' "$cursor"
+      [[ "$call_count" == "1" ]] || return 1
+      printf 'cursor:restart-success-cursor\n' >>"$observed"
+      printf 'restart-success-cursor\n'
     }
     wait_for_log() {
       if [[ "$3" == "OBI bridge restarted during traffic" ]]; then
@@ -7514,7 +7540,7 @@ EOF
       if [[ "$3" == "Java bridge reconfigured before restart traffic resumes" ]]; then
         [[ -f "$provider_ready" &&
           -n "$restart_log_cursor" &&
-          "${4:-}" != "$restart_log_cursor" ]] || return 1
+          "${4:-}" == "$restart_log_cursor" ]] || return 1
       fi
       printf 'log:%s:%s\n' "$3" "${4:-}" >>"$observed"
     }
@@ -7528,7 +7554,7 @@ EOF
       printf 'apache:%s\n' "$1" >>"$observed"
     }
     wait_for_java_duplicate_suppression() {
-      : >"$provider_ready"
+      [[ -f "$provider_ready" ]] || return 1
       printf 'suppression:%s\n' "$(basename -- "$1")" >>"$observed"
     }
     capture_phase_evidence() {
@@ -7567,6 +7593,7 @@ EOF
     $0 == "compose:stop --timeout 5 obi" { stopped = NR }
     $0 == "traffic:obi-stopped" { outage = NR }
     $0 == "compose:up --detach obi" { started = NR }
+    $0 == "provider-ready" { provider_ready = NR }
     /^cursor:/ { cursor_line[substr($0, 8)] = NR }
     /^log:OBI bridge restarted during traffic:/ {
       bridge = NR
@@ -7588,11 +7615,11 @@ EOF
     END {
       exit before > 0 && stopped > before && invalidated > stopped &&
         outage > invalidated &&
-        cursor_line[restart_cursor] > before &&
-        cursor_line[restart_cursor] < stopped &&
-        started > outage && bridge > started &&
-        settle > bridge && cursor_line[provider_cursor] > settle &&
-        readiness > cursor_line[provider_cursor] && suppression > readiness &&
+        cursor_line[restart_cursor] > outage &&
+        cursor_line[restart_cursor] < started &&
+        started > outage && provider_ready > started && bridge > provider_ready &&
+        settle > bridge && readiness > settle && suppression > readiness &&
+        provider_cursor == restart_cursor &&
         provider > suppression && transport > provider &&
         recovered > transport && capture > recovered &&
         scenario > capture ? 0 : 1
@@ -8277,6 +8304,7 @@ main() {
   test_primary_security_metrics_are_explicitly_scoped
   test_primary_security_identity_requires_same_cgroup_and_nonroot_user
   test_unix_security_metrics_require_explicit_race_scope
+  test_unix_security_provider_wait_uses_restart_cursor
   test_permissive_unix_directory_control_refuses_and_restores
   test_permissive_unix_directory_rejects_socket_probe_error
   test_unix_endpoint_restart_invalidates_before_stack_mutation

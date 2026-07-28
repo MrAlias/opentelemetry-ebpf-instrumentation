@@ -1,0 +1,1 @@
+{"status":"passed","scenario":"fail-open","exit_status":0,"metric_status":0,"pressure_correlation":null,"result":"scenario-fail-open-obi-absent.json","after_phase":"phases/fail-open-obi-absent-after"}

@@ -108,7 +108,7 @@ criterion from
 | --- | --- | --- | --- | --- | --- |
 | Cgroup sockopt on accepted application socket | Socket-local negotiation plus kernel tuple, network namespace, execution, and generation | Yes; one take or discard | Requires cgroup v2 sockopt and SockOps support, netns cookies, and hierarchy-root attachment; broader matrix untested | Dynamic helper: attach and reconfiguration supported; static extension: configured at JVM start and transport-agnostic | **retained**: [forced primary run](../../examples/apache-java-https/evidence/otel-getsockopt-tls13-94221a91/README.md) |
 | Cgroup getsockopt on a dummy socket | Current execution, without accepted-connection ownership | Mechanically yes, but cannot authorize the request connection | Same cgroup sockopt requirements as the primary | Dynamic helper: probe and reprobe supported; static extension: does not consume dummy-socket data | **focused**: [JNI probe tests](../../pkg/internal/java/agent/src/test/c/remote_parent_jni_test.c) |
-| Credential-checked Unix socket | Peer process, validated logical TID, process capability, and generation | Yes; one deadline-bounded RPC | Shares the producer's cgroup v2 SockOps and netns-cookie requirements; additionally requires a shared Unix endpoint and readable peer `/proc` identity across namespaces | Dynamic helper: attach, reconnect, and reconfiguration supported; static extension: configured at JVM start and transport-agnostic | **retained**: [forced Unix run](../../examples/apache-java-https/evidence/otel-unix-tls12-acedb68a/README.md) |
+| Credential-checked Unix socket | Peer process, validated logical TID, process capability, and generation | Yes; one deadline-bounded RPC | Shares the producer's cgroup v2 SockOps and netns-cookie requirements; additionally requires a shared Unix endpoint and readable peer `/proc` identity across namespaces | Dynamic helper: attach, reconnect, and reconfiguration supported; static extension: configured at JVM start and transport-agnostic | **retained**: [forced Unix run](../../examples/apache-java-https/evidence/otel-unix-tls12-bd1c9327/README.md) |
 | Brokered BPF map FD | Application chooses a map key; no socket-local request authority | Yes | Requires transferable map FDs and stable namespace/lifetime handling | Dynamic helper: must receive and revoke the FD; static extension: bridge API could remain, but the helper couples to map ABI | **analysis**, **untested** |
 | Direct bpffs lookup | Application chooses a map key; no socket-local request authority | Yes | Requires a bpffs mount and BPF permissions in the application environment | Dynamic helper: must discover and open pins; static extension: bridge API could remain, but the helper couples to pinned ABI | **analysis**, **untested** |
 | Shared memory | Needs a second secure request-ownership protocol | Yes | Needs a safely shared mapping across the deployment's namespaces | Dynamic helper: must establish and remap it; static extension: remains isolated only if the bridge hides the mapping protocol | **analysis**, **untested** |
@@ -241,7 +241,9 @@ The default is `disabled`. The proof-of-concept runner can exercise
 `getsockopt`, `unix`, `auto`, and disabled or absence controls. The
 [retained evidence index](../../examples/apache-java-https/evidence/README.md)
 contains two forced `getsockopt` full runs, including the current V2-schema
-run, plus one forced Unix full run. Disabled and absence behavior is retained only as controls within those
+run, plus two forced Unix full runs, including the current V2-schema
+Unix/TLS 1.2 run.
+Disabled and absence behavior is retained only as controls within those
 runs; no `auto` acceptance run is retained. Raw results are written under
 `examples/apache-java-https/.runtime/results/`; sanitized durable artifacts
 live under `examples/apache-java-https/evidence/`. Unexecuted cells remain

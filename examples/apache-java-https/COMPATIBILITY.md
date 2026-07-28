@@ -16,8 +16,9 @@ OpenSSL, TLS, transport, command, and artifact link.
 
 ## Kernel, cgroup, and transport
 
-Use Java 21, the OpenTelemetry agent, TLS 1.3, `amd64`, and one fixed container
-stack while varying this table.
+Use Java 21, the OpenTelemetry agent, `amd64`, and one fixed container stack
+while varying this table. Record the exact TLS version for each forced
+transport result.
 
 | Environment | Cgroup topology | `getsockopt` | `unix` | `auto` |
 | --- | --- | --- | --- | --- |
@@ -35,9 +36,10 @@ stack while varying this table.
 The following additional host is directly observed. It is not a substitute for
 any representative kernel row above.
 
-| Environment | Cgroup topology | `getsockopt` | `unix` | `auto` | Evidence |
-| --- | --- | --- | --- | --- | --- |
-| Linux 7.0.0-1009-aws (distribution not recorded) | unified v2 | pass | untested | untested | [clean full OpenTelemetry/TLS 1.3 run](evidence/otel-getsockopt-tls13-94221a91/README.md) |
+| Environment | Cgroup topology | TLS | `getsockopt` | `unix` | `auto` | Evidence |
+| --- | --- | --- | --- | --- | --- | --- |
+| Linux 7.0.0-1009-aws (distribution not recorded) | unified v2 | 1.3 | pass | untested | untested | [getsockopt/TLS 1.3](evidence/otel-getsockopt-tls13-94221a91/README.md) |
+| Linux 7.0.0-1009-aws (distribution not recorded) | unified v2 | 1.2 | untested | pass | untested | [Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/README.md) |
 
 RHEL 8 support may only be reported from direct execution on the documented
 backport. If a required cgroup hook is absent, report forced `getsockopt` as
@@ -45,19 +47,22 @@ backport. If a required cgroup hook is absent, report forced `getsockopt` as
 
 ## Architecture
 
-Use a supported upstream kernel, unified cgroup v2, Java 21, OpenTelemetry
-agent, TLS 1.3, and both forced transports.
+Each observed row uses one observed Linux kernel, unified cgroup v2, Java 21,
+and the OpenTelemetry agent. A row records one forced transport/TLS pair; it
+does not establish the other transport or TLS version.
 
-| Architecture | `getsockopt` | `unix` | Evidence |
-| --- | --- | --- | --- |
-| `amd64` | pass | untested | [Linux 7.0/OpenTelemetry/TLS 1.3](evidence/otel-getsockopt-tls13-94221a91/README.md) |
-| `arm64` | untested | untested | not recorded |
+| Architecture | TLS | `getsockopt` | `unix` | Evidence |
+| --- | --- | --- | --- | --- |
+| `amd64` | 1.3 | pass | untested | [getsockopt/TLS 1.3](evidence/otel-getsockopt-tls13-94221a91/README.md) |
+| `amd64` | 1.2 | untested | pass | [Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/README.md) |
+| `arm64` | untested | untested | untested | not recorded |
 
 ## JVM and official agent
 
-Use one fixed supported kernel/architecture and TLS 1.3. The Compose backend is
-pinned to Java 21; Java 8, 11, and 17 cells require a directly recorded backend
-image override or dedicated CI fixture. Do not mark them from unit tests alone.
+Use one fixed supported kernel/architecture and record the TLS/transport pair
+in the linked evidence. The Compose backend is pinned to Java 21; Java 8, 11,
+and 17 cells require a directly recorded backend image override or dedicated
+CI fixture. Do not mark them from unit tests alone.
 
 The external extension has a deliberately narrow runtime gate:
 
@@ -82,16 +87,16 @@ Compose run for a matrix cell below.
 | 8 | untested | untested | configured official-agent smoke; no privileged run recorded |
 | 11 | untested | untested | configured official-agent smoke; no privileged run recorded |
 | 17 | untested | untested | configured official-agent smoke; no privileged run recorded |
-| 21 | pass | untested | [Temurin 21/OpenTelemetry/`amd64` privileged run](evidence/otel-getsockopt-tls13-94221a91/README.md) |
+| 21 | pass | untested | [Temurin 21/OpenTelemetry getsockopt/TLS 1.3](evidence/otel-getsockopt-tls13-94221a91/README.md) and [Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/README.md) privileged runs |
 
 Additional agent releases must be selected deliberately, pinned by checksum,
 and added as new rows. “Latest” is not a matrix cell.
 
 ## Apache, OpenSSL, and TLS
 
-| Apache / OpenSSL | TLS 1.2 | TLS 1.3 | Backend HTTP |
-| --- | --- | --- | --- |
-| `httpd:2.4.68-alpine` image pinned in Compose | untested | [pass graph](evidence/otel-getsockopt-tls13-94221a91/scenario-basic.json), [runtime](evidence/otel-getsockopt-tls13-94221a91/apache-openssl-runtime.txt) | HTTP/1.1 only |
+| Apache / OpenSSL | `getsockopt`/TLS 1.2 | Unix/TLS 1.2 | `getsockopt`/TLS 1.3 | Unix/TLS 1.3 | Backend HTTP |
+| --- | --- | --- | --- | --- | --- |
+| `httpd:2.4.68-alpine` image pinned in Compose | untested | [pass graph](evidence/otel-unix-tls12-bd1c9327/scenario-basic.json), [runtime](evidence/otel-unix-tls12-bd1c9327/apache-openssl-runtime.txt) | [pass graph](evidence/otel-getsockopt-tls13-94221a91/scenario-basic.json), [runtime](evidence/otel-getsockopt-tls13-94221a91/apache-openssl-runtime.txt) | untested | HTTP/1.1 only |
 
 Every run must produce `apache-openssl-version.txt` proving that Apache loaded
 `ssl_module`, that `mod_ssl.so` links to `libssl.so.3` and `libcrypto.so.3`,
@@ -137,8 +142,8 @@ conserves the full request count, retains the actual upstream and retrieval
 failure reasons, and reconciles with the aggregate Java diagnostics. Other
 tests may report a miss only when their expected outcome permits it.
 
-The narrowest directly demonstrated configuration is currently the exact Linux
+The narrowest directly demonstrated configurations are the exact Linux
 7.0.0-1009-aws, unified-cgroup-v2, `amd64`, Temurin 21, OpenTelemetry 2.28.1,
-forced-`getsockopt`, Apache 2.4.68, OpenSSL 3.5.7, TLS 1.3 cell linked above.
-The distribution was not recorded independently, and no broader compatibility
-claim follows from that result.
+Apache 2.4.68, OpenSSL 3.5.7, forced-`getsockopt`/TLS 1.3 and
+forced-`unix`/TLS 1.2 cells linked above. The distribution was not recorded
+independently, and no broader compatibility claim follows from those results.

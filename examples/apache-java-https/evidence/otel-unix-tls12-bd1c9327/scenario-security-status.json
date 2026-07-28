@@ -1,0 +1,11 @@
+{
+  "status": "passed",
+  "scenario": "security",
+  "mode": "unix",
+  "probe_summary": "security-unix-probes.json",
+  "concurrent_victim": "passed",
+  "endpoint_replacement": "passed",
+  "permissive_directory": "refused",
+  "post_abuse_recovery": "passed",
+  "primary_only_cases": "not_applicable"
+}

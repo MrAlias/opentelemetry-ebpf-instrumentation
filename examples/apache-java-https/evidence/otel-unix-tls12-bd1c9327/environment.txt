@@ -1,0 +1,14 @@
+invocation=./examples/apache-java-https/run.sh --transport unix --agent otel --tls TLSv1.2 --command-timeout 1800 --readiness-timeout 120
+revision=bd1c932791791b910bba071e912de9455169c69d
+dirty=false
+source_tree_sha256=4a388fc9d70492fd3dae99341f71bd31ae1db0172a9a1ca54570be6b387c596d
+transport=unix
+agent_distribution=otel
+tls_protocol=TLSv1.2
+scenario=all
+acceptance_evidence=true
+architecture=x86_64
+kernel_release=7.0.0-1009-aws
+cgroup_topology=unified_v2
+docker=29.6.2
+compose=5.3.1

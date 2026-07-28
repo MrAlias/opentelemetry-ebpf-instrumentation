@@ -1,0 +1,1 @@
+{"status":"passed","scenario":"connection-churn","exit_status":0,"metric_status":0,"pressure_correlation":null,"result":"scenario-connection-churn.json","after_phase":"phases/connection-churn-after"}

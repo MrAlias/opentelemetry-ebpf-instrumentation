@@ -9126,6 +9126,81 @@ test_die_records_explicit_failure_boundary() {
   grep -Fq 'command=die:\ injected\ explicit\ failure' "$result_dir/failure-context.txt" || return 1
 }
 
+test_assertion_failure_control_is_explicit() {
+  local -r help_output="$TEST_TMP_DIR/assertion-failure-help.txt"
+  local -r dispatch_output="$TEST_TMP_DIR/assertion-failure-dispatch.txt"
+
+  usage >"$help_output"
+  grep -Fq 'assertion-failure' "$help_output" || {
+    printf 'help omitted the deliberate assertion failure control\n' >&2
+    return 1
+  }
+  (
+    TRANSPORT=getsockopt
+    SCENARIO=all
+    CLEANUP_ONLY=false
+    ACCEPTANCE_EVIDENCE=true
+    ACCEPTANCE_EVIDENCE_REASON=""
+    parse_args --scenario assertion-failure
+    [[ "$SCENARIO" == "assertion-failure" && "$ACCEPTANCE_EVIDENCE" == "false" && \
+      "$ACCEPTANCE_EVIDENCE_REASON" == \
+        "deliberate-assertion-failure,targeted-scenario" ]]
+  ) || {
+    printf 'assertion failure control was not marked as non-acceptance evidence\n' >&2
+    return 1
+  }
+  (
+    SCENARIO=assertion-failure
+    run_deliberate_assertion_failure_control() {
+      printf 'assertion-failure\n' >"$dispatch_output"
+    }
+    execute_requested_scenarios
+  ) || return 1
+  [[ "$(<"$dispatch_output")" == "assertion-failure" ]] || {
+    printf 'assertion failure scenario used the wrong dispatch\n' >&2
+    return 1
+  }
+}
+
+test_assertion_failure_control_retains_failure_evidence() {
+  local -r result_dir="$TEST_TMP_DIR/assertion-failure"
+  local status=0
+
+  set +e
+  (
+    RESULT_DIR="$result_dir"
+    RUN_STAGE="scenarios"
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    mkdir -p -- "$RESULT_DIR" || exit 1
+    run_scenario() {
+      [[ "$1" == "basic" ]] || return 1
+      : >"$RESULT_DIR/basic-passed"
+    }
+
+    run_deliberate_assertion_failure_control
+  ) >/dev/null 2>&1
+  status=$?
+  set -e
+
+  if ((status != 2)); then
+    printf 'deliberate assertion failure returned %d, expected 2\n' "$status" >&2
+    return 1
+  fi
+  [[ -e "$result_dir/basic-passed" ]] || {
+    printf 'deliberate assertion failure did not first run the basic scenario\n' >&2
+    return 1
+  }
+  grep -Fq '"expected_exit_status":2' "$result_dir/scenario-assertion-failure.json" || return 1
+  grep -Fq '"failure_context":"failure-context.txt"' \
+    "$result_dir/scenario-assertion-failure-status.json" || return 1
+  grep -Fq 'stage=deliberate-assertion-failure' "$result_dir/failure-context.txt" || return 1
+  grep -Fq 'command=die:\ deliberate\ assertion\ failure\ requested' \
+    "$result_dir/failure-context.txt" || return 1
+}
+
 test_non_acceptance_reasons_are_recorded() {
   (
     ACCEPTANCE_EVIDENCE=true
@@ -9430,6 +9505,8 @@ main() {
   test_footer_write_failure_preserves_first_failure
   test_error_logging_preserves_primary_status
   test_die_records_explicit_failure_boundary
+  test_assertion_failure_control_is_explicit
+  test_assertion_failure_control_retains_failure_evidence
   test_non_acceptance_reasons_are_recorded
   test_release_source_uses_one_version_for_extension
   test_demo_diagnostics_are_loopback_only

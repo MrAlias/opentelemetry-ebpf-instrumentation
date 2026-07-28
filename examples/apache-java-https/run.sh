@@ -194,8 +194,8 @@ Options:
                           pressure, handoff, virtual-thread, netty, netty-server, dispatch,
                           w3c, w3c-match, obi-flags, w3c-fault, w3c-only,
                           security, restart-fault, helper-attach-failure,
-                          delayed-otlp-suppression, fail-open, restart, disabled,
-                          or uninstrumented.
+                          delayed-otlp-suppression, assertion-failure, fail-open,
+                          restart, disabled, or uninstrumented.
                           Default: all
   --requests COUNT        Requests per scenario (1-1000); scenario default
                           when omitted.
@@ -217,6 +217,8 @@ precedence/match/flags/fault/no-state controls, late attach, OBI restart during
 traffic, helper attach failure, bounded primary or fallback transport abuse
 controls, delayed first-OTLP suppression, Unix endpoint replacement when that transport is selected,
 bridge/extension-disabled, extension-absent, and uninstrumented controls.
+It deliberately excludes the assertion-failure control, which is a
+non-acceptance run that exits after a passing basic scenario.
 Evidence is retained under:
   $RESULTS_ROOT
 EOF
@@ -374,7 +376,7 @@ parse_args() {
       ;;
   esac
   case "$SCENARIO" in
-    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|timeout-retry|pressure|handoff|virtual-thread|netty|netty-server|dispatch|w3c|w3c-match|obi-flags|w3c-fault|w3c-only|security|restart-fault|helper-attach-failure|delayed-otlp-suppression|fail-open|restart|disabled|uninstrumented)
+    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|timeout-retry|pressure|handoff|virtual-thread|netty|netty-server|dispatch|w3c|w3c-match|obi-flags|w3c-fault|w3c-only|security|restart-fault|helper-attach-failure|delayed-otlp-suppression|assertion-failure|fail-open|restart|disabled|uninstrumented)
       ;;
     *)
       die "unsupported scenario: $SCENARIO"
@@ -419,6 +421,9 @@ parse_args() {
   if [[ "$SCENARIO" == "tls-boundary" && "$REQUEST_COUNT" != "0" && \
     "$REQUEST_COUNT" != "2" ]]; then
     die "the tls-boundary scenario requires exactly two requests"
+  fi
+  if [[ "$SCENARIO" == "assertion-failure" ]]; then
+    mark_non_acceptance "deliberate-assertion-failure"
   fi
   if [[ "$SCENARIO" != "all" && "$CLEANUP_ONLY" == "false" ]]; then
     mark_non_acceptance "targeted-scenario"
@@ -3987,6 +3992,24 @@ run_scenario() {
   done
 }
 
+run_deliberate_assertion_failure_control() {
+  local -r label="assertion-failure"
+  local -r result="$RESULT_DIR/scenario-$label.json"
+
+  run_scenario basic || return $?
+  RUN_STAGE="deliberate-assertion-failure"
+  if ! printf '{"status":"failed","scenario":"assertion-failure","reason":"deliberate assertion failure requested","expected_exit_status":2}\n' \
+    >"$result"; then
+    return 1
+  fi
+  if ! printf '{"status":"failed","scenario":"assertion-failure","exit_status":2,"metric_status":0,"result":"%s","failure_context":"failure-context.txt"}\n' \
+    "$(basename -- "$result")" >"$RESULT_DIR/scenario-$label-status.json"; then
+    return 1
+  fi
+  log_info "basic scenario passed; recording the requested deliberate assertion failure"
+  die "deliberate assertion failure requested"
+}
+
 stop_obi_for_no_state_control() {
   local -r label="$1"
   local -r diagnostics_output="${2:-}"
@@ -6198,6 +6221,9 @@ execute_requested_scenarios() {
       ;;
     delayed-otlp-suppression)
       run_delayed_otlp_suppression_control
+      ;;
+    assertion-failure)
+      run_deliberate_assertion_failure_control
       ;;
     w3c-match)
       run_w3c_match_control

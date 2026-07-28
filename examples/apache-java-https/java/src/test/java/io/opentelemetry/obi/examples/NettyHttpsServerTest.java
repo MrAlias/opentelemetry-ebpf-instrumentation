@@ -13,10 +13,13 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
+import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 import javax.net.ssl.SSLSocket;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -127,6 +130,22 @@ class NettyHttpsServerTest {
     assertTrue(server.isTerminated());
   }
 
+  @Test
+  void failedStartupShutsDownAllocatedEventLoops() throws Exception {
+    Set<Long> eventLoopsBefore = nettyEventLoopThreadIDs();
+    try (ServerSocket occupiedPort = new ServerSocket()) {
+      occupiedPort.bind(new InetSocketAddress("127.0.0.1", 0));
+
+      assertThrows(
+          Exception.class,
+          () ->
+              NettyHttpsServer.start(
+                  occupiedPort.getLocalPort(), keyStore, KEYSTORE_PASSWORD, "TLSv1.3"));
+    }
+
+    assertEquals(eventLoopsBefore, nettyEventLoopThreadIDs());
+  }
+
   private static NettyHttpsServer start(String protocol) throws Exception {
     return NettyHttpsServer.start(0, keyStore, KEYSTORE_PASSWORD, protocol);
   }
@@ -168,5 +187,12 @@ class NettyHttpsServerTest {
 
   private static boolean isWindows() {
     return File.separatorChar == '\\';
+  }
+
+  private static Set<Long> nettyEventLoopThreadIDs() {
+    return Thread.getAllStackTraces().keySet().stream()
+        .filter(thread -> thread.getName().startsWith("nioEventLoopGroup-"))
+        .map(Thread::getId)
+        .collect(Collectors.toSet());
   }
 }

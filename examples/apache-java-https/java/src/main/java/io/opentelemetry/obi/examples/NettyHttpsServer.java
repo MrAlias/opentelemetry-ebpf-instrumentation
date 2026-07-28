@@ -84,12 +84,10 @@ final class NettyHttpsServer implements AutoCloseable {
       Channel serverChannel =
           bootstrap.bind(new InetSocketAddress("127.0.0.1", port)).sync().channel();
       return new NettyHttpsServer(acceptor, eventLoop, serverChannel);
-    } catch (InterruptedException interrupted) {
-      Thread.currentThread().interrupt();
-      shutdown(acceptor);
-      shutdown(eventLoop);
-      throw interrupted;
-    } catch (RuntimeException failure) {
+    } catch (Exception failure) {
+      if (failure instanceof InterruptedException) {
+        Thread.currentThread().interrupt();
+      }
       shutdown(acceptor);
       shutdown(eventLoop);
       throw failure;

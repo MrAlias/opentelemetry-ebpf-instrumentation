@@ -1,8 +1,9 @@
 # ADR: Bridge socket-owned OBI context into Java
 
 - Status: accepted for proof of concept
-- Scope: Apache/OpenSSL outbound HTTPS to an auto-instrumented Jetty server
-- Last updated: 2026-07-22
+- Scope: Apache/OpenSSL outbound HTTPS to auto-instrumented Jetty and bounded
+  inbound-Netty fixtures
+- Last updated: 2026-07-28
 
 ## Decision
 

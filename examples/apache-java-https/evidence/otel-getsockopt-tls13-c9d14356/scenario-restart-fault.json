@@ -1,0 +1,1905 @@
+{
+  "status": "passed",
+  "scenario": "restart-fault",
+  "seed": 1,
+  "started_at": "2026-07-28T15:55:33.730119366Z",
+  "finished_at": "2026-07-28T15:56:14.929900479Z",
+  "request_count": 32,
+  "traffic_elapsed_nanos": 34971902003,
+  "throughput_per_second": 0.9150202924981016,
+  "latency": {
+    "p50_nanos": 79851303,
+    "p95_nanos": 91339862,
+    "p99_nanos": 108283734
+  },
+  "cases": [
+    {
+      "request": {
+        "marker": "restart-fault-00-84aca3ab04bf90af",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "81258b8b3c2ef39c69181de3112db607",
+        "w3c_parent_span_id": "99a46ecb47f6e500",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "before-stop"
+      },
+      "response": {
+        "marker": "restart-fault-00-84aca3ab04bf90af",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 8,
+        "backend_remote_port": 51558,
+        "tls_read_events": 9,
+        "tls_read_bytes": 1660
+      },
+      "latency_nanos": 108283734,
+      "trace": {
+        "marker": "restart-fault-00-84aca3ab04bf90af",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "81258b8b3c2ef39c69181de3112db607",
+            "span_id": "a47507f5293b0d2f",
+            "parent_span_id": "99a46ecb47f6e500",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-00-84aca3ab04bf90af",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254133763261481,
+            "end_unix_nano": 1785254133840343497
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-01-102974141d8fb095",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "097cf69e40fce846f475130e5e7a086a",
+        "w3c_parent_span_id": "5e50fbe4601fcc4f",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "obi-stopped"
+      },
+      "response": {
+        "marker": "restart-fault-01-102974141d8fb095",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 8,
+        "backend_remote_port": 51558,
+        "tls_read_events": 10,
+        "tls_read_bytes": 2017
+      },
+      "latency_nanos": 80170462,
+      "trace": {
+        "marker": "restart-fault-01-102974141d8fb095",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "097cf69e40fce846f475130e5e7a086a",
+            "span_id": "124085c1f16039f5",
+            "parent_span_id": "5e50fbe4601fcc4f",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-01-102974141d8fb095",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254136800889712,
+            "end_unix_nano": 1785254136877977504
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-02-d76e41efb7d64880",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "8702225fc4027b855aa4c56453a92ff1",
+        "w3c_parent_span_id": "187734f0a3a0775e",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "obi-stopped"
+      },
+      "response": {
+        "marker": "restart-fault-02-d76e41efb7d64880",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 8,
+        "backend_remote_port": 51558,
+        "tls_read_events": 11,
+        "tls_read_bytes": 2374
+      },
+      "latency_nanos": 80710828,
+      "trace": {
+        "marker": "restart-fault-02-d76e41efb7d64880",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "8702225fc4027b855aa4c56453a92ff1",
+            "span_id": "43787bdb5ebabbc4",
+            "parent_span_id": "187734f0a3a0775e",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-02-d76e41efb7d64880",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254136931638487,
+            "end_unix_nano": 1785254137008247730
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-03-1801bd8b28562d13",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "af5beafc3c6b0e29f9f8f612d660297d",
+        "w3c_parent_span_id": "292a6b3d5397ad60",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "obi-stopped"
+      },
+      "response": {
+        "marker": "restart-fault-03-1801bd8b28562d13",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 8,
+        "backend_remote_port": 51558,
+        "tls_read_events": 12,
+        "tls_read_bytes": 2731
+      },
+      "latency_nanos": 81612858,
+      "trace": {
+        "marker": "restart-fault-03-1801bd8b28562d13",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "af5beafc3c6b0e29f9f8f612d660297d",
+            "span_id": "2ff18d67a02e4ef2",
+            "parent_span_id": "292a6b3d5397ad60",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-03-1801bd8b28562d13",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254137061143223,
+            "end_unix_nano": 1785254137140737273
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-04-ff29310d0dd635a0",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "5513f86435de53eb056e4350d59c9d29",
+        "w3c_parent_span_id": "36c783d220219a3f",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "obi-stopped"
+      },
+      "response": {
+        "marker": "restart-fault-04-ff29310d0dd635a0",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 8,
+        "backend_remote_port": 51558,
+        "tls_read_events": 13,
+        "tls_read_bytes": 3088
+      },
+      "latency_nanos": 80232992,
+      "trace": {
+        "marker": "restart-fault-04-ff29310d0dd635a0",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "5513f86435de53eb056e4350d59c9d29",
+            "span_id": "c32911ccf379c787",
+            "parent_span_id": "36c783d220219a3f",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-04-ff29310d0dd635a0",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254137193703483,
+            "end_unix_nano": 1785254137270939401
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-05-dd678527b385aa26",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "e18cd620b3031e6296ecb130f8a39e65",
+        "w3c_parent_span_id": "d0b6c8863b4d668a",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "obi-stopped"
+      },
+      "response": {
+        "marker": "restart-fault-05-dd678527b385aa26",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 8,
+        "backend_remote_port": 51558,
+        "tls_read_events": 14,
+        "tls_read_bytes": 3445
+      },
+      "latency_nanos": 79483819,
+      "trace": {
+        "marker": "restart-fault-05-dd678527b385aa26",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "e18cd620b3031e6296ecb130f8a39e65",
+            "span_id": "126cece9b1b2bac5",
+            "parent_span_id": "d0b6c8863b4d668a",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-05-dd678527b385aa26",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254137323480541,
+            "end_unix_nano": 1785254137400028737
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-06-a67f003c4a396a90",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "1d87cd16c510508a829c67d9dd15edf8",
+        "w3c_parent_span_id": "40d3f221e6cdab8d",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "obi-stopped"
+      },
+      "response": {
+        "marker": "restart-fault-06-a67f003c4a396a90",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 8,
+        "backend_remote_port": 51558,
+        "tls_read_events": 15,
+        "tls_read_bytes": 3802
+      },
+      "latency_nanos": 83288438,
+      "trace": {
+        "marker": "restart-fault-06-a67f003c4a396a90",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "1d87cd16c510508a829c67d9dd15edf8",
+            "span_id": "f5c24335d2353828",
+            "parent_span_id": "40d3f221e6cdab8d",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-06-a67f003c4a396a90",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254137454275159,
+            "end_unix_nano": 1785254137533070866
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-07-d1f77b7496250fb2",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "cf67d43e7da28d62c98e636340e015ae",
+        "w3c_parent_span_id": "ee9f7cb10807ee8c",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "obi-stopped"
+      },
+      "response": {
+        "marker": "restart-fault-07-d1f77b7496250fb2",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 8,
+        "backend_remote_port": 51558,
+        "tls_read_events": 16,
+        "tls_read_bytes": 4159
+      },
+      "latency_nanos": 79773699,
+      "trace": {
+        "marker": "restart-fault-07-d1f77b7496250fb2",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "cf67d43e7da28d62c98e636340e015ae",
+            "span_id": "38b944566ca03b98",
+            "parent_span_id": "ee9f7cb10807ee8c",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-07-d1f77b7496250fb2",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254137586538372,
+            "end_unix_nano": 1785254137663576821
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-08-1692280541a34004",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "2e0745e1cacc68f16734f4bb65d4fa02",
+        "w3c_parent_span_id": "aaf411a2b5773fb7",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "after-restart"
+      },
+      "response": {
+        "marker": "restart-fault-08-1692280541a34004",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 10,
+        "backend_remote_port": 34218,
+        "tls_read_events": 19,
+        "tls_read_bytes": 4835
+      },
+      "latency_nanos": 91339862,
+      "trace": {
+        "marker": "restart-fault-08-1692280541a34004",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "2e0745e1cacc68f16734f4bb65d4fa02",
+            "span_id": "7a73ab5197fee233",
+            "parent_span_id": "aaf411a2b5773fb7",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-08-1692280541a34004",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254165633670138,
+            "end_unix_nano": 1785254165710650581
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-09-fed031cc8e2ca916",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "456f1e9a82f11086393ade5488d993d0",
+        "w3c_parent_span_id": "0210f307fa28ffbd",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "after-restart"
+      },
+      "response": {
+        "marker": "restart-fault-09-fed031cc8e2ca916",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 10,
+        "backend_remote_port": 34218,
+        "tls_read_events": 20,
+        "tls_read_bytes": 5192
+      },
+      "latency_nanos": 80921303,
+      "trace": {
+        "marker": "restart-fault-09-fed031cc8e2ca916",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "456f1e9a82f11086393ade5488d993d0",
+            "span_id": "2300ab1a32d3eef0",
+            "parent_span_id": "0210f307fa28ffbd",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-09-fed031cc8e2ca916",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254165763999179,
+            "end_unix_nano": 1785254165840279154
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-10-e0d05db17a1a55cd",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "3736fad1855df501eb768adb93f15f4b",
+        "w3c_parent_span_id": "57c205e816c2da3b",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "after-restart"
+      },
+      "response": {
+        "marker": "restart-fault-10-e0d05db17a1a55cd",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 10,
+        "backend_remote_port": 34218,
+        "tls_read_events": 21,
+        "tls_read_bytes": 5549
+      },
+      "latency_nanos": 79962124,
+      "trace": {
+        "marker": "restart-fault-10-e0d05db17a1a55cd",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "3736fad1855df501eb768adb93f15f4b",
+            "span_id": "2bc2f58072c62b43",
+            "parent_span_id": "57c205e816c2da3b",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-10-e0d05db17a1a55cd",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254165894115857,
+            "end_unix_nano": 1785254165970892578
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-11-57039d92be283194",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "4bf2d635db92ec61b481992ea8fe9946",
+        "w3c_parent_span_id": "2957c4a32a0d16ae",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "after-restart"
+      },
+      "response": {
+        "marker": "restart-fault-11-57039d92be283194",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 10,
+        "backend_remote_port": 34218,
+        "tls_read_events": 22,
+        "tls_read_bytes": 5906
+      },
+      "latency_nanos": 78382810,
+      "trace": {
+        "marker": "restart-fault-11-57039d92be283194",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "4bf2d635db92ec61b481992ea8fe9946",
+            "span_id": "6b10700bb8f5467d",
+            "parent_span_id": "2957c4a32a0d16ae",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-11-57039d92be283194",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254166023681812,
+            "end_unix_nano": 1785254166100550502
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-12-6f6f97b030812cab",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "0ca668e600699e8f3ef3b313d6238fda",
+        "w3c_parent_span_id": "88a19b82309a39f7",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "after-restart"
+      },
+      "response": {
+        "marker": "restart-fault-12-6f6f97b030812cab",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 10,
+        "backend_remote_port": 34218,
+        "tls_read_events": 23,
+        "tls_read_bytes": 6263
+      },
+      "latency_nanos": 81832605,
+      "trace": {
+        "marker": "restart-fault-12-6f6f97b030812cab",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "0ca668e600699e8f3ef3b313d6238fda",
+            "span_id": "c6dace761e839496",
+            "parent_span_id": "88a19b82309a39f7",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-12-6f6f97b030812cab",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254166152676883,
+            "end_unix_nano": 1785254166230519493
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-13-203fc077d10fd61d",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "7965e9a1ae22691ac33cbaeecbaf5a79",
+        "w3c_parent_span_id": "bb2cab2a0f31084f",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "after-restart"
+      },
+      "response": {
+        "marker": "restart-fault-13-203fc077d10fd61d",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 10,
+        "backend_remote_port": 34218,
+        "tls_read_events": 24,
+        "tls_read_bytes": 6620
+      },
+      "latency_nanos": 80821553,
+      "trace": {
+        "marker": "restart-fault-13-203fc077d10fd61d",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "7965e9a1ae22691ac33cbaeecbaf5a79",
+            "span_id": "5769952563a9def7",
+            "parent_span_id": "bb2cab2a0f31084f",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-13-203fc077d10fd61d",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254166285863730,
+            "end_unix_nano": 1785254166362080916
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-14-e5c2d670d2e74835",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "652613962029fd7986950f1e16bdce09",
+        "w3c_parent_span_id": "6ef463475516c992",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "after-restart"
+      },
+      "response": {
+        "marker": "restart-fault-14-e5c2d670d2e74835",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 10,
+        "backend_remote_port": 34218,
+        "tls_read_events": 25,
+        "tls_read_bytes": 6977
+      },
+      "latency_nanos": 79851303,
+      "trace": {
+        "marker": "restart-fault-14-e5c2d670d2e74835",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "652613962029fd7986950f1e16bdce09",
+            "span_id": "29a9d860b93132a6",
+            "parent_span_id": "6ef463475516c992",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-14-e5c2d670d2e74835",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254166415646837,
+            "end_unix_nano": 1785254166491930547
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-15-927f691be3345455",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "e780c8115375ca3e0ffddd98abbcbdce",
+        "w3c_parent_span_id": "858762400b3b84ca",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "after-restart"
+      },
+      "response": {
+        "marker": "restart-fault-15-927f691be3345455",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 10,
+        "backend_remote_port": 34218,
+        "tls_read_events": 26,
+        "tls_read_bytes": 7334
+      },
+      "latency_nanos": 79759299,
+      "trace": {
+        "marker": "restart-fault-15-927f691be3345455",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "e780c8115375ca3e0ffddd98abbcbdce",
+            "span_id": "3f45ef5d9231b51a",
+            "parent_span_id": "858762400b3b84ca",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-15-927f691be3345455",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254166546125276,
+            "end_unix_nano": 1785254166622677989
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-16-e2b4b5a075a2de5f",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "16bf3efca478068c2cfbf2fdbe6bf886",
+        "w3c_parent_span_id": "d253c8cf73559425",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "after-restart"
+      },
+      "response": {
+        "marker": "restart-fault-16-e2b4b5a075a2de5f",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 10,
+        "backend_remote_port": 34218,
+        "tls_read_events": 27,
+        "tls_read_bytes": 7691
+      },
+      "latency_nanos": 79178470,
+      "trace": {
+        "marker": "restart-fault-16-e2b4b5a075a2de5f",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "16bf3efca478068c2cfbf2fdbe6bf886",
+            "span_id": "0a221c801886e90c",
+            "parent_span_id": "d253c8cf73559425",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-16-e2b4b5a075a2de5f",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254166675302791,
+            "end_unix_nano": 1785254166751538400
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-17-3dcf7f4e11f84ec4",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "a67b18a8493912f3fc92b8fe843d41df",
+        "w3c_parent_span_id": "f813103eb3577007",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "after-restart"
+      },
+      "response": {
+        "marker": "restart-fault-17-3dcf7f4e11f84ec4",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 10,
+        "backend_remote_port": 34218,
+        "tls_read_events": 28,
+        "tls_read_bytes": 8048
+      },
+      "latency_nanos": 81439225,
+      "trace": {
+        "marker": "restart-fault-17-3dcf7f4e11f84ec4",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "a67b18a8493912f3fc92b8fe843d41df",
+            "span_id": "ce65bb2adde1628f",
+            "parent_span_id": "f813103eb3577007",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-17-3dcf7f4e11f84ec4",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254166805087881,
+            "end_unix_nano": 1785254166883089468
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-18-3a8e5acccc57bead",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "d55805009334b3e4841be814eca66ae0",
+        "w3c_parent_span_id": "275d55adcb364503",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "after-restart"
+      },
+      "response": {
+        "marker": "restart-fault-18-3a8e5acccc57bead",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 10,
+        "backend_remote_port": 34218,
+        "tls_read_events": 29,
+        "tls_read_bytes": 8405
+      },
+      "latency_nanos": 80878059,
+      "trace": {
+        "marker": "restart-fault-18-3a8e5acccc57bead",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "d55805009334b3e4841be814eca66ae0",
+            "span_id": "c3c6727e192ffb35",
+            "parent_span_id": "275d55adcb364503",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-18-3a8e5acccc57bead",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254166936846204,
+            "end_unix_nano": 1785254167013342158
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-19-f3e0013906403496",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "b80f28d8ee7924378ffd16c024498dea",
+        "w3c_parent_span_id": "a3c129afbaab099a",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "after-restart"
+      },
+      "response": {
+        "marker": "restart-fault-19-f3e0013906403496",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 10,
+        "backend_remote_port": 34218,
+        "tls_read_events": 30,
+        "tls_read_bytes": 8762
+      },
+      "latency_nanos": 79548092,
+      "trace": {
+        "marker": "restart-fault-19-f3e0013906403496",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "b80f28d8ee7924378ffd16c024498dea",
+            "span_id": "8bd889c991d05049",
+            "parent_span_id": "a3c129afbaab099a",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-19-f3e0013906403496",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254167067679153,
+            "end_unix_nano": 1785254167143969205
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-20-e7d415db50fa84f1",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "423e850efee3557e6a2c6d44624c9f39",
+        "w3c_parent_span_id": "824f7f1ebd951fcf",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "after-restart"
+      },
+      "response": {
+        "marker": "restart-fault-20-e7d415db50fa84f1",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 10,
+        "backend_remote_port": 34218,
+        "tls_read_events": 31,
+        "tls_read_bytes": 9119
+      },
+      "latency_nanos": 81519572,
+      "trace": {
+        "marker": "restart-fault-20-e7d415db50fa84f1",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "423e850efee3557e6a2c6d44624c9f39",
+            "span_id": "7491d01c925c7048",
+            "parent_span_id": "824f7f1ebd951fcf",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-20-e7d415db50fa84f1",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254167199423885,
+            "end_unix_nano": 1785254167275687549
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-21-eeeba4e7461b36f8",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "359d268f9eefe69e86ba956fedcfc830",
+        "w3c_parent_span_id": "b7031557d3b21484",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "after-restart"
+      },
+      "response": {
+        "marker": "restart-fault-21-eeeba4e7461b36f8",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 10,
+        "backend_remote_port": 34218,
+        "tls_read_events": 32,
+        "tls_read_bytes": 9476
+      },
+      "latency_nanos": 79328140,
+      "trace": {
+        "marker": "restart-fault-21-eeeba4e7461b36f8",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "359d268f9eefe69e86ba956fedcfc830",
+            "span_id": "d03316820063ed7c",
+            "parent_span_id": "b7031557d3b21484",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-21-eeeba4e7461b36f8",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254167329586738,
+            "end_unix_nano": 1785254167406113881
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-22-b4f0558fd88c2e33",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "c369f84ed12eeffa16c93e49d5d778c6",
+        "w3c_parent_span_id": "d972043373094bd4",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "after-restart"
+      },
+      "response": {
+        "marker": "restart-fault-22-b4f0558fd88c2e33",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 10,
+        "backend_remote_port": 34218,
+        "tls_read_events": 33,
+        "tls_read_bytes": 9833
+      },
+      "latency_nanos": 78814813,
+      "trace": {
+        "marker": "restart-fault-22-b4f0558fd88c2e33",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "c369f84ed12eeffa16c93e49d5d778c6",
+            "span_id": "f320ffe1622fd1d8",
+            "parent_span_id": "d972043373094bd4",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-22-b4f0558fd88c2e33",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254167458149684,
+            "end_unix_nano": 1785254167535133627
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-23-c2beb4dc1beaa0ff",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "a45c18568123d1f34e10299082677861",
+        "w3c_parent_span_id": "fd3537a6197aba35",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "after-restart"
+      },
+      "response": {
+        "marker": "restart-fault-23-c2beb4dc1beaa0ff",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 10,
+        "backend_remote_port": 34218,
+        "tls_read_events": 34,
+        "tls_read_bytes": 10190
+      },
+      "latency_nanos": 80820511,
+      "trace": {
+        "marker": "restart-fault-23-c2beb4dc1beaa0ff",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "a45c18568123d1f34e10299082677861",
+            "span_id": "e2f0c469ce7f391b",
+            "parent_span_id": "fd3537a6197aba35",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-23-c2beb4dc1beaa0ff",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254167588959017,
+            "end_unix_nano": 1785254167665142431
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-24-7951af3df3f5d0c4",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "cf9062905d4a381833cb4447e9e5d26c",
+        "w3c_parent_span_id": "671498edbf5f7d5b",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "after-restart"
+      },
+      "response": {
+        "marker": "restart-fault-24-7951af3df3f5d0c4",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 10,
+        "backend_remote_port": 34218,
+        "tls_read_events": 35,
+        "tls_read_bytes": 10547
+      },
+      "latency_nanos": 79805718,
+      "trace": {
+        "marker": "restart-fault-24-7951af3df3f5d0c4",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "cf9062905d4a381833cb4447e9e5d26c",
+            "span_id": "41cd9f5d4c3ff5ea",
+            "parent_span_id": "671498edbf5f7d5b",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-24-7951af3df3f5d0c4",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254167718482973,
+            "end_unix_nano": 1785254167794610821
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-25-94c343f4ab0bae4d",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "22cc4277dd779e07eb82e6d0067bd171",
+        "w3c_parent_span_id": "f2cbdbf5ae90c8b5",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "after-restart"
+      },
+      "response": {
+        "marker": "restart-fault-25-94c343f4ab0bae4d",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 10,
+        "backend_remote_port": 34218,
+        "tls_read_events": 36,
+        "tls_read_bytes": 10904
+      },
+      "latency_nanos": 79060669,
+      "trace": {
+        "marker": "restart-fault-25-94c343f4ab0bae4d",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "22cc4277dd779e07eb82e6d0067bd171",
+            "span_id": "74bb6913e86f41be",
+            "parent_span_id": "f2cbdbf5ae90c8b5",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-25-94c343f4ab0bae4d",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254167848077657,
+            "end_unix_nano": 1785254167924626588
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-26-dcb34a1d56402229",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "167b21a2a4c1e5845278dc0dfe9bb528",
+        "w3c_parent_span_id": "7efb7c2273c1cfb6",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "after-restart"
+      },
+      "response": {
+        "marker": "restart-fault-26-dcb34a1d56402229",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 10,
+        "backend_remote_port": 34218,
+        "tls_read_events": 37,
+        "tls_read_bytes": 11261
+      },
+      "latency_nanos": 79796268,
+      "trace": {
+        "marker": "restart-fault-26-dcb34a1d56402229",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "167b21a2a4c1e5845278dc0dfe9bb528",
+            "span_id": "bde63715055f55d8",
+            "parent_span_id": "7efb7c2273c1cfb6",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-26-dcb34a1d56402229",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254167978272725,
+            "end_unix_nano": 1785254168054469157
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-27-6d01ed533b2b4d33",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "c72c856b139906184f27645c0acaf4af",
+        "w3c_parent_span_id": "afda218330272ff6",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "after-restart"
+      },
+      "response": {
+        "marker": "restart-fault-27-6d01ed533b2b4d33",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 10,
+        "backend_remote_port": 34218,
+        "tls_read_events": 38,
+        "tls_read_bytes": 11618
+      },
+      "latency_nanos": 78245324,
+      "trace": {
+        "marker": "restart-fault-27-6d01ed533b2b4d33",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "c72c856b139906184f27645c0acaf4af",
+            "span_id": "995d254d4f17e042",
+            "parent_span_id": "afda218330272ff6",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-27-6d01ed533b2b4d33",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254168107380670,
+            "end_unix_nano": 1785254168184165282
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-28-b4a14979522a28a5",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "1706898cdff523c0d21fd3f0701b3c26",
+        "w3c_parent_span_id": "b9956e4ef5b4d79b",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "after-restart"
+      },
+      "response": {
+        "marker": "restart-fault-28-b4a14979522a28a5",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 10,
+        "backend_remote_port": 34218,
+        "tls_read_events": 39,
+        "tls_read_bytes": 11975
+      },
+      "latency_nanos": 80136230,
+      "trace": {
+        "marker": "restart-fault-28-b4a14979522a28a5",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "1706898cdff523c0d21fd3f0701b3c26",
+            "span_id": "a3fd3772912070bf",
+            "parent_span_id": "b9956e4ef5b4d79b",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-28-b4a14979522a28a5",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254168236517291,
+            "end_unix_nano": 1785254168312636888
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-29-73b2321272b49ba3",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "d5f1e3a2ceea4c7d50f5a8dff41af23f",
+        "w3c_parent_span_id": "df3998515353d2f4",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "after-restart"
+      },
+      "response": {
+        "marker": "restart-fault-29-73b2321272b49ba3",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 10,
+        "backend_remote_port": 34218,
+        "tls_read_events": 40,
+        "tls_read_bytes": 12332
+      },
+      "latency_nanos": 79431878,
+      "trace": {
+        "marker": "restart-fault-29-73b2321272b49ba3",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "d5f1e3a2ceea4c7d50f5a8dff41af23f",
+            "span_id": "3b3d4794728ce325",
+            "parent_span_id": "df3998515353d2f4",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-29-73b2321272b49ba3",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254168367054223,
+            "end_unix_nano": 1785254168443794176
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-30-9c44cf7fbbec8e98",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "b5be0911df207185c9da8d7152dac258",
+        "w3c_parent_span_id": "6b40637b23adc5e2",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "after-restart"
+      },
+      "response": {
+        "marker": "restart-fault-30-9c44cf7fbbec8e98",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 10,
+        "backend_remote_port": 34218,
+        "tls_read_events": 41,
+        "tls_read_bytes": 12689
+      },
+      "latency_nanos": 78670674,
+      "trace": {
+        "marker": "restart-fault-30-9c44cf7fbbec8e98",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "b5be0911df207185c9da8d7152dac258",
+            "span_id": "96542e8fc562c2bb",
+            "parent_span_id": "6b40637b23adc5e2",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-30-9c44cf7fbbec8e98",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254168495918248,
+            "end_unix_nano": 1785254168572857295
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "restart-fault-31-cf3e2f91e5ab306c",
+        "endpoint": "/api/echo",
+        "w3c_trace_id": "b15db0a60f4d14e3d62b097c465e4f82",
+        "w3c_parent_span_id": "a47f30c1a2dfcf98",
+        "w3c_trace_flags": "01",
+        "w3c_case": "valid-w3c-during-obi-restart",
+        "restart_phase": "after-restart"
+      },
+      "response": {
+        "marker": "restart-fault-31-cf3e2f91e5ab306c",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 10,
+        "backend_remote_port": 34218,
+        "tls_read_events": 42,
+        "tls_read_bytes": 13054
+      },
+      "latency_nanos": 78698437,
+      "trace": {
+        "marker": "restart-fault-31-cf3e2f91e5ab306c",
+        "received_batches": 35,
+        "received_spans": 40,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 12424,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "b15db0a60f4d14e3d62b097c465e4f82",
+            "span_id": "f499b34ecc59a966",
+            "parent_span_id": "a47f30c1a2dfcf98",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "restart-fault-31-cf3e2f91e5ab306c",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785254168624984858,
+            "end_unix_nano": 1785254168701353345
+          }
+        ]
+      }
+    }
+  ]
+}

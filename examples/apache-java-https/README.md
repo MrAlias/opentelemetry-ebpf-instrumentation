@@ -14,10 +14,16 @@ trace-scenario
     | HTTP/1.1 :18080
     v
 Apache HTTP Server 2.4 (mod_proxy_http + mod_ssl)
+    |\
+    | \-- all demo routes except /api/netty-server:
+    |     verified HTTPS, TLS 1.2 or 1.3, HTTP/1.1 :18443
+    |     --> embedded Jetty
     |
-    | verified HTTPS, TLS 1.2 or 1.3, HTTP/1.1 :18443
-    v
-embedded Jetty + official Java agent + external OBI extension
+    \---- /api/netty-server:
+          verified HTTPS, TLS 1.2 or 1.3, HTTP/1.1 :18444
+          --> inbound Netty fixture
+
+both Java fixtures + official Java agent + external OBI extension
 
 Apache OBI spans -------------------+
 Java agent spans -------------------+--> local OTLP/HTTP receiver :14318
@@ -106,6 +112,7 @@ The checked-in #28 matrix is explicit about which layer proves each case:
 | repeated extraction | exact one-take/discard diagnostics per marked request | privileged run |
 | nested/duplicate server instrumentation | repeated Jetty async redispatch, exactly one Java server span | privileged run |
 | async/executor/Netty/virtual-thread handoff | dedicated exact-parent scenarios | privileged run |
+| inbound Netty receive-to-extraction | `netty-server`: Apache-to-inbound-Netty HTTPS with exact remote parent | support for arbitrary Netty frameworks or applications |
 | sequential keepalive, HTTP/1.1 pipelining, parallel connections, and fd/port reuse | dedicated exact-parent scenarios with connection evidence | privileged run |
 
 Unit tests alone do not mark a stock-agent E2E row as passed. The Unix-only
@@ -124,7 +131,7 @@ on the production Java TLS bridge path.
 - A kernel supported by OBI (normally Linux 5.8+ with BTF, or a documented
   RHEL 8 backport).
 - `bash`, `curl`, `git`, `jq`, `openssl`, `sha256sum`, and GNU `timeout`.
-- Free loopback ports `14318`, `18080`, and `18443`.
+- Free loopback ports `14318`, `18080`, `18443`, and `18444`.
 - Internet access for pinned container images, Maven dependencies, and the
   selected official Java agent.
 
@@ -214,6 +221,8 @@ The default `all` suite runs, in order:
 - Java 21 virtual-thread migration, mixed execution, and cancellation paths;
 - real Netty event-loop to platform-worker handoff, including canceled Netty
   work, while the successful request remains exact-parented;
+- inbound Netty HTTPS server extraction through the Apache `/api/netty-server`
+  route, with a separate exact-parent assertion for each request;
 - repeated real Jetty async redispatch with exactly one Java server span;
 - valid W3C precedence and invalid-W3C fallback to OBI;
 - a JVM started while OBI is absent, with root and valid-W3C behavior before
@@ -303,6 +312,7 @@ Before traffic begins, the orchestrator uses bounded waits for:
 - OBI log `Java remote parent bridge ready`;
 - helper log `OBI remote-parent provider ready`;
 - Jetty log `Jetty HTTPS backend ready on 127.0.0.1:18443`;
+- Netty log `Netty HTTPS backend ready on 127.0.0.1:18444`;
 - the Java backend's loopback-only transport-configuration endpoint, whose
   fixed snapshot must prove the requested and selected transport;
 - extension log `OBI remote-parent propagator enabled`;
@@ -437,7 +447,7 @@ the retained `compose.log` in this order:
 1. `trace-receiver` must listen on `127.0.0.1:14318`.
 2. Jetty must report HTTP/1.1 and the selected TLS protocol.
 3. Apache must load `mod_ssl` and verify the generated CA and hostname.
-4. OBI must discover ports `18080` and `18443`, then report bridge
+4. OBI must discover ports `18080`, `18443`, and `18444`, then report bridge
    availability.
 5. The JVM must report provider, extension, and injected-instrumentation
    readiness messages. Its loopback-only `/obi-transport-configuration`
@@ -479,9 +489,9 @@ not change transport.
 - The helper carries accepted-socket ownership through exact executor,
   ForkJoin, Netty-worker, and virtual-thread task contexts. Packaged-agent tests
   cover nested hops, cancellation, worker reuse, and Java 21 carrier migration.
-  The Compose servlet scenarios still begin after stock server extraction, so
-  a retained privileged run is required before claiming a specific framework's
-  receive-to-pre-extraction path.
+  The Jetty servlet scenarios still begin after stock server extraction. The
+  retained inbound-Netty fixture proves its own receive-to-extraction path, but
+  neither result establishes arbitrary framework or Netty application support.
 - The fd/port-reuse scenario is Linux-only. It reuses one client ephemeral port
   across closed frontend connections and asks the demo backend to resolve its
   accepted socket descriptor from `/proc/self`. A synchronized weak-key map

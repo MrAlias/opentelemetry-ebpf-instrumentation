@@ -1,0 +1,11 @@
+{
+  "labels": {
+    "otel_metric_overflow": "false",
+    "service_name": "java-backend",
+    "service_namespace": "apache-java-https",
+    "telemetry_type": "traces"
+  },
+  "metric": "obi_avoided_services",
+  "status": "passed",
+  "value": 1
+}

@@ -1,0 +1,27 @@
+{
+  "cleanup": {
+    "entries_removed": 5537,
+    "synthetic_entries_verified_absent": 10001,
+    "verified": true
+  },
+  "fill": {
+    "evicted_entries_observed": 3696,
+    "synthetic_entries_requested": 10001
+  },
+  "map": {
+    "max_entries": 10000
+  },
+  "recovery": {
+    "consecutive_at_or_below_baseline_samples": 2,
+    "verified": true
+  },
+  "scenario_status": "scenario-pressure-status.json",
+  "status": "passed",
+  "traffic": {
+    "exact_parent_hits": 128,
+    "explicit_roots": 0,
+    "requests": 128,
+    "unresolved_parents": 0,
+    "wrong_parents": 0
+  }
+}

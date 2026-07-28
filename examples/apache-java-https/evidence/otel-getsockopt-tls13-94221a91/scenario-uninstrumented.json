@@ -1,0 +1,48 @@
+{
+  "status": "passed",
+  "scenario": "uninstrumented",
+  "seed": 1,
+  "started_at": "2026-07-28T05:05:02.104258364Z",
+  "finished_at": "2026-07-28T05:05:08.313751086Z",
+  "request_count": 1,
+  "traffic_elapsed_nanos": 6183506,
+  "throughput_per_second": 161.72055141532974,
+  "latency": {
+    "p50_nanos": 6178683,
+    "p95_nanos": 6178683,
+    "p99_nanos": 6178683
+  },
+  "cases": [
+    {
+      "request": {
+        "marker": "uninstrumented-00-84aca3ab04bf90af",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "uninstrumented-00-84aca3ab04bf90af",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 2,
+        "backend_remote_port": 54750,
+        "tls_read_events": -1,
+        "tls_read_bytes": -1
+      },
+      "latency_nanos": 6178683,
+      "trace": {
+        "marker": "uninstrumented-00-84aca3ab04bf90af",
+        "received_batches": 0,
+        "received_spans": 0,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 0,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": []
+      }
+    }
+  ]
+}

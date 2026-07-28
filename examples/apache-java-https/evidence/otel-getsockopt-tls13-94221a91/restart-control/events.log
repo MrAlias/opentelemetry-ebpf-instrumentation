@@ -1,0 +1,5 @@
+2026-07-28T04:58:49.982079127Z observed:pre-stop-ready
+2026-07-28T04:58:52.085948868Z released:obi-stopped
+2026-07-28T04:58:53.113619852Z observed:stopped-traffic-complete
+2026-07-28T04:59:14.758116471Z released:obi-ready
+2026-07-28T04:59:17.934691246Z observed:post-restart-traffic-complete

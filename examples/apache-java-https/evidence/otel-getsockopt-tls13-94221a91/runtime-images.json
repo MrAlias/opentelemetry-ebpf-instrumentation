@@ -1,0 +1,22 @@
+[
+  {
+    "role": "apache",
+    "reference": "httpd:2.4.68-alpine",
+    "digest": "sha256:1b766f17b84026429b7cb243317b142921b24432336e798bc881c43f45ed9567"
+  },
+  {
+    "role": "java-backend",
+    "reference": "source-built",
+    "digest": "sha256:744dba1cccd1d59d81e4552a3fcab913de9a004f4bf7aed05e5df20971cc2921"
+  },
+  {
+    "role": "obi",
+    "reference": "source-built",
+    "digest": "sha256:defb00282805a8f34fb88986cd7960efa0b3d92c7d8859aa758c42536ee43a69"
+  },
+  {
+    "role": "trace-receiver",
+    "reference": "source-built",
+    "digest": "sha256:98ae1bbcb06b625750496d405ccb379dce10c633cb8f041358a1dcad8ed74347"
+  }
+]

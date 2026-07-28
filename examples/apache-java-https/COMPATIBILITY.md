@@ -37,7 +37,7 @@ any representative kernel row above.
 
 | Environment | Cgroup topology | `getsockopt` | `unix` | `auto` | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| Linux 6.17.0-1019-aws (distribution not recorded) | unified v2 | pass | untested | untested | [clean full OpenTelemetry/TLS 1.3 run](evidence/otel-getsockopt-tls13-7482d908/README.md) |
+| Linux 7.0.0-1009-aws (distribution not recorded) | unified v2 | pass | untested | untested | [clean full OpenTelemetry/TLS 1.3 run](evidence/otel-getsockopt-tls13-94221a91/README.md) |
 
 RHEL 8 support may only be reported from direct execution on the documented
 backport. If a required cgroup hook is absent, report forced `getsockopt` as
@@ -50,7 +50,7 @@ agent, TLS 1.3, and both forced transports.
 
 | Architecture | `getsockopt` | `unix` | Evidence |
 | --- | --- | --- | --- |
-| `amd64` | pass | untested | [Linux 6.17/OpenTelemetry/TLS 1.3](evidence/otel-getsockopt-tls13-7482d908/README.md) |
+| `amd64` | pass | untested | [Linux 7.0/OpenTelemetry/TLS 1.3](evidence/otel-getsockopt-tls13-94221a91/README.md) |
 | `arm64` | untested | untested | not recorded |
 
 ## JVM and official agent
@@ -82,7 +82,7 @@ Compose run for a matrix cell below.
 | 8 | untested | untested | configured official-agent smoke; no privileged run recorded |
 | 11 | untested | untested | configured official-agent smoke; no privileged run recorded |
 | 17 | untested | untested | configured official-agent smoke; no privileged run recorded |
-| 21 | pass | untested | [Temurin 21/OpenTelemetry/`amd64` privileged run](evidence/otel-getsockopt-tls13-7482d908/README.md) |
+| 21 | pass | untested | [Temurin 21/OpenTelemetry/`amd64` privileged run](evidence/otel-getsockopt-tls13-94221a91/README.md) |
 
 Additional agent releases must be selected deliberately, pinned by checksum,
 and added as new rows. “Latest” is not a matrix cell.
@@ -91,7 +91,7 @@ and added as new rows. “Latest” is not a matrix cell.
 
 | Apache / OpenSSL | TLS 1.2 | TLS 1.3 | Backend HTTP |
 | --- | --- | --- | --- |
-| `httpd:2.4.68-alpine` image pinned in Compose | untested | [pass graph](evidence/otel-getsockopt-tls13-7482d908/scenario-basic.json), [runtime](evidence/otel-getsockopt-tls13-7482d908/apache-openssl-runtime.txt) | HTTP/1.1 only |
+| `httpd:2.4.68-alpine` image pinned in Compose | untested | [pass graph](evidence/otel-getsockopt-tls13-94221a91/scenario-basic.json), [runtime](evidence/otel-getsockopt-tls13-94221a91/apache-openssl-runtime.txt) | HTTP/1.1 only |
 
 Every run must produce `apache-openssl-version.txt` proving that Apache loaded
 `ssl_module`, that `mod_ssl.so` links to `libssl.so.3` and `libcrypto.so.3`,
@@ -138,7 +138,7 @@ failure reasons, and reconciles with the aggregate Java diagnostics. Other
 tests may report a miss only when their expected outcome permits it.
 
 The narrowest directly demonstrated configuration is currently the exact Linux
-6.17.0-1019-aws, unified-cgroup-v2, `amd64`, Temurin 21, OpenTelemetry 2.28.1,
+7.0.0-1009-aws, unified-cgroup-v2, `amd64`, Temurin 21, OpenTelemetry 2.28.1,
 forced-`getsockopt`, Apache 2.4.68, OpenSSL 3.5.7, TLS 1.3 cell linked above.
 The distribution was not recorded independently, and no broader compatibility
 claim follows from that result.

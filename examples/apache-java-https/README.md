@@ -32,10 +32,9 @@ and aggregate retained payload bytes. Any count, value, or aggregate-limit
 drop is exposed in the snapshot and causes the corresponding assertion to
 fail.
 
-The checked-in result matrices are intentionally marked **untested**. They are
-templates for evidence produced on the machine where the privileged eBPF tests
-are actually run; the presence of this example does not claim those cells
-passed.
+Checked-in result matrices mark only linked retained evidence as passed; every
+other cell remains **untested**. The presence of this example does not claim
+that an unlinked cell passed.
 
 ## What the assertion proves
 

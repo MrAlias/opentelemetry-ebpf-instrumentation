@@ -30,6 +30,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
@@ -51,6 +52,7 @@ public final class ApacheJavaHttpsBackend {
   static final String BRIDGE_DIAGNOSTICS_HEADER = "X-OBI-Java-Diagnostics";
   static final String BRIDGE_DIAGNOSTICS_PARAMETER = "bridge_diagnostics";
   private static final int DEFAULT_PORT = 18443;
+  private static final int DEFAULT_NETTY_PORT = 18444;
   private static final int MAX_DELAY_MILLIS = 1000;
   private static final int MAX_BODY_BYTES = 64 * 1024;
   private static final int MAX_HANDOFFS = 8;
@@ -80,11 +82,17 @@ public final class ApacheJavaHttpsBackend {
   private static final DefaultEventExecutor NETTY_EVENT_LOOP =
       new DefaultEventExecutor(namedThreadFactory("obi-netty-eventloop-"));
   private static final ExecutorService VIRTUAL_EXECUTOR = virtualThreadExecutor();
+  private static final AtomicBoolean STOPPED = new AtomicBoolean();
 
   private ApacheJavaHttpsBackend() {}
 
   public static void main(String[] args) throws Exception {
-    int port = parsePort(environment("HTTPS_PORT", Integer.toString(DEFAULT_PORT)));
+    int port =
+        parsePort("HTTPS_PORT", environment("HTTPS_PORT", Integer.toString(DEFAULT_PORT)));
+    int nettyPort =
+        parsePort(
+            "NETTY_HTTPS_PORT",
+            environment("NETTY_HTTPS_PORT", Integer.toString(DEFAULT_NETTY_PORT)));
     String keyStorePath = environment("TLS_KEYSTORE_PATH", "/run/obi-demo/certs/server.p12");
     String keyStorePassword = environment("TLS_KEYSTORE_PASSWORD", "changeit");
     String tlsProtocol = environment("TLS_PROTOCOL", "TLSv1.3");
@@ -125,21 +133,28 @@ public final class ApacheJavaHttpsBackend {
     configureServlets(context, tlsProtocol, tlsBoundaryFixture);
     server.setHandler(context);
 
-    Runtime.getRuntime()
-        .addShutdownHook(
-            new Thread(() -> stop(server, tlsBoundaryFixture), "jetty-shutdown"));
+    NettyHttpsServer nettyServer = null;
     try {
+      nettyServer =
+          NettyHttpsServer.start(nettyPort, Path.of(keyStorePath), keyStorePassword, tlsProtocol);
+      NettyHttpsServer runningNettyServer = nettyServer;
+      Runtime.getRuntime()
+          .addShutdownHook(
+              new Thread(() -> stop(server, runningNettyServer, tlsBoundaryFixture), "jetty-shutdown"));
       server.start();
       System.out.printf(
           Locale.ROOT,
           "Jetty HTTPS backend ready on 127.0.0.1:%d with %s and HTTP/1.1%n",
           port,
           tlsProtocol);
+      System.out.printf(
+          Locale.ROOT,
+          "Netty HTTPS backend ready on 127.0.0.1:%d with %s and HTTP/1.1%n",
+          runningNettyServer.port(),
+          tlsProtocol);
       server.join();
     } finally {
-      if (tlsBoundaryFixture != null) {
-        tlsBoundaryFixture.close();
-      }
+      stop(server, nettyServer, tlsBoundaryFixture);
     }
   }
 
@@ -983,10 +998,10 @@ public final class ApacheJavaHttpsBackend {
     }
   }
 
-  private static int parsePort(String raw) {
+  private static int parsePort(String name, String raw) {
     int port = Integer.parseInt(raw);
     if (port < 1 || port > 65535) {
-      throw new IllegalArgumentException("HTTPS_PORT must be between 1 and 65535");
+      throw new IllegalArgumentException(name + " must be between 1 and 65535");
     }
     return port;
   }
@@ -1000,11 +1015,22 @@ public final class ApacheJavaHttpsBackend {
     return value.replace("\\", "\\\\").replace("\"", "\\\"");
   }
 
-  private static void stop(Server server, TlsReceiveBoundaryFixture tlsBoundaryFixture) {
+  private static void stop(
+      Server server, NettyHttpsServer nettyServer, TlsReceiveBoundaryFixture tlsBoundaryFixture) {
+    if (!STOPPED.compareAndSet(false, true)) {
+      return;
+    }
     try {
       server.stop();
     } catch (Exception exception) {
       System.err.println("Jetty shutdown failed: " + exception.getMessage());
+    }
+    try {
+      if (nettyServer != null) {
+        nettyServer.close();
+      }
+    } catch (Exception exception) {
+      System.err.println("Netty shutdown failed: " + exception.getMessage());
     } finally {
       HANDOFF_FIRST.shutdownNow();
       HANDOFF_SECOND.shutdownNow();

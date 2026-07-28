@@ -657,6 +657,14 @@ func TestStressScenarioRequestsHaveBoundedShapes(t *testing.T) {
 			},
 		},
 		{
+			scenario: "netty-server",
+			count:    4,
+			check: func(t *testing.T, request requestCase) {
+				assert.Equal(t, "/api/netty-server", request.Endpoint)
+				assert.True(t, request.CloseConnection)
+			},
+		},
+		{
 			scenario: "dispatch",
 			count:    4,
 			check: func(t *testing.T, request requestCase) {
@@ -739,7 +747,7 @@ func TestRequestsCloseBackendConnectionsAfterEvidence(t *testing.T) {
 		}
 	}
 
-	for _, scenario := range []string{"concurrency", "pressure", "handoff", "virtual-thread", "netty", "dispatch"} {
+	for _, scenario := range []string{"concurrency", "pressure", "handoff", "virtual-thread", "netty", "netty-server", "dispatch"} {
 		requests, err := makeRequests(config{scenario: scenario, seed: 1})
 		require.NoError(t, err)
 		for _, request := range requests {
@@ -821,6 +829,15 @@ func TestNettyRequestsCoverCancelledAndUncancelledWork(t *testing.T) {
 
 	assert.False(t, requests[0].NettyCancel)
 	assert.True(t, requests[1].NettyCancel)
+}
+
+func TestNettyServerResponseRequiresInboundNettyProof(t *testing.T) {
+	request := requestCase{Endpoint: "/api/netty-server"}
+	response := backendResponse{BackendKind: "netty"}
+
+	require.NoError(t, validateWorkloadResponse(request, response))
+	response.BackendKind = "jetty"
+	assert.Error(t, validateWorkloadResponse(request, response))
 }
 
 func TestDispatchRequestsCoverRepeatedServletInvocations(t *testing.T) {

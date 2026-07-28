@@ -38,6 +38,7 @@ services:
     network_mode: host
     environment:
       HTTPS_PORT: "18443"
+      NETTY_HTTPS_PORT: "18444"
       TLS_KEYSTORE_PATH: /run/obi-demo/certs/server.p12
       TLS_KEYSTORE_PASSWORD: changeit
       TLS_PROTOCOL: ${BACKEND_TLS_PROTOCOL:-TLSv1.3}

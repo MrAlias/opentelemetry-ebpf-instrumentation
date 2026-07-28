@@ -167,7 +167,7 @@ usage() {
   cat <<EOF
 Usage: $SCRIPT_NAME [OPTIONS]
 
-Build, run, and assert the client -> Apache -> HTTPS Jetty trace bridge demo.
+Build, run, and assert the client -> Apache -> HTTPS Java trace bridge demo.
 
 Options:
   --transport MODE        getsockopt, unix, auto, or disabled.
@@ -177,7 +177,7 @@ Options:
   --scenario NAME         all, basic, keepalive, pipelining, concurrency,
                           connection-churn, fd-port-reuse, slow-body, tls-boundary,
                           timeout-retry,
-                          pressure, handoff, virtual-thread, netty, dispatch,
+                          pressure, handoff, virtual-thread, netty, netty-server, dispatch,
                           w3c, w3c-match, obi-flags, w3c-fault, w3c-only,
                           security, restart-fault, helper-attach-failure,
                           fail-open, restart, disabled, or uninstrumented.
@@ -197,7 +197,7 @@ Options:
 The all scenario runs basic, keepalive, HTTP/1.1 pipelining, concurrency,
 connection churn, fd/ephemeral-port reuse, slow-body, deterministic TLS receive
 boundaries, timeout/retry, pressure,
-executor/virtual-thread/Netty handoff, async redispatch, W3C
+executor/virtual-thread/Netty handoff, inbound Netty TLS, async redispatch, W3C
 precedence/match/flags/fault/no-state controls, late attach, OBI restart during
 traffic, helper attach failure, bounded primary or fallback transport abuse
 controls, Unix endpoint replacement when that transport is selected,
@@ -359,7 +359,7 @@ parse_args() {
       ;;
   esac
   case "$SCENARIO" in
-    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|timeout-retry|pressure|handoff|virtual-thread|netty|dispatch|w3c|w3c-match|obi-flags|w3c-fault|w3c-only|security|restart-fault|helper-attach-failure|fail-open|restart|disabled|uninstrumented)
+    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|timeout-retry|pressure|handoff|virtual-thread|netty|netty-server|dispatch|w3c|w3c-match|obi-flags|w3c-fault|w3c-only|security|restart-fault|helper-attach-failure|fail-open|restart|disabled|uninstrumented)
       ;;
     *)
       die "unsupported scenario: $SCENARIO"
@@ -1104,6 +1104,11 @@ start_stack() {
       java-backend \
       "Jetty HTTPS backend ready on 127.0.0.1:18443" \
       "Jetty HTTPS backend" \
+      "$startup_since" || return $?
+    wait_for_log \
+      java-backend \
+      "Netty HTTPS backend ready on 127.0.0.1:18444" \
+      "Netty HTTPS backend" \
       "$startup_since" || return $?
     assert_selected_transport || return $?
   elif [[ "$SCENARIO" != "uninstrumented" ]]; then
@@ -2212,7 +2217,7 @@ scenario_request_count() {
     pressure)
       printf '128\n'
       ;;
-    handoff|virtual-thread|netty|dispatch)
+    handoff|virtual-thread|netty|netty-server|dispatch)
       printf '4\n'
       ;;
     w3c|obi-flags|w3c-fault)
@@ -4068,6 +4073,11 @@ recreate_instrumented_stack() {
     "Jetty HTTPS backend ready on 127.0.0.1:18443" \
     "$label Jetty HTTPS backend" \
     "$recreate_since" || return $?
+  wait_for_log \
+    java-backend \
+    "Netty HTTPS backend ready on 127.0.0.1:18444" \
+    "$label Netty HTTPS backend" \
+    "$recreate_since" || return $?
   BRIDGE_RUNNING=true
   assert_selected_transport "$transport" || return $?
   wait_for_apache_instrumentation recreate-instrumented || return $?
@@ -4248,6 +4258,11 @@ recover_helper_attach_failure_stack() {
     java-backend \
     "Jetty HTTPS backend ready on 127.0.0.1:18443" \
     "$label Jetty HTTPS backend" \
+    "$recovery_since" || return $?
+  wait_for_log \
+    java-backend \
+    "Netty HTTPS backend ready on 127.0.0.1:18444" \
+    "$label Netty HTTPS backend" \
     "$recovery_since" || return $?
   BRIDGE_RUNNING=true
   assert_selected_transport "$transport" || return $?
@@ -5670,6 +5685,7 @@ execute_requested_scenarios() {
       run_scenario handoff
       run_scenario virtual-thread
       run_scenario netty
+      run_scenario netty-server
       run_scenario dispatch
       run_scenario w3c
       run_w3c_match_control

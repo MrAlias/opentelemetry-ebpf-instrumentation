@@ -71,6 +71,7 @@ type requestCase struct {
 type backendResponse struct {
 	Marker              string               `json:"marker"`
 	Secure              bool                 `json:"secure"`
+	BackendKind         string               `json:"backend_kind,omitempty"`
 	Protocol            string               `json:"protocol"`
 	TLSProtocol         string               `json:"tls_protocol"`
 	TLSCipher           string               `json:"tls_cipher"`
@@ -283,7 +284,7 @@ func parseFlags() config {
 	var cfg config
 	flag.StringVar(&cfg.baseURL, "base-url", "http://127.0.0.1:18080", "Apache base URL")
 	flag.StringVar(&cfg.receiverURL, "receiver-url", "http://127.0.0.1:14318", "trace receiver base URL")
-	flag.StringVar(&cfg.scenario, "scenario", "basic", "basic, keepalive, pipelining, concurrency, connection-churn, fd-port-reuse, slow-body, tls-boundary, timeout-retry, pressure, handoff, virtual-thread, netty, dispatch, w3c, w3c-match, obi-flags, w3c-fault, w3c-only, helper-attach-failure, restart-fault, fail-open, restart, disabled, or uninstrumented")
+	flag.StringVar(&cfg.scenario, "scenario", "basic", "basic, keepalive, pipelining, concurrency, connection-churn, fd-port-reuse, slow-body, tls-boundary, timeout-retry, pressure, handoff, virtual-thread, netty, netty-server, dispatch, w3c, w3c-match, obi-flags, w3c-fault, w3c-only, helper-attach-failure, restart-fault, fail-open, restart, disabled, or uninstrumented")
 	flag.StringVar(&cfg.faultMode, "fault-mode", "", "w3c-fault mode")
 	flag.IntVar(&cfg.requestCount, "requests", 0, "number of requests (zero selects a scenario default)")
 	flag.DurationVar(&cfg.timeout, "timeout", 45*time.Second, "whole-scenario timeout")
@@ -303,7 +304,7 @@ func parseFlags() config {
 		"connection-churn": true, "fd-port-reuse": true,
 		"slow-body": true, "tls-boundary": true, "timeout-retry": true,
 		"pressure": true,
-		"handoff":  true, "virtual-thread": true, "netty": true, "dispatch": true,
+		"handoff":  true, "virtual-thread": true, "netty": true, "netty-server": true, "dispatch": true,
 		"w3c": true, "w3c-match": true, "obi-flags": true, "w3c-fault": true,
 		"w3c-only": true, "helper-attach-failure": true, "restart-fault": true,
 		"disabled": true, "uninstrumented": true,
@@ -473,7 +474,7 @@ func makeRequests(cfg config) ([]requestCase, error) {
 			count = 8
 		case "pressure":
 			count = 128
-		case "handoff", "virtual-thread", "netty", "dispatch":
+		case "handoff", "virtual-thread", "netty", "netty-server", "dispatch":
 			count = 4
 		case "w3c", "obi-flags", "w3c-fault", "tls-boundary":
 			count = 2
@@ -543,6 +544,9 @@ func makeRequests(cfg config) ([]requestCase, error) {
 		if cfg.scenario == "netty" {
 			requests[i].Endpoint = "/api/netty"
 			requests[i].NettyCancel = i&1 != 0
+		}
+		if cfg.scenario == "netty-server" {
+			requests[i].Endpoint = "/api/netty-server"
 		}
 		if cfg.scenario == "dispatch" {
 			requests[i].Endpoint = "/api/dispatch"
@@ -1201,7 +1205,7 @@ func decodeBackendResponse(
 		return backendResponse{}, fmt.Errorf("expected response marker %q, got %q", requestCase.Marker, backend.Marker)
 	}
 	if !backend.Secure {
-		return backendResponse{}, errors.New("jetty reported an insecure backend request")
+		return backendResponse{}, errors.New("backend reported an insecure request")
 	}
 	if backend.Protocol != "HTTP/1.1" {
 		return backendResponse{}, fmt.Errorf("expected backend HTTP/1.1, got %q", backend.Protocol)
@@ -1340,6 +1344,10 @@ func validateWorkloadResponse(request requestCase, response backendResponse) err
 				response.Workload,
 				response.NettyCancel,
 			)
+		}
+	case "/api/netty-server":
+		if response.BackendKind != "netty" {
+			return fmt.Errorf("netty server response did not prove its backend: kind=%q", response.BackendKind)
 		}
 	case "/api/dispatch":
 		if response.Workload != "servlet-async-redispatch" ||
@@ -1898,7 +1906,7 @@ func distinctParentScenario(scenario string) bool {
 
 func parallelScenario(scenario string) bool {
 	switch scenario {
-	case "concurrency", "pressure", "handoff", "virtual-thread", "netty", "dispatch":
+	case "concurrency", "pressure", "handoff", "virtual-thread", "netty", "netty-server", "dispatch":
 		return true
 	default:
 		return false

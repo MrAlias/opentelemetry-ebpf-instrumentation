@@ -5,6 +5,7 @@ routes:
     - /api/handoff
     - /api/virtual
     - /api/netty
+    - /api/netty-server
     - /api/dispatch
     - /api/obi-flags
   unmatched: path
@@ -63,6 +64,6 @@ discovery:
       open_ports: 18080
     - namespace: apache-java-https
       name: java-backend
-      open_ports: 18443
+      open_ports: 18443,18444
 
 log_level: info

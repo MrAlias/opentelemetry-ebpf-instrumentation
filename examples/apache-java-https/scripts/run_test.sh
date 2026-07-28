@@ -953,7 +953,7 @@ test_benchmark_controls_are_bounded() {
 
 test_all_suite_includes_every_scenario() {
   local -r actual="$TEST_TMP_DIR/all-scenarios.txt"
-  local -r expected=$'basic\nsecurity\nkeepalive\npipelining\nconcurrency\nconnection-churn\nfd-port-reuse\nslow-body\ntls-boundary\ntimeout-retry\npressure\nhandoff\nvirtual-thread\nnetty\ndispatch\nw3c\nw3c-match\nobi-flags\nfail-open\nw3c-only\nrestart\nrestart-fault\nhelper-attach-failure\ndisabled\nw3c-only\nw3c-only\nuninstrumented'
+  local -r expected=$'basic\nsecurity\nkeepalive\npipelining\nconcurrency\nconnection-churn\nfd-port-reuse\nslow-body\ntls-boundary\ntimeout-retry\npressure\nhandoff\nvirtual-thread\nnetty\nnetty-server\ndispatch\nw3c\nw3c-match\nobi-flags\nfail-open\nw3c-only\nrestart\nrestart-fault\nhelper-attach-failure\ndisabled\nw3c-only\nw3c-only\nuninstrumented'
 
   (
     SCENARIO=all
@@ -6230,6 +6230,7 @@ test_instrumented_readiness_precedes_https_traffic() {
     'log:injected Java helper' \
     'log:external OTel extension' \
     'log:Jetty HTTPS backend' \
+    'log:Netty HTTPS backend' \
     'transport' \
     'log:injected Java instrumentation' \
     'apache:startup' \
@@ -6671,6 +6672,7 @@ test_recreated_stack_readiness_uses_log_cursor() {
     'log:restoration external OTel extension:recreate-cursor' \
     'log:restoration injected Java instrumentation:recreate-cursor' \
     'log:restoration Jetty HTTPS backend:recreate-cursor' \
+    'log:restoration Netty HTTPS backend:recreate-cursor' \
     'transport:unix:unix' \
     'apache:recreate-instrumented' \
     'http:restoration HTTPS path' \

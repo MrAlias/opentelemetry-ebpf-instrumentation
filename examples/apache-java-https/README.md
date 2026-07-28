@@ -288,6 +288,10 @@ does not prove both paths.
 ./examples/apache-java-https/run.sh \
   --transport getsockopt \
   --scenario w3c-only
+
+./examples/apache-java-https/run.sh \
+  --transport getsockopt \
+  --scenario delayed-otlp-suppression
 ```
 
 Use `--keep` to inspect a successful or failed stack. Stop only this Compose
@@ -329,6 +333,29 @@ pre-attach backend TLS connection enters the recovery scenario. Separate
 controls run with the extension absent and disabled. The uninstrumented control
 requires that the official agent, extension, and OBI are absent. Every build,
 Compose operation, HTTP request, and trace wait has a deadline.
+
+## Delayed first-OTLP suppression control
+
+The `delayed-otlp-suppression` control exercises the
+[startup-window limitation](../../devdocs/exclude-otel-instrumented-services.md#1-startup-window-duplicates-until-the-first-export)
+without treating bridge propagation as part of exporter suppression. It
+force-recreates the Java backend, OBI, Apache, and receiver, sets
+`OTEL_BSP_SCHEDULE_DELAY=60000`, and performs exactly one marked Apache-to-Java
+prime request. Safe startup checks do not send an ordinary request to the Java
+backend before that prime.
+
+The control records an empty fresh receiver before the request. It then rejects
+any marker-correlated Java SDK Jetty server span received before the Java
+container's start time plus the configured 60-second delay. The receiver stamps
+the accepted OTLP request in milliseconds, so a delayed harness poll cannot
+hide an early export. After the deadline, it requires exactly one Java SDK
+server span from the `io.opentelemetry.jetty-11.0` scope, the Java duplicate
+suppression signal from OBI, and the normal exact-parent `basic` assertion.
+Apache OBI spans are allowed during the window; only the marked Java SDK export
+is the control's boundary.
+
+The `all` suite includes this control, then restores the prior export-delay
+setting and a normal instrumented stack before the remaining scenarios.
 
 ## Configuration contract
 
@@ -399,9 +426,11 @@ Every run retains a timestamped directory under `.runtime/results/` with:
   steady-recovery gate, with canonical cleanup/recovery evidence promoted only
   when the complete gate passes;
 - per-mode runtime assertions for the official-agent/extension/OBI topology
-  and the Java-service duplicate-suppression metric; after each OBI
+  and the Java-service duplicate-suppression metric; after each normal OBI
   create/restart, a non-measured health request drives behavioral detection
-  and asserted traffic starts only after the new process reports suppression;
+  and asserted traffic starts only after the new process reports suppression.
+  The delayed-first-OTLP control is distinct: it sends one marked prime request
+  only after safe startup and performs no generic Java health request before it;
 - final receiver snapshot, Compose state, and component logs.
 
 Build and startup output is streamed to the terminal and retained in

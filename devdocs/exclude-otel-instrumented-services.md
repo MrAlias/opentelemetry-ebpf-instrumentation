@@ -97,6 +97,12 @@ Once a service has its `ExportsOTelMetrics` / `ExportsOTelTraces` /
 - OTLP traces — [`pkg/export/otel/tracesgen/tracesgen.go`](../pkg/export/otel/tracesgen/tracesgen.go).
 - Prometheus — RED-metrics and span-metrics filters in [`pkg/export/prom/prom.go`](../pkg/export/prom/prom.go).
 
+This is an export decision, not a Java instrumentation lifecycle decision.
+When Java trace suppression is active, OBI retains the bridge probes, maps,
+helper signals, and transport state needed to supply a remote parent to the
+Java SDK. The Java SDK remains responsible for exporting its server span, and
+OBI does not export a duplicate Java server span after detection.
+
 Each detection event increments the `obi.avoided.services` internal metric
 (Prometheus name: `obi_avoided_services`). Normal series are labeled with the
 logical service name, service namespace, and the telemetry type that was
@@ -157,9 +163,10 @@ In practice this means:
 ### 2. Suppression is all-or-nothing per service
 
 Once a service is flagged, OBI suppresses **every** span / metric it would
-produce for that service, regardless of category. There is no way to say "the
-SDK already instruments HTTP and gRPC, so drop only those — but keep emitting
-SQL, Redis, Kafka, MongoDB, DNS, …".
+otherwise export for that service, regardless of category. There is no way to
+say "the SDK already instruments HTTP and gRPC, so drop only those — but keep
+emitting SQL, Redis, Kafka, MongoDB, DNS, …". This does not disable bridge
+state used only to propagate a Java remote parent.
 
 Concretely: if a service's SDK only covers HTTP/gRPC (a common configuration
 — e.g. only the web framework instrumentation is enabled, or the SDK has no

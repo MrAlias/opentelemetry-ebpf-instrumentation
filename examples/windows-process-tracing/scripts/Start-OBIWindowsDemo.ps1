@@ -358,9 +358,9 @@ function Assert-PackageManifest {
     )
 
     $stageRoot = [IO.Path]::GetFullPath($StageDirectory).TrimEnd('\') + '\'
-    $records = @(
-        Get-Content -Raw -LiteralPath $ManifestPath | ConvertFrom-Json
-    )
+    $parsedRecords = Get-Content -Raw -LiteralPath $ManifestPath |
+        ConvertFrom-Json
+    $records = @($parsedRecords)
     if ($records.Count -eq 0) {
         throw "Package manifest has no records: $ManifestPath"
     }

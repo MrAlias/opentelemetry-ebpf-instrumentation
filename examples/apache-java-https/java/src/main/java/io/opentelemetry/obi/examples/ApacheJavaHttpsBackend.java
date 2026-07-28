@@ -816,7 +816,7 @@ public final class ApacheJavaHttpsBackend {
         : null;
   }
 
-  private static long bridgeCounter(String method) {
+  static long bridgeCounter(String method) {
     try {
       Class<?> bridge =
           Class.forName("io.opentelemetry.obi.java.bridge.RemoteParentBootstrap", true, null);
@@ -996,7 +996,7 @@ public final class ApacheJavaHttpsBackend {
     return value == null || value.isEmpty() ? fallback : value;
   }
 
-  private static String jsonEscape(String value) {
+  static String jsonEscape(String value) {
     return value.replace("\\", "\\\\").replace("\"", "\\\"");
   }
 

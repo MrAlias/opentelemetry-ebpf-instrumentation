@@ -28,9 +28,7 @@ import io.netty.handler.codec.http.HttpServerCodec;
 import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.ssl.SslContext;
-import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SslHandler;
-import io.netty.handler.ssl.SslProvider;
 import io.netty.util.CharsetUtil;
 import io.netty.util.concurrent.DefaultEventExecutorGroup;
 import java.io.BufferedInputStream;
@@ -42,10 +40,7 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.security.KeyStore;
-import java.security.SecureRandom;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -61,11 +56,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
-import javax.net.ssl.KeyManagerFactory;
-import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
-import javax.net.ssl.TrustManagerFactory;
 
 /** Opt-in loopback fixture for observing decrypted TLS callback boundaries. */
 final class TlsReceiveBoundaryFixture implements AutoCloseable {
@@ -226,9 +218,10 @@ final class TlsReceiveBoundaryFixture implements AutoCloseable {
 
   static TlsReceiveBoundaryFixture start(
       Path keyStorePath, String keyStorePassword, String tlsProtocol) throws Exception {
-    TlsContexts contexts = loadTlsContexts(keyStorePath, keyStorePassword, tlsProtocol);
+    TlsContextFactory.Contexts contexts =
+        TlsContextFactory.load(keyStorePath, keyStorePassword, tlsProtocol);
     return new TlsReceiveBoundaryFixture(
-        contexts.serverContext, contexts.clientSocketFactory, tlsProtocol);
+        contexts.serverContext(), contexts.clientSocketFactory(), tlsProtocol);
   }
 
   private TlsReceiveBoundaryFixture(
@@ -383,31 +376,6 @@ final class TlsReceiveBoundaryFixture implements AutoCloseable {
         .awaitUninterruptibly(EXERCISE_TIMEOUT.toMillis());
   }
 
-  private static TlsContexts loadTlsContexts(
-      Path keyStorePath, String keyStorePassword, String tlsProtocol) throws Exception {
-    char[] password = keyStorePassword.toCharArray();
-    KeyStore keyStore = KeyStore.getInstance("PKCS12");
-    try (InputStream input = Files.newInputStream(keyStorePath)) {
-      keyStore.load(input, password);
-    }
-
-    KeyManagerFactory keyManagers =
-        KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
-    keyManagers.init(keyStore, password);
-    TrustManagerFactory trustManagers =
-        TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
-    trustManagers.init(keyStore);
-
-    SslContext serverContext =
-        SslContextBuilder.forServer(keyManagers)
-            .sslProvider(SslProvider.JDK)
-            .protocols(tlsProtocol)
-            .build();
-    SSLContext clientContext = SSLContext.getInstance(tlsProtocol);
-    clientContext.init(null, trustManagers.getTrustManagers(), new SecureRandom());
-    return new TlsContexts(serverContext, clientContext.getSocketFactory());
-  }
-
   private static int remainingMillis(long deadlineNanos) throws SocketTimeoutException {
     long remainingNanos = deadlineNanos - System.nanoTime();
     if (remainingNanos <= 0) {
@@ -508,16 +476,6 @@ final class TlsReceiveBoundaryFixture implements AutoCloseable {
 
   private static String integerListJson(List<Integer> values) {
     return values.toString().replace(" ", "");
-  }
-
-  private static final class TlsContexts {
-    private final SslContext serverContext;
-    private final SSLSocketFactory clientSocketFactory;
-
-    private TlsContexts(SslContext serverContext, SSLSocketFactory clientSocketFactory) {
-      this.serverContext = serverContext;
-      this.clientSocketFactory = clientSocketFactory;
-    }
   }
 
   private static final class RequestPlan {

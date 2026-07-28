@@ -66,10 +66,10 @@ registration are revalidated on every cache hit.
 
 In `auto` mode, OBI attempts the sockopt object and hooks and also starts and
 maintains the Unix service after the shared maps and data hook are ready. Its
-`select` event reports an OBI-side ready or preferred transport; it is not an
-acknowledgement of the Java helper's choice or proof that a request used that
-transport. The helper probes `getsockopt` first on a connected probe socket
-and, if that fails, probes Unix. Forced modes probe only the requested
+`availability/valid` event reports an OBI-side ready or preferred transport; it
+is not an acknowledgement of the Java helper's choice or proof that a request
+used that transport. The helper probes `getsockopt` first on a connected probe
+socket and, if that fails, probes Unix. Forced modes probe only the requested
 transport. A separate fixed Java configuration snapshot exports the requested
 and selected transport, attempted-probe mask, both probe outcomes, and final
 status from one completed native attempt. Fixed disabled, unknown,

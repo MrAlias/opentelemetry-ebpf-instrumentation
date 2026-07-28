@@ -297,7 +297,9 @@ func (p *Tracer) javaRemoteParentConstants() map[string]any {
 
 func (p *Tracer) runJavaRemoteParent(ctx context.Context) func() {
 	if !p.cfg.Java.RemoteParent.Enabled() {
-		p.observeJavaRemoteParent("disabled", "select", javabridge.StatusDisabled, 1)
+		p.observeJavaRemoteParent(
+			"disabled", javaRemoteParentAvailabilityOperation, javabridge.StatusDisabled, 1,
+		)
 		return func() {}
 	}
 	if p.javaRemoteParentSupportErr != nil {
@@ -426,14 +428,14 @@ func (p *Tracer) runJavaRemoteParentTransports(
 		)
 	}
 	server, serverDone := p.startJavaRemoteParentFallback(ctx, handler)
-	selected := obi.JavaRemoteParentUnix
+	readyTransport := obi.JavaRemoteParentUnix
 	if primary != nil {
-		selected = obi.JavaRemoteParentGetsockopt
+		readyTransport = obi.JavaRemoteParentGetsockopt
 	} else if server == nil && !p.javaRemoteParentFallbackEnabled() {
 		return
 	}
 	if primary != nil || server != nil {
-		p.reportJavaRemoteParentReady(selected)
+		p.reportJavaRemoteParentReady(readyTransport)
 	}
 
 	retryDelay := javaRemoteParentRetryInitial
@@ -494,7 +496,12 @@ func (p *Tracer) runJavaRemoteParentTransports(
 			}
 			if recoveringFallback {
 				p.log.Info("Java remote-parent fallback transport recovered")
-				p.observeJavaRemoteParent("unix", "select", javabridge.StatusValid, 1)
+				p.observeJavaRemoteParent(
+					"unix",
+					javaRemoteParentAvailabilityOperation,
+					javabridge.StatusValid,
+					1,
+				)
 			}
 			recoveringFallback = false
 			retryDelay = javaRemoteParentRetryInitial
@@ -557,7 +564,9 @@ func (p *Tracer) reportJavaRemoteParentReady(transport obi.JavaRemoteParentTrans
 		"transport", transport,
 		"socket_path", p.cfg.Java.RemoteParent.SocketPath,
 	)
-	p.observeJavaRemoteParent(string(transport), "select", javabridge.StatusValid, 1)
+	p.observeJavaRemoteParent(
+		string(transport), javaRemoteParentAvailabilityOperation, javabridge.StatusValid, 1,
+	)
 }
 
 func (p *Tracer) closeJavaRemoteParentFallback(

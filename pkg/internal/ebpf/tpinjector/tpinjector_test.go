@@ -368,7 +368,6 @@ func TestJavaRemoteParentMetricCardinalityContract(t *testing.T) {
 		"discard":      {},
 		"negotiate":    {},
 		"availability": {},
-		"select":       {},
 		"cleanup":      {},
 		"evict":        {},
 		"inject":       {},
@@ -392,10 +391,10 @@ func TestJavaRemoteParentMetricCardinalityContract(t *testing.T) {
 	}
 
 	require.Len(t, transports, 4)
-	require.Len(t, operations, 12)
+	require.Len(t, operations, 11)
 	require.Len(t, statuses, 18)
 	require.Len(t, stages, 6)
-	assert.Equal(t, 864, len(transports)*len(operations)*len(statuses))
+	assert.Equal(t, 792, len(transports)*len(operations)*len(statuses))
 
 	seen := map[javaRemoteParentStatLabel]struct{}{}
 	for _, label := range javaRemoteParentStatLabels {
@@ -407,7 +406,7 @@ func TestJavaRemoteParentMetricCardinalityContract(t *testing.T) {
 	}
 }
 
-func TestDisabledJavaRemoteParentReportsSelectionOnce(t *testing.T) {
+func TestDisabledJavaRemoteParentReportsAvailabilityOnce(t *testing.T) {
 	reporter := &javaRemoteParentRecordingReporter{}
 	var logs bytes.Buffer
 	cfg := obi.DefaultConfig
@@ -427,7 +426,7 @@ func TestDisabledJavaRemoteParentReportsSelectionOnce(t *testing.T) {
 
 	assert.Equal(t, []javaRemoteParentObservation{{
 		transport: "disabled",
-		operation: "select",
+		operation: javaRemoteParentAvailabilityOperation,
 		status:    "disabled",
 		count:     1,
 	}}, reporter.observations)
@@ -1003,7 +1002,7 @@ func TestJavaRemoteParentAutoFallsBackOnPrimaryPermissionFailure(t *testing.T) {
 				},
 				{
 					transport: "unix",
-					operation: "select",
+					operation: javaRemoteParentAvailabilityOperation,
 					status:    "valid",
 					count:     1,
 				},
@@ -1092,7 +1091,8 @@ func TestJavaRemoteParentFallbackRecoversAfterServeFailure(t *testing.T) {
 	})
 	validTransitions := 0
 	for _, observation := range reporter.observations {
-		if observation.transport == "unix" && observation.operation == "select" &&
+		if observation.transport == "unix" &&
+			observation.operation == javaRemoteParentAvailabilityOperation &&
 			observation.status == "valid" {
 			validTransitions++
 		}

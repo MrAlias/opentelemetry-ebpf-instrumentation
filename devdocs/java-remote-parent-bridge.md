@@ -563,20 +563,22 @@ must restart with the current helper generation. If the facade is present but
 the bootstrap bridge lacks its snapshot method, it reports version mismatch.
 
 The OBI operation counter has four possible `transport` values (`tcp`,
-`getsockopt`, `unix`, and `disabled`), twelve possible `operation` values
+`getsockopt`, `unix`, and `disabled`), eleven possible `operation` values
 (`stage`, `candidate`, `handoff`, `inject`, `take`, `discard`, `negotiate`,
-`availability`, `select`, `cleanup`, `evict`, and `report`), and eighteen fixed
-status values. Its absolute Cartesian cardinality bound is therefore 864,
-while the implementation emits only the meaningful combinations. `auto` is
-never a metric label; selection records the concrete transport. Failures
-before a fallback request can be decoded are
+`availability`, `cleanup`, `evict`, and `report`), and eighteen fixed status
+values. Its absolute Cartesian cardinality bound is therefore 792, while the
+implementation emits only the meaningful combinations. `auto` is never a
+metric label; availability records use the concrete transport. Failures before
+a fallback request can be decoded are
 reported as `negotiate`, so malformed or unauthenticated input cannot introduce
 another operation label. Local startup and transport-transition failures use
-`availability`; they cannot be confused with an unauthorized caller. Cleanup
-and fallback-map eviction are emitted as counted `tcp` lifecycle operations
-and never contain map keys. A `tcp/report/valid` marker is emitted after each
-successful BPF counter pass at the configured BPF metric interval so observers
-can identify complete publications. The Java snapshot has 50 fixed keys:
+`availability`; valid, disabled, and failure statuses describe OBI transport
+lifecycle outcomes, not the Java helper's selection or proof of request use. They
+cannot be confused with an unauthorized caller. Cleanup and fallback-map
+eviction are emitted as counted `tcp` lifecycle operations and never contain
+map keys. A `tcp/report/valid` marker is emitted after each successful BPF
+counter pass at the configured BPF metric interval so observers can identify
+complete publications. The Java snapshot has 50 fixed keys:
 twenty-two configuration, registration, lookup, extraction, trace-flag, and
 decrypted-read counters plus take and discard counters for each of the fourteen
 statuses. None of these surfaces derives a label or key from request data.

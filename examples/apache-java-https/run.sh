@@ -3224,6 +3224,7 @@ run_scenario() {
   local expected_bridge_lifecycle=0
   local expected_bridge_stage=0
   local expected_bridge_missing=0
+  local include_ambiguous_candidates=false
   local expected_java_missing=0
   local pressure_hits=0
   local pressure_roots=0
@@ -3300,9 +3301,11 @@ run_scenario() {
     expected_bridge_valid="$expected_requests"
     expected_bridge_lifecycle="$expected_requests"
     expected_bridge_stage="$expected_requests"
+    include_ambiguous_candidates=false
     if [[ "$retrieval_mode" == "helper-unavailable" ]]; then
       expected_bridge_valid=0
       expected_bridge_stage=0
+      include_ambiguous_candidates=true
     fi
     expected_bridge_missing="$baseline_bridge_missing"
     expected_java_missing="$baseline_java_missing"
@@ -3533,7 +3536,8 @@ run_scenario() {
         0 \
         "$expected_bridge_missing" \
         "$expected_bridge_lifecycle" \
-        "$expected_bridge_stage"; then
+        "$expected_bridge_stage" \
+        "$include_ambiguous_candidates"; then
         metric_status=1
       fi
     fi
@@ -6275,6 +6279,10 @@ assert_bridge_metric_delta() {
   local -r expected_missing="${5:-0}"
   local -r expected_upstream="${6:-$expected_takes}"
   local -r expected_stage="${7:-$expected_upstream}"
+  local -r include_ambiguous_candidates="${8:-false}"
+
+  [[ "$include_ambiguous_candidates" == "true" || \
+    "$include_ambiguous_candidates" == "false" ]] || return 1
 
   awk \
     -v selected="$transport" \
@@ -6283,6 +6291,7 @@ assert_bridge_metric_delta() {
     -v wanted_missing="$expected_missing" \
     -v wanted_upstream="$expected_upstream" \
     -v wanted_stage="$expected_stage" \
+    -v include_ambiguous_candidates="$include_ambiguous_candidates" \
     -v allow_primary_security="$ALLOW_PRIMARY_SECURITY_METRICS" \
     -v allow_unix_security="$ALLOW_UNIX_SECURITY_METRICS" '
     function label(line, name, value) {
@@ -6337,6 +6346,9 @@ assert_bridge_metric_delta() {
           stages += delta
         }
       }
+      if (operation == "candidate" && status == "ambiguous" && transport == "tcp") {
+        ambiguous_candidates += delta
+      }
       allowed = operation == "candidate" && transport == "tcp" && status == "valid"
       allowed = allowed || (operation == "inject" && transport == "tcp" && status == "valid")
       allowed = allowed || (operation == "stage" && transport == "tcp" && status == "valid")
@@ -6352,13 +6364,17 @@ assert_bridge_metric_delta() {
       }
     }
     END {
-      if (candidates != wanted_upstream || injections != wanted_upstream ||
+      candidate_total = candidates
+      if (include_ambiguous_candidates == "true") {
+        candidate_total += ambiguous_candidates
+      }
+      if (candidate_total != wanted_upstream || injections != wanted_upstream ||
           stages != wanted_stage ||
           takes != wanted_takes || discards != wanted_discards || missing != wanted_missing) {
-        printf "expected lifecycle=%d/%d/%d %s take/valid=%d discard/valid=%d take/missing=%d, got lifecycle=%d/%d/%d take=%d discard=%d missing=%d\n",
+        printf "expected lifecycle=%d/%d/%d %s take/valid=%d discard/valid=%d take/missing=%d, got candidate-valid=%d candidate-ambiguous=%d inject=%d stage=%d take=%d discard=%d missing=%d\n",
           wanted_upstream, wanted_upstream, wanted_stage, selected,
           wanted_takes, wanted_discards, wanted_missing,
-          candidates, injections, stages, takes, discards, missing > "/dev/stderr"
+          candidates, ambiguous_candidates, injections, stages, takes, discards, missing > "/dev/stderr"
         failed = 1
       }
       exit failed ? 1 : 0

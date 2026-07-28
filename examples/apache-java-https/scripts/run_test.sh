@@ -3223,24 +3223,45 @@ EOF
 obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=3 after=4 delta=1
 obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} before=3 after=4 delta=1
 obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=3 after=3 delta=0
-obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} before=3 after=3 delta=0
-obi_java_remote_parent_operations_total{operation="discard",status="valid",transport="getsockopt"} before=1 after=1 delta=0
+obi_java_remote_parent_operations_total{operation="take",status="valid",transport="unix"} before=3 after=3 delta=0
+obi_java_remote_parent_operations_total{operation="discard",status="valid",transport="unix"} before=1 after=1 delta=0
 EOF
-  assert_bridge_metric_delta "$helper_delta" getsockopt 0 0 0 1 0 || {
+  assert_bridge_metric_delta "$helper_delta" unix 0 0 0 1 0 || {
     printf 'bridge metric delta rejected upstream injection without a Java helper\n' >&2
     return 1
   }
+  sed -i 's/operation="candidate",status="valid",transport="tcp"} before=3 after=4 delta=1/operation="candidate",status="ambiguous",transport="tcp"} before=3 after=4 delta=1/' \
+    "$helper_delta"
+  if assert_bridge_metric_delta "$helper_delta" unix 0 0 0 1 0 >/dev/null 2>&1; then
+    printf 'bridge metric delta accepted an ambiguous candidate without helper-unavailable mode\n' >&2
+    return 1
+  fi
+  assert_bridge_metric_delta "$helper_delta" unix 0 0 0 1 0 true || {
+    printf 'bridge metric delta rejected an ambiguous helper-unavailable candidate\n' >&2
+    return 1
+  }
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=4 after=5 delta=1' \
+    >>"$helper_delta"
+  if assert_bridge_metric_delta "$helper_delta" unix 0 0 0 1 0 true >/dev/null 2>&1; then
+    printf 'bridge metric delta accepted duplicate helper-unavailable candidates\n' >&2
+    return 1
+  fi
+  sed -i '/operation="candidate",status="valid",transport="tcp"} before=4 after=5 delta=1/d' \
+    "$helper_delta"
+  sed -i 's/operation="candidate",status="ambiguous",transport="tcp"} before=3 after=4 delta=1/operation="candidate",status="valid",transport="tcp"} before=3 after=4 delta=1/' \
+    "$helper_delta"
   sed -i 's/operation="stage",status="valid",transport="tcp"} before=3 after=3 delta=0/operation="stage",status="valid",transport="tcp"} before=3 after=4 delta=1/' \
     "$helper_delta"
-  if assert_bridge_metric_delta "$helper_delta" getsockopt 0 0 0 1 0 >/dev/null 2>&1; then
+  if assert_bridge_metric_delta "$helper_delta" unix 0 0 0 1 0 >/dev/null 2>&1; then
     printf 'bridge metric delta accepted helper-unavailable staging\n' >&2
     return 1
   fi
   sed -i 's/operation="stage",status="valid",transport="tcp"} before=3 after=4 delta=1/operation="stage",status="valid",transport="tcp"} before=3 after=3 delta=0/' \
     "$helper_delta"
-  sed -i 's/operation="take",status="valid",transport="getsockopt"} before=3 after=3 delta=0/operation="take",status="valid",transport="getsockopt"} before=3 after=4 delta=1/' \
+  sed -i 's/operation="take",status="valid",transport="unix"} before=3 after=3 delta=0/operation="take",status="valid",transport="unix"} before=3 after=4 delta=1/' \
     "$helper_delta"
-  if assert_bridge_metric_delta "$helper_delta" getsockopt 0 0 0 1 0 >/dev/null 2>&1; then
+  if assert_bridge_metric_delta "$helper_delta" unix 0 0 0 1 0 >/dev/null 2>&1; then
     printf 'bridge metric delta accepted a Java take without a helper\n' >&2
     return 1
   fi
@@ -4602,7 +4623,7 @@ test_helper_unavailable_scenario_injects_without_staging_or_retrieval() {
     REQUEST_COUNT=99
     SCENARIO_SEED=7
     SCENARIO_VARIANT=""
-    SELECTED_TRANSPORT=getsockopt
+    SELECTED_TRANSPORT=unix
     TLS_PROTOCOL=TLSv1.3
     mkdir -p -- "$RESULT_DIR"
     : >"$calls"
@@ -4617,7 +4638,7 @@ test_helper_unavailable_scenario_injects_without_staging_or_retrieval() {
       printf 'evidence:%s\n' "$1" >>"$calls"
       mkdir -p -- "$RESULT_DIR/phases/$1"
       printf '%s\n' \
-        'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 4' \
+        'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="unix"} 4' \
         'obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} 7' \
         >"$RESULT_DIR/phases/$1/obi-metrics.prom"
     }
@@ -4632,8 +4653,8 @@ test_helper_unavailable_scenario_injects_without_staging_or_retrieval() {
       : >"$3"
     }
     assert_bridge_metric_delta() {
-      printf 'assert:%s:%s:%s:%s:%s:%s\n' \
-        "$2" "$3" "$4" "$5" "$6" "$7" >>"$calls"
+      printf 'assert:%s:%s:%s:%s:%s:%s:%s\n' \
+        "$2" "$3" "$4" "$5" "$6" "$7" "$8" >>"$calls"
     }
 
     run_scenario helper-attach-failure false full none helper-unavailable >/dev/null
@@ -4647,7 +4668,7 @@ test_helper_unavailable_scenario_injects_without_staging_or_retrieval() {
   grep -Fq -- '--scenario helper-attach-failure' "$calls"
   grep -Fq -- '--requests 1' "$calls"
   grep -Fqx 'wait:4:7' "$calls"
-  grep -Fqx 'assert:getsockopt:0:0:0:1:0' "$calls"
+  grep -Fqx 'assert:unix:0:0:0:1:0:true' "$calls"
   if grep -Fq 'unexpected-diagnostics' "$calls"; then
     printf 'helper-unavailable scenario attempted Java helper diagnostics\n' >&2
     return 1

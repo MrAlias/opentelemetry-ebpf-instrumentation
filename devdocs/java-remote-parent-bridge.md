@@ -583,6 +583,13 @@ twenty-two configuration, registration, lookup, extraction, trace-flag, and
 decrypted-read counters plus take and discard counters for each of the fourteen
 statuses. None of these surfaces derives a label or key from request data.
 
+Retained acceptance bundles from revisions before the availability rename can
+contain `operation="select"`. That historical label means OBI-side transport
+readiness or preference, never Java helper selection, and does not alter the
+current eleven-operation, 792-series bound. The [evidence
+index](../examples/apache-java-https/evidence/README.md) identifies those
+historical schemas; the V2 Java snapshot remains the selection source of truth.
+
 Each availability warning includes fixed `stage` and `reason` fields, and the
 corresponding operation counter uses `operation="availability"` with the same
 reason in its `status` label. A verifier error is `verifier_rejected`. An

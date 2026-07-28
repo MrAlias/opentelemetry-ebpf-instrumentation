@@ -5,10 +5,26 @@ package tracecheck
 
 import (
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 )
+
+func TestStoreRecordsProvidedReceiverArrivalMillisecond(t *testing.T) {
+	store := NewStore(1, 1024, 4096)
+	receivedAt := time.UnixMilli(123456)
+
+	store.AddAt([]Span{{SpanID: "span"}}, receivedAt)
+
+	snapshot := store.Snapshot("")
+	if len(snapshot.Spans) != 1 {
+		t.Fatalf("expected one retained span, got %#v", snapshot.Spans)
+	}
+	if got, want := snapshot.Spans[0].ReceivedUnixMilli, uint64(receivedAt.UnixMilli()); got != want {
+		t.Fatalf("unexpected receiver arrival time: got %d, want %d", got, want)
+	}
+}
 
 func TestStoreIsBoundedAndFiltersMarkers(t *testing.T) {
 	store := NewStore(2, 1024, 4096)

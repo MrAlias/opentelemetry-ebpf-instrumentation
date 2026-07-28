@@ -23,17 +23,18 @@ const (
 // Span is the deliberately small, machine-readable trace representation kept
 // by the demo receiver. It excludes request bodies and arbitrary headers.
 type Span struct {
-	TraceID       string            `json:"trace_id"`
-	SpanID        string            `json:"span_id"`
-	ParentSpanID  string            `json:"parent_span_id,omitempty"`
-	Flags         uint32            `json:"flags"`
-	ServiceName   string            `json:"service_name"`
-	ScopeName     string            `json:"scope_name,omitempty"`
-	Name          string            `json:"name"`
-	Kind          string            `json:"kind"`
-	Attributes    map[string]string `json:"attributes,omitempty"`
-	StartUnixNano uint64            `json:"start_unix_nano"`
-	EndUnixNano   uint64            `json:"end_unix_nano"`
+	TraceID           string            `json:"trace_id"`
+	SpanID            string            `json:"span_id"`
+	ParentSpanID      string            `json:"parent_span_id,omitempty"`
+	Flags             uint32            `json:"flags"`
+	ServiceName       string            `json:"service_name"`
+	ScopeName         string            `json:"scope_name,omitempty"`
+	Name              string            `json:"name"`
+	Kind              string            `json:"kind"`
+	Attributes        map[string]string `json:"attributes,omitempty"`
+	StartUnixNano     uint64            `json:"start_unix_nano"`
+	EndUnixNano       uint64            `json:"end_unix_nano"`
+	ReceivedUnixMilli uint64            `json:"received_unix_milli"`
 }
 
 type spanIdentity struct {

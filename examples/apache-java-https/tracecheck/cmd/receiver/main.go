@@ -131,6 +131,8 @@ func (r *receiver) reset(writer http.ResponseWriter, _ *http.Request) {
 }
 
 func (r *receiver) traces(writer http.ResponseWriter, request *http.Request) {
+	receivedAt := time.Now()
+
 	if request.Header.Get("Content-Encoding") != "" {
 		writeError(writer, http.StatusUnsupportedMediaType, "compressed OTLP payloads are not enabled")
 		return
@@ -159,7 +161,7 @@ func (r *receiver) traces(writer http.ResponseWriter, request *http.Request) {
 	}
 
 	spans := tracecheck.Flatten(exportRequest.Traces())
-	r.store.Add(spans)
+	r.store.AddAt(spans, receivedAt)
 
 	exportResponse := ptraceotlp.NewExportResponse()
 	if contentType == "application/json" {

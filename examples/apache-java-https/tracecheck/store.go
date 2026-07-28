@@ -6,6 +6,7 @@ package tracecheck
 import (
 	"math"
 	"sync"
+	"time"
 )
 
 type storedSpan struct {
@@ -46,6 +47,15 @@ func NewStore(maxSpans int, maxValueBytes, maxRetainedBytes uint64) *Store {
 }
 
 func (s *Store) Add(spans []Span) {
+	s.AddAt(spans, time.Now())
+}
+
+func (s *Store) AddAt(spans []Span, receivedAt time.Time) {
+	receivedUnixMilli := receivedAt.UnixMilli()
+	if receivedUnixMilli < 0 {
+		receivedUnixMilli = 0
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -53,6 +63,7 @@ func (s *Store) Add(spans []Span) {
 	s.receivedSpans = saturatingAdd(s.receivedSpans, uint64(len(spans)))
 	for _, span := range spans {
 		span = cloneSpan(span)
+		span.ReceivedUnixMilli = uint64(receivedUnixMilli)
 		retainedBytes, valueLimitExceeded, ok := spanRetainedBytes(span, s.maxValueBytes)
 		if valueLimitExceeded {
 			s.recordDrop(&s.droppedValueLimitSpans)

@@ -14,6 +14,13 @@ JAVA_DIAGNOSTIC_COUNTER_MAX="999999999"
 BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS=35
 JAVA_PROVIDER_RETRY_SETTLE_SECONDS=2
 JAVA_ATTACH_FAILURE_QUIET_SAMPLES=15
+DELAYED_OTLP_SCHEDULE_DELAY_SECONDS=60
+DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS="$((DELAYED_OTLP_SCHEDULE_DELAY_SECONDS * 1000))"
+DELAYED_OTLP_PRE_EXPORT_WAIT_SECONDS=5
+DELAYED_OTLP_PRE_EXPORT_SAFETY_SECONDS=1
+DELAYED_OTLP_SUPPRESSION_TIMEOUT_SECONDS=70
+DELAYED_OTLP_PRIME_MARKER="delayed-otlp-suppression-prime"
+DELAYED_OTLP_JAVA_SERVER_SCOPE="io.opentelemetry.jetty-11.0"
 HELPER_ATTACH_FAILURE_JAVA_TOOL_OPTIONS="-javaagent:/otel/official-javaagent.jar -XX:-EnableDynamicAgentLoading"
 TRANSPORT_CONFIGURATION_MAX_BYTES=256
 SCENARIO_RUN_TIMEOUT_SECONDS=120
@@ -59,6 +66,13 @@ readonly MAX_UINT64_DECIMAL JAVA_DIAGNOSTIC_COUNTER_MAX
 readonly BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS SCENARIO_RUN_TIMEOUT_SECONDS
 readonly JAVA_PROVIDER_RETRY_SETTLE_SECONDS
 readonly JAVA_ATTACH_FAILURE_QUIET_SAMPLES
+readonly DELAYED_OTLP_SCHEDULE_DELAY_SECONDS
+readonly DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS
+readonly DELAYED_OTLP_PRE_EXPORT_WAIT_SECONDS
+readonly DELAYED_OTLP_PRE_EXPORT_SAFETY_SECONDS
+readonly DELAYED_OTLP_SUPPRESSION_TIMEOUT_SECONDS
+readonly DELAYED_OTLP_PRIME_MARKER
+readonly DELAYED_OTLP_JAVA_SERVER_SCOPE
 readonly HELPER_ATTACH_FAILURE_JAVA_TOOL_OPTIONS
 readonly TRANSPORT_CONFIGURATION_MAX_BYTES
 readonly PRESSURE_STATE_TIMEOUT_SECONDS PRESSURE_MONITOR_METRICS_TIMEOUT_SECONDS
@@ -180,7 +194,8 @@ Options:
                           pressure, handoff, virtual-thread, netty, netty-server, dispatch,
                           w3c, w3c-match, obi-flags, w3c-fault, w3c-only,
                           security, restart-fault, helper-attach-failure,
-                          fail-open, restart, disabled, or uninstrumented.
+                          delayed-otlp-suppression, fail-open, restart, disabled,
+                          or uninstrumented.
                           Default: all
   --requests COUNT        Requests per scenario (1-1000); scenario default
                           when omitted.
@@ -200,7 +215,7 @@ boundaries, timeout/retry, pressure,
 executor/virtual-thread/Netty handoff, inbound Netty TLS, async redispatch, W3C
 precedence/match/flags/fault/no-state controls, late attach, OBI restart during
 traffic, helper attach failure, bounded primary or fallback transport abuse
-controls, Unix endpoint replacement when that transport is selected,
+controls, delayed first-OTLP suppression, Unix endpoint replacement when that transport is selected,
 bridge/extension-disabled, extension-absent, and uninstrumented controls.
 Evidence is retained under:
   $RESULTS_ROOT
@@ -359,7 +374,7 @@ parse_args() {
       ;;
   esac
   case "$SCENARIO" in
-    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|timeout-retry|pressure|handoff|virtual-thread|netty|netty-server|dispatch|w3c|w3c-match|obi-flags|w3c-fault|w3c-only|security|restart-fault|helper-attach-failure|fail-open|restart|disabled|uninstrumented)
+    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|timeout-retry|pressure|handoff|virtual-thread|netty|netty-server|dispatch|w3c|w3c-match|obi-flags|w3c-fault|w3c-only|security|restart-fault|helper-attach-failure|delayed-otlp-suppression|fail-open|restart|disabled|uninstrumented)
       ;;
     *)
       die "unsupported scenario: $SCENARIO"
@@ -1045,11 +1060,15 @@ export_compose_environment() {
     export OTEL_JAVAAGENT_EXTENSIONS_VALUE="/otel/obi-otel-extension.jar"
     export OTEL_PROPAGATORS_VALUE="obi,tracecontext,baggage"
   fi
+  if [[ "$SCENARIO" == "delayed-otlp-suppression" ]]; then
+    export OTEL_BSP_SCHEDULE_DELAY_VALUE="$DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS"
+  fi
 }
 
 start_stack() {
   local start_status=0
   local startup_since=""
+  local -a recreate_arguments=()
 
   RUN_STAGE="compose-ownership"
   verify_compose_project_ownership || {
@@ -1066,13 +1085,16 @@ start_stack() {
   RUN_STAGE="compose-build-start"
   startup_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" || return $?
   STACK_STARTED=true
+  if [[ "$SCENARIO" == "delayed-otlp-suppression" ]]; then
+    recreate_arguments=(--force-recreate)
+  fi
   if [[ "$SCENARIO" == "uninstrumented" ]]; then
     run_logged_bounded "$RESULT_DIR/compose-up.log" "$COMMAND_TIMEOUT_SECONDS" \
-      "${COMPOSE[@]}" up --build --detach \
+      "${COMPOSE[@]}" up --build --detach "${recreate_arguments[@]}" \
         trace-receiver java-backend apache-proxy || start_status=$?
   else
     run_logged_bounded "$RESULT_DIR/compose-up.log" "$COMMAND_TIMEOUT_SECONDS" \
-      "${COMPOSE[@]}" up --build --detach \
+      "${COMPOSE[@]}" up --build --detach "${recreate_arguments[@]}" \
         trace-receiver java-backend apache-proxy obi || start_status=$?
   fi
   if ((start_status != 0)); then
@@ -1110,7 +1132,9 @@ start_stack() {
       "Netty HTTPS backend ready on 127.0.0.1:18444" \
       "Netty HTTPS backend" \
       "$startup_since" || return $?
-    assert_selected_transport || return $?
+    if [[ "$SCENARIO" != "delayed-otlp-suppression" ]]; then
+      assert_selected_transport || return $?
+    fi
   elif [[ "$SCENARIO" != "uninstrumented" ]]; then
     wait_for_log \
       java-backend \
@@ -1125,6 +1149,14 @@ start_stack() {
       "injected Java instrumentation" \
       "$startup_since" || return $?
     wait_for_apache_instrumentation startup || return $?
+  fi
+  if [[ "$SCENARIO" == "delayed-otlp-suppression" ]]; then
+    wait_for_log \
+      apache-proxy \
+      "resuming normal operations" \
+      "Apache HTTP proxy" \
+      "$startup_since" || return $?
+    return 0
   fi
   wait_for_http \
     "$APACHE_HTTPS_HEALTH_ENDPOINT" \
@@ -1632,6 +1664,7 @@ environment_has_line() {
 
 assert_runtime_contract() {
   local -r mode="${1:-$SCENARIO}"
+  local -r suppression_already_observed="${2:-false}"
   local -r output="$RESULT_DIR/runtime-assertions-$mode.txt"
   local java_container=""
   local java_environment=""
@@ -1640,6 +1673,12 @@ assert_runtime_contract() {
   local java_agent="absent"
   local dynamic_agent_loading="not-configured"
   local extension="absent"
+
+  [[ "$suppression_already_observed" == "false" || \
+    "$suppression_already_observed" == "true" ]] || {
+    log_error "duplicate suppression readiness state must be true or false"
+    return 1
+  }
 
   java_container="$(run_bounded 10 \
     "${COMPOSE[@]}" ps --quiet java-backend)" || return $?
@@ -1670,6 +1709,12 @@ assert_runtime_contract() {
     elif environment_has_line "$java_environment" "OTEL_OBI_REMOTE_PARENT_ENABLED=false"; then
       extension="disabled"
     fi
+  fi
+  if [[ "$mode" == "delayed-otlp-suppression" ]] && ! environment_has_line \
+    "$java_environment" \
+    "OTEL_BSP_SCHEDULE_DELAY=$DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS"; then
+    log_error "delayed OTLP control did not configure the expected Java export delay"
+    return 1
   fi
 
   if [[ "$mode" == "uninstrumented" ]]; then
@@ -1757,8 +1802,10 @@ assert_runtime_contract() {
       log_error "host vmlinux BTF is not readable"
       return 1
     }
-    wait_for_java_duplicate_suppression \
-      "$RESULT_DIR/duplicate-suppression-$mode.prom" || return $?
+    if [[ "$suppression_already_observed" == "false" ]]; then
+      wait_for_java_duplicate_suppression \
+        "$RESULT_DIR/duplicate-suppression-$mode.prom" || return $?
+    fi
   fi
 
   {
@@ -1775,14 +1822,22 @@ assert_runtime_contract() {
 
 wait_for_java_duplicate_suppression() {
   local -r output="$1"
+
+  run_bounded 10 curl --fail --silent --show-error \
+    "$APACHE_HTTPS_HEALTH_ENDPOINT" >/dev/null || return $?
+  wait_for_java_duplicate_suppression_without_prime "$output"
+}
+
+wait_for_java_duplicate_suppression_without_prime() {
+  local -r output="$1"
+  local -r timeout_seconds="${2:-20}"
   local metrics=""
   local -i elapsed=0
   local status=0
 
-  run_bounded 10 curl --fail --silent --show-error \
-    "$APACHE_HTTPS_HEALTH_ENDPOINT" >/dev/null || return $?
+  [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || return 1
   metrics="$(mktemp "$RESULT_DIR/.duplicate-suppression.XXXXXX")" || return $?
-  while ((elapsed < 20)); do
+  while ((elapsed < timeout_seconds)); do
     if fetch_obi_metrics "$metrics" 2>/dev/null && \
       java_duplicate_suppression_present "$metrics"; then
       if install -m 0644 "$metrics" "$output"; then
@@ -1819,6 +1874,284 @@ java_duplicate_suppression_present() {
     $0 ~ /telemetry_type="traces"/ && $2 > 0 { found = 1 }
     END { exit found ? 0 : 1 }
   ' "$metrics"
+}
+
+assert_java_duplicate_suppression_absent() {
+  local -r output="$1"
+  local metrics=""
+  local status=0
+
+  metrics="$(mktemp "$RESULT_DIR/.duplicate-suppression.XXXXXX")" || return $?
+  if fetch_obi_metrics "$metrics"; then
+    :
+  else
+    status=$?
+    rm -f -- "$metrics" || true
+    return "$status"
+  fi
+  if java_duplicate_suppression_present "$metrics"; then
+    rm -f -- "$metrics" || true
+    log_error "OBI reported Java duplicate-trace suppression before delayed export readiness"
+    return 1
+  fi
+  if install -m 0644 "$metrics" "$output"; then
+    :
+  else
+    status=$?
+    rm -f -- "$metrics" || true
+    return "$status"
+  fi
+  rm -f -- "$metrics" || return $?
+}
+
+fetch_delayed_otlp_receiver_snapshot() {
+  local -r output="$1"
+
+  run_bounded 10 curl --fail --silent --show-error \
+    --get --data-urlencode "marker=$DELAYED_OTLP_PRIME_MARKER" \
+    --output "$output" \
+    "http://127.0.0.1:14318/snapshot"
+}
+
+delayed_otlp_receiver_snapshot_is_empty() {
+  local -r snapshot="$1"
+
+  jq -e --arg marker "$DELAYED_OTLP_PRIME_MARKER" '
+    .marker == $marker and
+    .received_batches == 0 and
+    .received_spans == 0 and
+    (.spans | type == "array" and length == 0)
+  ' "$snapshot" >/dev/null
+}
+
+delayed_otlp_receiver_snapshot_has_java_export() {
+  local -r snapshot="$1"
+
+  jq -e --arg marker "$DELAYED_OTLP_PRIME_MARKER" \
+    --arg scope "$DELAYED_OTLP_JAVA_SERVER_SCOPE" '
+    .marker == $marker and
+    .received_batches > 0 and
+    .received_spans > 0 and
+    (.spans | type == "array") and
+    ([.spans[] |
+      select(
+        .service_name == "java-backend" and
+        .kind == "SERVER" and
+        .attributes["http.request.header.x-obi-demo-id"] == $marker
+      )] | length == 1) and
+    ([.spans[] |
+      select(
+        .service_name == "java-backend" and
+        .kind == "SERVER" and
+        .scope_name == $scope and
+        .attributes["http.request.header.x-obi-demo-id"] == $marker
+      )] as $java_sdk_servers |
+      ($java_sdk_servers | length == 1) and
+      ($java_sdk_servers[0].received_unix_milli | type == "number") and
+      ($java_sdk_servers[0].received_unix_milli > 0))
+  ' "$snapshot" >/dev/null
+}
+
+delayed_otlp_receiver_snapshot_has_java_export_before_deadline() {
+  local -r snapshot="$1"
+  local -r earliest_export_millisecond="$2"
+
+  [[ "$earliest_export_millisecond" =~ ^[0-9]+$ ]] || return 1
+  jq -e --arg marker "$DELAYED_OTLP_PRIME_MARKER" \
+    --arg scope "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
+    --argjson earliest_export_millisecond "$earliest_export_millisecond" '
+    .marker == $marker and
+    (.spans | type == "array") and
+    ([.spans[] |
+      select(
+        .service_name == "java-backend" and
+        .kind == "SERVER" and
+        .scope_name == $scope and
+        .attributes["http.request.header.x-obi-demo-id"] == $marker and
+        (.received_unix_milli | type == "number") and
+        .received_unix_milli < $earliest_export_millisecond
+      )] | length > 0)
+  ' "$snapshot" >/dev/null
+}
+
+delayed_otlp_receiver_snapshot_has_java_export_at_or_after_deadline() {
+  local -r snapshot="$1"
+  local -r earliest_export_millisecond="$2"
+
+  [[ "$earliest_export_millisecond" =~ ^[0-9]+$ ]] || return 1
+  delayed_otlp_receiver_snapshot_has_java_export "$snapshot" || return 1
+  jq -e --arg marker "$DELAYED_OTLP_PRIME_MARKER" \
+    --arg scope "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
+    --argjson earliest_export_millisecond "$earliest_export_millisecond" '
+    [.spans[] |
+      select(
+        .service_name == "java-backend" and
+        .kind == "SERVER" and
+        .scope_name == $scope and
+        .attributes["http.request.header.x-obi-demo-id"] == $marker
+      )] as $java_sdk_servers |
+    $java_sdk_servers[0].received_unix_milli >= $earliest_export_millisecond
+  ' "$snapshot" >/dev/null
+}
+
+assert_delayed_otlp_receiver_empty() {
+  local -r output="$1"
+
+  fetch_delayed_otlp_receiver_snapshot "$output" || return $?
+  if ! delayed_otlp_receiver_snapshot_is_empty "$output"; then
+    log_error "trace receiver accepted an OTLP export before delayed export readiness"
+    return 1
+  fi
+}
+
+delayed_otlp_receiver_snapshot_has_no_java_export() {
+  local -r snapshot="$1"
+
+  jq -e --arg marker "$DELAYED_OTLP_PRIME_MARKER" \
+    --arg scope "$DELAYED_OTLP_JAVA_SERVER_SCOPE" '
+      .marker == $marker and
+      (.spans | type == "array") and
+      ([.spans[] |
+        select(
+          .service_name == "java-backend" and
+          .kind == "SERVER" and
+          .scope_name == $scope and
+          .attributes["http.request.header.x-obi-demo-id"] == $marker
+        )] | length == 0)
+    ' "$snapshot" >/dev/null
+}
+
+assert_delayed_otlp_receiver_has_no_java_export() {
+  local -r output="$1"
+
+  fetch_delayed_otlp_receiver_snapshot "$output" || return $?
+  if ! delayed_otlp_receiver_snapshot_has_no_java_export "$output"; then
+    log_error "trace receiver accepted the delayed Java OTLP export before readiness"
+    return 1
+  fi
+}
+
+wait_for_delayed_otlp_receiver_export() {
+  local -r output="$1"
+  local -r timeout_seconds="${2:-$DELAYED_OTLP_SUPPRESSION_TIMEOUT_SECONDS}"
+  local -r earliest_export_millisecond="${3:-}"
+  local -r early_output="${4:-$output}"
+  local snapshot=""
+  local -i elapsed=0
+  local status=0
+
+  [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ "$earliest_export_millisecond" =~ ^[0-9]+$ ]] || return 1
+  snapshot="$(mktemp "$RESULT_DIR/.delayed-otlp-receiver.XXXXXX")" || return $?
+  while ((elapsed < timeout_seconds)); do
+    if fetch_delayed_otlp_receiver_snapshot "$snapshot"; then
+      :
+    else
+      status=$?
+      rm -f -- "$snapshot" || true
+      return "$status"
+    fi
+    if delayed_otlp_receiver_snapshot_has_no_java_export "$snapshot"; then
+      :
+    elif delayed_otlp_receiver_snapshot_has_java_export_before_deadline \
+      "$snapshot" "$earliest_export_millisecond"; then
+      if install -m 0644 "$snapshot" "$early_output"; then
+        :
+      else
+        status=$?
+        rm -f -- "$snapshot" || true
+        return "$status"
+      fi
+      rm -f -- "$snapshot" || return $?
+      log_error "trace receiver accepted the delayed Java OTLP export before its configured deadline"
+      return 1
+    elif delayed_otlp_receiver_snapshot_has_java_export_at_or_after_deadline \
+      "$snapshot" "$earliest_export_millisecond"; then
+      if install -m 0644 "$snapshot" "$output"; then
+        :
+      else
+        status=$?
+        rm -f -- "$snapshot" || true
+        return "$status"
+      fi
+      rm -f -- "$snapshot" || return $?
+      return 0
+    else
+      rm -f -- "$snapshot" || true
+      log_error "trace receiver retained an unexpected delayed Java server span"
+      return 1
+    fi
+    if sleep 1; then
+      :
+    else
+      status=$?
+      rm -f -- "$snapshot" || true
+      return "$status"
+    fi
+    ((elapsed += 1))
+  done
+  rm -f -- "$snapshot" || return $?
+  log_error "trace receiver did not retain the delayed Java OTLP export"
+  return 1
+}
+
+java_backend_started_millisecond() {
+  local java_container=""
+  local started_at=""
+  local millisecond=""
+
+  java_container="$(run_bounded 10 "${COMPOSE[@]}" ps --quiet java-backend)" || return $?
+  [[ -n "$java_container" ]] || return 1
+  started_at="$(run_bounded 10 docker inspect --format '{{.State.StartedAt}}' "$java_container")" ||
+    return $?
+  [[ "$started_at" == *Z ]] || return 1
+  millisecond="$(date -u --date="$started_at" +%s%3N)" || return $?
+  [[ "$millisecond" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$millisecond"
+}
+
+delayed_otlp_earliest_export_millisecond() {
+  local java_started_millisecond=""
+
+  java_started_millisecond="$(java_backend_started_millisecond)" || return $?
+  printf '%s\n' "$((java_started_millisecond + DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS))"
+}
+
+assert_delayed_otlp_pre_export_window() {
+  local -r output="$1"
+  local -r expected_earliest_export_millisecond="${2:-}"
+  local java_started_millisecond=""
+  local current_millisecond=""
+  local -i earliest_export_millisecond=0
+
+  java_started_millisecond="$(java_backend_started_millisecond)" || return $?
+  current_millisecond="$(date -u +%s%3N)" || return $?
+  [[ "$current_millisecond" =~ ^[0-9]+$ ]] || return 1
+  if [[ -n "$expected_earliest_export_millisecond" ]]; then
+    [[ "$expected_earliest_export_millisecond" =~ ^[0-9]+$ ]] || return 1
+    [[ "$expected_earliest_export_millisecond" == \
+      "$((java_started_millisecond + DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS))" ]] || {
+      log_error "Java backend generation changed before delayed OTLP observation"
+      return 1
+    }
+    earliest_export_millisecond="$expected_earliest_export_millisecond"
+  else
+    earliest_export_millisecond="$((java_started_millisecond + DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS))"
+  fi
+  if ((current_millisecond +
+    (DELAYED_OTLP_PRE_EXPORT_WAIT_SECONDS + DELAYED_OTLP_PRE_EXPORT_SAFETY_SECONDS) * 1000 >=
+    earliest_export_millisecond)); then
+    log_error "cold Java startup did not leave the required delayed OTLP observation window"
+    return 1
+  fi
+  {
+    printf 'java_started_millisecond=%s\n' "$java_started_millisecond"
+    printf 'prime_millisecond=%s\n' "$current_millisecond"
+    printf 'earliest_export_millisecond=%s\n' "$earliest_export_millisecond"
+    printf 'schedule_delay_milliseconds=%s\n' "$DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS"
+    printf 'pre_export_wait_seconds=%s\n' "$DELAYED_OTLP_PRE_EXPORT_WAIT_SECONDS"
+    printf 'pre_export_safety_seconds=%s\n' "$DELAYED_OTLP_PRE_EXPORT_SAFETY_SECONDS"
+  } >"$output" || return $?
 }
 
 fetch_obi_metrics() {
@@ -4031,7 +4364,22 @@ recreate_instrumented_stack() {
   local -r propagation="$1"
   local -r label="$2"
   local -r transport="${3:-$TRANSPORT}"
+  local -r verify_java_traffic="${4:-true}"
+  local -r fresh_trace_receiver="${5:-false}"
   local recreate_since=""
+  local -a services=(java-backend apache-proxy obi)
+
+  [[ "$verify_java_traffic" == "true" || "$verify_java_traffic" == "false" ]] || {
+    log_error "Java traffic verification mode must be true or false"
+    return 1
+  }
+  [[ "$fresh_trace_receiver" == "true" || "$fresh_trace_receiver" == "false" ]] || {
+    log_error "trace receiver recreation mode must be true or false"
+    return 1
+  }
+  if [[ "$fresh_trace_receiver" == "true" ]]; then
+    services=(trace-receiver "${services[@]}")
+  fi
 
   CONTEXT_PROPAGATION="$propagation"
   export CONTEXT_PROPAGATION
@@ -4047,7 +4395,11 @@ recreate_instrumented_stack() {
   BRIDGE_RUNNING=false
   run_bounded 180 \
     "${COMPOSE[@]}" up --detach --force-recreate \
-      java-backend apache-proxy obi || return $?
+      "${services[@]}" || return $?
+  if [[ "$fresh_trace_receiver" == "true" ]]; then
+    wait_for_http "http://127.0.0.1:14318/healthz" \
+      "$label trace receiver" || return $?
+  fi
   wait_for_log \
     obi \
     "Java remote parent bridge ready" \
@@ -4079,11 +4431,106 @@ recreate_instrumented_stack() {
     "$label Netty HTTPS backend" \
     "$recreate_since" || return $?
   BRIDGE_RUNNING=true
-  assert_selected_transport "$transport" || return $?
+  if [[ "$verify_java_traffic" == "true" ]]; then
+    assert_selected_transport "$transport" || return $?
+  fi
   wait_for_apache_instrumentation recreate-instrumented || return $?
+  if [[ "$verify_java_traffic" == "false" ]]; then
+    wait_for_log \
+      apache-proxy \
+      "resuming normal operations" \
+      "$label Apache HTTP proxy" \
+      "$recreate_since" || return $?
+    return 0
+  fi
   wait_for_http "$APACHE_HTTPS_HEALTH_ENDPOINT" "$label HTTPS path" || return $?
   wait_for_java_duplicate_suppression \
     "$RESULT_DIR/duplicate-suppression-${label// /-}.prom" || return $?
+}
+
+run_delayed_otlp_suppression_sequence() {
+  local scenario_status=0
+  local earliest_export_millisecond=""
+
+  earliest_export_millisecond="$(delayed_otlp_earliest_export_millisecond)" || return $?
+  assert_delayed_otlp_receiver_empty \
+    "$RESULT_DIR/delayed-otlp-receiver-before-request.json" || return $?
+  assert_java_duplicate_suppression_absent \
+    "$RESULT_DIR/duplicate-suppression-delayed-otlp-before-request.prom" || return $?
+  run_bounded 10 curl --fail --silent --show-error \
+    --header "x-obi-demo-id: $DELAYED_OTLP_PRIME_MARKER" \
+    "$APACHE_HTTPS_HEALTH_ENDPOINT" >/dev/null || return $?
+  assert_delayed_otlp_pre_export_window \
+    "$RESULT_DIR/delayed-otlp-window.txt" \
+    "$earliest_export_millisecond" || return $?
+  sleep "$DELAYED_OTLP_PRE_EXPORT_WAIT_SECONDS" || return $?
+  assert_delayed_otlp_receiver_has_no_java_export \
+    "$RESULT_DIR/delayed-otlp-receiver-before-export.json" || return $?
+  assert_java_duplicate_suppression_absent \
+    "$RESULT_DIR/duplicate-suppression-delayed-otlp-before-export.prom" || return $?
+  wait_for_delayed_otlp_receiver_export \
+    "$RESULT_DIR/delayed-otlp-receiver-ready.json" \
+    "$DELAYED_OTLP_SUPPRESSION_TIMEOUT_SECONDS" \
+    "$earliest_export_millisecond" \
+    "$RESULT_DIR/delayed-otlp-receiver-early.json" || return $?
+  wait_for_java_duplicate_suppression_without_prime \
+    "$RESULT_DIR/duplicate-suppression-delayed-otlp-ready.prom" \
+    "$DELAYED_OTLP_SUPPRESSION_TIMEOUT_SECONDS" || return $?
+  assert_selected_transport || return $?
+  assert_runtime_contract delayed-otlp-suppression true || return $?
+  SCENARIO_VARIANT="delayed-otlp-suppression"
+  if run_scenario basic; then
+    SCENARIO_VARIANT=""
+  else
+    scenario_status=$?
+    SCENARIO_VARIANT=""
+    return "$scenario_status"
+  fi
+}
+
+run_delayed_otlp_suppression_control() {
+  local schedule_delay_previous=""
+  local schedule_delay_was_set=false
+  local control_status=0
+
+  if [[ "$SCENARIO" == "all" ]]; then
+    if [[ -v OTEL_BSP_SCHEDULE_DELAY_VALUE ]]; then
+      schedule_delay_was_set=true
+      schedule_delay_previous="$OTEL_BSP_SCHEDULE_DELAY_VALUE"
+    fi
+    export OTEL_BSP_SCHEDULE_DELAY_VALUE="$DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS"
+    if recreate_instrumented_stack \
+      tcp "delayed-otlp-suppression startup" "$TRANSPORT" false true; then
+      :
+    else
+      control_status=$?
+    fi
+  fi
+
+  if ((control_status == 0)); then
+    if run_delayed_otlp_suppression_sequence; then
+      :
+    else
+      control_status=$?
+    fi
+  fi
+
+  if [[ "$SCENARIO" == "all" ]]; then
+    if [[ "$schedule_delay_was_set" == "true" ]]; then
+      export OTEL_BSP_SCHEDULE_DELAY_VALUE="$schedule_delay_previous"
+    else
+      unset OTEL_BSP_SCHEDULE_DELAY_VALUE
+    fi
+    if ((control_status != 0)); then
+      log_warn "restoring the standard instrumented stack after delayed OTLP control failure"
+      recreate_instrumented_stack \
+        tcp "post-delayed-otlp suppression recovery" || true
+      return "$control_status"
+    fi
+    recreate_instrumented_stack \
+      tcp "post-delayed-otlp suppression restoration" || return $?
+  fi
+  return "$control_status"
 }
 
 capture_service_runtime_identity() {
@@ -5672,6 +6119,7 @@ execute_requested_scenarios() {
   case "$SCENARIO" in
     all)
       run_scenario basic
+      run_delayed_otlp_suppression_control
       run_security_control
       run_scenario keepalive
       run_scenario pipelining
@@ -5740,6 +6188,9 @@ execute_requested_scenarios() {
       ;;
     helper-attach-failure)
       run_helper_attach_failure_control
+      ;;
+    delayed-otlp-suppression)
+      run_delayed_otlp_suppression_control
       ;;
     w3c-match)
       run_w3c_match_control
@@ -6986,10 +7437,17 @@ run_demo() {
   RUN_STAGE="environment-evidence"
   capture_environment
   start_stack
-  RUN_STAGE="runtime-evidence"
-  capture_runtime_evidence
   RUN_STAGE="scenarios"
-  execute_requested_scenarios
+  if [[ "$SCENARIO" == "delayed-otlp-suppression" ]]; then
+    execute_requested_scenarios
+    RUN_STAGE="runtime-evidence"
+    capture_runtime_evidence
+  else
+    RUN_STAGE="runtime-evidence"
+    capture_runtime_evidence
+    RUN_STAGE="scenarios"
+    execute_requested_scenarios
+  fi
   RUN_STATUS="passed"
   RUN_STAGE="complete"
   log_info "all requested assertions passed; evidence: $RESULT_DIR"

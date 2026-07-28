@@ -914,6 +914,25 @@ test_control_modes_are_distinct() {
     printf 'rejected the uninstrumented control\n' >&2
     return 1
   }
+  (
+    TRANSPORT="getsockopt"
+    SCENARIO="all"
+    parse_args --transport getsockopt --scenario delayed-otlp-suppression
+    [[ "$TRANSPORT" == "getsockopt" && "$SCENARIO" == "delayed-otlp-suppression" ]]
+  ) || {
+    printf 'rejected the delayed OTLP suppression control\n' >&2
+    return 1
+  }
+  (
+    SCENARIO="delayed-otlp-suppression"
+    unset OTEL_BSP_SCHEDULE_DELAY_VALUE
+    export_compose_environment
+    [[ "$OTEL_BSP_SCHEDULE_DELAY_VALUE" == \
+      "$DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS" ]]
+  ) || {
+    printf 'delayed OTLP suppression did not configure its export delay\n' >&2
+    return 1
+  }
   if (
     TRANSPORT="getsockopt"
     SCENARIO="all"
@@ -953,7 +972,7 @@ test_benchmark_controls_are_bounded() {
 
 test_all_suite_includes_every_scenario() {
   local -r actual="$TEST_TMP_DIR/all-scenarios.txt"
-  local -r expected=$'basic\nsecurity\nkeepalive\npipelining\nconcurrency\nconnection-churn\nfd-port-reuse\nslow-body\ntls-boundary\ntimeout-retry\npressure\nhandoff\nvirtual-thread\nnetty\nnetty-server\ndispatch\nw3c\nw3c-match\nobi-flags\nfail-open\nw3c-only\nrestart\nrestart-fault\nhelper-attach-failure\ndisabled\nw3c-only\nw3c-only\nuninstrumented'
+  local -r expected=$'basic\nbasic\nsecurity\nkeepalive\npipelining\nconcurrency\nconnection-churn\nfd-port-reuse\nslow-body\ntls-boundary\ntimeout-retry\npressure\nhandoff\nvirtual-thread\nnetty\nnetty-server\ndispatch\nw3c\nw3c-match\nobi-flags\nfail-open\nw3c-only\nrestart\nrestart-fault\nhelper-attach-failure\ndisabled\nw3c-only\nw3c-only\nuninstrumented'
 
   (
     SCENARIO=all
@@ -974,6 +993,9 @@ test_all_suite_includes_every_scenario() {
     }
     run_primary_security_control() {
       run_scenario security
+    }
+    run_delayed_otlp_suppression_control() {
+      run_scenario basic
     }
     run_disabled_control() {
       run_scenario disabled
@@ -1019,6 +1041,9 @@ test_unix_all_suite_includes_fault_control() {
     run_unix_security_control() {
       run_scenario security
     }
+    run_delayed_otlp_suppression_control() {
+      run_scenario basic
+    }
     run_late_attach_control() {
       run_scenario fail-open
       run_scenario w3c-only
@@ -1043,7 +1068,7 @@ test_unix_all_suite_includes_fault_control() {
     execute_requested_scenarios
   )
 
-  [[ "$(<"$actual")" == *$'basic\nsecurity\nkeepalive'* && \
+  [[ "$(<"$actual")" == *$'basic\nbasic\nsecurity\nkeepalive'* && \
     "$(<"$actual")" == *$'obi-flags\nw3c-fault\nfail-open'* &&
     "$(<"$actual")" == *$'restart\nrestart-fault\nhelper-attach-failure'* ]] || {
     printf 'Unix all suite omitted the security or bounded W3C fault control\n' >&2
@@ -1117,6 +1142,7 @@ test_run_demo_preserves_strict_scenario_execution() {
     run_scenario() {
       printf 'scenario:%s\n' "$1" >>"$nested_observed"
     }
+    run_delayed_otlp_suppression_control() { :; }
     injected_security_failure() {
       return 23
     }
@@ -1136,6 +1162,49 @@ test_run_demo_preserves_strict_scenario_execution() {
   [[ "$demo_status" == "23" &&
     "$(<"$nested_observed")" == $'scenario:basic\nsecurity-entered' ]] || {
     printf 'run_demo suppressed a nested scenario failure\n' >&2
+    return 1
+  }
+}
+
+test_delayed_otlp_run_demo_defers_runtime_evidence() {
+  local -r observed="$TEST_TMP_DIR/delayed-otlp-run-demo-order"
+
+  (
+    set -Eeuo pipefail
+    install_traps() { :; }
+    parse_args() {
+      CLEANUP_ONLY=false
+      SCENARIO=delayed-otlp-suppression
+      TRANSPORT=getsockopt
+    }
+    check_dependencies() { :; }
+    prepare_directories() { :; }
+    capture_source_state() { :; }
+    prepare_certificates() { :; }
+    prepare_official_agent() { :; }
+    prepare_bridge_artifacts() { :; }
+    export_compose_environment() { :; }
+    capture_environment() { :; }
+    start_stack() {
+      printf 'stack\n' >>"$observed"
+    }
+    execute_requested_scenarios() {
+      printf 'control\n' >>"$observed"
+    }
+    capture_runtime_evidence() {
+      printf 'runtime-evidence\n' >>"$observed"
+    }
+
+    RUN_STATUS=failed
+    run_demo
+    [[ "$RUN_STATUS" == "passed" ]]
+  ) || {
+    printf 'delayed OTLP run demo did not complete in the expected order\n' >&2
+    return 1
+  }
+
+  [[ "$(<"$observed")" == $'stack\ncontrol\nruntime-evidence' ]] || {
+    printf 'delayed OTLP runtime evidence ran before the controlled request\n' >&2
     return 1
   }
 }
@@ -1860,6 +1929,552 @@ test_duplicate_suppression_wait_primes_java_export() {
   fi
   [[ "$failure_status" == "31" &&
     ! -e "$result_dir/sleep-failure.prom" ]] || return 1
+}
+
+test_duplicate_suppression_absence_requires_a_clean_metric_snapshot() {
+  local -r result_dir="$TEST_TMP_DIR/duplicate-suppression-absence"
+  local -r output="$result_dir/absent.prom"
+  local failure_status=0
+
+  mkdir -p -- "$result_dir"
+  (
+    RESULT_DIR="$result_dir"
+    fetch_obi_metrics() {
+      printf '# no Java duplicate suppression\n' >"$1"
+    }
+
+    assert_java_duplicate_suppression_absent "$output"
+  ) || {
+    printf 'duplicate suppression absence rejected an empty metric state\n' >&2
+    return 1
+  }
+  [[ "$(<"$output")" == '# no Java duplicate suppression' ]] || return 1
+
+  if (
+    RESULT_DIR="$result_dir"
+    fetch_obi_metrics() {
+      printf '%s\n' \
+        'obi_avoided_services{service_name="java-backend",service_namespace="apache-java-https",telemetry_type="traces"} 1' \
+        >"$1"
+    }
+
+    assert_java_duplicate_suppression_absent "$result_dir/present.prom"
+  ) >/dev/null 2>&1; then
+    printf 'duplicate suppression absence accepted a positive metric\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "1" && ! -e "$result_dir/present.prom" ]] || return 1
+
+  if (
+    RESULT_DIR="$result_dir"
+    fetch_obi_metrics() { return 23; }
+
+    assert_java_duplicate_suppression_absent "$result_dir/fetch-failure.prom"
+  ) >/dev/null 2>&1; then
+    printf 'duplicate suppression absence ignored a metrics fetch failure\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "23" && ! -e "$result_dir/fetch-failure.prom" ]] || return 1
+
+  if (
+    RESULT_DIR="$result_dir"
+    fetch_obi_metrics() {
+      printf '# no Java duplicate suppression\n' >"$1"
+    }
+    install() { return 29; }
+
+    assert_java_duplicate_suppression_absent "$result_dir/install-failure.prom"
+  ) >/dev/null 2>&1; then
+    printf 'duplicate suppression absence ignored an evidence publication failure\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "29" && ! -e "$result_dir/install-failure.prom" ]] || return 1
+}
+
+test_delayed_otlp_window_requires_a_fresh_generation() {
+  local -r result_dir="$TEST_TMP_DIR/delayed-otlp-window"
+  local -r output="$result_dir/window.txt"
+  local current_millisecond=""
+  local failure_status=0
+  local -i expected_current=0
+
+  mkdir -p -- "$result_dir"
+  expected_current="$((
+    100000 + DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS -
+      (DELAYED_OTLP_PRE_EXPORT_WAIT_SECONDS + DELAYED_OTLP_PRE_EXPORT_SAFETY_SECONDS) * 1000 - 1
+  ))"
+  (
+    java_backend_started_millisecond() { printf '100000\n'; }
+    date() { printf '%s\n' "$expected_current"; }
+
+    assert_delayed_otlp_pre_export_window "$output"
+  ) || {
+    printf 'delayed OTLP window rejected a fresh Java generation\n' >&2
+    return 1
+  }
+  current_millisecond="$expected_current"
+  grep -Fqx 'java_started_millisecond=100000' "$output"
+  grep -Fqx "prime_millisecond=$current_millisecond" "$output"
+  grep -Fqx "earliest_export_millisecond=$((100000 + DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS))" "$output"
+  grep -Fqx "schedule_delay_milliseconds=$DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS" "$output"
+  grep -Fqx "pre_export_wait_seconds=$DELAYED_OTLP_PRE_EXPORT_WAIT_SECONDS" "$output"
+  grep -Fqx "pre_export_safety_seconds=$DELAYED_OTLP_PRE_EXPORT_SAFETY_SECONDS" "$output"
+
+  if (
+    java_backend_started_millisecond() { printf '100000\n'; }
+    date() {
+      printf '%s\n' "$((
+        100000 + DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS -
+          (DELAYED_OTLP_PRE_EXPORT_WAIT_SECONDS + DELAYED_OTLP_PRE_EXPORT_SAFETY_SECONDS) * 1000
+      ))"
+    }
+
+    assert_delayed_otlp_pre_export_window "$result_dir/expired-window.txt"
+  ) >/dev/null 2>&1; then
+    printf 'delayed OTLP window accepted an export deadline boundary\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "1" && ! -e "$result_dir/expired-window.txt" ]] || return 1
+}
+
+test_delayed_otlp_receiver_snapshots_prove_export_boundary() {
+  local -r snapshot="$TEST_TMP_DIR/delayed-otlp-receiver.json"
+
+  printf '{"marker":"%s","received_batches":0,"received_spans":0,"spans":[]}' \
+    "$DELAYED_OTLP_PRIME_MARKER" >"$snapshot"
+  delayed_otlp_receiver_snapshot_is_empty "$snapshot" || {
+    printf 'delayed OTLP receiver rejected an empty startup snapshot\n' >&2
+    return 1
+  }
+  if delayed_otlp_receiver_snapshot_has_java_export "$snapshot"; then
+    printf 'delayed OTLP receiver treated an empty snapshot as a Java export\n' >&2
+    return 1
+  fi
+
+  printf '%s' \
+    '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
+    '","received_batches":1,"received_spans":2,"spans":[{"service_name":"apache","kind":"CLIENT","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"}},{"service_name":"java-backend","scope_name":"' \
+    "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
+    '","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"},"received_unix_milli":101000}]}' >"$snapshot"
+  delayed_otlp_receiver_snapshot_has_java_export "$snapshot" || {
+    printf 'delayed OTLP receiver rejected the marked Java server export\n' >&2
+    return 1
+  }
+  if delayed_otlp_receiver_snapshot_has_no_java_export "$snapshot"; then
+    printf 'delayed OTLP receiver missed the marked Java SDK export\n' >&2
+    return 1
+  fi
+  if delayed_otlp_receiver_snapshot_is_empty "$snapshot"; then
+    printf 'delayed OTLP receiver accepted an early export snapshot\n' >&2
+    return 1
+  fi
+  delayed_otlp_receiver_snapshot_has_java_export_before_deadline "$snapshot" 101001 || {
+    printf 'delayed OTLP receiver missed an early receipt timestamp\n' >&2
+    return 1
+  }
+  delayed_otlp_receiver_snapshot_has_java_export_at_or_after_deadline "$snapshot" 101000 || {
+    printf 'delayed OTLP receiver rejected a receipt timestamp at its deadline\n' >&2
+    return 1
+  }
+
+  printf '%s' \
+    '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
+    '","received_batches":1,"received_spans":1,"spans":[{"service_name":"java-backend","scope_name":"' \
+    "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
+    '","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"}}]}' >"$snapshot"
+  if delayed_otlp_receiver_snapshot_has_java_export "$snapshot"; then
+    printf 'delayed OTLP receiver accepted a Java server without a receipt timestamp\n' >&2
+    return 1
+  fi
+
+  printf '%s' \
+    '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
+    '","received_batches":2,"received_spans":4,"spans":[{"service_name":"apache","kind":"CLIENT","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"}}]}' >"$snapshot"
+  if ! delayed_otlp_receiver_snapshot_has_no_java_export "$snapshot"; then
+    printf 'Apache-only delayed OTLP snapshot unexpectedly had a Java SDK export\n' >&2
+    return 1
+  fi
+
+  printf '%s' \
+    '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
+    '","received_batches":1,"received_spans":1,"spans":[{"service_name":"java-backend","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"other-request"}}]}' >"$snapshot"
+  if delayed_otlp_receiver_snapshot_has_java_export "$snapshot"; then
+    printf 'delayed OTLP receiver accepted a Java export from another request\n' >&2
+    return 1
+  fi
+
+  printf '%s' \
+    '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
+    '","received_batches":1,"received_spans":1,"spans":[{"service_name":"java-backend","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"}}]}' >"$snapshot"
+  if delayed_otlp_receiver_snapshot_has_java_export "$snapshot"; then
+    printf 'delayed OTLP receiver accepted an unscoped Java server span\n' >&2
+    return 1
+  fi
+
+  printf '%s' \
+    '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
+    '","received_batches":1,"received_spans":2,"spans":[{"service_name":"java-backend","scope_name":"' \
+    "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
+    '","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"},"received_unix_milli":101000},{"service_name":"java-backend","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"}}]}' >"$snapshot"
+  if delayed_otlp_receiver_snapshot_has_java_export "$snapshot"; then
+    printf 'delayed OTLP receiver accepted a duplicate Java server span\n' >&2
+    return 1
+  fi
+}
+
+test_delayed_otlp_receiver_wait_enforces_export_deadline() {
+  local -r result_dir="$TEST_TMP_DIR/delayed-otlp-receiver-deadline"
+  local -r early_fixture="$result_dir/java-export-early.json"
+  local -r ready_fixture="$result_dir/java-export-ready.json"
+  local failure_status=0
+
+  mkdir -p -- "$result_dir"
+  printf '%s' \
+    '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
+    '","received_batches":1,"received_spans":1,"spans":[{"service_name":"java-backend","scope_name":"' \
+    "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
+    '","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"},"received_unix_milli":100999}]}' >"$early_fixture"
+  printf '%s' \
+    '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
+    '","received_batches":1,"received_spans":1,"spans":[{"service_name":"java-backend","scope_name":"' \
+    "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
+    '","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"},"received_unix_milli":101000}]}' >"$ready_fixture"
+
+  if (
+    RESULT_DIR="$result_dir"
+    fetch_delayed_otlp_receiver_snapshot() {
+      install -m 0644 "$early_fixture" "$1"
+    }
+    date() { return 1; }
+    log_error() { :; }
+
+    wait_for_delayed_otlp_receiver_export \
+      "$result_dir/ready-early.json" 1 101000 "$result_dir/early.json"
+  ) >/dev/null 2>&1; then
+    printf 'delayed OTLP receiver accepted an export before its deadline\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "1" && ! -e "$result_dir/ready-early.json" &&
+    "$(<"$result_dir/early.json")" == "$(<"$early_fixture")" ]] || {
+    printf 'delayed OTLP receiver did not retain the early export evidence\n' >&2
+    return 1
+  }
+
+  (
+    RESULT_DIR="$result_dir"
+    fetch_delayed_otlp_receiver_snapshot() {
+      install -m 0644 "$ready_fixture" "$1"
+    }
+    date() { return 1; }
+
+    wait_for_delayed_otlp_receiver_export \
+      "$result_dir/ready.json" 1 101000 "$result_dir/early-success.json"
+  ) || {
+    printf 'delayed OTLP receiver rejected an export at its deadline\n' >&2
+    return 1
+  }
+  [[ "$(<"$result_dir/ready.json")" == "$(<"$ready_fixture")" &&
+    ! -e "$result_dir/early-success.json" ]] || {
+    printf 'delayed OTLP receiver did not retain the deadline-ready snapshot\n' >&2
+    return 1
+  }
+
+  if (
+    RESULT_DIR="$result_dir"
+    fetch_delayed_otlp_receiver_snapshot() { return 23; }
+
+    wait_for_delayed_otlp_receiver_export \
+      "$result_dir/fetch-failure.json" 1 101000 "$result_dir/fetch-early.json"
+  ) >/dev/null 2>&1; then
+    printf 'delayed OTLP receiver ignored a snapshot fetch failure\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "23" && ! -e "$result_dir/fetch-failure.json" &&
+    ! -e "$result_dir/fetch-early.json" ]] || {
+    printf 'delayed OTLP receiver did not fail closed on a snapshot fetch gap\n' >&2
+    return 1
+  }
+}
+
+test_delayed_otlp_suppression_control_has_one_pre_export_request() {
+  local -r result_dir="$TEST_TMP_DIR/delayed-otlp-suppression"
+  local -r observed="$result_dir/observed"
+  local -r expected="$result_dir/expected"
+
+  mkdir -p -- "$result_dir"
+  (
+    local -i absence_calls=0
+    local -i request_calls=0
+    local -i receiver_empty_calls=0
+
+    RESULT_DIR="$result_dir"
+    SCENARIO=delayed-otlp-suppression
+    TRANSPORT=getsockopt
+    SCENARIO_VARIANT=""
+    delayed_otlp_earliest_export_millisecond() {
+      printf '900000\n'
+    }
+    assert_delayed_otlp_receiver_empty() {
+      case "$receiver_empty_calls" in
+        0) [[ "$request_calls" == "0" && "$absence_calls" == "0" ]] || return 1 ;;
+        *) return 1 ;;
+      esac
+      printf 'receiver-empty:%s\n' "${1##*/}" >>"$observed"
+      ((receiver_empty_calls += 1))
+    }
+    assert_delayed_otlp_receiver_has_no_java_export() {
+      [[ "$request_calls" == "1" && "$absence_calls" == "1" &&
+        "$receiver_empty_calls" == "1" ]] || return 1
+      printf 'receiver-no-java:%s\n' "${1##*/}" >>"$observed"
+    }
+    assert_java_duplicate_suppression_absent() {
+      case "$absence_calls" in
+        0) [[ "$request_calls" == "0" ]] || return 1 ;;
+        1) [[ "$request_calls" == "1" ]] || return 1 ;;
+        *) return 1 ;;
+      esac
+      printf 'absent:%s\n' "${1##*/}" >>"$observed"
+      ((absence_calls += 1))
+    }
+    assert_delayed_otlp_pre_export_window() {
+      [[ "$request_calls" == "1" && "$absence_calls" == "1" &&
+        "$2" == "900000" ]] || return 1
+      printf 'window:%s\n' "${1##*/}" >>"$observed"
+    }
+    run_bounded() {
+      [[ "$1" == "10" && "$2" == "curl" &&
+        "$*" == *"$APACHE_HTTPS_HEALTH_ENDPOINT"* &&
+        "$*" == *"x-obi-demo-id: $DELAYED_OTLP_PRIME_MARKER"* ]] || return 1
+      ((request_calls += 1))
+      [[ "$request_calls" == "1" ]] || return 1
+      printf 'prime\n' >>"$observed"
+    }
+    sleep() {
+      [[ "$1" == "$DELAYED_OTLP_PRE_EXPORT_WAIT_SECONDS" ]] || return 1
+      [[ "$request_calls" == "1" && "$absence_calls" == "1" &&
+        "$receiver_empty_calls" == "1" ]] || return 1
+      printf 'sleep:%s\n' "$1" >>"$observed"
+    }
+    wait_for_delayed_otlp_receiver_export() {
+      [[ "$request_calls" == "1" && "$absence_calls" == "2" &&
+        "$receiver_empty_calls" == "1" && "$2" == \
+          "$DELAYED_OTLP_SUPPRESSION_TIMEOUT_SECONDS" && "$3" == "900000" &&
+        "${4##*/}" == "delayed-otlp-receiver-early.json" ]] || return 1
+      printf 'receiver-ready:%s\n' "${1##*/}" >>"$observed"
+    }
+    wait_for_java_duplicate_suppression_without_prime() {
+      [[ "$request_calls" == "1" && "$absence_calls" == "2" &&
+        "$receiver_empty_calls" == "1" &&
+        "$2" == "$DELAYED_OTLP_SUPPRESSION_TIMEOUT_SECONDS" ]] || return 1
+      printf 'ready:%s\n' "${1##*/}" >>"$observed"
+    }
+    assert_selected_transport() {
+      [[ "$request_calls" == "1" && "$absence_calls" == "2" ]] || return 1
+      printf 'transport\n' >>"$observed"
+    }
+    assert_runtime_contract() {
+      [[ "$1" == "delayed-otlp-suppression" && "$2" == "true" &&
+        "$request_calls" == "1" ]] || return 1
+      printf 'runtime\n' >>"$observed"
+    }
+    recreate_instrumented_stack() {
+      return 1
+    }
+    run_scenario() {
+      [[ "$1" == "basic" && "$SCENARIO_VARIANT" == "delayed-otlp-suppression" &&
+        "$request_calls" == "1" ]] || return 1
+      printf 'scenario:%s:%s\n' "$1" "$SCENARIO_VARIANT" >>"$observed"
+    }
+
+    execute_requested_scenarios
+    [[ "$request_calls" == "1" && "$absence_calls" == "2" &&
+      "$receiver_empty_calls" == "1" && -z "$SCENARIO_VARIANT" ]]
+  ) || {
+    printf 'delayed OTLP suppression control did not preserve its request boundary\n' >&2
+    return 1
+  }
+
+  printf '%s\n' \
+    'receiver-empty:delayed-otlp-receiver-before-request.json' \
+    'absent:duplicate-suppression-delayed-otlp-before-request.prom' \
+    'prime' \
+    'window:delayed-otlp-window.txt' \
+    "sleep:$DELAYED_OTLP_PRE_EXPORT_WAIT_SECONDS" \
+    'receiver-no-java:delayed-otlp-receiver-before-export.json' \
+    'absent:duplicate-suppression-delayed-otlp-before-export.prom' \
+    'receiver-ready:delayed-otlp-receiver-ready.json' \
+    'ready:duplicate-suppression-delayed-otlp-ready.prom' \
+    'transport' \
+    'runtime' \
+    'scenario:basic:delayed-otlp-suppression' >"$expected"
+  cmp -s -- "$expected" "$observed" || {
+    printf 'delayed OTLP suppression sequence changed:\n' >&2
+    diff -u -- "$expected" "$observed" >&2 || true
+    return 1
+  }
+}
+
+test_delayed_otlp_suppression_control_restores_schedule_delay() {
+  local -r result_dir="$TEST_TMP_DIR/delayed-otlp-restoration"
+  local -r observed="$result_dir/observed"
+  local -r expected="$result_dir/expected"
+
+  mkdir -p -- "$result_dir"
+  (
+    RESULT_DIR="$result_dir"
+    SCENARIO=all
+    TRANSPORT=getsockopt
+    SCENARIO_VARIANT=""
+    export OTEL_BSP_SCHEDULE_DELAY_VALUE=750
+    delayed_otlp_earliest_export_millisecond() {
+      printf '900000\n'
+    }
+    recreate_instrumented_stack() {
+      printf 'recreate:%s:%s:%s:%s:%s:%s\n' \
+        "$1" "$2" "${3:-}" "${4:-}" "${5:-}" \
+        "$OTEL_BSP_SCHEDULE_DELAY_VALUE" >>"$observed"
+    }
+    assert_delayed_otlp_receiver_empty() {
+      printf 'receiver-empty:%s\n' "${1##*/}" >>"$observed"
+    }
+    assert_delayed_otlp_receiver_has_no_java_export() {
+      printf 'receiver-no-java:%s\n' "${1##*/}" >>"$observed"
+    }
+    assert_java_duplicate_suppression_absent() {
+      printf 'absent:%s\n' "${1##*/}" >>"$observed"
+    }
+    assert_delayed_otlp_pre_export_window() {
+      [[ "$2" == "900000" ]] || return 1
+      printf 'window:%s\n' "${1##*/}" >>"$observed"
+    }
+    run_bounded() {
+      [[ "$1" == "10" && "$2" == "curl" &&
+        "$*" == *"$APACHE_HTTPS_HEALTH_ENDPOINT"* ]] || return 1
+      printf 'prime\n' >>"$observed"
+    }
+    sleep() {
+      printf 'sleep:%s\n' "$1" >>"$observed"
+    }
+    wait_for_delayed_otlp_receiver_export() {
+      [[ "$2" == "$DELAYED_OTLP_SUPPRESSION_TIMEOUT_SECONDS" &&
+        "$3" == "900000" &&
+        "${4##*/}" == "delayed-otlp-receiver-early.json" ]] || return 1
+      printf 'receiver-ready:%s\n' "${1##*/}" >>"$observed"
+    }
+    wait_for_java_duplicate_suppression_without_prime() {
+      [[ "$2" == "$DELAYED_OTLP_SUPPRESSION_TIMEOUT_SECONDS" ]] || return 1
+      printf 'ready:%s\n' "${1##*/}" >>"$observed"
+    }
+    assert_selected_transport() {
+      printf 'transport\n' >>"$observed"
+    }
+    assert_runtime_contract() {
+      [[ "$1" == "delayed-otlp-suppression" && "$2" == "true" ]] || return 1
+      printf 'runtime\n' >>"$observed"
+    }
+    run_scenario() {
+      [[ "$1" == "basic" && "$SCENARIO_VARIANT" == "delayed-otlp-suppression" ]] || return 1
+      printf 'scenario\n' >>"$observed"
+    }
+
+    run_delayed_otlp_suppression_control
+    [[ "$OTEL_BSP_SCHEDULE_DELAY_VALUE" == "750" && -z "$SCENARIO_VARIANT" ]]
+  ) || {
+    printf 'delayed OTLP suppression did not restore the prior schedule delay\n' >&2
+    return 1
+  }
+
+  printf '%s\n' \
+    "recreate:tcp:delayed-otlp-suppression startup:getsockopt:false:true:$DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS" \
+    'receiver-empty:delayed-otlp-receiver-before-request.json' \
+    'absent:duplicate-suppression-delayed-otlp-before-request.prom' \
+    'prime' \
+    'window:delayed-otlp-window.txt' \
+    "sleep:$DELAYED_OTLP_PRE_EXPORT_WAIT_SECONDS" \
+    'receiver-no-java:delayed-otlp-receiver-before-export.json' \
+    'absent:duplicate-suppression-delayed-otlp-before-export.prom' \
+    'receiver-ready:delayed-otlp-receiver-ready.json' \
+    'ready:duplicate-suppression-delayed-otlp-ready.prom' \
+    'transport' \
+    'runtime' \
+    'scenario' \
+    'recreate:tcp:post-delayed-otlp suppression restoration::::750' >"$expected"
+  cmp -s -- "$expected" "$observed" || {
+    printf 'delayed OTLP schedule-delay restoration changed:\n' >&2
+    diff -u -- "$expected" "$observed" >&2 || true
+    return 1
+  }
+}
+
+test_delayed_otlp_suppression_recovers_after_startup_failure() {
+  local -r result_dir="$TEST_TMP_DIR/delayed-otlp-recovery"
+  local -r observed="$result_dir/observed"
+  local failure_status=0
+
+  mkdir -p -- "$result_dir"
+  if (
+    local -i recreate_calls=0
+
+    RESULT_DIR="$result_dir"
+    SCENARIO=all
+    TRANSPORT=getsockopt
+    export OTEL_BSP_SCHEDULE_DELAY_VALUE=750
+    recreate_instrumented_stack() {
+      ((recreate_calls += 1))
+      printf 'recreate:%s:%s:%s:%s:%s\n' \
+        "$2" "${4:-true}" "${5:-false}" \
+        "$OTEL_BSP_SCHEDULE_DELAY_VALUE" "$recreate_calls" >>"$observed"
+      if [[ "$recreate_calls" == "1" ]]; then
+        return 47
+      fi
+    }
+    run_delayed_otlp_suppression_sequence() {
+      printf 'sequence\n' >>"$observed"
+      return 1
+    }
+
+    run_delayed_otlp_suppression_control
+  ) >/dev/null 2>&1; then
+    printf 'delayed OTLP startup failure unexpectedly passed\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "47" &&
+    "$(<"$observed")" == $"recreate:delayed-otlp-suppression startup:false:true:$DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS:1"$'\nrecreate:post-delayed-otlp suppression recovery:true:false:750:2' ]] || {
+    printf 'delayed OTLP startup failure did not restore the standard stack\n' >&2
+    return 1
+  }
 }
 
 test_pressure_map_metric_requires_exact_unique_series() {
@@ -6059,6 +6674,68 @@ test_helper_attach_runtime_requires_exact_dynamic_disable() {
   )
 }
 
+test_delayed_otlp_runtime_requires_exact_export_delay() {
+  local -r result_dir="$TEST_TMP_DIR/delayed-otlp-runtime"
+  local runtime_environment=""
+
+  mkdir -p -- "$result_dir"
+  (
+    local -i duplicate_suppression_calls=0
+
+    RESULT_DIR="$result_dir"
+    COMPOSE=(test-compose)
+    run_bounded() {
+      case "$*" in
+        *"test-compose ps --quiet java-backend")
+          printf 'java-container\n'
+          ;;
+        *"docker inspect --format "*" java-container")
+          printf '%s\n' "$runtime_environment"
+          ;;
+        *"test-compose ps --quiet obi")
+          printf 'obi-container\n'
+          ;;
+        *"docker inspect --format "*" obi-container")
+          printf 'true host\n'
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+    }
+    wait_for_java_duplicate_suppression() {
+      ((duplicate_suppression_calls += 1))
+      return 1
+    }
+    log_error() { :; }
+
+    runtime_environment="$(printf '%s\n' \
+      'JAVA_TOOL_OPTIONS=-javaagent:/otel/official-javaagent.jar' \
+      'OTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar' \
+      'OTEL_OBI_REMOTE_PARENT_ENABLED=true' \
+      "OTEL_BSP_SCHEDULE_DELAY=$DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS")"
+    assert_runtime_contract delayed-otlp-suppression true || {
+      printf 'delayed OTLP runtime rejected the exact export delay\n' >&2
+      return 1
+    }
+    [[ "$duplicate_suppression_calls" == "0" ]] || {
+      printf 'delayed OTLP runtime added a second suppression prime\n' >&2
+      return 1
+    }
+    grep -Fqx 'status=passed' \
+      "$result_dir/runtime-assertions-delayed-otlp-suppression.txt"
+
+    for runtime_environment in \
+      $'JAVA_TOOL_OPTIONS=-javaagent:/otel/official-javaagent.jar\nOTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar\nOTEL_OBI_REMOTE_PARENT_ENABLED=true' \
+      $'JAVA_TOOL_OPTIONS=-javaagent:/otel/official-javaagent.jar\nOTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar\nOTEL_OBI_REMOTE_PARENT_ENABLED=true\nOTEL_BSP_SCHEDULE_DELAY=100'; do
+      if assert_runtime_contract delayed-otlp-suppression true >/dev/null 2>&1; then
+        printf 'delayed OTLP runtime accepted a missing or incorrect export delay\n' >&2
+        return 1
+      fi
+    done
+  )
+}
+
 test_start_stack_invalidates_project_evidence_before_compose_up() {
   local -r results_root="$TEST_TMP_DIR/start-stack-invalidation"
   local -r result_dir="$results_root/current"
@@ -6277,6 +6954,153 @@ test_instrumented_readiness_precedes_https_traffic() {
     printf 'startup mutated runtime evidence after diagnostic denial failure\n' >&2
     return 1
   }
+}
+
+test_delayed_otlp_startup_avoids_java_traffic() {
+  local -r result_dir="$TEST_TMP_DIR/delayed-otlp-startup"
+  local -r observed="$result_dir/observed"
+  local -r expected="$result_dir/expected"
+
+  mkdir -p -- "$result_dir/results"
+  (
+    RESULT_DIR="$result_dir"
+    RESULTS_ROOT="$result_dir/results"
+    PROJECT_NAME="obi-apache-java-https-test"
+    SCENARIO=delayed-otlp-suppression
+    TRANSPORT=getsockopt
+    COMMAND_TIMEOUT_SECONDS=5
+    STACK_STARTED=false
+    BRIDGE_RUNNING=false
+    COMPOSE=(test-compose)
+    verify_compose_project_ownership() {
+      return 0
+    }
+    run_bounded() {
+      return 0
+    }
+    run_logged_bounded() {
+      [[ "$*" == *"up --build --detach --force-recreate trace-receiver java-backend apache-proxy obi"* ]] ||
+        return 1
+      printf 'compose:up\n' >>"$observed"
+    }
+    date() {
+      printf 'cursor:startup\n' >>"$observed"
+      printf 'startup-cursor\n'
+    }
+    wait_for_http() {
+      [[ "$2" == "trace receiver" ]] || return 1
+      printf 'http:%s\n' "$2" >>"$observed"
+    }
+    wait_for_log() {
+      [[ "${4:-}" == "startup-cursor" ]] || return 1
+      printf 'log:%s\n' "$3" >>"$observed"
+    }
+    assert_selected_transport() {
+      return 1
+    }
+    assert_runtime_contract() {
+      return 1
+    }
+    wait_for_apache_instrumentation() {
+      printf 'apache:%s\n' "$1" >>"$observed"
+    }
+    assert_apache_denies_java_diagnostics() {
+      return 1
+    }
+
+    start_stack
+    [[ "$STACK_STARTED" == "true" && "$BRIDGE_RUNNING" == "true" ]]
+  ) || {
+    printf 'delayed OTLP startup generated Java traffic before its control\n' >&2
+    return 1
+  }
+
+  printf '%s\n' \
+    'cursor:startup' \
+    'compose:up' \
+    'http:trace receiver' \
+    'log:OBI remote-parent bridge' \
+    'log:injected Java helper' \
+    'log:external OTel extension' \
+    'log:Jetty HTTPS backend' \
+    'log:Netty HTTPS backend' \
+    'log:injected Java instrumentation' \
+    'apache:startup' \
+    'log:Apache HTTP proxy' >"$expected"
+  cmp -s -- "$expected" "$observed" || {
+    printf 'delayed OTLP startup order changed:\n' >&2
+    diff -u -- "$expected" "$observed" >&2 || true
+    return 1
+  }
+}
+
+test_delayed_otlp_recreate_avoids_java_traffic() {
+  local -r result_dir="$TEST_TMP_DIR/delayed-otlp-recreate"
+  local -r observed="$result_dir/observed"
+  local -r expected="$result_dir/expected"
+
+  mkdir -p -- "$result_dir"
+  (
+    RESULT_DIR="$result_dir"
+    COMPOSE=(test-compose)
+    BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=unix
+    date() {
+      printf 'recreate-cursor\n'
+    }
+    run_bounded() {
+      [[ "$BRIDGE_RUNNING" == "false" && -z "$SELECTED_TRANSPORT" ]] || return 1
+      printf 'compose:%s\n' "$*" >>"$observed"
+    }
+    wait_for_log() {
+      [[ "${4:-}" == "recreate-cursor" ]] || return 1
+      printf 'log:%s\n' "$3" >>"$observed"
+    }
+    assert_selected_transport() {
+      return 1
+    }
+    wait_for_apache_instrumentation() {
+      printf 'apache:%s\n' "$1" >>"$observed"
+    }
+    wait_for_http() {
+      [[ "$2" == "delayed-otlp-suppression trace receiver" ]] || return 1
+      printf 'http:%s\n' "$2" >>"$observed"
+    }
+    wait_for_java_duplicate_suppression() {
+      return 1
+    }
+
+    recreate_instrumented_stack tcp delayed-otlp-suppression getsockopt false true
+    [[ "$BRIDGE_RUNNING" == "true" && -z "$SELECTED_TRANSPORT" ]]
+  ) || {
+    printf 'delayed OTLP recreation generated Java traffic before its control\n' >&2
+    return 1
+  }
+
+  printf '%s\n' \
+    'compose:180 test-compose up --detach --force-recreate trace-receiver java-backend apache-proxy obi' \
+    'http:delayed-otlp-suppression trace receiver' \
+    'log:delayed-otlp-suppression OBI remote-parent bridge' \
+    'log:delayed-otlp-suppression injected Java helper' \
+    'log:delayed-otlp-suppression external OTel extension' \
+    'log:delayed-otlp-suppression injected Java instrumentation' \
+    'log:delayed-otlp-suppression Jetty HTTPS backend' \
+    'log:delayed-otlp-suppression Netty HTTPS backend' \
+    'apache:recreate-instrumented' \
+    'log:delayed-otlp-suppression Apache HTTP proxy' >"$expected"
+  cmp -s -- "$expected" "$observed" || {
+    printf 'delayed OTLP recreation order changed:\n' >&2
+    diff -u -- "$expected" "$observed" >&2 || true
+    return 1
+  }
+
+  if (
+    RESULT_DIR="$result_dir"
+    recreate_instrumented_stack tcp invalid getsockopt false invalid
+  ) >/dev/null 2>&1; then
+    printf 'delayed OTLP recreation accepted an invalid traffic mode\n' >&2
+    return 1
+  fi
 }
 
 test_apache_readiness_requires_the_full_pool() {
@@ -8435,6 +9259,7 @@ main() {
   test_all_suite_includes_every_scenario
   test_unix_all_suite_includes_fault_control
   test_run_demo_preserves_strict_scenario_execution
+  test_delayed_otlp_run_demo_defers_runtime_evidence
   test_helper_attach_failure_dispatch_and_seed_are_exact
   test_w3c_fault_requires_forced_unix
   test_security_accepts_enabled_transports
@@ -8453,6 +9278,13 @@ main() {
   test_helper_unavailable_metric_boundary_preserves_counters
   test_metric_boundary_helpers_are_reason_coded
   test_duplicate_suppression_wait_primes_java_export
+  test_duplicate_suppression_absence_requires_a_clean_metric_snapshot
+  test_delayed_otlp_window_requires_a_fresh_generation
+  test_delayed_otlp_receiver_snapshots_prove_export_boundary
+  test_delayed_otlp_receiver_wait_enforces_export_deadline
+  test_delayed_otlp_suppression_control_has_one_pre_export_request
+  test_delayed_otlp_suppression_control_restores_schedule_delay
+  test_delayed_otlp_suppression_recovers_after_startup_failure
   test_pressure_map_metric_requires_exact_unique_series
   test_bridge_metric_wait_requires_quiescent_report
   test_security_probe_window_covers_metric_fences
@@ -8514,8 +9346,11 @@ main() {
   test_runtime_environment_line_matching
   test_extension_disabled_runtime_requires_explicit_false
   test_helper_attach_runtime_requires_exact_dynamic_disable
+  test_delayed_otlp_runtime_requires_exact_export_delay
   test_start_stack_invalidates_project_evidence_before_compose_up
   test_instrumented_readiness_precedes_https_traffic
+  test_delayed_otlp_startup_avoids_java_traffic
+  test_delayed_otlp_recreate_avoids_java_traffic
   test_apache_readiness_requires_the_full_pool
   test_apache_instrumented_process_metric_is_exact
   test_apache_readiness_uses_elapsed_deadline

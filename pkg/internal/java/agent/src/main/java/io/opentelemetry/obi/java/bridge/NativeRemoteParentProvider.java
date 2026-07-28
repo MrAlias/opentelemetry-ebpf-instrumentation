@@ -111,12 +111,13 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
         continue;
       }
       try {
+        int status;
         if (take) {
-          BootstrapNative.takeRemoteParent(socketFileDescriptor, response);
+          status = BootstrapNative.takeRemoteParent(socketFileDescriptor, response);
         } else {
-          BootstrapNative.discardRemoteParent(socketFileDescriptor, response);
+          status = BootstrapNative.discardRemoteParent(socketFileDescriptor, response);
         }
-        RemoteParentRecord record = RemoteParentRecord.decode(response);
+        RemoteParentRecord record = recordFromNativeResponse(status, response);
         if (requiresReconfiguration(record.getStatus())) {
           markUnavailable(record.getStatus());
         }
@@ -129,6 +130,20 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
       }
     }
     return RemoteParentRecord.statusOnly(RemoteParentStatus.OVERLOAD);
+  }
+
+  static RemoteParentRecord recordFromNativeResponse(int status, byte[] response) {
+    if (!RemoteParentStatus.isKnown(status) || status == RemoteParentStatus.UNKNOWN) {
+      return RemoteParentRecord.statusOnly(RemoteParentStatus.MALFORMED);
+    }
+    if (status != RemoteParentStatus.VALID) {
+      return RemoteParentRecord.statusOnly(status);
+    }
+
+    RemoteParentRecord record = RemoteParentRecord.decode(response);
+    return record.getStatus() == RemoteParentStatus.VALID
+        ? record
+        : RemoteParentRecord.statusOnly(RemoteParentStatus.MALFORMED);
   }
 
   private boolean ensureReady() {

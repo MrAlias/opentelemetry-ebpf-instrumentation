@@ -55,6 +55,49 @@ class NativeRemoteParentProviderTest {
   }
 
   @Test
+  void ignoresStaleResponseWhenNativeCallFails() {
+    byte[] staleResponse = validResponse();
+
+    RemoteParentRecord transportError =
+        NativeRemoteParentProvider.recordFromNativeResponse(
+            RemoteParentStatus.TRANSPORT_ERROR, staleResponse);
+    assertEquals(RemoteParentStatus.TRANSPORT_ERROR, transportError.getStatus());
+    assertNull(transportError.getTraceIdHex());
+    assertNull(transportError.getParentSpanIdHex());
+
+    RemoteParentRecord missing =
+        NativeRemoteParentProvider.recordFromNativeResponse(
+            RemoteParentStatus.MISSING, staleResponse);
+    assertEquals(RemoteParentStatus.MISSING, missing.getStatus());
+    assertNull(missing.getTraceIdHex());
+    assertNull(missing.getParentSpanIdHex());
+  }
+
+  @Test
+  void requiresValidResponseForSuccessfulNativeCall() {
+    assertEquals(
+        RemoteParentStatus.VALID,
+        NativeRemoteParentProvider.recordFromNativeResponse(
+                RemoteParentStatus.VALID, validResponse())
+            .getStatus());
+    assertEquals(
+        RemoteParentStatus.MALFORMED,
+        NativeRemoteParentProvider.recordFromNativeResponse(
+                RemoteParentStatus.VALID, new byte[RemoteParentRecord.RECORD_SIZE])
+            .getStatus());
+    assertEquals(
+        RemoteParentStatus.MALFORMED,
+        NativeRemoteParentProvider.recordFromNativeResponse(
+                RemoteParentStatus.UNKNOWN, validResponse())
+            .getStatus());
+    assertEquals(
+        RemoteParentStatus.MALFORMED,
+        NativeRemoteParentProvider.recordFromNativeResponse(
+                RemoteParentStatus.DISABLED + 1, validResponse())
+            .getStatus());
+  }
+
+  @Test
   void registersBeforeEveryConfigurationAttempt() throws Exception {
     AtomicInteger configurationAttempts = new AtomicInteger();
     AtomicInteger registrations = new AtomicInteger();
@@ -377,6 +420,23 @@ class NativeRemoteParentProviderTest {
         (transport, path, timeout, uid, processIncarnation) ->
             configurationResult(transport, RemoteParentStatus.VALID),
         () -> true);
+  }
+
+  private static byte[] validResponse() {
+    byte[] response = new byte[RemoteParentRecord.RECORD_SIZE];
+    response[0] = 'O';
+    response[1] = 'B';
+    response[2] = 'I';
+    response[3] = 'J';
+    response[4] = (byte) RemoteParentRecord.ABI_VERSION;
+    response[6] = RemoteParentRecord.RECORD_SIZE;
+    response[8] = RemoteParentStatus.VALID;
+    response[9] = 1;
+    response[16] = 1;
+    response[32] = 1;
+    response[40] = 1;
+    response[48] = 1;
+    return response;
   }
 
   private static long configurationResult(int requested, int status) {

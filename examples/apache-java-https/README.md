@@ -6,7 +6,9 @@ remote-parent bridge. It runs this fixed topology on a Linux Docker host:
 It is the executable evidence harness for
 [issue #2](https://github.com/MrAlias/opentelemetry-ebpf-instrumentation/issues/2)
 and its bridge architecture, implementation, integration, and validation
-sub-issues.
+sub-issues. The [compatibility matrix](COMPATIBILITY.md) limits support claims
+to directly observed cells, and the [final result](FINAL-RESULT.md) reconciles
+the parent tracker's definition of done against retained evidence.
 
 ```text
 trace-scenario
@@ -307,6 +309,28 @@ volume, and network carries an ownership sentinel. Startup and cleanup
 enumerate all resources with the selected Compose project label and refuse to
 continue if any resource lacks that sentinel. Cleanup never removes images,
 unrelated containers, or retained result directories.
+
+## Deliberate assertion-failure control
+
+Use this bounded, non-acceptance control to verify that a failed assertion is
+understandable without causing a transport, certificate, or stack failure:
+
+```bash
+./examples/apache-java-https/run.sh \
+  --transport getsockopt \
+  --scenario assertion-failure
+```
+
+It first completes the normal `basic` assertion, then exits with status `2`
+and the terminal message `deliberate assertion failure requested`. Its retained
+result directory contains `scenario-basic.json`,
+`scenario-assertion-failure.json`, `scenario-assertion-failure-status.json`,
+`failure-context.txt`, and `run-status.json`. The two assertion-failure JSON
+files name the expected exit status and the failure-context path, while the
+standard files identify the exact shell stage, source line, and command. The
+control is deliberately excluded from `all` and never contributes acceptance
+evidence. Use `--keep` only if you want to inspect the stack before running the
+scoped `--cleanup-only` command above.
 
 ## Startup gates
 

@@ -220,6 +220,41 @@ and Splunk, the backend UI is the presenter-facing proof that the selected
 exporter delivered and stored them. The demo does not use Jaeger's internal,
 unsupported HTTP query API as an acceptance dependency.
 
+## Recover a missing process attach type
+
+If startup reports that the `ntosebpfext` process attach type is missing, do
+not replace the NetEbpfExt driver. The matched `ntosebpfext` service can be
+running while its user-scoped provider metadata is absent, for example after
+an eBPF runtime deployment or service restart.
+
+The demo package does not contain this external provider's exporter. Obtain
+`ntos_ebpf_ext_export_program_info.exe` built from the matching pinned
+`ntosebpfext` revision. In the proven VM it is at
+`C:\src\ntosebpfext\x64\Release\ntos_ebpf_ext_export_program_info.exe`.
+
+Run the following as the same Windows user that starts OBI. It refuses to
+change metadata if any eBPF program, map, or link remains loaded:
+
+```powershell
+$exporter = 'C:\src\ntosebpfext\x64\Release\ntos_ebpf_ext_export_program_info.exe'
+foreach ($object in @('programs', 'maps', 'links')) {
+    $output = & netsh.exe ebpf show $object 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or $output -match '(?m)^\s*\d+\s+') {
+        throw "Refusing export with live eBPF $object"
+    }
+}
+if (-not (Test-Path -LiteralPath $exporter)) {
+    throw "Missing matching ntosebpfext exporter: $exporter"
+}
+& $exporter
+if ($LASTEXITCODE -ne 0) { throw "Provider export failed: $LASTEXITCODE" }
+Get-Service ntosebpfext
+```
+
+The exporter should report that it is exporting program and section
+information. Then rerun the demo. This updates provider metadata only; it
+does not replace a driver or modify the demo package.
+
 ## Current limitations
 
 - The stream is supervised repetition of the proven one-shot native OBI

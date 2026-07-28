@@ -303,6 +303,26 @@ gradle :agent:jmh -Pjmh.profilers=gc
 gradle :agent:jmh -Pjmh.profilers=gc,stack
 ```
 
+### Remote-parent bridge
+
+Use the native benchmark for focused transport latency and the JMH GC profiler
+for Java allocation and latency. Run both hit and miss paths from this
+directory:
+
+```bash
+make -C agent -f Makefile.jni benchmark BENCHMARK_ITERATIONS=10000
+
+gradle :agent:jmh \
+  -Pjmh.includes='.*RemoteParentRecordBenchmark.*' \
+  -Pjmh.profilers=gc
+```
+
+The native benchmark reports `ns_per_op`, p50, p95, and p99 for deterministic
+getsockopt and Unix transport fixtures. The JMH command reports average latency
+and `gc.alloc.rate.norm` for the decode and bridge hit/miss paths. The latter
+uses a fixed provider to isolate Java bridge and record allocations; it is not
+an end-to-end native transport or production performance measurement.
+
 ### Benchmark Results
 
 See `agent/src/jmh/java/io/opentelemetry/obi/java/instrumentations/util/BENCHMARK_README.md` for detailed benchmarking documentation.

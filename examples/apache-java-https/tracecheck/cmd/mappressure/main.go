@@ -175,7 +175,7 @@ func run(cfg config) (result, error) {
 	var processMapID ebpf.MapID
 	tokenBase := cfg.tokenBase
 	if cfg.mode == "prepare" || cfg.mode == "fill" {
-		processes, discoveredMapID, openErr := openProcessMap()
+		processes, discoveredMapID, openErr := openProcessMap(mapID)
 		if openErr != nil {
 			return result{}, openErr
 		}
@@ -337,21 +337,27 @@ func verifySyntheticEntriesAbsent(
 	return absentEntries, nil
 }
 
-func openProcessMap() (*ebpf.Map, ebpf.MapID, error) {
-	var found *ebpf.Map
-	var foundID ebpf.MapID
+func openProcessMap(targetID ebpf.MapID) (*ebpf.Map, ebpf.MapID, error) {
+	relatedMapIDs, err := mapsRelatedToTarget(targetID)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	candidates := make(map[ebpf.MapID]*ebpf.Map)
+	candidateIDs := make([]ebpf.MapID, 0)
 	for id := ebpf.MapID(0); ; {
 		next, err := ebpf.MapGetNextID(id)
 		if errors.Is(err, os.ErrNotExist) {
 			break
 		}
 		if err != nil {
-			if found != nil {
-				found.Close()
-			}
+			closeMaps(candidates)
 			return nil, 0, fmt.Errorf("enumerate process maps after ID %d: %w", id, err)
 		}
 		id = next
+		if _, related := relatedMapIDs[id]; !related {
+			continue
+		}
 		candidate, err := ebpf.NewMapFromID(id)
 		if err != nil {
 			continue
@@ -361,18 +367,110 @@ func openProcessMap() (*ebpf.Map, ebpf.MapID, error) {
 			candidate.Close()
 			continue
 		}
-		if found != nil {
-			candidate.Close()
-			found.Close()
-			return nil, 0, fmt.Errorf("multiple live maps match %s", processMapName)
-		}
-		found = candidate
-		foundID = id
+		candidates[id] = candidate
+		candidateIDs = append(candidateIDs, id)
 	}
-	if found == nil {
-		return nil, 0, fmt.Errorf("live map %s was not found", processMapName)
+
+	foundID, err := selectRelatedMapID(targetID, relatedMapIDs, candidateIDs)
+	if err != nil {
+		closeMaps(candidates)
+		return nil, 0, err
 	}
+
+	found := candidates[foundID]
+	delete(candidates, foundID)
+	closeMaps(candidates)
 	return found, foundID, nil
+}
+
+func mapsRelatedToTarget(targetID ebpf.MapID) (map[ebpf.MapID]struct{}, error) {
+	related := make(map[ebpf.MapID]struct{})
+	mapIDsAvailable := false
+	targetReferenced := false
+
+	for id := ebpf.ProgramID(0); ; {
+		next, err := ebpf.ProgramGetNextID(id)
+		if errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("enumerate programs after ID %d: %w", id, err)
+		}
+		id = next
+
+		program, err := ebpf.NewProgramFromID(id)
+		if err != nil {
+			continue
+		}
+		info, infoErr := program.Info()
+		program.Close()
+		if infoErr != nil {
+			continue
+		}
+		mapIDs, available := info.MapIDs()
+		if !available {
+			continue
+		}
+		mapIDsAvailable = true
+		if !addRelatedMapIDs(targetID, mapIDs, related) {
+			continue
+		}
+		targetReferenced = true
+	}
+
+	if !targetReferenced {
+		if !mapIDsAvailable {
+			return nil, errors.New("program map relationships are unavailable")
+		}
+		return nil, fmt.Errorf("no live program references target map ID %d", targetID)
+	}
+	return related, nil
+}
+
+func containsMapID(mapIDs []ebpf.MapID, targetID ebpf.MapID) bool {
+	for _, mapID := range mapIDs {
+		if mapID == targetID {
+			return true
+		}
+	}
+	return false
+}
+
+func addRelatedMapIDs(
+	targetID ebpf.MapID, mapIDs []ebpf.MapID, related map[ebpf.MapID]struct{},
+) bool {
+	if !containsMapID(mapIDs, targetID) {
+		return false
+	}
+	for _, mapID := range mapIDs {
+		related[mapID] = struct{}{}
+	}
+	return true
+}
+
+func selectRelatedMapID(
+	targetID ebpf.MapID, relatedMapIDs map[ebpf.MapID]struct{}, candidates []ebpf.MapID,
+) (ebpf.MapID, error) {
+	var found ebpf.MapID
+	for _, candidateID := range candidates {
+		if _, related := relatedMapIDs[candidateID]; !related {
+			continue
+		}
+		if found != 0 && found != candidateID {
+			return 0, fmt.Errorf("multiple process maps are related to target map ID %d", targetID)
+		}
+		found = candidateID
+	}
+	if found == 0 {
+		return 0, fmt.Errorf("no process map is related to target map ID %d", targetID)
+	}
+	return found, nil
+}
+
+func closeMaps(maps map[ebpf.MapID]*ebpf.Map) {
+	for _, candidate := range maps {
+		candidate.Close()
+	}
 }
 
 func readProcessIdentity(processes *ebpf.Map) (processIdentity, error) {

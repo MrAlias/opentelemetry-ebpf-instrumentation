@@ -259,6 +259,56 @@ func TestMatchesProcessMapRequiresExactIncarnationMapShape(t *testing.T) {
 	assert.False(t, matchesProcessMap(&wrongKey))
 }
 
+func TestAddRelatedMapIDsIncludesOnlyTargetPrograms(t *testing.T) {
+	targetID := ebpf.MapID(41)
+	processMapID := ebpf.MapID(42)
+	unrelatedProcessMapID := ebpf.MapID(43)
+	related := make(map[ebpf.MapID]struct{})
+
+	assert.False(t, addRelatedMapIDs(targetID, []ebpf.MapID{44, unrelatedProcessMapID}, related))
+	assert.True(t, addRelatedMapIDs(targetID, []ebpf.MapID{targetID, processMapID}, related))
+	assert.Equal(t, map[ebpf.MapID]struct{}{targetID: {}, processMapID: {}}, related)
+}
+
+func TestSelectRelatedMapIDIgnoresUnrelatedProcessMaps(t *testing.T) {
+	targetID := ebpf.MapID(41)
+	processMapID := ebpf.MapID(42)
+	unrelatedProcessMapID := ebpf.MapID(43)
+	related := map[ebpf.MapID]struct{}{targetID: {}, processMapID: {}}
+
+	selected, err := selectRelatedMapID(
+		targetID,
+		related,
+		[]ebpf.MapID{unrelatedProcessMapID, processMapID},
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, processMapID, selected)
+}
+
+func TestSelectRelatedMapIDRejectsAmbiguousProgramRelatedProcessMaps(t *testing.T) {
+	targetID := ebpf.MapID(41)
+	related := map[ebpf.MapID]struct{}{
+		targetID:       {},
+		ebpf.MapID(42): {},
+		ebpf.MapID(43): {},
+	}
+
+	_, err := selectRelatedMapID(targetID, related, []ebpf.MapID{42, 43})
+
+	require.EqualError(t, err, "multiple process maps are related to target map ID 41")
+}
+
+func TestSelectRelatedMapIDRejectsMissingProgramRelatedProcessMap(t *testing.T) {
+	_, err := selectRelatedMapID(
+		ebpf.MapID(41),
+		map[ebpf.MapID]struct{}{ebpf.MapID(41): {}},
+		[]ebpf.MapID{42},
+	)
+
+	require.EqualError(t, err, "no process map is related to target map ID 41")
+}
+
 func TestCountEvictedSyntheticEntriesAcceptsAnyMissingKey(t *testing.T) {
 	identity := processIdentity{pid: 101, namespace: 202}
 	tokenBase := uint64(700)

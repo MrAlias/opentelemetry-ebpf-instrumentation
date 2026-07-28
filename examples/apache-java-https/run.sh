@@ -1938,17 +1938,20 @@ delayed_otlp_receiver_snapshot_has_java_export() {
         .service_name == "java-backend" and
         .kind == "SERVER" and
         .attributes["http.request.header.x-obi-demo-id"] == $marker
-      )] | length == 1) and
-    ([.spans[] |
-      select(
-        .service_name == "java-backend" and
-        .kind == "SERVER" and
-        .scope_name == $scope and
-        .attributes["http.request.header.x-obi-demo-id"] == $marker
-      )] as $java_sdk_servers |
-      ($java_sdk_servers | length == 1) and
-      ($java_sdk_servers[0].received_unix_milli | type == "number") and
-      ($java_sdk_servers[0].received_unix_milli > 0))
+      )] as $java_servers |
+      ([$java_servers[] | select(.scope_name == $scope)] as $java_sdk_servers |
+        ([$java_servers[] | select(.scope_name != $scope)] as $pre_detection_servers |
+          (($java_servers | length) >= 1) and
+          (($java_servers | length) <= 2) and
+          (($java_sdk_servers | length) == 1) and
+          (($pre_detection_servers | length) <= 1) and
+          ($pre_detection_servers | all(.[];
+            (.scope_name == null or .scope_name == "") and
+            (.received_unix_milli | type == "number") and
+            (.received_unix_milli > 0)
+          )) and
+          ($java_sdk_servers[0].received_unix_milli | type == "number") and
+          ($java_sdk_servers[0].received_unix_milli > 0))))
   ' "$snapshot" >/dev/null
 }
 
@@ -1987,10 +1990,14 @@ delayed_otlp_receiver_snapshot_has_java_export_at_or_after_deadline() {
       select(
         .service_name == "java-backend" and
         .kind == "SERVER" and
-        .scope_name == $scope and
         .attributes["http.request.header.x-obi-demo-id"] == $marker
-      )] as $java_sdk_servers |
-    $java_sdk_servers[0].received_unix_milli >= $earliest_export_millisecond
+      )] as $java_servers |
+    [$java_servers[] | select(.scope_name == $scope)] as $java_sdk_servers |
+    [$java_servers[] | select(.scope_name != $scope)] as $pre_detection_servers |
+    ($java_sdk_servers[0].received_unix_milli >= $earliest_export_millisecond) and
+    ($pre_detection_servers | all(.[];
+      .received_unix_milli < $earliest_export_millisecond
+    ))
   ' "$snapshot" >/dev/null
 }
 

@@ -2137,9 +2137,57 @@ test_delayed_otlp_receiver_snapshots_prove_export_boundary() {
     "$DELAYED_OTLP_PRIME_MARKER" \
     '"},"received_unix_milli":101000},{"service_name":"java-backend","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
     "$DELAYED_OTLP_PRIME_MARKER" \
-    '"}}]}' >"$snapshot"
+    '"},"received_unix_milli":100999}]}' >"$snapshot"
+  delayed_otlp_receiver_snapshot_has_java_export "$snapshot" || {
+    printf 'delayed OTLP receiver rejected the expected pre-detection OBI Java span\n' >&2
+    return 1
+  }
+  delayed_otlp_receiver_snapshot_has_java_export_at_or_after_deadline "$snapshot" 101000 || {
+    printf 'delayed OTLP receiver rejected an OBI Java span from before the deadline\n' >&2
+    return 1
+  }
+
+  printf '%s' \
+    '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
+    '","received_batches":1,"received_spans":3,"spans":[{"service_name":"java-backend","scope_name":"' \
+    "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
+    '","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"},"received_unix_milli":101000},{"service_name":"java-backend","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"},"received_unix_milli":100999},{"service_name":"java-backend","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"},"received_unix_milli":100998}]}' >"$snapshot"
   if delayed_otlp_receiver_snapshot_has_java_export "$snapshot"; then
-    printf 'delayed OTLP receiver accepted a duplicate Java server span\n' >&2
+    printf 'delayed OTLP receiver accepted duplicate pre-detection OBI Java spans\n' >&2
+    return 1
+  fi
+
+  printf '%s' \
+    '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
+    '","received_batches":1,"received_spans":2,"spans":[{"service_name":"java-backend","scope_name":"' \
+    "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
+    '","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"},"received_unix_milli":101000},{"service_name":"java-backend","scope_name":"other.java.instrumentation","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"},"received_unix_milli":100999}]}' >"$snapshot"
+  if delayed_otlp_receiver_snapshot_has_java_export "$snapshot"; then
+    printf 'delayed OTLP receiver accepted a Java server from another scope\n' >&2
+    return 1
+  fi
+
+  printf '%s' \
+    '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
+    '","received_batches":1,"received_spans":2,"spans":[{"service_name":"java-backend","scope_name":"' \
+    "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
+    '","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"},"received_unix_milli":101000},{"service_name":"java-backend","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"},"received_unix_milli":101000}]}' >"$snapshot"
+  if delayed_otlp_receiver_snapshot_has_java_export_at_or_after_deadline "$snapshot" 101000; then
+    printf 'delayed OTLP receiver accepted an OBI Java span after suppression\n' >&2
     return 1
   fi
 }
@@ -2160,11 +2208,13 @@ test_delayed_otlp_receiver_wait_enforces_export_deadline() {
     '"},"received_unix_milli":100999}]}' >"$early_fixture"
   printf '%s' \
     '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
-    '","received_batches":1,"received_spans":1,"spans":[{"service_name":"java-backend","scope_name":"' \
+    '","received_batches":1,"received_spans":2,"spans":[{"service_name":"java-backend","scope_name":"' \
     "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
     '","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
     "$DELAYED_OTLP_PRIME_MARKER" \
-    '"},"received_unix_milli":101000}]}' >"$ready_fixture"
+    '"},"received_unix_milli":101000},{"service_name":"java-backend","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"},"received_unix_milli":100999}]}' >"$ready_fixture"
 
   if (
     RESULT_DIR="$result_dir"

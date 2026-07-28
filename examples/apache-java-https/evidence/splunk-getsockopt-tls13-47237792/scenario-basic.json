@@ -1,0 +1,120 @@
+{
+  "status": "passed",
+  "scenario": "basic",
+  "seed": 1,
+  "started_at": "2026-07-28T17:36:53.617171636Z",
+  "finished_at": "2026-07-28T17:37:21.633288413Z",
+  "request_count": 1,
+  "traffic_elapsed_nanos": 13438098,
+  "throughput_per_second": 74.41529299756557,
+  "latency": {
+    "p50_nanos": 13437601,
+    "p95_nanos": 13437601,
+    "p99_nanos": 13437601
+  },
+  "cases": [
+    {
+      "request": {
+        "marker": "basic-00-84aca3ab04bf90af",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "basic-00-84aca3ab04bf90af",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 4,
+        "backend_remote_port": 34916,
+        "tls_read_events": 5,
+        "tls_read_bytes": 1010
+      },
+      "latency_nanos": 13437601,
+      "trace": {
+        "marker": "basic-00-84aca3ab04bf90af",
+        "received_batches": 3,
+        "received_spans": 161,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 24485,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "7f0f8ed143b49fbc3af8ff3b1ae36525",
+            "span_id": "841f74941d66aac3",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "basic-00-84aca3ab04bf90af",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785260213619072194,
+            "end_unix_nano": 1785260213631760211
+          },
+          {
+            "trace_id": "7f0f8ed143b49fbc3af8ff3b1ae36525",
+            "span_id": "73adcf7beaa14878",
+            "parent_span_id": "841f74941d66aac3",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785260213619150832,
+            "end_unix_nano": 1785260213631760211
+          },
+          {
+            "trace_id": "7f0f8ed143b49fbc3af8ff3b1ae36525",
+            "span_id": "1b405ecf383a8b17",
+            "parent_span_id": "73adcf7beaa14878",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "basic-00-84aca3ab04bf90af",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1"
+            },
+            "start_unix_nano": 1785260213619443847,
+            "end_unix_nano": 1785260213631586227
+          },
+          {
+            "trace_id": "7f0f8ed143b49fbc3af8ff3b1ae36525",
+            "span_id": "06aae2c091120566",
+            "parent_span_id": "1b405ecf383a8b17",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "basic-00-84aca3ab04bf90af",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785260213630571545,
+            "end_unix_nano": 1785260213632446777
+          }
+        ]
+      }
+    }
+  ]
+}

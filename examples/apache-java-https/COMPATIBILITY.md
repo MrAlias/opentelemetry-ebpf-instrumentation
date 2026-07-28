@@ -16,7 +16,7 @@ OpenSSL, TLS, transport, command, and artifact link.
 
 ## Kernel, cgroup, and transport
 
-Use Java 21, the OpenTelemetry agent, `amd64`, and one fixed container stack
+Use Java 21, one named official agent, `amd64`, and one fixed container stack
 while varying this table. Record the exact TLS version for each forced
 transport result.
 
@@ -36,10 +36,11 @@ transport result.
 The following additional host is directly observed. It is not a substitute for
 any representative kernel row above.
 
-| Environment | Cgroup topology | TLS | `getsockopt` | `unix` | `auto` | Evidence |
-| --- | --- | --- | --- | --- | --- | --- |
-| Linux 7.0.0-1009-aws (distribution not recorded) | unified v2 | 1.3 | pass | untested | untested | [getsockopt/TLS 1.3](evidence/otel-getsockopt-tls13-c9d14356/README.md) |
-| Linux 7.0.0-1009-aws (distribution not recorded) | unified v2 | 1.2 | untested | pass | untested | [Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/README.md) |
+| Environment | Agent | Cgroup topology | TLS | `getsockopt` | `unix` | `auto` | Evidence |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Linux 7.0.0-1009-aws (distribution not recorded) | OpenTelemetry 2.28.1 | unified v2 | 1.3 | pass | untested | untested | [getsockopt/TLS 1.3](evidence/otel-getsockopt-tls13-c9d14356/README.md) |
+| Linux 7.0.0-1009-aws (distribution not recorded) | Splunk 2.28.0 | unified v2 | 1.3 | pass | untested | untested | [getsockopt/TLS 1.3](evidence/splunk-getsockopt-tls13-47237792/README.md) |
+| Linux 7.0.0-1009-aws (distribution not recorded) | OpenTelemetry 2.28.1 | unified v2 | 1.2 | untested | pass | untested | [Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/README.md) |
 
 RHEL 8 support may only be reported from direct execution on the documented
 backport. If a required cgroup hook is absent, report forced `getsockopt` as
@@ -48,14 +49,15 @@ backport. If a required cgroup hook is absent, report forced `getsockopt` as
 ## Architecture
 
 Each observed row uses one observed Linux kernel, unified cgroup v2, Java 21,
-and the OpenTelemetry agent. A row records one forced transport/TLS pair; it
-does not establish the other transport or TLS version.
+and the named agent. A row records one forced transport/TLS pair; it does not
+establish the other transport or TLS version.
 
-| Architecture | TLS | `getsockopt` | `unix` | Evidence |
-| --- | --- | --- | --- | --- |
-| `amd64` | 1.3 | pass | untested | [getsockopt/TLS 1.3](evidence/otel-getsockopt-tls13-c9d14356/README.md) |
-| `amd64` | 1.2 | untested | pass | [Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/README.md) |
-| `arm64` | untested | untested | untested | not recorded |
+| Architecture | Agent | TLS | `getsockopt` | `unix` | Evidence |
+| --- | --- | --- | --- | --- | --- |
+| `amd64` | OpenTelemetry 2.28.1 | 1.3 | pass | untested | [getsockopt/TLS 1.3](evidence/otel-getsockopt-tls13-c9d14356/README.md) |
+| `amd64` | Splunk 2.28.0 | 1.3 | pass | untested | [getsockopt/TLS 1.3](evidence/splunk-getsockopt-tls13-47237792/README.md) |
+| `amd64` | OpenTelemetry 2.28.1 | 1.2 | untested | pass | [Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/README.md) |
+| `arm64` | untested | untested | untested | untested | not recorded |
 
 ## JVM and official agent
 
@@ -87,7 +89,7 @@ Compose run for a matrix cell below.
 | 8 | untested | untested | configured official-agent smoke; no privileged run recorded |
 | 11 | untested | untested | configured official-agent smoke; no privileged run recorded |
 | 17 | untested | untested | configured official-agent smoke; no privileged run recorded |
-| 21 | pass | untested | [Temurin 21/OpenTelemetry getsockopt/TLS 1.3](evidence/otel-getsockopt-tls13-c9d14356/README.md) and [Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/README.md) privileged runs |
+| 21 | pass | pass | [Temurin 21/OpenTelemetry getsockopt/TLS 1.3](evidence/otel-getsockopt-tls13-c9d14356/README.md), [Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/README.md), and [Splunk getsockopt/TLS 1.3](evidence/splunk-getsockopt-tls13-47237792/README.md) privileged runs |
 
 Additional agent releases must be selected deliberately, pinned by checksum,
 and added as new rows. “Latest” is not a matrix cell.
@@ -96,7 +98,7 @@ and added as new rows. “Latest” is not a matrix cell.
 
 | Apache / OpenSSL | `getsockopt`/TLS 1.2 | Unix/TLS 1.2 | `getsockopt`/TLS 1.3 | Unix/TLS 1.3 | Backend HTTP |
 | --- | --- | --- | --- | --- | --- |
-| `httpd:2.4.68-alpine` image pinned in Compose | untested | [pass graph](evidence/otel-unix-tls12-bd1c9327/scenario-basic.json), [runtime](evidence/otel-unix-tls12-bd1c9327/apache-openssl-runtime.txt) | [pass graph](evidence/otel-getsockopt-tls13-c9d14356/scenario-basic.json), [runtime](evidence/otel-getsockopt-tls13-c9d14356/apache-openssl-runtime.txt) | untested | HTTP/1.1 only |
+| `httpd:2.4.68-alpine` image pinned in Compose | untested | [pass graph](evidence/otel-unix-tls12-bd1c9327/scenario-basic.json), [runtime](evidence/otel-unix-tls12-bd1c9327/apache-openssl-runtime.txt) | [OpenTelemetry pass graph](evidence/otel-getsockopt-tls13-c9d14356/scenario-basic.json), [Splunk pass graph](evidence/splunk-getsockopt-tls13-47237792/scenario-basic.json), [runtime](evidence/splunk-getsockopt-tls13-47237792/apache-openssl-runtime.txt) | untested | HTTP/1.1 only |
 
 Every run must produce `apache-openssl-version.txt` proving that Apache loaded
 `ssl_module`, that `mod_ssl.so` links to `libssl.so.3` and `libcrypto.so.3`,
@@ -143,7 +145,8 @@ failure reasons, and reconciles with the aggregate Java diagnostics. Other
 tests may report a miss only when their expected outcome permits it.
 
 The narrowest directly demonstrated configurations are the exact Linux
-7.0.0-1009-aws, unified-cgroup-v2, `amd64`, Temurin 21, OpenTelemetry 2.28.1,
-Apache 2.4.68, OpenSSL 3.5.7, forced-`getsockopt`/TLS 1.3 and
-forced-`unix`/TLS 1.2 cells linked above. The distribution was not recorded
-independently, and no broader compatibility claim follows from those results.
+7.0.0-1009-aws, unified-cgroup-v2, `amd64`, Temurin 21, Apache 2.4.68, and
+OpenSSL 3.5.7 cells linked above: OpenTelemetry 2.28.1 on forced
+`getsockopt`/TLS 1.3 and forced `unix`/TLS 1.2, and Splunk 2.28.0 on forced
+`getsockopt`/TLS 1.3. The distribution was not recorded independently, and no
+broader compatibility claim follows from those results.

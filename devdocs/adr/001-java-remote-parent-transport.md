@@ -240,9 +240,10 @@ connection-only guess.
 The default is `disabled`. The proof-of-concept runner can exercise
 `getsockopt`, `unix`, `auto`, and disabled or absence controls. The
 [retained evidence index](../../examples/apache-java-https/evidence/README.md)
-contains three forced `getsockopt` full runs, including the current V2-schema
-run and its bounded inbound-Netty fixture, plus two forced Unix full runs,
-including the current V2-schema
+contains four forced `getsockopt` full runs: the current V2-schema
+OpenTelemetry run and its bounded inbound-Netty fixture, two historical
+OpenTelemetry runs, and the Splunk 2.28.0 V2-schema run; it also contains two
+forced Unix full runs, including the current V2-schema
 Unix/TLS 1.2 run.
 Disabled and absence behavior is retained only as controls within those
 runs; no `auto` acceptance run is retained. Raw results are written under

@@ -297,6 +297,7 @@ struct fake_jni_byte_array {
 static int fake_jni_string_failure;
 static int fake_jni_region_exception;
 static jboolean fake_jni_exception_pending;
+static int fake_jni_exception_clears;
 
 static const char *JNICALL fake_get_string_utf_chars(JNIEnv *env, jstring value,
                                                      jboolean *is_copy) {
@@ -305,6 +306,7 @@ static const char *JNICALL fake_get_string_utf_chars(JNIEnv *env, jstring value,
     *is_copy = JNI_FALSE;
   }
   if (fake_jni_string_failure) {
+    fake_jni_exception_pending = JNI_TRUE;
     return NULL;
   }
   return ((struct fake_jni_string *)value)->value;
@@ -341,12 +343,19 @@ static jboolean JNICALL fake_exception_check(JNIEnv *env) {
   return fake_jni_exception_pending;
 }
 
+static void JNICALL fake_exception_clear(JNIEnv *env) {
+  (void)env;
+  fake_jni_exception_pending = JNI_FALSE;
+  fake_jni_exception_clears++;
+}
+
 static const struct JNINativeInterface_ fake_jni_functions = {
     .GetStringUTFChars = fake_get_string_utf_chars,
     .ReleaseStringUTFChars = fake_release_string_utf_chars,
     .GetArrayLength = fake_get_array_length,
     .SetByteArrayRegion = fake_set_byte_array_region,
     .ExceptionCheck = fake_exception_check,
+    .ExceptionClear = fake_exception_clear,
 };
 static JNIEnv fake_jni_environment = &fake_jni_functions;
 
@@ -1055,6 +1064,7 @@ static void test_exported_jni_transport_lifecycle(void) {
   fake_jni_string_failure = 0;
   fake_jni_region_exception = 0;
   fake_jni_exception_pending = JNI_FALSE;
+  fake_jni_exception_clears = 0;
   Java_io_opentelemetry_obi_java_BootstrapNative_closeRemoteParentTransport(
       env, NULL);
 
@@ -1125,7 +1135,8 @@ static void test_exported_jni_transport_lifecycle(void) {
   assert(Java_io_opentelemetry_obi_java_BootstrapNative_takeRemoteParent(
              env, NULL, 59, (jbyteArray)&response) == 12);
   fake_jni_region_exception = 0;
-  fake_jni_exception_pending = JNI_FALSE;
+  assert(fake_jni_exception_pending == JNI_FALSE);
+  assert(fake_jni_exception_clears == 1);
 
   Java_io_opentelemetry_obi_java_BootstrapNative_closeRemoteParentTransport(
       env, NULL);
@@ -1137,6 +1148,9 @@ static void test_exported_jni_transport_lifecycle(void) {
 static void test_exported_jni_configuration_validation(void) {
   JNIEnv *env = fake_jni();
   struct fake_jni_string path = {.value = ""};
+
+  fake_jni_exception_pending = JNI_FALSE;
+  fake_jni_exception_clears = 0;
 
   assert(
       Java_io_opentelemetry_obi_java_BootstrapNative_configureRemoteParentTransport(
@@ -1158,6 +1172,8 @@ static void test_exported_jni_configuration_validation(void) {
           env, NULL, 1, (jstring)&path, 20, geteuid(), 1) == 12);
   fake_jni_string_failure = 0;
   assert(path.releases == 0);
+  assert(fake_jni_exception_pending == JNI_FALSE);
+  assert(fake_jni_exception_clears == 1);
 
   fake_setsockopt_error = EACCES;
   assert(

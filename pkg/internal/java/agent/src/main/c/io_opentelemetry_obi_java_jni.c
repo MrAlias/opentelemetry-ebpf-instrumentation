@@ -1220,6 +1220,7 @@ configure_remote_parent_jni(JNIEnv *env, jclass clazz, jint transport,
   if (unix_path != NULL) {
     path = (*env)->GetStringUTFChars(env, unix_path, NULL);
     if (path == NULL) {
+      clear_jni_exception(env);
       result.status = remote_parent_status_transport_error;
       return result;
     }
@@ -1274,6 +1275,7 @@ static jint remote_parent_response(JNIEnv *env, jbyteArray output,
   (*env)->SetByteArrayRegion(env, output, 0, remote_parent_record_size,
                              (const jbyte *)response);
   if ((*env)->ExceptionCheck(env)) {
+    clear_jni_exception(env);
     return remote_parent_status_transport_error;
   }
   return status;

@@ -351,7 +351,7 @@ the accepted OTLP request in milliseconds, so a delayed harness poll cannot
 hide an early export. After the deadline, it requires exactly one Java SDK
 server span from the `io.opentelemetry.jetty-11.0` scope, the Java duplicate
 suppression signal from OBI, and the normal exact-parent `basic` assertion.
-A single pre-detection OBI Java span, when present, is retained as
+A single unscoped pre-detection OBI Java server span, when present, is retained as
 startup-window evidence; after suppression, the `basic` assertion must have
 only the normal Java SDK server span. Apache OBI spans are also allowed during
 the window.

@@ -195,11 +195,11 @@ func TestJavaRemoteParentPrimarySocketAuthority(t *testing.T) {
 	assertUnrelatedProcessCannotRetrieve(t, first.client)
 	statsAfterUnauthorized := javaRemoteParentStats(t, objects.JavaRemoteParentStats)
 	assert.Equal(t,
-		statsBeforeUnauthorized[javaRemoteParentStatTakeUnauthorized]+1,
+		statsBeforeUnauthorized[javaRemoteParentStatTakeUnauthorized]+unauthorizedCallCount,
 		statsAfterUnauthorized[javaRemoteParentStatTakeUnauthorized],
 	)
 	assert.Equal(t,
-		statsBeforeUnauthorized[javaRemoteParentStatDiscardUnauthorized]+1,
+		statsBeforeUnauthorized[javaRemoteParentStatDiscardUnauthorized]+unauthorizedCallCount,
 		statsAfterUnauthorized[javaRemoteParentStatDiscardUnauthorized],
 	)
 	assertNativeTakeMiss(t, second.client)
@@ -292,8 +292,10 @@ func TestJavaRemoteParentUnauthorizedProcessHelper(t *testing.T) {
 		t.Skip("subprocess helper")
 	}
 
-	assertNativeTakeMiss(t, 3)
-	assertNativeDiscardMiss(t, 3)
+	for range unauthorizedCallCount {
+		assertNativeTakeMiss(t, 3)
+		assertNativeDiscardMiss(t, 3)
+	}
 }
 
 func TestJavaRemoteParentPrimaryRequiresAuthoritativeDataHook(t *testing.T) {

@@ -8403,6 +8403,14 @@ test_demo_uses_only_explicit_tcp_context() {
   grep -Fqx '  disable_black_box_cp: true' "$obi_config"
 }
 
+test_demo_java_attach_timeout_is_explicit() {
+  local -r obi_config="$TEST_SCRIPT_DIR/../configs/obi.yaml"
+  local -r compose_file="$TEST_SCRIPT_DIR/../docker-compose.yml"
+
+  grep -Fqx '  attach_timeout: 30s' "$obi_config"
+  ! grep -Fq 'OTEL_EBPF_JAVAAGENT_ATTACH_TIMEOUT:' "$compose_file"
+}
+
 main() {
   TEST_TMP_DIR="$(mktemp -d)"
   test_project_name_validation
@@ -8542,6 +8550,7 @@ main() {
   test_demo_diagnostics_are_loopback_only
   test_apache_diagnostic_denial_matrix_is_exact
   test_demo_uses_only_explicit_tcp_context
+  test_demo_java_attach_timeout_is_explicit
   printf 'demo harness tests passed\n'
 }
 

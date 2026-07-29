@@ -129,6 +129,21 @@ services:
       - tools
     labels: *demo-labels
 
+  benchmark:
+    image: obi-apache-java-https-tracecheck:local
+    network_mode: host
+    user: "65532:65532"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    entrypoint:
+      - /trace-benchmark
+    profiles:
+      - tools
+    labels: *demo-labels
+
   map-pressure:
     image: obi-apache-java-https-tracecheck:local
     network_mode: none

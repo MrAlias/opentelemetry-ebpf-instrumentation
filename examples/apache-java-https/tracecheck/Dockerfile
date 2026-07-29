@@ -11,6 +11,9 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -trimpath -o /out/trace-scenario \
     ./examples/apache-java-https/tracecheck/cmd/scenario
 RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath -o /out/trace-benchmark \
+    ./examples/apache-java-https/tracecheck/cmd/benchmark
+RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -trimpath -o /out/map-pressure \
     ./examples/apache-java-https/tracecheck/cmd/mappressure
 RUN --mount=type=cache,target=/root/.cache/go-build \
@@ -23,6 +26,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 FROM scratch
 COPY --from=builder /out/trace-receiver /trace-receiver
 COPY --from=builder /out/trace-scenario /trace-scenario
+COPY --from=builder /out/trace-benchmark /trace-benchmark
 COPY --from=builder /out/map-pressure /map-pressure
 COPY --from=builder /out/fault-bridge /fault-bridge
 COPY --from=builder /out/security-probe /security-probe

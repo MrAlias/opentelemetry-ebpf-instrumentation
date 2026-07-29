@@ -5,7 +5,9 @@
 set -Eeuo pipefail
 
 readonly OUTPUT_DIR="${TEST_OUTPUT:-testoutput}/java-remote-parent-rhel9.6-kernel-sockopt"
-readonly PRIVILEGED_TEST_PATTERN='^(TestJavaRemoteParentPrimarySocketAuthority|TestJavaRemoteParentPrimaryRequiresAuthoritativeDataHook|TestJavaRemoteParentNestedCgroupLifecycle|TestJavaRemoteParentCgroupLinkProcessDeathCleanup|TestJavaRemoteParentCgroupPartialAttachRollback|TestJavaRemoteParentBridgeLoadRequiresPrivileges)$'
+readonly JAVA_AGENT_PATH="${OUTPUT_DIR}/java-artifacts/obi-java-agent.jar"
+readonly JAVA_AGENT_CHECKSUM="${OUTPUT_DIR}/java-agent.sha256"
+readonly PRIVILEGED_TEST_PATTERN='^(TestJavaRemoteParentPrimarySocketAuthority|TestJavaRemoteParentPrimaryRequiresAuthoritativeDataHook|TestJavaRemoteParentPrimaryJVMFaults|TestJavaRemoteParentNestedCgroupLifecycle|TestJavaRemoteParentCgroupLinkProcessDeathCleanup|TestJavaRemoteParentCgroupPartialAttachRollback|TestJavaRemoteParentBridgeLoadRequiresPrivileges)$'
 readonly BENCHMARK_TEST_PATTERN='^TestJavaRemoteParentTransportBenchmark$'
 
 fail() {
@@ -23,6 +25,16 @@ require_test_passed() {
     if ! grep -Fq -- "--- PASS: ${test_name} " "$output_file"; then
         fail "${test_name} did not report PASS; see ${output_file}"
     fi
+}
+
+require_java_agent() {
+    [[ -s "$JAVA_AGENT_PATH" ]] || fail "Java bridge agent artifact is unavailable at ${JAVA_AGENT_PATH}"
+    [[ -s "$JAVA_AGENT_CHECKSUM" ]] || fail "Java bridge agent checksum is unavailable at ${JAVA_AGENT_CHECKSUM}"
+    command -v java >/dev/null 2>&1 || fail 'Java runtime is unavailable'
+
+    java -version 2>&1 | tee "$OUTPUT_DIR/java-version.txt"
+    sha256sum -c "$JAVA_AGENT_CHECKSUM" | tee "$OUTPUT_DIR/java-agent-verified.txt"
+    sha256sum "$JAVA_AGENT_PATH" | tee "$OUTPUT_DIR/java-agent-vm.sha256"
 }
 
 collect_kernel_evidence() {
@@ -71,6 +83,7 @@ collect_kernel_evidence() {
 run_sockopt_authority_tests() {
     local -r output_file="$OUTPUT_DIR/privileged-tests.log"
 
+    OBI_JAVA_REMOTE_PARENT_AGENT_JAR="$JAVA_AGENT_PATH" \
     OBI_REQUIRE_CGROUP_TOPOLOGY=1 go test \
         -count=1 \
         -timeout=10m \
@@ -83,6 +96,8 @@ run_sockopt_authority_tests() {
         TestJavaRemoteParentPrimarySocketAuthority
     require_test_passed "$output_file" \
         TestJavaRemoteParentPrimaryRequiresAuthoritativeDataHook
+    require_test_passed "$output_file" \
+        TestJavaRemoteParentPrimaryJVMFaults
     require_test_passed "$output_file" \
         TestJavaRemoteParentNestedCgroupLifecycle
     require_test_passed "$output_file" \
@@ -113,6 +128,7 @@ run_transport_benchmark() {
 main() {
     mkdir -p -- "$OUTPUT_DIR"
     collect_kernel_evidence
+    require_java_agent
     run_sockopt_authority_tests
     run_transport_benchmark
 }

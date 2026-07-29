@@ -9,6 +9,7 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 # Track the latest Alpine instead of pinning to 3.20. The 3.20 pin worked
 # around newer runc's procfs hardening ("unsafe procfs detected") failing in
 # the nested-VM CI; that no longer reproduces on the current runner. See #872.
+# gcompat lets the Alpine VM load the staged agent's glibc-built JNI library.
 RUN apk update && apk add --no-cache \
     agetty \
     bash \
@@ -16,10 +17,12 @@ RUN apk update && apk add --no-cache \
     ca-certificates \
     docker \
     docker-cli-compose \
+    gcompat \
     git \
     iptables \
     iptables-legacy \
     make \
+    openjdk21-jre-headless \
     openrc
 
 # Default iptables symlink to legacy; modules-load may relink to nft on

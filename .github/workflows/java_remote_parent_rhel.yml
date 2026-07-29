@@ -73,6 +73,21 @@ jobs:
             fi
           done
 
+      - name: Build Java bridge probe artifact
+        run: |
+          set -Eeuo pipefail
+          output_dir=testoutput/java-remote-parent-rhel9.6-kernel-sockopt
+          artifact_dir="${output_dir}/java-artifacts"
+          mkdir -p "$artifact_dir"
+          docker build \
+            --output "type=local,dest=${artifact_dir}" \
+            --target export \
+            -f javaagent.Dockerfile \
+            .
+          test -s "${artifact_dir}/obi-java-agent.jar"
+          sha256sum "${artifact_dir}/obi-java-agent.jar" \
+            | tee "${output_dir}/java-agent.sha256"
+
       - name: Install QEMU
         run: |
           sudo apt-get update

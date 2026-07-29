@@ -34,7 +34,8 @@ public final class RemoteParentPrimaryProbe {
     try (Socket socket = new Socket()) {
       socket.connect(new InetSocketAddress(host, port));
       int socketFileDescriptor =
-          intValue(nativeBridge.getMethod("socketFileDescriptor", Socket.class).invoke(null, socket));
+          intValue(
+              nativeBridge.getMethod("socketFileDescriptor", Socket.class).invoke(null, socket));
       if (socketFileDescriptor < 0) {
         throw new IllegalStateException("socket file descriptor is unavailable");
       }
@@ -83,7 +84,8 @@ public final class RemoteParentPrimaryProbe {
   }
 
   private static int emitData(Class<?> nativeBridge, int socketFileDescriptor) throws Exception {
-    Class<?> nativeMemory = Class.forName("io.opentelemetry.obi.java.ebpf.NativeMemory", true, null);
+    Class<?> nativeMemory =
+        Class.forName("io.opentelemetry.obi.java.ebpf.NativeMemory", true, null);
     Object memory = nativeMemory.getConstructor(int.class).newInstance(PACKET_SIZE);
     long address = longValue(nativeMemory.getMethod("getAddress").invoke(memory));
     return intValue(

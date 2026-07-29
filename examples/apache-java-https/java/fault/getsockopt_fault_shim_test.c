@@ -39,6 +39,7 @@ enum {
   java_remote_parent_test_span_id_byte = 0xb2,
   java_remote_parent_fault_version = 2,
   java_remote_parent_fault_file_private_mode = 0600,
+  java_remote_parent_fault_file_group_readable_mode = 0640,
   java_remote_parent_fault_file_group_writable_mode = 0620,
   java_remote_parent_concurrent_attempt_count = 8,
 };
@@ -132,6 +133,15 @@ static void test_missing_empty_and_invalid_controls_do_not_mutate(void) {
 
   assert(chmod(fault_file_path,
                java_remote_parent_fault_file_group_writable_mode) == 0);
+  assert(!obi_demo_java_remote_parent_apply_getsockopt_fault(
+      0, java_remote_parent_socket_level, java_remote_parent_socket_take,
+      response, &length));
+  assert(memcmp(response, expected, sizeof(response)) == 0);
+  assert(chmod(fault_file_path, java_remote_parent_fault_file_private_mode) ==
+         0);
+
+  assert(chmod(fault_file_path,
+               java_remote_parent_fault_file_group_readable_mode) == 0);
   assert(!obi_demo_java_remote_parent_apply_getsockopt_fault(
       0, java_remote_parent_socket_level, java_remote_parent_socket_take,
       response, &length));

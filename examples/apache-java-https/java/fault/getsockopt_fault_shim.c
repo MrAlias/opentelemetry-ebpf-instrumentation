@@ -42,6 +42,7 @@ enum {
   java_remote_parent_fault_version = 2,
   java_remote_parent_fault_mode_max_size = 32,
   java_remote_parent_fault_control_single_link_count = 1,
+  java_remote_parent_fault_control_private_mode = 0600,
 };
 
 static const char java_remote_parent_fault_file_environment[] =
@@ -96,7 +97,8 @@ static bool java_remote_parent_fault_control_is_trusted(int descriptor) {
          metadata.st_uid == geteuid() &&
          metadata.st_nlink ==
              java_remote_parent_fault_control_single_link_count &&
-         (metadata.st_mode & (S_IWGRP | S_IWOTH)) == 0;
+         (metadata.st_mode & 07777) ==
+             java_remote_parent_fault_control_private_mode;
 }
 
 static enum java_remote_parent_fault_mode java_remote_parent_fault_mode(void) {

@@ -218,25 +218,30 @@ tasks.register<Delete>("cleanNativeLib") {
     delete(file("target/classes/native/linux-aarch64/libobijni.so"))
 }
 
-val jmhIncludes: String? by project
-val jmhProfilers: String? by project
-val jmhWarmupIterations: String? by project
-val jmhIterations: String? by project
-val jmhForks: String? by project
+fun jmhProperty(documentedName: String, legacyName: String) =
+    providers.gradleProperty(documentedName).orElse(providers.gradleProperty(legacyName))
+
+val jmhIncludes = jmhProperty("jmh.includes", "jmhIncludes")
+val jmhProfilers = jmhProperty("jmh.profilers", "jmhProfilers")
+val jmhWarmupIterations = jmhProperty("jmh.warmupIterations", "jmhWarmupIterations")
+val jmhIterations = jmhProperty("jmh.iterations", "jmhIterations")
+val jmhForks = jmhProperty("jmh.forks", "jmhForks")
 
 jmh {
     includes.set(listOf(".*Benchmark.*"))
-    jmhIncludes?.let {
+
+    jmhIncludes.orNull?.let {
         includes.set(listOf(it))
     }
-    jmhProfilers?.let { profilersStr ->
+    jmhProfilers.orNull?.let { profilersStr ->
         profilers.set(profilersStr.split(",").map { p: String -> p.trim() })
     }
+
     benchmarkMode.set(listOf("avgt"))
     timeUnit.set("ns")
-    warmupIterations.set(jmhWarmupIterations?.toInt() ?: 3)
-    iterations.set(jmhIterations?.toInt() ?: 5)
-    fork.set(jmhForks?.toInt() ?: 1)
+    warmupIterations.set(jmhWarmupIterations.orNull?.toInt() ?: 3)
+    iterations.set(jmhIterations.orNull?.toInt() ?: 5)
+    fork.set(jmhForks.orNull?.toInt() ?: 1)
     jvmArgs.set(listOf("-Xmx2G"))
 }
 

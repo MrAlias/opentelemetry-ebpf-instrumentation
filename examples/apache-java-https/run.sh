@@ -210,7 +210,8 @@ Options:
                           primary-w3c-stale, w3c-only,
                           security, restart-fault, helper-attach-failure,
                           delayed-otlp-suppression, assertion-failure, fail-open,
-                          restart, disabled, or uninstrumented.
+                          restart, disabled, uninstrumented, benchmark-disabled,
+                          or benchmark-uninstrumented.
                           Default: all
   --requests COUNT        Requests per scenario (1-1000); scenario default
                           when omitted.
@@ -393,7 +394,7 @@ parse_args() {
       ;;
   esac
   case "$SCENARIO" in
-    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|timeout-retry|pressure|handoff|virtual-thread|netty|netty-server|dispatch|w3c|w3c-match|obi-flags|w3c-fault|primary-w3c-fault|primary-w3c-stale|w3c-only|security|restart-fault|helper-attach-failure|delayed-otlp-suppression|assertion-failure|fail-open|restart|disabled|uninstrumented)
+    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|timeout-retry|pressure|handoff|virtual-thread|netty|netty-server|dispatch|w3c|w3c-match|obi-flags|w3c-fault|primary-w3c-fault|primary-w3c-stale|w3c-only|security|restart-fault|helper-attach-failure|delayed-otlp-suppression|assertion-failure|fail-open|restart|disabled|uninstrumented|benchmark-disabled|benchmark-uninstrumented)
       ;;
     *)
       die "unsupported scenario: $SCENARIO"
@@ -404,14 +405,21 @@ parse_args() {
     "$PROJECT_NAME" =~ ^${PROJECT_NAMESPACE}-[a-z0-9]([a-z0-9_-]*[a-z0-9])?$ ]] || {
     die "COMPOSE_PROJECT_NAME must be $PROJECT_NAMESPACE or use its reserved lowercase suffix namespace"
   }
-  if [[ "$SCENARIO" == "disabled" && "$TRANSPORT" != "disabled" ]]; then
-    die "the disabled scenario requires --transport disabled"
-  fi
-  if [[ "$SCENARIO" == "uninstrumented" && "$TRANSPORT" != "disabled" ]]; then
-    die "the uninstrumented scenario requires --transport disabled"
-  fi
-  if [[ "$TRANSPORT" == "disabled" && "$SCENARIO" != "disabled" && "$SCENARIO" != "uninstrumented" ]]; then
-    die "--transport disabled may only run --scenario disabled or uninstrumented"
+  case "$SCENARIO" in
+    disabled|uninstrumented|benchmark-disabled|benchmark-uninstrumented)
+      [[ "$TRANSPORT" == "disabled" ]] || {
+        die "the $SCENARIO scenario requires --transport disabled"
+      }
+      ;;
+  esac
+  if [[ "$TRANSPORT" == "disabled" ]]; then
+    case "$SCENARIO" in
+      disabled|uninstrumented|benchmark-disabled|benchmark-uninstrumented)
+        ;;
+      *)
+        die "--transport disabled may only run a disabled or uninstrumented control"
+        ;;
+    esac
   fi
   if [[ "$SCENARIO" == "all" && "$TRANSPORT" == "disabled" ]]; then
     die "the all scenario requires getsockopt, unix, or auto transport"
@@ -1088,6 +1096,11 @@ configure_security_probe_timeouts() {
   export SECURITY_PROBE_TIMEOUT
 }
 
+uses_uninstrumented_runtime() {
+  [[ "$SCENARIO" == "uninstrumented" || \
+    "$SCENARIO" == "benchmark-uninstrumented" ]]
+}
+
 export_compose_environment() {
   SECURITY_PROBE_TIMEOUT="60s"
   PRIMARY_SECURITY_SAME_CGROUP_TIMEOUT="60s"
@@ -1102,7 +1115,7 @@ export_compose_environment() {
   export BACKEND_TLS_PROTOCOL="$TLS_PROTOCOL"
   CONTEXT_PROPAGATION="tcp"
   export CONTEXT_PROPAGATION
-  if [[ "$SCENARIO" == "uninstrumented" ]]; then
+  if uses_uninstrumented_runtime; then
     export EXTENSION_ENABLED=false
     export JAVA_TOOL_OPTIONS_VALUE=""
     export OTEL_JAVAAGENT_EXTENSIONS_VALUE=""
@@ -1125,9 +1138,17 @@ start_stack() {
   local -a recreate_arguments=()
 
   # The primary fault scenario replaces the normal Java runtime only after startup.
-  if [[ "$runtime_contract_mode" == "primary-w3c-fault" ]]; then
-    runtime_contract_mode="basic"
-  fi
+  case "$runtime_contract_mode" in
+    primary-w3c-fault)
+      runtime_contract_mode="basic"
+      ;;
+    benchmark-disabled)
+      runtime_contract_mode="disabled"
+      ;;
+    benchmark-uninstrumented)
+      runtime_contract_mode="uninstrumented"
+      ;;
+  esac
 
   RUN_STAGE="compose-ownership"
   verify_compose_project_ownership || {
@@ -1147,7 +1168,7 @@ start_stack() {
   if [[ "$SCENARIO" == "delayed-otlp-suppression" ]]; then
     recreate_arguments=(--force-recreate)
   fi
-  if [[ "$SCENARIO" == "uninstrumented" ]]; then
+  if uses_uninstrumented_runtime; then
     run_logged_bounded "$RESULT_DIR/compose-up.log" "$COMMAND_TIMEOUT_SECONDS" \
       "${COMPOSE[@]}" up --build --detach "${recreate_arguments[@]}" \
         trace-receiver java-backend apache-proxy || start_status=$?
@@ -1159,7 +1180,7 @@ start_stack() {
   if ((start_status != 0)); then
     return "$start_status"
   fi
-  if [[ "$SCENARIO" != "uninstrumented" && "$TRANSPORT" != "disabled" ]]; then
+  if ! uses_uninstrumented_runtime && [[ "$TRANSPORT" != "disabled" ]]; then
     BRIDGE_RUNNING=true
   fi
 
@@ -1194,14 +1215,14 @@ start_stack() {
     if [[ "$SCENARIO" != "delayed-otlp-suppression" ]]; then
       assert_selected_transport || return $?
     fi
-  elif [[ "$SCENARIO" != "uninstrumented" ]]; then
+  elif ! uses_uninstrumented_runtime; then
     wait_for_log \
       java-backend \
       "OBI remote-parent propagator enabled" \
       "external OTel extension" \
       "$startup_since" || return $?
   fi
-  if [[ "$SCENARIO" != "uninstrumented" ]]; then
+  if ! uses_uninstrumented_runtime; then
     wait_for_log \
       java-backend \
       "OBI Java instrumentation ready" \
@@ -1784,6 +1805,10 @@ assert_normal_runtime_has_no_primary_fault_environment() {
   }
 }
 
+host_vmlinux_btf_readable() {
+  [[ -r /sys/kernel/btf/vmlinux ]]
+}
+
 assert_runtime_contract() {
   local -r mode="${1:-$SCENARIO}"
   local -r suppression_already_observed="${2:-false}"
@@ -1792,9 +1817,12 @@ assert_runtime_contract() {
   local java_environment=""
   local obi_container=""
   local obi_identity=""
+  local obi_environment=""
+  local bridge_transport_count=""
   local java_agent="absent"
   local dynamic_agent_loading="not-configured"
   local extension="absent"
+  local bridge_transport="not-applicable"
 
   [[ "$suppression_already_observed" == "false" || \
     "$suppression_already_observed" == "true" ]] || {
@@ -1886,6 +1914,49 @@ assert_runtime_contract() {
       log_error "$mode control unexpectedly started OBI"
       return 1
     }
+  elif [[ "$mode" == "disabled" ]]; then
+    [[ "$java_agent" == "official" && "$dynamic_agent_loading" == "enabled" &&
+      "$extension" == "enabled" ]] || {
+      log_error "disabled control requires the official Java agent and enabled extension"
+      return 1
+    }
+    obi_container="$(run_bounded 10 "${COMPOSE[@]}" ps --quiet obi)" || return $?
+    [[ -n "$obi_container" ]] || {
+      log_error "disabled control requires an OBI container"
+      return 1
+    }
+    obi_identity="$(run_bounded 10 docker inspect \
+      --format '{{.HostConfig.Privileged}} {{.HostConfig.PidMode}}' \
+      "$obi_container")" || return $?
+    [[ "$obi_identity" == "true host" ]] || {
+      log_error "OBI runtime must be privileged with the host PID namespace, got: $obi_identity"
+      return 1
+    }
+    obi_environment="$(run_bounded 10 docker inspect \
+      --format '{{range .Config.Env}}{{println .}}{{end}}' \
+      "$obi_container")" || return $?
+    bridge_transport_count="$(environment_line_prefix_count \
+      "$obi_environment" \
+      "OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT=")" || return $?
+    [[ "$bridge_transport_count" == "1" ]] || {
+      log_error "disabled control requires exactly one OBI remote-parent transport setting"
+      return 1
+    }
+    environment_has_line \
+      "$obi_environment" \
+      "OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT=disabled" || {
+      log_error "disabled control did not configure the OBI remote-parent transport as disabled"
+      return 1
+    }
+    host_vmlinux_btf_readable || {
+      log_error "host vmlinux BTF is not readable"
+      return 1
+    }
+    bridge_transport="disabled"
+    if [[ "$suppression_already_observed" == "false" ]]; then
+      wait_for_java_duplicate_suppression \
+        "$RESULT_DIR/duplicate-suppression-$mode.prom" || return $?
+    fi
   elif [[ "$mode" == "helper-attach-fault" ]]; then
     [[ "$java_agent" == "official" && "$dynamic_agent_loading" == "disabled" &&
       "$extension" == "enabled" ]] || {
@@ -1904,7 +1975,7 @@ assert_runtime_contract() {
       log_error "OBI runtime must be privileged with the host PID namespace, got: $obi_identity"
       return 1
     }
-    [[ -r /sys/kernel/btf/vmlinux ]] || {
+    host_vmlinux_btf_readable || {
       log_error "host vmlinux BTF is not readable"
       return 1
     }
@@ -1926,7 +1997,7 @@ assert_runtime_contract() {
       log_error "OBI runtime must be privileged with the host PID namespace, got: $obi_identity"
       return 1
     }
-    [[ -r /sys/kernel/btf/vmlinux ]] || {
+    host_vmlinux_btf_readable || {
       log_error "host vmlinux BTF is not readable"
       return 1
     }
@@ -1944,7 +2015,8 @@ assert_runtime_contract() {
     printf 'extension=%s\n' "$extension"
     printf 'obi_container=%s\n' "${obi_container:-absent}"
     printf 'obi_privileged_pid_mode=%s\n' "${obi_identity:-absent}"
-    printf 'vmlinux_btf=%s\n' "$([[ -r /sys/kernel/btf/vmlinux ]] && printf readable || printf unavailable)"
+    printf 'bridge_transport=%s\n' "$bridge_transport"
+    printf 'vmlinux_btf=%s\n' "$(host_vmlinux_btf_readable && printf readable || printf unavailable)"
   } >"$output" || return $?
 }
 
@@ -3681,6 +3753,7 @@ run_scenario() {
   local -r phase_evidence="${3:-full}"
   local -r fixture_mode="${4:-none}"
   local -r retrieval_mode="${5:-normal}"
+  local -r assertion_mode="${6:-}"
   local run_number=0
   local label=""
   local output=""
@@ -3727,6 +3800,7 @@ run_scenario() {
   local metric_status=0
   local status_name="passed"
   local -a request_arguments=()
+  local -a scenario_arguments=()
 
   [[ "$diagnostics_enabled" == "true" || "$diagnostics_enabled" == "false" ]] || {
     log_error "scenario diagnostics mode must be true or false"
@@ -3744,6 +3818,15 @@ run_scenario() {
     log_error "scenario retrieval mode must be normal or helper-unavailable"
     return 1
   }
+  [[ -z "$assertion_mode" || "$assertion_mode" == "disabled" || \
+    "$assertion_mode" == "uninstrumented" ]] || {
+    log_error "scenario assertion mode must be disabled or uninstrumented"
+    return 1
+  }
+  if [[ -n "$assertion_mode" && "$name" != "concurrency" ]]; then
+    log_error "an explicit assertion mode requires the concurrency workload"
+    return 1
+  fi
   if [[ "$fixture_mode" == "matching" && \
     ( "$name" != "w3c-match" || "$diagnostics_enabled" != "true" ) ]]; then
     log_error "the matching fixture requires the diagnostic w3c-match scenario"
@@ -3880,13 +3963,20 @@ run_scenario() {
       fi
     fi
     if ((scenario_status == 0)); then
+      scenario_arguments=(
+        --scenario "$name"
+        --expected-tls "$TLS_PROTOCOL"
+        --seed "$SCENARIO_SEED"
+        "${request_arguments[@]}"
+        --timeout 75s
+      )
+      if [[ -n "$assertion_mode" ]]; then
+        scenario_arguments+=(--assertion-mode "$assertion_mode")
+      fi
       if run_bounded "$SCENARIO_RUN_TIMEOUT_SECONDS" \
         "${COMPOSE[@]}" run --rm --no-deps --no-TTY scenario \
-          --scenario "$name" \
-          --expected-tls "$TLS_PROTOCOL" \
-          --seed "$SCENARIO_SEED" \
-          "${request_arguments[@]}" \
-          --timeout 75s 2> >(tee "$stderr_output" >&2) | tee "$output"; then
+          "${scenario_arguments[@]}" \
+          2> >(tee "$stderr_output" >&2) | tee "$output"; then
         scenario_status=0
       else
         scenario_status=$?
@@ -6805,6 +6895,12 @@ execute_requested_scenarios() {
       ;;
     security)
       run_security_control
+      ;;
+    benchmark-disabled)
+      run_scenario concurrency true full none normal disabled
+      ;;
+    benchmark-uninstrumented)
+      run_scenario concurrency true full none normal uninstrumented
       ;;
     uninstrumented)
       run_scenario uninstrumented

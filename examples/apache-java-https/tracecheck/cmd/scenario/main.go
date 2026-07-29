@@ -33,6 +33,7 @@ type config struct {
 	baseURL               string
 	receiverURL           string
 	scenario              string
+	assertionMode         string
 	faultMode             string
 	javaDiagnosticsBefore string
 	requestCount          int
@@ -155,6 +156,7 @@ type socketObservation struct {
 type runResult struct {
 	Status                string                      `json:"status"`
 	Scenario              string                      `json:"scenario"`
+	AssertionMode         tracecheck.AssertionMode    `json:"assertion_mode,omitempty"`
 	Seed                  int64                       `json:"seed"`
 	StartedAt             time.Time                   `json:"started_at"`
 	FinishedAt            time.Time                   `json:"finished_at"`
@@ -286,6 +288,7 @@ func parseFlags() config {
 	flag.StringVar(&cfg.baseURL, "base-url", "http://127.0.0.1:18080", "Apache base URL")
 	flag.StringVar(&cfg.receiverURL, "receiver-url", "http://127.0.0.1:14318", "trace receiver base URL")
 	flag.StringVar(&cfg.scenario, "scenario", "basic", "basic, keepalive, pipelining, concurrency, connection-churn, fd-port-reuse, slow-body, tls-boundary, timeout-retry, pressure, handoff, virtual-thread, netty, netty-server, dispatch, w3c, w3c-match, obi-flags, w3c-fault, primary-w3c-fault, primary-w3c-stale, w3c-only, helper-attach-failure, restart-fault, fail-open, restart, disabled, or uninstrumented")
+	flag.StringVar(&cfg.assertionMode, "assertion-mode", "", "concurrency assertion override: disabled or uninstrumented")
 	flag.StringVar(&cfg.faultMode, "fault-mode", "", "W3C fault mode")
 	flag.StringVar(&cfg.javaDiagnosticsBefore, "java-diagnostics-before", "", "sanitized Java diagnostics baseline for primary-w3c-fault")
 	flag.IntVar(&cfg.requestCount, "requests", 0, "number of requests (zero selects a scenario default)")
@@ -333,6 +336,10 @@ func parseFlags() config {
 		fmt.Fprintln(os.Stderr, "--restart-control-dir requires restart-fault")
 		os.Exit(2)
 	}
+	if err := validateAssertionMode(cfg); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
 	if err := validateFaultMode(cfg); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
@@ -342,6 +349,32 @@ func parseFlags() config {
 		os.Exit(2)
 	}
 	return cfg
+}
+
+func validateAssertionMode(cfg config) error {
+	switch cfg.assertionMode {
+	case "":
+		return nil
+	case string(tracecheck.ModeDisabled), string(tracecheck.ModeUninstrumented):
+		if cfg.scenario == "concurrency" {
+			return nil
+		}
+		return errors.New("--assertion-mode requires concurrency")
+	default:
+		return fmt.Errorf("invalid --assertion-mode %q", cfg.assertionMode)
+	}
+}
+
+func concurrencyAssertionMode(cfg config) tracecheck.AssertionMode {
+	if cfg.assertionMode != "" {
+		return tracecheck.AssertionMode(cfg.assertionMode)
+	}
+	return tracecheck.ModeBridge
+}
+
+func requiresDistinctParents(cfg config) bool {
+	return cfg.assertionMode != string(tracecheck.ModeUninstrumented) &&
+		distinctParentScenario(cfg.scenario)
 }
 
 func validateFaultMode(cfg config) error {
@@ -425,6 +458,9 @@ func expectedPrimaryJavaFaultStatus(faultMode string) (string, bool) {
 
 func run(ctx context.Context, cfg config) (*runResult, error) {
 	result := &runResult{Scenario: cfg.scenario, Seed: cfg.seed, StartedAt: time.Now().UTC()}
+	if cfg.scenario == "concurrency" {
+		result.AssertionMode = concurrencyAssertionMode(cfg)
+	}
 	if err := waitForHealth(ctx, cfg.receiverURL+"/healthz"); err != nil {
 		return result, fmt.Errorf("receiver readiness: %w", err)
 	}
@@ -495,14 +531,19 @@ func run(ctx context.Context, cfg config) (*runResult, error) {
 	if pressureErr != nil {
 		return result, pressureErr
 	}
-	if err := validateDistinctParents(cfg.scenario, cfg.javaService, result.Cases); err != nil {
-		return result, err
+	if requiresDistinctParents(cfg) {
+		if err := validateDistinctParents(cfg.scenario, cfg.javaService, result.Cases); err != nil {
+			return result, err
+		}
 	}
 
 	return result, nil
 }
 
 func makeRequests(cfg config) ([]requestCase, error) {
+	if err := validateAssertionMode(cfg); err != nil {
+		return nil, err
+	}
 	if err := validateFaultMode(cfg); err != nil {
 		return nil, err
 	}
@@ -1620,6 +1661,9 @@ func expectationFor(cfg config, request requestCase) tracecheck.Expectation {
 		mode = tracecheck.ModeW3CNoOBI
 	case "restart-fault":
 		mode = tracecheck.ModeW3CResilience
+	}
+	if cfg.scenario == "concurrency" {
+		mode = concurrencyAssertionMode(cfg)
 	}
 	return tracecheck.Expectation{
 		Mode:            mode,

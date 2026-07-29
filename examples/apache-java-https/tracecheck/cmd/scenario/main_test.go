@@ -110,6 +110,47 @@ func TestPipeliningUsesFailClosedInboundPolicy(t *testing.T) {
 	).Mode)
 }
 
+func TestConcurrencyAssertionModesRetainOneWorkload(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		assertionMode string
+		wantMode      tracecheck.AssertionMode
+		wantDistinct  bool
+	}{
+		{name: "bridge", wantMode: tracecheck.ModeBridge, wantDistinct: true},
+		{name: "disabled", assertionMode: "disabled", wantMode: tracecheck.ModeDisabled, wantDistinct: true},
+		{name: "uninstrumented", assertionMode: "uninstrumented", wantMode: tracecheck.ModeUninstrumented},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := config{scenario: "concurrency", assertionMode: test.assertionMode, seed: 42}
+			requests, err := makeRequests(cfg)
+			require.NoError(t, err)
+			require.Len(t, requests, 16)
+			assert.Equal(t, test.wantMode, expectationFor(cfg, requests[0]).Mode)
+			assert.Equal(t, test.wantMode, concurrencyAssertionMode(cfg))
+			assert.Equal(t, test.wantDistinct, requiresDistinctParents(cfg))
+		})
+	}
+
+	assert.ErrorContains(t, validateAssertionMode(config{
+		scenario:      "basic",
+		assertionMode: "disabled",
+	}), "requires concurrency")
+	assert.ErrorContains(t, validateAssertionMode(config{
+		scenario:      "concurrency",
+		assertionMode: "bridge",
+	}), "invalid --assertion-mode")
+}
+
+func TestConcurrencyResultEncodesItsAssertionMode(t *testing.T) {
+	var output bytes.Buffer
+	require.NoError(t, encodeRunResult(&output, &runResult{
+		Scenario:      "concurrency",
+		AssertionMode: tracecheck.ModeUninstrumented,
+	}))
+	assert.Contains(t, output.String(), "\"assertion_mode\": \"uninstrumented\"")
+}
+
 func TestPressureUsesReasonCodedParentPolicy(t *testing.T) {
 	expectation := expectationFor(
 		config{scenario: "pressure"},

@@ -968,6 +968,24 @@ test_control_modes_are_distinct() {
   (
     TRANSPORT="getsockopt"
     SCENARIO="all"
+    parse_args --transport disabled --scenario benchmark-disabled
+    [[ "$TRANSPORT" == "disabled" && "$SCENARIO" == "benchmark-disabled" ]]
+  ) || {
+    printf 'rejected the comparable bridge-disabled benchmark control\n' >&2
+    return 1
+  }
+  (
+    TRANSPORT="getsockopt"
+    SCENARIO="all"
+    parse_args --transport disabled --scenario benchmark-uninstrumented
+    [[ "$TRANSPORT" == "disabled" && "$SCENARIO" == "benchmark-uninstrumented" ]]
+  ) || {
+    printf 'rejected the comparable uninstrumented benchmark control\n' >&2
+    return 1
+  }
+  (
+    TRANSPORT="getsockopt"
+    SCENARIO="all"
     parse_args --transport getsockopt --scenario delayed-otlp-suppression
     [[ "$TRANSPORT" == "getsockopt" && "$SCENARIO" == "delayed-otlp-suppression" ]]
   ) || {
@@ -992,6 +1010,182 @@ test_control_modes_are_distinct() {
     printf 'accepted an uninstrumented control with an enabled transport\n' >&2
     return 1
   fi
+  if (
+    TRANSPORT="getsockopt"
+    SCENARIO="all"
+    parse_args --transport getsockopt --scenario benchmark-uninstrumented
+  ) >/dev/null 2>&1; then
+    printf 'accepted an uninstrumented benchmark control with an enabled transport\n' >&2
+    return 1
+  fi
+}
+
+test_benchmark_controls_use_shared_concurrency_workload() {
+  local -r disabled_arguments="$TEST_TMP_DIR/benchmark-disabled-arguments"
+  local -r uninstrumented_arguments="$TEST_TMP_DIR/benchmark-uninstrumented-arguments"
+
+  (
+    SCENARIO="benchmark-disabled"
+    run_scenario() {
+      printf '%s\n' "$*" >"$disabled_arguments"
+    }
+    execute_requested_scenarios
+  ) || {
+    printf 'benchmark-disabled control could not dispatch its workload\n' >&2
+    return 1
+  }
+  [[ "$(<"$disabled_arguments")" == \
+    "concurrency true full none normal disabled" ]] || {
+    printf 'benchmark-disabled control did not retain the disabled concurrency assertion\n' >&2
+    return 1
+  }
+
+  (
+    SCENARIO="benchmark-uninstrumented"
+    run_scenario() {
+      printf '%s\n' "$*" >"$uninstrumented_arguments"
+    }
+    execute_requested_scenarios
+  ) || {
+    printf 'benchmark-uninstrumented control could not dispatch its workload\n' >&2
+    return 1
+  }
+  [[ "$(<"$uninstrumented_arguments")" == \
+    "concurrency true full none normal uninstrumented" ]] || {
+    printf 'benchmark-uninstrumented control did not retain the uninstrumented concurrency assertion\n' >&2
+    return 1
+  }
+}
+
+test_benchmark_controls_configure_their_runtime() {
+  (
+    SCENARIO="benchmark-disabled"
+    export_compose_environment
+    [[ "$EXTENSION_ENABLED" == "true" &&
+      "$JAVA_TOOL_OPTIONS_VALUE" == "-javaagent:/otel/official-javaagent.jar" &&
+      "$OTEL_JAVAAGENT_EXTENSIONS_VALUE" == "/otel/obi-otel-extension.jar" &&
+      "$OTEL_PROPAGATORS_VALUE" == "obi,tracecontext,baggage" ]]
+  ) || {
+    printf 'benchmark-disabled control did not retain the instrumented runtime\n' >&2
+    return 1
+  }
+  (
+    SCENARIO="benchmark-uninstrumented"
+    export_compose_environment
+    [[ "$EXTENSION_ENABLED" == "false" &&
+      -z "$JAVA_TOOL_OPTIONS_VALUE" &&
+      -z "$OTEL_JAVAAGENT_EXTENSIONS_VALUE" &&
+      "$OTEL_PROPAGATORS_VALUE" == "tracecontext,baggage" ]] &&
+      uses_uninstrumented_runtime
+  ) || {
+    printf 'benchmark-uninstrumented control did not omit instrumentation\n' >&2
+    return 1
+  }
+}
+
+test_benchmark_startup_selects_runtime_contract() {
+  local -r disabled_dir="$TEST_TMP_DIR/benchmark-disabled-startup"
+  local -r uninstrumented_dir="$TEST_TMP_DIR/benchmark-uninstrumented-startup"
+
+  mkdir -p -- "$disabled_dir" "$uninstrumented_dir"
+  (
+    RESULT_DIR="$disabled_dir"
+    SCENARIO="benchmark-disabled"
+    TRANSPORT=disabled
+    COMMAND_TIMEOUT_SECONDS=5
+    STACK_STARTED=false
+    BRIDGE_RUNNING=false
+    COMPOSE=(test-compose)
+    verify_compose_project_ownership() { :; }
+    invalidate_project_transport_evidence() { :; }
+    run_bounded() { :; }
+    run_logged_bounded() { printf '%s\n' "$*" >"$disabled_dir/compose"; }
+    date() { printf 'startup-cursor\n'; }
+    wait_for_http() { :; }
+    wait_for_log() { :; }
+    wait_for_apache_instrumentation() { :; }
+    assert_apache_denies_java_diagnostics() { :; }
+    assert_runtime_contract() { printf '%s\n' "$1" >"$disabled_dir/runtime"; }
+
+    start_stack
+  ) || {
+    printf 'benchmark-disabled startup failed\n' >&2
+    return 1
+  }
+  [[ "$(<"$disabled_dir/compose")" == *"trace-receiver java-backend apache-proxy obi"* &&
+    "$(<"$disabled_dir/runtime")" == "disabled" ]] || {
+    printf 'benchmark-disabled startup did not retain the disabled runtime\n' >&2
+    return 1
+  }
+
+  (
+    RESULT_DIR="$uninstrumented_dir"
+    SCENARIO="benchmark-uninstrumented"
+    TRANSPORT=disabled
+    COMMAND_TIMEOUT_SECONDS=5
+    STACK_STARTED=false
+    BRIDGE_RUNNING=false
+    COMPOSE=(test-compose)
+    verify_compose_project_ownership() { :; }
+    invalidate_project_transport_evidence() { :; }
+    run_bounded() { :; }
+    run_logged_bounded() { printf '%s\n' "$*" >"$uninstrumented_dir/compose"; }
+    date() { printf 'startup-cursor\n'; }
+    wait_for_http() { :; }
+    wait_for_log() { return 1; }
+    wait_for_apache_instrumentation() { return 1; }
+    assert_apache_denies_java_diagnostics() { :; }
+    assert_runtime_contract() { printf '%s\n' "$1" >"$uninstrumented_dir/runtime"; }
+
+    start_stack
+  ) || {
+    printf 'benchmark-uninstrumented startup failed\n' >&2
+    return 1
+  }
+  [[ "$(<"$uninstrumented_dir/compose")" == *"trace-receiver java-backend apache-proxy"* &&
+    "$(<"$uninstrumented_dir/compose")" != *" apache-proxy obi"* &&
+    "$(<"$uninstrumented_dir/runtime")" == "uninstrumented" ]] || {
+    printf 'benchmark-uninstrumented startup did not omit OBI\n' >&2
+    return 1
+  }
+}
+
+test_benchmark_control_passes_assertion_mode_to_tracecheck() {
+  local assertion_mode=""
+  local invocation=""
+
+  for assertion_mode in disabled uninstrumented; do
+    invocation="$TEST_TMP_DIR/benchmark-tracecheck-$assertion_mode-invocation"
+    (
+      RESULT_DIR="$TEST_TMP_DIR/benchmark-tracecheck-$assertion_mode"
+      mkdir -- "$RESULT_DIR"
+      COMPOSE=(docker compose)
+      REPEAT_COUNT=1
+      REQUEST_COUNT=16
+      BRIDGE_RUNNING=false
+      SELECTED_TRANSPORT=""
+      scenario_bridge_missing_count() { printf '0\n'; }
+      scenario_java_missing_count() { printf '0\n'; }
+      scenario_bridge_take_count() { printf '16\n'; }
+      flush_bridge_metric_boundary() { :; }
+      capture_java_diagnostics() { :; }
+      capture_phase_evidence() { :; }
+      write_metrics_delta() { :; }
+      run_bounded() {
+        printf '%q ' "$@" >"$invocation"
+        printf '{"status":"passed"}\n'
+      }
+
+      run_scenario concurrency true full none normal "$assertion_mode"
+    ) || {
+      printf 'benchmark %s control could not run its tracecheck assertion\n' \
+        "$assertion_mode" >&2
+      return 1
+    }
+    grep -Fq -- '--scenario concurrency' "$invocation" || return 1
+    grep -Fq -- '--requests 16' "$invocation" || return 1
+    grep -Fq -- "--assertion-mode $assertion_mode" "$invocation" || return 1
+  done
 }
 
 test_benchmark_controls_are_bounded() {
@@ -7408,6 +7602,74 @@ test_extension_disabled_runtime_requires_explicit_false() {
   )
 }
 
+test_disabled_runtime_requires_explicit_transport_disable() {
+  local -r result_dir="$TEST_TMP_DIR/disabled-runtime"
+  local java_environment=""
+  local obi_environment=""
+  local btf_readable=true
+
+  mkdir -p -- "$result_dir"
+  (
+    RESULT_DIR="$result_dir"
+    COMPOSE=(test-compose)
+    run_bounded() {
+      case "$*" in
+        *"test-compose ps --quiet java-backend")
+          printf 'java-container\n'
+          ;;
+        *"docker inspect --format "*" java-container")
+          printf '%s\n' "$java_environment"
+          ;;
+        *"test-compose ps --quiet obi")
+          printf 'obi-container\n'
+          ;;
+        *"range .Config.Env"*" obi-container")
+          printf '%s\n' "$obi_environment"
+          ;;
+        *"docker inspect --format "*" obi-container")
+          printf 'true host\n'
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+    }
+    wait_for_java_duplicate_suppression() { :; }
+    log_error() { :; }
+    host_vmlinux_btf_readable() { [[ "$btf_readable" == "true" ]]; }
+
+    java_environment=$'JAVA_TOOL_OPTIONS=-javaagent:/otel/official-javaagent.jar\nOTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar\nOTEL_OBI_REMOTE_PARENT_ENABLED=true'
+    obi_environment='OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT=disabled'
+    assert_runtime_contract disabled || {
+      printf 'disabled runtime rejected the exact disabled transport\n' >&2
+      return 1
+    }
+    grep -Fqx 'bridge_transport=disabled' \
+      "$result_dir/runtime-assertions-disabled.txt"
+    grep -Fqx 'vmlinux_btf=readable' \
+      "$result_dir/runtime-assertions-disabled.txt"
+
+    btf_readable=false
+    if assert_runtime_contract disabled >/dev/null 2>&1; then
+      printf 'disabled runtime accepted unreadable vmlinux BTF\n' >&2
+      return 1
+    fi
+    btf_readable=true
+
+    for obi_environment in \
+      'OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT=getsockopt' \
+      'OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT=unix' \
+      $'OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT=disabled\nOTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT=getsockopt' \
+      $'OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT=disabled\nOTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT=disabled' \
+      ''; do
+      if assert_runtime_contract disabled >/dev/null 2>&1; then
+        printf 'disabled runtime accepted a non-disabled OBI transport\n' >&2
+        return 1
+      fi
+    done
+  )
+}
+
 test_helper_attach_runtime_requires_exact_dynamic_disable() {
   local -r result_dir="$TEST_TMP_DIR/helper-attach-runtime"
   local runtime_environment=""
@@ -10183,6 +10445,10 @@ main() {
   test_selected_transport_uses_java_diagnostics
   test_transport_configuration_file_size_boundary_is_exact
   test_control_modes_are_distinct
+  test_benchmark_controls_use_shared_concurrency_workload
+  test_benchmark_controls_configure_their_runtime
+  test_benchmark_startup_selects_runtime_contract
+  test_benchmark_control_passes_assertion_mode_to_tracecheck
   test_benchmark_controls_are_bounded
   test_all_suite_includes_every_scenario
   test_unix_all_suite_includes_fault_control
@@ -10284,6 +10550,7 @@ main() {
   test_runtime_environment_line_matching
   test_primary_fault_runtime_contract_is_exact_and_base_is_clean
   test_extension_disabled_runtime_requires_explicit_false
+  test_disabled_runtime_requires_explicit_transport_disable
   test_helper_attach_runtime_requires_exact_dynamic_disable
   test_delayed_otlp_runtime_requires_exact_export_delay
   test_start_stack_invalidates_project_evidence_before_compose_up

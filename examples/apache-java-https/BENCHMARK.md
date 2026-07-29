@@ -123,8 +123,25 @@ JSON, post-load sentinel, host environment, Docker stats and inspect records,
 diagnostics. A snapshot labelled `unsynchronized_midpoint` is a point sample
 while the load command is still running; it is not proof that traffic was live
 throughout the sample. The manifest includes a shell-escaped invocation for
-reproduction. `summary.json` is therefore not acceptance evidence and does not
-turn unavailable measurements into zeroes.
+reproduction. On a successful full harness run, `variance.json` records every
+requested completed sustained-client repetition separately for each core cell;
+it preserves the ordinal source paths rather than combining cells, warmups,
+sentinels, midpoint samples, or individual requests. `summary.json` links that
+artifact only when it is available.
+
+For every retained per-repetition value, `variance.json` reports the observed
+minimum, numeric median, and maximum. With an odd sample count, the median is
+the middle sorted value; with an even count, it is the arithmetic mean of the
+two middle values. The observed minimum--maximum range is a spread, not a
+variance estimator or confidence interval. In particular, a latency p99 median
+is the median of repetition p99 values, not a pooled all-request p99. Missing,
+malformed, failed, symlinked, or unexpected numeric repetition artifacts fail the
+harness instead of being dropped or converted to zero.
+
+Both `variance.json` and `summary.json` are descriptive, non-acceptance
+evidence: they apply no threshold, make no acceptable-regression decision, and
+do not establish a production SLO. `summary.json` also does not turn unavailable
+measurements into zeroes.
 
 The initial harness intentionally records these #37 dimensions as
 `not_collected`: JNI lookup percentiles, JFR/NMT allocation/native/direct-memory
@@ -196,9 +213,11 @@ Retain raw summaries and the exact command with the result artifact. Do not
 enable host-global BPF statistics as part of a shared benchmark host without an
 explicit host-level measurement plan.
 
-Run at least five measurement repetitions and report median plus spread. Do not
-combine primary and fallback lookup latency into one percentile. Stop the
-scoped stack afterward:
+The harness requires five to ten measurement repetitions and records the
+per-cell median and observed spread in `variance.json`; report it with the
+fixed-host artifact rather than pooling transport configurations or lookup
+paths. Do not combine primary and fallback lookup latency into one percentile.
+Stop the scoped stack afterward:
 
 ```bash
 ./examples/apache-java-https/run.sh --cleanup-only

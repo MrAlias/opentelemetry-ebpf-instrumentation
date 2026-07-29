@@ -1060,6 +1060,13 @@ EOF
 write_valid_benchmark_result() {
   local -r output="$1"
   local -r duration_seconds="$2"
+  local -r successful_requests="${3:-1}"
+  local -r failed_requests="${4:-0}"
+  local -r traffic_elapsed_nanos="${5:-$((duration_seconds * 1000000000))}"
+  local -r throughput_per_second="${6:-1}"
+  local -r p50_nanos="${7:-1}"
+  local -r p95_nanos="${8:-1}"
+  local -r p99_nanos="${9:-1}"
 
   jq -n \
     --arg base_url "$WORKLOAD_BASE_URL" \
@@ -1070,18 +1077,70 @@ write_valid_benchmark_result() {
     --argjson concurrency "$CONCURRENCY" \
     --argjson request_limit "$REQUEST_LIMIT" \
     --argjson seed "$SUSTAINED_LOAD_SEED" \
-    --argjson w3c "$CELL_SUSTAINED_W3C" '
+    --argjson w3c "$CELL_SUSTAINED_W3C" \
+    --argjson successful_requests "$successful_requests" \
+    --argjson failed_requests "$failed_requests" \
+    --argjson traffic_elapsed_nanos "$traffic_elapsed_nanos" \
+    --argjson throughput_per_second "$throughput_per_second" \
+    --argjson p50_nanos "$p50_nanos" \
+    --argjson p95_nanos "$p95_nanos" \
+    --argjson p99_nanos "$p99_nanos" '
       {
         status: "passed", base_url: $base_url, path: $path,
         connection_mode: $connection_mode, w3c: $w3c, seed: $seed,
         requested_duration_nanos: $duration_nanos,
         request_timeout_nanos: $timeout_nanos, concurrency: $concurrency,
         request_limit: $request_limit, request_limit_reached: false,
-        canceled: false, successful_requests: 1, failed_requests: 0,
-        traffic_elapsed_nanos: $duration_nanos, throughput_per_second: 1,
-        latency: {p50_nanos: 1, p95_nanos: 1, p99_nanos: 1}
+        canceled: false, successful_requests: $successful_requests, failed_requests: $failed_requests,
+        traffic_elapsed_nanos: $traffic_elapsed_nanos, throughput_per_second: $throughput_per_second,
+        latency: {p50_nanos: $p50_nanos, p95_nanos: $p95_nanos, p99_nanos: $p99_nanos}
       }
     ' >"$output"
+}
+
+write_variance_fixture_cell() {
+  local -r cell="$1"
+  local -r successful_requests="${2:-1}"
+  local -r failed_requests="${3:-0}"
+  local -r traffic_elapsed_nanos="${4:-$((DURATION_SECONDS * 1000000000))}"
+  local -r throughput_per_second="${5:-1}"
+  local -r p50_nanos="${6:-1}"
+  local -r p95_nanos="${7:-1}"
+  local -r p99_nanos="${8:-1}"
+  local -r cell_dir="$OUTPUT_DIR/cells/$cell"
+  local repetition=0
+  local repetition_label=""
+
+  cell_spec "$cell" || return 1
+  mkdir -p -- "$cell_dir/measurements" "$cell_dir/preflight"
+  jq -n --arg cell "$cell" '{status: "passed", cell: $cell}' >"$cell_dir/status.json"
+  jq -n --arg cell "$cell" '{cell: $cell}' >"$cell_dir/preflight/contract.json"
+  for ((repetition = 1; repetition <= REPETITIONS; repetition++)); do
+    printf -v repetition_label 'rep-%02d' "$repetition"
+    write_valid_benchmark_result \
+      "$cell_dir/measurements/$repetition_label.json" \
+      "$DURATION_SECONDS" \
+      "$successful_requests" \
+      "$failed_requests" \
+      "$traffic_elapsed_nanos" \
+      "$throughput_per_second" \
+      "$p50_nanos" \
+      "$p95_nanos" \
+      "$p99_nanos"
+  done
+}
+
+prepare_variance_fixture() {
+  local -r output="$1"
+  local cell=""
+
+  OUTPUT_DIR="$output"
+  # shellcheck disable=SC2034 # Consumed by write_variance_summary from the sourced harness.
+  OUTPUT_READY=true
+  mkdir -p -- "$OUTPUT_DIR/cells"
+  for cell in "${CORE_CELLS[@]}"; do
+    write_variance_fixture_cell "$cell"
+  done
 }
 
 write_valid_sentinel() {
@@ -1122,6 +1181,8 @@ test_json_validators_require_one_document() {
   local -r w3c_sentinel_result="$TEST_TMP_DIR/w3c-sentinel-result.json"
   local -r under_run_result="$TEST_TMP_DIR/under-run-result.json"
   local -r overrun_result="$TEST_TMP_DIR/overrun-result.json"
+  local -r non_numeric_metric_result="$TEST_TMP_DIR/non-numeric-metric-result.json"
+  local -r fractional_metric_result="$TEST_TMP_DIR/fractional-metric-result.json"
 
   reset_options
   write_valid_benchmark_result "$benchmark_result" 2
@@ -1140,6 +1201,22 @@ test_json_validators_require_one_document() {
   ))" '.traffic_elapsed_nanos = $elapsed_nanos' "$benchmark_result" >"$overrun_result"
   if validate_benchmark_result "$overrun_result" 2 >/dev/null 2>&1; then
     printf 'benchmark validator accepted an overrun beyond its bounded drain tolerance\n' >&2
+    return 1
+  fi
+  jq '
+    .throughput_per_second = "x" |
+    .latency = {p50_nanos: "x", p95_nanos: "y", p99_nanos: "z"}
+  ' "$benchmark_result" >"$non_numeric_metric_result"
+  if validate_benchmark_result "$non_numeric_metric_result" 2 >/dev/null 2>&1; then
+    printf 'benchmark validator accepted non-numeric throughput or latency metrics\n' >&2
+    return 1
+  fi
+  jq '
+    .traffic_elapsed_nanos = 2000000000.5 |
+    .latency = {p50_nanos: 1.5, p95_nanos: 1.5, p99_nanos: 1.5}
+  ' "$benchmark_result" >"$fractional_metric_result"
+  if validate_benchmark_result "$fractional_metric_result" 2 >/dev/null 2>&1; then
+    printf 'benchmark validator accepted fractional nanosecond metrics\n' >&2
     return 1
   fi
   printf '\n' >>"$benchmark_result"
@@ -1296,6 +1373,265 @@ test_json_validators_require_one_document() {
     fi
   )
 }
+
+test_variance_summary_records_ordered_per_cell_statistics() (
+  local -r output="$TEST_TMP_DIR/variance-summary"
+  local repetition=0
+  local repetition_label=""
+  local -a successful_requests=(6 1 5 2 4 3)
+  local -a throughput_per_second=(60 10 50 20 40 30)
+  local -a p50_nanos=(6 1 5 2 4 3)
+  local -a p95_nanos=(60 10 50 20 40 30)
+  local -a p99_nanos=(600 100 500 200 400 300)
+
+  reset_options
+  DURATION_SECONDS=2
+  REPETITIONS=6
+  prepare_variance_fixture "$output"
+  cell_spec getsockopt-hit
+  for ((repetition = 1; repetition <= REPETITIONS; repetition++)); do
+    printf -v repetition_label 'rep-%02d' "$repetition"
+    write_valid_benchmark_result \
+      "$output/cells/getsockopt-hit/measurements/$repetition_label.json" \
+      "$DURATION_SECONDS" \
+      "${successful_requests[repetition - 1]}" \
+      0 \
+      2000000000 \
+      "${throughput_per_second[repetition - 1]}" \
+      "${p50_nanos[repetition - 1]}" \
+      "${p95_nanos[repetition - 1]}" \
+      "${p99_nanos[repetition - 1]}"
+  done
+  jq -n --arg timing unsynchronized_midpoint --arg status unavailable \
+    '{timing: $timing, status: $status, reason: "load_client_exited_before_sample"}' \
+    >"$output/cells/getsockopt-hit/measurements/rep-01-midpoint.json"
+  write_variance_summary || {
+    printf 'variance summary rejected valid fixture data\n' >&2
+    return 1
+  }
+  jq -e '
+    .schema_version == 1 and
+    .kind == "descriptive-repetition-summary" and
+    .status == "complete" and
+    .acceptance_evidence == false and
+    .manifest == "manifest.json" and
+    .aggregation.sample_unit == "one completed sustained-client repetition" and
+    .aggregation.cross_cell_aggregation == false and
+    .aggregation.per_request_latency_aggregation == false and
+    (.cells | map(.cell)) == [
+      "uninstrumented",
+      "bridge-disabled",
+      "getsockopt-hit",
+      "unix-hit",
+      "getsockopt-w3c"
+    ]
+  ' "$output/variance.json" >/dev/null || {
+    printf 'variance summary did not retain its descriptive per-cell contract\n' >&2
+    return 1
+  }
+  jq -e '
+    (.cells[] | select(.cell == "getsockopt-hit")) as $cell |
+    $cell.contract == "cells/getsockopt-hit/preflight/contract.json" and
+    $cell.expected_sample_count == 6 and
+    $cell.valid_sample_count == 6 and
+    ($cell.samples | map({repetition, source})) == [
+      {repetition: 1, source: "cells/getsockopt-hit/measurements/rep-01.json"},
+      {repetition: 2, source: "cells/getsockopt-hit/measurements/rep-02.json"},
+      {repetition: 3, source: "cells/getsockopt-hit/measurements/rep-03.json"},
+      {repetition: 4, source: "cells/getsockopt-hit/measurements/rep-04.json"},
+      {repetition: 5, source: "cells/getsockopt-hit/measurements/rep-05.json"},
+      {repetition: 6, source: "cells/getsockopt-hit/measurements/rep-06.json"}
+    ] and
+    $cell.statistics.successful_requests == {min: 1, median: 3.5, max: 6} and
+    $cell.statistics.failed_requests == {min: 0, median: 0, max: 0} and
+    $cell.statistics.traffic_elapsed_nanos == {min: 2000000000, median: 2000000000, max: 2000000000} and
+    $cell.statistics.throughput_per_second == {min: 10, median: 35, max: 60} and
+    $cell.statistics.latency.p50_nanos == {min: 1, median: 3.5, max: 6} and
+    $cell.statistics.latency.p95_nanos == {min: 10, median: 35, max: 60} and
+    $cell.statistics.latency.p99_nanos == {min: 100, median: 350, max: 600} and
+    (.cells[] | select(.cell == "unix-hit").statistics.throughput_per_second) ==
+      {min: 1, median: 1, max: 1}
+  ' "$output/variance.json" >/dev/null || {
+    printf 'variance summary did not preserve ordered samples or numeric per-cell statistics\n' >&2
+    return 1
+  }
+)
+
+test_variance_summary_rejects_invalid_repetition_sets() (
+  local mode=""
+  local output=""
+  local measurement_dir=""
+
+  for mode in missing extra multi_document symlink; do
+    reset_options
+    DURATION_SECONDS=2
+    REPETITIONS=5
+    output="$TEST_TMP_DIR/variance-invalid-$mode"
+    prepare_variance_fixture "$output"
+    measurement_dir="$output/cells/getsockopt-hit/measurements"
+    case "$mode" in
+      missing)
+        rm -f -- "$measurement_dir/rep-05.json"
+        ;;
+      extra)
+        cell_spec getsockopt-hit
+        write_valid_benchmark_result "$measurement_dir/rep-06.json" "$DURATION_SECONDS"
+        ;;
+      multi_document)
+        printf '\n{}\n' >>"$measurement_dir/rep-01.json"
+        ;;
+      symlink)
+        rm -f -- "$measurement_dir/rep-01.json"
+        ln -s -- rep-02.json "$measurement_dir/rep-01.json"
+        ;;
+    esac
+    if write_variance_summary >/dev/null 2>&1; then
+      printf 'variance summary accepted a %s repetition set\n' "$mode" >&2
+      return 1
+    fi
+    [[ ! -e "$output/variance.json" && ! -L "$output/variance.json" ]] || {
+      printf 'variance summary published an artifact for a %s repetition set\n' "$mode" >&2
+      return 1
+    }
+  done
+)
+
+test_summary_marks_unavailable_variance_after_failure() (
+  local -r output="$TEST_TMP_DIR/failed-variance-summary"
+
+  reset_options
+  OUTPUT_DIR="$output"
+  # shellcheck disable=SC2034 # Consumed by write_summary from the sourced harness.
+  OUTPUT_READY=true
+  mkdir -p -- "$output/cells"
+  jq -n '{status: "in_progress"}' >"$output/manifest.json"
+  if write_summary passed >/dev/null 2>&1; then
+    printf 'passed summary accepted a missing variance artifact\n' >&2
+    return 1
+  fi
+  jq -n '{status: "complete"}' >"$output/variance.json"
+  write_summary failed || {
+    printf 'failed summary could not record unavailable variance\n' >&2
+    return 1
+  }
+  jq -e '
+    .status == "failed" and
+    .acceptance_evidence == false and
+    .variance == {status: "not_available", path: null}
+  ' "$output/summary.json" >/dev/null || {
+    printf 'failed summary misrepresented unavailable variance\n' >&2
+    return 1
+  }
+  [[ ! -e "$output/variance.json" && ! -L "$output/variance.json" ]] || {
+    printf 'failed summary retained a completed variance artifact\n' >&2
+    return 1
+  }
+)
+
+test_failed_summary_refuses_unremovable_variance() (
+  local -r output="$TEST_TMP_DIR/unremovable-variance-summary"
+
+  reset_options
+  OUTPUT_DIR="$output"
+  # shellcheck disable=SC2034 # Consumed by write_summary from the sourced harness.
+  OUTPUT_READY=true
+  mkdir -p -- "$output/variance.json"
+  if write_summary failed >/dev/null 2>&1; then
+    printf 'failed summary accepted an unremovable variance artifact\n' >&2
+    return 1
+  fi
+  [[ -d "$output/variance.json" && ! -e "$output/summary.json" ]] || {
+    printf 'failed summary changed state after variance cleanup failed\n' >&2
+    return 1
+  }
+)
+
+test_on_exit_rewrites_failed_summary_after_passed_summary_error() {
+  local -r calls="$TEST_TMP_DIR/on-exit-summary-calls.txt"
+  local on_exit_status=0
+
+  if (
+    reset_options
+    # shellcheck disable=SC2034 # Consumed by on_exit from the sourced harness.
+    HARNESS_STATUS=passed
+    write_summary() {
+      printf '%s\n' "$1" >>"$calls"
+      [[ "$1" == "failed" ]]
+    }
+    on_exit 0
+  ); then
+    printf 'on_exit accepted a failed passed-summary finalization\n' >&2
+    return 1
+  else
+    on_exit_status=$?
+  fi
+  [[ "$on_exit_status" == 1 && "$(<"$calls")" == $'passed\nfailed' ]] || {
+    printf 'on_exit did not rewrite the summary after passed finalization failed\n' >&2
+    return 1
+  }
+}
+
+test_summary_rejects_manifest_render_failure() (
+  local -r output="$TEST_TMP_DIR/manifest-render-failure"
+
+  reset_options
+  OUTPUT_DIR="$output"
+  # shellcheck disable=SC2034 # Consumed by write_summary from the sourced harness.
+  OUTPUT_READY=true
+  mkdir -p -- "$output/cells"
+  command jq -n '{status: "in_progress"}' >"$output/manifest.json"
+  jq() {
+    if [[ "${1:-}" == "--arg" && "${2:-}" == "status" ]]; then
+      return 1
+    fi
+    command jq "$@"
+  }
+  if write_summary failed >/dev/null 2>&1; then
+    printf 'summary accepted a failed manifest render\n' >&2
+    return 1
+  fi
+  command jq -e '.status == "in_progress"' "$output/manifest.json" >/dev/null || {
+    printf 'summary changed the manifest after its render failed\n' >&2
+    return 1
+  }
+  [[ ! -e "$output/summary.json" && ! -L "$output/summary.json" &&
+    -z "$(find "$output" -maxdepth 1 \
+      \( -name '.summary.json.*' -o -name '.manifest.json.*' \) -print -quit)" ]] || {
+    printf 'summary retained an artifact after its manifest render failed\n' >&2
+    return 1
+  }
+)
+
+test_summary_publishes_completion_marker_last() (
+  local -r output="$TEST_TMP_DIR/summary-publication-order"
+
+  reset_options
+  OUTPUT_DIR="$output"
+  # shellcheck disable=SC2034 # Consumed by write_summary from the sourced harness.
+  OUTPUT_READY=true
+  mkdir -p -- "$output/cells"
+  command jq -n '{status: "in_progress"}' >"$output/manifest.json"
+  mv() {
+    case "${4:-}" in
+      "$output/summary.json")
+        command jq -e '.status == "in_progress"' "$output/manifest.json" >/dev/null || return 1
+        ;;
+      "$output/manifest.json")
+        [[ -f "$output/summary.json" && ! -L "$output/summary.json" ]] || return 1
+        ;;
+    esac
+    command mv "$@"
+  }
+  write_summary failed || {
+    printf 'summary did not publish its completion marker last\n' >&2
+    return 1
+  }
+  command jq -e '.status == "failed"' "$output/summary.json" >/dev/null &&
+    command jq -e '.status == "failed"' "$output/manifest.json" >/dev/null || {
+    printf 'summary did not retain matching terminal artifacts\n' >&2
+    return 1
+  }
+)
 
 test_w3c_discard_diagnostics_require_exact_delta() {
   local -r before="$TEST_TMP_DIR/w3c-diagnostics-before.txt"
@@ -1853,9 +2189,48 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
     .status == "passed" and
     .acceptance_evidence == false and
     (.cells | length == 5) and
-    all(.cells[]; .status == "passed")
+    all(.cells[]; .status == "passed") and
+    .variance == {status: "available", path: "variance.json"}
   ' "$output/summary.json" >/dev/null || {
     printf 'hermetic run did not retain five passing core summaries\n' >&2
+    return 1
+  }
+  jq -e '
+    .schema_version == 1 and
+    .kind == "descriptive-repetition-summary" and
+    .status == "complete" and
+    .acceptance_evidence == false and
+    .aggregation.cross_cell_aggregation == false and
+    .aggregation.per_request_latency_aggregation == false and
+    (.cells | map(.cell)) == [
+      "uninstrumented",
+      "bridge-disabled",
+      "getsockopt-hit",
+      "unix-hit",
+      "getsockopt-w3c"
+    ] and
+    all(.cells[];
+      .expected_sample_count == 5 and
+      .valid_sample_count == 5 and
+      (.samples | map(.repetition)) == [1, 2, 3, 4, 5] and
+      all(.samples[];
+        (.source | test("^cells/(uninstrumented|bridge-disabled|getsockopt-hit|unix-hit|getsockopt-w3c)/measurements/rep-0[1-5]\\.json$")) and
+        .successful_requests == 4 and
+        .failed_requests == 0 and
+        .traffic_elapsed_nanos == 2000000000 and
+        .throughput_per_second == 4 and
+        .latency == {p50_nanos: 1, p95_nanos: 2, p99_nanos: 3}
+      ) and
+      .statistics.successful_requests == {min: 4, median: 4, max: 4} and
+      .statistics.failed_requests == {min: 0, median: 0, max: 0} and
+      .statistics.traffic_elapsed_nanos == {min: 2000000000, median: 2000000000, max: 2000000000} and
+      .statistics.throughput_per_second == {min: 4, median: 4, max: 4} and
+      .statistics.latency.p50_nanos == {min: 1, median: 1, max: 1} and
+      .statistics.latency.p95_nanos == {min: 2, median: 2, max: 2} and
+      .statistics.latency.p99_nanos == {min: 3, median: 3, max: 3}
+    )
+  ' "$output/variance.json" >/dev/null || {
+    printf 'hermetic run did not retain complete per-cell repetition variance\n' >&2
     return 1
   }
   [[ "$(grep -Fc cleanup "$events")" == 5 ]] || {
@@ -1987,6 +2362,13 @@ main() {
   test_output_directory_is_absolute_fresh_private
   test_core_cell_mapping_is_exact
   test_json_validators_require_one_document
+  test_variance_summary_records_ordered_per_cell_statistics
+  test_variance_summary_rejects_invalid_repetition_sets
+  test_summary_marks_unavailable_variance_after_failure
+  test_failed_summary_refuses_unremovable_variance
+  test_on_exit_rewrites_failed_summary_after_passed_summary_error
+  test_summary_rejects_manifest_render_failure
+  test_summary_publishes_completion_marker_last
   test_w3c_discard_diagnostics_require_exact_delta
   test_runner_environment_contract_is_exact
   test_failed_measurement_clears_reaped_pid

@@ -450,7 +450,7 @@ check_dependencies() {
     die "the benchmark harness requires Linux"
     return $?
   }
-  for command_name in awk chmod curl date docker env find flock git grep head id install jq mkdir mv rm setsid stat timeout tr uname wc; do
+  for command_name in awk chmod curl date docker env find flock git grep head id install jq mkdir mktemp mv rm setsid sort stat timeout tr uname wc; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
       missing+=("$command_name")
     fi
@@ -466,6 +466,10 @@ check_dependencies() {
     die "missing required commands: ${missing[*]}"
     return $?
   fi
+  jq -n 'isfinite' >/dev/null 2>&1 || {
+    die "jq with finite-number predicates is required"
+    return $?
+  }
   [[ -x "$RUNNER" && -f "$COMPOSE_FILE" ]] || {
     die "demo runner or Compose file is unavailable"
     return $?
@@ -1094,6 +1098,14 @@ validate_benchmark_result() {
     --argjson request_limit "$REQUEST_LIMIT" \
     --argjson sustained_load_seed "$SUSTAINED_LOAD_SEED" \
     --argjson expected_w3c "$CELL_SUSTAINED_W3C" '
+      def finite_number:
+        type == "number" and isfinite;
+      def positive_integer:
+        finite_number and floor == . and . > 0;
+      def non_negative_integer:
+        finite_number and floor == . and . >= 0;
+      def positive_number:
+        finite_number and . > 0;
       length == 1 and
       (.[0] |
         .status == "passed" and
@@ -1108,19 +1120,15 @@ validate_benchmark_result() {
         .request_limit == $request_limit and
         .request_limit_reached == false and
         .canceled == false and
-        (if (.successful_requests | type) == "number" then
-          (.successful_requests | floor == . and . > 0 and . <= $request_limit)
-         else false
-         end) and
-        (if (.failed_requests | type) == "number" then
-          (.failed_requests | floor == . and . == 0)
-         else false
-         end) and
-        (.traffic_elapsed_nanos | type == "number") and
-        .traffic_elapsed_nanos >= $duration_nanos and
-        .traffic_elapsed_nanos <= $maximum_traffic_elapsed_nanos and
-        .throughput_per_second > 0 and
-        .latency.p50_nanos > 0 and
+        (.successful_requests | positive_integer and . <= $request_limit) and
+        (.failed_requests | non_negative_integer and . == 0) and
+        (.traffic_elapsed_nanos |
+          positive_integer and . >= $duration_nanos and . <= $maximum_traffic_elapsed_nanos) and
+        (.throughput_per_second | positive_number) and
+        (.latency | type == "object") and
+        (.latency.p50_nanos | positive_integer) and
+        (.latency.p95_nanos | positive_integer) and
+        (.latency.p99_nanos | positive_integer) and
         .latency.p95_nanos >= .latency.p50_nanos and
         .latency.p99_nanos >= .latency.p95_nanos
       )
@@ -1397,6 +1405,170 @@ run_measurement_rep() {
   fi
   wait_for_active_benchmark || return $?
   validate_benchmark_result "$result" "$DURATION_SECONDS"
+}
+
+variance_summary_cell() {
+  local -r cell="$1"
+  local -r cell_dir="$OUTPUT_DIR/cells/$cell"
+  local -r measurement_dir="$cell_dir/measurements"
+  local -r status_file="$cell_dir/status.json"
+  local -r contract_file="$cell_dir/preflight/contract.json"
+  local expected_sources=""
+  local observed_sources=""
+  local repetition=0
+  local repetition_label=""
+  local result=""
+  local source=""
+  local sample_json=""
+  local samples_json=""
+  local -a samples=()
+
+  cell_spec "$cell" || return 1
+  [[ -d "$measurement_dir" && ! -L "$measurement_dir" ]] || return 1
+  [[ -f "$status_file" && ! -L "$status_file" ]] || return 1
+  [[ -f "$contract_file" && ! -L "$contract_file" ]] || return 1
+  jq -se --arg cell "$cell" '
+    length == 1 and (.[0] | .status == "passed" and .cell == $cell)
+  ' "$status_file" >/dev/null || return 1
+  jq -se --arg cell "$cell" '
+    length == 1 and (.[0] | .cell == $cell)
+  ' "$contract_file" >/dev/null || return 1
+
+  expected_sources="$(
+    for ((repetition = 1; repetition <= REPETITIONS; repetition++)); do
+      printf -v repetition_label 'rep-%02d.json' "$repetition"
+      printf '%s\n' "$repetition_label"
+    done
+  )"
+  observed_sources="$(
+    find "$measurement_dir" -mindepth 1 -maxdepth 1 -name 'rep-[0-9][0-9].json' -printf '%f\n' | sort
+  )" || return 1
+  [[ "$observed_sources" == "$expected_sources" ]] || return 1
+
+  for ((repetition = 1; repetition <= REPETITIONS; repetition++)); do
+    printf -v repetition_label 'rep-%02d' "$repetition"
+    result="$measurement_dir/$repetition_label.json"
+    source="cells/$cell/measurements/$repetition_label.json"
+    validate_benchmark_result "$result" "$DURATION_SECONDS" || return 1
+    sample_json="$(jq -sce \
+      --argjson repetition "$repetition" \
+      --arg source "$source" '
+        if length != 1 then
+          error("expected exactly one benchmark result")
+        else
+          .[0] | {
+            repetition: $repetition,
+            source: $source,
+            successful_requests,
+            failed_requests,
+            traffic_elapsed_nanos,
+            throughput_per_second,
+            latency: {
+              p50_nanos: .latency.p50_nanos,
+              p95_nanos: .latency.p95_nanos,
+              p99_nanos: .latency.p99_nanos
+            }
+          }
+        end
+      ' "$result")" || return 1
+    samples+=("$sample_json")
+  done
+  samples_json="$(printf '%s\n' "${samples[@]}" | jq -s .)" || return 1
+  jq -cn \
+    --arg cell "$cell" \
+    --arg contract "cells/$cell/preflight/contract.json" \
+    --argjson expected_sample_count "$REPETITIONS" \
+    --argjson samples "$samples_json" '
+      def observed_stats:
+        sort as $ordered |
+        ($ordered | length) as $count |
+        ($count / 2 | floor) as $middle |
+        if $count == 0 then
+          error("cannot summarize an empty sample set")
+        else
+          {
+            min: $ordered[0],
+            median: (
+              if ($count % 2) == 1 then $ordered[$middle]
+              else (($ordered[$middle - 1] + $ordered[$middle]) / 2)
+              end
+            ),
+            max: $ordered[$count - 1]
+          }
+        end;
+      {
+        cell: $cell,
+        contract: $contract,
+        expected_sample_count: $expected_sample_count,
+        valid_sample_count: ($samples | length),
+        samples: $samples,
+        statistics: {
+          successful_requests: ($samples | map(.successful_requests) | observed_stats),
+          failed_requests: ($samples | map(.failed_requests) | observed_stats),
+          traffic_elapsed_nanos: ($samples | map(.traffic_elapsed_nanos) | observed_stats),
+          throughput_per_second: ($samples | map(.throughput_per_second) | observed_stats),
+          latency: {
+            p50_nanos: ($samples | map(.latency.p50_nanos) | observed_stats),
+            p95_nanos: ($samples | map(.latency.p95_nanos) | observed_stats),
+            p99_nanos: ($samples | map(.latency.p99_nanos) | observed_stats)
+          }
+        }
+      }
+    '
+}
+
+variance_summary_cells() {
+  local cell=""
+  local cell_json=""
+  local -a cells=()
+
+  for cell in "${CORE_CELLS[@]}"; do
+    cell_json="$(variance_summary_cell "$cell")" || return 1
+    cells+=("$cell_json")
+  done
+  printf '%s\n' "${cells[@]}" | jq -s .
+}
+
+write_variance_summary() {
+  local -r output="$OUTPUT_DIR/variance.json"
+  local cells_json=""
+  local temporary=""
+
+  [[ "$OUTPUT_READY" == "true" ]] || return 1
+  [[ ! -e "$output" && ! -L "$output" ]] || return 1
+  cells_json="$(variance_summary_cells)" || return 1
+  temporary="$(mktemp "$OUTPUT_DIR/.variance.json.XXXXXX")" || return 1
+  if ! jq -n \
+    --arg manifest manifest.json \
+    --argjson cells "$cells_json" '
+      {
+        schema_version: 1,
+        kind: "descriptive-repetition-summary",
+        status: "complete",
+        acceptance_evidence: false,
+        manifest: $manifest,
+        aggregation: {
+          sample_unit: "one completed sustained-client repetition",
+          sample_selection: "all requested schema-valid repetitions for one cell; none are dropped",
+          median: "odd: middle sorted numeric value; even: arithmetic mean of the two middle sorted numeric values",
+          spread: "observed minimum and maximum; not a variance estimator or confidence interval",
+          cross_cell_aggregation: false,
+          per_request_latency_aggregation: false
+        },
+        cells: $cells,
+        notes: [
+          "Each latency statistic summarizes one percentile value from each completed repetition.",
+          "This descriptive artifact applies no threshold and does not establish a performance SLO."
+        ]
+      }
+    ' >"$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  if ! mv -- "$temporary" "$output"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
 }
 
 validate_concurrency_sentinel() {
@@ -1970,8 +2142,31 @@ write_summary() {
   local cell=""
   local status_file=""
   local cells_json=""
+  local variance_json=""
+  local summary_temporary=""
+  local manifest_temporary=""
 
   [[ "$OUTPUT_READY" == "true" ]] || return 0
+  if [[ "$status" == "passed" ]]; then
+    [[ -f "$OUTPUT_DIR/variance.json" && ! -L "$OUTPUT_DIR/variance.json" ]] || return 1
+    jq -se '
+      length == 1 and
+      (.[0] |
+        .schema_version == 1 and
+        .kind == "descriptive-repetition-summary" and
+        .status == "complete" and
+        .acceptance_evidence == false and
+        (.cells | type == "array" and length > 0))
+    ' "$OUTPUT_DIR/variance.json" >/dev/null || return 1
+    variance_json='{"status":"available","path":"variance.json"}'
+  else
+    rm -f -- "$OUTPUT_DIR/variance.json" || return 1
+    rm -f -- "$OUTPUT_DIR/summary.json" || return 1
+    variance_json='{"status":"not_available","path":null}'
+  fi
+  [[ ! -e "$OUTPUT_DIR/summary.json" ||
+    ( -f "$OUTPUT_DIR/summary.json" && ! -L "$OUTPUT_DIR/summary.json" ) ]] || return 1
+  [[ -f "$OUTPUT_DIR/manifest.json" && ! -L "$OUTPUT_DIR/manifest.json" ]] || return 1
   cells_json="$({
     for cell in "${CORE_CELLS[@]}"; do
       status_file="$OUTPUT_DIR/cells/$cell/status.json"
@@ -1982,23 +2177,45 @@ write_summary() {
       fi
     done
   } | jq -s .)" || return 1
-  jq -n \
+  summary_temporary="$(mktemp "$OUTPUT_DIR/.summary.json.XXXXXX")" || return 1
+  manifest_temporary="$(mktemp "$OUTPUT_DIR/.manifest.json.XXXXXX")" || {
+    rm -f -- "$summary_temporary" || return 1
+    return 1
+  }
+  if ! jq -n \
     --arg status "$status" \
     --arg completed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --argjson cells "$cells_json" \
+    --argjson variance "$variance_json" \
     '{
       status: $status,
       acceptance_evidence: false,
       completed_at: $completed_at,
       cells: $cells,
+      variance: $variance,
       notes: [
         "The bounded preflight and post-load sentinel establish the declared correctness assertion for each cell.",
+        "variance.json is descriptive repetition data, not an acceptance threshold or production SLO.",
         "Midpoint resource snapshots are unsynchronized point samples and do not prove full in-load coverage.",
         "Unavailable dimensions in manifest.json are not measured as zero."
       ]
-    }' >"$OUTPUT_DIR/summary.json"
-  jq --arg status "$status" '.status = $status' "$OUTPUT_DIR/manifest.json" >"$OUTPUT_DIR/manifest.json.next"
-  mv -- "$OUTPUT_DIR/manifest.json.next" "$OUTPUT_DIR/manifest.json"
+    }' >"$summary_temporary"; then
+    rm -f -- "$summary_temporary" "$manifest_temporary" || return 1
+    return 1
+  fi
+  if ! jq --arg status "$status" '.status = $status' "$OUTPUT_DIR/manifest.json" \
+    >"$manifest_temporary"; then
+    rm -f -- "$summary_temporary" "$manifest_temporary" || return 1
+    return 1
+  fi
+  if ! mv -T -- "$summary_temporary" "$OUTPUT_DIR/summary.json"; then
+    rm -f -- "$summary_temporary" "$manifest_temporary" || return 1
+    return 1
+  fi
+  if ! mv -T -- "$manifest_temporary" "$OUTPUT_DIR/manifest.json"; then
+    rm -f -- "$manifest_temporary" || return 1
+    return 1
+  fi
 }
 
 terminate_active_benchmark() {
@@ -2082,7 +2299,10 @@ on_exit() {
   fi
   release_lock
   if ((final_status == 0)) && [[ "$HARNESS_STATUS" == "passed" ]]; then
-    write_summary passed || final_status=1
+    if ! write_summary passed; then
+      final_status=1
+      write_summary failed || final_status=1
+    fi
   else
     write_summary failed || final_status=1
   fi
@@ -2111,6 +2331,7 @@ main() {
   for cell in "${CORE_CELLS[@]}"; do
     run_cell "$cell"
   done
+  write_variance_summary
   HARNESS_STATUS="passed"
 }
 

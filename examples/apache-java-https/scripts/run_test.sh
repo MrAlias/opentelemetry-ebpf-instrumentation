@@ -10428,6 +10428,64 @@ test_apache_diagnostic_denial_matrix_is_exact() {
   }
 }
 
+test_compatibility_matrix_lists_deployment_modes() {
+  local -r matrix="$TEST_SCRIPT_DIR/../COMPATIBILITY.md"
+  local row=""
+  local -a expected_rows=(
+    '| RHEL 9 / kernel 5.14 | host process | unified v2 | untested | untested | untested |'
+    '| RHEL 9 / kernel 5.14 | container process | unified v2 | untested | untested | untested |'
+    '| upstream 5.10 | host process | unified v2 | untested | untested | untested |'
+    '| upstream 5.10 | container process | unified v2 | untested | untested | untested |'
+    '| upstream 5.15 | host process | unified v2 | untested | untested | untested |'
+    '| upstream 5.15 | container process | unified v2 | untested | untested | untested |'
+    '| upstream 6.1 | host process | unified v2 | untested | untested | untested |'
+    '| upstream 6.1 | container process | unified v2 | untested | untested | untested |'
+    '| upstream 6.6 | host process | unified v2 | untested | untested | untested |'
+    '| upstream 6.6 | container process | unified v2 | untested | untested | untested |'
+    '| upstream 6.12 | host process | unified v2 | untested | untested | untested |'
+    '| upstream 6.12 | container process | unified v2 | untested | untested | untested |'
+    '| RHEL 8 / 4.18 backport | host process | host default | untested | untested | untested |'
+    '| RHEL 8 / 4.18 backport | container process | container default | untested | untested | untested |'
+    '| supported kernel | host process | hybrid v1/v2 | untested | untested | untested |'
+    '| supported kernel | container process | hybrid v1/v2 | untested | untested | untested |'
+    '| supported kernel | host process | nested/delegated v2 | untested | untested | untested |'
+    '| supported kernel | container process | nested/delegated v2 | untested | untested | untested |'
+    '| supported kernel | container process | sibling containers | untested | untested | untested |'
+  )
+
+  grep -Fqx \
+    '| Environment | Deployment mode | Cgroup topology | `getsockopt` | `unix` | `auto` |' \
+    "$matrix" || return 1
+  for row in "${expected_rows[@]}"; do
+    grep -Fqx "$row" "$matrix" || return 1
+  done
+  awk '
+    $0 == "| Environment | Deployment mode | Agent | Cgroup topology | TLS | `getsockopt` | `unix` | `auto` | Evidence |" {
+      in_observed_table = 1
+      valid = 1
+      next
+    }
+    in_observed_table && $0 == "| --- | --- | --- | --- | --- | --- | --- | --- | --- |" {
+      saw_delimiter = 1
+      next
+    }
+    in_observed_table && $0 == "" {
+      reached_end = 1
+      exit
+    }
+    in_observed_table {
+      if (!saw_delimiter || NF != 11 || $3 != " container process ") {
+        valid = 0
+        exit
+      }
+      rows += 1
+    }
+    END {
+      exit in_observed_table && saw_delimiter && reached_end && valid != 0 && rows == 4 ? 0 : 1
+    }
+  ' FS='|' "$matrix"
+}
+
 test_demo_uses_only_explicit_tcp_context() {
   local -r obi_config="$TEST_SCRIPT_DIR/../configs/obi.yaml"
 
@@ -10612,6 +10670,7 @@ main() {
   test_release_source_uses_one_version_for_extension
   test_demo_diagnostics_are_loopback_only
   test_apache_diagnostic_denial_matrix_is_exact
+  test_compatibility_matrix_lists_deployment_modes
   test_demo_uses_only_explicit_tcp_context
   test_demo_java_attach_timeout_is_explicit
   printf 'demo harness tests passed\n'

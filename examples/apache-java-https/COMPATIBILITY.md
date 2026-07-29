@@ -14,34 +14,46 @@ Each result must be one of `pass`, `fail`, `unsupported`, or `untested` and
 include revision, kernel, architecture, cgroup mode, JVM, agent, Apache,
 OpenSSL, TLS, transport, command, and artifact link.
 
-## Kernel, cgroup, and transport
+## Kernel, deployment mode, cgroup, and transport
 
-Use Java 21, one named official agent, `amd64`, and one fixed container stack
-while varying this table. Record the exact TLS version for each forced
-transport result.
+For each named environment, host-process and container-process cells are
+distinct. Use Java 21, one named official agent, `amd64`, and one fixed stack.
+A container-process result does not establish the equivalent host-process
+cell. Sibling-container topology has only a container-process cell. Record the
+exact TLS version for each forced transport result.
 
-| Environment | Cgroup topology | `getsockopt` | `unix` | `auto` |
-| --- | --- | --- | --- | --- |
-| RHEL 9 / kernel 5.14 | unified v2 | untested | untested | untested |
-| upstream 5.10 | unified v2 | untested | untested | untested |
-| upstream 5.15 | unified v2 | untested | untested | untested |
-| upstream 6.1 | unified v2 | untested | untested | untested |
-| upstream 6.6 | unified v2 | untested | untested | untested |
-| upstream 6.12 | unified v2 | untested | untested | untested |
-| RHEL 8 / 4.18 backport | host default | untested | untested | untested |
-| supported kernel | hybrid v1/v2 | untested | untested | untested |
-| supported kernel | nested/delegated v2 | untested | untested | untested |
-| supported kernel | sibling containers | untested | untested | untested |
+| Environment | Deployment mode | Cgroup topology | `getsockopt` | `unix` | `auto` |
+| --- | --- | --- | --- | --- | --- |
+| RHEL 9 / kernel 5.14 | host process | unified v2 | untested | untested | untested |
+| RHEL 9 / kernel 5.14 | container process | unified v2 | untested | untested | untested |
+| upstream 5.10 | host process | unified v2 | untested | untested | untested |
+| upstream 5.10 | container process | unified v2 | untested | untested | untested |
+| upstream 5.15 | host process | unified v2 | untested | untested | untested |
+| upstream 5.15 | container process | unified v2 | untested | untested | untested |
+| upstream 6.1 | host process | unified v2 | untested | untested | untested |
+| upstream 6.1 | container process | unified v2 | untested | untested | untested |
+| upstream 6.6 | host process | unified v2 | untested | untested | untested |
+| upstream 6.6 | container process | unified v2 | untested | untested | untested |
+| upstream 6.12 | host process | unified v2 | untested | untested | untested |
+| upstream 6.12 | container process | unified v2 | untested | untested | untested |
+| RHEL 8 / 4.18 backport | host process | host default | untested | untested | untested |
+| RHEL 8 / 4.18 backport | container process | container default | untested | untested | untested |
+| supported kernel | host process | hybrid v1/v2 | untested | untested | untested |
+| supported kernel | container process | hybrid v1/v2 | untested | untested | untested |
+| supported kernel | host process | nested/delegated v2 | untested | untested | untested |
+| supported kernel | container process | nested/delegated v2 | untested | untested | untested |
+| supported kernel | container process | sibling containers | untested | untested | untested |
 
-The following additional host is directly observed. It is not a substitute for
-any representative kernel row above.
+The following additional host kernel is directly observed through
+container-process deployments. It is not a substitute for any representative
+kernel row above.
 
-| Environment | Agent | Cgroup topology | TLS | `getsockopt` | `unix` | `auto` | Evidence |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Linux 7.0.0-1009-aws (distribution not recorded) | OpenTelemetry 2.28.1 | unified v2 | 1.3 | pass | untested | untested | [getsockopt/TLS 1.3](evidence/otel-getsockopt-tls13-c9d14356/README.md) |
-| Linux 7.0.0-1009-aws (distribution not recorded) | OpenTelemetry 2.28.1 | unified v2 | 1.2 | pass | untested | untested | [getsockopt/TLS 1.2](evidence/otel-getsockopt-tls12-c7209e43/README.md) |
-| Linux 7.0.0-1009-aws (distribution not recorded) | Splunk 2.28.0 | unified v2 | 1.3 | pass | untested | untested | [getsockopt/TLS 1.3](evidence/splunk-getsockopt-tls13-47237792/README.md) |
-| Linux 7.0.0-1009-aws (distribution not recorded) | OpenTelemetry 2.28.1 | unified v2 | 1.2 | untested | pass | untested | [Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/README.md) |
+| Environment | Deployment mode | Agent | Cgroup topology | TLS | `getsockopt` | `unix` | `auto` | Evidence |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Linux 7.0.0-1009-aws (distribution not recorded) | container process | OpenTelemetry 2.28.1 | unified v2 | 1.3 | pass | untested | untested | [getsockopt/TLS 1.3](evidence/otel-getsockopt-tls13-c9d14356/README.md) |
+| Linux 7.0.0-1009-aws (distribution not recorded) | container process | OpenTelemetry 2.28.1 | unified v2 | 1.2 | pass | untested | untested | [getsockopt/TLS 1.2](evidence/otel-getsockopt-tls12-c7209e43/README.md) |
+| Linux 7.0.0-1009-aws (distribution not recorded) | container process | Splunk 2.28.0 | unified v2 | 1.3 | pass | untested | untested | [getsockopt/TLS 1.3](evidence/splunk-getsockopt-tls13-47237792/README.md) |
+| Linux 7.0.0-1009-aws (distribution not recorded) | container process | OpenTelemetry 2.28.1 | unified v2 | 1.2 | untested | pass | untested | [Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/README.md) |
 
 RHEL 8 support may only be reported from direct execution on the documented
 backport. If a required cgroup hook is absent, report forced `getsockopt` as

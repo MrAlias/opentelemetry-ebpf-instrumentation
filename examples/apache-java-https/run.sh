@@ -62,6 +62,9 @@ RESTART_SIGNAL_STOPPED_TRAFFIC_COMPLETE="stopped-traffic-complete"
 RESTART_SIGNAL_POST_RESTART_TRAFFIC_COMPLETE="post-restart-traffic-complete"
 RESTART_RELEASE_OBI_STOPPED="obi-stopped"
 RESTART_RELEASE_OBI_READY="obi-ready"
+PRIMARY_FAULT_PRELOAD="/otel/libobi-java-remote-parent-fault.so"
+PRIMARY_FAULT_CONTROL_DIRECTORY="/run/obi-demo/fault"
+PRIMARY_FAULT_CONTROL_FILE="$PRIMARY_FAULT_CONTROL_DIRECTORY/java-remote-parent.mode"
 readonly SCRIPT_DIR REPO_ROOT SCRIPT_NAME MAX_SHELL_INTEGER MAX_UINT32_DECIMAL
 readonly MAX_UINT64_DECIMAL JAVA_DIAGNOSTIC_COUNTER_MAX
 readonly BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS SCENARIO_RUN_TIMEOUT_SECONDS
@@ -97,12 +100,14 @@ readonly RESTART_CONTROL_CONTAINER_DIR
 readonly RESTART_SIGNAL_PRE_STOP_READY RESTART_SIGNAL_STOPPED_TRAFFIC_COMPLETE
 readonly RESTART_SIGNAL_POST_RESTART_TRAFFIC_COMPLETE
 readonly RESTART_RELEASE_OBI_STOPPED RESTART_RELEASE_OBI_READY
+readonly PRIMARY_FAULT_PRELOAD PRIMARY_FAULT_CONTROL_DIRECTORY PRIMARY_FAULT_CONTROL_FILE
 
 RUNTIME_DIR="$SCRIPT_DIR/.runtime"
 ARTIFACT_DIR="$RUNTIME_DIR/artifacts"
 CERT_DIR="$RUNTIME_DIR/certs"
 RESULTS_ROOT="$RUNTIME_DIR/results"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
+PRIMARY_FAULT_COMPOSE_FILE="$SCRIPT_DIR/docker-compose.primary-fault.yml"
 PROJECT_NAME="${COMPOSE_PROJECT_NAME:-$PROJECT_NAMESPACE}"
 
 TRANSPORT="getsockopt"
@@ -178,8 +183,13 @@ PRIMARY_SECURITY_NAMESPACE_PID=""
 PRIMARY_SECURITY_SIBLING_CONTAINER=""
 UNIX_SECURITY_DIRECTORY_RELAXED=false
 UNIX_SECURITY_RACE_CONTAINER=""
+PRIMARY_FAULT_STACK_ACTIVE=false
 
 declare -a COMPOSE=(docker compose --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE")
+declare -a PRIMARY_FAULT_COMPOSE=(
+  docker compose --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE" \
+    --file "$PRIMARY_FAULT_COMPOSE_FILE"
+)
 
 usage() {
   cat <<EOF
@@ -196,7 +206,8 @@ Options:
                           connection-churn, fd-port-reuse, slow-body, tls-boundary,
                           timeout-retry,
                           pressure, handoff, virtual-thread, netty, netty-server, dispatch,
-                          w3c, w3c-match, obi-flags, w3c-fault, primary-w3c-stale, w3c-only,
+                          w3c, w3c-match, obi-flags, w3c-fault, primary-w3c-fault,
+                          primary-w3c-stale, w3c-only,
                           security, restart-fault, helper-attach-failure,
                           delayed-otlp-suppression, assertion-failure, fail-open,
                           restart, disabled, or uninstrumented.
@@ -218,6 +229,7 @@ connection churn, fd/ephemeral-port reuse, slow-body, deterministic TLS receive
 boundaries, timeout/retry, pressure,
 executor/virtual-thread/Netty handoff, inbound Netty TLS, async redispatch, W3C
 precedence/match/flags/fault/no-state controls, the primary stale-record control,
+the primary malformed-response control,
 late attach, OBI restart during
 traffic, helper attach failure, bounded primary or fallback transport abuse
 controls, delayed first-OTLP suppression, Unix endpoint replacement when that transport is selected,
@@ -381,7 +393,7 @@ parse_args() {
       ;;
   esac
   case "$SCENARIO" in
-    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|timeout-retry|pressure|handoff|virtual-thread|netty|netty-server|dispatch|w3c|w3c-match|obi-flags|w3c-fault|primary-w3c-stale|w3c-only|security|restart-fault|helper-attach-failure|delayed-otlp-suppression|assertion-failure|fail-open|restart|disabled|uninstrumented)
+    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|timeout-retry|pressure|handoff|virtual-thread|netty|netty-server|dispatch|w3c|w3c-match|obi-flags|w3c-fault|primary-w3c-fault|primary-w3c-stale|w3c-only|security|restart-fault|helper-attach-failure|delayed-otlp-suppression|assertion-failure|fail-open|restart|disabled|uninstrumented)
       ;;
     *)
       die "unsupported scenario: $SCENARIO"
@@ -421,6 +433,12 @@ parse_args() {
   fi
   if [[ "$SCENARIO" == "primary-w3c-stale" && "$REQUEST_COUNT" != "0" && "$REQUEST_COUNT" != "1" ]]; then
     die "the primary-w3c-stale scenario requires exactly one request"
+  fi
+  if [[ "$SCENARIO" == "primary-w3c-fault" && "$TRANSPORT" != "getsockopt" ]]; then
+    die "the primary-w3c-fault scenario requires --transport getsockopt"
+  fi
+  if [[ "$SCENARIO" == "primary-w3c-fault" && "$REQUEST_COUNT" != "0" && "$REQUEST_COUNT" != "1" ]]; then
+    die "the primary-w3c-fault scenario requires exactly one request"
   fi
   if [[ ( "$SCENARIO" == "keepalive" || "$SCENARIO" == "pipelining" ) &&
     "$REQUEST_COUNT" != "0" && "$REQUEST_COUNT" -lt 3 ]]; then
@@ -717,11 +735,27 @@ cleanup() {
   local -r status="$?"
   local final_status="$status"
   local cleanup_status=0
+  local force_stack_shutdown=false
+  local primary_fault_recovery_marker=""
   trap - ERR EXIT INT TERM
   set +e
 
   if ((status != 0)) && [[ -z "$FAILURE_STAGE" ]]; then
     record_failure "$RUN_STAGE" 0 "$status" "exit"
+  fi
+
+  if [[ -n "${RESULT_DIR:-}" && -d "$RESULT_DIR" ]]; then
+    primary_fault_recovery_marker="$RESULT_DIR/primary-w3c-fault-recovery-required"
+    if [[ -e "$primary_fault_recovery_marker" || -L "$primary_fault_recovery_marker" ]]; then
+      force_stack_shutdown=true
+      PRIMARY_FAULT_STACK_ACTIVE=true
+      log_error "primary W3C fault recovery is incomplete; refusing to leave the fault stack running"
+      if ((final_status == 0)); then
+        final_status=1
+        record_failure \
+          "primary-w3c-fault-recovery" 0 1 "incomplete primary fault recovery"
+      fi
+    fi
   fi
 
   if [[ "$PRESSURE_ACTIVE" == "true" ]]; then
@@ -746,7 +780,8 @@ cleanup() {
     fi
     reset_matching_bridge_environment
   fi
-  if [[ "$STACK_STARTED" == "true" && "$KEEP_RUNNING" == "false" ]]; then
+  if [[ "$STACK_STARTED" == "true" && \
+    ( "$KEEP_RUNNING" == "false" || "$force_stack_shutdown" == "true" ) ]]; then
     log_info "stopping scoped Compose project $PROJECT_NAME"
     if invalidate_project_transport_evidence; then
       BRIDGE_RUNNING=false
@@ -1086,7 +1121,13 @@ export_compose_environment() {
 start_stack() {
   local start_status=0
   local startup_since=""
+  local runtime_contract_mode="$SCENARIO"
   local -a recreate_arguments=()
+
+  # The primary fault scenario replaces the normal Java runtime only after startup.
+  if [[ "$runtime_contract_mode" == "primary-w3c-fault" ]]; then
+    runtime_contract_mode="basic"
+  fi
 
   RUN_STAGE="compose-ownership"
   verify_compose_project_ownership || {
@@ -1180,7 +1221,7 @@ start_stack() {
     "$APACHE_HTTPS_HEALTH_ENDPOINT" \
     "verified Apache-to-Jetty HTTPS path" || return $?
   assert_apache_denies_java_diagnostics || return $?
-  assert_runtime_contract || return $?
+  assert_runtime_contract "$runtime_contract_mode" || return $?
 }
 
 remaining_timeout_seconds() {
@@ -1680,6 +1721,69 @@ environment_has_line() {
   return 1
 }
 
+environment_line_prefix_count() {
+  local -r environment="$1"
+  local -r prefix="$2"
+  local line=""
+  local -i count=0
+
+  while IFS= read -r line; do
+    if [[ "$line" == "$prefix"* ]]; then
+      ((count += 1))
+    fi
+  done <<<"$environment"
+  printf '%d\n' "$count"
+}
+
+assert_primary_fault_runtime_contract() {
+  local -r java_container="$1"
+  local -r java_environment="$2"
+  local preload_count=""
+  local control_file_count=""
+
+  preload_count="$(environment_line_prefix_count "$java_environment" "LD_PRELOAD=")" || return $?
+  control_file_count="$(environment_line_prefix_count \
+    "$java_environment" "OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_FILE=")" || return $?
+  [[ "$preload_count" == "1" && "$control_file_count" == "1" ]] || {
+    log_error "primary fault runtime must expose exactly one preload and control-file setting"
+    return 1
+  }
+  environment_has_line "$java_environment" "LD_PRELOAD=$PRIMARY_FAULT_PRELOAD" || {
+    log_error "primary fault runtime did not use the fixed preload library"
+    return 1
+  }
+  environment_has_line \
+    "$java_environment" \
+    "OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_FILE=$PRIMARY_FAULT_CONTROL_FILE" || {
+    log_error "primary fault runtime did not use the fixed control-file path"
+    return 1
+  }
+  # shellcheck disable=SC2016 # The fixed paths are positional parameters in the Java container.
+  run_bounded 10 docker exec "$java_container" /bin/sh -ec '
+    set -eu
+    directory=$1
+    control_file=$2
+    [ "$(id -u)" = 0 ]
+    [ -d "$directory" ] && [ ! -L "$directory" ]
+    [ "$(stat -c "%u:%g:%a:%F" "$directory")" = "0:0:700:directory" ]
+    [ ! -e "$control_file" ] && [ ! -L "$control_file" ]
+  ' sh "$PRIMARY_FAULT_CONTROL_DIRECTORY" "$PRIMARY_FAULT_CONTROL_FILE"
+}
+
+assert_normal_runtime_has_no_primary_fault_environment() {
+  local -r java_environment="$1"
+  local preload_count=""
+  local control_file_count=""
+
+  preload_count="$(environment_line_prefix_count "$java_environment" "LD_PRELOAD=")" || return $?
+  control_file_count="$(environment_line_prefix_count \
+    "$java_environment" "OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_FILE=")" || return $?
+  [[ "$preload_count" == "0" && "$control_file_count" == "0" ]] || {
+    log_error "normal Java runtime unexpectedly retained a primary fault setting"
+    return 1
+  }
+}
+
 assert_runtime_contract() {
   local -r mode="${1:-$SCENARIO}"
   local -r suppression_already_observed="${2:-false}"
@@ -1733,6 +1837,12 @@ assert_runtime_contract() {
     "OTEL_BSP_SCHEDULE_DELAY=$DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS"; then
     log_error "delayed OTLP control did not configure the expected Java export delay"
     return 1
+  fi
+
+  if [[ "$mode" == "primary-w3c-fault" ]]; then
+    assert_primary_fault_runtime_contract "$java_container" "$java_environment" || return $?
+  else
+    assert_normal_runtime_has_no_primary_fault_environment "$java_environment" || return $?
   fi
 
   if [[ "$mode" == "uninstrumented" ]]; then
@@ -2546,6 +2656,10 @@ scenario_request_count() {
 
   if [[ "$name" == "w3c-fault" ]]; then
     printf '%d\n' "$FAULT_REQUEST_COUNT"
+    return
+  fi
+  if [[ "$name" == "primary-w3c-fault" ]]; then
+    printf '1\n'
     return
   fi
   if [[ "$name" == "tls-boundary" ]]; then
@@ -4426,8 +4540,10 @@ recreate_instrumented_stack() {
   local -r transport="${3:-$TRANSPORT}"
   local -r verify_java_traffic="${4:-true}"
   local -r fresh_trace_receiver="${5:-false}"
+  local -r compose_flavor="${6:-base}"
   local recreate_since=""
   local -a services=(java-backend apache-proxy obi)
+  local -a compose_command=()
 
   [[ "$verify_java_traffic" == "true" || "$verify_java_traffic" == "false" ]] || {
     log_error "Java traffic verification mode must be true or false"
@@ -4437,6 +4553,18 @@ recreate_instrumented_stack() {
     log_error "trace receiver recreation mode must be true or false"
     return 1
   }
+  case "$compose_flavor" in
+    base)
+      compose_command=("${COMPOSE[@]}")
+      ;;
+    primary-fault)
+      compose_command=("${PRIMARY_FAULT_COMPOSE[@]}")
+      ;;
+    *)
+      log_error "unsupported instrumented-stack Compose flavor: $compose_flavor"
+      return 1
+      ;;
+  esac
   if [[ "$fresh_trace_receiver" == "true" ]]; then
     services=(trace-receiver "${services[@]}")
   fi
@@ -4450,11 +4578,16 @@ recreate_instrumented_stack() {
   export OTEL_JAVAAGENT_EXTENSIONS_VALUE="/otel/obi-otel-extension.jar"
   export OTEL_PROPAGATORS_VALUE="obi,tracecontext,baggage"
   recreate_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" || return $?
-  log_info "recreating the instrumented stack for $label propagation=$propagation"
+  log_info "recreating the instrumented stack for $label propagation=$propagation flavor=$compose_flavor"
   invalidate_selected_transport || return $?
   BRIDGE_RUNNING=false
+  if [[ "$compose_flavor" == "primary-fault" ]]; then
+    run_bounded 30 "${compose_command[@]}" config --quiet || return $?
+    run_bounded 30 "${compose_command[@]}" config \
+      >"$RESULT_DIR/compose-primary-fault-resolved.yaml" || return $?
+  fi
   run_bounded 180 \
-    "${COMPOSE[@]}" up --detach --force-recreate \
+    "${compose_command[@]}" up --detach --force-recreate \
       "${services[@]}" || return $?
   if [[ "$fresh_trace_receiver" == "true" ]]; then
     wait_for_http "http://127.0.0.1:14318/healthz" \
@@ -5328,6 +5461,347 @@ run_primary_w3c_stale_control() {
   fi
   return "$recovery_status"
 }
+
+primary_w3c_fault_expected_java_status() {
+  local -r mode="$1"
+
+  case "$mode" in
+    version-mismatch)
+      printf 'version_mismatch\n'
+      ;;
+    zero-trace-id|zero-span-id)
+      printf 'malformed\n'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+arm_primary_w3c_fault_control() {
+  local -r mode="$1"
+  local -r output="$2"
+
+  primary_w3c_fault_expected_java_status "$mode" >/dev/null || {
+    log_error "unsupported primary W3C fault mode: $mode"
+    return 1
+  }
+  [[ "$PRIMARY_FAULT_STACK_ACTIVE" == "true" ]] || {
+    log_error "cannot arm the primary W3C fault control outside its fault stack"
+    return 1
+  }
+  [[ ! -e "$output" && ! -L "$output" ]] || {
+    log_error "refusing to overwrite primary W3C fault evidence: $output"
+    return 1
+  }
+
+  # shellcheck disable=SC2016 # The control values are positional parameters in the Java container.
+  run_bounded 15 "${PRIMARY_FAULT_COMPOSE[@]}" exec --no-TTY --user 0:0 \
+    java-backend /bin/sh -ec '
+      set -eu
+      directory=$1
+      control_file=$2
+      mode=$3
+
+      case "$mode" in
+        version-mismatch|zero-trace-id|zero-span-id) ;;
+        *) exit 64 ;;
+      esac
+      [ "$control_file" = "$directory/java-remote-parent.mode" ]
+      [ "$(id -u)" = 0 ]
+      [ -d "$directory" ] && [ ! -L "$directory" ]
+      [ "$(stat -c "%u:%g:%a:%F" "$directory")" = "0:0:700:directory" ]
+      [ ! -e "$control_file" ] && [ ! -L "$control_file" ]
+
+      umask 077
+      temporary=$(mktemp "$directory/.java-remote-parent.mode.XXXXXX")
+      cleanup() {
+        [ -z "${temporary:-}" ] || rm -f -- "$temporary"
+      }
+      trap cleanup EXIT HUP INT TERM
+      printf "%s\\n" "$mode" >"$temporary"
+      chmod 0600 -- "$temporary"
+      [ "$(stat -c "%u:%g:%a:%h:%F" "$temporary")" = "0:0:600:1:regular file" ]
+      mv -T -- "$temporary" "$control_file"
+      temporary=
+      trap - EXIT HUP INT TERM
+      [ "$(stat -c "%u:%g:%a:%h:%F" "$control_file")" = "0:0:600:1:regular file" ]
+      [ "$(cat "$control_file")" = "$mode" ]
+      printf "phase=armed\\nmode=%s\\nmetadata=%s\\nsize=%s\\n" \\
+        "$mode" "$(stat -c "%u:%g:%a:%h:%F" "$control_file")" \\
+        "$(stat -c "%s" "$control_file")"
+    ' sh "$PRIMARY_FAULT_CONTROL_DIRECTORY" "$PRIMARY_FAULT_CONTROL_FILE" "$mode" \
+    >"$output"
+}
+
+consume_primary_w3c_fault_control() {
+  local -r output="$1"
+
+  [[ "$PRIMARY_FAULT_STACK_ACTIVE" == "true" ]] || {
+    log_error "cannot inspect the primary W3C fault control outside its fault stack"
+    return 1
+  }
+  [[ ! -e "$output" && ! -L "$output" ]] || {
+    log_error "refusing to overwrite primary W3C fault evidence: $output"
+    return 1
+  }
+
+  # shellcheck disable=SC2016 # The control values are positional parameters in the Java container.
+  run_bounded 15 "${PRIMARY_FAULT_COMPOSE[@]}" exec --no-TTY --user 0:0 \
+    java-backend /bin/sh -ec '
+      set -eu
+      directory=$1
+      control_file=$2
+
+      [ "$control_file" = "$directory/java-remote-parent.mode" ]
+      [ "$(id -u)" = 0 ]
+      [ -d "$directory" ] && [ ! -L "$directory" ]
+      [ "$(stat -c "%u:%g:%a:%F" "$directory")" = "0:0:700:directory" ]
+      [ -f "$control_file" ] && [ ! -L "$control_file" ]
+      [ "$(stat -c "%u:%g:%a:%h:%F" "$control_file")" = "0:0:600:1:regular file" ]
+      [ ! -s "$control_file" ]
+      printf "phase=consumed\\nmetadata=%s\\nsize=%s\\n" \\
+        "$(stat -c "%u:%g:%a:%h:%F" "$control_file")" \\
+        "$(stat -c "%s" "$control_file")"
+      rm -f -- "$control_file"
+      [ ! -e "$control_file" ] && [ ! -L "$control_file" ]
+    ' sh "$PRIMARY_FAULT_CONTROL_DIRECTORY" "$PRIMARY_FAULT_CONTROL_FILE" \
+    >"$output"
+}
+
+run_primary_w3c_fault_scenario() {
+  local -r mode="$1"
+  local run_number=0
+  local label=""
+  local output=""
+  local stderr_output=""
+  local before_phase=""
+  local after_phase=""
+  local before_diagnostics=""
+  local after_diagnostics=""
+  local diagnostics_delta=""
+  local before_success=0
+  local before_stage=0
+  local expected_success=0
+  local expected_stage=0
+  local baseline_snapshot=""
+  local arm_evidence=""
+  local consumption_evidence=""
+  local scenario_status=0
+  local metric_status=0
+  local status_name="passed"
+  local control_armed=false
+
+  primary_w3c_fault_expected_java_status "$mode" >/dev/null || {
+    log_error "unsupported primary W3C fault mode: $mode"
+    return 1
+  }
+  [[ "$BRIDGE_RUNNING" == "true" && "$SELECTED_TRANSPORT" == "getsockopt" && \
+    "$PRIMARY_FAULT_STACK_ACTIVE" == "true" ]] || {
+    log_error "primary W3C fault scenario requires the running forced primary fault stack"
+    return 1
+  }
+
+  for ((run_number = 1; run_number <= REPEAT_COUNT; run_number++)); do
+    label="primary-w3c-fault-$mode"
+    if ((REPEAT_COUNT > 1)); then
+      printf -v label '%s-run-%02d' "$label" "$run_number"
+    fi
+    output="$RESULT_DIR/scenario-$label.json"
+    stderr_output="$RESULT_DIR/scenario-$label.stderr.log"
+    before_phase="$label-before"
+    after_phase="$label-after"
+    before_diagnostics="$RESULT_DIR/phases/$before_phase/java-diagnostics.txt"
+    after_diagnostics="$RESULT_DIR/phases/$after_phase/java-diagnostics.txt"
+    diagnostics_delta="$RESULT_DIR/phases/$after_phase/java-diagnostics.delta"
+    arm_evidence="$RESULT_DIR/primary-w3c-fault-$mode-run-$run_number-armed.txt"
+    consumption_evidence="$RESULT_DIR/primary-w3c-fault-$mode-run-$run_number-consumed.txt"
+    scenario_status=0
+    metric_status=0
+    status_name="passed"
+    control_armed=false
+
+    log_info "running $label scenario"
+    mkdir -p -- "$RESULT_DIR/phases/$before_phase"
+    if ! flush_bridge_metric_boundary "$label" 1 1 "$before_diagnostics"; then
+      metric_status=1
+    elif ! assert_sanitized_java_diagnostics "$before_diagnostics"; then
+      log_error "primary W3C fault diagnostics baseline is invalid for $label"
+      metric_status=1
+    else
+      baseline_snapshot="$(<"$before_diagnostics")"
+    fi
+    if ! capture_phase_evidence "$before_phase"; then
+      metric_status=1
+    fi
+    before_success="$(bridge_success_total \
+      "$RESULT_DIR/phases/$before_phase/obi-metrics.prom")" || return $?
+    before_stage="$(bridge_stage_total \
+      "$RESULT_DIR/phases/$before_phase/obi-metrics.prom")" || return $?
+    if ((metric_status == 0)); then
+      if arm_primary_w3c_fault_control "$mode" "$arm_evidence"; then
+        control_armed=true
+      else
+        metric_status=1
+      fi
+    fi
+    if [[ "$control_armed" == "true" ]]; then
+      if run_bounded "$SCENARIO_RUN_TIMEOUT_SECONDS" \
+        "${COMPOSE[@]}" run --rm --no-deps --no-TTY scenario \
+          --scenario primary-w3c-fault \
+          --expected-tls "$TLS_PROTOCOL" \
+          --seed "$SCENARIO_SEED" \
+          --requests 1 \
+          --fault-mode "$mode" \
+          --java-diagnostics-before "$baseline_snapshot" \
+          --timeout 75s 2> >(tee "$stderr_output" >&2) | tee "$output"; then
+        :
+      else
+        scenario_status=$?
+      fi
+      if ! consume_primary_w3c_fault_control "$consumption_evidence"; then
+        log_error "primary W3C fault control was not consumed exactly once for $label"
+        metric_status=1
+      fi
+    fi
+    expected_success="$((before_success + 1))"
+    expected_stage="$((before_stage + 1))"
+    if ! wait_for_bridge_metrics_quiescent \
+      "$expected_success" \
+      "$expected_stage" \
+      "$RESULT_DIR/metrics-after-$label.prom" \
+      "$label scenario-attributable bridge operations"; then
+      metric_status=1
+    fi
+    if ! capture_phase_evidence "$after_phase"; then
+      metric_status=1
+    fi
+    if ! extract_fault_diagnostics_after "$output" "$after_diagnostics"; then
+      log_error "could not extract primary W3C fault diagnostics for $label"
+      metric_status=1
+    elif ! write_java_diagnostics_delta \
+      "$before_diagnostics" \
+      "$after_diagnostics" \
+      "$diagnostics_delta"; then
+      log_error "could not compute primary W3C fault diagnostics for $label"
+      metric_status=1
+    elif ! assert_w3c_fault_diagnostics_delta "$diagnostics_delta" "$mode" 1; then
+      log_error "primary W3C fault diagnostics were not exactly attributable for $label"
+      metric_status=1
+    fi
+    if ! write_metrics_delta \
+      "$RESULT_DIR/phases/$before_phase/obi-metrics.prom" \
+      "$RESULT_DIR/phases/$after_phase/obi-metrics.prom" \
+      "$RESULT_DIR/phases/$after_phase/obi-metrics.delta"; then
+      metric_status=1
+    elif ! assert_bridge_metric_delta \
+      "$RESULT_DIR/phases/$after_phase/obi-metrics.delta" \
+      getsockopt 1 0 0 1 1 false 0; then
+      metric_status=1
+    fi
+    if ((scenario_status != 0 || metric_status != 0)); then
+      status_name="failed"
+    fi
+    if ! printf '{\n  "status": "%s",\n  "scenario": "primary-w3c-fault",\n  "fault_mode": "%s",\n  "exit_status": %d,\n  "metric_status": %d,\n  "result": "%s",\n  "stderr": "%s",\n  "after_phase": "%s",\n  "fault_control_arm": "%s",\n  "fault_control_consumption": "%s"\n}\n' \
+      "$status_name" \
+      "$mode" \
+      "$scenario_status" \
+      "$metric_status" \
+      "$(basename -- "$output")" \
+      "$(basename -- "$stderr_output")" \
+      "phases/$after_phase" \
+      "$(basename -- "$arm_evidence")" \
+      "$(basename -- "$consumption_evidence")" \
+      >"$RESULT_DIR/scenario-$label-status.json"; then
+      return 1
+    fi
+    log_info "$label status=$status_name evidence=$RESULT_DIR/scenario-$label-status.json"
+    if ((scenario_status != 0)); then
+      return "$scenario_status"
+    fi
+    if ((metric_status != 0)); then
+      return "$metric_status"
+    fi
+  done
+}
+
+run_primary_w3c_fault_control() (
+  local -r original_variant="$SCENARIO_VARIANT"
+  local -r recovery_marker="$RESULT_DIR/primary-w3c-fault-recovery-required"
+  local restore_required=false
+
+  # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
+  restore_primary_w3c_fault_stack() {
+    local -r status="$?"
+    local restore_status=0
+
+    trap - EXIT
+    set +e
+    if [[ "$restore_required" == "true" ]]; then
+      log_warn "restoring the normal instrumented stack after primary W3C fault control" || true
+      (
+        set -Eeuo pipefail
+        recreate_instrumented_stack \
+          tcp "post-primary W3C fault recovery" getsockopt true false base
+        assert_runtime_contract basic true
+      )
+      restore_status=$?
+      if ((restore_status == 0)); then
+        if rm -f -- "$recovery_marker"; then
+          PRIMARY_FAULT_STACK_ACTIVE=false
+        else
+          restore_status=$?
+          log_error "could not clear the primary W3C fault recovery marker" || true
+        fi
+      else
+        log_error "could not restore the instrumented stack after primary W3C fault control" || true
+      fi
+    fi
+    SCENARIO_VARIANT="$original_variant"
+    if ((status == 0 && restore_status != 0)); then
+      exit "$restore_status"
+    fi
+    exit "$status"
+  }
+
+  trap restore_primary_w3c_fault_stack EXIT
+  [[ "$TRANSPORT" == "getsockopt" && "$SELECTED_TRANSPORT" == "getsockopt" && \
+    "$BRIDGE_RUNNING" == "true" ]] || {
+    log_error "the primary W3C fault control requires a healthy forced getsockopt bridge"
+    return 1
+  }
+  [[ ! -e "$recovery_marker" && ! -L "$recovery_marker" ]] || {
+    log_error "primary W3C fault recovery marker already exists: $recovery_marker"
+    return 1
+  }
+  if ! (umask 077; printf 'recovery_required\n' >"$recovery_marker"); then
+    log_error "could not create the primary W3C fault recovery marker"
+    return 1
+  fi
+
+  restore_required=true
+  PRIMARY_FAULT_STACK_ACTIVE=true
+  recreate_instrumented_stack \
+    tcp "primary W3C fault preparation" getsockopt true false primary-fault || return $?
+  assert_runtime_contract primary-w3c-fault true || return $?
+
+  for FAULT_MODE in version-mismatch zero-trace-id zero-span-id; do
+    run_primary_w3c_fault_scenario "$FAULT_MODE" || return $?
+  done
+  FAULT_MODE="alternating"
+
+  recreate_instrumented_stack \
+    tcp "post-primary W3C fault recovery" getsockopt true false base || return $?
+  assert_runtime_contract basic true || return $?
+  rm -f -- "$recovery_marker" || return $?
+  PRIMARY_FAULT_STACK_ACTIVE=false
+  restore_required=false
+  SCENARIO_VARIANT="primary-w3c-fault-recovery"
+  run_scenario basic
+  SCENARIO_VARIANT="$original_variant"
+
+  trap - EXIT
+)
 
 extract_java_diagnostics_header() {
   local -r headers="$1"
@@ -6251,9 +6725,12 @@ execute_requested_scenarios() {
       run_scenario obi-flags
       if [[ "$TRANSPORT" == "getsockopt" && "$SELECTED_TRANSPORT" == "getsockopt" ]]; then
         run_primary_w3c_stale_control
+        run_primary_w3c_fault_control
       else
         record_unsupported_scenario \
           primary-w3c-stale "requires forced getsockopt transport"
+        record_unsupported_scenario \
+          primary-w3c-fault "requires forced getsockopt transport"
       fi
       if [[ "$TRANSPORT" == "unix" ]]; then
         run_w3c_fault_control
@@ -6320,6 +6797,9 @@ execute_requested_scenarios() {
       ;;
     primary-w3c-stale)
       run_primary_w3c_stale_control
+      ;;
+    primary-w3c-fault)
+      run_primary_w3c_fault_control
       ;;
     security)
       run_security_control
@@ -7494,8 +7974,9 @@ assert_restart_fault_diagnostics() {
 }
 
 capture_final_java_diagnostics() {
-  if [[ "$FAULT_BRIDGE_RUNNING" == "true" ]]; then
-    log_warn "skipping final Java diagnostics while the W3C fault bridge is active"
+  if [[ "$FAULT_BRIDGE_RUNNING" == "true" || \
+    "$PRIMARY_FAULT_STACK_ACTIVE" == "true" ]]; then
+    log_warn "skipping final Java diagnostics while a fault bridge is active"
     return 0
   fi
   capture_java_diagnostics "final"

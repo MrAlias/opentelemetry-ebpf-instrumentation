@@ -327,6 +327,57 @@ test_cleanup_failure_changes_successful_run_status() {
   }
 }
 
+test_primary_fault_recovery_marker_forces_cleanup_with_keep() {
+  local -r result_dir="$TEST_TMP_DIR/primary-fault-recovery-marker"
+  local -r down_marker="$result_dir/down"
+  local cleanup_status=0
+
+  mkdir -p -- "$result_dir"
+  printf 'recovery_required\n' >"$result_dir/primary-w3c-fault-recovery-required"
+  if (
+    RESULT_DIR="$result_dir"
+    STACK_STARTED=true
+    KEEP_RUNNING=true
+    BRIDGE_RUNNING=true
+    PRIMARY_FAULT_STACK_ACTIVE=false
+    RUN_STATUS=passed
+    ACCEPTANCE_EVIDENCE=true
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    cleanup_security_processes() {
+      :
+    }
+    capture_evidence() {
+      [[ "$PRIMARY_FAULT_STACK_ACTIVE" == true ]]
+    }
+    invalidate_project_transport_evidence() {
+      :
+    }
+    safe_compose_down() {
+      [[ "$BRIDGE_RUNNING" == false ]] || return 1
+      : >"$down_marker"
+    }
+
+    cleanup
+  ) >/dev/null 2>&1; then
+    printf 'primary fault recovery marker left a kept stack running\n' >&2
+    return 1
+  else
+    cleanup_status=$?
+  fi
+  [[ "$cleanup_status" == 1 && -e "$down_marker" ]] || {
+    printf 'primary fault recovery marker did not force a failed cleanup\n' >&2
+    return 1
+  }
+  grep -Fq '"failure_stage": "primary-w3c-fault-recovery"' \
+    "$result_dir/run-status.json" || {
+    printf 'primary fault recovery marker omitted its failure evidence\n' >&2
+    return 1
+  }
+}
+
 test_run_status_publication_failure_changes_successful_exit() {
   local -r result_dir="$TEST_TMP_DIR/run-status-publication-failure"
   local -r cleanup_log="$result_dir/cleanup.log"
@@ -972,7 +1023,7 @@ test_benchmark_controls_are_bounded() {
 
 test_all_suite_includes_every_scenario() {
   local -r actual="$TEST_TMP_DIR/all-scenarios.txt"
-  local -r expected=$'basic\nbasic\nsecurity\nkeepalive\npipelining\nconcurrency\nconnection-churn\nfd-port-reuse\nslow-body\ntls-boundary\ntimeout-retry\npressure\nhandoff\nvirtual-thread\nnetty\nnetty-server\ndispatch\nw3c\nw3c-match\nobi-flags\nprimary-w3c-stale\nbasic\nfail-open\nw3c-only\nrestart\nrestart-fault\nhelper-attach-failure\ndisabled\nw3c-only\nw3c-only\nuninstrumented'
+  local -r expected=$'basic\nbasic\nsecurity\nkeepalive\npipelining\nconcurrency\nconnection-churn\nfd-port-reuse\nslow-body\ntls-boundary\ntimeout-retry\npressure\nhandoff\nvirtual-thread\nnetty\nnetty-server\ndispatch\nw3c\nw3c-match\nobi-flags\nprimary-w3c-stale\nbasic\nprimary-w3c-fault\nprimary-w3c-fault\nprimary-w3c-fault\nbasic\nfail-open\nw3c-only\nrestart\nrestart-fault\nhelper-attach-failure\ndisabled\nw3c-only\nw3c-only\nuninstrumented'
 
   (
     SCENARIO=all
@@ -990,6 +1041,12 @@ test_all_suite_includes_every_scenario() {
     }
     run_primary_w3c_stale_control() {
       run_scenario primary-w3c-stale
+      run_scenario basic
+    }
+    run_primary_w3c_fault_control() {
+      run_scenario primary-w3c-fault
+      run_scenario primary-w3c-fault
+      run_scenario primary-w3c-fault
       run_scenario basic
     }
     record_unsupported_scenario() {
@@ -1308,6 +1365,48 @@ test_primary_w3c_stale_requires_forced_primary() {
   fi
 }
 
+test_primary_w3c_fault_requires_forced_primary() {
+  (
+    TRANSPORT=getsockopt
+    SCENARIO=all
+    REQUEST_COUNT=0
+    parse_args --transport getsockopt --scenario primary-w3c-fault --requests 1
+    [[ "$TRANSPORT" == "getsockopt" && "$SCENARIO" == "primary-w3c-fault" && \
+      "$REQUEST_COUNT" == "1" ]]
+  ) || {
+    printf 'rejected the forced-primary malformed-response control\n' >&2
+    return 1
+  }
+  if (
+    TRANSPORT=getsockopt
+    SCENARIO=all
+    REQUEST_COUNT=0
+    parse_args --transport unix --scenario primary-w3c-fault
+  ) >/dev/null 2>&1; then
+    printf 'accepted the primary malformed-response control without forced getsockopt\n' >&2
+    return 1
+  fi
+  if (
+    TRANSPORT=getsockopt
+    SCENARIO=all
+    REQUEST_COUNT=0
+    parse_args --transport getsockopt --scenario primary-w3c-fault --requests 2
+  ) >/dev/null 2>&1; then
+    printf 'accepted the primary malformed-response control with multiple requests\n' >&2
+    return 1
+  fi
+}
+
+test_primary_w3c_fault_modes_are_exact() {
+  [[ "$(primary_w3c_fault_expected_java_status version-mismatch)" == version_mismatch ]]
+  [[ "$(primary_w3c_fault_expected_java_status zero-trace-id)" == malformed ]]
+  [[ "$(primary_w3c_fault_expected_java_status zero-span-id)" == malformed ]]
+  if primary_w3c_fault_expected_java_status alternating >/dev/null 2>&1; then
+    printf 'accepted a Unix-only W3C fault mode for the primary fault shim\n' >&2
+    return 1
+  fi
+}
+
 test_primary_w3c_stale_control_restores_the_normal_ttls() {
   local -r observed="$TEST_TMP_DIR/primary-w3c-stale-control.calls"
 
@@ -1406,6 +1505,278 @@ test_primary_w3c_stale_scenario_accounts_for_the_stale_take() {
   grep -Fqx 'wait:10:21' "$calls"
   grep -Fqx 'bridge:getsockopt:0:0:0:1:1:false:1' "$calls"
   grep -Fqx 'java:0:1:0:1:0:0:0' "$calls"
+}
+
+test_primary_w3c_fault_recreation_uses_the_overlay_only() {
+  local -r result_dir="$TEST_TMP_DIR/primary-fault-recreate"
+  local -r observed="$result_dir/observed"
+
+  mkdir -p -- "$result_dir"
+  (
+    RESULT_DIR="$result_dir"
+    COMPOSE=(base-compose)
+    PRIMARY_FAULT_COMPOSE=(fault-compose)
+    BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=getsockopt
+    date() {
+      printf 'primary-fault-cursor\n'
+    }
+    invalidate_selected_transport() {
+      SELECTED_TRANSPORT=""
+    }
+    run_bounded() {
+      printf 'bounded:%s\n' "$*" >>"$observed"
+    }
+    wait_for_log() {
+      printf 'log:%s\n' "$3" >>"$observed"
+    }
+    assert_selected_transport() {
+      printf 'transport:%s\n' "$1" >>"$observed"
+    }
+    wait_for_apache_instrumentation() {
+      printf 'apache:%s\n' "$1" >>"$observed"
+    }
+    wait_for_http() {
+      printf 'http:%s\n' "$2" >>"$observed"
+    }
+    wait_for_java_duplicate_suppression() {
+      printf 'suppression:%s\n' "$(basename -- "$1")" >>"$observed"
+    }
+
+    recreate_instrumented_stack \
+      tcp primary-fault-overlay getsockopt true false primary-fault
+    [[ "${COMPOSE[*]}" == "base-compose" && \
+      "${PRIMARY_FAULT_COMPOSE[*]}" == "fault-compose" ]]
+  ) || {
+    printf 'primary fault recreation did not use its overlay\n' >&2
+    return 1
+  }
+
+  grep -Fqx 'bounded:30 fault-compose config --quiet' "$observed"
+  grep -Fqx 'bounded:30 fault-compose config' "$observed"
+  grep -Fqx \
+    'bounded:180 fault-compose up --detach --force-recreate java-backend apache-proxy obi' \
+    "$observed"
+  if grep -Fq 'base-compose up' "$observed"; then
+    printf 'primary fault recreation used the base Compose command for its JVM\n' >&2
+    return 1
+  fi
+}
+
+test_primary_w3c_fault_scenario_arms_after_the_baseline() {
+  local -r result_dir="$TEST_TMP_DIR/primary-fault-scenario"
+  local -r observed="$result_dir/observed"
+  local baseline_count=0
+
+  mkdir -p -- "$result_dir"
+  (
+    RESULT_DIR="$result_dir"
+    BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=getsockopt
+    PRIMARY_FAULT_STACK_ACTIVE=true
+    COMPOSE=(base-compose)
+    PRIMARY_FAULT_COMPOSE=(fault-compose)
+    REPEAT_COUNT=2
+    SCENARIO_SEED=19
+    TLS_PROTOCOL=TLSv1.3
+    : >"$observed"
+    flush_bridge_metric_boundary() {
+      local -r diagnostics="$4"
+
+      ((baseline_count += 1))
+      printf 'boundary:%s:%s:%s\n' "$1" "$2" "$3" >>"$observed"
+      mkdir -p -- "$(dirname -- "$diagnostics")"
+      write_diagnostics_fixture \
+        "$diagnostics" 0 0 0 0 0 0 version_mismatch "$((baseline_count - 1))"
+    }
+    capture_phase_evidence() {
+      printf 'evidence:%s\n' "$1" >>"$observed"
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+      if [[ "$1" == *-before ]]; then
+        printf '%s\n' \
+          'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 10' \
+          'obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} 20' \
+          >"$RESULT_DIR/phases/$1/obi-metrics.prom"
+      else
+        printf '%s\n' \
+          'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 11' \
+          'obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} 21' \
+          >"$RESULT_DIR/phases/$1/obi-metrics.prom"
+      fi
+    }
+    arm_primary_w3c_fault_control() {
+      [[ -s "$RESULT_DIR/phases/primary-w3c-fault-version-mismatch-run-$(printf '%02d' "$baseline_count")-before/java-diagnostics.txt" ]] || return 1
+      printf 'arm:%s:%s\n' "$1" "$(basename -- "$2")" >>"$observed"
+      printf 'phase=armed\n' >"$2"
+    }
+    consume_primary_w3c_fault_control() {
+      printf 'consume:%s\n' "$(basename -- "$1")" >>"$observed"
+      printf 'phase=consumed\n' >"$1"
+    }
+    run_bounded() {
+      local diagnostics_before=""
+      local argument=""
+      local version_mismatch_count=""
+
+      for argument in "$@"; do
+        if [[ "$argument" == cfg_on=* ]]; then
+          diagnostics_before="$argument"
+        fi
+      done
+      [[ "$diagnostics_before" == \
+        "$(<"$RESULT_DIR/phases/primary-w3c-fault-version-mismatch-run-$(printf '%02d' "$baseline_count")-before/java-diagnostics.txt")" ]] || return 1
+      version_mismatch_count="$(sed -n 's/.*t_version_mismatch=\([0-9][0-9]*\).*/\1/p' \
+        <<<"$diagnostics_before")"
+      [[ "$version_mismatch_count" =~ ^[0-9]+$ ]] || return 1
+      printf 'scenario:%s\n' "$*" >>"$observed"
+      write_diagnostics_fixture \
+        "$RESULT_DIR/after-$baseline_count.txt" 0 0 0 0 0 0 version_mismatch \
+        "$((version_mismatch_count + 1))"
+      printf '{\n  "status": "passed",\n  "fault_diagnostics_after": "%s"\n}\n' \
+        "$(<"$RESULT_DIR/after-$baseline_count.txt")"
+    }
+    wait_for_bridge_metrics_quiescent() {
+      printf 'wait:%s:%s\n' "$1" "$2" >>"$observed"
+    }
+    write_metrics_delta() {
+      : >"$3"
+    }
+    assert_bridge_metric_delta() {
+      printf 'bridge:%s:%s:%s:%s:%s:%s:%s:%s\n' \
+        "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" >>"$observed"
+      [[ "$2" == getsockopt && "$3" == 1 && "$4" == 0 && "$5" == 0 && \
+        "$6" == 1 && "$7" == 1 && "$8" == false && "$9" == 0 ]]
+    }
+    capture_java_diagnostics() {
+      printf 'unexpected-direct-diagnostics:%s\n' "$1" >>"$observed"
+      return 1
+    }
+
+    run_primary_w3c_fault_scenario version-mismatch
+  ) || {
+    printf 'primary fault scenario did not preserve its one-shot lifecycle\n' >&2
+    return 1
+  }
+
+  [[ "$(grep -c '^boundary:' "$observed")" == 2 && \
+    "$(grep -c '^arm:' "$observed")" == 2 && \
+    "$(grep -c '^consume:' "$observed")" == 2 && \
+    "$(grep -c '^scenario:' "$observed")" == 2 ]] || {
+    printf 'primary fault scenario did not arm and consume every repeated request\n' >&2
+    return 1
+  }
+  if grep -q '^unexpected-direct-diagnostics:' "$observed"; then
+    printf 'primary fault scenario performed a direct Java diagnostics request after arming\n' >&2
+    return 1
+  fi
+  awk '
+    /^boundary:/ { boundary++ }
+    /^arm:/ {
+      arm++
+      if (boundary != arm) invalid = 1
+    }
+    /^scenario:/ {
+      scenario++
+      if (arm != scenario) invalid = 1
+    }
+    /^consume:/ {
+      consume++
+      if (scenario != consume) invalid = 1
+    }
+    END { exit invalid || boundary != 2 || arm != 2 || scenario != 2 || consume != 2 ? 1 : 0 }
+  ' "$observed" || {
+    printf 'primary fault scenario did not order boundary, arm, request, and consumption\n' >&2
+    return 1
+  }
+  grep -Fqx 'bridge:getsockopt:1:0:0:1:1:false:0' "$observed"
+  grep -Fq -- '--scenario primary-w3c-fault' "$observed"
+  grep -Fq -- '--fault-mode version-mismatch' "$observed"
+  [[ -s "$result_dir/scenario-primary-w3c-fault-version-mismatch-run-01-status.json" && \
+    -s "$result_dir/scenario-primary-w3c-fault-version-mismatch-run-02-status.json" ]] || {
+    printf 'primary fault scenario did not retain per-request evidence\n' >&2
+    return 1
+  }
+}
+
+test_primary_w3c_fault_control_restores_the_base_stack() {
+  run_case() (
+    local -r mode="$1"
+    local -r expected_status="$2"
+    local -r expected_primary_fault_stack_active="$3"
+    local -r result_dir="$TEST_TMP_DIR/primary-fault-control-$mode"
+    local -r observed="$result_dir/observed"
+    local status=0
+
+    mkdir -p -- "$result_dir"
+    RESULT_DIR="$result_dir"
+    TRANSPORT=getsockopt
+    SELECTED_TRANSPORT=getsockopt
+    BRIDGE_RUNNING=true
+    KEEP_RUNNING=true
+    SCENARIO_VARIANT=existing-variant
+    PRIMARY_FAULT_STACK_ACTIVE=false
+    : >"$observed"
+    recreate_instrumented_stack() {
+      printf 'recreate:%s:%s:%s:%s\n' "$2" "$3" "$4" "$6" >>"$observed"
+    }
+    assert_runtime_contract() {
+      printf 'runtime:%s:%s\n' "$1" "$2" >>"$observed"
+      [[ "$mode" != recovery-contract-failure || "$1" != basic ]] || return 23
+    }
+    run_primary_w3c_fault_scenario() {
+      printf 'fault:%s\n' "$1" >>"$observed"
+      [[ "$mode" != failure || "$1" != version-mismatch ]] || return 17
+    }
+    run_scenario() {
+      printf 'scenario:%s:%s\n' "$1" "$SCENARIO_VARIANT" >>"$observed"
+    }
+
+    if run_primary_w3c_fault_control; then
+      status=0
+    else
+      status=$?
+    fi
+    [[ "$status" == "$expected_status" && \
+      "$PRIMARY_FAULT_STACK_ACTIVE" == "$expected_primary_fault_stack_active" && \
+      "$SCENARIO_VARIANT" == existing-variant ]] || return 1
+    if [[ "$mode" == recovery-contract-failure ]]; then
+      [[ -e "$result_dir/primary-w3c-fault-recovery-required" ]] || return 1
+    else
+      [[ ! -e "$result_dir/primary-w3c-fault-recovery-required" ]] || return 1
+    fi
+  ) || {
+    printf 'primary fault control did not preserve its status and caller state\n' >&2
+    return 1
+  }
+
+  run_case success 0 false
+  run_case failure 17 false
+  run_case recovery-contract-failure 23 false
+
+  local -r success="$TEST_TMP_DIR/primary-fault-control-success/observed"
+  local -r failure="$TEST_TMP_DIR/primary-fault-control-failure/observed"
+  local -r recovery_contract_failure="$TEST_TMP_DIR/primary-fault-control-recovery-contract-failure/observed"
+
+  grep -Fqx 'recreate:primary W3C fault preparation:getsockopt:true:primary-fault' "$success"
+  grep -Fqx 'runtime:primary-w3c-fault:true' "$success"
+  grep -Fqx 'fault:version-mismatch' "$success"
+  grep -Fqx 'fault:zero-trace-id' "$success"
+  grep -Fqx 'fault:zero-span-id' "$success"
+  grep -Fqx 'recreate:post-primary W3C fault recovery:getsockopt:true:base' "$success"
+  grep -Fqx 'runtime:basic:true' "$success"
+  grep -Fqx 'scenario:basic:primary-w3c-fault-recovery' "$success"
+  grep -Fqx 'recreate:post-primary W3C fault recovery:getsockopt:true:base' "$failure"
+  grep -Fqx 'runtime:basic:true' "$failure"
+  if grep -q '^scenario:basic:' "$failure"; then
+    printf 'failed primary fault control ran its post-recovery traffic\n' >&2
+    return 1
+  fi
+  [[ "$(grep -c '^recreate:post-primary W3C fault recovery:getsockopt:true:base$' \
+    "$recovery_contract_failure")" == 2 && \
+    "$(grep -c '^runtime:basic:true$' "$recovery_contract_failure")" == 2 ]] || {
+    printf 'failed primary fault recovery cleared its marker without a clean runtime contract\n' >&2
+    return 1
+  }
 }
 
 test_security_accepts_enabled_transports() {
@@ -5527,6 +5898,7 @@ test_final_java_diagnostics_skip_active_fault_bridge() {
 
   (
     FAULT_BRIDGE_RUNNING=true
+    PRIMARY_FAULT_STACK_ACTIVE=false
     log_warn() {
       :
     }
@@ -5537,9 +5909,13 @@ test_final_java_diagnostics_skip_active_fault_bridge() {
     capture_final_java_diagnostics
     FAULT_BRIDGE_RUNNING=false
     capture_final_java_diagnostics
+    PRIMARY_FAULT_STACK_ACTIVE=true
+    capture_final_java_diagnostics
+    PRIMARY_FAULT_STACK_ACTIVE=false
+    capture_final_java_diagnostics
   )
-  [[ "$(<"$calls")" == "final" ]] || {
-    printf 'final evidence probed Java while the fault responder was active\n' >&2
+  [[ "$(<"$calls")" == $'final\nfinal' ]] || {
+    printf 'final evidence probed Java while a fault control was active\n' >&2
     return 1
   }
 }
@@ -6794,6 +7170,104 @@ test_runtime_environment_line_matching() {
   fi
 }
 
+test_primary_fault_runtime_contract_is_exact_and_base_is_clean() {
+  local -r result_dir="$TEST_TMP_DIR/primary-fault-runtime"
+  local runtime_environment=""
+  local -i primary_exec_calls=0
+
+  mkdir -p -- "$result_dir"
+  (
+    RESULT_DIR="$result_dir"
+    COMPOSE=(test-compose)
+    run_bounded() {
+      case "$*" in
+        *"test-compose ps --quiet java-backend")
+          printf 'java-container\n'
+          ;;
+        *"docker inspect --format "*" java-container")
+          printf '%s\n' "$runtime_environment"
+          ;;
+        *"docker exec java-container /bin/sh -ec "*)
+          ((primary_exec_calls += 1))
+          ;;
+        *"test-compose ps --quiet obi")
+          printf 'obi-container\n'
+          ;;
+        *"docker inspect --format "*" obi-container")
+          printf 'true host\n'
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+    }
+    wait_for_java_duplicate_suppression() {
+      return 1
+    }
+    log_error() {
+      :
+    }
+
+    runtime_environment="$(printf '%s\n' \
+      'JAVA_TOOL_OPTIONS=-javaagent:/otel/official-javaagent.jar' \
+      'OTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar' \
+      'OTEL_OBI_REMOTE_PARENT_ENABLED=true' \
+      "LD_PRELOAD=$PRIMARY_FAULT_PRELOAD" \
+      "OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_FILE=$PRIMARY_FAULT_CONTROL_FILE")"
+    assert_runtime_contract primary-w3c-fault true || {
+      printf 'primary fault runtime rejected its exact fixed environment\n' >&2
+      return 1
+    }
+    [[ "$primary_exec_calls" == 1 ]] || {
+      printf 'primary fault runtime did not inspect its private control tmpfs\n' >&2
+      return 1
+    }
+
+    runtime_environment="$(printf '%s\n' \
+      'JAVA_TOOL_OPTIONS=-javaagent:/otel/official-javaagent.jar' \
+      'OTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar' \
+      'OTEL_OBI_REMOTE_PARENT_ENABLED=true')"
+    assert_runtime_contract basic true || {
+      printf 'normal recovered runtime rejected its clean environment\n' >&2
+      return 1
+    }
+
+    for runtime_environment in \
+      "$(printf '%s\n' \
+        'JAVA_TOOL_OPTIONS=-javaagent:/otel/official-javaagent.jar' \
+        'OTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar' \
+        'OTEL_OBI_REMOTE_PARENT_ENABLED=true' \
+        "LD_PRELOAD=$PRIMARY_FAULT_PRELOAD")" \
+      "$(printf '%s\n' \
+        'JAVA_TOOL_OPTIONS=-javaagent:/otel/official-javaagent.jar' \
+        'OTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar' \
+        'OTEL_OBI_REMOTE_PARENT_ENABLED=true' \
+        "OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_FILE=$PRIMARY_FAULT_CONTROL_FILE")" \
+      "$(printf '%s\n' \
+        'JAVA_TOOL_OPTIONS=-javaagent:/otel/official-javaagent.jar' \
+        'OTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar' \
+        'OTEL_OBI_REMOTE_PARENT_ENABLED=true' \
+        "LD_PRELOAD=$PRIMARY_FAULT_PRELOAD" \
+        'LD_PRELOAD=/tmp/other.so' \
+        "OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_FILE=$PRIMARY_FAULT_CONTROL_FILE")"; do
+      if assert_runtime_contract primary-w3c-fault true >/dev/null 2>&1; then
+        printf 'primary fault runtime accepted an invalid preload/control environment\n' >&2
+        return 1
+      fi
+    done
+
+    runtime_environment="$(printf '%s\n' \
+      'JAVA_TOOL_OPTIONS=-javaagent:/otel/official-javaagent.jar' \
+      'OTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar' \
+      'OTEL_OBI_REMOTE_PARENT_ENABLED=true' \
+      "LD_PRELOAD=$PRIMARY_FAULT_PRELOAD")"
+    if assert_runtime_contract basic true >/dev/null 2>&1; then
+      printf 'normal recovered runtime accepted a retained preload\n' >&2
+      return 1
+    fi
+  )
+}
+
 test_extension_disabled_runtime_requires_explicit_false() {
   local -r result_dir="$TEST_TMP_DIR/extension-disabled-runtime"
   local runtime_environment=""
@@ -7096,6 +7570,45 @@ test_start_stack_invalidates_project_evidence_before_compose_up() {
     "$(<"$failure_result/java-transport-configuration.txt")" == "current" &&
     "$(<"$failure_result/java-selected-transport-configuration.txt")" == "retained" ]] || {
     printf 'startup mutated the stack after evidence invalidation failed\n' >&2
+    return 1
+  }
+}
+
+test_primary_w3c_fault_startup_uses_normal_runtime_contract() {
+  local -r result_dir="$TEST_TMP_DIR/primary-fault-startup"
+  local -r observed="$result_dir/observed"
+
+  mkdir -p -- "$result_dir"
+  (
+    RESULT_DIR="$result_dir"
+    SCENARIO=primary-w3c-fault
+    TRANSPORT=getsockopt
+    COMMAND_TIMEOUT_SECONDS=5
+    STACK_STARTED=false
+    BRIDGE_RUNNING=false
+    COMPOSE=(test-compose)
+    verify_compose_project_ownership() { return 0; }
+    invalidate_project_transport_evidence() { return 0; }
+    run_bounded() { return 0; }
+    run_logged_bounded() { return 0; }
+    date() { printf 'startup-cursor\n'; }
+    wait_for_http() { return 0; }
+    wait_for_log() { return 0; }
+    assert_selected_transport() { return 0; }
+    wait_for_apache_instrumentation() { return 0; }
+    assert_apache_denies_java_diagnostics() { return 0; }
+    assert_runtime_contract() {
+      [[ "$#" == 1 && "$1" == basic ]] || return 1
+      printf '%s\n' "$1" >"$observed"
+    }
+
+    start_stack
+  ) || {
+    printf 'primary fault startup did not validate the normal runtime\n' >&2
+    return 1
+  }
+  [[ "$(<"$observed")" == basic ]] || {
+    printf 'primary fault startup selected the overlay runtime contract\n' >&2
     return 1
   }
 }
@@ -9572,6 +10085,7 @@ main() {
   test_successful_cleanup_invalidates_current_transport_before_down
   test_cleanup_refuses_down_when_transport_invalidation_fails
   test_cleanup_failure_changes_successful_run_status
+  test_primary_fault_recovery_marker_forces_cleanup_with_keep
   test_run_status_publication_failure_changes_successful_exit
   test_cleanup_only_invalidates_matching_project_evidence_before_down
   test_cleanup_only_refuses_untrusted_current_evidence_identity
@@ -9593,8 +10107,13 @@ main() {
   test_helper_attach_failure_dispatch_and_seed_are_exact
   test_w3c_fault_requires_forced_unix
   test_primary_w3c_stale_requires_forced_primary
+  test_primary_w3c_fault_requires_forced_primary
+  test_primary_w3c_fault_modes_are_exact
   test_primary_w3c_stale_control_restores_the_normal_ttls
   test_primary_w3c_stale_scenario_accounts_for_the_stale_take
+  test_primary_w3c_fault_recreation_uses_the_overlay_only
+  test_primary_w3c_fault_scenario_arms_after_the_baseline
+  test_primary_w3c_fault_control_restores_the_base_stack
   test_security_accepts_enabled_transports
   test_tls_boundary_requires_both_deterministic_modes
   test_w3c_match_uses_controlled_unix_fixture
@@ -9678,10 +10197,12 @@ main() {
   test_compose_commands_close_stdin
   test_pipeline_dependencies_are_declared
   test_runtime_environment_line_matching
+  test_primary_fault_runtime_contract_is_exact_and_base_is_clean
   test_extension_disabled_runtime_requires_explicit_false
   test_helper_attach_runtime_requires_exact_dynamic_disable
   test_delayed_otlp_runtime_requires_exact_export_delay
   test_start_stack_invalidates_project_evidence_before_compose_up
+  test_primary_w3c_fault_startup_uses_normal_runtime_contract
   test_instrumented_readiness_precedes_https_traffic
   test_delayed_otlp_startup_avoids_java_traffic
   test_delayed_otlp_recreate_avoids_java_traffic

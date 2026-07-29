@@ -13,6 +13,10 @@ import java.lang.reflect.Field;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLongArray;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -145,6 +149,41 @@ class RemoteParentBridgeTest {
     assertTrue(snapshot.matches("[a-z0-9_=,]+"));
   }
 
+  @Test
+  void diagnosticLoggingCannotInterruptBridgeOperations() {
+    Logger diagnosticsLogger = Logger.getLogger(RemoteParentDiagnostics.class.getName());
+    boolean useParentHandlers = diagnosticsLogger.getUseParentHandlers();
+    Level previousLevel = diagnosticsLogger.getLevel();
+    Handler throwingHandler =
+        new Handler() {
+          @Override
+          public void publish(LogRecord record) {
+            throw new AssertionError("broken application log handler");
+          }
+
+          @Override
+          public void flush() {}
+
+          @Override
+          public void close() {}
+        };
+    throwingHandler.setLevel(Level.ALL);
+    diagnosticsLogger.setUseParentHandlers(false);
+    diagnosticsLogger.setLevel(Level.ALL);
+    diagnosticsLogger.addHandler(throwingHandler);
+    try {
+      assertTrue(RemoteParentBridge.installProviderForTest(new UnauthorizedProvider()));
+      assertEquals(
+          RemoteParentStatus.UNAUTHORIZED, RemoteParentBridge.takeRemoteParent().getStatus());
+      assertEquals(
+          RemoteParentStatus.UNAUTHORIZED, RemoteParentBridge.discardRemoteParent().getStatus());
+    } finally {
+      diagnosticsLogger.removeHandler(throwingHandler);
+      diagnosticsLogger.setLevel(previousLevel);
+      diagnosticsLogger.setUseParentHandlers(useParentHandlers);
+    }
+  }
+
   private static final class FakeProvider implements RemoteParentProvider {
     private final AtomicInteger takes = new AtomicInteger();
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -196,6 +235,26 @@ class RemoteParentBridgeTest {
     @Override
     public RemoteParentRecord discardRemoteParent() {
       return RemoteParentRecord.statusOnly(RemoteParentStatus.MISSING);
+    }
+
+    @Override
+    public void close() {}
+  }
+
+  private static final class UnauthorizedProvider implements RemoteParentProvider {
+    @Override
+    public int abiVersion() {
+      return RemoteParentRecord.ABI_VERSION;
+    }
+
+    @Override
+    public RemoteParentRecord takeRemoteParent() {
+      return RemoteParentRecord.statusOnly(RemoteParentStatus.UNAUTHORIZED);
+    }
+
+    @Override
+    public RemoteParentRecord discardRemoteParent() {
+      return RemoteParentRecord.statusOnly(RemoteParentStatus.UNAUTHORIZED);
     }
 
     @Override

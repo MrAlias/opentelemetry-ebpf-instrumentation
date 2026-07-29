@@ -9,6 +9,10 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.Arrays;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -57,5 +61,38 @@ class BootstrapBridgeAccessTest {
 
     assertEquals(1L, first[0]);
     assertTrue(Arrays.stream(second).allMatch(value -> value == 0L));
+  }
+
+  @Test
+  void lookupDiagnosticLoggingCannotInterruptMissingBridge() {
+    BootstrapBridgeAccess.resetLocalDiagnosticsForTest();
+    Logger bridgeLogger = Logger.getLogger(BootstrapBridgeAccess.class.getName());
+    boolean useParentHandlers = bridgeLogger.getUseParentHandlers();
+    Level previousLevel = bridgeLogger.getLevel();
+    Handler throwingHandler =
+        new Handler() {
+          @Override
+          public void publish(LogRecord record) {
+            throw new AssertionError("broken application log handler");
+          }
+
+          @Override
+          public void flush() {}
+
+          @Override
+          public void close() {}
+        };
+    throwingHandler.setLevel(Level.ALL);
+    bridgeLogger.setUseParentHandlers(false);
+    bridgeLogger.setLevel(Level.ALL);
+    bridgeLogger.addHandler(throwingHandler);
+    try {
+      assertEquals(
+          BridgeResult.STATUS_MISSING, new BootstrapBridgeAccess().takeRemoteParent().status);
+    } finally {
+      bridgeLogger.removeHandler(throwingHandler);
+      bridgeLogger.setLevel(previousLevel);
+      bridgeLogger.setUseParentHandlers(useParentHandlers);
+    }
   }
 }

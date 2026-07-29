@@ -246,7 +246,10 @@ public final class RemoteParentDiagnostics {
     } while (!counters.compareAndSet(index, current, next));
 
     if (failureReason != null && (next == 1L || (next & (next - 1L)) == 0L)) {
-      logger.warning("OBI remote-parent diagnostics reason=" + failureReason + " count=" + next);
+      try {
+        logger.warning("OBI remote-parent diagnostics reason=" + failureReason + " count=" + next);
+      } catch (Throwable ignored) {
+      }
     }
   }
 

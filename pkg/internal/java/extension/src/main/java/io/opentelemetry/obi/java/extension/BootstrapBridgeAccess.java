@@ -179,10 +179,13 @@ final class BootstrapBridgeAccess implements BridgeAccess {
       count = current + 1L;
     } while (!localCounters.compareAndSet(counter, current, count));
     if (count == 1L || (count & (count - 1L)) == 0L) {
-      logger.log(
-          level,
-          "OBI remote-parent diagnostics reason={0} count={1}",
-          new Object[] {reason, count});
+      try {
+        logger.log(
+            level,
+            "OBI remote-parent diagnostics reason={0} count={1}",
+            new Object[] {reason, count});
+      } catch (Throwable ignored) {
+      }
     }
   }
 

@@ -46,7 +46,7 @@ dedicated harness for the comparable core cells.
 
 ## Core sustained benchmark harness
 
-`scripts/benchmark.sh` runs four sequential, isolated cells:
+`scripts/benchmark.sh` runs five sequential, isolated cells:
 
 | Cell | Runtime | Transport | Correctness assertion |
 | --- | --- | --- | --- |
@@ -54,21 +54,42 @@ dedicated harness for the comparable core cells.
 | `bridge-disabled` | official Java agent, extension, and OBI | disabled | Java root span |
 | `getsockopt-hit` | official Java agent, extension, and OBI | forced `getsockopt` | exact remote parent |
 | `unix-hit` | official Java agent, extension, and OBI | forced Unix fallback | exact remote parent |
+| `getsockopt-w3c` | official Java agent, extension, and OBI | forced `getsockopt` | valid W3C parent wins; staged OBI candidate is discarded |
 
-For every cell, the harness first asks `run.sh` to retain a fixed 16-request
-concurrent correctness preflight and leave only that scoped Compose project
-running. It then warms the existing locked-down `benchmark` Compose client and
-runs five to ten fixed-duration closed-loop repetitions. The client uses closed
-connections, `/api/echo?delay_ms=150`, no W3C header, and a fixed seed of zero.
-The user seed applies only to the preflight and post-load tracecheck sentinel;
-it is deliberately not presented as a control for sustained traffic when W3C is
-off. The retained client result must report traffic from the requested duration
-through that duration plus a two-second cancellation-drain tolerance. The
-client's per-request contexts derive from one shared measurement deadline, so
-this small tolerance is only for scheduler and worker shutdown jitter; the
-separate 30-second command-start allowance is not measurement time. Each cell
-ends with another fixed 16-request scenario-specific correctness sentinel
-before the harness invokes `run.sh --cleanup-only` for that project.
+For every cell, the harness first asks `run.sh` to retain a fixed 16-request,
+scenario-specific correctness preflight and leave only that scoped Compose
+project running. The hit controls use concurrent preflight traffic; the W3C
+control is serial so it can alternate exact valid-W3C and malformed-W3C cases.
+It then warms the existing locked-down `benchmark` Compose client and runs five
+to ten fixed-duration closed-loop repetitions. The client uses closed
+connections, `/api/echo?delay_ms=150`, and a fixed seed of zero. The first four
+cells deliberately send no W3C header. `getsockopt-w3c` sends a valid W3C
+`traceparent` on every sustained request. Its preflight and post-load sentinel
+use the existing `w3c` control: they require the exact W3C Java parent, retain
+the runner's `discard_standard` diagnostic delta, and retain a direct
+before/after diagnostic delta of eight `discard_standard` events and sixteen
+`t_valid` takes for the 16-request post-load control: every request stages a
+valid OBI candidate, while the eight valid-W3C cases discard theirs because the
+standard parent wins. Separately, the harness requires the warmup plus every
+measured W3C request to produce both `discard_standard` and `t_valid` deltas
+equal to the summed successful client requests; that binds the staged-candidate
+precedence invariant to the sustained workload rather than only to its
+controls. The same snapshots require `d_valid` to remain zero, proving no
+second discard consumed a valid record. The user seed applies only to the
+preflight and post-load tracecheck sentinel; the sustained W3C identifier
+sequence is deterministic through the client seed of zero. The retained client
+result must report traffic from the requested duration through that duration plus a
+two-second cancellation-drain tolerance. The client's per-request contexts
+derive from one shared measurement deadline, so this small tolerance is only
+for scheduler and worker shutdown jitter; the separate 30-second command-start
+allowance is not measurement time. Each cell ends with its fixed scenario-
+specific correctness sentinel before the harness invokes `run.sh --cleanup-only`
+for that project.
+
+The manifest preserves its v1 `w3c_headers: false` baseline for existing
+consumers. Its authoritative per-cell traffic record is
+`workload.w3c_headers_by_cell`: only `getsockopt-w3c` is `true`; the four
+comparison controls are `false`.
 
 Create a private parent outside the repository for the retained artifact, then
 run the harness from the repository root:
@@ -112,9 +133,11 @@ evictions, and BPF lock contention. Do not use the repository-wide
 `scripts/bpf-metrics-sampler.sh` for this harness: it changes a host-global BPF
 statistics sysctl and is not scoped to the demo project.
 
-The four core cells are not the complete #37 matrix. Explicit primary/fallback
-miss or timeout, valid-W3C discard, and pressure cells still require separately
-measured evidence before declaring the benchmark issue complete.
+The five core cells are not the complete #37 matrix. Explicit primary/fallback
+miss or timeout and pressure cells still require separately measured evidence
+before declaring the benchmark issue complete. No checked-in benchmark artifact
+exists yet, so this harness change does not turn the W3C row in the comparison
+matrix into a passed result.
 
 For focused runner iteration, use the same request count, repetitions, and
 seed for every mode:

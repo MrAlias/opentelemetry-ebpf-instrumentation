@@ -18,6 +18,71 @@ readonly FAKE_WORKLOAD_BASE_URL="http://127.0.0.1:18080"
 readonly FAKE_WORKLOAD_PATH="/api/echo?delay_ms=150"
 readonly FAKE_WORKLOAD_CONNECTION_MODE="close"
 readonly FAKE_REQUEST_TIMEOUT_SECONDS=10
+readonly FAKE_JAVA_DIAGNOSTIC_COUNTER_NAMES=(
+  cfg_on cfg_off provider_ok provider_reject provider_ver extension_reg
+  lookup_ready lookup_missing lookup_version lookup_error record_version
+  invoke_error discard_standard extract_fields extract_invalid extract_error
+  registration_ok registration_fail take_sampled take_unsampled tls_reads tls_bytes
+  t_unknown d_unknown t_valid d_valid t_missing d_missing t_stale d_stale
+  t_unsupported d_unsupported t_malformed d_malformed
+  t_version_mismatch d_version_mismatch t_ambiguous d_ambiguous
+  t_unauthorized d_unauthorized t_already_consumed d_already_consumed
+  t_timeout d_timeout t_overload d_overload
+  t_transport_error d_transport_error t_disabled d_disabled
+)
+
+fake_java_diagnostics_snapshot() {
+  local -r discard_standard="$1"
+  local -r take_valid="$2"
+  local -r discard_valid="${3:-0}"
+  local counter=""
+  local -a entries=()
+
+  for counter in "${FAKE_JAVA_DIAGNOSTIC_COUNTER_NAMES[@]}"; do
+    case "$counter" in
+      discard_standard) entries+=("$counter=$discard_standard") ;;
+      t_valid) entries+=("$counter=$take_valid") ;;
+      d_valid) entries+=("$counter=$discard_valid") ;;
+      *) entries+=("$counter=0") ;;
+    esac
+  done
+  (IFS=,; printf '%s\n' "${entries[*]}")
+}
+
+fake_diagnostics_increment() {
+  local -r discard_increment="$1"
+  local -r take_valid_increment="$2"
+  local discard_standard=""
+  local take_valid=""
+  local extra=""
+
+  [[ -n "${FAKE_DIAGNOSTICS_FILE:-}" && -f "$FAKE_DIAGNOSTICS_FILE" ]] || return 64
+  read -r discard_standard take_valid extra <"$FAKE_DIAGNOSTICS_FILE" || return 64
+  [[ "$discard_standard" =~ ^[0-9]+$ && "$take_valid" =~ ^[0-9]+$ && -z "$extra" ]] || return 64
+  printf '%s %s\n' \
+    "$((discard_standard + discard_increment))" "$((take_valid + take_valid_increment))" \
+    >"$FAKE_DIAGNOSTICS_FILE"
+}
+
+fake_decimal_to_base36() {
+  local -r decimal="$1"
+  local value="$decimal"
+  local remainder=0
+  local encoded=""
+  local -r digits="0123456789abcdefghijklmnopqrstuvwxyz"
+
+  [[ "$value" =~ ^[0-9]+$ ]] || return 64
+  if ((value == 0)); then
+    printf '0\n'
+    return 0
+  fi
+  while ((value > 0)); do
+    remainder=$((value % 36))
+    encoded="${digits:remainder:1}${encoded}"
+    value=$((value / 36))
+  done
+  printf '%s\n' "$encoded"
+}
 
 write_runner_environment() {
   local -r output="$1"
@@ -42,6 +107,133 @@ write_runner_environment() {
   } >"$output"
 }
 
+fake_w3c_sentinel_result() {
+  local -r requests="$1"
+  local -r seed="$2"
+  local -r tls="$3"
+
+  jq -n \
+    --arg tls "$tls" \
+    --argjson requests "$requests" \
+    --argjson seed "$seed" '
+      {
+        status: "passed",
+        scenario: "w3c",
+        request_count: $requests,
+        seed: $seed,
+        cases: [range(0; $requests) as $index |
+          ("w3c-" + ($index | tostring)) as $marker |
+          if $index % 2 == 0 then
+            {
+              request: {
+                marker: $marker,
+                endpoint: "/api/echo",
+                w3c_trace_id: "00000000000000000000000000000001",
+                w3c_parent_span_id: "0000000000000001",
+                w3c_trace_flags: "01",
+                w3c_case: "conflicting-valid-w3c-and-obi"
+              },
+              response: {marker: $marker, tls_protocol: $tls},
+              trace: {
+                marker: $marker,
+                dropped_spans: 0,
+                spans: [
+                  {
+                    trace_id: "00000000000000000000000000000001",
+                    span_id: "0000000000000002",
+                    parent_span_id: "0000000000000001",
+                    flags: 1,
+                    service_name: "apache-proxy",
+                    kind: "SERVER",
+                    attributes: {
+                      "http.request.header.x-obi-demo-id": $marker,
+                      "url.path": "/api/echo"
+                    }
+                  },
+                  {
+                    trace_id: "00000000000000000000000000000001",
+                    span_id: "0000000000000003",
+                    parent_span_id: "0000000000000002",
+                    flags: 1,
+                    service_name: "apache-proxy",
+                    kind: "CLIENT",
+                    attributes: {
+                      "http.request.header.x-obi-demo-id": $marker,
+                      "url.full": "https://localhost:18443/api/echo"
+                    }
+                  },
+                  {
+                    trace_id: "00000000000000000000000000000001",
+                    span_id: "0000000000000004",
+                    parent_span_id: "0000000000000001",
+                    flags: 769,
+                    service_name: "java-backend",
+                    kind: "SERVER",
+                    attributes: {
+                      "http.request.header.x-obi-demo-id": $marker,
+                      "http.route": "/api/echo"
+                    }
+                  }
+                ]
+              }
+            }
+          else
+            {
+              request: {
+                marker: $marker,
+                endpoint: "/api/echo",
+                w3c_case: "malformed-w3c-valid-obi",
+                invalid_w3c: true
+              },
+              response: {marker: $marker, tls_protocol: $tls},
+              trace: {
+                marker: $marker,
+                dropped_spans: 0,
+                spans: [
+                  {
+                    trace_id: "00000000000000000000000000000005",
+                    span_id: "0000000000000006",
+                    flags: 1,
+                    service_name: "apache-proxy",
+                    kind: "SERVER",
+                    attributes: {
+                      "http.request.header.x-obi-demo-id": $marker,
+                      "url.path": "/api/echo"
+                    }
+                  },
+                  {
+                    trace_id: "00000000000000000000000000000005",
+                    span_id: "0000000000000007",
+                    parent_span_id: "0000000000000006",
+                    flags: 1,
+                    service_name: "apache-proxy",
+                    kind: "CLIENT",
+                    attributes: {
+                      "http.request.header.x-obi-demo-id": $marker,
+                      "url.full": "https://localhost:18443/api/echo?close=1"
+                    }
+                  },
+                  {
+                    trace_id: "00000000000000000000000000000005",
+                    span_id: "0000000000000008",
+                    parent_span_id: "0000000000000007",
+                    flags: 769,
+                    service_name: "java-backend",
+                    kind: "SERVER",
+                    attributes: {
+                      "http.request.header.x-obi-demo-id": $marker,
+                      "http.route": "/api/echo"
+                    }
+                  }
+                ]
+              }
+            }
+          end
+        ]
+      }
+    '
+}
+
 fake_write_runner_artifacts() {
   local -r result_directory="$1"
   local -r transport="$2"
@@ -51,9 +243,15 @@ fake_write_runner_artifacts() {
   local -r assertion_mode="$6"
   local -r selected_transport="$7"
   local -r project="$8"
+  local assertion_scenario="concurrency"
   local index=0
 
-  mkdir -p -- "$result_directory/phases/concurrency-before" "$result_directory/phases/concurrency-after"
+  if [[ "$scenario" == w3c ]]; then
+    assertion_scenario=w3c
+  fi
+  mkdir -p -- \
+    "$result_directory/phases/$assertion_scenario-before" \
+    "$result_directory/phases/$assertion_scenario-after"
   jq -n --arg result_directory "$result_directory" \
     '{status: "passed", exit_status: 0, evidence_directory: $result_directory}' \
     >"$result_directory/run-status.json"
@@ -94,27 +292,49 @@ fake_write_runner_artifacts() {
     printf 'selected_transport=%s\n' "$selected_transport" \
       >"$result_directory/java-selected-transport-configuration.txt"
   fi
-  jq -n \
-    --arg assertion_mode "$assertion_mode" \
-    --arg tls "${FAKE_TLS_PROTOCOL:-TLSv1.3}" \
-    --argjson requests "$FAKE_PREFLIGHT_REQUESTS" \
-    --argjson seed "${SEED:-1}" \
-    '{
-      status: "passed",
-      scenario: "concurrency",
-      assertion_mode: $assertion_mode,
-      request_count: $requests,
-      seed: $seed,
-      cases: [range(0; $requests) | {response: {tls_protocol: $tls}}]
-    }' >"$result_directory/scenario-concurrency.json"
-  jq -n '{status: "passed", scenario: "concurrency"}' \
-    >"$result_directory/scenario-concurrency-status.json"
-  printf 'scenario stderr\n' >"$result_directory/scenario-concurrency.stderr.log"
+  if [[ "$assertion_scenario" == w3c ]]; then
+    fake_w3c_sentinel_result \
+      "$FAKE_PREFLIGHT_REQUESTS" "${SEED:-1}" "${FAKE_TLS_PROTOCOL:-TLSv1.3}" \
+      >"$result_directory/scenario-w3c.json"
+    jq -n '
+      {
+        status: "passed",
+        scenario: "w3c",
+        exit_status: 0,
+        metric_status: 0,
+        result: "scenario-w3c.json",
+        after_phase: "phases/w3c-after"
+      }
+    ' >"$result_directory/scenario-w3c-status.json"
+    printf 'scenario stderr\n' >"$result_directory/scenario-w3c.stderr.log"
+  else
+    jq -n \
+      --arg assertion_mode "$assertion_mode" \
+      --arg tls "${FAKE_TLS_PROTOCOL:-TLSv1.3}" \
+      --argjson requests "$FAKE_PREFLIGHT_REQUESTS" \
+      --argjson seed "${SEED:-1}" \
+      '{
+        status: "passed",
+        scenario: "concurrency",
+        assertion_mode: $assertion_mode,
+        request_count: $requests,
+        seed: $seed,
+        cases: [range(0; $requests) | {response: {tls_protocol: $tls}}]
+      }' >"$result_directory/scenario-concurrency.json"
+    jq -n '{status: "passed", scenario: "concurrency"}' \
+      >"$result_directory/scenario-concurrency-status.json"
+    printf 'scenario stderr\n' >"$result_directory/scenario-concurrency.stderr.log"
+  fi
   for index in before after; do
     printf 'obi_java_remote_parent_operations_total 0\n' \
-      >"$result_directory/phases/concurrency-$index/obi-metrics.prom"
-    printf 'java-diagnostics\n' >"$result_directory/phases/concurrency-$index/java-diagnostics.txt"
+      >"$result_directory/phases/$assertion_scenario-$index/obi-metrics.prom"
+    printf 'java-diagnostics\n' \
+      >"$result_directory/phases/$assertion_scenario-$index/java-diagnostics.txt"
   done
+  if [[ "$assertion_scenario" == w3c ]]; then
+    printf 'discard_standard before=4 after=12 delta=8\n' \
+      >"$result_directory/phases/w3c-after/java-diagnostics.delta"
+  fi
 }
 
 fake_runner() {
@@ -178,7 +398,7 @@ fake_runner() {
     printf 'cleanup %s\n' "$project" >>"$FAKE_EVENTS"
     return 0
   fi
-  [[ "$project" =~ ^obi-apache-java-https-b-[0-9]+-[0-9]+-[a-z-]+$ &&
+  [[ "$project" =~ ^obi-apache-java-https-b-[0-9]+-[0-9]+-[a-z0-9-]+$ &&
     "$requests" == "$FAKE_PREFLIGHT_REQUESTS" && "$keep" == "true" && -n "$seed" &&
     ("$agent" == otel || "$agent" == splunk) && ("$tls" == TLSv1.2 || "$tls" == TLSv1.3) ]] || {
     printf 'invalid fake runner invocation\n' >&2
@@ -197,6 +417,11 @@ fake_runner() {
       ;;
     concurrency)
       [[ "$transport" == getsockopt || "$transport" == unix ]] || return 64
+      assertion_mode="bridge"
+      selected_transport="$transport"
+      ;;
+    w3c)
+      [[ "$transport" == getsockopt ]] || return 64
       assertion_mode="bridge"
       selected_transport="$transport"
       ;;
@@ -248,8 +473,8 @@ fake_benchmark_result() {
         connection_mode="$2"
         shift 2
         ;;
-      --w3c=false)
-        w3c=false
+      --w3c=false|--w3c=true)
+        w3c="${1#--w3c=}"
         shift
         ;;
       --base-url|--request-timeout)
@@ -264,7 +489,10 @@ fake_benchmark_result() {
   [[ "$duration" =~ ^[0-9]+$ && "$concurrency" =~ ^[0-9]+$ &&
     "$request_limit" == "$FAKE_REQUEST_LIMIT" && "$seed" == "$FAKE_SUSTAINED_LOAD_SEED" &&
     "$path" == "$FAKE_WORKLOAD_PATH" && "$connection_mode" == "$FAKE_WORKLOAD_CONNECTION_MODE" &&
-    "$w3c" == false ]] || return 64
+    ( "$w3c" == false || "$w3c" == true ) ]] || return 64
+  if [[ "$w3c" == true ]]; then
+    fake_diagnostics_increment 4 4 || return $?
+  fi
   printf 'benchmark duration=%s concurrency=%s\n' "$duration" "$concurrency" >>"$FAKE_DOCKER_LOG"
   # Give the harness enough real time to verify the dedicated client session.
   /bin/sleep 0.2
@@ -276,13 +504,14 @@ fake_benchmark_result() {
     --argjson timeout_nanos "$((FAKE_REQUEST_TIMEOUT_SECONDS * 1000000000))" \
     --argjson concurrency "$concurrency" \
     --argjson request_limit "$request_limit" \
-    --argjson seed "$seed" '
+    --argjson seed "$seed" \
+    --argjson w3c "$w3c" '
       {
         status: "passed",
         base_url: $base_url,
         path: $path,
         connection_mode: $connection_mode,
-        w3c: false,
+        w3c: $w3c,
         seed: $seed,
         requested_duration_nanos: $duration_nanos,
         request_timeout_nanos: $timeout_nanos,
@@ -301,6 +530,7 @@ fake_benchmark_result() {
 
 fake_sentinel_result() {
   local assertion_mode="bridge"
+  local scenario=""
   local requests=""
   local seed=""
   local index=0
@@ -308,7 +538,7 @@ fake_sentinel_result() {
   while (($# > 0)); do
     case "$1" in
       --scenario)
-        [[ "$2" == concurrency ]] || return 64
+        scenario="$2"
         shift 2
         ;;
       --requests)
@@ -333,7 +563,23 @@ fake_sentinel_result() {
     esac
   done
   [[ "$requests" == "$FAKE_PREFLIGHT_REQUESTS" && "$seed" =~ ^[0-9]+$ ]] || return 64
-  printf 'sentinel assertion=%s\n' "$assertion_mode" >>"$FAKE_DOCKER_LOG"
+  case "$scenario" in
+    concurrency)
+      printf 'sentinel assertion=%s\n' "$assertion_mode" >>"$FAKE_DOCKER_LOG"
+      ;;
+    w3c)
+      [[ "$assertion_mode" == bridge ]] || return 64
+      printf 'sentinel w3c-discard\n' >>"$FAKE_DOCKER_LOG"
+      fake_diagnostics_increment \
+        "$(( (FAKE_PREFLIGHT_REQUESTS + 1) / 2 ))" \
+        "$FAKE_PREFLIGHT_REQUESTS" || return $?
+      fake_w3c_sentinel_result "$requests" "$seed" "${FAKE_TLS_PROTOCOL:-TLSv1.3}"
+      return 0
+      ;;
+    *)
+      return 64
+      ;;
+  esac
   jq -n \
     --arg assertion_mode "$assertion_mode" \
     --arg tls "${FAKE_TLS_PROTOCOL:-TLSv1.3}" \
@@ -446,7 +692,12 @@ fake_curl() {
         return 0
         ;;
       https://127.0.0.1:18443/obi-diagnostics)
-        printf 'fake-java-diagnostics\n'
+        [[ -n "${FAKE_DIAGNOSTICS_FILE:-}" && -f "$FAKE_DIAGNOSTICS_FILE" ]] || return 64
+        read -r discard_standard take_valid extra <"$FAKE_DIAGNOSTICS_FILE" || return 64
+        [[ "$discard_standard" =~ ^[0-9]+$ && "$take_valid" =~ ^[0-9]+$ && -z "$extra" ]] || return 64
+        fake_java_diagnostics_snapshot \
+          "$(fake_decimal_to_base36 "$discard_standard")" \
+          "$(fake_decimal_to_base36 "$take_valid")"
         return 0
         ;;
     esac
@@ -522,6 +773,17 @@ reset_options() {
   BENCHMARK_PID=""
   BENCHMARK_IDENTITY=""
   HARNESS_INVOCATION=""
+  CELL_SLUG=""
+  CELL_TRANSPORT=""
+  CELL_SCENARIO=""
+  CELL_ASSERTION_MODE=""
+  CELL_REQUIRES_OBI=false
+  CELL_SELECTED_TRANSPORT=""
+  CELL_SENTINEL_SCENARIO=""
+  CELL_SUSTAINED_W3C=false
+  CELL_EXPECTED_STANDARD_PARENT_DISCARDS=0
+  CELL_EXPECTED_W3C_VALID_TAKES=0
+  CELL_W3C_WORKLOAD_SUCCESSFUL_REQUESTS=0
   COMPOSE=()
 }
 
@@ -781,16 +1043,17 @@ test_core_cell_mapping_is_exact() {
     (
       reset_options
       cell_spec "$cell"
-      [[ "$CELL_SLUG|$CELL_TRANSPORT|$CELL_SCENARIO|$CELL_ASSERTION_MODE|$CELL_REQUIRES_OBI|$CELL_SELECTED_TRANSPORT" == "$expected" ]]
+      [[ "$CELL_SLUG|$CELL_TRANSPORT|$CELL_SCENARIO|$CELL_ASSERTION_MODE|$CELL_REQUIRES_OBI|$CELL_SELECTED_TRANSPORT|$CELL_SENTINEL_SCENARIO|$CELL_SUSTAINED_W3C|$CELL_EXPECTED_STANDARD_PARENT_DISCARDS|$CELL_EXPECTED_W3C_VALID_TAKES" == "$expected" ]]
     ) || {
       printf 'incorrect core cell mapping for %s\n' "$cell" >&2
       return 1
     }
   done <<'EOF'
-uninstrumented|uninstrumented|disabled|benchmark-uninstrumented|uninstrumented|false|disabled
-bridge-disabled|bridge-disabled|disabled|benchmark-disabled|disabled|true|disabled
-getsockopt-hit|getsockopt-hit|getsockopt|concurrency||true|getsockopt
-unix-hit|unix-hit|unix|concurrency||true|unix
+uninstrumented|uninstrumented|disabled|benchmark-uninstrumented|uninstrumented|false|disabled|concurrency|false|0|0
+bridge-disabled|bridge-disabled|disabled|benchmark-disabled|disabled|true|disabled|concurrency|false|0|0
+getsockopt-hit|getsockopt-hit|getsockopt|concurrency||true|getsockopt|concurrency|false|0|0
+unix-hit|unix-hit|unix|concurrency||true|unix|concurrency|false|0|0
+getsockopt-w3c|getsockopt-w3c|getsockopt|w3c||true|getsockopt|w3c|true|8|16
 EOF
 }
 
@@ -806,10 +1069,11 @@ write_valid_benchmark_result() {
     --argjson timeout_nanos "$((REQUEST_TIMEOUT_SECONDS * 1000000000))" \
     --argjson concurrency "$CONCURRENCY" \
     --argjson request_limit "$REQUEST_LIMIT" \
-    --argjson seed "$SUSTAINED_LOAD_SEED" '
+    --argjson seed "$SUSTAINED_LOAD_SEED" \
+    --argjson w3c "$CELL_SUSTAINED_W3C" '
       {
         status: "passed", base_url: $base_url, path: $path,
-        connection_mode: $connection_mode, w3c: false, seed: $seed,
+        connection_mode: $connection_mode, w3c: $w3c, seed: $seed,
         requested_duration_nanos: $duration_nanos,
         request_timeout_nanos: $timeout_nanos, concurrency: $concurrency,
         request_limit: $request_limit, request_limit_reached: false,
@@ -837,9 +1101,25 @@ write_valid_sentinel() {
     ' >"$output"
 }
 
+write_valid_w3c_sentinel() {
+  local -r output="$1"
+
+  fake_w3c_sentinel_result "$PREFLIGHT_REQUESTS" "$SEED" "$TLS_PROTOCOL" >"$output"
+}
+
+write_valid_java_diagnostics_snapshot() {
+  local -r output="$1"
+  local -r discard_standard="$2"
+  local -r take_valid="$3"
+  local -r discard_valid="${4:-0}"
+
+  fake_java_diagnostics_snapshot "$discard_standard" "$take_valid" "$discard_valid" >"$output"
+}
+
 test_json_validators_require_one_document() {
   local -r benchmark_result="$TEST_TMP_DIR/benchmark-result.json"
   local -r sentinel_result="$TEST_TMP_DIR/sentinel-result.json"
+  local -r w3c_sentinel_result="$TEST_TMP_DIR/w3c-sentinel-result.json"
   local -r under_run_result="$TEST_TMP_DIR/under-run-result.json"
   local -r overrun_result="$TEST_TMP_DIR/overrun-result.json"
 
@@ -878,6 +1158,245 @@ test_json_validators_require_one_document() {
     printf 'sentinel validator accepted the wrong assertion mode\n' >&2
     return 1
   fi
+  (
+    reset_options
+    cell_spec getsockopt-w3c
+    write_valid_benchmark_result "$benchmark_result" 2
+    validate_benchmark_result "$benchmark_result" 2 || {
+      printf 'valid W3C benchmark result was rejected\n' >&2
+      return 1
+    }
+    write_valid_w3c_sentinel "$w3c_sentinel_result"
+    validate_w3c_sentinel "$w3c_sentinel_result" || {
+      printf 'valid W3C sentinel was rejected\n' >&2
+      return 1
+    }
+    jq '
+      .cases[0].trace.spans[2].parent_span_id = "0000000000000002"
+    ' "$w3c_sentinel_result" >"$w3c_sentinel_result.invalid"
+    if validate_w3c_sentinel "$w3c_sentinel_result.invalid" >/dev/null 2>&1; then
+      printf 'W3C sentinel validator accepted a Java span with the wrong W3C parent\n' >&2
+      return 1
+    fi
+    jq '
+      .cases[0].trace.spans += [.cases[0].trace.spans[2]]
+    ' "$w3c_sentinel_result" >"$w3c_sentinel_result.duplicate-java"
+    if validate_w3c_sentinel "$w3c_sentinel_result.duplicate-java" >/dev/null 2>&1; then
+      printf 'W3C sentinel validator accepted duplicate Java server spans\n' >&2
+      return 1
+    fi
+    jq '
+      .cases[0].trace.spans[2].flags = 1
+    ' "$w3c_sentinel_result" >"$w3c_sentinel_result.local-parent"
+    if validate_w3c_sentinel "$w3c_sentinel_result.local-parent" >/dev/null 2>&1; then
+      printf 'W3C sentinel validator accepted a Java span without remote-parent flags\n' >&2
+      return 1
+    fi
+    jq '
+      .cases[0].trace.spans[0].flags = 0
+    ' "$w3c_sentinel_result" >"$w3c_sentinel_result.apache-local-parent"
+    if validate_w3c_sentinel "$w3c_sentinel_result.apache-local-parent" >/dev/null 2>&1; then
+      printf 'W3C sentinel validator accepted an Apache span with the wrong W3C flags\n' >&2
+      return 1
+    fi
+    jq '
+      .cases[0].trace.dropped_spans = 1
+    ' "$w3c_sentinel_result" >"$w3c_sentinel_result.dropped-spans"
+    if validate_w3c_sentinel "$w3c_sentinel_result.dropped-spans" >/dev/null 2>&1; then
+      printf 'W3C sentinel validator accepted a trace with dropped spans\n' >&2
+      return 1
+    fi
+    jq '
+      .cases[0].trace.spans[0].attributes["http.request.header.x_obi_demo_id"] = "other-marker"
+    ' "$w3c_sentinel_result" >"$w3c_sentinel_result.conflicting-marker-alias"
+    if validate_w3c_sentinel "$w3c_sentinel_result.conflicting-marker-alias" >/dev/null 2>&1; then
+      printf 'W3C sentinel validator accepted conflicting marker aliases\n' >&2
+      return 1
+    fi
+    jq '
+      .cases[0].trace.spans[1].parent_span_id = "00000000000000ff"
+    ' "$w3c_sentinel_result" >"$w3c_sentinel_result.disconnected-apache-client"
+    if validate_w3c_sentinel "$w3c_sentinel_result.disconnected-apache-client" >/dev/null 2>&1; then
+      printf 'W3C sentinel validator accepted a disconnected Apache client span\n' >&2
+      return 1
+    fi
+    jq '
+      .cases[0].trace.spans[0].span_id = .cases[0].request.w3c_parent_span_id |
+      .cases[0].trace.spans[0].parent_span_id = .cases[0].request.w3c_parent_span_id |
+      .cases[0].trace.spans[1].parent_span_id = .cases[0].request.w3c_parent_span_id
+    ' "$w3c_sentinel_result" >"$w3c_sentinel_result.apache-parent-cycle"
+    if validate_w3c_sentinel "$w3c_sentinel_result.apache-parent-cycle" >/dev/null 2>&1; then
+      printf 'W3C sentinel validator accepted an Apache ancestor parent cycle\n' >&2
+      return 1
+    fi
+    jq '
+      .cases[0].request.w3c_trace_id += "\n" |
+      .cases[0].request.w3c_parent_span_id += "\n" |
+      .cases[0].trace.spans[] |= (
+        .trace_id += "\n" |
+        .span_id += "\n" |
+        if has("parent_span_id") then .parent_span_id += "\n" else . end
+      )
+    ' "$w3c_sentinel_result" >"$w3c_sentinel_result.trailing-newline-identifiers"
+    if validate_w3c_sentinel "$w3c_sentinel_result.trailing-newline-identifiers" >/dev/null 2>&1; then
+      printf 'W3C sentinel validator accepted identifiers with trailing newlines\n' >&2
+      return 1
+    fi
+    jq '
+      .cases[0].request.marker += "\n" |
+      .cases[0].response.marker += "\n" |
+      .cases[0].trace.marker += "\n" |
+      .cases[0].trace.spans[].attributes["http.request.header.x-obi-demo-id"] += "\n"
+    ' "$w3c_sentinel_result" >"$w3c_sentinel_result.trailing-newline-marker"
+    if validate_w3c_sentinel "$w3c_sentinel_result.trailing-newline-marker" >/dev/null 2>&1; then
+      printf 'W3C sentinel validator accepted a marker with a trailing newline\n' >&2
+      return 1
+    fi
+    jq '
+      .cases[1].trace.spans[0].parent_span_id = "0000000000000000\n"
+    ' "$w3c_sentinel_result" >"$w3c_sentinel_result.trailing-newline-root"
+    if validate_w3c_sentinel "$w3c_sentinel_result.trailing-newline-root" >/dev/null 2>&1; then
+      printf 'W3C sentinel validator accepted a malformed-W3C root with a trailing newline\n' >&2
+      return 1
+    fi
+    jq '
+      .cases[0].request.invalid_w3c = true
+    ' "$w3c_sentinel_result" >"$w3c_sentinel_result.valid-marked-invalid"
+    if validate_w3c_sentinel "$w3c_sentinel_result.valid-marked-invalid" >/dev/null 2>&1; then
+      printf 'W3C sentinel validator accepted a valid W3C case marked invalid\n' >&2
+      return 1
+    fi
+    jq '
+      .cases[0].trace.spans[0].attributes["url.path"] = "/unexpected"
+    ' "$w3c_sentinel_result" >"$w3c_sentinel_result.unexpected-endpoint"
+    if validate_w3c_sentinel "$w3c_sentinel_result.unexpected-endpoint" >/dev/null 2>&1; then
+      printf 'W3C sentinel validator accepted an Apache span for the wrong endpoint\n' >&2
+      return 1
+    fi
+    jq '
+      .cases[0].trace.spans[1].attributes["url.full"] = "https://localhost:18443/api/echo#bad%zz"
+    ' "$w3c_sentinel_result" >"$w3c_sentinel_result.fragment-endpoint"
+    if validate_w3c_sentinel "$w3c_sentinel_result.fragment-endpoint" >/dev/null 2>&1; then
+      printf 'W3C sentinel validator accepted an endpoint attribute with a fragment\n' >&2
+      return 1
+    fi
+    jq '
+      .cases[1].trace.spans[2].parent_span_id = "0000000000000006"
+    ' "$w3c_sentinel_result" >"$w3c_sentinel_result.fallback-wrong-parent"
+    if validate_w3c_sentinel "$w3c_sentinel_result.fallback-wrong-parent" >/dev/null 2>&1; then
+      printf 'W3C sentinel validator accepted a malformed-W3C fallback unrelated to Apache\n' >&2
+      return 1
+    fi
+    jq '
+      .cases[1].trace.spans[0].parent_span_id = "00000000000000ff"
+    ' "$w3c_sentinel_result" >"$w3c_sentinel_result.fallback-external-parent"
+    if validate_w3c_sentinel "$w3c_sentinel_result.fallback-external-parent" >/dev/null 2>&1; then
+      printf 'W3C sentinel validator accepted a malformed-W3C Apache server with an external parent\n' >&2
+      return 1
+    fi
+  )
+}
+
+test_w3c_discard_diagnostics_require_exact_delta() {
+  local -r before="$TEST_TMP_DIR/w3c-diagnostics-before.txt"
+  local -r after="$TEST_TMP_DIR/w3c-diagnostics-after.txt"
+  local -r output="$TEST_TMP_DIR/w3c-diagnostics.json"
+  local -r runner_delta="$TEST_TMP_DIR/w3c-runner-diagnostics.delta"
+  local -r oversized="$TEST_TMP_DIR/w3c-diagnostics-oversized.txt"
+
+  (
+    reset_options
+    cell_spec getsockopt-w3c
+    write_valid_java_diagnostics_snapshot "$before" z z
+    write_valid_java_diagnostics_snapshot "$after" 17 17
+    validate_java_diagnostics_counter_deltas \
+      "$before" "$after" "$output" discard_standard 8 t_valid 8 d_valid 0 || {
+      printf 'valid base36 W3C precedence diagnostic delta was rejected\n' >&2
+      return 1
+    }
+    jq -e '
+      .counters == [
+        {counter: "discard_standard", before_base36: "z", after_base36: "17", observed_delta: 8, expected_delta: 8},
+        {counter: "t_valid", before_base36: "z", after_base36: "17", observed_delta: 8, expected_delta: 8},
+        {counter: "d_valid", before_base36: "0", after_base36: "0", observed_delta: 0, expected_delta: 0}
+      ]
+    ' "$output" >/dev/null || {
+      printf 'W3C precedence diagnostic evidence did not retain the exact delta\n' >&2
+      return 1
+    }
+    write_valid_java_diagnostics_snapshot "$after" 18 17
+    if validate_java_diagnostics_counter_deltas \
+      "$before" "$after" "$output" discard_standard 8 t_valid 8 d_valid 0 >/dev/null 2>&1; then
+      printf 'W3C precedence diagnostic validator accepted the wrong discard delta\n' >&2
+      return 1
+    fi
+    write_valid_java_diagnostics_snapshot "$after" 17 1f
+    validate_standard_parent_discard_diagnostics "$before" "$after" "$output" || {
+      printf 'valid post-load W3C precedence diagnostic delta was rejected\n' >&2
+      return 1
+    }
+    jq -e '
+      .counters == [
+        {counter: "discard_standard", before_base36: "z", after_base36: "17", observed_delta: 8, expected_delta: 8},
+        {counter: "t_valid", before_base36: "z", after_base36: "1f", observed_delta: 16, expected_delta: 16},
+        {counter: "d_valid", before_base36: "0", after_base36: "0", observed_delta: 0, expected_delta: 0}
+      ]
+    ' "$output" >/dev/null || {
+      printf 'post-load W3C precedence diagnostic evidence did not retain its exact deltas\n' >&2
+      return 1
+    }
+    write_valid_java_diagnostics_snapshot "$after" 17 1e
+    if validate_standard_parent_discard_diagnostics "$before" "$after" "$output" >/dev/null 2>&1; then
+      printf 'W3C precedence diagnostic validator accepted the wrong valid-take delta\n' >&2
+      return 1
+    fi
+    write_valid_java_diagnostics_snapshot "$after" 17 1f 1
+    if validate_standard_parent_discard_diagnostics "$before" "$after" "$output" >/dev/null 2>&1; then
+      printf 'W3C precedence diagnostic validator accepted a valid discard result\n' >&2
+      return 1
+    fi
+    printf 'discard_standard=z\n' >"$before"
+    if validate_java_diagnostics_snapshot "$before" >/dev/null 2>&1; then
+      printf 'diagnostic validator accepted a truncated counter snapshot\n' >&2
+      return 1
+    fi
+    write_valid_java_diagnostics_snapshot "$before" z z
+    sed 's/^cfg_on=/unknown=/' "$before" >"$before.unknown"
+    if validate_java_diagnostics_snapshot "$before.unknown" >/dev/null 2>&1; then
+      printf 'diagnostic validator accepted an unknown counter name\n' >&2
+      return 1
+    fi
+    awk -F, 'BEGIN {OFS=","} {first=$1; $1=$2; $2=first; print}' "$before" >"$before.reordered"
+    if validate_java_diagnostics_snapshot "$before.reordered" >/dev/null 2>&1; then
+      printf 'diagnostic validator accepted reordered counters\n' >&2
+      return 1
+    fi
+    printf '%s,%s\n' "$(<"$before")" "discard_standard=0" >"$before.duplicate"
+    if validate_java_diagnostics_snapshot "$before.duplicate" >/dev/null 2>&1; then
+      printf 'diagnostic validator accepted a duplicate counter\n' >&2
+      return 1
+    fi
+    sed 's/discard_standard=z/discard_standard=gjdgxs/' "$before" >"$before.out-of-range"
+    if validate_java_diagnostics_snapshot "$before.out-of-range" >/dev/null 2>&1; then
+      printf 'diagnostic validator accepted an out-of-range counter\n' >&2
+      return 1
+    fi
+    head -c "$((MAX_JAVA_DIAGNOSTICS_SNAPSHOT_BYTES + 1))" /dev/zero >"$oversized"
+    if validate_java_diagnostics_snapshot "$oversized" >/dev/null 2>&1; then
+      printf 'diagnostic validator accepted an oversized snapshot\n' >&2
+      return 1
+    fi
+    printf 'discard_standard before=4 after=12 delta=8\n' >"$runner_delta"
+    validate_runner_standard_parent_discards "$runner_delta" || {
+      printf 'valid runner W3C discard delta was rejected\n' >&2
+      return 1
+    }
+    printf 'discard_standard before=12 after=4 delta=8\n' >"$runner_delta"
+    if validate_runner_standard_parent_discards "$runner_delta" >/dev/null 2>&1; then
+      printf 'runner W3C discard validator accepted an inconsistent delta\n' >&2
+      return 1
+    fi
+  )
 }
 
 test_runner_environment_contract_is_exact() {
@@ -1296,6 +1815,7 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
   local -r runner_log="$TEST_TMP_DIR/fake-runner.log"
   local -r docker_log="$TEST_TMP_DIR/fake-docker.log"
   local -r events="$TEST_TMP_DIR/fake-events.log"
+  local -r diagnostics="$TEST_TMP_DIR/fake-diagnostics.txt"
   local -r results_root="$fake_example/.runtime/results"
   local command_name=""
 
@@ -1307,9 +1827,11 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
   for command_name in docker curl sleep git; do
     ln -s -- "$TEST_SOURCE" "$fake_bin/$command_name"
   done
+  printf '0 0\n' >"$diagnostics"
   if ! PATH="$fake_bin:$PATH" \
     FAKE_CONTAINER_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
     FAKE_DOCKER_LOG="$docker_log" \
+    FAKE_DIAGNOSTICS_FILE="$diagnostics" \
     FAKE_EVENTS="$events" \
     FAKE_PID="$$" \
     FAKE_RESULTS_ROOT="$results_root" \
@@ -1330,13 +1852,13 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
   jq -e '
     .status == "passed" and
     .acceptance_evidence == false and
-    (.cells | length == 4) and
+    (.cells | length == 5) and
     all(.cells[]; .status == "passed")
   ' "$output/summary.json" >/dev/null || {
-    printf 'hermetic run did not retain four passing core summaries\n' >&2
+    printf 'hermetic run did not retain five passing core summaries\n' >&2
     return 1
   }
-  [[ "$(grep -Fc cleanup "$events")" == 4 ]] || {
+  [[ "$(grep -Fc cleanup "$events")" == 5 ]] || {
     printf 'hermetic run did not clean each core cell through the runner\n' >&2
     return 1
   }
@@ -1357,6 +1879,48 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
   }
   [[ -f "$output/cells/getsockopt-hit/preflight/runner/phases/concurrency-after/obi-metrics.prom" ]] || {
     printf 'hermetic run did not retain runner phase evidence\n' >&2
+    return 1
+  }
+  jq -e '
+    .sustained_w3c == true and
+    .sentinel_scenario == "w3c" and
+    .expected_standard_parent_discards == 8 and
+    .expected_w3c_valid_takes == 16
+  ' "$output/cells/getsockopt-w3c/preflight/contract.json" >/dev/null || {
+    printf 'W3C benchmark cell did not retain its traffic and discard contract\n' >&2
+    return 1
+  }
+  [[ -f "$output/cells/getsockopt-w3c/preflight/runner/phases/w3c-after/java-diagnostics.delta" ]] || {
+    printf 'W3C benchmark preflight did not retain standard-parent discard diagnostics\n' >&2
+    return 1
+  }
+  jq -e '
+    .scenario == "w3c" and
+    .expected_standard_parent_discards == 8
+  ' "$output/cells/getsockopt-w3c/postload-sentinel/status.json" >/dev/null || {
+    printf 'W3C benchmark post-load sentinel did not retain its assertion contract\n' >&2
+    return 1
+  }
+  jq -e '
+    (.counters | map({counter, observed_delta, expected_delta})) == [
+      {counter: "discard_standard", observed_delta: 8, expected_delta: 8},
+      {counter: "t_valid", observed_delta: 16, expected_delta: 16},
+      {counter: "d_valid", observed_delta: 0, expected_delta: 0}
+    ]
+  ' \
+    "$output/cells/getsockopt-w3c/postload-sentinel/standard-parent-discard-diagnostics.json" \
+    >/dev/null || {
+    printf 'W3C benchmark post-load sentinel did not retain the exact discard delta\n' >&2
+    return 1
+  }
+  jq -e '
+    (.counters | map({counter, observed_delta, expected_delta})) == [
+      {counter: "discard_standard", observed_delta: 24, expected_delta: 24},
+      {counter: "t_valid", observed_delta: 24, expected_delta: 24},
+      {counter: "d_valid", observed_delta: 0, expected_delta: 0}
+    ]
+  ' "$output/cells/getsockopt-w3c/sustained-w3c/java-diagnostics-deltas.json" >/dev/null || {
+    printf 'W3C benchmark workload did not retain exact precedence deltas\n' >&2
     return 1
   }
   jq -e '
@@ -1383,11 +1947,25 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
     printf 'manifest omitted the bounded measurement drain tolerance\n' >&2
     return 1
   }
+  jq -e '.workload.w3c_headers == false and
+    .workload.w3c_headers_by_cell == {
+      "uninstrumented": false,
+      "bridge-disabled": false,
+      "getsockopt-hit": false,
+      "unix-hit": false,
+      "getsockopt-w3c": true
+    } and
+    .workload.w3c_discard_cells == ["getsockopt-w3c"]' \
+    "$output/manifest.json" >/dev/null || {
+    printf 'manifest omitted the authoritative cell-specific W3C traffic contract\n' >&2
+    return 1
+  }
   jq -e '.invocation | contains("--agent splunk")' "$output/manifest.json" >/dev/null || {
     printf 'manifest omitted the shell-escaped benchmark invocation\n' >&2
     return 1
   }
   grep -Fq -- '--w3c=false' "$docker_log" &&
+    grep -Fq -- '--w3c=true' "$docker_log" &&
     grep -Fq -- '--connection-mode close' "$docker_log" &&
     grep -Fq -- '--seed 0' "$docker_log" || {
     printf 'hermetic run did not preserve the controlled sustained client contract\n' >&2
@@ -1409,6 +1987,7 @@ main() {
   test_output_directory_is_absolute_fresh_private
   test_core_cell_mapping_is_exact
   test_json_validators_require_one_document
+  test_w3c_discard_diagnostics_require_exact_delta
   test_runner_environment_contract_is_exact
   test_failed_measurement_clears_reaped_pid
   test_interrupted_measurement_reaps_client_tree

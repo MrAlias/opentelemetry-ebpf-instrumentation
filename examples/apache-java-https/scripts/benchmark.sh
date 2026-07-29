@@ -42,6 +42,9 @@ readonly MAX_CONCURRENCY=256
 readonly MIN_REPETITIONS=5
 readonly MAX_REPETITIONS=10
 readonly MAX_SEED=9223372036854775807
+readonly MAX_JAVA_DIAGNOSTIC_COUNTER=999999999
+readonly MAX_JAVA_DIAGNOSTICS_SNAPSHOT_BYTES=4096
+readonly MAX_W3C_WORKLOAD_SUCCESSFUL_REQUESTS="$(((MAX_REPETITIONS + 1) * REQUEST_LIMIT))"
 readonly MAX_WORKER_SECONDS=120000
 readonly MAX_TOTAL_WORKER_SECONDS=120000
 readonly METRICS_SETTLE_SECONDS=1
@@ -51,7 +54,8 @@ readonly BENCHMARK_PROCESS_GROUP_GRACE_SECONDS=10
 readonly RUNNER_START_TIMEOUT_SECONDS=1500
 readonly RUNNER_CLEANUP_TIMEOUT_SECONDS=300
 readonly POSTLOAD_SENTINEL_TIMEOUT_SECONDS=120
-readonly CORE_CELLS=(uninstrumented bridge-disabled getsockopt-hit unix-hit)
+readonly CORE_CELLS=(uninstrumented bridge-disabled getsockopt-hit unix-hit getsockopt-w3c)
+readonly W3C_DISCARD_CELLS=(getsockopt-w3c)
 
 OUTPUT_DIR=""
 OUTPUT_PARENT=""
@@ -85,6 +89,11 @@ CELL_SCENARIO=""
 CELL_ASSERTION_MODE=""
 CELL_REQUIRES_OBI=false
 CELL_SELECTED_TRANSPORT=""
+CELL_SENTINEL_SCENARIO=""
+CELL_SUSTAINED_W3C=false
+CELL_EXPECTED_STANDARD_PARENT_DISCARDS=0
+CELL_EXPECTED_W3C_VALID_TAKES=0
+CELL_W3C_WORKLOAD_SUCCESSFUL_REQUESTS=0
 
 declare -a COMPOSE=()
 
@@ -105,10 +114,10 @@ usage() {
     '  --concurrency N          1-256. Default: 16' \
     '  --repetitions N          5-10. Default: 5' \
     '  --seed N                 0-9223372036854775807. Default: 20260721' \
-    '  --cells core             The four comparable core cells. Default: core' \
+    '  --cells core             The five comparable core cells. Default: core' \
     '  -h, --help               Show this help text.' \
     '' \
-    'The total worker-seconds across all four cells must not exceed 120000.'
+    'The total worker-seconds across all five cells must not exceed 120000.'
 }
 
 log_info() {
@@ -348,7 +357,7 @@ parse_args() {
   }
   (((WARMUP_SECONDS + (REPETITIONS * DURATION_SECONDS)) * CONCURRENCY * ${#CORE_CELLS[@]}
     <= MAX_TOTAL_WORKER_SECONDS)) || {
-    die "total worker-seconds across the four cells must not exceed $MAX_TOTAL_WORKER_SECONDS"
+    die "total worker-seconds across the five cells must not exceed $MAX_TOTAL_WORKER_SECONDS"
     return $?
   }
 }
@@ -441,7 +450,7 @@ check_dependencies() {
     die "the benchmark harness requires Linux"
     return $?
   }
-  for command_name in awk chmod curl date docker env find flock git grep id install jq mkdir mv setsid stat timeout tr uname wc; do
+  for command_name in awk chmod curl date docker env find flock git grep head id install jq mkdir mv rm setsid stat timeout tr uname wc; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
       missing+=("$command_name")
     fi
@@ -531,6 +540,11 @@ cell_spec() {
   local -r cell="$1"
 
   CELL_SLUG="$cell"
+  CELL_SENTINEL_SCENARIO="concurrency"
+  CELL_SUSTAINED_W3C=false
+  CELL_EXPECTED_STANDARD_PARENT_DISCARDS=0
+  CELL_EXPECTED_W3C_VALID_TAKES=0
+  CELL_W3C_WORKLOAD_SUCCESSFUL_REQUESTS=0
   case "$cell" in
     uninstrumented)
       CELL_TRANSPORT="disabled"
@@ -552,6 +566,17 @@ cell_spec() {
       CELL_ASSERTION_MODE=""
       CELL_REQUIRES_OBI=true
       CELL_SELECTED_TRANSPORT="getsockopt"
+      ;;
+    getsockopt-w3c)
+      CELL_TRANSPORT="getsockopt"
+      CELL_SCENARIO="w3c"
+      CELL_ASSERTION_MODE=""
+      CELL_REQUIRES_OBI=true
+      CELL_SELECTED_TRANSPORT="getsockopt"
+      CELL_SENTINEL_SCENARIO="w3c"
+      CELL_SUSTAINED_W3C=true
+      CELL_EXPECTED_STANDARD_PARENT_DISCARDS="$(((PREFLIGHT_REQUESTS + 1) / 2))"
+      CELL_EXPECTED_W3C_VALID_TAKES="$PREFLIGHT_REQUESTS"
       ;;
     unix-hit)
       CELL_TRANSPORT="unix"
@@ -581,6 +606,18 @@ configure_compose() {
 }
 
 write_manifest() {
+  local cells_json=""
+  local w3c_discard_cells_json=""
+  local w3c_headers_by_cell_json=""
+
+  cells_json="$(jq -cn '$ARGS.positional' --args "${CORE_CELLS[@]}")" || return 1
+  w3c_discard_cells_json="$(jq -cn '$ARGS.positional' --args "${W3C_DISCARD_CELLS[@]}")" || return 1
+  w3c_headers_by_cell_json="$(jq -cn \
+    --argjson cells "$cells_json" \
+    --argjson w3c_discard_cells "$w3c_discard_cells_json" '
+      reduce $cells[] as $cell ({};
+        .[$cell] = (($w3c_discard_cells | index($cell)) != null))
+    ')" || return 1
   jq -n \
     --arg started_at "$STARTED_AT" \
     --arg invocation "$HARNESS_INVOCATION" \
@@ -598,6 +635,9 @@ write_manifest() {
     --argjson sustained_load_seed "$SUSTAINED_LOAD_SEED" \
     --argjson traffic_elapsed_overrun_tolerance_seconds "$MEASUREMENT_OVERRUN_TOLERANCE_SECONDS" \
     --argjson request_limit "$REQUEST_LIMIT" \
+    --argjson cells "$cells_json" \
+    --argjson w3c_discard_cells "$w3c_discard_cells_json" \
+    --argjson w3c_headers_by_cell "$w3c_headers_by_cell_json" \
     --argjson total_worker_seconds "$((
       (WARMUP_SECONDS + (REPETITIONS * DURATION_SECONDS)) * CONCURRENCY * ${#CORE_CELLS[@]}
     ))" \
@@ -618,6 +658,8 @@ write_manifest() {
         repetitions: $repetitions,
         request_limit: $request_limit,
         w3c_headers: false,
+        w3c_headers_by_cell: $w3c_headers_by_cell,
+        w3c_discard_cells: $w3c_discard_cells,
         sustained_load_seed: $sustained_load_seed,
         traffic_elapsed_overrun_tolerance_seconds: $traffic_elapsed_overrun_tolerance_seconds
       },
@@ -626,7 +668,7 @@ write_manifest() {
         seed: $tracecheck_seed,
         postload_sentinel: true
       },
-      cells: ["uninstrumented", "bridge-disabled", "getsockopt-hit", "unix-hit"],
+      cells: $cells,
       total_worker_seconds: $total_worker_seconds,
       unavailable_dimensions: {
         jni_lookup_latency_percentiles: "not_collected",
@@ -676,18 +718,26 @@ write_cell_contract() {
     --arg scenario "$CELL_SCENARIO" \
     --arg assertion_mode "$CELL_ASSERTION_MODE" \
     --arg selected_transport "$CELL_SELECTED_TRANSPORT" \
+    --arg sentinel_scenario "$CELL_SENTINEL_SCENARIO" \
     --argjson requests "$PREFLIGHT_REQUESTS" \
     --argjson seed "$SEED" \
     --argjson requires_obi "$CELL_REQUIRES_OBI" \
+    --argjson sustained_w3c "$CELL_SUSTAINED_W3C" \
+    --argjson expected_standard_parent_discards "$CELL_EXPECTED_STANDARD_PARENT_DISCARDS" \
+    --argjson expected_w3c_valid_takes "$CELL_EXPECTED_W3C_VALID_TAKES" \
     '{
       cell: $cell,
       transport: $transport,
       scenario: $scenario,
       assertion_mode: ($assertion_mode | if . == "" then null else . end),
       selected_transport: $selected_transport,
+      sentinel_scenario: $sentinel_scenario,
       requests: $requests,
       seed: $seed,
-      requires_obi: $requires_obi
+      requires_obi: $requires_obi,
+      sustained_w3c: $sustained_w3c,
+      expected_standard_parent_discards: $expected_standard_parent_discards,
+      expected_w3c_valid_takes: $expected_w3c_valid_takes
     }' >"$cell_dir/preflight/contract.json"
 }
 
@@ -832,9 +882,9 @@ retain_runner_artifacts() {
     java-startup.log
     apache-startup.log
     final-receiver-snapshot.json
-    scenario-concurrency.json
-    scenario-concurrency-status.json
-    scenario-concurrency.stderr.log
+    "scenario-$CELL_SENTINEL_SCENARIO.json"
+    "scenario-$CELL_SENTINEL_SCENARIO-status.json"
+    "scenario-$CELL_SENTINEL_SCENARIO.stderr.log"
   )
 
   if [[ "$CELL_TRANSPORT" != "disabled" ]]; then
@@ -959,13 +1009,25 @@ capture_obi_metrics() {
 
 capture_java_diagnostics() {
   local -r output="$1"
+  local -r partial="$output.partial"
+  local captured_bytes=""
 
+  [[ ! -e "$output" && ! -L "$output" && ! -e "$partial" && ! -L "$partial" ]] || return 1
   if run_bounded "$DOCKER_QUERY_TIMEOUT_SECONDS" \
     curl --fail --silent --show-error --max-time 5 \
+      --max-filesize "$MAX_JAVA_DIAGNOSTICS_SNAPSHOT_BYTES" \
       --cacert "$RUNTIME_DIR/certs/ca.crt" \
-      "https://127.0.0.1:18443/obi-diagnostics" >"$output" 2>"$output.stderr"; then
-    return 0
+      "https://127.0.0.1:18443/obi-diagnostics" 2>"$output.stderr" | \
+    head -c "$((MAX_JAVA_DIAGNOSTICS_SNAPSHOT_BYTES + 1))" >"$partial"; then
+    captured_bytes="$(stat --format '%s' -- "$partial")" || return 1
+    if [[ "$captured_bytes" =~ ^[0-9]+$ &&
+      "$captured_bytes" -le "$MAX_JAVA_DIAGNOSTICS_SNAPSHOT_BYTES" ]] &&
+      install -m 0600 "$partial" "$output"; then
+      rm -f -- "$partial" || return 1
+      return 0
+    fi
   fi
+  rm -f -- "$partial"
   printf 'status=unavailable\n' >"$output"
   return 0
 }
@@ -1030,14 +1092,15 @@ validate_benchmark_result() {
     --argjson request_timeout_nanos "$((REQUEST_TIMEOUT_SECONDS * 1000000000))" \
     --argjson concurrency "$CONCURRENCY" \
     --argjson request_limit "$REQUEST_LIMIT" \
-    --argjson sustained_load_seed "$SUSTAINED_LOAD_SEED" '
+    --argjson sustained_load_seed "$SUSTAINED_LOAD_SEED" \
+    --argjson expected_w3c "$CELL_SUSTAINED_W3C" '
       length == 1 and
       (.[0] |
         .status == "passed" and
         .base_url == $base_url and
         .path == $path and
         .connection_mode == $connection_mode and
-        .w3c == false and
+        .w3c == $expected_w3c and
         .seed == $sustained_load_seed and
         .requested_duration_nanos == $duration_nanos and
         .request_timeout_nanos == $request_timeout_nanos and
@@ -1045,8 +1108,14 @@ validate_benchmark_result() {
         .request_limit == $request_limit and
         .request_limit_reached == false and
         .canceled == false and
-        .successful_requests > 0 and
-        .failed_requests == 0 and
+        (if (.successful_requests | type) == "number" then
+          (.successful_requests | floor == . and . > 0 and . <= $request_limit)
+         else false
+         end) and
+        (if (.failed_requests | type) == "number" then
+          (.failed_requests | floor == . and . == 0)
+         else false
+         end) and
         (.traffic_elapsed_nanos | type == "number") and
         .traffic_elapsed_nanos >= $duration_nanos and
         .traffic_elapsed_nanos <= $maximum_traffic_elapsed_nanos and
@@ -1056,6 +1125,32 @@ validate_benchmark_result() {
         .latency.p99_nanos >= .latency.p95_nanos
       )
     ' "$result" >/dev/null
+}
+
+benchmark_successful_request_count() {
+  local -r result="$1"
+  local count=""
+
+  [[ -f "$result" && ! -L "$result" ]] || return 1
+  count="$(jq -ser '
+    if length == 1 and
+      (.[0].successful_requests |
+        if type == "number" then floor == . else false end)
+    then .[0].successful_requests
+    else empty
+    end
+  ' "$result")" || return 1
+  normalize_decimal "$count" "$REQUEST_LIMIT" false
+}
+
+record_w3c_workload_successes() {
+  local -r result="$1"
+  local count=""
+
+  [[ "$CELL_SUSTAINED_W3C" == "true" ]] || return 1
+  count="$(benchmark_successful_request_count "$result")" || return 1
+  ((CELL_W3C_WORKLOAD_SUCCESSFUL_REQUESTS <= MAX_W3C_WORKLOAD_SUCCESSFUL_REQUESTS - count)) || return 1
+  CELL_W3C_WORKLOAD_SUCCESSFUL_REQUESTS="$((CELL_W3C_WORKLOAD_SUCCESSFUL_REQUESTS + count))"
 }
 
 run_benchmark_client() {
@@ -1085,7 +1180,7 @@ start_benchmark_client() {
       --concurrency "$CONCURRENCY" \
       --request-limit "$REQUEST_LIMIT" \
       --seed "$SUSTAINED_LOAD_SEED" \
-      --w3c=false >"$output" 2>"$output.stderr"
+      --w3c="$CELL_SUSTAINED_W3C" >"$output" 2>"$output.stderr"
 }
 
 clear_active_benchmark() {
@@ -1328,11 +1423,381 @@ validate_concurrency_sentinel() {
     ' "$result" >/dev/null
 }
 
+validate_w3c_sentinel() {
+  local -r result="$1"
+  local -r endpoint="${WORKLOAD_PATH%%\?*}"
+
+  [[ -f "$result" && ! -L "$result" ]] || return 1
+  jq -se \
+    --arg tls "$TLS_PROTOCOL" \
+    --arg endpoint "$endpoint" \
+    --argjson requests "$PREFLIGHT_REQUESTS" \
+    --argjson seed "$SEED" \
+    --argjson standard_parent_discards "$CELL_EXPECTED_STANDARD_PARENT_DISCARDS" '
+      def marked($marker):
+        (.attributes | type) == "object" and
+        ([.attributes | to_entries[] |
+          select(
+            (.key | ascii_downcase) == "http.request.header.x-obi-demo-id" or
+            (.key | ascii_downcase) == "http.request.header.x_obi_demo_id"
+          ) | .value
+        ]) as $marker_values |
+        ($marker_values | length > 0 and
+          all(.[]; type == "string" and . == $marker));
+      def nonzero_trace_id:
+        type == "string" and test("^[0-9a-f]{32}\\z") and
+        . != "00000000000000000000000000000000";
+      def nonzero_span_id:
+        type == "string" and test("^[0-9a-f]{16}\\z") and
+        . != "0000000000000000";
+      def remote_parent:
+        (.flags |
+          if type == "number" then
+            floor == . and . >= 0 and
+            ((. / 256 | floor) % 2) == 1 and
+            ((. / 512 | floor) % 2) == 1
+          else false
+          end);
+      def trace_flags:
+        (.flags | if type == "number" and floor == . and . >= 0 then . % 256 else -1 end);
+      def zero_span_id:
+        if . == null then true
+        elif type == "string" then . == "" or test("^0+\\z")
+        else false
+        end;
+      def endpoint_path:
+        if type != "string" then null
+        elif contains("#") then null
+        elif startswith("/") then split("?")[0]
+        else try capture("^[A-Za-z][A-Za-z0-9+.-]*://[^/?#]+(?<path>/[^?#]*)").path catch null
+        end;
+      def endpoint_matches($endpoint):
+        if (.attributes | type) != "object" then false
+        else
+          .attributes["http.route"] == $endpoint or
+          .attributes["url.path"] == $endpoint or
+          ([.attributes["http.target"], .attributes["http.url"], .attributes["url.full"]]
+            | any(.[]; endpoint_path == $endpoint))
+        end;
+      def descends_from($spans; $descendant; $ancestor):
+        def follow($parent_id; $seen; $found_ancestor):
+          if ($parent_id | zero_span_id) then $found_ancestor
+          elif ($seen | index($parent_id)) != null then false
+          else
+            ([ $spans[] | select(
+              .trace_id == $descendant.trace_id and .span_id == $parent_id
+            ) ]) as $parents |
+            if ($parents | length) == 0 then $found_ancestor
+            elif ($parents | length) != 1 then false
+            elif (($found_ancestor | not) and
+              $parents[0].service_name != $ancestor.service_name) then false
+            else
+              follow(
+                $parents[0].parent_span_id;
+                $seen + [$parent_id];
+                ($found_ancestor or $parent_id == $ancestor.span_id)
+              )
+            end
+          end;
+        ($descendant.trace_id == $ancestor.trace_id and
+          $descendant.service_name == $ancestor.service_name and
+          ([ $spans[] | select(
+            .trace_id == $descendant.trace_id and .span_id == $descendant.span_id
+          ) ] | length == 1) and
+          ([ $spans[] | select(
+            .trace_id == $ancestor.trace_id and .span_id == $ancestor.span_id
+          ) ] | length == 1) and
+          follow($descendant.parent_span_id; []; false));
+      length == 1 and
+      (.[0] |
+        .status == "passed" and
+        .scenario == "w3c" and
+        .request_count == $requests and
+        .seed == $seed and
+        (.cases | type == "array" and length == $requests) and
+        ([.cases[] |
+          select(.request.w3c_case == "conflicting-valid-w3c-and-obi")]
+          | length == $standard_parent_discards) and
+        ([.cases[] |
+          select(.request.w3c_case == "malformed-w3c-valid-obi" and
+            .request.invalid_w3c == true)]
+          | length == ($requests - $standard_parent_discards)) and
+        ([.cases[] | .response.tls_protocol] | all(. == $tls)) and
+        all(.cases[];
+          . as $case |
+          if ($case.trace.spans | type) != "array" then false
+          else
+            $case.request as $request |
+            $request.marker as $marker |
+            $case.trace.spans as $spans |
+            ([ $spans[] | select(
+              .service_name == "java-backend" and .kind == "SERVER" and marked($marker)
+            ) ]) as $java_servers |
+            ([ $spans[] | select(
+              .service_name == "apache-proxy" and .kind == "SERVER" and marked($marker)
+            ) ]) as $apache_servers |
+            ([ $spans[] | select(
+              .service_name == "apache-proxy" and .kind == "CLIENT" and marked($marker)
+            ) ]) as $apache_clients |
+            ($request | type == "object") and
+            ($marker | type == "string" and test("^[a-z0-9-]+\\z") and
+              $case.trace.dropped_spans == 0 and
+              $request.endpoint == $endpoint and
+              $case.response.marker == $marker and $case.trace.marker == $marker and
+              ($java_servers | length == 1) and
+              ($apache_servers | length == 1) and
+              ($apache_clients | length == 1) and
+              ($java_servers[0].trace_id | nonzero_trace_id) and
+              ($java_servers[0].span_id | nonzero_span_id) and
+              ($apache_servers[0].trace_id | nonzero_trace_id) and
+              ($apache_servers[0].span_id | nonzero_span_id) and
+              ($apache_clients[0].trace_id | nonzero_trace_id) and
+              ($apache_clients[0].span_id | nonzero_span_id) and
+              ($java_servers[0] | endpoint_matches($endpoint)) and
+              ($apache_servers[0] | endpoint_matches($endpoint)) and
+              ($apache_clients[0] | endpoint_matches($endpoint)) and
+              descends_from($spans; $apache_clients[0]; $apache_servers[0]) and
+              ($java_servers[0] | remote_parent) and
+              (if $request.w3c_case == "conflicting-valid-w3c-and-obi" then
+                ($request | has("invalid_w3c") | not) and
+                ($request.w3c_trace_id | nonzero_trace_id) and
+                ($request.w3c_parent_span_id | nonzero_span_id) and
+                $request.w3c_trace_flags == "01" and
+                $java_servers[0].trace_id == $request.w3c_trace_id and
+                $java_servers[0].parent_span_id == $request.w3c_parent_span_id and
+                ($java_servers[0] | trace_flags) == 1 and
+                $apache_servers[0].trace_id == $request.w3c_trace_id and
+                $apache_servers[0].parent_span_id == $request.w3c_parent_span_id and
+                ($apache_servers[0] | trace_flags) == 1 and
+                $apache_clients[0].trace_id == $request.w3c_trace_id and
+                $apache_clients[0].span_id != $request.w3c_parent_span_id and
+                ($apache_clients[0] | trace_flags) == 1
+               elif $request.w3c_case == "malformed-w3c-valid-obi" then
+                $request.invalid_w3c == true and
+                ($request | has("w3c_trace_id") | not) and
+                ($request | has("w3c_parent_span_id") | not) and
+                ($request | has("w3c_trace_flags") | not) and
+                ($apache_servers[0].parent_span_id | zero_span_id) and
+                $apache_servers[0].trace_id == $apache_clients[0].trace_id and
+                $java_servers[0].trace_id == $apache_clients[0].trace_id and
+                $java_servers[0].parent_span_id == $apache_clients[0].span_id and
+                ($java_servers[0] | trace_flags) == ($apache_clients[0] | trace_flags)
+               else false
+               end)
+            )
+          end
+        )
+      )
+    ' "$result" >/dev/null
+}
+
+validate_cell_sentinel() {
+  local -r result="$1"
+
+  case "$CELL_SENTINEL_SCENARIO" in
+    concurrency)
+      validate_concurrency_sentinel "$result" "$CELL_ASSERTION_MODE"
+      ;;
+    w3c)
+      validate_w3c_sentinel "$result"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+validate_w3c_runner_status() {
+  local -r status_file="$1"
+
+  [[ -f "$status_file" && ! -L "$status_file" ]] || return 1
+  jq -se '
+    length == 1 and
+    (.[0] |
+      .status == "passed" and
+      .scenario == "w3c" and
+      .exit_status == 0 and
+      .metric_status == 0 and
+      .result == "scenario-w3c.json" and
+      .after_phase == "phases/w3c-after"
+    )
+  ' "$status_file" >/dev/null
+}
+
+validate_runner_standard_parent_discards() {
+  local -r delta_file="$1"
+
+  [[ -f "$delta_file" && ! -L "$delta_file" ]] || return 1
+  awk -v expected="$CELL_EXPECTED_STANDARD_PARENT_DISCARDS" \
+    -v maximum="$MAX_JAVA_DIAGNOSTIC_COUNTER" '
+    function bounded(value) {
+      return value ~ /^(0|[1-9][0-9]*)$/ &&
+        length(value) <= length(maximum) &&
+        (length(value) < length(maximum) || value < maximum)
+    }
+    $1 == "discard_standard" {
+      matches++
+      before = $2
+      after = $3
+      delta = $4
+      if (NF != 4 || sub(/^before=/, "", before) != 1 ||
+          sub(/^after=/, "", after) != 1 || sub(/^delta=/, "", delta) != 1 ||
+          !bounded(before) || !bounded(after) || !bounded(delta) ||
+          after + 0 < before + 0 || delta + 0 != (after + 0) - (before + 0) ||
+          delta != expected) {
+        invalid = 1
+      }
+    }
+    END { exit matches == 1 && invalid != 1 ? 0 : 1 }
+  ' "$delta_file"
+}
+
+base36_to_decimal() {
+  local raw="$1"
+  local value=0
+
+  [[ "$raw" =~ ^(0|[1-9a-z][0-9a-z]*)$ && ${#raw} -le 6 ]] || return 1
+  value="$((36#$raw))"
+  ((value < MAX_JAVA_DIAGNOSTIC_COUNTER)) || return 1
+  printf '%s\n' "$value"
+}
+
+validate_java_diagnostics_snapshot() {
+  local -r snapshot_file="$1"
+  local snapshot_size=""
+  local snapshot=""
+  local entry=""
+  local name=""
+  local value=""
+  local decoded=""
+  local index=0
+  local -a snapshots=()
+  local -a entries=()
+  local -a expected_names=(
+    cfg_on cfg_off provider_ok provider_reject provider_ver extension_reg
+    lookup_ready lookup_missing lookup_version lookup_error record_version
+    invoke_error discard_standard extract_fields extract_invalid extract_error
+    registration_ok registration_fail take_sampled take_unsampled tls_reads tls_bytes
+    t_unknown d_unknown t_valid d_valid t_missing d_missing t_stale d_stale
+    t_unsupported d_unsupported t_malformed d_malformed
+    t_version_mismatch d_version_mismatch t_ambiguous d_ambiguous
+    t_unauthorized d_unauthorized t_already_consumed d_already_consumed
+    t_timeout d_timeout t_overload d_overload
+    t_transport_error d_transport_error t_disabled d_disabled
+  )
+
+  [[ -f "$snapshot_file" && ! -L "$snapshot_file" ]] || return 1
+  snapshot_size="$(stat --format '%s' -- "$snapshot_file")" || return 1
+  [[ "$snapshot_size" =~ ^[0-9]+$ &&
+    "$snapshot_size" -le "$MAX_JAVA_DIAGNOSTICS_SNAPSHOT_BYTES" ]] || return 1
+  mapfile -t snapshots <"$snapshot_file" || return 1
+  [[ ${#snapshots[@]} == 1 && -n "${snapshots[0]}" ]] || return 1
+  snapshot="${snapshots[0]}"
+  IFS=, read -r -a entries <<<"$snapshot"
+  [[ ${#entries[@]} == "${#expected_names[@]}" ]] || return 1
+  for entry in "${entries[@]}"; do
+    [[ "$entry" =~ ^[a-z_]+=(0|[1-9a-z][0-9a-z]*)$ ]] || return 1
+    name="${entry%%=*}"
+    value="${entry#*=}"
+    [[ "$name" == "${expected_names[$index]}" ]] || return 1
+    decoded="$(base36_to_decimal "$value")" || return 1
+    [[ "$decoded" =~ ^[0-9]+$ ]] || return 1
+    ((index += 1))
+  done
+}
+
+diagnostic_counter_value() {
+  local -r snapshot_file="$1"
+  local -r wanted_counter="$2"
+  local snapshot=""
+  local entry=""
+  local counter_name=""
+  local encoded_value=""
+  local -a entries=()
+
+  validate_java_diagnostics_snapshot "$snapshot_file" || return 1
+  IFS= read -r snapshot <"$snapshot_file" || return 1
+  IFS=, read -r -a entries <<<"$snapshot"
+  for entry in "${entries[@]}"; do
+    counter_name="${entry%%=*}"
+    encoded_value="${entry#*=}"
+    if [[ "$counter_name" == "$wanted_counter" ]]; then
+      printf '%s\n' "$encoded_value"
+      return 0
+    fi
+  done
+  return 1
+}
+
+validate_java_diagnostics_counter_deltas() {
+  local -r before_snapshot="$1"
+  local -r after_snapshot="$2"
+  local -r output="$3"
+  local counter=""
+  local expected_delta=""
+  local before_encoded=""
+  local after_encoded=""
+  local before_value=""
+  local after_value=""
+  local observed_delta=0
+  local counters_json=""
+  local -a counter_json=()
+
+  shift 3
+  (($# > 0 && $# % 2 == 0)) || return 1
+  validate_java_diagnostics_snapshot "$before_snapshot" || return 1
+  validate_java_diagnostics_snapshot "$after_snapshot" || return 1
+  while (($# > 0)); do
+    counter="$1"
+    expected_delta="$(normalize_decimal "$2" "$MAX_JAVA_DIAGNOSTIC_COUNTER" true)" || return 1
+    shift 2
+
+    before_encoded="$(diagnostic_counter_value "$before_snapshot" "$counter")" || return 1
+    after_encoded="$(diagnostic_counter_value "$after_snapshot" "$counter")" || return 1
+    before_value="$(base36_to_decimal "$before_encoded")" || return 1
+    after_value="$(base36_to_decimal "$after_encoded")" || return 1
+    ((after_value >= before_value)) || return 1
+    observed_delta=$((after_value - before_value))
+    ((observed_delta == expected_delta)) || return 1
+    counter_json+=("$(jq -cn \
+      --arg counter "$counter" \
+      --arg before_base36 "$before_encoded" \
+      --arg after_base36 "$after_encoded" \
+      --argjson observed_delta "$observed_delta" \
+      --argjson expected_delta "$expected_delta" \
+      '{
+        counter: $counter,
+        before_base36: $before_base36,
+        after_base36: $after_base36,
+        observed_delta: $observed_delta,
+        expected_delta: $expected_delta
+      }')") || return 1
+  done
+  counters_json="$(printf '%s\n' "${counter_json[@]}" | jq -s .)" || return 1
+  jq -n --argjson counters "$counters_json" '{counters: $counters}' >"$output"
+}
+
+validate_standard_parent_discard_diagnostics() {
+  local -r before_snapshot="$1"
+  local -r after_snapshot="$2"
+  local -r output="$3"
+  local -r expected_standard_delta="${4:-$CELL_EXPECTED_STANDARD_PARENT_DISCARDS}"
+  local -r expected_valid_take_delta="${5:-$CELL_EXPECTED_W3C_VALID_TAKES}"
+
+  validate_java_diagnostics_counter_deltas \
+    "$before_snapshot" "$after_snapshot" "$output" \
+    discard_standard "$expected_standard_delta" \
+    t_valid "$expected_valid_take_delta" \
+    d_valid 0
+}
+
 run_postload_sentinel() {
   local -r cell_dir="$1"
   local -r output="$cell_dir/postload-sentinel/result.json"
+  local diagnostics_before=""
+  local diagnostics_after=""
   local -a arguments=(
-    --scenario concurrency
+    --scenario "$CELL_SENTINEL_SCENARIO"
     --requests "$PREFLIGHT_REQUESTS"
     --expected-tls "$TLS_PROTOCOL"
     --seed "$SEED"
@@ -1340,23 +1805,48 @@ run_postload_sentinel() {
   )
 
   mkdir -- "$cell_dir/postload-sentinel"
-  if [[ -n "$CELL_ASSERTION_MODE" ]]; then
+  if [[ "$CELL_SENTINEL_SCENARIO" == "w3c" ]]; then
+    diagnostics_before="$cell_dir/postload-sentinel/java-diagnostics-before.txt"
+    diagnostics_after="$cell_dir/postload-sentinel/java-diagnostics-after.txt"
+    capture_java_diagnostics "$diagnostics_before"
+  elif [[ -n "$CELL_ASSERTION_MODE" ]]; then
     arguments+=(--assertion-mode "$CELL_ASSERTION_MODE")
   fi
   run_bounded "$POSTLOAD_SENTINEL_TIMEOUT_SECONDS" \
     "${COMPOSE[@]}" run --rm --no-deps --no-TTY scenario "${arguments[@]}" \
       >"$output" 2>"$output.stderr"
-  validate_concurrency_sentinel "$output" "$CELL_ASSERTION_MODE"
-  jq -n --arg status passed --arg scenario concurrency --argjson requests "$PREFLIGHT_REQUESTS" \
-    '{status: $status, scenario: $scenario, requests: $requests}' \
+  validate_cell_sentinel "$output"
+  if [[ "$CELL_SENTINEL_SCENARIO" == "w3c" ]]; then
+    capture_java_diagnostics "$diagnostics_after"
+    validate_standard_parent_discard_diagnostics \
+      "$diagnostics_before" \
+      "$diagnostics_after" \
+      "$cell_dir/postload-sentinel/standard-parent-discard-diagnostics.json"
+  fi
+  jq -n \
+    --arg status passed \
+    --arg scenario "$CELL_SENTINEL_SCENARIO" \
+    --argjson requests "$PREFLIGHT_REQUESTS" \
+    --argjson standard_parent_discards "$CELL_EXPECTED_STANDARD_PARENT_DISCARDS" \
+    '{
+      status: $status,
+      scenario: $scenario,
+      requests: $requests,
+      expected_standard_parent_discards: $standard_parent_discards
+    }' \
     >"$cell_dir/postload-sentinel/status.json"
 }
 
 verify_preflight() {
   local -r result_directory="$1"
-  local scenario_result="$result_directory/scenario-concurrency.json"
+  local -r scenario_result="$result_directory/scenario-$CELL_SENTINEL_SCENARIO.json"
 
-  validate_concurrency_sentinel "$scenario_result" "$CELL_ASSERTION_MODE"
+  validate_cell_sentinel "$scenario_result" || return $?
+  if [[ "$CELL_SENTINEL_SCENARIO" == "w3c" ]]; then
+    validate_w3c_runner_status "$result_directory/scenario-w3c-status.json" || return $?
+    validate_runner_standard_parent_discards \
+      "$result_directory/phases/w3c-after/java-diagnostics.delta"
+  fi
 }
 
 start_cell_stack() {
@@ -1423,6 +1913,7 @@ run_cell() {
   local cell_dir=""
   local project=""
   local repetition=0
+  local repetition_label=""
 
   cell_spec "$cell" || return 1
   cell_dir="$OUTPUT_DIR/cells/$CELL_SLUG"
@@ -1436,15 +1927,36 @@ run_cell() {
   log_info "starting $CELL_SLUG preflight project=$project"
   start_cell_stack "$cell_dir" "$project"
   capture_resource_snapshot "$cell_dir/resources-before" before
+  if [[ "$CELL_SUSTAINED_W3C" == "true" ]]; then
+    mkdir -- "$cell_dir/sustained-w3c"
+    capture_java_diagnostics "$cell_dir/sustained-w3c/java-diagnostics-before.txt"
+  fi
 
   log_info "warming $CELL_SLUG for ${WARMUP_SECONDS}s"
   run_benchmark_client "$cell_dir/warmup.json" "$WARMUP_SECONDS"
   validate_benchmark_result "$cell_dir/warmup.json" "$WARMUP_SECONDS"
+  if [[ "$CELL_SUSTAINED_W3C" == "true" ]]; then
+    record_w3c_workload_successes "$cell_dir/warmup.json"
+  fi
 
   for ((repetition = 1; repetition <= REPETITIONS; repetition++)); do
     log_info "measuring $CELL_SLUG repetition $repetition/$REPETITIONS"
     run_measurement_rep "$cell_dir" "$repetition"
+    if [[ "$CELL_SUSTAINED_W3C" == "true" ]]; then
+      printf -v repetition_label 'rep-%02d' "$repetition"
+      record_w3c_workload_successes "$cell_dir/measurements/$repetition_label.json"
+    fi
   done
+  if [[ "$CELL_SUSTAINED_W3C" == "true" ]]; then
+    capture_java_diagnostics "$cell_dir/sustained-w3c/java-diagnostics-after.txt"
+    validate_java_diagnostics_counter_deltas \
+      "$cell_dir/sustained-w3c/java-diagnostics-before.txt" \
+      "$cell_dir/sustained-w3c/java-diagnostics-after.txt" \
+      "$cell_dir/sustained-w3c/java-diagnostics-deltas.json" \
+      discard_standard "$CELL_W3C_WORKLOAD_SUCCESSFUL_REQUESTS" \
+      t_valid "$CELL_W3C_WORKLOAD_SUCCESSFUL_REQUESTS" \
+      d_valid 0
+  fi
   capture_resource_snapshot "$cell_dir/resources-after-load" after
   run_postload_sentinel "$cell_dir"
   sleep "$METRICS_SETTLE_SECONDS"

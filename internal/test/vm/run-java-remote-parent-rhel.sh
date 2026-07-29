@@ -27,6 +27,67 @@ require_test_passed() {
     fi
 }
 
+require_private_benchmark_path() {
+    local -r path="$1"
+    local -r path_type="$2"
+    local -r mode="$3"
+    local path_identity=""
+
+    path_identity="$(stat -c '%F:%u:%a' -- "$path")" || \
+        fail "cannot stat transport benchmark path: ${path}"
+    [[ "$path_identity" == "${path_type}:${EUID}:${mode}" ]] || \
+        fail "transport benchmark path is not private: ${path}"
+}
+
+require_transport_benchmark_series() {
+    local -r artifact_file="$1"
+    local -r transport="$2"
+    local -r outcome="$3"
+    local -r samples="$4"
+    local -r positive_integer='[1-9][0-9]*'
+    local -r non_negative_integer='[0-9]+'
+    local -r non_negative_number='[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?'
+    local series_pattern="\\{\"transport\":\"${transport}\",\"outcome\":\"${outcome}\","
+
+    series_pattern+="\"warmup_rounds\":${positive_integer},"
+    series_pattern+="\"measurement_rounds\":${positive_integer},"
+    series_pattern+="\"samples\":${samples},\"concurrency\":8,"
+    series_pattern+="\"batch_elapsed_ns\":${positive_integer},"
+    series_pattern+="\"p50_ns\":${positive_integer},"
+    series_pattern+="\"p95_ns\":${positive_integer},"
+    series_pattern+="\"p99_ns\":${positive_integer},"
+    series_pattern+="\"operations_per_second\":${non_negative_number},"
+    series_pattern+="\"valid\":${non_negative_integer},"
+    series_pattern+="\"missing\":${non_negative_integer},"
+    series_pattern+="\"already_consumed\":${non_negative_integer},"
+    series_pattern+="\"errors\":0,\"correct\":true\\}"
+
+    if ! grep -Eq -- "$series_pattern" "$artifact_file"; then
+        fail "transport benchmark artifact lacks a valid ${transport}/${outcome} series: ${artifact_file}"
+    fi
+}
+
+require_transport_benchmark_artifact() {
+    local -r artifact_file="$1"
+    local transport_count=""
+
+    require_private_benchmark_path "$artifact_file" 'regular file' 600
+    [[ -s "$artifact_file" ]] || \
+        fail "transport benchmark artifact is missing or invalid: ${artifact_file}"
+    grep -Fq -- '"schema_version":1,"benchmark":"java_remote_parent_transport","series":[' "$artifact_file" || \
+        fail "transport benchmark artifact has an invalid root: ${artifact_file}"
+
+    transport_count="$(grep -o -- '"transport":' "$artifact_file" | wc -l || true)"
+    [[ "$transport_count" -eq 5 ]] || \
+        fail "transport benchmark artifact has an unexpected series count: ${artifact_file}"
+
+    require_transport_benchmark_series "$artifact_file" getsockopt miss 4096
+    require_transport_benchmark_series "$artifact_file" getsockopt hit 4096
+    require_transport_benchmark_series "$artifact_file" getsockopt one_shot 4096
+    require_transport_benchmark_series "$artifact_file" unix miss 1024
+    require_transport_benchmark_series "$artifact_file" unix hit 1024
+}
+
 require_java_agent() {
     [[ -s "$JAVA_AGENT_PATH" ]] || fail "Java bridge agent artifact is unavailable at ${JAVA_AGENT_PATH}"
     [[ -s "$JAVA_AGENT_CHECKSUM" ]] || fail "Java bridge agent checksum is unavailable at ${JAVA_AGENT_CHECKSUM}"
@@ -110,8 +171,15 @@ run_sockopt_authority_tests() {
 
 run_transport_benchmark() {
     local -r output_file="$OUTPUT_DIR/transport-benchmark.log"
+    local artifact_dir=""
 
-    OBI_JAVA_REMOTE_PARENT_BENCHMARK=1 go test \
+    artifact_dir="$(mktemp -d -- "${OUTPUT_DIR}/transport-benchmark.XXXXXX")" || \
+        fail 'failed to create transport benchmark artifact directory'
+    require_private_benchmark_path "$artifact_dir" directory 700
+    local -r artifact_file="${artifact_dir}/benchmark.json"
+
+    OBI_JAVA_REMOTE_PARENT_BENCHMARK=1 \
+    OBI_JAVA_REMOTE_PARENT_BENCHMARK_ARTIFACT="$artifact_file" go test \
         -count=1 \
         -timeout=10m \
         -v \
@@ -121,6 +189,7 @@ run_transport_benchmark() {
 
     require_test_passed "$output_file" \
         TestJavaRemoteParentTransportBenchmark
+    require_transport_benchmark_artifact "$artifact_file"
     grep -F -- 'bridge_benchmark ' "$output_file" \
         | tee "$OUTPUT_DIR/benchmark-results.txt"
 }

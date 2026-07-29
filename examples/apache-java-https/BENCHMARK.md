@@ -40,9 +40,84 @@ warmup, duration, concurrency, JVM flags, and agent artifact.
 
 ## Procedure
 
-The included runner provides a bounded, repeatable PoC comparison with exact
-parent assertions and before/after resource evidence. Use the same request
-count, repetitions, and seed for every mode:
+The included runner provides bounded exact-parent assertions and targeted
+resource evidence. Its request count is not a sustained benchmark: use the
+dedicated harness for the comparable core cells.
+
+## Core sustained benchmark harness
+
+`scripts/benchmark.sh` runs four sequential, isolated cells:
+
+| Cell | Runtime | Transport | Correctness assertion |
+| --- | --- | --- | --- |
+| `uninstrumented` | no Java agent or OBI | disabled | no marker-correlated spans |
+| `bridge-disabled` | official Java agent, extension, and OBI | disabled | Java root span |
+| `getsockopt-hit` | official Java agent, extension, and OBI | forced `getsockopt` | exact remote parent |
+| `unix-hit` | official Java agent, extension, and OBI | forced Unix fallback | exact remote parent |
+
+For every cell, the harness first asks `run.sh` to retain a fixed 16-request
+concurrent correctness preflight and leave only that scoped Compose project
+running. It then warms the existing locked-down `benchmark` Compose client and
+runs five to ten fixed-duration closed-loop repetitions. The client uses closed
+connections, `/api/echo?delay_ms=150`, no W3C header, and a fixed seed of zero.
+The user seed applies only to the preflight and post-load tracecheck sentinel;
+it is deliberately not presented as a control for sustained traffic when W3C is
+off. The retained client result must report traffic from the requested duration
+through that duration plus a two-second cancellation-drain tolerance. The
+client's per-request contexts derive from one shared measurement deadline, so
+this small tolerance is only for scheduler and worker shutdown jitter; the
+separate 30-second command-start allowance is not measurement time. Each cell
+ends with another fixed 16-request scenario-specific correctness sentinel
+before the harness invokes `run.sh --cleanup-only` for that project.
+
+Create a private parent outside the repository for the retained artifact, then
+run the harness from the repository root:
+
+```bash
+benchmark_parent="$(mktemp -d)"
+./examples/apache-java-https/scripts/benchmark.sh \
+  --output "$benchmark_parent/core-$(date -u +%Y%m%dT%H%M%SZ)" \
+  --warmup-seconds 30 \
+  --duration-seconds 60 \
+  --concurrency 16 \
+  --repetitions 5 \
+  --seed 20260721
+```
+
+The output path must be an absolute, fresh child of an existing current-user,
+owner-private directory outside the repository. This avoids both recording
+benchmark data in a shared location and contaminating the runner's source-state
+evidence with untracked artifacts. The harness uses an owner-private
+`.runtime/benchmark.lock` and serializes all cells because they use host-network
+ports. It creates only project names in the demo's reserved Compose namespace
+and never calls raw `docker compose down`; teardown is delegated to the runner's
+ownership-checked cleanup path.
+
+Run it on a Linux host with Docker Compose v2 plus the GNU/procps/util-linux
+tools it validates at startup, including `timeout`, `setsid`, `ps`, and `sleep`.
+
+Each cell retains the runner's preflight provenance, warmup and repetition
+JSON, post-load sentinel, host environment, Docker stats and inspect records,
+`/proc` memory/fd/thread snapshots, OBI metrics when applicable, and Java
+diagnostics. A snapshot labelled `unsynchronized_midpoint` is a point sample
+while the load command is still running; it is not proof that traffic was live
+throughout the sample. The manifest includes a shell-escaped invocation for
+reproduction. `summary.json` is therefore not acceptance evidence and does not
+turn unavailable measurements into zeroes.
+
+The initial harness intentionally records these #37 dimensions as
+`not_collected`: JNI lookup percentiles, JFR/NMT allocation/native/direct-memory
+summaries, primary cgroup-sockopt program CPU, BPF map insertion failures, map
+evictions, and BPF lock contention. Do not use the repository-wide
+`scripts/bpf-metrics-sampler.sh` for this harness: it changes a host-global BPF
+statistics sysctl and is not scoped to the demo project.
+
+The four core cells are not the complete #37 matrix. Explicit primary/fallback
+miss or timeout, valid-W3C discard, and pressure cells still require separately
+measured evidence before declaring the benchmark issue complete.
+
+For focused runner iteration, use the same request count, repetitions, and
+seed for every mode:
 
 ```bash
 ./examples/apache-java-https/run.sh \
@@ -94,9 +169,9 @@ Record at minimum:
   exact-parent bridge assertions;
 - BPF map occupancy, insert failures, evictions and lock contention.
 
-The repository's `scripts/bpf-metrics-sampler.sh` and
-`scripts/bpf-metrics-summary.sh` can capture map/program resource evidence.
-Retain raw summaries and the exact command with the result artifact.
+Retain raw summaries and the exact command with the result artifact. Do not
+enable host-global BPF statistics as part of a shared benchmark host without an
+explicit host-level measurement plan.
 
 Run at least five measurement repetitions and report median plus spread. Do not
 combine primary and fallback lookup latency into one percentile. Stop the

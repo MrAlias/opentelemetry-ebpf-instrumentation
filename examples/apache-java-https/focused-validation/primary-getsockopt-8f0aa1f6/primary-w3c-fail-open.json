@@ -1,0 +1,71 @@
+{
+  "format": 1,
+  "status": "passed",
+  "transport": "getsockopt",
+  "stale": {
+    "retrieval_ttl": "1ns",
+    "status": "passed",
+    "expected_java_status": "stale",
+    "observed_java_status": "stale",
+    "obi_operations_delta": {
+      "take_stale": 1
+    },
+    "java_diagnostic_delta": {
+      "take_stale": 1
+    },
+    "w3c_parent_precedence": true,
+    "java_server_span_remote": true,
+    "tls_protocol": "TLSv1.3",
+    "http_protocol": "HTTP/1.1"
+  },
+  "stale_recovery": {
+    "status": "passed"
+  },
+  "faults": [
+    {
+      "fault_mode": "version-mismatch",
+      "expected_java_status": "version_mismatch",
+      "observed_java_status": "version_mismatch",
+      "obi_operations_delta": {
+        "take_valid": 1
+      },
+      "java_diagnostic_delta": {
+        "take_version_mismatch": 1
+      },
+      "w3c_parent_precedence": true,
+      "java_server_span_remote": true,
+      "status": "passed"
+    },
+    {
+      "fault_mode": "zero-trace-id",
+      "expected_java_status": "malformed",
+      "observed_java_status": "malformed",
+      "obi_operations_delta": {
+        "take_valid": 1
+      },
+      "java_diagnostic_delta": {
+        "take_malformed": 1
+      },
+      "w3c_parent_precedence": true,
+      "java_server_span_remote": true,
+      "status": "passed"
+    },
+    {
+      "fault_mode": "zero-span-id",
+      "expected_java_status": "malformed",
+      "observed_java_status": "malformed",
+      "obi_operations_delta": {
+        "take_valid": 1
+      },
+      "java_diagnostic_delta": {
+        "take_malformed": 1
+      },
+      "w3c_parent_precedence": true,
+      "java_server_span_remote": true,
+      "status": "passed"
+    }
+  ],
+  "fault_recovery": {
+    "status": "passed"
+  }
+}

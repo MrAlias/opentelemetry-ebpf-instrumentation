@@ -1,0 +1,58 @@
+{
+  "format": 1,
+  "status": "passed",
+  "scope": "private one-shot primary response control",
+  "cases": [
+    {
+      "mode": "version-mismatch",
+      "armed": {
+        "owner": "0:0",
+        "permissions": "0600",
+        "link_count": 1,
+        "file_type": "regular file",
+        "payload_size": 17
+      },
+      "consumed": {
+        "empty": true,
+        "owner": "0:0",
+        "permissions": "0600",
+        "link_count": 1,
+        "file_type": "regular empty file"
+      }
+    },
+    {
+      "mode": "zero-trace-id",
+      "armed": {
+        "owner": "0:0",
+        "permissions": "0600",
+        "link_count": 1,
+        "file_type": "regular file",
+        "payload_size": 14
+      },
+      "consumed": {
+        "empty": true,
+        "owner": "0:0",
+        "permissions": "0600",
+        "link_count": 1,
+        "file_type": "regular empty file"
+      }
+    },
+    {
+      "mode": "zero-span-id",
+      "armed": {
+        "owner": "0:0",
+        "permissions": "0600",
+        "link_count": 1,
+        "file_type": "regular file",
+        "payload_size": 13
+      },
+      "consumed": {
+        "empty": true,
+        "owner": "0:0",
+        "permissions": "0600",
+        "link_count": 1,
+        "file_type": "regular empty file"
+      }
+    }
+  ]
+}

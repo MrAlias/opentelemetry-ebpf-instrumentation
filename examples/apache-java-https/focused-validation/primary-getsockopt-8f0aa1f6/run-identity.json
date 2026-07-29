@@ -1,0 +1,55 @@
+{
+  "format": 1,
+  "kind": "focused-non-acceptance-validation",
+  "source": {
+    "revision": "8f0aa1f6a7a28af93875823e4cf41675221d3542",
+    "dirty": false,
+    "tree_sha256": "b2b666ac5a1bb0aa7715ff2c0fbac2455e3eba1db5810d9b75e190ed8c79c27a"
+  },
+  "environment": {
+    "architecture": "x86_64",
+    "kernel_release": "7.0.0-1009-aws",
+    "cgroup_filesystem": "cgroup2fs",
+    "vmlinux_btf": "readable",
+    "agent_distribution": "otel",
+    "agent_version": "2.28.1",
+    "agent_sha256": "faa89bdeebf9b1f52be4a4374689176717b02a59df2d8f8b6eb9aa39f9292589",
+    "java_feature_version": 21,
+    "tls_protocol": "TLSv1.3"
+  },
+  "transport_configuration": {
+    "requested": "getsockopt",
+    "selected": "getsockopt",
+    "snapshot": "java-selected-transport-configuration.txt"
+  },
+  "bridge_artifacts": {
+    "obi_java_agent_sha256": "06cd729670abb6b6fc578e6eb32ceecf6694a04859ea8308d031aee63c4cb898",
+    "obi_otel_extension_sha256": "1f9eb6a130a86aa71b5bd5145ccd47e743ebbaf774387838b01ea1e9a2789c4d"
+  },
+  "runs": [
+    {
+      "scenario": "security",
+      "invocation": "examples/apache-java-https/run.sh --transport getsockopt --scenario security --agent otel --tls TLSv1.3",
+      "status": "passed",
+      "exit_status": 0,
+      "acceptance_evidence": false,
+      "acceptance_evidence_reason": "targeted-scenario"
+    },
+    {
+      "scenario": "primary-w3c-stale",
+      "invocation": "examples/apache-java-https/run.sh --transport getsockopt --scenario primary-w3c-stale --agent otel --tls TLSv1.3",
+      "status": "passed",
+      "exit_status": 0,
+      "acceptance_evidence": false,
+      "acceptance_evidence_reason": "targeted-scenario"
+    },
+    {
+      "scenario": "primary-w3c-fault",
+      "invocation": "examples/apache-java-https/run.sh --transport getsockopt --scenario primary-w3c-fault --agent otel --tls TLSv1.3",
+      "status": "passed",
+      "exit_status": 0,
+      "acceptance_evidence": false,
+      "acceptance_evidence_reason": "targeted-scenario"
+    }
+  ]
+}

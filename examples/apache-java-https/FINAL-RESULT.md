@@ -12,6 +12,12 @@ diagnostic deltas, and checksums. The refreshed OpenTelemetry primary run also
 includes the bounded inbound-Netty fixture. Each proves only its exact matrix
 cell. Rows requiring a different transport/TLS/agent/environment combination
 remain `untested`. A row's `pass` applies only to its linked retained evidence.
+Three clean focused OpenTelemetry/`getsockopt`/TLS 1.3 runs at
+`8f0aa1f6a7a28af93875823e4cf41675221d3542` validate primary attacker
+attribution, stale retrieval, and returned-response faults. They are recorded
+in [focused validation](focused-validation/primary-getsockopt-8f0aa1f6/README.md)
+with `acceptance_evidence=false`; they are not retained acceptance evidence and
+do not change a matrix cell from `untested` to `pass`.
 
 ## Parent tracker definition-of-done reconciliation
 
@@ -29,7 +35,7 @@ evidence define the current boundary of the result.
 | 3. Java uses the official agent and OBI extension/helper | pass | [official agent metadata](evidence/otel-unix-tls12-bd1c9327/official-javaagent.json), [external-extension runtime metadata](evidence/otel-getsockopt-tls13-c9d14356/runtime-metadata.json), and [dynamic helper attach evidence](evidence/otel-getsockopt-tls13-c9d14356/README.md#retained-proof). |
 | 4. Traffic and traces are collected without a vendor UI | pass | [local receiver inventory](evidence/otel-getsockopt-tls13-c9d14356/runtime-images.json) and retained scenario JSON. |
 | 5. Apache client and Java server spans have one exact trace/parent relationship | pass | [basic trace graph](evidence/otel-getsockopt-tls13-c9d14356/scenario-basic.json). |
-| 6. Precedence, concurrency, keepalive, failure, and compatibility cases are exercised | fail | Retained controls pass precedence, concurrency, keepalive, and Unix fault cells. Unexecuted source controls cover a forced-primary Apache stale record with W3C precedence and recovery, plus VM-gated JVM-to-JNI-to-cgroup-sockopt stale, ABI-mismatch, and zero-ID records. Neither has a retained privileged artifact, and the JVM fixture is not an application/OpenTelemetry/W3C fault result; [#37 benchmark](BENCHMARK.md) and [#38 compatibility](COMPATIBILITY.md) rows remain untested. |
+| 6. Precedence, concurrency, keepalive, failure, and compatibility cases are exercised | fail | Retained controls pass precedence, concurrency, keepalive, and Unix fault cells. [Focused clean primary runs](focused-validation/primary-getsockopt-8f0aa1f6/README.md) additionally exercised a `1ns` stale retrieval with valid-W3C precedence and recovery, plus version-mismatch, zero-trace-ID, and zero-span-ID returned-response faults with valid-W3C precedence and recovery. Those runs have `acceptance_evidence=false` and are not retained matrix evidence. The VM-gated JVM-to-JNI-to-cgroup-sockopt fixture still lacks a privileged artifact; [#37 benchmark](BENCHMARK.md) and [#38 compatibility](COMPATIBILITY.md) rows remain untested. |
 | 7. Exact build, run, certificate, host, agent, and cleanup steps are documented | pass | [reproducible runbook](README.md), including the bounded [deliberate assertion failure](README.md#deliberate-assertion-failure-control), and retained environment/certificate evidence. |
 
 | Acceptance item | Status | Evidence or remaining requirement |
@@ -89,8 +95,10 @@ and is intended for the RHEL kernel VM workflow. It calls
 `RemoteParentBridge.takeRemoteParent()` directly and manually stages BPF state;
 therefore it is source-level bridge/provider coverage, not a retained Apache,
 OpenTelemetry extraction, or W3C precedence acceptance result. A successful
-privileged run and its artifact, plus an application-level primary fault
-control, remain required before this record can claim those outcomes.
+privileged run and retained artifact remain required for this fixture.
+Separately, the [focused application-level primary control](focused-validation/primary-getsockopt-8f0aa1f6/README.md)
+at `8f0aa1f6` passed stale, version-mismatch, and zero-ID cases with W3C
+precedence and recovery, but is targeted non-acceptance output.
 
 ## Reproduction commands
 
@@ -129,11 +137,11 @@ column.
 | #33 final report | definition-of-done reconciliation names every parent item and the currently passing evidence | resolve the parent item 6 gaps before declaring PoC success |
 | #34 stress | retained TLS 1.3 and TLS 1.2 primary, and TLS 1.2 Unix stress, reuse, TLS-boundary-fixture, pressure, cleanup, and recovery cases passed | execute remaining advertised cells |
 | #35 handoff | executor, virtual-thread, Netty worker, redispatch, and bounded inbound-Netty receive-to-extraction scenarios passed in the retained primary run | execute the remaining framework and environment matrix evidence |
-| #36 fail-open | retained primary and Unix absence, restart, attach, disabled, fault, and recovery controls passed; unexecuted source controls cover a forced-primary Apache stale/W3C/recovery path and VM-gated stale, ABI-mismatch, and zero-ID component cases | retain a successful privileged artifact and a JVM/application primary-transport malformed fault control; the existing fault responder is Unix-only |
+| #36 fail-open | retained primary and Unix absence, restart, attach, disabled, fault, and recovery controls passed; [focused current primary evidence](focused-validation/primary-getsockopt-8f0aa1f6/README.md) also covers stale/W3C/recovery and version/zero-ID fail-open responses | retain a clean full primary artifact, the VM-gated component artifact, and remaining primary fault classes before promoting targeted controls to acceptance evidence |
 | #37 benchmark | predeclared matrix, repeated bounded workload, and resource/map snapshots | execute on fixed hardware and add sustained latency/throughput evidence |
 | #38 compatibility | explicit untested matrix | execute each claimed kernel/cgroup/architecture/JVM/agent/TLS/transport cell |
 | #39 diagnostics | retained OpenTelemetry and Splunk per-scenario counters, current availability schema, V2 snapshots, and suppression evidence passed | execute remaining agent/environment cells |
-| #40 security | retained Unix forged/flood/path/permission matrix, exact-parent victim, and recovery passed; retained primary attacker observations predate isolated metric windows; unexecuted source controls encode stale TTL rejection at Apache and primary-component boundaries | retain current isolated primary attacker, wrong-live-socket, and stale-TTL evidence before marking the partial security matrix complete |
+| #40 security | retained Unix forged/flood/path/permission matrix, exact-parent victim, and recovery passed; [focused current primary evidence](focused-validation/primary-getsockopt-8f0aa1f6/README.md) covers isolated same-cgroup and sibling abuse windows, a legitimate victim, recovery, and stale TTL rejection | retain wrong-live-socket evidence, Unix same-cgroup/sibling topology and stale-state evidence, and any full-cell artifact needed for the final support statement |
 
 Unexecuted rows remain `untested`; a plan or template is not a successful
 validation result.

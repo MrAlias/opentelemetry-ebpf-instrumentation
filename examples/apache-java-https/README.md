@@ -502,6 +502,10 @@ pre-restart snapshot from satisfying the gate.
 A dirty source tree, `--skip-bridge-build`, or an individually targeted
 scenario is explicitly labeled non-acceptance evidence. Only a clean full
 `all` run is eligible to populate the result matrices.
+The clean focused primary-control record is retained separately in
+[focused-validation/primary-getsockopt-8f0aa1f6](focused-validation/primary-getsockopt-8f0aa1f6/README.md)
+so its isolation and fail-open outcomes can be reviewed without being promoted
+to an acceptance cell.
 
 ## Diagnostics
 

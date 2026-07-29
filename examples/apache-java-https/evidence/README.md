@@ -35,4 +35,5 @@ their historical schema.
 
 An omitted matrix cell remains `untested`. A targeted run whose
 `acceptance_evidence` field is false is not retained here as acceptance
-evidence.
+evidence. The separate [focused primary-control record](../focused-validation/primary-getsockopt-8f0aa1f6/README.md)
+contains such current targeted validation and states its non-acceptance scope.

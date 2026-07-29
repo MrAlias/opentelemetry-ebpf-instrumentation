@@ -1,0 +1,51 @@
+{
+  "format": 1,
+  "status": "passed",
+  "transport": "getsockopt",
+  "verification": "isolated unauthorized-operation metric deltas",
+  "sibling": {
+    "topology": "separate sibling container with isolated network and PID namespaces and a distinct cgroup",
+    "probe_status": "unverified",
+    "attempts": 2866,
+    "case_outcomes": {
+      "standard_option": "preserved",
+      "unrelated_name": "not-intercepted",
+      "unrelated_level": "not-intercepted",
+      "wrong_process_negotiation": "native-unsupported",
+      "retrieval_sizes": "bounded",
+      "repeated_retrieval": "native-unsupported"
+    },
+    "metric_delta": {
+      "negotiate_unauthorized": 1,
+      "take_unauthorized": 2411
+    }
+  },
+  "same_cgroup": {
+    "topology": "unprivileged process in the Java backend container's cgroup",
+    "uid_gid": "65534:65534",
+    "cgroup_match": true,
+    "probe_status": "unverified",
+    "attempts": 33262,
+    "case_outcomes": {
+      "standard_option": "preserved",
+      "unrelated_name": "not-intercepted",
+      "unrelated_level": "not-intercepted",
+      "wrong_process_negotiation": "native-unsupported",
+      "retrieval_sizes": "bounded",
+      "repeated_retrieval": "native-unsupported"
+    },
+    "metric_delta": {
+      "negotiate_unauthorized": 1,
+      "take_unauthorized": 2974
+    }
+  },
+  "legitimate_victim": {
+    "status": "passed",
+    "request_count": 16,
+    "concurrent_unauthorized_take_delta": 26913,
+    "assertion": "exact parent remained available to the legitimate request"
+  },
+  "post_abuse_recovery": {
+    "status": "passed"
+  }
+}

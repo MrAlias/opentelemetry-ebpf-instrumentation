@@ -3,7 +3,7 @@
 - Status: accepted for proof of concept
 - Scope: Apache/OpenSSL outbound HTTPS to auto-instrumented Jetty and bounded
   inbound-Netty fixtures
-- Last updated: 2026-07-28
+- Last updated: 2026-07-29
 
 ## Decision
 
@@ -62,6 +62,27 @@ forking the upstream agent or requiring a proprietary backend.
   context-consumption attacks.
 - **Use request markers as a correlation key:** useful for test selection, but
   unsafe and semantically wrong as a production bridge identity.
+
+## Validation and residual risk
+
+Focused clean primary runs at `8f0aa1f6` exercised stale retrieval and
+version/zero-ID returned-response faults while preserving a valid W3C parent
+and post-fault recovery. They also exercised same-cgroup and isolated-sibling
+callers. These runs are explicitly non-acceptance validation and do not imply
+support beyond their tested OpenTelemetry/`getsockopt`/TLS 1.3 environment.
+
+The primary hook deliberately preserves the native `getsockopt` result after
+recording an unauthorized operation. Consequently, a raw attacker probe's
+`native-unsupported` result is not a denial proof; the focused control proves
+only isolated unauthorized metric attribution, a healthy legitimate victim,
+and recovery.
+
+An instrumented JVM that is fully compromised acts with that JVM's identity
+and can misuse contexts available to it. The Unix socket group is also an
+availability trust boundary: authorized peers can cause temporary `overload`
+even though they cannot consume another staged parent. Production support
+requires explicit namespace, endpoint-ownership, and log/metric-access policy,
+plus completion of the remaining matrix.
 
 ## Consequences
 

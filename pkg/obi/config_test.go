@@ -554,6 +554,7 @@ javaagent:
     socket_group_id: 1234
     timeout: 7ms
     ttl: 45s
+    retrieval_ttl: 9ms
 `))
 	require.NoError(t, err)
 	assert.Equal(t, JavaRemoteParentUnix, cfg.Java.RemoteParent.Transport)
@@ -561,13 +562,24 @@ javaagent:
 	assert.Equal(t, 1234, cfg.Java.RemoteParent.SocketGroupID)
 	assert.Equal(t, 7*time.Millisecond, cfg.Java.RemoteParent.Timeout)
 	assert.Equal(t, 45*time.Second, cfg.Java.RemoteParent.TTL)
+	assert.Equal(t, 9*time.Millisecond, cfg.Java.RemoteParent.RetrievalTTL)
+	assert.Equal(t, 9*time.Millisecond, cfg.Java.RemoteParent.EffectiveRetrievalTTL())
 
 	t.Setenv("OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT", "getsockopt")
 	t.Setenv("OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_PATH", "/run/obi/env.sock")
+	t.Setenv("OTEL_EBPF_JAVA_REMOTE_PARENT_RETRIEVAL_TTL", "1ns")
 	cfg, err = LoadConfig(bytes.NewReader(nil))
 	require.NoError(t, err)
 	assert.Equal(t, JavaRemoteParentGetsockopt, cfg.Java.RemoteParent.Transport)
 	assert.Equal(t, "/run/obi/env.sock", cfg.Java.RemoteParent.SocketPath)
+	assert.Equal(t, time.Nanosecond, cfg.Java.RemoteParent.RetrievalTTL)
+	assert.Equal(t, time.Nanosecond, cfg.Java.RemoteParent.EffectiveRetrievalTTL())
+
+	t.Setenv("OTEL_EBPF_JAVA_REMOTE_PARENT_RETRIEVAL_TTL", "0s")
+	cfg, err = LoadConfig(bytes.NewReader(nil))
+	require.NoError(t, err)
+	assert.Zero(t, cfg.Java.RemoteParent.RetrievalTTL)
+	assert.Equal(t, cfg.Java.RemoteParent.TTL, cfg.Java.RemoteParent.EffectiveRetrievalTTL())
 }
 
 func TestConfigValidate_JavaRemoteParent(t *testing.T) {
@@ -585,12 +597,14 @@ javaagent:
 	require.NoError(t, cfg.Validate())
 
 	tests := map[string]string{
-		"transport":   "transport: invalid",
-		"socket path": "transport: unix\n    socket_path: relative.sock",
-		"timeout":     "transport: unix\n    timeout: 0s",
-		"timeout max": "transport: unix\n    timeout: 2147483648ms",
-		"socket gid":  "transport: unix\n    socket_group_id: -2",
-		"ttl":         "transport: unix\n    ttl: 0s",
+		"transport":                       "transport: invalid",
+		"socket path":                     "transport: unix\n    socket_path: relative.sock",
+		"timeout":                         "transport: unix\n    timeout: 0s",
+		"timeout max":                     "transport: unix\n    timeout: 2147483648ms",
+		"socket gid":                      "transport: unix\n    socket_group_id: -2",
+		"ttl":                             "transport: unix\n    ttl: 0s",
+		"retrieval ttl":                   "transport: unix\n    retrieval_ttl: -1s",
+		"retrieval ttl exceeds retention": "transport: unix\n    ttl: 1s\n    retrieval_ttl: 2s",
 	}
 
 	for name, remoteParent := range tests {

@@ -314,6 +314,27 @@ func TestCustomMapper(t *testing.T) {
 	})
 }
 
+func TestJavaRemoteParentRetrievalTTLSchema(t *testing.T) {
+	g := NewSchemaGenerator()
+	reflector := &jsonschema.Reflector{
+		RequiredFromJSONSchemaTags: true,
+		AllowAdditionalProperties:  true,
+		ExpandedStruct:             true,
+		FieldNameTag:               "yaml",
+		Mapper:                     g.customMapper(),
+	}
+	schema := reflector.Reflect(&obi.Config{})
+
+	remoteParent, ok := schema.Definitions["JavaRemoteParentConfig"]
+	require.True(t, ok)
+	retrievalTTL, ok := remoteParent.Properties.Get("retrieval_ttl")
+	require.True(t, ok)
+
+	assert.Equal(t, "^[0-9]+(ns|ms|s|m)$", retrievalTTL.Pattern)
+	assert.Contains(t, retrievalTTL.Examples, "1ns")
+	assert.Regexp(t, retrievalTTL.Pattern, "1ns")
+}
+
 func TestExtractEnums(t *testing.T) {
 	g := NewSchemaGenerator()
 

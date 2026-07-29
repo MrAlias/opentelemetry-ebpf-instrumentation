@@ -190,6 +190,7 @@ func TestTracerJavaRemoteParentSpecSelection(t *testing.T) {
 
 	autoConfig := unixConfig
 	autoConfig.Java.RemoteParent.Transport = obi.JavaRemoteParentAuto
+	autoConfig.Java.RemoteParent.RetrievalTTL = time.Nanosecond
 	autoTracer := New(&autoConfig, nil)
 	autoTracer.haveSockOpsNetnsCookie = func() error { return nil }
 	autoBundles, err := autoTracer.LoadSpecs()
@@ -201,7 +202,8 @@ func TestTracerJavaRemoteParentSpecSelection(t *testing.T) {
 	assert.False(t, autoTracer.javaRemoteParentLoaded)
 
 	constants := autoTracer.javaRemoteParentConstants()
-	assert.Equal(t, uint64(autoConfig.Java.RemoteParent.TTL.Nanoseconds()), constants["java_remote_parent_max_age_ns"])
+	assert.Equal(t, uint64(time.Nanosecond), constants["java_remote_parent_max_age_ns"])
+	assert.Equal(t, uint64(autoConfig.Java.RemoteParent.TTL.Nanoseconds()), autoTracer.constants()["ssl_prewrite_max_age_ns"])
 	assert.Equal(t, int32(1), constants["filter_pids"])
 	assert.Equal(t, true, constants["java_remote_parent_enabled"])
 	assert.Contains(t, constants, "g_bpf_debug")

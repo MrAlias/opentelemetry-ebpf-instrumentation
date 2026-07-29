@@ -13,6 +13,7 @@ MAX_UINT64_DECIMAL="18446744073709551615"
 JAVA_DIAGNOSTIC_COUNTER_MAX="999999999"
 BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS=35
 JAVA_PROVIDER_RETRY_SETTLE_SECONDS=2
+PRIMARY_W3C_STALE_RETRIEVAL_TTL="1ns"
 JAVA_ATTACH_FAILURE_QUIET_SAMPLES=15
 DELAYED_OTLP_SCHEDULE_DELAY_SECONDS=60
 DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS="$((DELAYED_OTLP_SCHEDULE_DELAY_SECONDS * 1000))"
@@ -65,6 +66,7 @@ readonly SCRIPT_DIR REPO_ROOT SCRIPT_NAME MAX_SHELL_INTEGER MAX_UINT32_DECIMAL
 readonly MAX_UINT64_DECIMAL JAVA_DIAGNOSTIC_COUNTER_MAX
 readonly BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS SCENARIO_RUN_TIMEOUT_SECONDS
 readonly JAVA_PROVIDER_RETRY_SETTLE_SECONDS
+readonly PRIMARY_W3C_STALE_RETRIEVAL_TTL
 readonly JAVA_ATTACH_FAILURE_QUIET_SAMPLES
 readonly DELAYED_OTLP_SCHEDULE_DELAY_SECONDS
 readonly DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS
@@ -104,6 +106,8 @@ COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 PROJECT_NAME="${COMPOSE_PROJECT_NAME:-$PROJECT_NAMESPACE}"
 
 TRANSPORT="getsockopt"
+REMOTE_PARENT_TTL="30s"
+REMOTE_PARENT_RETRIEVAL_TTL="0s"
 AGENT_DISTRIBUTION="otel"
 TLS_PROTOCOL="TLSv1.3"
 SCENARIO="all"
@@ -192,7 +196,7 @@ Options:
                           connection-churn, fd-port-reuse, slow-body, tls-boundary,
                           timeout-retry,
                           pressure, handoff, virtual-thread, netty, netty-server, dispatch,
-                          w3c, w3c-match, obi-flags, w3c-fault, w3c-only,
+                          w3c, w3c-match, obi-flags, w3c-fault, primary-w3c-stale, w3c-only,
                           security, restart-fault, helper-attach-failure,
                           delayed-otlp-suppression, assertion-failure, fail-open,
                           restart, disabled, or uninstrumented.
@@ -213,7 +217,8 @@ The all scenario runs basic, keepalive, HTTP/1.1 pipelining, concurrency,
 connection churn, fd/ephemeral-port reuse, slow-body, deterministic TLS receive
 boundaries, timeout/retry, pressure,
 executor/virtual-thread/Netty handoff, inbound Netty TLS, async redispatch, W3C
-precedence/match/flags/fault/no-state controls, late attach, OBI restart during
+precedence/match/flags/fault/no-state controls, the primary stale-record control,
+late attach, OBI restart during
 traffic, helper attach failure, bounded primary or fallback transport abuse
 controls, delayed first-OTLP suppression, Unix endpoint replacement when that transport is selected,
 bridge/extension-disabled, extension-absent, and uninstrumented controls.
@@ -376,7 +381,7 @@ parse_args() {
       ;;
   esac
   case "$SCENARIO" in
-    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|timeout-retry|pressure|handoff|virtual-thread|netty|netty-server|dispatch|w3c|w3c-match|obi-flags|w3c-fault|w3c-only|security|restart-fault|helper-attach-failure|delayed-otlp-suppression|assertion-failure|fail-open|restart|disabled|uninstrumented)
+    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|timeout-retry|pressure|handoff|virtual-thread|netty|netty-server|dispatch|w3c|w3c-match|obi-flags|w3c-fault|primary-w3c-stale|w3c-only|security|restart-fault|helper-attach-failure|delayed-otlp-suppression|assertion-failure|fail-open|restart|disabled|uninstrumented)
       ;;
     *)
       die "unsupported scenario: $SCENARIO"
@@ -410,6 +415,12 @@ parse_args() {
   fi
   if [[ "$SCENARIO" == "w3c-fault" && "$REQUEST_COUNT" != "0" && "$REQUEST_COUNT" != "2" ]]; then
     die "the w3c-fault scenario requires exactly two requests"
+  fi
+  if [[ "$SCENARIO" == "primary-w3c-stale" && "$TRANSPORT" != "getsockopt" ]]; then
+    die "the primary-w3c-stale scenario requires --transport getsockopt"
+  fi
+  if [[ "$SCENARIO" == "primary-w3c-stale" && "$REQUEST_COUNT" != "0" && "$REQUEST_COUNT" != "1" ]]; then
+    die "the primary-w3c-stale scenario requires exactly one request"
   fi
   if [[ ( "$SCENARIO" == "keepalive" || "$SCENARIO" == "pipelining" ) &&
     "$REQUEST_COUNT" != "0" && "$REQUEST_COUNT" -lt 3 ]]; then
@@ -1051,6 +1062,8 @@ export_compose_environment() {
     export SECURITY_PROBE_TIMEOUT
   fi
   export BRIDGE_TRANSPORT="$TRANSPORT"
+  export REMOTE_PARENT_TTL
+  export REMOTE_PARENT_RETRIEVAL_TTL
   export BACKEND_TLS_PROTOCOL="$TLS_PROTOCOL"
   CONTEXT_PROPAGATION="tcp"
   export CONTEXT_PROPAGATION
@@ -2568,6 +2581,9 @@ scenario_request_count() {
     w3c|obi-flags|w3c-fault)
       printf '2\n'
       ;;
+    primary-w3c-stale)
+      printf '1\n'
+      ;;
     *)
       printf '1\n'
       ;;
@@ -3574,6 +3590,7 @@ run_scenario() {
   local expected_bridge_lifecycle=0
   local expected_bridge_stage=0
   local expected_bridge_missing=0
+  local expected_bridge_stale=0
   local include_ambiguous_candidates=false
   local expected_java_missing=0
   local pressure_hits=0
@@ -3652,11 +3669,16 @@ run_scenario() {
     expected_bridge_valid="$expected_requests"
     expected_bridge_lifecycle="$expected_requests"
     expected_bridge_stage="$expected_requests"
+    expected_bridge_stale=0
     include_ambiguous_candidates=false
     if [[ "$retrieval_mode" == "helper-unavailable" ]]; then
       expected_bridge_valid=0
       expected_bridge_stage=0
       include_ambiguous_candidates=true
+    fi
+    if [[ "$name" == "primary-w3c-stale" ]]; then
+      expected_bridge_valid=0
+      expected_bridge_stale="$expected_requests"
     fi
     expected_bridge_missing="$baseline_bridge_missing"
     expected_java_missing="$baseline_java_missing"
@@ -3695,6 +3717,10 @@ run_scenario() {
     fi
     if [[ "$retrieval_mode" == "helper-unavailable" ]]; then
       if ! flush_bridge_metric_boundary "$label" 0 0; then
+        metric_status=1
+      fi
+    elif [[ "$name" == "primary-w3c-stale" ]]; then
+      if ! flush_bridge_metric_boundary "$label" 0 1; then
         metric_status=1
       fi
     elif ! flush_bridge_metric_boundary "$label"; then
@@ -3811,7 +3837,7 @@ run_scenario() {
         metric_status=1
       fi
     fi
-    if [[ "$retrieval_mode" == "normal" ]]; then
+    if [[ "$retrieval_mode" == "normal" && "$name" != "primary-w3c-stale" ]]; then
       expected_bridge_lifecycle="$expected_bridge_valid"
       expected_bridge_stage="$expected_bridge_valid"
     fi
@@ -3894,7 +3920,8 @@ run_scenario() {
         "$expected_bridge_missing" \
         "$expected_bridge_lifecycle" \
         "$expected_bridge_stage" \
-        "$include_ambiguous_candidates"; then
+        "$include_ambiguous_candidates" \
+        "$expected_bridge_stale"; then
         metric_status=1
       fi
     fi
@@ -3925,6 +3952,9 @@ run_scenario() {
           obi-flags)
             expected_sampled="$((expected_requests / 2))"
             expected_unsampled="$(((expected_requests + 1) / 2))"
+            ;;
+          primary-w3c-stale)
+            expected_stale="$expected_requests"
             ;;
         esac
         if [[ "$name" == "pressure" && \
@@ -5258,6 +5288,47 @@ run_w3c_fault_control() {
   recreate_instrumented_stack "tcp" "post-fault bridge recovery"
 }
 
+run_primary_w3c_stale_control() {
+  local -r original_retrieval_ttl="$REMOTE_PARENT_RETRIEVAL_TTL"
+  local control_status=0
+  local recovery_status=0
+
+  [[ "$TRANSPORT" == "getsockopt" && "$SELECTED_TRANSPORT" == "getsockopt" ]] || {
+    log_error "the primary W3C stale control requires forced getsockopt transport"
+    return 1
+  }
+
+  log_info "recreating the forced primary bridge with retrieval TTL=$PRIMARY_W3C_STALE_RETRIEVAL_TTL"
+  REMOTE_PARENT_RETRIEVAL_TTL="$PRIMARY_W3C_STALE_RETRIEVAL_TTL"
+  export REMOTE_PARENT_RETRIEVAL_TTL
+  if recreate_instrumented_stack "tcp" "primary W3C stale preparation" getsockopt; then
+    if run_scenario primary-w3c-stale; then
+      :
+    else
+      control_status=$?
+    fi
+  else
+    control_status=$?
+  fi
+
+  REMOTE_PARENT_RETRIEVAL_TTL="$original_retrieval_ttl"
+  export REMOTE_PARENT_RETRIEVAL_TTL
+  if recreate_instrumented_stack "tcp" "post-primary W3C stale recovery" getsockopt; then
+    if SCENARIO_VARIANT="primary-w3c-stale-recovery" run_scenario basic; then
+      :
+    else
+      recovery_status=$?
+    fi
+  else
+    recovery_status=$?
+  fi
+
+  if ((control_status != 0)); then
+    return "$control_status"
+  fi
+  return "$recovery_status"
+}
+
 extract_java_diagnostics_header() {
   local -r headers="$1"
   local -r output="$2"
@@ -6168,6 +6239,12 @@ execute_requested_scenarios() {
       run_scenario w3c
       run_w3c_match_control
       run_scenario obi-flags
+      if [[ "$TRANSPORT" == "getsockopt" && "$SELECTED_TRANSPORT" == "getsockopt" ]]; then
+        run_primary_w3c_stale_control
+      else
+        record_unsupported_scenario \
+          primary-w3c-stale "requires forced getsockopt transport"
+      fi
       if [[ "$TRANSPORT" == "unix" ]]; then
         run_w3c_fault_control
       else
@@ -6230,6 +6307,9 @@ execute_requested_scenarios() {
       ;;
     w3c-fault)
       run_w3c_fault_control
+      ;;
+    primary-w3c-stale)
+      run_primary_w3c_stale_control
       ;;
     security)
       run_security_control
@@ -6853,6 +6933,7 @@ assert_bridge_metric_delta() {
   local -r expected_upstream="${6:-$expected_takes}"
   local -r expected_stage="${7:-$expected_upstream}"
   local -r include_ambiguous_candidates="${8:-false}"
+  local -r expected_stale="${9:-0}"
 
   [[ "$include_ambiguous_candidates" == "true" || \
     "$include_ambiguous_candidates" == "false" ]] || return 1
@@ -6864,6 +6945,7 @@ assert_bridge_metric_delta() {
     -v wanted_missing="$expected_missing" \
     -v wanted_upstream="$expected_upstream" \
     -v wanted_stage="$expected_stage" \
+    -v wanted_stale="$expected_stale" \
     -v include_ambiguous_candidates="$include_ambiguous_candidates" \
     -v allow_primary_security="$ALLOW_PRIMARY_SECURITY_METRICS" \
     -v allow_unix_security="$ALLOW_UNIX_SECURITY_METRICS" '
@@ -6904,6 +6986,8 @@ assert_bridge_metric_delta() {
           }
         } else if (transport == selected && operation == "take" && status == "missing") {
           missing += delta
+        } else if (transport == selected && operation == "take" && status == "stale") {
+          stale += delta
         } else if (delta != 0 && !security_allowed) {
           printf "unexpected bridge retrieval result: %s\n", $0 > "/dev/stderr"
           failed = 1
@@ -6943,11 +7027,12 @@ assert_bridge_metric_delta() {
       }
       if (candidate_total != wanted_upstream || injections != wanted_upstream ||
           stages != wanted_stage ||
-          takes != wanted_takes || discards != wanted_discards || missing != wanted_missing) {
-        printf "expected lifecycle=%d/%d/%d %s take/valid=%d discard/valid=%d take/missing=%d, got candidate-valid=%d candidate-ambiguous=%d inject=%d stage=%d take=%d discard=%d missing=%d\n",
+          takes != wanted_takes || discards != wanted_discards || missing != wanted_missing ||
+          stale != wanted_stale) {
+        printf "expected lifecycle=%d/%d/%d %s take/valid=%d discard/valid=%d take/missing=%d take/stale=%d, got candidate-valid=%d candidate-ambiguous=%d inject=%d stage=%d take=%d discard=%d missing=%d stale=%d\n",
           wanted_upstream, wanted_upstream, wanted_stage, selected,
-          wanted_takes, wanted_discards, wanted_missing,
-          candidates, ambiguous_candidates, injections, stages, takes, discards, missing > "/dev/stderr"
+          wanted_takes, wanted_discards, wanted_missing, wanted_stale,
+          candidates, ambiguous_candidates, injections, stages, takes, discards, missing, stale > "/dev/stderr"
         failed = 1
       }
       exit failed ? 1 : 0

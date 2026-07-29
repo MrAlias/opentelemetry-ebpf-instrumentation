@@ -972,7 +972,7 @@ test_benchmark_controls_are_bounded() {
 
 test_all_suite_includes_every_scenario() {
   local -r actual="$TEST_TMP_DIR/all-scenarios.txt"
-  local -r expected=$'basic\nbasic\nsecurity\nkeepalive\npipelining\nconcurrency\nconnection-churn\nfd-port-reuse\nslow-body\ntls-boundary\ntimeout-retry\npressure\nhandoff\nvirtual-thread\nnetty\nnetty-server\ndispatch\nw3c\nw3c-match\nobi-flags\nfail-open\nw3c-only\nrestart\nrestart-fault\nhelper-attach-failure\ndisabled\nw3c-only\nw3c-only\nuninstrumented'
+  local -r expected=$'basic\nbasic\nsecurity\nkeepalive\npipelining\nconcurrency\nconnection-churn\nfd-port-reuse\nslow-body\ntls-boundary\ntimeout-retry\npressure\nhandoff\nvirtual-thread\nnetty\nnetty-server\ndispatch\nw3c\nw3c-match\nobi-flags\nprimary-w3c-stale\nbasic\nfail-open\nw3c-only\nrestart\nrestart-fault\nhelper-attach-failure\ndisabled\nw3c-only\nw3c-only\nuninstrumented'
 
   (
     SCENARIO=all
@@ -987,6 +987,10 @@ test_all_suite_includes_every_scenario() {
     }
     run_w3c_match_control() {
       run_scenario w3c-match
+    }
+    run_primary_w3c_stale_control() {
+      run_scenario primary-w3c-stale
+      run_scenario basic
     }
     record_unsupported_scenario() {
       return 0
@@ -1034,6 +1038,9 @@ test_unix_all_suite_includes_fault_control() {
     }
     run_w3c_match_control() {
       run_scenario w3c-match
+    }
+    record_unsupported_scenario() {
+      return 0
     }
     run_w3c_fault_control() {
       run_scenario w3c-fault
@@ -1267,6 +1274,138 @@ test_w3c_fault_requires_forced_unix() {
     printf 'accepted an invalid W3C fault request count\n' >&2
     return 1
   fi
+}
+
+test_primary_w3c_stale_requires_forced_primary() {
+  (
+    TRANSPORT=getsockopt
+    SCENARIO=all
+    REQUEST_COUNT=0
+    parse_args --transport getsockopt --scenario primary-w3c-stale --requests 1
+    [[ "$TRANSPORT" == "getsockopt" && "$SCENARIO" == "primary-w3c-stale" && \
+      "$REQUEST_COUNT" == "1" ]]
+  ) || {
+    printf 'rejected the forced-primary stale control\n' >&2
+    return 1
+  }
+  if (
+    TRANSPORT=getsockopt
+    SCENARIO=all
+    REQUEST_COUNT=0
+    parse_args --transport unix --scenario primary-w3c-stale
+  ) >/dev/null 2>&1; then
+    printf 'accepted the primary stale control without forced getsockopt\n' >&2
+    return 1
+  fi
+  if (
+    TRANSPORT=getsockopt
+    SCENARIO=all
+    REQUEST_COUNT=0
+    parse_args --transport getsockopt --scenario primary-w3c-stale --requests 2
+  ) >/dev/null 2>&1; then
+    printf 'accepted the primary stale control with multiple requests\n' >&2
+    return 1
+  fi
+}
+
+test_primary_w3c_stale_control_restores_the_normal_ttls() {
+  local -r observed="$TEST_TMP_DIR/primary-w3c-stale-control.calls"
+
+  (
+    TRANSPORT=getsockopt
+    SELECTED_TRANSPORT=getsockopt
+    REMOTE_PARENT_TTL=30s
+    REMOTE_PARENT_RETRIEVAL_TTL=0s
+    SCENARIO_VARIANT=existing-variant
+    : >"$observed"
+    recreate_instrumented_stack() {
+      printf 'recreate:%s:%s:retention_ttl=%s:retrieval_ttl=%s\n' \
+        "$2" "$3" "$REMOTE_PARENT_TTL" "$REMOTE_PARENT_RETRIEVAL_TTL" >>"$observed"
+    }
+    run_scenario() {
+      printf 'scenario:%s:%s:retention_ttl=%s:retrieval_ttl=%s\n' \
+        "$1" "$SCENARIO_VARIANT" "$REMOTE_PARENT_TTL" "$REMOTE_PARENT_RETRIEVAL_TTL" >>"$observed"
+    }
+
+    run_primary_w3c_stale_control
+    [[ "$REMOTE_PARENT_TTL" == "30s" && "$REMOTE_PARENT_RETRIEVAL_TTL" == "0s" && \
+      "$SCENARIO_VARIANT" == "existing-variant" ]]
+  ) || {
+    printf 'primary stale control did not restore its caller state\n' >&2
+    return 1
+  }
+
+  local -r expected=$'recreate:primary W3C stale preparation:getsockopt:retention_ttl=30s:retrieval_ttl=1ns\nscenario:primary-w3c-stale:existing-variant:retention_ttl=30s:retrieval_ttl=1ns\nrecreate:post-primary W3C stale recovery:getsockopt:retention_ttl=30s:retrieval_ttl=0s\nscenario:basic:primary-w3c-stale-recovery:retention_ttl=30s:retrieval_ttl=0s'
+  [[ "$(<"$observed")" == "$expected" ]] || {
+    printf 'primary stale control lifecycle changed:\n%s\n' "$(<"$observed")" >&2
+    return 1
+  }
+}
+
+test_primary_w3c_stale_scenario_accounts_for_the_stale_take() {
+  local -r calls="$TEST_TMP_DIR/primary-w3c-stale-scenario.calls"
+
+  (
+    RESULT_DIR="$TEST_TMP_DIR/primary-w3c-stale-scenario"
+    mkdir -p -- "$RESULT_DIR"
+    : >"$calls"
+    BRIDGE_RUNNING=true
+    COMPOSE=(docker compose)
+    REPEAT_COUNT=1
+    REQUEST_COUNT=0
+    SCENARIO_SEED=1
+    SCENARIO_VARIANT=""
+    SELECTED_TRANSPORT=getsockopt
+    TLS_PROTOCOL=TLSv1.3
+    flush_bridge_metric_boundary() {
+      printf 'boundary:%s:%s:%s\n' "$1" "${2:-1}" "${3:-1}" >>"$calls"
+    }
+    capture_java_diagnostics() {
+      printf 'diagnostics:%s\n' "$1" >>"$calls"
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+      printf 'fixture\n' >"$RESULT_DIR/phases/$1/java-diagnostics.txt"
+    }
+    capture_phase_evidence() {
+      printf 'evidence:%s\n' "$1" >>"$calls"
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+      printf '%s\n' \
+        'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 10' \
+        'obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} 20' \
+        >"$RESULT_DIR/phases/$1/obi-metrics.prom"
+    }
+    run_bounded() {
+      printf 'scenario\n' >>"$calls"
+      printf '{"status":"passed"}\n'
+    }
+    wait_for_bridge_metrics_quiescent() {
+      printf 'wait:%s:%s\n' "$1" "$2" >>"$calls"
+    }
+    write_metrics_delta() { : >"$3"; }
+    assert_bridge_metric_delta() {
+      printf 'bridge:%s:%s:%s:%s:%s:%s:%s:%s\n' \
+        "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" >>"$calls"
+      [[ "$2" == "getsockopt" && "$3" == "0" && "$4" == "0" && \
+        "$5" == "0" && "$6" == "1" && "$7" == "1" && \
+        "$8" == "false" && "$9" == "1" ]]
+    }
+    write_java_diagnostics_delta() { : >"$3"; }
+    assert_java_diagnostics_delta() {
+      printf 'java:%s:%s:%s:%s:%s:%s:%s\n' \
+        "$2" "$3" "$4" "$5" "$6" "$7" "$8" >>"$calls"
+      [[ "$2" == "0" && "$3" == "1" && "$4" == "0" && \
+        "$5" == "1" && "$6" == "0" && "$7" == "0" && "$8" == "0" ]]
+    }
+
+    run_scenario primary-w3c-stale >/dev/null
+  ) || {
+    printf 'primary stale scenario did not keep stale accounting exact\n' >&2
+    return 1
+  }
+
+  grep -Fqx 'boundary:primary-w3c-stale:0:1' "$calls"
+  grep -Fqx 'wait:10:21' "$calls"
+  grep -Fqx 'bridge:getsockopt:0:0:0:1:1:false:1' "$calls"
+  grep -Fqx 'java:0:1:0:1:0:0:0' "$calls"
 }
 
 test_security_accepts_enabled_transports() {
@@ -3846,6 +3985,7 @@ obi_java_remote_parent_operations_total{operation="negotiate",status="missing",t
 obi_java_remote_parent_operations_total{operation="discard",status="valid",transport="getsockopt"} before=1 after=1 delta=0
 obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} before=3 after=5 delta=2
 obi_java_remote_parent_operations_total{operation="take",status="missing",transport="getsockopt"} before=0 after=0 delta=0
+obi_java_remote_parent_operations_total{operation="take",status="stale",transport="getsockopt"} before=0 after=0 delta=0
 EOF
   assert_bridge_metric_delta "$delta" getsockopt 2 0 || {
     printf 'bridge metric delta rejected exact one-shot results\n' >&2
@@ -3868,6 +4008,16 @@ EOF
   }
 
   sed -i 's/status="missing",transport="getsockopt"} before=0 after=1 delta=1/status="missing",transport="getsockopt"} before=0 after=0 delta=0/' "$delta"
+  sed -i 's/status="stale",transport="getsockopt"} before=0 after=0 delta=0/status="stale",transport="getsockopt"} before=0 after=1 delta=1/' "$delta"
+  if assert_bridge_metric_delta "$delta" getsockopt 2 0 >/dev/null 2>&1; then
+    printf 'bridge metric delta accepted an unexpected stale lookup\n' >&2
+    return 1
+  fi
+  assert_bridge_metric_delta "$delta" getsockopt 2 0 0 2 2 false 1 || {
+    printf 'bridge metric delta rejected an exact stale lookup\n' >&2
+    return 1
+  }
+  sed -i 's/status="stale",transport="getsockopt"} before=0 after=1 delta=1/status="stale",transport="getsockopt"} before=0 after=0 delta=0/' "$delta"
   printf '%s\n' \
     'obi_java_remote_parent_operations_total{operation="inject",status="ambiguous",transport="tcp"} before=0 after=1 delta=1' \
     >>"$delta"
@@ -9387,6 +9537,9 @@ main() {
   test_delayed_otlp_run_demo_defers_runtime_evidence
   test_helper_attach_failure_dispatch_and_seed_are_exact
   test_w3c_fault_requires_forced_unix
+  test_primary_w3c_stale_requires_forced_primary
+  test_primary_w3c_stale_control_restores_the_normal_ttls
+  test_primary_w3c_stale_scenario_accounts_for_the_stale_take
   test_security_accepts_enabled_transports
   test_tls_boundary_requires_both_deterministic_modes
   test_w3c_match_uses_controlled_unix_fixture

@@ -110,6 +110,7 @@ The checked-in #28 matrix is explicit about which layer proves each case:
 | conflicting valid W3C and OBI | `w3c`: exact W3C parent, distinct Apache candidate, one discard | privileged run |
 | malformed W3C and valid OBI | `w3c`: exact Apache client parent, one take | privileged run |
 | valid W3C and no OBI | `w3c-only` plus named Unix fault modes | privileged run |
+| valid W3C and stale primary state | `primary-w3c-stale`: forced `getsockopt` retrieval TTL of `1ns`, exact W3C parent, one stale take, then normal-TTL recovery | privileged run |
 | sampled and unsampled OBI flags | `obi-flags`: exact IDs, flags, and diagnostics | privileged run |
 | repeated extraction | exact one-take/discard diagnostics per marked request | privileged run |
 | nested/duplicate server instrumentation | repeated Jetty async redispatch, exactly one Java server span | privileged run |
@@ -125,6 +126,14 @@ The matching control uses the canonical sampled ABI vector as a bounded Unix
 bridge fixture and supplies the same IDs in a real `traceparent` header. This
 isolates extraction precedence without enabling generic payload header mutation
 on the production Java TLS bridge path.
+
+The primary `primary-w3c-stale` control force-recreates OBI with a `1ns`
+retrieval TTL while retaining the normal `30s` Apache prewrite and cleanup TTL.
+It verifies a healthy Apache request whose exact W3C parent wins after the
+primary stale retrieval, then restores the normal retrieval setting before
+proving a normal bridge recovery. It is an executable source control until a
+privileged run artifact is retained; it does not synthesize a malformed primary
+record.
 
 ## Prerequisites
 
@@ -395,7 +404,8 @@ OBI accepts these environment overrides (the YAML equivalents are in
 | `OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_PATH` | `/var/run/obi/java-remote-parent.sock` |
 | `OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_GROUP_ID` | `0` (the demo JVM runs as root) |
 | `OTEL_EBPF_JAVA_REMOTE_PARENT_TIMEOUT` | `50ms` |
-| `OTEL_EBPF_JAVA_REMOTE_PARENT_TTL` | `30s` |
+| `OTEL_EBPF_JAVA_REMOTE_PARENT_TTL` | `30s` prewrite and cleanup retention |
+| `OTEL_EBPF_JAVA_REMOTE_PARENT_RETRIEVAL_TTL` | `0s` (inherits `TTL` and must not exceed it; the stale control sets `1ns`) |
 
 The official agent loads the external extension with
 `OTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar`. The propagator order

@@ -421,6 +421,33 @@ func TestW3CFaultRequestsDescribeInjectedAndNormalizedOutcomes(t *testing.T) {
 	}
 }
 
+func TestPrimaryW3CStaleRequestUsesTheStandardParent(t *testing.T) {
+	cfg := config{scenario: "primary-w3c-stale", seed: 42}
+	requests, err := makeRequests(cfg)
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+
+	requestCase := requests[0]
+	assert.Equal(t, "stale", requestCase.ExpectedJavaStatus)
+	assert.Equal(t, "valid-w3c-primary-stale", requestCase.W3CCase)
+	assert.Equal(t, "01", requestCase.W3CTraceFlags)
+	assert.True(t, requestCase.CloseConnection)
+	assert.Equal(t, tracecheck.ModeW3C, expectationFor(cfg, requestCase).Mode)
+	assert.NotEmpty(t, requestCase.W3CTraceID)
+	assert.NotEmpty(t, requestCase.W3CParentSpanID)
+
+	request, err := newHTTPRequest(
+		context.Background(),
+		config{baseURL: "https://example.test", scenario: "primary-w3c-stale"},
+		requestCase,
+	)
+	require.NoError(t, err)
+	assert.Empty(t, request.URL.Query().Get("bridge_diagnostics"))
+
+	_, err = makeRequests(config{scenario: "primary-w3c-stale", requestCount: 2, seed: 42})
+	require.ErrorContains(t, err, "requires exactly one request")
+}
+
 func TestBridgeDiagnosticsHeaderIsRequiredOnlyForOptedInRequest(t *testing.T) {
 	snapshot := javaDiagnosticsSnapshot(t, 0)
 	header := make(http.Header)

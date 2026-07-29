@@ -411,6 +411,7 @@ AvoidedServicesConfig controls the avoided-services internal metric.
 
 | YAML Path | Type | Env Var | Default | Values | Deprecated | Description |
 |---|---|---|---|---|---|---|
+| `javaagent.remote_parent.retrieval_ttl` | `duration` | `OTEL_EBPF_JAVA_REMOTE_PARENT_RETRIEVAL_TTL` | `0s` | `30s`, `5m`, `1ms`, `1ns`, etc |  | Limits how long a Java process can retrieve a staged remote parent. A zero value inherits TTL and a non-zero value must not exceed it. |
 | `javaagent.remote_parent.socket_group_id` | `integer` | `OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_GROUP_ID` | `-1` |  |  |  |
 | `javaagent.remote_parent.socket_path` | `string` | `OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_PATH` | `/var/run/obi/java-remote-parent.sock` |  |  |  |
 | `javaagent.remote_parent.timeout` | `duration` | `OTEL_EBPF_JAVA_REMOTE_PARENT_TIMEOUT` | `50ms` | `30s`, `5m`, `1ms`, etc |  |  |

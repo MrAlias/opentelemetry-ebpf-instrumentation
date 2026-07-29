@@ -439,6 +439,17 @@ func TestJVMRuntimeMetricsConstantOverridesUseApplicationRuntimeAsFeatureGate(t 
 	}
 }
 
+func TestTracerUsesRemoteParentRetentionTTLForPrewrite(t *testing.T) {
+	cfg := obi.DefaultConfig
+	cfg.Java.RemoteParent.TTL = 30 * time.Second
+	cfg.Java.RemoteParent.RetrievalTTL = time.Nanosecond
+
+	tracer := Tracer{cfg: &cfg}
+	overrides := tracer.constants()
+
+	assert.Equal(t, uint64((30 * time.Second).Nanoseconds()), overrides["ssl_prewrite_max_age_ns"])
+}
+
 func TestRawJVMEventLayoutsUseGeneratedBPFStructs(t *testing.T) {
 	assert.Equal(t, 200, int(unsafe.Sizeof(BpfJvmMemPoolGcEvent{})))
 }

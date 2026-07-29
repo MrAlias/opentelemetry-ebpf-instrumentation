@@ -291,7 +291,7 @@ func (p *Tracer) javaRemoteParentConstants() map[string]any {
 		"filter_pids":                   filterPids,
 		"g_bpf_debug":                   p.cfg.EBPF.BpfDebug,
 		"java_remote_parent_enabled":    p.javaRemoteParentEnabled,
-		"java_remote_parent_max_age_ns": uint64(p.cfg.Java.RemoteParent.TTL.Nanoseconds()),
+		"java_remote_parent_max_age_ns": uint64(p.cfg.Java.RemoteParent.EffectiveRetrievalTTL().Nanoseconds()),
 	}
 }
 
@@ -320,7 +320,7 @@ func (p *Tracer) runJavaRemoteParent(ctx context.Context) func() {
 		return func() {}
 	}
 	maps := p.javaRemoteParentMaps()
-	handler := javabridge.NewMapHandler(maps, p.cfg.Java.RemoteParent.TTL)
+	handler := javabridge.NewMapHandler(maps, p.cfg.Java.RemoteParent.EffectiveRetrievalTTL())
 	cleanup := javabridge.NewCleanup(maps, p.cfg.Java.RemoteParent.TTL)
 	lifecycleCtx, cancel := context.WithCancel(ctx)
 

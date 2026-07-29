@@ -284,7 +284,7 @@ func parseFlags() config {
 	var cfg config
 	flag.StringVar(&cfg.baseURL, "base-url", "http://127.0.0.1:18080", "Apache base URL")
 	flag.StringVar(&cfg.receiverURL, "receiver-url", "http://127.0.0.1:14318", "trace receiver base URL")
-	flag.StringVar(&cfg.scenario, "scenario", "basic", "basic, keepalive, pipelining, concurrency, connection-churn, fd-port-reuse, slow-body, tls-boundary, timeout-retry, pressure, handoff, virtual-thread, netty, netty-server, dispatch, w3c, w3c-match, obi-flags, w3c-fault, w3c-only, helper-attach-failure, restart-fault, fail-open, restart, disabled, or uninstrumented")
+	flag.StringVar(&cfg.scenario, "scenario", "basic", "basic, keepalive, pipelining, concurrency, connection-churn, fd-port-reuse, slow-body, tls-boundary, timeout-retry, pressure, handoff, virtual-thread, netty, netty-server, dispatch, w3c, w3c-match, obi-flags, w3c-fault, primary-w3c-stale, w3c-only, helper-attach-failure, restart-fault, fail-open, restart, disabled, or uninstrumented")
 	flag.StringVar(&cfg.faultMode, "fault-mode", "", "w3c-fault mode")
 	flag.IntVar(&cfg.requestCount, "requests", 0, "number of requests (zero selects a scenario default)")
 	flag.DurationVar(&cfg.timeout, "timeout", 45*time.Second, "whole-scenario timeout")
@@ -306,7 +306,8 @@ func parseFlags() config {
 		"pressure": true,
 		"handoff":  true, "virtual-thread": true, "netty": true, "netty-server": true, "dispatch": true,
 		"w3c": true, "w3c-match": true, "obi-flags": true, "w3c-fault": true,
-		"w3c-only": true, "helper-attach-failure": true, "restart-fault": true,
+		"primary-w3c-stale": true,
+		"w3c-only":          true, "helper-attach-failure": true, "restart-fault": true,
 		"disabled": true, "uninstrumented": true,
 		"fail-open": true, "restart": true,
 	}
@@ -497,6 +498,9 @@ func makeRequests(cfg config) ([]requestCase, error) {
 	if cfg.scenario == "helper-attach-failure" && count != 1 {
 		return nil, fmt.Errorf("scenario %s requires exactly one request", cfg.scenario)
 	}
+	if cfg.scenario == "primary-w3c-stale" && count != 1 {
+		return nil, fmt.Errorf("scenario %s requires exactly one request", cfg.scenario)
+	}
 	if cfg.scenario == "restart-fault" && count <= restartAfterStartRequestIndex {
 		return nil, fmt.Errorf(
 			"scenario %s requires at least %d requests",
@@ -597,6 +601,11 @@ func makeRequests(cfg config) ([]requestCase, error) {
 				expectedStatus,
 			)
 			if err := addW3CContext(random, &requests[i], "01", caseName); err != nil {
+				return nil, err
+			}
+		case "primary-w3c-stale":
+			requests[i].ExpectedJavaStatus = "stale"
+			if err := addW3CContext(random, &requests[i], "01", "valid-w3c-primary-stale"); err != nil {
 				return nil, err
 			}
 		case "w3c-only":
@@ -1488,6 +1497,8 @@ func expectationFor(cfg config, request requestCase) tracecheck.Expectation {
 		javaTraceFlags = "01"
 	case "w3c-fault":
 		mode = tracecheck.ModeW3CNoOBI
+	case "primary-w3c-stale":
+		mode = tracecheck.ModeW3C
 	case "w3c-only":
 		mode = tracecheck.ModeW3CNoOBI
 	case "restart-fault":

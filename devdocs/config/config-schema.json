@@ -1542,6 +1542,19 @@
     },
     "JavaRemoteParentConfig": {
       "properties": {
+        "retrieval_ttl": {
+          "type": "string",
+          "pattern": "^[0-9]+(ns|ms|s|m)$",
+          "description": "Limits how long a Java process can retrieve a staged remote parent. A zero value inherits TTL and a non-zero value must not exceed it.",
+          "default": "0s",
+          "examples": [
+            "30s",
+            "5m",
+            "1ms",
+            "1ns"
+          ],
+          "x-env-var": "OTEL_EBPF_JAVA_REMOTE_PARENT_RETRIEVAL_TTL"
+        },
         "socket_group_id": {
           "type": "integer",
           "default": -1,

@@ -690,10 +690,20 @@ type JavaRemoteParentConfig struct {
 	SocketGroupID int                       `yaml:"socket_group_id" env:"OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_GROUP_ID" validate:"gte=-1"`
 	Timeout       time.Duration             `yaml:"timeout" env:"OTEL_EBPF_JAVA_REMOTE_PARENT_TIMEOUT" validate:"gte=0"`
 	TTL           time.Duration             `yaml:"ttl" env:"OTEL_EBPF_JAVA_REMOTE_PARENT_TTL" validate:"gte=0"`
+	// RetrievalTTL limits how long a Java process can retrieve a staged remote parent.
+	// A zero value inherits TTL and a non-zero value must not exceed it.
+	RetrievalTTL time.Duration `yaml:"retrieval_ttl" env:"OTEL_EBPF_JAVA_REMOTE_PARENT_RETRIEVAL_TTL" validate:"gte=0" jsonschema:"pattern=^[0-9]+(ns|ms|s|m)$,example=1ns"`
 }
 
 func (c JavaRemoteParentConfig) Enabled() bool {
 	return c.Transport != "" && c.Transport != JavaRemoteParentDisabled
+}
+
+func (c JavaRemoteParentConfig) EffectiveRetrievalTTL() time.Duration {
+	if c.RetrievalTTL > 0 {
+		return c.RetrievalTTL
+	}
+	return c.TTL
 }
 
 type JVMRuntimeMetricsConfig struct {
@@ -784,6 +794,9 @@ func (c *Config) validate(context validationContext) error {
 		}
 		if c.Java.RemoteParent.TTL <= 0 {
 			return ConfigError("javaagent.remote_parent.ttl must be greater than 0")
+		}
+		if c.Java.RemoteParent.RetrievalTTL > c.Java.RemoteParent.TTL {
+			return ConfigError("javaagent.remote_parent.retrieval_ttl must not exceed javaagent.remote_parent.ttl")
 		}
 	}
 

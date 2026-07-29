@@ -155,7 +155,7 @@ func runPrimaryProbe(
 	if err != nil {
 		return probeResult{}, fmt.Errorf("access probe socket: %w", err)
 	}
-	result := probeResult{Status: "passed", Mode: "primary"}
+	result := probeResult{Status: "unverified", Mode: "primary"}
 
 	socketType := make([]byte, 4)
 	length, err := rawGetsockopt(raw, unix.SOL_SOCKET, unix.SO_TYPE, socketType)

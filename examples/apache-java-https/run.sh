@@ -5592,7 +5592,7 @@ run_primary_security_control() {
   local -r probe_status="$RESULT_DIR/security-primary-probe.status"
   local -r sibling_cgroup="$RESULT_DIR/security-primary-sibling.cgroup"
   local -r sibling_delta="$RESULT_DIR/phases/security-primary-sibling-ready/obi-metrics.delta"
-  local -r initial_delta="$RESULT_DIR/phases/security-primary-probe-ready/obi-metrics.delta"
+  local -r same_cgroup_delta="$RESULT_DIR/phases/security-primary-probe-ready/obi-metrics.delta"
   local host_probe=""
   local java_container=""
   local java_host_pid=""
@@ -5679,12 +5679,41 @@ run_primary_security_control() {
     "$RESULT_DIR/phases/security-primary-before/obi-metrics.prom" \
     "$RESULT_DIR/phases/security-primary-sibling-ready/obi-metrics.prom" \
     "$sibling_delta"
-  assert_primary_security_metric_delta "$sibling_delta" negotiate 0 1
+  assert_primary_security_metric_delta "$sibling_delta" negotiate 1 1
+  assert_primary_security_metric_delta "$sibling_delta" take 5
 
   host_probe="$(mktemp "$RESULT_DIR/.security-primary-probe.XXXXXX")"
   PRIMARY_SECURITY_HOST_PROBE="$host_probe"
   run_bounded 15 docker cp \
     "$PRIMARY_SECURITY_SIBLING_CONTAINER:/security-probe" "$host_probe"
+
+  run_bounded 15 docker kill --signal SIGUSR1 \
+    "$PRIMARY_SECURITY_SIBLING_CONTAINER" >/dev/null
+  sibling_exit="$(run_bounded 60 docker wait "$PRIMARY_SECURITY_SIBLING_CONTAINER")"
+  [[ "$sibling_exit" == "0" ]] || {
+    log_error "sibling security probe exited with status $sibling_exit"
+    return 1
+  }
+  run_bounded 15 "${COMPOSE[@]}" logs --no-color security-probe >"$sibling_output"
+  PRIMARY_SECURITY_SIBLING_CONTAINER=""
+  if ! grep -Fq '"status":"unverified","mode":"primary"' "$sibling_output" || \
+    ! grep -Eq '"attempts":[1-9][0-9]*' "$sibling_output" || \
+    ! grep -Fq '"name":"wrong-process-negotiation","outcome":"native-unsupported"' \
+      "$sibling_output" || \
+    ! grep -Fq '"name":"repeated-retrieval","outcome":"native-unsupported"' \
+      "$sibling_output"; then
+    log_error "sibling security probe did not emit honest native-result evidence"
+    return 1
+  fi
+  if ! wait_for_primary_security_metrics_quiescent \
+    "$RESULT_DIR/metrics-security-primary-sibling-complete.prom" \
+    "sibling-container security probe completion"; then
+    return 1
+  fi
+  if ! capture_metric_phase_evidence "security-primary-sibling-complete"; then
+    return 1
+  fi
+
   PRIMARY_SECURITY_JAVA_CONTAINER="$java_container"
   run_bounded 10 docker exec "$java_container" \
     rm -f -- "$PRIMARY_SECURITY_PROBE_PATH" "$PRIMARY_SECURITY_PID_PATH"
@@ -5744,11 +5773,11 @@ run_primary_security_control() {
     return 1
   fi
   write_metrics_delta \
-    "$RESULT_DIR/phases/security-primary-sibling-ready/obi-metrics.prom" \
+    "$RESULT_DIR/phases/security-primary-sibling-complete/obi-metrics.prom" \
     "$RESULT_DIR/phases/security-primary-probe-ready/obi-metrics.prom" \
-    "$initial_delta"
-  assert_primary_security_metric_delta "$initial_delta" negotiate 1
-  assert_primary_security_metric_delta "$initial_delta" take 5
+    "$same_cgroup_delta"
+  assert_primary_security_metric_delta "$same_cgroup_delta" negotiate 1 1
+  assert_primary_security_metric_delta "$same_cgroup_delta" take 5
 
   (
     SCENARIO_VARIANT="security-primary-victim"
@@ -5787,30 +5816,11 @@ run_primary_security_control() {
   }
   PRIMARY_SECURITY_EXEC_PID=""
   PRIMARY_SECURITY_NAMESPACE_PID=""
-  if ! grep -Fq '"status":"passed","mode":"primary"' "$same_cgroup_output" || \
+  if ! grep -Fq '"status":"unverified","mode":"primary"' "$same_cgroup_output" || \
     ! grep -Eq '"attempts":[1-9][0-9]*' "$same_cgroup_output" || \
     ! grep -Fq '"name":"repeated-retrieval","outcome":"native-unsupported"' \
       "$same_cgroup_output"; then
     log_error "same-cgroup primary security probe did not emit bounded native-result evidence"
-    return 1
-  fi
-
-  run_bounded 15 docker kill --signal SIGUSR1 \
-    "$PRIMARY_SECURITY_SIBLING_CONTAINER" >/dev/null
-  sibling_exit="$(run_bounded 60 docker wait "$PRIMARY_SECURITY_SIBLING_CONTAINER")"
-  [[ "$sibling_exit" == "0" ]] || {
-    log_error "sibling security probe exited with status $sibling_exit"
-    return 1
-  }
-  run_bounded 15 "${COMPOSE[@]}" logs --no-color security-probe >"$sibling_output"
-  PRIMARY_SECURITY_SIBLING_CONTAINER=""
-  if ! grep -Fq '"status":"passed","mode":"primary"' "$sibling_output" || \
-    ! grep -Eq '"attempts":[1-9][0-9]*' "$sibling_output" || \
-    ! grep -Fq '"name":"wrong-process-negotiation","outcome":"native-unsupported"' \
-      "$sibling_output" || \
-    ! grep -Fq '"name":"repeated-retrieval","outcome":"native-unsupported"' \
-      "$sibling_output"; then
-    log_error "sibling security probe did not emit honest native-result evidence"
     return 1
   fi
 
@@ -5825,7 +5835,7 @@ run_primary_security_control() {
     SCENARIO_VARIANT="security-primary-recovery"
     run_scenario basic false
   )
-  printf '{"status":"passed","scenario":"security","mode":"primary","same_cgroup_probe":"%s","sibling_probe":"%s","cgroup_match":true,"unauthorized_classification":"metrics_verified","post_abuse_recovery":"passed","unix_only_cases":"not_applicable"}\n' \
+  printf '{"status":"passed","scenario":"security","mode":"primary","same_cgroup_probe":"%s","sibling_probe":"%s","probe_status":"unverified","probe_verification":"metrics_verified","cgroup_match":true,"unauthorized_classification":"metrics_verified","post_abuse_recovery":"passed","unix_only_cases":"not_applicable"}\n' \
     "$(basename -- "$same_cgroup_output")" \
     "$(basename -- "$sibling_output")" \
     >"$RESULT_DIR/scenario-security-status.json"

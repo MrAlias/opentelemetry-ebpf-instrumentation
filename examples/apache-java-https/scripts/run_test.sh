@@ -4215,10 +4215,13 @@ EOF
   assert_primary_security_metric_delta "$sibling_delta" negotiate 0 0
   assert_primary_security_metric_delta "$sibling_delta" take 0 0
   printf '%s\n' \
-    'obi_java_remote_parent_operations_total{operation="take",status="unauthorized",transport="getsockopt"} before=0 after=1 delta=1' \
+    'obi_java_remote_parent_operations_total{operation="negotiate",status="unauthorized",transport="getsockopt"} before=0 after=1 delta=1' \
+    'obi_java_remote_parent_operations_total{operation="take",status="unauthorized",transport="getsockopt"} before=0 after=5 delta=5' \
     >>"$sibling_delta"
-  if assert_primary_security_metric_delta "$sibling_delta" take 0 0 >/dev/null 2>&1; then
-    printf 'sibling security control accepted an intercepted take\n' >&2
+  assert_primary_security_metric_delta "$sibling_delta" negotiate 1 1
+  assert_primary_security_metric_delta "$sibling_delta" take 5
+  if assert_primary_security_metric_delta "$sibling_delta" take 6 >/dev/null 2>&1; then
+    printf 'sibling security control accepted an unmet take requirement\n' >&2
     return 1
   fi
 }
@@ -4252,6 +4255,58 @@ EOF
     printf 'primary security identity accepted a root probe\n' >&2
     return 1
   fi
+}
+
+test_primary_security_probe_is_not_self_certifying() {
+  local primary_control=""
+  local unverified_checks=""
+  local sibling_release_line=""
+  local sibling_completion_line=""
+  local same_cgroup_start_line=""
+  local same_cgroup_delta_line=""
+
+  primary_control="$(declare -f run_primary_security_control)"
+  unverified_checks="$(grep -Fc '"status":"unverified","mode":"primary"' \
+    <<<"$primary_control" || true)"
+  [[ "$unverified_checks" == "2" ]] || {
+    printf 'primary security control did not require both raw probes to be unverified\n' >&2
+    return 1
+  }
+  [[ "$primary_control" != *'"status":"passed","mode":"primary"'* ]] || {
+    printf 'primary security control treated raw probe output as proof\n' >&2
+    return 1
+  }
+  [[ "$primary_control" == *'"probe_status":"unverified"'* && \
+    "$primary_control" == *'"probe_verification":"metrics_verified"'* ]] || {
+    printf 'primary security result did not distinguish observation from verification\n' >&2
+    return 1
+  }
+  [[ "$primary_control" == *'assert_primary_security_metric_delta "$sibling_delta" negotiate 1 1'* && \
+    "$primary_control" == *'assert_primary_security_metric_delta "$sibling_delta" take 5'* && \
+    "$primary_control" == *'"$RESULT_DIR/phases/security-primary-sibling-complete/obi-metrics.prom"'* && \
+    "$primary_control" == *'assert_primary_security_metric_delta "$same_cgroup_delta" negotiate 1 1'* && \
+    "$primary_control" == *'assert_primary_security_metric_delta "$same_cgroup_delta" take 5'* ]] || {
+    printf 'primary security control did not retain per-topology enforcement evidence\n' >&2
+    return 1
+  }
+  sibling_release_line="$(awk '/docker kill --signal SIGUSR1/ { print NR; exit }' \
+    <<<"$primary_control")"
+  sibling_completion_line="$(awk '/capture_metric_phase_evidence "security-primary-sibling-complete"/ { print NR; exit }' \
+    <<<"$primary_control")"
+  same_cgroup_start_line="$(awk '/docker exec --user 65534:65534/ { print NR; exit }' \
+    <<<"$primary_control")"
+  same_cgroup_delta_line="$(awk '/assert_primary_security_metric_delta "\$same_cgroup_delta" negotiate 1 1/ { print NR; exit }' \
+    <<<"$primary_control")"
+  [[ "$sibling_release_line" =~ ^[1-9][0-9]*$ && \
+    "$sibling_completion_line" =~ ^[1-9][0-9]*$ && \
+    "$same_cgroup_start_line" =~ ^[1-9][0-9]*$ && \
+    "$same_cgroup_delta_line" =~ ^[1-9][0-9]*$ && \
+    sibling_release_line -lt sibling_completion_line && \
+    sibling_completion_line -lt same_cgroup_start_line && \
+    same_cgroup_start_line -lt same_cgroup_delta_line ]] || {
+    printf 'primary security probes did not use isolated metric windows\n' >&2
+    return 1
+  }
 }
 
 test_unix_security_metrics_require_explicit_race_scope() {
@@ -9586,6 +9641,7 @@ main() {
   test_pressure_bridge_reconciliation_preserves_failure_reasons
   test_primary_security_metrics_are_explicitly_scoped
   test_primary_security_identity_requires_same_cgroup_and_nonroot_user
+  test_primary_security_probe_is_not_self_certifying
   test_unix_security_metrics_require_explicit_race_scope
   test_unix_security_provider_wait_uses_restart_cursor
   test_permissive_unix_directory_control_refuses_and_restores

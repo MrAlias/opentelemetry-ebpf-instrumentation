@@ -133,7 +133,7 @@ column.
 | #37 benchmark | predeclared matrix, repeated bounded workload, and resource/map snapshots | execute on fixed hardware and add sustained latency/throughput evidence |
 | #38 compatibility | explicit untested matrix | execute each claimed kernel/cgroup/architecture/JVM/agent/TLS/transport cell |
 | #39 diagnostics | retained OpenTelemetry and Splunk per-scenario counters, current availability schema, V2 snapshots, and suppression evidence passed | execute remaining agent/environment cells |
-| #40 security | retained primary probes plus Unix forged/flood/path/permission matrix, exact-parent victim, and recovery passed; unexecuted source controls encode stale TTL rejection at Apache and primary-component boundaries | retain primary wrong-live-socket and stale-TTL evidence before marking the partial security matrix complete |
+| #40 security | retained Unix forged/flood/path/permission matrix, exact-parent victim, and recovery passed; retained primary attacker observations predate isolated metric windows; unexecuted source controls encode stale TTL rejection at Apache and primary-component boundaries | retain current isolated primary attacker, wrong-live-socket, and stale-TTL evidence before marking the partial security matrix complete |
 
 Unexecuted rows remain `untested`; a plan or template is not a successful
 validation result.

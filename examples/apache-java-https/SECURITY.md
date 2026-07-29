@@ -1,6 +1,7 @@
 # Security and abuse-case matrix
 
-Status: **partial — retained primary and Unix scenarios passed; remaining
+Status: **partial — retained Unix and non-abuse primary scenarios passed;
+primary attacker-topology controls await isolated current evidence; remaining
 primary and Unix cases and matrix cells untested**
 
 The PoC crosses a kernel/JVM trust boundary and exposes a local Unix fallback.
@@ -13,10 +14,22 @@ retained [OpenTelemetry/`getsockopt`/TLS 1.3](evidence/otel-getsockopt-tls13-c9d
 [OpenTelemetry/`getsockopt`/TLS 1.2](evidence/otel-getsockopt-tls12-c7209e43/README.md),
 and [OpenTelemetry/Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/README.md) runs.
 
+A primary probe's `native-unsupported` result is only an `unverified`
+observation. An unauthorized BPF call deliberately falls through to the native
+`getsockopt` result after recording its metric, and an unattached system returns
+the same result. A primary matrix pass therefore requires the runner's cgroup
+topology, per-topology unauthorized-metric deltas, legitimate-victim, and
+recovery gates; the raw probe cannot certify enforcement on its own.
+
+Retained primary attack artifacts predate those isolated metric windows. They
+remain historical observations, but do not satisfy the current per-topology
+acceptance gate; retain a fresh current run before restoring a primary attacker
+cell to `pass`.
+
 | Abuse or fault | Required result | Primary `getsockopt` | Unix | Evidence or remaining work |
 | --- | --- | --- | --- | --- |
-| unrelated process in same cgroup calls take | denied; legitimate Java take still succeeds | pass | untested | [sanitized probe topology and result](evidence/otel-getsockopt-tls13-c9d14356/security-primary-probes.json) and [victim](evidence/otel-getsockopt-tls13-c9d14356/scenario-concurrency-security-primary-victim.json) |
-| sibling container/PID namespace calls take | denied by current identity/peer credentials | pass | untested | [sanitized sibling topology and result](evidence/otel-getsockopt-tls13-c9d14356/security-primary-probes.json) and [recovery](evidence/otel-getsockopt-tls13-c9d14356/scenario-basic-security-primary-recovery.json) |
+| unrelated process in same cgroup calls take | denied; legitimate Java take still succeeds | untested | untested | retain a current isolated same-cgroup metric window, victim, and recovery result |
+| sibling container/PID namespace calls take | denied by current identity/peer credentials | untested | untested | retain a current isolated sibling metric window and recovery result |
 | forged caller PID/TID in Unix request | ignored; kernel peer identity is authoritative | not applicable | pass | [forged-peer probe](evidence/otel-unix-tls12-bd1c9327/security-unix-probes.json) |
 | repeated unauthorized take attempts | bounded; context remains available | untested | pass | [bounded repeated probes and recovery](evidence/otel-unix-tls12-bd1c9327/security-unix-probes.json) |
 | wrong socket identity | rejected without consuming another request's context | untested | untested | retain a targeted wrong-socket result |

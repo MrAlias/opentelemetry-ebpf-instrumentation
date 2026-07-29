@@ -57,7 +57,7 @@ func TestReadStatusRejectsContextBearingOrMalformedRecords(t *testing.T) {
 	}
 }
 
-func TestPrimaryProbeCannotReadWithoutProcessCapability(t *testing.T) {
+func TestPrimaryProbeReportsNativeResultsAsUnverified(t *testing.T) {
 	ready := make(chan struct{})
 	resume := make(chan os.Signal, 1)
 	completed := make(chan struct {
@@ -85,7 +85,7 @@ func TestPrimaryProbeCannotReadWithoutProcessCapability(t *testing.T) {
 	resume <- os.Interrupt
 	result := <-completed
 	require.NoError(t, result.err)
-	assert.Equal(t, "passed", result.result.Status)
+	assert.Equal(t, "unverified", result.result.Status)
 	assert.Equal(t, "primary", result.result.Mode)
 	assert.Positive(t, result.result.Attempts)
 	require.Len(t, result.result.Cases, 6)

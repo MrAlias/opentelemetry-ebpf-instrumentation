@@ -1,0 +1,8 @@
+services:
+  java-backend:
+    user: "0:0"
+    environment:
+      LD_PRELOAD: /otel/libobi-java-remote-parent-fault.so
+      OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_FILE: /run/obi-demo/fault/java-remote-parent.mode
+    tmpfs:
+      - /run/obi-demo/fault:uid=0,gid=0,mode=0700

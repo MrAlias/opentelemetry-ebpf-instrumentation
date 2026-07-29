@@ -74,12 +74,14 @@ evidence define the current boundary of the result.
 ## VM-gated primary fault fixture
 
 [`TestJavaRemoteParentPrimaryJVMFaults`](../../pkg/internal/ebpf/tpinjector/java_remote_parent_jvm_privileged_test.go)
-starts a clean JVM with the packaged OBI agent, negotiates the primary
-`getsockopt` socket through JNI, and then calls the Java bridge after staging
-a remote-parent state and associated BPF map entries. Its cases are valid,
-stale, ABI-version mismatch, all-zero trace ID, and all-zero parent span ID.
-When run, it asserts the status and returned identifiers, cleared socket FD,
-and absence of the staged state and data acknowledgement.
+starts a clean JVM with the packaged OBI agent but disables its automatic
+remote-parent transport provider. The probe explicitly initializes the primary
+`getsockopt` transport through the bootstrap bridge, which configures it via
+JNI, then obtains the Java-created socket's FD and calls the Java bridge after
+staging a remote-parent state and associated BPF map entries. Its cases are
+valid, stale, ABI-version mismatch, all-zero trace ID, and all-zero parent span
+ID. When run, it asserts the status and returned identifiers, cleared socket
+FD, and absence of the staged state and data acknowledgement.
 
 The fixture is run by
 [`run-java-remote-parent-rhel.sh`](../../internal/test/vm/run-java-remote-parent-rhel.sh)

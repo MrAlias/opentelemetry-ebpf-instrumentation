@@ -5521,14 +5521,16 @@ arm_primary_w3c_fault_control() {
       trap cleanup EXIT HUP INT TERM
       printf "%s\\n" "$mode" >"$temporary"
       chmod 0600 -- "$temporary"
-      [ "$(stat -c "%u:%g:%a:%h:%F" "$temporary")" = "0:0:600:1:regular file" ]
+      [ -f "$temporary" ] && [ ! -L "$temporary" ]
+      [ "$(stat -c "%u:%g:%a:%h" "$temporary")" = "0:0:600:1" ]
       mv -T -- "$temporary" "$control_file"
       temporary=
       trap - EXIT HUP INT TERM
-      [ "$(stat -c "%u:%g:%a:%h:%F" "$control_file")" = "0:0:600:1:regular file" ]
+      [ -f "$control_file" ] && [ ! -L "$control_file" ]
+      [ "$(stat -c "%u:%g:%a:%h" "$control_file")" = "0:0:600:1" ]
       [ "$(cat "$control_file")" = "$mode" ]
-      printf "phase=armed\\nmode=%s\\nmetadata=%s\\nsize=%s\\n" \\
-        "$mode" "$(stat -c "%u:%g:%a:%h:%F" "$control_file")" \\
+      printf "phase=armed\nmode=%s\nmetadata=%s\nsize=%s\n" \
+        "$mode" "$(stat -c "%u:%g:%a:%h:%F" "$control_file")" \
         "$(stat -c "%s" "$control_file")"
     ' sh "$PRIMARY_FAULT_CONTROL_DIRECTORY" "$PRIMARY_FAULT_CONTROL_FILE" "$mode" \
     >"$output"
@@ -5558,10 +5560,10 @@ consume_primary_w3c_fault_control() {
       [ -d "$directory" ] && [ ! -L "$directory" ]
       [ "$(stat -c "%u:%g:%a:%F" "$directory")" = "0:0:700:directory" ]
       [ -f "$control_file" ] && [ ! -L "$control_file" ]
-      [ "$(stat -c "%u:%g:%a:%h:%F" "$control_file")" = "0:0:600:1:regular file" ]
+      [ "$(stat -c "%u:%g:%a:%h" "$control_file")" = "0:0:600:1" ]
       [ ! -s "$control_file" ]
-      printf "phase=consumed\\nmetadata=%s\\nsize=%s\\n" \\
-        "$(stat -c "%u:%g:%a:%h:%F" "$control_file")" \\
+      printf "phase=consumed\nmetadata=%s\nsize=%s\n" \
+        "$(stat -c "%u:%g:%a:%h:%F" "$control_file")" \
         "$(stat -c "%s" "$control_file")"
       rm -f -- "$control_file"
       [ ! -e "$control_file" ] && [ ! -L "$control_file" ]

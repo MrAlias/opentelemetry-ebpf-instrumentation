@@ -1407,6 +1407,90 @@ test_primary_w3c_fault_modes_are_exact() {
   fi
 }
 
+test_primary_w3c_fault_control_scripts_publish_and_consume_exactly() {
+  local -r result_dir="$TEST_TMP_DIR/primary-fault-control-scripts"
+  local -r private_directory="$result_dir/fault"
+  local -r control_file="$private_directory/java-remote-parent.mode"
+  local -r fake_bin="$result_dir/bin"
+  local -r arm_evidence="$result_dir/armed.txt"
+  local -r consumption_evidence="$result_dir/consumed.txt"
+  local -r expected_arm=$'phase=armed\nmode=version-mismatch\nmetadata=0:0:600:1:regular file\nsize=17'
+  local -r expected_consumption=$'phase=consumed\nmetadata=0:0:600:1:regular empty file\nsize=0'
+
+  mkdir -p -- "$private_directory" "$fake_bin"
+  chmod 0700 -- "$private_directory"
+  cat >"$fake_bin/id" <<'EOF'
+#!/usr/bin/env bash
+printf '0\n'
+EOF
+  cat >"$fake_bin/stat" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+case "$2" in
+  '%u:%g:%a:%F') printf '0:0:700:directory\n' ;;
+  '%u:%g:%a:%h') printf '0:0:600:1\n' ;;
+  '%u:%g:%a:%h:%F')
+    if [[ -s "$3" ]]; then
+      printf '0:0:600:1:regular file\n'
+    else
+      printf '0:0:600:1:regular empty file\n'
+    fi
+    ;;
+  '%s') wc -c <"$3" ;;
+  *) exit 64 ;;
+esac
+EOF
+  chmod 0755 -- "$fake_bin/id" "$fake_bin/stat"
+
+  (
+    PRIMARY_FAULT_STACK_ACTIVE=true
+    PRIMARY_FAULT_COMPOSE=(test-compose)
+    run_bounded() {
+      local -a bounded_command=("$@")
+      local -a shell_command=()
+      local script_index=-1
+      local index=0
+
+      for index in "${!bounded_command[@]}"; do
+        if [[ "${bounded_command[$index]}" == -ec ]]; then
+          script_index="$index"
+          break
+        fi
+      done
+      ((script_index >= 0)) || return 1
+
+      shell_command=(
+        /bin/sh -ec "${bounded_command[$((script_index + 1))]}" sh
+        "$private_directory" "$control_file"
+      )
+      case "$(( ${#bounded_command[@]} - script_index ))" in
+        5)
+          ;;
+        6)
+          [[ "${bounded_command[$((script_index + 5))]}" == version-mismatch ]] || return 1
+          shell_command+=(version-mismatch)
+          ;;
+        *) return 1 ;;
+      esac
+
+      PATH="$fake_bin:$PATH" "${shell_command[@]}"
+    }
+
+    arm_primary_w3c_fault_control version-mismatch "$arm_evidence"
+    [[ "$(<"$arm_evidence")" == "$expected_arm" && \
+      "$(<"$control_file")" == version-mismatch ]]
+
+    : >"$control_file"
+    consume_primary_w3c_fault_control "$consumption_evidence"
+    [[ "$(<"$consumption_evidence")" == "$expected_consumption" && \
+      ! -e "$control_file" && ! -L "$control_file" ]]
+  ) || {
+    printf 'primary fault control scripts did not publish and consume exact evidence\n' >&2
+    return 1
+  }
+}
+
 test_primary_w3c_stale_control_restores_the_normal_ttls() {
   local -r observed="$TEST_TMP_DIR/primary-w3c-stale-control.calls"
 
@@ -10109,6 +10193,7 @@ main() {
   test_primary_w3c_stale_requires_forced_primary
   test_primary_w3c_fault_requires_forced_primary
   test_primary_w3c_fault_modes_are_exact
+  test_primary_w3c_fault_control_scripts_publish_and_consume_exactly
   test_primary_w3c_stale_control_restores_the_normal_ttls
   test_primary_w3c_stale_scenario_accounts_for_the_stale_take
   test_primary_w3c_fault_recreation_uses_the_overlay_only

@@ -73,14 +73,16 @@ type bridgeBenchmarkCall struct {
 }
 
 type bridgeBenchmarkSeries struct {
-	transport       string
-	path            string
-	durations       []time.Duration
-	batchElapsed    time.Duration
-	valid           int
-	missing         int
-	alreadyConsumed int
-	errors          int
+	warmupRounds      int
+	measurementRounds int
+	transport         string
+	outcome           string
+	durations         []time.Duration
+	batchElapsed      time.Duration
+	valid             int
+	missing           int
+	alreadyConsumed   int
+	errors            int
 }
 
 // TestJavaRemoteParentTransportBenchmark is opt-in because it loads and
@@ -157,6 +159,7 @@ func TestJavaRemoteParentTransportBenchmark(t *testing.T) {
 		process, capability, &nextGeneration,
 	)
 
+	summaries := make([]bridgeBenchmarkArtifactSeries, 0, 5)
 	for _, series := range []*bridgeBenchmarkSeries{
 		primaryMiss,
 		primaryHit,
@@ -164,7 +167,11 @@ func TestJavaRemoteParentTransportBenchmark(t *testing.T) {
 		unixMiss,
 		unixHit,
 	} {
-		series.report(t)
+		summaries = append(summaries, series.report(t))
+	}
+
+	if artifactPath := os.Getenv(javaRemoteParentBenchmarkArtifactEnv); artifactPath != "" {
+		require.NoError(t, writeBridgeBenchmarkArtifact(artifactPath, summaries))
 	}
 }
 
@@ -381,7 +388,9 @@ func runPrimaryMissBenchmark(
 		)
 	}
 
-	series := newBridgeBenchmarkSeries("getsockopt", "miss", primaryBenchmarkRounds)
+	series := newBridgeBenchmarkSeries(
+		"getsockopt", "miss", primaryBenchmarkWarmupRounds, primaryBenchmarkRounds,
+	)
 	jobs := primaryBenchmarkJobs(workers, pairs)
 	for round := range primaryBenchmarkWarmupRounds + primaryBenchmarkRounds {
 		calls, elapsed := runBridgeBenchmarkBatch(workers, jobs)
@@ -408,7 +417,9 @@ func runPrimaryHitBenchmark(
 ) *bridgeBenchmarkSeries {
 	t.Helper()
 
-	series := newBridgeBenchmarkSeries("getsockopt", "hit", primaryBenchmarkRounds)
+	series := newBridgeBenchmarkSeries(
+		"getsockopt", "hit", primaryBenchmarkWarmupRounds, primaryBenchmarkRounds,
+	)
 	jobs := primaryBenchmarkJobs(workers, pairs)
 	for round := range primaryBenchmarkWarmupRounds + primaryBenchmarkRounds {
 		expected := make([]uint64, len(workers))
@@ -445,7 +456,9 @@ func runPrimaryOneShotBenchmark(
 ) *bridgeBenchmarkSeries {
 	t.Helper()
 
-	series := newBridgeBenchmarkSeries("getsockopt", "one_shot", primaryBenchmarkRounds)
+	series := newBridgeBenchmarkSeries(
+		"getsockopt", "one_shot", primaryBenchmarkWarmupRounds, primaryBenchmarkRounds,
+	)
 	jobs := make([]bridgeBenchmarkJob, len(workers))
 	for index := range workers {
 		jobs[index] = bridgeBenchmarkJob{
@@ -548,7 +561,9 @@ func runUnixBenchmark(
 	}
 
 	takeJobs := unixBenchmarkJobs(t, workers, socketPath, javabridge.OperationTake, capability)
-	miss := newBridgeBenchmarkSeries("unix", "miss", unixBenchmarkRounds)
+	miss := newBridgeBenchmarkSeries(
+		"unix", "miss", unixBenchmarkWarmupRounds, unixBenchmarkRounds,
+	)
 	for round := range unixBenchmarkWarmupRounds + unixBenchmarkRounds {
 		calls, elapsed := runBridgeBenchmarkBatch(workers, takeJobs)
 		for _, call := range calls {
@@ -560,7 +575,9 @@ func runUnixBenchmark(
 		}
 	}
 
-	hit := newBridgeBenchmarkSeries("unix", "hit", unixBenchmarkRounds)
+	hit := newBridgeBenchmarkSeries(
+		"unix", "hit", unixBenchmarkWarmupRounds, unixBenchmarkRounds,
+	)
 	for round := range unixBenchmarkWarmupRounds + unixBenchmarkRounds {
 		expected := make([]uint64, len(workers))
 		for index, worker := range workers {
@@ -704,13 +721,16 @@ func deleteBenchmarkMapKey(t *testing.T, benchmarkMap *ebpf.Map, key any) {
 
 func newBridgeBenchmarkSeries(
 	transport string,
-	path string,
-	rounds int,
+	outcome string,
+	warmupRounds int,
+	measurementRounds int,
 ) *bridgeBenchmarkSeries {
 	return &bridgeBenchmarkSeries{
-		transport: transport,
-		path:      path,
-		durations: make([]time.Duration, 0, rounds*bridgeBenchmarkConcurrency),
+		warmupRounds:      warmupRounds,
+		measurementRounds: measurementRounds,
+		transport:         transport,
+		outcome:           outcome,
+		durations:         make([]time.Duration, 0, measurementRounds*bridgeBenchmarkConcurrency),
 	}
 }
 
@@ -733,30 +753,51 @@ func (s *bridgeBenchmarkSeries) add(calls []bridgeBenchmarkCall, elapsed time.Du
 	s.batchElapsed += elapsed
 }
 
-func (s *bridgeBenchmarkSeries) report(t *testing.T) {
+func (s *bridgeBenchmarkSeries) report(t *testing.T) bridgeBenchmarkArtifactSeries {
 	t.Helper()
 
 	require.NotEmpty(t, s.durations)
+	require.Positive(t, s.batchElapsed)
 	durations := slices.Clone(s.durations)
 	slices.Sort(durations)
-	operationsPerSecond := float64(len(durations)) / s.batchElapsed.Seconds()
+	summary := bridgeBenchmarkArtifactSeries{
+		Transport:           s.transport,
+		Outcome:             s.outcome,
+		WarmupRounds:        s.warmupRounds,
+		MeasurementRounds:   s.measurementRounds,
+		Samples:             len(durations),
+		Concurrency:         bridgeBenchmarkConcurrency,
+		BatchElapsedNS:      s.batchElapsed.Nanoseconds(),
+		P50NS:               benchmarkPercentile(durations, 50).Nanoseconds(),
+		P95NS:               benchmarkPercentile(durations, 95).Nanoseconds(),
+		P99NS:               benchmarkPercentile(durations, 99).Nanoseconds(),
+		OperationsPerSecond: float64(len(durations)) / s.batchElapsed.Seconds(),
+		Valid:               s.valid,
+		Missing:             s.missing,
+		AlreadyConsumed:     s.alreadyConsumed,
+		Errors:              s.errors,
+	}
+	summary.Correct = summary.Valid+summary.Missing+summary.AlreadyConsumed+
+		summary.Errors == summary.Samples && summary.Errors == 0
+	require.True(t, summary.Correct)
 	t.Logf(
-		"bridge_benchmark transport=%s path=%s samples=%d concurrency=%d "+
+		"bridge_benchmark transport=%s outcome=%s samples=%d concurrency=%d "+
 			"p50_ns=%d p95_ns=%d p99_ns=%d ops_per_second=%.0f "+
 			"valid=%d missing=%d already_consumed=%d errors=%d correct=true",
-		s.transport,
-		s.path,
-		len(durations),
-		bridgeBenchmarkConcurrency,
-		benchmarkPercentile(durations, 50),
-		benchmarkPercentile(durations, 95),
-		benchmarkPercentile(durations, 99),
-		operationsPerSecond,
-		s.valid,
-		s.missing,
-		s.alreadyConsumed,
-		s.errors,
+		summary.Transport,
+		summary.Outcome,
+		summary.Samples,
+		summary.Concurrency,
+		summary.P50NS,
+		summary.P95NS,
+		summary.P99NS,
+		summary.OperationsPerSecond,
+		summary.Valid,
+		summary.Missing,
+		summary.AlreadyConsumed,
+		summary.Errors,
 	)
+	return summary
 }
 
 func benchmarkPercentile(sorted []time.Duration, percentile int) time.Duration {

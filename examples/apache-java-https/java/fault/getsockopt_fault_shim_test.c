@@ -177,6 +177,25 @@ static void test_version_mismatch_mode(void) {
          java_remote_parent_test_span_id_byte);
 }
 
+static void test_bad_size_mode(void) {
+  unsigned char response[java_remote_parent_response_size];
+  unsigned char expected[java_remote_parent_response_size];
+  socklen_t length = java_remote_parent_response_size;
+
+  valid_response(response);
+  memcpy(expected, response, sizeof(expected));
+  expected[java_remote_parent_size_offset] =
+      java_remote_parent_response_size - 1;
+  expected[java_remote_parent_size_offset +
+           java_remote_parent_little_endian_high_byte_offset] = 0;
+  set_fault_mode("bad-size");
+  assert(obi_demo_java_remote_parent_apply_getsockopt_fault(
+      0, java_remote_parent_socket_level, java_remote_parent_socket_take,
+      response, &length));
+  assert(length == java_remote_parent_response_size);
+  assert(memcmp(response, expected, sizeof(expected)) == 0);
+}
+
 static void test_zero_trace_id_mode(void) {
   unsigned char response[java_remote_parent_response_size];
   socklen_t length = java_remote_parent_response_size;
@@ -474,6 +493,7 @@ int main(void) {
 
   test_missing_empty_and_invalid_controls_do_not_mutate();
   test_version_mismatch_mode();
+  test_bad_size_mode();
   test_zero_trace_id_mode();
   test_zero_span_id_mode();
   test_eligible_response_consumes_control();

@@ -449,7 +449,7 @@ func expectedPrimaryJavaFaultStatus(faultMode string) (string, bool) {
 	switch faultMode {
 	case "version-mismatch":
 		return "version_mismatch", true
-	case "zero-trace-id", "zero-span-id":
+	case "bad-size", "zero-trace-id", "zero-span-id":
 		return "malformed", true
 	default:
 		return "", false

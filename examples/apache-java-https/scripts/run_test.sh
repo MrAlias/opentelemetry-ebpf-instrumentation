@@ -1217,7 +1217,7 @@ test_benchmark_controls_are_bounded() {
 
 test_all_suite_includes_every_scenario() {
   local -r actual="$TEST_TMP_DIR/all-scenarios.txt"
-  local -r expected=$'basic\nbasic\nsecurity\nkeepalive\npipelining\nconcurrency\nconnection-churn\nfd-port-reuse\nslow-body\ntls-boundary\ntimeout-retry\npressure\nhandoff\nvirtual-thread\nnetty\nnetty-server\ndispatch\nw3c\nw3c-match\nobi-flags\nprimary-w3c-stale\nbasic\nprimary-w3c-fault\nprimary-w3c-fault\nprimary-w3c-fault\nbasic\nfail-open\nw3c-only\nrestart\nrestart-fault\nhelper-attach-failure\ndisabled\nw3c-only\nw3c-only\nuninstrumented'
+  local -r expected=$'basic\nbasic\nsecurity\nkeepalive\npipelining\nconcurrency\nconnection-churn\nfd-port-reuse\nslow-body\ntls-boundary\ntimeout-retry\npressure\nhandoff\nvirtual-thread\nnetty\nnetty-server\ndispatch\nw3c\nw3c-match\nobi-flags\nprimary-w3c-stale\nbasic\nprimary-w3c-fault\nprimary-w3c-fault\nprimary-w3c-fault\nprimary-w3c-fault\nbasic\nfail-open\nw3c-only\nrestart\nrestart-fault\nhelper-attach-failure\ndisabled\nw3c-only\nw3c-only\nuninstrumented'
 
   (
     SCENARIO=all
@@ -1238,6 +1238,7 @@ test_all_suite_includes_every_scenario() {
       run_scenario basic
     }
     run_primary_w3c_fault_control() {
+      run_scenario primary-w3c-fault
       run_scenario primary-w3c-fault
       run_scenario primary-w3c-fault
       run_scenario primary-w3c-fault
@@ -1593,6 +1594,7 @@ test_primary_w3c_fault_requires_forced_primary() {
 
 test_primary_w3c_fault_modes_are_exact() {
   [[ "$(primary_w3c_fault_expected_java_status version-mismatch)" == version_mismatch ]]
+  [[ "$(primary_w3c_fault_expected_java_status bad-size)" == malformed ]]
   [[ "$(primary_w3c_fault_expected_java_status zero-trace-id)" == malformed ]]
   [[ "$(primary_w3c_fault_expected_java_status zero-span-id)" == malformed ]]
   if primary_w3c_fault_expected_java_status alternating >/dev/null 2>&1; then
@@ -1607,8 +1609,11 @@ test_primary_w3c_fault_control_scripts_publish_and_consume_exactly() {
   local -r control_file="$private_directory/java-remote-parent.mode"
   local -r fake_bin="$result_dir/bin"
   local -r arm_evidence="$result_dir/armed.txt"
+  local -r bad_size_arm_evidence="$result_dir/bad-size-armed.txt"
   local -r consumption_evidence="$result_dir/consumed.txt"
+  local -r bad_size_consumption_evidence="$result_dir/bad-size-consumed.txt"
   local -r expected_arm=$'phase=armed\nmode=version-mismatch\nmetadata=0:0:600:1:regular file\nsize=17'
+  local -r expected_bad_size_arm=$'phase=armed\nmode=bad-size\nmetadata=0:0:600:1:regular file\nsize=9'
   local -r expected_consumption=$'phase=consumed\nmetadata=0:0:600:1:regular empty file\nsize=0'
 
   mkdir -p -- "$private_directory" "$fake_bin"
@@ -1662,8 +1667,12 @@ EOF
         5)
           ;;
         6)
-          [[ "${bounded_command[$((script_index + 5))]}" == version-mismatch ]] || return 1
-          shell_command+=(version-mismatch)
+          case "${bounded_command[$((script_index + 5))]}" in
+            version-mismatch|bad-size)
+              shell_command+=("${bounded_command[$((script_index + 5))]}")
+              ;;
+            *) return 1 ;;
+          esac
           ;;
         *) return 1 ;;
       esac
@@ -1678,6 +1687,15 @@ EOF
     : >"$control_file"
     consume_primary_w3c_fault_control "$consumption_evidence"
     [[ "$(<"$consumption_evidence")" == "$expected_consumption" && \
+      ! -e "$control_file" && ! -L "$control_file" ]]
+
+    arm_primary_w3c_fault_control bad-size "$bad_size_arm_evidence"
+    [[ "$(<"$bad_size_arm_evidence")" == "$expected_bad_size_arm" && \
+      "$(<"$control_file")" == bad-size ]]
+
+    : >"$control_file"
+    consume_primary_w3c_fault_control "$bad_size_consumption_evidence"
+    [[ "$(<"$bad_size_consumption_evidence")" == "$expected_consumption" && \
       ! -e "$control_file" && ! -L "$control_file" ]]
   ) || {
     printf 'primary fault control scripts did not publish and consume exact evidence\n' >&2
@@ -2038,6 +2056,7 @@ test_primary_w3c_fault_control_restores_the_base_stack() {
   grep -Fqx 'recreate:primary W3C fault preparation:getsockopt:true:primary-fault' "$success"
   grep -Fqx 'runtime:primary-w3c-fault:true' "$success"
   grep -Fqx 'fault:version-mismatch' "$success"
+  grep -Fqx 'fault:bad-size' "$success"
   grep -Fqx 'fault:zero-trace-id' "$success"
   grep -Fqx 'fault:zero-span-id' "$success"
   grep -Fqx 'recreate:post-primary W3C fault recovery:getsockopt:true:base' "$success"

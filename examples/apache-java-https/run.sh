@@ -5559,7 +5559,7 @@ primary_w3c_fault_expected_java_status() {
     version-mismatch)
       printf 'version_mismatch\n'
       ;;
-    zero-trace-id|zero-span-id)
+    bad-size|zero-trace-id|zero-span-id)
       printf 'malformed\n'
       ;;
     *)
@@ -5594,7 +5594,7 @@ arm_primary_w3c_fault_control() {
       mode=$3
 
       case "$mode" in
-        version-mismatch|zero-trace-id|zero-span-id) ;;
+        version-mismatch|bad-size|zero-trace-id|zero-span-id) ;;
         *) exit 64 ;;
       esac
       [ "$control_file" = "$directory/java-remote-parent.mode" ]
@@ -5877,7 +5877,7 @@ run_primary_w3c_fault_control() (
     tcp "primary W3C fault preparation" getsockopt true false primary-fault || return $?
   assert_runtime_contract primary-w3c-fault true || return $?
 
-  for FAULT_MODE in version-mismatch zero-trace-id zero-span-id; do
+  for FAULT_MODE in version-mismatch bad-size zero-trace-id zero-span-id; do
     run_primary_w3c_fault_scenario "$FAULT_MODE" || return $?
   done
   FAULT_MODE="alternating"

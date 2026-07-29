@@ -52,6 +52,7 @@ static const char java_remote_parent_magic[] = "OBIJ";
 enum java_remote_parent_fault_mode {
   java_remote_parent_fault_disabled,
   java_remote_parent_fault_version_mismatch,
+  java_remote_parent_fault_bad_size,
   java_remote_parent_fault_zero_trace_id,
   java_remote_parent_fault_zero_span_id,
 };
@@ -135,6 +136,9 @@ static enum java_remote_parent_fault_mode java_remote_parent_fault_mode(void) {
                                             "version-mismatch")) {
     mode = java_remote_parent_fault_version_mismatch;
   } else if (java_remote_parent_fault_mode_matches(value, (size_t)value_length,
+                                                   "bad-size")) {
+    mode = java_remote_parent_fault_bad_size;
+  } else if (java_remote_parent_fault_mode_matches(value, (size_t)value_length,
                                                    "zero-trace-id")) {
     mode = java_remote_parent_fault_zero_trace_id;
   } else if (java_remote_parent_fault_mode_matches(value, (size_t)value_length,
@@ -211,6 +215,11 @@ bool obi_demo_java_remote_parent_apply_getsockopt_fault(
     response[java_remote_parent_version_offset] =
         java_remote_parent_fault_version;
     response[java_remote_parent_version_offset + 1] = 0;
+    return true;
+  case java_remote_parent_fault_bad_size:
+    response[java_remote_parent_size_offset] =
+        java_remote_parent_response_size - 1;
+    response[java_remote_parent_size_offset + 1] = 0;
     return true;
   case java_remote_parent_fault_zero_trace_id:
     memset(response + java_remote_parent_trace_id_offset, 0,

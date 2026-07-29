@@ -496,6 +496,7 @@ func TestPrimaryW3CFaultRequestUsesW3CPrecedenceAndDiagnostics(t *testing.T) {
 		status    string
 	}{
 		{faultMode: "version-mismatch", status: "version_mismatch"},
+		{faultMode: "bad-size", status: "malformed"},
 		{faultMode: "zero-trace-id", status: "malformed"},
 		{faultMode: "zero-span-id", status: "malformed"},
 	}
@@ -508,6 +509,7 @@ func TestPrimaryW3CFaultRequestUsesW3CPrecedenceAndDiagnostics(t *testing.T) {
 				javaDiagnosticsBefore: baseline,
 				seed:                  42,
 			}
+			require.NoError(t, validateFaultMode(cfg))
 			requests, err := makeRequests(cfg)
 			require.NoError(t, err)
 			require.Len(t, requests, 1)

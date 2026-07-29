@@ -133,7 +133,11 @@ It verifies a healthy Apache request whose exact W3C parent wins after the
 primary stale retrieval, then restores the normal retrieval setting before
 proving a normal bridge recovery. It is an executable source control until a
 privileged run artifact is retained; it does not synthesize a malformed primary
-record.
+record. The separate `primary-w3c-fault` control uses a private one-shot
+response shim to exercise declared-size and zero-ID malformed primary replies,
+plus ABI-version mismatch, while the supplied W3C parent remains authoritative.
+It is also source-level coverage until a clean focused or acceptance artifact
+is retained.
 
 ## Prerequisites
 

@@ -30,17 +30,18 @@ import (
 )
 
 type config struct {
-	baseURL           string
-	receiverURL       string
-	scenario          string
-	faultMode         string
-	requestCount      int
-	timeout           time.Duration
-	expectedTLS       string
-	seed              int64
-	apacheService     string
-	javaService       string
-	restartControlDir string
+	baseURL               string
+	receiverURL           string
+	scenario              string
+	faultMode             string
+	javaDiagnosticsBefore string
+	requestCount          int
+	timeout               time.Duration
+	expectedTLS           string
+	seed                  int64
+	apacheService         string
+	javaService           string
+	restartControlDir     string
 }
 
 type requestCase struct {
@@ -284,8 +285,9 @@ func parseFlags() config {
 	var cfg config
 	flag.StringVar(&cfg.baseURL, "base-url", "http://127.0.0.1:18080", "Apache base URL")
 	flag.StringVar(&cfg.receiverURL, "receiver-url", "http://127.0.0.1:14318", "trace receiver base URL")
-	flag.StringVar(&cfg.scenario, "scenario", "basic", "basic, keepalive, pipelining, concurrency, connection-churn, fd-port-reuse, slow-body, tls-boundary, timeout-retry, pressure, handoff, virtual-thread, netty, netty-server, dispatch, w3c, w3c-match, obi-flags, w3c-fault, primary-w3c-stale, w3c-only, helper-attach-failure, restart-fault, fail-open, restart, disabled, or uninstrumented")
-	flag.StringVar(&cfg.faultMode, "fault-mode", "", "w3c-fault mode")
+	flag.StringVar(&cfg.scenario, "scenario", "basic", "basic, keepalive, pipelining, concurrency, connection-churn, fd-port-reuse, slow-body, tls-boundary, timeout-retry, pressure, handoff, virtual-thread, netty, netty-server, dispatch, w3c, w3c-match, obi-flags, w3c-fault, primary-w3c-fault, primary-w3c-stale, w3c-only, helper-attach-failure, restart-fault, fail-open, restart, disabled, or uninstrumented")
+	flag.StringVar(&cfg.faultMode, "fault-mode", "", "W3C fault mode")
+	flag.StringVar(&cfg.javaDiagnosticsBefore, "java-diagnostics-before", "", "sanitized Java diagnostics baseline for primary-w3c-fault")
 	flag.IntVar(&cfg.requestCount, "requests", 0, "number of requests (zero selects a scenario default)")
 	flag.DurationVar(&cfg.timeout, "timeout", 45*time.Second, "whole-scenario timeout")
 	flag.StringVar(&cfg.expectedTLS, "expected-tls", "TLSv1.3", "backend TLS protocol")
@@ -306,8 +308,8 @@ func parseFlags() config {
 		"pressure": true,
 		"handoff":  true, "virtual-thread": true, "netty": true, "netty-server": true, "dispatch": true,
 		"w3c": true, "w3c-match": true, "obi-flags": true, "w3c-fault": true,
-		"primary-w3c-stale": true,
-		"w3c-only":          true, "helper-attach-failure": true, "restart-fault": true,
+		"primary-w3c-fault": true, "primary-w3c-stale": true,
+		"w3c-only": true, "helper-attach-failure": true, "restart-fault": true,
 		"disabled": true, "uninstrumented": true,
 		"fail-open": true, "restart": true,
 	}
@@ -335,23 +337,57 @@ func parseFlags() config {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
+	if err := validateJavaDiagnosticsBefore(cfg); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
 	return cfg
 }
 
 func validateFaultMode(cfg config) error {
-	if cfg.scenario != "w3c-fault" {
+	if !isFaultScenario(cfg.scenario) {
 		if cfg.faultMode != "" {
-			return errors.New("--fault-mode requires w3c-fault")
+			return errors.New("--fault-mode requires w3c-fault or primary-w3c-fault")
 		}
 		return nil
 	}
 	if cfg.faultMode == "" {
-		return errors.New("w3c-fault requires --fault-mode")
+		return fmt.Errorf("%s requires --fault-mode", cfg.scenario)
+	}
+	if cfg.scenario == "primary-w3c-fault" {
+		if _, ok := expectedPrimaryJavaFaultStatus(cfg.faultMode); !ok {
+			return fmt.Errorf("invalid --fault-mode %q", cfg.faultMode)
+		}
+		return nil
 	}
 	if _, ok := expectedJavaFaultStatus(cfg.faultMode, 0); !ok {
 		return fmt.Errorf("invalid --fault-mode %q", cfg.faultMode)
 	}
 	return nil
+}
+
+func isFaultScenario(scenario string) bool {
+	return scenario == "w3c-fault" || scenario == "primary-w3c-fault"
+}
+
+func validateJavaDiagnosticsBefore(cfg config) error {
+	if cfg.scenario != "primary-w3c-fault" {
+		if cfg.javaDiagnosticsBefore != "" {
+			return errors.New("--java-diagnostics-before requires primary-w3c-fault")
+		}
+		return nil
+	}
+	if cfg.javaDiagnosticsBefore == "" {
+		return errors.New("primary-w3c-fault requires --java-diagnostics-before")
+	}
+	if _, err := javaDiagnosticsCounters(cfg.javaDiagnosticsBefore); err != nil {
+		return errors.New("invalid --java-diagnostics-before")
+	}
+	return nil
+}
+
+func requestsBridgeDiagnostics(cfg config, request requestCase) bool {
+	return isFaultScenario(cfg.scenario) && request.BridgeDiagnostics
 }
 
 func expectedJavaFaultStatus(faultMode string, requestIndex int) (string, bool) {
@@ -371,6 +407,17 @@ func expectedJavaFaultStatus(faultMode string, requestIndex int) (string, bool) 
 		return "malformed", true
 	case "version-mismatch":
 		return "version_mismatch", true
+	default:
+		return "", false
+	}
+}
+
+func expectedPrimaryJavaFaultStatus(faultMode string) (string, bool) {
+	switch faultMode {
+	case "version-mismatch":
+		return "version_mismatch", true
+	case "zero-trace-id", "zero-span-id":
+		return "malformed", true
 	default:
 		return "", false
 	}
@@ -407,8 +454,17 @@ func run(ctx context.Context, cfg config) (*runResult, error) {
 	if elapsed > 0 {
 		result.ThroughputPerSecond = float64(len(requests)) / elapsed.Seconds()
 	}
-	if cfg.scenario == "w3c-fault" {
+	if isFaultScenario(cfg.scenario) {
 		result.FaultDiagnosticsAfter = responses[len(responses)-1].BridgeDiagnostics
+	}
+	if cfg.scenario == "primary-w3c-fault" {
+		if err := assertPrimaryFaultDiagnostics(
+			cfg.javaDiagnosticsBefore,
+			result.FaultDiagnosticsAfter,
+			requests[0].ExpectedJavaStatus,
+		); err != nil {
+			return result, err
+		}
 	}
 	result.Latency = summarizeLatencies(latencies)
 	for i := range requests {
@@ -448,6 +504,9 @@ func run(ctx context.Context, cfg config) (*runResult, error) {
 
 func makeRequests(cfg config) ([]requestCase, error) {
 	if err := validateFaultMode(cfg); err != nil {
+		return nil, err
+	}
+	if err := validateJavaDiagnosticsBefore(cfg); err != nil {
 		return nil, err
 	}
 
@@ -499,6 +558,9 @@ func makeRequests(cfg config) ([]requestCase, error) {
 		return nil, fmt.Errorf("scenario %s requires exactly one request", cfg.scenario)
 	}
 	if cfg.scenario == "primary-w3c-stale" && count != 1 {
+		return nil, fmt.Errorf("scenario %s requires exactly one request", cfg.scenario)
+	}
+	if cfg.scenario == "primary-w3c-fault" && count != 1 {
 		return nil, fmt.Errorf("scenario %s requires exactly one request", cfg.scenario)
 	}
 	if cfg.scenario == "restart-fault" && count <= restartAfterStartRequestIndex {
@@ -608,6 +670,21 @@ func makeRequests(cfg config) ([]requestCase, error) {
 			if err := addW3CContext(random, &requests[i], "01", "valid-w3c-primary-stale"); err != nil {
 				return nil, err
 			}
+		case "primary-w3c-fault":
+			expectedStatus, ok := expectedPrimaryJavaFaultStatus(cfg.faultMode)
+			if !ok {
+				return nil, fmt.Errorf("invalid --fault-mode %q", cfg.faultMode)
+			}
+			requests[i].InjectedFaultMode = cfg.faultMode
+			requests[i].ExpectedJavaStatus = expectedStatus
+			caseName := fmt.Sprintf(
+				"valid-w3c-primary-injected-%s-java-%s",
+				cfg.faultMode,
+				expectedStatus,
+			)
+			if err := addW3CContext(random, &requests[i], "01", caseName); err != nil {
+				return nil, err
+			}
 		case "w3c-only":
 			if err := addW3CContext(random, &requests[i], "01", "valid-w3c-no-obi"); err != nil {
 				return nil, err
@@ -627,7 +704,7 @@ func makeRequests(cfg config) ([]requestCase, error) {
 			}
 		}
 	}
-	if cfg.scenario == "w3c-fault" {
+	if isFaultScenario(cfg.scenario) {
 		requests[len(requests)-1].BridgeDiagnostics = true
 	}
 	if parallelScenario(cfg.scenario) {
@@ -1098,7 +1175,7 @@ func newHTTPRequest(ctx context.Context, cfg config, requestCase requestCase) (*
 		query.Set("socket_identity", "1")
 		requestURL.RawQuery = query.Encode()
 	}
-	if cfg.scenario == "w3c-fault" && requestCase.BridgeDiagnostics {
+	if requestsBridgeDiagnostics(cfg, requestCase) {
 		query := requestURL.Query()
 		query.Set("bridge_diagnostics", "1")
 		requestURL.RawQuery = query.Encode()
@@ -1191,7 +1268,7 @@ func decodeBackendResponse(
 	}
 	diagnostics, err := javaDiagnosticsFromHeader(
 		response.Header,
-		cfg.scenario == "w3c-fault" && requestCase.BridgeDiagnostics,
+		requestsBridgeDiagnostics(cfg, requestCase),
 	)
 	if err != nil {
 		return backendResponse{}, err
@@ -1312,6 +1389,44 @@ func sanitizeJavaDiagnostics(snapshot string) (string, error) {
 		sanitized[index] = name + "=" + strconv.FormatUint(counter, 36)
 	}
 	return strings.Join(sanitized, ","), nil
+}
+
+func javaDiagnosticsCounters(snapshot string) (map[string]uint64, error) {
+	sanitized, err := sanitizeJavaDiagnostics(snapshot)
+	if err != nil {
+		return nil, err
+	}
+	counters := make(map[string]uint64, len(javaDiagnosticsFieldNames))
+	for _, field := range strings.Split(sanitized, ",") {
+		name, value, _ := strings.Cut(field, "=")
+		counter, err := strconv.ParseUint(value, 36, 64)
+		if err != nil {
+			return nil, err
+		}
+		counters[name] = counter
+	}
+	return counters, nil
+}
+
+func assertPrimaryFaultDiagnostics(before, after, expectedStatus string) error {
+	beforeCounters, err := javaDiagnosticsCounters(before)
+	if err != nil {
+		return fmt.Errorf("parse primary Java diagnostics baseline: %w", err)
+	}
+	afterCounters, err := javaDiagnosticsCounters(after)
+	if err != nil {
+		return fmt.Errorf("parse primary Java diagnostics result: %w", err)
+	}
+	for name, beforeValue := range beforeCounters {
+		if afterCounters[name] < beforeValue {
+			return fmt.Errorf("primary Java diagnostics counter %q decreased", name)
+		}
+	}
+	expectedCounter := "t_" + expectedStatus
+	if afterCounters[expectedCounter]-beforeCounters[expectedCounter] != 1 {
+		return fmt.Errorf("expected one primary Java %s result", expectedStatus)
+	}
+	return nil
 }
 
 func boolFlag(value bool) string {
@@ -1497,6 +1612,8 @@ func expectationFor(cfg config, request requestCase) tracecheck.Expectation {
 		javaTraceFlags = "01"
 	case "w3c-fault":
 		mode = tracecheck.ModeW3CNoOBI
+	case "primary-w3c-fault":
+		mode = tracecheck.ModeW3C
 	case "primary-w3c-stale":
 		mode = tracecheck.ModeW3C
 	case "w3c-only":

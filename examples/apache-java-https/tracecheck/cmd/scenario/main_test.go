@@ -448,6 +448,119 @@ func TestPrimaryW3CStaleRequestUsesTheStandardParent(t *testing.T) {
 	require.ErrorContains(t, err, "requires exactly one request")
 }
 
+func TestPrimaryW3CFaultRequestUsesW3CPrecedenceAndDiagnostics(t *testing.T) {
+	baseline := javaDiagnosticsSnapshot(t, 0)
+	tests := []struct {
+		faultMode string
+		status    string
+	}{
+		{faultMode: "version-mismatch", status: "version_mismatch"},
+		{faultMode: "zero-trace-id", status: "malformed"},
+		{faultMode: "zero-span-id", status: "malformed"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.faultMode, func(t *testing.T) {
+			cfg := config{
+				scenario:              "primary-w3c-fault",
+				faultMode:             test.faultMode,
+				javaDiagnosticsBefore: baseline,
+				seed:                  42,
+			}
+			requests, err := makeRequests(cfg)
+			require.NoError(t, err)
+			require.Len(t, requests, 1)
+
+			requestCase := requests[0]
+			assert.Equal(t, test.faultMode, requestCase.InjectedFaultMode)
+			assert.Equal(t, test.status, requestCase.ExpectedJavaStatus)
+			assert.Equal(
+				t,
+				"valid-w3c-primary-injected-"+test.faultMode+"-java-"+test.status,
+				requestCase.W3CCase,
+			)
+			assert.Equal(t, "01", requestCase.W3CTraceFlags)
+			assert.NotEmpty(t, requestCase.W3CTraceID)
+			assert.NotEmpty(t, requestCase.W3CParentSpanID)
+			assert.True(t, requestCase.BridgeDiagnostics)
+			assert.True(t, requestCase.CloseConnection)
+			assert.Equal(t, tracecheck.ModeW3C, expectationFor(cfg, requestCase).Mode)
+
+			request, requestErr := newHTTPRequest(
+				context.Background(),
+				config{baseURL: "https://example.test", scenario: cfg.scenario},
+				requestCase,
+			)
+			require.NoError(t, requestErr)
+			assert.Equal(t, "1", request.URL.Query().Get("bridge_diagnostics"))
+			assert.Equal(t, "1", request.URL.Query().Get("close"))
+
+			requestCase.BridgeDiagnostics = false
+			request, requestErr = newHTTPRequest(
+				context.Background(),
+				config{baseURL: "https://example.test", scenario: cfg.scenario},
+				requestCase,
+			)
+			require.NoError(t, requestErr)
+			assert.Empty(t, request.URL.Query().Get("bridge_diagnostics"))
+		})
+	}
+
+	for _, faultMode := range []string{"", "alternating", "timeout", "bad-magic"} {
+		require.Error(t, validateFaultMode(config{
+			scenario:  "primary-w3c-fault",
+			faultMode: faultMode,
+		}), faultMode)
+	}
+	require.ErrorContains(t, validateJavaDiagnosticsBefore(config{
+		scenario: "primary-w3c-fault",
+	}), "requires --java-diagnostics-before")
+	require.ErrorContains(t, validateJavaDiagnosticsBefore(config{
+		scenario:              "basic",
+		javaDiagnosticsBefore: baseline,
+	}), "requires primary-w3c-fault")
+
+	_, err := makeRequests(config{
+		scenario:              "primary-w3c-fault",
+		faultMode:             "zero-trace-id",
+		javaDiagnosticsBefore: baseline,
+		requestCount:          2,
+		seed:                  42,
+	})
+	require.ErrorContains(t, err, "requires exactly one request")
+}
+
+func TestPrimaryFaultDiagnosticsRequireOneExpectedStatus(t *testing.T) {
+	baseline := javaDiagnosticsSnapshot(t, 0)
+	for _, test := range []struct {
+		status string
+	}{
+		{status: "version_mismatch"},
+		{status: "malformed"},
+	} {
+		t.Run(test.status, func(t *testing.T) {
+			after := javaDiagnosticsSnapshotWithCounters(t, map[string]uint64{
+				"t_" + test.status: 1,
+			})
+			require.NoError(t, assertPrimaryFaultDiagnostics(baseline, after, test.status))
+			require.ErrorContains(
+				t,
+				assertPrimaryFaultDiagnostics(baseline, baseline, test.status),
+				"expected one primary Java",
+			)
+		})
+	}
+
+	before := javaDiagnosticsSnapshotWithCounters(t, map[string]uint64{
+		"t_malformed": 1,
+	})
+	require.ErrorContains(
+		t,
+		assertPrimaryFaultDiagnostics(before, javaDiagnosticsSnapshot(t, 0), "malformed"),
+		"decreased",
+	)
+}
+
 func TestBridgeDiagnosticsHeaderIsRequiredOnlyForOptedInRequest(t *testing.T) {
 	snapshot := javaDiagnosticsSnapshot(t, 0)
 	header := make(http.Header)
@@ -522,23 +635,27 @@ func TestJavaDiagnosticsSnapshotValidationIsExactAndBounded(t *testing.T) {
 
 func TestFaultDiagnosticsAreExposedOnlyAtTheTopLevel(t *testing.T) {
 	snapshot := javaDiagnosticsSnapshot(t, 0)
-	var output bytes.Buffer
-	require.NoError(t, encodeRunResult(&output, &runResult{
-		Status:                "passed",
-		Scenario:              "w3c-fault",
-		FaultDiagnosticsAfter: snapshot,
-		Cases: []caseResult{{
-			Request: requestCase{
-				Marker:            "fault",
-				BridgeDiagnostics: true,
-			},
-			Response: backendResponse{BridgeDiagnostics: snapshot},
-		}},
-	}))
+	for _, scenario := range []string{"w3c-fault", "primary-w3c-fault"} {
+		t.Run(scenario, func(t *testing.T) {
+			var output bytes.Buffer
+			require.NoError(t, encodeRunResult(&output, &runResult{
+				Status:                "passed",
+				Scenario:              scenario,
+				FaultDiagnosticsAfter: snapshot,
+				Cases: []caseResult{{
+					Request: requestCase{
+						Marker:            "fault",
+						BridgeDiagnostics: true,
+					},
+					Response: backendResponse{BridgeDiagnostics: snapshot},
+				}},
+			}))
 
-	assert.Contains(t, output.String(), `"fault_diagnostics_after": "`+snapshot+`"`)
-	assert.Equal(t, 1, strings.Count(output.String(), snapshot))
-	assert.NotContains(t, output.String(), `"bridge_diagnostics"`)
+			assert.Contains(t, output.String(), `"fault_diagnostics_after": "`+snapshot+`"`)
+			assert.Equal(t, 1, strings.Count(output.String(), snapshot))
+			assert.NotContains(t, output.String(), `"bridge_diagnostics"`)
+		})
+	}
 }
 
 func TestNonFaultRequestCannotOptInToBridgeDiagnostics(t *testing.T) {
@@ -580,11 +697,18 @@ func TestRestartFaultRequestsUseStandardParents(t *testing.T) {
 }
 
 func javaDiagnosticsSnapshot(t *testing.T, value uint64) string {
+	counters := make(map[string]uint64, len(javaDiagnosticsFieldNames))
+	for _, name := range javaDiagnosticsFieldNames {
+		counters[name] = value
+	}
+	return javaDiagnosticsSnapshotWithCounters(t, counters)
+}
+
+func javaDiagnosticsSnapshotWithCounters(t *testing.T, counters map[string]uint64) string {
 	t.Helper()
-	encoded := strconv.FormatUint(value, 36)
 	fields := make([]string, len(javaDiagnosticsFieldNames))
 	for index, name := range javaDiagnosticsFieldNames {
-		fields[index] = name + "=" + encoded
+		fields[index] = name + "=" + strconv.FormatUint(counters[name], 36)
 	}
 	return strings.Join(fields, ",")
 }

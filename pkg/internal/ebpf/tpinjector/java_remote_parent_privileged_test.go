@@ -18,9 +18,7 @@ import (
 	"unsafe"
 
 	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/features"
 	"github.com/cilium/ebpf/link"
-	"github.com/cilium/ebpf/rlimit"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
@@ -42,18 +40,7 @@ const (
 // reports missing kernel features or capabilities as unsupported rather than
 // treating an unexecuted security scenario as a pass.
 func TestJavaRemoteParentPrimarySocketAuthority(t *testing.T) {
-	if err := javabridge.HaveSockOpsNetnsCookie(); err != nil {
-		t.Skipf("sockops network namespace cookies unsupported: %v", err)
-	}
-	if err := features.HaveProgramType(ebpf.CGroupSockopt); err != nil {
-		t.Skipf("cgroup sockopt BPF programs unsupported: %v", err)
-	}
-	if err := features.HaveMapType(ebpf.SkStorage); err != nil {
-		t.Skipf("BPF socket-local storage unsupported: %v", err)
-	}
-	if err := rlimit.RemoveMemlock(); err != nil {
-		t.Skipf("cannot remove the BPF memory lock limit: %v", err)
-	}
+	requireJavaRemoteParentPrimarySockoptSupport(t)
 
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -299,18 +286,7 @@ func TestJavaRemoteParentUnauthorizedProcessHelper(t *testing.T) {
 }
 
 func TestJavaRemoteParentPrimaryRequiresAuthoritativeDataHook(t *testing.T) {
-	if err := javabridge.HaveSockOpsNetnsCookie(); err != nil {
-		t.Skipf("sockops network namespace cookies unsupported: %v", err)
-	}
-	if err := features.HaveProgramType(ebpf.CGroupSockopt); err != nil {
-		t.Skipf("cgroup sockopt BPF programs unsupported: %v", err)
-	}
-	if err := features.HaveMapType(ebpf.SkStorage); err != nil {
-		t.Skipf("BPF socket-local storage unsupported: %v", err)
-	}
-	if err := rlimit.RemoveMemlock(); err != nil {
-		t.Skipf("cannot remove the BPF memory lock limit: %v", err)
-	}
+	requireJavaRemoteParentPrimarySockoptSupport(t)
 
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()

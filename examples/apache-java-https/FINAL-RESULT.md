@@ -29,7 +29,7 @@ evidence define the current boundary of the result.
 | 3. Java uses the official agent and OBI extension/helper | pass | [official agent metadata](evidence/otel-unix-tls12-bd1c9327/official-javaagent.json), [external-extension runtime metadata](evidence/otel-getsockopt-tls13-c9d14356/runtime-metadata.json), and [dynamic helper attach evidence](evidence/otel-getsockopt-tls13-c9d14356/README.md#retained-proof). |
 | 4. Traffic and traces are collected without a vendor UI | pass | [local receiver inventory](evidence/otel-getsockopt-tls13-c9d14356/runtime-images.json) and retained scenario JSON. |
 | 5. Apache client and Java server spans have one exact trace/parent relationship | pass | [basic trace graph](evidence/otel-getsockopt-tls13-c9d14356/scenario-basic.json). |
-| 6. Precedence, concurrency, keepalive, failure, and compatibility cases are exercised | fail | Retained controls pass precedence, concurrency, keepalive, and Unix fault cells, but primary stale/malformed JVM acceptance is not retained; [#37 benchmark](BENCHMARK.md) and [#38 compatibility](COMPATIBILITY.md) rows remain untested. |
+| 6. Precedence, concurrency, keepalive, failure, and compatibility cases are exercised | fail | Retained controls pass precedence, concurrency, keepalive, and Unix fault cells. An unexecuted VM-gated JVM-to-JNI-to-cgroup-sockopt fixture encodes stale, ABI-mismatch, and zero-ID primary records, but it has no retained privileged execution and is not an application/OpenTelemetry/W3C fault result; [#37 benchmark](BENCHMARK.md) and [#38 compatibility](COMPATIBILITY.md) rows remain untested. |
 | 7. Exact build, run, certificate, host, agent, and cleanup steps are documented | pass | [reproducible runbook](README.md), including the bounded [deliberate assertion failure](README.md#deliberate-assertion-failure-control), and retained environment/certificate evidence. |
 
 | Acceptance item | Status | Evidence or remaining requirement |
@@ -71,6 +71,25 @@ evidence define the current boundary of the result.
 | No duplicate Java server span | pass | [all scenario graphs and statuses](evidence/otel-getsockopt-tls13-c9d14356/README.md#retained-proof) |
 | No vendor UI or backend | pass | [sanitized runtime image inventory](evidence/otel-getsockopt-tls13-c9d14356/runtime-images.json) |
 
+## VM-gated primary fault fixture
+
+[`TestJavaRemoteParentPrimaryJVMFaults`](../../pkg/internal/ebpf/tpinjector/java_remote_parent_jvm_privileged_test.go)
+starts a clean JVM with the packaged OBI agent, negotiates the primary
+`getsockopt` socket through JNI, and then calls the Java bridge after staging
+a remote-parent state and associated BPF map entries. Its cases are valid,
+stale, ABI-version mismatch, all-zero trace ID, and all-zero parent span ID.
+When run, it asserts the status and returned identifiers, cleared socket FD,
+and absence of the staged state and data acknowledgement.
+
+The fixture is run by
+[`run-java-remote-parent-rhel.sh`](../../internal/test/vm/run-java-remote-parent-rhel.sh)
+and is intended for the RHEL kernel VM workflow. It calls
+`RemoteParentBridge.takeRemoteParent()` directly and manually stages BPF state;
+therefore it is source-level bridge/provider coverage, not a retained Apache,
+OpenTelemetry extraction, or W3C precedence acceptance result. A successful
+privileged run and its artifact, plus an application-level primary fault
+control, remain required before this record can claim those outcomes.
+
 ## Reproduction commands
 
 ```bash
@@ -108,11 +127,11 @@ column.
 | #33 final report | definition-of-done reconciliation names every parent item and the currently passing evidence | resolve the parent item 6 gaps before declaring PoC success |
 | #34 stress | retained TLS 1.3 and TLS 1.2 primary, and TLS 1.2 Unix stress, reuse, TLS-boundary-fixture, pressure, cleanup, and recovery cases passed | execute remaining advertised cells |
 | #35 handoff | executor, virtual-thread, Netty worker, redispatch, and bounded inbound-Netty receive-to-extraction scenarios passed in the retained primary run | execute the remaining framework and environment matrix evidence |
-| #36 fail-open | retained primary and Unix absence, restart, attach, disabled, fault, and recovery controls passed | retain a JVM/application primary-transport stale and malformed fault control; the existing fault responder is Unix-only |
+| #36 fail-open | retained primary and Unix absence, restart, attach, disabled, fault, and recovery controls passed; an unexecuted VM-gated JVM-to-JNI-to-cgroup-sockopt component fixture encodes stale, ABI-mismatch, and zero-ID records | retain a successful privileged fixture artifact and a JVM/application primary-transport stale and malformed fault control; the existing fault responder is Unix-only |
 | #37 benchmark | predeclared matrix, repeated bounded workload, and resource/map snapshots | execute on fixed hardware and add sustained latency/throughput evidence |
 | #38 compatibility | explicit untested matrix | execute each claimed kernel/cgroup/architecture/JVM/agent/TLS/transport cell |
 | #39 diagnostics | retained OpenTelemetry and Splunk per-scenario counters, current availability schema, V2 snapshots, and suppression evidence passed | execute remaining agent/environment cells |
-| #40 security | retained primary probes plus Unix forged/flood/path/permission matrix, exact-parent victim, and recovery passed | retain primary wrong-live-socket and stale-TTL evidence before marking the partial security matrix complete |
+| #40 security | retained primary probes plus Unix forged/flood/path/permission matrix, exact-parent victim, and recovery passed; an unexecuted VM-gated primary component fixture encodes stale and malformed record rejection | retain primary wrong-live-socket and stale-TTL evidence before marking the partial security matrix complete |
 
 Unexecuted rows remain `untested`; a plan or template is not a successful
 validation result.

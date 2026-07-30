@@ -153,12 +153,29 @@ func mainExitCode(args []string, stdout, stderr io.Writer) int {
 }
 
 func runPrimaryLiveFDProbe(ctx context.Context, targetFD int) (probeResult, error) {
+	return runPrimaryLiveFDProbeWithDuplicator(ctx, targetFD, duplicateProcessFD)
+}
+
+func runPrimaryLiveFDProbeWithDuplicator(
+	ctx context.Context,
+	targetFD int,
+	duplicate func(int, int) (*os.File, error),
+) (probeResult, error) {
 	if err := ctx.Err(); err != nil {
 		return probeResult{}, err
 	}
 
-	socket, err := duplicateProcessFD(javaProcessPID, targetFD)
+	socket, err := duplicate(javaProcessPID, targetFD)
 	if err != nil {
+		if pidfdDuplicationUnavailable(err) {
+			return probeResult{
+				Status: "unsupported",
+				Mode:   "primary-live-fd",
+				Cases: []probeCase{{
+					Name: "pidfd-duplicate", Outcome: "unavailable",
+				}},
+			}, nil
+		}
 		return probeResult{}, fmt.Errorf("duplicate Java live socket descriptor: %w", err)
 	}
 	defer socket.Close()
@@ -172,9 +189,14 @@ func runPrimaryLiveFDProbe(ctx context.Context, targetFD int) (probeResult, erro
 		return probeResult{}, err
 	}
 	result.Cases = append([]probeCase{{
-		Name: "exact-live-fd-duplicate", Outcome: "opened",
+		Name: "pidfd-duplicate", Outcome: "opened",
 	}}, result.Cases...)
 	return result, nil
+}
+
+func pidfdDuplicationUnavailable(err error) bool {
+	return errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EOPNOTSUPP) ||
+		errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES)
 }
 
 func duplicateProcessFD(pid, targetFD int) (*os.File, error) {
@@ -241,7 +263,7 @@ func exercisePrimaryLiveFDProbe(ctx context.Context, raw syscall.RawConn) (probe
 		return probeResult{}, fmt.Errorf("exact live descriptor retrieval: expected native unsupported result, got %s", outcome)
 	}
 	result.Cases = append(result.Cases, probeCase{
-		Name: "exact-live-fd-take", Outcome: outcome,
+		Name: "duplicated-fd-take", Outcome: outcome,
 	})
 	return result, nil
 }

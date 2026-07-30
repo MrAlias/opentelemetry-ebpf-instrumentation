@@ -6,20 +6,29 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
-	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
+)
+
+const (
+	pidfdChildProcessEnv = "OBI_SECURITY_PROBE_PIDFD_CHILD"
+	pidfdChildMarker     = byte(0x5e)
 )
 
 func TestRequestUsesOnlyTheVersionedNamespaceIdentity(t *testing.T) {
@@ -115,11 +124,29 @@ func TestPrimaryLiveFDProbeUsesOneShotNativeResults(t *testing.T) {
 	assert.Equal(t, []probeCase{
 		{Name: "standard-option", Outcome: "preserved"},
 		{Name: "wrong-process-negotiation", Outcome: "native-unsupported"},
-		{Name: "exact-live-fd-take", Outcome: "native-unsupported"},
+		{Name: "duplicated-fd-take", Outcome: "native-unsupported"},
 	}, result.Cases)
 }
 
-func TestDuplicateProcessFDDuplicatesOnlyTheRequestedSocket(t *testing.T) {
+func TestPrimaryLiveFDProbeReportsUnavailableDescriptorDuplication(t *testing.T) {
+	result, err := runPrimaryLiveFDProbeWithDuplicator(
+		t.Context(), 7, func(pid, targetFD int) (*os.File, error) {
+			assert.Equal(t, javaProcessPID, pid)
+			assert.Equal(t, 7, targetFD)
+			return nil, unix.EPERM
+		},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, probeResult{
+		Status: "unsupported",
+		Mode:   "primary-live-fd",
+		Cases: []probeCase{{
+			Name: "pidfd-duplicate", Outcome: "unavailable",
+		}},
+	}, result)
+}
+
+func TestDuplicateProcessFDDuplicatesSocket(t *testing.T) {
 	client, server, err := connectedTCPPair()
 	require.NoError(t, err)
 	defer client.Close()
@@ -133,7 +160,7 @@ func TestDuplicateProcessFDDuplicatesOnlyTheRequestedSocket(t *testing.T) {
 	}))
 
 	duplicate, err := duplicateProcessFD(os.Getpid(), targetFD)
-	if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+	if pidfdDuplicationUnavailable(err) {
 		t.Skipf("pidfd descriptor duplication is unavailable: %v", err)
 	}
 	require.NoError(t, err)
@@ -151,6 +178,58 @@ func TestDuplicateProcessFDDuplicatesOnlyTheRequestedSocket(t *testing.T) {
 	require.NoError(t, err)
 	assert.EqualValues(t, len(socketType), length)
 	assert.Equal(t, uint32(unix.SOCK_STREAM), binary.NativeEndian.Uint32(socketType))
+}
+
+func TestDuplicateProcessFDDuplicatesCrossProcessSocket(t *testing.T) {
+	command := exec.Command(os.Args[0], "-test.run=^TestPIDFDChildProcess$")
+	command.Env = append(os.Environ(), pidfdChildProcessEnv+"=1")
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	stdout, err := command.StdoutPipe()
+	require.NoError(t, err)
+	require.NoError(t, command.Start())
+	defer func() {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+	}()
+
+	targetFDLine, err := bufio.NewReader(stdout).ReadString('\n')
+	require.NoError(t, err)
+	targetFD, err := strconv.Atoi(strings.TrimSpace(targetFDLine))
+	require.NoError(t, err)
+	assert.NotEqual(t, os.Getpid(), command.Process.Pid)
+
+	duplicate, err := duplicateProcessFD(command.Process.Pid, targetFD)
+	if pidfdDuplicationUnavailable(err) {
+		t.Skipf("cross-process pidfd descriptor duplication is unavailable: %v", err)
+	}
+	require.NoError(t, err)
+	_, err = duplicate.Write([]byte{pidfdChildMarker})
+	require.NoError(t, err)
+	require.NoError(t, duplicate.Close())
+	require.NoError(t, command.Wait(), stderr.String())
+}
+
+func TestPIDFDChildProcess(t *testing.T) {
+	if os.Getenv(pidfdChildProcessEnv) != "1" {
+		return
+	}
+
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	require.NoError(t, err)
+	target := os.NewFile(uintptr(fds[0]), "pidfd-child-target")
+	peer := os.NewFile(uintptr(fds[1]), "pidfd-child-peer")
+	require.NotNil(t, target)
+	require.NotNil(t, peer)
+	defer target.Close()
+	defer peer.Close()
+
+	_, err = fmt.Fprintln(os.Stdout, target.Fd())
+	require.NoError(t, err)
+	var received [1]byte
+	_, err = io.ReadFull(peer, received[:])
+	require.NoError(t, err)
+	assert.Equal(t, pidfdChildMarker, received[0])
 }
 
 func TestDuplicateProcessFDRejectsInvalidIdentifiers(t *testing.T) {

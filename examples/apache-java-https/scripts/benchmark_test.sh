@@ -17,6 +17,8 @@ readonly FAKE_SUSTAINED_LOAD_SEED=0
 readonly FAKE_WORKLOAD_BASE_URL="http://127.0.0.1:18080"
 readonly FAKE_WORKLOAD_PATH="/api/echo?delay_ms=150"
 readonly FAKE_WORKLOAD_CONNECTION_MODE="close"
+readonly FAKE_DIRECT_JAVA_WORKLOAD_BASE_URL="https://127.0.0.1:18443"
+readonly FAKE_DIRECT_JAVA_WORKLOAD_CA_FILE="/benchmark-ca.crt"
 readonly FAKE_REQUEST_TIMEOUT_SECONDS=10
 readonly FAKE_JAVA_DIAGNOSTIC_COUNTER_NAMES=(
   cfg_on cfg_off provider_ok provider_reject provider_ver extension_reg
@@ -35,6 +37,7 @@ fake_java_diagnostics_snapshot() {
   local -r discard_standard="$1"
   local -r take_valid="$2"
   local -r discard_valid="${3:-0}"
+  local -r take_missing="${4:-0}"
   local counter=""
   local -a entries=()
 
@@ -43,6 +46,7 @@ fake_java_diagnostics_snapshot() {
       discard_standard) entries+=("$counter=$discard_standard") ;;
       t_valid) entries+=("$counter=$take_valid") ;;
       d_valid) entries+=("$counter=$discard_valid") ;;
+      t_missing) entries+=("$counter=$take_missing") ;;
       *) entries+=("$counter=0") ;;
     esac
   done
@@ -52,16 +56,84 @@ fake_java_diagnostics_snapshot() {
 fake_diagnostics_increment() {
   local -r discard_increment="$1"
   local -r take_valid_increment="$2"
+  local -r take_missing_increment="${3:-0}"
   local discard_standard=""
   local take_valid=""
+  local take_missing=""
   local extra=""
 
   [[ -n "${FAKE_DIAGNOSTICS_FILE:-}" && -f "$FAKE_DIAGNOSTICS_FILE" ]] || return 64
-  read -r discard_standard take_valid extra <"$FAKE_DIAGNOSTICS_FILE" || return 64
-  [[ "$discard_standard" =~ ^[0-9]+$ && "$take_valid" =~ ^[0-9]+$ && -z "$extra" ]] || return 64
-  printf '%s %s\n' \
-    "$((discard_standard + discard_increment))" "$((take_valid + take_valid_increment))" \
+  read -r discard_standard take_valid take_missing extra <"$FAKE_DIAGNOSTICS_FILE" || return 64
+  [[ "$discard_standard" =~ ^[0-9]+$ && "$take_valid" =~ ^[0-9]+$ &&
+    "$take_missing" =~ ^[0-9]+$ && -z "$extra" ]] || return 64
+  printf '%s %s %s\n' \
+    "$((discard_standard + discard_increment))" \
+    "$((take_valid + take_valid_increment))" \
+    "$((take_missing + take_missing_increment))" \
     >"$FAKE_DIAGNOSTICS_FILE"
+}
+
+fake_bpf_metrics_increment() {
+  local -r report_increment="$1"
+  local -r candidate_increment="${2:-0}"
+  local -r inject_increment="${3:-0}"
+  local -r stage_increment="${4:-0}"
+  local -r handoff_increment="${5:-0}"
+  local -r take_increment="${6:-0}"
+  local -r discard_increment="${7:-0}"
+  local -r negotiate_missing_increment="${8:-0}"
+  local report=""
+  local candidate=""
+  local inject=""
+  local stage=""
+  local handoff=""
+  local take=""
+  local discard=""
+  local negotiate_missing=""
+  local extra=""
+
+  [[ -n "${FAKE_BPF_METRICS_FILE:-}" && -f "$FAKE_BPF_METRICS_FILE" ]] || return 64
+  read -r report candidate inject stage handoff take discard negotiate_missing extra <"$FAKE_BPF_METRICS_FILE" || return 64
+  [[ "$report" =~ ^[0-9]+$ && "$candidate" =~ ^[0-9]+$ && "$inject" =~ ^[0-9]+$ &&
+    "$stage" =~ ^[0-9]+$ && "$handoff" =~ ^[0-9]+$ && "$take" =~ ^[0-9]+$ &&
+    "$discard" =~ ^[0-9]+$ && "$negotiate_missing" =~ ^[0-9]+$ && -z "$extra" ]] || return 64
+  printf '%s %s %s %s %s %s %s %s\n' \
+    "$((report + report_increment))" \
+    "$((candidate + candidate_increment))" \
+    "$((inject + inject_increment))" \
+    "$((stage + stage_increment))" \
+    "$((handoff + handoff_increment))" \
+    "$((take + take_increment))" \
+    "$((discard + discard_increment))" \
+    "$((negotiate_missing + negotiate_missing_increment))" \
+    >"$FAKE_BPF_METRICS_FILE"
+}
+
+fake_bpf_metrics_snapshot() {
+  local report=""
+  local candidate=""
+  local inject=""
+  local stage=""
+  local handoff=""
+  local take=""
+  local discard=""
+  local negotiate_missing=""
+  local extra=""
+
+  [[ -n "${FAKE_BPF_METRICS_FILE:-}" && -f "$FAKE_BPF_METRICS_FILE" ]] || return 64
+  read -r report candidate inject stage handoff take discard negotiate_missing extra <"$FAKE_BPF_METRICS_FILE" || return 64
+  [[ "$report" =~ ^[0-9]+$ && "$candidate" =~ ^[0-9]+$ && "$inject" =~ ^[0-9]+$ &&
+    "$stage" =~ ^[0-9]+$ && "$handoff" =~ ^[0-9]+$ && "$take" =~ ^[0-9]+$ &&
+    "$discard" =~ ^[0-9]+$ && "$negotiate_missing" =~ ^[0-9]+$ && -z "$extra" ]] || return 64
+  printf '%s\n' \
+    "obi_java_remote_parent_operations_total{operation=\"candidate\",status=\"valid\",transport=\"tcp\"} $candidate" \
+    "obi_java_remote_parent_operations_total{operation=\"handoff\",status=\"valid\",transport=\"tcp\"} $handoff" \
+    "obi_java_remote_parent_operations_total{operation=\"inject\",status=\"valid\",transport=\"tcp\"} $inject" \
+    "obi_java_remote_parent_operations_total{operation=\"negotiate\",status=\"missing\",transport=\"getsockopt\"} $negotiate_missing" \
+    "obi_java_remote_parent_operations_total{operation=\"report\",status=\"valid\",transport=\"tcp\"} $report" \
+    "obi_java_remote_parent_operations_total{operation=\"stage\",status=\"valid\",transport=\"tcp\"} $stage" \
+    "obi_java_remote_parent_operations_total{operation=\"take\",status=\"valid\",transport=\"getsockopt\"} $take" \
+    "obi_java_remote_parent_operations_total{operation=\"discard\",status=\"valid\",transport=\"getsockopt\"} $discard"
 }
 
 fake_decimal_to_base36() {
@@ -435,16 +507,19 @@ fake_runner() {
     "$result_directory" "$transport" "$agent" "$tls" "$scenario" "$assertion_mode" \
     "$selected_transport" "$project"
   printf 'start %s %s %s\n' "$project" "$transport" "$scenario" >>"$FAKE_RUNNER_LOG"
+  printf 'start %s %s %s\n' "$project" "$transport" "$scenario" >>"$FAKE_EVENTS"
   printf '[fake] INFO: retained run evidence: %s\n' "$result_directory" >&2
 }
 
 fake_benchmark_result() {
+  local base_url=""
   local duration=""
   local concurrency=""
   local request_limit=""
   local seed=""
   local path=""
   local connection_mode=""
+  local ca_file=""
   local w3c="unset"
 
   while (($# > 0)); do
@@ -469,6 +544,14 @@ fake_benchmark_result() {
         path="$2"
         shift 2
         ;;
+      --base-url)
+        base_url="$2"
+        shift 2
+        ;;
+      --ca-file)
+        ca_file="$2"
+        shift 2
+        ;;
       --connection-mode)
         connection_mode="$2"
         shift 2
@@ -477,7 +560,7 @@ fake_benchmark_result() {
         w3c="${1#--w3c=}"
         shift
         ;;
-      --base-url|--request-timeout)
+      --request-timeout)
         shift 2
         ;;
       *)
@@ -490,6 +573,18 @@ fake_benchmark_result() {
     "$request_limit" == "$FAKE_REQUEST_LIMIT" && "$seed" == "$FAKE_SUSTAINED_LOAD_SEED" &&
     "$path" == "$FAKE_WORKLOAD_PATH" && "$connection_mode" == "$FAKE_WORKLOAD_CONNECTION_MODE" &&
     ( "$w3c" == false || "$w3c" == true ) ]] || return 64
+  case "$base_url" in
+    "$FAKE_WORKLOAD_BASE_URL")
+      [[ -z "$ca_file" ]] || return 64
+      ;;
+    "$FAKE_DIRECT_JAVA_WORKLOAD_BASE_URL")
+      [[ "$ca_file" == "$FAKE_DIRECT_JAVA_WORKLOAD_CA_FILE" && "$w3c" == false ]] || return 64
+      fake_diagnostics_increment 0 0 4 || return $?
+      fake_bpf_metrics_increment 4 || return $?
+      printf '%s\n' direct-java-workload >>"$FAKE_EVENTS"
+      ;;
+    *) return 64 ;;
+  esac
   if [[ "$w3c" == true ]]; then
     fake_diagnostics_increment 4 4 || return $?
   fi
@@ -497,7 +592,7 @@ fake_benchmark_result() {
   # Give the harness enough real time to verify the dedicated client session.
   /bin/sleep 0.2
   jq -n \
-    --arg base_url "$FAKE_WORKLOAD_BASE_URL" \
+    --arg base_url "$base_url" \
     --arg path "$path" \
     --arg connection_mode "$connection_mode" \
     --argjson duration_nanos "$((duration * 1000000000))" \
@@ -511,6 +606,7 @@ fake_benchmark_result() {
         base_url: $base_url,
         path: $path,
         connection_mode: $connection_mode,
+        tls_verification: (if ($base_url | startswith("https://")) then "verified_ca_file" else "not_applicable" end),
         w3c: $w3c,
         seed: $seed,
         requested_duration_nanos: $duration_nanos,
@@ -598,6 +694,8 @@ fake_sentinel_result() {
 
 fake_docker() {
   local format=""
+  local project=""
+  local project_temporary=""
   local service=""
   local argument=""
   local -a arguments=("$@")
@@ -607,6 +705,20 @@ fake_docker() {
     printf ' %q' "$argument" >>"$FAKE_DOCKER_LOG"
   done
   printf '\n' >>"$FAKE_DOCKER_LOG"
+  if [[ "${1:-}" == compose && "${2:-}" == --project-name ]]; then
+    project="${3:-}"
+    [[ "$project" =~ ^[a-z0-9][a-z0-9_-]*$ &&
+      -n "${FAKE_COMPOSE_PROJECT_FILE:-}" ]] || return 64
+    project_temporary="$(mktemp -- "${FAKE_COMPOSE_PROJECT_FILE}.tmp.XXXXXX")" || return 64
+    printf '%s\n' "$project" >"$project_temporary" || {
+      rm -f -- "$project_temporary"
+      return 64
+    }
+    mv -f -- "$project_temporary" "$FAKE_COMPOSE_PROJECT_FILE" || {
+      rm -f -- "$project_temporary"
+      return 64
+    }
+  fi
   if [[ "${1:-}" == compose && "${2:-}" == version ]]; then
     printf 'Docker Compose version v2.fake\n'
     return 0
@@ -625,8 +737,12 @@ fake_docker() {
       fi
     done
     if [[ -n "$format" ]]; then
+      [[ -n "${FAKE_COMPOSE_PROJECT_FILE:-}" &&
+        -f "$FAKE_COMPOSE_PROJECT_FILE" ]] || return 64
+      project="$(<"$FAKE_COMPOSE_PROJECT_FILE")"
+      [[ "$project" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || return 64
       printf '%s %s %s %s\n' \
-        "$FAKE_CONTAINER_ID" "$FAKE_PID" "${COMPOSE_PROJECT_NAME:-}" "acceptance-demo-v1"
+        "$FAKE_CONTAINER_ID" "$FAKE_PID" "$project" "acceptance-demo-v1"
     else
       printf '[{"Id":"%s"}]\n' "$FAKE_CONTAINER_ID"
     fi
@@ -688,16 +804,26 @@ fake_curl() {
   for argument in "$@"; do
     case "$argument" in
       http://127.0.0.1:18990/internal/metrics)
-        printf 'obi_java_remote_parent_operations_total 0\n'
+        printf '%s\n' obi-metrics >>"$FAKE_EVENTS"
+        # Model the periodic BPF stats reader: every completed fake scrape has
+        # a new report marker after the counters it published.
+        fake_bpf_metrics_increment 1 || return $?
+        fake_bpf_metrics_snapshot
         return 0
         ;;
       https://127.0.0.1:18443/obi-diagnostics)
+        printf '%s\n' java-diagnostics >>"$FAKE_EVENTS"
         [[ -n "${FAKE_DIAGNOSTICS_FILE:-}" && -f "$FAKE_DIAGNOSTICS_FILE" ]] || return 64
-        read -r discard_standard take_valid extra <"$FAKE_DIAGNOSTICS_FILE" || return 64
-        [[ "$discard_standard" =~ ^[0-9]+$ && "$take_valid" =~ ^[0-9]+$ && -z "$extra" ]] || return 64
+        fake_diagnostics_increment 0 0 1 || return $?
+        fake_bpf_metrics_increment 1 || return $?
+        read -r discard_standard take_valid take_missing extra <"$FAKE_DIAGNOSTICS_FILE" || return 64
+        [[ "$discard_standard" =~ ^[0-9]+$ && "$take_valid" =~ ^[0-9]+$ &&
+          "$take_missing" =~ ^[0-9]+$ && -z "$extra" ]] || return 64
         fake_java_diagnostics_snapshot \
           "$(fake_decimal_to_base36 "$discard_standard")" \
-          "$(fake_decimal_to_base36 "$take_valid")"
+          "$(fake_decimal_to_base36 "$take_valid")" \
+          0 \
+          "$(fake_decimal_to_base36 "$take_missing")"
         return 0
         ;;
     esac
@@ -784,6 +910,13 @@ reset_options() {
   CELL_EXPECTED_STANDARD_PARENT_DISCARDS=0
   CELL_EXPECTED_W3C_VALID_TAKES=0
   CELL_W3C_WORKLOAD_SUCCESSFUL_REQUESTS=0
+  CELL_WORKLOAD_BASE_URL=""
+  CELL_WORKLOAD_PATH=""
+  CELL_WORKLOAD_CONNECTION_MODE=""
+  CELL_WORKLOAD_CA_FILE=""
+  CELL_EXPECTED_TLS_VERIFICATION=""
+  CELL_UPSTREAM_HANDOFF=""
+  CELL_HELPER_IDLE=false
   COMPOSE=()
 }
 
@@ -1043,17 +1176,18 @@ test_core_cell_mapping_is_exact() {
     (
       reset_options
       cell_spec "$cell"
-      [[ "$CELL_SLUG|$CELL_TRANSPORT|$CELL_SCENARIO|$CELL_ASSERTION_MODE|$CELL_REQUIRES_OBI|$CELL_SELECTED_TRANSPORT|$CELL_SENTINEL_SCENARIO|$CELL_SUSTAINED_W3C|$CELL_EXPECTED_STANDARD_PARENT_DISCARDS|$CELL_EXPECTED_W3C_VALID_TAKES" == "$expected" ]]
+      [[ "$CELL_SLUG|$CELL_TRANSPORT|$CELL_SCENARIO|$CELL_ASSERTION_MODE|$CELL_REQUIRES_OBI|$CELL_SELECTED_TRANSPORT|$CELL_SENTINEL_SCENARIO|$CELL_SUSTAINED_W3C|$CELL_EXPECTED_STANDARD_PARENT_DISCARDS|$CELL_EXPECTED_W3C_VALID_TAKES|$CELL_WORKLOAD_BASE_URL|$CELL_WORKLOAD_PATH|$CELL_WORKLOAD_CONNECTION_MODE|$CELL_WORKLOAD_CA_FILE|$CELL_EXPECTED_TLS_VERIFICATION|$CELL_UPSTREAM_HANDOFF|$CELL_HELPER_IDLE" == "$expected" ]]
     ) || {
       printf 'incorrect core cell mapping for %s\n' "$cell" >&2
       return 1
     }
   done <<'EOF'
-uninstrumented|uninstrumented|disabled|benchmark-uninstrumented|uninstrumented|false|disabled|concurrency|false|0|0
-bridge-disabled|bridge-disabled|disabled|benchmark-disabled|disabled|true|disabled|concurrency|false|0|0
-getsockopt-hit|getsockopt-hit|getsockopt|concurrency||true|getsockopt|concurrency|false|0|0
-unix-hit|unix-hit|unix|concurrency||true|unix|concurrency|false|0|0
-getsockopt-w3c|getsockopt-w3c|getsockopt|w3c||true|getsockopt|w3c|true|8|16
+uninstrumented|uninstrumented|disabled|benchmark-uninstrumented|uninstrumented|false|disabled|concurrency|false|0|0|http://127.0.0.1:18080|/api/echo?delay_ms=150|close||not_applicable|apache_proxy|false
+bridge-disabled|bridge-disabled|disabled|benchmark-disabled|disabled|true|disabled|concurrency|false|0|0|http://127.0.0.1:18080|/api/echo?delay_ms=150|close||not_applicable|apache_proxy|false
+getsockopt-hit|getsockopt-hit|getsockopt|concurrency||true|getsockopt|concurrency|false|0|0|http://127.0.0.1:18080|/api/echo?delay_ms=150|close||not_applicable|apache_proxy|false
+unix-hit|unix-hit|unix|concurrency||true|unix|concurrency|false|0|0|http://127.0.0.1:18080|/api/echo?delay_ms=150|close||not_applicable|apache_proxy|false
+getsockopt-w3c|getsockopt-w3c|getsockopt|w3c||true|getsockopt|w3c|true|8|16|http://127.0.0.1:18080|/api/echo?delay_ms=150|close||not_applicable|apache_proxy|false
+getsockopt-helper-idle|getsockopt-helper-idle|getsockopt|concurrency||true|getsockopt|concurrency|false|0|0|https://127.0.0.1:18443|/api/echo?delay_ms=150|close|/benchmark-ca.crt|verified_ca_file|none|true
 EOF
 }
 
@@ -1069,9 +1203,10 @@ write_valid_benchmark_result() {
   local -r p99_nanos="${9:-1}"
 
   jq -n \
-    --arg base_url "$WORKLOAD_BASE_URL" \
-    --arg path "$WORKLOAD_PATH" \
-    --arg connection_mode "$WORKLOAD_CONNECTION_MODE" \
+    --arg base_url "$CELL_WORKLOAD_BASE_URL" \
+    --arg path "$CELL_WORKLOAD_PATH" \
+    --arg connection_mode "$CELL_WORKLOAD_CONNECTION_MODE" \
+    --arg tls_verification "$CELL_EXPECTED_TLS_VERIFICATION" \
     --argjson duration_nanos "$((duration_seconds * 1000000000))" \
     --argjson timeout_nanos "$((REQUEST_TIMEOUT_SECONDS * 1000000000))" \
     --argjson concurrency "$CONCURRENCY" \
@@ -1087,7 +1222,8 @@ write_valid_benchmark_result() {
     --argjson p99_nanos "$p99_nanos" '
       {
         status: "passed", base_url: $base_url, path: $path,
-        connection_mode: $connection_mode, w3c: $w3c, seed: $seed,
+        connection_mode: $connection_mode, tls_verification: $tls_verification,
+        w3c: $w3c, seed: $seed,
         requested_duration_nanos: $duration_nanos,
         request_timeout_nanos: $timeout_nanos, concurrency: $concurrency,
         request_limit: $request_limit, request_limit_reached: false,
@@ -1171,8 +1307,10 @@ write_valid_java_diagnostics_snapshot() {
   local -r discard_standard="$2"
   local -r take_valid="$3"
   local -r discard_valid="${4:-0}"
+  local -r take_missing="${5:-0}"
 
-  fake_java_diagnostics_snapshot "$discard_standard" "$take_valid" "$discard_valid" >"$output"
+  fake_java_diagnostics_snapshot \
+    "$discard_standard" "$take_valid" "$discard_valid" "$take_missing" >"$output"
 }
 
 test_json_validators_require_one_document() {
@@ -1185,6 +1323,7 @@ test_json_validators_require_one_document() {
   local -r fractional_metric_result="$TEST_TMP_DIR/fractional-metric-result.json"
 
   reset_options
+  cell_spec getsockopt-hit
   write_valid_benchmark_result "$benchmark_result" 2
   validate_benchmark_result "$benchmark_result" 2 || {
     printf 'valid benchmark result was rejected\n' >&2
@@ -1372,6 +1511,25 @@ test_json_validators_require_one_document() {
       return 1
     fi
   )
+  (
+    reset_options
+    cell_spec getsockopt-helper-idle
+    write_valid_benchmark_result "$benchmark_result" 2
+    validate_benchmark_result "$benchmark_result" 2 || {
+      printf 'valid direct-Java HTTPS benchmark result was rejected\n' >&2
+      return 1
+    }
+    jq '.tls_verification = "not_applicable"' "$benchmark_result" >"$benchmark_result.tls"
+    if validate_benchmark_result "$benchmark_result.tls" 2 >/dev/null 2>&1; then
+      printf 'helper-idle validator accepted an unverified HTTPS result\n' >&2
+      return 1
+    fi
+    jq '.base_url = "http://127.0.0.1:18080"' "$benchmark_result" >"$benchmark_result.http"
+    if validate_benchmark_result "$benchmark_result.http" 2 >/dev/null 2>&1; then
+      printf 'helper-idle validator accepted an Apache workload result\n' >&2
+      return 1
+    fi
+  )
 }
 
 test_variance_summary_records_ordered_per_cell_statistics() (
@@ -1423,7 +1581,8 @@ test_variance_summary_records_ordered_per_cell_statistics() (
       "bridge-disabled",
       "getsockopt-hit",
       "unix-hit",
-      "getsockopt-w3c"
+      "getsockopt-w3c",
+      "getsockopt-helper-idle"
     ]
   ' "$output/variance.json" >/dev/null || {
     printf 'variance summary did not retain its descriptive per-cell contract\n' >&2
@@ -1734,6 +1893,365 @@ test_w3c_discard_diagnostics_require_exact_delta() {
     fi
   )
 }
+
+test_helper_idle_java_diagnostics_require_exact_correction() (
+  local -r before="$TEST_TMP_DIR/helper-idle-java-before.txt"
+  local -r after="$TEST_TMP_DIR/helper-idle-java-after.txt"
+  local -r output="$TEST_TMP_DIR/helper-idle-java-deltas.json"
+  local -r maximum_successful_requests="$MAX_HELPER_IDLE_WORKLOAD_SUCCESSFUL_REQUESTS"
+  local -r maximum_raw_t_missing="$((maximum_successful_requests + 1))"
+  local -r maximum_raw_t_missing_base36="$(fake_decimal_to_base36 "$maximum_raw_t_missing")"
+
+  reset_options
+  cell_spec getsockopt-helper-idle
+  write_valid_java_diagnostics_snapshot "$before" 0 0 0 0
+  # `p` is base36 for 25: 24 direct-Java requests plus the after-diagnostics
+  # request, whose own server instrumentation is included in that snapshot.
+  write_valid_java_diagnostics_snapshot "$after" 0 0 0 p
+  validate_helper_idle_java_diagnostics "$before" "$after" "$output" 24 || {
+    printf 'helper-idle diagnostics rejected the exact raw N+1 correction\n' >&2
+    return 1
+  }
+  jq -e '
+    .semantic == "direct_java_no_upstream_handoff_not_state_map_miss_proof" and
+    .workload_successful_requests == 24 and
+    .diagnostic_after_probe_t_missing == 1 and
+    .raw_java_t_missing_delta == 25 and
+    .corrected_workload_t_missing == 24 and
+    .correction == {
+      reason: "the_after_obi_diagnostics_request_is_itself_server_instrumented",
+      raw_t_missing_expected: 25,
+      corrected_workload_t_missing_expected: 24
+    } and
+    ([.raw_counters[] | select(.counter == "t_missing")] == [
+      {counter: "t_missing", before_base36: "0", after_base36: "p", observed_delta: 25, expected_delta: 25}
+    ])
+  ' "$output" >/dev/null || {
+    printf 'helper-idle diagnostics omitted its exact correction evidence\n' >&2
+    return 1
+  }
+  rm -f -- "$output"
+  write_valid_java_diagnostics_snapshot "$after" 0 0 0 "$maximum_raw_t_missing_base36"
+  validate_helper_idle_java_diagnostics \
+    "$before" "$after" "$output" "$maximum_successful_requests" || {
+    printf 'helper-idle diagnostics rejected the maximum aggregate workload correction\n' >&2
+    return 1
+  }
+  rm -f -- "$output"
+  write_valid_java_diagnostics_snapshot "$after" 0 0 0 \
+    "$(fake_decimal_to_base36 "$((maximum_raw_t_missing + 1))")"
+  if validate_helper_idle_java_diagnostics \
+    "$before" "$after" "$output" "$maximum_successful_requests" >/dev/null 2>&1; then
+    printf 'helper-idle diagnostics accepted a raw delta above the aggregate workload bound\n' >&2
+    return 1
+  fi
+  write_valid_java_diagnostics_snapshot "$after" 0 0 0 o
+  if validate_helper_idle_java_diagnostics "$before" "$after" "$output" 24 >/dev/null 2>&1; then
+    printf 'helper-idle diagnostics accepted raw N instead of N+1\n' >&2
+    return 1
+  fi
+  write_valid_java_diagnostics_snapshot "$after" 0 1 0 p
+  if validate_helper_idle_java_diagnostics "$before" "$after" "$output" 24 >/dev/null 2>&1; then
+    printf 'helper-idle diagnostics accepted a native valid take\n' >&2
+    return 1
+  fi
+  write_valid_java_diagnostics_snapshot "$after" 0 0 1 p
+  if validate_helper_idle_java_diagnostics "$before" "$after" "$output" 24 >/dev/null 2>&1; then
+    printf 'helper-idle diagnostics accepted a native valid discard\n' >&2
+    return 1
+  fi
+  write_valid_java_diagnostics_snapshot "$after" 0 0 0 p
+  sed 's/provider_reject=0/provider_reject=1/' "$after" >"$after.provider-reject"
+  if validate_helper_idle_java_diagnostics \
+    "$before" "$after.provider-reject" "$output" 24 >/dev/null 2>&1; then
+    printf 'helper-idle diagnostics accepted a provider failure\n' >&2
+    return 1
+  fi
+)
+
+test_helper_idle_diagnostics_suppression_is_midpoint_only() (
+  local -r non_helper_snapshot="$TEST_TMP_DIR/non-helper-not-collected"
+  local -r wrong_timing_snapshot="$TEST_TMP_DIR/helper-wrong-timing-not-collected"
+
+  reset_options
+  cell_spec getsockopt-hit
+  if capture_resource_snapshot "$non_helper_snapshot" unsynchronized_midpoint not_collected; then
+    printf 'resource snapshot allowed diagnostics suppression outside the helper-idle control\n' >&2
+    return 1
+  fi
+  [[ ! -e "$non_helper_snapshot" ]] || {
+    printf 'resource snapshot created artifacts after rejecting non-helper diagnostics suppression\n' >&2
+    return 1
+  }
+
+  cell_spec getsockopt-helper-idle
+  if capture_resource_snapshot "$wrong_timing_snapshot" before not_collected; then
+    printf 'resource snapshot allowed diagnostics suppression outside the helper midpoint\n' >&2
+    return 1
+  fi
+  [[ ! -e "$wrong_timing_snapshot" ]] || {
+    printf 'resource snapshot created artifacts after rejecting an invalid helper timing\n' >&2
+    return 1
+  }
+)
+
+test_helper_idle_bpf_metrics_require_constrained_deltas() (
+  local -r before="$TEST_TMP_DIR/helper-idle-bpf-before.prom"
+  local -r after="$TEST_TMP_DIR/helper-idle-bpf-after.prom"
+  local -r unavailable="$TEST_TMP_DIR/helper-idle-bpf-unavailable.prom"
+  local -r duplicate="$TEST_TMP_DIR/helper-idle-bpf-duplicate.prom"
+  local -r churn_before="$TEST_TMP_DIR/helper-idle-bpf-churn-before.prom"
+  local -r churn_after="$TEST_TMP_DIR/helper-idle-bpf-churn-after.prom"
+  local -r output="$TEST_TMP_DIR/helper-idle-bpf-deltas.json"
+  local -r state="$TEST_TMP_DIR/helper-idle-bpf-state.txt"
+  local mutation=""
+  local transport=""
+  local operation=""
+  local report=""
+  local candidate=""
+  local inject=""
+  local stage=""
+  local handoff=""
+  local take=""
+  local discard=""
+  local negotiate_missing=""
+
+  reset_options
+  cell_spec getsockopt-helper-idle
+  export FAKE_BPF_METRICS_FILE="$state"
+  printf '5 0 0 0 0 0 0 1\n' >"$state"
+  fake_bpf_metrics_snapshot >"$before"
+  printf '13 0 0 0 0 0 0 9\n' >"$state"
+  fake_bpf_metrics_snapshot >"$after"
+  helper_idle_metric_delta_json "$before" "$after" "$output" || {
+    printf 'helper-idle BPF metrics rejected a no-handoff direct-Java window\n' >&2
+    return 1
+  }
+  jq -e '
+    .semantic == "direct_java_no_upstream_handoff_not_state_map_miss_proof" and
+    .report_watermark == {
+      operation: "report", status: "valid", transport: "tcp",
+      before: 5, after: 13, observed_delta: 8
+    } and
+    (.constrained_zero_deltas | map({category, operation, transport, expected_delta}) == [
+      {category: "tcp-candidate", operation: "candidate", transport: "tcp", expected_delta: 0},
+      {category: "tcp-inject", operation: "inject", transport: "tcp", expected_delta: 0},
+      {category: "tcp-stage", operation: "stage", transport: "tcp", expected_delta: 0},
+      {category: "tcp-handoff", operation: "handoff", transport: "tcp", expected_delta: 0},
+      {category: "getsockopt-take", operation: "take", transport: "getsockopt", expected_delta: 0},
+      {category: "getsockopt-discard", operation: "discard", transport: "getsockopt", expected_delta: 0}
+    ]) and
+    (.constrained_zero_deltas | all(.observed_delta == 0 and .expected_delta == 0)) and
+    .informative_getsockopt_negotiate_missing == {
+      before_series: 1, after_series: 1, before: 1, after: 9, observed_delta: 8,
+      interpretation: "informative_only_not_a_retrieval_outcome_reconciliation"
+    }
+  ' "$output" >/dev/null || {
+    printf 'helper-idle BPF metrics lost the report and informative-negotiation distinction\n' >&2
+    return 1
+  }
+  rm -f -- "$output"
+  printf 'status=unavailable\n' >"$unavailable"
+  if helper_idle_metric_delta_json "$unavailable" "$after" "$output" >/dev/null 2>&1; then
+    printf 'helper-idle BPF metrics accepted an unavailable scrape\n' >&2
+    return 1
+  fi
+  for mutation in \
+    'tcp candidate 13 1 0 0 0 0 0 9' \
+    'tcp inject 13 0 1 0 0 0 0 9' \
+    'tcp stage 13 0 0 1 0 0 0 9' \
+    'tcp handoff 13 0 0 0 1 0 0 9' \
+    'getsockopt take 13 0 0 0 0 1 0 9' \
+    'getsockopt discard 13 0 0 0 0 0 1 9'; do
+    read -r transport operation report candidate inject stage handoff take discard negotiate_missing \
+      <<<"$mutation"
+    printf '%s %s %s %s %s %s %s %s\n' \
+      "$report" "$candidate" "$inject" "$stage" "$handoff" "$take" "$discard" \
+      "$negotiate_missing" >"$state"
+    fake_bpf_metrics_snapshot >"$after"
+    if helper_idle_metric_delta_json "$before" "$after" "$output" >/dev/null 2>&1; then
+      printf 'helper-idle BPF metrics accepted %s/%s activity\n' "$transport" "$operation" >&2
+      return 1
+    fi
+  done
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} 10' \
+    'obi_java_remote_parent_operations_total{operation="negotiate",status="missing",transport="getsockopt"} 0' \
+    'obi_java_remote_parent_operations_total{operation="report",status="valid",transport="tcp"} 5' \
+    >"$churn_before"
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="candidate",status="ambiguous",transport="tcp"} 10' \
+    'obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} 0' \
+    'obi_java_remote_parent_operations_total{operation="negotiate",status="missing",transport="getsockopt"} 0' \
+    'obi_java_remote_parent_operations_total{operation="report",status="valid",transport="tcp"} 6' \
+    >"$churn_after"
+  if helper_idle_metric_delta_json "$churn_before" "$churn_after" "$output" >/dev/null 2>&1; then
+    printf 'helper-idle BPF metrics accepted a reset or status-series churn hidden by an aggregate\n' >&2
+    return 1
+  fi
+  printf '13 0 0 0 0 0 0 9\n' >"$state"
+  fake_bpf_metrics_snapshot >"$after"
+  cp -- "$after" "$duplicate"
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} 0' \
+    >>"$duplicate"
+  if helper_idle_metric_delta_json "$before" "$duplicate" "$output" >/dev/null 2>&1; then
+    printf 'helper-idle BPF metrics accepted duplicate label sets\n' >&2
+    return 1
+  fi
+)
+
+test_helper_idle_bpf_fence_requires_two_post_boundary_passes() (
+  local -r observed="$TEST_TMP_DIR/helper-idle-observed.prom"
+  local -r output="$TEST_TMP_DIR/helper-idle-causal.prom"
+  local -r fence="$TEST_TMP_DIR/helper-idle-causal.json"
+  local -r delta="$TEST_TMP_DIR/helper-idle-causal-delta.json"
+  local -r state="$TEST_TMP_DIR/helper-idle-causal-state.txt"
+  local captures=0
+  local candidate_result=""
+
+  reset_options
+  cell_spec getsockopt-helper-idle
+  export FAKE_BPF_METRICS_FILE="$state"
+  printf '10 0 0 0 0 0 0 0\n' >"$state"
+  fake_bpf_metrics_snapshot >"$observed"
+  capture_obi_metrics() {
+    local -r capture="$1"
+
+    ((captures += 1))
+    case "$captures" in
+      # The first post-boundary pass is a delayed prior report. The direct
+      # workload's candidate only arrives in the following stats pass.
+      1) printf '11 0 0 0 0 0 0 0\n' >"$state" ;;
+      2) printf '12 4 0 0 0 0 0 0\n' >"$state" ;;
+      3) printf '13 4 0 0 0 0 0 0\n' >"$state" ;;
+      4) printf '14 4 0 0 0 0 0 0\n' >"$state" ;;
+      *)
+        printf 'unexpected helper-idle fence metric capture: %s\n' "$captures" >&2
+        return 1
+        ;;
+    esac
+    fake_bpf_metrics_snapshot >"$capture"
+  }
+
+  wait_for_helper_idle_two_pass_fence \
+    "$observed" "$output" "$fence" "delayed helper-idle workload" || {
+    printf 'helper-idle BPF fence rejected a stable delayed-publication sequence\n' >&2
+    return 1
+  }
+  candidate_result="$(helper_idle_metric_total "$output" candidate tcp)" || return 1
+  [[ "$candidate_result" == "1 4" ]] || {
+    printf 'helper-idle BPF fence retained the stale pre-workload counter snapshot\n' >&2
+    return 1
+  }
+  jq -e '
+    .initial_report == 10 and
+    .first_post_boundary_report == 11 and
+    .second_post_boundary_report == 12 and
+    .observed_delta == 2 and
+    .fence == {
+      required_serial_post_boundary_report_passes: 2,
+      report_is_published_after_each_successful_bpf_counter_pass: true
+    }
+  ' "$fence" >/dev/null || {
+    printf 'helper-idle BPF fence omitted its two-pass causal evidence\n' >&2
+    return 1
+  }
+  if helper_idle_metric_delta_json "$observed" "$output" "$delta" >/dev/null 2>&1; then
+    printf 'helper-idle BPF fence let delayed lifecycle activity appear as a zero delta\n' >&2
+    return 1
+  fi
+)
+
+test_helper_idle_sustained_rejects_delayed_post_workload_lifecycle() (
+  local -r cell_dir="$TEST_TMP_DIR/helper-idle-delayed-lifecycle"
+  local -r state="$TEST_TMP_DIR/helper-idle-delayed-lifecycle-state.txt"
+  local metrics_captures=0
+  local diagnostics_captures=0
+  local measurement_repetitions=0
+  local run_status=0
+  local candidate_result=""
+
+  reset_options
+  cell_spec getsockopt-helper-idle
+  WARMUP_SECONDS=2
+  DURATION_SECONDS=2
+  REPETITIONS=5
+  export FAKE_BPF_METRICS_FILE="$state"
+  mkdir -p -- "$cell_dir/measurements"
+  capture_java_diagnostics() {
+    local -r output="$1"
+
+    ((diagnostics_captures += 1))
+    case "$diagnostics_captures" in
+      1) write_valid_java_diagnostics_snapshot "$output" 0 0 0 0 ;;
+      2) write_valid_java_diagnostics_snapshot "$output" 0 0 0 p ;;
+      *)
+        printf 'unexpected delayed-lifecycle Java diagnostic capture: %s\n' \
+          "$diagnostics_captures" >&2
+        return 1
+        ;;
+    esac
+  }
+  capture_obi_metrics() {
+    local -r output="$1"
+
+    ((metrics_captures += 1))
+    case "$metrics_captures" in
+      # pre seed, then the serial stale/fresh report passes
+      1) printf '10 0 0 0 0 0 0 0\n' >"$state" ;;
+      2) printf '11 0 0 0 0 0 0 0\n' >"$state" ;;
+      3) printf '12 0 0 0 0 0 0 0\n' >"$state" ;;
+      # post seed, then a delayed pre-window pass followed by the pass that
+      # actually publishes the direct-workload candidate.
+      4) printf '12 0 0 0 0 0 0 0\n' >"$state" ;;
+      5) printf '13 0 0 0 0 0 0 0\n' >"$state" ;;
+      6) printf '14 1 0 0 0 0 0 0\n' >"$state" ;;
+      *)
+        printf 'unexpected delayed-lifecycle BPF metric capture: %s\n' \
+          "$metrics_captures" >&2
+        return 1
+        ;;
+    esac
+    fake_bpf_metrics_snapshot >"$output"
+  }
+  run_benchmark_client() {
+    write_valid_benchmark_result "$1" "$2" 4
+  }
+  run_helper_idle_measurement_rep() {
+    local -r measurement_cell_dir="$1"
+    local -r repetition="$2"
+    local label=""
+
+    ((measurement_repetitions += 1))
+    printf -v label 'rep-%02d' "$repetition"
+    write_valid_benchmark_result \
+      "$measurement_cell_dir/measurements/$label.json" "$DURATION_SECONDS" 4
+  }
+
+  if run_helper_idle_sustained "$cell_dir"; then
+    printf 'helper-idle sustained run accepted delayed post-workload lifecycle activity\n' >&2
+    return 1
+  else
+    run_status=$?
+  fi
+  [[ "$run_status" != 0 && "$metrics_captures" == 6 && "$diagnostics_captures" == 2 &&
+    "$measurement_repetitions" == 5 ]] || {
+    printf 'helper-idle sustained delayed-publication control did not consume both boundary fences\n' >&2
+    return 1
+  }
+  [[ "$(helper_idle_report_value "$cell_dir/sustained-helper-idle/obi-metrics-before.prom")" == 12 &&
+    "$(helper_idle_report_value "$cell_dir/sustained-helper-idle/obi-metrics-after.prom")" == 14 ]] || {
+    printf 'helper-idle sustained control did not retain second-pass BPF fence snapshots\n' >&2
+    return 1
+  }
+  candidate_result="$(helper_idle_metric_total \
+    "$cell_dir/sustained-helper-idle/obi-metrics-after.prom" candidate tcp)" || return 1
+  [[ "$candidate_result" == "1 1" ]] || {
+    printf 'helper-idle sustained control lost delayed candidate evidence before rejection\n' >&2
+    return 1
+  }
+)
 
 test_runner_environment_contract_is_exact() {
   local -r result_directory="$TEST_TMP_DIR/runner-environment"
@@ -2152,8 +2670,13 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
   local -r docker_log="$TEST_TMP_DIR/fake-docker.log"
   local -r events="$TEST_TMP_DIR/fake-events.log"
   local -r diagnostics="$TEST_TMP_DIR/fake-diagnostics.txt"
+  local -r bpf_metrics="$TEST_TMP_DIR/fake-bpf-metrics.txt"
+  local -r compose_project="$TEST_TMP_DIR/fake-compose-project.txt"
   local -r results_root="$fake_example/.runtime/results"
+  local -r helper_events="$TEST_TMP_DIR/helper-idle-events.log"
+  local -r expected_helper_events="$TEST_TMP_DIR/helper-idle-events.expected"
   local command_name=""
+  local request=0
 
   mkdir -p -- "$fake_example/scripts" "$fake_bin" "$output_parent" "$fake_example/.runtime"
   chmod 0755 -- "$fake_example/.runtime"
@@ -2163,9 +2686,12 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
   for command_name in docker curl sleep git; do
     ln -s -- "$TEST_SOURCE" "$fake_bin/$command_name"
   done
-  printf '0 0\n' >"$diagnostics"
+  printf '0 0 0\n' >"$diagnostics"
+  printf '0 0 0 0 0 0 0 0\n' >"$bpf_metrics"
   if ! PATH="$fake_bin:$PATH" \
     FAKE_CONTAINER_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    FAKE_BPF_METRICS_FILE="$bpf_metrics" \
+    FAKE_COMPOSE_PROJECT_FILE="$compose_project" \
     FAKE_DOCKER_LOG="$docker_log" \
     FAKE_DIAGNOSTICS_FILE="$diagnostics" \
     FAKE_EVENTS="$events" \
@@ -2188,11 +2714,11 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
   jq -e '
     .status == "passed" and
     .acceptance_evidence == false and
-    (.cells | length == 5) and
+    (.cells | length == 6) and
     all(.cells[]; .status == "passed") and
     .variance == {status: "available", path: "variance.json"}
   ' "$output/summary.json" >/dev/null || {
-    printf 'hermetic run did not retain five passing core summaries\n' >&2
+    printf 'hermetic run did not retain six passing core summaries\n' >&2
     return 1
   }
   jq -e '
@@ -2207,14 +2733,15 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
       "bridge-disabled",
       "getsockopt-hit",
       "unix-hit",
-      "getsockopt-w3c"
+      "getsockopt-w3c",
+      "getsockopt-helper-idle"
     ] and
     all(.cells[];
       .expected_sample_count == 5 and
       .valid_sample_count == 5 and
       (.samples | map(.repetition)) == [1, 2, 3, 4, 5] and
       all(.samples[];
-        (.source | test("^cells/(uninstrumented|bridge-disabled|getsockopt-hit|unix-hit|getsockopt-w3c)/measurements/rep-0[1-5]\\.json$")) and
+        (.source | test("^cells/(uninstrumented|bridge-disabled|getsockopt-hit|unix-hit|getsockopt-w3c|getsockopt-helper-idle)/measurements/rep-0[1-5]\\.json$")) and
         .successful_requests == 4 and
         .failed_requests == 0 and
         .traffic_elapsed_nanos == 2000000000 and
@@ -2233,7 +2760,7 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
     printf 'hermetic run did not retain complete per-cell repetition variance\n' >&2
     return 1
   }
-  [[ "$(grep -Fc cleanup "$events")" == 5 ]] || {
+  [[ "$(grep -Fc cleanup "$events")" == 6 ]] || {
     printf 'hermetic run did not clean each core cell through the runner\n' >&2
     return 1
   }
@@ -2299,6 +2826,161 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
     return 1
   }
   jq -e '
+    .transport == "getsockopt" and
+    .scenario == "concurrency" and
+    .selected_transport == "getsockopt" and
+    .sentinel_scenario == "concurrency" and
+    .helper_idle_direct_java == true and
+    .state_map_absence_proof == false and
+    .workload == {
+      base_url: "https://127.0.0.1:18443",
+      path: "/api/echo?delay_ms=150",
+      connection_mode: "close",
+      ca_file: "/benchmark-ca.crt",
+      tls_verification: "verified_ca_file",
+      upstream_handoff: "none"
+    }
+  ' "$output/cells/getsockopt-helper-idle/preflight/contract.json" >/dev/null || {
+    printf 'helper-idle benchmark cell did not retain the direct-Java HTTPS contract\n' >&2
+    return 1
+  }
+  jq -e '
+    .workload_successful_requests == 24 and
+    .diagnostic_after_probe_t_missing == 1 and
+    .raw_java_t_missing_delta == 25 and
+    .corrected_workload_t_missing == 24 and
+    .correction.corrected_workload_t_missing_expected == 24 and
+    (.raw_counters | any(.counter == "t_missing" and .observed_delta == 25 and .expected_delta == 25)) and
+    (.raw_counters | all(.[] | select(.counter != "t_missing"); .observed_delta == 0 and .expected_delta == 0))
+  ' "$output/cells/getsockopt-helper-idle/sustained-helper-idle/java-diagnostics-deltas.json" \
+    >/dev/null || {
+    printf 'helper-idle Java diagnostics did not retain exact raw and corrected missing accounting\n' >&2
+    return 1
+  }
+  jq -e '
+    .semantic == "direct_java_no_upstream_handoff_not_state_map_miss_proof" and
+    .report_watermark.observed_delta > 0 and
+    (.constrained_zero_deltas | map({category, operation, transport, expected_delta}) == [
+      {category: "tcp-candidate", operation: "candidate", transport: "tcp", expected_delta: 0},
+      {category: "tcp-inject", operation: "inject", transport: "tcp", expected_delta: 0},
+      {category: "tcp-stage", operation: "stage", transport: "tcp", expected_delta: 0},
+      {category: "tcp-handoff", operation: "handoff", transport: "tcp", expected_delta: 0},
+      {category: "getsockopt-take", operation: "take", transport: "getsockopt", expected_delta: 0},
+      {category: "getsockopt-discard", operation: "discard", transport: "getsockopt", expected_delta: 0}
+    ]) and
+    (.constrained_zero_deltas | all(.observed_delta == 0 and .expected_delta == 0)) and
+    .assertion == {
+      tcp_upstream_candidate_inject_stage_handoff_delta_zero: true,
+      getsockopt_take_discard_delta_zero: true
+    }
+  ' "$output/cells/getsockopt-helper-idle/sustained-helper-idle/obi-metrics-deltas.json" \
+    >/dev/null || {
+    printf 'helper-idle BPF metrics did not retain constrained no-handoff evidence\n' >&2
+    return 1
+  }
+  jq -e '
+    .semantic == "direct_java_no_upstream_handoff_not_state_map_miss_proof" and
+    .workload_successful_requests == 24 and
+    .workload.upstream_handoff == "none" and
+    .java == {
+      raw_t_missing_delta: 25,
+      diagnostic_after_probe_t_missing: 1,
+      corrected_workload_t_missing: 24,
+      exact_workload_reconciliation: true
+    } and
+    (.caveat | contains("does not prove a java_remote_parent_state map absence"))
+  ' "$output/cells/getsockopt-helper-idle/sustained-helper-idle/reconciliation.json" \
+    >/dev/null || {
+    printf 'helper-idle reconciliation overstated or lost its direct-Java caveat\n' >&2
+    return 1
+  }
+  jq -e '
+    .metric == "obi_java_remote_parent_operations_total" and
+    .operation == "report" and .status == "valid" and .transport == "tcp" and
+    .initial_report >= 0 and
+    .first_post_boundary_report > .initial_report and
+    .second_post_boundary_report > .first_post_boundary_report and
+    .observed_delta > 0 and
+    .fence == {
+      required_serial_post_boundary_report_passes: 2,
+      report_is_published_after_each_successful_bpf_counter_pass: true
+    }
+  ' "$output/cells/getsockopt-helper-idle/sustained-helper-idle/metrics-watermark-before.json" \
+    "$output/cells/getsockopt-helper-idle/sustained-helper-idle/metrics-watermark-after.json" \
+    >/dev/null || {
+    printf 'helper-idle did not retain two-pass causal BPF fences around its exact window\n' >&2
+    return 1
+  }
+  for ((request = 1; request <= 5; request++)); do
+    printf -v repetition_label 'rep-%02d' "$request"
+    jq -e '
+      .timing == "unsynchronized_midpoint" and
+      .java_diagnostics == {
+        status: "not_collected",
+        reason: "would_mutate_exact_helper_idle_java_diagnostics_window"
+      }
+    ' "$output/cells/getsockopt-helper-idle/measurements/$repetition_label-midpoint/snapshot.json" \
+      >/dev/null || {
+      printf 'helper-idle midpoint %s did not retain diagnostics-free resource-sampling provenance\n' \
+        "$repetition_label" >&2
+      return 1
+    }
+    [[ -f "$output/cells/getsockopt-helper-idle/measurements/$repetition_label-midpoint/java-backend-proc.txt" &&
+      -f "$output/cells/getsockopt-helper-idle/measurements/$repetition_label-midpoint/container-stats.jsonl" &&
+      -s "$output/cells/getsockopt-helper-idle/measurements/$repetition_label-midpoint/obi-metrics.prom" &&
+      ! -e "$output/cells/getsockopt-helper-idle/measurements/$repetition_label-midpoint/java-diagnostics.txt" ]] || {
+      printf 'helper-idle midpoint %s did not retain diagnostics-free resource evidence\n' \
+        "$repetition_label" >&2
+      return 1
+    }
+    grep -Eq '^VmRSS:' \
+      "$output/cells/getsockopt-helper-idle/measurements/$repetition_label-midpoint/java-backend-proc.txt" &&
+      grep -Eq '^Threads:' \
+        "$output/cells/getsockopt-helper-idle/measurements/$repetition_label-midpoint/java-backend-proc.txt" &&
+      grep -Eq '^fd_count=' \
+        "$output/cells/getsockopt-helper-idle/measurements/$repetition_label-midpoint/java-backend-proc.txt" &&
+      grep -Eq '^task_count=' \
+        "$output/cells/getsockopt-helper-idle/measurements/$repetition_label-midpoint/java-backend-proc.txt" &&
+      grep -Eq '^stat=' \
+        "$output/cells/getsockopt-helper-idle/measurements/$repetition_label-midpoint/java-backend-proc.txt" || {
+      printf 'helper-idle midpoint %s omitted Java CPU/RSS/thread/FD process fields\n' \
+        "$repetition_label" >&2
+      return 1
+    }
+    grep -Fq '"fake"' \
+      "$output/cells/getsockopt-helper-idle/measurements/$repetition_label-midpoint/container-stats.jsonl" || {
+      printf 'helper-idle midpoint %s omitted container resource statistics\n' \
+        "$repetition_label" >&2
+      return 1
+    }
+  done
+  awk '
+    $1 == "start" && $2 ~ /-helper-idle$/ && $3 == "getsockopt" && $4 == "concurrency" {
+      collect = 1
+      next
+    }
+    collect && $1 == "cleanup" { exit }
+    collect { print }
+  ' "$events" >"$helper_events"
+  {
+    printf '%s\n' obi-metrics java-diagnostics java-diagnostics obi-metrics obi-metrics obi-metrics
+    printf '%s\n' direct-java-workload
+    for ((request = 0; request < 5; request++)); do
+      printf '%s\n' direct-java-workload
+      printf '%s\n' obi-metrics
+    done
+    printf '%s\n' obi-metrics obi-metrics obi-metrics java-diagnostics obi-metrics java-diagnostics \
+      obi-metrics java-diagnostics
+  } >"$expected_helper_events"
+  cmp -s -- "$expected_helper_events" "$helper_events" || {
+    printf 'helper-idle added an in-window diagnostic probe or reordered its BPF/resource fences\n' >&2
+    return 1
+  }
+  grep -Fq 'getsockopt concurrency' "$runner_log" || {
+    printf 'helper-idle preflight did not retain active forced-getsockopt concurrency coverage\n' >&2
+    return 1
+  }
+  jq -e '
     (.retained_files | index("compose-images.json")) and
     (.retained_files | index("host-topology.txt")) and
     (.retained_files | index("apache-openssl-version.txt")) and
@@ -2322,15 +3004,28 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
     printf 'manifest omitted the bounded measurement drain tolerance\n' >&2
     return 1
   }
-  jq -e '.workload.w3c_headers == false and
+  jq -e '.schema_version == 2 and
+    .workload.w3c_headers == false and
     .workload.w3c_headers_by_cell == {
       "uninstrumented": false,
       "bridge-disabled": false,
       "getsockopt-hit": false,
       "unix-hit": false,
-      "getsockopt-w3c": true
+      "getsockopt-w3c": true,
+      "getsockopt-helper-idle": false
     } and
-    .workload.w3c_discard_cells == ["getsockopt-w3c"]' \
+    .workload.w3c_discard_cells == ["getsockopt-w3c"] and
+    .workload.by_cell["getsockopt-helper-idle"] == {
+      base_url: "https://127.0.0.1:18443",
+      path: "/api/echo?delay_ms=150",
+      connection_mode: "close",
+      ca_file: "/benchmark-ca.crt",
+      tls_verification: "verified_ca_file",
+      upstream_handoff: "none",
+      w3c_headers: false,
+      helper_idle_direct_java: true,
+      state_map_absence_proof: false
+    }' \
     "$output/manifest.json" >/dev/null || {
     printf 'manifest omitted the authoritative cell-specific W3C traffic contract\n' >&2
     return 1
@@ -2344,6 +3039,12 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
     grep -Fq -- '--connection-mode close' "$docker_log" &&
     grep -Fq -- '--seed 0' "$docker_log" || {
     printf 'hermetic run did not preserve the controlled sustained client contract\n' >&2
+    return 1
+  }
+  [[ "$(grep -Fc -- '--base-url https://127.0.0.1:18443' "$docker_log")" == 6 &&
+    "$(grep -Fc -- '--ca-file /benchmark-ca.crt' "$docker_log")" == 6 &&
+    "$(grep -Fc -- '--ca-file' "$docker_log")" == 6 ]] || {
+    printf 'helper-idle did not confine verified-CA direct HTTPS arguments to its six client runs\n' >&2
     return 1
   }
   ! grep -Fq down "$docker_log" || {
@@ -2370,6 +3071,11 @@ main() {
   test_summary_rejects_manifest_render_failure
   test_summary_publishes_completion_marker_last
   test_w3c_discard_diagnostics_require_exact_delta
+  test_helper_idle_java_diagnostics_require_exact_correction
+  test_helper_idle_diagnostics_suppression_is_midpoint_only
+  test_helper_idle_bpf_metrics_require_constrained_deltas
+  test_helper_idle_bpf_fence_requires_two_post_boundary_passes
+  test_helper_idle_sustained_rejects_delayed_post_workload_lifecycle
   test_runner_environment_contract_is_exact
   test_failed_measurement_clears_reaped_pid
   test_interrupted_measurement_reaps_client_tree

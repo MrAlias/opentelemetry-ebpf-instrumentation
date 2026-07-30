@@ -13190,6 +13190,77 @@ test_primary_live_fd_compose_topology_is_scoped() {
   }
 }
 
+test_benchmark_client_compose_topology_is_least_privilege() {
+  local -r compose_file="$TEST_SCRIPT_DIR/../docker-compose.yml"
+  local -r resolved_compose="$TEST_TMP_DIR/benchmark-client-resolved-compose.yaml"
+  local example_directory=""
+  local benchmark_service=""
+  local resolved_benchmark_service=""
+  local benchmark_volumes=""
+  local resolved_benchmark_volumes=""
+  local resolved_security_options=""
+  local raw_volume_count=""
+  local resolved_volume_count=""
+  local resolved_security_option_count=""
+
+  example_directory="$(cd -- "$TEST_SCRIPT_DIR/.." && pwd -P)"
+  COMPOSE_PROFILES=tools docker compose --file "$compose_file" config >"$resolved_compose"
+  benchmark_service="$(compose_service_block "$compose_file" benchmark)"
+  resolved_benchmark_service="$(compose_service_block "$resolved_compose" benchmark)"
+  benchmark_volumes="$(awk '
+    $0 == "    volumes:" { inside = 1; next }
+    inside && $0 ~ /^    [^[:space:]#][^:]*:/ { exit }
+    inside { print }
+  ' <<<"$benchmark_service")"
+  resolved_benchmark_volumes="$(awk '
+    $0 == "    volumes:" { inside = 1; next }
+    inside && $0 ~ /^    [^[:space:]#][^:]*:/ { exit }
+    inside { print }
+  ' <<<"$resolved_benchmark_service")"
+  resolved_security_options="$(awk '
+    $0 == "    security_opt:" { inside = 1; next }
+    inside && $0 ~ /^    [^[:space:]#][^:]*:/ { exit }
+    inside { print }
+  ' <<<"$resolved_benchmark_service")"
+  raw_volume_count="$(awk '/^      - type: bind$/ { count += 1 } END { print count + 0 }' \
+    <<<"$benchmark_volumes")"
+  resolved_volume_count="$(awk '/^      - type: bind$/ { count += 1 } END { print count + 0 }' \
+    <<<"$resolved_benchmark_volumes")"
+  resolved_security_option_count="$(awk '/^      - / { count += 1 } END { print count + 0 }' \
+    <<<"$resolved_security_options")"
+
+  [[ "$benchmark_service" == *'user: "65532:65532"'* &&
+    "$benchmark_service" == *$'cap_drop:\n      - ALL'* &&
+    "$benchmark_service" == *'security_opt:'* &&
+    "$benchmark_service" == *'      - no-new-privileges:true'* &&
+    "$benchmark_service" == *'read_only: true'* &&
+    "$benchmark_service" != *'privileged:'* &&
+    "$benchmark_service" != *'cap_add:'* &&
+    "$benchmark_service" != *'pid:'* &&
+    "$benchmark_service" != *'userns_mode:'* &&
+    "$raw_volume_count" == "1" &&
+    "$benchmark_volumes" == $'      - type: bind\n        source: ./.runtime/certs/ca.crt\n        target: /benchmark-ca.crt\n        read_only: true\n        bind:\n          create_host_path: false' ]] || {
+    printf 'benchmark client must retain its exact read-only CA-only topology\n' >&2
+    return 1
+  }
+  [[ "$resolved_benchmark_service" == *'user: 65532:65532'* &&
+    "$resolved_benchmark_service" == *$'cap_drop:\n      - ALL'* &&
+    "$resolved_benchmark_service" == *'read_only: true'* &&
+    "$resolved_benchmark_service" != *'privileged: true'* &&
+    "$resolved_benchmark_service" != *'cap_add:'* &&
+    "$resolved_benchmark_service" != *'pid: host'* &&
+    "$resolved_benchmark_service" != *'userns_mode: host'* &&
+    "$resolved_volume_count" == "1" &&
+    "$resolved_benchmark_volumes" == $'      - type: bind\n        source: '"$example_directory"$'/.runtime/certs/ca.crt\n        target: /benchmark-ca.crt\n        read_only: true\n        bind:\n          create_host_path: false' &&
+    "$resolved_benchmark_volumes" != *'.key'* &&
+    "$resolved_benchmark_volumes" != *'.p12'* &&
+    "$resolved_security_option_count" == "1" &&
+    "$resolved_security_options" == '      - no-new-privileges:true' ]] || {
+    printf 'resolved benchmark client topology exposed more than its verified CA\n' >&2
+    return 1
+  }
+}
+
 test_unix_security_probe_topology_is_least_privilege() {
   local -r obi_config="$TEST_SCRIPT_DIR/../configs/obi.yaml"
   local -r compose_file="$TEST_SCRIPT_DIR/../docker-compose.yml"
@@ -13430,6 +13501,7 @@ main() {
   test_runtime_environment_line_matching
   test_primary_fault_runtime_contract_is_exact_and_base_is_clean
   test_primary_live_fd_runtime_topology_is_exact
+  test_benchmark_client_compose_topology_is_least_privilege
   test_extension_disabled_runtime_requires_explicit_false
   test_disabled_runtime_requires_explicit_transport_disable
   test_helper_attach_runtime_requires_exact_dynamic_disable

@@ -27,6 +27,8 @@ readonly PROJECT_SENTINEL_VALUE="acceptance-demo-v1"
 readonly WORKLOAD_BASE_URL="http://127.0.0.1:18080"
 readonly WORKLOAD_PATH="/api/echo?delay_ms=150"
 readonly WORKLOAD_CONNECTION_MODE="close"
+readonly DIRECT_JAVA_WORKLOAD_BASE_URL="https://127.0.0.1:18443"
+readonly DIRECT_JAVA_WORKLOAD_CA_FILE="/benchmark-ca.crt"
 readonly PREFLIGHT_REQUESTS=16
 readonly SUSTAINED_LOAD_SEED=0
 readonly REQUEST_TIMEOUT_SECONDS=10
@@ -43,8 +45,11 @@ readonly MIN_REPETITIONS=5
 readonly MAX_REPETITIONS=10
 readonly MAX_SEED=9223372036854775807
 readonly MAX_JAVA_DIAGNOSTIC_COUNTER=999999999
+readonly MAX_BPF_OPERATION_COUNTER=9223372036854775807
 readonly MAX_JAVA_DIAGNOSTICS_SNAPSHOT_BYTES=4096
-readonly MAX_W3C_WORKLOAD_SUCCESSFUL_REQUESTS="$(((MAX_REPETITIONS + 1) * REQUEST_LIMIT))"
+readonly MAX_SUSTAINED_WORKLOAD_SUCCESSFUL_REQUESTS="$(((MAX_REPETITIONS + 1) * REQUEST_LIMIT))"
+readonly MAX_W3C_WORKLOAD_SUCCESSFUL_REQUESTS="$MAX_SUSTAINED_WORKLOAD_SUCCESSFUL_REQUESTS"
+readonly MAX_HELPER_IDLE_WORKLOAD_SUCCESSFUL_REQUESTS="$MAX_SUSTAINED_WORKLOAD_SUCCESSFUL_REQUESTS"
 readonly MAX_WORKER_SECONDS=120000
 readonly MAX_TOTAL_WORKER_SECONDS=120000
 readonly METRICS_SETTLE_SECONDS=1
@@ -54,7 +59,7 @@ readonly BENCHMARK_PROCESS_GROUP_GRACE_SECONDS=10
 readonly RUNNER_START_TIMEOUT_SECONDS=1500
 readonly RUNNER_CLEANUP_TIMEOUT_SECONDS=300
 readonly POSTLOAD_SENTINEL_TIMEOUT_SECONDS=120
-readonly CORE_CELLS=(uninstrumented bridge-disabled getsockopt-hit unix-hit getsockopt-w3c)
+readonly CORE_CELLS=(uninstrumented bridge-disabled getsockopt-hit unix-hit getsockopt-w3c getsockopt-helper-idle)
 readonly W3C_DISCARD_CELLS=(getsockopt-w3c)
 
 OUTPUT_DIR=""
@@ -94,6 +99,13 @@ CELL_SUSTAINED_W3C=false
 CELL_EXPECTED_STANDARD_PARENT_DISCARDS=0
 CELL_EXPECTED_W3C_VALID_TAKES=0
 CELL_W3C_WORKLOAD_SUCCESSFUL_REQUESTS=0
+CELL_WORKLOAD_BASE_URL=""
+CELL_WORKLOAD_PATH=""
+CELL_WORKLOAD_CONNECTION_MODE=""
+CELL_WORKLOAD_CA_FILE=""
+CELL_EXPECTED_TLS_VERIFICATION=""
+CELL_UPSTREAM_HANDOFF=""
+CELL_HELPER_IDLE=false
 
 declare -a COMPOSE=()
 
@@ -114,10 +126,10 @@ usage() {
     '  --concurrency N          1-256. Default: 16' \
     '  --repetitions N          5-10. Default: 5' \
     '  --seed N                 0-9223372036854775807. Default: 20260721' \
-    '  --cells core             The five comparable core cells. Default: core' \
+    '  --cells core             The six comparable core cells. Default: core' \
     '  -h, --help               Show this help text.' \
     '' \
-    'The total worker-seconds across all five cells must not exceed 120000.'
+    'The total worker-seconds across all six cells must not exceed 120000.'
 }
 
 log_info() {
@@ -357,7 +369,7 @@ parse_args() {
   }
   (((WARMUP_SECONDS + (REPETITIONS * DURATION_SECONDS)) * CONCURRENCY * ${#CORE_CELLS[@]}
     <= MAX_TOTAL_WORKER_SECONDS)) || {
-    die "total worker-seconds across the five cells must not exceed $MAX_TOTAL_WORKER_SECONDS"
+    die "total worker-seconds across the six cells must not exceed $MAX_TOTAL_WORKER_SECONDS"
     return $?
   }
 }
@@ -549,6 +561,13 @@ cell_spec() {
   CELL_EXPECTED_STANDARD_PARENT_DISCARDS=0
   CELL_EXPECTED_W3C_VALID_TAKES=0
   CELL_W3C_WORKLOAD_SUCCESSFUL_REQUESTS=0
+  CELL_WORKLOAD_BASE_URL="$WORKLOAD_BASE_URL"
+  CELL_WORKLOAD_PATH="$WORKLOAD_PATH"
+  CELL_WORKLOAD_CONNECTION_MODE="$WORKLOAD_CONNECTION_MODE"
+  CELL_WORKLOAD_CA_FILE=""
+  CELL_EXPECTED_TLS_VERIFICATION="not_applicable"
+  CELL_UPSTREAM_HANDOFF="apache_proxy"
+  CELL_HELPER_IDLE=false
   case "$cell" in
     uninstrumented)
       CELL_TRANSPORT="disabled"
@@ -589,16 +608,64 @@ cell_spec() {
       CELL_REQUIRES_OBI=true
       CELL_SELECTED_TRANSPORT="unix"
       ;;
+    getsockopt-helper-idle)
+      CELL_TRANSPORT="getsockopt"
+      CELL_SCENARIO="concurrency"
+      CELL_ASSERTION_MODE=""
+      CELL_REQUIRES_OBI=true
+      CELL_SELECTED_TRANSPORT="getsockopt"
+      CELL_WORKLOAD_BASE_URL="$DIRECT_JAVA_WORKLOAD_BASE_URL"
+      CELL_WORKLOAD_CA_FILE="$DIRECT_JAVA_WORKLOAD_CA_FILE"
+      CELL_EXPECTED_TLS_VERIFICATION="verified_ca_file"
+      CELL_UPSTREAM_HANDOFF="none"
+      CELL_HELPER_IDLE=true
+      ;;
     *)
       return 1
       ;;
   esac
 }
 
-project_for_cell() {
+cell_workload_contract() {
   local -r cell="$1"
 
-  printf '%s-b-%s-%s\n' "$PROJECT_NAMESPACE" "$RUN_TOKEN" "$cell"
+  cell_spec "$cell" || return 1
+  jq -cn \
+    --arg cell "$CELL_SLUG" \
+    --arg base_url "$CELL_WORKLOAD_BASE_URL" \
+    --arg path "$CELL_WORKLOAD_PATH" \
+    --arg connection_mode "$CELL_WORKLOAD_CONNECTION_MODE" \
+    --arg ca_file "$CELL_WORKLOAD_CA_FILE" \
+    --arg tls_verification "$CELL_EXPECTED_TLS_VERIFICATION" \
+    --arg upstream_handoff "$CELL_UPSTREAM_HANDOFF" \
+    --argjson w3c "$CELL_SUSTAINED_W3C" \
+    --argjson helper_idle "$CELL_HELPER_IDLE" \
+    '{
+      cell: $cell,
+      base_url: $base_url,
+      path: $path,
+      connection_mode: $connection_mode,
+      ca_file: ($ca_file | if . == "" then null else . end),
+      tls_verification: $tls_verification,
+      upstream_handoff: $upstream_handoff,
+      w3c_headers: $w3c,
+      helper_idle_direct_java: $helper_idle,
+      state_map_absence_proof: false
+    }'
+}
+
+project_for_cell() {
+  local -r cell="$1"
+  local project_cell="$cell"
+
+  # Compose project names are capped at 63 characters. Keep the retained cell
+  # slug descriptive while using a collision-free short form only in the
+  # ephemeral project name.
+  if [[ "$cell" == "getsockopt-helper-idle" ]]; then
+    project_cell="helper-idle"
+  fi
+
+  printf '%s-b-%s-%s\n' "$PROJECT_NAMESPACE" "$RUN_TOKEN" "$project_cell"
 }
 
 configure_compose() {
@@ -613,6 +680,7 @@ write_manifest() {
   local cells_json=""
   local w3c_discard_cells_json=""
   local w3c_headers_by_cell_json=""
+  local workload_by_cell_json=""
 
   cells_json="$(jq -cn '$ARGS.positional' --args "${CORE_CELLS[@]}")" || return 1
   w3c_discard_cells_json="$(jq -cn '$ARGS.positional' --args "${W3C_DISCARD_CELLS[@]}")" || return 1
@@ -622,6 +690,13 @@ write_manifest() {
       reduce $cells[] as $cell ({};
         .[$cell] = (($w3c_discard_cells | index($cell)) != null))
     ')" || return 1
+  workload_by_cell_json="$({
+    local cell=""
+
+    for cell in "${CORE_CELLS[@]}"; do
+      cell_workload_contract "$cell"
+    done
+  } | jq -s 'reduce .[] as $workload ({}; .[$workload.cell] = ($workload | del(.cell)) )')" || return 1
   jq -n \
     --arg started_at "$STARTED_AT" \
     --arg invocation "$HARNESS_INVOCATION" \
@@ -642,11 +717,12 @@ write_manifest() {
     --argjson cells "$cells_json" \
     --argjson w3c_discard_cells "$w3c_discard_cells_json" \
     --argjson w3c_headers_by_cell "$w3c_headers_by_cell_json" \
+    --argjson workload_by_cell "$workload_by_cell_json" \
     --argjson total_worker_seconds "$((
       (WARMUP_SECONDS + (REPETITIONS * DURATION_SECONDS)) * CONCURRENCY * ${#CORE_CELLS[@]}
     ))" \
     '{
-      schema_version: 1,
+      schema_version: 2,
       status: "in_progress",
       started_at: $started_at,
       invocation: $invocation,
@@ -664,6 +740,7 @@ write_manifest() {
         w3c_headers: false,
         w3c_headers_by_cell: $w3c_headers_by_cell,
         w3c_discard_cells: $w3c_discard_cells,
+        by_cell: $workload_by_cell,
         sustained_load_seed: $sustained_load_seed,
         traffic_elapsed_overrun_tolerance_seconds: $traffic_elapsed_overrun_tolerance_seconds
       },
@@ -723,10 +800,17 @@ write_cell_contract() {
     --arg assertion_mode "$CELL_ASSERTION_MODE" \
     --arg selected_transport "$CELL_SELECTED_TRANSPORT" \
     --arg sentinel_scenario "$CELL_SENTINEL_SCENARIO" \
+    --arg workload_base_url "$CELL_WORKLOAD_BASE_URL" \
+    --arg workload_path "$CELL_WORKLOAD_PATH" \
+    --arg workload_connection_mode "$CELL_WORKLOAD_CONNECTION_MODE" \
+    --arg workload_ca_file "$CELL_WORKLOAD_CA_FILE" \
+    --arg expected_tls_verification "$CELL_EXPECTED_TLS_VERIFICATION" \
+    --arg upstream_handoff "$CELL_UPSTREAM_HANDOFF" \
     --argjson requests "$PREFLIGHT_REQUESTS" \
     --argjson seed "$SEED" \
     --argjson requires_obi "$CELL_REQUIRES_OBI" \
     --argjson sustained_w3c "$CELL_SUSTAINED_W3C" \
+    --argjson helper_idle "$CELL_HELPER_IDLE" \
     --argjson expected_standard_parent_discards "$CELL_EXPECTED_STANDARD_PARENT_DISCARDS" \
     --argjson expected_w3c_valid_takes "$CELL_EXPECTED_W3C_VALID_TAKES" \
     '{
@@ -736,6 +820,16 @@ write_cell_contract() {
       assertion_mode: ($assertion_mode | if . == "" then null else . end),
       selected_transport: $selected_transport,
       sentinel_scenario: $sentinel_scenario,
+      workload: {
+        base_url: $workload_base_url,
+        path: $workload_path,
+        connection_mode: $workload_connection_mode,
+        ca_file: ($workload_ca_file | if . == "" then null else . end),
+        tls_verification: $expected_tls_verification,
+        upstream_handoff: $upstream_handoff
+      },
+      helper_idle_direct_java: $helper_idle,
+      state_map_absence_proof: false,
       requests: $requests,
       seed: $seed,
       requires_obi: $requires_obi,
@@ -1039,6 +1133,7 @@ capture_java_diagnostics() {
 capture_resource_snapshot() {
   local -r snapshot_directory="$1"
   local -r timing="$2"
+  local -r java_diagnostics_mode="${3:-requested}"
   local service=""
   local container_id=""
   local host_pid=""
@@ -1047,13 +1142,29 @@ capture_resource_snapshot() {
 
   [[ "$timing" == "before" || "$timing" == "after" || "$timing" == "idle_recovery" ||
     "$timing" == "unsynchronized_midpoint" ]] || return 1
+  [[ "$java_diagnostics_mode" == requested || "$java_diagnostics_mode" == not_collected ]] || return 1
+  if [[ "$java_diagnostics_mode" == not_collected ]]; then
+    [[ "$CELL_HELPER_IDLE" == "true" && "$timing" == "unsynchronized_midpoint" ]] || return 1
+  fi
   if [[ "$CELL_REQUIRES_OBI" == "true" ]]; then
     services+=(obi)
   fi
   mkdir -- "$snapshot_directory"
   jq -n --arg captured_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg timing "$timing" \
-    --arg cell "$CELL_SLUG" \
-    '{captured_at: $captured_at, timing: $timing, cell: $cell}' \
+    --arg cell "$CELL_SLUG" --arg java_diagnostics_mode "$java_diagnostics_mode" \
+    '{
+      captured_at: $captured_at,
+      timing: $timing,
+      cell: $cell,
+      java_diagnostics: (
+        if $java_diagnostics_mode == "requested" then {status: "requested"}
+        else {
+          status: "not_collected",
+          reason: "would_mutate_exact_helper_idle_java_diagnostics_window"
+        }
+        end
+      )
+    }' \
     >"$snapshot_directory/snapshot.json"
 
   for service in "${services[@]}"; do
@@ -1079,7 +1190,414 @@ capture_resource_snapshot() {
     printf 'status=unavailable\n' >"$snapshot_directory/container-stats.jsonl"
   fi
   capture_obi_metrics "$snapshot_directory/obi-metrics.prom"
-  capture_java_diagnostics "$snapshot_directory/java-diagnostics.txt"
+  if [[ "$java_diagnostics_mode" == requested ]]; then
+    capture_java_diagnostics "$snapshot_directory/java-diagnostics.txt"
+  fi
+}
+
+# Emits one sorted `status value` row for every matching, semantically distinct
+# operation series. The parser intentionally accepts only the three labels
+# emitted by this metric, rejects duplicate label sets, and rejects non-integer
+# counter samples. This prevents a malformed scrape from being silently
+# interpreted as an idle control.
+helper_idle_metric_series() {
+  local -r input="$1"
+  local -r wanted_operation="$2"
+  local -r wanted_transport="$3"
+  local -r wanted_status="${4:-}"
+  local metric=""
+  local raw_value=""
+  local extra=""
+  local labels=""
+  local label=""
+  local operation=""
+  local status=""
+  local transport=""
+  local canonical=""
+  local normalized_value=""
+  local -a label_parts=()
+  local -a matching_series=()
+  local -A seen=()
+
+  [[ -f "$input" && ! -L "$input" &&
+    "$wanted_operation" =~ ^[a-z][a-z0-9_]*$ &&
+    "$wanted_transport" =~ ^[a-z][a-z0-9_]*$ &&
+    ( -z "$wanted_status" || "$wanted_status" =~ ^[a-z][a-z0-9_]*$ ) ]] || return 1
+  while IFS=' ' read -r metric raw_value extra || [[ -n "$metric" ]]; do
+    [[ -z "$metric" || "$metric" == \#* ]] && continue
+    if [[ "$metric" == obi_java_remote_parent_operations_total* ]]; then
+      [[ "$metric" == 'obi_java_remote_parent_operations_total{'*'}' && -z "$extra" ]] || return 1
+      normalized_value="$(normalize_decimal "$raw_value" "$MAX_BPF_OPERATION_COUNTER" true)" || return 1
+      labels="${metric#*\{}"
+      labels="${labels%\}}"
+      IFS=, read -r -a label_parts <<<"$labels"
+      ((${#label_parts[@]} == 3)) || return 1
+      operation=""
+      status=""
+      transport=""
+      for label in "${label_parts[@]}"; do
+        if [[ "$label" =~ ^operation=\"([a-z][a-z0-9_]*)\"$ ]]; then
+          [[ -z "$operation" ]] || return 1
+          operation="${BASH_REMATCH[1]}"
+        elif [[ "$label" =~ ^status=\"([a-z][a-z0-9_]*)\"$ ]]; then
+          [[ -z "$status" ]] || return 1
+          status="${BASH_REMATCH[1]}"
+        elif [[ "$label" =~ ^transport=\"([a-z][a-z0-9_]*)\"$ ]]; then
+          [[ -z "$transport" ]] || return 1
+          transport="${BASH_REMATCH[1]}"
+        else
+          return 1
+        fi
+      done
+      [[ -n "$operation" && -n "$status" && -n "$transport" ]] || return 1
+      canonical="$operation,$status,$transport"
+      [[ -z "${seen[$canonical]+present}" ]] || return 1
+      seen[$canonical]=true
+      if [[ "$operation" == "$wanted_operation" && "$transport" == "$wanted_transport" &&
+        ( -z "$wanted_status" || "$status" == "$wanted_status" ) ]]; then
+        matching_series+=("$status $normalized_value")
+      fi
+    fi
+  done <"$input"
+  if ((${#matching_series[@]} > 0)); then
+    printf '%s\n' "${matching_series[@]}" | sort
+  fi
+}
+
+# Returns the number of matching, semantically distinct operation series and
+# their summed non-negative integer value. This is suitable only for metrics
+# whose aggregate is informational or independently fixed; zero-delta controls
+# use helper_idle_metric_series_are_zero_delta so label churn cannot mask activity.
+helper_idle_metric_total() {
+  local -r input="$1"
+  local -r wanted_operation="$2"
+  local -r wanted_transport="$3"
+  local -r wanted_status="${4:-}"
+  local status=""
+  local value=""
+  local extra=""
+  local series_output=""
+  local count=0
+  local total=0
+
+  series_output="$(helper_idle_metric_series \
+    "$input" "$wanted_operation" "$wanted_transport" "$wanted_status")" || return 1
+  if [[ -n "$series_output" ]]; then
+    while read -r status value extra; do
+      [[ "$status" =~ ^[a-z][a-z0-9_]*$ && "$value" =~ ^[0-9]+$ && -z "$extra" ]] || return 1
+      ((count += 1))
+      ((total <= MAX_BPF_OPERATION_COUNTER - value)) || return 1
+      total="$((total + value))"
+    done <<<"$series_output"
+  fi
+  printf '%s %s\n' "$count" "$total"
+}
+
+helper_idle_report_value() {
+  local -r input="$1"
+  local result=""
+  local count=""
+  local value=""
+  local extra=""
+
+  result="$(helper_idle_metric_total "$input" report tcp valid)" || return 1
+  read -r count value extra <<<"$result"
+  [[ "$count" == 1 && "$value" =~ ^[0-9]+$ && -z "$extra" ]] || return 1
+  printf '%s\n' "$value"
+}
+
+helper_idle_metric_series_are_zero_delta() {
+  local -r before="$1"
+  local -r after="$2"
+  local -r operation="$3"
+  local -r transport="$4"
+  local before_output=""
+  local after_output=""
+  local status=""
+  local value=""
+  local extra=""
+  local -A before_values=()
+  local -A after_values=()
+
+  before_output="$(helper_idle_metric_series "$before" "$operation" "$transport")" || return 1
+  after_output="$(helper_idle_metric_series "$after" "$operation" "$transport")" || return 1
+  if [[ -n "$before_output" ]]; then
+    while read -r status value extra; do
+      [[ "$status" =~ ^[a-z][a-z0-9_]*$ && "$value" =~ ^[0-9]+$ && -z "$extra" &&
+        -z "${before_values[$status]+present}" ]] || return 1
+      before_values[$status]="$value"
+    done <<<"$before_output"
+  fi
+  if [[ -n "$after_output" ]]; then
+    while read -r status value extra; do
+      [[ "$status" =~ ^[a-z][a-z0-9_]*$ && "$value" =~ ^[0-9]+$ && -z "$extra" &&
+        -z "${after_values[$status]+present}" ]] || return 1
+      after_values[$status]="$value"
+    done <<<"$after_output"
+  fi
+  for status in "${!before_values[@]}"; do
+    [[ -n "${after_values[$status]+present}" ]] || return 1
+    ((after_values[$status] >= before_values[$status])) || return 1
+    ((after_values[$status] - before_values[$status] == 0)) || return 1
+  done
+  for status in "${!after_values[@]}"; do
+    [[ -n "${before_values[$status]+present}" ]] || return 1
+  done
+}
+
+wait_for_helper_idle_report_marker() {
+  local -r baseline="$1"
+  local -r output="$2"
+  local -r marker_output="$3"
+  local -r description="$4"
+  local deadline="${5:-}"
+  local -r candidate="$output.partial"
+  local baseline_report=""
+  local observed_report=""
+  local polls=0
+
+  [[ ! -e "$output" && ! -L "$output" && ! -e "$marker_output" && ! -L "$marker_output" &&
+    ! -e "$candidate" && ! -L "$candidate" ]] || return 1
+  baseline_report="$(helper_idle_report_value "$baseline")" || return 1
+  if [[ -z "$deadline" ]]; then
+    deadline="$((SECONDS + POSTLOAD_SENTINEL_TIMEOUT_SECONDS))"
+  fi
+  [[ "$deadline" =~ ^[0-9]+$ ]] || return 1
+  ((deadline > SECONDS)) || return 1
+  while ((SECONDS < deadline)); do
+    ((polls += 1))
+    capture_obi_metrics "$candidate"
+    observed_report="$(helper_idle_report_value "$candidate")" || {
+      rm -f -- "$candidate"
+      return 1
+    }
+    if ((observed_report > baseline_report)); then
+      install -m 0600 "$candidate" "$output" || {
+        rm -f -- "$candidate"
+        return 1
+      }
+      rm -f -- "$candidate" || return 1
+      jq -n \
+        --arg description "$description" \
+        --arg captured_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --argjson polls "$polls" \
+        --argjson baseline_report "$baseline_report" \
+        --argjson observed_report "$observed_report" \
+        '{
+          description: $description,
+          captured_at: $captured_at,
+          polls: $polls,
+          metric: "obi_java_remote_parent_operations_total",
+          operation: "report",
+          status: "valid",
+          transport: "tcp",
+          baseline: $baseline_report,
+          observed: $observed_report,
+          observed_delta: ($observed_report - $baseline_report)
+        }' >"$marker_output"
+      return 0
+    fi
+    rm -f -- "$candidate" || return 1
+    sleep "$METRICS_SETTLE_SECONDS"
+  done
+  rm -f -- "$candidate" || return 1
+  die "timed out waiting for $description tcp/report/valid marker"
+}
+
+wait_for_helper_idle_two_pass_fence() {
+  local -r initial="$1"
+  local -r output="$2"
+  local -r fence_output="$3"
+  local -r description="$4"
+  local -r first="$output.fence-first"
+  local -r first_marker="$fence_output.fence-first.json"
+  local -r second="$output.fence-second"
+  local -r second_marker="$fence_output.fence-second.json"
+  local initial_report=""
+  local first_report=""
+  local second_report=""
+  local deadline=0
+
+  [[ -f "$initial" && ! -L "$initial" &&
+    ! -e "$output" && ! -L "$output" &&
+    ! -e "$fence_output" && ! -L "$fence_output" &&
+    ! -e "$first" && ! -L "$first" &&
+    ! -e "$first_marker" && ! -L "$first_marker" &&
+    ! -e "$second" && ! -L "$second" &&
+    ! -e "$second_marker" && ! -L "$second_marker" ]] || return 1
+  initial_report="$(helper_idle_report_value "$initial")" || return 1
+  deadline="$((SECONDS + POSTLOAD_SENTINEL_TIMEOUT_SECONDS))"
+  # The report marker is emitted last by one serial BPF stats reader. A pass
+  # that was already in flight at the boundary can satisfy the first marker;
+  # the second begins after it, so its snapshot is a causal post-boundary
+  # fence without relying on a request-caused report count.
+  if ! wait_for_helper_idle_report_marker \
+    "$initial" "$first" "$first_marker" "$description first post-boundary BPF pass" "$deadline"; then
+    rm -f -- "$first" "$first_marker" "$second" "$second_marker" || true
+    return 1
+  fi
+  if ! wait_for_helper_idle_report_marker \
+    "$first" "$second" "$second_marker" "$description second post-boundary BPF pass" "$deadline"; then
+    rm -f -- "$first" "$first_marker" "$second" "$second_marker" || true
+    return 1
+  fi
+  first_report="$(helper_idle_report_value "$first")" || {
+    rm -f -- "$first" "$first_marker" "$second" "$second_marker" || true
+    return 1
+  }
+  second_report="$(helper_idle_report_value "$second")" || {
+    rm -f -- "$first" "$first_marker" "$second" "$second_marker" || true
+    return 1
+  }
+  install -m 0600 "$second" "$output" || {
+    rm -f -- "$first" "$first_marker" "$second" "$second_marker" || true
+    return 1
+  }
+  jq -n \
+    --arg description "$description" \
+    --arg captured_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --argjson initial_report "$initial_report" \
+    --argjson first_report "$first_report" \
+    --argjson second_report "$second_report" \
+    '{
+      description: $description,
+      captured_at: $captured_at,
+      metric: "obi_java_remote_parent_operations_total",
+      operation: "report",
+      status: "valid",
+      transport: "tcp",
+      initial_report: $initial_report,
+      first_post_boundary_report: $first_report,
+      second_post_boundary_report: $second_report,
+      observed_delta: ($second_report - $initial_report),
+      fence: {
+        required_serial_post_boundary_report_passes: 2,
+        report_is_published_after_each_successful_bpf_counter_pass: true
+      }
+    }' >"$fence_output" || {
+    rm -f -- "$output" "$first" "$first_marker" "$second" "$second_marker" || true
+    return 1
+  }
+  rm -f -- "$first" "$first_marker" "$second" "$second_marker" || return 1
+}
+
+helper_idle_metric_delta_json() {
+  local -r before="$1"
+  local -r after="$2"
+  local -r output="$3"
+  local operation=""
+  local transport=""
+  local name=""
+  local before_result=""
+  local after_result=""
+  local before_count=""
+  local after_count=""
+  local before_value=""
+  local after_value=""
+  local extra=""
+  local delta=0
+  local report_before=""
+  local report_after=""
+  local negotiate_before_result=""
+  local negotiate_after_result=""
+  local negotiate_before_count=""
+  local negotiate_after_count=""
+  local negotiate_before_value=""
+  local negotiate_after_value=""
+  local counters_json=""
+  local -a counter_json=()
+
+  [[ ! -e "$output" && ! -L "$output" ]] || return 1
+  report_before="$(helper_idle_report_value "$before")" || return 1
+  report_after="$(helper_idle_report_value "$after")" || return 1
+  ((report_after > report_before)) || return 1
+  for name in tcp-candidate tcp-inject tcp-stage tcp-handoff getsockopt-take getsockopt-discard; do
+    case "$name" in
+      tcp-*)
+        operation="${name#tcp-}"
+        transport=tcp
+        ;;
+      getsockopt-*)
+        operation="${name#getsockopt-}"
+        transport=getsockopt
+        ;;
+      *) return 1 ;;
+    esac
+    # A zero aggregate is insufficient: a reset or a new status-labelled
+    # series can otherwise hide activity. Require the canonical series set and
+    # every series value to remain exactly unchanged before summarizing it.
+    helper_idle_metric_series_are_zero_delta "$before" "$after" "$operation" "$transport" || return 1
+    before_result="$(helper_idle_metric_total "$before" "$operation" "$transport")" || return 1
+    after_result="$(helper_idle_metric_total "$after" "$operation" "$transport")" || return 1
+    read -r before_count before_value extra <<<"$before_result"
+    [[ "$before_count" =~ ^[0-9]+$ && "$before_value" =~ ^[0-9]+$ && -z "$extra" ]] || return 1
+    read -r after_count after_value extra <<<"$after_result"
+    [[ "$after_count" =~ ^[0-9]+$ && "$after_value" =~ ^[0-9]+$ && -z "$extra" ]] || return 1
+    ((after_value >= before_value)) || return 1
+    delta="$((after_value - before_value))"
+    ((delta == 0)) || return 1
+    counter_json+=("$(jq -cn \
+      --arg category "$name" \
+      --arg operation "$operation" \
+      --arg transport "$transport" \
+      --argjson before_series "$before_count" \
+      --argjson after_series "$after_count" \
+      --argjson before "$before_value" \
+      --argjson after "$after_value" \
+      --argjson observed_delta "$delta" \
+      '{
+        category: $category,
+        operation: $operation,
+        transport: $transport,
+        before_series: $before_series,
+        after_series: $after_series,
+        before: $before,
+        after: $after,
+        observed_delta: $observed_delta,
+        expected_delta: 0
+      }')") || return 1
+  done
+  negotiate_before_result="$(helper_idle_metric_total "$before" negotiate getsockopt missing)" || return 1
+  negotiate_after_result="$(helper_idle_metric_total "$after" negotiate getsockopt missing)" || return 1
+  read -r negotiate_before_count negotiate_before_value extra <<<"$negotiate_before_result"
+  [[ "$negotiate_before_count" =~ ^[0-9]+$ && "$negotiate_before_value" =~ ^[0-9]+$ && -z "$extra" ]] || return 1
+  read -r negotiate_after_count negotiate_after_value extra <<<"$negotiate_after_result"
+  [[ "$negotiate_after_count" =~ ^[0-9]+$ && "$negotiate_after_value" =~ ^[0-9]+$ && -z "$extra" ]] || return 1
+  ((negotiate_after_value >= negotiate_before_value)) || return 1
+  counters_json="$(printf '%s\n' "${counter_json[@]}" | jq -s .)" || return 1
+  jq -n \
+    --arg semantic "direct_java_no_upstream_handoff_not_state_map_miss_proof" \
+    --argjson report_before "$report_before" \
+    --argjson report_after "$report_after" \
+    --argjson constrained_zero_deltas "$counters_json" \
+    --argjson informative_negotiate_missing_before_count "$negotiate_before_count" \
+    --argjson informative_negotiate_missing_after_count "$negotiate_after_count" \
+    --argjson informative_negotiate_missing_before "$negotiate_before_value" \
+    --argjson informative_negotiate_missing_after "$negotiate_after_value" \
+    '{
+      semantic: $semantic,
+      report_watermark: {
+        operation: "report",
+        status: "valid",
+        transport: "tcp",
+        before: $report_before,
+        after: $report_after,
+        observed_delta: ($report_after - $report_before)
+      },
+      constrained_zero_deltas: $constrained_zero_deltas,
+      informative_getsockopt_negotiate_missing: {
+        before_series: $informative_negotiate_missing_before_count,
+        after_series: $informative_negotiate_missing_after_count,
+        before: $informative_negotiate_missing_before,
+        after: $informative_negotiate_missing_after,
+        observed_delta: ($informative_negotiate_missing_after - $informative_negotiate_missing_before),
+        interpretation: "informative_only_not_a_retrieval_outcome_reconciliation"
+      },
+      assertion: {
+        tcp_upstream_candidate_inject_stage_handoff_delta_zero: true,
+        getsockopt_take_discard_delta_zero: true
+      }
+    }' >"$output"
 }
 
 validate_benchmark_result() {
@@ -1088,9 +1606,10 @@ validate_benchmark_result() {
 
   [[ -f "$result" && ! -L "$result" ]] || return 1
   jq -se \
-    --arg base_url "$WORKLOAD_BASE_URL" \
-    --arg path "$WORKLOAD_PATH" \
-    --arg connection_mode "$WORKLOAD_CONNECTION_MODE" \
+    --arg base_url "$CELL_WORKLOAD_BASE_URL" \
+    --arg path "$CELL_WORKLOAD_PATH" \
+    --arg connection_mode "$CELL_WORKLOAD_CONNECTION_MODE" \
+    --arg tls_verification "$CELL_EXPECTED_TLS_VERIFICATION" \
     --argjson duration_nanos "$((duration_seconds * 1000000000))" \
     --argjson maximum_traffic_elapsed_nanos "$(((duration_seconds + MEASUREMENT_OVERRUN_TOLERANCE_SECONDS) * 1000000000))" \
     --argjson request_timeout_nanos "$((REQUEST_TIMEOUT_SECONDS * 1000000000))" \
@@ -1112,6 +1631,7 @@ validate_benchmark_result() {
         .base_url == $base_url and
         .path == $path and
         .connection_mode == $connection_mode and
+        .tls_verification == $tls_verification and
         .w3c == $expected_w3c and
         .seed == $sustained_load_seed and
         .requested_duration_nanos == $duration_nanos and
@@ -1174,21 +1694,28 @@ run_benchmark_client() {
 start_benchmark_client() {
   local -r output="$1"
   local -r duration_seconds="$2"
+  local -a arguments=(
+    --base-url "$CELL_WORKLOAD_BASE_URL"
+    --path "$CELL_WORKLOAD_PATH"
+    --connection-mode "$CELL_WORKLOAD_CONNECTION_MODE"
+    --duration "${duration_seconds}s"
+    --request-timeout "${REQUEST_TIMEOUT_SECONDS}s"
+    --concurrency "$CONCURRENCY"
+    --request-limit "$REQUEST_LIMIT"
+    --seed "$SUSTAINED_LOAD_SEED"
+    --w3c="$CELL_SUSTAINED_W3C"
+  )
+
+  if [[ -n "$CELL_WORKLOAD_CA_FILE" ]]; then
+    arguments+=(--ca-file "$CELL_WORKLOAD_CA_FILE")
+  fi
 
   # Measurements run in the background. Make their PID a dedicated session
   # and process-group leader so interruption can terminate timeout, Compose,
   # and every client descendant as one bounded unit.
   exec setsid -- timeout --signal=TERM --kill-after=10s "$((duration_seconds + 30))s" \
     "${COMPOSE[@]}" run --rm --no-deps --no-TTY benchmark \
-      --base-url "$WORKLOAD_BASE_URL" \
-      --path "$WORKLOAD_PATH" \
-      --connection-mode "$WORKLOAD_CONNECTION_MODE" \
-      --duration "${duration_seconds}s" \
-      --request-timeout "${REQUEST_TIMEOUT_SECONDS}s" \
-      --concurrency "$CONCURRENCY" \
-      --request-limit "$REQUEST_LIMIT" \
-      --seed "$SUSTAINED_LOAD_SEED" \
-      --w3c="$CELL_SUSTAINED_W3C" >"$output" 2>"$output.stderr"
+      "${arguments[@]}" >"$output" 2>"$output.stderr"
 }
 
 clear_active_benchmark() {
@@ -1398,6 +1925,36 @@ run_measurement_rep() {
     benchmark_identity_matches_leader "$BENCHMARK_PID"; then
     capture_resource_snapshot "$cell_dir/measurements/$repetition_label-midpoint" \
       unsynchronized_midpoint
+  else
+    jq -n --arg timing unsynchronized_midpoint --arg status unavailable \
+      '{timing: $timing, status: $status, reason: "load_client_exited_before_sample"}' \
+      >"$cell_dir/measurements/$repetition_label-midpoint.json"
+  fi
+  wait_for_active_benchmark || return $?
+  validate_benchmark_result "$result" "$DURATION_SECONDS"
+}
+
+run_helper_idle_measurement_rep() {
+  local -r cell_dir="$1"
+  local -r repetition="$2"
+  local repetition_label=""
+  local result=""
+  local launch_status=0
+
+  [[ "$CELL_HELPER_IDLE" == "true" ]] || return 1
+  printf -v repetition_label 'rep-%02d' "$repetition"
+  result="$cell_dir/measurements/$repetition_label.json"
+  launch_benchmark_client "$result" "$DURATION_SECONDS" || launch_status=$?
+  ((launch_status == 0)) || return "$launch_status"
+  sleep "$METRICS_SETTLE_SECONDS"
+  if benchmark_job_is_running "$BENCHMARK_PID" &&
+    benchmark_identity_matches_leader "$BENCHMARK_PID"; then
+    # Retain the same unsynchronized CPU/RSS/thread/FD/container point sample
+    # as the other cells, but omit only the Java diagnostics HTTP request. That
+    # request is server-instrumented and would invalidate exact t_missing
+    # accounting inside this direct-Java workload window.
+    capture_resource_snapshot "$cell_dir/measurements/$repetition_label-midpoint" \
+      unsynchronized_midpoint not_collected
   else
     jq -n --arg timing unsynchronized_midpoint --arg status unavailable \
       '{timing: $timing, status: $status, reason: "load_client_exited_before_sample"}' \
@@ -1963,6 +2520,103 @@ validate_standard_parent_discard_diagnostics() {
     d_valid 0
 }
 
+validate_helper_idle_java_diagnostics() {
+  local -r before_snapshot="$1"
+  local -r after_snapshot="$2"
+  local -r output="$3"
+  local -r successful_requests="$4"
+  local -r raw_output="$output.raw"
+  local normalized_successful_requests=""
+  local expected_raw_missing=0
+  local raw_deltas=""
+  local -a expected_counters=(
+    discard_standard 0
+    take_sampled 0
+    take_unsampled 0
+    provider_reject 0
+    provider_ver 0
+    lookup_missing 0
+    lookup_version 0
+    lookup_error 0
+    record_version 0
+    invoke_error 0
+    extract_fields 0
+    extract_invalid 0
+    extract_error 0
+    registration_fail 0
+    t_unknown 0
+    d_unknown 0
+    t_valid 0
+    d_valid 0
+    d_missing 0
+    t_stale 0
+    d_stale 0
+    t_unsupported 0
+    d_unsupported 0
+    t_malformed 0
+    d_malformed 0
+    t_version_mismatch 0
+    d_version_mismatch 0
+    t_ambiguous 0
+    d_ambiguous 0
+    t_unauthorized 0
+    d_unauthorized 0
+    t_already_consumed 0
+    d_already_consumed 0
+    t_timeout 0
+    d_timeout 0
+    t_overload 0
+    d_overload 0
+    t_transport_error 0
+    d_transport_error 0
+    t_disabled 0
+    d_disabled 0
+  )
+
+  [[ ! -e "$output" && ! -L "$output" && ! -e "$raw_output" && ! -L "$raw_output" ]] || return 1
+  normalized_successful_requests="$(normalize_decimal \
+    "$successful_requests" "$MAX_HELPER_IDLE_WORKLOAD_SUCCESSFUL_REQUESTS" true)" || return 1
+  ((normalized_successful_requests < MAX_JAVA_DIAGNOSTIC_COUNTER)) || return 1
+  expected_raw_missing="$((normalized_successful_requests + 1))"
+  expected_counters+=(t_missing "$expected_raw_missing")
+  if ! validate_java_diagnostics_counter_deltas \
+    "$before_snapshot" "$after_snapshot" "$raw_output" "${expected_counters[@]}"; then
+    rm -f -- "$raw_output"
+    return 1
+  fi
+  raw_deltas="$(jq -c . "$raw_output")" || {
+    rm -f -- "$raw_output"
+    return 1
+  }
+  jq -n \
+    --arg semantic "direct_java_no_upstream_handoff_not_state_map_miss_proof" \
+    --argjson successful_requests "$normalized_successful_requests" \
+    --argjson expected_raw_missing "$expected_raw_missing" \
+    --argjson raw_deltas "$raw_deltas" \
+    '{
+      semantic: $semantic,
+      workload_successful_requests: $successful_requests,
+      diagnostic_after_probe_t_missing: 1,
+      raw_java_t_missing_delta: $expected_raw_missing,
+      corrected_workload_t_missing: ($expected_raw_missing - 1),
+      correction: {
+        reason: "the_after_obi_diagnostics_request_is_itself_server_instrumented",
+        raw_t_missing_expected: $expected_raw_missing,
+        corrected_workload_t_missing_expected: $successful_requests
+      },
+      java_assertions: {
+        all_other_take_statuses_zero: true,
+        all_discard_statuses_zero: true,
+        discard_standard_zero: true,
+        take_sampled_zero: true,
+        take_unsampled_zero: true,
+        provider_lookup_record_invoke_extract_registration_failure_counters_zero: true
+      },
+      raw_counters: $raw_deltas.counters
+    }' >"$output"
+  rm -f -- "$raw_output" || return 1
+}
+
 run_postload_sentinel() {
   local -r cell_dir="$1"
   local -r output="$cell_dir/postload-sentinel/result.json"
@@ -2080,6 +2734,120 @@ write_cell_status() {
     >"$cell_dir/status.json"
 }
 
+write_helper_idle_reconciliation() {
+  local -r helper_directory="$1"
+  local -r successful_requests="$2"
+  local java_deltas=""
+  local bpf_deltas=""
+
+  [[ -f "$helper_directory/java-diagnostics-deltas.json" &&
+    ! -L "$helper_directory/java-diagnostics-deltas.json" &&
+    -f "$helper_directory/obi-metrics-deltas.json" &&
+    ! -L "$helper_directory/obi-metrics-deltas.json" ]] || return 1
+  java_deltas="$(jq -c . "$helper_directory/java-diagnostics-deltas.json")" || return 1
+  bpf_deltas="$(jq -c . "$helper_directory/obi-metrics-deltas.json")" || return 1
+  jq -n \
+    --arg cell "$CELL_SLUG" \
+    --arg semantic "direct_java_no_upstream_handoff_not_state_map_miss_proof" \
+    --arg base_url "$CELL_WORKLOAD_BASE_URL" \
+    --arg path "$CELL_WORKLOAD_PATH" \
+    --arg connection_mode "$CELL_WORKLOAD_CONNECTION_MODE" \
+    --arg ca_file "$CELL_WORKLOAD_CA_FILE" \
+    --arg tls_verification "$CELL_EXPECTED_TLS_VERIFICATION" \
+    --argjson successful_requests "$successful_requests" \
+    --argjson java_deltas "$java_deltas" \
+    --argjson bpf_deltas "$bpf_deltas" \
+    '{
+      cell: $cell,
+      semantic: $semantic,
+      workload: {
+        base_url: $base_url,
+        path: $path,
+        connection_mode: $connection_mode,
+        ca_file: $ca_file,
+        tls_verification: $tls_verification,
+        w3c_headers: false,
+        upstream_handoff: "none"
+      },
+      workload_successful_requests: $successful_requests,
+      java: {
+        raw_t_missing_delta: $java_deltas.raw_java_t_missing_delta,
+        diagnostic_after_probe_t_missing: $java_deltas.diagnostic_after_probe_t_missing,
+        corrected_workload_t_missing: $java_deltas.corrected_workload_t_missing,
+        exact_workload_reconciliation: ($java_deltas.corrected_workload_t_missing == $successful_requests)
+      },
+      bpf: {
+        no_tcp_upstream_lifecycle_or_getsockopt_retrieval_outcome: true,
+        report_watermark_delta: $bpf_deltas.report_watermark.observed_delta,
+        negotiate_missing: $bpf_deltas.informative_getsockopt_negotiate_missing
+      },
+      caveat: "This direct Java HTTPS control proves no Apache upstream handoff was observed during the exact window. It does not prove a java_remote_parent_state map absence, eviction, timeout, or per-request native getsockopt retrieval."
+    }' >"$helper_directory/reconciliation.json"
+}
+
+run_helper_idle_sustained() {
+  local -r cell_dir="$1"
+  local -r helper_directory="$cell_dir/sustained-helper-idle"
+  local successful_requests=0
+  local request_count=""
+  local repetition=0
+  local repetition_label=""
+
+  [[ "$CELL_HELPER_IDLE" == "true" && "$CELL_REQUIRES_OBI" == "true" &&
+    "$CELL_WORKLOAD_BASE_URL" == "$DIRECT_JAVA_WORKLOAD_BASE_URL" &&
+    "$CELL_WORKLOAD_CA_FILE" == "$DIRECT_JAVA_WORKLOAD_CA_FILE" &&
+    "$CELL_SUSTAINED_W3C" == "false" ]] || return 1
+  mkdir -- "$helper_directory"
+  capture_java_diagnostics "$helper_directory/java-diagnostics-before.txt"
+  validate_java_diagnostics_snapshot "$helper_directory/java-diagnostics-before.txt"
+  # The first observation is deliberately made after the Java diagnostic request
+  # has returned. The following two report passes form a causal BPF fence, so
+  # no pre-window lifecycle update can be mistaken for the workload baseline.
+  capture_obi_metrics "$helper_directory/obi-metrics-before-observed.prom"
+  wait_for_helper_idle_two_pass_fence \
+    "$helper_directory/obi-metrics-before-observed.prom" \
+    "$helper_directory/obi-metrics-before.prom" \
+    "$helper_directory/metrics-watermark-before.json" \
+    "post-diagnostics helper-idle baseline"
+
+  log_info "warming $CELL_SLUG for ${WARMUP_SECONDS}s"
+  run_benchmark_client "$cell_dir/warmup.json" "$WARMUP_SECONDS"
+  validate_benchmark_result "$cell_dir/warmup.json" "$WARMUP_SECONDS"
+  request_count="$(benchmark_successful_request_count "$cell_dir/warmup.json")" || return 1
+  ((successful_requests <= MAX_JAVA_DIAGNOSTIC_COUNTER - request_count)) || return 1
+  successful_requests="$((successful_requests + request_count))"
+  for ((repetition = 1; repetition <= REPETITIONS; repetition++)); do
+    log_info "measuring $CELL_SLUG repetition $repetition/$REPETITIONS"
+    run_helper_idle_measurement_rep "$cell_dir" "$repetition"
+    printf -v repetition_label 'rep-%02d' "$repetition"
+    request_count="$(benchmark_successful_request_count \
+      "$cell_dir/measurements/$repetition_label.json")" || return 1
+    ((successful_requests <= MAX_JAVA_DIAGNOSTIC_COUNTER - request_count)) || return 1
+    successful_requests="$((successful_requests + request_count))"
+  done
+  # Take a fresh observation after every workload client has exited. Waiting for
+  # two subsequent BPF report passes prevents a pass that occurred during the
+  # workload from being used as its completion boundary.
+  capture_obi_metrics "$helper_directory/obi-metrics-after-workload-observed.prom"
+  wait_for_helper_idle_two_pass_fence \
+    "$helper_directory/obi-metrics-after-workload-observed.prom" \
+    "$helper_directory/obi-metrics-after.prom" \
+    "$helper_directory/metrics-watermark-after.json" \
+    "post-workload helper-idle"
+  capture_java_diagnostics "$helper_directory/java-diagnostics-after.txt"
+  validate_java_diagnostics_snapshot "$helper_directory/java-diagnostics-after.txt"
+  validate_helper_idle_java_diagnostics \
+    "$helper_directory/java-diagnostics-before.txt" \
+    "$helper_directory/java-diagnostics-after.txt" \
+    "$helper_directory/java-diagnostics-deltas.json" \
+    "$successful_requests"
+  helper_idle_metric_delta_json \
+    "$helper_directory/obi-metrics-before.prom" \
+    "$helper_directory/obi-metrics-after.prom" \
+    "$helper_directory/obi-metrics-deltas.json"
+  write_helper_idle_reconciliation "$helper_directory" "$successful_requests"
+}
+
 run_cell() {
   local -r cell="$1"
   local cell_dir=""
@@ -2099,35 +2867,38 @@ run_cell() {
   log_info "starting $CELL_SLUG preflight project=$project"
   start_cell_stack "$cell_dir" "$project"
   capture_resource_snapshot "$cell_dir/resources-before" before
-  if [[ "$CELL_SUSTAINED_W3C" == "true" ]]; then
-    mkdir -- "$cell_dir/sustained-w3c"
-    capture_java_diagnostics "$cell_dir/sustained-w3c/java-diagnostics-before.txt"
-  fi
-
-  log_info "warming $CELL_SLUG for ${WARMUP_SECONDS}s"
-  run_benchmark_client "$cell_dir/warmup.json" "$WARMUP_SECONDS"
-  validate_benchmark_result "$cell_dir/warmup.json" "$WARMUP_SECONDS"
-  if [[ "$CELL_SUSTAINED_W3C" == "true" ]]; then
-    record_w3c_workload_successes "$cell_dir/warmup.json"
-  fi
-
-  for ((repetition = 1; repetition <= REPETITIONS; repetition++)); do
-    log_info "measuring $CELL_SLUG repetition $repetition/$REPETITIONS"
-    run_measurement_rep "$cell_dir" "$repetition"
+  if [[ "$CELL_HELPER_IDLE" == "true" ]]; then
+    run_helper_idle_sustained "$cell_dir"
+  else
     if [[ "$CELL_SUSTAINED_W3C" == "true" ]]; then
-      printf -v repetition_label 'rep-%02d' "$repetition"
-      record_w3c_workload_successes "$cell_dir/measurements/$repetition_label.json"
+      mkdir -- "$cell_dir/sustained-w3c"
+      capture_java_diagnostics "$cell_dir/sustained-w3c/java-diagnostics-before.txt"
     fi
-  done
-  if [[ "$CELL_SUSTAINED_W3C" == "true" ]]; then
-    capture_java_diagnostics "$cell_dir/sustained-w3c/java-diagnostics-after.txt"
-    validate_java_diagnostics_counter_deltas \
-      "$cell_dir/sustained-w3c/java-diagnostics-before.txt" \
-      "$cell_dir/sustained-w3c/java-diagnostics-after.txt" \
-      "$cell_dir/sustained-w3c/java-diagnostics-deltas.json" \
-      discard_standard "$CELL_W3C_WORKLOAD_SUCCESSFUL_REQUESTS" \
-      t_valid "$CELL_W3C_WORKLOAD_SUCCESSFUL_REQUESTS" \
-      d_valid 0
+    log_info "warming $CELL_SLUG for ${WARMUP_SECONDS}s"
+    run_benchmark_client "$cell_dir/warmup.json" "$WARMUP_SECONDS"
+    validate_benchmark_result "$cell_dir/warmup.json" "$WARMUP_SECONDS"
+    if [[ "$CELL_SUSTAINED_W3C" == "true" ]]; then
+      record_w3c_workload_successes "$cell_dir/warmup.json"
+    fi
+
+    for ((repetition = 1; repetition <= REPETITIONS; repetition++)); do
+      log_info "measuring $CELL_SLUG repetition $repetition/$REPETITIONS"
+      run_measurement_rep "$cell_dir" "$repetition"
+      if [[ "$CELL_SUSTAINED_W3C" == "true" ]]; then
+        printf -v repetition_label 'rep-%02d' "$repetition"
+        record_w3c_workload_successes "$cell_dir/measurements/$repetition_label.json"
+      fi
+    done
+    if [[ "$CELL_SUSTAINED_W3C" == "true" ]]; then
+      capture_java_diagnostics "$cell_dir/sustained-w3c/java-diagnostics-after.txt"
+      validate_java_diagnostics_counter_deltas \
+        "$cell_dir/sustained-w3c/java-diagnostics-before.txt" \
+        "$cell_dir/sustained-w3c/java-diagnostics-after.txt" \
+        "$cell_dir/sustained-w3c/java-diagnostics-deltas.json" \
+        discard_standard "$CELL_W3C_WORKLOAD_SUCCESSFUL_REQUESTS" \
+        t_valid "$CELL_W3C_WORKLOAD_SUCCESSFUL_REQUESTS" \
+        d_valid 0
+    fi
   fi
   capture_resource_snapshot "$cell_dir/resources-after-load" after
   run_postload_sentinel "$cell_dir"

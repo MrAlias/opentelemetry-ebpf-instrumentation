@@ -138,6 +138,13 @@ services:
     security_opt:
       - no-new-privileges:true
     read_only: true
+    volumes:
+      - type: bind
+        source: ./.runtime/certs/ca.crt
+        target: /benchmark-ca.crt
+        read_only: true
+        bind:
+          create_host_path: false
     entrypoint:
       - /trace-benchmark
     profiles:

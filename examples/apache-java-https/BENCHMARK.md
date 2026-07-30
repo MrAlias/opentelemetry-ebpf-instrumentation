@@ -27,6 +27,7 @@ warmup, duration, concurrency, JVM flags, and agent artifact.
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | uninstrumented JVM, OBI stopped | — | — | — | — | — | — | — | — | untested |
 | official agent and extension, bridge disabled | — | — | — | — | — | — | — | — | untested |
+| direct Java HTTPS, active `getsockopt` helper, no Apache handoff | — | — | — | — | — | — | — | — | untested |
 | forced `getsockopt`, hit | — | — | — | — | — | — | — | — | untested |
 | forced `getsockopt`, miss | — | — | — | — | — | — | — | — | untested |
 | forced `unix`, hit | — | — | — | — | — | — | — | — | untested |
@@ -46,7 +47,7 @@ dedicated harness for the comparable core cells.
 
 ## Core sustained benchmark harness
 
-`scripts/benchmark.sh` runs five sequential, isolated cells:
+`scripts/benchmark.sh` runs six sequential, isolated cells:
 
 | Cell | Runtime | Transport | Correctness assertion |
 | --- | --- | --- | --- |
@@ -55,6 +56,7 @@ dedicated harness for the comparable core cells.
 | `getsockopt-hit` | official Java agent, extension, and OBI | forced `getsockopt` | exact remote parent |
 | `unix-hit` | official Java agent, extension, and OBI | forced Unix fallback | exact remote parent |
 | `getsockopt-w3c` | official Java agent, extension, and OBI | forced `getsockopt` | valid W3C parent wins; staged OBI candidate is discarded |
+| `getsockopt-helper-idle` | official Java agent, extension, and OBI | active forced `getsockopt`; direct Java HTTPS workload | no Apache upstream handoff in the exact window; not a state-map-miss proof |
 
 For every cell, the harness first asks `run.sh` to retain a fixed 16-request,
 scenario-specific correctness preflight and leave only that scoped Compose
@@ -62,9 +64,9 @@ project running. The hit controls use concurrent preflight traffic; the W3C
 control is serial so it can alternate exact valid-W3C and malformed-W3C cases.
 It then warms the existing locked-down `benchmark` Compose client and runs five
 to ten fixed-duration closed-loop repetitions. The client uses closed
-connections, `/api/echo?delay_ms=150`, and a fixed seed of zero. The first four
-cells deliberately send no W3C header. `getsockopt-w3c` sends a valid W3C
-`traceparent` on every sustained request. Its preflight and post-load sentinel
+connections, `/api/echo?delay_ms=150`, and a fixed seed of zero. All cells
+except `getsockopt-w3c` deliberately send no W3C header. `getsockopt-w3c`
+sends a valid W3C `traceparent` on every sustained request. Its preflight and post-load sentinel
 use the existing `w3c` control: they require the exact W3C Java parent, retain
 the runner's `discard_standard` diagnostic delta, and retain a direct
 before/after diagnostic delta of eight `discard_standard` events and sixteen
@@ -86,10 +88,54 @@ allowance is not measurement time. Each cell ends with its fixed scenario-
 specific correctness sentinel before the harness invokes `run.sh --cleanup-only`
 for that project.
 
-The manifest preserves its v1 `w3c_headers: false` baseline for existing
+The schema-v2 manifest preserves its `w3c_headers: false` baseline for existing
 consumers. Its authoritative per-cell traffic record is
 `workload.w3c_headers_by_cell`: only `getsockopt-w3c` is `true`; the four
-comparison controls are `false`.
+other Apache comparison controls and the direct-Java helper-idle control are
+`false`. `workload.by_cell` records the base URL, CA-file use, TLS verification,
+and handoff contract for every cell.
+
+### Direct-Java helper-idle control
+
+`getsockopt-helper-idle` first keeps the normal 16-request forced-`getsockopt`
+concurrency preflight, so the configured bridge still has an ordinary
+Apache-to-Java hit control. Its sustained client then connects directly to the
+Java backend at `https://127.0.0.1:18443`, with W3C disabled and only the
+generated CA certificate mounted read-only at `/benchmark-ca.crt`; it has no
+Apache upstream connection to hand off. The benchmark Compose client remains
+non-root, read-only, capability-free, and `no-new-privileges`; it does not
+receive the certificate private key or PKCS#12 keystore.
+
+The exact helper-idle window is deliberately ordered as follows: a Java
+diagnostics snapshot; a fresh OBI metrics seed followed by two serial
+`tcp/report/valid` BPF-stats passes; the direct warmup and all repetitions; a
+fresh post-workload seed followed by two more serial BPF-stats passes; then a
+Java diagnostics snapshot. The marker is published last by the single periodic
+stats reader, not by an individual request: the second pass after each boundary
+is therefore the retained causal fence. Normal before/after/idle resource
+snapshots, the preflight, and the post-load sentinel remain outside this window.
+
+Each helper-idle repetition still retains an unsynchronized in-load resource
+point sample for OBI and Java CPU/RSS/thread/FD/container comparison. Its
+`snapshot.json` explicitly marks Java diagnostics `not_collected`; the sample
+retains process, container, and OBI-metrics artifacts but deliberately omits
+only the `/obi-diagnostics` request, because that server-instrumented request
+would contaminate exact `t_missing` accounting.
+
+For `N` successful direct-Java requests, the raw Java `t_missing` delta is
+exactly `N + 1`: the final diagnostics request is itself server-instrumented and
+is included in the after snapshot. The retained reconciliation records that
+one-event correction and requires corrected workload `t_missing == N`. It also
+requires zero deltas for TCP `candidate`, `inject`, `stage`, and `handoff`, and
+for `getsockopt` `take` and `discard`; `getsockopt/negotiate/missing` is retained
+only as informative context, not as a retrieval-outcome reconciliation.
+
+This control is labeled
+`direct_java_no_upstream_handoff_not_state_map_miss_proof`. It proves neither a
+`java_remote_parent_state` map absence nor eviction, timeout, or a per-request
+native `getsockopt` retrieval. It is therefore a direct-Java/no-Apache-handoff
+comparison, not the required primary or Unix state-map miss/timeout benchmark
+cell.
 
 Create a private parent outside the repository for the retained artifact, then
 run the harness from the repository root:
@@ -119,15 +165,17 @@ tools it validates at startup, including `timeout`, `setsid`, `ps`, and `sleep`.
 
 Each cell retains the runner's preflight provenance, warmup and repetition
 JSON, post-load sentinel, host environment, Docker stats and inspect records,
-`/proc` memory/fd/thread snapshots, OBI metrics when applicable, and Java
-diagnostics. A snapshot labelled `unsynchronized_midpoint` is a point sample
-while the load command is still running; it is not proof that traffic was live
-throughout the sample. The manifest includes a shell-escaped invocation for
-reproduction. On a successful full harness run, `variance.json` records every
-requested completed sustained-client repetition separately for each core cell;
-it preserves the ordinal source paths rather than combining cells, warmups,
-sentinels, midpoint samples, or individual requests. `summary.json` links that
-artifact only when it is available.
+`/proc` memory/fd/thread snapshots, OBI metrics when applicable, and requested
+Java diagnostics. The helper-idle midpoint is the documented exception: it
+omits Java diagnostics and records that explicit reason in `snapshot.json`.
+A snapshot labelled `unsynchronized_midpoint` is a point sample while the load
+command is still running; it is not proof that traffic was live throughout the
+sample. The manifest includes a shell-escaped invocation for reproduction. On a
+successful full harness run, `variance.json` records every requested completed
+sustained-client repetition separately for each core cell; it preserves the
+ordinal source paths rather than combining cells, warmups, sentinels, midpoint
+samples, or individual requests. `summary.json` links that artifact only when
+it is available.
 
 For every retained per-repetition value, `variance.json` reports the observed
 minimum, numeric median, and maximum. With an odd sample count, the median is
@@ -150,7 +198,7 @@ evictions, and BPF lock contention. Do not use the repository-wide
 `scripts/bpf-metrics-sampler.sh` for this harness: it changes a host-global BPF
 statistics sysctl and is not scoped to the demo project.
 
-The five core cells are not the complete #37 matrix. Explicit primary/fallback
+The six core cells are not the complete #37 matrix. Explicit primary/fallback
 miss or timeout and pressure cells still require separately measured evidence
 before declaring the benchmark issue complete. No checked-in benchmark artifact
 exists yet, so this harness change does not turn the W3C row in the comparison

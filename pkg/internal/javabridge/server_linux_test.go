@@ -1122,6 +1122,55 @@ func TestProcIdentityResolverUsesPeerProcess(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestProcIdentityResolverRejectsLiveThreadFromAnotherProcess(t *testing.T) {
+	const (
+		attackerPID = int32(123)
+		javaPID     = int32(456)
+		attackerTID = uint32(42)
+		javaTID     = uint32(1)
+	)
+	root := t.TempDir()
+	sharedNamespace := filepath.Join(root, "shared-pid-namespace")
+	require.NoError(t, os.WriteFile(sharedNamespace, nil, 0o600))
+	writeProcess := func(pid int32, namespacePID uint32) {
+		processDir := filepath.Join(root, fmt.Sprint(pid))
+		taskDir := filepath.Join(processDir, "task", fmt.Sprint(pid))
+		namespaceDir := filepath.Join(processDir, "ns")
+		require.NoError(t, os.MkdirAll(taskDir, 0o750))
+		require.NoError(t, os.MkdirAll(namespaceDir, 0o750))
+		require.NoError(t, os.WriteFile(
+			filepath.Join(processDir, "status"),
+			[]byte(fmt.Sprintf("NStgid:\t%d %d\n", pid, namespacePID)),
+			0o600,
+		))
+		require.NoError(t, os.WriteFile(
+			filepath.Join(taskDir, "status"),
+			[]byte(fmt.Sprintf("Tgid:\t%d\nNSpid:\t%d %d\n", pid, pid, namespacePID)),
+			0o600,
+		))
+		require.NoError(t, os.Link(
+			sharedNamespace, filepath.Join(namespaceDir, "pid_for_children"),
+		))
+	}
+	writeProcess(attackerPID, attackerTID)
+	writeProcess(javaPID, javaTID)
+
+	resolver := &procIdentityResolver{root: root, threadLimit: 1}
+	javaIdentity, err := resolver.Resolve(t.Context(), javaPID, javaTID)
+	require.NoError(t, err)
+	assert.Equal(t, javaTID, javaIdentity.TID)
+	assert.Equal(t, javaTID, javaIdentity.PID)
+
+	attackerIdentity, err := resolver.Resolve(t.Context(), attackerPID, attackerTID)
+	require.NoError(t, err)
+	assert.Equal(t, attackerTID, attackerIdentity.TID)
+	assert.Equal(t, attackerTID, attackerIdentity.PID)
+	assert.Equal(t, javaIdentity.Namespace, attackerIdentity.Namespace)
+
+	_, err = resolver.Resolve(t.Context(), attackerPID, javaTID)
+	require.ErrorContains(t, err, "namespace thread identity has no matches")
+}
+
 func TestProcIdentityResolverHonorsCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()

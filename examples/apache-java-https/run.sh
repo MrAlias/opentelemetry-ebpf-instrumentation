@@ -6368,6 +6368,25 @@ assert_unix_security_cgroup_identity() {
   }
 }
 
+assert_unix_sibling_security_options() {
+  local -r security_options="$1"
+
+  jq -e '
+    type == "array" and
+    length == 1 and
+    .[0] == "no-new-privileges:true"
+  ' <<<"$security_options" >/dev/null
+}
+
+assert_unix_sibling_tmpfs() {
+  local -r tmpfs="$1"
+
+  jq -e '
+    . == null or
+    (type == "object" and length == 0)
+  ' <<<"$tmpfs" >/dev/null
+}
+
 assert_unix_sibling_security_topology() {
   local -r java_container="$1"
   local -r sibling_container="$2"
@@ -6382,6 +6401,7 @@ assert_unix_sibling_security_topology() {
   local cap_add=""
   local security_options=""
   local mounts=""
+  local tmpfs=""
   local java_host_pid=""
   local sibling_host_pid=""
   local java_cgroup=""
@@ -6410,13 +6430,22 @@ assert_unix_sibling_security_topology() {
     --format '{{json .HostConfig.SecurityOpt}}' "$sibling_container")" || return $?
   mounts="$(run_bounded 10 docker inspect --format '{{json .Mounts}}' \
     "$sibling_container")" || return $?
+  tmpfs="$(run_bounded 10 docker inspect --format '{{json .HostConfig.Tmpfs}}' \
+    "$sibling_container")" || return $?
   [[ "$user" == "65534:65534" && "$network_mode" == "none" && -z "$pid_mode" && \
     -z "$java_pid_mode" && \
     "$read_only_rootfs" == "true" && "$privileged" == "false" && \
     "$cap_drop" == *'"ALL"'* && \
-    ( "$cap_add" == "null" || "$cap_add" == "[]" ) && \
-    "$security_options" == *'"no-new-privileges:true"'* ]] || {
+    ( "$cap_add" == "null" || "$cap_add" == "[]" ) ]] || {
     log_error "Unix sibling security probe did not preserve its least-privilege topology"
+    return 1
+  }
+  assert_unix_sibling_security_options "$security_options" || {
+    log_error "Unix sibling security probe did not retain exactly no-new-privileges:true"
+    return 1
+  }
+  assert_unix_sibling_tmpfs "$tmpfs" || {
+    log_error "Unix sibling security probe unexpectedly configured writable tmpfs storage"
     return 1
   }
   jq -e '
@@ -6471,6 +6500,7 @@ assert_unix_sibling_security_topology() {
     printf 'cap_drop_all=true\n'
     printf 'cap_add_empty=true\n'
     printf 'no_new_privileges=true\n'
+    printf 'tmpfs_empty=true\n'
     printf 'mount_count=1\n'
     printf 'socket_mount_type=volume\n'
     printf 'socket_mount_writable=false\n'

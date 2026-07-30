@@ -5233,6 +5233,36 @@ test_unix_security_identity_requires_same_cgroup_nonroot_capabilityfree() {
   fi
 }
 
+test_unix_sibling_security_options_require_exact_nnp() {
+  local security_options=""
+
+  assert_unix_sibling_security_options '["no-new-privileges:true"]'
+  for security_options in \
+    '["no-new-privileges:true","no-new-privileges:false"]' \
+    '["no-new-privileges:false"]' \
+    '["no-new-privileges:true","seccomp=unconfined"]' \
+    '[]' \
+    'null'; do
+    if assert_unix_sibling_security_options "$security_options" >/dev/null 2>&1; then
+      printf 'Unix sibling security options accepted %s\n' "$security_options" >&2
+      return 1
+    fi
+  done
+}
+
+test_unix_sibling_tmpfs_requires_empty_configuration() {
+  local tmpfs=""
+
+  assert_unix_sibling_tmpfs 'null'
+  assert_unix_sibling_tmpfs '{}'
+  for tmpfs in '{"tmp":""}' '{"tmp":"rw,size=16m"}' '[]'; do
+    if assert_unix_sibling_tmpfs "$tmpfs" >/dev/null 2>&1; then
+      printf 'Unix sibling tmpfs policy accepted %s\n' "$tmpfs" >&2
+      return 1
+    fi
+  done
+}
+
 test_unix_abuse_race_result_requires_every_case() {
   local -r output="$TEST_TMP_DIR/unix-abuse-race-result.log"
 
@@ -5317,9 +5347,12 @@ test_unix_security_controls_use_isolated_topology_windows() {
     "$same_cgroup_control" == *'assert_unix_abuse_race_output'* && \
     "$sibling_topology" == *'HostConfig.Privileged'* && \
     "$sibling_topology" == *'json .HostConfig.CapAdd'* && \
+    "$sibling_topology" == *'assert_unix_sibling_security_options'* && \
+    "$sibling_topology" == *'assert_unix_sibling_tmpfs'* && \
     "$sibling_topology" == *'"$privileged" == "false"'* && \
     "$sibling_topology" == *'( "$cap_add" == "null" || "$cap_add" == "[]" )'* && \
     "$sibling_topology" == *'json .Mounts'* && \
+    "$sibling_topology" == *'json .HostConfig.Tmpfs'* && \
     "$sibling_topology" == *'length == 1'* && \
     "$sibling_topology" == *'.[0].Type == "volume"'* && \
     "$sibling_topology" == *'.[0].Destination == "/var/run/obi"'* && \
@@ -11006,6 +11039,8 @@ test_unix_security_probe_topology_is_least_privilege() {
   local sibling_volumes=""
   local resolved_sibling_volumes=""
   local resolved_sibling_volume_count=""
+  local resolved_sibling_security_options=""
+  local resolved_sibling_security_option_count=""
   local endpoint_volumes=""
 
   grep -Fqx '    socket_group_id: 65534' "$obi_config"
@@ -11018,21 +11053,30 @@ test_unix_security_probe_topology_is_least_privilege() {
   endpoint_service="$(compose_service_block "$compose_file" security-probe)"
   sibling_volumes="$(awk '
     $0 == "    volumes:" { inside = 1; next }
-    inside && $0 ~ /^    [^[:space:]#].*:[[:space:]]*$/ { exit }
+    inside && $0 ~ /^    [^[:space:]#][^:]*:/ { exit }
     inside && $0 ~ /^      - / { print }
   ' <<<"$sibling_service")"
   resolved_sibling_volumes="$(awk '
     $0 == "    volumes:" { inside = 1; next }
-    inside && $0 ~ /^    [^[:space:]#].*:[[:space:]]*$/ { exit }
+    inside && $0 ~ /^    [^[:space:]#][^:]*:/ { exit }
     inside { print }
   ' <<<"$resolved_sibling_service")"
   resolved_sibling_volume_count="$(awk '
     /^      - type:/ { count += 1 }
     END { print count + 0 }
   ' <<<"$resolved_sibling_volumes")"
+  resolved_sibling_security_options="$(awk '
+    $0 == "    security_opt:" { inside = 1; next }
+    inside && $0 ~ /^    [^[:space:]#][^:]*:/ { exit }
+    inside { print }
+  ' <<<"$resolved_sibling_service")"
+  resolved_sibling_security_option_count="$(awk '
+    /^      - / { count += 1 }
+    END { print count + 0 }
+  ' <<<"$resolved_sibling_security_options")"
   endpoint_volumes="$(awk '
     $0 == "    volumes:" { inside = 1; next }
-    inside && $0 ~ /^    [^[:space:]#].*:[[:space:]]*$/ { exit }
+    inside && $0 ~ /^    [^[:space:]#][^:]*:/ { exit }
     inside && $0 ~ /^      - / { print }
   ' <<<"$endpoint_service")"
 
@@ -11045,10 +11089,13 @@ test_unix_security_probe_topology_is_least_privilege() {
     "$resolved_sibling_service" != *'cap_add:'* &&
     "$resolved_sibling_service" != *'pid: host'* &&
     "$resolved_sibling_service" != *'userns_mode: host'* &&
+    "$resolved_sibling_service" != *'tmpfs:'* &&
     "$resolved_sibling_volume_count" == "1" &&
     "$resolved_sibling_volumes" == *'source: java-remote-parent-socket'* &&
     "$resolved_sibling_volumes" == *'target: /var/run/obi'* &&
-    "$resolved_sibling_volumes" == *'read_only: true'* ]] || {
+    "$resolved_sibling_volumes" == *'read_only: true'* &&
+    "$resolved_sibling_security_option_count" == "1" &&
+    "$resolved_sibling_security_options" == '      - no-new-privileges:true' ]] || {
     printf 'resolved Unix sibling probe gained an unsafe topology through Compose inheritance\n' >&2
     return 1
   }
@@ -11169,6 +11216,8 @@ main() {
   test_unix_security_quiescence_restores_policy
   test_background_process_polling_handles_proc_race_quietly
   test_unix_security_identity_requires_same_cgroup_nonroot_capabilityfree
+  test_unix_sibling_security_options_require_exact_nnp
+  test_unix_sibling_tmpfs_requires_empty_configuration
   test_unix_abuse_race_result_requires_every_case
   test_unix_security_controls_use_isolated_topology_windows
   test_permissive_unix_directory_control_refuses_and_restores

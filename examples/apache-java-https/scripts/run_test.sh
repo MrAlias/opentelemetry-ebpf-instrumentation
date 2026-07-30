@@ -5256,6 +5256,7 @@ test_unix_security_controls_use_isolated_topology_windows() {
   local sibling_control=""
   local same_cgroup_control=""
   local cleanup_control=""
+  local sibling_topology=""
   local peer_start_line=""
   local endpoint_start_line=""
   local sibling_baseline_line=""
@@ -5270,6 +5271,7 @@ test_unix_security_controls_use_isolated_topology_windows() {
   sibling_control="$(declare -f run_unix_sibling_security_control)"
   same_cgroup_control="$(declare -f run_unix_same_cgroup_security_control)"
   cleanup_control="$(declare -f cleanup_security_processes)"
+  sibling_topology="$(declare -f assert_unix_sibling_security_topology)"
 
   peer_start_line="$(awk '/run_unix_peer_security_controls/ { print NR; exit }' \
     <<<"$unix_control")"
@@ -5313,6 +5315,15 @@ test_unix_security_controls_use_isolated_topology_windows() {
     "$same_cgroup_control" == *'assert_unix_security_cgroup_identity'* && \
     "$same_cgroup_control" == *'security-unix-same-cgroup-victim'* && \
     "$same_cgroup_control" == *'assert_unix_abuse_race_output'* && \
+    "$sibling_topology" == *'HostConfig.Privileged'* && \
+    "$sibling_topology" == *'json .HostConfig.CapAdd'* && \
+    "$sibling_topology" == *'"$privileged" == "false"'* && \
+    "$sibling_topology" == *'( "$cap_add" == "null" || "$cap_add" == "[]" )'* && \
+    "$sibling_topology" == *'json .Mounts'* && \
+    "$sibling_topology" == *'length == 1'* && \
+    "$sibling_topology" == *'.[0].Type == "volume"'* && \
+    "$sibling_topology" == *'.[0].Destination == "/var/run/obi"'* && \
+    "$sibling_topology" == *'.[0].RW == false'* && \
     "$cleanup_control" == *'UNIX_SECURITY_SIBLING_CONTAINER'* && \
     "$cleanup_control" == *'UNIX_SECURITY_ENDPOINT_CONTAINER'* && \
     "$cleanup_control" == *'UNIX_SECURITY_PROBE_DIRECTORY'* && \
@@ -10986,23 +10997,39 @@ compose_service_block() {
 test_unix_security_probe_topology_is_least_privilege() {
   local -r obi_config="$TEST_SCRIPT_DIR/../configs/obi.yaml"
   local -r compose_file="$TEST_SCRIPT_DIR/../docker-compose.yml"
+  local -r resolved_compose="$TEST_TMP_DIR/unix-security-resolved-compose.yaml"
   local sibling_service=""
+  local resolved_sibling_service=""
   local endpoint_service=""
   local socket_init_service=""
   local obi_service=""
   local sibling_volumes=""
+  local resolved_sibling_volumes=""
+  local resolved_sibling_volume_count=""
   local endpoint_volumes=""
 
   grep -Fqx '    socket_group_id: 65534' "$obi_config"
+  COMPOSE_PROFILES=tools docker compose --file "$compose_file" config >"$resolved_compose"
   socket_init_service="$(compose_service_block "$compose_file" socket-init)"
   obi_service="$(compose_service_block "$compose_file" obi)"
   sibling_service="$(compose_service_block "$compose_file" security-unix-sibling-probe)"
+  resolved_sibling_service="$(compose_service_block \
+    "$resolved_compose" security-unix-sibling-probe)"
   endpoint_service="$(compose_service_block "$compose_file" security-probe)"
   sibling_volumes="$(awk '
     $0 == "    volumes:" { inside = 1; next }
     inside && $0 ~ /^    [^[:space:]#].*:[[:space:]]*$/ { exit }
     inside && $0 ~ /^      - / { print }
   ' <<<"$sibling_service")"
+  resolved_sibling_volumes="$(awk '
+    $0 == "    volumes:" { inside = 1; next }
+    inside && $0 ~ /^    [^[:space:]#].*:[[:space:]]*$/ { exit }
+    inside { print }
+  ' <<<"$resolved_sibling_service")"
+  resolved_sibling_volume_count="$(awk '
+    /^      - type:/ { count += 1 }
+    END { print count + 0 }
+  ' <<<"$resolved_sibling_volumes")"
   endpoint_volumes="$(awk '
     $0 == "    volumes:" { inside = 1; next }
     inside && $0 ~ /^    [^[:space:]#].*:[[:space:]]*$/ { exit }
@@ -11012,6 +11039,17 @@ test_unix_security_probe_topology_is_least_privilege() {
   [[ "$socket_init_service" == *'chown 0:65534 /var/run/obi && chmod 0750 /var/run/obi'* &&
     "$obi_service" == *'OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_GROUP_ID: "65534"'* ]] || {
     printf 'Unix socket group is not owned consistently by socket-init and OBI\n' >&2
+    return 1
+  }
+  [[ "$resolved_sibling_service" != *'privileged: true'* &&
+    "$resolved_sibling_service" != *'cap_add:'* &&
+    "$resolved_sibling_service" != *'pid: host'* &&
+    "$resolved_sibling_service" != *'userns_mode: host'* &&
+    "$resolved_sibling_volume_count" == "1" &&
+    "$resolved_sibling_volumes" == *'source: java-remote-parent-socket'* &&
+    "$resolved_sibling_volumes" == *'target: /var/run/obi'* &&
+    "$resolved_sibling_volumes" == *'read_only: true'* ]] || {
+    printf 'resolved Unix sibling probe gained an unsafe topology through Compose inheritance\n' >&2
     return 1
   }
   [[ "$sibling_service" == *'network_mode: none'* &&

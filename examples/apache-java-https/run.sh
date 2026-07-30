@@ -6377,9 +6377,11 @@ assert_unix_sibling_security_topology() {
   local pid_mode=""
   local java_pid_mode=""
   local read_only_rootfs=""
+  local privileged=""
   local cap_drop=""
+  local cap_add=""
   local security_options=""
-  local socket_mount_writable=""
+  local mounts=""
   local java_host_pid=""
   local sibling_host_pid=""
   local java_cgroup=""
@@ -6398,19 +6400,32 @@ assert_unix_sibling_security_topology() {
     "$java_container")" || return $?
   read_only_rootfs="$(run_bounded 10 docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' \
     "$sibling_container")" || return $?
+  privileged="$(run_bounded 10 docker inspect --format '{{.HostConfig.Privileged}}' \
+    "$sibling_container")" || return $?
   cap_drop="$(run_bounded 10 docker inspect --format '{{json .HostConfig.CapDrop}}' \
+    "$sibling_container")" || return $?
+  cap_add="$(run_bounded 10 docker inspect --format '{{json .HostConfig.CapAdd}}' \
     "$sibling_container")" || return $?
   security_options="$(run_bounded 10 docker inspect \
     --format '{{json .HostConfig.SecurityOpt}}' "$sibling_container")" || return $?
-  socket_mount_writable="$(run_bounded 10 docker inspect \
-    --format '{{range .Mounts}}{{if eq .Destination "/var/run/obi"}}{{.RW}}{{end}}{{end}}' \
+  mounts="$(run_bounded 10 docker inspect --format '{{json .Mounts}}' \
     "$sibling_container")" || return $?
   [[ "$user" == "65534:65534" && "$network_mode" == "none" && -z "$pid_mode" && \
     -z "$java_pid_mode" && \
-    "$read_only_rootfs" == "true" && "$cap_drop" == *'"ALL"'* && \
-    "$security_options" == *'"no-new-privileges:true"'* && \
-    "$socket_mount_writable" == "false" ]] || {
+    "$read_only_rootfs" == "true" && "$privileged" == "false" && \
+    "$cap_drop" == *'"ALL"'* && \
+    ( "$cap_add" == "null" || "$cap_add" == "[]" ) && \
+    "$security_options" == *'"no-new-privileges:true"'* ]] || {
     log_error "Unix sibling security probe did not preserve its least-privilege topology"
+    return 1
+  }
+  jq -e '
+    type == "array" and length == 1 and
+    .[0].Type == "volume" and
+    .[0].Destination == "/var/run/obi" and
+    .[0].RW == false
+  ' <<<"$mounts" >/dev/null || {
+    log_error "Unix sibling security probe did not have exactly one read-only socket volume"
     return 1
   }
 
@@ -6452,8 +6467,12 @@ assert_unix_sibling_security_topology() {
     printf 'pid_namespace_evidence=%s\n' "$pid_namespace_evidence"
     printf 'cgroup_match=false\n'
     printf 'readonly_rootfs=true\n'
+    printf 'privileged=false\n'
     printf 'cap_drop_all=true\n'
+    printf 'cap_add_empty=true\n'
     printf 'no_new_privileges=true\n'
+    printf 'mount_count=1\n'
+    printf 'socket_mount_type=volume\n'
     printf 'socket_mount_writable=false\n'
   } >"$output"
 }

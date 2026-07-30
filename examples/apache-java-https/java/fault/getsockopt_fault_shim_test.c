@@ -595,6 +595,7 @@ static void test_live_fd_barrier_blocks_exact_take_until_release(void) {
   set_fault_mode(java_remote_parent_live_fd_barrier_mode);
   obi_demo_java_remote_parent_reset_real_getsockopt_call_count_for_test();
   obi_demo_java_remote_parent_reset_live_fd_barrier_observed_release_for_test();
+  obi_demo_java_remote_parent_reset_wrong_live_socket_probe_for_test();
 
   struct live_fd_barrier_attempt attempt = {
       .socket = sockets[0],
@@ -615,12 +616,20 @@ static void test_live_fd_barrier_blocks_exact_take_until_release(void) {
   assert(!atomic_load(&attempt.complete));
   assert(obi_demo_java_remote_parent_real_getsockopt_call_count_for_test() ==
          0);
+  assert(obi_demo_java_remote_parent_wrong_live_socket_probe_count_for_test() ==
+         1);
+  const int wrong_live_socket_errno =
+      obi_demo_java_remote_parent_wrong_live_socket_probe_errno_for_test();
+  assert(wrong_live_socket_errno == ENOPROTOOPT ||
+         wrong_live_socket_errno == EOPNOTSUPP);
 
   release_live_fd_barrier(sockets[1]);
   wait_for_live_fd_barrier_release_observation(sockets[1]);
   assert(!atomic_load(&attempt.complete));
   assert(obi_demo_java_remote_parent_real_getsockopt_call_count_for_test() ==
          0);
+  assert(obi_demo_java_remote_parent_wrong_live_socket_probe_count_for_test() ==
+         1);
 
   release_live_fd_barrier(alias);
   wait_for_live_fd_barrier_release_observation(alias);
@@ -634,6 +643,8 @@ static void test_live_fd_barrier_blocks_exact_take_until_release(void) {
   assert(attempt.result == -1);
   assert(attempt.error == ENOPROTOOPT || attempt.error == EOPNOTSUPP);
   assert(obi_demo_java_remote_parent_real_getsockopt_call_count_for_test() ==
+         1);
+  assert(obi_demo_java_remote_parent_wrong_live_socket_probe_count_for_test() ==
          1);
   assert(fault_file_matches(""));
 

@@ -7,15 +7,18 @@
 
 #include "getsockopt_fault_shim.h"
 
+#include <arpa/inet.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -84,6 +87,9 @@ static int java_remote_parent_live_fd_barrier_timeout_for_test =
 static _Atomic unsigned int
     java_remote_parent_real_getsockopt_call_count_for_test;
 static _Atomic int java_remote_parent_live_fd_barrier_observed_release_for_test;
+static _Atomic unsigned int
+    java_remote_parent_wrong_live_socket_probe_count_for_test;
+static _Atomic int java_remote_parent_wrong_live_socket_probe_errno_for_test;
 
 void obi_demo_java_remote_parent_set_live_fd_barrier_timeout_for_test(
     int timeout_millis) {
@@ -114,6 +120,28 @@ int obi_demo_java_remote_parent_live_fd_barrier_observed_release_for_test(
     void) {
   return atomic_load_explicit(
       &java_remote_parent_live_fd_barrier_observed_release_for_test,
+      memory_order_relaxed);
+}
+
+void obi_demo_java_remote_parent_reset_wrong_live_socket_probe_for_test(void) {
+  atomic_store_explicit(
+      &java_remote_parent_wrong_live_socket_probe_count_for_test, 0,
+      memory_order_relaxed);
+  atomic_store_explicit(
+      &java_remote_parent_wrong_live_socket_probe_errno_for_test, 0,
+      memory_order_relaxed);
+}
+
+unsigned int obi_demo_java_remote_parent_wrong_live_socket_probe_count_for_test(
+    void) {
+  return atomic_load_explicit(
+      &java_remote_parent_wrong_live_socket_probe_count_for_test,
+      memory_order_relaxed);
+}
+
+int obi_demo_java_remote_parent_wrong_live_socket_probe_errno_for_test(void) {
+  return atomic_load_explicit(
+      &java_remote_parent_wrong_live_socket_probe_errno_for_test,
       memory_order_relaxed);
 }
 #endif
@@ -310,6 +338,100 @@ static bool java_remote_parent_is_exact_take_request(int socket, int level,
          optlen != NULL && *optlen == java_remote_parent_response_size;
 }
 
+static bool java_remote_parent_close_wrong_live_socket_pair(int client,
+                                                            int server) {
+  int close_error = 0;
+  if (client >= 0 && close(client) != 0) {
+    close_error = errno;
+  }
+  if (server >= 0 && close(server) != 0 && close_error == 0) {
+    close_error = errno;
+  }
+  if (close_error != 0) {
+    errno = close_error;
+    return false;
+  }
+  return true;
+}
+
+/* Exercise a separate, established TCP socket from the same JVM process.
+ * It deliberately has no OBI negotiation, so the BPF program must reject the
+ * retrieval without reaching the held victim's socket-local state. Call the
+ * resolved libc symbol directly to avoid recursing through this interposer. */
+static bool java_remote_parent_probe_wrong_live_socket(void) {
+  int listener = -1;
+  int client = -1;
+  int server = -1;
+  struct sockaddr_in address;
+  memset(&address, 0, sizeof(address));
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+  listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
+  if (listener < 0 ||
+      bind(listener, (const struct sockaddr *)&address, sizeof(address)) != 0) {
+    goto failed;
+  }
+  socklen_t address_length = sizeof(address);
+  if (getsockname(listener, (struct sockaddr *)&address, &address_length) != 0 ||
+      address_length != sizeof(address) || listen(listener, 1) != 0) {
+    goto failed;
+  }
+
+  client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
+  if (client < 0 ||
+      connect(client, (const struct sockaddr *)&address, sizeof(address)) != 0) {
+    goto failed;
+  }
+  server = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+  if (server < 0) {
+    goto failed;
+  }
+  /* A failed close leaves the descriptor state indeterminate, so do not retry
+   * it from the generic cleanup path. */
+  const int closing_listener = listener;
+  listener = -1;
+  if (close(closing_listener) != 0) {
+    goto failed;
+  }
+
+  unsigned char response[java_remote_parent_response_size] = {0};
+  socklen_t response_length = sizeof(response);
+  const int result = real_getsockopt(
+      client, java_remote_parent_socket_level, java_remote_parent_socket_take,
+      response, &response_length);
+  const int probe_errno = errno;
+#if defined(OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TESTING)
+  atomic_fetch_add_explicit(
+      &java_remote_parent_wrong_live_socket_probe_count_for_test, 1,
+      memory_order_relaxed);
+  atomic_store_explicit(
+      &java_remote_parent_wrong_live_socket_probe_errno_for_test, probe_errno,
+      memory_order_relaxed);
+#endif
+  const bool denied =
+      result == -1 &&
+      (probe_errno == ENOPROTOOPT || probe_errno == EOPNOTSUPP);
+  if (!java_remote_parent_close_wrong_live_socket_pair(client, server)) {
+    return false;
+  }
+  if (!denied) {
+    errno = probe_errno == 0 ? EPROTO : probe_errno;
+    return false;
+  }
+  return true;
+
+failed:
+  {
+    const int saved_errno = errno;
+    (void)close(listener);
+    (void)close(client);
+    (void)close(server);
+    errno = saved_errno;
+  }
+  return false;
+}
+
 /* The private demo control intentionally pauses one live Java socket before
  * the real take consumes its one-shot BPF state. A same-container probe can
  * duplicate that exact descriptor during the bounded pause. The release
@@ -339,6 +461,11 @@ java_remote_parent_wait_for_live_fd_barrier(int socket, int level, int option,
           java_remote_parent_live_fd_barrier_mode)) {
     (void)close(descriptor);
     return 0;
+  }
+
+  if (!java_remote_parent_probe_wrong_live_socket()) {
+    java_remote_parent_close_preserving_errno(descriptor);
+    return -1;
   }
 
   char ready[java_remote_parent_fault_mode_max_size];

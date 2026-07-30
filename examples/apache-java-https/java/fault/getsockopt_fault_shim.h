@@ -21,4 +21,8 @@ obi_demo_java_remote_parent_real_getsockopt_call_count_for_test(void);
 void obi_demo_java_remote_parent_reset_live_fd_barrier_observed_release_for_test(
     void);
 int obi_demo_java_remote_parent_live_fd_barrier_observed_release_for_test(void);
+void obi_demo_java_remote_parent_reset_wrong_live_socket_probe_for_test(void);
+unsigned int
+obi_demo_java_remote_parent_wrong_live_socket_probe_count_for_test(void);
+int obi_demo_java_remote_parent_wrong_live_socket_probe_errno_for_test(void);
 #endif

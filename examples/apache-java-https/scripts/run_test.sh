@@ -5361,7 +5361,8 @@ test_primary_live_fd_control_uses_exact_barrier_protocol() {
     "$control" == *'--request-timeout "${PRIMARY_LIVE_FD_VICTIM_REQUEST_TIMEOUT_SECONDS}s"'* && \
     "$control" == *'primary_live_fd_remaining_timeout'* && \
     "$control" == *'assert_primary_security_metric_delta "$probe_delta" negotiate 1 1'* && \
-    "$control" == *'assert_primary_security_metric_delta "$probe_delta" take 1 1'* && \
+    "$control" == *'assert_primary_security_metric_delta "$probe_delta" take 2 2'* && \
+    "$control" == *'assert_primary_security_metric_delta "$full_delta" take 2 2'* && \
     "$control" == *'assert_bridge_metric_delta "$probe_delta" getsockopt 0 0 0 1 1 false 0'* && \
     "$control" == *'assert_bridge_metric_delta "$full_delta" getsockopt 1 0 0 1 1 false 0'* ]] || {
     printf 'primary live-descriptor control omitted its exact barrier or metric gates\n' >&2
@@ -5400,6 +5401,8 @@ test_primary_live_fd_control_uses_exact_barrier_protocol() {
     "$primary_control" != *'run_primary_live_fd_security_control "$host_probe" ||'* && \
     "$primary_control" == *'"live_descriptor_probe":"metrics_verified"'* && \
     "$primary_control" == *'"live_descriptor_topology":"pid1-cgroup-verified-preexec"'* && \
+    "$control" == *'"wrong_live_socket":"metrics_verified"'* && \
+    "$control" == *'"duplicated_fd_wrong_process":"metrics_verified"'* && \
     "$recovery_scenario" == *'run_scenario basic'* && \
     "$recovery_scenario" == *'return "$scenario_status"'* && \
     "$runtime_contract" == *'primary-live-fd-security'* ]] || {

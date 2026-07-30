@@ -7563,7 +7563,9 @@ run_primary_live_fd_security_control() (
     "$RESULT_DIR/phases/$probe_phase/obi-metrics.prom" \
     "$probe_delta" || return $?
   assert_primary_security_metric_delta "$probe_delta" negotiate 1 1 || return $?
-  assert_primary_security_metric_delta "$probe_delta" take 1 1 || return $?
+  # The same-JVM decoy and the root PID 1-cgroup duplicated descriptor are
+  # both denied before the held victim is released.
+  assert_primary_security_metric_delta "$probe_delta" take 2 2 || return $?
   (
     ALLOW_PRIMARY_SECURITY_METRICS=true
     # The victim has reached its Java getsockopt barrier, so its one inbound
@@ -7614,7 +7616,7 @@ run_primary_live_fd_security_control() (
     "$RESULT_DIR/phases/$after_phase/obi-metrics.prom" \
     "$full_delta" || return $?
   assert_primary_security_metric_delta "$full_delta" negotiate 1 1 || return $?
-  assert_primary_security_metric_delta "$full_delta" take 1 1 || return $?
+  assert_primary_security_metric_delta "$full_delta" take 2 2 || return $?
   (
     ALLOW_PRIMARY_SECURITY_METRICS=true
     assert_bridge_metric_delta "$full_delta" getsockopt 1 0 0 1 1 false 0
@@ -7630,7 +7632,7 @@ run_primary_live_fd_security_control() (
   PRIMARY_FAULT_STACK_ACTIVE=false
   restore_required=false
   run_primary_live_fd_security_recovery_scenario "$original_variant" || return $?
-  printf '{"status":"passed","scenario":"primary-live-fd-security","probe":"%s","probe_status":"unverified","probe_verification":"metrics_verified","attacker_identity":"root","attacker_cgroup":"pid1-verified-preexec","legitimate_victim":"passed","post_abuse_recovery":"passed","before_phase":"phases/%s","probe_phase":"phases/%s","after_phase":"phases/%s"}\n' \
+  printf '{"status":"passed","scenario":"primary-live-fd-security","probe":"%s","probe_status":"unverified","probe_verification":"metrics_verified","wrong_live_socket":"metrics_verified","duplicated_fd_wrong_process":"metrics_verified","attacker_identity":"root","attacker_cgroup":"pid1-verified-preexec","legitimate_victim":"passed","post_abuse_recovery":"passed","before_phase":"phases/%s","probe_phase":"phases/%s","after_phase":"phases/%s"}\n' \
     "$(basename -- "$probe_output")" \
     "$before_phase" \
     "$probe_phase" \

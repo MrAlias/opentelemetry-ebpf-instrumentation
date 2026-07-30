@@ -8,11 +8,17 @@
 #include "getsockopt_fault_shim.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdatomic.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 enum {
@@ -42,11 +48,20 @@ enum {
   java_remote_parent_fault_file_group_readable_mode = 0640,
   java_remote_parent_fault_file_group_writable_mode = 0620,
   java_remote_parent_concurrent_attempt_count = 8,
+  java_remote_parent_live_fd_barrier_timeout_millis = 20,
+  java_remote_parent_live_fd_barrier_non_matching_timeout_millis = 1000,
+  java_remote_parent_live_fd_barrier_wait_attempts = 200,
+  java_remote_parent_live_fd_barrier_wait_nanoseconds = 5000000,
+  java_remote_parent_live_fd_barrier_non_matching_max_millis = 500,
+  java_remote_parent_live_fd_barrier_max_timeout_millis = 1000,
 };
 
 static const char fault_file_environment[] =
     "OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_FILE";
 static const char java_remote_parent_magic[] = "OBIJ";
+static const char java_remote_parent_live_fd_barrier_mode[] = "live-fd-barrier";
+static const char java_remote_parent_live_fd_ready_prefix[] = "ready:";
+static const char java_remote_parent_live_fd_release_prefix[] = "release:";
 static char fault_file_path[] = "/tmp/obi-java-fault-shim.XXXXXX";
 static char fault_directory_path[] = "/tmp/obi-java-fault-shim-dir.XXXXXX";
 static char fault_hardlink_path[] = "/tmp/obi-java-fault-shim-hardlink.XXXXXX";
@@ -81,6 +96,86 @@ static void set_fault_mode(const char *mode) {
     assert(write(descriptor, mode, mode_length) == (ssize_t)mode_length);
   }
   assert(close(descriptor) == 0);
+}
+
+static void overwrite_fault_mode_in_place(const char *mode) {
+  assert(mode != NULL);
+
+  struct stat before;
+  assert(lstat(fault_file_path, &before) == 0);
+  const int descriptor =
+      open(fault_file_path, O_WRONLY | O_TRUNC | O_CLOEXEC | O_NOFOLLOW);
+  assert(descriptor >= 0);
+
+  struct stat opened;
+  assert(fstat(descriptor, &opened) == 0);
+  assert(opened.st_dev == before.st_dev && opened.st_ino == before.st_ino);
+
+  const size_t mode_length = strlen(mode);
+  assert(write(descriptor, mode, mode_length) == (ssize_t)mode_length);
+  assert(close(descriptor) == 0);
+
+  struct stat after;
+  assert(lstat(fault_file_path, &after) == 0);
+  assert(after.st_dev == before.st_dev && after.st_ino == before.st_ino);
+}
+
+static bool fault_file_matches(const char *expected) {
+  char value[64];
+  const int descriptor = open(fault_file_path, O_RDONLY | O_CLOEXEC);
+  assert(descriptor >= 0);
+  const ssize_t length = read(descriptor, value, sizeof(value));
+  assert(length >= 0);
+  assert(close(descriptor) == 0);
+  const size_t expected_length = strlen(expected);
+  return (size_t)length == expected_length &&
+         memcmp(value, expected, expected_length) == 0;
+}
+
+static void wait_for_fault_file(const char *expected) {
+  const struct timespec delay = {
+      .tv_sec = 0,
+      .tv_nsec = java_remote_parent_live_fd_barrier_wait_nanoseconds,
+  };
+  for (unsigned int attempt = 0;
+       attempt < java_remote_parent_live_fd_barrier_wait_attempts; attempt++) {
+    if (fault_file_matches(expected)) {
+      return;
+    }
+    assert(nanosleep(&delay, NULL) == 0);
+  }
+  assert(false);
+}
+
+static void release_live_fd_barrier(int socket) {
+  char release[64];
+  const int release_length =
+      snprintf(release, sizeof(release), "%s%d\n",
+               java_remote_parent_live_fd_release_prefix, socket);
+  assert(release_length > 0 && (size_t)release_length < sizeof(release));
+  overwrite_fault_mode_in_place(release);
+}
+
+static void wait_for_live_fd_barrier_release_observation(int socket) {
+  const struct timespec delay = {
+      .tv_sec = 0,
+      .tv_nsec = java_remote_parent_live_fd_barrier_wait_nanoseconds,
+  };
+  for (unsigned int attempt = 0;
+       attempt < java_remote_parent_live_fd_barrier_wait_attempts; attempt++) {
+    if (obi_demo_java_remote_parent_live_fd_barrier_observed_release_for_test() ==
+        socket) {
+      return;
+    }
+    assert(nanosleep(&delay, NULL) == 0);
+  }
+  assert(false);
+}
+
+static int64_t monotonic_millis(void) {
+  struct timespec value;
+  assert(clock_gettime(CLOCK_MONOTONIC, &value) == 0);
+  return (int64_t)value.tv_sec * 1000 + value.tv_nsec / 1000000;
 }
 
 static void test_missing_empty_and_invalid_controls_do_not_mutate(void) {
@@ -473,6 +568,153 @@ static void test_interposed_getsockopt_forwards_non_obi_calls(void) {
   assert(close(sockets[1]) == 0);
 }
 
+struct live_fd_barrier_attempt {
+  int socket;
+  _Atomic bool complete;
+  int result;
+  int error;
+};
+
+static void *wait_for_live_fd_barrier(void *argument) {
+  struct live_fd_barrier_attempt *const attempt = argument;
+  unsigned char response[java_remote_parent_response_size];
+  socklen_t length = sizeof(response);
+  attempt->result =
+      getsockopt(attempt->socket, java_remote_parent_socket_level,
+                 java_remote_parent_socket_take, response, &length);
+  attempt->error = errno;
+  atomic_store(&attempt->complete, true);
+  return NULL;
+}
+
+static void test_live_fd_barrier_blocks_exact_take_until_release(void) {
+  int sockets[2];
+  assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+  const int alias = dup(sockets[0]);
+  assert(alias >= 0);
+  set_fault_mode(java_remote_parent_live_fd_barrier_mode);
+  obi_demo_java_remote_parent_reset_real_getsockopt_call_count_for_test();
+  obi_demo_java_remote_parent_reset_live_fd_barrier_observed_release_for_test();
+
+  struct live_fd_barrier_attempt attempt = {
+      .socket = sockets[0],
+      .complete = false,
+      .result = 0,
+      .error = 0,
+  };
+  pthread_t thread;
+  assert(pthread_create(&thread, NULL, wait_for_live_fd_barrier, &attempt) ==
+         0);
+
+  char ready[64];
+  const int ready_length =
+      snprintf(ready, sizeof(ready), "%s%d\n",
+               java_remote_parent_live_fd_ready_prefix, sockets[0]);
+  assert(ready_length > 0 && (size_t)ready_length < sizeof(ready));
+  wait_for_fault_file(ready);
+  assert(!atomic_load(&attempt.complete));
+  assert(obi_demo_java_remote_parent_real_getsockopt_call_count_for_test() ==
+         0);
+
+  release_live_fd_barrier(sockets[1]);
+  wait_for_live_fd_barrier_release_observation(sockets[1]);
+  assert(!atomic_load(&attempt.complete));
+  assert(obi_demo_java_remote_parent_real_getsockopt_call_count_for_test() ==
+         0);
+
+  release_live_fd_barrier(alias);
+  wait_for_live_fd_barrier_release_observation(alias);
+  assert(!atomic_load(&attempt.complete));
+  assert(obi_demo_java_remote_parent_real_getsockopt_call_count_for_test() ==
+         0);
+
+  release_live_fd_barrier(sockets[0]);
+  assert(pthread_join(thread, NULL) == 0);
+  assert(atomic_load(&attempt.complete));
+  assert(attempt.result == -1);
+  assert(attempt.error == ENOPROTOOPT || attempt.error == EOPNOTSUPP);
+  assert(obi_demo_java_remote_parent_real_getsockopt_call_count_for_test() ==
+         1);
+  assert(fault_file_matches(""));
+
+  assert(close(alias) == 0);
+  assert(close(sockets[0]) == 0);
+  assert(close(sockets[1]) == 0);
+}
+
+static void test_live_fd_barrier_ignores_non_matching_requests(void) {
+  int sockets[2];
+  assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+  unsigned char response[java_remote_parent_response_size];
+  socklen_t short_length = sizeof(response) - 1;
+
+  obi_demo_java_remote_parent_set_live_fd_barrier_timeout_for_test(
+      java_remote_parent_live_fd_barrier_non_matching_timeout_millis);
+  set_fault_mode(java_remote_parent_live_fd_barrier_mode);
+  obi_demo_java_remote_parent_reset_real_getsockopt_call_count_for_test();
+
+  int64_t start = monotonic_millis();
+  assert(getsockopt(sockets[0], java_remote_parent_socket_level,
+                    java_remote_parent_socket_take, response,
+                    &short_length) == -1);
+  assert(monotonic_millis() - start <
+         java_remote_parent_live_fd_barrier_non_matching_max_millis);
+  assert(obi_demo_java_remote_parent_real_getsockopt_call_count_for_test() ==
+         1);
+  assert(fault_file_matches(java_remote_parent_live_fd_barrier_mode));
+
+  socklen_t length = sizeof(response);
+  start = monotonic_millis();
+  assert(getsockopt(sockets[0], java_remote_parent_socket_level,
+                    java_remote_parent_socket_discard, response,
+                    &length) == -1);
+  assert(monotonic_millis() - start <
+         java_remote_parent_live_fd_barrier_non_matching_max_millis);
+  assert(obi_demo_java_remote_parent_real_getsockopt_call_count_for_test() ==
+         2);
+  assert(fault_file_matches(java_remote_parent_live_fd_barrier_mode));
+
+  int socket_type = 0;
+  length = sizeof(socket_type);
+  start = monotonic_millis();
+  assert(getsockopt(sockets[0], SOL_SOCKET, SO_TYPE, &socket_type, &length) ==
+         0);
+  assert(monotonic_millis() - start <
+         java_remote_parent_live_fd_barrier_non_matching_max_millis);
+  assert(socket_type == SOCK_STREAM);
+  assert(obi_demo_java_remote_parent_real_getsockopt_call_count_for_test() ==
+         3);
+  assert(fault_file_matches(java_remote_parent_live_fd_barrier_mode));
+  set_fault_mode(NULL);
+  obi_demo_java_remote_parent_set_live_fd_barrier_timeout_for_test(10000);
+
+  assert(close(sockets[0]) == 0);
+  assert(close(sockets[1]) == 0);
+}
+
+static void test_live_fd_barrier_times_out_boundedly(void) {
+  int sockets[2];
+  assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+  unsigned char response[java_remote_parent_response_size];
+  socklen_t length = sizeof(response);
+
+  obi_demo_java_remote_parent_set_live_fd_barrier_timeout_for_test(
+      java_remote_parent_live_fd_barrier_timeout_millis);
+  set_fault_mode(java_remote_parent_live_fd_barrier_mode);
+  const int64_t start = monotonic_millis();
+  assert(getsockopt(sockets[0], java_remote_parent_socket_level,
+                    java_remote_parent_socket_take, response, &length) == -1);
+  const int64_t elapsed = monotonic_millis() - start;
+  assert(errno == ETIMEDOUT);
+  assert(elapsed >= java_remote_parent_live_fd_barrier_timeout_millis);
+  assert(elapsed < java_remote_parent_live_fd_barrier_max_timeout_millis);
+  set_fault_mode(NULL);
+  obi_demo_java_remote_parent_set_live_fd_barrier_timeout_for_test(10000);
+
+  assert(close(sockets[0]) == 0);
+  assert(close(sockets[1]) == 0);
+}
+
 int main(void) {
   const char *const original_file = getenv(fault_file_environment);
   char *const saved_file = original_file == NULL ? NULL : strdup(original_file);
@@ -500,6 +742,9 @@ int main(void) {
   test_concurrent_eligible_responses_consume_control_once();
   test_only_exact_successful_take_responses_mutate();
   test_interposed_getsockopt_forwards_non_obi_calls();
+  test_live_fd_barrier_blocks_exact_take_until_release();
+  test_live_fd_barrier_ignores_non_matching_requests();
+  test_live_fd_barrier_times_out_boundedly();
 
   assert(unlink(fault_file_path) == 0);
   assert(rmdir(fault_directory_path) == 0);

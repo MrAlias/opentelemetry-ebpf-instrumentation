@@ -14,6 +14,8 @@ all: $(SHIM)
 test: $(SHIM) $(TEST)
 	./$(TEST)
 
+$(TEST): override CPPFLAGS += -DOBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TESTING
+
 $(SHIM): getsockopt_fault_shim.c getsockopt_fault_shim.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) -fPIC -shared -o $@ $< $(LDFLAGS) -ldl -pthread
 

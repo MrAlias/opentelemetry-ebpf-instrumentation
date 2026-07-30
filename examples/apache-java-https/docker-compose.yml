@@ -10,7 +10,7 @@ services:
       - /bin/sh
       - -ec
     command:
-      - chown 0:0 /var/run/obi && chmod 0750 /var/run/obi
+      - chown 0:65534 /var/run/obi && chmod 0750 /var/run/obi
     volumes:
       - java-remote-parent-socket:/var/run/obi
     labels: *demo-labels
@@ -96,7 +96,7 @@ services:
     environment:
       OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT: ${BRIDGE_TRANSPORT:-getsockopt}
       OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_PATH: /var/run/obi/java-remote-parent.sock
-      OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_GROUP_ID: "0"
+      OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_GROUP_ID: "65534"
       OTEL_EBPF_JAVA_REMOTE_PARENT_TIMEOUT: 50ms
       OTEL_EBPF_JAVA_REMOTE_PARENT_TTL: ${REMOTE_PARENT_TTL:-30s}
       OTEL_EBPF_JAVA_REMOTE_PARENT_RETRIEVAL_TTL: ${REMOTE_PARENT_RETRIEVAL_TTL:-0s}
@@ -186,6 +186,30 @@ services:
       - ${SECURITY_PROBE_TIMEOUT:-60s}
     volumes:
       - java-remote-parent-socket:/var/run/obi
+    profiles:
+      - tools
+    labels: *demo-labels
+
+  # The endpoint-replacement control needs a writable root-owned view so it
+  # can replace the path. Unix peer-credential controls use the hardened
+  # sibling below instead.
+  security-unix-sibling-probe:
+    image: obi-apache-java-https-tracecheck:local
+    network_mode: none
+    user: "65534:65534"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    entrypoint:
+      - /security-probe
+      - --socket
+      - /var/run/obi/java-remote-parent.sock
+      - --mode
+      - abuse-race
+      - --timeout
+      - ${SECURITY_PROBE_TIMEOUT:-60s}
+    volumes:
+      - java-remote-parent-socket:/var/run/obi:ro
     profiles:
       - tools
     labels: *demo-labels

@@ -417,7 +417,7 @@ OBI accepts these environment overrides (the YAML equivalents are in
 | `OTEL_EBPF_BPF_DISABLE_BLACK_BOX_CP` | `true` |
 | `OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT` | `disabled`, `auto`, `getsockopt`, or `unix` |
 | `OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_PATH` | `/var/run/obi/java-remote-parent.sock` |
-| `OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_GROUP_ID` | `0` (the demo JVM runs as root) |
+| `OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_GROUP_ID` | `65534` (the bounded Unix attacker fixture; the demo JVM runs as root) |
 | `OTEL_EBPF_JAVA_REMOTE_PARENT_TIMEOUT` | `50ms` |
 | `OTEL_EBPF_JAVA_REMOTE_PARENT_TTL` | `30s` prewrite and cleanup retention |
 | `OTEL_EBPF_JAVA_REMOTE_PARENT_RETRIEVAL_TTL` | `0s` (inherits `TTL` and must not exceed it; stale controls set `1ns`) |
@@ -550,11 +550,16 @@ the retained `compose.log` in this order:
    unmatched trace/parent boundary.
 
 For `unix`, verify that the scoped `java-remote-parent-socket` volume is owned
-by `root:root`, has mode `0750`, and is mounted by both OBI and Java at
+by `root:65534`, has mode `0750`, and is mounted by both OBI and Java at
 `/var/run/obi`. The one-shot `socket-init` service establishes those
-permissions before either service starts. For `getsockopt`, confirm the kernel
-reports support rather than silently accepting fallback; a forced mode must
-not change transport.
+permissions before either service starts. Membership in this socket group only
+permits connection: OBI derives Unix peer credentials and still requires the
+peer process to satisfy its authorization checks. The hardened
+`security-unix-sibling-probe` fixture deliberately uses that group without
+root, network access, capabilities, a writable root filesystem, or a writable
+socket mount; `security-probe` remains root-owned only for endpoint-replacement
+testing. For `getsockopt`, confirm the kernel reports support rather than
+silently accepting fallback; a forced mode must not change transport.
 
 ## Explicit limitations
 

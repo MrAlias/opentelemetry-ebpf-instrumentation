@@ -10799,6 +10799,48 @@ test_demo_java_attach_timeout_is_explicit() {
   ! grep -Fq 'OTEL_EBPF_JAVAAGENT_ATTACH_TIMEOUT:' "$compose_file"
 }
 
+test_unix_security_probe_topology_is_least_privilege() {
+  local -r obi_config="$TEST_SCRIPT_DIR/../configs/obi.yaml"
+  local -r compose_file="$TEST_SCRIPT_DIR/../docker-compose.yml"
+  local sibling_service=""
+  local endpoint_service=""
+
+  grep -Fqx '    socket_group_id: 65534' "$obi_config"
+  grep -Fqx '      - chown 0:65534 /var/run/obi && chmod 0750 /var/run/obi' \
+    "$compose_file"
+  grep -Fqx '      OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_GROUP_ID: "65534"' \
+    "$compose_file"
+
+  sibling_service="$(awk '
+    $0 == "  security-unix-sibling-probe:" { inside = 1 }
+    inside && $0 ~ /^  [[:alnum:]_-]+:$/ &&
+      $0 != "  security-unix-sibling-probe:" { exit }
+    inside { print }
+  ' "$compose_file")"
+  endpoint_service="$(awk '
+    $0 == "  security-probe:" { inside = 1 }
+    inside && $0 ~ /^  [[:alnum:]_-]+:$/ && $0 != "  security-probe:" { exit }
+    inside { print }
+  ' "$compose_file")"
+
+  [[ "$sibling_service" == *'network_mode: none'* &&
+    "$sibling_service" == *'user: "65534:65534"'* &&
+    "$sibling_service" == *'read_only: true'* &&
+    "$sibling_service" == *'cap_drop: [ALL]'* &&
+    "$sibling_service" == *'security_opt: [no-new-privileges:true]'* &&
+    "$sibling_service" == *'      - abuse-race'* &&
+    "$sibling_service" == *'java-remote-parent-socket:/var/run/obi:ro'* ]] || {
+    printf 'Unix sibling probe lacks a least-privilege peer topology\n' >&2
+    return 1
+  }
+  [[ "$endpoint_service" == *'user: "0:0"'* &&
+    "$endpoint_service" == *'java-remote-parent-socket:/var/run/obi'* &&
+    "$endpoint_service" != *'java-remote-parent-socket:/var/run/obi:ro'* ]] || {
+    printf 'endpoint-replacement probe lost its required writable root topology\n' >&2
+    return 1
+  }
+}
+
 main() {
   TEST_TMP_DIR="$(mktemp -d)"
   test_project_name_validation
@@ -10975,6 +11017,7 @@ main() {
   test_compatibility_matrix_lists_deployment_modes
   test_demo_uses_only_explicit_tcp_context
   test_demo_java_attach_timeout_is_explicit
+  test_unix_security_probe_topology_is_least_privilege
   printf 'demo harness tests passed\n'
 }
 

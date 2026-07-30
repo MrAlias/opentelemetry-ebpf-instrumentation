@@ -53,7 +53,7 @@ javaagent:
   remote_parent:
     transport: disabled
     socket_path: /var/run/obi/java-remote-parent.sock
-    socket_group_id: 0
+    socket_group_id: 65534
     timeout: 50ms
     ttl: 30s
     retrieval_ttl: 0s

@@ -70,6 +70,15 @@ a primary attacker cell to `pass`.
   cgroup but not its JVM helper state.
 - Run a sibling container with the Unix directory mounted to test filesystem
   permissions and peer credentials.
+- The Unix sibling fixture is deliberately `65534:65534` with no network,
+  capabilities, writable root filesystem, or writable socket mount. The socket
+  directory and socket use group `65534` solely so this non-root peer reaches
+  OBI's credential and process-capability checks instead of failing at the
+  filesystem boundary. Group membership is therefore an availability boundary,
+  not authorization to retrieve a parent. The separate root
+  `security-probe` fixture is restricted to endpoint-path replacement, which
+  necessarily mutates the socket path. Source controls do not change an
+  `untested` matrix cell until their retained runtime artifact is reviewed.
 - Send fixed malformed, truncated, oversized, repeated, and wrong-version
   messages; never fuzz without a duration and size bound.
 - Concurrent attacker probes use separate, repeat-aware deadlines derived from

@@ -85,6 +85,7 @@ recast their historical schema.
 | [otel-getsockopt-tls13-74576ec6](otel-getsockopt-tls13-74576ec6/README.md) | pass | OpenTelemetry 2.28.1, forced `getsockopt`, TLS 1.3, Java 21, `amd64`, unified cgroup v2; bounded root-in-PID-1-cgroup live-descriptor security control |
 | [otel-getsockopt-tls13-94221a91](otel-getsockopt-tls13-94221a91/README.md) | pass | OpenTelemetry 2.28.1, forced `getsockopt`, TLS 1.3, Java 21, `amd64`, unified cgroup v2 |
 | [otel-unix-tls12-bd1c9327](otel-unix-tls12-bd1c9327/README.md) | pass | OpenTelemetry 2.28.1, forced Unix RPC, TLS 1.2, Java 21, `amd64`, unified cgroup v2 |
+| [otel-unix-tls13-6c4a2505](otel-unix-tls13-6c4a2505/README.md) | pass | OpenTelemetry 2.28.1, forced Unix RPC, TLS 1.3, Java 21, `amd64`, unified cgroup v2; sibling and same-cgroup attacker controls plus stale-TTL recovery |
 | [otel-getsockopt-tls13-7482d908](otel-getsockopt-tls13-7482d908/README.md) | pass | OpenTelemetry 2.28.1, forced `getsockopt`, TLS 1.3, Java 21, `amd64`, unified cgroup v2 |
 | [otel-unix-tls12-acedb68a](otel-unix-tls12-acedb68a/README.md) | pass | OpenTelemetry 2.28.1, forced Unix RPC, TLS 1.2, Java 21, `amd64`, unified cgroup v2 |
 

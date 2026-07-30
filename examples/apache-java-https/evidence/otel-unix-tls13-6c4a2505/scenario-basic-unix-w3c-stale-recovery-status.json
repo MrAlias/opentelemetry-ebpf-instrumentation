@@ -1,0 +1,8 @@
+{
+  "status": "passed",
+  "scenario": "basic",
+  "exit_status": 0,
+  "metric_status": 0,
+  "result": "scenario-basic-unix-w3c-stale-recovery.json",
+  "after_summary": "unix-w3c-stale.json"
+}

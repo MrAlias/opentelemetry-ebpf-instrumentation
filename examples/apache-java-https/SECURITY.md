@@ -1,8 +1,8 @@
 # Security and abuse-case matrix
 
-Status: **partial — retained Unix and non-abuse primary scenarios passed;
-the retained primary live-descriptor control passed; remaining primary and Unix
-cases and matrix cells are untested**
+Status: **partial — retained Unix sibling, same-cgroup, and stale-state
+controls passed; the retained primary live-descriptor control passed; wrong
+live-socket and remaining environment-matrix cases are untested**
 
 The PoC crosses a kernel/JVM trust boundary and exposes a local Unix fallback.
 Passing the happy path is insufficient. Every negative cell must preserve
@@ -12,7 +12,9 @@ logging trace IDs, headers, bodies, credentials, PID/TID labels, or socket
 payloads. Primary and Unix `pass` entries below refer only to the exact
 retained [OpenTelemetry/`getsockopt`/TLS 1.3](evidence/otel-getsockopt-tls13-c9d14356/README.md),
 [OpenTelemetry/`getsockopt`/TLS 1.2](evidence/otel-getsockopt-tls12-c7209e43/README.md),
-and [OpenTelemetry/Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/README.md) runs.
+and [OpenTelemetry/Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/README.md),
+and [OpenTelemetry/Unix/TLS 1.3](evidence/otel-unix-tls13-6c4a2505/README.md)
+runs.
 
 `untested (focused verification only)` denotes a clean targeted validation
 record with `acceptance_evidence=false`. It is not an acceptance-matrix `pass`
@@ -45,8 +47,8 @@ silently to Unix.
 
 | Abuse or fault | Required result | Primary `getsockopt` | Unix | Evidence or remaining work |
 | --- | --- | --- | --- | --- |
-| unrelated process in same cgroup calls take | denied; legitimate Java take still succeeds | untested (focused verification only) | untested | [current same-cgroup metric window, victim, and recovery](focused-validation/primary-getsockopt-8f0aa1f6/security-primary-probes.json) |
-| sibling container/PID namespace calls take | denied by current identity/peer credentials | untested (focused verification only) | untested | [current sibling metric window, victim, and recovery](focused-validation/primary-getsockopt-8f0aa1f6/security-primary-probes.json) |
+| unrelated process in same cgroup calls take | denied; legitimate Java take still succeeds | untested (focused verification only) | pass | [current primary same-cgroup metric window](focused-validation/primary-getsockopt-8f0aa1f6/security-primary-probes.json) and [retained Unix same-cgroup topology, metrics, victim, and recovery](evidence/otel-unix-tls13-6c4a2505/README.md#retained-proof) |
+| sibling container/PID namespace calls take | denied by current identity/peer credentials | untested (focused verification only) | pass | [current primary sibling metric window](focused-validation/primary-getsockopt-8f0aa1f6/security-primary-probes.json) and [retained Unix sibling topology, metrics, victim, and recovery](evidence/otel-unix-tls13-6c4a2505/README.md#retained-proof) |
 | forged caller PID/TID in Unix request | ignored; kernel peer identity is authoritative | not applicable | pass | [forged-peer probe](evidence/otel-unix-tls12-bd1c9327/security-unix-probes.json) |
 | repeated unauthorized take attempts | bounded; context remains available | untested (focused verification only) | pass | [primary bounded probe windows](focused-validation/primary-getsockopt-8f0aa1f6/security-primary-probes.json) and [Unix bounded probes and recovery](evidence/otel-unix-tls12-bd1c9327/security-unix-probes.json) |
 | root process in Java PID 1 cgroup duplicates a live accepted descriptor | raw probe is insufficient; isolated unauthorized metrics show zero valid retrievals, held victim keeps exact parent, recovery passes | pass | not applicable | [clean full primary acceptance bundle](evidence/otel-getsockopt-tls13-74576ec6/README.md) with [sanitized probe, topology, and metric summary](evidence/otel-getsockopt-tls13-74576ec6/security-primary-live-fd.json), barrier records, victim graph, and recovery graph; standalone `security` remains diagnostic only |
@@ -58,7 +60,7 @@ silently to Unix.
 | malformed/truncated versioned request | handled without crash or unintended parent | untested | pass | [Unix fault graphs and classifications](evidence/otel-unix-tls12-bd1c9327/README.md#retained-proof) |
 | oversized/repeated/flooded Unix request | bounded admission/deadline and recovery; test-payload canary non-disclosure | not applicable | pass | [bounded admission probes](evidence/otel-unix-tls12-bd1c9327/security-unix-probes.json) |
 | malformed/zero trace or span ID | discarded; Java request remains healthy | untested (focused verification only) | pass | [primary zero-ID controls](focused-validation/primary-getsockopt-8f0aa1f6/primary-w3c-fail-open.json) and [Unix zero-ID fault graphs](evidence/otel-unix-tls12-bd1c9327/README.md#retained-proof) |
-| stale entry past TTL | miss; never a parent | untested (focused verification only) | untested | [primary `1ns` TTL, W3C precedence, and recovery](focused-validation/primary-getsockopt-8f0aa1f6/primary-w3c-fail-open.json); retain an actual Unix stale-state result |
+| stale entry past TTL | miss; never a parent | untested (focused verification only) | pass | [primary `1ns` TTL, W3C precedence, and recovery](focused-validation/primary-getsockopt-8f0aa1f6/primary-w3c-fail-open.json) and [retained Unix `1ns` stale rejection, W3C precedence, and recovery](evidence/otel-unix-tls13-6c4a2505/unix-w3c-stale.json) |
 | live handoff-map pressure/eviction | order-independent eviction; exact hits, explicit roots, and actual upstream/retrieval reason counts reconciled by transport; zero wrong or unresolved parents; exact-key cleanup and steady-baseline recovery | pass | pass | [primary summary](evidence/otel-getsockopt-tls13-c9d14356/map-pressure-summary.json) and [Unix summary](evidence/otel-unix-tls12-bd1c9327/map-pressure-summary.json) |
 | OBI absent or delayed | Java root span and healthy response | pass | pass | [primary](evidence/otel-getsockopt-tls13-c9d14356/scenario-fail-open-obi-absent.json) and [Unix](evidence/otel-unix-tls12-bd1c9327/scenario-fail-open-obi-absent.json) absence graphs |
 | OBI restart with old endpoint/fd | no stale parent; recovery only if claimed | pass | pass | [primary](evidence/otel-getsockopt-tls13-c9d14356/scenario-restart-fault.json) and [Unix](evidence/otel-unix-tls12-bd1c9327/scenario-restart-fault.json) restart traffic |

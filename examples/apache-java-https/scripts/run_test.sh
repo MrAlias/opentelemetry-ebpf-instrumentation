@@ -13072,7 +13072,7 @@ test_compatibility_matrix_lists_deployment_modes() {
       rows += 1
     }
     END {
-      exit in_observed_table && saw_delimiter && reached_end && valid != 0 && rows == 4 ? 0 : 1
+      exit in_observed_table && saw_delimiter && reached_end && valid != 0 && rows == 5 ? 0 : 1
     }
   ' FS='|' "$matrix"
 }

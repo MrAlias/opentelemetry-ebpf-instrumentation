@@ -1,0 +1,33 @@
+{
+  "evidence_id": "otel-unix-tls13-6c4a2505",
+  "source_revision": "6c4a2505b6a6d4e89d3aedd9952097ad42ce1457",
+  "sanitized": true,
+  "matrix_cell": {
+    "agent_distribution": "opentelemetry",
+    "agent_version": "2.28.1",
+    "transport": "unix",
+    "tls_protocol": "TLSv1.3",
+    "scenario": "all"
+  },
+  "host": {
+    "architecture": "x86_64",
+    "kernel_release": "7.0.0-1009-aws",
+    "cgroup_filesystem": "cgroup2fs",
+    "vmlinux_btf": "readable"
+  },
+  "backend": {
+    "java_runtime": "Eclipse Temurin 21.0.10+7",
+    "http_protocol": "HTTP/1.1",
+    "official_agent_distribution": "opentelemetry",
+    "official_agent_version": "2.28.1",
+    "extension_separately_loaded": true,
+    "dynamic_helper_attached": true
+  },
+  "full_suite": {
+    "scenario_statuses": {
+      "passed": 48,
+      "unsupported": 2,
+      "failed": 0
+    }
+  }
+}

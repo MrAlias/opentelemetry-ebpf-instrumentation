@@ -1,0 +1,26 @@
+{
+  "format": 1,
+  "status": "passed",
+  "transport": "unix",
+  "retrieval_ttl": "1ns",
+  "scenario_result": "scenario-unix-w3c-stale.json",
+  "w3c_precedence": {
+    "status": "passed",
+    "assertion": "the exact supplied W3C parent remained authoritative while the Unix retrieval was stale"
+  },
+  "bridge_delta": {
+    "take_stale": 1,
+    "take_valid": 0,
+    "take_missing": 0
+  },
+  "java_delta": {
+    "take_stale": 1,
+    "take_valid": 0,
+    "take_missing": 0
+  },
+  "recovery": {
+    "status": "passed",
+    "result": "scenario-basic-unix-w3c-stale-recovery.json",
+    "assertion": "the normal retrieval TTL was restored before the exact-parent recovery request"
+  }
+}

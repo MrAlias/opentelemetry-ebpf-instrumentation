@@ -1,0 +1,8 @@
+{
+  "status": "passed",
+  "scenario": "basic",
+  "exit_status": 0,
+  "metric_status": 0,
+  "result": "scenario-basic-security-recovery.json",
+  "after_summary": "security-unix-probes.json"
+}

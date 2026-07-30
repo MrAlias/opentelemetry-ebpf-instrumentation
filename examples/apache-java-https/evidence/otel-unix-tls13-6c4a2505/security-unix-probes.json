@@ -1,0 +1,94 @@
+{
+  "format": 1,
+  "status": "passed",
+  "transport": "unix",
+  "sibling": {
+    "topology": {
+      "attacker_identity": "65534:65534",
+      "network_mode": "none",
+      "pid_namespace_relation_to_java": "different",
+      "cgroup_relation_to_java": "different",
+      "readonly_rootfs": true,
+      "privileged": false,
+      "capability_free": true,
+      "no_new_privileges": true,
+      "socket_mount_writable": false
+    },
+    "attempts": 21967,
+    "cases": [
+      {"name": "peer-identity", "outcome": "unauthorized"},
+      {"name": "forged-identity", "outcome": "unauthorized"},
+      {"name": "malformed", "outcome": "malformed"},
+      {"name": "truncated", "outcome": "malformed"},
+      {"name": "version-mismatch", "outcome": "version_mismatch"},
+      {"name": "oversized", "outcome": "unauthorized"},
+      {"name": "repeated-frame", "outcome": "unauthorized"},
+      {"name": "repeated-unauthorized", "outcome": "bounded"},
+      {"name": "high-rate-admission", "outcome": "overload-and-recovery"},
+      {"name": "concurrent-repeated-unauthorized", "outcome": "bounded"}
+    ],
+    "metric_delta": {
+      "take_unauthorized": 21987,
+      "take_valid_from_legitimate_traffic": 17,
+      "take_valid_metric_boundary_health_request": 1,
+      "take_valid_retained_concurrent_victims": 16,
+      "negotiate_malformed": 3,
+      "negotiate_overload": 16,
+      "negotiate_timeout": 32,
+      "negotiate_version_mismatch": 1
+    },
+    "legitimate_victim_result": "scenario-concurrency-security-unix-sibling-victim.json"
+  },
+  "same_cgroup": {
+    "topology": {
+      "attacker_identity": "65534:65534",
+      "pid_namespace_relation_to_java": "same",
+      "cgroup_relation_to_java": "same",
+      "capability_free": true
+    },
+    "attempts": 19209,
+    "cases": [
+      {"name": "peer-identity", "outcome": "unauthorized"},
+      {"name": "forged-identity", "outcome": "unauthorized"},
+      {"name": "forged-live-java-tid", "outcome": "unauthorized"},
+      {"name": "malformed", "outcome": "malformed"},
+      {"name": "truncated", "outcome": "malformed"},
+      {"name": "version-mismatch", "outcome": "version_mismatch"},
+      {"name": "oversized", "outcome": "unauthorized"},
+      {"name": "repeated-frame", "outcome": "unauthorized"},
+      {"name": "repeated-unauthorized", "outcome": "bounded"},
+      {"name": "high-rate-admission", "outcome": "overload-and-recovery"},
+      {"name": "concurrent-repeated-unauthorized", "outcome": "bounded"}
+    ],
+    "metric_delta": {
+      "take_unauthorized": 19230,
+      "take_valid_from_legitimate_traffic": 17,
+      "take_valid_metric_boundary_health_request": 1,
+      "take_valid_retained_concurrent_victims": 16,
+      "negotiate_malformed": 3,
+      "negotiate_overload": 16,
+      "negotiate_timeout": 32,
+      "negotiate_version_mismatch": 1
+    },
+    "legitimate_victim_result": "scenario-concurrency-security-unix-same-cgroup-victim.json"
+  },
+  "endpoint_replacement": {
+    "status": "passed",
+    "cases": [
+      {"name": "replacement-fail-closed", "outcome": "inaccessible"},
+      {"name": "old-client-fd", "outcome": "closed"},
+      {"name": "replacement-preserved", "outcome": "unchanged"}
+    ]
+  },
+  "permissive_directory": {
+    "unsafe_mode": "0777",
+    "safe_mode": "0750",
+    "listener_outcome": "refused",
+    "fail_open_https_status": 200,
+    "fail_open_tls_protocol": "TLSv1.3"
+  },
+  "post_abuse_recovery": {
+    "status": "passed",
+    "result": "scenario-basic-security-recovery.json"
+  }
+}

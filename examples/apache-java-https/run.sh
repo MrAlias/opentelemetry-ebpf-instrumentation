@@ -9530,18 +9530,29 @@ write_run_status() {
   local -r exit_status="$1"
   local failure_stage="${FAILURE_STAGE:-none}"
   local failure_line="${FAILURE_LINE:-0}"
+  local -r acceptance_evidence_reason="${ACCEPTANCE_EVIDENCE_REASON:-none}"
   local status="failed"
 
   if ((exit_status == 0)) && [[ "$RUN_STATUS" == "passed" ]]; then
     status="passed"
   fi
-  printf '{\n  "status": "%s",\n  "exit_status": %d,\n  "acceptance_evidence": %s,\n  "failure_stage": "%s",\n  "failure_line": %d,\n  "evidence_directory": "%s"\n}\n' \
-    "$status" \
-    "$exit_status" \
-    "$ACCEPTANCE_EVIDENCE" \
-    "$failure_stage" \
-    "$failure_line" \
-    "$RESULT_DIR" >"$RESULT_DIR/run-status.json"
+  jq -n \
+    --arg status "$status" \
+    --argjson exit_status "$exit_status" \
+    --argjson acceptance_evidence "$ACCEPTANCE_EVIDENCE" \
+    --arg acceptance_evidence_reason "$acceptance_evidence_reason" \
+    --arg failure_stage "$failure_stage" \
+    --argjson failure_line "$failure_line" \
+    --arg evidence_directory "$RESULT_DIR" \
+    '{
+      status: $status,
+      exit_status: $exit_status,
+      acceptance_evidence: $acceptance_evidence,
+      acceptance_evidence_reason: $acceptance_evidence_reason,
+      failure_stage: $failure_stage,
+      failure_line: $failure_line,
+      evidence_directory: $evidence_directory
+    }' >"$RESULT_DIR/run-status.json"
 }
 
 cleanup_only() {

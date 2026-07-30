@@ -10968,6 +10968,8 @@ test_start_failure_retains_command_boundary() {
     COMPOSE=("$fake_compose")
     SCENARIO="basic"
     TRANSPORT="getsockopt"
+    ACCEPTANCE_EVIDENCE=false
+    ACCEPTANCE_EVIDENCE_REASON="custom-request-count"
     COMMAND_TIMEOUT_SECONDS=5
     STACK_STARTED=false
     BRIDGE_RUNNING=false
@@ -10998,8 +11000,64 @@ test_start_failure_retains_command_boundary() {
 
     write_run_status "$status" || return 1
     grep -Fq '"failure_stage": "compose-build-start"' "$RESULT_DIR/run-status.json" || return 1
+    jq -e '
+      .acceptance_evidence == false and
+      .acceptance_evidence_reason == "custom-request-count"
+    ' "$RESULT_DIR/run-status.json" >/dev/null || return 1
   ) || {
     printf 'logged failure evidence was incomplete\n' >&2
+    return 1
+  }
+}
+
+test_pre_environment_failure_retains_acceptance_eligibility() {
+  local -r result_dir="$TEST_TMP_DIR/pre-environment-failure-result"
+  local status=0
+
+  set +e
+  (
+    set -Eeuo pipefail
+    RESULT_DIR=""
+    TMP_DIR=""
+    STACK_STARTED=false
+    RUN_STATUS=failed
+    ACCEPTANCE_EVIDENCE=true
+    ACCEPTANCE_EVIDENCE_REASON=""
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    check_dependencies() { :; }
+    prepare_directories() {
+      RESULT_DIR="$result_dir"
+      mkdir -p -- "$RESULT_DIR"
+    }
+    capture_source_state() { :; }
+    prepare_certificates() { return 47; }
+    capture_evidence() { :; }
+    cleanup_security_processes() { :; }
+
+    run_demo --scenario all --requests 1
+  ) >/dev/null 2>&1
+  status=$?
+  set -e
+
+  [[ "$status" -eq 47 ]] || {
+    printf 'pre-environment failure returned %d, expected 47\n' "$status" >&2
+    return 1
+  }
+  [[ ! -e "$result_dir/environment.txt" ]] || {
+    printf 'pre-environment failure unexpectedly wrote environment evidence\n' >&2
+    return 1
+  }
+  jq -e '
+    .status == "failed" and
+    .exit_status == 47 and
+    .acceptance_evidence == false and
+    .acceptance_evidence_reason == "custom-request-count" and
+    .failure_stage == "certificates"
+  ' "$result_dir/run-status.json" >/dev/null || {
+    printf 'pre-environment failure omitted acceptance eligibility evidence\n' >&2
     return 1
   }
 }
@@ -11274,6 +11332,54 @@ test_non_acceptance_reasons_are_recorded() {
     [[ "$ACCEPTANCE_EVIDENCE_REASON" == "dirty-source-tree,targeted-scenario" ]]
   ) || {
     printf 'non-acceptance evidence reasons were not retained\n' >&2
+    return 1
+  }
+}
+
+test_run_status_serializes_default_acceptance_reason() {
+  local -r result_dir="$TEST_TMP_DIR/run-status-eligible"
+  local -r hostile_result_dir="$TEST_TMP_DIR/run-status-hostile-reason"
+  local -r hostile_reason=$'targeted-scenario "quote" \\ slash\nnewline'
+
+  (
+    RESULT_DIR="$result_dir"
+    RUN_STATUS=passed
+    ACCEPTANCE_EVIDENCE=true
+    ACCEPTANCE_EVIDENCE_REASON=""
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    mkdir -p -- "$RESULT_DIR" || return 1
+
+    write_run_status 0
+    jq -e '
+      .status == "passed" and
+      .exit_status == 0 and
+      .acceptance_evidence == true and
+      .acceptance_evidence_reason == "none"
+    ' "$RESULT_DIR/run-status.json" >/dev/null
+  ) || {
+    printf 'eligible run status omitted its explicit acceptance reason\n' >&2
+    return 1
+  }
+
+  (
+    RESULT_DIR="$hostile_result_dir"
+    RUN_STATUS=failed
+    ACCEPTANCE_EVIDENCE=false
+    ACCEPTANCE_EVIDENCE_REASON="$hostile_reason"
+    FAILURE_STAGE="scenario"
+    FAILURE_LINE=42
+    mkdir -p -- "$RESULT_DIR" || return 1
+
+    write_run_status 17
+    jq -e --arg expected_reason "$hostile_reason" '
+      .status == "failed" and
+      .exit_status == 17 and
+      .acceptance_evidence == false and
+      .acceptance_evidence_reason == $expected_reason
+    ' "$RESULT_DIR/run-status.json" >/dev/null
+  ) || {
+    printf 'run status did not safely serialize an acceptance reason\n' >&2
     return 1
   }
 }
@@ -11875,6 +11981,7 @@ main() {
   test_restart_failure_reaps_background_traffic
   test_scenario_failure_retains_after_evidence
   test_start_failure_retains_command_boundary
+  test_pre_environment_failure_retains_acceptance_eligibility
   test_log_write_failure_is_not_ignored
   test_footer_write_failure_preserves_first_failure
   test_error_logging_preserves_primary_status
@@ -11882,6 +11989,7 @@ main() {
   test_assertion_failure_control_is_explicit
   test_assertion_failure_control_retains_failure_evidence
   test_non_acceptance_reasons_are_recorded
+  test_run_status_serializes_default_acceptance_reason
   test_release_source_uses_one_version_for_extension
   test_demo_diagnostics_are_loopback_only
   test_apache_diagnostic_denial_matrix_is_exact

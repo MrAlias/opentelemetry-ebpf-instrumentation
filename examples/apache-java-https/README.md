@@ -540,8 +540,10 @@ Every run retains a timestamped directory under `.runtime/results/` with:
 Build and startup output is streamed to the terminal and retained in
 `bridge-build.log` and `compose-up.log`. A failed run also records the exact
 failure stage, source line, exit status, and shell-escaped command in
-`failure-context.txt`; `run-status.json` repeats the stage and line for
-machine-readable triage.
+`failure-context.txt`; `run-status.json` repeats the stage, line, and
+acceptance-evidence eligibility reason for machine-readable triage, including
+failures that occur after the result directory exists but before
+`environment.txt` can be written.
 
 Only a generated marker header is captured. The receiver rejects compressed or
 oversized requests, enforces configured count, per-string, and aggregate
@@ -570,9 +572,10 @@ duplicate-suppression request must produce a post-restart provider-ready log
 before the transport snapshot is captured and traffic resumes, preventing a
 pre-restart snapshot from satisfying the gate.
 
-A dirty source tree, `--skip-bridge-build`, or an individually targeted
-scenario is explicitly labeled non-acceptance evidence. Only a clean full
-`all` run is eligible to populate the result matrices.
+A dirty source tree, `--skip-bridge-build`, an individually targeted scenario,
+or `--scenario all --requests N` is explicitly labeled non-acceptance evidence.
+Only a clean, fresh-build full `all` run with the default per-scenario request
+counts is eligible to populate the result matrices.
 The clean focused primary-control record is retained separately in
 [focused-validation/primary-getsockopt-8f0aa1f6](focused-validation/primary-getsockopt-8f0aa1f6/README.md)
 so its isolation and fail-open outcomes can be reviewed without being promoted

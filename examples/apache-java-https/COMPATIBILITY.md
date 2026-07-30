@@ -66,23 +66,28 @@ backport. If a required cgroup hook is absent, report forced `getsockopt` as
 ## Primary live-descriptor isolation gate
 
 This is a primary-transport security gate, not a substitute for a forced
-`getsockopt` compatibility result and not a Unix fallback cell. The runner
-holds a real Java request at its accepted-descriptor barrier, then starts a
-root probe in the Java container's PID 1 cgroup and attempts to duplicate that
-live descriptor with `pidfd_getfd`. The direct probe observation is
-`unverified`; enforcement is established only by its isolated metric windows,
-the held legitimate victim, and post-abuse recovery.
+`getsockopt` compatibility result and not a Unix fallback cell. Before the
+held request publishes its accepted-descriptor barrier, the Java process creates
+a separate established unnegotiated loopback TCP socket and attempts the raw
+retrieval on it. The runner then starts a root probe in the Java container's
+PID 1 cgroup and attempts to duplicate the held descriptor with `pidfd_getfd`.
+The direct probe observation is `unverified`; enforcement is established only
+by the ordered isolated metric windows, held legitimate victim, and post-abuse
+recovery.
 
 | Gate | Required topology and capability | Status | Required retained result |
 | --- | --- | --- | --- |
-| live accepted-descriptor duplication against forced `getsockopt` | clean Java container; root probe pre-exec cgroup exactly equals Java PID 1 cgroup; `pidfd_getfd` permitted | pass | [clean full forced-primary `all` result](evidence/otel-getsockopt-tls13-74576ec6/README.md), with [sanitized probe, topology, and metric summary](evidence/otel-getsockopt-tls13-74576ec6/security-primary-live-fd.json), barrier records, victim graph, and recovery graph |
+| same-JVM wrong live socket plus accepted-descriptor duplication against forced `getsockopt` | clean Java container; separate live unnegotiated TCP decoy before `ready`; root probe pre-exec cgroup exactly equals Java PID 1 cgroup; `pidfd_getfd` permitted | pass | [clean full forced-primary `all` result](evidence/otel-getsockopt-tls13-b678ce1e/README.md), with [sanitized probe, ordered aggregate metric summary](evidence/otel-getsockopt-tls13-b678ce1e/security-primary-live-fd.json), barrier records, victim graph, and recovery graph |
 
-The [retained clean full result](evidence/otel-getsockopt-tls13-74576ec6/README.md)
-meets this gate: its security status reports `status: passed` and
-`probe_verification: metrics_verified`, the unauthorized attempt has zero valid
-bridge retrievals, the victim retains its exact parent, and recovery passes.
-The standalone `--scenario security` command is useful for diagnostics but is
-non-acceptance evidence. A
+The [retained clean full result](evidence/otel-getsockopt-tls13-b678ce1e/README.md)
+meets this gate: its security status reports `status: passed`,
+`wrong_live_socket: metrics_verified`, and
+`duplicated_fd_wrong_process: metrics_verified`; the pre-release aggregate has
+zero valid and exactly two unauthorized bridge retrievals, the victim retains
+its exact parent, and recovery passes. The metric label does not identify the
+two attackers individually; the retained ordering record binds the first to the
+same-JVM decoy and the second to the duplicated-FD probe. The standalone
+`--scenario security` command is useful for diagnostics but is non-acceptance evidence. A
 `pidfd-duplicate-unavailable` result retains barrier records, probe log,
 held-victim JSON and stderr, baseline metric evidence, and unsupported status.
 It does not produce probe/after metric phases or the explicit post-abuse

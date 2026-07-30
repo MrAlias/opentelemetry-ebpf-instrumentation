@@ -1,8 +1,8 @@
 # Security and abuse-case matrix
 
 Status: **partial — retained Unix sibling, same-cgroup, and stale-state
-controls passed; the retained primary live-descriptor control passed; wrong
-live-socket and remaining environment-matrix cases are untested**
+controls passed; retained primary live-descriptor and wrong-live-socket controls
+passed; remaining environment-matrix cases are untested**
 
 The PoC crosses a kernel/JVM trust boundary and exposes a local Unix fallback.
 Passing the happy path is insufficient. Every negative cell must preserve
@@ -14,7 +14,8 @@ retained [OpenTelemetry/`getsockopt`/TLS 1.3](evidence/otel-getsockopt-tls13-c9d
 [OpenTelemetry/`getsockopt`/TLS 1.2](evidence/otel-getsockopt-tls12-c7209e43/README.md),
 and [OpenTelemetry/Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/README.md),
 and [OpenTelemetry/Unix/TLS 1.3](evidence/otel-unix-tls13-6c4a2505/README.md)
-runs.
+runs. The current primary wrong-live-socket result is the exact
+[OpenTelemetry/`getsockopt`/TLS 1.3 bundle](evidence/otel-getsockopt-tls13-b678ce1e/README.md).
 
 `untested (focused verification only)` denotes a clean targeted validation
 record with `acceptance_evidence=false`. It is not an acceptance-matrix `pass`
@@ -36,12 +37,15 @@ targeted and has `acceptance_evidence=false`, it is not a primary acceptance
 matrix pass. A sanitized full acceptance run is still required before restoring
 a primary attacker cell to `pass`.
 
-The retained [primary live-descriptor acceptance bundle](evidence/otel-getsockopt-tls13-74576ec6/README.md)
-holds an actual accepted Java descriptor, executes a root probe in the Java
-container's PID 1 cgroup, and opens the duplicate before the legitimate request
-is released. Its isolated metric window records zero valid takes during the
-attacker probe, one unauthorized negotiate/take pair, an exact-parent victim,
-and recovery. `pidfd-duplicate-unavailable` remains an `unsupported`
+The retained [primary wrong-live-socket acceptance bundle](evidence/otel-getsockopt-tls13-b678ce1e/README.md)
+first creates a separate, established, unnegotiated loopback TCP socket in the
+Java process, then holds an actual accepted Java descriptor and executes a root
+probe in the Java container's PID 1 cgroup. The ordered pre-release window
+records zero valid takes, exactly two aggregate unauthorized takes, one
+unauthorized negotiate, an exact-parent victim, and recovery. The reason-coded
+metric label does not identify either attacker individually; the runner orders
+the same-JVM socket before `ready` and the duplicated-FD probe after `ready`
+but before release. `pidfd-duplicate-unavailable` remains an `unsupported`
 capability result, not an authorization pass and not a reason to fall back
 silently to Unix.
 
@@ -51,8 +55,8 @@ silently to Unix.
 | sibling container/PID namespace calls take | denied by current identity/peer credentials | untested (focused verification only) | pass | [current primary sibling metric window](focused-validation/primary-getsockopt-8f0aa1f6/security-primary-probes.json) and [retained Unix sibling topology, metrics, victim, and recovery](evidence/otel-unix-tls13-6c4a2505/README.md#retained-proof) |
 | forged caller PID/TID in Unix request | ignored; kernel peer identity is authoritative | not applicable | pass | [forged-peer probe](evidence/otel-unix-tls12-bd1c9327/security-unix-probes.json) |
 | repeated unauthorized take attempts | bounded; context remains available | untested (focused verification only) | pass | [primary bounded probe windows](focused-validation/primary-getsockopt-8f0aa1f6/security-primary-probes.json) and [Unix bounded probes and recovery](evidence/otel-unix-tls12-bd1c9327/security-unix-probes.json) |
-| root process in Java PID 1 cgroup duplicates a live accepted descriptor | raw probe is insufficient; isolated unauthorized metrics show zero valid retrievals, held victim keeps exact parent, recovery passes | pass | not applicable | [clean full primary acceptance bundle](evidence/otel-getsockopt-tls13-74576ec6/README.md) with [sanitized probe, topology, and metric summary](evidence/otel-getsockopt-tls13-74576ec6/security-primary-live-fd.json), barrier records, victim graph, and recovery graph; standalone `security` remains diagnostic only |
-| wrong socket identity | rejected without consuming another request's context | untested | untested | retain a targeted wrong-socket result |
+| root process in Java PID 1 cgroup duplicates a live accepted descriptor | raw probe is insufficient; isolated unauthorized metrics show zero valid retrievals, held victim keeps exact parent, recovery passes | pass | not applicable | [clean full primary acceptance bundle](evidence/otel-getsockopt-tls13-b678ce1e/README.md) with [sanitized probe, topology, and metric summary](evidence/otel-getsockopt-tls13-b678ce1e/security-primary-live-fd.json), barrier records, victim graph, and recovery graph; standalone `security` remains diagnostic only |
+| wrong socket identity | rejected without consuming another request's context | pass for a separate live unnegotiated TCP socket in the same JVM | untested | [clean full primary wrong-live-socket result](evidence/otel-getsockopt-tls13-b678ce1e/README.md) with the [ordered aggregate metric summary](evidence/otel-getsockopt-tls13-b678ce1e/security-primary-live-fd.json), held victim, and recovery; it does not claim a Unix or second-negotiated-socket case |
 | fd reuse | closed/reopened fixed-port traffic; reused Jetty fd across distinct stable Jetty connection IDs; distinct exact parents; zero wrong parents | pass | pass | [primary](evidence/otel-getsockopt-tls13-c9d14356/scenario-fd-port-reuse.json) and [Unix](evidence/otel-unix-tls12-bd1c9327/scenario-fd-port-reuse.json) reuse graphs |
 | unrelated socket option/level | original kernel behavior preserved | pass | not applicable | [primary probe cases](evidence/otel-getsockopt-tls13-c9d14356/security-primary-probes.json) |
 | Unix socket path replacement | startup fails closed or uses protected endpoint | not applicable | pass | [endpoint-replacement probes](evidence/otel-unix-tls12-bd1c9327/security-unix-probes.json) |
@@ -80,13 +84,16 @@ silently to Unix.
 - Run an attacker process with `docker exec` in the Java container to share its
   cgroup but not its JVM helper state.
 - For the primary live-descriptor control, hold a real victim request at the
-  Java accepted-descriptor barrier, then execute the root probe in that same
-  container. It clears fault-injection preload state and verifies before exec
-  that its cgroup equals Java PID 1's cgroup. The proof requires permitted
-  `pidfd_getfd`, an `unverified` raw observation, isolated unauthorized
-  negotiate/take metric deltas with zero valid retrievals, the victim's exact
-  parent, and a normal-stack recovery. A raw native result never certifies
-  primary enforcement.
+  Java accepted-descriptor barrier. Before it publishes `ready`, the preload
+  creates a separate established loopback TCP socket in that same Java process
+  and directly calls the resolved native retrieval; it must be denied. The
+  runner then executes the root duplicated-FD probe in that container after
+  `ready` and before release. It clears fault-injection preload state and
+  verifies before exec that its cgroup equals Java PID 1's cgroup. The proof
+  requires permitted `pidfd_getfd`, an `unverified` raw observation, exactly
+  two ordered aggregate unauthorized takes with zero valid retrievals, the
+  victim's exact parent, and a normal-stack recovery. A raw native result never
+  certifies primary enforcement.
 - Run a sibling container with the Unix directory mounted to test filesystem
   permissions and peer credentials.
 - The Unix sibling fixture is deliberately `65534:65534` with no network,

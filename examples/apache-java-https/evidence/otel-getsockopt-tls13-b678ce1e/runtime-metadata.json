@@ -1,0 +1,40 @@
+{
+  "evidence_id": "otel-getsockopt-tls13-b678ce1e",
+  "source_revision": "b678ce1e2415906d45df3bf0728e7ed9e92c52c9",
+  "sanitized": true,
+  "matrix_cell": {
+    "agent_distribution": "opentelemetry",
+    "agent_version": "2.28.1",
+    "transport": "getsockopt",
+    "tls_protocol": "TLSv1.3",
+    "scenario": "all"
+  },
+  "host": {
+    "architecture": "x86_64",
+    "kernel_release": "7.0.0-1009-aws",
+    "cgroup_filesystem": "cgroup2fs",
+    "vmlinux_btf": "readable"
+  },
+  "backend": {
+    "java_runtime": "Eclipse Temurin 21.0.10+7",
+    "http_protocol": "HTTP/1.1",
+    "official_agent_distribution": "opentelemetry",
+    "official_agent_version": "2.28.1",
+    "extension_separately_loaded": true,
+    "dynamic_helper_attached": true
+  },
+  "live_fd_topology": {
+    "java_pid_namespace": "private",
+    "java_container_privileged": false,
+    "java_container_capability": "SYS_PTRACE",
+    "seccomp_profile": "docker-default",
+    "attacker_cgroup": "java-pid1-verified-preexec"
+  },
+  "full_suite": {
+    "scenario_statuses": {
+      "passed": 44,
+      "unsupported": 2,
+      "failed": 0
+    }
+  }
+}

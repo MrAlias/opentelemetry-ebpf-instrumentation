@@ -1,0 +1,23 @@
+{
+  "status": "unverified",
+  "mode": "primary-live-fd",
+  "attempts": 1,
+  "cases": [
+    {
+      "name": "pidfd-duplicate",
+      "outcome": "opened"
+    },
+    {
+      "name": "standard-option",
+      "outcome": "preserved"
+    },
+    {
+      "name": "wrong-process-negotiation",
+      "outcome": "native-unsupported"
+    },
+    {
+      "name": "duplicated-fd-take",
+      "outcome": "native-unsupported"
+    }
+  ]
+}

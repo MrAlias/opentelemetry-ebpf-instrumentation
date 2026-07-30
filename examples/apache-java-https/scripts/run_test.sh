@@ -12085,6 +12085,42 @@ capture_fixture_source_with_redirected_git_environment() {
     "$fixture_runner" "$result_directory" "$redirected_worktree" "$redirected_index"
 }
 
+test_primary_wrong_live_socket_evidence_is_exact() {
+  local -r bundle="$TEST_SCRIPT_DIR/../evidence/otel-getsockopt-tls13-b678ce1e"
+  local -r summary="$bundle/security-primary-live-fd.json"
+  local -r status="$bundle/scenario-primary-live-fd-security-status.json"
+
+  jq -e '
+    .status == "passed" and
+    .transport == "getsockopt" and
+    .controls.wrong_live_socket.status == "metrics_verified" and
+    .controls.wrong_live_socket.actor == "the Java process" and
+    .controls.duplicated_fd_wrong_process.status == "metrics_verified" and
+    .metric_windows.probe_delta.take_valid == 0 and
+    .metric_windows.probe_delta.take_unauthorized == 2 and
+    .metric_windows.probe_delta.negotiate_unauthorized == 1 and
+    .metric_windows.after_from_before_delta.take_valid == 1 and
+    .metric_windows.after_from_before_delta.take_unauthorized == 2 and
+    .legitimate_victim.status == "passed" and
+    .post_abuse_recovery.status == "passed"
+  ' "$summary" >/dev/null || {
+    printf 'primary wrong-live-socket evidence lost its ordered metric contract\n' >&2
+    return 1
+  }
+  jq -e '
+    .status == "passed" and
+    .probe_status == "unverified" and
+    .probe_verification == "metrics_verified" and
+    .wrong_live_socket == "metrics_verified" and
+    .duplicated_fd_wrong_process == "metrics_verified" and
+    .legitimate_victim == "passed" and
+    .post_abuse_recovery == "passed"
+  ' "$status" >/dev/null || {
+    printf 'primary wrong-live-socket evidence lost its status boundary\n' >&2
+    return 1
+  }
+}
+
 test_retained_evidence_v2_git_tree_schema_is_verified() {
   local -r verifier="$TEST_SCRIPT_DIR/verify-retained-evidence.sh"
   local -r fixture_repository="$TEST_TMP_DIR/retained-evidence-v2-fixture"
@@ -13437,6 +13473,7 @@ main() {
   test_assertion_failure_control_retains_failure_evidence
   test_non_acceptance_reasons_are_recorded
   test_retained_evidence_provenance_is_verified
+  test_primary_wrong_live_socket_evidence_is_exact
   test_retained_evidence_v2_git_tree_schema_is_verified
   test_source_gitlink_depth_is_bounded
   test_source_git_tree_path_validation_is_byte_safe

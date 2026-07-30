@@ -110,7 +110,8 @@ The checked-in #28 matrix is explicit about which layer proves each case:
 | conflicting valid W3C and OBI | `w3c`: exact W3C parent, distinct Apache candidate, one discard | privileged run |
 | malformed W3C and valid OBI | `w3c`: exact Apache client parent, one take | privileged run |
 | valid W3C and no OBI | `w3c-only` plus named Unix fault modes | privileged run |
-| valid W3C and stale primary state | `primary-w3c-stale`: forced `getsockopt` retrieval TTL of `1ns`, exact W3C parent, one stale take, then normal-TTL recovery | privileged run |
+| valid W3C and stale primary state | `primary-w3c-stale`: forced `getsockopt` retrieval TTL of `1ns`, exact W3C parent, one workload stale bridge take with an in-band terminal diagnostics snapshot, then normal-TTL recovery | privileged run |
+| valid W3C and stale Unix state | `unix-w3c-stale`: forced `unix` retrieval TTL of `1ns`, exact W3C parent, one workload stale bridge take with an in-band terminal diagnostics snapshot, then normal-TTL recovery | privileged run |
 | sampled and unsampled OBI flags | `obi-flags`: exact IDs, flags, and diagnostics | privileged run |
 | repeated extraction | exact one-take/discard diagnostics per marked request | privileged run |
 | nested/duplicate server instrumentation | repeated Jetty async redispatch, exactly one Java server span | privileged run |
@@ -133,7 +134,13 @@ It verifies a healthy Apache request whose exact W3C parent wins after the
 primary stale retrieval, then restores the normal retrieval setting before
 proving a normal bridge recovery. It is an executable source control until a
 privileged run artifact is retained; it does not synthesize a malformed primary
-record. The separate `primary-w3c-fault` control uses a private one-shot
+record. The Unix `unix-w3c-stale` control follows the same TTL and recovery
+sequence through the real OBI Unix handler, not the synthetic `w3c-fault`
+responder. It is also executable source coverage until a privileged Unix
+artifact is retained. Both stale controls capture their baseline on the existing
+bridge-boundary health request and their terminal diagnostics on the marked
+workload response, avoiding a separate diagnostics request with its own lookup.
+The separate `primary-w3c-fault` control uses a private one-shot
 response shim to exercise declared-size and zero-ID malformed primary replies,
 plus ABI-version mismatch, while the supplied W3C parent remains authoritative.
 It is also source-level coverage until a clean focused or acceptance artifact
@@ -409,7 +416,7 @@ OBI accepts these environment overrides (the YAML equivalents are in
 | `OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_GROUP_ID` | `0` (the demo JVM runs as root) |
 | `OTEL_EBPF_JAVA_REMOTE_PARENT_TIMEOUT` | `50ms` |
 | `OTEL_EBPF_JAVA_REMOTE_PARENT_TTL` | `30s` prewrite and cleanup retention |
-| `OTEL_EBPF_JAVA_REMOTE_PARENT_RETRIEVAL_TTL` | `0s` (inherits `TTL` and must not exceed it; the stale control sets `1ns`) |
+| `OTEL_EBPF_JAVA_REMOTE_PARENT_RETRIEVAL_TTL` | `0s` (inherits `TTL` and must not exceed it; stale controls set `1ns`) |
 
 The official agent loads the external extension with
 `OTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar`. The propagator order
@@ -483,16 +490,19 @@ Only a generated marker header is captured. The receiver rejects compressed or
 oversized requests, enforces configured count, per-string, and aggregate
 retained-byte ceilings, and strips arbitrary headers and bodies before writing
 evidence. Any receiver eviction or rejection is reason-coded and invalidates
-the scenario. For ordinary scenarios, Java diagnostics are fetched after each
-post-scenario OBI metric snapshot. Their delta requires exactly one
+the scenario. For ordinary non-stale scenarios, Java diagnostics are fetched
+after each post-scenario OBI metric snapshot. Their delta requires exactly one
 self-observed missing lookup, so the diagnostic request cannot mask another
-missing lookup in the reason-coded interval attributed to that scenario. A
-fault-injection request instead opts in to the same fixed snapshot on its
-response after Java extraction. The runner captures its baseline from the
-existing pre-control health request, validates the exact bounded schema, and
-chains response-to-response deltas while the fault suite remains serial. This
-avoids an extra bridge take and requires exactly the normalized Java status for
-each injected mode with no unexpected retrieval result. The restart-fault
+missing lookup in the reason-coded interval attributed to that scenario. The
+forced `1ns` stale controls instead use in-band snapshots from the existing
+bridge-boundary health request and the marked workload response, which keeps
+their exact stale delta tied to the workload. A fault-injection request also
+opts in to the fixed snapshot on its response after Java extraction. The runner
+captures its baseline from the existing pre-control health request, validates
+the exact bounded schema, and chains response-to-response deltas while the
+fault suite remains serial. This avoids an extra bridge take and requires
+exactly the normalized Java status for each injected mode with no unexpected
+retrieval result. The restart-fault
 interval also includes the after-restart diagnostics snapshot, the
 duplicate-suppression readiness request, and the single post-readiness
 transport-configuration request, so it requires exactly three non-workload

@@ -14,6 +14,7 @@ JAVA_DIAGNOSTIC_COUNTER_MAX="999999999"
 BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS=35
 JAVA_PROVIDER_RETRY_SETTLE_SECONDS=2
 PRIMARY_W3C_STALE_RETRIEVAL_TTL="1ns"
+UNIX_W3C_STALE_RETRIEVAL_TTL="1ns"
 JAVA_ATTACH_FAILURE_QUIET_SAMPLES=15
 DELAYED_OTLP_SCHEDULE_DELAY_SECONDS=60
 DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS="$((DELAYED_OTLP_SCHEDULE_DELAY_SECONDS * 1000))"
@@ -69,7 +70,7 @@ readonly SCRIPT_DIR REPO_ROOT SCRIPT_NAME MAX_SHELL_INTEGER MAX_UINT32_DECIMAL
 readonly MAX_UINT64_DECIMAL JAVA_DIAGNOSTIC_COUNTER_MAX
 readonly BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS SCENARIO_RUN_TIMEOUT_SECONDS
 readonly JAVA_PROVIDER_RETRY_SETTLE_SECONDS
-readonly PRIMARY_W3C_STALE_RETRIEVAL_TTL
+readonly PRIMARY_W3C_STALE_RETRIEVAL_TTL UNIX_W3C_STALE_RETRIEVAL_TTL
 readonly JAVA_ATTACH_FAILURE_QUIET_SAMPLES
 readonly DELAYED_OTLP_SCHEDULE_DELAY_SECONDS
 readonly DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS
@@ -207,7 +208,7 @@ Options:
                           timeout-retry,
                           pressure, handoff, virtual-thread, netty, netty-server, dispatch,
                           w3c, w3c-match, obi-flags, w3c-fault, primary-w3c-fault,
-                          primary-w3c-stale, w3c-only,
+                          primary-w3c-stale, unix-w3c-stale, w3c-only,
                           security, restart-fault, helper-attach-failure,
                           delayed-otlp-suppression, assertion-failure, fail-open,
                           restart, disabled, uninstrumented, benchmark-disabled,
@@ -394,7 +395,7 @@ parse_args() {
       ;;
   esac
   case "$SCENARIO" in
-    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|timeout-retry|pressure|handoff|virtual-thread|netty|netty-server|dispatch|w3c|w3c-match|obi-flags|w3c-fault|primary-w3c-fault|primary-w3c-stale|w3c-only|security|restart-fault|helper-attach-failure|delayed-otlp-suppression|assertion-failure|fail-open|restart|disabled|uninstrumented|benchmark-disabled|benchmark-uninstrumented)
+    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|timeout-retry|pressure|handoff|virtual-thread|netty|netty-server|dispatch|w3c|w3c-match|obi-flags|w3c-fault|primary-w3c-fault|primary-w3c-stale|unix-w3c-stale|w3c-only|security|restart-fault|helper-attach-failure|delayed-otlp-suppression|assertion-failure|fail-open|restart|disabled|uninstrumented|benchmark-disabled|benchmark-uninstrumented)
       ;;
     *)
       die "unsupported scenario: $SCENARIO"
@@ -441,6 +442,12 @@ parse_args() {
   fi
   if [[ "$SCENARIO" == "primary-w3c-stale" && "$REQUEST_COUNT" != "0" && "$REQUEST_COUNT" != "1" ]]; then
     die "the primary-w3c-stale scenario requires exactly one request"
+  fi
+  if [[ "$SCENARIO" == "unix-w3c-stale" && "$TRANSPORT" != "unix" ]]; then
+    die "the unix-w3c-stale scenario requires --transport unix"
+  fi
+  if [[ "$SCENARIO" == "unix-w3c-stale" && "$REQUEST_COUNT" != "0" && "$REQUEST_COUNT" != "1" ]]; then
+    die "the unix-w3c-stale scenario requires exactly one request"
   fi
   if [[ "$SCENARIO" == "primary-w3c-fault" && "$TRANSPORT" != "getsockopt" ]]; then
     die "the primary-w3c-fault scenario requires --transport getsockopt"
@@ -2723,6 +2730,17 @@ flush_bridge_metric_boundary() {
     "$label pre-scenario bridge metric boundary"
 }
 
+is_w3c_stale_scenario() {
+  case "$1" in
+    primary-w3c-stale|unix-w3c-stale)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 scenario_request_count() {
   local -r name="$1"
 
@@ -2767,7 +2785,7 @@ scenario_request_count() {
     w3c|obi-flags|w3c-fault)
       printf '2\n'
       ;;
-    primary-w3c-stale)
+    primary-w3c-stale|unix-w3c-stale)
       printf '1\n'
       ;;
     *)
@@ -2792,7 +2810,10 @@ scenario_java_missing_count() {
   local -r diagnostics_enabled="$2"
   local count=0
 
-  if [[ "$name" != "w3c-fault" && "$diagnostics_enabled" == "true" ]]; then
+  # Forced stale controls take their terminal snapshot from the marked
+  # workload response, so they do not issue the ordinary diagnostic self probe.
+  if [[ "$name" != "w3c-fault" && "$diagnostics_enabled" == "true" ]] &&
+    ! is_w3c_stale_scenario "$name"; then
     count=1
   fi
   if [[ "$name" == "tls-boundary" ]]; then
@@ -3760,6 +3781,8 @@ run_scenario() {
   local stderr_output=""
   local before_phase=""
   local after_phase=""
+  local before_diagnostics=""
+  local after_diagnostics=""
   local before_stage=0
   local before_success=0
   local expected_stage=0
@@ -3873,7 +3896,7 @@ run_scenario() {
       expected_bridge_stage=0
       include_ambiguous_candidates=true
     fi
-    if [[ "$name" == "primary-w3c-stale" ]]; then
+    if is_w3c_stale_scenario "$name"; then
       expected_bridge_valid=0
       expected_bridge_stale="$expected_requests"
     fi
@@ -3902,6 +3925,8 @@ run_scenario() {
     stderr_output="$RESULT_DIR/scenario-$label.stderr.log"
     before_phase="$label-before"
     after_phase="$label-after"
+    before_diagnostics="$RESULT_DIR/phases/$before_phase/java-diagnostics.txt"
+    after_diagnostics="$RESULT_DIR/phases/$after_phase/java-diagnostics.txt"
 
     log_info "running $label scenario"
     if [[ "$fixture_mode" == "matching" ]]; then
@@ -3916,15 +3941,23 @@ run_scenario() {
       if ! flush_bridge_metric_boundary "$label" 0 0; then
         metric_status=1
       fi
-    elif [[ "$name" == "primary-w3c-stale" ]]; then
-      if ! flush_bridge_metric_boundary "$label" 0 1; then
+    elif is_w3c_stale_scenario "$name"; then
+      if [[ "$diagnostics_enabled" == "true" ]] &&
+        ! mkdir -p -- "$RESULT_DIR/phases/$before_phase"; then
+        metric_status=1
+      elif [[ "$diagnostics_enabled" == "true" ]] &&
+        ! flush_bridge_metric_boundary "$label" 0 1 "$before_diagnostics"; then
+        metric_status=1
+      elif [[ "$diagnostics_enabled" == "false" ]] &&
+        ! flush_bridge_metric_boundary "$label" 0 1; then
         metric_status=1
       fi
     elif ! flush_bridge_metric_boundary "$label"; then
       metric_status=1
     fi
     if [[ "$name" != "w3c-fault" && "$diagnostics_enabled" == "true" ]]; then
-      if ! capture_java_diagnostics "$before_phase"; then
+      if ! is_w3c_stale_scenario "$name" &&
+        ! capture_java_diagnostics "$before_phase"; then
         metric_status=1
       fi
       if [[ "$BRIDGE_RUNNING" == "true" ]] &&
@@ -4041,7 +4074,7 @@ run_scenario() {
         metric_status=1
       fi
     fi
-    if [[ "$retrieval_mode" == "normal" && "$name" != "primary-w3c-stale" ]]; then
+    if [[ "$retrieval_mode" == "normal" ]] && ! is_w3c_stale_scenario "$name"; then
       expected_bridge_lifecycle="$expected_bridge_valid"
       expected_bridge_stage="$expected_bridge_valid"
     fi
@@ -4064,7 +4097,12 @@ run_scenario() {
       metric_status=1
     fi
     if [[ "$name" != "w3c-fault" && "$diagnostics_enabled" == "true" ]]; then
-      if ! capture_java_diagnostics "$after_phase"; then
+      if is_w3c_stale_scenario "$name" &&
+        ! extract_java_diagnostics_after "$output" "$after_diagnostics"; then
+        log_error "could not extract in-band Java diagnostics for $label"
+        metric_status=1
+      elif ! is_w3c_stale_scenario "$name" &&
+        ! capture_java_diagnostics "$after_phase"; then
         metric_status=1
       fi
     fi
@@ -4157,7 +4195,7 @@ run_scenario() {
             expected_sampled="$((expected_requests / 2))"
             expected_unsampled="$(((expected_requests + 1) / 2))"
             ;;
-          primary-w3c-stale)
+          primary-w3c-stale|unix-w3c-stale)
             expected_stale="$expected_requests"
             ;;
         esac
@@ -5552,6 +5590,47 @@ run_primary_w3c_stale_control() {
   return "$recovery_status"
 }
 
+run_unix_w3c_stale_control() {
+  local -r original_retrieval_ttl="$REMOTE_PARENT_RETRIEVAL_TTL"
+  local control_status=0
+  local recovery_status=0
+
+  [[ "$TRANSPORT" == "unix" && "$SELECTED_TRANSPORT" == "unix" ]] || {
+    log_error "the Unix W3C stale control requires forced Unix transport"
+    return 1
+  }
+
+  log_info "recreating the forced Unix bridge with retrieval TTL=$UNIX_W3C_STALE_RETRIEVAL_TTL"
+  REMOTE_PARENT_RETRIEVAL_TTL="$UNIX_W3C_STALE_RETRIEVAL_TTL"
+  export REMOTE_PARENT_RETRIEVAL_TTL
+  if recreate_instrumented_stack "tcp" "Unix W3C stale preparation" unix; then
+    if run_scenario unix-w3c-stale; then
+      :
+    else
+      control_status=$?
+    fi
+  else
+    control_status=$?
+  fi
+
+  REMOTE_PARENT_RETRIEVAL_TTL="$original_retrieval_ttl"
+  export REMOTE_PARENT_RETRIEVAL_TTL
+  if recreate_instrumented_stack "tcp" "post-Unix W3C stale recovery" unix; then
+    if SCENARIO_VARIANT="unix-w3c-stale-recovery" run_scenario basic; then
+      :
+    else
+      recovery_status=$?
+    fi
+  else
+    recovery_status=$?
+  fi
+
+  if ((control_status != 0)); then
+    return "$control_status"
+  fi
+  return "$recovery_status"
+}
+
 primary_w3c_fault_expected_java_status() {
   local -r mode="$1"
 
@@ -5942,23 +6021,30 @@ extract_java_diagnostics_header() {
   rm -f -- "$candidate"
 }
 
-extract_fault_diagnostics_after() {
+extract_terminal_diagnostics_after() {
   local -r input="$1"
   local -r output="$2"
+  local -r field="$3"
   local candidate=""
 
+  case "$field" in
+    fault_diagnostics_after|java_diagnostics_after) ;;
+    *) return 1 ;;
+  esac
   [[ -f "$input" && ! -L "$input" && \
     ! -e "$output" && ! -L "$output" ]] || return 1
-  candidate="$(mktemp "$RESULT_DIR/.fault-diagnostics.XXXXXX")" || return 1
-  if ! awk '
-    index($0, "\"fault_diagnostics_after\"") {
+  candidate="$(mktemp "$RESULT_DIR/.terminal-diagnostics.XXXXXX")" || return 1
+  if ! awk -v field="$field" '
+    index($0, "\"" field "\"") {
       matches++
       line = $0
-      if (line !~ /^[[:space:]]*"fault_diagnostics_after"[[:space:]]*:[[:space:]]*"[0-9a-z_=,]+"[[:space:]]*,?[[:space:]]*$/) {
+      pattern = "^[[:space:]]*\"" field "\"[[:space:]]*:[[:space:]]*\"[0-9a-z_=,]+\"[[:space:]]*,?[[:space:]]*$"
+      if (line !~ pattern) {
         invalid = 1
         next
       }
-      sub(/^[[:space:]]*"fault_diagnostics_after"[[:space:]]*:[[:space:]]*"/, "", line)
+      prefix = "^[[:space:]]*\"" field "\"[[:space:]]*:[[:space:]]*\""
+      sub(prefix, "", line)
       sub(/"[[:space:]]*,?[[:space:]]*$/, "", line)
       selected = line
     }
@@ -5981,6 +6067,14 @@ extract_fault_diagnostics_after() {
     return 1
   fi
   rm -f -- "$candidate"
+}
+
+extract_fault_diagnostics_after() {
+  extract_terminal_diagnostics_after "$1" "$2" fault_diagnostics_after
+}
+
+extract_java_diagnostics_after() {
+  extract_terminal_diagnostics_after "$1" "$2" java_diagnostics_after
 }
 
 assert_sanitized_java_diagnostics() {
@@ -6824,9 +6918,12 @@ execute_requested_scenarios() {
         record_unsupported_scenario \
           primary-w3c-fault "requires forced getsockopt transport"
       fi
-      if [[ "$TRANSPORT" == "unix" ]]; then
+      if [[ "$TRANSPORT" == "unix" && "$SELECTED_TRANSPORT" == "unix" ]]; then
+        run_unix_w3c_stale_control
         run_w3c_fault_control
       else
+        record_unsupported_scenario \
+          unix-w3c-stale "requires forced Unix transport"
         record_unsupported_scenario \
           w3c-fault "requires forced Unix transport"
       fi
@@ -6889,6 +6986,9 @@ execute_requested_scenarios() {
       ;;
     primary-w3c-stale)
       run_primary_w3c_stale_control
+      ;;
+    unix-w3c-stale)
+      run_unix_w3c_stale_control
       ;;
     primary-w3c-fault)
       run_primary_w3c_fault_control

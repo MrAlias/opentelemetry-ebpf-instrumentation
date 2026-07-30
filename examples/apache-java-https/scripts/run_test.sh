@@ -1294,6 +1294,10 @@ test_unix_all_suite_includes_fault_control() {
     record_unsupported_scenario() {
       return 0
     }
+    run_unix_w3c_stale_control() {
+      run_scenario unix-w3c-stale
+      run_scenario basic
+    }
     run_w3c_fault_control() {
       run_scenario w3c-fault
     }
@@ -1328,7 +1332,7 @@ test_unix_all_suite_includes_fault_control() {
   )
 
   [[ "$(<"$actual")" == *$'basic\nbasic\nsecurity\nkeepalive'* && \
-    "$(<"$actual")" == *$'obi-flags\nw3c-fault\nfail-open'* &&
+    "$(<"$actual")" == *$'obi-flags\nunix-w3c-stale\nbasic\nw3c-fault\nfail-open'* &&
     "$(<"$actual")" == *$'restart\nrestart-fault\nhelper-attach-failure'* ]] || {
     printf 'Unix all suite omitted the security or bounded W3C fault control\n' >&2
     return 1
@@ -1560,6 +1564,38 @@ test_primary_w3c_stale_requires_forced_primary() {
   fi
 }
 
+test_unix_w3c_stale_requires_forced_unix() {
+  (
+    TRANSPORT=unix
+    SCENARIO=all
+    REQUEST_COUNT=0
+    parse_args --transport unix --scenario unix-w3c-stale --requests 1
+    [[ "$TRANSPORT" == "unix" && "$SCENARIO" == "unix-w3c-stale" && \
+      "$REQUEST_COUNT" == "1" ]]
+  ) || {
+    printf 'rejected the forced-Unix stale control\n' >&2
+    return 1
+  }
+  if (
+    TRANSPORT=unix
+    SCENARIO=all
+    REQUEST_COUNT=0
+    parse_args --transport getsockopt --scenario unix-w3c-stale
+  ) >/dev/null 2>&1; then
+    printf 'accepted the Unix stale control without forced Unix transport\n' >&2
+    return 1
+  fi
+  if (
+    TRANSPORT=unix
+    SCENARIO=all
+    REQUEST_COUNT=0
+    parse_args --transport unix --scenario unix-w3c-stale --requests 2
+  ) >/dev/null 2>&1; then
+    printf 'accepted the Unix stale control with multiple requests\n' >&2
+    return 1
+  fi
+}
+
 test_primary_w3c_fault_requires_forced_primary() {
   (
     TRANSPORT=getsockopt
@@ -1737,70 +1773,165 @@ test_primary_w3c_stale_control_restores_the_normal_ttls() {
   }
 }
 
-test_primary_w3c_stale_scenario_accounts_for_the_stale_take() {
-  local -r calls="$TEST_TMP_DIR/primary-w3c-stale-scenario.calls"
+test_unix_w3c_stale_control_restores_the_normal_ttls() {
+  local -r observed="$TEST_TMP_DIR/unix-w3c-stale-control.calls"
 
   (
-    RESULT_DIR="$TEST_TMP_DIR/primary-w3c-stale-scenario"
-    mkdir -p -- "$RESULT_DIR"
-    : >"$calls"
-    BRIDGE_RUNNING=true
-    COMPOSE=(docker compose)
-    REPEAT_COUNT=1
-    REQUEST_COUNT=0
-    SCENARIO_SEED=1
-    SCENARIO_VARIANT=""
-    SELECTED_TRANSPORT=getsockopt
-    TLS_PROTOCOL=TLSv1.3
-    flush_bridge_metric_boundary() {
-      printf 'boundary:%s:%s:%s\n' "$1" "${2:-1}" "${3:-1}" >>"$calls"
+    TRANSPORT=unix
+    SELECTED_TRANSPORT=unix
+    REMOTE_PARENT_TTL=30s
+    REMOTE_PARENT_RETRIEVAL_TTL=0s
+    SCENARIO_VARIANT=existing-variant
+    : >"$observed"
+    recreate_instrumented_stack() {
+      printf 'recreate:%s:%s:retention_ttl=%s:retrieval_ttl=%s\n' \
+        "$2" "$3" "$REMOTE_PARENT_TTL" "$REMOTE_PARENT_RETRIEVAL_TTL" >>"$observed"
     }
-    capture_java_diagnostics() {
-      printf 'diagnostics:%s\n' "$1" >>"$calls"
-      mkdir -p -- "$RESULT_DIR/phases/$1"
-      printf 'fixture\n' >"$RESULT_DIR/phases/$1/java-diagnostics.txt"
-    }
-    capture_phase_evidence() {
-      printf 'evidence:%s\n' "$1" >>"$calls"
-      mkdir -p -- "$RESULT_DIR/phases/$1"
-      printf '%s\n' \
-        'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 10' \
-        'obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} 20' \
-        >"$RESULT_DIR/phases/$1/obi-metrics.prom"
-    }
-    run_bounded() {
-      printf 'scenario\n' >>"$calls"
-      printf '{"status":"passed"}\n'
-    }
-    wait_for_bridge_metrics_quiescent() {
-      printf 'wait:%s:%s\n' "$1" "$2" >>"$calls"
-    }
-    write_metrics_delta() { : >"$3"; }
-    assert_bridge_metric_delta() {
-      printf 'bridge:%s:%s:%s:%s:%s:%s:%s:%s\n' \
-        "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" >>"$calls"
-      [[ "$2" == "getsockopt" && "$3" == "0" && "$4" == "0" && \
-        "$5" == "0" && "$6" == "1" && "$7" == "1" && \
-        "$8" == "false" && "$9" == "1" ]]
-    }
-    write_java_diagnostics_delta() { : >"$3"; }
-    assert_java_diagnostics_delta() {
-      printf 'java:%s:%s:%s:%s:%s:%s:%s\n' \
-        "$2" "$3" "$4" "$5" "$6" "$7" "$8" >>"$calls"
-      [[ "$2" == "0" && "$3" == "1" && "$4" == "0" && \
-        "$5" == "1" && "$6" == "0" && "$7" == "0" && "$8" == "0" ]]
+    run_scenario() {
+      printf 'scenario:%s:%s:retention_ttl=%s:retrieval_ttl=%s\n' \
+        "$1" "$SCENARIO_VARIANT" "$REMOTE_PARENT_TTL" "$REMOTE_PARENT_RETRIEVAL_TTL" >>"$observed"
     }
 
-    run_scenario primary-w3c-stale >/dev/null
+    run_unix_w3c_stale_control
+    [[ "$REMOTE_PARENT_TTL" == "30s" && "$REMOTE_PARENT_RETRIEVAL_TTL" == "0s" && \
+      "$SCENARIO_VARIANT" == "existing-variant" ]]
   ) || {
-    printf 'primary stale scenario did not keep stale accounting exact\n' >&2
+    printf 'Unix stale control did not restore its caller state\n' >&2
     return 1
   }
 
-  grep -Fqx 'boundary:primary-w3c-stale:0:1' "$calls"
-  grep -Fqx 'wait:10:21' "$calls"
-  grep -Fqx 'bridge:getsockopt:0:0:0:1:1:false:1' "$calls"
-  grep -Fqx 'java:0:1:0:1:0:0:0' "$calls"
+  local -r expected=$'recreate:Unix W3C stale preparation:unix:retention_ttl=30s:retrieval_ttl=1ns\nscenario:unix-w3c-stale:existing-variant:retention_ttl=30s:retrieval_ttl=1ns\nrecreate:post-Unix W3C stale recovery:unix:retention_ttl=30s:retrieval_ttl=0s\nscenario:basic:unix-w3c-stale-recovery:retention_ttl=30s:retrieval_ttl=0s'
+  [[ "$(<"$observed")" == "$expected" ]] || {
+    printf 'Unix stale control lifecycle changed:\n%s\n' "$(<"$observed")" >&2
+    return 1
+  }
+}
+
+test_unix_w3c_stale_control_recovers_after_a_failed_stale_assertion() {
+  local -r observed="$TEST_TMP_DIR/unix-w3c-stale-failure-recovery.calls"
+  local control_status=0
+
+  (
+    TRANSPORT=unix
+    SELECTED_TRANSPORT=unix
+    REMOTE_PARENT_TTL=30s
+    REMOTE_PARENT_RETRIEVAL_TTL=0s
+    : >"$observed"
+    recreate_instrumented_stack() {
+      printf 'recreate:%s:%s:retrieval_ttl=%s\n' \
+        "$2" "$3" "$REMOTE_PARENT_RETRIEVAL_TTL" >>"$observed"
+    }
+    run_scenario() {
+      printf 'scenario:%s:retrieval_ttl=%s\n' \
+        "$1" "$REMOTE_PARENT_RETRIEVAL_TTL" >>"$observed"
+      [[ "$1" != "unix-w3c-stale" ]]
+    }
+
+    if run_unix_w3c_stale_control; then
+      return 1
+    else
+      control_status=$?
+    fi
+    [[ "$control_status" == "1" && "$REMOTE_PARENT_TTL" == "30s" && \
+      "$REMOTE_PARENT_RETRIEVAL_TTL" == "0s" ]]
+  ) || {
+    printf 'Unix stale control did not recover after a failed stale assertion\n' >&2
+    return 1
+  }
+
+  local -r expected=$'recreate:Unix W3C stale preparation:unix:retrieval_ttl=1ns\nscenario:unix-w3c-stale:retrieval_ttl=1ns\nrecreate:post-Unix W3C stale recovery:unix:retrieval_ttl=0s\nscenario:basic:retrieval_ttl=0s'
+  [[ "$(<"$observed")" == "$expected" ]] || {
+    printf 'Unix stale failure recovery changed:\n%s\n' "$(<"$observed")" >&2
+    return 1
+  }
+}
+
+test_w3c_stale_scenarios_use_in_band_diagnostics() {
+  local scenario=""
+  local transport=""
+  local calls=""
+  local index=0
+  local -a scenarios=(primary-w3c-stale unix-w3c-stale)
+  local -a transports=(getsockopt unix)
+
+  for index in "${!scenarios[@]}"; do
+    scenario="${scenarios[$index]}"
+    transport="${transports[$index]}"
+    calls="$TEST_TMP_DIR/$scenario-scenario.calls"
+
+    (
+      RESULT_DIR="$TEST_TMP_DIR/$scenario-scenario"
+      mkdir -p -- "$RESULT_DIR"
+      : >"$calls"
+      BRIDGE_RUNNING=true
+      COMPOSE=(docker compose)
+      REPEAT_COUNT=1
+      REQUEST_COUNT=0
+      SCENARIO_SEED=1
+      SCENARIO_VARIANT=""
+      SELECTED_TRANSPORT="$transport"
+      TLS_PROTOCOL=TLSv1.3
+      flush_bridge_metric_boundary() {
+        printf 'boundary:%s:%s:%s:%s\n' \
+          "$1" "${2:-1}" "${3:-1}" "${4:-}" >>"$calls"
+        mkdir -p -- "$(dirname -- "$4")"
+        write_diagnostics_fixture "$4" 0 0 0 0 0 0
+      }
+      capture_java_diagnostics() {
+        printf 'unexpected-direct-diagnostics:%s\n' "$1" >>"$calls"
+        return 1
+      }
+      capture_phase_evidence() {
+        printf 'evidence:%s\n' "$1" >>"$calls"
+        mkdir -p -- "$RESULT_DIR/phases/$1"
+        printf 'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="%s"} 10\n' \
+          "$transport" >"$RESULT_DIR/phases/$1/obi-metrics.prom"
+        printf '%s\n' \
+          'obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} 20' \
+          >>"$RESULT_DIR/phases/$1/obi-metrics.prom"
+      }
+      run_bounded() {
+        printf 'scenario\n' >>"$calls"
+        write_diagnostics_fixture "$RESULT_DIR/in-band-diagnostics.txt" 0 1 0 0 0 0
+        printf '{\n  "status": "passed",\n  "java_diagnostics_after": "%s"\n}\n' \
+          "$(<"$RESULT_DIR/in-band-diagnostics.txt")"
+      }
+      wait_for_bridge_metrics_quiescent() {
+        printf 'wait:%s:%s\n' "$1" "$2" >>"$calls"
+      }
+      write_metrics_delta() { : >"$3"; }
+      assert_bridge_metric_delta() {
+        printf 'bridge:%s:%s:%s:%s:%s:%s:%s:%s\n' \
+          "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" >>"$calls"
+        [[ "$2" == "$transport" && "$3" == "0" && "$4" == "0" && \
+          "$5" == "0" && "$6" == "1" && "$7" == "1" && \
+          "$8" == "false" && "$9" == "1" ]]
+      }
+      write_java_diagnostics_delta() { : >"$3"; }
+      assert_java_diagnostics_delta() {
+        printf 'java:%s:%s:%s:%s:%s:%s:%s\n' \
+          "$2" "$3" "$4" "$5" "$6" "$7" "$8" >>"$calls"
+        [[ "$2" == "0" && "$3" == "1" && "$4" == "0" && \
+          "$5" == "0" && "$6" == "0" && "$7" == "0" && "$8" == "0" ]]
+      }
+
+      run_scenario "$scenario" >/dev/null
+    ) || {
+      printf '%s stale scenario did not use its in-band diagnostics snapshot\n' "$transport" >&2
+      return 1
+    }
+
+    grep -Fqx \
+      "boundary:$scenario:0:1:$TEST_TMP_DIR/$scenario-scenario/phases/$scenario-before/java-diagnostics.txt" \
+      "$calls" || return 1
+    grep -Fqx 'wait:10:21' "$calls" || return 1
+    grep -Fqx "bridge:$transport:0:0:0:1:1:false:1" "$calls" || return 1
+    grep -Fqx 'java:0:1:0:0:0:0:0' "$calls" || return 1
+    if grep -Fq 'unexpected-direct-diagnostics:' "$calls"; then
+      printf '%s stale scenario issued a direct diagnostics probe\n' "$transport" >&2
+      return 1
+    fi
+  done
 }
 
 test_primary_w3c_fault_recreation_uses_the_overlay_only() {
@@ -4577,6 +4708,11 @@ test_bridge_take_count_includes_cancelled_request() {
     printf 'Unix metric baseline did not exclude the before-diagnostics lookup\n' >&2
     return 1
   }
+  [[ "$(scenario_java_missing_count primary-w3c-stale true)" == "0" &&
+    "$(scenario_java_missing_count unix-w3c-stale true)" == "0" ]] || {
+    printf 'stale diagnostics accounting did not suppress the direct self lookup\n' >&2
+    return 1
+  }
   [[ "$(scenario_bridge_missing_count tls-boundary getsockopt)" == "0" &&
     "$(scenario_java_missing_count tls-boundary true)" == "4" ]] || {
     printf 'getsockopt TLS-boundary miss expectations were not local-only\n' >&2
@@ -5863,6 +5999,59 @@ test_fault_diagnostics_result_is_single_sanitized_snapshot() {
   output="$TEST_TMP_DIR/fault-result-malformed.txt"
   if extract_fault_diagnostics_after "$result" "$output" >/dev/null 2>&1; then
     printf 'fault result accepted malformed terminal diagnostics\n' >&2
+    return 1
+  fi
+}
+
+test_java_diagnostics_result_is_single_sanitized_snapshot() {
+  local -r expected="$TEST_TMP_DIR/java-result-expected.txt"
+  local -r result="$TEST_TMP_DIR/java-result.json"
+  local output=""
+  local snapshot=""
+  local malformed=""
+
+  write_diagnostics_fixture "$expected" 0 1 0 0 0 0
+  snapshot="$(<"$expected")"
+  printf '{\n  "status": "passed",\n  "java_diagnostics_after": "%s"\n}\n' \
+    "$snapshot" >"$result"
+  output="$TEST_TMP_DIR/java-result-valid.txt"
+  extract_java_diagnostics_after "$result" "$output"
+  cmp -s -- "$expected" "$output" || {
+    printf 'stale result did not preserve its terminal diagnostics snapshot\n' >&2
+    return 1
+  }
+
+  printf '{\n  "status": "passed"\n}\n' >"$result"
+  output="$TEST_TMP_DIR/java-result-missing.txt"
+  if extract_java_diagnostics_after "$result" "$output" >/dev/null 2>&1; then
+    printf 'stale result accepted missing terminal diagnostics\n' >&2
+    return 1
+  fi
+  printf '{\n  "java_diagnostics_after": "%s",\n  "java_diagnostics_after": "%s"\n}\n' \
+    "$snapshot" "$snapshot" >"$result"
+  output="$TEST_TMP_DIR/java-result-duplicate.txt"
+  if extract_java_diagnostics_after "$result" "$output" >/dev/null 2>&1; then
+    printf 'stale result accepted duplicate terminal diagnostics\n' >&2
+    return 1
+  fi
+  printf '{\n  "java_diagnostics_after": "unavailable"\n}\n' >"$result"
+  output="$TEST_TMP_DIR/java-result-unavailable.txt"
+  if extract_java_diagnostics_after "$result" "$output" >/dev/null 2>&1; then
+    printf 'stale result accepted unavailable terminal diagnostics\n' >&2
+    return 1
+  fi
+  malformed="${snapshot/cfg_on=0/cfg_on=00}"
+  printf '{\n  "java_diagnostics_after": "%s"\n}\n' "$malformed" >"$result"
+  output="$TEST_TMP_DIR/java-result-malformed.txt"
+  if extract_java_diagnostics_after "$result" "$output" >/dev/null 2>&1; then
+    printf 'stale result accepted malformed terminal diagnostics\n' >&2
+    return 1
+  fi
+  printf '{\n  "java_diagnostics_after": "%s"\n}\n' "$snapshot" >"$result"
+  output="$TEST_TMP_DIR/java-result-symlink.txt"
+  ln -s -- "$expected" "$output"
+  if extract_java_diagnostics_after "$result" "$output" >/dev/null 2>&1; then
+    printf 'stale result overwrote a diagnostics symlink\n' >&2
     return 1
   fi
 }
@@ -7623,8 +7812,10 @@ test_extension_disabled_runtime_requires_explicit_false() {
 
 test_disabled_runtime_requires_explicit_transport_disable() {
   local -r result_dir="$TEST_TMP_DIR/disabled-runtime"
-  local java_environment=""
-  local obi_environment=""
+  # Keep mock values distinct from assert_runtime_contract's dynamically scoped
+  # local variables. Bash function mocks resolve names dynamically.
+  local mock_java_environment=""
+  local mock_obi_environment=""
   local btf_readable=true
 
   mkdir -p -- "$result_dir"
@@ -7637,13 +7828,13 @@ test_disabled_runtime_requires_explicit_transport_disable() {
           printf 'java-container\n'
           ;;
         *"docker inspect --format "*" java-container")
-          printf '%s\n' "$java_environment"
+          printf '%s\n' "$mock_java_environment"
           ;;
         *"test-compose ps --quiet obi")
           printf 'obi-container\n'
           ;;
         *"range .Config.Env"*" obi-container")
-          printf '%s\n' "$obi_environment"
+          printf '%s\n' "$mock_obi_environment"
           ;;
         *"docker inspect --format "*" obi-container")
           printf 'true host\n'
@@ -7657,8 +7848,8 @@ test_disabled_runtime_requires_explicit_transport_disable() {
     log_error() { :; }
     host_vmlinux_btf_readable() { [[ "$btf_readable" == "true" ]]; }
 
-    java_environment=$'JAVA_TOOL_OPTIONS=-javaagent:/otel/official-javaagent.jar\nOTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar\nOTEL_OBI_REMOTE_PARENT_ENABLED=true'
-    obi_environment='OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT=disabled'
+    mock_java_environment=$'JAVA_TOOL_OPTIONS=-javaagent:/otel/official-javaagent.jar\nOTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar\nOTEL_OBI_REMOTE_PARENT_ENABLED=true'
+    mock_obi_environment='OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT=disabled'
     assert_runtime_contract disabled || {
       printf 'disabled runtime rejected the exact disabled transport\n' >&2
       return 1
@@ -7675,7 +7866,7 @@ test_disabled_runtime_requires_explicit_transport_disable() {
     fi
     btf_readable=true
 
-    for obi_environment in \
+    for mock_obi_environment in \
       'OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT=getsockopt' \
       'OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT=unix' \
       $'OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT=disabled\nOTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT=getsockopt' \
@@ -10534,11 +10725,14 @@ main() {
   test_helper_attach_failure_dispatch_and_seed_are_exact
   test_w3c_fault_requires_forced_unix
   test_primary_w3c_stale_requires_forced_primary
+  test_unix_w3c_stale_requires_forced_unix
   test_primary_w3c_fault_requires_forced_primary
   test_primary_w3c_fault_modes_are_exact
   test_primary_w3c_fault_control_scripts_publish_and_consume_exactly
   test_primary_w3c_stale_control_restores_the_normal_ttls
-  test_primary_w3c_stale_scenario_accounts_for_the_stale_take
+  test_unix_w3c_stale_control_restores_the_normal_ttls
+  test_unix_w3c_stale_control_recovers_after_a_failed_stale_assertion
+  test_w3c_stale_scenarios_use_in_band_diagnostics
   test_primary_w3c_fault_recreation_uses_the_overlay_only
   test_primary_w3c_fault_scenario_arms_after_the_baseline
   test_primary_w3c_fault_control_restores_the_base_stack
@@ -10600,6 +10794,7 @@ main() {
   test_java_diagnostics_header_is_exact_and_piggybacked
   test_pre_stop_diagnostics_failure_does_not_stop_obi
   test_fault_diagnostics_result_is_single_sanitized_snapshot
+  test_java_diagnostics_result_is_single_sanitized_snapshot
   test_w3c_fault_diagnostics_mappings_are_exact
   test_fault_scenario_chains_in_band_diagnostics_without_direct_probe
   test_fault_scenario_failure_retains_in_band_diagnostics

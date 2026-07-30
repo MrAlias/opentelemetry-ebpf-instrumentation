@@ -168,6 +168,7 @@ type runResult struct {
 	ConnectionEvidence    *connectionEvidence         `json:"connection_evidence,omitempty"`
 	PressureCorrelation   *pressureCorrelationSummary `json:"pressure_correlation,omitempty"`
 	FaultDiagnosticsAfter string                      `json:"fault_diagnostics_after,omitempty"`
+	JavaDiagnosticsAfter  string                      `json:"java_diagnostics_after,omitempty"`
 	Cases                 []caseResult                `json:"cases"`
 }
 
@@ -287,7 +288,7 @@ func parseFlags() config {
 	var cfg config
 	flag.StringVar(&cfg.baseURL, "base-url", "http://127.0.0.1:18080", "Apache base URL")
 	flag.StringVar(&cfg.receiverURL, "receiver-url", "http://127.0.0.1:14318", "trace receiver base URL")
-	flag.StringVar(&cfg.scenario, "scenario", "basic", "basic, keepalive, pipelining, concurrency, connection-churn, fd-port-reuse, slow-body, tls-boundary, timeout-retry, pressure, handoff, virtual-thread, netty, netty-server, dispatch, w3c, w3c-match, obi-flags, w3c-fault, primary-w3c-fault, primary-w3c-stale, w3c-only, helper-attach-failure, restart-fault, fail-open, restart, disabled, or uninstrumented")
+	flag.StringVar(&cfg.scenario, "scenario", "basic", "basic, keepalive, pipelining, concurrency, connection-churn, fd-port-reuse, slow-body, tls-boundary, timeout-retry, pressure, handoff, virtual-thread, netty, netty-server, dispatch, w3c, w3c-match, obi-flags, w3c-fault, primary-w3c-fault, primary-w3c-stale, unix-w3c-stale, w3c-only, helper-attach-failure, restart-fault, fail-open, restart, disabled, or uninstrumented")
 	flag.StringVar(&cfg.assertionMode, "assertion-mode", "", "concurrency assertion override: disabled or uninstrumented")
 	flag.StringVar(&cfg.faultMode, "fault-mode", "", "W3C fault mode")
 	flag.StringVar(&cfg.javaDiagnosticsBefore, "java-diagnostics-before", "", "sanitized Java diagnostics baseline for primary-w3c-fault")
@@ -311,7 +312,7 @@ func parseFlags() config {
 		"pressure": true,
 		"handoff":  true, "virtual-thread": true, "netty": true, "netty-server": true, "dispatch": true,
 		"w3c": true, "w3c-match": true, "obi-flags": true, "w3c-fault": true,
-		"primary-w3c-fault": true, "primary-w3c-stale": true,
+		"primary-w3c-fault": true, "primary-w3c-stale": true, "unix-w3c-stale": true,
 		"w3c-only": true, "helper-attach-failure": true, "restart-fault": true,
 		"disabled": true, "uninstrumented": true,
 		"fail-open": true, "restart": true,
@@ -403,6 +404,14 @@ func isFaultScenario(scenario string) bool {
 	return scenario == "w3c-fault" || scenario == "primary-w3c-fault"
 }
 
+func isW3CStaleScenario(scenario string) bool {
+	return scenario == "primary-w3c-stale" || scenario == "unix-w3c-stale"
+}
+
+func usesInBandJavaDiagnostics(scenario string) bool {
+	return isFaultScenario(scenario) || isW3CStaleScenario(scenario)
+}
+
 func validateJavaDiagnosticsBefore(cfg config) error {
 	if cfg.scenario != "primary-w3c-fault" {
 		if cfg.javaDiagnosticsBefore != "" {
@@ -420,7 +429,7 @@ func validateJavaDiagnosticsBefore(cfg config) error {
 }
 
 func requestsBridgeDiagnostics(cfg config, request requestCase) bool {
-	return isFaultScenario(cfg.scenario) && request.BridgeDiagnostics
+	return usesInBandJavaDiagnostics(cfg.scenario) && request.BridgeDiagnostics
 }
 
 func expectedJavaFaultStatus(faultMode string, requestIndex int) (string, bool) {
@@ -492,6 +501,8 @@ func run(ctx context.Context, cfg config) (*runResult, error) {
 	}
 	if isFaultScenario(cfg.scenario) {
 		result.FaultDiagnosticsAfter = responses[len(responses)-1].BridgeDiagnostics
+	} else if isW3CStaleScenario(cfg.scenario) {
+		result.JavaDiagnosticsAfter = responses[len(responses)-1].BridgeDiagnostics
 	}
 	if cfg.scenario == "primary-w3c-fault" {
 		if err := assertPrimaryFaultDiagnostics(
@@ -598,7 +609,7 @@ func makeRequests(cfg config) ([]requestCase, error) {
 	if cfg.scenario == "helper-attach-failure" && count != 1 {
 		return nil, fmt.Errorf("scenario %s requires exactly one request", cfg.scenario)
 	}
-	if cfg.scenario == "primary-w3c-stale" && count != 1 {
+	if (cfg.scenario == "primary-w3c-stale" || cfg.scenario == "unix-w3c-stale") && count != 1 {
 		return nil, fmt.Errorf("scenario %s requires exactly one request", cfg.scenario)
 	}
 	if cfg.scenario == "primary-w3c-fault" && count != 1 {
@@ -706,9 +717,13 @@ func makeRequests(cfg config) ([]requestCase, error) {
 			if err := addW3CContext(random, &requests[i], "01", caseName); err != nil {
 				return nil, err
 			}
-		case "primary-w3c-stale":
+		case "primary-w3c-stale", "unix-w3c-stale":
 			requests[i].ExpectedJavaStatus = "stale"
-			if err := addW3CContext(random, &requests[i], "01", "valid-w3c-primary-stale"); err != nil {
+			w3cCase := "valid-w3c-primary-stale"
+			if cfg.scenario == "unix-w3c-stale" {
+				w3cCase = "valid-w3c-unix-stale"
+			}
+			if err := addW3CContext(random, &requests[i], "01", w3cCase); err != nil {
 				return nil, err
 			}
 		case "primary-w3c-fault":
@@ -745,7 +760,7 @@ func makeRequests(cfg config) ([]requestCase, error) {
 			}
 		}
 	}
-	if isFaultScenario(cfg.scenario) {
+	if usesInBandJavaDiagnostics(cfg.scenario) {
 		requests[len(requests)-1].BridgeDiagnostics = true
 	}
 	if parallelScenario(cfg.scenario) {
@@ -1655,7 +1670,7 @@ func expectationFor(cfg config, request requestCase) tracecheck.Expectation {
 		mode = tracecheck.ModeW3CNoOBI
 	case "primary-w3c-fault":
 		mode = tracecheck.ModeW3C
-	case "primary-w3c-stale":
+	case "primary-w3c-stale", "unix-w3c-stale":
 		mode = tracecheck.ModeW3C
 	case "w3c-only":
 		mode = tracecheck.ModeW3CNoOBI

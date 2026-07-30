@@ -462,31 +462,53 @@ func TestW3CFaultRequestsDescribeInjectedAndNormalizedOutcomes(t *testing.T) {
 	}
 }
 
-func TestPrimaryW3CStaleRequestUsesTheStandardParent(t *testing.T) {
-	cfg := config{scenario: "primary-w3c-stale", seed: 42}
-	requests, err := makeRequests(cfg)
-	require.NoError(t, err)
-	require.Len(t, requests, 1)
+func TestW3CStaleRequestUsesTheStandardParent(t *testing.T) {
+	tests := []struct {
+		scenario string
+		w3cCase  string
+	}{
+		{scenario: "primary-w3c-stale", w3cCase: "valid-w3c-primary-stale"},
+		{scenario: "unix-w3c-stale", w3cCase: "valid-w3c-unix-stale"},
+	}
 
-	requestCase := requests[0]
-	assert.Equal(t, "stale", requestCase.ExpectedJavaStatus)
-	assert.Equal(t, "valid-w3c-primary-stale", requestCase.W3CCase)
-	assert.Equal(t, "01", requestCase.W3CTraceFlags)
-	assert.True(t, requestCase.CloseConnection)
-	assert.Equal(t, tracecheck.ModeW3C, expectationFor(cfg, requestCase).Mode)
-	assert.NotEmpty(t, requestCase.W3CTraceID)
-	assert.NotEmpty(t, requestCase.W3CParentSpanID)
+	for _, test := range tests {
+		t.Run(test.scenario, func(t *testing.T) {
+			cfg := config{scenario: test.scenario, seed: 42}
+			requests, err := makeRequests(cfg)
+			require.NoError(t, err)
+			require.Len(t, requests, 1)
 
-	request, err := newHTTPRequest(
-		context.Background(),
-		config{baseURL: "https://example.test", scenario: "primary-w3c-stale"},
-		requestCase,
-	)
-	require.NoError(t, err)
-	assert.Empty(t, request.URL.Query().Get("bridge_diagnostics"))
+			requestCase := requests[0]
+			assert.Equal(t, "stale", requestCase.ExpectedJavaStatus)
+			assert.Equal(t, test.w3cCase, requestCase.W3CCase)
+			assert.Equal(t, "01", requestCase.W3CTraceFlags)
+			assert.True(t, requestCase.CloseConnection)
+			assert.Equal(t, tracecheck.ModeW3C, expectationFor(cfg, requestCase).Mode)
+			assert.NotEmpty(t, requestCase.W3CTraceID)
+			assert.NotEmpty(t, requestCase.W3CParentSpanID)
 
-	_, err = makeRequests(config{scenario: "primary-w3c-stale", requestCount: 2, seed: 42})
-	require.ErrorContains(t, err, "requires exactly one request")
+			request, err := newHTTPRequest(
+				context.Background(),
+				config{baseURL: "https://example.test", scenario: test.scenario},
+				requestCase,
+			)
+			require.NoError(t, err)
+			assert.True(t, requestCase.BridgeDiagnostics)
+			assert.Equal(t, "1", request.URL.Query().Get("bridge_diagnostics"))
+
+			requestCase.BridgeDiagnostics = false
+			request, err = newHTTPRequest(
+				context.Background(),
+				config{baseURL: "https://example.test", scenario: test.scenario},
+				requestCase,
+			)
+			require.NoError(t, err)
+			assert.Empty(t, request.URL.Query().Get("bridge_diagnostics"))
+
+			_, err = makeRequests(config{scenario: test.scenario, requestCount: 2, seed: 42})
+			require.ErrorContains(t, err, "requires exactly one request")
+		})
+	}
 }
 
 func TestPrimaryW3CFaultRequestUsesW3CPrecedenceAndDiagnostics(t *testing.T) {
@@ -701,7 +723,32 @@ func TestFaultDiagnosticsAreExposedOnlyAtTheTopLevel(t *testing.T) {
 	}
 }
 
-func TestNonFaultRequestCannotOptInToBridgeDiagnostics(t *testing.T) {
+func TestStaleDiagnosticsAreExposedOnlyAtTheTopLevel(t *testing.T) {
+	snapshot := javaDiagnosticsSnapshot(t, 0)
+	for _, scenario := range []string{"primary-w3c-stale", "unix-w3c-stale"} {
+		t.Run(scenario, func(t *testing.T) {
+			var output bytes.Buffer
+			require.NoError(t, encodeRunResult(&output, &runResult{
+				Status:               "passed",
+				Scenario:             scenario,
+				JavaDiagnosticsAfter: snapshot,
+				Cases: []caseResult{{
+					Request: requestCase{
+						Marker:            "stale",
+						BridgeDiagnostics: true,
+					},
+					Response: backendResponse{BridgeDiagnostics: snapshot},
+				}},
+			}))
+
+			assert.Contains(t, output.String(), `"java_diagnostics_after": "`+snapshot+`"`)
+			assert.Equal(t, 1, strings.Count(output.String(), snapshot))
+			assert.NotContains(t, output.String(), `"bridge_diagnostics"`)
+		})
+	}
+}
+
+func TestNonDiagnosticRequestCannotOptInToBridgeDiagnostics(t *testing.T) {
 	request, err := newHTTPRequest(
 		context.Background(),
 		config{baseURL: "https://example.test", scenario: "basic"},

@@ -145,12 +145,15 @@ or credential topology; do not mark it pass.
   removed before normal-stack recovery. It is not a production transport or
   fault-injection interface.
 - Java diagnostics are requested directly from the verified Jetty TLS endpoint
-  before and after each ordinary bridge scenario. The runner stores snapshots
-  separately from OBI metrics and accounts for exactly one self-observed
-  missing lookup; another missing result fails unless aggregate pressure trace
-  evidence reports a corresponding explicit root and the bridge reason counts
-  conserve the same request total. Diagnostics do not carry request markers,
-  so this is an aggregate reconciliation. The serial fault-injection suite
+  before and after each ordinary non-stale bridge scenario. The runner stores
+  snapshots separately from OBI metrics and accounts for exactly one
+  post-snapshot `missing` self-lookup. The forced `1ns` stale controls instead
+  use in-band snapshots on the existing bridge-boundary health request and the
+  marked workload response, so their exact `stale` delta has no standalone
+  diagnostics probe. Another result of the applicable status fails unless
+  aggregate pressure trace evidence reports a corresponding explicit root and
+  the bridge reason counts conserve the same request total. Diagnostics do not
+  carry request markers, so this is an aggregate reconciliation. The serial fault-injection suite
   instead opts in to the same fixed, sanitized snapshot on the existing
   pre-control health response and each terminal scenario response after Java
   extraction. Exact chained deltas attribute the normalized Java fault status

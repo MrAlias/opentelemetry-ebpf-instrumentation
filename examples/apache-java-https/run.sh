@@ -183,7 +183,13 @@ PRIMARY_SECURITY_JAVA_CONTAINER=""
 PRIMARY_SECURITY_NAMESPACE_PID=""
 PRIMARY_SECURITY_SIBLING_CONTAINER=""
 UNIX_SECURITY_DIRECTORY_RELAXED=false
-UNIX_SECURITY_RACE_CONTAINER=""
+UNIX_SECURITY_SIBLING_CONTAINER=""
+UNIX_SECURITY_ENDPOINT_CONTAINER=""
+UNIX_SECURITY_EXEC_PID=""
+UNIX_SECURITY_HOST_PROBE=""
+UNIX_SECURITY_JAVA_CONTAINER=""
+UNIX_SECURITY_NAMESPACE_PID=""
+UNIX_SECURITY_PROBE_DIRECTORY=""
 PRIMARY_FAULT_STACK_ACTIVE=false
 
 declare -a COMPOSE=(docker compose --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE")
@@ -728,9 +734,39 @@ cleanup_security_processes() {
   if [[ -n "$PRIMARY_SECURITY_HOST_PROBE" ]]; then
     rm -f -- "$PRIMARY_SECURITY_HOST_PROBE" || true
   fi
-  if [[ -n "$UNIX_SECURITY_RACE_CONTAINER" ]]; then
-    run_bounded 10 docker kill "$UNIX_SECURITY_RACE_CONTAINER" \
+  if [[ -n "$UNIX_SECURITY_JAVA_CONTAINER" && \
+    "$UNIX_SECURITY_NAMESPACE_PID" =~ ^[1-9][0-9]*$ ]]; then
+    # Expanded by the container shell, not this process.
+    # shellcheck disable=SC2016
+    run_bounded 10 docker exec "$UNIX_SECURITY_JAVA_CONTAINER" \
+      /bin/sh -ec '
+        if read -r name <"/proc/$1/comm" && [ "$name" = security-probe ]; then
+          kill -TERM "$1" 2>/dev/null || true
+        fi
+      ' sh \
+      "$UNIX_SECURITY_NAMESPACE_PID" >/dev/null 2>&1 || true
+  fi
+  if [[ "$UNIX_SECURITY_EXEC_PID" =~ ^[1-9][0-9]*$ ]]; then
+    if kill -0 "$UNIX_SECURITY_EXEC_PID" 2>/dev/null; then
+      kill -TERM "$UNIX_SECURITY_EXEC_PID" 2>/dev/null || true
+    fi
+    wait "$UNIX_SECURITY_EXEC_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$UNIX_SECURITY_SIBLING_CONTAINER" ]]; then
+    run_bounded 10 docker kill "$UNIX_SECURITY_SIBLING_CONTAINER" \
       >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$UNIX_SECURITY_ENDPOINT_CONTAINER" ]]; then
+    run_bounded 10 docker kill "$UNIX_SECURITY_ENDPOINT_CONTAINER" \
+      >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$UNIX_SECURITY_JAVA_CONTAINER" && \
+    "$UNIX_SECURITY_PROBE_DIRECTORY" =~ ^/tmp/obi-unix-security\.[[:alnum:]]{6,}$ ]]; then
+    run_bounded 10 docker exec "$UNIX_SECURITY_JAVA_CONTAINER" \
+      rm -rf -- "$UNIX_SECURITY_PROBE_DIRECTORY" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$UNIX_SECURITY_HOST_PROBE" ]]; then
+    rm -f -- "$UNIX_SECURITY_HOST_PROBE" || true
   fi
   if [[ "$UNIX_SECURITY_DIRECTORY_RELAXED" == "true" ]]; then
     run_bounded 10 "${COMPOSE[@]}" exec --no-TTY java-backend \
@@ -743,7 +779,13 @@ cleanup_security_processes() {
   PRIMARY_SECURITY_NAMESPACE_PID=""
   PRIMARY_SECURITY_SIBLING_CONTAINER=""
   UNIX_SECURITY_DIRECTORY_RELAXED=false
-  UNIX_SECURITY_RACE_CONTAINER=""
+  UNIX_SECURITY_SIBLING_CONTAINER=""
+  UNIX_SECURITY_ENDPOINT_CONTAINER=""
+  UNIX_SECURITY_EXEC_PID=""
+  UNIX_SECURITY_HOST_PROBE=""
+  UNIX_SECURITY_JAVA_CONTAINER=""
+  UNIX_SECURITY_NAMESPACE_PID=""
+  UNIX_SECURITY_PROBE_DIRECTORY=""
 }
 
 cleanup() {
@@ -2646,6 +2688,22 @@ wait_for_primary_security_metrics_quiescent() {
     wait_status=$?
   fi
   ALLOW_PRIMARY_SECURITY_METRICS="$previous_policy"
+  return "$wait_status"
+}
+
+wait_for_unix_security_metrics_quiescent() {
+  local -r output="$1"
+  local -r description="$2"
+  local -r previous_policy="$ALLOW_UNIX_SECURITY_METRICS"
+  local wait_status=0
+
+  ALLOW_UNIX_SECURITY_METRICS=true
+  if wait_for_bridge_metrics_quiescent 0 0 "$output" "$description"; then
+    wait_status=0
+  else
+    wait_status=$?
+  fi
+  ALLOW_UNIX_SECURITY_METRICS="$previous_policy"
   return "$wait_status"
 }
 
@@ -6137,8 +6195,8 @@ background_process_is_running() {
   local state=""
 
   [[ "$process_pid" =~ ^[1-9][0-9]*$ && -r "/proc/$process_pid/stat" ]] || return 1
-  state="$(sed -E 's/^[0-9]+ \(.*\) ([A-Z]) .*/\1/' "/proc/$process_pid/stat")"
-  [[ "$state" != "Z" ]]
+  state="$(sed -E 's/^[0-9]+ \(.*\) ([A-Z]) .*/\1/' "/proc/$process_pid/stat" 2>/dev/null)" || return 1
+  [[ "$state" =~ ^[A-Z]$ && "$state" != "Z" ]]
 }
 
 wait_for_background_log() {
@@ -6238,6 +6296,192 @@ assert_primary_security_cgroup_identity() {
     }
   ' "$probe_status" || {
     log_error "primary security probe did not run with the unprivileged 65534:65534 identity"
+    return 1
+  }
+}
+
+wait_for_unix_security_namespace_pid() {
+  local -r java_container="$1"
+  local -r pid_path="$2"
+  local candidate=""
+  local -i started_at="$SECONDS"
+
+  [[ "$pid_path" =~ ^/tmp/obi-unix-security\.[[:alnum:]]{6,}/security-probe\.pid$ ]] || {
+    log_error "refusing an unsafe Unix security probe PID path"
+    return 1
+  }
+  while ((SECONDS - started_at < READINESS_TIMEOUT_SECONDS)); do
+    candidate="$(run_bounded 5 docker exec "$java_container" \
+      cat -- "$pid_path" 2>/dev/null || true)"
+    if [[ "$candidate" =~ ^[1-9][0-9]*$ ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+    sleep 0.1
+  done
+  log_error "timed out waiting for the same-cgroup Unix security probe PID"
+  return 1
+}
+
+assert_unix_security_cgroup_identity() {
+  local -r java_cgroup="$1"
+  local -r probe_cgroup="$2"
+  local -r probe_status="$3"
+
+  [[ -n "$java_cgroup" && -n "$probe_cgroup" && -n "$probe_status" ]] || {
+    log_error "Unix same-cgroup security identity evidence was empty"
+    return 1
+  }
+  [[ "$java_cgroup" == "$probe_cgroup" ]] || {
+    log_error "Unix security probe did not share the Java container cgroup"
+    return 1
+  }
+  awk '
+    $1 == "Uid:" {
+      found_uid = 1
+      for (field = 2; field <= 5; field++) {
+        if ($field != 65534) {
+          failed = 1
+        }
+      }
+    }
+    $1 == "Gid:" {
+      found_gid = 1
+      for (field = 2; field <= 5; field++) {
+        if ($field != 65534) {
+          failed = 1
+        }
+      }
+    }
+    $1 == "CapEff:" {
+      found_cap_eff = 1
+      if (NF != 2 || $2 != "0000000000000000") {
+        failed = 1
+      }
+    }
+    END {
+      exit failed || !found_uid || !found_gid || !found_cap_eff ? 1 : 0
+    }
+  ' <<<"$probe_status" || {
+    log_error "Unix security probe did not run as capability-free 65534:65534"
+    return 1
+  }
+}
+
+assert_unix_sibling_security_topology() {
+  local -r java_container="$1"
+  local -r sibling_container="$2"
+  local -r output="$3"
+  local user=""
+  local network_mode=""
+  local pid_mode=""
+  local java_pid_mode=""
+  local read_only_rootfs=""
+  local cap_drop=""
+  local security_options=""
+  local socket_mount_writable=""
+  local java_host_pid=""
+  local sibling_host_pid=""
+  local java_cgroup=""
+  local sibling_cgroup=""
+  local java_pid_namespace=""
+  local sibling_pid_namespace=""
+  local pid_namespace_evidence=""
+
+  user="$(run_bounded 10 docker inspect --format '{{.Config.User}}' \
+    "$sibling_container")" || return $?
+  network_mode="$(run_bounded 10 docker inspect --format '{{.HostConfig.NetworkMode}}' \
+    "$sibling_container")" || return $?
+  pid_mode="$(run_bounded 10 docker inspect --format '{{.HostConfig.PidMode}}' \
+    "$sibling_container")" || return $?
+  java_pid_mode="$(run_bounded 10 docker inspect --format '{{.HostConfig.PidMode}}' \
+    "$java_container")" || return $?
+  read_only_rootfs="$(run_bounded 10 docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' \
+    "$sibling_container")" || return $?
+  cap_drop="$(run_bounded 10 docker inspect --format '{{json .HostConfig.CapDrop}}' \
+    "$sibling_container")" || return $?
+  security_options="$(run_bounded 10 docker inspect \
+    --format '{{json .HostConfig.SecurityOpt}}' "$sibling_container")" || return $?
+  socket_mount_writable="$(run_bounded 10 docker inspect \
+    --format '{{range .Mounts}}{{if eq .Destination "/var/run/obi"}}{{.RW}}{{end}}{{end}}' \
+    "$sibling_container")" || return $?
+  [[ "$user" == "65534:65534" && "$network_mode" == "none" && -z "$pid_mode" && \
+    -z "$java_pid_mode" && \
+    "$read_only_rootfs" == "true" && "$cap_drop" == *'"ALL"'* && \
+    "$security_options" == *'"no-new-privileges:true"'* && \
+    "$socket_mount_writable" == "false" ]] || {
+    log_error "Unix sibling security probe did not preserve its least-privilege topology"
+    return 1
+  }
+
+  java_host_pid="$(run_bounded 10 docker inspect --format '{{.State.Pid}}' \
+    "$java_container")" || return $?
+  sibling_host_pid="$(run_bounded 10 docker inspect --format '{{.State.Pid}}' \
+    "$sibling_container")" || return $?
+  if [[ ! "$java_host_pid" =~ ^[1-9][0-9]*$ || \
+    ! "$sibling_host_pid" =~ ^[1-9][0-9]*$ || \
+    ! -r "/proc/$java_host_pid/cgroup" || ! -r "/proc/$sibling_host_pid/cgroup" ]]; then
+    log_error "could not resolve host topology for the Java and Unix sibling containers"
+    return 1
+  fi
+  java_cgroup="$(<"/proc/$java_host_pid/cgroup")"
+  sibling_cgroup="$(<"/proc/$sibling_host_pid/cgroup")"
+  [[ "$java_cgroup" != "$sibling_cgroup" ]] || {
+    log_error "Unix sibling security probe unexpectedly shared the Java container cgroup"
+    return 1
+  }
+  java_pid_namespace="$(readlink "/proc/$java_host_pid/ns/pid" 2>/dev/null || true)"
+  sibling_pid_namespace="$(readlink "/proc/$sibling_host_pid/ns/pid" 2>/dev/null || true)"
+  if [[ -n "$java_pid_namespace" || -n "$sibling_pid_namespace" ]]; then
+    [[ -n "$java_pid_namespace" && -n "$sibling_pid_namespace" && \
+      "$java_pid_namespace" != "$sibling_pid_namespace" ]] || {
+      log_error "Unix sibling security probe did not remain in a distinct host-observed PID namespace"
+      return 1
+    }
+    pid_namespace_evidence="host-proc"
+  else
+    # Docker's empty PidMode is the engine's private-namespace contract. Some
+    # hardened hosts intentionally deny host-side /proc/<pid>/ns dereferences.
+    pid_namespace_evidence="docker-private"
+  fi
+
+  {
+    printf 'peer_user=65534:65534\n'
+    printf 'network_mode=none\n'
+    printf 'pid_namespace_shared=false\n'
+    printf 'pid_namespace_evidence=%s\n' "$pid_namespace_evidence"
+    printf 'cgroup_match=false\n'
+    printf 'readonly_rootfs=true\n'
+    printf 'cap_drop_all=true\n'
+    printf 'no_new_privileges=true\n'
+    printf 'socket_mount_writable=false\n'
+  } >"$output"
+}
+
+assert_unix_abuse_race_output() {
+  local -r output="$1"
+  local result=""
+
+  result="$(grep -E '^\{"status":' "$output" || true)"
+  [[ "$(wc -l <<<"$result")" == "1" ]] || {
+    log_error "Unix security probe did not emit exactly one result record"
+    return 1
+  }
+  jq -e '
+    .status == "passed" and .mode == "abuse-race" and
+    (.attempts | type == "number" and . >= 1) and
+    ([.cases[] | select(.name == "peer-identity" and .outcome == "unauthorized")] | length == 1) and
+    ([.cases[] | select(.name == "forged-identity" and .outcome == "unauthorized")] | length == 1) and
+    ([.cases[] | select(.name == "malformed" and .outcome == "malformed")] | length == 1) and
+    ([.cases[] | select(.name == "truncated" and .outcome == "malformed")] | length == 1) and
+    ([.cases[] | select(.name == "version-mismatch" and .outcome == "version_mismatch")] | length == 1) and
+    ([.cases[] | select(.name == "oversized" and .outcome == "unauthorized")] | length == 1) and
+    ([.cases[] | select(.name == "repeated-frame" and .outcome == "unauthorized")] | length == 1) and
+    ([.cases[] | select(.name == "repeated-unauthorized" and .outcome == "bounded")] | length == 1) and
+    ([.cases[] | select(.name == "high-rate-admission" and .outcome == "overload-and-recovery")] | length == 1) and
+    ([.cases[] | select(.name == "concurrent-repeated-unauthorized" and .outcome == "bounded")] | length == 1)
+  ' <<<"$result" >/dev/null || {
+    log_error "Unix abuse-race probe did not retain every bounded denial case"
     return 1
   }
 }
@@ -6597,17 +6841,236 @@ run_unix_permissive_directory_control() {
   BRIDGE_RUNNING=true
 }
 
+run_unix_sibling_security_control() {
+  local -r java_container="$1"
+  local -r output="$RESULT_DIR/security-unix-sibling.log"
+  local -r topology="$RESULT_DIR/security-unix-sibling-topology.txt"
+  local -r before_metrics="$RESULT_DIR/metrics-security-unix-sibling-before.prom"
+  local -r after_metrics="$RESULT_DIR/metrics-security-unix-sibling-complete.prom"
+  local -r metric_delta="$RESULT_DIR/metrics-security-unix-sibling.delta"
+  local host_probe=""
+  local probe_exit=""
+  local running=""
+  local run_number=0
+  local phase_label=""
+
+  if ! wait_for_unix_security_metrics_quiescent \
+    "$before_metrics" \
+    "Unix sibling security probe baseline"; then
+    return 1
+  fi
+  log_info "starting an isolated non-root Unix abuse race"
+  run_bounded 60 \
+    "${COMPOSE[@]}" up --detach --no-deps --force-recreate \
+    security-unix-sibling-probe || return $?
+  wait_for_log \
+    security-unix-sibling-probe \
+    "security probe abuse race ready" \
+    "Unix sibling abuse race barrier" || return $?
+  UNIX_SECURITY_SIBLING_CONTAINER="$(run_bounded 10 \
+    "${COMPOSE[@]}" ps --all --quiet security-unix-sibling-probe)"
+  [[ -n "$UNIX_SECURITY_SIBLING_CONTAINER" ]] || {
+    log_error "could not resolve the Unix sibling abuse-race container"
+    return 1
+  }
+  assert_unix_sibling_security_topology \
+    "$java_container" "$UNIX_SECURITY_SIBLING_CONTAINER" "$topology" || return $?
+
+  host_probe="$(mktemp "$RESULT_DIR/.security-unix-probe.XXXXXX")" || return $?
+  UNIX_SECURITY_HOST_PROBE="$host_probe"
+  run_bounded 15 docker cp \
+    "$UNIX_SECURITY_SIBLING_CONTAINER:/security-probe" "$host_probe" || return $?
+
+  (
+    SCENARIO_VARIANT="security-unix-sibling-victim"
+    ALLOW_UNIX_SECURITY_METRICS=true
+    run_scenario concurrency false metrics
+  ) || return $?
+  for ((run_number = 1; run_number <= REPEAT_COUNT; run_number++)); do
+    phase_label="concurrency-security-unix-sibling-victim"
+    if ((REPEAT_COUNT > 1)); then
+      printf -v phase_label '%s-run-%02d' "$phase_label" "$run_number"
+    fi
+    assert_security_metric_delta \
+      "$RESULT_DIR/phases/$phase_label-after/obi-metrics.delta" \
+      take unauthorized unix 1 || return $?
+  done
+
+  running="$(run_bounded 10 docker inspect --format '{{.State.Running}}' \
+    "$UNIX_SECURITY_SIBLING_CONTAINER")" || return $?
+  [[ "$running" == "true" ]] || {
+    log_error "Unix sibling security probe exited before release"
+    return 1
+  }
+  run_bounded 15 docker kill --signal SIGUSR1 \
+    "$UNIX_SECURITY_SIBLING_CONTAINER" >/dev/null || return $?
+  probe_exit="$(run_bounded 60 docker wait "$UNIX_SECURITY_SIBLING_CONTAINER")" || return $?
+  [[ "$probe_exit" == "0" ]] || {
+    log_error "Unix sibling security probe exited with status $probe_exit"
+    return 1
+  }
+  run_bounded 15 docker logs "$UNIX_SECURITY_SIBLING_CONTAINER" >"$output" || return $?
+  UNIX_SECURITY_SIBLING_CONTAINER=""
+  assert_unix_abuse_race_output "$output" || return $?
+
+  if ! wait_for_unix_security_metrics_quiescent \
+    "$after_metrics" \
+    "Unix sibling security probe completion"; then
+    return 1
+  fi
+  write_metrics_delta "$before_metrics" "$after_metrics" "$metric_delta" || return $?
+  assert_security_metric_delta "$metric_delta" take unauthorized unix 1
+}
+
+run_unix_same_cgroup_security_control() {
+  local -r java_container="$1"
+  local -r output="$RESULT_DIR/security-unix-same-cgroup.log"
+  local -r identity="$RESULT_DIR/security-unix-same-cgroup-identity.txt"
+  local -r before_metrics="$RESULT_DIR/metrics-security-unix-same-cgroup-before.prom"
+  local -r after_metrics="$RESULT_DIR/metrics-security-unix-same-cgroup-complete.prom"
+  local -r metric_delta="$RESULT_DIR/metrics-security-unix-same-cgroup.delta"
+  local probe_directory=""
+  local probe_path=""
+  local pid_path=""
+  local java_cgroup=""
+  local probe_cgroup=""
+  local probe_status=""
+  local probe_exit=0
+  local run_number=0
+  local phase_label=""
+
+  [[ -n "$UNIX_SECURITY_HOST_PROBE" && -f "$UNIX_SECURITY_HOST_PROBE" ]] || {
+    log_error "the Unix same-cgroup control requires the retained sibling probe binary"
+    return 1
+  }
+  if ! wait_for_unix_security_metrics_quiescent \
+    "$before_metrics" \
+    "Unix same-cgroup security probe baseline"; then
+    return 1
+  fi
+
+  UNIX_SECURITY_JAVA_CONTAINER="$java_container"
+  probe_directory="$(run_bounded 10 docker exec "$java_container" /bin/sh -ec '
+    set -eu
+    umask 077
+    directory="$(mktemp -d /tmp/obi-unix-security.XXXXXX)"
+    chown 65534:65534 "$directory"
+    printf "%s\\n" "$directory"
+  ')" || return $?
+  [[ "$probe_directory" =~ ^/tmp/obi-unix-security\.[[:alnum:]]{6,}$ ]] || {
+    log_error "Java container returned an unsafe Unix security probe directory"
+    return 1
+  }
+  UNIX_SECURITY_PROBE_DIRECTORY="$probe_directory"
+  probe_path="$probe_directory/security-probe"
+  pid_path="$probe_directory/security-probe.pid"
+  run_bounded 15 docker cp "$UNIX_SECURITY_HOST_PROBE" \
+    "$java_container:$probe_path" || return $?
+  rm -f -- "$UNIX_SECURITY_HOST_PROBE" || return $?
+  UNIX_SECURITY_HOST_PROBE=""
+  run_bounded 10 docker exec "$java_container" chmod 0755 "$probe_path" || return $?
+
+  : >"$output"
+  docker exec --user 65534:65534 "$java_container" /bin/sh -ec '
+    umask 077
+    printf "%s\n" "$$" >"$1"
+    exec "$2" --socket "$3" --mode abuse-race --timeout "$4"
+  ' sh "$pid_path" "$probe_path" /var/run/obi/java-remote-parent.sock \
+    "$SECURITY_PROBE_TIMEOUT" >"$output" 2>&1 &
+  UNIX_SECURITY_EXEC_PID=$!
+  wait_for_background_log \
+    "$UNIX_SECURITY_EXEC_PID" \
+    "$output" \
+    "security probe abuse race ready" \
+    "same-cgroup Unix abuse race" || return $?
+  UNIX_SECURITY_NAMESPACE_PID="$(wait_for_unix_security_namespace_pid \
+    "$java_container" "$pid_path")" || return $?
+
+  java_cgroup="$(run_bounded 10 docker exec "$java_container" cat /proc/1/cgroup)" || return $?
+  probe_cgroup="$(run_bounded 10 docker exec "$java_container" \
+    cat "/proc/$UNIX_SECURITY_NAMESPACE_PID/cgroup")" || return $?
+  probe_status="$(run_bounded 10 docker exec "$java_container" \
+    cat "/proc/$UNIX_SECURITY_NAMESPACE_PID/status")" || return $?
+  assert_unix_security_cgroup_identity \
+    "$java_cgroup" "$probe_cgroup" "$probe_status" || return $?
+  {
+    printf 'peer_user=65534:65534\n'
+    printf 'cgroup_match=true\n'
+    printf 'capability_free=true\n'
+    awk '/^(Uid|Gid|CapEff):/ { print }' <<<"$probe_status"
+  } >"$identity"
+
+  (
+    SCENARIO_VARIANT="security-unix-same-cgroup-victim"
+    ALLOW_UNIX_SECURITY_METRICS=true
+    run_scenario concurrency false metrics
+  ) || return $?
+  for ((run_number = 1; run_number <= REPEAT_COUNT; run_number++)); do
+    phase_label="concurrency-security-unix-same-cgroup-victim"
+    if ((REPEAT_COUNT > 1)); then
+      printf -v phase_label '%s-run-%02d' "$phase_label" "$run_number"
+    fi
+    assert_security_metric_delta \
+      "$RESULT_DIR/phases/$phase_label-after/obi-metrics.delta" \
+      take unauthorized unix 1 || return $?
+  done
+
+  background_process_is_running "$UNIX_SECURITY_EXEC_PID" || {
+    log_error "Unix same-cgroup security probe exited before release"
+    return 1
+  }
+  # Expanded by the container shell, not this process.
+  # shellcheck disable=SC2016
+  run_bounded 10 docker exec "$java_container" /bin/sh -ec '
+    read -r name <"/proc/$1/comm"
+    [ "$name" = security-probe ]
+    kill -USR1 "$1"
+  ' sh "$UNIX_SECURITY_NAMESPACE_PID" || return $?
+  if wait_for_background_process "$UNIX_SECURITY_EXEC_PID" 15; then
+    probe_exit=0
+  else
+    probe_exit=$?
+  fi
+  [[ "$probe_exit" == "0" ]] || {
+    log_error "Unix same-cgroup security probe exited with status $probe_exit"
+    return 1
+  }
+  UNIX_SECURITY_EXEC_PID=""
+  UNIX_SECURITY_NAMESPACE_PID=""
+  assert_unix_abuse_race_output "$output" || return $?
+
+  run_bounded 10 docker exec "$java_container" \
+    rm -rf -- "$probe_directory" || return $?
+  UNIX_SECURITY_PROBE_DIRECTORY=""
+  if ! wait_for_unix_security_metrics_quiescent \
+    "$after_metrics" \
+    "Unix same-cgroup security probe completion"; then
+    return 1
+  fi
+  write_metrics_delta "$before_metrics" "$after_metrics" "$metric_delta" || return $?
+  assert_security_metric_delta "$metric_delta" take unauthorized unix 1 || return $?
+  UNIX_SECURITY_JAVA_CONTAINER=""
+}
+
+run_unix_peer_security_controls() {
+  local java_container=""
+
+  java_container="$(run_bounded 10 "${COMPOSE[@]}" ps --quiet java-backend)" || return $?
+  [[ -n "$java_container" ]] || {
+    log_error "could not resolve the Java backend container for Unix security controls"
+    return 1
+  }
+  run_unix_sibling_security_control "$java_container" || return $?
+  run_unix_same_cgroup_security_control "$java_container"
+}
+
 run_unix_security_control() {
-  local -r abuse_output="$RESULT_DIR/security-abuse.json"
   local -r endpoint_output="$RESULT_DIR/security-endpoint.log"
   local -r security_logs="$RESULT_DIR/security-sanitized-logs.txt"
   local security_since=""
   local restart_since=""
-  local probe_container=""
   local probe_exit=""
   local canary_status=0
-  local run_number=0
-  local phase_label=""
 
   [[ "$TRANSPORT" == "unix" && "$SELECTED_TRANSPORT" == "unix" ]] || {
     log_error "the security control requires the forced Unix transport"
@@ -6619,55 +7082,7 @@ run_unix_security_control() {
   assert_sanitized_java_diagnostics \
     "$RESULT_DIR/phases/security-before/java-diagnostics.txt"
 
-  SECURITY_PROBE_MODE="abuse-race"
-  export SECURITY_PROBE_MODE
-  log_info "starting bounded Unix abuse while legitimate exact-parent traffic remains active"
-  run_bounded 60 \
-    "${COMPOSE[@]}" up --detach --no-deps --force-recreate security-probe
-  wait_for_log \
-    security-probe \
-    "security probe abuse race ready" \
-    "Unix abuse race barrier"
-  UNIX_SECURITY_RACE_CONTAINER="$(run_bounded 10 \
-    "${COMPOSE[@]}" ps --all --quiet security-probe)"
-  [[ -n "$UNIX_SECURITY_RACE_CONTAINER" ]] || {
-    log_error "could not resolve the Unix abuse-race container"
-    return 1
-  }
-
-  (
-    SCENARIO_VARIANT="security-unix-victim"
-    ALLOW_UNIX_SECURITY_METRICS=true
-    run_scenario concurrency false metrics
-  )
-
-  for ((run_number = 1; run_number <= REPEAT_COUNT; run_number++)); do
-    phase_label="concurrency-security-unix-victim"
-    if ((REPEAT_COUNT > 1)); then
-      printf -v phase_label '%s-run-%02d' "$phase_label" "$run_number"
-    fi
-    assert_security_metric_delta \
-      "$RESULT_DIR/phases/$phase_label-after/obi-metrics.delta" \
-      take unauthorized unix 1
-  done
-
-  run_bounded 15 docker kill --signal SIGUSR1 \
-    "$UNIX_SECURITY_RACE_CONTAINER" >/dev/null
-  probe_exit="$(run_bounded 60 docker wait "$UNIX_SECURITY_RACE_CONTAINER")"
-  [[ "$probe_exit" == "0" ]] || {
-    log_error "Unix abuse-race probe exited with status $probe_exit"
-    return 1
-  }
-  run_bounded 15 \
-    "${COMPOSE[@]}" logs --no-color security-probe >"$abuse_output"
-  UNIX_SECURITY_RACE_CONTAINER=""
-  if ! grep -Fq '"status":"passed","mode":"abuse-race"' "$abuse_output" || \
-    ! grep -Eq '"attempts":[1-9][0-9]*' "$abuse_output" || \
-    ! grep -Fq '"name":"concurrent-repeated-unauthorized","outcome":"bounded"' \
-      "$abuse_output"; then
-    log_error "Unix abuse-race probe did not emit explicit bounded pass evidence"
-    return 1
-  fi
+  run_unix_peer_security_controls || return $?
 
   SECURITY_PROBE_MODE="endpoint"
   export SECURITY_PROBE_MODE
@@ -6678,8 +7093,9 @@ run_unix_security_control() {
     security-probe \
     "security probe replacement ready" \
     "security endpoint replacement barrier"
-  probe_container="$(run_bounded 10 "${COMPOSE[@]}" ps --all --quiet security-probe)"
-  [[ -n "$probe_container" ]] || {
+  UNIX_SECURITY_ENDPOINT_CONTAINER="$(run_bounded 10 \
+    "${COMPOSE[@]}" ps --all --quiet security-probe)"
+  [[ -n "$UNIX_SECURITY_ENDPOINT_CONTAINER" ]] || {
     log_error "could not resolve the security probe container"
     return 1
   }
@@ -6695,14 +7111,14 @@ run_unix_security_control() {
     "$restart_since" || return $?
   run_bounded 15 \
     "${COMPOSE[@]}" kill --signal SIGUSR1 security-probe || return $?
-  probe_exit="$(run_bounded 60 docker wait "$probe_container")"
+  probe_exit="$(run_bounded 60 docker wait "$UNIX_SECURITY_ENDPOINT_CONTAINER")"
   [[ "$probe_exit" == "0" ]] || {
     log_error "security endpoint probe exited with status $probe_exit"
     return 1
   }
-  run_bounded 15 \
-    "${COMPOSE[@]}" logs --no-color security-probe \
+  run_bounded 15 docker logs "$UNIX_SECURITY_ENDPOINT_CONTAINER" \
     >"$endpoint_output" || return $?
+  UNIX_SECURITY_ENDPOINT_CONTAINER=""
   grep -Fq '"status":"passed","mode":"endpoint"' "$endpoint_output" || {
     log_error "security endpoint probe did not emit explicit pass evidence"
     return 1
@@ -6733,9 +7149,11 @@ run_unix_security_control() {
     "$RESULT_DIR/phases/security-after/java-diagnostics.txt"
   run_bounded 15 \
     "${COMPOSE[@]}" logs --no-color --since "$security_since" \
-      obi java-backend security-probe >"$security_logs"
+      obi java-backend security-probe security-unix-sibling-probe >"$security_logs"
   if grep -Fq 'OBI_SECURITY_PROBE_PAYLOAD_CANARY' \
-    "$abuse_output" "$endpoint_output" "$security_logs" \
+    "$RESULT_DIR/security-unix-sibling.log" \
+    "$RESULT_DIR/security-unix-same-cgroup.log" \
+    "$endpoint_output" "$security_logs" \
     "$RESULT_DIR/phases/security-before/java-diagnostics.txt" \
     "$RESULT_DIR/phases/security-after/java-diagnostics.txt"; then
     log_error "security diagnostics disclosed the probe payload canary"
@@ -6754,8 +7172,11 @@ run_unix_security_control() {
     SCENARIO_VARIANT="security-recovery"
     run_scenario basic false
   )
-  printf '{"status":"passed","scenario":"security","mode":"unix","abuse_race":"%s","concurrent_victim":"passed","endpoint":"%s","permissive_directory":"refused","post_abuse_recovery":"passed","primary_only_cases":"not_applicable"}\n' \
-    "$(basename -- "$abuse_output")" \
+  printf '{"status":"passed","scenario":"security","mode":"unix","sibling_probe":"%s","sibling_topology":"%s","same_cgroup_probe":"%s","same_cgroup_identity":"%s","sibling_cgroup_match":false,"same_cgroup_match":true,"peer_uid_gid":"65534:65534","concurrent_sibling_victim":"passed","concurrent_same_cgroup_victim":"passed","endpoint":"%s","permissive_directory":"refused","post_abuse_recovery":"passed","primary_only_cases":"not_applicable"}\n' \
+    "$(basename -- "$RESULT_DIR/security-unix-sibling.log")" \
+    "$(basename -- "$RESULT_DIR/security-unix-sibling-topology.txt")" \
+    "$(basename -- "$RESULT_DIR/security-unix-same-cgroup.log")" \
+    "$(basename -- "$RESULT_DIR/security-unix-same-cgroup-identity.txt")" \
     "$(basename -- "$endpoint_output")" \
     >"$RESULT_DIR/scenario-security-status.json"
 }

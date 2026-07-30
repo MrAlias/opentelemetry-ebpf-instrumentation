@@ -5156,6 +5156,172 @@ test_unix_security_provider_wait_uses_restart_cursor() {
   }
 }
 
+test_unix_security_quiescence_restores_policy() {
+  (
+    local observed_policy=""
+    local wait_status=0
+
+    ALLOW_UNIX_SECURITY_METRICS=false
+    wait_for_bridge_metrics_quiescent() {
+      observed_policy="$ALLOW_UNIX_SECURITY_METRICS"
+      return 23
+    }
+    if wait_for_unix_security_metrics_quiescent \
+      "$TEST_TMP_DIR/unix-security-settled.prom" "security publication"; then
+      printf 'Unix security quiescence ignored the underlying wait failure\n' >&2
+      return 1
+    else
+      wait_status=$?
+    fi
+    [[ "$wait_status" -eq 23 && "$observed_policy" == "true" && \
+      "$ALLOW_UNIX_SECURITY_METRICS" == "false" ]] || {
+      printf 'Unix security quiescence did not scope and restore its policy\n' >&2
+      return 1
+    }
+  )
+}
+
+test_background_process_polling_handles_proc_race_quietly() {
+  local -r fake_bin="$TEST_TMP_DIR/background-process-fake-bin"
+  local -r fake_sed="$fake_bin/sed"
+  local -r output="$TEST_TMP_DIR/background-process-race.log"
+
+  mkdir -p -- "$fake_bin"
+  cat >"$fake_sed" <<'EOF'
+#!/usr/bin/env bash
+printf 'simulated /proc race\n' >&2
+exit 1
+EOF
+  chmod 0755 "$fake_sed"
+
+  if (
+    PATH="$fake_bin:$PATH"
+    background_process_is_running "$$"
+  ) >"$output" 2>&1; then
+    printf 'background process poll accepted a failed proc read\n' >&2
+    return 1
+  fi
+  [[ ! -s "$output" ]] || {
+    printf 'background process poll leaked a failed proc-read diagnostic\n' >&2
+    return 1
+  }
+}
+
+test_unix_security_identity_requires_same_cgroup_nonroot_capabilityfree() {
+  local -r same_cgroup=$'0::/demo/java\n'
+  local -r sibling_cgroup=$'0::/demo/sibling\n'
+  local -r valid_status=$'Name:\tsecurity-probe\nUid:\t65534\t65534\t65534\t65534\nGid:\t65534\t65534\t65534\t65534\nCapEff:\t0000000000000000\n'
+  local -r root_status=$'Name:\tsecurity-probe\nUid:\t0\t0\t0\t0\nGid:\t65534\t65534\t65534\t65534\nCapEff:\t0000000000000000\n'
+  local -r capability_status=$'Name:\tsecurity-probe\nUid:\t65534\t65534\t65534\t65534\nGid:\t65534\t65534\t65534\t65534\nCapEff:\t0000000000000001\n'
+
+  assert_unix_security_cgroup_identity \
+    "$same_cgroup" "$same_cgroup" "$valid_status"
+  if assert_unix_security_cgroup_identity \
+    "$same_cgroup" "$sibling_cgroup" "$valid_status" >/dev/null 2>&1; then
+    printf 'Unix security identity accepted a sibling cgroup\n' >&2
+    return 1
+  fi
+  if assert_unix_security_cgroup_identity \
+    "$same_cgroup" "$same_cgroup" "$root_status" >/dev/null 2>&1; then
+    printf 'Unix security identity accepted a root peer\n' >&2
+    return 1
+  fi
+  if assert_unix_security_cgroup_identity \
+    "$same_cgroup" "$same_cgroup" "$capability_status" >/dev/null 2>&1; then
+    printf 'Unix security identity accepted an effective capability\n' >&2
+    return 1
+  fi
+}
+
+test_unix_abuse_race_result_requires_every_case() {
+  local -r output="$TEST_TMP_DIR/unix-abuse-race-result.log"
+
+  printf '%s\n' \
+    'security probe abuse race ready' \
+    '{"status":"passed","mode":"abuse-race","attempts":1,"cases":[{"name":"peer-identity","outcome":"unauthorized"},{"name":"forged-identity","outcome":"unauthorized"},{"name":"malformed","outcome":"malformed"},{"name":"truncated","outcome":"malformed"},{"name":"version-mismatch","outcome":"version_mismatch"},{"name":"oversized","outcome":"unauthorized"},{"name":"repeated-frame","outcome":"unauthorized"},{"name":"repeated-unauthorized","outcome":"bounded"},{"name":"high-rate-admission","outcome":"overload-and-recovery"},{"name":"concurrent-repeated-unauthorized","outcome":"bounded"}]}' \
+    >"$output"
+  assert_unix_abuse_race_output "$output"
+  printf '%s\n' \
+    '{"status":"passed","mode":"abuse-race","attempts":1,"cases":[]}' \
+    >"$output"
+  if assert_unix_abuse_race_output "$output" >/dev/null 2>&1; then
+    printf 'Unix abuse-race result accepted an incomplete case set\n' >&2
+    return 1
+  fi
+}
+
+test_unix_security_controls_use_isolated_topology_windows() {
+  local unix_control=""
+  local peer_controls=""
+  local sibling_control=""
+  local same_cgroup_control=""
+  local cleanup_control=""
+  local peer_start_line=""
+  local endpoint_start_line=""
+  local sibling_baseline_line=""
+  local sibling_start_line=""
+  local sibling_release_line=""
+  local sibling_completion_line=""
+  local same_cgroup_baseline_line=""
+  local same_cgroup_start_line=""
+
+  unix_control="$(declare -f run_unix_security_control)"
+  peer_controls="$(declare -f run_unix_peer_security_controls)"
+  sibling_control="$(declare -f run_unix_sibling_security_control)"
+  same_cgroup_control="$(declare -f run_unix_same_cgroup_security_control)"
+  cleanup_control="$(declare -f cleanup_security_processes)"
+
+  peer_start_line="$(awk '/run_unix_peer_security_controls/ { print NR; exit }' \
+    <<<"$unix_control")"
+  endpoint_start_line="$(awk '/SECURITY_PROBE_MODE="endpoint"/ { print NR; exit }' \
+    <<<"$unix_control")"
+  sibling_baseline_line="$(awk '/Unix sibling security probe baseline/ { print NR; exit }' \
+    <<<"$sibling_control")"
+  sibling_start_line="$(awk '/security-unix-sibling-probe/ { print NR; exit }' \
+    <<<"$sibling_control")"
+  sibling_release_line="$(awk '/docker kill --signal SIGUSR1/ { print NR; exit }' \
+    <<<"$sibling_control")"
+  sibling_completion_line="$(awk '/Unix sibling security probe completion/ { print NR; exit }' \
+    <<<"$sibling_control")"
+  same_cgroup_baseline_line="$(awk '/Unix same-cgroup security probe baseline/ { print NR; exit }' \
+    <<<"$same_cgroup_control")"
+  same_cgroup_start_line="$(awk '/docker exec --user 65534:65534/ { print NR; exit }' \
+    <<<"$same_cgroup_control")"
+  [[ "$peer_start_line" =~ ^[1-9][0-9]*$ && \
+    "$endpoint_start_line" =~ ^[1-9][0-9]*$ && \
+    peer_start_line -lt endpoint_start_line && \
+    "$sibling_baseline_line" =~ ^[1-9][0-9]*$ && \
+    "$sibling_start_line" =~ ^[1-9][0-9]*$ && \
+    "$sibling_release_line" =~ ^[1-9][0-9]*$ && \
+    "$sibling_completion_line" =~ ^[1-9][0-9]*$ && \
+    "$same_cgroup_baseline_line" =~ ^[1-9][0-9]*$ && \
+    "$same_cgroup_start_line" =~ ^[1-9][0-9]*$ && \
+    sibling_baseline_line -lt sibling_start_line && \
+    sibling_start_line -lt sibling_release_line && \
+    sibling_release_line -lt sibling_completion_line && \
+    same_cgroup_baseline_line -lt same_cgroup_start_line ]] || {
+    printf 'Unix security controls do not preserve isolated attacker windows\n' >&2
+    return 1
+  }
+  [[ "$peer_controls" == *'run_unix_sibling_security_control "$java_container"'* && \
+    "$peer_controls" == *'run_unix_same_cgroup_security_control "$java_container"'* && \
+    "$sibling_control" == *'security-unix-sibling-probe'* && \
+    "$sibling_control" != *'--force-recreate security-probe'* && \
+    "$sibling_control" == *'assert_unix_sibling_security_topology'* && \
+    "$sibling_control" == *'security-unix-sibling-victim'* && \
+    "$same_cgroup_control" == *'docker exec --user 65534:65534'* && \
+    "$same_cgroup_control" == *'assert_unix_security_cgroup_identity'* && \
+    "$same_cgroup_control" == *'security-unix-same-cgroup-victim'* && \
+    "$same_cgroup_control" == *'assert_unix_abuse_race_output'* && \
+    "$cleanup_control" == *'UNIX_SECURITY_SIBLING_CONTAINER'* && \
+    "$cleanup_control" == *'UNIX_SECURITY_ENDPOINT_CONTAINER'* && \
+    "$cleanup_control" == *'UNIX_SECURITY_PROBE_DIRECTORY'* && \
+    "$cleanup_control" == *'"/proc/$1/comm"'* ]] || {
+    printf 'Unix security controls lost topology, identity, or cleanup fencing\n' >&2
+    return 1
+  }
+}
+
 test_permissive_unix_directory_control_refuses_and_restores() {
   local -r result_dir="$TEST_TMP_DIR/permissive-directory-control"
   local -r observed="$result_dir/observed"
@@ -5377,7 +5543,7 @@ test_unix_endpoint_restart_invalidates_before_stack_mutation() {
     REPEAT_COUNT=1
     SCENARIO_VARIANT=""
     ALLOW_UNIX_SECURITY_METRICS=false
-    UNIX_SECURITY_RACE_CONTAINER=""
+    UNIX_SECURITY_ENDPOINT_CONTAINER=""
     mkdir -p -- "$RESULT_DIR"
     printf 'current\n' >"$RESULT_DIR/java-transport-configuration.txt"
     printf 'retained\n' >"$RESULT_DIR/java-selected-transport-configuration.txt"
@@ -5394,6 +5560,7 @@ test_unix_endpoint_restart_invalidates_before_stack_mutation() {
     capture_java_diagnostics() { return 0; }
     assert_sanitized_java_diagnostics() { return 0; }
     assert_security_metric_delta() { return 0; }
+    run_unix_peer_security_controls() { return 0; }
     wait_for_log() { return 0; }
     run_scenario() { return 0; }
     run_bounded() {
@@ -7062,12 +7229,15 @@ test_scenario_supports_metrics_only_security_evidence() {
 
 test_security_controls_select_metrics_only_evidence() {
   local primary_control=""
-  local unix_control=""
+  local unix_sibling_control=""
+  local unix_same_cgroup_control=""
 
   primary_control="$(declare -f run_primary_security_control)"
-  unix_control="$(declare -f run_unix_security_control)"
+  unix_sibling_control="$(declare -f run_unix_sibling_security_control)"
+  unix_same_cgroup_control="$(declare -f run_unix_same_cgroup_security_control)"
   [[ "$primary_control" == *'run_scenario concurrency false metrics'* &&
-    "$unix_control" == *'run_scenario concurrency false metrics'* ]] || {
+    "$unix_sibling_control" == *'run_scenario concurrency false metrics'* &&
+    "$unix_same_cgroup_control" == *'run_scenario concurrency false metrics'* ]] || {
     printf 'a concurrent security control selected full phase evidence\n' >&2
     return 1
   }
@@ -10799,43 +10969,67 @@ test_demo_java_attach_timeout_is_explicit() {
   ! grep -Fq 'OTEL_EBPF_JAVAAGENT_ATTACH_TIMEOUT:' "$compose_file"
 }
 
+compose_service_block() {
+  local -r compose_file="$1"
+  local -r service="$2"
+
+  awk -v service="$service" '
+    $0 == "  " service ":" { inside = 1 }
+    inside && $0 ~ /^[^[:space:]#][^:]*:[[:space:]]*$/ { exit }
+    inside && $0 ~ /^  [^[:space:]#].*:[[:space:]]*$/ &&
+      $0 != "  " service ":" { exit }
+    inside { print }
+    END { exit inside ? 0 : 1 }
+  ' "$compose_file"
+}
+
 test_unix_security_probe_topology_is_least_privilege() {
   local -r obi_config="$TEST_SCRIPT_DIR/../configs/obi.yaml"
   local -r compose_file="$TEST_SCRIPT_DIR/../docker-compose.yml"
   local sibling_service=""
   local endpoint_service=""
+  local socket_init_service=""
+  local obi_service=""
+  local sibling_volumes=""
+  local endpoint_volumes=""
 
   grep -Fqx '    socket_group_id: 65534' "$obi_config"
-  grep -Fqx '      - chown 0:65534 /var/run/obi && chmod 0750 /var/run/obi' \
-    "$compose_file"
-  grep -Fqx '      OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_GROUP_ID: "65534"' \
-    "$compose_file"
+  socket_init_service="$(compose_service_block "$compose_file" socket-init)"
+  obi_service="$(compose_service_block "$compose_file" obi)"
+  sibling_service="$(compose_service_block "$compose_file" security-unix-sibling-probe)"
+  endpoint_service="$(compose_service_block "$compose_file" security-probe)"
+  sibling_volumes="$(awk '
+    $0 == "    volumes:" { inside = 1; next }
+    inside && $0 ~ /^    [^[:space:]#].*:[[:space:]]*$/ { exit }
+    inside && $0 ~ /^      - / { print }
+  ' <<<"$sibling_service")"
+  endpoint_volumes="$(awk '
+    $0 == "    volumes:" { inside = 1; next }
+    inside && $0 ~ /^    [^[:space:]#].*:[[:space:]]*$/ { exit }
+    inside && $0 ~ /^      - / { print }
+  ' <<<"$endpoint_service")"
 
-  sibling_service="$(awk '
-    $0 == "  security-unix-sibling-probe:" { inside = 1 }
-    inside && $0 ~ /^  [[:alnum:]_-]+:$/ &&
-      $0 != "  security-unix-sibling-probe:" { exit }
-    inside { print }
-  ' "$compose_file")"
-  endpoint_service="$(awk '
-    $0 == "  security-probe:" { inside = 1 }
-    inside && $0 ~ /^  [[:alnum:]_-]+:$/ && $0 != "  security-probe:" { exit }
-    inside { print }
-  ' "$compose_file")"
-
+  [[ "$socket_init_service" == *'chown 0:65534 /var/run/obi && chmod 0750 /var/run/obi'* &&
+    "$obi_service" == *'OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_GROUP_ID: "65534"'* ]] || {
+    printf 'Unix socket group is not owned consistently by socket-init and OBI\n' >&2
+    return 1
+  }
   [[ "$sibling_service" == *'network_mode: none'* &&
     "$sibling_service" == *'user: "65534:65534"'* &&
     "$sibling_service" == *'read_only: true'* &&
     "$sibling_service" == *'cap_drop: [ALL]'* &&
     "$sibling_service" == *'security_opt: [no-new-privileges:true]'* &&
     "$sibling_service" == *'      - abuse-race'* &&
-    "$sibling_service" == *'java-remote-parent-socket:/var/run/obi:ro'* ]] || {
+    "$sibling_service" != *'privileged:'* &&
+    "$sibling_service" != *'cap_add:'* &&
+    "$sibling_service" != *'pid:'* &&
+    "$sibling_service" != *'userns_mode:'* &&
+    "$sibling_volumes" == '      - java-remote-parent-socket:/var/run/obi:ro' ]] || {
     printf 'Unix sibling probe lacks a least-privilege peer topology\n' >&2
     return 1
   }
   [[ "$endpoint_service" == *'user: "0:0"'* &&
-    "$endpoint_service" == *'java-remote-parent-socket:/var/run/obi'* &&
-    "$endpoint_service" != *'java-remote-parent-socket:/var/run/obi:ro'* ]] || {
+    "$endpoint_volumes" == '      - java-remote-parent-socket:/var/run/obi' ]] || {
     printf 'endpoint-replacement probe lost its required writable root topology\n' >&2
     return 1
   }
@@ -10934,6 +11128,11 @@ main() {
   test_primary_security_probe_is_not_self_certifying
   test_unix_security_metrics_require_explicit_race_scope
   test_unix_security_provider_wait_uses_restart_cursor
+  test_unix_security_quiescence_restores_policy
+  test_background_process_polling_handles_proc_race_quietly
+  test_unix_security_identity_requires_same_cgroup_nonroot_capabilityfree
+  test_unix_abuse_race_result_requires_every_case
+  test_unix_security_controls_use_isolated_topology_windows
   test_permissive_unix_directory_control_refuses_and_restores
   test_permissive_unix_directory_rejects_socket_probe_error
   test_unix_endpoint_restart_invalidates_before_stack_mutation

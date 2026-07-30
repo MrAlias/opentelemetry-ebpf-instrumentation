@@ -145,6 +145,7 @@ SOURCE_SNAPSHOT_PARENT="/tmp"
 readonly SOURCE_SNAPSHOT_PARENT
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 PRIMARY_FAULT_COMPOSE_FILE="$SCRIPT_DIR/docker-compose.primary-fault.yml"
+PRIMARY_LIVE_FD_COMPOSE_FILE="$SCRIPT_DIR/docker-compose.primary-live-fd.yml"
 COMPOSE_PROJECT_DIRECTORY="$SCRIPT_DIR"
 PROJECT_NAME="${COMPOSE_PROJECT_NAME:-$PROJECT_NAMESPACE}"
 
@@ -241,6 +242,11 @@ declare -a PRIMARY_FAULT_COMPOSE=(
   docker compose --project-name "$PROJECT_NAME" \
     --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE" \
     --file "$PRIMARY_FAULT_COMPOSE_FILE"
+)
+declare -a PRIMARY_LIVE_FD_COMPOSE=(
+  docker compose --project-name "$PROJECT_NAME" \
+    --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE" \
+    --file "$PRIMARY_FAULT_COMPOSE_FILE" --file "$PRIMARY_LIVE_FD_COMPOSE_FILE"
 )
 
 usage() {
@@ -1719,6 +1725,7 @@ assert_materialized_source_tree_matches_revision() {
 prepare_source_snapshot() {
   local snapshot_compose_file=""
   local snapshot_fault_compose_file=""
+  local snapshot_live_fd_compose_file=""
   local source_artifact_dir="$ARTIFACT_DIR"
   local artifact_file=""
   local -a reusable_bridge_artifact_files=(
@@ -1759,8 +1766,10 @@ prepare_source_snapshot() {
   }
   snapshot_compose_file="$SOURCE_SNAPSHOT_SCRIPT_DIR/docker-compose.yml"
   snapshot_fault_compose_file="$SOURCE_SNAPSHOT_SCRIPT_DIR/docker-compose.primary-fault.yml"
+  snapshot_live_fd_compose_file="$SOURCE_SNAPSHOT_SCRIPT_DIR/docker-compose.primary-live-fd.yml"
   [[ -f "$snapshot_compose_file" && ! -L "$snapshot_compose_file" && \
-    -f "$snapshot_fault_compose_file" && ! -L "$snapshot_fault_compose_file" ]] || {
+    -f "$snapshot_fault_compose_file" && ! -L "$snapshot_fault_compose_file" && \
+    -f "$snapshot_live_fd_compose_file" && ! -L "$snapshot_live_fd_compose_file" ]] || {
     die "source snapshot lacks the demo Compose configuration"
   }
 
@@ -1775,6 +1784,7 @@ prepare_source_snapshot() {
   fi
   COMPOSE_FILE="$snapshot_compose_file"
   PRIMARY_FAULT_COMPOSE_FILE="$snapshot_fault_compose_file"
+  PRIMARY_LIVE_FD_COMPOSE_FILE="$snapshot_live_fd_compose_file"
   COMPOSE_PROJECT_DIRECTORY="$SOURCE_SNAPSHOT_SCRIPT_DIR"
   COMPOSE=(
     docker compose --project-name "$PROJECT_NAME" \
@@ -1784,6 +1794,11 @@ prepare_source_snapshot() {
     docker compose --project-name "$PROJECT_NAME" \
       --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE" \
       --file "$PRIMARY_FAULT_COMPOSE_FILE"
+  )
+  PRIMARY_LIVE_FD_COMPOSE=(
+    docker compose --project-name "$PROJECT_NAME" \
+      --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE" \
+      --file "$PRIMARY_FAULT_COMPOSE_FILE" --file "$PRIMARY_LIVE_FD_COMPOSE_FILE"
   )
   assert_clean_source_checkout_is_stable
 }
@@ -2729,6 +2744,40 @@ assert_primary_fault_runtime_contract() {
   ' sh "$PRIMARY_FAULT_CONTROL_DIRECTORY" "$PRIMARY_FAULT_CONTROL_FILE"
 }
 
+assert_primary_live_fd_security_runtime_topology() {
+  local -r java_container="$1"
+  local privileged=""
+  local pid_mode=""
+  local cap_add=""
+  local security_options=""
+
+  privileged="$(run_bounded 10 docker inspect --format '{{.HostConfig.Privileged}}' \
+    "$java_container")" || return $?
+  pid_mode="$(run_bounded 10 docker inspect --format '{{.HostConfig.PidMode}}' \
+    "$java_container")" || return $?
+  cap_add="$(run_bounded 10 docker inspect --format '{{json .HostConfig.CapAdd}}' \
+    "$java_container")" || return $?
+  security_options="$(run_bounded 10 docker inspect \
+    --format '{{json .HostConfig.SecurityOpt}}' "$java_container")" || return $?
+
+  [[ "$privileged" == "false" && -z "$pid_mode" ]] || {
+    log_error "primary live-descriptor security runtime must stay unprivileged with a private PID namespace"
+    return 1
+  }
+  jq -e '
+    type == "array" and length == 1 and
+    (.[0] == "SYS_PTRACE" or .[0] == "CAP_SYS_PTRACE")
+  ' <<<"$cap_add" >/dev/null || {
+    log_error "primary live-descriptor security runtime must grant exactly CAP_SYS_PTRACE"
+    return 1
+  }
+  jq -e '. == null or (type == "array" and length == 0)' \
+    <<<"$security_options" >/dev/null || {
+    log_error "primary live-descriptor security runtime must retain Docker's default seccomp profile"
+    return 1
+  }
+}
+
 assert_normal_runtime_has_no_primary_fault_environment() {
   local -r java_environment="$1"
   local preload_count=""
@@ -2761,6 +2810,7 @@ assert_runtime_contract() {
   local dynamic_agent_loading="not-configured"
   local extension="absent"
   local bridge_transport="not-applicable"
+  local live_fd_security_topology="not-applicable"
 
   [[ "$suppression_already_observed" == "false" || \
     "$suppression_already_observed" == "true" ]] || {
@@ -2810,6 +2860,10 @@ assert_runtime_contract() {
     assert_primary_fault_runtime_contract "$java_container" "$java_environment" || return $?
   else
     assert_normal_runtime_has_no_primary_fault_environment "$java_environment" || return $?
+  fi
+  if [[ "$mode" == "primary-live-fd-security" ]]; then
+    assert_primary_live_fd_security_runtime_topology "$java_container" || return $?
+    live_fd_security_topology="private-pid-sys-ptrace"
   fi
 
   if [[ "$mode" == "uninstrumented" ]]; then
@@ -2955,6 +3009,7 @@ assert_runtime_contract() {
     printf 'obi_container=%s\n' "${obi_container:-absent}"
     printf 'obi_privileged_pid_mode=%s\n' "${obi_identity:-absent}"
     printf 'bridge_transport=%s\n' "$bridge_transport"
+    printf 'live_fd_security_topology=%s\n' "$live_fd_security_topology"
     printf 'vmlinux_btf=%s\n' "$(host_vmlinux_btf_readable && printf readable || printf unavailable)"
   } >"$output" || return $?
 }
@@ -5645,6 +5700,9 @@ recreate_instrumented_stack() {
     primary-fault)
       compose_command=("${PRIMARY_FAULT_COMPOSE[@]}")
       ;;
+    primary-live-fd)
+      compose_command=("${PRIMARY_LIVE_FD_COMPOSE[@]}")
+      ;;
     *)
       log_error "unsupported instrumented-stack Compose flavor: $compose_flavor"
       return 1
@@ -5666,10 +5724,11 @@ recreate_instrumented_stack() {
   log_info "recreating the instrumented stack for $label propagation=$propagation flavor=$compose_flavor"
   invalidate_selected_transport || return $?
   BRIDGE_RUNNING=false
-  if [[ "$compose_flavor" == "primary-fault" ]]; then
+  if [[ "$compose_flavor" == "primary-fault" || \
+    "$compose_flavor" == "primary-live-fd" ]]; then
     run_bounded 30 "${compose_command[@]}" config --quiet || return $?
     run_bounded 30 "${compose_command[@]}" config \
-      >"$RESULT_DIR/compose-primary-fault-resolved.yaml" || return $?
+      >"$RESULT_DIR/compose-${compose_flavor}-resolved.yaml" || return $?
   fi
   run_bounded 180 \
     "${compose_command[@]}" up --detach --force-recreate \
@@ -6719,7 +6778,7 @@ arm_primary_live_fd_barrier() {
   }
 
   # shellcheck disable=SC2016 # The fixed paths are positional parameters in the Java container.
-  run_bounded 15 "${PRIMARY_FAULT_COMPOSE[@]}" exec --no-TTY --user 0:0 \
+  run_bounded 15 "${PRIMARY_LIVE_FD_COMPOSE[@]}" exec --no-TTY --user 0:0 \
     java-backend /bin/sh -ec '
       set -eu
       directory=$1
@@ -6991,7 +7050,7 @@ consume_primary_live_fd_barrier() {
   # this exact inode, so ownership, mode, and link count are the stable
   # post-consumption metadata contract.
   # shellcheck disable=SC2016 # The fixed paths are positional parameters in the Java container.
-  run_bounded 10 "${PRIMARY_FAULT_COMPOSE[@]}" exec --no-TTY --user 0:0 \
+  run_bounded 10 "${PRIMARY_LIVE_FD_COMPOSE[@]}" exec --no-TTY --user 0:0 \
     java-backend /bin/sh -ec '
       set -eu
       directory=$1
@@ -7372,9 +7431,9 @@ run_primary_live_fd_security_control() (
   restore_required=true
   PRIMARY_FAULT_STACK_ACTIVE=true
   recreate_instrumented_stack \
-    tcp "primary live-descriptor security preparation" getsockopt true false primary-fault || return $?
+    tcp "primary live-descriptor security preparation" getsockopt true false primary-live-fd || return $?
   assert_runtime_contract primary-live-fd-security true || return $?
-  java_container="$(run_bounded 10 "${PRIMARY_FAULT_COMPOSE[@]}" ps --quiet java-backend)" || return $?
+  java_container="$(run_bounded 10 "${PRIMARY_LIVE_FD_COMPOSE[@]}" ps --quiet java-backend)" || return $?
   [[ -n "$java_container" ]] || {
     log_error "could not resolve the Java container for the primary live-descriptor security control"
     return 1
@@ -7400,7 +7459,7 @@ run_primary_live_fd_security_control() (
   # the EXIT trap can terminate and reap the complete victim process tree.
   timeout --signal=TERM --kill-after=10s \
     "${PRIMARY_LIVE_FD_VICTIM_TIMEOUT_SECONDS}s" \
-    "${PRIMARY_FAULT_COMPOSE[@]}" run --rm --no-deps --no-TTY scenario \
+    "${PRIMARY_LIVE_FD_COMPOSE[@]}" run --rm --no-deps --no-TTY scenario \
     --scenario basic \
     --expected-tls "$TLS_PROTOCOL" \
     --seed "$SCENARIO_SEED" \

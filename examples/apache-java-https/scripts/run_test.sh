@@ -5324,6 +5324,7 @@ EOF
 
 test_primary_live_fd_control_uses_exact_barrier_protocol() {
   local control=""
+  local arm=""
   local release=""
   local consume=""
   local probe_runner=""
@@ -5341,13 +5342,18 @@ test_primary_live_fd_control_uses_exact_barrier_protocol() {
   local unsupported_cleanup_line=""
 
   control="$(declare -f run_primary_live_fd_security_control)"
+  arm="$(declare -f arm_primary_live_fd_barrier)"
   release="$(declare -f release_primary_live_fd_barrier)"
   consume="$(declare -f consume_primary_live_fd_barrier)"
   probe_runner="$(declare -f run_primary_live_fd_probe)"
   recovery_scenario="$(declare -f run_primary_live_fd_security_recovery_scenario)"
   primary_control="$(declare -f run_primary_security_control)"
   runtime_contract="$(declare -f assert_runtime_contract)"
-  [[ "$control" == *'primary-fault'* && \
+  [[ "$control" == *'primary-live-fd'* && \
+    "$control" == *'PRIMARY_LIVE_FD_COMPOSE'* && \
+    "$control" != *'PRIMARY_FAULT_COMPOSE'* && \
+    "$arm" == *'PRIMARY_LIVE_FD_COMPOSE'* && \
+    "$consume" == *'PRIMARY_LIVE_FD_COMPOSE'* && \
     "$control" == *'arm_primary_live_fd_barrier'* && \
     "$control" == *'wait_for_primary_live_fd_barrier_ready'* && \
     "$control" == *'run_primary_live_fd_probe'* && \
@@ -5548,7 +5554,7 @@ test_primary_live_fd_control_restores_the_base_stack() {
     printf 'primary live-descriptor control did not restore after fault-stack validation failure\n' >&2
     return 1
   }
-  local -r expected=$'recreate:primary live-descriptor security preparation:primary-fault\ncontract:primary-live-fd-security\nrecreate:post-primary live-descriptor security recovery:base\ncontract:basic'
+  local -r expected=$'recreate:primary live-descriptor security preparation:primary-live-fd\ncontract:primary-live-fd-security\nrecreate:post-primary live-descriptor security recovery:base\ncontract:basic'
   [[ "$(<"$observed")" == "$expected" ]] || {
     printf 'primary live-descriptor recovery changed:\n%s\n' "$(<"$observed")" >&2
     return 1
@@ -8550,6 +8556,64 @@ test_primary_fault_runtime_contract_is_exact_and_base_is_clean() {
       "LD_PRELOAD=$PRIMARY_FAULT_PRELOAD")"
     if assert_runtime_contract basic true >/dev/null 2>&1; then
       printf 'normal recovered runtime accepted a retained preload\n' >&2
+      return 1
+    fi
+  )
+}
+
+test_primary_live_fd_runtime_topology_is_exact() {
+  local mock_privileged=false
+  local mock_pid_mode=""
+  local mock_cap_add='["SYS_PTRACE"]'
+  local mock_security_options=null
+
+  (
+    run_bounded() {
+      case "$*" in
+        *'HostConfig.Privileged'*) printf '%s\n' "$mock_privileged" ;;
+        *'HostConfig.PidMode'*) printf '%s\n' "$mock_pid_mode" ;;
+        *'HostConfig.CapAdd'*) printf '%s\n' "$mock_cap_add" ;;
+        *'HostConfig.SecurityOpt'*) printf '%s\n' "$mock_security_options" ;;
+        *) return 1 ;;
+      esac
+    }
+    log_error() { :; }
+
+    assert_primary_live_fd_security_runtime_topology java-container || {
+      printf 'primary live-descriptor runtime rejected its exact least-privilege topology\n' >&2
+      return 1
+    }
+
+    mock_cap_add='["CAP_SYS_PTRACE"]'
+    assert_primary_live_fd_security_runtime_topology java-container || {
+      printf 'primary live-descriptor runtime rejected Docker capability normalization\n' >&2
+      return 1
+    }
+
+    for mock_cap_add in '["SYS_PTRACE","NET_ADMIN"]' '[]' null; do
+      if assert_primary_live_fd_security_runtime_topology java-container >/dev/null 2>&1; then
+        printf 'primary live-descriptor runtime accepted capability topology %s\n' "$mock_cap_add" >&2
+        return 1
+      fi
+    done
+    mock_cap_add='["SYS_PTRACE"]'
+
+    mock_security_options='["seccomp=unconfined"]'
+    if assert_primary_live_fd_security_runtime_topology java-container >/dev/null 2>&1; then
+      printf 'primary live-descriptor runtime accepted a custom seccomp override\n' >&2
+      return 1
+    fi
+    mock_security_options=null
+
+    mock_privileged=true
+    if assert_primary_live_fd_security_runtime_topology java-container >/dev/null 2>&1; then
+      printf 'primary live-descriptor runtime accepted privileged mode\n' >&2
+      return 1
+    fi
+    mock_privileged=false
+    mock_pid_mode=host
+    if assert_primary_live_fd_security_runtime_topology java-container >/dev/null 2>&1; then
+      printf 'primary live-descriptor runtime accepted a shared PID namespace\n' >&2
       return 1
     fi
   )
@@ -11918,6 +11982,7 @@ prepare_fixture_source_snapshot() {
       PROJECT_NAME=obi-apache-java-https-snapshot-test
       COMPOSE_FILE="$REPO_ROOT/examples/apache-java-https/docker-compose.yml"
       PRIMARY_FAULT_COMPOSE_FILE="$REPO_ROOT/examples/apache-java-https/docker-compose.primary-fault.yml"
+      PRIMARY_LIVE_FD_COMPOSE_FILE="$REPO_ROOT/examples/apache-java-https/docker-compose.primary-live-fd.yml"
       COMPOSE_PROJECT_DIRECTORY="$REPO_ROOT/examples/apache-java-https"
       COMPOSE=(
         docker compose --project-name "$PROJECT_NAME" \
@@ -11927,6 +11992,11 @@ prepare_fixture_source_snapshot() {
         docker compose --project-name "$PROJECT_NAME" \
           --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE" \
           --file "$PRIMARY_FAULT_COMPOSE_FILE"
+      )
+      PRIMARY_LIVE_FD_COMPOSE=(
+        docker compose --project-name "$PROJECT_NAME" \
+          --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE" \
+          --file "$PRIMARY_FAULT_COMPOSE_FILE" --file "$PRIMARY_LIVE_FD_COMPOSE_FILE"
       )
 
       unset GIT_NO_REPLACE_OBJECTS
@@ -11944,6 +12014,8 @@ prepare_fixture_source_snapshot() {
         "$COMPOSE_FILE" == "$SOURCE_SNAPSHOT_DIR/examples/apache-java-https/docker-compose.yml" && \
         "$PRIMARY_FAULT_COMPOSE_FILE" == \
           "$SOURCE_SNAPSHOT_DIR/examples/apache-java-https/docker-compose.primary-fault.yml" && \
+        "$PRIMARY_LIVE_FD_COMPOSE_FILE" == \
+          "$SOURCE_SNAPSHOT_DIR/examples/apache-java-https/docker-compose.primary-live-fd.yml" && \
         "${COMPOSE[*]}" == *"--project-directory $SOURCE_SNAPSHOT_DIR/examples/apache-java-https"* && \
         ! -e "$SOURCE_SNAPSHOT_DIR/ignored-build-input" && \
         -L "$SOURCE_SNAPSHOT_DIR/link" && \
@@ -12403,6 +12475,8 @@ test_source_controls_and_bridge_export_use_private_work_directory() {
   printf 'services: {}\n' >"$source_repository/examples/apache-java-https/docker-compose.yml"
   printf 'services: {}\n' \
     >"$source_repository/examples/apache-java-https/docker-compose.primary-fault.yml"
+  printf 'services: {}\n' \
+    >"$source_repository/examples/apache-java-https/docker-compose.primary-live-fd.yml"
   printf 'FROM scratch\nCOPY . /source\n' >"$source_repository/javaagent.Dockerfile"
   git -C "$source_repository" add -- .
   git -C "$source_repository" commit --quiet -m 'Create private source-work fixture'
@@ -12556,6 +12630,8 @@ test_clean_source_snapshot_uses_pinned_git_inputs() {
   printf 'services: {}\n' >"$source_repository/examples/apache-java-https/docker-compose.yml"
   printf 'services: {}\n' \
     >"$source_repository/examples/apache-java-https/docker-compose.primary-fault.yml"
+  printf 'services: {}\n' \
+    >"$source_repository/examples/apache-java-https/docker-compose.primary-live-fd.yml"
   printf 'FROM scratch\nCOPY . /source\n' >"$source_repository/javaagent.Dockerfile"
   git -C "$source_repository" add -- .
   git -C "$source_repository" commit --quiet -m 'Create source snapshot fixture'
@@ -13030,6 +13106,51 @@ compose_service_block() {
   ' "$compose_file"
 }
 
+test_primary_live_fd_compose_topology_is_scoped() {
+  local -r compose_file="$TEST_SCRIPT_DIR/../docker-compose.yml"
+  local -r primary_fault_file="$TEST_SCRIPT_DIR/../docker-compose.primary-fault.yml"
+  local -r live_fd_file="$TEST_SCRIPT_DIR/../docker-compose.primary-live-fd.yml"
+  local -r base_resolved="$TEST_TMP_DIR/primary-live-fd-base-resolved.yaml"
+  local -r primary_fault_resolved="$TEST_TMP_DIR/primary-live-fd-fault-resolved.yaml"
+  local -r live_fd_resolved="$TEST_TMP_DIR/primary-live-fd-resolved.yaml"
+  local base_service=""
+  local primary_fault_service=""
+  local live_fd_service=""
+  local cap_add=""
+  local cap_add_count=""
+
+  COMPOSE_PROFILES=tools docker compose --file "$compose_file" config >"$base_resolved"
+  COMPOSE_PROFILES=tools docker compose --file "$compose_file" \
+    --file "$primary_fault_file" config >"$primary_fault_resolved"
+  COMPOSE_PROFILES=tools docker compose --file "$compose_file" \
+    --file "$primary_fault_file" --file "$live_fd_file" config >"$live_fd_resolved"
+  base_service="$(compose_service_block "$base_resolved" java-backend)"
+  primary_fault_service="$(compose_service_block "$primary_fault_resolved" java-backend)"
+  live_fd_service="$(compose_service_block "$live_fd_resolved" java-backend)"
+  cap_add="$(awk '
+    $0 == "    cap_add:" { inside = 1; next }
+    inside && $0 ~ /^    [^[:space:]#][^:]*:/ { exit }
+    inside { print }
+  ' <<<"$live_fd_service")"
+  cap_add_count="$(awk '/^      - / { count += 1 } END { print count + 0 }' <<<"$cap_add")"
+
+  [[ "$base_service" != *'cap_add:'* && \
+    "$primary_fault_service" != *'cap_add:'* ]] || {
+    printf 'base or primary W3C fault runtime unexpectedly gained SYS_PTRACE\n' >&2
+    return 1
+  }
+  [[ "$live_fd_service" == *"user: '0:0'"* && \
+    "$live_fd_service" != *'privileged: true'* && \
+    "$live_fd_service" != *'pid: host'* && \
+    "$live_fd_service" != *'userns_mode: host'* && \
+    "$live_fd_service" != *'security_opt:'* && \
+    "$cap_add_count" == "1" && \
+    "$cap_add" == '      - SYS_PTRACE' ]] || {
+    printf 'primary live-descriptor runtime lost its scoped SYS_PTRACE topology\n' >&2
+    return 1
+  }
+}
+
 test_unix_security_probe_topology_is_least_privilege() {
   local -r obi_config="$TEST_SCRIPT_DIR/../configs/obi.yaml"
   local -r compose_file="$TEST_SCRIPT_DIR/../docker-compose.yml"
@@ -13269,6 +13390,7 @@ main() {
   test_pipeline_dependencies_are_declared
   test_runtime_environment_line_matching
   test_primary_fault_runtime_contract_is_exact_and_base_is_clean
+  test_primary_live_fd_runtime_topology_is_exact
   test_extension_disabled_runtime_requires_explicit_false
   test_disabled_runtime_requires_explicit_transport_disable
   test_helper_attach_runtime_requires_exact_dynamic_disable
@@ -13326,6 +13448,7 @@ main() {
   test_compatibility_matrix_lists_deployment_modes
   test_demo_uses_only_explicit_tcp_context
   test_demo_java_attach_timeout_is_explicit
+  test_primary_live_fd_compose_topology_is_scoped
   test_unix_security_probe_topology_is_least_privilege
   printf 'demo harness tests passed\n'
 }

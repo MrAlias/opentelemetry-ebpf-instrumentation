@@ -1,0 +1,7 @@
+services:
+  # This capability is required only for the root-on-PID-1-cgroup adversary
+  # that duplicates a live Java descriptor with pidfd_getfd. Keep the Docker
+  # default seccomp profile and private PID namespace intact.
+  java-backend:
+    cap_add:
+      - SYS_PTRACE

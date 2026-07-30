@@ -3621,7 +3621,7 @@ test_security_probe_window_covers_metric_fences() {
       configured_same_cgroup="${PRIMARY_SECURITY_SAME_CGROUP_TIMEOUT%s}"
       configured_sibling="${SECURITY_PROBE_TIMEOUT%s}"
       required_same_cgroup=$((
-        (2 * readiness_timeout) + 143 + (repeat_count * 232)
+        (2 * readiness_timeout) + 193 + (repeat_count * 232)
       ))
       required_sibling=$((required_same_cgroup + readiness_timeout + 408))
       ((configured_same_cgroup > required_same_cgroup)) || return 1
@@ -3632,7 +3632,7 @@ test_security_probe_window_covers_metric_fences() {
 90 1
 120 1
 90 10
-136 10
+119 10
 EOF
     if (
       READINESS_TIMEOUT_SECONDS="$MAX_SHELL_INTEGER"
@@ -3642,13 +3642,13 @@ EOF
       return 1
     fi
     if (
-      READINESS_TIMEOUT_SECONDS=137
+      READINESS_TIMEOUT_SECONDS=120
       REPEAT_COUNT=10
       configure_security_probe_timeouts
     ) >/dev/null 2>&1; then
       return 1
     fi
-    READINESS_TIMEOUT_SECONDS=137
+    READINESS_TIMEOUT_SECONDS=120
     REPEAT_COUNT=10
     SCENARIO=basic
     TRANSPORT=getsockopt
@@ -5702,11 +5702,31 @@ test_unix_abuse_race_result_requires_every_case() {
     'security probe abuse race ready' \
     '{"status":"passed","mode":"abuse-race","attempts":1,"cases":[{"name":"peer-identity","outcome":"unauthorized"},{"name":"forged-identity","outcome":"unauthorized"},{"name":"malformed","outcome":"malformed"},{"name":"truncated","outcome":"malformed"},{"name":"version-mismatch","outcome":"version_mismatch"},{"name":"oversized","outcome":"unauthorized"},{"name":"repeated-frame","outcome":"unauthorized"},{"name":"repeated-unauthorized","outcome":"bounded"},{"name":"high-rate-admission","outcome":"overload-and-recovery"},{"name":"concurrent-repeated-unauthorized","outcome":"bounded"}]}' \
     >"$output"
-  assert_unix_abuse_race_output "$output"
+  assert_unix_abuse_race_output "$output" false
+  if assert_unix_abuse_race_output "$output" >/dev/null 2>&1; then
+    printf 'Unix abuse-race result accepted a missing live-Java-forgery policy\n' >&2
+    return 1
+  fi
+  if assert_unix_abuse_race_output "$output" true >/dev/null 2>&1; then
+    printf 'Unix abuse-race result accepted a missing live-Java forgery case\n' >&2
+    return 1
+  fi
+  printf '%s\n' \
+    '{"status":"passed","mode":"abuse-race","attempts":1,"cases":[{"name":"peer-identity","outcome":"unauthorized"},{"name":"forged-identity","outcome":"unauthorized"},{"name":"forged-live-java-tid","outcome":"unauthorized"},{"name":"malformed","outcome":"malformed"},{"name":"truncated","outcome":"malformed"},{"name":"version-mismatch","outcome":"version_mismatch"},{"name":"oversized","outcome":"unauthorized"},{"name":"repeated-frame","outcome":"unauthorized"},{"name":"repeated-unauthorized","outcome":"bounded"},{"name":"high-rate-admission","outcome":"overload-and-recovery"},{"name":"concurrent-repeated-unauthorized","outcome":"bounded"}]}' \
+    >"$output"
+  assert_unix_abuse_race_output "$output" true
+  if assert_unix_abuse_race_output "$output" false >/dev/null 2>&1; then
+    printf 'Unix abuse-race result accepted a live-Java forgery outside its control\n' >&2
+    return 1
+  fi
+  if assert_unix_abuse_race_output "$output" invalid >/dev/null 2>&1; then
+    printf 'Unix abuse-race result accepted an invalid live-Java-forgery policy\n' >&2
+    return 1
+  fi
   printf '%s\n' \
     '{"status":"passed","mode":"abuse-race","attempts":1,"cases":[]}' \
     >"$output"
-  if assert_unix_abuse_race_output "$output" >/dev/null 2>&1; then
+  if assert_unix_abuse_race_output "$output" false >/dev/null 2>&1; then
     printf 'Unix abuse-race result accepted an incomplete case set\n' >&2
     return 1
   fi
@@ -5726,6 +5746,7 @@ test_unix_security_controls_use_isolated_topology_windows() {
   local sibling_release_line=""
   local sibling_completion_line=""
   local same_cgroup_baseline_line=""
+  local same_cgroup_java_tid_line=""
   local same_cgroup_start_line=""
 
   unix_control="$(declare -f run_unix_security_control)"
@@ -5749,6 +5770,8 @@ test_unix_security_controls_use_isolated_topology_windows() {
     <<<"$sibling_control")"
   same_cgroup_baseline_line="$(awk '/Unix same-cgroup security probe baseline/ { print NR; exit }' \
     <<<"$same_cgroup_control")"
+  same_cgroup_java_tid_line="$(awk '/java_live_tid=1/ { print NR; exit }' \
+    <<<"$same_cgroup_control")"
   same_cgroup_start_line="$(awk '/docker exec --user 65534:65534/ { print NR; exit }' \
     <<<"$same_cgroup_control")"
   [[ "$peer_start_line" =~ ^[1-9][0-9]*$ && \
@@ -5759,11 +5782,13 @@ test_unix_security_controls_use_isolated_topology_windows() {
     "$sibling_release_line" =~ ^[1-9][0-9]*$ && \
     "$sibling_completion_line" =~ ^[1-9][0-9]*$ && \
     "$same_cgroup_baseline_line" =~ ^[1-9][0-9]*$ && \
+    "$same_cgroup_java_tid_line" =~ ^[1-9][0-9]*$ && \
     "$same_cgroup_start_line" =~ ^[1-9][0-9]*$ && \
     sibling_baseline_line -lt sibling_start_line && \
     sibling_start_line -lt sibling_release_line && \
     sibling_release_line -lt sibling_completion_line && \
-    same_cgroup_baseline_line -lt same_cgroup_start_line ]] || {
+    same_cgroup_baseline_line -lt same_cgroup_java_tid_line && \
+    same_cgroup_java_tid_line -lt same_cgroup_start_line ]] || {
     printf 'Unix security controls do not preserve isolated attacker windows\n' >&2
     return 1
   }
@@ -5773,10 +5798,23 @@ test_unix_security_controls_use_isolated_topology_windows() {
     "$sibling_control" != *'--force-recreate security-probe'* && \
     "$sibling_control" == *'assert_unix_sibling_security_topology'* && \
     "$sibling_control" == *'security-unix-sibling-victim'* && \
+    "$sibling_control" == *'assert_unix_abuse_race_output "$output" false'* && \
+    "$sibling_control" != *'--forged-tid'* && \
     "$same_cgroup_control" == *'docker exec --user 65534:65534'* && \
+    "$same_cgroup_control" == *'HostConfig.PidMode'* && \
+    "$same_cgroup_control" == *'/proc/1/task/1/comm'* && \
+    "$same_cgroup_control" == *'[ "$process_name" = java ]'* && \
+    "$same_cgroup_control" == *'[ "$thread_name" = java ]'* && \
+    "$same_cgroup_control" == *'--forged-tid "$5"'* && \
+    "$same_cgroup_control" == *'"$UNIX_SECURITY_NAMESPACE_PID" != "$java_live_tid"'* && \
+    "$same_cgroup_control" == *'[ "$1" != 1 ]'* && \
+    "$same_cgroup_control" == *'[ "$name" = security-probe ]'* && \
+    "$same_cgroup_control" == *'/proc/1/ns/pid'* && \
+    "$same_cgroup_control" == *'/proc/$UNIX_SECURITY_NAMESPACE_PID/ns/pid'* && \
+    "$same_cgroup_control" == *'"$java_pid_namespace" == "$probe_pid_namespace"'* && \
     "$same_cgroup_control" == *'assert_unix_security_cgroup_identity'* && \
     "$same_cgroup_control" == *'security-unix-same-cgroup-victim'* && \
-    "$same_cgroup_control" == *'assert_unix_abuse_race_output'* && \
+    "$same_cgroup_control" == *'assert_unix_abuse_race_output "$output" true'* && \
     "$sibling_topology" == *'HostConfig.Privileged'* && \
     "$sibling_topology" == *'json .HostConfig.CapAdd'* && \
     "$sibling_topology" == *'assert_unix_sibling_security_options'* && \

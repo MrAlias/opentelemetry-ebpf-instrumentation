@@ -45,7 +45,7 @@ PRESSURE_CLEANUP_DEADLINE_SECONDS=180
 PRESSURE_MAX_ENTRIES=50000
 # Sum explicit metric, readiness, Docker, release, and final-attempt overrun bounds.
 SECURITY_PROBE_SCENARIO_BUDGET_SECONDS=232
-SECURITY_PROBE_SAME_CGROUP_FIXED_BUDGET_SECONDS=143
+SECURITY_PROBE_SAME_CGROUP_FIXED_BUDGET_SECONDS=193
 SECURITY_PROBE_SIBLING_FIXED_BUDGET_SECONDS=408
 PRIMARY_LIVE_FD_BARRIER_TIMEOUT_SECONDS=90
 PRIMARY_LIVE_FD_PRE_RELEASE_DEADLINE_SECONDS=55
@@ -7207,28 +7207,49 @@ assert_unix_sibling_security_topology() {
 
 assert_unix_abuse_race_output() {
   local -r output="$1"
+  local -r require_live_java_forgery="${2:-}"
   local result=""
 
+  [[ "$require_live_java_forgery" == "true" || \
+    "$require_live_java_forgery" == "false" ]] || {
+    log_error "Unix abuse-race result requires an explicit live-Java-forgery policy"
+    return 1
+  }
   result="$(grep -E '^\{"status":' "$output" || true)"
   [[ "$(wc -l <<<"$result")" == "1" ]] || {
     log_error "Unix security probe did not emit exactly one result record"
     return 1
   }
-  jq -e '
+  jq -e --argjson require_live_java_forgery "$require_live_java_forgery" '
     .status == "passed" and .mode == "abuse-race" and
     (.attempts | type == "number" and . >= 1) and
-    ([.cases[] | select(.name == "peer-identity" and .outcome == "unauthorized")] | length == 1) and
-    ([.cases[] | select(.name == "forged-identity" and .outcome == "unauthorized")] | length == 1) and
-    ([.cases[] | select(.name == "malformed" and .outcome == "malformed")] | length == 1) and
-    ([.cases[] | select(.name == "truncated" and .outcome == "malformed")] | length == 1) and
-    ([.cases[] | select(.name == "version-mismatch" and .outcome == "version_mismatch")] | length == 1) and
-    ([.cases[] | select(.name == "oversized" and .outcome == "unauthorized")] | length == 1) and
-    ([.cases[] | select(.name == "repeated-frame" and .outcome == "unauthorized")] | length == 1) and
-    ([.cases[] | select(.name == "repeated-unauthorized" and .outcome == "bounded")] | length == 1) and
-    ([.cases[] | select(.name == "high-rate-admission" and .outcome == "overload-and-recovery")] | length == 1) and
-    ([.cases[] | select(.name == "concurrent-repeated-unauthorized" and .outcome == "bounded")] | length == 1)
+    (.cases | type == "array") and
+    (
+      (
+        [
+          {"name":"peer-identity","outcome":"unauthorized"},
+          {"name":"forged-identity","outcome":"unauthorized"}
+        ] +
+        (if $require_live_java_forgery then
+          [{"name":"forged-live-java-tid","outcome":"unauthorized"}]
+        else
+          []
+        end) +
+        [
+          {"name":"malformed","outcome":"malformed"},
+          {"name":"truncated","outcome":"malformed"},
+          {"name":"version-mismatch","outcome":"version_mismatch"},
+          {"name":"oversized","outcome":"unauthorized"},
+          {"name":"repeated-frame","outcome":"unauthorized"},
+          {"name":"repeated-unauthorized","outcome":"bounded"},
+          {"name":"high-rate-admission","outcome":"overload-and-recovery"},
+          {"name":"concurrent-repeated-unauthorized","outcome":"bounded"}
+        ]
+      ) as $expected |
+      .cases == $expected
+    )
   ' <<<"$result" >/dev/null || {
-    log_error "Unix abuse-race probe did not retain every bounded denial case"
+    log_error "Unix abuse-race probe did not emit the exact bounded denial cases"
     return 1
   }
 }
@@ -7661,7 +7682,7 @@ run_unix_sibling_security_control() {
   }
   run_bounded 15 docker logs "$UNIX_SECURITY_SIBLING_CONTAINER" >"$output" || return $?
   UNIX_SECURITY_SIBLING_CONTAINER=""
-  assert_unix_abuse_race_output "$output" || return $?
+  assert_unix_abuse_race_output "$output" false || return $?
 
   if ! wait_for_unix_security_metrics_quiescent \
     "$after_metrics" \
@@ -7682,6 +7703,10 @@ run_unix_same_cgroup_security_control() {
   local probe_directory=""
   local probe_path=""
   local pid_path=""
+  local java_pid_mode=""
+  local java_live_tid=""
+  local java_pid_namespace=""
+  local probe_pid_namespace=""
   local java_cgroup=""
   local probe_cgroup=""
   local probe_status=""
@@ -7700,6 +7725,25 @@ run_unix_same_cgroup_security_control() {
   fi
 
   UNIX_SECURITY_JAVA_CONTAINER="$java_container"
+  java_pid_mode="$(run_bounded 10 docker inspect --format '{{.HostConfig.PidMode}}' \
+    "$java_container")" || return $?
+  [[ -z "$java_pid_mode" ]] || {
+    log_error "Java backend did not retain a private PID namespace for the Unix same-cgroup control"
+    return 1
+  }
+  # Expanded by the container shell, not this process.
+  # shellcheck disable=SC2016
+  run_bounded 10 docker exec "$java_container" /bin/sh -ec '
+    set -eu
+    [ -d /proc/1/task/1 ]
+    [ -r /proc/1/comm ]
+    [ -r /proc/1/task/1/comm ]
+    read -r process_name </proc/1/comm
+    read -r thread_name </proc/1/task/1/comm
+    [ "$process_name" = java ]
+    [ "$thread_name" = java ]
+  ' || return $?
+  java_live_tid=1
   probe_directory="$(run_bounded 10 docker exec "$java_container" /bin/sh -ec '
     set -eu
     umask 077
@@ -7724,9 +7768,9 @@ run_unix_same_cgroup_security_control() {
   docker exec --user 65534:65534 "$java_container" /bin/sh -ec '
     umask 077
     printf "%s\n" "$$" >"$1"
-    exec "$2" --socket "$3" --mode abuse-race --timeout "$4"
+    exec "$2" --socket "$3" --mode abuse-race --timeout "$4" --forged-tid "$5"
   ' sh "$pid_path" "$probe_path" /var/run/obi/java-remote-parent.sock \
-    "$SECURITY_PROBE_TIMEOUT" >"$output" 2>&1 &
+    "$SECURITY_PROBE_TIMEOUT" "$java_live_tid" >"$output" 2>&1 &
   UNIX_SECURITY_EXEC_PID=$!
   wait_for_background_log \
     "$UNIX_SECURITY_EXEC_PID" \
@@ -7735,6 +7779,25 @@ run_unix_same_cgroup_security_control() {
     "same-cgroup Unix abuse race" || return $?
   UNIX_SECURITY_NAMESPACE_PID="$(wait_for_unix_security_namespace_pid \
     "$java_container" "$pid_path")" || return $?
+  [[ "$UNIX_SECURITY_NAMESPACE_PID" != "$java_live_tid" ]] || {
+    log_error "Unix same-cgroup security probe reused the Java live-thread identity"
+    return 1
+  }
+  # Expanded by the container shell, not this process.
+  # shellcheck disable=SC2016
+  run_bounded 10 docker exec "$java_container" /bin/sh -ec '
+    [ "$1" != 1 ]
+    read -r name <"/proc/$1/comm"
+    [ "$name" = security-probe ]
+  ' sh "$UNIX_SECURITY_NAMESPACE_PID" || return $?
+  java_pid_namespace="$(run_bounded 10 docker exec "$java_container" \
+    readlink /proc/1/ns/pid)" || return $?
+  probe_pid_namespace="$(run_bounded 10 docker exec "$java_container" \
+    readlink "/proc/$UNIX_SECURITY_NAMESPACE_PID/ns/pid")" || return $?
+  [[ -n "$java_pid_namespace" && "$java_pid_namespace" == "$probe_pid_namespace" ]] || {
+    log_error "Unix same-cgroup security probe did not share the Java PID namespace"
+    return 1
+  }
 
   java_cgroup="$(run_bounded 10 docker exec "$java_container" cat /proc/1/cgroup)" || return $?
   probe_cgroup="$(run_bounded 10 docker exec "$java_container" \
@@ -7787,7 +7850,7 @@ run_unix_same_cgroup_security_control() {
   }
   UNIX_SECURITY_EXEC_PID=""
   UNIX_SECURITY_NAMESPACE_PID=""
-  assert_unix_abuse_race_output "$output" || return $?
+  assert_unix_abuse_race_output "$output" true || return $?
 
   run_bounded 10 docker exec "$java_container" \
     rm -rf -- "$probe_directory" || return $?

@@ -141,8 +141,11 @@ RUNTIME_DIR="$SCRIPT_DIR/.runtime"
 ARTIFACT_DIR="$RUNTIME_DIR/artifacts"
 CERT_DIR="$RUNTIME_DIR/certs"
 RESULTS_ROOT="$RUNTIME_DIR/results"
+SOURCE_SNAPSHOT_PARENT="/tmp"
+readonly SOURCE_SNAPSHOT_PARENT
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 PRIMARY_FAULT_COMPOSE_FILE="$SCRIPT_DIR/docker-compose.primary-fault.yml"
+COMPOSE_PROJECT_DIRECTORY="$SCRIPT_DIR"
 PROJECT_NAME="${COMPOSE_PROJECT_NAME:-$PROJECT_NAMESPACE}"
 
 TRANSPORT="getsockopt"
@@ -159,14 +162,18 @@ READINESS_TIMEOUT_SECONDS=90
 REQUEST_COUNT=0
 REPEAT_COUNT=1
 SCENARIO_SEED=1
-TMP_DIR=""
+BRIDGE_EXPORT_DIR=""
 RESULT_DIR=""
+SOURCE_SNAPSHOT_DIR=""
+SOURCE_SNAPSHOT_SCRIPT_DIR=""
+SOURCE_SNAPSHOT_WORK_DIR=""
 STACK_STARTED=false
 SOURCE_DIRTY=""
 SOURCE_PATCH_SHA256=""
 SOURCE_REVISION=""
 SOURCE_TRACKED_PATCH_SHA256=""
 SOURCE_TREE_SHA256=""
+SOURCE_TREE_MANIFEST_SCHEMA=""
 RUN_INVOCATION=""
 RUN_STAGE="initialization"
 FAILURE_STAGE=""
@@ -226,9 +233,13 @@ UNIX_SECURITY_NAMESPACE_PID=""
 UNIX_SECURITY_PROBE_DIRECTORY=""
 PRIMARY_FAULT_STACK_ACTIVE=false
 
-declare -a COMPOSE=(docker compose --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE")
+declare -a COMPOSE=(
+  docker compose --project-name "$PROJECT_NAME" \
+    --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE"
+)
 declare -a PRIMARY_FAULT_COMPOSE=(
-  docker compose --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE" \
+  docker compose --project-name "$PROJECT_NAME" \
+    --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE" \
     --file "$PRIMARY_FAULT_COMPOSE_FILE"
 )
 
@@ -539,10 +550,59 @@ mark_non_acceptance() {
   fi
 }
 
+sanitize_git_environment() {
+  local git_variable=""
+
+  # Git's repository-selection and temporary-config environment variables can
+  # redirect an otherwise explicit `git -C "$REPO_ROOT"` invocation away from
+  # the physical checkout that Docker would otherwise read. The demo's source
+  # identity is always derived from its own checkout, never caller state.
+  unset \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES \
+    GIT_CEILING_DIRECTORIES \
+    GIT_COMMON_DIR \
+    GIT_CONFIG \
+    GIT_CONFIG_COUNT \
+    GIT_CONFIG_GLOBAL \
+    GIT_CONFIG_NOSYSTEM \
+    GIT_CONFIG_PARAMETERS \
+    GIT_CONFIG_SYSTEM \
+    GIT_DIR \
+    GIT_DISCOVERY_ACROSS_FILESYSTEM \
+    GIT_DIFF_OPTS \
+    GIT_EXTERNAL_DIFF \
+    GIT_GLOB_PATHSPECS \
+    GIT_ICASE_PATHSPECS \
+    GIT_INDEX_FILE \
+    GIT_LITERAL_PATHSPECS \
+    GIT_NAMESPACE \
+    GIT_NOGLOB_PATHSPECS \
+    GIT_OBJECT_DIRECTORY \
+    GIT_OPTIONAL_LOCKS \
+    GIT_REPLACE_REF_BASE \
+    GIT_WORK_TREE \
+    TAR_OPTIONS
+  for git_variable in "${!GIT_CONFIG_KEY_@}" "${!GIT_CONFIG_VALUE_@}"; do
+    [[ -n "$git_variable" ]] || continue
+    unset "$git_variable"
+  done
+  export GIT_NO_REPLACE_OBJECTS=1
+}
+
+sha256_file() {
+  local digest=""
+
+  [[ -f "$1" && ! -L "$1" ]] || return 1
+  digest="$(sha256sum <"$1")" || return 1
+  digest="${digest%% *}"
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$digest"
+}
+
 check_dependencies() {
   local -a missing=()
   local command_name=""
-  for command_name in awk cmp curl cut docker find git grep install jq mv openssl sed sha256sum sort tail tee timeout wc; do
+  for command_name in awk cmp curl cut docker find git grep head install jq mv openssl readlink rmdir sed sha256sum sort stat tail tar tee timeout wc; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
       missing+=("$command_name")
     fi
@@ -918,8 +978,17 @@ cleanup() {
       fi
     fi
   fi
-  if [[ -n "${TMP_DIR:-}" && -d "$TMP_DIR" ]]; then
-    rm -rf -- "$TMP_DIR"
+  cleanup_source_snapshot_work_directory
+  if [[ -n "${SOURCE_SNAPSHOT_DIR:-}" && \
+    "$SOURCE_SNAPSHOT_DIR" == "$SOURCE_SNAPSHOT_PARENT"/obi-source-snapshot.* && \
+    -d "$SOURCE_SNAPSHOT_DIR" && ! -L "$SOURCE_SNAPSHOT_DIR" ]]; then
+    if unseal_source_snapshot; then
+      rm -rf -- "$SOURCE_SNAPSHOT_DIR"
+      SOURCE_SNAPSHOT_DIR=""
+      SOURCE_SNAPSHOT_SCRIPT_DIR=""
+    else
+      log_error "could not unseal the private source snapshot for cleanup"
+    fi
   fi
 
   exit "$final_status"
@@ -956,62 +1025,812 @@ prepare_runtime_directory() {
   }
 }
 
-capture_source_state() {
+assert_source_snapshot_parent_is_trusted() {
+  local -r snapshot_parent="${1:-$SOURCE_SNAPSHOT_PARENT}"
+  local root_physical=""
+  local parent_physical=""
+  local root_owner=""
+  local root_mode=""
+  local parent_owner=""
+  local parent_mode=""
+  local -i root_mode_bits=0
+  local -i parent_mode_bits=0
+
+  [[ "$snapshot_parent" == /* ]] || {
+    die "source snapshot parent must be an absolute directory"
+  }
+  [[ -d / && ! -L / ]] || {
+    die "source snapshot root is not a regular directory"
+  }
+  root_physical="$(cd -- / && pwd -P)" || {
+    die "could not resolve the source snapshot filesystem root"
+  }
+  [[ "$root_physical" == / ]] || {
+    die "source snapshot filesystem root must be physical"
+  }
+  root_owner="$(stat --format=%u -- /)" || {
+    die "could not inspect the source snapshot filesystem root owner"
+  }
+  root_mode="$(stat --format=%a -- /)" || {
+    die "could not inspect the source snapshot filesystem root mode"
+  }
+  [[ "$root_owner" == 0 && "$root_mode" =~ ^[0-7]{3,4}$ ]] || {
+    die "source snapshot filesystem root ownership or mode is invalid"
+  }
+  root_mode_bits=$((8#$root_mode))
+  (( (root_mode_bits & 0022) == 0 )) || {
+    die "source snapshot filesystem root must not be group or world writable"
+  }
+
+  [[ -d "$snapshot_parent" && ! -L "$snapshot_parent" ]] || {
+    die "source snapshot parent is not a regular directory"
+  }
+  parent_physical="$(cd -- "$snapshot_parent" && pwd -P)" || {
+    die "could not resolve the source snapshot parent"
+  }
+  [[ "$parent_physical" == "$snapshot_parent" ]] || {
+    die "source snapshot parent must be a physical directory"
+  }
+  parent_owner="$(stat --format=%u -- "$snapshot_parent")" || {
+    die "could not inspect the source snapshot parent owner"
+  }
+  parent_mode="$(stat --format=%a -- "$snapshot_parent")" || {
+    die "could not inspect the source snapshot parent mode"
+  }
+  [[ "$parent_owner" == 0 && "$parent_mode" =~ ^[0-7]{3,4}$ ]] || {
+    die "source snapshot parent ownership or mode is invalid"
+  }
+  parent_mode_bits=$((8#$parent_mode))
+  (( (parent_mode_bits & 01000) != 0 && (parent_mode_bits & 0002) != 0 )) || {
+    die "source snapshot parent must be root-owned, sticky, and world writable"
+  }
+}
+
+assert_source_snapshot_root_has_mode() {
+  local -r expected_mode="$1"
+  local snapshot_physical=""
+  local owner=""
+  local mode=""
+
+  [[ -d "$SOURCE_SNAPSHOT_DIR" && ! -L "$SOURCE_SNAPSHOT_DIR" ]] || {
+    die "source snapshot is not a regular directory"
+  }
+  snapshot_physical="$(cd -- "$SOURCE_SNAPSHOT_DIR" && pwd -P)" || {
+    die "could not resolve the source snapshot directory"
+  }
+  [[ "$snapshot_physical" == "$SOURCE_SNAPSHOT_DIR" ]] || {
+    die "source snapshot must be a physical directory"
+  }
+  owner="$(stat --format=%u -- "$SOURCE_SNAPSHOT_DIR")" || {
+    die "could not inspect the source snapshot owner"
+  }
+  mode="$(stat --format=%a -- "$SOURCE_SNAPSHOT_DIR")" || {
+    die "could not inspect the source snapshot mode"
+  }
+  [[ "$expected_mode" =~ ^[0-7]{3,4}$ && "$owner" == "$EUID" && \
+    "$mode" == "$expected_mode" ]] || {
+    die "source snapshot ownership or mode is invalid"
+  }
+}
+
+assert_source_snapshot_root_is_private() {
+  assert_source_snapshot_parent_is_trusted
+  assert_source_snapshot_root_has_mode 700
+}
+
+assert_sealed_source_snapshot_is_private() {
+  assert_source_snapshot_parent_is_trusted
+  assert_source_snapshot_root_has_mode 500
+}
+
+assert_source_snapshot_work_directory_is_private() {
+  local work_physical=""
+  local owner=""
+  local mode=""
+
+  assert_source_snapshot_parent_is_trusted
+  [[ "$SOURCE_SNAPSHOT_WORK_DIR" == "$SOURCE_SNAPSHOT_PARENT"/obi-source-snapshot-work.* && \
+    -d "$SOURCE_SNAPSHOT_WORK_DIR" && ! -L "$SOURCE_SNAPSHOT_WORK_DIR" ]] || {
+    die "source snapshot work directory is unsafe"
+  }
+  work_physical="$(cd -- "$SOURCE_SNAPSHOT_WORK_DIR" && pwd -P)" || {
+    die "could not resolve the source snapshot work directory"
+  }
+  [[ "$work_physical" == "$SOURCE_SNAPSHOT_WORK_DIR" ]] || {
+    die "source snapshot work directory must be physical"
+  }
+  owner="$(stat --format=%u -- "$SOURCE_SNAPSHOT_WORK_DIR")" || {
+    die "could not inspect the source snapshot work directory owner"
+  }
+  mode="$(stat --format=%a -- "$SOURCE_SNAPSHOT_WORK_DIR")" || {
+    die "could not inspect the source snapshot work directory mode"
+  }
+  [[ "$owner" == "$EUID" && "$mode" == 700 ]] || {
+    die "source snapshot work directory ownership or mode is invalid"
+  }
+}
+
+ensure_source_snapshot_work_directory() {
+  if [[ -n "$SOURCE_SNAPSHOT_WORK_DIR" ]]; then
+    assert_source_snapshot_work_directory_is_private
+    return 0
+  fi
+  assert_source_snapshot_parent_is_trusted
+  SOURCE_SNAPSHOT_WORK_DIR="$(
+    mktemp -d "$SOURCE_SNAPSHOT_PARENT/obi-source-snapshot-work.XXXXXX"
+  )" || {
+    die "could not create the private source snapshot work directory"
+  }
+  assert_source_snapshot_work_directory_is_private
+}
+
+cleanup_source_snapshot_work_directory() {
+  if [[ -n "${SOURCE_SNAPSHOT_WORK_DIR:-}" && \
+    "$SOURCE_SNAPSHOT_WORK_DIR" == "$SOURCE_SNAPSHOT_PARENT"/obi-source-snapshot-work.* && \
+    -d "$SOURCE_SNAPSHOT_WORK_DIR" && ! -L "$SOURCE_SNAPSHOT_WORK_DIR" ]]; then
+    rm -rf -- "$SOURCE_SNAPSHOT_WORK_DIR"
+  fi
+  SOURCE_SNAPSHOT_WORK_DIR=""
+  BRIDGE_EXPORT_DIR=""
+}
+
+assert_bridge_export_directory_is_private() {
+  local export_physical=""
+  local owner=""
+  local mode=""
+
+  assert_source_snapshot_work_directory_is_private
+  [[ "$BRIDGE_EXPORT_DIR" == "$SOURCE_SNAPSHOT_WORK_DIR"/bridge-export.* && \
+    -d "$BRIDGE_EXPORT_DIR" && ! -L "$BRIDGE_EXPORT_DIR" ]] || {
+    die "bridge export directory is unsafe"
+  }
+  export_physical="$(cd -- "$BRIDGE_EXPORT_DIR" && pwd -P)" || {
+    die "could not resolve the bridge export directory"
+  }
+  [[ "$export_physical" == "$BRIDGE_EXPORT_DIR" ]] || {
+    die "bridge export directory must be physical"
+  }
+  owner="$(stat --format=%u -- "$BRIDGE_EXPORT_DIR")" || {
+    die "could not inspect the bridge export directory owner"
+  }
+  mode="$(stat --format=%a -- "$BRIDGE_EXPORT_DIR")" || {
+    die "could not inspect the bridge export directory mode"
+  }
+  [[ "$owner" == "$EUID" && "$mode" == 700 ]] || {
+    die "bridge export directory ownership or mode is invalid"
+  }
+}
+
+is_safe_git_tree_path() {
+  local -r path="$1"
+  local remainder="$path"
+  local component=""
+
+  [[ -n "$path" && "$path" != /* && "$path" != */ && "$path" != *'//' ]] || return 1
+  while true; do
+    if [[ "$remainder" == */* ]]; then
+      component="${remainder%%/*}"
+      remainder="${remainder#*/}"
+    else
+      component="$remainder"
+      remainder=""
+    fi
+    [[ -n "$component" && "$component" != . && "$component" != .. ]] || return 1
+    [[ -n "$remainder" ]] || return 0
+  done
+}
+
+capture_clean_source_tree_manifest() {
+  local -r output="$1"
+  local entries=""
+  local manifest=""
+  local entry=""
+  local metadata=""
+  local path=""
+  local mode=""
+  local object_id=""
+  local marker=""
+
+  ensure_source_snapshot_work_directory
+  entries="$(mktemp "$SOURCE_SNAPSHOT_WORK_DIR/.source-tree-v2.entries.XXXXXX")" || {
+    die "could not prepare clean source Git-tree entries"
+  }
+  manifest="$(mktemp "$SOURCE_SNAPSHOT_WORK_DIR/.source-tree-v2.manifest.XXXXXX")" || {
+    die "could not prepare clean source Git-tree manifest"
+  }
+  git -C "$REPO_ROOT" ls-tree -r -z --full-tree "$SOURCE_REVISION" >"$entries" || {
+    die "could not enumerate the clean source Git tree"
+  }
+  while IFS= read -r -d '' entry; do
+    metadata="${entry%%$'\t'*}"
+    path="${entry#*$'\t'}"
+    mode="${metadata%% *}"
+    object_id="${metadata##* }"
+    is_safe_git_tree_path "$path" || {
+      die "clean source Git tree has an unsafe path"
+    }
+    case "$mode" in
+      100644) marker='-' ;;
+      100755) marker='x' ;;
+      120000) marker='l' ;;
+      160000) marker='g' ;;
+      *) die "unsupported clean source Git-tree mode: $mode" ;;
+    esac
+    [[ "$object_id" =~ ^[0-9a-f]{40}$ ]] || {
+      die "clean source Git tree has an invalid object identifier"
+    }
+    LC_ALL=C printf '%s %s %q\n' "$object_id" "$marker" "$path"
+  done <"$entries" >"$manifest"
+  mv -f -- "$manifest" "$output"
+  rm -f -- "$entries"
+}
+
+capture_dirty_source_tree_manifest() {
+  local -r output="$1"
   local executable=""
   local object_id=""
   local path=""
 
-  SOURCE_REVISION="$(git -C "$REPO_ROOT" rev-parse HEAD)"
-  git -C "$REPO_ROOT" status --porcelain=v1 --untracked-files=all >"$RESULT_DIR/git-status.txt"
-  SOURCE_TRACKED_PATCH_SHA256="$(git -C "$REPO_ROOT" diff --binary --no-ext-diff HEAD | sha256sum)"
-  SOURCE_TRACKED_PATCH_SHA256="${SOURCE_TRACKED_PATCH_SHA256%% *}"
-
   (
     cd -- "$REPO_ROOT"
     while IFS= read -r -d '' path; do
+      is_safe_git_tree_path "$path" || {
+        printf '%s\n' "source working tree has an unsafe path" >&2
+        exit 1
+      }
       if [[ ! -f "$path" && ! -L "$path" ]]; then
         continue
       fi
-      object_id="$(git hash-object -- "$path")"
+      if [[ -L "$path" ]]; then
+        object_id="$(readlink -z -- "$path" | head -c -1 | git hash-object --stdin)"
+      else
+        object_id="$(git hash-object -- "$path")"
+      fi
       executable="-"
       if [[ -x "$path" ]]; then
         executable="x"
       fi
       printf '%s %s %q\n' "$object_id" "$executable" "$path"
     done < <(git ls-files --cached --others --exclude-standard -z | sort -z)
-  ) >"$RESULT_DIR/source-tree.manifest"
+  ) >"$output"
+}
 
-  SOURCE_TREE_SHA256="$(sha256sum "$RESULT_DIR/source-tree.manifest")"
-  SOURCE_TREE_SHA256="${SOURCE_TREE_SHA256%% *}"
-  SOURCE_PATCH_SHA256="$({
-    sha256sum "$RESULT_DIR/git-status.txt"
-    sha256sum "$RESULT_DIR/source-tree.manifest"
-    printf '%s\n' "$SOURCE_TRACKED_PATCH_SHA256"
-  } | sha256sum)"
-  SOURCE_PATCH_SHA256="${SOURCE_PATCH_SHA256%% *}"
+assert_source_gitlink_is_pinned() {
+  local -r gitlink_directory="$1"
+  local -r expected_revision="$2"
+  local gitlink_root=""
+  local gitlink_physical=""
+  local gitlink_revision=""
+
+  [[ "$expected_revision" =~ ^[0-9a-f]{40}$ ]] || {
+    die "source gitlink has an invalid revision"
+  }
+  [[ -d "$gitlink_directory" && ! -L "$gitlink_directory" ]] || {
+    die "source gitlink is not an initialized regular directory"
+  }
+  gitlink_physical="$(cd -- "$gitlink_directory" && pwd -P)" || {
+    die "could not resolve source gitlink directory"
+  }
+  gitlink_root="$(git -C "$gitlink_directory" rev-parse --show-toplevel)" || {
+    die "could not resolve source gitlink worktree root"
+  }
+  gitlink_root="$(cd -- "$gitlink_root" && pwd -P)" || {
+    die "could not resolve source gitlink worktree root physically"
+  }
+  [[ "$gitlink_root" == "$gitlink_physical" ]] || {
+    die "source gitlink directory is not its own Git worktree"
+  }
+  gitlink_revision="$(git -C "$gitlink_directory" rev-parse HEAD)" || {
+    die "could not resolve source gitlink revision"
+  }
+  [[ "$gitlink_revision" == "$expected_revision" ]] || {
+    die "source gitlink revision differs from its recorded Git tree"
+  }
+}
+
+assert_source_repository_index_is_fully_observed() {
+  local -r repository="$1"
+  local -r depth="$2"
+  local index_flags=""
+  local gitlinks=""
+  local repository_root=""
+  local repository_physical=""
+  local entry=""
+  local flag=""
+  local metadata=""
+  local mode=""
+  local object_id=""
+  local stage=""
+  local path=""
+  local gitlink_directory=""
+
+  ((depth <= 16)) || die "source gitlink nesting exceeds the snapshot limit"
+  ensure_source_snapshot_work_directory
+  index_flags="$SOURCE_SNAPSHOT_WORK_DIR/.source-index-flags-$depth"
+  gitlinks="$SOURCE_SNAPSHOT_WORK_DIR/.source-gitlinks-$depth"
+  repository_physical="$(cd -- "$repository" && pwd -P)" || {
+    die "could not resolve source repository directory"
+  }
+  repository_root="$(git -C "$repository" rev-parse --show-toplevel)" || {
+    die "could not resolve source repository root"
+  }
+  repository_root="$(cd -- "$repository_root" && pwd -P)" || {
+    die "could not resolve source repository root physically"
+  }
+  [[ "$repository_root" == "$repository_physical" ]] || {
+    die "source gitlink directory is not its own Git worktree"
+  }
+
+  git -C "$repository" ls-files -v -z >"$index_flags" || {
+    die "could not inspect source index flags"
+  }
+  while IFS= read -r -d '' entry; do
+    flag="${entry:0:1}"
+    case "$flag" in
+      [a-z]|S)
+        die "source index has assume-unchanged or skip-worktree entries"
+        ;;
+    esac
+  done <"$index_flags"
+  git -C "$repository" ls-files --stage -z >"$gitlinks" || {
+    die "could not inspect source gitlinks"
+  }
+  while IFS= read -r -d '' entry; do
+    metadata="${entry%%$'\t'*}"
+    path="${entry#*$'\t'}"
+    mode="${metadata%% *}"
+    metadata="${metadata#* }"
+    object_id="${metadata%% *}"
+    stage="${metadata##* }"
+    is_safe_git_tree_path "$path" || {
+      die "source index has an unsafe path"
+    }
+    [[ "$stage" == 0 ]] || {
+      die "source index has unresolved entries"
+    }
+    [[ "$mode" == 160000 ]] || continue
+    gitlink_directory="$repository/$path"
+    [[ "$object_id" =~ ^[0-9a-f]{40}$ ]] || {
+      die "source gitlink has an invalid revision"
+    }
+    assert_source_gitlink_is_pinned "$gitlink_directory" "$object_id"
+    assert_source_repository_index_is_fully_observed \
+      "$gitlink_directory" "$((depth + 1))"
+  done <"$gitlinks"
+  rm -f -- "$index_flags" "$gitlinks"
+}
+
+assert_source_index_is_fully_observed() {
+  ensure_source_snapshot_work_directory
+  assert_source_repository_index_is_fully_observed "$REPO_ROOT" 0
+}
+
+assert_clean_source_checkout_is_stable() {
+  local current_revision=""
+  local current_status=""
+
+  [[ "${SOURCE_DIRTY:-}" == false ]] || return 0
+  sanitize_git_environment
+  assert_source_index_is_fully_observed
+  current_revision="$(git -C "$REPO_ROOT" rev-parse HEAD)" || {
+    die "could not resolve the captured source revision"
+  }
+  [[ "$current_revision" == "$SOURCE_REVISION" ]] || {
+    die "source revision changed after capture"
+  }
+  if ! git -C "$REPO_ROOT" diff --quiet --no-ext-diff "$SOURCE_REVISION" --; then
+    die "source working tree changed after capture"
+  fi
+  if ! git -C "$REPO_ROOT" diff --cached --quiet --no-ext-diff "$SOURCE_REVISION" --; then
+    die "source index changed after capture"
+  fi
+  current_status="$(git -C "$REPO_ROOT" status --porcelain=v1 --untracked-files=all \
+    --ignore-submodules=none)" || {
+    die "could not inspect the captured source checkout"
+  }
+  [[ -z "$current_status" ]] || {
+    die "source checkout became dirty after capture"
+  }
+}
+
+capture_source_state() {
+  local source_status=""
+  local source_tree_manifest=""
+
+  sanitize_git_environment
+  ensure_source_snapshot_work_directory
+  source_status="$SOURCE_SNAPSHOT_WORK_DIR/git-status.txt"
+  source_tree_manifest="$SOURCE_SNAPSHOT_WORK_DIR/source-tree.manifest"
+  SOURCE_REVISION="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  assert_source_index_is_fully_observed
+  git -C "$REPO_ROOT" status --porcelain=v1 --untracked-files=all \
+    --ignore-submodules=none >"$source_status"
+  SOURCE_TRACKED_PATCH_SHA256="$(git -C "$REPO_ROOT" diff --binary --no-ext-diff HEAD | sha256sum)"
+  SOURCE_TRACKED_PATCH_SHA256="${SOURCE_TRACKED_PATCH_SHA256%% *}"
+
   SOURCE_DIRTY=false
-  if [[ -s "$RESULT_DIR/git-status.txt" ]]; then
+  if [[ -s "$source_status" ]]; then
     SOURCE_DIRTY=true
     mark_non_acceptance "dirty-source-tree"
   fi
+  if [[ "$SOURCE_DIRTY" == false ]]; then
+    SOURCE_TREE_MANIFEST_SCHEMA=git-tree-v2
+    capture_clean_source_tree_manifest "$source_tree_manifest"
+  else
+    SOURCE_TREE_MANIFEST_SCHEMA=worktree-v1
+    capture_dirty_source_tree_manifest "$source_tree_manifest"
+  fi
+
+  SOURCE_TREE_SHA256="$(sha256_file "$source_tree_manifest")" || {
+    die "could not checksum the source-tree manifest"
+  }
+  SOURCE_PATCH_SHA256="$({
+    sha256sum "$source_status"
+    sha256sum "$source_tree_manifest"
+    printf '%s\n' "$SOURCE_TRACKED_PATCH_SHA256"
+  } | sha256sum)"
+  SOURCE_PATCH_SHA256="${SOURCE_PATCH_SHA256%% *}"
+  assert_clean_source_checkout_is_stable
+
+  install -m 0644 "$source_status" "$RESULT_DIR/git-status.txt" || {
+    die "could not publish source status evidence"
+  }
+  install -m 0644 "$source_tree_manifest" "$RESULT_DIR/source-tree.manifest" || {
+    die "could not publish source-tree evidence"
+  }
 
   {
     printf 'revision=%s\n' "$SOURCE_REVISION"
     printf 'dirty=%s\n' "$SOURCE_DIRTY"
     printf 'source_tree_sha256=%s\n' "$SOURCE_TREE_SHA256"
+    printf 'source_tree_manifest_schema=%s\n' "$SOURCE_TREE_MANIFEST_SCHEMA"
     printf 'tracked_patch_sha256=%s\n' "$SOURCE_TRACKED_PATCH_SHA256"
     printf 'patch_identity_sha256=%s\n' "$SOURCE_PATCH_SHA256"
   } >"$RESULT_DIR/source-state.txt"
 }
 
+materialize_source_tree_snapshot() {
+  local -r repository="$1"
+  local -r revision="$2"
+  local -r destination="$3"
+  local -r depth="$4"
+  local entries=""
+  local entry=""
+  local metadata=""
+  local mode=""
+  local object_id=""
+  local path=""
+  local source_gitlink=""
+  local snapshot_gitlink=""
+  local snapshot_parent=""
+  local destination_entry=""
+
+  ((depth <= 16)) || die "source gitlink nesting exceeds the snapshot limit"
+  [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || {
+    die "source snapshot has an invalid Git revision"
+  }
+  [[ -d "$destination" && ! -L "$destination" ]] || {
+    die "source snapshot destination is not a regular directory"
+  }
+  ensure_source_snapshot_work_directory
+  destination_entry="$(find -- "$destination" -mindepth 1 -print -quit)" || {
+    die "could not inspect the source snapshot destination"
+  }
+  [[ -z "$destination_entry" ]] || {
+    die "source snapshot destination is not empty"
+  }
+  git -C "$repository" cat-file -e "${revision}^{commit}" || {
+    die "source snapshot revision is unavailable"
+  }
+  if ! git -C "$repository" archive --format=tar "$revision" |
+    (
+      cd -- "$destination" || exit 1
+      exec tar --extract --file=- --no-same-owner --same-permissions
+    ); then
+    die "could not materialize the pinned source Git tree"
+  fi
+
+  entries="$(mktemp "$SOURCE_SNAPSHOT_WORK_DIR/.source-snapshot-gitlinks-$depth.XXXXXX")" || {
+    die "could not prepare source snapshot gitlink evidence"
+  }
+  git -C "$repository" ls-tree -r -z --full-tree "$revision" >"$entries" || {
+    die "could not enumerate source snapshot gitlinks"
+  }
+  while IFS= read -r -d '' entry; do
+    metadata="${entry%%$'\t'*}"
+    path="${entry#*$'\t'}"
+    mode="${metadata%% *}"
+    object_id="${metadata##* }"
+    is_safe_git_tree_path "$path" || {
+      die "source snapshot Git tree has an unsafe path"
+    }
+    [[ "$mode" == 160000 ]] || continue
+    source_gitlink="$repository/$path"
+    snapshot_gitlink="$destination/$path"
+    assert_source_gitlink_is_pinned "$source_gitlink" "$object_id"
+    if [[ -e "$snapshot_gitlink" || -L "$snapshot_gitlink" ]]; then
+      [[ -d "$snapshot_gitlink" && ! -L "$snapshot_gitlink" ]] || {
+        die "source snapshot has a non-directory Gitlink placeholder"
+      }
+      rmdir -- "$snapshot_gitlink" || {
+        die "source snapshot Gitlink placeholder is not empty"
+      }
+    fi
+    snapshot_parent="${snapshot_gitlink%/*}"
+    mkdir -p -- "$snapshot_parent"
+    mkdir -- "$snapshot_gitlink"
+    materialize_source_tree_snapshot \
+      "$source_gitlink" "$object_id" "$snapshot_gitlink" "$((depth + 1))"
+  done <"$entries"
+  rm -f -- "$entries"
+}
+
+assert_materialized_source_tree_matches_revision() {
+  local -r repository="$1"
+  local -r revision="$2"
+  local -r destination="$3"
+  local -r depth="${4:-0}"
+  local entries=""
+  local entry=""
+  local metadata=""
+  local mode=""
+  local object_id=""
+  local path=""
+  local snapshot_path=""
+  local actual_object_id=""
+  local expected_mode=""
+  local actual_mode=""
+  local expected_paths=""
+  local expected_paths_sorted=""
+  local snapshot_paths=""
+  local snapshot_paths_filtered=""
+  local snapshot_paths_sorted=""
+  local actual_path=""
+  local parent_path=""
+  local gitlink_path=""
+  local skip_gitlink_descendant=false
+  local -a gitlink_paths=()
+
+  ((depth <= 16)) || die "source gitlink nesting exceeds the snapshot limit"
+  ensure_source_snapshot_work_directory
+  entries="$(mktemp "$SOURCE_SNAPSHOT_WORK_DIR/.source-snapshot-tree-$depth.XXXXXX")" || {
+    die "could not prepare source snapshot validation"
+  }
+  expected_paths="$(mktemp "$SOURCE_SNAPSHOT_WORK_DIR/.source-snapshot-expected-$depth.XXXXXX")" || {
+    die "could not prepare expected source snapshot paths"
+  }
+  expected_paths_sorted="$(mktemp "$SOURCE_SNAPSHOT_WORK_DIR/.source-snapshot-expected-sorted-$depth.XXXXXX")" || {
+    die "could not prepare sorted expected source snapshot paths"
+  }
+  snapshot_paths="$(mktemp "$SOURCE_SNAPSHOT_WORK_DIR/.source-snapshot-actual-$depth.XXXXXX")" || {
+    die "could not prepare actual source snapshot paths"
+  }
+  snapshot_paths_filtered="$(mktemp "$SOURCE_SNAPSHOT_WORK_DIR/.source-snapshot-actual-filtered-$depth.XXXXXX")" || {
+    die "could not prepare filtered source snapshot paths"
+  }
+  snapshot_paths_sorted="$(mktemp "$SOURCE_SNAPSHOT_WORK_DIR/.source-snapshot-actual-sorted-$depth.XXXXXX")" || {
+    die "could not prepare sorted actual source snapshot paths"
+  }
+  git -C "$repository" ls-tree -r -z --full-tree "$revision" >"$entries" || {
+    die "could not enumerate the pinned source Git tree"
+  }
+  while IFS= read -r -d '' entry; do
+    metadata="${entry%%$'\t'*}"
+    path="${entry#*$'\t'}"
+    mode="${metadata%% *}"
+    object_id="${metadata##* }"
+    is_safe_git_tree_path "$path" || {
+      die "source snapshot validation has an unsafe Git-tree path"
+    }
+    snapshot_path="$destination/$path"
+    printf '%s\0' "$path" >>"$expected_paths"
+    parent_path="$path"
+    while [[ "$parent_path" == */* ]]; do
+      parent_path="${parent_path%/*}"
+      printf '%s\0' "$parent_path" >>"$expected_paths"
+    done
+    case "$mode" in
+      100644|100755)
+        [[ -f "$snapshot_path" && ! -L "$snapshot_path" ]] || {
+          die "source snapshot lacks a regular Git-tree file"
+        }
+        if [[ "$mode" == 100755 ]]; then
+          expected_mode=755
+        else
+          expected_mode=644
+        fi
+        chmod "$expected_mode" -- "$snapshot_path" || {
+          die "could not normalize source snapshot file mode"
+        }
+        actual_object_id="$(git -C "$repository" hash-object --stdin <"$snapshot_path")" || {
+          die "could not hash a source snapshot file"
+        }
+        actual_mode="$(stat --format=%a -- "$snapshot_path")" || {
+          die "could not inspect a source snapshot file mode"
+        }
+        [[ "$actual_object_id" == "$object_id" && "$actual_mode" == "$expected_mode" ]] || {
+          die "source snapshot does not match the pinned Git tree"
+        }
+        ;;
+      120000)
+        [[ -L "$snapshot_path" ]] || {
+          die "source snapshot lacks a symbolic-link Git-tree entry"
+        }
+        actual_object_id="$(
+          readlink -z -- "$snapshot_path" |
+            head -c -1 |
+            git -C "$repository" hash-object --stdin
+        )" || {
+          die "could not hash a source snapshot symbolic link"
+        }
+        [[ "$actual_object_id" == "$object_id" ]] || {
+          die "source snapshot symbolic link does not match the pinned Git tree"
+        }
+        ;;
+      160000)
+        [[ -d "$snapshot_path" && ! -L "$snapshot_path" ]] || {
+          die "source snapshot lacks a materialized Gitlink"
+        }
+        gitlink_paths+=("$path")
+        assert_source_gitlink_is_pinned "$repository/$path" "$object_id"
+        assert_materialized_source_tree_matches_revision \
+          "$repository/$path" "$object_id" "$snapshot_path" "$((depth + 1))"
+        ;;
+      *)
+        die "source snapshot has an unsupported Git-tree mode"
+        ;;
+    esac
+  done <"$entries"
+  LC_ALL=C sort -z -u "$expected_paths" >"$expected_paths_sorted" || {
+    die "could not sort expected source snapshot paths"
+  }
+  find -- "$destination" -mindepth 1 -print0 >"$snapshot_paths" || {
+    die "could not enumerate actual source snapshot paths"
+  }
+  while IFS= read -r -d '' actual_path; do
+    actual_path="${actual_path#"$destination"/}"
+    skip_gitlink_descendant=false
+    for gitlink_path in "${gitlink_paths[@]}"; do
+      if [[ "$actual_path" == "$gitlink_path/"* ]]; then
+        skip_gitlink_descendant=true
+        break
+      fi
+    done
+    [[ "$skip_gitlink_descendant" == false ]] || continue
+    printf '%s\0' "$actual_path"
+  done <"$snapshot_paths" >"$snapshot_paths_filtered" || {
+    die "could not filter actual source snapshot paths"
+  }
+  LC_ALL=C sort -z -u "$snapshot_paths_filtered" >"$snapshot_paths_sorted" || {
+    die "could not sort actual source snapshot paths"
+  }
+  cmp -s "$expected_paths_sorted" "$snapshot_paths_sorted" || {
+    die "source snapshot contains unexpected Git-tree entries"
+  }
+  rm -f -- \
+    "$entries" \
+    "$expected_paths" \
+    "$expected_paths_sorted" \
+    "$snapshot_paths" \
+    "$snapshot_paths_filtered" \
+    "$snapshot_paths_sorted"
+}
+
+prepare_source_snapshot() {
+  local snapshot_compose_file=""
+  local snapshot_fault_compose_file=""
+  local source_artifact_dir="$ARTIFACT_DIR"
+  local artifact_file=""
+  local -a reusable_bridge_artifact_files=(
+    obi-java-agent.jar
+    obi-otel-extension.jar
+    bridge-artifacts.json
+    bridge-artifacts.sha256
+    bridge-metadata.sha256
+    bridge-source-revision.txt
+    bridge-source-tree.sha256
+  )
+
+  [[ "$SOURCE_DIRTY" == false ]] || return 0
+  sanitize_git_environment
+  assert_clean_source_checkout_is_stable
+  ensure_source_snapshot_work_directory
+  assert_source_snapshot_parent_is_trusted
+  if [[ "$SKIP_BRIDGE_BUILD" == "true" ]]; then
+    bridge_artifacts_are_valid || {
+      die "--skip-bridge-build requires checksum-verified bridge artifacts built from the current source tree"
+    }
+  fi
+  SOURCE_SNAPSHOT_DIR="$(mktemp -d "$SOURCE_SNAPSHOT_PARENT/obi-source-snapshot.XXXXXX")" || {
+    die "could not create the private source snapshot"
+  }
+  assert_source_snapshot_root_is_private
+  materialize_source_tree_snapshot \
+    "$REPO_ROOT" "$SOURCE_REVISION" "$SOURCE_SNAPSHOT_DIR" 0
+  find "$SOURCE_SNAPSHOT_DIR" -mindepth 1 -type d -exec chmod 0755 -- {} + || {
+    die "could not normalize source snapshot directory modes"
+  }
+  assert_materialized_source_tree_matches_revision \
+    "$REPO_ROOT" "$SOURCE_REVISION" "$SOURCE_SNAPSHOT_DIR"
+
+  SOURCE_SNAPSHOT_SCRIPT_DIR="$SOURCE_SNAPSHOT_DIR/examples/apache-java-https"
+  [[ -d "$SOURCE_SNAPSHOT_SCRIPT_DIR" && ! -L "$SOURCE_SNAPSHOT_SCRIPT_DIR" ]] || {
+    die "source snapshot lacks the Apache Java HTTPS demo"
+  }
+  snapshot_compose_file="$SOURCE_SNAPSHOT_SCRIPT_DIR/docker-compose.yml"
+  snapshot_fault_compose_file="$SOURCE_SNAPSHOT_SCRIPT_DIR/docker-compose.primary-fault.yml"
+  [[ -f "$snapshot_compose_file" && ! -L "$snapshot_compose_file" && \
+    -f "$snapshot_fault_compose_file" && ! -L "$snapshot_fault_compose_file" ]] || {
+    die "source snapshot lacks the demo Compose configuration"
+  }
+
+  ARTIFACT_DIR="$SOURCE_SNAPSHOT_SCRIPT_DIR/.runtime/artifacts"
+  CERT_DIR="$SOURCE_SNAPSHOT_SCRIPT_DIR/.runtime/certs"
+  prepare_runtime_directory "$ARTIFACT_DIR"
+  prepare_runtime_directory "$CERT_DIR"
+  if [[ "$SKIP_BRIDGE_BUILD" == "true" ]]; then
+    for artifact_file in "${reusable_bridge_artifact_files[@]}"; do
+      install -m 0644 "$source_artifact_dir/$artifact_file" "$ARTIFACT_DIR/$artifact_file"
+    done
+  fi
+  COMPOSE_FILE="$snapshot_compose_file"
+  PRIMARY_FAULT_COMPOSE_FILE="$snapshot_fault_compose_file"
+  COMPOSE_PROJECT_DIRECTORY="$SOURCE_SNAPSHOT_SCRIPT_DIR"
+  COMPOSE=(
+    docker compose --project-name "$PROJECT_NAME" \
+      --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE"
+  )
+  PRIMARY_FAULT_COMPOSE=(
+    docker compose --project-name "$PROJECT_NAME" \
+      --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE" \
+      --file "$PRIMARY_FAULT_COMPOSE_FILE"
+  )
+  assert_clean_source_checkout_is_stable
+}
+
+seal_source_snapshot() {
+  [[ -n "$SOURCE_SNAPSHOT_DIR" ]] || return 0
+  [[ "$SOURCE_SNAPSHOT_DIR" == "$SOURCE_SNAPSHOT_PARENT"/obi-source-snapshot.* && \
+    -d "$SOURCE_SNAPSHOT_DIR" && ! -L "$SOURCE_SNAPSHOT_DIR" ]] || {
+    die "source snapshot path is unsafe"
+  }
+  assert_source_snapshot_root_is_private
+  find "$SOURCE_SNAPSHOT_DIR" -type f -exec chmod a-w -- {} + || {
+    die "could not seal source snapshot files"
+  }
+  find "$SOURCE_SNAPSHOT_DIR" -type d -exec chmod a-w -- {} + || {
+    die "could not seal source snapshot directories"
+  }
+  assert_sealed_source_snapshot_is_private
+}
+
+unseal_source_snapshot() {
+  [[ -n "${SOURCE_SNAPSHOT_DIR:-}" ]] || return 0
+  [[ "$SOURCE_SNAPSHOT_DIR" == "$SOURCE_SNAPSHOT_PARENT"/obi-source-snapshot.* && \
+    -d "$SOURCE_SNAPSHOT_DIR" && ! -L "$SOURCE_SNAPSHOT_DIR" ]] || return 1
+  find "$SOURCE_SNAPSHOT_DIR" -type d -exec chmod u+rwx -- {} +
+}
+
 prepare_certificates() {
+  local certificate_generator="$SCRIPT_DIR/certs/generate.sh"
+
+  if [[ -n "$SOURCE_SNAPSHOT_SCRIPT_DIR" ]]; then
+    assert_source_snapshot_root_is_private
+    certificate_generator="$SOURCE_SNAPSHOT_SCRIPT_DIR/certs/generate.sh"
+  fi
   log_info "preparing runtime test CA"
-  "$SCRIPT_DIR/certs/generate.sh" --output "$CERT_DIR"
+  "$certificate_generator" --output "$CERT_DIR"
 }
 
 prepare_official_agent() {
+  local agent_downloader="$SCRIPT_DIR/scripts/download-agent.sh"
+
+  if [[ -n "$SOURCE_SNAPSHOT_SCRIPT_DIR" ]]; then
+    assert_source_snapshot_root_is_private
+    agent_downloader="$SOURCE_SNAPSHOT_SCRIPT_DIR/scripts/download-agent.sh"
+  fi
   log_info "preparing official $AGENT_DISTRIBUTION Java agent"
-  "$SCRIPT_DIR/scripts/download-agent.sh" \
+  "$agent_downloader" \
     --distribution "$AGENT_DISTRIBUTION" \
     --output "$ARTIFACT_DIR"
 }
@@ -1052,8 +1871,8 @@ bridge_artifacts_are_valid() {
   read -r digest filename extra <<<"${artifact_lines[1]}"
   [[ "$digest" =~ ^[0-9a-f]{64}$ && "$filename" == "obi-otel-extension.jar" && -z "$extra" ]] || return 1
   actual_extension_sha="$digest"
-  [[ "$(sha256sum "$ARTIFACT_DIR/obi-java-agent.jar")" == "$actual_helper_sha  $ARTIFACT_DIR/obi-java-agent.jar" ]] || return 1
-  [[ "$(sha256sum "$ARTIFACT_DIR/obi-otel-extension.jar")" == "$actual_extension_sha  $ARTIFACT_DIR/obi-otel-extension.jar" ]] || return 1
+  [[ "$(sha256_file "$ARTIFACT_DIR/obi-java-agent.jar")" == "$actual_helper_sha" ]] || return 1
+  [[ "$(sha256_file "$ARTIFACT_DIR/obi-otel-extension.jar")" == "$actual_extension_sha" ]] || return 1
 
   mapfile -t metadata_lines <"$ARTIFACT_DIR/bridge-metadata.sha256"
   [[ ${#metadata_lines[@]} -eq 4 ]] || return 1
@@ -1086,10 +1905,8 @@ write_bridge_metadata() {
     bridge-metadata.sha256
   )
 
-  helper_sha="$(sha256sum "$ARTIFACT_DIR/obi-java-agent.jar")"
-  helper_sha="${helper_sha%% *}"
-  extension_sha="$(sha256sum "$ARTIFACT_DIR/obi-otel-extension.jar")"
-  extension_sha="${extension_sha%% *}"
+  helper_sha="$(sha256_file "$ARTIFACT_DIR/obi-java-agent.jar")" || return 1
+  extension_sha="$(sha256_file "$ARTIFACT_DIR/obi-otel-extension.jar")" || return 1
   metadata_dir="$(mktemp -d "$ARTIFACT_DIR/.bridge-metadata.XXXXXX")"
   printf '%s  obi-java-agent.jar\n%s  obi-otel-extension.jar\n' \
     "$helper_sha" "$extension_sha" >"$metadata_dir/bridge-artifacts.sha256"
@@ -1117,7 +1934,19 @@ write_bridge_metadata() {
 
 prepare_bridge_artifacts() {
   local export_dir=""
+  local build_context="$REPO_ROOT"
+  local dockerfile="$REPO_ROOT/javaagent.Dockerfile"
 
+  assert_clean_source_checkout_is_stable
+  if [[ -n "$SOURCE_SNAPSHOT_DIR" ]]; then
+    assert_source_snapshot_root_is_private
+    build_context="$SOURCE_SNAPSHOT_DIR"
+    dockerfile="$SOURCE_SNAPSHOT_DIR/javaagent.Dockerfile"
+  fi
+  [[ -f "$dockerfile" && ! -L "$dockerfile" && \
+    -d "$build_context" && ! -L "$build_context" ]] || {
+    die "pinned source snapshot lacks the Java bridge build inputs"
+  }
   if [[ "$SKIP_BRIDGE_BUILD" == "true" ]]; then
     bridge_artifacts_are_valid || {
       die "--skip-bridge-build requires checksum-verified bridge artifacts built from the current source tree"
@@ -1128,28 +1957,38 @@ prepare_bridge_artifacts() {
     return 0
   fi
 
-  TMP_DIR="$(mktemp -d "$RUNTIME_DIR/.bridge-export.XXXXXX")"
-  export_dir="$TMP_DIR/export"
+  ensure_source_snapshot_work_directory
+  BRIDGE_EXPORT_DIR="$(mktemp -d "$SOURCE_SNAPSHOT_WORK_DIR/bridge-export.XXXXXX")" || {
+    die "could not create the private bridge export directory"
+  }
+  assert_bridge_export_directory_is_private
+  export_dir="$BRIDGE_EXPORT_DIR/export"
   mkdir -p -- "$export_dir"
   log_info "building OBI Java helper and external extension"
   RUN_STAGE="bridge-build"
+  if [[ -n "$SOURCE_SNAPSHOT_DIR" ]]; then
+    assert_source_snapshot_root_is_private
+  fi
+  assert_bridge_export_directory_is_private
   run_logged_bounded "$RESULT_DIR/bridge-build.log" "$COMMAND_TIMEOUT_SECONDS" \
     docker build \
-      --file "$REPO_ROOT/javaagent.Dockerfile" \
+      --file "$dockerfile" \
       --target export \
       --output "type=local,dest=$export_dir" \
-      "$REPO_ROOT" || return
+      "$build_context" || return
 
+  assert_clean_source_checkout_is_stable
+  assert_bridge_export_directory_is_private
   [[ -s "$export_dir/obi-java-agent.jar" ]] || die "Java build did not export obi-java-agent.jar"
   [[ -s "$export_dir/obi-otel-extension.jar" ]] || die "Java build did not export obi-otel-extension.jar"
-  install -m 0644 "$export_dir/obi-java-agent.jar" "$TMP_DIR/obi-java-agent.jar.ready"
-  install -m 0644 "$export_dir/obi-otel-extension.jar" "$TMP_DIR/obi-otel-extension.jar.ready"
-  mv -fT -- "$TMP_DIR/obi-java-agent.jar.ready" "$ARTIFACT_DIR/obi-java-agent.jar"
-  mv -fT -- "$TMP_DIR/obi-otel-extension.jar.ready" "$ARTIFACT_DIR/obi-otel-extension.jar"
+  install -m 0644 "$export_dir/obi-java-agent.jar" "$BRIDGE_EXPORT_DIR/obi-java-agent.jar.ready"
+  install -m 0644 "$export_dir/obi-otel-extension.jar" "$BRIDGE_EXPORT_DIR/obi-otel-extension.jar.ready"
+  mv -fT -- "$BRIDGE_EXPORT_DIR/obi-java-agent.jar.ready" "$ARTIFACT_DIR/obi-java-agent.jar"
+  mv -fT -- "$BRIDGE_EXPORT_DIR/obi-otel-extension.jar.ready" "$ARTIFACT_DIR/obi-otel-extension.jar"
   write_bridge_metadata
 
-  rm -rf -- "$TMP_DIR"
-  TMP_DIR=""
+  rm -rf -- "$BRIDGE_EXPORT_DIR"
+  BRIDGE_EXPORT_DIR=""
 }
 
 configure_security_probe_timeouts() {
@@ -1191,6 +2030,9 @@ uses_uninstrumented_runtime() {
 }
 
 export_compose_environment() {
+  if [[ -n "$SOURCE_SNAPSHOT_DIR" ]]; then
+    assert_sealed_source_snapshot_is_private
+  fi
   SECURITY_PROBE_TIMEOUT="60s"
   PRIMARY_SECURITY_SAME_CGROUP_TIMEOUT="60s"
   if [[ "$SCENARIO" == "all" || "$SCENARIO" == "security" ]]; then
@@ -1226,6 +2068,7 @@ start_stack() {
   local runtime_contract_mode="$SCENARIO"
   local -a recreate_arguments=()
 
+  assert_clean_source_checkout_is_stable
   # The primary fault scenario replaces the normal Java runtime only after startup.
   case "$runtime_contract_mode" in
     primary-w3c-fault)
@@ -1245,6 +2088,9 @@ start_stack() {
   }
   log_info "validating resolved Compose configuration"
   RUN_STAGE="compose-configuration"
+  if [[ -n "$SOURCE_SNAPSHOT_DIR" ]]; then
+    assert_sealed_source_snapshot_is_private
+  fi
   run_bounded 30 "${COMPOSE[@]}" config --quiet || return $?
   run_bounded 30 \
     "${COMPOSE[@]}" config >"$RESULT_DIR/compose-resolved.yaml" || return $?
@@ -1252,6 +2098,9 @@ start_stack() {
   invalidate_project_transport_evidence || return $?
   log_info "building and starting the demo stack"
   RUN_STAGE="compose-build-start"
+  if [[ -n "$SOURCE_SNAPSHOT_DIR" ]]; then
+    assert_sealed_source_snapshot_is_private
+  fi
   startup_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" || return $?
   STACK_STARTED=true
   if [[ "$SCENARIO" == "delayed-otlp-suppression" ]]; then
@@ -8350,6 +9199,7 @@ capture_environment() {
     printf 'revision=%s\n' "$SOURCE_REVISION"
     printf 'dirty=%s\n' "$SOURCE_DIRTY"
     printf 'source_tree_sha256=%s\n' "$SOURCE_TREE_SHA256"
+    printf 'source_tree_manifest_schema=%s\n' "$SOURCE_TREE_MANIFEST_SCHEMA"
     printf 'tracked_patch_sha256=%s\n' "$SOURCE_TRACKED_PATCH_SHA256"
     printf 'patch_identity_sha256=%s\n' "$SOURCE_PATCH_SHA256"
     printf 'transport=%s\n' "$TRANSPORT"
@@ -9579,16 +10429,21 @@ run_demo() {
   prepare_directories
   RUN_STAGE="source-state"
   capture_source_state
+  RUN_STAGE="source-snapshot"
+  prepare_source_snapshot
   RUN_STAGE="certificates"
   prepare_certificates
   RUN_STAGE="official-agent"
   prepare_official_agent
   RUN_STAGE="bridge-artifacts"
   prepare_bridge_artifacts
+  RUN_STAGE="source-snapshot-seal"
+  seal_source_snapshot
   RUN_STAGE="compose-environment"
   export_compose_environment
   RUN_STAGE="environment-evidence"
   capture_environment
+  assert_clean_source_checkout_is_stable
   start_stack
   RUN_STAGE="scenarios"
   if [[ "$SCENARIO" == "delayed-otlp-suppression" ]]; then
@@ -9601,6 +10456,7 @@ run_demo() {
     RUN_STAGE="scenarios"
     execute_requested_scenarios
   fi
+  assert_clean_source_checkout_is_stable
   RUN_STATUS="passed"
   RUN_STAGE="complete"
   log_info "all requested assertions passed; evidence: $RESULT_DIR"

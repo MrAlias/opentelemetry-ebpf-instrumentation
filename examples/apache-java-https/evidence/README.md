@@ -4,6 +4,60 @@ This directory contains bounded, sanitized artifacts from clean full demo runs.
 Each evidence directory records the exact source revision and invocation,
 contains a checksum manifest, and states which matrix cell it can support.
 
+## Verify a retained bundle
+
+Verify a published bundle before relying on it for a matrix cell:
+
+```bash
+./examples/apache-java-https/scripts/verify-retained-evidence.sh \
+  examples/apache-java-https/evidence/otel-getsockopt-tls13-c9d14356
+```
+
+The verifier accepts only a published evidence directory tracked by the `HEAD`
+commit captured when verification begins in the same Git checkout as the
+verifier. It reads that immutable Git snapshot, requires an exact checksum file
+set, a canonical public evidence identifier, and a passed clean full `all`
+result. It rejects a supplied bundle path that differs from the captured commit
+or contains extra working-tree files, and reports the pinned checkout commit on
+success. Its immutable archive snapshot is created under the same fixed,
+physically validated root-owned sticky `/tmp` boundary, not caller-controlled
+`TMPDIR`, and sealed read-only before validation. It also regenerates
+`source-tree.manifest` from the recorded source commit and compares it
+byte-for-byte. The reviewed Git checkout and its available provenance history
+are therefore the trust root; `SHA256SUMS` alone provides integrity checking,
+not independent authenticity. A raw `.runtime` result, an untracked copied
+bundle, or a targeted focused run cannot satisfy this acceptance-bundle
+contract.
+
+New clean runs record `source_tree_manifest_schema=git-tree-v2` in both source
+metadata files. That schema canonically represents regular, executable,
+symbolic-link, and gitlink tree entries from the recorded Git commit. Only the
+seven named historical bundles below may omit the schema because their original
+regular-file manifests are pinned to their exact recorded revisions.
+Before a clean run invokes Docker, the runner materializes a private snapshot
+from that pinned Git tree (recursively materializing initialized gitlinks at
+their recorded commits), verifies its contents and executable modes, and uses
+the snapshot's Dockerfiles, Compose build contexts, and source bind mounts.
+The snapshot is a current-user-owned `0700` child of the fixed, physically
+validated root-owned sticky `/tmp` directory; it never uses caller-controlled
+`TMPDIR` or the working tree's runtime directory. Only generated runtime
+certificates and checked bridge artifacts are added to that private snapshot.
+The runner keeps Git-tree control records and Docker bridge-export intermediates
+in a separate private `0700` child of that same boundary, so generated control
+files are not part of the source-tree inventory or exposed through `.runtime`.
+Consequently, ignored working-tree files, filters, and Git configuration such
+as `core.fileMode=false` cannot alter the clean-run source inputs Docker
+receives. Once its generated runtime inputs are present, the runner seals the
+snapshot read-only before Compose builds or starts the stack. This requires a
+local filesystem that honors POSIX ownership and sticky-directory semantics;
+ACL or network filesystems that do not provide equivalent isolation are
+unsupported. The boundary does not defend against another process running as
+the same user and deliberately changing file permissions; that process is
+within the local execution trust boundary. Dirty local runs remain
+non-acceptance evidence.
+The runner also fails a clean run if its source revision, index, working tree,
+or nested gitlink state changes after capture.
+
 ## Historical metric schemas
 
 The retained bundles are immutable evidence for their recorded revisions. The
@@ -20,8 +74,8 @@ snapshots. The prior
 current schema has an
 eleven-operation, 792-series upper bound, as documented in the [Java
 remote-parent bridge guide](../../../devdocs/java-remote-parent-bridge.md).
-Checksum verification authenticates the retained artifacts; it does not recast
-their historical schema.
+Checksum verification preserves the checked-in artifact set; it does not
+recast their historical schema.
 
 | Evidence | Result | Matrix cell |
 | --- | --- | --- |

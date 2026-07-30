@@ -92,7 +92,11 @@ EOF
     export FAKE_DOCKER_DOWN_MARKER="$docker_down_marker"
     export FAKE_DOCKER_MODE=owned
     PROJECT_NAME="obi-apache-java-https-test"
-    COMPOSE=(docker compose --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE")
+    # shellcheck disable=SC2153 # Sourced run.sh declares this global fixture path.
+    COMPOSE=(
+      docker compose --project-name "$PROJECT_NAME" \
+        --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE"
+    )
     safe_compose_down
   )
   grep -Fq 'compose --project-name obi-apache-java-https-test' "$docker_log" || {
@@ -116,7 +120,10 @@ EOF
     export FAKE_DOCKER_DOWN_MARKER="$docker_down_marker"
     export FAKE_DOCKER_MODE=foreign
     PROJECT_NAME="obi-apache-java-https-test"
-    COMPOSE=(docker compose --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE")
+    COMPOSE=(
+      docker compose --project-name "$PROJECT_NAME" \
+        --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE"
+    )
     safe_compose_down
   ) >/dev/null 2>&1; then
     printf 'cleanup accepted a foreign resource in the reserved project namespace\n' >&2
@@ -135,7 +142,10 @@ EOF
     export FAKE_DOCKER_DOWN_MARKER="$docker_down_marker"
     export FAKE_DOCKER_MODE=leftover
     PROJECT_NAME="obi-apache-java-https-test"
-    COMPOSE=(docker compose --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE")
+    COMPOSE=(
+      docker compose --project-name "$PROJECT_NAME" \
+        --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE"
+    )
     safe_compose_down
   ) >/dev/null 2>&1; then
     printf 'cleanup accepted project resources left behind by Compose\n' >&2
@@ -8424,8 +8434,10 @@ test_pipeline_dependencies_are_declared() {
 
   definition="$(declare -f check_dependencies)"
   [[ "$definition" == *" jq "* && "$definition" == *" mv "* && \
-    "$definition" == *" tee "* ]] || {
-    printf 'runner dependency check omitted jq, mv, or tee\n' >&2
+    "$definition" == *" tee "* && "$definition" == *" tar "* && \
+    "$definition" == *" head "* && "$definition" == *" readlink "* && \
+    "$definition" == *" rmdir "* && "$definition" == *" stat "* ]] || {
+    printf 'runner dependency check omitted a required evidence or snapshot command\n' >&2
     return 1
   }
 }
@@ -11020,6 +11032,7 @@ test_pre_environment_failure_retains_acceptance_eligibility() {
     RESULT_DIR=""
     TMP_DIR=""
     STACK_STARTED=false
+    CLEANUP_ONLY=false
     RUN_STATUS=failed
     ACCEPTANCE_EVIDENCE=true
     ACCEPTANCE_EVIDENCE_REASON=""
@@ -11334,6 +11347,1285 @@ test_non_acceptance_reasons_are_recorded() {
     printf 'non-acceptance evidence reasons were not retained\n' >&2
     return 1
   }
+}
+
+test_retained_evidence_provenance_is_verified() {
+  local -r verifier="$TEST_SCRIPT_DIR/verify-retained-evidence.sh"
+  local -r evidence_root="$TEST_SCRIPT_DIR/../evidence"
+  local -r source_bundle="$evidence_root/otel-getsockopt-tls13-c9d14356"
+  local repository_root=""
+  local -r fixture_repository="$TEST_TMP_DIR/retained-evidence-fixture-repository"
+  local -r fixture_hooks_dir="$fixture_repository/controlled-hooks"
+  local -r fixture_verifier="$fixture_repository/examples/apache-java-https/scripts/verify-retained-evidence.sh"
+  local -r fixture_bundle="$fixture_repository/examples/apache-java-https/evidence/${source_bundle##*/}"
+  local -r untracked_bundle="$TEST_TMP_DIR/untracked-retained-evidence/${source_bundle##*/}"
+  local -r unsafe_bundle="$TEST_TMP_DIR/unsafe retained evidence"
+  local -r option_tmp_parent="$TEST_TMP_DIR/retained-evidence-mktemp-option"
+  local -r backslash_tmp="$TEST_TMP_DIR/retained-evidence\\temporary"
+  local -r tmpdir_audit_bin="$TEST_TMP_DIR/retained-evidence-tmpdir-audit-bin"
+  local -r tmpdir_audit_mktemp="$tmpdir_audit_bin/mktemp"
+  local -r archive_race_bin="$TEST_TMP_DIR/retained-evidence-archive-race-bin"
+  local -r archive_race_tmp="$TEST_TMP_DIR/retained-evidence-archive-race-tmp"
+  local -r archive_race_workdir="$TEST_TMP_DIR/retained-evidence-archive-race-workdir"
+  local -r archive_race_git="$archive_race_bin/git"
+  local -r archive_race_mktemp="$archive_race_bin/mktemp"
+  local -r archive_race_record="$archive_race_tmp/archive-directory"
+  local -r replacement_index="$TEST_TMP_DIR/retained-evidence-replacement-index"
+  local -r fixture_status_path="examples/apache-java-https/evidence/${source_bundle##*/}/run-status.json"
+  local bundle=""
+  local manifest_line=""
+  local fabricated_tree_sha256=""
+  local fixture_head=""
+  local replacement_blob=""
+  local replacement_tree=""
+  local replacement_commit=""
+  local real_git=""
+  local real_mktemp=""
+
+  commit_fixture_state() {
+    local -r subject="$1"
+
+    git -C "$fixture_repository" add -A -- examples/apache-java-https
+    git -C "$fixture_repository" commit --quiet -m "$subject"
+  }
+
+  reset_fixture_bundle() {
+    local -r subject="$1"
+
+    [[ "$fixture_bundle" == "$fixture_repository/"* ]] || return 2
+    if [[ -e "$fixture_bundle" || -L "$fixture_bundle" ]]; then
+      rm -rf -- "$fixture_bundle"
+    fi
+    mkdir -p -- "${fixture_bundle%/*}"
+    cp -a -- "$source_bundle" "$fixture_bundle"
+    commit_fixture_state "$subject"
+  }
+
+  rewrite_bundle_checksums() {
+    local -r bundle_directory="$1"
+    local file=""
+
+    (
+      cd -- "$bundle_directory"
+      while IFS= read -r file; do
+        sha256sum "$file"
+      done < <(find . -type f ! -path './SHA256SUMS' -printf '%p\n' | LC_ALL=C sort) >SHA256SUMS
+    )
+  }
+
+  expect_invalid_bundle() {
+    local -r verifier_path="$1"
+    local -r bundle_directory="$2"
+    local -r description="$3"
+
+    if "$verifier_path" "$bundle_directory" >/dev/null 2>&1; then
+      printf 'retained evidence verifier accepted %s\n' "$description" >&2
+      return 1
+    fi
+  }
+
+  commit_invalid_fixture() {
+    local -r description="$1"
+
+    commit_fixture_state "Test $description"
+    expect_invalid_bundle "$fixture_verifier" "$fixture_bundle" "$description"
+  }
+
+  [[ -x "$verifier" ]] || {
+    printf 'retained evidence verifier is not executable\n' >&2
+    return 1
+  }
+  for bundle in "$evidence_root"/*; do
+    [[ -d "$bundle" ]] || continue
+    "$verifier" "$bundle" >/dev/null || return 1
+  done
+
+  mkdir -p -- "${untracked_bundle%/*}" "$unsafe_bundle" \
+    "$option_tmp_parent/--help" "$backslash_tmp" "$tmpdir_audit_bin"
+  cp -a -- "$source_bundle" "$untracked_bundle"
+  expect_invalid_bundle "$verifier" "$untracked_bundle" "an untracked copied bundle"
+  expect_invalid_bundle "$verifier" "$unsafe_bundle" "an unsafe evidence path"
+  (
+    cd -- "$option_tmp_parent"
+    TMPDIR=--help "$verifier" "$source_bundle" >/dev/null
+  ) || {
+    printf 'retained evidence verifier did not handle an option-like TMPDIR\n' >&2
+    return 1
+  }
+  TMPDIR="$backslash_tmp" "$verifier" "$source_bundle" >/dev/null || {
+    printf 'retained evidence verifier did not handle a backslash TMPDIR\n' >&2
+    return 1
+  }
+  real_mktemp="$(command -v mktemp)" || return 1
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -Eeuo pipefail' \
+    'for argument in "$@"; do' \
+    '  [[ "$argument" != *"$FORBIDDEN_TMPDIR"* ]] || exit 73' \
+    'done' \
+    'exec "$REAL_MKTEMP" "$@"' >"$tmpdir_audit_mktemp"
+  chmod 0755 -- "$tmpdir_audit_mktemp"
+  PATH="$tmpdir_audit_bin:$PATH" \
+    REAL_MKTEMP="$real_mktemp" FORBIDDEN_TMPDIR="$backslash_tmp" TMPDIR="$backslash_tmp" \
+    "$verifier" "$source_bundle" >/dev/null || {
+    printf 'retained evidence verifier used caller-controlled TMPDIR\n' >&2
+    return 1
+  }
+  real_git="$(command -v git)" || return 1
+  mkdir -p -- "$archive_race_bin" "$archive_race_tmp" "$archive_race_workdir"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -Eeuo pipefail' \
+    'for argument in "$@"; do' \
+    '  if [[ "$argument" == archive ]]; then' \
+    '    if [[ -s "$RACE_ARCHIVE_RECORD" ]]; then' \
+    '      IFS= read -r archive_directory <"$RACE_ARCHIVE_RECORD"' \
+    '      rmdir -- "$archive_directory"' \
+    '    fi' \
+    '    break' \
+    '  fi' \
+    'done' \
+    'exec "$REAL_GIT" "$@"' >"$archive_race_git"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -Eeuo pipefail' \
+    'result="$("$REAL_MKTEMP" "$@")"' \
+    'case "$result" in' \
+    '  /tmp/verify-retained-evidence.*/archive.*)' \
+    '    printf "%s\\n" "$result" >"$RACE_ARCHIVE_RECORD"' \
+    '    ;;' \
+    'esac' \
+    'printf "%s\\n" "$result"' >"$archive_race_mktemp"
+  chmod 0755 -- "$archive_race_git" "$archive_race_mktemp"
+  if (
+    cd -- "$archive_race_workdir"
+    PATH="$archive_race_bin:$PATH" \
+      REAL_GIT="$real_git" REAL_MKTEMP="$real_mktemp" RACE_ARCHIVE_RECORD="$archive_race_record" \
+      TMPDIR="$archive_race_tmp" \
+      "$verifier" "$source_bundle"
+  ) >/dev/null 2>&1; then
+    printf 'retained evidence verifier continued after its archive destination disappeared\n' >&2
+    return 1
+  fi
+  [[ ! -e "$archive_race_workdir/examples" && ! -L "$archive_race_workdir/examples" ]] || {
+    printf 'retained evidence verifier wrote archive output outside its destination\n' >&2
+    return 1
+  }
+
+  repository_root="$(git -C "$TEST_SCRIPT_DIR" rev-parse --show-toplevel)" || return 1
+  git clone --shared --no-checkout --quiet "$repository_root" "$fixture_repository"
+  git -C "$fixture_repository" read-tree --empty
+  git -C "$fixture_repository" config user.email 'retained-evidence-test@example.invalid'
+  git -C "$fixture_repository" config user.name 'Retained Evidence Test'
+  git -C "$fixture_repository" config commit.gpgSign false
+  mkdir -p -- "${fixture_verifier%/*}" "$fixture_hooks_dir"
+  git -C "$fixture_repository" config core.hooksPath "$fixture_hooks_dir"
+  cp -- "$verifier" "$fixture_verifier"
+  chmod 0755 -- "$fixture_verifier"
+  reset_fixture_bundle 'Add retained-evidence fixture'
+  expect_invalid_bundle "$verifier" "$fixture_bundle" \
+    "a bundle from a different Git checkout"
+  "$fixture_verifier" "$fixture_bundle" >/dev/null || return 1
+  fixture_head="$(GIT_NO_REPLACE_OBJECTS=1 git -C "$fixture_repository" rev-parse HEAD)"
+  replacement_blob="$(
+    printf '{"status":"failed"}\n' |
+      GIT_NO_REPLACE_OBJECTS=1 git -C "$fixture_repository" hash-object -w --stdin
+  )"
+  GIT_NO_REPLACE_OBJECTS=1 GIT_INDEX_FILE="$replacement_index" \
+    git -C "$fixture_repository" read-tree "${fixture_head}^{tree}"
+  GIT_NO_REPLACE_OBJECTS=1 GIT_INDEX_FILE="$replacement_index" \
+    git -C "$fixture_repository" update-index --add \
+      --cacheinfo "100644,$replacement_blob,$fixture_status_path"
+  replacement_tree="$(
+    GIT_NO_REPLACE_OBJECTS=1 GIT_INDEX_FILE="$replacement_index" \
+      git -C "$fixture_repository" write-tree
+  )"
+  replacement_commit="$(
+    printf 'replacement retained evidence fixture\n' |
+      GIT_NO_REPLACE_OBJECTS=1 \
+        git -C "$fixture_repository" commit-tree "$replacement_tree" -p "$fixture_head"
+  )"
+  GIT_NO_REPLACE_OBJECTS=1 \
+    git -C "$fixture_repository" replace "$fixture_head" "$replacement_commit"
+  env -u GIT_NO_REPLACE_OBJECTS "$fixture_verifier" "$fixture_bundle" >/dev/null || {
+    printf 'retained evidence verifier trusted a local Git replacement ref\n' >&2
+    return 1
+  }
+  GIT_NO_REPLACE_OBJECTS=1 git -C "$fixture_repository" replace -d "$fixture_head"
+  GIT_DIR="$fixture_repository/.git" \
+    GIT_WORK_TREE="$fixture_repository" \
+    GIT_INDEX_FILE="$fixture_repository/.git/index" \
+    "$verifier" "$source_bundle" >/dev/null || {
+      printf 'retained evidence verifier trusted caller-selected Git state\n' >&2
+      return 1
+    }
+  if GIT_DIR="$fixture_repository/.git" \
+    GIT_WORK_TREE="$fixture_repository" \
+    GIT_INDEX_FILE="$fixture_repository/.git/index" \
+    "$verifier" "$fixture_bundle" >/dev/null 2>&1; then
+    printf 'retained evidence verifier accepted a foreign bundle through Git environment redirection\n' >&2
+    return 1
+  fi
+  jq '.status = "failed"' "$fixture_bundle/run-status.json" \
+    >"$fixture_bundle/run-status.json.tmp"
+  mv -- "$fixture_bundle/run-status.json.tmp" "$fixture_bundle/run-status.json"
+  expect_invalid_bundle "$fixture_verifier" "$fixture_bundle" \
+    "a modified supplied bundle"
+  cp -a -- "$source_bundle/." "$fixture_bundle"
+  "$fixture_verifier" "$fixture_bundle" >/dev/null || return 1
+  : >"$fixture_bundle/untracked-working-tree-file"
+  expect_invalid_bundle "$fixture_verifier" "$fixture_bundle" \
+    "a supplied bundle with an extra working-tree file"
+  rm -f -- "$fixture_bundle/untracked-working-tree-file"
+  "$fixture_verifier" "$fixture_bundle" >/dev/null || return 1
+
+  jq '.status = "failed"' "$fixture_bundle/run-status.json" \
+    >"$fixture_bundle/run-status.json.tmp"
+  mv -- "$fixture_bundle/run-status.json.tmp" "$fixture_bundle/run-status.json"
+  commit_invalid_fixture "a checksum-corrupted bundle"
+
+  reset_fixture_bundle 'Restore retained-evidence fixture after checksum test'
+  : >"$fixture_bundle/unlisted.txt"
+  commit_invalid_fixture "an unlisted bundle file"
+
+  reset_fixture_bundle 'Restore retained-evidence fixture after file-set test'
+  ln -s run-status.json "$fixture_bundle/linked-status.json"
+  commit_invalid_fixture "a symbolic-link bundle file"
+
+  reset_fixture_bundle 'Restore retained-evidence fixture after symlink test'
+  jq '.status = "failed"' "$fixture_bundle/run-status.json" \
+    >"$fixture_bundle/run-status.json.tmp"
+  mv -- "$fixture_bundle/run-status.json.tmp" "$fixture_bundle/run-status.json"
+  rewrite_bundle_checksums "$fixture_bundle"
+  commit_invalid_fixture "a failed retained status"
+
+  reset_fixture_bundle 'Restore retained-evidence fixture after status test'
+  jq '.acceptance_evidence = false' "$fixture_bundle/run-status.json" \
+    >"$fixture_bundle/run-status.json.tmp"
+  mv -- "$fixture_bundle/run-status.json.tmp" "$fixture_bundle/run-status.json"
+  rewrite_bundle_checksums "$fixture_bundle"
+  commit_invalid_fixture "an ineligible retained status"
+
+  reset_fixture_bundle 'Restore retained-evidence fixture after eligibility test'
+  jq '.evidence_id = "wrong-evidence-id"' "$fixture_bundle/run-status.json" \
+    >"$fixture_bundle/run-status.json.tmp"
+  mv -- "$fixture_bundle/run-status.json.tmp" "$fixture_bundle/run-status.json"
+  rewrite_bundle_checksums "$fixture_bundle"
+  commit_invalid_fixture "a mismatched evidence identifier"
+
+  reset_fixture_bundle 'Restore retained-evidence fixture after identity test'
+  jq '.evidence_directory = "/tmp/raw-result"' "$fixture_bundle/run-status.json" \
+    >"$fixture_bundle/run-status.json.tmp"
+  mv -- "$fixture_bundle/run-status.json.tmp" "$fixture_bundle/run-status.json"
+  rewrite_bundle_checksums "$fixture_bundle"
+  commit_invalid_fixture "a raw evidence directory"
+
+  reset_fixture_bundle 'Restore retained-evidence fixture after raw-path test'
+  awk '
+    /^revision=/ {
+      print "revision=0000000000000000000000000000000000000000"
+      next
+    }
+    { print }
+  ' "$fixture_bundle/environment.txt" >"$fixture_bundle/environment.txt.tmp"
+  mv -- "$fixture_bundle/environment.txt.tmp" "$fixture_bundle/environment.txt"
+  rewrite_bundle_checksums "$fixture_bundle"
+  commit_invalid_fixture "a mismatched source revision"
+
+  reset_fixture_bundle 'Restore retained-evidence fixture after revision test'
+  awk '
+    /^dirty=/ { print "dirty=true"; next }
+    { print }
+  ' "$fixture_bundle/source-state.txt" >"$fixture_bundle/source-state.txt.tmp"
+  mv -- "$fixture_bundle/source-state.txt.tmp" "$fixture_bundle/source-state.txt"
+  rewrite_bundle_checksums "$fixture_bundle"
+  commit_invalid_fixture "a dirty source state"
+
+  reset_fixture_bundle 'Restore retained-evidence fixture after dirty-state test'
+  awk '
+    /^scenario=/ { print "scenario=basic"; next }
+    { print }
+  ' "$fixture_bundle/environment.txt" >"$fixture_bundle/environment.txt.tmp"
+  mv -- "$fixture_bundle/environment.txt.tmp" "$fixture_bundle/environment.txt"
+  rewrite_bundle_checksums "$fixture_bundle"
+  commit_invalid_fixture "a targeted scenario"
+
+  reset_fixture_bundle 'Restore retained-evidence fixture after scenario test'
+  awk '
+    /^request_count=/ { print "request_count=1"; next }
+    { print }
+  ' "$fixture_bundle/environment.txt" >"$fixture_bundle/environment.txt.tmp"
+  mv -- "$fixture_bundle/environment.txt.tmp" "$fixture_bundle/environment.txt"
+  rewrite_bundle_checksums "$fixture_bundle"
+  commit_invalid_fixture "a custom full-suite request count"
+
+  reset_fixture_bundle 'Restore retained-evidence fixture after request-count test'
+  awk '$0 !~ /^request_count=/' "$fixture_bundle/environment.txt" \
+    >"$fixture_bundle/environment.txt.tmp"
+  mv -- "$fixture_bundle/environment.txt.tmp" "$fixture_bundle/environment.txt"
+  rewrite_bundle_checksums "$fixture_bundle"
+  commit_invalid_fixture "a current bundle without request-count evidence"
+
+  reset_fixture_bundle 'Restore retained-evidence fixture after missing-count test'
+  awk '
+    /^bridge_build_mode=/ { print "bridge_build_mode=reused-local-cache"; next }
+    { print }
+  ' "$fixture_bundle/environment.txt" >"$fixture_bundle/environment.txt.tmp"
+  mv -- "$fixture_bundle/environment.txt.tmp" "$fixture_bundle/environment.txt"
+  rewrite_bundle_checksums "$fixture_bundle"
+  commit_invalid_fixture "a reused bridge build"
+
+  reset_fixture_bundle 'Restore retained-evidence fixture after build-mode test'
+  awk '
+    /^acceptance_evidence_reason=/ {
+      print "acceptance_evidence_reason=targeted-scenario"
+      next
+    }
+    { print }
+  ' "$fixture_bundle/environment.txt" >"$fixture_bundle/environment.txt.tmp"
+  mv -- "$fixture_bundle/environment.txt.tmp" "$fixture_bundle/environment.txt"
+  rewrite_bundle_checksums "$fixture_bundle"
+  commit_invalid_fixture "an ineligible acceptance reason"
+
+  reset_fixture_bundle 'Restore retained-evidence fixture after reason test'
+  awk '
+    NR == 1 {
+      print "0000000000000000000000000000000000000000" substr($0, 41)
+      next
+    }
+    { print }
+  ' "$fixture_bundle/source-tree.manifest" >"$fixture_bundle/source-tree.manifest.tmp"
+  mv -- "$fixture_bundle/source-tree.manifest.tmp" "$fixture_bundle/source-tree.manifest"
+  fabricated_tree_sha256="$(sha256sum <"$fixture_bundle/source-tree.manifest")"
+  fabricated_tree_sha256="${fabricated_tree_sha256%% *}"
+  for bundle in "$fixture_bundle/environment.txt" "$fixture_bundle/source-state.txt"; do
+    awk -v digest="$fabricated_tree_sha256" '
+      /^source_tree_sha256=/ { print "source_tree_sha256=" digest; next }
+      { print }
+    ' "$bundle" >"$bundle.tmp"
+    mv -- "$bundle.tmp" "$bundle"
+  done
+  printf '%s\n' "$fabricated_tree_sha256" >"$fixture_bundle/bridge-source-tree.sha256"
+  jq --arg digest "$fabricated_tree_sha256" '.source_tree_sha256 = $digest' \
+    "$fixture_bundle/bridge-artifacts.json" >"$fixture_bundle/bridge-artifacts.json.tmp"
+  mv -- "$fixture_bundle/bridge-artifacts.json.tmp" "$fixture_bundle/bridge-artifacts.json"
+  rewrite_bundle_checksums "$fixture_bundle"
+  commit_invalid_fixture "an internally re-checksummed fabricated source tree"
+
+  reset_fixture_bundle 'Restore retained-evidence fixture after source-tree test'
+  awk '
+    /^tracked_patch_sha256=/ {
+      print "tracked_patch_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      next
+    }
+    { print }
+  ' "$fixture_bundle/source-state.txt" >"$fixture_bundle/source-state.txt.tmp"
+  mv -- "$fixture_bundle/source-state.txt.tmp" "$fixture_bundle/source-state.txt"
+  rewrite_bundle_checksums "$fixture_bundle"
+  commit_invalid_fixture "a source state with a tracked patch"
+
+  reset_fixture_bundle 'Restore retained-evidence fixture after patch-state test'
+  printf ' M tracked-file\n' >"$fixture_bundle/git-status.txt"
+  rewrite_bundle_checksums "$fixture_bundle"
+  commit_invalid_fixture "a nonempty retained git-status record"
+
+  reset_fixture_bundle 'Restore retained-evidence fixture after git-status test'
+  manifest_line="$(sed -n '1p' "$fixture_bundle/SHA256SUMS")" || return 1
+  printf '%s\n' "$manifest_line" >>"$fixture_bundle/SHA256SUMS"
+  commit_invalid_fixture "a duplicate checksum path"
+
+  reset_fixture_bundle 'Restore retained-evidence fixture after duplicate-manifest test'
+  manifest_line="$(sed -n '1p' "$fixture_bundle/SHA256SUMS")" || return 1
+  printf '%s  ./../outside\n' "${manifest_line:0:64}" >>"$fixture_bundle/SHA256SUMS"
+  commit_invalid_fixture "an unsafe checksum path"
+}
+
+capture_fixture_source_state() {
+  local -r fixture_runner="$1"
+  local -r result_directory="$2"
+  local -r expectation="$3"
+
+  bash -c '
+    set -Eeuo pipefail
+    fixture_runner=$1
+    result_directory=$2
+    expectation=$3
+    source "$fixture_runner"
+    trap cleanup_source_snapshot_work_directory EXIT
+    RESULT_DIR="$result_directory"
+    SOURCE_DIRTY=""
+    SOURCE_PATCH_SHA256=""
+    SOURCE_REVISION=""
+    SOURCE_TRACKED_PATCH_SHA256=""
+    SOURCE_TREE_SHA256=""
+    SOURCE_TREE_MANIFEST_SCHEMA=""
+    ACCEPTANCE_EVIDENCE=true
+    ACCEPTANCE_EVIDENCE_REASON=""
+    capture_source_state
+    case "$expectation" in
+      clean)
+        [[ "$SOURCE_DIRTY" == false && "$SOURCE_TREE_MANIFEST_SCHEMA" == git-tree-v2 && \
+          "$ACCEPTANCE_EVIDENCE" == true && -z "$ACCEPTANCE_EVIDENCE_REASON" ]]
+        ;;
+      dirty)
+        [[ "$SOURCE_DIRTY" == true && "$SOURCE_TREE_MANIFEST_SCHEMA" == worktree-v1 && \
+          "$ACCEPTANCE_EVIDENCE" == false && \
+          "$ACCEPTANCE_EVIDENCE_REASON" == dirty-source-tree ]]
+        ;;
+      *) exit 64 ;;
+    esac
+  ' fixture-runner-child "$fixture_runner" "$result_directory" "$expectation"
+}
+
+materialize_fixture_source_snapshot() {
+  local -r fixture_runner="$1"
+  local -r result_directory="$2"
+  local -r fixture_repository="$3"
+  local -r source_revision="$4"
+  local -r snapshot_directory="$5"
+
+  bash -c '
+    set -Eeuo pipefail
+    fixture_runner=$1
+    result_directory=$2
+    fixture_repository=$3
+    source_revision=$4
+    snapshot_directory=$5
+    source "$fixture_runner"
+    trap cleanup_source_snapshot_work_directory EXIT
+    RESULT_DIR="$result_directory"
+    materialize_source_tree_snapshot \
+      "$fixture_repository" "$source_revision" "$snapshot_directory" 0
+    find "$snapshot_directory" -mindepth 1 -type d -exec chmod 0755 -- {} +
+    assert_materialized_source_tree_matches_revision \
+      "$fixture_repository" "$source_revision" "$snapshot_directory"
+  ' fixture-runner-child \
+    "$fixture_runner" "$result_directory" "$fixture_repository" "$source_revision" \
+    "$snapshot_directory"
+}
+
+materialize_fixture_source_snapshot_rejects_removed_destination() {
+  local -r fixture_runner="$1"
+  local -r result_directory="$2"
+  local -r fixture_repository="$3"
+  local -r source_revision="$4"
+  local -r snapshot_directory="$5"
+
+  bash -c '
+    set -Eeuo pipefail
+    fixture_runner=$1
+    result_directory=$2
+    fixture_repository=$3
+    source_revision=$4
+    snapshot_directory=$5
+    source "$fixture_runner"
+    trap cleanup_source_snapshot_work_directory EXIT
+    RESULT_DIR="$result_directory"
+    cd -- "$result_directory"
+    git() {
+      local argument=""
+
+      for argument in "$@"; do
+        if [[ "$argument" == archive ]]; then
+          rmdir -- "$snapshot_directory"
+          break
+        fi
+      done
+      command git "$@"
+    }
+    materialize_source_tree_snapshot \
+      "$fixture_repository" "$source_revision" "$snapshot_directory" 0
+  ' fixture-runner-child \
+    "$fixture_runner" "$result_directory" "$fixture_repository" "$source_revision" \
+    "$snapshot_directory"
+}
+
+assert_fixture_source_snapshot_matches() {
+  local -r fixture_runner="$1"
+  local -r result_directory="$2"
+  local -r fixture_repository="$3"
+  local -r source_revision="$4"
+  local -r snapshot_directory="$5"
+
+  bash -c '
+    set -Eeuo pipefail
+    fixture_runner=$1
+    result_directory=$2
+    fixture_repository=$3
+    source_revision=$4
+    snapshot_directory=$5
+    source "$fixture_runner"
+    trap cleanup_source_snapshot_work_directory EXIT
+    RESULT_DIR="$result_directory"
+    assert_materialized_source_tree_matches_revision \
+      "$fixture_repository" "$source_revision" "$snapshot_directory"
+  ' fixture-runner-child \
+    "$fixture_runner" "$result_directory" "$fixture_repository" "$source_revision" \
+    "$snapshot_directory"
+}
+
+assert_fixture_source_checkout_stability() {
+  local -r fixture_runner="$1"
+  local -r result_directory="$2"
+  local -r captured_revision="$3"
+
+  bash -c '
+    set -Eeuo pipefail
+    fixture_runner=$1
+    result_directory=$2
+    captured_revision=$3
+    source "$fixture_runner"
+    trap cleanup_source_snapshot_work_directory EXIT
+    RESULT_DIR="$result_directory"
+    SOURCE_DIRTY=false
+    SOURCE_REVISION="$captured_revision"
+    assert_clean_source_checkout_is_stable
+  ' fixture-runner-child "$fixture_runner" "$result_directory" "$captured_revision"
+}
+
+prepare_fixture_source_snapshot() {
+  local -r fixture_runner="$1"
+  local -r runtime_directory="$2"
+  local -r source_artifact_directory="$3"
+  local -r capture_directory="$4"
+  local -r expected_revision="$5"
+
+  bash -c '
+    set -Eeuo pipefail
+    fixture_runner=$1
+    runtime_directory=$2
+    source_artifact_directory=$3
+    capture_directory=$4
+    expected_revision=$5
+    source "$fixture_runner"
+    trap cleanup_source_snapshot_work_directory EXIT
+    {
+      RUNTIME_DIR="$runtime_directory"
+      ARTIFACT_DIR="$source_artifact_directory"
+      RESULT_DIR="$capture_directory"
+      SOURCE_SNAPSHOT_DIR=""
+      SOURCE_SNAPSHOT_SCRIPT_DIR=""
+      SOURCE_DIRTY=""
+      SOURCE_PATCH_SHA256=""
+      SOURCE_REVISION=""
+      SOURCE_TRACKED_PATCH_SHA256=""
+      SOURCE_TREE_SHA256=""
+      SOURCE_TREE_MANIFEST_SCHEMA=""
+      ACCEPTANCE_EVIDENCE=true
+      ACCEPTANCE_EVIDENCE_REASON=""
+      SKIP_BRIDGE_BUILD=true
+      BRIDGE_BUILD_MODE=fresh
+      PROJECT_NAME=obi-apache-java-https-snapshot-test
+      COMPOSE_FILE="$REPO_ROOT/examples/apache-java-https/docker-compose.yml"
+      PRIMARY_FAULT_COMPOSE_FILE="$REPO_ROOT/examples/apache-java-https/docker-compose.primary-fault.yml"
+      COMPOSE_PROJECT_DIRECTORY="$REPO_ROOT/examples/apache-java-https"
+      COMPOSE=(
+        docker compose --project-name "$PROJECT_NAME" \
+          --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE"
+      )
+      PRIMARY_FAULT_COMPOSE=(
+        docker compose --project-name "$PROJECT_NAME" \
+          --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE" \
+          --file "$PRIMARY_FAULT_COMPOSE_FILE"
+      )
+
+      unset GIT_NO_REPLACE_OBJECTS
+      capture_source_state
+      [[ "$SOURCE_DIRTY" == false && "$SOURCE_TREE_MANIFEST_SCHEMA" == git-tree-v2 && \
+        "$SOURCE_REVISION" == "$expected_revision" ]]
+      printf "cached Java bridge helper\\n" >"$ARTIFACT_DIR/obi-java-agent.jar"
+      printf "cached Java bridge extension\\n" >"$ARTIFACT_DIR/obi-otel-extension.jar"
+      write_bridge_metadata
+      bridge_artifacts_are_valid
+      prepare_source_snapshot
+      bridge_artifacts_are_valid
+      prepare_bridge_artifacts
+      [[ -d "$SOURCE_SNAPSHOT_DIR" && ! -L "$SOURCE_SNAPSHOT_DIR" && \
+        "$COMPOSE_FILE" == "$SOURCE_SNAPSHOT_DIR/examples/apache-java-https/docker-compose.yml" && \
+        "$PRIMARY_FAULT_COMPOSE_FILE" == \
+          "$SOURCE_SNAPSHOT_DIR/examples/apache-java-https/docker-compose.primary-fault.yml" && \
+        "${COMPOSE[*]}" == *"--project-directory $SOURCE_SNAPSHOT_DIR/examples/apache-java-https"* && \
+        ! -e "$SOURCE_SNAPSHOT_DIR/ignored-build-input" && \
+        -L "$SOURCE_SNAPSHOT_DIR/link" && \
+        "$(stat --format=%a -- "$SOURCE_SNAPSHOT_DIR/executable")" == 755 && \
+        "$(<"$SOURCE_SNAPSHOT_DIR/source")" == "tracked source input" && \
+        "$(stat --format=%a -- "$SOURCE_SNAPSHOT_DIR")" == 700 && \
+        "$BRIDGE_BUILD_MODE" == reused-local-cache && \
+        "$ACCEPTANCE_EVIDENCE" == false && \
+        "$ACCEPTANCE_EVIDENCE_REASON" == reused-bridge-artifacts ]]
+      seal_source_snapshot
+      [[ "$(stat --format=%a -- "$SOURCE_SNAPSHOT_DIR/source")" == 444 && \
+        "$(stat --format=%a -- "$SOURCE_SNAPSHOT_DIR/executable")" == 555 && \
+        "$(stat --format=%a -- "$SOURCE_SNAPSHOT_DIR")" == 500 ]]
+      unseal_source_snapshot
+    } >&2
+    printf "%s\\n" "$SOURCE_SNAPSHOT_DIR"
+  ' fixture-runner-child \
+    "$fixture_runner" "$runtime_directory" "$source_artifact_directory" "$capture_directory" \
+    "$expected_revision"
+}
+
+assert_fixture_source_snapshot_parent_is_rejected() {
+  local -r fixture_runner="$1"
+  local -r candidate_parent="$2"
+
+  bash -c '
+    set -Eeuo pipefail
+    fixture_runner=$1
+    candidate_parent=$2
+    source "$fixture_runner"
+    assert_source_snapshot_parent_is_trusted "$candidate_parent"
+  ' fixture-runner-child "$fixture_runner" "$candidate_parent"
+}
+
+capture_fixture_source_with_redirected_git_environment() {
+  local -r fixture_runner="$1"
+  local -r result_directory="$2"
+  local -r redirected_worktree="$3"
+  local -r redirected_index="$4"
+
+  bash -c '
+    set -Eeuo pipefail
+    fixture_runner=$1
+    result_directory=$2
+    redirected_worktree=$3
+    redirected_index=$4
+    source "$fixture_runner"
+    trap cleanup_source_snapshot_work_directory EXIT
+    RESULT_DIR="$result_directory"
+    SOURCE_DIRTY=""
+    SOURCE_PATCH_SHA256=""
+    SOURCE_REVISION=""
+    SOURCE_TRACKED_PATCH_SHA256=""
+    SOURCE_TREE_SHA256=""
+    SOURCE_TREE_MANIFEST_SCHEMA=""
+    ACCEPTANCE_EVIDENCE=true
+    ACCEPTANCE_EVIDENCE_REASON=""
+    export GIT_WORK_TREE="$redirected_worktree"
+    export GIT_INDEX_FILE="$redirected_index"
+    capture_source_state
+    [[ "$SOURCE_DIRTY" == true && "$ACCEPTANCE_EVIDENCE" == false && \
+      "$ACCEPTANCE_EVIDENCE_REASON" == dirty-source-tree ]]
+  ' fixture-runner-child \
+    "$fixture_runner" "$result_directory" "$redirected_worktree" "$redirected_index"
+}
+
+test_retained_evidence_v2_git_tree_schema_is_verified() {
+  local -r verifier="$TEST_SCRIPT_DIR/verify-retained-evidence.sh"
+  local -r fixture_repository="$TEST_TMP_DIR/retained-evidence-v2-fixture"
+  local -r fixture_hooks_dir="$fixture_repository/controlled-hooks"
+  local -r nested_repository="$fixture_repository/gitlink"
+  local -r capture_directory="$TEST_TMP_DIR/retained-evidence-v2-capture"
+  local -r dirty_capture_directory="$TEST_TMP_DIR/retained-evidence-v2-dirty-capture"
+  local -r index_flag_capture_directory="$TEST_TMP_DIR/retained-evidence-v2-index-flag-capture"
+  local -r nested_index_flag_capture_directory="$TEST_TMP_DIR/retained-evidence-v2-nested-index-flag-capture"
+  local -r snapshot_directory="$TEST_TMP_DIR/retained-evidence-v2-source-snapshot"
+  local -r race_snapshot_directory="$TEST_TMP_DIR/retained-evidence-v2-raced-source-snapshot"
+  local -r nonempty_snapshot_directory="$TEST_TMP_DIR/retained-evidence-v2-nonempty-source-snapshot"
+  local -r evidence_id='synthetic-git-tree-v2'
+  local -r bundle="$fixture_repository/examples/apache-java-https/evidence/$evidence_id"
+  local -r fixture_runner="$fixture_repository/examples/apache-java-https/run.sh"
+  local -r fixture_verifier="$fixture_repository/examples/apache-java-https/scripts/verify-retained-evidence.sh"
+  local source_revision=""
+  local source_tree_sha256=""
+
+  write_bundle_checksums() {
+    local file=""
+
+    (
+      cd -- "$bundle"
+      while IFS= read -r file; do
+        sha256sum "$file"
+      done < <(find . -type f ! -path './SHA256SUMS' -printf '%p\n' | LC_ALL=C sort) >SHA256SUMS
+    )
+  }
+
+  mkdir -p -- \
+    "$fixture_repository" "$fixture_hooks_dir" "$capture_directory" "$dirty_capture_directory" \
+    "$index_flag_capture_directory" "$nested_index_flag_capture_directory" \
+    "$snapshot_directory" "$race_snapshot_directory" "$nonempty_snapshot_directory" \
+    "${fixture_runner%/*}" \
+    "$fixture_repository/nested"
+  git init --quiet "$fixture_repository"
+  git -C "$fixture_repository" config user.email 'retained-evidence-v2@example.invalid'
+  git -C "$fixture_repository" config user.name 'Retained Evidence V2 Test'
+  git -C "$fixture_repository" config commit.gpgSign false
+  git -C "$fixture_repository" config core.hooksPath "$fixture_hooks_dir"
+  cp -- "$TEST_SCRIPT_DIR/../run.sh" "$fixture_runner"
+  chmod 0755 -- "$fixture_runner"
+  printf 'regular source file\n' >"$fixture_repository/regular"
+  printf 'executable source file\n' >"$fixture_repository/executable"
+  chmod 0755 -- "$fixture_repository/executable"
+  ln -s regular "$fixture_repository/link"
+  ln -s $'regular\n' "$fixture_repository/link-with-newline-target"
+  printf 'nested ordinary source file\n' >"$fixture_repository/nested/ordinary"
+  git init --quiet "$nested_repository"
+  git -C "$nested_repository" config user.email 'retained-evidence-v2@example.invalid'
+  git -C "$nested_repository" config user.name 'Retained Evidence V2 Test'
+  git -C "$nested_repository" config commit.gpgSign false
+  git -C "$nested_repository" config core.hooksPath "$fixture_hooks_dir"
+  printf 'nested source file\n' >"$nested_repository/nested"
+  git -C "$nested_repository" add -- nested
+  git -C "$nested_repository" commit --quiet -m 'Create nested gitlink source'
+  git -C "$fixture_repository" add -- \
+    regular executable link link-with-newline-target nested/ordinary gitlink \
+    examples/apache-java-https/run.sh
+  git -C "$fixture_repository" commit --quiet -m 'Create canonical source tree'
+
+  capture_fixture_source_state "$fixture_runner" "$capture_directory" clean || {
+    printf 'clean source capture did not produce a canonical Git-tree v2 manifest\n' >&2
+    return 1
+  }
+  grep -Eq ' l link$' "$capture_directory/source-tree.manifest" || {
+    printf 'canonical source manifest omitted the symbolic-link marker\n' >&2
+    return 1
+  }
+  grep -Eq ' g gitlink$' "$capture_directory/source-tree.manifest" || {
+    printf 'canonical source manifest omitted the gitlink marker\n' >&2
+    return 1
+  }
+  grep -Eq ' - nested/ordinary$' "$capture_directory/source-tree.manifest" || {
+    printf 'canonical source manifest omitted nested tracked content\n' >&2
+    return 1
+  }
+  grep -Fqx 'source_tree_manifest_schema=git-tree-v2' \
+    "$capture_directory/source-state.txt" || {
+    printf 'clean source state omitted its Git-tree v2 schema\n' >&2
+    return 1
+  }
+  source_revision="$(awk -F= '$1 == "revision" { print $2; exit }' "$capture_directory/source-state.txt")"
+  materialize_fixture_source_snapshot \
+    "$fixture_runner" "$capture_directory" "$fixture_repository" "$source_revision" \
+    "$snapshot_directory" || {
+    printf 'pinned source snapshot did not preserve the canonical Git tree and gitlink\n' >&2
+    return 1
+  }
+  [[ "$(<"$snapshot_directory/gitlink/nested")" == "nested source file" && \
+    "$(<"$snapshot_directory/nested/ordinary")" == "nested ordinary source file" && \
+    ! -e "$snapshot_directory/gitlink/.git" && \
+    -L "$snapshot_directory/link" && \
+    -x "$snapshot_directory/executable" ]] || {
+    printf 'pinned source snapshot omitted nested Git-tree content\n' >&2
+    return 1
+  }
+  printf 'unexpected snapshot content\n' >"$snapshot_directory/unexpected"
+  if assert_fixture_source_snapshot_matches \
+    "$fixture_runner" "$capture_directory" "$fixture_repository" "$source_revision" \
+    "$snapshot_directory" >/dev/null 2>&1; then
+    printf 'source snapshot validation accepted an unexpected regular file\n' >&2
+    return 1
+  fi
+  rm -f -- "$snapshot_directory/unexpected"
+  if materialize_fixture_source_snapshot_rejects_removed_destination \
+    "$fixture_runner" "$capture_directory" "$fixture_repository" "$source_revision" \
+    "$race_snapshot_directory" >/dev/null 2>&1; then
+    printf 'source snapshot extraction continued after its destination disappeared\n' >&2
+    return 1
+  fi
+  [[ ! -e "$race_snapshot_directory" && ! -L "$race_snapshot_directory" ]] || {
+    printf 'source snapshot extraction recreated a removed destination\n' >&2
+    return 1
+  }
+  [[ ! -e "$capture_directory/regular" && ! -L "$capture_directory/regular" ]] || {
+    printf 'source snapshot extraction wrote archive output outside its destination\n' >&2
+    return 1
+  }
+  mkdir -p -- "$nonempty_snapshot_directory/gitlink"
+  : >"$nonempty_snapshot_directory/gitlink/untrusted-placeholder-content"
+  if materialize_fixture_source_snapshot \
+    "$fixture_runner" "$capture_directory" "$fixture_repository" "$source_revision" \
+    "$nonempty_snapshot_directory" >/dev/null 2>&1; then
+    printf 'source snapshot accepted a nonempty Gitlink placeholder\n' >&2
+    return 1
+  fi
+  printf 'corrupted nested snapshot source\n' >"$snapshot_directory/gitlink/nested"
+  if assert_fixture_source_snapshot_matches \
+    "$fixture_runner" "$capture_directory" "$fixture_repository" "$source_revision" \
+    "$snapshot_directory" >/dev/null 2>&1; then
+    printf 'source snapshot validation accepted a corrupted nested gitlink file\n' >&2
+    return 1
+  fi
+  printf 'nested dirty source file\n' >"$nested_repository/nested"
+  : >"$nested_repository/untracked"
+  capture_fixture_source_state "$fixture_runner" "$dirty_capture_directory" dirty || {
+    printf 'dirty gitlink source was not marked non-acceptance evidence\n' >&2
+    return 1
+  }
+  [[ -s "$dirty_capture_directory/git-status.txt" ]] || {
+    printf 'dirty gitlink source omitted its Git-status evidence\n' >&2
+    return 1
+  }
+  printf 'nested source file\n' >"$nested_repository/nested"
+  rm -f -- "$nested_repository/untracked"
+  git -C "$nested_repository" update-index --assume-unchanged nested
+  printf 'nested assume-unchanged dirty source file\n' >"$nested_repository/nested"
+  if capture_fixture_source_state \
+    "$fixture_runner" "$nested_index_flag_capture_directory" clean >/dev/null 2>&1; then
+    printf 'source capture accepted a nested assume-unchanged source modification\n' >&2
+    return 1
+  fi
+  printf 'nested source file\n' >"$nested_repository/nested"
+  git -C "$nested_repository" update-index --no-assume-unchanged nested
+  git -C "$nested_repository" update-index --no-skip-worktree nested
+  git -C "$fixture_repository" update-index --assume-unchanged regular
+  printf 'assume-unchanged dirty source file\n' >"$fixture_repository/regular"
+  if capture_fixture_source_state \
+    "$fixture_runner" "$index_flag_capture_directory" clean >/dev/null 2>&1; then
+    printf 'source capture accepted an assume-unchanged source modification\n' >&2
+    return 1
+  fi
+  printf 'regular source file\n' >"$fixture_repository/regular"
+  git -C "$fixture_repository" update-index --no-assume-unchanged regular
+  git -C "$fixture_repository" update-index --no-skip-worktree regular
+  source_tree_sha256="$(awk -F= '$1 == "source_tree_sha256" { print $2; exit }' "$capture_directory/source-state.txt")"
+  [[ "$source_revision" =~ ^[0-9a-f]{40}$ && \
+    "$source_tree_sha256" =~ ^[0-9a-f]{64}$ ]] || {
+    printf 'clean source capture produced malformed Git-tree provenance\n' >&2
+    return 1
+  }
+
+  mkdir -p -- "$bundle" "${fixture_verifier%/*}"
+  cp -- "$verifier" "$fixture_verifier"
+  chmod 0755 -- "$fixture_verifier"
+  cp -- "$capture_directory/source-tree.manifest" "$bundle/source-tree.manifest"
+  cp -- "$capture_directory/source-state.txt" "$bundle/source-state.txt"
+  cp -- "$capture_directory/git-status.txt" "$bundle/git-status.txt"
+  printf '%s\n' "$source_revision" >"$bundle/bridge-source-revision.txt"
+  printf '%s\n' "$source_tree_sha256" >"$bundle/bridge-source-tree.sha256"
+  printf '%s\n' \
+    '{"status":"passed","exit_status":0,"acceptance_evidence":true,"acceptance_evidence_reason":"none","failure_stage":"none","failure_line":0,"evidence_id":"synthetic-git-tree-v2"}' \
+    >"$bundle/run-status.json"
+  printf '%s\n' \
+    "{\"sanitized\":true,\"evidence_id\":\"$evidence_id\",\"source_revision\":\"$source_revision\"}" \
+    >"$bundle/runtime-metadata.json"
+  printf '%s\n' \
+    "{\"source_revision\":\"$source_revision\",\"source_tree_sha256\":\"$source_tree_sha256\"}" \
+    >"$bundle/bridge-artifacts.json"
+  {
+    printf 'invocation=synthetic-git-tree-v2\n'
+    printf 'revision=%s\n' "$source_revision"
+    printf 'dirty=false\n'
+    printf 'source_tree_sha256=%s\n' "$source_tree_sha256"
+    printf 'source_tree_manifest_schema=git-tree-v2\n'
+    printf 'tracked_patch_sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n'
+    printf 'patch_identity_sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n'
+    printf 'transport=getsockopt\n'
+    printf 'agent_distribution=otel\n'
+    printf 'tls_protocol=TLSv1.3\n'
+    printf 'scenario=all\n'
+    printf 'request_count=0\n'
+    printf 'repeat_count=1\n'
+    printf 'scenario_seed=1\n'
+    printf 'bridge_build_mode=fresh\n'
+    printf 'acceptance_evidence=true\n'
+    printf 'acceptance_evidence_reason=none\n'
+  } >"$bundle/environment.txt"
+  write_bundle_checksums
+  git -C "$fixture_repository" add -A -- examples/apache-java-https
+  git -C "$fixture_repository" commit --quiet -m 'Add canonical retained evidence fixture'
+  [[ -z "$(git -C "$fixture_repository" status --porcelain=v1 --untracked-files=all)" ]] || {
+    printf 'canonical retained evidence fixture is not clean\n' >&2
+    return 1
+  }
+  "$fixture_verifier" "$bundle" >/dev/null || {
+    printf 'retained evidence verifier rejected canonical Git-tree v2 evidence\n' >&2
+    return 1
+  }
+  awk '
+    /^source_tree_manifest_schema=/ {
+      print "source_tree_manifest_schema=worktree-v1"
+      next
+    }
+    { print }
+  ' "$bundle/environment.txt" >"$bundle/environment.txt.tmp"
+  mv -- "$bundle/environment.txt.tmp" "$bundle/environment.txt"
+  write_bundle_checksums
+  git -C "$fixture_repository" add -A -- examples/apache-java-https
+  git -C "$fixture_repository" commit --quiet -m 'Corrupt canonical source-tree schema'
+  if "$fixture_verifier" "$bundle" >/dev/null 2>&1; then
+    printf 'retained evidence verifier accepted a noncanonical Git-tree schema\n' >&2
+    return 1
+  fi
+}
+
+test_source_gitlink_depth_is_bounded() {
+  local -r source_repository="$TEST_TMP_DIR/source-gitlink-depth-fixture"
+  local -r hooks_directory="$source_repository/controlled-hooks"
+  local -r result_directory="$TEST_TMP_DIR/source-gitlink-depth-result"
+  local -r fixture_runner="$source_repository/examples/apache-java-https/run.sh"
+  local nested_directory="$source_repository"
+  local child_name=""
+  local -a gitlink_directories=()
+  local -i depth=0
+
+  mkdir -p -- "$source_repository" "$hooks_directory" "$result_directory" "${fixture_runner%/*}"
+  git init --quiet "$source_repository"
+  git -C "$source_repository" config user.email 'source-gitlink-depth@example.invalid'
+  git -C "$source_repository" config user.name 'Source Gitlink Depth Test'
+  git -C "$source_repository" config commit.gpgSign false
+  git -C "$source_repository" config core.hooksPath "$hooks_directory"
+  cp -- "$TEST_SCRIPT_DIR/../run.sh" "$fixture_runner"
+  chmod 0755 -- "$fixture_runner"
+
+  for ((depth = 0; depth <= 16; depth++)); do
+    nested_directory+="/gitlink-$depth"
+    gitlink_directories+=("$nested_directory")
+  done
+  for ((depth = 16; depth >= 0; depth--)); do
+    nested_directory="${gitlink_directories[$depth]}"
+    mkdir -p -- "$nested_directory"
+    git init --quiet "$nested_directory"
+    git -C "$nested_directory" config user.email 'source-gitlink-depth@example.invalid'
+    git -C "$nested_directory" config user.name 'Source Gitlink Depth Test'
+    git -C "$nested_directory" config commit.gpgSign false
+    git -C "$nested_directory" config core.hooksPath "$hooks_directory"
+    if ((depth == 16)); then
+      printf 'nested leaf\n' >"$nested_directory/leaf"
+      git -C "$nested_directory" add -- leaf
+    else
+      child_name="gitlink-$((depth + 1))"
+      git -C "$nested_directory" add -- "$child_name"
+    fi
+    git -C "$nested_directory" commit --quiet -m "Create nested gitlink $depth"
+  done
+  git -C "$source_repository" add -- gitlink-0 examples/apache-java-https/run.sh
+  git -C "$source_repository" commit --quiet -m 'Create bounded gitlink-depth source'
+
+  if capture_fixture_source_state \
+    "$fixture_runner" "$result_directory" clean >/dev/null 2>&1; then
+    printf 'source capture accepted a gitlink chain beyond the nesting limit\n' >&2
+    return 1
+  fi
+}
+
+test_source_git_tree_path_validation_is_byte_safe() {
+  local -a unsafe_paths=(
+    ''
+    '/absolute'
+    'trailing/'
+    'double//slash'
+    '.'
+    '..'
+    'safe/./child'
+    'safe/../child'
+    $'safe\n/../child'
+  )
+  local -a safe_paths=(
+    'regular'
+    'nested/regular'
+    $'newline\ncomponent/child'
+  )
+  local path=""
+
+  for path in "${unsafe_paths[@]}"; do
+    if is_safe_git_tree_path "$path"; then
+      printf 'source Git-tree path validation accepted an unsafe path\n' >&2
+      return 1
+    fi
+  done
+  for path in "${safe_paths[@]}"; do
+    if ! is_safe_git_tree_path "$path"; then
+      printf 'source Git-tree path validation rejected a safe path\n' >&2
+      return 1
+    fi
+  done
+}
+
+test_clean_source_checkout_stability_rejects_changed_revision() {
+  local -r source_repository="$TEST_TMP_DIR/source-stability-fixture"
+  local -r hooks_directory="$source_repository/controlled-hooks"
+  local -r result_directory="$TEST_TMP_DIR/source-stability-result"
+  local -r fixture_runner="$source_repository/examples/apache-java-https/run.sh"
+  local captured_revision=""
+
+  mkdir -p -- \
+    "$source_repository" "$hooks_directory" "$result_directory" "${fixture_runner%/*}"
+  git init --quiet "$source_repository"
+  git -C "$source_repository" config user.email 'source-stability-test@example.invalid'
+  git -C "$source_repository" config user.name 'Source Stability Test'
+  git -C "$source_repository" config commit.gpgSign false
+  git -C "$source_repository" config core.hooksPath "$hooks_directory"
+  cp -- "$TEST_SCRIPT_DIR/../run.sh" "$fixture_runner"
+  chmod 0755 -- "$fixture_runner"
+  printf 'first source revision\n' >"$source_repository/source"
+  git -C "$source_repository" add -- source examples/apache-java-https/run.sh
+  git -C "$source_repository" commit --quiet -m 'Create first source revision'
+  captured_revision="$(git -C "$source_repository" rev-parse HEAD)"
+  printf 'second source revision\n' >"$source_repository/source"
+  git -C "$source_repository" add -- source
+  git -C "$source_repository" commit --quiet -m 'Create second source revision'
+  if assert_fixture_source_checkout_stability \
+    "$fixture_runner" "$result_directory" "$captured_revision" >/dev/null 2>&1; then
+    printf 'source stability check accepted a changed source revision\n' >&2
+    return 1
+  fi
+}
+
+test_source_controls_and_bridge_export_use_private_work_directory() {
+  local -r source_repository="$TEST_TMP_DIR/private-source-work-fixture"
+  local -r hooks_directory="$source_repository/controlled-hooks"
+  local -r fixture_runner="$source_repository/examples/apache-java-https/run.sh"
+  local -r runtime_directory="$TEST_TMP_DIR/private-source-work-runtime"
+  local -r source_artifact_directory="$TEST_TMP_DIR/private-source-work-artifacts"
+  local -r result_directory="$TEST_TMP_DIR/private-source-work-result"
+  local -r fake_bin="$TEST_TMP_DIR/private-source-work-fake-bin"
+  local -r fake_docker="$fake_bin/docker"
+  local -r fake_mktemp="$fake_bin/mktemp"
+  local -r docker_destination_record="$TEST_TMP_DIR/private-source-work-destination"
+  local -r control_canary="$TEST_TMP_DIR/private-source-work-canary"
+  local real_mktemp=""
+  local control_name=""
+  local -a control_names=(
+    .source-index-flags-0
+    .source-gitlinks-0
+    .source-tree-v2.entries
+    .source-tree-v2.manifest
+    .source-snapshot-gitlinks-0
+    .source-snapshot-tree-0
+    .source-snapshot-expected-0
+    .source-snapshot-expected-sorted-0
+    .source-snapshot-actual-0
+    .source-snapshot-actual-filtered-0
+    .source-snapshot-actual-sorted-0
+  )
+
+  mkdir -p -- \
+    "$source_repository/examples/apache-java-https" "$hooks_directory" \
+    "$runtime_directory" "$source_artifact_directory" "$result_directory" "$fake_bin"
+  git init --quiet "$source_repository"
+  git -C "$source_repository" config user.email 'private-source-work@example.invalid'
+  git -C "$source_repository" config user.name 'Private Source Work Test'
+  git -C "$source_repository" config commit.gpgSign false
+  git -C "$source_repository" config core.hooksPath "$hooks_directory"
+  cp -- "$TEST_SCRIPT_DIR/../run.sh" "$fixture_runner"
+  chmod 0755 -- "$fixture_runner"
+  printf 'tracked source input\n' >"$source_repository/source"
+  printf 'services: {}\n' >"$source_repository/examples/apache-java-https/docker-compose.yml"
+  printf 'services: {}\n' \
+    >"$source_repository/examples/apache-java-https/docker-compose.primary-fault.yml"
+  printf 'FROM scratch\nCOPY . /source\n' >"$source_repository/javaagent.Dockerfile"
+  git -C "$source_repository" add -- .
+  git -C "$source_repository" commit --quiet -m 'Create private source-work fixture'
+
+  real_mktemp="$(command -v mktemp)" || return 1
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -Eeuo pipefail' \
+    'for argument in "$@"; do' \
+    '  [[ "$argument" != *"$FORBIDDEN_RESULT_DIR"* ]] || exit 73' \
+    'done' \
+    'exec "$REAL_MKTEMP" "$@"' >"$fake_mktemp"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -Eeuo pipefail' \
+    '[[ "$1" == build ]] || exit 71' \
+    'destination=""' \
+    'for argument in "$@"; do' \
+    '  case "$argument" in' \
+    '    type=local,dest=*) destination="${argument#type=local,dest=}" ;;' \
+    '  esac' \
+    'done' \
+    '[[ "$destination" == /tmp/obi-source-snapshot-work.*/bridge-export.*/export ]] || exit 72' \
+    'printf "%s\\n" "$destination" >"$FAKE_DOCKER_DESTINATION_RECORD"' \
+    'mkdir -p -- "$destination"' \
+    'printf "agent\\n" >"$destination/obi-java-agent.jar"' \
+    'printf "extension\\n" >"$destination/obi-otel-extension.jar"' >"$fake_docker"
+  chmod 0755 -- "$fake_docker" "$fake_mktemp"
+
+  printf 'unchanged\n' >"$control_canary"
+  for control_name in "${control_names[@]}"; do
+    ln -s -- "$control_canary" "$result_directory/$control_name"
+  done
+  chmod 0777 -- "$runtime_directory" "$result_directory"
+
+  if ! bash -c '
+    set -Eeuo pipefail
+    fixture_runner=$1
+    runtime_directory=$2
+    source_artifact_directory=$3
+    result_directory=$4
+    fake_bin=$5
+    real_mktemp=$6
+    docker_destination_record=$7
+    control_canary=$8
+    control_names=(
+      .source-index-flags-0
+      .source-gitlinks-0
+      .source-tree-v2.entries
+      .source-tree-v2.manifest
+      .source-snapshot-gitlinks-0
+      .source-snapshot-tree-0
+      .source-snapshot-expected-0
+      .source-snapshot-expected-sorted-0
+      .source-snapshot-actual-0
+      .source-snapshot-actual-filtered-0
+      .source-snapshot-actual-sorted-0
+    )
+    export PATH="$fake_bin:$PATH"
+    export REAL_MKTEMP="$real_mktemp"
+    export FORBIDDEN_RESULT_DIR="$result_directory"
+    export FAKE_DOCKER_DESTINATION_RECORD="$docker_destination_record"
+    source "$fixture_runner"
+    cleanup_private_source_work_fixture() {
+      cleanup_source_snapshot_work_directory
+      if [[ -n "${SOURCE_SNAPSHOT_DIR:-}" && \
+        "$SOURCE_SNAPSHOT_DIR" == /tmp/obi-source-snapshot.* && \
+        -d "$SOURCE_SNAPSHOT_DIR" && ! -L "$SOURCE_SNAPSHOT_DIR" ]]; then
+        rm -rf -- "$SOURCE_SNAPSHOT_DIR"
+      fi
+    }
+    trap cleanup_private_source_work_fixture EXIT
+    RUNTIME_DIR="$runtime_directory"
+    ARTIFACT_DIR="$source_artifact_directory"
+    RESULT_DIR="$result_directory"
+    SOURCE_SNAPSHOT_DIR=""
+    SOURCE_SNAPSHOT_SCRIPT_DIR=""
+    SOURCE_SNAPSHOT_WORK_DIR=""
+    BRIDGE_EXPORT_DIR=""
+    SOURCE_DIRTY=""
+    SOURCE_PATCH_SHA256=""
+    SOURCE_REVISION=""
+    SOURCE_TRACKED_PATCH_SHA256=""
+    SOURCE_TREE_SHA256=""
+    SOURCE_TREE_MANIFEST_SCHEMA=""
+    SKIP_BRIDGE_BUILD=false
+    BRIDGE_BUILD_MODE=fresh
+    COMMAND_TIMEOUT_SECONDS=5
+
+    capture_source_state
+    [[ "$SOURCE_SNAPSHOT_WORK_DIR" == /tmp/obi-source-snapshot-work.* && \
+      "$(stat --format=%a -- "$SOURCE_SNAPSHOT_WORK_DIR")" == 700 && \
+      "$(stat --format=%a -- "$RUNTIME_DIR")" == 777 && \
+      "$(stat --format=%a -- "$RESULT_DIR")" == 777 && \
+      "$(<"$control_canary")" == unchanged ]]
+    for control_name in "${control_names[@]}"; do
+      [[ -L "$RESULT_DIR/$control_name" ]]
+    done
+
+    prepare_source_snapshot
+    prepare_bridge_artifacts
+    bridge_artifacts_are_valid
+    [[ "$BRIDGE_BUILD_MODE" == fresh && -z "$BRIDGE_EXPORT_DIR" && \
+      -s "$ARTIFACT_DIR/obi-java-agent.jar" && \
+      -s "$ARTIFACT_DIR/obi-otel-extension.jar" ]]
+    IFS= read -r exported_destination <"$FAKE_DOCKER_DESTINATION_RECORD"
+    [[ "$exported_destination" == "$SOURCE_SNAPSHOT_WORK_DIR"/bridge-export.*/export && \
+      "$(<"$control_canary")" == unchanged ]]
+  ' private-source-work-child \
+    "$fixture_runner" "$runtime_directory" "$source_artifact_directory" "$result_directory" \
+    "$fake_bin" "$real_mktemp" "$docker_destination_record" "$control_canary"; then
+    printf 'source controls or bridge export used an untrusted runtime/result directory\n' >&2
+    return 1
+  fi
+}
+
+test_clean_source_snapshot_uses_pinned_git_inputs() {
+  local -r source_repository="$TEST_TMP_DIR/source-snapshot-fixture"
+  local -r hooks_directory="$source_repository/controlled-hooks"
+  local -r fixture_runner="$source_repository/examples/apache-java-https/run.sh"
+  local -r runtime_directory="$TEST_TMP_DIR/source-snapshot\\runtime"
+  local -r source_artifact_directory="$TEST_TMP_DIR/source-snapshot-artifacts"
+  local -r capture_directory="$TEST_TMP_DIR/source-snapshot-capture"
+  local -r redirected_capture_directory="$TEST_TMP_DIR/source-snapshot-redirected-capture"
+  local -r redirected_worktree="$TEST_TMP_DIR/source-snapshot-redirected-worktree"
+  local -r redirected_index="$TEST_TMP_DIR/source-snapshot-redirected-index"
+  local -r replacement_index="$TEST_TMP_DIR/source-snapshot-replacement-index"
+  local -r replacement_source="$TEST_TMP_DIR/source-snapshot-replacement-source"
+  local expected_snapshot=""
+  local hostile_runtime_snapshot=""
+  local original_revision=""
+  local replacement_blob=""
+  local replacement_tree=""
+  local replacement_commit=""
+
+  mkdir -p -- \
+    "$source_repository/examples/apache-java-https" "$hooks_directory" \
+    "$runtime_directory" "$source_artifact_directory" "$capture_directory" "$redirected_capture_directory" \
+    "$redirected_worktree"
+  git init --quiet "$source_repository"
+  git -C "$source_repository" config user.email 'source-snapshot-test@example.invalid'
+  git -C "$source_repository" config user.name 'Source Snapshot Test'
+  git -C "$source_repository" config commit.gpgSign false
+  git -C "$source_repository" config core.hooksPath "$hooks_directory"
+  cp -- "$TEST_SCRIPT_DIR/../run.sh" "$fixture_runner"
+  chmod 0755 -- "$fixture_runner"
+  printf 'tracked source input\n' >"$source_repository/source"
+  printf 'tracked executable input\n' >"$source_repository/executable"
+  chmod 0755 -- "$source_repository/executable"
+  ln -s source "$source_repository/link"
+  printf 'services: {}\n' >"$source_repository/examples/apache-java-https/docker-compose.yml"
+  printf 'services: {}\n' \
+    >"$source_repository/examples/apache-java-https/docker-compose.primary-fault.yml"
+  printf 'FROM scratch\nCOPY . /source\n' >"$source_repository/javaagent.Dockerfile"
+  git -C "$source_repository" add -- .
+  git -C "$source_repository" commit --quiet -m 'Create source snapshot fixture'
+  printf '/ignored-build-input\n' >"$source_repository/.git/info/exclude"
+  printf 'ignored Docker build input\n' >"$source_repository/ignored-build-input"
+  git -C "$source_repository" config core.fileMode false
+  chmod 0644 -- "$source_repository/executable"
+  [[ -z "$(git -C "$source_repository" status --porcelain=v1 --untracked-files=all)" ]] || {
+    printf 'fixture did not reproduce a Git-clean ignored/mode-only source mutation\n' >&2
+    return 1
+  }
+  original_revision="$(GIT_NO_REPLACE_OBJECTS=1 git -C "$source_repository" rev-parse HEAD)"
+  printf 'replacement source input\n' >"$replacement_source"
+  replacement_blob="$(
+    GIT_NO_REPLACE_OBJECTS=1 \
+      git -C "$source_repository" hash-object -w -- "$replacement_source"
+  )"
+  GIT_NO_REPLACE_OBJECTS=1 GIT_INDEX_FILE="$replacement_index" \
+    git -C "$source_repository" read-tree "${original_revision}^{tree}"
+  GIT_NO_REPLACE_OBJECTS=1 GIT_INDEX_FILE="$replacement_index" \
+    git -C "$source_repository" update-index --add \
+      --cacheinfo "100644,$replacement_blob,source"
+  replacement_tree="$(
+    GIT_NO_REPLACE_OBJECTS=1 GIT_INDEX_FILE="$replacement_index" \
+      git -C "$source_repository" write-tree
+  )"
+  replacement_commit="$(
+    printf 'replacement source snapshot fixture\n' |
+      GIT_NO_REPLACE_OBJECTS=1 \
+        git -C "$source_repository" commit-tree "$replacement_tree" -p "$original_revision"
+  )"
+  GIT_NO_REPLACE_OBJECTS=1 \
+    git -C "$source_repository" replace "$original_revision" "$replacement_commit"
+
+  if ! expected_snapshot="$(prepare_fixture_source_snapshot \
+    "$fixture_runner" "$runtime_directory" "$source_artifact_directory" "$capture_directory" \
+    "$original_revision")"; then
+    printf 'clean source snapshot did not isolate pinned Git inputs\n' >&2
+    return 1
+  fi
+  [[ "$expected_snapshot" == /tmp/obi-source-snapshot.* ]] || {
+    printf 'clean source snapshot did not use the fixed private system staging directory\n' >&2
+    return 1
+  }
+  if assert_fixture_source_snapshot_parent_is_rejected \
+    "$fixture_runner" "$runtime_directory" >/dev/null 2>&1; then
+    printf 'clean source snapshot accepted a non-root-owned staging parent\n' >&2
+    return 1
+  fi
+  chmod 0777 -- "$runtime_directory"
+  if ! hostile_runtime_snapshot="$(prepare_fixture_source_snapshot \
+    "$fixture_runner" "$runtime_directory" "$source_artifact_directory" "$capture_directory" \
+    "$original_revision")"; then
+    printf 'clean source snapshot depended on the working tree runtime parent\n' >&2
+    return 1
+  fi
+  [[ "$hostile_runtime_snapshot" == /tmp/obi-source-snapshot.* ]] || {
+    printf 'clean source snapshot left the fixed private system staging directory\n' >&2
+    return 1
+  }
+  chmod 0755 -- "$runtime_directory"
+  rm -rf -- "$expected_snapshot" "$hostile_runtime_snapshot"
+
+  printf 'dirty tracked source input\n' >"$source_repository/source"
+  if ! capture_fixture_source_with_redirected_git_environment \
+    "$fixture_runner" "$redirected_capture_directory" "$redirected_worktree" \
+    "$redirected_index"; then
+    printf 'source capture trusted a caller-provided Git worktree or index\n' >&2
+    return 1
+  fi
 }
 
 test_run_status_serializes_default_acceptance_reason() {
@@ -11989,6 +13281,13 @@ main() {
   test_assertion_failure_control_is_explicit
   test_assertion_failure_control_retains_failure_evidence
   test_non_acceptance_reasons_are_recorded
+  test_retained_evidence_provenance_is_verified
+  test_retained_evidence_v2_git_tree_schema_is_verified
+  test_source_gitlink_depth_is_bounded
+  test_source_git_tree_path_validation_is_byte_safe
+  test_clean_source_checkout_stability_rejects_changed_revision
+  test_source_controls_and_bridge_export_use_private_work_directory
+  test_clean_source_snapshot_uses_pinned_git_inputs
   test_run_status_serializes_default_acceptance_reason
   test_release_source_uses_one_version_for_extension
   test_demo_diagnostics_are_loopback_only

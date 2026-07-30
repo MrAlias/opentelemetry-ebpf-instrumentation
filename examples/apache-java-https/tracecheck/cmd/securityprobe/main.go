@@ -46,6 +46,7 @@ const (
 	probeTimeout       = 60 * time.Second
 	maxProbeTimeout    = time.Hour
 	primaryInterval    = time.Millisecond
+	javaProcessPID     = 1
 	heldConnections    = 48
 	repeatedAttempts   = 16
 	oversizedBytes     = 4096
@@ -75,18 +76,28 @@ func mainExitCode(args []string, stdout, stderr io.Writer) int {
 	var socketPath string
 	var mode string
 	var timeout time.Duration
+	var targetFD int
 	flags.StringVar(&socketPath, "socket", defaultSocketPath, "Unix socket path")
-	flags.StringVar(&mode, "mode", "abuse", "probe mode: abuse, abuse-race, endpoint, or primary")
+	flags.StringVar(&mode, "mode", "abuse", "probe mode: abuse, abuse-race, endpoint, primary, or primary-live-fd")
 	flags.DurationVar(&timeout, "timeout", probeTimeout, "overall probe timeout")
+	flags.IntVar(&targetFD, "fd", -1, "live Java socket descriptor for primary-live-fd mode")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
-	if flags.NArg() != 0 || !filepath.IsAbs(socketPath) {
-		fmt.Fprintln(stderr, "security probe requires an absolute --socket and no positional arguments")
+	if flags.NArg() != 0 {
+		fmt.Fprintln(stderr, "security probe requires no positional arguments")
 		return 2
 	}
-	if mode != "abuse" && mode != "abuse-race" && mode != "endpoint" && mode != "primary" {
+	if mode != "abuse" && mode != "abuse-race" && mode != "endpoint" && mode != "primary" && mode != "primary-live-fd" {
 		fmt.Fprintf(stderr, "security probe mode %q is unsupported\n", mode)
+		return 2
+	}
+	if mode != "primary-live-fd" && !filepath.IsAbs(socketPath) {
+		fmt.Fprintln(stderr, "security probe requires an absolute --socket")
+		return 2
+	}
+	if mode == "primary-live-fd" && targetFD < 0 {
+		fmt.Fprintln(stderr, "primary-live-fd requires a nonnegative --fd")
 		return 2
 	}
 	if timeout < time.Second || timeout > maxProbeTimeout {
@@ -127,6 +138,8 @@ func mainExitCode(args []string, stdout, stderr io.Writer) int {
 		result, err = runPrimaryProbe(ctx, resume, func() {
 			fmt.Fprintln(stdout, "security probe primary ready")
 		})
+	case "primary-live-fd":
+		result, err = runPrimaryLiveFDProbe(ctx, targetFD)
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, "security probe failed: %v\n", err)
@@ -137,6 +150,100 @@ func mainExitCode(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+func runPrimaryLiveFDProbe(ctx context.Context, targetFD int) (probeResult, error) {
+	if err := ctx.Err(); err != nil {
+		return probeResult{}, err
+	}
+
+	socket, err := duplicateProcessFD(javaProcessPID, targetFD)
+	if err != nil {
+		return probeResult{}, fmt.Errorf("duplicate Java live socket descriptor: %w", err)
+	}
+	defer socket.Close()
+
+	raw, err := socket.SyscallConn()
+	if err != nil {
+		return probeResult{}, fmt.Errorf("access duplicated Java socket: %w", err)
+	}
+	result, err := exercisePrimaryLiveFDProbe(ctx, raw)
+	if err != nil {
+		return probeResult{}, err
+	}
+	result.Cases = append([]probeCase{{
+		Name: "exact-live-fd-duplicate", Outcome: "opened",
+	}}, result.Cases...)
+	return result, nil
+}
+
+func duplicateProcessFD(pid, targetFD int) (*os.File, error) {
+	if pid <= 0 {
+		return nil, errors.New("process identifier must be positive")
+	}
+	if targetFD < 0 {
+		return nil, errors.New("descriptor must be nonnegative")
+	}
+
+	pidFD, err := unix.PidfdOpen(pid, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open process handle: %w", err)
+	}
+	defer func() { _ = unix.Close(pidFD) }()
+
+	duplicatedFD, err := unix.PidfdGetfd(pidFD, targetFD, 0)
+	if err != nil {
+		return nil, fmt.Errorf("duplicate process descriptor: %w", err)
+	}
+	file := os.NewFile(uintptr(duplicatedFD), "pidfd-duplicate")
+	if file == nil {
+		_ = unix.Close(duplicatedFD)
+		return nil, errors.New("wrap duplicated process descriptor")
+	}
+	return file, nil
+}
+
+func exercisePrimaryLiveFDProbe(ctx context.Context, raw syscall.RawConn) (probeResult, error) {
+	result := probeResult{Status: "unverified", Mode: "primary-live-fd", Attempts: 1}
+
+	socketType := make([]byte, 4)
+	length, err := rawGetsockopt(raw, unix.SOL_SOCKET, unix.SO_TYPE, socketType)
+	if err != nil {
+		return probeResult{}, fmt.Errorf("read duplicated socket type: %w", err)
+	}
+	if length != uint32(len(socketType)) ||
+		binary.NativeEndian.Uint32(socketType) != unix.SOCK_STREAM {
+		return probeResult{}, errors.New("duplicated descriptor was not a stream socket")
+	}
+	result.Cases = append(result.Cases, probeCase{
+		Name: "standard-option", Outcome: "preserved",
+	})
+
+	if err := ctx.Err(); err != nil {
+		return probeResult{}, err
+	}
+	invalidCapability := make([]byte, 8)
+	if err := rawSetsockopt(raw, obiSocketLevel, obiNegotiateOption, invalidCapability); !isUnsupportedSockopt(err) {
+		return probeResult{}, fmt.Errorf("wrong-process negotiation: expected unsupported error, got %w", err)
+	}
+	result.Cases = append(result.Cases, probeCase{
+		Name: "wrong-process-negotiation", Outcome: "native-unsupported",
+	})
+
+	if err := ctx.Err(); err != nil {
+		return probeResult{}, err
+	}
+	outcome, err := safeTakeAttempt(raw, recordSize)
+	if err != nil {
+		return probeResult{}, fmt.Errorf("exact live descriptor retrieval: %w", err)
+	}
+	if outcome != "native-unsupported" {
+		return probeResult{}, fmt.Errorf("exact live descriptor retrieval: expected native unsupported result, got %s", outcome)
+	}
+	result.Cases = append(result.Cases, probeCase{
+		Name: "exact-live-fd-take", Outcome: outcome,
+	})
+	return result, nil
 }
 
 func runPrimaryProbe(

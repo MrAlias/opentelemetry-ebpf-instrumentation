@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 func TestRequestUsesOnlyTheVersionedNamespaceIdentity(t *testing.T) {
@@ -95,6 +97,78 @@ func TestPrimaryProbeReportsNativeResultsAsUnverified(t *testing.T) {
 	assert.Equal(t, probeCase{
 		Name: "repeated-retrieval", Outcome: "native-unsupported",
 	}, result.result.Cases[5])
+}
+
+func TestPrimaryLiveFDProbeUsesOneShotNativeResults(t *testing.T) {
+	client, server, err := connectedTCPPair()
+	require.NoError(t, err)
+	defer client.Close()
+	defer server.Close()
+
+	raw, err := client.SyscallConn()
+	require.NoError(t, err)
+	result, err := exercisePrimaryLiveFDProbe(t.Context(), raw)
+	require.NoError(t, err)
+	assert.Equal(t, "unverified", result.Status)
+	assert.Equal(t, "primary-live-fd", result.Mode)
+	assert.EqualValues(t, 1, result.Attempts)
+	assert.Equal(t, []probeCase{
+		{Name: "standard-option", Outcome: "preserved"},
+		{Name: "wrong-process-negotiation", Outcome: "native-unsupported"},
+		{Name: "exact-live-fd-take", Outcome: "native-unsupported"},
+	}, result.Cases)
+}
+
+func TestDuplicateProcessFDDuplicatesOnlyTheRequestedSocket(t *testing.T) {
+	client, server, err := connectedTCPPair()
+	require.NoError(t, err)
+	defer client.Close()
+	defer server.Close()
+
+	raw, err := client.SyscallConn()
+	require.NoError(t, err)
+	var targetFD int
+	require.NoError(t, raw.Control(func(fd uintptr) {
+		targetFD = int(fd)
+	}))
+
+	duplicate, err := duplicateProcessFD(os.Getpid(), targetFD)
+	if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+		t.Skipf("pidfd descriptor duplication is unavailable: %v", err)
+	}
+	require.NoError(t, err)
+
+	duplicateRaw, err := duplicate.SyscallConn()
+	require.NoError(t, err)
+	socketType := make([]byte, 4)
+	length, err := rawGetsockopt(duplicateRaw, unix.SOL_SOCKET, unix.SO_TYPE, socketType)
+	require.NoError(t, err)
+	assert.EqualValues(t, len(socketType), length)
+	assert.Equal(t, uint32(unix.SOCK_STREAM), binary.NativeEndian.Uint32(socketType))
+	require.NoError(t, duplicate.Close())
+
+	length, err = rawGetsockopt(raw, unix.SOL_SOCKET, unix.SO_TYPE, socketType)
+	require.NoError(t, err)
+	assert.EqualValues(t, len(socketType), length)
+	assert.Equal(t, uint32(unix.SOCK_STREAM), binary.NativeEndian.Uint32(socketType))
+}
+
+func TestDuplicateProcessFDRejectsInvalidIdentifiers(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		pid  int
+		fd   int
+	}{
+		{name: "zero process", pid: 0, fd: 0},
+		{name: "negative process", pid: -1, fd: 0},
+		{name: "negative descriptor", pid: 1, fd: -1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			file, err := duplicateProcessFD(test.pid, test.fd)
+			assert.Nil(t, file)
+			assert.Error(t, err)
+		})
+	}
 }
 
 func TestUnauthorizedRaceWaitsForReleaseAfterMakingAttempts(t *testing.T) {
@@ -261,6 +335,8 @@ func TestMainRejectsUnboundedOrInvalidInvocation(t *testing.T) {
 	for _, args := range [][]string{
 		{"--socket", "relative.sock"},
 		{"--mode", "unknown"},
+		{"--mode", "primary-live-fd"},
+		{"--mode", "primary-live-fd", "--fd=-1"},
 		{"--timeout", "999ms"},
 		{"--timeout", "1h1s"},
 		{"positional"},

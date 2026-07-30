@@ -5,14 +5,68 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
+
+func trustedTLSServer(t *testing.T, dnsNames []string, ipAddresses []net.IP) (*httptest.Server, string) {
+	t.Helper()
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificateTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "benchmark-test"},
+		NotBefore:             time.Now().Add(-time.Minute),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		DNSNames:              dnsNames,
+		IPAddresses:           ipAddresses,
+	}
+	certificateDER, err := x509.CreateCertificate(
+		rand.Reader, certificateTemplate, certificateTemplate, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusOK)
+	}))
+	server.TLS = &tls.Config{
+		Certificates: []tls.Certificate{{
+			Certificate: [][]byte{certificateDER},
+			PrivateKey:  privateKey,
+		}},
+	}
+	server.StartTLS()
+	t.Cleanup(server.Close)
+
+	caFile := filepath.Join(t.TempDir(), "trusted-ca.pem")
+	if err := os.WriteFile(caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificateDER}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return server, caFile
+}
 
 func TestRunMaintainsConfiguredConcurrency(t *testing.T) {
 	var active atomic.Int64
@@ -75,6 +129,9 @@ func TestRunMaintainsConfiguredConcurrency(t *testing.T) {
 	if result.Status != "passed" || result.SuccessfulRequests == 0 {
 		t.Fatalf("unexpected result: %+v", result)
 	}
+	if result.TLSVerification != tlsVerificationNotApplicable {
+		t.Fatalf("TLS verification = %q, want %q", result.TLSVerification, tlsVerificationNotApplicable)
+	}
 	if maximum.Load() != 4 {
 		t.Fatalf("maximum concurrent requests = %d, want 4", maximum.Load())
 	}
@@ -122,6 +179,146 @@ func TestRunSendsW3CHeaders(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("server did not receive a request")
+	}
+}
+
+func TestRunUsesExplicitTrustedCAForHTTPS(t *testing.T) {
+	server, caFile := trustedTLSServer(t, []string{"localhost"}, []net.IP{net.ParseIP("127.0.0.1")})
+
+	result, err := run(context.Background(), config{
+		baseURL:        server.URL,
+		caFile:         caFile,
+		path:           "/api/echo",
+		connectionMode: "close",
+		duration:       20 * time.Millisecond,
+		requestTimeout: time.Second,
+		concurrency:    1,
+		requestLimit:   maxRequestLimit,
+	})
+	if err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+	if result.Status != "passed" || result.SuccessfulRequests == 0 {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	if result.TLSVerification != tlsVerificationCAFile {
+		t.Fatalf("TLS verification = %q, want %q", result.TLSVerification, tlsVerificationCAFile)
+	}
+}
+
+func TestRunRejectsUntrustedHTTPSCertificate(t *testing.T) {
+	server, _ := trustedTLSServer(t, []string{"localhost"}, []net.IP{net.ParseIP("127.0.0.1")})
+	_, wrongCAFile := trustedTLSServer(t, []string{"localhost"}, []net.IP{net.ParseIP("127.0.0.1")})
+
+	result, err := run(context.Background(), config{
+		baseURL:        server.URL,
+		caFile:         wrongCAFile,
+		path:           "/api/echo",
+		connectionMode: "close",
+		duration:       time.Second,
+		requestTimeout: time.Second,
+		concurrency:    1,
+		requestLimit:   maxRequestLimit,
+	})
+	if err == nil {
+		t.Fatal("run() error = nil, want TLS validation failure")
+	}
+	if result.Status != "failed" || result.TLSVerification != tlsVerificationCAFile {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+}
+
+func TestRunRejectsTrustedCertificateForWrongHostname(t *testing.T) {
+	server, caFile := trustedTLSServer(t, []string{"localhost"}, nil)
+
+	result, err := run(context.Background(), config{
+		baseURL:        server.URL,
+		caFile:         caFile,
+		path:           "/api/echo",
+		connectionMode: "close",
+		duration:       time.Second,
+		requestTimeout: time.Second,
+		concurrency:    1,
+		requestLimit:   maxRequestLimit,
+	})
+	if err == nil {
+		t.Fatal("run() error = nil, want hostname validation failure")
+	}
+	if result.Status != "failed" || result.TLSVerification != tlsVerificationCAFile {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+}
+
+func TestTrustedCAPoolRejectsFIFOWithoutBlocking(t *testing.T) {
+	caFile := filepath.Join(t.TempDir(), "trusted-ca")
+	if err := syscall.Mkfifo(caFile, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	completed := make(chan error, 1)
+	go func() {
+		_, err := trustedCAPool(caFile)
+		completed <- err
+	}()
+	select {
+	case err := <-completed:
+		if err == nil {
+			t.Fatal("trustedCAPool() error = nil, want non-regular file rejection")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("trustedCAPool() blocked on FIFO")
+	}
+}
+
+func TestValidateConfigRequiresCAOnlyForHTTPS(t *testing.T) {
+	base := config{
+		path:           "/api/echo",
+		connectionMode: "close",
+		duration:       time.Second,
+		requestTimeout: time.Second,
+		concurrency:    1,
+		requestLimit:   1,
+	}
+	withBaseURL := func(baseURL, caFile string) config {
+		cfg := base
+		cfg.baseURL = baseURL
+		cfg.caFile = caFile
+		return cfg
+	}
+	for _, test := range []struct {
+		name string
+		cfg  config
+		want bool
+	}{
+		{
+			name: "http without CA",
+			cfg:  withBaseURL("http://127.0.0.1:8080", ""),
+			want: true,
+		},
+		{
+			name: "http with CA",
+			cfg:  withBaseURL("http://127.0.0.1:8080", "/trusted/ca.pem"),
+		},
+		{
+			name: "https without CA",
+			cfg:  withBaseURL("https://127.0.0.1:8443", ""),
+		},
+		{
+			name: "https relative CA",
+			cfg:  withBaseURL("https://127.0.0.1:8443", "ca.pem"),
+		},
+		{
+			name: "https absolute CA",
+			cfg:  withBaseURL("https://127.0.0.1:8443", "/trusted/ca.pem"),
+			want: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateConfig(test.cfg)
+			if (err == nil) != test.want {
+				t.Fatalf("validateConfig() error = %v, want success=%t", err, test.want)
+			}
+		})
 	}
 }
 

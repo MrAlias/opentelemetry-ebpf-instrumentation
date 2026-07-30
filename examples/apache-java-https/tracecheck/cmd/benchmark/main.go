@@ -5,6 +5,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -15,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -31,10 +34,15 @@ const (
 	maxRequestLimit        = 1_000_000
 	maxResponseBytes       = 1 << 20
 	maxResponseHeaderBytes = 64 << 10
+	maxTrustedCABytes      = 1 << 20
+
+	tlsVerificationNotApplicable = "not_applicable"
+	tlsVerificationCAFile        = "verified_ca_file"
 )
 
 type config struct {
 	baseURL        string
+	caFile         string
 	path           string
 	connectionMode string
 	duration       time.Duration
@@ -58,6 +66,7 @@ type runResult struct {
 	BaseURL             string         `json:"base_url"`
 	Path                string         `json:"path"`
 	ConnectionMode      string         `json:"connection_mode"`
+	TLSVerification     string         `json:"tls_verification"`
 	W3C                 bool           `json:"w3c"`
 	Seed                uint64         `json:"seed"`
 	Concurrency         int            `json:"concurrency"`
@@ -121,6 +130,7 @@ func parseFlags(arguments []string) (config, error) {
 	flags := flag.NewFlagSet("trace-benchmark", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	flags.StringVar(&cfg.baseURL, "base-url", cfg.baseURL, "Apache base URL")
+	flags.StringVar(&cfg.caFile, "ca-file", "", "absolute PEM CA file required for an HTTPS base URL")
 	flags.StringVar(&cfg.path, "path", cfg.path, "request path and query")
 	flags.StringVar(&cfg.connectionMode, "connection-mode", cfg.connectionMode, "close or reuse")
 	flags.DurationVar(&cfg.duration, "duration", cfg.duration, "fixed measurement duration")
@@ -157,6 +167,23 @@ func validateConfig(cfg config) error {
 	if cfg.connectionMode != "close" && cfg.connectionMode != "reuse" {
 		return errors.New("--connection-mode must be close or reuse")
 	}
+	baseURL, err := parseBaseURL(cfg.baseURL)
+	if err != nil {
+		return err
+	}
+	switch baseURL.Scheme {
+	case "http":
+		if cfg.caFile != "" {
+			return errors.New("--ca-file requires an https --base-url")
+		}
+	case "https":
+		if cfg.caFile == "" {
+			return errors.New("https --base-url requires --ca-file")
+		}
+		if !filepath.IsAbs(cfg.caFile) {
+			return errors.New("--ca-file must be an absolute path")
+		}
+	}
 	if _, err := requestURL(cfg); err != nil {
 		return err
 	}
@@ -164,22 +191,85 @@ func validateConfig(cfg config) error {
 }
 
 func requestURL(cfg config) (string, error) {
-	baseURL, err := url.Parse(cfg.baseURL)
-	if err != nil || baseURL.Scheme == "" || baseURL.Host == "" {
-		return "", fmt.Errorf("invalid --base-url %q", cfg.baseURL)
-	}
-	if baseURL.Scheme != "http" {
-		return "", fmt.Errorf("--base-url must use http")
-	}
-	if baseURL.User != nil || baseURL.RawQuery != "" || baseURL.Fragment != "" ||
-		(baseURL.Path != "" && baseURL.Path != "/") {
-		return "", fmt.Errorf("--base-url must be an origin without credentials, query, or path")
+	baseURL, err := parseBaseURL(cfg.baseURL)
+	if err != nil {
+		return "", err
 	}
 	requestPath, err := url.Parse(cfg.path)
 	if err != nil || requestPath.IsAbs() || requestPath.Host != "" || !strings.HasPrefix(requestPath.Path, "/") {
 		return "", fmt.Errorf("invalid --path %q", cfg.path)
 	}
 	return baseURL.ResolveReference(requestPath).String(), nil
+}
+
+func parseBaseURL(raw string) (*url.URL, error) {
+	baseURL, err := url.Parse(raw)
+	if err != nil || baseURL.Scheme == "" || baseURL.Host == "" {
+		return nil, fmt.Errorf("invalid --base-url %q", raw)
+	}
+	if baseURL.Scheme != "http" && baseURL.Scheme != "https" {
+		return nil, errors.New("--base-url must use http or https")
+	}
+	if baseURL.User != nil || baseURL.RawQuery != "" || baseURL.Fragment != "" ||
+		(baseURL.Path != "" && baseURL.Path != "/") {
+		return nil, errors.New("--base-url must be an origin without credentials, query, or path")
+	}
+	return baseURL, nil
+}
+
+func trustedCAPool(caFile string) (*x509.CertPool, error) {
+	file, err := os.OpenFile(caFile, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open trusted CA file: %w", err)
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat trusted CA file: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("trusted CA file must be a regular file")
+	}
+	contents, err := io.ReadAll(io.LimitReader(file, maxTrustedCABytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read trusted CA file: %w", err)
+	}
+	if len(contents) > maxTrustedCABytes {
+		return nil, fmt.Errorf("trusted CA file exceeds %d bytes", maxTrustedCABytes)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(contents) {
+		return nil, errors.New("trusted CA file contains no certificate")
+	}
+	return pool, nil
+}
+
+func newHTTPTransport(cfg config) (*http.Transport, string, error) {
+	baseURL, err := parseBaseURL(cfg.baseURL)
+	if err != nil {
+		return nil, "", err
+	}
+	transport := &http.Transport{
+		DisableKeepAlives:      cfg.connectionMode == "close",
+		MaxIdleConns:           cfg.concurrency,
+		MaxIdleConnsPerHost:    cfg.concurrency,
+		MaxConnsPerHost:        cfg.concurrency,
+		IdleConnTimeout:        30 * time.Second,
+		MaxResponseHeaderBytes: maxResponseHeaderBytes,
+	}
+	if baseURL.Scheme == "http" {
+		return transport, tlsVerificationNotApplicable, nil
+	}
+	pool, err := trustedCAPool(cfg.caFile)
+	if err != nil {
+		return nil, "", err
+	}
+	transport.TLSClientConfig = &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		RootCAs:    pool,
+	}
+	return transport, tlsVerificationCAFile, nil
 }
 
 func run(parent context.Context, cfg config) (runResult, error) {
@@ -190,12 +280,17 @@ func run(parent context.Context, cfg config) (runResult, error) {
 	if err != nil {
 		return runResult{}, err
 	}
+	transport, tlsVerification, err := newHTTPTransport(cfg)
+	if err != nil {
+		return runResult{}, err
+	}
 
 	result := runResult{
 		Status:              "failed",
 		BaseURL:             cfg.baseURL,
 		Path:                cfg.path,
 		ConnectionMode:      cfg.connectionMode,
+		TLSVerification:     tlsVerification,
 		W3C:                 cfg.w3c,
 		Seed:                cfg.seed,
 		Concurrency:         cfg.concurrency,
@@ -204,14 +299,6 @@ func run(parent context.Context, cfg config) (runResult, error) {
 		RequestLimit:        cfg.requestLimit,
 	}
 
-	transport := &http.Transport{
-		DisableKeepAlives:      cfg.connectionMode == "close",
-		MaxIdleConns:           cfg.concurrency,
-		MaxIdleConnsPerHost:    cfg.concurrency,
-		MaxConnsPerHost:        cfg.concurrency,
-		IdleConnTimeout:        30 * time.Second,
-		MaxResponseHeaderBytes: maxResponseHeaderBytes,
-	}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{
 		Transport: transport,

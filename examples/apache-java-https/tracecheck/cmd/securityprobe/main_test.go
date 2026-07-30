@@ -8,6 +8,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -42,6 +43,116 @@ func TestRequestUsesOnlyTheVersionedNamespaceIdentity(t *testing.T) {
 	assert.Equal(t, []byte{0, 0, 0}, request[9:12])
 	assert.EqualValues(t, 42, binary.LittleEndian.Uint32(request[12:16]))
 	assert.EqualValues(t, 99, binary.LittleEndian.Uint64(request[16:24]))
+}
+
+func TestAbuseIdentityRequestsEncodeOptionalLiveJavaTID(t *testing.T) {
+	const peerTID = uint32(42)
+	liveJavaTID := uint32(31337)
+	for _, test := range []struct {
+		name      string
+		forgedTID *uint32
+		want      []struct {
+			name string
+			tid  uint32
+		}
+	}{
+		{
+			name:      "default identities",
+			forgedTID: nil,
+			want: []struct {
+				name string
+				tid  uint32
+			}{
+				{name: "peer-identity", tid: peerTID},
+				{name: "forged-identity", tid: ^uint32(0)},
+			},
+		},
+		{
+			name:      "live Java forgery",
+			forgedTID: &liveJavaTID,
+			want: []struct {
+				name string
+				tid  uint32
+			}{
+				{name: "peer-identity", tid: peerTID},
+				{name: "forged-identity", tid: ^uint32(0)},
+				{name: "forged-live-java-tid", tid: liveJavaTID},
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			requests := abuseIdentityRequests(peerTID, test.forgedTID)
+			require.Len(t, requests, len(test.want))
+			for index, expected := range test.want {
+				request := requests[index]
+				assert.Equal(t, expected.name, request.name)
+				require.Len(t, request.payload, requestSize)
+				assert.Equal(t, "OBIQ", string(request.payload[:4]))
+				assert.Equal(t, requestVersion, binary.LittleEndian.Uint16(request.payload[4:6]))
+				assert.EqualValues(t, requestSize, binary.LittleEndian.Uint16(request.payload[6:8]))
+				assert.Equal(t, operationTake, request.payload[8])
+				assert.Equal(t, []byte{0, 0, 0}, request.payload[9:12])
+				assert.Equal(t, expected.tid, binary.LittleEndian.Uint32(request.payload[12:16]))
+				assert.Equal(t, uint64(0x5ec0000000000001), binary.LittleEndian.Uint64(request.payload[16:24]))
+			}
+		})
+	}
+}
+
+func TestAbuseRaceProbeForwardsLiveJavaTID(t *testing.T) {
+	liveJavaTID := uint32(31337)
+	socketPath := filepath.Join(t.TempDir(), "bridge.sock")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+	require.NoError(t, err)
+	defer listener.Close()
+	require.NoError(t, listener.SetDeadline(time.Now().Add(time.Second)))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	type serverResult struct {
+		tids [3]uint32
+		err  error
+	}
+	serverDone := make(chan serverResult, 1)
+	go func() {
+		var result serverResult
+		for index := range result.tids {
+			connection, acceptErr := listener.AcceptUnix()
+			if acceptErr != nil {
+				result.err = acceptErr
+				serverDone <- result
+				return
+			}
+			request := make([]byte, requestSize)
+			_, result.err = io.ReadFull(connection, request)
+			if result.err == nil {
+				result.tids[index] = binary.LittleEndian.Uint32(request[12:16])
+				if index == len(result.tids)-1 {
+					cancel()
+				}
+				_, result.err = connection.Write(statusRecord(statusUnauthorized))
+			}
+			closeErr := connection.Close()
+			if result.err == nil {
+				result.err = closeErr
+			}
+			if result.err != nil {
+				serverDone <- result
+				return
+			}
+		}
+		serverDone <- result
+	}()
+
+	resume := make(chan os.Signal, 1)
+	_, err = runAbuseRaceProbe(ctx, socketPath, &liveJavaTID, resume, func() {
+		t.Error("abuse race reached its traffic barrier after cancellation")
+	})
+	require.ErrorIs(t, err, context.Canceled)
+	result := <-serverDone
+	require.NoError(t, result.err)
+	assert.Equal(t, ^uint32(0), result.tids[1])
+	assert.Equal(t, liveJavaTID, result.tids[2])
 }
 
 func TestReadStatusRejectsContextBearingOrMalformedRecords(t *testing.T) {
@@ -424,6 +535,12 @@ func TestMainRejectsUnboundedOrInvalidInvocation(t *testing.T) {
 		{"--mode", "primary-live-fd"},
 		{"--mode", "primary-live-fd", "--fd=-1"},
 		{"--mode", "primary-live-fd", "--fd=2147483648"},
+		{"--forged-tid=0"},
+		{"--forged-tid=-2"},
+		{"--forged-tid=4294967296"},
+		{"--mode", "endpoint", "--forged-tid=1"},
+		{"--mode", "primary", "--forged-tid=1"},
+		{"--mode", "primary-live-fd", "--fd=0", "--forged-tid=1"},
 		{"--timeout", "999ms"},
 		{"--timeout", "1h1s"},
 		{"positional"},
@@ -434,6 +551,20 @@ func TestMainRejectsUnboundedOrInvalidInvocation(t *testing.T) {
 		assert.Empty(t, stdout.String(), args)
 		assert.NotEmpty(t, stderr.String(), args)
 	}
+}
+
+func TestMainAcceptsMaximumForgedTIDForAbuseMode(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	exitCode := mainExitCode([]string{
+		"--socket", filepath.Join(t.TempDir(), "missing.sock"),
+		"--forged-tid=4294967295",
+	}, &stdout, &stderr)
+
+	assert.Equal(t, 1, exitCode)
+	assert.Empty(t, stdout.String())
+	assert.Contains(t, stderr.String(), "security probe failed")
+	assert.NotContains(t, stderr.String(), "--forged-tid must")
 }
 
 func TestMaxProbeTimeoutMatchesRunnerSafetyBound(t *testing.T) {

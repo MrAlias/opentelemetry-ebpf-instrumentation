@@ -48,6 +48,7 @@ const (
 	primaryInterval    = time.Millisecond
 	javaProcessPID     = 1
 	maxKernelFD        = (1 << 31) - 1
+	maxNamespaceTID    = uint64(1<<32 - 1)
 	heldConnections    = 48
 	repeatedAttempts   = 16
 	oversizedBytes     = 4096
@@ -67,6 +68,11 @@ type probeResult struct {
 	Cases    []probeCase `json:"cases"`
 }
 
+type abuseIdentityRequest struct {
+	name    string
+	payload []byte
+}
+
 func main() {
 	os.Exit(mainExitCode(os.Args[1:], os.Stdout, os.Stderr))
 }
@@ -78,10 +84,12 @@ func mainExitCode(args []string, stdout, stderr io.Writer) int {
 	var mode string
 	var timeout time.Duration
 	var targetFD int
+	var forgedTID int64
 	flags.StringVar(&socketPath, "socket", defaultSocketPath, "Unix socket path")
 	flags.StringVar(&mode, "mode", "abuse", "probe mode: abuse, abuse-race, endpoint, primary, or primary-live-fd")
 	flags.DurationVar(&timeout, "timeout", probeTimeout, "overall probe timeout")
 	flags.IntVar(&targetFD, "fd", -1, "live Java socket descriptor for primary-live-fd mode")
+	flags.Int64Var(&forgedTID, "forged-tid", -1, "forged namespace thread ID for abuse modes")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -101,6 +109,14 @@ func mainExitCode(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "primary-live-fd requires a --fd in the kernel descriptor range")
 		return 2
 	}
+	if forgedTID != -1 && (forgedTID < 1 || uint64(forgedTID) > maxNamespaceTID) {
+		fmt.Fprintln(stderr, "--forged-tid must be a positive 32-bit thread ID")
+		return 2
+	}
+	if forgedTID != -1 && mode != "abuse" && mode != "abuse-race" {
+		fmt.Fprintln(stderr, "--forged-tid is only supported by abuse modes")
+		return 2
+	}
 	if timeout < time.Second || timeout > maxProbeTimeout {
 		fmt.Fprintln(stderr, "security probe timeout must be between 1s and 1h")
 		return 2
@@ -111,18 +127,24 @@ func mainExitCode(args []string, stdout, stderr io.Writer) int {
 	ctx, cancel := context.WithTimeout(baseCtx, timeout)
 	defer cancel()
 
+	var forgedLiveTID *uint32
+	if forgedTID != -1 {
+		value := uint32(forgedTID)
+		forgedLiveTID = &value
+	}
+
 	var (
 		result probeResult
 		err    error
 	)
 	switch mode {
 	case "abuse":
-		result, err = runAbuseProbe(ctx, socketPath)
+		result, err = runAbuseProbe(ctx, socketPath, forgedLiveTID)
 	case "abuse-race":
 		resume := make(chan os.Signal, 1)
 		signal.Notify(resume, syscall.SIGUSR1)
 		defer signal.Stop(resume)
-		result, err = runAbuseRaceProbe(ctx, socketPath, resume, func() {
+		result, err = runAbuseRaceProbe(ctx, socketPath, forgedLiveTID, resume, func() {
 			fmt.Fprintln(stdout, "security probe abuse race ready")
 		})
 	case "endpoint":
@@ -489,7 +511,31 @@ func rawSetsockopt(raw syscall.RawConn, level int, option int, value []byte) err
 	return callErr
 }
 
-func runAbuseProbe(ctx context.Context, socketPath string) (probeResult, error) {
+func abuseIdentityRequests(peerTID uint32, forgedLiveTID *uint32) []abuseIdentityRequest {
+	requests := []abuseIdentityRequest{
+		{
+			name:    "peer-identity",
+			payload: marshalRequest(peerTID, 0x5ec0000000000001),
+		},
+		{
+			name:    "forged-identity",
+			payload: marshalRequest(^uint32(0), 0x5ec0000000000001),
+		},
+	}
+	if forgedLiveTID != nil {
+		requests = append(requests, abuseIdentityRequest{
+			name:    "forged-live-java-tid",
+			payload: marshalRequest(*forgedLiveTID, 0x5ec0000000000001),
+		})
+	}
+	return requests
+}
+
+func runAbuseProbe(
+	ctx context.Context,
+	socketPath string,
+	forgedLiveTID *uint32,
+) (probeResult, error) {
 	result := probeResult{Status: "passed", Mode: "abuse"}
 	run := func(name string, probe func() (string, error)) error {
 		if err := ctx.Err(); err != nil {
@@ -503,17 +549,15 @@ func runAbuseProbe(ctx context.Context, socketPath string) (probeResult, error) 
 		return nil
 	}
 
-	request := marshalRequest(uint32(syscall.Gettid()), 0x5ec0000000000001)
-	forged := marshalRequest(^uint32(0), 0x5ec0000000000001)
-	if err := run("peer-identity", func() (string, error) {
-		return expectRoundTripStatus(socketPath, request, statusUnauthorized)
-	}); err != nil {
-		return probeResult{}, err
-	}
-	if err := run("forged-identity", func() (string, error) {
-		return expectRoundTripStatus(socketPath, forged, statusUnauthorized)
-	}); err != nil {
-		return probeResult{}, err
+	identityRequests := abuseIdentityRequests(uint32(syscall.Gettid()), forgedLiveTID)
+	request := identityRequests[0].payload
+	for _, identityRequest := range identityRequests {
+		identityRequest := identityRequest
+		if err := run(identityRequest.name, func() (string, error) {
+			return expectRoundTripStatus(socketPath, identityRequest.payload, statusUnauthorized)
+		}); err != nil {
+			return probeResult{}, err
+		}
 	}
 	if err := run("malformed", func() (string, error) {
 		return expectRoundTripStatus(socketPath, make([]byte, requestSize), statusMalformed)
@@ -568,10 +612,11 @@ func runAbuseProbe(ctx context.Context, socketPath string) (probeResult, error) 
 func runAbuseRaceProbe(
 	ctx context.Context,
 	socketPath string,
+	forgedLiveTID *uint32,
 	resume <-chan os.Signal,
 	ready func(),
 ) (probeResult, error) {
-	result, err := runAbuseProbe(ctx, socketPath)
+	result, err := runAbuseProbe(ctx, socketPath, forgedLiveTID)
 	if err != nil {
 		return probeResult{}, err
 	}

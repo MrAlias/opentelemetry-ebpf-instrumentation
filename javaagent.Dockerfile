@@ -45,8 +45,12 @@ COPY pkg/internal/java .
 COPY --from=jni-builder /build/target/classes/native/linux-amd64/libobijni.so agent/target/classes/native/linux-amd64/libobijni.so
 COPY --from=jni-builder /build/target/classes/native/linux-aarch64/libobijni.so agent/target/classes/native/linux-aarch64/libobijni.so
 
-# Build the project (skip native lib compilation, already done above)
-RUN gradle build -x buildNativeLib-amd64 -x buildNativeLib-aarch64 -x nativeTest --no-daemon
+# Isolate Gradle from the base image's declared user-home volume.
+ENV GRADLE_USER_HOME=/tmp/obi-gradle-user-home
+
+# Build the project (skip native lib compilation, already done above).
+RUN install -d -m 0700 "$GRADLE_USER_HOME" && \
+    gradle build -x buildNativeLib-amd64 -x buildNativeLib-aarch64 -x nativeTest --no-daemon
 
 FROM scratch AS export
 COPY --from=builder /workspace/pkg/internal/java/build/obi-java-agent.jar /obi-java-agent.jar

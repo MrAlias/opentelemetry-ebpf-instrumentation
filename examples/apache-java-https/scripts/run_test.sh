@@ -12689,6 +12689,36 @@ test_release_source_uses_one_version_for_extension() {
   }
 }
 
+test_java_build_uses_isolated_gradle_home() {
+  local dockerfile=""
+
+  for dockerfile in \
+    "$TEST_SCRIPT_DIR/../../../javaagent.Dockerfile" \
+    "$TEST_SCRIPT_DIR/../../../Dockerfile"; do
+    awk '
+      $0 == "ENV GRADLE_USER_HOME=/tmp/obi-gradle-user-home" {
+        gradle_home = NR
+        next
+      }
+      gradle_home && !creates_private_home &&
+          $0 ~ /^RUN install -d -m 0700 / &&
+          $0 ~ /GRADLE_USER_HOME/ && $0 ~ /&&/ {
+        creates_private_home = NR
+        next
+      }
+      $0 == "    gradle build -x buildNativeLib-amd64 -x buildNativeLib-aarch64 -x nativeTest --no-daemon" &&
+          creates_private_home && NR > creates_private_home {
+        invokes_gradle = NR
+      }
+      END { exit gradle_home && creates_private_home && invokes_gradle ? 0 : 1 }
+    ' "$dockerfile" || {
+      printf 'Java build Dockerfile did not isolate its Gradle user home: %s\n' \
+        "$dockerfile" >&2
+      return 1
+    }
+  done
+}
+
 test_demo_diagnostics_are_loopback_only() {
   local -r apache_config="$TEST_SCRIPT_DIR/../apache/httpd.conf"
   local -r obi_config="$TEST_SCRIPT_DIR/../configs/obi.yaml"
@@ -13290,6 +13320,7 @@ main() {
   test_clean_source_snapshot_uses_pinned_git_inputs
   test_run_status_serializes_default_acceptance_reason
   test_release_source_uses_one_version_for_extension
+  test_java_build_uses_isolated_gradle_home
   test_demo_diagnostics_are_loopback_only
   test_apache_diagnostic_denial_matrix_is_exact
   test_compatibility_matrix_lists_deployment_modes

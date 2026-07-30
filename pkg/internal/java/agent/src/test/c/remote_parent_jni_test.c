@@ -8,7 +8,9 @@
 #include <assert.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <jni.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -18,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -83,6 +86,10 @@ static _Atomic int observed_setsockopt_calls;
 static _Atomic int observed_ioctl_fd;
 static _Atomic unsigned long observed_ioctl_request;
 static _Atomic int observed_ioctl_calls;
+static _Atomic int observed_peer_credential_lookups;
+static struct stat denied_socket_identity;
+static _Atomic int denied_socket_identity_set;
+static _Atomic int observed_denied_socket_getsockopt_lookups;
 static _Atomic uint64_t observed_negotiate_incarnation;
 static _Atomic uint64_t observed_data_ack_nonce;
 static _Atomic int observed_transport_event_count;
@@ -132,9 +139,35 @@ static uint64_t fake_negotiation_for(int fd) {
   return incarnation;
 }
 
+static int socket_fd_is_denied(int fd) {
+  if (!atomic_load(&denied_socket_identity_set)) {
+    return 0;
+  }
+
+  struct stat identity;
+  assert(fstat(fd, &identity) == 0);
+  return identity.st_dev == denied_socket_identity.st_dev &&
+         identity.st_ino == denied_socket_identity.st_ino;
+}
+
+static void deny_socket_fd(int fd) {
+  assert(fstat(fd, &denied_socket_identity) == 0);
+  atomic_store(&denied_socket_identity_set, 1);
+}
+
+static void clear_denied_socket_fd(void) {
+  atomic_store(&denied_socket_identity_set, 0);
+  memset(&denied_socket_identity, 0, sizeof(denied_socket_identity));
+}
+
 int getsockopt(int fd, int level, int option, void *value, socklen_t *length) {
-  (void)fd;
+  if (socket_fd_is_denied(fd)) {
+    atomic_fetch_add(&observed_denied_socket_getsockopt_lookups, 1);
+    errno = EACCES;
+    return -1;
+  }
   if (level == SOL_SOCKET && option == SO_PEERCRED) {
+    atomic_fetch_add(&observed_peer_credential_lookups, 1);
     assert(*length >= sizeof(struct ucred));
     struct ucred credentials = {
         .pid = getpid(), .uid = geteuid(), .gid = getegid()};
@@ -279,6 +312,9 @@ static void reset_transport_observations(void) {
   atomic_store(&observed_ioctl_fd, -1);
   atomic_store(&observed_ioctl_request, 0);
   atomic_store(&observed_ioctl_calls, 0);
+  atomic_store(&observed_peer_credential_lookups, 0);
+  clear_denied_socket_fd();
+  atomic_store(&observed_denied_socket_getsockopt_lookups, 0);
   atomic_store(&observed_data_ack_nonce, 0);
   atomic_store(&observed_transport_event_count, 0);
   memset(observed_transport_events, 0, sizeof(observed_transport_events));
@@ -1195,7 +1231,26 @@ static void test_exported_jni_configuration_validation(void) {
 struct trickle_server {
   int listener;
   _Atomic int accepted;
+  _Atomic int result;
   char path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+};
+
+enum {
+  test_remote_parent_transport_unix = 2,
+  test_remote_parent_request_version = 2,
+  test_remote_parent_request_size = 24,
+  test_remote_parent_operation_take = 1,
+  test_remote_parent_operation_negotiate = 3,
+  test_remote_parent_status_valid = 1,
+  test_remote_parent_status_missing = 2,
+  test_remote_parent_status_unauthorized = 8,
+  test_remote_parent_timeout_millis = 100,
+  test_unix_server_timeout_millis = 1000,
+  test_remote_parent_process_incarnation = 1,
+  test_unix_server_success = 1,
+  test_unix_server_timeout = 2,
+  test_unix_server_io_error = 3,
+  test_unix_server_protocol_error = 4,
 };
 
 static void start_unix_test_server(struct trickle_server *server,
@@ -1235,6 +1290,120 @@ static void *run_probe_server(void *argument) {
   close(client);
   close(server->listener);
   unlink(server->path);
+  return NULL;
+}
+
+static int wait_for_unix_test_fd(int fd, short events, int64_t deadline) {
+  for (;;) {
+    int64_t remaining = deadline - test_monotonic_millis();
+    if (remaining <= 0) {
+      return 0;
+    }
+
+    struct pollfd descriptor = {.fd = fd, .events = events};
+    int result = poll(&descriptor, 1, (int)remaining);
+    if (result == 0) {
+      return 0;
+    }
+    if (result < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return -1;
+    }
+    if ((descriptor.revents & events) != 0) {
+      return 1;
+    }
+    return -1;
+  }
+}
+
+static int receive_unix_test_request(int fd, unsigned char *request,
+                                     int64_t deadline) {
+  size_t received = 0;
+  while (received < test_remote_parent_request_size) {
+    int ready = wait_for_unix_test_fd(fd, POLLIN, deadline);
+    if (ready != 1) {
+      return ready;
+    }
+
+    ssize_t count = recv(fd, request + received,
+                         test_remote_parent_request_size - received, 0);
+    if (count > 0) {
+      received += (size_t)count;
+      continue;
+    }
+    if (count == 0) {
+      return -1;
+    }
+    if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+      continue;
+    }
+    return -1;
+  }
+  return 1;
+}
+
+static void *run_missing_then_unauthorized_server(void *argument) {
+  struct trickle_server *server = argument;
+  const int operations[] = {test_remote_parent_operation_negotiate,
+                            test_remote_parent_operation_take};
+  const int statuses[] = {test_remote_parent_status_missing,
+                          test_remote_parent_status_unauthorized};
+  int result = test_unix_server_success;
+  int64_t deadline = test_monotonic_millis() + test_unix_server_timeout_millis;
+
+  for (size_t index = 0; index < sizeof(operations) / sizeof(operations[0]);
+       index++) {
+    int client = -1;
+    while (client < 0) {
+      int ready = wait_for_unix_test_fd(server->listener, POLLIN, deadline);
+      if (ready != 1) {
+        result =
+            ready == 0 ? test_unix_server_timeout : test_unix_server_io_error;
+        goto done;
+      }
+      client =
+          accept4(server->listener, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+      if (client < 0 && errno != EINTR && errno != EAGAIN &&
+          errno != EWOULDBLOCK) {
+        result = test_unix_server_io_error;
+        goto done;
+      }
+    }
+
+    unsigned char request[test_remote_parent_request_size];
+    int received = receive_unix_test_request(client, request, deadline);
+    if (received != 1) {
+      close(client);
+      result =
+          received == 0 ? test_unix_server_timeout : test_unix_server_io_error;
+      goto done;
+    }
+    if (memcmp(request, "OBIQ", 4) != 0 ||
+        read_u16_le(request, 4) != test_remote_parent_request_version ||
+        read_u16_le(request, 6) != sizeof(request) ||
+        request[8] != operations[index]) {
+      close(client);
+      result = test_unix_server_protocol_error;
+      goto done;
+    }
+
+    unsigned char response[64];
+    obi_test_status_response(response, statuses[index]);
+    if (send(client, response, sizeof(response), MSG_NOSIGNAL) !=
+        (ssize_t)sizeof(response)) {
+      close(client);
+      result = test_unix_server_io_error;
+      goto done;
+    }
+    close(client);
+  }
+
+done:
+  close(server->listener);
+  unlink(server->path);
+  atomic_store(&server->result, result);
   return NULL;
 }
 
@@ -1297,6 +1466,54 @@ static void test_unix_trickle_response_obeys_deadline(void) {
   assert(obi_test_configure_remote_parent(2, server.path, 20, geteuid(), 1) ==
          10);
   assert(pthread_join(thread, NULL) == 0);
+  obi_test_close_remote_parent();
+}
+
+static void test_unix_transport_ignores_unrelated_duplicated_socket_fd(void) {
+  struct trickle_server server = {0};
+  start_unix_test_server(&server, "duplicate-fd");
+
+  int unrelated[2];
+  assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0,
+                    unrelated) == 0);
+  int duplicate = fcntl(unrelated[0], F_DUPFD_CLOEXEC, 0);
+  assert(duplicate >= 0);
+  assert(close(unrelated[0]) == 0);
+  reset_transport_observations();
+  deny_socket_fd(duplicate);
+  int duplicate_alias = fcntl(duplicate, F_DUPFD_CLOEXEC, 0);
+  assert(duplicate_alias >= 0);
+  assert(socket_fd_is_denied(duplicate_alias));
+  assert(close(duplicate_alias) == 0);
+
+  pthread_t thread;
+  assert(pthread_create(&thread, NULL, run_missing_then_unauthorized_server,
+                        &server) == 0);
+  assert(obi_test_configure_remote_parent(
+             test_remote_parent_transport_unix, server.path,
+             test_remote_parent_timeout_millis, geteuid(),
+             test_remote_parent_process_incarnation) ==
+         test_remote_parent_status_valid);
+
+  unsigned char response[64];
+  assert(obi_test_call_remote_parent_on_socket(
+             test_remote_parent_operation_take, duplicate, response) ==
+         test_remote_parent_status_unauthorized);
+  assert(obi_test_response_status(response, sizeof(response)) ==
+         test_remote_parent_status_unauthorized);
+  assert(pthread_join(thread, NULL) == 0);
+  assert(atomic_load(&server.result) == test_unix_server_success);
+  assert(atomic_load(&observed_peer_credential_lookups) == 2);
+  assert(atomic_load(&observed_denied_socket_getsockopt_lookups) == 0);
+  clear_denied_socket_fd();
+
+  unsigned char unexpected[24];
+  assert(recv(unrelated[1], unexpected, sizeof(unexpected), MSG_DONTWAIT) ==
+         -1);
+  assert(errno == EAGAIN || errno == EWOULDBLOCK);
+
+  assert(close(duplicate) == 0);
+  assert(close(unrelated[1]) == 0);
   obi_test_close_remote_parent();
 }
 
@@ -1599,6 +1816,7 @@ int main(int argc, char **argv) {
   test_exported_jni_configuration_validation();
   test_configuration_result_auto_fallback();
   test_unix_trickle_response_obeys_deadline();
+  test_unix_transport_ignores_unrelated_duplicated_socket_fd();
   test_unix_server_first_failure_response();
   test_unix_server_first_valid_response_is_rejected();
   test_unix_server_first_truncated_response_fails_closed();

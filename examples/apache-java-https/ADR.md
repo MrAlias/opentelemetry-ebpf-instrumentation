@@ -3,7 +3,7 @@
 - Status: accepted for proof of concept
 - Scope: Apache/OpenSSL outbound HTTPS to auto-instrumented Jetty and bounded
   inbound-Netty fixtures
-- Last updated: 2026-07-29
+- Last updated: 2026-07-30
 
 ## Decision
 
@@ -81,8 +81,9 @@ An instrumented JVM that is fully compromised acts with that JVM's identity
 and can misuse contexts available to it. The demo assigns the Unix socket group
 to the non-root `65534` attacker fixture so the control reaches kernel-derived
 peer authorization rather than stopping at filesystem permissions. Socket-group
-membership remains an availability trust boundary: authorized peers can cause
-temporary `overload` even though they cannot consume another staged parent.
+membership remains an availability trust boundary: peers granted socket-connect
+access can cause temporary `overload` even though they cannot consume another
+staged parent.
 Production support requires explicit namespace, endpoint-ownership, socket
 group, and log/metric-access policy, plus completion of the remaining matrix.
 

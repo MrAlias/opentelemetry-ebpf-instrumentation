@@ -553,13 +553,16 @@ For `unix`, verify that the scoped `java-remote-parent-socket` volume is owned
 by `root:65534`, has mode `0750`, and is mounted by both OBI and Java at
 `/var/run/obi`. The one-shot `socket-init` service establishes those
 permissions before either service starts. Membership in this socket group only
-permits connection: OBI derives Unix peer credentials and still requires the
-peer process to satisfy its authorization checks. The hardened
+permits directory listing/traversal and socket connection: OBI derives Unix
+peer credentials and still requires the peer process to satisfy its
+authorization checks. The hardened
 `security-unix-sibling-probe` fixture deliberately uses that group without
 root, network access, capabilities, a writable root filesystem, or a writable
-socket mount; `security-probe` remains root-owned only for endpoint-replacement
-testing. For `getsockopt`, confirm the kernel reports support rather than
-silently accepting fallback; a forced mode must not change transport.
+socket mount. Within the Unix control, `security-probe` remains root-owned
+only for endpoint-replacement testing; the separate `getsockopt` control
+reuses its image for native protocol checks. For `getsockopt`, confirm the
+kernel reports support rather than silently accepting fallback; a forced mode
+must not change transport.
 
 ## Explicit limitations
 

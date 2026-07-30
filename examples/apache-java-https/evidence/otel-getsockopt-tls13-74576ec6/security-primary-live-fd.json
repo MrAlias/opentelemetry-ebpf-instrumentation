@@ -1,0 +1,74 @@
+{
+  "format": 1,
+  "status": "passed",
+  "transport": "getsockopt",
+  "verification": "isolated unauthorized-operation metric deltas",
+  "topology": {
+    "attacker_identity": "root",
+    "attacker_cgroup": "verified equal to Java PID 1 before execution",
+    "java_pid_namespace": "private",
+    "java_container_privileged": false,
+    "java_container_capability": "SYS_PTRACE",
+    "seccomp_profile": "docker-default"
+  },
+  "barrier": {
+    "armed": {
+      "status": "armed",
+      "ownership": "root:root",
+      "mode": "0600",
+      "kind": "regular-file",
+      "size_bytes": 16
+    },
+    "released": {
+      "status": "released",
+      "ownership": "root:root",
+      "mode": "0600",
+      "kind": "regular-file",
+      "size_bytes": 0
+    },
+    "consumed": {
+      "status": "consumed",
+      "ownership": "root:root",
+      "mode": "0600",
+      "kind": "regular-empty-file",
+      "size_bytes": 0
+    }
+  },
+  "probe": {
+    "raw_status": "unverified",
+    "verification": "metrics_verified",
+    "attempts": 1,
+    "case_outcomes": {
+      "pidfd_duplicate": "opened",
+      "standard_option": "preserved",
+      "wrong_process_negotiation": "native-unsupported",
+      "duplicated_fd_take": "native-unsupported"
+    }
+  },
+  "metric_windows": {
+    "before": {
+      "take_valid": 2,
+      "take_unauthorized": 0,
+      "negotiate_unauthorized": 0
+    },
+    "probe_delta": {
+      "take_valid": 0,
+      "take_unauthorized": 1,
+      "negotiate_unauthorized": 1
+    },
+    "after_from_before_delta": {
+      "take_valid": 1,
+      "take_unauthorized": 1,
+      "negotiate_unauthorized": 1
+    }
+  },
+  "legitimate_victim": {
+    "status": "passed",
+    "request_count": 1,
+    "assertion": "the held request retained its exact Apache client parent"
+  },
+  "post_abuse_recovery": {
+    "status": "passed",
+    "assertion": "a normal-stack basic request retained its exact Apache client parent"
+  }
+}

@@ -74,19 +74,20 @@ the held legitimate victim, and post-abuse recovery.
 
 | Gate | Required topology and capability | Status | Required retained result |
 | --- | --- | --- | --- |
-| live accepted-descriptor duplication against forced `getsockopt` | clean Java container; root probe pre-exec cgroup exactly equals Java PID 1 cgroup; `pidfd_getfd` permitted | untested | clean full forced-primary `all` run, for example `./examples/apache-java-https/run.sh --transport getsockopt --agent otel --tls TLSv1.3`; barrier arm/release/consumed records, `security-primary-live-fd.log`, victim graph, before/probe/after metric deltas, and `scenario-primary-live-fd-security-status.json` |
+| live accepted-descriptor duplication against forced `getsockopt` | clean Java container; root probe pre-exec cgroup exactly equals Java PID 1 cgroup; `pidfd_getfd` permitted | pass | [clean full forced-primary `all` result](evidence/otel-getsockopt-tls13-74576ec6/README.md), with [sanitized probe, topology, and metric summary](evidence/otel-getsockopt-tls13-74576ec6/security-primary-live-fd.json), barrier records, victim graph, and recovery graph |
 
-The matrix gate is `pass` only when its clean full run's security status reports
-`status: passed` and `probe_verification: metrics_verified`, the unauthorized
-attempt has zero valid bridge retrievals, the victim retains its exact parent,
-and recovery passes. The standalone `--scenario security` command is useful
-for diagnostics but is non-acceptance evidence. A
+The [retained clean full result](evidence/otel-getsockopt-tls13-74576ec6/README.md)
+meets this gate: its security status reports `status: passed` and
+`probe_verification: metrics_verified`, the unauthorized attempt has zero valid
+bridge retrievals, the victim retains its exact parent, and recovery passes.
+The standalone `--scenario security` command is useful for diagnostics but is
+non-acceptance evidence. A
 `pidfd-duplicate-unavailable` result retains barrier records, probe log,
 held-victim JSON and stderr, baseline metric evidence, and unsupported status.
 It does not produce probe/after metric phases or the explicit post-abuse
 recovery scenario, and exits nonzero after its trap restores the base stack; it
 is `unsupported` for this gate, not a pass and not permission to label forced
-Unix fallback as tested. No retained artifact exists yet.
+Unix fallback as tested.
 
 ## Architecture
 

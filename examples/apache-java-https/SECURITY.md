@@ -1,9 +1,8 @@
 # Security and abuse-case matrix
 
 Status: **partial — retained Unix and non-abuse primary scenarios passed;
-clean focused primary attacker controls passed but are recorded separately as
-non-acceptance validation; remaining primary and Unix cases and matrix cells
-are untested**
+the retained primary live-descriptor control passed; remaining primary and Unix
+cases and matrix cells are untested**
 
 The PoC crosses a kernel/JVM trust boundary and exposes a local Unix fallback.
 Passing the happy path is insufficient. Every negative cell must preserve
@@ -35,12 +34,14 @@ targeted and has `acceptance_evidence=false`, it is not a primary acceptance
 matrix pass. A sanitized full acceptance run is still required before restoring
 a primary attacker cell to `pass`.
 
-Current source also contains a separate primary live-descriptor control. It
+The retained [primary live-descriptor acceptance bundle](evidence/otel-getsockopt-tls13-74576ec6/README.md)
 holds an actual accepted Java descriptor, executes a root probe in the Java
-container's PID 1 cgroup, and attempts `pidfd_getfd` before the legitimate
-request is released. It has no retained runtime artifact, so it is `untested`.
-`pidfd-duplicate-unavailable` is an `unsupported` capability result, not an
-authorization pass and not a reason to fall back silently to Unix.
+container's PID 1 cgroup, and opens the duplicate before the legitimate request
+is released. Its isolated metric window records zero valid takes during the
+attacker probe, one unauthorized negotiate/take pair, an exact-parent victim,
+and recovery. `pidfd-duplicate-unavailable` remains an `unsupported`
+capability result, not an authorization pass and not a reason to fall back
+silently to Unix.
 
 | Abuse or fault | Required result | Primary `getsockopt` | Unix | Evidence or remaining work |
 | --- | --- | --- | --- | --- |
@@ -48,7 +49,7 @@ authorization pass and not a reason to fall back silently to Unix.
 | sibling container/PID namespace calls take | denied by current identity/peer credentials | untested (focused verification only) | untested | [current sibling metric window, victim, and recovery](focused-validation/primary-getsockopt-8f0aa1f6/security-primary-probes.json) |
 | forged caller PID/TID in Unix request | ignored; kernel peer identity is authoritative | not applicable | pass | [forged-peer probe](evidence/otel-unix-tls12-bd1c9327/security-unix-probes.json) |
 | repeated unauthorized take attempts | bounded; context remains available | untested (focused verification only) | pass | [primary bounded probe windows](focused-validation/primary-getsockopt-8f0aa1f6/security-primary-probes.json) and [Unix bounded probes and recovery](evidence/otel-unix-tls12-bd1c9327/security-unix-probes.json) |
-| root process in Java PID 1 cgroup duplicates a live accepted descriptor | raw probe is insufficient; isolated unauthorized metrics show zero valid retrievals, held victim keeps exact parent, recovery passes | untested | not applicable | a clean full forced-primary `all` run must retain barrier arm/release/consumed records, probe log, victim graph, phase metric deltas, and `scenario-primary-live-fd-security-status.json`; standalone `security` is diagnostic only, while a pidfd-unavailable result retains barrier/probe/victim/baseline/status evidence but not probe/after phases or the explicit recovery scenario, then exits nonzero after base-stack restoration |
+| root process in Java PID 1 cgroup duplicates a live accepted descriptor | raw probe is insufficient; isolated unauthorized metrics show zero valid retrievals, held victim keeps exact parent, recovery passes | pass | not applicable | [clean full primary acceptance bundle](evidence/otel-getsockopt-tls13-74576ec6/README.md) with [sanitized probe, topology, and metric summary](evidence/otel-getsockopt-tls13-74576ec6/security-primary-live-fd.json), barrier records, victim graph, and recovery graph; standalone `security` remains diagnostic only |
 | wrong socket identity | rejected without consuming another request's context | untested | untested | retain a targeted wrong-socket result |
 | fd reuse | closed/reopened fixed-port traffic; reused Jetty fd across distinct stable Jetty connection IDs; distinct exact parents; zero wrong parents | pass | pass | [primary](evidence/otel-getsockopt-tls13-c9d14356/scenario-fd-port-reuse.json) and [Unix](evidence/otel-unix-tls12-bd1c9327/scenario-fd-port-reuse.json) reuse graphs |
 | unrelated socket option/level | original kernel behavior preserved | pass | not applicable | [primary probe cases](evidence/otel-getsockopt-tls13-c9d14356/security-primary-probes.json) |

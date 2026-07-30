@@ -50,7 +50,8 @@ enum {
   java_remote_parent_fault_mode_max_size = 64,
   java_remote_parent_fault_control_single_link_count = 1,
   java_remote_parent_fault_control_private_mode = 0600,
-  java_remote_parent_live_fd_barrier_timeout_millis = 10000,
+  /* The runner reserves a bounded 55-second proof window before release. */
+  java_remote_parent_live_fd_barrier_timeout_millis = 90000,
   java_remote_parent_live_fd_barrier_poll_nanoseconds = 10000000,
   java_remote_parent_nanoseconds_per_millisecond = 1000000,
   java_remote_parent_nanoseconds_per_second = 1000000000,

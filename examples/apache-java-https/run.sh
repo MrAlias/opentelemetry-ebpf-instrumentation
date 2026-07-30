@@ -47,6 +47,24 @@ PRESSURE_MAX_ENTRIES=50000
 SECURITY_PROBE_SCENARIO_BUDGET_SECONDS=232
 SECURITY_PROBE_SAME_CGROUP_FIXED_BUDGET_SECONDS=143
 SECURITY_PROBE_SIBLING_FIXED_BUDGET_SECONDS=408
+PRIMARY_LIVE_FD_BARRIER_TIMEOUT_SECONDS=90
+PRIMARY_LIVE_FD_PRE_RELEASE_DEADLINE_SECONDS=55
+PRIMARY_LIVE_FD_BARRIER_READY_TIMEOUT_SECONDS=5
+PRIMARY_LIVE_FD_PROBE_TIMEOUT_SECONDS=5
+PRIMARY_LIVE_FD_METRICS_TIMEOUT_SECONDS=35
+PRIMARY_LIVE_FD_METRIC_CAPTURE_TIMEOUT_SECONDS=5
+PRIMARY_LIVE_FD_RELEASE_TIMEOUT_SECONDS=5
+PRIMARY_LIVE_FD_VICTIM_REQUEST_TIMEOUT_SECONDS=70
+PRIMARY_LIVE_FD_VICTIM_SCENARIO_TIMEOUT_SECONDS=90
+PRIMARY_LIVE_FD_VICTIM_STARTUP_BUDGET_SECONDS=30
+PRIMARY_LIVE_FD_VICTIM_SUPERVISOR_SLACK_SECONDS=5
+PRIMARY_LIVE_FD_VICTIM_TIMEOUT_SECONDS="$((
+  PRIMARY_LIVE_FD_VICTIM_SCENARIO_TIMEOUT_SECONDS +
+  PRIMARY_LIVE_FD_VICTIM_STARTUP_BUDGET_SECONDS +
+  PRIMARY_LIVE_FD_VICTIM_SUPERVISOR_SLACK_SECONDS
+))"
+PRIMARY_LIVE_FD_VICTIM_REAP_TIMEOUT_SECONDS=15
+PRIMARY_LIVE_FD_FIXED_BUDGET_SECONDS=260
 SECURITY_PROBE_TIMEOUT_SLACK_SECONDS=60
 MAX_SECURITY_PROBE_TIMEOUT_SECONDS=3600
 PROJECT_NAMESPACE="obi-apache-java-https"
@@ -91,6 +109,20 @@ readonly PRESSURE_CLEANUP_DEADLINE_SECONDS PRESSURE_MAX_ENTRIES
 readonly SECURITY_PROBE_SCENARIO_BUDGET_SECONDS
 readonly SECURITY_PROBE_SAME_CGROUP_FIXED_BUDGET_SECONDS
 readonly SECURITY_PROBE_SIBLING_FIXED_BUDGET_SECONDS
+readonly PRIMARY_LIVE_FD_BARRIER_TIMEOUT_SECONDS
+readonly PRIMARY_LIVE_FD_PRE_RELEASE_DEADLINE_SECONDS
+readonly PRIMARY_LIVE_FD_BARRIER_READY_TIMEOUT_SECONDS
+readonly PRIMARY_LIVE_FD_PROBE_TIMEOUT_SECONDS
+readonly PRIMARY_LIVE_FD_METRICS_TIMEOUT_SECONDS
+readonly PRIMARY_LIVE_FD_METRIC_CAPTURE_TIMEOUT_SECONDS
+readonly PRIMARY_LIVE_FD_RELEASE_TIMEOUT_SECONDS
+readonly PRIMARY_LIVE_FD_VICTIM_REQUEST_TIMEOUT_SECONDS
+readonly PRIMARY_LIVE_FD_VICTIM_SCENARIO_TIMEOUT_SECONDS
+readonly PRIMARY_LIVE_FD_VICTIM_STARTUP_BUDGET_SECONDS
+readonly PRIMARY_LIVE_FD_VICTIM_SUPERVISOR_SLACK_SECONDS
+readonly PRIMARY_LIVE_FD_VICTIM_TIMEOUT_SECONDS
+readonly PRIMARY_LIVE_FD_VICTIM_REAP_TIMEOUT_SECONDS
+readonly PRIMARY_LIVE_FD_FIXED_BUDGET_SECONDS
 readonly SECURITY_PROBE_TIMEOUT_SLACK_SECONDS
 readonly MAX_SECURITY_PROBE_TIMEOUT_SECONDS PROJECT_NAMESPACE
 readonly PROJECT_SENTINEL_LABEL PROJECT_SENTINEL_VALUE APACHE_EXPECTED_PROCESS_COUNT
@@ -794,6 +826,7 @@ cleanup() {
   local cleanup_status=0
   local force_stack_shutdown=false
   local primary_fault_recovery_marker=""
+  local primary_fault_recovery_stage=""
   trap - ERR EXIT INT TERM
   set +e
 
@@ -802,17 +835,22 @@ cleanup() {
   fi
 
   if [[ -n "${RESULT_DIR:-}" && -d "$RESULT_DIR" ]]; then
-    primary_fault_recovery_marker="$RESULT_DIR/primary-w3c-fault-recovery-required"
-    if [[ -e "$primary_fault_recovery_marker" || -L "$primary_fault_recovery_marker" ]]; then
-      force_stack_shutdown=true
-      PRIMARY_FAULT_STACK_ACTIVE=true
-      log_error "primary W3C fault recovery is incomplete; refusing to leave the fault stack running"
-      if ((final_status == 0)); then
-        final_status=1
-        record_failure \
-          "primary-w3c-fault-recovery" 0 1 "incomplete primary fault recovery"
+    for primary_fault_recovery_marker in \
+      "$RESULT_DIR/primary-w3c-fault-recovery-required" \
+      "$RESULT_DIR/primary-live-fd-security-recovery-required"; do
+      if [[ -e "$primary_fault_recovery_marker" || -L "$primary_fault_recovery_marker" ]]; then
+        primary_fault_recovery_stage="${primary_fault_recovery_marker##*/}"
+        primary_fault_recovery_stage="${primary_fault_recovery_stage%-recovery-required}"
+        force_stack_shutdown=true
+        PRIMARY_FAULT_STACK_ACTIVE=true
+        log_error "$primary_fault_recovery_stage recovery is incomplete; refusing to leave the fault stack running"
+        if ((final_status == 0)); then
+          final_status=1
+          record_failure \
+            "$primary_fault_recovery_stage-recovery" 0 1 "incomplete primary fault recovery"
+        fi
       fi
-    fi
+    done
   fi
 
   if [[ "$PRESSURE_ACTIVE" == "true" ]]; then
@@ -1119,7 +1157,7 @@ configure_security_probe_timeouts() {
   local -i maximum_readiness=$((
     (MAX_SECURITY_PROBE_TIMEOUT_SECONDS - repeat_seconds -
       SECURITY_PROBE_SAME_CGROUP_FIXED_BUDGET_SECONDS -
-      SECURITY_PROBE_SIBLING_FIXED_BUDGET_SECONDS -
+      SECURITY_PROBE_SIBLING_FIXED_BUDGET_SECONDS - PRIMARY_LIVE_FD_FIXED_BUDGET_SECONDS -
       SECURITY_PROBE_TIMEOUT_SLACK_SECONDS) / 3
   ))
 
@@ -1916,7 +1954,8 @@ assert_runtime_contract() {
     return 1
   fi
 
-  if [[ "$mode" == "primary-w3c-fault" ]]; then
+  if [[ "$mode" == "primary-w3c-fault" || \
+    "$mode" == "primary-live-fd-security" ]]; then
     assert_primary_fault_runtime_contract "$java_container" "$java_environment" || return $?
   else
     assert_normal_runtime_has_no_primary_fault_environment "$java_environment" || return $?
@@ -2640,18 +2679,23 @@ wait_for_bridge_metrics_quiescent() {
   local -r minimum_stage="$2"
   local -r output="$3"
   local -r description="$4"
+  local -r timeout_seconds="${5:-$BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS}"
   local candidate=""
   local fingerprint=""
   local previous_fingerprint=""
   local report=""
   local stage=""
   local success=""
-  local -i started_at="$SECONDS"
+  local metrics_timeout=""
+  local -i deadline=0
   local -i previous_report=-1
 
+  bounded_decimal "$timeout_seconds" "$MAX_SHELL_INTEGER" false >/dev/null || return 1
   candidate="$(mktemp "$RESULT_DIR/.bridge-metrics.XXXXXX")" || return $?
-  while ((SECONDS - started_at < BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS)); do
-    if fetch_obi_metrics "$candidate" 2>/dev/null; then
+  deadline="$((SECONDS + timeout_seconds))"
+  while ((SECONDS < deadline)); do
+    metrics_timeout="$(remaining_timeout_seconds "$deadline" 5)" || break
+    if fetch_obi_metrics "$candidate" "$metrics_timeout" 2>/dev/null; then
       success="$(bridge_success_total "$candidate")" || return $?
       stage="$(bridge_stage_total "$candidate")" || return $?
       report="$(bridge_report_total "$candidate")" || return $?
@@ -2668,7 +2712,9 @@ wait_for_bridge_metrics_quiescent() {
         previous_fingerprint="$fingerprint"
       fi
     fi
-    sleep 1 || return $?
+    if ((SECONDS < deadline)); then
+      sleep 1 || return $?
+    fi
   done
   rm -f -- "$candidate" || return $?
   log_error "timed out waiting for $description (minimum success=$minimum_success stage=$minimum_stage, last success=${success:-unavailable} stage=${stage:-unavailable} report=${report:-unavailable})"
@@ -2678,11 +2724,13 @@ wait_for_bridge_metrics_quiescent() {
 wait_for_primary_security_metrics_quiescent() {
   local -r output="$1"
   local -r description="$2"
+  local -r timeout_seconds="${3:-$BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS}"
   local -r previous_policy="$ALLOW_PRIMARY_SECURITY_METRICS"
   local wait_status=0
 
   ALLOW_PRIMARY_SECURITY_METRICS=true
-  if wait_for_bridge_metrics_quiescent 0 0 "$output" "$description"; then
+  if wait_for_bridge_metrics_quiescent \
+    0 0 "$output" "$description" "$timeout_seconds"; then
     wait_status=0
   else
     wait_status=$?
@@ -5798,6 +5846,321 @@ consume_primary_w3c_fault_control() {
     >"$output"
 }
 
+primary_live_fd_descriptor() {
+  local -r raw="$1"
+  local normalized=""
+
+  normalized="$(bounded_decimal "$raw" "2147483647" true)" || return 1
+  [[ "$normalized" == "$raw" ]] || return 1
+  printf '%s\n' "$normalized"
+}
+
+arm_primary_live_fd_barrier() {
+  local -r output="$1"
+
+  [[ "$PRIMARY_FAULT_STACK_ACTIVE" == "true" ]] || {
+    log_error "cannot arm the primary live-descriptor barrier outside its fault stack"
+    return 1
+  }
+  [[ ! -e "$output" && ! -L "$output" ]] || {
+    log_error "refusing to overwrite primary live-descriptor barrier evidence: $output"
+    return 1
+  }
+
+  # shellcheck disable=SC2016 # The fixed paths are positional parameters in the Java container.
+  run_bounded 15 "${PRIMARY_FAULT_COMPOSE[@]}" exec --no-TTY --user 0:0 \
+    java-backend /bin/sh -ec '
+      set -eu
+      directory=$1
+      control_file=$2
+
+      [ "$control_file" = "$directory/java-remote-parent.mode" ]
+      [ "$(id -u)" = 0 ]
+      [ -d "$directory" ] && [ ! -L "$directory" ]
+      [ "$(stat -c "%u:%g:%a:%F" "$directory")" = "0:0:700:directory" ]
+      [ ! -e "$control_file" ] && [ ! -L "$control_file" ]
+
+      umask 077
+      temporary=$(mktemp "$directory/.java-remote-parent.mode.XXXXXX")
+      cleanup() {
+        [ -z "${temporary:-}" ] || rm -f -- "$temporary"
+      }
+      trap cleanup EXIT HUP INT TERM
+      printf "%s\\n" live-fd-barrier >"$temporary"
+      chmod 0600 -- "$temporary"
+      [ -f "$temporary" ] && [ ! -L "$temporary" ]
+      [ "$(stat -c "%u:%g:%a:%h" "$temporary")" = "0:0:600:1" ]
+      mv -T -- "$temporary" "$control_file"
+      temporary=
+      trap - EXIT HUP INT TERM
+      [ -f "$control_file" ] && [ ! -L "$control_file" ]
+      [ "$(stat -c "%u:%g:%a:%h" "$control_file")" = "0:0:600:1" ]
+      [ "$(cat "$control_file")" = live-fd-barrier ]
+      printf "phase=armed\\nmetadata=%s\\nsize=%s\\n" \
+        "$(stat -c "%u:%g:%a:%h:%F" "$control_file")" \
+        "$(stat -c "%s" "$control_file")"
+    ' sh "$PRIMARY_FAULT_CONTROL_DIRECTORY" "$PRIMARY_FAULT_CONTROL_FILE" \
+    >"$output"
+}
+
+read_primary_live_fd_barrier() {
+  local -r java_container="$1"
+
+  [[ "$PRIMARY_FAULT_STACK_ACTIVE" == "true" ]] || return 1
+  [[ -n "$java_container" ]] || return 1
+
+  # shellcheck disable=SC2016 # The fixed paths are positional parameters in the Java container.
+  run_bounded 5 docker exec --user 0:0 "$java_container" /bin/sh -ec '
+    set -eu
+    directory=$1
+    control_file=$2
+    value=
+    size=
+
+    [ "$control_file" = "$directory/java-remote-parent.mode" ]
+    [ "$(id -u)" = 0 ]
+    [ -d "$directory" ] && [ ! -L "$directory" ]
+    [ "$(stat -c "%u:%g:%a:%F" "$directory")" = "0:0:700:directory" ]
+    [ -f "$control_file" ] && [ ! -L "$control_file" ]
+    [ "$(stat -c "%u:%g:%a:%h:%F" "$control_file")" = "0:0:600:1:regular file" ]
+    size="$(stat -c "%s" "$control_file")"
+    case "$size" in
+      ""|*[!0-9]*) exit 65 ;;
+    esac
+    [ "$size" -lt 64 ] || exit 65
+    if IFS= read -r value <"$control_file"; then
+      printf "%s\\n" "$value"
+    fi
+  ' sh "$PRIMARY_FAULT_CONTROL_DIRECTORY" "$PRIMARY_FAULT_CONTROL_FILE"
+}
+
+wait_for_primary_live_fd_barrier_ready() {
+  local -r java_container="$1"
+  local -r victim_pid="$2"
+  local value=""
+  local descriptor=""
+  local -i started_at="$SECONDS"
+
+  while ((SECONDS - started_at < PRIMARY_LIVE_FD_BARRIER_READY_TIMEOUT_SECONDS)); do
+    value="$(read_primary_live_fd_barrier "$java_container")" || {
+      log_error "could not read the primary live-descriptor barrier"
+      return 1
+    }
+    case "$value" in
+      ""|live-fd-barrier)
+        ;;
+      ready:*)
+        descriptor="$(primary_live_fd_descriptor "${value#ready:}")" || {
+          log_error "primary live-descriptor barrier returned an invalid descriptor"
+          return 1
+        }
+        printf '%s\n' "$descriptor"
+        return 0
+        ;;
+      *)
+        log_error "primary live-descriptor barrier returned an unexpected state"
+        return 1
+        ;;
+    esac
+    if ! background_process_is_running "$victim_pid"; then
+      log_error "primary live-descriptor victim exited before reaching its barrier"
+      return 1
+    fi
+    sleep 0.1
+  done
+  log_error "timed out waiting for the primary live-descriptor barrier"
+  return 1
+}
+
+primary_live_fd_remaining_timeout() {
+  local -r deadline="$1"
+  local -r maximum="$2"
+  local -r reserve="$3"
+  local -i remaining=0
+
+  [[ "$deadline" =~ ^[1-9][0-9]*$ && "$maximum" =~ ^[1-9][0-9]*$ && \
+    "$reserve" =~ ^[0-9]+$ ]] || return 1
+  ((remaining = deadline - SECONDS, remaining > reserve)) || return 1
+  ((remaining -= reserve))
+  if ((remaining > maximum)); then
+    remaining="$maximum"
+  fi
+  printf '%d\n' "$remaining"
+}
+
+run_primary_live_fd_probe() {
+  local -r java_container="$1"
+  local -r descriptor="$2"
+  local -r timeout_seconds="$3"
+  local -r output="$4"
+
+  primary_live_fd_descriptor "$descriptor" >/dev/null || return 1
+  bounded_decimal "$timeout_seconds" "$MAX_SHELL_INTEGER" false >/dev/null || return 1
+  [[ -n "$java_container" && -f "$output" && ! -L "$output" && ! -s "$output" ]] || return 1
+
+  # The cgroup comparison and preload clearing occur in the exact root process
+  # that execs the probe, so an adjacent diagnostic process cannot certify it.
+  # shellcheck disable=SC2016 # Fixed values are positional parameters in the Java container.
+  run_bounded "$timeout_seconds" docker exec --user 0:0 "$java_container" \
+    env -u LD_PRELOAD -u OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_FILE /bin/sh -ec '
+      set -eu
+      probe_path=$1
+      descriptor=$2
+      probe_timeout=$3
+      process_name=
+      self_cgroup=
+      pid_one_cgroup=
+
+      case "$descriptor" in
+        ""|*[!0-9]*) exit 64 ;;
+      esac
+      case "$probe_timeout" in
+        ""|*[!0-9]*) exit 64 ;;
+      esac
+      [ "$(id -u)" = 0 ]
+      [ -r /proc/1/comm ]
+      IFS= read -r process_name </proc/1/comm
+      [ "$process_name" = java ]
+      self_cgroup="$(cat /proc/self/cgroup)"
+      pid_one_cgroup="$(cat /proc/1/cgroup)"
+      [ -n "$self_cgroup" ] && [ "$self_cgroup" = "$pid_one_cgroup" ]
+      [ -f "$probe_path" ] && [ ! -L "$probe_path" ] && [ -x "$probe_path" ]
+      exec "$probe_path" --mode primary-live-fd --fd "$descriptor" \
+        --timeout "${probe_timeout}s"
+    ' sh "$PRIMARY_SECURITY_PROBE_PATH" "$descriptor" "$timeout_seconds" \
+    >"$output"
+}
+
+assert_primary_live_fd_probe_output() {
+  local -r input="$1"
+
+  [[ -s "$input" && -f "$input" && ! -L "$input" ]] || return 1
+  [[ "$(wc -l <"$input")" == "1" ]] || return 1
+  jq -e '
+    type == "object" and
+    ((keys | sort) == ["attempts", "cases", "mode", "status"]) and
+    .status == "unverified" and
+    .mode == "primary-live-fd" and
+    .attempts == 1 and
+    (.cases | type == "array" and length == 4 and
+      all(.[]; try (
+        type == "object" and
+        ((keys | sort) == ["name", "outcome"]) and
+        (.name | type == "string") and
+        (.outcome | type == "string")
+      ) catch false)) and
+    ([.cases[] | select(.name == "pidfd-duplicate" and .outcome == "opened")] | length == 1) and
+    ([.cases[] | select(.name == "standard-option" and .outcome == "preserved")] | length == 1) and
+    ([.cases[] | select(.name == "wrong-process-negotiation" and .outcome == "native-unsupported")] | length == 1) and
+    ([.cases[] | select(.name == "duplicated-fd-take" and .outcome == "native-unsupported")] | length == 1)
+  ' "$input" >/dev/null
+}
+
+assert_primary_live_fd_probe_unsupported_output() {
+  local -r input="$1"
+
+  [[ -s "$input" && -f "$input" && ! -L "$input" ]] || return 1
+  [[ "$(wc -l <"$input")" == "1" ]] || return 1
+  jq -e '
+    type == "object" and
+    ((keys | sort) == ["cases", "mode", "status"]) and
+    .status == "unsupported" and
+    .mode == "primary-live-fd" and
+    (.cases | type == "array" and length == 1 and
+      all(.[]; try (
+        type == "object" and
+        ((keys | sort) == ["name", "outcome"]) and
+        .name == "pidfd-duplicate" and
+        .outcome == "unavailable"
+      ) catch false))
+  ' "$input" >/dev/null
+}
+
+release_primary_live_fd_barrier() {
+  local -r java_container="$1"
+  local -r descriptor="$2"
+  local -r output="$3"
+  local -r timeout_seconds="${4:-$PRIMARY_LIVE_FD_RELEASE_TIMEOUT_SECONDS}"
+
+  primary_live_fd_descriptor "$descriptor" >/dev/null || return 1
+  bounded_decimal "$timeout_seconds" "$MAX_SHELL_INTEGER" false >/dev/null || return 1
+  [[ "$PRIMARY_FAULT_STACK_ACTIVE" == "true" ]] || {
+    log_error "cannot release the primary live-descriptor barrier outside its fault stack"
+    return 1
+  }
+  [[ ! -e "$output" && ! -L "$output" ]] || {
+    log_error "refusing to overwrite primary live-descriptor release evidence: $output"
+    return 1
+  }
+
+  # shellcheck disable=SC2016 # The fixed paths and validated descriptor are positional parameters.
+  run_bounded "$timeout_seconds" docker exec --user 0:0 "$java_container" /bin/sh -ec '
+    set -eu
+    directory=$1
+    control_file=$2
+    descriptor=$3
+    before=
+    after=
+
+    case "$descriptor" in
+      ""|*[!0-9]*) exit 64 ;;
+    esac
+    [ "$control_file" = "$directory/java-remote-parent.mode" ]
+    [ "$(id -u)" = 0 ]
+    [ -d "$directory" ] && [ ! -L "$directory" ]
+    [ "$(stat -c "%u:%g:%a:%F" "$directory")" = "0:0:700:directory" ]
+    [ -f "$control_file" ] && [ ! -L "$control_file" ]
+    [ "$(stat -c "%u:%g:%a:%h:%F" "$control_file")" = "0:0:600:1:regular file" ]
+    [ "$(cat "$control_file")" = "ready:$descriptor" ]
+    before="$(stat -c "%d:%i:%u:%g:%a:%h" "$control_file")"
+    printf "release:%s\\n" "$descriptor" >"$control_file"
+    after="$(stat -c "%d:%i:%u:%g:%a:%h" "$control_file")"
+    [ "$before" = "$after" ]
+    printf "phase=released\\nmetadata=%s\\nsize=%s\\n" \
+      "$(stat -c "%u:%g:%a:%h:%F" "$control_file")" \
+      "$(stat -c "%s" "$control_file")"
+  ' sh "$PRIMARY_FAULT_CONTROL_DIRECTORY" "$PRIMARY_FAULT_CONTROL_FILE" "$descriptor" \
+    >"$output"
+}
+
+consume_primary_live_fd_barrier() {
+  local -r output="$1"
+
+  [[ "$PRIMARY_FAULT_STACK_ACTIVE" == "true" ]] || {
+    log_error "cannot consume the primary live-descriptor barrier outside its fault stack"
+    return 1
+  }
+  [[ ! -e "$output" && ! -L "$output" ]] || {
+    log_error "refusing to overwrite primary live-descriptor consumption evidence: $output"
+    return 1
+  }
+
+  # The initial -f test establishes the regular-file type. %F changes from
+  # "regular file" to "regular empty file" when the trusted shim truncates
+  # this exact inode, so ownership, mode, and link count are the stable
+  # post-consumption metadata contract.
+  # shellcheck disable=SC2016 # The fixed paths are positional parameters in the Java container.
+  run_bounded 10 "${PRIMARY_FAULT_COMPOSE[@]}" exec --no-TTY --user 0:0 \
+    java-backend /bin/sh -ec '
+      set -eu
+      directory=$1
+      control_file=$2
+      [ "$control_file" = "$directory/java-remote-parent.mode" ]
+      [ "$(id -u)" = 0 ]
+      [ -d "$directory" ] && [ ! -L "$directory" ]
+      [ "$(stat -c "%u:%g:%a:%F" "$directory")" = "0:0:700:directory" ]
+      [ -f "$control_file" ] && [ ! -L "$control_file" ]
+      [ "$(stat -c "%u:%g:%a:%h" "$control_file")" = "0:0:600:1" ]
+      [ ! -s "$control_file" ]
+      printf "phase=consumed\\nmetadata=%s\\nsize=%s\\n" \
+        "$(stat -c "%u:%g:%a:%h:%F" "$control_file")" \
+        "$(stat -c "%s" "$control_file")"
+      rm -f -- "$control_file"
+      [ ! -e "$control_file" ] && [ ! -L "$control_file" ]
+    ' sh "$PRIMARY_FAULT_CONTROL_DIRECTORY" "$PRIMARY_FAULT_CONTROL_FILE" \
+    >"$output"
+}
+
 run_primary_w3c_fault_scenario() {
   local -r mode="$1"
   local run_number=0
@@ -6028,6 +6391,341 @@ run_primary_w3c_fault_control() (
   SCENARIO_VARIANT="primary-w3c-fault-recovery"
   run_scenario basic
   SCENARIO_VARIANT="$original_variant"
+
+  trap - EXIT
+)
+
+run_primary_live_fd_security_recovery_scenario() {
+  local -r original_variant="$1"
+  local scenario_status=0
+
+  SCENARIO_VARIANT="security-primary-live-fd-recovery"
+  if run_scenario basic; then
+    scenario_status=0
+  else
+    scenario_status=$?
+  fi
+  SCENARIO_VARIANT="$original_variant"
+  return "$scenario_status"
+}
+
+run_primary_live_fd_security_control() (
+  local -r probe_source="$1"
+  local -r original_variant="$SCENARIO_VARIANT"
+  local -r recovery_marker="$RESULT_DIR/primary-live-fd-security-recovery-required"
+  local -r before_phase="security-primary-live-fd-before"
+  local -r probe_phase="security-primary-live-fd-probe"
+  local -r after_phase="security-primary-live-fd-after"
+  local -r arm_evidence="$RESULT_DIR/primary-live-fd-security-armed.txt"
+  local -r release_evidence="$RESULT_DIR/primary-live-fd-security-released.txt"
+  local -r consumption_evidence="$RESULT_DIR/primary-live-fd-security-consumed.txt"
+  local -r probe_output="$RESULT_DIR/security-primary-live-fd.log"
+  local -r victim_output="$RESULT_DIR/scenario-security-primary-live-fd-victim.json"
+  local -r victim_stderr="$RESULT_DIR/scenario-security-primary-live-fd-victim.stderr.log"
+  local -r probe_delta="$RESULT_DIR/phases/$probe_phase/obi-metrics.delta"
+  local -r full_delta="$RESULT_DIR/phases/$after_phase/obi-metrics.delta"
+  local restore_required=false
+  local java_container=""
+  local descriptor=""
+  local victim_pid=""
+  local before_success=""
+  local before_stage=""
+  local probe_candidate=""
+  local victim_exit=0
+  local restore_status=0
+  local probe_timeout=""
+  local metrics_timeout=""
+  local capture_timeout=""
+  local release_timeout=""
+  local -i pre_release_deadline=0
+
+  # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
+  restore_primary_live_fd_security_stack() {
+    local -r status="$?"
+
+    trap - EXIT
+    set +e
+    if [[ -n "$probe_candidate" ]]; then
+      rm -f -- "$probe_candidate" || true
+      probe_candidate=""
+    fi
+    if [[ "$victim_pid" =~ ^[1-9][0-9]*$ ]]; then
+      if background_process_is_running "$victim_pid"; then
+        kill -TERM "$victim_pid" 2>/dev/null || true
+      fi
+      if ! wait_for_background_process \
+        "$victim_pid" "$PRIMARY_LIVE_FD_VICTIM_REAP_TIMEOUT_SECONDS"; then
+        if background_process_is_running "$victim_pid"; then
+          kill -KILL "$victim_pid" 2>/dev/null || true
+        fi
+        wait "$victim_pid" 2>/dev/null || true
+      fi
+      victim_pid=""
+    fi
+    if [[ "$restore_required" == "true" ]]; then
+      log_warn "restoring the normal instrumented stack after primary live-descriptor security control" || true
+      (
+        set -Eeuo pipefail
+        recreate_instrumented_stack \
+          tcp "post-primary live-descriptor security recovery" getsockopt true false base
+        assert_runtime_contract basic true
+      )
+      restore_status=$?
+      if ((restore_status == 0)); then
+        if rm -f -- "$recovery_marker"; then
+          PRIMARY_FAULT_STACK_ACTIVE=false
+        else
+          restore_status=$?
+          log_error "could not clear the primary live-descriptor recovery marker" || true
+        fi
+      else
+        log_error "could not restore the instrumented stack after primary live-descriptor security control" || true
+      fi
+    fi
+    SCENARIO_VARIANT="$original_variant"
+    if ((status == 0 && restore_status != 0)); then
+      exit "$restore_status"
+    fi
+    exit "$status"
+  }
+
+  trap restore_primary_live_fd_security_stack EXIT
+  ((PRIMARY_LIVE_FD_PRE_RELEASE_DEADLINE_SECONDS +
+    PRIMARY_LIVE_FD_RELEASE_TIMEOUT_SECONDS <
+    PRIMARY_LIVE_FD_BARRIER_TIMEOUT_SECONDS)) || {
+    log_error "primary live-descriptor barrier cannot retain its release window"
+    return 1
+  }
+  [[ -s "$probe_source" && -f "$probe_source" && ! -L "$probe_source" ]] || {
+    log_error "primary live-descriptor security probe source is unavailable"
+    return 1
+  }
+  [[ ! -e "$probe_output" && ! -L "$probe_output" ]] || {
+    log_error "refusing to overwrite primary live-descriptor probe evidence: $probe_output"
+    return 1
+  }
+  [[ "$TRANSPORT" == "getsockopt" && "$SELECTED_TRANSPORT" == "getsockopt" && \
+    "$BRIDGE_RUNNING" == "true" ]] || {
+    log_error "the primary live-descriptor security control requires a healthy forced getsockopt bridge"
+    return 1
+  }
+  [[ ! -e "$recovery_marker" && ! -L "$recovery_marker" ]] || {
+    log_error "primary live-descriptor recovery marker already exists: $recovery_marker"
+    return 1
+  }
+  if ! (umask 077; printf 'recovery_required\n' >"$recovery_marker"); then
+    log_error "could not create the primary live-descriptor recovery marker"
+    return 1
+  fi
+
+  restore_required=true
+  PRIMARY_FAULT_STACK_ACTIVE=true
+  recreate_instrumented_stack \
+    tcp "primary live-descriptor security preparation" getsockopt true false primary-fault || return $?
+  assert_runtime_contract primary-live-fd-security true || return $?
+  java_container="$(run_bounded 10 "${PRIMARY_FAULT_COMPOSE[@]}" ps --quiet java-backend)" || return $?
+  [[ -n "$java_container" ]] || {
+    log_error "could not resolve the Java container for the primary live-descriptor security control"
+    return 1
+  }
+  run_bounded 10 docker exec --user 0:0 "$java_container" \
+    rm -f -- "$PRIMARY_SECURITY_PROBE_PATH" || return $?
+  run_bounded 15 docker cp "$probe_source" \
+    "$java_container:$PRIMARY_SECURITY_PROBE_PATH" || return $?
+  run_bounded 10 docker exec --user 0:0 "$java_container" \
+    chmod 0755 "$PRIMARY_SECURITY_PROBE_PATH" || return $?
+
+  wait_for_primary_security_metrics_quiescent \
+    "$RESULT_DIR/metrics-security-primary-live-fd-before.prom" \
+    "primary live-descriptor security baseline" || return $?
+  capture_metric_phase_evidence "$before_phase" || return $?
+  before_success="$(bridge_success_total \
+    "$RESULT_DIR/phases/$before_phase/obi-metrics.prom")" || return $?
+  before_stage="$(bridge_stage_total \
+    "$RESULT_DIR/phases/$before_phase/obi-metrics.prom")" || return $?
+
+  arm_primary_live_fd_barrier "$arm_evidence" || return $?
+  # Background the timeout supervisor itself, not a Bash function wrapper, so
+  # the EXIT trap can terminate and reap the complete victim process tree.
+  timeout --signal=TERM --kill-after=10s \
+    "${PRIMARY_LIVE_FD_VICTIM_TIMEOUT_SECONDS}s" \
+    "${PRIMARY_FAULT_COMPOSE[@]}" run --rm --no-deps --no-TTY scenario \
+    --scenario basic \
+    --expected-tls "$TLS_PROTOCOL" \
+    --seed "$SCENARIO_SEED" \
+    --requests 1 \
+    --timeout "${PRIMARY_LIVE_FD_VICTIM_SCENARIO_TIMEOUT_SECONDS}s" \
+    --request-timeout "${PRIMARY_LIVE_FD_VICTIM_REQUEST_TIMEOUT_SECONDS}s" \
+    </dev/null >"$victim_output" 2>"$victim_stderr" &
+  victim_pid=$!
+  descriptor="$(wait_for_primary_live_fd_barrier_ready "$java_container" "$victim_pid")" || return $?
+  background_process_is_running "$victim_pid" || {
+    log_error "primary live-descriptor victim exited before the security probe"
+    return 1
+  }
+  pre_release_deadline="$((SECONDS + PRIMARY_LIVE_FD_PRE_RELEASE_DEADLINE_SECONDS))"
+  probe_timeout="$(primary_live_fd_remaining_timeout \
+    "$pre_release_deadline" \
+    "$PRIMARY_LIVE_FD_PROBE_TIMEOUT_SECONDS" \
+    "$((PRIMARY_LIVE_FD_METRICS_TIMEOUT_SECONDS + \
+      PRIMARY_LIVE_FD_METRIC_CAPTURE_TIMEOUT_SECONDS + \
+      PRIMARY_LIVE_FD_RELEASE_TIMEOUT_SECONDS))")" || {
+    log_error "primary live-descriptor proof did not retain enough time for release"
+    return 1
+  }
+  probe_candidate="$(mktemp "$RESULT_DIR/.security-primary-live-fd.XXXXXX")" || return $?
+  if ! run_primary_live_fd_probe \
+    "$java_container" "$descriptor" "$probe_timeout" "$probe_candidate"; then
+    rm -f -- "$probe_candidate" || true
+    probe_candidate=""
+    log_error "primary live-descriptor security probe failed"
+    return 1
+  fi
+  if assert_primary_live_fd_probe_unsupported_output "$probe_candidate"; then
+    install -m 0644 "$probe_candidate" "$probe_output" || return $?
+    rm -f -- "$probe_candidate" || return $?
+    probe_candidate=""
+    release_timeout="$(primary_live_fd_remaining_timeout \
+      "$pre_release_deadline" "$PRIMARY_LIVE_FD_RELEASE_TIMEOUT_SECONDS" 0)" || {
+      log_error "primary live-descriptor unsupported probe exhausted its release budget"
+      return 1
+    }
+    [[ "$release_timeout" == "$PRIMARY_LIVE_FD_RELEASE_TIMEOUT_SECONDS" ]] || {
+      log_error "primary live-descriptor unsupported probe did not retain the full release budget"
+      return 1
+    }
+    release_primary_live_fd_barrier \
+      "$java_container" "$descriptor" "$release_evidence" "$release_timeout" || return $?
+    if wait_for_background_process \
+      "$victim_pid" "$PRIMARY_LIVE_FD_VICTIM_TIMEOUT_SECONDS"; then
+      victim_exit=0
+      victim_pid=""
+    else
+      victim_exit=$?
+    fi
+    [[ "$victim_exit" == "0" ]] || {
+      log_error "primary live-descriptor victim failed while releasing an unsupported probe"
+      return "$victim_exit"
+    }
+    consume_primary_live_fd_barrier "$consumption_evidence" || return $?
+    printf '{"status":"unsupported","scenario":"primary-live-fd-security","reason":"pidfd-duplicate-unavailable","probe":"%s","attacker_identity":"root","attacker_cgroup":"pid1-verified-preexec"}\n' \
+      "$(basename -- "$probe_output")" \
+      >"$RESULT_DIR/scenario-primary-live-fd-security-status.json" || return $?
+    if ! run_bounded 10 docker exec --user 0:0 "$java_container" \
+      rm -f -- "$PRIMARY_SECURITY_PROBE_PATH"; then
+      log_error "could not remove the primary live-descriptor security probe after an unsupported result"
+      return 1
+    fi
+    log_error "primary live-descriptor security probe is unsupported in this topology"
+    return 1
+  fi
+  assert_primary_live_fd_probe_output "$probe_candidate" || {
+    rm -f -- "$probe_candidate" || true
+    probe_candidate=""
+    log_error "primary live-descriptor security probe did not emit the expected unverified observation"
+    return 1
+  }
+  install -m 0644 "$probe_candidate" "$probe_output" || return $?
+  rm -f -- "$probe_candidate" || return $?
+  probe_candidate=""
+
+  metrics_timeout="$(primary_live_fd_remaining_timeout \
+    "$pre_release_deadline" \
+    "$PRIMARY_LIVE_FD_METRICS_TIMEOUT_SECONDS" \
+    "$((PRIMARY_LIVE_FD_METRIC_CAPTURE_TIMEOUT_SECONDS + \
+      PRIMARY_LIVE_FD_RELEASE_TIMEOUT_SECONDS))")" || {
+    log_error "primary live-descriptor proof did not retain enough time for its metric fence"
+    return 1
+  }
+  wait_for_primary_security_metrics_quiescent \
+    "$RESULT_DIR/metrics-security-primary-live-fd-probe.prom" \
+    "primary live-descriptor security probe" "$metrics_timeout" || return $?
+  capture_timeout="$(primary_live_fd_remaining_timeout \
+    "$pre_release_deadline" \
+    "$PRIMARY_LIVE_FD_METRIC_CAPTURE_TIMEOUT_SECONDS" \
+    "$PRIMARY_LIVE_FD_RELEASE_TIMEOUT_SECONDS")" || {
+    log_error "primary live-descriptor proof did not retain enough time for metric evidence"
+    return 1
+  }
+  capture_metric_phase_evidence "$probe_phase" "$capture_timeout" || return $?
+  write_metrics_delta \
+    "$RESULT_DIR/phases/$before_phase/obi-metrics.prom" \
+    "$RESULT_DIR/phases/$probe_phase/obi-metrics.prom" \
+    "$probe_delta" || return $?
+  assert_primary_security_metric_delta "$probe_delta" negotiate 1 1 || return $?
+  assert_primary_security_metric_delta "$probe_delta" take 1 1 || return $?
+  (
+    ALLOW_PRIMARY_SECURITY_METRICS=true
+    # The victim has reached its Java getsockopt barrier, so its one inbound
+    # context is staged before release. Only retrieval must remain denied.
+    assert_bridge_metric_delta "$probe_delta" getsockopt 0 0 0 1 1 false 0
+  ) || {
+    log_error "primary live-descriptor security probe produced a valid bridge retrieval"
+    return 1
+  }
+
+  release_timeout="$(primary_live_fd_remaining_timeout \
+    "$pre_release_deadline" "$PRIMARY_LIVE_FD_RELEASE_TIMEOUT_SECONDS" 0)" || {
+    log_error "primary live-descriptor proof exhausted its release budget"
+    return 1
+  }
+  [[ "$release_timeout" == "$PRIMARY_LIVE_FD_RELEASE_TIMEOUT_SECONDS" ]] || {
+    log_error "primary live-descriptor proof did not retain the full release budget"
+    return 1
+  }
+  release_primary_live_fd_barrier \
+    "$java_container" "$descriptor" "$release_evidence" "$release_timeout" || return $?
+  if wait_for_background_process \
+    "$victim_pid" "$PRIMARY_LIVE_FD_VICTIM_TIMEOUT_SECONDS"; then
+    victim_exit=0
+    victim_pid=""
+  else
+    victim_exit=$?
+  fi
+  [[ "$victim_exit" == "0" ]] || {
+    log_error "primary live-descriptor victim did not retain its exact parent"
+    return "$victim_exit"
+  }
+  consume_primary_live_fd_barrier "$consumption_evidence" || return $?
+  run_bounded 10 docker exec --user 0:0 "$java_container" \
+    rm -f -- "$PRIMARY_SECURITY_PROBE_PATH" || return $?
+
+  (
+    ALLOW_PRIMARY_SECURITY_METRICS=true
+    wait_for_bridge_metrics_quiescent \
+      "$((before_success + 1))" \
+      "$((before_stage + 1))" \
+      "$RESULT_DIR/metrics-security-primary-live-fd-after.prom" \
+      "primary live-descriptor legitimate victim"
+  ) || return $?
+  capture_metric_phase_evidence "$after_phase" || return $?
+  write_metrics_delta \
+    "$RESULT_DIR/phases/$before_phase/obi-metrics.prom" \
+    "$RESULT_DIR/phases/$after_phase/obi-metrics.prom" \
+    "$full_delta" || return $?
+  assert_primary_security_metric_delta "$full_delta" negotiate 1 1 || return $?
+  assert_primary_security_metric_delta "$full_delta" take 1 1 || return $?
+  (
+    ALLOW_PRIMARY_SECURITY_METRICS=true
+    assert_bridge_metric_delta "$full_delta" getsockopt 1 0 0 1 1 false 0
+  ) || {
+    log_error "primary live-descriptor security metrics did not preserve one legitimate retrieval"
+    return 1
+  }
+
+  recreate_instrumented_stack \
+    tcp "post-primary live-descriptor security recovery" getsockopt true false base || return $?
+  assert_runtime_contract basic true || return $?
+  rm -f -- "$recovery_marker" || return $?
+  PRIMARY_FAULT_STACK_ACTIVE=false
+  restore_required=false
+  run_primary_live_fd_security_recovery_scenario "$original_variant" || return $?
+  printf '{"status":"passed","scenario":"primary-live-fd-security","probe":"%s","probe_status":"unverified","probe_verification":"metrics_verified","attacker_identity":"root","attacker_cgroup":"pid1-verified-preexec","legitimate_victim":"passed","post_abuse_recovery":"passed","before_phase":"phases/%s","probe_phase":"phases/%s","after_phase":"phases/%s"}\n' \
+    "$(basename -- "$probe_output")" \
+    "$before_phase" \
+    "$probe_phase" \
+    "$after_phase" \
+    >"$RESULT_DIR/scenario-primary-live-fd-security-status.json" || return $?
 
   trap - EXIT
 )
@@ -6672,9 +7370,6 @@ run_primary_security_control() {
     rm -f -- "$PRIMARY_SECURITY_PROBE_PATH" "$PRIMARY_SECURITY_PID_PATH"
   run_bounded 15 docker cp "$host_probe" \
     "$java_container:$PRIMARY_SECURITY_PROBE_PATH"
-  rm -f -- "$host_probe"
-  host_probe=""
-  PRIMARY_SECURITY_HOST_PROBE=""
   run_bounded 10 docker exec "$java_container" \
     chmod 0755 "$PRIMARY_SECURITY_PROBE_PATH"
 
@@ -6788,7 +7483,13 @@ run_primary_security_control() {
     SCENARIO_VARIANT="security-primary-recovery"
     run_scenario basic false
   )
-  printf '{"status":"passed","scenario":"security","mode":"primary","same_cgroup_probe":"%s","sibling_probe":"%s","probe_status":"unverified","probe_verification":"metrics_verified","cgroup_match":true,"unauthorized_classification":"metrics_verified","post_abuse_recovery":"passed","unix_only_cases":"not_applicable"}\n' \
+  # Keep this as a simple command: a conditional call would suppress errexit
+  # inside the nested fault-control subshell.
+  run_primary_live_fd_security_control "$host_probe"
+  rm -f -- "$host_probe" || return $?
+  host_probe=""
+  PRIMARY_SECURITY_HOST_PROBE=""
+  printf '{"status":"passed","scenario":"security","mode":"primary","same_cgroup_probe":"%s","sibling_probe":"%s","live_descriptor_probe":"metrics_verified","live_descriptor_topology":"pid1-cgroup-verified-preexec","probe_status":"unverified","probe_verification":"metrics_verified","cgroup_match":true,"unauthorized_classification":"metrics_verified","post_abuse_recovery":"passed","unix_only_cases":"not_applicable"}\n' \
     "$(basename -- "$same_cgroup_output")" \
     "$(basename -- "$sibling_output")" \
     >"$RESULT_DIR/scenario-security-status.json"
@@ -7731,15 +8432,17 @@ capture_runtime_evidence() {
 
 capture_metric_phase_evidence() {
   local -r phase="$1"
+  local -r timeout_seconds="${2:-5}"
   local phase_dir=""
 
   [[ "$phase" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || {
     log_error "refusing invalid metric evidence phase name: $phase"
     return 1
   }
+  bounded_decimal "$timeout_seconds" "$MAX_SHELL_INTEGER" false >/dev/null || return 1
   phase_dir="$RESULT_DIR/phases/$phase"
   mkdir -p -- "$phase_dir"
-  fetch_obi_metrics "$phase_dir/obi-metrics.prom"
+  fetch_obi_metrics "$phase_dir/obi-metrics.prom" "$timeout_seconds"
 }
 
 capture_phase_evidence() {

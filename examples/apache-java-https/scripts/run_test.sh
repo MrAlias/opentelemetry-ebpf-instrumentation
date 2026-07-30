@@ -378,6 +378,57 @@ test_primary_fault_recovery_marker_forces_cleanup_with_keep() {
   }
 }
 
+test_primary_live_fd_recovery_marker_forces_cleanup_with_keep() {
+  local -r result_dir="$TEST_TMP_DIR/primary-live-fd-recovery-marker"
+  local -r down_marker="$result_dir/down"
+  local cleanup_status=0
+
+  mkdir -p -- "$result_dir"
+  printf 'recovery_required\n' >"$result_dir/primary-live-fd-security-recovery-required"
+  if (
+    RESULT_DIR="$result_dir"
+    STACK_STARTED=true
+    KEEP_RUNNING=true
+    BRIDGE_RUNNING=true
+    PRIMARY_FAULT_STACK_ACTIVE=false
+    RUN_STATUS=passed
+    ACCEPTANCE_EVIDENCE=true
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    cleanup_security_processes() {
+      :
+    }
+    capture_evidence() {
+      [[ "$PRIMARY_FAULT_STACK_ACTIVE" == true ]]
+    }
+    invalidate_project_transport_evidence() {
+      :
+    }
+    safe_compose_down() {
+      [[ "$BRIDGE_RUNNING" == false ]] || return 1
+      : >"$down_marker"
+    }
+
+    cleanup
+  ) >/dev/null 2>&1; then
+    printf 'primary live-descriptor recovery marker left a kept stack running\n' >&2
+    return 1
+  else
+    cleanup_status=$?
+  fi
+  [[ "$cleanup_status" == 1 && -e "$down_marker" ]] || {
+    printf 'primary live-descriptor recovery marker did not force a failed cleanup\n' >&2
+    return 1
+  }
+  grep -Fq '"failure_stage": "primary-live-fd-security-recovery"' \
+    "$result_dir/run-status.json" || {
+    printf 'primary live-descriptor recovery marker omitted its failure evidence\n' >&2
+    return 1
+  }
+}
+
 test_run_status_publication_failure_changes_successful_exit() {
   local -r result_dir="$TEST_TMP_DIR/run-status-publication-failure"
   local -r cleanup_log="$result_dir/cleanup.log"
@@ -3581,7 +3632,7 @@ test_security_probe_window_covers_metric_fences() {
 90 1
 120 1
 90 10
-223 10
+136 10
 EOF
     if (
       READINESS_TIMEOUT_SECONDS="$MAX_SHELL_INTEGER"
@@ -3591,13 +3642,13 @@ EOF
       return 1
     fi
     if (
-      READINESS_TIMEOUT_SECONDS=224
+      READINESS_TIMEOUT_SECONDS=137
       REPEAT_COUNT=10
       configure_security_probe_timeouts
     ) >/dev/null 2>&1; then
       return 1
     fi
-    READINESS_TIMEOUT_SECONDS=224
+    READINESS_TIMEOUT_SECONDS=137
     REPEAT_COUNT=10
     SCENARIO=basic
     TRANSPORT=getsockopt
@@ -5109,6 +5160,387 @@ test_primary_security_probe_is_not_self_certifying() {
     sibling_completion_line -lt same_cgroup_start_line && \
     same_cgroup_start_line -lt same_cgroup_delta_line ]] || {
     printf 'primary security probes did not use isolated metric windows\n' >&2
+    return 1
+  }
+}
+
+test_primary_live_fd_descriptor_is_exact_and_bounded() {
+  local descriptor=""
+
+  descriptor="$(primary_live_fd_descriptor 0)" || return $?
+  [[ "$descriptor" == "0" ]] || return 1
+  descriptor="$(primary_live_fd_descriptor 2147483647)" || return $?
+  [[ "$descriptor" == "2147483647" ]] || return 1
+  for descriptor in '' -1 00 0001 2147483648 99999999999; do
+    if primary_live_fd_descriptor "$descriptor" >/dev/null 2>&1; then
+      printf 'primary live-descriptor parser accepted an unsafe descriptor: %s\n' \
+        "${descriptor:-empty}" >&2
+      return 1
+    fi
+  done
+}
+
+test_primary_live_fd_probe_result_is_exact() {
+  local -r good="$TEST_TMP_DIR/primary-live-fd-good.json"
+  local -r unsupported="$TEST_TMP_DIR/primary-live-fd-unsupported.json"
+  local -r extra="$TEST_TMP_DIR/primary-live-fd-extra.json"
+  local -r nested_extra="$TEST_TMP_DIR/primary-live-fd-nested-extra.json"
+  local -r unsupported_extra="$TEST_TMP_DIR/primary-live-fd-unsupported-extra.json"
+  local -r valid="$TEST_TMP_DIR/primary-live-fd-valid.json"
+
+  cat >"$good" <<'EOF'
+{"status":"unverified","mode":"primary-live-fd","attempts":1,"cases":[{"name":"pidfd-duplicate","outcome":"opened"},{"name":"standard-option","outcome":"preserved"},{"name":"wrong-process-negotiation","outcome":"native-unsupported"},{"name":"duplicated-fd-take","outcome":"native-unsupported"}]}
+EOF
+  assert_primary_live_fd_probe_output "$good" || {
+    printf 'primary live-descriptor result rejected the exact denial observation\n' >&2
+    return 1
+  }
+
+  cat >"$unsupported" <<'EOF'
+{"status":"unsupported","mode":"primary-live-fd","cases":[{"name":"pidfd-duplicate","outcome":"unavailable"}]}
+EOF
+  assert_primary_live_fd_probe_unsupported_output "$unsupported" || {
+    printf 'primary live-descriptor unsupported result rejected its exact schema\n' >&2
+    return 1
+  }
+  if assert_primary_live_fd_probe_output "$unsupported" >/dev/null 2>&1; then
+    printf 'primary live-descriptor result accepted an unsupported probe\n' >&2
+    return 1
+  fi
+
+  cat >"$extra" <<'EOF'
+{"status":"unverified","mode":"primary-live-fd","attempts":1,"descriptor":7,"cases":[{"name":"pidfd-duplicate","outcome":"opened"},{"name":"standard-option","outcome":"preserved"},{"name":"wrong-process-negotiation","outcome":"native-unsupported"},{"name":"duplicated-fd-take","outcome":"native-unsupported"}]}
+EOF
+  if assert_primary_live_fd_probe_output "$extra" >/dev/null 2>&1; then
+    printf 'primary live-descriptor result accepted an unsafe extra field\n' >&2
+    return 1
+  fi
+
+  cat >"$nested_extra" <<'EOF'
+{"status":"unverified","mode":"primary-live-fd","attempts":1,"cases":[{"name":"pidfd-duplicate","outcome":"opened","descriptor":7},{"name":"standard-option","outcome":"preserved"},{"name":"wrong-process-negotiation","outcome":"native-unsupported"},{"name":"duplicated-fd-take","outcome":"native-unsupported"}]}
+EOF
+  if assert_primary_live_fd_probe_output "$nested_extra" >/dev/null 2>&1; then
+    printf 'primary live-descriptor result accepted a nested unsafe field\n' >&2
+    return 1
+  fi
+
+  cat >"$unsupported_extra" <<'EOF'
+{"status":"unsupported","mode":"primary-live-fd","cases":[{"name":"pidfd-duplicate","outcome":"unavailable","descriptor":7}]}
+EOF
+  if assert_primary_live_fd_probe_unsupported_output "$unsupported_extra" >/dev/null 2>&1; then
+    printf 'primary live-descriptor unsupported result accepted a nested unsafe field\n' >&2
+    return 1
+  fi
+
+  cat >"$valid" <<'EOF'
+{"status":"unverified","mode":"primary-live-fd","attempts":1,"cases":[{"name":"pidfd-duplicate","outcome":"opened"},{"name":"standard-option","outcome":"preserved"},{"name":"wrong-process-negotiation","outcome":"native-unsupported"},{"name":"duplicated-fd-take","outcome":"valid"}]}
+EOF
+  if assert_primary_live_fd_probe_output "$valid" >/dev/null 2>&1; then
+    printf 'primary live-descriptor result accepted a valid attacker retrieval\n' >&2
+    return 1
+  fi
+}
+
+test_primary_live_fd_barrier_consumption_accepts_empty_inode() {
+  local -r result_dir="$TEST_TMP_DIR/primary-live-fd-barrier-consumption"
+  local -r private_directory="$result_dir/fault"
+  local -r control_file="$private_directory/java-remote-parent.mode"
+  local -r fake_bin="$result_dir/bin"
+  local -r evidence="$result_dir/consumed.txt"
+  local -r nonempty_evidence="$result_dir/nonempty.txt"
+  local -r expected=$'phase=consumed\nmetadata=0:0:600:1:regular empty file\nsize=0'
+
+  mkdir -p -- "$private_directory" "$fake_bin"
+  chmod 0700 -- "$private_directory"
+  cat >"$fake_bin/id" <<'EOF'
+#!/usr/bin/env bash
+printf '0\n'
+EOF
+  cat >"$fake_bin/stat" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+case "$2" in
+  '%u:%g:%a:%F') printf '0:0:700:directory\n' ;;
+  '%u:%g:%a:%h') printf '0:0:600:1\n' ;;
+  '%u:%g:%a:%h:%F')
+    if [[ -s "$3" ]]; then
+      printf '0:0:600:1:regular file\n'
+    else
+      printf '0:0:600:1:regular empty file\n'
+    fi
+    ;;
+  '%s') wc -c <"$3" ;;
+  *) exit 64 ;;
+esac
+EOF
+  chmod 0755 -- "$fake_bin/id" "$fake_bin/stat"
+
+  (
+    PRIMARY_FAULT_STACK_ACTIVE=true
+    PRIMARY_FAULT_COMPOSE=(test-compose)
+    run_bounded() {
+      local -a bounded_command=("$@")
+      local script_index=-1
+      local index=0
+
+      [[ "${bounded_command[0]}" == 10 ]] || return 1
+      for index in "${!bounded_command[@]}"; do
+        if [[ "${bounded_command[$index]}" == -ec ]]; then
+          script_index="$index"
+          break
+        fi
+      done
+      ((script_index >= 0)) || return 1
+      PATH="$fake_bin:$PATH" /bin/sh -ec \
+        "${bounded_command[$((script_index + 1))]}" \
+        sh "$private_directory" "$control_file"
+    }
+
+    : >"$control_file"
+    consume_primary_live_fd_barrier "$evidence"
+    [[ "$(<"$evidence")" == "$expected" && \
+      ! -e "$control_file" && ! -L "$control_file" ]]
+    printf 'release:124\n' >"$control_file"
+    if consume_primary_live_fd_barrier "$nonempty_evidence"; then
+      return 1
+    fi
+    [[ "$(<"$control_file")" == release:124 && -s "$control_file" ]]
+  ) || {
+    printf 'primary live-descriptor barrier rejected the trusted empty inode\n' >&2
+    return 1
+  }
+}
+
+test_primary_live_fd_control_uses_exact_barrier_protocol() {
+  local control=""
+  local release=""
+  local consume=""
+  local probe_runner=""
+  local recovery_scenario=""
+  local primary_control=""
+  local runtime_contract=""
+  local arm_line=""
+  local victim_line=""
+  local ready_line=""
+  local probe_line=""
+  local probe_delta_line=""
+  local release_line=""
+  local victim_wait_line=""
+  local unsupported_status_line=""
+  local unsupported_cleanup_line=""
+
+  control="$(declare -f run_primary_live_fd_security_control)"
+  release="$(declare -f release_primary_live_fd_barrier)"
+  consume="$(declare -f consume_primary_live_fd_barrier)"
+  probe_runner="$(declare -f run_primary_live_fd_probe)"
+  recovery_scenario="$(declare -f run_primary_live_fd_security_recovery_scenario)"
+  primary_control="$(declare -f run_primary_security_control)"
+  runtime_contract="$(declare -f assert_runtime_contract)"
+  [[ "$control" == *'primary-fault'* && \
+    "$control" == *'arm_primary_live_fd_barrier'* && \
+    "$control" == *'wait_for_primary_live_fd_barrier_ready'* && \
+    "$control" == *'run_primary_live_fd_probe'* && \
+    "$control" == *'timeout --signal=TERM --kill-after=10s'* && \
+    "$control" == *'--request-timeout "${PRIMARY_LIVE_FD_VICTIM_REQUEST_TIMEOUT_SECONDS}s"'* && \
+    "$control" == *'primary_live_fd_remaining_timeout'* && \
+    "$control" == *'assert_primary_security_metric_delta "$probe_delta" negotiate 1 1'* && \
+    "$control" == *'assert_primary_security_metric_delta "$probe_delta" take 1 1'* && \
+    "$control" == *'assert_bridge_metric_delta "$probe_delta" getsockopt 0 0 0 1 1 false 0'* && \
+    "$control" == *'assert_bridge_metric_delta "$full_delta" getsockopt 1 0 0 1 1 false 0'* ]] || {
+    printf 'primary live-descriptor control omitted its exact barrier or metric gates\n' >&2
+    return 1
+  }
+  [[ "$control" != *'run_bounded "$PRIMARY_LIVE_FD_VICTIM_TIMEOUT_SECONDS"'* && \
+    "$control" != *'/proc/1/fd'* && "$control" != *'--pid'* && \
+    "$control" != *'capture_java_diagnostics'* ]] || {
+    printf 'primary live-descriptor control used an unsafe fallback or post-arm diagnostic\n' >&2
+    return 1
+  }
+  [[ "$release" == *'printf "release:%s\\n" "$descriptor" >"$control_file"'* && \
+    "$release" != *'flock '* && "$release" != *'mv '* ]] || {
+    printf 'primary live-descriptor release was not an in-place non-locking write\n' >&2
+    return 1
+  }
+  [[ "$release" == *'before="$(stat -c "%d:%i:%u:%g:%a:%h" "$control_file")"'* && \
+    "$release" == *'after="$(stat -c "%d:%i:%u:%g:%a:%h" "$control_file")"'* && \
+    "$release" != *'%d:%i:%u:%g:%a:%h:%F'* && \
+    "$consume" == *'$(stat -c "%u:%g:%a:%h" "$control_file")" = "0:0:600:1"'* && \
+    "$consume" != *'$(stat -c "%u:%g:%a:%h:%F" "$control_file")" = "0:0:600:1:regular file"'* && \
+    "$consume" != *'flock '* && "$consume" != *'mv '* ]] || {
+    printf 'primary live-descriptor empty-inode metadata contract is unsafe\n' >&2
+    return 1
+  }
+  [[ "$probe_runner" == *'env -u LD_PRELOAD -u OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_FILE /bin/sh -ec'* && \
+    "$probe_runner" == *'self_cgroup="$(cat /proc/self/cgroup)"'* && \
+    "$probe_runner" == *'pid_one_cgroup="$(cat /proc/1/cgroup)"'* && \
+    "$probe_runner" == *'[ "$self_cgroup" = "$pid_one_cgroup" ]'* && \
+    "$probe_runner" == *'exec "$probe_path" --mode primary-live-fd'* && \
+    "$probe_runner" != *'/proc/1/fd'* && "$probe_runner" != *'--pid'* ]] || {
+    printf 'primary live-descriptor probe did not verify its pre-exec root topology\n' >&2
+    return 1
+  }
+  [[ "$primary_control" == *'run_primary_live_fd_security_control "$host_probe"'* && \
+    "$primary_control" != *'run_primary_live_fd_security_control "$host_probe" ||'* && \
+    "$primary_control" == *'"live_descriptor_probe":"metrics_verified"'* && \
+    "$primary_control" == *'"live_descriptor_topology":"pid1-cgroup-verified-preexec"'* && \
+    "$recovery_scenario" == *'run_scenario basic'* && \
+    "$recovery_scenario" == *'return "$scenario_status"'* && \
+    "$runtime_contract" == *'primary-live-fd-security'* ]] || {
+    printf 'primary security control did not retain the live-descriptor evidence path\n' >&2
+    return 1
+  }
+  awk '
+    /^[[:space:]]*if wait_for_background_process/ {
+      waiting = 1
+      succeeded = 0
+      next
+    }
+    waiting && /victim_exit=0/ {
+      succeeded = 1
+      next
+    }
+    waiting && succeeded && /victim_pid=""/ {
+      cleared_after_reap++
+      waiting = 0
+      next
+    }
+    waiting && /\[\[ "\$victim_exit" == "0" \]\]/ {
+      missing_reap_clear++
+      waiting = 0
+    }
+    END { exit !(cleared_after_reap == 2 && missing_reap_clear == 0) }
+  ' <<<"$control" || {
+    printf 'primary live-descriptor control loses a timed-out victim before trap cleanup\n' >&2
+    return 1
+  }
+
+  arm_line="$(awk '/arm_primary_live_fd_barrier/ { print NR; exit }' <<<"$control")"
+  victim_line="$(awk '/run --rm --no-deps --no-TTY scenario/ { print NR; exit }' <<<"$control")"
+  ready_line="$(awk '/wait_for_primary_live_fd_barrier_ready/ { print NR; exit }' <<<"$control")"
+  probe_line="$(awk '/run_primary_live_fd_probe/ { print NR; exit }' <<<"$control")"
+  probe_delta_line="$(awk '/assert_primary_security_metric_delta "\$probe_delta" negotiate 1 1/ { print NR; exit }' <<<"$control")"
+  release_line="$(awk '/release_primary_live_fd_barrier/ { line = NR } END { print line }' <<<"$control")"
+  victim_wait_line="$(awk -v release_line="$release_line" \
+    'NR > release_line && /wait_for_background_process/ { print NR; exit }' <<<"$control")"
+  unsupported_status_line="$(awk '/"status":"unsupported"/ { print NR; exit }' <<<"$control")"
+  unsupported_cleanup_line="$(awk -v status_line="$unsupported_status_line" \
+    'NR > status_line && /rm -f -- "\$PRIMARY_SECURITY_PROBE_PATH"/ { print NR; exit }' <<<"$control")"
+  [[ "$arm_line" =~ ^[1-9][0-9]*$ && "$victim_line" =~ ^[1-9][0-9]*$ && \
+    "$ready_line" =~ ^[1-9][0-9]*$ && "$probe_line" =~ ^[1-9][0-9]*$ && \
+    "$probe_delta_line" =~ ^[1-9][0-9]*$ && "$release_line" =~ ^[1-9][0-9]*$ && \
+    "$victim_wait_line" =~ ^[1-9][0-9]*$ && \
+    "$unsupported_status_line" =~ ^[1-9][0-9]*$ && \
+    "$unsupported_cleanup_line" =~ ^[1-9][0-9]*$ && \
+    arm_line -lt victim_line && victim_line -lt ready_line && \
+    ready_line -lt probe_line && probe_line -lt probe_delta_line && \
+    probe_delta_line -lt release_line && release_line -lt victim_wait_line && \
+    unsupported_status_line -lt unsupported_cleanup_line ]] || {
+    printf 'primary live-descriptor control did not sequence barrier, denial, release, and victim evidence\n' >&2
+    return 1
+  }
+}
+
+test_primary_live_fd_barrier_budget_is_consistent() {
+  local -r shim_source="$REPO_ROOT/examples/apache-java-https/java/fault/getsockopt_fault_shim.c"
+  local barrier_millis=""
+
+  barrier_millis="$(sed -nE \
+    's/^[[:space:]]*java_remote_parent_live_fd_barrier_timeout_millis = ([0-9]+),$/\1/p' \
+    "$shim_source")" || return $?
+  [[ "$barrier_millis" =~ ^[1-9][0-9]*$ && \
+    "$barrier_millis" == "$((PRIMARY_LIVE_FD_BARRIER_TIMEOUT_SECONDS * 1000))" ]] || {
+    printf 'primary live-descriptor shim and runner barrier deadlines diverged\n' >&2
+    return 1
+  }
+  ((PRIMARY_LIVE_FD_PROBE_TIMEOUT_SECONDS +
+    PRIMARY_LIVE_FD_METRICS_TIMEOUT_SECONDS +
+    PRIMARY_LIVE_FD_METRIC_CAPTURE_TIMEOUT_SECONDS +
+    PRIMARY_LIVE_FD_RELEASE_TIMEOUT_SECONDS <
+    PRIMARY_LIVE_FD_PRE_RELEASE_DEADLINE_SECONDS)) || {
+    printf 'primary live-descriptor pre-release work exceeds its deadline\n' >&2
+    return 1
+  }
+  ((PRIMARY_LIVE_FD_PRE_RELEASE_DEADLINE_SECONDS +
+    PRIMARY_LIVE_FD_RELEASE_TIMEOUT_SECONDS <
+    PRIMARY_LIVE_FD_BARRIER_TIMEOUT_SECONDS)) || {
+    printf 'primary live-descriptor release budget reaches the shim deadline\n' >&2
+    return 1
+  }
+  ((PRIMARY_LIVE_FD_VICTIM_REQUEST_TIMEOUT_SECONDS >
+    PRIMARY_LIVE_FD_PRE_RELEASE_DEADLINE_SECONDS +
+      PRIMARY_LIVE_FD_RELEASE_TIMEOUT_SECONDS &&
+    PRIMARY_LIVE_FD_VICTIM_SCENARIO_TIMEOUT_SECONDS >
+      PRIMARY_LIVE_FD_VICTIM_REQUEST_TIMEOUT_SECONDS &&
+    PRIMARY_LIVE_FD_VICTIM_TIMEOUT_SECONDS ==
+      PRIMARY_LIVE_FD_VICTIM_SCENARIO_TIMEOUT_SECONDS +
+        PRIMARY_LIVE_FD_VICTIM_STARTUP_BUDGET_SECONDS +
+        PRIMARY_LIVE_FD_VICTIM_SUPERVISOR_SLACK_SECONDS)) || {
+    printf 'primary live-descriptor victim timeouts do not cover the release path\n' >&2
+    return 1
+  }
+}
+
+test_primary_live_fd_recovery_scenario_propagates_failure() {
+  local status=0
+
+  (
+    SCENARIO_VARIANT=original
+    run_scenario() {
+      [[ "$1" == basic && "$SCENARIO_VARIANT" == security-primary-live-fd-recovery ]] || return 1
+      return 47
+    }
+
+    if run_primary_live_fd_security_recovery_scenario "$SCENARIO_VARIANT"; then
+      return 1
+    else
+      status=$?
+    fi
+    [[ "$status" == 47 && "$SCENARIO_VARIANT" == original ]]
+  ) || {
+    printf 'primary live-descriptor recovery scenario failure did not propagate\n' >&2
+    return 1
+  }
+}
+
+test_primary_live_fd_control_restores_the_base_stack() {
+  local -r result_dir="$TEST_TMP_DIR/primary-live-fd-recovery"
+  local -r probe_source="$result_dir/security-probe"
+  local -r observed="$result_dir/observed"
+  local control_status=0
+
+  mkdir -p -- "$result_dir"
+  printf 'probe\n' >"$probe_source"
+  (
+    RESULT_DIR="$result_dir"
+    TRANSPORT=getsockopt
+    SELECTED_TRANSPORT=getsockopt
+    BRIDGE_RUNNING=true
+    PRIMARY_FAULT_STACK_ACTIVE=false
+    SCENARIO_VARIANT=original
+    : >"$observed"
+    recreate_instrumented_stack() {
+      printf 'recreate:%s:%s\n' "$2" "$6" >>"$observed"
+    }
+    assert_runtime_contract() {
+      printf 'contract:%s\n' "$1" >>"$observed"
+      [[ "$1" != primary-live-fd-security ]]
+    }
+
+    if run_primary_live_fd_security_control "$probe_source"; then
+      return 1
+    else
+      control_status=$?
+    fi
+    [[ "$control_status" == "1" && ! -e "$result_dir/primary-live-fd-security-recovery-required" && \
+      "$SCENARIO_VARIANT" == original ]]
+  ) || {
+    printf 'primary live-descriptor control did not restore after fault-stack validation failure\n' >&2
+    return 1
+  }
+  local -r expected=$'recreate:primary live-descriptor security preparation:primary-fault\ncontract:primary-live-fd-security\nrecreate:post-primary live-descriptor security recovery:base\ncontract:basic'
+  [[ "$(<"$observed")" == "$expected" ]] || {
+    printf 'primary live-descriptor recovery changed:\n%s\n' "$(<"$observed")" >&2
     return 1
   }
 }
@@ -11128,6 +11560,7 @@ main() {
   test_cleanup_refuses_down_when_transport_invalidation_fails
   test_cleanup_failure_changes_successful_run_status
   test_primary_fault_recovery_marker_forces_cleanup_with_keep
+  test_primary_live_fd_recovery_marker_forces_cleanup_with_keep
   test_run_status_publication_failure_changes_successful_exit
   test_cleanup_only_invalidates_matching_project_evidence_before_down
   test_cleanup_only_refuses_untrusted_current_evidence_identity
@@ -11211,6 +11644,13 @@ main() {
   test_primary_security_metrics_are_explicitly_scoped
   test_primary_security_identity_requires_same_cgroup_and_nonroot_user
   test_primary_security_probe_is_not_self_certifying
+  test_primary_live_fd_descriptor_is_exact_and_bounded
+  test_primary_live_fd_probe_result_is_exact
+  test_primary_live_fd_barrier_consumption_accepts_empty_inode
+  test_primary_live_fd_control_uses_exact_barrier_protocol
+  test_primary_live_fd_barrier_budget_is_consistent
+  test_primary_live_fd_recovery_scenario_propagates_failure
+  test_primary_live_fd_control_restores_the_base_stack
   test_unix_security_metrics_require_explicit_race_scope
   test_unix_security_provider_wait_uses_restart_cursor
   test_unix_security_quiescence_restores_policy

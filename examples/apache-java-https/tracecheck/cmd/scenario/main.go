@@ -29,6 +29,8 @@ import (
 	"go.opentelemetry.io/obi/examples/apache-java-https/tracecheck"
 )
 
+const defaultRequestTimeout = 10 * time.Second
+
 type config struct {
 	baseURL               string
 	receiverURL           string
@@ -38,6 +40,8 @@ type config struct {
 	javaDiagnosticsBefore string
 	requestCount          int
 	timeout               time.Duration
+	requestTimeout        time.Duration
+	requestTimeoutSet     bool
 	expectedTLS           string
 	seed                  int64
 	apacheService         string
@@ -294,12 +298,18 @@ func parseFlags() config {
 	flag.StringVar(&cfg.javaDiagnosticsBefore, "java-diagnostics-before", "", "sanitized Java diagnostics baseline for primary-w3c-fault")
 	flag.IntVar(&cfg.requestCount, "requests", 0, "number of requests (zero selects a scenario default)")
 	flag.DurationVar(&cfg.timeout, "timeout", 45*time.Second, "whole-scenario timeout")
+	flag.DurationVar(&cfg.requestTimeout, "request-timeout", defaultRequestTimeout, "per-request HTTP and raw-connection timeout")
 	flag.StringVar(&cfg.expectedTLS, "expected-tls", "TLSv1.3", "backend TLS protocol")
 	flag.Int64Var(&cfg.seed, "seed", 1, "deterministic request and W3C identifier seed")
 	flag.StringVar(&cfg.apacheService, "apache-service", "apache-proxy", "Apache service.name")
 	flag.StringVar(&cfg.javaService, "java-service", "java-backend", "Java service.name")
 	flag.StringVar(&cfg.restartControlDir, "restart-control-dir", "", "shared restart-fault control directory")
 	flag.Parse()
+	flag.Visit(func(visited *flag.Flag) {
+		if visited.Name == "request-timeout" {
+			cfg.requestTimeoutSet = true
+		}
+	})
 
 	if flag.NArg() != 0 {
 		fmt.Fprintln(os.Stderr, "unexpected positional arguments")
@@ -325,8 +335,8 @@ func parseFlags() config {
 		fmt.Fprintln(os.Stderr, "requests must be between 0 and 1000")
 		os.Exit(2)
 	}
-	if cfg.timeout <= 0 || cfg.timeout > 10*time.Minute {
-		fmt.Fprintln(os.Stderr, "timeout must be positive and at most 10m")
+	if err := validateTimeouts(cfg); err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
 	if cfg.scenario == "restart-fault" && cfg.restartControlDir == "" {
@@ -350,6 +360,16 @@ func parseFlags() config {
 		os.Exit(2)
 	}
 	return cfg
+}
+
+func validateTimeouts(cfg config) error {
+	if cfg.timeout <= 0 || cfg.timeout > 10*time.Minute {
+		return errors.New("timeout must be positive and at most 10m")
+	}
+	if cfg.requestTimeout <= 0 || (cfg.requestTimeoutSet && cfg.requestTimeout > cfg.timeout) {
+		return errors.New("request-timeout must be positive and no greater than timeout")
+	}
+	return nil
 }
 
 func validateAssertionMode(cfg config) error {
@@ -817,7 +837,7 @@ func sendRequests(
 		transport.DisableKeepAlives = true
 	}
 	defer transport.CloseIdleConnections()
-	client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
+	client := &http.Client{Transport: transport, Timeout: effectiveRequestTimeout(cfg)}
 
 	responses := make([]backendResponse, len(requests))
 	latencies := make([]int64, len(requests))
@@ -899,6 +919,17 @@ func sendRequests(
 	return responses, latencies, time.Since(trafficStart), nil, nil
 }
 
+func effectiveRequestTimeout(cfg config) time.Duration {
+	requestTimeout := cfg.requestTimeout
+	if requestTimeout == 0 {
+		requestTimeout = defaultRequestTimeout
+	}
+	if cfg.timeout > 0 && requestTimeout > cfg.timeout {
+		return cfg.timeout
+	}
+	return requestTimeout
+}
+
 func sendPipelinedRequests(
 	ctx context.Context,
 	cfg config,
@@ -913,7 +944,7 @@ func sendPipelinedRequests(
 		return nil, nil, 0, nil, fmt.Errorf("dial Apache for HTTP/1.1 pipeline: %w", err)
 	}
 	defer connection.Close()
-	if err := setConnectionDeadline(ctx, connection); err != nil {
+	if err := setConnectionDeadline(ctx, connection, effectiveRequestTimeout(cfg)); err != nil {
 		return nil, nil, 0, nil, err
 	}
 
@@ -1004,7 +1035,7 @@ func sendFDPortReuseRequests(
 		if dialErr != nil {
 			return responses, latencies, time.Since(trafficStart), nil, fmt.Errorf("request %d reused-port dial: %w", i, dialErr)
 		}
-		if deadlineErr := setConnectionDeadline(ctx, connection); deadlineErr != nil {
+		if deadlineErr := setConnectionDeadline(ctx, connection, effectiveRequestTimeout(cfg)); deadlineErr != nil {
 			_ = connection.Close()
 			return responses, latencies, time.Since(trafficStart), nil, deadlineErr
 		}
@@ -1124,8 +1155,12 @@ func directTCPAddress(baseURL string) (string, string, error) {
 	return network, resolved.String(), nil
 }
 
-func setConnectionDeadline(ctx context.Context, connection net.Conn) error {
-	deadline := time.Now().Add(10 * time.Second)
+func setConnectionDeadline(
+	ctx context.Context,
+	connection net.Conn,
+	requestTimeout time.Duration,
+) error {
+	deadline := time.Now().Add(requestTimeout)
 	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
 		deadline = contextDeadline
 	}

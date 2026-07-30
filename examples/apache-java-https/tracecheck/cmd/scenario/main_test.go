@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -52,6 +53,86 @@ func TestW3COnlyRequestRecordsNoOBIControl(t *testing.T) {
 	assert.Equal(t, "valid-w3c-no-obi", requests[0].W3CCase)
 	assert.Equal(t, "01", requests[0].W3CTraceFlags)
 	assert.False(t, requests[0].InvalidW3C)
+}
+
+func TestRequestTimeoutDefaultsAndRemainsWithinScenarioDeadline(t *testing.T) {
+	assert.Equal(t, defaultRequestTimeout, effectiveRequestTimeout(config{}))
+	assert.Equal(t, 5*time.Second, effectiveRequestTimeout(config{
+		timeout:        5 * time.Second,
+		requestTimeout: defaultRequestTimeout,
+	}))
+	assert.Equal(t, 70*time.Second, effectiveRequestTimeout(config{
+		timeout:        90 * time.Second,
+		requestTimeout: 70 * time.Second,
+	}))
+
+	assert.NoError(t, validateTimeouts(config{
+		timeout:        90 * time.Second,
+		requestTimeout: 70 * time.Second,
+	}))
+	assert.ErrorContains(t, validateTimeouts(config{
+		timeout:           90 * time.Second,
+		requestTimeout:    91 * time.Second,
+		requestTimeoutSet: true,
+	}), "request-timeout")
+	assert.NoError(t, validateTimeouts(config{
+		timeout:        5 * time.Second,
+		requestTimeout: defaultRequestTimeout,
+	}))
+	assert.ErrorContains(t, validateTimeouts(config{
+		timeout:        90 * time.Second,
+		requestTimeout: 0,
+	}), "request-timeout")
+}
+
+type deadlineRecordingConn struct {
+	deadline time.Time
+}
+
+func (connection *deadlineRecordingConn) Read([]byte) (int, error) {
+	return 0, io.EOF
+}
+
+func (connection *deadlineRecordingConn) Write([]byte) (int, error) {
+	return 0, io.EOF
+}
+
+func (connection *deadlineRecordingConn) Close() error {
+	return nil
+}
+
+func (connection *deadlineRecordingConn) LocalAddr() net.Addr {
+	return &net.TCPAddr{}
+}
+
+func (connection *deadlineRecordingConn) RemoteAddr() net.Addr {
+	return &net.TCPAddr{}
+}
+
+func (connection *deadlineRecordingConn) SetDeadline(deadline time.Time) error {
+	connection.deadline = deadline
+	return nil
+}
+
+func (connection *deadlineRecordingConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+
+func (connection *deadlineRecordingConn) SetWriteDeadline(time.Time) error {
+	return nil
+}
+
+func TestConnectionDeadlineHonorsRequestTimeout(t *testing.T) {
+	connection := &deadlineRecordingConn{}
+	startedAt := time.Now()
+	require.NoError(t, setConnectionDeadline(context.Background(), connection, 70*time.Second))
+	assert.WithinDuration(t, startedAt.Add(70*time.Second), connection.deadline, time.Second)
+
+	contextDeadline := startedAt.Add(5 * time.Second)
+	ctx, cancel := context.WithDeadline(context.Background(), contextDeadline)
+	defer cancel()
+	require.NoError(t, setConnectionDeadline(ctx, connection, 70*time.Second))
+	assert.WithinDuration(t, contextDeadline, connection.deadline, time.Second)
 }
 
 func TestHelperAttachFailureUsesOneRequestWithoutW3C(t *testing.T) {

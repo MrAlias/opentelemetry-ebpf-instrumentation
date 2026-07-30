@@ -686,7 +686,8 @@ static void test_live_fd_barrier_ignores_non_matching_requests(void) {
          3);
   assert(fault_file_matches(java_remote_parent_live_fd_barrier_mode));
   set_fault_mode(NULL);
-  obi_demo_java_remote_parent_set_live_fd_barrier_timeout_for_test(10000);
+  obi_demo_java_remote_parent_set_live_fd_barrier_timeout_for_test(
+      java_remote_parent_live_fd_barrier_timeout_millis);
 
   assert(close(sockets[0]) == 0);
   assert(close(sockets[1]) == 0);
@@ -709,7 +710,8 @@ static void test_live_fd_barrier_times_out_boundedly(void) {
   assert(elapsed >= java_remote_parent_live_fd_barrier_timeout_millis);
   assert(elapsed < java_remote_parent_live_fd_barrier_max_timeout_millis);
   set_fault_mode(NULL);
-  obi_demo_java_remote_parent_set_live_fd_barrier_timeout_for_test(10000);
+  obi_demo_java_remote_parent_set_live_fd_barrier_timeout_for_test(
+      java_remote_parent_live_fd_barrier_timeout_millis);
 
   assert(close(sockets[0]) == 0);
   assert(close(sockets[1]) == 0);

@@ -35,12 +35,20 @@ targeted and has `acceptance_evidence=false`, it is not a primary acceptance
 matrix pass. A sanitized full acceptance run is still required before restoring
 a primary attacker cell to `pass`.
 
+Current source also contains a separate primary live-descriptor control. It
+holds an actual accepted Java descriptor, executes a root probe in the Java
+container's PID 1 cgroup, and attempts `pidfd_getfd` before the legitimate
+request is released. It has no retained runtime artifact, so it is `untested`.
+`pidfd-duplicate-unavailable` is an `unsupported` capability result, not an
+authorization pass and not a reason to fall back silently to Unix.
+
 | Abuse or fault | Required result | Primary `getsockopt` | Unix | Evidence or remaining work |
 | --- | --- | --- | --- | --- |
 | unrelated process in same cgroup calls take | denied; legitimate Java take still succeeds | untested (focused verification only) | untested | [current same-cgroup metric window, victim, and recovery](focused-validation/primary-getsockopt-8f0aa1f6/security-primary-probes.json) |
 | sibling container/PID namespace calls take | denied by current identity/peer credentials | untested (focused verification only) | untested | [current sibling metric window, victim, and recovery](focused-validation/primary-getsockopt-8f0aa1f6/security-primary-probes.json) |
 | forged caller PID/TID in Unix request | ignored; kernel peer identity is authoritative | not applicable | pass | [forged-peer probe](evidence/otel-unix-tls12-bd1c9327/security-unix-probes.json) |
 | repeated unauthorized take attempts | bounded; context remains available | untested (focused verification only) | pass | [primary bounded probe windows](focused-validation/primary-getsockopt-8f0aa1f6/security-primary-probes.json) and [Unix bounded probes and recovery](evidence/otel-unix-tls12-bd1c9327/security-unix-probes.json) |
+| root process in Java PID 1 cgroup duplicates a live accepted descriptor | raw probe is insufficient; isolated unauthorized metrics show zero valid retrievals, held victim keeps exact parent, recovery passes | untested | not applicable | a clean full forced-primary `all` run must retain barrier arm/release/consumed records, probe log, victim graph, phase metric deltas, and `scenario-primary-live-fd-security-status.json`; standalone `security` is diagnostic only, while a pidfd-unavailable result retains barrier/probe/victim/baseline/status evidence but not probe/after phases or the explicit recovery scenario, then exits nonzero after base-stack restoration |
 | wrong socket identity | rejected without consuming another request's context | untested | untested | retain a targeted wrong-socket result |
 | fd reuse | closed/reopened fixed-port traffic; reused Jetty fd across distinct stable Jetty connection IDs; distinct exact parents; zero wrong parents | pass | pass | [primary](evidence/otel-getsockopt-tls13-c9d14356/scenario-fd-port-reuse.json) and [Unix](evidence/otel-unix-tls12-bd1c9327/scenario-fd-port-reuse.json) reuse graphs |
 | unrelated socket option/level | original kernel behavior preserved | pass | not applicable | [primary probe cases](evidence/otel-getsockopt-tls13-c9d14356/security-primary-probes.json) |
@@ -68,6 +76,14 @@ a primary attacker cell to `pass`.
 
 - Run an attacker process with `docker exec` in the Java container to share its
   cgroup but not its JVM helper state.
+- For the primary live-descriptor control, hold a real victim request at the
+  Java accepted-descriptor barrier, then execute the root probe in that same
+  container. It clears fault-injection preload state and verifies before exec
+  that its cgroup equals Java PID 1's cgroup. The proof requires permitted
+  `pidfd_getfd`, an `unverified` raw observation, isolated unauthorized
+  negotiate/take metric deltas with zero valid retrievals, the victim's exact
+  parent, and a normal-stack recovery. A raw native result never certifies
+  primary enforcement.
 - Run a sibling container with the Unix directory mounted to test filesystem
   permissions and peer credentials.
 - The Unix sibling fixture is deliberately `65534:65534` with no network,

@@ -1,7 +1,7 @@
 # Compatibility evidence matrix
 
-Matrix revision: `apache-java-https-compatibility-v1`.
-<!-- obi-compatibility-matrix-revision: apache-java-https-compatibility-v1 -->
+Matrix revision: `apache-java-https-compatibility-v2`.
+<!-- obi-compatibility-matrix-revision: apache-java-https-compatibility-v2 -->
 
 Cells without a linked run artifact remain **untested**. Kernel or distribution
 version inference is not evidence. Runtime feature detection must name the
@@ -61,6 +61,32 @@ kernel row above.
 RHEL 8 support may only be reported from direct execution on the documented
 backport. If a required cgroup hook is absent, report forced `getsockopt` as
 `unsupported` with feature-detection evidence and test the Unix fallback.
+
+## Primary live-descriptor isolation gate
+
+This is a primary-transport security gate, not a substitute for a forced
+`getsockopt` compatibility result and not a Unix fallback cell. The runner
+holds a real Java request at its accepted-descriptor barrier, then starts a
+root probe in the Java container's PID 1 cgroup and attempts to duplicate that
+live descriptor with `pidfd_getfd`. The direct probe observation is
+`unverified`; enforcement is established only by its isolated metric windows,
+the held legitimate victim, and post-abuse recovery.
+
+| Gate | Required topology and capability | Status | Required retained result |
+| --- | --- | --- | --- |
+| live accepted-descriptor duplication against forced `getsockopt` | clean Java container; root probe pre-exec cgroup exactly equals Java PID 1 cgroup; `pidfd_getfd` permitted | untested | clean full forced-primary `all` run, for example `./examples/apache-java-https/run.sh --transport getsockopt --agent otel --tls TLSv1.3`; barrier arm/release/consumed records, `security-primary-live-fd.log`, victim graph, before/probe/after metric deltas, and `scenario-primary-live-fd-security-status.json` |
+
+The matrix gate is `pass` only when its clean full run's security status reports
+`status: passed` and `probe_verification: metrics_verified`, the unauthorized
+attempt has zero valid bridge retrievals, the victim retains its exact parent,
+and recovery passes. The standalone `--scenario security` command is useful
+for diagnostics but is non-acceptance evidence. A
+`pidfd-duplicate-unavailable` result retains barrier records, probe log,
+held-victim JSON and stderr, baseline metric evidence, and unsupported status.
+It does not produce probe/after metric phases or the explicit post-abuse
+recovery scenario, and exits nonzero after its trap restores the base stack; it
+is `unsupported` for this gate, not a pass and not permission to label forced
+Unix fallback as tested. No retained artifact exists yet.
 
 ## Architecture
 
@@ -151,6 +177,10 @@ before changing that status.
   --transport unix \
   --agent otel \
   --tls TLSv1.2
+
+./examples/apache-java-https/run.sh \
+  --transport getsockopt \
+  --scenario security
 ```
 
 Attach the result directories, `bpftool feature probe` output, cgroup mount

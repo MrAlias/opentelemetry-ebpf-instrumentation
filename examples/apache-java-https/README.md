@@ -11,8 +11,8 @@ to directly observed cells. The [final result](FINAL-RESULT.md) reconciles the
 parent tracker's definition of done against that same retained evidence
 boundary.
 
-Matrix revision: `apache-java-https-compatibility-v1`.
-<!-- obi-compatibility-matrix-revision: apache-java-https-compatibility-v1 -->
+Matrix revision: `apache-java-https-compatibility-v2`.
+<!-- obi-compatibility-matrix-revision: apache-java-https-compatibility-v2 -->
 
 ```text
 trace-scenario
@@ -156,6 +156,7 @@ is retained.
 - Docker Engine with Compose v2 and permission to run privileged containers.
 - A kernel supported by OBI (normally Linux 5.8+ with BTF, or a documented
   RHEL 8 backport).
+- Go 1.25.11 (for the repository and tracecheck tests).
 - `bash`, `curl`, `git`, `jq`, `openssl`, `sha256sum`, and GNU `timeout`.
 - Free loopback ports `14318`, `18080`, `18443`, and `18444`.
 - Internet access for pinned container images, Maven dependencies, and the
@@ -177,6 +178,32 @@ docker compose \
   --file examples/apache-java-https/docker-compose.yml \
   config --quiet
 ```
+
+## Clean-host bootstrap
+
+Start from a clean checkout of the exact revision being evaluated. For example:
+
+```bash
+git clone https://github.com/MrAlias/opentelemetry-ebpf-instrumentation.git
+cd opentelemetry-ebpf-instrumentation
+git checkout <recorded-revision>
+git status --porcelain
+./examples/apache-java-https/certs/generate_test.sh
+./examples/apache-java-https/scripts/run_test.sh
+go test ./examples/apache-java-https/tracecheck/...
+git status --porcelain
+./examples/apache-java-https/run.sh \
+  --transport getsockopt \
+  --agent otel \
+  --tls TLSv1.3
+```
+
+The final `git status --porcelain` before the acceptance command must be
+empty. `run.sh` builds the bridge artifacts from that checkout: it invokes
+`docker build --file javaagent.Dockerfile --target export` and records the
+resulting helper and external-extension checksums with the run. Do not replace
+those artifacts manually. `--skip-bridge-build` is only for checksum-verified,
+targeted local iteration and is never acceptance evidence.
 
 ## Reproducible inputs
 
@@ -225,7 +252,9 @@ The default `all` suite runs, in order:
 - an exact OBI-derived parent check;
 - bounded primary and fallback abuse controls that keep legitimate exact-parent
   traffic active, distinguish the same-cgroup attacker from a sibling
-  container, reject a world-accessible Unix directory, and prove recovery;
+  container, reject a world-accessible Unix directory, attempt a root
+  same-cgroup `pidfd_getfd` duplication of a live accepted Java descriptor,
+  and prove recovery;
 - sequential requests over one reused backend connection;
 - bodyless HTTP/1.1 requests written as one pipeline before any response read;
 - parallel requests that force multiple backend connections;
@@ -297,6 +326,10 @@ does not prove both paths.
 
 ./examples/apache-java-https/run.sh \
   --transport getsockopt \
+  --scenario security
+
+./examples/apache-java-https/run.sh \
+  --transport getsockopt \
   --scenario pipelining
 
 ./examples/apache-java-https/run.sh \
@@ -319,6 +352,17 @@ does not prove both paths.
   --transport getsockopt \
   --scenario delayed-otlp-suppression
 ```
+
+The forced-primary `security` control includes the live-descriptor probe. It
+holds one real request at the Java barrier, runs a root probe in the Java
+container's PID 1 cgroup, and attempts `pidfd_getfd` against that accepted
+descriptor. A standalone `--scenario security` invocation is a targeted
+source-control run and remains non-acceptance evidence even when its checks
+pass. The same control is acceptance evidence only when it runs as part of a
+clean full `all` suite. A host that cannot duplicate the descriptor records
+`pidfd-duplicate-unavailable` as `unsupported`; it does not silently fall back
+to Unix or count as a primary pass, and the runner exits nonzero after releasing
+the held victim while its exit trap restores the base stack.
 
 Use `--keep` to inspect a successful or failed stack. Stop only this Compose
 project afterward:
@@ -459,6 +503,15 @@ Every run retains a timestamped directory under `.runtime/results/` with:
 - CA and server certificate fingerprints and validity;
 - one JSON trace graph and assertion result per scenario, plus retained
   assertion stderr;
+- for a clean full forced-primary run whose live-descriptor status is `passed`:
+  barrier arm, release, and consumption records;
+  `security-primary-live-fd.log`; the held victim's JSON and stderr;
+  before/probe/after metric phases; and
+  `scenario-primary-live-fd-security-status.json`. An unsupported pidfd result
+  instead retains the barrier records, probe log, held-victim JSON and stderr,
+  baseline metric evidence, and unsupported status. It does not produce the
+  probe/after phases or explicit post-abuse recovery scenario, and exits
+  nonzero after its trap restores the base stack;
 - machine-readable connection evidence for pipeline depth, writes completed
   before the first response read, stable Jetty connection IDs, fixed frontend
   ephemeral-port reuse, and frontend/backend descriptor reuse;
@@ -523,7 +576,10 @@ scenario is explicitly labeled non-acceptance evidence. Only a clean full
 The clean focused primary-control record is retained separately in
 [focused-validation/primary-getsockopt-8f0aa1f6](focused-validation/primary-getsockopt-8f0aa1f6/README.md)
 so its isolation and fail-open outcomes can be reviewed without being promoted
-to an acceptance cell.
+to an acceptance cell. That historical record predates the live-descriptor
+control and does not establish its result. A clean full current-revision run
+with the primary security artifacts above is required before a matrix cell can
+be updated.
 
 ## Diagnostics
 
@@ -563,6 +619,16 @@ only for endpoint-replacement testing; the separate `getsockopt` control
 reuses its image for native protocol checks. For `getsockopt`, confirm the
 kernel reports support rather than silently accepting fallback; a forced mode
 must not change transport.
+
+The live-descriptor probe intentionally reports its direct native observation
+as `unverified`: a native `getsockopt` result alone cannot show whether the
+cgroup program enforced denial. A passing scenario status instead requires
+`probe_verification: metrics_verified`, one unauthorized negotiate and take
+metric window with zero valid retrievals, a held legitimate victim with an
+exact parent, and a post-abuse recovery scenario. Preserve all of the listed
+artifacts when that status is `passed`. If the status is `unsupported` with
+`pidfd-duplicate-unavailable`, retain it as an unsupported primary capability
+result and do not promote the targeted run to an acceptance matrix cell.
 
 ## Explicit limitations
 

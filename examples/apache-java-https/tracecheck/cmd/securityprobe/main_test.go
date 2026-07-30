@@ -249,7 +249,9 @@ func TestDuplicateProcessFDRejectsInvalidIdentifiers(t *testing.T) {
 		})
 	}
 	if strconv.IntSize > 32 {
-		file, err := duplicateProcessFD(1, int(int64(maxKernelFD)+1))
+		overflowFD := int64(maxKernelFD)
+		overflowFD++
+		file, err := duplicateProcessFD(1, int(overflowFD))
 		assert.Nil(t, file)
 		assert.Error(t, err)
 	}

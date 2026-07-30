@@ -248,6 +248,11 @@ func TestDuplicateProcessFDRejectsInvalidIdentifiers(t *testing.T) {
 			assert.Error(t, err)
 		})
 	}
+	if strconv.IntSize > 32 {
+		file, err := duplicateProcessFD(1, int(int64(maxKernelFD)+1))
+		assert.Nil(t, file)
+		assert.Error(t, err)
+	}
 }
 
 func TestUnauthorizedRaceWaitsForReleaseAfterMakingAttempts(t *testing.T) {
@@ -416,6 +421,7 @@ func TestMainRejectsUnboundedOrInvalidInvocation(t *testing.T) {
 		{"--mode", "unknown"},
 		{"--mode", "primary-live-fd"},
 		{"--mode", "primary-live-fd", "--fd=-1"},
+		{"--mode", "primary-live-fd", "--fd=2147483648"},
 		{"--timeout", "999ms"},
 		{"--timeout", "1h1s"},
 		{"positional"},

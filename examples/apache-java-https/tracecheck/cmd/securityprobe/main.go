@@ -47,6 +47,7 @@ const (
 	maxProbeTimeout    = time.Hour
 	primaryInterval    = time.Millisecond
 	javaProcessPID     = 1
+	maxKernelFD        = (1 << 31) - 1
 	heldConnections    = 48
 	repeatedAttempts   = 16
 	oversizedBytes     = 4096
@@ -96,8 +97,8 @@ func mainExitCode(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "security probe requires an absolute --socket")
 		return 2
 	}
-	if mode == "primary-live-fd" && targetFD < 0 {
-		fmt.Fprintln(stderr, "primary-live-fd requires a nonnegative --fd")
+	if mode == "primary-live-fd" && (targetFD < 0 || targetFD > maxKernelFD) {
+		fmt.Fprintln(stderr, "primary-live-fd requires a --fd in the kernel descriptor range")
 		return 2
 	}
 	if timeout < time.Second || timeout > maxProbeTimeout {
@@ -203,8 +204,8 @@ func duplicateProcessFD(pid, targetFD int) (*os.File, error) {
 	if pid <= 0 {
 		return nil, errors.New("process identifier must be positive")
 	}
-	if targetFD < 0 {
-		return nil, errors.New("descriptor must be nonnegative")
+	if targetFD < 0 || targetFD > maxKernelFD {
+		return nil, errors.New("descriptor is outside the kernel range")
 	}
 
 	pidFD, err := unix.PidfdOpen(pid, 0)

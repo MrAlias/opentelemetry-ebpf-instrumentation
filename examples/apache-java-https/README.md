@@ -7,8 +7,12 @@ It is the executable evidence harness for
 [issue #2](https://github.com/MrAlias/opentelemetry-ebpf-instrumentation/issues/2)
 and its bridge architecture, implementation, integration, and validation
 sub-issues. The [compatibility matrix](COMPATIBILITY.md) limits support claims
-to directly observed cells, and the [final result](FINAL-RESULT.md) reconciles
-the parent tracker's definition of done against retained evidence.
+to directly observed cells. The [final result](FINAL-RESULT.md) reconciles the
+parent tracker's definition of done against that same retained evidence
+boundary.
+
+Matrix revision: `apache-java-https-compatibility-v1`.
+<!-- obi-compatibility-matrix-revision: apache-java-https-compatibility-v1 -->
 
 ```text
 trace-scenario

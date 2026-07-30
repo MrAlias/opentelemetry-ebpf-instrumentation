@@ -28,6 +28,9 @@ does not invalidate the named passing matrix cells. The
 [runbook](README.md), [compatibility matrix](COMPATIBILITY.md), and linked
 evidence define the current boundary of the result.
 
+Matrix revision: `apache-java-https-compatibility-v1`.
+<!-- obi-compatibility-matrix-revision: apache-java-https-compatibility-v1 -->
+
 | Parent definition-of-done item | Status | Evidence or exact gap |
 | --- | --- | --- |
 | 1. Apache proxies to Java over HTTPS | pass | [Apache runtime and certificate evidence](evidence/otel-getsockopt-tls13-c9d14356/README.md#retained-proof) and the [exact-parent graph](evidence/otel-getsockopt-tls13-c9d14356/scenario-basic.json). |

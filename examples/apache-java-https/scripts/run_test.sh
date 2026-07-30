@@ -10619,8 +10619,75 @@ test_apache_diagnostic_denial_matrix_is_exact() {
   }
 }
 
+compatibility_matrix_revision() {
+  local -r matrix="$1"
+
+  awk '
+    index($0, "Matrix revision:") != 0 {
+      visible_declarations += 1
+      if ($0 ~ /^Matrix revision: `[a-z0-9][a-z0-9-]*`\.$/) {
+        visible_matches += 1
+        visible_revision = $0
+        sub(/^Matrix revision: `/, "", visible_revision)
+        sub(/`\.$/, "", visible_revision)
+      }
+    }
+    index($0, "obi-compatibility-matrix-revision:") != 0 {
+      declarations += 1
+      if ($0 ~ /^<!-- obi-compatibility-matrix-revision: [a-z0-9][a-z0-9-]* -->$/) {
+        matches += 1
+        revision = $0
+        sub(/^<!-- obi-compatibility-matrix-revision: /, "", revision)
+        sub(/ -->$/, "", revision)
+      }
+    }
+    END {
+      if (declarations != 1 || matches != 1 ||
+        visible_declarations != 1 || visible_matches != 1 ||
+        revision != visible_revision) {
+        exit 1
+      }
+      print revision
+    }
+  ' "$matrix"
+}
+
+assert_compatibility_matrix_reference() {
+  local -r document="$1"
+  local -r revision="$2"
+
+  awk -v revision="$revision" '
+    index($0, "Matrix revision:") != 0 {
+      visible_references += 1
+      if ($0 == "Matrix revision: `" revision "`.") {
+        visible_matches += 1
+      }
+    }
+    index($0, "obi-compatibility-matrix-revision:") != 0 {
+      references += 1
+      if ($0 == "<!-- obi-compatibility-matrix-revision: " revision " -->") {
+        matches += 1
+      }
+    }
+    END {
+      exit (references == 1 && matches == 1 &&
+        visible_references == 1 && visible_matches == 1) ? 0 : 1
+    }
+  ' "$document"
+}
+
 test_compatibility_matrix_lists_deployment_modes() {
   local -r matrix="$TEST_SCRIPT_DIR/../COMPATIBILITY.md"
+  local -r readme="$TEST_SCRIPT_DIR/../README.md"
+  local -r final_result="$TEST_SCRIPT_DIR/../FINAL-RESULT.md"
+  local -r invalid_matrix="$TEST_TMP_DIR/compatibility-matrix-revision-invalid.md"
+  local -r duplicate_visible_matrix="$TEST_TMP_DIR/compatibility-matrix-visible-revision-duplicate.md"
+  local -r duplicate_marker_reference="$TEST_TMP_DIR/compatibility-matrix-marker-reference-duplicate.md"
+  local -r malformed_reference="$TEST_TMP_DIR/compatibility-matrix-revision-malformed.md"
+  local -r suffix_reference="$TEST_TMP_DIR/compatibility-matrix-revision-suffix.md"
+  local -r stale_reference="$TEST_TMP_DIR/compatibility-matrix-revision-stale.md"
+  local matrix_revision=""
+  local document=""
   local row=""
   local -a expected_rows=(
     '| RHEL 9 / kernel 5.14 | host process | unified v2 | untested | untested | untested |'
@@ -10644,6 +10711,46 @@ test_compatibility_matrix_lists_deployment_modes() {
     '| supported kernel | container process | sibling containers | untested | untested | untested |'
   )
 
+  matrix_revision="$(compatibility_matrix_revision "$matrix")" || return 1
+  for document in "$readme" "$final_result"; do
+    assert_compatibility_matrix_reference "$document" "$matrix_revision" || return 1
+  done
+  printf 'Matrix revision: `%s`.\n<!-- obi-compatibility-matrix-revision: %s -->\n  <!-- obi-compatibility-matrix-revision: %s-stale -->\n' \
+    "$matrix_revision" "$matrix_revision" "$matrix_revision" >"$invalid_matrix"
+  if compatibility_matrix_revision "$invalid_matrix" >/dev/null; then
+    printf 'compatibility matrix accepted a stale revision declaration\n' >&2
+    return 1
+  fi
+  printf 'Matrix revision: `%s`.\n  Matrix revision: `%s-stale`.\n<!-- obi-compatibility-matrix-revision: %s -->\n' \
+    "$matrix_revision" "$matrix_revision" "$matrix_revision" >"$duplicate_visible_matrix"
+  if compatibility_matrix_revision "$duplicate_visible_matrix" >/dev/null; then
+    printf 'compatibility matrix accepted a duplicate visible revision declaration\n' >&2
+    return 1
+  fi
+  printf 'Matrix revision: `%s`.stale\n<!-- obi-compatibility-matrix-revision: %s -->\n' \
+    "$matrix_revision" "$matrix_revision" >"$suffix_reference"
+  if assert_compatibility_matrix_reference "$suffix_reference" "$matrix_revision"; then
+    printf 'compatibility matrix accepted a suffixed revision reference\n' >&2
+    return 1
+  fi
+  printf 'Matrix revision: `%s`.\n<!-- obi-compatibility-matrix-revision: %s -->\nMatrix revision: `%s-stale`.\n' \
+    "$matrix_revision" "$matrix_revision" "$matrix_revision" >"$stale_reference"
+  if assert_compatibility_matrix_reference "$stale_reference" "$matrix_revision"; then
+    printf 'compatibility matrix accepted a stale visible revision reference\n' >&2
+    return 1
+  fi
+  printf 'Matrix revision: `%s`.\n<!-- obi-compatibility-matrix-revision: %s -->\n  <!-- obi-compatibility-matrix-revision: %s-stale -->\n' \
+    "$matrix_revision" "$matrix_revision" "$matrix_revision" >"$duplicate_marker_reference"
+  if assert_compatibility_matrix_reference "$duplicate_marker_reference" "$matrix_revision"; then
+    printf 'compatibility matrix accepted an indented stale revision marker\n' >&2
+    return 1
+  fi
+  printf 'Matrix revision: `%s`.\n<!-- obi-compatibility-matrix-revision: %s -->\n<!-- obi-compatibility-matrix-revision: %s-stale\n' \
+    "$matrix_revision" "$matrix_revision" "$matrix_revision" >"$malformed_reference"
+  if assert_compatibility_matrix_reference "$malformed_reference" "$matrix_revision"; then
+    printf 'compatibility matrix accepted a malformed stale revision reference\n' >&2
+    return 1
+  fi
   grep -Fqx \
     '| Environment | Deployment mode | Cgroup topology | `getsockopt` | `unix` | `auto` |' \
     "$matrix" || return 1

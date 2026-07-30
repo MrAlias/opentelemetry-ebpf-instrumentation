@@ -1,5 +1,8 @@
 # Compatibility evidence matrix
 
+Matrix revision: `apache-java-https-compatibility-v1`.
+<!-- obi-compatibility-matrix-revision: apache-java-https-compatibility-v1 -->
+
 Cells without a linked run artifact remain **untested**. Kernel or distribution
 version inference is not evidence. Runtime feature detection must name the
 selected transport in the JVM's fixed transport-configuration snapshot; OBI's

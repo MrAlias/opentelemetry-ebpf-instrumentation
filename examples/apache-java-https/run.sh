@@ -75,6 +75,7 @@ APACHE_HTTPS_HEALTH_ENDPOINT="http://127.0.0.1:18080/healthz?close=1"
 PRIMARY_SECURITY_PROBE_PATH="/tmp/security-probe"
 PRIMARY_SECURITY_PID_PATH="/tmp/security-probe.pid"
 UNIX_PERMISSION_REFUSAL_PATTERN="writable without the sticky bit"
+UNIX_SECURITY_STATUS_SEPARATOR="__OBI_UNIX_SECURITY_STATUS_BOUNDARY_V1__"
 RESTART_CONTROL_CONTAINER_DIR="/run/obi-demo/restart-control"
 RESTART_SIGNAL_PRE_STOP_READY="pre-stop-ready"
 RESTART_SIGNAL_STOPPED_TRAFFIC_COMPLETE="stopped-traffic-complete"
@@ -129,6 +130,7 @@ readonly PROJECT_SENTINEL_LABEL PROJECT_SENTINEL_VALUE APACHE_EXPECTED_PROCESS_C
 readonly APACHE_HTTPS_HEALTH_ENDPOINT
 readonly PRIMARY_SECURITY_PROBE_PATH PRIMARY_SECURITY_PID_PATH
 readonly UNIX_PERMISSION_REFUSAL_PATTERN
+readonly UNIX_SECURITY_STATUS_SEPARATOR
 readonly RESTART_CONTROL_CONTAINER_DIR
 readonly RESTART_SIGNAL_PRE_STOP_READY RESTART_SIGNAL_STOPPED_TRAFFIC_COMPLETE
 readonly RESTART_SIGNAL_POST_RESTART_TRAFFIC_COMPLETE
@@ -7066,6 +7068,106 @@ assert_unix_security_cgroup_identity() {
   }
 }
 
+assert_unix_security_pid_namespace_identity() {
+  local -r status_snapshot="$1"
+  local -r probe_pid="$2"
+
+  [[ "$probe_pid" =~ ^[1-9][0-9]*$ && "$probe_pid" != "1" ]] || return 1
+  awk \
+    -v separator="$UNIX_SECURITY_STATUS_SEPARATOR" \
+    -v expected_probe_pid="$probe_pid" '
+    function valid_namespace_pid(value) {
+      return value ~ /^[1-9][0-9]*$/
+    }
+    function same_namespace_pid(left, right, character_index) {
+      if (length(left) != length(right)) {
+        return 0
+      }
+      for (character_index = 1; character_index <= length(left); character_index++) {
+        if (substr(left, character_index, 1) != substr(right, character_index, 1)) {
+          return 0
+        }
+      }
+      return 1
+    }
+    $0 == separator {
+      section++
+      if (section > 2) {
+        invalid = 1
+      }
+      next
+    }
+    section == 0 || section > 2 {
+      invalid = 1
+      next
+    }
+    section == 1 && $1 == "Pid:" {
+      java_pid_count++
+      if (NF != 2 || !valid_namespace_pid($2) || $2 != "1") {
+        invalid = 1
+      }
+      next
+    }
+    section == 1 && $1 == "NSpid:" {
+      java_nspid_count++
+      if (NF != 2 || !valid_namespace_pid($2) || $2 != "1") {
+        invalid = 1
+      }
+      next
+    }
+    section == 2 && $1 == "Pid:" {
+      probe_pid_count++
+      if (NF != 2 || !valid_namespace_pid($2) ||
+        !same_namespace_pid($2, expected_probe_pid)) {
+        invalid = 1
+      }
+      next
+    }
+    section == 2 && $1 == "NSpid:" {
+      probe_nspid_count++
+      if (NF != 2 || !valid_namespace_pid($2) ||
+        !same_namespace_pid($2, expected_probe_pid)) {
+        invalid = 1
+      }
+      next
+    }
+    END {
+      exit invalid || section != 2 || java_pid_count != 1 ||
+        java_nspid_count != 1 || probe_pid_count != 1 ||
+        probe_nspid_count != 1 ? 1 : 0
+    }
+  ' <<<"$status_snapshot"
+}
+
+capture_unix_security_pid_namespace_status() {
+  local -r java_container="$1"
+  local -r probe_pid="$2"
+
+  [[ "$probe_pid" =~ ^[1-9][0-9]*$ && "$probe_pid" != "1" ]] || return 1
+  # The namespace link for an unprivileged peer is ptrace-gated on hardened
+  # kernels. Validate both statuses from Java's private /proc view instead;
+  # a sibling is invisible and a child namespace has an additional NSpid value.
+  # Suppress proc-race diagnostics because they include the transient PID.
+  # Expanded by the container shell, not this process.
+  # shellcheck disable=SC2016
+  run_bounded 10 docker exec "$java_container" /bin/sh -ec '
+    set -eu
+    case "$1" in
+      ""|*[!0-9]*|0|1) exit 1 ;;
+    esac
+    process_name="$(cat /proc/1/comm 2>/dev/null)"
+    thread_name="$(cat /proc/1/task/1/comm 2>/dev/null)"
+    probe_name="$(cat "/proc/$1/comm" 2>/dev/null)"
+    [ "$process_name" = java ]
+    [ "$thread_name" = java ]
+    [ "$probe_name" = security-probe ]
+    printf "%s\\n" "$2"
+    cat /proc/1/status 2>/dev/null
+    printf "%s\\n" "$2"
+    cat "/proc/$1/status" 2>/dev/null
+  ' sh "$probe_pid" "$UNIX_SECURITY_STATUS_SEPARATOR" 2>/dev/null
+}
+
 assert_unix_sibling_security_options() {
   local -r security_options="$1"
 
@@ -7705,8 +7807,7 @@ run_unix_same_cgroup_security_control() {
   local pid_path=""
   local java_pid_mode=""
   local java_live_tid=""
-  local java_pid_namespace=""
-  local probe_pid_namespace=""
+  local pid_namespace_status=""
   local java_cgroup=""
   local probe_cgroup=""
   local probe_status=""
@@ -7783,33 +7884,30 @@ run_unix_same_cgroup_security_control() {
     log_error "Unix same-cgroup security probe reused the Java live-thread identity"
     return 1
   }
-  # Expanded by the container shell, not this process.
-  # shellcheck disable=SC2016
-  run_bounded 10 docker exec "$java_container" /bin/sh -ec '
-    [ "$1" != 1 ]
-    read -r name <"/proc/$1/comm"
-    [ "$name" = security-probe ]
-  ' sh "$UNIX_SECURITY_NAMESPACE_PID" || return $?
-  java_pid_namespace="$(run_bounded 10 docker exec "$java_container" \
-    readlink /proc/1/ns/pid)" || return $?
-  probe_pid_namespace="$(run_bounded 10 docker exec "$java_container" \
-    readlink "/proc/$UNIX_SECURITY_NAMESPACE_PID/ns/pid")" || return $?
-  [[ -n "$java_pid_namespace" && "$java_pid_namespace" == "$probe_pid_namespace" ]] || {
+  if ! pid_namespace_status="$(capture_unix_security_pid_namespace_status \
+    "$java_container" "$UNIX_SECURITY_NAMESPACE_PID")"; then
+    log_error "Unix same-cgroup security probe did not present a shared private PID namespace"
+    return 1
+  fi
+  if ! assert_unix_security_pid_namespace_identity \
+    "$pid_namespace_status" "$UNIX_SECURITY_NAMESPACE_PID"; then
     log_error "Unix same-cgroup security probe did not share the Java PID namespace"
     return 1
-  }
+  fi
 
   java_cgroup="$(run_bounded 10 docker exec "$java_container" cat /proc/1/cgroup)" || return $?
   probe_cgroup="$(run_bounded 10 docker exec "$java_container" \
-    cat "/proc/$UNIX_SECURITY_NAMESPACE_PID/cgroup")" || return $?
+    cat "/proc/$UNIX_SECURITY_NAMESPACE_PID/cgroup" 2>/dev/null)" || return $?
   probe_status="$(run_bounded 10 docker exec "$java_container" \
-    cat "/proc/$UNIX_SECURITY_NAMESPACE_PID/status")" || return $?
+    cat "/proc/$UNIX_SECURITY_NAMESPACE_PID/status" 2>/dev/null)" || return $?
   assert_unix_security_cgroup_identity \
     "$java_cgroup" "$probe_cgroup" "$probe_status" || return $?
   {
     printf 'peer_user=65534:65534\n'
     printf 'cgroup_match=true\n'
     printf 'capability_free=true\n'
+    printf 'pid_namespace_shared=true\n'
+    printf 'pid_namespace_evidence=status-nspid-depth\n'
     awk '/^(Uid|Gid|CapEff):/ { print }' <<<"$probe_status"
   } >"$identity"
 
@@ -7835,10 +7933,11 @@ run_unix_same_cgroup_security_control() {
   # Expanded by the container shell, not this process.
   # shellcheck disable=SC2016
   run_bounded 10 docker exec "$java_container" /bin/sh -ec '
-    read -r name <"/proc/$1/comm"
+    set -eu
+    name="$(cat "/proc/$1/comm" 2>/dev/null)"
     [ "$name" = security-probe ]
     kill -USR1 "$1"
-  ' sh "$UNIX_SECURITY_NAMESPACE_PID" || return $?
+  ' sh "$UNIX_SECURITY_NAMESPACE_PID" 2>/dev/null || return $?
   if wait_for_background_process "$UNIX_SECURITY_EXEC_PID" 15; then
     probe_exit=0
   else

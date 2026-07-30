@@ -5665,6 +5665,100 @@ test_unix_security_identity_requires_same_cgroup_nonroot_capabilityfree() {
   fi
 }
 
+test_unix_security_pid_namespace_identity_requires_exact_single_layer() {
+  local valid_snapshot=""
+  local child_java_snapshot=""
+  local child_probe_snapshot=""
+  local invalid_java_pid_snapshot=""
+  local probe_pid_mismatch_snapshot=""
+  local missing_nspid_snapshot=""
+  local duplicate_nspid_snapshot=""
+  local malformed_nspid_snapshot=""
+  local missing_probe_nspid_snapshot=""
+  local duplicate_probe_nspid_snapshot=""
+  local malformed_probe_nspid_snapshot=""
+  local huge_pid_mismatch_snapshot=""
+  local output="$TEST_TMP_DIR/unix-security-pid-namespace.log"
+  local snapshot=""
+
+  printf -v valid_snapshot '%s\nPid:\t1\nNSpid:\t1\n%s\nPid:\t42\nNSpid:\t42\n' \
+    "$UNIX_SECURITY_STATUS_SEPARATOR" "$UNIX_SECURITY_STATUS_SEPARATOR"
+  assert_unix_security_pid_namespace_identity "$valid_snapshot" 42 >"$output" 2>&1
+  [[ ! -s "$output" ]] || {
+    printf 'Unix PID namespace identity validator emitted raw status data\n' >&2
+    return 1
+  }
+
+  printf -v child_java_snapshot '%s\nPid:\t1\nNSpid:\t1\t1\n%s\nPid:\t42\nNSpid:\t42\n' \
+    "$UNIX_SECURITY_STATUS_SEPARATOR" "$UNIX_SECURITY_STATUS_SEPARATOR"
+  printf -v child_probe_snapshot '%s\nPid:\t1\nNSpid:\t1\n%s\nPid:\t42\nNSpid:\t42\t7\n' \
+    "$UNIX_SECURITY_STATUS_SEPARATOR" "$UNIX_SECURITY_STATUS_SEPARATOR"
+  printf -v invalid_java_pid_snapshot '%s\nPid:\t7\nNSpid:\t1\n%s\nPid:\t42\nNSpid:\t42\n' \
+    "$UNIX_SECURITY_STATUS_SEPARATOR" "$UNIX_SECURITY_STATUS_SEPARATOR"
+  printf -v probe_pid_mismatch_snapshot '%s\nPid:\t1\nNSpid:\t1\n%s\nPid:\t7\nNSpid:\t7\n' \
+    "$UNIX_SECURITY_STATUS_SEPARATOR" "$UNIX_SECURITY_STATUS_SEPARATOR"
+  printf -v missing_nspid_snapshot '%s\nPid:\t1\n%s\nPid:\t42\nNSpid:\t42\n' \
+    "$UNIX_SECURITY_STATUS_SEPARATOR" "$UNIX_SECURITY_STATUS_SEPARATOR"
+  printf -v duplicate_nspid_snapshot '%s\nPid:\t1\nNSpid:\t1\nNSpid:\t1\n%s\nPid:\t42\nNSpid:\t42\n' \
+    "$UNIX_SECURITY_STATUS_SEPARATOR" "$UNIX_SECURITY_STATUS_SEPARATOR"
+  printf -v malformed_nspid_snapshot '%s\nPid:\t1\nNSpid:\tinvalid\n%s\nPid:\t42\nNSpid:\t42\n' \
+    "$UNIX_SECURITY_STATUS_SEPARATOR" "$UNIX_SECURITY_STATUS_SEPARATOR"
+  printf -v missing_probe_nspid_snapshot '%s\nPid:\t1\nNSpid:\t1\n%s\nPid:\t42\n' \
+    "$UNIX_SECURITY_STATUS_SEPARATOR" "$UNIX_SECURITY_STATUS_SEPARATOR"
+  printf -v duplicate_probe_nspid_snapshot '%s\nPid:\t1\nNSpid:\t1\n%s\nPid:\t42\nNSpid:\t42\nNSpid:\t42\n' \
+    "$UNIX_SECURITY_STATUS_SEPARATOR" "$UNIX_SECURITY_STATUS_SEPARATOR"
+  printf -v malformed_probe_nspid_snapshot '%s\nPid:\t1\nNSpid:\t1\n%s\nPid:\t42\nNSpid:\tinvalid\n' \
+    "$UNIX_SECURITY_STATUS_SEPARATOR" "$UNIX_SECURITY_STATUS_SEPARATOR"
+  printf -v huge_pid_mismatch_snapshot '%s\nPid:\t1\nNSpid:\t1\n%s\nPid:\t9007199254740992\nNSpid:\t9007199254740992\n' \
+    "$UNIX_SECURITY_STATUS_SEPARATOR" "$UNIX_SECURITY_STATUS_SEPARATOR"
+  for snapshot in \
+    "$child_java_snapshot" \
+    "$child_probe_snapshot" \
+    "$invalid_java_pid_snapshot" \
+    "$probe_pid_mismatch_snapshot" \
+    "$missing_nspid_snapshot" \
+    "$duplicate_nspid_snapshot" \
+    "$malformed_nspid_snapshot" \
+    "$missing_probe_nspid_snapshot" \
+    "$duplicate_probe_nspid_snapshot" \
+    "$malformed_probe_nspid_snapshot"; do
+    if assert_unix_security_pid_namespace_identity "$snapshot" 42 >/dev/null 2>&1; then
+      printf 'Unix PID namespace identity accepted an invalid status snapshot\n' >&2
+      return 1
+    fi
+  done
+  if assert_unix_security_pid_namespace_identity \
+    "$huge_pid_mismatch_snapshot" 9007199254740993 >/dev/null 2>&1; then
+    printf 'Unix PID namespace identity accepted an imprecise large PID match\n' >&2
+    return 1
+  fi
+  if assert_unix_security_pid_namespace_identity "$valid_snapshot" 1 >/dev/null 2>&1; then
+    printf 'Unix PID namespace identity accepted the Java live thread as an attacker PID\n' >&2
+    return 1
+  fi
+}
+
+test_unix_security_pid_namespace_capture_redacts_proc_races() {
+  local original_run_bounded=""
+  local output=""
+
+  original_run_bounded="$(declare -f run_bounded)"
+  run_bounded() {
+    printf 'cat: /proc/987654321/comm: No such file or directory\n' >&2
+    return 1
+  }
+  if output="$(capture_unix_security_pid_namespace_status java-container 42 2>&1)"; then
+    eval "$original_run_bounded"
+    printf 'Unix PID namespace capture unexpectedly succeeded after a proc race\n' >&2
+    return 1
+  fi
+  eval "$original_run_bounded"
+  [[ -z "$output" && "$output" != *987654321* ]] || {
+    printf 'Unix PID namespace capture leaked a proc-race identity\n' >&2
+    return 1
+  }
+}
+
 test_unix_sibling_security_options_require_exact_nnp() {
   local security_options=""
 
@@ -5737,6 +5831,7 @@ test_unix_security_controls_use_isolated_topology_windows() {
   local peer_controls=""
   local sibling_control=""
   local same_cgroup_control=""
+  local pid_namespace_capture=""
   local cleanup_control=""
   local sibling_topology=""
   local peer_start_line=""
@@ -5753,6 +5848,7 @@ test_unix_security_controls_use_isolated_topology_windows() {
   peer_controls="$(declare -f run_unix_peer_security_controls)"
   sibling_control="$(declare -f run_unix_sibling_security_control)"
   same_cgroup_control="$(declare -f run_unix_same_cgroup_security_control)"
+  pid_namespace_capture="$(declare -f capture_unix_security_pid_namespace_status)"
   cleanup_control="$(declare -f cleanup_security_processes)"
   sibling_topology="$(declare -f assert_unix_sibling_security_topology)"
 
@@ -5807,11 +5903,20 @@ test_unix_security_controls_use_isolated_topology_windows() {
     "$same_cgroup_control" == *'[ "$thread_name" = java ]'* && \
     "$same_cgroup_control" == *'--forged-tid "$5"'* && \
     "$same_cgroup_control" == *'"$UNIX_SECURITY_NAMESPACE_PID" != "$java_live_tid"'* && \
-    "$same_cgroup_control" == *'[ "$1" != 1 ]'* && \
-    "$same_cgroup_control" == *'[ "$name" = security-probe ]'* && \
-    "$same_cgroup_control" == *'/proc/1/ns/pid'* && \
-    "$same_cgroup_control" == *'/proc/$UNIX_SECURITY_NAMESPACE_PID/ns/pid'* && \
-    "$same_cgroup_control" == *'"$java_pid_namespace" == "$probe_pid_namespace"'* && \
+    "$same_cgroup_control" == *'capture_unix_security_pid_namespace_status'* && \
+    "$same_cgroup_control" == *'assert_unix_security_pid_namespace_identity'* && \
+    "$same_cgroup_control" == *'cat "/proc/$UNIX_SECURITY_NAMESPACE_PID/cgroup" 2> /dev/null'* && \
+    "$same_cgroup_control" == *'cat "/proc/$UNIX_SECURITY_NAMESPACE_PID/status" 2> /dev/null'* && \
+    "$pid_namespace_capture" == *'case "$1" in'* && \
+    "$pid_namespace_capture" == *'""|*[!0-9]*|0|1)'* && \
+    "$pid_namespace_capture" == *'[ "$probe_name" = security-probe ]'* && \
+    "$pid_namespace_capture" == *'cat "/proc/$1/comm" 2>/dev/null'* && \
+    "$pid_namespace_capture" == *'cat /proc/1/status 2>/dev/null'* && \
+    "$pid_namespace_capture" == *'cat "/proc/$1/status" 2>/dev/null'* && \
+    "$pid_namespace_capture" == *'2> /dev/null'* && \
+    "$same_cgroup_control" == *'pid_namespace_shared=true'* && \
+    "$same_cgroup_control" == *'pid_namespace_evidence=status-nspid-depth'* && \
+    "$same_cgroup_control" != *'/ns/pid'* && \
     "$same_cgroup_control" == *'assert_unix_security_cgroup_identity'* && \
     "$same_cgroup_control" == *'security-unix-same-cgroup-victim'* && \
     "$same_cgroup_control" == *'assert_unix_abuse_race_output "$output" true'* && \
@@ -11694,6 +11799,8 @@ main() {
   test_unix_security_quiescence_restores_policy
   test_background_process_polling_handles_proc_race_quietly
   test_unix_security_identity_requires_same_cgroup_nonroot_capabilityfree
+  test_unix_security_pid_namespace_identity_requires_exact_single_layer
+  test_unix_security_pid_namespace_capture_redacts_proc_races
   test_unix_sibling_security_options_require_exact_nnp
   test_unix_sibling_tmpfs_requires_empty_configuration
   test_unix_abuse_race_result_requires_every_case

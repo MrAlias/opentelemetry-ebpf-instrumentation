@@ -172,19 +172,64 @@ public class ThreadInfo {
     }
   }
 
+  /**
+   * Stages a descriptor only while the exact socket or connection lifecycle remains live.
+   *
+   * <p>The lifecycle is shared with queued task handoffs, so its invalidation makes every alias
+   * fail closed without changing ordinary detach-only cleanup semantics.
+   */
+  public static boolean setRemoteParentSocketFileDescriptor(
+      int socketFileDescriptor, RemoteParentSocketContext.Lifecycle lifecycle) {
+    if (socketFileDescriptor < 0 || lifecycle == null || !lifecycle.active()) {
+      remoteParentSocketContext.remove();
+      return false;
+    }
+    remoteParentSocketContext.set(new RemoteParentSocketContext(socketFileDescriptor, lifecycle));
+    return true;
+  }
+
   public static int remoteParentSocketFileDescriptor() {
     RemoteParentSocketContext context = remoteParentSocketContext.get();
     return context == null ? -1 : context.peek();
   }
 
   public static int takeRemoteParentSocketFileDescriptor() {
+    RemoteParentSocketContext context = takeRemoteParentSocketContext();
+    return context == null ? -1 : context.take();
+  }
+
+  /** Atomically detaches the current one-shot socket context for a native remote-parent lookup. */
+  public static RemoteParentSocketContext takeRemoteParentSocketContext() {
     RemoteParentSocketContext context = remoteParentSocketContext.get();
     remoteParentSocketContext.remove();
-    return context == null ? -1 : context.take();
+    return context;
   }
 
   public static void clearRemoteParentSocketFileDescriptor() {
     remoteParentSocketContext.remove();
+  }
+
+  /**
+   * Invalidates the shared lifecycle for a terminal receive path.
+   *
+   * <p>Unlike {@link #clearRemoteParentSocketFileDescriptor()}, this consumes ownership held by
+   * queued task aliases as well as the current thread.
+   */
+  public static void invalidateRemoteParentSocketFileDescriptor(Object lifecycle) {
+    if (lifecycle instanceof RemoteParentSocketContext.Lifecycle) {
+      ((RemoteParentSocketContext.Lifecycle) lifecycle).invalidate();
+      RemoteParentSocketContext current = remoteParentSocketContext.get();
+      if (current != null && current.hasLifecycle(lifecycle)) {
+        remoteParentSocketContext.remove();
+      }
+      return;
+    }
+
+    RemoteParentSocketContext current = remoteParentSocketContext.get();
+    remoteParentSocketContext.remove();
+    if (current != null) {
+      current.take();
+    }
   }
 
   public static boolean registerProcessIncarnation() {

@@ -21,23 +21,71 @@ public class ProxyInputStream extends InputStream {
 
   @Override
   public int read() throws IOException {
-    return delegate.read();
+    Object lifecycle = BootstrapNative.currentRemoteParentSocketLifecycle(socket);
+    int value;
+    try {
+      value = delegate.read();
+    } catch (IOException | RuntimeException | Error failure) {
+      invalidateRemoteParentSocketFileDescriptor(lifecycle);
+      throw failure;
+    }
+    if (value < 0) {
+      invalidateRemoteParentSocketFileDescriptor(lifecycle);
+      return value;
+    }
+
+    byte[] singleByte = {(byte) value};
+    try {
+      forwardRead(singleByte, 0, 1);
+    } catch (RuntimeException | Error failure) {
+      invalidateRemoteParentSocketFileDescriptor(lifecycle);
+      throw failure;
+    }
+    return value;
   }
 
   @Override
   public int read(byte[] b) throws IOException {
-    int len = delegate.read(b);
+    Object lifecycle = BootstrapNative.currentRemoteParentSocketLifecycle(socket);
+    int len;
+    try {
+      len = delegate.read(b);
+    } catch (IOException | RuntimeException | Error failure) {
+      invalidateRemoteParentSocketFileDescriptor(lifecycle);
+      throw failure;
+    }
     if (len > 0) {
-      forwardRead(b, 0, len);
+      try {
+        forwardRead(b, 0, len);
+      } catch (RuntimeException | Error failure) {
+        invalidateRemoteParentSocketFileDescriptor(lifecycle);
+        throw failure;
+      }
+    } else if (len < 0) {
+      invalidateRemoteParentSocketFileDescriptor(lifecycle);
     }
     return len;
   }
 
   @Override
   public int read(byte[] b, int off, int len) throws IOException {
-    int bytesRead = delegate.read(b, off, len);
+    Object lifecycle = BootstrapNative.currentRemoteParentSocketLifecycle(socket);
+    int bytesRead;
+    try {
+      bytesRead = delegate.read(b, off, len);
+    } catch (IOException | RuntimeException | Error failure) {
+      invalidateRemoteParentSocketFileDescriptor(lifecycle);
+      throw failure;
+    }
     if (bytesRead > 0) {
-      forwardRead(b, off, bytesRead);
+      try {
+        forwardRead(b, off, bytesRead);
+      } catch (RuntimeException | Error failure) {
+        invalidateRemoteParentSocketFileDescriptor(lifecycle);
+        throw failure;
+      }
+    } else if (bytesRead < 0) {
+      invalidateRemoteParentSocketFileDescriptor(lifecycle);
     }
     return bytesRead;
   }
@@ -55,6 +103,19 @@ public class ProxyInputStream extends InputStream {
 
   @Override
   public void close() throws IOException {
-    delegate.close();
+    Object lifecycle = BootstrapNative.beginRemoteParentSocketClose(socket);
+    try {
+      delegate.close();
+    } finally {
+      BootstrapNative.finishRemoteParentSocketClose(socket, lifecycle);
+    }
+  }
+
+  private void invalidateRemoteParentSocketFileDescriptor(Object lifecycle) {
+    if (socket != null) {
+      BootstrapNative.invalidateRemoteParentSocketFileDescriptor(socket, lifecycle);
+    } else {
+      BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+    }
   }
 }

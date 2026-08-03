@@ -19,12 +19,18 @@ public class CappedConcurrentHashMap<K, V> {
   private final ConcurrentHashMap<K, V> map = new ConcurrentHashMap<>();
   private final AtomicReferenceArray<K> ring;
   private final AtomicLong index = new AtomicLong();
+  private final EvictionListener<V> evictionListener;
 
   public CappedConcurrentHashMap(int capacity) {
+    this(capacity, null);
+  }
+
+  public CappedConcurrentHashMap(int capacity, EvictionListener<V> evictionListener) {
     if (capacity <= 0) {
       throw new IllegalArgumentException("capacity must be > 0");
     }
     this.ring = new AtomicReferenceArray<>(capacity);
+    this.evictionListener = evictionListener;
   }
 
   // Not using the JDK Math implementation because it's
@@ -85,7 +91,13 @@ public class CappedConcurrentHashMap<K, V> {
 
     K oldKey = ring.getAndSet(slot, key);
     if (oldKey != null && !oldKey.equals(key)) {
-      map.remove(oldKey);
+      V oldValue = map.get(oldKey);
+      if (oldValue != null && evictionListener != null) {
+        evictionListener.onEviction(oldValue);
+      }
+      if (oldValue != null) {
+        map.remove(oldKey, oldValue);
+      }
     }
   }
 
@@ -107,5 +119,10 @@ public class CappedConcurrentHashMap<K, V> {
 
   boolean containsKey(K key) {
     return map.containsKey(key);
+  }
+
+  /** Receives a value before its approximate-ring eviction removes its key. */
+  public interface EvictionListener<V> {
+    void onEviction(V value);
   }
 }

@@ -6,10 +6,13 @@
 package io.opentelemetry.obi.java.instrumentations.data;
 
 import io.opentelemetry.obi.java.ebpf.ThreadInfo;
+import io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext.Lifecycle;
 import io.opentelemetry.obi.java.instrumentations.util.CappedConcurrentHashMap;
 import io.opentelemetry.obi.java.instrumentations.util.NettyChannelExtractor;
+import java.lang.ref.WeakReference;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
 import java.util.IdentityHashMap;
@@ -36,7 +39,7 @@ public class SSLStorage {
   private static volatile boolean bootDebugOnLookupComplete;
   private static final AtomicBoolean nettyFailureLogged = new AtomicBoolean();
 
-  private static final int MAX_CONCURRENT = 10_000;
+  static final int MAX_CONCURRENT = 10_000;
   private static final int CHANNEL_LIFECYCLE_LOCK_STRIPES = 64;
   private static final int CHANNEL_LIFECYCLE_LOCK_MASK = CHANNEL_LIFECYCLE_LOCK_STRIPES - 1;
   private static final String NETTY_ABSTRACT_CHANNEL_CLASS_NAME =
@@ -60,8 +63,10 @@ public class SSLStorage {
       new WeakIdentityConcurrentMap<>(MAX_CONCURRENT);
   private static final WeakIdentityConcurrentMap<Object> nettyCloseHookLoaders =
       new WeakIdentityConcurrentMap<>(MAX_CONCURRENT);
+  private static final WeakIdentityConcurrentMap<Lifecycle> socketRemoteParentLifecycles =
+      new WeakIdentityConcurrentMap<>(MAX_CONCURRENT);
   private static final CappedConcurrentHashMap<ExactConnection, ConnectionOwner> activeConnections =
-      new CappedConcurrentHashMap<>(MAX_CONCURRENT);
+      new CappedConcurrentHashMap<>(MAX_CONCURRENT, new ActiveConnectionEvictionListener());
 
   private static final WeakIdentityTaskMap tasks = new WeakIdentityTaskMap(MAX_CONCURRENT);
   private static final ThreadLocal<IdentityHashMap<Object, Integer>> activeTaskSubmissions =
@@ -70,6 +75,7 @@ public class SSLStorage {
   private static final ThreadLocal<Integer> executorHookDepth = new ThreadLocal<>();
   private static final ThreadLocal<ArrayDeque<Boolean>> executorTaskScopes = new ThreadLocal<>();
   private static final ThreadLocal<Boolean> virtualThreadTaskScope = new ThreadLocal<>();
+  private static final ThreadLocal<Integer> remoteParentUnwrapDepth = new ThreadLocal<>();
   private static volatile LongSupplier threadIdProviderForTest;
   private static volatile LongSupplier tlsConnectionMarkerClockForTest;
   private static final Object NO_NETTY_CONNECTION = new Object();
@@ -181,6 +187,157 @@ public class SSLStorage {
 
     nettyConnection.set(new NettyConnectionScope(owner));
     return true;
+  }
+
+  /**
+   * Enters a TLS unwrap scope and returns whether this is the outermost instrumented overload.
+   *
+   * <p>JDK convenience overloads delegate to other {@code unwrap} overloads. Only the outermost
+   * advice may correlate or emit plaintext; nested advice must remain a no-op to avoid duplicate
+   * remote-parent staging.
+   */
+  public static boolean beginRemoteParentUnwrap() {
+    Integer depth = remoteParentUnwrapDepth.get();
+    if (depth == null) {
+      remoteParentUnwrapDepth.set(1);
+      return true;
+    }
+    remoteParentUnwrapDepth.set(depth + 1);
+    return false;
+  }
+
+  /** Balances {@link #beginRemoteParentUnwrap()} without retaining state on a reused worker. */
+  public static void endRemoteParentUnwrap() {
+    Integer depth = remoteParentUnwrapDepth.get();
+    if (depth == null || depth <= 1) {
+      remoteParentUnwrapDepth.remove();
+      return;
+    }
+    remoteParentUnwrapDepth.set(depth - 1);
+  }
+
+  static void clearRemoteParentUnwrapDepthForTest() {
+    remoteParentUnwrapDepth.remove();
+  }
+
+  /** Returns an existing lifecycle for a socket without allocating one on a terminal path. */
+  public static Object currentRemoteParentSocketLifecycle(Socket socket) {
+    Lifecycle lifecycle = socket == null ? null : socketRemoteParentLifecycles.get(socket);
+    return lifecycle != null && lifecycle.active() ? lifecycle : null;
+  }
+
+  /**
+   * Returns the live lifecycle for a socket receive, creating one only for an open socket.
+   *
+   * <p>The weak, capped owner map prevents a closed socket from being rebound to a reused numeric
+   * descriptor. Capacity exhaustion fails closed by returning {@code null}.
+   */
+  public static Object prepareRemoteParentSocketLifecycle(Socket socket) {
+    if (socket == null || socket.isClosed()) {
+      return null;
+    }
+
+    Lifecycle current = (Lifecycle) currentRemoteParentSocketLifecycle(socket);
+    if (current != null) {
+      return current;
+    }
+    if (socketRemoteParentLifecycles.get(socket) != null) {
+      return null;
+    }
+
+    Lifecycle candidate = new Lifecycle(socket);
+    if (socketRemoteParentLifecycles.putIfAbsent(socket, candidate)) {
+      return candidate;
+    }
+    return currentRemoteParentSocketLifecycle(socket);
+  }
+
+  /**
+   * Invalidates and removes a terminal socket lifecycle.
+   *
+   * <p>When an expected lifecycle is supplied, a delayed callback can revoke only its original
+   * socket generation and never a lifecycle created after a retry or descriptor reuse.
+   */
+  public static Object invalidateRemoteParentSocketLifecycle(Socket socket, Object expected) {
+    if (!(expected instanceof Lifecycle)) {
+      return null;
+    }
+
+    Lifecycle expectedLifecycle = (Lifecycle) expected;
+    if (socket == null) {
+      expectedLifecycle.invalidate();
+      return expectedLifecycle;
+    }
+
+    Lifecycle lifecycle = socketRemoteParentLifecycles.get(socket);
+    expectedLifecycle.invalidate();
+    if (lifecycle == expectedLifecycle) {
+      socketRemoteParentLifecycles.remove(socket, expectedLifecycle);
+    }
+    return expectedLifecycle;
+  }
+
+  /**
+   * Creates an inactive close tombstone so no concurrent receive can restage this socket before its
+   * close method completes.
+   */
+  public static Object beginRemoteParentSocketClose(Socket socket) {
+    if (socket == null) {
+      return null;
+    }
+
+    while (true) {
+      Lifecycle current = socketRemoteParentLifecycles.get(socket);
+      if (current != null && current.retainCloseTombstoneIfOpen()) {
+        return current;
+      }
+
+      Lifecycle tombstone = Lifecycle.newCloseTombstone();
+      if (current == null) {
+        if (socketRemoteParentLifecycles.putIfAbsent(socket, tombstone)) {
+          return tombstone;
+        }
+        // putIfAbsent also returns false when the capped weak map has no room. Do not spin in a
+        // close path in that case: another thread can be observed on the next get, while a still
+        // absent socket must fail locally without revoking an unrelated lifecycle.
+        if (socketRemoteParentLifecycles.get(socket) == null) {
+          return null;
+        }
+        continue;
+      }
+
+      current.invalidate();
+      if (socketRemoteParentLifecycles.replace(socket, current, tombstone)) {
+        return tombstone;
+      }
+    }
+  }
+
+  /** Removes the temporary close tombstone after the socket close method returns. */
+  public static void finishRemoteParentSocketClose(Socket socket, Object lifecycle) {
+    if (socket != null
+        && lifecycle instanceof Lifecycle
+        && ((Lifecycle) lifecycle).isCloseTombstone()
+        && ((Lifecycle) lifecycle).releaseCloseTombstone()) {
+      socketRemoteParentLifecycles.remove(socket, (Lifecycle) lifecycle);
+    }
+  }
+
+  /** Returns the exact active connection-owner lifecycle for an engine receive. */
+  public static Object remoteParentSocketLifecycle(Connection connection) {
+    ConnectionOwner owner =
+        connection == null ? null : asConnectionOwner(connection.getOwnerToken());
+    return isActive(owner) && owner.connection == connection && owner.remoteParentLifecycle.active()
+        ? owner.remoteParentLifecycle
+        : null;
+  }
+
+  /** Returns the exact active connection-owner lifecycle already associated with an engine. */
+  public static Object remoteParentSocketLifecycle(SSLEngine engine) {
+    ConnectionOwner owner = connectionOwnerForSession(engine);
+    return isActive(owner) && owner.remoteParentLifecycle.active()
+        ? owner.remoteParentLifecycle
+        : null;
   }
 
   public static Connection getConnectionForSession(SSLEngine session) {
@@ -579,7 +736,7 @@ public class SSLStorage {
             : null;
       }
 
-      ConnectionOwner owner = newChannelConnectionOwner(connection);
+      ConnectionOwner owner = newChannelConnectionOwner(channel, connection);
       if (owner == null || !isActive(owner)) {
         state.closed = true;
         return null;
@@ -607,6 +764,30 @@ public class SSLStorage {
     return associateConnectionWithChannel(channel, connection);
   }
 
+  /** Test-only owner association that exercises the same connection-generation path. */
+  static Connection associateConnectionWithPhysicalOwnerForTest(
+      Object physicalOwner, Connection connection) {
+    if (physicalOwner == null || connection == null || connection.getSocketFileDescriptor() < 0) {
+      return null;
+    }
+    ConnectionOwner owner = newChannelConnectionOwner(physicalOwner, connection);
+    return owner == null ? null : owner.connection;
+  }
+
+  static Object physicalOwnerForTest(Connection connection) {
+    ConnectionOwner owner =
+        connection == null ? null : asConnectionOwner(connection.getOwnerToken());
+    return owner == null || owner.connection != connection ? null : owner.physicalOwner.get();
+  }
+
+  static void clearPhysicalOwnerForTest(Connection connection) {
+    ConnectionOwner owner =
+        connection == null ? null : asConnectionOwner(connection.getOwnerToken());
+    if (owner != null && owner.connection == connection) {
+      owner.physicalOwner.clear();
+    }
+  }
+
   public static Connection getConnectionForSocketChannel(Object channel) {
     return getConnectionForChannel(channel);
   }
@@ -632,6 +813,33 @@ public class SSLStorage {
     if (connection != null && connection.getSocketFileDescriptor() >= 0) {
       cleanupConnectionOwnerFor(connection);
     }
+  }
+
+  /**
+   * Blocks new descriptor operations before a channel close whose terminal result is not yet known.
+   *
+   * <p>{@code SocketChannelImpl.tryClose()} may close its descriptor before returning its boolean
+   * result. The returned fence therefore must be finished from method exit on both normal and
+   * exceptional paths.
+   */
+  public static Object beginRemoteParentConnectionClose(Object channel, Connection connection) {
+    ConnectionOwner owner = connectionOwnerForClose(channel, connection);
+    return owner == null ? null : owner.remoteParentLifecycle.beginCloseFence();
+  }
+
+  /**
+   * Finishes a {@code SocketChannelImpl.tryClose()} fence and permanently retires its owner.
+   *
+   * <p>The JDK invokes {@code tryClose()} only after logical channel closure has started. A {@code
+   * false} result merely defers the physical descriptor close, so reopening correlation at that
+   * point could select a pre-closed or later-reused descriptor.
+   */
+  public static void finishRemoteParentConnectionClose(
+      Object channel, Connection connection, Object fence) {
+    if (fence instanceof Lifecycle.CloseFence) {
+      ((Lifecycle.CloseFence) fence).finish(true);
+    }
+    cleanupConnection(channel, connection);
   }
 
   public static void closeNettyChannel(Object channel) {
@@ -746,6 +954,36 @@ public class SSLStorage {
     }
   }
 
+  private static ConnectionOwner connectionOwnerForClose(Object channel, Connection connection) {
+    if (channel != null) {
+      synchronized (channelLifecycleLock(channel)) {
+        ChannelState state = channelStates.get(channel);
+        if (state == null || state.owner == null) {
+          return null;
+        }
+        if (state.owner != null) {
+          if (connection == null || sameExactConnection(state.owner.connection, connection)) {
+            // A concurrent close may have already raised closePending. It is still essential that
+            // this closer enters beginCloseFence(), which waits for any in-flight native lease
+            // before the JDK can pre-close or recycle the descriptor.
+            return isRegistered(state.owner) ? state.owner : null;
+          }
+          return null;
+        }
+      }
+    }
+
+    if (connection == null || connection.getSocketFileDescriptor() < 0) {
+      return null;
+    }
+    ConnectionOwner owner = asConnectionOwner(connection.getOwnerToken());
+    if (owner != null && owner.connection == connection) {
+      return isRegistered(owner) ? owner : null;
+    }
+    owner = activeConnections.get(new ExactConnection(connection));
+    return owner != null && isRegistered(owner) ? owner : null;
+  }
+
   private static void markChannelStateCapacityExhausted() {
     channelStateCapacityExhausted.set(true);
     if (channelStateCapacityLogged.compareAndSet(false, true)) {
@@ -757,40 +995,34 @@ public class SSLStorage {
 
   private static ConnectionOwner activeConnectionOwner(Connection connection) {
     ConnectionOwner knownOwner = asConnectionOwner(connection.getOwnerToken());
-    if (knownOwner != null) {
+    if (knownOwner != null && knownOwner.connection == connection) {
       return isActive(knownOwner) ? knownOwner : null;
     }
-
-    ExactConnection key = new ExactConnection(connection);
-    while (true) {
-      ConnectionOwner owner = activeConnections.get(key);
-      if (owner != null) {
-        connection.setOwnerToken(owner);
-        return isActive(owner) ? owner : null;
-      }
-      ConnectionOwner candidate = new ConnectionOwner(key);
-      owner = activeConnections.putIfAbsent(key, candidate);
-      if (owner != null) {
-        continue;
-      }
-      return isActive(candidate) ? candidate : null;
-    }
+    return null;
   }
 
-  private static ConnectionOwner newChannelConnectionOwner(Connection connection) {
+  private static ConnectionOwner newChannelConnectionOwner(Object channel, Connection connection) {
     ConnectionOwner knownOwner = asConnectionOwner(connection.getOwnerToken());
     if (knownOwner != null) {
-      return isActive(knownOwner) && knownOwner.connection == connection ? knownOwner : null;
+      if (knownOwner.connection == connection
+          && knownOwner.hasPhysicalOwner(channel)
+          && isActive(knownOwner)) {
+        return knownOwner;
+      }
+      cleanupConnectionOwner(knownOwner);
     }
 
     ExactConnection key = new ExactConnection(connection);
     while (true) {
       ConnectionOwner owner = activeConnections.get(key);
       if (owner != null) {
+        if (owner.connection == connection && owner.hasPhysicalOwner(channel) && isActive(owner)) {
+          return owner;
+        }
         cleanupConnectionOwner(owner);
         continue;
       }
-      ConnectionOwner candidate = new ConnectionOwner(key);
+      ConnectionOwner candidate = new ConnectionOwner(key, channel);
       owner = activeConnections.putIfAbsent(key, candidate);
       if (owner == null) {
         return isActive(candidate) ? candidate : null;
@@ -799,6 +1031,9 @@ public class SSLStorage {
   }
 
   private static void cleanupConnectionOwner(ConnectionOwner owner) {
+    if (owner != null) {
+      owner.remoteParentLifecycle.invalidate();
+    }
     if (owner != null && activeConnections.remove(owner.key, owner)) {
       owner.active = false;
     }
@@ -817,6 +1052,10 @@ public class SSLStorage {
   }
 
   private static boolean isActive(ConnectionOwner owner) {
+    return isRegistered(owner) && owner.remoteParentLifecycle.active();
+  }
+
+  private static boolean isRegistered(ConnectionOwner owner) {
     return owner != null && owner.active && activeConnections.get(owner.key) == owner;
   }
 
@@ -1377,15 +1616,36 @@ public class SSLStorage {
     }
   }
 
-  static final class ConnectionOwner {
+  static final class ConnectionOwner implements Lifecycle.ActiveCheck {
     private final ExactConnection key;
     private final Connection connection;
+    private final WeakReference<Object> physicalOwner;
+    private final Lifecycle remoteParentLifecycle;
     private volatile boolean active = true;
 
-    ConnectionOwner(ExactConnection key) {
+    ConnectionOwner(ExactConnection key, Object physicalOwner) {
       this.key = key;
       this.connection = key.connection;
+      this.physicalOwner = new WeakReference<Object>(physicalOwner);
       this.connection.setOwnerToken(this);
+      this.remoteParentLifecycle = new Lifecycle(this.physicalOwner, this);
+    }
+
+    boolean hasPhysicalOwner(Object candidate) {
+      return candidate != null && physicalOwner.get() == candidate;
+    }
+
+    @Override
+    public boolean active() {
+      return isRegistered(this);
+    }
+  }
+
+  static final class ActiveConnectionEvictionListener
+      implements CappedConcurrentHashMap.EvictionListener<ConnectionOwner> {
+    @Override
+    public void onEviction(ConnectionOwner owner) {
+      cleanupConnectionOwner(owner);
     }
   }
 

@@ -79,6 +79,91 @@ class ThreadInfoTest {
   }
 
   @Test
+  void terminalLifecycleInvalidatesACapturedSocketAcrossThreads() throws Exception {
+    enableRemoteParentWithNoopEmitter();
+    RemoteParentSocketContext.Lifecycle lifecycle = new RemoteParentSocketContext.Lifecycle();
+    ThreadInfo.setRemoteParentSocketFileDescriptor(71, lifecycle);
+    TaskContext context = ThreadInfo.captureTaskContext(101L);
+    ThreadInfo.clearRemoteParentSocketFileDescriptor();
+
+    Thread closer =
+        new Thread(() -> ThreadInfo.invalidateRemoteParentSocketFileDescriptor(lifecycle));
+    closer.start();
+    closer.join(TimeUnit.SECONDS.toMillis(5));
+
+    assertFalse(closer.isAlive());
+    assertEquals(-1, context.getRemoteParentSocketContext().peek());
+
+    AtomicInteger claimed = new AtomicInteger(Integer.MIN_VALUE);
+    Thread worker =
+        new Thread(
+            () -> {
+              boolean entered =
+                  ThreadInfo.enterTaskParentThreadContext(
+                      900L,
+                      context.getParentThreadId(),
+                      context.getHandoffToken(),
+                      context.getRemoteParentSocketContext());
+              try {
+                claimed.set(ThreadInfo.takeRemoteParentSocketFileDescriptor());
+              } finally {
+                if (entered) {
+                  ThreadInfo.restoreTaskParentThreadContext();
+                }
+              }
+            });
+    worker.start();
+    worker.join(TimeUnit.SECONDS.toMillis(5));
+
+    assertFalse(worker.isAlive());
+    assertEquals(-1, claimed.get());
+  }
+
+  @Test
+  void terminalLifecycleDoesNotInvalidateADifferentSocketOwnership() {
+    enableRemoteParentWithNoopEmitter();
+    RemoteParentSocketContext.Lifecycle live = new RemoteParentSocketContext.Lifecycle();
+    ThreadInfo.setRemoteParentSocketFileDescriptor(72, live);
+    TaskContext liveContext = ThreadInfo.captureTaskContext(101L);
+    ThreadInfo.clearRemoteParentSocketFileDescriptor();
+
+    RemoteParentSocketContext.Lifecycle terminal = new RemoteParentSocketContext.Lifecycle();
+    ThreadInfo.setRemoteParentSocketFileDescriptor(73, terminal);
+    ThreadInfo.invalidateRemoteParentSocketFileDescriptor(terminal);
+
+    assertEquals(72, liveContext.getRemoteParentSocketContext().peek());
+  }
+
+  @Test
+  void delayedOldLifecycleInvalidationDoesNotRevokeAReusedDescriptor() {
+    enableRemoteParentWithNoopEmitter();
+    RemoteParentSocketContext.Lifecycle oldLifecycle = new RemoteParentSocketContext.Lifecycle();
+    ThreadInfo.setRemoteParentSocketFileDescriptor(74, oldLifecycle);
+    TaskContext oldContext = ThreadInfo.captureTaskContext(101L);
+    ThreadInfo.clearRemoteParentSocketFileDescriptor();
+    ThreadInfo.invalidateRemoteParentSocketFileDescriptor(oldLifecycle);
+
+    RemoteParentSocketContext.Lifecycle freshLifecycle = new RemoteParentSocketContext.Lifecycle();
+    ThreadInfo.setRemoteParentSocketFileDescriptor(74, freshLifecycle);
+    TaskContext freshContext = ThreadInfo.captureTaskContext(102L);
+    ThreadInfo.clearRemoteParentSocketFileDescriptor();
+
+    ThreadInfo.invalidateRemoteParentSocketFileDescriptor(oldLifecycle);
+
+    assertEquals(-1, oldContext.getRemoteParentSocketContext().peek());
+    assertEquals(74, freshContext.getRemoteParentSocketContext().peek());
+  }
+
+  @Test
+  void stagingRejectsALifecycleInvalidatedDuringReceive() {
+    RemoteParentSocketContext.Lifecycle lifecycle = new RemoteParentSocketContext.Lifecycle();
+    lifecycle.invalidate();
+
+    assertFalse(ThreadInfo.setRemoteParentSocketFileDescriptor(75, lifecycle));
+    assertEquals(-1, ThreadInfo.remoteParentSocketFileDescriptor());
+  }
+
+  @Test
   void taskSocketDescriptorIsClaimedOnceAndNotRestored() {
     enableRemoteParentWithNoopEmitter();
     ThreadInfo.setRemoteParentSocketFileDescriptor(18);

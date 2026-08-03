@@ -52,6 +52,7 @@ public class Agent {
                   "io.opentelemetry.obi.java.instrumentations.data.Connection",
                   "io.opentelemetry.obi.java.instrumentations.data.SSLStorage",
                   "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$BufferHandoff",
+                  "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ActiveConnectionEvictionListener",
                   "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ChannelState",
                   "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ConnectionOwner",
                   "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ExactConnection",
@@ -59,6 +60,11 @@ public class Agent {
                   "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$NettyHandlerScope",
                   "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$TlsConnectionMarkerAttempt",
                   "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext",
+                  "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext$Lookup",
+                  "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext$Lifecycle",
+                  "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext$Lifecycle$ActiveCheck",
+                  "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext$Lifecycle$CloseFence",
+                  "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext$Lifecycle$Lease",
                   "io.opentelemetry.obi.java.instrumentations.data.TaskContext",
                   "io.opentelemetry.obi.java.instrumentations.data.WeakIdentityConcurrentMap",
                   "io.opentelemetry.obi.java.instrumentations.data.WeakIdentityConcurrentMap$IdentityWeakReference",
@@ -67,6 +73,7 @@ public class Agent {
                   "io.opentelemetry.obi.java.instrumentations.data.WeakIdentityTaskMap$Entry",
                   "io.opentelemetry.obi.java.instrumentations.util.ByteBufferExtractor",
                   "io.opentelemetry.obi.java.instrumentations.util.CappedConcurrentHashMap",
+                  "io.opentelemetry.obi.java.instrumentations.util.CappedConcurrentHashMap$EvictionListener",
                   "io.opentelemetry.obi.java.instrumentations.util.NettyChannelExtractor",
                   "io.opentelemetry.obi.java.bridge.RemoteParentStatus",
                   "io.opentelemetry.obi.java.bridge.RemoteParentDiagnostics",
@@ -79,6 +86,7 @@ public class Agent {
                   "io.opentelemetry.obi.java.bridge.RemoteParentTransportDiagnosticsV1",
                   "io.opentelemetry.obi.java.bridge.NativeRemoteParentProvider",
                   "io.opentelemetry.obi.java.bridge.NativeRemoteParentProvider$ProcessRegistrar",
+                  "io.opentelemetry.obi.java.bridge.NativeRemoteParentProvider$SocketCaller",
                   "io.opentelemetry.obi.java.bridge.NativeRemoteParentProvider$TransportConfigurer",
                   "io.opentelemetry.obi.java.bridge.RemoteParentBootstrap")));
 
@@ -195,8 +203,12 @@ public class Agent {
 
       nettyTransformer = NettySSLHandlerInst.install(inst);
       builder(opts, inst)
+          .type(safelyMatches(SSLSocketInst.inheritedSocketCloseType()))
+          .transform(SSLSocketInst.inheritedSocketCloseTransformer())
           .type(safelyMatches(SSLSocketInst.type()))
           .transform(SSLSocketInst.transformer())
+          .type(safelyMatches(SSLSocketInst.defaultSocketCloseType()))
+          .transform(SSLSocketInst.defaultSocketCloseTransformer())
           .type(safelyMatches(SSLSocketStreamInst.inputStreamType()))
           .transform(SSLSocketStreamInst.inputStreamTransformer())
           .type(safelyMatches(SSLSocketStreamInst.outputStreamType()))
@@ -261,7 +273,8 @@ public class Agent {
       if (clazz.getName().contains("$$Lambda$")) {
         continue;
       }
-      if (SSLSocketInst.matches(clazz)
+      if (SSLSocketInst.matchesInheritedSocketClose(clazz)
+          || SSLSocketInst.matches(clazz)
           || SSLSocketStreamInst.matchesInputStream(clazz)
           || SSLSocketStreamInst.matchesOutputStream(clazz)
           || SSLEngineInst.matches(clazz)

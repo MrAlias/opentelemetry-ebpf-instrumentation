@@ -222,17 +222,23 @@ holder with the generation-bound task token. Task entry masks any prior worker
 binding, task exit restores it, and take or discard atomically consumes the
 shared descriptor before transport readiness, buffer acquisition, or native
 lookup. Cancellation and rejection detach the task without invalidating a
-holder that another exact alias may still claim. This supports instrumented
-task ownership across a TLS-receive-to-extraction thread change without
-duplicating or retaining the application socket. Packaged-agent probes prove
-the task-scope mechanism; a framework-specific pre-extraction claim still
-requires retained privileged trace evidence.
+holder that another exact alias may still claim. Idle holders retain only weak
+socket ownership; a successful native operation temporarily holds a strong
+owner and a lifecycle lease from its final liveness check through the native
+call. A close first makes that lifecycle unavailable and waits for all such
+leases, including concurrent provisional channel closes, before its descriptor
+can be reused. This supports instrumented task ownership across a
+TLS-receive-to-extraction thread change without retaining the application
+socket beyond an in-flight native operation. Packaged-agent probes prove the
+task-scope mechanism; a framework-specific pre-extraction claim still requires
+retained privileged trace evidence.
 
 The descriptor is only a lookup handle. Socket-local negotiation and the exact
-task generation still authorize retrieval, so close or numeric descriptor
-reuse can cause a miss but cannot select a newer connection's parent. A
-framework handoff outside the instrumented task surfaces remains an explicit
-primary-transport miss and never falls back to a dummy socket or a
+task generation still authorize retrieval, and every normal native use of an
+application descriptor is covered by the same lease, so close or numeric
+descriptor reuse can cause a miss but cannot select a newer connection's
+parent. A framework handoff outside the instrumented task surfaces remains an
+explicit primary-transport miss and never falls back to a dummy socket or a
 connection-only guess.
 
 ## Rollout and evidence

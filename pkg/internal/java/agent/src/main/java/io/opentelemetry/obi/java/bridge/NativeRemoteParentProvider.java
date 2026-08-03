@@ -7,6 +7,7 @@ package io.opentelemetry.obi.java.bridge;
 
 import io.opentelemetry.obi.java.BootstrapNative;
 import io.opentelemetry.obi.java.ebpf.ThreadInfo;
+import io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.function.IntSupplier;
 import java.util.function.LongSupplier;
@@ -25,6 +26,7 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
   private final long serverUid;
   private final TransportConfigurer transportConfigurer;
   private final ProcessRegistrar processRegistrar;
+  private final SocketCaller socketCaller;
 
   private volatile int transportStatus;
   private volatile long transportConfiguration;
@@ -39,7 +41,8 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
         timeoutMillis,
         serverUid,
         NativeRemoteParentProvider::configureNativeTransport,
-        ThreadInfo::registerProcessIncarnation);
+        ThreadInfo::registerProcessIncarnation,
+        NativeRemoteParentProvider::callNative);
   }
 
   NativeRemoteParentProvider(
@@ -49,12 +52,31 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
       long serverUid,
       TransportConfigurer transportConfigurer,
       ProcessRegistrar processRegistrar) {
+    this(
+        transport,
+        unixSocketPath,
+        timeoutMillis,
+        serverUid,
+        transportConfigurer,
+        processRegistrar,
+        NativeRemoteParentProvider::callNative);
+  }
+
+  NativeRemoteParentProvider(
+      int transport,
+      String unixSocketPath,
+      int timeoutMillis,
+      long serverUid,
+      TransportConfigurer transportConfigurer,
+      ProcessRegistrar processRegistrar,
+      SocketCaller socketCaller) {
     this.transport = transport;
     this.unixSocketPath = unixSocketPath == null ? "" : unixSocketPath;
     this.timeoutMillis = timeoutMillis;
     this.serverUid = serverUid;
     this.transportConfigurer = transportConfigurer;
     this.processRegistrar = processRegistrar;
+    this.socketCaller = socketCaller;
     this.transportConfiguration = RemoteParentTransportConfiguration.unknown(transport);
     for (int i = 0; i < BUFFER_POOL_SIZE; i++) {
       buffers.set(i, new byte[RemoteParentRecord.RECORD_SIZE]);
@@ -91,18 +113,21 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
   }
 
   private RemoteParentRecord callAndClearSocket(boolean take) {
-    int socketFileDescriptor = ThreadInfo.takeRemoteParentSocketFileDescriptor();
+    RemoteParentSocketContext context = ThreadInfo.takeRemoteParentSocketContext();
     try {
       if (!ensureReady()) {
         return RemoteParentRecord.statusOnly(transportStatus);
       }
-      return call(take, socketFileDescriptor);
+      return call(take, context);
     } finally {
+      if (context != null) {
+        context.discard();
+      }
       ThreadInfo.clearRemoteParentSocketFileDescriptor();
     }
   }
 
-  private RemoteParentRecord call(boolean take, int socketFileDescriptor) {
+  private RemoteParentRecord call(boolean take, RemoteParentSocketContext context) {
     int start = ((int) Thread.currentThread().getId()) & (BUFFER_POOL_SIZE - 1);
     for (int i = 0; i < BUFFER_POOL_SIZE; i++) {
       int slot = (start + i) & (BUFFER_POOL_SIZE - 1);
@@ -111,12 +136,7 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
         continue;
       }
       try {
-        int status;
-        if (take) {
-          status = BootstrapNative.takeRemoteParent(socketFileDescriptor, response);
-        } else {
-          status = BootstrapNative.discardRemoteParent(socketFileDescriptor, response);
-        }
+        int status = callNative(take, context, response);
         RemoteParentRecord record = recordFromNativeResponse(status, response);
         if (requiresReconfiguration(record.getStatus())) {
           markUnavailable(record.getStatus());
@@ -130,6 +150,37 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
       }
     }
     return RemoteParentRecord.statusOnly(RemoteParentStatus.OVERLOAD);
+  }
+
+  private int callNative(boolean take, RemoteParentSocketContext context, byte[] response) {
+    RemoteParentSocketContext.Lookup lookup = null;
+    try {
+      if (context != null) {
+        lookup = context.takeForRemoteParentLookup();
+        if (lookup == null) {
+          return RemoteParentStatus.MISSING;
+        }
+      }
+      return socketCaller.call(
+          take,
+          usesPrimarySocketLookup() && lookup != null ? lookup.socketFileDescriptor() : -1,
+          response);
+    } finally {
+      if (lookup != null) {
+        lookup.close();
+      }
+    }
+  }
+
+  private boolean usesPrimarySocketLookup() {
+    return RemoteParentTransportConfiguration.selected(transportConfiguration)
+        == RemoteParentTransport.GETSOCKOPT;
+  }
+
+  private static int callNative(boolean take, int socketFileDescriptor, byte[] response) {
+    return take
+        ? BootstrapNative.takeRemoteParent(socketFileDescriptor, response)
+        : BootstrapNative.discardRemoteParent(socketFileDescriptor, response);
   }
 
   static RemoteParentRecord recordFromNativeResponse(int status, byte[] response) {
@@ -292,5 +343,10 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
 
   interface ProcessRegistrar {
     boolean register();
+  }
+
+  @FunctionalInterface
+  interface SocketCaller {
+    int call(boolean take, int socketFileDescriptor, byte[] response);
   }
 }

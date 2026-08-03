@@ -7,19 +7,24 @@ package io.opentelemetry.obi.java.instrumentations.data;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import io.opentelemetry.obi.java.BootstrapNative;
 import io.opentelemetry.obi.java.ebpf.ThreadInfo;
 import io.opentelemetry.obi.java.instrumentations.BlockingQueueInst;
 import io.opentelemetry.obi.java.instrumentations.FutureInst;
 import io.opentelemetry.obi.java.instrumentations.JavaExecutorInst;
 import io.opentelemetry.obi.java.instrumentations.RunnableInst;
 import io.opentelemetry.obi.java.instrumentations.SSLEngineInst;
+import io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext.Lifecycle;
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.lang.reflect.Proxy;
 import java.net.InetAddress;
+import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -32,6 +37,7 @@ import java.util.concurrent.FutureTask;
 import java.util.concurrent.RejectedExecutionHandler;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLEngineResult;
 import javax.net.ssl.SSLException;
@@ -40,6 +46,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 class SSLStorageTest {
+  private final List<Connection> ownedConnections = new ArrayList<>();
+  private final List<Object> physicalOwners = new ArrayList<>();
 
   static class DummySSLEngine extends SSLEngine {
     private final SSLSession session;
@@ -216,21 +224,404 @@ class SSLStorageTest {
     SSLStorage.nettyConnection.remove();
     SSLStorage.setThreadIdProviderForTest(null);
     SSLStorage.setTlsConnectionMarkerClockForTest(null);
+    SSLStorage.clearRemoteParentUnwrapDepthForTest();
     ThreadInfo.setRemoteParentEnabled(false);
+    ThreadInfo.clearRemoteParentSocketFileDescriptor();
+    for (Connection connection : ownedConnections) {
+      SSLStorage.cleanupConnection(connection);
+    }
+    ownedConnections.clear();
+    physicalOwners.clear();
   }
 
   @Test
   void testSessionConnectionMapping() throws Exception {
     SSLEngine engine = new DummySSLEngine();
     Connection conn =
-        new Connection(
-            InetAddress.getByName("127.0.0.1"), 1234, InetAddress.getByName("1.2.3.4"), 5678, 6);
+        own(
+            new Connection(
+                InetAddress.getByName("127.0.0.1"),
+                1234,
+                InetAddress.getByName("1.2.3.4"),
+                5678,
+                6));
 
     assertNull(SSLStorage.getConnectionForSession(engine));
     SSLStorage.setConnectionForSession(engine, conn);
     assertEquals(conn, SSLStorage.getConnectionForSession(engine));
     SSLStorage.cleanupConnection(conn);
     assertNull(SSLStorage.getConnectionForSession(engine));
+  }
+
+  @Test
+  void unassociatedDescriptorConnectionCannotStageCorrelationOrEmit() throws Exception {
+    SSLEngine engine = new DummySSLEngine();
+    Connection connection = rawConnection(1235, 5679, 80);
+    ByteBuffer buffer = ByteBuffer.allocate(8);
+
+    SSLStorage.setConnectionForSession(engine, connection);
+    SSLStorage.setConnectionForReadBuffer(buffer, connection);
+
+    assertNull(SSLStorage.getConnectionForSession(engine));
+    assertNull(SSLStorage.getConnectionForReadBuffer(buffer));
+    assertNull(SSLStorage.remoteParentSocketLifecycle(connection));
+    assertEquals(-1, BootstrapNative.emitData(connection, 1L, false));
+  }
+
+  @Test
+  void clearedPhysicalOwnerFailsClosedBeforeLookupOrNativeEmission() throws Exception {
+    Connection connection = connection(1236, 5680, 81);
+    Object physicalOwner = SSLStorage.physicalOwnerForTest(connection);
+    assertNotNull(physicalOwner);
+    Lifecycle lifecycle = (Lifecycle) SSLStorage.remoteParentSocketLifecycle(connection);
+    assertNotNull(lifecycle);
+    Lifecycle.Lease lease = lifecycle.acquireLookupLease();
+    assertNotNull(lease);
+    assertSame(physicalOwner, lease.retainedOwnerForTest());
+    lease.close();
+    RemoteParentSocketContext context =
+        new RemoteParentSocketContext(connection.getSocketFileDescriptor(), lifecycle);
+
+    SSLStorage.clearPhysicalOwnerForTest(connection);
+
+    assertNull(SSLStorage.remoteParentSocketLifecycle(connection));
+    assertEquals(-1, context.peek());
+    assertNull(context.takeForRemoteParentLookup());
+    assertEquals(-1, BootstrapNative.emitData(connection, 1L, false));
+  }
+
+  @Test
+  void scalarUnwrapThrowableInvalidatesItsExactOwnerLifecycle() throws Exception {
+    SSLEngine engine = new DummySSLEngine(new byte[] {1});
+    Connection connection = connection(1235, 5679, 81);
+    SSLStorage.setConnectionForSession(engine, connection);
+    RemoteParentSocketContext.Lifecycle lifecycle =
+        (RemoteParentSocketContext.Lifecycle) SSLStorage.remoteParentSocketLifecycle(connection);
+    assertTrue(
+        ThreadInfo.setRemoteParentSocketFileDescriptor(
+            connection.getSocketFileDescriptor(), lifecycle));
+    RemoteParentSocketContext alias =
+        new RemoteParentSocketContext(connection.getSocketFileDescriptor(), lifecycle);
+    ByteBuffer source = ByteBuffer.allocate(1);
+    ByteBuffer destination = ByteBuffer.allocate(1);
+    Object[] saved = SSLEngineInst.UnwrapAdvice.unwrap(engine, source, destination);
+
+    SSLEngineInst.UnwrapAdvice.unwrap(
+        engine, saved, source, destination, null, new SSLException("expected unwrap failure"));
+
+    assertEquals(-1, ThreadInfo.remoteParentSocketFileDescriptor());
+    assertEquals(-1, alias.peek());
+    SSLStorage.cleanupConnection(connection);
+  }
+
+  @Test
+  void arrayUnwrapThrowableInvalidatesItsExactOwnerLifecycle() throws Exception {
+    SSLEngine engine = new DummySSLEngine(new byte[] {1});
+    Connection connection = connection(1236, 5680, 82);
+    SSLStorage.setConnectionForSession(engine, connection);
+    RemoteParentSocketContext.Lifecycle lifecycle =
+        (RemoteParentSocketContext.Lifecycle) SSLStorage.remoteParentSocketLifecycle(connection);
+    assertTrue(
+        ThreadInfo.setRemoteParentSocketFileDescriptor(
+            connection.getSocketFileDescriptor(), lifecycle));
+    RemoteParentSocketContext alias =
+        new RemoteParentSocketContext(connection.getSocketFileDescriptor(), lifecycle);
+    ByteBuffer source = ByteBuffer.allocate(1);
+    ByteBuffer[] destinations = {ByteBuffer.allocate(1)};
+    Object[] saved = SSLEngineInst.UnwrapAdviceArray.unwrap(engine, source, destinations);
+
+    SSLEngineInst.UnwrapAdviceArray.unwrap(
+        engine, saved, source, destinations, null, new SSLException("expected unwrap failure"));
+
+    assertEquals(-1, ThreadInfo.remoteParentSocketFileDescriptor());
+    assertEquals(-1, alias.peek());
+    SSLStorage.cleanupConnection(connection);
+  }
+
+  @Test
+  void rangedUnwrapThrowableInvalidatesItsExactOwnerLifecycle() throws Exception {
+    SSLEngine engine = new DummySSLEngine(new byte[] {1});
+    Connection connection = connection(1237, 5681, 83);
+    SSLStorage.setConnectionForSession(engine, connection);
+    RemoteParentSocketContext.Lifecycle lifecycle =
+        (RemoteParentSocketContext.Lifecycle) SSLStorage.remoteParentSocketLifecycle(connection);
+    assertTrue(
+        ThreadInfo.setRemoteParentSocketFileDescriptor(
+            connection.getSocketFileDescriptor(), lifecycle));
+    RemoteParentSocketContext alias =
+        new RemoteParentSocketContext(connection.getSocketFileDescriptor(), lifecycle);
+    ByteBuffer source = ByteBuffer.allocate(1);
+    ByteBuffer[] destinations = {ByteBuffer.allocate(1)};
+    Object[] saved =
+        SSLEngineInst.UnwrapAdviceArrayOffset.unwrap(engine, source, destinations, 0, 1);
+
+    SSLEngineInst.UnwrapAdviceArrayOffset.unwrap(
+        engine,
+        saved,
+        source,
+        destinations,
+        0,
+        1,
+        null,
+        new SSLException("expected unwrap failure"));
+
+    assertEquals(-1, ThreadInfo.remoteParentSocketFileDescriptor());
+    assertEquals(-1, alias.peek());
+    SSLStorage.cleanupConnection(connection);
+  }
+
+  @Test
+  void malformedScalarUnwrapEntryCannotInvalidateANewerEngineLifecycle() throws Exception {
+    SSLEngine engine = new DummySSLEngine(new byte[] {1});
+    Connection stale = connection(1238, 5682, 84);
+    SSLStorage.setConnectionForSession(engine, stale);
+    Lifecycle staleLifecycle = (Lifecycle) SSLStorage.remoteParentSocketLifecycle(stale);
+    assertNotNull(staleLifecycle);
+    SSLStorage.cleanupConnection(stale);
+
+    Connection current = connection(1239, 5683, 85);
+    SSLStorage.setConnectionForSession(engine, current);
+    Lifecycle currentLifecycle = (Lifecycle) SSLStorage.remoteParentSocketLifecycle(current);
+    assertNotNull(currentLifecycle);
+    assertTrue(
+        ThreadInfo.setRemoteParentSocketFileDescriptor(
+            current.getSocketFileDescriptor(), currentLifecycle));
+    RemoteParentSocketContext alias =
+        new RemoteParentSocketContext(current.getSocketFileDescriptor(), currentLifecycle);
+    Object[] malformed = {null, null, null, null, null, staleLifecycle, true};
+
+    SSLEngineInst.UnwrapAdvice.unwrap(
+        engine, malformed, ByteBuffer.allocate(1), ByteBuffer.allocate(1), null, null);
+
+    assertSame(current, SSLStorage.getConnectionForSession(engine));
+    assertEquals(current.getSocketFileDescriptor(), ThreadInfo.remoteParentSocketFileDescriptor());
+    assertEquals(current.getSocketFileDescriptor(), alias.peek());
+    SSLStorage.cleanupConnection(current);
+  }
+
+  @Test
+  void malformedArrayUnwrapEntryStillInvalidatesTheLifecycleCapturedFromItsEngine()
+      throws Exception {
+    SSLEngine engine = new DummySSLEngine(new byte[] {1});
+    Connection connection = connection(1237, 5681, 87);
+    SSLStorage.setConnectionForSession(engine, connection);
+    RemoteParentSocketContext.Lifecycle lifecycle =
+        (RemoteParentSocketContext.Lifecycle) SSLStorage.remoteParentSocketLifecycle(connection);
+    assertTrue(
+        ThreadInfo.setRemoteParentSocketFileDescriptor(
+            connection.getSocketFileDescriptor(), lifecycle));
+    RemoteParentSocketContext alias =
+        new RemoteParentSocketContext(connection.getSocketFileDescriptor(), lifecycle);
+    ByteBuffer source = ByteBuffer.allocate(1);
+    Object[] saved = SSLEngineInst.UnwrapAdviceArray.unwrap(engine, source, null);
+
+    SSLEngineInst.UnwrapAdviceArray.unwrap(engine, saved, source, null, null, null);
+
+    assertEquals(-1, ThreadInfo.remoteParentSocketFileDescriptor());
+    assertEquals(-1, alias.peek());
+    SSLStorage.cleanupConnection(connection);
+  }
+
+  @Test
+  void malformedRangedUnwrapEntryStillInvalidatesTheLifecycleCapturedFromItsEngine()
+      throws Exception {
+    SSLEngine engine = new DummySSLEngine(new byte[] {1});
+    Connection connection = connection(1238, 5682, 88);
+    SSLStorage.setConnectionForSession(engine, connection);
+    RemoteParentSocketContext.Lifecycle lifecycle =
+        (RemoteParentSocketContext.Lifecycle) SSLStorage.remoteParentSocketLifecycle(connection);
+    assertTrue(
+        ThreadInfo.setRemoteParentSocketFileDescriptor(
+            connection.getSocketFileDescriptor(), lifecycle));
+    RemoteParentSocketContext alias =
+        new RemoteParentSocketContext(connection.getSocketFileDescriptor(), lifecycle);
+    ByteBuffer source = ByteBuffer.allocate(1);
+    ByteBuffer[] destinations = {ByteBuffer.allocate(1)};
+    Object[] saved =
+        SSLEngineInst.UnwrapAdviceArrayOffset.unwrap(engine, source, destinations, -1, 0);
+
+    SSLEngineInst.UnwrapAdviceArrayOffset.unwrap(
+        engine, saved, source, destinations, -1, 0, null, null);
+
+    assertEquals(-1, ThreadInfo.remoteParentSocketFileDescriptor());
+    assertEquals(-1, alias.peek());
+    SSLStorage.cleanupConnection(connection);
+  }
+
+  @Test
+  void underflowPreservesTheExactOwnerLifecycle() throws Exception {
+    SSLEngine engine = new DummySSLEngine(new byte[] {1});
+    Connection connection = connection(1238, 5682, 84);
+    SSLStorage.setConnectionForSession(engine, connection);
+    RemoteParentSocketContext.Lifecycle lifecycle =
+        (RemoteParentSocketContext.Lifecycle) SSLStorage.remoteParentSocketLifecycle(connection);
+    assertTrue(
+        ThreadInfo.setRemoteParentSocketFileDescriptor(
+            connection.getSocketFileDescriptor(), lifecycle));
+    RemoteParentSocketContext alias =
+        new RemoteParentSocketContext(connection.getSocketFileDescriptor(), lifecycle);
+    ByteBuffer source = ByteBuffer.allocate(1);
+    ByteBuffer destination = ByteBuffer.allocate(1);
+    Object[] saved = SSLEngineInst.UnwrapAdvice.unwrap(engine, source, destination);
+
+    SSLEngineInst.UnwrapAdvice.unwrap(
+        engine,
+        saved,
+        source,
+        destination,
+        new SSLEngineResult(
+            SSLEngineResult.Status.BUFFER_UNDERFLOW,
+            SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING,
+            0,
+            0),
+        null);
+
+    assertEquals(
+        connection.getSocketFileDescriptor(), ThreadInfo.remoteParentSocketFileDescriptor());
+    assertEquals(connection.getSocketFileDescriptor(), alias.peek());
+    SSLStorage.cleanupConnection(connection);
+  }
+
+  @Test
+  void closeInboundAndOwnerCleanupInvalidateTheExactOwnerLifecycle() throws Exception {
+    SSLEngine engine = new DummySSLEngine(new byte[] {1});
+    Connection first = connection(1239, 5683, 85);
+    SSLStorage.setConnectionForSession(engine, first);
+    RemoteParentSocketContext.Lifecycle firstLifecycle =
+        (RemoteParentSocketContext.Lifecycle) SSLStorage.remoteParentSocketLifecycle(first);
+    RemoteParentSocketContext firstAlias =
+        new RemoteParentSocketContext(first.getSocketFileDescriptor(), firstLifecycle);
+
+    SSLEngineInst.CloseInboundAdvice.closeInbound(engine);
+
+    assertEquals(-1, firstAlias.peek());
+    assertNull(SSLStorage.remoteParentSocketLifecycle(engine));
+    assertNull(SSLStorage.remoteParentSocketLifecycle(first));
+    SSLStorage.cleanupConnection(first);
+
+    SSLEngine second = new DummySSLEngine(new byte[] {2});
+    Connection secondConnection = connection(1240, 5684, 86);
+    SSLStorage.setConnectionForSession(second, secondConnection);
+    RemoteParentSocketContext.Lifecycle secondLifecycle =
+        (RemoteParentSocketContext.Lifecycle)
+            SSLStorage.remoteParentSocketLifecycle(secondConnection);
+    RemoteParentSocketContext secondAlias =
+        new RemoteParentSocketContext(secondConnection.getSocketFileDescriptor(), secondLifecycle);
+
+    SSLStorage.cleanupConnection(secondConnection);
+
+    assertEquals(-1, secondAlias.peek());
+  }
+
+  @Test
+  void activeConnectionCapacityEvictionWaitsForAndInvalidatesAStagedAlias() throws Exception {
+    SSLEngine engine = new DummySSLEngine(new byte[] {9});
+    Connection first = connection(32_000, 42_000, 500_000);
+    SSLStorage.setConnectionForSession(engine, first);
+    RemoteParentSocketContext.Lifecycle lifecycle =
+        (RemoteParentSocketContext.Lifecycle) SSLStorage.remoteParentSocketLifecycle(first);
+    assertNotNull(lifecycle);
+    RemoteParentSocketContext alias =
+        new RemoteParentSocketContext(first.getSocketFileDescriptor(), lifecycle);
+    assertTrue(
+        ThreadInfo.setRemoteParentSocketFileDescriptor(first.getSocketFileDescriptor(), lifecycle));
+    RemoteParentSocketContext.Lifecycle.Lease lease = lifecycle.acquireLookupLease();
+    assertNotNull(lease);
+
+    Connection[] connections = new Connection[SSLStorage.MAX_CONCURRENT];
+    CountDownLatch evictionFinished = new CountDownLatch(1);
+    java.util.concurrent.atomic.AtomicReference<Throwable> failure =
+        new java.util.concurrent.atomic.AtomicReference<>();
+    Thread evictor =
+        new Thread(
+            () -> {
+              try {
+                for (int i = 0; i < SSLStorage.MAX_CONCURRENT; i++) {
+                  Connection candidate = connection(32_001, 42_001, 600_000 + i);
+                  connections[i] = candidate;
+                  SSLStorage.setConnectionForSession(engine, candidate);
+                }
+              } catch (Throwable thrown) {
+                failure.compareAndSet(null, thrown);
+              } finally {
+                evictionFinished.countDown();
+              }
+            });
+    evictor.start();
+
+    try {
+      assertTrue(waitForInactive(lifecycle));
+      assertFalse(evictionFinished.await(250, java.util.concurrent.TimeUnit.MILLISECONDS));
+      assertEquals(-1, alias.peek());
+      assertEquals(-1, ThreadInfo.remoteParentSocketFileDescriptor());
+      assertEquals(-1, ThreadInfo.takeRemoteParentSocketFileDescriptor());
+    } finally {
+      lease.close();
+      assertTrue(evictionFinished.await(5, java.util.concurrent.TimeUnit.SECONDS));
+      for (int i = 0; i < connections.length; i++) {
+        if (connections[i] != null) {
+          SSLStorage.cleanupConnection(connections[i]);
+        }
+      }
+      SSLStorage.cleanupConnection(first);
+    }
+    assertNull(failure.get());
+    assertEquals(-1, alias.take());
+  }
+
+  @Test
+  void socketCloseCapacityExhaustionReturnsWithoutSpinningOrRetainingThreadState()
+      throws Exception {
+    List<Socket> trackedSockets = new ArrayList<>();
+    Socket rejectedSocket = null;
+    try {
+      // Fill whatever capacity remains in the shared weak map, including any live socket
+      // lifecycles retained by a preceding test worker.
+      for (int i = 0; i <= SSLStorage.MAX_CONCURRENT; i++) {
+        Socket candidate = new Socket();
+        if (SSLStorage.prepareRemoteParentSocketLifecycle(candidate) == null) {
+          rejectedSocket = candidate;
+          break;
+        }
+        trackedSockets.add(candidate);
+      }
+      assertNotNull(rejectedSocket);
+
+      AtomicReference<Object> closeLifecycle = new AtomicReference<>();
+      AtomicReference<Integer> remainingDescriptor = new AtomicReference<>();
+      AtomicReference<Throwable> failure = new AtomicReference<>();
+      Socket closeTarget = rejectedSocket;
+      Thread closer =
+          new Thread(
+              () -> {
+                try {
+                  ThreadInfo.setRemoteParentSocketFileDescriptor(60);
+                  closeLifecycle.set(BootstrapNative.beginRemoteParentSocketClose(closeTarget));
+                  remainingDescriptor.set(ThreadInfo.remoteParentSocketFileDescriptor());
+                } catch (Throwable thrown) {
+                  failure.set(thrown);
+                }
+              },
+              "socket-close-capacity-test");
+      // A regression must fail the test instead of leaving a non-daemon test worker spinning.
+      closer.setDaemon(true);
+      closer.start();
+      closer.join(1_000);
+
+      assertFalse(closer.isAlive());
+      assertNull(failure.get());
+      assertNull(closeLifecycle.get());
+      assertEquals(-1, remainingDescriptor.get());
+    } finally {
+      if (rejectedSocket != null) {
+        rejectedSocket.close();
+      }
+      for (Socket socket : trackedSockets) {
+        SSLStorage.invalidateRemoteParentSocketLifecycle(
+            socket, SSLStorage.currentRemoteParentSocketLifecycle(socket));
+        socket.close();
+      }
+    }
   }
 
   @Test
@@ -262,8 +653,9 @@ class SSLStorageTest {
     AtomicLong now = new AtomicLong(100L);
     SSLStorage.setTlsConnectionMarkerClockForTest(now::get);
     Connection first =
-        new Connection(
-            InetAddress.getLoopbackAddress(), 1234, InetAddress.getLoopbackAddress(), 5678, 7);
+        own(
+            new Connection(
+                InetAddress.getLoopbackAddress(), 1234, InetAddress.getLoopbackAddress(), 5678, 7));
 
     assertFalse(SSLStorage.claimTlsConnectionMarkerAttempt(null, first, 11));
     assertFalse(SSLStorage.claimTlsConnectionMarkerAttempt(engine, null, 11));
@@ -298,14 +690,17 @@ class SSLStorageTest {
     AtomicLong now = new AtomicLong(100L);
     SSLStorage.setTlsConnectionMarkerClockForTest(now::get);
     Connection first =
-        new Connection(
-            InetAddress.getLoopbackAddress(), 1234, InetAddress.getLoopbackAddress(), 5678, 7);
+        own(
+            new Connection(
+                InetAddress.getLoopbackAddress(), 1234, InetAddress.getLoopbackAddress(), 5678, 7));
     Connection changedDescriptor =
-        new Connection(
-            InetAddress.getLoopbackAddress(), 1234, InetAddress.getLoopbackAddress(), 5678, 8);
+        own(
+            new Connection(
+                InetAddress.getLoopbackAddress(), 1234, InetAddress.getLoopbackAddress(), 5678, 8));
     Connection changedTuple =
-        new Connection(
-            InetAddress.getLoopbackAddress(), 1235, InetAddress.getLoopbackAddress(), 5678, 8);
+        own(
+            new Connection(
+                InetAddress.getLoopbackAddress(), 1235, InetAddress.getLoopbackAddress(), 5678, 8));
 
     exhaustTlsConnectionMarkerBurst(engine, first, 11);
     assertFalse(SSLStorage.claimTlsConnectionMarkerAttempt(engine, first, 11));
@@ -456,7 +851,8 @@ class SSLStorageTest {
         source,
         destination,
         new SSLEngineResult(
-            SSLEngineResult.Status.OK, SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING, 1, 1));
+            SSLEngineResult.Status.OK, SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING, 1, 1),
+        null);
 
     assertSame(first, SSLStorage.getConnectionForSession(engine));
     SSLStorage.cleanupConnection(first);
@@ -467,7 +863,7 @@ class SSLStorageTest {
   void sameExactReplacementScopedConnectionAtExitFailsClosed() throws Exception {
     SSLEngine engine = new DummySSLEngine(new byte[] {1});
     Connection first = connection(2484, 6928, 36);
-    Connection replacement = connection(2484, 6928, 36);
+    Connection replacement = rawConnection(2484, 6928, 36);
     ByteBuffer source = ByteBuffer.allocate(8);
     installNettyScope(first);
     Connection expected = SSLStorage.resolveConnectionForUnwrap(engine, null);
@@ -555,7 +951,8 @@ class SSLStorageTest {
         source,
         destination,
         new SSLEngineResult(
-            SSLEngineResult.Status.OK, SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING, 1, 1));
+            SSLEngineResult.Status.OK, SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING, 1, 1),
+        null);
 
     assertNull(SSLStorage.getConnectionForSession(engine));
     assertSame(readOwner, SSLStorage.getConnectionForReadBuffer(source));
@@ -1142,11 +1539,11 @@ class SSLStorageTest {
 
   @Test
   void nonterminalSocketChannelCleanupPreservesTheOpenConnection() throws Exception {
-    Connection first = connection(9436, 4880, 31);
+    Connection first = rawConnection(9436, 4880, 31);
     DummySSLEngine engine = new DummySSLEngine(new byte[] {4});
     try (SocketChannel channel = SocketChannel.open()) {
-      SSLStorage.setConnectionForSession(engine, first);
       assertSame(first, SSLStorage.associateConnectionWithSocketChannel(channel, first));
+      SSLStorage.setConnectionForSession(engine, first);
       SSLStorage.cleanupConnection(channel, first, false);
 
       assertSame(first, SSLStorage.getConnectionForSession(engine));
@@ -1161,7 +1558,6 @@ class SSLStorageTest {
   @Test
   void closedNettyScopeCannotReactivateAReusedExactConnection() throws Exception {
     Connection closed = connection(9534, 4978, 29);
-    Connection reused = connection(9534, 4978, 29);
     ByteBuffer closedBuffer = ByteBuffer.allocate(8);
     ByteBuffer reusedBuffer = ByteBuffer.allocate(8);
     DummySSLEngine reusedEngine = new DummySSLEngine(new byte[] {1});
@@ -1170,6 +1566,7 @@ class SSLStorageTest {
     assertTrue(SSLStorage.setCurrentNettyConnection(closed));
     SSLStorage.cleanupConnection(closed);
 
+    Connection reused = connection(9534, 4978, 29);
     SSLStorage.setConnectionForReadBuffer(reusedBuffer, reused);
     SSLStorage.setConnectionForSession(reusedEngine, reused);
 
@@ -1263,7 +1660,8 @@ class SSLStorageTest {
             SSLEngineResult.Status.BUFFER_UNDERFLOW,
             SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING,
             0,
-            0));
+            0),
+        null);
 
     assertNull(saved[1]);
     assertNull(SSLStorage.getConnectionForSession(engine));
@@ -1286,7 +1684,8 @@ class SSLStorageTest {
         source,
         destination,
         new SSLEngineResult(
-            SSLEngineResult.Status.OK, SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING, 1, 1));
+            SSLEngineResult.Status.OK, SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING, 1, 1),
+        null);
 
     assertNull(SSLStorage.getConnectionForSession(engine));
     assertSame(connection, SSLStorage.getConnectionForReadBuffer(source));
@@ -1298,7 +1697,12 @@ class SSLStorageTest {
     assertTrue(SSLStorage.setCurrentNettyConnection(connection));
   }
 
-  private static Connection connection(int localPort, int remotePort, int fileDescriptor)
+  private Connection connection(int localPort, int remotePort, int fileDescriptor)
+      throws Exception {
+    return own(rawConnection(localPort, remotePort, fileDescriptor));
+  }
+
+  private static Connection rawConnection(int localPort, int remotePort, int fileDescriptor)
       throws Exception {
     return new Connection(
         InetAddress.getByName("127.0.0.1"),
@@ -1306,6 +1710,19 @@ class SSLStorageTest {
         InetAddress.getByName("127.0.0.2"),
         remotePort,
         fileDescriptor);
+  }
+
+  private Connection own(Connection connection) {
+    if (connection.getSocketFileDescriptor() < 0) {
+      return connection;
+    }
+    Object physicalOwner = new Object();
+    physicalOwners.add(physicalOwner);
+    assertSame(
+        connection,
+        SSLStorage.associateConnectionWithPhysicalOwnerForTest(physicalOwner, connection));
+    ownedConnections.add(connection);
+    return connection;
   }
 
   @Test
@@ -1705,5 +2122,13 @@ class SSLStorageTest {
       JavaExecutorInst.SetExecuteRunnableStateAdvice.exitJobSubmit(
           Runnable::run, task, "execute", null, submission);
     }
+  }
+
+  private static boolean waitForInactive(RemoteParentSocketContext.Lifecycle lifecycle) {
+    long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+    while (lifecycle.active() && System.nanoTime() - deadline < 0) {
+      Thread.yield();
+    }
+    return !lifecycle.active();
   }
 }

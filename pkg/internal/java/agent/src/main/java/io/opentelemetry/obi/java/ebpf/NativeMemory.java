@@ -14,13 +14,16 @@ import java.nio.ByteOrder;
  * loaders.
  */
 public class NativeMemory {
+  private static final ThreadLocal<Boolean> syntheticAddressForTest = new ThreadLocal<>();
+
   private final ByteBuffer buffer;
   private final long address;
 
   public NativeMemory(int size) {
     this.buffer = ByteBuffer.allocateDirect(size);
     this.buffer.order(ByteOrder.nativeOrder());
-    this.address = getDirectBufferAddress(buffer);
+    this.address =
+        Boolean.TRUE.equals(syntheticAddressForTest.get()) ? 1L : getDirectBufferAddress(buffer);
   }
 
   /**
@@ -81,6 +84,15 @@ public class NativeMemory {
 
   public ByteBuffer getBuffer() {
     return buffer;
+  }
+
+  /** Enables a non-JNI address for the current test thread. */
+  static void setSyntheticAddressForTest(boolean enabled) {
+    if (enabled) {
+      syntheticAddressForTest.set(Boolean.TRUE);
+    } else {
+      syntheticAddressForTest.remove();
+    }
   }
 
   // Done through JNI

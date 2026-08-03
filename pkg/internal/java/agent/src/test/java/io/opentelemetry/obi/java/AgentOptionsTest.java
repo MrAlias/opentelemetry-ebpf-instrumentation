@@ -93,6 +93,9 @@ class AgentOptionsTest {
             "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$BufferHandoff"));
     assertTrue(
         Agent.isBootstrapHelperClassName(
+            "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ActiveConnectionEvictionListener"));
+    assertTrue(
+        Agent.isBootstrapHelperClassName(
             "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ChannelState"));
     assertTrue(
         Agent.isBootstrapHelperClassName(
@@ -109,6 +112,27 @@ class AgentOptionsTest {
     assertTrue(
         Agent.isBootstrapHelperClassName(
             "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext"));
+    assertTrue(
+        Agent.isBootstrapHelperClassName(
+            "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext$Lookup"));
+    assertTrue(
+        Agent.isBootstrapHelperClassName(
+            "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext$Lifecycle"));
+    assertTrue(
+        Agent.isBootstrapHelperClassName(
+            "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext$Lifecycle$ActiveCheck"));
+    assertTrue(
+        Agent.isBootstrapHelperClassName(
+            "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext$Lifecycle$CloseFence"));
+    assertTrue(
+        Agent.isBootstrapHelperClassName(
+            "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext$Lifecycle$Lease"));
+    assertTrue(
+        Agent.isBootstrapHelperClassName(
+            "io.opentelemetry.obi.java.instrumentations.util.CappedConcurrentHashMap$EvictionListener"));
+    assertTrue(
+        Agent.isBootstrapHelperClassName(
+            "io.opentelemetry.obi.java.bridge.NativeRemoteParentProvider$SocketCaller"));
     assertTrue(
         Agent.isBootstrapHelperClassName(
             "io.opentelemetry.obi.java.instrumentations.data.WeakIdentityConcurrentMap"));
@@ -140,6 +164,14 @@ class AgentOptionsTest {
         "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$NettyConnectionScope");
     assertNoAccessMarkerConstructor(
         "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$NettyHandlerScope");
+    assertNoAccessMarkerConstructor(
+        "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ActiveConnectionEvictionListener");
+    assertNoAccessMarkerConstructor(
+        "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext$Lookup");
+    assertNoAccessMarkerConstructor(
+        "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext$Lifecycle$CloseFence");
+    assertNoAccessMarkerConstructor(
+        "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext$Lifecycle$Lease");
     assertNoAccessMarkerConstructor(
         "io.opentelemetry.obi.java.instrumentations.data.WeakIdentityConcurrentMap$IdentityWeakReference");
   }

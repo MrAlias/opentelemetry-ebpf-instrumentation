@@ -7,14 +7,19 @@ package io.opentelemetry.obi.java.bridge;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.opentelemetry.obi.java.BootstrapNative;
 import io.opentelemetry.obi.java.ebpf.ThreadInfo;
+import io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext.Lifecycle;
+import io.opentelemetry.obi.java.instrumentations.data.SSLStorage;
 import io.opentelemetry.obi.java.instrumentations.data.TaskContext;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.net.Socket;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -391,6 +396,98 @@ class NativeRemoteParentProviderTest {
     provider.close();
   }
 
+  @Test
+  void primaryLookupKeepsSocketCloseFencedUntilItsNativeCallReturns() throws Exception {
+    CountDownLatch nativeEntered = new CountDownLatch(1);
+    CountDownLatch releaseNative = new CountDownLatch(1);
+    CountDownLatch lookupFinished = new CountDownLatch(1);
+    CountDownLatch closeFinished = new CountDownLatch(1);
+    AtomicInteger observedSocketFileDescriptor = new AtomicInteger(-1);
+    AtomicReference<Throwable> failure = new AtomicReference<>();
+    AtomicReference<Object> closeLifecycle = new AtomicReference<>();
+    NativeRemoteParentProvider provider =
+        readyProvider(
+            (take, socketFileDescriptor, response) -> {
+              observedSocketFileDescriptor.set(socketFileDescriptor);
+              nativeEntered.countDown();
+              awaitUninterruptibly(releaseNative);
+              return RemoteParentStatus.MISSING;
+            });
+
+    Socket socket = new Socket();
+    try {
+      Lifecycle lifecycle = (Lifecycle) SSLStorage.prepareRemoteParentSocketLifecycle(socket);
+      assertNotNull(lifecycle);
+      Thread lookup =
+          new Thread(
+              () -> {
+                try {
+                  assertTrue(ThreadInfo.setRemoteParentSocketFileDescriptor(96, lifecycle));
+                  assertEquals(RemoteParentStatus.MISSING, provider.takeRemoteParent().getStatus());
+                } catch (Throwable thrown) {
+                  failure.compareAndSet(null, thrown);
+                } finally {
+                  lookupFinished.countDown();
+                }
+              });
+      lookup.start();
+      assertTrue(nativeEntered.await(5, TimeUnit.SECONDS));
+
+      Thread closer =
+          new Thread(
+              () -> {
+                try {
+                  closeLifecycle.set(BootstrapNative.beginRemoteParentSocketClose(socket));
+                } catch (Throwable thrown) {
+                  failure.compareAndSet(null, thrown);
+                } finally {
+                  closeFinished.countDown();
+                }
+              });
+      closer.start();
+      assertTrue(waitForInactive(lifecycle));
+      assertFalse(closeFinished.await(250, TimeUnit.MILLISECONDS));
+
+      releaseNative.countDown();
+      assertTrue(lookupFinished.await(5, TimeUnit.SECONDS));
+      assertTrue(closeFinished.await(5, TimeUnit.SECONDS));
+      assertEquals(96, observedSocketFileDescriptor.get());
+      assertNull(failure.get());
+    } finally {
+      releaseNative.countDown();
+      Object lifecycle = closeLifecycle.get();
+      if (lifecycle != null) {
+        BootstrapNative.finishRemoteParentSocketClose(socket, lifecycle);
+      }
+      socket.close();
+      provider.close();
+    }
+  }
+
+  @Test
+  void unixFallbackRejectsAnInvalidatedSocketContextBeforeCallingTheBroker() throws Exception {
+    AtomicInteger calls = new AtomicInteger();
+    NativeRemoteParentProvider provider =
+        readyProvider(
+            RemoteParentTransport.UNIX,
+            (take, socketFileDescriptor, response) -> {
+              calls.incrementAndGet();
+              return RemoteParentStatus.MISSING;
+            });
+
+    try (Socket socket = new Socket()) {
+      Lifecycle lifecycle = (Lifecycle) SSLStorage.prepareRemoteParentSocketLifecycle(socket);
+      assertNotNull(lifecycle);
+      assertTrue(ThreadInfo.setRemoteParentSocketFileDescriptor(97, lifecycle));
+      lifecycle.invalidate();
+
+      assertEquals(RemoteParentStatus.MISSING, provider.takeRemoteParent().getStatus());
+      assertEquals(0, calls.get());
+    } finally {
+      provider.close();
+    }
+  }
+
   private static TaskContext captureSocketAlias(int socketFileDescriptor) throws Exception {
     setTaskContextEmitter((proxy, method, args) -> null);
     ThreadInfo.setRemoteParentEnabled(true);
@@ -412,14 +509,52 @@ class NativeRemoteParentProviderTest {
   }
 
   private static NativeRemoteParentProvider readyProvider() {
+    return readyProvider(
+        (take, socketFileDescriptor, response) ->
+            take
+                ? BootstrapNative.takeRemoteParent(socketFileDescriptor, response)
+                : BootstrapNative.discardRemoteParent(socketFileDescriptor, response));
+  }
+
+  private static NativeRemoteParentProvider readyProvider(
+      NativeRemoteParentProvider.SocketCaller socketCaller) {
+    return readyProvider(RemoteParentTransport.GETSOCKOPT, socketCaller);
+  }
+
+  private static NativeRemoteParentProvider readyProvider(
+      int requestedTransport, NativeRemoteParentProvider.SocketCaller socketCaller) {
     return new NativeRemoteParentProvider(
-        RemoteParentTransport.GETSOCKOPT,
+        requestedTransport,
         "/tmp/obi-java.sock",
         50,
         0,
         (transport, path, timeout, uid, processIncarnation) ->
             configurationResult(transport, RemoteParentStatus.VALID),
-        () -> true);
+        () -> true,
+        socketCaller);
+  }
+
+  private static void awaitUninterruptibly(CountDownLatch latch) {
+    boolean interrupted = false;
+    while (true) {
+      try {
+        latch.await();
+        break;
+      } catch (InterruptedException ignored) {
+        interrupted = true;
+      }
+    }
+    if (interrupted) {
+      Thread.currentThread().interrupt();
+    }
+  }
+
+  private static boolean waitForInactive(Lifecycle lifecycle) {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+    while (lifecycle.active() && System.nanoTime() - deadline < 0) {
+      Thread.yield();
+    }
+    return !lifecycle.active();
   }
 
   private static byte[] validResponse() {

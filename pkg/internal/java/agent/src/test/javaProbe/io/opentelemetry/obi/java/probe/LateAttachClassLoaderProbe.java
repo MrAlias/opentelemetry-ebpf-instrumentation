@@ -114,6 +114,14 @@ public final class LateAttachClassLoaderProbe {
             .newInstance(
                 InetAddress.getLoopbackAddress(), 1234, InetAddress.getLoopbackAddress(), 5678, 7);
     Class<?> storage = Class.forName(SSL_STORAGE_CLASS, true, null);
+    Object physicalOwner = new Object();
+    Object associated =
+        storage
+            .getMethod("associateConnectionWithChannel", Object.class, connectionClass)
+            .invoke(null, physicalOwner, connection);
+    if (associated != connection) {
+      throw new AssertionError("bootstrap helper did not bind the TLS connection to its transport");
+    }
     storage
         .getMethod("setConnectionForSession", SSLEngine.class, connectionClass)
         .invoke(null, engine, connection);

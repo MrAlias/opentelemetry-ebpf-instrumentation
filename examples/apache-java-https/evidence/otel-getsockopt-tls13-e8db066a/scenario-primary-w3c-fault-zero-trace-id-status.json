@@ -1,0 +1,10 @@
+{
+  "status": "passed",
+  "scenario": "primary-w3c-fault",
+  "fault_mode": "zero-trace-id",
+  "exit_status": 0,
+  "metric_status": 0,
+  "result": "scenario-primary-w3c-fault-zero-trace-id.json",
+  "fault_control_arm": "primary-w3c-fault-zero-trace-id-run-1-armed.txt",
+  "fault_control_consumption": "primary-w3c-fault-zero-trace-id-run-1-consumed.txt"
+}

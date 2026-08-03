@@ -10,7 +10,7 @@ Verify a published bundle before relying on it for a matrix cell:
 
 ```bash
 ./examples/apache-java-https/scripts/verify-retained-evidence.sh \
-  examples/apache-java-https/evidence/otel-getsockopt-tls13-c9d14356
+  examples/apache-java-https/evidence/otel-getsockopt-tls13-e8db066a
 ```
 
 The verifier accepts only a published evidence directory tracked by the `HEAD`
@@ -66,6 +66,7 @@ two historical bundles `otel-getsockopt-tls13-7482d908` and
 metric deltas can contain `operation="select"`. In those historical revisions,
 `select` means only OBI-side transport readiness or preference; it is neither
 Java helper selection nor proof that a request used that transport. The current
+`otel-getsockopt-tls13-e8db066a`, and the prior
 `otel-getsockopt-tls13-c9d14356`, `otel-getsockopt-tls12-c7209e43`,
 `otel-unix-tls12-bd1c9327`, and `splunk-getsockopt-tls13-47237792` bundles use
 `operation="availability"` and retain V2 Java transport-configuration
@@ -79,11 +80,12 @@ recast their historical schema.
 
 | Evidence | Result | Matrix cell |
 | --- | --- | --- |
+| [otel-getsockopt-tls13-e8db066a](otel-getsockopt-tls13-e8db066a/README.md) | pass | OpenTelemetry 2.28.1, forced `getsockopt`, TLS 1.3, Java 21, `amd64`, unified cgroup v2; exact-source full cell with primary stale-state, malformed-response, same-JVM wrong-live-socket, duplicated-descriptor, pressure, and recovery controls |
 | [splunk-getsockopt-tls13-47237792](splunk-getsockopt-tls13-47237792/README.md) | pass | Splunk 2.28.0, forced `getsockopt`, TLS 1.3, Java 21, `amd64`, unified cgroup v2; includes bounded primary-transport security controls |
-| [otel-getsockopt-tls12-c7209e43](otel-getsockopt-tls12-c7209e43/README.md) | pass | OpenTelemetry 2.28.1, forced `getsockopt`, TLS 1.2, Java 21, `amd64`, unified cgroup v2; source-exact current V2 primary cell |
-| [otel-getsockopt-tls13-c9d14356](otel-getsockopt-tls13-c9d14356/README.md) | pass | OpenTelemetry 2.28.1, forced `getsockopt`, TLS 1.3, Java 21, `amd64`, unified cgroup v2; includes the bounded inbound-Netty fixture |
+| [otel-getsockopt-tls12-c7209e43](otel-getsockopt-tls12-c7209e43/README.md) | pass | OpenTelemetry 2.28.1, forced `getsockopt`, TLS 1.2, Java 21, `amd64`, unified cgroup v2; retained V2 primary cell |
+| [otel-getsockopt-tls13-c9d14356](otel-getsockopt-tls13-c9d14356/README.md) | pass | OpenTelemetry 2.28.1, forced `getsockopt`, TLS 1.3, Java 21, `amd64`, unified cgroup v2; prior full cell with the bounded inbound-Netty fixture |
 | [otel-getsockopt-tls13-74576ec6](otel-getsockopt-tls13-74576ec6/README.md) | pass | OpenTelemetry 2.28.1, forced `getsockopt`, TLS 1.3, Java 21, `amd64`, unified cgroup v2; bounded root-in-PID-1-cgroup live-descriptor security control |
-| [otel-getsockopt-tls13-b678ce1e](otel-getsockopt-tls13-b678ce1e/README.md) | pass | OpenTelemetry 2.28.1, forced `getsockopt`, TLS 1.3, Java 21, `amd64`, unified cgroup v2; same-JVM wrong-live-socket and root duplicated-descriptor controls |
+| [otel-getsockopt-tls13-b678ce1e](otel-getsockopt-tls13-b678ce1e/README.md) | pass | OpenTelemetry 2.28.1, forced `getsockopt`, TLS 1.3, Java 21, `amd64`, unified cgroup v2; prior same-JVM wrong-live-socket and root duplicated-descriptor control bundle |
 | [otel-getsockopt-tls13-94221a91](otel-getsockopt-tls13-94221a91/README.md) | pass | OpenTelemetry 2.28.1, forced `getsockopt`, TLS 1.3, Java 21, `amd64`, unified cgroup v2 |
 | [otel-unix-tls12-bd1c9327](otel-unix-tls12-bd1c9327/README.md) | pass | OpenTelemetry 2.28.1, forced Unix RPC, TLS 1.2, Java 21, `amd64`, unified cgroup v2 |
 | [otel-unix-tls13-6c4a2505](otel-unix-tls13-6c4a2505/README.md) | pass | OpenTelemetry 2.28.1, forced Unix RPC, TLS 1.3, Java 21, `amd64`, unified cgroup v2; sibling and same-cgroup attacker controls plus stale-TTL recovery |

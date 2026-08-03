@@ -1,0 +1,5 @@
+observed:pre-stop-ready
+released:obi-stopped
+observed:stopped-traffic-complete
+released:obi-ready
+observed:post-restart-traffic-complete

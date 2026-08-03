@@ -1,0 +1,60 @@
+{
+  "format": 2,
+  "status": "passed",
+  "transport": "getsockopt",
+  "verification": "isolated unauthorized-operation metric deltas plus ordered barrier controls",
+  "topology": {
+    "attacker_identity": "root",
+    "attacker_cgroup": "verified equal to Java PID 1 before execution",
+    "java_pid_namespace": "private",
+    "java_container_privileged": false,
+    "java_container_capability": "SYS_PTRACE",
+    "seccomp_profile": "docker-default"
+  },
+  "barrier": {
+    "armed": {"status": "armed", "ownership": "root:root", "mode": "0600", "kind": "regular-file", "size_bytes": 16},
+    "released": {"status": "released", "ownership": "root:root", "mode": "0600", "kind": "regular-empty-file", "size_bytes": 0},
+    "consumed": {"status": "consumed", "ownership": "root:root", "mode": "0600", "kind": "regular-empty-file", "size_bytes": 0}
+  },
+  "controls": {
+    "wrong_live_socket": {
+      "status": "metrics_verified",
+      "actor": "the Java process",
+      "operation": "a separate, live, unnegotiated loopback TCP socket calls the raw getsockopt retrieval before the barrier is ready",
+      "transport_scope": "forced primary getsockopt only",
+      "ordering": "before the duplicated-FD probe and before the held victim is released"
+    },
+    "duplicated_fd_wrong_process": {
+      "status": "metrics_verified",
+      "actor": "root probe in the Java PID 1 cgroup",
+      "operation": "duplicates the held accepted descriptor with pidfd_getfd and attempts retrieval",
+      "ordering": "after barrier readiness and before the held victim is released"
+    }
+  },
+  "probe": {
+    "raw_status": "unverified",
+    "verification": "metrics_verified",
+    "attempts": 1,
+    "case_outcomes": {
+      "pidfd_duplicate": "opened",
+      "standard_option": "preserved",
+      "wrong_process_negotiation": "native-unsupported",
+      "duplicated_fd_take": "native-unsupported"
+    }
+  },
+  "metric_windows": {
+    "before": {"take_valid": 2, "take_unauthorized": 0, "negotiate_unauthorized": 0},
+    "probe_delta": {"take_valid": 0, "take_unauthorized": 2, "negotiate_unauthorized": 1},
+    "after_from_before_delta": {"take_valid": 1, "take_unauthorized": 2, "negotiate_unauthorized": 1},
+    "attribution": "take_unauthorized is an aggregate reason-coded counter; runner ordering binds its two exact pre-release events to the same-JVM wrong-live-socket control and the duplicated-FD wrong-process control, but the metric label does not identify them individually"
+  },
+  "legitimate_victim": {
+    "status": "passed",
+    "request_count": 1,
+    "assertion": "the held request retained its exact Apache client parent"
+  },
+  "post_abuse_recovery": {
+    "status": "passed",
+    "assertion": "a normal-stack basic request retained its exact Apache client parent"
+  }
+}

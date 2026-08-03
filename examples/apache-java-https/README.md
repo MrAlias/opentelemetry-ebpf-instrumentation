@@ -105,23 +105,24 @@ exact exported trace and parent IDs.
 
 The checked-in #28 matrix is explicit about which layer proves each case:
 
-| Extraction case | Checked-in proof path | Remaining live gap |
+| Extraction case | Checked-in proof path | Retained evidence or remaining boundary |
 | --- | --- | --- |
-| no W3C and no OBI state | `fail-open`: OBI stopped, one Java root | privileged run |
-| valid W3C only | `w3c-only`: OBI stopped, exact remote W3C parent | privileged run |
-| valid OBI only | `basic`: exact Apache client parent | privileged run |
-| matching W3C and OBI | `w3c-match`: controlled Unix bridge candidate plus an identical W3C header, exact Java parent, and one standard-parent discard | privileged run |
-| conflicting valid W3C and OBI | `w3c`: exact W3C parent, distinct Apache candidate, one discard | privileged run |
-| malformed W3C and valid OBI | `w3c`: exact Apache client parent, one take | privileged run |
-| valid W3C and no OBI | `w3c-only` plus named Unix fault modes | privileged run |
-| valid W3C and stale primary state | `primary-w3c-stale`: forced `getsockopt` retrieval TTL of `1ns`, exact W3C parent, one workload stale bridge take with an in-band terminal diagnostics snapshot, then normal-TTL recovery | privileged run |
-| valid W3C and stale Unix state | `unix-w3c-stale`: forced `unix` retrieval TTL of `1ns`, exact W3C parent, one workload stale bridge take with an in-band terminal diagnostics snapshot, then normal-TTL recovery | privileged run |
-| sampled and unsampled OBI flags | `obi-flags`: exact IDs, flags, and diagnostics | privileged run |
-| repeated extraction | exact one-take/discard diagnostics per marked request | privileged run |
-| nested/duplicate server instrumentation | repeated Jetty async redispatch, exactly one Java server span | privileged run |
-| async/executor/Netty/virtual-thread handoff | dedicated exact-parent scenarios | privileged run |
-| inbound Netty receive-to-extraction | `netty-server`: Apache-to-inbound-Netty HTTPS with exact remote parent | support for arbitrary Netty frameworks or applications |
-| sequential keepalive, HTTP/1.1 pipelining, parallel connections, and fd/port reuse | dedicated exact-parent scenarios with connection evidence | privileged run |
+| no W3C and no OBI state | `fail-open`: OBI stopped, one Java root | [current primary acceptance](evidence/otel-getsockopt-tls13-e8db066a/scenario-fail-open-obi-absent.json) |
+| valid W3C only | `w3c-only`: OBI stopped, exact remote W3C parent | [current primary acceptance](evidence/otel-getsockopt-tls13-e8db066a/scenario-w3c-only-obi-absent.json) |
+| valid OBI only | `basic`: exact Apache client parent | [current primary acceptance](evidence/otel-getsockopt-tls13-e8db066a/scenario-basic.json) |
+| matching W3C and OBI | `w3c-match`: controlled bridge candidate plus an identical W3C header, exact Java parent, and one standard-parent discard assertion | [graph](evidence/otel-getsockopt-tls13-e8db066a/scenario-w3c-match.json) and [passing status](evidence/otel-getsockopt-tls13-e8db066a/scenario-w3c-match-status.json); ordinary phase values are omitted |
+| conflicting valid W3C and OBI | `w3c`: exact W3C parent, distinct Apache candidate, and one discard assertion | [graph](evidence/otel-getsockopt-tls13-e8db066a/scenario-w3c.json) and [passing status](evidence/otel-getsockopt-tls13-e8db066a/scenario-w3c-status.json); ordinary phase values are omitted |
+| malformed W3C and valid OBI | `w3c`: exact Apache client parent and one take assertion | [graph](evidence/otel-getsockopt-tls13-e8db066a/scenario-w3c.json) and [passing status](evidence/otel-getsockopt-tls13-e8db066a/scenario-w3c-status.json); ordinary phase values are omitted |
+| valid W3C and no OBI | `w3c-only` plus named Unix fault modes | [primary](evidence/otel-getsockopt-tls13-e8db066a/scenario-w3c-only-obi-absent.json) and [Unix](evidence/otel-unix-tls12-bd1c9327/README.md#retained-proof) acceptance |
+| valid W3C and stale primary state | `primary-w3c-stale`: forced `getsockopt` retrieval TTL of `1ns`, exact W3C parent, one workload stale bridge take with an in-band terminal diagnostics snapshot, then normal-TTL recovery | [current primary acceptance](evidence/otel-getsockopt-tls13-e8db066a/scenario-primary-w3c-stale.json) |
+| valid W3C and malformed primary response | `primary-w3c-fault`: version, declared-size, zero-trace-ID, and zero-span-ID responses, exact W3C parent, then normal recovery | [current primary acceptance](evidence/otel-getsockopt-tls13-e8db066a/README.md#retained-proof) |
+| valid W3C and stale Unix state | `unix-w3c-stale`: forced `unix` retrieval TTL of `1ns`, exact W3C parent, one workload stale bridge take with an in-band terminal diagnostics snapshot, then normal-TTL recovery | [current Unix acceptance](evidence/otel-unix-tls13-6c4a2505/README.md#retained-proof) |
+| sampled and unsampled OBI flags | `obi-flags`: exact IDs and flags plus counter/diagnostic assertions | [graph](evidence/otel-getsockopt-tls13-e8db066a/scenario-obi-flags.json) and [passing assertion status](evidence/otel-getsockopt-tls13-e8db066a/scenario-obi-flags-status.json); ordinary phase values are omitted |
+| repeated extraction | unit tests invoke the propagator repeatedly, while retained request assertions prove only one take/discard lifecycle outcome | a dedicated stock-agent runtime control that records multiple extraction calls for one request remains unretained |
+| nested/duplicate server instrumentation | repeated Jetty async redispatch is a distinct case and produces exactly one Java server span | dedicated nested/duplicate-instrumenter activation remains untested |
+| async/executor/Netty/virtual-thread handoff | dedicated exact-parent scenarios | [current primary acceptance](evidence/otel-getsockopt-tls13-e8db066a/README.md#retained-proof) for the named surfaces; a runtime parent-chain depth/cycle-limit control remains unretained |
+| inbound Netty receive-to-extraction | `netty-server`: Apache-to-inbound-Netty HTTPS with exact remote parent | [bounded fixture passed](evidence/otel-getsockopt-tls13-e8db066a/scenario-netty-server.json); arbitrary Netty frameworks or applications remain unproven |
+| sequential keepalive, HTTP/1.1 pipelining, parallel connections, and fd/port reuse | dedicated exact-parent scenarios with connection evidence | [current primary acceptance](evidence/otel-getsockopt-tls13-e8db066a/README.md#retained-proof) |
 
 Unit tests alone do not mark a stock-agent E2E row as passed. The Unix-only
 fault control supplies bounded stale, malformed, timeout, disconnect,
@@ -136,19 +137,22 @@ The primary `primary-w3c-stale` control force-recreates OBI with a `1ns`
 retrieval TTL while retaining the normal `30s` Apache prewrite and cleanup TTL.
 It verifies a healthy Apache request whose exact W3C parent wins after the
 primary stale retrieval, then restores the normal retrieval setting before
-proving a normal bridge recovery. It is an executable source control until a
-privileged run artifact is retained; it does not synthesize a malformed primary
+proving a normal bridge recovery. It is an executable source control. The current
+[primary acceptance bundle](evidence/otel-getsockopt-tls13-e8db066a/README.md)
+retains that execution, so the exact primary cell is no longer source-only.
+The control does not synthesize a malformed primary
 record. The Unix `unix-w3c-stale` control follows the same TTL and recovery
 sequence through the real OBI Unix handler, not the synthetic `w3c-fault`
-responder. It is also executable source coverage until a privileged Unix
-artifact is retained. Both stale controls capture their baseline on the existing
+responder. The current
+[Unix acceptance bundle](evidence/otel-unix-tls13-6c4a2505/README.md) retains
+that execution. Both stale controls capture their baseline on the existing
 bridge-boundary health request and their terminal diagnostics on the marked
 workload response, avoiding a separate diagnostics request with its own lookup.
 The separate `primary-w3c-fault` control uses a private one-shot
 response shim to exercise declared-size and zero-ID malformed primary replies,
 plus ABI-version mismatch, while the supplied W3C parent remains authoritative.
-It is also source-level coverage until a clean focused or acceptance artifact
-is retained.
+The [current primary acceptance bundle](evidence/otel-getsockopt-tls13-e8db066a/README.md)
+retains all four one-shot response modes and normal recovery.
 
 ## Prerequisites
 

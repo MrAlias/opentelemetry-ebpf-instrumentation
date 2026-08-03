@@ -3,32 +3,31 @@
 Status: **partial — four OpenTelemetry transport/TLS cells and one Splunk primary cell passed**
 
 The clean full
-[getsockopt/TLS 1.3](evidence/otel-getsockopt-tls13-c9d14356/README.md),
+[getsockopt/TLS 1.3](evidence/otel-getsockopt-tls13-e8db066a/README.md),
 [getsockopt/TLS 1.2](evidence/otel-getsockopt-tls12-c7209e43/README.md), and
 [Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/README.md), and
 [Unix/TLS 1.3](evidence/otel-unix-tls13-6c4a2505/README.md), and the
 [Splunk getsockopt/TLS 1.3](evidence/splunk-getsockopt-tls13-47237792/README.md)
 runs are retained with source revision, environment, scenario graphs,
-diagnostic deltas, and checksums. The refreshed OpenTelemetry primary run also
-includes the bounded inbound-Netty fixture. Each proves only its exact matrix
+bounded diagnostics, and checksums. The refreshed OpenTelemetry primary run
+also includes the bounded inbound-Netty fixture. Each proves only its exact matrix
 cell. Rows requiring a different transport/TLS/agent/environment combination
 remain `untested`. A row's `pass` applies only to its linked retained evidence.
-The [current primary socket-isolation acceptance bundle](evidence/otel-getsockopt-tls13-b678ce1e/README.md)
-records a clean full current-revision run with a same-JVM wrong-live-socket
-control, a root duplicated-descriptor control, ordered aggregate unauthorized
-metrics, an exact-parent held victim, and recovery. It promotes only those
-named primary security controls to `pass`.
+The [current primary socket-isolation acceptance bundle](evidence/otel-getsockopt-tls13-e8db066a/README.md)
+records a clean full current-revision run with same-cgroup, sibling,
+same-JVM wrong-live-socket, and root duplicated-descriptor controls; primary
+stale-state and four returned-response fault modes; exact-parent victims; and
+recovery. It promotes only those named primary controls to `pass`.
 The current Unix/TLS 1.3 bundle additionally records a clean full acceptance
 run with sibling and same-cgroup attacker controls, concurrent legitimate
 victims, endpoint and directory controls, and a 1ns stale-retrieval recovery.
 It promotes only that exact forced-Unix matrix cell and those named Unix
 controls to `pass`.
 Three clean focused OpenTelemetry/`getsockopt`/TLS 1.3 runs at
-`8f0aa1f6a7a28af93875823e4cf41675221d3542` validate primary attacker
-attribution, stale retrieval, and returned-response faults. They are recorded
-in [focused validation](focused-validation/primary-getsockopt-8f0aa1f6/README.md)
-with `acceptance_evidence=false`; they are not retained acceptance evidence and
-do not change a matrix cell from `untested` to `pass`.
+`8f0aa1f6a7a28af93875823e4cf41675221d3542` remain historical targeted
+validation. The current clean full bundle independently exercises those
+controls and additionally retains the malformed declared-size response; the
+focused records are not used to promote an acceptance cell.
 
 ## Parent tracker definition-of-done reconciliation
 
@@ -44,53 +43,57 @@ Matrix revision: `apache-java-https-compatibility-v2`.
 
 | Parent definition-of-done item | Status | Evidence or exact gap |
 | --- | --- | --- |
-| 1. Apache proxies to Java over HTTPS | pass | [Apache runtime and certificate evidence](evidence/otel-getsockopt-tls13-c9d14356/README.md#retained-proof) and the [exact-parent graph](evidence/otel-getsockopt-tls13-c9d14356/scenario-basic.json). |
-| 2. Apache is instrumented by OBI | pass | [OBI startup and Apache instrumentation evidence](evidence/otel-getsockopt-tls13-c9d14356/README.md#retained-proof). |
-| 3. Java uses the official agent and OBI extension/helper | pass | [official agent metadata](evidence/otel-unix-tls12-bd1c9327/official-javaagent.json), [external-extension runtime metadata](evidence/otel-getsockopt-tls13-c9d14356/runtime-metadata.json), and [dynamic helper attach evidence](evidence/otel-getsockopt-tls13-c9d14356/README.md#retained-proof). |
-| 4. Traffic and traces are collected without a vendor UI | pass | [local receiver inventory](evidence/otel-getsockopt-tls13-c9d14356/runtime-images.json) and retained scenario JSON. |
-| 5. Apache client and Java server spans have one exact trace/parent relationship | pass | [basic trace graph](evidence/otel-getsockopt-tls13-c9d14356/scenario-basic.json). |
-| 6. Precedence, concurrency, keepalive, failure, and compatibility cases are exercised | fail | Retained controls pass precedence, concurrency, keepalive, Unix fault cells, the [current Unix sibling/same-cgroup/stale controls](evidence/otel-unix-tls13-6c4a2505/README.md), and the [current primary same-JVM wrong-live-socket plus root PID 1-cgroup descriptor gates](evidence/otel-getsockopt-tls13-b678ce1e/README.md). [Focused clean primary runs](focused-validation/primary-getsockopt-8f0aa1f6/README.md) additionally exercised a `1ns` stale retrieval with valid-W3C precedence and recovery, plus version-mismatch, zero-trace-ID, and zero-span-ID returned-response faults with valid-W3C precedence and recovery. The focused runs have `acceptance_evidence=false` and are not retained matrix evidence. The VM-gated JVM-to-JNI-to-cgroup-sockopt fixture, Unix wrong-socket, [#37 benchmark](BENCHMARK.md), and [#38 compatibility](COMPATIBILITY.md) rows remain untested. |
+| 1. Apache proxies to Java over HTTPS | pass | [Apache runtime and certificate evidence](evidence/otel-getsockopt-tls13-e8db066a/README.md#retained-proof) and the [exact-parent graph](evidence/otel-getsockopt-tls13-e8db066a/scenario-basic.json). |
+| 2. Apache is instrumented by OBI | pass | [OBI startup and Apache instrumentation evidence](evidence/otel-getsockopt-tls13-e8db066a/README.md#retained-proof). |
+| 3. Java uses the official agent and OBI extension/helper | pass | [official agent metadata](evidence/otel-unix-tls12-bd1c9327/official-javaagent.json), [external-extension runtime metadata](evidence/otel-getsockopt-tls13-e8db066a/runtime-metadata.json), and [dynamic helper attach evidence](evidence/otel-getsockopt-tls13-e8db066a/README.md#retained-proof). |
+| 4. Traffic and traces are collected without a vendor UI | pass | [local receiver inventory](evidence/otel-getsockopt-tls13-e8db066a/runtime-images.json) and retained scenario JSON. |
+| 5. Apache client and Java server spans have one exact trace/parent relationship | pass | [basic trace graph](evidence/otel-getsockopt-tls13-e8db066a/scenario-basic.json). |
+| 6. Precedence, concurrency, keepalive, failure, and compatibility cases are exercised | fail | Retained controls pass precedence, concurrency, keepalive, primary and Unix fail-open/fault cases, [current Unix sibling/same-cgroup/stale controls](evidence/otel-unix-tls13-6c4a2505/README.md), and [current primary same/sibling/live-descriptor/stale/malformed-response controls](evidence/otel-getsockopt-tls13-e8db066a/README.md). A Unix application-descriptor mismatch is not applicable because Unix opens a fresh broker socket and authorizes peer/TID/capability instead of accepting the application FD; its meaningful peer and endpoint analogues pass in the retained Unix cells. Permanent process-lifetime OBI absence, explicit stale-generation mismatch, genuine TID/PID reuse, and an `auto` primary-unavailable-plus-fallback-unavailable application control remain untested for #36. Literal retained-evidence gaps for #19, #28, #34, #35, #39, and #40 are listed below. The [#37 benchmark](BENCHMARK.md) and unexecuted [#38 compatibility](COMPATIBILITY.md) rows also prevent the complete workstream from passing. The VM-gated JVM-to-JNI-to-cgroup-sockopt fixture remains a narrower unretained component cell, not a substitute for this full application evidence. |
 | 7. Exact build, run, certificate, host, agent, and cleanup steps are documented | pass | [reproducible runbook](README.md), including the bounded [deliberate assertion failure](README.md#deliberate-assertion-failure-control), and retained environment/certificate evidence. |
 
 | Acceptance item | Status | Evidence or remaining requirement |
 | --- | --- | --- |
-| Apache 2.4 proxies to Jetty over verified HTTPS | pass | [runtime and certificate evidence](evidence/otel-getsockopt-tls13-c9d14356/README.md#retained-proof) |
-| Backend protocol is HTTP/1.1 | pass | [basic response and trace graph](evidence/otel-getsockopt-tls13-c9d14356/scenario-basic.json) |
+| Apache 2.4 proxies to Jetty over verified HTTPS | pass | [runtime and certificate evidence](evidence/otel-getsockopt-tls13-e8db066a/README.md#retained-proof) |
+| Backend protocol is HTTP/1.1 | pass | [basic response and trace graph](evidence/otel-getsockopt-tls13-e8db066a/scenario-basic.json) |
 | Forced Unix/TLS 1.2 | pass | [forced Unix response and trace graph](evidence/otel-unix-tls12-bd1c9327/scenario-basic.json) |
 | Forced Unix/TLS 1.3 | pass | [forced Unix recovery graph and V2 selection](evidence/otel-unix-tls13-6c4a2505/README.md#retained-proof) |
 | Forced `getsockopt`/TLS 1.2 | pass | [OpenTelemetry graph](evidence/otel-getsockopt-tls12-c7209e43/scenario-basic.json) |
-| Forced `getsockopt`/TLS 1.3 | pass | [OpenTelemetry graph](evidence/otel-getsockopt-tls13-c9d14356/scenario-basic.json) and [Splunk graph](evidence/splunk-getsockopt-tls13-47237792/scenario-basic.json) |
+| Forced `getsockopt`/TLS 1.3 | pass | [OpenTelemetry graph](evidence/otel-getsockopt-tls13-e8db066a/scenario-basic.json) and [Splunk graph](evidence/splunk-getsockopt-tls13-47237792/scenario-basic.json) |
 | Official OpenTelemetry agent in retained cells | pass | [version, URL, and checksum](evidence/otel-unix-tls12-bd1c9327/official-javaagent.json) |
 | Official Splunk agent | pass | [pinned version, URL, and checksum](evidence/splunk-getsockopt-tls13-47237792/official-javaagent.json), [runtime metadata](evidence/splunk-getsockopt-tls13-47237792/runtime-metadata.json), and [full acceptance](evidence/splunk-getsockopt-tls13-47237792/README.md) |
-| OBI helper is dynamically attached | pass | [startup and late-attach recovery](evidence/otel-getsockopt-tls13-c9d14356/README.md#retained-proof) |
-| External extension is separately loaded | pass | [sanitized runtime metadata](evidence/otel-getsockopt-tls13-c9d14356/runtime-metadata.json) |
-| Forced `getsockopt` bridge | pass | [TLS 1.3](evidence/otel-getsockopt-tls13-c9d14356/README.md) and [TLS 1.2](evidence/otel-getsockopt-tls12-c7209e43/README.md) exact trace/parent graphs and run identities |
-| Java V2 transport configuration | pass | [getsockopt](evidence/otel-getsockopt-tls13-c9d14356/java-selected-transport-configuration.txt), [Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/java-selected-transport-configuration.txt), and [Unix/TLS 1.3](evidence/otel-unix-tls13-6c4a2505/java-selected-transport-configuration.txt) snapshots; exact trace assertions independently prove request use |
+| OBI helper is dynamically attached | pass | [startup and late-attach recovery](evidence/otel-getsockopt-tls13-e8db066a/README.md#retained-proof) |
+| External extension is separately loaded | pass | [sanitized runtime metadata](evidence/otel-getsockopt-tls13-e8db066a/runtime-metadata.json) |
+| Forced `getsockopt` bridge | pass | [TLS 1.3](evidence/otel-getsockopt-tls13-e8db066a/README.md) and [TLS 1.2](evidence/otel-getsockopt-tls12-c7209e43/README.md) exact trace/parent graphs and run identities |
+| Java V2 transport configuration | pass | [getsockopt](evidence/otel-getsockopt-tls13-e8db066a/java-selected-transport-configuration.txt), [Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/java-selected-transport-configuration.txt), and [Unix/TLS 1.3](evidence/otel-unix-tls13-6c4a2505/java-selected-transport-configuration.txt) snapshots; exact trace assertions independently prove request use |
 | Forced Unix fallback | pass | [TLS 1.2 exact trace/parent graph](evidence/otel-unix-tls12-bd1c9327/README.md#retained-proof) and [TLS 1.3 V2 selection plus recovery](evidence/otel-unix-tls13-6c4a2505/README.md#retained-proof) |
-| Remote parent flag | pass | [basic exact-parent graph](evidence/otel-getsockopt-tls13-c9d14356/scenario-basic.json) |
-| W3C-only, no OBI state | pass | [OBI-absent W3C graph](evidence/otel-getsockopt-tls13-c9d14356/scenario-w3c-only-obi-absent.json) |
-| Conflicting W3C context wins | pass | [precedence graph and counters](evidence/otel-getsockopt-tls13-c9d14356/scenario-w3c.json) |
-| Matching W3C and OBI context | pass | [matching-context graph](evidence/otel-getsockopt-tls13-c9d14356/scenario-w3c-match.json) |
-| Sampled and unsampled OBI-only take outcomes | pass | [lookup classification graph and diagnostics](evidence/otel-getsockopt-tls13-c9d14356/scenario-obi-flags.json) |
+| Remote parent flag | pass | [basic exact-parent graph](evidence/otel-getsockopt-tls13-e8db066a/scenario-basic.json) |
+| W3C-only, no OBI state | pass | [OBI-absent W3C graph](evidence/otel-getsockopt-tls13-e8db066a/scenario-w3c-only-obi-absent.json) |
+| Conflicting W3C context wins | pass | [precedence graph](evidence/otel-getsockopt-tls13-e8db066a/scenario-w3c.json) and [passing counter assertion status](evidence/otel-getsockopt-tls13-e8db066a/scenario-w3c-status.json); the ordinary phase counter values are omitted |
+| Matching W3C and OBI context | pass | [matching-context graph](evidence/otel-getsockopt-tls13-e8db066a/scenario-w3c-match.json) |
+| Sampled and unsampled OBI-only take outcomes | pass | [lookup classification graph](evidence/otel-getsockopt-tls13-e8db066a/scenario-obi-flags.json) and [passing diagnostic assertion status](evidence/otel-getsockopt-tls13-e8db066a/scenario-obi-flags-status.json); the ordinary phase diagnostic values are omitted |
 | Valid W3C through Unix bridge faults | pass | [named bounded responder modes, graphs, and Java deltas](evidence/otel-unix-tls12-bd1c9327/README.md#retained-proof) |
-| Invalid W3C falls through to OBI | pass | [fallback graph and counters](evidence/otel-getsockopt-tls13-c9d14356/scenario-w3c.json) |
-| Sequential backend keepalive | pass | [keepalive graph and connection evidence](evidence/otel-getsockopt-tls13-c9d14356/scenario-keepalive.json) |
-| HTTP/1.1 pipelining | pass | [pipelining graph and connection evidence](evidence/otel-getsockopt-tls13-c9d14356/scenario-pipelining.json) |
-| Parallel requests/connections | pass | [concurrency graph and connection evidence](evidence/otel-getsockopt-tls13-c9d14356/scenario-concurrency.json) |
-| FD and ephemeral-port reuse | pass | [reuse graph and connection evidence](evidence/otel-getsockopt-tls13-c9d14356/scenario-fd-port-reuse.json) |
-| Servlet/executor handoff | pass | [executor-handoff graph](evidence/otel-getsockopt-tls13-c9d14356/scenario-handoff.json) |
-| Java 21 virtual-thread handoff | pass | [virtual-thread graph](evidence/otel-getsockopt-tls13-c9d14356/scenario-virtual-thread.json) |
-| Jetty Netty-executor handoff | pass | [Netty handoff graph](evidence/otel-getsockopt-tls13-c9d14356/scenario-netty.json) |
-| Inbound Netty server extraction | pass | [Apache-to-Netty exact-parent graph](evidence/otel-getsockopt-tls13-c9d14356/scenario-netty-server.json); this is the bounded fixture only |
-| Repeated servlet async redispatch | pass | [redispatch graph](evidence/otel-getsockopt-tls13-c9d14356/scenario-dispatch.json) |
-| Live handoff-map pressure | pass | [pressure accounting](evidence/otel-getsockopt-tls13-c9d14356/scenario-pressure-status.json), [cleanup and recovery](evidence/otel-getsockopt-tls13-c9d14356/map-pressure-summary.json) |
-| OBI absent at JVM start and late attach | pass | [absence, late attach, and recovery evidence](evidence/otel-getsockopt-tls13-c9d14356/README.md#retained-proof) |
-| Bridge-disabled control | pass | [bridge-disabled graph](evidence/otel-getsockopt-tls13-c9d14356/scenario-disabled.json) |
-| Extension absent and disabled controls | pass | [extension-control graphs](evidence/otel-getsockopt-tls13-c9d14356/README.md#retained-proof) |
-| Uninstrumented control | pass | [zero-span control](evidence/otel-getsockopt-tls13-c9d14356/scenario-uninstrumented.json) |
-| Java SDK duplicate suppression | pass | [allowlisted suppression metric](evidence/otel-getsockopt-tls13-c9d14356/duplicate-suppression.json) |
-| No duplicate Java server span | pass | [all scenario graphs and statuses](evidence/otel-getsockopt-tls13-c9d14356/README.md#retained-proof) |
-| No vendor UI or backend | pass | [sanitized runtime image inventory](evidence/otel-getsockopt-tls13-c9d14356/runtime-images.json) |
+| Valid W3C through stale primary state | pass | [retained `1ns` stale graph, terminal diagnostics, and recovery](evidence/otel-getsockopt-tls13-e8db066a/README.md#retained-proof) |
+| Valid W3C through primary version, declared-size, and zero-ID responses | pass | [four one-shot returned-response fault graphs and normal recovery](evidence/otel-getsockopt-tls13-e8db066a/README.md#retained-proof) |
+| Primary same/sibling and live-descriptor isolation | pass | [bounded probes, ordered metric windows, exact-parent victims, and recovery](evidence/otel-getsockopt-tls13-e8db066a/README.md#retained-proof) |
+| Unix application-descriptor mismatch | not applicable | Unix does not accept an application FD; [peer/TID/capability and endpoint controls](SECURITY.md) are the applicable isolation cases |
+| Invalid W3C falls through to OBI | pass | [fallback graph](evidence/otel-getsockopt-tls13-e8db066a/scenario-w3c.json) and [passing counter assertion status](evidence/otel-getsockopt-tls13-e8db066a/scenario-w3c-status.json); the ordinary phase counter values are omitted |
+| Sequential backend keepalive | pass | [keepalive graph and connection evidence](evidence/otel-getsockopt-tls13-e8db066a/scenario-keepalive.json) |
+| HTTP/1.1 pipelining | pass | [pipelining graph and connection evidence](evidence/otel-getsockopt-tls13-e8db066a/scenario-pipelining.json) |
+| Parallel requests/connections | pass | [concurrency graph and connection evidence](evidence/otel-getsockopt-tls13-e8db066a/scenario-concurrency.json) |
+| FD and ephemeral-port reuse | pass | [reuse graph and connection evidence](evidence/otel-getsockopt-tls13-e8db066a/scenario-fd-port-reuse.json) |
+| Servlet/executor handoff | pass | [executor-handoff graph](evidence/otel-getsockopt-tls13-e8db066a/scenario-handoff.json) |
+| Java 21 virtual-thread handoff | pass | [virtual-thread graph](evidence/otel-getsockopt-tls13-e8db066a/scenario-virtual-thread.json) |
+| Jetty Netty-executor handoff | pass | [Netty handoff graph](evidence/otel-getsockopt-tls13-e8db066a/scenario-netty.json) |
+| Inbound Netty server extraction | pass | [Apache-to-Netty exact-parent graph](evidence/otel-getsockopt-tls13-e8db066a/scenario-netty-server.json); this is the bounded fixture only |
+| Repeated servlet async redispatch | pass | [redispatch graph](evidence/otel-getsockopt-tls13-e8db066a/scenario-dispatch.json) |
+| Live handoff-map pressure | pass | [pressure accounting](evidence/otel-getsockopt-tls13-e8db066a/scenario-pressure-status.json), [cleanup and recovery](evidence/otel-getsockopt-tls13-e8db066a/map-pressure-summary.json) |
+| OBI absent at JVM start and late attach | pass | [absence, late attach, and recovery evidence](evidence/otel-getsockopt-tls13-e8db066a/README.md#retained-proof) |
+| Bridge-disabled control | pass | [bridge-disabled graph](evidence/otel-getsockopt-tls13-e8db066a/scenario-disabled.json) |
+| Extension absent and disabled controls | pass | [extension-control graphs](evidence/otel-getsockopt-tls13-e8db066a/README.md#retained-proof) |
+| Uninstrumented control | pass | [zero-span control](evidence/otel-getsockopt-tls13-e8db066a/scenario-uninstrumented.json) |
+| Java SDK duplicate-suppression detection | pass | [allowlisted suppression metric and bounded first-export timing](evidence/otel-getsockopt-tls13-e8db066a/delayed-otlp-suppression.json); detection occurs only after the first official SDK export |
+| No duplicate Java server span after detection | pass | [post-detection exact-parent graph](evidence/otel-getsockopt-tls13-e8db066a/scenario-basic-delayed-otlp-suppression.json); the retained prime request has one startup-window OBI span before detection and is an explicit limitation, not a no-duplicate pass |
+| No vendor UI or backend | pass | [sanitized runtime image inventory](evidence/otel-getsockopt-tls13-e8db066a/runtime-images.json) |
 
 ## VM-gated primary fault fixture
 
@@ -136,27 +139,29 @@ outcomes.
 ## Issue coverage and remaining evidence gaps
 
 The retained OpenTelemetry cells and the named Splunk primary cell prove
-applicable issue #28 extraction cases, including exact one-shot operation
-counters and request graphs. The V2 Java snapshots record configuration
-selection; OBI availability metrics remain readiness evidence only. Benchmark
-and external compatibility requirements remain open as listed in the final
-column.
+applicable issue #28 extraction cases through request graphs and passing
+one-shot counter/diagnostic assertions. Exact counter values are retained only
+for the explicitly linked bounded fault, security, pressure, and suppression
+summaries; ordinary phase snapshots are omitted. The V2 Java snapshots record
+configuration selection; OBI availability metrics remain readiness evidence
+only. Benchmark and external compatibility requirements remain open as listed
+in the final column.
 
 | Issue | Asset coverage | Still required before pass |
 | --- | --- | --- |
-| #19 Java SDK suppression | retained getsockopt and Unix avoided-service metrics plus exact-parent traffic passed | retain any additional supported agent cells required by the final support statement |
-| #27 agent compatibility | OpenTelemetry cells at `c9d14356`, `c7209e43`, `bd1c9327`, and `6c4a2505`, plus Splunk 2.28.0 at `47237792`, passed their named cells | execute the declared JVM/architecture matrix and remaining agent cells |
-| #28 Java extraction matrix | applicable getsockopt and Unix OpenTelemetry cases, including Unix/TLS 1.3 at `6c4a2505`, plus Splunk getsockopt/TLS 1.3, passed with exact graphs and one-shot counters | execute remaining agent, transport, and child-semantics cells |
+| #19 Java SDK suppression | retained getsockopt and Unix avoided-service metrics plus exact-parent traffic pass after detection; the delayed-export control records one bounded startup-window OBI span before behavioral detection and one exact-parent official SDK span with no OBI duplicate afterward | exercise missing protocol coverage and prove it is not hidden by an all-or-nothing instrumentation-disable path; retain any additional supported agent cells required by the final support statement; do not describe the pre-detection startup window as duplicate-free |
+| #27 agent compatibility | OpenTelemetry cells at `e8db066a`, `c7209e43`, `bd1c9327`, and `6c4a2505`, plus Splunk 2.28.0 at `47237792`, passed their named cells | execute the declared JVM/architecture matrix and remaining agent cells |
+| #28 Java extraction matrix | applicable getsockopt and Unix OpenTelemetry cases, including Unix/TLS 1.3 at `6c4a2505`, plus Splunk getsockopt/TLS 1.3, passed with exact graphs and passing one-shot counter assertions | retain dedicated stock-agent runtime controls for multiple extraction calls on one request and nested/duplicate-server-instrumenter activation; execute remaining agent, transport, and child-semantics cells |
 | #31 deterministic traffic/assertions | retained OpenTelemetry and Splunk primary cells plus the Unix/TLS 1.3 control cell passed with exact IDs, flags, controls, and status records | retain the remaining advertised cells |
 | #32 complete runbook | current runbook contains bounded startup/cleanup, exact controls, and an intentional failed-assertion artifact path | retain a clean-host execution whenever the runbook changes |
 | #33 final report | definition-of-done reconciliation names every parent item and the currently passing evidence | resolve the parent item 6 gaps before declaring PoC success |
-| #34 stress | retained TLS 1.3 and TLS 1.2 primary, and Unix TLS 1.2 plus the TLS 1.3 security/recovery control stress cases passed | execute remaining advertised cells |
-| #35 handoff | executor, virtual-thread, Netty worker, redispatch, and bounded inbound-Netty receive-to-extraction scenarios passed in the retained primary run | execute the remaining framework and environment matrix evidence |
-| #36 fail-open | retained primary and Unix absence, restart, attach, disabled, fault, and recovery controls passed; [current Unix acceptance evidence](evidence/otel-unix-tls13-6c4a2505/README.md) adds stale/W3C/recovery; [focused current primary evidence](focused-validation/primary-getsockopt-8f0aa1f6/README.md) also covers stale/W3C/recovery and version/zero-ID fail-open responses; the source control additionally covers a malformed declared-size primary response | retain a clean full primary artifact for the malformed declared-size response, the VM-gated component artifact, and focused or retained evidence for the declared-size primary response before promoting targeted controls to acceptance evidence |
+| #34 stress | retained TLS 1.3 and TLS 1.2 primary, and Unix TLS 1.2 plus the TLS 1.3 security/recovery control request and decrypted-read stress cases passed | retain an actual TLS-record split/coalescing control across Java reads; execute remaining advertised cells |
+| #35 handoff | executor, virtual-thread, Netty worker, redispatch, and bounded inbound-Netty receive-to-extraction scenarios passed in the retained primary run | retain a runtime parent-chain depth/cycle-limit control; execute the remaining framework and environment matrix evidence |
+| #36 fail-open | retained primary and Unix bounded startup absence/late attach, failed attach, disabled, timeout, disconnect, overload, restart, TTL-stale, version, declared-size, truncated-frame, zero-ID, map-pressure/FD-reuse, W3C-precedence, and recovery controls pass for their transport-applicable cells | retain application-level controls for permanent process-lifetime OBI absence, an explicit stale-generation mismatch, genuine TID/PID reuse, and `auto` with both primary and fallback unavailable; the VM-gated direct component fixture remains a separate unretained compatibility cell |
 | #37 benchmark | predeclared matrix, repeated bounded workload, and resource/map snapshots | execute on fixed hardware and add sustained latency/throughput evidence |
 | #38 compatibility | exact Linux unified-v2 `amd64` OpenTelemetry Unix/TLS 1.3 cell at `6c4a2505` is retained; the rest remains explicitly untested | execute each remaining claimed kernel/cgroup/architecture/JVM/agent/TLS/transport cell |
-| #39 diagnostics | retained OpenTelemetry and Splunk per-scenario counters, current availability schema, V2 snapshots, and suppression evidence passed | execute remaining agent/environment cells |
-| #40 security | retained Unix forged/flood/path/permission matrix, sibling and same-cgroup attacker topology, exact-parent victims, stale-TTL rejection, and recovery passed in the [current Unix acceptance bundle](evidence/otel-unix-tls13-6c4a2505/README.md); [focused current primary evidence](focused-validation/primary-getsockopt-8f0aa1f6/README.md) covers isolated same-cgroup and sibling abuse windows, a legitimate victim, recovery, and stale TTL rejection; the [current primary socket-isolation result](evidence/otel-getsockopt-tls13-b678ce1e/README.md) passed the same-JVM separate live unnegotiated socket control, `pidfd_getfd` availability, two ordered aggregate metric-verified denials, exact-parent held victim, and recovery | retain Unix wrong-socket evidence and any full-cell artifact needed for the final support statement |
+| #39 diagnostics | retained OpenTelemetry and Splunk per-scenario assertion statuses, current availability schema, V2 snapshots, delayed-first-export suppression evidence, and bounded public diagnostic summaries passed; exact values are retained only for named bounded controls | retain bounded counter/log evidence that makes every negative test diagnosable and a runtime endpoint/log non-disclosure audit; execute remaining agent/environment cells |
+| #40 security | retained Unix forged/flood/path/permission matrix, sibling and same-cgroup topology, exact-parent victims, stale-TTL rejection, and recovery pass; the [current primary acceptance result](evidence/otel-getsockopt-tls13-e8db066a/README.md) adds same/sibling isolated unauthorized windows, same-JVM wrong-live-socket and duplicated-descriptor controls, exact-parent victims, stale/malformed rejection, and recovery | retain explicit stale-generation-mismatch, genuine TID/PID-reuse, primary wrong-current-TID/logical-execution, and runtime diagnostic-side-channel controls; broader environment coverage remains tracked by #38 |
 
 Unexecuted rows remain `untested`; a plan or template is not a successful
 validation result.

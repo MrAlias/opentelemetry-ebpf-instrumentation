@@ -1,0 +1,46 @@
+{
+  "status": "passed",
+  "schedule_delay_milliseconds": 60000,
+  "prime_request_count": 1,
+  "receiver_before_request": {
+    "received_batches": 0,
+    "received_spans": 0,
+    "retained_spans": 0,
+    "retained_bytes": 0,
+    "dropped_spans": 0
+  },
+  "receiver_before_export_boundary": {
+    "received_batches": 0,
+    "received_spans": 0,
+    "retained_spans": 0,
+    "retained_bytes": 0,
+    "dropped_spans": 0
+  },
+  "receiver_ready": {
+    "received_batches": 2,
+    "received_spans": 6,
+    "retained_spans": 5,
+    "retained_bytes": 1369,
+    "dropped_spans": 0,
+    "span_inventory": {
+      "apache_spans": 3,
+      "unscoped_obi_java_server_spans": 1,
+      "official_sdk_jetty_server_spans": 1,
+      "official_sdk_scope": "io.opentelemetry.jetty-11.0"
+    },
+    "unscoped_java_received_before_export_boundary_milliseconds": 28138,
+    "official_sdk_received_after_export_boundary_milliseconds": 1246
+  },
+  "suppression_signal": {
+    "before_request": "absent",
+    "before_export_boundary": "absent",
+    "receiver_ready": "present"
+  },
+  "post_detection": {
+    "scenario": "scenario-basic-delayed-otlp-suppression.json",
+    "scenario_status": "passed",
+    "official_sdk_jetty_server_spans": 1,
+    "unscoped_obi_java_server_spans": 0,
+    "exact_remote_parent": true
+  }
+}

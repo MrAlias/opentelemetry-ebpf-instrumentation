@@ -1,0 +1,9 @@
+{
+  "status": "passed",
+  "exit_status": 0,
+  "acceptance_evidence": true,
+  "acceptance_evidence_reason": "none",
+  "failure_stage": "none",
+  "failure_line": 0,
+  "evidence_id": "otel-getsockopt-tls13-e8db066a"
+}

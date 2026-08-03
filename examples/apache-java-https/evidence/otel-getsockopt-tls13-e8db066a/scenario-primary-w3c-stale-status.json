@@ -1,0 +1,8 @@
+{
+  "status": "passed",
+  "scenario": "primary-w3c-stale",
+  "exit_status": 0,
+  "metric_status": 0,
+  "pressure_correlation": null,
+  "result": "scenario-primary-w3c-stale.json"
+}

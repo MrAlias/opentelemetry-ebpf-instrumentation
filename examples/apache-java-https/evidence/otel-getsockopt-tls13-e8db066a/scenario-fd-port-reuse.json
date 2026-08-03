@@ -1,0 +1,3484 @@
+{
+  "status": "passed",
+  "scenario": "fd-port-reuse",
+  "seed": 1,
+  "started_at": "2026-08-03T15:29:10.957223791Z",
+  "finished_at": "2026-08-03T15:29:26.173404836Z",
+  "request_count": 32,
+  "traffic_elapsed_nanos": 400185994,
+  "throughput_per_second": 79.96281848884496,
+  "latency": {
+    "p50_nanos": 12082094,
+    "p95_nanos": 14502120,
+    "p99_nanos": 17405409
+  },
+  "connection_evidence": {
+    "frontend_connections": 32,
+    "frontend_protocol": "HTTP/1.1",
+    "reused_frontend_local_port": 38900,
+    "reused_frontend_file_descriptor": 6,
+    "distinct_frontend_local_ports": 1,
+    "backend_connections": 32,
+    "distinct_backend_connection_ids": 32,
+    "distinct_backend_remote_ports": 32,
+    "reused_backend_file_descriptor": 49
+  },
+  "cases": [
+    {
+      "request": {
+        "marker": "fd-port-reuse-00-84aca3ab04bf90af",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-00-84aca3ab04bf90af",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 60,
+        "backend_remote_port": 38486,
+        "backend_socket_fd": 53,
+        "tls_read_events": 90,
+        "tls_read_bytes": 22465
+      },
+      "latency_nanos": 17405409,
+      "trace": {
+        "marker": "fd-port-reuse-00-84aca3ab04bf90af",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "346848d9228d55321d90b9dc299befda",
+            "span_id": "ba4cd9db5ccfbfc3",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-00-84aca3ab04bf90af",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770950959133534,
+            "end_unix_nano": 1785770950975699326,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "346848d9228d55321d90b9dc299befda",
+            "span_id": "85dfa7b20b146838",
+            "parent_span_id": "ba4cd9db5ccfbfc3",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770950959209697,
+            "end_unix_nano": 1785770950975699326,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "346848d9228d55321d90b9dc299befda",
+            "span_id": "40ec118d3eafc1bc",
+            "parent_span_id": "85dfa7b20b146838",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-00-84aca3ab04bf90af",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770950959376335,
+            "end_unix_nano": 1785770950975500798,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "346848d9228d55321d90b9dc299befda",
+            "span_id": "bfdcb81ec72ddf69",
+            "parent_span_id": "40ec118d3eafc1bc",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-00-84aca3ab04bf90af",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770950965589739,
+            "end_unix_nano": 1785770950976115938,
+            "received_unix_milli": 1785770951048
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-01-81258b8b3c2ef39c",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-01-81258b8b3c2ef39c",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 61,
+        "backend_remote_port": 38502,
+        "backend_socket_fd": 49,
+        "tls_read_events": 91,
+        "tls_read_bytes": 22743
+      },
+      "latency_nanos": 14502120,
+      "trace": {
+        "marker": "fd-port-reuse-01-81258b8b3c2ef39c",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "a2a35ed23012f89709bff3d106b33b4c",
+            "span_id": "828c5e50b9600385",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-01-81258b8b3c2ef39c",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770950976214797,
+            "end_unix_nano": 1785770950990399147,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "a2a35ed23012f89709bff3d106b33b4c",
+            "span_id": "4a0750895ebce4da",
+            "parent_span_id": "828c5e50b9600385",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770950976270150,
+            "end_unix_nano": 1785770950990399147,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "a2a35ed23012f89709bff3d106b33b4c",
+            "span_id": "20fa0d1b6a12ba6d",
+            "parent_span_id": "4a0750895ebce4da",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-01-81258b8b3c2ef39c",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770950976409067,
+            "end_unix_nano": 1785770950990202466,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "a2a35ed23012f89709bff3d106b33b4c",
+            "span_id": "1aaa1e78c0602417",
+            "parent_span_id": "20fa0d1b6a12ba6d",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-01-81258b8b3c2ef39c",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770950982324544,
+            "end_unix_nano": 1785770950990783971,
+            "received_unix_milli": 1785770951048
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-02-69181de3112db607",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-02-69181de3112db607",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 62,
+        "backend_remote_port": 38510,
+        "backend_socket_fd": 53,
+        "tls_read_events": 92,
+        "tls_read_bytes": 23021
+      },
+      "latency_nanos": 13406692,
+      "trace": {
+        "marker": "fd-port-reuse-02-69181de3112db607",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "0b602efe67eaf8a01bdfafa7e30dbfe9",
+            "span_id": "1b8a47e9092d94a2",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-02-69181de3112db607",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770950990810982,
+            "end_unix_nano": 1785770951003862807,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "0b602efe67eaf8a01bdfafa7e30dbfe9",
+            "span_id": "6dbb66d2fb892f13",
+            "parent_span_id": "1b8a47e9092d94a2",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770950990867513,
+            "end_unix_nano": 1785770951003862807,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "0b602efe67eaf8a01bdfafa7e30dbfe9",
+            "span_id": "2cbb09e224e0d8b3",
+            "parent_span_id": "6dbb66d2fb892f13",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-02-69181de3112db607",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770950991016806,
+            "end_unix_nano": 1785770951003660508,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "0b602efe67eaf8a01bdfafa7e30dbfe9",
+            "span_id": "b89ea0ac8b633980",
+            "parent_span_id": "2cbb09e224e0d8b3",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-02-69181de3112db607",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770950996547438,
+            "end_unix_nano": 1785770951004258506,
+            "received_unix_milli": 1785770951048
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-03-99a46ecb47f6e500",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-03-99a46ecb47f6e500",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 63,
+        "backend_remote_port": 38522,
+        "backend_socket_fd": 49,
+        "tls_read_events": 93,
+        "tls_read_bytes": 23299
+      },
+      "latency_nanos": 13858349,
+      "trace": {
+        "marker": "fd-port-reuse-03-99a46ecb47f6e500",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "38974a000bdee4a5d3f4c784f2c28cc3",
+            "span_id": "98c8235e40ac254f",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-03-99a46ecb47f6e500",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951004331944,
+            "end_unix_nano": 1785770951017743008,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "38974a000bdee4a5d3f4c784f2c28cc3",
+            "span_id": "e418022a068dbbc3",
+            "parent_span_id": "98c8235e40ac254f",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951004401465,
+            "end_unix_nano": 1785770951017743008,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "38974a000bdee4a5d3f4c784f2c28cc3",
+            "span_id": "c233fd21c2ef12d8",
+            "parent_span_id": "e418022a068dbbc3",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-03-99a46ecb47f6e500",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951004551678,
+            "end_unix_nano": 1785770951017463582,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "38974a000bdee4a5d3f4c784f2c28cc3",
+            "span_id": "682ca417ff0bc59f",
+            "parent_span_id": "c233fd21c2ef12d8",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-03-99a46ecb47f6e500",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951011745492,
+            "end_unix_nano": 1785770951017698572,
+            "received_unix_milli": 1785770951048
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-04-102974141d8fb095",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-04-102974141d8fb095",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 64,
+        "backend_remote_port": 38536,
+        "backend_socket_fd": 53,
+        "tls_read_events": 94,
+        "tls_read_bytes": 23577
+      },
+      "latency_nanos": 11867785,
+      "trace": {
+        "marker": "fd-port-reuse-04-102974141d8fb095",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "3ca225631654a2145ee7d6c6279408d6",
+            "span_id": "706af4805eb1dd4a",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-04-102974141d8fb095",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951018168710,
+            "end_unix_nano": 1785770951029623842,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "3ca225631654a2145ee7d6c6279408d6",
+            "span_id": "bbcc34948c479909",
+            "parent_span_id": "706af4805eb1dd4a",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951018226292,
+            "end_unix_nano": 1785770951029623842,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "3ca225631654a2145ee7d6c6279408d6",
+            "span_id": "bb10167a5c5c3807",
+            "parent_span_id": "bbcc34948c479909",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-04-102974141d8fb095",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951018376437,
+            "end_unix_nano": 1785770951029446924,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "3ca225631654a2145ee7d6c6279408d6",
+            "span_id": "d46377355219d796",
+            "parent_span_id": "bb10167a5c5c3807",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-04-102974141d8fb095",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951023895107,
+            "end_unix_nano": 1785770951029775247,
+            "received_unix_milli": 1785770951048
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-05-097cf69e40fce846",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-05-097cf69e40fce846",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 65,
+        "backend_remote_port": 38546,
+        "backend_socket_fd": 49,
+        "tls_read_events": 95,
+        "tls_read_bytes": 23855
+      },
+      "latency_nanos": 11827124,
+      "trace": {
+        "marker": "fd-port-reuse-05-097cf69e40fce846",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "6ed5b07f9f6d69b92deef2ec6660203e",
+            "span_id": "42107a8492c085d5",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-05-097cf69e40fce846",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951030075832,
+            "end_unix_nano": 1785770951041491341,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "6ed5b07f9f6d69b92deef2ec6660203e",
+            "span_id": "93f570e0a8270a71",
+            "parent_span_id": "42107a8492c085d5",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951030136924,
+            "end_unix_nano": 1785770951041491341,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "6ed5b07f9f6d69b92deef2ec6660203e",
+            "span_id": "7f39e575e64bed1c",
+            "parent_span_id": "93f570e0a8270a71",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-05-097cf69e40fce846",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951030291429,
+            "end_unix_nano": 1785770951041307607,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "6ed5b07f9f6d69b92deef2ec6660203e",
+            "span_id": "0bbb7aaa4775ac77",
+            "parent_span_id": "7f39e575e64bed1c",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-05-097cf69e40fce846",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951035995343,
+            "end_unix_nano": 1785770951041908895,
+            "received_unix_milli": 1785770951048
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-06-f475130e5e7a086a",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-06-f475130e5e7a086a",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 66,
+        "backend_remote_port": 38548,
+        "backend_socket_fd": 53,
+        "tls_read_events": 96,
+        "tls_read_bytes": 24133
+      },
+      "latency_nanos": 13867579,
+      "trace": {
+        "marker": "fd-port-reuse-06-f475130e5e7a086a",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "04d02a17e874003614b57796fd8051aa",
+            "span_id": "c4029461111af3fe",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-06-f475130e5e7a086a",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951041924706,
+            "end_unix_nano": 1785770951055466602,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "04d02a17e874003614b57796fd8051aa",
+            "span_id": "bc56baf08ec28435",
+            "parent_span_id": "c4029461111af3fe",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951041977825,
+            "end_unix_nano": 1785770951055466602,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "04d02a17e874003614b57796fd8051aa",
+            "span_id": "caa2013c1540de89",
+            "parent_span_id": "bc56baf08ec28435",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-06-f475130e5e7a086a",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951042138278,
+            "end_unix_nano": 1785770951055282653,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "04d02a17e874003614b57796fd8051aa",
+            "span_id": "bb85b4622fbd35fe",
+            "parent_span_id": "caa2013c1540de89",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-06-f475130e5e7a086a",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951049851682,
+            "end_unix_nano": 1785770951055812315,
+            "received_unix_milli": 1785770951150
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-07-5e50fbe4601fcc4f",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-07-5e50fbe4601fcc4f",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 67,
+        "backend_remote_port": 38552,
+        "backend_socket_fd": 49,
+        "tls_read_events": 97,
+        "tls_read_bytes": 24411
+      },
+      "latency_nanos": 11468509,
+      "trace": {
+        "marker": "fd-port-reuse-07-5e50fbe4601fcc4f",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "4fc61570ea919b5786f2dd6b851bd241",
+            "span_id": "feacd1b3a5d63a5c",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-07-5e50fbe4601fcc4f",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951055843968,
+            "end_unix_nano": 1785770951066976288,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "4fc61570ea919b5786f2dd6b851bd241",
+            "span_id": "610a4bf74f0771fb",
+            "parent_span_id": "feacd1b3a5d63a5c",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951055910021,
+            "end_unix_nano": 1785770951066976288,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "4fc61570ea919b5786f2dd6b851bd241",
+            "span_id": "eca9cb0311d09924",
+            "parent_span_id": "610a4bf74f0771fb",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-07-5e50fbe4601fcc4f",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951056072440,
+            "end_unix_nano": 1785770951066799944,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "4fc61570ea919b5786f2dd6b851bd241",
+            "span_id": "eb0a127e829a1a1a",
+            "parent_span_id": "eca9cb0311d09924",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-07-5e50fbe4601fcc4f",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951061483640,
+            "end_unix_nano": 1785770951067106226,
+            "received_unix_milli": 1785770951150
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-08-d76e41efb7d64880",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-08-d76e41efb7d64880",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 68,
+        "backend_remote_port": 38566,
+        "backend_socket_fd": 53,
+        "tls_read_events": 98,
+        "tls_read_bytes": 24689
+      },
+      "latency_nanos": 11315747,
+      "trace": {
+        "marker": "fd-port-reuse-08-d76e41efb7d64880",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "d07ef6d9704528a6dc0313645c2b9645",
+            "span_id": "ff662e3b2a724a6a",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-08-d76e41efb7d64880",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951067323973,
+            "end_unix_nano": 1785770951078250624,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "d07ef6d9704528a6dc0313645c2b9645",
+            "span_id": "f92561a6b50b317b",
+            "parent_span_id": "ff662e3b2a724a6a",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951067379502,
+            "end_unix_nano": 1785770951078250624,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "d07ef6d9704528a6dc0313645c2b9645",
+            "span_id": "fe4d72b54c0e3153",
+            "parent_span_id": "f92561a6b50b317b",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-08-d76e41efb7d64880",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951067518070,
+            "end_unix_nano": 1785770951078071097,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "d07ef6d9704528a6dc0313645c2b9645",
+            "span_id": "e04c01ba82b13648",
+            "parent_span_id": "fe4d72b54c0e3153",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-08-d76e41efb7d64880",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951072713982,
+            "end_unix_nano": 1785770951078636028,
+            "received_unix_milli": 1785770951150
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-09-8702225fc4027b85",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-09-8702225fc4027b85",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 69,
+        "backend_remote_port": 38572,
+        "backend_socket_fd": 49,
+        "tls_read_events": 99,
+        "tls_read_bytes": 24967
+      },
+      "latency_nanos": 12346413,
+      "trace": {
+        "marker": "fd-port-reuse-09-8702225fc4027b85",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "7b50360e1d6656db2e71cc9853dc54cb",
+            "span_id": "f575b3b67d05f005",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-09-8702225fc4027b85",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951078700329,
+            "end_unix_nano": 1785770951090641174,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "7b50360e1d6656db2e71cc9853dc54cb",
+            "span_id": "9dde5f9b4d7f619e",
+            "parent_span_id": "f575b3b67d05f005",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951078783482,
+            "end_unix_nano": 1785770951090641174,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "7b50360e1d6656db2e71cc9853dc54cb",
+            "span_id": "8b17073db0b72b25",
+            "parent_span_id": "9dde5f9b4d7f619e",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-09-8702225fc4027b85",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951078961022,
+            "end_unix_nano": 1785770951090386174,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "7b50360e1d6656db2e71cc9853dc54cb",
+            "span_id": "8d2e6adb3d047bf3",
+            "parent_span_id": "8b17073db0b72b25",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-09-8702225fc4027b85",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951084899374,
+            "end_unix_nano": 1785770951090667998,
+            "received_unix_milli": 1785770951150
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-10-5aa4c56453a92ff1",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-10-5aa4c56453a92ff1",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 70,
+        "backend_remote_port": 38574,
+        "backend_socket_fd": 53,
+        "tls_read_events": 100,
+        "tls_read_bytes": 25245
+      },
+      "latency_nanos": 12082094,
+      "trace": {
+        "marker": "fd-port-reuse-10-5aa4c56453a92ff1",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "47c3965a2df1b122ad9e7aa172b684b3",
+            "span_id": "d1e440139f7169a8",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-10-5aa4c56453a92ff1",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951091093398,
+            "end_unix_nano": 1785770951102866596,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "47c3965a2df1b122ad9e7aa172b684b3",
+            "span_id": "bdbd1e6f7d0308cb",
+            "parent_span_id": "d1e440139f7169a8",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951091146813,
+            "end_unix_nano": 1785770951102866596,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "47c3965a2df1b122ad9e7aa172b684b3",
+            "span_id": "06fd6a8416030583",
+            "parent_span_id": "bdbd1e6f7d0308cb",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-10-5aa4c56453a92ff1",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951091292517,
+            "end_unix_nano": 1785770951102630444,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "47c3965a2df1b122ad9e7aa172b684b3",
+            "span_id": "9e26d349301539f5",
+            "parent_span_id": "06fd6a8416030583",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-10-5aa4c56453a92ff1",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951097014147,
+            "end_unix_nano": 1785770951102986727,
+            "received_unix_milli": 1785770951150
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-11-187734f0a3a0775e",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-11-187734f0a3a0775e",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 71,
+        "backend_remote_port": 38576,
+        "backend_socket_fd": 49,
+        "tls_read_events": 101,
+        "tls_read_bytes": 25523
+      },
+      "latency_nanos": 12161609,
+      "trace": {
+        "marker": "fd-port-reuse-11-187734f0a3a0775e",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "22c7bce51dc2edf90792de723e4dfe57",
+            "span_id": "2b52708e78f1d1d3",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-11-187734f0a3a0775e",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951103239091,
+            "end_unix_nano": 1785770951115050588,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "22c7bce51dc2edf90792de723e4dfe57",
+            "span_id": "18586e377f8f2219",
+            "parent_span_id": "2b52708e78f1d1d3",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951103301800,
+            "end_unix_nano": 1785770951115050588,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "22c7bce51dc2edf90792de723e4dfe57",
+            "span_id": "f77e228a80e89bd4",
+            "parent_span_id": "18586e377f8f2219",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-11-187734f0a3a0775e",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951103497575,
+            "end_unix_nano": 1785770951114813548,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "22c7bce51dc2edf90792de723e4dfe57",
+            "span_id": "2fc8b40d3e50a3e4",
+            "parent_span_id": "f77e228a80e89bd4",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-11-187734f0a3a0775e",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951109347093,
+            "end_unix_nano": 1785770951115174486,
+            "received_unix_milli": 1785770951150
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-12-1801bd8b28562d13",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-12-1801bd8b28562d13",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 72,
+        "backend_remote_port": 38582,
+        "backend_socket_fd": 53,
+        "tls_read_events": 102,
+        "tls_read_bytes": 25801
+      },
+      "latency_nanos": 11561827,
+      "trace": {
+        "marker": "fd-port-reuse-12-1801bd8b28562d13",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "c24c43e89b7440904a8bef186a298345",
+            "span_id": "72d9084d8295255b",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-12-1801bd8b28562d13",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951115451425,
+            "end_unix_nano": 1785770951126649834,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "c24c43e89b7440904a8bef186a298345",
+            "span_id": "d3bcd2a7131165b1",
+            "parent_span_id": "72d9084d8295255b",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951115511734,
+            "end_unix_nano": 1785770951126649834,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "c24c43e89b7440904a8bef186a298345",
+            "span_id": "a7a38a20c43acc66",
+            "parent_span_id": "d3bcd2a7131165b1",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-12-1801bd8b28562d13",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951115650498,
+            "end_unix_nano": 1785770951126449872,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "c24c43e89b7440904a8bef186a298345",
+            "span_id": "ba36228167e79b9b",
+            "parent_span_id": "a7a38a20c43acc66",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-12-1801bd8b28562d13",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951120991895,
+            "end_unix_nano": 1785770951126779557,
+            "received_unix_milli": 1785770951150
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-13-af5beafc3c6b0e29",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-13-af5beafc3c6b0e29",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 73,
+        "backend_remote_port": 38590,
+        "backend_socket_fd": 49,
+        "tls_read_events": 103,
+        "tls_read_bytes": 26079
+      },
+      "latency_nanos": 11694574,
+      "trace": {
+        "marker": "fd-port-reuse-13-af5beafc3c6b0e29",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "b7f83895863450edeee12c80d604f4ae",
+            "span_id": "452cc4324e0ffd84",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-13-af5beafc3c6b0e29",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951127036685,
+            "end_unix_nano": 1785770951138423282,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "b7f83895863450edeee12c80d604f4ae",
+            "span_id": "ca965b212a4f25ad",
+            "parent_span_id": "452cc4324e0ffd84",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951127099254,
+            "end_unix_nano": 1785770951138423282,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "b7f83895863450edeee12c80d604f4ae",
+            "span_id": "e294ccd9009f6ecf",
+            "parent_span_id": "ca965b212a4f25ad",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-13-af5beafc3c6b0e29",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951127260439,
+            "end_unix_nano": 1785770951138238617,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "b7f83895863450edeee12c80d604f4ae",
+            "span_id": "23112dee9bd2beda",
+            "parent_span_id": "e294ccd9009f6ecf",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-13-af5beafc3c6b0e29",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951132893379,
+            "end_unix_nano": 1785770951138821768,
+            "received_unix_milli": 1785770951150
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-14-f9f8f612d660297d",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-14-f9f8f612d660297d",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 74,
+        "backend_remote_port": 38596,
+        "backend_socket_fd": 53,
+        "tls_read_events": 104,
+        "tls_read_bytes": 26357
+      },
+      "latency_nanos": 11558103,
+      "trace": {
+        "marker": "fd-port-reuse-14-f9f8f612d660297d",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "94fde336e30173f7dade6c16d46cd3d3",
+            "span_id": "d4ac66665249f273",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-14-f9f8f612d660297d",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951138791104,
+            "end_unix_nano": 1785770951150026609,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "94fde336e30173f7dade6c16d46cd3d3",
+            "span_id": "3d84f40d253567fc",
+            "parent_span_id": "d4ac66665249f273",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951138840481,
+            "end_unix_nano": 1785770951150026609,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "94fde336e30173f7dade6c16d46cd3d3",
+            "span_id": "5b777f51d698baa1",
+            "parent_span_id": "3d84f40d253567fc",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-14-f9f8f612d660297d",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951138980789,
+            "end_unix_nano": 1785770951149848339,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "94fde336e30173f7dade6c16d46cd3d3",
+            "span_id": "95825bea0f449519",
+            "parent_span_id": "5b777f51d698baa1",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-14-f9f8f612d660297d",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951144671086,
+            "end_unix_nano": 1785770951150372276,
+            "received_unix_milli": 1785770951252
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-15-292a6b3d5397ad60",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-15-292a6b3d5397ad60",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 75,
+        "backend_remote_port": 38612,
+        "backend_socket_fd": 49,
+        "tls_read_events": 105,
+        "tls_read_bytes": 26635
+      },
+      "latency_nanos": 11377880,
+      "trace": {
+        "marker": "fd-port-reuse-15-292a6b3d5397ad60",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "4aa3e865c4be0c526449bb8a408a710c",
+            "span_id": "19037dd4f65c6075",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-15-292a6b3d5397ad60",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951150374035,
+            "end_unix_nano": 1785770951161457933,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "4aa3e865c4be0c526449bb8a408a710c",
+            "span_id": "8f66a3ec61a834a9",
+            "parent_span_id": "19037dd4f65c6075",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951150421927,
+            "end_unix_nano": 1785770951161457933,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "4aa3e865c4be0c526449bb8a408a710c",
+            "span_id": "1ec65603e65d860f",
+            "parent_span_id": "8f66a3ec61a834a9",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-15-292a6b3d5397ad60",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951150561538,
+            "end_unix_nano": 1785770951161276663,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "4aa3e865c4be0c526449bb8a408a710c",
+            "span_id": "180ac4a2f4a3186d",
+            "parent_span_id": "1ec65603e65d860f",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-15-292a6b3d5397ad60",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951156004612,
+            "end_unix_nano": 1785770951161831667,
+            "received_unix_milli": 1785770951252
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-16-ff29310d0dd635a0",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-16-ff29310d0dd635a0",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 76,
+        "backend_remote_port": 38618,
+        "backend_socket_fd": 53,
+        "tls_read_events": 106,
+        "tls_read_bytes": 26913
+      },
+      "latency_nanos": 13218584,
+      "trace": {
+        "marker": "fd-port-reuse-16-ff29310d0dd635a0",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "af8fd076be1914d30ecc54b547e1fd27",
+            "span_id": "5f95e58dfde9e6f5",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-16-ff29310d0dd635a0",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951161834948,
+            "end_unix_nano": 1785770951174717470,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "af8fd076be1914d30ecc54b547e1fd27",
+            "span_id": "4c2df284a69e7caf",
+            "parent_span_id": "5f95e58dfde9e6f5",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951161885282,
+            "end_unix_nano": 1785770951174717470,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "af8fd076be1914d30ecc54b547e1fd27",
+            "span_id": "d70c38d7d5cbb6e8",
+            "parent_span_id": "4c2df284a69e7caf",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-16-ff29310d0dd635a0",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951162015920,
+            "end_unix_nano": 1785770951174535723,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "af8fd076be1914d30ecc54b547e1fd27",
+            "span_id": "c59f5017fc4f30ee",
+            "parent_span_id": "d70c38d7d5cbb6e8",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-16-ff29310d0dd635a0",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951169061817,
+            "end_unix_nano": 1785770951175098457,
+            "received_unix_milli": 1785770951252
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-17-5513f86435de53eb",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-17-5513f86435de53eb",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 77,
+        "backend_remote_port": 38630,
+        "backend_socket_fd": 49,
+        "tls_read_events": 107,
+        "tls_read_bytes": 27191
+      },
+      "latency_nanos": 12231383,
+      "trace": {
+        "marker": "fd-port-reuse-17-5513f86435de53eb",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "41601c15672b0ee0260457b3bccbdc69",
+            "span_id": "9ca565fdc59627c0",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-17-5513f86435de53eb",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951175063765,
+            "end_unix_nano": 1785770951186979006,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "41601c15672b0ee0260457b3bccbdc69",
+            "span_id": "17fee74b09b27c8c",
+            "parent_span_id": "9ca565fdc59627c0",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951175118081,
+            "end_unix_nano": 1785770951186979006,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "41601c15672b0ee0260457b3bccbdc69",
+            "span_id": "01b2ff3ac2b36cd9",
+            "parent_span_id": "17fee74b09b27c8c",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-17-5513f86435de53eb",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951175271312,
+            "end_unix_nano": 1785770951186794270,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "41601c15672b0ee0260457b3bccbdc69",
+            "span_id": "e3983489f0da813f",
+            "parent_span_id": "01b2ff3ac2b36cd9",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-17-5513f86435de53eb",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951180438970,
+            "end_unix_nano": 1785770951187296745,
+            "received_unix_milli": 1785770951252
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-18-056e4350d59c9d29",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-18-056e4350d59c9d29",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 78,
+        "backend_remote_port": 38646,
+        "backend_socket_fd": 53,
+        "tls_read_events": 108,
+        "tls_read_bytes": 27469
+      },
+      "latency_nanos": 12571373,
+      "trace": {
+        "marker": "fd-port-reuse-18-056e4350d59c9d29",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "0d8e7de2ba15f63cd401298bfa3a4a8a",
+            "span_id": "a97c6d29fff27213",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-18-056e4350d59c9d29",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951187354947,
+            "end_unix_nano": 1785770951199604298,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "0d8e7de2ba15f63cd401298bfa3a4a8a",
+            "span_id": "dd71f5a8c3281abd",
+            "parent_span_id": "a97c6d29fff27213",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951187432414,
+            "end_unix_nano": 1785770951199604298,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "0d8e7de2ba15f63cd401298bfa3a4a8a",
+            "span_id": "621a088b7f44b49b",
+            "parent_span_id": "dd71f5a8c3281abd",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-18-056e4350d59c9d29",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951187619270,
+            "end_unix_nano": 1785770951199428407,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "0d8e7de2ba15f63cd401298bfa3a4a8a",
+            "span_id": "f32613278e015077",
+            "parent_span_id": "621a088b7f44b49b",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-18-056e4350d59c9d29",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951193178982,
+            "end_unix_nano": 1785770951199966339,
+            "received_unix_milli": 1785770951252
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-19-36c783d220219a3f",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-19-36c783d220219a3f",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 79,
+        "backend_remote_port": 38654,
+        "backend_socket_fd": 49,
+        "tls_read_events": 109,
+        "tls_read_bytes": 27747
+      },
+      "latency_nanos": 12929717,
+      "trace": {
+        "marker": "fd-port-reuse-19-36c783d220219a3f",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "9f8bdf19c5b50f03a1d23abdc7f50596",
+            "span_id": "d0fe1035a3b8bea0",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-19-36c783d220219a3f",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951199971984,
+            "end_unix_nano": 1785770951212557995,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "9f8bdf19c5b50f03a1d23abdc7f50596",
+            "span_id": "6ba4da76f80434a5",
+            "parent_span_id": "d0fe1035a3b8bea0",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951200040906,
+            "end_unix_nano": 1785770951212557995,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "9f8bdf19c5b50f03a1d23abdc7f50596",
+            "span_id": "69d528e2066d76ff",
+            "parent_span_id": "6ba4da76f80434a5",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-19-36c783d220219a3f",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951200207937,
+            "end_unix_nano": 1785770951212320125,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "9f8bdf19c5b50f03a1d23abdc7f50596",
+            "span_id": "1204a6255c6ee7e1",
+            "parent_span_id": "69d528e2066d76ff",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-19-36c783d220219a3f",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951206122016,
+            "end_unix_nano": 1785770951212651600,
+            "received_unix_milli": 1785770951252
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-20-dd678527b385aa26",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-20-dd678527b385aa26",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 80,
+        "backend_remote_port": 38656,
+        "backend_socket_fd": 53,
+        "tls_read_events": 110,
+        "tls_read_bytes": 28025
+      },
+      "latency_nanos": 11899054,
+      "trace": {
+        "marker": "fd-port-reuse-20-dd678527b385aa26",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "fccff1ae47eee6b19f7cb1399693ee0b",
+            "span_id": "44a48ce9d697b7a4",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-20-dd678527b385aa26",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951212950029,
+            "end_unix_nano": 1785770951224503342,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "fccff1ae47eee6b19f7cb1399693ee0b",
+            "span_id": "1b0d66d83f10a216",
+            "parent_span_id": "44a48ce9d697b7a4",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951213078822,
+            "end_unix_nano": 1785770951224503342,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "fccff1ae47eee6b19f7cb1399693ee0b",
+            "span_id": "72c6c249f0bca689",
+            "parent_span_id": "1b0d66d83f10a216",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-20-dd678527b385aa26",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951213217594,
+            "end_unix_nano": 1785770951224336111,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "fccff1ae47eee6b19f7cb1399693ee0b",
+            "span_id": "c8e7bd7df2471214",
+            "parent_span_id": "72c6c249f0bca689",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-20-dd678527b385aa26",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951218286479,
+            "end_unix_nano": 1785770951224617615,
+            "received_unix_milli": 1785770951252
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-21-e18cd620b3031e62",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-21-e18cd620b3031e62",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 81,
+        "backend_remote_port": 38660,
+        "backend_socket_fd": 49,
+        "tls_read_events": 111,
+        "tls_read_bytes": 28303
+      },
+      "latency_nanos": 12340510,
+      "trace": {
+        "marker": "fd-port-reuse-21-e18cd620b3031e62",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "7fe6a266513efcd8af157415f6be0308",
+            "span_id": "88755a1c41a3b83a",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-21-e18cd620b3031e62",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951224863371,
+            "end_unix_nano": 1785770951236870643,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "7fe6a266513efcd8af157415f6be0308",
+            "span_id": "fdffe340315c92dc",
+            "parent_span_id": "88755a1c41a3b83a",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951224915056,
+            "end_unix_nano": 1785770951236870643,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "7fe6a266513efcd8af157415f6be0308",
+            "span_id": "7c5c2e870d07720c",
+            "parent_span_id": "fdffe340315c92dc",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-21-e18cd620b3031e62",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951225064747,
+            "end_unix_nano": 1785770951236586211,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "7fe6a266513efcd8af157415f6be0308",
+            "span_id": "86e3e56bcd2c48b3",
+            "parent_span_id": "7c5c2e870d07720c",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-21-e18cd620b3031e62",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951230354696,
+            "end_unix_nano": 1785770951236836969,
+            "received_unix_milli": 1785770951252
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-22-96ecb130f8a39e65",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-22-96ecb130f8a39e65",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 82,
+        "backend_remote_port": 38668,
+        "backend_socket_fd": 53,
+        "tls_read_events": 112,
+        "tls_read_bytes": 28581
+      },
+      "latency_nanos": 13055714,
+      "trace": {
+        "marker": "fd-port-reuse-22-96ecb130f8a39e65",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "8cbfd6c40777d0c60f09a01b94db11c4",
+            "span_id": "f793e62c907cc429",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-22-96ecb130f8a39e65",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951237255011,
+            "end_unix_nano": 1785770951249939536,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "8cbfd6c40777d0c60f09a01b94db11c4",
+            "span_id": "788f04dd3cfc1128",
+            "parent_span_id": "f793e62c907cc429",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951237315473,
+            "end_unix_nano": 1785770951249939536,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "8cbfd6c40777d0c60f09a01b94db11c4",
+            "span_id": "4b30a617a262a360",
+            "parent_span_id": "788f04dd3cfc1128",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-22-96ecb130f8a39e65",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951237458404,
+            "end_unix_nano": 1785770951249733390,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "8cbfd6c40777d0c60f09a01b94db11c4",
+            "span_id": "4a9a2d9250227d58",
+            "parent_span_id": "4b30a617a262a360",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-22-96ecb130f8a39e65",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951243237679,
+            "end_unix_nano": 1785770951250424528,
+            "received_unix_milli": 1785770951252
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-23-d0b6c8863b4d668a",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-23-d0b6c8863b4d668a",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 83,
+        "backend_remote_port": 38680,
+        "backend_socket_fd": 49,
+        "tls_read_events": 113,
+        "tls_read_bytes": 28859
+      },
+      "latency_nanos": 12914618,
+      "trace": {
+        "marker": "fd-port-reuse-23-d0b6c8863b4d668a",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "b30f978e75b796927764bb5c36da0e4a",
+            "span_id": "0e678de6d035bcea",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-23-d0b6c8863b4d668a",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951250400373,
+            "end_unix_nano": 1785770951262936774,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "b30f978e75b796927764bb5c36da0e4a",
+            "span_id": "2133b69c4a49d990",
+            "parent_span_id": "0e678de6d035bcea",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951250456936,
+            "end_unix_nano": 1785770951262936774,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "b30f978e75b796927764bb5c36da0e4a",
+            "span_id": "86f0b1176e5d4a47",
+            "parent_span_id": "2133b69c4a49d990",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-23-d0b6c8863b4d668a",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951250613370,
+            "end_unix_nano": 1785770951262693788,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "b30f978e75b796927764bb5c36da0e4a",
+            "span_id": "6c3bc9a25060c8cc",
+            "parent_span_id": "86f0b1176e5d4a47",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-23-d0b6c8863b4d668a",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951256276302,
+            "end_unix_nano": 1785770951262939548,
+            "received_unix_milli": 1785770951354
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-24-a67f003c4a396a90",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-24-a67f003c4a396a90",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 84,
+        "backend_remote_port": 38696,
+        "backend_socket_fd": 53,
+        "tls_read_events": 114,
+        "tls_read_bytes": 29137
+      },
+      "latency_nanos": 12562241,
+      "trace": {
+        "marker": "fd-port-reuse-24-a67f003c4a396a90",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "3797099bc7f6b40a5bfd12efb7088d94",
+            "span_id": "07654a84de9f2f3c",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-24-a67f003c4a396a90",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951263342318,
+            "end_unix_nano": 1785770951275524368,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "3797099bc7f6b40a5bfd12efb7088d94",
+            "span_id": "b8405b709ae355d3",
+            "parent_span_id": "07654a84de9f2f3c",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951263407426,
+            "end_unix_nano": 1785770951275524368,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "3797099bc7f6b40a5bfd12efb7088d94",
+            "span_id": "6a58bfd5620a5f6e",
+            "parent_span_id": "b8405b709ae355d3",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-24-a67f003c4a396a90",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951263552203,
+            "end_unix_nano": 1785770951275335955,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "3797099bc7f6b40a5bfd12efb7088d94",
+            "span_id": "9aceaaa92c0c5a79",
+            "parent_span_id": "6a58bfd5620a5f6e",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-24-a67f003c4a396a90",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951268963426,
+            "end_unix_nano": 1785770951275899268,
+            "received_unix_milli": 1785770951354
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-25-1d87cd16c510508a",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-25-1d87cd16c510508a",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 85,
+        "backend_remote_port": 38702,
+        "backend_socket_fd": 49,
+        "tls_read_events": 115,
+        "tls_read_bytes": 29415
+      },
+      "latency_nanos": 11391509,
+      "trace": {
+        "marker": "fd-port-reuse-25-1d87cd16c510508a",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "7fa7d88809cc09fa85d6ec0b64805740",
+            "span_id": "8cc6b736af73e1bf",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-25-1d87cd16c510508a",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951275971970,
+            "end_unix_nano": 1785770951286994519,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "7fa7d88809cc09fa85d6ec0b64805740",
+            "span_id": "f7331293c5f4998a",
+            "parent_span_id": "8cc6b736af73e1bf",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951276035994,
+            "end_unix_nano": 1785770951286994519,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "7fa7d88809cc09fa85d6ec0b64805740",
+            "span_id": "3e2dfaa4ae73a674",
+            "parent_span_id": "f7331293c5f4998a",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-25-1d87cd16c510508a",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951276200447,
+            "end_unix_nano": 1785770951286752206,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "7fa7d88809cc09fa85d6ec0b64805740",
+            "span_id": "c5f081456069f7f7",
+            "parent_span_id": "3e2dfaa4ae73a674",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-25-1d87cd16c510508a",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951281656720,
+            "end_unix_nano": 1785770951287067552,
+            "received_unix_milli": 1785770951354
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-26-829c67d9dd15edf8",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-26-829c67d9dd15edf8",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 86,
+        "backend_remote_port": 38712,
+        "backend_socket_fd": 53,
+        "tls_read_events": 116,
+        "tls_read_bytes": 29693
+      },
+      "latency_nanos": 11178467,
+      "trace": {
+        "marker": "fd-port-reuse-26-829c67d9dd15edf8",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "e8d56b496a37328da02f3a7a71647ea0",
+            "span_id": "e767e7b9b3604878",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-26-829c67d9dd15edf8",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951287363722,
+            "end_unix_nano": 1785770951298222219,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "e8d56b496a37328da02f3a7a71647ea0",
+            "span_id": "60d1406e2ff0595c",
+            "parent_span_id": "e767e7b9b3604878",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951287410937,
+            "end_unix_nano": 1785770951298222219,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "e8d56b496a37328da02f3a7a71647ea0",
+            "span_id": "fa08e8c426b0fa7d",
+            "parent_span_id": "60d1406e2ff0595c",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-26-829c67d9dd15edf8",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951287555307,
+            "end_unix_nano": 1785770951298031496,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "e8d56b496a37328da02f3a7a71647ea0",
+            "span_id": "caf8bda273a206e2",
+            "parent_span_id": "fa08e8c426b0fa7d",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-26-829c67d9dd15edf8",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951292933924,
+            "end_unix_nano": 1785770951298624790,
+            "received_unix_milli": 1785770951354
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-27-40d3f221e6cdab8d",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-27-40d3f221e6cdab8d",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 87,
+        "backend_remote_port": 38728,
+        "backend_socket_fd": 49,
+        "tls_read_events": 117,
+        "tls_read_bytes": 29971
+      },
+      "latency_nanos": 11834287,
+      "trace": {
+        "marker": "fd-port-reuse-27-40d3f221e6cdab8d",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "b697e4980c4009de1ba832f5143b4cde",
+            "span_id": "b504fe70370dc737",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-27-40d3f221e6cdab8d",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951298634266,
+            "end_unix_nano": 1785770951310127662,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "b697e4980c4009de1ba832f5143b4cde",
+            "span_id": "571afd9fe5875203",
+            "parent_span_id": "b504fe70370dc737",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951298702058,
+            "end_unix_nano": 1785770951310127662,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "b697e4980c4009de1ba832f5143b4cde",
+            "span_id": "af319dbf761b2617",
+            "parent_span_id": "571afd9fe5875203",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-27-40d3f221e6cdab8d",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951298891404,
+            "end_unix_nano": 1785770951309931459,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "b697e4980c4009de1ba832f5143b4cde",
+            "span_id": "3397381222b05b1e",
+            "parent_span_id": "af319dbf761b2617",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-27-40d3f221e6cdab8d",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951304554093,
+            "end_unix_nano": 1785770951310255636,
+            "received_unix_milli": 1785770951354
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-28-d1f77b7496250fb2",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-28-d1f77b7496250fb2",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 88,
+        "backend_remote_port": 38738,
+        "backend_socket_fd": 53,
+        "tls_read_events": 118,
+        "tls_read_bytes": 30249
+      },
+      "latency_nanos": 11962910,
+      "trace": {
+        "marker": "fd-port-reuse-28-d1f77b7496250fb2",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "669394ddda9f6aeac2363400b5905051",
+            "span_id": "3fcee37b32e0f4e5",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-28-d1f77b7496250fb2",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951310471664,
+            "end_unix_nano": 1785770951322136557,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "669394ddda9f6aeac2363400b5905051",
+            "span_id": "a55a3ce85e9a22d3",
+            "parent_span_id": "3fcee37b32e0f4e5",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951310523964,
+            "end_unix_nano": 1785770951322136557,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "669394ddda9f6aeac2363400b5905051",
+            "span_id": "dd0bddc8be1f370a",
+            "parent_span_id": "a55a3ce85e9a22d3",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-28-d1f77b7496250fb2",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951310682317,
+            "end_unix_nano": 1785770951321928568,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "669394ddda9f6aeac2363400b5905051",
+            "span_id": "b1ad0a615b95fc7e",
+            "parent_span_id": "dd0bddc8be1f370a",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-28-d1f77b7496250fb2",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951316541303,
+            "end_unix_nano": 1785770951322539667,
+            "received_unix_milli": 1785770951354
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-29-cf67d43e7da28d62",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-29-cf67d43e7da28d62",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 89,
+        "backend_remote_port": 38754,
+        "backend_socket_fd": 49,
+        "tls_read_events": 119,
+        "tls_read_bytes": 30527
+      },
+      "latency_nanos": 11591372,
+      "trace": {
+        "marker": "fd-port-reuse-29-cf67d43e7da28d62",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "12f582f36c32b467a903901dbeb4b032",
+            "span_id": "9720de592586ae3f",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-29-cf67d43e7da28d62",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951322496577,
+            "end_unix_nano": 1785770951333782516,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "12f582f36c32b467a903901dbeb4b032",
+            "span_id": "007f031072f3c51a",
+            "parent_span_id": "9720de592586ae3f",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951322548202,
+            "end_unix_nano": 1785770951333782516,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "12f582f36c32b467a903901dbeb4b032",
+            "span_id": "c00a000bd220c7e6",
+            "parent_span_id": "007f031072f3c51a",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-29-cf67d43e7da28d62",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951322681349,
+            "end_unix_nano": 1785770951333567839,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "12f582f36c32b467a903901dbeb4b032",
+            "span_id": "eaee17808a332646",
+            "parent_span_id": "c00a000bd220c7e6",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-29-cf67d43e7da28d62",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951328173285,
+            "end_unix_nano": 1785770951334222876,
+            "received_unix_milli": 1785770951354
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-30-c98e636340e015ae",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-30-c98e636340e015ae",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 90,
+        "backend_remote_port": 38756,
+        "backend_socket_fd": 53,
+        "tls_read_events": 120,
+        "tls_read_bytes": 30805
+      },
+      "latency_nanos": 10981277,
+      "trace": {
+        "marker": "fd-port-reuse-30-c98e636340e015ae",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "d45846a27113491d88ef9206a226ace9",
+            "span_id": "b12dcd4ce90eeb8b",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-30-c98e636340e015ae",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951334118414,
+            "end_unix_nano": 1785770951344808037,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "d45846a27113491d88ef9206a226ace9",
+            "span_id": "516b2b997077f119",
+            "parent_span_id": "b12dcd4ce90eeb8b",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951334166218,
+            "end_unix_nano": 1785770951344808037,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "d45846a27113491d88ef9206a226ace9",
+            "span_id": "df7c625ebfb7ef64",
+            "parent_span_id": "516b2b997077f119",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-30-c98e636340e015ae",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951334313524,
+            "end_unix_nano": 1785770951344610170,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "d45846a27113491d88ef9206a226ace9",
+            "span_id": "0b7b730d8c6d03d8",
+            "parent_span_id": "df7c625ebfb7ef64",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-30-c98e636340e015ae",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951339536650,
+            "end_unix_nano": 1785770951345174665,
+            "received_unix_milli": 1785770951354
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "marker": "fd-port-reuse-31-ee9f7cb10807ee8c",
+        "endpoint": "/api/echo"
+      },
+      "response": {
+        "marker": "fd-port-reuse-31-ee9f7cb10807ee8c",
+        "secure": true,
+        "protocol": "HTTP/1.1",
+        "tls_protocol": "TLSv1.3",
+        "tls_cipher": "TLS_AES_256_GCM_SHA384",
+        "backend_connection_id": 91,
+        "backend_remote_port": 38772,
+        "backend_socket_fd": 49,
+        "tls_read_events": 121,
+        "tls_read_bytes": 31083
+      },
+      "latency_nanos": 13688610,
+      "trace": {
+        "marker": "fd-port-reuse-31-ee9f7cb10807ee8c",
+        "received_batches": 6,
+        "received_spans": 164,
+        "dropped_spans": 0,
+        "dropped_count_spans": 0,
+        "dropped_value_limit_spans": 0,
+        "dropped_retained_limit_spans": 0,
+        "retained_bytes": 36498,
+        "max_retained_bytes": 67108864,
+        "max_value_bytes": 4096,
+        "spans": [
+          {
+            "trace_id": "1e2042e9a6c7dd3621a72a24d1ec1c43",
+            "span_id": "0548e361a7ce81b8",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-31-ee9f7cb10807ee8c",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "server.address": "apache-proxy",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951345918536,
+            "end_unix_nano": 1785770951358539270,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "1e2042e9a6c7dd3621a72a24d1ec1c43",
+            "span_id": "6989a31a53428342",
+            "parent_span_id": "0548e361a7ce81b8",
+            "flags": 0,
+            "service_name": "apache-proxy",
+            "name": "processing",
+            "kind": "INTERNAL",
+            "start_unix_nano": 1785770951345974662,
+            "end_unix_nano": 1785770951358539270,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "1e2042e9a6c7dd3621a72a24d1ec1c43",
+            "span_id": "8398da22f9d12279",
+            "parent_span_id": "6989a31a53428342",
+            "flags": 1,
+            "service_name": "apache-proxy",
+            "name": "GET /api/echo",
+            "kind": "CLIENT",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-31-ee9f7cb10807ee8c",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "server.address": "localhost:18443",
+              "server.port": "18443",
+              "url.full": "https://localhost:18443/api/echo?close=1\u0026socket_identity=1"
+            },
+            "start_unix_nano": 1785770951346131821,
+            "end_unix_nano": 1785770951358343531,
+            "received_unix_milli": 1785770960125
+          },
+          {
+            "trace_id": "1e2042e9a6c7dd3621a72a24d1ec1c43",
+            "span_id": "5515287a0c927cc6",
+            "parent_span_id": "8398da22f9d12279",
+            "flags": 769,
+            "service_name": "java-backend",
+            "scope_name": "io.opentelemetry.jetty-11.0",
+            "name": "GET /api/echo",
+            "kind": "SERVER",
+            "attributes": {
+              "http.request.header.x-obi-demo-id": "fd-port-reuse-31-ee9f7cb10807ee8c",
+              "http.request.method": "GET",
+              "http.response.status_code": "200",
+              "http.route": "/api/echo",
+              "network.protocol.version": "1.1",
+              "server.address": "127.0.0.1",
+              "server.port": "18080",
+              "url.path": "/api/echo"
+            },
+            "start_unix_nano": 1785770951353063651,
+            "end_unix_nano": 1785770951358956853,
+            "received_unix_milli": 1785770951455
+          }
+        ]
+      }
+    }
+  ]
+}

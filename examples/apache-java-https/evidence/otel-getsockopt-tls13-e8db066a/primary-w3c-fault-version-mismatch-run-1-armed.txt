@@ -1,0 +1,4 @@
+phase=armed
+mode=version-mismatch
+metadata=0:0:600:1:regular file
+size=17

@@ -1,0 +1,8 @@
+{
+  "status": "passed",
+  "scenario": "helper-attach-failure",
+  "exit_status": 0,
+  "metric_status": 0,
+  "pressure_correlation": null,
+  "result": "scenario-helper-attach-failure-helper-unavailable.json"
+}

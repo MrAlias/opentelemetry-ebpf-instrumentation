@@ -1,0 +1,4 @@
+phase=armed
+mode=zero-trace-id
+metadata=0:0:600:1:regular file
+size=14

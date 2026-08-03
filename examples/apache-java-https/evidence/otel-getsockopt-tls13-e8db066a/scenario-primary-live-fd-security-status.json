@@ -1,0 +1,13 @@
+{
+  "status": "passed",
+  "scenario": "primary-live-fd-security",
+  "probe": "security-primary-live-fd-probe.json",
+  "probe_status": "unverified",
+  "probe_verification": "metrics_verified",
+  "wrong_live_socket": "metrics_verified",
+  "duplicated_fd_wrong_process": "metrics_verified",
+  "attacker_identity": "root",
+  "attacker_cgroup": "pid1-verified-preexec",
+  "legitimate_victim": "passed",
+  "post_abuse_recovery": "passed"
+}

@@ -53,7 +53,7 @@ kernel row above.
 
 | Environment | Deployment mode | Agent | Cgroup topology | TLS | `getsockopt` | `unix` | `auto` | Evidence |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Linux 7.0.0-1009-aws (distribution not recorded) | container process | OpenTelemetry 2.28.1 | unified v2 | 1.3 | pass | untested | untested | [getsockopt/TLS 1.3](evidence/otel-getsockopt-tls13-c9d14356/README.md) |
+| Linux 7.0.0-1009-aws (distribution not recorded) | container process | OpenTelemetry 2.28.1 | unified v2 | 1.3 | pass | untested | untested | [getsockopt/TLS 1.3](evidence/otel-getsockopt-tls13-e8db066a/README.md) |
 | Linux 7.0.0-1009-aws (distribution not recorded) | container process | OpenTelemetry 2.28.1 | unified v2 | 1.2 | pass | untested | untested | [getsockopt/TLS 1.2](evidence/otel-getsockopt-tls12-c7209e43/README.md) |
 | Linux 7.0.0-1009-aws (distribution not recorded) | container process | Splunk 2.28.0 | unified v2 | 1.3 | pass | untested | untested | [getsockopt/TLS 1.3](evidence/splunk-getsockopt-tls13-47237792/README.md) |
 | Linux 7.0.0-1009-aws (distribution not recorded) | container process | OpenTelemetry 2.28.1 | unified v2 | 1.2 | untested | pass | untested | [Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/README.md) |
@@ -77,9 +77,9 @@ recovery.
 
 | Gate | Required topology and capability | Status | Required retained result |
 | --- | --- | --- | --- |
-| same-JVM wrong live socket plus accepted-descriptor duplication against forced `getsockopt` | clean Java container; separate live unnegotiated TCP decoy before `ready`; root probe pre-exec cgroup exactly equals Java PID 1 cgroup; `pidfd_getfd` permitted | pass | [clean full forced-primary `all` result](evidence/otel-getsockopt-tls13-b678ce1e/README.md), with [sanitized probe, ordered aggregate metric summary](evidence/otel-getsockopt-tls13-b678ce1e/security-primary-live-fd.json), barrier records, victim graph, and recovery graph |
+| same-JVM wrong live socket plus accepted-descriptor duplication against forced `getsockopt` | clean Java container; separate live unnegotiated TCP decoy before `ready`; root probe pre-exec cgroup exactly equals Java PID 1 cgroup; `pidfd_getfd` permitted | pass | [clean full forced-primary `all` result](evidence/otel-getsockopt-tls13-e8db066a/README.md), with [sanitized probe, ordered aggregate metric summary](evidence/otel-getsockopt-tls13-e8db066a/security-primary-live-fd.json), barrier records, victim graph, and recovery graph |
 
-The [retained clean full result](evidence/otel-getsockopt-tls13-b678ce1e/README.md)
+The [retained clean full result](evidence/otel-getsockopt-tls13-e8db066a/README.md)
 meets this gate: its security status reports `status: passed`,
 `wrong_live_socket: metrics_verified`, and
 `duplicated_fd_wrong_process: metrics_verified`; the pre-release aggregate has
@@ -103,7 +103,7 @@ establish the other transport or TLS version.
 
 | Architecture | Agent | TLS | `getsockopt` | `unix` | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| `amd64` | OpenTelemetry 2.28.1 | 1.3 | pass | untested | [getsockopt/TLS 1.3](evidence/otel-getsockopt-tls13-c9d14356/README.md) |
+| `amd64` | OpenTelemetry 2.28.1 | 1.3 | pass | untested | [getsockopt/TLS 1.3](evidence/otel-getsockopt-tls13-e8db066a/README.md) |
 | `amd64` | OpenTelemetry 2.28.1 | 1.2 | pass | untested | [getsockopt/TLS 1.2](evidence/otel-getsockopt-tls12-c7209e43/README.md) |
 | `amd64` | Splunk 2.28.0 | 1.3 | pass | untested | [getsockopt/TLS 1.3](evidence/splunk-getsockopt-tls13-47237792/README.md) |
 | `amd64` | OpenTelemetry 2.28.1 | 1.2 | untested | pass | [Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/README.md) |
@@ -140,7 +140,7 @@ Compose run for a matrix cell below.
 | 8 | untested | untested | configured official-agent smoke; no privileged run recorded |
 | 11 | untested | untested | configured official-agent smoke; no privileged run recorded |
 | 17 | untested | untested | configured official-agent smoke; no privileged run recorded |
-| 21 | pass | pass | [OpenTelemetry getsockopt/TLS 1.3](evidence/otel-getsockopt-tls13-c9d14356/README.md), [getsockopt/TLS 1.2](evidence/otel-getsockopt-tls12-c7209e43/README.md), [Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/README.md), [Unix/TLS 1.3](evidence/otel-unix-tls13-6c4a2505/README.md), and [Splunk getsockopt/TLS 1.3](evidence/splunk-getsockopt-tls13-47237792/README.md) privileged runs |
+| 21 | pass | pass | [OpenTelemetry getsockopt/TLS 1.3](evidence/otel-getsockopt-tls13-e8db066a/README.md), [getsockopt/TLS 1.2](evidence/otel-getsockopt-tls12-c7209e43/README.md), [Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/README.md), [Unix/TLS 1.3](evidence/otel-unix-tls13-6c4a2505/README.md), and [Splunk getsockopt/TLS 1.3](evidence/splunk-getsockopt-tls13-47237792/README.md) privileged runs |
 
 Additional agent releases must be selected deliberately, pinned by checksum,
 and added as new rows. “Latest” is not a matrix cell.
@@ -149,7 +149,7 @@ and added as new rows. “Latest” is not a matrix cell.
 
 | Apache / OpenSSL | `getsockopt`/TLS 1.2 | Unix/TLS 1.2 | `getsockopt`/TLS 1.3 | Unix/TLS 1.3 | Backend HTTP |
 | --- | --- | --- | --- | --- | --- |
-| `httpd:2.4.68-alpine` image pinned in Compose | [pass graph](evidence/otel-getsockopt-tls12-c7209e43/scenario-basic.json), [runtime](evidence/otel-getsockopt-tls12-c7209e43/apache-openssl-runtime.txt) | [pass graph](evidence/otel-unix-tls12-bd1c9327/scenario-basic.json), [runtime](evidence/otel-unix-tls12-bd1c9327/apache-openssl-runtime.txt) | [OpenTelemetry pass graph](evidence/otel-getsockopt-tls13-c9d14356/scenario-basic.json), [Splunk pass graph](evidence/splunk-getsockopt-tls13-47237792/scenario-basic.json), [runtime](evidence/splunk-getsockopt-tls13-47237792/apache-openssl-runtime.txt) | [OpenTelemetry pass graph](evidence/otel-unix-tls13-6c4a2505/scenario-basic-security-recovery.json), [runtime](evidence/otel-unix-tls13-6c4a2505/apache-openssl-runtime.txt) | HTTP/1.1 only |
+| `httpd:2.4.68-alpine` image pinned in Compose | [pass graph](evidence/otel-getsockopt-tls12-c7209e43/scenario-basic.json), [runtime](evidence/otel-getsockopt-tls12-c7209e43/apache-openssl-runtime.txt) | [pass graph](evidence/otel-unix-tls12-bd1c9327/scenario-basic.json), [runtime](evidence/otel-unix-tls12-bd1c9327/apache-openssl-runtime.txt) | [OpenTelemetry pass graph](evidence/otel-getsockopt-tls13-e8db066a/scenario-basic.json), [Splunk pass graph](evidence/splunk-getsockopt-tls13-47237792/scenario-basic.json), [runtime](evidence/splunk-getsockopt-tls13-47237792/apache-openssl-runtime.txt) | [OpenTelemetry pass graph](evidence/otel-unix-tls13-6c4a2505/scenario-basic-security-recovery.json), [runtime](evidence/otel-unix-tls13-6c4a2505/apache-openssl-runtime.txt) | HTTP/1.1 only |
 
 Every run must produce `apache-openssl-version.txt` proving that Apache loaded
 `ssl_module`, that `mod_ssl.so` links to `libssl.so.3` and `libcrypto.so.3`,

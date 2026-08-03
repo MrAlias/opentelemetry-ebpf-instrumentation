@@ -1,8 +1,9 @@
 # Security and abuse-case matrix
 
-Status: **partial — retained Unix sibling, same-cgroup, and stale-state
-controls passed; retained primary live-descriptor and wrong-live-socket controls
-passed; remaining environment-matrix cases are untested**
+Status: **partial — retained named primary/Unix isolation controls and public
+bundle sanitization pass; explicit stale-generation, genuine TID/PID reuse,
+primary wrong-current-TID/logical-execution, runtime diagnostic-side-channel,
+and broader environment controls remain untested**
 
 The PoC crosses a kernel/JVM trust boundary and exposes a local Unix fallback.
 Passing the happy path is insufficient. Every negative cell must preserve
@@ -10,17 +11,12 @@ application availability, avoid consuming another request's context, finish
 within a bounded deadline, and produce a low-cardinality reason code without
 logging trace IDs, headers, bodies, credentials, PID/TID labels, or socket
 payloads. Primary and Unix `pass` entries below refer only to the exact
-retained [OpenTelemetry/`getsockopt`/TLS 1.3](evidence/otel-getsockopt-tls13-c9d14356/README.md),
+retained [OpenTelemetry/`getsockopt`/TLS 1.3](evidence/otel-getsockopt-tls13-e8db066a/README.md),
 [OpenTelemetry/`getsockopt`/TLS 1.2](evidence/otel-getsockopt-tls12-c7209e43/README.md),
 and [OpenTelemetry/Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/README.md),
 and [OpenTelemetry/Unix/TLS 1.3](evidence/otel-unix-tls13-6c4a2505/README.md)
 runs. The current primary wrong-live-socket result is the exact
-[OpenTelemetry/`getsockopt`/TLS 1.3 bundle](evidence/otel-getsockopt-tls13-b678ce1e/README.md).
-
-`untested (focused verification only)` denotes a clean targeted validation
-record with `acceptance_evidence=false`. It is not an acceptance-matrix `pass`
-and cannot close issue #40. The current primary record is
-[focused validation](focused-validation/primary-getsockopt-8f0aa1f6/README.md).
+[OpenTelemetry/`getsockopt`/TLS 1.3 bundle](evidence/otel-getsockopt-tls13-e8db066a/README.md).
 
 A primary probe's `native-unsupported` result is only an `unverified`
 observation. An unauthorized BPF call deliberately falls through to the native
@@ -29,15 +25,11 @@ the same result. A primary matrix pass therefore requires the runner's cgroup
 topology, per-topology unauthorized-metric deltas, legitimate-victim, and
 recovery gates; the raw probe cannot certify enforcement on its own.
 
-A clean focused primary run at `8f0aa1f6` reached the current cgroup-topology,
-per-topology unauthorized-metric, legitimate-victim, and recovery gates. Its
-raw probes remain `native-unsupported` and `unverified`; the runner verifies
-attribution through isolated unauthorized metric deltas. Because the run is
-targeted and has `acceptance_evidence=false`, it is not a primary acceptance
-matrix pass. A sanitized full acceptance run is still required before restoring
-a primary attacker cell to `pass`.
+A prior focused primary run at `8f0aa1f6` remains historical targeted evidence.
+The current full acceptance bundle independently reaches the cgroup-topology,
+per-topology unauthorized-metric, exact-parent victim, and recovery gates.
 
-The retained [primary wrong-live-socket acceptance bundle](evidence/otel-getsockopt-tls13-b678ce1e/README.md)
+The retained [primary wrong-live-socket acceptance bundle](evidence/otel-getsockopt-tls13-e8db066a/README.md)
 first creates a separate, established, unnegotiated loopback TCP socket in the
 Java process, then holds an actual accepted Java descriptor and executes a root
 probe in the Java container's PID 1 cgroup. The ordered pre-release window
@@ -51,33 +43,50 @@ silently to Unix.
 
 | Abuse or fault | Required result | Primary `getsockopt` | Unix | Evidence or remaining work |
 | --- | --- | --- | --- | --- |
-| unrelated process in same cgroup calls take | denied; legitimate Java take still succeeds | untested (focused verification only) | pass | [current primary same-cgroup metric window](focused-validation/primary-getsockopt-8f0aa1f6/security-primary-probes.json) and [retained Unix same-cgroup topology, metrics, victim, and recovery](evidence/otel-unix-tls13-6c4a2505/README.md#retained-proof) |
-| sibling container/PID namespace calls take | denied by current identity/peer credentials | untested (focused verification only) | pass | [current primary sibling metric window](focused-validation/primary-getsockopt-8f0aa1f6/security-primary-probes.json) and [retained Unix sibling topology, metrics, victim, and recovery](evidence/otel-unix-tls13-6c4a2505/README.md#retained-proof) |
+| unrelated process in same cgroup calls take | denied; legitimate Java take still succeeds | pass | pass | [current primary same-cgroup summary](evidence/otel-getsockopt-tls13-e8db066a/security-primary-probes.json) and [retained Unix same-cgroup topology, metrics, victim, and recovery](evidence/otel-unix-tls13-6c4a2505/README.md#retained-proof) |
+| sibling container/PID namespace calls take | denied by current identity/peer credentials | pass | pass | [current primary sibling summary](evidence/otel-getsockopt-tls13-e8db066a/security-primary-probes.json) and [retained Unix sibling topology, metrics, victim, and recovery](evidence/otel-unix-tls13-6c4a2505/README.md#retained-proof) |
 | forged caller PID/TID in Unix request | ignored; kernel peer identity is authoritative | not applicable | pass | [forged-peer probe](evidence/otel-unix-tls12-bd1c9327/security-unix-probes.json) |
-| repeated unauthorized take attempts | bounded; context remains available | untested (focused verification only) | pass | [primary bounded probe windows](focused-validation/primary-getsockopt-8f0aa1f6/security-primary-probes.json) and [Unix bounded probes and recovery](evidence/otel-unix-tls12-bd1c9327/security-unix-probes.json) |
-| root process in Java PID 1 cgroup duplicates a live accepted descriptor | raw probe is insufficient; isolated unauthorized metrics show zero valid retrievals, held victim keeps exact parent, recovery passes | pass | not applicable | [clean full primary acceptance bundle](evidence/otel-getsockopt-tls13-b678ce1e/README.md) with [sanitized probe, topology, and metric summary](evidence/otel-getsockopt-tls13-b678ce1e/security-primary-live-fd.json), barrier records, victim graph, and recovery graph; standalone `security` remains diagnostic only |
-| wrong socket identity | rejected without consuming another request's context | pass for a separate live unnegotiated TCP socket in the same JVM | untested | [clean full primary wrong-live-socket result](evidence/otel-getsockopt-tls13-b678ce1e/README.md) with the [ordered aggregate metric summary](evidence/otel-getsockopt-tls13-b678ce1e/security-primary-live-fd.json), held victim, and recovery; it does not claim a Unix or second-negotiated-socket case |
-| fd reuse | closed/reopened fixed-port traffic; reused Jetty fd across distinct stable Jetty connection IDs; distinct exact parents; zero wrong parents | pass | pass | [primary](evidence/otel-getsockopt-tls13-c9d14356/scenario-fd-port-reuse.json) and [Unix](evidence/otel-unix-tls12-bd1c9327/scenario-fd-port-reuse.json) reuse graphs |
-| unrelated socket option/level | original kernel behavior preserved | pass | not applicable | [primary probe cases](evidence/otel-getsockopt-tls13-c9d14356/security-primary-probes.json) |
-| Unix socket path replacement | startup fails closed or uses protected endpoint | not applicable | pass | [endpoint-replacement probes](evidence/otel-unix-tls12-bd1c9327/security-unix-probes.json) |
+| wrong current TID/logical-execution identity on primary retrieval | rejected without consuming the legitimate value | untested | not applicable | wrong-process and wrong-socket controls do not establish a wrong-current-TID primary call |
+| repeated unauthorized take attempts | bounded; context remains available | pass | pass | [primary bounded probe summaries and exact-parent victim](evidence/otel-getsockopt-tls13-e8db066a/README.md#retained-proof) and [Unix bounded probes and recovery](evidence/otel-unix-tls12-bd1c9327/security-unix-probes.json) |
+| root process in Java PID 1 cgroup duplicates a live accepted descriptor | raw probe is insufficient; isolated unauthorized metrics show zero valid retrievals, held victim keeps exact parent, recovery passes | pass | not applicable | [clean full primary acceptance bundle](evidence/otel-getsockopt-tls13-e8db066a/README.md) with [sanitized probe, topology, and metric summary](evidence/otel-getsockopt-tls13-e8db066a/security-primary-live-fd.json), barrier records, victim graph, and recovery graph; standalone `security` remains diagnostic only |
+| wrong application-socket identity (primary only) | rejected without consuming another request's context | pass for a separate live unnegotiated TCP socket in the same JVM | not applicable | [clean full primary wrong-live-socket result](evidence/otel-getsockopt-tls13-e8db066a/README.md) with the [ordered aggregate metric summary](evidence/otel-getsockopt-tls13-e8db066a/security-primary-live-fd.json), held victim, and recovery; Unix opens a fresh broker socket and authorizes peer process, TID, and capability rather than accepting an application descriptor |
+| fd reuse | closed/reopened fixed-port traffic; reused Jetty fd across distinct stable Jetty connection IDs; distinct exact parents; zero wrong parents | pass | pass | [primary](evidence/otel-getsockopt-tls13-e8db066a/scenario-fd-port-reuse.json) and [Unix](evidence/otel-unix-tls12-bd1c9327/scenario-fd-port-reuse.json) reuse graphs |
+| unrelated socket option/level | original kernel behavior preserved | pass | not applicable | [primary probe cases](evidence/otel-getsockopt-tls13-e8db066a/security-primary-probes.json) |
+| Unix socket path replacement and old client FD | replacement fails closed; the old client closes without consuming context; the replacement remains unchanged | not applicable | pass | [endpoint-replacement and old-client-FD probes](evidence/otel-unix-tls12-bd1c9327/security-unix-probes.json) |
 | permissive Unix directory mode | rejected or prominently diagnosed | not applicable | pass | [permission refusal and recovery](evidence/otel-unix-tls12-bd1c9327/security-unix-probes.json) |
-| malformed/truncated versioned request | handled without crash or unintended parent | untested | pass | [Unix fault graphs and classifications](evidence/otel-unix-tls12-bd1c9327/README.md#retained-proof) |
+| malformed/truncated versioned request | handled without crash or unintended parent | not applicable | pass | [Unix fault graphs and classifications](evidence/otel-unix-tls12-bd1c9327/README.md#retained-proof); the primary syscall has no request frame |
 | oversized/repeated/flooded Unix request | bounded admission/deadline and recovery; test-payload canary non-disclosure | not applicable | pass | [bounded admission probes](evidence/otel-unix-tls12-bd1c9327/security-unix-probes.json) |
-| malformed/zero trace or span ID | discarded; Java request remains healthy | untested (focused verification only) | pass | [primary zero-ID controls](focused-validation/primary-getsockopt-8f0aa1f6/primary-w3c-fail-open.json) and [Unix zero-ID fault graphs](evidence/otel-unix-tls12-bd1c9327/README.md#retained-proof) |
-| stale entry past TTL | miss; never a parent | untested (focused verification only) | pass | [primary `1ns` TTL, W3C precedence, and recovery](focused-validation/primary-getsockopt-8f0aa1f6/primary-w3c-fail-open.json) and [retained Unix `1ns` stale rejection, W3C precedence, and recovery](evidence/otel-unix-tls13-6c4a2505/unix-w3c-stale.json) |
-| live handoff-map pressure/eviction | order-independent eviction; exact hits, explicit roots, and actual upstream/retrieval reason counts reconciled by transport; zero wrong or unresolved parents; exact-key cleanup and steady-baseline recovery | pass | pass | [primary summary](evidence/otel-getsockopt-tls13-c9d14356/map-pressure-summary.json) and [Unix summary](evidence/otel-unix-tls12-bd1c9327/map-pressure-summary.json) |
-| OBI absent or delayed | Java root span and healthy response | pass | pass | [primary](evidence/otel-getsockopt-tls13-c9d14356/scenario-fail-open-obi-absent.json) and [Unix](evidence/otel-unix-tls12-bd1c9327/scenario-fail-open-obi-absent.json) absence graphs |
-| OBI restart with old endpoint/fd | no stale parent; recovery only if claimed | pass | pass | [primary](evidence/otel-getsockopt-tls13-c9d14356/scenario-restart-fault.json) and [Unix](evidence/otel-unix-tls12-bd1c9327/scenario-restart-fault.json) restart traffic |
+| malformed/zero trace or span ID | discarded; Java request remains healthy | pass | pass | [retained primary zero-ID controls and recovery](evidence/otel-getsockopt-tls13-e8db066a/README.md#retained-proof) and [Unix zero-ID fault graphs](evidence/otel-unix-tls12-bd1c9327/README.md#retained-proof) |
+| stale entry past TTL | miss; never a parent | pass | pass | [retained primary `1ns` TTL, W3C precedence, and recovery](evidence/otel-getsockopt-tls13-e8db066a/scenario-primary-w3c-stale.json) and [retained Unix `1ns` stale rejection, W3C precedence, and recovery](evidence/otel-unix-tls13-6c4a2505/unix-w3c-stale.json) |
+| explicit stale-generation mismatch | miss; never a parent; valid W3C still wins | untested | untested | restart and TTL-stale controls do not inject a mismatched generation |
+| live handoff-map pressure/eviction | order-independent eviction; exact hits, explicit roots, and actual upstream/retrieval reason counts reconciled by transport; zero wrong or unresolved parents; exact-key cleanup and steady-baseline recovery | pass | pass | [primary summary](evidence/otel-getsockopt-tls13-e8db066a/map-pressure-summary.json) and [Unix summary](evidence/otel-unix-tls12-bd1c9327/map-pressure-summary.json) |
+| OBI absent at JVM start, followed by late attach | Java root span and healthy response while absent; exact-parent recovery after attach | pass | pass | [primary](evidence/otel-getsockopt-tls13-e8db066a/scenario-fail-open-obi-absent.json) and [Unix](evidence/otel-unix-tls12-bd1c9327/scenario-fail-open-obi-absent.json) bounded startup-absence graphs plus their late-attach recovery scenarios |
+| OBI permanently absent for the JVM lifetime | ordinary Java-agent behavior remains healthy for the full process lifetime | untested | untested | retained late-attach sequences do not establish permanent process-lifetime absence |
+| OBI stop/restart during traffic | no wrong parent while absent; recovery only if claimed | pass | pass | [primary](evidence/otel-getsockopt-tls13-e8db066a/scenario-restart-fault.json) and [Unix](evidence/otel-unix-tls12-bd1c9327/scenario-restart-fault.json) restart traffic; this row does not claim a primary descriptor survived into a new OBI generation |
 | helper absent/disabled | ordinary official-agent behavior | pass | pass | [Unix helper failure](evidence/otel-unix-tls12-bd1c9327/scenario-helper-attach-failure-helper-unavailable.json) and [bridge-disabled](evidence/otel-unix-tls12-bd1c9327/scenario-disabled.json) graphs |
 | extension absent/disabled | ordinary official-agent behavior | pass | pass | [Unix extension absent](evidence/otel-unix-tls12-bd1c9327/scenario-w3c-only-extension-absent.json) and [disabled](evidence/otel-unix-tls12-bd1c9327/scenario-w3c-only-extension-disabled.json) graphs |
-| both transports unavailable | bounded fail-open, no retry storm | pass | untested | [OBI-absent root](evidence/otel-getsockopt-tls13-c9d14356/scenario-fail-open-obi-absent.json) and [W3C-only](evidence/otel-getsockopt-tls13-c9d14356/scenario-w3c-only-obi-absent.json) |
-| malformed ABI length | rejected with `malformed` reason | untested | pass | [bad-size fault graph](evidence/otel-unix-tls12-bd1c9327/README.md#retained-proof) |
-| truncated Unix reply | fails open with `transport_error` reason | untested | pass | [truncation fault graph](evidence/otel-unix-tls12-bd1c9327/README.md#retained-proof) |
-| ABI version mismatch | rejected with `version_mismatch` reason | untested (focused verification only) | pass | [primary response control](focused-validation/primary-getsockopt-8f0aa1f6/primary-w3c-fail-open.json) and [Unix version fault graph](evidence/otel-unix-tls12-bd1c9327/README.md#retained-proof) |
-| valid W3C plus conflicting OBI context | W3C exact IDs win; OBI entry discarded | pass | pass | [primary](evidence/otel-getsockopt-tls13-c9d14356/scenario-w3c.json) and [Unix](evidence/otel-unix-tls12-bd1c9327/scenario-w3c.json) conflict graphs |
-| valid W3C with no OBI state | exact W3C parent; bounded no-state lookup; no Apache span | pass | pass | [primary](evidence/otel-getsockopt-tls13-c9d14356/scenario-w3c-only-obi-absent.json) and [Unix](evidence/otel-unix-tls12-bd1c9327/scenario-w3c-only-obi-absent.json) W3C-only graphs |
-| repeated async redispatch | one Java server span; one request-scoped parent | pass | pass | [primary](evidence/otel-getsockopt-tls13-c9d14356/scenario-dispatch.json) and [Unix](evidence/otel-unix-tls12-bd1c9327/scenario-dispatch.json) redispatch graphs |
-| diagnostic endpoint/log scrape | no raw context/request data or scenario-counter contamination | pass | pass | retained fixed-schema phase deltas and [Unix public-bundle sanitization](evidence/otel-unix-tls12-bd1c9327/SANITIZATION.md) |
+| both transports unavailable under `auto` | bounded fail-open, no retry storm | untested | untested | the retained OBI-absent controls use a forced transport; no retained `auto` run attempts primary and fallback unavailability in one application control |
+| malformed ABI length | rejected with `malformed` reason | pass | pass | [retained primary declared-size fault](evidence/otel-getsockopt-tls13-e8db066a/scenario-primary-w3c-fault-bad-size.json) and [Unix bad-size fault graph](evidence/otel-unix-tls12-bd1c9327/README.md#retained-proof) |
+| truncated Unix reply | fails open with `transport_error` reason | not applicable | pass | [Unix truncation fault graph](evidence/otel-unix-tls12-bd1c9327/README.md#retained-proof) |
+| ABI version mismatch | rejected with `version_mismatch` reason | pass | pass | [retained primary response control](evidence/otel-getsockopt-tls13-e8db066a/scenario-primary-w3c-fault-version-mismatch.json) and [Unix version fault graph](evidence/otel-unix-tls12-bd1c9327/README.md#retained-proof) |
+| valid W3C plus conflicting OBI context | W3C exact IDs win; OBI entry discarded | pass | pass | [primary](evidence/otel-getsockopt-tls13-e8db066a/scenario-w3c.json) and [Unix](evidence/otel-unix-tls12-bd1c9327/scenario-w3c.json) conflict graphs |
+| valid W3C with no OBI state | exact W3C parent; bounded no-state lookup; no Apache span | pass | pass | [primary](evidence/otel-getsockopt-tls13-e8db066a/scenario-w3c-only-obi-absent.json) and [Unix](evidence/otel-unix-tls12-bd1c9327/scenario-w3c-only-obi-absent.json) W3C-only graphs |
+| repeated async redispatch | one Java server span; one request-scoped parent | pass | pass | [primary](evidence/otel-getsockopt-tls13-e8db066a/scenario-dispatch.json) and [Unix](evidence/otel-unix-tls12-bd1c9327/scenario-dispatch.json) redispatch graphs |
+| genuine TID/PID reuse | no prior execution's value becomes a parent | untested | untested | descriptor/port reuse and forged-identity controls do not establish kernel TID/PID reuse |
+| runtime diagnostic endpoint/log side channel | no raw context/request data; every negative remains diagnosable from bounded counters/logs | untested | untested | public-bundle sanitization proves only the publication boundary because raw runtime scrapes and operational logs are deliberately omitted |
+| published evidence-bundle disclosure scan | no checkout paths, raw context payloads, credentials, or private operational identifiers | pass | pass | [primary sanitization](evidence/otel-getsockopt-tls13-e8db066a/SANITIZATION.md) and [Unix sanitization](evidence/otel-unix-tls12-bd1c9327/SANITIZATION.md) |
+
+The Unix transport never receives or uses the application socket descriptor:
+the [provider passes `-1` outside the primary path](../../pkg/internal/java/agent/src/main/java/io/opentelemetry/obi/java/bridge/NativeRemoteParentProvider.java),
+[JNI opens a fresh Unix broker socket](../../pkg/internal/java/agent/src/main/c/io_opentelemetry_obi_java_jni.c),
+and OBI authorizes the kernel-derived peer process, logical TID, and process
+capability. A numeric application-socket mismatch is therefore not an
+applicable Unix case. Its meaningful isolation analogues are the retained
+same-cgroup, sibling, forged PID/TID, repeated-call, peer-credential,
+endpoint-replacement, and stale-endpoint controls. The
+[native regression test](../../pkg/internal/java/agent/src/test/c/remote_parent_jni_test.c)
+also proves that an unrelated duplicated descriptor is ignored by the Unix
+transport and remains untouched.
 
 ## Test topology
 

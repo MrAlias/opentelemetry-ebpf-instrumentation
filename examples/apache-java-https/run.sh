@@ -2165,6 +2165,16 @@ start_stack() {
       "Netty HTTPS backend ready on 127.0.0.1:18444" \
       "Netty HTTPS backend" \
       "$startup_since" || return $?
+    wait_for_log \
+      java-backend \
+      "TLS boundary split HTTPS backend ready on 127.0.0.1:18445" \
+      "TLS boundary split HTTPS backend" \
+      "$startup_since" || return $?
+    wait_for_log \
+      java-backend \
+      "TLS boundary coalesced HTTPS backend ready on 127.0.0.1:18446" \
+      "TLS boundary coalesced HTTPS backend" \
+      "$startup_since" || return $?
     if [[ "$SCENARIO" != "delayed-otlp-suppression" ]]; then
       assert_selected_transport || return $?
     fi
@@ -5767,6 +5777,16 @@ recreate_instrumented_stack() {
     "Netty HTTPS backend ready on 127.0.0.1:18444" \
     "$label Netty HTTPS backend" \
     "$recreate_since" || return $?
+  wait_for_log \
+    java-backend \
+    "TLS boundary split HTTPS backend ready on 127.0.0.1:18445" \
+    "$label TLS boundary split HTTPS backend" \
+    "$recreate_since" || return $?
+  wait_for_log \
+    java-backend \
+    "TLS boundary coalesced HTTPS backend ready on 127.0.0.1:18446" \
+    "$label TLS boundary coalesced HTTPS backend" \
+    "$recreate_since" || return $?
   BRIDGE_RUNNING=true
   if [[ "$verify_java_traffic" == "true" ]]; then
     assert_selected_transport "$transport" || return $?
@@ -6047,6 +6067,16 @@ recover_helper_attach_failure_stack() {
     java-backend \
     "Netty HTTPS backend ready on 127.0.0.1:18444" \
     "$label Netty HTTPS backend" \
+    "$recovery_since" || return $?
+  wait_for_log \
+    java-backend \
+    "TLS boundary split HTTPS backend ready on 127.0.0.1:18445" \
+    "$label TLS boundary split HTTPS backend" \
+    "$recovery_since" || return $?
+  wait_for_log \
+    java-backend \
+    "TLS boundary coalesced HTTPS backend ready on 127.0.0.1:18446" \
+    "$label TLS boundary coalesced HTTPS backend" \
     "$recovery_since" || return $?
   BRIDGE_RUNNING=true
   assert_selected_transport "$transport" || return $?

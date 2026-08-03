@@ -53,6 +53,8 @@ public final class ApacheJavaHttpsBackend {
   static final String BRIDGE_DIAGNOSTICS_PARAMETER = "bridge_diagnostics";
   private static final int DEFAULT_PORT = 18443;
   private static final int DEFAULT_NETTY_PORT = 18444;
+  private static final int DEFAULT_TLS_BOUNDARY_SPLIT_PORT = 18445;
+  private static final int DEFAULT_TLS_BOUNDARY_COALESCED_PORT = 18446;
   private static final int MAX_DELAY_MILLIS = 1000;
   private static final int MAX_BODY_BYTES = 64 * 1024;
   private static final int MAX_HANDOFFS = 8;
@@ -93,6 +95,18 @@ public final class ApacheJavaHttpsBackend {
         parsePort(
             "NETTY_HTTPS_PORT",
             environment("NETTY_HTTPS_PORT", Integer.toString(DEFAULT_NETTY_PORT)));
+    int tlsBoundarySplitPort =
+        parsePort(
+            "TLS_BOUNDARY_SPLIT_HTTPS_PORT",
+            environment(
+                "TLS_BOUNDARY_SPLIT_HTTPS_PORT",
+                Integer.toString(DEFAULT_TLS_BOUNDARY_SPLIT_PORT)));
+    int tlsBoundaryCoalescedPort =
+        parsePort(
+            "TLS_BOUNDARY_COALESCED_HTTPS_PORT",
+            environment(
+                "TLS_BOUNDARY_COALESCED_HTTPS_PORT",
+                Integer.toString(DEFAULT_TLS_BOUNDARY_COALESCED_PORT)));
     String keyStorePath = environment("TLS_KEYSTORE_PATH", "/run/obi-demo/certs/server.p12");
     String keyStorePassword = environment("TLS_KEYSTORE_PASSWORD", "changeit");
     String tlsProtocol = environment("TLS_PROTOCOL", "TLSv1.3");
@@ -134,13 +148,29 @@ public final class ApacheJavaHttpsBackend {
     server.setHandler(context);
 
     NettyHttpsServer nettyServer = null;
+    TlsBoundaryHttpsServer tlsBoundaryServer = null;
     try {
       nettyServer =
           NettyHttpsServer.start(nettyPort, Path.of(keyStorePath), keyStorePassword, tlsProtocol);
+      tlsBoundaryServer =
+          TlsBoundaryHttpsServer.start(
+              tlsBoundarySplitPort,
+              tlsBoundaryCoalescedPort,
+              Path.of(keyStorePath),
+              keyStorePassword,
+              tlsProtocol);
       NettyHttpsServer runningNettyServer = nettyServer;
+      TlsBoundaryHttpsServer runningTlsBoundaryServer = tlsBoundaryServer;
       Runtime.getRuntime()
           .addShutdownHook(
-              new Thread(() -> stop(server, runningNettyServer, tlsBoundaryFixture), "jetty-shutdown"));
+              new Thread(
+                  () ->
+                      stop(
+                          server,
+                          runningNettyServer,
+                          runningTlsBoundaryServer,
+                          tlsBoundaryFixture),
+                  "jetty-shutdown"));
       server.start();
       System.out.printf(
           Locale.ROOT,
@@ -152,9 +182,19 @@ public final class ApacheJavaHttpsBackend {
           "Netty HTTPS backend ready on 127.0.0.1:%d with %s and HTTP/1.1%n",
           runningNettyServer.port(),
           tlsProtocol);
+      System.out.printf(
+          Locale.ROOT,
+          "TLS boundary split HTTPS backend ready on 127.0.0.1:%d with %s and HTTP/1.1%n",
+          runningTlsBoundaryServer.port(TlsBoundaryHttpsServer.Mode.SPLIT),
+          tlsProtocol);
+      System.out.printf(
+          Locale.ROOT,
+          "TLS boundary coalesced HTTPS backend ready on 127.0.0.1:%d with %s and HTTP/1.1%n",
+          runningTlsBoundaryServer.port(TlsBoundaryHttpsServer.Mode.COALESCED),
+          tlsProtocol);
       server.join();
     } finally {
-      stop(server, nettyServer, tlsBoundaryFixture);
+      stop(server, nettyServer, tlsBoundaryServer, tlsBoundaryFixture);
     }
   }
 
@@ -1016,7 +1056,10 @@ public final class ApacheJavaHttpsBackend {
   }
 
   private static void stop(
-      Server server, NettyHttpsServer nettyServer, TlsReceiveBoundaryFixture tlsBoundaryFixture) {
+      Server server,
+      NettyHttpsServer nettyServer,
+      TlsBoundaryHttpsServer tlsBoundaryServer,
+      TlsReceiveBoundaryFixture tlsBoundaryFixture) {
     if (!STOPPED.compareAndSet(false, true)) {
       return;
     }
@@ -1031,6 +1074,13 @@ public final class ApacheJavaHttpsBackend {
       }
     } catch (Exception exception) {
       System.err.println("Netty shutdown failed: " + exception.getMessage());
+    }
+    try {
+      if (tlsBoundaryServer != null) {
+        tlsBoundaryServer.close();
+      }
+    } catch (Exception exception) {
+      System.err.println("TLS boundary shutdown failed: " + exception.getMessage());
     } finally {
       HANDOFF_FIRST.shutdownNow();
       HANDOFF_SECOND.shutdownNow();

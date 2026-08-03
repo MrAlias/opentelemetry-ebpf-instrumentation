@@ -9100,6 +9100,8 @@ test_instrumented_readiness_precedes_https_traffic() {
     'log:external OTel extension' \
     'log:Jetty HTTPS backend' \
     'log:Netty HTTPS backend' \
+    'log:TLS boundary split HTTPS backend' \
+    'log:TLS boundary coalesced HTTPS backend' \
     'transport' \
     'log:injected Java instrumentation' \
     'apache:startup' \
@@ -9216,6 +9218,8 @@ test_delayed_otlp_startup_avoids_java_traffic() {
     'log:external OTel extension' \
     'log:Jetty HTTPS backend' \
     'log:Netty HTTPS backend' \
+    'log:TLS boundary split HTTPS backend' \
+    'log:TLS boundary coalesced HTTPS backend' \
     'log:injected Java instrumentation' \
     'apache:startup' \
     'log:Apache HTTP proxy' >"$expected"
@@ -9278,6 +9282,8 @@ test_delayed_otlp_recreate_avoids_java_traffic() {
     'log:delayed-otlp-suppression injected Java instrumentation' \
     'log:delayed-otlp-suppression Jetty HTTPS backend' \
     'log:delayed-otlp-suppression Netty HTTPS backend' \
+    'log:delayed-otlp-suppression TLS boundary split HTTPS backend' \
+    'log:delayed-otlp-suppression TLS boundary coalesced HTTPS backend' \
     'apache:recreate-instrumented' \
     'log:delayed-otlp-suppression Apache HTTP proxy' >"$expected"
   cmp -s -- "$expected" "$observed" || {
@@ -9689,6 +9695,8 @@ test_recreated_stack_readiness_uses_log_cursor() {
     'log:restoration injected Java instrumentation:recreate-cursor' \
     'log:restoration Jetty HTTPS backend:recreate-cursor' \
     'log:restoration Netty HTTPS backend:recreate-cursor' \
+    'log:restoration TLS boundary split HTTPS backend:recreate-cursor' \
+    'log:restoration TLS boundary coalesced HTTPS backend:recreate-cursor' \
     'transport:unix:unix' \
     'apache:recreate-instrumented' \
     'http:restoration HTTPS path' \

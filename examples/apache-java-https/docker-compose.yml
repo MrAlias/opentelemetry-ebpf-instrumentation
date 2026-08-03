@@ -39,6 +39,8 @@ services:
     environment:
       HTTPS_PORT: "18443"
       NETTY_HTTPS_PORT: "18444"
+      TLS_BOUNDARY_SPLIT_HTTPS_PORT: "18445"
+      TLS_BOUNDARY_COALESCED_HTTPS_PORT: "18446"
       TLS_KEYSTORE_PATH: /run/obi-demo/certs/server.p12
       TLS_KEYSTORE_PASSWORD: changeit
       TLS_PROTOCOL: ${BACKEND_TLS_PROTOCOL:-TLSv1.3}

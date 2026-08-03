@@ -64,6 +64,15 @@ func TestJavaRemoteParentPrimarySocketAuthority(t *testing.T) {
 
 	assertStandardSockoptPassThrough(t, first.client)
 	assertNativeSockoptMiss(t, first.client, javabridge.SocketLevel, javaRemoteParentUnknown)
+	requireNativeSockoptUnsupported(t, rawSetsockoptUint64(
+		first.client, javabridge.SocketLevel, javabridge.SocketNegotiate, capability,
+	))
+	assertSocketNegotiationMissing(t, objects.JavaRemoteParentNegotiations, first.client)
+
+	firstSocketCookie := seedJavaRemoteParentSocketCookie(
+		t, objects.JavaRemoteParentSocketCookies, first.client,
+	)
+	seedJavaRemoteParentSocketCookie(t, objects.JavaRemoteParentSocketCookies, second.client)
 
 	for range unauthorizedCallCount {
 		require.ErrorIs(t,
@@ -120,6 +129,7 @@ func TestJavaRemoteParentPrimarySocketAuthority(t *testing.T) {
 		capability,
 		firstNegotiation.Connection,
 		netns,
+		firstSocketCookie,
 		firstGeneration,
 		firstNonce,
 	)
@@ -243,23 +253,14 @@ func TestJavaRemoteParentPrimarySocketAuthority(t *testing.T) {
 			third.close()
 		}
 	}()
+	thirdSocketCookie := seedJavaRemoteParentSocketCookie(
+		t, objects.JavaRemoteParentSocketCookies, third.client,
+	)
 	require.NoError(t, rawSetsockoptUint64(
 		third.client, javabridge.SocketLevel, javabridge.SocketNegotiate, capability,
 	))
 	thirdNegotiation := socketNegotiation(t, objects.JavaRemoteParentNegotiations, third.client)
-	const reuseGeneration = uint64(46)
-	const secondNonce = uint64(0x8877665544332211)
-	stageRemoteParent(t,
-		&objects.BpfJavaRemoteParentMaps,
-		process,
-		owner,
-		capability,
-		thirdNegotiation.Connection,
-		netns,
-		reuseGeneration,
-		secondNonce,
-	)
-	require.NoError(t, acknowledgeRemoteParentData(third.client, secondNonce))
+	assert.NotZero(t, thirdNegotiation.ConnectionNetns)
 
 	reusedFD := third.client
 	require.NoError(t, unix.Close(third.client))
@@ -271,7 +272,50 @@ func TestJavaRemoteParentPrimarySocketAuthority(t *testing.T) {
 	assert.Equal(t, reusedFD, replacement.client)
 	assertSocketNegotiationMissing(t, objects.JavaRemoteParentNegotiations, replacement.client)
 	assertNativeTakeMiss(t, replacement.client)
+	var missingReplacementCookie uint64
+	assert.ErrorIs(t, objects.JavaRemoteParentSocketCookies.Lookup(
+		uint32(replacement.client), &missingReplacementCookie,
+	), ebpf.ErrKeyNotExist)
+	replacementSocketCookie := seedJavaRemoteParentSocketCookie(
+		t, objects.JavaRemoteParentSocketCookies, replacement.client,
+	)
+	require.NotEqual(t, thirdSocketCookie, replacementSocketCookie)
+	require.NoError(t, rawSetsockoptUint64(
+		replacement.client, javabridge.SocketLevel, javabridge.SocketNegotiate, capability,
+	))
+	replacementNegotiation := socketNegotiation(
+		t, objects.JavaRemoteParentNegotiations, replacement.client,
+	)
+	const reuseGeneration = uint64(46)
+	const secondNonce = uint64(0x8877665544332211)
+	stageRemoteParent(t,
+		&objects.BpfJavaRemoteParentMaps,
+		process,
+		owner,
+		capability,
+		replacementNegotiation.Connection,
+		replacementNegotiation.ConnectionNetns,
+		thirdSocketCookie,
+		reuseGeneration,
+		secondNonce,
+	)
+	assertNativeDataAckMiss(t, replacement.client, secondNonce)
 	assertGenerationPresent(t, objects.JavaRemoteParentState, owner, reuseGeneration)
+	assert.Zero(t,
+		socketNegotiation(t, objects.JavaRemoteParentNegotiations, replacement.client).Generation,
+	)
+	var preservedAck BpfJavaRemoteParentJavaRemoteParentDataAckT
+	require.NoError(t, objects.JavaRemoteParentDataAcks.Lookup(
+		BpfJavaRemoteParentJavaRemoteParentDataSignalKeyT{
+			Process: process,
+			Nonce:   secondNonce,
+		},
+		&preservedAck,
+	))
+	assert.Equal(t, reuseGeneration, preservedAck.Generation)
+	var preservedSignal uint64
+	require.NoError(t, objects.JavaRemoteParentDataSignals.Lookup(process, &preservedSignal))
+	assert.Equal(t, secondNonce, preservedSignal)
 }
 
 func TestJavaRemoteParentUnauthorizedProcessHelper(t *testing.T) {
@@ -304,6 +348,9 @@ func TestJavaRemoteParentPrimaryRequiresAuthoritativeDataHook(t *testing.T) {
 	defer unix.Close(listener)
 	pair := connectTCP(t, listener)
 	defer pair.close()
+	seedJavaRemoteParentSocketCookie(
+		t, objects.JavaRemoteParentSocketCookies, pair.client,
+	)
 
 	requireNativeSockoptUnsupported(t, rawSetsockoptUint64(
 		pair.client, javabridge.SocketLevel, javabridge.SocketNegotiate, capability,
@@ -374,6 +421,41 @@ func attachJavaRemoteParentFixture(t *testing.T, programs *BpfJavaRemoteParentPr
 		require.NoError(t, err)
 	}
 	t.Cleanup(func() { require.NoError(t, getsockoptLink.Close()) })
+}
+
+func attachJavaRemoteParentSockopsFixture(t *testing.T, socketCookies *ebpf.Map) {
+	t.Helper()
+
+	spec, err := LoadBpf()
+	require.NoError(t, err)
+	for _, mapSpec := range spec.Maps {
+		mapSpec.Pinning = ebpf.PinNone
+	}
+	require.NoError(t, ebpfconvenience.RewriteConstants(spec, map[string]any{
+		"filter_pids":                int32(0),
+		"g_bpf_debug":                false,
+		"inject_flags":               uint32(0),
+		"java_remote_parent_enabled": true,
+	}))
+
+	programs := struct {
+		ObiSockmapTracker *ebpf.Program `ebpf:"obi_sockmap_tracker"`
+	}{}
+	require.NoError(t, spec.LoadAndAssign(&programs, &ebpf.CollectionOptions{
+		MapReplacements: map[string]*ebpf.Map{
+			"java_remote_parent_socket_cookies": socketCookies,
+		},
+	}))
+	t.Cleanup(func() { require.NoError(t, programs.ObiSockmapTracker.Close()) })
+
+	path := currentCgroupV2Path(t)
+	sockopsLink, err := link.AttachCgroup(link.CgroupOptions{
+		Path:    path,
+		Attach:  ebpf.AttachCGroupSockOps,
+		Program: programs.ObiSockmapTracker,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sockopsLink.Close()) })
 }
 
 func currentCgroupV2Path(t *testing.T) string {
@@ -629,6 +711,7 @@ func assertValidDiscard(
 		capability,
 		negotiation.Connection,
 		negotiation.ConnectionNetns,
+		socketCookie(t, fd),
 		generation,
 		nonce,
 	)
@@ -688,6 +771,7 @@ func assertStaleRemoteParent(
 		capability,
 		negotiation.Connection,
 		negotiation.ConnectionNetns,
+		socketCookie(t, fd),
 		generation,
 		nonce,
 		now-uint64(staleAge.Nanoseconds()),
@@ -720,6 +804,7 @@ func assertVersionMismatchedRemoteParent(
 		capability,
 		negotiation.Connection,
 		negotiation.ConnectionNetns,
+		socketCookie(t, fd),
 		generation,
 		nonce,
 	)
@@ -760,6 +845,7 @@ func assertConcurrentTakeIsOneShot(
 		capability,
 		negotiation.Connection,
 		negotiation.ConnectionNetns,
+		socketCookie(t, fd),
 		generation,
 		nonce,
 	)
@@ -880,6 +966,26 @@ func socketNegotiation(
 	return negotiation
 }
 
+func socketCookie(t *testing.T, fd int) uint64 {
+	t.Helper()
+
+	cookie, err := unix.GetsockoptUint64(fd, unix.SOL_SOCKET, unix.SO_COOKIE)
+	require.NoError(t, err)
+	require.NotZero(t, cookie)
+	return cookie
+}
+
+func seedJavaRemoteParentSocketCookie(t *testing.T, storage *ebpf.Map, fd int) uint64 {
+	t.Helper()
+
+	cookie := socketCookie(t, fd)
+	require.NoError(t, storage.Update(uint32(fd), cookie, ebpf.UpdateAny))
+	var stored uint64
+	require.NoError(t, storage.Lookup(uint32(fd), &stored))
+	require.Equal(t, cookie, stored)
+	return cookie
+}
+
 func assertSocketNegotiationMissing(t *testing.T, storage *ebpf.Map, fd int) {
 	t.Helper()
 
@@ -918,6 +1024,7 @@ func stageRemoteParent(
 	capability uint64,
 	connection BpfJavaRemoteParentConnectionInfoT,
 	netns uint32,
+	socketCookie uint64,
 	generation uint64,
 	nonce uint64,
 ) {
@@ -930,6 +1037,7 @@ func stageRemoteParent(
 		capability,
 		connection,
 		netns,
+		socketCookie,
 		generation,
 		nonce,
 		monotonicNowNS(t),
@@ -944,11 +1052,13 @@ func stageRemoteParentAt(
 	capability uint64,
 	connection BpfJavaRemoteParentConnectionInfoT,
 	netns uint32,
+	socketCookie uint64,
 	generation uint64,
 	nonce uint64,
 	observed uint64,
 ) {
 	t.Helper()
+	require.NotZero(t, socketCookie)
 
 	record := BpfJavaRemoteParentJavaRemoteParentResponseT{
 		Magic:                [4]uint8{'O', 'B', 'I', 'J'},
@@ -976,6 +1086,7 @@ func stageRemoteParentAt(
 		Generation:         generation,
 		NetnsCookie:        netnsCookie,
 		IncomingGeneration: generation,
+		SocketCookie:       socketCookie,
 		Netns:              netns,
 	}
 
@@ -1005,6 +1116,9 @@ func stageRemoteParentAt(
 			ProcessIncarnation: capability,
 			Lifecycle:          bridgeLifecycleActive,
 		}, ebpf.UpdateNoExist))
+	require.NoError(t, maps.JavaRemoteParentDataSignals.Update(
+		process, nonce, ebpf.UpdateAny,
+	))
 
 	updateDataAck(t,
 		maps.JavaRemoteParentDataAcks,

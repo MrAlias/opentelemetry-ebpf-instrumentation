@@ -63,6 +63,7 @@ typedef struct call_protocol_args {
     u16 traceparent_pos;
     u32 flags;
     u64 connection_netns_cookie;
+    u64 connection_socket_cookie;
     u64 ssl_ptr;
     u64 u_buf;
     u64 ssl_handoff_id;

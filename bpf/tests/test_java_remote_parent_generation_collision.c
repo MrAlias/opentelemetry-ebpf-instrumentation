@@ -54,6 +54,9 @@ static u8 test_java_remote_parent_data_hook_is_ready(void);
 static const pid_key_t test_owner = {.tid = 7, .pid = 5, .ns = 3};
 static u64 generation_sequence;
 static java_remote_parent_terminal_t terminal;
+static java_remote_parent_key_t active_state_key;
+static java_remote_parent_state_t active_state;
+static int active_state_present;
 static connection_info_netns_cookie_t incoming_connection_key;
 static incoming_trace_candidate_t incoming_candidate;
 static u64 incoming_generation;
@@ -65,6 +68,7 @@ static int delete_calls;
 enum {
     test_connection_netns = 42,
     test_connection_netns_cookie = 84,
+    test_socket_cookie = 86,
     test_incoming_generation = 21,
     test_trace_seed = 0x10,
     test_span_seed = 0x30,
@@ -76,6 +80,7 @@ enum invalid_stage_case {
     invalid_stage_zero_trace_id,
     invalid_stage_zero_span_id,
     invalid_stage_provenance,
+    invalid_stage_socket_cookie,
     invalid_stage_case_count,
 };
 
@@ -106,6 +111,10 @@ static void *test_map_lookup(void *map, const void *key) {
             owner->ns == test_owner.ns) {
             return &terminal;
         }
+    }
+    if (map == &java_remote_parent_state && active_state_present &&
+        memcmp(key, &active_state_key, sizeof(active_state_key)) == 0) {
+        return &active_state;
     }
     if (map == &java_remote_parent_stats) {
         const u32 index = *(const u32 *)key;
@@ -187,9 +196,11 @@ static void test_invalid_stage_inputs_fail_before_publication(void) {
             memset(incoming.tp.trace_id, 0, sizeof(incoming.tp.trace_id));
         } else if (invalid_case == invalid_stage_zero_span_id) {
             memset(incoming.tp.span_id, 0, sizeof(incoming.tp.span_id));
-        } else {
+        } else if (invalid_case == invalid_stage_provenance) {
             incoming.provenance = k_tp_provenance_tcp_legacy;
         }
+        const u64 socket_cookie =
+            invalid_case == invalid_stage_socket_cookie ? 0 : test_socket_cookie;
 
         memset(stats, 0, sizeof(stats));
         generation_sequence = 0;
@@ -198,6 +209,7 @@ static void test_invalid_stage_inputs_fail_before_publication(void) {
         if (java_remote_parent_stage(&connection,
                                      test_connection_netns,
                                      test_connection_netns_cookie,
+                                     socket_cookie,
                                      test_incoming_generation,
                                      &incoming) != 0 ||
             generation_sequence != 0 || update_calls != 0 || delete_calls != 0 ||
@@ -227,6 +239,7 @@ static void test_wrapped_generation_does_not_replace_terminal(void) {
     if (java_remote_parent_stage(&connection,
                                  test_connection_netns,
                                  test_connection_netns_cookie,
+                                 test_socket_cookie,
                                  test_incoming_generation,
                                  &incoming) != 0 ||
         generation_sequence != 1 || terminal.generation != 1 || update_calls != 0 ||
@@ -235,8 +248,38 @@ static void test_wrapped_generation_does_not_replace_terminal(void) {
     }
 }
 
+static void test_wrapped_generation_does_not_replace_active_other_socket(void) {
+    memset(stats, 0, sizeof(stats));
+    memset(&terminal, 0, sizeof(terminal));
+    memset(&active_state, 0, sizeof(active_state));
+    update_calls = 0;
+    delete_calls = 0;
+    generation_sequence = (1ULL << k_per_cpu_generation_sequence_bits) - 1;
+    active_state_key = java_remote_parent_state_key(&test_owner, 1);
+    active_state.lifecycle = k_java_remote_parent_lifecycle_active;
+    active_state_present = 1;
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    const tp_info_pid_t incoming = valid_incoming_parent();
+    incoming_generation = test_incoming_generation;
+    incoming_claim = 1;
+    incoming_candidate = (incoming_trace_candidate_t){.candidate = incoming};
+
+    if (java_remote_parent_stage(&connection,
+                                 test_connection_netns,
+                                 test_connection_netns_cookie,
+                                 test_socket_cookie + 1,
+                                 test_incoming_generation,
+                                 &incoming) != 0 ||
+        generation_sequence != 1 || !active_state_present || update_calls != 0 ||
+        delete_calls != 0 || stats[k_java_remote_parent_stat_stage_ambiguous] != 1) {
+        fail("wrapped generation replaced an active generation on another socket");
+    }
+    active_state_present = 0;
+}
+
 int main(void) {
     test_invalid_stage_inputs_fail_before_publication();
     test_wrapped_generation_does_not_replace_terminal();
+    test_wrapped_generation_does_not_replace_active_other_socket();
     return 0;
 }

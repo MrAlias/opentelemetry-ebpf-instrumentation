@@ -11,6 +11,7 @@
 #include <common/sock_port_ns.h>
 
 #include <maps/java_remote_parent.h>
+#include <maps/java_remote_parent_socket_cookie.h>
 
 #include <pid/pid.h>
 
@@ -147,7 +148,8 @@ static __always_inline int java_remote_parent_ack_data(struct bpf_sockopt *ctx) 
     }
 
     connection_info_t current_connection = {0};
-    if (!java_remote_parent_sockopt_connection(ctx, &current_connection) ||
+    const u64 socket_cookie = java_remote_parent_socket_cookie(ctx->sk);
+    if (!socket_cookie || !java_remote_parent_sockopt_connection(ctx, &current_connection) ||
         __builtin_memcmp(&current_connection, &copy.connection, sizeof(current_connection)) != 0) {
         return 1;
     }
@@ -182,11 +184,13 @@ static __always_inline int java_remote_parent_ack_data(struct bpf_sockopt *ctx) 
         __builtin_memcmp(&acknowledgement_copy.connection,
                          &current_connection,
                          sizeof(current_connection)) != 0 ||
-        !java_remote_parent_connection_matches_in_netns(&acknowledgement_copy.connection,
-                                                        acknowledgement_copy.connection_netns,
-                                                        &acknowledgement_copy.owner,
-                                                        acknowledgement_copy.generation,
-                                                        0)) {
+        !java_remote_parent_connection_matches_socket_in_netns(
+            &acknowledgement_copy.connection,
+            acknowledgement_copy.connection_netns,
+            &acknowledgement_copy.owner,
+            acknowledgement_copy.generation,
+            0,
+            socket_cookie)) {
         return 1;
     }
 
@@ -216,7 +220,9 @@ int obi_java_remote_parent_setsockopt(struct bpf_sockopt *ctx) {
     }
 
     connection_info_t connection = {0};
-    if (!java_remote_parent_sockopt_connection(ctx, &connection)) {
+    const u64 socket_cookie = java_remote_parent_socket_cookie(ctx->sk);
+    if (!socket_cookie || !java_remote_parent_sockopt_connection(ctx, &connection)) {
+        java_remote_parent_negotiate_stat(k_java_remote_parent_status_overload);
         return 1;
     }
 
@@ -301,7 +307,8 @@ int obi_java_remote_parent_getsockopt(struct bpf_sockopt *ctx) {
     }
 
     connection_info_t current_connection = {0};
-    if (!java_remote_parent_sockopt_connection(ctx, &current_connection) ||
+    const u64 socket_cookie = java_remote_parent_socket_cookie(ctx->sk);
+    if (!socket_cookie || !java_remote_parent_sockopt_connection(ctx, &current_connection) ||
         __builtin_memcmp(&current_connection, &copy.connection, sizeof(current_connection)) != 0) {
         java_remote_parent_record_unauthorized_retrieval(discard, health);
         return 1;
@@ -338,7 +345,8 @@ int obi_java_remote_parent_getsockopt(struct bpf_sockopt *ctx) {
                                                java_remote_parent_max_age_ns,
                                                &copy.connection,
                                                copy.connection_netns,
-                                               copy.generation);
+                                               copy.generation,
+                                               socket_cookie);
 
     __builtin_memcpy(optval, &response, sizeof(response));
     ctx->optlen = sizeof(response);

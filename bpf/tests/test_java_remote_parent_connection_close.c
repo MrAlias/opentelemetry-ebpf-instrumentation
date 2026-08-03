@@ -141,6 +141,7 @@ static void reset_state(const connection_info_t *connection,
     staged_connection.generation = 11;
     staged_connection.netns_cookie = netns_cookie;
     staged_connection.incoming_generation = incoming_generation;
+    staged_connection.socket_cookie = 86;
     cookie_staged_connection = staged_connection;
     indexed_owner.generation = staged_connection.generation;
     indexed_owner.lifecycle = k_java_remote_parent_lifecycle_active;
@@ -161,7 +162,7 @@ static void test_connection_close_invalidates_staged_generation(void) {
     };
     reset_state(&connection, 42, 84, 21);
 
-    java_remote_parent_mark_connection_ambiguous_in_netns_cookie(&connection, 84, 0);
+    java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(&connection, 84, 86, 0);
 
     if (staged_present || cookie_staged_present) {
         fail("sockops close preserved a staged connection index");
@@ -183,7 +184,7 @@ static void test_orphaned_connection_close_removes_fallback(void) {
     reset_state(&connection, 42, 84, 21);
     owner_present = 0;
 
-    java_remote_parent_mark_connection_ambiguous_in_netns_cookie(&connection, 84, 0);
+    java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(&connection, 84, 86, 0);
 
     if (staged_present || cookie_staged_present || ambiguity_present || fallback_present) {
         fail("orphaned close did not fail closed");
@@ -226,20 +227,84 @@ static void test_connection_match_requires_consistent_indexes(void) {
     reset_state(&connection, 42, 84, 21);
 
     if (!java_remote_parent_connection_matches_in_netns(
-            &connection, 42, &staged_connection.owner, staged_connection.generation, 21)) {
+            &connection, 42, &staged_connection.owner, staged_connection.generation, 21, 0)) {
         fail("consistent connection indexes did not match");
     }
 
     cookie_staged_connection.incoming_generation++;
     if (java_remote_parent_connection_matches_in_netns(
-            &connection, 42, &staged_connection.owner, staged_connection.generation, 21)) {
+            &connection, 42, &staged_connection.owner, staged_connection.generation, 21, 0)) {
         fail("inconsistent connection indexes matched");
     }
     cookie_staged_connection = staged_connection;
+    cookie_staged_connection.socket_cookie++;
+    if (java_remote_parent_connection_matches_in_netns(
+            &connection, 42, &staged_connection.owner, staged_connection.generation, 21, 0)) {
+        fail("inconsistent socket cookie indexes matched");
+    }
+    cookie_staged_connection = staged_connection;
+    if (java_remote_parent_connection_matches_socket_in_netns(&connection,
+                                                              42,
+                                                              &staged_connection.owner,
+                                                              staged_connection.generation,
+                                                              21,
+                                                              staged_connection.socket_cookie +
+                                                                  1)) {
+        fail("a different physical socket matched the staged request");
+    }
+    if (java_remote_parent_connection_matches_socket_in_netns(
+            &connection, 42, &staged_connection.owner, staged_connection.generation, 21, 0)) {
+        fail("a zero physical socket identity matched the staged request");
+    }
+    if (!java_remote_parent_connection_matches_socket_in_netns(&connection,
+                                                               42,
+                                                               &staged_connection.owner,
+                                                               staged_connection.generation,
+                                                               21,
+                                                               staged_connection.socket_cookie)) {
+        fail("the exact physical socket did not match the staged request");
+    }
     cookie_staged_present = 0;
     if (java_remote_parent_connection_matches_in_netns(
-            &connection, 42, &staged_connection.owner, staged_connection.generation, 21)) {
+            &connection, 42, &staged_connection.owner, staged_connection.generation, 21, 0)) {
         fail("missing cookie connection index matched");
+    }
+}
+
+static void test_delayed_cleanup_preserves_reused_physical_connection(void) {
+    const connection_info_t connection = {
+        .s_port = 1234,
+        .d_port = 443,
+    };
+    reset_state(&connection, 42, 84, 21);
+    const java_remote_parent_connection_t stale = staged_connection;
+    staged_connection.socket_cookie++;
+    cookie_staged_connection.socket_cookie++;
+
+    java_remote_parent_delete_connection_indexes(&connection, &stale);
+
+    if (!staged_present || !cookie_staged_present) {
+        fail("delayed cleanup deleted a physically different replacement connection");
+    }
+}
+
+static void test_delayed_close_preserves_reused_physical_connection(void) {
+    const connection_info_t connection = {
+        .s_port = 1234,
+        .d_port = 443,
+    };
+    reset_state(&connection, 42, 84, 21);
+    staged_connection.socket_cookie = 87;
+    cookie_staged_connection.socket_cookie = 87;
+
+    java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(&connection, 84, 86, 0);
+    if (!staged_present || !cookie_staged_present || ambiguity_present || !fallback_present) {
+        fail("delayed close invalidated a physically different replacement connection");
+    }
+
+    java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(&connection, 84, 87, 0);
+    if (staged_present || cookie_staged_present || !ambiguity_present || !fallback_present) {
+        fail("matching physical close did not invalidate its staged connection");
     }
 }
 
@@ -272,7 +337,7 @@ static void test_claimed_stage_owns_close_race(void) {
     };
     claim_present = 1;
 
-    java_remote_parent_mark_connection_ambiguous_in_netns_cookie(&connection, 84, 0);
+    java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(&connection, 84, 86, 0);
 
     if (!staged_present || !cookie_staged_present || ambiguity_present || !fallback_present) {
         fail("close raced incorrectly with an owned Java retrieval");
@@ -285,6 +350,8 @@ int main(void) {
     test_other_incoming_generation_does_not_invalidate_stage();
     test_matching_incoming_generation_invalidates_stage();
     test_connection_match_requires_consistent_indexes();
+    test_delayed_cleanup_preserves_reused_physical_connection();
+    test_delayed_close_preserves_reused_physical_connection();
     test_full_width_network_namespace_cookie_is_required();
     test_claimed_stage_owns_close_race();
     return 0;

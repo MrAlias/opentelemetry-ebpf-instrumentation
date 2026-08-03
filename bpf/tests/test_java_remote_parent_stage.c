@@ -54,6 +54,7 @@ static u8 test_java_remote_parent_data_hook_is_ready(void);
 enum {
     test_connection_netns = 42,
     test_connection_netns_cookie = 84,
+    test_socket_cookie = 86,
     test_incoming_generation = 21,
     test_process_incarnation = 9,
     test_trace_seed = 0x10,
@@ -123,6 +124,7 @@ static pid_key_t stored_fallback_key;
 static java_remote_parent_response_t stored_fallback;
 static int fallback_present;
 static u64 stats[k_java_remote_parent_stat_max];
+static int corrupt_cookie_socket_cookie;
 static int unexpected_update;
 static int unexpected_delete;
 
@@ -230,6 +232,10 @@ test_map_update(void *map, const void *key, const void *value, unsigned long lon
         !cookie_connection_present) {
         stored_cookie_connection_key = *(const connection_info_netns_cookie_t *)key;
         stored_cookie_connection = *(const java_remote_parent_connection_t *)value;
+        if (corrupt_cookie_socket_cookie) {
+            stored_cookie_connection.socket_cookie++;
+            corrupt_cookie_socket_cookie = 0;
+        }
         cookie_connection_present = 1;
         return 0;
     }
@@ -252,6 +258,34 @@ static long test_map_delete(void *map, const void *key) {
         if (fallback_present && same_key(key, &stored_fallback_key, sizeof(stored_fallback_key))) {
             fallback_present = 0;
         }
+        return 0;
+    }
+    if (map == &java_remote_parent_connections && connection_present &&
+        same_key(key, &stored_connection_key, sizeof(stored_connection_key))) {
+        connection_present = 0;
+        return 0;
+    }
+    if (map == &java_remote_parent_cookie_connections && cookie_connection_present &&
+        same_key(key, &stored_cookie_connection_key, sizeof(stored_cookie_connection_key))) {
+        cookie_connection_present = 0;
+        return 0;
+    }
+    if (map == &java_remote_parent_state && state_present &&
+        same_key(key, &stored_state_key, sizeof(stored_state_key))) {
+        state_present = 0;
+        return 0;
+    }
+    if (map == &java_remote_parent_generation_index && generation_index_present &&
+        same_key(key, &stored_generation_index_key, sizeof(stored_generation_index_key))) {
+        generation_index_present = 0;
+        return 0;
+    }
+    if (map == &java_remote_parent_owners && owner_present &&
+        same_key(key, &stored_owner_key, sizeof(stored_owner_key))) {
+        owner_present = 0;
+        return 0;
+    }
+    if (map == &java_remote_parent_ambiguity) {
         return 0;
     }
 
@@ -322,8 +356,34 @@ static void reset(const connection_info_t *connection, const tp_info_pid_t *inco
     connection_present = 0;
     cookie_connection_present = 0;
     fallback_present = 0;
+    corrupt_cookie_socket_cookie = 0;
     unexpected_update = 0;
     unexpected_delete = 0;
+}
+
+static void test_inconsistent_physical_index_rolls_back_stage(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    const tp_info_pid_t raw = raw_parent(k_flag_sampled);
+    reset(&connection, &raw);
+    java_remote_parent_incoming_t handoff = {.generation = test_incoming_generation};
+    if (!apply_incoming_trace_candidate(
+            &(tp_info_t){}, &raw, &handoff.candidate, &handoff.generation)) {
+        fail("raw TCP parent was not prepared for inconsistent-index test");
+    }
+    corrupt_cookie_socket_cookie = 1;
+
+    if (java_remote_parent_stage_incoming(&connection,
+                                          test_connection_netns,
+                                          test_connection_netns_cookie,
+                                          test_socket_cookie,
+                                          &handoff) != 0 ||
+        owner_present || state_present || generation_index_present || connection_present ||
+        fallback_present || !cookie_connection_present ||
+        stored_cookie_connection.socket_cookie == test_socket_cookie ||
+        stats[k_java_remote_parent_stat_stage_ambiguous] != 1 || unexpected_update ||
+        unexpected_delete) {
+        fail("inconsistent physical connection index was published or deleted as current");
+    }
 }
 
 static void test_raw_parent_is_published_before_w3c_override(void) {
@@ -347,10 +407,16 @@ static void test_raw_parent_is_published_before_w3c_override(void) {
         }
 
         const u64 staged_generation = java_remote_parent_stage_incoming(
-            &connection, test_connection_netns, test_connection_netns_cookie, &handoff);
+            &connection,
+            test_connection_netns,
+            test_connection_netns_cookie,
+            test_socket_cookie,
+            &handoff);
         if (!staged_generation || !state_present || !fallback_present || unexpected_update ||
             unexpected_delete || stats[k_java_remote_parent_stat_stage_valid] != 1 ||
             stored_state.response.status != k_java_remote_parent_status_valid ||
+            stored_connection.socket_cookie != test_socket_cookie ||
+            stored_cookie_connection.socket_cookie != test_socket_cookie ||
             memcmp(stored_state.response.trace_id,
                    raw.tp.trace_id,
                    sizeof(stored_state.response.trace_id)) != 0 ||
@@ -386,5 +452,6 @@ static void test_raw_parent_is_published_before_w3c_override(void) {
 
 int main(void) {
     test_raw_parent_is_published_before_w3c_override();
+    test_inconsistent_physical_index_rolls_back_stage();
     return 0;
 }

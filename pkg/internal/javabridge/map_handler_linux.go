@@ -114,6 +114,7 @@ type connectionClaim struct {
 	Generation         uint64
 	NetNSCookie        uint64
 	IncomingGeneration uint64
+	SocketCookie       uint64
 	NetNS              uint32
 	Reserved2          uint32
 }

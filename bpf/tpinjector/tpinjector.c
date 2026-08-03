@@ -36,6 +36,7 @@
 #include <logger/bpf_dbg.h>
 
 #include <maps/incoming_trace_map.h>
+#include <maps/java_remote_parent_socket_cookie.h>
 #include <maps/java_remote_parent_shared.h>
 #include <maps/msg_buffers.h>
 #include <maps/ongoing_http.h>
@@ -410,6 +411,10 @@ static __always_inline void bpf_sock_ops_set_flags(struct bpf_sock_ops *skops, u
 static __always_inline void bpf_sock_ops_active_est_cb(struct bpf_sock_ops *skops) {
     const u64 cookie = bpf_get_socket_cookie(skops);
 
+    if (java_remote_parent_enabled && !java_remote_parent_seed_socket_cookie(skops->sk, cookie)) {
+        java_remote_parent_stat_add(k_java_remote_parent_stat_candidate_overload);
+    }
+
     if (bpf_sock_hash_update(skops, &sock_dir, (void *)&cookie, BPF_ANY) == 0) {
         bpf_map_update_elem(&tracked_sock_cookies, &cookie, &(u8){1}, BPF_ANY);
     }
@@ -421,15 +426,20 @@ static __always_inline void bpf_sock_ops_active_est_cb(struct bpf_sock_ops *skop
 }
 
 static __always_inline void bpf_sock_ops_passive_est_cb(struct bpf_sock_ops *skops) {
-    if (!(inject_flags & k_inject_tcp_options)) {
-        return;
-    }
-
-    u8 flags = BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG;
+    u8 flags = 0;
     if (java_remote_parent_enabled) {
+        const u64 socket_cookie = bpf_get_socket_cookie(skops);
+        if (!java_remote_parent_seed_socket_cookie(skops->sk, socket_cookie)) {
+            java_remote_parent_stat_add(k_java_remote_parent_stat_candidate_overload);
+        }
         flags |= BPF_SOCK_OPS_STATE_CB_FLAG;
     }
-    bpf_sock_ops_set_flags(skops, flags);
+    if (inject_flags & k_inject_tcp_options) {
+        flags |= BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG;
+    }
+    if (flags) {
+        bpf_sock_ops_set_flags(skops, flags);
+    }
 }
 
 static __always_inline ssl_prewrite_value_t *
@@ -926,9 +936,11 @@ static __always_inline void bpf_sock_ops_parse_hdr_cb(struct bpf_sock_ops *skops
     connection_info_t conn = get_connection_info_ops(skops);
     sort_connection_info(&conn);
     u64 netns_cookie = 0;
+    u64 socket_cookie = 0;
     if (java_remote_parent_enabled) {
         netns_cookie = bpf_get_netns_cookie(skops);
-        if (!netns_cookie) {
+        socket_cookie = bpf_get_socket_cookie(skops);
+        if (!netns_cookie || !socket_cookie) {
             java_remote_parent_stat_add(k_java_remote_parent_stat_candidate_overload);
             return;
         }
@@ -940,8 +952,8 @@ static __always_inline void bpf_sock_ops_parse_hdr_cb(struct bpf_sock_ops *skops
         &conn, &tp, tcp_sequence, netns_cookie, &ambiguous_generation);
     if (java_remote_parent_enabled) {
         if (ambiguous_generation) {
-            java_remote_parent_mark_connection_ambiguous_in_netns_cookie(
-                &conn, netns_cookie, ambiguous_generation);
+            java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(
+                &conn, netns_cookie, socket_cookie, ambiguous_generation);
         }
         if (result == k_incoming_trace_ambiguous) {
             java_remote_parent_stat_add(k_java_remote_parent_stat_candidate_ambiguous);
@@ -971,17 +983,19 @@ static __always_inline void bpf_sock_ops_state_cb(struct bpf_sock_ops *skops) {
     connection_info_t conn = get_connection_info_ops(skops);
     sort_connection_info(&conn);
     const u64 netns_cookie = bpf_get_netns_cookie(skops);
+    const u64 socket_cookie = bpf_get_socket_cookie(skops);
     if (netns_cookie) {
         if (ssl_prewrite_connection_tracked(&conn, netns_cookie)) {
             cleanup_ssl_prewrite_connection(&conn, netns_cookie);
         }
-        java_remote_parent_mark_connection_ambiguous_in_netns_cookie(&conn, netns_cookie, 0);
+        java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(
+            &conn, netns_cookie, socket_cookie, 0);
         delete_strict_incoming_trace(&conn, netns_cookie);
     }
 }
 
-// Tracks all outgoing sockets (BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB)
-// We don't track incoming, those would be BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB
+// Tracks outgoing sockets for injection and observes incoming sockets for
+// traceparent parsing and Java remote-parent socket identity.
 SEC("sockops")
 int obi_sockmap_tracker(struct bpf_sock_ops *skops) {
     struct bpf_sock *sk = skops->sk;

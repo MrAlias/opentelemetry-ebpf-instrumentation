@@ -762,7 +762,7 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
             java_remote_parent_incoming_t *java_incoming = NULL;
             if (java_remote_parent_enabled && java_remote_parent_data_hook_is_ready() &&
                 args->java && args->ssl && args->connection_netns &&
-                args->connection_netns_cookie) {
+                args->connection_netns_cookie && args->connection_socket_cookie) {
                 java_incoming = java_remote_parent_incoming_snapshot_mem();
             }
             found_tp = find_trace_for_server_request_with_incoming(
@@ -783,6 +783,7 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
                         java_remote_parent_stage_incoming(java_connection,
                                                           args->connection_netns,
                                                           args->connection_netns_cookie,
+                                                          args->connection_socket_cookie,
                                                           java_incoming);
                 }
                 if (!staged_generation) {

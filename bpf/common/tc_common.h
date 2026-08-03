@@ -160,11 +160,13 @@ static __always_inline u32 sk_ops_local_ip4(struct bpf_sock_ops *ctx) {
 static __always_inline void
 sk_ops_read_remote_ip6(struct bpf_sock_ops *ctx,
                        u32 *res) { //NOLINT(readability-non-const-parameter)
+    // The context remains live across all four loads. Early-clobber outputs prevent the register
+    // allocator from reusing its register before the final load.
     asm("%[res0] = *(u32 *)(%[base] + %[offset] + 0)\n"
         "%[res1] = *(u32 *)(%[base] + %[offset] + 4)\n"
         "%[res2] = *(u32 *)(%[base] + %[offset] + 8)\n"
         "%[res3] = *(u32 *)(%[base] + %[offset] + 12)\n"
-        : [res0] "=r"(res[0]), [res1] "=r"(res[1]), [res2] "=r"(res[2]), [res3] "=r"(res[3])
+        : [res0] "=&r"(res[0]), [res1] "=&r"(res[1]), [res2] "=&r"(res[2]), [res3] "=&r"(res[3])
         : [base] "r"(ctx), [offset] "i"(offsetof(struct bpf_sock_ops, remote_ip6)), "m"(*ctx));
 }
 
@@ -175,7 +177,7 @@ sk_ops_read_local_ip6(struct bpf_sock_ops *ctx,
         "%[res1] = *(u32 *)(%[base] + %[offset] + 4)\n"
         "%[res2] = *(u32 *)(%[base] + %[offset] + 8)\n"
         "%[res3] = *(u32 *)(%[base] + %[offset] + 12)\n"
-        : [res0] "=r"(res[0]), [res1] "=r"(res[1]), [res2] "=r"(res[2]), [res3] "=r"(res[3])
+        : [res0] "=&r"(res[0]), [res1] "=&r"(res[1]), [res2] "=&r"(res[2]), [res3] "=&r"(res[3])
         : [base] "r"(ctx), [offset] "i"(offsetof(struct bpf_sock_ops, local_ip6)), "m"(*ctx));
 }
 

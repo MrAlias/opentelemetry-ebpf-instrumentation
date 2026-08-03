@@ -69,6 +69,8 @@ static const u64 test_capture_race_token = 2001;
 static const u64 test_relay_race_token = 2002;
 static const u64 test_capture_transfer_token = 3001;
 static const u64 test_relay_transfer_token = 3002;
+static const u64 test_socket_cookie = 86;
+static const u64 test_replacement_socket_cookie = 87;
 static const pid_key_t test_owner = {.tid = 7, .pid = 5, .ns = 3};
 static const pid_key_t test_child = {.tid = 8, .pid = 5, .ns = 3};
 static const pid_key_t test_relay_child = {.tid = 9, .pid = 5, .ns = 3};
@@ -94,6 +96,7 @@ typedef struct ambiguity_entry {
 static pid_key_t current_task;
 static java_remote_parent_connection_keys_t connection_keys_scratch;
 static java_remote_parent_connection_t connection_value_scratch;
+static java_remote_parent_state_t stage_state_scratch;
 static java_remote_parent_owner_t stored_owner;
 static int owner_present;
 static java_remote_parent_owner_t child_owner;
@@ -259,6 +262,9 @@ static void *test_map_lookup(void *map, const void *key) {
     }
     if (map == &java_remote_parent_connection_value_storage) {
         return &connection_value_scratch;
+    }
+    if (map == &java_remote_parent_stage_state_storage) {
+        return &stage_state_scratch;
     }
     if (map == &java_remote_parent_owners && owner_present &&
         same_key(key, &test_owner, sizeof(test_owner))) {
@@ -532,6 +538,14 @@ static long test_map_delete(void *map, const void *key) {
         claim_present = 0;
         return 0;
     }
+    if (map == &java_remote_parent_terminal &&
+        same_key(key, &test_owner, sizeof(test_owner))) {
+        if (terminal_present) {
+            terminal_present = 0;
+            return 0;
+        }
+        return -1;
+    }
     if (map == &java_remote_parent_data_signals) {
         return -1;
     }
@@ -571,6 +585,7 @@ static void seed_generation(const connection_info_t *connection) {
     current_task = test_owner;
     memset(&connection_keys_scratch, 0, sizeof(connection_keys_scratch));
     memset(&connection_value_scratch, 0, sizeof(connection_value_scratch));
+    memset(&stage_state_scratch, 0, sizeof(stage_state_scratch));
     memset(&stored_owner, 0, sizeof(stored_owner));
     memset(&child_owner, 0, sizeof(child_owner));
     memset(&stored_state, 0, sizeof(stored_state));
@@ -658,6 +673,7 @@ static void seed_generation(const connection_info_t *connection) {
     stored_connection.generation = test_generation;
     stored_connection.netns_cookie = 84;
     stored_connection.incoming_generation = 21;
+    stored_connection.socket_cookie = test_socket_cookie;
     stored_connection.netns = test_connection_netns;
 
     stored_cookie_connection_key.connection = *connection;
@@ -702,6 +718,7 @@ seed_replacement_generation(const connection_info_t *connection) {
     replacement_connection.generation = test_replacement_generation;
     replacement_connection.netns_cookie = 85;
     replacement_connection.incoming_generation = 22;
+    replacement_connection.socket_cookie = test_replacement_socket_cookie;
     replacement_connection.netns = test_connection_netns;
     replacement_connection_present = 1;
 
@@ -873,6 +890,29 @@ static void test_direct_child_conflict_marks_exact_generations(void) {
     }
 }
 
+static void test_new_receive_cleans_unaliased_generation_with_the_same_socket_cookie(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+
+    java_remote_parent_begin_data_receive();
+    if (owner_present || fallback_present || state_present || generation_index_present ||
+        connection_present || cookie_connection_present || task_present || claim_present ||
+        terminal_present || unexpected_update || unexpected_delete) {
+        fail("new receive retained an unaliased generation for the same physical socket");
+    }
+
+    java_remote_parent_capture_handoff(test_cancelled_token);
+    const java_remote_parent_handoff_key_t handoff_key = {
+        .pid = test_owner.pid,
+        .ns = test_owner.ns,
+        .token = test_cancelled_token,
+    };
+    if (find_handoff(&handoff_key) || stored_state.aliases != 0 || unexpected_update ||
+        unexpected_delete) {
+        fail("cleaned same-socket generation was revived by a later task capture");
+    }
+}
+
 static void test_captured_generation_survives_owner_reuse(void) {
     const connection_info_t connection = {.s_port = 1234, .d_port = 443};
     const connection_info_t replacement = {.s_port = 2345, .d_port = 8443};
@@ -934,19 +974,48 @@ static void test_captured_generation_survives_owner_reuse(void) {
     current_task = test_child;
     java_remote_parent_response_t response = {0};
     enum java_remote_parent_status status = java_remote_parent_retrieve_for_connection(
-        &response, 0, test_now_ns, &connection, test_connection_netns, test_replacement_generation);
+        &response,
+        0,
+        test_now_ns,
+        &connection,
+        test_connection_netns,
+        test_replacement_generation,
+        test_socket_cookie);
     if (status != k_java_remote_parent_status_missing || !state_present || claim_present) {
         fail("wrong exact generation consumed the preserved generation");
     }
 
     status = java_remote_parent_retrieve_for_connection(
-        &response, 0, test_now_ns, &replacement, test_connection_netns, test_generation);
+        &response,
+        0,
+        test_now_ns,
+        &replacement,
+        test_connection_netns,
+        test_generation,
+        test_replacement_socket_cookie);
     if (status != k_java_remote_parent_status_missing || !state_present || claim_present) {
         fail("wrong exact connection consumed the preserved generation");
     }
 
     status = java_remote_parent_retrieve_for_connection(
-        &response, 0, test_now_ns, &connection, test_connection_netns, test_generation);
+        &response,
+        0,
+        test_now_ns,
+        &connection,
+        test_connection_netns,
+        test_generation,
+        test_replacement_socket_cookie);
+    if (status != k_java_remote_parent_status_missing || !state_present || claim_present) {
+        fail("wrong physical socket consumed the preserved generation");
+    }
+
+    status = java_remote_parent_retrieve_for_connection(&response,
+                                                        0,
+                                                        test_now_ns,
+                                                        &connection,
+                                                        test_connection_netns,
+                                                        test_generation,
+                                                        test_socket_cookie);
     if (status != k_java_remote_parent_status_valid ||
         java_remote_parent_le64_to_cpu(response.generation_le) != test_generation ||
         memcmp(response.trace_id, expected.trace_id, sizeof(response.trace_id)) != 0 ||
@@ -963,7 +1032,7 @@ static void test_captured_generation_survives_owner_reuse(void) {
         stored_terminal.process_incarnation != test_process_incarnation ||
         stored_terminal.lifecycle != k_java_remote_parent_lifecycle_consumed ||
         stats[k_java_remote_parent_stat_take_valid] != 1 ||
-        stats[k_java_remote_parent_stat_take_missing] != 2 ||
+        stats[k_java_remote_parent_stat_take_missing] != 3 ||
         stats[k_java_remote_parent_stat_handoff_valid] != 1 || unexpected_update ||
         unexpected_delete) {
         fail("task-linked exact retrieval did not consume the preserved generation");
@@ -992,7 +1061,8 @@ static void test_captured_generation_survives_owner_reuse(void) {
                                                         test_now_ns,
                                                         &replacement,
                                                         test_connection_netns,
-                                                        test_replacement_generation);
+                                                        test_replacement_generation,
+                                                        test_replacement_socket_cookie);
     if (status != k_java_remote_parent_status_valid ||
         java_remote_parent_le64_to_cpu(response.generation_le) != test_replacement_generation ||
         memcmp(response.trace_id, expected_replacement.trace_id, sizeof(response.trace_id)) != 0 ||
@@ -1006,7 +1076,7 @@ static void test_captured_generation_survives_owner_reuse(void) {
         stored_terminal.process_incarnation != test_process_incarnation ||
         stored_terminal.lifecycle != k_java_remote_parent_lifecycle_consumed ||
         stats[k_java_remote_parent_stat_take_valid] != 2 ||
-        stats[k_java_remote_parent_stat_take_missing] != 2 ||
+        stats[k_java_remote_parent_stat_take_missing] != 3 ||
         stats[k_java_remote_parent_stat_handoff_valid] != 1 || unexpected_update ||
         unexpected_delete) {
         fail("replacement generation did not remain directly retrievable");
@@ -1019,6 +1089,7 @@ int main(void) {
     test_capture_transfer_survives_claim_eviction();
     test_relay_transfer_survives_claim_eviction();
     test_direct_child_conflict_marks_exact_generations();
+    test_new_receive_cleans_unaliased_generation_with_the_same_socket_cookie();
     test_captured_generation_survives_owner_reuse();
     return 0;
 }

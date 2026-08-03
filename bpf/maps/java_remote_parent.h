@@ -235,7 +235,7 @@ java_remote_parent_generation_state_active(const java_remote_parent_key_t *key) 
            java_remote_parent_generation_index_matches(
                key, process_incarnation, state->observed_monotime_ns) &&
            java_remote_parent_connection_matches_in_netns(
-               &state->connection, state->connection_netns, &key->owner, key->generation, 0);
+               &state->connection, state->connection_netns, &key->owner, key->generation, 0, 0);
 }
 
 static __always_inline u8
@@ -519,6 +519,7 @@ java_remote_parent_stage_is_consistent(const pid_key_t *owner,
                                        const connection_info_t *connection,
                                        u32 connection_netns,
                                        u64 connection_netns_cookie,
+                                       u64 socket_cookie,
                                        u64 incoming_generation,
                                        u64 process_incarnation,
                                        const tp_info_pid_t *incoming) {
@@ -538,8 +539,13 @@ java_remote_parent_stage_is_consistent(const pid_key_t *owner,
         java_remote_parent_le64_to_cpu(state->response.generation_le) != key->generation ||
         !java_remote_parent_generation_index_matches(
             key, process_incarnation, state->observed_monotime_ns) ||
-        !java_remote_parent_connection_matches_in_netns(
-            connection, connection_netns, owner, key->generation, incoming_generation) ||
+        !java_remote_parent_connection_matches_socket_in_netns(
+            connection,
+            connection_netns,
+            owner,
+            key->generation,
+            incoming_generation,
+            socket_cookie) ||
         !java_remote_parent_fallback_matches(owner, key->generation)) {
         return 0;
     }
@@ -555,10 +561,12 @@ java_remote_parent_stage_is_consistent(const pid_key_t *owner,
 static __always_inline u64 java_remote_parent_stage(const connection_info_t *connection,
                                                     u32 connection_netns,
                                                     u64 connection_netns_cookie,
+                                                    u64 socket_cookie,
                                                     u64 incoming_generation,
                                                     const tp_info_pid_t *incoming) {
     if (!java_remote_parent_data_hook_is_ready() || !connection || !connection_netns ||
-        !connection_netns_cookie || !incoming_generation || !incoming || !incoming->valid ||
+        !connection_netns_cookie || !socket_cookie || !incoming_generation || !incoming ||
+        !incoming->valid ||
         incoming->provenance != k_tp_provenance_tcp_exact_flags ||
         !valid_trace(incoming->tp.trace_id) || !valid_span(incoming->tp.span_id)) {
         java_remote_parent_stat_add(k_java_remote_parent_stat_stage_malformed);
@@ -655,10 +663,12 @@ static __always_inline u64 java_remote_parent_stage(const connection_info_t *con
     handoff->generation = generation;
     handoff->netns_cookie = connection_netns_cookie;
     handoff->incoming_generation = incoming_generation;
+    handoff->socket_cookie = socket_cookie;
     if (bpf_map_update_elem(
             &java_remote_parent_connections, &connection_keys->netns, handoff, BPF_NOEXIST) != 0) {
         invalidate_incoming_trace_in_netns_cookie(connection, connection_netns_cookie, now);
-        java_remote_parent_mark_connection_ambiguous_in_netns(connection, connection_netns);
+        java_remote_parent_mark_connection_ambiguous_in_netns_for_socket(
+            connection, connection_netns, socket_cookie);
         java_remote_parent_rollback_stage(&owner, &key, connection, connection_netns);
         java_remote_parent_stat_add(k_java_remote_parent_stat_stage_ambiguous);
         return 0;
@@ -669,8 +679,8 @@ static __always_inline u64 java_remote_parent_stage(const connection_info_t *con
                             handoff,
                             BPF_NOEXIST) != 0) {
         invalidate_incoming_trace_in_netns_cookie(connection, connection_netns_cookie, now);
-        java_remote_parent_mark_connection_ambiguous_in_netns_cookie(
-            connection, connection_netns_cookie, 0);
+        java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(
+            connection, connection_netns_cookie, socket_cookie, 0);
         java_remote_parent_rollback_stage(&owner, &key, connection, connection_netns);
         java_remote_parent_stat_add(k_java_remote_parent_stat_stage_ambiguous);
         return 0;
@@ -684,6 +694,7 @@ static __always_inline u64 java_remote_parent_stage(const connection_info_t *con
                                                 connection,
                                                 connection_netns,
                                                 connection_netns_cookie,
+                                                socket_cookie,
                                                 incoming_generation,
                                                 process_incarnation,
                                                 incoming)) {
@@ -735,10 +746,12 @@ static __always_inline u64
 java_remote_parent_stage_incoming(const connection_info_t *connection,
                                   u32 connection_netns,
                                   u64 connection_netns_cookie,
+                                  u64 socket_cookie,
                                   const java_remote_parent_incoming_t *incoming) {
     return java_remote_parent_stage(connection,
                                     connection_netns,
                                     connection_netns_cookie,
+                                    socket_cookie,
                                     incoming->generation,
                                     &incoming->candidate);
 }
@@ -1195,11 +1208,17 @@ java_remote_parent_retrieve_for_connection(java_remote_parent_response_t *respon
                                            u64 max_age_ns,
                                            const connection_info_t *expected_connection,
                                            u32 expected_connection_netns,
-                                           u64 expected_generation) {
+                                           u64 expected_generation,
+                                           u64 expected_socket_cookie) {
     const pid_key_t start = java_remote_parent_current_owner();
     const java_remote_parent_resolution_t resolution =
         java_remote_parent_resolve(&start, max_age_ns);
 
+    if (expected_connection && !expected_socket_cookie) {
+        java_remote_parent_init_response(response, k_java_remote_parent_status_missing, 0, 0);
+        java_remote_parent_retrieval_stat(discard, k_java_remote_parent_status_missing);
+        return k_java_remote_parent_status_missing;
+    }
     if (expected_connection && resolution.found && expected_generation &&
         resolution.key.generation != expected_generation) {
         java_remote_parent_init_response(
@@ -1212,7 +1231,14 @@ java_remote_parent_retrieve_for_connection(java_remote_parent_response_t *respon
             bpf_map_lookup_elem(&java_remote_parent_state, &resolution.key);
         if (!bound_state || bound_state->connection_netns != expected_connection_netns ||
             __builtin_memcmp(
-                &bound_state->connection, expected_connection, sizeof(*expected_connection)) != 0) {
+                &bound_state->connection, expected_connection, sizeof(*expected_connection)) != 0 ||
+            !java_remote_parent_connection_matches_socket_in_netns(
+                expected_connection,
+                expected_connection_netns,
+                &resolution.key.owner,
+                resolution.key.generation,
+                0,
+                expected_socket_cookie)) {
             java_remote_parent_init_response(
                 response, k_java_remote_parent_status_missing, resolution.key.generation, 0);
             java_remote_parent_retrieval_stat(discard, k_java_remote_parent_status_missing);
@@ -1310,11 +1336,19 @@ java_remote_parent_retrieve_for_connection(java_remote_parent_response_t *respon
         state->process_incarnation != java_current_process_incarnation() ||
         state->lifecycle != k_java_remote_parent_lifecycle_active ||
         java_remote_parent_generation_ambiguous(&resolution.key) ||
-        !java_remote_parent_connection_matches_in_netns(&state->connection,
-                                                        state->connection_netns,
-                                                        &resolution.key.owner,
-                                                        resolution.key.generation,
-                                                        0) ||
+        (expected_connection
+             ? !java_remote_parent_connection_matches_socket_in_netns(&state->connection,
+                                                                       state->connection_netns,
+                                                                       &resolution.key.owner,
+                                                                       resolution.key.generation,
+                                                                       0,
+                                                                       expected_socket_cookie)
+             : !java_remote_parent_connection_matches_in_netns(&state->connection,
+                                                                state->connection_netns,
+                                                                &resolution.key.owner,
+                                                                resolution.key.generation,
+                                                                0,
+                                                                0)) ||
         (!resolution.via_task &&
          (!claimed_fallback || claimed_fallback->status != k_java_remote_parent_status_valid ||
           java_remote_parent_le64_to_cpu(claimed_fallback->generation_le) !=
@@ -1373,5 +1407,5 @@ java_remote_parent_retrieve_for_connection(java_remote_parent_response_t *respon
 
 static __always_inline enum java_remote_parent_status
 java_remote_parent_retrieve(java_remote_parent_response_t *response, u8 discard, u64 max_age_ns) {
-    return java_remote_parent_retrieve_for_connection(response, discard, max_age_ns, NULL, 0, 0);
+    return java_remote_parent_retrieve_for_connection(response, discard, max_age_ns, NULL, 0, 0, 0);
 }

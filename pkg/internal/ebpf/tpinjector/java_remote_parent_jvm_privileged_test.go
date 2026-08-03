@@ -26,6 +26,7 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 
 	"go.opentelemetry.io/obi/pkg/internal/javabridge"
 )
@@ -76,6 +77,7 @@ func TestJavaRemoteParentPrimaryJVMFaults(t *testing.T) {
 	defer objects.Close()
 	setJavaRemoteParentDataHookReadiness(t, objects.JavaRemoteParentDataHookReadiness, true)
 	attachJavaRemoteParentFixture(t, &objects.BpfJavaRemoteParentPrograms)
+	attachJavaRemoteParentSockopsFixture(t, objects.JavaRemoteParentSocketCookies)
 
 	scenarios := []javaRemoteParentJVMScenario{
 		{generation: 51, name: "valid", status: javabridge.StatusValid},
@@ -216,6 +218,20 @@ func runJavaRemoteParentJVMScenario(
 	lines := javaRemoteParentJVMProbeLines(stdout)
 	ready := waitForJavaRemoteParentJVMProbe(t, ctx, lines, "READY", &stderr)
 	tid := javaRemoteParentJVMProbeUint32(t, ready, "tid")
+	javaSocketFD := javaRemoteParentJVMProbeInt(t, ready, "fd")
+	require.GreaterOrEqual(t, javaSocketFD, 0)
+	pidfd, err := unix.PidfdOpen(command.Process.Pid, 0)
+	require.NoError(t, err)
+	defer unix.Close(pidfd)
+	javaSocketDuplicate, err := unix.PidfdGetfd(pidfd, javaSocketFD, 0)
+	require.NoError(t, err)
+	defer unix.Close(javaSocketDuplicate)
+	javaSocketCookie := socketCookie(t, javaSocketDuplicate)
+	var seededSocketCookie uint64
+	require.NoError(t, maps.JavaRemoteParentSocketCookies.Lookup(
+		uint32(javaSocketDuplicate), &seededSocketCookie,
+	))
+	require.Equal(t, javaSocketCookie, seededSocketCookie)
 	owner := process
 	owner.Tid = tid
 
@@ -239,6 +255,7 @@ func runJavaRemoteParentJVMScenario(
 		capability,
 		connectionInfo,
 		netns,
+		javaSocketCookie,
 		scenario.generation,
 		javaRemoteParentJVMProbeNonce,
 		observed,

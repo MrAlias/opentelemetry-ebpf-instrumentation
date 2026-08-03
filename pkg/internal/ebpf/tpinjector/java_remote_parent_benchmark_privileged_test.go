@@ -130,6 +130,9 @@ func TestJavaRemoteParentTransportBenchmark(t *testing.T) {
 	for i := range workers {
 		pairs[i] = connectTCP(t, listener)
 		defer pairs[i].close()
+		seedJavaRemoteParentSocketCookie(
+			t, objects.JavaRemoteParentSocketCookies, pairs[i].client,
+		)
 
 		require.NoError(t, rawSetsockoptUint64(
 			pairs[i].client, javabridge.SocketLevel, javabridge.SocketNegotiate, capability,
@@ -770,6 +773,7 @@ func stageBenchmarkGeneration(
 		capability,
 		negotiation.Connection,
 		negotiation.ConnectionNetns,
+		socketCookie(t, fd),
 		generation,
 		nonce,
 	)

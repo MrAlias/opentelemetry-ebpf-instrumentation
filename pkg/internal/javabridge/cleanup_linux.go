@@ -318,7 +318,8 @@ func validConnectionClaim(
 ) bool {
 	return connection.Owner == owner && connection.Reserved == 0 &&
 		connection.Generation == generation && connection.NetNSCookie != 0 &&
-		connection.IncomingGeneration != 0 && connection.NetNS == netns &&
+		connection.IncomingGeneration != 0 && connection.SocketCookie != 0 &&
+		connection.NetNS == netns &&
 		connection.Reserved2 == 0
 }
 

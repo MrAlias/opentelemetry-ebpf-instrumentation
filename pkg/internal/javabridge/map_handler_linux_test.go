@@ -156,10 +156,11 @@ func TestMapHandlerKernelMapLayouts(t *testing.T) {
 	var cookieConnection connectionInfoNetNSCookie
 	assert.Equal(t, uintptr(48), unsafe.Sizeof(cookieConnection))
 	assert.Equal(t, uintptr(40), unsafe.Offsetof(cookieConnection.NetNSCookie))
-	assert.Equal(t, uintptr(48), unsafe.Sizeof(connectionClaim{}))
+	assert.Equal(t, uintptr(56), unsafe.Sizeof(connectionClaim{}))
 	assert.Equal(t, uintptr(24), unsafe.Offsetof(connectionClaim{}.NetNSCookie))
 	assert.Equal(t, uintptr(32), unsafe.Offsetof(connectionClaim{}.IncomingGeneration))
-	assert.Equal(t, uintptr(40), unsafe.Offsetof(connectionClaim{}.NetNS))
+	assert.Equal(t, uintptr(40), unsafe.Offsetof(connectionClaim{}.SocketCookie))
+	assert.Equal(t, uintptr(48), unsafe.Offsetof(connectionClaim{}.NetNS))
 
 	var state stateValue
 	assert.Equal(t, uintptr(128), unsafe.Sizeof(state))
@@ -1721,6 +1722,7 @@ func seedConnectionClaim(
 		Generation:         generation,
 		NetNSCookie:        netnsCookie,
 		IncomingGeneration: incomingGeneration,
+		SocketCookie:       generation | 1,
 		NetNS:              connectionKey.NetNS,
 	}
 	handler.connections.(*fakeBridgeMap).values[connectionKey] = connectionValue

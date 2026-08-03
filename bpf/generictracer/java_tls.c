@@ -68,7 +68,8 @@ static __always_inline u8 java_connection_from_file(struct file *file,
                                                     connection_info_t *connection,
                                                     u16 *orig_dport,
                                                     u32 *netns,
-                                                    u64 *netns_cookie) {
+                                                    u64 *netns_cookie,
+                                                    u64 *socket_cookie) {
     if (!file) {
         return 0;
     }
@@ -95,6 +96,7 @@ static __always_inline u8 java_connection_from_file(struct file *file,
     }
     *netns = sock_port_ns_from_sk(sk).netns;
     *netns_cookie = java_remote_parent_enabled ? sock_netns_cookie_from_sk(sk) : 0;
+    *socket_cookie = BPF_CORE_READ(sk, __sk_common.skc_cookie.counter);
     return *netns != 0;
 }
 
@@ -284,12 +286,14 @@ static __always_inline int handle_java_ioctl(
         u16 orig_dport = 0;
         u32 connection_netns = 0;
         u64 connection_netns_cookie = 0;
+        u64 socket_cookie = 0;
         if (!java_connection_from_file(file,
                                        TCP_RECV,
                                        &connection.conn,
                                        &orig_dport,
                                        &connection_netns,
-                                       &connection_netns_cookie)) {
+                                       &connection_netns_cookie,
+                                       &socket_cookie)) {
             return 0;
         }
         mark_java_tls_connection(&claimed, &connection.conn, pid_from_pid_tgid(id));
@@ -387,6 +391,7 @@ static __always_inline int handle_java_ioctl(
     u16 orig_dport = 0;
     u32 connection_netns = 0;
     u64 connection_netns_cookie = 0;
+    u64 socket_cookie = 0;
     connection_info_t claimed = {0};
     if (bpf_probe_read_user(&claimed, sizeof(claimed), uarg + 1) != 0) {
         return 0;
@@ -394,7 +399,13 @@ static __always_inline int handle_java_ioctl(
 
     if (file) {
         if (!java_connection_from_file(
-                file, op, &p_conn.conn, &orig_dport, &connection_netns, &connection_netns_cookie)) {
+                file,
+                op,
+                &p_conn.conn,
+                &orig_dport,
+                &connection_netns,
+                &connection_netns_cookie,
+                &socket_cookie)) {
             return 0;
         }
 
@@ -475,7 +486,15 @@ static __always_inline int handle_java_ioctl(
         const u64 zero = 0;
         bpf_map_update_elem(&active_ssl_connections, &p_conn, &zero, BPF_NOEXIST);
         handle_java_buf_with_connection(
-            ctx, &p_conn, buf, max_len, op, orig_dport, connection_netns, connection_netns_cookie);
+            ctx,
+            &p_conn,
+            buf,
+            max_len,
+            op,
+            orig_dport,
+            connection_netns,
+            connection_netns_cookie,
+            socket_cookie);
     }
 
     return 0;

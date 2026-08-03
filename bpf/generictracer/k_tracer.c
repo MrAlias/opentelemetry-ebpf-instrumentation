@@ -744,6 +744,7 @@ static __always_inline void java_remote_parent_close_socket(struct sock *sk) {
     sort_connection_info(&connection);
 
     const u64 netns_cookie = sock_netns_cookie_from_sk(sk);
+    const u64 socket_cookie = BPF_CORE_READ(sk, __sk_common.skc_cookie.counter);
     if (netns_cookie) {
         const pid_connection_info_t process_connection = {
             .conn = connection,
@@ -752,12 +753,14 @@ static __always_inline void java_remote_parent_close_socket(struct sock *sk) {
         if (ssl_prewrite_connection_should_cleanup(&process_connection, netns_cookie)) {
             cleanup_ssl_prewrite_connection(&connection, netns_cookie);
         }
-        java_remote_parent_mark_connection_ambiguous_in_netns_cookie(&connection, netns_cookie, 0);
+        java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(
+            &connection, netns_cookie, socket_cookie, 0);
         delete_strict_incoming_trace(&connection, netns_cookie);
     } else {
         const u32 netns = sock_port_ns_from_sk(sk).netns;
         if (netns) {
-            java_remote_parent_mark_connection_ambiguous_in_netns(&connection, netns);
+            java_remote_parent_mark_connection_ambiguous_in_netns_for_socket(
+                &connection, netns, socket_cookie);
         }
     }
 }

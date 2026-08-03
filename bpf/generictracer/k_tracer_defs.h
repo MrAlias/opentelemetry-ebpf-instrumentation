@@ -62,6 +62,7 @@ static __always_inline call_protocol_args_t *make_protocol_args(const pid_connec
     args->flags = k_call_protocol_flag_none;
     args->connection_netns = task_netns();
     args->connection_netns_cookie = (ssl || java_remote_parent_enabled) ? task_netns_cookie() : 0;
+    args->connection_socket_cookie = 0;
     args->ssl_ptr = 0;
     args->u_buf = (u64)u_buf;
     args->lw_thread = lw_thread;
@@ -127,7 +128,8 @@ static __always_inline void handle_java_buf_with_connection(void *ctx,
                                                             u8 direction,
                                                             u16 orig_dport,
                                                             u32 connection_netns,
-                                                            u64 connection_netns_cookie) {
+                                                            u64 connection_netns_cookie,
+                                                            u64 socket_cookie) {
     call_protocol_args_t *args = make_protocol_args(pid_conn,
                                                     k_lw_thread_none,
                                                     k_protocol_selector_all,
@@ -143,6 +145,7 @@ static __always_inline void handle_java_buf_with_connection(void *ctx,
     args->java = 1;
     args->connection_netns = connection_netns;
     args->connection_netns_cookie = connection_netns_cookie;
+    args->connection_socket_cookie = socket_cookie;
     bpf_tail_call(ctx, &jump_table, k_tail_handle_buf_with_args);
 }
 

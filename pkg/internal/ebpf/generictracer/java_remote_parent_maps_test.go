@@ -51,6 +51,16 @@ func TestJavaRemoteParentSharedMapSpecsAreCompatible(t *testing.T) {
 				}
 			}
 			for loader, spec := range specs {
+				for _, mapName := range []string{
+					"java_remote_parent_connections",
+					"java_remote_parent_cookie_connections",
+				} {
+					shared := spec.Maps[mapName]
+					require.NotNil(t, shared, loader+" "+mapName)
+					require.Equal(t, uint32(56), shared.ValueSize, loader+" "+mapName)
+				}
+			}
+			for loader, spec := range specs {
 				if loader == "generic" {
 					continue
 				}
@@ -154,7 +164,8 @@ func assertSharedMapSpecs(t *testing.T, left, right *ebpf.CollectionSpec) {
 	t.Helper()
 	compared := 0
 	for name, rightMap := range right.Maps {
-		if name == "java_remote_parent_negotiations" {
+		if name == "java_remote_parent_negotiations" ||
+			name == "java_remote_parent_socket_cookies" {
 			continue
 		}
 		if name != "incoming_trace_map" &&
@@ -214,30 +225,46 @@ func TestJavaRemoteParentGenerationMapsArePerCPU(t *testing.T) {
 }
 
 func TestJavaRemoteParentSocketAuthorityIsSocketLocal(t *testing.T) {
-	spec, err := tpinjector.LoadBpfJavaRemoteParent()
+	primarySpec, err := tpinjector.LoadBpfJavaRemoteParent()
+	require.NoError(t, err)
+	sockopsSpec, err := tpinjector.LoadBpf()
 	require.NoError(t, err)
 
-	negotiations := spec.Maps["java_remote_parent_negotiations"]
+	negotiations := primarySpec.Maps["java_remote_parent_negotiations"]
 	require.NotNil(t, negotiations)
 	require.Equal(t, ebpf.SkStorage, negotiations.Type)
 	require.Equal(t, uint32(unix.BPF_F_NO_PREALLOC), negotiations.Flags)
 	require.NotEqual(t, ebpf.PinNone, negotiations.Pinning)
-	require.Equal(t, spec.Maps["java_authorized_processes"].Pinning, negotiations.Pinning)
+	require.Equal(t, primarySpec.Maps["java_authorized_processes"].Pinning, negotiations.Pinning)
+
+	primaryCookies := primarySpec.Maps["java_remote_parent_socket_cookies"]
+	sockopsCookies := sockopsSpec.Maps["java_remote_parent_socket_cookies"]
+	require.NotNil(t, primaryCookies)
+	require.NotNil(t, sockopsCookies)
+	assertMapSpecEqual(
+		t, "java_remote_parent_socket_cookies", primaryCookies, sockopsCookies,
+	)
+	require.Equal(t, ebpf.SkStorage, primaryCookies.Type)
+	require.Equal(t, uint32(4), primaryCookies.KeySize)
+	require.Equal(t, uint32(8), primaryCookies.ValueSize)
+	require.Zero(t, primaryCookies.MaxEntries)
+	require.Equal(t, uint32(unix.BPF_F_NO_PREALLOC), primaryCookies.Flags)
+	require.Equal(t, negotiations.Pinning, primaryCookies.Pinning)
 	require.Equal(
 		t,
 		"cgroup/setsockopt",
-		spec.Programs["obi_java_remote_parent_setsockopt"].SectionName,
+		primarySpec.Programs["obi_java_remote_parent_setsockopt"].SectionName,
 	)
 	require.Equal(
 		t,
 		"cgroup/getsockopt",
-		spec.Programs["obi_java_remote_parent_getsockopt"].SectionName,
+		primarySpec.Programs["obi_java_remote_parent_getsockopt"].SectionName,
 	)
 
-	require.Equal(t, ebpf.Hash, spec.Maps["java_authorized_processes"].Type)
-	require.Equal(t, ebpf.LRUHash, spec.Maps["java_remote_parent_data_signals"].Type)
-	require.Equal(t, ebpf.LRUHash, spec.Maps["java_remote_parent_data_acks"].Type)
-	readiness := spec.Maps["java_remote_parent_data_hook_readiness"]
+	require.Equal(t, ebpf.Hash, primarySpec.Maps["java_authorized_processes"].Type)
+	require.Equal(t, ebpf.LRUHash, primarySpec.Maps["java_remote_parent_data_signals"].Type)
+	require.Equal(t, ebpf.LRUHash, primarySpec.Maps["java_remote_parent_data_acks"].Type)
+	readiness := primarySpec.Maps["java_remote_parent_data_hook_readiness"]
 	require.NotNil(t, readiness)
 	require.Equal(t, ebpf.Array, readiness.Type)
 	require.Equal(t, uint32(1), readiness.MaxEntries)

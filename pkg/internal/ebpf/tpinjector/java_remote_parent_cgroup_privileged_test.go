@@ -47,6 +47,7 @@ const (
 	javaRemoteParentControllerSetsockoptFD = 4
 	javaRemoteParentControllerReadyFD      = 5
 	javaRemoteParentControllerHoldFD       = 6
+	javaRemoteParentCgroupSocketCookiesFD  = 5
 )
 
 type javaRemoteParentCgroupTopology struct {
@@ -459,6 +460,11 @@ func TestJavaRemoteParentCgroupWorkloadHelper(t *testing.T) {
 		require.NoError(t, binary.Write(result, binary.LittleEndian, uint64(0)))
 		return
 	}
+
+	cookieStorage, err := ebpf.NewMapFromFD(javaRemoteParentCgroupSocketCookiesFD)
+	require.NoError(t, err)
+	defer cookieStorage.Close()
+	seedJavaRemoteParentSocketCookie(t, cookieStorage, pair.client)
 
 	require.NoError(t, rawSetsockoptUint64(
 		pair.client,
@@ -1043,7 +1049,18 @@ func runJavaRemoteParentCgroupWorkload(
 		javaRemoteParentCgroupCapability+"="+strconv.FormatUint(capability, 16),
 		javaRemoteParentCgroupAttached+"="+strconv.FormatBool(attached),
 	)
-	command.ExtraFiles = []*os.File{releaseReader, resultWriter}
+	extraFiles := []*os.File{releaseReader, resultWriter}
+	var socketCookiesFile *os.File
+	if maps != nil {
+		duplicate, duplicateErr := unix.Dup(maps.JavaRemoteParentSocketCookies.FD())
+		require.NoError(t, duplicateErr)
+		socketCookiesFile = os.NewFile(
+			uintptr(duplicate), "java-remote-parent-socket-cookies",
+		)
+		require.NotNil(t, socketCookiesFile)
+		extraFiles = append(extraFiles, socketCookiesFile)
+	}
+	command.ExtraFiles = extraFiles
 	var output bytes.Buffer
 	command.Stdout = &output
 	command.Stderr = &output
@@ -1055,6 +1072,9 @@ func runJavaRemoteParentCgroupWorkload(
 		releaseWriter.Close()
 		resultReader.Close()
 		resultWriter.Close()
+		if socketCookiesFile != nil {
+			socketCookiesFile.Close()
+		}
 		if started && !waited {
 			_ = command.Process.Kill()
 			_ = command.Wait()

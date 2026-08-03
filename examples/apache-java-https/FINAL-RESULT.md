@@ -13,8 +13,13 @@ bounded diagnostics, and checksums. The refreshed OpenTelemetry primary run
 also includes the bounded inbound-Netty fixture. Each proves only its exact matrix
 cell. Rows requiring a different transport/TLS/agent/environment combination
 remain `untested`. A row's `pass` applies only to its linked retained evidence.
-The [current primary socket-isolation acceptance bundle](evidence/otel-getsockopt-tls13-e8db066a/README.md)
-records a clean full current-revision run with same-cgroup, sibling,
+The clean full TLS 1.3
+[issue #34 supplement](evidence/otel-getsockopt-tls13-8282d2ed/README.md)
+retains a current-revision nested wire-record/decrypted-callback fixture. Its
+correlated Apache-to-Java trigger is a separate path, so the supplement does
+not close #34 or replace the broader primary bundle for unrelated controls.
+The [full primary socket-isolation acceptance bundle](evidence/otel-getsockopt-tls13-e8db066a/README.md)
+records a clean full run at its named revision with same-cgroup, sibling,
 same-JVM wrong-live-socket, and root duplicated-descriptor controls; primary
 stale-state and four returned-response fault modes; exact-parent victims; and
 recovery. It promotes only those named primary controls to `pass`.
@@ -25,7 +30,7 @@ It promotes only that exact forced-Unix matrix cell and those named Unix
 controls to `pass`.
 Three clean focused OpenTelemetry/`getsockopt`/TLS 1.3 runs at
 `8f0aa1f6a7a28af93875823e4cf41675221d3542` remain historical targeted
-validation. The current clean full bundle independently exercises those
+validation. The full primary bundle independently exercises those
 controls and additionally retains the malformed declared-size response; the
 focused records are not used to promote an acceptance cell.
 
@@ -48,7 +53,7 @@ Matrix revision: `apache-java-https-compatibility-v2`.
 | 3. Java uses the official agent and OBI extension/helper | pass | [official agent metadata](evidence/otel-unix-tls12-bd1c9327/official-javaagent.json), [external-extension runtime metadata](evidence/otel-getsockopt-tls13-e8db066a/runtime-metadata.json), and [dynamic helper attach evidence](evidence/otel-getsockopt-tls13-e8db066a/README.md#retained-proof). |
 | 4. Traffic and traces are collected without a vendor UI | pass | [local receiver inventory](evidence/otel-getsockopt-tls13-e8db066a/runtime-images.json) and retained scenario JSON. |
 | 5. Apache client and Java server spans have one exact trace/parent relationship | pass | [basic trace graph](evidence/otel-getsockopt-tls13-e8db066a/scenario-basic.json). |
-| 6. Precedence, concurrency, keepalive, failure, and compatibility cases are exercised | fail | Retained controls pass precedence, concurrency, keepalive, primary and Unix fail-open/fault cases, [current Unix sibling/same-cgroup/stale controls](evidence/otel-unix-tls13-6c4a2505/README.md), and [current primary same/sibling/live-descriptor/stale/malformed-response controls](evidence/otel-getsockopt-tls13-e8db066a/README.md). A Unix application-descriptor mismatch is not applicable because Unix opens a fresh broker socket and authorizes peer/TID/capability instead of accepting the application FD; its meaningful peer and endpoint analogues pass in the retained Unix cells. Permanent process-lifetime OBI absence, explicit stale-generation mismatch, genuine TID/PID reuse, and an `auto` primary-unavailable-plus-fallback-unavailable application control remain untested for #36. Literal retained-evidence gaps for #19, #28, #34, #35, #39, and #40 are listed below. The [#37 benchmark](BENCHMARK.md) and unexecuted [#38 compatibility](COMPATIBILITY.md) rows also prevent the complete workstream from passing. The VM-gated JVM-to-JNI-to-cgroup-sockopt fixture remains a narrower unretained component cell, not a substitute for this full application evidence. |
+| 6. Precedence, concurrency, keepalive, failure, and compatibility cases are exercised | fail | Retained controls pass precedence, concurrency, keepalive, primary and Unix fail-open/fault cases, [current Unix sibling/same-cgroup/stale controls](evidence/otel-unix-tls13-6c4a2505/README.md), and [full primary same/sibling/live-descriptor/stale/malformed-response controls](evidence/otel-getsockopt-tls13-e8db066a/README.md). The [TLS wire-record/decrypted-callback fixture](evidence/otel-getsockopt-tls13-8282d2ed/README.md) passes on a nested Java-to-loopback-Netty connection, but its exact-parent Apache-to-Java trigger is a separate path; the same-request conjunction remains untested for #34. A Unix application-descriptor mismatch is not applicable because Unix opens a fresh broker socket and authorizes peer/TID/capability instead of accepting the application FD; its meaningful peer and endpoint analogues pass in the retained Unix cells. Permanent process-lifetime OBI absence, explicit stale-generation mismatch, genuine TID/PID reuse, and an `auto` primary-unavailable-plus-fallback-unavailable application control remain untested for #36. Literal retained-evidence gaps for #19, #28, #34, #35, #39, and #40 are listed below. The [#37 benchmark](BENCHMARK.md) and unexecuted [#38 compatibility](COMPATIBILITY.md) rows also prevent the complete workstream from passing. The VM-gated JVM-to-JNI-to-cgroup-sockopt fixture remains a narrower unretained component cell, not a substitute for this full application evidence. |
 | 7. Exact build, run, certificate, host, agent, and cleanup steps are documented | pass | [reproducible runbook](README.md), including the bounded [deliberate assertion failure](README.md#deliberate-assertion-failure-control), and retained environment/certificate evidence. |
 
 | Acceptance item | Status | Evidence or remaining requirement |
@@ -79,6 +84,7 @@ Matrix revision: `apache-java-https-compatibility-v2`.
 | Invalid W3C falls through to OBI | pass | [fallback graph](evidence/otel-getsockopt-tls13-e8db066a/scenario-w3c.json) and [passing counter assertion status](evidence/otel-getsockopt-tls13-e8db066a/scenario-w3c-status.json); the ordinary phase counter values are omitted |
 | Sequential backend keepalive | pass | [keepalive graph and connection evidence](evidence/otel-getsockopt-tls13-e8db066a/scenario-keepalive.json) |
 | HTTP/1.1 pipelining | pass | [pipelining graph and connection evidence](evidence/otel-getsockopt-tls13-e8db066a/scenario-pipelining.json) |
+| TLS record split/coalescing across Java callbacks | partial | [nested wire-record/decrypted-callback fixture and separate outer exact-parent graph](evidence/otel-getsockopt-tls13-8282d2ed/README.md#retained-proof); the same Apache-to-Java correlated request must exercise both properties |
 | Parallel requests/connections | pass | [concurrency graph and connection evidence](evidence/otel-getsockopt-tls13-e8db066a/scenario-concurrency.json) |
 | FD and ephemeral-port reuse | pass | [reuse graph and connection evidence](evidence/otel-getsockopt-tls13-e8db066a/scenario-fd-port-reuse.json) |
 | Servlet/executor handoff | pass | [executor-handoff graph](evidence/otel-getsockopt-tls13-e8db066a/scenario-handoff.json) |
@@ -155,7 +161,7 @@ in the final column.
 | #31 deterministic traffic/assertions | retained OpenTelemetry and Splunk primary cells plus the Unix/TLS 1.3 control cell passed with exact IDs, flags, controls, and status records | retain the remaining advertised cells |
 | #32 complete runbook | current runbook contains bounded startup/cleanup, exact controls, and an intentional failed-assertion artifact path | retain a clean-host execution whenever the runbook changes |
 | #33 final report | definition-of-done reconciliation names every parent item and the currently passing evidence | resolve the parent item 6 gaps before declaring PoC success |
-| #34 stress | retained TLS 1.3 and TLS 1.2 primary, and Unix TLS 1.2 plus the TLS 1.3 security/recovery control request and decrypted-read stress cases passed | retain an actual TLS-record split/coalescing control across Java reads; execute remaining advertised cells |
+| #34 stress | retained keepalive, pipelining, concurrency, churn, fd/port reuse, slow-body, timeout/retry, pressure/cleanup, reason-coded outcome, and exact-parent controls pass; the [current TLS 1.3 supplement](evidence/otel-getsockopt-tls13-8282d2ed/README.md) adds actual nested TLS-record split/coalescing with exact decrypted callbacks and ordering | retain the conjunction on the same correlated Apache-to-Java request; the current exact-parent graph is the outer trigger while boundary traffic is a separate Java-to-loopback-Netty connection |
 | #35 handoff | executor, virtual-thread, Netty worker, redispatch, and bounded inbound-Netty receive-to-extraction scenarios passed in the retained primary run | retain a runtime parent-chain depth/cycle-limit control; execute the remaining framework and environment matrix evidence |
 | #36 fail-open | retained primary and Unix bounded startup absence/late attach, failed attach, disabled, timeout, disconnect, overload, restart, TTL-stale, version, declared-size, truncated-frame, zero-ID, map-pressure/FD-reuse, W3C-precedence, and recovery controls pass for their transport-applicable cells | retain application-level controls for permanent process-lifetime OBI absence, an explicit stale-generation mismatch, genuine TID/PID reuse, and `auto` with both primary and fallback unavailable; the VM-gated direct component fixture remains a separate unretained compatibility cell |
 | #37 benchmark | predeclared matrix, repeated bounded workload, and resource/map snapshots | execute on fixed hardware and add sustained latency/throughput evidence |

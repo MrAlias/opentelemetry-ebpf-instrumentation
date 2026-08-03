@@ -314,6 +314,13 @@ iterating on that boundary:
 ./examples/apache-java-https/run.sh --scenario tls-boundary --tls TLSv1.3
 ```
 
+The clean full TLS 1.3
+[retained fixture evidence](evidence/otel-getsockopt-tls13-8282d2ed/README.md)
+records the exact two-record/two-callback split case and one-record/one-callback
+coalesced case on a nested Java-to-loopback-Netty connection. The exact
+Apache-client-to-Java-server parent belongs to the separate outer trigger, so a
+same-request correlated application-path proof remains required for issue #34.
+
 Exercise the Splunk distribution without changing the backend:
 
 ```bash
@@ -660,6 +667,12 @@ result and do not promote the targeted run to an acceptance matrix cell.
   crosses at least two decrypted Java receive callbacks and that those
   callbacks account for at least the full 64 KiB body. It does not infer exact
   Apache/OpenSSL TLS record boundaries from the client-side write pattern.
+- The separate retained TLS-boundary fixture observes bounded post-handshake
+  TLS application-record version and length metadata without retaining payloads.
+  Its exact record/callback cardinality proof is scoped to the planned fixture
+  writes and does not claim a general one-write/one-record JSSE contract. The
+  fixture uses a nested Java-to-loopback-Netty connection; it does not prove
+  that the outer correlated Apache-to-Java request has the same boundary shape.
 - The helper carries accepted-socket ownership through exact executor,
   ForkJoin, Netty-worker, and virtual-thread task contexts. Packaged-agent tests
   cover nested hops, cancellation, worker reuse, and Java 21 carrier migration.

@@ -1,0 +1,18 @@
+{
+  "evidence_id": "otel-getsockopt-tls13-8282d2ed",
+  "source_revision": "8282d2ed9c3a3f6925902cd84f11f491bc4f4565",
+  "sanitized": true,
+  "matrix_cell": {
+    "agent_distribution": "opentelemetry",
+    "transport": "getsockopt",
+    "tls_protocol": "TLSv1.3",
+    "java_feature": 21
+  },
+  "suite_summary": {
+    "total": 46,
+    "passed": 44,
+    "unsupported": 2,
+    "failed": 0
+  },
+  "retained_scope": "issue-34 nested TLS wire-record/decrypted-callback fixture evidence; correlated application-path proof remains open"
+}

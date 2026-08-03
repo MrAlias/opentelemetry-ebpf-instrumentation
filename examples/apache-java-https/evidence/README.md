@@ -10,7 +10,7 @@ Verify a published bundle before relying on it for a matrix cell:
 
 ```bash
 ./examples/apache-java-https/scripts/verify-retained-evidence.sh \
-  examples/apache-java-https/evidence/otel-getsockopt-tls13-e8db066a
+  examples/apache-java-https/evidence/otel-getsockopt-tls13-8282d2ed
 ```
 
 The verifier accepts only a published evidence directory tracked by the `HEAD`
@@ -66,6 +66,7 @@ two historical bundles `otel-getsockopt-tls13-7482d908` and
 metric deltas can contain `operation="select"`. In those historical revisions,
 `select` means only OBI-side transport readiness or preference; it is neither
 Java helper selection nor proof that a request used that transport. The current
+issue #34 supplement `otel-getsockopt-tls13-8282d2ed`, the full primary
 `otel-getsockopt-tls13-e8db066a`, and the prior
 `otel-getsockopt-tls13-c9d14356`, `otel-getsockopt-tls12-c7209e43`,
 `otel-unix-tls12-bd1c9327`, and `splunk-getsockopt-tls13-47237792` bundles use
@@ -80,6 +81,7 @@ recast their historical schema.
 
 | Evidence | Result | Matrix cell |
 | --- | --- | --- |
+| [otel-getsockopt-tls13-8282d2ed](otel-getsockopt-tls13-8282d2ed/README.md) | fixture pass | OpenTelemetry 2.28.1, forced `getsockopt`, TLS 1.3, Java 21, `amd64`; clean full run with bounded nested TLS wire-record/decrypted-callback evidence; the correlated Apache-to-Java request is a separate outer path, so this does not close #34 or replace a general cell |
 | [otel-getsockopt-tls13-e8db066a](otel-getsockopt-tls13-e8db066a/README.md) | pass | OpenTelemetry 2.28.1, forced `getsockopt`, TLS 1.3, Java 21, `amd64`, unified cgroup v2; exact-source full cell with primary stale-state, malformed-response, same-JVM wrong-live-socket, duplicated-descriptor, pressure, and recovery controls |
 | [splunk-getsockopt-tls13-47237792](splunk-getsockopt-tls13-47237792/README.md) | pass | Splunk 2.28.0, forced `getsockopt`, TLS 1.3, Java 21, `amd64`, unified cgroup v2; includes bounded primary-transport security controls |
 | [otel-getsockopt-tls12-c7209e43](otel-getsockopt-tls12-c7209e43/README.md) | pass | OpenTelemetry 2.28.1, forced `getsockopt`, TLS 1.2, Java 21, `amd64`, unified cgroup v2; retained V2 primary cell |

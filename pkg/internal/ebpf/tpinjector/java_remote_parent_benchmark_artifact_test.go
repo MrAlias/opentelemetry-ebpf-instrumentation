@@ -11,11 +11,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
+	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
@@ -23,45 +27,119 @@ import (
 
 const (
 	javaRemoteParentBenchmarkArtifactEnv = "OBI_JAVA_REMOTE_PARENT_BENCHMARK_ARTIFACT"
-	bridgeBenchmarkArtifactSchemaVersion = 1
+	bridgeBenchmarkArtifactSchemaVersion = 2
 	bridgeBenchmarkArtifactName          = "java_remote_parent_transport"
 	benchmarkArtifactTemporaryAttempts   = 16
+	bridgeBenchmarkConcurrency           = 8
+	bridgeBenchmarkUnixDeadline          = 50 * time.Millisecond
+	bridgeBenchmarkGetsockoptP99Limit    = time.Millisecond
+	bridgeBenchmarkUnixP99Limit          = bridgeBenchmarkUnixDeadline
+	bridgeBenchmarkUnixTimeoutP99Limit   = 100 * time.Millisecond
+	bridgeBenchmarkHarness               = "go_privileged_transport_provider"
+	bridgeBenchmarkGateP99LT             = "p99_lt"
+	bridgeBenchmarkGateCorrectnessOnly   = "correctness_only"
+	bridgeBenchmarkGateP50GTEP99LTE      = "p50_gte_p99_lte"
 )
 
 type bridgeBenchmarkArtifact struct {
-	SchemaVersion int                             `json:"schema_version"`
-	Benchmark     string                          `json:"benchmark"`
-	Series        []bridgeBenchmarkArtifactSeries `json:"series"`
+	SchemaVersion         int                               `json:"schema_version"`
+	Benchmark             string                            `json:"benchmark"`
+	Provenance            bridgeBenchmarkArtifactProvenance `json:"provenance"`
+	UnixTimeoutDeadlineNS int64                             `json:"unix_timeout_deadline_ns"`
+	Series                []bridgeBenchmarkArtifactSeries   `json:"series"`
+}
+
+type bridgeBenchmarkArtifactProvenance struct {
+	Harness  string   `json:"harness"`
+	Measures []string `json:"measures"`
+	Excludes []string `json:"excludes"`
 }
 
 type bridgeBenchmarkArtifactSeries struct {
-	Transport           string  `json:"transport"`
-	Outcome             string  `json:"outcome"`
-	WarmupRounds        int     `json:"warmup_rounds"`
-	MeasurementRounds   int     `json:"measurement_rounds"`
-	Samples             int     `json:"samples"`
-	Concurrency         int     `json:"concurrency"`
-	BatchElapsedNS      int64   `json:"batch_elapsed_ns"`
-	P50NS               int64   `json:"p50_ns"`
-	P95NS               int64   `json:"p95_ns"`
-	P99NS               int64   `json:"p99_ns"`
-	OperationsPerSecond float64 `json:"operations_per_second"`
-	Valid               int     `json:"valid"`
-	Missing             int     `json:"missing"`
-	AlreadyConsumed     int     `json:"already_consumed"`
-	Errors              int     `json:"errors"`
-	Correct             bool    `json:"correct"`
+	Transport           string                             `json:"transport"`
+	Outcome             string                             `json:"outcome"`
+	WarmupRounds        int                                `json:"warmup_rounds"`
+	MeasurementRounds   int                                `json:"measurement_rounds"`
+	Samples             int                                `json:"samples"`
+	Concurrency         int                                `json:"concurrency"`
+	BatchElapsedNS      int64                              `json:"batch_elapsed_ns"`
+	P50NS               int64                              `json:"p50_ns"`
+	P95NS               int64                              `json:"p95_ns"`
+	P99NS               int64                              `json:"p99_ns"`
+	OperationsPerSecond float64                            `json:"operations_per_second"`
+	Valid               int                                `json:"valid"`
+	Missing             int                                `json:"missing"`
+	AlreadyConsumed     int                                `json:"already_consumed"`
+	Timeout             int                                `json:"timeout"`
+	Errors              int                                `json:"errors"`
+	Correct             bool                               `json:"correct"`
+	LatencyGate         bridgeBenchmarkArtifactLatencyGate `json:"latency_gate"`
 }
 
-var expectedBridgeBenchmarkSeries = []struct {
-	transport string
-	outcome   string
-}{
-	{transport: "getsockopt", outcome: "miss"},
-	{transport: "getsockopt", outcome: "hit"},
-	{transport: "getsockopt", outcome: "one_shot"},
-	{transport: "unix", outcome: "miss"},
-	{transport: "unix", outcome: "hit"},
+type bridgeBenchmarkArtifactLatencyGate struct {
+	Kind     string `json:"kind"`
+	P50MinNS int64  `json:"p50_min_ns"`
+	P99MaxNS int64  `json:"p99_max_ns"`
+	Passed   bool   `json:"passed"`
+}
+
+type expectedBridgeBenchmarkArtifactSeries struct {
+	transport         string
+	outcome           string
+	warmupRounds      int
+	measurementRounds int
+	latencyGate       bridgeBenchmarkArtifactLatencyGate
+}
+
+var expectedBridgeBenchmarkArtifactProvenance = bridgeBenchmarkArtifactProvenance{
+	Harness:  bridgeBenchmarkHarness,
+	Measures: []string{"transport", "provider"},
+	Excludes: []string{"java", "jni"},
+}
+
+var expectedBridgeBenchmarkSeries = []expectedBridgeBenchmarkArtifactSeries{
+	{
+		transport: "getsockopt", outcome: "miss",
+		warmupRounds: 16, measurementRounds: 512,
+		latencyGate: bridgeBenchmarkArtifactLatencyGate{
+			Kind: bridgeBenchmarkGateP99LT, P99MaxNS: bridgeBenchmarkGetsockoptP99Limit.Nanoseconds(),
+		},
+	},
+	{
+		transport: "getsockopt", outcome: "hit",
+		warmupRounds: 16, measurementRounds: 512,
+		latencyGate: bridgeBenchmarkArtifactLatencyGate{
+			Kind: bridgeBenchmarkGateP99LT, P99MaxNS: bridgeBenchmarkGetsockoptP99Limit.Nanoseconds(),
+		},
+	},
+	{
+		transport: "getsockopt", outcome: "one_shot",
+		warmupRounds: 16, measurementRounds: 512,
+		latencyGate: bridgeBenchmarkArtifactLatencyGate{Kind: bridgeBenchmarkGateCorrectnessOnly},
+	},
+	{
+		transport: "unix", outcome: "miss",
+		warmupRounds: 8, measurementRounds: 128,
+		latencyGate: bridgeBenchmarkArtifactLatencyGate{
+			Kind: bridgeBenchmarkGateP99LT, P99MaxNS: bridgeBenchmarkUnixP99Limit.Nanoseconds(),
+		},
+	},
+	{
+		transport: "unix", outcome: "hit",
+		warmupRounds: 8, measurementRounds: 128,
+		latencyGate: bridgeBenchmarkArtifactLatencyGate{
+			Kind: bridgeBenchmarkGateP99LT, P99MaxNS: bridgeBenchmarkUnixP99Limit.Nanoseconds(),
+		},
+	},
+	{
+		transport: "unix", outcome: "timeout",
+		warmupRounds: 8, measurementRounds: 128,
+		latencyGate: bridgeBenchmarkArtifactLatencyGate{
+			Kind:     bridgeBenchmarkGateP50GTEP99LTE,
+			P50MinNS: bridgeBenchmarkUnixDeadline.Nanoseconds(),
+			P99MaxNS: bridgeBenchmarkUnixTimeoutP99Limit.Nanoseconds(),
+		},
+	},
 }
 
 func writeBridgeBenchmarkArtifact(
@@ -73,9 +151,11 @@ func writeBridgeBenchmarkArtifact(
 	}
 
 	artifact := bridgeBenchmarkArtifact{
-		SchemaVersion: bridgeBenchmarkArtifactSchemaVersion,
-		Benchmark:     bridgeBenchmarkArtifactName,
-		Series:        series,
+		SchemaVersion:         bridgeBenchmarkArtifactSchemaVersion,
+		Benchmark:             bridgeBenchmarkArtifactName,
+		Provenance:            expectedBridgeBenchmarkArtifactProvenance,
+		UnixTimeoutDeadlineNS: bridgeBenchmarkUnixDeadline.Nanoseconds(),
+		Series:                series,
 	}
 	if err := validateBridgeBenchmarkArtifact(artifact); err != nil {
 		return err
@@ -231,6 +311,18 @@ func validateBridgeBenchmarkArtifact(artifact bridgeBenchmarkArtifact) error {
 	if artifact.Benchmark != bridgeBenchmarkArtifactName {
 		return fmt.Errorf("unexpected benchmark artifact name: %q", artifact.Benchmark)
 	}
+	if artifact.Provenance.Harness != expectedBridgeBenchmarkArtifactProvenance.Harness ||
+		!slices.Equal(artifact.Provenance.Measures, expectedBridgeBenchmarkArtifactProvenance.Measures) ||
+		!slices.Equal(artifact.Provenance.Excludes, expectedBridgeBenchmarkArtifactProvenance.Excludes) {
+		return errors.New("unexpected benchmark artifact provenance")
+	}
+	if artifact.UnixTimeoutDeadlineNS != bridgeBenchmarkUnixDeadline.Nanoseconds() {
+		return fmt.Errorf(
+			"unexpected Unix timeout deadline: got %d, want %d",
+			artifact.UnixTimeoutDeadlineNS,
+			bridgeBenchmarkUnixDeadline.Nanoseconds(),
+		)
+	}
 	if len(artifact.Series) != len(expectedBridgeBenchmarkSeries) {
 		return fmt.Errorf(
 			"unexpected benchmark series count: got %d, want %d",
@@ -250,10 +342,17 @@ func validateBridgeBenchmarkArtifact(artifact bridgeBenchmarkArtifact) error {
 				expected.outcome,
 			)
 		}
-		if series.WarmupRounds <= 0 || series.MeasurementRounds <= 0 || series.Concurrency <= 0 {
-			return fmt.Errorf("benchmark series %s/%s has non-positive run parameters", series.Transport, series.Outcome)
+		if series.WarmupRounds != expected.warmupRounds ||
+			series.MeasurementRounds != expected.measurementRounds ||
+			series.Concurrency != bridgeBenchmarkConcurrency {
+			return fmt.Errorf(
+				"benchmark series %s/%s has unexpected run parameters",
+				series.Transport,
+				series.Outcome,
+			)
 		}
-		if series.Samples <= 0 || int64(series.Samples) != int64(series.Concurrency)*int64(series.MeasurementRounds) {
+		if series.Samples <= 0 ||
+			int64(series.Samples) != int64(series.Concurrency)*int64(series.MeasurementRounds) {
 			return fmt.Errorf("benchmark series %s/%s has inconsistent sample count", series.Transport, series.Outcome)
 		}
 		if series.BatchElapsedNS <= 0 || series.P50NS <= 0 || series.P95NS <= 0 || series.P99NS <= 0 {
@@ -262,21 +361,151 @@ func validateBridgeBenchmarkArtifact(artifact bridgeBenchmarkArtifact) error {
 		if series.P50NS > series.P95NS || series.P95NS > series.P99NS {
 			return fmt.Errorf("benchmark series %s/%s has non-monotonic percentiles", series.Transport, series.Outcome)
 		}
+		if series.BatchElapsedNS < series.P99NS {
+			return fmt.Errorf("benchmark series %s/%s has impossible batch elapsed time", series.Transport, series.Outcome)
+		}
 		if series.OperationsPerSecond <= 0 || math.IsInf(series.OperationsPerSecond, 0) || math.IsNaN(series.OperationsPerSecond) {
 			return fmt.Errorf("benchmark series %s/%s has invalid throughput", series.Transport, series.Outcome)
 		}
-		if series.Valid < 0 || series.Missing < 0 || series.AlreadyConsumed < 0 || series.Errors != 0 {
+		expectedThroughput := float64(series.Samples) * float64(time.Second) /
+			float64(series.BatchElapsedNS)
+		if relativeDifference(series.OperationsPerSecond, expectedThroughput) > 1e-12 {
+			return fmt.Errorf("benchmark series %s/%s has inconsistent throughput", series.Transport, series.Outcome)
+		}
+		if series.Valid < 0 || series.Missing < 0 || series.AlreadyConsumed < 0 ||
+			series.Timeout < 0 || series.Errors != 0 {
 			return fmt.Errorf("benchmark series %s/%s has invalid status counts", series.Transport, series.Outcome)
 		}
-		if series.Valid+series.Missing+series.AlreadyConsumed+series.Errors != series.Samples {
+		if series.Valid+series.Missing+series.AlreadyConsumed+series.Timeout+series.Errors != series.Samples {
 			return fmt.Errorf("benchmark series %s/%s has inconsistent status counts", series.Transport, series.Outcome)
+		}
+		if err := validateBridgeBenchmarkStatusDistribution(series); err != nil {
+			return err
 		}
 		if !series.Correct {
 			return fmt.Errorf("benchmark series %s/%s is not correct", series.Transport, series.Outcome)
 		}
+		if series.LatencyGate.Kind != expected.latencyGate.Kind ||
+			series.LatencyGate.P50MinNS != expected.latencyGate.P50MinNS ||
+			series.LatencyGate.P99MaxNS != expected.latencyGate.P99MaxNS {
+			return fmt.Errorf("benchmark series %s/%s has an unexpected latency gate", series.Transport, series.Outcome)
+		}
+		gatePassed := bridgeBenchmarkLatencyGatePassed(
+			expected.latencyGate,
+			series.P50NS,
+			series.P99NS,
+		)
+		if series.LatencyGate.Passed != gatePassed {
+			return fmt.Errorf("benchmark series %s/%s has an inconsistent latency gate result", series.Transport, series.Outcome)
+		}
 	}
 
 	return nil
+}
+
+func relativeDifference(observed, expected float64) float64 {
+	return math.Abs(observed-expected) / expected
+}
+
+func validateBridgeBenchmarkStatusDistribution(series bridgeBenchmarkArtifactSeries) error {
+	valid := false
+	switch {
+	case series.Transport == "getsockopt" && series.Outcome == "miss",
+		series.Transport == "unix" && series.Outcome == "miss":
+		valid = series.Valid == 0 && series.Missing == series.Samples &&
+			series.AlreadyConsumed == 0 && series.Timeout == 0
+	case series.Outcome == "hit":
+		valid = series.Valid == series.Samples && series.Missing == 0 &&
+			series.AlreadyConsumed == 0 && series.Timeout == 0
+	case series.Transport == "getsockopt" && series.Outcome == "one_shot":
+		valid = series.Valid == series.MeasurementRounds &&
+			series.Missing+series.AlreadyConsumed == series.Samples-series.Valid &&
+			series.Timeout == 0
+	case series.Transport == "unix" && series.Outcome == "timeout":
+		valid = series.Valid == 0 && series.Missing == 0 &&
+			series.AlreadyConsumed == 0 && series.Timeout == series.Samples
+	}
+	if !valid {
+		return fmt.Errorf(
+			"benchmark series %s/%s has an unexpected status distribution",
+			series.Transport,
+			series.Outcome,
+		)
+	}
+	return nil
+}
+
+func bridgeBenchmarkLatencyGatePassed(
+	gate bridgeBenchmarkArtifactLatencyGate,
+	p50NS int64,
+	p99NS int64,
+) bool {
+	switch gate.Kind {
+	case bridgeBenchmarkGateCorrectnessOnly:
+		return true
+	case bridgeBenchmarkGateP99LT:
+		return p99NS < gate.P99MaxNS
+	case bridgeBenchmarkGateP50GTEP99LTE:
+		return p50NS >= gate.P50MinNS && p99NS <= gate.P99MaxNS
+	default:
+		return false
+	}
+}
+
+func isBridgeBenchmarkNetTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netError net.Error
+	return errors.As(err, &netError) && netError.Timeout()
+}
+
+func unixBridgeRoundTrip(
+	socket string,
+	request []byte,
+	response []byte,
+	timeout time.Duration,
+) (bool, error) {
+	if timeout <= 0 {
+		return false, errors.New("Unix benchmark deadline is required")
+	}
+	deadline := time.Now().Add(timeout)
+	dialer := net.Dialer{Deadline: deadline}
+	connection, err := dialer.Dial("unix", socket)
+	if err != nil {
+		return false, err
+	}
+	if err := connection.SetDeadline(deadline); err != nil {
+		return false, errors.Join(err, connection.Close())
+	}
+	if err := writeBridgeBenchmarkRequest(connection, request); err != nil {
+		return false, errors.Join(err, connection.Close())
+	}
+
+	_, readErr := io.ReadFull(connection, response)
+	return classifyBridgeBenchmarkRead(readErr, connection.Close())
+}
+
+func writeBridgeBenchmarkRequest(writer io.Writer, request []byte) error {
+	remaining := request
+	for len(remaining) > 0 {
+		written, err := writer.Write(remaining)
+		if err != nil {
+			return err
+		}
+		if written == 0 {
+			return io.ErrNoProgress
+		}
+		remaining = remaining[written:]
+	}
+	return nil
+}
+
+func classifyBridgeBenchmarkRead(readErr, closeErr error) (bool, error) {
+	if isBridgeBenchmarkNetTimeout(readErr) && closeErr == nil {
+		return true, nil
+	}
+	return false, errors.Join(readErr, closeErr)
 }
 
 func TestBridgeBenchmarkArtifact(t *testing.T) {
@@ -297,9 +526,11 @@ func TestBridgeBenchmarkArtifact(t *testing.T) {
 		var artifact bridgeBenchmarkArtifact
 		require.NoError(t, json.Unmarshal(contents, &artifact))
 		require.Equal(t, bridgeBenchmarkArtifact{
-			SchemaVersion: bridgeBenchmarkArtifactSchemaVersion,
-			Benchmark:     bridgeBenchmarkArtifactName,
-			Series:        series,
+			SchemaVersion:         bridgeBenchmarkArtifactSchemaVersion,
+			Benchmark:             bridgeBenchmarkArtifactName,
+			Provenance:            expectedBridgeBenchmarkArtifactProvenance,
+			UnixTimeoutDeadlineNS: bridgeBenchmarkUnixDeadline.Nanoseconds(),
+			Series:                series,
 		}, artifact)
 	})
 
@@ -325,6 +556,20 @@ func TestBridgeBenchmarkArtifact(t *testing.T) {
 		require.Error(t, writeBridgeBenchmarkArtifact(artifactPath, series))
 		_, err := os.Lstat(artifactPath)
 		require.ErrorIs(t, err, os.ErrNotExist)
+	})
+
+	t.Run("writes an accurately reported gate failure", func(t *testing.T) {
+		artifactPath := filepath.Join(t.TempDir(), "benchmark.json")
+		series := validBridgeBenchmarkArtifactSeries()
+		series[0].P99NS = bridgeBenchmarkGetsockoptP99Limit.Nanoseconds()
+		series[0].LatencyGate.Passed = false
+
+		require.NoError(t, writeBridgeBenchmarkArtifact(artifactPath, series))
+		contents, err := os.ReadFile(artifactPath)
+		require.NoError(t, err)
+		var artifact bridgeBenchmarkArtifact
+		require.NoError(t, json.Unmarshal(contents, &artifact))
+		require.False(t, artifact.Series[0].LatencyGate.Passed)
 	})
 
 	t.Run("accepts an empty artifact path", func(t *testing.T) {
@@ -377,13 +622,344 @@ func TestBridgeBenchmarkArtifact(t *testing.T) {
 	})
 }
 
+func TestValidateBridgeBenchmarkArtifact(t *testing.T) {
+	tests := []struct {
+		name      string
+		mutate    func(*bridgeBenchmarkArtifact)
+		wantError string
+	}{
+		{
+			name: "schema version",
+			mutate: func(artifact *bridgeBenchmarkArtifact) {
+				artifact.SchemaVersion--
+			},
+			wantError: "unsupported benchmark artifact schema version",
+		},
+		{
+			name: "benchmark name",
+			mutate: func(artifact *bridgeBenchmarkArtifact) {
+				artifact.Benchmark = "other"
+			},
+			wantError: "unexpected benchmark artifact name",
+		},
+		{
+			name: "provenance harness",
+			mutate: func(artifact *bridgeBenchmarkArtifact) {
+				artifact.Provenance.Harness = "java_jni"
+			},
+			wantError: "unexpected benchmark artifact provenance",
+		},
+		{
+			name: "provenance measurement scope",
+			mutate: func(artifact *bridgeBenchmarkArtifact) {
+				artifact.Provenance.Measures[1] = "java"
+			},
+			wantError: "unexpected benchmark artifact provenance",
+		},
+		{
+			name: "provenance exclusions",
+			mutate: func(artifact *bridgeBenchmarkArtifact) {
+				artifact.Provenance.Excludes = []string{"java"}
+			},
+			wantError: "unexpected benchmark artifact provenance",
+		},
+		{
+			name: "Unix deadline",
+			mutate: func(artifact *bridgeBenchmarkArtifact) {
+				artifact.UnixTimeoutDeadlineNS++
+			},
+			wantError: "unexpected Unix timeout deadline",
+		},
+		{
+			name: "series count",
+			mutate: func(artifact *bridgeBenchmarkArtifact) {
+				artifact.Series = artifact.Series[:len(artifact.Series)-1]
+			},
+			wantError: "unexpected benchmark series count",
+		},
+		{
+			name: "series order",
+			mutate: func(artifact *bridgeBenchmarkArtifact) {
+				artifact.Series[0], artifact.Series[1] = artifact.Series[1], artifact.Series[0]
+			},
+			wantError: "unexpected benchmark series 0",
+		},
+		{
+			name: "run parameters",
+			mutate: func(artifact *bridgeBenchmarkArtifact) {
+				artifact.Series[0].WarmupRounds++
+			},
+			wantError: "unexpected run parameters",
+		},
+		{
+			name: "sample count",
+			mutate: func(artifact *bridgeBenchmarkArtifact) {
+				artifact.Series[0].Samples--
+			},
+			wantError: "inconsistent sample count",
+		},
+		{
+			name: "percentile order",
+			mutate: func(artifact *bridgeBenchmarkArtifact) {
+				artifact.Series[0].P50NS = artifact.Series[0].P95NS + 1
+			},
+			wantError: "non-monotonic percentiles",
+		},
+		{
+			name: "batch elapsed",
+			mutate: func(artifact *bridgeBenchmarkArtifact) {
+				artifact.Series[0].BatchElapsedNS = artifact.Series[0].P99NS - 1
+			},
+			wantError: "impossible batch elapsed time",
+		},
+		{
+			name: "throughput",
+			mutate: func(artifact *bridgeBenchmarkArtifact) {
+				artifact.Series[0].OperationsPerSecond++
+			},
+			wantError: "inconsistent throughput",
+		},
+		{
+			name: "negative status count",
+			mutate: func(artifact *bridgeBenchmarkArtifact) {
+				artifact.Series[0].Timeout = -1
+			},
+			wantError: "invalid status counts",
+		},
+		{
+			name: "status distribution",
+			mutate: func(artifact *bridgeBenchmarkArtifact) {
+				artifact.Series[0].Valid++
+				artifact.Series[0].Missing--
+			},
+			wantError: "unexpected status distribution",
+		},
+		{
+			name: "correctness claim",
+			mutate: func(artifact *bridgeBenchmarkArtifact) {
+				artifact.Series[0].Correct = false
+			},
+			wantError: "is not correct",
+		},
+		{
+			name: "gate definition",
+			mutate: func(artifact *bridgeBenchmarkArtifact) {
+				artifact.Series[0].LatencyGate.P99MaxNS++
+			},
+			wantError: "unexpected latency gate",
+		},
+		{
+			name: "gate result claim",
+			mutate: func(artifact *bridgeBenchmarkArtifact) {
+				artifact.Series[0].LatencyGate.Passed = false
+			},
+			wantError: "inconsistent latency gate result",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			artifact := validBridgeBenchmarkArtifact()
+			test.mutate(&artifact)
+			require.ErrorContains(t, validateBridgeBenchmarkArtifact(artifact), test.wantError)
+		})
+	}
+}
+
+func TestIsBridgeBenchmarkNetTimeout(t *testing.T) {
+	timeoutError := &net.DNSError{Err: "deadline", IsTimeout: true}
+	require.True(t, isBridgeBenchmarkNetTimeout(timeoutError))
+	require.True(t, isBridgeBenchmarkNetTimeout(errors.Join(io.EOF, timeoutError)))
+	require.False(t, isBridgeBenchmarkNetTimeout(nil))
+	require.False(t, isBridgeBenchmarkNetTimeout(io.EOF))
+	require.False(t, isBridgeBenchmarkNetTimeout(&net.DNSError{Err: "other"}))
+}
+
+func TestClassifyBridgeBenchmarkRead(t *testing.T) {
+	timeoutError := &net.DNSError{Err: "deadline", IsTimeout: true}
+	timedOut, err := classifyBridgeBenchmarkRead(timeoutError, nil)
+	require.True(t, timedOut)
+	require.NoError(t, err)
+
+	closeError := errors.New("close failed")
+	timedOut, err = classifyBridgeBenchmarkRead(timeoutError, closeError)
+	require.False(t, timedOut)
+	require.ErrorIs(t, err, timeoutError)
+	require.ErrorIs(t, err, closeError)
+
+	timedOut, err = classifyBridgeBenchmarkRead(io.EOF, nil)
+	require.False(t, timedOut)
+	require.ErrorIs(t, err, io.EOF)
+
+	timedOut, err = classifyBridgeBenchmarkRead(nil, nil)
+	require.False(t, timedOut)
+	require.NoError(t, err)
+}
+
+func TestWriteBridgeBenchmarkRequestRejectsNoProgress(t *testing.T) {
+	require.ErrorIs(
+		t,
+		writeBridgeBenchmarkRequest(bridgeBenchmarkNoProgressWriter{}, []byte("request")),
+		io.ErrNoProgress,
+	)
+}
+
+func TestUnixBridgeRoundTrip(t *testing.T) {
+	t.Run("complete response", func(t *testing.T) {
+		request := []byte("benchmark request")
+		expectedResponse := bytes.Repeat([]byte{0x5a}, 32)
+		socket, listener, serverDone := startBridgeBenchmarkTestServer(
+			t,
+			func(connection *net.UnixConn) error {
+				observedRequest := make([]byte, len(request))
+				if _, err := io.ReadFull(connection, observedRequest); err != nil {
+					return err
+				}
+				if !bytes.Equal(observedRequest, request) {
+					return errors.New("server observed an unexpected request")
+				}
+				return writeBridgeBenchmarkRequest(connection, expectedResponse)
+			},
+		)
+		defer listener.Close()
+
+		response := make([]byte, len(expectedResponse))
+		timedOut, err := unixBridgeRoundTrip(socket, request, response, time.Second)
+		require.NoError(t, err)
+		require.False(t, timedOut)
+		require.Equal(t, expectedResponse, response)
+		require.NoError(t, <-serverDone)
+	})
+
+	t.Run("read deadline", func(t *testing.T) {
+		request := []byte("benchmark request")
+		fullRequest := make(chan struct{})
+		socket, listener, serverDone := startBridgeBenchmarkTestServer(
+			t,
+			func(connection *net.UnixConn) error {
+				observedRequest := make([]byte, len(request))
+				if _, err := io.ReadFull(connection, observedRequest); err != nil {
+					return err
+				}
+				close(fullRequest)
+				var untilClientClose [1]byte
+				_, _ = connection.Read(untilClientClose[:])
+				return nil
+			},
+		)
+		defer listener.Close()
+
+		response := make([]byte, 32)
+		timedOut, err := unixBridgeRoundTrip(
+			socket,
+			request,
+			response,
+			bridgeBenchmarkUnixDeadline,
+		)
+		require.NoError(t, err)
+		require.True(t, timedOut)
+		requireNoWait(t, fullRequest, "server did not fully read the timeout request")
+		require.NoError(t, <-serverDone)
+	})
+
+	t.Run("early EOF", func(t *testing.T) {
+		request := []byte("benchmark request")
+		socket, listener, serverDone := startBridgeBenchmarkTestServer(
+			t,
+			func(connection *net.UnixConn) error {
+				observedRequest := make([]byte, len(request))
+				_, err := io.ReadFull(connection, observedRequest)
+				return err
+			},
+		)
+		defer listener.Close()
+
+		timedOut, err := unixBridgeRoundTrip(
+			socket,
+			request,
+			make([]byte, 32),
+			bridgeBenchmarkUnixDeadline,
+		)
+		require.Error(t, err)
+		require.False(t, timedOut)
+		require.NoError(t, <-serverDone)
+	})
+
+	t.Run("dial failure", func(t *testing.T) {
+		socket := filepath.Join(t.TempDir(), "missing.sock")
+		timedOut, err := unixBridgeRoundTrip(
+			socket,
+			[]byte("request"),
+			make([]byte, 32),
+			bridgeBenchmarkUnixDeadline,
+		)
+		require.Error(t, err)
+		require.False(t, timedOut)
+	})
+}
+
+type bridgeBenchmarkNoProgressWriter struct{}
+
+func (bridgeBenchmarkNoProgressWriter) Write([]byte) (int, error) {
+	return 0, nil
+}
+
+func startBridgeBenchmarkTestServer(
+	t *testing.T,
+	handle func(*net.UnixConn) error,
+) (string, *net.UnixListener, <-chan error) {
+	t.Helper()
+
+	var socketID [8]byte
+	_, err := rand.Read(socketID[:])
+	require.NoError(t, err)
+	socket := fmt.Sprintf("@obi-benchmark-%x", socketID)
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+	require.NoError(t, err)
+	serverDone := make(chan error, 1)
+	go func() {
+		connection, acceptErr := listener.AcceptUnix()
+		if acceptErr != nil {
+			serverDone <- acceptErr
+			return
+		}
+		defer connection.Close()
+		serverDone <- handle(connection)
+	}()
+	return socket, listener, serverDone
+}
+
+func requireNoWait(t *testing.T, signal <-chan struct{}, message string) {
+	t.Helper()
+	select {
+	case <-signal:
+	default:
+		require.Fail(t, message)
+	}
+}
+
+func validBridgeBenchmarkArtifact() bridgeBenchmarkArtifact {
+	return bridgeBenchmarkArtifact{
+		SchemaVersion: bridgeBenchmarkArtifactSchemaVersion,
+		Benchmark:     bridgeBenchmarkArtifactName,
+		Provenance: bridgeBenchmarkArtifactProvenance{
+			Harness:  expectedBridgeBenchmarkArtifactProvenance.Harness,
+			Measures: slices.Clone(expectedBridgeBenchmarkArtifactProvenance.Measures),
+			Excludes: slices.Clone(expectedBridgeBenchmarkArtifactProvenance.Excludes),
+		},
+		UnixTimeoutDeadlineNS: bridgeBenchmarkUnixDeadline.Nanoseconds(),
+		Series:                validBridgeBenchmarkArtifactSeries(),
+	}
+}
+
 func validBridgeBenchmarkArtifactSeries() []bridgeBenchmarkArtifactSeries {
 	return []bridgeBenchmarkArtifactSeries{
-		validBridgeBenchmarkSeries("getsockopt", "miss", 16, 512, 0, 4096, 0),
-		validBridgeBenchmarkSeries("getsockopt", "hit", 16, 512, 4096, 0, 0),
-		validBridgeBenchmarkSeries("getsockopt", "one_shot", 16, 512, 512, 1792, 1792),
-		validBridgeBenchmarkSeries("unix", "miss", 8, 128, 0, 1024, 0),
-		validBridgeBenchmarkSeries("unix", "hit", 8, 128, 1024, 0, 0),
+		validBridgeBenchmarkSeries("getsockopt", "miss", 16, 512, 0, 4096, 0, 0),
+		validBridgeBenchmarkSeries("getsockopt", "hit", 16, 512, 4096, 0, 0, 0),
+		validBridgeBenchmarkSeries("getsockopt", "one_shot", 16, 512, 512, 1792, 1792, 0),
+		validBridgeBenchmarkSeries("unix", "miss", 8, 128, 0, 1024, 0, 0),
+		validBridgeBenchmarkSeries("unix", "hit", 8, 128, 1024, 0, 0, 0),
+		validBridgeBenchmarkSeries("unix", "timeout", 8, 128, 0, 0, 0, 1024),
 	}
 }
 
@@ -395,24 +971,55 @@ func validBridgeBenchmarkSeries(
 	valid int,
 	missing int,
 	alreadyConsumed int,
+	timeouts int,
 ) bridgeBenchmarkArtifactSeries {
-	samples := measurementRounds * 8
+	samples := measurementRounds * bridgeBenchmarkConcurrency
+	p50 := 10 * time.Microsecond
+	p95 := 20 * time.Microsecond
+	p99 := 30 * time.Microsecond
+	batchElapsed := time.Duration(measurementRounds) * 100 * time.Microsecond
+	if outcome == "timeout" {
+		p50 = bridgeBenchmarkUnixDeadline
+		p95 = 75 * time.Millisecond
+		p99 = 90 * time.Millisecond
+		batchElapsed = time.Duration(measurementRounds) * 60 * time.Millisecond
+	}
+	latencyGate := expectedBridgeBenchmarkLatencyGate(transport, outcome)
+	latencyGate.Passed = bridgeBenchmarkLatencyGatePassed(
+		latencyGate,
+		p50.Nanoseconds(),
+		p99.Nanoseconds(),
+	)
 	return bridgeBenchmarkArtifactSeries{
 		Transport:           transport,
 		Outcome:             outcome,
 		WarmupRounds:        warmupRounds,
 		MeasurementRounds:   measurementRounds,
 		Samples:             samples,
-		Concurrency:         8,
-		BatchElapsedNS:      int64(samples * 100),
-		P50NS:               10,
-		P95NS:               20,
-		P99NS:               30,
-		OperationsPerSecond: 1_000,
+		Concurrency:         bridgeBenchmarkConcurrency,
+		BatchElapsedNS:      batchElapsed.Nanoseconds(),
+		P50NS:               p50.Nanoseconds(),
+		P95NS:               p95.Nanoseconds(),
+		P99NS:               p99.Nanoseconds(),
+		OperationsPerSecond: float64(samples) / batchElapsed.Seconds(),
 		Valid:               valid,
 		Missing:             missing,
 		AlreadyConsumed:     alreadyConsumed,
+		Timeout:             timeouts,
 		Errors:              0,
 		Correct:             true,
+		LatencyGate:         latencyGate,
 	}
+}
+
+func expectedBridgeBenchmarkLatencyGate(
+	transport string,
+	outcome string,
+) bridgeBenchmarkArtifactLatencyGate {
+	for _, expected := range expectedBridgeBenchmarkSeries {
+		if expected.transport == transport && expected.outcome == outcome {
+			return expected.latencyGate
+		}
+	}
+	panic(fmt.Sprintf("unexpected benchmark series: %s/%s", transport, outcome))
 }

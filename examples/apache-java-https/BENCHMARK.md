@@ -11,12 +11,61 @@ performance cell fail regardless of latency.
 - zero wrong parents and zero duplicate Java server spans;
 - no monotonic file-descriptor, thread, native-memory, or map growth after the
   workload and one idle recovery interval;
-- primary helper lookup p99 below 1 ms;
-- Unix fallback lookup completes below its configured 50 ms deadline;
+- privileged Go transport-harness `getsockopt` miss and hit p99 below 1 ms;
+- privileged Go transport-harness Unix miss and hit p99 below 50 ms;
+- Unix timeout p50 at or above its 50 ms absolute deadline and p99 at or
+  below 100 ms;
 - steady-state application throughput and p99 latency regression no worse than
   10% against the same official-agent baseline.
 
 These are PoC acceptance gates, not production SLOs.
+
+## Privileged transport microbenchmark
+
+The final RHEL 9.6 kernel workflow runs
+`TestJavaRemoteParentTransportBenchmark` as root with the
+`privileged_tests` build tag and retains its owner-private JSON artifact. The
+schema-v2 artifact contains six independently reported series:
+
+| Series | Samples | Latency gate |
+| --- | ---: | --- |
+| `getsockopt` miss | 4096 | p99 < 1 ms |
+| `getsockopt` hit | 4096 | p99 < 1 ms |
+| `getsockopt` one-shot contention | 4096 | correctness only: exactly one valid take per round |
+| Unix miss | 1024 | p99 < 50 ms |
+| Unix hit | 1024 | p99 < 50 ms |
+| Unix timeout | 1024 | p50 >= 50 ms and p99 <= 100 ms |
+
+The timeout control uses one 50 ms absolute client connection deadline against
+a deliberate Unix non-responder that accepts the request but withholds the
+response. It measures a client deadline error, not a provider
+`StatusTimeout` response. A result that returns early or exceeds the bounded
+upper tail fails even when it has the expected timeout error.
+
+This is a Go transport/provider microbenchmark. The primary series attach the
+real cgroup `getsockopt` programs; the Unix miss/hit series exercise the Go Unix
+client, server admission, and map-provider path, while the timeout series uses
+the deliberate non-responder described above. It does not load the Java agent,
+call the JNI entry point, run Java instrumentation or extraction, or measure
+application request latency. Consequently these percentiles must not be
+reported as Java/JNI lookup or end-to-end workload measurements.
+
+The opt-in privileged benchmark is intentionally not run as part of local
+validation. Local checks compile and test the artifact validation code; the
+digest-pinned final RHEL workflow supplies the required root privileges,
+cgroup/BPF facilities, fixed kernel identity, and retained execution evidence.
+Until that workflow passes and its artifact is inspected, every corresponding
+comparison-matrix cell remains `untested`.
+
+The harness records the measured `passed` value for all six series and
+atomically publishes the artifact before asserting the latency gates. The VM
+runner validates and reports a structurally consistent artifact even when one
+of those values is `false`, then fails the workflow. This preserves the failed
+measurement for diagnosis instead of losing the evidence that caused the gate
+failure. The VM path is deterministically
+`transport-benchmark/benchmark.json` below the workflow output directory; the
+runner refuses to reuse an existing artifact directory, so a rerun cannot leave
+multiple candidates associated with one log.
 
 ## Comparison matrix
 
@@ -198,11 +247,13 @@ evictions, and BPF lock contention. Do not use the repository-wide
 `scripts/bpf-metrics-sampler.sh` for this harness: it changes a host-global BPF
 statistics sysctl and is not scoped to the demo project.
 
-The six core cells are not the complete #37 matrix. Explicit primary/fallback
-miss or timeout and pressure cells still require separately measured evidence
-before declaring the benchmark issue complete. No checked-in benchmark artifact
-exists yet, so this harness change does not turn the W3C row in the comparison
-matrix into a passed result.
+The six sustained core cells are not the complete #37 matrix. End-to-end
+Java/JNI primary and fallback miss/timeout cells, plus pressure cells, still
+require separately measured evidence before declaring the benchmark issue
+complete. The privileged Go transport artifact is complementary evidence; it
+does not fill those application-workload cells. No checked-in benchmark
+artifact exists yet, so this harness change does not turn the W3C row in the
+comparison matrix into a passed result.
 
 For focused runner iteration, use the same request count, repetitions, and
 seed for every mode:

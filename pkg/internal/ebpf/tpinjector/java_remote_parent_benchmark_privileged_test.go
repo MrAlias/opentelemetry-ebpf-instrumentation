@@ -33,7 +33,6 @@ import (
 
 const (
 	javaRemoteParentBenchmarkEnv = "OBI_JAVA_REMOTE_PARENT_BENCHMARK"
-	bridgeBenchmarkConcurrency   = 8
 	primaryBenchmarkWarmupRounds = 16
 	primaryBenchmarkRounds       = 512
 	unixBenchmarkWarmupRounds    = 8
@@ -59,6 +58,7 @@ type bridgeBenchmarkJob struct {
 	fd        int
 	socket    string
 	request   []byte
+	deadline  time.Duration
 	ready     chan<- struct{}
 	start     <-chan struct{}
 	results   chan<- bridgeBenchmarkCall
@@ -69,6 +69,7 @@ type bridgeBenchmarkCall struct {
 	duration    time.Duration
 	completedAt time.Time
 	record      javabridge.Record
+	timedOut    bool
 	err         error
 }
 
@@ -82,6 +83,7 @@ type bridgeBenchmarkSeries struct {
 	valid             int
 	missing           int
 	alreadyConsumed   int
+	timeouts          int
 	errors            int
 }
 
@@ -154,24 +156,35 @@ func TestJavaRemoteParentTransportBenchmark(t *testing.T) {
 	for _, worker := range workers {
 		deleteBenchmarkMapKey(t, objects.JavaRemoteParentTerminal, worker.owner)
 	}
-	unixMiss, unixHit := runUnixBenchmark(
+	unixMiss, unixHit, unixTimeout := runUnixBenchmark(
 		t, workers, pairs, negotiations, &objects.BpfJavaRemoteParentMaps,
 		process, capability, &nextGeneration,
 	)
 
-	summaries := make([]bridgeBenchmarkArtifactSeries, 0, 5)
+	summaries := make([]bridgeBenchmarkArtifactSeries, 0, 6)
 	for _, series := range []*bridgeBenchmarkSeries{
 		primaryMiss,
 		primaryHit,
 		primaryOneShot,
 		unixMiss,
 		unixHit,
+		unixTimeout,
 	} {
 		summaries = append(summaries, series.report(t))
 	}
 
 	if artifactPath := os.Getenv(javaRemoteParentBenchmarkArtifactEnv); artifactPath != "" {
 		require.NoError(t, writeBridgeBenchmarkArtifact(artifactPath, summaries))
+	}
+	for _, summary := range summaries {
+		require.Truef(
+			t,
+			summary.LatencyGate.Passed,
+			"bridge benchmark %s/%s failed latency gate %s",
+			summary.Transport,
+			summary.Outcome,
+			summary.LatencyGate.Kind,
+		)
 	}
 }
 
@@ -266,6 +279,7 @@ func runBridgeBenchmarkJob(worker int, job bridgeBenchmarkJob) {
 	<-job.start
 
 	startedAt := time.Now()
+	timedOut := false
 	var err error
 	switch job.transport {
 	case bridgeBenchmarkGetsockopt:
@@ -277,14 +291,21 @@ func runBridgeBenchmarkJob(worker int, job bridgeBenchmarkJob) {
 			err = fmt.Errorf("getsockopt returned %d bytes, want %d", length, len(value))
 		}
 	case bridgeBenchmarkUnix:
-		err = unixBridgeRoundTrip(job.socket, job.request, value)
+		timedOut, err = unixBridgeRoundTrip(
+			job.socket,
+			job.request,
+			value,
+			job.deadline,
+		)
 	default:
 		err = errors.New("unknown benchmark transport")
 	}
 	completedAt := time.Now()
 
 	var record javabridge.Record
-	if err == nil {
+	if timedOut {
+		record.Status = javabridge.StatusTimeout
+	} else if err == nil {
 		record, err = javabridge.UnmarshalRecord(value)
 	}
 	job.results <- bridgeBenchmarkCall{
@@ -292,32 +313,9 @@ func runBridgeBenchmarkJob(worker int, job bridgeBenchmarkJob) {
 		duration:    completedAt.Sub(startedAt),
 		completedAt: completedAt,
 		record:      record,
+		timedOut:    timedOut,
 		err:         err,
 	}
-}
-
-func unixBridgeRoundTrip(socket string, request, response []byte) error {
-	connection, err := net.DialTimeout("unix", socket, 5*time.Second)
-	if err != nil {
-		return err
-	}
-	if err := connection.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		_ = connection.Close()
-		return err
-	}
-
-	remaining := request
-	for len(remaining) > 0 {
-		written, writeErr := connection.Write(remaining)
-		if writeErr != nil {
-			_ = connection.Close()
-			return writeErr
-		}
-		remaining = remaining[written:]
-	}
-	_, readErr := io.ReadFull(connection, response)
-	closeErr := connection.Close()
-	return errors.Join(readErr, closeErr)
 }
 
 func runBridgeBenchmarkBatch(
@@ -525,7 +523,7 @@ func runUnixBenchmark(
 	process BpfJavaRemoteParentPidKeyT,
 	capability uint64,
 	nextGeneration *uint64,
-) (*bridgeBenchmarkSeries, *bridgeBenchmarkSeries) {
+) (*bridgeBenchmarkSeries, *bridgeBenchmarkSeries, *bridgeBenchmarkSeries) {
 	t.Helper()
 
 	handler := javabridge.NewMapHandler(javaRemoteParentBenchmarkMaps(maps), 30*time.Second)
@@ -535,7 +533,7 @@ func runUnixBenchmark(
 	server, err := javabridge.NewServer(javabridge.ServerOptions{
 		SocketPath:    socketPath,
 		SocketGID:     os.Getegid(),
-		Timeout:       5 * time.Second,
+		Timeout:       bridgeBenchmarkUnixDeadline,
 		MaxConcurrent: bridgeBenchmarkConcurrency * 4,
 		Log:           slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}, handler)
@@ -598,7 +596,106 @@ func runUnixBenchmark(
 		}
 	}
 
-	return miss, hit
+	timeoutSocketPath := filepath.Join(socketDir, "timeout.sock")
+	fullTimeoutRequests, stopTimeoutServer := startUnixBenchmarkNonResponder(
+		t,
+		timeoutSocketPath,
+	)
+	defer stopTimeoutServer()
+	timeoutJobs := unixBenchmarkJobs(
+		t, workers, timeoutSocketPath, javabridge.OperationTake, capability,
+	)
+	timeout := newBridgeBenchmarkSeries(
+		"unix", "timeout", unixBenchmarkWarmupRounds, unixBenchmarkRounds,
+	)
+	for round := range unixBenchmarkWarmupRounds + unixBenchmarkRounds {
+		calls, elapsed := runBridgeBenchmarkBatch(workers, timeoutJobs)
+		requireUnixBenchmarkFullRequests(
+			t,
+			fullTimeoutRequests,
+			len(workers),
+		)
+		for _, call := range calls {
+			require.NoError(t, call.err)
+			require.True(t, call.timedOut, "Unix timeout control returned without a net timeout")
+			require.Equal(t, javabridge.StatusTimeout, call.record.Status)
+		}
+		if round >= unixBenchmarkWarmupRounds {
+			timeout.add(calls, elapsed)
+		}
+	}
+
+	return miss, hit, timeout
+}
+
+func startUnixBenchmarkNonResponder(
+	t *testing.T,
+	socketPath string,
+) (<-chan struct{}, func()) {
+	t.Helper()
+
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+	require.NoError(t, err)
+	listener.SetUnlinkOnClose(true)
+
+	serveDone := make(chan error, 1)
+	fullRequests := make(chan struct{}, bridgeBenchmarkConcurrency)
+	var connections sync.WaitGroup
+	go func() {
+		for {
+			connection, acceptErr := listener.AcceptUnix()
+			if acceptErr != nil {
+				serveDone <- acceptErr
+				return
+			}
+			connections.Add(1)
+			go func() {
+				defer connections.Done()
+				defer connection.Close()
+
+				request := make([]byte, javabridge.RequestSize)
+				if _, readErr := io.ReadFull(connection, request); readErr != nil {
+					return
+				}
+				fullRequests <- struct{}{}
+				// Deliberately send no response. A second read waits until the
+				// benchmark client reaches its absolute deadline and closes.
+				var untilClientClose [1]byte
+				_, _ = connection.Read(untilClientClose[:])
+			}()
+		}
+	}()
+
+	return fullRequests, func() {
+		require.NoError(t, listener.Close())
+		require.ErrorIs(t, <-serveDone, net.ErrClosed)
+		connections.Wait()
+	}
+}
+
+func requireUnixBenchmarkFullRequests(
+	t *testing.T,
+	fullRequests <-chan struct{},
+	want int,
+) {
+	t.Helper()
+
+	timer := time.NewTimer(bridgeBenchmarkUnixTimeoutP99Limit)
+	defer timer.Stop()
+	for observed := range want {
+		select {
+		case <-fullRequests:
+		case <-timer.C:
+			require.Failf(
+				t,
+				"Unix benchmark non-responder did not read every request",
+				"observed=%d want=%d",
+				observed,
+				want,
+			)
+		}
+	}
+	require.Zero(t, len(fullRequests), "Unix benchmark non-responder observed extra requests")
 }
 
 func unixBenchmarkJobs(
@@ -622,6 +719,7 @@ func unixBenchmarkJobs(
 			transport: bridgeBenchmarkUnix,
 			socket:    socket,
 			request:   request,
+			deadline:  bridgeBenchmarkUnixDeadline,
 		}
 	}
 	return jobs
@@ -748,6 +846,8 @@ func (s *bridgeBenchmarkSeries) add(calls []bridgeBenchmarkCall, elapsed time.Du
 			s.missing++
 		case javabridge.StatusAlreadyConsumed:
 			s.alreadyConsumed++
+		case javabridge.StatusTimeout:
+			s.timeouts++
 		}
 	}
 	s.batchElapsed += elapsed
@@ -775,15 +875,23 @@ func (s *bridgeBenchmarkSeries) report(t *testing.T) bridgeBenchmarkArtifactSeri
 		Valid:               s.valid,
 		Missing:             s.missing,
 		AlreadyConsumed:     s.alreadyConsumed,
+		Timeout:             s.timeouts,
 		Errors:              s.errors,
 	}
 	summary.Correct = summary.Valid+summary.Missing+summary.AlreadyConsumed+
-		summary.Errors == summary.Samples && summary.Errors == 0
+		summary.Timeout+summary.Errors == summary.Samples && summary.Errors == 0
+	summary.LatencyGate = expectedBridgeBenchmarkLatencyGate(s.transport, s.outcome)
+	summary.LatencyGate.Passed = bridgeBenchmarkLatencyGatePassed(
+		summary.LatencyGate,
+		summary.P50NS,
+		summary.P99NS,
+	)
 	require.True(t, summary.Correct)
 	t.Logf(
 		"bridge_benchmark transport=%s outcome=%s samples=%d concurrency=%d "+
 			"p50_ns=%d p95_ns=%d p99_ns=%d ops_per_second=%.0f "+
-			"valid=%d missing=%d already_consumed=%d errors=%d correct=true",
+			"valid=%d missing=%d already_consumed=%d timeout=%d errors=%d "+
+			"correct=true gate=%s gate_passed=%t",
 		summary.Transport,
 		summary.Outcome,
 		summary.Samples,
@@ -795,7 +903,10 @@ func (s *bridgeBenchmarkSeries) report(t *testing.T) bridgeBenchmarkArtifactSeri
 		summary.Valid,
 		summary.Missing,
 		summary.AlreadyConsumed,
+		summary.Timeout,
 		summary.Errors,
+		summary.LatencyGate.Kind,
+		summary.LatencyGate.Passed,
 	)
 	return summary
 }

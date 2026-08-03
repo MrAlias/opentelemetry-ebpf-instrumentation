@@ -39,53 +39,278 @@ require_private_benchmark_path() {
         fail "transport benchmark path is not private: ${path}"
 }
 
-require_transport_benchmark_series() {
-    local -r artifact_file="$1"
-    local -r transport="$2"
-    local -r outcome="$3"
-    local -r samples="$4"
-    local -r positive_integer='[1-9][0-9]*'
-    local -r non_negative_integer='[0-9]+'
-    local -r non_negative_number='[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?'
+transport_benchmark_series_pattern() {
+    local -r transport="$1"
+    local -r outcome="$2"
+    local -r warmup_rounds="$3"
+    local -r measurement_rounds="$4"
+    local -r samples="$5"
+    local -r gate_kind="$6"
+    local -r p50_min_ns="$7"
+    local -r p99_max_ns="$8"
+    local -r positive_integer='[1-9][0-9]{0,15}'
+    local -r non_negative_integer='(0|[1-9][0-9]{0,15})'
+    local -r positive_number='([1-9][0-9]*(\.[0-9]+)?|0\.[0-9]*[1-9][0-9]*)([eE][+-]?[0-9]{1,2})?'
     local series_pattern="\\{\"transport\":\"${transport}\",\"outcome\":\"${outcome}\","
 
-    series_pattern+="\"warmup_rounds\":${positive_integer},"
-    series_pattern+="\"measurement_rounds\":${positive_integer},"
+    series_pattern+="\"warmup_rounds\":${warmup_rounds},"
+    series_pattern+="\"measurement_rounds\":${measurement_rounds},"
     series_pattern+="\"samples\":${samples},\"concurrency\":8,"
     series_pattern+="\"batch_elapsed_ns\":${positive_integer},"
     series_pattern+="\"p50_ns\":${positive_integer},"
     series_pattern+="\"p95_ns\":${positive_integer},"
     series_pattern+="\"p99_ns\":${positive_integer},"
-    series_pattern+="\"operations_per_second\":${non_negative_number},"
+    series_pattern+="\"operations_per_second\":${positive_number},"
     series_pattern+="\"valid\":${non_negative_integer},"
     series_pattern+="\"missing\":${non_negative_integer},"
     series_pattern+="\"already_consumed\":${non_negative_integer},"
-    series_pattern+="\"errors\":0,\"correct\":true\\}"
+    series_pattern+="\"timeout\":${non_negative_integer},"
+    series_pattern+="\"errors\":0,\"correct\":true,"
+    series_pattern+="\"latency_gate\":\\{\"kind\":\"${gate_kind}\","
+    series_pattern+="\"p50_min_ns\":${p50_min_ns},"
+    series_pattern+="\"p99_max_ns\":${p99_max_ns},\"passed\":(true|false)\\}\\}"
 
-    if ! grep -Eq -- "$series_pattern" "$artifact_file"; then
-        fail "transport benchmark artifact lacks a valid ${transport}/${outcome} series: ${artifact_file}"
+    printf '%s' "$series_pattern"
+}
+
+transport_benchmark_integer_field() {
+    local -r series_json="$1"
+    local -r field="$2"
+
+    if [[ "$series_json" =~ \"${field}\":([0-9]+) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
     fi
+    return 1
+}
+
+transport_benchmark_boolean_field() {
+    local -r series_json="$1"
+    local -r field="$2"
+
+    if [[ "$series_json" =~ \"${field}\":(true|false) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+transport_benchmark_number_field() {
+    local -r series_json="$1"
+    local -r field="$2"
+    local -r positive_number='([1-9][0-9]*(\.[0-9]+)?|0\.[0-9]*[1-9][0-9]*)([eE][+-]?[0-9]{1,2})?'
+
+    if [[ "$series_json" =~ \"${field}\":(${positive_number}) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+require_transport_benchmark_series() {
+    local -r artifact_file="$1"
+    local -r transport="$2"
+    local -r outcome="$3"
+    local -r warmup_rounds="$4"
+    local -r measurement_rounds="$5"
+    local -r samples="$6"
+    local -r gate_kind="$7"
+    local -r p50_min_ns="$8"
+    local -r p99_max_ns="$9"
+    local series_pattern=""
+    local series_json=""
+    local p50_ns=""
+    local p95_ns=""
+    local p99_ns=""
+    local batch_elapsed_ns=""
+    local operations_per_second=""
+    local valid=""
+    local missing=""
+    local already_consumed=""
+    local timeout=""
+    local gate_passed=""
+    local expected_gate_passed=false
+
+    series_pattern="$(transport_benchmark_series_pattern \
+        "$transport" "$outcome" "$warmup_rounds" "$measurement_rounds" \
+        "$samples" "$gate_kind" "$p50_min_ns" "$p99_max_ns")" || \
+        fail "cannot construct ${transport}/${outcome} benchmark validation"
+    series_json="$(grep -Eo -- "$series_pattern" "$artifact_file")" || \
+        fail "transport benchmark artifact lacks a valid ${transport}/${outcome} series: ${artifact_file}"
+
+    batch_elapsed_ns="$(transport_benchmark_integer_field "$series_json" batch_elapsed_ns)" || \
+        fail "transport benchmark artifact lacks ${transport}/${outcome} batch elapsed time: ${artifact_file}"
+    p50_ns="$(transport_benchmark_integer_field "$series_json" p50_ns)" || \
+        fail "transport benchmark artifact lacks ${transport}/${outcome} p50: ${artifact_file}"
+    p95_ns="$(transport_benchmark_integer_field "$series_json" p95_ns)" || \
+        fail "transport benchmark artifact lacks ${transport}/${outcome} p95: ${artifact_file}"
+    p99_ns="$(transport_benchmark_integer_field "$series_json" p99_ns)" || \
+        fail "transport benchmark artifact lacks ${transport}/${outcome} p99: ${artifact_file}"
+    operations_per_second="$(transport_benchmark_number_field "$series_json" operations_per_second)" || \
+        fail "transport benchmark artifact lacks ${transport}/${outcome} throughput: ${artifact_file}"
+    valid="$(transport_benchmark_integer_field "$series_json" valid)" || \
+        fail "transport benchmark artifact lacks ${transport}/${outcome} valid count: ${artifact_file}"
+    missing="$(transport_benchmark_integer_field "$series_json" missing)" || \
+        fail "transport benchmark artifact lacks ${transport}/${outcome} missing count: ${artifact_file}"
+    already_consumed="$(transport_benchmark_integer_field "$series_json" already_consumed)" || \
+        fail "transport benchmark artifact lacks ${transport}/${outcome} consumed count: ${artifact_file}"
+    timeout="$(transport_benchmark_integer_field "$series_json" timeout)" || \
+        fail "transport benchmark artifact lacks ${transport}/${outcome} timeout count: ${artifact_file}"
+    gate_passed="$(transport_benchmark_boolean_field "$series_json" passed)" || \
+        fail "transport benchmark artifact lacks ${transport}/${outcome} gate result: ${artifact_file}"
+
+    (( p50_ns <= p95_ns && p95_ns <= p99_ns )) || \
+        fail "transport benchmark artifact has non-monotonic ${transport}/${outcome} percentiles: ${artifact_file}"
+    (( batch_elapsed_ns >= p99_ns )) || \
+        fail "transport benchmark artifact has impossible ${transport}/${outcome} batch elapsed time: ${artifact_file}"
+    awk \
+        -v observed="$operations_per_second" \
+        -v sample_count="$samples" \
+        -v elapsed_ns="$batch_elapsed_ns" \
+        'BEGIN {
+            expected = sample_count * 1000000000 / elapsed_ns
+            difference = observed - expected
+            if (difference < 0) {
+                difference = -difference
+            }
+            exit !(observed > 0 && expected > 0 && difference / expected <= 1e-12)
+        }' || \
+        fail "transport benchmark artifact has inconsistent ${transport}/${outcome} throughput: ${artifact_file}"
+    (( valid + missing + already_consumed + timeout == samples )) || \
+        fail "transport benchmark artifact has inconsistent ${transport}/${outcome} status counts: ${artifact_file}"
+
+    case "${transport}/${outcome}" in
+        getsockopt/miss|unix/miss)
+            (( valid == 0 && missing == samples && already_consumed == 0 && timeout == 0 )) || \
+                fail "transport benchmark artifact has incorrect ${transport}/${outcome} outcomes: ${artifact_file}"
+            ;;
+        getsockopt/hit|unix/hit)
+            (( valid == samples && missing == 0 && already_consumed == 0 && timeout == 0 )) || \
+                fail "transport benchmark artifact has incorrect ${transport}/${outcome} outcomes: ${artifact_file}"
+            ;;
+        getsockopt/one_shot)
+            (( valid == measurement_rounds && missing + already_consumed == samples - valid && timeout == 0 )) || \
+                fail "transport benchmark artifact has incorrect ${transport}/${outcome} outcomes: ${artifact_file}"
+            ;;
+        unix/timeout)
+            (( valid == 0 && missing == 0 && already_consumed == 0 && timeout == samples )) || \
+                fail "transport benchmark artifact has incorrect ${transport}/${outcome} outcomes: ${artifact_file}"
+            ;;
+        *)
+            fail "unknown transport benchmark series: ${transport}/${outcome}"
+            ;;
+    esac
+
+    case "$gate_kind" in
+        p99_lt)
+            (( p50_min_ns == 0 )) || \
+                fail "transport benchmark artifact has an invalid ${transport}/${outcome} p99 gate: ${artifact_file}"
+            if (( p99_ns < p99_max_ns )); then
+                expected_gate_passed=true
+            fi
+            ;;
+        p50_gte_p99_lte)
+            if (( p50_ns >= p50_min_ns && p99_ns <= p99_max_ns )); then
+                expected_gate_passed=true
+            fi
+            ;;
+        correctness_only)
+            (( p50_min_ns == 0 && p99_max_ns == 0 )) || \
+                fail "transport benchmark artifact has an invalid ${transport}/${outcome} correctness gate: ${artifact_file}"
+            expected_gate_passed=true
+            ;;
+        *)
+            fail "unknown transport benchmark gate: ${gate_kind}"
+            ;;
+    esac
+    [[ "$gate_passed" == "$expected_gate_passed" ]] || \
+        fail "transport benchmark artifact has an inconsistent ${transport}/${outcome} gate result: ${artifact_file}"
 }
 
 require_transport_benchmark_artifact() {
     local -r artifact_file="$1"
-    local transport_count=""
+    local artifact_bytes=""
+    local artifact_lines=""
+    local artifact_pattern='^\{"schema_version":2,"benchmark":"java_remote_parent_transport",'
+    local getsockopt_miss_pattern=""
+    local getsockopt_hit_pattern=""
+    local getsockopt_one_shot_pattern=""
+    local unix_miss_pattern=""
+    local unix_hit_pattern=""
+    local unix_timeout_pattern=""
 
+    command -v awk >/dev/null 2>&1 || fail 'awk is unavailable'
     require_private_benchmark_path "$artifact_file" 'regular file' 600
     [[ -s "$artifact_file" ]] || \
         fail "transport benchmark artifact is missing or invalid: ${artifact_file}"
-    grep -Fq -- '"schema_version":1,"benchmark":"java_remote_parent_transport","series":[' "$artifact_file" || \
-        fail "transport benchmark artifact has an invalid root: ${artifact_file}"
+    artifact_bytes="$(stat -c '%s' -- "$artifact_file")" || \
+        fail "cannot read transport benchmark artifact size: ${artifact_file}"
+    (( artifact_bytes > 0 && artifact_bytes <= 65536 )) || \
+        fail "transport benchmark artifact has an invalid size: ${artifact_file}"
+    artifact_lines="$(wc -l < "$artifact_file")" || \
+        fail "cannot read transport benchmark artifact lines: ${artifact_file}"
+    [[ "$artifact_lines" -eq 1 ]] || \
+        fail "transport benchmark artifact must be one newline-terminated JSON record: ${artifact_file}"
 
-    transport_count="$(grep -o -- '"transport":' "$artifact_file" | wc -l || true)"
-    [[ "$transport_count" -eq 5 ]] || \
-        fail "transport benchmark artifact has an unexpected series count: ${artifact_file}"
+    getsockopt_miss_pattern="$(transport_benchmark_series_pattern \
+        getsockopt miss 16 512 4096 p99_lt 0 1000000)" || \
+        fail 'cannot construct getsockopt/miss benchmark validation'
+    getsockopt_hit_pattern="$(transport_benchmark_series_pattern \
+        getsockopt hit 16 512 4096 p99_lt 0 1000000)" || \
+        fail 'cannot construct getsockopt/hit benchmark validation'
+    getsockopt_one_shot_pattern="$(transport_benchmark_series_pattern \
+        getsockopt one_shot 16 512 4096 correctness_only 0 0)" || \
+        fail 'cannot construct getsockopt/one_shot benchmark validation'
+    unix_miss_pattern="$(transport_benchmark_series_pattern \
+        unix miss 8 128 1024 p99_lt 0 50000000)" || \
+        fail 'cannot construct unix/miss benchmark validation'
+    unix_hit_pattern="$(transport_benchmark_series_pattern \
+        unix hit 8 128 1024 p99_lt 0 50000000)" || \
+        fail 'cannot construct unix/hit benchmark validation'
+    unix_timeout_pattern="$(transport_benchmark_series_pattern \
+        unix timeout 8 128 1024 p50_gte_p99_lte 50000000 100000000)" || \
+        fail 'cannot construct unix/timeout benchmark validation'
 
-    require_transport_benchmark_series "$artifact_file" getsockopt miss 4096
-    require_transport_benchmark_series "$artifact_file" getsockopt hit 4096
-    require_transport_benchmark_series "$artifact_file" getsockopt one_shot 4096
-    require_transport_benchmark_series "$artifact_file" unix miss 1024
-    require_transport_benchmark_series "$artifact_file" unix hit 1024
+    artifact_pattern+='"provenance":\{"harness":"go_privileged_transport_provider",'
+    artifact_pattern+='"measures":\["transport","provider"\],'
+    artifact_pattern+='"excludes":\["java","jni"\]\},'
+    artifact_pattern+='"unix_timeout_deadline_ns":50000000,"series":\['
+    artifact_pattern+="${getsockopt_miss_pattern},${getsockopt_hit_pattern},"
+    artifact_pattern+="${getsockopt_one_shot_pattern},${unix_miss_pattern},"
+    artifact_pattern+="${unix_hit_pattern},${unix_timeout_pattern}\]\}$"
+    grep -Eq -- "$artifact_pattern" "$artifact_file" || \
+        fail "transport benchmark artifact has an invalid schema-v2 structure: ${artifact_file}"
+
+    require_transport_benchmark_series \
+        "$artifact_file" getsockopt miss 16 512 4096 p99_lt 0 1000000
+    require_transport_benchmark_series \
+        "$artifact_file" getsockopt hit 16 512 4096 p99_lt 0 1000000
+    require_transport_benchmark_series \
+        "$artifact_file" getsockopt one_shot 16 512 4096 correctness_only 0 0
+    require_transport_benchmark_series \
+        "$artifact_file" unix miss 8 128 1024 p99_lt 0 50000000
+    require_transport_benchmark_series \
+        "$artifact_file" unix hit 8 128 1024 p99_lt 0 50000000
+    require_transport_benchmark_series \
+        "$artifact_file" unix timeout 8 128 1024 p50_gte_p99_lte 50000000 100000000
+}
+
+transport_benchmark_artifact_gates_pass() {
+    local -r artifact_file="$1"
+
+    ! grep -Fq -- '"passed":false' "$artifact_file"
+}
+
+create_transport_benchmark_artifact_path() {
+    local -r artifact_dir="$1"
+
+    if [[ -e "$artifact_dir" || -L "$artifact_dir" ]]; then
+        fail "transport benchmark artifact directory already exists: ${artifact_dir}"
+    fi
+    mkdir -m 700 -- "$artifact_dir" || \
+        fail "failed to create transport benchmark artifact directory: ${artifact_dir}"
+    require_private_benchmark_path "$artifact_dir" directory 700
+    printf '%s\n' "${artifact_dir}/benchmark.json"
 }
 
 require_java_agent() {
@@ -171,27 +396,35 @@ run_sockopt_authority_tests() {
 
 run_transport_benchmark() {
     local -r output_file="$OUTPUT_DIR/transport-benchmark.log"
-    local artifact_dir=""
+    local -r artifact_dir="$OUTPUT_DIR/transport-benchmark"
+    local artifact_file=""
+    local test_status=0
 
-    artifact_dir="$(mktemp -d -- "${OUTPUT_DIR}/transport-benchmark.XXXXXX")" || \
-        fail 'failed to create transport benchmark artifact directory'
-    require_private_benchmark_path "$artifact_dir" directory 700
-    local -r artifact_file="${artifact_dir}/benchmark.json"
+    artifact_file="$(create_transport_benchmark_artifact_path "$artifact_dir")" || \
+        fail 'failed to prepare transport benchmark artifact path'
 
-    OBI_JAVA_REMOTE_PARENT_BENCHMARK=1 \
-    OBI_JAVA_REMOTE_PARENT_BENCHMARK_ARTIFACT="$artifact_file" go test \
-        -count=1 \
-        -timeout=10m \
-        -v \
-        -tags=privileged_tests \
-        -run "$BENCHMARK_TEST_PATTERN" \
-        ./pkg/internal/ebpf/tpinjector 2>&1 | tee "$output_file"
+    if OBI_JAVA_REMOTE_PARENT_BENCHMARK=1 \
+        OBI_JAVA_REMOTE_PARENT_BENCHMARK_ARTIFACT="$artifact_file" go test \
+            -count=1 \
+            -timeout=10m \
+            -v \
+            -tags=privileged_tests \
+            -run "$BENCHMARK_TEST_PATTERN" \
+            ./pkg/internal/ebpf/tpinjector 2>&1 | tee "$output_file"; then
+        test_status=0
+    else
+        test_status=$?
+    fi
 
-    require_test_passed "$output_file" \
-        TestJavaRemoteParentTransportBenchmark
     require_transport_benchmark_artifact "$artifact_file"
     grep -F -- 'bridge_benchmark ' "$output_file" \
         | tee "$OUTPUT_DIR/benchmark-results.txt"
+    transport_benchmark_artifact_gates_pass "$artifact_file" || \
+        fail "transport benchmark artifact records a failed latency gate: ${artifact_file}"
+    (( test_status == 0 )) || \
+        fail "transport benchmark test failed with status ${test_status}; see ${output_file}"
+    require_test_passed "$output_file" \
+        TestJavaRemoteParentTransportBenchmark
 }
 
 main() {
@@ -202,4 +435,6 @@ main() {
     run_transport_benchmark
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

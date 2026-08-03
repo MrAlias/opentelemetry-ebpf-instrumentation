@@ -73,6 +73,9 @@ jobs:
             fi
           done
 
+      - name: Validate transport benchmark artifact checks
+        run: bash internal/test/vm/run-java-remote-parent-rhel_test.sh
+
       - name: Build Java bridge probe artifact
         run: |
           set -Eeuo pipefail

@@ -99,16 +99,19 @@ type backendResponse struct {
 }
 
 type tlsBoundaryEvidence struct {
-	Mode                             string `json:"mode"`
-	Passed                           bool   `json:"passed"`
-	ShapeExact                       bool   `json:"shape_exact"`
-	ExpectedPlaintextCallbackLengths []int  `json:"expected_plaintext_callback_lengths"`
-	ActualPlaintextCallbackLengths   []int  `json:"actual_plaintext_callback_lengths"`
-	RequestOrder                     []int  `json:"request_order"`
-	ResponseOrder                    []int  `json:"response_order"`
-	BuffersForwardedUnchanged        bool   `json:"buffers_forwarded_unchanged"`
-	HandoffBeforeParse               bool   `json:"handoff_before_parse"`
-	ConnectionClosed                 bool   `json:"connection_closed"`
+	Mode                               string `json:"mode"`
+	Passed                             bool   `json:"passed"`
+	ShapeExact                         bool   `json:"shape_exact"`
+	ExpectedPlaintextCallbackLengths   []int  `json:"expected_plaintext_callback_lengths"`
+	ActualPlaintextCallbackLengths     []int  `json:"actual_plaintext_callback_lengths"`
+	TLSApplicationRecordLegacyVersions []int  `json:"tls_application_record_legacy_versions"`
+	TLSApplicationRecordPayloadLengths []int  `json:"tls_application_record_payload_lengths"`
+	WireTLSRecordShapeExact            bool   `json:"wire_tls_record_shape_exact"`
+	RequestOrder                       []int  `json:"request_order"`
+	ResponseOrder                      []int  `json:"response_order"`
+	BuffersForwardedUnchanged          bool   `json:"buffers_forwarded_unchanged"`
+	HandoffBeforeParse                 bool   `json:"handoff_before_parse"`
+	ConnectionClosed                   bool   `json:"connection_closed"`
 }
 
 type caseResult struct {
@@ -1588,6 +1591,7 @@ func validateTLSBoundaryResponse(request requestCase, response backendResponse) 
 	}
 	if evidence.Mode != request.TLSBoundaryMode || !evidence.Passed || !evidence.ShapeExact ||
 		!equalInts(evidence.ExpectedPlaintextCallbackLengths, evidence.ActualPlaintextCallbackLengths) ||
+		!evidence.WireTLSRecordShapeExact ||
 		!evidence.BuffersForwardedUnchanged || !evidence.HandoffBeforeParse ||
 		!evidence.ConnectionClosed {
 		return fmt.Errorf("TLS boundary evidence failed for mode %s: %+v", request.TLSBoundaryMode, evidence)
@@ -1600,19 +1604,42 @@ func validateTLSBoundaryResponse(request requestCase, response backendResponse) 
 		expectedCallbacks = 1
 	}
 	if len(evidence.ExpectedPlaintextCallbackLengths) != expectedCallbacks ||
+		len(evidence.TLSApplicationRecordLegacyVersions) != expectedCallbacks ||
+		len(evidence.TLSApplicationRecordPayloadLengths) != expectedCallbacks ||
 		!equalInts(evidence.RequestOrder, expectedOrder) ||
 		!equalInts(evidence.ResponseOrder, expectedOrder) {
 		return fmt.Errorf("TLS boundary evidence had the wrong deterministic shape for mode %s: %+v", request.TLSBoundaryMode, evidence)
 	}
-	for _, length := range evidence.ExpectedPlaintextCallbackLengths {
+	for index, length := range evidence.ExpectedPlaintextCallbackLengths {
 		if length <= 0 || length > tlsBoundaryMaxHTTPBytes {
 			return fmt.Errorf("TLS boundary callback length is out of bounds: %d", length)
+		}
+		legacyVersion := evidence.TLSApplicationRecordLegacyVersions[index]
+		if legacyVersion != tlsBoundaryApplicationDataLegacyVersion {
+			return fmt.Errorf(
+				"TLS boundary application record legacy version is invalid: %d",
+				legacyVersion,
+			)
+		}
+		payloadLength := evidence.TLSApplicationRecordPayloadLengths[index]
+		if payloadLength <= length || payloadLength > length+tlsBoundaryMaxRecordOverhead ||
+			payloadLength > tlsBoundaryMaxRecordPayload {
+			return fmt.Errorf(
+				"TLS boundary application record length is out of bounds: plaintext=%d payload=%d",
+				length,
+				payloadLength,
+			)
 		}
 	}
 	return nil
 }
 
-const tlsBoundaryMaxHTTPBytes = 16 * 1024
+const (
+	tlsBoundaryMaxHTTPBytes                 = 16 * 1024
+	tlsBoundaryMaxRecordOverhead            = 256
+	tlsBoundaryMaxRecordPayload             = (1 << 14) + 2048
+	tlsBoundaryApplicationDataLegacyVersion = 0x0303
+)
 
 func equalInts(left, right []int) bool {
 	if len(left) != len(right) {

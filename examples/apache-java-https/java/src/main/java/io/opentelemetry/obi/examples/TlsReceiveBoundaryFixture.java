@@ -38,6 +38,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -103,39 +104,51 @@ final class TlsReceiveBoundaryFixture implements AutoCloseable {
     private final Mode mode;
     private final List<Integer> expectedPlaintextCallbackLengths;
     private final List<Integer> actualPlaintextCallbackLengths;
+    private final List<Integer> tlsApplicationRecordLegacyVersions;
+    private final List<Integer> tlsApplicationRecordPayloadLengths;
     private final List<Long> decryptThreadIDs;
     private final List<Long> parserThreadIDs;
     private final List<Integer> requestOrder;
     private final List<Integer> responseOrder;
     private final boolean buffersForwardedUnchanged;
     private final boolean handoffBeforeParse;
+    private final boolean wireTlsRecordShapeExact;
     private final boolean connectionClosed;
 
     private Evidence(
         Mode mode,
         List<Integer> expectedPlaintextCallbackLengths,
         List<Integer> actualPlaintextCallbackLengths,
+        List<Integer> tlsApplicationRecordLegacyVersions,
+        List<Integer> tlsApplicationRecordPayloadLengths,
         List<Long> decryptThreadIDs,
         List<Long> parserThreadIDs,
         List<Integer> requestOrder,
         List<Integer> responseOrder,
         boolean buffersForwardedUnchanged,
         boolean handoffBeforeParse,
+        boolean wireTlsRecordShapeExact,
         boolean connectionClosed) {
       this.mode = mode;
       this.expectedPlaintextCallbackLengths = List.copyOf(expectedPlaintextCallbackLengths);
       this.actualPlaintextCallbackLengths = List.copyOf(actualPlaintextCallbackLengths);
+      this.tlsApplicationRecordLegacyVersions =
+          List.copyOf(tlsApplicationRecordLegacyVersions);
+      this.tlsApplicationRecordPayloadLengths =
+          List.copyOf(tlsApplicationRecordPayloadLengths);
       this.decryptThreadIDs = List.copyOf(decryptThreadIDs);
       this.parserThreadIDs = List.copyOf(parserThreadIDs);
       this.requestOrder = List.copyOf(requestOrder);
       this.responseOrder = List.copyOf(responseOrder);
       this.buffersForwardedUnchanged = buffersForwardedUnchanged;
       this.handoffBeforeParse = handoffBeforeParse;
+      this.wireTlsRecordShapeExact = wireTlsRecordShapeExact;
       this.connectionClosed = connectionClosed;
     }
 
     boolean passed() {
       return shapeExact()
+          && wireTlsRecordShapeExact
           && buffersForwardedUnchanged
           && handoffBeforeParse
           && requestOrder.equals(expectedOrder(mode.requestCount()))
@@ -153,6 +166,14 @@ final class TlsReceiveBoundaryFixture implements AutoCloseable {
 
     List<Integer> actualPlaintextCallbackLengths() {
       return actualPlaintextCallbackLengths;
+    }
+
+    List<Integer> tlsApplicationRecordPayloadLengths() {
+      return tlsApplicationRecordPayloadLengths;
+    }
+
+    List<Integer> tlsApplicationRecordLegacyVersions() {
+      return tlsApplicationRecordLegacyVersions;
     }
 
     List<Long> decryptThreadIDs() {
@@ -179,6 +200,10 @@ final class TlsReceiveBoundaryFixture implements AutoCloseable {
       return handoffBeforeParse;
     }
 
+    boolean wireTlsRecordShapeExact() {
+      return wireTlsRecordShapeExact;
+    }
+
     boolean connectionClosed() {
       return connectionClosed;
     }
@@ -189,6 +214,9 @@ final class TlsReceiveBoundaryFixture implements AutoCloseable {
           "{\"mode\":\"%s\",\"passed\":%s,\"shape_exact\":%s,"
               + "\"expected_plaintext_callback_lengths\":%s,"
               + "\"actual_plaintext_callback_lengths\":%s,"
+              + "\"tls_application_record_legacy_versions\":%s,"
+              + "\"tls_application_record_payload_lengths\":%s,"
+              + "\"wire_tls_record_shape_exact\":%s,"
               + "\"request_order\":%s,\"response_order\":%s,"
               + "\"buffers_forwarded_unchanged\":%s,"
               + "\"handoff_before_parse\":%s,\"connection_closed\":%s}%n",
@@ -197,6 +225,9 @@ final class TlsReceiveBoundaryFixture implements AutoCloseable {
           shapeExact(),
           integerListJson(expectedPlaintextCallbackLengths),
           integerListJson(actualPlaintextCallbackLengths),
+          integerListJson(tlsApplicationRecordLegacyVersions),
+          integerListJson(tlsApplicationRecordPayloadLengths),
+          wireTlsRecordShapeExact,
           integerListJson(requestOrder),
           integerListJson(responseOrder),
           buffersForwardedUnchanged,
@@ -297,34 +328,40 @@ final class TlsReceiveBoundaryFixture implements AutoCloseable {
     }
 
     List<Integer> responseOrder = new ArrayList<>(mode.requestCount());
+    TlsRecordObserver.Snapshot tlsRecordSnapshot = TlsRecordObserver.Snapshot.empty();
     long deadlineNanos = System.nanoTime() + EXERCISE_TIMEOUT.toNanos();
     boolean clientClosed = false;
     try {
-      try (SSLSocket socket =
-          (SSLSocket) clientSocketFactory.createSocket()) {
-        socket.setEnabledProtocols(new String[] {tlsProtocol});
-        socket.connect(
+      try (ObservedTlsSocket transport = new ObservedTlsSocket()) {
+        transport.connect(
             new InetSocketAddress("127.0.0.1", port), remainingMillis(deadlineNanos));
-        socket.setSoTimeout(remainingMillis(deadlineNanos));
-        socket.startHandshake();
-
-        OutputStream output = socket.getOutputStream();
-        InputStream input = new BufferedInputStream(socket.getInputStream());
-        for (int index = 0; index < plan.writes.size(); index++) {
-          output.write(plan.writes.get(index));
-          output.flush();
-          if (mode == Mode.SPLIT && index == 0) {
-            state.awaitFirstPlaintext(deadlineNanos);
-          }
-        }
-
-        for (int expected = 1; expected <= mode.requestCount(); expected++) {
+        try (SSLSocket socket =
+            (SSLSocket)
+                clientSocketFactory.createSocket(transport, "127.0.0.1", port, true)) {
+          socket.setEnabledProtocols(new String[] {tlsProtocol});
           socket.setSoTimeout(remainingMillis(deadlineNanos));
-          responseOrder.add(readResponseSequence(input));
-        }
-        socket.setSoTimeout(remainingMillis(deadlineNanos));
-        if (input.read() != -1) {
-          throw new IOException("fixture server sent bytes after the final response");
+          socket.startHandshake();
+          transport.armObserver();
+
+          OutputStream output = socket.getOutputStream();
+          InputStream input = new BufferedInputStream(socket.getInputStream());
+          for (int index = 0; index < plan.writes.size(); index++) {
+            output.write(plan.writes.get(index));
+            output.flush();
+            if (mode == Mode.SPLIT && index == 0) {
+              state.awaitFirstPlaintext(deadlineNanos);
+            }
+          }
+          tlsRecordSnapshot = transport.snapshotObserver();
+
+          for (int expected = 1; expected <= mode.requestCount(); expected++) {
+            socket.setSoTimeout(remainingMillis(deadlineNanos));
+            responseOrder.add(readResponseSequence(input));
+          }
+          socket.setSoTimeout(remainingMillis(deadlineNanos));
+          if (input.read() != -1) {
+            throw new IOException("fixture server sent bytes after the final response");
+          }
         }
       } finally {
         clientClosed = true;
@@ -333,7 +370,7 @@ final class TlsReceiveBoundaryFixture implements AutoCloseable {
       state.awaitRequests(deadlineNanos);
       state.awaitConnectionClosed(deadlineNanos);
       state.throwIfFailed();
-      return state.evidence(responseOrder, clientClosed);
+      return state.evidence(responseOrder, clientClosed, tlsRecordSnapshot);
     } finally {
       activeRun.compareAndSet(state, null);
     }
@@ -479,6 +516,7 @@ final class TlsReceiveBoundaryFixture implements AutoCloseable {
   }
 
   private static final class RequestPlan {
+    private static final int MAX_TLS_RECORD_OVERHEAD_BYTES = 256;
     private final Mode mode;
     private final String marker;
     private final List<byte[]> writes;
@@ -534,6 +572,51 @@ final class TlsReceiveBoundaryFixture implements AutoCloseable {
         throw new IllegalArgumentException("fixture request exceeds the configured limit");
       }
       return bytes;
+    }
+
+    private boolean wireTlsRecordShapeExact(TlsRecordObserver.Snapshot snapshot) {
+      List<Integer> legacyVersions = snapshot.legacyVersions();
+      List<Integer> payloadLengths = snapshot.payloadLengths();
+      if (payloadLengths.size() != expectedCallbackLengths.size()) {
+        return false;
+      }
+      if (legacyVersions.size() != payloadLengths.size()) {
+        return false;
+      }
+      for (int index = 0; index < payloadLengths.size(); index++) {
+        if (legacyVersions.get(index)
+            != TlsRecordObserver.TLS_APPLICATION_DATA_LEGACY_VERSION) {
+          return false;
+        }
+        int plaintextLength = expectedCallbackLengths.get(index);
+        int payloadLength = payloadLengths.get(index);
+        int overhead = payloadLength - plaintextLength;
+        if (overhead <= 0 || overhead > MAX_TLS_RECORD_OVERHEAD_BYTES) {
+          return false;
+        }
+      }
+      return true;
+    }
+  }
+
+  private static final class ObservedTlsSocket extends Socket {
+    private final TlsRecordObserver observer = new TlsRecordObserver();
+    private OutputStream observedOutput;
+
+    @Override
+    public synchronized OutputStream getOutputStream() throws IOException {
+      if (observedOutput == null) {
+        observedOutput = observer.observe(super.getOutputStream());
+      }
+      return observedOutput;
+    }
+
+    private void armObserver() throws IOException {
+      observer.arm();
+    }
+
+    private TlsRecordObserver.Snapshot snapshotObserver() throws IOException {
+      return observer.disarmAndSnapshot();
     }
   }
 
@@ -675,7 +758,10 @@ final class TlsReceiveBoundaryFixture implements AutoCloseable {
       throw new IOException("TLS receive-boundary fixture failed", cause);
     }
 
-    private synchronized Evidence evidence(List<Integer> responseOrder, boolean clientClosed) {
+    private synchronized Evidence evidence(
+        List<Integer> responseOrder,
+        boolean clientClosed,
+        TlsRecordObserver.Snapshot tlsRecordSnapshot) {
       List<Integer> actualLengths = new ArrayList<>(boundaries.size());
       List<Long> decryptThreadIDs = new ArrayList<>(boundaries.size());
       for (BufferObservation boundary : boundaries) {
@@ -699,12 +785,15 @@ final class TlsReceiveBoundaryFixture implements AutoCloseable {
           plan.mode,
           plan.expectedCallbackLengths,
           actualLengths,
+          tlsRecordSnapshot.legacyVersions(),
+          tlsRecordSnapshot.payloadLengths(),
           decryptThreadIDs,
           parserThreadIDs,
           requestOrder,
           responseOrder,
           buffersForwardedUnchanged,
           handoff,
+          plan.wireTlsRecordShapeExact(tlsRecordSnapshot),
           clientClosed && connectionClosed.getCount() == 0);
     }
 

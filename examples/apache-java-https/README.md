@@ -268,9 +268,12 @@ The default `all` suite runs, in order:
   stable Jetty connection IDs;
 - 64 KiB request bodies paced in small writes, with monotonic backend counters
   requiring multiple decrypted Java receive callbacks per request;
-- deterministic split and coalesced plaintext callback shapes in the opt-in
-  Netty TLS fixture, reached from exact-parented Apache-to-Java requests and
-  validated under the selected TLS 1.2 or TLS 1.3 backend protocol;
+- deterministic split and coalesced TLS application-data record counts and
+  matching plaintext callback shapes in the opt-in Netty TLS fixture, reached
+  from exact-parented Apache-to-Java requests and validated under the selected
+  TLS 1.2 or TLS 1.3 backend protocol; the bounded wire observer retains only
+  application-data type, legacy-version, length, and count metadata, never
+  record contents;
 - a canceled request followed by a successful retry;
 - order-independent handoff-claim LRU eviction under sustained concurrent
   pressure, with exact hits and explicit roots counted separately and
@@ -300,8 +303,11 @@ Run the fallback transport and TLS version separately:
 ./examples/apache-java-https/run.sh --transport unix --tls TLSv1.2
 ```
 
-The `tls-boundary` target runs both the split and coalesced cases. Run it once
-per declared protocol when iterating on that boundary:
+The `tls-boundary` target runs both the split and coalesced cases. It fails
+unless the post-handshake wire observer sees one bounded TLS application-data
+record for each planned plaintext write and the Netty server sees the exact
+corresponding decrypted callback shape. Run it once per declared protocol when
+iterating on that boundary:
 
 ```bash
 ./examples/apache-java-https/run.sh --scenario tls-boundary --tls TLSv1.2

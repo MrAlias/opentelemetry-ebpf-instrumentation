@@ -1201,33 +1201,52 @@ func TestTLSBoundaryRequestsAndEvidenceCoverBothDeterministicModes(t *testing.T)
 	}
 
 	split := backendResponse{TLSBoundary: &tlsBoundaryEvidence{
-		Mode:                             "split",
-		Passed:                           true,
-		ShapeExact:                       true,
-		ExpectedPlaintextCallbackLengths: []int{3, 5},
-		ActualPlaintextCallbackLengths:   []int{3, 5},
-		RequestOrder:                     []int{1},
-		ResponseOrder:                    []int{1},
-		BuffersForwardedUnchanged:        true,
-		HandoffBeforeParse:               true,
-		ConnectionClosed:                 true,
+		Mode:                               "split",
+		Passed:                             true,
+		ShapeExact:                         true,
+		ExpectedPlaintextCallbackLengths:   []int{3, 5},
+		ActualPlaintextCallbackLengths:     []int{3, 5},
+		TLSApplicationRecordLegacyVersions: []int{0x0303, 0x0303},
+		TLSApplicationRecordPayloadLengths: []int{20, 22},
+		WireTLSRecordShapeExact:            true,
+		RequestOrder:                       []int{1},
+		ResponseOrder:                      []int{1},
+		BuffersForwardedUnchanged:          true,
+		HandoffBeforeParse:                 true,
+		ConnectionClosed:                   true,
 	}}
 	require.NoError(t, validateTLSBoundaryResponse(requests[0], split))
 
 	coalesced := backendResponse{TLSBoundary: &tlsBoundaryEvidence{
-		Mode:                             "coalesced",
-		Passed:                           true,
-		ShapeExact:                       true,
-		ExpectedPlaintextCallbackLengths: []int{8},
-		ActualPlaintextCallbackLengths:   []int{8},
-		RequestOrder:                     []int{1, 2},
-		ResponseOrder:                    []int{1, 2},
-		BuffersForwardedUnchanged:        true,
-		HandoffBeforeParse:               true,
-		ConnectionClosed:                 true,
+		Mode:                               "coalesced",
+		Passed:                             true,
+		ShapeExact:                         true,
+		ExpectedPlaintextCallbackLengths:   []int{8},
+		ActualPlaintextCallbackLengths:     []int{8},
+		TLSApplicationRecordLegacyVersions: []int{0x0303},
+		TLSApplicationRecordPayloadLengths: []int{25},
+		WireTLSRecordShapeExact:            true,
+		RequestOrder:                       []int{1, 2},
+		ResponseOrder:                      []int{1, 2},
+		BuffersForwardedUnchanged:          true,
+		HandoffBeforeParse:                 true,
+		ConnectionClosed:                   true,
 	}}
 	require.NoError(t, validateTLSBoundaryResponse(requests[1], coalesced))
 	coalesced.TLSBoundary.ActualPlaintextCallbackLengths = []int{4, 4}
+	assert.Error(t, validateTLSBoundaryResponse(requests[1], coalesced))
+	coalesced.TLSBoundary.ActualPlaintextCallbackLengths = []int{8}
+	coalesced.TLSBoundary.WireTLSRecordShapeExact = false
+	assert.Error(t, validateTLSBoundaryResponse(requests[1], coalesced))
+	coalesced.TLSBoundary.WireTLSRecordShapeExact = true
+	coalesced.TLSBoundary.TLSApplicationRecordLegacyVersions = []int{0x0302}
+	assert.Error(t, validateTLSBoundaryResponse(requests[1], coalesced))
+	coalesced.TLSBoundary.TLSApplicationRecordLegacyVersions = []int{0x0303}
+	coalesced.TLSBoundary.TLSApplicationRecordPayloadLengths = []int{8}
+	assert.Error(t, validateTLSBoundaryResponse(requests[1], coalesced))
+	coalesced.TLSBoundary.TLSApplicationRecordPayloadLengths = []int{265}
+	assert.Error(t, validateTLSBoundaryResponse(requests[1], coalesced))
+	coalesced.TLSBoundary.TLSApplicationRecordPayloadLengths = []int{25, 25}
 	assert.Error(t, validateTLSBoundaryResponse(requests[1], coalesced))
 }
 

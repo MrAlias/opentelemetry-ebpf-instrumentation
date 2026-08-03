@@ -87,6 +87,9 @@ class TlsReceiveBoundaryFixtureTest {
         assertEquals(
             evidence.expectedPlaintextCallbackLengths(),
             evidence.actualPlaintextCallbackLengths());
+        assertTrue(evidence.wireTlsRecordShapeExact(), protocol + ": " + evidence.toJson());
+        assertEquals(2, evidence.tlsApplicationRecordPayloadLengths().size());
+        assertWireRecordMetadata(evidence);
         assertEquals(List.of(1), evidence.requestOrder());
         assertEquals(List.of(1), evidence.responseOrder());
         assertHandoffEvidence(evidence);
@@ -108,6 +111,9 @@ class TlsReceiveBoundaryFixtureTest {
         assertEquals(
             evidence.expectedPlaintextCallbackLengths(),
             evidence.actualPlaintextCallbackLengths());
+        assertTrue(evidence.wireTlsRecordShapeExact(), protocol + ": " + evidence.toJson());
+        assertEquals(1, evidence.tlsApplicationRecordPayloadLengths().size());
+        assertWireRecordMetadata(evidence);
         assertEquals(List.of(1, 2), evidence.requestOrder());
         assertEquals(List.of(1, 2), evidence.responseOrder());
         assertHandoffEvidence(evidence);
@@ -152,6 +158,24 @@ class TlsReceiveBoundaryFixtureTest {
     assertTrue(
         Collections.disjoint(evidence.decryptThreadIDs(), evidence.parserThreadIDs()),
         evidence.toJson());
+  }
+
+  private static void assertWireRecordMetadata(TlsReceiveBoundaryFixture.Evidence evidence) {
+    assertEquals(
+        evidence.expectedPlaintextCallbackLengths().size(),
+        evidence.tlsApplicationRecordPayloadLengths().size());
+    assertEquals(
+        evidence.tlsApplicationRecordPayloadLengths().size(),
+        evidence.tlsApplicationRecordLegacyVersions().size());
+    for (int index = 0; index < evidence.expectedPlaintextCallbackLengths().size(); index++) {
+      assertEquals(
+          TlsRecordObserver.TLS_APPLICATION_DATA_LEGACY_VERSION,
+          evidence.tlsApplicationRecordLegacyVersions().get(index));
+      int plaintextLength = evidence.expectedPlaintextCallbackLengths().get(index);
+      int payloadLength = evidence.tlsApplicationRecordPayloadLengths().get(index);
+      assertTrue(payloadLength > plaintextLength, evidence.toJson());
+      assertTrue(payloadLength <= plaintextLength + 256, evidence.toJson());
+    }
   }
 
   private static TlsReceiveBoundaryFixture newFixture(String protocol) throws Exception {

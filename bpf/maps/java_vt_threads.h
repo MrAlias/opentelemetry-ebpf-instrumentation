@@ -64,9 +64,11 @@ struct {
 } java_retired_processes SEC(".maps");
 
 // Which full virtual-thread identity is currently mounted on a carrier OS
-// thread. An entry exists only while the virtual thread is mounted.
+// thread. An entry exists only while the virtual thread is mounted. This map
+// must not evict: a missing live mount could let a synthetic owner escape a
+// receive-boundary detach and revive after remount.
 struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, pid_key_t);
     __type(value, java_vt_identity_t);
     __uint(max_entries, MAX_CONCURRENT_REQUESTS);
@@ -89,6 +91,13 @@ enum java_vt_mount_result : u8 {
     k_java_vt_mount_collision = 2,
     k_java_vt_mount_stale_incarnation = 3,
     k_java_vt_mount_overload = 4,
+    k_java_vt_mount_new_identity = 5,
+};
+
+enum java_vt_cleanup_translation_result : u8 {
+    k_java_vt_cleanup_translation_none = 0,
+    k_java_vt_cleanup_translation_exact = 1,
+    k_java_vt_cleanup_translation_fallback = 2,
 };
 
 static __always_inline pid_key_t java_process_key(const pid_key_t *task) {
@@ -155,6 +164,31 @@ static __always_inline u8 java_vt_identity_equal(const java_vt_identity_t *left,
            left->process_incarnation == right->process_incarnation;
 }
 
+static __always_inline u8
+java_vt_prepare_unregistered_cleanup(const pid_key_t *carrier,
+                                     u64 vt_id,
+                                     u64 process_capability,
+                                     pid_key_t *synthetic_owner,
+                                     java_vt_identity_t *expected_identity) {
+    if (!vt_id || !process_capability) {
+        return 0;
+    }
+
+    *synthetic_owner = java_vt_synthetic_owner(carrier, vt_id);
+    expected_identity->virtual_thread_id = vt_id;
+    expected_identity->process_incarnation = process_capability;
+    return 1;
+}
+
+static __always_inline u8 java_vt_delete_identity_if_matches(
+    const pid_key_t *synthetic_owner, const java_vt_identity_t *expected_identity) {
+    const java_vt_identity_t *published = bpf_map_lookup_elem(&java_vt_identities, synthetic_owner);
+    if (!published || !java_vt_identity_equal(published, expected_identity)) {
+        return 0;
+    }
+    return bpf_map_delete_elem(&java_vt_identities, synthetic_owner) == 0;
+}
+
 static __always_inline enum java_vt_mount_result
 java_vt_prepare_mount(const pid_key_t *carrier,
                       u64 vt_id,
@@ -181,8 +215,13 @@ java_vt_prepare_mount(const pid_key_t *carrier,
                                                             : k_java_vt_mount_stale_incarnation;
     }
 
-    if (bpf_map_update_elem(&java_vt_identities, synthetic_owner, mount_identity, BPF_NOEXIST) !=
+    if (bpf_map_update_elem(&java_vt_identities, synthetic_owner, mount_identity, BPF_NOEXIST) ==
         0) {
+        // The LRU guard may be new or may have been evicted. The caller must
+        // conservatively discard state under this synthetic key before it can
+        // publish the mount.
+        return k_java_vt_mount_new_identity;
+    } else {
         existing = bpf_map_lookup_elem(&java_vt_identities, synthetic_owner);
         if (!existing) {
             return k_java_vt_mount_overload;
@@ -206,22 +245,46 @@ static __always_inline u8 java_vt_replace_stale_identity(const pid_key_t *synthe
     return published && java_vt_identity_equal(published, mount_identity);
 }
 
-static __always_inline u8 java_vt_publish_mount(const pid_key_t *carrier,
-                                                const java_vt_identity_t *mount_identity) {
-    return bpf_map_update_elem(&java_vt_threads, carrier, mount_identity, BPF_ANY) == 0;
+static __always_inline void
+java_vt_invalidate_mount_identity(const pid_key_t *carrier,
+                                  const java_vt_identity_t *mount_identity) {
+    const pid_key_t owner = java_vt_synthetic_owner(carrier, mount_identity->virtual_thread_id);
+    java_vt_delete_identity_if_matches(&owner, mount_identity);
 }
 
-// Rewrites a mounted carrier only after full-id and process-incarnation
-// validation. Missing/evicted/mismatched guards deliberately fail closed.
-static __always_inline u8 java_vt_translate_tid(pid_key_t *p_key) {
+static __always_inline u8 java_vt_mount_registration_matches(
+    const pid_key_t *carrier, const java_vt_identity_t *mount_identity) {
+    return java_process_capability_for(carrier) == mount_identity->process_incarnation &&
+           java_process_incarnation_for(carrier) == mount_identity->process_incarnation;
+}
+
+static __always_inline u8 java_vt_publish_mount(const pid_key_t *carrier,
+                                                const java_vt_identity_t *mount_identity) {
+    if (!java_vt_mount_registration_matches(carrier, mount_identity)) {
+        java_vt_invalidate_mount_identity(carrier, mount_identity);
+        return 0;
+    }
+    if (bpf_map_update_elem(&java_vt_threads, carrier, mount_identity, BPF_ANY) != 0) {
+        java_vt_invalidate_mount_identity(carrier, mount_identity);
+        return 0;
+    }
+    if (!java_vt_mount_registration_matches(carrier, mount_identity)) {
+        java_vt_invalidate_mount_identity(carrier, mount_identity);
+        return 0;
+    }
+    return 1;
+}
+
+static __always_inline u8 java_vt_translate_tid_for_incarnation(pid_key_t *p_key,
+                                                                u64 expected_process_incarnation) {
     const java_vt_identity_t *mounted = bpf_map_lookup_elem(&java_vt_threads, p_key);
     if (!mounted) {
         return 0;
     }
     const java_vt_identity_t mounted_copy = *mounted;
     if (!mounted_copy.process_incarnation ||
-        (java_remote_parent_enabled &&
-         java_process_incarnation_for(p_key) != mounted_copy.process_incarnation)) {
+        (expected_process_incarnation &&
+         expected_process_incarnation != mounted_copy.process_incarnation)) {
         return 0;
     }
 
@@ -233,6 +296,52 @@ static __always_inline u8 java_vt_translate_tid(pid_key_t *p_key) {
 
     p_key->tid = owner.tid;
     return 1;
+}
+
+// Rewrites a mounted carrier only after full-id and process-incarnation
+// validation. Missing/evicted/mismatched guards deliberately fail closed.
+static __always_inline u8 java_vt_translate_tid(pid_key_t *p_key) {
+    u64 process_incarnation = 0;
+    if (java_remote_parent_enabled) {
+        process_incarnation = java_process_incarnation_for(p_key);
+        if (!process_incarnation) {
+            return 0;
+        }
+    }
+    return java_vt_translate_tid_for_incarnation(p_key, process_incarnation);
+}
+
+// Receive cleanup must still find a mounted owner when the LRU registration or
+// identity-guard entry was evicted. A capability-matched mount is sufficient
+// to derive a conservative cleanup target, but only a matching full identity
+// may preserve task-aliased state. Ordinary lookup continues to require both
+// the registered incarnation and full identity through java_vt_translate_tid().
+static __always_inline enum java_vt_cleanup_translation_result
+java_vt_translate_tid_for_capability(pid_key_t *p_key, u64 process_capability) {
+    if (!process_capability) {
+        return k_java_vt_cleanup_translation_none;
+    }
+
+    const java_vt_identity_t *mounted = bpf_map_lookup_elem(&java_vt_threads, p_key);
+    if (!mounted) {
+        return k_java_vt_cleanup_translation_none;
+    }
+    const java_vt_identity_t mounted_copy = *mounted;
+    if (mounted_copy.process_incarnation != process_capability) {
+        return k_java_vt_cleanup_translation_none;
+    }
+
+    const pid_key_t owner = java_vt_synthetic_owner(p_key, mounted_copy.virtual_thread_id);
+    const java_vt_identity_t *identity = bpf_map_lookup_elem(&java_vt_identities, &owner);
+    p_key->tid = owner.tid;
+    return identity && java_vt_identity_equal(identity, &mounted_copy)
+               ? k_java_vt_cleanup_translation_exact
+               : k_java_vt_cleanup_translation_fallback;
+}
+
+static __always_inline enum java_vt_cleanup_translation_result
+java_vt_translate_authorized_tid(pid_key_t *p_key) {
+    return java_vt_translate_tid_for_capability(p_key, java_process_capability_for(p_key));
 }
 
 static __always_inline u8 java_vt_mounted(void) {
@@ -265,6 +374,5 @@ static __always_inline u8 java_vt_terminate_identity(const pid_key_t *carrier,
     if (mounted && java_vt_identity_equal(mounted, &expected)) {
         bpf_map_delete_elem(&java_vt_threads, carrier);
     }
-    bpf_map_delete_elem(&java_vt_identities, owner);
     return 1;
 }

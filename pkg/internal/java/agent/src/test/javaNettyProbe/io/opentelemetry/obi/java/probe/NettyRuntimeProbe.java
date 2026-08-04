@@ -9,6 +9,7 @@ import io.netty.util.concurrent.DefaultEventExecutor;
 import io.netty.util.concurrent.Future;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.net.InetAddress;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -18,6 +19,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 public final class NettyRuntimeProbe {
   private static final List<Event> EVENTS = Collections.synchronizedList(new ArrayList<Event>());
@@ -59,6 +61,7 @@ public final class NettyRuntimeProbe {
   private static void verifyEventLoopToWorkerHandoff() throws Exception {
     DefaultEventExecutor eventLoop = new DefaultEventExecutor();
     ExecutorService worker = Executors.newSingleThreadExecutor();
+    ExactNettyConnection exact = new ExactNettyConnection(81);
     CountDownLatch complete = new CountDownLatch(1);
     AtomicInteger claimedDescriptor = new AtomicInteger(-2);
     NamedTask workerTask =
@@ -68,11 +71,19 @@ public final class NettyRuntimeProbe {
               claimedDescriptor.set(takeSocketFileDescriptor());
               complete.countDown();
             });
-    NamedTask eventLoopTask = new NamedTask("event-loop", () -> worker.execute(workerTask));
+    NamedTask eventLoopTask =
+        new NamedTask(
+            "event-loop",
+            () ->
+                exact.runInHandlerScope(
+                    () -> {
+                      setSocketFileDescriptor(81, exact.lifecycle);
+                      worker.execute(workerTask);
+                      clearSocketFileDescriptor();
+                    }));
     int start = eventCount();
 
     try {
-      setSocketFileDescriptor(81);
       eventLoop.execute(eventLoopTask);
       require(complete.await(5, TimeUnit.SECONDS), "Netty-to-worker handoff did not complete");
       require(claimedDescriptor.get() == 81, "Netty worker lost accepted socket ownership");
@@ -81,7 +92,8 @@ public final class NettyRuntimeProbe {
 
       List<Event> events = snapshotSince(start);
       require(
-          count(events, "TASK_CAPTURE") >= 2, "Netty-to-worker captures were missing: " + events);
+          count(events, "TASK_CAPTURE") == 1,
+          "only the exact Netty-to-worker submission should be captured: " + events);
       require(allCapturesLinked(events), "Netty-to-worker tokens were not linked: " + events);
 
       CountDownLatch reuseComplete = new CountDownLatch(2);
@@ -108,6 +120,7 @@ public final class NettyRuntimeProbe {
       require(leakedDescriptors.get() == 0, "Netty worker reused accepted socket ownership");
     } finally {
       clearSocketFileDescriptor();
+      exact.close();
       worker.shutdownNow();
       require(worker.awaitTermination(5, TimeUnit.SECONDS), "worker did not terminate");
       eventLoop.shutdownGracefully(0, 5, TimeUnit.SECONDS).syncUninterruptibly();
@@ -116,6 +129,8 @@ public final class NettyRuntimeProbe {
 
   private static void verifyCancellationAndRejectionCleanup() throws Exception {
     DefaultEventExecutor eventLoop = new DefaultEventExecutor();
+    ExactNettyConnection cancellationConnection = new ExactNettyConnection(83);
+    ExactNettyConnection rejectionConnection = new ExactNettyConnection(84);
     CountDownLatch workerBlocked = new CountDownLatch(1);
     CountDownLatch releaseWorker = new CountDownLatch(1);
     eventLoop.execute(
@@ -127,13 +142,26 @@ public final class NettyRuntimeProbe {
             }));
     require(workerBlocked.await(5, TimeUnit.SECONDS), "Netty event loop did not block");
     try {
-      setSocketFileDescriptor(83);
+      int cancellationStart = eventCount();
       NamedTask cancelled = new NamedTask("cancelled", () -> {});
-      Future<?> future = eventLoop.schedule(cancelled, 1, TimeUnit.HOURS);
+      AtomicReference<Future<?>> futureReference = new AtomicReference<>();
+      cancellationConnection.runInHandlerScope(
+          () -> {
+            setSocketFileDescriptor(83, cancellationConnection.lifecycle);
+            futureReference.set(eventLoop.schedule(cancelled, 1, TimeUnit.HOURS));
+          });
+      Future<?> future = futureReference.get();
       clearSocketFileDescriptor();
       require(taskContext(future) != null, "scheduled Netty wrapper was not tracked");
       require(future.cancel(false), "scheduled Netty task was not cancelled");
       awaitNoContext(future);
+      List<Event> cancellationEvents = snapshotSince(cancellationStart);
+      require(
+          count(cancellationEvents, "TASK_CAPTURE") == 1
+              && count(cancellationEvents, "TASK_LINK") == 0
+              && count(cancellationEvents, "TASK_CANCEL") == 1,
+          "scheduled Netty cancellation did not release exactly one handoff: "
+              + cancellationEvents);
 
       releaseWorker.countDown();
       AtomicInteger reusedDescriptor = new AtomicInteger(-2);
@@ -143,27 +171,36 @@ public final class NettyRuntimeProbe {
           "cancelled Netty task leaked socket ownership to its event loop");
       eventLoop.shutdownGracefully(0, 1, TimeUnit.SECONDS).syncUninterruptibly();
       NamedTask rejected = new NamedTask("rejected", () -> {});
-      setSocketFileDescriptor(84);
+      int rejectionStart = eventCount();
       try {
-        eventLoop.execute(rejected);
+        rejectionConnection.runInHandlerScope(
+            () -> {
+              setSocketFileDescriptor(84, rejectionConnection.lifecycle);
+              eventLoop.execute(rejected);
+            });
         throw new AssertionError("terminated Netty event loop accepted a task");
       } catch (RejectedExecutionException expected) {
       } finally {
         clearSocketFileDescriptor();
       }
       awaitNoContext(rejected);
-
+      List<Event> rejectionEvents = snapshotSince(rejectionStart);
       require(
-          count(snapshotSince(0), "TASK_CANCEL") >= 2,
-          "Netty cancel/reject paths did not cancel handoffs: " + snapshotSince(0));
+          count(rejectionEvents, "TASK_CAPTURE") == 1
+              && count(rejectionEvents, "TASK_LINK") == 0
+              && count(rejectionEvents, "TASK_CANCEL") == 1,
+          "rejected Netty submission did not release exactly one handoff: " + rejectionEvents);
     } finally {
       releaseWorker.countDown();
+      cancellationConnection.close();
+      rejectionConnection.close();
       eventLoop.shutdownGracefully(0, 1, TimeUnit.SECONDS).syncUninterruptibly();
     }
   }
 
   private static void verifyScheduledTaskHandoff() throws Exception {
     DefaultEventExecutor eventLoop = new DefaultEventExecutor();
+    ExactNettyConnection exact = new ExactNettyConnection(82);
     CountDownLatch complete = new CountDownLatch(1);
     AtomicInteger claimedDescriptor = new AtomicInteger(-2);
     NamedTask scheduled =
@@ -177,8 +214,13 @@ public final class NettyRuntimeProbe {
     int start = eventCount();
 
     try {
-      setSocketFileDescriptor(82);
-      Future<?> future = eventLoop.schedule(scheduled, 0, TimeUnit.MILLISECONDS);
+      AtomicReference<Future<?>> futureReference = new AtomicReference<>();
+      exact.runInHandlerScope(
+          () -> {
+            setSocketFileDescriptor(82, exact.lifecycle);
+            futureReference.set(eventLoop.schedule(scheduled, 0, TimeUnit.MILLISECONDS));
+          });
+      Future<?> future = futureReference.get();
       require(complete.await(5, TimeUnit.SECONDS), "scheduled Netty handoff did not complete");
       require(claimedDescriptor.get() == 82, "scheduled Netty task lost socket ownership");
       future.syncUninterruptibly();
@@ -192,6 +234,7 @@ public final class NettyRuntimeProbe {
       require(allCapturesLinked(events), "scheduled Netty token was not linked: " + events);
     } finally {
       clearSocketFileDescriptor();
+      exact.close();
       eventLoop.shutdownGracefully(0, 1, TimeUnit.SECONDS).syncUninterruptibly();
     }
   }
@@ -213,11 +256,25 @@ public final class NettyRuntimeProbe {
     return storage.getMethod("taskContext", Object.class).invoke(null, task);
   }
 
-  private static void setSocketFileDescriptor(int socketFileDescriptor) {
-    invokeThreadInfo(
-        "setRemoteParentSocketFileDescriptor",
-        new Class<?>[] {int.class},
-        new Object[] {Integer.valueOf(socketFileDescriptor)});
+  private static void setSocketFileDescriptor(int socketFileDescriptor, Object lifecycle) {
+    Class<?> lifecycleClass = socketLifecycleClass();
+    Object staged =
+        invokeThreadInfo(
+            "setRemoteParentSocketFileDescriptor",
+            new Class<?>[] {int.class, lifecycleClass},
+            new Object[] {Integer.valueOf(socketFileDescriptor), lifecycle});
+    require(Boolean.TRUE.equals(staged), "failed to stage exact socket ownership");
+  }
+
+  private static Class<?> socketLifecycleClass() {
+    try {
+      return Class.forName(
+          "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext$Lifecycle",
+          true,
+          null);
+    } catch (ClassNotFoundException failure) {
+      throw new AssertionError(failure);
+    }
   }
 
   private static int socketFileDescriptor() {
@@ -300,6 +357,77 @@ public final class NettyRuntimeProbe {
   private static void require(boolean condition, String message) {
     if (!condition) {
       throw new AssertionError(message);
+    }
+  }
+
+  private static final class ExactNettyConnection implements AutoCloseable {
+    private final Class<?> storage;
+    private final Class<?> connectionClass;
+    private final Object channel = new Object();
+    private final Object connection;
+    private final Object lifecycle;
+
+    private ExactNettyConnection(int socketFileDescriptor) throws Exception {
+      storage =
+          Class.forName("io.opentelemetry.obi.java.instrumentations.data.SSLStorage", true, null);
+      connectionClass =
+          Class.forName("io.opentelemetry.obi.java.instrumentations.data.Connection", true, null);
+      connection =
+          connectionClass
+              .getConstructor(InetAddress.class, int.class, InetAddress.class, int.class, int.class)
+              .newInstance(
+                  InetAddress.getByName("127.0.0.1"),
+                  20_000 + socketFileDescriptor,
+                  InetAddress.getByName("127.0.0.2"),
+                  30_000 + socketFileDescriptor,
+                  socketFileDescriptor);
+      require(
+          storage
+                  .getMethod("associateConnectionWithChannel", Object.class, connectionClass)
+                  .invoke(null, channel, connection)
+              == connection,
+          "failed to register exact Netty connection");
+      lifecycle =
+          storage
+              .getMethod("remoteParentSocketLifecycle", connectionClass)
+              .invoke(null, connection);
+      require(lifecycle != null, "exact Netty lifecycle is unavailable");
+    }
+
+    private void runInHandlerScope(Runnable action) {
+      try {
+        storage
+            .getMethod("beginNettyHandlerScope", Object.class, boolean.class)
+            .invoke(null, null, Boolean.TRUE);
+        try {
+          require(
+              Boolean.TRUE.equals(
+                  storage
+                      .getMethod("setCurrentNettyConnection", Object.class)
+                      .invoke(null, connection)),
+              "failed to install exact Netty connection scope");
+          invokeThreadInfo(
+              "markRemoteParentDirectLookup",
+              new Class<?>[] {Object.class},
+              new Object[] {lifecycle});
+          action.run();
+        } finally {
+          storage.getMethod("endNettyHandlerScope").invoke(null);
+        }
+      } catch (ReflectiveOperationException failure) {
+        throw new AssertionError(failure);
+      }
+    }
+
+    @Override
+    public void close() {
+      try {
+        storage
+            .getMethod("cleanupConnection", Object.class, connectionClass)
+            .invoke(null, channel, connection);
+      } catch (ReflectiveOperationException failure) {
+        throw new AssertionError(failure);
+      }
     }
   }
 

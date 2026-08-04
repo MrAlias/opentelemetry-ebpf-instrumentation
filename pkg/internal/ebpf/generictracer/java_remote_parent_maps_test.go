@@ -207,6 +207,7 @@ func TestJavaRemoteParentExactLifecycleMapsDoNotEvict(t *testing.T) {
 		"java_remote_parent_generation_index",
 		"java_remote_parent_state",
 		"java_retired_processes",
+		"java_vt_threads",
 	} {
 		require.Equal(t, ebpf.Hash, spec.Maps[name].Type, name)
 	}

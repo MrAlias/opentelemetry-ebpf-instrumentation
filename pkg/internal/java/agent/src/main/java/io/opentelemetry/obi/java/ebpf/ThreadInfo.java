@@ -15,10 +15,23 @@ import java.util.function.LongSupplier;
 public class ThreadInfo {
   static final long NO_TASK_RELAY_CHANGE = -1L;
   static final int MAX_TASK_RELAY_DEPTH = 64;
+  private static final byte LOOKUP_DEFAULT = 0;
+  private static final byte LOOKUP_DIRECT = 1;
+  private static final byte LOOKUP_TASK = 2;
+  private static final byte LOOKUP_BLOCKED = 3;
+
+  public static final int REMOTE_PARENT_LOOKUP_DIRECT = 1;
+  public static final int REMOTE_PARENT_LOOKUP_TASK = 2;
+  public static final int REMOTE_PARENT_LOOKUP_BLOCKED = 3;
 
   private static final ThreadLocal<TaskRelayState> taskRelayState = new ThreadLocal<>();
   private static final ThreadLocal<RemoteParentSocketContext> remoteParentSocketContext =
       new ThreadLocal<>();
+  private static final ThreadLocal<Byte> remoteParentLookupOverride = new ThreadLocal<>();
+  private static final ThreadLocal<RemoteParentSocketContext.Lifecycle>
+      remoteParentLookupLifecycle = new ThreadLocal<>();
+  private static final ThreadLocal<Integer> remoteParentReceiveDepth = new ThreadLocal<>();
+  private static final ThreadLocal<Long> remoteParentReceiveEpoch = new ThreadLocal<>();
   private static final AtomicLong nextTaskToken = new AtomicLong(initialTaskToken());
   private static volatile LongSupplier processIncarnationSource = ThreadInfo::newProcessIncarnation;
   private static volatile long processIncarnation = initialProcessIncarnation();
@@ -43,13 +56,45 @@ public class ThreadInfo {
   }
 
   public static TaskContext captureTaskContext(long parentThreadId) {
-    if (!remoteParentEnabled) {
+    // Preserve binary compatibility for older instrumentations without letting an unscoped caller
+    // acquire a strict BPF generation alias.
+    return captureTaskContext(parentThreadId, null);
+  }
+
+  /**
+   * Captures a strict remote-parent handoff only for an exact active transport scope.
+   *
+   * <p>Tasks submitted outside the TLS handler keep ordinary parent-thread propagation without
+   * acquiring a BPF generation alias. Unix transport has no Java descriptor context, so an active
+   * lifecycle permits a capture attempt; BPF still requires a generation staged directly by the
+   * current receive. A descriptor context is copied only when it belongs to that same lifecycle.
+   */
+  public static TaskContext captureTaskContext(
+      long parentThreadId, RemoteParentSocketContext.Lifecycle lifecycle) {
+    if (!remoteParentEnabled
+        || lifecycle == null
+        || !lifecycle.active()
+        || !hasRemoteParentDirectReceiveAuthority()
+        || remoteParentLookupLifecycle.get() != lifecycle
+        || onVirtualThread()) {
       return new TaskContext(onVirtualThread() ? 0L : parentThreadId, 0L);
     }
 
+    RemoteParentSocketContext socketContext = remoteParentSocketContext.get();
+    if (socketContext != null && !socketContext.hasLifecycle(lifecycle)) {
+      // A descriptorless receive can be a Unix transport, but a present socket context is
+      // positive evidence about the BPF generation currently owned by this execution. Never let
+      // a different lifecycle authorize an alias of that generation.
+      return new TaskContext(parentThreadId, 0L);
+    }
+    if (socketContext != null && socketContext.peek() < 0) {
+      // The one-shot descriptor may already have been claimed while the exact lifecycle remains
+      // active. Further task aliases for that same generation are still valid.
+      socketContext = null;
+    }
     long token = newTaskToken();
     emitTaskContextOp(OperationType.TASK_CAPTURE, token, 0L);
-    return new TaskContext(parentThreadId, token, remoteParentSocketContext.get());
+    return new TaskContext(parentThreadId, token, socketContext, lifecycle);
   }
 
   public static void cancelTaskContext(TaskContext context) {
@@ -71,11 +116,25 @@ public class ThreadInfo {
 
   public static boolean enterTaskParentThreadContext(
       long threadId, long parentId, long handoffToken) {
-    return enterTaskParentThreadContext(threadId, parentId, handoffToken, null);
+    return enterTaskParentThreadContext(threadId, parentId, handoffToken, null, null);
   }
 
   public static boolean enterTaskParentThreadContext(
       long threadId, long parentId, long handoffToken, RemoteParentSocketContext socketContext) {
+    return enterTaskParentThreadContext(
+        threadId,
+        parentId,
+        handoffToken,
+        socketContext,
+        socketContext == null ? null : socketContext.lifecycle());
+  }
+
+  public static boolean enterTaskParentThreadContext(
+      long threadId,
+      long parentId,
+      long handoffToken,
+      RemoteParentSocketContext socketContext,
+      RemoteParentSocketContext.Lifecycle socketLifecycle) {
     if (onVirtualThread() && handoffToken == 0L) {
       rejectTaskEntry(handoffToken);
       return false;
@@ -86,12 +145,21 @@ public class ThreadInfo {
       rejectTaskEntry(handoffToken);
       return false;
     }
+    if (handoffToken != 0L
+        && (socketLifecycle != null && !socketLifecycle.active()
+            || socketContext != null
+                && socketLifecycle != null
+                && !socketContext.hasLifecycle(socketLifecycle))) {
+      rejectTaskEntry(handoffToken);
+      return false;
+    }
     if (!remoteParentEnabled && state == null) {
       try {
         cancelTaskHandoff(handoffToken);
         sendParentThreadContext(parentId);
       } finally {
         remoteParentSocketContext.remove();
+        blockRemoteParentLookup();
       }
       return false;
     }
@@ -106,10 +174,21 @@ public class ThreadInfo {
       taskRelayState.set(state);
     }
 
-    long restoreToken = state.isEmpty() ? 0L : captureRelayToken();
+    boolean exactTokenHandoff = handoffToken != 0L;
+    long restoreToken = state.isEmpty() || !state.currentExact() ? 0L : captureRelayToken();
+    byte previousLookupOverride = currentRemoteParentLookupOverride();
+    long previousReceiveEpoch = currentRemoteParentReceiveEpoch();
+    RemoteParentSocketContext.Lifecycle previousLookupLifecycle = remoteParentLookupLifecycle.get();
     long target =
         state.enter(
-            threadId, parentId, restoreToken, handoffToken != 0L, remoteParentSocketContext.get());
+            threadId,
+            parentId,
+            restoreToken,
+            exactTokenHandoff,
+            remoteParentSocketContext.get(),
+            previousLookupOverride,
+            previousReceiveEpoch,
+            previousLookupLifecycle);
     if (target == NO_TASK_RELAY_CHANGE) {
       failClosedTaskEntry(handoffToken, restoreToken);
       if (state.isEmpty()) {
@@ -118,13 +197,21 @@ public class ThreadInfo {
       return false;
     }
 
+    if (exactTokenHandoff) {
+      remoteParentLookupOverride.set(LOOKUP_TASK);
+      setRemoteParentLookupLifecycle(socketLifecycle);
+    } else {
+      blockRemoteParentLookup();
+    }
     try {
-      emitTaskContextOp(OperationType.TASK_LINK, target, handoffToken);
+      emitTaskParentContext(target, handoffToken, exactTokenHandoff);
       setRemoteParentSocketContext(socketContext);
       return true;
     } catch (Throwable failure) {
       remoteParentSocketContext.remove();
       state.exit();
+      blockRemoteParentLookup();
+      bestEffortUnlinkTask(failure);
       cancelTaskHandoff(handoffToken);
       cancelTaskHandoff(restoreToken);
       if (state.isEmpty()) {
@@ -143,16 +230,35 @@ public class ThreadInfo {
     long threadId = state.threadId();
     long target = state.exit();
     long restoreToken = state.exitToken();
+    boolean restoreExact = state.exitExact();
     RemoteParentSocketContext previousSocketContext = state.exitSocketContext();
+    byte previousLookupOverride = state.exitLookupOverride();
+    long previousReceiveEpoch = state.exitReceiveEpoch();
+    RemoteParentSocketContext.Lifecycle previousLookupLifecycle = state.exitLookupLifecycle();
     if (state.isEmpty()) {
       taskRelayState.remove();
     }
+    boolean restoreSucceeded = false;
     try {
       if (target != NO_TASK_RELAY_CHANGE) {
-        emitTaskContextOp(OperationType.TASK_LINK, target, restoreToken);
+        emitTaskParentContext(target, restoreToken, restoreExact);
       }
+      restoreSucceeded = true;
+    } catch (Throwable failure) {
+      bestEffortUnlinkTask(failure);
+      throw failure;
     } finally {
-      setRemoteParentSocketContext(previousSocketContext);
+      if (restoreSucceeded
+          && restoreRemoteParentLookup(
+              previousLookupOverride, previousReceiveEpoch, previousLookupLifecycle)) {
+        setRemoteParentSocketContext(previousSocketContext);
+      } else {
+        if (previousSocketContext != null) {
+          previousSocketContext.discard();
+        }
+        remoteParentSocketContext.remove();
+        blockRemoteParentLookup();
+      }
     }
   }
 
@@ -209,6 +315,89 @@ public class ThreadInfo {
     remoteParentSocketContext.remove();
   }
 
+  /** Marks a successful receive as the direct authority for the current execution scope. */
+  public static void markRemoteParentDirectLookup() {
+    markRemoteParentDirectLookup(null);
+  }
+
+  /** Marks a successful receive and retains its physical lifecycle as a revocation fence. */
+  public static void markRemoteParentDirectLookup(Object lifecycle) {
+    if (lifecycle instanceof RemoteParentSocketContext.Lifecycle) {
+      RemoteParentSocketContext.Lifecycle exact = (RemoteParentSocketContext.Lifecycle) lifecycle;
+      if (!exact.active()) {
+        blockRemoteParentLookup();
+        return;
+      }
+      remoteParentLookupLifecycle.set(exact);
+    } else {
+      remoteParentLookupLifecycle.remove();
+    }
+    remoteParentLookupOverride.set(LOOKUP_DIRECT);
+  }
+
+  /** Returns positive evidence that this execution completed the current inbound receive. */
+  public static boolean hasRemoteParentDirectReceiveAuthority() {
+    return currentRemoteParentLookupOverride() == LOOKUP_DIRECT;
+  }
+
+  /** Prevents an uncertain receive from falling back to either a task or a direct owner. */
+  public static void blockRemoteParentLookup() {
+    remoteParentLookupOverride.set(LOOKUP_BLOCKED);
+    remoteParentLookupLifecycle.remove();
+  }
+
+  /** Returns the most recent positively established execution source, or fail-closed BLOCKED. */
+  public static int remoteParentLookupSource() {
+    byte lookupOverride = currentRemoteParentLookupOverride();
+    if (lookupOverride == LOOKUP_BLOCKED) {
+      return REMOTE_PARENT_LOOKUP_BLOCKED;
+    }
+    if (lookupOverride == LOOKUP_TASK) {
+      TaskRelayState state = taskRelayState.get();
+      return state != null && state.currentExact()
+          ? REMOTE_PARENT_LOOKUP_TASK
+          : REMOTE_PARENT_LOOKUP_BLOCKED;
+    }
+    return REMOTE_PARENT_LOOKUP_DIRECT;
+  }
+
+  /** Resets the ambient source override during process/test cleanup. */
+  public static void clearRemoteParentLookupSource() {
+    remoteParentLookupOverride.remove();
+    remoteParentLookupLifecycle.remove();
+  }
+
+  /** Returns the lifecycle that must remain live for a direct or task lookup. */
+  public static RemoteParentSocketContext.Lifecycle remoteParentLookupLifecycle() {
+    return remoteParentLookupLifecycle.get();
+  }
+
+  /** Begins a receive attempt that may not have an explicit surrounding unwrap scope. */
+  public static void beginRemoteParentReceiveAttempt() {
+    if (remoteParentReceiveDepth.get() == null) {
+      advanceRemoteParentReceiveEpoch();
+    }
+    blockRemoteParentLookup();
+  }
+
+  /** Enters an inbound TLS boundary that must never fall back to a task alias. */
+  public static void beginRemoteParentReceiveScope() {
+    Integer depth = remoteParentReceiveDepth.get();
+    advanceRemoteParentReceiveEpoch();
+    blockRemoteParentLookup();
+    remoteParentReceiveDepth.set(depth == null ? 1 : depth + 1);
+  }
+
+  /** Balances {@link #beginRemoteParentReceiveScope()} on every exit path. */
+  public static void endRemoteParentReceiveScope() {
+    Integer depth = remoteParentReceiveDepth.get();
+    if (depth == null || depth <= 1) {
+      remoteParentReceiveDepth.remove();
+    } else {
+      remoteParentReceiveDepth.set(depth - 1);
+    }
+  }
+
   /**
    * Invalidates the shared lifecycle for a terminal receive path.
    *
@@ -216,6 +405,8 @@ public class ThreadInfo {
    * queued task aliases as well as the current thread.
    */
   public static void invalidateRemoteParentSocketFileDescriptor(Object lifecycle) {
+    advanceRemoteParentReceiveEpoch();
+    blockRemoteParentLookup();
     if (lifecycle instanceof RemoteParentSocketContext.Lifecycle) {
       ((RemoteParentSocketContext.Lifecycle) lifecycle).invalidate();
       RemoteParentSocketContext current = remoteParentSocketContext.get();
@@ -354,6 +545,7 @@ public class ThreadInfo {
       emitTaskContextOp(OperationType.TASK_UNLINK, 0L, 0L);
     } finally {
       remoteParentSocketContext.remove();
+      blockRemoteParentLookup();
       cancelTaskHandoff(handoffToken);
       cancelTaskHandoff(restoreToken);
     }
@@ -364,6 +556,58 @@ public class ThreadInfo {
       cancelTaskHandoff(handoffToken);
     } finally {
       remoteParentSocketContext.remove();
+      blockRemoteParentLookup();
+    }
+  }
+
+  private static byte currentRemoteParentLookupOverride() {
+    Byte lookupOverride = remoteParentLookupOverride.get();
+    return lookupOverride == null ? LOOKUP_DEFAULT : lookupOverride;
+  }
+
+  private static long currentRemoteParentReceiveEpoch() {
+    Long epoch = remoteParentReceiveEpoch.get();
+    return epoch == null ? 0L : epoch;
+  }
+
+  private static void advanceRemoteParentReceiveEpoch() {
+    long next = currentRemoteParentReceiveEpoch() + 1L;
+    remoteParentReceiveEpoch.set(next == 0L ? 1L : next);
+  }
+
+  private static boolean restoreRemoteParentLookup(
+      byte lookupOverride, long receiveEpoch, RemoteParentSocketContext.Lifecycle lookupLifecycle) {
+    if (currentRemoteParentReceiveEpoch() != receiveEpoch) {
+      blockRemoteParentLookup();
+      return false;
+    } else if (lookupLifecycle != null && !lookupLifecycle.active()) {
+      blockRemoteParentLookup();
+      return false;
+    } else if (lookupOverride == LOOKUP_DIRECT
+        || lookupOverride == LOOKUP_TASK
+        || lookupOverride == LOOKUP_BLOCKED) {
+      remoteParentLookupOverride.set(lookupOverride);
+    } else {
+      remoteParentLookupOverride.remove();
+    }
+    setRemoteParentLookupLifecycle(lookupLifecycle);
+    return true;
+  }
+
+  private static void setRemoteParentLookupLifecycle(
+      RemoteParentSocketContext.Lifecycle lifecycle) {
+    if (lifecycle == null) {
+      remoteParentLookupLifecycle.remove();
+    } else {
+      remoteParentLookupLifecycle.set(lifecycle);
+    }
+  }
+
+  private static void bestEffortUnlinkTask(Throwable failure) {
+    try {
+      emitTaskContextOp(OperationType.TASK_UNLINK, 0L, 0L);
+    } catch (Throwable unlinkFailure) {
+      failure.addSuppressed(unlinkFailure);
     }
   }
 
@@ -384,6 +628,14 @@ public class ThreadInfo {
     BootstrapNative.emitTaskContextOp(operation.code, value, token);
   }
 
+  private static void emitTaskParentContext(long parentId, long token, boolean exactTokenHandoff) {
+    if (exactTokenHandoff) {
+      emitTaskContextOp(OperationType.TASK_LINK, parentId, token);
+    } else {
+      sendParentThreadContext(parentId);
+    }
+  }
+
   private static void emitVirtualThreadOp(OperationType operation, long value) {
     TaskContextEmitter testEmitter = taskContextEmitterForTest;
     if (testEmitter != null) {
@@ -398,13 +650,31 @@ public class ThreadInfo {
     private long currentParent;
     private long[] previousParents = new long[4];
     private long[] previousTokens = new long[4];
+    private boolean[] previousExact = new boolean[4];
+    private byte[] previousLookupOverrides = new byte[4];
+    private long[] previousReceiveEpochs = new long[4];
+    private RemoteParentSocketContext.Lifecycle[] previousLookupLifecycles =
+        new RemoteParentSocketContext.Lifecycle[4];
     private RemoteParentSocketContext[] previousSocketContexts = new RemoteParentSocketContext[4];
     private long exitToken;
+    private boolean currentExact;
+    private boolean exitExact;
+    private byte exitLookupOverride;
+    private long exitReceiveEpoch;
+    private RemoteParentSocketContext.Lifecycle exitLookupLifecycle;
     private RemoteParentSocketContext exitSocketContext;
     private int depth;
 
     long enter(long currentThreadId, long parentId, long restoreToken, boolean exactTokenHandoff) {
-      return enter(currentThreadId, parentId, restoreToken, exactTokenHandoff, null);
+      return enter(
+          currentThreadId,
+          parentId,
+          restoreToken,
+          exactTokenHandoff,
+          null,
+          LOOKUP_DEFAULT,
+          0L,
+          null);
     }
 
     long enter(
@@ -412,7 +682,10 @@ public class ThreadInfo {
         long parentId,
         long restoreToken,
         boolean exactTokenHandoff,
-        RemoteParentSocketContext previousSocketContext) {
+        RemoteParentSocketContext previousSocketContext,
+        byte previousLookupOverride,
+        long previousReceiveEpoch,
+        RemoteParentSocketContext.Lifecycle previousLookupLifecycle) {
       if (parentId <= 0
           || depth >= MAX_TASK_RELAY_DEPTH
           || (!exactTokenHandoff && hasParent(parentId))) {
@@ -429,6 +702,26 @@ public class ThreadInfo {
         long[] expandedTokens = new long[previousTokens.length * 2];
         System.arraycopy(previousTokens, 0, expandedTokens, 0, previousTokens.length);
         previousTokens = expandedTokens;
+        boolean[] expandedExact = new boolean[previousExact.length * 2];
+        System.arraycopy(previousExact, 0, expandedExact, 0, previousExact.length);
+        previousExact = expandedExact;
+        byte[] expandedLookupOverrides = new byte[previousLookupOverrides.length * 2];
+        System.arraycopy(
+            previousLookupOverrides, 0, expandedLookupOverrides, 0, previousLookupOverrides.length);
+        previousLookupOverrides = expandedLookupOverrides;
+        long[] expandedReceiveEpochs = new long[previousReceiveEpochs.length * 2];
+        System.arraycopy(
+            previousReceiveEpochs, 0, expandedReceiveEpochs, 0, previousReceiveEpochs.length);
+        previousReceiveEpochs = expandedReceiveEpochs;
+        RemoteParentSocketContext.Lifecycle[] expandedLookupLifecycles =
+            new RemoteParentSocketContext.Lifecycle[previousLookupLifecycles.length * 2];
+        System.arraycopy(
+            previousLookupLifecycles,
+            0,
+            expandedLookupLifecycles,
+            0,
+            previousLookupLifecycles.length);
+        previousLookupLifecycles = expandedLookupLifecycles;
         RemoteParentSocketContext[] expandedSocketContexts =
             new RemoteParentSocketContext[previousSocketContexts.length * 2];
         System.arraycopy(
@@ -437,9 +730,14 @@ public class ThreadInfo {
       }
       previousParents[depth] = currentParent;
       previousTokens[depth] = restoreToken;
+      previousExact[depth] = currentExact;
+      previousLookupOverrides[depth] = previousLookupOverride;
+      previousReceiveEpochs[depth] = previousReceiveEpoch;
+      previousLookupLifecycles[depth] = previousLookupLifecycle;
       previousSocketContexts[depth] = previousSocketContext;
       depth++;
       currentParent = parentId;
+      currentExact = exactTokenHandoff;
       return parentId;
     }
 
@@ -450,11 +748,20 @@ public class ThreadInfo {
 
       long previous = previousParents[--depth];
       exitToken = previousTokens[depth];
+      exitExact = previousExact[depth];
+      exitLookupOverride = previousLookupOverrides[depth];
+      exitReceiveEpoch = previousReceiveEpochs[depth];
+      exitLookupLifecycle = previousLookupLifecycles[depth];
       exitSocketContext = previousSocketContexts[depth];
       previousParents[depth] = 0L;
       previousTokens[depth] = 0L;
+      previousExact[depth] = false;
+      previousLookupOverrides[depth] = LOOKUP_DEFAULT;
+      previousReceiveEpochs[depth] = 0L;
+      previousLookupLifecycles[depth] = null;
       previousSocketContexts[depth] = null;
       currentParent = previous;
+      currentExact = exitExact;
       return previous == 0 ? threadId : previous;
     }
 
@@ -464,6 +771,10 @@ public class ThreadInfo {
 
     boolean requiresReset() {
       return depth > 1;
+    }
+
+    boolean currentExact() {
+      return currentExact;
     }
 
     long threadId() {
@@ -484,6 +795,22 @@ public class ThreadInfo {
 
     long exitToken() {
       return exitToken;
+    }
+
+    boolean exitExact() {
+      return exitExact;
+    }
+
+    byte exitLookupOverride() {
+      return exitLookupOverride;
+    }
+
+    long exitReceiveEpoch() {
+      return exitReceiveEpoch;
+    }
+
+    RemoteParentSocketContext.Lifecycle exitLookupLifecycle() {
+      return exitLookupLifecycle;
     }
 
     RemoteParentSocketContext exitSocketContext() {

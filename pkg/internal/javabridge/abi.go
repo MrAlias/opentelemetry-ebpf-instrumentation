@@ -10,18 +10,20 @@ import (
 )
 
 const (
-	Version         = uint16(1)
-	RequestVersion  = uint16(2)
-	RecordSize      = uint16(64)
-	RequestSize     = uint16(24)
-	TraceIDSize     = 16
-	SpanIDSize      = 8
-	SocketLevel     = 0x4f42
-	SocketTake      = 0x4a01
-	SocketDiscard   = 0x4a02
-	SocketNegotiate = 0x4a03
-	SocketDataAck   = 0x4a04
-	SocketHealth    = 0x4a05
+	Version           = uint16(1)
+	RequestVersion    = uint16(3)
+	RecordSize        = uint16(64)
+	RequestSize       = uint16(24)
+	TraceIDSize       = 16
+	SpanIDSize        = 8
+	SocketLevel       = 0x4f42
+	SocketTake        = 0x4a01
+	SocketDiscard     = 0x4a02
+	SocketNegotiate   = 0x4a03
+	SocketDataAck     = 0x4a04
+	SocketHealth      = 0x4a05
+	SocketTaskTake    = 0x4a06
+	SocketTaskDiscard = 0x4a07
 )
 
 func (o Operation) String() string {
@@ -103,6 +105,13 @@ const (
 	OperationNegotiate
 )
 
+type LookupSource uint8
+
+const (
+	LookupSourceDirect LookupSource = iota + 1
+	LookupSourceTask
+)
+
 type Record struct {
 	Status              Status
 	Flags               byte
@@ -181,6 +190,7 @@ func (r Record) IsValidRemoteParent() bool {
 
 type Request struct {
 	Operation          Operation
+	Source             LookupSource
 	NamespaceTID       uint32
 	ProcessIncarnation uint64
 }
@@ -189,12 +199,20 @@ func (r Request) MarshalBinary() ([]byte, error) {
 	if r.Operation < OperationTake || r.Operation > OperationNegotiate {
 		return nil, fmt.Errorf("unknown Java bridge operation %d", r.Operation)
 	}
+	lookupSource := r.Source
+	if lookupSource == 0 {
+		lookupSource = LookupSourceDirect
+	}
+	if lookupSource < LookupSourceDirect || lookupSource > LookupSourceTask {
+		return nil, fmt.Errorf("unknown Java bridge lookup source %d", lookupSource)
+	}
 
 	buf := make([]byte, RequestSize)
 	copy(buf[0:4], requestMagic[:])
 	binary.LittleEndian.PutUint16(buf[4:6], RequestVersion)
 	binary.LittleEndian.PutUint16(buf[6:8], RequestSize)
 	buf[8] = byte(r.Operation)
+	buf[9] = byte(lookupSource)
 	binary.LittleEndian.PutUint32(buf[12:16], r.NamespaceTID)
 	binary.LittleEndian.PutUint64(buf[16:24], r.ProcessIncarnation)
 
@@ -214,7 +232,7 @@ func UnmarshalRequest(buf []byte) (Request, error) {
 	if size := binary.LittleEndian.Uint16(buf[6:8]); size != RequestSize {
 		return Request{}, fmt.Errorf("invalid Java bridge request record size %d", size)
 	}
-	if !allZero(buf[9:12]) {
+	if !allZero(buf[10:12]) {
 		return Request{}, errors.New("java bridge request has nonzero reserved bytes")
 	}
 
@@ -222,9 +240,14 @@ func UnmarshalRequest(buf []byte) (Request, error) {
 	if operation < OperationTake || operation > OperationNegotiate {
 		return Request{}, fmt.Errorf("unknown Java bridge operation %d", operation)
 	}
+	lookupSource := LookupSource(buf[9])
+	if lookupSource < LookupSourceDirect || lookupSource > LookupSourceTask {
+		return Request{}, fmt.Errorf("unknown Java bridge lookup source %d", lookupSource)
+	}
 
 	return Request{
 		Operation:          operation,
+		Source:             lookupSource,
 		NamespaceTID:       binary.LittleEndian.Uint32(buf[12:16]),
 		ProcessIncarnation: binary.LittleEndian.Uint64(buf[16:24]),
 	}, nil

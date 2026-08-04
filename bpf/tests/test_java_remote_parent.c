@@ -659,6 +659,29 @@ static void test_registered_process_reserves_incoming_claim_for_lifecycle(void) 
     }
 }
 
+static void test_socket_options_route_explicit_sources_and_operations(void) {
+    if (!java_remote_parent_socket_option_is_retrieval(k_java_remote_parent_socket_take) ||
+        !java_remote_parent_socket_option_is_retrieval(k_java_remote_parent_socket_discard) ||
+        !java_remote_parent_socket_option_is_retrieval(k_java_remote_parent_socket_task_take) ||
+        !java_remote_parent_socket_option_is_retrieval(k_java_remote_parent_socket_task_discard) ||
+        java_remote_parent_socket_option_is_retrieval(k_java_remote_parent_socket_health) ||
+        java_remote_parent_socket_option_is_discard(k_java_remote_parent_socket_take) ||
+        !java_remote_parent_socket_option_is_discard(k_java_remote_parent_socket_discard) ||
+        java_remote_parent_socket_option_is_discard(k_java_remote_parent_socket_task_take) ||
+        !java_remote_parent_socket_option_is_discard(k_java_remote_parent_socket_task_discard) ||
+        java_remote_parent_socket_option_source(k_java_remote_parent_socket_take) !=
+            k_java_remote_parent_source_direct ||
+        java_remote_parent_socket_option_source(k_java_remote_parent_socket_discard) !=
+            k_java_remote_parent_source_direct ||
+        java_remote_parent_socket_option_source(k_java_remote_parent_socket_task_take) !=
+            k_java_remote_parent_source_task ||
+        java_remote_parent_socket_option_source(k_java_remote_parent_socket_task_discard) !=
+            k_java_remote_parent_source_task) {
+        fprintf(stderr, "remote-parent socket option routing failed\n");
+        exit(1);
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "usage: %s CORPUS\n", argv[0]);
@@ -671,5 +694,6 @@ int main(int argc, char **argv) {
     test_fallback_collision_does_not_overwrite();
     test_observation_age_fails_closed();
     test_registered_process_reserves_incoming_claim_for_lifecycle();
+    test_socket_options_route_explicit_sources_and_operations();
     return 0;
 }

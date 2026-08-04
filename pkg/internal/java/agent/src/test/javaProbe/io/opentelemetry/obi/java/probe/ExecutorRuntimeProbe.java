@@ -88,16 +88,24 @@ public final class ExecutorRuntimeProbe {
       setSocketFileDescriptor(71);
       first.execute(tasks[0]);
       require(complete.await(5, TimeUnit.SECONDS), "nested executor chain did not complete");
-      require(claimedDescriptor.get() == 71, "nested executor lost accepted socket ownership");
+      require(
+          claimedDescriptor.get() == -1,
+          "ordinary nested executor acquired unauthorized socket ownership");
+      require(
+          socketFileDescriptor() == 71,
+          "ordinary nested executor consumed the submitter socket ownership");
       awaitNoContext(tasks[0]);
       awaitNoContext(tasks[1]);
       awaitNoContext(tasks[2]);
-      awaitOperationCount(start, "TASK_LINK", 6);
+      awaitOperationCount(start, "THREAD", 6);
 
       List<Event> events = snapshotSince(start);
-      require(count(events, "TASK_CAPTURE") == 3, "nested captures were not exact: " + events);
-      require(count(events, "TASK_LINK") >= 6, "nested links were not restored: " + events);
-      require(hasLinkedCapture(events), "nested handoff tokens were not linked: " + events);
+      require(
+          count(events, "TASK_CAPTURE") == 0
+              && count(events, "TASK_LINK") == 0
+              && count(events, "TASK_CANCEL") == 0,
+          "ordinary nested executor emitted a strict bridge operation: " + events);
+      require(count(events, "THREAD") >= 6, "ordinary parents were not restored: " + events);
 
       CountDownLatch secondComplete = new CountDownLatch(1);
       AtomicInteger secondDescriptor = new AtomicInteger(-2);
@@ -112,7 +120,12 @@ public final class ExecutorRuntimeProbe {
       setSocketFileDescriptor(72);
       first.execute(firstHop);
       require(secondComplete.await(5, TimeUnit.SECONDS), "second executor chain did not complete");
-      require(secondDescriptor.get() == 72, "fresh socket ownership was not propagated");
+      require(
+          secondDescriptor.get() == -1,
+          "fresh ordinary executor chain acquired unauthorized socket ownership");
+      require(
+          socketFileDescriptor() == 72,
+          "fresh ordinary executor chain consumed the submitter socket ownership");
 
       CountDownLatch reuseComplete = new CountDownLatch(2);
       AtomicInteger leakedDescriptors = new AtomicInteger();
@@ -136,6 +149,12 @@ public final class ExecutorRuntimeProbe {
               }));
       require(reuseComplete.await(5, TimeUnit.SECONDS), "worker reuse probes did not complete");
       require(leakedDescriptors.get() == 0, "executor worker reused accepted socket ownership");
+      List<Event> allEvents = snapshotSince(start);
+      require(
+          count(allEvents, "TASK_CAPTURE") == 0
+              && count(allEvents, "TASK_LINK") == 0
+              && count(allEvents, "TASK_CANCEL") == 0,
+          "generic executor path emitted a strict bridge operation: " + allEvents);
     } finally {
       clearSocketFileDescriptor();
       shutdown(first);
@@ -202,9 +221,15 @@ public final class ExecutorRuntimeProbe {
     require(reuseComplete.await(5, TimeUnit.SECONDS), "post-cancellation probe did not complete");
     require(reusedDescriptor.get() == -1, "cancelled task leaked socket ownership to its worker");
     shutdown(executor);
+    List<Event> events = snapshotSince(start);
     require(
-        count(snapshotSince(start), "TASK_CANCEL") >= 3,
-        "cancel, timeout, and rejection did not cancel every handoff: " + snapshotSince(start));
+        count(events, "TASK_CAPTURE") == 0
+            && count(events, "TASK_LINK") == 0
+            && count(events, "TASK_CANCEL") == 0,
+        "ordinary cancel, timeout, or rejection emitted a strict bridge operation: " + events);
+    require(
+        count(events, "THREAD") >= 2,
+        "executed ordinary task did not restore its parent: " + events);
   }
 
   private static void awaitNoContext(Object task) throws Exception {
@@ -303,20 +328,6 @@ public final class ExecutorRuntimeProbe {
       }
     }
     return count;
-  }
-
-  private static boolean hasLinkedCapture(List<Event> events) {
-    for (Event capture : events) {
-      if (!"TASK_CAPTURE".equals(capture.operation) || capture.value == 0L) {
-        continue;
-      }
-      for (Event link : events) {
-        if ("TASK_LINK".equals(link.operation) && link.token == capture.value) {
-          return true;
-        }
-      }
-    }
-    return false;
   }
 
   private static void require(boolean condition, String message) {

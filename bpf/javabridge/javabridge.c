@@ -42,8 +42,7 @@ struct {
 
 static __always_inline u8 java_remote_parent_is_retrieval_option(const struct bpf_sockopt *ctx) {
     return ctx->level == k_java_remote_parent_socket_level &&
-           (ctx->optname == k_java_remote_parent_socket_take ||
-            ctx->optname == k_java_remote_parent_socket_discard);
+           java_remote_parent_socket_option_is_retrieval(ctx->optname);
 }
 
 static __always_inline u8 java_remote_parent_is_negotiate_option(const struct bpf_sockopt *ctx) {
@@ -279,7 +278,9 @@ int obi_java_remote_parent_getsockopt(struct bpf_sockopt *ctx) {
         return 1;
     }
 
-    const u8 discard = ctx->optname == k_java_remote_parent_socket_discard;
+    const u8 discard = java_remote_parent_socket_option_is_discard(ctx->optname);
+    const enum java_remote_parent_source source =
+        java_remote_parent_socket_option_source(ctx->optname);
     if (!ctx->sk) {
         return 1;
     }
@@ -343,6 +344,7 @@ int obi_java_remote_parent_getsockopt(struct bpf_sockopt *ctx) {
     java_remote_parent_retrieve_for_connection(&response,
                                                discard,
                                                java_remote_parent_max_age_ns,
+                                               source,
                                                &copy.connection,
                                                copy.connection_netns,
                                                copy.generation,

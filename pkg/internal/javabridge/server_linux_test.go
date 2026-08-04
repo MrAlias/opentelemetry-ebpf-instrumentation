@@ -118,6 +118,7 @@ type recordingHandler struct {
 	calls       atomic.Int32
 	identity    Identity
 	operation   Operation
+	source      LookupSource
 	incarnation uint64
 	record      Record
 }
@@ -139,13 +140,18 @@ type observedOutcome struct {
 }
 
 func (h *recordingHandler) HandleAuthenticated(
-	_ context.Context, identity Identity, operation Operation, incarnation uint64,
+	_ context.Context,
+	identity Identity,
+	operation Operation,
+	source LookupSource,
+	incarnation uint64,
 ) Record {
 	h.calls.Add(1)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.identity = identity
 	h.operation = operation
+	h.source = source
 	h.incarnation = incarnation
 	return h.record
 }
@@ -172,6 +178,7 @@ func TestFallbackServerAuthenticatesAndHandlesRequest(t *testing.T) {
 
 	request, err := (Request{
 		Operation:          OperationTake,
+		Source:             LookupSourceTask,
 		NamespaceTID:       7,
 		ProcessIncarnation: 11,
 	}).MarshalBinary()
@@ -183,6 +190,7 @@ func TestFallbackServerAuthenticatesAndHandlesRequest(t *testing.T) {
 	defer handler.mu.Unlock()
 	assert.Equal(t, identity, handler.identity)
 	assert.Equal(t, OperationTake, handler.operation)
+	assert.Equal(t, LookupSourceTask, handler.source)
 	assert.Equal(t, uint64(11), handler.incarnation)
 }
 
@@ -390,6 +398,11 @@ func TestFallbackServerRejectsInvalidRequestFields(t *testing.T) {
 			status: StatusMalformed,
 		},
 		{
+			name:   "missing lookup source",
+			mutate: func(request []byte) { request[9] = 0 },
+			status: StatusMalformed,
+		},
+		{
 			name: "declared size",
 			mutate: func(request []byte) {
 				binary.LittleEndian.PutUint16(request[6:8], RequestSize+1)
@@ -515,7 +528,7 @@ func TestFallbackServerReportsRequestVersionMismatch(t *testing.T) {
 
 	request, err := (Request{Operation: OperationTake, NamespaceTID: 7}).MarshalBinary()
 	require.NoError(t, err)
-	request[4] = 3
+	request[4] = 4
 	response := fallbackRoundTrip(t, socketPath, request)
 	assert.Equal(t, StatusVersionMismatch, response.Status)
 }

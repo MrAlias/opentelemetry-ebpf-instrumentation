@@ -9,6 +9,7 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.net.InetAddress;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -65,6 +66,7 @@ public final class VirtualThreadRuntimeProbe {
 
   private static void verifyPublicStartMigrationAndCarrierReuse() throws Exception {
     AlternatingExecutor scheduler = new AlternatingExecutor();
+    ExactNettyConnection exact = new ExactNettyConnection(91);
     try {
       int start = EVENTS.size();
       CountDownLatch parked = new CountDownLatch(1);
@@ -93,8 +95,8 @@ public final class VirtualThreadRuntimeProbe {
                 }
               });
       virtualThreadReference.set(virtualThread);
-      setSocketFileDescriptor(91);
-      virtualThread.start();
+      setSocketFileDescriptor(91, exact.lifecycle);
+      exact.runInHandlerScope(virtualThread::start);
       require(parked.await(5, TimeUnit.SECONDS), "virtual thread did not reach park");
       awaitOperationSince(start, "VT_UNMOUNT");
       LockSupport.unpark(virtualThreadReference.get());
@@ -137,16 +139,18 @@ public final class VirtualThreadRuntimeProbe {
       require(reusedDescriptor.get() == -1, "reused carrier exposed prior socket ownership");
       List<Event> reuseEvents = snapshotSince(reuseStart);
       require(
-          count(reuseEvents, "TASK_CAPTURE") == 1,
-          "carrier reuse start was not captured once: " + reuseEvents);
+          count(reuseEvents, "TASK_CAPTURE") == 0,
+          "ordinary carrier reuse acquired a strict alias: " + reuseEvents);
       require(
           count(reuseEvents, "VT_TERMINATE") == 1,
           "carrier reuse termination missing: " + reuseEvents);
       require(
-          hasExactTaskLink(reuseEvents), "carrier reuse handoff token mismatch: " + reuseEvents);
+          count(reuseEvents, "TASK_LINK") == 0,
+          "ordinary carrier reuse emitted a strict link: " + reuseEvents);
       require(taskContext(reuse) == null, "reused carrier retained task context");
     } finally {
       clearSocketFileDescriptor();
+      exact.close();
       scheduler.close();
     }
   }
@@ -155,16 +159,18 @@ public final class VirtualThreadRuntimeProbe {
     int start = EVENTS.size();
     AtomicReference<Thread> child = new AtomicReference<>();
     AtomicInteger claimedDescriptor = new AtomicInteger(-2);
-    setSocketFileDescriptor(92);
-    try (StructuredTaskScope.ShutdownOnFailure scope =
-        new StructuredTaskScope.ShutdownOnFailure()) {
-      scope.fork(
-          () -> {
-            child.set(Thread.currentThread());
-            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(10));
-            claimedDescriptor.set(takeSocketFileDescriptor());
-            return null;
-          });
+    try (ExactNettyConnection exact = new ExactNettyConnection(92);
+        StructuredTaskScope.ShutdownOnFailure scope = new StructuredTaskScope.ShutdownOnFailure()) {
+      setSocketFileDescriptor(92, exact.lifecycle);
+      exact.runInHandlerScope(
+          () ->
+              scope.fork(
+                  () -> {
+                    child.set(Thread.currentThread());
+                    LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(10));
+                    claimedDescriptor.set(takeSocketFileDescriptor());
+                    return null;
+                  }));
       scope.join().throwIfFailed();
     }
 
@@ -189,6 +195,8 @@ public final class VirtualThreadRuntimeProbe {
   private static void verifyCancellationAndMixedPlatformHandoff() throws Exception {
     AlternatingExecutor scheduler = new AlternatingExecutor();
     ExecutorService platformExecutor = Executors.newSingleThreadExecutor();
+    ExactNettyConnection cancellationConnection = new ExactNettyConnection(93);
+    ExactNettyConnection mixedConnection = new ExactNettyConnection(94);
     try {
       int cancellationStart = EVENTS.size();
       CountDownLatch parked = new CountDownLatch(1);
@@ -200,8 +208,8 @@ public final class VirtualThreadRuntimeProbe {
                 parked.countDown();
                 LockSupport.park();
               });
-      setSocketFileDescriptor(93);
-      cancelled.start();
+      setSocketFileDescriptor(93, cancellationConnection.lifecycle);
+      cancellationConnection.runInHandlerScope(cancelled::start);
       clearSocketFileDescriptor();
       require(parked.await(5, TimeUnit.SECONDS), "cancelled virtual thread did not reach park");
       awaitOperationSince(cancellationStart, "VT_UNMOUNT");
@@ -237,6 +245,7 @@ public final class VirtualThreadRuntimeProbe {
       int mixedStart = EVENTS.size();
       AtomicReference<FutureTask<Void>> platformTask = new AtomicReference<>();
       AtomicInteger platformDescriptor = new AtomicInteger(-2);
+      AtomicInteger platformSubmissionStart = new AtomicInteger(-1);
       Thread mixed =
           newVirtualThread(
               scheduler,
@@ -246,6 +255,7 @@ public final class VirtualThreadRuntimeProbe {
                     new FutureTask<>(
                         () -> platformDescriptor.set(takeSocketFileDescriptor()), null);
                 platformTask.set(task);
+                platformSubmissionStart.set(EVENTS.size());
                 platformExecutor.execute(task);
                 try {
                   task.get(5, TimeUnit.SECONDS);
@@ -253,24 +263,37 @@ public final class VirtualThreadRuntimeProbe {
                   throw new AssertionError(failure);
                 }
               });
-      setSocketFileDescriptor(94);
-      mixed.start();
+      setSocketFileDescriptor(94, mixedConnection.lifecycle);
+      mixedConnection.runInHandlerScope(mixed::start);
       mixed.join(TimeUnit.SECONDS.toMillis(5));
       require(!mixed.isAlive(), "mixed platform/virtual handoff did not terminate");
       require(
-          platformDescriptor.get() == 94,
-          "virtual-to-platform handoff lost accepted socket ownership");
+          platformDescriptor.get() == -1,
+          "virtual-to-platform task acquired unauthorized socket ownership");
+      require(
+          socketFileDescriptor() == 94,
+          "unauthorized platform lookup consumed the exact submitter ownership");
 
       List<Event> mixedEvents = snapshotSince(mixedStart);
       require(
-          count(mixedEvents, "TASK_CAPTURE") >= 2,
-          "mixed platform/virtual captures were missing: " + mixedEvents);
+          count(mixedEvents, "TASK_CAPTURE") == 1,
+          "mixed virtual start was not the only strict capture: " + mixedEvents);
       require(
-          allCapturesLinked(mixedEvents), "a mixed handoff token was not linked: " + mixedEvents);
+          hasExactTaskLink(mixedEvents),
+          "mixed virtual start handoff was not linked: " + mixedEvents);
+      require(platformSubmissionStart.get() >= 0, "platform submission event boundary was missing");
+      List<Event> platformEvents = snapshotSince(platformSubmissionStart.get());
+      require(
+          count(platformEvents, "TASK_CAPTURE") == 0
+              && count(platformEvents, "TASK_LINK") == 0
+              && count(platformEvents, "TASK_CANCEL") == 0,
+          "virtual-to-platform task emitted a strict bridge operation: " + platformEvents);
       require(taskContext(mixed) == null, "mixed virtual thread retained task context");
       require(taskContext(platformTask.get()) == null, "mixed platform task retained context");
     } finally {
       clearSocketFileDescriptor();
+      cancellationConnection.close();
+      mixedConnection.close();
       platformExecutor.shutdownNow();
       require(
           platformExecutor.awaitTermination(5, TimeUnit.SECONDS),
@@ -286,25 +309,32 @@ public final class VirtualThreadRuntimeProbe {
     AtomicInteger claimedDescriptors = new AtomicInteger();
     AtomicInteger unexpectedDescriptors = new AtomicInteger();
     int start = EVENTS.size();
-    try {
-      setSocketFileDescriptor(95);
-      for (int index = 0; index < threadCount; index++) {
-        Thread thread =
-            newVirtualThread(
-                scheduler,
-                "obi-concurrent-" + index,
-                () -> {
-                  Thread.yield();
-                  int descriptor = takeSocketFileDescriptor();
-                  if (descriptor == 95) {
-                    claimedDescriptors.incrementAndGet();
-                  } else if (descriptor != -1) {
-                    unexpectedDescriptors.incrementAndGet();
-                  }
-                });
-        threads.add(thread);
-        thread.start();
-      }
+    try (ExactNettyConnection exact = new ExactNettyConnection(95)) {
+      setSocketFileDescriptor(95, exact.lifecycle);
+      exact.runInHandlerScope(
+          () -> {
+            for (int index = 0; index < threadCount; index++) {
+              try {
+                Thread thread =
+                    newVirtualThread(
+                        scheduler,
+                        "obi-concurrent-" + index,
+                        () -> {
+                          Thread.yield();
+                          int descriptor = takeSocketFileDescriptor();
+                          if (descriptor == 95) {
+                            claimedDescriptors.incrementAndGet();
+                          } else if (descriptor != -1) {
+                            unexpectedDescriptors.incrementAndGet();
+                          }
+                        });
+                threads.add(thread);
+                thread.start();
+              } catch (Exception failure) {
+                throw new AssertionError(failure);
+              }
+            }
+          });
       for (Thread thread : threads) {
         thread.join(TimeUnit.SECONDS.toMillis(5));
         require(!thread.isAlive(), "concurrent virtual thread did not terminate: " + thread);
@@ -344,11 +374,24 @@ public final class VirtualThreadRuntimeProbe {
     return storage.getMethod("taskContext", Object.class).invoke(null, task);
   }
 
-  private static void setSocketFileDescriptor(int socketFileDescriptor) {
-    invokeThreadInfo(
-        "setRemoteParentSocketFileDescriptor",
-        new Class<?>[] {int.class},
-        new Object[] {Integer.valueOf(socketFileDescriptor)});
+  private static void setSocketFileDescriptor(int socketFileDescriptor, Object lifecycle) {
+    Object staged =
+        invokeThreadInfo(
+            "setRemoteParentSocketFileDescriptor",
+            new Class<?>[] {int.class, socketLifecycleClass()},
+            new Object[] {Integer.valueOf(socketFileDescriptor), lifecycle});
+    require(Boolean.TRUE.equals(staged), "failed to stage exact socket ownership");
+  }
+
+  private static Class<?> socketLifecycleClass() {
+    try {
+      return Class.forName(
+          "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext$Lifecycle",
+          true,
+          null);
+    } catch (ClassNotFoundException failure) {
+      throw new AssertionError(failure);
+    }
   }
 
   private static int socketFileDescriptor() {
@@ -443,6 +486,77 @@ public final class VirtualThreadRuntimeProbe {
   private static void require(boolean condition, String message) {
     if (!condition) {
       throw new AssertionError(message);
+    }
+  }
+
+  private static final class ExactNettyConnection implements AutoCloseable {
+    private final Class<?> storage;
+    private final Class<?> connectionClass;
+    private final Object channel = new Object();
+    private final Object connection;
+    private final Object lifecycle;
+
+    private ExactNettyConnection(int socketFileDescriptor) throws Exception {
+      storage =
+          Class.forName("io.opentelemetry.obi.java.instrumentations.data.SSLStorage", true, null);
+      connectionClass =
+          Class.forName("io.opentelemetry.obi.java.instrumentations.data.Connection", true, null);
+      connection =
+          connectionClass
+              .getConstructor(InetAddress.class, int.class, InetAddress.class, int.class, int.class)
+              .newInstance(
+                  InetAddress.getByName("127.0.0.1"),
+                  20_000 + socketFileDescriptor,
+                  InetAddress.getByName("127.0.0.2"),
+                  30_000 + socketFileDescriptor,
+                  socketFileDescriptor);
+      require(
+          storage
+                  .getMethod("associateConnectionWithChannel", Object.class, connectionClass)
+                  .invoke(null, channel, connection)
+              == connection,
+          "failed to register exact Netty connection");
+      lifecycle =
+          storage
+              .getMethod("remoteParentSocketLifecycle", connectionClass)
+              .invoke(null, connection);
+      require(lifecycle != null, "exact Netty lifecycle is unavailable");
+    }
+
+    private void runInHandlerScope(Runnable action) {
+      try {
+        storage
+            .getMethod("beginNettyHandlerScope", Object.class, boolean.class)
+            .invoke(null, null, Boolean.TRUE);
+        try {
+          require(
+              Boolean.TRUE.equals(
+                  storage
+                      .getMethod("setCurrentNettyConnection", Object.class)
+                      .invoke(null, connection)),
+              "failed to install exact Netty connection scope");
+          invokeThreadInfo(
+              "markRemoteParentDirectLookup",
+              new Class<?>[] {Object.class},
+              new Object[] {lifecycle});
+          action.run();
+        } finally {
+          storage.getMethod("endNettyHandlerScope").invoke(null);
+        }
+      } catch (ReflectiveOperationException failure) {
+        throw new AssertionError(failure);
+      }
+    }
+
+    @Override
+    public void close() {
+      try {
+        storage
+            .getMethod("cleanupConnection", Object.class, connectionClass)
+            .invoke(null, channel, connection);
+      } catch (ReflectiveOperationException failure) {
+        throw new AssertionError(failure);
+      }
     }
   }
 

@@ -17,7 +17,34 @@ enum {
     k_java_remote_parent_socket_negotiate = 0x4a03,
     k_java_remote_parent_socket_data_ack = 0x4a04,
     k_java_remote_parent_socket_health = 0x4a05,
+    k_java_remote_parent_socket_task_take = 0x4a06,
+    k_java_remote_parent_socket_task_discard = 0x4a07,
 };
+
+enum java_remote_parent_source : u8 {
+    k_java_remote_parent_source_direct = 1,
+    k_java_remote_parent_source_task = 2,
+};
+
+static __always_inline u8 java_remote_parent_socket_option_is_retrieval(int option) {
+    return option == k_java_remote_parent_socket_take ||
+           option == k_java_remote_parent_socket_discard ||
+           option == k_java_remote_parent_socket_task_take ||
+           option == k_java_remote_parent_socket_task_discard;
+}
+
+static __always_inline u8 java_remote_parent_socket_option_is_discard(int option) {
+    return option == k_java_remote_parent_socket_discard ||
+           option == k_java_remote_parent_socket_task_discard;
+}
+
+static __always_inline enum java_remote_parent_source
+java_remote_parent_socket_option_source(int option) {
+    return option == k_java_remote_parent_socket_task_take ||
+                   option == k_java_remote_parent_socket_task_discard
+               ? k_java_remote_parent_source_task
+               : k_java_remote_parent_source_direct;
+}
 
 volatile const bool java_remote_parent_enabled;
 

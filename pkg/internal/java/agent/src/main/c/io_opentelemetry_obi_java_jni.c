@@ -28,7 +28,7 @@ enum {
   remote_parent_record_size = 64,
   remote_parent_request_size = 24,
   remote_parent_abi_version = 1,
-  remote_parent_request_version = 2,
+  remote_parent_request_version = 3,
   remote_parent_status_unknown = 0,
   remote_parent_status_valid = 1,
   remote_parent_status_missing = 2,
@@ -55,12 +55,16 @@ enum {
   remote_parent_operation_take = 1,
   remote_parent_operation_discard = 2,
   remote_parent_operation_negotiate = 3,
+  remote_parent_source_direct = 1,
+  remote_parent_source_task = 2,
   obi_socket_level = 0x4f42,
   obi_socket_take = 0x4a01,
   obi_socket_discard = 0x4a02,
   obi_socket_negotiate = 0x4a03,
   obi_socket_data_ack = 0x4a04,
   obi_socket_health = 0x4a05,
+  obi_socket_task_take = 0x4a06,
+  obi_socket_task_discard = 0x4a07,
   obi_ioctl_magic = 0x0b10b1,
 };
 
@@ -596,13 +600,14 @@ static int verify_unix_peer(int fd, const struct remote_parent_config *config) {
 }
 
 static void build_unix_request(unsigned char *request, int operation,
-                               uint32_t namespace_tid,
+                               int source, uint32_t namespace_tid,
                                uint64_t process_incarnation) {
   memset(request, 0, remote_parent_request_size);
   memcpy(request, "OBIQ", 4);
   write_u16_le(request, 4, remote_parent_request_version);
   write_u16_le(request, 6, remote_parent_request_size);
   request[8] = (unsigned char)operation;
+  request[9] = (unsigned char)source;
   write_u32_le(request, 12, namespace_tid);
   write_u64_le(request, 16, process_incarnation);
 }
@@ -616,7 +621,7 @@ static void build_task_context_packet(unsigned char *packet, int operation,
 }
 
 static int call_unix_socket(const struct remote_parent_config *config,
-                            int operation, unsigned char *response,
+                            int operation, int source, unsigned char *response,
                             int64_t deadline) {
   status_response(response, 0);
   struct sockaddr_un address;
@@ -661,7 +666,7 @@ static int call_unix_socket(const struct remote_parent_config *config,
   }
 
   unsigned char request[remote_parent_request_size];
-  build_unix_request(request, operation, (uint32_t)syscall(SYS_gettid),
+  build_unix_request(request, operation, source, (uint32_t)syscall(SYS_gettid),
                      config->process_incarnation);
 
   status = exchange_unix_request(fd, request, response, deadline);
@@ -867,8 +872,9 @@ configure_remote_parent_result(int requested_transport, const char *path,
       return result;
     }
     unsigned char response[remote_parent_record_size];
-    int probe = call_unix_socket(candidate, remote_parent_operation_negotiate,
-                                 response, deadline);
+    int probe =
+        call_unix_socket(candidate, remote_parent_operation_negotiate,
+                         remote_parent_source_direct, response, deadline);
     if (!probe_succeeded(probe)) {
       result.unix_status = (unsigned char)failed_probe_status(probe);
       result.status = result.unix_status;
@@ -892,8 +898,16 @@ configure_remote_parent_result(int requested_transport, const char *path,
   return result;
 }
 
-static int call_remote_parent(int operation, int socket_fd,
+static int call_remote_parent(int operation, int source, int socket_fd,
                               unsigned char *response) {
+  if ((operation != remote_parent_operation_take &&
+       operation != remote_parent_operation_discard) ||
+      (source != remote_parent_source_direct &&
+       source != remote_parent_source_task)) {
+    status_response(response, remote_parent_status_malformed);
+    return remote_parent_status_malformed;
+  }
+
   int64_t start = monotonic_millis();
   int admission_timeout =
       atomic_load_explicit(&remote_parent_timeout_millis, memory_order_acquire);
@@ -927,13 +941,19 @@ static int call_remote_parent(int operation, int socket_fd,
       status = remote_parent_status_missing;
       status_response(response, status);
     } else {
-      int option = operation == remote_parent_operation_take
-                       ? obi_socket_take
-                       : obi_socket_discard;
+      int option;
+      if (source == remote_parent_source_task) {
+        option = operation == remote_parent_operation_take
+                     ? obi_socket_task_take
+                     : obi_socket_task_discard;
+      } else {
+        option = operation == remote_parent_operation_take ? obi_socket_take
+                                                           : obi_socket_discard;
+      }
       status = call_getsockopt(socket_fd, option, response);
     }
   } else if (config->transport == remote_parent_transport_unix) {
-    status = call_unix_socket(config, operation, response, deadline);
+    status = call_unix_socket(config, operation, source, response, deadline);
   } else {
     status = remote_parent_status_disabled;
     status_response(response, status);
@@ -1064,7 +1084,8 @@ int obi_test_peer_credentials_allowed(pid_t pid, uid_t uid,
 void obi_test_build_unix_request(unsigned char *request, int operation,
                                  uint32_t namespace_tid,
                                  uint64_t process_incarnation) {
-  build_unix_request(request, operation, namespace_tid, process_incarnation);
+  build_unix_request(request, operation, remote_parent_source_direct,
+                     namespace_tid, process_incarnation);
 }
 
 void obi_test_build_task_context_packet(unsigned char *packet, int operation,
@@ -1089,19 +1110,28 @@ uint64_t obi_test_configure_remote_parent_v2(int transport, const char *path,
 }
 
 int obi_test_call_remote_parent(int operation, unsigned char *response) {
-  return call_remote_parent(operation, -1, response);
+  return call_remote_parent(operation, remote_parent_source_direct, -1,
+                            response);
 }
 
 int obi_test_call_remote_parent_on_socket(int operation, int socket_fd,
                                           unsigned char *response) {
-  return call_remote_parent(operation, socket_fd, response);
+  return call_remote_parent(operation, remote_parent_source_direct, socket_fd,
+                            response);
+}
+
+int obi_test_call_remote_parent_task_on_socket(int operation, int socket_fd,
+                                               unsigned char *response) {
+  return call_remote_parent(operation, remote_parent_source_task, socket_fd,
+                            response);
 }
 
 int obi_test_exchange_unix_request(int fd, unsigned char *response,
                                    int64_t deadline) {
   unsigned char request[remote_parent_request_size];
   build_unix_request(request, remote_parent_operation_take,
-                     (uint32_t)syscall(SYS_gettid), 1);
+                     remote_parent_source_direct, (uint32_t)syscall(SYS_gettid),
+                     1);
   return exchange_unix_request(fd, request, response, deadline);
 }
 
@@ -1264,14 +1294,14 @@ Java_io_opentelemetry_obi_java_BootstrapNative_configureRemoteParentTransportV2(
 }
 
 static jint remote_parent_response(JNIEnv *env, jbyteArray output,
-                                   int operation, int socket_fd) {
+                                   int operation, int source, int socket_fd) {
   if (output == NULL ||
       (*env)->GetArrayLength(env, output) != remote_parent_record_size) {
     return remote_parent_status_malformed;
   }
 
   unsigned char response[remote_parent_record_size];
-  int status = call_remote_parent(operation, socket_fd, response);
+  int status = call_remote_parent(operation, source, socket_fd, response);
   (*env)->SetByteArrayRegion(env, output, 0, remote_parent_record_size,
                              (const jbyte *)response);
   if ((*env)->ExceptionCheck(env)) {
@@ -1290,7 +1320,7 @@ JNIEXPORT jint JNICALL
 Java_io_opentelemetry_obi_java_BootstrapNative_takeRemoteParent(
     JNIEnv *env, jclass clazz, jint socket_fd, jbyteArray output) {
   return remote_parent_response(env, output, remote_parent_operation_take,
-                                socket_fd);
+                                remote_parent_source_direct, socket_fd);
 }
 
 /*
@@ -1302,7 +1332,21 @@ JNIEXPORT jint JNICALL
 Java_io_opentelemetry_obi_java_BootstrapNative_discardRemoteParent(
     JNIEnv *env, jclass clazz, jint socket_fd, jbyteArray output) {
   return remote_parent_response(env, output, remote_parent_operation_discard,
-                                socket_fd);
+                                remote_parent_source_direct, socket_fd);
+}
+
+JNIEXPORT jint JNICALL
+Java_io_opentelemetry_obi_java_BootstrapNative_takeRemoteParentTask(
+    JNIEnv *env, jclass clazz, jint socket_fd, jbyteArray output) {
+  return remote_parent_response(env, output, remote_parent_operation_take,
+                                remote_parent_source_task, socket_fd);
+}
+
+JNIEXPORT jint JNICALL
+Java_io_opentelemetry_obi_java_BootstrapNative_discardRemoteParentTask(
+    JNIEnv *env, jclass clazz, jint socket_fd, jbyteArray output) {
+  return remote_parent_response(env, output, remote_parent_operation_discard,
+                                remote_parent_source_task, socket_fd);
 }
 
 /*

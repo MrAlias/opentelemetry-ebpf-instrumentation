@@ -47,6 +47,8 @@ uint64_t obi_test_configure_remote_parent_v2(int transport, const char *path,
 int obi_test_call_remote_parent(int operation, unsigned char *response);
 int obi_test_call_remote_parent_on_socket(int operation, int socket_fd,
                                           unsigned char *response);
+int obi_test_call_remote_parent_task_on_socket(int operation, int socket_fd,
+                                               unsigned char *response);
 int obi_test_exchange_unix_request(int fd, unsigned char *response,
                                    int64_t deadline);
 int obi_test_emit_data_on_socket(int socket_fd, unsigned char *packet);
@@ -63,6 +65,10 @@ jlong Java_io_opentelemetry_obi_java_BootstrapNative_configureRemoteParentTransp
 jint Java_io_opentelemetry_obi_java_BootstrapNative_takeRemoteParent(
     JNIEnv *env, jclass clazz, jint socket_fd, jbyteArray output);
 jint Java_io_opentelemetry_obi_java_BootstrapNative_discardRemoteParent(
+    JNIEnv *env, jclass clazz, jint socket_fd, jbyteArray output);
+jint Java_io_opentelemetry_obi_java_BootstrapNative_takeRemoteParentTask(
+    JNIEnv *env, jclass clazz, jint socket_fd, jbyteArray output);
+jint Java_io_opentelemetry_obi_java_BootstrapNative_discardRemoteParentTask(
     JNIEnv *env, jclass clazz, jint socket_fd, jbyteArray output);
 void Java_io_opentelemetry_obi_java_BootstrapNative_closeRemoteParentTransport(
     JNIEnv *env, jclass clazz);
@@ -867,10 +873,10 @@ static void test_request_vector(void) {
                               UINT64_C(0x0102030405060708));
 
   assert(memcmp(request, "OBIQ", 4) == 0);
-  assert(read_u16_le(request, 4) == 2);
+  assert(read_u16_le(request, 4) == 3);
   assert(read_u16_le(request, 6) == 24);
   assert(request[8] == 2);
-  assert(request[9] == 0 && request[10] == 0 && request[11] == 0);
+  assert(request[9] == 1 && request[10] == 0 && request[11] == 0);
   assert(read_u32_le(request, 12) == 0x12345678);
   assert(read_u64_le(request, 16) == UINT64_C(0x0102030405060708));
 }
@@ -1085,6 +1091,20 @@ static void test_retrieval_never_renegotiates_socket(void) {
   assert(atomic_load(&observed_getsockopt_fd) == 58);
   assert(atomic_load(&observed_getsockopt_option) == 0x4a01);
   assert(atomic_load(&observed_getsockopt_calls) == 1);
+
+  reset_transport_observations();
+  assert(obi_test_call_remote_parent_task_on_socket(1, 58, response) == 2);
+  assert(atomic_load(&observed_setsockopt_calls) == 0);
+  assert(atomic_load(&observed_getsockopt_fd) == 58);
+  assert(atomic_load(&observed_getsockopt_option) == 0x4a06);
+  assert(atomic_load(&observed_getsockopt_calls) == 1);
+
+  reset_transport_observations();
+  assert(obi_test_call_remote_parent_task_on_socket(2, 58, response) == 2);
+  assert(atomic_load(&observed_setsockopt_calls) == 0);
+  assert(atomic_load(&observed_getsockopt_fd) == 58);
+  assert(atomic_load(&observed_getsockopt_option) == 0x4a07);
+  assert(atomic_load(&observed_getsockopt_calls) == 1);
   obi_test_close_remote_parent();
 }
 
@@ -1150,6 +1170,18 @@ static void test_exported_jni_transport_lifecycle(void) {
   assert(Java_io_opentelemetry_obi_java_BootstrapNative_discardRemoteParent(
              env, NULL, 59, (jbyteArray)&response) == 3);
   assert(atomic_load(&observed_getsockopt_option) == 0x4a02);
+  assert(response.bytes[8] == 3);
+
+  fake_getsockopt_status = 1;
+  assert(Java_io_opentelemetry_obi_java_BootstrapNative_takeRemoteParentTask(
+             env, NULL, 59, (jbyteArray)&response) == 1);
+  assert(atomic_load(&observed_getsockopt_option) == 0x4a06);
+  assert(response.bytes[8] == 1);
+
+  fake_getsockopt_status = 3;
+  assert(Java_io_opentelemetry_obi_java_BootstrapNative_discardRemoteParentTask(
+             env, NULL, 59, (jbyteArray)&response) == 3);
+  assert(atomic_load(&observed_getsockopt_option) == 0x4a07);
   assert(response.bytes[8] == 3);
 
   fake_getsockopt_status = 2;
@@ -1237,10 +1269,12 @@ struct trickle_server {
 
 enum {
   test_remote_parent_transport_unix = 2,
-  test_remote_parent_request_version = 2,
+  test_remote_parent_request_version = 3,
   test_remote_parent_request_size = 24,
   test_remote_parent_operation_take = 1,
   test_remote_parent_operation_negotiate = 3,
+  test_remote_parent_source_direct = 1,
+  test_remote_parent_source_task = 2,
   test_remote_parent_status_valid = 1,
   test_remote_parent_status_missing = 2,
   test_remote_parent_status_unauthorized = 8,
@@ -1348,6 +1382,8 @@ static void *run_missing_then_unauthorized_server(void *argument) {
   struct trickle_server *server = argument;
   const int operations[] = {test_remote_parent_operation_negotiate,
                             test_remote_parent_operation_take};
+  const int sources[] = {test_remote_parent_source_direct,
+                         test_remote_parent_source_task};
   const int statuses[] = {test_remote_parent_status_missing,
                           test_remote_parent_status_unauthorized};
   int result = test_unix_server_success;
@@ -1383,7 +1419,8 @@ static void *run_missing_then_unauthorized_server(void *argument) {
     if (memcmp(request, "OBIQ", 4) != 0 ||
         read_u16_le(request, 4) != test_remote_parent_request_version ||
         read_u16_le(request, 6) != sizeof(request) ||
-        request[8] != operations[index]) {
+        request[8] != operations[index] || request[9] != sources[index] ||
+        request[10] != 0 || request[11] != 0) {
       close(client);
       result = test_unix_server_protocol_error;
       goto done;
@@ -1496,7 +1533,7 @@ static void test_unix_transport_ignores_unrelated_duplicated_socket_fd(void) {
          test_remote_parent_status_valid);
 
   unsigned char response[64];
-  assert(obi_test_call_remote_parent_on_socket(
+  assert(obi_test_call_remote_parent_task_on_socket(
              test_remote_parent_operation_take, duplicate, response) ==
          test_remote_parent_status_unauthorized);
   assert(obi_test_response_status(response, sizeof(response)) ==

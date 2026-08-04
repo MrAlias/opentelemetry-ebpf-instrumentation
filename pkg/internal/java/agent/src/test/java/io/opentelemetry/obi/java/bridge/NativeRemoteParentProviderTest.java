@@ -41,6 +41,7 @@ class NativeRemoteParentProviderTest {
   void resetThreadInfo() throws Exception {
     ThreadInfo.setRemoteParentEnabled(false);
     ThreadInfo.clearRemoteParentSocketFileDescriptor();
+    ThreadInfo.clearRemoteParentLookupSource();
     setTaskContextEmitter(null);
   }
 
@@ -407,7 +408,7 @@ class NativeRemoteParentProviderTest {
     AtomicReference<Object> closeLifecycle = new AtomicReference<>();
     NativeRemoteParentProvider provider =
         readyProvider(
-            (take, socketFileDescriptor, response) -> {
+            (take, taskScoped, socketFileDescriptor, response) -> {
               observedSocketFileDescriptor.set(socketFileDescriptor);
               nativeEntered.countDown();
               awaitUninterruptibly(releaseNative);
@@ -470,7 +471,7 @@ class NativeRemoteParentProviderTest {
     NativeRemoteParentProvider provider =
         readyProvider(
             RemoteParentTransport.UNIX,
-            (take, socketFileDescriptor, response) -> {
+            (take, taskScoped, socketFileDescriptor, response) -> {
               calls.incrementAndGet();
               return RemoteParentStatus.MISSING;
             });
@@ -488,11 +489,198 @@ class NativeRemoteParentProviderTest {
     }
   }
 
+  @Test
+  void routesLookupsOnlyToTheExplicitExecutionSource() throws Exception {
+    List<Boolean> taskLookups = new ArrayList<>();
+    NativeRemoteParentProvider provider =
+        readyProvider(
+            (take, taskScoped, socketFileDescriptor, response) -> {
+              taskLookups.add(taskScoped);
+              return RemoteParentStatus.MISSING;
+            });
+
+    setTaskContextEmitter((proxy, method, args) -> null);
+    ThreadInfo.setRemoteParentEnabled(true);
+    boolean entered = false;
+    boolean receiving = false;
+    try {
+      provider.takeRemoteParent();
+
+      entered = ThreadInfo.enterTaskParentThreadContext(900L, 101L, 42L);
+      assertTrue(entered);
+      provider.takeRemoteParent();
+
+      ThreadInfo.markRemoteParentDirectLookup();
+      provider.takeRemoteParent();
+      provider.takeRemoteParent();
+
+      ThreadInfo.beginRemoteParentReceiveScope();
+      receiving = true;
+      assertEquals(RemoteParentStatus.MISSING, provider.takeRemoteParent().getStatus());
+      ThreadInfo.markRemoteParentDirectLookup();
+      provider.takeRemoteParent();
+
+      assertEquals(Arrays.asList(false, true, false, false, false), taskLookups);
+    } finally {
+      if (receiving) {
+        ThreadInfo.endRemoteParentReceiveScope();
+      }
+      if (entered) {
+        ThreadInfo.restoreTaskParentThreadContext();
+      }
+      provider.close();
+    }
+  }
+
+  @Test
+  void unixDirectOverrideSurvivesRetriesInsideAnExactTask() throws Exception {
+    List<Boolean> taskLookups = new ArrayList<>();
+    NativeRemoteParentProvider provider =
+        readyProvider(
+            RemoteParentTransport.UNIX,
+            (take, taskScoped, socketFileDescriptor, response) -> {
+              taskLookups.add(taskScoped);
+              return RemoteParentStatus.MISSING;
+            });
+
+    setTaskContextEmitter((proxy, method, args) -> null);
+    ThreadInfo.setRemoteParentEnabled(true);
+    boolean entered = false;
+    try {
+      entered = ThreadInfo.enterTaskParentThreadContext(900L, 101L, 42L);
+      assertTrue(entered);
+      ThreadInfo.markRemoteParentDirectLookup();
+
+      assertEquals(RemoteParentStatus.MISSING, provider.takeRemoteParent().getStatus());
+      assertEquals(RemoteParentStatus.MISSING, provider.takeRemoteParent().getStatus());
+      assertEquals(Arrays.asList(false, false), taskLookups);
+    } finally {
+      if (entered) {
+        ThreadInfo.restoreTaskParentThreadContext();
+      }
+      provider.close();
+    }
+  }
+
+  @Test
+  void blockedLookupNeverCallsTheUnixBroker() {
+    AtomicInteger calls = new AtomicInteger();
+    NativeRemoteParentProvider provider =
+        readyProvider(
+            RemoteParentTransport.UNIX,
+            (take, taskScoped, socketFileDescriptor, response) -> {
+              calls.incrementAndGet();
+              return RemoteParentStatus.VALID;
+            });
+
+    try {
+      ThreadInfo.setRemoteParentSocketFileDescriptor(98);
+      ThreadInfo.beginRemoteParentReceiveAttempt();
+
+      assertEquals(RemoteParentStatus.MISSING, provider.takeRemoteParent().getStatus());
+      assertEquals(0, calls.get());
+      assertEquals(-1, ThreadInfo.remoteParentSocketFileDescriptor());
+    } finally {
+      provider.close();
+    }
+  }
+
+  @Test
+  void invalidatedDescriptorlessLifecycleBlocksDirectAndTaskUnixLookups() throws Exception {
+    AtomicInteger calls = new AtomicInteger();
+    NativeRemoteParentProvider provider =
+        readyProvider(
+            RemoteParentTransport.UNIX,
+            (take, taskScoped, socketFileDescriptor, response) -> {
+              calls.incrementAndGet();
+              return RemoteParentStatus.VALID;
+            });
+    Lifecycle direct = new Lifecycle();
+
+    setTaskContextEmitter((proxy, method, args) -> null);
+    ThreadInfo.setRemoteParentEnabled(true);
+    boolean entered = false;
+    try {
+      ThreadInfo.markRemoteParentDirectLookup(direct);
+      direct.invalidate();
+      assertEquals(RemoteParentStatus.MISSING, provider.takeRemoteParent().getStatus());
+
+      Lifecycle task = new Lifecycle();
+      entered = ThreadInfo.enterTaskParentThreadContext(900L, 101L, 42L, null, task);
+      assertTrue(entered);
+      task.invalidate();
+      assertEquals(RemoteParentStatus.MISSING, provider.takeRemoteParent().getStatus());
+      assertEquals(0, calls.get());
+    } finally {
+      if (entered) {
+        ThreadInfo.restoreTaskParentThreadContext();
+      }
+      provider.close();
+    }
+  }
+
+  @Test
+  void descriptorlessUnixLookupHoldsTheLifecycleLeaseUntilNativeReturns() throws Exception {
+    CountDownLatch nativeEntered = new CountDownLatch(1);
+    CountDownLatch releaseNative = new CountDownLatch(1);
+    CountDownLatch lookupFinished = new CountDownLatch(1);
+    CountDownLatch invalidationFinished = new CountDownLatch(1);
+    AtomicReference<Throwable> failure = new AtomicReference<>();
+    Lifecycle lifecycle = new Lifecycle();
+    NativeRemoteParentProvider provider =
+        readyProvider(
+            RemoteParentTransport.UNIX,
+            (take, taskScoped, socketFileDescriptor, response) -> {
+              nativeEntered.countDown();
+              awaitUninterruptibly(releaseNative);
+              return RemoteParentStatus.MISSING;
+            });
+    ThreadInfo.markRemoteParentDirectLookup(lifecycle);
+
+    Thread lookup =
+        new Thread(
+            () -> {
+              try {
+                ThreadInfo.markRemoteParentDirectLookup(lifecycle);
+                provider.takeRemoteParent();
+              } catch (Throwable thrown) {
+                failure.set(thrown);
+              } finally {
+                lookupFinished.countDown();
+              }
+            });
+    Thread invalidator =
+        new Thread(
+            () -> {
+              lifecycle.invalidate();
+              invalidationFinished.countDown();
+            });
+
+    try {
+      lookup.start();
+      assertTrue(nativeEntered.await(5, TimeUnit.SECONDS));
+      invalidator.start();
+      assertFalse(invalidationFinished.await(250, TimeUnit.MILLISECONDS));
+
+      releaseNative.countDown();
+      assertTrue(lookupFinished.await(5, TimeUnit.SECONDS));
+      assertTrue(invalidationFinished.await(5, TimeUnit.SECONDS));
+      assertNull(failure.get());
+    } finally {
+      releaseNative.countDown();
+      lookup.join(TimeUnit.SECONDS.toMillis(5));
+      invalidator.join(TimeUnit.SECONDS.toMillis(5));
+      provider.close();
+    }
+  }
+
   private static TaskContext captureSocketAlias(int socketFileDescriptor) throws Exception {
     setTaskContextEmitter((proxy, method, args) -> null);
     ThreadInfo.setRemoteParentEnabled(true);
-    ThreadInfo.setRemoteParentSocketFileDescriptor(socketFileDescriptor);
-    return ThreadInfo.captureTaskContext(101L);
+    Lifecycle lifecycle = new Lifecycle();
+    ThreadInfo.setRemoteParentSocketFileDescriptor(socketFileDescriptor, lifecycle);
+    ThreadInfo.markRemoteParentDirectLookup(lifecycle);
+    return ThreadInfo.captureTaskContext(101L, lifecycle);
   }
 
   private static void setTaskContextEmitter(java.lang.reflect.InvocationHandler handler)
@@ -510,10 +698,16 @@ class NativeRemoteParentProviderTest {
 
   private static NativeRemoteParentProvider readyProvider() {
     return readyProvider(
-        (take, socketFileDescriptor, response) ->
-            take
-                ? BootstrapNative.takeRemoteParent(socketFileDescriptor, response)
-                : BootstrapNative.discardRemoteParent(socketFileDescriptor, response));
+        (take, taskScoped, socketFileDescriptor, response) -> {
+          if (taskScoped) {
+            return take
+                ? BootstrapNative.takeRemoteParentTask(socketFileDescriptor, response)
+                : BootstrapNative.discardRemoteParentTask(socketFileDescriptor, response);
+          }
+          return take
+              ? BootstrapNative.takeRemoteParent(socketFileDescriptor, response)
+              : BootstrapNative.discardRemoteParent(socketFileDescriptor, response);
+        });
   }
 
   private static NativeRemoteParentProvider readyProvider(

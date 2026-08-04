@@ -75,6 +75,11 @@ public final class RemoteParentSocketContext {
     return lifecycle != null && lifecycle == candidate;
   }
 
+  /** Returns the physical lifecycle fence independently of the one-shot descriptor. */
+  public Lifecycle lifecycle() {
+    return lifecycle;
+  }
+
   private boolean active() {
     return lifecycle == null || lifecycle.active();
   }

@@ -30,6 +30,9 @@ public final class BootstrapNative {
   public static native int socketFileDescriptor(Socket socket);
 
   public static int emitData(Socket socket, long argp, boolean receive) {
+    if (receive) {
+      ThreadInfo.beginRemoteParentReceiveAttempt();
+    }
     Lifecycle lifecycle = asLifecycle(SSLStorage.prepareRemoteParentSocketLifecycle(socket));
     if (lifecycle == null) {
       failClosedSocketEmission(socket, receive);
@@ -40,6 +43,7 @@ public final class BootstrapNative {
     if (lease == null) {
       if (receive) {
         ThreadInfo.clearRemoteParentSocketFileDescriptor();
+        ThreadInfo.blockRemoteParentLookup();
       }
       return -1;
     }
@@ -66,9 +70,13 @@ public final class BootstrapNative {
   }
 
   public static int emitData(Connection connection, long argp, boolean receive) {
+    if (receive) {
+      ThreadInfo.beginRemoteParentReceiveAttempt();
+    }
     Lifecycle lifecycle = asLifecycle(SSLStorage.remoteParentSocketLifecycle(connection));
     if (connection == null || lifecycle == null) {
       if (receive) {
+        ThreadInfo.blockRemoteParentLookup();
         if (connection == null) {
           ThreadInfo.invalidateRemoteParentSocketFileDescriptor(null);
         } else {
@@ -83,6 +91,7 @@ public final class BootstrapNative {
     if (lease == null) {
       if (receive) {
         ThreadInfo.clearRemoteParentSocketFileDescriptor();
+        ThreadInfo.blockRemoteParentLookup();
       }
       return -1;
     }
@@ -101,6 +110,9 @@ public final class BootstrapNative {
   }
 
   public static int emitData(int socketFileDescriptor, long argp, boolean receive) {
+    if (receive) {
+      ThreadInfo.beginRemoteParentReceiveAttempt();
+    }
     return emitDataWithoutLease(socketFileDescriptor, argp, receive, null);
   }
 
@@ -130,6 +142,9 @@ public final class BootstrapNative {
       if (socketFileDescriptor < 0) {
         terminalFailure = receive;
         return -1;
+      }
+      if (receive && result >= 0) {
+        ThreadInfo.markRemoteParentDirectLookup(lifecycle);
       }
       if (receive && result == 1) {
         if (lifecycle instanceof Lifecycle) {
@@ -163,6 +178,7 @@ public final class BootstrapNative {
 
   private static void finishEmitDataFailure(boolean receive, Object lifecycle) {
     if (receive) {
+      ThreadInfo.blockRemoteParentLookup();
       ThreadInfo.invalidateRemoteParentSocketFileDescriptor(lifecycle);
     }
   }
@@ -175,6 +191,7 @@ public final class BootstrapNative {
     if (!receive) {
       return;
     }
+    ThreadInfo.blockRemoteParentLookup();
     if (socket == null) {
       ThreadInfo.invalidateRemoteParentSocketFileDescriptor(null);
     } else if (socket.isClosed()) {
@@ -218,6 +235,7 @@ public final class BootstrapNative {
       // created after it entered. It can still leave an unrelated descriptor staged on this
       // thread, so detach that local state.
       ThreadInfo.clearRemoteParentSocketFileDescriptor();
+      ThreadInfo.blockRemoteParentLookup();
       return;
     }
     Object invalidated = SSLStorage.invalidateRemoteParentSocketLifecycle(socket, lifecycle);
@@ -237,6 +255,7 @@ public final class BootstrapNative {
       // A live socket that could not obtain a tombstone (for example because the capped weak map
       // is full) must not block close or revoke an unknown generation. Detach only this thread.
       ThreadInfo.clearRemoteParentSocketFileDescriptor();
+      ThreadInfo.blockRemoteParentLookup();
     }
     return lifecycle;
   }
@@ -306,6 +325,10 @@ public final class BootstrapNative {
   public static native int takeRemoteParent(int socketFileDescriptor, byte[] response);
 
   public static native int discardRemoteParent(int socketFileDescriptor, byte[] response);
+
+  public static native int takeRemoteParentTask(int socketFileDescriptor, byte[] response);
+
+  public static native int discardRemoteParentTask(int socketFileDescriptor, byte[] response);
 
   public static native void closeRemoteParentTransport();
 

@@ -57,6 +57,8 @@
 
 #include <shared/obi_ctx.h>
 
+#include <generictracer/java_exit_cleanup.h>
+
 SCRATCH_MEM_TYPED(backup_buffer, backup_buffer_t)
 
 volatile const u64 ssl_prewrite_max_age_ns = 30ULL * 1000 * 1000 * 1000;
@@ -1449,7 +1451,7 @@ int BPF_KPROBE(obi_kprobe_sys_exit, int status) {
     const u64 id = bpf_get_current_pid_tgid();
     const u32 traced_pid = valid_pid(id);
 
-    if (!traced_pid && !java_remote_parent_enabled) {
+    if (!java_exit_cleanup_required(traced_pid, java_remote_parent_enabled)) {
         return 0;
     }
 
@@ -1461,35 +1463,23 @@ int BPF_KPROBE(obi_kprobe_sys_exit, int status) {
                    pid_from_pid_tgid(id),
                    valid_pid(id));
 
-    if (java_remote_parent_enabled) {
-        java_remote_parent_cleanup(&task.p_key);
-    }
     trace_key_t vt_task = task;
-    const u8 vt_keyed = java_vt_translate_tid(&vt_task.p_key);
-    if (vt_keyed) {
-        if (java_remote_parent_enabled) {
-            java_remote_parent_cleanup(&vt_task.p_key);
+    u8 vt_keyed = 0;
+    if (java_remote_parent_enabled) {
+        vt_keyed = java_remote_parent_cleanup_exiting_task(&task.p_key, &vt_task.p_key) !=
+                   k_java_vt_cleanup_translation_none;
+    } else {
+        vt_keyed = java_vt_translate_tid(&vt_task.p_key);
+        if (vt_keyed) {
+            java_remote_parent_unlink_task(&vt_task.p_key);
         }
-        java_remote_parent_unlink_task(&vt_task.p_key);
-    }
-    java_remote_parent_unlink_task(&task.p_key);
-
-    if (!traced_pid) {
-        return 0;
+        java_remote_parent_unlink_task(&task.p_key);
     }
 
-    bpf_map_delete_elem(&clone_map, &task.p_key);
-    // This won't delete trace ids for traces with extra_id, like NodeJS. But,
-    // we expect that it doesn't matter, since NodeJS main thread won't exit.
-    bpf_map_delete_elem(&server_traces, &task);
-    if (vt_keyed) {
-        bpf_map_delete_elem(&server_traces, &vt_task);
-    }
-    obi_ctx__del(id);
-    // A carrier dying without VirtualThread.unmount() must not leave a
-    // stale entry that would re-key a future thread reusing this tid.
-    bpf_map_delete_elem(&java_vt_threads, &task.p_key);
-    bpf_map_delete_elem(&java_tasks, &task.p_key);
+    // Once bridge cleanup admits an exit, delete every exact task key even if
+    // the task has since left the instrumentation PID filter. Otherwise PID or
+    // TID reuse can revive formerly traced Java parent/context state.
+    java_exit_cleanup_task_maps(&traces_ctx_v1, id, &task, &vt_task, vt_keyed);
 
     return 0;
 }

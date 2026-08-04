@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import io.opentelemetry.obi.java.bridge.RemoteParentBridge;
 import io.opentelemetry.obi.java.ebpf.NativeMemoryTestAccess;
@@ -43,6 +44,7 @@ class SSLEngineUnwrapNestingTest {
     BootstrapNative.setEmitDataOnSocketForTest(null);
     NativeMemoryTestAccess.setSyntheticAddress(false);
     ThreadInfo.clearRemoteParentSocketFileDescriptor();
+    ThreadInfo.clearRemoteParentLookupSource();
     physicalOwners.clear();
   }
 
@@ -65,16 +67,19 @@ class SSLEngineUnwrapNestingTest {
       engine.unwrap(ByteBuffer.wrap(new byte[] {1}), ByteBuffer.allocate(4));
       assertEquals(1, emissions.get());
       assertEquals(initialTlsReadEvents + 1, RemoteParentBridge.tlsReadEvents());
+      assertEquals(91, ThreadInfo.remoteParentSocketFileDescriptor());
 
       engine.unwrap(ByteBuffer.wrap(new byte[] {2}), new ByteBuffer[] {ByteBuffer.allocate(4)});
       assertEquals(2, emissions.get());
       assertEquals(initialTlsReadEvents + 2, RemoteParentBridge.tlsReadEvents());
+      assertEquals(91, ThreadInfo.remoteParentSocketFileDescriptor());
 
       // A direct ranged call after each wrapper proves every nested scope was balanced.
       engine.unwrap(
           ByteBuffer.wrap(new byte[] {3}), new ByteBuffer[] {ByteBuffer.allocate(4)}, 0, 1);
       assertEquals(3, emissions.get());
       assertEquals(initialTlsReadEvents + 3, RemoteParentBridge.tlsReadEvents());
+      assertEquals(91, ThreadInfo.remoteParentSocketFileDescriptor());
     } finally {
       SSLStorage.cleanupConnection(connection);
     }
@@ -86,6 +91,71 @@ class SSLEngineUnwrapNestingTest {
 
     assertEquals(1, BootstrapNative.emitData(92, 1L, true));
     assertEquals(92, ThreadInfo.remoteParentSocketFileDescriptor());
+    assertEquals(ThreadInfo.REMOTE_PARENT_LOOKUP_DIRECT, ThreadInfo.remoteParentLookupSource());
+  }
+
+  @Test
+  void zeroResultForTheSameConnectionClearsOwnershipWithoutInvalidatingItsLifecycle()
+      throws Exception {
+    AtomicInteger emissions = new AtomicInteger();
+    BootstrapNative.setEmitDataOnSocketForTest(
+        (socketFileDescriptor, packetAddress) -> emissions.getAndIncrement() == 0 ? 1 : 0);
+    Connection connection = connection(98, 1234, 5678);
+    Lifecycle lifecycle = (Lifecycle) SSLStorage.remoteParentSocketLifecycle(connection);
+    assertNotNull(lifecycle);
+    RemoteParentSocketContext alias = new RemoteParentSocketContext(98, lifecycle);
+
+    try {
+      assertEquals(1, BootstrapNative.emitData(connection, 1L, true));
+      assertEquals(98, ThreadInfo.remoteParentSocketFileDescriptor());
+      assertEquals(0, BootstrapNative.emitData(connection, 2L, true));
+      assertEquals(-1, ThreadInfo.remoteParentSocketFileDescriptor());
+      assertEquals(ThreadInfo.REMOTE_PARENT_LOOKUP_DIRECT, ThreadInfo.remoteParentLookupSource());
+      assertSame(lifecycle, SSLStorage.remoteParentSocketLifecycle(connection));
+      assertEquals(98, alias.peek());
+    } finally {
+      SSLStorage.cleanupConnection(connection);
+    }
+  }
+
+  @Test
+  void throwingReceiveRemainsBlockedAfterTheAttemptReturns() {
+    BootstrapNative.setEmitDataOnSocketForTest(
+        (socketFileDescriptor, packetAddress) -> {
+          throw new IllegalStateException("emit failed");
+        });
+
+    assertThrows(IllegalStateException.class, () -> BootstrapNative.emitData(92, 1L, true));
+    assertEquals(ThreadInfo.REMOTE_PARENT_LOOKUP_BLOCKED, ThreadInfo.remoteParentLookupSource());
+    assertEquals(-1, ThreadInfo.remoteParentSocketFileDescriptor());
+  }
+
+  @Test
+  void zeroResultForAnotherConnectionCannotRetainAReusedDescriptor() throws Exception {
+    AtomicInteger emissions = new AtomicInteger();
+    BootstrapNative.setEmitDataOnSocketForTest(
+        (socketFileDescriptor, packetAddress) -> emissions.getAndIncrement() == 0 ? 1 : 0);
+    Connection first = connection(99, 1234, 5678);
+    Connection second = connection(99, 1235, 5679);
+
+    try {
+      assertEquals(1, BootstrapNative.emitData(first, 1L, true));
+      assertEquals(99, ThreadInfo.remoteParentSocketFileDescriptor());
+      assertEquals(0, BootstrapNative.emitData(second, 2L, true));
+      assertEquals(-1, ThreadInfo.remoteParentSocketFileDescriptor());
+    } finally {
+      SSLStorage.cleanupConnection(first);
+      SSLStorage.cleanupConnection(second);
+    }
+  }
+
+  @Test
+  void zeroResultWithoutAnExactLifecycleKeepsLegacyClearSemantics() {
+    BootstrapNative.setEmitDataOnSocketForTest((socketFileDescriptor, packetAddress) -> 0);
+    ThreadInfo.setRemoteParentSocketFileDescriptor(100);
+
+    assertEquals(0, BootstrapNative.emitData(100, 1L, true));
+    assertEquals(-1, ThreadInfo.remoteParentSocketFileDescriptor());
   }
 
   @Test
@@ -106,6 +176,7 @@ class SSLEngineUnwrapNestingTest {
     assertEquals(-1, BootstrapNative.emitData(connection, 1L, true));
     assertEquals(0, emissions.get());
     assertEquals(-1, ThreadInfo.remoteParentSocketFileDescriptor());
+    assertEquals(ThreadInfo.REMOTE_PARENT_LOOKUP_BLOCKED, ThreadInfo.remoteParentLookupSource());
     SSLStorage.cleanupConnection(connection);
   }
 
@@ -231,12 +302,17 @@ class SSLEngineUnwrapNestingTest {
   }
 
   private Connection connection(int fileDescriptor) throws Exception {
+    return connection(fileDescriptor, 1234, 5678);
+  }
+
+  private Connection connection(int fileDescriptor, int localPort, int remotePort)
+      throws Exception {
     Connection connection =
         new Connection(
             InetAddress.getByName("127.0.0.1"),
-            1234,
+            localPort,
             InetAddress.getByName("127.0.0.2"),
-            5678,
+            remotePort,
             fileDescriptor);
     Object physicalOwner = new Object();
     physicalOwners.add(physicalOwner);

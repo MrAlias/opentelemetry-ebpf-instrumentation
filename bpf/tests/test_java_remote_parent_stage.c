@@ -30,18 +30,24 @@ static unsigned int test_prandom_u32(void);
 
 static void test_task_tid(pid_key_t *owner);
 static u8 test_java_vt_translate_tid(pid_key_t *owner);
+static u64 test_java_process_capability_for(const pid_key_t *owner);
 static u64 test_java_process_incarnation_for(const pid_key_t *owner);
+static u64 test_java_current_process_incarnation(void);
 static u8 test_java_remote_parent_data_hook_is_ready(void);
 
 #define task_tid test_task_tid
 #define java_vt_translate_tid test_java_vt_translate_tid
+#define java_process_capability_for test_java_process_capability_for
 #define java_process_incarnation_for test_java_process_incarnation_for
+#define java_current_process_incarnation test_java_current_process_incarnation
 #define java_remote_parent_data_hook_is_ready test_java_remote_parent_data_hook_is_ready
 
 #include <maps/java_remote_parent.h>
 
 #undef java_remote_parent_data_hook_is_ready
+#undef java_current_process_incarnation
 #undef java_process_incarnation_for
+#undef java_process_capability_for
 #undef java_vt_translate_tid
 #undef task_tid
 #undef bpf_loop
@@ -111,9 +117,15 @@ static int owner_present;
 static java_remote_parent_key_t stored_state_key;
 static java_remote_parent_state_t stored_state;
 static int state_present;
+static java_remote_parent_key_t replacement_state_key;
+static java_remote_parent_state_t replacement_state;
+static int replacement_state_present;
 static java_remote_parent_key_t stored_generation_index_key;
 static java_remote_parent_generation_index_t stored_generation_index;
 static int generation_index_present;
+static java_remote_parent_key_t replacement_generation_index_key;
+static java_remote_parent_generation_index_t replacement_generation_index;
+static int replacement_generation_index_present;
 static connection_info_ns_t stored_connection_key;
 static java_remote_parent_connection_t stored_connection;
 static int connection_present;
@@ -123,6 +135,12 @@ static int cookie_connection_present;
 static pid_key_t stored_fallback_key;
 static java_remote_parent_response_t stored_fallback;
 static int fallback_present;
+static pid_key_t stored_terminal_key;
+static java_remote_parent_terminal_t stored_terminal;
+static int terminal_present;
+static java_remote_parent_key_t ambiguity_key;
+static u64 ambiguity_observed_monotime_ns;
+static int ambiguity_present;
 static u64 stats[k_java_remote_parent_stat_max];
 static int corrupt_cookie_socket_cookie;
 static int unexpected_update;
@@ -174,9 +192,18 @@ static void *test_map_lookup(void *map, const void *key) {
         same_key(key, &stored_state_key, sizeof(stored_state_key))) {
         return &stored_state;
     }
+    if (map == &java_remote_parent_state && replacement_state_present &&
+        same_key(key, &replacement_state_key, sizeof(replacement_state_key))) {
+        return &replacement_state;
+    }
     if (map == &java_remote_parent_generation_index && generation_index_present &&
         same_key(key, &stored_generation_index_key, sizeof(stored_generation_index_key))) {
         return &stored_generation_index;
+    }
+    if (map == &java_remote_parent_generation_index && replacement_generation_index_present &&
+        same_key(
+            key, &replacement_generation_index_key, sizeof(replacement_generation_index_key))) {
+        return &replacement_generation_index;
     }
     if (map == &java_remote_parent_connections && connection_present &&
         same_key(key, &stored_connection_key, sizeof(stored_connection_key))) {
@@ -189,6 +216,14 @@ static void *test_map_lookup(void *map, const void *key) {
     if (map == &java_remote_parent_fallback && fallback_present &&
         same_key(key, &stored_fallback_key, sizeof(stored_fallback_key))) {
         return &stored_fallback;
+    }
+    if (map == &java_remote_parent_terminal && terminal_present &&
+        same_key(key, &stored_terminal_key, sizeof(stored_terminal_key))) {
+        return &stored_terminal;
+    }
+    if (map == &java_remote_parent_ambiguity && ambiguity_present &&
+        same_key(key, &ambiguity_key, sizeof(ambiguity_key))) {
+        return &ambiguity_observed_monotime_ns;
     }
     if (map == &java_remote_parent_stats) {
         const u32 index = *(const u32 *)key;
@@ -209,20 +244,42 @@ test_map_update(void *map, const void *key, const void *value, unsigned long lon
         owner_present = 1;
         return 0;
     }
-    if (map == &java_remote_parent_state && flags == BPF_NOEXIST && !state_present) {
-        stored_state_key = *(const java_remote_parent_key_t *)key;
-        stored_state = *(const java_remote_parent_state_t *)value;
-        state_present = 1;
-        return 0;
+    if (map == &java_remote_parent_state && flags == BPF_NOEXIST) {
+        if (!state_present) {
+            stored_state_key = *(const java_remote_parent_key_t *)key;
+            stored_state = *(const java_remote_parent_state_t *)value;
+            state_present = 1;
+            return 0;
+        }
+        if (!replacement_state_present &&
+            !same_key(key, &stored_state_key, sizeof(stored_state_key))) {
+            replacement_state_key = *(const java_remote_parent_key_t *)key;
+            replacement_state = *(const java_remote_parent_state_t *)value;
+            replacement_state_present = 1;
+            return 0;
+        }
+        return -1;
     }
-    if (map == &java_remote_parent_generation_index && flags == BPF_NOEXIST &&
-        !generation_index_present) {
-        stored_generation_index_key = *(const java_remote_parent_key_t *)key;
-        stored_generation_index = *(const java_remote_parent_generation_index_t *)value;
-        generation_index_present = 1;
-        return 0;
+    if (map == &java_remote_parent_generation_index && flags == BPF_NOEXIST) {
+        if (!generation_index_present) {
+            stored_generation_index_key = *(const java_remote_parent_key_t *)key;
+            stored_generation_index = *(const java_remote_parent_generation_index_t *)value;
+            generation_index_present = 1;
+            return 0;
+        }
+        if (!replacement_generation_index_present &&
+            !same_key(key, &stored_generation_index_key, sizeof(stored_generation_index_key))) {
+            replacement_generation_index_key = *(const java_remote_parent_key_t *)key;
+            replacement_generation_index = *(const java_remote_parent_generation_index_t *)value;
+            replacement_generation_index_present = 1;
+            return 0;
+        }
+        return -1;
     }
-    if (map == &java_remote_parent_connections && flags == BPF_NOEXIST && !connection_present) {
+    if (map == &java_remote_parent_connections && flags == BPF_NOEXIST) {
+        if (connection_present) {
+            return -1;
+        }
         stored_connection_key = *(const connection_info_ns_t *)key;
         stored_connection = *(const java_remote_parent_connection_t *)value;
         connection_present = 1;
@@ -245,6 +302,12 @@ test_map_update(void *map, const void *key, const void *value, unsigned long lon
         fallback_present = 1;
         return 0;
     }
+    if (map == &java_remote_parent_ambiguity && flags == BPF_ANY) {
+        ambiguity_key = *(const java_remote_parent_key_t *)key;
+        ambiguity_observed_monotime_ns = *(const u64 *)value;
+        ambiguity_present = 1;
+        return 0;
+    }
 
     unexpected_update = 1;
     return -1;
@@ -252,6 +315,9 @@ test_map_update(void *map, const void *key, const void *value, unsigned long lon
 
 static long test_map_delete(void *map, const void *key) {
     if (map == &java_remote_parent_terminal) {
+        if (terminal_present && same_key(key, &stored_terminal_key, sizeof(stored_terminal_key))) {
+            terminal_present = 0;
+        }
         return 0;
     }
     if (map == &java_remote_parent_fallback) {
@@ -275,9 +341,20 @@ static long test_map_delete(void *map, const void *key) {
         state_present = 0;
         return 0;
     }
+    if (map == &java_remote_parent_state && replacement_state_present &&
+        same_key(key, &replacement_state_key, sizeof(replacement_state_key))) {
+        replacement_state_present = 0;
+        return 0;
+    }
     if (map == &java_remote_parent_generation_index && generation_index_present &&
         same_key(key, &stored_generation_index_key, sizeof(stored_generation_index_key))) {
         generation_index_present = 0;
+        return 0;
+    }
+    if (map == &java_remote_parent_generation_index && replacement_generation_index_present &&
+        same_key(
+            key, &replacement_generation_index_key, sizeof(replacement_generation_index_key))) {
+        replacement_generation_index_present = 0;
         return 0;
     }
     if (map == &java_remote_parent_owners && owner_present &&
@@ -286,7 +363,13 @@ static long test_map_delete(void *map, const void *key) {
         return 0;
     }
     if (map == &java_remote_parent_ambiguity) {
+        if (ambiguity_present && same_key(key, &ambiguity_key, sizeof(ambiguity_key))) {
+            ambiguity_present = 0;
+        }
         return 0;
+    }
+    if (map == &java_remote_parent_data_signals) {
+        return -1;
     }
 
     unexpected_delete = 1;
@@ -310,8 +393,17 @@ static u8 test_java_vt_translate_tid(pid_key_t *owner) {
     return 0;
 }
 
+static u64 test_java_process_capability_for(const pid_key_t *owner) {
+    (void)owner;
+    return test_process_incarnation;
+}
+
 static u64 test_java_process_incarnation_for(const pid_key_t *owner) {
     (void)owner;
+    return test_process_incarnation;
+}
+
+static u64 test_java_current_process_incarnation(void) {
     return test_process_incarnation;
 }
 
@@ -344,18 +436,27 @@ static void reset(const connection_info_t *connection, const tp_info_pid_t *inco
     memset(&connection_value_scratch, 0, sizeof(connection_value_scratch));
     memset(&stored_owner, 0, sizeof(stored_owner));
     memset(&stored_state, 0, sizeof(stored_state));
+    memset(&replacement_state, 0, sizeof(replacement_state));
     memset(&stored_generation_index, 0, sizeof(stored_generation_index));
+    memset(&replacement_generation_index, 0, sizeof(replacement_generation_index));
     memset(&stored_connection, 0, sizeof(stored_connection));
     memset(&stored_cookie_connection, 0, sizeof(stored_cookie_connection));
     memset(&stored_fallback, 0, sizeof(stored_fallback));
+    memset(&stored_terminal, 0, sizeof(stored_terminal));
+    memset(&ambiguity_key, 0, sizeof(ambiguity_key));
     memset(stats, 0, sizeof(stats));
     stored_connection_key = connection_info_with_netns(connection, test_connection_netns);
     owner_present = 0;
     state_present = 0;
+    replacement_state_present = 0;
     generation_index_present = 0;
+    replacement_generation_index_present = 0;
     connection_present = 0;
     cookie_connection_present = 0;
     fallback_present = 0;
+    terminal_present = 0;
+    ambiguity_observed_monotime_ns = 0;
+    ambiguity_present = 0;
     corrupt_cookie_socket_cookie = 0;
     unexpected_update = 0;
     unexpected_delete = 0;
@@ -386,6 +487,105 @@ static void test_inconsistent_physical_index_rolls_back_stage(void) {
     }
 }
 
+static void test_aliased_generation_blocks_a_second_stage_on_the_same_socket(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    const tp_info_pid_t raw = raw_parent(k_flag_sampled);
+    reset(&connection, &raw);
+    java_remote_parent_incoming_t first_handoff = {.generation = test_incoming_generation};
+    if (!apply_incoming_trace_candidate(
+            &(tp_info_t){}, &raw, &first_handoff.candidate, &first_handoff.generation)) {
+        fail("first same-socket parent was not prepared");
+    }
+
+    const u64 first_generation = java_remote_parent_stage_incoming(&connection,
+                                                                   test_connection_netns,
+                                                                   test_connection_netns_cookie,
+                                                                   test_socket_cookie,
+                                                                   &first_handoff);
+    if (!first_generation || !state_present || !generation_index_present || !connection_present ||
+        !cookie_connection_present || !owner_present || !fallback_present) {
+        fail("first same-socket generation was not staged");
+    }
+
+    stored_state.aliases = 1;
+    java_remote_parent_begin_data_receive();
+    java_remote_parent_resolution_t direct = {0};
+    java_remote_parent_resolve_exact(&direct, &test_owner, 0, 0);
+    java_remote_parent_resolution_t exact_task = {0};
+    java_remote_parent_resolve_exact(&exact_task, &test_owner, first_generation, 1);
+    if (owner_present || fallback_present || !state_present || !generation_index_present ||
+        !connection_present || !cookie_connection_present || stored_state.aliases != 1 ||
+        direct.found || !exact_task.found || exact_task.ambiguous ||
+        exact_task.key.generation != first_generation) {
+        fail("rejected receive kept direct access or lost the exact task generation");
+    }
+
+    incoming_generation++;
+    incoming_candidate = (incoming_trace_candidate_t){.candidate = raw};
+    incoming_claim = 1;
+    java_remote_parent_incoming_t second_handoff = {.generation = incoming_generation};
+    if (!apply_incoming_trace_candidate(
+            &(tp_info_t){}, &raw, &second_handoff.candidate, &second_handoff.generation)) {
+        fail("second same-socket parent was not prepared");
+    }
+
+    const u64 second_generation = java_remote_parent_stage_incoming(&connection,
+                                                                    test_connection_netns,
+                                                                    test_connection_netns_cookie,
+                                                                    test_socket_cookie,
+                                                                    &second_handoff);
+    if (second_generation != 0 || owner_present || fallback_present || !state_present ||
+        stored_state_key.generation != first_generation || stored_state.aliases != 1 ||
+        !generation_index_present || replacement_state_present ||
+        replacement_generation_index_present || connection_present || cookie_connection_present ||
+        ambiguity_present || stats[k_java_remote_parent_stat_stage_valid] != 1 ||
+        stats[k_java_remote_parent_stat_stage_ambiguous] != 1 || unexpected_update ||
+        unexpected_delete) {
+        fail("second same-socket stage did not fail closed behind the aliased generation");
+    }
+}
+
+static void test_terminal_generation_is_replaced_without_ambiguity(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    const tp_info_pid_t raw = raw_parent(k_flag_sampled);
+    reset(&connection, &raw);
+    stored_terminal_key = test_owner;
+    stored_terminal = (java_remote_parent_terminal_t){
+        .generation = 0xdead,
+        .observed_monotime_ns = 50,
+        .process_incarnation = test_process_incarnation,
+        .lifecycle = k_java_remote_parent_lifecycle_consumed,
+    };
+    terminal_present = 1;
+
+    java_remote_parent_incoming_t handoff = {.generation = test_incoming_generation};
+    if (!apply_incoming_trace_candidate(
+            &(tp_info_t){}, &raw, &handoff.candidate, &handoff.generation)) {
+        fail("replacement parent was not prepared");
+    }
+
+    const u64 replacement_generation =
+        java_remote_parent_stage_incoming(&connection,
+                                          test_connection_netns,
+                                          test_connection_netns_cookie,
+                                          test_socket_cookie,
+                                          &handoff);
+    if (!replacement_generation || replacement_generation == stored_terminal.generation ||
+        terminal_present || !owner_present || stored_owner.generation != replacement_generation ||
+        !state_present || stored_state_key.generation != replacement_generation ||
+        !generation_index_present ||
+        stored_generation_index_key.generation != replacement_generation || !connection_present ||
+        stored_connection.generation != replacement_generation || !cookie_connection_present ||
+        stored_cookie_connection.generation != replacement_generation || !fallback_present ||
+        java_remote_parent_le64_to_cpu(stored_fallback.generation_le) != replacement_generation ||
+        ambiguity_present || replacement_state_present || replacement_generation_index_present ||
+        stats[k_java_remote_parent_stat_stage_valid] != 1 ||
+        stats[k_java_remote_parent_stat_stage_ambiguous] != 0 || unexpected_update ||
+        unexpected_delete) {
+        fail("terminal generation was not replaced by a clean active generation");
+    }
+}
+
 static void test_raw_parent_is_published_before_w3c_override(void) {
     const unsigned char raw_flags[] = {0, k_flag_sampled, 0x81};
 
@@ -406,12 +606,12 @@ static void test_raw_parent_is_published_before_w3c_override(void) {
             fail("raw TCP parent was not prepared for Java handoff");
         }
 
-        const u64 staged_generation = java_remote_parent_stage_incoming(
-            &connection,
-            test_connection_netns,
-            test_connection_netns_cookie,
-            test_socket_cookie,
-            &handoff);
+        const u64 staged_generation =
+            java_remote_parent_stage_incoming(&connection,
+                                              test_connection_netns,
+                                              test_connection_netns_cookie,
+                                              test_socket_cookie,
+                                              &handoff);
         if (!staged_generation || !state_present || !fallback_present || unexpected_update ||
             unexpected_delete || stats[k_java_remote_parent_stat_stage_valid] != 1 ||
             stored_state.response.status != k_java_remote_parent_status_valid ||
@@ -453,5 +653,7 @@ static void test_raw_parent_is_published_before_w3c_override(void) {
 int main(void) {
     test_raw_parent_is_published_before_w3c_override();
     test_inconsistent_physical_index_rolls_back_stage();
+    test_aliased_generation_blocks_a_second_stage_on_the_same_socket();
+    test_terminal_generation_is_replaced_without_ambiguity();
     return 0;
 }

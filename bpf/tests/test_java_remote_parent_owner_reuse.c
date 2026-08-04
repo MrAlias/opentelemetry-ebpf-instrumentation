@@ -30,18 +30,38 @@ static unsigned int test_prandom_u32(void);
 
 static void test_task_tid(pid_key_t *owner);
 static u8 test_java_vt_translate_tid(pid_key_t *owner);
+static u8 test_java_vt_translate_authorized_tid(pid_key_t *owner);
+static u8 test_java_vt_translate_tid_for_capability(pid_key_t *owner, u64 process_capability);
 static u64 test_java_current_process_incarnation(void);
 static u64 test_java_process_incarnation_for(const pid_key_t *owner);
+static u64 test_java_process_capability_for(const pid_key_t *owner);
+static u8 test_java_vt_prepare_unregistered_cleanup(const pid_key_t *carrier,
+                                                    u64 vt_id,
+                                                    u64 process_capability,
+                                                    pid_key_t *synthetic_owner,
+                                                    java_vt_identity_t *expected_identity);
+static u8 test_java_vt_delete_identity_if_matches(const pid_key_t *synthetic_owner,
+                                                  const java_vt_identity_t *expected_identity);
 
 #define task_tid test_task_tid
 #define java_vt_translate_tid test_java_vt_translate_tid
+#define java_vt_translate_authorized_tid test_java_vt_translate_authorized_tid
+#define java_vt_translate_tid_for_capability test_java_vt_translate_tid_for_capability
 #define java_current_process_incarnation test_java_current_process_incarnation
 #define java_process_incarnation_for test_java_process_incarnation_for
+#define java_process_capability_for test_java_process_capability_for
+#define java_vt_prepare_unregistered_cleanup test_java_vt_prepare_unregistered_cleanup
+#define java_vt_delete_identity_if_matches test_java_vt_delete_identity_if_matches
 
 #include <maps/java_remote_parent.h>
 
+#undef java_process_capability_for
 #undef java_process_incarnation_for
 #undef java_current_process_incarnation
+#undef java_vt_delete_identity_if_matches
+#undef java_vt_prepare_unregistered_cleanup
+#undef java_vt_translate_authorized_tid
+#undef java_vt_translate_tid_for_capability
 #undef java_vt_translate_tid
 #undef task_tid
 #undef bpf_loop
@@ -69,6 +89,9 @@ static const u64 test_capture_race_token = 2001;
 static const u64 test_relay_race_token = 2002;
 static const u64 test_capture_transfer_token = 3001;
 static const u64 test_relay_transfer_token = 3002;
+static const u64 test_task_only_capture_token = 4001;
+static const u64 test_receive_boundary_capture_token = 4002;
+static const u64 test_direct_over_task_capture_token = 4003;
 static const u64 test_socket_cookie = 86;
 static const u64 test_replacement_socket_cookie = 87;
 static const pid_key_t test_owner = {.tid = 7, .pid = 5, .ns = 3};
@@ -94,6 +117,9 @@ typedef struct ambiguity_entry {
 } ambiguity_entry_t;
 
 static pid_key_t current_task;
+static pid_key_t authorized_translation_owner;
+static u8 authorized_translation_result;
+static u64 current_process_incarnation;
 static java_remote_parent_connection_keys_t connection_keys_scratch;
 static java_remote_parent_connection_t connection_value_scratch;
 static java_remote_parent_state_t stage_state_scratch;
@@ -131,6 +157,7 @@ static handoff_entry_t handoffs[2];
 static handoff_claim_entry_t handoff_claims[2];
 static ambiguity_entry_t ambiguities[3];
 static java_remote_parent_task_t stored_task;
+static pid_key_t stored_task_key;
 static int task_present;
 static pid_key_t transferred_task_key;
 static java_remote_parent_task_t transferred_task;
@@ -156,6 +183,11 @@ static int transfer_handoff_deletes;
 static int transfer_claim_evictions;
 static int observe_alias_balance;
 static int alias_zero_observed;
+static int java_vt_thread_deletes;
+static int java_vt_identity_deletes;
+static pid_key_t expected_java_task_delete_key;
+static int expect_java_task_delete;
+static int java_task_deletes;
 static int unexpected_update;
 static int unexpected_delete;
 
@@ -324,7 +356,7 @@ static void *test_map_lookup(void *map, const void *key) {
         return entry ? &entry->value : NULL;
     }
     if (map == &java_remote_parent_tasks && task_present &&
-        same_key(key, &test_child, sizeof(test_child))) {
+        same_key(key, &stored_task_key, sizeof(stored_task_key))) {
         return &stored_task;
     }
     if (map == &java_remote_parent_tasks && transferred_task_present &&
@@ -427,7 +459,7 @@ test_map_update(void *map, const void *key, const void *value, unsigned long lon
         return update_ambiguity(key, value, flags);
     }
     if (map == &java_remote_parent_tasks && flags == BPF_ANY &&
-        same_key(key, &test_child, sizeof(test_child))) {
+        same_key(key, &stored_task_key, sizeof(stored_task_key))) {
         stored_task = *(const java_remote_parent_task_t *)value;
         task_present = 1;
         return 0;
@@ -482,7 +514,7 @@ static long test_map_delete(void *map, const void *key) {
         return 0;
     }
     if (map == &java_remote_parent_tasks && task_present &&
-        same_key(key, &test_child, sizeof(test_child))) {
+        same_key(key, &stored_task_key, sizeof(stored_task_key))) {
         task_present = 0;
         return 0;
     }
@@ -538,8 +570,7 @@ static long test_map_delete(void *map, const void *key) {
         claim_present = 0;
         return 0;
     }
-    if (map == &java_remote_parent_terminal &&
-        same_key(key, &test_owner, sizeof(test_owner))) {
+    if (map == &java_remote_parent_terminal && same_key(key, &test_owner, sizeof(test_owner))) {
         if (terminal_present) {
             terminal_present = 0;
             return 0;
@@ -548,6 +579,17 @@ static long test_map_delete(void *map, const void *key) {
     }
     if (map == &java_remote_parent_data_signals) {
         return -1;
+    }
+    if (map == &java_tasks) {
+        if (expect_java_task_delete &&
+            same_key(key, &expected_java_task_delete_key, sizeof(expected_java_task_delete_key))) {
+            java_task_deletes++;
+        }
+        return 0;
+    }
+    if (map == &java_vt_threads) {
+        java_vt_thread_deletes++;
+        return 0;
     }
 
     unexpected_delete = 1;
@@ -571,14 +613,64 @@ static u8 test_java_vt_translate_tid(pid_key_t *owner) {
     return 0;
 }
 
+static u8 test_java_vt_translate_authorized_tid(pid_key_t *owner) {
+    if (authorized_translation_result == k_java_vt_cleanup_translation_none) {
+        return 0;
+    }
+    *owner = authorized_translation_owner;
+    return authorized_translation_result;
+}
+
+static u8 test_java_vt_translate_tid_for_capability(pid_key_t *owner, u64 process_capability) {
+    if (process_capability != test_process_incarnation) {
+        return k_java_vt_cleanup_translation_none;
+    }
+    return test_java_vt_translate_authorized_tid(owner);
+}
+
 static u64 test_java_current_process_incarnation(void) {
-    return test_process_incarnation;
+    return current_process_incarnation;
 }
 
 static u64 test_java_process_incarnation_for(const pid_key_t *owner) {
     const pid_key_t process = java_process_key(owner);
     const pid_key_t expected = java_process_key(&test_owner);
     return same_key(&process, &expected, sizeof(process)) ? test_process_incarnation : 0;
+}
+
+static u64 test_java_process_capability_for(const pid_key_t *owner) {
+    const pid_key_t process = java_process_key(owner);
+    const pid_key_t expected = java_process_key(&test_owner);
+    return same_key(&process, &expected, sizeof(process)) ? test_process_incarnation : 0;
+}
+
+static u8 test_java_vt_prepare_unregistered_cleanup(const pid_key_t *carrier,
+                                                    u64 vt_id,
+                                                    u64 process_capability,
+                                                    pid_key_t *synthetic_owner,
+                                                    java_vt_identity_t *expected_identity) {
+    (void)carrier;
+    if (!vt_id || !process_capability) {
+        return 0;
+    }
+    *synthetic_owner = test_owner;
+    *expected_identity = (java_vt_identity_t){
+        .virtual_thread_id = vt_id,
+        .process_incarnation = process_capability,
+    };
+    return 1;
+}
+
+static u8 test_java_vt_delete_identity_if_matches(const pid_key_t *synthetic_owner,
+                                                  const java_vt_identity_t *expected_identity) {
+    if (!same_key(synthetic_owner, &test_owner, sizeof(test_owner)) ||
+        expected_identity->virtual_thread_id != 42 ||
+        expected_identity->process_incarnation != test_process_incarnation) {
+        unexpected_delete = 1;
+        return 0;
+    }
+    java_vt_identity_deletes++;
+    return 1;
 }
 
 static void seed_generation(const connection_info_t *connection) {
@@ -601,6 +693,7 @@ static void seed_generation(const connection_info_t *connection) {
     memset(handoff_claims, 0, sizeof(handoff_claims));
     memset(ambiguities, 0, sizeof(ambiguities));
     memset(&stored_task, 0, sizeof(stored_task));
+    stored_task_key = test_child;
     memset(&transferred_task_key, 0, sizeof(transferred_task_key));
     memset(&transferred_task, 0, sizeof(transferred_task));
     memset(&stored_claim, 0, sizeof(stored_claim));
@@ -637,8 +730,16 @@ static void seed_generation(const connection_info_t *connection) {
     transfer_claim_evictions = 0;
     observe_alias_balance = 0;
     alias_zero_observed = 0;
+    java_vt_thread_deletes = 0;
+    java_vt_identity_deletes = 0;
+    expected_java_task_delete_key = (pid_key_t){0};
+    expect_java_task_delete = 0;
+    java_task_deletes = 0;
     unexpected_update = 0;
     unexpected_delete = 0;
+    authorized_translation_owner = (pid_key_t){0};
+    authorized_translation_result = k_java_vt_cleanup_translation_none;
+    current_process_incarnation = test_process_incarnation;
 
     stored_owner.generation = test_generation;
     stored_owner.process_incarnation = test_process_incarnation;
@@ -847,6 +948,496 @@ static void test_relay_transfer_survives_claim_eviction(void) {
     }
 }
 
+static void test_direct_capture_rejects_a_task_only_generation(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = test_now_ns,
+    };
+    task_present = 1;
+    current_task = test_child;
+
+    const java_remote_parent_handoff_key_t handoff_key =
+        java_remote_parent_handoff_key(&test_child, test_task_only_capture_token);
+    java_remote_parent_capture_handoff(test_task_only_capture_token);
+
+    if (find_handoff(&handoff_key) || find_handoff_claim(&handoff_key) ||
+        stored_state.aliases != 1 || !task_present || stored_task.generation != test_generation ||
+        !same_key(&stored_task.owner, &test_owner, sizeof(test_owner)) ||
+        find_ambiguity(&stored_state_key) || !owner_present || !state_present ||
+        !generation_index_present || !connection_present || !cookie_connection_present ||
+        !fallback_present || unexpected_update || unexpected_delete) {
+        fail("direct capture accepted or mutated an inherited task-only generation");
+    }
+}
+
+static void test_direct_retrieval_rejects_a_task_only_generation(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = test_now_ns,
+    };
+    task_present = 1;
+    current_task = test_child;
+    java_remote_parent_response_t response = {0};
+
+    const enum java_remote_parent_status status =
+        java_remote_parent_retrieve(&response, 0, test_now_ns, k_java_remote_parent_source_direct);
+
+    if (status != k_java_remote_parent_status_missing ||
+        response.status != k_java_remote_parent_status_missing ||
+        stats[k_java_remote_parent_stat_take_missing] != 1 || stored_state.aliases != 1 ||
+        !task_present || stored_task.generation != test_generation ||
+        !same_key(&stored_task.owner, &test_owner, sizeof(test_owner)) ||
+        find_ambiguity(&stored_state_key) || !owner_present || !state_present ||
+        !generation_index_present || !connection_present || !cookie_connection_present ||
+        !fallback_present || claim_present || terminal_present || unexpected_update ||
+        unexpected_delete) {
+        fail("direct retrieval accepted or mutated an inherited task-only generation");
+    }
+}
+
+static void test_task_retrieval_rejects_malformed_task_links(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    java_remote_parent_response_t response = {0};
+
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .reserved = 1,
+        .generation = test_generation,
+        .observed_monotime_ns = test_now_ns,
+    };
+    task_present = 1;
+    current_task = test_child;
+    enum java_remote_parent_status status =
+        java_remote_parent_retrieve(&response, 0, test_now_ns, k_java_remote_parent_source_task);
+    if (status != k_java_remote_parent_status_missing || task_present ||
+        stored_state.aliases != 0 || !owner_present || !state_present ||
+        !generation_index_present || !connection_present || !cookie_connection_present ||
+        !fallback_present || claim_present || terminal_present || unexpected_update ||
+        unexpected_delete) {
+        fail("task retrieval accepted a nonzero reserved task link");
+    }
+
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    stored_task = (java_remote_parent_task_t){
+        .generation = test_generation,
+        .observed_monotime_ns = test_now_ns,
+    };
+    task_present = 1;
+    current_task = test_child;
+    memset(&response, 0, sizeof(response));
+    status =
+        java_remote_parent_retrieve(&response, 0, test_now_ns, k_java_remote_parent_source_task);
+    if (status != k_java_remote_parent_status_missing || task_present ||
+        stored_state.aliases != 1 || !owner_present || !state_present ||
+        !generation_index_present || !connection_present || !cookie_connection_present ||
+        !fallback_present || claim_present || terminal_present || unexpected_update ||
+        unexpected_delete) {
+        fail("task retrieval accepted an empty task owner");
+    }
+}
+
+static void test_direct_capture_rejects_a_generation_detached_at_a_receive_boundary(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    stored_task_key = test_owner;
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = test_now_ns,
+    };
+    task_present = 1;
+
+    java_remote_parent_begin_data_receive();
+    if (owner_present || fallback_present || !state_present || !generation_index_present ||
+        !connection_present || !cookie_connection_present || !task_present ||
+        stored_state.aliases != 1 || unexpected_update || unexpected_delete) {
+        fail("receive boundary did not detach the inherited generation cursor");
+    }
+
+    const java_remote_parent_handoff_key_t handoff_key =
+        java_remote_parent_handoff_key(&test_owner, test_receive_boundary_capture_token);
+    java_remote_parent_capture_handoff(test_receive_boundary_capture_token);
+
+    if (find_handoff(&handoff_key) || find_handoff_claim(&handoff_key) ||
+        stored_state.aliases != 1 || !task_present || stored_task.generation != test_generation ||
+        !same_key(&stored_task.owner, &test_owner, sizeof(test_owner)) ||
+        find_ambiguity(&stored_state_key) || owner_present || fallback_present || !state_present ||
+        !generation_index_present || !connection_present || !cookie_connection_present ||
+        unexpected_update || unexpected_delete) {
+        fail("direct capture revived a task alias detached by a receive boundary");
+    }
+}
+
+static void test_registration_eviction_detaches_a_mounted_virtual_thread(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    stored_task_key = test_owner;
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = test_now_ns,
+    };
+    task_present = 1;
+
+    current_task = (pid_key_t){.tid = 6, .pid = test_owner.pid, .ns = test_owner.ns};
+    authorized_translation_owner = test_owner;
+    authorized_translation_result = k_java_vt_cleanup_translation_exact;
+    current_process_incarnation = 0;
+    java_remote_parent_begin_data_receive();
+
+    if (owner_present || fallback_present || !state_present || !generation_index_present ||
+        !connection_present || !cookie_connection_present || !task_present ||
+        stored_state.aliases != 1 || unexpected_update || unexpected_delete) {
+        fail("registration eviction deleted an exact mounted virtual-thread alias");
+    }
+
+    current_process_incarnation = test_process_incarnation;
+    java_remote_parent_resolution_t direct = {0};
+    java_remote_parent_resolve_exact(&direct, &test_owner, 0, 0);
+    java_remote_parent_resolution_t exact_task = {0};
+    java_remote_parent_resolve_exact(&exact_task, &test_owner, test_generation, 1);
+    if (direct.found || !exact_task.found || exact_task.ambiguous ||
+        exact_task.key.generation != test_generation || unexpected_update || unexpected_delete) {
+        fail("registration eviction left a mounted virtual thread's direct cursor visible");
+    }
+
+    // If the full-width guard then disappears, fallback cleanup must unlink
+    // the already task-only alias even though its direct owner cursor is gone.
+    authorized_translation_result = k_java_vt_cleanup_translation_fallback;
+    current_process_incarnation = 0;
+    java_remote_parent_begin_data_receive();
+    if (!state_present || !generation_index_present || !connection_present ||
+        !cookie_connection_present || task_present || stored_state.aliases != 0 || claim_present ||
+        terminal_present || unexpected_update || unexpected_delete) {
+        fail("identity-guard loss preserved an ownerless synthetic task alias");
+    }
+    current_process_incarnation = test_process_incarnation;
+    direct = (java_remote_parent_resolution_t){0};
+    java_remote_parent_resolve_exact(&direct, &test_owner, 0, 0);
+    exact_task = (java_remote_parent_resolution_t){0};
+    java_remote_parent_resolve_exact(&exact_task, &test_owner, test_generation, 1);
+    if (direct.found || exact_task.found) {
+        fail("identity-guard recovery revived a zero-alias orphan generation");
+    }
+}
+
+static void test_missing_identity_guard_destroys_a_mounted_virtual_thread_generation(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    stored_task_key = test_owner;
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = test_now_ns,
+    };
+    task_present = 1;
+
+    current_task = (pid_key_t){.tid = 6, .pid = test_owner.pid, .ns = test_owner.ns};
+    authorized_translation_owner = test_owner;
+    authorized_translation_result = k_java_vt_cleanup_translation_fallback;
+    current_process_incarnation = 0;
+    java_remote_parent_begin_data_receive();
+
+    if (owner_present || fallback_present || state_present || generation_index_present ||
+        connection_present || cookie_connection_present || task_present || claim_present ||
+        terminal_present || unexpected_update || unexpected_delete) {
+        fail("missing virtual-thread identity guard preserved a revivable generation");
+    }
+
+    current_process_incarnation = test_process_incarnation;
+    java_remote_parent_resolution_t direct = {0};
+    java_remote_parent_resolve_exact(&direct, &test_owner, 0, 0);
+    java_remote_parent_resolution_t exact_task = {0};
+    java_remote_parent_resolve_exact(&exact_task, &test_owner, test_generation, 1);
+    if (direct.found || exact_task.found || unexpected_update || unexpected_delete) {
+        fail("identity-guard recovery revived a destructively detached generation");
+    }
+}
+
+static void test_recreated_identity_guard_discards_the_shared_synthetic_owner(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    stored_task_key = test_owner;
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = test_now_ns,
+    };
+    task_present = 1;
+
+    // A successful BPF_NOEXIST insertion may be the first guard or a guard
+    // recreated after eviction. Mount handling must discard the shared low-31
+    // synthetic key before publishing either case.
+    java_remote_parent_discard_virtual_thread_owner(&test_owner);
+    if (owner_present || fallback_present || state_present || generation_index_present ||
+        connection_present || cookie_connection_present || task_present || claim_present ||
+        terminal_present || unexpected_update || unexpected_delete) {
+        fail("recreated virtual-thread identity guard preserved old synthetic-owner state");
+    }
+
+    current_task = (pid_key_t){.tid = 6, .pid = test_owner.pid, .ns = test_owner.ns};
+    authorized_translation_owner = test_owner;
+    authorized_translation_result = k_java_vt_cleanup_translation_exact;
+    java_remote_parent_begin_data_receive();
+    java_remote_parent_resolution_t exact_task = {0};
+    java_remote_parent_resolve_exact(&exact_task, &test_owner, test_generation, 1);
+    if (exact_task.found || unexpected_update || unexpected_delete) {
+        fail("colliding remount revived a discarded synthetic task alias");
+    }
+}
+
+static void assert_carrier_exit_destroys_mounted_owner(u8 translation_result) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    stored_task_key = test_owner;
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = test_now_ns,
+    };
+    task_present = 1;
+
+    const pid_key_t carrier = {.tid = 6, .pid = test_owner.pid, .ns = test_owner.ns};
+    authorized_translation_owner = test_owner;
+    authorized_translation_result = translation_result;
+    current_process_incarnation = 0;
+    pid_key_t logical_owner = {};
+    if (java_remote_parent_cleanup_exiting_task(&carrier, &logical_owner) != translation_result ||
+        !same_key(&logical_owner, &test_owner, sizeof(logical_owner)) || owner_present ||
+        fallback_present || state_present || generation_index_present || connection_present ||
+        cookie_connection_present || task_present || claim_present || terminal_present ||
+        unexpected_update || unexpected_delete) {
+        fail("carrier exit preserved a mounted synthetic generation after guard loss");
+    }
+}
+
+static void test_carrier_exit_cleans_mounted_owner_after_lru_loss(void) {
+    assert_carrier_exit_destroys_mounted_owner(k_java_vt_cleanup_translation_exact);
+    assert_carrier_exit_destroys_mounted_owner(k_java_vt_cleanup_translation_fallback);
+}
+
+static void assert_unregistered_lifecycle_destroys_mounted_owner(u8 translation_result) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    stored_task_key = test_owner;
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = test_now_ns,
+    };
+    task_present = 1;
+
+    const pid_key_t carrier = {.tid = 6, .pid = test_owner.pid, .ns = test_owner.ns};
+    authorized_translation_owner = test_owner;
+    authorized_translation_result = translation_result;
+    current_process_incarnation = 0;
+    expected_java_task_delete_key = carrier;
+    expect_java_task_delete = 1;
+    java_remote_parent_discard_unregistered_virtual_thread_lifecycle(&carrier,
+                                                                     test_process_incarnation);
+
+    if (owner_present || fallback_present || state_present || generation_index_present ||
+        connection_present || cookie_connection_present || task_present || claim_present ||
+        terminal_present || java_vt_thread_deletes != 1 || java_task_deletes != 1 ||
+        unexpected_update || unexpected_delete) {
+        fail("unregistered virtual-thread lifecycle preserved a mounted synthetic generation");
+    }
+}
+
+static void test_unregistered_lifecycle_cleans_mounted_owner_after_registration_loss(void) {
+    assert_unregistered_lifecycle_destroys_mounted_owner(k_java_vt_cleanup_translation_exact);
+    assert_unregistered_lifecycle_destroys_mounted_owner(k_java_vt_cleanup_translation_fallback);
+}
+
+static void assert_unregistered_payload_destroys_parked_owner(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    stored_task_key = test_owner;
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = test_now_ns,
+    };
+    task_present = 1;
+
+    const pid_key_t carrier = {.tid = 6, .pid = test_owner.pid, .ns = test_owner.ns};
+    authorized_translation_result = k_java_vt_cleanup_translation_none;
+    current_process_incarnation = 0;
+    expected_java_task_delete_key = carrier;
+    expect_java_task_delete = 1;
+    java_remote_parent_discard_unregistered_virtual_thread_id(
+        &carrier, 42, test_process_incarnation, 1);
+
+    if (owner_present || fallback_present || state_present || generation_index_present ||
+        connection_present || cookie_connection_present || task_present || claim_present ||
+        terminal_present || java_vt_thread_deletes != 1 || java_vt_identity_deletes != 1 ||
+        java_task_deletes != 1 || unexpected_update || unexpected_delete) {
+        fail("unregistered payload cleanup preserved a parked virtual-thread generation");
+    }
+
+    // Model registration recovery and an exact remount. Neither direct nor
+    // task lookup may revive the state that existed before the rejected event.
+    current_process_incarnation = test_process_incarnation;
+    authorized_translation_owner = test_owner;
+    authorized_translation_result = k_java_vt_cleanup_translation_exact;
+    java_remote_parent_resolution_t direct = {0};
+    java_remote_parent_resolve_exact(&direct, &test_owner, 0, 0);
+    const java_remote_parent_resolution_t task = java_remote_parent_resolve_task(&test_owner, 0);
+    if (direct.found || task.found || unexpected_update || unexpected_delete) {
+        fail("registration recovery revived a parked virtual-thread generation");
+    }
+}
+
+static void test_unregistered_payload_cleans_parked_owner_after_registration_loss(void) {
+    assert_unregistered_payload_destroys_parked_owner();
+}
+
+static void assert_unregistered_task_lifecycle_removes_stale_alias(u8 translation_result) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    const pid_key_t carrier = {.tid = 6, .pid = test_owner.pid, .ns = test_owner.ns};
+    stored_task_key =
+        translation_result == k_java_vt_cleanup_translation_none ? carrier : test_owner;
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = test_now_ns,
+    };
+    task_present = 1;
+    authorized_translation_owner = test_owner;
+    authorized_translation_result = translation_result;
+    current_process_incarnation = 0;
+
+    java_remote_parent_discard_unregistered_task_lifecycle(&carrier, test_process_incarnation);
+    const u8 fallback_preserved_state =
+        translation_result == k_java_vt_cleanup_translation_fallback &&
+        (owner_present || fallback_present || state_present || generation_index_present ||
+         connection_present || cookie_connection_present || claim_present || terminal_present);
+    const u8 exact_alias_not_released =
+        translation_result != k_java_vt_cleanup_translation_fallback && stored_state.aliases != 0;
+    if (task_present || fallback_preserved_state || exact_alias_not_released || unexpected_update ||
+        unexpected_delete) {
+        fail("unregistered task lifecycle preserved an exact worker alias");
+    }
+
+    current_process_incarnation = test_process_incarnation;
+    const java_remote_parent_resolution_t task = java_remote_parent_resolve_task(
+        translation_result == k_java_vt_cleanup_translation_none ? &carrier : &test_owner, 0);
+    if (task.found || unexpected_update || unexpected_delete) {
+        fail("registration recovery revived a rejected task link");
+    }
+}
+
+static void test_unregistered_task_lifecycle_cleans_worker_alias_after_registration_loss(void) {
+    assert_unregistered_task_lifecycle_removes_stale_alias(k_java_vt_cleanup_translation_none);
+    assert_unregistered_task_lifecycle_removes_stale_alias(k_java_vt_cleanup_translation_exact);
+    assert_unregistered_task_lifecycle_removes_stale_alias(k_java_vt_cleanup_translation_fallback);
+}
+
+static void test_unregistered_token_cancellation_cannot_replay_after_registration_recovery(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    java_remote_parent_capture_handoff(test_cancelled_token);
+    const java_remote_parent_handoff_key_t key =
+        java_remote_parent_handoff_key(&test_owner, test_cancelled_token);
+    if (!find_handoff(&key) || stored_state.aliases != 1) {
+        fail("task handoff was not staged before registration loss");
+    }
+
+    current_process_incarnation = 0;
+    const pid_key_t carrier = {.tid = 6, .pid = test_owner.pid, .ns = test_owner.ns};
+    // Handoff authority is process-scoped: carrier and synthetic VT tids map
+    // to the same {pid, namespace, token} cancellation key.
+    java_remote_parent_cancel_handoff_for_capability(
+        &carrier, test_cancelled_token, test_process_incarnation);
+    const handoff_claim_entry_t *claim = find_handoff_claim(&key);
+    if (find_handoff(&key) || !claim ||
+        claim->value.process_incarnation != test_process_incarnation || stored_state.aliases != 0 ||
+        unexpected_update || unexpected_delete) {
+        fail("unregistered cancellation retained a replayable task handoff");
+    }
+
+    current_process_incarnation = test_process_incarnation;
+    java_remote_parent_link_handoff(&test_child, test_cancelled_token);
+    if (task_present || transferred_task_present || find_handoff(&key) || unexpected_update ||
+        unexpected_delete) {
+        fail("registration recovery replayed a cleanup-claimed task handoff");
+    }
+}
+
+static void test_direct_capture_selects_a_new_receive_over_an_old_task_alias(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    const connection_info_t replacement = {.s_port = 2345, .d_port = 8443};
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+
+    java_remote_parent_begin_data_receive();
+    seed_replacement_generation(&replacement);
+    stored_task_key = test_owner;
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = test_now_ns,
+    };
+    task_present = 1;
+
+    const java_remote_parent_handoff_key_t handoff_key =
+        java_remote_parent_handoff_key(&test_owner, test_direct_over_task_capture_token);
+    java_remote_parent_capture_handoff(test_direct_over_task_capture_token);
+
+    const handoff_entry_t *handoff = find_handoff(&handoff_key);
+    if (!handoff || handoff->value.generation != test_replacement_generation ||
+        !same_key(&handoff->value.owner, &test_owner, sizeof(test_owner)) ||
+        stored_state.aliases != 1 || replacement_state.aliases != 1 || !task_present ||
+        stored_task.generation != test_generation ||
+        !same_key(&stored_task.owner, &test_owner, sizeof(test_owner)) ||
+        find_ambiguity(&stored_state_key) || find_ambiguity(&replacement_state_key) ||
+        !owner_present || stored_owner.generation != test_replacement_generation ||
+        !state_present || !replacement_state_present || !generation_index_present ||
+        !replacement_generation_index_present || !connection_present ||
+        !replacement_connection_present || !cookie_connection_present ||
+        !replacement_cookie_connection_present || unexpected_update || unexpected_delete) {
+        fail("direct capture selected or mutated an old task alias instead of the new receive");
+    }
+}
+
+static void test_retrieval_rejects_an_unknown_source_without_mutation(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    java_remote_parent_response_t response = {0};
+
+    const enum java_remote_parent_status status =
+        java_remote_parent_retrieve(&response, 0, test_now_ns, (enum java_remote_parent_source)0);
+
+    if (status != k_java_remote_parent_status_malformed ||
+        response.status != k_java_remote_parent_status_malformed ||
+        stats[k_java_remote_parent_stat_take_malformed] != 1 || !owner_present || !state_present ||
+        !generation_index_present || !connection_present || !cookie_connection_present ||
+        !fallback_present || task_present || claim_present || terminal_present ||
+        unexpected_update || unexpected_delete) {
+        fail("unknown retrieval source did not fail malformed without mutation");
+    }
+}
+
 static void test_direct_child_conflict_marks_exact_generations(void) {
     const connection_info_t connection = {.s_port = 1234, .d_port = 443};
     const connection_info_t replacement = {.s_port = 2345, .d_port = 8443};
@@ -973,38 +1564,39 @@ static void test_captured_generation_survives_owner_reuse(void) {
 
     current_task = test_child;
     java_remote_parent_response_t response = {0};
-    enum java_remote_parent_status status = java_remote_parent_retrieve_for_connection(
-        &response,
-        0,
-        test_now_ns,
-        &connection,
-        test_connection_netns,
-        test_replacement_generation,
-        test_socket_cookie);
+    enum java_remote_parent_status status =
+        java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_replacement_generation,
+                                                   test_socket_cookie);
     if (status != k_java_remote_parent_status_missing || !state_present || claim_present) {
         fail("wrong exact generation consumed the preserved generation");
     }
 
-    status = java_remote_parent_retrieve_for_connection(
-        &response,
-        0,
-        test_now_ns,
-        &replacement,
-        test_connection_netns,
-        test_generation,
-        test_replacement_socket_cookie);
+    status = java_remote_parent_retrieve_for_connection(&response,
+                                                        0,
+                                                        test_now_ns,
+                                                        k_java_remote_parent_source_task,
+                                                        &replacement,
+                                                        test_connection_netns,
+                                                        test_generation,
+                                                        test_replacement_socket_cookie);
     if (status != k_java_remote_parent_status_missing || !state_present || claim_present) {
         fail("wrong exact connection consumed the preserved generation");
     }
 
-    status = java_remote_parent_retrieve_for_connection(
-        &response,
-        0,
-        test_now_ns,
-        &connection,
-        test_connection_netns,
-        test_generation,
-        test_replacement_socket_cookie);
+    status = java_remote_parent_retrieve_for_connection(&response,
+                                                        0,
+                                                        test_now_ns,
+                                                        k_java_remote_parent_source_task,
+                                                        &connection,
+                                                        test_connection_netns,
+                                                        test_generation,
+                                                        test_replacement_socket_cookie);
     if (status != k_java_remote_parent_status_missing || !state_present || claim_present) {
         fail("wrong physical socket consumed the preserved generation");
     }
@@ -1012,6 +1604,7 @@ static void test_captured_generation_survives_owner_reuse(void) {
     status = java_remote_parent_retrieve_for_connection(&response,
                                                         0,
                                                         test_now_ns,
+                                                        k_java_remote_parent_source_task,
                                                         &connection,
                                                         test_connection_netns,
                                                         test_generation,
@@ -1039,7 +1632,8 @@ static void test_captured_generation_survives_owner_reuse(void) {
     }
 
     memset(&response, 0, sizeof(response));
-    status = java_remote_parent_retrieve(&response, 0, test_now_ns);
+    status =
+        java_remote_parent_retrieve(&response, 0, test_now_ns, k_java_remote_parent_source_task);
     if (status != k_java_remote_parent_status_already_consumed ||
         java_remote_parent_le64_to_cpu(response.generation_le) != test_generation ||
         stats[k_java_remote_parent_stat_take_already_consumed] != 1 ||
@@ -1059,6 +1653,7 @@ static void test_captured_generation_survives_owner_reuse(void) {
     status = java_remote_parent_retrieve_for_connection(&response,
                                                         0,
                                                         test_now_ns,
+                                                        k_java_remote_parent_source_direct,
                                                         &replacement,
                                                         test_connection_netns,
                                                         test_replacement_generation,
@@ -1088,6 +1683,20 @@ int main(void) {
     test_relay_claim_race_preserves_existing_task_alias();
     test_capture_transfer_survives_claim_eviction();
     test_relay_transfer_survives_claim_eviction();
+    test_direct_capture_rejects_a_task_only_generation();
+    test_direct_retrieval_rejects_a_task_only_generation();
+    test_task_retrieval_rejects_malformed_task_links();
+    test_direct_capture_rejects_a_generation_detached_at_a_receive_boundary();
+    test_registration_eviction_detaches_a_mounted_virtual_thread();
+    test_missing_identity_guard_destroys_a_mounted_virtual_thread_generation();
+    test_recreated_identity_guard_discards_the_shared_synthetic_owner();
+    test_carrier_exit_cleans_mounted_owner_after_lru_loss();
+    test_unregistered_lifecycle_cleans_mounted_owner_after_registration_loss();
+    test_unregistered_payload_cleans_parked_owner_after_registration_loss();
+    test_unregistered_task_lifecycle_cleans_worker_alias_after_registration_loss();
+    test_unregistered_token_cancellation_cannot_replay_after_registration_recovery();
+    test_direct_capture_selects_a_new_receive_over_an_old_task_alias();
+    test_retrieval_rejects_an_unknown_source_without_mutation();
     test_direct_child_conflict_marks_exact_generations();
     test_new_receive_cleans_unaliased_generation_with_the_same_socket_cookie();
     test_captured_generation_survives_owner_reuse();

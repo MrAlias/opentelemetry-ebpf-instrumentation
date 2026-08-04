@@ -99,7 +99,7 @@ func TestVersionMismatchIsTyped(t *testing.T) {
 
 	request, err := (Request{Operation: OperationTake, NamespaceTID: 1}).MarshalBinary()
 	require.NoError(t, err)
-	request[4] = 3
+	request[4] = 4
 	_, err = UnmarshalRequest(request)
 	require.ErrorIs(t, err, ErrVersionMismatch)
 }
@@ -173,17 +173,42 @@ func TestValidRecordRejectsIncompletePayload(t *testing.T) {
 func TestRequestGoldenVector(t *testing.T) {
 	request := Request{
 		Operation:          OperationTake,
+		Source:             LookupSourceDirect,
 		NamespaceTID:       0x01020304,
 		ProcessIncarnation: 0x0102030405060708,
 	}
 
 	encoded, err := request.MarshalBinary()
 	require.NoError(t, err)
-	assert.Equal(t, "4f4249510200180001000000040302010807060504030201", hex.EncodeToString(encoded))
+	assert.Equal(t, "4f4249510300180001010000040302010807060504030201", hex.EncodeToString(encoded))
 
 	decoded, err := UnmarshalRequest(encoded)
 	require.NoError(t, err)
 	assert.Equal(t, request, decoded)
+}
+
+func TestRequestSourceIsExplicitOnTheWire(t *testing.T) {
+	direct, err := (Request{Operation: OperationTake}).MarshalBinary()
+	require.NoError(t, err)
+	assert.Equal(t, byte(LookupSourceDirect), direct[9])
+
+	task, err := (Request{Operation: OperationDiscard, Source: LookupSourceTask}).MarshalBinary()
+	require.NoError(t, err)
+	decoded, err := UnmarshalRequest(task)
+	require.NoError(t, err)
+	assert.Equal(t, LookupSourceTask, decoded.Source)
+
+	for _, source := range []byte{0, 0xff} {
+		candidate := append([]byte(nil), direct...)
+		candidate[9] = source
+		_, err = UnmarshalRequest(candidate)
+		require.Error(t, err)
+	}
+
+	candidate := append([]byte(nil), direct...)
+	candidate[10] = 1
+	_, err = UnmarshalRequest(candidate)
+	require.Error(t, err)
 }
 
 func TestSampledAndUnsampledRoundTrip(t *testing.T) {

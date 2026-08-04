@@ -30,6 +30,8 @@
 
 #include <shared/obi_ctx.h>
 
+#include <generictracer/java_remote_parent_receive.h>
+
 enum { k_ioctl_magic_id = 0x0b10b1 };
 enum {
     k_ioctl_java_send = 1,
@@ -48,6 +50,7 @@ enum {
 };
 
 enum { k_ioctl_invalid_op = 0xff };
+enum { k_java_control_cleanup_required = 1 };
 // Keep this ceiling aligned with the largest large-buffer capture limit in
 // bpf/common/large_buffers.h.
 enum { k_ioctl_max_payload_len = 1 << 16 };
@@ -100,312 +103,32 @@ static __always_inline u8 java_connection_from_file(struct file *file,
     return *netns != 0;
 }
 
-static __always_inline int handle_java_ioctl(
-    struct pt_regs *ctx, struct file *file, u64 id, unsigned char *uarg, u8 data_only) {
-    pid_key_t task = {0};
-    task_tid(&task);
-    if (!java_process_authorized_for(&task)) {
+// Keep the payload path in a sibling BPF function so the receive-boundary
+// cleanup does not share its large stack frame. The boundary and registration
+// gate run in handle_java_ioctl before this function performs the first tuple
+// read.
+static __noinline int
+handle_java_data_ioctl(struct pt_regs *ctx, struct file *file, u64 id, unsigned char *uarg, u8 op) {
+    connection_info_t claimed = {0};
+    if (bpf_probe_read_user(&claimed, sizeof(claimed), uarg + 1) != 0) {
         return 0;
     }
 
-    u8 op_cmd = 0;
-    if (bpf_probe_read_user(&op_cmd, sizeof(op_cmd), uarg) != 0) {
-        return 0;
-    }
-    const u8 op = cmd_to_op(op_cmd);
-    const u8 data_operation = op != k_ioctl_invalid_op || op_cmd == k_ioctl_java_tls_connection;
-    if (data_operation != data_only) {
-        return 0;
-    }
-    if (op_cmd != k_ioctl_java_process_register && !java_process_registered_for(&task)) {
-        return 0;
-    }
-
-    // Control opcodes each handle themselves and return; the data opcodes
-    // (send/recv) fall through to the connection/payload path below.
-    switch (op_cmd) {
-    case k_ioctl_java_process_register: {
-        u64 incarnation = 0;
-        if (bpf_probe_read_user(&incarnation, sizeof(incarnation), uarg + 1) != 0 || !incarnation) {
-            return 0;
-        }
-
-        const pid_key_t process = java_process_key(&task);
-        if (java_process_capability_for(&process) != incarnation) {
-            return 0;
-        }
-        const u64 *previous = bpf_map_lookup_elem(&java_process_incarnations, &process);
-        if (java_remote_parent_enabled && previous && *previous != incarnation) {
-            java_remote_parent_cleanup(&task);
-            java_remote_parent_cleanup(&process);
-            java_remote_parent_unlink_task(&task);
-            bpf_map_delete_elem(&java_tasks, &task);
-        }
-        java_register_process_incarnation(incarnation);
-        return 0;
-    }
-    case k_ioctl_java_vt_mount: {
-        // The agent reports, on every VirtualThread.mount(), the logical
-        // thread id now mounted on this carrier; the current kernel thread
-        // IS the carrier.
-        u64 vt_id = 0;
-        if (bpf_probe_read_user(&vt_id, sizeof(vt_id), uarg + 1) != 0) {
-            return 0;
-        }
-
-        pid_key_t carrier = {0};
-        task_tid(&carrier);
-        pid_key_t synthetic_owner = {0};
-        java_vt_identity_t mount_identity = {0};
-        enum java_vt_mount_result mount_result =
-            java_vt_prepare_mount(&carrier, vt_id, &synthetic_owner, &mount_identity);
-
-        if (mount_result == k_java_vt_mount_collision ||
-            mount_result == k_java_vt_mount_stale_incarnation) {
-            if (java_remote_parent_enabled) {
-                java_remote_parent_cleanup(&synthetic_owner);
-                java_remote_parent_unlink_task(&synthetic_owner);
-                bpf_map_delete_elem(&java_tasks, &synthetic_owner);
-            }
-            if (mount_result == k_java_vt_mount_collision ||
-                !java_vt_replace_stale_identity(&synthetic_owner, &mount_identity)) {
-                bpf_map_delete_elem(&java_vt_threads, &carrier);
-                return 0;
-            }
-        } else if (mount_result != k_java_vt_mount_success) {
-            bpf_map_delete_elem(&java_vt_threads, &carrier);
-            return 0;
-        }
-
-        if (java_remote_parent_enabled) {
-            java_remote_parent_cleanup(&carrier);
-            bpf_map_delete_elem(&java_tasks, &carrier);
-        }
-
-        bpf_dbg_printk("Java virtual thread mount observed");
-        if (!java_vt_publish_mount(&carrier, &mount_identity)) {
-            bpf_map_delete_elem(&java_vt_threads, &carrier);
-        }
-
-        return 0;
-    }
-    case k_ioctl_java_vt_terminate: {
-        u64 vt_id = 0;
-        if (bpf_probe_read_user(&vt_id, sizeof(vt_id), uarg + 1) != 0) {
-            return 0;
-        }
-
-        pid_key_t carrier = {0};
-        pid_key_t owner = {0};
-        task_tid(&carrier);
-        if (!java_vt_terminate_identity(&carrier, vt_id, &owner)) {
-            return 0;
-        }
-        if (java_remote_parent_enabled) {
-            java_remote_parent_cleanup(&owner);
-            java_remote_parent_unlink_task(&owner);
-            bpf_map_delete_elem(&java_tasks, &owner);
-        }
-        return 0;
-    }
-    case k_ioctl_java_vt_unmount: {
-        // The mounted VT left this carrier: delete the entry so a carrier
-        // with no mounted VT is never translated. mount/unmount for a
-        // carrier always execute ON that carrier thread, so write and
-        // delete are in program order.
-        pid_key_t carrier = {0};
-        task_tid(&carrier);
-
-        bpf_dbg_printk("Java virtual thread unmount observed");
-        if (java_remote_parent_enabled) {
-            java_remote_parent_cleanup(&carrier);
-            bpf_map_delete_elem(&java_tasks, &carrier);
-        }
-        bpf_map_delete_elem(&java_vt_threads, &carrier);
-
-        return 0;
-    }
-    case k_ioctl_java_task_capture: {
-        u64 token = 0;
-        if (bpf_probe_read_user(&token, sizeof(token), uarg + 1) != 0) {
-            return 0;
-        }
-        if (java_remote_parent_enabled) {
-            java_remote_parent_capture_handoff(token);
-        }
-        return 0;
-    }
-    case k_ioctl_java_task_cancel: {
-        u64 token = 0;
-        if (bpf_probe_read_user(&token, sizeof(token), uarg + 1) != 0) {
-            return 0;
-        }
-        if (java_remote_parent_enabled) {
-            const pid_key_t execution = java_remote_parent_current_owner();
-            java_remote_parent_cancel_handoff(&execution, token);
-        }
-        return 0;
-    }
-    case k_ioctl_java_task_relay_capture: {
-        u64 token = 0;
-        if (bpf_probe_read_user(&token, sizeof(token), uarg + 1) != 0) {
-            return 0;
-        }
-        if (java_remote_parent_enabled) {
-            const pid_key_t execution = java_remote_parent_current_owner();
-            java_remote_parent_capture_relay(&execution, token);
-        }
-        return 0;
-    }
-    case k_ioctl_java_task_unlink: {
-        if (!java_remote_parent_enabled) {
-            return 0;
-        }
-
-        pid_key_t child = {0};
-        task_tid(&child);
-        pid_key_t logical_child = child;
-        java_vt_translate_tid(&logical_child);
-        java_remote_parent_unlink_task(&logical_child);
-        bpf_map_delete_elem(&java_tasks, &child);
-        obi_ctx__del(id);
-        return 0;
-    }
-    case k_ioctl_java_tls_connection: {
-        if (!java_remote_parent_enabled) {
-            return 0;
-        }
-
-        connection_info_t claimed = {0};
-        if (bpf_probe_read_user(&claimed, sizeof(claimed), uarg + 1) != 0 ||
-            is_empty_connection_info(&claimed)) {
-            return 0;
-        }
-
-        pid_connection_info_t connection = {0};
-        u16 orig_dport = 0;
-        u32 connection_netns = 0;
-        u64 connection_netns_cookie = 0;
-        u64 socket_cookie = 0;
-        if (!java_connection_from_file(file,
-                                       TCP_RECV,
-                                       &connection.conn,
-                                       &orig_dport,
-                                       &connection_netns,
-                                       &connection_netns_cookie,
-                                       &socket_cookie)) {
-            return 0;
-        }
-        mark_java_tls_connection(&claimed, &connection.conn, pid_from_pid_tgid(id));
-        return 0;
-    }
-    case k_ioctl_java_threads:
-    case k_ioctl_java_task_link: {
-        u64 parent_id = 0;
-        if (bpf_probe_read_user(&parent_id, sizeof(parent_id), uarg + 1) != 0) {
-            return 0;
-        }
-        u64 token = 0;
-        if (op_cmd == k_ioctl_java_task_link &&
-            bpf_probe_read_user(&token, sizeof(token), uarg + 1 + sizeof(parent_id)) != 0) {
-            return 0;
-        }
-
-        pid_key_t child = {0};
-        task_tid(&child);
-        pid_key_t logical_child = child;
-        java_vt_translate_tid(&logical_child);
-        pid_key_t parent = child;
-        const u32 parent_tid = tid_from_pid_tgid(parent_id);
-        parent.tid = parent_tid;
-
-        if (java_remote_parent_enabled && op_cmd == k_ioctl_java_task_link) {
-            bpf_map_delete_elem(&java_tasks, &child);
-            obi_ctx__del(id);
-            java_remote_parent_link_handoff(&logical_child, token);
-            return 0;
-        }
-
-        if (parent.tid == child.tid) {
-            if (java_remote_parent_enabled) {
-                if (op_cmd == k_ioctl_java_threads) {
-                    java_remote_parent_fail_handoff(&logical_child);
-                }
-                bpf_map_delete_elem(&java_tasks, &child);
-                obi_ctx__del(id);
-            }
-            bpf_dbg_printk("self-referencing Java thread mapping ignored");
-            return 0;
-        }
-
-        if (java_remote_parent_enabled && op_cmd == k_ioctl_java_threads &&
-            java_remote_parent_task_mapping_would_cycle(&child, &parent)) {
-            java_remote_parent_mark_ambiguous(&child);
-            java_remote_parent_mark_ambiguous(&parent);
-            java_remote_parent_cancel_handoff(&logical_child, token);
-            java_remote_parent_unlink_task(&logical_child);
-            bpf_dbg_printk("cyclic Java thread mapping ignored");
-            return 0;
-        }
-
-        if (java_remote_parent_enabled && op_cmd == k_ioctl_java_threads) {
-            const pid_key_t *previous_parent = bpf_map_lookup_elem(&java_tasks, &child);
-            if (previous_parent && !java_remote_parent_pid_key_equal(previous_parent, &parent)) {
-                java_remote_parent_guard_owner_reuse(&child);
-            }
-        }
-
-        bpf_dbg_printk("Java thread mapping recorded");
-        bpf_map_update_elem(&java_tasks, &child, &parent, BPF_ANY);
-        if (java_remote_parent_enabled) {
-            if (op_cmd == k_ioctl_java_threads) {
-                java_remote_parent_fail_handoff(&logical_child);
-            }
-        }
-
-        // Walk the java_tasks chain to find the parent's server trace and
-        // refresh traces_ctx_v1 for this child thread.
-        trace_key_t t_key = {.p_key = parent, .extra_id = extra_runtime_id_with_task_id(parent_id)};
-        tp_info_pid_t *server_tp = find_parent_java_trace(&t_key);
-
-        if (server_tp && server_tp->valid) {
-            obi_ctx__set(id, &server_tp->tp);
-        } else {
-            obi_ctx__del(id);
-        }
-
-        return 0;
-    }
-    default:
-        break;
-    }
-
-    if (op == k_ioctl_invalid_op) {
-        bpf_dbg_printk("unknown cmd=%d", op_cmd);
-        return 0;
-    }
-
-    bpf_dbg_printk("op=%d, cmd=%d", op, op_cmd);
+    bpf_dbg_printk("op=%d", op);
 
     pid_connection_info_t p_conn = {0};
     u16 orig_dport = 0;
     u32 connection_netns = 0;
     u64 connection_netns_cookie = 0;
     u64 socket_cookie = 0;
-    connection_info_t claimed = {0};
-    if (bpf_probe_read_user(&claimed, sizeof(claimed), uarg + 1) != 0) {
-        return 0;
-    }
-
     if (file) {
-        if (!java_connection_from_file(
-                file,
-                op,
-                &p_conn.conn,
-                &orig_dport,
-                &connection_netns,
-                &connection_netns_cookie,
-                &socket_cookie)) {
+        if (!java_connection_from_file(file,
+                                       op,
+                                       &p_conn.conn,
+                                       &orig_dport,
+                                       &connection_netns,
+                                       &connection_netns_cookie,
+                                       &socket_cookie)) {
             return 0;
         }
 
@@ -436,11 +159,6 @@ static __always_inline int handle_java_ioctl(
         }
     }
     d_print_http_connection_info(&p_conn.conn);
-
-    if (java_remote_parent_enabled && java_remote_parent_data_hook_is_ready() && connection_netns &&
-        op == TCP_RECV) {
-        java_remote_parent_begin_data_receive();
-    }
 
     u32 len = 0;
     if (bpf_probe_read_user(&len, sizeof(len), uarg + 1 + sizeof(connection_info_t)) != 0) {
@@ -485,18 +203,474 @@ static __always_inline int handle_java_ioctl(
 
         const u64 zero = 0;
         bpf_map_update_elem(&active_ssl_connections, &p_conn, &zero, BPF_NOEXIST);
-        handle_java_buf_with_connection(
-            ctx,
-            &p_conn,
-            buf,
-            max_len,
-            op,
-            orig_dport,
-            connection_netns,
-            connection_netns_cookie,
-            socket_cookie);
+        handle_java_buf_with_connection(ctx,
+                                        &p_conn,
+                                        buf,
+                                        max_len,
+                                        op,
+                                        orig_dport,
+                                        connection_netns,
+                                        connection_netns_cookie,
+                                        socket_cookie);
     }
 
+    return 0;
+}
+
+static __noinline int handle_java_unregistered_lifecycle_ioctl(unsigned char *uarg,
+                                                               u8 op_cmd,
+                                                               const pid_key_t *task,
+                                                               u64 process_capability);
+static __noinline int handle_java_unregistered_control_ioctl(
+    unsigned char *uarg, u64 id, u8 op_cmd, const pid_key_t *task, u64 process_capability);
+
+static __noinline int handle_java_lifecycle_ioctl(unsigned char *uarg,
+                                                  u8 op_cmd,
+                                                  const pid_key_t *task,
+                                                  u64 process_capability) {
+    if (op_cmd != k_ioctl_java_process_register &&
+        java_process_incarnation_for(task) != process_capability) {
+        return handle_java_unregistered_lifecycle_ioctl(uarg, op_cmd, task, process_capability);
+    }
+
+    switch (op_cmd) {
+    case k_ioctl_java_process_register: {
+        u64 incarnation = 0;
+        if (bpf_probe_read_user(&incarnation, sizeof(incarnation), uarg + 1) != 0 || !incarnation) {
+            return 0;
+        }
+
+        const pid_key_t process = java_process_key(task);
+        if (process_capability != incarnation ||
+            java_process_capability_for(&process) != incarnation) {
+            return 0;
+        }
+        const u64 *previous = bpf_map_lookup_elem(&java_process_incarnations, &process);
+        if (java_remote_parent_enabled && previous && *previous != incarnation) {
+            java_remote_parent_cleanup(task);
+            java_remote_parent_cleanup(&process);
+            java_remote_parent_unlink_task(task);
+            bpf_map_delete_elem(&java_tasks, task);
+        }
+        java_register_process_incarnation(incarnation);
+        return 0;
+    }
+    case k_ioctl_java_vt_mount: {
+        // The agent reports, on every VirtualThread.mount(), the logical
+        // thread id now mounted on this carrier; the current kernel thread
+        // IS the carrier.
+        u64 vt_id = 0;
+        if (bpf_probe_read_user(&vt_id, sizeof(vt_id), uarg + 1) != 0) {
+            return 0;
+        }
+
+        const pid_key_t carrier = *task;
+        pid_key_t synthetic_owner = {0};
+        java_vt_identity_t mount_identity = {0};
+        enum java_vt_mount_result mount_result =
+            java_vt_prepare_mount(&carrier, vt_id, &synthetic_owner, &mount_identity);
+
+        if (mount_result == k_java_vt_mount_collision ||
+            mount_result == k_java_vt_mount_stale_incarnation) {
+            if (java_remote_parent_enabled) {
+                java_remote_parent_discard_virtual_thread_owner(&synthetic_owner);
+            }
+            if (mount_result == k_java_vt_mount_collision ||
+                !java_vt_replace_stale_identity(&synthetic_owner, &mount_identity)) {
+                if (java_remote_parent_enabled) {
+                    // Removing the carrier translation must also destroy the
+                    // logical/physical cursors and legacy mapping it masked.
+                    java_remote_parent_discard_unregistered_virtual_thread_lifecycle(
+                        &carrier, process_capability);
+                } else {
+                    bpf_map_delete_elem(&java_vt_threads, &carrier);
+                }
+                return 0;
+            }
+        } else if (mount_result == k_java_vt_mount_new_identity) {
+            if (java_remote_parent_enabled) {
+                // A newly inserted LRU guard may replace an evicted full-width
+                // identity. Discard the shared synthetic key before publishing
+                // it, so neither the same nor a colliding VT can revive state.
+                java_remote_parent_discard_virtual_thread_owner(&synthetic_owner);
+            }
+        } else if (mount_result != k_java_vt_mount_success) {
+            if (java_remote_parent_enabled) {
+                java_remote_parent_discard_unregistered_virtual_thread_id(
+                    &carrier, vt_id, process_capability, 1);
+            } else {
+                bpf_map_delete_elem(&java_vt_threads, &carrier);
+            }
+            return 0;
+        }
+
+        if (java_remote_parent_enabled) {
+            java_remote_parent_cleanup(&carrier);
+            bpf_map_delete_elem(&java_tasks, &carrier);
+        }
+
+        bpf_dbg_printk("Java virtual thread mount observed");
+        if (!java_vt_publish_mount(&carrier, &mount_identity)) {
+            if (java_remote_parent_enabled) {
+                java_remote_parent_discard_virtual_thread_owner(&synthetic_owner);
+            }
+            bpf_map_delete_elem(&java_vt_threads, &carrier);
+        }
+
+        return 0;
+    }
+    case k_ioctl_java_vt_terminate: {
+        u64 vt_id = 0;
+        if (bpf_probe_read_user(&vt_id, sizeof(vt_id), uarg + 1) != 0) {
+            return 0;
+        }
+
+        const pid_key_t carrier = *task;
+        pid_key_t owner = {0};
+        if (!java_vt_terminate_identity(&carrier, vt_id, &owner)) {
+            if (java_remote_parent_enabled) {
+                java_remote_parent_discard_unregistered_virtual_thread_id(
+                    &carrier, vt_id, process_capability, 1);
+            } else {
+                java_vt_identity_t expected_identity = {0};
+                if (java_vt_prepare_unregistered_cleanup(
+                        &carrier, vt_id, process_capability, &owner, &expected_identity)) {
+                    java_vt_delete_identity_if_matches(&owner, &expected_identity);
+                }
+                bpf_map_delete_elem(&java_vt_threads, &carrier);
+            }
+            return 0;
+        }
+        if (java_remote_parent_enabled) {
+            java_remote_parent_discard_virtual_thread_owner(&owner);
+        }
+        // Keep the full-width guard present until all state under its
+        // synthetic key has been discarded.
+        java_vt_identity_t expected_identity = {0};
+        if (java_vt_prepare_unregistered_cleanup(
+                &carrier, vt_id, process_capability, &owner, &expected_identity)) {
+            java_vt_delete_identity_if_matches(&owner, &expected_identity);
+        }
+        return 0;
+    }
+    case k_ioctl_java_vt_unmount: {
+        // The mounted VT left this carrier: delete the entry so a carrier
+        // with no mounted VT is never translated. mount/unmount for a
+        // carrier always execute ON that carrier thread, so write and
+        // delete are in program order.
+        const pid_key_t carrier = *task;
+
+        bpf_dbg_printk("Java virtual thread unmount observed");
+        if (java_remote_parent_enabled) {
+            java_remote_parent_cleanup(&carrier);
+            bpf_map_delete_elem(&java_tasks, &carrier);
+        }
+        bpf_map_delete_elem(&java_vt_threads, &carrier);
+
+        return 0;
+    }
+    default:
+        return 0;
+    }
+}
+
+static __noinline int handle_java_unregistered_lifecycle_ioctl(unsigned char *uarg,
+                                                               u8 op_cmd,
+                                                               const pid_key_t *task,
+                                                               u64 process_capability) {
+    if (op_cmd == k_ioctl_java_vt_unmount) {
+        if (java_remote_parent_enabled) {
+            java_remote_parent_discard_unregistered_virtual_thread_lifecycle(task,
+                                                                             process_capability);
+        } else {
+            bpf_map_delete_elem(&java_vt_threads, task);
+        }
+        return 0;
+    }
+
+    u64 vt_id = 0;
+    if (bpf_probe_read_user(&vt_id, sizeof(vt_id), uarg + 1) != 0) {
+        if (java_remote_parent_enabled) {
+            java_remote_parent_discard_unregistered_virtual_thread_lifecycle(task,
+                                                                             process_capability);
+        } else {
+            bpf_map_delete_elem(&java_vt_threads, task);
+        }
+        return 0;
+    }
+
+    if (java_remote_parent_enabled) {
+        java_remote_parent_discard_unregistered_virtual_thread_id(
+            task, vt_id, process_capability, 1);
+    } else {
+        bpf_map_delete_elem(&java_vt_threads, task);
+        if (op_cmd == k_ioctl_java_vt_mount || op_cmd == k_ioctl_java_vt_terminate) {
+            pid_key_t owner = {0};
+            java_vt_identity_t expected_identity = {0};
+            if (java_vt_prepare_unregistered_cleanup(
+                    task, vt_id, process_capability, &owner, &expected_identity)) {
+                java_vt_delete_identity_if_matches(&owner, &expected_identity);
+            }
+        }
+    }
+    return 0;
+}
+
+static __noinline int handle_java_unregistered_control_ioctl(
+    unsigned char *uarg, u64 id, u8 op_cmd, const pid_key_t *task, u64 process_capability) {
+    const u8 token_operation =
+        op_cmd == k_ioctl_java_task_capture || op_cmd == k_ioctl_java_task_cancel ||
+        op_cmd == k_ioctl_java_task_relay_capture || op_cmd == k_ioctl_java_task_link;
+    if (token_operation) {
+        unsigned char *token_arg = uarg + 1;
+        if (op_cmd == k_ioctl_java_task_link) {
+            token_arg += sizeof(u64);
+        }
+        u64 token = 0;
+        if (bpf_probe_read_user(&token, sizeof(token), token_arg) == 0 &&
+            java_remote_parent_enabled) {
+            java_remote_parent_cancel_handoff_for_capability(task, token, process_capability);
+        }
+    }
+
+    const u8 execution_lifecycle = op_cmd == k_ioctl_java_threads ||
+                                   op_cmd == k_ioctl_java_task_link ||
+                                   op_cmd == k_ioctl_java_task_unlink;
+    if (!execution_lifecycle) {
+        return 0;
+    }
+    if (java_remote_parent_enabled) {
+        java_remote_parent_discard_unregistered_task_lifecycle(task, process_capability);
+    }
+    bpf_map_delete_elem(&java_tasks, task);
+    obi_ctx__del(id);
+    return 0;
+}
+
+static __noinline int handle_java_tls_connection_ioctl(struct file *file,
+                                                       unsigned char *uarg,
+                                                       const pid_key_t *task,
+                                                       u64 process_capability) {
+    if (!java_remote_parent_enabled || java_process_incarnation_for(task) != process_capability) {
+        return 0;
+    }
+
+    connection_info_t claimed = {0};
+    if (bpf_probe_read_user(&claimed, sizeof(claimed), uarg + 1) != 0 ||
+        is_empty_connection_info(&claimed)) {
+        return 0;
+    }
+
+    pid_connection_info_t connection = {0};
+    u16 orig_dport = 0;
+    u32 connection_netns = 0;
+    u64 connection_netns_cookie = 0;
+    u64 socket_cookie = 0;
+    if (!java_connection_from_file(file,
+                                   TCP_RECV,
+                                   &connection.conn,
+                                   &orig_dport,
+                                   &connection_netns,
+                                   &connection_netns_cookie,
+                                   &socket_cookie)) {
+        return 0;
+    }
+    mark_java_tls_connection(
+        &claimed, &connection.conn, pid_from_pid_tgid(bpf_get_current_pid_tgid()));
+    return 0;
+}
+
+static __noinline int handle_java_control_ioctl(unsigned char *uarg,
+                                                u8 op_cmd,
+                                                const pid_key_t *task,
+                                                u64 process_capability) {
+    const u64 id = bpf_get_current_pid_tgid();
+    if (java_process_incarnation_for(task) != process_capability) {
+        return k_java_control_cleanup_required;
+    }
+
+    pid_key_t execution = *task;
+    const enum java_vt_cleanup_translation_result translation =
+        java_vt_translate_tid_for_capability(&execution, process_capability);
+    if (translation == k_java_vt_cleanup_translation_fallback) {
+        return k_java_control_cleanup_required;
+    }
+
+    switch (op_cmd) {
+    case k_ioctl_java_task_capture: {
+        u64 token = 0;
+        if (bpf_probe_read_user(&token, sizeof(token), uarg + 1) != 0) {
+            return 0;
+        }
+        if (java_remote_parent_enabled) {
+            java_remote_parent_capture_handoff_for_execution(&execution, token);
+        }
+        return 0;
+    }
+    case k_ioctl_java_task_cancel: {
+        u64 token = 0;
+        if (bpf_probe_read_user(&token, sizeof(token), uarg + 1) != 0) {
+            return 0;
+        }
+        if (java_remote_parent_enabled) {
+            java_remote_parent_cancel_handoff_for_capability(&execution, token, process_capability);
+        }
+        return 0;
+    }
+    case k_ioctl_java_task_relay_capture: {
+        u64 token = 0;
+        if (bpf_probe_read_user(&token, sizeof(token), uarg + 1) != 0) {
+            return 0;
+        }
+        if (java_remote_parent_enabled) {
+            java_remote_parent_capture_relay(&execution, token);
+        }
+        return 0;
+    }
+    case k_ioctl_java_task_unlink: {
+        if (!java_remote_parent_enabled) {
+            return 0;
+        }
+
+        java_remote_parent_unlink_task(&execution);
+        bpf_map_delete_elem(&java_tasks, task);
+        obi_ctx__del(id);
+        return 0;
+    }
+    case k_ioctl_java_threads:
+    case k_ioctl_java_task_link: {
+        u64 parent_id = 0;
+        if (bpf_probe_read_user(&parent_id, sizeof(parent_id), uarg + 1) != 0) {
+            return 0;
+        }
+        u64 token = 0;
+        if (op_cmd == k_ioctl_java_task_link &&
+            bpf_probe_read_user(&token, sizeof(token), uarg + 1 + sizeof(parent_id)) != 0) {
+            return 0;
+        }
+
+        const pid_key_t child = *task;
+        const pid_key_t logical_child = execution;
+        pid_key_t parent = child;
+        const u32 parent_tid = tid_from_pid_tgid(parent_id);
+        parent.tid = parent_tid;
+
+        if (java_remote_parent_enabled && op_cmd == k_ioctl_java_task_link) {
+            bpf_map_delete_elem(&java_tasks, &child);
+            obi_ctx__del(id);
+            java_remote_parent_link_handoff_for_capability(
+                &logical_child, token, process_capability);
+            return 0;
+        }
+
+        if (parent.tid == child.tid) {
+            if (java_remote_parent_enabled) {
+                if (op_cmd == k_ioctl_java_threads) {
+                    java_remote_parent_fail_handoff(&logical_child);
+                }
+                bpf_map_delete_elem(&java_tasks, &child);
+                obi_ctx__del(id);
+            }
+            bpf_dbg_printk("self-referencing Java thread mapping ignored");
+            return 0;
+        }
+
+        if (java_remote_parent_enabled && op_cmd == k_ioctl_java_threads &&
+            java_remote_parent_task_mapping_would_cycle(&child, &parent)) {
+            java_remote_parent_mark_ambiguous(&child);
+            java_remote_parent_mark_ambiguous(&parent);
+            java_remote_parent_cancel_handoff_for_capability(
+                &logical_child, token, process_capability);
+            java_remote_parent_unlink_task(&logical_child);
+            bpf_dbg_printk("cyclic Java thread mapping ignored");
+            return 0;
+        }
+
+        if (java_remote_parent_enabled && op_cmd == k_ioctl_java_threads) {
+            const pid_key_t *previous_parent = bpf_map_lookup_elem(&java_tasks, &child);
+            if (previous_parent && !java_remote_parent_pid_key_equal(previous_parent, &parent)) {
+                java_remote_parent_guard_owner_reuse(&child);
+            }
+        }
+
+        bpf_dbg_printk("Java thread mapping recorded");
+        bpf_map_update_elem(&java_tasks, &child, &parent, BPF_ANY);
+        if (java_remote_parent_enabled) {
+            if (op_cmd == k_ioctl_java_threads) {
+                java_remote_parent_fail_handoff(&logical_child);
+            }
+        }
+
+        // Walk the java_tasks chain to find the parent's server trace and
+        // refresh traces_ctx_v1 for this child thread.
+        trace_key_t t_key = {.p_key = parent, .extra_id = extra_runtime_id_with_task_id(parent_id)};
+        tp_info_pid_t *server_tp = find_parent_java_trace(&t_key);
+
+        if (server_tp && server_tp->valid) {
+            obi_ctx__set(id, &server_tp->tp);
+        } else {
+            obi_ctx__del(id);
+        }
+
+        return 0;
+    }
+    default:
+        bpf_dbg_printk("unknown cmd=%d", op_cmd);
+        return 0;
+    }
+}
+
+static __always_inline int handle_java_ioctl(
+    struct pt_regs *ctx, struct file *file, u64 id, unsigned char *uarg, u8 data_only) {
+    pid_key_t task = {0};
+    task_tid(&task);
+    const u64 process_capability = java_process_capability_for(&task);
+    if (!process_capability) {
+        return 0;
+    }
+
+    u8 op_cmd = 0;
+    if (bpf_probe_read_user(&op_cmd, sizeof(op_cmd), uarg) != 0) {
+        return 0;
+    }
+    const u8 op = cmd_to_op(op_cmd);
+    const u8 data_operation = op != k_ioctl_invalid_op || op_cmd == k_ioctl_java_tls_connection;
+    if (data_operation != data_only) {
+        return 0;
+    }
+    const u8 registered = op_cmd == k_ioctl_java_process_register ||
+                          java_process_incarnation_for(&task) == process_capability;
+
+    if (op != k_ioctl_invalid_op) {
+        if (!java_remote_parent_begin_receive(java_remote_parent_enabled,
+                                              java_remote_parent_enabled &&
+                                                  java_remote_parent_data_hook_is_ready(),
+                                              registered,
+                                              op,
+                                              process_capability)) {
+            return 0;
+        }
+        return handle_java_data_ioctl(ctx, file, id, uarg, op);
+    }
+    if (!registered) {
+        if (op_cmd == k_ioctl_java_vt_mount || op_cmd == k_ioctl_java_vt_unmount ||
+            op_cmd == k_ioctl_java_vt_terminate) {
+            return handle_java_unregistered_lifecycle_ioctl(
+                uarg, op_cmd, &task, process_capability);
+        }
+        return handle_java_unregistered_control_ioctl(uarg, id, op_cmd, &task, process_capability);
+    }
+    if (op_cmd == k_ioctl_java_process_register || op_cmd == k_ioctl_java_vt_mount ||
+        op_cmd == k_ioctl_java_vt_unmount || op_cmd == k_ioctl_java_vt_terminate) {
+        return handle_java_lifecycle_ioctl(uarg, op_cmd, &task, process_capability);
+    }
+    if (op_cmd == k_ioctl_java_tls_connection) {
+        return handle_java_tls_connection_ioctl(file, uarg, &task, process_capability);
+    }
+    if (handle_java_control_ioctl(uarg, op_cmd, &task, process_capability) ==
+        k_java_control_cleanup_required) {
+        return handle_java_unregistered_control_ioctl(uarg, id, op_cmd, &task, process_capability);
+    }
     return 0;
 }
 

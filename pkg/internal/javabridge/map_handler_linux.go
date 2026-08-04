@@ -205,22 +205,34 @@ func NewMapHandler(maps Maps, ttl time.Duration) *MapHandler {
 }
 
 func (h *MapHandler) Handle(identity Identity, operation Operation) Record {
-	return h.handle(context.Background(), identity, operation, 0, false)
+	return h.handle(
+		context.Background(), identity, operation, LookupSourceDirect, 0, false,
+	)
+}
+
+func (h *MapHandler) HandleTask(identity Identity, operation Operation) Record {
+	return h.handle(
+		context.Background(), identity, operation, LookupSourceTask, 0, false,
+	)
 }
 
 func (h *MapHandler) HandleAuthenticated(
 	ctx context.Context,
 	identity Identity,
 	operation Operation,
+	lookupSource LookupSource,
 	expectedProcessIncarnation uint64,
 ) Record {
-	return h.handle(ctx, identity, operation, expectedProcessIncarnation, true)
+	return h.handle(
+		ctx, identity, operation, lookupSource, expectedProcessIncarnation, true,
+	)
 }
 
 func (h *MapHandler) handle(
 	ctx context.Context,
 	identity Identity,
 	operation Operation,
+	lookupSource LookupSource,
 	expectedProcessIncarnation uint64,
 	authenticated bool,
 ) Record {
@@ -233,6 +245,9 @@ func (h *MapHandler) handle(
 		return Record{Status: StatusUnsupported}
 	}
 	if operation != OperationTake && operation != OperationDiscard && operation != OperationNegotiate {
+		return Record{Status: StatusMalformed}
+	}
+	if lookupSource != LookupSourceDirect && lookupSource != LookupSourceTask {
 		return Record{Status: StatusMalformed}
 	}
 
@@ -261,7 +276,13 @@ func (h *MapHandler) handle(
 	}
 	identity = translated
 
-	candidates, ambiguous, lookupFailed := h.resolve(ctx, identity, processIncarnation)
+	var candidates []resolvedCandidate
+	var ambiguous, lookupFailed bool
+	if lookupSource == LookupSourceTask {
+		candidates, ambiguous, lookupFailed = h.resolveTask(identity, processIncarnation)
+	} else {
+		candidates, ambiguous, lookupFailed = h.resolveDirect(identity, processIncarnation)
+	}
 	if requestCanceled(ctx) {
 		return Record{Status: StatusTimeout}
 	}
@@ -606,14 +627,12 @@ func (h *MapHandler) wasConsumed(identity Identity, processIncarnation uint64) b
 	return true
 }
 
-func (h *MapHandler) resolve(
-	ctx context.Context,
-	start Identity,
-	processIncarnation uint64,
+func (h *MapHandler) resolveDirect(
+	start Identity, processIncarnation uint64,
 ) ([]resolvedCandidate, bool, bool) {
 	candidates := make([]resolvedCandidate, 0, 1)
 	direct, directFound, lookupFailed := h.resolveOwner(
-		start, 0, processIncarnation, false,
+		start, 0, processIncarnation, true,
 	)
 	if lookupFailed {
 		return nil, false, true
@@ -628,71 +647,21 @@ func (h *MapHandler) resolve(
 			return candidates, true, false
 		}
 	}
+	return candidates, false, false
+}
 
+func (h *MapHandler) resolveTask(
+	start Identity, processIncarnation uint64,
+) ([]resolvedCandidate, bool, bool) {
 	var link taskLink
 	if err := h.tasks.Lookup(&start, &link); err != nil {
 		if errors.Is(err, ebpf.ErrKeyNotExist) {
-			if directFound {
-				return candidates, false, false
-			}
-			terminal, found, failed := h.resolveOwner(
-				start, 0, processIncarnation, true,
-			)
-			if failed {
-				return nil, false, true
-			}
-			if found {
-				candidates = append(candidates, terminal)
-			}
-			return candidates, false, false
+			return nil, false, false
 		}
 		return nil, false, true
 	}
 	if !h.currentTaskLink(link) {
-		return candidates, false, false
-	}
-	if link.Owner == start {
-		if directFound && direct.Generation != link.Generation {
-			if requestCanceled(ctx) {
-				return nil, false, true
-			}
-			if !h.markAmbiguous(resolvedCandidate{
-				Owner:              start,
-				Generation:         link.Generation,
-				ProcessIncarnation: processIncarnation,
-			}) {
-				return nil, false, true
-			}
-			return candidates, true, false
-		}
-		if directFound {
-			return candidates, false, false
-		}
-		linked, found, failed := h.resolveOwner(
-			start, link.Generation, processIncarnation, true,
-		)
-		if failed {
-			return nil, false, true
-		}
-		if found {
-			candidates = append(candidates, linked)
-		}
-		return candidates, false, false
-	}
-	ambiguous := false
-	if directFound {
-		ambiguous = true
-		if requestCanceled(ctx) {
-			return nil, false, true
-		}
-		if !h.markAmbiguous(candidates[0]) ||
-			!h.markAmbiguous(resolvedCandidate{
-				Owner:              link.Owner,
-				Generation:         link.Generation,
-				ProcessIncarnation: processIncarnation,
-			}) {
-			return nil, false, true
-		}
+		return nil, false, false
 	}
 	linked, found, failed := h.resolveOwner(
 		link.Owner, link.Generation, processIncarnation, true,
@@ -704,7 +673,8 @@ func (h *MapHandler) resolve(
 	if lookupFailed {
 		return nil, false, true
 	}
-	ambiguous = ambiguous || marked
+	ambiguous := marked
+	candidates := make([]resolvedCandidate, 0, 1)
 	if found {
 		candidates = append(candidates, linked)
 	}

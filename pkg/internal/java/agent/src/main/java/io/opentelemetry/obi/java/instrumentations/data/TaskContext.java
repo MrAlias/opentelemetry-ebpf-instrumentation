@@ -10,16 +10,30 @@ public final class TaskContext {
   private final long parentThreadId;
   private final long handoffToken;
   private final RemoteParentSocketContext remoteParentSocketContext;
+  private final RemoteParentSocketContext.Lifecycle remoteParentSocketLifecycle;
 
   public TaskContext(long parentThreadId, long handoffToken) {
-    this(parentThreadId, handoffToken, null);
+    this(parentThreadId, handoffToken, null, null);
   }
 
   public TaskContext(
       long parentThreadId, long handoffToken, RemoteParentSocketContext remoteParentSocketContext) {
+    this(
+        parentThreadId,
+        handoffToken,
+        remoteParentSocketContext,
+        remoteParentSocketContext == null ? null : remoteParentSocketContext.lifecycle());
+  }
+
+  public TaskContext(
+      long parentThreadId,
+      long handoffToken,
+      RemoteParentSocketContext remoteParentSocketContext,
+      RemoteParentSocketContext.Lifecycle remoteParentSocketLifecycle) {
     this.parentThreadId = parentThreadId;
     this.handoffToken = handoffToken;
     this.remoteParentSocketContext = remoteParentSocketContext;
+    this.remoteParentSocketLifecycle = remoteParentSocketLifecycle;
   }
 
   public long getParentThreadId() {
@@ -32,5 +46,9 @@ public final class TaskContext {
 
   public RemoteParentSocketContext getRemoteParentSocketContext() {
     return remoteParentSocketContext;
+  }
+
+  public RemoteParentSocketContext.Lifecycle getRemoteParentSocketLifecycle() {
+    return remoteParentSocketLifecycle;
   }
 }

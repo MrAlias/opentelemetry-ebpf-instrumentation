@@ -60,6 +60,8 @@ class NettySSLHandlerInstTest {
         1, scopeInvocationCount(transformed, "wrap", WRAP_DESCRIPTOR, "beginNettyHandlerScope"));
     assertEquals(
         2, scopeInvocationCount(transformed, "wrap", WRAP_DESCRIPTOR, "endNettyHandlerScope"));
+    assertEquals(1, scopeDirectionArgument(transformed, "unwrap", UNWRAP_DESCRIPTOR));
+    assertEquals(0, scopeDirectionArgument(transformed, "wrap", WRAP_DESCRIPTOR));
   }
 
   @Test
@@ -234,6 +236,53 @@ class NettySSLHandlerInstTest {
   private static int staticInvocationCount(
       byte[] classFile, String methodName, String descriptor, String staticMethod) {
     return scopeInvocationCount(classFile, methodName, descriptor, staticMethod);
+  }
+
+  private static int scopeDirectionArgument(
+      byte[] classFile, String methodName, String descriptor) {
+    int[] direction = {-1};
+    new ClassReader(classFile)
+        .accept(
+            new ClassVisitor(Opcodes.ASM9) {
+              @Override
+              public MethodVisitor visitMethod(
+                  int access,
+                  String name,
+                  String methodDescriptor,
+                  String signature,
+                  String[] exceptions) {
+                if (!methodName.equals(name) || !descriptor.equals(methodDescriptor)) {
+                  return null;
+                }
+                return new MethodVisitor(Opcodes.ASM9) {
+                  private int lastBoolean = -1;
+
+                  @Override
+                  public void visitInsn(int opcode) {
+                    if (opcode == Opcodes.ICONST_0 || opcode == Opcodes.ICONST_1) {
+                      lastBoolean = opcode - Opcodes.ICONST_0;
+                    }
+                  }
+
+                  @Override
+                  public void visitMethodInsn(
+                      int opcode,
+                      String owner,
+                      String name,
+                      String methodDescriptor,
+                      boolean isInterface) {
+                    if (opcode == Opcodes.INVOKESTATIC
+                        && SSL_STORAGE_INTERNAL_NAME.equals(owner)
+                        && "beginNettyHandlerScope".equals(name)
+                        && "(Ljava/lang/Object;Z)V".equals(methodDescriptor)) {
+                      direction[0] = lastBoolean;
+                    }
+                  }
+                };
+              }
+            },
+            0);
+    return direction[0];
   }
 
   private static int outerChannelFieldAccessCount(

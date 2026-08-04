@@ -46,7 +46,7 @@ type Identity struct {
 }
 
 type Handler interface {
-	HandleAuthenticated(context.Context, Identity, Operation, uint64) Record
+	HandleAuthenticated(context.Context, Identity, Operation, LookupSource, uint64) Record
 }
 
 type IdentityResolver interface {
@@ -668,7 +668,7 @@ func (s *Server) handleConnection(
 	}
 
 	response := s.handler.HandleAuthenticated(
-		resolveCtx, identity, request.Operation, request.ProcessIncarnation,
+		resolveCtx, identity, request.Operation, request.Source, request.ProcessIncarnation,
 	)
 	s.observeOutcome(request.Operation, response.Status)
 	s.writeRecord(conn, response)

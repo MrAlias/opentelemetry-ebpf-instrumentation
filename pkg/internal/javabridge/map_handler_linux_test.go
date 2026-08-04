@@ -265,7 +265,7 @@ func TestMapHandlerDeadlineBeforeClaimPreservesParent(t *testing.T) {
 	}
 
 	result := handler.HandleAuthenticated(
-		ctx, identity, OperationTake, testProcessIncarnation,
+		ctx, identity, OperationTake, LookupSourceDirect, testProcessIncarnation,
 	)
 	assert.Equal(t, StatusTimeout, result.Status)
 	require.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
@@ -273,7 +273,7 @@ func TestMapHandlerDeadlineBeforeClaimPreservesParent(t *testing.T) {
 
 	remoteParents.afterLookup = nil
 	retry := handler.HandleAuthenticated(
-		t.Context(), identity, OperationTake, testProcessIncarnation,
+		t.Context(), identity, OperationTake, LookupSourceDirect, testProcessIncarnation,
 	)
 	assert.Equal(t, StatusValid, retry.Status)
 }
@@ -293,7 +293,7 @@ func TestMapHandlerFinishesClaimThatCrossesDeadline(t *testing.T) {
 	}
 
 	result := handler.HandleAuthenticated(
-		ctx, identity, OperationTake, testProcessIncarnation,
+		ctx, identity, OperationTake, LookupSourceDirect, testProcessIncarnation,
 	)
 	assert.Equal(t, StatusValid, result.Status)
 	require.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
@@ -309,19 +309,19 @@ func TestMapHandlerRejectsReusedPeerProcessIncarnation(t *testing.T) {
 	)
 
 	result := handler.HandleAuthenticated(
-		t.Context(), identity, OperationNegotiate, testProcessIncarnation+1,
+		t.Context(), identity, OperationNegotiate, LookupSourceDirect, testProcessIncarnation+1,
 	)
 	assert.Equal(t, StatusUnauthorized, result.Status)
 	assert.Equal(
 		t, StatusMissing,
 		handler.HandleAuthenticated(
-			t.Context(), identity, OperationNegotiate, testProcessIncarnation,
+			t.Context(), identity, OperationNegotiate, LookupSourceDirect, testProcessIncarnation,
 		).Status,
 	)
 	assert.Equal(
 		t, StatusValid,
 		handler.HandleAuthenticated(
-			t.Context(), identity, OperationTake, testProcessIncarnation,
+			t.Context(), identity, OperationTake, LookupSourceDirect, testProcessIncarnation,
 		).Status,
 	)
 }
@@ -337,7 +337,7 @@ func TestMapHandlerRequiresExactProcessCapability(t *testing.T) {
 		assert.Equal(
 			t, StatusUnauthorized,
 			handler.HandleAuthenticated(
-				t.Context(), identity, OperationNegotiate, testProcessIncarnation,
+				t.Context(), identity, OperationNegotiate, LookupSourceDirect, testProcessIncarnation,
 			).Status,
 		)
 	})
@@ -349,7 +349,7 @@ func TestMapHandlerRequiresExactProcessCapability(t *testing.T) {
 		assert.Equal(
 			t, StatusUnauthorized,
 			handler.HandleAuthenticated(
-				t.Context(), identity, OperationNegotiate, testProcessIncarnation,
+				t.Context(), identity, OperationNegotiate, LookupSourceDirect, testProcessIncarnation,
 			).Status,
 		)
 	})
@@ -364,7 +364,7 @@ func TestMapHandlerResolvesOneExecutorParent(t *testing.T) {
 		nil,
 	)
 
-	assert.Equal(t, StatusValid, handler.Handle(child, OperationTake).Status)
+	assert.Equal(t, StatusValid, handler.HandleTask(child, OperationTake).Status)
 }
 
 func TestMapHandlerLinkedParentSurvivesOwnerReuse(t *testing.T) {
@@ -381,7 +381,7 @@ func TestMapHandlerLinkedParentSurvivesOwnerReuse(t *testing.T) {
 	handler.remoteParents.(*fakeBridgeMap).values[owner] = validEncodedRecord(t, 11)
 	seedOwnerState(handler, owner, 11)
 
-	linked := handler.Handle(child, OperationTake)
+	linked := handler.HandleTask(child, OperationTake)
 	assert.Equal(t, StatusValid, linked.Status)
 	assert.Equal(t, uint64(10), linked.Generation)
 	assert.NotContains(t, handler.states.(*fakeBridgeMap).values, stateKey{
@@ -437,7 +437,7 @@ func TestMapHandlerLinkedParentRequiresCompletePreservedState(t *testing.T) {
 			key := stateKey{Owner: owner, Generation: 10}
 			test.configure(handler, key)
 
-			assert.NotEqual(t, StatusValid, handler.Handle(child, OperationTake).Status)
+			assert.NotEqual(t, StatusValid, handler.HandleTask(child, OperationTake).Status)
 		})
 	}
 }
@@ -446,7 +446,7 @@ func TestMapHandlerRejectsConflictingResolution(t *testing.T) {
 	child := Identity{TID: 4, PID: 2, Namespace: 1}
 	parent := Identity{TID: 3, PID: 2, Namespace: 1}
 
-	t.Run("conflicting direct owner and task link", func(t *testing.T) {
+	t.Run("direct and task sources remain independent", func(t *testing.T) {
 		handler := testMapHandler(
 			map[Identity]any{
 				child:  validEncodedRecord(t, 10),
@@ -455,8 +455,28 @@ func TestMapHandlerRejectsConflictingResolution(t *testing.T) {
 			map[Identity]any{child: activeTaskLink(parent, 11)},
 			nil,
 		)
-		assert.Equal(t, StatusAmbiguous, handler.Handle(child, OperationTake).Status)
-		assert.Empty(t, handler.remoteParents.(*fakeBridgeMap).values)
+		direct := handler.Handle(child, OperationTake)
+		assert.Equal(t, StatusValid, direct.Status)
+		assert.Equal(t, uint64(10), direct.Generation)
+		assert.Contains(t, handler.remoteParents.(*fakeBridgeMap).values, parent)
+
+		linked := handler.HandleTask(child, OperationTake)
+		assert.Equal(t, StatusValid, linked.Status)
+		assert.Equal(t, uint64(11), linked.Generation)
+	})
+
+	t.Run("task-only state cannot satisfy a direct lookup", func(t *testing.T) {
+		handler := testMapHandler(
+			map[Identity]any{parent: validEncodedRecord(t, 11)},
+			map[Identity]any{child: activeTaskLink(parent, 11)},
+			nil,
+		)
+
+		direct := handler.Handle(child, OperationTake)
+		assert.Equal(t, StatusMissing, direct.Status)
+		assert.Contains(t, handler.remoteParents.(*fakeBridgeMap).values, parent)
+		assert.Contains(t, handler.tasks.(*fakeBridgeMap).values, child)
+		assert.Empty(t, handler.claims.(*fakeBridgeMap).values)
 	})
 
 	t.Run("self link", func(t *testing.T) {
@@ -465,7 +485,7 @@ func TestMapHandlerRejectsConflictingResolution(t *testing.T) {
 			map[Identity]any{child: activeTaskLink(child, 10)},
 			nil,
 		)
-		assert.Equal(t, StatusMissing, handler.Handle(child, OperationTake).Status)
+		assert.Equal(t, StatusMissing, handler.HandleTask(child, OperationTake).Status)
 	})
 
 	t.Run("kernel marker", func(t *testing.T) {
@@ -496,7 +516,7 @@ func TestMapHandlerRejectsConflictingResolution(t *testing.T) {
 			nil,
 		)
 
-		assert.Equal(t, StatusAmbiguous, handler.Handle(child, OperationTake).Status)
+		assert.Equal(t, StatusValid, handler.Handle(child, OperationTake).Status)
 		assert.NotContains(t, handler.ambiguity.(*fakeBridgeMap).values, stateKey{
 			Owner: parent, Generation: 11,
 		})
@@ -517,7 +537,7 @@ func TestMapHandlerRejectsStaleOrReusedExecutorLink(t *testing.T) {
 		)
 		handler.monoTimeNow = func() time.Duration { return 41 * time.Second }
 
-		assert.Equal(t, StatusMissing, handler.Handle(child, OperationTake).Status)
+		assert.Equal(t, StatusMissing, handler.HandleTask(child, OperationTake).Status)
 		assert.Contains(t, handler.remoteParents.(*fakeBridgeMap).values, owner)
 	})
 
@@ -528,7 +548,7 @@ func TestMapHandlerRejectsStaleOrReusedExecutorLink(t *testing.T) {
 			nil,
 		)
 
-		assert.Equal(t, StatusMissing, handler.Handle(child, OperationTake).Status)
+		assert.Equal(t, StatusMissing, handler.HandleTask(child, OperationTake).Status)
 		assert.Contains(t, handler.remoteParents.(*fakeBridgeMap).values, owner)
 	})
 
@@ -540,7 +560,7 @@ func TestMapHandlerRejectsStaleOrReusedExecutorLink(t *testing.T) {
 			nil,
 		)
 
-		assert.Equal(t, StatusMissing, handler.Handle(child, OperationTake).Status)
+		assert.Equal(t, StatusMissing, handler.HandleTask(child, OperationTake).Status)
 	})
 
 	t.Run("replacement after stale lookup", func(t *testing.T) {
@@ -567,11 +587,11 @@ func TestMapHandlerRejectsStaleOrReusedExecutorLink(t *testing.T) {
 			handler.states.(*fakeBridgeMap).values[key] = state
 		}
 
-		assert.Equal(t, StatusMissing, handler.Handle(child, OperationTake).Status)
+		assert.Equal(t, StatusMissing, handler.HandleTask(child, OperationTake).Status)
 		assert.Equal(t, replacement, tasks.values[child])
 
 		handler.monoTimeNow = func() time.Duration { return 11 * time.Second }
-		assert.Equal(t, StatusValid, handler.Handle(child, OperationTake).Status)
+		assert.Equal(t, StatusValid, handler.HandleTask(child, OperationTake).Status)
 	})
 }
 
@@ -1033,7 +1053,13 @@ func TestMapHandlerHonorsTerminalFromPrimaryTransport(t *testing.T) {
 				Lifecycle:           test.lifecycle,
 			}
 
-			assert.Equal(t, test.status, handler.Handle(test.identity, OperationTake).Status)
+			var result Record
+			if test.tasks != nil {
+				result = handler.HandleTask(test.identity, OperationTake)
+			} else {
+				result = handler.Handle(test.identity, OperationTake)
+			}
+			assert.Equal(t, test.status, result.Status)
 		})
 	}
 }
@@ -1295,7 +1321,7 @@ func TestMapHandlerLateConsumerPreservesNextGeneration(t *testing.T) {
 	assert.Equal(t, StatusValid, handler.Handle(identity, OperationTake).Status)
 }
 
-func TestMapHandlerAmbiguityCleanupPreservesReplacementGeneration(t *testing.T) {
+func TestMapHandlerTaskSourceIgnoresAConcurrentDirectGeneration(t *testing.T) {
 	child := Identity{TID: 4, PID: 2, Namespace: 1}
 	parent := Identity{TID: 3, PID: 2, Namespace: 1}
 	handler := testMapHandler(
@@ -1306,23 +1332,15 @@ func TestMapHandlerAmbiguityCleanupPreservesReplacementGeneration(t *testing.T) 
 		map[Identity]any{child: activeTaskLink(parent, 11)},
 		nil,
 	)
+	linked := handler.HandleTask(child, OperationTake)
+	assert.Equal(t, StatusValid, linked.Status)
+	assert.Equal(t, uint64(11), linked.Generation)
 	remoteParents := handler.remoteParents.(*fakeBridgeMap)
-	remoteParents.afterLookup = func(count int) {
-		if count != 2 {
-			return
-		}
-		remoteParents.mu.Lock()
-		remoteParents.values[child] = validEncodedRecord(t, 12)
-		remoteParents.mu.Unlock()
-		seedOwnerState(handler, child, 12)
-	}
-
-	assert.Equal(t, StatusAmbiguous, handler.Handle(child, OperationTake).Status)
 	var preserved [RecordSize]byte
 	require.NoError(t, remoteParents.Lookup(&child, &preserved))
 	record, err := UnmarshalRecord(preserved[:])
 	require.NoError(t, err)
-	assert.Equal(t, uint64(12), record.Generation)
+	assert.Equal(t, uint64(10), record.Generation)
 }
 
 func TestMapHandlerRevalidatesBeforeDeletingReusableKeys(t *testing.T) {

@@ -121,6 +121,12 @@ public class SSLStorage {
   }
 
   public static void beginNettyHandlerScope(Object context) {
+    // Retained for already transformed callers. Unknown direction cannot authorize a receive-side
+    // task capture and therefore enters a non-receive scope.
+    beginNettyHandlerScope(context, false);
+  }
+
+  public static void beginNettyHandlerScope(Object context, boolean receiving) {
     try {
       NettyHandlerScope scope = new NettyHandlerScope();
       ArrayDeque<NettyHandlerScope> scopes = nettyHandlerScopes.get();
@@ -131,6 +137,10 @@ public class SSLStorage {
       scopes.push(scope);
       beginNettyConnectionScope();
       scope.started = true;
+      if (receiving) {
+        ThreadInfo.beginRemoteParentReceiveScope();
+        scope.receiving = true;
+      }
     } catch (Throwable failure) {
       logNettyHandlerScopeFailure("begin Netty SSL handler scope", failure);
       return;
@@ -160,7 +170,13 @@ public class SSLStorage {
         nettyHandlerScopes.remove();
       }
       if (scope.started) {
-        endNettyConnectionScope();
+        try {
+          if (scope.receiving) {
+            ThreadInfo.endRemoteParentReceiveScope();
+          }
+        } finally {
+          endNettyConnectionScope();
+        }
       }
     } catch (Throwable failure) {
       logNettyHandlerScopeFailure("end Netty SSL handler scope", failure);
@@ -197,6 +213,7 @@ public class SSLStorage {
    * remote-parent staging.
    */
   public static boolean beginRemoteParentUnwrap() {
+    ThreadInfo.beginRemoteParentReceiveScope();
     Integer depth = remoteParentUnwrapDepth.get();
     if (depth == null) {
       remoteParentUnwrapDepth.set(1);
@@ -208,12 +225,16 @@ public class SSLStorage {
 
   /** Balances {@link #beginRemoteParentUnwrap()} without retaining state on a reused worker. */
   public static void endRemoteParentUnwrap() {
-    Integer depth = remoteParentUnwrapDepth.get();
-    if (depth == null || depth <= 1) {
-      remoteParentUnwrapDepth.remove();
-      return;
+    try {
+      Integer depth = remoteParentUnwrapDepth.get();
+      if (depth == null || depth <= 1) {
+        remoteParentUnwrapDepth.remove();
+        return;
+      }
+      remoteParentUnwrapDepth.set(depth - 1);
+    } finally {
+      ThreadInfo.endRemoteParentReceiveScope();
     }
-    remoteParentUnwrapDepth.set(depth - 1);
   }
 
   static void clearRemoteParentUnwrapDepthForTest() {
@@ -1312,11 +1333,36 @@ public class SSLStorage {
     nettyFailureLogged.set(false);
   }
 
+  private static Lifecycle activeNettyTaskLifecycle() {
+    try {
+      if (!ThreadInfo.hasRemoteParentDirectReceiveAuthority()) {
+        return null;
+      }
+      ArrayDeque<NettyHandlerScope> handlerScopes = nettyHandlerScopes.get();
+      if (handlerScopes == null
+          || handlerScopes.isEmpty()
+          || !handlerScopes.peek().started
+          || !handlerScopes.peek().receiving) {
+        return null;
+      }
+      Object scoped = nettyConnection.get();
+      if (!(scoped instanceof NettyConnectionScope)) {
+        return null;
+      }
+      ConnectionOwner owner = ((NettyConnectionScope) scoped).owner;
+      return isActive(owner) && owner.remoteParentLifecycle.active()
+          ? owner.remoteParentLifecycle
+          : null;
+    } catch (Throwable ignored) {
+      return null;
+    }
+  }
+
   public static void trackTask(long threadId, Object task) {
     if (task == null) {
       return;
     }
-    tasks.track(task, ThreadInfo.captureTaskContext(threadId));
+    tasks.track(task, ThreadInfo.captureTaskContext(threadId, activeNettyTaskLifecycle()));
   }
 
   public static void untrackTask(Object task) {
@@ -1420,7 +1466,8 @@ public class SSLStorage {
             threadId,
             context.getParentThreadId(),
             context.getHandoffToken(),
-            context.getRemoteParentSocketContext());
+            context.getRemoteParentSocketContext(),
+            context.getRemoteParentSocketLifecycle());
     if (linked) {
       scopes.pop();
       scopes.push(Boolean.TRUE);
@@ -1486,7 +1533,8 @@ public class SSLStorage {
           threadId,
           parentThreadId,
           context.getHandoffToken(),
-          context.getRemoteParentSocketContext());
+          context.getRemoteParentSocketContext(),
+          context.getRemoteParentSocketLifecycle());
     }
     ThreadInfo.cancelTaskContext(context);
     return false;
@@ -1511,7 +1559,8 @@ public class SSLStorage {
             currentThreadId(),
             context.getParentThreadId(),
             context.getHandoffToken(),
-            context.getRemoteParentSocketContext());
+            context.getRemoteParentSocketContext(),
+            context.getRemoteParentSocketLifecycle());
     virtualThreadTaskScope.set(linked);
   }
 
@@ -1666,6 +1715,7 @@ public class SSLStorage {
 
   private static final class NettyHandlerScope {
     private boolean started;
+    private boolean receiving;
 
     NettyHandlerScope() {}
   }

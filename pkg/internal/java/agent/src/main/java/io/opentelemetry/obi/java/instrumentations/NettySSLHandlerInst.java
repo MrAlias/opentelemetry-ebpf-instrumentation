@@ -35,7 +35,7 @@ public class NettySSLHandlerInst {
   private static final String END_SCOPE_METHOD = "endNettyHandlerScope";
   private static final String CLOSE_NETTY_CHANNEL_METHOD = "closeNettyChannel";
   private static final String REGISTER_NETTY_CLOSE_HOOK_METHOD = "registerNettyCloseHook";
-  private static final String BEGIN_SCOPE_DESCRIPTOR = "(Ljava/lang/Object;)V";
+  private static final String BEGIN_SCOPE_DESCRIPTOR = "(Ljava/lang/Object;Z)V";
   private static final String END_SCOPE_DESCRIPTOR = "()V";
   private static final String CLOSE_NETTY_CHANNEL_DESCRIPTOR = "(Ljava/lang/Object;)V";
   private static final String REGISTER_NETTY_CLOSE_HOOK_DESCRIPTOR = "(Ljava/lang/Object;)V";
@@ -170,7 +170,7 @@ public class NettySSLHandlerInst {
           && (("unwrap".equals(name) && argumentCount == 3)
               || ("wrap".equals(name) && argumentCount == 2))) {
         instrumented = true;
-        return new ScopeAdvice(visitor);
+        return new ScopeAdvice(visitor, "unwrap".equals(name));
       }
       return visitor;
     }
@@ -257,15 +257,18 @@ public class NettySSLHandlerInst {
     private final Label scopeStart = new Label();
     private final Label scopeEnd = new Label();
     private final Label scopeFailure = new Label();
+    private final boolean receiving;
 
-    ScopeAdvice(MethodVisitor visitor) {
+    ScopeAdvice(MethodVisitor visitor, boolean receiving) {
       super(Opcodes.ASM9, visitor);
+      this.receiving = receiving;
     }
 
     @Override
     public void visitCode() {
       super.visitCode();
       visitVarInsn(Opcodes.ALOAD, 1);
+      visitInsn(receiving ? Opcodes.ICONST_1 : Opcodes.ICONST_0);
       visitMethodInsn(
           Opcodes.INVOKESTATIC,
           SSL_STORAGE_INTERNAL_CLASS_NAME,

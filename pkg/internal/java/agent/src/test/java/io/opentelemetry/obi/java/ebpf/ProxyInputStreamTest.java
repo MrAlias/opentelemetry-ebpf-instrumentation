@@ -259,7 +259,8 @@ class ProxyInputStreamTest {
       ThreadInfo.setRemoteParentEnabled(true);
       ThreadInfo.setTaskContextEmitterForTest((operation, value, token) -> {});
       assertTrue(ThreadInfo.setRemoteParentSocketFileDescriptor(59, lifecycle));
-      TaskContext alias = ThreadInfo.captureTaskContext(101L);
+      ThreadInfo.markRemoteParentDirectLookup(lifecycle);
+      TaskContext alias = ThreadInfo.captureTaskContext(101L, lifecycle);
 
       socket.close();
 

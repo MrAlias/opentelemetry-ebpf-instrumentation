@@ -8,6 +8,7 @@ package io.opentelemetry.obi.java.bridge;
 import io.opentelemetry.obi.java.BootstrapNative;
 import io.opentelemetry.obi.java.ebpf.ThreadInfo;
 import io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext;
+import io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext.Lifecycle;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.function.IntSupplier;
 import java.util.function.LongSupplier;
@@ -113,13 +114,29 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
   }
 
   private RemoteParentRecord callAndClearSocket(boolean take) {
+    int lookupSource = ThreadInfo.remoteParentLookupSource();
+    boolean taskScoped = lookupSource == ThreadInfo.REMOTE_PARENT_LOOKUP_TASK;
     RemoteParentSocketContext context = ThreadInfo.takeRemoteParentSocketContext();
+    Lifecycle.Lease lifecycleLease = null;
     try {
+      if (lookupSource == ThreadInfo.REMOTE_PARENT_LOOKUP_BLOCKED) {
+        return RemoteParentRecord.statusOnly(RemoteParentStatus.MISSING);
+      }
       if (!ensureReady()) {
         return RemoteParentRecord.statusOnly(transportStatus);
       }
-      return call(take, context);
+      Lifecycle lifecycle = ThreadInfo.remoteParentLookupLifecycle();
+      if (lifecycle != null) {
+        lifecycleLease = lifecycle.acquireLookupLease();
+        if (lifecycleLease == null) {
+          return RemoteParentRecord.statusOnly(RemoteParentStatus.MISSING);
+        }
+      }
+      return call(take, taskScoped, context);
     } finally {
+      if (lifecycleLease != null) {
+        lifecycleLease.close();
+      }
       if (context != null) {
         context.discard();
       }
@@ -127,7 +144,8 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
     }
   }
 
-  private RemoteParentRecord call(boolean take, RemoteParentSocketContext context) {
+  private RemoteParentRecord call(
+      boolean take, boolean taskScoped, RemoteParentSocketContext context) {
     int start = ((int) Thread.currentThread().getId()) & (BUFFER_POOL_SIZE - 1);
     for (int i = 0; i < BUFFER_POOL_SIZE; i++) {
       int slot = (start + i) & (BUFFER_POOL_SIZE - 1);
@@ -136,7 +154,7 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
         continue;
       }
       try {
-        int status = callNative(take, context, response);
+        int status = callNative(take, taskScoped, context, response);
         RemoteParentRecord record = recordFromNativeResponse(status, response);
         if (requiresReconfiguration(record.getStatus())) {
           markUnavailable(record.getStatus());
@@ -152,7 +170,8 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
     return RemoteParentRecord.statusOnly(RemoteParentStatus.OVERLOAD);
   }
 
-  private int callNative(boolean take, RemoteParentSocketContext context, byte[] response) {
+  private int callNative(
+      boolean take, boolean taskScoped, RemoteParentSocketContext context, byte[] response) {
     RemoteParentSocketContext.Lookup lookup = null;
     try {
       if (context != null) {
@@ -163,6 +182,7 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
       }
       return socketCaller.call(
           take,
+          taskScoped,
           usesPrimarySocketLookup() && lookup != null ? lookup.socketFileDescriptor() : -1,
           response);
     } finally {
@@ -177,7 +197,13 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
         == RemoteParentTransport.GETSOCKOPT;
   }
 
-  private static int callNative(boolean take, int socketFileDescriptor, byte[] response) {
+  private static int callNative(
+      boolean take, boolean taskScoped, int socketFileDescriptor, byte[] response) {
+    if (taskScoped) {
+      return take
+          ? BootstrapNative.takeRemoteParentTask(socketFileDescriptor, response)
+          : BootstrapNative.discardRemoteParentTask(socketFileDescriptor, response);
+    }
     return take
         ? BootstrapNative.takeRemoteParent(socketFileDescriptor, response)
         : BootstrapNative.discardRemoteParent(socketFileDescriptor, response);
@@ -347,6 +373,6 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
 
   @FunctionalInterface
   interface SocketCaller {
-    int call(boolean take, int socketFileDescriptor, byte[] response);
+    int call(boolean take, boolean taskScoped, int socketFileDescriptor, byte[] response);
   }
 }

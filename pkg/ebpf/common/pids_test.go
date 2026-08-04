@@ -4,11 +4,14 @@
 package ebpfcommon
 
 import (
+	"bytes"
+	"encoding/binary"
 	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"go.opentelemetry.io/otel/trace"
 
@@ -17,6 +20,8 @@ import (
 	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
 	"go.opentelemetry.io/obi/pkg/appolly/discover/exec"
 	"go.opentelemetry.io/obi/pkg/appolly/services"
+	"go.opentelemetry.io/obi/pkg/config"
+	"go.opentelemetry.io/obi/pkg/ebpf/ringbuf"
 	"go.opentelemetry.io/obi/pkg/export/imetrics"
 )
 
@@ -278,6 +283,81 @@ func TestFilter_TriggersOTelSpanFiltering(t *testing.T) {
 		assert.False(t, filtered[i].ExportsOTelMetricsSpan())
 		assert.True(t, filtered[i].ExportsOTelTraces())
 	}
+}
+
+func TestFilter_OTelDetectionKeepsKProbeCaptureEligibleForUncoveredProtocol(t *testing.T) {
+	previousReadNamespacePIDs := readNamespacePIDs
+	t.Cleanup(func() {
+		readNamespacePIDs = previousReadNamespacePIDs
+	})
+	readNamespacePIDs = func(pid app.PID) ([]app.PID, error) {
+		return []app.PID{pid}, nil
+	}
+
+	const (
+		pid       = app.PID(123)
+		namespace = uint32(33)
+	)
+	fileInfo := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava},
+		Pid:     pid,
+		Ns:      namespace,
+	})
+	pf := NewPIDsFilter(
+		&services.DiscoveryConfig{ExcludeOTelInstrumentedServices: true},
+		slog.With("env", "testing"),
+		&imetrics.NoopReporter{},
+	)
+	pf.AllowPID(pid, namespace, fileInfo, PIDTypeKProbes)
+
+	exportSpans := pf.Filter([]request.Span{{
+		Pid: request.PidInfo{
+			UserPID:   pid,
+			HostPID:   pid,
+			Namespace: namespace,
+		},
+		Type:   request.EventTypeHTTPClient,
+		Method: "POST",
+		Path:   "/v1/traces",
+		Status: 200,
+	}})
+	require.Len(t, exportSpans, 1)
+	require.True(t, fileInfo.ExportsOTelTraces())
+	require.True(t, pf.ValidPID(pid, namespace, PIDTypeKProbes))
+	currentNamespace, namespaceExists := pf.CurrentPIDs(PIDTypeKProbes)[namespace]
+	require.True(t, namespaceExists)
+	_, pidExists := currentNamespace[pid]
+	require.True(t, pidExists)
+
+	event := makeRedisTCPEvent(directionSend)
+	event.EventSource = GenericEventSourceTypeKProbes
+	event.Pid.UserPid = uint32(pid)
+	event.Pid.HostPid = uint32(pid)
+	event.Pid.Ns = namespace
+	requestBytes := respArray("GET", "cache-key")
+	responseBytes := []byte("$5\r\nvalue\r\n")
+	event.Len = uint32(len(requestBytes))
+	event.RespLen = uint32(len(responseBytes))
+	copy(event.Buf[:], requestBytes)
+	copy(event.Rbuf[:], responseBytes)
+
+	var raw bytes.Buffer
+	require.NoError(t, binary.Write(&raw, binary.LittleEndian, event))
+	ebpfConfig := config.EBPFTracer{}
+	span, ignore, err := ReadTCPRequestIntoSpan(
+		NewEBPFParseContext(&ebpfConfig, nil, nil),
+		&ebpfConfig,
+		&ringbuf.Record{RawSample: raw.Bytes()},
+		pf,
+	)
+	require.NoError(t, err)
+	require.False(t, ignore)
+	require.Equal(t, request.EventTypeRedisClient, span.Type)
+	require.Equal(t, "GET", span.Method)
+
+	capturedSpans := pf.Filter([]request.Span{span})
+	require.Len(t, capturedSpans, 1)
+	assert.True(t, capturedSpans[0].Service.ExportsOTelTraces())
 }
 
 func TestFilter_Cleanup(t *testing.T) {

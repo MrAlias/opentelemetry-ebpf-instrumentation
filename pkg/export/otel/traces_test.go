@@ -2754,6 +2754,16 @@ func TestTracesSkipsInstrumented(t *testing.T) {
 			spans:    []request.Span{{Service: svcExportTraces, Type: request.EventTypeHTTPClient, Method: "GET", Route: "/v1/traces", RequestStart: 100, End: 200}},
 			filtered: true,
 		},
+		{
+			name:     "SDK-uncovered Redis span is exportable without SDK suppression",
+			spans:    []request.Span{{Service: svcNoExport, Type: request.EventTypeRedisClient, Method: "GET", Path: "cache-key", RequestStart: 100, End: 200}},
+			filtered: false,
+		},
+		{
+			name:     "SDK-uncovered Redis span follows existing service-wide suppression",
+			spans:    []request.Span{{Service: svcExportTraces, Type: request.EventTypeRedisClient, Method: "GET", Path: "cache-key", RequestStart: 100, End: 200}},
+			filtered: true,
+		},
 	}
 
 	tr := makeTracesTestReceiver([]instrumentations.Instrumentation{instrumentations.InstrumentationALL})

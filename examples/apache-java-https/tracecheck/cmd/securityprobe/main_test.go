@@ -32,15 +32,20 @@ const (
 	pidfdChildMarker     = byte(0x5e)
 )
 
-func TestRequestUsesOnlyTheVersionedNamespaceIdentity(t *testing.T) {
+func TestRequestUsesCurrentDirectSourceAndVersionedNamespaceIdentity(t *testing.T) {
 	request := marshalRequest(42, 99)
 
 	require.Len(t, request, requestSize)
 	assert.Equal(t, "OBIQ", string(request[:4]))
-	assert.Equal(t, requestVersion, binary.LittleEndian.Uint16(request[4:6]))
+	assert.Equal(t, uint16(3), requestVersion)
+	assert.Equal(t, uint16(3), binary.LittleEndian.Uint16(request[4:6]))
+	assert.Equal(t, 24, requestSize)
 	assert.EqualValues(t, requestSize, binary.LittleEndian.Uint16(request[6:8]))
+	assert.Equal(t, byte(1), operationTake)
 	assert.Equal(t, operationTake, request[8])
-	assert.Equal(t, []byte{0, 0, 0}, request[9:12])
+	assert.Equal(t, byte(1), sourceDirect)
+	assert.Equal(t, byte(1), request[9])
+	assert.Equal(t, []byte{0, 0}, request[10:12])
 	assert.EqualValues(t, 42, binary.LittleEndian.Uint32(request[12:16]))
 	assert.EqualValues(t, 99, binary.LittleEndian.Uint64(request[16:24]))
 }
@@ -91,7 +96,8 @@ func TestAbuseIdentityRequestsEncodeOptionalLiveJavaTID(t *testing.T) {
 				assert.Equal(t, requestVersion, binary.LittleEndian.Uint16(request.payload[4:6]))
 				assert.EqualValues(t, requestSize, binary.LittleEndian.Uint16(request.payload[6:8]))
 				assert.Equal(t, operationTake, request.payload[8])
-				assert.Equal(t, []byte{0, 0, 0}, request.payload[9:12])
+				assert.Equal(t, sourceDirect, request.payload[9])
+				assert.Equal(t, []byte{0, 0}, request.payload[10:12])
 				assert.Equal(t, expected.tid, binary.LittleEndian.Uint32(request.payload[12:16]))
 				assert.Equal(t, uint64(0x5ec0000000000001), binary.LittleEndian.Uint64(request.payload[16:24]))
 			}

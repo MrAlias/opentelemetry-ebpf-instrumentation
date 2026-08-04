@@ -29,9 +29,10 @@ const (
 	defaultSocketPath  = "/var/run/obi/java-remote-parent.sock"
 	requestSize        = 24
 	recordSize         = 64
-	requestVersion     = uint16(2)
+	requestVersion     = uint16(3)
 	recordVersion      = uint16(1)
 	operationTake      = byte(1)
+	sourceDirect       = byte(1)
 	statusValid        = byte(1)
 	statusMalformed    = byte(5)
 	statusMismatch     = byte(6)
@@ -733,6 +734,7 @@ func marshalRequest(namespaceTID uint32, incarnation uint64) []byte {
 	binary.LittleEndian.PutUint16(request[4:6], requestVersion)
 	binary.LittleEndian.PutUint16(request[6:8], requestSize)
 	request[8] = operationTake
+	request[9] = sourceDirect
 	binary.LittleEndian.PutUint32(request[12:16], namespaceTID)
 	binary.LittleEndian.PutUint64(request[16:24], incarnation)
 	return request

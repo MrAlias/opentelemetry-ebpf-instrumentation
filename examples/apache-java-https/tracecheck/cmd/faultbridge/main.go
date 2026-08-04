@@ -20,13 +20,15 @@ import (
 )
 
 const (
-	requestVersion   = uint16(2)
+	requestVersion   = uint16(3)
 	requestSize      = 24
 	recordVersion    = uint16(1)
 	recordSize       = 64
 	operationTake    = byte(1)
 	operationDrop    = byte(2)
 	operationProbe   = byte(3)
+	sourceDirect     = byte(1)
+	sourceTask       = byte(2)
 	statusValid      = byte(1)
 	statusMissing    = byte(2)
 	statusStale      = byte(3)
@@ -49,6 +51,11 @@ type faultResponse struct {
 	payload []byte
 	status  string
 	delay   time.Duration
+}
+
+type faultRequest struct {
+	operation byte
+	source    byte
 }
 
 func main() {
@@ -130,6 +137,9 @@ func serve(ctx context.Context, socketPath string, server *faultServer) error {
 			return fmt.Errorf("accept: %w", err)
 		}
 		if err := handle(connection, server); err != nil {
+			if server.mode == "matching" {
+				return fmt.Errorf("handle matching request: %w", err)
+			}
 			fmt.Fprintf(os.Stderr, "fault bridge request rejected: %v\n", err)
 		}
 	}
@@ -157,20 +167,27 @@ func handle(connection *net.UnixConn, server *faultServer) error {
 	if err := connection.SetDeadline(time.Now().Add(requestTimeout)); err != nil {
 		return err
 	}
-	request := make([]byte, requestSize)
-	if _, err := io.ReadFull(connection, request); err != nil {
+	payload := make([]byte, requestSize)
+	if _, err := io.ReadFull(connection, payload); err != nil {
 		return fmt.Errorf("read request: %w", err)
 	}
-	operation, err := parseRequest(request)
+	request, err := parseRequest(payload)
 	if err != nil {
 		return err
 	}
-	response := server.response(operation)
+	if server.mode == "matching" && request.source != sourceDirect {
+		return fmt.Errorf(
+			"matching request source must be direct, got %s",
+			sourceName(request.source),
+		)
+	}
+	response := server.response(request.operation, request.source)
 	fmt.Printf(
-		"fault bridge operation=%s status=%s take_count=%d\n",
-		operationName(operation),
+		"fault bridge operation=%s status=%s take_count=%d source=%s\n",
+		operationName(request.operation),
 		response.status,
 		server.takes.Load(),
+		sourceName(request.source),
 	)
 	if response.delay > 0 {
 		time.Sleep(response.delay)
@@ -184,26 +201,31 @@ func handle(connection *net.UnixConn, server *faultServer) error {
 	return nil
 }
 
-func parseRequest(request []byte) (byte, error) {
+func parseRequest(request []byte) (faultRequest, error) {
 	if len(request) != requestSize || string(request[:4]) != "OBIQ" ||
 		binary.LittleEndian.Uint16(request[4:6]) != requestVersion ||
 		binary.LittleEndian.Uint16(request[6:8]) != requestSize {
-		return 0, errors.New("invalid request envelope")
+		return faultRequest{}, errors.New("invalid request envelope")
 	}
-	if request[9] != 0 || request[10] != 0 || request[11] != 0 ||
+	if request[10] != 0 || request[11] != 0 ||
 		binary.LittleEndian.Uint32(request[12:16]) == 0 ||
 		binary.LittleEndian.Uint64(request[16:24]) == 0 {
-		return 0, errors.New("invalid request identity or reserved bytes")
+		return faultRequest{}, errors.New("invalid request identity or reserved bytes")
+	}
+	switch request[9] {
+	case sourceDirect, sourceTask:
+	default:
+		return faultRequest{}, errors.New("invalid request source")
 	}
 	switch request[8] {
 	case operationTake, operationDrop, operationProbe:
-		return request[8], nil
+		return faultRequest{operation: request[8], source: request[9]}, nil
 	default:
-		return 0, errors.New("invalid request operation")
+		return faultRequest{}, errors.New("invalid request operation")
 	}
 }
 
-func (s *faultServer) response(operation byte) faultResponse {
+func (s *faultServer) response(operation, source byte) faultResponse {
 	if operation != operationTake {
 		return responseWithStatus(statusMissing)
 	}
@@ -214,7 +236,7 @@ func (s *faultServer) response(operation byte) faultResponse {
 
 	switch s.mode {
 	case "matching":
-		if count == 1 || count > s.matchingValidTakes+1 {
+		if source != sourceDirect || count == 1 || count > s.matchingValidTakes+1 {
 			return responseWithStatus(statusMissing)
 		}
 		return faultResponse{payload: validRecord(), status: statusName(statusValid)}
@@ -321,6 +343,17 @@ func operationName(operation byte) string {
 		return "discard"
 	case operationProbe:
 		return "negotiate"
+	default:
+		return "unknown"
+	}
+}
+
+func sourceName(source byte) string {
+	switch source {
+	case sourceDirect:
+		return "direct"
+	case sourceTask:
+		return "task"
 	default:
 		return "unknown"
 	}

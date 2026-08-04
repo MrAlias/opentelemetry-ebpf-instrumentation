@@ -14,6 +14,8 @@ import (
 
 const MarkerHeader = "x-obi-demo-id"
 
+const invalidMarkerAttribute = "obi.related.marker.invalid"
+
 const (
 	spanFlagsParentRemoteKnown = uint32(1 << 8)
 	spanFlagsParentRemote      = uint32(1 << 9)
@@ -55,6 +57,9 @@ type Snapshot struct {
 	MaxRetainedBytes          uint64 `json:"max_retained_bytes"`
 	MaxValueBytes             uint64 `json:"max_value_bytes"`
 	Spans                     []Span `json:"spans"`
+	RelatedSpans              []Span `json:"related_spans,omitempty"`
+	OmittedRelatedSpans       uint64 `json:"omitted_related_spans,omitempty"`
+	AmbiguousRelatedSpans     uint64 `json:"ambiguous_related_spans,omitempty"`
 }
 
 func Flatten(traces ptrace.Traces) []Span {
@@ -69,10 +74,15 @@ func Flatten(traces ptrace.Traces) []Span {
 					if keepAttribute(key) {
 						if normalized, ok := normalizedAttributeValue(key, value); ok {
 							attributes[key] = normalized
+						} else if isMarkerAttribute(key) {
+							attributes[invalidMarkerAttribute] = "true"
 						}
 					}
 					return true
 				})
+				if markerValuesConflict(attributes) {
+					attributes[invalidMarkerAttribute] = "true"
+				}
 
 				result = append(result, Span{
 					TraceID:       source.TraceID().String(),
@@ -126,6 +136,27 @@ func hasMarkerAttribute(span Span) bool {
 		if isMarkerAttribute(key) {
 			return true
 		}
+	}
+	return false
+}
+
+func hasInvalidMarkerAttribute(span Span) bool {
+	return span.Attributes[invalidMarkerAttribute] == "true" ||
+		markerValuesConflict(span.Attributes)
+}
+
+func markerValuesConflict(attributes map[string]string) bool {
+	var first string
+	found := false
+	for key, value := range attributes {
+		if !isMarkerAttribute(key) {
+			continue
+		}
+		if found && value != first {
+			return true
+		}
+		first = value
+		found = true
 	}
 	return false
 }

@@ -98,6 +98,22 @@ func TestAssertSnapshotPressureClassifiesOnlyExplicitRootsAsMisses(t *testing.T)
 	unresolvedOutcome, err := ClassifyPressureParent(unresolved, expectation)
 	require.Error(t, err)
 	assert.Equal(t, PressureParentUnresolved, unresolvedOutcome)
+
+	zeroClient := missing
+	zeroClient.Spans = append([]Span(nil), missing.Spans...)
+	zeroClient.Spans[1].SpanID = ""
+	require.ErrorContains(t, AssertSnapshot(zeroClient, expectation), "Apache client candidate has a zero span ID")
+
+	boundarySibling := exact
+	boundarySibling.Spans = append([]Span(nil), exact.Spans...)
+	boundarySibling.RelatedSpans = []Span{{
+		TraceID:      testTraceID,
+		SpanID:       "445566778899aabb",
+		ParentSpanID: testApacheClientID,
+		ServiceName:  "foreign-service",
+		Kind:         "INTERNAL",
+	}}
+	require.ErrorContains(t, AssertSnapshot(boundarySibling, expectation), "only exported child of remote parent")
 }
 
 func TestAssertSnapshotRejectsAdditionalBridgeCandidate(t *testing.T) {
@@ -390,6 +406,195 @@ func TestAssertSnapshotRejectsMultiplePipelinedInboundSpans(t *testing.T) {
 	}
 
 	require.ErrorContains(t, AssertSnapshot(snapshot, expectation), "at most one Apache inbound")
+}
+
+func TestAssertSnapshotRejectsUnmarkedJavaServerCandidate(t *testing.T) {
+	snapshot := bridgeSnapshot(testRemoteSpanFlags)
+	snapshot.Spans[0].ParentSpanID = ""
+	delete(snapshot.Spans[2].Attributes, "http.request.header.x-obi-demo-id")
+	expectation := Expectation{
+		Mode:          ModeBridge,
+		ApacheService: "apache",
+		JavaService:   "java",
+		Endpoint:      testEndpoint,
+		Marker:        testMarker,
+	}
+
+	require.ErrorContains(t, AssertSnapshot(snapshot, expectation), "did not carry exact marker")
+}
+
+func TestAssertSnapshotRejectsUnmarkedRelatedDuplicateServer(t *testing.T) {
+	snapshot := bridgeSnapshot(testRemoteSpanFlags)
+	snapshot.Spans[0].ParentSpanID = ""
+	duplicate := snapshot.Spans[2]
+	duplicate.SpanID = "445566778899aabb"
+	duplicate.Attributes = map[string]string{"url.path": testEndpoint}
+	snapshot.RelatedSpans = []Span{duplicate}
+	expectation := Expectation{
+		Mode:          ModeBridge,
+		ApacheService: "apache",
+		JavaService:   "java",
+		Endpoint:      testEndpoint,
+		Marker:        testMarker,
+	}
+
+	require.ErrorContains(t, AssertSnapshot(snapshot, expectation), "exactly one Java server span")
+}
+
+func TestAssertSnapshotNoOBIModesRejectUnmarkedRelatedApacheSpan(t *testing.T) {
+	for _, mode := range []AssertionMode{ModeFailOpen, ModeW3CNoOBI, ModeW3CMatch} {
+		t.Run(string(mode), func(t *testing.T) {
+			base := bridgeSnapshot(testRemoteSpanFlags)
+			snapshot := Snapshot{
+				Marker: base.Marker,
+				Spans:  []Span{base.Spans[2]},
+				RelatedSpans: []Span{{
+					TraceID:     testTraceID,
+					SpanID:      "445566778899aabb",
+					ServiceName: "apache",
+					Kind:        "SERVER",
+				}},
+			}
+			expectation := Expectation{
+				Mode:            mode,
+				ApacheService:   "apache",
+				JavaService:     "java",
+				Endpoint:        testEndpoint,
+				Marker:          testMarker,
+				W3CTraceID:      testTraceID,
+				W3CParentSpanID: testApacheClientID,
+				W3CTraceFlags:   "01",
+			}
+
+			require.ErrorContains(t, AssertSnapshot(snapshot, expectation), "expected no Apache spans without OBI")
+		})
+	}
+}
+
+func TestAssertSnapshotRejectsAmbiguousRelatedServerEndpoint(t *testing.T) {
+	snapshot := bridgeSnapshot(testRemoteSpanFlags)
+	snapshot.Spans[0].ParentSpanID = ""
+	ambiguous := snapshot.Spans[2]
+	ambiguous.SpanID = "445566778899aabb"
+	ambiguous.ParentSpanID = snapshot.Spans[2].SpanID
+	ambiguous.Attributes = map[string]string{
+		"http.route": testEndpoint,
+		"url.path":   "/api/other",
+	}
+	snapshot.RelatedSpans = []Span{ambiguous}
+	expectation := Expectation{
+		Mode:          ModeBridge,
+		ApacheService: "apache",
+		JavaService:   "java",
+		Endpoint:      testEndpoint,
+		Marker:        testMarker,
+	}
+
+	require.ErrorContains(t, AssertSnapshot(snapshot, expectation), "exactly one Java server span")
+}
+
+func TestAssertSnapshotRejectsMalformedPrimaryEndpointEvidence(t *testing.T) {
+	snapshot := bridgeSnapshot(testRemoteSpanFlags)
+	snapshot.Spans[0].ParentSpanID = ""
+	snapshot.Spans[2].Attributes = map[string]string{
+		"http.request.header.x-obi-demo-id": testMarker,
+		"http.route":                        testEndpoint,
+		"http.url":                          "%",
+	}
+	expectation := Expectation{
+		Mode:          ModeBridge,
+		ApacheService: "apache",
+		JavaService:   "java",
+		Endpoint:      testEndpoint,
+		Marker:        testMarker,
+	}
+
+	require.ErrorContains(t, AssertSnapshot(snapshot, expectation), "did not match endpoint")
+}
+
+func TestAssertSnapshotRejectsRelatedServerWithDifferentEndpoint(t *testing.T) {
+	snapshot := bridgeSnapshot(testRemoteSpanFlags)
+	snapshot.Spans[0].ParentSpanID = ""
+	downstream := snapshot.Spans[2]
+	downstream.SpanID = "445566778899aabb"
+	downstream.ParentSpanID = snapshot.Spans[2].SpanID
+	downstream.Attributes = map[string]string{
+		"http.route": "/api/other",
+		"url.path":   "/api/other",
+	}
+	snapshot.RelatedSpans = []Span{downstream}
+	expectation := Expectation{
+		Mode:          ModeBridge,
+		ApacheService: "apache",
+		JavaService:   "java",
+		Endpoint:      testEndpoint,
+		Marker:        testMarker,
+	}
+
+	require.ErrorContains(t, AssertSnapshot(snapshot, expectation), "exactly one Java server span")
+}
+
+func TestAssertSnapshotRejectsSyntheticRemoteBoundarySibling(t *testing.T) {
+	snapshot := bridgeSnapshot(testRemoteSpanFlags)
+	snapshot.Spans[0].ParentSpanID = ""
+	snapshot.RelatedSpans = []Span{{
+		TraceID:      testTraceID,
+		SpanID:       "445566778899aabb",
+		ParentSpanID: testApacheClientID,
+		ServiceName:  "java",
+		Kind:         "INTERNAL",
+	}}
+	expectation := Expectation{
+		Mode:          ModeBridge,
+		ApacheService: "apache",
+		JavaService:   "java",
+		Endpoint:      testEndpoint,
+		Marker:        testMarker,
+	}
+
+	require.ErrorContains(t, AssertSnapshot(snapshot, expectation), "only exported child of remote parent")
+}
+
+func TestAssertSnapshotFailsClosedWhenRelatedSpansWereOmitted(t *testing.T) {
+	snapshot := bridgeSnapshot(testRemoteSpanFlags)
+	snapshot.OmittedRelatedSpans = 1
+	expectation := Expectation{
+		Mode:          ModeBridge,
+		ApacheService: "apache",
+		JavaService:   "java",
+		Endpoint:      testEndpoint,
+		Marker:        testMarker,
+	}
+
+	require.ErrorContains(t, AssertSnapshot(snapshot, expectation), "omitted 1 related spans")
+}
+
+func TestAssertSnapshotFailsClosedOnGraphAmbiguousRelatedSpans(t *testing.T) {
+	snapshot := bridgeSnapshot(testRemoteSpanFlags)
+	snapshot.AmbiguousRelatedSpans = 1
+	expectation := Expectation{
+		Mode:          ModeBridge,
+		ApacheService: "apache",
+		JavaService:   "java",
+		Endpoint:      testEndpoint,
+		Marker:        testMarker,
+	}
+
+	require.ErrorContains(t, AssertSnapshot(snapshot, expectation), "graph-ambiguous related spans")
+}
+
+func TestIncludeRelatedSpansIsIdempotent(t *testing.T) {
+	snapshot := Snapshot{
+		Spans:        []Span{{SpanID: "primary"}},
+		RelatedSpans: []Span{{SpanID: "related"}},
+	}
+
+	once := includeRelatedSpans(snapshot)
+	twice := includeRelatedSpans(once)
+
+	require.Len(t, once.Spans, 2)
+	require.Empty(t, once.RelatedSpans)
+	require.Equal(t, once.Spans, twice.Spans)
 }
 
 func TestSpanDescendsFromRejectsCyclesAndDuplicates(t *testing.T) {

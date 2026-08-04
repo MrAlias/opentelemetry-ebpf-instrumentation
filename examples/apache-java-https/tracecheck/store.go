@@ -5,13 +5,36 @@ package tracecheck
 
 import (
 	"math"
+	"strings"
 	"sync"
 	"time"
+)
+
+const (
+	maxRelatedSpans         = 256
+	maxRelatedValueBytes    = 1024
+	maxRelatedRetainedBytes = 256 * 1024
 )
 
 type storedSpan struct {
 	span          Span
 	retainedBytes uint64
+}
+
+type markerRelation uint8
+
+const (
+	markerRelationUnknown markerRelation = iota
+	markerRelationVisiting
+	markerRelationWanted
+	markerRelationDifferent
+	markerRelationAmbiguous
+)
+
+type duplicateMarkerInfo struct {
+	relevant               bool
+	exactMarker            bool
+	allExplicitlyDifferent bool
 }
 
 type Store struct {
@@ -119,7 +142,7 @@ func (s *Store) Snapshot(marker string) Snapshot {
 	for _, stored := range s.spans {
 		retained = append(retained, cloneSpan(stored.span))
 	}
-	spans := spansForMarker(retained, marker)
+	spans, relatedSpans, omittedRelatedSpans, ambiguousRelatedSpans := spansForMarker(retained, marker)
 	sortSpans(spans)
 
 	return Snapshot{
@@ -134,12 +157,15 @@ func (s *Store) Snapshot(marker string) Snapshot {
 		MaxRetainedBytes:          s.maxRetainedBytes,
 		MaxValueBytes:             s.maxValueBytes,
 		Spans:                     spans,
+		RelatedSpans:              relatedSpans,
+		OmittedRelatedSpans:       omittedRelatedSpans,
+		AmbiguousRelatedSpans:     ambiguousRelatedSpans,
 	}
 }
 
-func spansForMarker(spans []Span, marker string) []Span {
+func spansForMarker(spans []Span, marker string) ([]Span, []Span, uint64, uint64) {
 	if marker == "" {
-		return spans
+		return spans, nil, 0, 0
 	}
 
 	byIdentity := make(map[spanIdentity]Span, len(spans))
@@ -158,11 +184,20 @@ func spansForMarker(spans []Span, marker string) []Span {
 	}
 
 	included := make(map[spanIdentity]struct{}, len(spans))
+	selectedTraces := make(map[string]struct{})
+	boundaryParents := make(map[spanIdentity]struct{})
 	for _, span := range spans {
-		if !MatchesMarker(span, marker) {
+		if hasInvalidMarkerAttribute(span) || !MatchesMarker(span, marker) {
 			continue
 		}
 		identity := makeSpanIdentity(span.TraceID, span.SpanID)
+		if !isZeroID(span.TraceID) {
+			selectedTraces[identity.traceID] = struct{}{}
+		}
+		if !isZeroID(span.TraceID) && strings.EqualFold(span.Kind, "SERVER") &&
+			!isZeroID(span.ParentSpanID) {
+			boundaryParents[makeSpanIdentity(span.TraceID, span.ParentSpanID)] = struct{}{}
+		}
 		if _, duplicate := duplicates[identity]; duplicate {
 			continue
 		}
@@ -185,7 +220,8 @@ func spansForMarker(spans []Span, marker string) []Span {
 			if !exists {
 				break
 			}
-			if hasMarkerAttribute(parent) && !MatchesMarker(parent, marker) {
+			if hasInvalidMarkerAttribute(parent) ||
+				hasMarkerAttribute(parent) && !MatchesMarker(parent, marker) {
 				break
 			}
 			current = parent
@@ -202,7 +238,154 @@ func spansForMarker(spans []Span, marker string) []Span {
 			selected = append(selected, span)
 		}
 	}
-	return selected
+
+	ambiguousIdentities := make(map[spanIdentity]struct{})
+	duplicateInfo := make(map[spanIdentity]duplicateMarkerInfo, len(duplicates))
+	for identity := range duplicates {
+		duplicateInfo[identity] = duplicateMarkerInfo{allExplicitlyDifferent: true}
+	}
+	for _, span := range spans {
+		identity := makeSpanIdentity(span.TraceID, span.SpanID)
+		info, duplicate := duplicateInfo[identity]
+		if !duplicate {
+			continue
+		}
+		_, sharesBoundaryParent := boundaryParents[makeSpanIdentity(span.TraceID, span.ParentSpanID)]
+		info.relevant = info.relevant || strings.EqualFold(span.Kind, "SERVER") || sharesBoundaryParent
+		if hasInvalidMarkerAttribute(span) || !hasMarkerAttribute(span) {
+			info.allExplicitlyDifferent = false
+		} else if MatchesMarker(span, marker) {
+			info.exactMarker = true
+			info.allExplicitlyDifferent = false
+		}
+		duplicateInfo[identity] = info
+	}
+	for identity, info := range duplicateInfo {
+		if info.exactMarker {
+			ambiguousIdentities[identity] = struct{}{}
+			continue
+		}
+		if _, selectedTrace := selectedTraces[identity.traceID]; !selectedTrace {
+			continue
+		}
+		if info.relevant && !info.allExplicitlyDifferent {
+			ambiguousIdentities[identity] = struct{}{}
+		}
+	}
+
+	relations := make(map[spanIdentity]markerRelation, len(byIdentity)+len(duplicates))
+	related := make([]Span, 0)
+	for _, span := range spans {
+		identity := makeSpanIdentity(span.TraceID, span.SpanID)
+		if _, duplicate := duplicates[identity]; duplicate {
+			continue
+		}
+		if _, exists := included[identity]; exists {
+			continue
+		}
+		if _, selectedTrace := selectedTraces[identity.traceID]; !selectedTrace {
+			continue
+		}
+		_, sharesBoundaryParent := boundaryParents[makeSpanIdentity(span.TraceID, span.ParentSpanID)]
+		if !strings.EqualFold(span.Kind, "SERVER") && !sharesBoundaryParent {
+			continue
+		}
+		relation := relationToMarker(identity, marker, byIdentity, duplicates, relations)
+		if relation == markerRelationAmbiguous {
+			ambiguousIdentities[identity] = struct{}{}
+			continue
+		}
+		if relation != markerRelationWanted {
+			continue
+		}
+		related = append(related, redactedRelatedSpan(span))
+	}
+	sortSpans(related)
+	boundedRelated := make([]Span, 0, min(len(related), maxRelatedSpans))
+	omitted := uint64(0)
+	retainedBytes := uint64(0)
+	for _, span := range related {
+		spanBytes, valueLimitExceeded, ok := spanRetainedBytes(span, maxRelatedValueBytes)
+		if valueLimitExceeded || !ok || spanBytes > maxRelatedRetainedBytes-retainedBytes ||
+			len(boundedRelated) == maxRelatedSpans {
+			omitted = saturatingAdd(omitted, 1)
+			continue
+		}
+		retainedBytes += spanBytes
+		boundedRelated = append(boundedRelated, span)
+	}
+	return selected, boundedRelated, omitted, uint64(len(ambiguousIdentities))
+}
+
+func relationToMarker(
+	start spanIdentity,
+	marker string,
+	byIdentity map[spanIdentity]Span,
+	duplicates map[spanIdentity]struct{},
+	relations map[spanIdentity]markerRelation,
+) markerRelation {
+	if relation := relations[start]; relation != markerRelationUnknown {
+		if relation == markerRelationVisiting {
+			return markerRelationAmbiguous
+		}
+		return relation
+	}
+
+	path := make([]spanIdentity, 0)
+	current := start
+	result := markerRelationAmbiguous
+	for {
+		relation := relations[current]
+		if relation != markerRelationUnknown {
+			if relation == markerRelationVisiting {
+				result = markerRelationAmbiguous
+			} else {
+				result = relation
+			}
+			break
+		}
+		relations[current] = markerRelationVisiting
+		path = append(path, current)
+
+		if _, duplicate := duplicates[current]; duplicate {
+			break
+		}
+		span, exists := byIdentity[current]
+		if !exists || hasInvalidMarkerAttribute(span) {
+			break
+		}
+		if hasMarkerAttribute(span) {
+			if MatchesMarker(span, marker) {
+				result = markerRelationWanted
+			} else {
+				result = markerRelationDifferent
+			}
+			break
+		}
+		if isZeroID(span.ParentSpanID) {
+			result = markerRelationWanted
+			break
+		}
+		current = makeSpanIdentity(span.TraceID, span.ParentSpanID)
+	}
+	for _, identity := range path {
+		relations[identity] = result
+	}
+	return result
+}
+
+func redactedRelatedSpan(span Span) Span {
+	return Span{
+		TraceID:           span.TraceID,
+		SpanID:            span.SpanID,
+		ParentSpanID:      span.ParentSpanID,
+		Flags:             span.Flags,
+		ServiceName:       span.ServiceName,
+		Kind:              span.Kind,
+		StartUnixNano:     span.StartUnixNano,
+		EndUnixNano:       span.EndUnixNano,
+		ReceivedUnixMilli: span.ReceivedUnixMilli,
+	}
 }
 
 func (s *Store) recordDrop(reason *uint64) {

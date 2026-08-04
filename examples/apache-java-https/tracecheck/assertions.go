@@ -6,7 +6,17 @@ package tracecheck
 import (
 	"encoding/hex"
 	"fmt"
+	"net/url"
 	"strings"
+)
+
+type endpointEvidence int
+
+const (
+	endpointAbsent endpointEvidence = iota
+	endpointExact
+	endpointDifferent
+	endpointConflicting
 )
 
 type AssertionMode string
@@ -59,6 +69,19 @@ func AssertSnapshot(snapshot Snapshot, expectation Expectation) error {
 			snapshot.DroppedRetainedLimitSpans,
 		)
 	}
+	if snapshot.OmittedRelatedSpans != 0 {
+		return fmt.Errorf(
+			"receiver omitted %d related spans before the assertion",
+			snapshot.OmittedRelatedSpans,
+		)
+	}
+	if snapshot.AmbiguousRelatedSpans != 0 {
+		return fmt.Errorf(
+			"receiver found %d graph-ambiguous related spans before the assertion",
+			snapshot.AmbiguousRelatedSpans,
+		)
+	}
+	snapshot = includeRelatedSpans(snapshot)
 	if expectation.Mode == ModeUninstrumented {
 		if len(snapshot.Spans) != 0 {
 			return fmt.Errorf(
@@ -70,7 +93,7 @@ func AssertSnapshot(snapshot Snapshot, expectation Expectation) error {
 		return nil
 	}
 
-	javaSpans := selectMarkerServerSpans(
+	javaSpans := selectServerCandidates(
 		snapshot.Spans,
 		expectation.JavaService,
 		expectation.Marker,
@@ -84,8 +107,17 @@ func AssertSnapshot(snapshot Snapshot, expectation Expectation) error {
 		)
 	}
 	javaSpan := javaSpans[0]
-	if !MatchesEndpoint(javaSpan, expectation.Endpoint) {
+	if !MatchesMarker(javaSpan, expectation.Marker) {
+		return fmt.Errorf("java server span did not carry exact marker %s", expectation.Marker)
+	}
+	if classifyEndpoint(javaSpan, expectation.Endpoint) != endpointExact {
 		return fmt.Errorf("java server span for marker %s did not match endpoint %s", expectation.Marker, expectation.Endpoint)
+	}
+	if err := assertNonzeroSpanIdentity(javaSpan, "Java server span"); err != nil {
+		return err
+	}
+	if err := assertUniqueBoundaryChild(snapshot.Spans, javaSpan, true); err != nil {
+		return err
 	}
 
 	var apacheServer Span
@@ -94,7 +126,7 @@ func AssertSnapshot(snapshot Snapshot, expectation Expectation) error {
 		expectation.Mode != ModeW3CNoOBI &&
 		expectation.Mode != ModeW3CMatch &&
 		expectation.Mode != ModeW3CResilience {
-		apacheServers := selectMarkerServerSpans(
+		apacheServers := selectServerCandidates(
 			snapshot.Spans,
 			expectation.ApacheService,
 			expectation.Marker,
@@ -117,8 +149,14 @@ func AssertSnapshot(snapshot Snapshot, expectation Expectation) error {
 		if len(apacheServers) == 1 {
 			hasApacheServer = true
 			apacheServer = apacheServers[0]
-			if !MatchesEndpoint(apacheServer, expectation.Endpoint) {
+			if !MatchesMarker(apacheServer, expectation.Marker) {
+				return fmt.Errorf("apache server span did not carry exact marker %s", expectation.Marker)
+			}
+			if classifyEndpoint(apacheServer, expectation.Endpoint) != endpointExact {
 				return fmt.Errorf("apache server span for marker %s did not match endpoint %s", expectation.Marker, expectation.Endpoint)
+			}
+			if err := assertNonzeroSpanIdentity(apacheServer, "Apache inbound server span"); err != nil {
+				return err
 			}
 			if expectation.W3CTraceID == "" && !isZeroID(apacheServer.ParentSpanID) {
 				return fmt.Errorf(
@@ -129,7 +167,7 @@ func AssertSnapshot(snapshot Snapshot, expectation Expectation) error {
 		}
 	} else if expectation.Mode != ModeW3CResilience {
 		for _, span := range snapshot.Spans {
-			if span.ServiceName == expectation.ApacheService && MatchesMarker(span, expectation.Marker) {
+			if span.ServiceName == expectation.ApacheService {
 				return fmt.Errorf(
 					"expected no Apache spans without OBI for marker %s, got span %s",
 					expectation.Marker,
@@ -155,6 +193,9 @@ func AssertSnapshot(snapshot Snapshot, expectation Expectation) error {
 			)
 		}
 		matchingParent := apacheClients[0]
+		if err := assertNonzeroSpanIdentity(matchingParent, "Apache client candidate"); err != nil {
+			return err
+		}
 		if hasApacheServer && !spanDescendsFrom(snapshot.Spans, matchingParent, apacheServer) {
 			return fmt.Errorf(
 				"expected Apache client %s/%s to descend from inbound span %s/%s",
@@ -185,8 +226,13 @@ func AssertSnapshot(snapshot Snapshot, expectation Expectation) error {
 			if err != nil {
 				return err
 			}
-			if outcome == PressureParentExactHit ||
-				outcome == PressureParentExplicitRoot {
+			if outcome == PressureParentExactHit {
+				if err := assertUniqueBoundaryChild(snapshot.Spans, javaSpan, false); err != nil {
+					return err
+				}
+				return nil
+			}
+			if outcome == PressureParentExplicitRoot {
 				return nil
 			}
 		}
@@ -207,6 +253,9 @@ func AssertSnapshot(snapshot Snapshot, expectation Expectation) error {
 				matchingParent.TraceID,
 				matchingParent.SpanID,
 			)
+		}
+		if err := assertUniqueBoundaryChild(snapshot.Spans, javaSpan, false); err != nil {
+			return err
 		}
 		if err := assertBridgeTraceFlags(javaSpan, matchingParent, expectation); err != nil {
 			return err
@@ -340,7 +389,20 @@ func ClassifyPressureParent(
 			expectation.Mode,
 		)
 	}
-	javaSpans := selectMarkerServerSpans(
+	if snapshot.OmittedRelatedSpans != 0 {
+		return PressureParentUnresolved, fmt.Errorf(
+			"receiver omitted %d related spans before pressure classification",
+			snapshot.OmittedRelatedSpans,
+		)
+	}
+	if snapshot.AmbiguousRelatedSpans != 0 {
+		return PressureParentUnresolved, fmt.Errorf(
+			"receiver found %d graph-ambiguous related spans before pressure classification",
+			snapshot.AmbiguousRelatedSpans,
+		)
+	}
+	snapshot = includeRelatedSpans(snapshot)
+	javaSpans := selectServerCandidates(
 		snapshot.Spans,
 		expectation.JavaService,
 		expectation.Marker,
@@ -458,16 +520,111 @@ func assertExpectedTraceFlags(span Span, expected string) error {
 	return nil
 }
 
-func selectMarkerServerSpans(spans []Span, serviceName, marker string) []Span {
+func includeRelatedSpans(snapshot Snapshot) Snapshot {
+	if len(snapshot.RelatedSpans) == 0 {
+		return snapshot
+	}
+	combined := make([]Span, 0, len(snapshot.Spans)+len(snapshot.RelatedSpans))
+	combined = append(combined, snapshot.Spans...)
+	combined = append(combined, snapshot.RelatedSpans...)
+	snapshot.Spans = combined
+	snapshot.RelatedSpans = nil
+	return snapshot
+}
+
+func selectServerCandidates(
+	spans []Span,
+	serviceName string,
+	marker string,
+) []Span {
 	var selected []Span
 	for _, span := range spans {
 		if span.ServiceName == serviceName &&
 			strings.EqualFold(span.Kind, "SERVER") &&
-			MatchesMarker(span, marker) {
+			!markerConflicts(span, marker) {
 			selected = append(selected, span)
 		}
 	}
 	return selected
+}
+
+func markerConflicts(span Span, marker string) bool {
+	return hasInvalidMarkerAttribute(span) ||
+		hasMarkerAttribute(span) && !MatchesMarker(span, marker)
+}
+
+func classifyEndpoint(span Span, expected string) endpointEvidence {
+	found := false
+	exact := false
+	different := false
+	invalid := false
+
+	for _, key := range []string{"http.route", "url.path"} {
+		value := span.Attributes[key]
+		if value == "" {
+			continue
+		}
+		found = true
+		if value == expected {
+			exact = true
+		} else {
+			different = true
+		}
+	}
+	for _, key := range []string{"http.target", "http.url", "url.full"} {
+		value := span.Attributes[key]
+		if value == "" {
+			continue
+		}
+		found = true
+		parsed, err := url.Parse(value)
+		if err != nil || parsed.Path == "" {
+			invalid = true
+			continue
+		}
+		if parsed.Path == expected {
+			exact = true
+		} else {
+			different = true
+		}
+	}
+
+	switch {
+	case !found:
+		return endpointAbsent
+	case invalid || exact && different:
+		return endpointConflicting
+	case exact:
+		return endpointExact
+	default:
+		return endpointDifferent
+	}
+}
+
+func assertUniqueBoundaryChild(spans []Span, selected Span, sameServiceOnly bool) error {
+	if isZeroID(selected.ParentSpanID) {
+		return nil
+	}
+	selectedIdentity := makeSpanIdentity(selected.TraceID, selected.SpanID)
+	for _, span := range spans {
+		identity := makeSpanIdentity(span.TraceID, span.SpanID)
+		if identity == selectedIdentity ||
+			!strings.EqualFold(span.TraceID, selected.TraceID) ||
+			!strings.EqualFold(span.ParentSpanID, selected.ParentSpanID) ||
+			sameServiceOnly && span.ServiceName != selected.ServiceName {
+			continue
+		}
+		return fmt.Errorf(
+			"expected Java server span %s/%s to be the only exported child of remote parent %s, got competing %s/%s span %s",
+			selected.TraceID,
+			selected.SpanID,
+			selected.ParentSpanID,
+			span.ServiceName,
+			span.Kind,
+			span.SpanID,
+		)
+	}
+	return nil
 }
 
 func selectMarkerClientSpans(spans []Span, serviceName, marker string) []Span {

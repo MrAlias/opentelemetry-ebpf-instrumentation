@@ -4,6 +4,8 @@
 package tracecheck
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -79,6 +81,419 @@ func TestStoreMarkerSnapshotRetainsParentChain(t *testing.T) {
 	}
 }
 
+func TestStoreMarkerSnapshotAddsOnlyRedactedRelatedCandidates(t *testing.T) {
+	const marker = "bridge-request"
+	const traceID = "00112233445566778899aabbccddeeff"
+	requestAttributes := map[string]string{
+		"http.request.header.x_obi_demo_id": marker,
+		"url.path":                          "/api/echo",
+	}
+	store := NewStore(16, 1024, 16384)
+	store.Add([]Span{
+		{
+			TraceID:     traceID,
+			SpanID:      "apache-server",
+			ServiceName: "apache",
+			Kind:        "SERVER",
+			Attributes:  requestAttributes,
+		},
+		{
+			TraceID:      traceID,
+			SpanID:       "apache-client",
+			ParentSpanID: "apache-server",
+			ServiceName:  "apache",
+			Kind:         "CLIENT",
+			Attributes:   requestAttributes,
+		},
+		{
+			TraceID:      traceID,
+			SpanID:       "java-server",
+			ParentSpanID: "apache-client",
+			ServiceName:  "java",
+			Kind:         "SERVER",
+			Attributes:   requestAttributes,
+		},
+		{
+			TraceID:      traceID,
+			SpanID:       "duplicate-server",
+			ParentSpanID: "apache-client",
+			ServiceName:  "java",
+			ScopeName:    "sensitive-scope",
+			Name:         "sensitive-name",
+			Kind:         "SERVER",
+			Attributes: map[string]string{
+				"url.path": "/api/echo",
+				"url.full": "https://java/api/echo?secret=value",
+				"http.url": "%",
+				"custom":   "sensitive-value",
+			},
+		},
+		{
+			TraceID:      traceID,
+			SpanID:       "downstream-server",
+			ParentSpanID: "java-server",
+			ServiceName:  "java",
+			Kind:         "SERVER",
+			Attributes:   map[string]string{"url.path": "/api/other"},
+		},
+		{
+			TraceID:      traceID,
+			SpanID:       "boundary-sibling",
+			ParentSpanID: "apache-client",
+			ServiceName:  "java",
+			Name:         "sensitive-boundary-name",
+			Kind:         "INTERNAL",
+			Attributes:   map[string]string{"url.full": "https://java/private?secret=value"},
+		},
+		{
+			TraceID:      traceID,
+			SpanID:       "unrelated-internal",
+			ParentSpanID: "apache-server",
+			ServiceName:  "java",
+			Kind:         "INTERNAL",
+		},
+	})
+
+	snapshot := store.Snapshot(marker)
+	if len(snapshot.Spans) != 3 {
+		t.Fatalf("expected only marker spans and ancestors, got %#v", snapshot.Spans)
+	}
+	if len(snapshot.RelatedSpans) != 3 || snapshot.OmittedRelatedSpans != 0 {
+		t.Fatalf("unexpected related candidates: %#v", snapshot)
+	}
+	for _, span := range snapshot.RelatedSpans {
+		if span.Name != "" || span.ScopeName != "" || len(span.Attributes) != 0 {
+			t.Fatalf("related span retained nonessential data: %#v", span)
+		}
+	}
+}
+
+func TestStoreMarkerSnapshotExcludesDifferentMarkerSubtree(t *testing.T) {
+	const traceID = "00112233445566778899aabbccddeeff"
+	store := NewStore(10, 1024, 4096)
+	store.Add([]Span{
+		{
+			TraceID:     traceID,
+			SpanID:      "wanted",
+			ServiceName: "java",
+			Kind:        "SERVER",
+			Attributes:  map[string]string{"http.request.header.x_obi_demo_id": "wanted"},
+		},
+		{
+			TraceID:      traceID,
+			SpanID:       "other",
+			ParentSpanID: "wanted",
+			ServiceName:  "java",
+			Kind:         "SERVER",
+			Attributes:   map[string]string{"http.request.header.x_obi_demo_id": "other"},
+		},
+		{
+			TraceID:      traceID,
+			SpanID:       "other-child",
+			ParentSpanID: "other",
+			ServiceName:  "java",
+			Kind:         "SERVER",
+		},
+	})
+
+	snapshot := store.Snapshot("wanted")
+	if len(snapshot.Spans) != 1 || snapshot.Spans[0].SpanID != "wanted" ||
+		len(snapshot.RelatedSpans) != 0 {
+		t.Fatalf("different-marker subtree leaked into snapshot: %#v", snapshot)
+	}
+}
+
+func TestStoreMarkerSnapshotCapsRelatedCandidates(t *testing.T) {
+	const traceID = "00112233445566778899aabbccddeeff"
+	spans := []Span{{
+		TraceID:     traceID,
+		SpanID:      "wanted",
+		ServiceName: "java",
+		Kind:        "SERVER",
+		Attributes:  map[string]string{"http.request.header.x_obi_demo_id": "wanted"},
+	}}
+	for index := 0; index < maxRelatedSpans+1; index++ {
+		spans = append(spans, Span{
+			TraceID:     traceID,
+			SpanID:      fmt.Sprintf("related-%03d", index),
+			ServiceName: "java",
+			Kind:        "SERVER",
+		})
+	}
+	store := NewStore(len(spans), 1024, 1<<20)
+	store.Add(spans)
+
+	snapshot := store.Snapshot("wanted")
+	if len(snapshot.RelatedSpans) != maxRelatedSpans || snapshot.OmittedRelatedSpans != 1 {
+		t.Fatalf("related candidate cap did not fail closed: %#v", snapshot)
+	}
+}
+
+func TestStoreMarkerSnapshotBoundsRelatedCandidateValues(t *testing.T) {
+	const traceID = "00112233445566778899aabbccddeeff"
+	spans := []Span{{
+		TraceID:     traceID,
+		SpanID:      "wanted",
+		ServiceName: "java",
+		Kind:        "SERVER",
+		Attributes:  map[string]string{"http.request.header.x_obi_demo_id": "wanted"},
+	}}
+	spans = append(spans, Span{
+		TraceID:     traceID,
+		SpanID:      "oversized-value",
+		ServiceName: strings.Repeat("v", maxRelatedValueBytes+1),
+		Kind:        "SERVER",
+	})
+	store := NewStore(len(spans), maxRelatedValueBytes+1, 1<<20)
+	store.Add(spans)
+
+	snapshot := store.Snapshot("wanted")
+	if len(snapshot.RelatedSpans) != 0 || snapshot.OmittedRelatedSpans != 1 {
+		t.Fatalf("related value limit did not fail closed: %#v", snapshot)
+	}
+}
+
+func TestStoreMarkerSnapshotBoundsAggregateRelatedBytes(t *testing.T) {
+	const traceID = "00112233445566778899aabbccddeeff"
+	spans := []Span{{
+		TraceID:     traceID,
+		SpanID:      "wanted",
+		ServiceName: "java",
+		Kind:        "SERVER",
+		Attributes:  map[string]string{"http.request.header.x_obi_demo_id": "wanted"},
+	}}
+	for index := 0; index < maxRelatedSpans; index++ {
+		spans = append(spans, Span{
+			TraceID:     traceID,
+			SpanID:      fmt.Sprintf("aggregate-%03d", index),
+			ServiceName: strings.Repeat("b", maxRelatedValueBytes),
+			Kind:        "SERVER",
+		})
+	}
+	store := NewStore(len(spans), maxRelatedValueBytes+1, 1<<20)
+	store.Add(spans)
+
+	snapshot := store.Snapshot("wanted")
+	if snapshot.OmittedRelatedSpans == 0 {
+		t.Fatalf("related aggregate limit did not fail closed: %#v", snapshot)
+	}
+	var retained uint64
+	for _, span := range snapshot.RelatedSpans {
+		spanBytes, valueLimitExceeded, ok := spanRetainedBytes(span, maxRelatedValueBytes)
+		if valueLimitExceeded || !ok {
+			t.Fatalf("retained an over-limit related span: %#v", span)
+		}
+		retained += spanBytes
+	}
+	if retained > maxRelatedRetainedBytes {
+		t.Fatalf("retained %d related bytes, limit is %d", retained, maxRelatedRetainedBytes)
+	}
+}
+
+func TestStoreMarkerSnapshotTaintsRelevantDuplicateIdentities(t *testing.T) {
+	const traceID = "00112233445566778899aabbccddeeff"
+	for _, testCase := range []struct {
+		name  string
+		spans []Span
+	}{
+		{
+			name: "unmarked server peer",
+			spans: []Span{
+				{TraceID: traceID, SpanID: "duplicate", ServiceName: "java", Kind: "SERVER"},
+				{TraceID: traceID, SpanID: "duplicate", ServiceName: "java", Kind: "SERVER"},
+			},
+		},
+		{
+			name: "exact marker seed",
+			spans: []Span{
+				{
+					TraceID:     traceID,
+					SpanID:      "duplicate",
+					ServiceName: "java",
+					Kind:        "SERVER",
+					Attributes:  map[string]string{"http.request.header.x_obi_demo_id": "wanted"},
+				},
+				{
+					TraceID:     traceID,
+					SpanID:      "duplicate",
+					ServiceName: "java",
+					Kind:        "SERVER",
+					Attributes:  map[string]string{"http.request.header.x_obi_demo_id": "wanted"},
+				},
+			},
+		},
+		{
+			name: "zero trace exact marker seed",
+			spans: []Span{
+				{
+					SpanID:      "duplicate",
+					ServiceName: "java",
+					Kind:        "SERVER",
+					Attributes:  map[string]string{"http.request.header.x_obi_demo_id": "wanted"},
+				},
+				{
+					SpanID:      "duplicate",
+					ServiceName: "java",
+					Kind:        "SERVER",
+					Attributes:  map[string]string{"http.request.header.x_obi_demo_id": "wanted"},
+				},
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			spans := []Span{{
+				TraceID:     traceID,
+				SpanID:      "wanted",
+				ServiceName: "java",
+				Kind:        "SERVER",
+				Attributes:  map[string]string{"http.request.header.x_obi_demo_id": "wanted"},
+			}}
+			spans = append(spans, testCase.spans...)
+			store := NewStore(len(spans), 1024, 4096)
+			store.Add(spans)
+
+			snapshot := store.Snapshot("wanted")
+			if snapshot.AmbiguousRelatedSpans != 1 {
+				t.Fatalf("relevant duplicate identity did not fail closed: %#v", snapshot)
+			}
+		})
+	}
+}
+
+func TestRelationToMarkerMemoizesHighCardinalityChain(t *testing.T) {
+	const (
+		traceID = "00112233445566778899aabbccddeeff"
+		count   = 10_000
+	)
+	byIdentity := make(map[spanIdentity]Span, count)
+	identities := make([]spanIdentity, 0, count)
+	parentID := ""
+	for index := 0; index < count; index++ {
+		spanID := fmt.Sprintf("node-%05d", index)
+		span := Span{TraceID: traceID, SpanID: spanID, ParentSpanID: parentID}
+		identity := makeSpanIdentity(traceID, spanID)
+		byIdentity[identity] = span
+		identities = append(identities, identity)
+		parentID = spanID
+	}
+	relations := make(map[spanIdentity]markerRelation, count)
+	duplicates := make(map[spanIdentity]struct{})
+
+	if got := relationToMarker(identities[len(identities)-1], "wanted", byIdentity, duplicates, relations); got != markerRelationWanted {
+		t.Fatalf("deep chain relation = %d, want %d", got, markerRelationWanted)
+	}
+	for _, identity := range identities {
+		if got := relationToMarker(identity, "wanted", byIdentity, duplicates, relations); got != markerRelationWanted {
+			t.Fatalf("memoized relation for %#v = %d, want %d", identity, got, markerRelationWanted)
+		}
+	}
+	if len(relations) != count {
+		t.Fatalf("memoized %d graph nodes, want %d", len(relations), count)
+	}
+}
+
+func TestStoreMarkerSnapshotDoesNotCorrelateZeroTraceIDs(t *testing.T) {
+	store := NewStore(2, 1024, 4096)
+	store.Add([]Span{
+		{
+			SpanID:      "wanted",
+			ServiceName: "java",
+			Kind:        "SERVER",
+			Attributes:  map[string]string{"http.request.header.x_obi_demo_id": "wanted"},
+		},
+		{SpanID: "unmarked", ServiceName: "java", Kind: "SERVER"},
+	})
+
+	snapshot := store.Snapshot("wanted")
+	if len(snapshot.Spans) != 1 || len(snapshot.RelatedSpans) != 0 ||
+		snapshot.AmbiguousRelatedSpans != 0 {
+		t.Fatalf("zero trace IDs were correlated: %#v", snapshot)
+	}
+}
+
+func TestStoreMarkerSnapshotTaintsGraphAmbiguousRelatedCandidate(t *testing.T) {
+	const traceID = "00112233445566778899aabbccddeeff"
+	for _, testCase := range []struct {
+		name  string
+		spans []Span
+	}{
+		{
+			name: "missing parent",
+			spans: []Span{{
+				TraceID:      traceID,
+				SpanID:       "candidate",
+				ParentSpanID: "missing",
+				ServiceName:  "java",
+				Kind:         "SERVER",
+			}},
+		},
+		{
+			name: "duplicate parent",
+			spans: []Span{
+				{TraceID: traceID, SpanID: "duplicate", ServiceName: "java", Kind: "INTERNAL"},
+				{TraceID: traceID, SpanID: "duplicate", ServiceName: "other", Kind: "INTERNAL"},
+				{
+					TraceID:      traceID,
+					SpanID:       "candidate",
+					ParentSpanID: "duplicate",
+					ServiceName:  "java",
+					Kind:         "SERVER",
+				},
+			},
+		},
+		{
+			name: "cycle",
+			spans: []Span{
+				{
+					TraceID:      traceID,
+					SpanID:       "candidate",
+					ParentSpanID: "cycle",
+					ServiceName:  "java",
+					Kind:         "SERVER",
+				},
+				{
+					TraceID:      traceID,
+					SpanID:       "cycle",
+					ParentSpanID: "candidate",
+					ServiceName:  "java",
+					Kind:         "INTERNAL",
+				},
+			},
+		},
+		{
+			name: "conflicting valid marker aliases",
+			spans: []Span{{
+				TraceID:     traceID,
+				SpanID:      "candidate",
+				ServiceName: "java",
+				Kind:        "SERVER",
+				Attributes: map[string]string{
+					"http.request.header.x-obi-demo-id": "wanted",
+					"http.request.header.x_obi_demo_id": "other",
+				},
+			}},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			spans := []Span{{
+				TraceID:     traceID,
+				SpanID:      "wanted",
+				ServiceName: "java",
+				Kind:        "SERVER",
+				Attributes:  map[string]string{"http.request.header.x_obi_demo_id": "wanted"},
+			}}
+			spans = append(spans, testCase.spans...)
+			store := NewStore(10, 1024, 4096)
+			store.Add(spans)
+
+			snapshot := store.Snapshot("wanted")
+			if len(snapshot.RelatedSpans) != 0 || snapshot.AmbiguousRelatedSpans != 1 {
+				t.Fatalf("graph ambiguity did not fail closed: %#v", snapshot)
+			}
+		})
+	}
+}
+
 func TestStoreMarkerSnapshotStopsAtDifferentRequestMarker(t *testing.T) {
 	store := NewStore(10, 1024, 4096)
 	store.Add([]Span{
@@ -117,7 +532,8 @@ func TestStoreMarkerSnapshotRejectsConflictingDuplicateSeed(t *testing.T) {
 	})
 
 	snapshot := store.Snapshot("wanted")
-	if len(snapshot.Spans) != 0 {
+	if len(snapshot.Spans) != 0 || len(snapshot.RelatedSpans) != 0 ||
+		snapshot.OmittedRelatedSpans != 0 {
 		t.Fatalf("conflicting duplicate leaked into marker snapshot: %#v", snapshot.Spans)
 	}
 }
@@ -581,5 +997,39 @@ func TestNormalizedMarkerRequiresOneExactStringValue(t *testing.T) {
 	span := Span{Attributes: map[string]string{"custom.x_obi_demo_id": "basic-00-deadbeef"}}
 	if MatchesMarker(span, "basic-00-deadbeef") {
 		t.Fatal("accepted a marker from an unexpected attribute")
+	}
+}
+
+func TestFlattenMarksInvalidMarkerAliasesAsConflicting(t *testing.T) {
+	const marker = "basic-00-deadbeef"
+	traces := ptrace.NewTraces()
+	span := traces.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	span.Attributes().PutStr("http.request.header.x-obi-demo-id", marker)
+	invalid := span.Attributes().PutEmptySlice("http.request.header.x_obi_demo_id")
+	invalid.AppendEmpty().SetStr(marker)
+	invalid.AppendEmpty().SetStr("other")
+
+	flattened := Flatten(traces)
+	if len(flattened) != 1 {
+		t.Fatalf("expected one flattened span, got %d", len(flattened))
+	}
+	if !hasInvalidMarkerAttribute(flattened[0]) || !markerConflicts(flattened[0], marker) {
+		t.Fatalf("invalid marker alias was not retained as conflicting evidence: %#v", flattened[0])
+	}
+}
+
+func TestFlattenMarksDisagreeingValidMarkerAliasesAsConflicting(t *testing.T) {
+	const marker = "basic-00-deadbeef"
+	traces := ptrace.NewTraces()
+	span := traces.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	span.Attributes().PutStr("http.request.header.x-obi-demo-id", marker)
+	span.Attributes().PutStr("http.request.header.x_obi_demo_id", "other")
+
+	flattened := Flatten(traces)
+	if len(flattened) != 1 {
+		t.Fatalf("expected one flattened span, got %d", len(flattened))
+	}
+	if !hasInvalidMarkerAttribute(flattened[0]) || !markerConflicts(flattened[0], marker) {
+		t.Fatalf("disagreeing marker aliases were not retained as conflicting evidence: %#v", flattened[0])
 	}
 }

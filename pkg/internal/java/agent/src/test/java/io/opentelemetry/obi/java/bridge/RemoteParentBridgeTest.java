@@ -10,9 +10,17 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.lang.reflect.Field;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLongArray;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
@@ -56,6 +64,20 @@ class RemoteParentBridgeTest {
   }
 
   @Test
+  void sameProviderRegistrationIsIdempotentWithoutRevalidation() {
+    FakeProvider provider = new FakeProvider();
+    assertTrue(RemoteParentBridge.installProviderForTest(provider));
+    assertTrue(RemoteParentBridge.installProviderForTest(provider));
+
+    assertEquals(1, provider.abiCalls.get());
+    assertFalse(provider.closed.get());
+    assertTrue(RemoteParentBridge.diagnosticsSnapshot().contains("provider_ok=1"));
+    assertTrue(RemoteParentBridge.diagnosticsSnapshot().contains("provider_reject=0"));
+    assertTrue(RemoteParentBridge.removeProvider(provider));
+    assertEquals(1, provider.closeCount.get());
+  }
+
+  @Test
   void defaultsTransportConfigurationForExistingProviders() {
     assertTrue(RemoteParentBridge.installProviderForTest(new DefaultConfigurationProvider()));
 
@@ -66,32 +88,178 @@ class RemoteParentBridgeTest {
 
   @Test
   void sanitizesUnavailableProviderConfigurations() {
-    assertTrue(RemoteParentBridge.installProviderForTest(new FutureConfigurationProvider()));
+    FutureConfigurationProvider future = new FutureConfigurationProvider();
+    assertTrue(RemoteParentBridge.installProviderForTest(future));
     assertEquals(
         "version=2,status=6,requested=255,selected=255,attempted=0,getsockopt=0,unix=0",
         RemoteParentBridge.transportConfigurationSnapshot());
+    assertTrue(RemoteParentBridge.removeProvider(future));
 
-    assertTrue(RemoteParentBridge.installProviderForTest(new ThrowingConfigurationProvider()));
+    ThrowingConfigurationProvider throwing = new ThrowingConfigurationProvider();
+    assertTrue(RemoteParentBridge.installProviderForTest(throwing));
     assertEquals(
         "version=2,status=12,requested=255,selected=255,attempted=0,getsockopt=0,unix=0",
         RemoteParentBridge.transportConfigurationSnapshot());
   }
 
   @Test
-  void rejectsVersionMismatchAndClosesReplacement() {
+  void rejectsVersionMismatchAndRequiresExplicitReplacement() {
     FakeProvider first = new FakeProvider();
     assertTrue(RemoteParentBridge.installProviderForTest(first));
     assertFalse(RemoteParentBridge.installProviderForTest(new WrongVersionProvider()));
 
     FakeProvider replacement = new FakeProvider();
+    assertFalse(RemoteParentBridge.installProviderForTest(replacement));
+    assertFalse(first.closed.get());
+    assertFalse(replacement.closed.get());
+    assertTrue(RemoteParentBridge.removeProvider(first));
+    assertEquals(1, first.closeCount.get());
     assertTrue(RemoteParentBridge.installProviderForTest(replacement));
-    assertTrue(first.closed.get());
+    assertFalse(RemoteParentBridge.removeProvider(first));
     assertTrue(RemoteParentBridge.removeProvider(replacement));
-    assertTrue(replacement.closed.get());
+    assertEquals(1, replacement.closeCount.get());
+    assertFalse(RemoteParentBridge.removeProvider(replacement));
+    assertEquals(1, replacement.closeCount.get());
 
     String snapshot = RemoteParentBridge.diagnosticsSnapshot();
     assertTrue(snapshot.contains("provider_ok=2"));
+    assertTrue(snapshot.contains("provider_reject=1"));
     assertTrue(snapshot.contains("provider_ver=1"));
+  }
+
+  @Test
+  void concurrentSameProviderRegistrationIsIdempotent() throws Exception {
+    FakeProvider shared = new FakeProvider();
+    ExecutorService installers = Executors.newFixedThreadPool(8);
+    CountDownLatch start = new CountDownLatch(1);
+    List<Future<Boolean>> results = new ArrayList<>();
+    try {
+      for (int index = 0; index < 8; index++) {
+        results.add(
+            installers.submit(
+                () -> {
+                  start.await();
+                  return RemoteParentBridge.installProviderForTest(shared);
+                }));
+      }
+      start.countDown();
+
+      int installed = 0;
+      for (Future<Boolean> result : results) {
+        if (result.get(5, TimeUnit.SECONDS)) {
+          installed++;
+        }
+      }
+      assertEquals(8, installed);
+      assertFalse(shared.closed.get());
+
+      String snapshot = RemoteParentBridge.diagnosticsSnapshot();
+      assertTrue(snapshot.contains("provider_ok=1"));
+      assertTrue(snapshot.contains("provider_reject=0"));
+      assertTrue(RemoteParentBridge.removeProvider(shared));
+      assertEquals(1, shared.closeCount.get());
+    } finally {
+      start.countDown();
+      installers.shutdownNow();
+      assertTrue(installers.awaitTermination(5, TimeUnit.SECONDS));
+    }
+  }
+
+  @Test
+  void concurrentDifferentProvidersHaveOneWinner() throws Exception {
+    ExecutorService installers = Executors.newFixedThreadPool(8);
+    CountDownLatch start = new CountDownLatch(1);
+    List<FakeProvider> candidates = new ArrayList<>();
+    List<Future<Boolean>> results = new ArrayList<>();
+    try {
+      for (int index = 0; index < 8; index++) {
+        FakeProvider candidate = new FakeProvider();
+        candidates.add(candidate);
+        results.add(
+            installers.submit(
+                () -> {
+                  start.await();
+                  return RemoteParentBridge.installProviderForTest(candidate);
+                }));
+      }
+      start.countDown();
+
+      int winnerIndex = -1;
+      for (int index = 0; index < results.size(); index++) {
+        if (results.get(index).get(5, TimeUnit.SECONDS)) {
+          assertEquals(-1, winnerIndex);
+          winnerIndex = index;
+        }
+      }
+      assertTrue(winnerIndex >= 0);
+      for (FakeProvider candidate : candidates) {
+        assertFalse(candidate.closed.get());
+      }
+
+      String snapshot = RemoteParentBridge.diagnosticsSnapshot();
+      assertTrue(snapshot.contains("provider_ok=1"));
+      assertTrue(snapshot.contains("provider_reject=7"));
+
+      FakeProvider winner = candidates.get(winnerIndex);
+      assertTrue(RemoteParentBridge.removeProvider(winner));
+      for (FakeProvider candidate : candidates) {
+        if (candidate != winner) {
+          candidate.close();
+        }
+        assertEquals(1, candidate.closeCount.get());
+      }
+    } finally {
+      start.countDown();
+      installers.shutdownNow();
+      assertTrue(installers.awaitTermination(5, TimeUnit.SECONDS));
+    }
+  }
+
+  @Test
+  void reportsActionableDuplicateDiagnostic() {
+    Logger diagnosticsLogger = Logger.getLogger(RemoteParentDiagnostics.class.getName());
+    boolean useParentHandlers = diagnosticsLogger.getUseParentHandlers();
+    Level previousLevel = diagnosticsLogger.getLevel();
+    AtomicReference<String> message = new AtomicReference<>();
+    Handler recordingHandler =
+        new Handler() {
+          @Override
+          public void publish(LogRecord record) {
+            if (record.getMessage().contains("reason=provider_duplicate")) {
+              message.compareAndSet(null, record.getMessage());
+            }
+          }
+
+          @Override
+          public void flush() {}
+
+          @Override
+          public void close() {}
+        };
+    recordingHandler.setLevel(Level.ALL);
+    diagnosticsLogger.setUseParentHandlers(false);
+    diagnosticsLogger.setLevel(Level.ALL);
+    diagnosticsLogger.addHandler(recordingHandler);
+    try {
+      assertFalse(RemoteParentBridge.installProviderForTest(null));
+      assertFalse(RemoteParentBridge.installProviderForTest(null));
+      FakeProvider active = new FakeProvider();
+      FakeProvider duplicate = new FakeProvider();
+      assertTrue(RemoteParentBridge.installProviderForTest(active));
+      assertFalse(RemoteParentBridge.installProviderForTest(duplicate));
+
+      assertEquals(
+          "OBI remote-parent diagnostics reason=provider_duplicate count=1", message.get());
+      assertTrue(RemoteParentBridge.diagnosticsSnapshot().contains("provider_reject=3"));
+      assertFalse(active.closed.get());
+      assertFalse(duplicate.closed.get());
+      duplicate.close();
+      assertTrue(RemoteParentBridge.removeProvider(active));
+    } finally {
+      diagnosticsLogger.removeHandler(recordingHandler);
+      diagnosticsLogger.setLevel(previousLevel);
+      diagnosticsLogger.setUseParentHandlers(useParentHandlers);
+    }
   }
 
   @Test
@@ -172,7 +340,9 @@ class RemoteParentBridgeTest {
     diagnosticsLogger.setLevel(Level.ALL);
     diagnosticsLogger.addHandler(throwingHandler);
     try {
-      assertTrue(RemoteParentBridge.installProviderForTest(new UnauthorizedProvider()));
+      UnauthorizedProvider provider = new UnauthorizedProvider();
+      assertTrue(RemoteParentBridge.installProviderForTest(provider));
+      assertFalse(RemoteParentBridge.installProviderForTest(new UnauthorizedProvider()));
       assertEquals(
           RemoteParentStatus.UNAUTHORIZED, RemoteParentBridge.takeRemoteParent().getStatus());
       assertEquals(
@@ -186,10 +356,13 @@ class RemoteParentBridgeTest {
 
   private static final class FakeProvider implements RemoteParentProvider {
     private final AtomicInteger takes = new AtomicInteger();
+    private final AtomicInteger abiCalls = new AtomicInteger();
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final AtomicInteger closeCount = new AtomicInteger();
 
     @Override
     public int abiVersion() {
+      abiCalls.incrementAndGet();
       return RemoteParentRecord.ABI_VERSION;
     }
 
@@ -217,6 +390,7 @@ class RemoteParentBridgeTest {
 
     @Override
     public void close() {
+      closeCount.incrementAndGet();
       closed.set(true);
     }
   }

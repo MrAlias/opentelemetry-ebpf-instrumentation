@@ -39,7 +39,10 @@ public final class RemoteParentDiagnostics {
   private static final int TLS_READ_BYTES = 21;
   private static final int TAKE_STATUS_BASE = 22;
   private static final int DISCARD_STATUS_BASE = TAKE_STATUS_BASE + RemoteParentStatus.DISABLED + 1;
-  private static final int COUNTER_COUNT = DISCARD_STATUS_BASE + RemoteParentStatus.DISABLED + 1;
+  private static final int SNAPSHOT_COUNTER_COUNT =
+      DISCARD_STATUS_BASE + RemoteParentStatus.DISABLED + 1;
+  private static final int PROVIDER_DUPLICATE_EVENTS = SNAPSHOT_COUNTER_COUNT;
+  private static final int COUNTER_COUNT = PROVIDER_DUPLICATE_EVENTS + 1;
   static final long MAX_COUNTER_VALUE = 999_999_999L;
   private static final AtomicLongArray counters = new AtomicLongArray(COUNTER_COUNT);
   private static final Logger logger = Logger.getLogger(RemoteParentDiagnostics.class.getName());
@@ -76,6 +79,11 @@ public final class RemoteParentDiagnostics {
 
   static void providerVersionMismatch() {
     increment(PROVIDER_VERSION_MISMATCH, "provider_version_mismatch");
+  }
+
+  static void providerDuplicate() {
+    increment(PROVIDER_REJECTED, null);
+    increment(PROVIDER_DUPLICATE_EVENTS, "provider_duplicate");
   }
 
   static void takeStatus(int status) {

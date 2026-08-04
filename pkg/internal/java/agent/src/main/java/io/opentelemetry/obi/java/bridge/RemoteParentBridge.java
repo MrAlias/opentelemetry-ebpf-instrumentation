@@ -54,6 +54,12 @@ public final class RemoteParentBridge {
     return record;
   }
 
+  /**
+   * Installs a compatible provider when the bridge is empty.
+   *
+   * <p>Reinstalling the exact active instance is an idempotent success. A different provider is
+   * rejected until the active provider is explicitly removed.
+   */
   public static boolean installProvider(RemoteParentProvider next) {
     return installProvider(next, false);
   }
@@ -66,6 +72,9 @@ public final class RemoteParentBridge {
     if (next == null) {
       RemoteParentDiagnostics.providerRejected();
       return false;
+    }
+    if (provider.get() == next) {
+      return true;
     }
     try {
       if (next.abiVersion() != RemoteParentRecord.ABI_VERSION) {
@@ -81,15 +90,20 @@ public final class RemoteParentBridge {
       return false;
     }
 
-    RemoteParentProvider previous = provider.getAndSet(next);
-    if (previous != NOOP && previous != next) {
-      try {
-        previous.close();
-      } catch (Throwable ignored) {
+    while (true) {
+      RemoteParentProvider current = provider.get();
+      if (current == next) {
+        return true;
+      }
+      if (current != NOOP) {
+        RemoteParentDiagnostics.providerDuplicate();
+        return false;
+      }
+      if (provider.compareAndSet(NOOP, next)) {
+        RemoteParentDiagnostics.providerInstalled();
+        return true;
       }
     }
-    RemoteParentDiagnostics.providerInstalled();
-    return true;
   }
 
   public static void recordExtractionFailure(int reason) {

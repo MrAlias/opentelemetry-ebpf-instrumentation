@@ -119,6 +119,24 @@ extension is loaded, the OBI helper may attach later or restart without another
 JVM restart; the extension retries bootstrap-bridge discovery with bounded
 backoff and does not permanently cache helper absence.
 
+The bootstrap bridge owns at most one provider. Installing the first compatible
+provider returns `true` and transfers ownership to the bridge. Reinstalling the
+exact active instance is an idempotent `true` result that does not revalidate,
+close, or recount it. A different compatible provider offered while the slot is
+occupied returns `false`, leaves the active provider unchanged, increments the
+fixed `provider_reject` counter, and logs the fixed `provider_duplicate` reason
+on its own first-and-power-of-two cadence. The rejected candidate remains
+caller-owned and is never retained or described in diagnostics.
+
+Replacement is an explicit remove-then-install sequence. Removal atomically
+publishes the no-op provider and closes only the expected active instance; stale
+removal does nothing. The serialized OBI bootstrap performs removal before it
+constructs and configures a fresh replacement, so closing the old provider
+cannot tear down transport configured by the new one. Calls in the bounded gap
+see `missing`. A removed provider is retired and must not be installed again.
+Null, incompatible, and non-bootstrap candidates likewise leave the active
+provider unchanged and remain caller-owned.
+
 The primary transport uses paired cgroup `setsockopt` and `getsockopt` hooks.
 A connected loopback socket is used only to probe hook availability. For each
 decrypted receive, the helper negotiates on the actual application socket by
@@ -581,8 +599,9 @@ values. They never include trace IDs, span IDs, headers, bodies, credentials,
 or caller-supplied identifiers. The bootstrap bridge exposes its fixed-cardinality
 Java counters through `RemoteParentBridge.diagnosticsSnapshot()`. The snapshot
 separates bridge lookup from take and discard statuses, extraction failures,
-provider and extension negotiation, and discards caused by an existing standard
-parent. Counter values use lower-case base 36 so the complete bounded snapshot
+provider and extension negotiation (including duplicate registration), and
+discards caused by an existing standard parent. Counter values use lower-case
+base 36 so the complete bounded snapshot
 remains below one KiB at saturation. Failures are logged on the first and
 power-of-two occurrences so repeated transport faults do not produce per-request
 log volume.

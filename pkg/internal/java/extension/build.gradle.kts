@@ -13,9 +13,11 @@ version = rootProject.version
 
 val otelVersion = "1.62.0"
 val jettyVersion = "11.0.26"
+val nettyVersion = "4.1.135.Final"
 
 val officialAgentProbeExtension = sourceSets.create("officialAgentProbeExtension")
 val officialAgentProbeApp = sourceSets.create("officialAgentProbeApp")
+val officialAgentNettyProbeApp = sourceSets.create("officialAgentNettyProbeApp")
 
 dependencies {
     compileOnly("io.opentelemetry:opentelemetry-api:$otelVersion")
@@ -51,6 +53,14 @@ dependencies {
         officialAgentProbeApp.runtimeOnlyConfigurationName,
         "org.slf4j:slf4j-simple:2.0.13",
     )
+    add(
+        officialAgentNettyProbeApp.implementationConfigurationName,
+        "io.netty:netty-codec-http:$nettyVersion",
+    )
+    add(
+        officialAgentNettyProbeApp.implementationConfigurationName,
+        "io.netty:netty-handler:$nettyVersion",
+    )
 }
 
 configure<com.diffplug.gradle.spotless.SpotlessExtension> {
@@ -67,6 +77,7 @@ tasks.test {
     useJUnitPlatform()
     filter {
         excludeTestsMatching("*OfficialAgentJettyRuntimeTest")
+        excludeTestsMatching("*OfficialAgentNettyRuntimeTest")
     }
     dependsOn(tasks.jar)
     doFirst {
@@ -79,6 +90,10 @@ tasks.test {
 
 tasks.named<JavaCompile>(officialAgentProbeApp.compileJavaTaskName) {
     options.release.set(11)
+}
+
+tasks.named<JavaCompile>(officialAgentNettyProbeApp.compileJavaTaskName) {
+    options.release.set(8)
 }
 
 val officialAgentProbeExtensionJar by tasks.registering(Jar::class) {
@@ -118,19 +133,21 @@ val verifyOfficialAgentProbeExtensionJar by tasks.registering {
 
 val officialAgentRuntimeTest by tasks.registering(Test::class) {
     group = "verification"
-    description = "Run the compatibility and Jetty probes with both pinned official agents"
+    description = "Run compatibility, Jetty, and Netty probes with both pinned official agents"
     testClassesDirs = sourceSets.test.get().output.classesDirs
     classpath = sourceSets.test.get().runtimeClasspath
     useJUnitPlatform()
     filter {
         includeTestsMatching("*OfficialAgentCompatibilityTest")
         includeTestsMatching("*OfficialAgentJettyRuntimeTest")
+        includeTestsMatching("*OfficialAgentNettyRuntimeTest")
     }
     dependsOn(
         tasks.jar,
         tasks.testClasses,
         rootProject.tasks.named("copyLoaderJar"),
         officialAgentProbeApp.classesTaskName,
+        officialAgentNettyProbeApp.classesTaskName,
         officialAgentProbeExtensionJar,
         verifyOfficialAgentProbeExtensionJar,
     )
@@ -138,6 +155,7 @@ val officialAgentRuntimeTest by tasks.registering(Test::class) {
     inputs.file(rootProject.layout.buildDirectory.file("obi-java-agent.jar"))
     inputs.file(officialAgentProbeExtensionJar.flatMap { it.archiveFile })
     inputs.files(officialAgentProbeApp.runtimeClasspath)
+    inputs.files(officialAgentNettyProbeApp.runtimeClasspath)
     val officialAgents =
         listOf("OBI_TEST_OTEL_AGENT", "OBI_TEST_SPLUNK_AGENT").associateWith {
             providers.environmentVariable(it)
@@ -164,6 +182,10 @@ val officialAgentRuntimeTest by tasks.registering(Test::class) {
         systemProperty(
             "obi.test.official.agent.probe.app.classpath",
             officialAgentProbeApp.runtimeClasspath.asPath,
+        )
+        systemProperty(
+            "obi.test.official.agent.netty.probe.app.classpath",
+            officialAgentNettyProbeApp.runtimeClasspath.asPath,
         )
     }
 }

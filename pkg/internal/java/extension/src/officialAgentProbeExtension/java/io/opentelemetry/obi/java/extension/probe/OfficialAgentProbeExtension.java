@@ -30,6 +30,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
+import java.util.Base64;
 import java.util.Collection;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -38,9 +39,11 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
-/** Test-only official-agent extension for the isolated Jetty runtime probe. */
+/** Test-only official-agent extension for the isolated server runtime probes. */
 public final class OfficialAgentProbeExtension implements AutoConfigurationCustomizerProvider {
   private static final String OUTPUT_PROPERTY = "obi.test.official.agent.probe.output";
+  private static final String FRAMEWORK_PROPERTY = "obi.test.official.agent.probe.framework";
+  private static final String FRAMEWORK_NETTY = "netty";
   private static final String RAW_OBI_PROPAGATOR =
       "io.opentelemetry.obi.java.extension.ObiRemoteParentPropagator";
   private static final int STATUS_VALID = 1;
@@ -83,11 +86,12 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
   public void customize(AutoConfigurationCustomizer customizer) {
     ProbeOutput output = new ProbeOutput(requiredProperty(OUTPUT_PROPERTY));
     output.append("EXTENSION\tready");
-    ProviderState provider = ProviderState.install(output);
+    boolean netty = FRAMEWORK_NETTY.equals(System.getProperty(FRAMEWORK_PROPERTY));
+    ProviderState provider = ProviderState.install(output, netty);
     customizer.addPropagatorCustomizer(
         (propagator, config) -> wrapObiPropagator(propagator, output, provider));
     customizer.addTracerProviderCustomizer(
-        (builder, config) -> builder.addSpanProcessor(new CapturingSpanProcessor(output)));
+        (builder, config) -> builder.addSpanProcessor(new CapturingSpanProcessor(output, netty)));
   }
 
   private static TextMapPropagator wrapObiPropagator(
@@ -213,19 +217,22 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
     private final Object alreadyConsumed;
     private final ThreadLocal<Invocation> current = new ThreadLocal<>();
     private final CountDownLatch parallelTakes = new CountDownLatch(2);
+    private final NettyAuthority nettyAuthority;
 
     private ProviderState(
         ProbeOutput output,
         Map<String, ScenarioState> scenarios,
         Object missing,
-        Object alreadyConsumed) {
+        Object alreadyConsumed,
+        NettyAuthority nettyAuthority) {
       this.output = output;
       this.scenarios = scenarios;
       this.missing = missing;
       this.alreadyConsumed = alreadyConsumed;
+      this.nettyAuthority = nettyAuthority;
     }
 
-    private static ProviderState install(ProbeOutput output) {
+    private static ProviderState install(ProbeOutput output, boolean netty) {
       try {
         Class<?> bridge =
             Class.forName("io.opentelemetry.obi.java.bridge.RemoteParentBridge", true, null);
@@ -269,7 +276,13 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
         scenarios.put(
             "D", new ScenarioState(decode.invoke(null, record(TRACE_D_OBI, PARENT_D_OBI, 1, 8L))));
 
-        ProviderState state = new ProviderState(output, scenarios, missing, alreadyConsumed);
+        ProviderState state =
+            new ProviderState(
+                output,
+                scenarios,
+                missing,
+                alreadyConsumed,
+                netty ? NettyAuthority.create() : null);
         Object provider = Proxy.newProxyInstance(null, new Class<?>[] {providerType}, state);
         requireBootstrap(provider.getClass(), "test provider");
         boolean installed =
@@ -304,7 +317,7 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
         return null;
       }
       if ("toString".equals(name)) {
-        return "OfficialAgentJettyProbeProvider";
+        return "OfficialAgentProbeProvider";
       }
       if ("hashCode".equals(name)) {
         return System.identityHashCode(proxy);
@@ -325,6 +338,9 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
       ScenarioState scenario = scenarios.get(invocation.id);
       if (scenario == null) {
         output.append("ERROR\tunknown-provider-scenario\t" + token(invocation.id));
+        return missing;
+      }
+      if (nettyAuthority != null && !nettyAuthority.verify(output, operation, invocation)) {
         return missing;
       }
 
@@ -359,6 +375,91 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
     private static void requireBootstrap(Class<?> type, String name) {
       if (type.getClassLoader() != null) {
         throw new IllegalStateException(name + " is not bootstrap loaded");
+      }
+    }
+  }
+
+  private static final class NettyAuthority {
+    private static final int LOOKUP_TASK = 2;
+
+    private final Method lookupSource;
+    private final Method lookupLifecycle;
+    private final Method takeSocketFileDescriptor;
+    private final Method lifecycleActive;
+
+    private NettyAuthority(
+        Method lookupSource,
+        Method lookupLifecycle,
+        Method takeSocketFileDescriptor,
+        Method lifecycleActive) {
+      this.lookupSource = lookupSource;
+      this.lookupLifecycle = lookupLifecycle;
+      this.takeSocketFileDescriptor = takeSocketFileDescriptor;
+      this.lifecycleActive = lifecycleActive;
+    }
+
+    private static NettyAuthority create() throws ReflectiveOperationException {
+      Class<?> threadInfo = Class.forName("io.opentelemetry.obi.java.ebpf.ThreadInfo", true, null);
+      Class<?> lifecycle =
+          Class.forName(
+              "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext$Lifecycle",
+              true,
+              null);
+      ProviderState.requireBootstrap(threadInfo, "thread authority");
+      ProviderState.requireBootstrap(lifecycle, "socket lifecycle");
+      return new NettyAuthority(
+          threadInfo.getMethod("remoteParentLookupSource"),
+          threadInfo.getMethod("remoteParentLookupLifecycle"),
+          threadInfo.getMethod("takeRemoteParentSocketFileDescriptor"),
+          lifecycle.getMethod("active"));
+    }
+
+    private boolean verify(ProbeOutput output, String operation, Invocation invocation) {
+      try {
+        int source = ((Integer) lookupSource.invoke(null)).intValue();
+        Object lifecycle = lookupLifecycle.invoke(null);
+        boolean active =
+            lifecycle != null && Boolean.TRUE.equals(lifecycleActive.invoke(lifecycle));
+        int socketFileDescriptor = ((Integer) takeSocketFileDescriptor.invoke(null)).intValue();
+        long threadId = Thread.currentThread().getId();
+        output.append(
+            "AUTH\t"
+                + operation
+                + "\t"
+                + invocation.id
+                + "\t"
+                + invocation.invocation
+                + "\t"
+                + invocation.pass
+                + "\t"
+                + source
+                + "\t"
+                + (active ? "LIVE" : "NONE")
+                + "\t"
+                + (lifecycle == null ? 0 : System.identityHashCode(lifecycle))
+                + "\t"
+                + socketFileDescriptor
+                + "\t"
+                + threadId);
+        boolean firstPass = invocation.invocation == 1 && invocation.pass == 1;
+        boolean valid =
+            source == LOOKUP_TASK
+                && active
+                && threadId > 0
+                && (firstPass ? socketFileDescriptor >= 0 : socketFileDescriptor == -1);
+        if (!valid) {
+          output.append(
+              "ERROR\tnetty-authority\t"
+                  + invocation.id
+                  + "\t"
+                  + invocation.invocation
+                  + "\t"
+                  + invocation.pass);
+        }
+        return valid;
+      } catch (ReflectiveOperationException error) {
+        output.append("ERROR\tnetty-authority-reflection\t" + token(error.getClass().getName()));
+        return false;
       }
     }
   }
@@ -468,11 +569,21 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
   private static final class CapturingSpanProcessor implements SpanProcessor {
     private static final AttributeKey<String> PROBE_ID = AttributeKey.stringKey("obi.probe.id");
     private static final AttributeKey<String> HTTP_ROUTE = AttributeKey.stringKey("http.route");
+    private static final AttributeKey<String> HTTP_METHOD =
+        AttributeKey.stringKey("http.request.method");
+    private static final AttributeKey<String> URL_SCHEME = AttributeKey.stringKey("url.scheme");
+    private static final AttributeKey<String> URL_PATH = AttributeKey.stringKey("url.path");
+    private static final AttributeKey<Long> HTTP_STATUS =
+        AttributeKey.longKey("http.response.status_code");
+    private static final AttributeKey<String> PROTOCOL_VERSION =
+        AttributeKey.stringKey("network.protocol.version");
 
     private final ProbeOutput output;
+    private final boolean captureHttp;
 
-    private CapturingSpanProcessor(ProbeOutput output) {
+    private CapturingSpanProcessor(ProbeOutput output, boolean captureHttp) {
       this.output = output;
+      this.captureHttp = captureHttp;
     }
 
     @Override
@@ -496,6 +607,8 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
       SpanData span = readableSpan.toSpanData();
       String id = span.getAttributes().get(PROBE_ID);
       SpanContext parent = span.getParentSpanContext();
+      String route = span.getAttributes().get(HTTP_ROUTE);
+      boolean routePresent = span.getAttributes().asMap().containsKey(HTTP_ROUTE);
       output.append(
           "SPAN\t"
               + token(id)
@@ -514,7 +627,23 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
               + "\t"
               + token(span.getInstrumentationScopeInfo().getName())
               + "\t"
-              + token(span.getAttributes().get(HTTP_ROUTE)));
+              + (captureHttp ? Boolean.toString(routePresent) : token(route)));
+      if (captureHttp) {
+        Long status = span.getAttributes().get(HTTP_STATUS);
+        output.append(
+            "HTTP\t"
+                + token(id)
+                + "\t"
+                + token(span.getAttributes().get(HTTP_METHOD))
+                + "\t"
+                + token(span.getAttributes().get(URL_SCHEME))
+                + "\t"
+                + reversibleToken(span.getAttributes().get(URL_PATH))
+                + "\t"
+                + (status == null ? "-" : status.toString())
+                + "\t"
+                + token(span.getAttributes().get(PROTOCOL_VERSION)));
+      }
     }
 
     @Override
@@ -553,6 +682,15 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
       }
     }
     return result.toString();
+  }
+
+  private static String reversibleToken(String value) {
+    if (value == null) {
+      return "-";
+    }
+    return Base64.getUrlEncoder()
+        .withoutPadding()
+        .encodeToString(value.getBytes(StandardCharsets.UTF_8));
   }
 
   private static final class ProbeOutput {

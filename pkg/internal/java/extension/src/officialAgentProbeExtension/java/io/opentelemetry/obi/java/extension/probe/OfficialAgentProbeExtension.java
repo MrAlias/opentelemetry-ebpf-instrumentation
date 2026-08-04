@@ -45,6 +45,8 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
       "io.opentelemetry.obi.java.extension.ObiRemoteParentPropagator";
   private static final int STATUS_VALID = 1;
   private static final int STATUS_MISSING = 2;
+  private static final int STATUS_STALE = 3;
+  private static final int STATUS_MALFORMED = 5;
   private static final int STATUS_ALREADY_CONSUMED = 9;
   private static final long DISABLED_TRANSPORT_CONFIGURATION = 0x4f0200000003030dL;
 
@@ -52,8 +54,12 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
   private static final String PARENT_A = "2222222222222222";
   private static final String TRACE_B = "33333333333333333333333333333333";
   private static final String PARENT_B = "4444444444444444";
+  private static final String TRACE_MATCHING = "34343434343434343434343434343434";
+  private static final String PARENT_MATCHING = "5656565656565656";
   private static final String TRACE_CONFLICT = "77777777777777777777777777777777";
   private static final String PARENT_CONFLICT = "8888888888888888";
+  private static final String TRACE_MALFORMED_W3C = "90909090909090909090909090909090";
+  private static final String PARENT_MALFORMED_W3C = "9191919191919191";
   private static final String TRACE_P = "99999999999999999999999999999999";
   private static final String PARENT_P = "aaaaaaaaaaaaaaaa";
   private static final String TRACE_Q = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -167,7 +173,12 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
       if ("A".equals(value)
           || "B".equals(value)
           || "C".equals(value)
+          || "H".equals(value)
+          || "M".equals(value)
           || "W".equals(value)
+          || "F".equals(value)
+          || "R".equals(value)
+          || "S".equals(value)
           || "P".equals(value)
           || "Q".equals(value)
           || "D".equals(value)) {
@@ -229,6 +240,8 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
         Method decode = recordType.getMethod("decode", byte[].class);
         Method statusOnly = recordType.getMethod("statusOnly", int.class);
         Object missing = statusOnly.invoke(null, STATUS_MISSING);
+        Object stale = statusOnly.invoke(null, STATUS_STALE);
+        Object malformed = statusOnly.invoke(null, STATUS_MALFORMED);
         Object alreadyConsumed = statusOnly.invoke(null, STATUS_ALREADY_CONSUMED);
         Map<String, ScenarioState> scenarios = new ConcurrentHashMap<>();
         scenarios.put(
@@ -236,15 +249,25 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
         scenarios.put(
             "B", new ScenarioState(decode.invoke(null, record(TRACE_B, PARENT_B, 0, 2L))));
         scenarios.put("C", new ScenarioState(null));
+        scenarios.put("H", new ScenarioState(null));
+        scenarios.put(
+            "M",
+            new ScenarioState(decode.invoke(null, record(TRACE_MATCHING, PARENT_MATCHING, 1, 3L))));
         scenarios.put(
             "W",
-            new ScenarioState(decode.invoke(null, record(TRACE_CONFLICT, PARENT_CONFLICT, 0, 3L))));
+            new ScenarioState(decode.invoke(null, record(TRACE_CONFLICT, PARENT_CONFLICT, 0, 4L))));
         scenarios.put(
-            "P", new ScenarioState(decode.invoke(null, record(TRACE_P, PARENT_P, 1, 4L))));
+            "F",
+            new ScenarioState(
+                decode.invoke(null, record(TRACE_MALFORMED_W3C, PARENT_MALFORMED_W3C, 1, 5L))));
+        scenarios.put("R", ScenarioState.failure(malformed, "MALFORMED"));
+        scenarios.put("S", ScenarioState.failure(stale, "STALE"));
         scenarios.put(
-            "Q", new ScenarioState(decode.invoke(null, record(TRACE_Q, PARENT_Q, 0, 5L))));
+            "P", new ScenarioState(decode.invoke(null, record(TRACE_P, PARENT_P, 1, 6L))));
         scenarios.put(
-            "D", new ScenarioState(decode.invoke(null, record(TRACE_D_OBI, PARENT_D_OBI, 1, 6L))));
+            "Q", new ScenarioState(decode.invoke(null, record(TRACE_Q, PARENT_Q, 0, 7L))));
+        scenarios.put(
+            "D", new ScenarioState(decode.invoke(null, record(TRACE_D_OBI, PARENT_D_OBI, 1, 8L))));
 
         ProviderState state = new ProviderState(output, scenarios, missing, alreadyConsumed);
         Object provider = Proxy.newProxyInstance(null, new Class<?>[] {providerType}, state);
@@ -354,14 +377,31 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
 
   private static final class ScenarioState {
     private final Object valid;
+    private final Object failure;
+    private final String failureStatus;
     private final AtomicBoolean claimed = new AtomicBoolean();
 
     private ScenarioState(Object valid) {
       this.valid = valid;
+      this.failure = null;
+      this.failureStatus = null;
+    }
+
+    private ScenarioState(Object failure, String failureStatus) {
+      this.valid = null;
+      this.failure = failure;
+      this.failureStatus = failureStatus;
+    }
+
+    private static ScenarioState failure(Object record, String status) {
+      return new ScenarioState(record, status);
     }
 
     private ProviderResult claim(Object missing, Object alreadyConsumed) {
       if (valid == null) {
+        if (failure != null) {
+          return new ProviderResult(failure, failureStatus, false);
+        }
         return new ProviderResult(missing, "MISSING", false);
       }
       if (claimed.compareAndSet(false, true)) {
@@ -427,6 +467,7 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
 
   private static final class CapturingSpanProcessor implements SpanProcessor {
     private static final AttributeKey<String> PROBE_ID = AttributeKey.stringKey("obi.probe.id");
+    private static final AttributeKey<String> HTTP_ROUTE = AttributeKey.stringKey("http.route");
 
     private final ProbeOutput output;
 
@@ -471,7 +512,9 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
               + "\t"
               + span.getSpanContext().isSampled()
               + "\t"
-              + token(span.getInstrumentationScopeInfo().getName()));
+              + token(span.getInstrumentationScopeInfo().getName())
+              + "\t"
+              + token(span.getAttributes().get(HTTP_ROUTE)));
     }
 
     @Override

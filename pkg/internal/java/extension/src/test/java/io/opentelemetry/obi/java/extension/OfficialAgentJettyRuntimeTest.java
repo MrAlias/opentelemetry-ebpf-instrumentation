@@ -37,10 +37,20 @@ class OfficialAgentJettyRuntimeTest {
   private static final String PARENT_A = "2222222222222222";
   private static final String TRACE_B = "33333333333333333333333333333333";
   private static final String PARENT_B = "4444444444444444";
+  private static final String TRACE_W3C_ONLY = "12121212121212121212121212121212";
+  private static final String PARENT_W3C_ONLY = "1313131313131313";
+  private static final String TRACE_MATCHING = "34343434343434343434343434343434";
+  private static final String PARENT_MATCHING = "5656565656565656";
   private static final String TRACE_W3C = "55555555555555555555555555555555";
   private static final String PARENT_W3C = "6666666666666666";
   private static final String TRACE_CONFLICT = "77777777777777777777777777777777";
   private static final String PARENT_CONFLICT = "8888888888888888";
+  private static final String TRACE_MALFORMED_W3C = "90909090909090909090909090909090";
+  private static final String PARENT_MALFORMED_W3C = "9191919191919191";
+  private static final String TRACE_STALE_W3C = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+  private static final String PARENT_STALE_W3C = "b2b2b2b2b2b2b2b2";
+  private static final String TRACE_MALFORMED_OBI_W3C = "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
+  private static final String PARENT_MALFORMED_OBI_W3C = "d4d4d4d4d4d4d4d4";
   private static final String TRACE_P = "99999999999999999999999999999999";
   private static final String PARENT_P = "aaaaaaaaaaaaaaaa";
   private static final String TRACE_Q = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -210,7 +220,7 @@ class OfficialAgentJettyRuntimeTest {
 
   private static void assertDefaultResult(List<String> lines, String output) {
     Map<String, Integer> invocations = new HashMap<>();
-    for (String id : new String[] {"A", "B", "C", "W", "P", "Q"}) {
+    for (String id : new String[] {"A", "B", "C", "H", "M", "W", "F", "R", "S", "P", "Q"}) {
       invocations.put(id, invocationCount(lines, id));
       assertDispatch(output, id);
     }
@@ -218,50 +228,70 @@ class OfficialAgentJettyRuntimeTest {
     assertAllPasses(lines, "A", invocations.get("A"), TRACE_A, PARENT_A, true, true);
     assertAllPasses(lines, "B", invocations.get("B"), TRACE_B, PARENT_B, true, false);
     assertAllPasses(lines, "C", invocations.get("C"), INVALID_TRACE, INVALID_SPAN, false, false);
+    assertAllPasses(lines, "H", invocations.get("H"), INVALID_TRACE, INVALID_SPAN, false, false);
+    assertAllPasses(lines, "M", invocations.get("M"), TRACE_MATCHING, PARENT_MATCHING, true, true);
     assertPasses(lines, "W", 1, TRACE_CONFLICT, PARENT_CONFLICT, true, false);
     for (int invocation = 2; invocation <= invocations.get("W"); invocation++) {
       assertPasses(lines, "W", invocation, TRACE_W3C, PARENT_W3C, true, true);
     }
+    assertAllPasses(
+        lines, "F", invocations.get("F"), TRACE_MALFORMED_W3C, PARENT_MALFORMED_W3C, true, true);
+    assertAllPasses(lines, "R", invocations.get("R"), INVALID_TRACE, INVALID_SPAN, false, false);
+    assertAllPasses(lines, "S", invocations.get("S"), INVALID_TRACE, INVALID_SPAN, false, false);
     assertAllPasses(lines, "P", invocations.get("P"), TRACE_P, PARENT_P, true, true);
     assertAllPasses(lines, "Q", invocations.get("Q"), TRACE_Q, PARENT_Q, true, false);
 
-    for (String id : new String[] {"A", "B", "W", "P", "Q"}) {
+    for (String id : new String[] {"A", "B", "M", "W", "F", "P", "Q"}) {
       assertEquals(
           "PROVIDER\tTAKE\t" + id + "\t1\t1\tVALID", only(lines, "PROVIDER\tTAKE\t" + id + "\t"));
     }
-    int missingInvocations = invocations.get("C");
-    assertEquals(
-        missingInvocations * 2, prefix(lines, "PROVIDER\tTAKE\tC\t").size(), lines.toString());
-    for (int invocation = 1; invocation <= missingInvocations; invocation++) {
-      for (int pass = 1; pass <= 2; pass++) {
-        assertEquals(
-            1,
-            count(lines, "PROVIDER\tTAKE\tC\t" + invocation + "\t" + pass + "\tMISSING"),
-            lines.toString());
-      }
+    int missingInvocations = invocations.get("C") + invocations.get("H");
+    for (String id : new String[] {"C", "H"}) {
+      assertEquals(
+          invocations.get(id) * 2,
+          prefix(lines, "PROVIDER\tTAKE\t" + id + "\t").size(),
+          lines.toString());
+      assertProviderPasses(lines, "TAKE", id, invocations.get(id), "MISSING");
     }
     assertEquals(
-        5 + missingInvocations * 2, prefix(lines, "PROVIDER\tTAKE\t").size(), lines.toString());
+        invocations.get("S") * 2, prefix(lines, "PROVIDER\tTAKE\tS\t").size(), lines.toString());
+    assertProviderPasses(lines, "TAKE", "S", invocations.get("S"), "STALE");
+    assertEquals(
+        invocations.get("R") * 2, prefix(lines, "PROVIDER\tTAKE\tR\t").size(), lines.toString());
+    assertProviderPasses(lines, "TAKE", "R", invocations.get("R"), "MALFORMED");
+    assertEquals(
+        7 + (missingInvocations + invocations.get("R") + invocations.get("S")) * 2,
+        prefix(lines, "PROVIDER\tTAKE\t").size(),
+        lines.toString());
     assertEquals(0, prefix(lines, "PROVIDER\tDISCARD\t").size(), lines.toString());
 
     Map<String, Long> diagnostics = diagnostics(output, MODE_DEFAULT);
-    assertEquals(5L, counter(diagnostics, "t_valid"));
+    assertEquals(7L, counter(diagnostics, "t_valid"));
     assertEquals((long) missingInvocations * 2L, counter(diagnostics, "t_missing"));
+    assertEquals((long) invocations.get("S") * 2L, counter(diagnostics, "t_stale"));
+    assertEquals((long) invocations.get("R") * 2L, counter(diagnostics, "t_malformed"));
     assertEquals(0L, counter(diagnostics, "t_already_consumed"));
-    assertEquals(2L, counter(diagnostics, "take_sampled"));
+    assertEquals(4L, counter(diagnostics, "take_sampled"));
     assertEquals(3L, counter(diagnostics, "take_unsampled"));
-    assertEquals(1L, counter(diagnostics, "discard_standard"));
+    assertEquals(2L, counter(diagnostics, "discard_standard"));
     assertEquals(0L, counter(diagnostics, "d_valid"));
     assertEquals(0L, counter(diagnostics, "d_missing"));
+    assertEquals(0L, counter(diagnostics, "d_stale"));
+    assertEquals(0L, counter(diagnostics, "d_malformed"));
     assertEquals(0L, counter(diagnostics, "d_already_consumed"));
 
-    Map<String, SpanResult> spans = spans(lines, 6);
+    Map<String, SpanResult> spans = spans(lines, 11);
     assertRemoteSpan(required(spans, "A"), TRACE_A, PARENT_A, true);
     assertRemoteSpan(required(spans, "B"), TRACE_B, PARENT_B, false);
+    assertRemoteSpan(required(spans, "H"), TRACE_W3C_ONLY, PARENT_W3C_ONLY, true);
+    assertRemoteSpan(required(spans, "M"), TRACE_MATCHING, PARENT_MATCHING, true);
     SpanResult standard = required(spans, "W");
     assertRemoteSpan(standard, TRACE_W3C, PARENT_W3C, true);
     assertNotEquals(TRACE_CONFLICT, standard.traceId);
     assertNotEquals(PARENT_CONFLICT, standard.parentSpanId);
+    assertRemoteSpan(required(spans, "F"), TRACE_MALFORMED_W3C, PARENT_MALFORMED_W3C, true);
+    assertRemoteSpan(required(spans, "R"), TRACE_MALFORMED_OBI_W3C, PARENT_MALFORMED_OBI_W3C, true);
+    assertRemoteSpan(required(spans, "S"), TRACE_STALE_W3C, PARENT_STALE_W3C, false);
     assertRemoteSpan(required(spans, "P"), TRACE_P, PARENT_P, true);
     assertRemoteSpan(required(spans, "Q"), TRACE_Q, PARENT_Q, false);
     assertNotEquals(required(spans, "P").spanId, required(spans, "Q").spanId);
@@ -272,8 +302,43 @@ class OfficialAgentJettyRuntimeTest {
     assertFalse(root.parentSampled);
     assertTrue(root.sampled);
     for (String traceId :
-        new String[] {TRACE_A, TRACE_B, TRACE_W3C, TRACE_CONFLICT, TRACE_P, TRACE_Q}) {
+        new String[] {
+          TRACE_A,
+          TRACE_B,
+          TRACE_W3C_ONLY,
+          TRACE_MATCHING,
+          TRACE_W3C,
+          TRACE_CONFLICT,
+          TRACE_MALFORMED_W3C,
+          TRACE_MALFORMED_OBI_W3C,
+          TRACE_STALE_W3C,
+          TRACE_P,
+          TRACE_Q
+        }) {
       assertNotEquals(traceId, root.traceId);
+    }
+  }
+
+  private static void assertProviderPasses(
+      List<String> lines, String operation, String id, int invocations, String status) {
+    for (int invocation = 1; invocation <= invocations; invocation++) {
+      for (int pass = 1; pass <= 2; pass++) {
+        assertEquals(
+            1,
+            count(
+                lines,
+                "PROVIDER\t"
+                    + operation
+                    + "\t"
+                    + id
+                    + "\t"
+                    + invocation
+                    + "\t"
+                    + pass
+                    + "\t"
+                    + status),
+            lines.toString());
+      }
     }
   }
 
@@ -309,8 +374,22 @@ class OfficialAgentJettyRuntimeTest {
 
   private static void assertDispatch(String output, String id) {
     List<String> outputLines = lines(output);
-    assertEquals(1, count(outputLines, "OBI_DISPATCH\tREQUEST\t" + id), output);
-    assertEquals(1, count(outputLines, "OBI_DISPATCH\tASYNC\t" + id), output);
+    long requestThread = dispatchThread(outputLines, "REQUEST", id);
+    long executorThread = dispatchThread(outputLines, "EXECUTOR", id);
+    dispatchThread(outputLines, "ASYNC", id);
+    assertNotEquals(requestThread, executorThread, output);
+  }
+
+  private static long dispatchThread(List<String> lines, String phase, String id) {
+    String line = only(lines, "OBI_DISPATCH\t" + phase + "\t" + id + "\t");
+    String[] fields = line.split("\\t", -1);
+    assertEquals(4, fields.length, line);
+    assertEquals("OBI_DISPATCH", fields[0], line);
+    assertEquals(phase, fields[1], line);
+    assertEquals(id, fields[2], line);
+    long thread = Long.parseLong(fields[3]);
+    assertTrue(thread > 0, line);
+    return thread;
   }
 
   private static int invocationCount(List<String> lines, String id) {
@@ -378,6 +457,7 @@ class OfficialAgentJettyRuntimeTest {
       spans.put(span.id, span);
       spanIds.put(span.spanId, span.id);
       assertEquals("io.opentelemetry.jetty-11.0", span.scope);
+      assertEquals("_probe__", span.route);
     }
     assertEquals(expected, spans.size());
     return spans;
@@ -597,6 +677,7 @@ class OfficialAgentJettyRuntimeTest {
     private final boolean parentSampled;
     private final boolean sampled;
     private final String scope;
+    private final String route;
 
     private SpanResult(
         String id,
@@ -606,7 +687,8 @@ class OfficialAgentJettyRuntimeTest {
         boolean parentRemote,
         boolean parentSampled,
         boolean sampled,
-        String scope) {
+        String scope,
+        String route) {
       this.id = id;
       this.traceId = traceId;
       this.spanId = spanId;
@@ -615,11 +697,12 @@ class OfficialAgentJettyRuntimeTest {
       this.parentSampled = parentSampled;
       this.sampled = sampled;
       this.scope = scope;
+      this.route = route;
     }
 
     private static SpanResult parse(String line) {
       String[] fields = line.split("\\t", -1);
-      assertEquals(9, fields.length, line);
+      assertEquals(10, fields.length, line);
       assertEquals("SPAN", fields[0], line);
       return new SpanResult(
           fields[1],
@@ -629,7 +712,8 @@ class OfficialAgentJettyRuntimeTest {
           parseBoolean(fields[5], line),
           parseBoolean(fields[6], line),
           parseBoolean(fields[7], line),
-          fields[8]);
+          fields[8],
+          fields[9]);
     }
   }
 }

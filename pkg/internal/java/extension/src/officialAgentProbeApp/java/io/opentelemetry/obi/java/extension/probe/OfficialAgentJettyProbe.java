@@ -24,7 +24,10 @@ import java.nio.file.Paths;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.eclipse.jetty.server.Server;
 import org.eclipse.jetty.server.ServerConnector;
@@ -40,6 +43,14 @@ public final class OfficialAgentJettyProbe {
 
   private static final String TRACE_W3C = "55555555555555555555555555555555";
   private static final String PARENT_W3C = "6666666666666666";
+  private static final String TRACE_W3C_ONLY = "12121212121212121212121212121212";
+  private static final String PARENT_W3C_ONLY = "1313131313131313";
+  private static final String TRACE_MATCHING = "34343434343434343434343434343434";
+  private static final String PARENT_MATCHING = "5656565656565656";
+  private static final String TRACE_STALE_W3C = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+  private static final String PARENT_STALE_W3C = "b2b2b2b2b2b2b2b2";
+  private static final String TRACE_MALFORMED_OBI_W3C = "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
+  private static final String PARENT_MALFORMED_OBI_W3C = "d4d4d4d4d4d4d4d4";
   private static final String TRACE_D_W3C = "dddddddddddddddddddddddddddddddd";
   private static final String PARENT_D_W3C = "eeeeeeeeeeeeeeee";
 
@@ -52,6 +63,18 @@ public final class OfficialAgentJettyProbe {
         MODE_DEFAULT.equals(mode) || MODE_STANDARD_FIRST.equals(mode),
         "unsupported probe mode " + mode);
 
+    AtomicInteger dispatchThreadId = new AtomicInteger();
+    ExecutorService dispatchExecutor =
+        Executors.newFixedThreadPool(
+            2,
+            runnable -> {
+              Thread thread =
+                  new Thread(
+                      runnable,
+                      "obi-official-agent-dispatch-" + dispatchThreadId.incrementAndGet());
+              thread.setDaemon(true);
+              return thread;
+            });
     Server server = new Server();
     ServerConnector connector = new ServerConnector(server);
     connector.setHost("127.0.0.1");
@@ -60,7 +83,7 @@ public final class OfficialAgentJettyProbe {
 
     ServletContextHandler context = new ServletContextHandler();
     context.setContextPath("/");
-    ServletHolder servlet = new ServletHolder(new AsyncProbeServlet());
+    ServletHolder servlet = new ServletHolder(new AsyncProbeServlet(dispatchExecutor));
     servlet.setAsyncSupported(true);
     context.addServlet(servlet, "/probe/*");
     server.setHandler(context);
@@ -72,7 +95,7 @@ public final class OfficialAgentJettyProbe {
       int expectedSpans;
       if (MODE_DEFAULT.equals(mode)) {
         runDefaultMode(port);
-        expectedSpans = 6;
+        expectedSpans = 11;
       } else {
         runStandardFirstMode(port);
         expectedSpans = 1;
@@ -85,8 +108,18 @@ public final class OfficialAgentJettyProbe {
       System.out.println("OBI_STOCK_PROBE mode=" + mode + " diagnostics=" + diagnostics);
       System.out.println("OBI_STOCK_PROBE mode=" + mode + " passed");
     } finally {
-      server.stop();
-      server.join();
+      try {
+        server.stop();
+        server.join();
+      } finally {
+        dispatchExecutor.shutdown();
+        if (!dispatchExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+          dispatchExecutor.shutdownNow();
+          require(
+              dispatchExecutor.awaitTermination(5, TimeUnit.SECONDS),
+              "dispatch executor did not terminate");
+        }
+      }
     }
   }
 
@@ -98,8 +131,51 @@ public final class OfficialAgentJettyProbe {
       require("B:ok".equals(send(request, input, "B", null, false)), "request B failed");
       require("C:ok".equals(send(request, input, "C", null, false)), "request C failed");
       require(
-          "W:ok".equals(send(request, input, "W", traceparent(TRACE_W3C, PARENT_W3C, "01"), true)),
+          "H:ok"
+              .equals(
+                  send(
+                      request,
+                      input,
+                      "H",
+                      traceparent(TRACE_W3C_ONLY, PARENT_W3C_ONLY, "01"),
+                      false)),
+          "request H failed W3C-only extraction");
+      require(
+          "M:ok"
+              .equals(
+                  send(
+                      request,
+                      input,
+                      "M",
+                      traceparent(TRACE_MATCHING, PARENT_MATCHING, "01"),
+                      false)),
+          "request M failed matching-parent extraction");
+      require(
+          "W:ok".equals(send(request, input, "W", traceparent(TRACE_W3C, PARENT_W3C, "01"), false)),
           "request W failed standard-parent precedence");
+      require(
+          "F:ok".equals(send(request, input, "F", "malformed-traceparent", false)),
+          "request F failed malformed-W3C fallback");
+      require(
+          "R:ok"
+              .equals(
+                  send(
+                      request,
+                      input,
+                      "R",
+                      traceparent(TRACE_MALFORMED_OBI_W3C, PARENT_MALFORMED_OBI_W3C, "01"),
+                      false)),
+          "request R failed malformed-OBI precedence");
+      require(
+          "S:ok"
+              .equals(
+                  send(
+                      request,
+                      input,
+                      "S",
+                      traceparent(TRACE_STALE_W3C, PARENT_STALE_W3C, "00"),
+                      true)),
+          "request S failed stale-OBI precedence");
     }
     sendParallel(port);
   }
@@ -269,6 +345,12 @@ public final class OfficialAgentJettyProbe {
   }
 
   private static final class AsyncProbeServlet extends HttpServlet {
+    private final ExecutorService dispatchExecutor;
+
+    private AsyncProbeServlet(ExecutorService dispatchExecutor) {
+      this.dispatchExecutor = dispatchExecutor;
+    }
+
     @Override
     protected void doGet(HttpServletRequest request, HttpServletResponse response)
         throws IOException, ServletException {
@@ -277,22 +359,32 @@ public final class OfficialAgentJettyProbe {
           "A".equals(id)
               || "B".equals(id)
               || "C".equals(id)
+              || "H".equals(id)
+              || "M".equals(id)
               || "W".equals(id)
+              || "F".equals(id)
+              || "R".equals(id)
+              || "S".equals(id)
               || "P".equals(id)
               || "Q".equals(id)
               || "D".equals(id),
           "invalid probe id");
 
       if (request.getDispatcherType() == DispatcherType.REQUEST) {
-        System.out.println("OBI_DISPATCH\tREQUEST\t" + id);
+        System.out.println("OBI_DISPATCH\tREQUEST\t" + id + "\t" + Thread.currentThread().getId());
         AsyncContext async = request.startAsync();
         async.setTimeout(5_000L);
-        async.start(async::dispatch);
+        dispatchExecutor.execute(
+            () -> {
+              System.out.println(
+                  "OBI_DISPATCH\tEXECUTOR\t" + id + "\t" + Thread.currentThread().getId());
+              async.dispatch();
+            });
         return;
       }
 
       require(request.getDispatcherType() == DispatcherType.ASYNC, "unexpected dispatch type");
-      System.out.println("OBI_DISPATCH\tASYNC\t" + id);
+      System.out.println("OBI_DISPATCH\tASYNC\t" + id + "\t" + Thread.currentThread().getId());
       byte[] body = (id + ":ok").getBytes(StandardCharsets.UTF_8);
       response.setStatus(HttpServletResponse.SC_OK);
       response.setContentType("text/plain");

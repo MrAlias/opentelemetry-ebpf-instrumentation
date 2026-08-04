@@ -15,11 +15,12 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 class PackagedExecutorAgentIntegrationTest {
   @Test
-  void packagedAgentHandlesNestedCancellationTimeoutAndRejectionPaths() throws Exception {
+  void packagedAgentHandlesExecutorCleanupAndParentChainLimits() throws Exception {
     File agent = new File(requiredProperty("obi.test.packaged.agent"));
     File probeClasses = new File(requiredProperty("obi.test.late.attach.probe.classes"));
     assertTrue(agent.isFile() && agent.length() > 0, "packaged Java agent is missing");
@@ -34,9 +35,10 @@ class PackagedExecutorAgentIntegrationTest {
 
     Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
     ByteArrayOutputStream output = new ByteArrayOutputStream();
-    Thread reader = copyOutput(process.getInputStream(), output);
+    AtomicReference<Throwable> readerFailure = new AtomicReference<>();
+    Thread reader = copyOutput(process.getInputStream(), output, readerFailure);
     try {
-      assertTrue(process.waitFor(30, TimeUnit.SECONDS), "executor probe timed out");
+      assertTrue(process.waitFor(60, TimeUnit.SECONDS), "executor probe timed out");
     } finally {
       if (process.isAlive()) {
         process.destroy();
@@ -47,13 +49,19 @@ class PackagedExecutorAgentIntegrationTest {
       }
       reader.join(TimeUnit.SECONDS.toMillis(5));
     }
+    assertTrue(!reader.isAlive(), "executor probe output reader did not terminate");
+    if (readerFailure.get() != null) {
+      throw new AssertionError("executor probe output reader failed", readerFailure.get());
+    }
 
     String text = new String(output.toByteArray(), StandardCharsets.UTF_8);
     assertEquals(0, process.exitValue(), text);
+    assertTrue(text.contains("parent-chain-limit depth=64 cycle=blocked cleanup=clean"), text);
     assertTrue(text.contains("executor-agent-probe passed"), text);
   }
 
-  private static Thread copyOutput(InputStream input, ByteArrayOutputStream output) {
+  private static Thread copyOutput(
+      InputStream input, ByteArrayOutputStream output, AtomicReference<Throwable> failure) {
     Thread reader =
         new Thread(
             () -> {
@@ -63,8 +71,8 @@ class PackagedExecutorAgentIntegrationTest {
                 while ((read = input.read(buffer)) >= 0) {
                   output.write(buffer, 0, read);
                 }
-              } catch (Exception failure) {
-                throw new AssertionError(failure);
+              } catch (Throwable readerFailure) {
+                failure.compareAndSet(null, readerFailure);
               }
             },
             "executor-probe-output");

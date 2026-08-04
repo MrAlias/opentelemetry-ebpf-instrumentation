@@ -1,0 +1,303 @@
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package io.opentelemetry.obi.java.extension.probe;
+
+import jakarta.servlet.AsyncContext;
+import jakarta.servlet.DispatcherType;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServlet;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import java.io.BufferedInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.List;
+import java.util.Locale;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import org.eclipse.jetty.server.Server;
+import org.eclipse.jetty.server.ServerConnector;
+import org.eclipse.jetty.servlet.ServletContextHandler;
+import org.eclipse.jetty.servlet.ServletHolder;
+
+/** Isolated Jetty process used with an official Java agent and the production OBI extension. */
+public final class OfficialAgentJettyProbe {
+  private static final String OUTPUT_PROPERTY = "obi.test.official.agent.probe.output";
+  private static final String MODE_PROPERTY = "obi.test.official.agent.probe.mode";
+  private static final String MODE_DEFAULT = "default";
+  private static final String MODE_STANDARD_FIRST = "standard-first";
+
+  private static final String TRACE_W3C = "55555555555555555555555555555555";
+  private static final String PARENT_W3C = "6666666666666666";
+  private static final String TRACE_D_W3C = "dddddddddddddddddddddddddddddddd";
+  private static final String PARENT_D_W3C = "eeeeeeeeeeeeeeee";
+
+  private OfficialAgentJettyProbe() {}
+
+  public static void main(String[] args) throws Exception {
+    Path output = Paths.get(requiredProperty(OUTPUT_PROPERTY)).toAbsolutePath().normalize();
+    String mode = requiredProperty(MODE_PROPERTY);
+    require(
+        MODE_DEFAULT.equals(mode) || MODE_STANDARD_FIRST.equals(mode),
+        "unsupported probe mode " + mode);
+
+    Server server = new Server();
+    ServerConnector connector = new ServerConnector(server);
+    connector.setHost("127.0.0.1");
+    connector.setPort(0);
+    server.addConnector(connector);
+
+    ServletContextHandler context = new ServletContextHandler();
+    context.setContextPath("/");
+    ServletHolder servlet = new ServletHolder(new AsyncProbeServlet());
+    servlet.setAsyncSupported(true);
+    context.addServlet(servlet, "/probe/*");
+    server.setHandler(context);
+
+    try {
+      server.start();
+      int port = connector.getLocalPort();
+      require(port > 0, "Jetty did not bind an ephemeral port");
+      int expectedSpans;
+      if (MODE_DEFAULT.equals(mode)) {
+        runDefaultMode(port);
+        expectedSpans = 6;
+      } else {
+        runStandardFirstMode(port);
+        expectedSpans = 1;
+      }
+
+      awaitServerSpans(output, expectedSpans, 10, TimeUnit.SECONDS);
+      Class<?> bridge =
+          Class.forName("io.opentelemetry.obi.java.bridge.RemoteParentBridge", true, null);
+      String diagnostics = (String) bridge.getMethod("diagnosticsSnapshot").invoke(null);
+      System.out.println("OBI_STOCK_PROBE mode=" + mode + " diagnostics=" + diagnostics);
+      System.out.println("OBI_STOCK_PROBE mode=" + mode + " passed");
+    } finally {
+      server.stop();
+      server.join();
+    }
+  }
+
+  private static void runDefaultMode(int port) throws Exception {
+    try (Socket socket = connect(port)) {
+      BufferedInputStream input = new BufferedInputStream(socket.getInputStream());
+      OutputStream request = socket.getOutputStream();
+      require("A:ok".equals(send(request, input, "A", null, false)), "request A failed");
+      require("B:ok".equals(send(request, input, "B", null, false)), "request B failed");
+      require("C:ok".equals(send(request, input, "C", null, false)), "request C failed");
+      require(
+          "W:ok".equals(send(request, input, "W", traceparent(TRACE_W3C, PARENT_W3C, "01"), true)),
+          "request W failed standard-parent precedence");
+    }
+    sendParallel(port);
+  }
+
+  private static void runStandardFirstMode(int port) throws Exception {
+    try (Socket socket = connect(port)) {
+      require(
+          "D:ok"
+              .equals(
+                  send(
+                      socket.getOutputStream(),
+                      new BufferedInputStream(socket.getInputStream()),
+                      "D",
+                      traceparent(TRACE_D_W3C, PARENT_D_W3C, "00"),
+                      true)),
+          "request D failed standard-first discard");
+    }
+  }
+
+  private static Socket connect(int port) throws IOException {
+    Socket socket = new Socket();
+    socket.connect(new InetSocketAddress("127.0.0.1", port), 5_000);
+    socket.setSoTimeout(10_000);
+    return socket;
+  }
+
+  private static String traceparent(String traceId, String parentSpanId, String flags) {
+    return "00-" + traceId + "-" + parentSpanId + "-" + flags;
+  }
+
+  private static String send(
+      OutputStream output, BufferedInputStream input, String id, String traceparent, boolean close)
+      throws IOException {
+    // Raw framing prevents an instrumented client from adding a parent or creating client spans.
+    StringBuilder request =
+        new StringBuilder()
+            .append("GET /probe/")
+            .append(id)
+            .append(" HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Obi-Probe-Id: ")
+            .append(id)
+            .append("\r\n");
+    if (traceparent != null) {
+      request.append("traceparent: ").append(traceparent).append("\r\n");
+    }
+    request.append("Connection: ").append(close ? "close" : "keep-alive").append("\r\n\r\n");
+    output.write(request.toString().getBytes(StandardCharsets.US_ASCII));
+    output.flush();
+
+    String status = readLine(input);
+    require(status != null && status.startsWith("HTTP/1.1 200 "), "unexpected response " + status);
+    int contentLength = -1;
+    String line;
+    while ((line = readLine(input)) != null && !line.isEmpty()) {
+      int separator = line.indexOf(':');
+      if (separator > 0
+          && "content-length"
+              .equals(line.substring(0, separator).trim().toLowerCase(Locale.ROOT))) {
+        contentLength = Integer.parseInt(line.substring(separator + 1).trim());
+      }
+    }
+    require(contentLength >= 0 && contentLength <= 64, "invalid response content length");
+    byte[] body = new byte[contentLength];
+    int offset = 0;
+    while (offset < body.length) {
+      int read = input.read(body, offset, body.length - offset);
+      require(read >= 0, "truncated response body");
+      offset += read;
+    }
+    return new String(body, StandardCharsets.UTF_8);
+  }
+
+  private static void sendParallel(int port) throws Exception {
+    CountDownLatch ready = new CountDownLatch(2);
+    CountDownLatch start = new CountDownLatch(1);
+    AtomicReference<Throwable> failure = new AtomicReference<>();
+    Thread first = parallelRequest(port, "P", ready, start, failure);
+    Thread second = parallelRequest(port, "Q", ready, start, failure);
+    first.start();
+    second.start();
+    require(ready.await(5, TimeUnit.SECONDS), "parallel clients did not become ready");
+    start.countDown();
+    first.join(TimeUnit.SECONDS.toMillis(15));
+    second.join(TimeUnit.SECONDS.toMillis(15));
+    require(!first.isAlive() && !second.isAlive(), "parallel clients did not finish");
+    Throwable problem = failure.get();
+    if (problem != null) {
+      throw new IllegalStateException("parallel request failed", problem);
+    }
+  }
+
+  private static Thread parallelRequest(
+      int port,
+      String id,
+      CountDownLatch ready,
+      CountDownLatch start,
+      AtomicReference<Throwable> failure) {
+    return new Thread(
+        () -> {
+          ready.countDown();
+          try {
+            require(start.await(5, TimeUnit.SECONDS), "parallel start was not released");
+            try (Socket socket = connect(port)) {
+              String response =
+                  send(
+                      socket.getOutputStream(),
+                      new BufferedInputStream(socket.getInputStream()),
+                      id,
+                      null,
+                      true);
+              require((id + ":ok").equals(response), "request " + id + " failed");
+            }
+          } catch (Throwable problem) {
+            failure.compareAndSet(null, problem);
+          }
+        },
+        "obi-official-agent-parallel-" + id);
+  }
+
+  private static String readLine(InputStream input) throws IOException {
+    StringBuilder line = new StringBuilder();
+    boolean carriageReturn = false;
+    while (true) {
+      int value = input.read();
+      if (value < 0) {
+        return line.length() == 0 ? null : line.toString();
+      }
+      if (carriageReturn && value == '\n') {
+        return line.toString();
+      }
+      if (carriageReturn) {
+        line.append('\r');
+      }
+      carriageReturn = value == '\r';
+      if (!carriageReturn) {
+        line.append((char) value);
+      }
+      require(line.length() <= 8_192, "oversized response header line");
+    }
+  }
+
+  private static void awaitServerSpans(Path output, int expected, long timeout, TimeUnit unit)
+      throws Exception {
+    long deadline = System.nanoTime() + unit.toNanos(timeout);
+    while (System.nanoTime() - deadline < 0) {
+      if (Files.isRegularFile(output)) {
+        List<String> lines = Files.readAllLines(output, StandardCharsets.UTF_8);
+        long count = lines.stream().filter(line -> line.startsWith("SPAN\t")).count();
+        if (count >= expected) {
+          return;
+        }
+      }
+      Thread.sleep(25L);
+    }
+    throw new IllegalStateException("timed out waiting for server spans");
+  }
+
+  private static String requiredProperty(String name) {
+    String value = System.getProperty(name);
+    require(value != null && !value.isEmpty(), "missing system property " + name);
+    return value;
+  }
+
+  private static void require(boolean condition, String message) {
+    if (!condition) {
+      throw new IllegalStateException(message);
+    }
+  }
+
+  private static final class AsyncProbeServlet extends HttpServlet {
+    @Override
+    protected void doGet(HttpServletRequest request, HttpServletResponse response)
+        throws IOException, ServletException {
+      String id = request.getHeader("x-obi-probe-id");
+      require(
+          "A".equals(id)
+              || "B".equals(id)
+              || "C".equals(id)
+              || "W".equals(id)
+              || "P".equals(id)
+              || "Q".equals(id)
+              || "D".equals(id),
+          "invalid probe id");
+
+      if (request.getDispatcherType() == DispatcherType.REQUEST) {
+        System.out.println("OBI_DISPATCH\tREQUEST\t" + id);
+        AsyncContext async = request.startAsync();
+        async.setTimeout(5_000L);
+        async.start(async::dispatch);
+        return;
+      }
+
+      require(request.getDispatcherType() == DispatcherType.ASYNC, "unexpected dispatch type");
+      System.out.println("OBI_DISPATCH\tASYNC\t" + id);
+      byte[] body = (id + ":ok").getBytes(StandardCharsets.UTF_8);
+      response.setStatus(HttpServletResponse.SC_OK);
+      response.setContentType("text/plain");
+      response.setContentLength(body.length);
+      response.getOutputStream().write(body);
+    }
+  }
+}

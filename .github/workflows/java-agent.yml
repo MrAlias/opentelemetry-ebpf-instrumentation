@@ -189,8 +189,7 @@ jobs:
           OBI_TEST_SPLUNK_AGENT=/tmp/obi-agent-compatibility/splunk/artifacts/official-javaagent.jar \
             gradle \
               -p pkg/internal/java \
-              :extension:test \
-              --tests '*OfficialAgentCompatibilityTest' \
+              :extension:officialAgentRuntimeTest \
               -I /tmp/obi-agent-compatibility-jvm.init.gradle \
               --no-daemon \
               --stacktrace

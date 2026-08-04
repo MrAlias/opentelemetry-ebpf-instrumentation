@@ -1,5 +1,8 @@
 import java.util.jar.Manifest
 import java.util.zip.ZipFile
+import org.gradle.api.tasks.compile.JavaCompile
+import org.gradle.api.tasks.testing.Test
+import org.gradle.jvm.tasks.Jar
 
 plugins {
     java
@@ -9,6 +12,10 @@ plugins {
 version = rootProject.version
 
 val otelVersion = "1.62.0"
+val jettyVersion = "11.0.26"
+
+val officialAgentProbeExtension = sourceSets.create("officialAgentProbeExtension")
+val officialAgentProbeApp = sourceSets.create("officialAgentProbeApp")
 
 dependencies {
     compileOnly("io.opentelemetry:opentelemetry-api:$otelVersion")
@@ -19,6 +26,31 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter-api:5.14.4")
     testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.14.4")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher:1.14.4")
+
+    add(
+        officialAgentProbeExtension.compileOnlyConfigurationName,
+        "io.opentelemetry:opentelemetry-api:$otelVersion",
+    )
+    add(
+        officialAgentProbeExtension.compileOnlyConfigurationName,
+        "io.opentelemetry:opentelemetry-sdk-extension-autoconfigure-spi:$otelVersion",
+    )
+    add(
+        officialAgentProbeExtension.compileOnlyConfigurationName,
+        "io.opentelemetry:opentelemetry-sdk-trace:$otelVersion",
+    )
+    add(
+        officialAgentProbeApp.implementationConfigurationName,
+        "org.eclipse.jetty:jetty-server:$jettyVersion",
+    )
+    add(
+        officialAgentProbeApp.implementationConfigurationName,
+        "org.eclipse.jetty:jetty-servlet:$jettyVersion",
+    )
+    add(
+        officialAgentProbeApp.runtimeOnlyConfigurationName,
+        "org.slf4j:slf4j-simple:2.0.13",
+    )
 }
 
 configure<com.diffplug.gradle.spotless.SpotlessExtension> {
@@ -33,11 +65,105 @@ configure<com.diffplug.gradle.spotless.SpotlessExtension> {
 
 tasks.test {
     useJUnitPlatform()
+    filter {
+        excludeTestsMatching("*OfficialAgentJettyRuntimeTest")
+    }
     dependsOn(tasks.jar)
     doFirst {
         systemProperty(
             "obi.test.extension.jar",
             tasks.jar.get().archiveFile.get().asFile.absolutePath,
+        )
+    }
+}
+
+tasks.named<JavaCompile>(officialAgentProbeApp.compileJavaTaskName) {
+    options.release.set(11)
+}
+
+val officialAgentProbeExtensionJar by tasks.registering(Jar::class) {
+    archiveFileName.set("obi-official-agent-probe-extension.jar")
+    from(officialAgentProbeExtension.output)
+}
+
+val verifyOfficialAgentProbeExtensionJar by tasks.registering {
+    dependsOn(officialAgentProbeExtensionJar)
+    inputs.file(officialAgentProbeExtensionJar.flatMap { it.archiveFile })
+
+    doLast {
+        val jarFile = officialAgentProbeExtensionJar.get().archiveFile.get().asFile
+        ZipFile(jarFile).use { zip ->
+            val service =
+                "META-INF/services/io.opentelemetry.sdk.autoconfigure.spi.AutoConfigurationCustomizerProvider"
+            val serviceEntry = zip.getEntry(service)
+            check(serviceEntry != null) { "Missing probe AutoConfigurationCustomizerProvider metadata" }
+            val provider =
+                zip.getInputStream(serviceEntry).bufferedReader(Charsets.UTF_8).use { it.readText() }.trim()
+            check(
+                provider ==
+                    "io.opentelemetry.obi.java.extension.probe.OfficialAgentProbeExtension",
+            ) { "Unexpected probe extension provider: $provider" }
+
+            val forbidden =
+                zip.entries().asSequence().firstOrNull {
+                    it.name.startsWith("io/opentelemetry/api/") ||
+                        it.name.startsWith("io/opentelemetry/context/") ||
+                        it.name.startsWith("io/opentelemetry/javaagent/") ||
+                        it.name.startsWith("io/opentelemetry/sdk/")
+                }
+            check(forbidden == null) { "Probe extension contains agent-provided class: ${forbidden?.name}" }
+        }
+    }
+}
+
+val officialAgentRuntimeTest by tasks.registering(Test::class) {
+    group = "verification"
+    description = "Run the compatibility and Jetty probes with both pinned official agents"
+    testClassesDirs = sourceSets.test.get().output.classesDirs
+    classpath = sourceSets.test.get().runtimeClasspath
+    useJUnitPlatform()
+    filter {
+        includeTestsMatching("*OfficialAgentCompatibilityTest")
+        includeTestsMatching("*OfficialAgentJettyRuntimeTest")
+    }
+    dependsOn(
+        tasks.jar,
+        tasks.testClasses,
+        rootProject.tasks.named("copyLoaderJar"),
+        officialAgentProbeApp.classesTaskName,
+        officialAgentProbeExtensionJar,
+        verifyOfficialAgentProbeExtensionJar,
+    )
+    inputs.file(tasks.jar.flatMap { it.archiveFile })
+    inputs.file(rootProject.layout.buildDirectory.file("obi-java-agent.jar"))
+    inputs.file(officialAgentProbeExtensionJar.flatMap { it.archiveFile })
+    inputs.files(officialAgentProbeApp.runtimeClasspath)
+    val officialAgents =
+        listOf("OBI_TEST_OTEL_AGENT", "OBI_TEST_SPLUNK_AGENT").associateWith {
+            providers.environmentVariable(it)
+        }
+    officialAgents.forEach { (environmentName, agentPath) ->
+        agentPath.orNull?.let { inputs.file(it).withPropertyName(environmentName) }
+    }
+    doFirst {
+        officialAgents.forEach { (environmentName, agentPath) ->
+            check(agentPath.isPresent) { "$environmentName must be set" }
+        }
+        systemProperty(
+            "obi.test.extension.jar",
+            tasks.jar.get().archiveFile.get().asFile.absolutePath,
+        )
+        systemProperty(
+            "obi.test.packaged.agent",
+            rootProject.layout.buildDirectory.file("obi-java-agent.jar").get().asFile.absolutePath,
+        )
+        systemProperty(
+            "obi.test.official.agent.probe.extension.jar",
+            officialAgentProbeExtensionJar.get().archiveFile.get().asFile.absolutePath,
+        )
+        systemProperty(
+            "obi.test.official.agent.probe.app.classpath",
+            officialAgentProbeApp.runtimeClasspath.asPath,
         )
     }
 }
@@ -107,5 +233,5 @@ val verifyExtensionJar by tasks.registering {
 }
 
 tasks.check {
-    dependsOn(verifyExtensionJar)
+    dependsOn(verifyExtensionJar, verifyOfficialAgentProbeExtensionJar)
 }

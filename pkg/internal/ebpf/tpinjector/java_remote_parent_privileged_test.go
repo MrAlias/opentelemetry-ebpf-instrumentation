@@ -869,7 +869,7 @@ func assertConcurrentTakeIsOneShot(
 
 			value := make([]byte, javabridge.RecordSize)
 			length, err := rawGetsockopt(
-				fd, javabridge.SocketLevel, javabridge.SocketTake, value,
+				fd, javabridge.SocketLevel, javabridge.SocketTaskTake, value,
 			)
 			results <- takeResult{value: value, length: length, err: err}
 		}()

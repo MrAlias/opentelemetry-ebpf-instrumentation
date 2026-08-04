@@ -54,14 +54,15 @@ type bridgeBenchmarkWorker struct {
 }
 
 type bridgeBenchmarkJob struct {
-	transport bridgeBenchmarkTransport
-	fd        int
-	socket    string
-	request   []byte
-	deadline  time.Duration
-	ready     chan<- struct{}
-	start     <-chan struct{}
-	results   chan<- bridgeBenchmarkCall
+	transport        bridgeBenchmarkTransport
+	getsockoptOption int
+	fd               int
+	socket           string
+	request          []byte
+	deadline         time.Duration
+	ready            chan<- struct{}
+	start            <-chan struct{}
+	results          chan<- bridgeBenchmarkCall
 }
 
 type bridgeBenchmarkCall struct {
@@ -288,7 +289,7 @@ func runBridgeBenchmarkJob(worker int, job bridgeBenchmarkJob) {
 	case bridgeBenchmarkGetsockopt:
 		var length int
 		length, err = rawGetsockopt(
-			job.fd, javabridge.SocketLevel, javabridge.SocketTake, value,
+			job.fd, javabridge.SocketLevel, job.getsockoptOption, value,
 		)
 		if err == nil && length != len(value) {
 			err = fmt.Errorf("getsockopt returned %d bytes, want %d", length, len(value))
@@ -360,8 +361,9 @@ func primaryBenchmarkJobs(
 	jobs := make([]bridgeBenchmarkJob, len(workers))
 	for index := range workers {
 		jobs[index] = bridgeBenchmarkJob{
-			transport: bridgeBenchmarkGetsockopt,
-			fd:        pairs[index].client,
+			transport:        bridgeBenchmarkGetsockopt,
+			getsockoptOption: javabridge.SocketTake,
+			fd:               pairs[index].client,
 		}
 	}
 	return jobs
@@ -463,8 +465,9 @@ func runPrimaryOneShotBenchmark(
 	jobs := make([]bridgeBenchmarkJob, len(workers))
 	for index := range workers {
 		jobs[index] = bridgeBenchmarkJob{
-			transport: bridgeBenchmarkGetsockopt,
-			fd:        pair.client,
+			transport:        bridgeBenchmarkGetsockopt,
+			getsockoptOption: javabridge.SocketTaskTake,
+			fd:               pair.client,
 		}
 	}
 

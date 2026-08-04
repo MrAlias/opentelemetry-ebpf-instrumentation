@@ -132,8 +132,8 @@ void obi_demo_java_remote_parent_reset_wrong_live_socket_probe_for_test(void) {
       memory_order_relaxed);
 }
 
-unsigned int obi_demo_java_remote_parent_wrong_live_socket_probe_count_for_test(
-    void) {
+unsigned int
+obi_demo_java_remote_parent_wrong_live_socket_probe_count_for_test(void) {
   return atomic_load_explicit(
       &java_remote_parent_wrong_live_socket_probe_count_for_test,
       memory_order_relaxed);
@@ -373,14 +373,15 @@ static bool java_remote_parent_probe_wrong_live_socket(void) {
     goto failed;
   }
   socklen_t address_length = sizeof(address);
-  if (getsockname(listener, (struct sockaddr *)&address, &address_length) != 0 ||
+  if (getsockname(listener, (struct sockaddr *)&address, &address_length) !=
+          0 ||
       address_length != sizeof(address) || listen(listener, 1) != 0) {
     goto failed;
   }
 
   client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
-  if (client < 0 ||
-      connect(client, (const struct sockaddr *)&address, sizeof(address)) != 0) {
+  if (client < 0 || connect(client, (const struct sockaddr *)&address,
+                            sizeof(address)) != 0) {
     goto failed;
   }
   server = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
@@ -397,9 +398,9 @@ static bool java_remote_parent_probe_wrong_live_socket(void) {
 
   unsigned char response[java_remote_parent_response_size] = {0};
   socklen_t response_length = sizeof(response);
-  const int result = real_getsockopt(
-      client, java_remote_parent_socket_level, java_remote_parent_socket_take,
-      response, &response_length);
+  const int result = real_getsockopt(client, java_remote_parent_socket_level,
+                                     java_remote_parent_socket_take, response,
+                                     &response_length);
   const int probe_errno = errno;
 #if defined(OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TESTING)
   atomic_fetch_add_explicit(
@@ -410,8 +411,7 @@ static bool java_remote_parent_probe_wrong_live_socket(void) {
       memory_order_relaxed);
 #endif
   const bool denied =
-      result == -1 &&
-      (probe_errno == ENOPROTOOPT || probe_errno == EOPNOTSUPP);
+      result == -1 && (probe_errno == ENOPROTOOPT || probe_errno == EOPNOTSUPP);
   if (!java_remote_parent_close_wrong_live_socket_pair(client, server)) {
     return false;
   }
@@ -421,14 +421,13 @@ static bool java_remote_parent_probe_wrong_live_socket(void) {
   }
   return true;
 
-failed:
-  {
-    const int saved_errno = errno;
-    (void)close(listener);
-    (void)close(client);
-    (void)close(server);
-    errno = saved_errno;
-  }
+failed: {
+  const int saved_errno = errno;
+  (void)close(listener);
+  (void)close(client);
+  (void)close(server);
+  errno = saved_errno;
+}
   return false;
 }
 

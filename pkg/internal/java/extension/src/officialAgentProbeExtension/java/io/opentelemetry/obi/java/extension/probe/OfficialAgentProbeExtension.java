@@ -49,6 +49,7 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
       "obi.test.official.agent.probe.install-provider";
   private static final String REEXTRACT_ID_PROPERTY = "obi.test.official.agent.probe.reextract.id";
   private static final String FRAMEWORK_NETTY = "netty";
+  private static final String FRAMEWORK_JAVA21_CONCURRENCY = "java21-concurrency";
   private static final String RAW_OBI_PROPAGATOR =
       "io.opentelemetry.obi.java.extension.ObiRemoteParentPropagator";
   private static final int STATUS_VALID = 1;
@@ -95,25 +96,34 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
   public void customize(AutoConfigurationCustomizer customizer) {
     ProbeOutput output = new ProbeOutput(requiredProperty(OUTPUT_PROPERTY));
     output.append("EXTENSION\tready");
-    boolean netty = FRAMEWORK_NETTY.equals(System.getProperty(FRAMEWORK_PROPERTY));
+    String framework = System.getProperty(FRAMEWORK_PROPERTY);
+    boolean netty = FRAMEWORK_NETTY.equals(framework);
+    boolean java21Concurrency = FRAMEWORK_JAVA21_CONCURRENCY.equals(framework);
     boolean installProvider =
         !"false".equalsIgnoreCase(System.getProperty(INSTALL_PROVIDER_PROPERTY));
-    ProviderState provider = installProvider ? ProviderState.install(output, netty) : null;
+    ProviderState provider =
+        installProvider ? ProviderState.install(output, netty, java21Concurrency) : null;
     if (provider == null) {
       output.append("PROVIDER\tabsent");
       customizer.addPropagatorCustomizer(
           (propagator, config) -> wrapHelperAbsentObiPropagator(propagator, output));
     } else {
       customizer.addPropagatorCustomizer(
-          (propagator, config) -> wrapObiPropagator(propagator, output, provider, netty));
+          (propagator, config) ->
+              wrapObiPropagator(propagator, output, provider, netty, java21Concurrency));
     }
     customizer.addTracerProviderCustomizer(
         (builder, config) ->
-            builder.addSpanProcessor(new CapturingSpanProcessor(output, netty, !installProvider)));
+            builder.addSpanProcessor(
+                new CapturingSpanProcessor(output, netty, !installProvider, java21Concurrency)));
   }
 
   private static TextMapPropagator wrapObiPropagator(
-      TextMapPropagator propagator, ProbeOutput output, ProviderState provider, boolean netty) {
+      TextMapPropagator propagator,
+      ProbeOutput output,
+      ProviderState provider,
+      boolean netty,
+      boolean java21Concurrency) {
     if (!RAW_OBI_PROPAGATOR.equals(propagator.getClass().getName())) {
       return propagator;
     }
@@ -123,7 +133,12 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
       output.append("ERROR\tmultiple-obi-propagators");
     }
     return new RecordingObiPropagator(
-        propagator, output, provider, System.getProperty(REEXTRACT_ID_PROPERTY), netty);
+        propagator,
+        output,
+        provider,
+        System.getProperty(REEXTRACT_ID_PROPERTY),
+        netty,
+        java21Concurrency);
   }
 
   private static TextMapPropagator wrapHelperAbsentObiPropagator(
@@ -298,6 +313,7 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
     private final ProviderState provider;
     private final String reextractId;
     private final boolean netty;
+    private final boolean java21Concurrency;
     private final AtomicBoolean reextractionStarted = new AtomicBoolean();
     private final ThreadLocal<Boolean> reextracting = new ThreadLocal<>();
 
@@ -306,12 +322,14 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
         ProbeOutput output,
         ProviderState provider,
         String reextractId,
-        boolean netty) {
+        boolean netty,
+        boolean java21Concurrency) {
       this.delegate = delegate;
       this.output = output;
       this.provider = provider;
       this.reextractId = reextractId;
       this.netty = netty;
+      this.java21Concurrency = java21Concurrency;
     }
 
     @Override
@@ -387,8 +405,11 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
       }
     }
 
-    private static <C> String probeId(C carrier, TextMapGetter<C> getter) {
+    private <C> String probeId(C carrier, TextMapGetter<C> getter) {
       String value = getter.get(carrier, ID_HEADER);
+      if (java21ConcurrencyId(value)) {
+        return value;
+      }
       if ("A".equals(value)
           || "B".equals(value)
           || "C".equals(value)
@@ -405,6 +426,10 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
         return value;
       }
       return null;
+    }
+
+    private boolean java21ConcurrencyId(String value) {
+      return java21Concurrency && OfficialAgentProbeExtension.java21ConcurrencyId(value);
     }
 
     private static String pass(String id, int invocation, int pass, Context context) {
@@ -433,22 +458,23 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
     private final Object alreadyConsumed;
     private final ThreadLocal<Invocation> current = new ThreadLocal<>();
     private final CountDownLatch parallelTakes = new CountDownLatch(2);
-    private final NettyAuthority nettyAuthority;
+    private final AuthorityVerifier authorityVerifier;
 
     private ProviderState(
         ProbeOutput output,
         Map<String, ScenarioState> scenarios,
         Object missing,
         Object alreadyConsumed,
-        NettyAuthority nettyAuthority) {
+        AuthorityVerifier authorityVerifier) {
       this.output = output;
       this.scenarios = scenarios;
       this.missing = missing;
       this.alreadyConsumed = alreadyConsumed;
-      this.nettyAuthority = nettyAuthority;
+      this.authorityVerifier = authorityVerifier;
     }
 
-    private static ProviderState install(ProbeOutput output, boolean netty) {
+    private static ProviderState install(
+        ProbeOutput output, boolean netty, boolean java21Concurrency) {
       try {
         Class<?> bridge =
             Class.forName("io.opentelemetry.obi.java.bridge.RemoteParentBridge", true, null);
@@ -493,14 +519,24 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
             "D", new ScenarioState(decode.invoke(null, record(TRACE_D_OBI, PARENT_D_OBI, 1, 8L))));
         scenarios.put(
             "T", new ScenarioState(decode.invoke(null, record(TRACE_T, PARENT_T, 1, 9L))));
+        if (java21Concurrency) {
+          for (int index = 0; index < 16; index++) {
+            addJava21Scenario(decode, scenarios, "V", index);
+          }
+          for (int index = 0; index < 4; index++) {
+            addJava21Scenario(decode, scenarios, "P", index);
+          }
+        }
+
+        AuthorityVerifier authorityVerifier = null;
+        if (netty) {
+          authorityVerifier = NettyAuthority.create();
+        } else if (java21Concurrency) {
+          authorityVerifier = Java21Authority.create();
+        }
 
         ProviderState state =
-            new ProviderState(
-                output,
-                scenarios,
-                missing,
-                alreadyConsumed,
-                netty ? NettyAuthority.create() : null);
+            new ProviderState(output, scenarios, missing, alreadyConsumed, authorityVerifier);
         Object provider = Proxy.newProxyInstance(null, new Class<?>[] {providerType}, state);
         requireBootstrap(provider.getClass(), "test provider");
         boolean installed =
@@ -513,6 +549,23 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
       } catch (ReflectiveOperationException error) {
         throw new IllegalStateException("cannot install probe provider", error);
       }
+    }
+
+    private static void addJava21Scenario(
+        Method decode, Map<String, ScenarioState> scenarios, String kind, int index)
+        throws ReflectiveOperationException {
+      String firstWave = "W1" + kind + twoDigits(index);
+      scenarios.put(
+          firstWave,
+          new ScenarioState(
+              decode.invoke(
+                  null,
+                  record(
+                      java21TraceId(firstWave),
+                      java21ParentSpanId(firstWave),
+                      java21Ordinal(firstWave) & 1,
+                      100L + java21Ordinal(firstWave)))));
+      scenarios.put("W2" + kind + twoDigits(index), new ScenarioState(null));
     }
 
     @Override
@@ -558,7 +611,7 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
         output.append("ERROR\tunknown-provider-scenario\t" + token(invocation.id));
         return missing;
       }
-      if (nettyAuthority != null && !nettyAuthority.verify(output, operation, invocation)) {
+      if (authorityVerifier != null && !authorityVerifier.verify(output, operation, invocation)) {
         return missing;
       }
 
@@ -597,7 +650,11 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
     }
   }
 
-  private static final class NettyAuthority {
+  private interface AuthorityVerifier {
+    boolean verify(ProbeOutput output, String operation, Invocation invocation);
+  }
+
+  private static final class NettyAuthority implements AuthorityVerifier {
     private static final int LOOKUP_TASK = 2;
 
     private final Method lookupSource;
@@ -632,7 +689,8 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
           lifecycle.getMethod("active"));
     }
 
-    private boolean verify(ProbeOutput output, String operation, Invocation invocation) {
+    @Override
+    public boolean verify(ProbeOutput output, String operation, Invocation invocation) {
       try {
         int source = ((Integer) lookupSource.invoke(null)).intValue();
         Object lifecycle = lookupLifecycle.invoke(null);
@@ -679,6 +737,160 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
         output.append("ERROR\tnetty-authority-reflection\t" + token(error.getClass().getName()));
         return false;
       }
+    }
+  }
+
+  private static final class Java21Authority implements AuthorityVerifier {
+    private static final int LOOKUP_TASK = 2;
+    private static final int LOOKUP_BLOCKED = 3;
+
+    private final Method lookupSource;
+    private final Method directAuthority;
+    private final Method lookupLifecycle;
+    private final Method takeSocketFileDescriptor;
+    private final Method lifecycleActive;
+    private final Method nativeThreadId;
+    private final Field taskRelayState;
+    private final Field socketContext;
+
+    private Java21Authority(
+        Method lookupSource,
+        Method directAuthority,
+        Method lookupLifecycle,
+        Method takeSocketFileDescriptor,
+        Method lifecycleActive,
+        Method nativeThreadId,
+        Field taskRelayState,
+        Field socketContext) {
+      this.lookupSource = lookupSource;
+      this.directAuthority = directAuthority;
+      this.lookupLifecycle = lookupLifecycle;
+      this.takeSocketFileDescriptor = takeSocketFileDescriptor;
+      this.lifecycleActive = lifecycleActive;
+      this.nativeThreadId = nativeThreadId;
+      this.taskRelayState = taskRelayState;
+      this.socketContext = socketContext;
+    }
+
+    private static Java21Authority create() throws ReflectiveOperationException {
+      Class<?> threadInfo = Class.forName("io.opentelemetry.obi.java.ebpf.ThreadInfo", true, null);
+      Class<?> storage =
+          Class.forName("io.opentelemetry.obi.java.instrumentations.data.SSLStorage", true, null);
+      Class<?> lifecycle =
+          Class.forName(
+              "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext$Lifecycle",
+              true,
+              null);
+      ProviderState.requireBootstrap(threadInfo, "Java 21 thread authority");
+      ProviderState.requireBootstrap(storage, "Java 21 task storage");
+      ProviderState.requireBootstrap(lifecycle, "Java 21 socket lifecycle");
+      Field taskRelayState = threadInfo.getDeclaredField("taskRelayState");
+      taskRelayState.setAccessible(true);
+      Field socketContext = threadInfo.getDeclaredField("remoteParentSocketContext");
+      socketContext.setAccessible(true);
+      return new Java21Authority(
+          threadInfo.getMethod("remoteParentLookupSource"),
+          threadInfo.getMethod("hasRemoteParentDirectReceiveAuthority"),
+          threadInfo.getMethod("remoteParentLookupLifecycle"),
+          threadInfo.getMethod("takeRemoteParentSocketFileDescriptor"),
+          lifecycle.getMethod("active"),
+          storage.getMethod("currentThreadId"),
+          taskRelayState,
+          socketContext);
+    }
+
+    @Override
+    public boolean verify(ProbeOutput output, String operation, Invocation invocation) {
+      try {
+        int source = ((Integer) lookupSource.invoke(null)).intValue();
+        boolean direct = ((Boolean) directAuthority.invoke(null)).booleanValue();
+        Object lifecycle = lookupLifecycle.invoke(null);
+        boolean active =
+            lifecycle != null && Boolean.TRUE.equals(lifecycleActive.invoke(lifecycle));
+        boolean socketContextPresent = ((ThreadLocal<?>) socketContext.get(null)).get() != null;
+        int socketFileDescriptor = ((Integer) takeSocketFileDescriptor.invoke(null)).intValue();
+        long javaThreadId = Thread.currentThread().getId();
+        long nativeThread = ((Long) nativeThreadId.invoke(null)).longValue();
+        Object relay = ((ThreadLocal<?>) taskRelayState.get(null)).get();
+        boolean exact = relay != null && booleanField(relay, "currentExact");
+        int lifecycleIdentity = lifecycle == null ? 0 : System.identityHashCode(lifecycle);
+        output.append(
+            "AUTH\tJAVA21\t"
+                + operation
+                + "\t"
+                + invocation.id
+                + "\t"
+                + invocation.invocation
+                + "\t"
+                + invocation.pass
+                + "\t"
+                + source
+                + "\t"
+                + direct
+                + "\t"
+                + (active ? "LIVE" : "NONE")
+                + "\t"
+                + lifecycleIdentity
+                + "\t"
+                + socketFileDescriptor
+                + "\t"
+                + exact
+                + "\t"
+                + socketContextPresent
+                + "\t"
+                + javaThreadId
+                + "\t"
+                + nativeThread);
+
+        boolean firstWave = invocation.id.startsWith("W1");
+        boolean firstPass = invocation.invocation == 1 && invocation.pass == 1;
+        boolean valid;
+        if (firstWave) {
+          valid =
+              source == LOOKUP_TASK
+                  && !direct
+                  && active
+                  && lifecycleIdentity != 0
+                  && exact
+                  && javaThreadId > 0
+                  && nativeThread > 0
+                  && (firstPass
+                      ? socketContextPresent
+                          && socketFileDescriptor == 200 + java21Ordinal(invocation.id)
+                      : !socketContextPresent && socketFileDescriptor == -1);
+        } else {
+          valid =
+              source == LOOKUP_BLOCKED
+                  && !direct
+                  && !active
+                  && lifecycleIdentity == 0
+                  && socketFileDescriptor == -1
+                  && !exact
+                  && !socketContextPresent
+                  && javaThreadId > 0
+                  && nativeThread > 0;
+        }
+        if (!valid) {
+          output.append(
+              "ERROR\tjava21-authority\t"
+                  + invocation.id
+                  + "\t"
+                  + invocation.invocation
+                  + "\t"
+                  + invocation.pass);
+        }
+        return valid;
+      } catch (ReflectiveOperationException error) {
+        output.append("ERROR\tjava21-authority-reflection\t" + token(error.getClass().getName()));
+        return false;
+      }
+    }
+
+    private static boolean booleanField(Object target, String name)
+        throws ReflectiveOperationException {
+      Field field = target.getClass().getDeclaredField(name);
+      field.setAccessible(true);
+      return field.getBoolean(target);
     }
   }
 
@@ -742,6 +954,61 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
     }
   }
 
+  private static boolean java21ConcurrencyId(String value) {
+    if (value == null || value.length() != 5 || value.charAt(0) != 'W') {
+      return false;
+    }
+    char wave = value.charAt(1);
+    char kind = value.charAt(2);
+    char tens = value.charAt(3);
+    char ones = value.charAt(4);
+    if ((wave != '1' && wave != '2')
+        || (kind != 'V' && kind != 'P')
+        || tens < '0'
+        || tens > '9'
+        || ones < '0'
+        || ones > '9') {
+      return false;
+    }
+    int index = (tens - '0') * 10 + (ones - '0');
+    return kind == 'V' ? index < 16 : index < 4;
+  }
+
+  private static int java21Ordinal(String id) {
+    if (!java21ConcurrencyId(id)) {
+      throw new IllegalArgumentException("invalid Java 21 concurrency id " + token(id));
+    }
+    int index = (id.charAt(3) - '0') * 10 + (id.charAt(4) - '0');
+    return id.charAt(2) == 'V' ? index : 16 + index;
+  }
+
+  private static String java21TraceId(String id) {
+    return paddedHex(java21Ordinal(id) + 1L, 32);
+  }
+
+  private static String java21ParentSpanId(String id) {
+    return paddedHex(java21Ordinal(id) + 1L, 16);
+  }
+
+  private static String twoDigits(int value) {
+    if (value < 0 || value > 99) {
+      throw new IllegalArgumentException("two-digit value out of range");
+    }
+    return value < 10 ? "0" + value : Integer.toString(value);
+  }
+
+  private static String paddedHex(long value, int width) {
+    String hex = Long.toHexString(value);
+    if (hex.length() > width) {
+      throw new IllegalArgumentException("hex value exceeds width");
+    }
+    StringBuilder result = new StringBuilder(width);
+    for (int index = hex.length(); index < width; index++) {
+      result.append('0');
+    }
+    return result.append(hex).toString();
+  }
+
   private static byte[] record(String traceId, String parentSpanId, int flags, long generation) {
     byte[] bytes = new byte[64];
     bytes[0] = 'O';
@@ -799,12 +1066,17 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
     private final ProbeOutput output;
     private final boolean captureHttp;
     private final boolean captureHelperAbsent;
+    private final boolean captureJava21Concurrency;
 
     private CapturingSpanProcessor(
-        ProbeOutput output, boolean captureHttp, boolean captureHelperAbsent) {
+        ProbeOutput output,
+        boolean captureHttp,
+        boolean captureHelperAbsent,
+        boolean captureJava21Concurrency) {
       this.output = output;
       this.captureHttp = captureHttp;
       this.captureHelperAbsent = captureHelperAbsent;
+      this.captureJava21Concurrency = captureJava21Concurrency;
     }
 
     @Override
@@ -812,7 +1084,7 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
       String id = parentContext.get(PROBE_ID_CONTEXT);
       if (id != null && span.getKind() == SpanKind.SERVER) {
         span.setAttribute(PROBE_ID, id);
-        if (captureHttp) {
+        if (captureHttp || captureJava21Concurrency) {
           output.append("THREAD\tSPAN_START\t" + id + "\t" + Thread.currentThread().getId());
         } else if ("T".equals(id)) {
           output.append("THREAD\tSPAN_START\tT\t" + Thread.currentThread().getId());

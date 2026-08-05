@@ -253,7 +253,8 @@ public final class RemoteParentDiagnostics {
       next = Math.min(MAX_COUNTER_VALUE, current + Math.min(amount, MAX_COUNTER_VALUE));
     } while (!counters.compareAndSet(index, current, next));
 
-    if (failureReason != null && (next == 1L || (next & (next - 1L)) == 0L)) {
+    if (failureReason != null
+        && (current == 0L || Long.highestOneBit(current) != Long.highestOneBit(next))) {
       try {
         logger.warning("OBI remote-parent diagnostics reason=" + failureReason + " count=" + next);
       } catch (Throwable ignored) {

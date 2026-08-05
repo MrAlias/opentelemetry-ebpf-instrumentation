@@ -601,10 +601,13 @@ Java counters through `RemoteParentBridge.diagnosticsSnapshot()`. The snapshot
 separates bridge lookup from take and discard statuses, extraction failures,
 provider and extension negotiation (including duplicate registration), and
 discards caused by an existing standard parent. Counter values use lower-case
-base 36 so the complete bounded snapshot
-remains below one KiB at saturation. Failures are logged on the first and
-power-of-two occurrences so repeated transport faults do not produce per-request
-log volume.
+base 36 so the complete bounded snapshot remains below one KiB at saturation.
+Failures are logged on the first
+observation and whenever the cumulative counter crosses a power-of-two boundary,
+so a batched update emits at most one record with its post-update count. Log
+messages match `OBI remote-parent diagnostics reason=<reason> count=<count>`;
+reasons are fixed lower-case identifiers of at most 30 characters, counts are
+at most nine decimal digits, and the complete message is at most 83 characters.
 
 `RemoteParentTransportDiagnosticsV1.snapshot()` separately exposes a fixed
 configuration-state snapshot as seven decimal fields:

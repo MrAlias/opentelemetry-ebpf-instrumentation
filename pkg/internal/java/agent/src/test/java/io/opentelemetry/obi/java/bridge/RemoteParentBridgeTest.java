@@ -7,6 +7,7 @@ package io.opentelemetry.obi.java.bridge;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.lang.reflect.Field;
@@ -263,6 +264,79 @@ class RemoteParentBridgeTest {
   }
 
   @Test
+  void failureLoggingUsesABoundedSanitizedPowerOfTwoCadenceAcrossBatches() {
+    Logger diagnosticsLogger = Logger.getLogger(RemoteParentDiagnostics.class.getName());
+    boolean useParentHandlers = diagnosticsLogger.getUseParentHandlers();
+    Level previousLevel = diagnosticsLogger.getLevel();
+    List<LogRecord> records = new ArrayList<>();
+    Handler recordingHandler =
+        new Handler() {
+          @Override
+          public void publish(LogRecord record) {
+            if (record.getMessage().startsWith("OBI remote-parent diagnostics reason=")) {
+              records.add(record);
+            }
+          }
+
+          @Override
+          public void flush() {}
+
+          @Override
+          public void close() {}
+        };
+    recordingHandler.setLevel(Level.ALL);
+    diagnosticsLogger.setUseParentHandlers(false);
+    diagnosticsLogger.setLevel(Level.ALL);
+    diagnosticsLogger.addHandler(recordingHandler);
+    try {
+      assertTrue(RemoteParentBridge.installProviderForTest(new SensitiveFailureProvider()));
+      for (int attempt = 0; attempt < 17; attempt++) {
+        assertEquals(
+            RemoteParentStatus.TRANSPORT_ERROR, RemoteParentBridge.takeRemoteParent().getStatus());
+      }
+      RemoteParentBridge.recordExtensionEvent(5, 3L);
+      RemoteParentBridge.recordExtensionEvent(5, 3L);
+      RemoteParentBridge.recordExtensionEvent(5, 1L);
+      RemoteParentBridge.recordExtensionEvent(5, 10L);
+
+      String[] expectedMessages = {
+        "OBI remote-parent diagnostics reason=take_transport_error count=1",
+        "OBI remote-parent diagnostics reason=take_transport_error count=2",
+        "OBI remote-parent diagnostics reason=take_transport_error count=4",
+        "OBI remote-parent diagnostics reason=take_transport_error count=8",
+        "OBI remote-parent diagnostics reason=take_transport_error count=16",
+        "OBI remote-parent diagnostics reason=bridge_lookup_error count=3",
+        "OBI remote-parent diagnostics reason=bridge_lookup_error count=6",
+        "OBI remote-parent diagnostics reason=bridge_lookup_error count=17"
+      };
+      assertEquals(expectedMessages.length, records.size());
+      for (int index = 0; index < expectedMessages.length; index++) {
+        LogRecord record = records.get(index);
+        String message = record.getMessage();
+        assertEquals(expectedMessages[index], message);
+        assertEquals(Level.WARNING, record.getLevel());
+        assertEquals(RemoteParentDiagnostics.class.getName(), record.getLoggerName());
+        assertNull(record.getParameters());
+        assertNull(record.getThrown());
+        assertTrue(
+            message.matches(
+                "OBI remote-parent diagnostics reason=[a-z][a-z0-9_]{0,29}"
+                    + " count=[1-9][0-9]{0,8}"));
+        assertTrue(message.length() <= 83, message);
+        for (String forbidden : SensitiveFailureProvider.FORBIDDEN_VALUES) {
+          assertFalse(message.contains(forbidden), message);
+        }
+      }
+      assertTrue(RemoteParentBridge.diagnosticsSnapshot().contains("t_transport_error=h"));
+      assertTrue(RemoteParentBridge.diagnosticsSnapshot().contains("lookup_error=h"));
+    } finally {
+      diagnosticsLogger.removeHandler(recordingHandler);
+      diagnosticsLogger.setLevel(previousLevel);
+      diagnosticsLogger.setUseParentHandlers(useParentHandlers);
+    }
+  }
+
+  @Test
   void reportsFixedSanitizedTakeAndExtractionCounters() {
     FakeProvider provider = new FakeProvider();
     assertTrue(RemoteParentBridge.installProviderForTest(provider));
@@ -429,6 +503,41 @@ class RemoteParentBridgeTest {
     @Override
     public RemoteParentRecord discardRemoteParent() {
       return RemoteParentRecord.statusOnly(RemoteParentStatus.UNAUTHORIZED);
+    }
+
+    @Override
+    public void close() {}
+  }
+
+  private static final class SensitiveFailureProvider implements RemoteParentProvider {
+    private static final String[] FORBIDDEN_VALUES = {
+      "4bf92f3577b34da6a3ce929d0e0e4736",
+      "00f067aa0ba902b7",
+      "Bearer-secret-credential",
+      "private-request-body"
+    };
+
+    @Override
+    public int abiVersion() {
+      return RemoteParentRecord.ABI_VERSION;
+    }
+
+    @Override
+    public RemoteParentRecord takeRemoteParent() {
+      throw new IllegalStateException(
+          "trace_id="
+              + FORBIDDEN_VALUES[0]
+              + " span_id="
+              + FORBIDDEN_VALUES[1]
+              + " authorization="
+              + FORBIDDEN_VALUES[2]
+              + " body="
+              + FORBIDDEN_VALUES[3]);
+    }
+
+    @Override
+    public RemoteParentRecord discardRemoteParent() {
+      return RemoteParentRecord.statusOnly(RemoteParentStatus.MISSING);
     }
 
     @Override

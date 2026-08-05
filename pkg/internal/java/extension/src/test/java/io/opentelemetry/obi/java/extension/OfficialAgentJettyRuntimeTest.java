@@ -31,6 +31,7 @@ import org.junit.jupiter.api.Test;
 
 class OfficialAgentJettyRuntimeTest {
   private static final String MODE_DEFAULT = "default";
+  private static final String MODE_HELPER_ABSENT = "helper-absent";
   private static final String MODE_NESTED = "nested";
   private static final String MODE_STANDARD_FIRST = "standard-first";
 
@@ -119,7 +120,8 @@ class OfficialAgentJettyRuntimeTest {
         MODE_DEFAULT,
         "obi,tracecontext,baggage",
         true,
-        null);
+        null,
+        true);
     // Jetty starts the span, while the nested Servlet advice adds the servlet mapping route. The
     // paired disabled-module run proves that the route came from an actual second stock server
     // advice rather than from the probe or Jetty itself.
@@ -135,7 +137,8 @@ class OfficialAgentJettyRuntimeTest {
         MODE_NESTED,
         "obi,tracecontext,baggage",
         true,
-        "_probe__");
+        "_probe__",
+        true);
     runMode(
         officialAgent,
         expectedSha256,
@@ -148,7 +151,8 @@ class OfficialAgentJettyRuntimeTest {
         MODE_NESTED,
         "obi,tracecontext,baggage",
         false,
-        "-");
+        "-",
+        true);
     runMode(
         officialAgent,
         expectedSha256,
@@ -161,7 +165,22 @@ class OfficialAgentJettyRuntimeTest {
         MODE_STANDARD_FIRST,
         "tracecontext,obi,baggage",
         true,
-        null);
+        null,
+        true);
+    runMode(
+        officialAgent,
+        expectedSha256,
+        helper,
+        extension,
+        probeExtension,
+        probeClasspath,
+        distribution,
+        version,
+        MODE_HELPER_ABSENT,
+        "obi,tracecontext,baggage",
+        true,
+        null,
+        false);
     assertEquals(expectedSha256, sha256(officialAgent.toPath()));
   }
 
@@ -177,14 +196,19 @@ class OfficialAgentJettyRuntimeTest {
       String mode,
       String propagators,
       boolean servletEnabled,
-      String nestedExpectedRoute)
+      String nestedExpectedRoute,
+      boolean helperEnabled)
       throws Exception {
     Path directory = Files.createTempDirectory("obi-official-agent-jetty-");
     Path result = directory.resolve("spans.tsv");
     try {
       List<String> command = new ArrayList<>();
       command.add(new File(System.getProperty("java.home"), "bin/java").getAbsolutePath());
-      command.add("-javaagent:" + helper.getAbsolutePath() + "=remoteParentTransport=disabled");
+      if (helperEnabled) {
+        command.add("-javaagent:" + helper.getAbsolutePath() + "=remoteParentTransport=disabled");
+      } else {
+        command.add("-Dobi.test.official.agent.probe.install-provider=false");
+      }
       command.add("-javaagent:" + officialAgent.getAbsolutePath());
       command.add(
           "-Dotel.javaagent.extensions="
@@ -223,14 +247,20 @@ class OfficialAgentJettyRuntimeTest {
       List<String> lines = Files.readAllLines(result, StandardCharsets.UTF_8);
       try {
         assertCommonOutput(output, mode, distribution, version);
-        assertCommonResult(lines);
+        if (helperEnabled) {
+          assertCommonResult(lines);
+        } else {
+          assertHelperAbsentResult(lines, output);
+        }
         if (MODE_DEFAULT.equals(mode)) {
           assertDefaultResult(lines, output);
         } else if (MODE_NESTED.equals(mode)) {
           assertTrue(nestedExpectedRoute != null, "missing nested route oracle");
           assertNestedResult(lines, output, MODE_NESTED, nestedExpectedRoute);
-        } else {
+        } else if (MODE_STANDARD_FIRST.equals(mode)) {
           assertStandardFirstResult(lines, output);
+        } else {
+          assertHelperAbsentSpans(lines, output);
         }
         assertEquals(expectedSha256, sha256(officialAgent.toPath()));
       } catch (Throwable failure) {
@@ -261,6 +291,98 @@ class OfficialAgentJettyRuntimeTest {
     assertEquals(1, count(lines, "WRAP\tobi\t1"), lines.toString());
     assertEquals(0, prefix(lines, "WRAP\tobi\t2").size(), lines.toString());
     assertEquals(0, prefix(lines, "ERROR\t").size(), lines.toString());
+  }
+
+  private static void assertHelperAbsentResult(List<String> resultLines, String output) {
+    assertEquals(1, count(resultLines, "EXTENSION\tready"), resultLines.toString());
+    assertEquals(1, count(resultLines, "PROVIDER\tabsent"), resultLines.toString());
+    assertEquals(0, prefix(resultLines, "PROVIDER\tready\t").size(), resultLines.toString());
+    assertEquals(1, count(resultLines, "WRAP\thelper-absent\t1"), resultLines.toString());
+    assertEquals(0, prefix(resultLines, "WRAP\thelper-absent\t2").size(), resultLines.toString());
+    assertEquals(0, prefix(resultLines, "CALL\t").size(), resultLines.toString());
+    assertEquals(0, prefix(resultLines, "ERROR\t").size(), resultLines.toString());
+
+    assertHelperAbsentDeadline(resultLines);
+    long burstDeadlineDelta = helperAbsentLookup(resultLines, "BURST", 1L);
+    long midDeadlineDelta = helperAbsentLookup(resultLines, "MID", 1L);
+    long retryDeadlineDelta = helperAbsentLookup(resultLines, "RETRY", 2L);
+    assertTrue(burstDeadlineDelta < 0L, Long.toString(burstDeadlineDelta));
+    assertTrue(midDeadlineDelta < 0L, Long.toString(midDeadlineDelta));
+    assertTrue(
+        retryDeadlineDelta >= TimeUnit.MILLISECONDS.toNanos(500L),
+        Long.toString(retryDeadlineDelta));
+
+    List<String> outputLines = lines(output);
+    int burstStart = exactLineIndex(outputLines, "OBI_HELPER_ABSENT\tBURST_START");
+    int burstEnd = exactLineIndex(outputLines, "OBI_HELPER_ABSENT\tBURST_END");
+    int midStart = exactLineIndex(outputLines, "OBI_HELPER_ABSENT\tMID_START");
+    int midEnd = exactLineIndex(outputLines, "OBI_HELPER_ABSENT\tMID_END");
+    int retryStart = exactLineIndex(outputLines, "OBI_HELPER_ABSENT\tRETRY_START");
+    int retryEnd = exactLineIndex(outputLines, "OBI_HELPER_ABSENT\tRETRY_END");
+    assertTrue(
+        burstStart < burstEnd
+            && burstEnd < midStart
+            && midStart < midEnd
+            && midEnd < retryStart
+            && retryStart < retryEnd,
+        output);
+
+    List<Integer> diagnosticLines = new ArrayList<>();
+    List<Long> diagnosticCounts = new ArrayList<>();
+    String diagnostic = "reason=bridge_lookup_missing count=";
+    for (int index = 0; index < outputLines.size(); index++) {
+      String line = outputLines.get(index);
+      int offset = line.indexOf(diagnostic);
+      if (offset < 0) {
+        continue;
+      }
+      String count = line.substring(offset + diagnostic.length()).trim();
+      assertTrue(count.matches("[0-9]+"), line);
+      diagnosticLines.add(index);
+      diagnosticCounts.add(Long.parseLong(count));
+    }
+    assertEquals(2, diagnosticLines.size(), output);
+    assertEquals(1L, diagnosticCounts.get(0).longValue(), output);
+    assertEquals(2L, diagnosticCounts.get(1).longValue(), output);
+    assertTrue(burstStart < diagnosticLines.get(0) && diagnosticLines.get(0) < burstEnd, output);
+    assertTrue(retryStart < diagnosticLines.get(1) && diagnosticLines.get(1) < retryEnd, output);
+  }
+
+  private static void assertHelperAbsentSpans(List<String> lines, String output) {
+    assertDispatch(output, "H");
+    Map<String, SpanResult> spans = spans(lines, 1);
+    assertRemoteSpan(required(spans, "H"), TRACE_W3C_ONLY, PARENT_W3C_ONLY, true);
+  }
+
+  private static long helperAbsentLookup(List<String> lines, String phase, long missing) {
+    String line = only(lines, "LOOKUP\t" + phase + "\t");
+    String[] fields = line.split("\t", -1);
+    assertEquals(6, fields.length, line);
+    assertEquals("LOOKUP", fields[0], line);
+    assertEquals(phase, fields[1], line);
+    long deadlineDelta = Long.parseLong(fields[2]);
+    assertEquals(TimeUnit.SECONDS.toNanos(1L), Long.parseLong(fields[3]), line);
+    assertEquals(8, Integer.parseInt(fields[4]), line);
+    assertEquals(
+        "bridge_lookup_missing="
+            + missing
+            + ",bridge_lookup_version_mismatch=0,bridge_lookup_error=0",
+        fields[5],
+        line);
+    return deadlineDelta;
+  }
+
+  private static void assertHelperAbsentDeadline(List<String> lines) {
+    String line = only(lines, "DEADLINE\t");
+    String[] fields = line.split("\t", -1);
+    assertEquals(4, fields.length, line);
+    long fromBefore = Long.parseLong(fields[1]);
+    long fromAfter = Long.parseLong(fields[2]);
+    long interval = Long.parseLong(fields[3]);
+    assertEquals(TimeUnit.SECONDS.toNanos(1L), interval, line);
+    assertTrue(fromBefore >= interval, line);
+    assertTrue(fromAfter <= interval, line);
+    assertTrue(fromAfter > 0L, line);
   }
 
   private static void assertDefaultResult(List<String> lines, String output) {
@@ -597,6 +719,18 @@ class OfficialAgentJettyRuntimeTest {
       }
     }
     return count;
+  }
+
+  private static int exactLineIndex(List<String> lines, String value) {
+    int found = -1;
+    for (int index = 0; index < lines.size(); index++) {
+      if (value.equals(lines.get(index))) {
+        assertEquals(-1, found, lines.toString());
+        found = index;
+      }
+    }
+    assertTrue(found >= 0, lines.toString());
+    return found;
   }
 
   private static String only(List<String> lines, String prefix) {

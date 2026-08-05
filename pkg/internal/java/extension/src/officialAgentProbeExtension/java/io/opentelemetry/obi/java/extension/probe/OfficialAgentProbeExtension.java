@@ -23,6 +23,7 @@ import io.opentelemetry.sdk.trace.ReadableSpan;
 import io.opentelemetry.sdk.trace.SpanProcessor;
 import io.opentelemetry.sdk.trace.data.SpanData;
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
@@ -44,6 +45,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class OfficialAgentProbeExtension implements AutoConfigurationCustomizerProvider {
   private static final String OUTPUT_PROPERTY = "obi.test.official.agent.probe.output";
   private static final String FRAMEWORK_PROPERTY = "obi.test.official.agent.probe.framework";
+  private static final String INSTALL_PROVIDER_PROPERTY =
+      "obi.test.official.agent.probe.install-provider";
   private static final String REEXTRACT_ID_PROPERTY = "obi.test.official.agent.probe.reextract.id";
   private static final String FRAMEWORK_NETTY = "netty";
   private static final String RAW_OBI_PROPAGATOR =
@@ -59,6 +62,7 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
   private static final String PARENT_A = "2222222222222222";
   private static final String TRACE_B = "33333333333333333333333333333333";
   private static final String PARENT_B = "4444444444444444";
+  private static final String TRACE_W3C_ONLY = "12121212121212121212121212121212";
   private static final String TRACE_MATCHING = "34343434343434343434343434343434";
   private static final String PARENT_MATCHING = "5656565656565656";
   private static final String TRACE_CONFLICT = "77777777777777777777777777777777";
@@ -77,6 +81,7 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
   private static final ConcurrentHashMap<String, AtomicInteger> EXTRACTION_CALLS =
       new ConcurrentHashMap<>();
   private static final AtomicInteger OBI_WRAPS = new AtomicInteger();
+  private static final AtomicInteger HELPER_ABSENT_WRAPS = new AtomicInteger();
 
   @Override
   public int order() {
@@ -89,11 +94,20 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
     ProbeOutput output = new ProbeOutput(requiredProperty(OUTPUT_PROPERTY));
     output.append("EXTENSION\tready");
     boolean netty = FRAMEWORK_NETTY.equals(System.getProperty(FRAMEWORK_PROPERTY));
-    ProviderState provider = ProviderState.install(output, netty);
-    customizer.addPropagatorCustomizer(
-        (propagator, config) -> wrapObiPropagator(propagator, output, provider));
+    boolean installProvider =
+        !"false".equalsIgnoreCase(System.getProperty(INSTALL_PROVIDER_PROPERTY));
+    ProviderState provider = installProvider ? ProviderState.install(output, netty) : null;
+    if (provider == null) {
+      output.append("PROVIDER\tabsent");
+      customizer.addPropagatorCustomizer(
+          (propagator, config) -> wrapHelperAbsentObiPropagator(propagator, output));
+    } else {
+      customizer.addPropagatorCustomizer(
+          (propagator, config) -> wrapObiPropagator(propagator, output, provider));
+    }
     customizer.addTracerProviderCustomizer(
-        (builder, config) -> builder.addSpanProcessor(new CapturingSpanProcessor(output, netty)));
+        (builder, config) ->
+            builder.addSpanProcessor(new CapturingSpanProcessor(output, netty, !installProvider)));
   }
 
   private static TextMapPropagator wrapObiPropagator(
@@ -108,6 +122,162 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
     }
     return new RecordingObiPropagator(
         propagator, output, provider, System.getProperty(REEXTRACT_ID_PROPERTY));
+  }
+
+  private static TextMapPropagator wrapHelperAbsentObiPropagator(
+      TextMapPropagator propagator, ProbeOutput output) {
+    if (!RAW_OBI_PROPAGATOR.equals(propagator.getClass().getName())) {
+      return propagator;
+    }
+    int wraps = HELPER_ABSENT_WRAPS.incrementAndGet();
+    output.append("WRAP\thelper-absent\t" + wraps);
+    if (wraps != 1) {
+      output.append("ERROR\tmultiple-helper-absent-obi-propagators");
+    }
+    return new HelperAbsentObiPropagator(propagator, output);
+  }
+
+  private static final class HelperAbsentObiPropagator implements TextMapPropagator {
+    private static final String ID_HEADER = "x-obi-probe-id";
+    private static final String BRIDGE_ACCESS_CLASS =
+        "io.opentelemetry.obi.java.extension.BootstrapBridgeAccess";
+    private static final int CALLS_PER_PHASE = 8;
+    private static final long DEADLINE_MARGIN_NANOS = TimeUnit.MILLISECONDS.toNanos(500L);
+
+    private final TextMapPropagator delegate;
+    private final ProbeOutput output;
+    private final AtomicBoolean exercised = new AtomicBoolean();
+
+    private HelperAbsentObiPropagator(TextMapPropagator delegate, ProbeOutput output) {
+      this.delegate = delegate;
+      this.output = output;
+    }
+
+    @Override
+    public Collection<String> fields() {
+      return delegate.fields();
+    }
+
+    @Override
+    public <C> void inject(Context context, C carrier, TextMapSetter<C> setter) {
+      delegate.inject(context, carrier, setter);
+    }
+
+    @Override
+    public <C> Context extract(Context context, C carrier, TextMapGetter<C> getter) {
+      Context input = context == null ? Context.root() : context;
+      if (!"H".equals(getter.get(carrier, ID_HEADER)) || !exercised.compareAndSet(false, true)) {
+        return delegate.extract(input, carrier, getter);
+      }
+
+      try {
+        System.out.println("OBI_HELPER_ABSENT\tBURST_START");
+        long lookupBefore = System.nanoTime();
+        Context result = delegate.extract(input, carrier, getter);
+        long lookupAfter = System.nanoTime();
+        requireInputContext(input, result);
+        Object bridge = productionBridge();
+        long deadline = lookupDeadlineNanos(bridge);
+        recordDeadline(bridge, deadline, lookupBefore, lookupAfter);
+        result = extractBurst(input, carrier, getter, CALLS_PER_PHASE - 1);
+        recordLookup("BURST", bridge, deadline);
+        System.out.println("OBI_HELPER_ABSENT\tBURST_END");
+
+        waitUntil(deadline - DEADLINE_MARGIN_NANOS);
+        System.out.println("OBI_HELPER_ABSENT\tMID_START");
+        result = extractBurst(input, carrier, getter, CALLS_PER_PHASE);
+        recordLookup("MID", bridge, deadline);
+        System.out.println("OBI_HELPER_ABSENT\tMID_END");
+
+        waitUntil(deadline + DEADLINE_MARGIN_NANOS);
+        System.out.println("OBI_HELPER_ABSENT\tRETRY_START");
+        result = extractBurst(input, carrier, getter, CALLS_PER_PHASE);
+        recordLookup("RETRY", bridge, deadline);
+        System.out.println("OBI_HELPER_ABSENT\tRETRY_END");
+        return result;
+      } catch (InterruptedException interrupted) {
+        Thread.currentThread().interrupt();
+        output.append("ERROR\thelper-absent-exercise\tinterrupted");
+        return delegate.extract(input, carrier, getter);
+      } catch (Exception failure) {
+        output.append("ERROR\thelper-absent-exercise\t" + token(failure.getClass().getName()));
+        return delegate.extract(input, carrier, getter);
+      }
+    }
+
+    private <C> Context extractBurst(Context input, C carrier, TextMapGetter<C> getter, int calls) {
+      Context result = input;
+      for (int call = 0; call < calls; call++) {
+        result = delegate.extract(input, carrier, getter);
+        requireInputContext(input, result);
+      }
+      return result;
+    }
+
+    private static void requireInputContext(Context input, Context result) {
+      if (result != input) {
+        throw new IllegalStateException("helper-absent OBI propagator changed the input context");
+      }
+    }
+
+    private Object productionBridge() throws Exception {
+      Field field = delegate.getClass().getDeclaredField("bridge");
+      field.setAccessible(true);
+      Object bridge = field.get(delegate);
+      if (bridge == null || !BRIDGE_ACCESS_CLASS.equals(bridge.getClass().getName())) {
+        throw new IllegalStateException("raw OBI propagator does not use BootstrapBridgeAccess");
+      }
+      return bridge;
+    }
+
+    private static long lookupDeadlineNanos(Object bridge) throws Exception {
+      Field field = bridge.getClass().getDeclaredField("nextLookupNanos");
+      field.setAccessible(true);
+      return field.getLong(bridge);
+    }
+
+    private static long lookupRetryNanos(Object bridge) throws Exception {
+      Field field = bridge.getClass().getDeclaredField("LOOKUP_RETRY_NANOS");
+      field.setAccessible(true);
+      return field.getLong(null);
+    }
+
+    private void recordDeadline(
+        Object bridge, long deadlineNanos, long lookupBefore, long lookupAfter) throws Exception {
+      output.append(
+          "DEADLINE\t"
+              + (deadlineNanos - lookupBefore)
+              + "\t"
+              + (deadlineNanos - lookupAfter)
+              + "\t"
+              + lookupRetryNanos(bridge));
+    }
+
+    private void recordLookup(String phase, Object bridge, long deadlineNanos) throws Exception {
+      Method snapshot = bridge.getClass().getDeclaredMethod("localDiagnosticsSnapshot");
+      snapshot.setAccessible(true);
+      output.append(
+          "LOOKUP\t"
+              + phase
+              + "\t"
+              + (System.nanoTime() - deadlineNanos)
+              + "\t"
+              + lookupRetryNanos(bridge)
+              + "\t"
+              + CALLS_PER_PHASE
+              + "\t"
+              + snapshot.invoke(null));
+    }
+
+    private static void waitUntil(long deadlineNanos) throws InterruptedException {
+      while (true) {
+        long remaining = deadlineNanos - System.nanoTime();
+        if (remaining <= 0) {
+          return;
+        }
+        TimeUnit.NANOSECONDS.sleep(remaining);
+      }
+    }
   }
 
   private static String requiredProperty(String name) {
@@ -614,10 +784,13 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
 
     private final ProbeOutput output;
     private final boolean captureHttp;
+    private final boolean captureHelperAbsent;
 
-    private CapturingSpanProcessor(ProbeOutput output, boolean captureHttp) {
+    private CapturingSpanProcessor(
+        ProbeOutput output, boolean captureHttp, boolean captureHelperAbsent) {
       this.output = output;
       this.captureHttp = captureHttp;
+      this.captureHelperAbsent = captureHelperAbsent;
     }
 
     @Override
@@ -640,6 +813,11 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
       }
       SpanData span = readableSpan.toSpanData();
       String id = span.getAttributes().get(PROBE_ID);
+      if (id == null && captureHelperAbsent) {
+        if (TRACE_W3C_ONLY.equals(span.getTraceId())) {
+          id = "H";
+        }
+      }
       SpanContext parent = span.getParentSpanContext();
       String route = span.getAttributes().get(HTTP_ROUTE);
       boolean routePresent = span.getAttributes().asMap().containsKey(HTTP_ROUTE);

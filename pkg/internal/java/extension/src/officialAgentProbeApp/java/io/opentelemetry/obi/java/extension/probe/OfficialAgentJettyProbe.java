@@ -39,6 +39,7 @@ public final class OfficialAgentJettyProbe {
   private static final String OUTPUT_PROPERTY = "obi.test.official.agent.probe.output";
   private static final String MODE_PROPERTY = "obi.test.official.agent.probe.mode";
   private static final String MODE_DEFAULT = "default";
+  private static final String MODE_HELPER_ABSENT = "helper-absent";
   private static final String MODE_NESTED = "nested";
   private static final String MODE_STANDARD_FIRST = "standard-first";
 
@@ -61,7 +62,10 @@ public final class OfficialAgentJettyProbe {
     Path output = Paths.get(requiredProperty(OUTPUT_PROPERTY)).toAbsolutePath().normalize();
     String mode = requiredProperty(MODE_PROPERTY);
     require(
-        MODE_DEFAULT.equals(mode) || MODE_NESTED.equals(mode) || MODE_STANDARD_FIRST.equals(mode),
+        MODE_DEFAULT.equals(mode)
+            || MODE_HELPER_ABSENT.equals(mode)
+            || MODE_NESTED.equals(mode)
+            || MODE_STANDARD_FIRST.equals(mode),
         "unsupported probe mode " + mode);
 
     AtomicInteger dispatchThreadId = new AtomicInteger();
@@ -97,6 +101,10 @@ public final class OfficialAgentJettyProbe {
       if (MODE_DEFAULT.equals(mode)) {
         runDefaultMode(port);
         expectedSpans = 11;
+      } else if (MODE_HELPER_ABSENT.equals(mode)) {
+        requireBootstrapHelperAbsent();
+        runHelperAbsentMode(port);
+        expectedSpans = 1;
       } else if (MODE_NESTED.equals(mode)) {
         runNestedMode(port);
         expectedSpans = 1;
@@ -106,10 +114,12 @@ public final class OfficialAgentJettyProbe {
       }
 
       awaitServerSpans(output, expectedSpans, 10, TimeUnit.SECONDS);
-      Class<?> bridge =
-          Class.forName("io.opentelemetry.obi.java.bridge.RemoteParentBridge", true, null);
-      String diagnostics = (String) bridge.getMethod("diagnosticsSnapshot").invoke(null);
-      System.out.println("OBI_STOCK_PROBE mode=" + mode + " diagnostics=" + diagnostics);
+      if (!MODE_HELPER_ABSENT.equals(mode)) {
+        Class<?> bridge =
+            Class.forName("io.opentelemetry.obi.java.bridge.RemoteParentBridge", true, null);
+        String diagnostics = (String) bridge.getMethod("diagnosticsSnapshot").invoke(null);
+        System.out.println("OBI_STOCK_PROBE mode=" + mode + " diagnostics=" + diagnostics);
+      }
       System.out.println("OBI_STOCK_PROBE mode=" + mode + " passed");
     } finally {
       try {
@@ -196,6 +206,30 @@ public final class OfficialAgentJettyProbe {
                       traceparent(TRACE_D_W3C, PARENT_D_W3C, "00"),
                       true)),
           "request D failed standard-first discard");
+    }
+  }
+
+  private static void runHelperAbsentMode(int port) throws Exception {
+    try (Socket socket = connect(port)) {
+      require(
+          "H:ok"
+              .equals(
+                  send(
+                      socket.getOutputStream(),
+                      new BufferedInputStream(socket.getInputStream()),
+                      "H",
+                      traceparent(TRACE_W3C_ONLY, PARENT_W3C_ONLY, "01"),
+                      true)),
+          "helper-absent request H failed W3C extraction");
+    }
+  }
+
+  private static void requireBootstrapHelperAbsent() {
+    try {
+      Class.forName("io.opentelemetry.obi.java.bridge.RemoteParentBridge", false, null);
+      throw new IllegalStateException("OBI bootstrap helper unexpectedly present");
+    } catch (ClassNotFoundException expected) {
+      // The missing helper is the condition under test for this entire process.
     }
   }
 

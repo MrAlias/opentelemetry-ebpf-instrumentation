@@ -488,6 +488,7 @@ public final class ExecutorRuntimeProbe {
 
   private static void installEventRecorder() throws Exception {
     Class<?> threadInfo = Class.forName("io.opentelemetry.obi.java.ebpf.ThreadInfo", true, null);
+    require(threadInfo.getClassLoader() == null, "ThreadInfo was not loaded by bootstrap");
     Class<?> emitter =
         Class.forName("io.opentelemetry.obi.java.ebpf.ThreadInfo$TaskContextEmitter", true, null);
     Object recorder =

@@ -22,7 +22,7 @@ check-java-remote-parent: test_java_remote_parent test_incoming_trace_collision 
 	test_java_remote_parent_socket_cookie test_java_remote_parent_receive \
 	test_java_remote_parent_task_ancestry \
 	test_java_remote_parent_stats test_java_vt_identity test_java_vt_identity_disabled \
-	test_java_exit_cleanup bpf_ssl_connection_cleanup
+	test_java_exit_cleanup test_java_tls_thread_mapping bpf_ssl_connection_cleanup
 	./test_java_remote_parent "$(JAVA_REMOTE_PARENT_VECTORS)"
 	./test_incoming_trace_collision
 	./test_java_remote_parent_generation_collision
@@ -36,6 +36,7 @@ check-java-remote-parent: test_java_remote_parent test_incoming_trace_collision 
 	./test_java_vt_identity
 	./test_java_vt_identity_disabled
 	./test_java_exit_cleanup
+	./test_java_tls_thread_mapping
 	./bpf_ssl_connection_cleanup
 
 .PHONY: clean

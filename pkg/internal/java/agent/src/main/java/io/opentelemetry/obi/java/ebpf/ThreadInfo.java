@@ -32,6 +32,7 @@ public class ThreadInfo {
       remoteParentLookupLifecycle = new ThreadLocal<>();
   private static final ThreadLocal<Integer> remoteParentReceiveDepth = new ThreadLocal<>();
   private static final ThreadLocal<Long> remoteParentReceiveEpoch = new ThreadLocal<>();
+  private static final Object taskAncestryPublicationLock = new Object();
   private static final AtomicLong nextTaskToken = new AtomicLong(initialTaskToken());
   private static volatile LongSupplier processIncarnationSource = ThreadInfo::newProcessIncarnation;
   private static volatile long processIncarnation = initialProcessIncarnation();
@@ -46,13 +47,30 @@ public class ThreadInfo {
 
   public static void sendParentThreadContext(long parentId) {
     TaskContextEmitter testEmitter = taskContextEmitterForTest;
+    NativeMemory packet = null;
+    if (testEmitter == null) {
+      packet = new NativeMemory(IOCTLPacket.packetPrefixSize);
+      IOCTLPacket.writePacket(packet, 0, OperationType.THREAD, parentId);
+    }
+
+    // The BPF side uses a process-scoped claim to make uncooperative or stale
+    // callers fail closed. Queue every current-agent publisher here so ordinary
+    // executor fan-out waits for the preceding synchronous ioctl instead of
+    // losing propagation to that defensive claim. This cannot be gated on the
+    // Java negotiation state: it may be false while the BPF bridge remains
+    // enabled, including during startup, failed negotiation, or reconfiguration.
+    synchronized (taskAncestryPublicationLock) {
+      emitParentThreadContext(testEmitter, packet, parentId);
+    }
+  }
+
+  private static void emitParentThreadContext(
+      TaskContextEmitter testEmitter, NativeMemory packet, long parentId) {
     if (testEmitter != null) {
       testEmitter.emit(OperationType.THREAD, parentId, 0L);
       return;
     }
-    NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize);
-    IOCTLPacket.writePacket(p, 0, OperationType.THREAD, parentId);
-    BootstrapNative.ioctl(0, BootstrapNative.IOCTL_CMD, p.getAddress());
+    BootstrapNative.ioctl(0, BootstrapNative.IOCTL_CMD, packet.getAddress());
   }
 
   public static TaskContext captureTaskContext(long parentThreadId) {
@@ -153,17 +171,6 @@ public class ThreadInfo {
       rejectTaskEntry(handoffToken);
       return false;
     }
-    if (!remoteParentEnabled && state == null) {
-      try {
-        cancelTaskHandoff(handoffToken);
-        sendParentThreadContext(parentId);
-      } finally {
-        remoteParentSocketContext.remove();
-        blockRemoteParentLookup();
-      }
-      return false;
-    }
-
     if (state != null && state.hasParent(parentId) && handoffToken == 0L) {
       failClosedTaskEntry(handoffToken, 0L);
       return false;
@@ -191,9 +198,6 @@ public class ThreadInfo {
             previousLookupLifecycle);
     if (target == NO_TASK_RELAY_CHANGE) {
       failClosedTaskEntry(handoffToken, restoreToken);
-      if (state.isEmpty()) {
-        taskRelayState.remove();
-      }
       return false;
     }
 
@@ -210,20 +214,18 @@ public class ThreadInfo {
     } catch (Throwable failure) {
       remoteParentSocketContext.remove();
       state.exit();
+      state.clearExitReferences();
       blockRemoteParentLookup();
       bestEffortUnlinkTask(failure);
       cancelTaskHandoff(handoffToken);
       cancelTaskHandoff(restoreToken);
-      if (state.isEmpty()) {
-        taskRelayState.remove();
-      }
       throw failure;
     }
   }
 
   public static void restoreTaskParentThreadContext() {
     TaskRelayState state = taskRelayState.get();
-    if (state == null) {
+    if (state == null || state.isEmpty()) {
       return;
     }
 
@@ -235,9 +237,7 @@ public class ThreadInfo {
     byte previousLookupOverride = state.exitLookupOverride();
     long previousReceiveEpoch = state.exitReceiveEpoch();
     RemoteParentSocketContext.Lifecycle previousLookupLifecycle = state.exitLookupLifecycle();
-    if (state.isEmpty()) {
-      taskRelayState.remove();
-    }
+    state.clearExitReferences();
     boolean restoreSucceeded = false;
     try {
       if (target != NO_TASK_RELAY_CHANGE) {
@@ -428,7 +428,12 @@ public class ThreadInfo {
     if (incarnation == 0L) {
       return false;
     }
-    emitVirtualThreadOp(OperationType.PROCESS_REGISTER, incarnation);
+    // Registration rotates the process-wide ancestry epoch in BPF. Serialize
+    // it with every THREAD publication so the old epoch either commits fully
+    // before rotation or observes an explicit miss.
+    synchronized (taskAncestryPublicationLock) {
+      emitVirtualThreadOp(OperationType.PROCESS_REGISTER, incarnation);
+    }
     return true;
   }
 
@@ -453,7 +458,12 @@ public class ThreadInfo {
   }
 
   static boolean hasTaskRelayState() {
-    return taskRelayState.get() != null;
+    TaskRelayState state = taskRelayState.get();
+    return state != null && !state.isEmpty();
+  }
+
+  static TaskRelayState taskRelayStateForTest() {
+    return taskRelayState.get();
   }
 
   static void setTaskContextEmitterForTest(TaskContextEmitter emitter) {
@@ -815,6 +825,11 @@ public class ThreadInfo {
 
     RemoteParentSocketContext exitSocketContext() {
       return exitSocketContext;
+    }
+
+    void clearExitReferences() {
+      exitLookupLifecycle = null;
+      exitSocketContext = null;
     }
   }
 

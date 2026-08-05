@@ -27,6 +27,7 @@ var disabledBridgeMapNames = [...]string{
 	"java_remote_parent_state",
 	"java_remote_parent_tasks",
 	"java_remote_parent_terminal",
+	"java_thread_mapping_claims",
 	"sk_ssl_prewrite_map",
 	"ssl_prewrite_connection_ambiguity",
 	"ssl_prewrite_connection_claims",

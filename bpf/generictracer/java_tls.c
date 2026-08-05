@@ -31,6 +31,7 @@
 #include <shared/obi_ctx.h>
 
 #include <generictracer/java_remote_parent_receive.h>
+#include <generictracer/java_thread_mapping.h>
 
 enum { k_ioctl_magic_id = 0x0b10b1 };
 enum {
@@ -240,19 +241,13 @@ static __noinline int handle_java_lifecycle_ioctl(unsigned char *uarg,
             return 0;
         }
 
-        const pid_key_t process = java_process_key(task);
+        pid_key_t process = java_process_key(task);
         if (process_capability != incarnation ||
             java_process_capability_for(&process) != incarnation) {
             return 0;
         }
-        const u64 *previous = bpf_map_lookup_elem(&java_process_incarnations, &process);
-        if (java_remote_parent_enabled && previous && *previous != incarnation) {
-            java_remote_parent_cleanup(task);
-            java_remote_parent_cleanup(&process);
-            java_remote_parent_unlink_task(task);
-            bpf_map_delete_elem(&java_tasks, task);
-        }
-        java_register_process_incarnation(incarnation);
+        java_thread_mapping_register_process(
+            task, &process, bpf_get_current_pid_tgid(), incarnation, java_remote_parent_enabled);
         return 0;
     }
     case k_ioctl_java_vt_mount: {
@@ -538,81 +533,28 @@ static __noinline int handle_java_control_ioctl(unsigned char *uarg,
         return 0;
     }
     case k_ioctl_java_threads:
+        return handle_java_thread_mapping_ioctl(
+            uarg, id, task, &execution, process_capability, java_remote_parent_enabled);
     case k_ioctl_java_task_link: {
         u64 parent_id = 0;
         if (bpf_probe_read_user(&parent_id, sizeof(parent_id), uarg + 1) != 0) {
             return 0;
         }
         u64 token = 0;
-        if (op_cmd == k_ioctl_java_task_link &&
-            bpf_probe_read_user(&token, sizeof(token), uarg + 1 + sizeof(parent_id)) != 0) {
+        if (bpf_probe_read_user(&token, sizeof(token), uarg + 1 + sizeof(parent_id)) != 0) {
             return 0;
         }
 
-        const pid_key_t child = *task;
         const pid_key_t logical_child = execution;
-        pid_key_t parent = child;
-        const u32 parent_tid = tid_from_pid_tgid(parent_id);
-        parent.tid = parent_tid;
-
-        if (java_remote_parent_enabled && op_cmd == k_ioctl_java_task_link) {
+        if (java_remote_parent_enabled) {
+            const pid_key_t child = *task;
             bpf_map_delete_elem(&java_tasks, &child);
             obi_ctx__del(id);
             java_remote_parent_link_handoff_for_capability(
                 &logical_child, token, process_capability);
             return 0;
         }
-
-        if (parent.tid == child.tid) {
-            if (java_remote_parent_enabled) {
-                if (op_cmd == k_ioctl_java_threads) {
-                    java_remote_parent_fail_handoff(&logical_child);
-                }
-                bpf_map_delete_elem(&java_tasks, &child);
-                obi_ctx__del(id);
-            }
-            bpf_dbg_printk("self-referencing Java thread mapping ignored");
-            return 0;
-        }
-
-        if (java_remote_parent_enabled && op_cmd == k_ioctl_java_threads &&
-            java_remote_parent_task_mapping_would_cycle(&child, &parent)) {
-            java_remote_parent_mark_ambiguous(&child);
-            java_remote_parent_mark_ambiguous(&parent);
-            java_remote_parent_cancel_handoff_for_capability(
-                &logical_child, token, process_capability);
-            java_remote_parent_unlink_task(&logical_child);
-            bpf_dbg_printk("cyclic Java thread mapping ignored");
-            return 0;
-        }
-
-        if (java_remote_parent_enabled && op_cmd == k_ioctl_java_threads) {
-            const pid_key_t *previous_parent = bpf_map_lookup_elem(&java_tasks, &child);
-            if (previous_parent && !java_remote_parent_pid_key_equal(previous_parent, &parent)) {
-                java_remote_parent_guard_owner_reuse(&child);
-            }
-        }
-
-        bpf_dbg_printk("Java thread mapping recorded");
-        bpf_map_update_elem(&java_tasks, &child, &parent, BPF_ANY);
-        if (java_remote_parent_enabled) {
-            if (op_cmd == k_ioctl_java_threads) {
-                java_remote_parent_fail_handoff(&logical_child);
-            }
-        }
-
-        // Walk the java_tasks chain to find the parent's server trace and
-        // refresh traces_ctx_v1 for this child thread.
-        trace_key_t t_key = {.p_key = parent, .extra_id = extra_runtime_id_with_task_id(parent_id)};
-        tp_info_pid_t *server_tp = find_parent_java_trace(&t_key);
-
-        if (server_tp && server_tp->valid) {
-            obi_ctx__set(id, &server_tp->tp);
-        } else {
-            obi_ctx__del(id);
-        }
-
-        return 0;
+        return handle_java_thread_mapping(parent_id, id, task, &execution, process_capability, 0);
     }
     default:
         bpf_dbg_printk("unknown cmd=%d", op_cmd);

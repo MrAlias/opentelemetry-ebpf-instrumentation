@@ -45,7 +45,9 @@ struct {
 // state so PID, TID, and low-31-bit virtual-thread reuse cannot select an
 // earlier JVM's data.
 struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    // Incarnation changes are serialized with ancestry publication. This map
+    // must not evict a live process behind that protocol.
+    __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, pid_key_t); // process key: tid == pid
     __type(value, u64);
     __uint(max_entries, MAX_CONCURRENT_REQUESTS);

@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -74,6 +75,246 @@ class ThreadInfoTest {
 
     ThreadInfo.setProcessIncarnation(22L);
     assertEquals(22L, ThreadInfo.processIncarnation());
+  }
+
+  @Test
+  void remoteParentThreadContextEmissionsAreSerialized() throws Exception {
+    ThreadInfo.setRemoteParentEnabled(true);
+    CountDownLatch firstEntered = new CountDownLatch(1);
+    CountDownLatch releaseFirst = new CountDownLatch(1);
+    AtomicInteger active = new AtomicInteger();
+    AtomicInteger maxActive = new AtomicInteger();
+    AtomicInteger failures = new AtomicInteger();
+    List<Long> emitted = Collections.synchronizedList(new ArrayList<>());
+    ThreadInfo.setTaskContextEmitterForTest(
+        (operation, value, token) -> {
+          int concurrent = active.incrementAndGet();
+          maxActive.accumulateAndGet(concurrent, Math::max);
+          try {
+            assertEquals(OperationType.THREAD, operation);
+            emitted.add(value);
+            if (value == 101L) {
+              firstEntered.countDown();
+              if (!releaseFirst.await(5, TimeUnit.SECONDS)) {
+                throw new AssertionError("timed out waiting to release first emitter");
+              }
+            }
+          } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(interrupted);
+          } finally {
+            active.decrementAndGet();
+          }
+        });
+
+    Thread first =
+        new Thread(
+            () -> {
+              try {
+                ThreadInfo.sendParentThreadContext(101L);
+              } catch (Throwable failure) {
+                failures.incrementAndGet();
+              }
+            });
+    Thread second =
+        new Thread(
+            () -> {
+              try {
+                ThreadInfo.sendParentThreadContext(202L);
+              } catch (Throwable failure) {
+                failures.incrementAndGet();
+              }
+            });
+
+    try {
+      first.start();
+      assertTrue(firstEntered.await(5, TimeUnit.SECONDS));
+      second.start();
+      long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+      while (second.getState() != Thread.State.BLOCKED && System.nanoTime() < deadline) {
+        Thread.sleep(1L);
+      }
+      assertEquals(Thread.State.BLOCKED, second.getState());
+      assertEquals(1, emitted.size());
+      assertEquals(1, maxActive.get());
+    } finally {
+      releaseFirst.countDown();
+      first.join(TimeUnit.SECONDS.toMillis(5));
+      second.join(TimeUnit.SECONDS.toMillis(5));
+    }
+
+    assertFalse(first.isAlive());
+    assertFalse(second.isAlive());
+    assertEquals(0, failures.get());
+    assertEquals(java.util.Arrays.asList(101L, 202L), emitted);
+    assertEquals(1, maxActive.get());
+  }
+
+  @Test
+  void threadContextEmissionsRemainSerializedAcrossRemoteParentActivation() throws Exception {
+    ThreadInfo.setRemoteParentEnabled(false);
+    CountDownLatch firstEntered = new CountDownLatch(1);
+    CountDownLatch releaseFirst = new CountDownLatch(1);
+    AtomicInteger active = new AtomicInteger();
+    AtomicInteger maxActive = new AtomicInteger();
+    AtomicInteger failures = new AtomicInteger();
+    List<Long> emitted = Collections.synchronizedList(new ArrayList<>());
+    ThreadInfo.setTaskContextEmitterForTest(
+        (operation, value, token) -> {
+          int concurrent = active.incrementAndGet();
+          maxActive.accumulateAndGet(concurrent, Math::max);
+          try {
+            assertEquals(OperationType.THREAD, operation);
+            emitted.add(value);
+            if (value == 303L) {
+              firstEntered.countDown();
+              if (!releaseFirst.await(5, TimeUnit.SECONDS)) {
+                throw new AssertionError("timed out waiting to release first emitter");
+              }
+            }
+          } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(interrupted);
+          } finally {
+            active.decrementAndGet();
+          }
+        });
+
+    Thread first =
+        new Thread(
+            () -> {
+              try {
+                ThreadInfo.sendParentThreadContext(303L);
+              } catch (Throwable failure) {
+                failures.incrementAndGet();
+              }
+            });
+    Thread second =
+        new Thread(
+            () -> {
+              try {
+                ThreadInfo.sendParentThreadContext(404L);
+              } catch (Throwable failure) {
+                failures.incrementAndGet();
+              }
+            });
+
+    try {
+      first.start();
+      assertTrue(firstEntered.await(5, TimeUnit.SECONDS));
+      ThreadInfo.setRemoteParentEnabled(true);
+      second.start();
+      long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+      while (second.getState() != Thread.State.BLOCKED && System.nanoTime() < deadline) {
+        Thread.sleep(1L);
+      }
+      assertEquals(Thread.State.BLOCKED, second.getState());
+      assertEquals(1, emitted.size());
+      assertEquals(1, maxActive.get());
+    } finally {
+      releaseFirst.countDown();
+      first.join(TimeUnit.SECONDS.toMillis(5));
+      second.join(TimeUnit.SECONDS.toMillis(5));
+    }
+
+    assertFalse(first.isAlive());
+    assertFalse(second.isAlive());
+    assertEquals(0, failures.get());
+    assertEquals(java.util.Arrays.asList(303L, 404L), emitted);
+    assertEquals(1, maxActive.get());
+  }
+
+  @Test
+  void processRegistrationWaitsForThreadContextPublication() throws Exception {
+    ThreadInfo.setProcessIncarnation(505L);
+    CountDownLatch threadEntered = new CountDownLatch(1);
+    CountDownLatch releaseThread = new CountDownLatch(1);
+    AtomicInteger failures = new AtomicInteger();
+    List<OperationType> emitted = Collections.synchronizedList(new ArrayList<>());
+    ThreadInfo.setTaskContextEmitterForTest(
+        (operation, value, token) -> {
+          emitted.add(operation);
+          if (operation == OperationType.THREAD) {
+            threadEntered.countDown();
+            try {
+              if (!releaseThread.await(5, TimeUnit.SECONDS)) {
+                throw new AssertionError("timed out waiting to release thread publication");
+              }
+            } catch (InterruptedException interrupted) {
+              Thread.currentThread().interrupt();
+              throw new AssertionError(interrupted);
+            }
+          }
+        });
+
+    Thread publisher =
+        new Thread(
+            () -> {
+              try {
+                ThreadInfo.sendParentThreadContext(606L);
+              } catch (Throwable failure) {
+                failures.incrementAndGet();
+              }
+            });
+    Thread registrar =
+        new Thread(
+            () -> {
+              try {
+                ThreadInfo.registerProcessIncarnation();
+              } catch (Throwable failure) {
+                failures.incrementAndGet();
+              }
+            });
+
+    try {
+      publisher.start();
+      assertTrue(threadEntered.await(5, TimeUnit.SECONDS));
+      registrar.start();
+      long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+      while (registrar.getState() != Thread.State.BLOCKED && System.nanoTime() < deadline) {
+        Thread.sleep(1L);
+      }
+      assertEquals(Thread.State.BLOCKED, registrar.getState());
+      assertEquals(java.util.Arrays.asList(OperationType.THREAD), emitted);
+    } finally {
+      releaseThread.countDown();
+      publisher.join(TimeUnit.SECONDS.toMillis(5));
+      registrar.join(TimeUnit.SECONDS.toMillis(5));
+    }
+
+    assertFalse(publisher.isAlive());
+    assertFalse(registrar.isAlive());
+    assertEquals(0, failures.get());
+    assertEquals(
+        java.util.Arrays.asList(OperationType.THREAD, OperationType.PROCESS_REGISTER), emitted);
+  }
+
+  @Test
+  void remoteParentThreadContextEmissionLockIsReentrantAndReleasedAfterFailure() {
+    ThreadInfo.setRemoteParentEnabled(true);
+    List<Long> emitted = new ArrayList<>();
+    ThreadInfo.setTaskContextEmitterForTest(
+        (operation, value, token) -> {
+          emitted.add(value);
+          if (value == 101L) {
+            ThreadInfo.sendParentThreadContext(202L);
+          }
+        });
+
+    ThreadInfo.sendParentThreadContext(101L);
+    assertEquals(java.util.Arrays.asList(101L, 202L), emitted);
+
+    ThreadInfo.setTaskContextEmitterForTest(
+        (operation, value, token) -> {
+          throw new IllegalStateException("synthetic emission failure");
+        });
+    assertThrows(IllegalStateException.class, () -> ThreadInfo.sendParentThreadContext(303L));
+
+    AtomicInteger recovered = new AtomicInteger();
+    ThreadInfo.setTaskContextEmitterForTest(
+        (operation, value, token) -> recovered.incrementAndGet());
+    ThreadInfo.sendParentThreadContext(404L);
+    assertEquals(1, recovered.get());
   }
 
   @Test
@@ -424,6 +665,60 @@ class ThreadInfoTest {
     assertFalse(ThreadInfo.hasTaskRelayState());
     ThreadInfo.restoreTaskParentThreadContext();
     assertFalse(ThreadInfo.hasTaskRelayState());
+  }
+
+  @Test
+  void javaDisabledTaskScopeStillRestoresTheWorkerParent() {
+    ThreadInfo.setRemoteParentEnabled(false);
+    List<EmittedOp> emitted = new ArrayList<>();
+    ThreadInfo.setTaskContextEmitterForTest(
+        (operation, value, token) -> emitted.add(new EmittedOp(operation, value, token)));
+
+    assertTrue(ThreadInfo.enterTaskParentThreadContext(900L, 101L));
+    assertTrue(ThreadInfo.hasTaskRelayState());
+    ThreadInfo.restoreTaskParentThreadContext();
+
+    assertFalse(ThreadInfo.hasTaskRelayState());
+    assertEquals(2, emitted.size());
+    assertEquals(OperationType.THREAD, emitted.get(0).operation);
+    assertEquals(101L, emitted.get(0).value);
+    assertEquals(OperationType.THREAD, emitted.get(1).operation);
+    assertEquals(900L, emitted.get(1).value);
+  }
+
+  @Test
+  void balancedTaskScopesReuseThePerWorkerRelayState() {
+    ThreadInfo.setRemoteParentEnabled(false);
+    ThreadInfo.setTaskContextEmitterForTest((operation, value, token) -> {});
+
+    assertTrue(ThreadInfo.enterTaskParentThreadContext(900L, 101L));
+    ThreadInfo.TaskRelayState state = ThreadInfo.taskRelayStateForTest();
+    ThreadInfo.restoreTaskParentThreadContext();
+    assertFalse(ThreadInfo.hasTaskRelayState());
+
+    assertTrue(ThreadInfo.enterTaskParentThreadContext(900L, 202L));
+    assertSame(state, ThreadInfo.taskRelayStateForTest());
+    ThreadInfo.restoreTaskParentThreadContext();
+    assertFalse(ThreadInfo.hasTaskRelayState());
+  }
+
+  @Test
+  void duplicateRestoreCannotReuseCachedLookupMetadata() {
+    List<EmittedOp> emitted = new ArrayList<>();
+    ThreadInfo.setTaskContextEmitterForTest(
+        (operation, value, token) -> emitted.add(new EmittedOp(operation, value, token)));
+    ThreadInfo.markRemoteParentDirectLookup();
+
+    assertTrue(ThreadInfo.enterTaskParentThreadContext(900L, 101L));
+    ThreadInfo.restoreTaskParentThreadContext();
+    assertEquals(ThreadInfo.REMOTE_PARENT_LOOKUP_DIRECT, ThreadInfo.remoteParentLookupSource());
+    assertEquals(2, emitted.size());
+
+    ThreadInfo.blockRemoteParentLookup();
+    ThreadInfo.restoreTaskParentThreadContext();
+
+    assertEquals(ThreadInfo.REMOTE_PARENT_LOOKUP_BLOCKED, ThreadInfo.remoteParentLookupSource());
+    assertEquals(2, emitted.size());
   }
 
   @Test

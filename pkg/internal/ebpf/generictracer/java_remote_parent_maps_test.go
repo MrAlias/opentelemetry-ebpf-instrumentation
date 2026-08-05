@@ -320,3 +320,23 @@ func TestDisabledBridgeKeepsPerProcessAuthorizationCapacity(t *testing.T) {
 	require.Equal(t, uint32(1), spec.Maps["java_remote_parent_data_signals"].MaxEntries)
 	require.Equal(t, uint32(1), spec.Maps["java_remote_parent_data_acks"].MaxEntries)
 }
+
+func TestJavaThreadMappingMapsSpec(t *testing.T) {
+	spec, err := generictracer.LoadBpf()
+	require.NoError(t, err)
+
+	incarnations := spec.Maps["java_process_incarnations"]
+	require.NotNil(t, incarnations)
+	require.Equal(t, ebpf.Hash, incarnations.Type)
+
+	claims := spec.Maps["java_thread_mapping_claims"]
+	require.NotNil(t, claims)
+	require.Equal(t, ebpf.Hash, claims.Type)
+	require.Equal(t, uint32(12), claims.KeySize)
+	require.Equal(t, uint32(24), claims.ValueSize)
+	require.Greater(t, claims.MaxEntries, uint32(1))
+	require.Equal(t, ebpfconvenience.PinInternal, claims.Pinning)
+
+	javabridge.MinimizeDisabledMaps(spec)
+	require.Equal(t, uint32(1), claims.MaxEntries)
+}

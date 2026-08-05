@@ -215,11 +215,11 @@ func (p *Tracer) authorizeJavaProcess(pid app.PID, ns uint32, fi *exec.FileInfo)
 		return
 	}
 
-	// Rotating an authorization invalidates any incarnation registered by an
-	// earlier OBI instance before the replacement agent configuration arrives.
-	if p.bpfObjects.JavaProcessIncarnations != nil {
-		_ = p.bpfObjects.JavaProcessIncarnations.Delete(&identity)
-	}
+	// Do not delete the registered incarnation while rotating authorization.
+	// The new capability already fences subsequent ioctls, while an in-flight
+	// ioctl that captured the old capability must be allowed to finish its
+	// claimed ancestry transaction. PROCESS_REGISTER performs the serialized
+	// incarnation transition when the replacement configuration arrives.
 	p.javaAuthKeys[authorizationKey] = append(
 		history,
 		javaAuthorization{identity: identity, capability: capability},

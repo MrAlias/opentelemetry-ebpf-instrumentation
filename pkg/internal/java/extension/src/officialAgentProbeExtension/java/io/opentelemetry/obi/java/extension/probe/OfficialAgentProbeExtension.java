@@ -105,7 +105,7 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
           (propagator, config) -> wrapHelperAbsentObiPropagator(propagator, output));
     } else {
       customizer.addPropagatorCustomizer(
-          (propagator, config) -> wrapObiPropagator(propagator, output, provider));
+          (propagator, config) -> wrapObiPropagator(propagator, output, provider, netty));
     }
     customizer.addTracerProviderCustomizer(
         (builder, config) ->
@@ -113,7 +113,7 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
   }
 
   private static TextMapPropagator wrapObiPropagator(
-      TextMapPropagator propagator, ProbeOutput output, ProviderState provider) {
+      TextMapPropagator propagator, ProbeOutput output, ProviderState provider, boolean netty) {
     if (!RAW_OBI_PROPAGATOR.equals(propagator.getClass().getName())) {
       return propagator;
     }
@@ -123,7 +123,7 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
       output.append("ERROR\tmultiple-obi-propagators");
     }
     return new RecordingObiPropagator(
-        propagator, output, provider, System.getProperty(REEXTRACT_ID_PROPERTY));
+        propagator, output, provider, System.getProperty(REEXTRACT_ID_PROPERTY), netty);
   }
 
   private static TextMapPropagator wrapHelperAbsentObiPropagator(
@@ -297,6 +297,7 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
     private final ProbeOutput output;
     private final ProviderState provider;
     private final String reextractId;
+    private final boolean netty;
     private final AtomicBoolean reextractionStarted = new AtomicBoolean();
     private final ThreadLocal<Boolean> reextracting = new ThreadLocal<>();
 
@@ -304,11 +305,13 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
         TextMapPropagator delegate,
         ProbeOutput output,
         ProviderState provider,
-        String reextractId) {
+        String reextractId,
+        boolean netty) {
       this.delegate = delegate;
       this.output = output;
       this.provider = provider;
       this.reextractId = reextractId;
+      this.netty = netty;
     }
 
     @Override
@@ -334,6 +337,9 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
       output.append("CALL\t" + id + "\t" + invocation);
       if ("T".equals(id)) {
         output.append("THREAD\tEXTRACT\tT\t" + Thread.currentThread().getId());
+      } else if ("B".equals(id) && !netty) {
+        output.append(
+            "TIMING\tEXTRACT\tB\t" + Thread.currentThread().getId() + "\t" + System.nanoTime());
       }
       boolean reentry = Boolean.TRUE.equals(reextracting.get());
       if (reentry) {
@@ -808,6 +814,12 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
         span.setAttribute(PROBE_ID, id);
         if ("T".equals(id)) {
           output.append("THREAD\tSPAN_START\tT\t" + Thread.currentThread().getId());
+        } else if ("B".equals(id) && !captureHttp) {
+          output.append(
+              "TIMING\tSPAN_START\tB\t"
+                  + Thread.currentThread().getId()
+                  + "\t"
+                  + System.nanoTime());
         }
       }
     }

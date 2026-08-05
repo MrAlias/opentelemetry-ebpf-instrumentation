@@ -415,6 +415,8 @@ class OfficialAgentJettyRuntimeTest {
 
     assertRegisteredReextraction(lines, invocations.get("A"));
     assertAllPasses(lines, "B", invocations.get("B"), TRACE_B, PARENT_B, true, false);
+    assertEquals(1, invocations.get("B"), lines.toString());
+    assertAsyncSpanStartTiming(lines, output, "B");
     assertAllPasses(lines, "C", invocations.get("C"), INVALID_TRACE, INVALID_SPAN, false, false);
     assertAllPasses(lines, "H", invocations.get("H"), INVALID_TRACE, INVALID_SPAN, false, false);
     assertAllPasses(lines, "M", invocations.get("M"), TRACE_MATCHING, PARENT_MATCHING, true, true);
@@ -631,6 +633,37 @@ class OfficialAgentJettyRuntimeTest {
     assertNotEquals(requestThread, executorThread, output);
   }
 
+  private static void assertAsyncSpanStartTiming(
+      List<String> resultLines, String output, String id) {
+    String extraction = only(resultLines, "TIMING\tEXTRACT\t" + id + "\t");
+    String spanStart = only(resultLines, "TIMING\tSPAN_START\t" + id + "\t");
+    assertTrue(
+        resultLines.indexOf(extraction) < resultLines.indexOf(spanStart), resultLines.toString());
+
+    List<String> outputLines = lines(output);
+    TimingResult extractionTiming = timing(resultLines, "TIMING", "EXTRACT", id);
+    TimingResult spanStartTiming = timing(resultLines, "TIMING", "SPAN_START", id);
+    TimingResult requestTiming = timing(outputLines, "OBI_TIMING", "REQUEST", id);
+    TimingResult executorTiming = timing(outputLines, "OBI_TIMING", "EXECUTOR", id);
+    TimingResult asyncTiming = timing(outputLines, "OBI_TIMING", "ASYNC", id);
+    long requestThread = dispatchThread(outputLines, "REQUEST", id);
+    long executorThread = dispatchThread(outputLines, "EXECUTOR", id);
+    long asyncThread = dispatchThread(outputLines, "ASYNC", id);
+    assertEquals(3, prefix(outputLines, "OBI_TIMING\t").size(), output);
+    assertTrue(
+        spanStartTiming.observedNanos - extractionTiming.observedNanos > 0L,
+        resultLines.toString());
+    assertTrue(requestTiming.observedNanos - spanStartTiming.observedNanos > 0L, output);
+    assertTrue(executorTiming.observedNanos - requestTiming.observedNanos > 0L, output);
+    assertTrue(asyncTiming.observedNanos - executorTiming.observedNanos > 0L, output);
+    assertEquals(extractionTiming.threadId, spanStartTiming.threadId, resultLines.toString());
+    assertEquals(extractionTiming.threadId, requestTiming.threadId, output);
+    assertEquals(requestTiming.threadId, requestThread, output);
+    assertEquals(executorTiming.threadId, executorThread, output);
+    assertEquals(asyncTiming.threadId, asyncThread, output);
+    assertNotEquals(extractionTiming.threadId, executorTiming.threadId, output);
+  }
+
   private static long dispatchThread(List<String> lines, String phase, String id) {
     String line = only(lines, "OBI_DISPATCH\t" + phase + "\t" + id + "\t");
     String[] fields = line.split("\\t", -1);
@@ -653,6 +686,19 @@ class OfficialAgentJettyRuntimeTest {
     long thread = Long.parseLong(fields[3]);
     assertTrue(thread > 0, line);
     return thread;
+  }
+
+  private static TimingResult timing(List<String> lines, String record, String phase, String id) {
+    String line = only(lines, record + "\t" + phase + "\t" + id + "\t");
+    String[] fields = line.split("\\t", -1);
+    assertEquals(5, fields.length, line);
+    assertEquals(record, fields[0], line);
+    assertEquals(phase, fields[1], line);
+    assertEquals(id, fields[2], line);
+    long threadId = Long.parseLong(fields[3]);
+    long observedNanos = Long.parseLong(fields[4]);
+    assertTrue(threadId > 0, line);
+    return new TimingResult(threadId, observedNanos);
   }
 
   private static int invocationCount(List<String> lines, String id) {
@@ -936,6 +982,16 @@ class OfficialAgentJettyRuntimeTest {
   private static boolean parseBoolean(String value, String line) {
     assertTrue(value.equals("true") || value.equals("false"), line);
     return value.equals("true");
+  }
+
+  private static final class TimingResult {
+    private final long threadId;
+    private final long observedNanos;
+
+    private TimingResult(long threadId, long observedNanos) {
+      this.threadId = threadId;
+      this.observedNanos = observedNanos;
+    }
   }
 
   private static final class PassResult {

@@ -448,23 +448,21 @@ public final class OfficialAgentJettyProbe {
           "invalid probe id");
 
       if (request.getDispatcherType() == DispatcherType.REQUEST) {
-        System.out.println("OBI_DISPATCH\tREQUEST\t" + id + "\t" + Thread.currentThread().getId());
+        recordDispatch("REQUEST", id);
         if (blockingMode) {
           require("T".equals(id), "unexpected blocking probe id");
           require(!request.isAsyncSupported(), "blocking request unexpectedly supports async");
           require(!request.isAsyncStarted(), "blocking request unexpectedly started async");
           writeResponse(id, response);
           require(!request.isAsyncStarted(), "blocking response unexpectedly started async");
-          System.out.println(
-              "OBI_DISPATCH\tBLOCKING\t" + id + "\t" + Thread.currentThread().getId());
+          recordDispatch("BLOCKING", id);
           return;
         }
         AsyncContext async = request.startAsync();
         async.setTimeout(5_000L);
         dispatchExecutor.execute(
             () -> {
-              System.out.println(
-                  "OBI_DISPATCH\tEXECUTOR\t" + id + "\t" + Thread.currentThread().getId());
+              recordDispatch("EXECUTOR", id);
               async.dispatch();
             });
         return;
@@ -472,8 +470,18 @@ public final class OfficialAgentJettyProbe {
 
       require(!blockingMode, "blocking request was asynchronously dispatched");
       require(request.getDispatcherType() == DispatcherType.ASYNC, "unexpected dispatch type");
-      System.out.println("OBI_DISPATCH\tASYNC\t" + id + "\t" + Thread.currentThread().getId());
+      recordDispatch("ASYNC", id);
       writeResponse(id, response);
+    }
+
+    private static void recordDispatch(String phase, String id) {
+      long threadId = Thread.currentThread().getId();
+      long observedNanos = System.nanoTime();
+      System.out.println("OBI_DISPATCH\t" + phase + "\t" + id + "\t" + threadId);
+      if ("B".equals(id)) {
+        System.out.println(
+            "OBI_TIMING\t" + phase + "\t" + id + "\t" + threadId + "\t" + observedNanos);
+      }
     }
 
     private static void writeResponse(String id, HttpServletResponse response) throws IOException {

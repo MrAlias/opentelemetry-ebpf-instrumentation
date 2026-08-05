@@ -583,7 +583,7 @@ static __always_inline int handle_java_ioctl(
                                               java_remote_parent_enabled &&
                                                   java_remote_parent_data_hook_is_ready(),
                                               registered,
-                                              op,
+                                              op == TCP_RECV,
                                               process_capability)) {
             return 0;
         }

@@ -30,6 +30,8 @@ import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 
 class OfficialAgentJettyRuntimeTest {
+  private static final long AUTO_PHASE_DEADLINE_NANOS = TimeUnit.SECONDS.toNanos(2L);
+  private static final String MODE_AUTO_UNAVAILABLE = "auto-unavailable";
   private static final String MODE_BLOCKING = "blocking";
   private static final String MODE_DEFAULT = "default";
   private static final String MODE_HELPER_ABSENT = "helper-absent";
@@ -198,6 +200,20 @@ class OfficialAgentJettyRuntimeTest {
         true,
         null,
         false);
+    runMode(
+        officialAgent,
+        expectedSha256,
+        helper,
+        extension,
+        probeExtension,
+        probeClasspath,
+        distribution,
+        version,
+        MODE_AUTO_UNAVAILABLE,
+        "obi,tracecontext,baggage",
+        true,
+        null,
+        true);
     assertEquals(expectedSha256, sha256(officialAgent.toPath()));
   }
 
@@ -218,10 +234,20 @@ class OfficialAgentJettyRuntimeTest {
       throws Exception {
     Path directory = Files.createTempDirectory("obi-official-agent-jetty-");
     Path result = directory.resolve("spans.tsv");
+    String unavailableEndpoint =
+        "@obi-auto-unavailable-sensitive-" + Long.toHexString(System.nanoTime());
     try {
       List<String> command = new ArrayList<>();
       command.add(new File(System.getProperty("java.home"), "bin/java").getAbsolutePath());
-      if (helperEnabled) {
+      if (MODE_AUTO_UNAVAILABLE.equals(mode)) {
+        command.add(
+            "-javaagent:"
+                + helper.getAbsolutePath()
+                + "=remoteParentTransport=auto,remoteParentSocket="
+                + unavailableEndpoint
+                + ",remoteParentTimeoutMillis=25,processCapability=6840220001");
+        command.add("-Dobi.test.official.agent.probe.install-provider=false");
+      } else if (helperEnabled) {
         command.add("-javaagent:" + helper.getAbsolutePath() + "=remoteParentTransport=disabled");
       } else {
         command.add("-Dobi.test.official.agent.probe.install-provider=false");
@@ -264,7 +290,9 @@ class OfficialAgentJettyRuntimeTest {
       List<String> lines = Files.readAllLines(result, StandardCharsets.UTF_8);
       try {
         assertCommonOutput(output, mode, distribution, version);
-        if (helperEnabled) {
+        if (MODE_AUTO_UNAVAILABLE.equals(mode)) {
+          assertAutoUnavailableResult(lines, output, unavailableEndpoint);
+        } else if (helperEnabled) {
           assertCommonResult(lines);
         } else {
           assertHelperAbsentResult(lines, output);
@@ -280,6 +308,8 @@ class OfficialAgentJettyRuntimeTest {
           assertStandardFirstResult(lines, output);
         } else if (MODE_HELPER_ABSENT.equals(mode)) {
           assertHelperAbsentSpans(lines, output);
+        } else if (MODE_AUTO_UNAVAILABLE.equals(mode)) {
+          assertAutoUnavailableSpans(lines, output);
         } else {
           throw new AssertionError("unsupported mode " + mode);
         }
@@ -373,6 +403,144 @@ class OfficialAgentJettyRuntimeTest {
     assertDispatch(output, "H");
     Map<String, SpanResult> spans = spans(lines, 1);
     assertRemoteSpan(required(spans, "H"), TRACE_W3C_ONLY, PARENT_W3C_ONLY, true);
+  }
+
+  private static void assertAutoUnavailableResult(
+      List<String> resultLines, String output, String unavailableEndpoint) {
+    assertEquals(1, count(resultLines, "EXTENSION\tready"), resultLines.toString());
+    assertEquals(1, count(resultLines, "PROVIDER\tretained\tbootstrap"), resultLines.toString());
+    assertEquals(0, prefix(resultLines, "PROVIDER\tready\t").size(), resultLines.toString());
+    assertEquals(0, count(resultLines, "PROVIDER\tabsent"), resultLines.toString());
+    assertEquals(1, count(resultLines, "WRAP\tauto-unavailable\t1"), resultLines.toString());
+    assertEquals(
+        0, prefix(resultLines, "WRAP\tauto-unavailable\t2").size(), resultLines.toString());
+    assertEquals(1, count(resultLines, "AUTO_CLEANUP\tBLOCKED"), resultLines.toString());
+    assertEquals(0, prefix(resultLines, "CALL\t").size(), resultLines.toString());
+    assertEquals(0, prefix(resultLines, "ERROR\t").size(), resultLines.toString());
+
+    String baselineLine = only(resultLines, "AUTO_BASELINE\t");
+    String[] baselineFields = baselineLine.split("\\t", -1);
+    assertEquals(3, baselineFields.length, baselineLine);
+    assertEquals("AUTO_BASELINE", baselineFields[0], baselineLine);
+    Map<String, Long> baselineTransport = namedCounters(baselineFields[1], 10);
+    Map<String, Long> baselineDiagnostics = namedCounters(baselineFields[2], Character.MAX_RADIX);
+    assertUnavailableTransport(baselineTransport, baselineLine);
+    assertEquals(1L, counter(baselineDiagnostics, "registration_fail", baselineLine), baselineLine);
+    assertEquals(0L, counter(baselineDiagnostics, "t_transport_error", baselineLine), baselineLine);
+
+    AutoPhase burst = AutoPhase.parse(only(resultLines, "AUTO\tBURST\t"));
+    AutoPhase mid = AutoPhase.parse(only(resultLines, "AUTO\tMID\t"));
+    AutoPhase retry = AutoPhase.parse(only(resultLines, "AUTO\tRETRY\t"));
+    AutoPhase lifetime = AutoPhase.parse(only(resultLines, "AUTO\tLIFETIME\t"));
+    for (AutoPhase phase : new AutoPhase[] {burst, mid, retry, lifetime}) {
+      assertUnavailableTransport(phase.transportFields, phase.line);
+      assertEquals(TimeUnit.SECONDS.toNanos(1L), phase.retryNanos, phase.line);
+      assertEquals(8, phase.calls, phase.line);
+      long deadlineRemaining = phase.deadlineAdvance - phase.deadlineDelta;
+      assertTrue(deadlineRemaining > 0L && deadlineRemaining <= phase.retryNanos, phase.line);
+      assertTrue(
+          phase.elapsedNanos >= 0L && phase.elapsedNanos <= AUTO_PHASE_DEADLINE_NANOS, phase.line);
+      assertEquals(burst.transport, phase.transport, phase.line);
+      assertEquals(1L, phase.counter("cfg_on"), phase.line);
+      assertEquals(0L, phase.counter("cfg_off"), phase.line);
+      assertEquals(1L, phase.counter("provider_ok"), phase.line);
+      assertEquals(0L, phase.counter("provider_reject"), phase.line);
+      assertEquals(0L, phase.counter("registration_ok"), phase.line);
+    }
+    assertTrue(burst.deadlineDelta < 0L, burst.line);
+    assertEquals(0L, burst.deadlineAdvance, burst.line);
+    assertTrue(mid.deadlineDelta < 0L, mid.line);
+    assertEquals(0L, mid.deadlineAdvance, mid.line);
+    assertTrue(retry.deadlineDelta > 0L, retry.line);
+    assertTrue(retry.deadlineAdvance >= retry.retryNanos, retry.line);
+    assertTrue(lifetime.deadlineDelta > 0L, lifetime.line);
+    assertTrue(lifetime.deadlineAdvance >= lifetime.retryNanos, lifetime.line);
+
+    assertEquals(2L, burst.counter("registration_fail"), burst.line);
+    assertEquals(2L, mid.counter("registration_fail"), mid.line);
+    assertEquals(3L, retry.counter("registration_fail"), retry.line);
+    assertEquals(4L, lifetime.counter("registration_fail"), lifetime.line);
+    assertTakeCounters(baselineDiagnostics, burst, burst.calls);
+    assertTakeCounters(baselineDiagnostics, mid, burst.calls + mid.calls);
+    assertTakeCounters(baselineDiagnostics, retry, burst.calls + mid.calls + retry.calls);
+    assertTakeCounters(
+        baselineDiagnostics, lifetime, burst.calls + mid.calls + retry.calls + lifetime.calls);
+
+    List<String> outputLines = lines(output);
+    int burstStart = exactLineIndex(outputLines, "OBI_AUTO_UNAVAILABLE\tBURST_START");
+    int burstEnd = exactLineIndex(outputLines, "OBI_AUTO_UNAVAILABLE\tBURST_END");
+    int midStart = exactLineIndex(outputLines, "OBI_AUTO_UNAVAILABLE\tMID_START");
+    int midEnd = exactLineIndex(outputLines, "OBI_AUTO_UNAVAILABLE\tMID_END");
+    int retryStart = exactLineIndex(outputLines, "OBI_AUTO_UNAVAILABLE\tRETRY_START");
+    int retryEnd = exactLineIndex(outputLines, "OBI_AUTO_UNAVAILABLE\tRETRY_END");
+    int lifetimeStart = exactLineIndex(outputLines, "OBI_AUTO_UNAVAILABLE\tLIFETIME_START");
+    int lifetimeEnd = exactLineIndex(outputLines, "OBI_AUTO_UNAVAILABLE\tLIFETIME_END");
+    assertTrue(
+        burstStart < burstEnd
+            && burstEnd < midStart
+            && midStart < midEnd
+            && midEnd < retryStart
+            && retryStart < retryEnd
+            && retryEnd < lifetimeStart
+            && lifetimeStart < lifetimeEnd,
+        output);
+
+    assertTrue(output.contains("OBI remote-parent bridge provider is not ready"), output);
+    assertFalse(output.contains("OBI remote-parent provider ready"), output);
+    assertEquals(
+        1,
+        countContaining(
+            outputLines, "OBI remote-parent transport configuration " + burst.transport),
+        output);
+    List<Long> registrationLogs = diagnosticLogCounts(outputLines, "registration_transport_error");
+    assertEquals(powerOfTwoCounts(lifetime.counter("registration_fail")), registrationLogs, output);
+    List<Long> takeLogs = diagnosticLogCounts(outputLines, "take_transport_error");
+    assertEquals(powerOfTwoCounts(lifetime.counter("t_transport_error")), takeLogs, output);
+
+    assertFalse(output.contains(unavailableEndpoint), output);
+    assertFalse(output.contains("obi-auto-unavailable-sensitive"), output);
+    for (String line : outputLines) {
+      if (line.contains("OBI remote-parent")) {
+        assertTrue(line.length() <= 1_024, line);
+      }
+    }
+  }
+
+  private static void assertAutoUnavailableSpans(List<String> lines, String output) {
+    assertDispatch(output, "H");
+    Map<String, SpanResult> spans = spans(lines, 1);
+    assertRemoteSpan(required(spans, "H"), TRACE_W3C_ONLY, PARENT_W3C_ONLY, true);
+  }
+
+  private static void assertTakeCounters(
+      Map<String, Long> baseline, AutoPhase phase, long expectedTransportErrors) {
+    for (Map.Entry<String, Long> entry : baseline.entrySet()) {
+      if (!entry.getKey().startsWith("t_")) {
+        continue;
+      }
+      long expected =
+          entry.getValue()
+              + ("t_transport_error".equals(entry.getKey()) ? expectedTransportErrors : 0L);
+      assertEquals(expected, phase.counter(entry.getKey()), phase.line);
+    }
+  }
+
+  private static void assertUnavailableTransport(Map<String, Long> fields, String line) {
+    assertEquals(2L, counter(fields, "version", line), line);
+    assertEquals(12L, counter(fields, "status", line), line);
+    assertEquals(0L, counter(fields, "requested", line), line);
+    assertEquals(255L, counter(fields, "selected", line), line);
+    assertEquals(3L, counter(fields, "attempted", line), line);
+    long primary = counter(fields, "getsockopt", line);
+    assertTrue(
+        primary == 4L
+            || primary == 5L
+            || primary == 8L
+            || primary == 10L
+            || primary == 11L
+            || primary == 12L,
+        line);
+    assertEquals(12L, counter(fields, "unix", line), line);
   }
 
   private static long helperAbsentLookup(List<String> lines, String phase, long missing) {
@@ -838,6 +1006,61 @@ class OfficialAgentJettyRuntimeTest {
     return count;
   }
 
+  private static int countContaining(List<String> lines, String value) {
+    int count = 0;
+    for (String line : lines) {
+      if (line.contains(value)) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  private static List<Long> diagnosticLogCounts(List<String> lines, String reason) {
+    List<Long> counts = new ArrayList<>();
+    String marker = "reason=" + reason + " count=";
+    for (String line : lines) {
+      int offset = line.indexOf(marker);
+      if (offset < 0) {
+        continue;
+      }
+      int start = offset + marker.length();
+      int end = start;
+      while (end < line.length() && Character.isDigit(line.charAt(end))) {
+        end++;
+      }
+      assertTrue(end > start, line);
+      counts.add(Long.parseLong(line.substring(start, end)));
+    }
+    return counts;
+  }
+
+  private static List<Long> powerOfTwoCounts(long finalCount) {
+    List<Long> counts = new ArrayList<>();
+    for (long count = 1L; count <= finalCount; count <<= 1) {
+      counts.add(count);
+    }
+    return counts;
+  }
+
+  private static Map<String, Long> namedCounters(String snapshot, int radix) {
+    Map<String, Long> result = new HashMap<>();
+    for (String field : snapshot.split(",")) {
+      int separator = field.indexOf('=');
+      assertTrue(separator > 0 && separator < field.length() - 1, snapshot);
+      String name = field.substring(0, separator);
+      assertFalse(result.containsKey(name), "duplicate snapshot field " + name);
+      result.put(name, Long.parseLong(field.substring(separator + 1), radix));
+    }
+    return result;
+  }
+
+  private static long counter(Map<String, Long> counters, String name, String line) {
+    Long value = counters.get(name);
+    assertTrue(value != null, "missing counter " + name + " in " + line);
+    return value;
+  }
+
   private static int exactLineIndex(List<String> lines, String value) {
     int found = -1;
     for (int index = 0; index < lines.size(); index++) {
@@ -982,6 +1205,67 @@ class OfficialAgentJettyRuntimeTest {
   private static boolean parseBoolean(String value, String line) {
     assertTrue(value.equals("true") || value.equals("false"), line);
     return value.equals("true");
+  }
+
+  private static final class AutoPhase {
+    private final String line;
+    private final long deadlineDelta;
+    private final long deadlineAdvance;
+    private final long retryNanos;
+    private final int calls;
+    private final long elapsedNanos;
+    private final String transport;
+    private final Map<String, Long> transportFields;
+    private final Map<String, Long> diagnostics;
+
+    private AutoPhase(
+        String line,
+        long deadlineDelta,
+        long deadlineAdvance,
+        long retryNanos,
+        int calls,
+        long elapsedNanos,
+        String transport,
+        Map<String, Long> transportFields,
+        Map<String, Long> diagnostics) {
+      this.line = line;
+      this.deadlineDelta = deadlineDelta;
+      this.deadlineAdvance = deadlineAdvance;
+      this.retryNanos = retryNanos;
+      this.calls = calls;
+      this.elapsedNanos = elapsedNanos;
+      this.transport = transport;
+      this.transportFields = transportFields;
+      this.diagnostics = diagnostics;
+    }
+
+    private static AutoPhase parse(String line) {
+      String[] fields = line.split("\\t", -1);
+      assertEquals(9, fields.length, line);
+      assertEquals("AUTO", fields[0], line);
+      assertTrue(
+          "BURST".equals(fields[1])
+              || "MID".equals(fields[1])
+              || "RETRY".equals(fields[1])
+              || "LIFETIME".equals(fields[1]),
+          line);
+      return new AutoPhase(
+          line,
+          Long.parseLong(fields[2]),
+          Long.parseLong(fields[3]),
+          Long.parseLong(fields[4]),
+          Integer.parseInt(fields[5]),
+          Long.parseLong(fields[6]),
+          fields[7],
+          namedCounters(fields[7], 10),
+          namedCounters(fields[8], Character.MAX_RADIX));
+    }
+
+    private long counter(String name) {
+      Long value = diagnostics.get(name);
+      assertTrue(value != null, "missing diagnostics counter " + name + " in " + line);
+      return value;
+    }
   }
 
   private static final class TimingResult {

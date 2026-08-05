@@ -44,12 +44,14 @@ import java.util.concurrent.atomic.AtomicInteger;
 /** Test-only official-agent extension for the isolated server runtime probes. */
 public final class OfficialAgentProbeExtension implements AutoConfigurationCustomizerProvider {
   private static final String OUTPUT_PROPERTY = "obi.test.official.agent.probe.output";
+  private static final String MODE_PROPERTY = "obi.test.official.agent.probe.mode";
   private static final String FRAMEWORK_PROPERTY = "obi.test.official.agent.probe.framework";
   private static final String INSTALL_PROVIDER_PROPERTY =
       "obi.test.official.agent.probe.install-provider";
   private static final String REEXTRACT_ID_PROPERTY = "obi.test.official.agent.probe.reextract.id";
   private static final String FRAMEWORK_NETTY = "netty";
   private static final String FRAMEWORK_JAVA21_CONCURRENCY = "java21-concurrency";
+  private static final String MODE_AUTO_UNAVAILABLE = "auto-unavailable";
   private static final String RAW_OBI_PROPAGATOR =
       "io.opentelemetry.obi.java.extension.ObiRemoteParentPropagator";
   private static final int STATUS_VALID = 1;
@@ -84,6 +86,7 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
   private static final ConcurrentHashMap<String, AtomicInteger> EXTRACTION_CALLS =
       new ConcurrentHashMap<>();
   private static final AtomicInteger OBI_WRAPS = new AtomicInteger();
+  private static final AtomicInteger AUTO_UNAVAILABLE_WRAPS = new AtomicInteger();
   private static final AtomicInteger HELPER_ABSENT_WRAPS = new AtomicInteger();
 
   @Override
@@ -101,12 +104,22 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
     boolean java21Concurrency = FRAMEWORK_JAVA21_CONCURRENCY.equals(framework);
     boolean installProvider =
         !"false".equalsIgnoreCase(System.getProperty(INSTALL_PROVIDER_PROPERTY));
+    boolean autoUnavailable = MODE_AUTO_UNAVAILABLE.equals(System.getProperty(MODE_PROPERTY));
+    if (autoUnavailable && installProvider) {
+      throw new IllegalStateException("auto-unavailable mode must retain the native provider");
+    }
     ProviderState provider =
         installProvider ? ProviderState.install(output, netty, java21Concurrency) : null;
     if (provider == null) {
-      output.append("PROVIDER\tabsent");
-      customizer.addPropagatorCustomizer(
-          (propagator, config) -> wrapHelperAbsentObiPropagator(propagator, output));
+      if (autoUnavailable) {
+        output.append("PROVIDER\tretained\tbootstrap");
+        customizer.addPropagatorCustomizer(
+            (propagator, config) -> wrapAutoUnavailableObiPropagator(propagator, output));
+      } else {
+        output.append("PROVIDER\tabsent");
+        customizer.addPropagatorCustomizer(
+            (propagator, config) -> wrapHelperAbsentObiPropagator(propagator, output));
+      }
     } else {
       customizer.addPropagatorCustomizer(
           (propagator, config) ->
@@ -152,6 +165,229 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
       output.append("ERROR\tmultiple-helper-absent-obi-propagators");
     }
     return new HelperAbsentObiPropagator(propagator, output);
+  }
+
+  private static TextMapPropagator wrapAutoUnavailableObiPropagator(
+      TextMapPropagator propagator, ProbeOutput output) {
+    if (!RAW_OBI_PROPAGATOR.equals(propagator.getClass().getName())) {
+      return propagator;
+    }
+    int wraps = AUTO_UNAVAILABLE_WRAPS.incrementAndGet();
+    output.append("WRAP\tauto-unavailable\t" + wraps);
+    if (wraps != 1) {
+      output.append("ERROR\tmultiple-auto-unavailable-obi-propagators");
+    }
+    return new AutoUnavailableObiPropagator(propagator, output);
+  }
+
+  private static final class AutoUnavailableObiPropagator implements TextMapPropagator {
+    private static final String ID_HEADER = "x-obi-probe-id";
+    private static final String BRIDGE_CLASS =
+        "io.opentelemetry.obi.java.bridge.RemoteParentBridge";
+    private static final String PROVIDER_CLASS =
+        "io.opentelemetry.obi.java.bridge.NativeRemoteParentProvider";
+    private static final String THREAD_INFO_CLASS = "io.opentelemetry.obi.java.ebpf.ThreadInfo";
+    private static final int CALLS_PER_PHASE = 8;
+    private static final long DEADLINE_MARGIN_NANOS = TimeUnit.MILLISECONDS.toNanos(250L);
+
+    private final TextMapPropagator delegate;
+    private final ProbeOutput output;
+    private final AtomicBoolean exercised = new AtomicBoolean();
+
+    private AutoUnavailableObiPropagator(TextMapPropagator delegate, ProbeOutput output) {
+      this.delegate = delegate;
+      this.output = output;
+    }
+
+    @Override
+    public Collection<String> fields() {
+      return delegate.fields();
+    }
+
+    @Override
+    public <C> void inject(Context context, C carrier, TextMapSetter<C> setter) {
+      delegate.inject(context, carrier, setter);
+    }
+
+    @Override
+    public <C> Context extract(Context context, C carrier, TextMapGetter<C> getter) {
+      Context input = context == null ? Context.root() : context;
+      if (!"H".equals(getter.get(carrier, ID_HEADER)) || !exercised.compareAndSet(false, true)) {
+        return delegate.extract(input, carrier, getter);
+      }
+
+      try {
+        markDirectLookup();
+        Object provider = productionProvider();
+        long initialDeadline = nextConfigurationAttemptNanos(provider);
+        if (initialDeadline == 0L) {
+          throw new IllegalStateException("unavailable provider has no retry deadline");
+        }
+        recordBaseline();
+        waitUntil(initialDeadline + DEADLINE_MARGIN_NANOS);
+
+        System.out.println("OBI_AUTO_UNAVAILABLE\tBURST_START");
+        long phaseStart = System.nanoTime();
+        Context result = delegate.extract(input, carrier, getter);
+        requireInputContext(input, result);
+        long deadline = nextConfigurationAttemptNanos(provider);
+        result = extractBurst(input, carrier, getter, CALLS_PER_PHASE - 1);
+        recordPhase("BURST", provider, deadline, phaseStart);
+        System.out.println("OBI_AUTO_UNAVAILABLE\tBURST_END");
+
+        waitUntil(deadline - DEADLINE_MARGIN_NANOS);
+        System.out.println("OBI_AUTO_UNAVAILABLE\tMID_START");
+        phaseStart = System.nanoTime();
+        result = extractBurst(input, carrier, getter, CALLS_PER_PHASE);
+        recordPhase("MID", provider, deadline, phaseStart);
+        System.out.println("OBI_AUTO_UNAVAILABLE\tMID_END");
+
+        waitUntil(deadline + DEADLINE_MARGIN_NANOS);
+        System.out.println("OBI_AUTO_UNAVAILABLE\tRETRY_START");
+        phaseStart = System.nanoTime();
+        result = extractBurst(input, carrier, getter, CALLS_PER_PHASE);
+        recordPhase("RETRY", provider, deadline, phaseStart);
+        long retryDeadline = nextConfigurationAttemptNanos(provider);
+        System.out.println("OBI_AUTO_UNAVAILABLE\tRETRY_END");
+
+        waitUntil(retryDeadline + DEADLINE_MARGIN_NANOS);
+        System.out.println("OBI_AUTO_UNAVAILABLE\tLIFETIME_START");
+        phaseStart = System.nanoTime();
+        result = extractBurst(input, carrier, getter, CALLS_PER_PHASE);
+        recordPhase("LIFETIME", provider, retryDeadline, phaseStart);
+        System.out.println("OBI_AUTO_UNAVAILABLE\tLIFETIME_END");
+        return result;
+      } catch (InterruptedException interrupted) {
+        Thread.currentThread().interrupt();
+        output.append("ERROR\tauto-unavailable-exercise\tinterrupted");
+        return delegate.extract(input, carrier, getter);
+      } catch (Exception failure) {
+        output.append("ERROR\tauto-unavailable-exercise\t" + token(failure.getClass().getName()));
+        return delegate.extract(input, carrier, getter);
+      } finally {
+        restoreBlockedLookup(output);
+      }
+    }
+
+    private <C> Context extractBurst(Context input, C carrier, TextMapGetter<C> getter, int calls) {
+      Context result = input;
+      for (int call = 0; call < calls; call++) {
+        result = delegate.extract(input, carrier, getter);
+        requireInputContext(input, result);
+      }
+      return result;
+    }
+
+    private static void requireInputContext(Context input, Context result) {
+      if (result != input) {
+        throw new IllegalStateException("unavailable native provider changed the input context");
+      }
+    }
+
+    private static Object productionProvider() throws Exception {
+      Class<?> bridge = Class.forName(BRIDGE_CLASS, true, null);
+      ProviderState.requireBootstrap(bridge, "bridge");
+      Field field = bridge.getDeclaredField("provider");
+      field.setAccessible(true);
+      Object reference = field.get(null);
+      Object provider = reference.getClass().getMethod("get").invoke(reference);
+      if (provider == null || !PROVIDER_CLASS.equals(provider.getClass().getName())) {
+        throw new IllegalStateException("native remote-parent provider is not installed");
+      }
+      ProviderState.requireBootstrap(provider.getClass(), "native provider");
+      return provider;
+    }
+
+    private static void markDirectLookup() throws Exception {
+      Class<?> threadInfo = Class.forName(THREAD_INFO_CLASS, true, null);
+      ProviderState.requireBootstrap(threadInfo, "thread lookup authority");
+      int previous =
+          ((Integer) threadInfo.getMethod("remoteParentLookupSource").invoke(null)).intValue();
+      if (previous != 3) {
+        throw new IllegalStateException("auto-unavailable lookup did not begin blocked");
+      }
+      threadInfo.getMethod("markRemoteParentDirectLookup").invoke(null);
+      int source =
+          ((Integer) threadInfo.getMethod("remoteParentLookupSource").invoke(null)).intValue();
+      if (source != 1) {
+        throw new IllegalStateException(
+            "direct remote-parent lookup authority was not established");
+      }
+    }
+
+    private static void restoreBlockedLookup(ProbeOutput output) {
+      try {
+        Class<?> threadInfo = Class.forName(THREAD_INFO_CLASS, true, null);
+        threadInfo.getMethod("blockRemoteParentLookup").invoke(null);
+        int source =
+            ((Integer) threadInfo.getMethod("remoteParentLookupSource").invoke(null)).intValue();
+        if (source != 3) {
+          throw new IllegalStateException(
+              "blocked remote-parent lookup authority was not restored");
+        }
+        output.append("AUTO_CLEANUP\tBLOCKED");
+      } catch (Exception failure) {
+        output.append("ERROR\tauto-unavailable-cleanup\t" + token(failure.getClass().getName()));
+      }
+    }
+
+    private static long nextConfigurationAttemptNanos(Object provider) throws Exception {
+      Field field = provider.getClass().getDeclaredField("nextConfigurationAttemptNanos");
+      field.setAccessible(true);
+      return field.getLong(provider);
+    }
+
+    private static long retryNanos(Object provider) throws Exception {
+      Field field = provider.getClass().getDeclaredField("RETRY_NANOS");
+      field.setAccessible(true);
+      return field.getLong(null);
+    }
+
+    private void recordBaseline() throws Exception {
+      Class<?> bridge = Class.forName(BRIDGE_CLASS, true, null);
+      output.append(
+          "AUTO_BASELINE\t"
+              + bridge.getMethod("transportConfigurationSnapshot").invoke(null)
+              + "\t"
+              + bridge.getMethod("diagnosticsSnapshot").invoke(null));
+    }
+
+    private void recordPhase(
+        String phase, Object provider, long previousDeadline, long phaseStartNanos)
+        throws Exception {
+      long now = System.nanoTime();
+      long currentDeadline = nextConfigurationAttemptNanos(provider);
+      Class<?> bridge = Class.forName(BRIDGE_CLASS, true, null);
+      String transport = (String) bridge.getMethod("transportConfigurationSnapshot").invoke(null);
+      String diagnostics = (String) bridge.getMethod("diagnosticsSnapshot").invoke(null);
+      output.append(
+          "AUTO\t"
+              + phase
+              + "\t"
+              + (now - previousDeadline)
+              + "\t"
+              + (currentDeadline - previousDeadline)
+              + "\t"
+              + retryNanos(provider)
+              + "\t"
+              + CALLS_PER_PHASE
+              + "\t"
+              + (now - phaseStartNanos)
+              + "\t"
+              + transport
+              + "\t"
+              + diagnostics);
+    }
+
+    private static void waitUntil(long deadlineNanos) throws InterruptedException {
+      while (true) {
+        long remaining = deadlineNanos - System.nanoTime();
+        if (remaining <= 0L) {
+          return;
+        }
+        TimeUnit.NANOSECONDS.sleep(remaining);
+      }
+    }
   }
 
   private static final class HelperAbsentObiPropagator implements TextMapPropagator {

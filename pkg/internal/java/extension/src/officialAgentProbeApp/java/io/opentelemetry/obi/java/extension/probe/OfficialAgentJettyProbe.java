@@ -39,6 +39,7 @@ public final class OfficialAgentJettyProbe {
   private static final String OUTPUT_PROPERTY = "obi.test.official.agent.probe.output";
   private static final String MODE_PROPERTY = "obi.test.official.agent.probe.mode";
   private static final String MODE_BLOCKING = "blocking";
+  private static final String MODE_AUTO_UNAVAILABLE = "auto-unavailable";
   private static final String MODE_DEFAULT = "default";
   private static final String MODE_HELPER_ABSENT = "helper-absent";
   private static final String MODE_NESTED = "nested";
@@ -64,6 +65,7 @@ public final class OfficialAgentJettyProbe {
     String mode = requiredProperty(MODE_PROPERTY);
     require(
         MODE_BLOCKING.equals(mode)
+            || MODE_AUTO_UNAVAILABLE.equals(mode)
             || MODE_DEFAULT.equals(mode)
             || MODE_HELPER_ABSENT.equals(mode)
             || MODE_NESTED.equals(mode)
@@ -107,9 +109,11 @@ public final class OfficialAgentJettyProbe {
       } else if (MODE_DEFAULT.equals(mode)) {
         runDefaultMode(port);
         expectedSpans = 11;
-      } else if (MODE_HELPER_ABSENT.equals(mode)) {
-        requireBootstrapHelperAbsent();
-        runHelperAbsentMode(port);
+      } else if (MODE_HELPER_ABSENT.equals(mode) || MODE_AUTO_UNAVAILABLE.equals(mode)) {
+        if (MODE_HELPER_ABSENT.equals(mode)) {
+          requireBootstrapHelperAbsent();
+        }
+        runW3cFallbackMode(port, mode);
         expectedSpans = 1;
       } else if (MODE_NESTED.equals(mode)) {
         runNestedMode(port);
@@ -230,7 +234,7 @@ public final class OfficialAgentJettyProbe {
     }
   }
 
-  private static void runHelperAbsentMode(int port) throws Exception {
+  private static void runW3cFallbackMode(int port, String mode) throws Exception {
     try (Socket socket = connect(port)) {
       require(
           "H:ok"
@@ -241,7 +245,7 @@ public final class OfficialAgentJettyProbe {
                       "H",
                       traceparent(TRACE_W3C_ONLY, PARENT_W3C_ONLY, "01"),
                       true)),
-          "helper-absent request H failed W3C extraction");
+          mode + " request H failed W3C extraction");
     }
   }
 

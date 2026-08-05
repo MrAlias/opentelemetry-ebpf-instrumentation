@@ -66,6 +66,12 @@ enum {
   obi_socket_task_take = 0x4a06,
   obi_socket_task_discard = 0x4a07,
   obi_ioctl_magic = 0x0b10b1,
+  obi_data_operation_send = 1,
+  obi_data_operation_receive = 2,
+  obi_data_operation_http1_receive_start = 14,
+  obi_data_operation_http1_receive_continue = 15,
+  obi_data_operation_http1_receive_reset = 16,
+  obi_data_signal_offset = 1 + 36 + sizeof(uint32_t),
 };
 
 struct remote_parent_config {
@@ -92,6 +98,9 @@ static pthread_mutex_t remote_parent_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct remote_parent_config *remote_parent_current;
 static _Atomic int remote_parent_timeout_millis = 50;
 static _Atomic uint64_t next_data_signal_nonce = 1;
+#ifdef OBI_JNI_TEST_OBSERVATIONS
+static _Atomic unsigned int test_remote_parent_config_acquisitions;
+#endif
 
 static void clear_jni_exception(JNIEnv *env) {
   if ((*env)->ExceptionCheck(env)) {
@@ -358,6 +367,23 @@ static uint64_t next_data_signal(void) {
                                       memory_order_relaxed);
   }
   return nonce;
+}
+
+static int data_operation_requires_ack(unsigned char operation) {
+  switch (operation) {
+  case obi_data_operation_http1_receive_continue:
+  case obi_data_operation_http1_receive_reset:
+    // CONTINUE and RESET intentionally bypass configuration negotiation and
+    // data-signal acknowledgement; START already established the authority.
+    return 0;
+  case obi_data_operation_send:
+  case obi_data_operation_receive:
+  case obi_data_operation_http1_receive_start:
+  default:
+    // Preserve the legacy emitter behavior for operation bytes that this
+    // native library does not yet recognize.
+    return 1;
+  }
 }
 
 static int connected_tcp_probe_pair(int *client, int *peer) {
@@ -714,6 +740,10 @@ static int swap_remote_parent_config(struct remote_parent_config *replacement,
 
 static int acquire_remote_parent_config(struct remote_parent_config **config,
                                         int64_t deadline) {
+#ifdef OBI_JNI_TEST_OBSERVATIONS
+  atomic_fetch_add_explicit(&test_remote_parent_config_acquisitions, 1,
+                            memory_order_relaxed);
+#endif
   *config = NULL;
   if (mutex_lock_until(&remote_parent_lock, deadline) != 0) {
     return errno_status(errno);
@@ -968,27 +998,32 @@ static int emit_data_on_socket(int socket_fd, void *packet) {
     return -1;
   }
 
-  int timeout =
-      atomic_load_explicit(&remote_parent_timeout_millis, memory_order_acquire);
-  int64_t deadline = deadline_after_millis(monotonic_millis(), timeout);
+  const unsigned char operation = ((const unsigned char *)packet)[0];
+  const int acknowledgement_required = data_operation_requires_ack(operation);
   int primary_negotiated = 0;
-  if (deadline >= 0) {
-    struct remote_parent_config *config = NULL;
-    int status = acquire_remote_parent_config(&config, deadline);
-    if (status == remote_parent_status_valid) {
-      if (config != NULL &&
-          config->transport == remote_parent_transport_getsockopt) {
-        unsigned char response[remote_parent_record_size];
-        status = call_setsockopt_negotiate(
-            socket_fd, config->process_incarnation, response);
-        primary_negotiated = probe_succeeded(status);
+  uint64_t data_signal_nonce = 0;
+  if (acknowledgement_required) {
+    int timeout = atomic_load_explicit(&remote_parent_timeout_millis,
+                                       memory_order_acquire);
+    int64_t deadline = deadline_after_millis(monotonic_millis(), timeout);
+    if (deadline >= 0) {
+      struct remote_parent_config *config = NULL;
+      int status = acquire_remote_parent_config(&config, deadline);
+      if (status == remote_parent_status_valid) {
+        if (config != NULL &&
+            config->transport == remote_parent_transport_getsockopt) {
+          unsigned char response[remote_parent_record_size];
+          status = call_setsockopt_negotiate(
+              socket_fd, config->process_incarnation, response);
+          primary_negotiated = probe_succeeded(status);
+        }
+        release_remote_parent_config(config);
       }
-      release_remote_parent_config(config);
     }
+    data_signal_nonce = next_data_signal();
   }
 
-  uint64_t data_signal_nonce = next_data_signal();
-  write_u64_le((unsigned char *)packet, 1 + 36 + sizeof(uint32_t),
+  write_u64_le((unsigned char *)packet, obi_data_signal_offset,
                data_signal_nonce);
 
   if (ioctl(socket_fd, obi_ioctl_magic, packet) != 0 && errno != ENOTTY) {
@@ -1138,6 +1173,18 @@ int obi_test_exchange_unix_request(int fd, unsigned char *response,
 int obi_test_emit_data_on_socket(int socket_fd, unsigned char *packet) {
   return emit_data_on_socket(socket_fd, packet);
 }
+
+#ifdef OBI_JNI_TEST_OBSERVATIONS
+unsigned int obi_test_remote_parent_config_acquisition_count(void) {
+  return atomic_load_explicit(&test_remote_parent_config_acquisitions,
+                              memory_order_relaxed);
+}
+
+void obi_test_reset_remote_parent_config_acquisition_count(void) {
+  atomic_store_explicit(&test_remote_parent_config_acquisitions, 0,
+                        memory_order_relaxed);
+}
+#endif
 
 void obi_test_close_remote_parent(void) { close_remote_parent(); }
 

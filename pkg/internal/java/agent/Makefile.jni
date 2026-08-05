@@ -37,7 +37,7 @@ $(TARGET): $(OBJECTS) | $(TARGET_DIR)
 	$(CC) $(LDFLAGS) -o $@ $^
 	@echo "Built JNI library: $(TARGET)"
 
-test: override CFLAGS += -DOBI_JNI_TESTING -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
+test: override CFLAGS += -DOBI_JNI_TESTING -DOBI_JNI_TEST_OBSERVATIONS -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
 test: override LDFLAGS = -pthread -fsanitize=address,undefined
 test: $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) $(SRC_DIR)/io_opentelemetry_obi_java_jni.c src/test/c/remote_parent_jni_test.c $(LDFLAGS) -o $(TEST_TARGET)

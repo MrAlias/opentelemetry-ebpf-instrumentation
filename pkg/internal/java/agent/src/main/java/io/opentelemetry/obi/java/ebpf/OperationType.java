@@ -28,7 +28,13 @@ public enum OperationType {
   // fail closed by removing the calling logical task's inherited context
   TASK_UNLINK((byte) 12),
   // identify a correlated live socket as TLS before application data arrives
-  TLS_CONNECTION((byte) 13);
+  TLS_CONNECTION((byte) 13),
+  // start one exact HTTP/1 receive sequence with its first nonempty plaintext fragment
+  HTTP1_RECEIVE_START((byte) 14),
+  // append a nonempty plaintext fragment to an exact HTTP/1 receive sequence
+  HTTP1_RECEIVE_CONTINUE((byte) 15),
+  // discard an exact HTTP/1 receive sequence without a payload
+  HTTP1_RECEIVE_RESET((byte) 16);
 
   public final byte code;
 

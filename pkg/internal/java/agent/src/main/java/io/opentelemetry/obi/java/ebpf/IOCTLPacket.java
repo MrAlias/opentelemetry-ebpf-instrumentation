@@ -14,6 +14,9 @@ public class IOCTLPacket {
   public static final int bufferLengthOffset = tlsConnectionMarkerSize;
   public static final int dataSignalOffset = bufferLengthOffset + Integer.BYTES;
   public static int packetPrefixSize = dataSignalOffset + Long.BYTES;
+  public static final int http1LifecycleOffset = dataSignalOffset + Long.BYTES;
+  public static final int http1RequestSequenceOffset = http1LifecycleOffset + Long.BYTES;
+  public static final int http1PacketPrefixSize = http1RequestSequenceOffset + Long.BYTES;
 
   public static int writePacketPrefix(
       NativeMemory mem, int off, OperationType type, Socket socket, int bufLen) {
@@ -66,6 +69,66 @@ public class IOCTLPacket {
 
   public static int writePacketBuffer(NativeMemory mem, int off, byte[] buf) {
     return writePacketBuffer(mem, off, buf, 0, buf.length);
+  }
+
+  public static int writeHttp1PacketPrefix(
+      NativeMemory mem,
+      int off,
+      OperationType type,
+      Socket socket,
+      int bufLen,
+      long lifecycleId,
+      long requestSequence) {
+    validateHttp1Packet(type, bufLen, lifecycleId, requestSequence);
+    off = writePacketPrefix(mem, off, type, socket, bufLen);
+    return writeHttp1Identity(mem, off, lifecycleId, requestSequence);
+  }
+
+  public static int writeHttp1PacketPrefix(
+      NativeMemory mem,
+      int off,
+      OperationType type,
+      Connection conn,
+      int bufLen,
+      long lifecycleId,
+      long requestSequence) {
+    validateHttp1Packet(type, bufLen, lifecycleId, requestSequence);
+    off = writePacketPrefix(mem, off, type, conn, bufLen);
+    return writeHttp1Identity(mem, off, lifecycleId, requestSequence);
+  }
+
+  private static int writeHttp1Identity(
+      NativeMemory mem, int off, long lifecycleId, long requestSequence) {
+    mem.setLong(off, lifecycleId);
+    off += Long.BYTES;
+    mem.setLong(off, requestSequence);
+    return off + Long.BYTES;
+  }
+
+  private static void validateHttp1Packet(
+      OperationType type, int bufLen, long lifecycleId, long requestSequence) {
+    if (type == null) {
+      throw new IllegalArgumentException("HTTP/1 receive operation must be specified");
+    }
+    if (lifecycleId == 0L) {
+      throw new IllegalArgumentException("HTTP/1 receive lifecycle must be nonzero");
+    }
+    if (requestSequence == 0L) {
+      throw new IllegalArgumentException("HTTP/1 request sequence must be nonzero");
+    }
+    if (type == OperationType.HTTP1_RECEIVE_START || type == OperationType.HTTP1_RECEIVE_CONTINUE) {
+      if (bufLen <= 0) {
+        throw new IllegalArgumentException("HTTP/1 receive fragment must be nonempty");
+      }
+      return;
+    }
+    if (type == OperationType.HTTP1_RECEIVE_RESET) {
+      if (bufLen != 0) {
+        throw new IllegalArgumentException("HTTP/1 receive reset must not have a payload");
+      }
+      return;
+    }
+    throw new IllegalArgumentException("not an HTTP/1 receive operation: " + type);
   }
 
   public static int writeTlsConnectionMarker(NativeMemory mem, int off, Connection conn) {

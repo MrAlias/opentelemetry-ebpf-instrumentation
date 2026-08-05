@@ -52,6 +52,8 @@ int obi_test_call_remote_parent_task_on_socket(int operation, int socket_fd,
 int obi_test_exchange_unix_request(int fd, unsigned char *response,
                                    int64_t deadline);
 int obi_test_emit_data_on_socket(int socket_fd, unsigned char *packet);
+unsigned int obi_test_remote_parent_config_acquisition_count(void);
+void obi_test_reset_remote_parent_config_acquisition_count(void);
 void obi_test_close_remote_parent(void);
 int obi_test_lock_remote_parent(void);
 int obi_test_unlock_remote_parent(void);
@@ -70,6 +72,10 @@ jint Java_io_opentelemetry_obi_java_BootstrapNative_takeRemoteParentTask(
     JNIEnv *env, jclass clazz, jint socket_fd, jbyteArray output);
 jint Java_io_opentelemetry_obi_java_BootstrapNative_discardRemoteParentTask(
     JNIEnv *env, jclass clazz, jint socket_fd, jbyteArray output);
+jint Java_io_opentelemetry_obi_java_BootstrapNative_emitVirtualThreadOp(
+    JNIEnv *env, jclass clazz, jbyte operation, jlong value);
+jint Java_io_opentelemetry_obi_java_BootstrapNative_emitTaskContextOp(
+    JNIEnv *env, jclass clazz, jbyte operation, jlong value, jlong token);
 void Java_io_opentelemetry_obi_java_BootstrapNative_closeRemoteParentTransport(
     JNIEnv *env, jclass clazz);
 
@@ -92,6 +98,7 @@ static _Atomic int observed_setsockopt_calls;
 static _Atomic int observed_ioctl_fd;
 static _Atomic unsigned long observed_ioctl_request;
 static _Atomic int observed_ioctl_calls;
+static _Atomic uint64_t observed_ioctl_nonce;
 static _Atomic int observed_peer_credential_lookups;
 static struct stat denied_socket_identity;
 static _Atomic int denied_socket_identity_set;
@@ -100,6 +107,29 @@ static _Atomic uint64_t observed_negotiate_incarnation;
 static _Atomic uint64_t observed_data_ack_nonce;
 static _Atomic int observed_transport_event_count;
 static int observed_transport_events[3];
+
+enum {
+  test_data_operation_send = 1,
+  test_data_operation_receive = 2,
+  test_data_operation_http1_receive_start = 14,
+  test_data_operation_http1_receive_continue = 15,
+  test_data_operation_http1_receive_reset = 16,
+  test_data_operation_unknown = 0xff,
+  test_data_signal_offset = 41,
+};
+
+static int operation_has_data_signal_nonce(unsigned char operation) {
+  switch (operation) {
+  case test_data_operation_send:
+  case test_data_operation_receive:
+  case test_data_operation_http1_receive_start:
+  case test_data_operation_http1_receive_continue:
+  case test_data_operation_http1_receive_reset:
+    return 1;
+  default:
+    return 0;
+  }
+}
 
 enum { fake_negotiation_capacity = 128 };
 struct fake_negotiation {
@@ -274,6 +304,10 @@ int ioctl(int fd, unsigned long request, ...) {
 
   atomic_store(&observed_ioctl_fd, fd);
   atomic_store(&observed_ioctl_request, request);
+  uint64_t nonce = operation_has_data_signal_nonce(packet[0])
+                       ? read_u64_le(packet, test_data_signal_offset)
+                       : 0;
+  atomic_store(&observed_ioctl_nonce, nonce);
   atomic_fetch_add(&observed_ioctl_calls, 1);
   int event = atomic_fetch_add(&observed_transport_event_count, 1);
   if (event < 3) {
@@ -318,12 +352,14 @@ static void reset_transport_observations(void) {
   atomic_store(&observed_ioctl_fd, -1);
   atomic_store(&observed_ioctl_request, 0);
   atomic_store(&observed_ioctl_calls, 0);
+  atomic_store(&observed_ioctl_nonce, 0);
   atomic_store(&observed_peer_credential_lookups, 0);
   clear_denied_socket_fd();
   atomic_store(&observed_denied_socket_getsockopt_lookups, 0);
   atomic_store(&observed_data_ack_nonce, 0);
   atomic_store(&observed_transport_event_count, 0);
   memset(observed_transport_events, 0, sizeof(observed_transport_events));
+  obi_test_reset_remote_parent_config_acquisition_count();
 }
 
 struct fake_jni_string {
@@ -1022,31 +1058,151 @@ static void test_forced_getsockopt_health_preserves_failure(void) {
   fake_health_mismatch = 0;
 }
 
-static void test_data_emit_negotiates_and_acknowledges_same_socket(void) {
+static void test_short_non_data_ioctl_packets_skip_nonce_snapshot(void) {
+  fake_ioctl_error = 0;
+  reset_transport_observations();
+
+  assert(Java_io_opentelemetry_obi_java_BootstrapNative_emitVirtualThreadOp(
+             NULL, NULL, 9, (jlong)UINT64_C(0x0102030405060708)) == 0);
+  assert(atomic_load(&observed_ioctl_fd) == 0);
+  assert(atomic_load(&observed_ioctl_request) == 0x0b10b1);
+  assert(atomic_load(&observed_ioctl_calls) == 1);
+  assert(atomic_load(&observed_ioctl_nonce) == 0);
+
+  reset_transport_observations();
+  assert(Java_io_opentelemetry_obi_java_BootstrapNative_emitTaskContextOp(
+             NULL, NULL, 12, (jlong)UINT64_C(0x1112131415161718),
+             (jlong)UINT64_C(0x2122232425262728)) == 0);
+  assert(atomic_load(&observed_ioctl_fd) == 0);
+  assert(atomic_load(&observed_ioctl_request) == 0x0b10b1);
+  assert(atomic_load(&observed_ioctl_calls) == 1);
+  assert(atomic_load(&observed_ioctl_nonce) == 0);
+
+  fake_ioctl_error = ENOTTY;
+}
+
+static void test_acknowledged_data_operations_preserve_transport_order(void) {
   fake_setsockopt_error = 0;
   fake_data_ack_error = 0;
   fake_ioctl_error = ENOTTY;
   assert(obi_test_configure_remote_parent(1, "", 50, geteuid(), 77) == 1);
+
+  const unsigned char operations[] = {
+      test_data_operation_send,
+      test_data_operation_receive,
+      test_data_operation_http1_receive_start,
+      test_data_operation_unknown,
+  };
+  for (size_t index = 0; index < sizeof(operations) / sizeof(operations[0]);
+       index++) {
+    reset_transport_observations();
+
+    unsigned char packet[65] = {0};
+    packet[0] = operations[index];
+    memset(packet + test_data_signal_offset, 0xff, sizeof(uint64_t));
+    int socket_fd = 55 + (int)index;
+    assert(obi_test_emit_data_on_socket(socket_fd, packet) == 1);
+    uint64_t nonce = read_u64_le(packet, test_data_signal_offset);
+    assert(nonce != 0);
+    assert(atomic_load(&observed_negotiate_incarnation) == 77);
+    assert(atomic_load(&observed_setsockopt_fd) == socket_fd);
+    assert(atomic_load(&observed_setsockopt_option) == 0x4a04);
+    assert(atomic_load(&observed_setsockopt_calls) == 2);
+    assert(atomic_load(&observed_ioctl_fd) == socket_fd);
+    assert(atomic_load(&observed_ioctl_request) == 0x0b10b1);
+    assert(atomic_load(&observed_ioctl_calls) == 1);
+    if (operations[index] != test_data_operation_unknown) {
+      assert(atomic_load(&observed_ioctl_nonce) == nonce);
+    }
+    assert(atomic_load(&observed_getsockopt_calls) == 0);
+    assert(obi_test_remote_parent_config_acquisition_count() == 1);
+    assert(atomic_load(&observed_data_ack_nonce) == nonce);
+    assert(atomic_load(&observed_transport_event_count) == 3);
+    assert(observed_transport_events[0] == 1);
+    assert(observed_transport_events[1] == 2);
+    assert(observed_transport_events[2] == 3);
+  }
+  obi_test_close_remote_parent();
+}
+
+static void test_http1_start_hard_ioctl_error_skips_acknowledgement(void) {
+  fake_setsockopt_error = 0;
+  fake_data_ack_error = 0;
+  fake_ioctl_error = EIO;
+  assert(obi_test_configure_remote_parent(1, "", 50, geteuid(), 81) == 1);
   reset_transport_observations();
 
-  unsigned char packet[50] = {2};
-  assert(obi_test_emit_data_on_socket(55, packet) == 1);
-  uint64_t nonce = read_u64_le(packet, 41);
+  unsigned char packet[65] = {0};
+  packet[0] = test_data_operation_http1_receive_start;
+  memset(packet + test_data_signal_offset, 0xff, sizeof(uint64_t));
+  assert(obi_test_emit_data_on_socket(59, packet) == -1);
+
+  uint64_t nonce = read_u64_le(packet, test_data_signal_offset);
   assert(nonce != 0);
-  assert(atomic_load(&observed_negotiate_incarnation) == 77);
-  assert(atomic_load(&observed_setsockopt_fd) == 55);
-  assert(atomic_load(&observed_setsockopt_option) == 0x4a04);
-  assert(atomic_load(&observed_setsockopt_calls) == 2);
-  assert(atomic_load(&observed_ioctl_fd) == 55);
+  assert(atomic_load(&observed_negotiate_incarnation) == 81);
+  assert(atomic_load(&observed_setsockopt_fd) == 59);
+  assert(atomic_load(&observed_setsockopt_option) == 0x4a03);
+  assert(atomic_load(&observed_setsockopt_calls) == 1);
+  assert(atomic_load(&observed_getsockopt_calls) == 0);
+  assert(obi_test_remote_parent_config_acquisition_count() == 1);
+  assert(atomic_load(&observed_ioctl_fd) == 59);
   assert(atomic_load(&observed_ioctl_request) == 0x0b10b1);
   assert(atomic_load(&observed_ioctl_calls) == 1);
-  assert(atomic_load(&observed_getsockopt_calls) == 0);
-  assert(atomic_load(&observed_data_ack_nonce) == nonce);
-  assert(atomic_load(&observed_transport_event_count) == 3);
+  assert(atomic_load(&observed_ioctl_nonce) == nonce);
+  assert(atomic_load(&observed_data_ack_nonce) == 0);
+  assert(atomic_load(&observed_transport_event_count) == 2);
   assert(observed_transport_events[0] == 1);
   assert(observed_transport_events[1] == 2);
-  assert(observed_transport_events[2] == 3);
+  assert(observed_transport_events[2] == 0);
+
   obi_test_close_remote_parent();
+  fake_ioctl_error = ENOTTY;
+}
+
+static void test_http1_continue_and_reset_issue_only_ioctl(void) {
+  fake_setsockopt_error = 0;
+  fake_data_ack_error = ENOPROTOOPT;
+  assert(obi_test_configure_remote_parent(1, "", 50, geteuid(), 82) == 1);
+
+  const unsigned char operations[] = {
+      test_data_operation_http1_receive_continue,
+      test_data_operation_http1_receive_reset,
+  };
+  const int ioctl_errors[] = {ENOTTY, EIO};
+  for (size_t operation_index = 0;
+       operation_index < sizeof(operations) / sizeof(operations[0]);
+       operation_index++) {
+    for (size_t error_index = 0;
+         error_index < sizeof(ioctl_errors) / sizeof(ioctl_errors[0]);
+         error_index++) {
+      reset_transport_observations();
+      fake_ioctl_error = ioctl_errors[error_index];
+
+      unsigned char packet[65] = {0};
+      packet[0] = operations[operation_index];
+      memset(packet + test_data_signal_offset, 0xff, sizeof(uint64_t));
+      int socket_fd = 60 + (int)operation_index;
+      int expected_result = fake_ioctl_error == ENOTTY ? 0 : -1;
+      assert(obi_test_emit_data_on_socket(socket_fd, packet) == expected_result);
+      assert(read_u64_le(packet, test_data_signal_offset) == 0);
+      assert(atomic_load(&observed_setsockopt_calls) == 0);
+      assert(atomic_load(&observed_getsockopt_calls) == 0);
+      assert(atomic_load(&observed_data_ack_nonce) == 0);
+      assert(obi_test_remote_parent_config_acquisition_count() == 0);
+      assert(atomic_load(&observed_ioctl_fd) == socket_fd);
+      assert(atomic_load(&observed_ioctl_request) == 0x0b10b1);
+      assert(atomic_load(&observed_ioctl_calls) == 1);
+      assert(atomic_load(&observed_ioctl_nonce) == 0);
+      assert(atomic_load(&observed_transport_event_count) == 1);
+      assert(observed_transport_events[0] == 2);
+      assert(observed_transport_events[1] == 0);
+      assert(observed_transport_events[2] == 0);
+    }
+  }
+
+  obi_test_close_remote_parent();
+  fake_data_ack_error = 0;
+  fake_ioctl_error = ENOTTY;
 }
 
 static void test_data_emit_rejects_missing_acknowledgement(void) {
@@ -1851,7 +2007,10 @@ int main(int argc, char **argv) {
   test_sockopt_negotiate_and_health_probe();
   test_forced_setsockopt_preserves_failure();
   test_forced_getsockopt_health_preserves_failure();
-  test_data_emit_negotiates_and_acknowledges_same_socket();
+  test_short_non_data_ioctl_packets_skip_nonce_snapshot();
+  test_acknowledged_data_operations_preserve_transport_order();
+  test_http1_start_hard_ioctl_error_skips_acknowledgement();
+  test_http1_continue_and_reset_issue_only_ioctl();
   test_data_emit_rejects_missing_acknowledgement();
   test_data_emit_falls_back_when_socket_negotiation_fails();
   test_retrieval_never_renegotiates_socket();

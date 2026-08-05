@@ -5,6 +5,7 @@
 
 package io.opentelemetry.obi.java.extension.probe;
 
+import io.opentelemetry.api.GlobalOpenTelemetry;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.SpanContext;
@@ -43,6 +44,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class OfficialAgentProbeExtension implements AutoConfigurationCustomizerProvider {
   private static final String OUTPUT_PROPERTY = "obi.test.official.agent.probe.output";
   private static final String FRAMEWORK_PROPERTY = "obi.test.official.agent.probe.framework";
+  private static final String REEXTRACT_ID_PROPERTY = "obi.test.official.agent.probe.reextract.id";
   private static final String FRAMEWORK_NETTY = "netty";
   private static final String RAW_OBI_PROPAGATOR =
       "io.opentelemetry.obi.java.extension.ObiRemoteParentPropagator";
@@ -104,7 +106,8 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
     if (wraps != 1) {
       output.append("ERROR\tmultiple-obi-propagators");
     }
-    return new RecordingObiPropagator(propagator, output, provider);
+    return new RecordingObiPropagator(
+        propagator, output, provider, System.getProperty(REEXTRACT_ID_PROPERTY));
   }
 
   private static String requiredProperty(String name) {
@@ -121,12 +124,19 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
     private final TextMapPropagator delegate;
     private final ProbeOutput output;
     private final ProviderState provider;
+    private final String reextractId;
+    private final AtomicBoolean reextractionStarted = new AtomicBoolean();
+    private final ThreadLocal<Boolean> reextracting = new ThreadLocal<>();
 
     private RecordingObiPropagator(
-        TextMapPropagator delegate, ProbeOutput output, ProviderState provider) {
+        TextMapPropagator delegate,
+        ProbeOutput output,
+        ProviderState provider,
+        String reextractId) {
       this.delegate = delegate;
       this.output = output;
       this.provider = provider;
+      this.reextractId = reextractId;
     }
 
     @Override
@@ -150,11 +160,35 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
       int invocation =
           EXTRACTION_CALLS.computeIfAbsent(id, ignored -> new AtomicInteger()).incrementAndGet();
       output.append("CALL\t" + id + "\t" + invocation);
+      boolean reentry = Boolean.TRUE.equals(reextracting.get());
+      if (reentry) {
+        output.append("REENTRY\t" + id + "\t" + invocation);
+      }
       Context first = extractPass(input, carrier, getter, id, invocation, 1);
       output.append(pass(id, invocation, 1, first));
+      if (reentry) {
+        return first.with(PROBE_ID_CONTEXT, id);
+      }
       Context second = extractPass(first, carrier, getter, id, invocation, 2);
       output.append(pass(id, invocation, 2, second));
-      return second.with(PROBE_ID_CONTEXT, id);
+      Context result = second.with(PROBE_ID_CONTEXT, id);
+      reextractRegisteredChain(carrier, getter, id);
+      return result;
+    }
+
+    private <C> void reextractRegisteredChain(C carrier, TextMapGetter<C> getter, String id) {
+      if (!id.equals(reextractId) || !reextractionStarted.compareAndSet(false, true)) {
+        return;
+      }
+      reextracting.set(Boolean.TRUE);
+      try {
+        GlobalOpenTelemetry.get()
+            .getPropagators()
+            .getTextMapPropagator()
+            .extract(Context.root(), carrier, getter);
+      } finally {
+        reextracting.remove();
+      }
     }
 
     private <C> Context extractPass(

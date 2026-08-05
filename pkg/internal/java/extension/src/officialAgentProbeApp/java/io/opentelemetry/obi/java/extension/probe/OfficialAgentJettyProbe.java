@@ -39,6 +39,7 @@ public final class OfficialAgentJettyProbe {
   private static final String OUTPUT_PROPERTY = "obi.test.official.agent.probe.output";
   private static final String MODE_PROPERTY = "obi.test.official.agent.probe.mode";
   private static final String MODE_DEFAULT = "default";
+  private static final String MODE_NESTED = "nested";
   private static final String MODE_STANDARD_FIRST = "standard-first";
 
   private static final String TRACE_W3C = "55555555555555555555555555555555";
@@ -60,7 +61,7 @@ public final class OfficialAgentJettyProbe {
     Path output = Paths.get(requiredProperty(OUTPUT_PROPERTY)).toAbsolutePath().normalize();
     String mode = requiredProperty(MODE_PROPERTY);
     require(
-        MODE_DEFAULT.equals(mode) || MODE_STANDARD_FIRST.equals(mode),
+        MODE_DEFAULT.equals(mode) || MODE_NESTED.equals(mode) || MODE_STANDARD_FIRST.equals(mode),
         "unsupported probe mode " + mode);
 
     AtomicInteger dispatchThreadId = new AtomicInteger();
@@ -96,6 +97,9 @@ public final class OfficialAgentJettyProbe {
       if (MODE_DEFAULT.equals(mode)) {
         runDefaultMode(port);
         expectedSpans = 11;
+      } else if (MODE_NESTED.equals(mode)) {
+        runNestedMode(port);
+        expectedSpans = 1;
       } else {
         runStandardFirstMode(port);
         expectedSpans = 1;
@@ -192,6 +196,21 @@ public final class OfficialAgentJettyProbe {
                       traceparent(TRACE_D_W3C, PARENT_D_W3C, "00"),
                       true)),
           "request D failed standard-first discard");
+    }
+  }
+
+  private static void runNestedMode(int port) throws Exception {
+    try (Socket socket = connect(port)) {
+      require(
+          "A:ok"
+              .equals(
+                  send(
+                      socket.getOutputStream(),
+                      new BufferedInputStream(socket.getInputStream()),
+                      "A",
+                      null,
+                      true)),
+          "nested-instrumentation request A failed");
     }
   }
 

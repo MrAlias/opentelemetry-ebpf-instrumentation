@@ -31,6 +31,7 @@ import org.junit.jupiter.api.Test;
 
 class OfficialAgentJettyRuntimeTest {
   private static final String MODE_DEFAULT = "default";
+  private static final String MODE_NESTED = "nested";
   private static final String MODE_STANDARD_FIRST = "standard-first";
 
   private static final String TRACE_A = "11111111111111111111111111111111";
@@ -116,7 +117,38 @@ class OfficialAgentJettyRuntimeTest {
         distribution,
         version,
         MODE_DEFAULT,
-        "obi,tracecontext,baggage");
+        "obi,tracecontext,baggage",
+        true,
+        null);
+    // Jetty starts the span, while the nested Servlet advice adds the servlet mapping route. The
+    // paired disabled-module run proves that the route came from an actual second stock server
+    // advice rather than from the probe or Jetty itself.
+    runMode(
+        officialAgent,
+        expectedSha256,
+        helper,
+        extension,
+        probeExtension,
+        probeClasspath,
+        distribution,
+        version,
+        MODE_NESTED,
+        "obi,tracecontext,baggage",
+        true,
+        "_probe__");
+    runMode(
+        officialAgent,
+        expectedSha256,
+        helper,
+        extension,
+        probeExtension,
+        probeClasspath,
+        distribution,
+        version,
+        MODE_NESTED,
+        "obi,tracecontext,baggage",
+        false,
+        "-");
     runMode(
         officialAgent,
         expectedSha256,
@@ -127,7 +159,9 @@ class OfficialAgentJettyRuntimeTest {
         distribution,
         version,
         MODE_STANDARD_FIRST,
-        "tracecontext,obi,baggage");
+        "tracecontext,obi,baggage",
+        true,
+        null);
     assertEquals(expectedSha256, sha256(officialAgent.toPath()));
   }
 
@@ -141,7 +175,9 @@ class OfficialAgentJettyRuntimeTest {
       String distribution,
       String version,
       String mode,
-      String propagators)
+      String propagators,
+      boolean servletEnabled,
+      String nestedExpectedRoute)
       throws Exception {
     Path directory = Files.createTempDirectory("obi-official-agent-jetty-");
     Path result = directory.resolve("spans.tsv");
@@ -164,6 +200,12 @@ class OfficialAgentJettyRuntimeTest {
       command.add("-Dotel.service.name=obi-official-agent-jetty-probe");
       command.add("-Dobi.test.official.agent.probe.output=" + result);
       command.add("-Dobi.test.official.agent.probe.mode=" + mode);
+      if (MODE_DEFAULT.equals(mode)) {
+        command.add("-Dobi.test.official.agent.probe.reextract.id=A");
+      }
+      if (!servletEnabled) {
+        command.add("-Dotel.instrumentation.servlet.enabled=false");
+      }
       command.add("-cp");
       command.add(probeClasspath);
       command.add("io.opentelemetry.obi.java.extension.probe.OfficialAgentJettyProbe");
@@ -184,6 +226,9 @@ class OfficialAgentJettyRuntimeTest {
         assertCommonResult(lines);
         if (MODE_DEFAULT.equals(mode)) {
           assertDefaultResult(lines, output);
+        } else if (MODE_NESTED.equals(mode)) {
+          assertTrue(nestedExpectedRoute != null, "missing nested route oracle");
+          assertNestedResult(lines, output, MODE_NESTED, nestedExpectedRoute);
         } else {
           assertStandardFirstResult(lines, output);
         }
@@ -225,7 +270,7 @@ class OfficialAgentJettyRuntimeTest {
       assertDispatch(output, id);
     }
 
-    assertAllPasses(lines, "A", invocations.get("A"), TRACE_A, PARENT_A, true, true);
+    assertRegisteredReextraction(lines, invocations.get("A"));
     assertAllPasses(lines, "B", invocations.get("B"), TRACE_B, PARENT_B, true, false);
     assertAllPasses(lines, "C", invocations.get("C"), INVALID_TRACE, INVALID_SPAN, false, false);
     assertAllPasses(lines, "H", invocations.get("H"), INVALID_TRACE, INVALID_SPAN, false, false);
@@ -241,7 +286,11 @@ class OfficialAgentJettyRuntimeTest {
     assertAllPasses(lines, "P", invocations.get("P"), TRACE_P, PARENT_P, true, true);
     assertAllPasses(lines, "Q", invocations.get("Q"), TRACE_Q, PARENT_Q, true, false);
 
-    for (String id : new String[] {"A", "B", "M", "W", "F", "P", "Q"}) {
+    List<String> reextractionTakes = prefix(lines, "PROVIDER\tTAKE\tA\t");
+    assertEquals(2, reextractionTakes.size(), lines.toString());
+    assertEquals("PROVIDER\tTAKE\tA\t1\t1\tVALID", reextractionTakes.get(0));
+    assertEquals("PROVIDER\tTAKE\tA\t2\t1\tALREADY_CONSUMED", reextractionTakes.get(1));
+    for (String id : new String[] {"B", "M", "W", "F", "P", "Q"}) {
       assertEquals(
           "PROVIDER\tTAKE\t" + id + "\t1\t1\tVALID", only(lines, "PROVIDER\tTAKE\t" + id + "\t"));
     }
@@ -260,7 +309,7 @@ class OfficialAgentJettyRuntimeTest {
         invocations.get("R") * 2, prefix(lines, "PROVIDER\tTAKE\tR\t").size(), lines.toString());
     assertProviderPasses(lines, "TAKE", "R", invocations.get("R"), "MALFORMED");
     assertEquals(
-        7 + (missingInvocations + invocations.get("R") + invocations.get("S")) * 2,
+        8 + (missingInvocations + invocations.get("R") + invocations.get("S")) * 2,
         prefix(lines, "PROVIDER\tTAKE\t").size(),
         lines.toString());
     assertEquals(0, prefix(lines, "PROVIDER\tDISCARD\t").size(), lines.toString());
@@ -270,7 +319,7 @@ class OfficialAgentJettyRuntimeTest {
     assertEquals((long) missingInvocations * 2L, counter(diagnostics, "t_missing"));
     assertEquals((long) invocations.get("S") * 2L, counter(diagnostics, "t_stale"));
     assertEquals((long) invocations.get("R") * 2L, counter(diagnostics, "t_malformed"));
-    assertEquals(0L, counter(diagnostics, "t_already_consumed"));
+    assertEquals(1L, counter(diagnostics, "t_already_consumed"));
     assertEquals(4L, counter(diagnostics, "take_sampled"));
     assertEquals(3L, counter(diagnostics, "take_unsampled"));
     assertEquals(2L, counter(diagnostics, "discard_standard"));
@@ -281,6 +330,7 @@ class OfficialAgentJettyRuntimeTest {
     assertEquals(0L, counter(diagnostics, "d_already_consumed"));
 
     Map<String, SpanResult> spans = spans(lines, 11);
+    assertEquals(1, prefix(lines, "SPAN\tA\t").size(), lines.toString());
     assertRemoteSpan(required(spans, "A"), TRACE_A, PARENT_A, true);
     assertRemoteSpan(required(spans, "B"), TRACE_B, PARENT_B, false);
     assertRemoteSpan(required(spans, "H"), TRACE_W3C_ONLY, PARENT_W3C_ONLY, true);
@@ -372,6 +422,26 @@ class OfficialAgentJettyRuntimeTest {
     assertNotEquals(PARENT_D_OBI, standard.parentSpanId);
   }
 
+  private static void assertNestedResult(
+      List<String> lines, String output, String mode, String expectedRoute) {
+    int invocations = invocationCount(lines, "A");
+    assertDispatch(output, "A");
+    assertEquals(1, invocations, lines.toString());
+    assertPasses(lines, "A", 1, TRACE_A, PARENT_A, true, true);
+    assertEquals("PROVIDER\tTAKE\tA\t1\t1\tVALID", only(lines, "PROVIDER\tTAKE\tA\t"));
+
+    Map<String, Long> diagnostics = diagnostics(output, mode);
+    assertEquals(1L, counter(diagnostics, "t_valid"));
+    assertEquals(0L, counter(diagnostics, "t_missing"));
+    assertEquals(0L, counter(diagnostics, "t_already_consumed"));
+    assertEquals(1L, counter(diagnostics, "take_sampled"));
+    assertEquals(0L, counter(diagnostics, "take_unsampled"));
+    assertEquals(0L, counter(diagnostics, "discard_standard"));
+
+    Map<String, SpanResult> spans = spans(lines, 1, expectedRoute);
+    assertRemoteSpan(required(spans, "A"), TRACE_A, PARENT_A, true);
+  }
+
   private static void assertDispatch(String output, String id) {
     List<String> outputLines = lines(output);
     long requestThread = dispatchThread(outputLines, "REQUEST", id);
@@ -423,6 +493,21 @@ class OfficialAgentJettyRuntimeTest {
     }
   }
 
+  private static void assertRegisteredReextraction(List<String> lines, int invocations) {
+    assertTrue(invocations >= 2, "missing registered-chain re-extraction for A");
+    assertPasses(lines, "A", 1, TRACE_A, PARENT_A, true, true);
+    assertEquals("REENTRY\tA\t2", only(lines, "REENTRY\tA\t"));
+    PassResult reentry = pass(lines, "A", 2, 1);
+    assertEquals(INVALID_TRACE, reentry.traceId);
+    assertEquals(INVALID_SPAN, reentry.parentSpanId);
+    assertFalse(reentry.remote);
+    assertFalse(reentry.sampled);
+    assertEquals(0, prefix(lines, "PASS\tA\t2\t2\t").size(), lines.toString());
+    for (int invocation = 3; invocation <= invocations; invocation++) {
+      assertPasses(lines, "A", invocation, TRACE_A, PARENT_A, true, true);
+    }
+  }
+
   private static void assertPasses(
       List<String> lines,
       String id,
@@ -445,6 +530,11 @@ class OfficialAgentJettyRuntimeTest {
   }
 
   private static Map<String, SpanResult> spans(List<String> lines, int expected) {
+    return spans(lines, expected, "_probe__");
+  }
+
+  private static Map<String, SpanResult> spans(
+      List<String> lines, int expected, String expectedRoute) {
     List<String> spanLines = prefix(lines, "SPAN\t");
     assertEquals(expected, spanLines.size(), lines.toString());
     assertEquals(0, prefix(lines, "SPAN\t-\t").size(), lines.toString());
@@ -457,7 +547,7 @@ class OfficialAgentJettyRuntimeTest {
       spans.put(span.id, span);
       spanIds.put(span.spanId, span.id);
       assertEquals("io.opentelemetry.jetty-11.0", span.scope);
-      assertEquals("_probe__", span.route);
+      assertEquals(expectedRoute, span.route);
     }
     assertEquals(expected, spans.size());
     return spans;

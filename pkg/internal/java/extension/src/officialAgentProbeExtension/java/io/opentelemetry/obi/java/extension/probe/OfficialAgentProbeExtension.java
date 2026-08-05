@@ -75,6 +75,8 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
   private static final String PARENT_Q = "cccccccccccccccc";
   private static final String TRACE_D_OBI = "f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0";
   private static final String PARENT_D_OBI = "abababababababab";
+  private static final String TRACE_T = "20202020202020202020202020202020";
+  private static final String PARENT_T = "2121212121212121";
 
   private static final ContextKey<String> PROBE_ID_CONTEXT =
       ContextKey.named("obi-official-agent-probe-id");
@@ -330,6 +332,9 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
       int invocation =
           EXTRACTION_CALLS.computeIfAbsent(id, ignored -> new AtomicInteger()).incrementAndGet();
       output.append("CALL\t" + id + "\t" + invocation);
+      if ("T".equals(id)) {
+        output.append("THREAD\tEXTRACT\tT\t" + Thread.currentThread().getId());
+      }
       boolean reentry = Boolean.TRUE.equals(reextracting.get());
       if (reentry) {
         output.append("REENTRY\t" + id + "\t" + invocation);
@@ -389,7 +394,8 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
           || "S".equals(value)
           || "P".equals(value)
           || "Q".equals(value)
-          || "D".equals(value)) {
+          || "D".equals(value)
+          || "T".equals(value)) {
         return value;
       }
       return null;
@@ -479,6 +485,8 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
             "Q", new ScenarioState(decode.invoke(null, record(TRACE_Q, PARENT_Q, 0, 7L))));
         scenarios.put(
             "D", new ScenarioState(decode.invoke(null, record(TRACE_D_OBI, PARENT_D_OBI, 1, 8L))));
+        scenarios.put(
+            "T", new ScenarioState(decode.invoke(null, record(TRACE_T, PARENT_T, 1, 9L))));
 
         ProviderState state =
             new ProviderState(
@@ -798,6 +806,9 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
       String id = parentContext.get(PROBE_ID_CONTEXT);
       if (id != null && span.getKind() == SpanKind.SERVER) {
         span.setAttribute(PROBE_ID, id);
+        if ("T".equals(id)) {
+          output.append("THREAD\tSPAN_START\tT\t" + Thread.currentThread().getId());
+        }
       }
     }
 

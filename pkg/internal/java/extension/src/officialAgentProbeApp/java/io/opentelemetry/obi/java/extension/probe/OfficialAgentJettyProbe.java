@@ -38,6 +38,7 @@ import org.eclipse.jetty.servlet.ServletHolder;
 public final class OfficialAgentJettyProbe {
   private static final String OUTPUT_PROPERTY = "obi.test.official.agent.probe.output";
   private static final String MODE_PROPERTY = "obi.test.official.agent.probe.mode";
+  private static final String MODE_BLOCKING = "blocking";
   private static final String MODE_DEFAULT = "default";
   private static final String MODE_HELPER_ABSENT = "helper-absent";
   private static final String MODE_NESTED = "nested";
@@ -62,11 +63,13 @@ public final class OfficialAgentJettyProbe {
     Path output = Paths.get(requiredProperty(OUTPUT_PROPERTY)).toAbsolutePath().normalize();
     String mode = requiredProperty(MODE_PROPERTY);
     require(
-        MODE_DEFAULT.equals(mode)
+        MODE_BLOCKING.equals(mode)
+            || MODE_DEFAULT.equals(mode)
             || MODE_HELPER_ABSENT.equals(mode)
             || MODE_NESTED.equals(mode)
             || MODE_STANDARD_FIRST.equals(mode),
         "unsupported probe mode " + mode);
+    boolean blockingMode = MODE_BLOCKING.equals(mode);
 
     AtomicInteger dispatchThreadId = new AtomicInteger();
     ExecutorService dispatchExecutor =
@@ -88,8 +91,8 @@ public final class OfficialAgentJettyProbe {
 
     ServletContextHandler context = new ServletContextHandler();
     context.setContextPath("/");
-    ServletHolder servlet = new ServletHolder(new AsyncProbeServlet(dispatchExecutor));
-    servlet.setAsyncSupported(true);
+    ServletHolder servlet = new ServletHolder(new ProbeServlet(dispatchExecutor, blockingMode));
+    servlet.setAsyncSupported(!blockingMode);
     context.addServlet(servlet, "/probe/*");
     server.setHandler(context);
 
@@ -98,7 +101,10 @@ public final class OfficialAgentJettyProbe {
       int port = connector.getLocalPort();
       require(port > 0, "Jetty did not bind an ephemeral port");
       int expectedSpans;
-      if (MODE_DEFAULT.equals(mode)) {
+      if (MODE_BLOCKING.equals(mode)) {
+        runBlockingMode(port);
+        expectedSpans = 1;
+      } else if (MODE_DEFAULT.equals(mode)) {
         runDefaultMode(port);
         expectedSpans = 11;
       } else if (MODE_HELPER_ABSENT.equals(mode)) {
@@ -192,6 +198,21 @@ public final class OfficialAgentJettyProbe {
           "request S failed stale-OBI precedence");
     }
     sendParallel(port);
+  }
+
+  private static void runBlockingMode(int port) throws Exception {
+    try (Socket socket = connect(port)) {
+      require(
+          "T:ok"
+              .equals(
+                  send(
+                      socket.getOutputStream(),
+                      new BufferedInputStream(socket.getInputStream()),
+                      "T",
+                      null,
+                      true)),
+          "blocking request T failed");
+    }
   }
 
   private static void runStandardFirstMode(int port) throws Exception {
@@ -397,11 +418,13 @@ public final class OfficialAgentJettyProbe {
     }
   }
 
-  private static final class AsyncProbeServlet extends HttpServlet {
+  private static final class ProbeServlet extends HttpServlet {
     private final ExecutorService dispatchExecutor;
+    private final boolean blockingMode;
 
-    private AsyncProbeServlet(ExecutorService dispatchExecutor) {
+    private ProbeServlet(ExecutorService dispatchExecutor, boolean blockingMode) {
       this.dispatchExecutor = dispatchExecutor;
+      this.blockingMode = blockingMode;
     }
 
     @Override
@@ -420,11 +443,22 @@ public final class OfficialAgentJettyProbe {
               || "S".equals(id)
               || "P".equals(id)
               || "Q".equals(id)
-              || "D".equals(id),
+              || "D".equals(id)
+              || "T".equals(id),
           "invalid probe id");
 
       if (request.getDispatcherType() == DispatcherType.REQUEST) {
         System.out.println("OBI_DISPATCH\tREQUEST\t" + id + "\t" + Thread.currentThread().getId());
+        if (blockingMode) {
+          require("T".equals(id), "unexpected blocking probe id");
+          require(!request.isAsyncSupported(), "blocking request unexpectedly supports async");
+          require(!request.isAsyncStarted(), "blocking request unexpectedly started async");
+          writeResponse(id, response);
+          require(!request.isAsyncStarted(), "blocking response unexpectedly started async");
+          System.out.println(
+              "OBI_DISPATCH\tBLOCKING\t" + id + "\t" + Thread.currentThread().getId());
+          return;
+        }
         AsyncContext async = request.startAsync();
         async.setTimeout(5_000L);
         dispatchExecutor.execute(
@@ -436,8 +470,13 @@ public final class OfficialAgentJettyProbe {
         return;
       }
 
+      require(!blockingMode, "blocking request was asynchronously dispatched");
       require(request.getDispatcherType() == DispatcherType.ASYNC, "unexpected dispatch type");
       System.out.println("OBI_DISPATCH\tASYNC\t" + id + "\t" + Thread.currentThread().getId());
+      writeResponse(id, response);
+    }
+
+    private static void writeResponse(String id, HttpServletResponse response) throws IOException {
       byte[] body = (id + ":ok").getBytes(StandardCharsets.UTF_8);
       response.setStatus(HttpServletResponse.SC_OK);
       response.setContentType("text/plain");

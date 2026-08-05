@@ -30,6 +30,7 @@ import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 
 class OfficialAgentJettyRuntimeTest {
+  private static final String MODE_BLOCKING = "blocking";
   private static final String MODE_DEFAULT = "default";
   private static final String MODE_HELPER_ABSENT = "helper-absent";
   private static final String MODE_NESTED = "nested";
@@ -61,6 +62,8 @@ class OfficialAgentJettyRuntimeTest {
   private static final String PARENT_D_W3C = "eeeeeeeeeeeeeeee";
   private static final String TRACE_D_OBI = "f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0";
   private static final String PARENT_D_OBI = "abababababababab";
+  private static final String TRACE_T = "20202020202020202020202020202020";
+  private static final String PARENT_T = "2121212121212121";
   private static final String INVALID_TRACE = "00000000000000000000000000000000";
   private static final String INVALID_SPAN = "0000000000000000";
 
@@ -108,6 +111,20 @@ class OfficialAgentJettyRuntimeTest {
     assertNoAgentProvidedClasses(extension);
     assertNoAgentProvidedClasses(probeExtension);
 
+    runMode(
+        officialAgent,
+        expectedSha256,
+        helper,
+        extension,
+        probeExtension,
+        probeClasspath,
+        distribution,
+        version,
+        MODE_BLOCKING,
+        "obi,tracecontext,baggage",
+        true,
+        null,
+        true);
     runMode(
         officialAgent,
         expectedSha256,
@@ -252,15 +269,19 @@ class OfficialAgentJettyRuntimeTest {
         } else {
           assertHelperAbsentResult(lines, output);
         }
-        if (MODE_DEFAULT.equals(mode)) {
+        if (MODE_BLOCKING.equals(mode)) {
+          assertBlockingResult(lines, output);
+        } else if (MODE_DEFAULT.equals(mode)) {
           assertDefaultResult(lines, output);
         } else if (MODE_NESTED.equals(mode)) {
           assertTrue(nestedExpectedRoute != null, "missing nested route oracle");
           assertNestedResult(lines, output, MODE_NESTED, nestedExpectedRoute);
         } else if (MODE_STANDARD_FIRST.equals(mode)) {
           assertStandardFirstResult(lines, output);
-        } else {
+        } else if (MODE_HELPER_ABSENT.equals(mode)) {
           assertHelperAbsentSpans(lines, output);
+        } else {
+          throw new AssertionError("unsupported mode " + mode);
         }
         assertEquals(expectedSha256, sha256(officialAgent.toPath()));
       } catch (Throwable failure) {
@@ -491,6 +512,44 @@ class OfficialAgentJettyRuntimeTest {
     }
   }
 
+  private static void assertBlockingResult(List<String> lines, String output) {
+    assertEquals(1, invocationCount(lines, "T"), lines.toString());
+    assertPasses(lines, "T", 1, TRACE_T, PARENT_T, true, true);
+    assertEquals("PROVIDER\tTAKE\tT\t1\t1\tVALID", only(lines, "PROVIDER\tTAKE\tT\t"));
+    assertEquals(1, prefix(lines, "PROVIDER\tTAKE\t").size(), lines.toString());
+    assertEquals(0, prefix(lines, "PROVIDER\tDISCARD\t").size(), lines.toString());
+
+    Map<String, Long> diagnostics = diagnostics(output, MODE_BLOCKING);
+    assertEquals(1L, counter(diagnostics, "t_valid"));
+    assertEquals(0L, counter(diagnostics, "t_missing"));
+    assertEquals(0L, counter(diagnostics, "t_stale"));
+    assertEquals(0L, counter(diagnostics, "t_malformed"));
+    assertEquals(0L, counter(diagnostics, "t_already_consumed"));
+    assertEquals(1L, counter(diagnostics, "take_sampled"));
+    assertEquals(0L, counter(diagnostics, "take_unsampled"));
+    assertEquals(0L, counter(diagnostics, "discard_standard"));
+    assertEquals(0L, counter(diagnostics, "d_valid"));
+    assertEquals(0L, counter(diagnostics, "d_missing"));
+    assertEquals(0L, counter(diagnostics, "d_stale"));
+    assertEquals(0L, counter(diagnostics, "d_malformed"));
+    assertEquals(0L, counter(diagnostics, "d_already_consumed"));
+
+    Map<String, SpanResult> spans = spans(lines, 1);
+    assertRemoteSpan(required(spans, "T"), TRACE_T, PARENT_T, true);
+
+    List<String> outputLines = lines(output);
+    long extractionThread = recordedThread(lines, "EXTRACT", "T");
+    long spanStartThread = recordedThread(lines, "SPAN_START", "T");
+    long requestThread = dispatchThread(outputLines, "REQUEST", "T");
+    long responseThread = dispatchThread(outputLines, "BLOCKING", "T");
+    assertEquals(extractionThread, spanStartThread, lines.toString());
+    assertEquals(extractionThread, requestThread, output);
+    assertEquals(extractionThread, responseThread, output);
+    assertEquals(2, prefix(outputLines, "OBI_DISPATCH\t").size(), output);
+    assertEquals(0, prefix(outputLines, "OBI_DISPATCH\tEXECUTOR\t").size(), output);
+    assertEquals(0, prefix(outputLines, "OBI_DISPATCH\tASYNC\t").size(), output);
+  }
+
   private static void assertProviderPasses(
       List<String> lines, String operation, String id, int invocations, String status) {
     for (int invocation = 1; invocation <= invocations; invocation++) {
@@ -577,6 +636,18 @@ class OfficialAgentJettyRuntimeTest {
     String[] fields = line.split("\\t", -1);
     assertEquals(4, fields.length, line);
     assertEquals("OBI_DISPATCH", fields[0], line);
+    assertEquals(phase, fields[1], line);
+    assertEquals(id, fields[2], line);
+    long thread = Long.parseLong(fields[3]);
+    assertTrue(thread > 0, line);
+    return thread;
+  }
+
+  private static long recordedThread(List<String> lines, String phase, String id) {
+    String line = only(lines, "THREAD\t" + phase + "\t" + id + "\t");
+    String[] fields = line.split("\\t", -1);
+    assertEquals(4, fields.length, line);
+    assertEquals("THREAD", fields[0], line);
     assertEquals(phase, fields[1], line);
     assertEquals(id, fields[2], line);
     long thread = Long.parseLong(fields[3]);

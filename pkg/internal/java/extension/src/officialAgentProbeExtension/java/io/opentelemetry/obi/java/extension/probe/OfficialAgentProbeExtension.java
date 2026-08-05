@@ -812,9 +812,11 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
       String id = parentContext.get(PROBE_ID_CONTEXT);
       if (id != null && span.getKind() == SpanKind.SERVER) {
         span.setAttribute(PROBE_ID, id);
-        if ("T".equals(id)) {
+        if (captureHttp) {
+          output.append("THREAD\tSPAN_START\t" + id + "\t" + Thread.currentThread().getId());
+        } else if ("T".equals(id)) {
           output.append("THREAD\tSPAN_START\tT\t" + Thread.currentThread().getId());
-        } else if ("B".equals(id) && !captureHttp) {
+        } else if ("B".equals(id)) {
           output.append(
               "TIMING\tSPAN_START\tB\t"
                   + Thread.currentThread().getId()

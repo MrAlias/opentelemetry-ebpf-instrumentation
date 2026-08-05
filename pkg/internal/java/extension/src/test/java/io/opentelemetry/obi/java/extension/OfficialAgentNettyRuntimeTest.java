@@ -217,6 +217,7 @@ class OfficialAgentNettyRuntimeTest {
 
     List<String> outputLines = lines(output);
     assertTrue(prefix(outputLines, "OBI_NETTY_TASK\tTASK_CAPTURE\t").size() > 0, output);
+    assertTrue(prefix(outputLines, "OBI_NETTY_TASK\tTASK_RELAY_CAPTURE\t").size() >= 2, output);
     assertTrue(prefix(outputLines, "OBI_NETTY_TASK\tTASK_LINK\t").size() > 0, output);
     Map<String, HandlerResult> handlers = new HashMap<>();
     for (String id : new String[] {"A", "B", "C", "P", "Q"}) {
@@ -227,6 +228,9 @@ class OfficialAgentNettyRuntimeTest {
       assertTrue(handler.channelFd >= 0, output);
       assertTrue(handler.lifecycleIdentity != 0, output);
       assertNotEquals(handler.tlsThread, handler.requestThread, output);
+      assertTrue(handler.tlsNativeThread > 0, output);
+      assertTrue(handler.requestNativeThread > 0, output);
+      assertNotEquals(handler.tlsNativeThread, handler.requestNativeThread, output);
       assertEquals(2, handler.lookupSource, output);
       assertTrue(handler.lifecycleActive, output);
       assertEquals(-1, handler.socketFileDescriptor, output);
@@ -248,6 +252,147 @@ class OfficialAgentNettyRuntimeTest {
     assertNotEquals(
         handlers.get("P").lifecycleIdentity, handlers.get("Q").lifecycleIdentity, output);
 
+    for (String id : new String[] {"A", "B", "C"}) {
+      assertEquals(0, prefix(outputLines, "OBI_NETTY_HANDOFF\t" + id + "\t").size(), output);
+    }
+    assertEquals(2, prefix(outputLines, "OBI_NETTY_HANDOFF\t").size(), output);
+    Map<String, HandoffResult> handoffs = new HashMap<>();
+    for (String id : new String[] {"P", "Q"}) {
+      HandoffResult handoff =
+          HandoffResult.parse(only(outputLines, "OBI_NETTY_HANDOFF\t" + id + "\t"));
+      handoffs.put(id, handoff);
+      HandlerResult handler = handlers.get(id);
+      assertEquals(handler.channelId, handoff.channelId, output);
+      assertEquals(handler.channelFd, handoff.channelFd, output);
+      assertEquals(handler.lifecycleIdentity, handoff.lifecycleIdentity, output);
+      assertEquals(handler.tlsThread, handoff.tlsThread, output);
+      assertEquals(handler.requestThread, handoff.requestThread, output);
+      assertEquals(handler.tlsNativeThread, handoff.tlsNativeThread, output);
+      assertEquals(handler.requestNativeThread, handoff.requestNativeThread, output);
+      assertTrue(handoff.tlsThread > 0, output);
+      assertTrue(handoff.intermediateThread > 0, output);
+      assertTrue(handoff.requestThread > 0, output);
+      assertNotEquals(handoff.tlsThread, handoff.intermediateThread, output);
+      assertNotEquals(handoff.intermediateThread, handoff.requestThread, output);
+      assertNotEquals(handoff.tlsThread, handoff.requestThread, output);
+      assertTrue(handoff.tlsNativeThread > 0, output);
+      assertTrue(handoff.intermediateNativeThread > 0, output);
+      assertTrue(handoff.requestNativeThread > 0, output);
+      assertNotEquals(handoff.tlsNativeThread, handoff.intermediateNativeThread, output);
+      assertNotEquals(handoff.intermediateNativeThread, handoff.requestNativeThread, output);
+      assertNotEquals(handoff.tlsNativeThread, handoff.requestNativeThread, output);
+      assertEquals(2, handoff.lookupSource, output);
+      assertTrue(handoff.lifecycleActive, output);
+      assertEquals(handler.channelFd, handoff.socketFileDescriptor, output);
+    }
+    assertNotEquals(handoffs.get("P").tlsThread, handoffs.get("Q").tlsThread, output);
+    assertEquals(
+        handoffs.get("P").intermediateThread, handoffs.get("Q").intermediateThread, output);
+    assertNotEquals(handoffs.get("P").requestThread, handoffs.get("Q").requestThread, output);
+    assertNotEquals(handoffs.get("P").tlsNativeThread, handoffs.get("Q").tlsNativeThread, output);
+    assertEquals(
+        handoffs.get("P").intermediateNativeThread,
+        handoffs.get("Q").intermediateNativeThread,
+        output);
+    assertNotEquals(
+        handoffs.get("P").requestNativeThread, handoffs.get("Q").requestNativeThread, output);
+
+    assertEquals(4, prefix(outputLines, "OBI_NETTY_EDGE\t").size(), output);
+    Map<Long, String> edgeTokens = new HashMap<>();
+    for (String id : new String[] {"P", "Q"}) {
+      HandoffResult handoff = handoffs.get(id);
+      EdgeResult first =
+          EdgeResult.parse(
+              only(
+                  outputLines,
+                  "OBI_NETTY_EDGE\t" + id + "\t" + handoff.channelId + "\tTLS_TO_INTERMEDIATE\t"));
+      EdgeResult second =
+          EdgeResult.parse(
+              only(
+                  outputLines,
+                  "OBI_NETTY_EDGE\t"
+                      + id
+                      + "\t"
+                      + handoff.channelId
+                      + "\tINTERMEDIATE_TO_REQUEST\t"));
+      assertEquals(id, first.id, output);
+      assertEquals(id, second.id, output);
+      assertEquals(handoff.channelId, first.channelId, output);
+      assertEquals(handoff.channelId, second.channelId, output);
+      assertEquals("TLS_TO_INTERMEDIATE", first.edge, output);
+      assertEquals("INTERMEDIATE_TO_REQUEST", second.edge, output);
+      assertEdge(
+          outputLines,
+          output,
+          first,
+          "TASK_CAPTURE",
+          handoff.tlsNativeThread,
+          handoff.intermediateNativeThread);
+      assertEdge(
+          outputLines,
+          output,
+          second,
+          "TASK_RELAY_CAPTURE",
+          handoff.intermediateNativeThread,
+          handoff.requestNativeThread);
+      assertTrue(first.linkSequence < second.captureSequence, output);
+      assertFalse(edgeTokens.containsKey(first.token), "duplicate edge token in " + output);
+      edgeTokens.put(first.token, id + "/TLS_TO_INTERMEDIATE");
+      assertFalse(edgeTokens.containsKey(second.token), "duplicate edge token in " + output);
+      edgeTokens.put(second.token, id + "/INTERMEDIATE_TO_REQUEST");
+    }
+    assertEquals(4, edgeTokens.size(), output);
+
+    Map<String, IntermediateCleanupResult> intermediateCleanups = new HashMap<>();
+    List<String> intermediateCleanupLines = prefix(outputLines, "OBI_NETTY_INTERMEDIATE_CLEANUP\t");
+    assertEquals(2, intermediateCleanupLines.size(), output);
+    for (String line : intermediateCleanupLines) {
+      IntermediateCleanupResult cleanup = IntermediateCleanupResult.parse(line);
+      assertFalse(
+          intermediateCleanups.containsKey(cleanup.id),
+          "duplicate intermediate cleanup for " + cleanup.id);
+      intermediateCleanups.put(cleanup.id, cleanup);
+    }
+    for (String id : new String[] {"P", "Q"}) {
+      IntermediateCleanupResult cleanup = intermediateCleanups.get(id);
+      HandoffResult handoff = handoffs.get(id);
+      assertTrue(cleanup != null, "missing intermediate cleanup for " + id);
+      assertEquals(handoff.intermediateThread, cleanup.threadId, output);
+      assertEquals(handoff.intermediateNativeThread, cleanup.nativeThreadId, output);
+      assertNotEquals(2, cleanup.lookupSource, output);
+      assertFalse(cleanup.directAuthority, output);
+      assertFalse(cleanup.lifecycleActive, output);
+      assertEquals(-1, cleanup.socketFileDescriptor, output);
+      assertFalse(cleanup.exactTaskRelayState, output);
+      assertTrue(cleanup.baselineRestored, output);
+      assertFalse(cleanup.socketContextPresent, output);
+      assertEquals(0, cleanup.receiveDepth, output);
+    }
+
+    Map<String, TlsCleanupResult> tlsCleanups = new HashMap<>();
+    List<String> tlsCleanupLines = prefix(outputLines, "OBI_NETTY_TLS_CLEANUP\t");
+    assertEquals(2, tlsCleanupLines.size(), output);
+    for (String line : tlsCleanupLines) {
+      TlsCleanupResult cleanup = TlsCleanupResult.parse(line);
+      assertFalse(tlsCleanups.containsKey(cleanup.id), "duplicate TLS cleanup for " + cleanup.id);
+      tlsCleanups.put(cleanup.id, cleanup);
+    }
+    for (String id : new String[] {"P", "Q"}) {
+      TlsCleanupResult cleanup = tlsCleanups.get(id);
+      HandoffResult handoff = handoffs.get(id);
+      assertTrue(cleanup != null, "missing TLS cleanup for " + id);
+      assertEquals(handoff.tlsThread, cleanup.threadId, output);
+      assertEquals(handoff.tlsNativeThread, cleanup.nativeThreadId, output);
+      assertNotEquals(2, cleanup.lookupSource, output);
+      assertFalse(cleanup.directAuthority, output);
+      assertFalse(cleanup.lifecycleActive, output);
+      assertEquals(-1, cleanup.socketFileDescriptor, output);
+      assertFalse(cleanup.exactTaskRelayState, output);
+      assertTrue(cleanup.baselineRestored, output);
+      assertFalse(cleanup.socketContextPresent, output);
+      assertEquals(0, cleanup.receiveDepth, output);
+    }
+
     Map<String, CleanupResult> cleanups = new HashMap<>();
     List<String> cleanupLines = prefix(outputLines, "OBI_NETTY_CLEANUP\t");
     assertEquals(5, cleanupLines.size(), output);
@@ -262,12 +407,43 @@ class OfficialAgentNettyRuntimeTest {
       assertTrue(cleanup != null, "missing cleanup result for " + id);
       assertEquals(handler.channelId, cleanup.channelId, output);
       assertEquals(handler.requestThread, cleanup.threadId, output);
+      assertEquals(handler.requestNativeThread, cleanup.nativeThreadId, output);
       assertNotEquals(2, cleanup.lookupSource, output);
       assertFalse(cleanup.directAuthority, output);
       assertFalse(cleanup.lifecycleActive, output);
       assertEquals(-1, cleanup.socketFileDescriptor, output);
+      assertFalse(cleanup.exactTaskRelayState, output);
+      assertTrue(cleanup.baselineRestored, output);
+      assertFalse(cleanup.socketContextPresent, output);
+      assertEquals(0, cleanup.receiveDepth, output);
     }
     return handlers;
+  }
+
+  private static void assertEdge(
+      List<String> outputLines,
+      String output,
+      EdgeResult edge,
+      String expectedOperation,
+      long expectedParentThread,
+      long expectedChildThread) {
+    assertEquals(expectedOperation, edge.captureOperation, output);
+    assertNotEquals(0L, edge.token, output);
+    assertEquals(expectedParentThread, edge.captureThreadId, output);
+    assertEquals(expectedParentThread, edge.linkParentThreadId, output);
+    assertEquals(expectedChildThread, edge.linkChildThreadId, output);
+    assertTrue(edge.captureSequence < edge.linkSequence, output);
+    assertEquals(
+        1,
+        count(outputLines, "OBI_NETTY_TASK\t" + expectedOperation + "\t" + edge.token + "\t0"),
+        output);
+    assertEquals(
+        1,
+        count(
+            outputLines, "OBI_NETTY_TASK\tTASK_LINK\t" + expectedParentThread + "\t" + edge.token),
+        output);
+    assertEquals(
+        0, count(outputLines, "OBI_NETTY_TASK\tTASK_CANCEL\t" + edge.token + "\t0"), output);
   }
 
   private static void assertResult(
@@ -277,6 +453,13 @@ class OfficialAgentNettyRuntimeTest {
     assertEquals(1, count(lines, "WRAP\tobi\t1"), lines.toString());
     assertEquals(0, prefix(lines, "WRAP\tobi\t2").size(), lines.toString());
     assertEquals(0, prefix(lines, "ERROR\t").size(), lines.toString());
+    assertEquals(5, prefix(lines, "THREAD\tSPAN_START\t").size(), lines.toString());
+    for (String id : new String[] {"A", "B", "C", "P", "Q"}) {
+      assertEquals(
+          "THREAD\tSPAN_START\t" + id + "\t" + handlers.get(id).requestThread,
+          only(lines, "THREAD\tSPAN_START\t" + id + "\t"),
+          lines.toString());
+    }
 
     Map<String, Integer> invocations = new HashMap<>();
     for (String id : new String[] {"A", "B", "C", "P", "Q"}) {
@@ -476,6 +659,7 @@ class OfficialAgentNettyRuntimeTest {
   private static void assertProbeClasspath(String classpath) {
     assertFalse(classpath.isEmpty());
     int nettyJars = 0;
+    boolean codec = false;
     boolean codecHttp = false;
     boolean handler = false;
     for (String entry : classpath.split(Pattern.quote(File.pathSeparator))) {
@@ -486,11 +670,13 @@ class OfficialAgentNettyRuntimeTest {
       if (name.startsWith("netty-") && name.endsWith(".jar")) {
         nettyJars++;
         assertTrue(name.endsWith("-" + NETTY_VERSION + ".jar"), name);
+        codec |= name.equals("netty-codec-" + NETTY_VERSION + ".jar");
         codecHttp |= name.startsWith("netty-codec-http-");
         handler |= name.startsWith("netty-handler-");
       }
     }
     assertTrue(nettyJars > 0, classpath);
+    assertTrue(codec, classpath);
     assertTrue(codecHttp, classpath);
     assertTrue(handler, classpath);
   }
@@ -721,6 +907,8 @@ class OfficialAgentNettyRuntimeTest {
     private final int lookupSource;
     private final boolean lifecycleActive;
     private final int socketFileDescriptor;
+    private final long tlsNativeThread;
+    private final long requestNativeThread;
 
     private HandlerResult(
         String channelId,
@@ -730,7 +918,9 @@ class OfficialAgentNettyRuntimeTest {
         long requestThread,
         int lookupSource,
         boolean lifecycleActive,
-        int socketFileDescriptor) {
+        int socketFileDescriptor,
+        long tlsNativeThread,
+        long requestNativeThread) {
       this.channelId = channelId;
       this.channelFd = channelFd;
       this.lifecycleIdentity = lifecycleIdentity;
@@ -739,11 +929,13 @@ class OfficialAgentNettyRuntimeTest {
       this.lookupSource = lookupSource;
       this.lifecycleActive = lifecycleActive;
       this.socketFileDescriptor = socketFileDescriptor;
+      this.tlsNativeThread = tlsNativeThread;
+      this.requestNativeThread = requestNativeThread;
     }
 
     private static HandlerResult parse(String line) {
       String[] fields = line.split("\\t", -1);
-      assertEquals(10, fields.length, line);
+      assertEquals(12, fields.length, line);
       assertEquals("OBI_NETTY_HANDLER", fields[0], line);
       assertTrue(!fields[1].isEmpty(), line);
       assertTrue(!fields[2].isEmpty(), line);
@@ -755,7 +947,194 @@ class OfficialAgentNettyRuntimeTest {
           Long.parseLong(fields[6]),
           Integer.parseInt(fields[7]),
           "LIVE".equals(fields[8]),
-          Integer.parseInt(fields[9]));
+          Integer.parseInt(fields[9]),
+          Long.parseLong(fields[10]),
+          Long.parseLong(fields[11]));
+    }
+  }
+
+  private static final class HandoffResult {
+    private final String channelId;
+    private final int channelFd;
+    private final int lifecycleIdentity;
+    private final long tlsThread;
+    private final long intermediateThread;
+    private final long requestThread;
+    private final long tlsNativeThread;
+    private final long intermediateNativeThread;
+    private final long requestNativeThread;
+    private final int lookupSource;
+    private final boolean lifecycleActive;
+    private final int socketFileDescriptor;
+
+    private HandoffResult(
+        String channelId,
+        int channelFd,
+        int lifecycleIdentity,
+        long tlsThread,
+        long intermediateThread,
+        long requestThread,
+        long tlsNativeThread,
+        long intermediateNativeThread,
+        long requestNativeThread,
+        int lookupSource,
+        boolean lifecycleActive,
+        int socketFileDescriptor) {
+      this.channelId = channelId;
+      this.channelFd = channelFd;
+      this.lifecycleIdentity = lifecycleIdentity;
+      this.tlsThread = tlsThread;
+      this.intermediateThread = intermediateThread;
+      this.requestThread = requestThread;
+      this.tlsNativeThread = tlsNativeThread;
+      this.intermediateNativeThread = intermediateNativeThread;
+      this.requestNativeThread = requestNativeThread;
+      this.lookupSource = lookupSource;
+      this.lifecycleActive = lifecycleActive;
+      this.socketFileDescriptor = socketFileDescriptor;
+    }
+
+    private static HandoffResult parse(String line) {
+      String[] fields = line.split("\\t", -1);
+      assertEquals(14, fields.length, line);
+      assertEquals("OBI_NETTY_HANDOFF", fields[0], line);
+      assertTrue(!fields[1].isEmpty(), line);
+      assertTrue(!fields[2].isEmpty(), line);
+      boolean active = "LIVE".equals(fields[12]);
+      assertTrue(active || "NONE".equals(fields[12]), line);
+      return new HandoffResult(
+          fields[2],
+          Integer.parseInt(fields[3]),
+          Integer.parseInt(fields[4]),
+          Long.parseLong(fields[5]),
+          Long.parseLong(fields[6]),
+          Long.parseLong(fields[7]),
+          Long.parseLong(fields[8]),
+          Long.parseLong(fields[9]),
+          Long.parseLong(fields[10]),
+          Integer.parseInt(fields[11]),
+          active,
+          Integer.parseInt(fields[13]));
+    }
+  }
+
+  private static final class EdgeResult {
+    private final String id;
+    private final String channelId;
+    private final String edge;
+    private final String captureOperation;
+    private final long token;
+    private final long captureThreadId;
+    private final long linkParentThreadId;
+    private final long linkChildThreadId;
+    private final long captureSequence;
+    private final long linkSequence;
+
+    private EdgeResult(
+        String id,
+        String channelId,
+        String edge,
+        String captureOperation,
+        long token,
+        long captureThreadId,
+        long linkParentThreadId,
+        long linkChildThreadId,
+        long captureSequence,
+        long linkSequence) {
+      this.id = id;
+      this.channelId = channelId;
+      this.edge = edge;
+      this.captureOperation = captureOperation;
+      this.token = token;
+      this.captureThreadId = captureThreadId;
+      this.linkParentThreadId = linkParentThreadId;
+      this.linkChildThreadId = linkChildThreadId;
+      this.captureSequence = captureSequence;
+      this.linkSequence = linkSequence;
+    }
+
+    private static EdgeResult parse(String line) {
+      String[] fields = line.split("\\t", -1);
+      assertEquals(11, fields.length, line);
+      assertEquals("OBI_NETTY_EDGE", fields[0], line);
+      assertTrue(!fields[1].isEmpty(), line);
+      assertTrue(!fields[2].isEmpty(), line);
+      assertTrue(!fields[3].isEmpty(), line);
+      return new EdgeResult(
+          fields[1],
+          fields[2],
+          fields[3],
+          fields[4],
+          Long.parseLong(fields[5]),
+          Long.parseLong(fields[6]),
+          Long.parseLong(fields[7]),
+          Long.parseLong(fields[8]),
+          Long.parseLong(fields[9]),
+          Long.parseLong(fields[10]));
+    }
+  }
+
+  private static final class TlsCleanupResult {
+    private final String id;
+    private final long threadId;
+    private final int lookupSource;
+    private final boolean directAuthority;
+    private final boolean lifecycleActive;
+    private final int socketFileDescriptor;
+    private final long nativeThreadId;
+    private final boolean taskRelayState;
+    private final boolean exactTaskRelayState;
+    private final boolean baselineRestored;
+    private final boolean socketContextPresent;
+    private final int receiveDepth;
+
+    private TlsCleanupResult(
+        String id,
+        long threadId,
+        int lookupSource,
+        boolean directAuthority,
+        boolean lifecycleActive,
+        int socketFileDescriptor,
+        long nativeThreadId,
+        boolean taskRelayState,
+        boolean exactTaskRelayState,
+        boolean baselineRestored,
+        boolean socketContextPresent,
+        int receiveDepth) {
+      this.id = id;
+      this.threadId = threadId;
+      this.lookupSource = lookupSource;
+      this.directAuthority = directAuthority;
+      this.lifecycleActive = lifecycleActive;
+      this.socketFileDescriptor = socketFileDescriptor;
+      this.nativeThreadId = nativeThreadId;
+      this.taskRelayState = taskRelayState;
+      this.exactTaskRelayState = exactTaskRelayState;
+      this.baselineRestored = baselineRestored;
+      this.socketContextPresent = socketContextPresent;
+      this.receiveDepth = receiveDepth;
+    }
+
+    private static TlsCleanupResult parse(String line) {
+      String[] fields = line.split("\\t", -1);
+      assertEquals(13, fields.length, line);
+      assertEquals("OBI_NETTY_TLS_CLEANUP", fields[0], line);
+      assertTrue(!fields[1].isEmpty(), line);
+      boolean active = "LIVE".equals(fields[5]);
+      assertTrue(active || "NONE".equals(fields[5]), line);
+      return new TlsCleanupResult(
+          fields[1],
+          Long.parseLong(fields[2]),
+          Integer.parseInt(fields[3]),
+          parseBoolean(fields[4], line),
+          active,
+          Integer.parseInt(fields[6]),
+          Long.parseLong(fields[7]),
+          parseBoolean(fields[8], line),
+          parseBoolean(fields[9], line),
+          parseBoolean(fields[10], line),
+          parseBoolean(fields[11], line),
+          Integer.parseInt(fields[12]));
     }
   }
 
@@ -767,6 +1146,12 @@ class OfficialAgentNettyRuntimeTest {
     private final boolean directAuthority;
     private final boolean lifecycleActive;
     private final int socketFileDescriptor;
+    private final long nativeThreadId;
+    private final boolean taskRelayState;
+    private final boolean exactTaskRelayState;
+    private final boolean baselineRestored;
+    private final boolean socketContextPresent;
+    private final int receiveDepth;
 
     private CleanupResult(
         String id,
@@ -775,7 +1160,13 @@ class OfficialAgentNettyRuntimeTest {
         int lookupSource,
         boolean directAuthority,
         boolean lifecycleActive,
-        int socketFileDescriptor) {
+        int socketFileDescriptor,
+        long nativeThreadId,
+        boolean taskRelayState,
+        boolean exactTaskRelayState,
+        boolean baselineRestored,
+        boolean socketContextPresent,
+        int receiveDepth) {
       this.id = id;
       this.channelId = channelId;
       this.threadId = threadId;
@@ -783,11 +1174,17 @@ class OfficialAgentNettyRuntimeTest {
       this.directAuthority = directAuthority;
       this.lifecycleActive = lifecycleActive;
       this.socketFileDescriptor = socketFileDescriptor;
+      this.nativeThreadId = nativeThreadId;
+      this.taskRelayState = taskRelayState;
+      this.exactTaskRelayState = exactTaskRelayState;
+      this.baselineRestored = baselineRestored;
+      this.socketContextPresent = socketContextPresent;
+      this.receiveDepth = receiveDepth;
     }
 
     private static CleanupResult parse(String line) {
       String[] fields = line.split("\\t", -1);
-      assertEquals(8, fields.length, line);
+      assertEquals(14, fields.length, line);
       assertEquals("OBI_NETTY_CLEANUP", fields[0], line);
       assertTrue(!fields[1].isEmpty(), line);
       assertTrue(!fields[2].isEmpty(), line);
@@ -800,7 +1197,77 @@ class OfficialAgentNettyRuntimeTest {
           Integer.parseInt(fields[4]),
           parseBoolean(fields[5], line),
           active,
-          Integer.parseInt(fields[7]));
+          Integer.parseInt(fields[7]),
+          Long.parseLong(fields[8]),
+          parseBoolean(fields[9], line),
+          parseBoolean(fields[10], line),
+          parseBoolean(fields[11], line),
+          parseBoolean(fields[12], line),
+          Integer.parseInt(fields[13]));
+    }
+  }
+
+  private static final class IntermediateCleanupResult {
+    private final String id;
+    private final long threadId;
+    private final int lookupSource;
+    private final boolean directAuthority;
+    private final boolean lifecycleActive;
+    private final int socketFileDescriptor;
+    private final long nativeThreadId;
+    private final boolean taskRelayState;
+    private final boolean exactTaskRelayState;
+    private final boolean baselineRestored;
+    private final boolean socketContextPresent;
+    private final int receiveDepth;
+
+    private IntermediateCleanupResult(
+        String id,
+        long threadId,
+        int lookupSource,
+        boolean directAuthority,
+        boolean lifecycleActive,
+        int socketFileDescriptor,
+        long nativeThreadId,
+        boolean taskRelayState,
+        boolean exactTaskRelayState,
+        boolean baselineRestored,
+        boolean socketContextPresent,
+        int receiveDepth) {
+      this.id = id;
+      this.threadId = threadId;
+      this.lookupSource = lookupSource;
+      this.directAuthority = directAuthority;
+      this.lifecycleActive = lifecycleActive;
+      this.socketFileDescriptor = socketFileDescriptor;
+      this.nativeThreadId = nativeThreadId;
+      this.taskRelayState = taskRelayState;
+      this.exactTaskRelayState = exactTaskRelayState;
+      this.baselineRestored = baselineRestored;
+      this.socketContextPresent = socketContextPresent;
+      this.receiveDepth = receiveDepth;
+    }
+
+    private static IntermediateCleanupResult parse(String line) {
+      String[] fields = line.split("\\t", -1);
+      assertEquals(13, fields.length, line);
+      assertEquals("OBI_NETTY_INTERMEDIATE_CLEANUP", fields[0], line);
+      assertTrue(!fields[1].isEmpty(), line);
+      boolean active = "LIVE".equals(fields[5]);
+      assertTrue(active || "NONE".equals(fields[5]), line);
+      return new IntermediateCleanupResult(
+          fields[1],
+          Long.parseLong(fields[2]),
+          Integer.parseInt(fields[3]),
+          parseBoolean(fields[4], line),
+          active,
+          Integer.parseInt(fields[6]),
+          Long.parseLong(fields[7]),
+          parseBoolean(fields[8], line),
+          parseBoolean(fields[9], line),
+          parseBoolean(fields[10], line),
+          parseBoolean(fields[11], line),
+          Integer.parseInt(fields[12]));
     }
   }
 

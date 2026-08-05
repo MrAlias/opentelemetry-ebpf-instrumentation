@@ -11,6 +11,7 @@
 #include <common/sock_port_ns.h>
 
 #include <maps/java_remote_parent.h>
+#include <maps/java_remote_parent_receive_cursor.h>
 #include <maps/java_remote_parent_socket_cookie.h>
 
 #include <pid/pid.h>

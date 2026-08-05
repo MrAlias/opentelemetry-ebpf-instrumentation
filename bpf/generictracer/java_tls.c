@@ -23,6 +23,7 @@
 
 #include <maps/active_ssl_connections.h>
 #include <maps/java_remote_parent.h>
+#include <maps/java_remote_parent_receive_cursor.h>
 #include <maps/java_tasks.h>
 #include <maps/java_vt_threads.h>
 

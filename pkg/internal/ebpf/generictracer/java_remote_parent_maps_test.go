@@ -50,6 +50,23 @@ func TestJavaRemoteParentSharedMapSpecsAreCompatible(t *testing.T) {
 					javabridge.MinimizeDisabledMaps(spec)
 				}
 			}
+			for _, loader := range []string{"generic", "bridge", "primary"} {
+				cursor := specs[loader].Maps["java_remote_parent_receive_cursors"]
+				require.NotNil(t, cursor, loader)
+				require.Equal(t, ebpf.LRUHash, cursor.Type, loader)
+				require.Equal(t, uint32(8), cursor.KeySize, loader)
+				require.Equal(t, uint32(56), cursor.ValueSize, loader)
+				require.Zero(t, cursor.Flags, loader)
+				require.Equal(t, ebpfconvenience.PinInternal, cursor.Pinning, loader)
+				if enabled {
+					require.Greater(t, cursor.MaxEntries, uint32(1), loader)
+				} else {
+					require.Equal(t, uint32(1), cursor.MaxEntries, loader)
+				}
+			}
+			for _, loader := range []string{"tp", "go"} {
+				require.NotContains(t, specs[loader].Maps, "java_remote_parent_receive_cursors")
+			}
 			for loader, spec := range specs {
 				for _, mapName := range []string{
 					"java_remote_parent_connections",

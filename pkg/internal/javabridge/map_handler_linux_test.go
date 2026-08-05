@@ -191,20 +191,21 @@ func TestMapHandlerRejectsMissingOwnerMap(t *testing.T) {
 
 func TestMinimizeDisabledMapsPreservesVirtualThreadTracingCapacity(t *testing.T) {
 	spec := &ebpf.CollectionSpec{Maps: map[string]*ebpf.MapSpec{
-		"incoming_trace_ambiguity":          {MaxEntries: 128},
-		"incoming_trace_candidates":         {MaxEntries: 128},
-		"incoming_trace_claims":             {MaxEntries: 128},
-		"incoming_trace_heads":              {MaxEntries: 128},
-		"java_authorized_processes":         {MaxEntries: 128},
-		"java_process_incarnations":         {MaxEntries: 128},
-		"java_thread_mapping_claims":        {MaxEntries: 128},
-		"java_vt_identities":                {MaxEntries: 128},
-		"java_vt_threads":                   {MaxEntries: 128},
-		"sk_ssl_prewrite_map":               {Type: ebpf.SkStorage},
-		"ssl_prewrite_connection_ambiguity": {MaxEntries: 128},
-		"ssl_prewrite_connection_claims":    {MaxEntries: 128},
-		"ssl_prewrite_connection_owners":    {MaxEntries: 128},
-		"ssl_prewrite_tp":                   {MaxEntries: 128},
+		"incoming_trace_ambiguity":           {MaxEntries: 128},
+		"incoming_trace_candidates":          {MaxEntries: 128},
+		"incoming_trace_claims":              {MaxEntries: 128},
+		"incoming_trace_heads":               {MaxEntries: 128},
+		"java_authorized_processes":          {MaxEntries: 128},
+		"java_process_incarnations":          {MaxEntries: 128},
+		"java_remote_parent_receive_cursors": {MaxEntries: 128},
+		"java_thread_mapping_claims":         {MaxEntries: 128},
+		"java_vt_identities":                 {MaxEntries: 128},
+		"java_vt_threads":                    {MaxEntries: 128},
+		"sk_ssl_prewrite_map":                {Type: ebpf.SkStorage},
+		"ssl_prewrite_connection_ambiguity":  {MaxEntries: 128},
+		"ssl_prewrite_connection_claims":     {MaxEntries: 128},
+		"ssl_prewrite_connection_owners":     {MaxEntries: 128},
+		"ssl_prewrite_tp":                    {MaxEntries: 128},
 	}}
 
 	MinimizeDisabledMaps(spec)
@@ -214,6 +215,7 @@ func TestMinimizeDisabledMapsPreservesVirtualThreadTracingCapacity(t *testing.T)
 		"incoming_trace_candidates",
 		"incoming_trace_claims",
 		"incoming_trace_heads",
+		"java_remote_parent_receive_cursors",
 		"java_thread_mapping_claims",
 		"ssl_prewrite_connection_ambiguity",
 		"ssl_prewrite_connection_claims",

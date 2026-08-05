@@ -1333,8 +1333,12 @@ public class SSLStorage {
     nettyFailureLogged.set(false);
   }
 
-  private static Lifecycle activeNettyTaskLifecycle() {
+  private static Lifecycle activeTaskLifecycle() {
     try {
+      if (ThreadInfo.remoteParentLookupSource() == ThreadInfo.REMOTE_PARENT_LOOKUP_TASK) {
+        Lifecycle relayed = ThreadInfo.remoteParentLookupLifecycle();
+        return relayed != null && relayed.active() ? relayed : null;
+      }
       if (!ThreadInfo.hasRemoteParentDirectReceiveAuthority()) {
         return null;
       }
@@ -1362,7 +1366,7 @@ public class SSLStorage {
     if (task == null) {
       return;
     }
-    tasks.track(task, ThreadInfo.captureTaskContext(threadId, activeNettyTaskLifecycle()));
+    tasks.track(task, ThreadInfo.captureTaskContext(threadId, activeTaskLifecycle()));
   }
 
   public static void untrackTask(Object task) {

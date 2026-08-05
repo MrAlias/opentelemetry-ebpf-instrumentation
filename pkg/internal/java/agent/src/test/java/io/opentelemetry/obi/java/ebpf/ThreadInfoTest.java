@@ -1139,6 +1139,131 @@ class ThreadInfoTest {
   }
 
   @Test
+  void exactTaskRelayCanCaptureAnotherHandoffWithoutANettyHandlerScope() throws Exception {
+    List<EmittedOp> emitted = new ArrayList<>();
+    ThreadInfo.setTaskContextEmitterForTest(
+        (operation, value, token) -> emitted.add(new EmittedOp(operation, value, token)));
+    ThreadInfo.setRemoteParentEnabled(true);
+    ExactNettyContext exact = new ExactNettyContext(38);
+    Object firstTask = new Object();
+    Object secondTask = new Object();
+    TaskContext first = null;
+    TaskContext second = null;
+
+    try {
+      assertTrue(ThreadInfo.setRemoteParentSocketFileDescriptor(38, exact.lifecycle));
+      exact.runInHandlerScope(() -> SSLStorage.trackTask(101L, firstTask));
+      first = SSLStorage.takeTaskContext(firstTask);
+      assertTrue(first.getHandoffToken() != 0L);
+      assertEquals(38, first.getRemoteParentSocketContext().peek());
+      ThreadInfo.clearRemoteParentSocketFileDescriptor();
+      ThreadInfo.clearRemoteParentLookupSource();
+
+      assertTrue(
+          ThreadInfo.enterTaskParentThreadContext(
+              201L,
+              first.getParentThreadId(),
+              first.getHandoffToken(),
+              first.getRemoteParentSocketContext(),
+              first.getRemoteParentSocketLifecycle()));
+      try {
+        assertEquals(ThreadInfo.REMOTE_PARENT_LOOKUP_TASK, ThreadInfo.remoteParentLookupSource());
+        assertSame(exact.lifecycle, ThreadInfo.remoteParentLookupLifecycle());
+        SSLStorage.trackTask(201L, secondTask);
+        second = SSLStorage.takeTaskContext(secondTask);
+        assertTrue(second.getHandoffToken() != 0L);
+        assertFalse(first.getHandoffToken() == second.getHandoffToken());
+        assertSame(first.getRemoteParentSocketContext(), second.getRemoteParentSocketContext());
+        assertSame(exact.lifecycle, second.getRemoteParentSocketLifecycle());
+      } finally {
+        ThreadInfo.restoreTaskParentThreadContext();
+      }
+      assertFalse(ThreadInfo.hasTaskRelayState());
+
+      assertTrue(
+          ThreadInfo.enterTaskParentThreadContext(
+              301L,
+              second.getParentThreadId(),
+              second.getHandoffToken(),
+              second.getRemoteParentSocketContext(),
+              second.getRemoteParentSocketLifecycle()));
+      try {
+        assertEquals(ThreadInfo.REMOTE_PARENT_LOOKUP_TASK, ThreadInfo.remoteParentLookupSource());
+        assertSame(exact.lifecycle, ThreadInfo.remoteParentLookupLifecycle());
+        assertEquals(38, ThreadInfo.takeRemoteParentSocketFileDescriptor());
+      } finally {
+        ThreadInfo.restoreTaskParentThreadContext();
+      }
+      assertFalse(ThreadInfo.hasTaskRelayState());
+      assertEquals(6, emitted.size());
+      assertOperation(emitted.get(0), OperationType.TASK_CAPTURE, first.getHandoffToken(), 0L);
+      assertOperation(emitted.get(1), OperationType.TASK_LINK, 101L, first.getHandoffToken());
+      assertOperation(
+          emitted.get(2), OperationType.TASK_RELAY_CAPTURE, second.getHandoffToken(), 0L);
+      assertOperation(emitted.get(3), OperationType.THREAD, 201L, 0L);
+      assertOperation(emitted.get(4), OperationType.TASK_LINK, 201L, second.getHandoffToken());
+      assertOperation(emitted.get(5), OperationType.THREAD, 301L, 0L);
+    } finally {
+      SSLStorage.untrackTask(firstTask);
+      SSLStorage.untrackTask(secondTask);
+      ThreadInfo.clearRemoteParentSocketFileDescriptor();
+      exact.close();
+    }
+  }
+
+  @Test
+  void exactTaskRelayRejectsMismatchedAndInvalidatedLifecycles() throws Exception {
+    List<EmittedOp> emitted = new ArrayList<>();
+    ThreadInfo.setTaskContextEmitterForTest(
+        (operation, value, token) -> emitted.add(new EmittedOp(operation, value, token)));
+    ThreadInfo.setRemoteParentEnabled(true);
+    ExactNettyContext exact = new ExactNettyContext(39);
+    Object firstTask = new Object();
+    Object rejectedTask = new Object();
+
+    try {
+      assertTrue(ThreadInfo.setRemoteParentSocketFileDescriptor(39, exact.lifecycle));
+      exact.runInHandlerScope(() -> SSLStorage.trackTask(101L, firstTask));
+      TaskContext first = SSLStorage.takeTaskContext(firstTask);
+      ThreadInfo.clearRemoteParentSocketFileDescriptor();
+      ThreadInfo.clearRemoteParentLookupSource();
+
+      assertTrue(
+          ThreadInfo.enterTaskParentThreadContext(
+              201L,
+              first.getParentThreadId(),
+              first.getHandoffToken(),
+              first.getRemoteParentSocketContext(),
+              first.getRemoteParentSocketLifecycle()));
+      try {
+        TaskContext mismatched =
+            ThreadInfo.captureTaskContext(201L, new RemoteParentSocketContext.Lifecycle());
+        assertEquals(0L, mismatched.getHandoffToken());
+        assertNull(mismatched.getRemoteParentSocketContext());
+
+        exact.invalidate();
+        SSLStorage.trackTask(201L, rejectedTask);
+        TaskContext invalidated = SSLStorage.taskContext(rejectedTask);
+        assertEquals(0L, invalidated.getHandoffToken());
+        assertNull(invalidated.getRemoteParentSocketContext());
+      } finally {
+        ThreadInfo.restoreTaskParentThreadContext();
+      }
+      assertEquals(
+          1, emitted.stream().filter(op -> op.operation == OperationType.TASK_CAPTURE).count());
+      assertEquals(
+          0,
+          emitted.stream().filter(op -> op.operation == OperationType.TASK_RELAY_CAPTURE).count());
+      assertFalse(ThreadInfo.hasTaskRelayState());
+    } finally {
+      SSLStorage.untrackTask(firstTask);
+      SSLStorage.untrackTask(rejectedTask);
+      ThreadInfo.clearRemoteParentSocketFileDescriptor();
+      exact.close();
+    }
+  }
+
+  @Test
   void nonReceiveNettyHandlerScopesCannotAuthorizeStrictCapture() throws Exception {
     List<EmittedOp> emitted = new ArrayList<>();
     ThreadInfo.setTaskContextEmitterForTest(
@@ -1674,6 +1799,13 @@ class ThreadInfoTest {
             complete.countDown();
           }
         });
+  }
+
+  private static void assertOperation(
+      EmittedOp actual, OperationType operation, long value, long token) {
+    assertEquals(operation, actual.operation);
+    assertEquals(value, actual.value);
+    assertEquals(token, actual.token);
   }
 
   private static final class EmittedOp {

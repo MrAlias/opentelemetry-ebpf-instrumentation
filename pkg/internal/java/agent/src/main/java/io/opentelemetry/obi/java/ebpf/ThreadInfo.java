@@ -80,19 +80,23 @@ public class ThreadInfo {
   }
 
   /**
-   * Captures a strict remote-parent handoff only for an exact active transport scope.
+   * Captures a strict remote-parent handoff only for exact active transport authority.
    *
-   * <p>Tasks submitted outside the TLS handler keep ordinary parent-thread propagation without
-   * acquiring a BPF generation alias. Unix transport has no Java descriptor context, so an active
-   * lifecycle permits a capture attempt; BPF still requires a generation staged directly by the
-   * current receive. A descriptor context is copied only when it belongs to that same lifecycle.
+   * <p>Tasks submitted outside the TLS handler or an exact task relay keep ordinary parent-thread
+   * propagation without acquiring a BPF generation alias. An exact task relay may capture another
+   * handoff for the same live transport lifecycle, allowing bounded executor chains without
+   * weakening the original receive authority. Unix transport has no Java descriptor context, so an
+   * active lifecycle permits a capture attempt; BPF still requires the generation staged by the
+   * direct receive or preceding exact token. A descriptor context is copied only when it belongs to
+   * that same lifecycle.
    */
   public static TaskContext captureTaskContext(
       long parentThreadId, RemoteParentSocketContext.Lifecycle lifecycle) {
+    boolean relayCapture = hasRemoteParentTaskLookupAuthority();
     if (!remoteParentEnabled
         || lifecycle == null
         || !lifecycle.active()
-        || !hasRemoteParentDirectReceiveAuthority()
+        || !(hasRemoteParentDirectReceiveAuthority() || relayCapture)
         || remoteParentLookupLifecycle.get() != lifecycle
         || onVirtualThread()) {
       return new TaskContext(onVirtualThread() ? 0L : parentThreadId, 0L);
@@ -111,7 +115,8 @@ public class ThreadInfo {
       socketContext = null;
     }
     long token = newTaskToken();
-    emitTaskContextOp(OperationType.TASK_CAPTURE, token, 0L);
+    emitTaskContextOp(
+        relayCapture ? OperationType.TASK_RELAY_CAPTURE : OperationType.TASK_CAPTURE, token, 0L);
     return new TaskContext(parentThreadId, token, socketContext, lifecycle);
   }
 
@@ -340,6 +345,14 @@ public class ThreadInfo {
     return currentRemoteParentLookupOverride() == LOOKUP_DIRECT;
   }
 
+  private static boolean hasRemoteParentTaskLookupAuthority() {
+    if (currentRemoteParentLookupOverride() != LOOKUP_TASK) {
+      return false;
+    }
+    TaskRelayState state = taskRelayState.get();
+    return state != null && state.currentExact();
+  }
+
   /** Prevents an uncertain receive from falling back to either a task or a direct owner. */
   public static void blockRemoteParentLookup() {
     remoteParentLookupOverride.set(LOOKUP_BLOCKED);
@@ -353,8 +366,7 @@ public class ThreadInfo {
       return REMOTE_PARENT_LOOKUP_BLOCKED;
     }
     if (lookupOverride == LOOKUP_TASK) {
-      TaskRelayState state = taskRelayState.get();
-      return state != null && state.currentExact()
+      return hasRemoteParentTaskLookupAuthority()
           ? REMOTE_PARENT_LOOKUP_TASK
           : REMOTE_PARENT_LOOKUP_BLOCKED;
     }

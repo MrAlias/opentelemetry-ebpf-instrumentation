@@ -687,6 +687,22 @@ class ThreadInfoTest {
   }
 
   @Test
+  void javaDisabledCycleRejectionUnlinksTheCurrentWorkerContext() {
+    ThreadInfo.setRemoteParentEnabled(false);
+    List<EmittedOp> emitted = new ArrayList<>();
+    ThreadInfo.setTaskContextEmitterForTest(
+        (operation, value, token) -> emitted.add(new EmittedOp(operation, value, token)));
+
+    assertTrue(ThreadInfo.enterTaskParentThreadContext(900L, 101L));
+    assertTrue(ThreadInfo.enterTaskParentThreadContext(900L, 202L));
+    assertFalse(ThreadInfo.enterTaskParentThreadContext(900L, 101L));
+
+    assertEquals(OperationType.TASK_UNLINK, emitted.get(emitted.size() - 1).operation);
+    ThreadInfo.restoreTaskParentThreadContext();
+    ThreadInfo.restoreTaskParentThreadContext();
+  }
+
+  @Test
   void balancedTaskScopesReuseThePerWorkerRelayState() {
     ThreadInfo.setRemoteParentEnabled(false);
     ThreadInfo.setTaskContextEmitterForTest((operation, value, token) -> {});

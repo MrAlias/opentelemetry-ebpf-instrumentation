@@ -901,6 +901,12 @@ static void test_task_context_packet_vectors(void) {
   assert(packet[0] == 9);
   assert(read_u64_le(packet, 1) == UINT64_C(0x3132333435363738));
   assert(read_u64_le(packet, 9) == 0);
+
+  memset(packet, 0xff, sizeof(packet));
+  obi_test_build_task_context_packet(packet, 12, 0, 0);
+  assert(packet[0] == 12);
+  assert(read_u64_le(packet, 1) == 0);
+  assert(read_u64_le(packet, 9) == 0);
 }
 
 static void test_errno_mapping(void) {

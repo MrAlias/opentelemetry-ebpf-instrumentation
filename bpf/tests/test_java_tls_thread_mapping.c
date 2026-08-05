@@ -863,6 +863,46 @@ static void test_bridge_disabled_self_restore_clears_legacy_state(void) {
     require_sentinel_state(scenario);
 }
 
+static void test_task_unlink_clears_physical_state_in_both_bridge_modes(void) {
+    const char *disabled_scenario = "bridge-disabled task unlink";
+    reset();
+    store_task(child_a, child_c);
+    seed_context(child_context_id, 0x11);
+
+    java_thread_mapping_unlink_execution(&child_a, &logical_vt, child_context_id, 0);
+
+    require_no_task(disabled_scenario, &child_a);
+    require(context_entry(child_context_id) == NULL,
+            disabled_scenario,
+            "fail-closed unlink retained legacy context");
+    require(task_delete_count == 1 && context_delete_count == 1,
+            disabled_scenario,
+            "fail-closed unlink did not clear physical task state");
+    require(unlink_task_count == 0,
+            disabled_scenario,
+            "disabled bridge attempted logical remote-parent cleanup");
+    require_sentinel_state(disabled_scenario);
+
+    const char *enabled_scenario = "bridge-enabled task unlink";
+    reset();
+    store_task(child_a, child_c);
+    seed_context(child_context_id, 0x11);
+
+    java_thread_mapping_unlink_execution(&child_a, &logical_vt, child_context_id, 1);
+
+    require_no_task(enabled_scenario, &child_a);
+    require(context_entry(child_context_id) == NULL,
+            enabled_scenario,
+            "remote-parent unlink retained physical context");
+    require(task_delete_count == 1 && context_delete_count == 1,
+            enabled_scenario,
+            "remote-parent unlink did not clear physical task state");
+    require(unlink_task_count == 1 && same_key(&last_unlinked_task, &logical_vt),
+            enabled_scenario,
+            "remote-parent unlink did not target the logical execution");
+    require_sentinel_state(enabled_scenario);
+}
+
 static void test_process_registration_serializes_with_mapping_claim(void) {
     const char *contention_scenario = "registration contention";
     reset();
@@ -1204,6 +1244,7 @@ int main(void) {
     test_parent_read_failure_and_self_mapping_fail_closed();
     test_bridge_disabled_read_failure_preserves_legacy_state();
     test_bridge_disabled_self_restore_clears_legacy_state();
+    test_task_unlink_clears_physical_state_in_both_bridge_modes();
     test_process_registration_serializes_with_mapping_claim();
     test_decoded_parent_path_does_not_reread_user_memory();
     test_bridge_disabled_legacy_mapping_is_preserved();

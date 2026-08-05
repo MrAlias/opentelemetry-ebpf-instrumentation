@@ -262,6 +262,20 @@ java_thread_mapping_publish_context(u64 id, const tp_info_t *context, u8 context
     }
 }
 
+static __always_inline void java_thread_mapping_unlink_execution(const pid_key_t *physical_task,
+                                                                 const pid_key_t *logical_task,
+                                                                 u64 id,
+                                                                 u8 remote_parent_enabled) {
+    // TASK_UNLINK is also the fail-closed cleanup for the legacy THREAD path.
+    // Logical remote-parent state exists only when the bridge is enabled, but
+    // physical ancestry and its copied trace context must always be removed.
+    if (remote_parent_enabled) {
+        JAVA_THREAD_MAPPING_UNLINK_TASK(logical_task);
+    }
+    bpf_map_delete_elem(&java_tasks, physical_task);
+    JAVA_THREAD_MAPPING_CONTEXT_DELETE(id);
+}
+
 static __always_inline u8 java_thread_mapping_register_process(
     const pid_key_t *task, pid_key_t *process, u64 id, u64 incarnation, u8 remote_parent_enabled) {
     if (remote_parent_enabled && !java_thread_mapping_acquire_claim(task, incarnation, process)) {

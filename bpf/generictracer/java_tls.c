@@ -523,13 +523,7 @@ static __noinline int handle_java_control_ioctl(unsigned char *uarg,
         return 0;
     }
     case k_ioctl_java_task_unlink: {
-        if (!java_remote_parent_enabled) {
-            return 0;
-        }
-
-        java_remote_parent_unlink_task(&execution);
-        bpf_map_delete_elem(&java_tasks, task);
-        obi_ctx__del(id);
+        java_thread_mapping_unlink_execution(task, &execution, id, java_remote_parent_enabled);
         return 0;
     }
     case k_ioctl_java_threads:

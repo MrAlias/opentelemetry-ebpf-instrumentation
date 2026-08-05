@@ -30,10 +30,28 @@ final class BootstrapBridgeAccess implements BridgeAccess {
   private static final long MAX_COUNTER_VALUE = 999_999_999L;
   private static final AtomicLongArray localCounters = new AtomicLongArray(3);
   private static final Logger logger = Logger.getLogger(BootstrapBridgeAccess.class.getName());
+  private static volatile ReflectiveAccess diagnosticAccess;
+  private static final BridgeClassResolver BOOTSTRAP_CLASS_RESOLVER =
+      new BridgeClassResolver() {
+        @Override
+        public Class<?> resolve() throws ClassNotFoundException {
+          return Class.forName(BRIDGE_CLASS, true, null);
+        }
+      };
 
+  private final BridgeClassResolver bridgeClassResolver;
   private volatile ReflectiveAccess access;
+  private volatile NegativeLookup negativeLookup;
   private volatile long nextLookupNanos;
-  private volatile String observedAvailability;
+  private Thread lookupOwner;
+
+  BootstrapBridgeAccess() {
+    this(BOOTSTRAP_CLASS_RESOLVER);
+  }
+
+  BootstrapBridgeAccess(BridgeClassResolver bridgeClassResolver) {
+    this.bridgeClassResolver = bridgeClassResolver;
+  }
 
   @Override
   public BridgeResult takeRemoteParent() {
@@ -60,65 +78,90 @@ final class BootstrapBridgeAccess implements BridgeAccess {
   }
 
   private ReflectiveAccess findBridge() {
+    long failureCount = 0L;
+    int failureCounter = -1;
+    String failureReason = null;
+    Level failureLevel = null;
+    ReflectiveAccess found = null;
     long now = System.nanoTime();
     String availability = bridgeAvailability();
-    if (nextLookupNanos != 0
-        && now - nextLookupNanos < 0
-        && sameAvailability(availability, observedAvailability)) {
+    NegativeLookup currentNegative = negativeLookup;
+    if (currentNegative != null && currentNegative.applies(now, availability)) {
       return null;
     }
-
     synchronized (this) {
       if (access != null) {
         return access;
       }
+      Thread currentThread = Thread.currentThread();
+      if (lookupOwner == currentThread) {
+        return null;
+      }
       now = System.nanoTime();
       availability = bridgeAvailability();
-      if (nextLookupNanos != 0
-          && now - nextLookupNanos < 0
-          && sameAvailability(availability, observedAvailability)) {
+      currentNegative = negativeLookup;
+      if (currentNegative != null && currentNegative.applies(now, availability)) {
         return null;
       }
-      observedAvailability = availability;
-      nextLookupNanos = now + LOOKUP_RETRY_NANOS;
+      long retryAt = now + LOOKUP_RETRY_NANOS;
+      negativeLookup = null;
+      nextLookupNanos = 0L;
+      lookupOwner = currentThread;
       try {
-        Class<?> bridge = Class.forName(BRIDGE_CLASS, true, null);
+        Class<?> bridge = bridgeClassResolver.resolve();
         Method abiVersion = bridge.getMethod("abiVersion");
         if (((Number) abiVersion.invoke(null)).intValue() != SUPPORTED_ABI_VERSION) {
-          recordLocal(
-              LOCAL_LOOKUP_VERSION_MISMATCH, "bridge_lookup_version_mismatch", Level.WARNING);
-          return null;
+          failureCounter = LOCAL_LOOKUP_VERSION_MISMATCH;
+          failureReason = "bridge_lookup_version_mismatch";
+          failureLevel = Level.WARNING;
+        } else {
+          Method take = bridge.getMethod("takeRemoteParent");
+          Method discard = bridge.getMethod("discardRemoteParent", int.class);
+          Method extractionFailure = bridge.getMethod("recordExtractionFailure", int.class);
+          Method extensionEvent = bridge.getMethod("recordExtensionEvent", int.class, long.class);
+          Class<?> record = take.getReturnType();
+          found =
+              new ReflectiveAccess(
+                  take,
+                  discard,
+                  extractionFailure,
+                  extensionEvent,
+                  record.getMethod("getAbiVersion"),
+                  record.getMethod("getStatus"),
+                  record.getMethod("getTraceFlags"),
+                  record.getMethod("getTraceIdHex"),
+                  record.getMethod("getParentSpanIdHex"));
         }
-
-        Method take = bridge.getMethod("takeRemoteParent");
-        Method discard = bridge.getMethod("discardRemoteParent", int.class);
-        Method extractionFailure = bridge.getMethod("recordExtractionFailure", int.class);
-        Method extensionEvent = bridge.getMethod("recordExtensionEvent", int.class, long.class);
-        Class<?> record = take.getReturnType();
-        ReflectiveAccess found =
-            new ReflectiveAccess(
-                take,
-                discard,
-                extractionFailure,
-                extensionEvent,
-                record.getMethod("getAbiVersion"),
-                record.getMethod("getStatus"),
-                record.getMethod("getTraceFlags"),
-                record.getMethod("getTraceIdHex"),
-                record.getMethod("getParentSpanIdHex"));
-        found.recordExtensionEvent(EVENT_EXTENSION_REGISTERED, 1L);
-        found.recordExtensionEvent(EVENT_LOOKUP_READY, 1L);
-        flushLocalCounters(found);
-        access = found;
-        return found;
       } catch (ClassNotFoundException ignored) {
-        recordLocal(LOCAL_LOOKUP_MISSING, "bridge_lookup_missing", Level.INFO);
-        return null;
+        failureCounter = LOCAL_LOOKUP_MISSING;
+        failureReason = "bridge_lookup_missing";
+        failureLevel = Level.INFO;
       } catch (Throwable ignored) {
-        recordLocal(LOCAL_LOOKUP_ERROR, "bridge_lookup_error", Level.WARNING);
-        return null;
+        failureCounter = LOCAL_LOOKUP_ERROR;
+        failureReason = "bridge_lookup_error";
+        failureLevel = Level.WARNING;
+      } finally {
+        lookupOwner = null;
+      }
+      if (found != null) {
+        access = found;
+      } else {
+        failureCount = incrementLocalCounter(failureCounter);
+        nextLookupNanos = retryAt;
+        negativeLookup = new NegativeLookup(availability, retryAt);
       }
     }
+    if (found != null) {
+      found.recordExtensionEvent(EVENT_EXTENSION_REGISTERED, 1L);
+      found.recordExtensionEvent(EVENT_LOOKUP_READY, 1L);
+      diagnosticAccess = found;
+      flushLocalCounters(found);
+      return found;
+    }
+    if (!flushLocalCountersIfReady()) {
+      logLocalFailure(failureReason, failureLevel, failureCount);
+    }
+    return null;
   }
 
   static String localDiagnosticsSnapshot() {
@@ -131,9 +174,19 @@ final class BootstrapBridgeAccess implements BridgeAccess {
   }
 
   static void resetLocalDiagnosticsForTest() {
+    diagnosticAccess = null;
     for (int index = 0; index < localCounters.length(); index++) {
       localCounters.set(index, 0L);
     }
+  }
+
+  private static boolean flushLocalCountersIfReady() {
+    ReflectiveAccess current = diagnosticAccess;
+    if (current == null) {
+      return false;
+    }
+    flushLocalCounters(current);
+    return true;
   }
 
   private static void flushLocalCounters(ReflectiveAccess found) {
@@ -168,16 +221,26 @@ final class BootstrapBridgeAccess implements BridgeAccess {
     return left == null ? right == null : left.equals(right);
   }
 
-  private static void recordLocal(int counter, String reason, Level level) {
+  private static long incrementLocalCounter(int counter) {
+    if (counter < 0 || counter >= localCounters.length()) {
+      return 0L;
+    }
     long current;
     long count;
     do {
       current = localCounters.get(counter);
       if (current == MAX_COUNTER_VALUE) {
-        return;
+        return 0L;
       }
       count = current + 1L;
     } while (!localCounters.compareAndSet(counter, current, count));
+    return count;
+  }
+
+  private static void logLocalFailure(String reason, Level level, long count) {
+    if (count <= 0L) {
+      return;
+    }
     if (count == 1L || (count & (count - 1L)) == 0L) {
       try {
         logger.log(
@@ -186,6 +249,24 @@ final class BootstrapBridgeAccess implements BridgeAccess {
             new Object[] {reason, count});
       } catch (Throwable ignored) {
       }
+    }
+  }
+
+  interface BridgeClassResolver {
+    Class<?> resolve() throws ClassNotFoundException;
+  }
+
+  private static final class NegativeLookup {
+    private final String availability;
+    private final long retryAt;
+
+    private NegativeLookup(String availability, long retryAt) {
+      this.availability = availability;
+      this.retryAt = retryAt;
+    }
+
+    private boolean applies(long now, String currentAvailability) {
+      return now - retryAt < 0 && sameAvailability(currentAvailability, availability);
     }
   }
 

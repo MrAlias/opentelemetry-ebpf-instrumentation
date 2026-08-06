@@ -193,6 +193,11 @@ static u64 stats[k_java_remote_parent_stat_max];
 static int corrupt_cookie_socket_cookie;
 static int unexpected_update;
 static int unexpected_delete;
+static u64 data_signal_nonce;
+static int data_signal_present;
+static java_remote_parent_data_signal_key_t stored_ack_key;
+static java_remote_parent_data_ack_t stored_ack;
+static int ack_present;
 
 static void fail(const char *message) {
     fprintf(stderr, "FAIL: %s\n", message);
@@ -389,13 +394,17 @@ static void *test_map_lookup(void *map, const void *key) {
         same_key(key, &stored_exact_claim_key, sizeof(stored_exact_claim_key))) {
         return &stored_exact_claim;
     }
-    if (map == &java_remote_parent_claims && detach_guard_present &&
-        same_key(key, &stored_detach_guard_key, sizeof(stored_detach_guard_key))) {
+    if (map == &java_remote_parent_owner_guards && detach_guard_present &&
+        same_key(key, &stored_detach_guard_key.owner, sizeof(stored_detach_guard_key.owner))) {
         return &stored_detach_guard;
     }
     if (map == &java_remote_parent_ambiguity) {
         ambiguity_entry_t *entry = find_ambiguity_entry(key);
         return entry ? &entry->observed_monotime_ns : NULL;
+    }
+    if (map == &java_remote_parent_data_signals && data_signal_present &&
+        same_key(key, &test_owner, sizeof(test_owner))) {
+        return &data_signal_nonce;
     }
     if (map == &java_remote_parent_stats) {
         const u32 index = *(const u32 *)key;
@@ -522,21 +531,37 @@ test_map_update(void *map, const void *key, const void *value, unsigned long lon
         fallback_present = 1;
         return 0;
     }
+    if (map == &java_remote_parent_owner_guards && flags == BPF_EXIST) {
+        if (detach_guard_present &&
+            same_key(key, &stored_detach_guard_key.owner, sizeof(stored_detach_guard_key.owner))) {
+            stored_detach_guard = *(const java_remote_parent_claim_t *)value;
+            return 0;
+        }
+        return -1;
+    }
+    if (map == &java_remote_parent_claims && flags == BPF_EXIST) {
+        if (exact_claim_present &&
+            same_key(key, &stored_exact_claim_key, sizeof(stored_exact_claim_key))) {
+            stored_exact_claim = *(const java_remote_parent_claim_t *)value;
+            return 0;
+        }
+        return -1;
+    }
+    if (map == &java_remote_parent_owner_guards && flags == BPF_NOEXIST) {
+        const java_remote_parent_claim_t *claim = value;
+        if (detach_guard_present || claim->lifecycle != k_java_remote_parent_lifecycle_publishing ||
+            !claim->observed_monotime_ns || !claim->process_incarnation) {
+            return -1;
+        }
+        stored_detach_guard_key = java_remote_parent_detach_guard_key(key);
+        stored_detach_guard = *claim;
+        detach_guard_present = 1;
+        rollback_guard_publications++;
+        return 0;
+    }
     if (map == &java_remote_parent_claims && flags == BPF_NOEXIST) {
         const java_remote_parent_key_t *claim_key = key;
         const java_remote_parent_claim_t *claim = value;
-        if (!claim_key->generation) {
-            if (detach_guard_present ||
-                claim->lifecycle != k_java_remote_parent_lifecycle_publishing ||
-                !claim->observed_monotime_ns || !claim->process_incarnation) {
-                return -1;
-            }
-            stored_detach_guard_key = *claim_key;
-            stored_detach_guard = *claim;
-            detach_guard_present = 1;
-            rollback_guard_publications++;
-            return 0;
-        }
         if (exact_claim_present || !claim->observed_monotime_ns || !claim->process_incarnation ||
             (claim->lifecycle != k_java_remote_parent_lifecycle_publishing &&
              claim->lifecycle != k_java_remote_parent_lifecycle_discarded)) {
@@ -551,6 +576,12 @@ test_map_update(void *map, const void *key, const void *value, unsigned long lon
         } else {
             cleanup_claim_publications++;
         }
+        return 0;
+    }
+    if (map == &java_remote_parent_data_acks && flags == BPF_ANY) {
+        stored_ack_key = *(const java_remote_parent_data_signal_key_t *)key;
+        stored_ack = *(const java_remote_parent_data_ack_t *)value;
+        ack_present = 1;
         return 0;
     }
     if (map == &java_remote_parent_ambiguity && (flags == BPF_ANY || flags == BPF_NOEXIST)) {
@@ -700,8 +731,8 @@ static long test_map_delete(void *map, const void *key) {
         }
         return 0;
     }
-    if (map == &java_remote_parent_claims && detach_guard_present &&
-        same_key(key, &stored_detach_guard_key, sizeof(stored_detach_guard_key))) {
+    if (map == &java_remote_parent_owner_guards && detach_guard_present &&
+        same_key(key, &stored_detach_guard_key.owner, sizeof(stored_detach_guard_key.owner))) {
         guard_delete_step = ++rollback_delete_step;
         detach_guard_present = 0;
         rollback_guard_deletions++;
@@ -859,6 +890,11 @@ static void reset(const connection_info_t *connection, const tp_info_pid_t *inco
     corrupt_cookie_socket_cookie = 0;
     unexpected_update = 0;
     unexpected_delete = 0;
+    data_signal_nonce = 0;
+    data_signal_present = 0;
+    memset(&stored_ack_key, 0, sizeof(stored_ack_key));
+    memset(&stored_ack, 0, sizeof(stored_ack));
+    ack_present = 0;
 }
 
 static void test_ambiguity_reservation_failure_retires_or_preserves_exact_claim(void) {
@@ -1002,7 +1038,7 @@ static void test_logical_owner_conflict_retires_only_the_empty_transaction(void)
     if (inject_owner_conflict_after_ambiguity_reservation || logical_owner_conflict_pending ||
         fail_ambiguity_delete_with_successor_reservation || !owner_present ||
         stored_owner.generation != test_successor_generation || !exact_claim_present ||
-        stored_exact_claim.lifecycle != k_java_remote_parent_lifecycle_publishing ||
+        stored_exact_claim.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
         !ambiguity_reserved(&marker_successor_key) || ambiguity_marked(&marker_successor_key) ||
         !ambiguity_marked(&successor_key) || ambiguity_count() != 2 || state_present ||
         generation_index_present || connection_present || cookie_connection_present ||
@@ -1167,7 +1203,9 @@ static void test_cleanup_fence_rolls_back_stage(enum test_stage_fence_kind kind,
         (exact_claim_present &&
          (!same_key(&stored_exact_claim_key, &failed_key, sizeof(failed_key)) ||
           stored_exact_claim.process_incarnation != test_process_incarnation ||
-          stored_exact_claim.lifecycle != k_java_remote_parent_lifecycle_publishing)) ||
+          stored_exact_claim.lifecycle != (kind == test_stage_fence_exact_claim
+                                               ? k_java_remote_parent_lifecycle_publishing
+                                               : k_java_remote_parent_lifecycle_cleanup))) ||
         (detach_guard_present &&
          (stored_detach_guard_key.generation != 0 ||
           !java_remote_parent_pid_key_equal(&stored_detach_guard_key.owner, &test_owner) ||
@@ -1393,8 +1431,12 @@ static void test_rollback_preserves_successor_reservation_after_failed_marker_de
         fail_ambiguity_delete_with_successor_reservation || owner_present || state_present ||
         generation_index_present || connection_present || cookie_connection_present ||
         fallback_present || terminal_present || !exact_claim_present ||
-        stored_exact_claim.lifecycle != k_java_remote_parent_lifecycle_publishing ||
-        !detach_guard_present || !ambiguity_reserved(&stored_state_key) || ambiguity_count() != 1 ||
+        stored_exact_claim.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_exact_claim.reserved[0] != k_java_remote_parent_lifecycle_publishing ||
+        !detach_guard_present ||
+        stored_detach_guard.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_detach_guard.reserved[0] != k_java_remote_parent_lifecycle_publishing ||
+        !ambiguity_reserved(&stored_state_key) || ambiguity_count() != 1 ||
         stage_claim_publications != 1 || stage_claim_deletions ||
         rollback_guard_publications != 1 || rollback_guard_deletions ||
         stats[k_java_remote_parent_stat_stage_ambiguous] != 1 ||
@@ -1763,8 +1805,39 @@ static void test_raw_parent_is_published_before_w3c_override(void) {
     }
 }
 
+static void test_stage_acknowledges_after_claim_release(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    const tp_info_pid_t raw = raw_parent(k_flag_sampled);
+    reset(&connection, &raw);
+    data_signal_nonce = 0xfeedbeef;
+    data_signal_present = 1;
+
+    java_remote_parent_incoming_t handoff = {.generation = test_incoming_generation};
+    if (!apply_incoming_trace_candidate(
+            &(tp_info_t){}, &raw, &handoff.candidate, &handoff.generation)) {
+        fail("acknowledged stage parent was not prepared");
+    }
+    const u64 generation = java_remote_parent_stage_incoming(&connection,
+                                                             test_connection_netns,
+                                                             test_connection_netns_cookie,
+                                                             test_socket_cookie,
+                                                             &handoff);
+    const pid_key_t process = java_process_key(&test_owner);
+    if (!generation || exact_claim_present || !owner_present || !state_present || !ack_present ||
+        stored_ack_key.nonce != data_signal_nonce || stored_ack_key.reserved ||
+        !same_key(&stored_ack_key.process, &process, sizeof(process)) || stored_ack.reserved ||
+        !same_key(&stored_ack.owner, &test_owner, sizeof(test_owner)) ||
+        stored_ack.generation != generation ||
+        memcmp(&stored_ack.connection, &connection, sizeof(connection)) != 0 ||
+        stored_ack.connection_netns != test_connection_netns || unexpected_update ||
+        unexpected_delete || stats[k_java_remote_parent_stat_stage_valid] != 1) {
+        fail("committed stage did not acknowledge after releasing its publishing claim");
+    }
+}
+
 int main(void) {
     test_raw_parent_is_published_before_w3c_override();
+    test_stage_acknowledges_after_claim_release();
     test_ambiguity_reservation_failure_retires_or_preserves_exact_claim();
     test_logical_owner_conflict_retires_only_the_empty_transaction();
     test_stage_commit_preserves_immediate_consumer_claim();

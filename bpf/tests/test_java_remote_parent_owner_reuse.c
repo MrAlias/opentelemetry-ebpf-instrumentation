@@ -168,6 +168,7 @@ static int claim_present;
 static int exact_claim_update_attempts;
 static int exact_claim_present_at_guard_acquisition;
 static int exact_claim_update_failures;
+static int exact_claim_handoff_failures;
 static int exact_claim_delete_failures;
 static java_remote_parent_key_t stored_detach_guard_key;
 static java_remote_parent_claim_t stored_detach_guard;
@@ -205,6 +206,7 @@ static int replace_task_after_exact_claim;
 static int replace_task_during_claim_lookup;
 static int replace_task_during_detach_guard_lookup;
 static int remove_claim_and_replace_task_during_claim_lookup;
+static int inject_identical_foreign_detach_guard_on_update;
 static int arm_task_replacement_after_post_claim_check;
 static int replace_task_on_next_state_lookup;
 static int arm_task_replacement_and_state_loss_after_post_claim_check;
@@ -312,7 +314,8 @@ static int exact_adoption_fence_retained(const java_remote_parent_key_t *key) {
     return claim_present && same_key(&stored_claim_key, key, sizeof(*key)) &&
            stored_claim.observed_monotime_ns &&
            stored_claim.process_incarnation == test_process_incarnation &&
-           stored_claim.lifecycle == k_java_remote_parent_lifecycle_publishing &&
+           stored_claim.lifecycle == k_java_remote_parent_lifecycle_cleanup &&
+           stored_claim.reserved[0] == k_java_remote_parent_lifecycle_publishing &&
            find_ambiguity(key);
 }
 
@@ -322,7 +325,8 @@ static int exact_reset_fences_retained(const java_remote_parent_key_t *key) {
            same_key(&stored_detach_guard_key, &guard_key, sizeof(guard_key)) &&
            stored_detach_guard.observed_monotime_ns &&
            stored_detach_guard.process_incarnation == key->generation &&
-           stored_detach_guard.lifecycle == k_java_remote_parent_lifecycle_publishing;
+           stored_detach_guard.lifecycle == k_java_remote_parent_lifecycle_cleanup &&
+           stored_detach_guard.reserved[0] == k_java_remote_parent_lifecycle_publishing;
 }
 
 static int exact_finish_fences_retained(const java_remote_parent_key_t *key,
@@ -331,11 +335,13 @@ static int exact_finish_fences_retained(const java_remote_parent_key_t *key,
     return claim_present && same_key(&stored_claim_key, key, sizeof(*key)) &&
            stored_claim.observed_monotime_ns &&
            stored_claim.process_incarnation == test_process_incarnation &&
-           stored_claim.lifecycle == lifecycle && find_ambiguity(key) && detach_guard_present &&
+           stored_claim.lifecycle == k_java_remote_parent_lifecycle_cleanup &&
+           stored_claim.reserved[0] == lifecycle && find_ambiguity(key) && detach_guard_present &&
            same_key(&stored_detach_guard_key, &guard_key, sizeof(guard_key)) &&
            stored_detach_guard.observed_monotime_ns &&
            stored_detach_guard.process_incarnation == key->generation &&
-           stored_detach_guard.lifecycle == k_java_remote_parent_lifecycle_publishing;
+           stored_detach_guard.lifecycle == k_java_remote_parent_lifecycle_cleanup &&
+           stored_detach_guard.reserved[0] == k_java_remote_parent_lifecycle_publishing;
 }
 
 static int exact_finish_claim_guard_tail(const java_remote_parent_key_t *key,
@@ -344,12 +350,14 @@ static int exact_finish_claim_guard_tail(const java_remote_parent_key_t *key,
     return claim_present && same_key(&stored_claim_key, key, sizeof(*key)) &&
            stored_claim.observed_monotime_ns &&
            stored_claim.process_incarnation == test_process_incarnation &&
-           stored_claim.lifecycle == lifecycle && !find_ambiguity_entry(key) &&
+           stored_claim.lifecycle == k_java_remote_parent_lifecycle_cleanup &&
+           stored_claim.reserved[0] == lifecycle && !find_ambiguity_entry(key) &&
            detach_guard_present &&
            same_key(&stored_detach_guard_key, &guard_key, sizeof(guard_key)) &&
            stored_detach_guard.observed_monotime_ns &&
            stored_detach_guard.process_incarnation == key->generation &&
-           stored_detach_guard.lifecycle == k_java_remote_parent_lifecycle_publishing;
+           stored_detach_guard.lifecycle == k_java_remote_parent_lifecycle_cleanup &&
+           stored_detach_guard.reserved[0] == k_java_remote_parent_lifecycle_publishing;
 }
 
 static int owner_cleanup_payload_absent(void) {
@@ -528,8 +536,8 @@ static void *test_map_lookup(void *map, const void *key) {
         }
         return &stored_claim;
     }
-    if (map == &java_remote_parent_claims && detach_guard_present &&
-        same_key(key, &stored_detach_guard_key, sizeof(stored_detach_guard_key))) {
+    if (map == &java_remote_parent_owner_guards && detach_guard_present &&
+        same_key(key, &stored_detach_guard_key.owner, sizeof(stored_detach_guard_key.owner))) {
         if (replace_task_during_detach_guard_lookup) {
             replace_task_during_detach_guard_lookup = 0;
             stored_task.generation = test_replacement_generation;
@@ -653,60 +661,85 @@ test_map_update(void *map, const void *key, const void *value, unsigned long lon
         task_present = 1;
         return 0;
     }
-    if (map == &java_remote_parent_claims && flags == BPF_NOEXIST) {
-        const java_remote_parent_key_t *claim_key = key;
-        if (!claim_key->generation) {
-            if (claim_present &&
-                same_key(&stored_claim_key, &stored_state_key, sizeof(stored_state_key))) {
-                exact_claim_present_at_guard_acquisition++;
-            }
-            if (detach_guard_present) {
-                return -1;
-            }
-            stored_detach_guard_key = *claim_key;
+    if (map == &java_remote_parent_owner_guards && flags == BPF_EXIST) {
+        if (detach_guard_present &&
+            same_key(key, &stored_detach_guard_key.owner, sizeof(stored_detach_guard_key.owner))) {
             stored_detach_guard = *(const java_remote_parent_claim_t *)value;
-            detach_guard_present = 1;
-            if (replace_cleanup_owner_after_guard_acquisition) {
-                replace_cleanup_owner_after_guard_acquisition = 0;
-                stored_owner.generation = test_replacement_generation;
-            }
-            if (replace_detach_guard_after_claim) {
-                replace_detach_guard_after_claim = 0;
-                stored_detach_guard.process_incarnation = test_replacement_generation;
-            }
-            if (replace_detach_guard_token_after_claim) {
-                replace_detach_guard_token_after_claim = 0;
-                stored_detach_guard.observed_monotime_ns++;
-            }
-            if (inject_transient_alias_after_guard) {
-                inject_transient_alias_after_guard = 0;
-                stored_state.aliases++;
-            }
-            if (attempt_exact_receive_retain_after_guard) {
-                attempt_exact_receive_retain_after_guard = 0;
-                exact_receive_retain_after_guard_result =
-                    java_remote_parent_retain_generation_alias(&stored_state_key,
-                                                               stored_state.observed_monotime_ns);
-            }
-            if (inject_exact_receive_task_take_after_guard) {
-                inject_exact_receive_task_take_after_guard = 0;
-                const u8 discard = discard_injected_exact_receive_task_take;
-                discard_injected_exact_receive_task_take = 0;
-                const pid_key_t saved_task = current_task;
-                current_task = test_child;
-                exact_receive_task_take_status =
-                    java_remote_parent_retrieve_for_connection(&exact_receive_task_take_response,
-                                                               discard,
-                                                               test_now_ns,
-                                                               k_java_remote_parent_source_task,
-                                                               &stored_state.connection,
-                                                               stored_state.connection_netns,
-                                                               test_generation,
-                                                               test_socket_cookie);
-                current_task = saved_task;
-            }
             return 0;
         }
+        return -1;
+    }
+    if (map == &java_remote_parent_claims && flags == BPF_EXIST) {
+        if (claim_present && same_key(key, &stored_claim_key, sizeof(stored_claim_key))) {
+            if (exact_claim_handoff_failures) {
+                exact_claim_handoff_failures--;
+                return -1;
+            }
+            stored_claim = *(const java_remote_parent_claim_t *)value;
+            return 0;
+        }
+        return -1;
+    }
+    if (map == &java_remote_parent_owner_guards && flags == BPF_NOEXIST) {
+        if (inject_identical_foreign_detach_guard_on_update) {
+            inject_identical_foreign_detach_guard_on_update = 0;
+            stored_detach_guard_key = java_remote_parent_detach_guard_key(key);
+            stored_detach_guard = *(const java_remote_parent_claim_t *)value;
+            detach_guard_present = 1;
+            return -1;
+        }
+        if (detach_guard_present) {
+            return -1;
+        }
+        stored_detach_guard_key = java_remote_parent_detach_guard_key(key);
+        stored_detach_guard = *(const java_remote_parent_claim_t *)value;
+        detach_guard_present = 1;
+        if (claim_present &&
+            same_key(&stored_claim_key, &stored_state_key, sizeof(stored_state_key))) {
+            exact_claim_present_at_guard_acquisition++;
+        }
+        if (replace_cleanup_owner_after_guard_acquisition) {
+            replace_cleanup_owner_after_guard_acquisition = 0;
+            stored_owner.generation = test_replacement_generation;
+        }
+        if (replace_detach_guard_after_claim) {
+            replace_detach_guard_after_claim = 0;
+            stored_detach_guard.process_incarnation = test_replacement_generation;
+        }
+        if (replace_detach_guard_token_after_claim) {
+            replace_detach_guard_token_after_claim = 0;
+            stored_detach_guard.observed_monotime_ns++;
+        }
+        if (inject_transient_alias_after_guard) {
+            inject_transient_alias_after_guard = 0;
+            stored_state.aliases++;
+        }
+        if (attempt_exact_receive_retain_after_guard) {
+            attempt_exact_receive_retain_after_guard = 0;
+            exact_receive_retain_after_guard_result = java_remote_parent_retain_generation_alias(
+                &stored_state_key, stored_state.observed_monotime_ns);
+        }
+        if (inject_exact_receive_task_take_after_guard) {
+            inject_exact_receive_task_take_after_guard = 0;
+            const u8 discard = discard_injected_exact_receive_task_take;
+            discard_injected_exact_receive_task_take = 0;
+            const pid_key_t saved_task = current_task;
+            current_task = test_child;
+            exact_receive_task_take_status =
+                java_remote_parent_retrieve_for_connection(&exact_receive_task_take_response,
+                                                           discard,
+                                                           test_now_ns,
+                                                           k_java_remote_parent_source_task,
+                                                           &stored_state.connection,
+                                                           stored_state.connection_netns,
+                                                           test_generation,
+                                                           test_socket_cookie);
+            current_task = saved_task;
+        }
+        return 0;
+    }
+    if (map == &java_remote_parent_claims && flags == BPF_NOEXIST) {
+        const java_remote_parent_key_t *claim_key = key;
         if (inject_claim_before_exact_update) {
             inject_claim_before_exact_update = 0;
             stored_claim_key = *claim_key;
@@ -989,8 +1022,8 @@ static long test_map_delete(void *map, const void *key) {
         claim_present = 0;
         return 0;
     }
-    if (map == &java_remote_parent_claims && detach_guard_present &&
-        same_key(key, &stored_detach_guard_key, sizeof(stored_detach_guard_key))) {
+    if (map == &java_remote_parent_owner_guards && detach_guard_present &&
+        same_key(key, &stored_detach_guard_key.owner, sizeof(stored_detach_guard_key.owner))) {
         if (detach_guard_delete_failures) {
             detach_guard_delete_failures--;
             if (detach_guard_delete_absent_on_failure) {
@@ -1221,6 +1254,7 @@ static void seed_generation(const connection_info_t *connection) {
     exact_claim_update_attempts = 0;
     exact_claim_present_at_guard_acquisition = 0;
     exact_claim_update_failures = 0;
+    exact_claim_handoff_failures = 0;
     exact_claim_delete_failures = 0;
     detach_guard_present = 0;
     terminal_present = 0;
@@ -1254,6 +1288,7 @@ static void seed_generation(const connection_info_t *connection) {
     replace_task_during_claim_lookup = 0;
     replace_task_during_detach_guard_lookup = 0;
     remove_claim_and_replace_task_during_claim_lookup = 0;
+    inject_identical_foreign_detach_guard_on_update = 0;
     arm_task_replacement_after_post_claim_check = 0;
     replace_task_on_next_state_lookup = 0;
     arm_task_replacement_and_state_loss_after_post_claim_check = 0;
@@ -2603,7 +2638,8 @@ static void test_detached_zero_cleanup_quarantines_retain_race(void) {
         stored_state.aliases != 1 || !generation_index_present || owner_present ||
         fallback_present || connection_present || cookie_connection_present || !claim_present ||
         !same_key(&stored_claim_key, &stored_state_key, sizeof(stored_state_key)) ||
-        stored_claim.lifecycle != k_java_remote_parent_lifecycle_publishing ||
+        stored_claim.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_claim.reserved[0] != k_java_remote_parent_lifecycle_publishing ||
         stored_claim.process_incarnation != test_process_incarnation || detach_guard_present ||
         terminal_present || !find_ambiguity(&stored_state_key) ||
         exact_claim_update_attempts != 2 || unexpected_update || unexpected_delete) {
@@ -2627,7 +2663,8 @@ static void test_detached_zero_cleanup_retains_adoption_artifacts(void) {
         &stored_state_key, test_process_incarnation, test_observed_monotime_ns);
     if (!state_present || stored_state.aliases || !generation_index_present || !claim_present ||
         !same_key(&stored_claim_key, &stored_state_key, sizeof(stored_state_key)) ||
-        stored_claim.lifecycle != k_java_remote_parent_lifecycle_publishing ||
+        stored_claim.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_claim.reserved[0] != k_java_remote_parent_lifecycle_publishing ||
         stored_claim.process_incarnation != test_process_incarnation || terminal_present ||
         !find_ambiguity(&stored_state_key) || owner_present || fallback_present ||
         connection_present || cookie_connection_present || detach_guard_present ||
@@ -2660,7 +2697,8 @@ static void test_cross_generation_guard_does_not_block_detached_cleanup(void) {
     if (task_present || !state_present || stored_state.aliases || !generation_index_present ||
         !claim_present ||
         !same_key(&stored_claim_key, &stored_state_key, sizeof(stored_state_key)) ||
-        stored_claim.lifecycle != k_java_remote_parent_lifecycle_publishing ||
+        stored_claim.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_claim.reserved[0] != k_java_remote_parent_lifecycle_publishing ||
         !detach_guard_present || !owner_present || !fallback_present ||
         stored_owner.generation != test_replacement_generation ||
         memcmp(&stored_fallback, &replacement, sizeof(replacement)) != 0 ||
@@ -2699,10 +2737,12 @@ static void test_cleanup_unlinks_and_cleans_a_different_detached_generation(void
         generation_index_present || !replacement_generation_index_present || connection_present ||
         cookie_connection_present || fallback_present || task_present || !claim_present ||
         !same_key(&stored_claim_key, &replacement_state_key, sizeof(replacement_state_key)) ||
-        stored_claim.lifecycle != k_java_remote_parent_lifecycle_publishing ||
+        stored_claim.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_claim.reserved[0] != k_java_remote_parent_lifecycle_publishing ||
         !detach_guard_present || stored_detach_guard_key.generation ||
         stored_detach_guard.process_incarnation != test_generation ||
-        stored_detach_guard.lifecycle != k_java_remote_parent_lifecycle_publishing ||
+        stored_detach_guard.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_detach_guard.reserved[0] != k_java_remote_parent_lifecycle_publishing ||
         terminal_present || !find_ambiguity(&stored_state_key) ||
         !find_ambiguity(&replacement_state_key) || exact_claim_update_attempts != 2 ||
         unexpected_update || unexpected_delete) {
@@ -2720,9 +2760,12 @@ static void test_owner_cleanup_release_tails_are_recoverable(void) {
         stored_owner.generation != test_replacement_generation || !fallback_present ||
         !state_present || !generation_index_present || !connection_present ||
         !cookie_connection_present || !claim_present ||
-        stored_claim.lifecycle != k_java_remote_parent_lifecycle_discarded ||
-        !detach_guard_present || !find_ambiguity(&stored_state_key) || unexpected_update ||
-        unexpected_delete) {
+        stored_claim.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_claim.reserved[0] != k_java_remote_parent_lifecycle_discarded ||
+        !detach_guard_present ||
+        stored_detach_guard.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_detach_guard.reserved[0] != k_java_remote_parent_lifecycle_publishing ||
+        !find_ambiguity(&stored_state_key) || unexpected_update || unexpected_delete) {
         fail("owner cleanup did not retain its full fence after post-guard owner replacement");
     }
 
@@ -2732,9 +2775,13 @@ static void test_owner_cleanup_release_tails_are_recoverable(void) {
     java_remote_parent_cleanup(&test_owner);
     if (ambiguity_delete_failures || replace_ambiguity_after_failed_delete ||
         !owner_cleanup_payload_absent() || !claim_present ||
-        stored_claim.lifecycle != k_java_remote_parent_lifecycle_discarded ||
-        !detach_guard_present || !find_ambiguity_entry(&stored_state_key) ||
-        find_ambiguity(&stored_state_key) || unexpected_update || unexpected_delete) {
+        stored_claim.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_claim.reserved[0] != k_java_remote_parent_lifecycle_discarded ||
+        !detach_guard_present ||
+        stored_detach_guard.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_detach_guard.reserved[0] != k_java_remote_parent_lifecycle_publishing ||
+        !find_ambiguity_entry(&stored_state_key) || find_ambiguity(&stored_state_key) ||
+        unexpected_update || unexpected_delete) {
         fail("owner cleanup promoted a successor reservation after failed marker deletion");
     }
 
@@ -2742,9 +2789,12 @@ static void test_owner_cleanup_release_tails_are_recoverable(void) {
     exact_claim_delete_failures = 1;
     java_remote_parent_cleanup(&test_owner);
     if (exact_claim_delete_failures || !owner_cleanup_payload_absent() || !claim_present ||
-        stored_claim.lifecycle != k_java_remote_parent_lifecycle_discarded ||
-        !detach_guard_present || find_ambiguity_entry(&stored_state_key) || unexpected_update ||
-        unexpected_delete) {
+        stored_claim.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_claim.reserved[0] != k_java_remote_parent_lifecycle_discarded ||
+        !detach_guard_present ||
+        stored_detach_guard.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_detach_guard.reserved[0] != k_java_remote_parent_lifecycle_publishing ||
+        find_ambiguity_entry(&stored_state_key) || unexpected_update || unexpected_delete) {
         fail("owner cleanup lost its exact-claim/guard release tail");
     }
 
@@ -2776,8 +2826,10 @@ static void test_owner_cleanup_release_tails_are_recoverable(void) {
     detach_guard_delete_failures = 1;
     java_remote_parent_cleanup(&test_owner);
     if (detach_guard_delete_failures || !owner_cleanup_payload_absent() || claim_present ||
-        !detach_guard_present || find_ambiguity_entry(&stored_state_key) || unexpected_update ||
-        unexpected_delete) {
+        !detach_guard_present ||
+        stored_detach_guard.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_detach_guard.reserved[0] != k_java_remote_parent_lifecycle_publishing ||
+        find_ambiguity_entry(&stored_state_key) || unexpected_update || unexpected_delete) {
         fail("owner cleanup lost its guard-only release tail");
     }
 
@@ -2914,6 +2966,126 @@ static void test_generation_claim_status_validation(void) {
             .status = k_java_remote_parent_status_already_consumed,
             .take_stat = k_java_remote_parent_stat_take_already_consumed,
             .discard_stat = k_java_remote_parent_stat_discard_already_consumed,
+        },
+        {
+            .name = "cleanup-consumed claim lost its committed status",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_cleanup,
+                    .reserved = {[0] = k_java_remote_parent_lifecycle_consumed},
+                },
+            .status = k_java_remote_parent_status_already_consumed,
+            .take_stat = k_java_remote_parent_stat_take_already_consumed,
+            .discard_stat = k_java_remote_parent_stat_discard_already_consumed,
+        },
+        {
+            .name = "cleanup-discarded claim lost its committed status",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_cleanup,
+                    .reserved = {[0] = k_java_remote_parent_lifecycle_discarded},
+                },
+            .status = k_java_remote_parent_status_already_consumed,
+            .take_stat = k_java_remote_parent_stat_take_already_consumed,
+            .discard_stat = k_java_remote_parent_stat_discard_already_consumed,
+        },
+        {
+            .name = "cleanup-stale claim lost its committed status",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_cleanup,
+                    .reserved = {[0] = k_java_remote_parent_lifecycle_stale},
+                },
+            .status = k_java_remote_parent_status_already_consumed,
+            .take_stat = k_java_remote_parent_stat_take_already_consumed,
+            .discard_stat = k_java_remote_parent_stat_discard_already_consumed,
+        },
+        {
+            .name = "cleanup-ambiguous claim was not ambiguous",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_cleanup,
+                    .reserved = {[0] = k_java_remote_parent_lifecycle_ambiguous},
+                },
+            .status = k_java_remote_parent_status_ambiguous,
+            .take_stat = k_java_remote_parent_stat_take_ambiguous,
+            .discard_stat = k_java_remote_parent_stat_discard_ambiguous,
+        },
+        {
+            .name = "cleanup-publishing claim was not overload",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_cleanup,
+                    .reserved = {[0] = k_java_remote_parent_lifecycle_publishing},
+                },
+            .status = k_java_remote_parent_status_overload,
+            .take_stat = k_java_remote_parent_stat_take_overload,
+            .discard_stat = k_java_remote_parent_stat_discard_overload,
+        },
+        {
+            .name = "cleanup claim with zero origin was not ambiguous",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_cleanup,
+                },
+            .status = k_java_remote_parent_status_ambiguous,
+            .take_stat = k_java_remote_parent_stat_take_ambiguous,
+            .discard_stat = k_java_remote_parent_stat_discard_ambiguous,
+        },
+        {
+            .name = "cleanup claim with active origin was not ambiguous",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_cleanup,
+                    .reserved = {[0] = k_java_remote_parent_lifecycle_active},
+                },
+            .status = k_java_remote_parent_status_ambiguous,
+            .take_stat = k_java_remote_parent_stat_take_ambiguous,
+            .discard_stat = k_java_remote_parent_stat_discard_ambiguous,
+        },
+        {
+            .name = "cleanup claim with recursive origin was not ambiguous",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_cleanup,
+                    .reserved = {[0] = k_java_remote_parent_lifecycle_cleanup},
+                },
+            .status = k_java_remote_parent_status_ambiguous,
+            .take_stat = k_java_remote_parent_stat_take_ambiguous,
+            .discard_stat = k_java_remote_parent_stat_discard_ambiguous,
+        },
+        {
+            .name = "cleanup claim with reserved metadata was not ambiguous",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_cleanup,
+                    .reserved =
+                        {
+                            [0] = k_java_remote_parent_lifecycle_consumed,
+                            [1] = 1,
+                        },
+                },
+            .status = k_java_remote_parent_status_ambiguous,
+            .take_stat = k_java_remote_parent_stat_take_ambiguous,
+            .discard_stat = k_java_remote_parent_stat_discard_ambiguous,
         },
         {
             .name = "zero-timestamp claim was not ambiguous",
@@ -3199,7 +3371,8 @@ static void test_exact_receive_detach_quarantines_last_alias_release_race(void) 
         fallback_present || !state_present || stored_state.aliases || !generation_index_present ||
         connection_present || cookie_connection_present || task_present || !claim_present ||
         !same_key(&stored_claim_key, &stored_state_key, sizeof(stored_state_key)) ||
-        stored_claim.lifecycle != k_java_remote_parent_lifecycle_publishing ||
+        stored_claim.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_claim.reserved[0] != k_java_remote_parent_lifecycle_publishing ||
         stored_claim.process_incarnation != test_process_incarnation ||
         !exact_reset_fences_retained(&stored_state_key) || terminal_present ||
         !find_ambiguity(&stored_state_key) || unexpected_update || unexpected_delete ||
@@ -3298,7 +3471,8 @@ static void test_exact_receive_detach_handles_pre_guard_retain_increment(void) {
         !generation_index_present || connection_present || cookie_connection_present ||
         !claim_present ||
         !same_key(&stored_claim_key, &stored_state_key, sizeof(stored_state_key)) ||
-        stored_claim.lifecycle != k_java_remote_parent_lifecycle_publishing ||
+        stored_claim.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_claim.reserved[0] != k_java_remote_parent_lifecycle_publishing ||
         stored_claim.process_incarnation != test_process_incarnation || detach_guard_present ||
         terminal_present || !find_ambiguity(&stored_state_key) ||
         exact_claim_update_attempts != 2 || unexpected_update || unexpected_delete) {
@@ -3483,7 +3657,8 @@ static void test_aliased_reset_guard_release_failure_retains_tail(void) {
         !generation_index_present || connection_present || cookie_connection_present ||
         !task_present || claim_present || !detach_guard_present ||
         stored_detach_guard.process_incarnation != test_generation ||
-        stored_detach_guard.lifecycle != k_java_remote_parent_lifecycle_publishing ||
+        stored_detach_guard.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_detach_guard.reserved[0] != k_java_remote_parent_lifecycle_publishing ||
         !find_ambiguity_entry(&stored_state_key) || find_ambiguity(&stored_state_key) ||
         terminal_present || exact_claim_update_attempts != 1 || unexpected_update ||
         unexpected_delete) {
@@ -3507,10 +3682,11 @@ static void test_take_claim_revalidates_state_and_generation_index(void) {
                                                    test_socket_cookie) !=
             k_java_remote_parent_status_missing ||
         remove_state_index_after_claim || state_present || generation_index_present ||
-        !claim_present || stored_claim.lifecycle != k_java_remote_parent_lifecycle_consumed ||
-        terminal_present || !owner_present || !fallback_present || !connection_present ||
-        !cookie_connection_present || exact_claim_update_attempts != 1 ||
-        !find_ambiguity(&stored_state_key) || unexpected_update || unexpected_delete) {
+        !claim_present || stored_claim.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_claim.reserved[0] != k_java_remote_parent_lifecycle_consumed || terminal_present ||
+        !owner_present || !fallback_present || !connection_present || !cookie_connection_present ||
+        exact_claim_update_attempts != 1 || !find_ambiguity(&stored_state_key) ||
+        unexpected_update || unexpected_delete) {
         fail("late TAKE claim published a terminal after state/index removal");
     }
     memset(&response, 0, sizeof(response));
@@ -3536,7 +3712,8 @@ static void test_take_claim_revalidates_state_and_generation_index(void) {
         replace_state_index_observation_after_claim || !state_present ||
         stored_state.observed_monotime_ns != test_now_ns || !generation_index_present ||
         stored_generation_index.observed_monotime_ns != test_now_ns || !claim_present ||
-        stored_claim.lifecycle != k_java_remote_parent_lifecycle_consumed || terminal_present ||
+        stored_claim.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_claim.reserved[0] != k_java_remote_parent_lifecycle_consumed || terminal_present ||
         !owner_present || !fallback_present || !connection_present || !cookie_connection_present ||
         !find_ambiguity(&stored_state_key) || exact_claim_update_attempts != 1 ||
         unexpected_update || unexpected_delete) {
@@ -3589,8 +3766,9 @@ static void test_visible_final_claim_survives_post_claim_guard(void) {
                 k_java_remote_parent_status_overload ||
             response.status != k_java_remote_parent_status_overload ||
             inject_detach_guard_after_exact_claim || !claim_present ||
-            stored_claim.lifecycle != (discard ? k_java_remote_parent_lifecycle_discarded
-                                               : k_java_remote_parent_lifecycle_consumed) ||
+            stored_claim.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+            stored_claim.reserved[0] != (discard ? k_java_remote_parent_lifecycle_discarded
+                                                 : k_java_remote_parent_lifecycle_consumed) ||
             !detach_guard_present || !find_ambiguity(&stored_state_key) || !owner_present ||
             !fallback_present || !state_present || !generation_index_present ||
             !connection_present || !cookie_connection_present || terminal_present ||
@@ -4396,9 +4574,60 @@ static void test_exact_receive_detach_claim_failures_are_fail_closed(void) {
         !generation_index_present || connection_present || cookie_connection_present ||
         !task_present || !claim_present || !detach_guard_present ||
         !find_ambiguity_entry(&stored_state_key) || find_ambiguity(&stored_state_key) ||
-        stored_claim.lifecycle != k_java_remote_parent_lifecycle_publishing || terminal_present ||
-        exact_claim_update_attempts != 1 || unexpected_update || unexpected_delete) {
+        stored_claim.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_claim.reserved[0] != k_java_remote_parent_lifecycle_publishing ||
+        stored_detach_guard.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_detach_guard.reserved[0] != k_java_remote_parent_lifecycle_publishing ||
+        terminal_present || exact_claim_update_attempts != 1 || unexpected_update ||
+        unexpected_delete) {
         fail("aliased RESET did not retain its recoverable claim/guard release tail");
+    }
+
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    exact_claim_delete_failures = 1;
+    exact_claim_handoff_failures = 1;
+    if (!java_remote_parent_detach_exact_receive_generation(&stored_state_key,
+                                                            test_process_incarnation,
+                                                            &connection,
+                                                            test_connection_netns,
+                                                            test_socket_cookie) ||
+        exact_claim_delete_failures || exact_claim_handoff_failures || owner_present ||
+        fallback_present || !state_present || !generation_index_present || connection_present ||
+        cookie_connection_present || !task_present || !claim_present || !detach_guard_present ||
+        !find_ambiguity_entry(&stored_state_key) || find_ambiguity(&stored_state_key) ||
+        stored_claim.lifecycle != k_java_remote_parent_lifecycle_publishing ||
+        stored_claim.reserved[0] ||
+        stored_detach_guard.lifecycle != k_java_remote_parent_lifecycle_publishing ||
+        stored_detach_guard.reserved[0] || terminal_present || exact_claim_update_attempts != 1 ||
+        unexpected_update || unexpected_delete) {
+        fail("failed exact RESET handoff exposed a cleanup-owned guard without its exact fence");
+    }
+}
+
+static void test_failed_guard_acquisition_preserves_identical_foreign_guard(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+
+    seed_generation(&connection);
+    inject_identical_foreign_detach_guard_on_update = 1;
+    if (java_remote_parent_detach_exact_receive_generation(&stored_state_key,
+                                                           test_process_incarnation,
+                                                           &connection,
+                                                           test_connection_netns,
+                                                           test_socket_cookie) ||
+        inject_identical_foreign_detach_guard_on_update || !owner_present || !fallback_present ||
+        !state_present || !generation_index_present || !connection_present ||
+        !cookie_connection_present || claim_present || !detach_guard_present ||
+        stored_detach_guard.observed_monotime_ns != test_now_ns ||
+        stored_detach_guard.process_incarnation != test_generation ||
+        stored_detach_guard.lifecycle != k_java_remote_parent_lifecycle_publishing ||
+        stored_detach_guard.reserved[0] || stored_detach_guard.reserved[1] ||
+        stored_detach_guard.reserved[2] || stored_detach_guard.reserved[3] ||
+        stored_detach_guard.reserved[4] || stored_detach_guard.reserved[5] ||
+        stored_detach_guard.reserved[6] || terminal_present ||
+        !find_ambiguity_entry(&stored_state_key) || find_ambiguity(&stored_state_key) ||
+        exact_claim_update_attempts != 1 || unexpected_update || unexpected_delete) {
+        fail("failed guard acquisition handed off a byte-identical foreign guard");
     }
 }
 
@@ -4443,7 +4672,10 @@ static void test_exact_receive_zero_alias_claim_failures_are_fail_closed(void) {
         exact_claim_delete_failures || owner_present || fallback_present || state_present ||
         generation_index_present || connection_present || cookie_connection_present ||
         !claim_present || !detach_guard_present || find_ambiguity_entry(&stored_state_key) ||
-        terminal_present || stored_claim.lifecycle != k_java_remote_parent_lifecycle_publishing ||
+        terminal_present || stored_claim.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_claim.reserved[0] != k_java_remote_parent_lifecycle_publishing ||
+        stored_detach_guard.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_detach_guard.reserved[0] != k_java_remote_parent_lifecycle_publishing ||
         exact_claim_update_attempts != 1 || unexpected_update || unexpected_delete) {
         fail("zero-alias RESET did not retain its recoverable claim/guard release tail");
     }
@@ -4802,7 +5034,7 @@ static void seed_finish_claim(enum java_remote_parent_lifecycle lifecycle) {
 
 static void finish_seeded_generation(enum java_remote_parent_lifecycle lifecycle) {
     const java_remote_parent_resolution_t resolution = finish_resolution();
-    const java_remote_parent_claim_t owned_claim = stored_claim;
+    java_remote_parent_claim_t owned_claim = stored_claim;
     java_remote_parent_finish_generation(
         &resolution, lifecycle, test_observed_monotime_ns, &owned_claim);
 }
@@ -4968,9 +5200,13 @@ static void test_finish_release_failures_are_fenced(void) {
     if (ambiguity_delete_failures || replace_ambiguity_after_failed_delete ||
         !finish_generation_artifacts_absent() ||
         !exact_finish_terminal_present(k_java_remote_parent_lifecycle_consumed) || !claim_present ||
-        stored_claim.lifecycle != k_java_remote_parent_lifecycle_consumed ||
-        !detach_guard_present || !find_ambiguity_entry(&stored_state_key) ||
-        find_ambiguity(&stored_state_key) || unexpected_update || unexpected_delete) {
+        stored_claim.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_claim.reserved[0] != k_java_remote_parent_lifecycle_consumed ||
+        !detach_guard_present ||
+        stored_detach_guard.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_detach_guard.reserved[0] != k_java_remote_parent_lifecycle_publishing ||
+        !find_ambiguity_entry(&stored_state_key) || find_ambiguity(&stored_state_key) ||
+        unexpected_update || unexpected_delete) {
         fail("finish promoted a successor reservation after failed marker deletion");
     }
 
@@ -5305,6 +5541,7 @@ int main(void) {
     test_exact_receive_detach_rejects_claim_ambiguity_and_terminal();
     test_exact_receive_detach_revalidates_after_claim();
     test_exact_receive_detach_claim_failures_are_fail_closed();
+    test_failed_guard_acquisition_preserves_identical_foreign_guard();
     test_exact_receive_zero_alias_claim_failures_are_fail_closed();
     test_exact_receive_take_completion_requires_strict_postconditions();
     test_exact_receive_detach_preserves_post_guard_successors();

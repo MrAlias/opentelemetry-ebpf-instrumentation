@@ -24,6 +24,7 @@ var disabledBridgeMapNames = [...]string{
 	"java_remote_parent_handoff_claims",
 	"java_remote_parent_handoffs",
 	"java_remote_parent_owners",
+	"java_remote_parent_owner_guards",
 	"java_remote_parent_receive_cursors",
 	"java_remote_parent_state",
 	"java_remote_parent_tasks",

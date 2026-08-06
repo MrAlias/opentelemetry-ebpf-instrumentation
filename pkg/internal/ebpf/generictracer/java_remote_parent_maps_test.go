@@ -221,6 +221,7 @@ func TestJavaRemoteParentExactLifecycleMapsDoNotEvict(t *testing.T) {
 	for _, name := range []string{
 		"java_remote_parent_ambiguity",
 		"java_remote_parent_claims",
+		"java_remote_parent_owner_guards",
 		"java_remote_parent_generation_index",
 		"java_remote_parent_state",
 		"java_retired_processes",
@@ -228,6 +229,16 @@ func TestJavaRemoteParentExactLifecycleMapsDoNotEvict(t *testing.T) {
 	} {
 		require.Equal(t, ebpf.Hash, spec.Maps[name].Type, name)
 	}
+
+	claims := spec.Maps["java_remote_parent_claims"]
+	guards := spec.Maps["java_remote_parent_owner_guards"]
+	require.NotNil(t, claims)
+	require.NotNil(t, guards)
+	require.Equal(t, uint32(12), guards.KeySize)
+	require.Equal(t, uint32(24), guards.ValueSize)
+	require.Equal(t, claims.MaxEntries, guards.MaxEntries)
+	require.Equal(t, claims.Flags, guards.Flags)
+	require.Equal(t, ebpfconvenience.PinInternal, guards.Pinning)
 }
 
 func TestJavaRemoteParentGenerationMapsArePerCPU(t *testing.T) {
@@ -336,6 +347,7 @@ func TestDisabledBridgeKeepsPerProcessAuthorizationCapacity(t *testing.T) {
 	require.Equal(t, incarnationCapacity, spec.Maps["java_process_incarnations"].MaxEntries)
 	require.Equal(t, uint32(1), spec.Maps["java_remote_parent_data_signals"].MaxEntries)
 	require.Equal(t, uint32(1), spec.Maps["java_remote_parent_data_acks"].MaxEntries)
+	require.Equal(t, uint32(1), spec.Maps["java_remote_parent_owner_guards"].MaxEntries)
 }
 
 func TestJavaThreadMappingMapsSpec(t *testing.T) {

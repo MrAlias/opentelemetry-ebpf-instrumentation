@@ -36,6 +36,8 @@ static java_remote_parent_key_t ambiguous_key;
 static u64 ambiguity_observed_monotime_ns;
 static java_remote_parent_key_t stored_claim_key;
 static java_remote_parent_claim_t stored_claim;
+static java_remote_parent_key_t stored_guard_key;
+static java_remote_parent_claim_t stored_guard;
 static java_remote_parent_response_t fallback_record;
 static int staged_present;
 static int cookie_staged_present;
@@ -43,7 +45,14 @@ static int owner_present;
 static int ambiguity_present;
 static int fallback_present;
 static int claim_present;
-static int reject_claim_update;
+static int guard_present;
+static int reject_guard_insert;
+static int reject_exact_insert;
+static int reject_exact_handoff;
+static int inject_identical_foreign_exact;
+static u64 exact_insert_observed_monotime_ns;
+static u64 guard_insert_observed_monotime_ns;
+static u64 test_now_ns;
 
 static void fail(const char *message) {
     fprintf(stderr, "FAIL: %s\n", message);
@@ -62,11 +71,18 @@ static int ambiguity_marked(void) {
     return ambiguity_present && ambiguity_observed_monotime_ns;
 }
 
-static int ambiguity_claim_retained(u64 process_incarnation) {
+static int ambiguity_fences_handed_off(u64 process_incarnation) {
     return claim_present && memcmp(&stored_claim_key, &ambiguous_key, sizeof(ambiguous_key)) == 0 &&
-           stored_claim.observed_monotime_ns == test_ktime_get_ns() &&
+           stored_claim.observed_monotime_ns > exact_insert_observed_monotime_ns &&
            stored_claim.process_incarnation == process_incarnation &&
-           stored_claim.lifecycle == k_java_remote_parent_lifecycle_ambiguous;
+           stored_claim.lifecycle == k_java_remote_parent_lifecycle_cleanup &&
+           stored_claim.reserved[0] == k_java_remote_parent_lifecycle_ambiguous && guard_present &&
+           !stored_guard_key.generation &&
+           same_owner(&stored_guard_key.owner, &ambiguous_key.owner) &&
+           stored_guard.observed_monotime_ns > guard_insert_observed_monotime_ns &&
+           stored_guard.process_incarnation == ambiguous_key.generation &&
+           stored_guard.lifecycle == k_java_remote_parent_lifecycle_cleanup &&
+           stored_guard.reserved[0] == k_java_remote_parent_lifecycle_publishing;
 }
 
 static void *test_map_lookup(void *map, const void *key) {
@@ -90,6 +106,10 @@ static void *test_map_lookup(void *map, const void *key) {
         memcmp(key, &stored_claim_key, sizeof(stored_claim_key)) == 0) {
         return &stored_claim;
     }
+    if (map == &java_remote_parent_owner_guards && guard_present &&
+        memcmp(key, &stored_guard_key.owner, sizeof(stored_guard_key.owner)) == 0) {
+        return &stored_guard;
+    }
     if (map == &java_remote_parent_fallback && fallback_present &&
         same_owner(key, &staged_connection.owner)) {
         return &fallback_record;
@@ -99,12 +119,60 @@ static void *test_map_lookup(void *map, const void *key) {
 
 static long
 test_map_update(void *map, const void *key, const void *value, unsigned long long flags) {
-    if (map == &java_remote_parent_claims && flags == BPF_NOEXIST && !claim_present &&
-        !reject_claim_update) {
-        stored_claim_key = *(const java_remote_parent_key_t *)key;
-        stored_claim = *(const java_remote_parent_claim_t *)value;
-        claim_present = 1;
-        return 0;
+    if (map == &java_remote_parent_owner_guards) {
+        const java_remote_parent_claim_t *claim = value;
+        if (flags == BPF_NOEXIST) {
+            if (reject_guard_insert) {
+                reject_guard_insert = 0;
+                return -1;
+            }
+            if (guard_present) {
+                return -1;
+            }
+            stored_guard_key = java_remote_parent_detach_guard_key(key);
+            stored_guard = *claim;
+            guard_insert_observed_monotime_ns = claim->observed_monotime_ns;
+            guard_present = 1;
+            return 0;
+        }
+        if (flags == BPF_EXIST && guard_present &&
+            memcmp(key, &stored_guard_key.owner, sizeof(stored_guard_key.owner)) == 0) {
+            stored_guard = *claim;
+            return 0;
+        }
+        return -1;
+    }
+    if (map == &java_remote_parent_claims) {
+        const java_remote_parent_key_t *claim_key = key;
+        const java_remote_parent_claim_t *claim = value;
+        if (flags == BPF_NOEXIST) {
+            if (reject_exact_insert) {
+                reject_exact_insert = 0;
+                return -1;
+            }
+            if (claim_present) {
+                return -1;
+            }
+            stored_claim_key = *claim_key;
+            stored_claim = *claim;
+            exact_insert_observed_monotime_ns = claim->observed_monotime_ns;
+            claim_present = 1;
+            if (inject_identical_foreign_exact) {
+                inject_identical_foreign_exact = 0;
+                return -1;
+            }
+            return 0;
+        }
+        if (flags == BPF_EXIST && claim_present &&
+            memcmp(key, &stored_claim_key, sizeof(stored_claim_key)) == 0) {
+            if (reject_exact_handoff) {
+                reject_exact_handoff = 0;
+                return -1;
+            }
+            stored_claim = *claim;
+            return 0;
+        }
+        return -1;
     }
     if (map == &java_remote_parent_ambiguity && (flags == BPF_ANY || flags == BPF_NOEXIST) &&
         !(flags == BPF_NOEXIST && ambiguity_present)) {
@@ -142,11 +210,16 @@ static long test_map_delete(void *map, const void *key) {
         claim_present = 0;
         return 0;
     }
+    if (map == &java_remote_parent_owner_guards && guard_present &&
+        memcmp(key, &stored_guard_key.owner, sizeof(stored_guard_key.owner)) == 0) {
+        guard_present = 0;
+        return 0;
+    }
     return -1;
 }
 
 static unsigned long long test_ktime_get_ns(void) {
-    return 123;
+    return ++test_now_ns;
 }
 
 static void reset_state(const connection_info_t *connection,
@@ -159,6 +232,8 @@ static void reset_state(const connection_info_t *connection,
     ambiguity_observed_monotime_ns = 0;
     memset(&stored_claim_key, 0, sizeof(stored_claim_key));
     memset(&stored_claim, 0, sizeof(stored_claim));
+    memset(&stored_guard_key, 0, sizeof(stored_guard_key));
+    memset(&stored_guard, 0, sizeof(stored_guard));
     memset(&fallback_record, 0, sizeof(fallback_record));
 
     staged_key = connection_info_with_netns(connection, netns);
@@ -185,7 +260,14 @@ static void reset_state(const connection_info_t *connection,
     ambiguity_present = 1;
     fallback_present = 1;
     claim_present = 0;
-    reject_claim_update = 0;
+    guard_present = 0;
+    reject_guard_insert = 0;
+    reject_exact_insert = 0;
+    reject_exact_handoff = 0;
+    inject_identical_foreign_exact = 0;
+    exact_insert_observed_monotime_ns = 0;
+    guard_insert_observed_monotime_ns = 0;
+    test_now_ns = 122;
 }
 
 static void test_connection_close_invalidates_staged_generation(void) {
@@ -204,7 +286,7 @@ static void test_connection_close_invalidates_staged_generation(void) {
         !same_owner(&ambiguous_key.owner, &staged_connection.owner)) {
         fail("connection close did not invalidate the staged generation");
     }
-    if (!fallback_present || !ambiguity_claim_retained(indexed_owner.process_incarnation)) {
+    if (!fallback_present || !ambiguity_fences_handed_off(indexed_owner.process_incarnation)) {
         fail("valid invalidation did not retain its userspace cleanup authority");
     }
 }
@@ -220,7 +302,7 @@ static void test_orphaned_connection_close_quarantines_and_cleans_indexes(void) 
     java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(&connection, 84, 86, 0);
 
     if (staged_present || cookie_staged_present || !ambiguity_marked() || !fallback_present ||
-        !ambiguity_claim_retained(staged_connection.generation)) {
+        !ambiguity_fences_handed_off(staged_connection.generation)) {
         fail("orphaned close did not quarantine and clean its physical indexes");
     }
 }
@@ -249,7 +331,7 @@ static void test_matching_incoming_generation_invalidates_stage(void) {
     java_remote_parent_mark_connection_ambiguous_in_netns_cookie(&connection, 84, 21);
 
     if (staged_present || cookie_staged_present || !ambiguity_marked() ||
-        !ambiguity_claim_retained(indexed_owner.process_incarnation)) {
+        !ambiguity_fences_handed_off(indexed_owner.process_incarnation)) {
         fail("matching incoming generation did not invalidate the staged request");
     }
 }
@@ -380,24 +462,231 @@ static void test_claimed_stage_owns_close_race(void) {
     java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(&connection, 84, 86, 0);
 
     if (!staged_present || !cookie_staged_present || !ambiguity_marked() || !fallback_present ||
-        !claim_present) {
+        !claim_present || stored_claim.lifecycle != k_java_remote_parent_lifecycle_publishing ||
+        !guard_present || stored_guard.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_guard.reserved[0] != k_java_remote_parent_lifecycle_publishing) {
         fail("close raced incorrectly with an owned Java retrieval");
     }
 }
 
-static void test_claim_pressure_preserves_ambiguous_physical_generation(void) {
+static void test_exact_handoff_failure_retains_producer_fences(void) {
     const connection_info_t connection = {
         .s_port = 1234,
         .d_port = 443,
     };
     reset_state(&connection, 42, 84, 21);
-    reject_claim_update = 1;
+    reject_exact_handoff = 1;
+
+    java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(&connection, 84, 86, 0);
+
+    if (reject_exact_handoff || staged_present || cookie_staged_present || !ambiguity_marked() ||
+        !fallback_present || !claim_present ||
+        stored_claim.lifecycle != k_java_remote_parent_lifecycle_ambiguous ||
+        stored_claim.reserved[0] || !guard_present ||
+        stored_guard.lifecycle != k_java_remote_parent_lifecycle_publishing ||
+        stored_guard.reserved[0]) {
+        fail("failed exact handoff exposed a partial userspace cleanup fence");
+    }
+}
+
+static void test_failed_exact_acquisition_preserves_identical_foreign_claim(void) {
+    const connection_info_t connection = {
+        .s_port = 1234,
+        .d_port = 443,
+    };
+    reset_state(&connection, 42, 84, 21);
+    inject_identical_foreign_exact = 1;
+
+    java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(&connection, 84, 86, 0);
+
+    if (inject_identical_foreign_exact || !staged_present || !cookie_staged_present ||
+        !ambiguity_marked() || !fallback_present || !claim_present ||
+        stored_claim.lifecycle != k_java_remote_parent_lifecycle_ambiguous ||
+        stored_claim.reserved[0] || !guard_present ||
+        stored_guard.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_guard.reserved[0] != k_java_remote_parent_lifecycle_publishing ||
+        stored_guard.observed_monotime_ns <= guard_insert_observed_monotime_ns) {
+        fail("failed exact acquisition handed off a byte-identical foreign claim");
+    }
+}
+
+static void test_cleanup_guard_blocks_physical_invalidation(void) {
+    const connection_info_t connection = {
+        .s_port = 1234,
+        .d_port = 443,
+    };
+    reset_state(&connection, 42, 84, 21);
+    stored_guard_key = java_remote_parent_detach_guard_key(&staged_connection.owner);
+    stored_guard = (java_remote_parent_claim_t){
+        .observed_monotime_ns = 121,
+        .process_incarnation = staged_connection.generation,
+        .lifecycle = k_java_remote_parent_lifecycle_cleanup,
+        .reserved = {k_java_remote_parent_lifecycle_publishing},
+    };
+    const java_remote_parent_claim_t expected_guard = stored_guard;
+    guard_present = 1;
 
     java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(&connection, 84, 86, 0);
 
     if (!staged_present || !cookie_staged_present || !ambiguity_marked() || !fallback_present ||
-        claim_present) {
-        fail("claim pressure exposed or deleted an unowned physical generation");
+        claim_present || !guard_present ||
+        memcmp(&stored_guard, &expected_guard, sizeof(expected_guard)) != 0) {
+        fail("lifecycle-cleanup owner guard did not fence physical invalidation");
+    }
+}
+
+static void test_guard_pressure_preserves_ambiguous_physical_generation(void) {
+    const connection_info_t connection = {
+        .s_port = 1234,
+        .d_port = 443,
+    };
+    reset_state(&connection, 42, 84, 21);
+    reject_guard_insert = 1;
+
+    java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(&connection, 84, 86, 0);
+
+    if (reject_guard_insert || !staged_present || !cookie_staged_present || !ambiguity_marked() ||
+        !fallback_present || claim_present || guard_present) {
+        fail("guard pressure exposed or deleted an unowned physical generation");
+    }
+}
+
+static void test_exact_claim_pressure_hands_off_owned_guard(void) {
+    const connection_info_t connection = {
+        .s_port = 1234,
+        .d_port = 443,
+    };
+    reset_state(&connection, 42, 84, 21);
+    reject_exact_insert = 1;
+
+    java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(&connection, 84, 86, 0);
+
+    if (reject_exact_insert || !staged_present || !cookie_staged_present || !ambiguity_marked() ||
+        !fallback_present || claim_present || !guard_present ||
+        stored_guard.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_guard.reserved[0] != k_java_remote_parent_lifecycle_publishing ||
+        stored_guard.observed_monotime_ns <= guard_insert_observed_monotime_ns) {
+        fail("exact-claim pressure did not retain its cleanup-owned guard tail");
+    }
+}
+
+static void test_handoff_timestamps_are_strictly_newer(void) {
+    const connection_info_t connection = {
+        .s_port = 1234,
+        .d_port = 443,
+    };
+    reset_state(&connection, 42, 84, 21);
+    const java_remote_parent_key_t key = ambiguous_key;
+    const java_remote_parent_key_t guard_key = java_remote_parent_detach_guard_key(&key.owner);
+
+    stored_claim_key = key;
+    stored_claim = (java_remote_parent_claim_t){
+        .observed_monotime_ns = 500,
+        .process_incarnation = indexed_owner.process_incarnation,
+        .lifecycle = k_java_remote_parent_lifecycle_ambiguous,
+    };
+    const java_remote_parent_claim_t local_claim = stored_claim;
+    claim_present = 1;
+    test_now_ns = 100;
+    if (!java_remote_parent_handoff_exact_fence(&key, &local_claim) ||
+        stored_claim.observed_monotime_ns != 501 ||
+        stored_claim.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_claim.reserved[0] != k_java_remote_parent_lifecycle_ambiguous) {
+        fail("exact handoff did not advance a frozen monotonic clock");
+    }
+
+    stored_guard_key = guard_key;
+    stored_guard = (java_remote_parent_claim_t){
+        .observed_monotime_ns = 700,
+        .process_incarnation = key.generation,
+        .lifecycle = k_java_remote_parent_lifecycle_publishing,
+    };
+    const java_remote_parent_claim_t local_guard = stored_guard;
+    guard_present = 1;
+    test_now_ns = 100;
+    if (!java_remote_parent_handoff_exact_detach_guard_at(&guard_key, &local_guard) ||
+        stored_guard.observed_monotime_ns != 701 ||
+        stored_guard.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
+        stored_guard.reserved[0] != k_java_remote_parent_lifecycle_publishing) {
+        fail("guard handoff did not advance a frozen monotonic clock");
+    }
+}
+
+static void test_saturated_handoff_timestamps_fail_closed(void) {
+    const connection_info_t connection = {
+        .s_port = 1234,
+        .d_port = 443,
+    };
+    reset_state(&connection, 42, 84, 21);
+    const java_remote_parent_key_t key = ambiguous_key;
+    const java_remote_parent_key_t guard_key = java_remote_parent_detach_guard_key(&key.owner);
+
+    stored_claim_key = key;
+    stored_claim = (java_remote_parent_claim_t){
+        .observed_monotime_ns = ~(u64)0,
+        .process_incarnation = indexed_owner.process_incarnation,
+        .lifecycle = k_java_remote_parent_lifecycle_ambiguous,
+    };
+    const java_remote_parent_claim_t local_claim = stored_claim;
+    claim_present = 1;
+    if (java_remote_parent_handoff_exact_fence(&key, &local_claim) ||
+        memcmp(&stored_claim, &local_claim, sizeof(local_claim)) != 0) {
+        fail("saturated exact handoff published cleanup authority");
+    }
+
+    stored_guard_key = guard_key;
+    stored_guard = (java_remote_parent_claim_t){
+        .observed_monotime_ns = ~(u64)0,
+        .process_incarnation = key.generation,
+        .lifecycle = k_java_remote_parent_lifecycle_publishing,
+    };
+    const java_remote_parent_claim_t local_guard = stored_guard;
+    guard_present = 1;
+    if (java_remote_parent_handoff_exact_detach_guard_at(&guard_key, &local_guard) ||
+        memcmp(&stored_guard, &local_guard, sizeof(local_guard)) != 0) {
+        fail("saturated guard handoff published cleanup authority");
+    }
+}
+
+static void test_detach_guard_rejects_malformed_keys(void) {
+    const connection_info_t connection = {
+        .s_port = 1234,
+        .d_port = 443,
+    };
+    reset_state(&connection, 42, 84, 21);
+    java_remote_parent_key_t expected = ambiguous_key;
+    java_remote_parent_key_t guard_key = java_remote_parent_detach_guard_key(&expected.owner);
+    java_remote_parent_claim_t local_guard = {.observed_monotime_ns = 1};
+
+    if (java_remote_parent_acquire_detach_guard_at(NULL, &guard_key, &local_guard) ||
+        memcmp(&local_guard, &(java_remote_parent_claim_t){0}, sizeof(local_guard)) != 0 ||
+        java_remote_parent_acquire_detach_guard_at(&expected, &guard_key, NULL)) {
+        fail("detach guard accepted a null protocol argument");
+    }
+    expected.generation = 0;
+    if (java_remote_parent_acquire_detach_guard_at(&expected, &guard_key, &local_guard)) {
+        fail("detach guard accepted a zero-generation exact key");
+    }
+    expected = ambiguous_key;
+    expected.reserved = 1;
+    if (java_remote_parent_acquire_detach_guard_at(&expected, &guard_key, &local_guard)) {
+        fail("detach guard accepted a reserved exact key");
+    }
+    expected = ambiguous_key;
+    guard_key.generation = expected.generation;
+    if (java_remote_parent_acquire_detach_guard_at(&expected, &guard_key, &local_guard)) {
+        fail("detach guard accepted a nonzero guard generation");
+    }
+    guard_key = java_remote_parent_detach_guard_key(&expected.owner);
+    guard_key.reserved = 1;
+    if (java_remote_parent_acquire_detach_guard_at(&expected, &guard_key, &local_guard)) {
+        fail("detach guard accepted a reserved guard key");
+    }
+    guard_key = java_remote_parent_detach_guard_key(&expected.owner);
+    guard_key.owner.tid++;
+    if (java_remote_parent_acquire_detach_guard_at(&expected, &guard_key, &local_guard) ||
+        guard_present) {
+        fail("detach guard accepted a different owner key");
     }
 }
 
@@ -411,6 +700,13 @@ int main(void) {
     test_delayed_close_preserves_reused_physical_connection();
     test_full_width_network_namespace_cookie_is_required();
     test_claimed_stage_owns_close_race();
-    test_claim_pressure_preserves_ambiguous_physical_generation();
+    test_exact_handoff_failure_retains_producer_fences();
+    test_failed_exact_acquisition_preserves_identical_foreign_claim();
+    test_cleanup_guard_blocks_physical_invalidation();
+    test_guard_pressure_preserves_ambiguous_physical_generation();
+    test_exact_claim_pressure_hands_off_owned_guard();
+    test_handoff_timestamps_are_strictly_newer();
+    test_saturated_handoff_timestamps_fail_closed();
+    test_detach_guard_rejects_malformed_keys();
     return 0;
 }

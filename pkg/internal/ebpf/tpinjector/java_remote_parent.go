@@ -320,8 +320,11 @@ func (p *Tracer) runJavaRemoteParent(ctx context.Context) func() {
 		return func() {}
 	}
 	maps := p.javaRemoteParentMaps()
-	handler := javabridge.NewMapHandler(maps, p.cfg.Java.RemoteParent.EffectiveRetrievalTTL())
-	cleanup := javabridge.NewCleanup(maps, p.cfg.Java.RemoteParent.TTL)
+	coordinator := javabridge.NewGenerationCoordinator()
+	handler := javabridge.NewMapHandler(
+		maps, p.cfg.Java.RemoteParent.EffectiveRetrievalTTL(), coordinator,
+	)
+	cleanup := javabridge.NewCleanup(maps, p.cfg.Java.RemoteParent.TTL, coordinator)
 	lifecycleCtx, cancel := context.WithCancel(ctx)
 
 	statsDone := make(chan struct{})

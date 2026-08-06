@@ -42,6 +42,7 @@ type MapHandler struct {
 	generations       bridgeMap
 	terminals         bridgeMap
 	claims            bridgeMap
+	coordinator       *GenerationCoordinator
 	ttl               time.Duration
 	monoTimeNow       func() time.Duration
 	consumedMu        sync.Mutex
@@ -182,7 +183,14 @@ const (
 	lifecyclePublishing = uint8(6)
 )
 
-func NewMapHandler(maps Maps, ttl time.Duration) *MapHandler {
+func NewMapHandler(
+	maps Maps,
+	ttl time.Duration,
+	coordinator *GenerationCoordinator,
+) *MapHandler {
+	if coordinator == nil {
+		panic("nil Java generation coordinator")
+	}
 	return &MapHandler{
 		remoteParents:     maps.RemoteParents,
 		tasks:             maps.Tasks,
@@ -198,6 +206,7 @@ func NewMapHandler(maps Maps, ttl time.Duration) *MapHandler {
 		generations:       maps.Generations,
 		terminals:         maps.Terminals,
 		claims:            maps.Claims,
+		coordinator:       coordinator,
 		ttl:               ttl,
 		monoTimeNow:       timing.MonoTimeNow,
 		consumed:          make(map[consumedIdentity]time.Duration),
@@ -250,24 +259,29 @@ func (h *MapHandler) handle(
 	if lookupSource != LookupSourceDirect && lookupSource != LookupSourceTask {
 		return Record{Status: StatusMalformed}
 	}
-
-	processCapability, status := h.processCapability(identity)
-	if status != StatusValid {
-		return Record{Status: StatusUnauthorized}
-	}
-	processIncarnation, status := h.processIncarnation(identity)
-	if status != StatusValid {
-		if authenticated {
-			return Record{Status: StatusUnauthorized}
-		}
-		return Record{Status: status}
-	}
-	if processIncarnation != processCapability ||
-		(authenticated && (expectedProcessIncarnation == 0 || processCapability != expectedProcessIncarnation)) {
-		return Record{Status: StatusUnauthorized}
-	}
 	if operation == OperationNegotiate {
+		_, status := h.authorizeProcess(identity, expectedProcessIncarnation, authenticated)
+		if status != StatusValid {
+			return Record{Status: status}
+		}
 		return Record{Status: StatusMissing}
+	}
+
+	unlock, locked := h.coordinator.tryLockHandler()
+	if !locked {
+		// Cleanup owns the userspace generation state. Fail open immediately
+		// instead of spending the transport deadline behind an RWMutex.
+		return Record{Status: StatusTimeout}
+	}
+	defer unlock()
+	if requestCanceled(ctx) {
+		return Record{Status: StatusTimeout}
+	}
+	processIncarnation, status := h.authorizeProcess(
+		identity, expectedProcessIncarnation, authenticated,
+	)
+	if status != StatusValid {
+		return Record{Status: status}
 	}
 
 	translated, status := h.translateVirtualThread(identity, processIncarnation)
@@ -860,6 +874,29 @@ func (h *MapHandler) preservedTaskGeneration(candidate resolvedCandidate) bool {
 	return state.Lifecycle == lifecycleActive && state.Reserved == ([3]byte{}) &&
 		state.Aliases > 0 && state.ProcessIncarnation == candidate.ProcessIncarnation &&
 		state.ObservedMonotonicNS > 0
+}
+
+func (h *MapHandler) authorizeProcess(
+	identity Identity,
+	expectedProcessIncarnation uint64,
+	authenticated bool,
+) (uint64, Status) {
+	processCapability, status := h.processCapability(identity)
+	if status != StatusValid {
+		return 0, StatusUnauthorized
+	}
+	processIncarnation, status := h.processIncarnation(identity)
+	if status != StatusValid {
+		if authenticated {
+			return 0, StatusUnauthorized
+		}
+		return 0, status
+	}
+	if processIncarnation != processCapability ||
+		(authenticated && (expectedProcessIncarnation == 0 || processCapability != expectedProcessIncarnation)) {
+		return 0, StatusUnauthorized
+	}
+	return processIncarnation, StatusValid
 }
 
 func (h *MapHandler) processIncarnation(identity Identity) (uint64, Status) {

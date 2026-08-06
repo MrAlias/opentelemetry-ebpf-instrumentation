@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -175,6 +176,193 @@ func TestMapHandlerKernelMapLayouts(t *testing.T) {
 	assert.Equal(t, uintptr(32), unsafe.Sizeof(terminalValue{}))
 	assert.Equal(t, uintptr(32), unsafe.Sizeof(generationIndexValue{}))
 	assert.Equal(t, uintptr(24), unsafe.Sizeof(generationClaim{}))
+}
+
+func TestNewMapHandlerRequiresGenerationCoordinator(t *testing.T) {
+	assert.Panics(t, func() {
+		NewMapHandler(Maps{}, time.Second, nil)
+	})
+}
+
+func TestGenerationCoordinatorNilLocksFailClosed(t *testing.T) {
+	var coordinator *GenerationCoordinator
+	assert.Panics(t, func() { coordinator.tryLockHandler() })
+	assert.Panics(t, func() { coordinator.lockCleanup() })
+}
+
+func TestGenerationCoordinatorBlocksCleanupDuringDelayedHandler(t *testing.T) {
+	identity := Identity{TID: 3, PID: 2, Namespace: 1}
+	handler := testMapHandler(
+		map[Identity]any{identity: validEncodedRecord(t, 10)},
+		nil,
+		nil,
+	)
+	var now atomic.Int64
+	now.Store(int64(11 * time.Second))
+	handler.monoTimeNow = func() time.Duration {
+		return time.Duration(now.Load())
+	}
+	cleanup := testCleanup(handler)
+	require.Same(t, handler.coordinator, cleanup.coordinator)
+	require.Same(t, handler.claims, cleanup.maps.claims)
+
+	claimed := make(chan struct{})
+	resume := make(chan struct{})
+	var resumeOnce sync.Once
+	var delayOnce sync.Once
+	t.Cleanup(func() { resumeOnce.Do(func() { close(resume) }) })
+	handler.claims.(*fakeBridgeMap).afterUpdate = func(any, any) {
+		delayOnce.Do(func() {
+			close(claimed)
+			<-resume
+		})
+	}
+	result := make(chan Record, 1)
+	go func() {
+		result <- handler.Handle(identity, OperationTake)
+	}()
+	select {
+	case <-claimed:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not acquire its generation claim")
+	}
+
+	now.Store(int64(10*time.Second + handler.ttl + time.Nanosecond))
+	cleanupStarted := make(chan struct{})
+	sweepEntered := make(chan struct{})
+	var sweepEnteredOnce sync.Once
+	cleanup.maps.generations.(*fakeBridgeMap).afterIterate = func() {
+		sweepEnteredOnce.Do(func() { close(sweepEntered) })
+	}
+	type cleanupResult struct {
+		stats CleanupStats
+		err   error
+	}
+	cleanupFinished := make(chan cleanupResult, 1)
+	go func() {
+		close(cleanupStarted)
+		stats, err := cleanup.SweepWithStats()
+		cleanupFinished <- cleanupResult{stats: stats, err: err}
+	}()
+	select {
+	case <-cleanupStarted:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not begin its coordinator acquisition")
+	}
+	select {
+	case <-sweepEntered:
+		t.Fatal("cleanup entered its real map sweep while the handler owned its claim")
+	case <-time.After(50 * time.Millisecond):
+	}
+	key := stateKey{Owner: identity, Generation: 10}
+	assert.Contains(t, handler.claims.(*fakeBridgeMap).values, key)
+	assert.Contains(t, handler.states.(*fakeBridgeMap).values, key)
+	assert.Contains(t, handler.generations.(*fakeBridgeMap).values, key)
+	assert.Contains(t, handler.remoteParents.(*fakeBridgeMap).values, identity)
+
+	resumeOnce.Do(func() { close(resume) })
+	select {
+	case record := <-result:
+		assert.Equal(t, StatusStale, record.Status)
+	case <-time.After(time.Second):
+		t.Fatal("handler did not complete after it was resumed")
+	}
+	select {
+	case <-sweepEntered:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not enter its real map sweep after the handler completed")
+	}
+	select {
+	case completed := <-cleanupFinished:
+		require.NoError(t, completed.err)
+		assert.Equal(t, CleanupStats{Cleaned: 1}, completed.stats)
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not finish after the handler completed")
+	}
+}
+
+func TestGenerationCoordinatorFailsHandlerOpenDuringCleanup(t *testing.T) {
+	identity := Identity{TID: 3, PID: 2, Namespace: 1}
+	handler := testMapHandler(
+		map[Identity]any{identity: validEncodedRecord(t, 10)},
+		nil,
+		nil,
+	)
+	cleanup := testCleanup(handler)
+
+	sweepEntered := make(chan struct{})
+	resumeSweep := make(chan struct{})
+	var resumeOnce sync.Once
+	var enterOnce sync.Once
+	t.Cleanup(func() { resumeOnce.Do(func() { close(resumeSweep) }) })
+	cleanup.maps.generations.(*fakeBridgeMap).afterIterate = func() {
+		enterOnce.Do(func() { close(sweepEntered) })
+		<-resumeSweep
+	}
+
+	type cleanupResult struct {
+		stats CleanupStats
+		err   error
+	}
+	cleanupFinished := make(chan cleanupResult, 1)
+	go func() {
+		stats, err := cleanup.SweepWithStats()
+		cleanupFinished <- cleanupResult{stats: stats, err: err}
+	}()
+	select {
+	case <-sweepEntered:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not acquire the generation coordinator")
+	}
+
+	negotiateResult := make(chan Record, 1)
+	go func() {
+		negotiateResult <- handler.HandleAuthenticated(
+			t.Context(),
+			identity,
+			OperationNegotiate,
+			LookupSourceDirect,
+			testProcessIncarnation,
+		)
+	}()
+	select {
+	case record := <-negotiateResult:
+		assert.Equal(t, StatusMissing, record.Status)
+	case <-time.After(time.Second):
+		t.Fatal("negotiation blocked during generation cleanup")
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	result := make(chan Record, 1)
+	go func() {
+		result <- handler.HandleAuthenticated(
+			ctx,
+			identity,
+			OperationTake,
+			LookupSourceDirect,
+			testProcessIncarnation,
+		)
+	}()
+	select {
+	case record := <-result:
+		assert.Equal(t, StatusTimeout, record.Status)
+		assert.NoError(t, ctx.Err())
+	case <-time.After(time.Second):
+		t.Fatal("handler blocked behind cleanup instead of failing open")
+	}
+	assert.Empty(t, handler.claims.(*fakeBridgeMap).values)
+	assert.NotEmpty(t, handler.states.(*fakeBridgeMap).values)
+	assert.NotEmpty(t, handler.generations.(*fakeBridgeMap).values)
+	assert.NotEmpty(t, handler.remoteParents.(*fakeBridgeMap).values)
+
+	resumeOnce.Do(func() { close(resumeSweep) })
+	select {
+	case completed := <-cleanupFinished:
+		require.NoError(t, completed.err)
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not finish after release")
+	}
 }
 
 func TestMapHandlerRejectsMissingOwnerMap(t *testing.T) {
@@ -1601,6 +1789,7 @@ func testMapHandler(remoteParents, tasks, ambiguity map[Identity]any) *MapHandle
 		generations:       &fakeBridgeMap{values: make(map[any]any)},
 		terminals:         &fakeBridgeMap{values: make(map[any]any)},
 		claims:            &fakeBridgeMap{values: make(map[any]any)},
+		coordinator:       NewGenerationCoordinator(),
 		ttl:               30 * time.Second,
 		monoTimeNow:       func() time.Duration { return 11 * time.Second },
 		consumed:          make(map[consumedIdentity]time.Duration),

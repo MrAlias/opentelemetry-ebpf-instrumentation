@@ -532,7 +532,11 @@ func runUnixBenchmark(
 ) (*bridgeBenchmarkSeries, *bridgeBenchmarkSeries, *bridgeBenchmarkSeries) {
 	t.Helper()
 
-	handler := javabridge.NewMapHandler(javaRemoteParentBenchmarkMaps(maps), 30*time.Second)
+	handler := javabridge.NewMapHandler(
+		javaRemoteParentBenchmarkMaps(maps),
+		30*time.Second,
+		javabridge.NewGenerationCoordinator(),
+	)
 	socketDir := t.TempDir()
 	require.NoError(t, os.Chmod(socketDir, 0o700))
 	socketPath := filepath.Join(socketDir, "bridge.sock")

@@ -66,6 +66,7 @@ type Cleanup struct {
 	maps        cleanupMaps
 	ttl         time.Duration
 	monoTimeNow func() time.Duration
+	coordinator *GenerationCoordinator
 }
 
 // CleanupStats reports logical cleanup roots reclaimed by one sweep. Cleaned
@@ -101,7 +102,14 @@ type retiredProcessKey struct {
 	ProcessIncarnation uint64
 }
 
-func NewCleanup(maps Maps, ttl time.Duration) *Cleanup {
+func NewCleanup(
+	maps Maps,
+	ttl time.Duration,
+	coordinator *GenerationCoordinator,
+) *Cleanup {
+	if coordinator == nil {
+		panic("nil Java generation coordinator")
+	}
 	wrap := func(m *ebpf.Map) cleanupMap {
 		if m == nil {
 			return nil
@@ -134,6 +142,7 @@ func NewCleanup(maps Maps, ttl time.Duration) *Cleanup {
 		},
 		ttl:         ttl,
 		monoTimeNow: timing.MonoTimeNow,
+		coordinator: coordinator,
 	}
 }
 
@@ -150,8 +159,10 @@ func (c *Cleanup) SweepWithStats() (CleanupStats, error) {
 	if c == nil || !c.complete() {
 		return stats, errors.New("java remote-parent cleanup maps are incomplete")
 	}
-
 	err := c.sweepSSLPrewrite()
+	unlock := c.coordinator.lockCleanup()
+	defer unlock()
+
 	retiredEntries, retiredErr := cleanupMapEntries[retiredProcessKey, uint64](c.maps.retired)
 	if retiredErr != nil {
 		return stats, errors.Join(err, fmt.Errorf("iterating retired Java processes: %w", retiredErr))
@@ -289,7 +300,7 @@ func (c *Cleanup) processCleanupSafe(
 }
 
 func (c *Cleanup) complete() bool {
-	return c.maps.remoteParents != nil && c.maps.tasks != nil &&
+	return c.coordinator != nil && c.maps.remoteParents != nil && c.maps.tasks != nil &&
 		c.maps.virtualThreads != nil && c.maps.vtIdentities != nil &&
 		c.maps.incarnations != nil && c.maps.connections != nil &&
 		c.maps.cookieConnections != nil &&

@@ -7,6 +7,7 @@ package javabridge
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 	"unsafe"
@@ -20,6 +21,136 @@ func TestCleanupKernelMapLayouts(t *testing.T) {
 	assert.Equal(t, uintptr(16), unsafe.Sizeof(handoffClaimValue{}))
 	assert.Equal(t, uintptr(24), unsafe.Sizeof(retiredProcessKey{}))
 	assert.Equal(t, uintptr(24), unsafe.Sizeof(generationClaim{}))
+}
+
+func TestNewCleanupRejectsNilGenerationCoordinator(t *testing.T) {
+	assert.PanicsWithValue(t, "nil Java generation coordinator", func() {
+		NewCleanup(Maps{}, time.Second, nil)
+	})
+}
+
+func TestCleanupRejectsMissingGenerationCoordinator(t *testing.T) {
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	cleanup.coordinator = nil
+
+	stats, err := cleanup.SweepWithStats()
+	require.Error(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+}
+
+func TestCleanupSweepSerializesWithRealMapHandlerRequest(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)}, nil, nil,
+	)
+	cleanup := testCleanup(handler)
+	enteredHandler := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	var releaseHandlerOnce sync.Once
+	t.Cleanup(func() { releaseHandlerOnce.Do(func() { close(releaseHandler) }) })
+	handler.remoteParents.(*fakeBridgeMap).afterLookup = func(count int) {
+		if count != 1 {
+			return
+		}
+		close(enteredHandler)
+		<-releaseHandler
+	}
+	handlerResult := make(chan Record, 1)
+	go func() {
+		handlerResult <- handler.Handle(owner, OperationTake)
+	}()
+	select {
+	case <-enteredHandler:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not enter its coordinated lookup")
+	}
+
+	cleanupStarted := make(chan struct{})
+	sweepEntered := make(chan struct{})
+	var sweepEnteredOnce sync.Once
+	cleanup.maps.generations.(*fakeBridgeMap).afterIterate = func() {
+		sweepEnteredOnce.Do(func() { close(sweepEntered) })
+	}
+	cleanupResult := make(chan error, 1)
+	go func() {
+		close(cleanupStarted)
+		cleanupResult <- cleanup.Sweep()
+	}()
+	select {
+	case <-cleanupStarted:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not start")
+	}
+	require.Eventually(t, func() bool {
+		unlock, locked := handler.coordinator.tryLockHandler()
+		if locked {
+			unlock()
+		}
+		return !locked
+	}, time.Second, time.Millisecond, "cleanup did not queue for the coordinator")
+	select {
+	case <-sweepEntered:
+		t.Fatal("cleanup entered the generation sweep while the handler was active")
+	default:
+	}
+
+	releaseHandlerOnce.Do(func() { close(releaseHandler) })
+	select {
+	case result := <-handlerResult:
+		assert.Equal(t, StatusValid, result.Status)
+	case <-time.After(time.Second):
+		t.Fatal("handler did not finish after release")
+	}
+	select {
+	case err := <-cleanupResult:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not finish after the handler")
+	}
+	assert.NotContains(t, cleanup.maps.states.(*fakeBridgeMap).values,
+		stateKey{Owner: owner, Generation: 10})
+}
+
+func TestCleanupSSLPrewriteSweepDoesNotBlockMapHandler(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)}, nil, nil,
+	)
+	cleanup := testCleanup(handler)
+	enteredSSL := make(chan struct{})
+	releaseSSL := make(chan struct{})
+	var enteredSSLOnce sync.Once
+	var releaseSSLOnce sync.Once
+	t.Cleanup(func() { releaseSSLOnce.Do(func() { close(releaseSSL) }) })
+	cleanup.maps.sslPrewriteConnectionClaims.(*fakeBridgeMap).afterIterate = func() {
+		enteredSSLOnce.Do(func() { close(enteredSSL) })
+		<-releaseSSL
+	}
+
+	cleanupResult := make(chan error, 1)
+	go func() { cleanupResult <- cleanup.Sweep() }()
+	select {
+	case <-enteredSSL:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not enter the SSL-prewrite sweep")
+	}
+
+	handlerResult := make(chan Record, 1)
+	go func() { handlerResult <- handler.Handle(owner, OperationTake) }()
+	select {
+	case result := <-handlerResult:
+		assert.Equal(t, StatusValid, result.Status)
+	case <-time.After(time.Second):
+		t.Fatal("handler blocked during unrelated SSL-prewrite cleanup")
+	}
+
+	releaseSSLOnce.Do(func() { close(releaseSSL) })
+	select {
+	case err := <-cleanupResult:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not finish after SSL-prewrite release")
+	}
 }
 
 func TestCleanupCookieDeleteErrorPreservesConnectionLocator(t *testing.T) {
@@ -671,6 +802,7 @@ func testCleanup(handler *MapHandler) *Cleanup {
 		},
 		ttl:         handler.ttl,
 		monoTimeNow: handler.monoTimeNow,
+		coordinator: handler.coordinator,
 	}
 }
 

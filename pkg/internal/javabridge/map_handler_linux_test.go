@@ -286,6 +286,15 @@ func TestNewMapHandlerRequiresGenerationCoordinator(t *testing.T) {
 	})
 }
 
+func TestMapHandlerRequiresOwnerGuardMap(t *testing.T) {
+	handler := testMapHandler(nil, nil, nil)
+	handler.ownerGuards = nil
+
+	assert.Equal(t, StatusUnsupported, handler.Handle(
+		Identity{TID: 3, PID: 2, Namespace: 1}, OperationTake,
+	).Status)
+}
+
 func TestGenerationCoordinatorNilLocksFailClosed(t *testing.T) {
 	var coordinator *GenerationCoordinator
 	assert.Panics(t, func() { coordinator.tryLockHandler() })
@@ -378,6 +387,7 @@ func TestGenerationCoordinatorBlocksCleanupDuringDelayedHandler(t *testing.T) {
 	case completed := <-cleanupFinished:
 		require.NoError(t, completed.err)
 		assert.Equal(t, CleanupStats{}, completed.stats)
+		assert.NotContains(t, cleanup.maps.claims.(*fakeBridgeMap).values, key)
 	case <-time.After(time.Second):
 		t.Fatal("cleanup did not finish after the handler completed")
 	}
@@ -689,6 +699,799 @@ func TestMapHandlerLinkedParentSurvivesOwnerReuse(t *testing.T) {
 	direct := handler.Handle(owner, OperationTake)
 	assert.Equal(t, StatusValid, direct.Status)
 	assert.Equal(t, uint64(11), direct.Generation)
+}
+
+func TestMapHandlerRejectsTaskLinkObservationReplacement(t *testing.T) {
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	link := activeTaskLink(owner, 10)
+	link.ObservedMonotonicNS--
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)},
+		map[Identity]any{child: link},
+		nil,
+	)
+
+	assert.Equal(t, StatusAmbiguous, handler.HandleTask(child, OperationTake).Status)
+	assert.Empty(t, handler.claims.(*fakeBridgeMap).values)
+	assert.Contains(t, handler.states.(*fakeBridgeMap).values, stateKey{
+		Owner: owner, Generation: 10,
+	})
+}
+
+func TestMapHandlerRejectsTaskTargetSnapshotReplacement(t *testing.T) {
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*stateValue, *generationIndexValue, *Record)
+	}{
+		{
+			name: "observation",
+			mutate: func(state *stateValue, index *generationIndexValue, record *Record) {
+				record.ObservedMonotonicNS++
+				state.ObservedMonotonicNS = record.ObservedMonotonicNS
+				index.ObservedMonotonicNS = record.ObservedMonotonicNS
+			},
+		},
+		{
+			name: "payload",
+			mutate: func(_ *stateValue, _ *generationIndexValue, record *Record) {
+				record.SpanID[6] = 1
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler := testMapHandler(
+				map[Identity]any{owner: validEncodedRecord(t, 10)},
+				map[Identity]any{child: activeTaskLink(owner, 10)},
+				nil,
+			)
+			states := handler.states.(*fakeBridgeMap)
+			replacement := states.values[key].(stateValue)
+			index := handler.generations.(*fakeBridgeMap).values[key].(generationIndexValue)
+			record, err := UnmarshalRecord(replacement.Response[:])
+			require.NoError(t, err)
+			test.mutate(&replacement, &index, &record)
+			encoded, err := record.MarshalBinary()
+			require.NoError(t, err)
+			replacement.Response = [RecordSize]byte(encoded)
+			replaced := false
+			states.afterLookup = func(count int) {
+				if count != 2 || replaced {
+					return
+				}
+				replaced = true
+				states.mu.Lock()
+				states.values[key] = replacement
+				states.mu.Unlock()
+				generations := handler.generations.(*fakeBridgeMap)
+				generations.mu.Lock()
+				generations.values[key] = index
+				generations.mu.Unlock()
+			}
+
+			result := handler.HandleTask(child, OperationTake)
+			assert.Equal(t, StatusAmbiguous, result.Status)
+			assert.False(t, result.IsValidRemoteParent())
+			assert.True(t, replaced)
+			assert.Equal(t, replacement, states.values[key])
+			assert.NotContains(t, handler.claims.(*fakeBridgeMap).values, key)
+		})
+	}
+}
+
+func TestMapHandlerRejectsTaskTerminalSnapshotReplacement(t *testing.T) {
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)},
+		map[Identity]any{child: activeTaskLink(owner, 10)},
+		nil,
+	)
+	delete(handler.states.(*fakeBridgeMap).values, key)
+	delete(handler.generations.(*fakeBridgeMap).values, key)
+	delete(handler.ambiguity.(*fakeBridgeMap).values, key)
+	original := terminalValue{
+		Generation:          10,
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleConsumed,
+	}
+	replacement := original
+	replacement.Lifecycle = lifecycleAmbiguous
+	terminals := handler.terminals.(*fakeBridgeMap)
+	terminals.values[owner] = original
+	terminals.afterLookup = func(count int) {
+		if count == 2 {
+			terminals.mu.Lock()
+			terminals.values[owner] = replacement
+			terminals.mu.Unlock()
+		}
+	}
+
+	result := handler.HandleTask(child, OperationTake)
+	assert.Equal(t, StatusAmbiguous, result.Status)
+	assert.False(t, result.IsValidRemoteParent())
+	assert.Equal(t, replacement, terminals.values[owner])
+	assert.Empty(t, handler.claims.(*fakeBridgeMap).values)
+}
+
+func TestMapHandlerAllowsTaskAliasCountChangeAfterClaim(t *testing.T) {
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)},
+		map[Identity]any{child: activeTaskLink(owner, 10)},
+		nil,
+	)
+	state := handler.states.(*fakeBridgeMap).values[key].(stateValue)
+	state.Aliases = 2
+	handler.states.(*fakeBridgeMap).values[key] = state
+	changed := false
+	handler.claims.(*fakeBridgeMap).afterUpdate = func(updatedKey, _ any) {
+		if updatedKey != key || changed {
+			return
+		}
+		changed = true
+		current := handler.states.(*fakeBridgeMap).values[key].(stateValue)
+		current.Aliases = 1
+		handler.states.(*fakeBridgeMap).values[key] = current
+	}
+
+	result := handler.HandleTask(child, OperationTake)
+	assert.Equal(t, StatusValid, result.Status)
+	assert.True(t, result.IsValidRemoteParent())
+}
+
+func TestMapHandlerRetainedTaskClaimOutranksTargetDisappearance(t *testing.T) {
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)},
+		map[Identity]any{child: activeTaskLink(owner, 10)},
+		nil,
+	)
+	retained := *cleanupGenerationClaim(
+		lifecycleConsumed, uint64(11*time.Second),
+	)
+	collided := false
+	claims := handler.claims.(*fakeBridgeMap)
+	claims.beforeUpdate = func(updatedKey, _ any, flags ebpf.MapUpdateFlags) {
+		if updatedKey != key || flags != ebpf.UpdateNoExist || collided {
+			return
+		}
+		collided = true
+		claims.values[key] = retained
+		delete(handler.states.(*fakeBridgeMap).values, key)
+		delete(handler.generations.(*fakeBridgeMap).values, key)
+		delete(handler.ambiguity.(*fakeBridgeMap).values, key)
+	}
+
+	result := handler.HandleTask(child, OperationTake)
+	assert.Equal(t, StatusAlreadyConsumed, result.Status)
+	assert.False(t, result.IsValidRemoteParent())
+	assert.True(t, collided)
+	assert.Equal(t, retained, claims.values[key])
+	assert.NotContains(t, handler.states.(*fakeBridgeMap).values, key)
+	assert.NotContains(t, handler.generations.(*fakeBridgeMap).values, key)
+}
+
+func TestMapHandlerClaimOnlyTaskGeneration(t *testing.T) {
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	oldKey := stateKey{Owner: owner, Generation: 10}
+	newLink := activeTaskLink(owner, 11)
+
+	newHandler := func(t *testing.T) *MapHandler {
+		handler := testMapHandler(
+			map[Identity]any{owner: validEncodedRecord(t, 10)},
+			map[Identity]any{child: activeTaskLink(owner, 10)},
+			nil,
+		)
+		delete(handler.states.(*fakeBridgeMap).values, oldKey)
+		delete(handler.generations.(*fakeBridgeMap).values, oldKey)
+		delete(handler.ambiguity.(*fakeBridgeMap).values, oldKey)
+		handler.remoteParents.(*fakeBridgeMap).values[owner] = validEncodedRecord(t, 11)
+		seedOwnerState(handler, owner, 11)
+		handler.terminals.(*fakeBridgeMap).values[owner] = terminalValue{
+			Generation:          11,
+			ObservedMonotonicNS: uint64(11 * time.Second),
+			ProcessIncarnation:  testProcessIncarnation,
+			Lifecycle:           lifecycleConsumed,
+		}
+		return handler
+	}
+
+	t.Run("retained exact claim outranks successor terminal", func(t *testing.T) {
+		handler := newHandler(t)
+		retained := *cleanupGenerationClaim(
+			lifecycleConsumed, uint64(11*time.Second),
+		)
+		handler.claims.(*fakeBridgeMap).values[oldKey] = retained
+
+		result := handler.HandleTask(child, OperationTake)
+		assert.Equal(t, StatusAlreadyConsumed, result.Status)
+		assert.False(t, result.IsValidRemoteParent())
+		assert.Equal(t, retained, handler.claims.(*fakeBridgeMap).values[oldKey])
+	})
+
+	t.Run("successor terminal is not old generation authority", func(t *testing.T) {
+		handler := newHandler(t)
+
+		result := handler.HandleTask(child, OperationTake)
+		assert.Equal(t, StatusMissing, result.Status)
+		assert.False(t, result.IsValidRemoteParent())
+		assert.Empty(t, handler.consumed)
+	})
+
+	t.Run("task rebind during exact claim lookup wins", func(t *testing.T) {
+		handler := newHandler(t)
+		retained := *cleanupGenerationClaim(
+			lifecycleConsumed, uint64(11*time.Second),
+		)
+		claims := handler.claims.(*fakeBridgeMap)
+		claims.values[oldKey] = retained
+		claims.afterLookupResult = func(lookedUpKey any, err error) {
+			if lookedUpKey == oldKey && err == nil {
+				handler.tasks.(*fakeBridgeMap).values[child] = newLink
+			}
+		}
+
+		result := handler.HandleTask(child, OperationTake)
+		assert.Equal(t, StatusAmbiguous, result.Status)
+		assert.False(t, result.IsValidRemoteParent())
+		assert.Equal(t, newLink, handler.tasks.(*fakeBridgeMap).values[child])
+		assert.Equal(t, retained, claims.values[oldKey])
+		assert.Empty(t, handler.consumed)
+	})
+
+	validExactTerminal := terminalValue{
+		Generation:          10,
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleConsumed,
+	}
+	malformedTerminals := map[string]terminalValue{
+		"zero lifecycle": func() terminalValue {
+			terminal := validExactTerminal
+			terminal.Lifecycle = 0
+			return terminal
+		}(),
+		"zero observation": func() terminalValue {
+			terminal := validExactTerminal
+			terminal.ObservedMonotonicNS = 0
+			return terminal
+		}(),
+		"invalid lifecycle": func() terminalValue {
+			terminal := validExactTerminal
+			terminal.Lifecycle = lifecycleCleanup
+			return terminal
+		}(),
+		"reserved bytes": func() terminalValue {
+			terminal := validExactTerminal
+			terminal.Reserved[0] = 1
+			return terminal
+		}(),
+	}
+	for name, terminal := range malformedTerminals {
+		for _, retained := range []bool{false, true} {
+			t.Run(fmt.Sprintf("malformed exact terminal/%s/retained=%t", name, retained), func(t *testing.T) {
+				handler := testMapHandler(
+					map[Identity]any{owner: validEncodedRecord(t, 10)},
+					map[Identity]any{child: activeTaskLink(owner, 10)},
+					nil,
+				)
+				delete(handler.states.(*fakeBridgeMap).values, oldKey)
+				delete(handler.generations.(*fakeBridgeMap).values, oldKey)
+				delete(handler.ambiguity.(*fakeBridgeMap).values, oldKey)
+				handler.terminals.(*fakeBridgeMap).values[owner] = terminal
+				expected := StatusMissing
+				if retained {
+					expected = StatusAlreadyConsumed
+					handler.claims.(*fakeBridgeMap).values[oldKey] =
+						*cleanupGenerationClaim(lifecycleConsumed, uint64(11*time.Second))
+				}
+
+				result := handler.HandleTask(child, OperationTake)
+				assert.Equal(t, expected, result.Status)
+				assert.False(t, result.IsValidRemoteParent())
+			})
+		}
+	}
+}
+
+func TestMapHandlerClaimOnlyRetryObservesCommittedExactClaim(t *testing.T) {
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)},
+		map[Identity]any{child: activeTaskLink(owner, 10)},
+		nil,
+	)
+	removed := false
+	handler.claims.(*fakeBridgeMap).afterUpdate = func(updatedKey, _ any) {
+		if updatedKey != key || removed {
+			return
+		}
+		removed = true
+		delete(handler.states.(*fakeBridgeMap).values, key)
+		delete(handler.generations.(*fakeBridgeMap).values, key)
+	}
+
+	first := handler.HandleTask(child, OperationTake)
+	assert.Equal(t, StatusAmbiguous, first.Status)
+	assert.False(t, first.IsValidRemoteParent())
+	assert.True(t, removed)
+	retained := handler.claims.(*fakeBridgeMap).values[key].(generationClaim)
+	assert.Equal(t, lifecycleCleanup, retained.Lifecycle)
+	assert.Equal(t, lifecycleConsumed, retained.Reserved[0])
+
+	second := handler.HandleTask(child, OperationTake)
+	assert.Equal(t, StatusAlreadyConsumed, second.Status)
+	assert.False(t, second.IsValidRemoteParent())
+	assert.Equal(t, retained, handler.claims.(*fakeBridgeMap).values[key])
+}
+
+func TestMapHandlerRevalidatesExactTaskAuthority(t *testing.T) {
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	oldLink := activeTaskLink(owner, 10)
+	newLink := activeTaskLink(owner, 11)
+
+	newHandler := func(t *testing.T) *MapHandler {
+		handler := testMapHandler(
+			map[Identity]any{owner: validEncodedRecord(t, 10)},
+			map[Identity]any{child: oldLink},
+			nil,
+		)
+		handler.remoteParents.(*fakeBridgeMap).values[owner] = validEncodedRecord(t, 11)
+		seedOwnerState(handler, owner, 11)
+		return handler
+	}
+
+	t.Run("replacement after resolution lookup", func(t *testing.T) {
+		handler := newHandler(t)
+		tasks := handler.tasks.(*fakeBridgeMap)
+		tasks.afterLookup = func(count int) {
+			if count == 1 {
+				tasks.mu.Lock()
+				tasks.values[child] = newLink
+				tasks.mu.Unlock()
+			}
+		}
+
+		result := handler.HandleTask(child, OperationTake)
+		assert.Equal(t, StatusAmbiguous, result.Status)
+		assert.False(t, result.IsValidRemoteParent())
+		assert.Equal(t, newLink, tasks.values[child])
+		assert.NotContains(t, handler.claims.(*fakeBridgeMap).values, stateKey{
+			Owner: owner, Generation: 10,
+		})
+	})
+
+	t.Run("replacement while old target disappears", func(t *testing.T) {
+		handler := newHandler(t)
+		oldKey := stateKey{Owner: owner, Generation: 10}
+		tasks := handler.tasks.(*fakeBridgeMap)
+		tasks.afterLookup = func(count int) {
+			if count == 1 {
+				tasks.mu.Lock()
+				tasks.values[child] = newLink
+				tasks.mu.Unlock()
+				delete(handler.states.(*fakeBridgeMap).values, oldKey)
+			}
+		}
+
+		result := handler.HandleTask(child, OperationTake)
+		assert.Equal(t, StatusAmbiguous, result.Status)
+		assert.False(t, result.IsValidRemoteParent())
+		assert.Equal(t, newLink, tasks.values[child])
+		assert.NotContains(t, handler.claims.(*fakeBridgeMap).values, oldKey)
+	})
+
+	t.Run("replacement while old payload disappears", func(t *testing.T) {
+		handler := newHandler(t)
+		oldKey := stateKey{Owner: owner, Generation: 10}
+		states := handler.states.(*fakeBridgeMap)
+		states.afterLookup = func(count int) {
+			if count == 2 {
+				handler.tasks.(*fakeBridgeMap).values[child] = newLink
+				delete(states.values, oldKey)
+			}
+		}
+
+		result := handler.HandleTask(child, OperationTake)
+		assert.Equal(t, StatusAmbiguous, result.Status)
+		assert.False(t, result.IsValidRemoteParent())
+		assert.Equal(t, newLink, handler.tasks.(*fakeBridgeMap).values[child])
+		assert.NotContains(t, handler.claims.(*fakeBridgeMap).values, oldKey)
+	})
+
+	t.Run("replacement after claim", func(t *testing.T) {
+		handler := newHandler(t)
+		oldKey := stateKey{Owner: owner, Generation: 10}
+		handler.claims.(*fakeBridgeMap).afterUpdate = func(updatedKey, _ any) {
+			if updatedKey == oldKey {
+				handler.tasks.(*fakeBridgeMap).values[child] = newLink
+			}
+		}
+
+		result := handler.HandleTask(child, OperationTake)
+		assert.Equal(t, StatusAmbiguous, result.Status)
+		assert.False(t, result.IsValidRemoteParent())
+		assert.Equal(t, newLink, handler.tasks.(*fakeBridgeMap).values[child])
+	})
+
+	t.Run("replacement outranks pre-claim owner guard", func(t *testing.T) {
+		handler := newHandler(t)
+		oldKey := stateKey{Owner: owner, Generation: 10}
+		guard := testGenerationClaim(lifecyclePublishing)
+		guard.ProcessIncarnation = 10
+		guards := handler.ownerGuards.(*fakeBridgeMap)
+		guards.values[owner] = guard
+		rebound := false
+		guards.afterLookupResult = func(key any, err error) {
+			if rebound || key != owner || err != nil {
+				return
+			}
+			rebound = true
+			handler.tasks.(*fakeBridgeMap).values[child] = newLink
+		}
+
+		result := handler.HandleTask(child, OperationTake)
+		assert.Equal(t, StatusAmbiguous, result.Status)
+		assert.False(t, result.IsValidRemoteParent())
+		assert.True(t, rebound)
+		assert.Equal(t, newLink, handler.tasks.(*fakeBridgeMap).values[child])
+		assert.NotContains(t, handler.claims.(*fakeBridgeMap).values, oldKey)
+		assert.Equal(t, guard, guards.values[owner])
+	})
+
+	t.Run("replacement outranks disappeared collided claim", func(t *testing.T) {
+		handler := newHandler(t)
+		oldKey := stateKey{Owner: owner, Generation: 10}
+		claims := handler.claims.(*fakeBridgeMap)
+		claims.beforeUpdate = func(updatedKey, _ any, flags ebpf.MapUpdateFlags) {
+			if updatedKey != oldKey || flags != ebpf.UpdateNoExist {
+				return
+			}
+			claims.values[oldKey] = testGenerationClaim(lifecycleConsumed)
+			claims.lookupErr = ebpf.ErrKeyNotExist
+		}
+		claims.afterLookupResult = func(key any, err error) {
+			if key == oldKey && errors.Is(err, ebpf.ErrKeyNotExist) {
+				handler.tasks.(*fakeBridgeMap).values[child] = newLink
+			}
+		}
+
+		result := handler.HandleTask(child, OperationTake)
+		assert.Equal(t, StatusAmbiguous, result.Status)
+		assert.False(t, result.IsValidRemoteParent())
+		assert.Equal(t, newLink, handler.tasks.(*fakeBridgeMap).values[child])
+		assert.Contains(t, claims.values, oldKey)
+	})
+
+	t.Run("replacement while post-claim state disappears", func(t *testing.T) {
+		handler := newHandler(t)
+		oldKey := stateKey{Owner: owner, Generation: 10}
+		tasks := handler.tasks.(*fakeBridgeMap)
+		tasks.afterLookup = func(count int) {
+			if count == 5 {
+				tasks.mu.Lock()
+				tasks.values[child] = newLink
+				tasks.mu.Unlock()
+				delete(handler.states.(*fakeBridgeMap).values, oldKey)
+			}
+		}
+
+		result := handler.HandleTask(child, OperationTake)
+		assert.Equal(t, StatusAmbiguous, result.Status)
+		assert.False(t, result.IsValidRemoteParent())
+		assert.Equal(t, newLink, tasks.values[child])
+		assert.Contains(t, handler.claims.(*fakeBridgeMap).values, oldKey)
+		assert.NotZero(t, handler.ambiguity.(*fakeBridgeMap).values[oldKey])
+	})
+
+	t.Run("replacement outranks post-claim owner guard", func(t *testing.T) {
+		handler := newHandler(t)
+		oldKey := stateKey{Owner: owner, Generation: 10}
+		guard := testGenerationClaim(lifecyclePublishing)
+		guard.ProcessIncarnation = 10
+		handler.claims.(*fakeBridgeMap).afterUpdate = func(updatedKey, _ any) {
+			if updatedKey == oldKey {
+				handler.tasks.(*fakeBridgeMap).values[child] = newLink
+				handler.ownerGuards.(*fakeBridgeMap).values[owner] = guard
+			}
+		}
+
+		result := handler.HandleTask(child, OperationTake)
+		assert.Equal(t, StatusAmbiguous, result.Status)
+		assert.False(t, result.IsValidRemoteParent())
+		assert.Equal(t, newLink, handler.tasks.(*fakeBridgeMap).values[child])
+		assert.Contains(t, handler.claims.(*fakeBridgeMap).values, oldKey)
+		assert.Equal(t, guard, handler.ownerGuards.(*fakeBridgeMap).values[owner])
+		assert.NotZero(t, handler.ambiguity.(*fakeBridgeMap).values[oldKey])
+	})
+
+	t.Run("replacement while retained claim is read", func(t *testing.T) {
+		handler := newHandler(t)
+		oldKey := stateKey{Owner: owner, Generation: 10}
+		handler.ambiguity.(*fakeBridgeMap).values[oldKey] = uint64(10 * time.Second)
+		handler.claims.(*fakeBridgeMap).values[oldKey] = testGenerationClaim(lifecycleConsumed)
+		claims := handler.claims.(*fakeBridgeMap)
+		claims.afterLookupResult = func(key any, err error) {
+			if err == nil && key == oldKey {
+				handler.tasks.(*fakeBridgeMap).values[child] = newLink
+			}
+		}
+
+		result := handler.HandleTask(child, OperationTake)
+		assert.Equal(t, StatusAmbiguous, result.Status)
+		assert.False(t, result.IsValidRemoteParent())
+		assert.Equal(t, newLink, handler.tasks.(*fakeBridgeMap).values[child])
+		assert.Empty(t, handler.consumed)
+	})
+}
+
+func TestMapHandlerMalformedTaskSnapshotNeverQuarantinesSuccessor(t *testing.T) {
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	oldKey := stateKey{Owner: owner, Generation: 10}
+	newKey := stateKey{Owner: owner, Generation: 11}
+	oldLink := activeTaskLink(owner, 10)
+	newLink := activeTaskLink(owner, 11)
+
+	type successorSnapshot struct {
+		fallback      [RecordSize]byte
+		owner         ownerValue
+		state         stateValue
+		generation    generationIndexValue
+		connectionKey connectionInfoNS
+		connection    connectionClaim
+		cookieKey     connectionInfoNetNSCookie
+	}
+	newHandler := func(t *testing.T) (*MapHandler, successorSnapshot) {
+		t.Helper()
+		handler := testMapHandler(
+			map[Identity]any{owner: validEncodedRecord(t, 10)},
+			map[Identity]any{child: oldLink},
+			nil,
+		)
+		delete(handler.owners.(*fakeBridgeMap).values, owner)
+		delete(handler.remoteParents.(*fakeBridgeMap).values, owner)
+		handler.remoteParents.(*fakeBridgeMap).values[owner] = validEncodedRecord(t, 11)
+		seedOwnerState(handler, owner, 11)
+
+		state := handler.states.(*fakeBridgeMap).values[newKey].(stateValue)
+		connectionKey := connectionInfoNS{
+			Connection: state.Connection,
+			NetNS:      state.ConnectionNetNS,
+		}
+		connection := handler.connections.(*fakeBridgeMap).values[connectionKey].(connectionClaim)
+		return handler, successorSnapshot{
+			fallback:      handler.remoteParents.(*fakeBridgeMap).values[owner].([RecordSize]byte),
+			owner:         handler.owners.(*fakeBridgeMap).values[owner].(ownerValue),
+			state:         state,
+			generation:    handler.generations.(*fakeBridgeMap).values[newKey].(generationIndexValue),
+			connectionKey: connectionKey,
+			connection:    connection,
+			cookieKey: connectionInfoNetNSCookie{
+				Connection:  state.Connection,
+				NetNSCookie: connection.NetNSCookie,
+			},
+		}
+	}
+	assertSuccessorUnchanged := func(t *testing.T, handler *MapHandler, expected successorSnapshot) {
+		t.Helper()
+		assert.Equal(t, expected.fallback,
+			handler.remoteParents.(*fakeBridgeMap).values[owner])
+		assert.Equal(t, expected.owner, handler.owners.(*fakeBridgeMap).values[owner])
+		assert.Equal(t, expected.state, handler.states.(*fakeBridgeMap).values[newKey])
+		assert.Equal(t, expected.generation,
+			handler.generations.(*fakeBridgeMap).values[newKey])
+		assert.Equal(t, expected.connection,
+			handler.connections.(*fakeBridgeMap).values[expected.connectionKey])
+		assert.Equal(t, expected.connection,
+			handler.cookieConnections.(*fakeBridgeMap).values[expected.cookieKey])
+		assert.Equal(t, uint64(0), handler.ambiguity.(*fakeBridgeMap).values[newKey])
+		assert.NotContains(t, handler.claims.(*fakeBridgeMap).values, newKey)
+		assert.NotContains(t, handler.ownerGuards.(*fakeBridgeMap).values, owner)
+	}
+	corruptOldStateAfterResolution := func(handler *MapHandler, rebind bool) {
+		states := handler.states.(*fakeBridgeMap)
+		states.afterLookup = func(count int) {
+			switch count {
+			case 2:
+				states.mu.Lock()
+				state := states.values[oldKey].(stateValue)
+				state.Response = [RecordSize]byte{}
+				states.values[oldKey] = state
+				states.mu.Unlock()
+			case 3:
+				if rebind {
+					tasks := handler.tasks.(*fakeBridgeMap)
+					tasks.mu.Lock()
+					tasks.values[child] = newLink
+					tasks.mu.Unlock()
+				}
+			}
+		}
+	}
+
+	t.Run("exact old snapshot replacement remains unmarked", func(t *testing.T) {
+		handler, successor := newHandler(t)
+		corruptOldStateAfterResolution(handler, false)
+
+		result := handler.HandleTask(child, OperationTake)
+		assert.Equal(t, StatusAmbiguous, result.Status)
+		assert.Equal(t, uint64(0), handler.ambiguity.(*fakeBridgeMap).values[oldKey])
+		assert.NotContains(t, handler.claims.(*fakeBridgeMap).values, oldKey)
+		assertSuccessorUnchanged(t, handler, successor)
+	})
+
+	t.Run("task rebind prevents old-generation quarantine", func(t *testing.T) {
+		handler, successor := newHandler(t)
+		corruptOldStateAfterResolution(handler, true)
+
+		result := handler.HandleTask(child, OperationTake)
+		assert.Equal(t, StatusAmbiguous, result.Status)
+		assert.Equal(t, uint64(0), handler.ambiguity.(*fakeBridgeMap).values[oldKey])
+		assert.NotContains(t, handler.claims.(*fakeBridgeMap).values, oldKey)
+		assert.Equal(t, newLink, handler.tasks.(*fakeBridgeMap).values[child])
+		assertSuccessorUnchanged(t, handler, successor)
+	})
+
+	t.Run("released old reservation is never recreated", func(t *testing.T) {
+		handler, successor := newHandler(t)
+		corruptOldStateAfterResolution(handler, false)
+		ambiguity := handler.ambiguity.(*fakeBridgeMap)
+		ambiguity.afterLookupResult = func(key any, err error) {
+			if key == oldKey && err == nil {
+				ambiguity.mu.Lock()
+				delete(ambiguity.values, oldKey)
+				ambiguity.mu.Unlock()
+			}
+		}
+
+		result := handler.HandleTask(child, OperationTake)
+		assert.Equal(t, StatusAmbiguous, result.Status)
+		assert.NotContains(t, ambiguity.values, oldKey)
+		assert.NotContains(t, handler.claims.(*fakeBridgeMap).values, oldKey)
+		assertSuccessorUnchanged(t, handler, successor)
+	})
+}
+
+func TestMapHandlerTaskObservationLookupFailureIsTransportError(t *testing.T) {
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)},
+		map[Identity]any{child: activeTaskLink(owner, 10)},
+		nil,
+	)
+	states := handler.states.(*fakeBridgeMap)
+	states.afterLookup = func(count int) {
+		if count == 1 {
+			states.lookupErr = errors.New("injected task observation lookup failure")
+		}
+	}
+
+	result := handler.HandleTask(child, OperationTake)
+	assert.Equal(t, StatusTransportError, result.Status)
+	assert.False(t, result.IsValidRemoteParent())
+	assert.Empty(t, handler.consumed)
+}
+
+func TestMapHandlerTakesResetDetachedTaskAndRetainsRecoveryFences(t *testing.T) {
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)},
+		map[Identity]any{child: activeTaskLink(owner, 10)},
+		nil,
+	)
+	oldKey := stateKey{Owner: owner, Generation: 10}
+	oldState := handler.states.(*fakeBridgeMap).values[oldKey].(stateValue)
+	oldConnectionKey := connectionInfoNS{
+		Connection: oldState.Connection,
+		NetNS:      oldState.ConnectionNetNS,
+	}
+	oldConnection := handler.connections.(*fakeBridgeMap).values[oldConnectionKey].(connectionClaim)
+	delete(handler.connections.(*fakeBridgeMap).values, oldConnectionKey)
+	delete(handler.cookieConnections.(*fakeBridgeMap).values, connectionInfoNetNSCookie{
+		Connection:  oldState.Connection,
+		NetNSCookie: oldConnection.NetNSCookie,
+	})
+	delete(handler.owners.(*fakeBridgeMap).values, owner)
+	delete(handler.remoteParents.(*fakeBridgeMap).values, owner)
+
+	handler.remoteParents.(*fakeBridgeMap).values[owner] = validEncodedRecord(t, 11)
+	seedOwnerState(handler, owner, 11)
+
+	linked := handler.HandleTask(child, OperationTake)
+	assert.Equal(t, StatusValid, linked.Status)
+	assert.Equal(t, uint64(10), linked.Generation)
+	assert.Contains(t, handler.states.(*fakeBridgeMap).values, oldKey)
+	assert.Contains(t, handler.generations.(*fakeBridgeMap).values, oldKey)
+	claimed, ok := handler.claims.(*fakeBridgeMap).values[oldKey].(generationClaim)
+	require.True(t, ok)
+	assert.Equal(t, testProcessIncarnation, claimed.ProcessIncarnation)
+	assert.Equal(t, lifecycleCleanup, claimed.Lifecycle)
+	assert.Equal(t, lifecycleConsumed, claimed.Reserved[0])
+	guard, ok := handler.ownerGuards.(*fakeBridgeMap).values[owner].(generationClaim)
+	require.True(t, ok)
+	assert.Equal(t, uint64(10), guard.ProcessIncarnation)
+	assert.Equal(t, lifecycleCleanup, guard.Lifecycle)
+	assert.Equal(t, lifecyclePublishing, guard.Reserved[0])
+	assert.NotZero(t, handler.ambiguity.(*fakeBridgeMap).values[oldKey])
+	assert.Equal(t, uint64(11),
+		handler.owners.(*fakeBridgeMap).values[owner].(ownerValue).Generation)
+	assert.Equal(t, uint64(11), func() uint64 {
+		encoded := handler.remoteParents.(*fakeBridgeMap).values[owner].([RecordSize]byte)
+		record, err := UnmarshalRecord(encoded[:])
+		require.NoError(t, err)
+		return record.Generation
+	}())
+
+	assert.Equal(t, StatusAlreadyConsumed, handler.HandleTask(child, OperationTake).Status)
+	assert.Equal(t, StatusAlreadyConsumed, handler.HandleTask(child, OperationDiscard).Status)
+	assert.Equal(t, StatusOverload, handler.Handle(owner, OperationTake).Status)
+}
+
+func TestMapHandlerRetainsDetachedTaskWhenAliasDisappearsAfterClaim(t *testing.T) {
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)},
+		map[Identity]any{child: activeTaskLink(owner, 10)},
+		nil,
+	)
+	oldKey := stateKey{Owner: owner, Generation: 10}
+	oldState := handler.states.(*fakeBridgeMap).values[oldKey].(stateValue)
+	oldConnectionKey := connectionInfoNS{
+		Connection: oldState.Connection,
+		NetNS:      oldState.ConnectionNetNS,
+	}
+	oldConnection := handler.connections.(*fakeBridgeMap).values[oldConnectionKey].(connectionClaim)
+	oldCookieKey := connectionInfoNetNSCookie{
+		Connection:  oldState.Connection,
+		NetNSCookie: oldConnection.NetNSCookie,
+	}
+
+	delete(handler.owners.(*fakeBridgeMap).values, owner)
+	delete(handler.remoteParents.(*fakeBridgeMap).values, owner)
+	handler.remoteParents.(*fakeBridgeMap).values[owner] = validEncodedRecord(t, 11)
+	seedOwnerState(handler, owner, 11)
+	handler.claims.(*fakeBridgeMap).afterUpdate = func(updatedKey, _ any) {
+		if updatedKey != oldKey {
+			return
+		}
+		state := handler.states.(*fakeBridgeMap).values[oldKey].(stateValue)
+		state.Aliases = 0
+		handler.states.(*fakeBridgeMap).values[oldKey] = state
+	}
+
+	result := handler.HandleTask(child, OperationTake)
+	assert.Equal(t, StatusAmbiguous, result.Status)
+	assert.Contains(t, handler.states.(*fakeBridgeMap).values, oldKey)
+	assert.Contains(t, handler.generations.(*fakeBridgeMap).values, oldKey)
+	assert.Contains(t, handler.connections.(*fakeBridgeMap).values, oldConnectionKey)
+	assert.Contains(t, handler.cookieConnections.(*fakeBridgeMap).values, oldCookieKey)
+	assert.Contains(t, handler.claims.(*fakeBridgeMap).values, oldKey)
+	guard, ok := handler.ownerGuards.(*fakeBridgeMap).values[owner].(generationClaim)
+	require.True(t, ok)
+	assert.Equal(t, lifecycleCleanup, guard.Lifecycle)
+	assert.Equal(t, lifecyclePublishing, guard.Reserved[0])
+	assert.NotZero(t, handler.ambiguity.(*fakeBridgeMap).values[oldKey])
+	assert.Equal(t, uint64(11),
+		handler.owners.(*fakeBridgeMap).values[owner].(ownerValue).Generation)
 }
 
 func TestMapHandlerLinkedParentRequiresCompletePreservedState(t *testing.T) {
@@ -1179,7 +1982,7 @@ func TestMapHandlerRejectsStaleAndMalformedRecords(t *testing.T) {
 	})
 }
 
-func TestMapHandlerQuarantinesMalformedFallbackAndAllowsOwnerReuse(t *testing.T) {
+func TestMapHandlerDefersMalformedFallbackToCoordinatedCleanup(t *testing.T) {
 	identity := Identity{TID: 3, PID: 2, Namespace: 1}
 	handler := testMapHandler(
 		map[Identity]any{identity: validEncodedRecord(t, 10)},
@@ -1187,21 +1990,53 @@ func TestMapHandlerQuarantinesMalformedFallbackAndAllowsOwnerReuse(t *testing.T)
 		nil,
 	)
 	handler.remoteParents.(*fakeBridgeMap).values[identity] = [RecordSize]byte{}
+	key := stateKey{Owner: identity, Generation: 10}
+	owner := handler.owners.(*fakeBridgeMap).values[identity]
+	state := handler.states.(*fakeBridgeMap).values[key]
+	generation := handler.generations.(*fakeBridgeMap).values[key]
 
 	assert.Equal(t, StatusMalformed, handler.Handle(identity, OperationTake).Status)
+	assert.Equal(t, [RecordSize]byte{}, handler.remoteParents.(*fakeBridgeMap).values[identity])
+	assert.Equal(t, owner, handler.owners.(*fakeBridgeMap).values[identity])
+	assert.Equal(t, state, handler.states.(*fakeBridgeMap).values[key])
+	assert.Equal(t, generation, handler.generations.(*fakeBridgeMap).values[key])
+	assert.Empty(t, handler.claims.(*fakeBridgeMap).values)
+	assert.Empty(t, handler.ownerGuards.(*fakeBridgeMap).values)
+
+	cleanup := testCleanup(handler)
+	now := 41 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+	stats, err := cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	claim := cleanup.maps.claims.(*fakeBridgeMap).values[key].(generationClaim)
+	guard := cleanup.maps.ownerGuards.(*fakeBridgeMap).values[identity].(generationClaim)
+	assert.True(t, validGenerationCleanupClaim(claim))
+	assert.True(t, validGenerationCleanupGuard(identity, guard))
+	assert.Equal(t, uint64(now), cleanup.maps.ambiguity.(*fakeBridgeMap).values[key])
+	assert.Contains(t, cleanup.maps.states.(*fakeBridgeMap).values, key)
+
+	now += cleanup.ttl + time.Nanosecond
+	for range 4 {
+		_, err = cleanup.SweepWithStats()
+		require.NoError(t, err)
+	}
 	assert.Empty(t, handler.remoteParents.(*fakeBridgeMap).values)
 	assert.Empty(t, handler.owners.(*fakeBridgeMap).values)
 	assert.Empty(t, handler.states.(*fakeBridgeMap).values)
 	assert.Empty(t, handler.generations.(*fakeBridgeMap).values)
 	assert.Empty(t, handler.connections.(*fakeBridgeMap).values)
 	assert.Empty(t, handler.cookieConnections.(*fakeBridgeMap).values)
+	assert.NotContains(t, handler.ambiguity.(*fakeBridgeMap).values, key)
+	assert.NotContains(t, handler.claims.(*fakeBridgeMap).values, key)
+	assert.NotContains(t, handler.ownerGuards.(*fakeBridgeMap).values, identity)
 
 	handler.remoteParents.(*fakeBridgeMap).values[identity] = validEncodedRecord(t, 11)
 	seedOwnerState(handler, identity, 11)
 	assert.Equal(t, StatusValid, handler.Handle(identity, OperationTake).Status)
 }
 
-func TestMapHandlerMalformedFallbackQuarantinePreservesReplacement(t *testing.T) {
+func TestMapHandlerMalformedFallbackSnapshotNeverQuarantinesSuccessor(t *testing.T) {
 	identity := Identity{TID: 3, PID: 2, Namespace: 1}
 	handler := testMapHandler(
 		map[Identity]any{identity: validEncodedRecord(t, 10)},
@@ -1210,26 +2045,51 @@ func TestMapHandlerMalformedFallbackQuarantinePreservesReplacement(t *testing.T)
 	)
 	handler.remoteParents.(*fakeBridgeMap).values[identity] = [RecordSize]byte{}
 	remoteParents := handler.remoteParents.(*fakeBridgeMap)
+	newKey := stateKey{Owner: identity, Generation: 11}
+	var successorState stateValue
+	var successorConnectionKey connectionInfoNS
+	var successorConnection connectionClaim
 	remoteParents.afterLookup = func(count int) {
-		if count != 3 {
+		if count != 2 {
 			return
 		}
 		remoteParents.mu.Lock()
 		remoteParents.values[identity] = validEncodedRecord(t, 11)
 		remoteParents.mu.Unlock()
-		handler.owners.(*fakeBridgeMap).values[identity] = ownerValue{
-			Generation:         11,
-			ProcessIncarnation: testProcessIncarnation,
-			Lifecycle:          lifecycleActive,
+		seedOwnerState(handler, identity, 11)
+		successorState = handler.states.(*fakeBridgeMap).values[newKey].(stateValue)
+		successorConnectionKey = connectionInfoNS{
+			Connection: successorState.Connection,
+			NetNS:      successorState.ConnectionNetNS,
 		}
+		successorConnection = handler.connections.(*fakeBridgeMap).
+			values[successorConnectionKey].(connectionClaim)
 	}
 
 	assert.Equal(t, StatusMalformed, handler.Handle(identity, OperationTake).Status)
-	var preserved [RecordSize]byte
-	require.NoError(t, remoteParents.Lookup(&identity, &preserved))
-	record, err := UnmarshalRecord(preserved[:])
-	require.NoError(t, err)
-	assert.Equal(t, uint64(11), record.Generation)
+	assert.Equal(t, validEncodedRecord(t, 11), remoteParents.values[identity])
+	assert.Equal(t, ownerValue{
+		Generation:         11,
+		ProcessIncarnation: testProcessIncarnation,
+		Lifecycle:          lifecycleActive,
+	}, handler.owners.(*fakeBridgeMap).values[identity])
+	assert.Equal(t, successorState, handler.states.(*fakeBridgeMap).values[newKey])
+	assert.Equal(t, generationIndexValue{
+		Process:             javaProcessIdentity(identity),
+		ProcessIncarnation:  testProcessIncarnation,
+		ObservedMonotonicNS: successorState.ObservedMonotonicNS,
+	}, handler.generations.(*fakeBridgeMap).values[newKey])
+	assert.Equal(t, successorConnection,
+		handler.connections.(*fakeBridgeMap).values[successorConnectionKey])
+	assert.Equal(t, successorConnection,
+		handler.cookieConnections.(*fakeBridgeMap).values[connectionInfoNetNSCookie{
+			Connection:  successorState.Connection,
+			NetNSCookie: successorConnection.NetNSCookie,
+		}])
+	assert.NotContains(t, handler.terminals.(*fakeBridgeMap).values, identity)
+	assert.Empty(t, handler.claims.(*fakeBridgeMap).values)
+	assert.Empty(t, handler.ownerGuards.(*fakeBridgeMap).values)
+	assert.Equal(t, uint64(0), handler.ambiguity.(*fakeBridgeMap).values[newKey])
 }
 
 func TestMapHandlerQuarantinesMalformedFallbackWithInvalidOwner(t *testing.T) {
@@ -1275,14 +2135,36 @@ func TestMapHandlerQuarantinesMalformedFallbackWithInvalidOwner(t *testing.T) {
 			handler.owners.(*fakeBridgeMap).values[identity] = test.owner
 
 			assert.Equal(t, StatusMalformed, handler.Handle(identity, OperationTake).Status)
-			assert.Empty(t, handler.remoteParents.(*fakeBridgeMap).values)
-			assert.Empty(t, handler.owners.(*fakeBridgeMap).values)
+			assert.Equal(t, [RecordSize]byte{},
+				handler.remoteParents.(*fakeBridgeMap).values[identity])
+			assert.Equal(t, test.owner, handler.owners.(*fakeBridgeMap).values[identity])
 
 			handler.remoteParents.(*fakeBridgeMap).values[identity] = validEncodedRecord(t, 11)
 			seedOwnerState(handler, identity, 11)
 			assert.Equal(t, StatusValid, handler.Handle(identity, OperationTake).Status)
 		})
 	}
+}
+
+func TestMapHandlerMalformedFallbackPreservesOwnerDetachGuard(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	guard := generationClaim{
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  10,
+		Lifecycle:           lifecyclePublishing,
+	}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)}, nil, nil,
+	)
+	handler.remoteParents.(*fakeBridgeMap).values[owner] = [RecordSize]byte{}
+	handler.ownerGuards.(*fakeBridgeMap).values[owner] = guard
+
+	assert.Equal(t, StatusMalformed, handler.Handle(owner, OperationTake).Status)
+	assert.Equal(t, guard, handler.ownerGuards.(*fakeBridgeMap).values[owner])
+	assert.NotContains(t, handler.claims.(*fakeBridgeMap).values, stateKey{
+		Owner: owner, Generation: 10,
+	})
+	assert.Contains(t, handler.remoteParents.(*fakeBridgeMap).values, owner)
 }
 
 func TestMapHandlerDiscardDoesNotReturnContext(t *testing.T) {
@@ -1358,6 +2240,77 @@ func TestMapHandlerHonorsTerminalFromPrimaryTransport(t *testing.T) {
 	}
 }
 
+func TestMapHandlerRetainedExactClaimOutranksTerminal(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+
+	tests := []struct {
+		name              string
+		terminalLifecycle uint8
+		claim             *generationClaim
+		status            Status
+	}{
+		{
+			name:              "discarded cleanup outranks ambiguous terminal",
+			terminalLifecycle: lifecycleAmbiguous,
+			claim: cleanupGenerationClaim(
+				lifecycleDiscarded, uint64(11*time.Second),
+			),
+			status: StatusAlreadyConsumed,
+		},
+		{
+			name:              "ambiguous cleanup outranks consumed terminal",
+			terminalLifecycle: lifecycleConsumed,
+			claim: cleanupGenerationClaim(
+				lifecycleAmbiguous, uint64(11*time.Second),
+			),
+			status: StatusAmbiguous,
+		},
+		{
+			name:              "publishing cleanup outranks consumed terminal",
+			terminalLifecycle: lifecycleConsumed,
+			claim: cleanupGenerationClaim(
+				lifecyclePublishing, uint64(11*time.Second),
+			),
+			status: StatusOverload,
+		},
+		{
+			name:              "malformed cleanup outranks stale terminal",
+			terminalLifecycle: lifecycleStale,
+			claim: func() *generationClaim {
+				claim := cleanupGenerationClaim(
+					lifecycleConsumed, uint64(11*time.Second),
+				)
+				claim.Reserved[1] = 1
+				return claim
+			}(),
+			status: StatusAmbiguous,
+		},
+		{
+			name:              "terminal remains authoritative without exact claim",
+			terminalLifecycle: lifecycleStale,
+			status:            StatusStale,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler := testMapHandler(nil, nil, nil)
+			handler.terminals.(*fakeBridgeMap).values[owner] = terminalValue{
+				Generation:          key.Generation,
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  testProcessIncarnation,
+				Lifecycle:           test.terminalLifecycle,
+			}
+			if test.claim != nil {
+				handler.claims.(*fakeBridgeMap).values[key] = *test.claim
+			}
+
+			assert.Equal(t, test.status, handler.Handle(owner, OperationTake).Status)
+		})
+	}
+}
+
 func TestMapHandlerCleansKernelStateBeforeSequentialRequest(t *testing.T) {
 	identity := Identity{TID: 3, PID: 2, Namespace: 1}
 	handler := testMapHandler(
@@ -1375,6 +2328,53 @@ func TestMapHandlerCleansKernelStateBeforeSequentialRequest(t *testing.T) {
 	handler.remoteParents.(*fakeBridgeMap).values[identity] = validEncodedRecord(t, 11)
 	seedOwnerState(handler, identity, 11)
 	assert.Equal(t, StatusValid, handler.Handle(identity, OperationTake).Status)
+}
+
+func TestMapHandlerRejectsMalformedConnectionMetadata(t *testing.T) {
+	identity := Identity{TID: 3, PID: 2, Namespace: 1}
+	for _, test := range []struct {
+		name   string
+		mutate func(*stateValue)
+	}{
+		{
+			name: "zero network namespace",
+			mutate: func(state *stateValue) {
+				state.ConnectionNetNS = 0
+			},
+		},
+		{
+			name: "empty connection",
+			mutate: func(state *stateValue) {
+				state.Connection = connectionInfo{}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler := testMapHandler(
+				map[Identity]any{identity: validEncodedRecord(t, 10)}, nil, nil,
+			)
+			key := stateKey{Owner: identity, Generation: 10}
+			state := handler.states.(*fakeBridgeMap).values[key].(stateValue)
+			test.mutate(&state)
+			handler.states.(*fakeBridgeMap).values[key] = state
+			clear(handler.connections.(*fakeBridgeMap).values)
+			clear(handler.cookieConnections.(*fakeBridgeMap).values)
+			connectionKey := connectionInfoNS{
+				Connection: state.Connection,
+				NetNS:      state.ConnectionNetNS,
+			}
+			seedConnectionClaim(handler, connectionKey, identity, key.Generation)
+			record, err := UnmarshalRecord(state.Response[:])
+			require.NoError(t, err)
+
+			assert.False(t, validFinishState(state, record, testProcessIncarnation))
+			assert.Equal(t, StatusAmbiguous, handler.Handle(identity, OperationTake).Status)
+			assert.Empty(t, handler.claims.(*fakeBridgeMap).values)
+			assert.Empty(t, handler.ownerGuards.(*fakeBridgeMap).values)
+			assert.Equal(t, state, handler.states.(*fakeBridgeMap).values[key])
+			assert.Contains(t, handler.connections.(*fakeBridgeMap).values, connectionKey)
+		})
+	}
 }
 
 func TestMapHandlerReleasesConnectionHandoff(t *testing.T) {
@@ -1442,6 +2442,197 @@ func TestMapHandlerHonorsClaimFromPrimaryTransport(t *testing.T) {
 
 	assert.Equal(t, StatusAlreadyConsumed, handler.Handle(identity, OperationTake).Status)
 	assert.NotEmpty(t, handler.remoteParents.(*fakeBridgeMap).values)
+}
+
+func TestMapHandlerRejectsForeignIncarnationClaimCollision(t *testing.T) {
+	identity := Identity{TID: 3, PID: 2, Namespace: 1}
+	handler := testMapHandler(
+		map[Identity]any{identity: validEncodedRecord(t, 10)},
+		nil,
+		nil,
+	)
+	seedOwnerState(handler, identity, 10)
+	key := stateKey{Owner: identity, Generation: 10}
+	claim := testGenerationClaim(lifecycleConsumed)
+	claim.ProcessIncarnation++
+	handler.claims.(*fakeBridgeMap).values[key] = claim
+
+	assert.Equal(t, StatusAmbiguous, handler.Handle(identity, OperationTake).Status)
+	assert.Equal(t, claim, handler.claims.(*fakeBridgeMap).values[key])
+	assert.NotEmpty(t, handler.remoteParents.(*fakeBridgeMap).values)
+	assert.Empty(t, handler.consumed)
+}
+
+func TestMapHandlerPropagatesRacedClaimStatus(t *testing.T) {
+	identity := Identity{TID: 3, PID: 2, Namespace: 1}
+	for _, operation := range []Operation{OperationTake, OperationDiscard} {
+		for _, test := range []struct {
+			name          string
+			claim         generationClaim
+			expected      Status
+			marksConsumed bool
+		}{
+			{
+				name:     "publishing",
+				claim:    testGenerationClaim(lifecyclePublishing),
+				expected: StatusOverload,
+			},
+			{
+				name:          "consumed",
+				claim:         testGenerationClaim(lifecycleConsumed),
+				expected:      StatusAlreadyConsumed,
+				marksConsumed: true,
+			},
+			{
+				name:          "discarded",
+				claim:         testGenerationClaim(lifecycleDiscarded),
+				expected:      StatusAlreadyConsumed,
+				marksConsumed: true,
+			},
+			{
+				name:          "stale",
+				claim:         testGenerationClaim(lifecycleStale),
+				expected:      StatusAlreadyConsumed,
+				marksConsumed: true,
+			},
+			{
+				name:     "ambiguous",
+				claim:    testGenerationClaim(lifecycleAmbiguous),
+				expected: StatusAmbiguous,
+			},
+			{
+				name: "foreign incarnation",
+				claim: func() generationClaim {
+					claim := testGenerationClaim(lifecycleConsumed)
+					claim.ProcessIncarnation++
+					return claim
+				}(),
+				expected: StatusAmbiguous,
+			},
+		} {
+			t.Run(fmt.Sprintf("%s/%s", operation, test.name), func(t *testing.T) {
+				handler := testMapHandler(
+					map[Identity]any{identity: validEncodedRecord(t, 10)}, nil,
+					map[Identity]any{identity: uint64(10 * time.Second)},
+				)
+				key := stateKey{Owner: identity, Generation: 10}
+				claims := handler.claims.(*fakeBridgeMap)
+				claims.beforeUpdate = func(updatedKey, _ any, flags ebpf.MapUpdateFlags) {
+					if updatedKey == key && flags == ebpf.UpdateNoExist {
+						claims.values[key] = test.claim
+					}
+				}
+
+				result := handler.Handle(identity, operation)
+				assert.Equal(t, test.expected, result.Status)
+				assert.False(t, result.IsValidRemoteParent())
+				assert.Equal(t, test.claim, claims.values[key])
+				assert.Equal(t, test.marksConsumed, len(handler.consumed) != 0)
+			})
+		}
+	}
+}
+
+func TestMapHandlerNeverRollsBackVisibleFinalClaim(t *testing.T) {
+	identity := Identity{TID: 3, PID: 2, Namespace: 1}
+	for _, operation := range []Operation{OperationTake, OperationDiscard} {
+		t.Run(operation.String(), func(t *testing.T) {
+			handler := testMapHandler(
+				map[Identity]any{identity: validEncodedRecord(t, 10)}, nil, nil,
+			)
+			key := stateKey{Owner: identity, Generation: 10}
+			guard := testGenerationClaim(lifecyclePublishing)
+			guard.ProcessIncarnation = 10
+			handler.claims.(*fakeBridgeMap).afterUpdate = func(updatedKey, _ any) {
+				if updatedKey == key {
+					handler.ownerGuards.(*fakeBridgeMap).values[identity] = guard
+				}
+			}
+
+			result := handler.Handle(identity, operation)
+			assert.Equal(t, StatusOverload, result.Status)
+			assert.False(t, result.IsValidRemoteParent())
+			claim, ok := handler.claims.(*fakeBridgeMap).values[key].(generationClaim)
+			require.True(t, ok)
+			assert.Equal(t, lifecycleCleanup, claim.Lifecycle)
+			expectedOrigin := lifecycleConsumed
+			if operation == OperationDiscard {
+				expectedOrigin = lifecycleDiscarded
+			}
+			assert.Equal(t, expectedOrigin, claim.Reserved[0])
+			assert.NotZero(t, handler.ambiguity.(*fakeBridgeMap).values[key])
+
+			retry := handler.Handle(identity, OperationTake)
+			assert.Equal(t, StatusAlreadyConsumed, retry.Status)
+			assert.Equal(t, claim, handler.claims.(*fakeBridgeMap).values[key])
+		})
+	}
+}
+
+func TestMapHandlerAmbiguousConsumePreservesStatusWhenGuardAppears(t *testing.T) {
+	identity := Identity{TID: 3, PID: 2, Namespace: 1}
+	handler := testMapHandler(
+		map[Identity]any{identity: validEncodedRecord(t, 10)}, nil,
+		map[Identity]any{identity: uint64(10 * time.Second)},
+	)
+	key := stateKey{Owner: identity, Generation: 10}
+	guard := testGenerationClaim(lifecyclePublishing)
+	guard.ProcessIncarnation = 10
+	handler.claims.(*fakeBridgeMap).afterUpdate = func(updatedKey, _ any) {
+		if updatedKey == key {
+			handler.ownerGuards.(*fakeBridgeMap).values[identity] = guard
+		}
+	}
+
+	result := handler.Handle(identity, OperationTake)
+	assert.Equal(t, StatusAmbiguous, result.Status)
+	claim := handler.claims.(*fakeBridgeMap).values[key].(generationClaim)
+	assert.Equal(t, lifecycleCleanup, claim.Lifecycle)
+	assert.Equal(t, lifecycleDiscarded, claim.Reserved[0])
+	assert.Equal(t, guard, handler.ownerGuards.(*fakeBridgeMap).values[identity])
+	assert.NotZero(t, handler.ambiguity.(*fakeBridgeMap).values[key])
+}
+
+func TestMapHandlerCancellationBeforeClaimNeverCommits(t *testing.T) {
+	identity := Identity{TID: 3, PID: 2, Namespace: 1}
+	for _, test := range []struct {
+		name      string
+		configure func(*MapHandler)
+	}{
+		{name: "valid take"},
+		{
+			name: "ambiguous consume",
+			configure: func(handler *MapHandler) {
+				handler.ambiguity.(*fakeBridgeMap).values[stateKey{
+					Owner: identity, Generation: 10,
+				}] = uint64(10 * time.Second)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler := testMapHandler(
+				map[Identity]any{identity: validEncodedRecord(t, 10)}, nil, nil,
+			)
+			if test.configure != nil {
+				test.configure(handler)
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			handler.ownerGuards.(*fakeBridgeMap).afterLookupResult = func(key any, err error) {
+				if key == identity && errors.Is(err, ebpf.ErrKeyNotExist) {
+					cancel()
+				}
+			}
+
+			result := handler.HandleAuthenticated(
+				ctx, identity, OperationTake, LookupSourceDirect, testProcessIncarnation,
+			)
+			assert.Equal(t, StatusTimeout, result.Status)
+			assert.False(t, result.IsValidRemoteParent())
+			assert.NotContains(t, handler.claims.(*fakeBridgeMap).values, stateKey{
+				Owner: identity, Generation: 10,
+			})
+		})
+	}
 }
 
 func TestMapHandlerHonorsAmbiguousClaimFromPrimaryTransport(t *testing.T) {
@@ -1521,7 +2712,10 @@ func TestMapHandlerRevalidatesPublicationAfterClaim(t *testing.T) {
 
 		assert.Equal(t, StatusAlreadyConsumed, handler.Handle(identity, OperationTake).Status)
 		assert.NotEmpty(t, handler.remoteParents.(*fakeBridgeMap).values)
-		assert.Empty(t, handler.claims.(*fakeBridgeMap).values)
+		assert.NotEmpty(t, handler.claims.(*fakeBridgeMap).values)
+		assert.NotZero(t, handler.ambiguity.(*fakeBridgeMap).values[stateKey{
+			Owner: identity, Generation: 10,
+		}])
 	})
 
 	t.Run("state disappears", func(t *testing.T) {
@@ -1535,8 +2729,11 @@ func TestMapHandlerRevalidatesPublicationAfterClaim(t *testing.T) {
 		}
 
 		assert.Equal(t, StatusMissing, handler.Handle(identity, OperationTake).Status)
-		assert.Empty(t, handler.remoteParents.(*fakeBridgeMap).values)
-		assert.Empty(t, handler.claims.(*fakeBridgeMap).values)
+		assert.NotEmpty(t, handler.remoteParents.(*fakeBridgeMap).values)
+		assert.NotEmpty(t, handler.claims.(*fakeBridgeMap).values)
+		assert.NotZero(t, handler.ambiguity.(*fakeBridgeMap).values[stateKey{
+			Owner: identity, Generation: 10,
+		}])
 	})
 
 	t.Run("connection changes", func(t *testing.T) {
@@ -1555,8 +2752,23 @@ func TestMapHandlerRevalidatesPublicationAfterClaim(t *testing.T) {
 		}
 
 		assert.Equal(t, StatusAmbiguous, handler.Handle(identity, OperationTake).Status)
-		assert.Empty(t, handler.remoteParents.(*fakeBridgeMap).values)
-		assert.Empty(t, handler.claims.(*fakeBridgeMap).values)
+		assert.NotEmpty(t, handler.remoteParents.(*fakeBridgeMap).values)
+		assert.NotEmpty(t, handler.claims.(*fakeBridgeMap).values)
+	})
+
+	t.Run("connection cookie disappears", func(t *testing.T) {
+		handler := testMapHandler(
+			map[Identity]any{identity: validEncodedRecord(t, 10)},
+			nil,
+			nil,
+		)
+		handler.claims.(*fakeBridgeMap).afterUpdate = func(any, any) {
+			clear(handler.cookieConnections.(*fakeBridgeMap).values)
+		}
+
+		assert.Equal(t, StatusAmbiguous, handler.Handle(identity, OperationTake).Status)
+		assert.NotEmpty(t, handler.remoteParents.(*fakeBridgeMap).values)
+		assert.NotEmpty(t, handler.claims.(*fakeBridgeMap).values)
 	})
 
 	t.Run("fallback changes generation", func(t *testing.T) {
@@ -1577,6 +2789,73 @@ func TestMapHandlerRevalidatesPublicationAfterClaim(t *testing.T) {
 		assert.Equal(t, uint64(11), record.Generation)
 		assert.Empty(t, handler.claims.(*fakeBridgeMap).values)
 	})
+}
+
+func TestMapHandlerCompareReleasesOnlyItsOwnClaim(t *testing.T) {
+	identity := Identity{TID: 3, PID: 2, Namespace: 1}
+	handler := testMapHandler(
+		map[Identity]any{identity: validEncodedRecord(t, 10)},
+		nil,
+		nil,
+	)
+	key := stateKey{Owner: identity, Generation: 10}
+	replacement := generationClaim{
+		ObservedMonotonicNS: uint64(12 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecyclePublishing,
+	}
+	handler.claims.(*fakeBridgeMap).afterUpdate = func(any, any) {
+		handler.claims.(*fakeBridgeMap).values[key] = replacement
+		handler.owners.(*fakeBridgeMap).lookupErr = errors.New("injected owner lookup failure")
+	}
+
+	assert.Equal(t, StatusTransportError, handler.Handle(identity, OperationTake).Status)
+	assert.Equal(t, replacement, handler.claims.(*fakeBridgeMap).values[key])
+}
+
+func TestMapHandlerRetainsClaimWhenOwnershipIsUncertain(t *testing.T) {
+	identity := Identity{TID: 3, PID: 2, Namespace: 1}
+
+	tests := []struct {
+		name      string
+		configure func(*MapHandler)
+	}{
+		{
+			name: "owner has same generation from another incarnation",
+			configure: func(handler *MapHandler) {
+				handler.owners.(*fakeBridgeMap).values[identity] = ownerValue{
+					Generation:         10,
+					ProcessIncarnation: testProcessIncarnation + 1,
+					Lifecycle:          lifecycleActive,
+				}
+			},
+		},
+		{
+			name: "state key belongs to another incarnation",
+			configure: func(handler *MapHandler) {
+				key := stateKey{Owner: identity, Generation: 10}
+				state := handler.states.(*fakeBridgeMap).values[key].(stateValue)
+				state.ProcessIncarnation++
+				handler.states.(*fakeBridgeMap).values[key] = state
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler := testMapHandler(
+				map[Identity]any{identity: validEncodedRecord(t, 10)},
+				nil,
+				nil,
+			)
+			handler.claims.(*fakeBridgeMap).afterUpdate = func(any, any) {
+				test.configure(handler)
+			}
+
+			assert.Equal(t, StatusAmbiguous, handler.Handle(identity, OperationTake).Status)
+			assert.NotEmpty(t, handler.claims.(*fakeBridgeMap).values)
+		})
+	}
 }
 
 func TestMapHandlerLateConsumerPreservesNextGeneration(t *testing.T) {
@@ -1667,6 +2946,49 @@ func TestMapHandlerRevalidatesBeforeDeletingReusableKeys(t *testing.T) {
 		assert.Contains(t, remoteParents.values, identity)
 	})
 
+	t.Run("fallback same generation replacement", func(t *testing.T) {
+		handler := testMapHandler(
+			map[Identity]any{identity: validEncodedRecord(t, 10)}, nil, nil,
+		)
+		remoteParents := handler.remoteParents.(*fakeBridgeMap)
+		replacement := validEncodedRecord(t, 10)
+		replacement[16] = 2
+		remoteParents.afterLookup = func(count int) {
+			if count != 1 {
+				return
+			}
+			remoteParents.mu.Lock()
+			remoteParents.values[identity] = replacement
+			remoteParents.mu.Unlock()
+		}
+
+		assert.False(t, handler.deleteRemoteParentGeneration(
+			identity, 10, testProcessIncarnation,
+		))
+		assert.Equal(t, replacement, remoteParents.values[identity])
+	})
+
+	t.Run("fallback non-valid same generation", func(t *testing.T) {
+		handler := testMapHandler(
+			map[Identity]any{identity: validEncodedRecord(t, 10)}, nil, nil,
+		)
+		record := Record{
+			Status:              StatusMissing,
+			Generation:          10,
+			ObservedMonotonicNS: uint64(10 * time.Second),
+		}
+		encoded, err := record.MarshalBinary()
+		require.NoError(t, err)
+		replacement := [RecordSize]byte(encoded)
+		handler.remoteParents.(*fakeBridgeMap).values[identity] = replacement
+
+		assert.False(t, handler.deleteRemoteParentGeneration(
+			identity, 10, testProcessIncarnation,
+		))
+		assert.Equal(t, replacement,
+			handler.remoteParents.(*fakeBridgeMap).values[identity])
+	})
+
 	t.Run("owner", func(t *testing.T) {
 		handler := testMapHandler(
 			map[Identity]any{identity: validEncodedRecord(t, 10)},
@@ -1674,6 +2996,7 @@ func TestMapHandlerRevalidatesBeforeDeletingReusableKeys(t *testing.T) {
 			nil,
 		)
 		owners := handler.owners.(*fakeBridgeMap)
+		expected := owners.values[identity].(ownerValue)
 		owners.afterLookup = func(count int) {
 			if count == 1 {
 				owners.mu.Lock()
@@ -1686,64 +3009,53 @@ func TestMapHandlerRevalidatesBeforeDeletingReusableKeys(t *testing.T) {
 			}
 		}
 
-		assert.False(t, handler.deleteOwnerGeneration(
-			identity, 10, testProcessIncarnation,
-		))
+		assert.True(t, handler.deleteOwnerGeneration(identity, expected))
 		assert.Equal(t, uint64(11), owners.values[identity].(ownerValue).Generation)
 	})
 
-	t.Run("connection", func(t *testing.T) {
-		handler := testMapHandler(nil, nil, nil)
-		key := connectionInfoNS{
-			Connection: connectionInfo{SourcePort: 12345, DestinationPort: 443},
-			NetNS:      17,
-		}
-		connections := handler.connections.(*fakeBridgeMap)
-		cookieConnections := handler.cookieConnections.(*fakeBridgeMap)
-		seedConnectionClaim(handler, key, identity, 10)
-		oldClaim := connections.values[key].(connectionClaim)
-		oldCookieKey := connectionCookieKey(key, oldClaim)
-		newClaim := oldClaim
-		newClaim.Generation = 11
-		newClaim.NetNSCookie++
-		newClaim.IncomingGeneration++
-		newCookieKey := connectionCookieKey(key, newClaim)
-		connections.afterLookup = func(count int) {
-			if count == 1 {
-				connections.mu.Lock()
-				connections.values[key] = newClaim
-				connections.mu.Unlock()
-				cookieConnections.mu.Lock()
-				delete(cookieConnections.values, oldCookieKey)
-				cookieConnections.values[newCookieKey] = newClaim
-				cookieConnections.mu.Unlock()
-			}
+	t.Run("owner same generation different incarnation", func(t *testing.T) {
+		handler := testMapHandler(
+			map[Identity]any{identity: validEncodedRecord(t, 10)},
+			nil,
+			nil,
+		)
+		owners := handler.owners.(*fakeBridgeMap)
+		owners.values[identity] = ownerValue{
+			Generation:         10,
+			ProcessIncarnation: testProcessIncarnation + 1,
+			Lifecycle:          lifecycleActive,
 		}
 
-		assert.True(t, handler.releaseConnection(identity, 10, key.Connection, key.NetNS))
-		assert.Equal(t, newClaim, connections.values[key])
-		assert.Equal(t, newClaim, cookieConnections.values[newCookieKey])
+		assert.False(t, handler.deleteOwnerGeneration(identity, ownerValue{
+			Generation:         10,
+			ProcessIncarnation: testProcessIncarnation,
+			Lifecycle:          lifecycleActive,
+		}))
+		assert.Equal(
+			t, testProcessIncarnation+1,
+			owners.values[identity].(ownerValue).ProcessIncarnation,
+		)
 	})
 
-	t.Run("connection cookie deletion error", func(t *testing.T) {
-		handler := testMapHandler(nil, nil, nil)
-		key := connectionInfoNS{
-			Connection: connectionInfo{SourcePort: 12345, DestinationPort: 443},
-			NetNS:      17,
+	t.Run("owner same generation lifecycle replacement", func(t *testing.T) {
+		handler := testMapHandler(
+			map[Identity]any{identity: validEncodedRecord(t, 10)}, nil, nil,
+		)
+		owners := handler.owners.(*fakeBridgeMap)
+		expected := owners.values[identity].(ownerValue)
+		replacement := expected
+		replacement.Lifecycle = lifecyclePublishing
+		owners.afterLookup = func(count int) {
+			if count != 1 {
+				return
+			}
+			owners.mu.Lock()
+			owners.values[identity] = replacement
+			owners.mu.Unlock()
 		}
-		seedConnectionClaim(handler, key, identity, 10)
-		connections := handler.connections.(*fakeBridgeMap)
-		cookieConnections := handler.cookieConnections.(*fakeBridgeMap)
-		cookieConnections.deleteErr = errors.New("unexpected cookie connection deletion")
 
-		assert.False(t, handler.releaseConnection(identity, 10, key.Connection, key.NetNS))
-		assert.Contains(t, connections.values, key)
-		assert.NotEmpty(t, cookieConnections.values)
-
-		cookieConnections.deleteErr = nil
-		assert.True(t, handler.releaseConnection(identity, 10, key.Connection, key.NetNS))
-		assert.Empty(t, connections.values)
-		assert.Empty(t, cookieConnections.values)
+		assert.False(t, handler.deleteOwnerGeneration(identity, expected))
+		assert.Equal(t, replacement, owners.values[identity])
 	})
 
 	t.Run("generation index", func(t *testing.T) {
@@ -1754,6 +3066,7 @@ func TestMapHandlerRevalidatesBeforeDeletingReusableKeys(t *testing.T) {
 		)
 		key := stateKey{Owner: identity, Generation: 10}
 		generations := handler.generations.(*fakeBridgeMap)
+		expected := generations.values[key].(generationIndexValue)
 		generations.afterLookup = func(count int) {
 			if count == 1 {
 				generations.mu.Lock()
@@ -1766,18 +3079,40 @@ func TestMapHandlerRevalidatesBeforeDeletingReusableKeys(t *testing.T) {
 			}
 		}
 
-		assert.False(t, handler.deleteGenerationIndex(key, testProcessIncarnation))
+		assert.False(t, handler.deleteGenerationIndex(key, expected))
 		assert.Equal(
 			t,
 			testProcessIncarnation+1,
 			generations.values[key].(generationIndexValue).ProcessIncarnation,
 		)
 	})
+
+	t.Run("generation index observation replacement", func(t *testing.T) {
+		handler := testMapHandler(
+			map[Identity]any{identity: validEncodedRecord(t, 10)}, nil, nil,
+		)
+		key := stateKey{Owner: identity, Generation: 10}
+		generations := handler.generations.(*fakeBridgeMap)
+		expected := generations.values[key].(generationIndexValue)
+		replacement := expected
+		replacement.ObservedMonotonicNS++
+		generations.afterLookup = func(count int) {
+			if count != 1 {
+				return
+			}
+			generations.mu.Lock()
+			generations.values[key] = replacement
+			generations.mu.Unlock()
+		}
+
+		assert.False(t, handler.deleteGenerationIndex(key, expected))
+		assert.Equal(t, replacement, generations.values[key])
+	})
 }
 
-func TestMapHandlerReleasesClaimWhenGenerationCleanupFails(t *testing.T) {
+func TestMapHandlerRetainsClaimWhenTargetReappearsDuringFinish(t *testing.T) {
 	identity := Identity{TID: 3, PID: 2, Namespace: 1}
-	testError := errors.New("injected map failure")
+	key := stateKey{Owner: identity, Generation: 10}
 
 	tests := []struct {
 		name      string
@@ -1785,8 +3120,223 @@ func TestMapHandlerReleasesClaimWhenGenerationCleanupFails(t *testing.T) {
 		configure func(*MapHandler)
 	}{
 		{
-			name:   "owner revalidation lookup",
-			status: StatusTransportError,
+			name:   "connection cursor",
+			status: StatusValid,
+			configure: func(handler *MapHandler) {
+				connections := handler.connections.(*fakeBridgeMap)
+				connections.afterDelete = func(deletedKey any) {
+					connections.values[deletedKey] = connectionClaim{
+						Owner: identity, Generation: 10,
+					}
+				}
+			},
+		},
+		{
+			name:   "cookie cursor",
+			status: StatusValid,
+			configure: func(handler *MapHandler) {
+				cookies := handler.cookieConnections.(*fakeBridgeMap)
+				cookies.afterDelete = func(deletedKey any) {
+					cookies.values[deletedKey] = connectionClaim{
+						Owner: identity, Generation: 10,
+					}
+				}
+			},
+		},
+		{
+			name:   "state key",
+			status: StatusValid,
+			configure: func(handler *MapHandler) {
+				states := handler.states.(*fakeBridgeMap)
+				states.afterDelete = func(any) {
+					states.values[key] = stateValue{
+						ProcessIncarnation: testProcessIncarnation + 1,
+					}
+				}
+			},
+		},
+		{
+			name:   "generation key",
+			status: StatusValid,
+			configure: func(handler *MapHandler) {
+				generations := handler.generations.(*fakeBridgeMap)
+				generations.afterDelete = func(any) {
+					generations.values[key] = generationIndexValue{
+						ProcessIncarnation: testProcessIncarnation + 1,
+					}
+				}
+			},
+		},
+		{
+			name:   "owner generation",
+			status: StatusValid,
+			configure: func(handler *MapHandler) {
+				owners := handler.owners.(*fakeBridgeMap)
+				owners.afterDelete = func(any) {
+					owners.values[identity] = ownerValue{
+						Generation:         10,
+						ProcessIncarnation: testProcessIncarnation + 1,
+					}
+				}
+			},
+		},
+		{
+			name:   "fallback generation",
+			status: StatusValid,
+			configure: func(handler *MapHandler) {
+				fallbacks := handler.remoteParents.(*fakeBridgeMap)
+				fallbacks.afterDelete = func(any) {
+					fallbacks.values[identity] = validEncodedRecord(t, 10)
+				}
+			},
+		},
+		{
+			name:   "terminal generation",
+			status: StatusValid,
+			configure: func(handler *MapHandler) {
+				terminals := handler.terminals.(*fakeBridgeMap)
+				terminals.afterUpdate = func(any, any) {
+					terminals.values[identity] = terminalValue{
+						Generation:          10,
+						ObservedMonotonicNS: uint64(12 * time.Second),
+						ProcessIncarnation:  testProcessIncarnation + 1,
+						Lifecycle:           lifecycleConsumed,
+					}
+				}
+			},
+		},
+		{
+			name:   "ambiguity marker",
+			status: StatusAmbiguous,
+			configure: func(handler *MapHandler) {
+				ambiguity := handler.ambiguity.(*fakeBridgeMap)
+				handler.claims.(*fakeBridgeMap).afterUpdate = func(any, any) {
+					ambiguity.values[key] = uint64(11 * time.Second)
+				}
+				ambiguity.afterDelete = func(any) {
+					ambiguity.values[key] = uint64(12 * time.Second)
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler := testMapHandler(
+				map[Identity]any{identity: validEncodedRecord(t, 10)},
+				nil,
+				nil,
+			)
+			test.configure(handler)
+
+			assert.Equal(t, test.status, handler.Handle(identity, OperationTake).Status)
+			assert.NotEmpty(t, handler.claims.(*fakeBridgeMap).values)
+		})
+	}
+}
+
+func TestMapHandlerRestoresMarkerAfterFinishBarrierLoss(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)}, nil, nil,
+	)
+	handler.terminals.(*fakeBridgeMap).afterUpdate = func(any, any) {
+		delete(handler.ambiguity.(*fakeBridgeMap).values, key)
+	}
+
+	assert.Equal(t, StatusValid, handler.Handle(owner, OperationTake).Status)
+	assert.Contains(t, handler.claims.(*fakeBridgeMap).values, key)
+	assert.Contains(t, handler.ownerGuards.(*fakeBridgeMap).values, owner)
+	assert.NotZero(t, handler.ambiguity.(*fakeBridgeMap).values[key])
+	assert.Contains(t, handler.states.(*fakeBridgeMap).values, key)
+}
+
+func TestMapHandlerAcceptsMarkerDisappearanceAtOrderedRelease(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)}, nil, nil,
+	)
+	ambiguity := handler.ambiguity.(*fakeBridgeMap)
+	eligibleLookups := 0
+	ambiguity.afterLookup = func(int) {
+		if _, statePresent := handler.states.(*fakeBridgeMap).values[key]; statePresent {
+			return
+		}
+		if _, indexPresent := handler.generations.(*fakeBridgeMap).values[key]; indexPresent {
+			return
+		}
+		if _, ownerPresent := handler.owners.(*fakeBridgeMap).values[owner]; ownerPresent {
+			return
+		}
+		if _, fallbackPresent := handler.remoteParents.(*fakeBridgeMap).values[owner]; fallbackPresent {
+			return
+		}
+		eligibleLookups++
+		if eligibleLookups == 3 {
+			ambiguity.mu.Lock()
+			delete(ambiguity.values, key)
+			ambiguity.mu.Unlock()
+		}
+	}
+
+	assert.Equal(t, StatusValid, handler.Handle(owner, OperationTake).Status)
+	assert.GreaterOrEqual(t, eligibleLookups, 3)
+	assert.Empty(t, handler.claims.(*fakeBridgeMap).values)
+	assert.NotContains(t, ambiguity.values, key)
+	assert.NotContains(t, handler.states.(*fakeBridgeMap).values, key)
+	assert.NotContains(t, handler.generations.(*fakeBridgeMap).values, key)
+}
+
+func TestMapHandlerConvergesWhenClaimDisappearsAfterMarkerRelease(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)}, nil, nil,
+	)
+	claims := handler.claims.(*fakeBridgeMap)
+	handler.ambiguity.(*fakeBridgeMap).afterDelete = func(deleted any) {
+		if deleted != key {
+			return
+		}
+		claims.mu.Lock()
+		delete(claims.values, key)
+		claims.mu.Unlock()
+	}
+
+	assert.Equal(t, StatusValid, handler.Handle(owner, OperationTake).Status)
+	assert.NotContains(t, claims.values, key)
+	assert.NotContains(t, handler.ownerGuards.(*fakeBridgeMap).values, owner)
+	assert.NotContains(t, handler.ambiguity.(*fakeBridgeMap).values, key)
+	assert.NotContains(t, handler.states.(*fakeBridgeMap).values, key)
+	assert.NotContains(t, handler.generations.(*fakeBridgeMap).values, key)
+}
+
+func TestMapHandlerRetainsClaimAfterGenerationCleanupStarts(t *testing.T) {
+	identity := Identity{TID: 3, PID: 2, Namespace: 1}
+	testError := errors.New("injected map failure")
+
+	tests := []struct {
+		name        string
+		status      Status
+		retainClaim bool
+		configure   func(*MapHandler)
+	}{
+		{
+			name:        "process incarnation revalidation lookup",
+			status:      StatusTransportError,
+			retainClaim: true,
+			configure: func(handler *MapHandler) {
+				handler.claims.(*fakeBridgeMap).afterUpdate = func(any, any) {
+					handler.incarnations.(*fakeBridgeMap).lookupErr = testError
+				}
+			},
+		},
+		{
+			name:        "owner revalidation lookup",
+			status:      StatusTransportError,
+			retainClaim: true,
 			configure: func(handler *MapHandler) {
 				handler.claims.(*fakeBridgeMap).afterUpdate = func(any, any) {
 					handler.owners.(*fakeBridgeMap).lookupErr = testError
@@ -1794,8 +3344,9 @@ func TestMapHandlerReleasesClaimWhenGenerationCleanupFails(t *testing.T) {
 			},
 		},
 		{
-			name:   "state revalidation lookup",
-			status: StatusTransportError,
+			name:        "state revalidation lookup",
+			status:      StatusTransportError,
+			retainClaim: true,
 			configure: func(handler *MapHandler) {
 				handler.claims.(*fakeBridgeMap).afterUpdate = func(any, any) {
 					handler.states.(*fakeBridgeMap).lookupErr = testError
@@ -1803,43 +3354,99 @@ func TestMapHandlerReleasesClaimWhenGenerationCleanupFails(t *testing.T) {
 			},
 		},
 		{
-			name:   "connection delete",
-			status: StatusTransportError,
+			name:        "generation revalidation lookup",
+			status:      StatusTransportError,
+			retainClaim: true,
+			configure: func(handler *MapHandler) {
+				handler.claims.(*fakeBridgeMap).afterUpdate = func(any, any) {
+					handler.generations.(*fakeBridgeMap).lookupErr = testError
+				}
+			},
+		},
+		{
+			name:        "ambiguity revalidation lookup",
+			status:      StatusTransportError,
+			retainClaim: true,
+			configure: func(handler *MapHandler) {
+				handler.claims.(*fakeBridgeMap).afterUpdate = func(any, any) {
+					handler.ambiguity.(*fakeBridgeMap).lookupErr = testError
+				}
+			},
+		},
+		{
+			name:        "connection revalidation lookup",
+			status:      StatusTransportError,
+			retainClaim: true,
+			configure: func(handler *MapHandler) {
+				handler.claims.(*fakeBridgeMap).afterUpdate = func(any, any) {
+					handler.connections.(*fakeBridgeMap).lookupErr = testError
+				}
+			},
+		},
+		{
+			name:        "cookie connection revalidation lookup",
+			status:      StatusTransportError,
+			retainClaim: true,
+			configure: func(handler *MapHandler) {
+				handler.claims.(*fakeBridgeMap).afterUpdate = func(any, any) {
+					handler.cookieConnections.(*fakeBridgeMap).lookupErr = testError
+				}
+			},
+		},
+		{
+			name:        "fallback revalidation lookup",
+			status:      StatusTransportError,
+			retainClaim: true,
+			configure: func(handler *MapHandler) {
+				handler.claims.(*fakeBridgeMap).afterUpdate = func(any, any) {
+					handler.remoteParents.(*fakeBridgeMap).lookupErr = testError
+				}
+			},
+		},
+		{
+			name:        "connection delete",
+			status:      StatusValid,
+			retainClaim: true,
 			configure: func(handler *MapHandler) {
 				handler.connections.(*fakeBridgeMap).deleteErr = testError
 			},
 		},
 		{
-			name:   "terminal update",
-			status: StatusTransportError,
+			name:        "terminal update",
+			status:      StatusValid,
+			retainClaim: true,
 			configure: func(handler *MapHandler) {
 				handler.terminals.(*fakeBridgeMap).updateErr = testError
 			},
 		},
 		{
-			name:   "state delete",
-			status: StatusTransportError,
+			name:        "state delete",
+			status:      StatusValid,
+			retainClaim: true,
 			configure: func(handler *MapHandler) {
 				handler.states.(*fakeBridgeMap).deleteErr = testError
 			},
 		},
 		{
-			name:   "fallback delete",
-			status: StatusTransportError,
+			name:        "fallback delete",
+			status:      StatusValid,
+			retainClaim: true,
 			configure: func(handler *MapHandler) {
 				handler.remoteParents.(*fakeBridgeMap).deleteErr = testError
 			},
 		},
 		{
-			name:   "owner delete",
-			status: StatusTransportError,
+			name:        "owner delete",
+			status:      StatusValid,
+			retainClaim: true,
 			configure: func(handler *MapHandler) {
 				handler.owners.(*fakeBridgeMap).deleteErr = testError
 			},
 		},
 		{
-			name:   "ambiguity delete",
-			status: StatusAmbiguous,
+			name:        "ambiguity delete",
+			status:      StatusAmbiguous,
+			retainClaim: true,
 			configure: func(handler *MapHandler) {
 				handler.claims.(*fakeBridgeMap).afterUpdate = func(any, any) {
 					handler.ambiguity.(*fakeBridgeMap).values[stateKey{
@@ -1861,9 +3468,709 @@ func TestMapHandlerReleasesClaimWhenGenerationCleanupFails(t *testing.T) {
 			test.configure(handler)
 
 			assert.Equal(t, test.status, handler.Handle(identity, OperationTake).Status)
+			if test.retainClaim {
+				assert.NotEmpty(t, handler.claims.(*fakeBridgeMap).values)
+			} else {
+				assert.Empty(t, handler.claims.(*fakeBridgeMap).values)
+			}
+		})
+	}
+}
+
+func TestMapHandlerAmbiguousConsumeMarksPostClaimValidationLoss(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)}, nil, nil,
+	)
+	key := stateKey{Owner: owner, Generation: 10}
+	encoded := handler.remoteParents.(*fakeBridgeMap).values[owner].([RecordSize]byte)
+	handler.claims.(*fakeBridgeMap).afterUpdate = func(updatedKey, _ any) {
+		if updatedKey != key {
+			return
+		}
+		index := handler.generations.(*fakeBridgeMap).values[key].(generationIndexValue)
+		index.ObservedMonotonicNS++
+		handler.generations.(*fakeBridgeMap).values[key] = index
+	}
+
+	committed, status, err := handler.consume(t.Context(), []resolvedCandidate{{
+		Owner:              owner,
+		Generation:         10,
+		ProcessIncarnation: testProcessIncarnation,
+		Encoded:            encoded,
+	}}, lifecycleAmbiguous)
+	require.NoError(t, err)
+	assert.True(t, committed)
+	assert.Equal(t, StatusUnknown, status)
+	assert.Contains(t, handler.claims.(*fakeBridgeMap).values, key)
+	assert.NotZero(t, handler.ambiguity.(*fakeBridgeMap).values[key])
+}
+
+func TestMapHandlerAmbiguousConsumeContinuesPastIndependentFences(t *testing.T) {
+	owners := []Identity{
+		{TID: 3, PID: 2, Namespace: 1},
+		{TID: 4, PID: 2, Namespace: 1},
+	}
+
+	tests := []struct {
+		name          string
+		order         []int
+		collided      map[int]bool
+		guarded       map[int]bool
+		wantCommitted bool
+	}{
+		{
+			name:          "collision then free",
+			order:         []int{0, 1},
+			collided:      map[int]bool{0: true},
+			wantCommitted: true,
+		},
+		{
+			name:          "free then collision",
+			order:         []int{0, 1},
+			collided:      map[int]bool{1: true},
+			wantCommitted: true,
+		},
+		{
+			name:          "all collide",
+			order:         []int{0, 1},
+			collided:      map[int]bool{0: true, 1: true},
+			wantCommitted: false,
+		},
+		{
+			name:          "foreign guard then free",
+			order:         []int{0, 1},
+			guarded:       map[int]bool{0: true},
+			wantCommitted: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			remoteParents := map[Identity]any{
+				owners[0]: validEncodedRecord(t, 10),
+				owners[1]: validEncodedRecord(t, 10),
+			}
+			handler := testMapHandler(remoteParents, nil, nil)
+			// Stop each newly claimed candidate after durable E/G acquisition so
+			// the deferred producer handoff remains directly observable.
+			handler.terminals.(*fakeBridgeMap).updateErr = errors.New(
+				"injected terminal publication failure",
+			)
+
+			candidates := make([]resolvedCandidate, 0, len(test.order))
+			collidedClaims := make(map[int]generationClaim)
+			guardClaims := make(map[int]generationClaim)
+			for _, index := range test.order {
+				key := stateKey{Owner: owners[index], Generation: 10}
+				if test.collided[index] {
+					claim := *cleanupGenerationClaim(
+						lifecycleConsumed,
+						uint64(10*time.Second),
+					)
+					handler.claims.(*fakeBridgeMap).values[key] = claim
+					collidedClaims[index] = claim
+				}
+				if test.guarded[index] {
+					guard := testGenerationClaim(lifecyclePublishing)
+					handler.ownerGuards.(*fakeBridgeMap).values[owners[index]] = guard
+					guardClaims[index] = guard
+				}
+				candidates = append(candidates, resolvedCandidate{
+					Owner:              owners[index],
+					Generation:         10,
+					ProcessIncarnation: testProcessIncarnation,
+					Encoded:            remoteParents[owners[index]].([RecordSize]byte),
+				})
+			}
+
+			committed, status, err := handler.consume(
+				t.Context(), candidates, lifecycleAmbiguous,
+			)
+			require.NoError(t, err)
+			assert.Equal(t, test.wantCommitted, committed)
+			assert.Equal(t, StatusUnknown, status)
+
+			for index := range owners {
+				key := stateKey{Owner: owners[index], Generation: 10}
+				switch {
+				case test.collided[index]:
+					assert.Equal(t, collidedClaims[index],
+						handler.claims.(*fakeBridgeMap).values[key])
+				case test.guarded[index]:
+					assert.NotContains(t, handler.claims.(*fakeBridgeMap).values, key)
+					assert.Equal(t, guardClaims[index],
+						handler.ownerGuards.(*fakeBridgeMap).values[owners[index]])
+				default:
+					claim, ok := handler.claims.(*fakeBridgeMap).values[key].(generationClaim)
+					require.True(t, ok)
+					assert.Equal(t, lifecycleCleanup, claim.Lifecycle)
+					assert.Equal(t, lifecycleDiscarded, claim.Reserved[0])
+					guard, ok := handler.ownerGuards.(*fakeBridgeMap).values[owners[index]].(generationClaim)
+					require.True(t, ok)
+					assert.Equal(t, lifecycleCleanup, guard.Lifecycle)
+					assert.Equal(t, lifecyclePublishing, guard.Reserved[0])
+				}
+			}
+		})
+	}
+}
+
+func TestMapHandlerAmbiguousConsumeRetainsClaimOnTransportUncertainty(t *testing.T) {
+	identity := Identity{TID: 3, PID: 2, Namespace: 1}
+	handler := testMapHandler(
+		map[Identity]any{identity: validEncodedRecord(t, 10)}, nil,
+		map[Identity]any{identity: uint64(10 * time.Second)},
+	)
+	transportErr := errors.New("injected ambiguous-consume transport failure")
+	handler.claims.(*fakeBridgeMap).afterUpdate = func(any, any) {
+		handler.generations.(*fakeBridgeMap).lookupErr = transportErr
+	}
+
+	assert.Equal(t, StatusTransportError, handler.Handle(identity, OperationTake).Status)
+	key := stateKey{Owner: identity, Generation: 10}
+	claim := handler.claims.(*fakeBridgeMap).values[key].(generationClaim)
+	assert.Equal(t, lifecycleCleanup, claim.Lifecycle)
+	assert.Equal(t, lifecycleDiscarded, claim.Reserved[0])
+	assert.Greater(t, claim.ObservedMonotonicNS, uint64(10*time.Second))
+	handler.generations.(*fakeBridgeMap).lookupErr = nil
+	assert.Equal(t, StatusAlreadyConsumed, handler.Handle(identity, OperationTake).Status)
+}
+
+func TestMapHandlerAmbiguousConsumeRetainsFinalClaimAfterValidationLoss(t *testing.T) {
+	identity := Identity{TID: 3, PID: 2, Namespace: 1}
+	handler := testMapHandler(
+		map[Identity]any{identity: validEncodedRecord(t, 10)}, nil,
+		map[Identity]any{identity: uint64(10 * time.Second)},
+	)
+	handler.claims.(*fakeBridgeMap).afterUpdate = func(any, any) {
+		delete(handler.states.(*fakeBridgeMap).values,
+			stateKey{Owner: identity, Generation: 10})
+	}
+
+	assert.Equal(t, StatusAmbiguous, handler.Handle(identity, OperationTake).Status)
+	key := stateKey{Owner: identity, Generation: 10}
+	claim := handler.claims.(*fakeBridgeMap).values[key].(generationClaim)
+	assert.Equal(t, lifecycleCleanup, claim.Lifecycle)
+	assert.Equal(t, lifecycleDiscarded, claim.Reserved[0])
+	assert.Greater(t, claim.ObservedMonotonicNS, uint64(10*time.Second))
+	assert.NotZero(t, handler.ambiguity.(*fakeBridgeMap).values[key])
+}
+
+func TestMapHandlerMalformedFallbackNeverAcquiresClaim(t *testing.T) {
+	identity := Identity{TID: 3, PID: 2, Namespace: 1}
+	for _, test := range []struct {
+		name      string
+		configure func(*MapHandler)
+	}{
+		{
+			name: "process lookup error",
+			configure: func(handler *MapHandler) {
+				handler.incarnations.(*fakeBridgeMap).lookupErr = errors.New("injected incarnation revalidation failure")
+			},
+		},
+		{
+			name: "owner lookup error",
+			configure: func(handler *MapHandler) {
+				handler.owners.(*fakeBridgeMap).lookupErr = errors.New("injected owner revalidation failure")
+			},
+		},
+		{
+			name: "incarnation replacement",
+			configure: func(handler *MapHandler) {
+				handler.incarnations.(*fakeBridgeMap).values[javaProcessIdentity(identity)] =
+					testProcessIncarnation + 1
+			},
+		},
+		{
+			name: "owner replacement",
+			configure: func(handler *MapHandler) {
+				handler.owners.(*fakeBridgeMap).values[identity] = ownerValue{
+					Generation:         11,
+					ProcessIncarnation: testProcessIncarnation,
+					Lifecycle:          lifecycleActive,
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler := testMapHandler(
+				map[Identity]any{identity: validEncodedRecord(t, 10)}, nil, nil,
+			)
+			handler.remoteParents.(*fakeBridgeMap).values[identity] = [RecordSize]byte{}
+			triggered := false
+			handler.claims.(*fakeBridgeMap).afterUpdate = func(any, any) {
+				triggered = true
+				test.configure(handler)
+			}
+
+			assert.Equal(t, StatusMalformed, handler.Handle(identity, OperationTake).Status)
+			assert.False(t, triggered)
 			assert.Empty(t, handler.claims.(*fakeBridgeMap).values)
 		})
 	}
+}
+
+func TestMapHandlerRetainsOneShotClaimWhenForeignGuardWinsFinishRace(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)}, nil, nil,
+	)
+	foreignGuard := generationClaim{
+		ObservedMonotonicNS: uint64(9 * time.Second),
+		ProcessIncarnation:  10,
+		Lifecycle:           lifecyclePublishing,
+	}
+	claims := handler.claims.(*fakeBridgeMap)
+	claims.afterLookup = func(count int) {
+		if count == 1 {
+			guards := handler.ownerGuards.(*fakeBridgeMap)
+			guards.mu.Lock()
+			guards.values[owner] = foreignGuard
+			guards.mu.Unlock()
+		}
+	}
+
+	assert.Equal(t, StatusValid, handler.Handle(owner, OperationTake).Status)
+	assert.Contains(t, claims.values, key)
+	assert.Equal(t, foreignGuard, handler.ownerGuards.(*fakeBridgeMap).values[owner])
+	assert.NotZero(t, handler.ambiguity.(*fakeBridgeMap).values[key])
+	assert.Empty(t, handler.terminals.(*fakeBridgeMap).values)
+}
+
+func TestMapHandlerDoesNotRemarkOldGenerationAfterFinalGuardRelease(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	oldKey := stateKey{Owner: owner, Generation: 10}
+	successorKey := stateKey{Owner: owner, Generation: 11}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)}, nil, nil,
+	)
+	claims := handler.claims.(*fakeBridgeMap)
+	guards := handler.ownerGuards.(*fakeBridgeMap)
+	guards.afterDelete = func(deleted any) {
+		deletedOwner, ok := deleted.(Identity)
+		if !ok || deletedOwner != owner {
+			return
+		}
+		handler.remoteParents.(*fakeBridgeMap).values[owner] = validEncodedRecord(t, 11)
+		seedOwnerState(handler, owner, 11)
+	}
+
+	assert.Equal(t, StatusValid, handler.Handle(owner, OperationTake).Status)
+	assert.Empty(t, claims.values)
+	assert.Empty(t, guards.values)
+	assert.NotContains(t, handler.ambiguity.(*fakeBridgeMap).values, oldKey)
+	assert.Contains(t, handler.ambiguity.(*fakeBridgeMap).values, successorKey)
+	assert.NotContains(t, handler.states.(*fakeBridgeMap).values, oldKey)
+	assert.Contains(t, handler.states.(*fakeBridgeMap).values, successorKey)
+	assert.Contains(t, handler.generations.(*fakeBridgeMap).values, successorKey)
+	assert.Equal(t, uint64(11),
+		handler.owners.(*fakeBridgeMap).values[owner].(ownerValue).Generation)
+	assert.Equal(t, validEncodedRecord(t, 11),
+		handler.remoteParents.(*fakeBridgeMap).values[owner])
+}
+
+func TestMapHandlerActiveFinishRejectsTerminalReplacement(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)}, nil, nil,
+	)
+	key := stateKey{Owner: owner, Generation: 10}
+	state := handler.states.(*fakeBridgeMap).values[key].(stateValue)
+	record, err := UnmarshalRecord(state.Response[:])
+	require.NoError(t, err)
+	claim := testGoGenerationClaim(lifecycleConsumed)
+	handler.claims.(*fakeBridgeMap).values[key] = claim
+	replacement := terminalValue{
+		Generation:          11,
+		ObservedMonotonicNS: uint64(11 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleConsumed,
+	}
+	replaced := false
+	handler.terminals.(*fakeBridgeMap).afterUpdate = func(updatedKey, _ any) {
+		if updatedKey != owner || replaced {
+			return
+		}
+		replaced = true
+		handler.terminals.(*fakeBridgeMap).values[owner] = replacement
+	}
+
+	result := handler.finish(
+		owner, record, testProcessIncarnation, lifecycleConsumed, &claim,
+	)
+	assert.False(t, result.complete)
+	assert.True(t, result.mutationStarted)
+	assert.True(t, replaced)
+	assert.Equal(t, replacement, handler.terminals.(*fakeBridgeMap).values[owner])
+	assert.Contains(t, handler.states.(*fakeBridgeMap).values, key)
+	assert.Contains(t, handler.generations.(*fakeBridgeMap).values, key)
+	assert.NotZero(t, handler.ambiguity.(*fakeBridgeMap).values[key])
+	assert.Zero(t, claim)
+	retainedClaim := handler.claims.(*fakeBridgeMap).values[key].(generationClaim)
+	assert.True(t, validGenerationCleanupClaim(retainedClaim))
+	assert.Equal(t, lifecycleConsumed, retainedClaim.Reserved[0])
+	retainedGuard := handler.ownerGuards.(*fakeBridgeMap).values[owner].(generationClaim)
+	assert.True(t, validGenerationCleanupGuard(owner, retainedGuard))
+	assert.Equal(t, key.Generation, retainedGuard.ProcessIncarnation)
+}
+
+func TestMapHandlerDetachedFinishRejectsPublishedTerminalReplacement(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)},
+		map[Identity]any{child: activeTaskLink(owner, 10)},
+		nil,
+	)
+	oldKey := stateKey{Owner: owner, Generation: 10}
+	oldState := handler.states.(*fakeBridgeMap).values[oldKey].(stateValue)
+	require.Equal(t, uint32(1), oldState.Aliases)
+	oldRecord, err := UnmarshalRecord(oldState.Response[:])
+	require.NoError(t, err)
+	handler.remoteParents.(*fakeBridgeMap).values[owner] = validEncodedRecord(t, 11)
+	seedOwnerState(handler, owner, 11)
+	successorKey := stateKey{Owner: owner, Generation: 11}
+	replacement := terminalValue{
+		Generation:          11,
+		ObservedMonotonicNS: uint64(11 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleConsumed,
+	}
+	replaced := false
+	handler.terminals.(*fakeBridgeMap).afterUpdate = func(updatedKey, _ any) {
+		if updatedKey != owner || replaced {
+			return
+		}
+		replaced = true
+		handler.terminals.(*fakeBridgeMap).values[owner] = replacement
+	}
+	claim := testGoGenerationClaim(lifecycleConsumed)
+	handler.claims.(*fakeBridgeMap).values[oldKey] = claim
+
+	result := handler.finish(
+		owner, oldRecord, testProcessIncarnation, lifecycleConsumed, &claim,
+	)
+	assert.False(t, result.complete)
+	assert.True(t, result.mutationStarted)
+	assert.True(t, replaced)
+	assert.Equal(t, replacement, handler.terminals.(*fakeBridgeMap).values[owner])
+	assert.Contains(t, handler.states.(*fakeBridgeMap).values, oldKey)
+	assert.Contains(t, handler.generations.(*fakeBridgeMap).values, oldKey)
+	assert.Contains(t, handler.states.(*fakeBridgeMap).values, successorKey)
+	assert.Contains(t, handler.generations.(*fakeBridgeMap).values, successorKey)
+	assert.NotZero(t, handler.ambiguity.(*fakeBridgeMap).values[oldKey])
+	assert.Zero(t, claim)
+	retainedClaim := handler.claims.(*fakeBridgeMap).values[oldKey].(generationClaim)
+	assert.True(t, validGenerationCleanupClaim(retainedClaim))
+	assert.Equal(t, lifecycleConsumed, retainedClaim.Reserved[0])
+	retainedGuard := handler.ownerGuards.(*fakeBridgeMap).values[owner].(generationClaim)
+	assert.True(t, validGenerationCleanupGuard(owner, retainedGuard))
+	assert.Equal(t, oldKey.Generation, retainedGuard.ProcessIncarnation)
+}
+
+func TestMapHandlerAliasedFinishPreservesSuccessorTerminalAndCleansOldGeneration(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)},
+		map[Identity]any{child: activeTaskLink(owner, 10)},
+		nil,
+	)
+	oldKey := stateKey{Owner: owner, Generation: 10}
+	oldState := handler.states.(*fakeBridgeMap).values[oldKey].(stateValue)
+	require.Equal(t, uint32(1), oldState.Aliases)
+	oldRecord, err := UnmarshalRecord(oldState.Response[:])
+	require.NoError(t, err)
+	handler.remoteParents.(*fakeBridgeMap).values[owner] = validEncodedRecord(t, 11)
+	seedOwnerState(handler, owner, 11)
+	successorKey := stateKey{Owner: owner, Generation: 11}
+	successorTerminal := terminalValue{
+		Generation:          11,
+		ObservedMonotonicNS: uint64(11 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleConsumed,
+	}
+	handler.terminals.(*fakeBridgeMap).values[owner] = successorTerminal
+	claim := testGoGenerationClaim(lifecycleConsumed)
+	handler.claims.(*fakeBridgeMap).values[oldKey] = claim
+
+	result := handler.finish(
+		owner, oldRecord, testProcessIncarnation, lifecycleConsumed, &claim,
+	)
+	assert.True(t, result.complete)
+	assert.True(t, result.mutationStarted)
+	assert.Equal(t, successorTerminal, handler.terminals.(*fakeBridgeMap).values[owner])
+	assert.NotContains(t, handler.states.(*fakeBridgeMap).values, oldKey)
+	assert.NotContains(t, handler.generations.(*fakeBridgeMap).values, oldKey)
+	assert.Contains(t, handler.states.(*fakeBridgeMap).values, successorKey)
+	assert.Contains(t, handler.generations.(*fakeBridgeMap).values, successorKey)
+	assert.Equal(t, uint64(11),
+		handler.owners.(*fakeBridgeMap).values[owner].(ownerValue).Generation)
+	assert.Zero(t, claim)
+	assert.NotContains(t, handler.claims.(*fakeBridgeMap).values, oldKey)
+	assert.NotContains(t, handler.ownerGuards.(*fakeBridgeMap).values, owner)
+	assert.NotContains(t, handler.ambiguity.(*fakeBridgeMap).values, oldKey)
+	for _, value := range handler.connections.(*fakeBridgeMap).values {
+		assert.NotEqual(t, uint64(10), value.(connectionClaim).Generation)
+	}
+	for _, value := range handler.cookieConnections.(*fakeBridgeMap).values {
+		assert.NotEqual(t, uint64(10), value.(connectionClaim).Generation)
+	}
+}
+
+func TestMapHandlerRetainsUnaliasedGenerationWhenOwnerChangesDuringRevalidation(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)}, nil, nil,
+	)
+	oldKey := stateKey{Owner: owner, Generation: 10}
+	oldState := handler.states.(*fakeBridgeMap).values[oldKey].(stateValue)
+	oldRecord, err := UnmarshalRecord(oldState.Response[:])
+	require.NoError(t, err)
+	successorTerminal := terminalValue{
+		Generation:          11,
+		ObservedMonotonicNS: uint64(11 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleConsumed,
+	}
+	owners := handler.owners.(*fakeBridgeMap)
+	claim := testGoGenerationClaim(lifecycleConsumed)
+	handler.claims.(*fakeBridgeMap).values[oldKey] = claim
+	owners.afterLookup = func(count int) {
+		if count != 1 {
+			return
+		}
+		handler.remoteParents.(*fakeBridgeMap).values[owner] = validEncodedRecord(t, 11)
+		seedOwnerState(handler, owner, 11)
+		handler.terminals.(*fakeBridgeMap).values[owner] = successorTerminal
+	}
+
+	result := handler.finish(
+		owner, oldRecord, testProcessIncarnation, lifecycleConsumed, &claim,
+	)
+	assert.False(t, result.complete)
+	assert.True(t, result.mutationStarted)
+	assert.Equal(t, successorTerminal, handler.terminals.(*fakeBridgeMap).values[owner])
+	assert.Contains(t, handler.states.(*fakeBridgeMap).values, oldKey)
+	assert.Contains(t, handler.generations.(*fakeBridgeMap).values, oldKey)
+	assert.Equal(t, uint64(11), owners.values[owner].(ownerValue).Generation)
+	assert.Zero(t, claim)
+	retainedClaim := handler.claims.(*fakeBridgeMap).values[oldKey].(generationClaim)
+	assert.Equal(t, lifecycleCleanup, retainedClaim.Lifecycle)
+	assert.Equal(t, lifecycleConsumed, retainedClaim.Reserved[0])
+	retainedGuard := handler.ownerGuards.(*fakeBridgeMap).values[owner].(generationClaim)
+	assert.Equal(t, lifecycleCleanup, retainedGuard.Lifecycle)
+	assert.Equal(t, lifecyclePublishing, retainedGuard.Reserved[0])
+	assert.NotZero(t, handler.ambiguity.(*fakeBridgeMap).values[oldKey])
+}
+
+func TestMapHandlerFinishRetiresGenerationFencesInOrder(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)}, nil, nil,
+	)
+	key := stateKey{Owner: owner, Generation: 10}
+	state := handler.states.(*fakeBridgeMap).values[key].(stateValue)
+	record, err := UnmarshalRecord(state.Response[:])
+	require.NoError(t, err)
+	claim := testGoGenerationClaim(lifecycleConsumed)
+	claims := handler.claims.(*fakeBridgeMap)
+	guards := handler.ownerGuards.(*fakeBridgeMap)
+	ambiguity := handler.ambiguity.(*fakeBridgeMap)
+	claims.values[key] = claim
+
+	retired := make([]string, 0, 3)
+	ambiguity.afterDelete = func(deletedKey any) {
+		assert.Equal(t, key, deletedKey)
+		retired = append(retired, "M")
+		assert.NotContains(t, ambiguity.values, key)
+		assert.Contains(t, claims.values, key)
+		assert.Contains(t, guards.values, owner)
+	}
+	claims.afterDelete = func(deletedKey any) {
+		assert.Equal(t, key, deletedKey)
+		retired = append(retired, "E")
+		assert.NotContains(t, ambiguity.values, key)
+		assert.NotContains(t, claims.values, key)
+		assert.Contains(t, guards.values, owner)
+	}
+	guards.afterDelete = func(deletedKey any) {
+		assert.Equal(t, owner, deletedKey)
+		retired = append(retired, "G")
+		assert.NotContains(t, ambiguity.values, key)
+		assert.NotContains(t, claims.values, key)
+		assert.NotContains(t, guards.values, owner)
+	}
+
+	result := handler.finish(
+		owner, record, testProcessIncarnation, lifecycleConsumed, &claim,
+	)
+	require.True(t, result.complete)
+	assert.Equal(t, []string{"M", "E", "G"}, retired)
+}
+
+func TestMapHandlerActiveFinishClaimBlocksSuccessorStageAfterOwnerRevalidation(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)}, nil, nil,
+	)
+	oldKey := stateKey{Owner: owner, Generation: 10}
+	oldState := handler.states.(*fakeBridgeMap).values[oldKey].(stateValue)
+	oldRecord, err := UnmarshalRecord(oldState.Response[:])
+	require.NoError(t, err)
+	claim := testGoGenerationClaim(lifecycleConsumed)
+	handler.claims.(*fakeBridgeMap).values[oldKey] = claim
+	stageAttempted := false
+	stageBlockedByGuard := false
+	markerNonzero := false
+	owners := handler.owners.(*fakeBridgeMap)
+	owners.afterLookup = func(count int) {
+		if count != 2 {
+			return
+		}
+		stageAttempted = true
+		guards := handler.ownerGuards.(*fakeBridgeMap)
+		guards.mu.Lock()
+		_, stageBlockedByGuard = guards.values[owner]
+		guards.mu.Unlock()
+		marker, ok := handler.ambiguity.(*fakeBridgeMap).values[oldKey].(uint64)
+		markerNonzero = ok && marker != 0
+	}
+
+	assert.True(t, handler.finishClaimed(
+		owner, oldRecord, testProcessIncarnation, lifecycleConsumed, &claim,
+	))
+	assert.True(t, stageAttempted)
+	assert.True(t, stageBlockedByGuard)
+	assert.True(t, markerNonzero)
+	assert.Equal(t, uint64(10),
+		handler.terminals.(*fakeBridgeMap).values[owner].(terminalValue).Generation)
+	assert.NotContains(t, handler.states.(*fakeBridgeMap).values, oldKey)
+	assert.NotContains(t, handler.generations.(*fakeBridgeMap).values, oldKey)
+	assert.Empty(t, handler.claims.(*fakeBridgeMap).values)
+}
+
+func TestMapHandlerActiveFinishReplacesDetachedPredecessorTerminal(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)},
+		map[Identity]any{child: activeTaskLink(owner, 10)},
+		nil,
+	)
+	oldKey := stateKey{Owner: owner, Generation: 10}
+	oldState := handler.states.(*fakeBridgeMap).values[oldKey].(stateValue)
+	require.Equal(t, uint32(1), oldState.Aliases)
+	oldRecord, err := UnmarshalRecord(oldState.Response[:])
+	require.NoError(t, err)
+	handler.remoteParents.(*fakeBridgeMap).values[owner] = validEncodedRecord(t, 11)
+	seedOwnerState(handler, owner, 11)
+	oldTerminal := terminalValue{
+		Generation:          10,
+		ObservedMonotonicNS: oldRecord.ObservedMonotonicNS,
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleConsumed,
+	}
+	handler.terminals.(*fakeBridgeMap).values[owner] = oldTerminal
+	oldClaim := testGoGenerationClaim(lifecycleConsumed)
+	handler.claims.(*fakeBridgeMap).values[oldKey] = oldClaim
+
+	assert.True(t, handler.finishClaimed(
+		owner, oldRecord, testProcessIncarnation, lifecycleConsumed, &oldClaim,
+	))
+	assert.Equal(t, oldTerminal, handler.terminals.(*fakeBridgeMap).values[owner])
+	assert.NotContains(t, handler.ambiguity.(*fakeBridgeMap).values, oldKey)
+	assert.NotContains(t, handler.ownerGuards.(*fakeBridgeMap).values, owner)
+	assert.NotContains(t, handler.claims.(*fakeBridgeMap).values, oldKey)
+
+	newKey := stateKey{Owner: owner, Generation: 11}
+	newState := handler.states.(*fakeBridgeMap).values[newKey].(stateValue)
+	newRecord, err := UnmarshalRecord(newState.Response[:])
+	require.NoError(t, err)
+	newClaim := testGoGenerationClaim(lifecycleConsumed)
+	handler.claims.(*fakeBridgeMap).values[newKey] = newClaim
+	assert.True(t, handler.finishClaimed(
+		owner, newRecord, testProcessIncarnation, lifecycleConsumed, &newClaim,
+	))
+	assert.Equal(t, terminalValue{
+		Generation:          11,
+		ObservedMonotonicNS: newRecord.ObservedMonotonicNS,
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleConsumed,
+	}, handler.terminals.(*fakeBridgeMap).values[owner])
+	assert.NotContains(t, handler.claims.(*fakeBridgeMap).values, oldKey)
+}
+
+func TestMapHandlerDetachedFinishWithoutOldStateRetainsClaimAndIndex(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)}, nil, nil,
+	)
+	oldKey := stateKey{Owner: owner, Generation: 10}
+	oldState := handler.states.(*fakeBridgeMap).values[oldKey].(stateValue)
+	oldRecord, err := UnmarshalRecord(oldState.Response[:])
+	require.NoError(t, err)
+	delete(handler.states.(*fakeBridgeMap).values, oldKey)
+	handler.remoteParents.(*fakeBridgeMap).values[owner] = validEncodedRecord(t, 11)
+	seedOwnerState(handler, owner, 11)
+	successorTerminal := terminalValue{
+		Generation:          11,
+		ObservedMonotonicNS: uint64(11 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleConsumed,
+	}
+	handler.terminals.(*fakeBridgeMap).values[owner] = successorTerminal
+	claim := testGoGenerationClaim(lifecycleConsumed)
+	originalClaim := claim
+	handler.claims.(*fakeBridgeMap).values[oldKey] = claim
+
+	assert.False(t, handler.finishClaimed(
+		owner, oldRecord, testProcessIncarnation, lifecycleConsumed, &claim,
+	))
+	assert.Zero(t, claim)
+	retained := handler.claims.(*fakeBridgeMap).values[oldKey].(generationClaim)
+	assert.Equal(t, lifecycleCleanup, retained.Lifecycle)
+	assert.Equal(t, lifecycleConsumed, retained.Reserved[0])
+	assert.Greater(t, retained.ObservedMonotonicNS, originalClaim.ObservedMonotonicNS)
+	assert.Contains(t, handler.generations.(*fakeBridgeMap).values, oldKey)
+	assert.Equal(t, successorTerminal, handler.terminals.(*fakeBridgeMap).values[owner])
+	assert.Equal(t, uint64(11),
+		handler.owners.(*fakeBridgeMap).values[owner].(ownerValue).Generation)
+}
+
+func TestMapHandlerMalformedActiveOwnerCannotOverwriteTerminal(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)}, nil, nil,
+	)
+	key := stateKey{Owner: owner, Generation: 10}
+	state := handler.states.(*fakeBridgeMap).values[key].(stateValue)
+	record, err := UnmarshalRecord(state.Response[:])
+	require.NoError(t, err)
+	indexed := handler.owners.(*fakeBridgeMap).values[owner].(ownerValue)
+	indexed.Lifecycle = lifecyclePublishing
+	handler.owners.(*fakeBridgeMap).values[owner] = indexed
+	successor := terminalValue{
+		Generation:          11,
+		ObservedMonotonicNS: uint64(11 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleConsumed,
+	}
+	handler.terminals.(*fakeBridgeMap).values[owner] = successor
+
+	claim := testGoGenerationClaim(lifecycleConsumed)
+	handler.claims.(*fakeBridgeMap).values[key] = claim
+	result := handler.finish(
+		owner, record, testProcessIncarnation, lifecycleConsumed, &claim,
+	)
+	assert.False(t, result.complete)
+	assert.True(t, result.mutationStarted)
+	assert.Equal(t, successor, handler.terminals.(*fakeBridgeMap).values[owner])
+	assert.Contains(t, handler.claims.(*fakeBridgeMap).values, key)
+	assert.Contains(t, handler.ownerGuards.(*fakeBridgeMap).values, owner)
+	assert.NotZero(t, handler.ambiguity.(*fakeBridgeMap).values[key])
 }
 
 func testMapHandler(remoteParents, tasks, ambiguity map[Identity]any) *MapHandler {
@@ -2071,4 +4378,23 @@ func testGenerationClaim(lifecycle uint8) generationClaim {
 		ProcessIncarnation:  testProcessIncarnation,
 		Lifecycle:           lifecycle,
 	}
+}
+
+func testGoGenerationClaim(lifecycle uint8) generationClaim {
+	claim := testGenerationClaim(lifecycle)
+	claim.Reserved[6] = generationGoProducerTag
+	return claim
+}
+
+func cleanupGenerationClaim(
+	origin uint8,
+	observedMonotonicNS uint64,
+) *generationClaim {
+	claim := generationClaim{
+		ObservedMonotonicNS: observedMonotonicNS,
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleCleanup,
+	}
+	claim.Reserved[0] = origin
+	return &claim
 }

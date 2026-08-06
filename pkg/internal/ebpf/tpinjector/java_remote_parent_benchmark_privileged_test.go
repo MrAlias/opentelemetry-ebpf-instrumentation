@@ -751,6 +751,7 @@ func javaRemoteParentBenchmarkMaps(maps *BpfJavaRemoteParentMaps) javabridge.Map
 		Generations:       maps.JavaRemoteParentGenerationIndex,
 		Terminals:         maps.JavaRemoteParentTerminal,
 		Claims:            maps.JavaRemoteParentClaims,
+		OwnerGuards:       maps.JavaRemoteParentOwnerGuards,
 		Handoffs:          maps.JavaRemoteParentHandoffs,
 		HandoffClaims:     maps.JavaRemoteParentHandoffClaims,
 		Retired:           maps.JavaRetiredProcesses,
@@ -814,11 +815,15 @@ func removeBenchmarkGeneration(
 	deleteBenchmarkMapKey(t, maps.JavaRemoteParentCookieConnections, cookieConnectionKey)
 	deleteBenchmarkMapKey(t, maps.JavaRemoteParentState, key)
 	deleteBenchmarkMapKey(t, maps.JavaRemoteParentFallback, owner)
-	deleteBenchmarkMapKey(t, maps.JavaRemoteParentAmbiguity, key)
 	deleteBenchmarkMapKey(t, maps.JavaRemoteParentGenerationIndex, key)
 	deleteBenchmarkMapKey(t, maps.JavaRemoteParentOwners, owner)
-	deleteBenchmarkMapKey(t, maps.JavaRemoteParentClaims, key)
 	deleteBenchmarkMapKey(t, maps.JavaRemoteParentTerminal, owner)
+	deleteBenchmarkMapKey(t, maps.JavaRemoteParentAmbiguity, key)
+	deleteBenchmarkMapKey(t, maps.JavaRemoteParentClaims, key)
+	deleteBenchmarkMapKey(t, maps.JavaRemoteParentOwnerGuards, owner)
+	requireBenchmarkMapKeyAbsent(t, maps.JavaRemoteParentAmbiguity, key)
+	requireBenchmarkMapKeyAbsent(t, maps.JavaRemoteParentClaims, key)
+	requireBenchmarkMapKeyAbsent(t, maps.JavaRemoteParentOwnerGuards, owner)
 }
 
 func deleteBenchmarkMapKey(t *testing.T, benchmarkMap *ebpf.Map, key any) {
@@ -826,6 +831,14 @@ func deleteBenchmarkMapKey(t *testing.T, benchmarkMap *ebpf.Map, key any) {
 
 	err := benchmarkMap.Delete(key)
 	require.True(t, err == nil || errors.Is(err, ebpf.ErrKeyNotExist), "delete map key: %v", err)
+}
+
+func requireBenchmarkMapKeyAbsent(t *testing.T, benchmarkMap *ebpf.Map, key any) {
+	t.Helper()
+
+	value, err := benchmarkMap.LookupBytes(key)
+	require.NoError(t, err)
+	require.Nil(t, value)
 }
 
 func newBridgeBenchmarkSeries(

@@ -394,12 +394,12 @@ func (h *MapHandler) handle(
 			if lookupErr := h.claims.Lookup(&key, &claimed); lookupErr != nil {
 				return Record{Status: StatusTransportError}
 			}
-			if claimed.Lifecycle == lifecycleAmbiguous {
-				return Record{Status: StatusAmbiguous}
+			claimedStatus := statusForGenerationClaim(claimed, processIncarnation)
+			if claimedStatus == StatusAlreadyConsumed {
+				h.markConsumed(identity, processIncarnation)
+				h.markConsumed(owner, processIncarnation)
 			}
-			h.markConsumed(identity, processIncarnation)
-			h.markConsumed(owner, processIncarnation)
-			return Record{Status: StatusAlreadyConsumed}
+			return Record{Status: claimedStatus}
 		}
 		if requestCanceled(ctx) {
 			return Record{Status: StatusTimeout}
@@ -1207,6 +1207,7 @@ func (h *MapHandler) newGenerationClaim(
 		ObservedMonotonicNS: uint64(now),
 		ProcessIncarnation:  processIncarnation,
 		Lifecycle:           lifecycle,
+		Reserved:            [7]byte{6: generationGoProducerTag},
 	}, true
 }
 
@@ -1398,5 +1399,31 @@ func statusForLifecycle(lifecycle uint8) Status {
 		return StatusAlreadyConsumed
 	default:
 		return StatusMissing
+	}
+}
+
+func statusForGenerationClaim(claim generationClaim, processIncarnation uint64) Status {
+	if processIncarnation == 0 || claim.ObservedMonotonicNS == 0 ||
+		claim.ProcessIncarnation != processIncarnation {
+		return StatusAmbiguous
+	}
+	semanticLifecycle := claim.Lifecycle
+	if claim.Lifecycle == lifecycleCleanup {
+		if !validGenerationCleanupClaim(claim) {
+			return StatusAmbiguous
+		}
+		semanticLifecycle = claim.Reserved[0]
+	} else if claim.Reserved != ([7]byte{}) && !validGenerationProducerClaim(claim) {
+		return StatusAmbiguous
+	}
+	switch semanticLifecycle {
+	case lifecyclePublishing:
+		return StatusOverload
+	case lifecycleAmbiguous:
+		return StatusAmbiguous
+	case lifecycleConsumed, lifecycleDiscarded, lifecycleStale:
+		return StatusAlreadyConsumed
+	default:
+		return StatusAmbiguous
 	}
 }

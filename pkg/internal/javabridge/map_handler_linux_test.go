@@ -27,6 +27,7 @@ type fakeBridgeMap struct {
 	mu                sync.Mutex
 	values            map[any]any
 	lookupCount       int
+	updateCount       int
 	lookupErr         error
 	updateErr         error
 	deleteErr         error
@@ -116,6 +117,7 @@ func (m *fakeBridgeMap) Lookup(key, valueOut any) error {
 
 func (m *fakeBridgeMap) Update(key, value any, flags ebpf.MapUpdateFlags) error {
 	m.mu.Lock()
+	m.updateCount++
 	if m.updateErr != nil {
 		err := m.updateErr
 		m.mu.Unlock()

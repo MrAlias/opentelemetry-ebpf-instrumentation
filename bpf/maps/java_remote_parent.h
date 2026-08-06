@@ -3858,11 +3858,19 @@ java_remote_parent_finish_generation(const java_remote_parent_resolution_t *reso
 static __always_inline enum java_remote_parent_status
 java_remote_parent_claim_status(const java_remote_parent_resolution_t *resolution,
                                 const java_remote_parent_claim_t *claimed) {
-    if (!claimed || !claimed->observed_monotime_ns ||
+    if (!claimed) {
+        return k_java_remote_parent_status_ambiguous;
+    }
+    const u8 tagged_go_producer = claimed->lifecycle >= k_java_remote_parent_lifecycle_consumed &&
+                                  claimed->lifecycle <= k_java_remote_parent_lifecycle_publishing &&
+                                  claimed->reserved[6] == k_java_remote_parent_go_producer_tag;
+    if (!claimed->observed_monotime_ns ||
         claimed->process_incarnation != resolution->indexed.process_incarnation ||
         claimed->reserved[1] || claimed->reserved[2] || claimed->reserved[3] ||
-        claimed->reserved[4] || claimed->reserved[5] || claimed->reserved[6] ||
-        (claimed->lifecycle != k_java_remote_parent_lifecycle_cleanup && claimed->reserved[0])) {
+        claimed->reserved[4] || claimed->reserved[5] ||
+        (claimed->lifecycle == k_java_remote_parent_lifecycle_cleanup
+             ? claimed->reserved[6]
+             : claimed->reserved[0] || (claimed->reserved[6] && !tagged_go_producer))) {
         return k_java_remote_parent_status_ambiguous;
     }
     const u8 semantic_lifecycle = claimed->lifecycle == k_java_remote_parent_lifecycle_cleanup

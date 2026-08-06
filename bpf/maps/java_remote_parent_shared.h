@@ -25,10 +25,19 @@ enum java_remote_parent_lifecycle : u8 {
     k_java_remote_parent_lifecycle_publishing = 6,
     // A producer changes only its own exact surviving fence to this state,
     // with a fresh timestamp, after its final possible payload mutation.
-    // Userspace cleanup never adopts lifecycle 1-6 because a preempted BPF
-    // invocation may still resume and key-delete through an old exact check.
+    // Userspace cleanup never adopts untagged lifecycle 1-6 because a
+    // preempted BPF invocation may still resume and key-delete through an old
+    // exact check. The coordinator-quiesced tagged Go exception is documented
+    // below.
     k_java_remote_parent_lifecycle_cleanup = 7,
 };
+
+// Userspace handlers and cleanup share one agent-wide generation coordinator,
+// while the internal maps can outlive an individual handler invocation. This
+// reserved-byte tag gives cleanup durable Go provenance without granting BPF
+// mutation authority: BPF producer helpers continue to require all reserved
+// bytes to be zero.
+#define k_java_remote_parent_go_producer_tag ((u8)0x47)
 
 typedef struct java_remote_parent_key {
     pid_key_t owner;

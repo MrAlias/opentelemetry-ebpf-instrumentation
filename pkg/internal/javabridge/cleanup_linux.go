@@ -278,6 +278,9 @@ func (c *Cleanup) SweepWithStats() (CleanupStats, error) {
 		c.recordKnownLogicalKey(entry.key)
 		c.recordKnownGeneration(entry.key)
 	}
+	if handoffErr := c.recoverGoGenerationProducerHandoffs(); handoffErr != nil {
+		err = errors.Join(err, handoffErr)
+	}
 
 	generationNow := c.monoTimeNow()
 	cleanedGenerations := make(map[stateKey]struct{})

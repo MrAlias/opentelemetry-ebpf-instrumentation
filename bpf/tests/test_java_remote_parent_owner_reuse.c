@@ -28,6 +28,11 @@ static unsigned int test_prandom_u32(void);
 #include <maps/java_vt_threads.h>
 #include <pid/pid_helpers.h>
 
+_Static_assert(k_java_remote_parent_go_producer_tag == (u8)0x47, "Go producer tag ABI changed");
+_Static_assert(sizeof(java_remote_parent_claim_t) == 24, "generation claim ABI size changed");
+_Static_assert(__builtin_offsetof(java_remote_parent_claim_t, reserved) + 6 == 23,
+               "Go producer tag ABI offset changed");
+
 static void test_task_tid(pid_key_t *owner);
 static u8 test_java_vt_translate_tid(pid_key_t *owner);
 static u8 test_java_vt_translate_authorized_tid(pid_key_t *owner);
@@ -2968,6 +2973,71 @@ static void test_generation_claim_status_validation(void) {
             .discard_stat = k_java_remote_parent_stat_discard_already_consumed,
         },
         {
+            .name = "tagged Go publishing claim was not overload",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_publishing,
+                    .reserved = {[6] = k_java_remote_parent_go_producer_tag},
+                },
+            .status = k_java_remote_parent_status_overload,
+            .take_stat = k_java_remote_parent_stat_take_overload,
+            .discard_stat = k_java_remote_parent_stat_discard_overload,
+        },
+        {
+            .name = "tagged Go ambiguous claim was not ambiguous",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_ambiguous,
+                    .reserved = {[6] = k_java_remote_parent_go_producer_tag},
+                },
+            .status = k_java_remote_parent_status_ambiguous,
+            .take_stat = k_java_remote_parent_stat_take_ambiguous,
+            .discard_stat = k_java_remote_parent_stat_discard_ambiguous,
+        },
+        {
+            .name = "tagged Go consumed claim lost its committed status",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_consumed,
+                    .reserved = {[6] = k_java_remote_parent_go_producer_tag},
+                },
+            .status = k_java_remote_parent_status_already_consumed,
+            .take_stat = k_java_remote_parent_stat_take_already_consumed,
+            .discard_stat = k_java_remote_parent_stat_discard_already_consumed,
+        },
+        {
+            .name = "tagged Go discarded claim lost its committed status",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_discarded,
+                    .reserved = {[6] = k_java_remote_parent_go_producer_tag},
+                },
+            .status = k_java_remote_parent_status_already_consumed,
+            .take_stat = k_java_remote_parent_stat_take_already_consumed,
+            .discard_stat = k_java_remote_parent_stat_discard_already_consumed,
+        },
+        {
+            .name = "tagged Go stale claim lost its committed status",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_stale,
+                    .reserved = {[6] = k_java_remote_parent_go_producer_tag},
+                },
+            .status = k_java_remote_parent_status_already_consumed,
+            .take_stat = k_java_remote_parent_stat_take_already_consumed,
+            .discard_stat = k_java_remote_parent_stat_discard_already_consumed,
+        },
+        {
             .name = "cleanup-consumed claim lost its committed status",
             .claim =
                 {
@@ -3124,6 +3194,82 @@ static void test_generation_claim_status_validation(void) {
             .discard_stat = k_java_remote_parent_stat_discard_ambiguous,
         },
         {
+            .name = "tagged Go claim with extra metadata was not ambiguous",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_consumed,
+                    .reserved =
+                        {
+                            [1] = 1,
+                            [6] = k_java_remote_parent_go_producer_tag,
+                        },
+                },
+            .status = k_java_remote_parent_status_ambiguous,
+            .take_stat = k_java_remote_parent_stat_take_ambiguous,
+            .discard_stat = k_java_remote_parent_stat_discard_ambiguous,
+        },
+        {
+            .name = "tagged cleanup claim was not ambiguous",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_cleanup,
+                    .reserved =
+                        {
+                            [0] = k_java_remote_parent_lifecycle_consumed,
+                            [6] = k_java_remote_parent_go_producer_tag,
+                        },
+                },
+            .status = k_java_remote_parent_status_ambiguous,
+            .take_stat = k_java_remote_parent_stat_take_ambiguous,
+            .discard_stat = k_java_remote_parent_stat_discard_ambiguous,
+        },
+        {
+            .name = "tagged Go claim with semantic metadata was not ambiguous",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_consumed,
+                    .reserved =
+                        {
+                            [0] = k_java_remote_parent_lifecycle_consumed,
+                            [6] = k_java_remote_parent_go_producer_tag,
+                        },
+                },
+            .status = k_java_remote_parent_status_ambiguous,
+            .take_stat = k_java_remote_parent_stat_take_ambiguous,
+            .discard_stat = k_java_remote_parent_stat_discard_ambiguous,
+        },
+        {
+            .name = "tagged active claim was not ambiguous",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_active,
+                    .reserved = {[6] = k_java_remote_parent_go_producer_tag},
+                },
+            .status = k_java_remote_parent_status_ambiguous,
+            .take_stat = k_java_remote_parent_stat_take_ambiguous,
+            .discard_stat = k_java_remote_parent_stat_discard_ambiguous,
+        },
+        {
+            .name = "tagged unknown claim was not ambiguous",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .reserved = {[6] = k_java_remote_parent_go_producer_tag},
+                },
+            .status = k_java_remote_parent_status_ambiguous,
+            .take_stat = k_java_remote_parent_stat_take_ambiguous,
+            .discard_stat = k_java_remote_parent_stat_discard_ambiguous,
+        },
+        {
             .name = "active claim was not ambiguous",
             .claim =
                 {
@@ -3182,6 +3328,38 @@ static void test_generation_claim_status_validation(void) {
     }
 }
 
+static void test_tagged_go_guard_is_status_only(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    stored_detach_guard_key = java_remote_parent_detach_guard_key(&stored_state_key.owner);
+    stored_detach_guard = (java_remote_parent_claim_t){
+        .observed_monotime_ns = test_now_ns,
+        .process_incarnation = test_generation,
+        .lifecycle = k_java_remote_parent_lifecycle_publishing,
+        .reserved = {[6] = k_java_remote_parent_go_producer_tag},
+    };
+    detach_guard_present = 1;
+
+    java_remote_parent_response_t response = stored_state.response;
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_direct,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_overload ||
+        response.status != k_java_remote_parent_status_overload || !detach_guard_present ||
+        stored_detach_guard.reserved[6] != k_java_remote_parent_go_producer_tag || claim_present ||
+        !owner_present || !fallback_present || !state_present || !generation_index_present ||
+        !connection_present || !cookie_connection_present || terminal_present ||
+        exact_claim_update_attempts || stats[k_java_remote_parent_stat_take_overload] != 1 ||
+        unexpected_update || unexpected_delete) {
+        fail("tagged Go guard granted BPF mutation authority");
+    }
+}
+
 static void test_ambiguity_claim_collision_reports_committed_status(void) {
     const connection_info_t connection = {.s_port = 1234, .d_port = 443};
     const struct {
@@ -3222,6 +3400,71 @@ static void test_ambiguity_claim_collision_reports_committed_status(void) {
                     .observed_monotime_ns = test_now_ns,
                     .process_incarnation = test_process_incarnation,
                     .lifecycle = k_java_remote_parent_lifecycle_consumed,
+                },
+            .status = k_java_remote_parent_status_already_consumed,
+            .take_stat = k_java_remote_parent_stat_take_already_consumed,
+            .discard_stat = k_java_remote_parent_stat_discard_already_consumed,
+        },
+        {
+            .name = "tagged Go publishing claim collision was not overload",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_publishing,
+                    .reserved = {[6] = k_java_remote_parent_go_producer_tag},
+                },
+            .status = k_java_remote_parent_status_overload,
+            .take_stat = k_java_remote_parent_stat_take_overload,
+            .discard_stat = k_java_remote_parent_stat_discard_overload,
+        },
+        {
+            .name = "tagged Go ambiguous claim collision was not ambiguous",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_ambiguous,
+                    .reserved = {[6] = k_java_remote_parent_go_producer_tag},
+                },
+            .status = k_java_remote_parent_status_ambiguous,
+            .take_stat = k_java_remote_parent_stat_take_ambiguous,
+            .discard_stat = k_java_remote_parent_stat_discard_ambiguous,
+        },
+        {
+            .name = "tagged Go consumed claim collision lost its committed status",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_consumed,
+                    .reserved = {[6] = k_java_remote_parent_go_producer_tag},
+                },
+            .status = k_java_remote_parent_status_already_consumed,
+            .take_stat = k_java_remote_parent_stat_take_already_consumed,
+            .discard_stat = k_java_remote_parent_stat_discard_already_consumed,
+        },
+        {
+            .name = "tagged Go discarded claim collision lost its committed status",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_discarded,
+                    .reserved = {[6] = k_java_remote_parent_go_producer_tag},
+                },
+            .status = k_java_remote_parent_status_already_consumed,
+            .take_stat = k_java_remote_parent_stat_take_already_consumed,
+            .discard_stat = k_java_remote_parent_stat_discard_already_consumed,
+        },
+        {
+            .name = "tagged Go stale claim collision lost its committed status",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_stale,
+                    .reserved = {[6] = k_java_remote_parent_go_producer_tag},
                 },
             .status = k_java_remote_parent_status_already_consumed,
             .take_stat = k_java_remote_parent_stat_take_already_consumed,
@@ -5517,6 +5760,7 @@ int main(void) {
     test_owner_cleanup_release_tails_are_recoverable();
     test_internal_cleanup_claim_is_transient();
     test_generation_claim_status_validation();
+    test_tagged_go_guard_is_status_only();
     test_ambiguity_claim_collision_reports_committed_status();
     test_exact_receive_detach_removes_only_unaliased_generation();
     test_exact_receive_detach_preserves_aliases();

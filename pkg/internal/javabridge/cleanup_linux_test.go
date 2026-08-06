@@ -23,6 +23,596 @@ func TestCleanupKernelMapLayouts(t *testing.T) {
 	assert.Equal(t, uintptr(16), unsafe.Sizeof(handoffClaimValue{}))
 	assert.Equal(t, uintptr(24), unsafe.Sizeof(retiredProcessKey{}))
 	assert.Equal(t, uintptr(24), unsafe.Sizeof(generationClaim{}))
+	assert.Equal(t, uintptr(23), unsafe.Offsetof(generationClaim{}.Reserved)+6)
+	assert.Equal(t, uint8(0x47), generationGoProducerTag)
+}
+
+func taggedGoGenerationClaim(
+	lifecycle uint8,
+	observedMonotonicNS uint64,
+	processIncarnation uint64,
+) generationClaim {
+	return generationClaim{
+		ObservedMonotonicNS: observedMonotonicNS,
+		ProcessIncarnation:  processIncarnation,
+		Lifecycle:           lifecycle,
+		Reserved:            [7]byte{6: generationGoProducerTag},
+	}
+}
+
+func generationRecoveryCleanup(t *testing.T) *Cleanup {
+	t.Helper()
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	cleanup.monoTimeNow = func() time.Duration { return 100 * time.Second }
+	resetGenerationRecoverySweep(cleanup)
+	return cleanup
+}
+
+func resetGenerationRecoverySweep(cleanup *Cleanup) {
+	cleanup.currentSweepClaims = make(map[stateKey]generationClaim)
+	cleanup.currentSweepGuards = make(map[Identity]generationClaim)
+	cleanup.currentSweepAmbiguities = make(map[stateKey]uint64)
+}
+
+func TestGenerationGoProducerTagAndHandoffValidation(t *testing.T) {
+	for _, lifecycle := range []uint8{
+		lifecycleConsumed,
+		lifecycleDiscarded,
+		lifecycleStale,
+		lifecycleAmbiguous,
+		lifecyclePublishing,
+	} {
+		producer := taggedGoGenerationClaim(lifecycle, 10, testProcessIncarnation)
+		require.True(t, validGenerationProducerClaim(producer))
+		cleanup, err := generationProducerHandoffValue(producer, 9)
+		require.NoError(t, err)
+		assert.Equal(t, uint64(11), cleanup.ObservedMonotonicNS)
+		assert.Equal(t, testProcessIncarnation, cleanup.ProcessIncarnation)
+		assert.Equal(t, lifecycleCleanup, cleanup.Lifecycle)
+		assert.Equal(t, [7]byte{lifecycle}, cleanup.Reserved)
+	}
+
+	valid := taggedGoGenerationClaim(lifecycleConsumed, 10, testProcessIncarnation)
+	for _, test := range []struct {
+		name   string
+		mutate func(*generationClaim)
+	}{
+		{name: "untagged", mutate: func(claim *generationClaim) { claim.Reserved = [7]byte{} }},
+		{name: "wrong tag", mutate: func(claim *generationClaim) { claim.Reserved[6]++ }},
+		{name: "extra metadata", mutate: func(claim *generationClaim) { claim.Reserved[1] = 1 }},
+		{name: "active lifecycle", mutate: func(claim *generationClaim) { claim.Lifecycle = lifecycleActive }},
+		{name: "cleanup lifecycle", mutate: func(claim *generationClaim) { claim.Lifecycle = lifecycleCleanup }},
+		{name: "zero timestamp", mutate: func(claim *generationClaim) { claim.ObservedMonotonicNS = 0 }},
+		{name: "zero incarnation", mutate: func(claim *generationClaim) { claim.ProcessIncarnation = 0 }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			claim := valid
+			test.mutate(&claim)
+			assert.False(t, validGenerationProducerClaim(claim))
+			_, err := generationProducerHandoffValue(claim, 20)
+			require.Error(t, err)
+		})
+	}
+
+	saturated := valid
+	saturated.ObservedMonotonicNS = ^uint64(0)
+	_, err := generationProducerHandoffValue(saturated, 100*time.Second)
+	require.Error(t, err)
+	_, err = generationProducerHandoffValue(valid, -1)
+	require.Error(t, err)
+}
+
+func TestMapHandlerTaggedProducerClaimStatusParity(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	for _, test := range []struct {
+		name      string
+		lifecycle uint8
+		status    Status
+	}{
+		{name: "publishing", lifecycle: lifecyclePublishing, status: StatusOverload},
+		{name: "ambiguous", lifecycle: lifecycleAmbiguous, status: StatusAmbiguous},
+		{name: "consumed", lifecycle: lifecycleConsumed, status: StatusAlreadyConsumed},
+		{name: "discarded", lifecycle: lifecycleDiscarded, status: StatusAlreadyConsumed},
+		{name: "stale", lifecycle: lifecycleStale, status: StatusAlreadyConsumed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler := testMapHandler(
+				map[Identity]any{owner: validEncodedRecord(t, key.Generation)}, nil, nil,
+			)
+			claim := taggedGoGenerationClaim(
+				test.lifecycle, uint64(10*time.Second), testProcessIncarnation,
+			)
+			handler.claims.(*fakeBridgeMap).values[key] = claim
+
+			result := handler.Handle(owner, OperationTake)
+			assert.Equal(t, test.status, result.Status)
+			assert.Equal(t, claim, handler.claims.(*fakeBridgeMap).values[key])
+			assert.Contains(t, handler.remoteParents.(*fakeBridgeMap).values, owner)
+		})
+	}
+}
+
+func TestCleanupRecoversTaggedGoGenerationHandoffShapes(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	producerClaim := taggedGoGenerationClaim(
+		lifecycleConsumed, uint64(10*time.Second), testProcessIncarnation,
+	)
+	producerGuard := taggedGoGenerationClaim(
+		lifecyclePublishing, uint64(11*time.Second), key.Generation,
+	)
+	cleanupClaim := generationClaim{
+		ObservedMonotonicNS: uint64(20 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleCleanup,
+		Reserved:            [7]byte{lifecycleConsumed},
+	}
+	cleanupGuard := generationClaim{
+		ObservedMonotonicNS: uint64(21 * time.Second),
+		ProcessIncarnation:  key.Generation,
+		Lifecycle:           lifecycleCleanup,
+		Reserved:            [7]byte{lifecyclePublishing},
+	}
+
+	for _, test := range []struct {
+		name          string
+		claim         *generationClaim
+		guard         *generationClaim
+		markerPresent bool
+		marker        uint64
+		wantOrder     []string
+	}{
+		{
+			name:  "tagged E only publishes G before E",
+			claim: &producerClaim, markerPresent: true,
+			wantOrder: []string{"G", "E"},
+		},
+		{
+			name:  "tagged E and tagged G convert E before G",
+			claim: &producerClaim, guard: &producerGuard,
+			markerPresent: true, marker: uint64(12 * time.Second),
+			wantOrder: []string{"E", "G"},
+		},
+		{
+			name:  "cleanup E permits tagged G tail",
+			claim: &cleanupClaim, guard: &producerGuard,
+			wantOrder: []string{"G"},
+		},
+		{
+			name:  "cleanup G permits tagged E tail",
+			claim: &producerClaim, guard: &cleanupGuard,
+			markerPresent: true, marker: uint64(12 * time.Second),
+			wantOrder: []string{"E"},
+		},
+		{
+			name:      "tagged G alone becomes a cleanup tail",
+			guard:     &producerGuard,
+			wantOrder: []string{"G"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cleanup := generationRecoveryCleanup(t)
+			claims := cleanup.maps.claims.(*fakeBridgeMap)
+			guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+			markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+			if test.claim != nil {
+				claims.values[key] = *test.claim
+			}
+			if test.guard != nil {
+				guards.values[owner] = *test.guard
+			}
+			if test.markerPresent {
+				markers.values[key] = test.marker
+			}
+			var order []string
+			claims.afterUpdate = func(any, any) { order = append(order, "E") }
+			guards.afterUpdate = func(any, any) { order = append(order, "G") }
+
+			require.NoError(t, cleanup.recoverGoGenerationProducerHandoffs())
+			assert.Equal(t, test.wantOrder, order)
+			if test.claim == nil {
+				assert.NotContains(t, claims.values, key)
+			} else {
+				got := claims.values[key].(generationClaim)
+				if validGenerationProducerClaim(*test.claim) {
+					assert.True(t, validGenerationCleanupClaim(got))
+					assert.Equal(t, test.claim.Lifecycle, got.Reserved[0])
+					assert.Greater(t, got.ObservedMonotonicNS, test.claim.ObservedMonotonicNS)
+				} else {
+					assert.Equal(t, *test.claim, got)
+				}
+			}
+			gotGuard := guards.values[owner].(generationClaim)
+			assert.True(t, validGenerationCleanupGuard(owner, gotGuard))
+			assert.Equal(t, key.Generation, gotGuard.ProcessIncarnation)
+			if test.guard != nil && validGenerationProducerClaim(*test.guard) {
+				assert.Greater(t, gotGuard.ObservedMonotonicNS, test.guard.ObservedMonotonicNS)
+			}
+			if test.markerPresent {
+				assert.Equal(t, test.marker, markers.values[key])
+			} else {
+				assert.NotContains(t, markers.values, key)
+			}
+		})
+	}
+}
+
+func TestCleanupNeverAdoptsUntaggedGenerationProducers(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	markers := []struct {
+		name    string
+		present bool
+		value   uint64
+	}{
+		{name: "absent"},
+		{name: "reserved", present: true},
+		{name: "promoted", present: true, value: uint64(time.Second)},
+	}
+	for _, producer := range []struct {
+		name      string
+		lifecycle uint8
+	}{
+		{name: "consumed", lifecycle: lifecycleConsumed},
+		{name: "discarded", lifecycle: lifecycleDiscarded},
+		{name: "stale", lifecycle: lifecycleStale},
+		{name: "ambiguous", lifecycle: lifecycleAmbiguous},
+		{name: "publishing", lifecycle: lifecyclePublishing},
+	} {
+		for _, marker := range markers {
+			t.Run(marker.name+"-"+producer.name, func(t *testing.T) {
+				cleanup := generationRecoveryCleanup(t)
+				claims := cleanup.maps.claims.(*fakeBridgeMap)
+				guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+				ambiguity := cleanup.maps.ambiguity.(*fakeBridgeMap)
+				claim := generationClaim{
+					ObservedMonotonicNS: 1,
+					ProcessIncarnation:  testProcessIncarnation,
+					Lifecycle:           producer.lifecycle,
+				}
+				guard := generationClaim{
+					ObservedMonotonicNS: 1,
+					ProcessIncarnation:  key.Generation,
+					Lifecycle:           lifecyclePublishing,
+				}
+				claims.values[key] = claim
+				guards.values[owner] = guard
+				if marker.present {
+					ambiguity.values[key] = marker.value
+				}
+
+				require.NoError(t, cleanup.recoverGoGenerationProducerHandoffs())
+				assert.Equal(t, claim, claims.values[key])
+				assert.Equal(t, guard, guards.values[owner])
+				assert.Zero(t, claims.updateCount)
+				assert.Zero(t, guards.updateCount)
+				if marker.present {
+					assert.Equal(t, marker.value, ambiguity.values[key])
+				} else {
+					assert.NotContains(t, ambiguity.values, key)
+				}
+			})
+		}
+	}
+}
+
+func TestCleanupTaggedGenerationRecoveryRequiresCompleteFenceSnapshots(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	producerClaim := taggedGoGenerationClaim(
+		lifecycleConsumed, uint64(10*time.Second), testProcessIncarnation,
+	)
+	producerGuard := taggedGoGenerationClaim(
+		lifecyclePublishing, uint64(11*time.Second), key.Generation,
+	)
+	injected := errors.New("injected generation fence iteration failure")
+	for _, target := range []string{"claims", "guards"} {
+		t.Run(target, func(t *testing.T) {
+			cleanup := generationRecoveryCleanup(t)
+			claims := cleanup.maps.claims.(*fakeBridgeMap)
+			guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+			claims.values[key] = producerClaim
+			guards.values[owner] = producerGuard
+			if target == "claims" {
+				claims.iterateErr = injected
+			} else {
+				guards.iterateErr = injected
+			}
+
+			err := cleanup.recoverGoGenerationProducerHandoffs()
+			require.ErrorIs(t, err, injected)
+			assert.Equal(t, producerClaim, claims.values[key])
+			assert.Equal(t, producerGuard, guards.values[owner])
+			assert.Zero(t, claims.updateCount)
+			assert.Zero(t, guards.updateCount)
+		})
+	}
+}
+
+func TestCleanupForeignGenerationGuardBlocksTaggedClaim(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	producerClaim := taggedGoGenerationClaim(
+		lifecycleConsumed, uint64(10*time.Second), testProcessIncarnation,
+	)
+	foreignGuard := generationClaim{
+		ObservedMonotonicNS: uint64(11 * time.Second),
+		ProcessIncarnation:  key.Generation + 1,
+		Lifecycle:           lifecyclePublishing,
+	}
+	cleanup := generationRecoveryCleanup(t)
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+	claims.values[key] = producerClaim
+	guards.values[owner] = foreignGuard
+
+	require.NoError(t, cleanup.recoverGoGenerationProducerHandoffs())
+	assert.Equal(t, producerClaim, claims.values[key])
+	assert.Equal(t, foreignGuard, guards.values[owner])
+	assert.Zero(t, claims.updateCount)
+	assert.Zero(t, guards.updateCount)
+}
+
+func TestCleanupTaggedGenerationGuardRequiresAbsentOrCleanupClaim(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	producerGuard := taggedGoGenerationClaim(lifecyclePublishing, 10, key.Generation)
+	for _, test := range []struct {
+		name  string
+		claim generationClaim
+	}{
+		{
+			name: "tagged producer",
+			claim: taggedGoGenerationClaim(
+				lifecycleConsumed, 10, testProcessIncarnation,
+			),
+		},
+		{
+			name: "untagged producer",
+			claim: generationClaim{
+				ObservedMonotonicNS: 10,
+				ProcessIncarnation:  testProcessIncarnation,
+				Lifecycle:           lifecycleConsumed,
+			},
+		},
+		{
+			name: "malformed producer tag",
+			claim: generationClaim{
+				ObservedMonotonicNS: 10,
+				ProcessIncarnation:  testProcessIncarnation,
+				Lifecycle:           lifecycleConsumed,
+				Reserved:            [7]byte{1: 1, 6: generationGoProducerTag},
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cleanup := generationRecoveryCleanup(t)
+			claims := cleanup.maps.claims.(*fakeBridgeMap)
+			guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+			claims.values[key] = test.claim
+			guards.values[owner] = producerGuard
+
+			require.NoError(t, cleanup.recoverGoGenerationProducerGuardTail(key, producerGuard))
+			assert.Equal(t, test.claim, claims.values[key])
+			assert.Equal(t, producerGuard, guards.values[owner])
+			assert.Zero(t, guards.updateCount)
+		})
+	}
+}
+
+func TestCleanupRetriesFailedTaggedGenerationHandoffsOnLaterSweep(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	producerClaim := taggedGoGenerationClaim(
+		lifecycleConsumed, uint64(10*time.Second), testProcessIncarnation,
+	)
+	producerGuard := taggedGoGenerationClaim(
+		lifecyclePublishing, uint64(11*time.Second), key.Generation,
+	)
+	injected := errors.New("injected producer handoff failure")
+
+	t.Run("claim", func(t *testing.T) {
+		cleanup := generationRecoveryCleanup(t)
+		claims := cleanup.maps.claims.(*fakeBridgeMap)
+		guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+		claims.values[key] = producerClaim
+		claims.updateErr = injected
+
+		err := cleanup.recoverGoGenerationProducerHandoffs()
+		require.ErrorIs(t, err, injected)
+		assert.Equal(t, producerClaim, claims.values[key])
+		assert.True(t, validGenerationCleanupGuard(owner, guards.values[owner].(generationClaim)))
+		assert.Equal(t, 1, claims.updateCount)
+
+		claims.updateErr = nil
+		resetGenerationRecoverySweep(cleanup)
+		require.NoError(t, cleanup.recoverGoGenerationProducerHandoffs())
+		assert.True(t, validGenerationCleanupClaim(claims.values[key].(generationClaim)))
+		assert.Equal(t, 2, claims.updateCount)
+	})
+
+	t.Run("guard", func(t *testing.T) {
+		cleanup := generationRecoveryCleanup(t)
+		claims := cleanup.maps.claims.(*fakeBridgeMap)
+		guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+		claims.values[key] = producerClaim
+		guards.values[owner] = producerGuard
+		guards.updateErr = injected
+
+		err := cleanup.recoverGoGenerationProducerHandoffs()
+		require.ErrorIs(t, err, injected)
+		assert.True(t, validGenerationCleanupClaim(claims.values[key].(generationClaim)))
+		assert.Equal(t, producerGuard, guards.values[owner])
+		assert.Equal(t, 1, guards.updateCount)
+
+		guards.updateErr = nil
+		resetGenerationRecoverySweep(cleanup)
+		require.NoError(t, cleanup.recoverGoGenerationProducerHandoffs())
+		assert.True(t, validGenerationCleanupGuard(owner, guards.values[owner].(generationClaim)))
+		assert.Equal(t, 2, guards.updateCount)
+	})
+}
+
+func TestCleanupTaggedGenerationRecoveryPreservesSuccessors(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	producerClaim := taggedGoGenerationClaim(lifecycleConsumed, 10, testProcessIncarnation)
+	producerGuard := taggedGoGenerationClaim(lifecyclePublishing, 11, key.Generation)
+
+	t.Run("claim", func(t *testing.T) {
+		for _, successor := range []generationClaim{
+			producerClaim,
+			{
+				ObservedMonotonicNS: 12,
+				ProcessIncarnation:  testProcessIncarnation + 1,
+				Lifecycle:           lifecycleConsumed,
+			},
+		} {
+			cleanup := generationRecoveryCleanup(t)
+			claims := cleanup.maps.claims.(*fakeBridgeMap)
+			guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+			claims.values[key] = producerClaim
+			guards.values[owner] = producerGuard
+			claims.afterUpdate = func(updatedKey, _ any) {
+				claims.mu.Lock()
+				claims.values[updatedKey] = successor
+				claims.mu.Unlock()
+			}
+
+			require.NoError(t, cleanup.recoverGoGenerationProducerHandoffs())
+			assert.Equal(t, successor, claims.values[key])
+			assert.Equal(t, producerGuard, guards.values[owner])
+			assert.Equal(t, 1, claims.updateCount)
+			assert.Zero(t, guards.updateCount)
+		}
+	})
+
+	t.Run("guard", func(t *testing.T) {
+		cleanup := generationRecoveryCleanup(t)
+		claims := cleanup.maps.claims.(*fakeBridgeMap)
+		guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+		claims.values[key] = producerClaim
+		guards.values[owner] = producerGuard
+		guards.afterUpdate = func(updatedKey, _ any) {
+			guards.mu.Lock()
+			guards.values[updatedKey] = producerGuard
+			guards.mu.Unlock()
+		}
+
+		require.NoError(t, cleanup.recoverGoGenerationProducerHandoffs())
+		assert.True(t, validGenerationCleanupClaim(claims.values[key].(generationClaim)))
+		assert.Equal(t, producerGuard, guards.values[owner])
+		assert.Equal(t, 1, guards.updateCount)
+	})
+}
+
+func TestCleanupTaggedGenerationRecoveryRejectsSaturatedTimestamp(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	producer := taggedGoGenerationClaim(
+		lifecycleConsumed, ^uint64(0), testProcessIncarnation,
+	)
+	cleanup := generationRecoveryCleanup(t)
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+	claims.values[key] = producer
+
+	require.Error(t, cleanup.recoverGoGenerationProducerHandoffs())
+	assert.Equal(t, producer, claims.values[key])
+	assert.NotContains(t, guards.values, owner)
+	assert.Zero(t, claims.updateCount)
+	assert.Zero(t, guards.updateCount)
+
+	t.Run("guard tail", func(t *testing.T) {
+		cleanup := generationRecoveryCleanup(t)
+		claims := cleanup.maps.claims.(*fakeBridgeMap)
+		guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+		guard := taggedGoGenerationClaim(
+			lifecyclePublishing, ^uint64(0), key.Generation,
+		)
+		guards.values[owner] = guard
+
+		require.Error(t, cleanup.recoverGoGenerationProducerHandoffs())
+		assert.Empty(t, claims.values)
+		assert.Equal(t, guard, guards.values[owner])
+		assert.Zero(t, guards.updateCount)
+	})
+
+	t.Run("claim and guard pair", func(t *testing.T) {
+		cleanup := generationRecoveryCleanup(t)
+		claims := cleanup.maps.claims.(*fakeBridgeMap)
+		guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+		claim := taggedGoGenerationClaim(
+			lifecycleConsumed, uint64(10*time.Second), testProcessIncarnation,
+		)
+		guard := taggedGoGenerationClaim(
+			lifecyclePublishing, ^uint64(0), key.Generation,
+		)
+		claims.values[key] = claim
+		guards.values[owner] = guard
+
+		require.Error(t, cleanup.recoverGoGenerationProducerHandoffs())
+		assert.Equal(t, claim, claims.values[key])
+		assert.Equal(t, guard, guards.values[owner])
+		assert.Zero(t, claims.updateCount)
+		assert.Zero(t, guards.updateCount)
+	})
+}
+
+func TestCleanupTaggedGenerationRecoveryAgesBeforePayloadMutation(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, key.Generation)}, nil, nil,
+	)
+	cleanup := testCleanup(handler)
+	cleanup.ttl = time.Second
+	now := 41 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+	cleanup.maps.claims.(*fakeBridgeMap).values[key] = taggedGoGenerationClaim(
+		lifecycleConsumed, uint64(10*time.Second), testProcessIncarnation,
+	)
+	cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner] = taggedGoGenerationClaim(
+		lifecyclePublishing, uint64(11*time.Second), key.Generation,
+	)
+	cleanup.maps.ambiguity.(*fakeBridgeMap).values[key] = uint64(12 * time.Second)
+
+	parentsBefore := maps.Clone(cleanup.maps.remoteParents.(*fakeBridgeMap).values)
+	statesBefore := maps.Clone(cleanup.maps.states.(*fakeBridgeMap).values)
+	generationsBefore := maps.Clone(cleanup.maps.generations.(*fakeBridgeMap).values)
+	connectionsBefore := maps.Clone(cleanup.maps.connections.(*fakeBridgeMap).values)
+	cookiesBefore := maps.Clone(cleanup.maps.cookieConnections.(*fakeBridgeMap).values)
+	stats, err := cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Equal(t, parentsBefore, cleanup.maps.remoteParents.(*fakeBridgeMap).values)
+	assert.Equal(t, statesBefore, cleanup.maps.states.(*fakeBridgeMap).values)
+	assert.Equal(t, generationsBefore, cleanup.maps.generations.(*fakeBridgeMap).values)
+	assert.Equal(t, connectionsBefore, cleanup.maps.connections.(*fakeBridgeMap).values)
+	assert.Equal(t, cookiesBefore, cleanup.maps.cookieConnections.(*fakeBridgeMap).values)
+	assert.True(t, validGenerationCleanupClaim(
+		cleanup.maps.claims.(*fakeBridgeMap).values[key].(generationClaim),
+	))
+	assert.True(t, validGenerationCleanupGuard(
+		owner, cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner].(generationClaim),
+	))
+
+	now = 43 * time.Second
+	var total CleanupStats
+	for range 4 {
+		stats, err = cleanup.SweepWithStats()
+		require.NoError(t, err)
+		total.Cleaned += stats.Cleaned
+		total.Evicted += stats.Evicted
+	}
+	assert.Equal(t, CleanupStats{Cleaned: 1}, total)
+	assert.NotContains(t, cleanup.maps.remoteParents.(*fakeBridgeMap).values, owner)
+	assert.NotContains(t, cleanup.maps.states.(*fakeBridgeMap).values, key)
+	assert.NotContains(t, cleanup.maps.generations.(*fakeBridgeMap).values, key)
+	assert.NotContains(t, cleanup.maps.claims.(*fakeBridgeMap).values, key)
+	assert.NotContains(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values, owner)
+	assert.NotContains(t, cleanup.maps.ambiguity.(*fakeBridgeMap).values, key)
 }
 
 func TestNewCleanupRejectsNilGenerationCoordinator(t *testing.T) {

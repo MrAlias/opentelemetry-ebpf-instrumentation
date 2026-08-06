@@ -8,8 +8,10 @@ package javabridge // import "go.opentelemetry.io/obi/pkg/internal/javabridge"
 import "sync"
 
 // GenerationCoordinator excludes userspace cleanup while a Java bridge request
-// can own or mutate generation state. BPF producers use their map fences and
-// post-publication revalidation instead of this process-local lock.
+// can own or mutate generation state. Every userspace handler and Cleanup that
+// shares one internal map set must share this coordinator. BPF producers use
+// their map fences and post-publication revalidation instead of this
+// process-local lock.
 type GenerationCoordinator struct {
 	mu sync.RWMutex
 }

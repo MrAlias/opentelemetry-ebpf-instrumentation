@@ -200,6 +200,20 @@ func TestCleanupStatsCountGenerationOnce(t *testing.T) {
 	assert.Equal(t, CleanupStats{}, stats)
 }
 
+func TestCleanupPreservesLiveGenerationReservation(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, 10)}, nil, nil,
+	)
+	cleanup := testCleanup(handler)
+	key := stateKey{Owner: owner, Generation: 10}
+
+	stats, err := cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Equal(t, uint64(0), cleanup.maps.ambiguity.(*fakeBridgeMap).values[key])
+}
+
 func TestCleanupPreservesGenerationObservedDuringEnumeration(t *testing.T) {
 	owner := Identity{TID: 3, PID: 2, Namespace: 1}
 	encoded := validEncodedRecordObservedAt(t, 10, 10*time.Second)

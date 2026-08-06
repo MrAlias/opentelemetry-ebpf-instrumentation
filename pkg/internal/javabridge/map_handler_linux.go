@@ -529,10 +529,14 @@ func (h *MapHandler) validatePublishedGeneration(
 
 	var markedAt uint64
 	if err := h.ambiguity.Lookup(&key, &markedAt); err == nil {
-		if !allowAmbiguous {
+		if markedAt != 0 && !allowAmbiguous {
 			return stateValue{}, Record{}, StatusAmbiguous
 		}
-	} else if !errors.Is(err, ebpf.ErrKeyNotExist) {
+	} else if errors.Is(err, ebpf.ErrKeyNotExist) {
+		// Active and detached generations are valid only while their exact
+		// zero-valued reservation remains present.
+		return stateValue{}, Record{}, StatusAmbiguous
+	} else {
 		return stateValue{}, Record{}, StatusTransportError
 	}
 
@@ -826,7 +830,15 @@ func (h *MapHandler) generationAmbiguous(candidate resolvedCandidate) (bool, boo
 	key := stateKey{Owner: candidate.Owner, Generation: candidate.Generation}
 	var markedAt uint64
 	if err := h.ambiguity.Lookup(&key, &markedAt); err != nil {
-		return false, !errors.Is(err, ebpf.ErrKeyNotExist)
+		if !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return false, true
+		}
+		// Live state without its exact reservation is structurally ambiguous;
+		// terminal-only state is complete only after the reservation is absent.
+		return candidate.Lifecycle == 0, false
+	}
+	if candidate.Lifecycle == 0 {
+		return markedAt != 0, false
 	}
 	return true, false
 }
@@ -841,39 +853,18 @@ func (h *MapHandler) markAmbiguous(candidate resolvedCandidate) bool {
 	}
 	markedAt := uint64(now)
 	key := stateKey{Owner: candidate.Owner, Generation: candidate.Generation}
-	if err := h.ambiguity.Update(&key, &markedAt, ebpf.UpdateAny); err != nil {
+	var current uint64
+	if err := h.ambiguity.Lookup(&key, &current); err == nil {
+		if current != 0 {
+			return true
+		}
+		_ = h.ambiguity.Update(&key, &markedAt, ebpf.UpdateExist)
+	} else if errors.Is(err, ebpf.ErrKeyNotExist) {
+		_ = h.ambiguity.Update(&key, &markedAt, ebpf.UpdateNoExist)
+	} else {
 		return false
 	}
-
-	var indexed ownerValue
-	if err := h.owners.Lookup(&candidate.Owner, &indexed); err != nil {
-		if !errors.Is(err, ebpf.ErrKeyNotExist) {
-			_ = h.ambiguity.Delete(&key)
-			return false
-		}
-		if !h.preservedTaskGeneration(candidate) {
-			_ = h.ambiguity.Delete(&key)
-		}
-		return true
-	}
-	if indexed.Generation != candidate.Generation ||
-		indexed.ProcessIncarnation != candidate.ProcessIncarnation {
-		if !h.preservedTaskGeneration(candidate) {
-			_ = h.ambiguity.Delete(&key)
-		}
-	}
-	return true
-}
-
-func (h *MapHandler) preservedTaskGeneration(candidate resolvedCandidate) bool {
-	key := stateKey{Owner: candidate.Owner, Generation: candidate.Generation}
-	var state stateValue
-	if err := h.states.Lookup(&key, &state); err != nil {
-		return false
-	}
-	return state.Lifecycle == lifecycleActive && state.Reserved == ([3]byte{}) &&
-		state.Aliases > 0 && state.ProcessIncarnation == candidate.ProcessIncarnation &&
-		state.ObservedMonotonicNS > 0
+	return h.ambiguity.Lookup(&key, &current) == nil && current != 0
 }
 
 func (h *MapHandler) authorizeProcess(

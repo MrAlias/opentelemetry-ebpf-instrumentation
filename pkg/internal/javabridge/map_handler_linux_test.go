@@ -33,6 +33,7 @@ type fakeBridgeMap struct {
 	iterateErr   error
 	afterIterate func()
 	afterLookup  func(int)
+	beforeUpdate func(any, any, ebpf.MapUpdateFlags)
 	afterUpdate  func(any, any)
 	afterDelete  func(any)
 }
@@ -107,11 +108,19 @@ func (m *fakeBridgeMap) Update(key, value any, flags ebpf.MapUpdateFlags) error 
 		return err
 	}
 	mapKey := indirectValue(key)
-	if _, exists := m.values[mapKey]; exists && flags == ebpf.UpdateNoExist {
+	mapValue := indirectValue(value)
+	if m.beforeUpdate != nil {
+		m.beforeUpdate(mapKey, mapValue, flags)
+	}
+	_, exists := m.values[mapKey]
+	if exists && flags == ebpf.UpdateNoExist {
 		m.mu.Unlock()
 		return ebpf.ErrKeyExist
 	}
-	mapValue := indirectValue(value)
+	if !exists && flags == ebpf.UpdateExist {
+		m.mu.Unlock()
+		return ebpf.ErrKeyNotExist
+	}
 	m.values[mapKey] = mapValue
 	afterUpdate := m.afterUpdate
 	m.mu.Unlock()
@@ -176,6 +185,81 @@ func TestMapHandlerKernelMapLayouts(t *testing.T) {
 	assert.Equal(t, uintptr(32), unsafe.Sizeof(terminalValue{}))
 	assert.Equal(t, uintptr(32), unsafe.Sizeof(generationIndexValue{}))
 	assert.Equal(t, uintptr(24), unsafe.Sizeof(generationClaim{}))
+}
+
+func TestFakeBridgeMapHonorsUpdateFlags(t *testing.T) {
+	m := &fakeBridgeMap{values: make(map[any]any)}
+	key := stateKey{Generation: 10}
+	value := uint64(1)
+
+	require.ErrorIs(t, m.Update(&key, &value, ebpf.UpdateExist), ebpf.ErrKeyNotExist)
+	require.NoError(t, m.Update(&key, &value, ebpf.UpdateNoExist))
+	replacement := uint64(2)
+	require.ErrorIs(t, m.Update(&key, &replacement, ebpf.UpdateNoExist), ebpf.ErrKeyExist)
+	assert.Equal(t, value, m.values[key])
+}
+
+func TestMapHandlerGenerationReservationTruthTable(t *testing.T) {
+	identity := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: identity, Generation: 10}
+
+	tests := []struct {
+		name      string
+		lifecycle uint8
+		present   bool
+		markedAt  uint64
+		ambiguous bool
+	}{
+		{name: "live missing", ambiguous: true},
+		{name: "live reserved", present: true},
+		{name: "live fenced", present: true, markedAt: 1, ambiguous: true},
+		{name: "terminal missing", lifecycle: lifecycleConsumed},
+		{name: "terminal reserved", lifecycle: lifecycleConsumed, present: true, ambiguous: true},
+		{
+			name: "terminal fenced", lifecycle: lifecycleConsumed, present: true, markedAt: 1,
+			ambiguous: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler := testMapHandler(nil, nil, nil)
+			if test.present {
+				handler.ambiguity.(*fakeBridgeMap).values[key] = test.markedAt
+			}
+			ambiguous, failed := handler.generationAmbiguous(resolvedCandidate{
+				Owner: identity, Generation: key.Generation, Lifecycle: test.lifecycle,
+			})
+			assert.False(t, failed)
+			assert.Equal(t, test.ambiguous, ambiguous)
+		})
+	}
+}
+
+func TestMapHandlerMarkAmbiguousPromotesReservation(t *testing.T) {
+	identity := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: identity, Generation: 10}
+	handler := testMapHandler(nil, nil, nil)
+	ambiguity := handler.ambiguity.(*fakeBridgeMap)
+	ambiguity.values[key] = uint64(0)
+
+	assert.True(t, handler.markAmbiguous(resolvedCandidate{Owner: identity, Generation: 10}))
+	assert.Equal(t, uint64(11*time.Second), ambiguity.values[key])
+}
+
+func TestMapHandlerMarkAmbiguousAcceptsConcurrentFence(t *testing.T) {
+	identity := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: identity, Generation: 10}
+	handler := testMapHandler(nil, nil, nil)
+	ambiguity := handler.ambiguity.(*fakeBridgeMap)
+	concurrentMarker := uint64(12 * time.Second)
+	ambiguity.beforeUpdate = func(mapKey, _ any, flags ebpf.MapUpdateFlags) {
+		require.Equal(t, key, mapKey)
+		require.Equal(t, ebpf.UpdateNoExist, flags)
+		ambiguity.values[mapKey] = concurrentMarker
+	}
+
+	assert.True(t, handler.markAmbiguous(resolvedCandidate{Owner: identity, Generation: 10}))
+	assert.Equal(t, concurrentMarker, ambiguity.values[key])
 }
 
 func TestNewMapHandlerRequiresGenerationCoordinator(t *testing.T) {
@@ -1883,6 +1967,10 @@ func seedOwnerStateWithIncarnation(
 	generation uint64,
 	processIncarnation uint64,
 ) {
+	key := stateKey{Owner: identity, Generation: generation}
+	if _, exists := handler.ambiguity.(*fakeBridgeMap).values[key]; !exists {
+		handler.ambiguity.(*fakeBridgeMap).values[key] = uint64(0)
+	}
 	encoded := handler.remoteParents.(*fakeBridgeMap).values[identity].([RecordSize]byte)
 	record, _ := UnmarshalRecord(encoded[:])
 	connection := connectionInfo{
@@ -1900,7 +1988,7 @@ func seedOwnerStateWithIncarnation(
 		ProcessIncarnation: processIncarnation,
 		Lifecycle:          lifecycleActive,
 	}
-	handler.states.(*fakeBridgeMap).values[stateKey{Owner: identity, Generation: generation}] = stateValue{
+	handler.states.(*fakeBridgeMap).values[key] = stateValue{
 		Lifecycle:           lifecycleActive,
 		ObservedMonotonicNS: record.ObservedMonotonicNS,
 		Connection:          connection,
@@ -1908,9 +1996,7 @@ func seedOwnerStateWithIncarnation(
 		ProcessIncarnation:  processIncarnation,
 		Response:            encoded,
 	}
-	handler.generations.(*fakeBridgeMap).values[stateKey{
-		Owner: identity, Generation: generation,
-	}] = generationIndexValue{
+	handler.generations.(*fakeBridgeMap).values[key] = generationIndexValue{
 		Process:             javaProcessIdentity(identity),
 		ProcessIncarnation:  processIncarnation,
 		ObservedMonotonicNS: record.ObservedMonotonicNS,

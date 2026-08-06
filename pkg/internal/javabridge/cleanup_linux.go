@@ -883,6 +883,12 @@ func (c *Cleanup) sweepOrphans(
 	}
 	ambiguityNow := c.monoTimeNow()
 	for _, entry := range ambiguity {
+		if entry.value == 0 {
+			// Zero is the live generation reservation published before the
+			// generation's reusable indexes. It carries no timestamp and cannot
+			// be aged out independently of a coordinated teardown fence.
+			continue
+		}
 		_, generationCleaned := cleanedGenerations[entry.key]
 		if !generationCleaned && !cleanupExpired(ambiguityNow, entry.value, c.ttl) {
 			continue

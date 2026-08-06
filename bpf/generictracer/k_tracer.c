@@ -734,7 +734,7 @@ static __always_inline bool is_conn_unreadable(const connection_info_t *conn) {
     return is_port_unreadable(conn->d_port) || is_port_unreadable(conn->s_port);
 }
 
-static __always_inline void java_remote_parent_close_socket(struct sock *sk) {
+static __noinline void java_remote_parent_close_socket(struct sock *sk) {
     if (!java_remote_parent_enabled) {
         return;
     }
@@ -767,8 +767,8 @@ static __always_inline void java_remote_parent_close_socket(struct sock *sk) {
     }
 }
 
-SEC("kprobe/tcp_close")
-int BPF_KPROBE(obi_kprobe_tcp_close, struct sock *sk, long timeout) {
+static __noinline int
+java_remote_parent_tcp_close_main(struct pt_regs *ctx, struct sock *sk, long timeout) {
     (void)ctx;
     (void)timeout;
 
@@ -777,8 +777,6 @@ int BPF_KPROBE(obi_kprobe_tcp_close, struct sock *sk, long timeout) {
     if (!valid_pid(id)) {
         return 0;
     }
-
-    java_remote_parent_close_socket(sk);
 
     u64 sock_p = (u64)sk;
 
@@ -831,6 +829,12 @@ int BPF_KPROBE(obi_kprobe_tcp_close, struct sock *sk, long timeout) {
     bpf_map_delete_elem(&active_send_sock_args, &sock_p);
 
     return 0;
+}
+
+SEC("kprobe/tcp_close")
+int BPF_KPROBE(obi_kprobe_tcp_close, struct sock *sk, long timeout) {
+    java_remote_parent_close_socket(sk);
+    return java_remote_parent_tcp_close_main(ctx, sk, timeout);
 }
 
 SEC("kprobe/sock_def_error_report")

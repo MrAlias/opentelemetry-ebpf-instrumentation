@@ -29,12 +29,13 @@ static unsigned long long test_ktime_get_ns(void);
 
 static connection_info_ns_t staged_key;
 static connection_info_netns_cookie_t cookie_staged_key;
-static java_remote_parent_connection_keys_t connection_keys_scratch;
-static java_remote_parent_connection_t connection_value_scratch;
 static java_remote_parent_connection_t staged_connection;
 static java_remote_parent_connection_t cookie_staged_connection;
 static java_remote_parent_owner_t indexed_owner;
 static java_remote_parent_key_t ambiguous_key;
+static u64 ambiguity_observed_monotime_ns;
+static java_remote_parent_key_t stored_claim_key;
+static java_remote_parent_claim_t stored_claim;
 static java_remote_parent_response_t fallback_record;
 static int staged_present;
 static int cookie_staged_present;
@@ -42,6 +43,7 @@ static int owner_present;
 static int ambiguity_present;
 static int fallback_present;
 static int claim_present;
+static int reject_claim_update;
 
 static void fail(const char *message) {
     fprintf(stderr, "FAIL: %s\n", message);
@@ -52,13 +54,15 @@ static int same_owner(const pid_key_t *left, const pid_key_t *right) {
     return memcmp(left, right, sizeof(*left)) == 0;
 }
 
+static int ambiguity_reserved(void) {
+    return ambiguity_present && !ambiguity_observed_monotime_ns;
+}
+
+static int ambiguity_marked(void) {
+    return ambiguity_present && ambiguity_observed_monotime_ns;
+}
+
 static void *test_map_lookup(void *map, const void *key) {
-    if (map == &java_remote_parent_connection_keys_storage) {
-        return &connection_keys_scratch;
-    }
-    if (map == &java_remote_parent_connection_value_storage) {
-        return &connection_value_scratch;
-    }
     if (map == &java_remote_parent_connections && staged_present &&
         memcmp(key, &staged_key, sizeof(staged_key)) == 0) {
         return &staged_connection;
@@ -73,11 +77,11 @@ static void *test_map_lookup(void *map, const void *key) {
     }
     if (map == &java_remote_parent_ambiguity && ambiguity_present &&
         memcmp(key, &ambiguous_key, sizeof(ambiguous_key)) == 0) {
-        return &ambiguous_key.generation;
+        return &ambiguity_observed_monotime_ns;
     }
     if (map == &java_remote_parent_claims && claim_present &&
-        memcmp(key, &ambiguous_key, sizeof(ambiguous_key)) == 0) {
-        return &ambiguous_key.generation;
+        memcmp(key, &stored_claim_key, sizeof(stored_claim_key)) == 0) {
+        return &stored_claim;
     }
     if (map == &java_remote_parent_fallback && fallback_present &&
         same_owner(key, &staged_connection.owner)) {
@@ -88,13 +92,21 @@ static void *test_map_lookup(void *map, const void *key) {
 
 static long
 test_map_update(void *map, const void *key, const void *value, unsigned long long flags) {
-    (void)value;
-    if (map != &java_remote_parent_ambiguity || flags != BPF_ANY) {
-        return -1;
+    if (map == &java_remote_parent_claims && flags == BPF_NOEXIST && !claim_present &&
+        !reject_claim_update) {
+        stored_claim_key = *(const java_remote_parent_key_t *)key;
+        stored_claim = *(const java_remote_parent_claim_t *)value;
+        claim_present = 1;
+        return 0;
     }
-    ambiguous_key = *(const java_remote_parent_key_t *)key;
-    ambiguity_present = 1;
-    return 0;
+    if (map == &java_remote_parent_ambiguity && (flags == BPF_ANY || flags == BPF_NOEXIST) &&
+        !(flags == BPF_NOEXIST && ambiguity_present)) {
+        ambiguous_key = *(const java_remote_parent_key_t *)key;
+        ambiguity_observed_monotime_ns = *(const u64 *)value;
+        ambiguity_present = 1;
+        return 0;
+    }
+    return -1;
 }
 
 static long test_map_delete(void *map, const void *key) {
@@ -118,6 +130,11 @@ static long test_map_delete(void *map, const void *key) {
         fallback_present = 0;
         return 0;
     }
+    if (map == &java_remote_parent_claims && claim_present &&
+        memcmp(key, &stored_claim_key, sizeof(stored_claim_key)) == 0) {
+        claim_present = 0;
+        return 0;
+    }
     return -1;
 }
 
@@ -132,6 +149,9 @@ static void reset_state(const connection_info_t *connection,
     memset(&staged_connection, 0, sizeof(staged_connection));
     memset(&indexed_owner, 0, sizeof(indexed_owner));
     memset(&ambiguous_key, 0, sizeof(ambiguous_key));
+    ambiguity_observed_monotime_ns = 0;
+    memset(&stored_claim_key, 0, sizeof(stored_claim_key));
+    memset(&stored_claim, 0, sizeof(stored_claim));
     memset(&fallback_record, 0, sizeof(fallback_record));
 
     staged_key = connection_info_with_netns(connection, netns);
@@ -144,15 +164,21 @@ static void reset_state(const connection_info_t *connection,
     staged_connection.socket_cookie = 86;
     cookie_staged_connection = staged_connection;
     indexed_owner.generation = staged_connection.generation;
+    indexed_owner.process_incarnation = 9;
     indexed_owner.lifecycle = k_java_remote_parent_lifecycle_active;
+    ambiguous_key = (java_remote_parent_key_t){
+        .owner = staged_connection.owner,
+        .generation = staged_connection.generation,
+    };
     java_remote_parent_init_response(
         &fallback_record, k_java_remote_parent_status_valid, staged_connection.generation, 1);
     staged_present = 1;
     cookie_staged_present = 1;
     owner_present = 1;
-    ambiguity_present = 0;
+    ambiguity_present = 1;
     fallback_present = 1;
     claim_present = 0;
+    reject_claim_update = 0;
 }
 
 static void test_connection_close_invalidates_staged_generation(void) {
@@ -167,7 +193,7 @@ static void test_connection_close_invalidates_staged_generation(void) {
     if (staged_present || cookie_staged_present) {
         fail("sockops close preserved a staged connection index");
     }
-    if (!ambiguity_present || ambiguous_key.generation != staged_connection.generation ||
+    if (!ambiguity_marked() || ambiguous_key.generation != staged_connection.generation ||
         !same_owner(&ambiguous_key.owner, &staged_connection.owner)) {
         fail("connection close did not invalidate the staged generation");
     }
@@ -176,7 +202,7 @@ static void test_connection_close_invalidates_staged_generation(void) {
     }
 }
 
-static void test_orphaned_connection_close_removes_fallback(void) {
+static void test_orphaned_connection_close_quarantines_and_cleans_indexes(void) {
     const connection_info_t connection = {
         .s_port = 1234,
         .d_port = 443,
@@ -186,8 +212,9 @@ static void test_orphaned_connection_close_removes_fallback(void) {
 
     java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(&connection, 84, 86, 0);
 
-    if (staged_present || cookie_staged_present || ambiguity_present || fallback_present) {
-        fail("orphaned close did not fail closed");
+    if (staged_present || cookie_staged_present || !ambiguity_marked() || !fallback_present ||
+        claim_present) {
+        fail("orphaned close did not quarantine and clean its physical indexes");
     }
 }
 
@@ -200,7 +227,7 @@ static void test_other_incoming_generation_does_not_invalidate_stage(void) {
 
     java_remote_parent_mark_connection_ambiguous_in_netns_cookie(&connection, 84, 22);
 
-    if (!staged_present || !cookie_staged_present || ambiguity_present) {
+    if (!staged_present || !cookie_staged_present || !ambiguity_reserved()) {
         fail("another incoming generation invalidated the staged request");
     }
 }
@@ -214,7 +241,7 @@ static void test_matching_incoming_generation_invalidates_stage(void) {
 
     java_remote_parent_mark_connection_ambiguous_in_netns_cookie(&connection, 84, 21);
 
-    if (staged_present || cookie_staged_present || !ambiguity_present) {
+    if (staged_present || cookie_staged_present || !ambiguity_marked()) {
         fail("matching incoming generation did not invalidate the staged request");
     }
 }
@@ -298,12 +325,12 @@ static void test_delayed_close_preserves_reused_physical_connection(void) {
     cookie_staged_connection.socket_cookie = 87;
 
     java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(&connection, 84, 86, 0);
-    if (!staged_present || !cookie_staged_present || ambiguity_present || !fallback_present) {
+    if (!staged_present || !cookie_staged_present || !ambiguity_reserved() || !fallback_present) {
         fail("delayed close invalidated a physically different replacement connection");
     }
 
     java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(&connection, 84, 87, 0);
-    if (staged_present || cookie_staged_present || !ambiguity_present || !fallback_present) {
+    if (staged_present || cookie_staged_present || !ambiguity_marked() || !fallback_present) {
         fail("matching physical close did not invalidate its staged connection");
     }
 }
@@ -320,7 +347,7 @@ static void test_full_width_network_namespace_cookie_is_required(void) {
     java_remote_parent_mark_connection_ambiguous_in_netns_cookie(
         &connection, colliding_low_bits, 21);
 
-    if (!staged_present || !cookie_staged_present || ambiguity_present) {
+    if (!staged_present || !cookie_staged_present || !ambiguity_reserved()) {
         fail("a low-32-bit namespace cookie collision invalidated the staged request");
     }
 }
@@ -331,22 +358,44 @@ static void test_claimed_stage_owns_close_race(void) {
         .d_port = 443,
     };
     reset_state(&connection, 42, 84, 21);
-    ambiguous_key = (java_remote_parent_key_t){
+    stored_claim_key = (java_remote_parent_key_t){
         .owner = staged_connection.owner,
         .generation = staged_connection.generation,
+    };
+    stored_claim = (java_remote_parent_claim_t){
+        .observed_monotime_ns = 122,
+        .process_incarnation = indexed_owner.process_incarnation,
+        .lifecycle = k_java_remote_parent_lifecycle_publishing,
     };
     claim_present = 1;
 
     java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(&connection, 84, 86, 0);
 
-    if (!staged_present || !cookie_staged_present || ambiguity_present || !fallback_present) {
+    if (!staged_present || !cookie_staged_present || !ambiguity_marked() || !fallback_present ||
+        !claim_present) {
         fail("close raced incorrectly with an owned Java retrieval");
+    }
+}
+
+static void test_claim_pressure_preserves_ambiguous_physical_generation(void) {
+    const connection_info_t connection = {
+        .s_port = 1234,
+        .d_port = 443,
+    };
+    reset_state(&connection, 42, 84, 21);
+    reject_claim_update = 1;
+
+    java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(&connection, 84, 86, 0);
+
+    if (!staged_present || !cookie_staged_present || !ambiguity_marked() || !fallback_present ||
+        claim_present) {
+        fail("claim pressure exposed or deleted an unowned physical generation");
     }
 }
 
 int main(void) {
     test_connection_close_invalidates_staged_generation();
-    test_orphaned_connection_close_removes_fallback();
+    test_orphaned_connection_close_quarantines_and_cleans_indexes();
     test_other_incoming_generation_does_not_invalidate_stage();
     test_matching_incoming_generation_invalidates_stage();
     test_connection_match_requires_consistent_indexes();
@@ -354,5 +403,6 @@ int main(void) {
     test_delayed_close_preserves_reused_physical_connection();
     test_full_width_network_namespace_cookie_is_required();
     test_claimed_stage_owns_close_race();
+    test_claim_pressure_preserves_ambiguous_physical_generation();
     return 0;
 }

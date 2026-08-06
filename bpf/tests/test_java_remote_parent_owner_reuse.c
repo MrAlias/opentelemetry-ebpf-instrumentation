@@ -238,6 +238,8 @@ static int ambiguity_delete_failures;
 static int replace_ambiguity_after_update;
 static int exact_claim_delete_absent_on_failure;
 static int inject_claim_after_detach_guard_delete;
+static int inject_claim_before_exact_update;
+static java_remote_parent_claim_t claim_before_exact_update;
 static int inject_ambiguity_after_detach_guard_delete;
 static int inject_connection_after_detach_guard_delete;
 static int complete_take_after_detach_guard_delete;
@@ -625,6 +627,14 @@ test_map_update(void *map, const void *key, const void *value, unsigned long lon
                 current_task = saved_task;
             }
             return 0;
+        }
+        if (inject_claim_before_exact_update) {
+            inject_claim_before_exact_update = 0;
+            stored_claim_key = *claim_key;
+            stored_claim = claim_before_exact_update;
+            claim_present = 1;
+            exact_claim_update_attempts++;
+            return -1;
         }
         if (claim_present && same_key(key, &stored_claim_key, sizeof(stored_claim_key))) {
             return -1;
@@ -1150,6 +1160,8 @@ static void seed_generation(const connection_info_t *connection) {
     replace_ambiguity_after_update = 0;
     exact_claim_delete_absent_on_failure = 0;
     inject_claim_after_detach_guard_delete = 0;
+    inject_claim_before_exact_update = 0;
+    memset(&claim_before_exact_update, 0, sizeof(claim_before_exact_update));
     inject_ambiguity_after_detach_guard_delete = 0;
     inject_connection_after_detach_guard_delete = 0;
     complete_take_after_detach_guard_delete = 0;
@@ -2182,6 +2194,29 @@ static void test_alias_observation_rejects_same_generation_reuse(void) {
     }
 }
 
+static int task_retrieval_rejects_authority(const java_remote_parent_response_t *stale_response,
+                                            const connection_info_t *connection,
+                                            u32 connection_netns,
+                                            u64 generation,
+                                            u64 socket_cookie,
+                                            u64 response_generation) {
+    java_remote_parent_response_t response = *stale_response;
+    const enum java_remote_parent_status status =
+        java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   connection,
+                                                   connection_netns,
+                                                   generation,
+                                                   socket_cookie);
+    java_remote_parent_response_t expected = {0};
+    java_remote_parent_init_response(
+        &expected, k_java_remote_parent_status_missing, response_generation, 0);
+    return status == k_java_remote_parent_status_missing &&
+           memcmp(&response, &expected, sizeof(response)) == 0;
+}
+
 static void test_detached_task_bridge_preserves_same_socket_replacement(void) {
     const connection_info_t connection = {.s_port = 1234, .d_port = 443};
     seed_generation(&connection);
@@ -2256,6 +2291,151 @@ static void test_detached_task_bridge_preserves_same_socket_replacement(void) {
         stored_terminal.lifecycle != k_java_remote_parent_lifecycle_consumed || !task_present ||
         unexpected_update || unexpected_delete) {
         fail("detached task TAKE disturbed a same-socket replacement generation");
+    }
+
+    const java_remote_parent_response_t stale_response = response;
+    connection_info_t wrong_connection = connection;
+    wrong_connection.d_port++;
+    if (!task_retrieval_rejects_authority(&stale_response,
+                                          &connection,
+                                          test_connection_netns,
+                                          test_replacement_generation,
+                                          test_socket_cookie,
+                                          test_generation) ||
+        !task_retrieval_rejects_authority(&stale_response,
+                                          &wrong_connection,
+                                          test_connection_netns,
+                                          test_generation,
+                                          test_socket_cookie,
+                                          test_generation) ||
+        !task_retrieval_rejects_authority(&stale_response,
+                                          &connection,
+                                          test_connection_netns + 1,
+                                          test_generation,
+                                          test_socket_cookie,
+                                          test_generation) ||
+        !task_retrieval_rejects_authority(&stale_response,
+                                          &connection,
+                                          test_connection_netns,
+                                          test_generation,
+                                          test_replacement_socket_cookie,
+                                          test_generation) ||
+        stats[k_java_remote_parent_stat_take_missing] != 5 ||
+        !exact_finish_fences_retained(&stored_state_key, k_java_remote_parent_lifecycle_consumed) ||
+        !replacement_state_present || !replacement_generation_index_present ||
+        !replacement_connection_present || !replacement_cookie_connection_present ||
+        unexpected_update || unexpected_delete) {
+        fail("retained claim accepted mismatched task retrieval authority");
+    }
+
+    memset(&response, 0, sizeof(response));
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_already_consumed ||
+        response.status != k_java_remote_parent_status_already_consumed ||
+        java_remote_parent_le64_to_cpu(response.generation_le) != test_generation ||
+        !exact_finish_fences_retained(&stored_state_key, k_java_remote_parent_lifecycle_consumed) ||
+        !replacement_state_present || !replacement_generation_index_present ||
+        !replacement_connection_present || !replacement_cookie_connection_present ||
+        stats[k_java_remote_parent_stat_take_already_consumed] != 1 || unexpected_update ||
+        unexpected_delete) {
+        fail("repeated detached task TAKE did not preserve an already-consumed claim");
+    }
+
+    memset(&response, 0, sizeof(response));
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   1,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_already_consumed ||
+        response.status != k_java_remote_parent_status_already_consumed ||
+        java_remote_parent_le64_to_cpu(response.generation_le) != test_generation ||
+        !exact_finish_fences_retained(&stored_state_key, k_java_remote_parent_lifecycle_consumed) ||
+        !replacement_state_present || !replacement_generation_index_present ||
+        !replacement_connection_present || !replacement_cookie_connection_present ||
+        stats[k_java_remote_parent_stat_discard_already_consumed] != 1 || unexpected_update ||
+        unexpected_delete) {
+        fail("repeated detached task DISCARD did not preserve an already-consumed claim");
+    }
+
+    current_task = test_owner;
+    memset(&response, 0, sizeof(response));
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_direct,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_replacement_generation,
+                                                   test_replacement_socket_cookie) !=
+            k_java_remote_parent_status_overload ||
+        response.status != k_java_remote_parent_status_overload ||
+        java_remote_parent_le64_to_cpu(response.generation_le) != test_replacement_generation ||
+        !exact_finish_fences_retained(&stored_state_key, k_java_remote_parent_lifecycle_consumed) ||
+        !replacement_state_present || !replacement_generation_index_present ||
+        !replacement_connection_present || !replacement_cookie_connection_present ||
+        stats[k_java_remote_parent_stat_take_overload] != 1 || unexpected_update ||
+        unexpected_delete) {
+        fail("retained owner guard did not overload the replacement generation");
+    }
+}
+
+static void test_task_claim_binding_rejects_reserved_state(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    if (!java_remote_parent_detach_exact_receive_generation(&stored_state_key,
+                                                            test_process_incarnation,
+                                                            &connection,
+                                                            test_connection_netns,
+                                                            test_socket_cookie)) {
+        fail("could not detach task generation for metadata validation");
+    }
+    stored_state.reserved[2] = 1;
+    stored_claim_key = stored_state_key;
+    stored_claim = (java_remote_parent_claim_t){
+        .observed_monotime_ns = test_now_ns,
+        .process_incarnation = test_process_incarnation,
+        .lifecycle = k_java_remote_parent_lifecycle_consumed,
+    };
+    claim_present = 1;
+    ambiguities[0].key = stored_state_key;
+    ambiguities[0].observed_monotime_ns = test_now_ns;
+    ambiguities[0].present = 1;
+    current_task = test_child;
+
+    java_remote_parent_response_t response = stored_state.response;
+    const enum java_remote_parent_status status =
+        java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie);
+    java_remote_parent_response_t expected = {0};
+    java_remote_parent_init_response(
+        &expected, k_java_remote_parent_status_missing, test_generation, 0);
+    if (status != k_java_remote_parent_status_missing ||
+        memcmp(&response, &expected, sizeof(response)) != 0 || !state_present ||
+        stored_state.aliases != 1 || !generation_index_present || owner_present ||
+        fallback_present || connection_present || cookie_connection_present || !task_present ||
+        !claim_present || terminal_present || !find_ambiguity(&stored_state_key) ||
+        stats[k_java_remote_parent_stat_take_missing] != 1 ||
+        stats[k_java_remote_parent_stat_take_already_consumed] != 0 || unexpected_update ||
+        unexpected_delete) {
+        fail("reserved task state authorized a retained claim outcome");
     }
 }
 
@@ -2416,6 +2596,265 @@ static void test_internal_cleanup_claim_is_transient(void) {
         stats[k_java_remote_parent_stat_take_already_consumed] != 0 || unexpected_update ||
         unexpected_delete) {
         fail("terminal-free cleanup claim surfaced as an already-consumed outcome");
+    }
+}
+
+static void test_generation_claim_status_validation(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    const struct {
+        const char *name;
+        java_remote_parent_claim_t claim;
+        enum java_remote_parent_status status;
+        enum java_remote_parent_stat take_stat;
+        enum java_remote_parent_stat discard_stat;
+    } cases[] = {
+        {
+            .name = "publishing claim was not overload",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_publishing,
+                },
+            .status = k_java_remote_parent_status_overload,
+            .take_stat = k_java_remote_parent_stat_take_overload,
+            .discard_stat = k_java_remote_parent_stat_discard_overload,
+        },
+        {
+            .name = "ambiguous claim was not ambiguous",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_ambiguous,
+                },
+            .status = k_java_remote_parent_status_ambiguous,
+            .take_stat = k_java_remote_parent_stat_take_ambiguous,
+            .discard_stat = k_java_remote_parent_stat_discard_ambiguous,
+        },
+        {
+            .name = "consumed claim was not already consumed",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_consumed,
+                },
+            .status = k_java_remote_parent_status_already_consumed,
+            .take_stat = k_java_remote_parent_stat_take_already_consumed,
+            .discard_stat = k_java_remote_parent_stat_discard_already_consumed,
+        },
+        {
+            .name = "discarded claim was not already consumed",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_discarded,
+                },
+            .status = k_java_remote_parent_status_already_consumed,
+            .take_stat = k_java_remote_parent_stat_take_already_consumed,
+            .discard_stat = k_java_remote_parent_stat_discard_already_consumed,
+        },
+        {
+            .name = "stale claim was not already consumed",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_stale,
+                },
+            .status = k_java_remote_parent_status_already_consumed,
+            .take_stat = k_java_remote_parent_stat_take_already_consumed,
+            .discard_stat = k_java_remote_parent_stat_discard_already_consumed,
+        },
+        {
+            .name = "zero-timestamp claim was not ambiguous",
+            .claim =
+                {
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_consumed,
+                },
+            .status = k_java_remote_parent_status_ambiguous,
+            .take_stat = k_java_remote_parent_stat_take_ambiguous,
+            .discard_stat = k_java_remote_parent_stat_discard_ambiguous,
+        },
+        {
+            .name = "foreign-incarnation claim was not ambiguous",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation + 1,
+                    .lifecycle = k_java_remote_parent_lifecycle_consumed,
+                },
+            .status = k_java_remote_parent_status_ambiguous,
+            .take_stat = k_java_remote_parent_stat_take_ambiguous,
+            .discard_stat = k_java_remote_parent_stat_discard_ambiguous,
+        },
+        {
+            .name = "reserved claim was not ambiguous",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_consumed,
+                    .reserved = {[6] = 1},
+                },
+            .status = k_java_remote_parent_status_ambiguous,
+            .take_stat = k_java_remote_parent_stat_take_ambiguous,
+            .discard_stat = k_java_remote_parent_stat_discard_ambiguous,
+        },
+        {
+            .name = "active claim was not ambiguous",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_active,
+                },
+            .status = k_java_remote_parent_status_ambiguous,
+            .take_stat = k_java_remote_parent_stat_take_ambiguous,
+            .discard_stat = k_java_remote_parent_stat_discard_ambiguous,
+        },
+        {
+            .name = "unknown claim was not ambiguous",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                },
+            .status = k_java_remote_parent_status_ambiguous,
+            .take_stat = k_java_remote_parent_stat_take_ambiguous,
+            .discard_stat = k_java_remote_parent_stat_discard_ambiguous,
+        },
+    };
+
+    for (u32 i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        for (u8 discard = 0; discard < 2; discard++) {
+            seed_generation(&connection);
+            stored_claim_key = stored_state_key;
+            stored_claim = cases[i].claim;
+            claim_present = 1;
+
+            java_remote_parent_response_t response = stored_state.response;
+            const enum java_remote_parent_status status =
+                java_remote_parent_retrieve_for_connection(&response,
+                                                           discard,
+                                                           test_now_ns,
+                                                           k_java_remote_parent_source_direct,
+                                                           &connection,
+                                                           test_connection_netns,
+                                                           test_generation,
+                                                           test_socket_cookie);
+            const enum java_remote_parent_stat expected_stat =
+                discard ? cases[i].discard_stat : cases[i].take_stat;
+            java_remote_parent_response_t expected = {0};
+            java_remote_parent_init_response(&expected, cases[i].status, test_generation, 0);
+            if (status != cases[i].status || memcmp(&response, &expected, sizeof(response)) != 0 ||
+                !claim_present ||
+                memcmp(&stored_claim, &cases[i].claim, sizeof(stored_claim)) != 0 ||
+                !owner_present || !fallback_present || !state_present ||
+                !generation_index_present || !connection_present || !cookie_connection_present ||
+                terminal_present || stats[expected_stat] != 1 || unexpected_update ||
+                unexpected_delete) {
+                fail(cases[i].name);
+            }
+        }
+    }
+}
+
+static void test_ambiguity_claim_collision_reports_committed_status(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    const struct {
+        const char *name;
+        java_remote_parent_claim_t claim;
+        enum java_remote_parent_status status;
+        enum java_remote_parent_stat take_stat;
+        enum java_remote_parent_stat discard_stat;
+    } cases[] = {
+        {
+            .name = "publishing claim collision was not overload",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_publishing,
+                },
+            .status = k_java_remote_parent_status_overload,
+            .take_stat = k_java_remote_parent_stat_take_overload,
+            .discard_stat = k_java_remote_parent_stat_discard_overload,
+        },
+        {
+            .name = "ambiguous claim collision was not ambiguous",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_ambiguous,
+                },
+            .status = k_java_remote_parent_status_ambiguous,
+            .take_stat = k_java_remote_parent_stat_take_ambiguous,
+            .discard_stat = k_java_remote_parent_stat_discard_ambiguous,
+        },
+        {
+            .name = "consumed claim collision lost its committed status",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_consumed,
+                },
+            .status = k_java_remote_parent_status_already_consumed,
+            .take_stat = k_java_remote_parent_stat_take_already_consumed,
+            .discard_stat = k_java_remote_parent_stat_discard_already_consumed,
+        },
+        {
+            .name = "malformed claim collision was not ambiguous",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_consumed,
+                    .reserved = {[0] = 1},
+                },
+            .status = k_java_remote_parent_status_ambiguous,
+            .take_stat = k_java_remote_parent_stat_take_ambiguous,
+            .discard_stat = k_java_remote_parent_stat_discard_ambiguous,
+        },
+    };
+
+    for (u32 i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        for (u8 discard = 0; discard < 2; discard++) {
+            seed_generation(&connection);
+            ambiguities[0].observed_monotime_ns = test_now_ns;
+            claim_before_exact_update = cases[i].claim;
+            inject_claim_before_exact_update = 1;
+
+            java_remote_parent_response_t response = stored_state.response;
+            const enum java_remote_parent_status status =
+                java_remote_parent_retrieve_for_connection(&response,
+                                                           discard,
+                                                           test_now_ns,
+                                                           k_java_remote_parent_source_direct,
+                                                           &connection,
+                                                           test_connection_netns,
+                                                           test_generation,
+                                                           test_socket_cookie);
+            const enum java_remote_parent_stat expected_stat =
+                discard ? cases[i].discard_stat : cases[i].take_stat;
+            java_remote_parent_response_t expected = {0};
+            java_remote_parent_init_response(&expected, cases[i].status, test_generation, 0);
+            if (status != cases[i].status || memcmp(&response, &expected, sizeof(response)) != 0 ||
+                inject_claim_before_exact_update || !claim_present ||
+                memcmp(&stored_claim, &cases[i].claim, sizeof(stored_claim)) != 0 ||
+                !owner_present || !fallback_present || !state_present ||
+                !generation_index_present || !connection_present || !cookie_connection_present ||
+                terminal_present || !find_ambiguity(&stored_state_key) ||
+                exact_claim_update_attempts != 1 || stats[expected_stat] != 1 ||
+                unexpected_update || unexpected_delete) {
+                fail(cases[i].name);
+            }
+        }
     }
 }
 
@@ -3391,12 +3830,12 @@ static void test_exact_receive_detach_claim_failures_are_fail_closed(void) {
                                                    test_connection_netns,
                                                    test_generation,
                                                    test_socket_cookie);
-    if (fenced_status != k_java_remote_parent_status_ambiguous ||
-        response.status != k_java_remote_parent_status_ambiguous || !claim_present ||
+    if (fenced_status != k_java_remote_parent_status_overload ||
+        response.status != k_java_remote_parent_status_overload || !claim_present ||
         terminal_present || !state_present || !generation_index_present ||
-        stats[k_java_remote_parent_stat_take_ambiguous] != 1 || unexpected_update ||
+        stats[k_java_remote_parent_stat_take_overload] != 1 || unexpected_update ||
         unexpected_delete) {
-        fail("failed RESET ambiguity fence did not reject a later task TAKE");
+        fail("failed RESET publishing claim did not overload a later task TAKE");
     }
 
     seed_generation(&connection);
@@ -3926,6 +4365,61 @@ static void test_finish_release_failures_are_fenced(void) {
         unexpected_update || unexpected_delete) {
         fail("finish claim-release failure was not fenced");
     }
+    java_remote_parent_response_t response = {0};
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_direct,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_already_consumed ||
+        response.status != k_java_remote_parent_status_already_consumed ||
+        java_remote_parent_retrieve_for_connection(&response,
+                                                   1,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_direct,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_already_consumed ||
+        response.status != k_java_remote_parent_status_already_consumed ||
+        !finish_generation_artifacts_absent() ||
+        !exact_finish_terminal_present(k_java_remote_parent_lifecycle_consumed) ||
+        !exact_finish_fences_retained(&stored_state_key, k_java_remote_parent_lifecycle_consumed) ||
+        stats[k_java_remote_parent_stat_take_already_consumed] != 1 ||
+        stats[k_java_remote_parent_stat_discard_already_consumed] != 1 || unexpected_update ||
+        unexpected_delete) {
+        fail("retained direct finish claim did not preserve repeat status");
+    }
+
+    stored_terminal.observed_monotime_ns = 0;
+    response = stored_state.response;
+    const enum java_remote_parent_status malformed_terminal_status =
+        java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_direct,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie);
+    java_remote_parent_response_t expected_missing = {0};
+    java_remote_parent_init_response(
+        &expected_missing, k_java_remote_parent_status_missing, test_generation, 0);
+    if (malformed_terminal_status != k_java_remote_parent_status_missing ||
+        memcmp(&response, &expected_missing, sizeof(response)) != 0 ||
+        stats[k_java_remote_parent_stat_take_missing] != 1 ||
+        stats[k_java_remote_parent_stat_take_already_consumed] != 1 || unexpected_update ||
+        unexpected_delete) {
+        fail("zero-observation terminal authorized a retained claim outcome");
+    }
+    stored_terminal.observed_monotime_ns = test_observed_monotime_ns;
+    if (!exact_finish_fences_retained(&stored_state_key, k_java_remote_parent_lifecycle_consumed)) {
+        fail("terminal metadata validation disturbed retained finish fences");
+    }
 
     seed_generation(&connection);
     seed_finish_claim(k_java_remote_parent_lifecycle_consumed);
@@ -3960,6 +4454,83 @@ static void test_finish_release_failures_are_fenced(void) {
         !find_ambiguity(&stored_state_key) || detach_guard_present || unexpected_update ||
         unexpected_delete) {
         fail("finish accepted a post-guard ambiguity marker");
+    }
+}
+
+static void test_live_task_finish_claim_release_preserves_repeat_status(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    seed_finish_claim(k_java_remote_parent_lifecycle_consumed);
+    exact_claim_delete_failures = 1;
+    finish_seeded_generation(k_java_remote_parent_lifecycle_consumed);
+    if (exact_claim_delete_failures || !finish_generation_artifacts_absent() || !task_present ||
+        !exact_finish_terminal_present(k_java_remote_parent_lifecycle_consumed) ||
+        !exact_finish_fences_retained(&stored_state_key, k_java_remote_parent_lifecycle_consumed) ||
+        unexpected_update || unexpected_delete) {
+        fail("live task finish claim-release failure was not fenced");
+    }
+
+    current_task = test_child;
+    java_remote_parent_response_t response = {0};
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_already_consumed ||
+        response.status != k_java_remote_parent_status_already_consumed ||
+        java_remote_parent_le64_to_cpu(response.generation_le) != test_generation ||
+        java_remote_parent_retrieve_for_connection(&response,
+                                                   1,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_already_consumed ||
+        response.status != k_java_remote_parent_status_already_consumed || !task_present ||
+        !exact_finish_fences_retained(&stored_state_key, k_java_remote_parent_lifecycle_consumed) ||
+        stats[k_java_remote_parent_stat_take_already_consumed] != 1 ||
+        stats[k_java_remote_parent_stat_discard_already_consumed] != 1 || unexpected_update ||
+        unexpected_delete) {
+        fail("live task retry lost the retained finish outcome");
+    }
+
+    const java_remote_parent_response_t stale_response = stored_state.response;
+    if (!task_retrieval_rejects_authority(&stale_response,
+                                          &connection,
+                                          test_connection_netns,
+                                          test_replacement_generation,
+                                          test_socket_cookie,
+                                          test_generation) ||
+        !task_present) {
+        fail("retained task terminal accepted a mismatched generation");
+    }
+
+    stored_task.observed_monotime_ns++;
+    response = stale_response;
+    const enum java_remote_parent_status mismatched_link_status =
+        java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie);
+    java_remote_parent_response_t expected_missing = {0};
+    java_remote_parent_init_response(&expected_missing, k_java_remote_parent_status_missing, 0, 0);
+    if (mismatched_link_status != k_java_remote_parent_status_missing ||
+        memcmp(&response, &expected_missing, sizeof(response)) != 0 || task_present ||
+        !exact_finish_fences_retained(&stored_state_key, k_java_remote_parent_lifecycle_consumed) ||
+        stats[k_java_remote_parent_stat_take_missing] != 2 || unexpected_update ||
+        unexpected_delete) {
+        fail("retained task terminal accepted a mismatched task link");
     }
 }
 
@@ -4053,11 +4624,14 @@ int main(void) {
     test_captured_generation_survives_owner_reuse();
     test_alias_observation_rejects_same_generation_reuse();
     test_detached_task_bridge_preserves_same_socket_replacement();
+    test_task_claim_binding_rejects_reserved_state();
     test_detached_zero_cleanup_quarantines_retain_race();
     test_detached_zero_cleanup_retains_adoption_artifacts();
     test_cross_generation_guard_does_not_block_detached_cleanup();
     test_cleanup_unlinks_and_cleans_a_different_detached_generation();
     test_internal_cleanup_claim_is_transient();
+    test_generation_claim_status_validation();
+    test_ambiguity_claim_collision_reports_committed_status();
     test_exact_receive_detach_removes_only_unaliased_generation();
     test_exact_receive_detach_preserves_aliases();
     test_exact_receive_detach_quarantines_last_alias_release_race();
@@ -4086,6 +4660,7 @@ int main(void) {
     test_finish_physical_failures_are_fenced();
     test_finish_logical_failures_are_fenced();
     test_finish_release_failures_are_fenced();
+    test_live_task_finish_claim_release_preserves_repeat_status();
     test_detached_finish_preserves_successor_terminal();
     return 0;
 }

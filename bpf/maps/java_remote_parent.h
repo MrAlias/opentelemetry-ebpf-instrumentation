@@ -2959,10 +2959,12 @@ java_remote_parent_resolve_task(const pid_key_t *start, u64 max_age_ns) {
     }
 
     java_remote_parent_resolve_exact(&resolution, &copy.owner, copy.generation, 1);
-    if (resolution.found && !resolution.ambiguous &&
-        java_remote_parent_pid_key_equal(&resolution.key.owner, &copy.owner) &&
+    if (resolution.found && java_remote_parent_pid_key_equal(&resolution.key.owner, &copy.owner) &&
         resolution.key.generation == copy.generation &&
         resolution.observed_monotime_ns == copy.observed_monotime_ns) {
+        // Keep the exact task provenance even when the generation is fenced.
+        // A retained claim can then report the committed one-shot result while
+        // the fence still prevents any new delivery.
         resolution.via_task = 1;
     } else if (resolution.found &&
                java_remote_parent_pid_key_equal(&resolution.key.owner, &copy.owner) &&
@@ -3757,6 +3759,30 @@ java_remote_parent_finish_generation(const java_remote_parent_resolution_t *reso
 }
 
 static __always_inline enum java_remote_parent_status
+java_remote_parent_claim_status(const java_remote_parent_resolution_t *resolution,
+                                const java_remote_parent_claim_t *claimed) {
+    if (!claimed || !claimed->observed_monotime_ns ||
+        claimed->process_incarnation != resolution->indexed.process_incarnation ||
+        claimed->reserved[0] || claimed->reserved[1] || claimed->reserved[2] ||
+        claimed->reserved[3] || claimed->reserved[4] || claimed->reserved[5] ||
+        claimed->reserved[6]) {
+        return k_java_remote_parent_status_ambiguous;
+    }
+    switch (claimed->lifecycle) {
+    case k_java_remote_parent_lifecycle_publishing:
+        return k_java_remote_parent_status_overload;
+    case k_java_remote_parent_lifecycle_ambiguous:
+        return k_java_remote_parent_status_ambiguous;
+    case k_java_remote_parent_lifecycle_consumed:
+    case k_java_remote_parent_lifecycle_discarded:
+    case k_java_remote_parent_lifecycle_stale:
+        return k_java_remote_parent_status_already_consumed;
+    default:
+        return k_java_remote_parent_status_ambiguous;
+    }
+}
+
+static __always_inline enum java_remote_parent_status
 java_remote_parent_claim(const java_remote_parent_resolution_t *resolution,
                          u8 discard,
                          java_remote_parent_claim_t *owned_claim) {
@@ -3768,7 +3794,7 @@ java_remote_parent_claim(const java_remote_parent_resolution_t *resolution,
     // present. A claimant that won before the guard remains authoritative;
     // callers arriving after it must retry/fail open rather than enter the
     // local-claim-release to guard-release window.
-    if (java_remote_parent_detach_guard_matches(&resolution->key)) {
+    if (java_remote_parent_owner_detach_guarded(&resolution->key.owner)) {
         return k_java_remote_parent_status_overload;
     }
     const java_remote_parent_claim_t claim = {
@@ -3780,7 +3806,7 @@ java_remote_parent_claim(const java_remote_parent_resolution_t *resolution,
     if (bpf_map_update_elem(&java_remote_parent_claims, &resolution->key, &claim, BPF_NOEXIST) ==
         0) {
         *owned_claim = claim;
-        if (java_remote_parent_detach_guard_matches(&resolution->key)) {
+        if (java_remote_parent_owner_detach_guarded(&resolution->key.owner)) {
             java_remote_parent_delete_exact_receive_claim(&resolution->key, &claim);
             __builtin_memset(owned_claim, 0, sizeof(*owned_claim));
             return k_java_remote_parent_status_overload;
@@ -3813,16 +3839,131 @@ java_remote_parent_claim(const java_remote_parent_resolution_t *resolution,
 
     const java_remote_parent_claim_t *claimed =
         bpf_map_lookup_elem(&java_remote_parent_claims, &resolution->key);
-    if (claimed && claimed->lifecycle == k_java_remote_parent_lifecycle_ambiguous) {
-        return k_java_remote_parent_status_ambiguous;
-    }
-    if (claimed && claimed->lifecycle == k_java_remote_parent_lifecycle_publishing) {
-        return k_java_remote_parent_status_overload;
-    }
     if (claimed) {
-        return k_java_remote_parent_status_already_consumed;
+        return java_remote_parent_claim_status(resolution, claimed);
     }
     return k_java_remote_parent_status_overload;
+}
+
+static __always_inline enum java_remote_parent_status
+java_remote_parent_existing_claim_status(const java_remote_parent_resolution_t *resolution,
+                                         u8 *found) {
+    *found = 0;
+    const java_remote_parent_claim_t *claimed =
+        bpf_map_lookup_elem(&java_remote_parent_claims, &resolution->key);
+    if (!claimed) {
+        return k_java_remote_parent_status_ambiguous;
+    }
+    *found = 1;
+    return java_remote_parent_claim_status(resolution, claimed);
+}
+
+static __always_inline u8 java_remote_parent_retrieval_state_metadata_matches(
+    const java_remote_parent_resolution_t *resolution, const java_remote_parent_state_t *state) {
+    return state && resolution->observed_monotime_ns && state->process_incarnation &&
+           state->process_incarnation == resolution->indexed.process_incarnation &&
+           state->lifecycle == k_java_remote_parent_lifecycle_active && !state->reserved[0] &&
+           !state->reserved[1] && !state->reserved[2] &&
+           state->observed_monotime_ns == resolution->observed_monotime_ns &&
+           state->response.status == k_java_remote_parent_status_valid &&
+           java_remote_parent_le64_to_cpu(state->response.generation_le) ==
+               resolution->key.generation &&
+           java_remote_parent_le64_to_cpu(state->response.observed_monotime_ns_le) ==
+               resolution->observed_monotime_ns;
+}
+
+static __always_inline u8 java_remote_parent_retrieval_task_link_matches(
+    const java_remote_parent_resolution_t *resolution, const pid_key_t *execution) {
+    if (!resolution->via_task) {
+        return 0;
+    }
+    const java_remote_parent_task_t *linked =
+        bpf_map_lookup_elem(&java_remote_parent_tasks, execution);
+    return linked && !linked->reserved &&
+           java_remote_parent_pid_key_equal(&linked->owner, &resolution->key.owner) &&
+           linked->generation == resolution->key.generation &&
+           linked->observed_monotime_ns == resolution->observed_monotime_ns;
+}
+
+static __always_inline u8
+java_remote_parent_retrieval_socket_not_rebound(const java_remote_parent_resolution_t *resolution,
+                                                const connection_info_t *expected_connection,
+                                                u32 expected_connection_netns,
+                                                u64 expected_socket_cookie) {
+    if (!expected_connection) {
+        return 1;
+    }
+    if (!expected_socket_cookie) {
+        return 0;
+    }
+    java_remote_parent_connection_key_t connection_key = {0};
+    if (!java_remote_parent_connection_netns_key_init(
+            &connection_key, expected_connection, expected_connection_netns)) {
+        return 0;
+    }
+    const java_remote_parent_connection_t *current =
+        bpf_map_lookup_elem(&java_remote_parent_connections, &connection_key.netns);
+    if (!current) {
+        return 1;
+    }
+    // The sockopt caller has already bound expected_socket_cookie to its
+    // socket-local negotiation. Once a successor replaces the singleton
+    // cursor, reject that successor's cookie without requiring the old
+    // physical index to outlive its completed one-shot claim.
+    const u8 exact_generation =
+        current->generation == resolution->key.generation &&
+        java_remote_parent_pid_key_equal(&current->owner, &resolution->key.owner);
+    return !((exact_generation && current->socket_cookie != expected_socket_cookie) ||
+             (!exact_generation && current->socket_cookie == expected_socket_cookie));
+}
+
+static __always_inline u8 java_remote_parent_retrieval_claim_binding_matches(
+    const java_remote_parent_resolution_t *resolution,
+    const pid_key_t *execution,
+    const java_remote_parent_state_t *state,
+    const connection_info_t *expected_connection,
+    u32 expected_connection_netns,
+    u64 expected_socket_cookie) {
+    if (!expected_socket_cookie || !state || !state->aliases ||
+        !java_remote_parent_retrieval_state_metadata_matches(resolution, state) ||
+        state->connection_netns != expected_connection_netns ||
+        __builtin_memcmp(&state->connection, expected_connection, sizeof(*expected_connection)) !=
+            0 ||
+        !java_remote_parent_generation_index_matches(
+            &resolution->key, state->process_incarnation, state->observed_monotime_ns) ||
+        !java_remote_parent_retrieval_socket_not_rebound(
+            resolution, expected_connection, expected_connection_netns, expected_socket_cookie)) {
+        return 0;
+    }
+    return java_remote_parent_retrieval_task_link_matches(resolution, execution);
+}
+
+static __always_inline u8 java_remote_parent_retrieval_claim_terminal_matches(
+    const java_remote_parent_resolution_t *resolution,
+    const pid_key_t *execution,
+    const java_remote_parent_state_t *state,
+    const connection_info_t *expected_connection,
+    u32 expected_connection_netns,
+    u64 expected_socket_cookie) {
+    const java_remote_parent_terminal_t *terminal =
+        bpf_map_lookup_elem(&java_remote_parent_terminal, &resolution->key.owner);
+    if (!java_remote_parent_finish_terminal_record_valid(terminal) ||
+        terminal->generation != resolution->key.generation ||
+        terminal->observed_monotime_ns != resolution->observed_monotime_ns ||
+        terminal->process_incarnation != resolution->indexed.process_incarnation) {
+        return 0;
+    }
+    // A completed finish can remove every connection artifact before a
+    // compare-delete failure retains its exact claim. The cgroup sockopt caller
+    // has already revalidated its socket-local negotiation, so the exact
+    // terminal remains the durable binding for this status-only replay. Task
+    // provenance additionally requires the exact task link to remain bound.
+    return !resolution->via_task ||
+           (!state && (java_remote_parent_retrieval_task_link_matches(resolution, execution) &&
+                       java_remote_parent_retrieval_socket_not_rebound(resolution,
+                                                                       expected_connection,
+                                                                       expected_connection_netns,
+                                                                       expected_socket_cookie)));
 }
 
 static __noinline __attribute__((unused)) u8
@@ -3831,7 +3972,7 @@ java_remote_parent_retrieval_connection_matches(const java_remote_parent_resolut
                                                 const connection_info_t *expected_connection,
                                                 u32 expected_connection_netns,
                                                 u64 expected_socket_cookie) {
-    if (!state) {
+    if (!java_remote_parent_retrieval_state_metadata_matches(resolution, state)) {
         return 0;
     }
     const u8 detached_task =
@@ -3893,6 +4034,11 @@ java_remote_parent_retrieve_for_connection(java_remote_parent_response_t *respon
         java_remote_parent_retrieval_stat(discard, k_java_remote_parent_status_missing);
         return k_java_remote_parent_status_missing;
     }
+    u8 claim_found = 0;
+    enum java_remote_parent_status existing_claim_status = k_java_remote_parent_status_ambiguous;
+    if (resolution.ambiguous && resolution.found) {
+        existing_claim_status = java_remote_parent_existing_claim_status(&resolution, &claim_found);
+    }
     if (expected_connection && resolution.found) {
         const java_remote_parent_state_t *bound_state =
             bpf_map_lookup_elem(&java_remote_parent_state, &resolution.key);
@@ -3900,7 +4046,20 @@ java_remote_parent_retrieve_for_connection(java_remote_parent_response_t *respon
                                                              bound_state,
                                                              expected_connection,
                                                              expected_connection_netns,
-                                                             expected_socket_cookie)) {
+                                                             expected_socket_cookie) &&
+            !(claim_found &&
+              (java_remote_parent_retrieval_claim_binding_matches(&resolution,
+                                                                  &start,
+                                                                  bound_state,
+                                                                  expected_connection,
+                                                                  expected_connection_netns,
+                                                                  expected_socket_cookie) ||
+               java_remote_parent_retrieval_claim_terminal_matches(&resolution,
+                                                                   &start,
+                                                                   bound_state,
+                                                                   expected_connection,
+                                                                   expected_connection_netns,
+                                                                   expected_socket_cookie)))) {
             java_remote_parent_init_response(
                 response, k_java_remote_parent_status_missing, resolution.key.generation, 0);
             java_remote_parent_retrieval_stat(discard, k_java_remote_parent_status_missing);
@@ -3909,21 +4068,39 @@ java_remote_parent_retrieve_for_connection(java_remote_parent_response_t *respon
     }
 
     if (resolution.ambiguous) {
+        if (claim_found) {
+            java_remote_parent_init_response(
+                response, existing_claim_status, resolution.key.generation, 0);
+            java_remote_parent_retrieval_stat(discard, existing_claim_status);
+            return existing_claim_status;
+        }
         u64 observed_monotime_ns = 0;
         java_remote_parent_claim_t owned_claim = {0};
         if (resolution.found &&
-            resolution.indexed.lifecycle != k_java_remote_parent_lifecycle_publishing &&
-            java_remote_parent_claim(&resolution, 1, &owned_claim) ==
-                k_java_remote_parent_status_valid) {
-            const java_remote_parent_state_t *state =
-                bpf_map_lookup_elem(&java_remote_parent_state, &resolution.key);
-            if (state) {
-                observed_monotime_ns = state->observed_monotime_ns;
+            resolution.indexed.lifecycle != k_java_remote_parent_lifecycle_publishing) {
+            const enum java_remote_parent_status claim_status =
+                java_remote_parent_claim(&resolution, 1, &owned_claim);
+            if (claim_status == k_java_remote_parent_status_valid) {
+                const java_remote_parent_state_t *state =
+                    bpf_map_lookup_elem(&java_remote_parent_state, &resolution.key);
+                if (state) {
+                    observed_monotime_ns = state->observed_monotime_ns;
+                }
+                java_remote_parent_finish_generation(&resolution,
+                                                     k_java_remote_parent_lifecycle_ambiguous,
+                                                     observed_monotime_ns,
+                                                     &owned_claim);
+            } else if (!owned_claim.observed_monotime_ns) {
+                u8 raced_claim_found = 0;
+                const enum java_remote_parent_status raced_claim_status =
+                    java_remote_parent_existing_claim_status(&resolution, &raced_claim_found);
+                if (raced_claim_found) {
+                    java_remote_parent_init_response(
+                        response, raced_claim_status, resolution.key.generation, 0);
+                    java_remote_parent_retrieval_stat(discard, raced_claim_status);
+                    return raced_claim_status;
+                }
             }
-            java_remote_parent_finish_generation(&resolution,
-                                                 k_java_remote_parent_lifecycle_ambiguous,
-                                                 observed_monotime_ns,
-                                                 &owned_claim);
         }
         java_remote_parent_init_response(response,
                                          k_java_remote_parent_status_ambiguous,
@@ -4000,15 +4177,8 @@ java_remote_parent_retrieve_for_connection(java_remote_parent_response_t *respon
     if (!resolution.via_task) {
         claimed_fallback = bpf_map_lookup_elem(&java_remote_parent_fallback, &resolution.key.owner);
     }
-    if (state->process_incarnation != resolution.indexed.process_incarnation ||
+    if (!java_remote_parent_retrieval_state_metadata_matches(&resolution, state) ||
         state->process_incarnation != java_current_process_incarnation() ||
-        state->lifecycle != k_java_remote_parent_lifecycle_active ||
-        state->observed_monotime_ns != resolution.observed_monotime_ns ||
-        state->response.status != k_java_remote_parent_status_valid ||
-        java_remote_parent_le64_to_cpu(state->response.generation_le) !=
-            resolution.key.generation ||
-        java_remote_parent_le64_to_cpu(state->response.observed_monotime_ns_le) !=
-            resolution.observed_monotime_ns ||
         !java_remote_parent_generation_index_matches(
             &resolution.key, state->process_incarnation, resolution.observed_monotime_ns) ||
         !java_remote_parent_generation_cleanly_reserved(&resolution.key) ||

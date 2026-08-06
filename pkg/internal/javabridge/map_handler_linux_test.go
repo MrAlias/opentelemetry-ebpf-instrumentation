@@ -28,6 +28,7 @@ type fakeBridgeMap struct {
 	values            map[any]any
 	lookupCount       int
 	updateCount       int
+	deleteCount       int
 	lookupErr         error
 	updateErr         error
 	deleteErr         error
@@ -148,6 +149,7 @@ func (m *fakeBridgeMap) Update(key, value any, flags ebpf.MapUpdateFlags) error 
 
 func (m *fakeBridgeMap) Delete(key any) error {
 	m.mu.Lock()
+	m.deleteCount++
 	if m.deleteErr != nil {
 		err := m.deleteErr
 		m.mu.Unlock()

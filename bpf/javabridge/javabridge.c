@@ -30,6 +30,37 @@ typedef struct java_remote_parent_negotiation {
 _Static_assert(sizeof(java_remote_parent_negotiation_t) == 72,
                "java remote-parent negotiation size mismatch");
 
+typedef struct java_remote_parent_sockopt_scratch {
+    java_remote_parent_negotiation_t negotiation;
+    connection_info_t connection;
+    u32 reserved;
+    java_remote_parent_response_t response;
+    java_remote_parent_data_signal_key_t signal_key;
+    java_remote_parent_data_ack_t acknowledgement;
+    pid_key_t acknowledged_process;
+    u32 reserved2;
+} java_remote_parent_sockopt_scratch_t;
+
+// A per-CPU scratch value can be overwritten when a cgroup sockopt program is
+// preempted on a PREEMPT_RCU kernel. Socket-local storage keeps concurrent
+// operations on different sockets isolated; the cgroup sockopt runners hold
+// the socket lock while executing programs, serializing same-socket access.
+struct {
+    __uint(type, BPF_MAP_TYPE_SK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, u32);
+    __type(value, java_remote_parent_sockopt_scratch_t);
+} javabridge_sockopt_scratch SEC(".maps");
+
+static __always_inline java_remote_parent_sockopt_scratch_t *
+java_remote_parent_sockopt_scratch_for(const struct bpf_sockopt *ctx) {
+    if (!ctx->sk) {
+        return NULL;
+    }
+    return bpf_sk_storage_get(
+        &javabridge_sockopt_scratch, ctx->sk, NULL, BPF_SK_STORAGE_GET_F_CREATE);
+}
+
 // Socket-local storage is available to cgroup sockopt programs on the
 // minimum supported kernel. The kernel frees it with the socket, so a reused
 // struct sock address can never inherit an earlier negotiation.
@@ -133,24 +164,30 @@ static __always_inline int java_remote_parent_ack_data(struct bpf_sockopt *ctx) 
     if (!negotiated) {
         return 1;
     }
-    const java_remote_parent_negotiation_t copy = *negotiated;
+    java_remote_parent_sockopt_scratch_t *scratch = java_remote_parent_sockopt_scratch_for(ctx);
+    if (!scratch) {
+        return 1;
+    }
+    scratch->negotiation = *negotiated;
     const pid_key_t process = java_remote_parent_current_process();
-    if (!java_remote_parent_same_process(&copy.process, &process)) {
+    if (!java_remote_parent_same_process(&scratch->negotiation.process, &process)) {
         return 1;
     }
     const u64 process_capability = java_process_capability_for(&process);
     const u64 registered_incarnation = java_current_process_incarnation();
-    if (!process_capability || !registered_incarnation || copy.reserved != 0 ||
-        copy.process_incarnation != process_capability ||
+    if (!process_capability || !registered_incarnation || scratch->negotiation.reserved != 0 ||
+        scratch->negotiation.process_incarnation != process_capability ||
         registered_incarnation != process_capability) {
         bpf_sk_storage_delete(&java_remote_parent_negotiations, ctx->sk);
         return 1;
     }
 
-    connection_info_t current_connection = {0};
+    __builtin_memset(&scratch->connection, 0, sizeof(scratch->connection));
     const u64 socket_cookie = java_remote_parent_socket_cookie(ctx->sk);
-    if (!socket_cookie || !java_remote_parent_sockopt_connection(ctx, &current_connection) ||
-        __builtin_memcmp(&current_connection, &copy.connection, sizeof(current_connection)) != 0) {
+    if (!socket_cookie || !java_remote_parent_sockopt_connection(ctx, &scratch->connection) ||
+        __builtin_memcmp(&scratch->connection,
+                         &scratch->negotiation.connection,
+                         sizeof(scratch->connection)) != 0) {
         return 1;
     }
 
@@ -162,42 +199,42 @@ static __always_inline int java_remote_parent_ack_data(struct bpf_sockopt *ctx) 
     u64 nonce = 0;
     __builtin_memcpy(&nonce, optval, sizeof(nonce));
     nonce = java_remote_parent_le64_to_cpu(nonce);
-    const java_remote_parent_data_signal_key_t signal_key = {
+    scratch->signal_key = (java_remote_parent_data_signal_key_t){
         .process = process,
         .nonce = nonce,
     };
     const java_remote_parent_data_ack_t *acknowledgement =
-        bpf_map_lookup_elem(&java_remote_parent_data_acks, &signal_key);
+        bpf_map_lookup_elem(&java_remote_parent_data_acks, &scratch->signal_key);
     if (!acknowledgement) {
         return 1;
     }
-    const java_remote_parent_data_ack_t acknowledgement_copy = *acknowledgement;
-    const pid_key_t acknowledged_process = java_process_key(&acknowledgement_copy.owner);
-    if (acknowledgement_copy.reserved != 0 || !acknowledgement_copy.generation ||
-        !acknowledgement_copy.connection_netns || acknowledgement_copy.reserved2 != 0 ||
-        __builtin_memcmp(acknowledgement_copy.reserved3,
-                         (unsigned char[sizeof(acknowledgement_copy.reserved3)]){0},
-                         sizeof(acknowledgement_copy.reserved3)) != 0 ||
-        acknowledgement_copy.connection_netns != copy.connection_netns ||
-        acknowledgement_copy.connection_netns != task_netns() ||
-        !java_remote_parent_same_process(&acknowledged_process, &process) ||
-        __builtin_memcmp(&acknowledgement_copy.connection,
-                         &current_connection,
-                         sizeof(current_connection)) != 0 ||
+    scratch->acknowledgement = *acknowledgement;
+    scratch->acknowledged_process = java_process_key(&scratch->acknowledgement.owner);
+    if (scratch->acknowledgement.reserved != 0 || !scratch->acknowledgement.generation ||
+        !scratch->acknowledgement.connection_netns || scratch->acknowledgement.reserved2 != 0 ||
+        __builtin_memcmp(scratch->acknowledgement.reserved3,
+                         (unsigned char[sizeof(scratch->acknowledgement.reserved3)]){0},
+                         sizeof(scratch->acknowledgement.reserved3)) != 0 ||
+        scratch->acknowledgement.connection_netns != scratch->negotiation.connection_netns ||
+        scratch->acknowledgement.connection_netns != task_netns() ||
+        !java_remote_parent_same_process(&scratch->acknowledged_process, &process) ||
+        __builtin_memcmp(&scratch->acknowledgement.connection,
+                         &scratch->connection,
+                         sizeof(scratch->connection)) != 0 ||
         !java_remote_parent_connection_matches_socket_in_netns(
-            &acknowledgement_copy.connection,
-            acknowledgement_copy.connection_netns,
-            &acknowledgement_copy.owner,
-            acknowledgement_copy.generation,
+            &scratch->acknowledgement.connection,
+            scratch->acknowledgement.connection_netns,
+            &scratch->acknowledgement.owner,
+            scratch->acknowledgement.generation,
             0,
             socket_cookie)) {
         return 1;
     }
 
-    negotiated->connection_netns = acknowledgement_copy.connection_netns;
-    negotiated->generation = acknowledgement_copy.generation;
-    java_remote_parent_finish_data_signal(&acknowledgement_copy.owner, nonce);
-    bpf_map_delete_elem(&java_remote_parent_data_acks, &signal_key);
+    negotiated->connection_netns = scratch->acknowledgement.connection_netns;
+    negotiated->generation = scratch->acknowledgement.generation;
+    java_remote_parent_finish_data_signal(&scratch->acknowledgement.owner, nonce);
+    bpf_map_delete_elem(&java_remote_parent_data_acks, &scratch->signal_key);
     ctx->optlen = -1;
     return 1;
 }
@@ -219,9 +256,14 @@ int obi_java_remote_parent_setsockopt(struct bpf_sockopt *ctx) {
         return 1;
     }
 
-    connection_info_t connection = {0};
+    java_remote_parent_sockopt_scratch_t *scratch = java_remote_parent_sockopt_scratch_for(ctx);
+    if (!scratch) {
+        java_remote_parent_negotiate_stat(k_java_remote_parent_status_overload);
+        return 1;
+    }
+    __builtin_memset(&scratch->connection, 0, sizeof(scratch->connection));
     const u64 socket_cookie = java_remote_parent_socket_cookie(ctx->sk);
-    if (!socket_cookie || !java_remote_parent_sockopt_connection(ctx, &connection)) {
+    if (!socket_cookie || !java_remote_parent_sockopt_connection(ctx, &scratch->connection)) {
         java_remote_parent_negotiate_stat(k_java_remote_parent_status_overload);
         return 1;
     }
@@ -248,21 +290,21 @@ int obi_java_remote_parent_setsockopt(struct bpf_sockopt *ctx) {
         return 1;
     }
 
-    const java_remote_parent_negotiation_t negotiation = {
+    scratch->negotiation = (java_remote_parent_negotiation_t){
         .process = process,
         .process_incarnation = registered_incarnation,
-        .connection = connection,
+        .connection = scratch->connection,
         .connection_netns = caller_netns,
     };
     java_remote_parent_negotiation_t *stored = bpf_sk_storage_get(&java_remote_parent_negotiations,
                                                                   ctx->sk,
-                                                                  (void *)&negotiation,
+                                                                  &scratch->negotiation,
                                                                   BPF_SK_STORAGE_GET_F_CREATE);
     if (!stored) {
         java_remote_parent_negotiate_stat(k_java_remote_parent_status_overload);
         return 1;
     }
-    *stored = negotiation;
+    *stored = scratch->negotiation;
 
     java_remote_parent_negotiate_stat(k_java_remote_parent_status_missing);
     ctx->optlen = -1;
@@ -292,33 +334,41 @@ int obi_java_remote_parent_getsockopt(struct bpf_sockopt *ctx) {
         java_remote_parent_record_unauthorized_retrieval(discard, health);
         return 1;
     }
-    const java_remote_parent_negotiation_t copy = *negotiated;
+    java_remote_parent_sockopt_scratch_t *scratch = java_remote_parent_sockopt_scratch_for(ctx);
+    if (!scratch) {
+        java_remote_parent_retrieval_stat(discard, k_java_remote_parent_status_overload);
+        return 1;
+    }
+    scratch->negotiation = *negotiated;
     const pid_key_t process = java_remote_parent_current_process();
-    if (!java_remote_parent_same_process(&copy.process, &process)) {
+    if (!java_remote_parent_same_process(&scratch->negotiation.process, &process)) {
         java_remote_parent_record_unauthorized_retrieval(discard, health);
         return 1;
     }
     const u64 process_capability = java_process_capability_for(&process);
     const u64 registered_incarnation = java_current_process_incarnation();
-    if (!process_capability || !registered_incarnation || copy.reserved != 0 ||
-        copy.process_incarnation != process_capability ||
+    if (!process_capability || !registered_incarnation || scratch->negotiation.reserved != 0 ||
+        scratch->negotiation.process_incarnation != process_capability ||
         registered_incarnation != process_capability) {
         bpf_sk_storage_delete(&java_remote_parent_negotiations, ctx->sk);
         java_remote_parent_record_unauthorized_retrieval(discard, health);
         return 1;
     }
 
-    connection_info_t current_connection = {0};
+    __builtin_memset(&scratch->connection, 0, sizeof(scratch->connection));
     const u64 socket_cookie = java_remote_parent_socket_cookie(ctx->sk);
-    if (!socket_cookie || !java_remote_parent_sockopt_connection(ctx, &current_connection) ||
-        __builtin_memcmp(&current_connection, &copy.connection, sizeof(current_connection)) != 0) {
+    if (!socket_cookie || !java_remote_parent_sockopt_connection(ctx, &scratch->connection) ||
+        __builtin_memcmp(&scratch->connection,
+                         &scratch->negotiation.connection,
+                         sizeof(scratch->connection)) != 0) {
         java_remote_parent_record_unauthorized_retrieval(discard, health);
         return 1;
     }
 
     unsigned char *optval = ctx->optval;
     const unsigned char *optval_end = ctx->optval_end;
-    if (!copy.connection_netns || copy.connection_netns != task_netns()) {
+    if (!scratch->negotiation.connection_netns ||
+        scratch->negotiation.connection_netns != task_netns()) {
         java_remote_parent_record_unauthorized_retrieval(discard, health);
         return 1;
     }
@@ -326,13 +376,14 @@ int obi_java_remote_parent_getsockopt(struct bpf_sockopt *ctx) {
         if (!optval || ctx->optlen < sizeof(u64) || optval + sizeof(u64) > optval_end) {
             return 1;
         }
-        const u64 response = java_remote_parent_cpu_to_le64(copy.process_incarnation);
+        const u64 response =
+            java_remote_parent_cpu_to_le64(scratch->negotiation.process_incarnation);
         __builtin_memcpy(optval, &response, sizeof(response));
         ctx->optlen = sizeof(response);
         ctx->retval = 0;
         return 1;
     }
-    if (!copy.generation) {
+    if (!scratch->negotiation.generation) {
         return 1;
     }
     if (!optval || ctx->optlen != k_java_remote_parent_response_size ||
@@ -341,18 +392,17 @@ int obi_java_remote_parent_getsockopt(struct bpf_sockopt *ctx) {
         return 1;
     }
 
-    java_remote_parent_response_t response;
-    java_remote_parent_retrieve_for_connection(&response,
+    java_remote_parent_retrieve_for_connection(&scratch->response,
                                                discard,
                                                java_remote_parent_max_age_ns,
                                                source,
-                                               &copy.connection,
-                                               copy.connection_netns,
-                                               copy.generation,
+                                               &scratch->negotiation.connection,
+                                               scratch->negotiation.connection_netns,
+                                               scratch->negotiation.generation,
                                                socket_cookie);
 
-    __builtin_memcpy(optval, &response, sizeof(response));
-    ctx->optlen = sizeof(response);
+    __builtin_memcpy(optval, &scratch->response, sizeof(scratch->response));
+    ctx->optlen = sizeof(scratch->response);
     ctx->retval = 0;
     return 1;
 }

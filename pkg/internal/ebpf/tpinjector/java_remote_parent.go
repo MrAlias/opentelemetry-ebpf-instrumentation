@@ -698,6 +698,7 @@ func (p *Tracer) javaRemoteParentMaps() javabridge.Maps {
 		Generations:       p.bpfJavaRemoteParentMaps.JavaRemoteParentGenerationIndex,
 		Terminals:         p.bpfJavaRemoteParentMaps.JavaRemoteParentTerminal,
 		Claims:            p.bpfJavaRemoteParentMaps.JavaRemoteParentClaims,
+		OwnerGuards:       p.bpfJavaRemoteParentMaps.JavaRemoteParentOwnerGuards,
 		Handoffs:          p.bpfJavaRemoteParentMaps.JavaRemoteParentHandoffs,
 		HandoffClaims:     p.bpfJavaRemoteParentMaps.JavaRemoteParentHandoffClaims,
 		Retired:           p.bpfJavaRemoteParentMaps.JavaRetiredProcesses,

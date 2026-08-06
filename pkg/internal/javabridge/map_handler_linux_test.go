@@ -24,18 +24,19 @@ import (
 const testProcessIncarnation = uint64(0x123456789abcdef0)
 
 type fakeBridgeMap struct {
-	mu           sync.Mutex
-	values       map[any]any
-	lookupCount  int
-	lookupErr    error
-	updateErr    error
-	deleteErr    error
-	iterateErr   error
-	afterIterate func()
-	afterLookup  func(int)
-	beforeUpdate func(any, any, ebpf.MapUpdateFlags)
-	afterUpdate  func(any, any)
-	afterDelete  func(any)
+	mu                sync.Mutex
+	values            map[any]any
+	lookupCount       int
+	lookupErr         error
+	updateErr         error
+	deleteErr         error
+	iterateErr        error
+	afterIterate      func()
+	afterLookup       func(int)
+	afterLookupResult func(any, error)
+	beforeUpdate      func(any, any, ebpf.MapUpdateFlags)
+	afterUpdate       func(any, any)
+	afterDelete       func(any)
 }
 
 type fakeCleanupEntry struct {
@@ -79,23 +80,36 @@ func (m *fakeBridgeMap) Iterate() cleanupIterator {
 
 func (m *fakeBridgeMap) Lookup(key, valueOut any) error {
 	m.mu.Lock()
+	mapKey := indirectValue(key)
 	if m.lookupErr != nil {
 		err := m.lookupErr
+		afterLookupResult := m.afterLookupResult
 		m.mu.Unlock()
+		if afterLookupResult != nil {
+			afterLookupResult(mapKey, err)
+		}
 		return err
 	}
-	value, ok := m.values[indirectValue(key)]
+	value, ok := m.values[mapKey]
 	if !ok {
+		afterLookupResult := m.afterLookupResult
 		m.mu.Unlock()
+		if afterLookupResult != nil {
+			afterLookupResult(mapKey, ebpf.ErrKeyNotExist)
+		}
 		return ebpf.ErrKeyNotExist
 	}
 	reflect.ValueOf(valueOut).Elem().Set(reflect.ValueOf(value))
 	m.lookupCount++
 	count := m.lookupCount
 	afterLookup := m.afterLookup
+	afterLookupResult := m.afterLookupResult
 	m.mu.Unlock()
 	if afterLookup != nil {
 		afterLookup(count)
+	}
+	if afterLookupResult != nil {
+		afterLookupResult(mapKey, nil)
 	}
 	return nil
 }
@@ -359,7 +373,7 @@ func TestGenerationCoordinatorBlocksCleanupDuringDelayedHandler(t *testing.T) {
 	select {
 	case completed := <-cleanupFinished:
 		require.NoError(t, completed.err)
-		assert.Equal(t, CleanupStats{Cleaned: 1}, completed.stats)
+		assert.Equal(t, CleanupStats{}, completed.stats)
 	case <-time.After(time.Second):
 		t.Fatal("cleanup did not finish after the handler completed")
 	}
@@ -1873,6 +1887,7 @@ func testMapHandler(remoteParents, tasks, ambiguity map[Identity]any) *MapHandle
 		generations:       &fakeBridgeMap{values: make(map[any]any)},
 		terminals:         &fakeBridgeMap{values: make(map[any]any)},
 		claims:            &fakeBridgeMap{values: make(map[any]any)},
+		ownerGuards:       &fakeBridgeMap{values: make(map[any]any)},
 		coordinator:       NewGenerationCoordinator(),
 		ttl:               30 * time.Second,
 		monoTimeNow:       func() time.Duration { return 11 * time.Second },

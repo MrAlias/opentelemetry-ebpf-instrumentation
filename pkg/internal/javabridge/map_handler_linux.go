@@ -42,6 +42,7 @@ type MapHandler struct {
 	generations       bridgeMap
 	terminals         bridgeMap
 	claims            bridgeMap
+	ownerGuards       bridgeMap
 	coordinator       *GenerationCoordinator
 	ttl               time.Duration
 	monoTimeNow       func() time.Duration
@@ -64,6 +65,7 @@ type Maps struct {
 	Generations                    *ebpf.Map
 	Terminals                      *ebpf.Map
 	Claims                         *ebpf.Map
+	OwnerGuards                    *ebpf.Map
 	Handoffs                       *ebpf.Map
 	HandoffClaims                  *ebpf.Map
 	Retired                        *ebpf.Map
@@ -181,6 +183,7 @@ const (
 	lifecycleStale      = uint8(4)
 	lifecycleAmbiguous  = uint8(5)
 	lifecyclePublishing = uint8(6)
+	lifecycleCleanup    = uint8(7)
 )
 
 func NewMapHandler(
@@ -206,6 +209,7 @@ func NewMapHandler(
 		generations:       maps.Generations,
 		terminals:         maps.Terminals,
 		claims:            maps.Claims,
+		ownerGuards:       maps.OwnerGuards,
 		coordinator:       coordinator,
 		ttl:               ttl,
 		monoTimeNow:       timing.MonoTimeNow,

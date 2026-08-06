@@ -200,6 +200,15 @@ static int java_task_deletes;
 static int mutate_exact_receive_after_claim;
 static int remove_state_index_after_claim;
 static int replace_state_index_observation_after_claim;
+static int inject_detach_guard_after_exact_claim;
+static int replace_task_after_exact_claim;
+static int replace_task_during_claim_lookup;
+static int replace_task_during_detach_guard_lookup;
+static int remove_claim_and_replace_task_during_claim_lookup;
+static int arm_task_replacement_after_post_claim_check;
+static int replace_task_on_next_state_lookup;
+static int arm_task_replacement_and_state_loss_after_post_claim_check;
+static int replace_task_and_drop_state_on_next_lookup;
 static int replace_detach_guard_after_claim;
 static int replace_detach_guard_token_after_claim;
 static int increment_alias_after_cleanup_claim;
@@ -235,18 +244,28 @@ static int reinsert_exact_cookie_connection_after_netns_delete;
 static int replace_netns_and_reinsert_exact_cookie_after_delete;
 static int ambiguity_update_failures;
 static int ambiguity_delete_failures;
+static int replace_ambiguity_after_failed_delete;
 static int replace_ambiguity_after_update;
 static int exact_claim_delete_absent_on_failure;
+static int replace_exact_claim_on_delete_failure;
 static int inject_claim_after_detach_guard_delete;
 static int inject_claim_before_exact_update;
 static java_remote_parent_claim_t claim_before_exact_update;
 static int inject_ambiguity_after_detach_guard_delete;
+static int inject_zero_ambiguity_after_detach_guard_delete;
 static int inject_connection_after_detach_guard_delete;
 static int complete_take_after_detach_guard_delete;
+static int publish_successor_after_detach_guard_delete;
 static int inject_foreign_guard_after_detach_guard_delete;
+static int replace_cleanup_owner_after_guard_acquisition;
 static int detach_guard_delete_failures;
+static int detach_guard_delete_absent_on_failure;
+static int replace_detach_guard_on_delete_failure;
 static int unexpected_update;
 static int unexpected_delete;
+
+static java_remote_parent_response_t
+seed_replacement_generation(const connection_info_t *connection);
 
 static void fail(const char *message) {
     fprintf(stderr, "FAIL: %s\n", message);
@@ -317,6 +336,25 @@ static int exact_finish_fences_retained(const java_remote_parent_key_t *key,
            stored_detach_guard.observed_monotime_ns &&
            stored_detach_guard.process_incarnation == key->generation &&
            stored_detach_guard.lifecycle == k_java_remote_parent_lifecycle_publishing;
+}
+
+static int exact_finish_claim_guard_tail(const java_remote_parent_key_t *key,
+                                         enum java_remote_parent_lifecycle lifecycle) {
+    const java_remote_parent_key_t guard_key = {.owner = key->owner};
+    return claim_present && same_key(&stored_claim_key, key, sizeof(*key)) &&
+           stored_claim.observed_monotime_ns &&
+           stored_claim.process_incarnation == test_process_incarnation &&
+           stored_claim.lifecycle == lifecycle && !find_ambiguity_entry(key) &&
+           detach_guard_present &&
+           same_key(&stored_detach_guard_key, &guard_key, sizeof(guard_key)) &&
+           stored_detach_guard.observed_monotime_ns &&
+           stored_detach_guard.process_incarnation == key->generation &&
+           stored_detach_guard.lifecycle == k_java_remote_parent_lifecycle_publishing;
+}
+
+static int owner_cleanup_payload_absent(void) {
+    return !owner_present && !fallback_present && !state_present && !generation_index_present &&
+           !connection_present && !cookie_connection_present && !task_present && !terminal_present;
 }
 
 static int inject_handoff_claim(const java_remote_parent_handoff_key_t *key) {
@@ -399,6 +437,18 @@ static void *test_map_lookup(void *map, const void *key) {
     }
     if (map == &java_remote_parent_state && state_present &&
         same_key(key, &stored_state_key, sizeof(stored_state_key))) {
+        if (replace_task_and_drop_state_on_next_lookup) {
+            replace_task_and_drop_state_on_next_lookup = 0;
+            stored_task.generation = test_replacement_generation;
+            stored_task.observed_monotime_ns = test_now_ns;
+            state_present = 0;
+            return NULL;
+        }
+        if (replace_task_on_next_state_lookup) {
+            replace_task_on_next_state_lookup = 0;
+            stored_task.generation = test_replacement_generation;
+            stored_task.observed_monotime_ns = test_now_ns;
+        }
         if (observe_alias_balance && !stored_state.aliases) {
             alias_zero_observed = 1;
         }
@@ -448,6 +498,14 @@ static void *test_map_lookup(void *map, const void *key) {
     }
     if (map == &java_remote_parent_tasks && task_present &&
         same_key(key, &stored_task_key, sizeof(stored_task_key))) {
+        if (claim_present && arm_task_replacement_after_post_claim_check) {
+            arm_task_replacement_after_post_claim_check = 0;
+            replace_task_on_next_state_lookup = 1;
+        }
+        if (claim_present && arm_task_replacement_and_state_loss_after_post_claim_check) {
+            arm_task_replacement_and_state_loss_after_post_claim_check = 0;
+            replace_task_and_drop_state_on_next_lookup = 1;
+        }
         return &stored_task;
     }
     if (map == &java_remote_parent_tasks && transferred_task_present &&
@@ -456,10 +514,27 @@ static void *test_map_lookup(void *map, const void *key) {
     }
     if (map == &java_remote_parent_claims && claim_present &&
         same_key(key, &stored_claim_key, sizeof(stored_claim_key))) {
+        if (remove_claim_and_replace_task_during_claim_lookup) {
+            remove_claim_and_replace_task_during_claim_lookup = 0;
+            claim_present = 0;
+            stored_task.generation = test_replacement_generation;
+            stored_task.observed_monotime_ns = test_now_ns;
+            return NULL;
+        }
+        if (replace_task_during_claim_lookup) {
+            replace_task_during_claim_lookup = 0;
+            stored_task.generation = test_replacement_generation;
+            stored_task.observed_monotime_ns = test_now_ns;
+        }
         return &stored_claim;
     }
     if (map == &java_remote_parent_claims && detach_guard_present &&
         same_key(key, &stored_detach_guard_key, sizeof(stored_detach_guard_key))) {
+        if (replace_task_during_detach_guard_lookup) {
+            replace_task_during_detach_guard_lookup = 0;
+            stored_task.generation = test_replacement_generation;
+            stored_task.observed_monotime_ns = test_now_ns;
+        }
         if (hide_detach_guard_once_for_injected_take) {
             hide_detach_guard_once_for_injected_take = 0;
             return NULL;
@@ -591,6 +666,10 @@ test_map_update(void *map, const void *key, const void *value, unsigned long lon
             stored_detach_guard_key = *claim_key;
             stored_detach_guard = *(const java_remote_parent_claim_t *)value;
             detach_guard_present = 1;
+            if (replace_cleanup_owner_after_guard_acquisition) {
+                replace_cleanup_owner_after_guard_acquisition = 0;
+                stored_owner.generation = test_replacement_generation;
+            }
             if (replace_detach_guard_after_claim) {
                 replace_detach_guard_after_claim = 0;
                 stored_detach_guard.process_incarnation = test_replacement_generation;
@@ -647,6 +726,21 @@ test_map_update(void *map, const void *key, const void *value, unsigned long lon
         stored_claim_key = *(const java_remote_parent_key_t *)key;
         stored_claim = *(const java_remote_parent_claim_t *)value;
         claim_present = 1;
+        if (inject_detach_guard_after_exact_claim) {
+            inject_detach_guard_after_exact_claim = 0;
+            stored_detach_guard_key = java_remote_parent_state_key(&stored_state_key.owner, 0);
+            stored_detach_guard = (java_remote_parent_claim_t){
+                .observed_monotime_ns = test_now_ns,
+                .process_incarnation = stored_state_key.generation,
+                .lifecycle = k_java_remote_parent_lifecycle_publishing,
+            };
+            detach_guard_present = 1;
+        }
+        if (replace_task_after_exact_claim) {
+            replace_task_after_exact_claim = 0;
+            stored_task.generation = test_replacement_generation;
+            stored_task.observed_monotime_ns = test_now_ns;
+        }
         if (remove_state_index_after_claim) {
             remove_state_index_after_claim = 0;
             state_present = 0;
@@ -761,6 +855,10 @@ static long test_map_delete(void *map, const void *key) {
         }
         if (ambiguity_delete_failures) {
             ambiguity_delete_failures--;
+            if (replace_ambiguity_after_failed_delete) {
+                replace_ambiguity_after_failed_delete = 0;
+                entry->observed_monotime_ns = 0;
+            }
             return -1;
         }
         entry->present = 0;
@@ -872,6 +970,13 @@ static long test_map_delete(void *map, const void *key) {
             if (exact_claim_delete_absent_on_failure) {
                 exact_claim_delete_absent_on_failure = 0;
                 claim_present = 0;
+            } else if (replace_exact_claim_on_delete_failure) {
+                replace_exact_claim_on_delete_failure = 0;
+                stored_claim = (java_remote_parent_claim_t){
+                    .observed_monotime_ns = test_now_ns + 1,
+                    .process_incarnation = test_process_incarnation + 1,
+                    .lifecycle = k_java_remote_parent_lifecycle_publishing,
+                };
             }
             return -1;
         }
@@ -888,6 +993,17 @@ static long test_map_delete(void *map, const void *key) {
         same_key(key, &stored_detach_guard_key, sizeof(stored_detach_guard_key))) {
         if (detach_guard_delete_failures) {
             detach_guard_delete_failures--;
+            if (detach_guard_delete_absent_on_failure) {
+                detach_guard_delete_absent_on_failure = 0;
+                detach_guard_present = 0;
+            } else if (replace_detach_guard_on_delete_failure) {
+                replace_detach_guard_on_delete_failure = 0;
+                stored_detach_guard = (java_remote_parent_claim_t){
+                    .observed_monotime_ns = test_now_ns + 1,
+                    .process_incarnation = test_replacement_generation,
+                    .lifecycle = k_java_remote_parent_lifecycle_publishing,
+                };
+            }
             return -1;
         }
         detach_guard_present = 0;
@@ -918,6 +1034,13 @@ static long test_map_delete(void *map, const void *key) {
                 .present = 1,
             };
         }
+        if (inject_zero_ambiguity_after_detach_guard_delete) {
+            inject_zero_ambiguity_after_detach_guard_delete = 0;
+            ambiguities[0] = (ambiguity_entry_t){
+                .key = stored_state_key,
+                .present = 1,
+            };
+        }
         if (inject_connection_after_detach_guard_delete) {
             inject_connection_after_detach_guard_delete = 0;
             connection_present = 1;
@@ -942,6 +1065,10 @@ static long test_map_delete(void *map, const void *key) {
                 .lifecycle = k_java_remote_parent_lifecycle_consumed,
             };
             terminal_present = 1;
+        }
+        if (publish_successor_after_detach_guard_delete) {
+            publish_successor_after_detach_guard_delete = 0;
+            seed_replacement_generation(&stored_state.connection);
         }
         return 0;
     }
@@ -1122,6 +1249,15 @@ static void seed_generation(const connection_info_t *connection) {
     mutate_exact_receive_after_claim = 0;
     remove_state_index_after_claim = 0;
     replace_state_index_observation_after_claim = 0;
+    inject_detach_guard_after_exact_claim = 0;
+    replace_task_after_exact_claim = 0;
+    replace_task_during_claim_lookup = 0;
+    replace_task_during_detach_guard_lookup = 0;
+    remove_claim_and_replace_task_during_claim_lookup = 0;
+    arm_task_replacement_after_post_claim_check = 0;
+    replace_task_on_next_state_lookup = 0;
+    arm_task_replacement_and_state_loss_after_post_claim_check = 0;
+    replace_task_and_drop_state_on_next_lookup = 0;
     replace_detach_guard_after_claim = 0;
     replace_detach_guard_token_after_claim = 0;
     increment_alias_after_cleanup_claim = 0;
@@ -1157,16 +1293,23 @@ static void seed_generation(const connection_info_t *connection) {
     replace_netns_and_reinsert_exact_cookie_after_delete = 0;
     ambiguity_update_failures = 0;
     ambiguity_delete_failures = 0;
+    replace_ambiguity_after_failed_delete = 0;
     replace_ambiguity_after_update = 0;
     exact_claim_delete_absent_on_failure = 0;
+    replace_exact_claim_on_delete_failure = 0;
     inject_claim_after_detach_guard_delete = 0;
     inject_claim_before_exact_update = 0;
     memset(&claim_before_exact_update, 0, sizeof(claim_before_exact_update));
     inject_ambiguity_after_detach_guard_delete = 0;
+    inject_zero_ambiguity_after_detach_guard_delete = 0;
     inject_connection_after_detach_guard_delete = 0;
     complete_take_after_detach_guard_delete = 0;
+    publish_successor_after_detach_guard_delete = 0;
     inject_foreign_guard_after_detach_guard_delete = 0;
+    replace_cleanup_owner_after_guard_acquisition = 0;
     detach_guard_delete_failures = 0;
+    detach_guard_delete_absent_on_failure = 0;
+    replace_detach_guard_on_delete_failure = 0;
     unexpected_update = 0;
     unexpected_delete = 0;
     authorized_translation_owner = (pid_key_t){0};
@@ -2567,6 +2710,110 @@ static void test_cleanup_unlinks_and_cleans_a_different_detached_generation(void
     }
 }
 
+static void test_owner_cleanup_release_tails_are_recoverable(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+
+    seed_generation(&connection);
+    replace_cleanup_owner_after_guard_acquisition = 1;
+    java_remote_parent_cleanup(&test_owner);
+    if (replace_cleanup_owner_after_guard_acquisition ||
+        stored_owner.generation != test_replacement_generation || !fallback_present ||
+        !state_present || !generation_index_present || !connection_present ||
+        !cookie_connection_present || !claim_present ||
+        stored_claim.lifecycle != k_java_remote_parent_lifecycle_discarded ||
+        !detach_guard_present || !find_ambiguity(&stored_state_key) || unexpected_update ||
+        unexpected_delete) {
+        fail("owner cleanup did not retain its full fence after post-guard owner replacement");
+    }
+
+    seed_generation(&connection);
+    ambiguity_delete_failures = 1;
+    replace_ambiguity_after_failed_delete = 1;
+    java_remote_parent_cleanup(&test_owner);
+    if (ambiguity_delete_failures || replace_ambiguity_after_failed_delete ||
+        !owner_cleanup_payload_absent() || !claim_present ||
+        stored_claim.lifecycle != k_java_remote_parent_lifecycle_discarded ||
+        !detach_guard_present || !find_ambiguity_entry(&stored_state_key) ||
+        find_ambiguity(&stored_state_key) || unexpected_update || unexpected_delete) {
+        fail("owner cleanup promoted a successor reservation after failed marker deletion");
+    }
+
+    seed_generation(&connection);
+    exact_claim_delete_failures = 1;
+    java_remote_parent_cleanup(&test_owner);
+    if (exact_claim_delete_failures || !owner_cleanup_payload_absent() || !claim_present ||
+        stored_claim.lifecycle != k_java_remote_parent_lifecycle_discarded ||
+        !detach_guard_present || find_ambiguity_entry(&stored_state_key) || unexpected_update ||
+        unexpected_delete) {
+        fail("owner cleanup lost its exact-claim/guard release tail");
+    }
+
+    seed_generation(&connection);
+    exact_claim_delete_failures = 1;
+    exact_claim_delete_absent_on_failure = 1;
+    java_remote_parent_cleanup(&test_owner);
+    if (exact_claim_delete_failures || exact_claim_delete_absent_on_failure ||
+        !owner_cleanup_payload_absent() || claim_present || detach_guard_present ||
+        find_ambiguity_entry(&stored_state_key) || unexpected_update || unexpected_delete) {
+        fail("owner cleanup did not converge after an ambiguous absent exact-claim delete");
+    }
+
+    seed_generation(&connection);
+    exact_claim_delete_failures = 1;
+    replace_exact_claim_on_delete_failure = 1;
+    java_remote_parent_cleanup(&test_owner);
+    if (exact_claim_delete_failures || replace_exact_claim_on_delete_failure ||
+        !owner_cleanup_payload_absent() || !claim_present ||
+        stored_claim.observed_monotime_ns != test_now_ns + 1 ||
+        stored_claim.process_incarnation != test_process_incarnation + 1 ||
+        stored_claim.lifecycle != k_java_remote_parent_lifecycle_publishing ||
+        !detach_guard_present || find_ambiguity_entry(&stored_state_key) || unexpected_update ||
+        unexpected_delete) {
+        fail("owner cleanup removed a replacement claim after an ambiguous delete failure");
+    }
+
+    seed_generation(&connection);
+    detach_guard_delete_failures = 1;
+    java_remote_parent_cleanup(&test_owner);
+    if (detach_guard_delete_failures || !owner_cleanup_payload_absent() || claim_present ||
+        !detach_guard_present || find_ambiguity_entry(&stored_state_key) || unexpected_update ||
+        unexpected_delete) {
+        fail("owner cleanup lost its guard-only release tail");
+    }
+
+    seed_generation(&connection);
+    detach_guard_delete_failures = 1;
+    detach_guard_delete_absent_on_failure = 1;
+    java_remote_parent_cleanup(&test_owner);
+    if (detach_guard_delete_failures || detach_guard_delete_absent_on_failure ||
+        !owner_cleanup_payload_absent() || claim_present || detach_guard_present ||
+        find_ambiguity_entry(&stored_state_key) || unexpected_update || unexpected_delete) {
+        fail("owner cleanup did not converge after an ambiguous absent guard delete");
+    }
+
+    seed_generation(&connection);
+    detach_guard_delete_failures = 1;
+    replace_detach_guard_on_delete_failure = 1;
+    java_remote_parent_cleanup(&test_owner);
+    if (detach_guard_delete_failures || replace_detach_guard_on_delete_failure ||
+        !owner_cleanup_payload_absent() || claim_present || !detach_guard_present ||
+        stored_detach_guard.observed_monotime_ns != test_now_ns + 1 ||
+        stored_detach_guard.process_incarnation != test_replacement_generation ||
+        stored_detach_guard.lifecycle != k_java_remote_parent_lifecycle_publishing ||
+        find_ambiguity_entry(&stored_state_key) || unexpected_update || unexpected_delete) {
+        fail("owner cleanup removed a replacement guard after an ambiguous delete failure");
+    }
+
+    seed_generation(&connection);
+    inject_zero_ambiguity_after_detach_guard_delete = 1;
+    java_remote_parent_cleanup(&test_owner);
+    if (inject_zero_ambiguity_after_detach_guard_delete || !owner_cleanup_payload_absent() ||
+        claim_present || detach_guard_present || !find_ambiguity_entry(&stored_state_key) ||
+        find_ambiguity(&stored_state_key) || unexpected_update || unexpected_delete) {
+        fail("owner cleanup re-marked a successor reservation after final guard release");
+    }
+}
+
 static void test_internal_cleanup_claim_is_transient(void) {
     const connection_info_t connection = {.s_port = 1234, .d_port = 443};
     seed_generation(&connection);
@@ -3222,6 +3469,28 @@ static void test_exact_receive_detach_fences_task_take_during_delete_retry(void)
     }
 }
 
+static void test_aliased_reset_guard_release_failure_retains_tail(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    detach_guard_delete_failures = 1;
+    if (!java_remote_parent_detach_exact_receive_generation(&stored_state_key,
+                                                            test_process_incarnation,
+                                                            &connection,
+                                                            test_connection_netns,
+                                                            test_socket_cookie) ||
+        detach_guard_delete_failures || owner_present || fallback_present || !state_present ||
+        !generation_index_present || connection_present || cookie_connection_present ||
+        !task_present || claim_present || !detach_guard_present ||
+        stored_detach_guard.process_incarnation != test_generation ||
+        stored_detach_guard.lifecycle != k_java_remote_parent_lifecycle_publishing ||
+        !find_ambiguity_entry(&stored_state_key) || find_ambiguity(&stored_state_key) ||
+        terminal_present || exact_claim_update_attempts != 1 || unexpected_update ||
+        unexpected_delete) {
+        fail("aliased RESET did not retain its zero-reservation/guard release tail");
+    }
+}
+
 static void test_take_claim_revalidates_state_and_generation_index(void) {
     const connection_info_t connection = {.s_port = 1234, .d_port = 443};
     java_remote_parent_response_t response = {0};
@@ -3238,10 +3507,18 @@ static void test_take_claim_revalidates_state_and_generation_index(void) {
                                                    test_socket_cookie) !=
             k_java_remote_parent_status_missing ||
         remove_state_index_after_claim || state_present || generation_index_present ||
-        claim_present || terminal_present || !owner_present || !fallback_present ||
-        !connection_present || !cookie_connection_present || exact_claim_update_attempts != 1 ||
-        unexpected_update || unexpected_delete) {
+        !claim_present || stored_claim.lifecycle != k_java_remote_parent_lifecycle_consumed ||
+        terminal_present || !owner_present || !fallback_present || !connection_present ||
+        !cookie_connection_present || exact_claim_update_attempts != 1 ||
+        !find_ambiguity(&stored_state_key) || unexpected_update || unexpected_delete) {
         fail("late TAKE claim published a terminal after state/index removal");
+    }
+    memset(&response, 0, sizeof(response));
+    if (java_remote_parent_retrieve(
+            &response, 0, test_now_ns, k_java_remote_parent_source_direct) !=
+            k_java_remote_parent_status_already_consumed ||
+        response.status != k_java_remote_parent_status_already_consumed || !claim_present) {
+        fail("late TAKE state/index loss rolled back its visible final claim");
     }
 
     seed_generation(&connection);
@@ -3258,11 +3535,19 @@ static void test_take_claim_revalidates_state_and_generation_index(void) {
             k_java_remote_parent_status_missing ||
         replace_state_index_observation_after_claim || !state_present ||
         stored_state.observed_monotime_ns != test_now_ns || !generation_index_present ||
-        stored_generation_index.observed_monotime_ns != test_now_ns || claim_present ||
-        terminal_present || !owner_present || !fallback_present || !connection_present ||
-        !cookie_connection_present || find_ambiguity(&stored_state_key) ||
-        exact_claim_update_attempts != 1 || unexpected_update || unexpected_delete) {
+        stored_generation_index.observed_monotime_ns != test_now_ns || !claim_present ||
+        stored_claim.lifecycle != k_java_remote_parent_lifecycle_consumed || terminal_present ||
+        !owner_present || !fallback_present || !connection_present || !cookie_connection_present ||
+        !find_ambiguity(&stored_state_key) || exact_claim_update_attempts != 1 ||
+        unexpected_update || unexpected_delete) {
         fail("late TAKE claim adopted a same-key replacement observation");
+    }
+    memset(&response, 0, sizeof(response));
+    if (java_remote_parent_retrieve(
+            &response, 0, test_now_ns, k_java_remote_parent_source_direct) !=
+            k_java_remote_parent_status_already_consumed ||
+        response.status != k_java_remote_parent_status_already_consumed || !claim_present) {
+        fail("late TAKE observation replacement rolled back its visible final claim");
     }
 
     seed_generation(&connection);
@@ -3283,6 +3568,267 @@ static void test_take_claim_revalidates_state_and_generation_index(void) {
         stored_terminal.lifecycle != k_java_remote_parent_lifecycle_consumed ||
         exact_claim_update_attempts != 1 || unexpected_update || unexpected_delete) {
         fail("post-publication claim revalidation changed a valid TAKE");
+    }
+}
+
+static void test_visible_final_claim_survives_post_claim_guard(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+
+    for (u8 discard = 0; discard < 2; discard++) {
+        seed_generation(&connection);
+        inject_detach_guard_after_exact_claim = 1;
+        java_remote_parent_response_t response = {0};
+        if (java_remote_parent_retrieve_for_connection(&response,
+                                                       discard,
+                                                       test_now_ns,
+                                                       k_java_remote_parent_source_direct,
+                                                       &connection,
+                                                       test_connection_netns,
+                                                       test_generation,
+                                                       test_socket_cookie) !=
+                k_java_remote_parent_status_overload ||
+            response.status != k_java_remote_parent_status_overload ||
+            inject_detach_guard_after_exact_claim || !claim_present ||
+            stored_claim.lifecycle != (discard ? k_java_remote_parent_lifecycle_discarded
+                                               : k_java_remote_parent_lifecycle_consumed) ||
+            !detach_guard_present || !find_ambiguity(&stored_state_key) || !owner_present ||
+            !fallback_present || !state_present || !generation_index_present ||
+            !connection_present || !cookie_connection_present || terminal_present ||
+            unexpected_update || unexpected_delete) {
+            fail("post-claim owner guard rolled back a visible final claim");
+        }
+
+        memset(&response, 0, sizeof(response));
+        if (java_remote_parent_retrieve(
+                &response, discard, test_now_ns, k_java_remote_parent_source_direct) !=
+                k_java_remote_parent_status_already_consumed ||
+            response.status != k_java_remote_parent_status_already_consumed || !claim_present ||
+            !detach_guard_present || !find_ambiguity(&stored_state_key)) {
+            fail("post-claim owner guard did not preserve deterministic retry status");
+        }
+    }
+}
+
+static void test_task_link_is_revalidated_after_claim(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    current_task = test_child;
+    replace_task_after_exact_claim = 1;
+
+    java_remote_parent_response_t response = stored_state.response;
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_ambiguous ||
+        response.status != k_java_remote_parent_status_ambiguous ||
+        replace_task_after_exact_claim || !task_present ||
+        stored_task.generation != test_replacement_generation ||
+        stored_task.observed_monotime_ns != test_now_ns ||
+        stats[k_java_remote_parent_stat_take_valid] != 0 ||
+        stats[k_java_remote_parent_stat_handoff_valid] != 0 || unexpected_update ||
+        unexpected_delete) {
+        fail("task-link replacement after claim returned the old remote parent");
+    }
+
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    current_task = test_child;
+    inject_detach_guard_after_exact_claim = 1;
+    replace_task_after_exact_claim = 1;
+    response = stored_state.response;
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_ambiguous ||
+        response.status != k_java_remote_parent_status_ambiguous ||
+        inject_detach_guard_after_exact_claim || replace_task_after_exact_claim || !claim_present ||
+        !detach_guard_present || !find_ambiguity(&stored_state_key) || !task_present ||
+        stored_task.generation != test_replacement_generation ||
+        stored_task.observed_monotime_ns != test_now_ns ||
+        stats[k_java_remote_parent_stat_take_overload] != 0 ||
+        stats[k_java_remote_parent_stat_take_ambiguous] != 1 ||
+        stats[k_java_remote_parent_stat_take_valid] != 0 || unexpected_update ||
+        unexpected_delete) {
+        fail("post-claim task replacement did not outrank the owner guard");
+    }
+
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    current_task = test_child;
+    arm_task_replacement_after_post_claim_check = 1;
+    response = stored_state.response;
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_ambiguous ||
+        response.status != k_java_remote_parent_status_ambiguous ||
+        arm_task_replacement_after_post_claim_check || replace_task_on_next_state_lookup ||
+        !task_present || stored_task.generation != test_replacement_generation ||
+        stored_task.observed_monotime_ns != test_now_ns ||
+        stats[k_java_remote_parent_stat_take_valid] != 0 ||
+        stats[k_java_remote_parent_stat_handoff_valid] != 0 || unexpected_update ||
+        unexpected_delete) {
+        fail("late post-claim task replacement returned the old remote parent");
+    }
+
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    current_task = test_child;
+    arm_task_replacement_and_state_loss_after_post_claim_check = 1;
+    response = stored_state.response;
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_ambiguous ||
+        response.status != k_java_remote_parent_status_ambiguous ||
+        arm_task_replacement_and_state_loss_after_post_claim_check ||
+        replace_task_and_drop_state_on_next_lookup || state_present || !claim_present ||
+        !find_ambiguity(&stored_state_key) || !task_present ||
+        stored_task.generation != test_replacement_generation ||
+        stored_task.observed_monotime_ns != test_now_ns ||
+        stats[k_java_remote_parent_stat_take_missing] != 0 ||
+        stats[k_java_remote_parent_stat_take_ambiguous] != 1 ||
+        stats[k_java_remote_parent_stat_take_valid] != 0 || unexpected_update ||
+        unexpected_delete) {
+        fail("late task replacement plus state loss returned a terminal old status");
+    }
+
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    current_task = test_child;
+    ambiguities[0] = (ambiguity_entry_t){
+        .key = stored_state_key,
+        .observed_monotime_ns = test_now_ns,
+        .present = 1,
+    };
+    stored_claim_key = stored_state_key;
+    stored_claim = (java_remote_parent_claim_t){
+        .observed_monotime_ns = test_now_ns,
+        .process_incarnation = test_process_incarnation,
+        .lifecycle = k_java_remote_parent_lifecycle_consumed,
+    };
+    claim_present = 1;
+    replace_task_during_claim_lookup = 1;
+    memset(&response, 0, sizeof(response));
+    if (java_remote_parent_retrieve(&response, 0, test_now_ns, k_java_remote_parent_source_task) !=
+            k_java_remote_parent_status_ambiguous ||
+        response.status != k_java_remote_parent_status_ambiguous ||
+        replace_task_during_claim_lookup || !claim_present || !task_present ||
+        stored_task.generation != test_replacement_generation ||
+        stored_task.observed_monotime_ns != test_now_ns ||
+        stats[k_java_remote_parent_stat_take_already_consumed] != 0 ||
+        stats[k_java_remote_parent_stat_take_valid] != 0 || unexpected_update ||
+        unexpected_delete) {
+        fail("task-link replacement during retained-claim lookup returned the old status");
+    }
+
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    current_task = test_child;
+    ambiguities[0] = (ambiguity_entry_t){
+        .key = stored_state_key,
+        .observed_monotime_ns = test_now_ns,
+        .present = 1,
+    };
+    inject_claim_before_exact_update = 1;
+    claim_before_exact_update = (java_remote_parent_claim_t){
+        .observed_monotime_ns = test_now_ns,
+        .process_incarnation = test_process_incarnation,
+        .lifecycle = k_java_remote_parent_lifecycle_consumed,
+    };
+    replace_task_during_claim_lookup = 1;
+    memset(&response, 0, sizeof(response));
+    if (java_remote_parent_retrieve(&response, 0, test_now_ns, k_java_remote_parent_source_task) !=
+            k_java_remote_parent_status_ambiguous ||
+        response.status != k_java_remote_parent_status_ambiguous ||
+        inject_claim_before_exact_update || replace_task_during_claim_lookup || !claim_present ||
+        !task_present || stored_task.generation != test_replacement_generation ||
+        stats[k_java_remote_parent_stat_take_already_consumed] != 0 ||
+        stats[k_java_remote_parent_stat_take_ambiguous] != 1 || unexpected_update ||
+        unexpected_delete) {
+        fail("task rebind during a raced ambiguous claim returned the old status");
+    }
+
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    current_task = test_child;
+    stored_detach_guard_key = java_remote_parent_state_key(&test_owner, 0);
+    stored_detach_guard = (java_remote_parent_claim_t){
+        .observed_monotime_ns = test_now_ns,
+        .process_incarnation = test_generation,
+        .lifecycle = k_java_remote_parent_lifecycle_publishing,
+    };
+    detach_guard_present = 1;
+    replace_task_during_detach_guard_lookup = 1;
+    response = stored_state.response;
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_ambiguous ||
+        response.status != k_java_remote_parent_status_ambiguous ||
+        replace_task_during_detach_guard_lookup || claim_present || !detach_guard_present ||
+        !task_present || stored_task.generation != test_replacement_generation ||
+        stored_task.observed_monotime_ns != test_now_ns ||
+        stats[k_java_remote_parent_stat_take_overload] != 0 ||
+        stats[k_java_remote_parent_stat_take_ambiguous] != 1 || unexpected_update ||
+        unexpected_delete) {
+        fail("task rebind did not outrank a pre-claim owner guard");
+    }
+
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    current_task = test_child;
+    inject_claim_before_exact_update = 1;
+    claim_before_exact_update = (java_remote_parent_claim_t){
+        .observed_monotime_ns = test_now_ns,
+        .process_incarnation = test_process_incarnation,
+        .lifecycle = k_java_remote_parent_lifecycle_consumed,
+    };
+    remove_claim_and_replace_task_during_claim_lookup = 1;
+    response = stored_state.response;
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_ambiguous ||
+        response.status != k_java_remote_parent_status_ambiguous ||
+        inject_claim_before_exact_update || remove_claim_and_replace_task_during_claim_lookup ||
+        claim_present || !task_present || stored_task.generation != test_replacement_generation ||
+        stored_task.observed_monotime_ns != test_now_ns ||
+        stats[k_java_remote_parent_stat_take_overload] != 0 ||
+        stats[k_java_remote_parent_stat_take_ambiguous] != 1 || unexpected_update ||
+        unexpected_delete) {
+        fail("task rebind did not outrank a disappeared collided claim");
     }
 }
 
@@ -3841,18 +4387,18 @@ static void test_exact_receive_detach_claim_failures_are_fail_closed(void) {
     seed_generation(&connection);
     seed_exact_receive_aliases(1);
     exact_claim_delete_failures = 1;
-    if (java_remote_parent_detach_exact_receive_generation(&stored_state_key,
-                                                           test_process_incarnation,
-                                                           &connection,
-                                                           test_connection_netns,
-                                                           test_socket_cookie) ||
+    if (!java_remote_parent_detach_exact_receive_generation(&stored_state_key,
+                                                            test_process_incarnation,
+                                                            &connection,
+                                                            test_connection_netns,
+                                                            test_socket_cookie) ||
         exact_claim_delete_failures || owner_present || fallback_present || !state_present ||
         !generation_index_present || connection_present || cookie_connection_present ||
-        !task_present || !exact_reset_fences_retained(&stored_state_key) ||
+        !task_present || !claim_present || !detach_guard_present ||
+        !find_ambiguity_entry(&stored_state_key) || find_ambiguity(&stored_state_key) ||
         stored_claim.lifecycle != k_java_remote_parent_lifecycle_publishing || terminal_present ||
-        !find_ambiguity(&stored_state_key) || exact_claim_update_attempts != 1 ||
-        unexpected_update || unexpected_delete) {
-        fail("exact claim delete failure was reported as a completed RESET");
+        exact_claim_update_attempts != 1 || unexpected_update || unexpected_delete) {
+        fail("aliased RESET did not retain its recoverable claim/guard release tail");
     }
 }
 
@@ -3889,18 +4435,17 @@ static void test_exact_receive_zero_alias_claim_failures_are_fail_closed(void) {
 
     seed_generation(&connection);
     exact_claim_delete_failures = 1;
-    if (java_remote_parent_detach_exact_receive_generation(&stored_state_key,
-                                                           test_process_incarnation,
-                                                           &connection,
-                                                           test_connection_netns,
-                                                           test_socket_cookie) ||
+    if (!java_remote_parent_detach_exact_receive_generation(&stored_state_key,
+                                                            test_process_incarnation,
+                                                            &connection,
+                                                            test_connection_netns,
+                                                            test_socket_cookie) ||
         exact_claim_delete_failures || owner_present || fallback_present || state_present ||
         generation_index_present || connection_present || cookie_connection_present ||
-        !exact_reset_fences_retained(&stored_state_key) || terminal_present ||
-        stored_claim.lifecycle != k_java_remote_parent_lifecycle_publishing ||
-        !find_ambiguity(&stored_state_key) || exact_claim_update_attempts != 1 ||
-        unexpected_update || unexpected_delete) {
-        fail("zero-alias exact-claim delete failure was reported as complete");
+        !claim_present || !detach_guard_present || find_ambiguity_entry(&stored_state_key) ||
+        terminal_present || stored_claim.lifecycle != k_java_remote_parent_lifecycle_publishing ||
+        exact_claim_update_attempts != 1 || unexpected_update || unexpected_delete) {
+        fail("zero-alias RESET did not retain its recoverable claim/guard release tail");
     }
 }
 
@@ -4048,73 +4593,73 @@ static void test_exact_receive_take_completion_requires_strict_postconditions(vo
     }
 }
 
-static void test_exact_receive_detach_rechecks_post_guard_interference(void) {
+static void test_exact_receive_detach_preserves_post_guard_successors(void) {
     const connection_info_t connection = {.s_port = 1234, .d_port = 443};
 
     seed_generation(&connection);
     seed_exact_receive_aliases(1);
     inject_claim_after_detach_guard_delete = 1;
-    if (java_remote_parent_detach_exact_receive_generation(&stored_state_key,
-                                                           test_process_incarnation,
-                                                           &connection,
-                                                           test_connection_netns,
-                                                           test_socket_cookie) ||
+    if (!java_remote_parent_detach_exact_receive_generation(&stored_state_key,
+                                                            test_process_incarnation,
+                                                            &connection,
+                                                            test_connection_netns,
+                                                            test_socket_cookie) ||
         inject_claim_after_detach_guard_delete || owner_present || fallback_present ||
         !state_present || !generation_index_present || connection_present ||
         cookie_connection_present || !task_present || !claim_present || detach_guard_present ||
         terminal_present || find_ambiguity(&stored_state_key) || unexpected_update ||
         unexpected_delete) {
-        fail("post-guard exact claim escaped the final RESET postcondition");
+        fail("aliased RESET disturbed a later exact claim after final guard release");
     }
 
     seed_generation(&connection);
     seed_exact_receive_aliases(1);
     inject_ambiguity_after_detach_guard_delete = 1;
-    if (java_remote_parent_detach_exact_receive_generation(&stored_state_key,
-                                                           test_process_incarnation,
-                                                           &connection,
-                                                           test_connection_netns,
-                                                           test_socket_cookie) ||
+    if (!java_remote_parent_detach_exact_receive_generation(&stored_state_key,
+                                                            test_process_incarnation,
+                                                            &connection,
+                                                            test_connection_netns,
+                                                            test_socket_cookie) ||
         inject_ambiguity_after_detach_guard_delete || owner_present || fallback_present ||
         !state_present || !generation_index_present || connection_present ||
         cookie_connection_present || !task_present || claim_present || detach_guard_present ||
         terminal_present || !find_ambiguity(&stored_state_key) || unexpected_update ||
         unexpected_delete) {
-        fail("post-guard ambiguity escaped the final RESET postcondition");
+        fail("aliased RESET disturbed a later ambiguity after final guard release");
     }
 
     seed_generation(&connection);
     seed_exact_receive_aliases(1);
     inject_connection_after_detach_guard_delete = 1;
-    if (java_remote_parent_detach_exact_receive_generation(&stored_state_key,
-                                                           test_process_incarnation,
-                                                           &connection,
-                                                           test_connection_netns,
-                                                           test_socket_cookie) ||
+    if (!java_remote_parent_detach_exact_receive_generation(&stored_state_key,
+                                                            test_process_incarnation,
+                                                            &connection,
+                                                            test_connection_netns,
+                                                            test_socket_cookie) ||
         inject_connection_after_detach_guard_delete || owner_present || fallback_present ||
         !state_present || !generation_index_present || !connection_present ||
         cookie_connection_present || !task_present || claim_present || detach_guard_present ||
         terminal_present || find_ambiguity(&stored_state_key) || unexpected_update ||
         unexpected_delete) {
-        fail("post-guard physical artifact escaped the final RESET postcondition");
+        fail("aliased RESET disturbed a later physical artifact after final guard release");
     }
 
     seed_generation(&connection);
     seed_exact_receive_aliases(1);
     inject_foreign_guard_after_detach_guard_delete = 1;
-    if (java_remote_parent_detach_exact_receive_generation(&stored_state_key,
-                                                           test_process_incarnation,
-                                                           &connection,
-                                                           test_connection_netns,
-                                                           test_socket_cookie) ||
+    if (!java_remote_parent_detach_exact_receive_generation(&stored_state_key,
+                                                            test_process_incarnation,
+                                                            &connection,
+                                                            test_connection_netns,
+                                                            test_socket_cookie) ||
         inject_foreign_guard_after_detach_guard_delete || owner_present || fallback_present ||
         !state_present || !generation_index_present || connection_present ||
         cookie_connection_present || !task_present || claim_present || !detach_guard_present ||
         stored_detach_guard.process_incarnation != test_replacement_generation ||
         stored_detach_guard.lifecycle != k_java_remote_parent_lifecycle_publishing ||
-        terminal_present || !find_ambiguity(&stored_state_key) || unexpected_update ||
-        unexpected_delete) {
-        fail("post-delete foreign owner guard escaped the final RESET postcondition");
+        terminal_present || !find_ambiguity_entry(&stored_state_key) ||
+        find_ambiguity(&stored_state_key) || unexpected_update || unexpected_delete) {
+        fail("aliased RESET disturbed a later owner guard after final guard release");
     }
 
     seed_generation(&connection);
@@ -4133,6 +4678,66 @@ static void test_exact_receive_detach_rechecks_post_guard_interference(void) {
         stored_terminal.lifecycle != k_java_remote_parent_lifecycle_consumed ||
         find_ambiguity(&stored_state_key) || unexpected_update || unexpected_delete) {
         fail("fully completed post-guard task TAKE was not accepted");
+    }
+}
+
+static void test_zero_alias_reset_final_guard_release_preserves_successor(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+
+    seed_generation(&connection);
+    seed_exact_receive_aliases(0);
+    publish_successor_after_detach_guard_delete = 1;
+    if (!java_remote_parent_detach_exact_receive_generation(&stored_state_key,
+                                                            test_process_incarnation,
+                                                            &connection,
+                                                            test_connection_netns,
+                                                            test_socket_cookie)) {
+        fail("zero-alias RESET rejected success after its final guard release");
+    }
+
+    const ambiguity_entry_t *successor_reservation = find_ambiguity_entry(&replacement_state_key);
+    if (publish_successor_after_detach_guard_delete || state_present || generation_index_present ||
+        connection_present || cookie_connection_present || !owner_present ||
+        stored_owner.generation != test_replacement_generation || !fallback_present ||
+        java_remote_parent_le64_to_cpu(stored_fallback.generation_le) !=
+            test_replacement_generation ||
+        !replacement_state_present || !replacement_generation_index_present ||
+        !replacement_connection_present || !replacement_cookie_connection_present ||
+        !successor_reservation || successor_reservation->observed_monotime_ns || claim_present ||
+        find_ambiguity_entry(&stored_state_key) || detach_guard_present || terminal_present ||
+        unexpected_update || unexpected_delete) {
+        fail("zero-alias RESET disturbed a successor after final guard release");
+    }
+}
+
+static void test_aliased_reset_final_guard_release_preserves_successor(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    publish_successor_after_detach_guard_delete = 1;
+    if (!java_remote_parent_detach_exact_receive_generation(&stored_state_key,
+                                                            test_process_incarnation,
+                                                            &connection,
+                                                            test_connection_netns,
+                                                            test_socket_cookie)) {
+        fail("aliased RESET rejected success after its final guard release");
+    }
+
+    const ambiguity_entry_t *old_reservation = find_ambiguity_entry(&stored_state_key);
+    const ambiguity_entry_t *successor_reservation = find_ambiguity_entry(&replacement_state_key);
+    if (publish_successor_after_detach_guard_delete || !state_present ||
+        !generation_index_present || connection_present || cookie_connection_present ||
+        !task_present || !owner_present || stored_owner.generation != test_replacement_generation ||
+        !fallback_present ||
+        java_remote_parent_le64_to_cpu(stored_fallback.generation_le) !=
+            test_replacement_generation ||
+        !replacement_state_present || !replacement_generation_index_present ||
+        !replacement_connection_present || !replacement_cookie_connection_present ||
+        !old_reservation || old_reservation->observed_monotime_ns || !successor_reservation ||
+        successor_reservation->observed_monotime_ns || claim_present || detach_guard_present ||
+        terminal_present || unexpected_update || unexpected_delete) {
+        fail("aliased RESET disturbed a successor after final guard release");
     }
 }
 
@@ -4357,11 +4962,26 @@ static void test_finish_release_failures_are_fenced(void) {
 
     seed_generation(&connection);
     seed_finish_claim(k_java_remote_parent_lifecycle_consumed);
+    ambiguity_delete_failures = 1;
+    replace_ambiguity_after_failed_delete = 1;
+    finish_seeded_generation(k_java_remote_parent_lifecycle_consumed);
+    if (ambiguity_delete_failures || replace_ambiguity_after_failed_delete ||
+        !finish_generation_artifacts_absent() ||
+        !exact_finish_terminal_present(k_java_remote_parent_lifecycle_consumed) || !claim_present ||
+        stored_claim.lifecycle != k_java_remote_parent_lifecycle_consumed ||
+        !detach_guard_present || !find_ambiguity_entry(&stored_state_key) ||
+        find_ambiguity(&stored_state_key) || unexpected_update || unexpected_delete) {
+        fail("finish promoted a successor reservation after failed marker deletion");
+    }
+
+    seed_generation(&connection);
+    seed_finish_claim(k_java_remote_parent_lifecycle_consumed);
     exact_claim_delete_failures = 1;
     finish_seeded_generation(k_java_remote_parent_lifecycle_consumed);
     if (exact_claim_delete_failures || !finish_generation_artifacts_absent() ||
         !exact_finish_terminal_present(k_java_remote_parent_lifecycle_consumed) ||
-        !exact_finish_fences_retained(&stored_state_key, k_java_remote_parent_lifecycle_consumed) ||
+        !exact_finish_claim_guard_tail(&stored_state_key,
+                                       k_java_remote_parent_lifecycle_consumed) ||
         unexpected_update || unexpected_delete) {
         fail("finish claim-release failure was not fenced");
     }
@@ -4388,7 +5008,8 @@ static void test_finish_release_failures_are_fenced(void) {
         response.status != k_java_remote_parent_status_already_consumed ||
         !finish_generation_artifacts_absent() ||
         !exact_finish_terminal_present(k_java_remote_parent_lifecycle_consumed) ||
-        !exact_finish_fences_retained(&stored_state_key, k_java_remote_parent_lifecycle_consumed) ||
+        !exact_finish_claim_guard_tail(&stored_state_key,
+                                       k_java_remote_parent_lifecycle_consumed) ||
         stats[k_java_remote_parent_stat_take_already_consumed] != 1 ||
         stats[k_java_remote_parent_stat_discard_already_consumed] != 1 || unexpected_update ||
         unexpected_delete) {
@@ -4417,7 +5038,8 @@ static void test_finish_release_failures_are_fenced(void) {
         fail("zero-observation terminal authorized a retained claim outcome");
     }
     stored_terminal.observed_monotime_ns = test_observed_monotime_ns;
-    if (!exact_finish_fences_retained(&stored_state_key, k_java_remote_parent_lifecycle_consumed)) {
+    if (!exact_finish_claim_guard_tail(&stored_state_key,
+                                       k_java_remote_parent_lifecycle_consumed)) {
         fail("terminal metadata validation disturbed retained finish fences");
     }
 
@@ -4427,7 +5049,7 @@ static void test_finish_release_failures_are_fenced(void) {
     finish_seeded_generation(k_java_remote_parent_lifecycle_consumed);
     if (detach_guard_delete_failures || !finish_generation_artifacts_absent() ||
         !exact_finish_terminal_present(k_java_remote_parent_lifecycle_consumed) || claim_present ||
-        !find_ambiguity(&stored_state_key) || !detach_guard_present ||
+        find_ambiguity_entry(&stored_state_key) || !detach_guard_present ||
         stored_detach_guard.process_incarnation != test_generation || unexpected_update ||
         unexpected_delete) {
         fail("finish owner-guard release failure was not fenced");
@@ -4440,9 +5062,9 @@ static void test_finish_release_failures_are_fenced(void) {
     if (inject_claim_after_detach_guard_delete || !finish_generation_artifacts_absent() ||
         !exact_finish_terminal_present(k_java_remote_parent_lifecycle_consumed) || !claim_present ||
         stored_claim.lifecycle != k_java_remote_parent_lifecycle_publishing ||
-        !find_ambiguity(&stored_state_key) || detach_guard_present || unexpected_update ||
+        find_ambiguity_entry(&stored_state_key) || detach_guard_present || unexpected_update ||
         unexpected_delete) {
-        fail("finish accepted a post-guard exact claim");
+        fail("finish disturbed a later exact claim after final guard release");
     }
 
     seed_generation(&connection);
@@ -4453,7 +5075,31 @@ static void test_finish_release_failures_are_fenced(void) {
         !exact_finish_terminal_present(k_java_remote_parent_lifecycle_consumed) || claim_present ||
         !find_ambiguity(&stored_state_key) || detach_guard_present || unexpected_update ||
         unexpected_delete) {
-        fail("finish accepted a post-guard ambiguity marker");
+        fail("finish disturbed a later ambiguity marker after final guard release");
+    }
+}
+
+static void test_finish_final_guard_release_preserves_successor(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+
+    seed_generation(&connection);
+    seed_finish_claim(k_java_remote_parent_lifecycle_consumed);
+    publish_successor_after_detach_guard_delete = 1;
+    finish_seeded_generation(k_java_remote_parent_lifecycle_consumed);
+
+    const ambiguity_entry_t *successor_reservation = find_ambiguity_entry(&replacement_state_key);
+    if (publish_successor_after_detach_guard_delete || state_present || generation_index_present ||
+        connection_present || cookie_connection_present || !owner_present ||
+        stored_owner.generation != test_replacement_generation || !fallback_present ||
+        java_remote_parent_le64_to_cpu(stored_fallback.generation_le) !=
+            test_replacement_generation ||
+        !replacement_state_present || !replacement_generation_index_present ||
+        !replacement_connection_present || !replacement_cookie_connection_present ||
+        !successor_reservation || successor_reservation->observed_monotime_ns || claim_present ||
+        find_ambiguity_entry(&stored_state_key) || detach_guard_present ||
+        !exact_finish_terminal_present(k_java_remote_parent_lifecycle_consumed) ||
+        unexpected_update || unexpected_delete) {
+        fail("final finish guard release disturbed a coherent successor generation");
     }
 }
 
@@ -4466,7 +5112,8 @@ static void test_live_task_finish_claim_release_preserves_repeat_status(void) {
     finish_seeded_generation(k_java_remote_parent_lifecycle_consumed);
     if (exact_claim_delete_failures || !finish_generation_artifacts_absent() || !task_present ||
         !exact_finish_terminal_present(k_java_remote_parent_lifecycle_consumed) ||
-        !exact_finish_fences_retained(&stored_state_key, k_java_remote_parent_lifecycle_consumed) ||
+        !exact_finish_claim_guard_tail(&stored_state_key,
+                                       k_java_remote_parent_lifecycle_consumed) ||
         unexpected_update || unexpected_delete) {
         fail("live task finish claim-release failure was not fenced");
     }
@@ -4494,7 +5141,8 @@ static void test_live_task_finish_claim_release_preserves_repeat_status(void) {
                                                    test_socket_cookie) !=
             k_java_remote_parent_status_already_consumed ||
         response.status != k_java_remote_parent_status_already_consumed || !task_present ||
-        !exact_finish_fences_retained(&stored_state_key, k_java_remote_parent_lifecycle_consumed) ||
+        !exact_finish_claim_guard_tail(&stored_state_key,
+                                       k_java_remote_parent_lifecycle_consumed) ||
         stats[k_java_remote_parent_stat_take_already_consumed] != 1 ||
         stats[k_java_remote_parent_stat_discard_already_consumed] != 1 || unexpected_update ||
         unexpected_delete) {
@@ -4527,7 +5175,8 @@ static void test_live_task_finish_claim_release_preserves_repeat_status(void) {
     java_remote_parent_init_response(&expected_missing, k_java_remote_parent_status_missing, 0, 0);
     if (mismatched_link_status != k_java_remote_parent_status_missing ||
         memcmp(&response, &expected_missing, sizeof(response)) != 0 || task_present ||
-        !exact_finish_fences_retained(&stored_state_key, k_java_remote_parent_lifecycle_consumed) ||
+        !exact_finish_claim_guard_tail(&stored_state_key,
+                                       k_java_remote_parent_lifecycle_consumed) ||
         stats[k_java_remote_parent_stat_take_missing] != 2 || unexpected_update ||
         unexpected_delete) {
         fail("retained task terminal accepted a mismatched task link");
@@ -4629,6 +5278,7 @@ int main(void) {
     test_detached_zero_cleanup_retains_adoption_artifacts();
     test_cross_generation_guard_does_not_block_detached_cleanup();
     test_cleanup_unlinks_and_cleans_a_different_detached_generation();
+    test_owner_cleanup_release_tails_are_recoverable();
     test_internal_cleanup_claim_is_transient();
     test_generation_claim_status_validation();
     test_ambiguity_claim_collision_reports_committed_status();
@@ -4642,7 +5292,10 @@ int main(void) {
     test_exact_receive_detach_fences_task_discard_after_guard();
     test_exact_receive_detach_preclaims_generation_before_guard();
     test_exact_receive_detach_fences_task_take_during_delete_retry();
+    test_aliased_reset_guard_release_failure_retains_tail();
     test_take_claim_revalidates_state_and_generation_index();
+    test_visible_final_claim_survives_post_claim_guard();
+    test_task_link_is_revalidated_after_claim();
     test_exact_receive_detach_verifies_fallback_and_owner_deletes();
     test_exact_receive_detach_verifies_connection_half_states();
     test_exact_receive_detach_preserves_replacements();
@@ -4654,12 +5307,15 @@ int main(void) {
     test_exact_receive_detach_claim_failures_are_fail_closed();
     test_exact_receive_zero_alias_claim_failures_are_fail_closed();
     test_exact_receive_take_completion_requires_strict_postconditions();
-    test_exact_receive_detach_rechecks_post_guard_interference();
+    test_exact_receive_detach_preserves_post_guard_successors();
+    test_zero_alias_reset_final_guard_release_preserves_successor();
+    test_aliased_reset_final_guard_release_preserves_successor();
     test_exact_receive_connection_delete_rechecks_late_cookie();
     test_finish_guard_and_terminal_failures_are_fenced();
     test_finish_physical_failures_are_fenced();
     test_finish_logical_failures_are_fenced();
     test_finish_release_failures_are_fenced();
+    test_finish_final_guard_release_preserves_successor();
     test_live_task_finish_claim_release_preserves_repeat_status();
     test_detached_finish_preserves_successor_terminal();
     return 0;

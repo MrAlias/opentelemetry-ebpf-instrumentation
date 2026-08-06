@@ -618,9 +618,10 @@ static __noinline __attribute__((unused)) u8 java_remote_parent_cleanup_acquire(
                          sizeof(indexed->reserved)) != 0 ||
         !java_remote_parent_exact_receive_claim_matches(&scratch->key, &scratch->claim) ||
         !java_remote_parent_detach_guard_matches_at(&scratch->key, &scratch->guard_key)) {
-        // No generation artifact was mutated. The exact marker/claim remains
-        // for userspace recovery; release only our owner-scoped guard.
-        java_remote_parent_delete_exact_detach_guard_at(&scratch->guard_key, &scratch->guard_claim);
+        // No generation artifact was mutated. Retain the complete marker,
+        // exact-claim, and owner-guard tuple for userspace recovery. Releasing
+        // G=0 here would let the outer failure path re-mark an already released
+        // generation after a concurrent cleanup completed.
         return 0;
     }
 
@@ -746,16 +747,17 @@ java_remote_parent_cleanup_release(java_remote_parent_cleanup_scratch_t *scratch
     }
     bpf_map_delete_elem(&java_remote_parent_ambiguity, &scratch->key);
     if (!java_remote_parent_generation_ambiguity_absent(&scratch->key)) {
-        return 0;
+        // Payload cleanup is complete. Preserve whichever marker survived the
+        // retirement attempt and never let the outer wrapper re-mark old G.
+        return 1;
     }
-    if (!java_remote_parent_delete_exact_receive_claim(&scratch->key, &scratch->claim)) {
-        java_remote_parent_mark_exact_receive_cleanup_failed(&scratch->key, &scratch->claim);
-        return 0;
-    }
-    if (!java_remote_parent_delete_exact_detach_guard_at(&scratch->guard_key,
-                                                         &scratch->guard_claim)) {
-        java_remote_parent_mark_exact_receive_cleanup_failed(&scratch->key, &scratch->claim);
-        return 0;
+    // Marker deletion completes payload cleanup. Claim/guard retirement is
+    // best-effort so a concurrent releaser can never make the outer wrapper
+    // recreate an old marker after G=0 linearization.
+    java_remote_parent_delete_exact_receive_claim(&scratch->key, &scratch->claim);
+    if (!bpf_map_lookup_elem(&java_remote_parent_claims, &scratch->key) &&
+        java_remote_parent_generation_ambiguity_absent(&scratch->key)) {
+        java_remote_parent_delete_exact_detach_guard_at(&scratch->guard_key, &scratch->guard_claim);
     }
     return 1;
 }
@@ -1047,9 +1049,20 @@ static __always_inline u8 java_remote_parent_exact_receive_claim_matches(
 
 static __always_inline u8 java_remote_parent_delete_exact_receive_claim(
     const java_remote_parent_key_t *expected, const java_remote_parent_claim_t *local_claim) {
-    return java_remote_parent_exact_receive_claim_matches(expected, local_claim) &&
-           bpf_map_delete_elem(&java_remote_parent_claims, expected) == 0 &&
-           !bpf_map_lookup_elem(&java_remote_parent_claims, expected);
+    const java_remote_parent_claim_t *claim =
+        bpf_map_lookup_elem(&java_remote_parent_claims, expected);
+    if (!claim || __builtin_memcmp(claim, local_claim, sizeof(*local_claim)) != 0) {
+        // Absence or replacement means the local claim was already released.
+        return 1;
+    }
+    if (bpf_map_delete_elem(&java_remote_parent_claims, expected) != 0) {
+        claim = bpf_map_lookup_elem(&java_remote_parent_claims, expected);
+        // Report failure only while the exact local claim demonstrably remains.
+        return !claim || __builtin_memcmp(claim, local_claim, sizeof(*local_claim)) != 0;
+    }
+    // Successful deletion is the release linearization point. A consumer may
+    // publish a successor claim immediately afterward.
+    return 1;
 }
 
 static __always_inline u8
@@ -1597,7 +1610,9 @@ java_remote_parent_cleanup_exact_receive_zero_alias(const java_remote_parent_key
         !java_remote_parent_generation_cleanly_reserved(expected) ||
         !java_remote_parent_exact_receive_claim_matches(expected, &scratch->generation_claim) ||
         !java_remote_parent_reset_fences_match(expected, scratch)) {
-        if (java_remote_parent_delete_exact_receive_claim(expected, &scratch->generation_claim)) {
+        java_remote_parent_delete_exact_receive_claim(expected, &scratch->generation_claim);
+        if (!bpf_map_lookup_elem(&java_remote_parent_claims, expected) &&
+            java_remote_parent_generation_cleanly_reserved(expected)) {
             java_remote_parent_delete_exact_detach_guard_at(&scratch->guard_key,
                                                             &scratch->guard_claim);
         }
@@ -1645,21 +1660,22 @@ java_remote_parent_cleanup_exact_receive_zero_alias(const java_remote_parent_key
     // operation follows any fence release.
     bpf_map_delete_elem(&java_remote_parent_ambiguity, expected);
     if (!java_remote_parent_generation_ambiguity_absent(expected)) {
-        java_remote_parent_mark_exact_receive_cleanup_failed(expected, &scratch->generation_claim);
-        return 0;
+        // Logical RESET is complete. Preserve whichever marker survived the
+        // retirement attempt and never re-mark a possibly reused generation.
+        return 1;
     }
-    if (!java_remote_parent_delete_exact_receive_claim(expected, &scratch->generation_claim)) {
-        java_remote_parent_mark_exact_receive_cleanup_failed(expected, &scratch->generation_claim);
-        return 0;
+    // Marker deletion completes RESET. Retire the remaining fences only while
+    // the exact claim is absent; otherwise leave the guard for asynchronous
+    // convergence and never recreate the released marker.
+    java_remote_parent_delete_exact_receive_claim(expected, &scratch->generation_claim);
+    if (!bpf_map_lookup_elem(&java_remote_parent_claims, expected) &&
+        java_remote_parent_generation_ambiguity_absent(expected)) {
+        java_remote_parent_delete_exact_detach_guard_at(&scratch->guard_key, &scratch->guard_claim);
     }
-    if (!java_remote_parent_delete_exact_detach_guard_at(&scratch->guard_key,
-                                                         &scratch->guard_claim)) {
-        java_remote_parent_mark_exact_receive_cleanup_failed(expected, &scratch->generation_claim);
-        return 0;
-    }
-    return java_remote_parent_exact_receive_completed_terminal_free(
-               expected, connection, connection_netns, connection_netns_cookie, socket_cookie) &&
-           !java_remote_parent_owner_detach_guarded(&expected->owner);
+    // Exact guard deletion is the linearization point. A successor may reuse
+    // the owner and generation keys immediately afterward, so no old-G
+    // postcheck or cleanup-failed marker is valid beyond this point.
+    return 1;
 }
 
 // RESET is a receive-lifecycle correction, not a take/discard outcome. It
@@ -1754,30 +1770,15 @@ java_remote_parent_detach_exact_receive_generation(const java_remote_parent_key_
         !java_remote_parent_generation_cleanly_reserved(expected) ||
         !java_remote_parent_exact_receive_claim_matches(expected, &scratch->generation_claim) ||
         !java_remote_parent_reset_fences_match(expected, scratch)) {
-        const u8 zero_aliases = state && !state->aliases;
-        if (!java_remote_parent_delete_exact_receive_claim(expected, &scratch->generation_claim)) {
-            return 0;
+        java_remote_parent_delete_exact_receive_claim(expected, &scratch->generation_claim);
+        if (!bpf_map_lookup_elem(&java_remote_parent_claims, expected) &&
+            java_remote_parent_generation_cleanly_reserved(expected)) {
+            java_remote_parent_delete_exact_detach_guard_at(&scratch->guard_key,
+                                                            &scratch->guard_claim);
         }
-        if (!java_remote_parent_delete_exact_detach_guard_at(&scratch->guard_key,
-                                                             &scratch->guard_claim)) {
-            return 0;
-        }
-        if ((java_remote_parent_exact_receive_completed_by_take(expected,
-                                                                process_incarnation,
-                                                                observed_monotime_ns,
-                                                                connection,
-                                                                connection_netns,
-                                                                connection_netns_cookie,
-                                                                socket_cookie) ||
-             java_remote_parent_exact_receive_completed_terminal_free(
-                 expected, connection, connection_netns, connection_netns_cookie, socket_cookie)) &&
-            !java_remote_parent_owner_detach_guarded(&expected->owner)) {
-            return 1;
-        }
-        if (zero_aliases) {
-            return java_remote_parent_cleanup_exact_receive_zero_alias(
-                expected, process_incarnation, connection, connection_netns, socket_cookie);
-        }
+        // This attempt did not prove RESET completion. The successful guard
+        // deletion still linearizes its release; do not classify or mutate
+        // artifacts that may be published by a later owner operation.
         return 0;
     }
 
@@ -1815,64 +1816,15 @@ java_remote_parent_detach_exact_receive_generation(const java_remote_parent_key_
     // Aliased success preserves the zero reservation that keeps this detached
     // state enumerable. Release only the exact claim and then the owner guard;
     // no destructive operation follows either fence release.
-    if (!java_remote_parent_delete_exact_receive_claim(expected, &scratch->generation_claim)) {
-        java_remote_parent_mark_exact_receive_cleanup_failed(expected, &scratch->generation_claim);
-        return 0;
+    java_remote_parent_delete_exact_receive_claim(expected, &scratch->generation_claim);
+    if (!bpf_map_lookup_elem(&java_remote_parent_claims, expected) &&
+        java_remote_parent_generation_cleanly_reserved(expected)) {
+        java_remote_parent_delete_exact_detach_guard_at(&scratch->guard_key, &scratch->guard_claim);
     }
-    if (!java_remote_parent_delete_exact_detach_guard_at(&scratch->guard_key,
-                                                         &scratch->guard_claim)) {
-        java_remote_parent_mark_exact_receive_cleanup_failed(expected, &scratch->generation_claim);
-        return 0;
-    }
-    if (java_remote_parent_exact_receive_completed_by_take(expected,
-                                                           process_incarnation,
-                                                           observed_monotime_ns,
-                                                           connection,
-                                                           connection_netns,
-                                                           connection_netns_cookie,
-                                                           socket_cookie) &&
-        !java_remote_parent_owner_detach_guarded(&expected->owner)) {
-        return 1;
-    }
-
-    // The final alias can unwind while RESET holds the owner guard. The
-    // release-side janitor deliberately refuses in that interval; once the
-    // guard is gone, RESET is the other side of the protocol and retries the
-    // observation-bound terminal-free cleanup.
-    state = bpf_map_lookup_elem(&java_remote_parent_state, expected);
-    if (state && !state->aliases && state->process_incarnation == process_incarnation &&
-        state->observed_monotime_ns == observed_monotime_ns) {
-        java_remote_parent_cleanup_detached_zero_alias(
-            expected, process_incarnation, observed_monotime_ns);
-        state = bpf_map_lookup_elem(&java_remote_parent_state, expected);
-    }
-    if (!state || !state->aliases) {
-        if ((java_remote_parent_exact_receive_completed_by_take(expected,
-                                                                process_incarnation,
-                                                                observed_monotime_ns,
-                                                                connection,
-                                                                connection_netns,
-                                                                connection_netns_cookie,
-                                                                socket_cookie) ||
-             java_remote_parent_exact_receive_completed_terminal_free(
-                 expected, connection, connection_netns, connection_netns_cookie, socket_cookie)) &&
-            !java_remote_parent_owner_detach_guarded(&expected->owner)) {
-            return 1;
-        }
-        return 0;
-    }
-    if (state->process_incarnation != process_incarnation ||
-        state->observed_monotime_ns != observed_monotime_ns) {
-        return 0;
-    }
-    return java_remote_parent_exact_receive_detached_state_matches(expected,
-                                                                   process_incarnation,
-                                                                   connection,
-                                                                   connection_netns,
-                                                                   observed_monotime_ns,
-                                                                   connection_netns_cookie,
-                                                                   socket_cookie) &&
-           !java_remote_parent_owner_detach_guarded(&expected->owner);
+    // Exact guard deletion is the linearization point. The direct cursor has
+    // been removed and the aliased state is intentionally detached. Later
+    // alias convergence or successor publication belongs to another operation.
+    return 1;
 }
 
 static __always_inline u8 java_remote_parent_detached_zero_state_matches(
@@ -2370,21 +2322,11 @@ java_remote_parent_stage_finish_publication(java_remote_parent_stage_transaction
         !java_remote_parent_delete_exact_receive_claim(&transaction->key, &transaction->claim)) {
         return 0;
     }
-
-    state = bpf_map_lookup_elem(&java_remote_parent_state, &transaction->key);
-    if (!java_remote_parent_stage_state_matches_transaction(transaction, state)) {
-        return 0;
-    }
-    value.state.connection = state->connection;
-    return java_remote_parent_stage_transaction_is_consistent(transaction,
-                                                              incoming,
-                                                              &connection_key,
-                                                              &value.state.connection,
-                                                              state->connection_netns,
-                                                              guard_key,
-                                                              k_java_remote_parent_lifecycle_active,
-                                                              NULL,
-                                                              1);
+    // Releasing the publishing claim commits STAGE. A legitimate consumer can
+    // install its own exact claim immediately afterward, so no graph or claim
+    // observation beyond this point may turn the committed publication into a
+    // rollback.
+    return 1;
 }
 
 static __noinline __attribute__((unused)) void
@@ -2621,14 +2563,19 @@ static __noinline __attribute__((unused)) u8 java_remote_parent_stage_release_ro
     // guard in order; no destructive operation follows either fence release.
     bpf_map_delete_elem(&java_remote_parent_ambiguity, &transaction->key);
     if (!java_remote_parent_generation_ambiguity_absent(&transaction->key)) {
-        java_remote_parent_ensure_exact_ambiguity(&transaction->key);
-        return 0;
+        // Rollback payload is already absent. Preserve whichever marker
+        // survived this attempt and suppress the outer old-G re-mark.
+        return 1;
     }
-    if (!java_remote_parent_delete_exact_receive_claim(&transaction->key, &transaction->claim)) {
-        java_remote_parent_ensure_exact_ambiguity(&transaction->key);
-        return 0;
+    // M absence commits rollback. Retire E and G=0 best-effort, but never let
+    // an exact-delete failure or a replacement fence make the outer caller
+    // recreate the released marker.
+    java_remote_parent_delete_exact_receive_claim(&transaction->key, &transaction->claim);
+    if (!bpf_map_lookup_elem(&java_remote_parent_claims, &transaction->key) &&
+        java_remote_parent_generation_ambiguity_absent(&transaction->key)) {
+        java_remote_parent_delete_exact_detach_guard_at(&guard_key, guard_claim);
     }
-    return java_remote_parent_delete_exact_detach_guard_at(&guard_key, guard_claim);
+    return 1;
 }
 
 static __always_inline u64 java_remote_parent_stage(const connection_info_t *connection,
@@ -2694,9 +2641,9 @@ static __always_inline u64 java_remote_parent_stage(const connection_info_t *con
         return 0;
     }
     if (!java_remote_parent_reserve_exact_ambiguity(&transaction.key)) {
-        if (!java_remote_parent_delete_exact_receive_claim(&transaction.key, &transaction.claim)) {
-            java_remote_parent_ensure_exact_ambiguity(&transaction.key);
-        }
+        // No marker was published. An exact-only failure tail is recoverable;
+        // never synthesize M after a concurrently completed claim release.
+        java_remote_parent_delete_exact_receive_claim(&transaction.key, &transaction.claim);
         java_remote_parent_stat_add(k_java_remote_parent_stat_stage_overload);
         return 0;
     }
@@ -2713,13 +2660,11 @@ static __always_inline u64 java_remote_parent_stage(const connection_info_t *con
         if (java_remote_parent_generation_cleanly_reserved(&transaction.key) &&
             java_remote_parent_exact_receive_claim_matches(&transaction.key, &transaction.claim)) {
             bpf_map_delete_elem(&java_remote_parent_ambiguity, &transaction.key);
-            if (!java_remote_parent_generation_ambiguity_absent(&transaction.key) ||
-                !java_remote_parent_delete_exact_receive_claim(&transaction.key,
-                                                               &transaction.claim)) {
-                java_remote_parent_ensure_exact_ambiguity(&transaction.key);
+            if (java_remote_parent_generation_ambiguity_absent(&transaction.key)) {
+                // No G artifact or owner guard exists in this branch. Once M
+                // is absent, release E best-effort and never recreate M.
+                java_remote_parent_delete_exact_receive_claim(&transaction.key, &transaction.claim);
             }
-        } else {
-            java_remote_parent_ensure_exact_ambiguity(&transaction.key);
         }
         java_remote_parent_stat_add(k_java_remote_parent_stat_stage_ambiguous);
         return 0;
@@ -3706,33 +3651,19 @@ java_remote_parent_finish_release_claim(const java_remote_parent_resolution_t *r
     // no destructive operation follows any fence release.
     bpf_map_delete_elem(&java_remote_parent_ambiguity, &resolution->key);
     if (!java_remote_parent_generation_ambiguity_absent(&resolution->key)) {
-        java_remote_parent_mark_exact_receive_cleanup_failed(&resolution->key, owned_claim);
-        return 0;
+        // FINISH payload is complete. Preserve whichever marker survived the
+        // retirement attempt and never re-mark a possibly reused generation.
+        return 1;
     }
-    if (!java_remote_parent_finish_barriers_valid(
-            resolution, lifecycle, observed_monotime_ns, owned_claim, guard) ||
-        !java_remote_parent_delete_exact_receive_claim(&resolution->key, owned_claim)) {
-        return 0;
+    java_remote_parent_delete_exact_receive_claim(&resolution->key, owned_claim);
+    if (!bpf_map_lookup_elem(&java_remote_parent_claims, &resolution->key) &&
+        java_remote_parent_generation_ambiguity_absent(&resolution->key)) {
+        java_remote_parent_delete_exact_detach_guard_at(&guard->key, &guard->claim);
     }
-    if (!java_remote_parent_delete_exact_detach_guard_at(&guard->key, &guard->claim)) {
-        return 0;
-    }
-
-    // The exact terminal remains durable, so generation-in-use rejects every
-    // future publisher of G. Connection-index publishers run only inside that
-    // claimed generation transaction; invalidators can delete or mark G but
-    // never insert an index. The sibling physical absence proof therefore
-    // remains stable after the final fence release. Recheck every artifact that
-    // can still be published independently at this boundary.
-    owner = bpf_map_lookup_elem(&java_remote_parent_owners, &resolution->key.owner);
-    return java_remote_parent_generation_ambiguity_absent(&resolution->key) &&
-           !bpf_map_lookup_elem(&java_remote_parent_claims, &resolution->key) &&
-           !java_remote_parent_owner_detach_guarded(&resolution->key.owner) &&
-           (!owner || owner->generation != resolution->key.generation) &&
-           !bpf_map_lookup_elem(&java_remote_parent_state, &resolution->key) &&
-           !bpf_map_lookup_elem(&java_remote_parent_generation_index, &resolution->key) &&
-           !java_remote_parent_fallback_has_generation(&resolution->key.owner,
-                                                       resolution->key.generation);
+    // Exact guard deletion is the linearization point. A successor may reuse
+    // the owner and generation keys immediately afterward, so no old-G
+    // postcheck or cleanup-failed marker is valid beyond this point.
+    return 1;
 }
 
 static __always_inline void
@@ -3807,8 +3738,10 @@ java_remote_parent_claim(const java_remote_parent_resolution_t *resolution,
         0) {
         *owned_claim = claim;
         if (java_remote_parent_owner_detach_guarded(&resolution->key.owner)) {
-            java_remote_parent_delete_exact_receive_claim(&resolution->key, &claim);
-            __builtin_memset(owned_claim, 0, sizeof(*owned_claim));
+            // A final-status claim is externally visible as soon as BPF_NOEXIST
+            // succeeds. Never roll it back after another reader could have
+            // classified it as consumed; fence it for coordinated cleanup.
+            java_remote_parent_mark_exact_receive_cleanup_failed(&resolution->key, &claim);
             return k_java_remote_parent_status_overload;
         }
         // Resolution precedes claim publication. Revalidate the authoritative
@@ -3830,11 +3763,8 @@ java_remote_parent_claim(const java_remote_parent_resolution_t *resolution,
             java_remote_parent_generation_cleanly_reserved(&resolution->key)) {
             return k_java_remote_parent_status_valid;
         }
-        if (java_remote_parent_delete_exact_receive_claim(&resolution->key, &claim)) {
-            __builtin_memset(owned_claim, 0, sizeof(*owned_claim));
-            return k_java_remote_parent_status_missing;
-        }
-        return k_java_remote_parent_status_overload;
+        java_remote_parent_mark_exact_receive_cleanup_failed(&resolution->key, &claim);
+        return k_java_remote_parent_status_missing;
     }
 
     const java_remote_parent_claim_t *claimed =
@@ -4034,10 +3964,25 @@ java_remote_parent_retrieve_for_connection(java_remote_parent_response_t *respon
         java_remote_parent_retrieval_stat(discard, k_java_remote_parent_status_missing);
         return k_java_remote_parent_status_missing;
     }
+    if (resolution.found && resolution.via_task &&
+        !java_remote_parent_retrieval_task_link_matches(&resolution, &start)) {
+        java_remote_parent_init_response(
+            response, k_java_remote_parent_status_ambiguous, resolution.key.generation, 0);
+        java_remote_parent_retrieval_stat(discard, k_java_remote_parent_status_ambiguous);
+        return k_java_remote_parent_status_ambiguous;
+    }
     u8 claim_found = 0;
     enum java_remote_parent_status existing_claim_status = k_java_remote_parent_status_ambiguous;
-    if (resolution.ambiguous && resolution.found) {
+    if (resolution.found && (resolution.ambiguous || resolution.indexed.lifecycle !=
+                                                         k_java_remote_parent_lifecycle_active)) {
         existing_claim_status = java_remote_parent_existing_claim_status(&resolution, &claim_found);
+        // Ordered fence retirement can leave exact E after M is gone. Make any
+        // exact claim the classification authority before connection binding:
+        // final claims replay their terminal outcome, publishing claims
+        // overload, and malformed claims fail closed as ambiguous.
+        if (claim_found) {
+            resolution.ambiguous = 1;
+        }
     }
     if (expected_connection && resolution.found) {
         const java_remote_parent_state_t *bound_state =
@@ -4069,6 +4014,10 @@ java_remote_parent_retrieve_for_connection(java_remote_parent_response_t *respon
 
     if (resolution.ambiguous) {
         if (claim_found) {
+            if (resolution.via_task &&
+                !java_remote_parent_retrieval_task_link_matches(&resolution, &start)) {
+                existing_claim_status = k_java_remote_parent_status_ambiguous;
+            }
             java_remote_parent_init_response(
                 response, existing_claim_status, resolution.key.generation, 0);
             java_remote_parent_retrieval_stat(discard, existing_claim_status);
@@ -4095,10 +4044,15 @@ java_remote_parent_retrieve_for_connection(java_remote_parent_response_t *respon
                 const enum java_remote_parent_status raced_claim_status =
                     java_remote_parent_existing_claim_status(&resolution, &raced_claim_found);
                 if (raced_claim_found) {
+                    const enum java_remote_parent_status authoritative_status =
+                        resolution.via_task &&
+                                !java_remote_parent_retrieval_task_link_matches(&resolution, &start)
+                            ? k_java_remote_parent_status_ambiguous
+                            : raced_claim_status;
                     java_remote_parent_init_response(
-                        response, raced_claim_status, resolution.key.generation, 0);
-                    java_remote_parent_retrieval_stat(discard, raced_claim_status);
-                    return raced_claim_status;
+                        response, authoritative_status, resolution.key.generation, 0);
+                    java_remote_parent_retrieval_stat(discard, authoritative_status);
+                    return authoritative_status;
                 }
             }
         }
@@ -4156,6 +4110,19 @@ java_remote_parent_retrieve_for_connection(java_remote_parent_response_t *respon
     java_remote_parent_claim_t owned_claim = {0};
     const enum java_remote_parent_status claim_status =
         java_remote_parent_claim(&resolution, discard, &owned_claim);
+    if (resolution.via_task &&
+        !java_remote_parent_retrieval_task_link_matches(&resolution, &start)) {
+        if (owned_claim.observed_monotime_ns) {
+            java_remote_parent_finish_generation(&resolution,
+                                                 k_java_remote_parent_lifecycle_ambiguous,
+                                                 resolution.observed_monotime_ns,
+                                                 &owned_claim);
+        }
+        java_remote_parent_init_response(
+            response, k_java_remote_parent_status_ambiguous, resolution.key.generation, 0);
+        java_remote_parent_retrieval_stat(discard, k_java_remote_parent_status_ambiguous);
+        return k_java_remote_parent_status_ambiguous;
+    }
     if (claim_status != k_java_remote_parent_status_valid) {
         java_remote_parent_init_response(response, claim_status, resolution.key.generation, 0);
         java_remote_parent_retrieval_stat(discard, claim_status);
@@ -4165,12 +4132,19 @@ java_remote_parent_retrieve_for_connection(java_remote_parent_response_t *respon
     java_remote_parent_state_t *state =
         bpf_map_lookup_elem(&java_remote_parent_state, &resolution.key);
     if (!state) {
-        java_remote_parent_init_response(
-            response, k_java_remote_parent_status_missing, resolution.key.generation, 0);
-        java_remote_parent_finish_generation(
-            &resolution, k_java_remote_parent_lifecycle_discarded, 0, &owned_claim);
-        java_remote_parent_retrieval_stat(discard, k_java_remote_parent_status_missing);
-        return k_java_remote_parent_status_missing;
+        const u8 task_rebound =
+            resolution.via_task &&
+            !java_remote_parent_retrieval_task_link_matches(&resolution, &start);
+        const enum java_remote_parent_status status = task_rebound
+                                                          ? k_java_remote_parent_status_ambiguous
+                                                          : k_java_remote_parent_status_missing;
+        const enum java_remote_parent_lifecycle lifecycle =
+            task_rebound ? k_java_remote_parent_lifecycle_ambiguous
+                         : k_java_remote_parent_lifecycle_discarded;
+        java_remote_parent_init_response(response, status, resolution.key.generation, 0);
+        java_remote_parent_finish_generation(&resolution, lifecycle, 0, &owned_claim);
+        java_remote_parent_retrieval_stat(discard, status);
+        return status;
     }
 
     const java_remote_parent_response_t *claimed_fallback = NULL;
@@ -4191,6 +4165,18 @@ java_remote_parent_retrieve_for_connection(java_remote_parent_response_t *respon
          (!claimed_fallback || claimed_fallback->status != k_java_remote_parent_status_valid ||
           java_remote_parent_le64_to_cpu(claimed_fallback->generation_le) !=
               resolution.key.generation))) {
+        java_remote_parent_init_response(
+            response, k_java_remote_parent_status_ambiguous, resolution.key.generation, 0);
+        java_remote_parent_finish_generation(&resolution,
+                                             k_java_remote_parent_lifecycle_ambiguous,
+                                             state->observed_monotime_ns,
+                                             &owned_claim);
+        java_remote_parent_retrieval_stat(discard, k_java_remote_parent_status_ambiguous);
+        return k_java_remote_parent_status_ambiguous;
+    }
+
+    if (resolution.via_task &&
+        !java_remote_parent_retrieval_task_link_matches(&resolution, &start)) {
         java_remote_parent_init_response(
             response, k_java_remote_parent_status_ambiguous, resolution.key.generation, 0);
         java_remote_parent_finish_generation(&resolution,

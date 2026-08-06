@@ -265,11 +265,19 @@ static __always_inline u8 java_remote_parent_delete_exact_detach_guard_at(
     const java_remote_parent_key_t *guard_key, const java_remote_parent_claim_t *local_guard) {
     const java_remote_parent_claim_t *guard =
         bpf_map_lookup_elem(&java_remote_parent_claims, guard_key);
-    if (!guard || __builtin_memcmp(guard, local_guard, sizeof(*local_guard)) != 0 ||
-        bpf_map_delete_elem(&java_remote_parent_claims, guard_key) != 0) {
-        return 0;
+    if (!guard || __builtin_memcmp(guard, local_guard, sizeof(*local_guard)) != 0) {
+        // Absence or replacement means the old guard was already released.
+        return 1;
     }
-    return !bpf_map_lookup_elem(&java_remote_parent_claims, guard_key);
+    if (bpf_map_delete_elem(&java_remote_parent_claims, guard_key) != 0) {
+        guard = bpf_map_lookup_elem(&java_remote_parent_claims, guard_key);
+        // Report failure only while the exact old guard demonstrably remains.
+        return !guard || __builtin_memcmp(guard, local_guard, sizeof(*local_guard)) != 0;
+    }
+    // Successful exact deletion is the release linearization point. A new
+    // owner operation may publish another guard immediately afterward; that
+    // successor must not make this completed release look like a failure.
+    return 1;
 }
 
 static __always_inline u8 java_remote_parent_exact_detach_guard_matches_at(
@@ -703,13 +711,11 @@ java_remote_parent_invalidate_connection(const connection_info_t *connection,
         return;
     }
 
-    claim = bpf_map_lookup_elem(&java_remote_parent_claims, &key);
-    if (durable_ambiguity && claim &&
-        __builtin_memcmp(claim, &local_claim, sizeof(local_claim)) == 0) {
-        // Fresh claims cannot be reaped or replaced during one non-sleeping BPF
-        // invocation. No physical delete follows this exact release.
-        bpf_map_delete_elem(&java_remote_parent_claims, &key);
-    }
+    // Retain the exact ambiguity claim with the marker. A stale invalidator can
+    // resume while another actor is retiring this generation's fences; dropping
+    // E here could otherwise leave a marker-only tail after G=0 is released.
+    // The aged M+E tuple is intentionally left for userspace convergence.
+    (void)durable_ambiguity;
 }
 
 static __always_inline void

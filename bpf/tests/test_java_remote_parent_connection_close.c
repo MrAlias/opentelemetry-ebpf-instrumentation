@@ -62,6 +62,13 @@ static int ambiguity_marked(void) {
     return ambiguity_present && ambiguity_observed_monotime_ns;
 }
 
+static int ambiguity_claim_retained(u64 process_incarnation) {
+    return claim_present && memcmp(&stored_claim_key, &ambiguous_key, sizeof(ambiguous_key)) == 0 &&
+           stored_claim.observed_monotime_ns == test_ktime_get_ns() &&
+           stored_claim.process_incarnation == process_incarnation &&
+           stored_claim.lifecycle == k_java_remote_parent_lifecycle_ambiguous;
+}
+
 static void *test_map_lookup(void *map, const void *key) {
     if (map == &java_remote_parent_connections && staged_present &&
         memcmp(key, &staged_key, sizeof(staged_key)) == 0) {
@@ -197,8 +204,8 @@ static void test_connection_close_invalidates_staged_generation(void) {
         !same_owner(&ambiguous_key.owner, &staged_connection.owner)) {
         fail("connection close did not invalidate the staged generation");
     }
-    if (!fallback_present) {
-        fail("valid invalidation removed fallback before retrieval cleanup");
+    if (!fallback_present || !ambiguity_claim_retained(indexed_owner.process_incarnation)) {
+        fail("valid invalidation did not retain its userspace cleanup authority");
     }
 }
 
@@ -213,7 +220,7 @@ static void test_orphaned_connection_close_quarantines_and_cleans_indexes(void) 
     java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(&connection, 84, 86, 0);
 
     if (staged_present || cookie_staged_present || !ambiguity_marked() || !fallback_present ||
-        claim_present) {
+        !ambiguity_claim_retained(staged_connection.generation)) {
         fail("orphaned close did not quarantine and clean its physical indexes");
     }
 }
@@ -241,7 +248,8 @@ static void test_matching_incoming_generation_invalidates_stage(void) {
 
     java_remote_parent_mark_connection_ambiguous_in_netns_cookie(&connection, 84, 21);
 
-    if (staged_present || cookie_staged_present || !ambiguity_marked()) {
+    if (staged_present || cookie_staged_present || !ambiguity_marked() ||
+        !ambiguity_claim_retained(indexed_owner.process_incarnation)) {
         fail("matching incoming generation did not invalidate the staged request");
     }
 }

@@ -14,6 +14,7 @@ var disabledBridgeMapNames = [...]string{
 	"incoming_trace_heads",
 	"java_retired_processes",
 	"java_remote_parent_ambiguity",
+	"java_remote_parent_alias_replays",
 	"java_remote_parent_claims",
 	"java_remote_parent_connections",
 	"java_remote_parent_cookie_connections",

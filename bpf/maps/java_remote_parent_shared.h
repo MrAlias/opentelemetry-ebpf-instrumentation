@@ -89,11 +89,89 @@ typedef struct java_remote_parent_data_ack {
 _Static_assert(sizeof(java_remote_parent_connection_t) == 56,
                "java remote-parent connection size mismatch");
 _Static_assert(sizeof(java_remote_parent_owner_t) == 24, "java remote-parent owner size mismatch");
+_Static_assert(__builtin_offsetof(java_remote_parent_owner_t, generation) == 0,
+               "java remote-parent owner generation offset mismatch");
+_Static_assert(__builtin_offsetof(java_remote_parent_owner_t, process_incarnation) == 8,
+               "java remote-parent owner process-incarnation offset mismatch");
+_Static_assert(__builtin_offsetof(java_remote_parent_owner_t, lifecycle) == 16,
+               "java remote-parent owner lifecycle offset mismatch");
+_Static_assert(__builtin_offsetof(java_remote_parent_owner_t, reserved) == 17,
+               "java remote-parent owner reserved offset mismatch");
 _Static_assert(sizeof(java_remote_parent_claim_t) == 24, "java remote-parent claim size mismatch");
+_Static_assert(__builtin_offsetof(java_remote_parent_claim_t, observed_monotime_ns) == 0,
+               "java remote-parent claim observation offset mismatch");
+_Static_assert(__builtin_offsetof(java_remote_parent_claim_t, process_incarnation) == 8,
+               "java remote-parent claim process-incarnation offset mismatch");
+_Static_assert(__builtin_offsetof(java_remote_parent_claim_t, lifecycle) == 16,
+               "java remote-parent claim lifecycle offset mismatch");
+_Static_assert(__builtin_offsetof(java_remote_parent_claim_t, reserved) == 17,
+               "java remote-parent claim reserved offset mismatch");
+_Static_assert(sizeof(((java_remote_parent_claim_t *)0)->lifecycle) +
+                       sizeof(((java_remote_parent_claim_t *)0)->reserved) ==
+                   sizeof(u64),
+               "java remote-parent claim tail size mismatch");
 _Static_assert(sizeof(java_remote_parent_data_signal_key_t) == 24,
                "java remote-parent data-signal key size mismatch");
 _Static_assert(sizeof(java_remote_parent_data_ack_t) == 72,
                "java remote-parent data acknowledgement size mismatch");
+
+static __always_inline u64 java_remote_parent_lifecycle_tail_word(const u8 *tail) {
+    u64 actual;
+    const u8 *aligned_tail = __builtin_assume_aligned(tail, sizeof(actual));
+    __builtin_memcpy(&actual, aligned_tail, sizeof(actual));
+    return java_remote_parent_cpu_to_le64(actual);
+}
+
+static __always_inline u32 java_remote_parent_metadata_word(const u8 *metadata) {
+    u32 actual;
+    const u8 *aligned_metadata = __builtin_assume_aligned(metadata, sizeof(actual));
+    __builtin_memcpy(&actual, aligned_metadata, sizeof(actual));
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    actual = __builtin_bswap32(actual);
+#endif
+    return actual;
+}
+
+// lifecycle followed by reserved[7] is an eight-byte ABI tail in claims,
+// owners, and terminals. Compare it as one endian-correct word so every
+// reserved byte remains required to be zero without multiplying verifier
+// states for seven independent byte predicates.
+static __always_inline u8 java_remote_parent_clean_lifecycle_tail(const u8 *tail, u8 lifecycle) {
+    return java_remote_parent_lifecycle_tail_word(tail) == lifecycle;
+}
+
+// The finish-guard trailer starts with physical_detached, then the boolean
+// replay_required flag and reserved[6]. Preserve the historical unconstrained
+// physical byte while checking the rest of the trailer in one word.
+static __always_inline u8 java_remote_parent_clean_boolean_second_byte_tail(const u8 *tail) {
+    u64 actual;
+    const u8 *aligned_tail = __builtin_assume_aligned(tail, sizeof(actual));
+    __builtin_memcpy(&actual, aligned_tail, sizeof(actual));
+    return (java_remote_parent_cpu_to_le64(actual) >> 8) <= 1;
+}
+
+// Compare all 24 bytes in three verifier-friendly words. The final word is
+// copied from lifecycle plus reserved[7], so this remains byte-exact without
+// expanding a fixed-size memcmp into 24 independent byte predicates.
+static __always_inline u8 java_remote_parent_claim_equal_inline(
+    const java_remote_parent_claim_t *left, const java_remote_parent_claim_t *right) {
+    if (!left || !right) {
+        return 0;
+    }
+    u64 left_tail;
+    u64 right_tail;
+    __builtin_memcpy(&left_tail, &left->lifecycle, sizeof(left_tail));
+    __builtin_memcpy(&right_tail, &right->lifecycle, sizeof(right_tail));
+    volatile u64 mismatch = (left->observed_monotime_ns ^ right->observed_monotime_ns) |
+                            (left->process_incarnation ^ right->process_incarnation) |
+                            (left_tail ^ right_tail);
+    return mismatch == 0;
+}
+
+static __noinline __attribute__((unused)) u8 java_remote_parent_claim_equal(
+    const java_remote_parent_claim_t *left, const java_remote_parent_claim_t *right) {
+    return java_remote_parent_claim_equal_inline(left, right);
+}
 
 typedef struct java_remote_parent_connection_keys {
     connection_info_ns_t netns;
@@ -291,14 +369,14 @@ static __always_inline u8 java_remote_parent_delete_exact_detach_guard_at(
     const java_remote_parent_key_t *guard_key, const java_remote_parent_claim_t *local_guard) {
     const java_remote_parent_claim_t *guard =
         bpf_map_lookup_elem(&java_remote_parent_owner_guards, &guard_key->owner);
-    if (!guard || __builtin_memcmp(guard, local_guard, sizeof(*local_guard)) != 0) {
+    if (!java_remote_parent_claim_equal(guard, local_guard)) {
         // Absence or replacement means the old guard was already released.
         return 1;
     }
     if (bpf_map_delete_elem(&java_remote_parent_owner_guards, &guard_key->owner) != 0) {
         guard = bpf_map_lookup_elem(&java_remote_parent_owner_guards, &guard_key->owner);
         // Report failure only while the exact old guard demonstrably remains.
-        return !guard || __builtin_memcmp(guard, local_guard, sizeof(*local_guard)) != 0;
+        return !java_remote_parent_claim_equal(guard, local_guard);
     }
     // Successful exact deletion is the release linearization point. A new
     // owner operation may publish another guard immediately afterward; that
@@ -321,7 +399,7 @@ static __always_inline u8 java_remote_parent_exact_detach_guard_matches_at(
     const java_remote_parent_key_t *guard_key, const java_remote_parent_claim_t *local_guard) {
     const java_remote_parent_claim_t *guard =
         bpf_map_lookup_elem(&java_remote_parent_owner_guards, &guard_key->owner);
-    return guard && __builtin_memcmp(guard, local_guard, sizeof(*local_guard)) == 0;
+    return java_remote_parent_claim_equal(guard, local_guard);
 }
 
 static __always_inline u8 java_remote_parent_handoff_exact_fence(
@@ -337,7 +415,7 @@ static __always_inline u8 java_remote_parent_handoff_exact_fence(
     }
     const java_remote_parent_claim_t *current =
         bpf_map_lookup_elem(&java_remote_parent_claims, key);
-    if (!current || __builtin_memcmp(current, local_fence, sizeof(*local_fence)) != 0) {
+    if (!java_remote_parent_claim_equal(current, local_fence)) {
         // Absence or replacement means this invocation has no fence left to
         // hand off. Never update a value that is not exactly invocation-local.
         return 1;
@@ -359,22 +437,20 @@ static __always_inline u8 java_remote_parent_handoff_exact_fence(
         return 0;
     }
     current = bpf_map_lookup_elem(&java_remote_parent_claims, key);
-    return current && __builtin_memcmp(current, &cleanup, sizeof(cleanup)) == 0;
+    return java_remote_parent_claim_equal(current, &cleanup);
 }
 
 static __always_inline u8 java_remote_parent_handoff_exact_detach_guard_at(
     const java_remote_parent_key_t *guard_key, const java_remote_parent_claim_t *local_guard) {
     if (!guard_key || guard_key->generation || guard_key->reserved || !local_guard ||
         !local_guard->observed_monotime_ns || !local_guard->process_incarnation ||
-        local_guard->lifecycle != k_java_remote_parent_lifecycle_publishing ||
-        __builtin_memcmp(local_guard->reserved,
-                         (unsigned char[sizeof(local_guard->reserved)]){0},
-                         sizeof(local_guard->reserved)) != 0) {
+        !java_remote_parent_clean_lifecycle_tail(&local_guard->lifecycle,
+                                                 k_java_remote_parent_lifecycle_publishing)) {
         return 0;
     }
     const java_remote_parent_claim_t *current =
         bpf_map_lookup_elem(&java_remote_parent_owner_guards, &guard_key->owner);
-    if (!current || __builtin_memcmp(current, local_guard, sizeof(*local_guard)) != 0) {
+    if (!java_remote_parent_claim_equal(current, local_guard)) {
         return 1;
     }
     if (local_guard->observed_monotime_ns == ~(u64)0) {
@@ -392,7 +468,7 @@ static __always_inline u8 java_remote_parent_handoff_exact_detach_guard_at(
         return 0;
     }
     current = bpf_map_lookup_elem(&java_remote_parent_owner_guards, &guard_key->owner);
-    return current && __builtin_memcmp(current, &cleanup, sizeof(cleanup)) == 0;
+    return java_remote_parent_claim_equal(current, &cleanup);
 }
 
 static __always_inline u8
@@ -717,7 +793,7 @@ java_remote_parent_generation_ambiguity_absent(const java_remote_parent_key_t *k
     return bpf_map_lookup_elem(&java_remote_parent_ambiguity, key) == NULL;
 }
 
-static __always_inline void
+static __noinline __attribute__((unused)) void
 java_remote_parent_delete_connection_indexes(const connection_info_t *connection,
                                              const java_remote_parent_connection_t *staged) {
     if (!staged || staged->reserved != 0 || staged->reserved2 != 0 || !staged->netns ||
@@ -725,35 +801,58 @@ java_remote_parent_delete_connection_indexes(const connection_info_t *connection
         return;
     }
 
-    java_remote_parent_connection_t copy = {0};
-    __builtin_memcpy(&copy, staged, sizeof(copy));
     java_remote_parent_connection_keys_t keys = {0};
     if (!java_remote_parent_connection_keys_init(
-            &keys, connection, copy.netns, copy.netns_cookie)) {
+            &keys, connection, staged->netns, staged->netns_cookie)) {
         return;
     }
     const java_remote_parent_connection_t *netns_staged =
         bpf_map_lookup_elem(&java_remote_parent_connections, &keys.netns);
     if (netns_staged && netns_staged->reserved == 0 && netns_staged->reserved2 == 0 &&
-        netns_staged->generation == copy.generation && netns_staged->netns == copy.netns &&
-        netns_staged->netns_cookie == copy.netns_cookie &&
-        netns_staged->incoming_generation == copy.incoming_generation &&
-        netns_staged->socket_cookie == copy.socket_cookie &&
-        netns_staged->owner.tid == copy.owner.tid && netns_staged->owner.pid == copy.owner.pid &&
-        netns_staged->owner.ns == copy.owner.ns) {
+        netns_staged->generation == staged->generation && netns_staged->netns == staged->netns &&
+        netns_staged->netns_cookie == staged->netns_cookie &&
+        netns_staged->incoming_generation == staged->incoming_generation &&
+        netns_staged->socket_cookie == staged->socket_cookie &&
+        netns_staged->owner.tid == staged->owner.tid &&
+        netns_staged->owner.pid == staged->owner.pid &&
+        netns_staged->owner.ns == staged->owner.ns) {
         bpf_map_delete_elem(&java_remote_parent_connections, &keys.netns);
     }
 
     const java_remote_parent_connection_t *cookie_staged =
         bpf_map_lookup_elem(&java_remote_parent_cookie_connections, &keys.cookie);
     if (cookie_staged && cookie_staged->reserved == 0 && cookie_staged->reserved2 == 0 &&
-        cookie_staged->generation == copy.generation && cookie_staged->netns == copy.netns &&
-        cookie_staged->netns_cookie == copy.netns_cookie &&
-        cookie_staged->incoming_generation == copy.incoming_generation &&
-        cookie_staged->socket_cookie == copy.socket_cookie &&
-        cookie_staged->owner.tid == copy.owner.tid && cookie_staged->owner.pid == copy.owner.pid &&
-        cookie_staged->owner.ns == copy.owner.ns) {
+        cookie_staged->generation == staged->generation && cookie_staged->netns == staged->netns &&
+        cookie_staged->netns_cookie == staged->netns_cookie &&
+        cookie_staged->incoming_generation == staged->incoming_generation &&
+        cookie_staged->socket_cookie == staged->socket_cookie &&
+        cookie_staged->owner.tid == staged->owner.tid &&
+        cookie_staged->owner.pid == staged->owner.pid &&
+        cookie_staged->owner.ns == staged->owner.ns) {
         bpf_map_delete_elem(&java_remote_parent_cookie_connections, &keys.cookie);
+    }
+}
+
+static __noinline __attribute__((unused)) void
+java_remote_parent_observe_connection_indexes(const connection_info_t *connection,
+                                              const java_remote_parent_connection_t *staged) {
+    java_remote_parent_connection_keys_t keys = {0};
+    if (!java_remote_parent_connection_keys_init(
+            &keys, connection, staged->netns, staged->netns_cookie)) {
+        return;
+    }
+    const java_remote_parent_connection_t *remaining =
+        bpf_map_lookup_elem(&java_remote_parent_connections, &keys.netns);
+    if (remaining && remaining->generation == staged->generation &&
+        remaining->owner.tid == staged->owner.tid && remaining->owner.pid == staged->owner.pid &&
+        remaining->owner.ns == staged->owner.ns) {
+        return;
+    }
+    remaining = bpf_map_lookup_elem(&java_remote_parent_cookie_connections, &keys.cookie);
+    if (remaining && remaining->generation == staged->generation &&
+        remaining->owner.tid == staged->owner.tid && remaining->owner.pid == staged->owner.pid &&
+        remaining->owner.ns == staged->owner.ns) {
+        return;
     }
 }
 
@@ -829,31 +928,13 @@ java_remote_parent_invalidate_connection(const connection_info_t *connection,
         return;
     }
     const java_remote_parent_claim_t *claim = bpf_map_lookup_elem(&java_remote_parent_claims, &key);
-    if (!claim || __builtin_memcmp(claim, &local_claim, sizeof(local_claim)) != 0 ||
+    if (!java_remote_parent_claim_equal(claim, &local_claim) ||
         !java_remote_parent_exact_detach_guard_matches_at(&guard_key, &local_guard)) {
         goto handoff;
     }
 
     java_remote_parent_delete_connection_indexes(connection, &copy);
-
-    java_remote_parent_connection_keys_t keys = {0};
-    if (!java_remote_parent_connection_keys_init(
-            &keys, connection, copy.netns, copy.netns_cookie)) {
-        goto handoff;
-    }
-    const java_remote_parent_connection_t *remaining =
-        bpf_map_lookup_elem(&java_remote_parent_connections, &keys.netns);
-    if (remaining && remaining->generation == copy.generation &&
-        remaining->owner.tid == copy.owner.tid && remaining->owner.pid == copy.owner.pid &&
-        remaining->owner.ns == copy.owner.ns) {
-        goto handoff;
-    }
-    remaining = bpf_map_lookup_elem(&java_remote_parent_cookie_connections, &keys.cookie);
-    if (remaining && remaining->generation == copy.generation &&
-        remaining->owner.tid == copy.owner.tid && remaining->owner.pid == copy.owner.pid &&
-        remaining->owner.ns == copy.owner.ns) {
-        goto handoff;
-    }
+    java_remote_parent_observe_connection_indexes(connection, &copy);
 
 handoff:
     // Payload work is over. Publish E first; only a successful E handoff (or

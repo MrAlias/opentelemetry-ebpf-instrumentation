@@ -39,6 +39,7 @@ typedef struct java_remote_parent_sockopt_scratch {
     java_remote_parent_data_ack_t acknowledgement;
     pid_key_t acknowledged_process;
     u32 reserved2;
+    java_remote_parent_retrieval_workspace_t retrieval;
 } java_remote_parent_sockopt_scratch_t;
 
 // A per-CPU scratch value can be overwritten when a cgroup sockopt program is
@@ -72,10 +73,49 @@ struct {
     __uint(pinning, OBI_PIN_INTERNAL);
 } java_remote_parent_negotiations SEC(".maps");
 
-static __always_inline u8 java_remote_parent_is_retrieval_option(const struct bpf_sockopt *ctx) {
-    return ctx->level == k_java_remote_parent_socket_level &&
-           java_remote_parent_socket_option_is_retrieval(ctx->optname);
-}
+enum java_remote_parent_getsockopt_handler_slot {
+    k_java_remote_parent_getsockopt_direct_take = 0,
+    k_java_remote_parent_getsockopt_direct_discard = 1,
+    k_java_remote_parent_getsockopt_task_take = 2,
+    k_java_remote_parent_getsockopt_task_discard = 3,
+    k_java_remote_parent_getsockopt_health = 4,
+    k_java_remote_parent_getsockopt_handler_slots = 5,
+};
+
+_Static_assert(k_java_remote_parent_getsockopt_health + 1 ==
+                   k_java_remote_parent_getsockopt_handler_slots,
+               "java remote-parent getsockopt handler slots must be contiguous");
+
+int obi_java_remote_parent_getsockopt_direct_take(struct bpf_sockopt *ctx);
+int obi_java_remote_parent_getsockopt_direct_discard(struct bpf_sockopt *ctx);
+int obi_java_remote_parent_getsockopt_task_take(struct bpf_sockopt *ctx);
+int obi_java_remote_parent_getsockopt_task_discard(struct bpf_sockopt *ctx);
+int obi_java_remote_parent_getsockopt_health(struct bpf_sockopt *ctx);
+
+// This primary-program-only map is deliberately unpinned and fully initialized
+// by the object loader before the public router can be attached. Its fixed
+// contents keep operation dispatch private to this object and remove any
+// post-attach population window.
+struct {
+    __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+    __uint(max_entries, k_java_remote_parent_getsockopt_handler_slots);
+    __uint(key_size, sizeof(u32));
+    __array(values, int(void *));
+} javabridge_getsockopt_handlers SEC(".maps") = {
+    .values =
+        {
+            [k_java_remote_parent_getsockopt_direct_take] =
+                (void *)&obi_java_remote_parent_getsockopt_direct_take,
+            [k_java_remote_parent_getsockopt_direct_discard] =
+                (void *)&obi_java_remote_parent_getsockopt_direct_discard,
+            [k_java_remote_parent_getsockopt_task_take] =
+                (void *)&obi_java_remote_parent_getsockopt_task_take,
+            [k_java_remote_parent_getsockopt_task_discard] =
+                (void *)&obi_java_remote_parent_getsockopt_task_discard,
+            [k_java_remote_parent_getsockopt_health] =
+                (void *)&obi_java_remote_parent_getsockopt_health,
+        },
+};
 
 static __always_inline u8 java_remote_parent_is_negotiate_option(const struct bpf_sockopt *ctx) {
     return ctx->level == k_java_remote_parent_socket_level &&
@@ -85,11 +125,6 @@ static __always_inline u8 java_remote_parent_is_negotiate_option(const struct bp
 static __always_inline u8 java_remote_parent_is_data_ack_option(const struct bpf_sockopt *ctx) {
     return ctx->level == k_java_remote_parent_socket_level &&
            ctx->optname == k_java_remote_parent_socket_data_ack;
-}
-
-static __always_inline u8 java_remote_parent_is_health_option(const struct bpf_sockopt *ctx) {
-    return ctx->level == k_java_remote_parent_socket_level &&
-           ctx->optname == k_java_remote_parent_socket_health;
 }
 
 static __always_inline void java_remote_parent_record_unauthorized_retrieval(u8 discard,
@@ -311,19 +346,12 @@ int obi_java_remote_parent_setsockopt(struct bpf_sockopt *ctx) {
     return 1;
 }
 
-SEC("cgroup/getsockopt")
-int obi_java_remote_parent_getsockopt(struct bpf_sockopt *ctx) {
-    const u8 health = java_remote_parent_is_health_option(ctx);
-    if (!java_remote_parent_is_retrieval_option(ctx) && !health) {
-        return 1;
-    }
+static __always_inline int java_remote_parent_getsockopt_for_operation(
+    struct bpf_sockopt *ctx, u8 discard, enum java_remote_parent_source source, u8 health) {
     if (!java_remote_parent_data_hook_is_ready()) {
         return 1;
     }
 
-    const u8 discard = java_remote_parent_socket_option_is_discard(ctx->optname);
-    const enum java_remote_parent_source source =
-        java_remote_parent_socket_option_source(ctx->optname);
     if (!ctx->sk) {
         return 1;
     }
@@ -392,18 +420,77 @@ int obi_java_remote_parent_getsockopt(struct bpf_sockopt *ctx) {
         return 1;
     }
 
-    java_remote_parent_retrieve_for_connection(&scratch->response,
-                                               discard,
-                                               java_remote_parent_max_age_ns,
-                                               source,
-                                               &scratch->negotiation.connection,
-                                               scratch->negotiation.connection_netns,
-                                               scratch->negotiation.generation,
-                                               socket_cookie);
+    java_remote_parent_retrieve_for_connection_with_workspace(&scratch->response,
+                                                              discard,
+                                                              java_remote_parent_max_age_ns,
+                                                              source,
+                                                              &scratch->negotiation.connection,
+                                                              scratch->negotiation.connection_netns,
+                                                              scratch->negotiation.generation,
+                                                              socket_cookie,
+                                                              &scratch->retrieval);
 
     __builtin_memcpy(optval, &scratch->response, sizeof(scratch->response));
     ctx->optlen = sizeof(scratch->response);
     ctx->retval = 0;
+    return 1;
+}
+
+SEC("cgroup/getsockopt")
+int obi_java_remote_parent_getsockopt_direct_take(struct bpf_sockopt *ctx) {
+    return java_remote_parent_getsockopt_for_operation(
+        ctx, 0, k_java_remote_parent_source_direct, 0);
+}
+
+SEC("cgroup/getsockopt")
+int obi_java_remote_parent_getsockopt_direct_discard(struct bpf_sockopt *ctx) {
+    return java_remote_parent_getsockopt_for_operation(
+        ctx, 1, k_java_remote_parent_source_direct, 0);
+}
+
+SEC("cgroup/getsockopt")
+int obi_java_remote_parent_getsockopt_task_take(struct bpf_sockopt *ctx) {
+    return java_remote_parent_getsockopt_for_operation(ctx, 0, k_java_remote_parent_source_task, 0);
+}
+
+SEC("cgroup/getsockopt")
+int obi_java_remote_parent_getsockopt_task_discard(struct bpf_sockopt *ctx) {
+    return java_remote_parent_getsockopt_for_operation(ctx, 1, k_java_remote_parent_source_task, 0);
+}
+
+SEC("cgroup/getsockopt")
+int obi_java_remote_parent_getsockopt_health(struct bpf_sockopt *ctx) {
+    return java_remote_parent_getsockopt_for_operation(
+        ctx, 0, k_java_remote_parent_source_direct, 1);
+}
+
+SEC("cgroup/getsockopt")
+int obi_java_remote_parent_getsockopt(struct bpf_sockopt *ctx) {
+    if (ctx->level != k_java_remote_parent_socket_level) {
+        return 1;
+    }
+    switch (ctx->optname) {
+    case k_java_remote_parent_socket_take:
+        bpf_tail_call_static(
+            ctx, &javabridge_getsockopt_handlers, k_java_remote_parent_getsockopt_direct_take);
+        break;
+    case k_java_remote_parent_socket_discard:
+        bpf_tail_call_static(
+            ctx, &javabridge_getsockopt_handlers, k_java_remote_parent_getsockopt_direct_discard);
+        break;
+    case k_java_remote_parent_socket_task_take:
+        bpf_tail_call_static(
+            ctx, &javabridge_getsockopt_handlers, k_java_remote_parent_getsockopt_task_take);
+        break;
+    case k_java_remote_parent_socket_task_discard:
+        bpf_tail_call_static(
+            ctx, &javabridge_getsockopt_handlers, k_java_remote_parent_getsockopt_task_discard);
+        break;
+    case k_java_remote_parent_socket_health:
+        bpf_tail_call_static(
+            ctx, &javabridge_getsockopt_handlers, k_java_remote_parent_getsockopt_health);
+        break;
+    }
     return 1;
 }
 

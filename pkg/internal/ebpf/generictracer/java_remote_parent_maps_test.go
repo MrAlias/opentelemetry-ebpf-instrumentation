@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
@@ -94,6 +95,160 @@ func TestJavaRemoteParentSharedMapSpecsAreCompatible(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestJavaRemoteParentGetsockoptRouterSpec(t *testing.T) {
+	const (
+		handlerMapName = "javabridge_getsockopt_handlers"
+		routerName     = "obi_java_remote_parent_getsockopt"
+	)
+	targetNames := []string{
+		"obi_java_remote_parent_getsockopt_direct_take",
+		"obi_java_remote_parent_getsockopt_direct_discard",
+		"obi_java_remote_parent_getsockopt_task_take",
+		"obi_java_remote_parent_getsockopt_task_discard",
+		"obi_java_remote_parent_getsockopt_health",
+	}
+	wantContents := []ebpf.MapKV{
+		{Key: uint32(0), Value: targetNames[0]},
+		{Key: uint32(1), Value: targetNames[1]},
+		{Key: uint32(2), Value: targetNames[2]},
+		{Key: uint32(3), Value: targetNames[3]},
+		{Key: uint32(4), Value: targetNames[4]},
+	}
+
+	spec, err := tpinjector.LoadBpfJavaRemoteParent()
+	require.NoError(t, err)
+
+	handlers := spec.Maps[handlerMapName]
+	require.NotNil(t, handlers)
+	require.Equal(t, ebpf.ProgramArray, handlers.Type)
+	require.Equal(t, uint32(4), handlers.KeySize)
+	require.Equal(t, uint32(4), handlers.ValueSize)
+	require.Equal(t, uint32(len(wantContents)), handlers.MaxEntries)
+	require.Zero(t, handlers.Flags)
+	require.Equal(t, ebpf.PinNone, handlers.Pinning)
+	require.Equal(t, wantContents, handlers.Contents)
+
+	for _, scale := range []struct {
+		name   string
+		factor int
+	}{
+		{name: "scale_down", factor: -3},
+		{name: "scale_up", factor: 3},
+	} {
+		t.Run(scale.name, func(t *testing.T) {
+			scaledSpec := spec.Copy()
+			ebpfconvenience.SetupMapSizes(scaledSpec, scale.factor)
+			scaledHandlers := scaledSpec.Maps[handlerMapName]
+			require.NotNil(t, scaledHandlers)
+			assertMapSpecEqual(t, handlerMapName, handlers, scaledHandlers)
+			require.Equal(t, wantContents, scaledHandlers.Contents)
+		})
+	}
+
+	for _, programName := range append([]string{routerName}, targetNames...) {
+		program := spec.Programs[programName]
+		require.NotNil(t, program, programName)
+		require.Equal(t, ebpf.CGroupSockopt, program.Type, programName)
+		require.Equal(t, ebpf.AttachCGroupGetsockopt, program.AttachType, programName)
+		require.Equal(t, "cgroup/getsockopt", program.SectionName, programName)
+	}
+
+	router := spec.Programs[routerName]
+	rawInstructionCount := router.Instructions.Size() / asm.InstructionSize
+	require.LessOrEqual(t, rawInstructionCount, uint64(64))
+	functionCalls := 0
+	tailCalls := 0
+	handlerMapReferences := 0
+	tailCallSlots := make([]int64, 0, len(targetNames))
+	for index := range router.Instructions {
+		instruction := &router.Instructions[index]
+		if instruction.IsFunctionCall() {
+			functionCalls++
+		}
+		if instruction.IsBuiltinCall() && instruction.Constant == int64(asm.FnTailCall) {
+			tailCalls++
+			require.Positive(t, index)
+			slot := &router.Instructions[index-1]
+			require.Equal(t, asm.Mov.Op(asm.ImmSource), slot.OpCode)
+			require.Equal(t, asm.R3, slot.Dst)
+			tailCallSlots = append(tailCallSlots, slot.Constant)
+		}
+		if instruction.Reference() == handlerMapName {
+			handlerMapReferences++
+		}
+	}
+	require.Zero(t, functionCalls)
+	require.Equal(t, len(targetNames), tailCalls)
+	require.Equal(t, len(targetNames), handlerMapReferences)
+	require.ElementsMatch(t, []int64{0, 1, 2, 3, 4}, tailCallSlots)
+
+	for _, targetName := range targetNames {
+		tailCalls := 0
+		for index := range spec.Programs[targetName].Instructions {
+			instruction := &spec.Programs[targetName].Instructions[index]
+			if instruction.IsBuiltinCall() && instruction.Constant == int64(asm.FnTailCall) {
+				tailCalls++
+			}
+		}
+		require.Zero(t, tailCalls, targetName)
+	}
+}
+
+func TestBPFProgramsStayWithinVerifierMapLimit(t *testing.T) {
+	const verifierMapLimit = 64
+
+	loaders := []struct {
+		name string
+		load func() (*ebpf.CollectionSpec, error)
+	}{
+		{name: "generictracer", load: generictracer.LoadBpf},
+		{name: "gotracer", load: gotracer.LoadBpf},
+		{name: "tpinjector", load: tpinjector.LoadBpf},
+		{name: "java_remote_parent", load: tpinjector.LoadBpfJavaRemoteParent},
+	}
+
+	for _, loader := range loaders {
+		t.Run(loader.name, func(t *testing.T) {
+			spec, err := loader.load()
+			require.NoError(t, err)
+			for programName, program := range spec.Programs {
+				references := referencedProgramMaps(spec, program)
+				require.LessOrEqualf(
+					t,
+					len(references),
+					verifierMapLimit,
+					"program %s references %d verifier-visible maps: %v",
+					programName,
+					len(references),
+					references,
+				)
+			}
+		})
+	}
+
+	spec, err := generictracer.LoadBpf()
+	require.NoError(t, err)
+	tcpClose := spec.Programs["obi_kprobe_tcp_close"]
+	require.NotNil(t, tcpClose)
+	references := referencedProgramMaps(spec, tcpClose)
+	require.Len(t, references, verifierMapLimit)
+	require.Contains(t, references, "java_remote_parent_alias_replays")
+}
+
+func referencedProgramMaps(
+	spec *ebpf.CollectionSpec,
+	program *ebpf.ProgramSpec,
+) map[string]struct{} {
+	references := make(map[string]struct{})
+	for _, instruction := range program.Instructions {
+		name := instruction.Reference()
+		if _, ok := spec.Maps[name]; ok {
+			references[name] = struct{}{}
+		}
+	}
+	return references
 }
 
 func TestSSLPrewriteMapSpecsAreCompatible(t *testing.T) {
@@ -220,6 +375,7 @@ func TestJavaRemoteParentExactLifecycleMapsDoNotEvict(t *testing.T) {
 
 	for _, name := range []string{
 		"java_remote_parent_ambiguity",
+		"java_remote_parent_alias_replays",
 		"java_remote_parent_claims",
 		"java_remote_parent_owner_guards",
 		"java_remote_parent_generation_index",
@@ -231,9 +387,15 @@ func TestJavaRemoteParentExactLifecycleMapsDoNotEvict(t *testing.T) {
 	}
 
 	claims := spec.Maps["java_remote_parent_claims"]
+	replays := spec.Maps["java_remote_parent_alias_replays"]
 	guards := spec.Maps["java_remote_parent_owner_guards"]
 	require.NotNil(t, claims)
+	require.NotNil(t, replays)
 	require.NotNil(t, guards)
+	require.Equal(t, uint32(40), replays.KeySize)
+	require.Equal(t, uint32(16), replays.ValueSize)
+	require.Equal(t, uint32(30_000), replays.MaxEntries)
+	require.Equal(t, ebpfconvenience.PinInternal, replays.Pinning)
 	require.Equal(t, uint32(12), guards.KeySize)
 	require.Equal(t, uint32(24), guards.ValueSize)
 	require.Equal(t, claims.MaxEntries, guards.MaxEntries)
@@ -348,6 +510,7 @@ func TestDisabledBridgeKeepsPerProcessAuthorizationCapacity(t *testing.T) {
 	require.Equal(t, uint32(1), spec.Maps["java_remote_parent_data_signals"].MaxEntries)
 	require.Equal(t, uint32(1), spec.Maps["java_remote_parent_data_acks"].MaxEntries)
 	require.Equal(t, uint32(1), spec.Maps["java_remote_parent_owner_guards"].MaxEntries)
+	require.Equal(t, uint32(1), spec.Maps["java_remote_parent_alias_replays"].MaxEntries)
 }
 
 func TestJavaThreadMappingMapsSpec(t *testing.T) {

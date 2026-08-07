@@ -408,7 +408,7 @@ static __always_inline void bpf_sock_ops_set_flags(struct bpf_sock_ops *skops, u
 }
 
 // Helper that writes in the sock map for a sock_ops program
-static __always_inline void bpf_sock_ops_active_est_cb(struct bpf_sock_ops *skops) {
+static __noinline void bpf_sock_ops_active_est_cb(struct bpf_sock_ops *skops) {
     const u64 cookie = bpf_get_socket_cookie(skops);
 
     if (java_remote_parent_enabled && !java_remote_parent_seed_socket_cookie(skops->sk, cookie)) {
@@ -425,7 +425,7 @@ static __always_inline void bpf_sock_ops_active_est_cb(struct bpf_sock_ops *skop
     bpf_sock_ops_set_flags(skops, flags);
 }
 
-static __always_inline void bpf_sock_ops_passive_est_cb(struct bpf_sock_ops *skops) {
+static __noinline void bpf_sock_ops_passive_est_cb(struct bpf_sock_ops *skops) {
     u8 flags = 0;
     if (java_remote_parent_enabled) {
         const u64 socket_cookie = bpf_get_socket_cookie(skops);
@@ -566,7 +566,7 @@ static __always_inline enum tcp_traceparent_target_position ssl_prewrite_write_t
         sequence, skops->skb_len - tcp_header_len, prewrite->target_tcp_sequence);
 }
 
-static __always_inline void bpf_sock_ops_opt_len_cb(struct bpf_sock_ops *skops) {
+static __noinline void bpf_sock_ops_opt_len_cb(struct bpf_sock_ops *skops) {
     struct bpf_sock *sk = skops->sk;
     if (!sk) {
         return;
@@ -682,7 +682,7 @@ static __always_inline void bpf_sock_ops_opt_len_cb(struct bpf_sock_ops *skops) 
     bpf_reserve_hdr_opt(skops, option_size, 0);
 }
 
-static __always_inline void bpf_sock_ops_write_hdr_cb(struct bpf_sock_ops *skops) {
+static __noinline void bpf_sock_ops_write_hdr_cb(struct bpf_sock_ops *skops) {
     struct bpf_sock *sk = skops->sk;
 
     if (!sk) {
@@ -882,7 +882,23 @@ static __always_inline u8 tcp_sequence_from_sockops(struct bpf_sock_ops *skops, 
     return 1;
 }
 
-static __always_inline void bpf_sock_ops_parse_hdr_cb(struct bpf_sock_ops *skops) {
+typedef struct java_remote_parent_sockops_deferred {
+    connection_info_t connection;
+    unsigned char reserved0[4];
+    u64 netns_cookie;
+    u64 socket_cookie;
+    u64 incoming_generation;
+    enum java_remote_parent_stat candidate_stat;
+    u8 invalidate;
+    u8 delete_strict;
+    unsigned char reserved[2];
+} java_remote_parent_sockops_deferred_t;
+
+_Static_assert(sizeof(java_remote_parent_sockops_deferred_t) == 72,
+               "sockops deferred result size mismatch");
+
+static __noinline void bpf_sock_ops_parse_hdr_cb(struct bpf_sock_ops *skops,
+                                                 java_remote_parent_sockops_deferred_t *deferred) {
     if (!(inject_flags & k_inject_tcp_options)) {
         return;
     }
@@ -952,20 +968,24 @@ static __always_inline void bpf_sock_ops_parse_hdr_cb(struct bpf_sock_ops *skops
         &conn, &tp, tcp_sequence, netns_cookie, &ambiguous_generation);
     if (java_remote_parent_enabled) {
         if (ambiguous_generation) {
-            java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(
-                &conn, netns_cookie, socket_cookie, ambiguous_generation);
+            deferred->connection = conn;
+            deferred->netns_cookie = netns_cookie;
+            deferred->socket_cookie = socket_cookie;
+            deferred->incoming_generation = ambiguous_generation;
+            deferred->invalidate = 1;
         }
         if (result == k_incoming_trace_ambiguous) {
-            java_remote_parent_stat_add(k_java_remote_parent_stat_candidate_ambiguous);
+            deferred->candidate_stat = k_java_remote_parent_stat_candidate_ambiguous;
         } else if (result == k_incoming_trace_update_failed) {
-            java_remote_parent_stat_add(k_java_remote_parent_stat_candidate_overload);
+            deferred->candidate_stat = k_java_remote_parent_stat_candidate_overload;
         } else {
-            java_remote_parent_stat_add(k_java_remote_parent_stat_candidate_valid);
+            deferred->candidate_stat = k_java_remote_parent_stat_candidate_valid;
         }
     }
 }
 
-static __always_inline void bpf_sock_ops_state_cb(struct bpf_sock_ops *skops) {
+static __noinline void bpf_sock_ops_state_cb(struct bpf_sock_ops *skops,
+                                             java_remote_parent_sockops_deferred_t *deferred) {
     if (!java_remote_parent_enabled || skops->args[1] != BPF_TCP_CLOSE) {
         return;
     }
@@ -988,9 +1008,12 @@ static __always_inline void bpf_sock_ops_state_cb(struct bpf_sock_ops *skops) {
         if (ssl_prewrite_connection_tracked(&conn, netns_cookie)) {
             cleanup_ssl_prewrite_connection(&conn, netns_cookie);
         }
-        java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(
-            &conn, netns_cookie, socket_cookie, 0);
-        delete_strict_incoming_trace(&conn, netns_cookie);
+        deferred->connection = conn;
+        deferred->netns_cookie = netns_cookie;
+        deferred->socket_cookie = socket_cookie;
+        deferred->incoming_generation = 0;
+        deferred->invalidate = 1;
+        deferred->delete_strict = 1;
     }
 }
 
@@ -999,6 +1022,9 @@ static __always_inline void bpf_sock_ops_state_cb(struct bpf_sock_ops *skops) {
 SEC("sockops")
 int obi_sockmap_tracker(struct bpf_sock_ops *skops) {
     struct bpf_sock *sk = skops->sk;
+    java_remote_parent_sockops_deferred_t deferred = {
+        .candidate_stat = k_java_remote_parent_stat_max,
+    };
 
     if (!sk) {
         return 1;
@@ -1018,13 +1044,30 @@ int obi_sockmap_tracker(struct bpf_sock_ops *skops) {
         bpf_sock_ops_write_hdr_cb(skops);
         break;
     case BPF_SOCK_OPS_PARSE_HDR_OPT_CB:
-        bpf_sock_ops_parse_hdr_cb(skops);
+        bpf_sock_ops_parse_hdr_cb(skops, &deferred);
         break;
     case BPF_SOCK_OPS_STATE_CB:
-        bpf_sock_ops_state_cb(skops);
+        bpf_sock_ops_state_cb(skops, &deferred);
         break;
     default:
         break;
+    }
+
+    // Keep the ambiguity invalidation out of the parsing callback's stack
+    // chain. Its exact connection, namespace, socket, and incoming generation
+    // bind the deferred operation to the candidate that requested it.
+    if (deferred.invalidate) {
+        java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(
+            &deferred.connection,
+            deferred.netns_cookie,
+            deferred.socket_cookie,
+            deferred.incoming_generation);
+    }
+    if (deferred.delete_strict) {
+        delete_strict_incoming_trace(&deferred.connection, deferred.netns_cookie);
+    }
+    if (deferred.candidate_stat < k_java_remote_parent_stat_max) {
+        java_remote_parent_stat_add(deferred.candidate_stat);
     }
 
     return 1;

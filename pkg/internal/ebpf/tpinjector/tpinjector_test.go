@@ -1235,8 +1235,8 @@ func TestJavaRemoteParentBridgeModeProductionOrdering(t *testing.T) {
 	optionLength := sourceSection(
 		t,
 		source,
-		"static __always_inline void bpf_sock_ops_opt_len_cb",
-		"static __always_inline void bpf_sock_ops_write_hdr_cb",
+		"static __noinline void bpf_sock_ops_opt_len_cb",
+		"static __noinline void bpf_sock_ops_write_hdr_cb",
 	)
 	legacyDecision := sourcePosition(
 		t,
@@ -1259,7 +1259,7 @@ func TestJavaRemoteParentBridgeModeProductionOrdering(t *testing.T) {
 		t,
 		source,
 		"static __always_inline enum tcp_traceparent_target_position ssl_prewrite_write_target_position",
-		"static __always_inline void bpf_sock_ops_opt_len_cb",
+		"static __noinline void bpf_sock_ops_opt_len_cb",
 	)
 	assert.Contains(t, targetPosition, "(const void *)(tcp + 1) > data_end")
 	assert.Contains(t, targetPosition, "tcp_traceparent_write_packet_valid")
@@ -1268,7 +1268,7 @@ func TestJavaRemoteParentBridgeModeProductionOrdering(t *testing.T) {
 	optionWrite := sourceSection(
 		t,
 		source,
-		"static __always_inline void bpf_sock_ops_write_hdr_cb",
+		"static __noinline void bpf_sock_ops_write_hdr_cb",
 		"static __always_inline u8 tcp_sequence_from_sockops",
 	)
 	exactOwnerCheck := sourcePosition(

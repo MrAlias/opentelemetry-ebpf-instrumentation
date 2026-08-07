@@ -121,10 +121,17 @@ typedef struct ambiguity_entry {
     int present;
 } ambiguity_entry_t;
 
+typedef struct alias_replay_entry {
+    java_remote_parent_alias_replay_key_t key;
+    java_remote_parent_alias_replay_t value;
+    int present;
+} alias_replay_entry_t;
+
 static pid_key_t current_task;
 static pid_key_t authorized_translation_owner;
 static u8 authorized_translation_result;
 static u64 current_process_incarnation;
+static u64 current_ktime_ns;
 static java_remote_parent_state_t stage_state_scratch;
 static java_remote_parent_cleanup_workspace_t cleanup_workspace;
 static java_remote_parent_janitor_workspace_t janitor_workspace;
@@ -161,6 +168,14 @@ static int fallback_present;
 static handoff_entry_t handoffs[2];
 static handoff_claim_entry_t handoff_claims[2];
 static ambiguity_entry_t ambiguities[3];
+static alias_replay_entry_t alias_replays[4];
+static int alias_replay_update_failures;
+static int disable_alias_replay_autoseed;
+static int replace_task_during_alias_replay_lookup;
+static int increment_alias_replay_before_publishing_update;
+static int advance_time_after_claim_task_validation;
+static int zero_alias_replay_after_task_publish;
+static int task_update_attempts;
 static java_remote_parent_task_t stored_task;
 static pid_key_t stored_task_key;
 static int task_present;
@@ -313,6 +328,43 @@ static ambiguity_entry_t *find_ambiguity_entry(const java_remote_parent_key_t *k
 static ambiguity_entry_t *find_ambiguity(const java_remote_parent_key_t *key) {
     ambiguity_entry_t *entry = find_ambiguity_entry(key);
     return entry && entry->observed_monotime_ns ? entry : NULL;
+}
+
+static alias_replay_entry_t *find_alias_replay(const java_remote_parent_alias_replay_key_t *key) {
+    for (size_t i = 0; i < sizeof(alias_replays) / sizeof(alias_replays[0]); i++) {
+        if (alias_replays[i].present && same_key(key, &alias_replays[i].key, sizeof(*key))) {
+            return &alias_replays[i];
+        }
+    }
+    return NULL;
+}
+
+static alias_replay_entry_t *seed_alias_replay(const java_remote_parent_key_t *generation,
+                                               u64 observed_monotime_ns,
+                                               u64 process_incarnation,
+                                               u32 references) {
+    const java_remote_parent_alias_replay_key_t key =
+        java_remote_parent_alias_replay_key(generation, observed_monotime_ns, process_incarnation);
+    alias_replay_entry_t *entry = find_alias_replay(&key);
+    if (!entry) {
+        for (size_t i = 0; i < sizeof(alias_replays) / sizeof(alias_replays[0]); i++) {
+            if (!alias_replays[i].present) {
+                entry = &alias_replays[i];
+                entry->key = key;
+                entry->present = 1;
+                break;
+            }
+        }
+    }
+    if (!entry) {
+        fail("alias replay fixture capacity exhausted");
+    }
+    entry->value = (java_remote_parent_alias_replay_t){
+        .transition_monotime_ns = test_now_ns,
+        .references = references,
+        .lifecycle = k_java_remote_parent_lifecycle_active,
+    };
+    return entry;
 }
 
 static int exact_adoption_fence_retained(const java_remote_parent_key_t *key) {
@@ -519,6 +571,11 @@ static void *test_map_lookup(void *map, const void *key) {
             arm_task_replacement_and_state_loss_after_post_claim_check = 0;
             replace_task_and_drop_state_on_next_lookup = 1;
         }
+        if (claim_present && stored_claim.lifecycle == k_java_remote_parent_lifecycle_publishing &&
+            advance_time_after_claim_task_validation) {
+            advance_time_after_claim_task_validation = 0;
+            current_ktime_ns++;
+        }
         return &stored_task;
     }
     if (map == &java_remote_parent_tasks && transferred_task_present &&
@@ -561,6 +618,40 @@ static void *test_map_lookup(void *map, const void *key) {
     if (map == &java_remote_parent_terminal && terminal_present &&
         same_key(key, &test_owner, sizeof(test_owner))) {
         return &stored_terminal;
+    }
+    if (map == &java_remote_parent_alias_replays) {
+        alias_replay_entry_t *entry = find_alias_replay(key);
+        if (!entry && !disable_alias_replay_autoseed) {
+            const java_remote_parent_alias_replay_key_t *replay_key = key;
+            if (state_present && stored_state.aliases &&
+                same_key(&replay_key->owner, &stored_state_key.owner, sizeof(replay_key->owner)) &&
+                replay_key->generation == stored_state_key.generation &&
+                replay_key->generation_observed_monotime_ns == stored_state.observed_monotime_ns &&
+                replay_key->process_incarnation == stored_state.process_incarnation) {
+                entry = seed_alias_replay(&stored_state_key,
+                                          stored_state.observed_monotime_ns,
+                                          stored_state.process_incarnation,
+                                          stored_state.aliases);
+            } else if (replacement_state_present && replacement_state.aliases &&
+                       same_key(&replay_key->owner,
+                                &replacement_state_key.owner,
+                                sizeof(replay_key->owner)) &&
+                       replay_key->generation == replacement_state_key.generation &&
+                       replay_key->generation_observed_monotime_ns ==
+                           replacement_state.observed_monotime_ns &&
+                       replay_key->process_incarnation == replacement_state.process_incarnation) {
+                entry = seed_alias_replay(&replacement_state_key,
+                                          replacement_state.observed_monotime_ns,
+                                          replacement_state.process_incarnation,
+                                          replacement_state.aliases);
+            }
+        }
+        if (entry && replace_task_during_alias_replay_lookup) {
+            replace_task_during_alias_replay_lookup = 0;
+            stored_task.generation = test_replacement_generation;
+            stored_task.observed_monotime_ns = test_now_ns;
+        }
+        return entry ? &entry->value : NULL;
     }
     if (map == &java_remote_parent_stats) {
         const u32 index = *(const u32 *)key;
@@ -649,6 +740,45 @@ static long update_ambiguity(const java_remote_parent_key_t *key,
     return -1;
 }
 
+static long update_alias_replay(const java_remote_parent_alias_replay_key_t *key,
+                                const java_remote_parent_alias_replay_t *value,
+                                unsigned long long flags) {
+    if (alias_replay_update_failures) {
+        alias_replay_update_failures--;
+        return -1;
+    }
+    alias_replay_entry_t *entry = find_alias_replay(key);
+    if ((entry && flags == BPF_NOEXIST) || (!entry && flags == BPF_EXIST)) {
+        return -1;
+    }
+    if (!entry) {
+        for (size_t i = 0; i < sizeof(alias_replays) / sizeof(alias_replays[0]); i++) {
+            if (!alias_replays[i].present) {
+                entry = &alias_replays[i];
+                entry->key = *key;
+                entry->present = 1;
+                break;
+            }
+        }
+    }
+    if (!entry) {
+        return -1;
+    }
+    const int stale_retain = entry->present && increment_alias_replay_before_publishing_update &&
+                             value->lifecycle == k_java_remote_parent_lifecycle_publishing;
+    if (stale_retain) {
+        increment_alias_replay_before_publishing_update = 0;
+        entry->value.references++;
+    }
+    entry->value = *value;
+    if (stale_retain) {
+        const java_remote_parent_key_t generation =
+            java_remote_parent_state_key(&key->owner, key->generation);
+        java_remote_parent_alias_replay_unwind_failed_retain(&generation, key);
+    }
+    return 0;
+}
+
 static long
 test_map_update(void *map, const void *key, const void *value, unsigned long long flags) {
     if (map == &java_remote_parent_handoffs) {
@@ -660,10 +790,31 @@ test_map_update(void *map, const void *key, const void *value, unsigned long lon
     if (map == &java_remote_parent_ambiguity) {
         return update_ambiguity(key, value, flags);
     }
-    if (map == &java_remote_parent_tasks && flags == BPF_ANY &&
+    if (map == &java_remote_parent_alias_replays) {
+        return update_alias_replay(key, value, flags);
+    }
+    if (map == &java_remote_parent_tasks && flags == BPF_NOEXIST &&
         same_key(key, &stored_task_key, sizeof(stored_task_key))) {
+        task_update_attempts++;
+        if (task_present) {
+            return -1;
+        }
         stored_task = *(const java_remote_parent_task_t *)value;
         task_present = 1;
+        if (zero_alias_replay_after_task_publish) {
+            zero_alias_replay_after_task_publish = 0;
+            const java_remote_parent_key_t generation =
+                java_remote_parent_state_key(&stored_task.owner, stored_task.generation);
+            const java_remote_parent_alias_replay_key_t replay_key =
+                java_remote_parent_alias_replay_key(
+                    &generation, stored_task.observed_monotime_ns, test_process_incarnation);
+            alias_replay_entry_t *replay = find_alias_replay(&replay_key);
+            if (replay) {
+                replay->value.references = 0;
+            } else {
+                unexpected_update = 1;
+            }
+        }
         return 0;
     }
     if (map == &java_remote_parent_owner_guards && flags == BPF_EXIST) {
@@ -845,6 +996,14 @@ static long delete_handoff(const java_remote_parent_handoff_key_t *key) {
 }
 
 static long test_map_delete(void *map, const void *key) {
+    if (map == &java_remote_parent_alias_replays) {
+        alias_replay_entry_t *entry = find_alias_replay(key);
+        if (!entry) {
+            return -1;
+        }
+        entry->present = 0;
+        return 0;
+    }
     if (map == &java_remote_parent_owners && owner_present &&
         same_key(key, &test_owner, sizeof(test_owner))) {
         if (owner_delete_failures) {
@@ -1137,7 +1296,7 @@ static long test_map_delete(void *map, const void *key) {
 }
 
 static unsigned long long test_ktime_get_ns(void) {
-    return test_now_ns;
+    return current_ktime_ns;
 }
 
 static unsigned int test_prandom_u32(void) {
@@ -1232,6 +1391,7 @@ static void seed_generation(const connection_info_t *connection) {
     memset(handoffs, 0, sizeof(handoffs));
     memset(handoff_claims, 0, sizeof(handoff_claims));
     memset(ambiguities, 0, sizeof(ambiguities));
+    memset(alias_replays, 0, sizeof(alias_replays));
     memset(&stored_task, 0, sizeof(stored_task));
     stored_task_key = test_child;
     memset(&transferred_task_key, 0, sizeof(transferred_task_key));
@@ -1265,6 +1425,13 @@ static void seed_generation(const connection_info_t *connection) {
     terminal_present = 0;
     terminal_update_failures = 0;
     replace_terminal_after_update = 0;
+    alias_replay_update_failures = 0;
+    disable_alias_replay_autoseed = 0;
+    replace_task_during_alias_replay_lookup = 0;
+    increment_alias_replay_before_publishing_update = 0;
+    advance_time_after_claim_task_validation = 0;
+    zero_alias_replay_after_task_publish = 0;
+    task_update_attempts = 0;
     handoff_claim_update_attempts = 0;
     handoff_claim_update_successes = 0;
     inject_handoff_claim_on_publish = 0;
@@ -1355,6 +1522,7 @@ static void seed_generation(const connection_info_t *connection) {
     authorized_translation_owner = (pid_key_t){0};
     authorized_translation_result = k_java_vt_cleanup_translation_none;
     current_process_incarnation = test_process_incarnation;
+    current_ktime_ns = test_now_ns;
 
     stored_owner.generation = test_generation;
     stored_owner.process_incarnation = test_process_incarnation;
@@ -1458,6 +1626,600 @@ seed_replacement_generation(const connection_info_t *connection) {
     stored_fallback = replacement_state.response;
     fallback_present = 1;
     return replacement_state.response;
+}
+
+static void test_claim_equality_is_byte_exact(void) {
+    const java_remote_parent_claim_t expected = {
+        .observed_monotime_ns = test_now_ns,
+        .process_incarnation = test_process_incarnation,
+        .lifecycle = k_java_remote_parent_lifecycle_publishing,
+        .reserved = {1, 2, 3, 4, 5, 6, 7},
+    };
+    java_remote_parent_claim_t actual = expected;
+    if (!java_remote_parent_claim_equal(&expected, &actual) ||
+        java_remote_parent_claim_equal(NULL, &actual) ||
+        java_remote_parent_claim_equal(&expected, NULL)) {
+        fail("claim equality rejected identical bytes or accepted a null claim");
+    }
+
+    actual.observed_monotime_ns++;
+    if (java_remote_parent_claim_equal(&expected, &actual)) {
+        fail("claim equality ignored the observation timestamp");
+    }
+    actual = expected;
+    actual.process_incarnation++;
+    if (java_remote_parent_claim_equal(&expected, &actual)) {
+        fail("claim equality ignored the process incarnation");
+    }
+    actual = expected;
+    actual.lifecycle++;
+    if (java_remote_parent_claim_equal(&expected, &actual)) {
+        fail("claim equality ignored the lifecycle");
+    }
+    for (u32 i = 0; i < sizeof(actual.reserved); i++) {
+        actual = expected;
+        actual.reserved[i] ^= 0xff;
+        if (java_remote_parent_claim_equal(&expected, &actual)) {
+            fail("claim equality ignored reserved metadata");
+        }
+    }
+}
+
+static void test_pid_and_generation_index_equality_is_exact(void) {
+    pid_key_t left = test_owner;
+    const pid_key_t right = test_owner;
+    if (!java_remote_parent_pid_key_equal(&left, &right)) {
+        fail("pid-key equality rejected identical fields");
+    }
+    for (u32 bit = 0; bit < 32; bit++) {
+        left = right;
+        left.tid ^= (u32)1 << bit;
+        if (java_remote_parent_pid_key_equal(&left, &right)) {
+            fail("pid-key equality ignored a tid bit");
+        }
+        left = right;
+        left.pid ^= (u32)1 << bit;
+        if (java_remote_parent_pid_key_equal(&left, &right)) {
+            fail("pid-key equality ignored a pid bit");
+        }
+        left = right;
+        left.ns ^= (u32)1 << bit;
+        if (java_remote_parent_pid_key_equal(&left, &right)) {
+            fail("pid-key equality ignored a namespace bit");
+        }
+    }
+
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    if (!java_remote_parent_generation_index_matches(
+            &stored_state_key, test_process_incarnation, test_observed_monotime_ns)) {
+        fail("generation-index equality rejected an exact record");
+    }
+    stored_generation_index.reserved = 1;
+    if (java_remote_parent_generation_index_matches(
+            &stored_state_key, test_process_incarnation, test_observed_monotime_ns)) {
+        fail("generation-index equality ignored reserved metadata");
+    }
+    stored_generation_index.reserved = 0;
+    stored_generation_index.process.tid ^= 1;
+    if (java_remote_parent_generation_index_matches(
+            &stored_state_key, test_process_incarnation, test_observed_monotime_ns)) {
+        fail("generation-index equality ignored process tid");
+    }
+    stored_generation_index.process = java_process_key(&test_owner);
+    stored_generation_index.process.pid ^= 1;
+    if (java_remote_parent_generation_index_matches(
+            &stored_state_key, test_process_incarnation, test_observed_monotime_ns)) {
+        fail("generation-index equality ignored process pid");
+    }
+    stored_generation_index.process = java_process_key(&test_owner);
+    stored_generation_index.process.ns ^= 1;
+    if (java_remote_parent_generation_index_matches(
+            &stored_state_key, test_process_incarnation, test_observed_monotime_ns)) {
+        fail("generation-index equality ignored process namespace");
+    }
+    stored_generation_index.process = java_process_key(&test_owner);
+    stored_generation_index.process_incarnation++;
+    if (java_remote_parent_generation_index_matches(
+            &stored_state_key, test_process_incarnation, test_observed_monotime_ns)) {
+        fail("generation-index equality ignored process incarnation");
+    }
+    stored_generation_index.process_incarnation = test_process_incarnation;
+    stored_generation_index.observed_monotime_ns++;
+    if (java_remote_parent_generation_index_matches(
+            &stored_state_key, test_process_incarnation, test_observed_monotime_ns)) {
+        fail("generation-index equality ignored observation time");
+    }
+    stored_generation_index.observed_monotime_ns = test_observed_monotime_ns;
+    generation_index_present = 0;
+    if (java_remote_parent_generation_index_matches(
+            &stored_state_key, test_process_incarnation, test_observed_monotime_ns)) {
+        fail("generation-index equality accepted an absent record");
+    }
+}
+
+static void test_abi_tail_validation_is_byte_exact(void) {
+    java_remote_parent_claim_t claim = {
+        .lifecycle = k_java_remote_parent_lifecycle_publishing,
+    };
+    if (!java_remote_parent_clean_lifecycle_tail(&claim.lifecycle,
+                                                 k_java_remote_parent_lifecycle_publishing)) {
+        fail("claim tail rejected clean publishing metadata");
+    }
+    claim.lifecycle = k_java_remote_parent_lifecycle_consumed;
+    if (java_remote_parent_clean_lifecycle_tail(&claim.lifecycle,
+                                                k_java_remote_parent_lifecycle_publishing)) {
+        fail("claim tail ignored the lifecycle");
+    }
+    claim.lifecycle = k_java_remote_parent_lifecycle_publishing;
+    for (u32 i = 0; i < sizeof(claim.reserved); i++) {
+        claim.reserved[i] = 1;
+        if (java_remote_parent_clean_lifecycle_tail(&claim.lifecycle,
+                                                    k_java_remote_parent_lifecycle_publishing)) {
+            fail("claim tail ignored reserved metadata");
+        }
+        claim.reserved[i] = 0;
+    }
+
+    java_remote_parent_owner_t owner = {
+        .lifecycle = k_java_remote_parent_lifecycle_active,
+    };
+    if (!java_remote_parent_clean_lifecycle_tail(&owner.lifecycle,
+                                                 k_java_remote_parent_lifecycle_active)) {
+        fail("owner tail rejected clean active metadata");
+    }
+    for (u32 i = 0; i < sizeof(owner.reserved); i++) {
+        owner.reserved[i] = 1;
+        if (java_remote_parent_clean_lifecycle_tail(&owner.lifecycle,
+                                                    k_java_remote_parent_lifecycle_active)) {
+            fail("owner tail ignored reserved metadata");
+        }
+        owner.reserved[i] = 0;
+    }
+
+    java_remote_parent_terminal_t terminal = {
+        .lifecycle = k_java_remote_parent_lifecycle_ambiguous,
+    };
+    if (!java_remote_parent_clean_lifecycle_tail(&terminal.lifecycle,
+                                                 k_java_remote_parent_lifecycle_ambiguous)) {
+        fail("terminal tail rejected clean final metadata");
+    }
+    for (u32 i = 0; i < sizeof(terminal.reserved); i++) {
+        terminal.reserved[i] = 1;
+        if (java_remote_parent_clean_lifecycle_tail(&terminal.lifecycle,
+                                                    k_java_remote_parent_lifecycle_ambiguous)) {
+            fail("terminal tail ignored reserved metadata");
+        }
+        terminal.reserved[i] = 0;
+    }
+
+    java_remote_parent_finish_guard_t guard = {
+        .physical_detached = 0xff,
+        .replay_required = 1,
+    };
+    if (!java_remote_parent_clean_boolean_second_byte_tail(&guard.physical_detached)) {
+        fail("finish-guard tail constrained the physical byte");
+    }
+    guard.replay_required = 2;
+    if (java_remote_parent_clean_boolean_second_byte_tail(&guard.physical_detached)) {
+        fail("finish-guard tail accepted a non-boolean replay flag");
+    }
+    guard.replay_required = 0;
+    for (u32 i = 0; i < sizeof(guard.reserved); i++) {
+        guard.reserved[i] = 1;
+        if (java_remote_parent_clean_boolean_second_byte_tail(&guard.physical_detached)) {
+            fail("finish-guard tail ignored reserved metadata");
+        }
+        guard.reserved[i] = 0;
+    }
+
+    java_remote_parent_state_t state = {
+        .lifecycle = k_java_remote_parent_lifecycle_active,
+    };
+    if (java_remote_parent_metadata_word(&state.lifecycle) !=
+        k_java_remote_parent_lifecycle_active) {
+        fail("state metadata rejected a clean active prefix");
+    }
+    for (u32 i = 0; i < sizeof(state.reserved); i++) {
+        state.reserved[i] = 1;
+        if (java_remote_parent_metadata_word(&state.lifecycle) ==
+            k_java_remote_parent_lifecycle_active) {
+            fail("state metadata ignored a reserved byte");
+        }
+        state.reserved[i] = 0;
+    }
+    state.lifecycle = k_java_remote_parent_lifecycle_publishing;
+    if (java_remote_parent_metadata_word(&state.lifecycle) ==
+        k_java_remote_parent_lifecycle_active) {
+        fail("state metadata ignored the lifecycle");
+    }
+
+    const java_remote_parent_alias_replay_key_t replay_key = {
+        .owner = test_owner,
+        .generation = test_generation,
+        .generation_observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
+    };
+    java_remote_parent_alias_replay_t replay = {
+        .transition_monotime_ns = test_now_ns,
+        .references = 1,
+        .lifecycle = k_java_remote_parent_lifecycle_active,
+    };
+    if (!java_remote_parent_alias_replay_active_valid(&replay_key, &replay, 1)) {
+        fail("replay metadata rejected a clean active record");
+    }
+    for (u32 i = 0; i < 4; i++) {
+        replay = (java_remote_parent_alias_replay_t){
+            .transition_monotime_ns = test_now_ns,
+            .references = 1,
+            .lifecycle = k_java_remote_parent_lifecycle_active,
+        };
+        ((u8 *)&replay.lifecycle)[i] ^= 0xff;
+        if (java_remote_parent_alias_replay_active_valid(&replay_key, &replay, 1)) {
+            fail("active replay metadata ignored a metadata byte");
+        }
+    }
+    replay = (java_remote_parent_alias_replay_t){
+        .transition_monotime_ns = test_now_ns,
+        .references = 1,
+        .lifecycle = k_java_remote_parent_lifecycle_publishing,
+        .desired_lifecycle = k_java_remote_parent_lifecycle_consumed,
+    };
+    if (!java_remote_parent_alias_replay_publishing_valid(
+            &replay_key, &replay, k_java_remote_parent_lifecycle_consumed)) {
+        fail("replay metadata rejected a clean publishing record");
+    }
+    for (u32 i = 0; i < 4; i++) {
+        java_remote_parent_alias_replay_t mutated = replay;
+        ((u8 *)&mutated.lifecycle)[i] ^= 0xff;
+        if (java_remote_parent_alias_replay_publishing_valid(
+                &replay_key, &mutated, k_java_remote_parent_lifecycle_consumed)) {
+            fail("publishing replay metadata ignored a metadata byte");
+        }
+    }
+    replay.producer_tag = k_java_remote_parent_go_producer_tag;
+    if (!java_remote_parent_alias_replay_publishing_valid(
+            &replay_key, &replay, k_java_remote_parent_lifecycle_consumed)) {
+        fail("replay metadata rejected a tagged Go publishing record");
+    }
+    replay.producer_tag = 1;
+    if (java_remote_parent_alias_replay_publishing_valid(
+            &replay_key, &replay, k_java_remote_parent_lifecycle_consumed)) {
+        fail("replay metadata accepted an unknown producer tag");
+    }
+    replay = (java_remote_parent_alias_replay_t){
+        .transition_monotime_ns = test_now_ns,
+        .references = 1,
+        .lifecycle = k_java_remote_parent_lifecycle_consumed,
+    };
+    if (!java_remote_parent_alias_replay_final_valid(
+            &replay_key, &replay, k_java_remote_parent_lifecycle_consumed)) {
+        fail("replay metadata rejected a clean final record");
+    }
+    for (u32 i = 0; i < 4; i++) {
+        java_remote_parent_alias_replay_t mutated = replay;
+        ((u8 *)&mutated.lifecycle)[i] ^= 0xff;
+        if (java_remote_parent_alias_replay_final_valid(
+                &replay_key, &mutated, k_java_remote_parent_lifecycle_consumed)) {
+            fail("final replay metadata ignored a metadata byte");
+        }
+    }
+
+    const java_remote_parent_resolution_t resolution = {
+        .key =
+            {
+                .owner = test_owner,
+                .generation = test_generation,
+            },
+    };
+    const java_remote_parent_finish_connection_t expected_connection = {
+        .netns_cookie = 84,
+        .incoming_generation = 21,
+        .socket_cookie = test_socket_cookie,
+        .netns = test_connection_netns,
+    };
+    java_remote_parent_connection_t connection = {
+        .owner = test_owner,
+        .generation = test_generation,
+        .netns_cookie = expected_connection.netns_cookie,
+        .incoming_generation = expected_connection.incoming_generation,
+        .socket_cookie = expected_connection.socket_cookie,
+        .netns = expected_connection.netns,
+    };
+    if (!java_remote_parent_finish_connection_matches(
+            &resolution, &connection, &expected_connection)) {
+        fail("finish connection matcher rejected clean reserved fields");
+    }
+    connection.reserved = 1;
+    if (java_remote_parent_finish_connection_matches(
+            &resolution, &connection, &expected_connection)) {
+        fail("finish connection matcher ignored reserved");
+    }
+    connection.reserved = 0;
+    connection.reserved2 = 1;
+    if (java_remote_parent_finish_connection_matches(
+            &resolution, &connection, &expected_connection)) {
+        fail("finish connection matcher ignored reserved2");
+    }
+}
+
+static void test_finish_connection_matcher_is_field_exact(void) {
+    java_remote_parent_resolution_t resolution = {
+        .key =
+            {
+                .owner = test_owner,
+                .reserved = ~(u32)0,
+                .generation = test_generation,
+            },
+    };
+    java_remote_parent_finish_connection_t expected = {
+        .netns_cookie = 0x0123456789abcdef,
+        .incoming_generation = 0xfedcba9876543210,
+        .socket_cookie = test_socket_cookie,
+        .netns = test_connection_netns,
+        .reserved = ~(u32)0,
+    };
+    java_remote_parent_connection_t connection = {
+        .owner = test_owner,
+        .generation = test_generation,
+        .netns_cookie = expected.netns_cookie,
+        .incoming_generation = expected.incoming_generation,
+        .socket_cookie = expected.socket_cookie,
+        .netns = expected.netns,
+    };
+    if (!java_remote_parent_finish_connection_matches(&resolution, &connection, &expected)) {
+        fail("finish connection matcher constrained ignored input metadata");
+    }
+    if (java_remote_parent_finish_connection_matches(&resolution, 0, &expected)) {
+        fail("finish connection matcher accepted an absent connection");
+    }
+
+#define ASSERT_FINISH_CONNECTION_FIELD_EXACT(field)                                                \
+    do {                                                                                           \
+        for (u32 bit = 0; bit < sizeof(connection.field) * 8; bit++) {                             \
+            java_remote_parent_connection_t mutated = connection;                                  \
+            ((u8 *)&mutated.field)[bit / 8] ^= (u8)(1U << (bit % 8));                              \
+            if (java_remote_parent_finish_connection_matches(&resolution, &mutated, &expected))    \
+                fail("finish connection matcher ignored a bit in " #field);                        \
+        }                                                                                          \
+    } while (0)
+
+    ASSERT_FINISH_CONNECTION_FIELD_EXACT(owner.tid);
+    ASSERT_FINISH_CONNECTION_FIELD_EXACT(owner.pid);
+    ASSERT_FINISH_CONNECTION_FIELD_EXACT(owner.ns);
+    ASSERT_FINISH_CONNECTION_FIELD_EXACT(reserved);
+    ASSERT_FINISH_CONNECTION_FIELD_EXACT(generation);
+    ASSERT_FINISH_CONNECTION_FIELD_EXACT(netns_cookie);
+    ASSERT_FINISH_CONNECTION_FIELD_EXACT(incoming_generation);
+    ASSERT_FINISH_CONNECTION_FIELD_EXACT(socket_cookie);
+    ASSERT_FINISH_CONNECTION_FIELD_EXACT(netns);
+    ASSERT_FINISH_CONNECTION_FIELD_EXACT(reserved2);
+#undef ASSERT_FINISH_CONNECTION_FIELD_EXACT
+
+    resolution = (java_remote_parent_resolution_t){
+        .key.reserved = ~(u32)0,
+    };
+    expected = (java_remote_parent_finish_connection_t){
+        .reserved = ~(u32)0,
+    };
+    connection = (java_remote_parent_connection_t){0};
+    if (!java_remote_parent_finish_connection_matches(&resolution, &connection, &expected)) {
+        fail("finish connection matcher added a nonzero or ignored-metadata requirement");
+    }
+}
+
+static u8 reference_finish_claim_shape_compact(const java_remote_parent_resolution_t *resolution,
+                                               const java_remote_parent_claim_t *owned_claim,
+                                               enum java_remote_parent_lifecycle lifecycle) {
+    return owned_claim && owned_claim->lifecycle == lifecycle &&
+           java_remote_parent_finish_claim_shape_valid(resolution, owned_claim) &&
+           resolution->key.generation && !resolution->key.reserved;
+}
+
+static void assert_compact_finish_claim_shape(const java_remote_parent_resolution_t *resolution,
+                                              const java_remote_parent_claim_t *owned_claim,
+                                              enum java_remote_parent_lifecycle lifecycle) {
+    if (java_remote_parent_finish_claim_shape_compact(resolution, owned_claim, lifecycle) !=
+        reference_finish_claim_shape_compact(resolution, owned_claim, lifecycle)) {
+        fail("compact finish-claim shape changed authority");
+    }
+}
+
+static void assert_compact_finish_guard_shape(const java_remote_parent_resolution_t *resolution,
+                                              const java_remote_parent_finish_guard_t *guard) {
+    if (java_remote_parent_finish_guard_shape_compact(resolution, guard) !=
+        java_remote_parent_finish_guard_shape_valid(resolution, guard)) {
+        fail("compact finish-guard shape changed authority");
+    }
+}
+
+static void
+assert_compact_finish_terminal_authority(const java_remote_parent_resolution_t *resolution,
+                                         const java_remote_parent_terminal_t *terminal,
+                                         enum java_remote_parent_lifecycle lifecycle,
+                                         u64 observed_monotime_ns,
+                                         const java_remote_parent_finish_guard_t *guard) {
+    if (java_remote_parent_finish_terminal_authority_compact(
+            resolution, terminal, lifecycle, observed_monotime_ns, guard) !=
+        java_remote_parent_finish_terminal_matches_guard(
+            resolution, terminal, lifecycle, observed_monotime_ns, guard)) {
+        fail("compact finish-terminal authority changed semantics");
+    }
+}
+
+static void test_compact_finish_shapes_match_reference(void) {
+    java_remote_parent_resolution_t resolution = {
+        .key =
+            {
+                .owner = test_owner,
+                .generation = test_generation,
+            },
+        .indexed.process_incarnation = test_process_incarnation,
+    };
+    java_remote_parent_claim_t claim = {
+        .observed_monotime_ns = test_now_ns,
+        .process_incarnation = test_process_incarnation,
+        .lifecycle = k_java_remote_parent_lifecycle_consumed,
+    };
+    for (u32 expected = 0; expected < 256; expected++) {
+        for (u32 actual = 0; actual < 256; actual++) {
+            claim.lifecycle = actual;
+            assert_compact_finish_claim_shape(
+                &resolution, &claim, (enum java_remote_parent_lifecycle)expected);
+        }
+    }
+    claim.lifecycle = k_java_remote_parent_lifecycle_consumed;
+    for (u32 i = 0; i < sizeof(claim.reserved); i++) {
+        claim.reserved[i] = 1;
+        assert_compact_finish_claim_shape(
+            &resolution, &claim, k_java_remote_parent_lifecycle_consumed);
+        claim.reserved[i] = 0;
+    }
+    claim.observed_monotime_ns = 0;
+    assert_compact_finish_claim_shape(&resolution, &claim, k_java_remote_parent_lifecycle_consumed);
+    claim.observed_monotime_ns = test_now_ns;
+    claim.process_incarnation++;
+    assert_compact_finish_claim_shape(&resolution, &claim, k_java_remote_parent_lifecycle_consumed);
+    claim.process_incarnation = test_process_incarnation;
+    resolution.key.generation = 0;
+    assert_compact_finish_claim_shape(&resolution, &claim, k_java_remote_parent_lifecycle_consumed);
+    resolution.key.generation = test_generation;
+    resolution.key.reserved = 1;
+    assert_compact_finish_claim_shape(&resolution, &claim, k_java_remote_parent_lifecycle_consumed);
+    resolution.key.reserved = 0;
+
+    java_remote_parent_finish_guard_t guard = {
+        .key.owner = test_owner,
+        .claim =
+            {
+                .observed_monotime_ns = test_now_ns,
+                .process_incarnation = test_generation,
+                .lifecycle = k_java_remote_parent_lifecycle_publishing,
+            },
+        .physical_detached = 0xff,
+        .replay_required = 1,
+    };
+    assert_compact_finish_guard_shape(&resolution, &guard);
+    guard.key.generation = 1;
+    assert_compact_finish_guard_shape(&resolution, &guard);
+    guard.key.generation = 0;
+    guard.key.reserved = 1;
+    assert_compact_finish_guard_shape(&resolution, &guard);
+    guard.key.reserved = 0;
+    guard.key.owner.tid++;
+    assert_compact_finish_guard_shape(&resolution, &guard);
+    guard.key.owner = test_owner;
+    guard.key.owner.pid++;
+    assert_compact_finish_guard_shape(&resolution, &guard);
+    guard.key.owner = test_owner;
+    guard.key.owner.ns++;
+    assert_compact_finish_guard_shape(&resolution, &guard);
+    guard.key.owner = test_owner;
+    guard.claim.observed_monotime_ns = 0;
+    assert_compact_finish_guard_shape(&resolution, &guard);
+    guard.claim.observed_monotime_ns = test_now_ns;
+    guard.claim.process_incarnation++;
+    assert_compact_finish_guard_shape(&resolution, &guard);
+    guard.claim.process_incarnation = test_generation;
+    for (u32 lifecycle = 0; lifecycle < 256; lifecycle++) {
+        guard.claim.lifecycle = lifecycle;
+        assert_compact_finish_guard_shape(&resolution, &guard);
+    }
+    guard.claim.lifecycle = k_java_remote_parent_lifecycle_publishing;
+    for (u32 i = 0; i < sizeof(guard.claim.reserved); i++) {
+        guard.claim.reserved[i] = 1;
+        assert_compact_finish_guard_shape(&resolution, &guard);
+        guard.claim.reserved[i] = 0;
+    }
+    for (u32 physical_detached = 0; physical_detached < 256; physical_detached++) {
+        guard.physical_detached = physical_detached;
+        assert_compact_finish_guard_shape(&resolution, &guard);
+    }
+    guard.physical_detached = 0;
+    for (u32 replay_required = 0; replay_required < 256; replay_required++) {
+        guard.replay_required = replay_required;
+        assert_compact_finish_guard_shape(&resolution, &guard);
+    }
+    guard.replay_required = 0;
+    for (u32 i = 0; i < sizeof(guard.reserved); i++) {
+        guard.reserved[i] = 1;
+        assert_compact_finish_guard_shape(&resolution, &guard);
+        guard.reserved[i] = 0;
+    }
+
+    java_remote_parent_terminal_t terminal = {
+        .generation = test_generation,
+        .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
+        .lifecycle = k_java_remote_parent_lifecycle_consumed,
+    };
+    guard.terminal_generation = test_generation;
+    for (u32 expected = 0; expected < 256; expected++) {
+        for (u32 actual = 0; actual < 256; actual++) {
+            terminal.lifecycle = actual;
+            assert_compact_finish_terminal_authority(&resolution,
+                                                     &terminal,
+                                                     (enum java_remote_parent_lifecycle)expected,
+                                                     test_observed_monotime_ns,
+                                                     &guard);
+        }
+    }
+    terminal.lifecycle = k_java_remote_parent_lifecycle_consumed;
+    for (u32 i = 0; i < sizeof(terminal.reserved); i++) {
+        terminal.reserved[i] = 1;
+        assert_compact_finish_terminal_authority(&resolution,
+                                                 &terminal,
+                                                 k_java_remote_parent_lifecycle_consumed,
+                                                 test_observed_monotime_ns,
+                                                 &guard);
+        terminal.reserved[i] = 0;
+    }
+    terminal.generation = 0;
+    assert_compact_finish_terminal_authority(&resolution,
+                                             &terminal,
+                                             k_java_remote_parent_lifecycle_consumed,
+                                             test_observed_monotime_ns,
+                                             &guard);
+    terminal.generation = test_generation;
+    terminal.observed_monotime_ns = 0;
+    assert_compact_finish_terminal_authority(&resolution,
+                                             &terminal,
+                                             k_java_remote_parent_lifecycle_consumed,
+                                             test_observed_monotime_ns,
+                                             &guard);
+    terminal.observed_monotime_ns = test_observed_monotime_ns;
+    terminal.process_incarnation = 0;
+    assert_compact_finish_terminal_authority(&resolution,
+                                             &terminal,
+                                             k_java_remote_parent_lifecycle_consumed,
+                                             test_observed_monotime_ns,
+                                             &guard);
+    terminal.process_incarnation = test_process_incarnation;
+    guard.terminal_generation = 0;
+    assert_compact_finish_terminal_authority(&resolution,
+                                             &terminal,
+                                             k_java_remote_parent_lifecycle_consumed,
+                                             test_observed_monotime_ns,
+                                             &guard);
+    guard.terminal_generation = test_replacement_generation;
+    assert_compact_finish_terminal_authority(&resolution,
+                                             &terminal,
+                                             k_java_remote_parent_lifecycle_consumed,
+                                             test_observed_monotime_ns,
+                                             &guard);
+    guard.terminal_generation = test_generation;
+    assert_compact_finish_terminal_authority(&resolution, NULL, 0, 0, &guard);
+    assert_compact_finish_terminal_authority(
+        &resolution, &terminal, k_java_remote_parent_lifecycle_consumed, 0, NULL);
+
+    resolution.key.generation = test_replacement_generation;
+    terminal.observed_monotime_ns++;
+    terminal.process_incarnation++;
+    terminal.lifecycle = k_java_remote_parent_lifecycle_ambiguous;
+    for (u32 expected = 0; expected < 256; expected++) {
+        assert_compact_finish_terminal_authority(
+            &resolution, &terminal, (enum java_remote_parent_lifecycle)expected, 0, &guard);
+    }
 }
 
 static void test_capture_claim_race_releases_published_alias(void) {
@@ -2716,18 +3478,49 @@ static void test_cross_generation_guard_does_not_block_detached_cleanup(void) {
     }
 }
 
-static void test_cleanup_unlinks_and_cleans_a_different_detached_generation(void) {
+static void test_cleanup_unlinks_exact_task_and_releases_final_replay_reference(void) {
     const connection_info_t connection = {.s_port = 1234, .d_port = 443};
     seed_generation(&connection);
-    seed_replacement_generation(&connection);
+    stored_state.aliases = 1;
+    stored_task_key = test_owner;
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = test_observed_monotime_ns,
+    };
+    task_present = 1;
+    alias_replay_entry_t *replay = seed_alias_replay(
+        &stored_state_key, test_observed_monotime_ns, test_process_incarnation, 1);
 
-    // Generation A remains the indexed generation being cleaned. Its owner task
-    // link is the final alias of detached generation B.
-    stored_owner.generation = test_generation;
-    stored_fallback = stored_state.response;
-    replacement_connection_present = 0;
-    replacement_cookie_connection_present = 0;
-    replacement_state.aliases = 1;
+    java_remote_parent_cleanup(&test_owner);
+
+    if (!owner_cleanup_payload_absent() || claim_present || detach_guard_present ||
+        terminal_present || find_ambiguity_entry(&stored_state_key) || !replay->present ||
+        replay->value.references ||
+        replay->value.lifecycle != k_java_remote_parent_lifecycle_active ||
+        exact_claim_update_attempts != 1 || unexpected_update || unexpected_delete) {
+        fail("owner cleanup did not unlink its exact task replay reference");
+    }
+}
+
+static void test_cleanup_absent_task_is_idempotent(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+
+    java_remote_parent_cleanup(&test_owner);
+
+    if (!owner_cleanup_payload_absent() || claim_present || detach_guard_present ||
+        terminal_present || find_ambiguity_entry(&stored_state_key) ||
+        exact_claim_update_attempts != 1 || unexpected_update || unexpected_delete) {
+        fail("owner cleanup did not accept an already-absent task link");
+    }
+}
+
+static void test_cleanup_retains_foreign_generation_task_and_replay(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    const java_remote_parent_key_t foreign =
+        java_remote_parent_state_key(&test_owner, test_replacement_generation);
     stored_task_key = test_owner;
     stored_task = (java_remote_parent_task_t){
         .owner = test_owner,
@@ -2735,23 +3528,26 @@ static void test_cleanup_unlinks_and_cleans_a_different_detached_generation(void
         .observed_monotime_ns = test_now_ns,
     };
     task_present = 1;
+    alias_replay_entry_t *replay =
+        seed_alias_replay(&foreign, test_now_ns, test_process_incarnation, 1);
 
     java_remote_parent_cleanup(&test_owner);
 
-    if (owner_present || state_present || !replacement_state_present || replacement_state.aliases ||
-        generation_index_present || !replacement_generation_index_present || connection_present ||
-        cookie_connection_present || fallback_present || task_present || !claim_present ||
-        !same_key(&stored_claim_key, &replacement_state_key, sizeof(replacement_state_key)) ||
+    if (owner_present || state_present || generation_index_present || connection_present ||
+        cookie_connection_present || fallback_present || !task_present ||
+        stored_task.generation != test_replacement_generation ||
+        stored_task.observed_monotime_ns != test_now_ns || !claim_present ||
+        !same_key(&stored_claim_key, &stored_state_key, sizeof(stored_state_key)) ||
         stored_claim.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
-        stored_claim.reserved[0] != k_java_remote_parent_lifecycle_publishing ||
+        stored_claim.reserved[0] != k_java_remote_parent_lifecycle_discarded ||
         !detach_guard_present || stored_detach_guard_key.generation ||
         stored_detach_guard.process_incarnation != test_generation ||
         stored_detach_guard.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
         stored_detach_guard.reserved[0] != k_java_remote_parent_lifecycle_publishing ||
-        terminal_present || !find_ambiguity(&stored_state_key) ||
-        !find_ambiguity(&replacement_state_key) || exact_claim_update_attempts != 2 ||
-        unexpected_update || unexpected_delete) {
-        fail("owner cleanup did not quarantine the final alias of a detached generation");
+        terminal_present || !find_ambiguity(&stored_state_key) || !replay->present ||
+        replay->value.references != 1 || exact_claim_update_attempts != 1 || unexpected_update ||
+        unexpected_delete) {
+        fail("owner cleanup deleted or released a foreign-generation task carrier");
     }
 }
 
@@ -2903,6 +3699,91 @@ static void test_internal_cleanup_claim_is_transient(void) {
     }
 }
 
+static enum java_remote_parent_status
+reference_claim_status(const java_remote_parent_resolution_t *resolution,
+                       const java_remote_parent_claim_t *claimed) {
+    if (!claimed) {
+        return k_java_remote_parent_status_ambiguous;
+    }
+    const u8 tagged_go_producer = claimed->lifecycle >= k_java_remote_parent_lifecycle_consumed &&
+                                  claimed->lifecycle <= k_java_remote_parent_lifecycle_publishing &&
+                                  claimed->reserved[6] == k_java_remote_parent_go_producer_tag;
+    const u8 publishing_intent =
+        claimed->lifecycle == k_java_remote_parent_lifecycle_publishing &&
+        java_remote_parent_alias_replay_lifecycle_final(claimed->reserved[0]) &&
+        !claimed->reserved[1] && !claimed->reserved[2] && !claimed->reserved[3] &&
+        !claimed->reserved[4] && !claimed->reserved[5] &&
+        (!claimed->reserved[6] || tagged_go_producer);
+    if (!claimed->observed_monotime_ns ||
+        claimed->process_incarnation != resolution->indexed.process_incarnation ||
+        claimed->reserved[1] || claimed->reserved[2] || claimed->reserved[3] ||
+        claimed->reserved[4] || claimed->reserved[5] ||
+        (claimed->lifecycle == k_java_remote_parent_lifecycle_cleanup
+             ? claimed->reserved[6]
+             : (!publishing_intent && claimed->reserved[0]) ||
+                   (claimed->reserved[6] && !tagged_go_producer) ||
+                   (claimed->lifecycle == k_java_remote_parent_lifecycle_publishing &&
+                    claimed->reserved[6] == k_java_remote_parent_go_producer_tag &&
+                    !publishing_intent))) {
+        return k_java_remote_parent_status_ambiguous;
+    }
+    if (publishing_intent) {
+        return k_java_remote_parent_status_overload;
+    }
+    const u8 semantic_lifecycle = claimed->lifecycle == k_java_remote_parent_lifecycle_cleanup
+                                      ? claimed->reserved[0]
+                                      : claimed->lifecycle;
+    switch (semantic_lifecycle) {
+    case k_java_remote_parent_lifecycle_publishing:
+        return k_java_remote_parent_status_overload;
+    case k_java_remote_parent_lifecycle_ambiguous:
+        return k_java_remote_parent_status_ambiguous;
+    case k_java_remote_parent_lifecycle_consumed:
+    case k_java_remote_parent_lifecycle_discarded:
+    case k_java_remote_parent_lifecycle_stale:
+        return k_java_remote_parent_status_already_consumed;
+    default:
+        return k_java_remote_parent_status_ambiguous;
+    }
+}
+
+static void test_claim_status_packed_classifier_matches_reference(void) {
+    const java_remote_parent_resolution_t resolution = {
+        .indexed.process_incarnation = test_process_incarnation,
+    };
+    java_remote_parent_claim_t claim = {
+        .observed_monotime_ns = test_now_ns,
+        .process_incarnation = test_process_incarnation,
+    };
+    for (u32 lifecycle = 0; lifecycle < 256; lifecycle++) {
+        claim.lifecycle = lifecycle;
+        for (u32 desired_lifecycle = 0; desired_lifecycle < 256; desired_lifecycle++) {
+            claim.reserved[0] = desired_lifecycle;
+            for (u32 producer_tag = 0; producer_tag < 256; producer_tag++) {
+                claim.reserved[6] = producer_tag;
+                if (java_remote_parent_claim_status(&resolution, &claim) !=
+                    reference_claim_status(&resolution, &claim)) {
+                    fail("packed claim-status classifier changed a lifecycle tuple");
+                }
+            }
+        }
+    }
+
+    claim = (java_remote_parent_claim_t){
+        .observed_monotime_ns = test_now_ns,
+        .process_incarnation = test_process_incarnation,
+        .lifecycle = k_java_remote_parent_lifecycle_consumed,
+    };
+    for (u32 i = 1; i <= 5; i++) {
+        claim.reserved[i] = 1;
+        if (java_remote_parent_claim_status(&resolution, &claim) !=
+            reference_claim_status(&resolution, &claim)) {
+            fail("packed claim-status classifier ignored middle reserved metadata");
+        }
+        claim.reserved[i] = 0;
+    }
+}
+
 static void test_generation_claim_status_validation(void) {
     const connection_info_t connection = {.s_port = 1234, .d_port = 443};
     const struct {
@@ -2919,6 +3800,36 @@ static void test_generation_claim_status_validation(void) {
                     .observed_monotime_ns = test_now_ns,
                     .process_incarnation = test_process_incarnation,
                     .lifecycle = k_java_remote_parent_lifecycle_publishing,
+                },
+            .status = k_java_remote_parent_status_overload,
+            .take_stat = k_java_remote_parent_stat_take_overload,
+            .discard_stat = k_java_remote_parent_stat_discard_overload,
+        },
+        {
+            .name = "BPF publishing intent was not overload",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_publishing,
+                    .reserved = {[0] = k_java_remote_parent_lifecycle_consumed},
+                },
+            .status = k_java_remote_parent_status_overload,
+            .take_stat = k_java_remote_parent_stat_take_overload,
+            .discard_stat = k_java_remote_parent_stat_discard_overload,
+        },
+        {
+            .name = "tagged Go publishing intent was not overload",
+            .claim =
+                {
+                    .observed_monotime_ns = test_now_ns,
+                    .process_incarnation = test_process_incarnation,
+                    .lifecycle = k_java_remote_parent_lifecycle_publishing,
+                    .reserved =
+                        {
+                            [0] = k_java_remote_parent_lifecycle_stale,
+                            [6] = k_java_remote_parent_go_producer_tag,
+                        },
                 },
             .status = k_java_remote_parent_status_overload,
             .take_stat = k_java_remote_parent_stat_take_overload,
@@ -2973,7 +3884,7 @@ static void test_generation_claim_status_validation(void) {
             .discard_stat = k_java_remote_parent_stat_discard_already_consumed,
         },
         {
-            .name = "tagged Go publishing claim was not overload",
+            .name = "tag-only Go publishing exact claim was not ambiguous",
             .claim =
                 {
                     .observed_monotime_ns = test_now_ns,
@@ -2981,9 +3892,9 @@ static void test_generation_claim_status_validation(void) {
                     .lifecycle = k_java_remote_parent_lifecycle_publishing,
                     .reserved = {[6] = k_java_remote_parent_go_producer_tag},
                 },
-            .status = k_java_remote_parent_status_overload,
-            .take_stat = k_java_remote_parent_stat_take_overload,
-            .discard_stat = k_java_remote_parent_stat_discard_overload,
+            .status = k_java_remote_parent_status_ambiguous,
+            .take_stat = k_java_remote_parent_stat_take_ambiguous,
+            .discard_stat = k_java_remote_parent_stat_discard_ambiguous,
         },
         {
             .name = "tagged Go ambiguous claim was not ambiguous",
@@ -3406,7 +4317,7 @@ static void test_ambiguity_claim_collision_reports_committed_status(void) {
             .discard_stat = k_java_remote_parent_stat_discard_already_consumed,
         },
         {
-            .name = "tagged Go publishing claim collision was not overload",
+            .name = "tag-only Go publishing claim collision was not ambiguous",
             .claim =
                 {
                     .observed_monotime_ns = test_now_ns,
@@ -3414,9 +4325,9 @@ static void test_ambiguity_claim_collision_reports_committed_status(void) {
                     .lifecycle = k_java_remote_parent_lifecycle_publishing,
                     .reserved = {[6] = k_java_remote_parent_go_producer_tag},
                 },
-            .status = k_java_remote_parent_status_overload,
-            .take_stat = k_java_remote_parent_stat_take_overload,
-            .discard_stat = k_java_remote_parent_stat_discard_overload,
+            .status = k_java_remote_parent_status_ambiguous,
+            .take_stat = k_java_remote_parent_stat_take_ambiguous,
+            .discard_stat = k_java_remote_parent_stat_discard_ambiguous,
         },
         {
             .name = "tagged Go ambiguous claim collision was not ambiguous",
@@ -3925,19 +4836,17 @@ static void test_take_claim_revalidates_state_and_generation_index(void) {
                                                    test_socket_cookie) !=
             k_java_remote_parent_status_missing ||
         remove_state_index_after_claim || state_present || generation_index_present ||
-        !claim_present || stored_claim.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
-        stored_claim.reserved[0] != k_java_remote_parent_lifecycle_consumed || terminal_present ||
-        !owner_present || !fallback_present || !connection_present || !cookie_connection_present ||
-        exact_claim_update_attempts != 1 || !find_ambiguity(&stored_state_key) ||
-        unexpected_update || unexpected_delete) {
+        claim_present || terminal_present || !owner_present || !fallback_present ||
+        !connection_present || !cookie_connection_present || exact_claim_update_attempts != 1 ||
+        !find_ambiguity(&stored_state_key) || unexpected_update || unexpected_delete) {
         fail("late TAKE claim published a terminal after state/index removal");
     }
     memset(&response, 0, sizeof(response));
     if (java_remote_parent_retrieve(
             &response, 0, test_now_ns, k_java_remote_parent_source_direct) !=
-            k_java_remote_parent_status_already_consumed ||
-        response.status != k_java_remote_parent_status_already_consumed || !claim_present) {
-        fail("late TAKE state/index loss rolled back its visible final claim");
+            k_java_remote_parent_status_ambiguous ||
+        response.status != k_java_remote_parent_status_ambiguous || claim_present) {
+        fail("late TAKE state/index loss escaped its precommit ambiguity fence");
     }
 
     seed_generation(&connection);
@@ -3954,20 +4863,18 @@ static void test_take_claim_revalidates_state_and_generation_index(void) {
             k_java_remote_parent_status_missing ||
         replace_state_index_observation_after_claim || !state_present ||
         stored_state.observed_monotime_ns != test_now_ns || !generation_index_present ||
-        stored_generation_index.observed_monotime_ns != test_now_ns || !claim_present ||
-        stored_claim.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
-        stored_claim.reserved[0] != k_java_remote_parent_lifecycle_consumed || terminal_present ||
-        !owner_present || !fallback_present || !connection_present || !cookie_connection_present ||
-        !find_ambiguity(&stored_state_key) || exact_claim_update_attempts != 1 ||
-        unexpected_update || unexpected_delete) {
+        stored_generation_index.observed_monotime_ns != test_now_ns || claim_present ||
+        terminal_present || !owner_present || !fallback_present || !connection_present ||
+        !cookie_connection_present || !find_ambiguity(&stored_state_key) ||
+        exact_claim_update_attempts != 1 || unexpected_update || unexpected_delete) {
         fail("late TAKE claim adopted a same-key replacement observation");
     }
     memset(&response, 0, sizeof(response));
     if (java_remote_parent_retrieve(
             &response, 0, test_now_ns, k_java_remote_parent_source_direct) !=
-            k_java_remote_parent_status_already_consumed ||
-        response.status != k_java_remote_parent_status_already_consumed || !claim_present) {
-        fail("late TAKE observation replacement rolled back its visible final claim");
+            k_java_remote_parent_status_ambiguous ||
+        response.status != k_java_remote_parent_status_ambiguous || claim_present) {
+        fail("late TAKE observation replacement escaped its precommit ambiguity fence");
     }
 
     seed_generation(&connection);
@@ -4008,24 +4915,21 @@ static void test_visible_final_claim_survives_post_claim_guard(void) {
                                                        test_socket_cookie) !=
                 k_java_remote_parent_status_overload ||
             response.status != k_java_remote_parent_status_overload ||
-            inject_detach_guard_after_exact_claim || !claim_present ||
-            stored_claim.lifecycle != k_java_remote_parent_lifecycle_cleanup ||
-            stored_claim.reserved[0] != (discard ? k_java_remote_parent_lifecycle_discarded
-                                                 : k_java_remote_parent_lifecycle_consumed) ||
-            !detach_guard_present || !find_ambiguity(&stored_state_key) || !owner_present ||
-            !fallback_present || !state_present || !generation_index_present ||
-            !connection_present || !cookie_connection_present || terminal_present ||
-            unexpected_update || unexpected_delete) {
-            fail("post-claim owner guard rolled back a visible final claim");
+            inject_detach_guard_after_exact_claim || claim_present || !detach_guard_present ||
+            find_ambiguity(&stored_state_key) || !owner_present || !fallback_present ||
+            !state_present || !generation_index_present || !connection_present ||
+            !cookie_connection_present || terminal_present || unexpected_update ||
+            unexpected_delete) {
+            fail("precommit owner guard was not rolled back cleanly");
         }
 
         memset(&response, 0, sizeof(response));
         if (java_remote_parent_retrieve(
                 &response, discard, test_now_ns, k_java_remote_parent_source_direct) !=
-                k_java_remote_parent_status_already_consumed ||
-            response.status != k_java_remote_parent_status_already_consumed || !claim_present ||
-            !detach_guard_present || !find_ambiguity(&stored_state_key)) {
-            fail("post-claim owner guard did not preserve deterministic retry status");
+                k_java_remote_parent_status_overload ||
+            response.status != k_java_remote_parent_status_overload || claim_present ||
+            !detach_guard_present || find_ambiguity(&stored_state_key)) {
+            fail("precommit owner guard did not preserve deterministic retry status");
         }
     }
 }
@@ -4073,8 +4977,8 @@ static void test_task_link_is_revalidated_after_claim(void) {
                                                    test_socket_cookie) !=
             k_java_remote_parent_status_ambiguous ||
         response.status != k_java_remote_parent_status_ambiguous ||
-        inject_detach_guard_after_exact_claim || replace_task_after_exact_claim || !claim_present ||
-        !detach_guard_present || !find_ambiguity(&stored_state_key) || !task_present ||
+        inject_detach_guard_after_exact_claim || replace_task_after_exact_claim || claim_present ||
+        !detach_guard_present || find_ambiguity(&stored_state_key) || !task_present ||
         stored_task.generation != test_replacement_generation ||
         stored_task.observed_monotime_ns != test_now_ns ||
         stats[k_java_remote_parent_stat_take_overload] != 0 ||
@@ -5662,6 +6566,606 @@ static void test_live_task_finish_claim_release_preserves_repeat_status(void) {
     }
 }
 
+static alias_replay_entry_t *exact_test_alias_replay(void) {
+    const java_remote_parent_alias_replay_key_t key = java_remote_parent_alias_replay_key(
+        &stored_state_key, test_observed_monotime_ns, test_process_incarnation);
+    return find_alias_replay(&key);
+}
+
+static void seed_two_task_aliases(const connection_info_t *connection) {
+    seed_generation(connection);
+    seed_exact_receive_aliases(1);
+    stored_state.aliases = 2;
+    transferred_task_key = test_relay_child;
+    transferred_task = stored_task;
+    transferred_task_present = 1;
+    seed_alias_replay(&stored_state_key, test_observed_monotime_ns, test_process_incarnation, 2);
+}
+
+static void publish_replacement_terminal(void) {
+    stored_terminal = (java_remote_parent_terminal_t){
+        .generation = test_replacement_generation,
+        .observed_monotime_ns = test_now_ns + 10,
+        .process_incarnation = test_process_incarnation,
+        .lifecycle = k_java_remote_parent_lifecycle_consumed,
+    };
+    terminal_present = 1;
+}
+
+static void test_sibling_task_replays_after_successor_terminal(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_two_task_aliases(&connection);
+
+    current_task = test_child;
+    java_remote_parent_response_t response = {0};
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_valid ||
+        response.status != k_java_remote_parent_status_valid ||
+        java_remote_parent_le64_to_cpu(response.generation_le) != test_generation ||
+        !finish_generation_artifacts_absent() || claim_present || detach_guard_present ||
+        !task_present || !transferred_task_present || unexpected_update || unexpected_delete) {
+        fail("first sibling task did not commit the aliased generation");
+    }
+    alias_replay_entry_t *replay = exact_test_alias_replay();
+    if (!replay || replay->value.references != 2 ||
+        replay->value.lifecycle != k_java_remote_parent_lifecycle_consumed ||
+        replay->value.desired_lifecycle || replay->value.producer_tag || replay->value.reserved) {
+        fail("first sibling task did not publish exact consumed replay authority");
+    }
+
+    publish_replacement_terminal();
+    const java_remote_parent_terminal_t successor = stored_terminal;
+    current_task = test_relay_child;
+    memset(&response, 0, sizeof(response));
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_already_consumed ||
+        response.status != k_java_remote_parent_status_already_consumed ||
+        java_remote_parent_le64_to_cpu(response.generation_le) != test_generation ||
+        java_remote_parent_le64_to_cpu(response.observed_monotime_ns_le) !=
+            test_observed_monotime_ns ||
+        memcmp(&stored_terminal, &successor, sizeof(successor)) != 0 || claim_present ||
+        !task_present || !transferred_task_present || replay != exact_test_alias_replay() ||
+        replay->value.lifecycle != k_java_remote_parent_lifecycle_consumed || unexpected_update ||
+        unexpected_delete) {
+        fail("second sibling lost exact replay after successor terminal displacement");
+    }
+}
+
+static void test_missing_alias_replay_overloads_before_exact_claim(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    disable_alias_replay_autoseed = 1;
+    current_task = test_child;
+
+    java_remote_parent_response_t response = {0};
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_overload ||
+        response.status != k_java_remote_parent_status_overload || claim_present ||
+        exact_claim_update_attempts || !state_present || !generation_index_present ||
+        !owner_present || !fallback_present || !connection_present || !cookie_connection_present ||
+        !task_present || exact_test_alias_replay() ||
+        stats[k_java_remote_parent_stat_take_overload] != 1 || unexpected_update ||
+        unexpected_delete) {
+        fail("missing alias replay consumed E instead of returning Overload");
+    }
+}
+
+static void test_alias_replay_capacity_rejects_retain_before_publication(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    disable_alias_replay_autoseed = 1;
+    alias_replay_update_failures = 1;
+    const java_remote_parent_handoff_key_t handoff_key =
+        java_remote_parent_handoff_key(&test_owner, test_capture_race_token);
+    java_remote_parent_capture_handoff(test_capture_race_token);
+    if (alias_replay_update_failures || stored_state.aliases || find_handoff(&handoff_key) ||
+        exact_test_alias_replay() || claim_present || exact_claim_update_attempts ||
+        !find_ambiguity(&stored_state_key) || unexpected_update || unexpected_delete) {
+        fail("alias replay capacity failure published a carrier or consumed E");
+    }
+}
+
+static void test_direct_successor_never_consults_old_alias_replay(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    const connection_info_t replacement = {.s_port = 2345, .d_port = 8443};
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    seed_alias_replay(&stored_state_key, test_observed_monotime_ns, test_process_incarnation, 1);
+    current_task = test_child;
+    java_remote_parent_response_t response = {0};
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+        k_java_remote_parent_status_valid) {
+        fail("could not seed predecessor replay for direct successor testing");
+    }
+    alias_replay_entry_t *old_replay = exact_test_alias_replay();
+    const java_remote_parent_alias_replay_t old_value = old_replay->value;
+    const java_remote_parent_response_t successor = seed_replacement_generation(&replacement);
+    publish_replacement_terminal();
+    current_task = test_owner;
+    memset(&response, 0, sizeof(response));
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_direct,
+                                                   &replacement,
+                                                   test_connection_netns,
+                                                   test_replacement_generation,
+                                                   test_replacement_socket_cookie) !=
+            k_java_remote_parent_status_valid ||
+        response.status != k_java_remote_parent_status_valid ||
+        java_remote_parent_le64_to_cpu(response.generation_le) != test_replacement_generation ||
+        memcmp(response.trace_id, successor.trace_id, sizeof(response.trace_id)) != 0 ||
+        !old_replay->present || memcmp(&old_replay->value, &old_value, sizeof(old_value)) != 0 ||
+        unexpected_update || unexpected_delete) {
+        fail("direct successor lookup consulted or mutated predecessor exact replay");
+    }
+}
+
+static void test_tagged_final_alias_replay_fails_closed(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    alias_replay_entry_t *replay = seed_alias_replay(
+        &stored_state_key, test_observed_monotime_ns, test_process_incarnation, 1);
+    replay->value = (java_remote_parent_alias_replay_t){
+        .transition_monotime_ns = test_now_ns,
+        .references = 1,
+        .lifecycle = k_java_remote_parent_lifecycle_consumed,
+        .producer_tag = k_java_remote_parent_go_producer_tag,
+    };
+    const java_remote_parent_alias_replay_t tagged_final = replay->value;
+    owner_present = 0;
+    state_present = 0;
+    generation_index_present = 0;
+    connection_present = 0;
+    cookie_connection_present = 0;
+    fallback_present = 0;
+    terminal_present = 0;
+    current_task = test_child;
+
+    java_remote_parent_response_t response = {0};
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_ambiguous ||
+        response.status != k_java_remote_parent_status_ambiguous || !task_present ||
+        !replay->present || memcmp(&replay->value, &tagged_final, sizeof(tagged_final)) != 0 ||
+        claim_present || exact_claim_update_attempts || unexpected_update || unexpected_delete) {
+        fail("tagged final alias replay was accepted as committed authority");
+    }
+}
+
+static void test_zero_reference_publishing_replay_fails_closed(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    alias_replay_entry_t *replay = seed_alias_replay(
+        &stored_state_key, test_observed_monotime_ns, test_process_incarnation, 0);
+    replay->value = (java_remote_parent_alias_replay_t){
+        .transition_monotime_ns = test_now_ns,
+        .lifecycle = k_java_remote_parent_lifecycle_publishing,
+        .desired_lifecycle = k_java_remote_parent_lifecycle_consumed,
+    };
+    const java_remote_parent_alias_replay_t zero_reference_publishing = replay->value;
+    stored_claim_key = stored_state_key;
+    stored_claim = (java_remote_parent_claim_t){
+        .observed_monotime_ns = test_now_ns,
+        .process_incarnation = test_process_incarnation,
+        .lifecycle = k_java_remote_parent_lifecycle_publishing,
+        .reserved = {[0] = k_java_remote_parent_lifecycle_consumed},
+    };
+    claim_present = 1;
+    current_task = test_child;
+
+    java_remote_parent_response_t response = {0};
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_ambiguous ||
+        response.status != k_java_remote_parent_status_ambiguous || !task_present ||
+        !replay->present ||
+        memcmp(&replay->value, &zero_reference_publishing, sizeof(zero_reference_publishing)) !=
+            0 ||
+        !claim_present || exact_claim_update_attempts || unexpected_update || unexpected_delete) {
+        fail("zero-reference publishing replay authorized a task carrier");
+    }
+}
+
+static alias_replay_entry_t *seed_publishing_handoff_replay(u32 references) {
+    seed_generation(&(connection_info_t){.s_port = 1234, .d_port = 443});
+    const java_remote_parent_handoff_key_t handoff_key =
+        java_remote_parent_handoff_key(&test_child, test_first_token);
+    handoffs[0] = (handoff_entry_t){
+        .key = handoff_key,
+        .value =
+            {
+                .owner = test_owner,
+                .generation = test_generation,
+                .observed_monotime_ns = test_observed_monotime_ns,
+            },
+        .present = 1,
+    };
+    state_present = 0;
+    alias_replay_entry_t *replay = seed_alias_replay(
+        &stored_state_key, test_observed_monotime_ns, test_process_incarnation, references);
+    replay->value.lifecycle = k_java_remote_parent_lifecycle_publishing;
+    replay->value.desired_lifecycle = k_java_remote_parent_lifecycle_consumed;
+    stored_claim_key = stored_state_key;
+    stored_claim = (java_remote_parent_claim_t){
+        .observed_monotime_ns = test_now_ns,
+        .process_incarnation = test_process_incarnation,
+        .lifecycle = k_java_remote_parent_lifecycle_consumed,
+    };
+    claim_present = 1;
+    return replay;
+}
+
+static void test_zero_reference_publishing_replay_rejects_handoff_transfer(void) {
+    const java_remote_parent_handoff_key_t handoff_key =
+        java_remote_parent_handoff_key(&test_child, test_first_token);
+    alias_replay_entry_t *replay = seed_publishing_handoff_replay(0);
+    const java_remote_parent_alias_replay_t publishing = replay->value;
+    java_remote_parent_link_handoff(&test_child, test_first_token);
+    if (find_handoff(&handoff_key) || task_present || task_update_attempts || !replay->present ||
+        memcmp(&replay->value, &publishing, sizeof(publishing)) != 0 || !claim_present ||
+        !find_handoff_claim(&handoff_key) || handoff_claim_update_successes != 1 ||
+        unexpected_update || unexpected_delete) {
+        fail("zero-reference publishing replay authorized pre-link handoff transfer");
+    }
+
+    replay = seed_publishing_handoff_replay(1);
+    zero_alias_replay_after_task_publish = 1;
+    java_remote_parent_link_handoff(&test_child, test_first_token);
+    if (zero_alias_replay_after_task_publish || find_handoff(&handoff_key) || task_present ||
+        task_update_attempts != 1 || !replay->present || replay->value.references ||
+        replay->value.lifecycle != k_java_remote_parent_lifecycle_publishing ||
+        replay->value.desired_lifecycle != k_java_remote_parent_lifecycle_consumed ||
+        !claim_present || !find_handoff_claim(&handoff_key) ||
+        handoff_claim_update_successes != 1 || unexpected_update || unexpected_delete) {
+        fail("zero-reference publishing replay survived post-link authority validation");
+    }
+}
+
+static void test_task_replay_outweighs_same_generation_successor_observation(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    const connection_info_t successor_connection = {.s_port = 2345, .d_port = 8443};
+    seed_two_task_aliases(&connection);
+
+    current_task = test_child;
+    java_remote_parent_response_t response = {0};
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+        k_java_remote_parent_status_valid) {
+        fail("could not seed predecessor replay for same-generation reuse testing");
+    }
+    alias_replay_entry_t *replay = exact_test_alias_replay();
+    if (!replay || replay->value.lifecycle != k_java_remote_parent_lifecycle_consumed ||
+        replay->value.references != 2) {
+        fail("predecessor did not publish exact replay before same-generation reuse");
+    }
+    const java_remote_parent_alias_replay_t replay_value = replay->value;
+
+    // Simulate eviction of the narrow terminal cursor followed by a coherent
+    // successor that reused its owner and generation but has a new observation.
+    terminal_present = 0;
+    stored_owner = (java_remote_parent_owner_t){
+        .generation = test_generation,
+        .process_incarnation = test_process_incarnation,
+        .lifecycle = k_java_remote_parent_lifecycle_active,
+    };
+    owner_present = 1;
+    memset(&stored_state, 0, sizeof(stored_state));
+    stored_state.lifecycle = k_java_remote_parent_lifecycle_active;
+    stored_state.observed_monotime_ns = test_now_ns;
+    stored_state.connection = successor_connection;
+    stored_state.connection_netns = test_connection_netns;
+    stored_state.process_incarnation = test_process_incarnation;
+    java_remote_parent_init_response(
+        &stored_state.response, k_java_remote_parent_status_valid, test_generation, test_now_ns);
+    state_present = 1;
+    stored_generation_index = (java_remote_parent_generation_index_t){
+        .process = java_process_key(&test_owner),
+        .process_incarnation = test_process_incarnation,
+        .observed_monotime_ns = test_now_ns,
+    };
+    generation_index_present = 1;
+    ambiguities[0] = (ambiguity_entry_t){
+        .key = stored_state_key,
+        .present = 1,
+    };
+    stored_fallback = stored_state.response;
+    fallback_present = 1;
+    const java_remote_parent_state_t successor_state = stored_state;
+
+    current_task = test_relay_child;
+    memset(&response, 0, sizeof(response));
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_already_consumed ||
+        response.status != k_java_remote_parent_status_already_consumed ||
+        java_remote_parent_le64_to_cpu(response.generation_le) != test_generation ||
+        java_remote_parent_le64_to_cpu(response.observed_monotime_ns_le) !=
+            test_observed_monotime_ns ||
+        !task_present || !transferred_task_present || !replay->present ||
+        memcmp(&replay->value, &replay_value, sizeof(replay_value)) != 0 || !state_present ||
+        memcmp(&stored_state, &successor_state, sizeof(successor_state)) != 0 || claim_present ||
+        unexpected_update || unexpected_delete) {
+        fail("same-generation successor masked the task's exact replay provenance");
+    }
+}
+
+static void test_replay_binding_mismatch_is_missing_and_nonmutating(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    const connection_info_t replacement = {.s_port = 2345, .d_port = 8443};
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    seed_alias_replay(&stored_state_key, test_observed_monotime_ns, test_process_incarnation, 1);
+    current_task = test_child;
+    java_remote_parent_response_t response = {0};
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+        k_java_remote_parent_status_valid) {
+        fail("could not seed predecessor replay for binding mismatch testing");
+    }
+    alias_replay_entry_t *replay = exact_test_alias_replay();
+    const java_remote_parent_alias_replay_t replay_value = replay->value;
+    seed_replacement_generation(&replacement);
+    publish_replacement_terminal();
+
+    memset(&response, 0, sizeof(response));
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_replacement_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_missing ||
+        response.status != k_java_remote_parent_status_missing || !replay->present ||
+        memcmp(&replay->value, &replay_value, sizeof(replay_value)) != 0 || !task_present ||
+        claim_present || unexpected_update || unexpected_delete) {
+        fail("expected-generation mismatch mutated exact replay authority");
+    }
+
+    memset(&response, 0, sizeof(response));
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &replacement,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_replacement_socket_cookie) !=
+            k_java_remote_parent_status_missing ||
+        response.status != k_java_remote_parent_status_missing || !replay->present ||
+        memcmp(&replay->value, &replay_value, sizeof(replay_value)) != 0 || !task_present ||
+        claim_present || unexpected_update || unexpected_delete) {
+        fail("socket/connection rebound mismatch mutated exact replay authority");
+    }
+}
+
+static void test_replay_task_rebind_fails_closed_without_retiring_authority(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    seed_alias_replay(&stored_state_key, test_observed_monotime_ns, test_process_incarnation, 1);
+    current_task = test_child;
+    java_remote_parent_response_t response = {0};
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+        k_java_remote_parent_status_valid) {
+        fail("could not seed a completed task replay for rebind testing");
+    }
+    publish_replacement_terminal();
+    replace_task_during_alias_replay_lookup = 1;
+    memset(&response, 0, sizeof(response));
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_ambiguous ||
+        response.status != k_java_remote_parent_status_ambiguous ||
+        replace_task_during_alias_replay_lookup || !task_present ||
+        stored_task.generation != test_replacement_generation || claim_present ||
+        !exact_test_alias_replay() ||
+        exact_test_alias_replay()->value.lifecycle != k_java_remote_parent_lifecycle_consumed ||
+        unexpected_update || unexpected_delete) {
+        fail("task rebind during exact replay retired or returned old authority");
+    }
+}
+
+static void test_replay_transition_failure_retains_finish_fences(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    alias_replay_entry_t *replay = seed_alias_replay(
+        &stored_state_key, test_observed_monotime_ns, test_process_incarnation, 1);
+    seed_finish_claim(k_java_remote_parent_lifecycle_consumed);
+    alias_replay_update_failures = 1;
+    finish_seeded_generation(k_java_remote_parent_lifecycle_consumed);
+    if (alias_replay_update_failures || !finish_generation_artifacts_present() ||
+        !exact_finish_terminal_present(k_java_remote_parent_lifecycle_consumed) ||
+        !exact_finish_fences_retained(&stored_state_key, k_java_remote_parent_lifecycle_consumed) ||
+        !replay->present || replay->value.references != 1 ||
+        replay->value.lifecycle != k_java_remote_parent_lifecycle_active || unexpected_update ||
+        unexpected_delete) {
+        fail("failed replay transition released finish fences or payload");
+    }
+}
+
+static void test_stale_retain_transition_is_overcount_only(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    alias_replay_entry_t *replay = seed_alias_replay(
+        &stored_state_key, test_observed_monotime_ns, test_process_incarnation, 1);
+    seed_finish_claim(k_java_remote_parent_lifecycle_consumed);
+    increment_alias_replay_before_publishing_update = 1;
+    finish_seeded_generation(k_java_remote_parent_lifecycle_consumed);
+    if (increment_alias_replay_before_publishing_update || !finish_generation_artifacts_absent() ||
+        claim_present || detach_guard_present || !task_present || !replay->present ||
+        replay->value.references != 1 ||
+        replay->value.lifecycle != k_java_remote_parent_lifecycle_consumed || unexpected_update ||
+        unexpected_delete) {
+        fail("stale retain/finalizer interleaving undercounted exact replay");
+    }
+    java_remote_parent_unlink_task(&stored_task_key);
+    if (task_present || replay->present || unexpected_update || unexpected_delete) {
+        fail("last final replay reference did not retire after E/G release");
+    }
+}
+
+static void test_ambiguous_alias_commit_replays_ambiguous(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    seed_alias_replay(&stored_state_key, test_observed_monotime_ns, test_process_incarnation, 1);
+    ambiguities[0].observed_monotime_ns = test_now_ns;
+    current_task = test_child;
+    java_remote_parent_response_t response = {0};
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_ambiguous ||
+        response.status != k_java_remote_parent_status_ambiguous || claim_present ||
+        !finish_generation_artifacts_absent() || !exact_test_alias_replay() ||
+        exact_test_alias_replay()->value.lifecycle != k_java_remote_parent_lifecycle_ambiguous ||
+        unexpected_update || unexpected_delete) {
+        fail("ambiguous task claim did not commit matching E/replay semantics");
+    }
+    publish_replacement_terminal();
+    memset(&response, 0, sizeof(response));
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_ambiguous ||
+        response.status != k_java_remote_parent_status_ambiguous || claim_present ||
+        !exact_test_alias_replay() || unexpected_update || unexpected_delete) {
+        fail("ambiguous exact replay did not preserve the committed semantic");
+    }
+}
+
+static void test_ttl_boundary_promotes_stale_and_replays_consumed(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_two_task_aliases(&connection);
+    advance_time_after_claim_task_validation = 1;
+    current_task = test_child;
+    java_remote_parent_response_t response = {0};
+    const u64 max_age_ns = test_now_ns - test_observed_monotime_ns;
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   max_age_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_stale ||
+        response.status != k_java_remote_parent_status_stale ||
+        advance_time_after_claim_task_validation || claim_present ||
+        !finish_generation_artifacts_absent() || !exact_test_alias_replay() ||
+        exact_test_alias_replay()->value.lifecycle != k_java_remote_parent_lifecycle_stale ||
+        unexpected_update || unexpected_delete) {
+        fail("TTL boundary did not promote E and replay to stale");
+    }
+    publish_replacement_terminal();
+    current_task = test_relay_child;
+    memset(&response, 0, sizeof(response));
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   max_age_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_already_consumed ||
+        response.status != k_java_remote_parent_status_already_consumed || claim_present ||
+        !exact_test_alias_replay() ||
+        exact_test_alias_replay()->value.lifecycle != k_java_remote_parent_lifecycle_stale ||
+        unexpected_update || unexpected_delete) {
+        fail("stale replay sibling did not classify the one-shot as consumed");
+    }
+}
+
 static void test_detached_finish_preserves_successor_terminal(void) {
     const connection_info_t connection = {.s_port = 1234, .d_port = 443};
     const connection_info_t replacement = {.s_port = 2345, .d_port = 8443};
@@ -5729,6 +7233,12 @@ static void test_detached_finish_preserves_successor_terminal(void) {
 }
 
 int main(void) {
+    test_claim_equality_is_byte_exact();
+    test_pid_and_generation_index_equality_is_exact();
+    test_abi_tail_validation_is_byte_exact();
+    test_finish_connection_matcher_is_field_exact();
+    test_compact_finish_shapes_match_reference();
+    test_claim_status_packed_classifier_matches_reference();
     test_capture_claim_race_releases_published_alias();
     test_relay_claim_race_preserves_existing_task_alias();
     test_capture_transfer_survives_claim_eviction();
@@ -5756,7 +7266,9 @@ int main(void) {
     test_detached_zero_cleanup_quarantines_retain_race();
     test_detached_zero_cleanup_retains_adoption_artifacts();
     test_cross_generation_guard_does_not_block_detached_cleanup();
-    test_cleanup_unlinks_and_cleans_a_different_detached_generation();
+    test_cleanup_unlinks_exact_task_and_releases_final_replay_reference();
+    test_cleanup_absent_task_is_idempotent();
+    test_cleanup_retains_foreign_generation_task_and_replay();
     test_owner_cleanup_release_tails_are_recoverable();
     test_internal_cleanup_claim_is_transient();
     test_generation_claim_status_validation();
@@ -5798,6 +7310,20 @@ int main(void) {
     test_finish_release_failures_are_fenced();
     test_finish_final_guard_release_preserves_successor();
     test_live_task_finish_claim_release_preserves_repeat_status();
+    test_sibling_task_replays_after_successor_terminal();
+    test_missing_alias_replay_overloads_before_exact_claim();
+    test_alias_replay_capacity_rejects_retain_before_publication();
+    test_direct_successor_never_consults_old_alias_replay();
+    test_tagged_final_alias_replay_fails_closed();
+    test_zero_reference_publishing_replay_fails_closed();
+    test_zero_reference_publishing_replay_rejects_handoff_transfer();
+    test_task_replay_outweighs_same_generation_successor_observation();
+    test_replay_binding_mismatch_is_missing_and_nonmutating();
+    test_replay_task_rebind_fails_closed_without_retiring_authority();
+    test_replay_transition_failure_retains_finish_fences();
+    test_stale_retain_transition_is_overcount_only();
+    test_ambiguous_alias_commit_replays_ambiguous();
+    test_ttl_boundary_promotes_stale_and_replays_consumed();
     test_detached_finish_preserves_successor_terminal();
     return 0;
 }

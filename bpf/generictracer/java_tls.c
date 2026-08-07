@@ -53,6 +53,10 @@ enum {
 
 enum { k_ioctl_invalid_op = 0xff };
 enum { k_java_control_cleanup_required = 1 };
+enum java_ioctl_operation_mask : u8 {
+    k_java_ioctl_control = 1 << 0,
+    k_java_ioctl_data = 1 << 1,
+};
 // Keep this ceiling aligned with the largest large-buffer capture limit in
 // bpf/common/large_buffers.h.
 enum { k_ioctl_max_payload_len = 1 << 16 };
@@ -226,15 +230,10 @@ static __noinline int handle_java_unregistered_lifecycle_ioctl(unsigned char *ua
 static __noinline int handle_java_unregistered_control_ioctl(
     unsigned char *uarg, u64 id, u8 op_cmd, const pid_key_t *task, u64 process_capability);
 
-static __noinline int handle_java_lifecycle_ioctl(unsigned char *uarg,
-                                                  u8 op_cmd,
-                                                  const pid_key_t *task,
-                                                  u64 process_capability) {
-    if (op_cmd != k_ioctl_java_process_register &&
-        java_process_incarnation_for(task) != process_capability) {
-        return handle_java_unregistered_lifecycle_ioctl(uarg, op_cmd, task, process_capability);
-    }
-
+static __noinline int handle_java_registered_lifecycle_ioctl(unsigned char *uarg,
+                                                             u8 op_cmd,
+                                                             const pid_key_t *task,
+                                                             u64 process_capability) {
     switch (op_cmd) {
     case k_ioctl_java_process_register: {
         u64 incarnation = 0;
@@ -370,6 +369,17 @@ static __noinline int handle_java_lifecycle_ioctl(unsigned char *uarg,
     }
 }
 
+static __noinline int handle_java_lifecycle_ioctl(unsigned char *uarg,
+                                                  u8 op_cmd,
+                                                  const pid_key_t *task,
+                                                  u64 process_capability) {
+    if (op_cmd != k_ioctl_java_process_register &&
+        java_process_incarnation_for(task) != process_capability) {
+        return handle_java_unregistered_lifecycle_ioctl(uarg, op_cmd, task, process_capability);
+    }
+    return handle_java_registered_lifecycle_ioctl(uarg, op_cmd, task, process_capability);
+}
+
 static __noinline int handle_java_unregistered_lifecycle_ioctl(unsigned char *uarg,
                                                                u8 op_cmd,
                                                                const pid_key_t *task,
@@ -476,6 +486,72 @@ static __noinline int handle_java_tls_connection_ioctl(struct file *file,
     return 0;
 }
 
+static __noinline int handle_java_task_capture_ioctl(unsigned char *uarg,
+                                                     const pid_key_t *execution) {
+    u64 token = 0;
+    if (bpf_probe_read_user(&token, sizeof(token), uarg + 1) == 0 && java_remote_parent_enabled) {
+        java_remote_parent_capture_handoff_for_execution(execution, token);
+    }
+    return 0;
+}
+
+static __noinline int handle_java_task_cancel_ioctl(unsigned char *uarg,
+                                                    const pid_key_t *execution,
+                                                    u64 process_capability) {
+    u64 token = 0;
+    if (bpf_probe_read_user(&token, sizeof(token), uarg + 1) == 0 && java_remote_parent_enabled) {
+        java_remote_parent_cancel_handoff_for_capability(execution, token, process_capability);
+    }
+    return 0;
+}
+
+static __noinline int handle_java_task_relay_capture_ioctl(unsigned char *uarg,
+                                                           const pid_key_t *execution) {
+    u64 token = 0;
+    if (bpf_probe_read_user(&token, sizeof(token), uarg + 1) == 0 && java_remote_parent_enabled) {
+        java_remote_parent_capture_relay(execution, token);
+    }
+    return 0;
+}
+
+static __noinline int
+handle_java_task_unlink_ioctl(const pid_key_t *task, const pid_key_t *execution, u64 id) {
+    java_thread_mapping_unlink_execution(task, execution, id, java_remote_parent_enabled);
+    return 0;
+}
+
+static __noinline int handle_java_threads_ioctl(unsigned char *uarg,
+                                                u64 id,
+                                                const pid_key_t *task,
+                                                const pid_key_t *execution,
+                                                u64 process_capability) {
+    return handle_java_thread_mapping_ioctl(
+        uarg, id, task, execution, process_capability, java_remote_parent_enabled);
+}
+
+static __noinline int handle_java_task_link_ioctl(unsigned char *uarg,
+                                                  u64 id,
+                                                  const pid_key_t *task,
+                                                  const pid_key_t *execution,
+                                                  u64 process_capability) {
+    u64 parent_id = 0;
+    if (bpf_probe_read_user(&parent_id, sizeof(parent_id), uarg + 1) != 0) {
+        return 0;
+    }
+    u64 token = 0;
+    if (bpf_probe_read_user(&token, sizeof(token), uarg + 1 + sizeof(parent_id)) != 0) {
+        return 0;
+    }
+
+    if (java_remote_parent_enabled) {
+        bpf_map_delete_elem(&java_tasks, task);
+        obi_ctx__del(id);
+        java_remote_parent_link_handoff_for_capability(execution, token, process_capability);
+        return 0;
+    }
+    return handle_java_thread_mapping(parent_id, id, task, execution, process_capability, 0);
+}
+
 static __noinline int handle_java_control_ioctl(unsigned char *uarg,
                                                 u8 op_cmd,
                                                 const pid_key_t *task,
@@ -493,72 +569,55 @@ static __noinline int handle_java_control_ioctl(unsigned char *uarg,
     }
 
     switch (op_cmd) {
-    case k_ioctl_java_task_capture: {
-        u64 token = 0;
-        if (bpf_probe_read_user(&token, sizeof(token), uarg + 1) != 0) {
-            return 0;
-        }
-        if (java_remote_parent_enabled) {
-            java_remote_parent_capture_handoff_for_execution(&execution, token);
-        }
-        return 0;
-    }
-    case k_ioctl_java_task_cancel: {
-        u64 token = 0;
-        if (bpf_probe_read_user(&token, sizeof(token), uarg + 1) != 0) {
-            return 0;
-        }
-        if (java_remote_parent_enabled) {
-            java_remote_parent_cancel_handoff_for_capability(&execution, token, process_capability);
-        }
-        return 0;
-    }
-    case k_ioctl_java_task_relay_capture: {
-        u64 token = 0;
-        if (bpf_probe_read_user(&token, sizeof(token), uarg + 1) != 0) {
-            return 0;
-        }
-        if (java_remote_parent_enabled) {
-            java_remote_parent_capture_relay(&execution, token);
-        }
-        return 0;
-    }
-    case k_ioctl_java_task_unlink: {
-        java_thread_mapping_unlink_execution(task, &execution, id, java_remote_parent_enabled);
-        return 0;
-    }
+    case k_ioctl_java_task_capture:
+        return handle_java_task_capture_ioctl(uarg, &execution);
+    case k_ioctl_java_task_cancel:
+        return handle_java_task_cancel_ioctl(uarg, &execution, process_capability);
+    case k_ioctl_java_task_relay_capture:
+        return handle_java_task_relay_capture_ioctl(uarg, &execution);
+    case k_ioctl_java_task_unlink:
+        return handle_java_task_unlink_ioctl(task, &execution, id);
     case k_ioctl_java_threads:
-        return handle_java_thread_mapping_ioctl(
-            uarg, id, task, &execution, process_capability, java_remote_parent_enabled);
-    case k_ioctl_java_task_link: {
-        u64 parent_id = 0;
-        if (bpf_probe_read_user(&parent_id, sizeof(parent_id), uarg + 1) != 0) {
-            return 0;
-        }
-        u64 token = 0;
-        if (bpf_probe_read_user(&token, sizeof(token), uarg + 1 + sizeof(parent_id)) != 0) {
-            return 0;
-        }
-
-        const pid_key_t logical_child = execution;
-        if (java_remote_parent_enabled) {
-            const pid_key_t child = *task;
-            bpf_map_delete_elem(&java_tasks, &child);
-            obi_ctx__del(id);
-            java_remote_parent_link_handoff_for_capability(
-                &logical_child, token, process_capability);
-            return 0;
-        }
-        return handle_java_thread_mapping(parent_id, id, task, &execution, process_capability, 0);
-    }
+        return handle_java_threads_ioctl(uarg, id, task, &execution, process_capability);
+    case k_ioctl_java_task_link:
+        return handle_java_task_link_ioctl(uarg, id, task, &execution, process_capability);
     default:
         bpf_dbg_printk("unknown cmd=%d", op_cmd);
         return 0;
     }
 }
 
-static __always_inline int handle_java_ioctl(
-    struct pt_regs *ctx, struct file *file, u64 id, unsigned char *uarg, u8 data_only) {
+static __always_inline int handle_java_data_operation_ioctl(struct pt_regs *ctx,
+                                                            struct file *file,
+                                                            u64 id,
+                                                            unsigned char *uarg,
+                                                            u8 op_cmd,
+                                                            u8 op,
+                                                            const pid_key_t *task,
+                                                            u64 process_capability) {
+    const u8 registered = java_process_incarnation_for(task) == process_capability;
+    if (op != k_ioctl_invalid_op) {
+        if (!java_remote_parent_begin_receive(java_remote_parent_enabled,
+                                              java_remote_parent_enabled &&
+                                                  java_remote_parent_data_hook_is_ready(),
+                                              registered,
+                                              op == TCP_RECV,
+                                              process_capability)) {
+            return 0;
+        }
+        return handle_java_data_ioctl(ctx, file, id, uarg, op);
+    }
+    if (op_cmd == k_ioctl_java_tls_connection) {
+        return handle_java_tls_connection_ioctl(file, uarg, task, process_capability);
+    }
+    return 0;
+}
+
+static __always_inline int handle_java_ioctl(struct pt_regs *ctx,
+                                             struct file *file,
+                                             u64 id,
+                                             unsigned char *uarg,
+                                             enum java_ioctl_operation_mask operation_mask) {
     pid_key_t task = {0};
     task_tid(&task);
     const u64 process_capability = java_process_capability_for(&task);
@@ -572,23 +631,22 @@ static __always_inline int handle_java_ioctl(
     }
     const u8 op = cmd_to_op(op_cmd);
     const u8 data_operation = op != k_ioctl_invalid_op || op_cmd == k_ioctl_java_tls_connection;
-    if (data_operation != data_only) {
-        return 0;
+    // Keep the file-bearing hook's linked call graph data-only. The literal
+    // mask makes this branch compile-time separable, so security_file_ioctl
+    // cannot inherit unreachable lifecycle/control stack frames.
+    if (operation_mask == k_java_ioctl_data) {
+        return data_operation ? handle_java_data_operation_ioctl(
+                                    ctx, file, id, uarg, op_cmd, op, &task, process_capability)
+                              : 0;
+    }
+    if (data_operation) {
+        return (operation_mask & k_java_ioctl_data)
+                   ? handle_java_data_operation_ioctl(
+                         ctx, file, id, uarg, op_cmd, op, &task, process_capability)
+                   : 0;
     }
     const u8 registered = op_cmd == k_ioctl_java_process_register ||
                           java_process_incarnation_for(&task) == process_capability;
-
-    if (op != k_ioctl_invalid_op) {
-        if (!java_remote_parent_begin_receive(java_remote_parent_enabled,
-                                              java_remote_parent_enabled &&
-                                                  java_remote_parent_data_hook_is_ready(),
-                                              registered,
-                                              op == TCP_RECV,
-                                              process_capability)) {
-            return 0;
-        }
-        return handle_java_data_ioctl(ctx, file, id, uarg, op);
-    }
     if (!registered) {
         if (op_cmd == k_ioctl_java_vt_mount || op_cmd == k_ioctl_java_vt_unmount ||
             op_cmd == k_ioctl_java_vt_terminate) {
@@ -600,9 +658,6 @@ static __always_inline int handle_java_ioctl(
     if (op_cmd == k_ioctl_java_process_register || op_cmd == k_ioctl_java_vt_mount ||
         op_cmd == k_ioctl_java_vt_unmount || op_cmd == k_ioctl_java_vt_terminate) {
         return handle_java_lifecycle_ioctl(uarg, op_cmd, &task, process_capability);
-    }
-    if (op_cmd == k_ioctl_java_tls_connection) {
-        return handle_java_tls_connection_ioctl(file, uarg, &task, process_capability);
     }
     if (handle_java_control_ioctl(uarg, op_cmd, &task, process_capability) ==
         k_java_control_cleanup_required) {
@@ -627,11 +682,9 @@ int BPF_KPROBE(obi_kprobe_sys_ioctl) {
         return 0;
     }
 
-    handle_java_ioctl(ctx, NULL, id, arg, 0);
-    if (!java_remote_parent_data_hook_is_ready()) {
-        return handle_java_ioctl(ctx, NULL, id, arg, 1);
-    }
-    return 0;
+    const enum java_ioctl_operation_mask operation_mask =
+        k_java_ioctl_control | (java_remote_parent_data_hook_is_ready() ? 0 : k_java_ioctl_data);
+    return handle_java_ioctl(ctx, NULL, id, arg, operation_mask);
 }
 
 SEC("kprobe/security_file_ioctl")
@@ -647,5 +700,6 @@ int BPF_KPROBE(obi_kprobe_security_file_ioctl,
         return 0;
     }
 
-    return handle_java_ioctl(ctx, file, bpf_get_current_pid_tgid(), (unsigned char *)arg, 1);
+    return handle_java_ioctl(
+        ctx, file, bpf_get_current_pid_tgid(), (unsigned char *)arg, k_java_ioctl_data);
 }

@@ -42,6 +42,7 @@ type MapHandler struct {
 	generations       bridgeMap
 	terminals         bridgeMap
 	claims            bridgeMap
+	aliasReplays      bridgeMap
 	ownerGuards       bridgeMap
 	coordinator       *GenerationCoordinator
 	ttl               time.Duration
@@ -65,6 +66,7 @@ type Maps struct {
 	Generations                    *ebpf.Map
 	Terminals                      *ebpf.Map
 	Claims                         *ebpf.Map
+	AliasReplays                   *ebpf.Map
 	OwnerGuards                    *ebpf.Map
 	Handoffs                       *ebpf.Map
 	HandoffClaims                  *ebpf.Map
@@ -79,6 +81,23 @@ type stateKey struct {
 	Owner      Identity
 	Reserved   uint32
 	Generation uint64
+}
+
+type aliasReplayKey struct {
+	Owner               Identity
+	Reserved            uint32
+	Generation          uint64
+	ObservedMonotonicNS uint64
+	ProcessIncarnation  uint64
+}
+
+type aliasReplayValue struct {
+	TransitionMonotonicNS uint64
+	References            uint32
+	Lifecycle             uint8
+	DesiredLifecycle      uint8
+	ProducerTag           uint8
+	Reserved              uint8
 }
 
 type taskLink struct {
@@ -214,6 +233,7 @@ func NewMapHandler(
 		generations:       maps.Generations,
 		terminals:         maps.Terminals,
 		claims:            maps.Claims,
+		aliasReplays:      maps.AliasReplays,
 		ownerGuards:       maps.OwnerGuards,
 		coordinator:       coordinator,
 		ttl:               ttl,
@@ -260,7 +280,7 @@ func (h *MapHandler) handle(
 	if h.remoteParents == nil || h.tasks == nil || h.virtualThreads == nil || h.vtIdentities == nil || h.authorized == nil || h.incarnations == nil ||
 		h.connections == nil || h.cookieConnections == nil || h.ambiguity == nil ||
 		h.owners == nil || h.states == nil || h.generations == nil || h.terminals == nil ||
-		h.claims == nil || h.ownerGuards == nil {
+		h.claims == nil || h.aliasReplays == nil || h.ownerGuards == nil {
 		return Record{Status: StatusUnsupported}
 	}
 	if operation != OperationTake && operation != OperationDiscard && operation != OperationNegotiate {
@@ -489,10 +509,6 @@ func (h *MapHandler) handle(
 		lifecycle = lifecycleDiscarded
 	}
 	key := stateKey{Owner: owner, Generation: record.Generation}
-	claim, ok := h.newGenerationClaim(lifecycle, processIncarnation)
-	if !ok {
-		return Record{Status: StatusTransportError}
-	}
 	if requestCanceled(ctx) {
 		return Record{Status: StatusTimeout}
 	}
@@ -515,8 +531,36 @@ func (h *MapHandler) handle(
 	if requestCanceled(ctx) {
 		return Record{Status: StatusTimeout}
 	}
-	// Acquiring the claim commits the one-shot operation. Once it succeeds,
-	// cleanup must finish and report the real outcome even if the deadline crosses.
+	preclaimState, _, status := h.validatePublishedGeneration(
+		candidate, record, encoded, StatusMissing, false,
+	)
+	if status != StatusValid {
+		return Record{Status: status}
+	}
+	now := h.monoTimeNow()
+	if now <= 0 || preclaimState.ObservedMonotonicNS == 0 ||
+		uint64(now) < preclaimState.ObservedMonotonicNS {
+		return Record{Status: StatusTransportError}
+	}
+	if time.Duration(uint64(now)-preclaimState.ObservedMonotonicNS) > h.ttl {
+		lifecycle = lifecycleStale
+	}
+	replayTransition, status := h.activeAliasReplay(candidate, key, preclaimState)
+	if status != StatusValid {
+		return Record{Status: status}
+	}
+	if status := h.candidateTaskAuthorityStatus(candidate); status != StatusValid {
+		return Record{Status: status}
+	}
+	if requestCanceled(ctx) {
+		return Record{Status: StatusTimeout}
+	}
+	claim, ok := h.newGenerationClaim(lifecycle, processIncarnation)
+	if !ok {
+		return Record{Status: StatusTransportError}
+	}
+	// E first publishes a reversible reservation. Only the exact promotion to
+	// the target lifecycle below commits the one-shot operation.
 	if err := h.claims.Update(&key, &claim, ebpf.UpdateNoExist); err != nil {
 		if errors.Is(err, ebpf.ErrKeyExist) {
 			claimedStatus, claimed, claimErr := h.existingGenerationClaimStatus(candidate)
@@ -538,55 +582,114 @@ func (h *MapHandler) handle(
 		return Record{Status: StatusTransportError}
 	}
 	ownedClaim := claim
+	claimCommitted := false
+	rollbackAllowed := true
 	defer func() {
+		if !claimCommitted {
+			if rollbackAllowed && h.rollbackPublishingClaim(
+				key, &ownedClaim, replayTransition,
+			) {
+				return
+			}
+			_ = h.retainLocalClaim(key)
+		}
 		_ = handoffGenerationProducerFencePair(
 			h.claims, h.ownerGuards, key, &ownedClaim, nil, h.monoTimeNow,
 		)
 	}()
 	guarded, guardErr = ownerDetachGuardPresent(h.ownerGuards, owner)
 	if guardErr != nil {
-		// The exact claim is already committed. Retain it so cleanup can
-		// converge the uncertain claim/guard overlap.
-		_ = h.retainLocalClaim(key)
+		rollbackAllowed = false
 		return Record{Status: StatusTransportError}
 	}
 	if guarded {
-		if err := h.retainLocalClaim(key); err != nil {
-			return Record{Status: StatusTransportError}
-		}
 		if status := h.candidateTaskAuthorityStatus(candidate); status != StatusValid {
 			return Record{Status: status}
 		}
 		return Record{Status: StatusOverload}
+	}
+	if status := h.publishAliasReplayTransition(
+		replayTransition, ownedClaim, lifecycle,
+	); status != StatusValid {
+		rollbackAllowed = false
+		return Record{Status: status}
 	}
 
 	state, claimedRecord, status := h.validatePublishedGeneration(
 		candidate, record, encoded, StatusAlreadyConsumed, false,
 	)
 	if status != StatusValid {
-		if status == StatusTransportError {
-			_ = h.retainLocalClaim(key)
-			return Record{Status: status}
+		if linkStatus := h.candidateTaskLinkStatus(candidate); linkStatus == StatusValid ||
+			linkStatus == StatusTransportError {
+			rollbackAllowed = false
 		}
-		if status == StatusAlreadyConsumed || status == StatusMissing {
-			if err := h.retainLocalClaim(key); err != nil {
-				return Record{Status: StatusTransportError}
-			}
-			return Record{Status: status}
-		}
-		terminalLifecycle := lifecycleAmbiguous
-		h.finishClaimed(
-			owner, record, processIncarnation, terminalLifecycle, &ownedClaim,
-		)
 		return Record{Status: status}
 	}
+	if replayTransition == nil && state.Aliases > 0 {
+		replayTransition, status = h.activeAliasReplay(candidate, key, state)
+		if status != StatusValid {
+			rollbackAllowed = false
+			return Record{Status: status}
+		}
+		if status = h.publishAliasReplayTransition(
+			replayTransition, ownedClaim, lifecycle,
+		); status != StatusValid {
+			rollbackAllowed = false
+			return Record{Status: status}
+		}
+	}
+	if replayTransition != nil {
+		if aliasReplayKeyForState(key, state) != replayTransition.key {
+			rollbackAllowed = false
+			return Record{Status: StatusAmbiguous}
+		}
+		if status = h.revalidateAliasReplayTransition(replayTransition); status != StatusValid {
+			rollbackAllowed = false
+			return Record{Status: status}
+		}
+	}
+	guarded, guardErr = ownerDetachGuardPresent(h.ownerGuards, owner)
+	if guardErr != nil {
+		rollbackAllowed = false
+		return Record{Status: StatusTransportError}
+	}
+	if guarded {
+		return Record{Status: StatusOverload}
+	}
+	if status = h.candidateTaskAuthorityStatus(candidate); status != StatusValid {
+		if linkStatus := h.candidateTaskLinkStatus(candidate); linkStatus == StatusValid ||
+			linkStatus == StatusTransportError {
+			rollbackAllowed = false
+		}
+		return Record{Status: status}
+	}
+	if lifecycle != lifecycleStale {
+		now = h.monoTimeNow()
+		if now <= 0 || state.ObservedMonotonicNS == 0 ||
+			uint64(now) < state.ObservedMonotonicNS {
+			rollbackAllowed = false
+			return Record{Status: StatusTransportError}
+		}
+		if time.Duration(uint64(now)-state.ObservedMonotonicNS) > h.ttl {
+			if status = h.retargetPublishingClaimStale(
+				key, &ownedClaim, replayTransition,
+			); status != StatusValid {
+				rollbackAllowed = false
+				return Record{Status: status}
+			}
+			lifecycle = lifecycleStale
+		}
+	}
+	if status = h.promoteGenerationClaim(key, &ownedClaim); status != StatusValid {
+		rollbackAllowed = false
+		return Record{Status: status}
+	}
+	claimCommitted = true
 	record = claimedRecord
 	h.markConsumed(identity, processIncarnation)
 	h.markConsumed(owner, processIncarnation)
 
-	if now := h.monoTimeNow(); now <= 0 || state.ObservedMonotonicNS == 0 ||
-		uint64(now) < state.ObservedMonotonicNS ||
-		time.Duration(uint64(now)-state.ObservedMonotonicNS) > h.ttl {
+	if lifecycle == lifecycleStale {
 		h.finishClaimedResult(
 			owner, record, processIncarnation, lifecycleStale, &ownedClaim,
 		)
@@ -911,8 +1014,23 @@ func (h *MapHandler) resolveTask(
 		}
 		return nil, false, true
 	}
-	if !h.currentTaskLink(link) {
+	current, expired := h.taskLinkFreshness(link)
+	if !current && !expired {
 		return nil, false, false
+	}
+	if expired {
+		// An expired link can no longer authorize parent delivery. Preserve only
+		// its exact identity long enough to consult the generation claim and
+		// composite-key alias replay, both of which are revalidated against the
+		// current task-map value before returning a terminal result.
+		return []resolvedCandidate{{
+			Owner:              link.Owner,
+			Generation:         link.Generation,
+			ProcessIncarnation: processIncarnation,
+			ClaimOnly:          true,
+			TaskSource:         start,
+			TaskLink:           link,
+		}}, false, false
 	}
 	linked, found, failed := h.resolveOwner(
 		link.Owner, link.Generation, processIncarnation, true,
@@ -1357,12 +1475,17 @@ func javaVirtualThreadOwner(carrier Identity, virtualThreadID uint64) Identity {
 	return carrier
 }
 
-func (h *MapHandler) currentTaskLink(link taskLink) bool {
+func (h *MapHandler) taskLinkFreshness(link taskLink) (current, expired bool) {
 	now := h.monoTimeNow()
-	return now > 0 && link.Owner != (Identity{}) && link.Reserved == 0 && link.Generation > 0 &&
-		link.ObservedMonotonicNS > 0 &&
-		uint64(now) >= link.ObservedMonotonicNS &&
-		time.Duration(uint64(now)-link.ObservedMonotonicNS) <= h.ttl
+	if now <= 0 || link.Owner == (Identity{}) || link.Reserved != 0 ||
+		link.Generation == 0 || link.ObservedMonotonicNS == 0 ||
+		uint64(now) < link.ObservedMonotonicNS {
+		return false, false
+	}
+	if time.Duration(uint64(now)-link.ObservedMonotonicNS) > h.ttl {
+		return false, true
+	}
+	return true, false
 }
 
 func (h *MapHandler) consume(
@@ -1400,14 +1523,7 @@ func (h *MapHandler) consume(
 		}
 
 		key := stateKey{Owner: candidate.Owner, Generation: candidate.Generation}
-		claimLifecycle := lifecycle
-		if lifecycle == lifecycleAmbiguous {
-			// BPF claims an ambiguous resolution as discarded and publishes an
-			// ambiguous terminal. A retained exact claim must therefore classify
-			// every retry as already consumed in both runtimes.
-			claimLifecycle = lifecycleDiscarded
-		}
-		claim, ok := h.newGenerationClaim(claimLifecycle, candidate.ProcessIncarnation)
+		claim, ok := h.newGenerationClaim(lifecycle, candidate.ProcessIncarnation)
 		if !ok {
 			continue
 		}
@@ -1432,6 +1548,41 @@ func (h *MapHandler) consume(
 		}
 		if !committed && requestCanceled(ctx) {
 			return false, StatusUnknown, nil
+		}
+		preclaimState, _, status := h.validatePublishedGeneration(
+			candidate,
+			record,
+			encoded,
+			StatusMissing,
+			true,
+		)
+		if status != StatusValid {
+			if status == StatusTransportError {
+				return committed, StatusUnknown, errors.New("revalidating generation before claim")
+			}
+			if len(candidates) == 1 {
+				return committed, status, nil
+			}
+			continue
+		}
+		replayTransition, status := h.activeAliasReplay(candidate, key, preclaimState)
+		if status != StatusValid {
+			if status == StatusTransportError {
+				return committed, StatusUnknown, errors.New("validating alias replay before claim")
+			}
+			if len(candidates) == 1 {
+				return committed, status, nil
+			}
+			continue
+		}
+		if status := h.candidateTaskAuthorityStatus(candidate); status != StatusValid {
+			if status == StatusTransportError {
+				return committed, StatusUnknown, errors.New("revalidating task authority at claim")
+			}
+			if len(candidates) == 1 {
+				return committed, status, nil
+			}
+			continue
 		}
 		if err := h.claims.Update(&key, &claim, ebpf.UpdateNoExist); err != nil {
 			if !errors.Is(err, ebpf.ErrKeyExist) {
@@ -1459,23 +1610,37 @@ func (h *MapHandler) consume(
 		}
 		ownedClaim := new(generationClaim)
 		*ownedClaim = claim
-		defer func(key stateKey, owned *generationClaim) {
+		ownedCommitted := new(bool)
+		ownedRollbackAllowed := new(bool)
+		*ownedRollbackAllowed = true
+		ownedTransition := new(*aliasReplayTransition)
+		*ownedTransition = replayTransition
+		defer func(
+			key stateKey,
+			owned *generationClaim,
+			claimCommitted *bool,
+			rollbackAllowed *bool,
+			transition **aliasReplayTransition,
+		) {
+			if !*claimCommitted {
+				if *rollbackAllowed && h.rollbackPublishingClaim(key, owned, *transition) {
+					return
+				}
+				_ = h.retainLocalClaim(key)
+			}
 			_ = handoffGenerationProducerFencePair(
 				h.claims, h.ownerGuards, key, owned, nil, h.monoTimeNow,
 			)
-		}(key, ownedClaim)
-		committed = true
+		}(key, ownedClaim, ownedCommitted, ownedRollbackAllowed, ownedTransition)
 		guarded, guardErr = ownerDetachGuardPresent(h.ownerGuards, candidate.Owner)
 		if guardErr != nil {
-			_ = h.retainLocalClaim(key)
+			*ownedRollbackAllowed = false
 			return committed, StatusUnknown, guardErr
 		}
 		if guarded {
-			if err := h.retainLocalClaim(key); err != nil {
-				return committed, StatusUnknown, err
-			}
 			if status := h.candidateTaskAuthorityStatus(candidate); status != StatusValid {
 				if status == StatusTransportError {
+					*ownedRollbackAllowed = false
 					return committed, StatusUnknown,
 						errors.New("revalidating guarded task authority after claim")
 				}
@@ -1486,32 +1651,119 @@ func (h *MapHandler) consume(
 			}
 			return committed, StatusOverload, nil
 		}
-		if _, _, status := h.validatePublishedGeneration(
+		if status := h.publishAliasReplayTransition(
+			replayTransition, *ownedClaim, lifecycle,
+		); status != StatusValid {
+			*ownedRollbackAllowed = false
+			if status == StatusTransportError {
+				return committed, StatusUnknown, errors.New("publishing alias replay transition")
+			}
+			if len(candidates) == 1 {
+				return committed, status, nil
+			}
+			continue
+		}
+		state, _, status := h.validatePublishedGeneration(
 			candidate,
 			record,
 			encoded,
 			StatusAlreadyConsumed,
 			true,
-		); status != StatusValid {
-			switch status {
-			case StatusMissing, StatusAlreadyConsumed:
-				if err := h.retainLocalClaim(key); err != nil {
-					return committed, StatusUnknown, err
-				}
-			case StatusAmbiguous:
-				h.finishClaimedResult(
-					candidate.Owner,
-					record,
-					candidate.ProcessIncarnation,
-					lifecycleAmbiguous,
-					ownedClaim,
-				)
-			case StatusTransportError:
-				_ = h.retainLocalClaim(key)
+		)
+		if status != StatusValid {
+			if linkStatus := h.candidateTaskLinkStatus(candidate); linkStatus == StatusValid ||
+				linkStatus == StatusTransportError {
+				*ownedRollbackAllowed = false
+			}
+			if status == StatusTransportError {
 				return committed, StatusUnknown, errors.New("revalidating claimed generation")
+			}
+			if len(candidates) == 1 {
+				return committed, status, nil
 			}
 			continue
 		}
+		if replayTransition == nil && state.Aliases > 0 {
+			replayTransition, status = h.activeAliasReplay(candidate, key, state)
+			*ownedTransition = replayTransition
+			if status != StatusValid {
+				*ownedRollbackAllowed = false
+				if status == StatusTransportError {
+					return committed, StatusUnknown, errors.New("revalidating alias replay after claim")
+				}
+				if len(candidates) == 1 {
+					return committed, status, nil
+				}
+				continue
+			}
+			if status = h.publishAliasReplayTransition(
+				replayTransition, *ownedClaim, lifecycle,
+			); status != StatusValid {
+				*ownedRollbackAllowed = false
+				if status == StatusTransportError {
+					return committed, StatusUnknown, errors.New("publishing late alias replay transition")
+				}
+				if len(candidates) == 1 {
+					return committed, status, nil
+				}
+				continue
+			}
+		}
+		if replayTransition != nil {
+			if aliasReplayKeyForState(key, state) != replayTransition.key {
+				*ownedRollbackAllowed = false
+				if len(candidates) == 1 {
+					return committed, StatusAmbiguous, nil
+				}
+				continue
+			}
+			if status = h.revalidateAliasReplayTransition(replayTransition); status != StatusValid {
+				*ownedRollbackAllowed = false
+				if status == StatusTransportError {
+					return committed, StatusUnknown, errors.New("checking claimed alias replay")
+				}
+				if len(candidates) == 1 {
+					return committed, status, nil
+				}
+				continue
+			}
+		}
+		guarded, guardErr = ownerDetachGuardPresent(h.ownerGuards, candidate.Owner)
+		if guardErr != nil {
+			*ownedRollbackAllowed = false
+			return committed, StatusUnknown, guardErr
+		}
+		if guarded {
+			if len(candidates) == 1 {
+				return committed, StatusOverload, nil
+			}
+			continue
+		}
+		if status = h.candidateTaskAuthorityStatus(candidate); status != StatusValid {
+			if linkStatus := h.candidateTaskLinkStatus(candidate); linkStatus == StatusValid ||
+				linkStatus == StatusTransportError {
+				*ownedRollbackAllowed = false
+			}
+			if status == StatusTransportError {
+				return committed, StatusUnknown, errors.New("revalidating task authority before commit")
+			}
+			if len(candidates) == 1 {
+				return committed, status, nil
+			}
+			continue
+		}
+		if status = h.promoteGenerationClaim(key, ownedClaim); status != StatusValid {
+			*ownedRollbackAllowed = false
+			if status == StatusTransportError {
+				return committed, StatusUnknown, errors.New("promoting generation claim")
+			}
+			if len(candidates) == 1 {
+				return committed, status, nil
+			}
+			continue
+		}
+		*ownedCommitted = true
+		committed = true
 		if h.finishClaimed(
 			candidate.Owner,
 			record,
@@ -1534,20 +1786,35 @@ func (h *MapHandler) newGenerationClaim(
 	processIncarnation uint64,
 ) (generationClaim, bool) {
 	now := h.monoTimeNow()
-	if now <= 0 || processIncarnation == 0 {
+	if now <= 0 || processIncarnation == 0 || !validAliasReplayTarget(lifecycle) {
 		return generationClaim{}, false
 	}
 	return generationClaim{
 		ObservedMonotonicNS: uint64(now),
 		ProcessIncarnation:  processIncarnation,
-		Lifecycle:           lifecycle,
-		Reserved:            [7]byte{6: generationGoProducerTag},
+		Lifecycle:           lifecyclePublishing,
+		Reserved: [7]byte{
+			0: lifecycle,
+			6: generationGoProducerTag,
+		},
 	}, true
 }
 
 type generationFinishResult struct {
 	complete        bool
 	mutationStarted bool
+}
+
+type aliasReplayTransition struct {
+	key            aliasReplayKey
+	claimTimestamp uint64
+	desired        uint8
+}
+
+type aliasReplayFinishProof struct {
+	key                 aliasReplayKey
+	transitionTimestamp uint64
+	lifecycle           uint8
 }
 
 type connectionReleaseProof struct {
@@ -1561,6 +1828,517 @@ func (h *MapHandler) retainLocalClaim(key stateKey) error {
 		return errors.New("reading monotonic time for retained Java generation claim")
 	}
 	return ensureGenerationAmbiguity(h.ambiguity, key, uint64(now))
+}
+
+func aliasReplayKeyForState(
+	key stateKey,
+	state stateValue,
+) aliasReplayKey {
+	return aliasReplayKey{
+		Owner:               key.Owner,
+		Generation:          key.Generation,
+		ObservedMonotonicNS: state.ObservedMonotonicNS,
+		ProcessIncarnation:  state.ProcessIncarnation,
+	}
+}
+
+func validAliasReplayTarget(lifecycle uint8) bool {
+	return lifecycle >= lifecycleConsumed && lifecycle <= lifecycleAmbiguous
+}
+
+func validActiveAliasReplay(value aliasReplayValue) bool {
+	return value.TransitionMonotonicNS != 0 && value.Lifecycle == lifecycleActive &&
+		value.DesiredLifecycle == 0 &&
+		value.ProducerTag == 0 && value.Reserved == 0
+}
+
+func validPublishingAliasReplay(value aliasReplayValue) bool {
+	return value.TransitionMonotonicNS != 0 && value.Lifecycle == lifecyclePublishing &&
+		validAliasReplayTarget(value.DesiredLifecycle) &&
+		(value.ProducerTag == 0 || value.ProducerTag == generationGoProducerTag) &&
+		value.Reserved == 0
+}
+
+func validGoPublishingAliasReplay(
+	value aliasReplayValue,
+	claimTimestamp uint64,
+	desired uint8,
+) bool {
+	return validPublishingAliasReplay(value) &&
+		value.TransitionMonotonicNS == claimTimestamp &&
+		value.DesiredLifecycle == desired && value.ProducerTag == generationGoProducerTag
+}
+
+func validFinalAliasReplay(value aliasReplayValue) bool {
+	return value.TransitionMonotonicNS != 0 && validAliasReplayTarget(value.Lifecycle) &&
+		value.DesiredLifecycle == 0 && value.ProducerTag == 0 && value.Reserved == 0
+}
+
+func statusForAliasReplay(value aliasReplayValue) Status {
+	switch {
+	case validActiveAliasReplay(value), validPublishingAliasReplay(value):
+		return StatusOverload
+	case validFinalAliasReplay(value):
+		if value.Lifecycle == lifecycleAmbiguous {
+			return StatusAmbiguous
+		}
+		return StatusAlreadyConsumed
+	default:
+		return StatusAmbiguous
+	}
+}
+
+func (h *MapHandler) activeAliasReplay(
+	candidate resolvedCandidate,
+	key stateKey,
+	state stateValue,
+) (*aliasReplayTransition, Status) {
+	replayKey := aliasReplayKeyForState(key, state)
+	var current aliasReplayValue
+	if err := h.aliasReplays.Lookup(&replayKey, &current); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			if state.Aliases == 0 {
+				return nil, StatusValid
+			}
+			return nil, StatusOverload
+		}
+		return nil, StatusTransportError
+	}
+	if !validActiveAliasReplay(current) {
+		// A retained exact claim is the primary one-shot authority, including
+		// while a final or interrupted publishing replay coexists with live
+		// generation state. Only an exact task carrier may use a final replay
+		// after that claim is absent; direct lookups never replay task outcomes.
+		claimedStatus, claimed, claimErr := h.existingGenerationClaimStatus(candidate)
+		if claimErr != nil {
+			return nil, StatusTransportError
+		}
+		if claimed {
+			return nil, claimedStatus
+		}
+		if validFinalAliasReplay(current) {
+			if candidate.TaskSource != (Identity{}) && current.References == 0 {
+				return nil, StatusAmbiguous
+			}
+			if candidate.TaskSource == (Identity{}) {
+				return nil, StatusOverload
+			}
+		}
+		return nil, statusForAliasReplay(current)
+	}
+	if state.Aliases > 0 && current.References == 0 {
+		return nil, StatusAmbiguous
+	}
+	return &aliasReplayTransition{key: replayKey}, StatusValid
+}
+
+func (h *MapHandler) publishAliasReplayTransition(
+	transition *aliasReplayTransition,
+	claim generationClaim,
+	desired uint8,
+) Status {
+	if transition == nil {
+		return StatusValid
+	}
+	if (!validGoPublishingGenerationClaim(claim) && !validGoFinalGenerationClaim(claim)) ||
+		!validAliasReplayTarget(desired) {
+		return StatusAmbiguous
+	}
+	transition.claimTimestamp = claim.ObservedMonotonicNS
+	transition.desired = desired
+
+	var current aliasReplayValue
+	if err := h.aliasReplays.Lookup(&transition.key, &current); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return StatusOverload
+		}
+		return StatusTransportError
+	}
+	if validGoPublishingAliasReplay(current, transition.claimTimestamp, desired) {
+		return StatusValid
+	}
+	if !validActiveAliasReplay(current) {
+		return statusForAliasReplay(current)
+	}
+
+	publishing := current
+	publishing.TransitionMonotonicNS = transition.claimTimestamp
+	publishing.Lifecycle = lifecyclePublishing
+	publishing.DesiredLifecycle = desired
+	publishing.ProducerTag = generationGoProducerTag
+	publishing.Reserved = 0
+	updateErr := h.aliasReplays.Update(&transition.key, &publishing, ebpf.UpdateExist)
+	if err := h.aliasReplays.Lookup(&transition.key, &current); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return StatusOverload
+		}
+		return StatusTransportError
+	}
+	if validGoPublishingAliasReplay(current, transition.claimTimestamp, desired) {
+		return StatusValid
+	}
+	if updateErr != nil {
+		return StatusTransportError
+	}
+	return statusForAliasReplay(current)
+}
+
+func (h *MapHandler) revalidateAliasReplayTransition(
+	transition *aliasReplayTransition,
+) Status {
+	if transition == nil {
+		return StatusValid
+	}
+	var current aliasReplayValue
+	if err := h.aliasReplays.Lookup(&transition.key, &current); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return StatusOverload
+		}
+		return StatusTransportError
+	}
+	if validGoPublishingAliasReplay(
+		current, transition.claimTimestamp, transition.desired,
+	) {
+		return StatusValid
+	}
+	return statusForAliasReplay(current)
+}
+
+func validGoPublishingGenerationClaim(claim generationClaim) bool {
+	return claim.ObservedMonotonicNS != 0 && claim.ProcessIncarnation != 0 &&
+		claim.Lifecycle == lifecyclePublishing && validAliasReplayTarget(claim.Reserved[0]) &&
+		claim.Reserved[1] == 0 && claim.Reserved[2] == 0 && claim.Reserved[3] == 0 &&
+		claim.Reserved[4] == 0 && claim.Reserved[5] == 0 &&
+		claim.Reserved[6] == generationGoProducerTag
+}
+
+func validGoFinalGenerationClaim(claim generationClaim) bool {
+	return claim.ObservedMonotonicNS != 0 && claim.ProcessIncarnation != 0 &&
+		validAliasReplayTarget(claim.Lifecycle) && claim.Reserved[0] == 0 &&
+		claim.Reserved[1] == 0 && claim.Reserved[2] == 0 && claim.Reserved[3] == 0 &&
+		claim.Reserved[4] == 0 && claim.Reserved[5] == 0 &&
+		claim.Reserved[6] == generationGoProducerTag
+}
+
+func (h *MapHandler) promoteGenerationClaim(
+	key stateKey,
+	claim *generationClaim,
+) Status {
+	if claim == nil || !validGoPublishingGenerationClaim(*claim) {
+		return StatusAmbiguous
+	}
+	var current generationClaim
+	if err := h.claims.Lookup(&key, &current); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return StatusOverload
+		}
+		return StatusTransportError
+	}
+	if current != *claim {
+		return statusForGenerationClaim(current, claim.ProcessIncarnation)
+	}
+
+	final := *claim
+	final.Lifecycle = claim.Reserved[0]
+	final.Reserved = [7]byte{6: generationGoProducerTag}
+	updateErr := h.claims.Update(&key, &final, ebpf.UpdateExist)
+	if err := h.claims.Lookup(&key, &current); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return StatusOverload
+		}
+		return StatusTransportError
+	}
+	if current == final {
+		*claim = final
+		return StatusValid
+	}
+	if updateErr != nil {
+		return StatusTransportError
+	}
+	return statusForGenerationClaim(current, claim.ProcessIncarnation)
+}
+
+func (h *MapHandler) retargetPublishingClaimStale(
+	key stateKey,
+	claim *generationClaim,
+	transition *aliasReplayTransition,
+) Status {
+	if claim == nil || !validGoPublishingGenerationClaim(*claim) ||
+		(claim.Reserved[0] != lifecycleConsumed &&
+			claim.Reserved[0] != lifecycleDiscarded) {
+		return StatusAmbiguous
+	}
+
+	var currentClaim generationClaim
+	if err := h.claims.Lookup(&key, &currentClaim); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return StatusOverload
+		}
+		return StatusTransportError
+	}
+	if currentClaim != *claim {
+		return statusForGenerationClaim(currentClaim, claim.ProcessIncarnation)
+	}
+
+	var staleReplay aliasReplayValue
+	if transition != nil {
+		if transition.desired != claim.Reserved[0] {
+			return StatusAmbiguous
+		}
+		var currentReplay aliasReplayValue
+		if err := h.aliasReplays.Lookup(&transition.key, &currentReplay); err != nil {
+			if errors.Is(err, ebpf.ErrKeyNotExist) {
+				return StatusOverload
+			}
+			return StatusTransportError
+		}
+		if !validGoPublishingAliasReplay(
+			currentReplay, transition.claimTimestamp, transition.desired,
+		) {
+			return statusForAliasReplay(currentReplay)
+		}
+		staleReplay = currentReplay
+		staleReplay.DesiredLifecycle = lifecycleStale
+	}
+
+	// E is the durable semantic authority. Retarget it first so an interruption
+	// between the two updates hands cleanup the stale outcome; cleanup can then
+	// converge a still-tagged replay from its previous desired lifecycle.
+	staleClaim := *claim
+	staleClaim.Reserved[0] = lifecycleStale
+	updateErr := h.claims.Update(&key, &staleClaim, ebpf.UpdateExist)
+	if err := h.claims.Lookup(&key, &currentClaim); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return StatusOverload
+		}
+		return StatusTransportError
+	}
+	if currentClaim == staleClaim {
+		*claim = staleClaim
+	} else if updateErr != nil {
+		return StatusTransportError
+	} else {
+		return statusForGenerationClaim(currentClaim, claim.ProcessIncarnation)
+	}
+
+	if transition == nil {
+		return StatusValid
+	}
+	var currentReplay aliasReplayValue
+	if err := h.aliasReplays.Lookup(&transition.key, &currentReplay); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return StatusOverload
+		}
+		return StatusTransportError
+	}
+	if !validGoPublishingAliasReplay(
+		currentReplay, transition.claimTimestamp, transition.desired,
+	) {
+		return statusForAliasReplay(currentReplay)
+	}
+	// Preserve the freshest reference snapshot from the exact read immediately
+	// before the whole-value update; Go never increments or decrements it.
+	staleReplay.References = currentReplay.References
+	updateErr = h.aliasReplays.Update(
+		&transition.key, &staleReplay, ebpf.UpdateExist,
+	)
+	if err := h.aliasReplays.Lookup(&transition.key, &currentReplay); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return StatusOverload
+		}
+		return StatusTransportError
+	}
+	if currentReplay == staleReplay {
+		transition.desired = lifecycleStale
+		return StatusValid
+	}
+	if updateErr != nil {
+		return StatusTransportError
+	}
+	return statusForAliasReplay(currentReplay)
+}
+
+func (h *MapHandler) rollbackPublishingClaim(
+	key stateKey,
+	claim *generationClaim,
+	transition *aliasReplayTransition,
+) bool {
+	if claim == nil || !validGoPublishingGenerationClaim(*claim) {
+		return false
+	}
+	if transition != nil {
+		var current aliasReplayValue
+		if err := h.aliasReplays.Lookup(&transition.key, &current); err != nil {
+			return false
+		}
+		if validGoPublishingAliasReplay(
+			current, transition.claimTimestamp, transition.desired,
+		) {
+			now := h.monoTimeNow()
+			if now <= 0 {
+				return false
+			}
+			active := current
+			active.TransitionMonotonicNS = uint64(now)
+			active.Lifecycle = lifecycleActive
+			active.DesiredLifecycle = 0
+			active.ProducerTag = 0
+			active.Reserved = 0
+			updateErr := h.aliasReplays.Update(&transition.key, &active, ebpf.UpdateExist)
+			if err := h.aliasReplays.Lookup(&transition.key, &current); err != nil ||
+				!validActiveAliasReplay(current) {
+				return false
+			}
+			_ = updateErr
+		} else if !validActiveAliasReplay(current) {
+			return false
+		}
+	}
+	deleted, err := cleanupDeleteExact(h.claims, key, *claim)
+	if err != nil || !deleted {
+		var current generationClaim
+		if !errors.Is(h.claims.Lookup(&key, &current), ebpf.ErrKeyNotExist) {
+			return false
+		}
+	}
+	claim.ObservedMonotonicNS = 0
+	return true
+}
+
+func (h *MapHandler) prepareAliasReplayFinish(
+	key stateKey,
+	state stateValue,
+	claim generationClaim,
+	lifecycle uint8,
+) (*aliasReplayTransition, *aliasReplayFinishProof, Status) {
+	if !validGoFinalGenerationClaim(claim) || claim.Lifecycle != lifecycle ||
+		!validAliasReplayTarget(lifecycle) {
+		return nil, nil, StatusAmbiguous
+	}
+	replayKey := aliasReplayKeyForState(key, state)
+	var current aliasReplayValue
+	if err := h.aliasReplays.Lookup(&replayKey, &current); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			if state.Aliases == 0 {
+				return nil, nil, StatusValid
+			}
+			return nil, nil, StatusOverload
+		}
+		return nil, nil, StatusTransportError
+	}
+	if state.Aliases > 0 && current.References == 0 {
+		return nil, nil, StatusAmbiguous
+	}
+	if validFinalAliasReplay(current) {
+		if current.Lifecycle != lifecycle {
+			return nil, nil, StatusAmbiguous
+		}
+		return nil, &aliasReplayFinishProof{
+			key:                 replayKey,
+			transitionTimestamp: current.TransitionMonotonicNS,
+			lifecycle:           lifecycle,
+		}, StatusValid
+	}
+
+	transition := &aliasReplayTransition{key: replayKey}
+	if validActiveAliasReplay(current) {
+		if status := h.publishAliasReplayTransition(
+			transition, claim, lifecycle,
+		); status != StatusValid {
+			return nil, nil, status
+		}
+		return transition, nil, StatusValid
+	}
+	if validGoPublishingAliasReplay(
+		current, claim.ObservedMonotonicNS, lifecycle,
+	) {
+		transition.claimTimestamp = claim.ObservedMonotonicNS
+		transition.desired = lifecycle
+		return transition, nil, StatusValid
+	}
+	return nil, nil, statusForAliasReplay(current)
+}
+
+func (h *MapHandler) commitFinalAliasReplay(
+	transition *aliasReplayTransition,
+	existingProof *aliasReplayFinishProof,
+	lifecycle uint8,
+) (*aliasReplayFinishProof, Status) {
+	if existingProof != nil {
+		if h.aliasReplayFinishProofValid(existingProof) {
+			return existingProof, StatusValid
+		}
+		return nil, StatusAmbiguous
+	}
+	if transition == nil {
+		return nil, StatusValid
+	}
+	if !validAliasReplayTarget(lifecycle) {
+		return nil, StatusAmbiguous
+	}
+
+	var current aliasReplayValue
+	if err := h.aliasReplays.Lookup(&transition.key, &current); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return nil, StatusOverload
+		}
+		return nil, StatusTransportError
+	}
+	if validFinalAliasReplay(current) {
+		if current.Lifecycle != lifecycle {
+			return nil, StatusAmbiguous
+		}
+		return &aliasReplayFinishProof{
+			key:                 transition.key,
+			transitionTimestamp: current.TransitionMonotonicNS,
+			lifecycle:           lifecycle,
+		}, StatusValid
+	}
+	if !validGoPublishingAliasReplay(
+		current, transition.claimTimestamp, transition.desired,
+	) {
+		return nil, statusForAliasReplay(current)
+	}
+	now := h.monoTimeNow()
+	if now <= 0 {
+		return nil, StatusTransportError
+	}
+	final := current
+	final.TransitionMonotonicNS = uint64(now)
+	final.Lifecycle = lifecycle
+	final.DesiredLifecycle = 0
+	final.ProducerTag = 0
+	final.Reserved = 0
+	updateErr := h.aliasReplays.Update(&transition.key, &final, ebpf.UpdateExist)
+	if err := h.aliasReplays.Lookup(&transition.key, &current); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return nil, StatusOverload
+		}
+		return nil, StatusTransportError
+	}
+	if validFinalAliasReplay(current) && current.Lifecycle == lifecycle {
+		return &aliasReplayFinishProof{
+			key:                 transition.key,
+			transitionTimestamp: current.TransitionMonotonicNS,
+			lifecycle:           lifecycle,
+		}, StatusValid
+	}
+	if updateErr != nil {
+		return nil, StatusTransportError
+	}
+	return nil, statusForAliasReplay(current)
+}
+
+func (h *MapHandler) aliasReplayFinishProofValid(
+	proof *aliasReplayFinishProof,
+) bool {
+	if proof == nil {
+		return true
+	}
+	var current aliasReplayValue
+	return h.aliasReplays.Lookup(&proof.key, &current) == nil &&
+		validFinalAliasReplay(current) && current.Lifecycle == proof.lifecycle &&
+		current.TransitionMonotonicNS == proof.transitionTimestamp
 }
 
 func (h *MapHandler) finishClaimed(
@@ -1637,6 +2415,12 @@ func (h *MapHandler) finish(
 	}
 	if current, status := h.processIncarnation(owner); status != StatusValid ||
 		current != processIncarnation {
+		return result
+	}
+	replayTransition, existingReplayProof, replayStatus := h.prepareAliasReplayFinish(
+		key, state, *claim, lifecycle,
+	)
+	if replayStatus != StatusValid {
 		return result
 	}
 
@@ -1758,34 +2542,42 @@ func (h *MapHandler) finish(
 	if !h.finishBarriersValid(fence, publishedTerminal) {
 		return result
 	}
+	replayProof, replayStatus := h.commitFinalAliasReplay(
+		replayTransition, existingReplayProof, lifecycle,
+	)
+	if replayStatus != StatusValid ||
+		!h.finishBarriersValid(fence, publishedTerminal, replayProof) {
+		return result
+	}
 
 	proof, released := h.releaseConnectionFenced(
-		fence, publishedTerminal, state.Connection, state.ConnectionNetNS,
+		fence, publishedTerminal, replayProof, state.Connection, state.ConnectionNetNS,
 	)
 	if !released {
 		return result
 	}
 	connectionProof := &proof
-	if !h.finishBarriersValid(fence, publishedTerminal) {
+	if !h.finishBarriersValid(fence, publishedTerminal, replayProof) {
 		return result
 	}
 	deleted, deleteErr := cleanupDeleteExact(h.states, key, state)
-	if deleteErr != nil || !deleted || !h.finishBarriersValid(fence, publishedTerminal) {
+	if deleteErr != nil || !deleted ||
+		!h.finishBarriersValid(fence, publishedTerminal, replayProof) {
 		return result
 	}
-	if !h.finishBarriersValid(fence, publishedTerminal) {
+	if !h.finishBarriersValid(fence, publishedTerminal, replayProof) {
 		return result
 	}
 	if !h.deleteRemoteParentGeneration(owner, generation, processIncarnation) {
 		return result
 	}
-	if !h.finishBarriersValid(fence, publishedTerminal) {
+	if !h.finishBarriersValid(fence, publishedTerminal, replayProof) {
 		return result
 	}
 	if !h.deleteGenerationIndex(key, generationIndex) {
 		return result
 	}
-	if !h.finishBarriersValid(fence, publishedTerminal) {
+	if !h.finishBarriersValid(fence, publishedTerminal, replayProof) {
 		return result
 	}
 	if ownsGeneration {
@@ -1793,7 +2585,9 @@ func (h *MapHandler) finish(
 			return result
 		}
 	}
-	if !h.generationFinishReady(fence, publishedTerminal, connectionProof) {
+	if !h.generationFinishReady(
+		fence, publishedTerminal, replayProof, connectionProof,
+	) {
 		return result
 	}
 	// All generation payload has been removed. Coordination-fence retirement is
@@ -1879,8 +2673,13 @@ func validFinishGenerationIndex(
 func (h *MapHandler) finishBarriersValid(
 	fence generationTeardownFence,
 	terminal terminalValue,
+	replayProof ...*aliasReplayFinishProof,
 ) bool {
 	if !h.finishFenceValid(fence) {
+		return false
+	}
+	if len(replayProof) > 1 ||
+		(len(replayProof) == 1 && !h.aliasReplayFinishProofValid(replayProof[0])) {
 		return false
 	}
 	var current terminalValue
@@ -1903,11 +2702,12 @@ func validTerminalValue(terminal terminalValue) bool {
 func (h *MapHandler) generationFinishReady(
 	fence generationTeardownFence,
 	terminal terminalValue,
+	replayProof *aliasReplayFinishProof,
 	connectionProof *connectionReleaseProof,
 ) bool {
-	return h.finishBarriersValid(fence, terminal) &&
+	return h.finishBarriersValid(fence, terminal, replayProof) &&
 		h.generationArtifactsAbsent(fence.key, terminal, connectionProof) &&
-		h.finishBarriersValid(fence, terminal)
+		h.finishBarriersValid(fence, terminal, replayProof)
 }
 
 func (h *MapHandler) generationArtifactsAbsent(
@@ -2035,6 +2835,7 @@ func (h *MapHandler) deleteOwnerGeneration(
 func (h *MapHandler) releaseConnectionFenced(
 	fence generationTeardownFence,
 	terminal terminalValue,
+	replayProof *aliasReplayFinishProof,
 	connection connectionInfo,
 	connectionNetNS uint32,
 ) (connectionReleaseProof, bool) {
@@ -2052,19 +2853,19 @@ func (h *MapHandler) releaseConnectionFenced(
 	proof.cookieKey = cookieKey
 	var cookieClaim connectionClaim
 	if err := h.cookieConnections.Lookup(&cookieKey, &cookieClaim); err != nil ||
-		cookieClaim != claim || !h.finishBarriersValid(fence, terminal) {
+		cookieClaim != claim || !h.finishBarriersValid(fence, terminal, replayProof) {
 		return proof, false
 	}
 	deleted, err := cleanupDeleteExact(h.cookieConnections, cookieKey, claim)
 	if err != nil || !deleted ||
 		!h.connectionGenerationReleased(
 			h.cookieConnections, cookieKey, fence.key.Owner, fence.key.Generation,
-		) || !h.finishBarriersValid(fence, terminal) {
+		) || !h.finishBarriersValid(fence, terminal, replayProof) {
 		return proof, false
 	}
 	var revalidated connectionClaim
 	if err := h.connections.Lookup(&connectionKey, &revalidated); err != nil ||
-		revalidated != claim || !h.finishBarriersValid(fence, terminal) {
+		revalidated != claim || !h.finishBarriersValid(fence, terminal, replayProof) {
 		return proof, false
 	}
 	deleted, err = cleanupDeleteExact(h.connections, connectionKey, claim)
@@ -2073,7 +2874,7 @@ func (h *MapHandler) releaseConnectionFenced(
 			h.connections, connectionKey, fence.key.Owner, fence.key.Generation,
 		) || !h.connectionGenerationReleased(
 		h.cookieConnections, cookieKey, fence.key.Owner, fence.key.Generation,
-	) || !h.finishBarriersValid(fence, terminal) {
+	) || !h.finishBarriersValid(fence, terminal, replayProof) {
 		return proof, false
 	}
 	return proof, true
@@ -2121,6 +2922,9 @@ func statusForGenerationClaim(claim generationClaim, processIncarnation uint64) 
 		claim.ProcessIncarnation != processIncarnation {
 		return StatusAmbiguous
 	}
+	if validGoPublishingGenerationClaim(claim) {
+		return StatusOverload
+	}
 	semanticLifecycle := claim.Lifecycle
 	if claim.Lifecycle == lifecycleCleanup {
 		if !validGenerationCleanupClaim(claim) {
@@ -2152,6 +2956,51 @@ func (h *MapHandler) claimedCandidateStatus(
 	return status, found, err != nil
 }
 
+func (h *MapHandler) displacedTaskAliasReplayStatus(
+	candidate resolvedCandidate,
+) (Status, bool, error) {
+	if !candidate.ClaimOnly || candidate.TaskLink.Generation == 0 {
+		return StatusUnknown, false, nil
+	}
+	if status := h.candidateTaskLinkStatus(candidate); status != StatusValid {
+		if status == StatusTransportError {
+			return status, false, errors.New("validating task link before alias replay lookup")
+		}
+		return status, true, nil
+	}
+	key := aliasReplayKey{
+		Owner:               candidate.Owner,
+		Generation:          candidate.Generation,
+		ObservedMonotonicNS: candidate.TaskLink.ObservedMonotonicNS,
+		ProcessIncarnation:  candidate.ProcessIncarnation,
+	}
+	var replay aliasReplayValue
+	if err := h.aliasReplays.Lookup(&key, &replay); err != nil {
+		if !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return StatusTransportError, false, err
+		}
+		if status := h.candidateTaskLinkStatus(candidate); status != StatusValid {
+			if status == StatusTransportError {
+				return status, false, errors.New("revalidating task link after missing alias replay")
+			}
+			return status, true, nil
+		}
+		return StatusUnknown, false, nil
+	}
+	if status := h.candidateTaskLinkStatus(candidate); status != StatusValid {
+		if status == StatusTransportError {
+			return status, false, errors.New("revalidating task link after alias replay lookup")
+		}
+		return status, true, nil
+	}
+	if replay.References == 0 {
+		// Active-zero reservations and final-zero cleanup tails are structurally
+		// valid, but no zero-reference record can authorize a task carrier.
+		return StatusAmbiguous, true, nil
+	}
+	return statusForAliasReplay(replay), true, nil
+}
+
 func (h *MapHandler) existingGenerationClaimStatus(
 	candidate resolvedCandidate,
 ) (Status, bool, error) {
@@ -2173,6 +3022,11 @@ func (h *MapHandler) existingGenerationClaimStatus(
 				// The caller must propagate a changed task authority even though
 				// the collided claim disappeared before it could be observed.
 				return status, true, nil
+			}
+			if replayStatus, found, replayErr := h.displacedTaskAliasReplayStatus(
+				candidate,
+			); replayErr != nil || found {
+				return replayStatus, found, replayErr
 			}
 			return StatusOverload, false, nil
 		}

@@ -25,15 +25,22 @@ type generationTeardownFence struct {
 const generationGoProducerTag = uint8(0x47)
 
 func validGenerationProducerClaim(claim generationClaim) bool {
-	return claim.ObservedMonotonicNS != 0 && claim.ProcessIncarnation != 0 &&
-		claim.Reserved == ([7]byte{6: generationGoProducerTag}) &&
-		claim.Lifecycle >= lifecycleConsumed &&
-		claim.Lifecycle <= lifecyclePublishing
+	if claim.ObservedMonotonicNS == 0 || claim.ProcessIncarnation == 0 ||
+		claim.Reserved[1] != 0 || claim.Reserved[2] != 0 ||
+		claim.Reserved[3] != 0 || claim.Reserved[4] != 0 ||
+		claim.Reserved[5] != 0 || claim.Reserved[6] != generationGoProducerTag {
+		return false
+	}
+	if claim.Lifecycle == lifecyclePublishing {
+		return validAliasReplayTarget(claim.Reserved[0])
+	}
+	return validAliasReplayTarget(claim.Lifecycle) && claim.Reserved[0] == 0
 }
 
 func validGenerationProducerGuard(key stateKey, guard generationClaim) bool {
 	return key.Owner != (Identity{}) && key.Generation != 0 && key.Reserved == 0 &&
-		validGenerationProducerClaim(guard) &&
+		guard.ObservedMonotonicNS != 0 && guard.ProcessIncarnation != 0 &&
+		guard.Reserved == ([7]byte{6: generationGoProducerTag}) &&
 		guard.ProcessIncarnation == key.Generation &&
 		guard.Lifecycle == lifecyclePublishing
 }
@@ -42,7 +49,11 @@ func generationProducerHandoffValue(
 	claim generationClaim,
 	now time.Duration,
 ) (generationClaim, error) {
-	if !validGenerationProducerClaim(claim) || claim.ObservedMonotonicNS == ^uint64(0) {
+	producerClaim := validGenerationProducerClaim(claim)
+	producerGuard := claim.ObservedMonotonicNS != 0 && claim.ProcessIncarnation != 0 &&
+		claim.Lifecycle == lifecyclePublishing &&
+		claim.Reserved == ([7]byte{6: generationGoProducerTag})
+	if (!producerClaim && !producerGuard) || claim.ObservedMonotonicNS == ^uint64(0) {
 		return generationClaim{}, errors.New("invalid Java generation producer handoff")
 	}
 	if now < 0 {
@@ -59,7 +70,11 @@ func generationProducerHandoffValue(
 	cleanup.ObservedMonotonicNS = observed
 	cleanup.Lifecycle = lifecycleCleanup
 	cleanup.Reserved = [7]byte{}
-	cleanup.Reserved[0] = claim.Lifecycle
+	if claim.Lifecycle == lifecyclePublishing && producerClaim {
+		cleanup.Reserved[0] = claim.Reserved[0]
+	} else {
+		cleanup.Reserved[0] = claim.Lifecycle
+	}
 	return cleanup, nil
 }
 

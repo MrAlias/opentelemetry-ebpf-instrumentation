@@ -24,6 +24,8 @@ func TestCleanupKernelMapLayouts(t *testing.T) {
 	assert.Equal(t, uintptr(24), unsafe.Sizeof(retiredProcessKey{}))
 	assert.Equal(t, uintptr(24), unsafe.Sizeof(generationClaim{}))
 	assert.Equal(t, uintptr(23), unsafe.Offsetof(generationClaim{}.Reserved)+6)
+	assert.Equal(t, uintptr(40), unsafe.Sizeof(aliasReplayKey{}))
+	assert.Equal(t, uintptr(16), unsafe.Sizeof(aliasReplayValue{}))
 	assert.Equal(t, uint8(0x47), generationGoProducerTag)
 }
 
@@ -38,6 +40,18 @@ func taggedGoGenerationClaim(
 		Lifecycle:           lifecycle,
 		Reserved:            [7]byte{6: generationGoProducerTag},
 	}
+}
+
+func taggedGoPublishingGenerationClaim(
+	target uint8,
+	observedMonotonicNS uint64,
+	processIncarnation uint64,
+) generationClaim {
+	claim := taggedGoGenerationClaim(
+		lifecyclePublishing, observedMonotonicNS, processIncarnation,
+	)
+	claim.Reserved[0] = target
+	return claim
 }
 
 func generationRecoveryCleanup(t *testing.T) *Cleanup {
@@ -60,7 +74,6 @@ func TestGenerationGoProducerTagAndHandoffValidation(t *testing.T) {
 		lifecycleDiscarded,
 		lifecycleStale,
 		lifecycleAmbiguous,
-		lifecyclePublishing,
 	} {
 		producer := taggedGoGenerationClaim(lifecycle, 10, testProcessIncarnation)
 		require.True(t, validGenerationProducerClaim(producer))
@@ -71,6 +84,22 @@ func TestGenerationGoProducerTagAndHandoffValidation(t *testing.T) {
 		assert.Equal(t, lifecycleCleanup, cleanup.Lifecycle)
 		assert.Equal(t, [7]byte{lifecycle}, cleanup.Reserved)
 	}
+	publishing := taggedGoPublishingGenerationClaim(
+		lifecycleConsumed, 10, testProcessIncarnation,
+	)
+	require.True(t, validGenerationProducerClaim(publishing))
+	publishingCleanup, err := generationProducerHandoffValue(publishing, 9)
+	require.NoError(t, err)
+	assert.Equal(t, [7]byte{lifecycleConsumed}, publishingCleanup.Reserved)
+
+	// The same tag-only publishing shape is G producer state, not an E claim.
+	producerGuard := taggedGoGenerationClaim(
+		lifecyclePublishing, 10, testProcessIncarnation,
+	)
+	assert.False(t, validGenerationProducerClaim(producerGuard))
+	guardCleanup, err := generationProducerHandoffValue(producerGuard, 9)
+	require.NoError(t, err)
+	assert.Equal(t, [7]byte{lifecyclePublishing}, guardCleanup.Reserved)
 
 	valid := taggedGoGenerationClaim(lifecycleConsumed, 10, testProcessIncarnation)
 	for _, test := range []struct {
@@ -96,7 +125,7 @@ func TestGenerationGoProducerTagAndHandoffValidation(t *testing.T) {
 
 	saturated := valid
 	saturated.ObservedMonotonicNS = ^uint64(0)
-	_, err := generationProducerHandoffValue(saturated, 100*time.Second)
+	_, err = generationProducerHandoffValue(saturated, 100*time.Second)
 	require.Error(t, err)
 	_, err = generationProducerHandoffValue(valid, -1)
 	require.Error(t, err)
@@ -123,6 +152,11 @@ func TestMapHandlerTaggedProducerClaimStatusParity(t *testing.T) {
 			claim := taggedGoGenerationClaim(
 				test.lifecycle, uint64(10*time.Second), testProcessIncarnation,
 			)
+			if test.lifecycle == lifecyclePublishing {
+				claim = taggedGoPublishingGenerationClaim(
+					lifecycleConsumed, uint64(10*time.Second), testProcessIncarnation,
+				)
+			}
 			handler.claims.(*fakeBridgeMap).values[key] = claim
 
 			result := handler.Handle(owner, OperationTake)
@@ -1876,6 +1910,7 @@ func testCleanup(handler *MapHandler) *Cleanup {
 			generations:                    handler.generations.(cleanupMap),
 			terminals:                      handler.terminals.(cleanupMap),
 			claims:                         handler.claims.(cleanupMap),
+			aliasReplays:                   handler.aliasReplays.(cleanupMap),
 			ownerGuards:                    handler.ownerGuards.(cleanupMap),
 			handoffs:                       newMap(),
 			handoffClaims:                  newMap(),
@@ -1885,9 +1920,10 @@ func testCleanup(handler *MapHandler) *Cleanup {
 			sslPrewriteConnectionClaims:    newMap(),
 			sslPrewriteConnectionOwners:    newMap(),
 		},
-		ttl:         handler.ttl,
-		monoTimeNow: handler.monoTimeNow,
-		coordinator: handler.coordinator,
+		ttl:                  handler.ttl,
+		monoTimeNow:          handler.monoTimeNow,
+		aliasReplayNoCarrier: make(map[aliasReplayKey]aliasReplayNoCarrierObservation),
+		coordinator:          handler.coordinator,
 	}
 }
 
@@ -2365,6 +2401,7 @@ func TestCleanupFinalFenceReleaseConvergesWhenClaimDisappears(t *testing.T) {
 	cleanup.generationSnapshotComplete = true
 	cleanup.stateSnapshotComplete = true
 	cleanup.physicalGenerations = make(map[stateKey]struct{})
+	require.NoError(t, cleanup.snapshotAliasReplayState())
 
 	claims := cleanup.maps.claims.(*fakeBridgeMap)
 	cleanup.maps.ambiguity.(*fakeBridgeMap).afterDelete = func(any) {

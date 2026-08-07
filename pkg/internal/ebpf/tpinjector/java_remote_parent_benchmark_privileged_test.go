@@ -37,6 +37,7 @@ const (
 	primaryBenchmarkRounds       = 512
 	unixBenchmarkWarmupRounds    = 8
 	unixBenchmarkRounds          = 128
+	benchmarkReplayActive        = uint8(1)
 )
 
 type bridgeBenchmarkTransport uint8
@@ -475,15 +476,30 @@ func runPrimaryOneShotBenchmark(
 		generation := stageBenchmarkGeneration(
 			t, maps, process, owner, capability, negotiation, pair.client, nextGeneration,
 		)
-		observed := monotonicNowNS(t)
 		stateKey := BpfJavaRemoteParentJavaRemoteParentKeyT{
 			Owner:      owner,
 			Generation: generation,
 		}
 		var state BpfJavaRemoteParentJavaRemoteParentStateT
 		require.NoError(t, maps.JavaRemoteParentState.Lookup(stateKey, &state))
+		observed := state.ObservedMonotimeNs
 		state.Aliases = uint32(len(workers))
 		require.NoError(t, maps.JavaRemoteParentState.Update(stateKey, state, ebpf.UpdateExist))
+		replayKey := BpfJavaRemoteParentJavaRemoteParentAliasReplayKeyT{
+			Owner:                        owner,
+			Generation:                   generation,
+			GenerationObservedMonotimeNs: observed,
+			ProcessIncarnation:           state.ProcessIncarnation,
+		}
+		require.NoError(t, maps.JavaRemoteParentAliasReplays.Update(
+			replayKey,
+			BpfJavaRemoteParentJavaRemoteParentAliasReplayT{
+				TransitionMonotimeNs: observed,
+				References:           uint32(len(workers)),
+				Lifecycle:            benchmarkReplayActive,
+			},
+			ebpf.UpdateNoExist,
+		))
 		for _, worker := range workers {
 			require.NoError(t, maps.JavaRemoteParentTasks.Update(
 				worker.owner,
@@ -513,6 +529,8 @@ func runPrimaryOneShotBenchmark(
 		for _, worker := range workers {
 			deleteBenchmarkMapKey(t, maps.JavaRemoteParentTasks, worker.owner)
 		}
+		deleteBenchmarkMapKey(t, maps.JavaRemoteParentAliasReplays, replayKey)
+		requireBenchmarkMapKeyAbsent(t, maps.JavaRemoteParentAliasReplays, replayKey)
 		if round >= primaryBenchmarkWarmupRounds {
 			series.add(calls, elapsed)
 		}
@@ -746,6 +764,7 @@ func javaRemoteParentBenchmarkMaps(maps *BpfJavaRemoteParentMaps) javabridge.Map
 		Connections:       maps.JavaRemoteParentConnections,
 		CookieConnections: maps.JavaRemoteParentCookieConnections,
 		Ambiguity:         maps.JavaRemoteParentAmbiguity,
+		AliasReplays:      maps.JavaRemoteParentAliasReplays,
 		Owners:            maps.JavaRemoteParentOwners,
 		States:            maps.JavaRemoteParentState,
 		Generations:       maps.JavaRemoteParentGenerationIndex,
@@ -802,6 +821,8 @@ func removeBenchmarkGeneration(
 		Owner:      owner,
 		Generation: generation,
 	}
+	var state BpfJavaRemoteParentJavaRemoteParentStateT
+	require.NoError(t, maps.JavaRemoteParentState.Lookup(key, &state))
 	connectionKey := BpfJavaRemoteParentConnectionInfoNsT{
 		Connection: negotiation.Connection,
 		Netns:      negotiation.ConnectionNetns,
@@ -813,6 +834,14 @@ func removeBenchmarkGeneration(
 	}
 	deleteBenchmarkMapKey(t, maps.JavaRemoteParentConnections, connectionKey)
 	deleteBenchmarkMapKey(t, maps.JavaRemoteParentCookieConnections, cookieConnectionKey)
+	replayKey := BpfJavaRemoteParentJavaRemoteParentAliasReplayKeyT{
+		Owner:                        owner,
+		Generation:                   generation,
+		GenerationObservedMonotimeNs: state.ObservedMonotimeNs,
+		ProcessIncarnation:           state.ProcessIncarnation,
+	}
+	deleteBenchmarkMapKey(t, maps.JavaRemoteParentAliasReplays, replayKey)
+	requireBenchmarkMapKeyAbsent(t, maps.JavaRemoteParentAliasReplays, replayKey)
 	deleteBenchmarkMapKey(t, maps.JavaRemoteParentState, key)
 	deleteBenchmarkMapKey(t, maps.JavaRemoteParentFallback, owner)
 	deleteBenchmarkMapKey(t, maps.JavaRemoteParentGenerationIndex, key)

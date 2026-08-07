@@ -938,6 +938,7 @@ func javaRemoteParentMapID(t *testing.T, bridgeMap *ebpf.Map) ebpf.MapID {
 	require.NoError(t, err)
 	id, ok := info.ID()
 	require.True(t, ok)
+	require.NotZero(t, id)
 	return id
 }
 
@@ -981,13 +982,18 @@ func requireJavaRemoteParentMapsReleased(
 	deadline := time.Now().Add(5 * time.Second)
 	for len(remaining) != 0 && time.Now().Before(deadline) {
 		for id := range remaining {
-			bridgeMap, err := ebpf.NewMapFromID(id)
+			// Do not poll with NewMapFromID: closing a newly acquired
+			// ProgramArray FD can race its deferred clear work and strand a
+			// kernel reference. ID enumeration does not acquire a map FD.
+			nextID, err := ebpf.MapGetNextID(id - 1)
 			if errors.Is(err, os.ErrNotExist) {
 				delete(remaining, id)
 				continue
 			}
 			require.NoError(t, err)
-			require.NoError(t, bridgeMap.Close())
+			if nextID != id {
+				delete(remaining, id)
+			}
 		}
 		if len(remaining) == 0 {
 			return

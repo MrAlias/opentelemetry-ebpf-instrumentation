@@ -53,6 +53,7 @@ type cleanupMaps struct {
 	generations                    cleanupMap
 	terminals                      cleanupMap
 	claims                         cleanupMap
+	aliasReplays                   cleanupMap
 	ownerGuards                    cleanupMap
 	handoffs                       cleanupMap
 	handoffClaims                  cleanupMap
@@ -64,25 +65,31 @@ type cleanupMaps struct {
 }
 
 type Cleanup struct {
-	maps                        cleanupMaps
-	ttl                         time.Duration
-	monoTimeNow                 func() time.Duration
-	physicalGenerations         map[stateKey]struct{}
-	physicalGenerationsByOwner  map[Identity][]stateKey
-	deferPhysicalGenerationScan bool
-	currentSweepClaims          map[stateKey]generationClaim
-	currentSweepGuards          map[Identity]generationClaim
-	releasedSweepClaims         map[stateKey]generationClaim
-	releasedSweepGuards         map[Identity]generationClaim
-	releasedSweepAmbiguities    map[stateKey]uint64
-	currentSweepAmbiguities     map[stateKey]uint64
-	knownGenerations            map[stateKey]struct{}
-	knownGenerationsByOwner     map[Identity][]stateKey
-	knownLogicalKeys            map[stateKey]struct{}
-	knownLogicalKeysByOwner     map[Identity][]stateKey
-	generationSnapshotComplete  bool
-	stateSnapshotComplete       bool
-	coordinator                 *GenerationCoordinator
+	maps                         cleanupMaps
+	ttl                          time.Duration
+	monoTimeNow                  func() time.Duration
+	physicalGenerations          map[stateKey]struct{}
+	physicalGenerationsByOwner   map[Identity][]stateKey
+	deferPhysicalGenerationScan  bool
+	currentSweepClaims           map[stateKey]generationClaim
+	currentSweepGuards           map[Identity]generationClaim
+	releasedSweepClaims          map[stateKey]generationClaim
+	releasedSweepGuards          map[Identity]generationClaim
+	releasedSweepAmbiguities     map[stateKey]uint64
+	currentSweepAmbiguities      map[stateKey]uint64
+	knownGenerations             map[stateKey]struct{}
+	knownGenerationsByOwner      map[Identity][]stateKey
+	knownLogicalKeys             map[stateKey]struct{}
+	knownLogicalKeysByOwner      map[Identity][]stateKey
+	generationSnapshotComplete   bool
+	stateSnapshotComplete        bool
+	aliasReplaySnapshotComplete  bool
+	aliasCarrierSnapshotComplete bool
+	aliasReplayEntries           map[aliasReplayKey]aliasReplayValue
+	aliasReplayCarriers          map[aliasReplayCarrierKey]struct{}
+	aliasReplayCleanupKeys       map[stateKey]aliasReplayKey
+	aliasReplayNoCarrier         map[aliasReplayKey]aliasReplayNoCarrierObservation
+	coordinator                  *GenerationCoordinator
 }
 
 const javaRemoteParentMinimumFenceAge = time.Second
@@ -163,6 +170,7 @@ func NewCleanup(
 			generations:                    wrap(maps.Generations),
 			terminals:                      wrap(maps.Terminals),
 			claims:                         wrap(maps.Claims),
+			aliasReplays:                   wrap(maps.AliasReplays),
 			ownerGuards:                    wrap(maps.OwnerGuards),
 			handoffs:                       wrap(maps.Handoffs),
 			handoffClaims:                  wrap(maps.HandoffClaims),
@@ -172,9 +180,10 @@ func NewCleanup(
 			sslPrewriteConnectionClaims:    wrap(maps.SSLPrewriteConnectionClaims),
 			sslPrewriteConnectionOwners:    wrap(maps.SSLPrewriteConnectionOwners),
 		},
-		ttl:         ttl,
-		monoTimeNow: timing.MonoTimeNow,
-		coordinator: coordinator,
+		ttl:                  ttl,
+		monoTimeNow:          timing.MonoTimeNow,
+		aliasReplayNoCarrier: make(map[aliasReplayKey]aliasReplayNoCarrierObservation),
+		coordinator:          coordinator,
 	}
 }
 
@@ -208,7 +217,16 @@ func (c *Cleanup) SweepWithStats() (CleanupStats, error) {
 	sweep.knownGenerationsByOwner = make(map[Identity][]stateKey)
 	sweep.knownLogicalKeys = make(map[stateKey]struct{})
 	sweep.knownLogicalKeysByOwner = make(map[Identity][]stateKey)
+	sweep.aliasReplayEntries = make(map[aliasReplayKey]aliasReplayValue)
+	sweep.aliasReplayCarriers = make(map[aliasReplayCarrierKey]struct{})
+	sweep.aliasReplayCleanupKeys = make(map[stateKey]aliasReplayKey)
+	if sweep.aliasReplayNoCarrier == nil {
+		sweep.aliasReplayNoCarrier = make(map[aliasReplayKey]aliasReplayNoCarrierObservation)
+	}
 	c = &sweep
+	if snapshotErr := c.snapshotAliasReplayState(); snapshotErr != nil {
+		err = errors.Join(err, snapshotErr)
+	}
 
 	retiredEntries, retiredErr := cleanupMapEntries[retiredProcessKey, uint64](c.maps.retired)
 	if retiredErr != nil {
@@ -431,7 +449,7 @@ func (c *Cleanup) complete() bool {
 		c.maps.cookieConnections != nil &&
 		c.maps.ambiguity != nil && c.maps.owners != nil && c.maps.states != nil &&
 		c.maps.generations != nil && c.maps.terminals != nil && c.maps.claims != nil &&
-		c.maps.ownerGuards != nil &&
+		c.maps.aliasReplays != nil && c.maps.ownerGuards != nil &&
 		c.maps.handoffs != nil && c.maps.handoffClaims != nil && c.maps.retired != nil &&
 		c.maps.sslPrewrite != nil && c.maps.sslPrewriteConnectionAmbiguity != nil &&
 		c.maps.sslPrewriteConnectionClaims != nil && c.maps.sslPrewriteConnectionOwners != nil
@@ -690,6 +708,9 @@ func (c *Cleanup) cleanupGenerationChecked(
 	if current != index {
 		return false, nil
 	}
+	c.recordAliasReplayCleanupKey(
+		key, index.ObservedMonotonicNS, index.ProcessIncarnation,
+	)
 	if requireEvicted {
 		evicted, _, evictionErr := c.generationFallbackEvicted(key, index)
 		if evictionErr != nil {
@@ -775,6 +796,13 @@ func (c *Cleanup) cleanupGenerationChecked(
 	if lookupErr := c.maps.states.Lookup(&key, &state); lookupErr == nil {
 		if state.ProcessIncarnation == index.ProcessIncarnation &&
 			state.ObservedMonotonicNS == index.ObservedMonotonicNS {
+			replayReady, replayErr := c.ensureStateAliasReplayFinal(ownership, key, state)
+			if replayErr != nil {
+				return false, fmt.Errorf("finalizing generation alias replay: %w", replayErr)
+			}
+			if !replayReady {
+				return false, nil
+			}
 			connectionKey := connectionInfoNS{
 				Connection: state.Connection,
 				NetNS:      state.ConnectionNetNS,
@@ -821,6 +849,14 @@ func (c *Cleanup) cleanupGenerationChecked(
 		}
 	} else if !errors.Is(lookupErr, ebpf.ErrKeyNotExist) {
 		err = errors.Join(err, fmt.Errorf("looking up generation state: %w", lookupErr))
+	} else {
+		replayReady, replayErr := c.ensureGenerationAliasReplaysFinal(ownership, key)
+		if replayErr != nil {
+			return false, fmt.Errorf("finalizing detached generation alias replay: %w", replayErr)
+		}
+		if !replayReady {
+			return false, nil
+		}
 	}
 
 	fenced, fenceErr := c.generationCleanupFenceMatches(ownership)
@@ -1656,6 +1692,13 @@ func (c *Cleanup) finishGenerationCleanupFenced(
 	key stateKey,
 	ownership generationCleanupOwnership,
 ) (bool, error) {
+	replayReady, replayErr := c.ensureGenerationAliasReplaysFinal(ownership, key)
+	if replayErr != nil {
+		return false, fmt.Errorf("checking alias replay before fence retirement: %w", replayErr)
+	}
+	if !replayReady {
+		return false, nil
+	}
 	complete, err := c.finishGenerationCleanup(key)
 	if err != nil || !complete {
 		return complete, err
@@ -1832,6 +1875,10 @@ func (c *Cleanup) releaseGenerationCleanupClaimGuardTail(
 		if err != nil || !complete {
 			return false, err
 		}
+		replaySafe, err := c.aliasReplayFenceRetirementSafe(key, &claim)
+		if err != nil || !replaySafe {
+			return false, err
+		}
 		guardMatches, err := generationGuardMatches(c.maps.ownerGuards, guardKey, guard)
 		if err != nil || !guardMatches {
 			return false, err
@@ -1912,6 +1959,10 @@ func (c *Cleanup) releaseGenerationCleanupClaimTail(
 		}
 		complete, err := c.snapshotProvesGenerationCleanupComplete(key)
 		if err != nil || !complete {
+			return false, err
+		}
+		replaySafe, err := c.aliasReplayFenceRetirementSafe(key, &claim)
+		if err != nil || !replaySafe {
 			return false, err
 		}
 		return generationClaimMatches(c.maps.claims, key, claim)
@@ -2067,7 +2118,11 @@ func (c *Cleanup) releaseGenerationPublishingCleanupTail(
 		// all, or cleanup may already have removed every artifact. Complete
 		// snapshots are independent non-destructive authority for retiring E
 		// and G while preserving the zero reservation.
-		return c.snapshotProvesGenerationCleanupComplete(key)
+		complete, err := c.snapshotProvesGenerationCleanupComplete(key)
+		if err != nil || !complete {
+			return false, err
+		}
+		return c.aliasReplayFenceRetirementSafe(key, &claim)
 	}
 	valid, err := validate()
 	if err != nil || !valid {
@@ -2106,6 +2161,10 @@ func (c *Cleanup) releaseGenerationPublishingCleanupTail(
 			return true, completeErr
 		}
 	}
+	replaySafe, replayErr := c.aliasReplayFenceRetirementSafe(key, &claim)
+	if replayErr != nil || !replaySafe {
+		return true, replayErr
+	}
 	guardMatches, err := generationGuardMatches(c.maps.ownerGuards, key.Owner, guard)
 	if err != nil || !guardMatches {
 		return true, err
@@ -2127,6 +2186,10 @@ func (c *Cleanup) releaseGenerationPublishingCleanupTail(
 		if completeErr != nil || !complete {
 			return true, completeErr
 		}
+	}
+	replaySafe, replayErr = c.aliasReplayFenceRetirementSafe(key, &claim)
+	if replayErr != nil || !replaySafe {
+		return true, replayErr
 	}
 	deleted, err = cleanupDeleteExact(c.maps.ownerGuards, key.Owner, guard)
 	if err != nil || !deleted {
@@ -2196,6 +2259,10 @@ func (c *Cleanup) releaseGenerationCleanupReservedGuardTail(
 	if err := c.maps.ambiguity.Lookup(&key, &marker); err != nil || marker != 0 {
 		return false, ignoreMissing(err)
 	}
+	replaySafe, err := c.aliasReplayFenceRetirementSafe(key, nil)
+	if err != nil || !replaySafe {
+		return false, err
+	}
 	guardMatches, err := generationGuardMatches(c.maps.ownerGuards, guardKey, guard)
 	if err != nil || !guardMatches {
 		return false, err
@@ -2210,6 +2277,10 @@ func (c *Cleanup) releaseGenerationCleanupReservedGuardTail(
 	}
 	if err := c.maps.ambiguity.Lookup(&key, &marker); err != nil || marker != 0 {
 		return false, ignoreMissing(err)
+	}
+	replaySafe, err = c.aliasReplayFenceRetirementSafe(key, nil)
+	if err != nil || !replaySafe {
+		return false, err
 	}
 	guardMatches, err = generationGuardMatches(c.maps.ownerGuards, guardKey, guard)
 	if err != nil || !guardMatches {
@@ -2249,6 +2320,10 @@ func (c *Cleanup) releaseGenerationCleanupGuardTail(
 	if err != nil || !complete {
 		return false, err
 	}
+	replaySafe, err := c.aliasReplayFenceRetirementSafe(key, nil)
+	if err != nil || !replaySafe {
+		return false, err
+	}
 	guardMatches, err := generationGuardMatches(c.maps.ownerGuards, guardKey, guard)
 	if err != nil || !guardMatches {
 		return false, err
@@ -2266,6 +2341,10 @@ func (c *Cleanup) releaseGenerationCleanupGuardTail(
 	}
 	complete, err = c.snapshotProvesGenerationCleanupComplete(key)
 	if err != nil || !complete {
+		return false, err
+	}
+	replaySafe, err = c.aliasReplayFenceRetirementSafe(key, nil)
+	if err != nil || !replaySafe {
 		return false, err
 	}
 	deleted, err := cleanupDeleteExact(c.maps.ownerGuards, guardKey, guard)
@@ -3328,6 +3407,13 @@ func (c *Cleanup) sweepOrphans(
 		}
 	}
 
+	// Alias replay is status-only authority, not a logical or physical
+	// generation artifact. Reclaim proven carrier-free tails only after every
+	// generation mutation and fence-retirement pass has finished.
+	if replayErr := c.sweepAliasReplayTails(retired); replayErr != nil {
+		result = errors.Join(result, replayErr)
+	}
+
 	return result
 }
 
@@ -3560,6 +3646,18 @@ func (c *Cleanup) quarantineMalformedState(
 	if key.Generation == 0 || key.Reserved != 0 {
 		// BPF never publishes generation-zero or reserved state keys. Delete
 		// only this noncanonical key and leave the canonical generation alone.
+		// It cannot acquire a canonical full fence, so any alias counter or
+		// exact replay is an explicit fail-closed block on direct deletion.
+		if state.Aliases > 0 {
+			return false, nil
+		}
+		replayKey := aliasReplayKeyForState(key, state)
+		var replay aliasReplayValue
+		if err := c.maps.aliasReplays.Lookup(&replayKey, &replay); err == nil {
+			return false, nil
+		} else if !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return false, fmt.Errorf("checking malformed-key alias replay: %w", err)
+		}
 		deleted, err := cleanupDeleteExact(c.maps.states, key, state)
 		if err != nil {
 			return false, fmt.Errorf("deleting malformed state key: %w", err)
@@ -3581,6 +3679,13 @@ func (c *Cleanup) quarantineMalformedState(
 	)
 	if err != nil || !ready {
 		return false, err
+	}
+	replayReady, replayErr := c.ensureStateAliasReplayFinal(ownership, key, state)
+	if replayErr != nil {
+		return false, fmt.Errorf("finalizing malformed-state alias replay: %w", replayErr)
+	}
+	if !replayReady {
+		return false, nil
 	}
 	deleted, err := c.mutateGenerationCleanupFenced(
 		ownership, "malformed state deletion", func() (bool, error) {
@@ -4003,6 +4108,13 @@ func (c *Cleanup) cleanupOrphanState(
 	if fenced, fenceErr := c.generationCleanupFenceMatches(ownership); fenceErr != nil {
 		return false, fenceErr
 	} else if !fenced {
+		return false, nil
+	}
+	replayReady, replayErr := c.ensureStateAliasReplayFinal(ownership, key, state)
+	if replayErr != nil {
+		return false, fmt.Errorf("finalizing orphan-state alias replay: %w", replayErr)
+	}
+	if !replayReady {
 		return false, nil
 	}
 	mutationStarted := false

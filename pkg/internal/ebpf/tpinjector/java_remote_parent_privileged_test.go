@@ -35,6 +35,60 @@ const (
 	unauthorizedHelperEnv    = "OBI_JAVA_REMOTE_PARENT_UNAUTHORIZED_HELPER"
 )
 
+func TestJavaRemoteParentGetsockoptHandlersPopulatedBeforeAttach(t *testing.T) {
+	requireJavaRemoteParentPrimarySockoptSupport(t)
+
+	objects := loadJavaRemoteParentFixture(t)
+	t.Cleanup(func() { require.NoError(t, objects.Close()) })
+
+	handlers := []struct {
+		name    string
+		slot    uint32
+		program *ebpf.Program
+	}{
+		{
+			name:    "direct_take",
+			slot:    0,
+			program: objects.ObiJavaRemoteParentGetsockoptDirectTake,
+		},
+		{
+			name:    "direct_discard",
+			slot:    1,
+			program: objects.ObiJavaRemoteParentGetsockoptDirectDiscard,
+		},
+		{
+			name:    "task_take",
+			slot:    2,
+			program: objects.ObiJavaRemoteParentGetsockoptTaskTake,
+		},
+		{
+			name:    "task_discard",
+			slot:    3,
+			program: objects.ObiJavaRemoteParentGetsockoptTaskDiscard,
+		},
+		{
+			name:    "health",
+			slot:    4,
+			program: objects.ObiJavaRemoteParentGetsockoptHealth,
+		},
+	}
+
+	require.NotNil(t, objects.JavabridgeGetsockoptHandlers)
+	for _, handler := range handlers {
+		t.Run(handler.name, func(t *testing.T) {
+			var loaded *ebpf.Program
+			require.NoError(t, objects.JavabridgeGetsockoptHandlers.Lookup(handler.slot, &loaded))
+			require.NotNil(t, loaded)
+			t.Cleanup(func() { require.NoError(t, loaded.Close()) })
+			require.Equal(
+				t,
+				javaRemoteParentProgramID(t, handler.program),
+				javaRemoteParentProgramID(t, loaded),
+			)
+		})
+	}
+}
+
 // TestJavaRemoteParentPrimarySocketAuthority exercises the cgroup sockopt
 // programs against real TCP sockets. It is intentionally privileged and
 // reports missing kernel features or capabilities as unsupported rather than
@@ -209,6 +263,15 @@ func TestJavaRemoteParentPrimarySocketAuthority(t *testing.T) {
 	assert.False(t, record.SpanID == [javabridge.SpanIDSize]byte{})
 	assertGenerationMissing(t, objects.JavaRemoteParentState, owner, firstGeneration)
 	assertValidDiscard(
+		t,
+		&objects.BpfJavaRemoteParentMaps,
+		process,
+		owner,
+		capability,
+		firstNegotiation,
+		first.client,
+	)
+	assertValidTaskDiscard(
 		t,
 		&objects.BpfJavaRemoteParentMaps,
 		process,
@@ -740,6 +803,170 @@ func assertValidDiscard(
 	)
 }
 
+func assertValidTaskDiscard(
+	t *testing.T,
+	maps *BpfJavaRemoteParentMaps,
+	process BpfJavaRemoteParentPidKeyT,
+	execution BpfJavaRemoteParentPidKeyT,
+	capability uint64,
+	negotiation BpfJavaRemoteParentJavaRemoteParentNegotiationT,
+	fd int,
+) {
+	t.Helper()
+
+	const generation = uint64(47)
+	const nonce = uint64(0x31425364758697a8)
+	generationOwner := execution
+	if generationOwner.Tid == ^uint32(0) {
+		generationOwner.Tid--
+	} else {
+		generationOwner.Tid++
+	}
+	require.NotEqual(t, execution, generationOwner)
+
+	observed := monotonicNowNS(t)
+	stageRemoteParentAt(t,
+		maps,
+		process,
+		generationOwner,
+		capability,
+		negotiation.Connection,
+		negotiation.ConnectionNetns,
+		socketCookie(t, fd),
+		generation,
+		nonce,
+		observed,
+	)
+	stateKey := BpfJavaRemoteParentJavaRemoteParentKeyT{
+		Owner:      generationOwner,
+		Generation: generation,
+	}
+	var state BpfJavaRemoteParentJavaRemoteParentStateT
+	require.NoError(t, maps.JavaRemoteParentState.Lookup(stateKey, &state))
+	require.Equal(t, observed, state.ObservedMonotimeNs)
+	require.Equal(t, capability, state.ProcessIncarnation)
+	state.Aliases = 1
+	require.NoError(t, maps.JavaRemoteParentState.Update(stateKey, state, ebpf.UpdateExist))
+
+	replayKey := BpfJavaRemoteParentJavaRemoteParentAliasReplayKeyT{
+		Owner:                        generationOwner,
+		Generation:                   generation,
+		GenerationObservedMonotimeNs: observed,
+		ProcessIncarnation:           capability,
+	}
+	require.NoError(t, maps.JavaRemoteParentAliasReplays.Update(
+		replayKey,
+		BpfJavaRemoteParentJavaRemoteParentAliasReplayT{
+			TransitionMonotimeNs: observed,
+			References:           1,
+			Lifecycle:            bridgeLifecycleActive,
+		},
+		ebpf.UpdateNoExist,
+	))
+	task := BpfJavaRemoteParentJavaRemoteParentTaskT{
+		Owner:              generationOwner,
+		Generation:         generation,
+		ObservedMonotimeNs: observed,
+	}
+	require.NoError(t, maps.JavaRemoteParentTasks.Update(execution, task, ebpf.UpdateNoExist))
+	defer func() {
+		for _, cleanup := range []struct {
+			mapRef *ebpf.Map
+			key    any
+		}{
+			{maps.JavaRemoteParentTasks, execution},
+			{maps.JavaRemoteParentAliasReplays, replayKey},
+			{maps.JavaRemoteParentTerminal, generationOwner},
+			{maps.JavaRemoteParentDataSignals, process},
+		} {
+			err := cleanup.mapRef.Delete(cleanup.key)
+			if err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+				assert.NoError(t, err)
+			}
+		}
+	}()
+
+	require.NoError(t, acknowledgeRemoteParentData(fd, nonce))
+	require.Equal(t,
+		generation,
+		socketNegotiation(t, maps.JavaRemoteParentNegotiations, fd).Generation,
+	)
+	statsBefore := javaRemoteParentStats(t, maps.JavaRemoteParentStats)
+	value := make([]byte, javabridge.RecordSize)
+	length, err := rawGetsockopt(
+		fd, javabridge.SocketLevel, javabridge.SocketTaskDiscard, value,
+	)
+	require.NoError(t, err)
+	require.Equal(t, len(value), length)
+	record, err := javabridge.UnmarshalRecord(value)
+	require.NoError(t, err)
+	assert.Equal(t, javabridge.StatusMissing, record.Status)
+	assert.Equal(t, generation, record.Generation)
+	assert.Equal(t, observed, record.ObservedMonotonicNS)
+	assertGenerationMissing(t, maps.JavaRemoteParentState, generationOwner, generation)
+	var fallback BpfJavaRemoteParentJavaRemoteParentResponseT
+	assert.ErrorIs(t,
+		maps.JavaRemoteParentFallback.Lookup(generationOwner, &fallback),
+		ebpf.ErrKeyNotExist,
+	)
+	var generationIndex BpfJavaRemoteParentJavaRemoteParentGenerationIndexT
+	assert.ErrorIs(t,
+		maps.JavaRemoteParentGenerationIndex.Lookup(stateKey, &generationIndex),
+		ebpf.ErrKeyNotExist,
+	)
+	var ownerState BpfJavaRemoteParentJavaRemoteParentOwnerT
+	assert.ErrorIs(t,
+		maps.JavaRemoteParentOwners.Lookup(generationOwner, &ownerState),
+		ebpf.ErrKeyNotExist,
+	)
+	var ambiguity uint64
+	assert.ErrorIs(t,
+		maps.JavaRemoteParentAmbiguity.Lookup(stateKey, &ambiguity),
+		ebpf.ErrKeyNotExist,
+	)
+	var claim BpfJavaRemoteParentJavaRemoteParentClaimT
+	assert.ErrorIs(t,
+		maps.JavaRemoteParentClaims.Lookup(stateKey, &claim),
+		ebpf.ErrKeyNotExist,
+	)
+	var ownerGuard BpfJavaRemoteParentJavaRemoteParentClaimT
+	assert.ErrorIs(t,
+		maps.JavaRemoteParentOwnerGuards.Lookup(generationOwner, &ownerGuard),
+		ebpf.ErrKeyNotExist,
+	)
+
+	var terminal BpfJavaRemoteParentJavaRemoteParentTerminalT
+	require.NoError(t, maps.JavaRemoteParentTerminal.Lookup(generationOwner, &terminal))
+	assert.Equal(t, generation, terminal.Generation)
+	assert.Equal(t, observed, terminal.ObservedMonotimeNs)
+	assert.Equal(t, capability, terminal.ProcessIncarnation)
+	assert.Equal(t, bridgeLifecycleDiscarded, terminal.Lifecycle)
+	assert.Zero(t, terminal.Reserved)
+
+	var replay BpfJavaRemoteParentJavaRemoteParentAliasReplayT
+	require.NoError(t, maps.JavaRemoteParentAliasReplays.Lookup(replayKey, &replay))
+	assert.Equal(t, uint32(1), replay.References)
+	assert.Equal(t, bridgeLifecycleDiscarded, replay.Lifecycle)
+	assert.Zero(t, replay.DesiredLifecycle)
+	assert.Zero(t, replay.ProducerTag)
+	assert.Zero(t, replay.Reserved)
+	assert.NotZero(t, replay.TransitionMonotimeNs)
+
+	var retainedTask BpfJavaRemoteParentJavaRemoteParentTaskT
+	require.NoError(t, maps.JavaRemoteParentTasks.Lookup(execution, &retainedTask))
+	assert.Equal(t, task, retainedTask)
+
+	statsAfter := javaRemoteParentStats(t, maps.JavaRemoteParentStats)
+	assert.Equal(t,
+		statsBefore[javaRemoteParentStatDiscardValid]+1,
+		statsAfter[javaRemoteParentStatDiscardValid],
+	)
+	assert.Equal(t,
+		statsBefore[javaRemoteParentStatHandoffValid],
+		statsAfter[javaRemoteParentStatHandoffValid],
+	)
+}
+
 func javaRemoteParentStats(t *testing.T, stats *ebpf.Map) [javaRemoteParentStatCount]uint64 {
 	t.Helper()
 
@@ -875,7 +1102,6 @@ func assertConcurrentTakeIsOneShot(
 		}()
 	}
 
-	observed := monotonicNowNS(t)
 	workerKeys := make([]BpfJavaRemoteParentPidKeyT, 0, concurrentTakeWorkers)
 	for range concurrentTakeWorkers {
 		worker := BpfJavaRemoteParentPidKeyT{
@@ -892,8 +1118,24 @@ func assertConcurrentTakeIsOneShot(
 	}
 	var state BpfJavaRemoteParentJavaRemoteParentStateT
 	require.NoError(t, maps.JavaRemoteParentState.Lookup(stateKey, &state))
+	observed := state.ObservedMonotimeNs
 	state.Aliases = uint32(len(workerKeys))
 	require.NoError(t, maps.JavaRemoteParentState.Update(stateKey, state, ebpf.UpdateExist))
+	replayKey := BpfJavaRemoteParentJavaRemoteParentAliasReplayKeyT{
+		Owner:                        owner,
+		Generation:                   generation,
+		GenerationObservedMonotimeNs: observed,
+		ProcessIncarnation:           state.ProcessIncarnation,
+	}
+	require.NoError(t, maps.JavaRemoteParentAliasReplays.Update(
+		replayKey,
+		BpfJavaRemoteParentJavaRemoteParentAliasReplayT{
+			TransitionMonotimeNs: observed,
+			References:           uint32(len(workerKeys)),
+			Lifecycle:            bridgeLifecycleActive,
+		},
+		ebpf.UpdateNoExist,
+	))
 
 	for _, worker := range workerKeys {
 		require.NoError(t, maps.JavaRemoteParentTasks.Update(worker,
@@ -930,6 +1172,7 @@ func assertConcurrentTakeIsOneShot(
 	for _, worker := range workerKeys {
 		require.NoError(t, maps.JavaRemoteParentTasks.Delete(worker))
 	}
+	require.NoError(t, maps.JavaRemoteParentAliasReplays.Delete(replayKey))
 	assertGenerationMissing(t, maps.JavaRemoteParentState, owner, generation)
 }
 
@@ -1090,6 +1333,9 @@ func stageRemoteParentAt(
 		Netns:              netns,
 	}
 
+	require.NoError(t, maps.JavaRemoteParentAmbiguity.Update(
+		key, uint64(0), ebpf.UpdateNoExist,
+	))
 	require.NoError(t, maps.JavaRemoteParentState.Update(key,
 		BpfJavaRemoteParentJavaRemoteParentStateT{
 			Lifecycle:          bridgeLifecycleActive,

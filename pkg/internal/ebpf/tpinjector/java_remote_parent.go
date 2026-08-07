@@ -693,6 +693,7 @@ func (p *Tracer) javaRemoteParentMaps() javabridge.Maps {
 		Connections:       p.bpfJavaRemoteParentMaps.JavaRemoteParentConnections,
 		CookieConnections: p.bpfJavaRemoteParentMaps.JavaRemoteParentCookieConnections,
 		Ambiguity:         p.bpfJavaRemoteParentMaps.JavaRemoteParentAmbiguity,
+		AliasReplays:      p.bpfJavaRemoteParentMaps.JavaRemoteParentAliasReplays,
 		Owners:            p.bpfJavaRemoteParentMaps.JavaRemoteParentOwners,
 		States:            p.bpfJavaRemoteParentMaps.JavaRemoteParentState,
 		Generations:       p.bpfJavaRemoteParentMaps.JavaRemoteParentGenerationIndex,

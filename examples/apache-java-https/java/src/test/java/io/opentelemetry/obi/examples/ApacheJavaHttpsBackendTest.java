@@ -15,10 +15,18 @@ import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.lang.reflect.Proxy;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import org.eclipse.jetty.servlet.ServletContextHandler;
 import org.eclipse.jetty.servlet.ServletMapping;
 import org.junit.jupiter.api.Test;
@@ -165,6 +173,108 @@ class ApacheJavaHttpsBackendTest {
     assertThrows(
         IllegalArgumentException.class,
         () -> ApacheJavaHttpsBackend.parseDispatchRounds("many"));
+  }
+
+  @Test
+  void concurrencyExpectedIsBounded() {
+    assertEquals(2, ApacheJavaHttpsBackend.parseConcurrencyExpected("2"));
+    assertEquals(64, ApacheJavaHttpsBackend.parseConcurrencyExpected("64"));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> ApacheJavaHttpsBackend.parseConcurrencyExpected(null));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> ApacheJavaHttpsBackend.parseConcurrencyExpected("1"));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> ApacheJavaHttpsBackend.parseConcurrencyExpected("65"));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> ApacheJavaHttpsBackend.parseConcurrencyExpected("many"));
+  }
+
+  @Test
+  void concurrencyBarrierProvesDistinctOverlappingWorkers() throws Exception {
+    ApacheJavaHttpsBackend.ConcurrencyBarrier barrier =
+        new ApacheJavaHttpsBackend.ConcurrencyBarrier();
+    ExecutorService workers = Executors.newFixedThreadPool(4);
+    try {
+      List<Future<ApacheJavaHttpsBackend.BarrierEvidence>> futures =
+          List.of(
+              workers.submit(() -> barrier.await("c000000000000002a", 4, 11)),
+              workers.submit(() -> barrier.await("c000000000000002a", 4, 12)),
+              workers.submit(() -> barrier.await("c000000000000002a", 4, 13)),
+              workers.submit(() -> barrier.await("c000000000000002a", 4, 14)));
+      Set<Integer> arrivals = new HashSet<>();
+      Set<Long> workerIDs = new HashSet<>();
+      Set<Long> releases = new HashSet<>();
+      for (Future<ApacheJavaHttpsBackend.BarrierEvidence> future : futures) {
+        ApacheJavaHttpsBackend.BarrierEvidence evidence = future.get();
+        assertEquals("c000000000000002a", evidence.batch);
+        assertEquals(4, evidence.participants);
+        assertEquals(4, evidence.maxActive);
+        arrivals.add(evidence.arrival);
+        workerIDs.add(evidence.workerID);
+        releases.add(evidence.release);
+      }
+      assertEquals(Set.of(1, 2, 3, 4), arrivals);
+      assertEquals(Set.of(11L, 12L, 13L, 14L), workerIDs);
+      assertEquals(1, releases.size());
+      assertTrue(releases.iterator().next() > 0);
+    } finally {
+      workers.shutdownNow();
+    }
+  }
+
+  @Test
+  void concurrencyBarrierCanBeReusedAfterSuccessfulBatchDeparture() throws Exception {
+    ApacheJavaHttpsBackend.ConcurrencyBarrier barrier =
+        new ApacheJavaHttpsBackend.ConcurrencyBarrier();
+    ExecutorService workers = Executors.newFixedThreadPool(2);
+    try {
+      long firstRelease = awaitBarrierPair(barrier, workers, "c000000000000002a", 11, 12);
+      long secondRelease = awaitBarrierPair(barrier, workers, "c000000000000002b", 13, 14);
+
+      assertTrue(firstRelease > 0);
+      assertTrue(secondRelease > firstRelease);
+    } finally {
+      workers.shutdownNow();
+    }
+  }
+
+  @Test
+  void concurrencyBarrierTimeoutClearsPartialBatchForReuse() throws Exception {
+    ApacheJavaHttpsBackend.ConcurrencyBarrier barrier =
+        new ApacheJavaHttpsBackend.ConcurrencyBarrier(TimeUnit.MILLISECONDS.toNanos(250));
+    ExecutorService workers = Executors.newFixedThreadPool(2);
+    try {
+      Future<ApacheJavaHttpsBackend.BarrierEvidence> partial =
+          workers.submit(() -> barrier.await("c000000000000002a", 2, 11));
+      ExecutionException failure =
+          assertThrows(ExecutionException.class, () -> partial.get(2, TimeUnit.SECONDS));
+      assertTrue(failure.getCause() instanceof TimeoutException);
+
+      assertTrue(awaitBarrierPair(barrier, workers, "c000000000000002b", 12, 13) > 0);
+    } finally {
+      workers.shutdownNow();
+    }
+  }
+
+  private static long awaitBarrierPair(
+      ApacheJavaHttpsBackend.ConcurrencyBarrier barrier,
+      ExecutorService workers,
+      String batch,
+      long firstWorker,
+      long secondWorker)
+      throws Exception {
+    Future<ApacheJavaHttpsBackend.BarrierEvidence> first =
+        workers.submit(() -> barrier.await(batch, 2, firstWorker));
+    Future<ApacheJavaHttpsBackend.BarrierEvidence> second =
+        workers.submit(() -> barrier.await(batch, 2, secondWorker));
+    ApacheJavaHttpsBackend.BarrierEvidence firstEvidence = first.get(2, TimeUnit.SECONDS);
+    ApacheJavaHttpsBackend.BarrierEvidence secondEvidence = second.get(2, TimeUnit.SECONDS);
+    assertEquals(firstEvidence.release, secondEvidence.release);
+    return firstEvidence.release;
   }
 
   @Test

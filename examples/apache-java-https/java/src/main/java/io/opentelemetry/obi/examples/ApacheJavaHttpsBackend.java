@@ -59,6 +59,8 @@ public final class ApacheJavaHttpsBackend {
   private static final int MAX_BODY_BYTES = 64 * 1024;
   private static final int MAX_HANDOFFS = 8;
   private static final int MAX_DISPATCH_ROUNDS = 8;
+  private static final int MAX_CONCURRENCY_PARTICIPANTS = 64;
+  private static final long CONCURRENCY_BARRIER_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(5);
   private static final int PROC_LOCAL_ENDPOINT_INDEX = 1;
   private static final int PROC_REMOTE_ENDPOINT_INDEX = 2;
   private static final int PROC_STATE_INDEX = 3;
@@ -85,6 +87,7 @@ public final class ApacheJavaHttpsBackend {
       new DefaultEventExecutor(namedThreadFactory("obi-netty-eventloop-"));
   private static final ExecutorService VIRTUAL_EXECUTOR = virtualThreadExecutor();
   private static final AtomicBoolean STOPPED = new AtomicBoolean();
+  private static final ConcurrencyBarrier CONCURRENCY_BARRIER = new ConcurrencyBarrier();
 
   private ApacheJavaHttpsBackend() {}
 
@@ -265,6 +268,36 @@ public final class ApacheJavaHttpsBackend {
       }
 
       int delayMillis = parseDelay(request.getParameter("delay_ms"));
+
+      String concurrencyBatch = request.getParameter("concurrency_batch");
+      String concurrencyExpected = request.getParameter("concurrency_expected");
+      if (concurrencyBatch != null || concurrencyExpected != null) {
+        BarrierEvidence evidence;
+        try {
+          evidence =
+              CONCURRENCY_BARRIER.await(
+                  concurrencyBatch,
+                  parseConcurrencyExpected(concurrencyExpected),
+                  Thread.currentThread().getId());
+        } catch (IllegalArgumentException invalid) {
+          response.sendError(HttpServletResponse.SC_BAD_REQUEST, invalid.getMessage());
+          return;
+        } catch (TimeoutException timeout) {
+          response.sendError(HttpServletResponse.SC_SERVICE_UNAVAILABLE, "concurrency barrier timed out");
+          return;
+        } catch (InterruptedException interrupted) {
+          Thread.currentThread().interrupt();
+          response.sendError(HttpServletResponse.SC_SERVICE_UNAVAILABLE, "concurrency barrier interrupted");
+          return;
+        }
+        response.setHeader("X-OBI-Backend-Worker-ID", Long.toString(evidence.workerID));
+        response.setHeader("X-OBI-Concurrency-Batch", evidence.batch);
+        response.setHeader(
+            "X-OBI-Concurrency-Participants", Integer.toString(evidence.participants));
+        response.setHeader("X-OBI-Concurrency-Max-Active", Integer.toString(evidence.maxActive));
+        response.setHeader("X-OBI-Concurrency-Arrival", Integer.toString(evidence.arrival));
+        response.setHeader("X-OBI-Concurrency-Release", Long.toString(evidence.release));
+      }
       if (delayMillis > 0) {
         try {
           Thread.sleep(delayMillis);
@@ -735,6 +768,131 @@ public final class ApacheJavaHttpsBackend {
       return rounds;
     } catch (NumberFormatException failure) {
       throw new IllegalArgumentException("rounds must be an integer", failure);
+    }
+  }
+
+  static int parseConcurrencyExpected(String raw) {
+    if (raw == null || raw.isEmpty()) {
+      throw new IllegalArgumentException("concurrency_expected is required");
+    }
+    try {
+      int expected = Integer.parseInt(raw);
+      if (expected < 2 || expected > MAX_CONCURRENCY_PARTICIPANTS) {
+        throw new IllegalArgumentException("concurrency_expected must be between 2 and 64");
+      }
+      return expected;
+    } catch (NumberFormatException failure) {
+      throw new IllegalArgumentException("concurrency_expected must be an integer", failure);
+    }
+  }
+
+  static final class ConcurrencyBarrier {
+    private static final Pattern BATCH_PATTERN = Pattern.compile("c[0-9a-f]{16}");
+    private final AtomicLong releases = new AtomicLong();
+    private final long timeoutNanos;
+    private BarrierState current;
+
+    ConcurrencyBarrier() {
+      this(CONCURRENCY_BARRIER_TIMEOUT_NANOS);
+    }
+
+    ConcurrencyBarrier(long timeoutNanos) {
+      if (timeoutNanos <= 0) {
+        throw new IllegalArgumentException("concurrency barrier timeout must be positive");
+      }
+      this.timeoutNanos = timeoutNanos;
+    }
+
+    synchronized BarrierEvidence await(String batch, int expected, long workerID)
+        throws InterruptedException, TimeoutException {
+      if (batch == null || !BATCH_PATTERN.matcher(batch).matches() || workerID <= 0) {
+        throw new IllegalArgumentException("invalid concurrency barrier identity");
+      }
+      if (current == null) {
+        current = new BarrierState(batch, expected);
+      } else if (!current.batch.equals(batch) || current.expected != expected || current.failed) {
+        throw new IllegalArgumentException("another concurrency barrier is active");
+      }
+      BarrierState state = current;
+      int arrival = ++state.participants;
+      if (arrival > expected) {
+        state.failed = true;
+        notifyAll();
+        depart(state);
+        throw new IllegalArgumentException("too many concurrency barrier participants");
+      }
+      if (arrival == expected) {
+        state.release = releases.incrementAndGet();
+        if (state.release <= 0) {
+          state.failed = true;
+        }
+        notifyAll();
+      }
+
+      long deadline = System.nanoTime() + timeoutNanos;
+      try {
+        while (state.release == 0 && !state.failed) {
+          long remaining = deadline - System.nanoTime();
+          if (remaining <= 0) {
+            state.failed = true;
+            notifyAll();
+            throw new TimeoutException("concurrency barrier timed out");
+          }
+          TimeUnit.NANOSECONDS.timedWait(this, remaining);
+        }
+        if (state.failed) {
+          throw new TimeoutException("concurrency barrier failed");
+        }
+        return new BarrierEvidence(
+            state.batch, expected, expected, arrival, state.release, workerID);
+      } catch (InterruptedException interrupted) {
+        state.failed = true;
+        notifyAll();
+        throw interrupted;
+      } finally {
+        depart(state);
+      }
+    }
+
+    private void depart(BarrierState state) {
+      state.departed++;
+      if (state == current && state.departed == state.participants &&
+          (state.release != 0 || state.failed)) {
+        current = null;
+      }
+    }
+  }
+
+  private static final class BarrierState {
+    private final String batch;
+    private final int expected;
+    private int participants;
+    private int departed;
+    private long release;
+    private boolean failed;
+
+    private BarrierState(String batch, int expected) {
+      this.batch = batch;
+      this.expected = expected;
+    }
+  }
+
+  static final class BarrierEvidence {
+    final String batch;
+    final int participants;
+    final int maxActive;
+    final int arrival;
+    final long release;
+    final long workerID;
+
+    private BarrierEvidence(
+        String batch, int participants, int maxActive, int arrival, long release, long workerID) {
+      this.batch = batch;
+      this.participants = participants;
+      this.maxActive = maxActive;
+      this.arrival = arrival;
+      this.release = release;
+      this.workerID = workerID;
     }
   }
 

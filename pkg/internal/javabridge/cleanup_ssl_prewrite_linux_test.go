@@ -12,6 +12,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/cilium/ebpf"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -163,26 +164,200 @@ func TestSSLPrewriteCleanupLeavesRootWithOccupiedClaim(t *testing.T) {
 	assert.Empty(t, cleanup.maps.sslPrewriteConnectionAmbiguity.(*fakeBridgeMap).values)
 }
 
-func TestSSLPrewriteCleanupSweepsStaleClaimsFirst(t *testing.T) {
+func TestSSLPrewriteCleanupFencesStaleClaimsBeforeDelete(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		marker *sslPrewriteConnectionAmbiguity
+	}{
+		{name: "absent marker"},
+		{
+			name: "expired ambiguous marker",
+			marker: &sslPrewriteConnectionAmbiguity{
+				ObservedMonotonicNS: uint64(time.Second),
+				State:               sslPrewriteAmbiguous,
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cleanup := testSSLCleanup(3*time.Second, time.Second)
+			key := testSSLConnectionKey(1)
+			stale := sslPrewriteConnectionOwner{
+				ObservedMonotonicNS: uint64(time.Second),
+				State:               sslPrewriteOwnerBlocked,
+			}
+			freshKey := testSSLConnectionKey(2)
+			fresh := sslPrewriteConnectionOwner{
+				ObservedMonotonicNS: uint64(2500 * time.Millisecond),
+				State:               sslPrewriteOwnerClosing,
+			}
+			closing := sslPrewriteConnectionAmbiguity{
+				ObservedMonotonicNS: uint64(3 * time.Second),
+				State:               sslPrewriteClosing,
+			}
+			claims := cleanup.maps.sslPrewriteConnectionClaims.(*fakeBridgeMap)
+			ambiguity := cleanup.maps.sslPrewriteConnectionAmbiguity.(*fakeBridgeMap)
+			claims.values[key] = stale
+			claims.values[freshKey] = fresh
+			if test.marker != nil {
+				ambiguity.values[key] = *test.marker
+			}
+
+			var order []string
+			ambiguity.beforeUpdate = func(updatedKey, value any, flags ebpf.MapUpdateFlags) {
+				require.Equal(t, key, updatedKey)
+				require.Equal(t, closing, value)
+				require.Equal(t, ebpf.UpdateAny, flags)
+				require.Equal(t, stale, claims.values[key])
+			}
+			ambiguity.afterUpdate = func(any, any) { order = append(order, "marker") }
+			ambiguity.afterDelete = func(any) { t.Fatal("fresh closing marker was deleted") }
+			claims.afterDelete = func(deletedKey any) {
+				require.Equal(t, key, deletedKey)
+				require.Equal(t, closing, ambiguity.values[key])
+				order = append(order, "claim")
+			}
+
+			require.NoError(t, cleanup.Sweep())
+			assert.Equal(t, []string{"marker", "claim"}, order)
+			assert.Equal(t, map[any]any{freshKey: fresh}, claims.values)
+			assert.Equal(t, closing, ambiguity.values[key])
+		})
+	}
+}
+
+func TestSSLPrewriteCleanupPreservesStaleClaimWhenFencePublicationFails(t *testing.T) {
 	cleanup := testSSLCleanup(3*time.Second, time.Second)
+	key := testSSLConnectionKey(1)
+	claim := sslPrewriteConnectionOwner{
+		ObservedMonotonicNS: uint64(time.Second),
+		State:               sslPrewriteOwnerBlocked,
+	}
+	marker := sslPrewriteConnectionAmbiguity{
+		ObservedMonotonicNS: uint64(time.Second),
+		State:               sslPrewriteAmbiguous,
+	}
 	claims := cleanup.maps.sslPrewriteConnectionClaims.(*fakeBridgeMap)
-	stale := []sslPrewriteConnectionOwner{
-		{ObservedMonotonicNS: 0, State: sslPrewriteOwnerClosing},
-		{ObservedMonotonicNS: uint64(4 * time.Second), State: sslPrewriteOwnerClosing},
-		{ObservedMonotonicNS: uint64(time.Second), State: sslPrewriteOwnerBlocked},
+	ambiguity := cleanup.maps.sslPrewriteConnectionAmbiguity.(*fakeBridgeMap)
+	claims.values[key] = claim
+	ambiguity.values[key] = marker
+	ambiguity.updateErr = errors.New("map full")
+	deletes := 0
+	claims.afterDelete = func(any) { deletes++ }
+
+	err := cleanup.Sweep()
+	require.ErrorContains(t, err, "publishing stale-claim closing marker")
+	assert.Equal(t, claim, claims.values[key])
+	assert.Equal(t, marker, ambiguity.values[key])
+	assert.Zero(t, deletes)
+}
+
+func TestSSLPrewriteCleanupPreservesClaimWhenClosingFenceIsRefreshed(t *testing.T) {
+	cleanup := testSSLCleanup(3*time.Second, time.Second)
+	key := testSSLConnectionKey(1)
+	claim := sslPrewriteConnectionOwner{
+		ObservedMonotonicNS: uint64(time.Second),
+		State:               sslPrewriteOwnerBlocked,
 	}
-	for i, claim := range stale {
-		claims.values[testSSLConnectionKey(uint64(i+1))] = claim
+	refreshed := sslPrewriteConnectionAmbiguity{
+		ObservedMonotonicNS: uint64(4 * time.Second),
+		State:               sslPrewriteClosing,
 	}
-	freshKey := testSSLConnectionKey(10)
-	fresh := sslPrewriteConnectionOwner{
+	claims := cleanup.maps.sslPrewriteConnectionClaims.(*fakeBridgeMap)
+	ambiguity := cleanup.maps.sslPrewriteConnectionAmbiguity.(*fakeBridgeMap)
+	claims.values[key] = claim
+	ambiguity.afterUpdate = func(updatedKey, _ any) {
+		ambiguity.mu.Lock()
+		ambiguity.values[updatedKey] = refreshed
+		ambiguity.mu.Unlock()
+	}
+
+	require.NoError(t, cleanup.Sweep())
+	assert.Equal(t, claim, claims.values[key])
+	assert.Equal(t, refreshed, ambiguity.values[key])
+}
+
+func TestSSLPrewriteCleanupPreservesClaimReplacementBeforeFinalRead(t *testing.T) {
+	cleanup := testSSLCleanup(3*time.Second, time.Second)
+	key := testSSLConnectionKey(1)
+	claim := sslPrewriteConnectionOwner{
+		ObservedMonotonicNS: uint64(time.Second),
+		State:               sslPrewriteOwnerBlocked,
+	}
+	replacement := sslPrewriteConnectionOwner{
 		ObservedMonotonicNS: uint64(2500 * time.Millisecond),
 		State:               sslPrewriteOwnerClosing,
 	}
-	claims.values[freshKey] = fresh
+	claims := cleanup.maps.sslPrewriteConnectionClaims.(*fakeBridgeMap)
+	claims.values[key] = claim
+	claims.afterLookup = func(count int) {
+		if count != 1 {
+			return
+		}
+		claims.mu.Lock()
+		claims.values[key] = replacement
+		claims.mu.Unlock()
+	}
 
 	require.NoError(t, cleanup.Sweep())
-	assert.Equal(t, map[any]any{freshKey: fresh}, claims.values)
+	assert.Equal(t, replacement, claims.values[key])
+	assert.Equal(t, sslPrewriteConnectionAmbiguity{
+		ObservedMonotonicNS: uint64(3 * time.Second),
+		State:               sslPrewriteClosing,
+	}, cleanup.maps.sslPrewriteConnectionAmbiguity.(*fakeBridgeMap).values[key])
+}
+
+func TestSSLPrewriteCleanupKeepsFenceWhenFinalDeleteRemovesTransientSuccessor(t *testing.T) {
+	cleanup := testSSLCleanup(3*time.Second, time.Second)
+	key := testSSLConnectionKey(1)
+	claim := sslPrewriteConnectionOwner{
+		ObservedMonotonicNS: uint64(time.Second),
+		State:               sslPrewriteOwnerBlocked,
+	}
+	successor := sslPrewriteConnectionOwner{
+		ObservedMonotonicNS: uint64(4 * time.Second),
+		State:               sslPrewriteOwnerPublished,
+	}
+	claims := cleanup.maps.sslPrewriteConnectionClaims.(*fakeBridgeMap)
+	claims.values[key] = claim
+	claims.afterLookup = func(count int) {
+		if count != 4 {
+			return
+		}
+		claims.mu.Lock()
+		claims.values[key] = successor
+		claims.mu.Unlock()
+	}
+
+	require.NoError(t, cleanup.Sweep())
+	assert.NotContains(t, claims.values, key)
+	assert.Equal(t, sslPrewriteConnectionAmbiguity{
+		ObservedMonotonicNS: uint64(3 * time.Second),
+		State:               sslPrewriteClosing,
+	}, cleanup.maps.sslPrewriteConnectionAmbiguity.(*fakeBridgeMap).values[key])
+}
+
+func TestSSLPrewriteCleanupPreservesStaleClaimWhenFenceTimeFails(t *testing.T) {
+	cleanup := testSSLCleanup(3*time.Second, time.Second)
+	key := testSSLConnectionKey(1)
+	claim := sslPrewriteConnectionOwner{
+		ObservedMonotonicNS: uint64(time.Second),
+		State:               sslPrewriteOwnerBlocked,
+	}
+	claims := cleanup.maps.sslPrewriteConnectionClaims.(*fakeBridgeMap)
+	claims.values[key] = claim
+	calls := 0
+	cleanup.monoTimeNow = func() time.Duration {
+		calls++
+		if calls == 1 {
+			return 3 * time.Second
+		}
+		return 0
+	}
+
+	err := cleanup.Sweep()
+	require.ErrorContains(t, err, "reading monotonic time for stale SSL prewrite claim fence")
+	assert.Equal(t, claim, claims.values[key])
+	assert.Empty(t, cleanup.maps.sslPrewriteConnectionAmbiguity.(*fakeBridgeMap).values)
 }
 
 func TestSSLPrewriteCleanupPreservesEntriesObservedDuringEnumeration(t *testing.T) {
@@ -313,7 +488,10 @@ func TestSSLPrewriteCleanupReportsMapErrors(t *testing.T) {
 
 		err := cleanup.Sweep()
 		require.ErrorContains(t, err, "publishing SSL prewrite closing marker")
-		assert.Empty(t, ambiguity.values)
+		assert.Equal(t, sslPrewriteConnectionAmbiguity{
+			ObservedMonotonicNS: uint64(time.Second),
+			State:               sslPrewriteAmbiguous,
+		}, ambiguity.values[key])
 		assert.Equal(t, sslPrewriteConnectionOwner{
 			ObservedMonotonicNS: uint64(3 * time.Second),
 			State:               sslPrewriteOwnerClosing,

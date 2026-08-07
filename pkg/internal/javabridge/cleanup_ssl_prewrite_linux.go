@@ -72,9 +72,7 @@ func (c *Cleanup) sweepSSLPrewrite() error {
 		if !sslPrewriteOwnerStale(claimsNow, retention, entry.value) {
 			continue
 		}
-		if _, deleteErr := cleanupDeleteExact(
-			c.maps.sslPrewriteConnectionClaims, entry.key, entry.value,
-		); deleteErr != nil {
+		if deleteErr := c.retireStaleSSLPrewriteClaim(entry.key, entry.value); deleteErr != nil {
 			result = errors.Join(
 				result, fmt.Errorf("deleting stale SSL prewrite connection claim: %w", deleteErr),
 			)
@@ -195,7 +193,11 @@ func (c *Cleanup) cleanupSSLPrewriteRoot(
 		return fmt.Errorf("claiming stale SSL prewrite connection: %w", err)
 	}
 	ensureClosingOnRelease := false
+	releaseClaim := true
 	defer func() {
+		if !releaseClaim {
+			return
+		}
 		result = errors.Join(
 			result,
 			c.releaseSSLPrewriteClaim(key, claim, ensureClosingOnRelease),
@@ -215,8 +217,12 @@ func (c *Cleanup) cleanupSSLPrewriteRoot(
 		revalidated.ambiguity.Reserved == ([7]byte{})
 	if !expiredClosing {
 		ensureClosingOnRelease = true
-		published, publishErr := c.publishSSLPrewriteClosing(key, revalidated)
+		published, publishErr := c.publishSSLPrewriteClosing(key)
 		if publishErr != nil {
+			// The claim itself is a closing fence. Retain it when the stronger
+			// ambiguity marker could not be atomically published; a later stale-
+			// claim pass will retry the marker before removing this claim.
+			releaseClaim = false
 			return publishErr
 		}
 		if !published {
@@ -281,23 +287,7 @@ func (c *Cleanup) revalidateSSLPrewriteRoot(
 	return current, true, nil
 }
 
-func (c *Cleanup) publishSSLPrewriteClosing(
-	key connectionInfoNetNSCookie,
-	root sslPrewriteRoot,
-) (bool, error) {
-	if root.hasAmbiguity {
-		deleted, err := cleanupDeleteExact(
-			c.maps.sslPrewriteConnectionAmbiguity,
-			key,
-			root.ambiguity,
-		)
-		if err != nil {
-			return false, fmt.Errorf("deleting stale SSL prewrite ambiguity marker: %w", err)
-		}
-		if !deleted {
-			return false, nil
-		}
-	}
+func (c *Cleanup) publishSSLPrewriteClosing(key connectionInfoNetNSCookie) (bool, error) {
 	now := c.monoTimeNow()
 	if now <= 0 {
 		return false, errors.New("reading monotonic time for SSL prewrite closing marker")
@@ -307,11 +297,8 @@ func (c *Cleanup) publishSSLPrewriteClosing(
 		State:               sslPrewriteClosing,
 	}
 	if err := c.maps.sslPrewriteConnectionAmbiguity.Update(
-		&key, &closing, ebpf.UpdateNoExist,
+		&key, &closing, ebpf.UpdateAny,
 	); err != nil {
-		if errors.Is(err, ebpf.ErrKeyExist) {
-			return false, nil
-		}
 		return false, fmt.Errorf("publishing SSL prewrite closing marker: %w", err)
 	}
 	exact, err := cleanupValueExact(c.maps.sslPrewriteConnectionAmbiguity, key, closing)
@@ -319,6 +306,52 @@ func (c *Cleanup) publishSSLPrewriteClosing(
 		return false, fmt.Errorf("revalidating SSL prewrite closing marker: %w", err)
 	}
 	return exact, nil
+}
+
+func (c *Cleanup) retireStaleSSLPrewriteClaim(
+	key connectionInfoNetNSCookie,
+	expected sslPrewriteConnectionOwner,
+) error {
+	now := c.monoTimeNow()
+	if now <= 0 {
+		return errors.New("reading monotonic time for stale SSL prewrite claim fence")
+	}
+	closing := sslPrewriteConnectionAmbiguity{
+		ObservedMonotonicNS: uint64(now),
+		State:               sslPrewriteClosing,
+	}
+	// HASH maps on the oldest supported kernels have no compare-and-delete.
+	// Atomically replacing or inserting a closing marker first makes any claim
+	// replacement fail closed: every BPF publisher checks this map before and
+	// after publication, and BPF never removes an ambiguity entry.
+	if err := c.maps.sslPrewriteConnectionAmbiguity.Update(
+		&key, &closing, ebpf.UpdateAny,
+	); err != nil {
+		return fmt.Errorf("publishing stale-claim closing marker: %w", err)
+	}
+	fenced, err := cleanupValueExact(c.maps.sslPrewriteConnectionAmbiguity, key, closing)
+	if err != nil {
+		return fmt.Errorf("revalidating stale-claim closing marker: %w", err)
+	}
+	if !fenced {
+		return nil
+	}
+	claimExact, err := cleanupValueExact(c.maps.sslPrewriteConnectionClaims, key, expected)
+	if err != nil {
+		return fmt.Errorf("revalidating stale SSL prewrite claim: %w", err)
+	}
+	if !claimExact {
+		return nil
+	}
+	fenced, err = cleanupValueExact(c.maps.sslPrewriteConnectionAmbiguity, key, closing)
+	if err != nil {
+		return fmt.Errorf("revalidating stale-claim fence before deletion: %w", err)
+	}
+	if !fenced {
+		return nil
+	}
+	_, err = cleanupDeleteExact(c.maps.sslPrewriteConnectionClaims, key, expected)
+	return err
 }
 
 func (c *Cleanup) deleteSSLPrewriteOwner(

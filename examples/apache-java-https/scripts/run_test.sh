@@ -35,6 +35,49 @@ expect_invalid_project_name() {
   fi
 }
 
+print_concurrency_result_fixture() {
+  local -r request_count="$1"
+  local -r assertion_mode="${2:-bridge}"
+
+  jq -cn \
+    --argjson request_count "$request_count" \
+    --arg assertion_mode "$assertion_mode" '
+      {
+        status: "passed",
+        scenario: "concurrency",
+        assertion_mode: $assertion_mode,
+        request_count: $request_count,
+        connection_evidence: {
+          frontend_connections: $request_count,
+          frontend_protocol: "HTTP/1.1",
+          distinct_backend_workers: $request_count,
+          distinct_concurrency_arrivals: $request_count,
+          concurrency_participants: $request_count,
+          concurrency_max_active: $request_count,
+          concurrency_release: 7
+        },
+        cases: [
+          range(0; $request_count) as $index |
+          {
+            request: {
+              concurrency_batch: "c0000000000000007",
+              concurrency_expected: $request_count
+            },
+            response: {
+              backend_worker_id: ($index + 11),
+              backend_connection_id: (($index % 2) + 1),
+              concurrency_batch: "c0000000000000007",
+              concurrency_participants: $request_count,
+              concurrency_max_active: $request_count,
+              concurrency_arrival: ($index + 1),
+              concurrency_release: 7
+            }
+          }
+        ]
+      }
+    '
+}
+
 test_project_name_validation() {
   local overlong_name=""
 
@@ -1173,7 +1216,7 @@ test_benchmark_startup_selects_runtime_contract() {
     printf 'benchmark-disabled startup failed\n' >&2
     return 1
   }
-  [[ "$(<"$disabled_dir/compose")" == *"trace-receiver java-backend apache-proxy obi"* &&
+  [[ "$(<"$disabled_dir/compose")" == *"trace-receiver java-backend coalesced-source apache-proxy obi"* &&
     "$(<"$disabled_dir/runtime")" == "disabled" ]] || {
     printf 'benchmark-disabled startup did not retain the disabled runtime\n' >&2
     return 1
@@ -1203,7 +1246,7 @@ test_benchmark_startup_selects_runtime_contract() {
     printf 'benchmark-uninstrumented startup failed\n' >&2
     return 1
   }
-  [[ "$(<"$uninstrumented_dir/compose")" == *"trace-receiver java-backend apache-proxy"* &&
+  [[ "$(<"$uninstrumented_dir/compose")" == *"trace-receiver java-backend coalesced-source apache-proxy"* &&
     "$(<"$uninstrumented_dir/compose")" != *" apache-proxy obi"* &&
     "$(<"$uninstrumented_dir/runtime")" == "uninstrumented" ]] || {
     printf 'benchmark-uninstrumented startup did not omit OBI\n' >&2
@@ -1234,7 +1277,7 @@ test_benchmark_control_passes_assertion_mode_to_tracecheck() {
       write_metrics_delta() { :; }
       run_bounded() {
         printf '%q ' "$@" >"$invocation"
-        printf '{"status":"passed"}\n'
+        print_concurrency_result_fixture "$REQUEST_COUNT" "$assertion_mode"
       }
 
       run_scenario concurrency true full none normal "$assertion_mode"
@@ -1262,6 +1305,25 @@ test_benchmark_controls_are_bounded() {
     printf 'accepted a non-numeric scenario seed\n' >&2
     return 1
   fi
+  if (parse_args --scenario concurrency --requests 1) >/dev/null 2>&1; then
+    printf 'accepted a concurrency fixture with fewer than two participants\n' >&2
+    return 1
+  fi
+  if (parse_args --scenario concurrency --requests 65) >/dev/null 2>&1; then
+    printf 'accepted a concurrency fixture with more than 64 participants\n' >&2
+    return 1
+  fi
+  for request_count in 2 64; do
+    (
+      SCENARIO=all
+      REQUEST_COUNT=0
+      parse_args --scenario concurrency --requests "$request_count"
+      [[ "$REQUEST_COUNT" == "$request_count" ]]
+    ) || {
+      printf 'rejected bounded concurrency participant count: %s\n' "$request_count" >&2
+      return 1
+    }
+  done
   if (parse_args --scenario keepalive --requests 2) >/dev/null 2>&1; then
     printf 'accepted keepalive without two pre-terminal requests\n' >&2
     return 1
@@ -1278,7 +1340,7 @@ test_benchmark_controls_are_bounded() {
 
 test_all_suite_includes_every_scenario() {
   local -r actual="$TEST_TMP_DIR/all-scenarios.txt"
-  local -r expected=$'basic\nbasic\nsecurity\nkeepalive\npipelining\nconcurrency\nconnection-churn\nfd-port-reuse\nslow-body\ntls-boundary\ntimeout-retry\npressure\nhandoff\nvirtual-thread\nnetty\nnetty-server\ndispatch\nw3c\nw3c-match\nobi-flags\nprimary-w3c-stale\nbasic\nprimary-w3c-fault\nprimary-w3c-fault\nprimary-w3c-fault\nprimary-w3c-fault\nbasic\nfail-open\nw3c-only\nrestart\nrestart-fault\nhelper-attach-failure\ndisabled\nw3c-only\nw3c-only\nuninstrumented'
+  local -r expected=$'basic\nbasic\nsecurity\nkeepalive\npipelining\nconcurrency\nconnection-churn\nfd-port-reuse\nslow-body\ntls-boundary\ncoalesced-bridge\ntimeout-retry\npressure\nhandoff\nvirtual-thread\nnetty\nnetty-server\ndispatch\nw3c\nw3c-match\nobi-flags\nprimary-w3c-stale\nbasic\nprimary-w3c-fault\nprimary-w3c-fault\nprimary-w3c-fault\nprimary-w3c-fault\nbasic\nfail-open\nw3c-only\nrestart\nrestart-fault\nhelper-attach-failure\ndisabled\nw3c-only\nw3c-only\nuninstrumented'
 
   (
     SCENARIO=all
@@ -2292,22 +2354,234 @@ test_security_accepts_enabled_transports() {
   fi
 }
 
-test_tls_boundary_requires_both_deterministic_modes() {
+test_tls_boundary_requires_split_and_coalesced_pair() {
   (
     SCENARIO=all
     REQUEST_COUNT=0
-    parse_args --scenario tls-boundary --requests 2
-    [[ "$SCENARIO" == "tls-boundary" && "$REQUEST_COUNT" == "2" ]]
+    parse_args --scenario tls-boundary --requests 3
+    [[ "$SCENARIO" == "tls-boundary" && "$REQUEST_COUNT" == "3" ]]
   ) || {
-    printf 'rejected the exact two-case TLS boundary scenario\n' >&2
+    printf 'rejected the exact split-plus-coalesced-pair TLS boundary scenario\n' >&2
     return 1
   }
   if (
     SCENARIO=all
     REQUEST_COUNT=0
-    parse_args --scenario tls-boundary --requests 1
+    parse_args --scenario tls-boundary --requests 2
   ) >/dev/null 2>&1; then
-    printf 'accepted a TLS boundary run without both deterministic modes\n' >&2
+    printf 'accepted a TLS boundary run without the complete coalesced pair\n' >&2
+    return 1
+  fi
+}
+
+test_coalesced_bridge_requires_exact_live_pair() {
+  (
+    SCENARIO=all
+    REQUEST_COUNT=0
+    parse_args --scenario coalesced-bridge --requests 2
+    [[ "$SCENARIO" == "coalesced-bridge" && "$REQUEST_COUNT" == "2" && \
+      "$(scenario_request_count coalesced-bridge)" == "2" ]]
+  ) || {
+    printf 'rejected the exact two-boundary coalesced bridge control\n' >&2
+    return 1
+  }
+  if (
+    SCENARIO=all
+    REQUEST_COUNT=0
+    parse_args --scenario coalesced-bridge --requests 1
+  ) >/dev/null 2>&1; then
+    printf 'accepted a coalesced bridge control without two boundaries\n' >&2
+    return 1
+  fi
+}
+
+test_tls_boundary_receive_cursor_map_evidence_is_exact_and_steady() {
+  local -r result_dir="$TEST_TMP_DIR/tls-boundary-receive-cursor-map"
+  local -r helper_calls="$result_dir/helper.calls"
+
+  mkdir -p -- "$result_dir"
+  (
+    local helper_call_count=0
+
+    RESULT_DIR="$result_dir"
+    RECEIVE_CURSOR_MAP_ID=""
+    RECEIVE_GUARD_MAP_ID=""
+    RECEIVE_CURSOR_MAP_BASELINE_ENTRIES=""
+    RECEIVE_GUARD_MAP_BASELINE_ENTRIES=""
+    RECEIVE_CURSOR_MAP_STATUS_JSON="null"
+    run_receive_cursor_map_helper() {
+      local -r output="$1"
+      local -r stderr_output="$2"
+      local cursor_map_id=41
+      local guard_map_id=42
+      local cursor_max_entries=10000
+      local guard_max_entries=10000
+      local cursor_entries=0
+      local guard_entries=0
+      shift 3
+
+      ((helper_call_count += 1))
+      printf 'call=%d args=%s\n' "$helper_call_count" "$*" >>"$helper_calls"
+      : >"$stderr_output"
+      case "$helper_call_count" in
+        1)
+          cursor_entries=2
+          guard_entries=2
+          ;;
+        2)
+          cursor_entries=2
+          guard_entries=2
+          ;;
+        3)
+          cursor_map_id=43
+          cursor_entries=2
+          guard_entries=2
+          ;;
+        4)
+          cursor_max_entries=9999
+          cursor_entries=2
+          guard_entries=2
+          ;;
+        5)
+          cursor_entries=2
+          guard_entries=1
+          ;;
+        *)
+          cursor_entries=2
+          guard_entries=2
+          ;;
+      esac
+      printf '{"status":"passed","cursor_map_id":%d,"cursor_map_name":"jrp_recv_cur","cursor_kernel_name":"jrp_recv_cur","cursor_map_type":"Hash","cursor_key_size":8,"cursor_value_size":56,"cursor_max_entries":%d,"cursor_entries":%d,"guard_map_id":%d,"guard_map_name":"jrp_recv_guard","guard_kernel_name":"jrp_recv_guard","guard_map_type":"Hash","guard_key_size":8,"guard_value_size":56,"guard_max_entries":%d,"guard_entries":%d}\n' \
+        "$cursor_map_id" "$cursor_max_entries" "$cursor_entries" \
+        "$guard_map_id" "$guard_max_entries" "$guard_entries" >"$output"
+    }
+    sleep() { :; }
+
+    capture_receive_cursor_map_baseline tls-boundary >/dev/null
+    [[ "$RECEIVE_CURSOR_MAP_ID" == "41" && \
+      "$RECEIVE_GUARD_MAP_ID" == "42" && \
+      "$RECEIVE_CURSOR_MAP_BASELINE_ENTRIES" == "2" && \
+      "$RECEIVE_GUARD_MAP_BASELINE_ENTRIES" == "2" ]]
+    wait_for_receive_cursor_map_recovery tls-boundary >/dev/null
+    [[ "$helper_call_count" == "7" ]]
+    [[ -f "$result_dir/receive-cursor-map-tls-boundary-before.json" && \
+      -f "$result_dir/receive-cursor-map-tls-boundary-after.json" && \
+      -f "$result_dir/receive-cursor-map-tls-boundary-recovery-samples.log" && \
+      -f "$result_dir/receive-cursor-map-tls-boundary-status.json" ]]
+    [[ "$(grep -c 'matched=true' \
+      "$result_dir/receive-cursor-map-tls-boundary-recovery-samples.log")" == "3" ]]
+    grep -F 'attempt=1 ' \
+      "$result_dir/receive-cursor-map-tls-boundary-recovery-samples.log" | \
+      grep -Fq 'cursor_map_id=41 cursor_entries=2 guard_map_id=42 guard_entries=2 matched=true consecutive=1'
+    grep -F 'attempt=2 ' \
+      "$result_dir/receive-cursor-map-tls-boundary-recovery-samples.log" | \
+      grep -Fq 'cursor_map_id=43 cursor_entries=2 guard_map_id=42 guard_entries=2 matched=false consecutive=0'
+    grep -F 'attempt=3 ' \
+      "$result_dir/receive-cursor-map-tls-boundary-recovery-samples.log" | \
+      grep -Fq 'cursor_map_id=41 cursor_entries=2 guard_map_id=42 guard_entries=2 matched=false consecutive=0'
+    grep -Fq '"status":"passed","reason":"steady-baseline"' \
+      "$result_dir/receive-cursor-map-tls-boundary-status.json"
+    grep -Fq '"cursor_baseline_entries":2,"guard_baseline_entries":2,"cursor_final_entries":2,"guard_final_entries":2' \
+      "$result_dir/receive-cursor-map-tls-boundary-status.json"
+    grep -Fq '"required_consecutive_samples":2,"attempts":6' \
+      "$result_dir/receive-cursor-map-tls-boundary-status.json"
+  ) || {
+    printf 'TLS-boundary receive-cursor map evidence did not require exact steady recovery\n' >&2
+    return 1
+  }
+
+  grep -Fqx 'call=1 args=' "$helper_calls"
+  [[ "$(grep -c \
+    'args=--cursor-map-id 41 --guard-map-id 42 --expected-max-entries 10000' \
+    "$helper_calls")" == "6" ]]
+
+  (
+    RESULT_DIR="$TEST_TMP_DIR/tls-boundary-receive-cursor-map-missing-baseline"
+    mkdir -p -- "$RESULT_DIR"
+    RECEIVE_CURSOR_MAP_ID=""
+    RECEIVE_GUARD_MAP_ID=""
+    RECEIVE_CURSOR_MAP_BASELINE_ENTRIES=""
+    RECEIVE_GUARD_MAP_BASELINE_ENTRIES=""
+    RECEIVE_CURSOR_MAP_STATUS_JSON="null"
+    if wait_for_receive_cursor_map_recovery tls-boundary >/dev/null 2>&1; then
+      return 1
+    fi
+    grep -Fq '"status":"failed","reason":"missing-baseline"' \
+      "$RESULT_DIR/receive-cursor-map-tls-boundary-status.json"
+  ) || {
+    printf 'receive coordination-map recovery accepted a missing baseline\n' >&2
+    return 1
+  }
+
+  local -r malformed="$result_dir/malformed.json"
+  printf '%s\n' \
+    '{"status":"passed","cursor_map_id":41,"cursor_map_name":"jrp_recv_cur","cursor_kernel_name":"jrp_recv_cur","cursor_map_type":"Hash","cursor_key_size":8,"cursor_value_size":56,"cursor_max_entries":10000,"cursor_entries":0,"guard_map_id":42,"guard_map_name":"jrp_recv_guard","guard_kernel_name":"jrp_recv_guard","guard_map_type":"Hash","guard_key_size":8,"guard_value_size":55,"guard_max_entries":10000,"guard_entries":0}' \
+    >"$malformed"
+  if receive_cursor_map_result_has_contract "$malformed"; then
+    printf 'receive coordination-map evidence accepted the wrong guard layout\n' >&2
+    return 1
+  fi
+}
+
+test_receive_cursor_map_helper_bounds_evidence_before_replay() {
+  run_limit_case() (
+    local -r mode="$1"
+    local -r result_dir="$TEST_TMP_DIR/receive-cursor-helper-bound-$mode"
+    local -r output="$result_dir/output.json"
+    local -r stderr_output="$result_dir/stderr.log"
+    local -r replay_stdout="$result_dir/replay.stdout"
+    local -r replay_stderr="$result_dir/replay.stderr"
+    local output_size=0
+    local stderr_size=0
+
+    mkdir -p -- "$result_dir"
+    COMPOSE=(test-compose)
+    run_bounded() {
+      case "$mode" in
+        stdout-bytes)
+          awk -v count="$((RECEIVE_CURSOR_HELPER_STDOUT_MAX_BYTES + 1))" \
+            'BEGIN { for (position = 0; position < count; position++) printf "x" }'
+          ;;
+        stdout-lines)
+          printf '{}\n{}\n'
+          ;;
+        stderr-bytes)
+          printf '{}\n'
+          awk -v count="$((RECEIVE_CURSOR_HELPER_STDERR_MAX_BYTES + 1))" \
+            'BEGIN { for (position = 0; position < count; position++) printf "x" > "/dev/stderr" }'
+          ;;
+        *)
+          return 2
+          ;;
+      esac
+    }
+
+    if run_receive_cursor_map_helper \
+      "$output" "$stderr_output" 1 >"$replay_stdout" 2>"$replay_stderr"; then
+      return 1
+    fi
+    output_size="$(stat -c '%s' -- "$output")"
+    stderr_size="$(stat -c '%s' -- "$stderr_output")"
+    ((output_size <= RECEIVE_CURSOR_HELPER_STDOUT_MAX_BYTES))
+    ((stderr_size <= RECEIVE_CURSOR_HELPER_STDERR_MAX_BYTES))
+    [[ ! -s "$replay_stdout" ]]
+    grep -Fq 'exceeded its evidence bounds' "$replay_stderr"
+  )
+
+  local mode=""
+  for mode in stdout-bytes stdout-lines stderr-bytes; do
+    run_limit_case "$mode" || {
+      printf 'receive-cursor helper replay was not bounded for %s\n' "$mode" >&2
+      return 1
+    }
+  done
+
+  local -r oversized_record="$TEST_TMP_DIR/oversized-pressure-result.json"
+  awk -v count="$((PRESSURE_RESULT_MAX_BYTES + 1))" \
+    'BEGIN { for (position = 0; position < count; position++) printf "x" }' \
+    >"$oversized_record"
+  if pressure_result_record "$oversized_record" >/dev/null 2>&1; then
+    printf 'pressure result parser accepted oversized evidence\n' >&2
     return 1
   fi
 }
@@ -3285,11 +3559,13 @@ test_delayed_otlp_suppression_control_has_one_pre_export_request() {
     local -i absence_calls=0
     local -i request_calls=0
     local -i receiver_empty_calls=0
+    local -i sleep_calls=0
 
     RESULT_DIR="$result_dir"
     SCENARIO=delayed-otlp-suppression
     TRANSPORT=getsockopt
     SCENARIO_VARIANT=""
+    DELAYED_OTLP_PROVIDER_READY_SINCE="provider-cursor"
     delayed_otlp_earliest_export_millisecond() {
       printf '900000\n'
     }
@@ -3329,10 +3605,28 @@ test_delayed_otlp_suppression_control_has_one_pre_export_request() {
       printf 'prime\n' >>"$observed"
     }
     sleep() {
-      [[ "$1" == "$DELAYED_OTLP_PRE_EXPORT_WAIT_SECONDS" ]] || return 1
-      [[ "$request_calls" == "1" && "$absence_calls" == "1" &&
-        "$receiver_empty_calls" == "1" ]] || return 1
+      case "$sleep_calls" in
+        0)
+          [[ "$1" == "$JAVA_PROVIDER_RETRY_SETTLE_SECONDS" &&
+            "$request_calls" == "0" && "$absence_calls" == "1" &&
+            "$receiver_empty_calls" == "1" ]] || return 1
+          ;;
+        1)
+          [[ "$1" == "$DELAYED_OTLP_PRE_EXPORT_WAIT_SECONDS" &&
+            "$request_calls" == "1" && "$absence_calls" == "1" &&
+            "$receiver_empty_calls" == "1" ]] || return 1
+          ;;
+        *) return 1 ;;
+      esac
       printf 'sleep:%s\n' "$1" >>"$observed"
+      ((sleep_calls += 1))
+    }
+    wait_for_log() {
+      [[ "$1" == "java-backend" &&
+        "$2" == "OBI remote-parent provider ready" &&
+        "$3" == "delayed-otlp-suppression injected Java helper" &&
+        "$4" == "provider-cursor" && "$request_calls" == "1" ]] || return 1
+      printf 'provider-ready\n' >>"$observed"
     }
     wait_for_delayed_otlp_receiver_export() {
       [[ "$request_calls" == "1" && "$absence_calls" == "2" &&
@@ -3367,7 +3661,8 @@ test_delayed_otlp_suppression_control_has_one_pre_export_request() {
 
     execute_requested_scenarios
     [[ "$request_calls" == "1" && "$absence_calls" == "2" &&
-      "$receiver_empty_calls" == "1" && -z "$SCENARIO_VARIANT" ]]
+      "$receiver_empty_calls" == "1" && "$sleep_calls" == "2" &&
+      -z "$SCENARIO_VARIANT" ]]
   ) || {
     printf 'delayed OTLP suppression control did not preserve its request boundary\n' >&2
     return 1
@@ -3376,7 +3671,9 @@ test_delayed_otlp_suppression_control_has_one_pre_export_request() {
   printf '%s\n' \
     'receiver-empty:delayed-otlp-receiver-before-request.json' \
     'absent:duplicate-suppression-delayed-otlp-before-request.prom' \
+    "sleep:$JAVA_PROVIDER_RETRY_SETTLE_SECONDS" \
     'prime' \
+    'provider-ready' \
     'window:delayed-otlp-window.txt' \
     "sleep:$DELAYED_OTLP_PRE_EXPORT_WAIT_SECONDS" \
     'receiver-no-java:delayed-otlp-receiver-before-export.json' \
@@ -3404,6 +3701,7 @@ test_delayed_otlp_suppression_control_restores_schedule_delay() {
     SCENARIO=all
     TRANSPORT=getsockopt
     SCENARIO_VARIANT=""
+    DELAYED_OTLP_PROVIDER_READY_SINCE="provider-cursor"
     export OTEL_BSP_SCHEDULE_DELAY_VALUE=750
     delayed_otlp_earliest_export_millisecond() {
       printf '900000\n'
@@ -3430,6 +3728,13 @@ test_delayed_otlp_suppression_control_restores_schedule_delay() {
       [[ "$1" == "10" && "$2" == "curl" &&
         "$*" == *"$APACHE_HTTPS_HEALTH_ENDPOINT"* ]] || return 1
       printf 'prime\n' >>"$observed"
+    }
+    wait_for_log() {
+      [[ "$1" == "java-backend" &&
+        "$2" == "OBI remote-parent provider ready" &&
+        "$3" == "delayed-otlp-suppression injected Java helper" &&
+        "$4" == "provider-cursor" ]] || return 1
+      printf 'provider-ready\n' >>"$observed"
     }
     sleep() {
       printf 'sleep:%s\n' "$1" >>"$observed"
@@ -3467,7 +3772,9 @@ test_delayed_otlp_suppression_control_restores_schedule_delay() {
     "recreate:tcp:delayed-otlp-suppression startup:getsockopt:false:true:$DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS" \
     'receiver-empty:delayed-otlp-receiver-before-request.json' \
     'absent:duplicate-suppression-delayed-otlp-before-request.prom' \
+    "sleep:$JAVA_PROVIDER_RETRY_SETTLE_SECONDS" \
     'prime' \
+    'provider-ready' \
     'window:delayed-otlp-window.txt' \
     "sleep:$DELAYED_OTLP_PRE_EXPORT_WAIT_SECONDS" \
     'receiver-no-java:delayed-otlp-receiver-before-export.json' \
@@ -4759,6 +5066,12 @@ test_bridge_take_count_includes_cancelled_request() {
     printf 'timeout/retry bridge take count omitted the cancelled request\n' >&2
     return 1
   }
+  [[ "$(scenario_bridge_take_count coalesced-bridge)" == "2" && \
+    "$(scenario_java_missing_count coalesced-bridge true)" == "0" && \
+    "$(scenario_java_missing_count timeout-retry true)" == "0" ]] || {
+    printf 'in-band controls retained a diagnostic self-probe\n' >&2
+    return 1
+  }
   [[ "$(scenario_bridge_missing_count basic getsockopt)" == "0" &&
     "$(scenario_java_missing_count basic true)" == "1" ]] || {
     printf 'getsockopt diagnostics miss expectations were conflated\n' >&2
@@ -4775,13 +5088,13 @@ test_bridge_take_count_includes_cancelled_request() {
     return 1
   }
   [[ "$(scenario_bridge_missing_count tls-boundary getsockopt)" == "0" &&
-    "$(scenario_java_missing_count tls-boundary true)" == "4" ]] || {
-    printf 'getsockopt TLS-boundary miss expectations were not local-only\n' >&2
+    "$(scenario_java_missing_count tls-boundary true)" == "1" ]] || {
+    printf 'getsockopt TLS-boundary miss expectations included nested fixture traffic\n' >&2
     return 1
   }
-  [[ "$(scenario_bridge_missing_count tls-boundary unix)" == "3" &&
-    "$(scenario_java_missing_count tls-boundary true)" == "4" ]] || {
-    printf 'Unix TLS-boundary miss expectations included baseline diagnostics\n' >&2
+  [[ "$(scenario_bridge_missing_count tls-boundary unix)" == "0" &&
+    "$(scenario_java_missing_count tls-boundary true)" == "1" ]] || {
+    printf 'Unix TLS-boundary miss expectations included nested fixture traffic\n' >&2
     return 1
   }
 }
@@ -4831,6 +5144,235 @@ EOF
   sed -i 's/"wrong_parent_count": -1/"wrong_parent_count": 129/' "$result"
   if pressure_scenario_count "$result" wrong_parent_count 128 >/dev/null 2>&1; then
     printf 'pressure scenario result accepted a count above the request bound\n' >&2
+    return 1
+  fi
+}
+
+test_concurrency_overlap_reconciliation_is_exact() {
+  local -r result="$TEST_TMP_DIR/concurrency-reconciliation.json"
+  local -r mutated="$TEST_TMP_DIR/concurrency-reconciliation-mutated.json"
+
+  printf '%s\n' \
+    '{"status":"passed","scenario":"concurrency","request_count":4,"connection_evidence":{"frontend_connections":4,"frontend_protocol":"HTTP/1.1","distinct_backend_workers":4,"distinct_concurrency_arrivals":4,"concurrency_participants":4,"concurrency_max_active":4,"concurrency_release":7},"cases":[{"request":{"concurrency_batch":"c0000000000000007","concurrency_expected":4},"response":{"backend_worker_id":11,"backend_connection_id":1,"concurrency_batch":"c0000000000000007","concurrency_participants":4,"concurrency_max_active":4,"concurrency_arrival":1,"concurrency_release":7}},{"request":{"concurrency_batch":"c0000000000000007","concurrency_expected":4},"response":{"backend_worker_id":12,"backend_connection_id":2,"concurrency_batch":"c0000000000000007","concurrency_participants":4,"concurrency_max_active":4,"concurrency_arrival":2,"concurrency_release":7}},{"request":{"concurrency_batch":"c0000000000000007","concurrency_expected":4},"response":{"backend_worker_id":13,"backend_connection_id":3,"concurrency_batch":"c0000000000000007","concurrency_participants":4,"concurrency_max_active":4,"concurrency_arrival":3,"concurrency_release":7}},{"request":{"concurrency_batch":"c0000000000000007","concurrency_expected":4},"response":{"backend_worker_id":14,"backend_connection_id":4,"concurrency_batch":"c0000000000000007","concurrency_participants":4,"concurrency_max_active":4,"concurrency_arrival":4,"concurrency_release":7}}]}' \
+    >"$result"
+  [[ "$(concurrency_overlap_reconciliation "$result" 4 | \
+    jq -r '.distinct_concurrency_arrivals')" == "4" ]] || return 1
+  if concurrency_overlap_reconciliation "$result" 3 >/dev/null 2>&1; then
+    printf 'concurrency reconciliation accepted the wrong request count\n' >&2
+    return 1
+  fi
+
+  jq 'del(.connection_evidence.distinct_concurrency_arrivals)' \
+    "$result" >"$mutated"
+  if concurrency_overlap_reconciliation "$mutated" 4 >/dev/null 2>&1; then
+    printf 'concurrency reconciliation accepted missing distinct arrivals\n' >&2
+    return 1
+  fi
+  jq '.connection_evidence.distinct_concurrency_arrivals = "4"' \
+    "$result" >"$mutated"
+  if concurrency_overlap_reconciliation "$mutated" 4 >/dev/null 2>&1; then
+    printf 'concurrency reconciliation accepted string distinct arrivals\n' >&2
+    return 1
+  fi
+  jq '.connection_evidence.distinct_concurrency_arrivals = 0' \
+    "$result" >"$mutated"
+  if concurrency_overlap_reconciliation "$mutated" 4 >/dev/null 2>&1; then
+    printf 'concurrency reconciliation accepted zero distinct arrivals\n' >&2
+    return 1
+  fi
+  jq '.connection_evidence.distinct_concurrency_arrivals = 3' \
+    "$result" >"$mutated"
+  if concurrency_overlap_reconciliation "$mutated" 4 >/dev/null 2>&1; then
+    printf 'concurrency reconciliation accepted a missing distinct arrival\n' >&2
+    return 1
+  fi
+  jq 'del(.cases[0].request.concurrency_batch)' "$result" >"$mutated"
+  if concurrency_overlap_reconciliation "$mutated" 4 >/dev/null 2>&1; then
+    printf 'concurrency reconciliation accepted a missing request batch\n' >&2
+    return 1
+  fi
+  jq '.cases[0].request.concurrency_batch = "c0000000000000008"' \
+    "$result" >"$mutated"
+  if concurrency_overlap_reconciliation "$mutated" 4 >/dev/null 2>&1; then
+    printf 'concurrency reconciliation accepted mismatched request batches\n' >&2
+    return 1
+  fi
+  jq '.cases[0].request.concurrency_expected = 3' "$result" >"$mutated"
+  if concurrency_overlap_reconciliation "$mutated" 4 >/dev/null 2>&1; then
+    printf 'concurrency reconciliation accepted a wrong request barrier size\n' >&2
+    return 1
+  fi
+  jq 'del(.cases[0].response.concurrency_batch)' "$result" >"$mutated"
+  if concurrency_overlap_reconciliation "$mutated" 4 >/dev/null 2>&1; then
+    printf 'concurrency reconciliation accepted a missing response batch\n' >&2
+    return 1
+  fi
+  jq '.cases[0].response.concurrency_batch = "c0000000000000008"' \
+    "$result" >"$mutated"
+  if concurrency_overlap_reconciliation "$mutated" 4 >/dev/null 2>&1; then
+    printf 'concurrency reconciliation accepted a response from another batch\n' >&2
+    return 1
+  fi
+  jq 'del(.cases[0].response)' "$result" >"$mutated"
+  if concurrency_overlap_reconciliation "$mutated" 4 >/dev/null 2>&1; then
+    printf 'concurrency reconciliation accepted a missing response object\n' >&2
+    return 1
+  fi
+  jq '.cases[3].response.backend_worker_id = 11' "$result" >"$mutated"
+  if concurrency_overlap_reconciliation "$mutated" 4 >/dev/null 2>&1; then
+    printf 'concurrency reconciliation accepted a repeated worker\n' >&2
+    return 1
+  fi
+  jq '.cases[3].response.concurrency_arrival = 3' "$result" >"$mutated"
+  if concurrency_overlap_reconciliation "$mutated" 4 >/dev/null 2>&1; then
+    printf 'concurrency reconciliation accepted a duplicate arrival\n' >&2
+    return 1
+  fi
+  jq '.cases[3].response.concurrency_release = 8' "$result" >"$mutated"
+  if concurrency_overlap_reconciliation "$mutated" 4 >/dev/null 2>&1; then
+    printf 'concurrency reconciliation accepted a mismatched release\n' >&2
+    return 1
+  fi
+  jq '.cases[3].response.concurrency_participants = 3' "$result" >"$mutated"
+  if concurrency_overlap_reconciliation "$mutated" 4 >/dev/null 2>&1; then
+    printf 'concurrency reconciliation accepted incomplete participation\n' >&2
+    return 1
+  fi
+}
+
+test_reason_coded_scenario_reconciliation_is_exact() {
+  local -r coalesced="$TEST_TMP_DIR/coalesced-reconciliation.json"
+  local -r mutated="$TEST_TMP_DIR/reason-coded-reconciliation-mutated.json"
+  local -r timeout="$TEST_TMP_DIR/timeout-reconciliation.json"
+
+  printf '%s\n' \
+    '{"status":"passed","scenario":"coalesced-bridge","request_count":2,"coalesced_bridge_correlation":{"outcome":"supported_exact","exact_hit_count":2,"explicit_root_count":0,"wrong_parent_count":0,"unresolved_count":0,"source_client_candidates":2,"trigger_chain_proven":true,"discard_total_delta":0,"discard_ambiguous_delta":0}}' \
+    >"$coalesced"
+  [[ "$(coalesced_bridge_reconciliation "$coalesced" | jq -r '.outcome')" == \
+    "supported_exact" ]] || return 1
+  jq 'del(.coalesced_bridge_correlation.discard_total_delta)' \
+    "$coalesced" >"$mutated"
+  if coalesced_bridge_reconciliation "$mutated" >/dev/null 2>&1; then
+    printf 'coalesced reconciliation accepted a missing total discard count\n' >&2
+    return 1
+  fi
+  jq '.coalesced_bridge_correlation.discard_total_delta = null' \
+    "$coalesced" >"$mutated"
+  if coalesced_bridge_reconciliation "$mutated" >/dev/null 2>&1; then
+    printf 'coalesced reconciliation accepted a null total discard count\n' >&2
+    return 1
+  fi
+  jq '.coalesced_bridge_correlation.discard_total_delta = "0"' \
+    "$coalesced" >"$mutated"
+  if coalesced_bridge_reconciliation "$mutated" >/dev/null 2>&1; then
+    printf 'coalesced reconciliation accepted a string total discard count\n' >&2
+    return 1
+  fi
+  jq '.coalesced_bridge_correlation.discard_total_delta = 2' \
+    "$coalesced" >"$mutated"
+  if coalesced_bridge_reconciliation "$mutated" >/dev/null 2>&1; then
+    printf 'coalesced reconciliation accepted two total discards\n' >&2
+    return 1
+  fi
+  sed -i 's/"source_client_candidates":2/"source_client_candidates":1/' "$coalesced"
+  if coalesced_bridge_reconciliation "$coalesced" >/dev/null 2>&1; then
+    printf 'coalesced exact reconciliation accepted one source candidate for two parents\n' >&2
+    return 1
+  fi
+  sed -i 's/"source_client_candidates":1/"source_client_candidates":2/' "$coalesced"
+  sed -i 's/"discard_total_delta":0/"discard_total_delta":1/' "$coalesced"
+  if coalesced_bridge_reconciliation "$coalesced" >/dev/null 2>&1; then
+    printf 'coalesced exact reconciliation accepted an unexpected discard\n' >&2
+    return 1
+  fi
+  sed -i 's/"discard_total_delta":1/"discard_total_delta":0/' "$coalesced"
+  sed -i \
+    -e 's/"outcome":"supported_exact"/"outcome":"ambiguous_drop"/' \
+    -e 's/"exact_hit_count":2/"exact_hit_count":0/' \
+    -e 's/"explicit_root_count":0/"explicit_root_count":2/' \
+    -e 's/"discard_total_delta":0/"discard_total_delta":1/' \
+    -e 's/"discard_ambiguous_delta":0/"discard_ambiguous_delta":1/' \
+    "$coalesced"
+  [[ "$(coalesced_bridge_reconciliation "$coalesced" | jq -r '.outcome')" == \
+    "ambiguous_drop" ]] || return 1
+  sed -i 's/"source_client_candidates":2/"source_client_candidates":1/' "$coalesced"
+  if coalesced_bridge_reconciliation "$coalesced" >/dev/null 2>&1; then
+    printf 'coalesced ambiguous reconciliation accepted one source candidate\n' >&2
+    return 1
+  fi
+  sed -i 's/"source_client_candidates":1/"source_client_candidates":2/' "$coalesced"
+  sed -i 's/"discard_total_delta":1/"discard_total_delta":0/' "$coalesced"
+  if coalesced_bridge_reconciliation "$coalesced" >/dev/null 2>&1; then
+    printf 'coalesced ambiguous reconciliation accepted zero total discards\n' >&2
+    return 1
+  fi
+  sed -i 's/"discard_total_delta":0/"discard_total_delta":1/' "$coalesced"
+  sed -i 's/"wrong_parent_count":0/"wrong_parent_count":1/' "$coalesced"
+  if coalesced_bridge_reconciliation "$coalesced" >/dev/null 2>&1; then
+    printf 'coalesced reconciliation accepted a wrong parent\n' >&2
+    return 1
+  fi
+
+  printf '%s\n' \
+    '{"status":"passed","scenario":"timeout-retry","faults":[{"kind":"client-timeout","outcome":"deadline-exceeded-as-expected","marker":"timeout-retry-cancelled-42","parent_outcome":"exact","drop_reasons":[]}]}' \
+    >"$timeout"
+  [[ "$(timeout_cancellation_reconciliation "$timeout" | jq -r '.parent_outcome')" == \
+    "exact" ]] || return 1
+  jq 'del(.faults[0].drop_reasons)' "$timeout" >"$mutated"
+  if timeout_cancellation_reconciliation "$mutated" >/dev/null 2>&1; then
+    printf 'timeout reconciliation accepted missing drop reasons\n' >&2
+    return 1
+  fi
+  jq '.faults[0].drop_reasons = null' "$timeout" >"$mutated"
+  if timeout_cancellation_reconciliation "$mutated" >/dev/null 2>&1; then
+    printf 'timeout reconciliation accepted null drop reasons\n' >&2
+    return 1
+  fi
+  jq '.faults[0].drop_reasons = {}' "$timeout" >"$mutated"
+  if timeout_cancellation_reconciliation "$mutated" >/dev/null 2>&1; then
+    printf 'timeout reconciliation accepted object drop reasons\n' >&2
+    return 1
+  fi
+  jq '.faults[0].drop_reasons = ["valid"]' "$timeout" >"$mutated"
+  if timeout_cancellation_reconciliation "$mutated" >/dev/null 2>&1; then
+    printf 'timeout reconciliation accepted a non-failure drop reason\n' >&2
+    return 1
+  fi
+  jq '.faults[0].drop_reasons = ["timeout", "timeout"]' \
+    "$timeout" >"$mutated"
+  if timeout_cancellation_reconciliation "$mutated" >/dev/null 2>&1; then
+    printf 'timeout reconciliation accepted two identical drop reasons\n' >&2
+    return 1
+  fi
+  jq '.faults[0].parent_outcome = "missing" | .faults[0].drop_reasons = ["timeout"]' \
+    "$timeout" >"$mutated"
+  if timeout_cancellation_reconciliation "$mutated" >/dev/null 2>&1; then
+    printf 'timeout missing-parent reconciliation accepted a drop reason\n' >&2
+    return 1
+  fi
+  sed -i 's/"drop_reasons":\[\]/"drop_reasons":["ambiguous"]/' "$timeout"
+  if timeout_cancellation_reconciliation "$timeout" >/dev/null 2>&1; then
+    printf 'timeout exact reconciliation accepted an unrelated discard reason\n' >&2
+    return 1
+  fi
+  sed -i 's/"drop_reasons":\["ambiguous"\]/"drop_reasons":[]/' "$timeout"
+  sed -i \
+    -e 's/"parent_outcome":"exact"/"parent_outcome":"reason_coded_drop"/' \
+    -e 's/"drop_reasons":\[\]/"drop_reasons":["ambiguous"]/' \
+    "$timeout"
+  [[ "$(timeout_cancellation_reconciliation "$timeout" | jq -r '.drop_reasons[0]')" == \
+    "ambiguous" ]] || return 1
+  sed -i 's/"ambiguous"/"ambiguous","missing"/' "$timeout"
+  if timeout_cancellation_reconciliation "$timeout" >/dev/null 2>&1; then
+    printf 'timeout reconciliation accepted multiple drop reasons\n' >&2
+    return 1
+  fi
+  sed -i \
+    -e 's/"parent_outcome":"reason_coded_drop"/"parent_outcome":"wrong_parent"/' \
+    -e 's/"drop_reasons":\["ambiguous","missing"\]/"drop_reasons":[]/' \
+    "$timeout"
+  if timeout_cancellation_reconciliation "$timeout" >/dev/null 2>&1; then
+    printf 'timeout reconciliation accepted a wrong parent\n' >&2
     return 1
   fi
 }
@@ -4943,6 +5485,108 @@ EOF
     "$helper_delta"
   if assert_bridge_metric_delta "$helper_delta" unix 0 0 0 1 0 >/dev/null 2>&1; then
     printf 'bridge metric delta accepted a Java take without a helper\n' >&2
+    return 1
+  fi
+}
+
+test_coalesced_bridge_metrics_follow_explicit_outcome() {
+  local -r delta="$TEST_TMP_DIR/coalesced-bridge.delta"
+
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=0 after=2 delta=2' \
+    'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} before=0 after=2 delta=2' \
+    'obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=0 after=2 delta=2' \
+    'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} before=0 after=2 delta=2' \
+    >"$delta"
+  assert_coalesced_bridge_metric_delta "$delta" getsockopt supported_exact || {
+    printf 'coalesced bridge metrics rejected the explicit exact outcome\n' >&2
+    return 1
+  }
+
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=0 after=1 delta=1' \
+    'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} before=0 after=1 delta=1' \
+    'obi_java_remote_parent_operations_total{operation="inject",status="ambiguous",transport="tcp"} before=0 after=1 delta=1' \
+    'obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=0 after=0 delta=0' \
+    'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} before=0 after=0 delta=0' \
+    >"$delta"
+  assert_coalesced_bridge_metric_delta "$delta" getsockopt ambiguous_drop || {
+    printf 'coalesced bridge metrics rejected the explicit ambiguous outcome\n' >&2
+    return 1
+  }
+  sed -i \
+    's/operation="take",status="valid",transport="getsockopt"} before=0 after=0 delta=0/operation="take",status="valid",transport="getsockopt"} before=0 after=1 delta=1/' \
+    "$delta"
+  if assert_coalesced_bridge_metric_delta \
+    "$delta" getsockopt ambiguous_drop >/dev/null 2>&1; then
+    printf 'coalesced ambiguous metrics accepted a valid Java take\n' >&2
+    return 1
+  fi
+}
+
+test_timeout_cancellation_metrics_follow_explicit_outcome() {
+  local -r delta="$TEST_TMP_DIR/timeout-cancellation.delta"
+  local local_reason=""
+
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=0 after=2 delta=2' \
+    'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} before=0 after=2 delta=2' \
+    'obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=0 after=2 delta=2' \
+    'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} before=0 after=2 delta=2' \
+    >"$delta"
+  assert_timeout_cancellation_metric_delta \
+    "$delta" getsockopt exact 2 || {
+    printf 'timeout cancellation metrics rejected the exact parent outcome\n' >&2
+    return 1
+  }
+
+  sed -i \
+    -e 's/operation="stage",status="valid",transport="tcp"} before=0 after=2 delta=2/operation="stage",status="valid",transport="tcp"} before=0 after=1 delta=1/' \
+    -e 's/operation="take",status="valid",transport="getsockopt"} before=0 after=2 delta=2/operation="take",status="valid",transport="getsockopt"} before=0 after=1 delta=1/' \
+    "$delta"
+  assert_timeout_cancellation_metric_delta \
+    "$delta" getsockopt missing 1 || {
+    printf 'timeout cancellation metrics rejected the missing parent outcome\n' >&2
+    return 1
+  }
+  for local_reason in ambiguous unsupported stale; do
+    assert_timeout_cancellation_metric_delta \
+      "$delta" getsockopt reason_coded_drop 1 "$local_reason" || {
+      printf 'timeout cancellation metrics rejected local %s without a BPF discard\n' \
+        "$local_reason" >&2
+      return 1
+    }
+  done
+  if assert_timeout_cancellation_metric_delta \
+    "$delta" getsockopt reason_coded_drop 1 timeout >/dev/null 2>&1; then
+    printf 'timeout cancellation metrics accepted a native-only reason without a BPF discard\n' >&2
+    return 1
+  fi
+
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="discard",status="ambiguous",transport="getsockopt"} before=0 after=1 delta=1' \
+    >>"$delta"
+  assert_timeout_cancellation_metric_delta \
+    "$delta" getsockopt reason_coded_drop 1 ambiguous || {
+    printf 'timeout cancellation metrics rejected the reason-coded discard\n' >&2
+    return 1
+  }
+  if assert_timeout_cancellation_metric_delta \
+    "$delta" getsockopt reason_coded_drop 1 stale >/dev/null 2>&1; then
+    printf 'timeout cancellation metrics accepted the wrong discard reason\n' >&2
+    return 1
+  fi
+  if assert_timeout_cancellation_metric_delta \
+    "$delta" getsockopt missing 1 >/dev/null 2>&1; then
+    printf 'timeout cancellation metrics accepted a discard for a missing parent\n' >&2
+    return 1
+  fi
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="discard",status="timeout",transport="getsockopt"} before=0 after=1 delta=1' \
+    >>"$delta"
+  if assert_timeout_cancellation_metric_delta \
+    "$delta" getsockopt reason_coded_drop 1 ambiguous >/dev/null 2>&1; then
+    printf 'timeout cancellation metrics accepted two discard outcomes\n' >&2
     return 1
   fi
 }
@@ -6455,6 +7099,52 @@ test_java_diagnostics_delta_is_exact() {
   }
 }
 
+test_reason_coded_control_diagnostics_are_exact() {
+  local -r before="$TEST_TMP_DIR/reason-coded-before.txt"
+  local -r after="$TEST_TMP_DIR/reason-coded-after.txt"
+  local -r delta="$TEST_TMP_DIR/reason-coded.delta"
+  local reconciliation=""
+
+  write_diagnostics_fixture "$before" 0 0 0 0 0 0
+  write_diagnostics_fixture "$after" 2 0 0 2 0 0
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  assert_coalesced_bridge_diagnostics_delta "$delta" supported_exact || return 1
+
+  write_diagnostics_fixture "$after" 0 0 0 0 0 0
+  sed -i 's/d_ambiguous=0/d_ambiguous=1/' "$after"
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  assert_coalesced_bridge_diagnostics_delta "$delta" ambiguous_drop || return 1
+  sed -i 's/d_missing before=0 after=0 delta=0/d_missing before=0 after=1 delta=1/' \
+    "$delta"
+  if assert_coalesced_bridge_diagnostics_delta \
+    "$delta" ambiguous_drop >/dev/null 2>&1; then
+    printf 'coalesced diagnostics accepted a second discard reason\n' >&2
+    return 1
+  fi
+
+  reconciliation='{"parent_outcome":"exact","drop_reasons":[]}'
+  write_diagnostics_fixture "$after" 2 0 0 2 0 0
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  assert_timeout_cancellation_diagnostics_delta "$delta" "$reconciliation" || return 1
+
+  reconciliation='{"parent_outcome":"missing","drop_reasons":[]}'
+  write_diagnostics_fixture "$after" 1 0 0 1 0 0
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  assert_timeout_cancellation_diagnostics_delta "$delta" "$reconciliation" || return 1
+
+  reconciliation='{"parent_outcome":"reason_coded_drop","drop_reasons":["timeout"]}'
+  sed -i 's/d_timeout=0/d_timeout=1/' "$after"
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  assert_timeout_cancellation_diagnostics_delta "$delta" "$reconciliation" || return 1
+  sed -i 's/take_sampled before=0 after=1 delta=1/take_sampled before=0 after=0 delta=0/' \
+    "$delta"
+  if assert_timeout_cancellation_diagnostics_delta \
+    "$delta" "$reconciliation" >/dev/null 2>&1; then
+    printf 'timeout diagnostics accepted changed trace flags\n' >&2
+    return 1
+  fi
+}
+
 test_pressure_unix_already_consumed_diagnostics_are_exact() {
   local -r before="$TEST_TMP_DIR/pressure-unix-before.txt"
   local -r after="$TEST_TMP_DIR/pressure-unix-after.txt"
@@ -7287,6 +7977,7 @@ test_scenario_fences_metrics_around_diagnostics() {
     local -r call_log="$TEST_TMP_DIR/scenario-$name.calls"
     local boundary_ran=false
     local expected_requests=0
+    local expected_calls_file="$RESULT_DIR/expected.calls"
 
     RESULT_DIR="$TEST_TMP_DIR/scenario-$name"
     mkdir -p -- "$RESULT_DIR"
@@ -7312,6 +8003,18 @@ test_scenario_fences_metrics_around_diagnostics() {
       printf 'evidence:%s\n' "$1" >>"$call_log"
       mkdir -p -- "$RESULT_DIR/phases/$1"
       printf '# empty\n' >"$RESULT_DIR/phases/$1/obi-metrics.prom"
+    }
+    capture_receive_cursor_map_baseline() {
+      printf 'cursor-map-before:%s\n' "$1" >>"$call_log"
+      RECEIVE_CURSOR_MAP_ID=41
+      RECEIVE_GUARD_MAP_ID=42
+      RECEIVE_CURSOR_MAP_BASELINE_ENTRIES=0
+      RECEIVE_GUARD_MAP_BASELINE_ENTRIES=0
+      RECEIVE_CURSOR_MAP_STATUS_JSON="null"
+    }
+    wait_for_receive_cursor_map_recovery() {
+      printf 'cursor-map-after:%s\n' "$1" >>"$call_log"
+      RECEIVE_CURSOR_MAP_STATUS_JSON='{"status":"passed"}'
     }
     run_bounded() {
       local request_argument=default
@@ -7349,10 +8052,23 @@ test_scenario_fences_metrics_around_diagnostics() {
     run_scenario "$name" >/dev/null || return $?
 
     expected_requests="$(scenario_bridge_take_count "$name")"
-    [[ "$(<"$call_log")" == "$(printf \
-      'boundary:%s\ndiagnostics:%s-before\nwait:0:0\nevidence:%s-before\nscenario:%s\nwait:%d:%d\nevidence:%s-after\ndiagnostics:%s-after' \
-      "$name" "$name" "$name" "$wanted_request_argument" \
-      "$expected_requests" "$expected_requests" "$name" "$name")" ]]
+    {
+      printf 'boundary:%s\n' "$name"
+      printf 'diagnostics:%s-before\n' "$name"
+      printf 'wait:0:0\n'
+      printf 'evidence:%s-before\n' "$name"
+      if [[ "$name" == "tls-boundary" ]]; then
+        printf 'cursor-map-before:%s\n' "$name"
+      fi
+      printf 'scenario:%s\n' "$wanted_request_argument"
+      if [[ "$name" == "tls-boundary" ]]; then
+        printf 'cursor-map-after:%s\n' "$name"
+      fi
+      printf 'wait:%d:%d\n' "$expected_requests" "$expected_requests"
+      printf 'evidence:%s-after\n' "$name"
+      printf 'diagnostics:%s-after\n' "$name"
+    } >"$expected_calls_file"
+    cmp -s -- "$expected_calls_file" "$call_log"
   )
 
   run_accounting_case basic 1 1 1 1 0 0 1 || {
@@ -7367,7 +8083,7 @@ test_scenario_fences_metrics_around_diagnostics() {
     printf 'targeted keepalive request count was not forwarded and accounted\n' >&2
     return 1
   }
-  run_accounting_case tls-boundary 0 2 4 2 0 0 2 || {
+  run_accounting_case tls-boundary 0 3 1 3 0 0 3 || {
     printf 'TLS-boundary scenario did not fence metrics around diagnostics\n' >&2
     return 1
   }
@@ -9096,16 +9812,17 @@ test_instrumented_readiness_precedes_https_traffic() {
     'compose:up' \
     'http:trace receiver' \
     'log:OBI remote-parent bridge' \
-    'log:injected Java helper' \
     'log:external OTel extension' \
     'log:Jetty HTTPS backend' \
     'log:Netty HTTPS backend' \
     'log:TLS boundary split HTTPS backend' \
     'log:TLS boundary coalesced HTTPS backend' \
-    'transport' \
     'log:injected Java instrumentation' \
     'apache:startup' \
+    'http:live coalesced-request source' \
     'http:verified Apache-to-Jetty HTTPS path' \
+    'log:injected Java helper' \
+    'transport' \
     'diagnostic-denials' \
     'runtime' >"$expected"
   cmp -s -- "$expected" "$observed" || {
@@ -9173,7 +9890,7 @@ test_delayed_otlp_startup_avoids_java_traffic() {
       return 0
     }
     run_logged_bounded() {
-      [[ "$*" == *"up --build --detach --force-recreate trace-receiver java-backend apache-proxy obi"* ]] ||
+      [[ "$*" == *"up --build --detach --force-recreate trace-receiver java-backend coalesced-source apache-proxy obi"* ]] ||
         return 1
       printf 'compose:up\n' >>"$observed"
     }
@@ -9203,7 +9920,8 @@ test_delayed_otlp_startup_avoids_java_traffic() {
     }
 
     start_stack
-    [[ "$STACK_STARTED" == "true" && "$BRIDGE_RUNNING" == "true" ]]
+    [[ "$STACK_STARTED" == "true" && "$BRIDGE_RUNNING" == "true" &&
+      "$DELAYED_OTLP_PROVIDER_READY_SINCE" == "startup-cursor" ]]
   ) || {
     printf 'delayed OTLP startup generated Java traffic before its control\n' >&2
     return 1
@@ -9214,7 +9932,6 @@ test_delayed_otlp_startup_avoids_java_traffic() {
     'compose:up' \
     'http:trace receiver' \
     'log:OBI remote-parent bridge' \
-    'log:injected Java helper' \
     'log:external OTel extension' \
     'log:Jetty HTTPS backend' \
     'log:Netty HTTPS backend' \
@@ -9266,8 +9983,10 @@ test_delayed_otlp_recreate_avoids_java_traffic() {
       return 1
     }
 
+    DELAYED_OTLP_PROVIDER_READY_SINCE=""
     recreate_instrumented_stack tcp delayed-otlp-suppression getsockopt false true
-    [[ "$BRIDGE_RUNNING" == "true" && -z "$SELECTED_TRANSPORT" ]]
+    [[ "$BRIDGE_RUNNING" == "true" && -z "$SELECTED_TRANSPORT" &&
+      "$DELAYED_OTLP_PROVIDER_READY_SINCE" == "recreate-cursor" ]]
   ) || {
     printf 'delayed OTLP recreation generated Java traffic before its control\n' >&2
     return 1
@@ -9277,7 +9996,6 @@ test_delayed_otlp_recreate_avoids_java_traffic() {
     'compose:180 test-compose up --detach --force-recreate trace-receiver java-backend apache-proxy obi' \
     'http:delayed-otlp-suppression trace receiver' \
     'log:delayed-otlp-suppression OBI remote-parent bridge' \
-    'log:delayed-otlp-suppression injected Java helper' \
     'log:delayed-otlp-suppression external OTel extension' \
     'log:delayed-otlp-suppression injected Java instrumentation' \
     'log:delayed-otlp-suppression Jetty HTTPS backend' \
@@ -9690,16 +10408,16 @@ test_recreated_stack_readiness_uses_log_cursor() {
   printf '%s\n' \
     'compose:180 test-compose up --detach --force-recreate java-backend apache-proxy obi' \
     'log:restoration OBI remote-parent bridge:recreate-cursor' \
-    'log:restoration injected Java helper:recreate-cursor' \
     'log:restoration external OTel extension:recreate-cursor' \
     'log:restoration injected Java instrumentation:recreate-cursor' \
     'log:restoration Jetty HTTPS backend:recreate-cursor' \
     'log:restoration Netty HTTPS backend:recreate-cursor' \
     'log:restoration TLS boundary split HTTPS backend:recreate-cursor' \
     'log:restoration TLS boundary coalesced HTTPS backend:recreate-cursor' \
-    'transport:unix:unix' \
     'apache:recreate-instrumented' \
     'http:restoration HTTPS path' \
+    'log:restoration injected Java helper:recreate-cursor' \
+    'transport:unix:unix' \
     'suppression:duplicate-suppression-restoration.prom' >"$expected"
   cmp -s -- "$expected" "$observed" || {
     printf 'recreated stack used stale readiness evidence\n' >&2
@@ -12877,7 +13595,7 @@ test_demo_diagnostics_are_loopback_only() {
   ' "$apache_config"
   grep -Fq 'address: 127.0.0.1' "$obi_config"
   grep -Fqx '  buffer_sizes:' "$obi_config"
-  grep -Fqx '    http: 8192' "$obi_config"
+  grep -Fqx '    http: 32768' "$obi_config"
   grep -Fqx '                - X-OBI-Demo-ID' "$obi_config"
 }
 
@@ -13408,7 +14126,10 @@ main() {
   test_primary_w3c_fault_scenario_arms_after_the_baseline
   test_primary_w3c_fault_control_restores_the_base_stack
   test_security_accepts_enabled_transports
-  test_tls_boundary_requires_both_deterministic_modes
+  test_tls_boundary_requires_split_and_coalesced_pair
+  test_coalesced_bridge_requires_exact_live_pair
+  test_tls_boundary_receive_cursor_map_evidence_is_exact_and_steady
+  test_receive_cursor_map_helper_bounds_evidence_before_replay
   test_w3c_match_uses_controlled_unix_fixture
   test_matching_bridge_sequence_is_exact
   test_matching_bridge_start_failure_is_cleaned_up
@@ -13449,7 +14170,11 @@ main() {
   test_map_pressure_canonical_promotion_rolls_back_partial_files
   test_bridge_take_count_includes_cancelled_request
   test_pressure_scenario_counts_are_unique_and_bounded
+  test_concurrency_overlap_reconciliation_is_exact
+  test_reason_coded_scenario_reconciliation_is_exact
   test_bridge_metric_delta_requires_exact_one_shot_results
+  test_coalesced_bridge_metrics_follow_explicit_outcome
+  test_timeout_cancellation_metrics_follow_explicit_outcome
   test_pressure_bridge_reconciliation_preserves_failure_reasons
   test_primary_security_metrics_are_explicitly_scoped
   test_primary_security_identity_requires_same_cgroup_and_nonroot_user
@@ -13477,6 +14202,7 @@ main() {
   test_unix_endpoint_restart_invalidates_before_stack_mutation
   test_java_diagnostics_schema_is_exact
   test_java_diagnostics_delta_is_exact
+  test_reason_coded_control_diagnostics_are_exact
   test_pressure_unix_already_consumed_diagnostics_are_exact
   test_java_diagnostics_header_is_exact_and_piggybacked
   test_pre_stop_diagnostics_failure_does_not_stop_obi

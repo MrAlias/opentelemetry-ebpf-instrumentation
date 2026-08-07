@@ -43,6 +43,18 @@ PRESSURE_HELPER_TIMEOUT_SECONDS=60
 PRESSURE_CLEANUP_MAX_ATTEMPTS=3
 PRESSURE_CLEANUP_DEADLINE_SECONDS=180
 PRESSURE_MAX_ENTRIES=50000
+RECEIVE_CURSOR_MAP_MAX_ENTRIES=10000
+RECEIVE_CURSOR_MAP_RECOVERY_TIMEOUT_SECONDS=10
+RECEIVE_CURSOR_MAP_RECOVERY_CONSECUTIVE_SAMPLES=2
+RECEIVE_CURSOR_MAP_HELPER_TIMEOUT_SECONDS=60
+RECEIVE_CURSOR_HELPER_STDOUT_MAX_BYTES=4096
+RECEIVE_CURSOR_HELPER_STDOUT_MAX_LINES=1
+RECEIVE_CURSOR_HELPER_STDERR_MAX_BYTES=65536
+RECEIVE_CURSOR_HELPER_STDERR_MAX_LINES=512
+PRESSURE_RESULT_MAX_BYTES=4096
+PRESSURE_RESULT_MAX_LINES=1
+SCENARIO_RECONCILIATION_MAX_BYTES=8388608
+SCENARIO_RECONCILIATION_MAX_LINES=131072
 # Sum explicit metric, readiness, Docker, release, and final-attempt overrun bounds.
 SECURITY_PROBE_SCENARIO_BUDGET_SECONDS=232
 SECURITY_PROBE_SAME_CGROUP_FIXED_BUDGET_SECONDS=193
@@ -107,6 +119,17 @@ readonly PRESSURE_ENTRY_TTL_SECONDS
 readonly PRESSURE_RECOVERY_TIMEOUT_SECONDS PRESSURE_RECOVERY_CONSECUTIVE_SAMPLES
 readonly PRESSURE_HELPER_TIMEOUT_SECONDS PRESSURE_CLEANUP_MAX_ATTEMPTS
 readonly PRESSURE_CLEANUP_DEADLINE_SECONDS PRESSURE_MAX_ENTRIES
+readonly RECEIVE_CURSOR_MAP_MAX_ENTRIES
+readonly RECEIVE_CURSOR_MAP_RECOVERY_TIMEOUT_SECONDS
+readonly RECEIVE_CURSOR_MAP_RECOVERY_CONSECUTIVE_SAMPLES
+readonly RECEIVE_CURSOR_MAP_HELPER_TIMEOUT_SECONDS
+readonly RECEIVE_CURSOR_HELPER_STDOUT_MAX_BYTES
+readonly RECEIVE_CURSOR_HELPER_STDOUT_MAX_LINES
+readonly RECEIVE_CURSOR_HELPER_STDERR_MAX_BYTES
+readonly RECEIVE_CURSOR_HELPER_STDERR_MAX_LINES
+readonly PRESSURE_RESULT_MAX_BYTES PRESSURE_RESULT_MAX_LINES
+readonly SCENARIO_RECONCILIATION_MAX_BYTES
+readonly SCENARIO_RECONCILIATION_MAX_LINES
 readonly SECURITY_PROBE_SCENARIO_BUDGET_SECONDS
 readonly SECURITY_PROBE_SAME_CGROUP_FIXED_BUDGET_SECONDS
 readonly SECURITY_PROBE_SIBLING_FIXED_BUDGET_SECONDS
@@ -209,11 +232,17 @@ PRESSURE_MONITOR_OUTPUT=""
 PRESSURE_MONITOR_FINAL_OUTPUT=""
 PRESSURE_MONITOR_STATUS=0
 PRESSURE_INJECT_TARGET=""
+RECEIVE_CURSOR_MAP_ID=""
+RECEIVE_GUARD_MAP_ID=""
+RECEIVE_CURSOR_MAP_BASELINE_ENTRIES=""
+RECEIVE_GUARD_MAP_BASELINE_ENTRIES=""
+RECEIVE_CURSOR_MAP_STATUS_JSON="null"
 FAULT_MODE="alternating"
 FAULT_REQUEST_COUNT=2
 W3C_FAULT_DIAGNOSTICS_PREVIOUS=""
 MATCHING_VALID_TAKES=1
 SCENARIO_VARIANT=""
+DELAYED_OTLP_PROVIDER_READY_SINCE=""
 SECURITY_PROBE_MODE="abuse"
 SECURITY_PROBE_TIMEOUT="60s"
 PRIMARY_SECURITY_SAME_CGROUP_TIMEOUT="60s"
@@ -262,7 +291,7 @@ Options:
   --tls VERSION           TLSv1.2 or TLSv1.3. Default: TLSv1.3
   --scenario NAME         all, basic, keepalive, pipelining, concurrency,
                           connection-churn, fd-port-reuse, slow-body, tls-boundary,
-                          timeout-retry,
+                          coalesced-bridge, timeout-retry,
                           pressure, handoff, virtual-thread, netty, netty-server, dispatch,
                           w3c, w3c-match, obi-flags, w3c-fault, primary-w3c-fault,
                           primary-w3c-stale, unix-w3c-stale, w3c-only,
@@ -285,7 +314,7 @@ Options:
 
 The all scenario runs basic, keepalive, HTTP/1.1 pipelining, concurrency,
 connection churn, fd/ephemeral-port reuse, slow-body, deterministic TLS receive
-boundaries, timeout/retry, pressure,
+boundaries, the live coalesced receive control, timeout/retry, pressure,
 executor/virtual-thread/Netty handoff, inbound Netty TLS, async redispatch, W3C
 precedence/match/flags/fault/no-state controls, the primary stale-record control,
 the primary malformed-response control,
@@ -452,7 +481,7 @@ parse_args() {
       ;;
   esac
   case "$SCENARIO" in
-    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|timeout-retry|pressure|handoff|virtual-thread|netty|netty-server|dispatch|w3c|w3c-match|obi-flags|w3c-fault|primary-w3c-fault|primary-w3c-stale|unix-w3c-stale|w3c-only|security|restart-fault|helper-attach-failure|delayed-otlp-suppression|assertion-failure|fail-open|restart|disabled|uninstrumented|benchmark-disabled|benchmark-uninstrumented)
+    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|coalesced-bridge|timeout-retry|pressure|handoff|virtual-thread|netty|netty-server|dispatch|w3c|w3c-match|obi-flags|w3c-fault|primary-w3c-fault|primary-w3c-stale|unix-w3c-stale|w3c-only|security|restart-fault|helper-attach-failure|delayed-otlp-suppression|assertion-failure|fail-open|restart|disabled|uninstrumented|benchmark-disabled|benchmark-uninstrumented)
       ;;
     *)
       die "unsupported scenario: $SCENARIO"
@@ -516,12 +545,20 @@ parse_args() {
     "$REQUEST_COUNT" != "0" && "$REQUEST_COUNT" -lt 3 ]]; then
     die "the $SCENARIO scenario requires at least three requests"
   fi
+  if [[ "$SCENARIO" == "concurrency" && "$REQUEST_COUNT" != "0" ]] &&
+    ((REQUEST_COUNT < 2 || REQUEST_COUNT > 64)); then
+    die "the concurrency scenario requires between two and 64 requests"
+  fi
   if [[ "$SCENARIO" == "fd-port-reuse" && "$REQUEST_COUNT" == "1" ]]; then
     die "the fd-port-reuse scenario requires at least two requests"
   fi
   if [[ "$SCENARIO" == "tls-boundary" && "$REQUEST_COUNT" != "0" && \
+    "$REQUEST_COUNT" != "3" ]]; then
+    die "the tls-boundary scenario requires exactly three requests"
+  fi
+  if [[ "$SCENARIO" == "coalesced-bridge" && "$REQUEST_COUNT" != "0" && \
     "$REQUEST_COUNT" != "2" ]]; then
-    die "the tls-boundary scenario requires exactly two requests"
+    die "the coalesced-bridge scenario requires exactly two requests"
   fi
   if [[ "$SCENARIO" == "assertion-failure" ]]; then
     mark_non_acceptance "deliberate-assertion-failure"
@@ -2117,6 +2154,9 @@ start_stack() {
     assert_sealed_source_snapshot_is_private
   fi
   startup_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" || return $?
+  if [[ "$SCENARIO" == "delayed-otlp-suppression" ]]; then
+    DELAYED_OTLP_PROVIDER_READY_SINCE="$startup_since"
+  fi
   STACK_STARTED=true
   if [[ "$SCENARIO" == "delayed-otlp-suppression" ]]; then
     recreate_arguments=(--force-recreate)
@@ -2124,11 +2164,11 @@ start_stack() {
   if uses_uninstrumented_runtime; then
     run_logged_bounded "$RESULT_DIR/compose-up.log" "$COMMAND_TIMEOUT_SECONDS" \
       "${COMPOSE[@]}" up --build --detach "${recreate_arguments[@]}" \
-        trace-receiver java-backend apache-proxy || start_status=$?
+        trace-receiver java-backend coalesced-source apache-proxy || start_status=$?
   else
     run_logged_bounded "$RESULT_DIR/compose-up.log" "$COMMAND_TIMEOUT_SECONDS" \
       "${COMPOSE[@]}" up --build --detach "${recreate_arguments[@]}" \
-        trace-receiver java-backend apache-proxy obi || start_status=$?
+        trace-receiver java-backend coalesced-source apache-proxy obi || start_status=$?
   fi
   if ((start_status != 0)); then
     return "$start_status"
@@ -2144,11 +2184,6 @@ start_stack() {
       obi \
       "Java remote parent bridge ready" \
       "OBI remote-parent bridge" \
-      "$startup_since" || return $?
-    wait_for_log \
-      java-backend \
-      "OBI remote-parent provider ready" \
-      "injected Java helper" \
       "$startup_since" || return $?
     wait_for_log \
       java-backend \
@@ -2175,9 +2210,6 @@ start_stack() {
       "TLS boundary coalesced HTTPS backend ready on 127.0.0.1:18446" \
       "TLS boundary coalesced HTTPS backend" \
       "$startup_since" || return $?
-    if [[ "$SCENARIO" != "delayed-otlp-suppression" ]]; then
-      assert_selected_transport || return $?
-    fi
   elif ! uses_uninstrumented_runtime; then
     wait_for_log \
       java-backend \
@@ -2202,8 +2234,22 @@ start_stack() {
     return 0
   fi
   wait_for_http \
+    "http://127.0.0.1:18081/healthz" \
+    "live coalesced-request source" || return $?
+  wait_for_http \
     "$APACHE_HTTPS_HEALTH_ENDPOINT" \
     "verified Apache-to-Jetty HTTPS path" || return $?
+  if [[ "$TRANSPORT" != "disabled" ]]; then
+    # A provider registration attempted before the bridge is ready is retried
+    # when Java next handles TLS traffic. Use the bounded health request as that
+    # activation probe, then require the provider and selected transport.
+    wait_for_log \
+      java-backend \
+      "OBI remote-parent provider ready" \
+      "injected Java helper" \
+      "$startup_since" || return $?
+    assert_selected_transport || return $?
+  fi
   assert_apache_denies_java_diagnostics || return $?
   assert_runtime_contract "$runtime_contract_mode" || return $?
 }
@@ -3763,6 +3809,17 @@ is_w3c_stale_scenario() {
   esac
 }
 
+scenario_uses_in_band_java_diagnostics() {
+  case "$1" in
+    coalesced-bridge|timeout-retry)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 scenario_request_count() {
   local -r name="$1"
 
@@ -3775,6 +3832,10 @@ scenario_request_count() {
     return
   fi
   if [[ "$name" == "tls-boundary" ]]; then
+    printf '3\n'
+    return
+  fi
+  if [[ "$name" == "coalesced-bridge" ]]; then
     printf '2\n'
     return
   fi
@@ -3832,14 +3893,17 @@ scenario_java_missing_count() {
   local -r diagnostics_enabled="$2"
   local count=0
 
+  # Coalesced and timeout controls return their terminal snapshot in-band.
+  # They must not add a diagnostic self-probe after the measured workload.
+  if [[ "$name" == "coalesced-bridge" || "$name" == "timeout-retry" ]]; then
+    printf '0\n'
+    return
+  fi
   # Forced stale controls take their terminal snapshot from the marked
   # workload response, so they do not issue the ordinary diagnostic self probe.
   if [[ "$name" != "w3c-fault" && "$diagnostics_enabled" == "true" ]] &&
     ! is_w3c_stale_scenario "$name"; then
     count=1
-  fi
-  if [[ "$name" == "tls-boundary" ]]; then
-    count="$((count + 3))"
   fi
   printf '%d\n' "$count"
 }
@@ -3848,11 +3912,150 @@ scenario_bridge_missing_count() {
   local -r name="$1"
   local -r transport="$2"
 
-  if [[ "$transport" == "unix" && "$name" == "tls-boundary" ]]; then
-    printf '3\n'
-    return
-  fi
-  printf '0\n'
+	printf '0\n'
+}
+
+concurrency_overlap_reconciliation() {
+	local -r input="$1"
+	local expected="$2"
+
+	bounded_evidence_file \
+		"$input" \
+		"$SCENARIO_RECONCILIATION_MAX_BYTES" \
+		"$SCENARIO_RECONCILIATION_MAX_LINES" || return 1
+	expected="$(bounded_decimal "$expected" 64 false)" || return 1
+	((expected >= 2)) || return 1
+	jq -ce --argjson expected "$expected" '
+		def positive_integer:
+			type == "number" and floor == . and . >= 1 and . <= 9007199254740991;
+		. as $result |
+		if
+			$result.status == "passed" and
+			$result.scenario == "concurrency" and
+			$result.request_count == $expected and
+			($result.connection_evidence | type == "object") and
+			($result.cases | type == "array" and length == $expected)
+		then
+			$result.connection_evidence as $e |
+			($result.cases | map(.request)) as $requests |
+			($result.cases | map(.response)) as $responses |
+			($requests | map(.concurrency_batch)) as $request_batches |
+			($request_batches[0]) as $batch |
+			($responses | map(.backend_worker_id)) as $workers |
+			($responses | map(.backend_connection_id)) as $connections |
+			($responses | map(.concurrency_arrival)) as $arrivals |
+			($responses | map(.concurrency_release)) as $releases |
+			if
+				$e.frontend_connections == $expected and
+				$e.frontend_protocol == "HTTP/1.1" and
+				$e.distinct_backend_workers == $expected and
+				$e.distinct_concurrency_arrivals == $expected and
+				$e.concurrency_participants == $expected and
+				$e.concurrency_max_active == $expected and
+				($e.concurrency_release | positive_integer) and
+				($batch | type == "string" and test("^c[0-9a-f]{16}$")) and
+				($request_batches | unique | length == 1) and
+				all($requests[];
+					type == "object" and
+					.concurrency_batch == $batch and
+					.concurrency_expected == $expected) and
+				($workers | all(.[]; positive_integer)) and
+				($workers | unique | length == $expected) and
+				($connections | all(.[]; positive_integer)) and
+				($connections | unique | length >= 2) and
+				($arrivals | all(.[]; positive_integer)) and
+				($arrivals | sort == [range(1; $expected + 1)]) and
+				($releases | all(.[]; . == $e.concurrency_release)) and
+				all($responses[];
+					type == "object" and
+					.concurrency_batch == $batch and
+					.concurrency_participants == $expected and
+					.concurrency_max_active == $expected)
+			then $e else error("invalid concurrency overlap evidence") end
+		else error("missing concurrency overlap evidence") end
+	' "$input"
+}
+
+coalesced_bridge_reconciliation() {
+  local -r input="$1"
+
+  bounded_evidence_file \
+    "$input" \
+    "$SCENARIO_RECONCILIATION_MAX_BYTES" \
+    "$SCENARIO_RECONCILIATION_MAX_LINES" || return 1
+  jq -ce '
+    def count: type == "number" and floor == . and . >= 0 and . <= 2;
+    . as $result |
+    if
+      $result.status == "passed" and
+      $result.scenario == "coalesced-bridge" and
+      $result.request_count == 2 and
+      ($result.coalesced_bridge_correlation | type == "object")
+    then
+      $result.coalesced_bridge_correlation as $correlation |
+      if
+        ($correlation.exact_hit_count | count) and
+        ($correlation.explicit_root_count | count) and
+        ($correlation.wrong_parent_count | count) and
+        ($correlation.unresolved_count | count) and
+		$correlation.source_client_candidates == 2 and
+		$correlation.trigger_chain_proven == true and
+		($correlation.discard_total_delta | type == "number" and floor == . and . >= 0 and . <= 1) and
+		($correlation.discard_ambiguous_delta | type == "number" and floor == . and . >= 0 and . <= 1) and
+        $correlation.wrong_parent_count == 0 and
+        $correlation.unresolved_count == 0 and
+        (
+          ($correlation.outcome == "supported_exact" and
+           $correlation.exact_hit_count == 2 and
+		   $correlation.explicit_root_count == 0 and
+		   $correlation.source_client_candidates == 2 and
+		   $correlation.discard_total_delta == 0 and
+		   $correlation.discard_ambiguous_delta == 0) or
+          ($correlation.outcome == "ambiguous_drop" and
+		   $correlation.exact_hit_count == 0 and
+		   $correlation.explicit_root_count == 2 and
+		   $correlation.source_client_candidates == 2 and
+		   $correlation.discard_total_delta == 1 and
+		   $correlation.discard_ambiguous_delta == 1)
+        )
+      then $correlation else error("invalid coalesced bridge correlation") end
+    else error("missing coalesced bridge correlation") end
+  ' "$input"
+}
+
+timeout_cancellation_reconciliation() {
+  local -r input="$1"
+
+  bounded_evidence_file \
+    "$input" \
+    "$SCENARIO_RECONCILIATION_MAX_BYTES" \
+    "$SCENARIO_RECONCILIATION_MAX_LINES" || return 1
+  jq -ce '
+    def fixed_reason:
+      . == "missing" or . == "stale" or . == "unsupported" or
+      . == "malformed" or . == "version_mismatch" or . == "ambiguous" or
+      . == "unauthorized" or . == "already_consumed" or . == "timeout" or
+      . == "overload" or . == "transport_error" or . == "disabled";
+    . as $result |
+    if
+      $result.status == "passed" and
+      $result.scenario == "timeout-retry" and
+      ($result.faults | type == "array" and length == 1) and
+      ($result.faults[0] | type == "object") and
+      $result.faults[0].kind == "client-timeout" and
+      $result.faults[0].outcome == "deadline-exceeded-as-expected" and
+      ($result.faults[0].marker | type == "string" and test("^timeout-retry-cancelled-[0-9]+$")) and
+      ($result.faults[0].parent_outcome == "exact" or
+       $result.faults[0].parent_outcome == "missing" or
+       $result.faults[0].parent_outcome == "reason_coded_drop") and
+      ($result.faults[0].drop_reasons | type == "array" and all(.[]; type == "string" and fixed_reason)) and
+      (($result.faults[0].parent_outcome == "reason_coded_drop" and
+        ($result.faults[0].drop_reasons | length == 1)) or
+       (($result.faults[0].parent_outcome == "exact" or
+         $result.faults[0].parent_outcome == "missing") and
+        ($result.faults[0].drop_reasons | length == 0)))
+    then $result.faults[0] else error("invalid timeout cancellation reconciliation") end
+  ' "$input"
 }
 
 pressure_map_metric() {
@@ -3919,11 +4122,47 @@ run_map_pressure_helper() {
   return "$replay_status"
 }
 
+bounded_evidence_file() {
+  local -r input="$1"
+  local -r maximum_bytes="$2"
+  local -r maximum_lines="$3"
+  local size=""
+
+  [[ -f "$input" && ! -L "$input" ]] || return 1
+  bounded_decimal "$maximum_bytes" "$MAX_SHELL_INTEGER" false >/dev/null || return 1
+  bounded_decimal "$maximum_lines" "$MAX_SHELL_INTEGER" false >/dev/null || return 1
+  size="$(stat -c '%s' -- "$input")" || return 1
+  bounded_decimal "$size" "$maximum_bytes" true >/dev/null || return 1
+  LC_ALL=C awk -v maximum="$maximum_lines" '
+    NR > maximum { exit 1 }
+  ' "$input"
+}
+
+retain_bounded_evidence_prefix() {
+  local -r input="$1"
+  local -r maximum_bytes="$2"
+  local bounded=""
+  local status=0
+
+  [[ -f "$input" && ! -L "$input" ]] || return 1
+  bounded_decimal "$maximum_bytes" "$MAX_SHELL_INTEGER" false >/dev/null || return 1
+  bounded="$(mktemp "$input.bounded.XXXXXX")" || return 1
+  if LC_ALL=C head -c "$maximum_bytes" -- "$input" >"$bounded" && \
+    chmod 0644 "$bounded" && mv -f -- "$bounded" "$input"; then
+    return 0
+  else
+    status=$?
+  fi
+  rm -f -- "$bounded" || true
+  return "$status"
+}
+
 pressure_result_record() {
   local -r input="$1"
   local -a records=()
 
-  [[ -f "$input" && ! -L "$input" ]] || return 1
+  bounded_evidence_file \
+    "$input" "$PRESSURE_RESULT_MAX_BYTES" "$PRESSURE_RESULT_MAX_LINES" || return 1
   mapfile -t records <"$input"
   ((${#records[@]} == 1)) || return 1
   printf '%s\n' "${records[0]}"
@@ -4025,6 +4264,306 @@ pressure_result_bounded_uint() {
 
   value="$(pressure_result_uint "$input" "$field")" || return 1
   bounded_decimal "$value" "$maximum" "$allow_zero"
+}
+
+run_receive_cursor_map_helper() {
+  local -r output="$1"
+  local -r stderr_output="$2"
+  local -r timeout_seconds="$3"
+  local command_status=0
+  local evidence_status=0
+  local replay_status=0
+  shift 3
+
+  bounded_decimal "$timeout_seconds" "$MAX_SHELL_INTEGER" false >/dev/null || {
+    log_error "receive-cursor map helper timeout must be a positive integer"
+    return 2
+  }
+  if run_bounded "$timeout_seconds" \
+    "${COMPOSE[@]}" run --rm --no-deps --no-TTY map-state \
+      "$@" >"$output" 2>"$stderr_output"; then
+    command_status=0
+  else
+    command_status=$?
+  fi
+  if ! bounded_evidence_file \
+    "$output" \
+    "$RECEIVE_CURSOR_HELPER_STDOUT_MAX_BYTES" \
+    "$RECEIVE_CURSOR_HELPER_STDOUT_MAX_LINES"; then
+    log_error "receive-cursor map helper stdout exceeded its evidence bounds"
+    retain_bounded_evidence_prefix \
+      "$output" "$RECEIVE_CURSOR_HELPER_STDOUT_MAX_BYTES" || return 1
+    evidence_status=1
+  fi
+  if ! bounded_evidence_file \
+    "$stderr_output" \
+    "$RECEIVE_CURSOR_HELPER_STDERR_MAX_BYTES" \
+    "$RECEIVE_CURSOR_HELPER_STDERR_MAX_LINES"; then
+    log_error "receive-cursor map helper stderr exceeded its evidence bounds"
+    retain_bounded_evidence_prefix \
+      "$stderr_output" "$RECEIVE_CURSOR_HELPER_STDERR_MAX_BYTES" || return 1
+    evidence_status=1
+  fi
+  if ((evidence_status != 0)); then
+    if ((command_status != 0)); then
+      return "$command_status"
+    fi
+    return "$evidence_status"
+  fi
+  if [[ -s "$stderr_output" ]]; then
+    if sed -n 'p' "$stderr_output" >&2; then
+      :
+    else
+      replay_status=$?
+    fi
+  fi
+  if [[ -s "$output" ]]; then
+    if sed -n 'p' "$output"; then
+      :
+    else
+      replay_status=$?
+    fi
+  fi
+  if ((command_status != 0)); then
+    return "$command_status"
+  fi
+  return "$replay_status"
+}
+
+receive_cursor_map_result_has_contract() {
+  local -r input="$1"
+  local -r decimal='(0|[1-9][0-9]*)'
+  local record=""
+  local pattern=""
+
+  record="$(pressure_result_record "$input")" || return 1
+  pattern='^\{"status":"passed","cursor_map_id":'"$decimal"',"cursor_map_name":"jrp_recv_cur","cursor_kernel_name":"jrp_recv_cur","cursor_map_type":"Hash","cursor_key_size":8,"cursor_value_size":56,"cursor_max_entries":10000,"cursor_entries":'"$decimal"',"guard_map_id":'"$decimal"',"guard_map_name":"jrp_recv_guard","guard_kernel_name":"jrp_recv_guard","guard_map_type":"Hash","guard_key_size":8,"guard_value_size":56,"guard_max_entries":10000,"guard_entries":'"$decimal"'\}$'
+  [[ "$record" =~ $pattern ]]
+}
+
+record_receive_cursor_map_status() {
+  local -r label="$1"
+  local -r status="$2"
+  local -r reason="$3"
+  local cursor_final_entries="$4"
+  local guard_final_entries="$5"
+  local -r attempts="$6"
+  local -r status_output="$RESULT_DIR/receive-cursor-map-$label-status.json"
+  local cursor_final_json="null"
+  local guard_final_json="null"
+
+  if [[ -n "$cursor_final_entries" ]]; then
+    cursor_final_entries="$(bounded_decimal \
+      "$cursor_final_entries" "$RECEIVE_CURSOR_MAP_MAX_ENTRIES" true)" || return 1
+    cursor_final_json="$cursor_final_entries"
+  fi
+  if [[ -n "$guard_final_entries" ]]; then
+    guard_final_entries="$(bounded_decimal \
+      "$guard_final_entries" "$RECEIVE_CURSOR_MAP_MAX_ENTRIES" true)" || return 1
+    guard_final_json="$guard_final_entries"
+  fi
+  bounded_decimal "$attempts" "$MAX_SHELL_INTEGER" true >/dev/null || return 1
+  [[ "$status" == "passed" || "$status" == "failed" ]] || return 1
+  [[ "$reason" =~ ^[a-z-]+$ ]] || return 1
+  RECEIVE_CURSOR_MAP_STATUS_JSON="$(printf \
+    '{"status":"%s","reason":"%s","cursor_map_id":%s,"guard_map_id":%s,"cursor_baseline_entries":%s,"guard_baseline_entries":%s,"cursor_final_entries":%s,"guard_final_entries":%s,"required_consecutive_samples":%d,"attempts":%s,"before":"receive-cursor-map-%s-before.json","after":"receive-cursor-map-%s-after.json","samples":"receive-cursor-map-%s-recovery-samples.log"}' \
+    "$status" \
+    "$reason" \
+    "${RECEIVE_CURSOR_MAP_ID:-0}" \
+    "${RECEIVE_GUARD_MAP_ID:-0}" \
+    "${RECEIVE_CURSOR_MAP_BASELINE_ENTRIES:-0}" \
+    "${RECEIVE_GUARD_MAP_BASELINE_ENTRIES:-0}" \
+    "$cursor_final_json" \
+    "$guard_final_json" \
+    "$RECEIVE_CURSOR_MAP_RECOVERY_CONSECUTIVE_SAMPLES" \
+    "$attempts" \
+    "$label" \
+    "$label" \
+    "$label")" || return 1
+  printf '%s\n' "$RECEIVE_CURSOR_MAP_STATUS_JSON" >"$status_output"
+}
+
+capture_receive_cursor_map_baseline() {
+  local -r label="$1"
+  local -r output="$RESULT_DIR/receive-cursor-map-$label-before.json"
+  local -r stderr_output="$RESULT_DIR/receive-cursor-map-$label-before.stderr.log"
+  local cursor_map_id=""
+  local guard_map_id=""
+  local cursor_max_entries=""
+  local guard_max_entries=""
+  local cursor_entries=""
+  local guard_entries=""
+
+  RECEIVE_CURSOR_MAP_ID=""
+  RECEIVE_GUARD_MAP_ID=""
+  RECEIVE_CURSOR_MAP_BASELINE_ENTRIES=""
+  RECEIVE_GUARD_MAP_BASELINE_ENTRIES=""
+  RECEIVE_CURSOR_MAP_STATUS_JSON="null"
+  if ! run_receive_cursor_map_helper \
+    "$output" \
+    "$stderr_output" \
+    "$RECEIVE_CURSOR_MAP_HELPER_TIMEOUT_SECONDS"; then
+    record_receive_cursor_map_status "$label" failed baseline-command "" "" 0 || true
+    return 1
+  fi
+  if ! receive_cursor_map_result_has_contract "$output"; then
+    log_error "receive-cursor map baseline does not match the exact evidence contract"
+    record_receive_cursor_map_status "$label" failed baseline-contract "" "" 0 || true
+    return 1
+  fi
+  if ! cursor_map_id="$(pressure_result_bounded_uint \
+    "$output" cursor_map_id "$MAX_UINT32_DECIMAL" false)" || \
+    ! guard_map_id="$(pressure_result_bounded_uint \
+      "$output" guard_map_id "$MAX_UINT32_DECIMAL" false)" || \
+    ! cursor_max_entries="$(pressure_result_bounded_uint \
+      "$output" cursor_max_entries "$RECEIVE_CURSOR_MAP_MAX_ENTRIES" false)" || \
+    ! guard_max_entries="$(pressure_result_bounded_uint \
+      "$output" guard_max_entries "$RECEIVE_CURSOR_MAP_MAX_ENTRIES" false)" || \
+    ! cursor_entries="$(pressure_result_bounded_uint \
+      "$output" cursor_entries "$RECEIVE_CURSOR_MAP_MAX_ENTRIES" true)" || \
+    ! guard_entries="$(pressure_result_bounded_uint \
+      "$output" guard_entries "$RECEIVE_CURSOR_MAP_MAX_ENTRIES" true)"; then
+    log_error "receive coordination-map baseline contains invalid bounded fields"
+    record_receive_cursor_map_status "$label" failed baseline-fields "" "" 0 || true
+    return 1
+  fi
+  if [[ "$cursor_map_id" == "$guard_map_id" || \
+    "$cursor_max_entries" != "$RECEIVE_CURSOR_MAP_MAX_ENTRIES" || \
+    "$guard_max_entries" != "$RECEIVE_CURSOR_MAP_MAX_ENTRIES" ]]; then
+    log_error "receive coordination-map baseline reported an unexpected identity or capacity"
+    record_receive_cursor_map_status "$label" failed baseline-identity "" "" 0 || true
+    return 1
+  fi
+  RECEIVE_CURSOR_MAP_ID="$cursor_map_id"
+  RECEIVE_GUARD_MAP_ID="$guard_map_id"
+  RECEIVE_CURSOR_MAP_BASELINE_ENTRIES="$cursor_entries"
+  RECEIVE_GUARD_MAP_BASELINE_ENTRIES="$guard_entries"
+  if ! record_receive_cursor_map_status \
+    "$label" failed recovery-pending "" "" 0; then
+    log_error "could not persist the receive coordination-map recovery gate"
+    return 1
+  fi
+}
+
+wait_for_receive_cursor_map_recovery() {
+  local -r label="$1"
+  local -r samples_log="$RESULT_DIR/receive-cursor-map-$label-recovery-samples.log"
+  local -r canonical_after="$RESULT_DIR/receive-cursor-map-$label-after.json"
+  local output=""
+  local stderr_output=""
+  local cursor_map_id=""
+  local guard_map_id=""
+  local cursor_max_entries=""
+  local guard_max_entries=""
+  local cursor_entries=""
+  local guard_entries=""
+  local helper_timeout=""
+  local matched=false
+  local -i attempts=0
+  local -i consecutive_matches=0
+  local -i deadline=0
+
+  if ! bounded_decimal \
+    "$RECEIVE_CURSOR_MAP_ID" "$MAX_UINT32_DECIMAL" false >/dev/null || \
+    ! bounded_decimal \
+      "$RECEIVE_GUARD_MAP_ID" "$MAX_UINT32_DECIMAL" false >/dev/null || \
+    ! bounded_decimal \
+      "$RECEIVE_CURSOR_MAP_BASELINE_ENTRIES" \
+      "$RECEIVE_CURSOR_MAP_MAX_ENTRIES" \
+      true >/dev/null || \
+    ! bounded_decimal \
+      "$RECEIVE_GUARD_MAP_BASELINE_ENTRIES" \
+      "$RECEIVE_CURSOR_MAP_MAX_ENTRIES" \
+      true >/dev/null; then
+    log_error "receive coordination-map recovery has no exact baseline identity"
+    record_receive_cursor_map_status "$label" failed missing-baseline "" "" 0 || true
+    return 1
+  fi
+  : >"$samples_log" || return 1
+  deadline="$((SECONDS + RECEIVE_CURSOR_MAP_RECOVERY_TIMEOUT_SECONDS))"
+  while ((SECONDS < deadline)); do
+    ((attempts += 1))
+    printf -v output \
+      '%s/receive-cursor-map-%s-recovery-attempt-%02d.json' \
+      "$RESULT_DIR" "$label" "$attempts"
+    printf -v stderr_output \
+      '%s/receive-cursor-map-%s-recovery-attempt-%02d.stderr.log' \
+      "$RESULT_DIR" "$label" "$attempts"
+    cursor_map_id=""
+    guard_map_id=""
+    cursor_max_entries=""
+    guard_max_entries=""
+    cursor_entries=""
+    guard_entries=""
+    helper_timeout="$(remaining_timeout_seconds \
+      "$deadline" "$RECEIVE_CURSOR_MAP_HELPER_TIMEOUT_SECONDS")" || break
+    matched=false
+    if run_receive_cursor_map_helper \
+      "$output" \
+      "$stderr_output" \
+      "$helper_timeout" \
+      --cursor-map-id "$RECEIVE_CURSOR_MAP_ID" \
+      --guard-map-id "$RECEIVE_GUARD_MAP_ID" \
+      --expected-max-entries "$RECEIVE_CURSOR_MAP_MAX_ENTRIES" && \
+      receive_cursor_map_result_has_contract "$output"; then
+      cursor_map_id="$(pressure_result_bounded_uint \
+        "$output" cursor_map_id "$MAX_UINT32_DECIMAL" false)" || cursor_map_id=""
+      guard_map_id="$(pressure_result_bounded_uint \
+        "$output" guard_map_id "$MAX_UINT32_DECIMAL" false)" || guard_map_id=""
+      cursor_max_entries="$(pressure_result_bounded_uint \
+        "$output" cursor_max_entries "$RECEIVE_CURSOR_MAP_MAX_ENTRIES" false)" || \
+        cursor_max_entries=""
+      guard_max_entries="$(pressure_result_bounded_uint \
+        "$output" guard_max_entries "$RECEIVE_CURSOR_MAP_MAX_ENTRIES" false)" || \
+        guard_max_entries=""
+      cursor_entries="$(pressure_result_bounded_uint \
+        "$output" cursor_entries "$RECEIVE_CURSOR_MAP_MAX_ENTRIES" true)" || \
+        cursor_entries=""
+      guard_entries="$(pressure_result_bounded_uint \
+        "$output" guard_entries "$RECEIVE_CURSOR_MAP_MAX_ENTRIES" true)" || \
+        guard_entries=""
+      if [[ "$cursor_map_id" == "$RECEIVE_CURSOR_MAP_ID" && \
+        "$guard_map_id" == "$RECEIVE_GUARD_MAP_ID" && \
+        "$cursor_max_entries" == "$RECEIVE_CURSOR_MAP_MAX_ENTRIES" && \
+        "$guard_max_entries" == "$RECEIVE_CURSOR_MAP_MAX_ENTRIES" && \
+        -n "$cursor_entries" && -n "$guard_entries" ]] && \
+        ((cursor_entries == RECEIVE_CURSOR_MAP_BASELINE_ENTRIES &&
+          guard_entries == RECEIVE_GUARD_MAP_BASELINE_ENTRIES)); then
+        matched=true
+      fi
+    fi
+    if [[ "$matched" == "true" ]]; then
+      ((consecutive_matches += 1))
+    else
+      consecutive_matches=0
+    fi
+    printf 'attempt=%d observed_at=%(%Y-%m-%dT%H:%M:%SZ)T cursor_map_id=%s cursor_entries=%s guard_map_id=%s guard_entries=%s matched=%s consecutive=%d\n' \
+      "$attempts" \
+      -1 \
+      "${cursor_map_id:-unavailable}" \
+      "${cursor_entries:-unavailable}" \
+      "${guard_map_id:-unavailable}" \
+      "${guard_entries:-unavailable}" \
+      "$matched" \
+      "$consecutive_matches" >>"$samples_log" || return 1
+    if ((consecutive_matches >= RECEIVE_CURSOR_MAP_RECOVERY_CONSECUTIVE_SAMPLES)); then
+      if ! install -m 0644 "$output" "$canonical_after"; then
+        record_receive_cursor_map_status \
+          "$label" failed artifact-write "$cursor_entries" "$guard_entries" "$attempts" || true
+        return 1
+      fi
+      record_receive_cursor_map_status \
+        "$label" passed steady-baseline "$cursor_entries" "$guard_entries" "$attempts"
+      return $?
+    fi
+    if ((SECONDS < deadline)); then
+      sleep 1
+    fi
+  done
+  log_error "receive coordination maps did not return to their steady baselines, cursor_map_id=$RECEIVE_CURSOR_MAP_ID cursor_baseline=$RECEIVE_CURSOR_MAP_BASELINE_ENTRIES cursor_actual=${cursor_entries:-unavailable} guard_map_id=$RECEIVE_GUARD_MAP_ID guard_baseline=$RECEIVE_GUARD_MAP_BASELINE_ENTRIES guard_actual=${guard_entries:-unavailable} attempts=$attempts"
+  record_receive_cursor_map_status \
+    "$label" failed recovery-timeout "$cursor_entries" "$guard_entries" "$attempts" || true
+  return 1
 }
 
 record_pressure_cleanup_status() {
@@ -4833,7 +5372,13 @@ run_scenario() {
   local pressure_bridge_json="null"
   local pressure_java_json="null"
   local pressure_status_json="null"
+  local scenario_reconciliation_json="null"
+  local receive_cursor_map_status_json="null"
   local pressure_unix_already_consumed_reconciled=false
+  local coalesced_outcome=""
+  local timeout_parent_outcome=""
+  local timeout_drop_reason=""
+  local diagnostic_valid_takes=0
   local expected_fault_status=""
   local expected_fault_count=0
   local fault_diagnostics_after=""
@@ -4899,7 +5444,7 @@ run_scenario() {
       --fault-mode "$FAULT_MODE"
     )
   elif [[ "$name" == "tls-boundary" ]]; then
-    request_arguments=(--requests 2)
+    request_arguments=(--requests 3)
   elif (( REQUEST_COUNT > 0 )); then
     request_arguments=(--requests "$REQUEST_COUNT")
   fi
@@ -4932,7 +5477,13 @@ run_scenario() {
     pressure_bridge_json="null"
     pressure_java_json="null"
     pressure_status_json="null"
+    scenario_reconciliation_json="null"
+    receive_cursor_map_status_json="null"
     pressure_unix_already_consumed_reconciled=false
+    coalesced_outcome=""
+    timeout_parent_outcome=""
+    timeout_drop_reason=""
+    diagnostic_valid_takes=0
     label="$name"
     if [[ "$name" == "w3c-fault" ]]; then
       label="$name-$FAULT_MODE"
@@ -4998,6 +5549,10 @@ run_scenario() {
     elif ! capture_phase_evidence "$before_phase"; then
       metric_status=1
     fi
+    if [[ "$name" == "tls-boundary" || "$name" == "coalesced-bridge" ]] && \
+      ! capture_receive_cursor_map_baseline "$label"; then
+      metric_status=1
+    fi
     bridge_was_running="$BRIDGE_RUNNING"
     if [[ "$bridge_was_running" == "true" ]]; then
       before_success="$(bridge_success_total \
@@ -5025,16 +5580,103 @@ run_scenario() {
         "${request_arguments[@]}"
         --timeout 75s
       )
+      if scenario_uses_in_band_java_diagnostics "$name"; then
+        if assert_sanitized_java_diagnostics "$before_diagnostics"; then
+          scenario_arguments+=(
+            --java-diagnostics-before "$(<"$before_diagnostics")"
+          )
+        else
+          log_error "$label has no valid Java diagnostics baseline"
+          scenario_status=1
+        fi
+      fi
       if [[ -n "$assertion_mode" ]]; then
         scenario_arguments+=(--assertion-mode "$assertion_mode")
       fi
-      if run_bounded "$SCENARIO_RUN_TIMEOUT_SECONDS" \
+      if ((scenario_status == 0)) && run_bounded "$SCENARIO_RUN_TIMEOUT_SECONDS" \
         "${COMPOSE[@]}" run --rm --no-deps --no-TTY scenario \
           "${scenario_arguments[@]}" \
           2> >(tee "$stderr_output" >&2) | tee "$output"; then
         scenario_status=0
       else
         scenario_status=$?
+      fi
+    fi
+    if ((scenario_status == 0)) && scenario_uses_in_band_java_diagnostics "$name"; then
+      if ! mkdir -p -- "$RESULT_DIR/phases/$after_phase"; then
+        metric_status=1
+      elif ! extract_java_diagnostics_after "$output" "$after_diagnostics"; then
+        log_error "could not extract in-band Java diagnostics for $label"
+        metric_status=1
+      elif ! write_java_diagnostics_delta \
+        "$before_diagnostics" \
+        "$after_diagnostics" \
+        "$RESULT_DIR/phases/$after_phase/java-diagnostics.delta"; then
+        log_error "could not compute in-band Java diagnostics for $label"
+        metric_status=1
+      else
+        diagnostic_valid_takes="$(java_diagnostic_delta \
+          "$RESULT_DIR/phases/$after_phase/java-diagnostics.delta" t_valid)" || {
+          diagnostic_valid_takes=""
+          metric_status=1
+        }
+      fi
+    fi
+	if ((scenario_status == 0)) && [[ "$name" == "concurrency" ]]; then
+		if ! scenario_reconciliation_json="$(concurrency_overlap_reconciliation \
+			"$output" "$expected_requests")"; then
+			log_error "concurrency result did not retain exact worker and arrival evidence"
+			scenario_reconciliation_json="null"
+			scenario_status=1
+		fi
+	elif ((scenario_status == 0)) && [[ "$name" == "coalesced-bridge" ]]; then
+      if scenario_reconciliation_json="$(coalesced_bridge_reconciliation "$output")"; then
+        coalesced_outcome="$(jq -er '.outcome' <<<"$scenario_reconciliation_json")" || {
+          coalesced_outcome=""
+          metric_status=1
+        }
+      else
+        log_error "coalesced bridge result did not report one supported correlation outcome"
+        scenario_reconciliation_json="null"
+        scenario_status=1
+      fi
+      case "$coalesced_outcome" in
+        supported_exact)
+          expected_bridge_valid=2
+          expected_bridge_stage=2
+          ;;
+        ambiguous_drop)
+          expected_bridge_valid=0
+          expected_bridge_stage=0
+          include_ambiguous_candidates=true
+          ;;
+      esac
+    elif ((scenario_status == 0)) && [[ "$name" == "timeout-retry" ]]; then
+      if scenario_reconciliation_json="$(timeout_cancellation_reconciliation "$output")"; then
+        timeout_parent_outcome="$(jq -er '.parent_outcome' \
+          <<<"$scenario_reconciliation_json")" || {
+          timeout_parent_outcome=""
+          metric_status=1
+        }
+        if [[ "$timeout_parent_outcome" == "reason_coded_drop" ]]; then
+          timeout_drop_reason="$(jq -er \
+            '.drop_reasons | if length == 1 then .[0] else error("expected one drop reason") end' \
+            <<<"$scenario_reconciliation_json")" || {
+            timeout_drop_reason=""
+            metric_status=1
+          }
+        fi
+      else
+        log_error "timeout result did not retain one bounded cancellation outcome"
+        scenario_reconciliation_json="null"
+        scenario_status=1
+      fi
+      if [[ "$diagnostic_valid_takes" =~ ^[12]$ ]]; then
+        expected_bridge_valid="$diagnostic_valid_takes"
+        expected_bridge_stage="$diagnostic_valid_takes"
+      else
+        log_error "timeout result did not report one or two valid Java takes"
+        metric_status=1
       fi
     fi
     if [[ "$name" == "pressure" ]]; then
@@ -5096,9 +5738,27 @@ run_scenario() {
         metric_status=1
       fi
     fi
+    if [[ ( "$name" == "tls-boundary" || "$name" == "coalesced-bridge" ) && \
+      -n "$RECEIVE_CURSOR_MAP_ID" ]] && \
+      ! wait_for_receive_cursor_map_recovery "$label"; then
+      metric_status=1
+    fi
     if [[ "$retrieval_mode" == "normal" ]] && ! is_w3c_stale_scenario "$name"; then
-      expected_bridge_lifecycle="$expected_bridge_valid"
-      expected_bridge_stage="$expected_bridge_valid"
+      case "$name" in
+        coalesced-bridge)
+          # The Apache-to-source trigger is a separate live path. Dedicated
+          # reconciliation below accounts for its TCP lifecycle without
+          # pretending Apache produced the coalesced plaintext write.
+          expected_bridge_lifecycle=0
+          ;;
+        timeout-retry)
+          expected_bridge_lifecycle=2
+          ;;
+        *)
+          expected_bridge_lifecycle="$expected_bridge_valid"
+          expected_bridge_stage="$expected_bridge_valid"
+          ;;
+      esac
     fi
     if [[ "$bridge_was_running" == "true" ]]; then
       expected_success="$((before_success + expected_bridge_valid))"
@@ -5123,7 +5783,12 @@ run_scenario() {
         ! extract_java_diagnostics_after "$output" "$after_diagnostics"; then
         log_error "could not extract in-band Java diagnostics for $label"
         metric_status=1
+      elif scenario_uses_in_band_java_diagnostics "$name" &&
+        ! assert_sanitized_java_diagnostics "$after_diagnostics"; then
+        log_error "in-band Java diagnostics became unavailable for $label"
+        metric_status=1
       elif ! is_w3c_stale_scenario "$name" &&
+        ! scenario_uses_in_band_java_diagnostics "$name" &&
         ! capture_java_diagnostics "$after_phase"; then
         metric_status=1
       fi
@@ -5160,7 +5825,23 @@ run_scenario() {
       metric_status=1
     fi
     if [[ "$bridge_was_running" == "true" ]]; then
-      if [[ "$name" == "pressure" && -n "$pressure_hits" &&
+      if [[ "$name" == "coalesced-bridge" && -n "$coalesced_outcome" ]]; then
+        if ! assert_coalesced_bridge_metric_delta \
+          "$RESULT_DIR/phases/$after_phase/obi-metrics.delta" \
+          "$SELECTED_TRANSPORT" \
+          "$coalesced_outcome"; then
+          metric_status=1
+        fi
+      elif [[ "$name" == "timeout-retry" && -n "$timeout_parent_outcome" ]]; then
+        if ! assert_timeout_cancellation_metric_delta \
+          "$RESULT_DIR/phases/$after_phase/obi-metrics.delta" \
+          "$SELECTED_TRANSPORT" \
+          "$timeout_parent_outcome" \
+          "$diagnostic_valid_takes" \
+          "$timeout_drop_reason"; then
+          metric_status=1
+        fi
+      elif [[ "$name" == "pressure" && -n "$pressure_hits" &&
         -n "$pressure_roots" && -n "$pressure_wrong" && -n "$pressure_unresolved" ]]; then
         pressure_bridge_json="$(pressure_bridge_reconciliation \
           "$RESULT_DIR/phases/$after_phase/obi-metrics.delta" \
@@ -5221,7 +5902,19 @@ run_scenario() {
             expected_stale="$expected_requests"
             ;;
         esac
-        if [[ "$name" == "pressure" && \
+        if [[ "$name" == "coalesced-bridge" ]]; then
+          if ! assert_coalesced_bridge_diagnostics_delta \
+            "$RESULT_DIR/phases/$after_phase/java-diagnostics.delta" \
+            "$coalesced_outcome"; then
+            metric_status=1
+          fi
+        elif [[ "$name" == "timeout-retry" ]]; then
+          if ! assert_timeout_cancellation_diagnostics_delta \
+            "$RESULT_DIR/phases/$after_phase/java-diagnostics.delta" \
+            "$scenario_reconciliation_json"; then
+            metric_status=1
+          fi
+        elif [[ "$name" == "pressure" && \
           "$pressure_unix_already_consumed_reconciled" == "true" ]]; then
           if ! assert_pressure_unix_already_consumed_diagnostics_delta \
             "$RESULT_DIR/phases/$after_phase/java-diagnostics.delta" \
@@ -5262,12 +5955,17 @@ run_scenario() {
         "$pressure_bridge_json" \
         "$pressure_java_json"
     fi
-    if ! printf '{\n  "status": "%s",\n  "scenario": "%s",\n  "exit_status": %d,\n  "metric_status": %d,\n  "pressure_correlation": %s,\n  "result": "%s",\n  "stderr": "%s",\n  "after_phase": "%s"\n}\n' \
+    if [[ "$name" == "tls-boundary" || "$name" == "coalesced-bridge" ]]; then
+      receive_cursor_map_status_json="$RECEIVE_CURSOR_MAP_STATUS_JSON"
+    fi
+    if ! printf '{\n  "status": "%s",\n  "scenario": "%s",\n  "exit_status": %d,\n  "metric_status": %d,\n  "pressure_correlation": %s,\n  "scenario_reconciliation": %s,\n  "receive_coordination_maps": %s,\n  "result": "%s",\n  "stderr": "%s",\n  "after_phase": "%s"\n}\n' \
       "$status_name" \
       "$name" \
       "$scenario_status" \
       "$metric_status" \
       "$pressure_status_json" \
+      "$scenario_reconciliation_json" \
+      "$receive_cursor_map_status_json" \
       "$(basename -- "$output")" \
       "$(basename -- "$stderr_output")" \
       "phases/$after_phase" >"$RESULT_DIR/scenario-$label-status.json"; then
@@ -5731,6 +6429,9 @@ recreate_instrumented_stack() {
   export OTEL_JAVAAGENT_EXTENSIONS_VALUE="/otel/obi-otel-extension.jar"
   export OTEL_PROPAGATORS_VALUE="obi,tracecontext,baggage"
   recreate_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" || return $?
+  if [[ "$verify_java_traffic" == "false" ]]; then
+    DELAYED_OTLP_PROVIDER_READY_SINCE="$recreate_since"
+  fi
   log_info "recreating the instrumented stack for $label propagation=$propagation flavor=$compose_flavor"
   invalidate_selected_transport || return $?
   BRIDGE_RUNNING=false
@@ -5751,11 +6452,6 @@ recreate_instrumented_stack() {
     obi \
     "Java remote parent bridge ready" \
     "$label OBI remote-parent bridge" \
-    "$recreate_since" || return $?
-  wait_for_log \
-    java-backend \
-    "OBI remote-parent provider ready" \
-    "$label injected Java helper" \
     "$recreate_since" || return $?
   wait_for_log \
     java-backend \
@@ -5788,9 +6484,6 @@ recreate_instrumented_stack() {
     "$label TLS boundary coalesced HTTPS backend" \
     "$recreate_since" || return $?
   BRIDGE_RUNNING=true
-  if [[ "$verify_java_traffic" == "true" ]]; then
-    assert_selected_transport "$transport" || return $?
-  fi
   wait_for_apache_instrumentation recreate-instrumented || return $?
   if [[ "$verify_java_traffic" == "false" ]]; then
     wait_for_log \
@@ -5801,6 +6494,12 @@ recreate_instrumented_stack() {
     return 0
   fi
   wait_for_http "$APACHE_HTTPS_HEALTH_ENDPOINT" "$label HTTPS path" || return $?
+  wait_for_log \
+    java-backend \
+    "OBI remote-parent provider ready" \
+    "$label injected Java helper" \
+    "$recreate_since" || return $?
+  assert_selected_transport "$transport" || return $?
   wait_for_java_duplicate_suppression \
     "$RESULT_DIR/duplicate-suppression-${label// /-}.prom" || return $?
 }
@@ -5808,15 +6507,29 @@ recreate_instrumented_stack() {
 run_delayed_otlp_suppression_sequence() {
   local scenario_status=0
   local earliest_export_millisecond=""
+  local -r provider_ready_since="$DELAYED_OTLP_PROVIDER_READY_SINCE"
+
+  [[ -n "$provider_ready_since" ]] || {
+    log_error "delayed OTLP provider-readiness cursor is unavailable"
+    return 1
+  }
 
   earliest_export_millisecond="$(delayed_otlp_earliest_export_millisecond)" || return $?
   assert_delayed_otlp_receiver_empty \
     "$RESULT_DIR/delayed-otlp-receiver-before-request.json" || return $?
   assert_java_duplicate_suppression_absent \
     "$RESULT_DIR/duplicate-suppression-delayed-otlp-before-request.prom" || return $?
+  # Registration can race bridge attachment. Let the provider's bounded retry interval expire,
+  # then use the one intentional prime request to activate recovery without adding another span.
+  sleep "$JAVA_PROVIDER_RETRY_SETTLE_SECONDS" || return $?
   run_bounded 10 curl --fail --silent --show-error \
     --header "x-obi-demo-id: $DELAYED_OTLP_PRIME_MARKER" \
     "$APACHE_HTTPS_HEALTH_ENDPOINT" >/dev/null || return $?
+  wait_for_log \
+    java-backend \
+    "OBI remote-parent provider ready" \
+    "delayed-otlp-suppression injected Java helper" \
+    "$provider_ready_since" || return $?
   assert_delayed_otlp_pre_export_window \
     "$RESULT_DIR/delayed-otlp-window.txt" \
     "$earliest_export_millisecond" || return $?
@@ -9172,6 +9885,7 @@ execute_requested_scenarios() {
       run_scenario fd-port-reuse
       run_scenario slow-body
       run_scenario tls-boundary
+      run_scenario coalesced-bridge
       run_scenario timeout-retry
       run_scenario pressure
       run_scenario handoff
@@ -9580,7 +10294,7 @@ capture_phase_evidence() {
     printf 'containers=unavailable\n' >"$phase_dir/container-stats.jsonl"
   fi
 
-  for service in obi apache-proxy java-backend trace-receiver; do
+  for service in obi apache-proxy java-backend coalesced-source trace-receiver; do
     container_id="$(run_bounded 10 "${COMPOSE[@]}" ps --quiet "$service" 2>/dev/null || true)"
     if [[ -z "$container_id" ]]; then
       printf 'container=unavailable\n' >"$phase_dir/$service-resources.txt"
@@ -10004,6 +10718,238 @@ assert_bridge_metric_delta() {
   ' "$input"
 }
 
+assert_coalesced_bridge_metric_delta() {
+  local -r input="$1"
+  local -r transport="$2"
+  local -r outcome="$3"
+
+  [[ -f "$input" && ! -L "$input" && \
+    ( "$transport" == "getsockopt" || "$transport" == "unix" ) && \
+    ( "$outcome" == "supported_exact" || "$outcome" == "ambiguous_drop" ) ]] || return 1
+
+  awk \
+    -v selected="$transport" \
+    -v wanted_outcome="$outcome" '
+    function label(line, name, value) {
+      value = line
+      sub("^.*" name "=\"", "", value)
+      sub("\".*$", "", value)
+      return value
+    }
+    function fail(kind, line) {
+      printf "unexpected coalesced bridge %s: %s\n", kind, line > "/dev/stderr"
+      failed = 1
+    }
+    /^obi_java_remote_parent_operations_total/ {
+      operation = label($0, "operation")
+      status = label($0, "status")
+      transport = label($0, "transport")
+      delta = ""
+      fields = 0
+      for (field = 1; field <= NF; field++) {
+        if ($field ~ /^delta=/) {
+          delta = $field
+          sub(/^delta=/, "", delta)
+          fields++
+        }
+      }
+      if (fields != 1 || delta !~ /^(0|[1-9][0-9]*)$/) {
+        fail("metric delta", $0)
+        next
+      }
+      if (operation == "take" || operation == "discard") {
+        if (transport != selected) {
+          if (delta != 0) fail("non-selected retrieval", $0)
+        } else if (status == "valid") {
+          if (operation == "take") takes += delta
+          else discards += delta
+        } else if (delta != 0) {
+          fail("retrieval result", $0)
+        }
+        next
+      }
+      if (transport == "tcp" && operation == "candidate") {
+        candidate_total += delta
+        if (status == "valid") candidate_valid += delta
+        else if (status == "ambiguous") candidate_ambiguous += delta
+        else if (delta != 0) fail("candidate result", $0)
+        next
+      }
+      if (transport == "tcp" && operation == "inject") {
+        inject_total += delta
+        if (status == "valid") inject_valid += delta
+        else if (status == "ambiguous") inject_ambiguous += delta
+        else if (delta != 0) fail("inject result", $0)
+        next
+      }
+      if (transport == "tcp" && operation == "stage") {
+        stage_total += delta
+        if (status == "valid") stage_valid += delta
+        else if (delta != 0) fail("stage result", $0)
+        next
+      }
+      if (transport == "tcp" && operation == "handoff") {
+        if (status == "valid") handoff_valid += delta
+        else if (delta != 0) fail("handoff result", $0)
+        next
+      }
+      allowed = operation == "negotiate" && status == "missing" && transport == selected
+      allowed = allowed || (operation == "cleanup" && status == "valid" && transport == "tcp")
+      allowed = allowed || (operation == "report" && status == "valid" && transport == "tcp")
+      if (delta != 0 && !allowed) fail("operation result", $0)
+    }
+    END {
+      if (wanted_outcome == "supported_exact") {
+        if (takes != 2 || discards != 0 || stage_valid != 2 || stage_total != 2 ||
+            handoff_valid > 2 || inject_ambiguous != 0 || candidate_ambiguous != 0 ||
+            inject_total < 2 || inject_total > 3 || inject_valid != inject_total ||
+            candidate_total < 2 || candidate_total > 3 || candidate_valid != candidate_total) {
+          printf "supported coalesced bridge metric mismatch: take=%d discard=%d candidate=%d/%d inject=%d/%d stage=%d/%d handoff=%d\n",
+            takes, discards, candidate_valid, candidate_total, inject_valid, inject_total,
+            stage_valid, stage_total, handoff_valid > "/dev/stderr"
+          failed = 1
+        }
+      } else if (takes != 0 || discards != 0 || stage_total != 0 || handoff_valid != 0 ||
+                 inject_total != 2 || inject_valid < 1 || inject_ambiguous > 1 ||
+                 inject_valid + inject_ambiguous != inject_total ||
+                 candidate_total < 1 || candidate_total > 2 || candidate_valid < 1 ||
+                 candidate_valid + candidate_ambiguous != candidate_total) {
+        printf "ambiguous coalesced bridge metric mismatch: take=%d discard=%d candidate=%d/%d ambiguous=%d inject=%d/%d ambiguous=%d stage=%d handoff=%d\n",
+          takes, discards, candidate_valid, candidate_total, candidate_ambiguous,
+          inject_valid, inject_total, inject_ambiguous, stage_total,
+          handoff_valid > "/dev/stderr"
+        failed = 1
+      }
+      exit failed ? 1 : 0
+    }
+  ' "$input"
+}
+
+assert_timeout_cancellation_metric_delta() {
+  local -r input="$1"
+  local -r transport="$2"
+  local -r outcome="$3"
+  local -r expected_valid="$4"
+  local -r reason="${5:-}"
+  local minimum_discards=0
+
+  [[ -f "$input" && ! -L "$input" && \
+    ( "$transport" == "getsockopt" || "$transport" == "unix" ) ]] || return 1
+  case "$outcome" in
+    exact)
+      [[ "$expected_valid" == "2" && -z "$reason" ]] || return 1
+      ;;
+    missing)
+      [[ ( "$expected_valid" == "1" || "$expected_valid" == "2" ) && \
+        -z "$reason" ]] || return 1
+      ;;
+    reason_coded_drop)
+      [[ "$expected_valid" == "1" ]] || return 1
+      case "$reason" in
+        stale|unsupported|ambiguous)
+          minimum_discards=0
+          ;;
+        missing|malformed|version_mismatch|unauthorized|already_consumed|timeout|overload|transport_error|disabled)
+          minimum_discards=1
+          ;;
+        *) return 1 ;;
+      esac
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  awk \
+    -v selected="$transport" \
+    -v wanted_outcome="$outcome" \
+    -v wanted_valid="$expected_valid" \
+    -v wanted_reason="$reason" \
+    -v minimum_discards="$minimum_discards" '
+    function label(line, name, value) {
+      value = line
+      sub("^.*" name "=\"", "", value)
+      sub("\".*$", "", value)
+      return value
+    }
+    function fail(kind, line) {
+      printf "unexpected timeout cancellation %s: %s\n", kind, line > "/dev/stderr"
+      failed = 1
+    }
+    /^obi_java_remote_parent_operations_total/ {
+      operation = label($0, "operation")
+      status = label($0, "status")
+      transport = label($0, "transport")
+      delta = ""
+      fields = 0
+      for (field = 1; field <= NF; field++) {
+        if ($field ~ /^delta=/) {
+          delta = $field
+          sub(/^delta=/, "", delta)
+          fields++
+        }
+      }
+      if (fields != 1 || delta !~ /^(0|[1-9][0-9]*)$/) {
+        fail("metric delta", $0)
+        next
+      }
+      if (operation == "take" || operation == "discard") {
+        if (transport != selected) {
+          if (delta != 0) fail("non-selected retrieval", $0)
+        } else if (operation == "take") {
+          if (status == "valid") take_valid += delta
+          else if (delta != 0) fail("take result", $0)
+        } else {
+          discard_total += delta
+          if (wanted_outcome == "reason_coded_drop" && status == wanted_reason) {
+            reason_discard += delta
+          } else if (delta != 0) {
+            fail("discard result", $0)
+          }
+        }
+        next
+      }
+      if (transport == "tcp" && operation == "candidate") {
+        candidate_total += delta
+        if (status == "valid") candidate_valid += delta
+        else if (delta != 0) fail("candidate result", $0)
+        next
+      }
+      if (transport == "tcp" && operation == "inject") {
+        inject_total += delta
+        if (status == "valid") inject_valid += delta
+        else if (delta != 0) fail("inject result", $0)
+        next
+      }
+      if (transport == "tcp" && operation == "stage") {
+        stage_total += delta
+        if (status == "valid") stage_valid += delta
+        else if (delta != 0) fail("stage result", $0)
+        next
+      }
+      allowed = operation == "negotiate" && status == "missing" && transport == selected
+      allowed = allowed || (operation == "cleanup" && status == "valid" && transport == "tcp")
+      allowed = allowed || (operation == "report" && status == "valid" && transport == "tcp")
+      if (delta != 0 && !allowed) fail("operation result", $0)
+    }
+    END {
+      maximum_discards = wanted_outcome == "reason_coded_drop" ? 1 : 0
+      if (candidate_valid != 2 || candidate_total != 2 ||
+          inject_valid != 2 || inject_total != 2 ||
+          stage_valid != wanted_valid || stage_total != wanted_valid ||
+          take_valid != wanted_valid || discard_total < minimum_discards ||
+          discard_total > maximum_discards || reason_discard != discard_total) {
+        printf "timeout cancellation metric mismatch: outcome=%s reason=%s candidate=%d/%d inject=%d/%d stage=%d/%d take=%d discard=%d reason-discard=%d\n",
+          wanted_outcome, wanted_reason, candidate_valid, candidate_total,
+          inject_valid, inject_total, stage_valid, stage_total, take_valid,
+          discard_total, reason_discard > "/dev/stderr"
+        failed = 1
+      }
+      exit failed ? 1 : 0
+    }
+  ' "$input"
+}
+
 assert_primary_security_metric_delta() {
   local -r input="$1"
   local -r operation="$2"
@@ -10349,6 +11295,114 @@ assert_java_diagnostics_delta() {
       return 1
     fi
   done
+}
+
+assert_one_reason_coded_discard_diagnostics_delta() {
+  local -r input="$1"
+  local -r expected_valid="$2"
+  local -r reason="$3"
+  local name=""
+  local actual=""
+  local expected=""
+  local -a failure_counters=(
+    provider_reject provider_ver lookup_missing lookup_version lookup_error
+    record_version invoke_error extract_fields extract_invalid extract_error
+    registration_fail
+  )
+
+  case "$reason" in
+    missing|stale|unsupported|malformed|version_mismatch|ambiguous|unauthorized|already_consumed|timeout|overload|transport_error|disabled)
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  if ! assert_java_diagnostics_delta_schema "$input"; then
+    log_error "reason-coded Java diagnostics delta did not contain the exact counter schema"
+    return 1
+  fi
+  while IFS= read -r name; do
+    actual="$(java_diagnostic_delta "$input" "$name")" || return 1
+    expected=0
+    if [[ "$name" == "t_valid" ]]; then
+      expected="$expected_valid"
+    elif [[ "$name" == "d_$reason" ]]; then
+      expected=1
+    fi
+    if [[ "$actual" != "$expected" ]]; then
+      log_error "reason-coded Java diagnostics expected $name=$expected, got $actual"
+      return 1
+    fi
+  done < <(awk '$1 ~ /^[td]_/ { print $1 }' "$input")
+  for name in "${failure_counters[@]}"; do
+    actual="$(java_diagnostic_delta "$input" "$name")" || return 1
+    [[ "$actual" == "0" ]] || {
+      log_error "reason-coded Java diagnostics reported unexpected $name=$actual"
+      return 1
+    }
+  done
+  [[ "$(java_diagnostic_delta "$input" take_sampled)" == "$expected_valid" && \
+    "$(java_diagnostic_delta "$input" take_unsampled)" == "0" && \
+    "$(java_diagnostic_delta "$input" discard_standard)" == "0" ]] || {
+    log_error "reason-coded Java diagnostics changed flags or standard-parent precedence"
+    return 1
+  }
+}
+
+assert_coalesced_bridge_diagnostics_delta() {
+  local -r input="$1"
+  local -r outcome="$2"
+
+  case "$outcome" in
+    supported_exact)
+      assert_java_diagnostics_delta "$input" 2 0 0 0 2 0 0 "" 0
+      ;;
+    ambiguous_drop)
+      assert_one_reason_coded_discard_diagnostics_delta "$input" 0 ambiguous
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+assert_timeout_cancellation_diagnostics_delta() {
+  local -r input="$1"
+  local -r reconciliation="$2"
+  local outcome=""
+  local valid=""
+  local reason=""
+
+  outcome="$(jq -er '.parent_outcome' <<<"$reconciliation")" || return 1
+  valid="$(java_diagnostic_delta "$input" t_valid)" || return 1
+  case "$outcome" in
+    exact)
+      [[ "$valid" == "2" ]] || {
+        log_error "exact canceled request expected two valid Java takes, got $valid"
+        return 1
+      }
+      assert_java_diagnostics_delta "$input" 2 0 0 0 2 0 0 "" 0
+      ;;
+    missing)
+      [[ "$valid" == "1" || "$valid" == "2" ]] || {
+        log_error "missing canceled request expected one or two valid Java takes, got $valid"
+        return 1
+      }
+      assert_java_diagnostics_delta "$input" "$valid" 0 0 0 "$valid" 0 0 "" 0
+      ;;
+    reason_coded_drop)
+      [[ "$valid" == "1" ]] || {
+        log_error "reason-coded canceled request expected one valid retry take, got $valid"
+        return 1
+      }
+      reason="$(jq -er '.drop_reasons | if length == 1 then .[0] else error("expected one drop reason") end' \
+        <<<"$reconciliation")" || return 1
+      assert_one_reason_coded_discard_diagnostics_delta "$input" 1 "$reason"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 assert_restart_fault_diagnostics() {

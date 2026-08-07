@@ -69,6 +69,24 @@ services:
     labels: *demo-labels
     restart: "no"
 
+  coalesced-source:
+    image: obi-apache-java-https-tracecheck:local
+    network_mode: host
+    entrypoint:
+      - /coalesced-source
+    environment:
+      LISTEN_ADDRESS: 127.0.0.1:18081
+      BACKEND_ADDRESS: 127.0.0.1:18444
+      BACKEND_TLS_PROTOCOL: ${BACKEND_TLS_PROTOCOL:-TLSv1.3}
+      CA_PATH: /run/obi-demo/certs/ca.crt
+    volumes:
+      - ./.runtime/certs/ca.crt:/run/obi-demo/certs/ca.crt:ro
+    depends_on:
+      java-backend:
+        condition: service_started
+    labels: *demo-labels
+    restart: "no"
+
   apache-proxy:
     image: httpd:2.4.68-alpine@sha256:1b766f17b84026429b7cb243317b142921b24432336e798bc881c43f45ed9567
     network_mode: host
@@ -79,6 +97,7 @@ services:
       - ./.runtime/certs/ca.crt:/run/obi-demo/certs/ca.crt:ro
     depends_on:
       - java-backend
+      - coalesced-source
     labels: *demo-labels
     restart: "no"
 
@@ -159,6 +178,16 @@ services:
     privileged: true
     entrypoint:
       - /map-pressure
+    profiles:
+      - tools
+    labels: *demo-labels
+
+  map-state:
+    image: obi-apache-java-https-tracecheck:local
+    network_mode: none
+    privileged: true
+    entrypoint:
+      - /map-state
     profiles:
       - tools
     labels: *demo-labels

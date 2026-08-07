@@ -69,6 +69,7 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
   static final int MIN_BODY_BYTES = 32 * 1024;
   static final int PADDING_HEADER_COUNT = 3;
   static final int PADDING_HEADER_VALUE_BYTES = 6000;
+  static final String SEQUENCE_HEADER = "x-obi-boundary-sequence";
 
   private static final int MAX_INITIAL_LINE_BYTES = 4096;
   private static final int MAX_HEADER_BYTES = 32 * 1024;
@@ -78,6 +79,8 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
   private static final int MAX_TLS_RECORDS = 32;
   private static final int MAX_ACTIVE_CHANNELS = 256;
   private static final int REQUEST_DEADLINE_SECONDS = 5;
+  static final long COALESCING_GRACE_MILLIS = 150;
+  private static final long MAX_COALESCING_GRACE_MILLIS = 1000;
   private static final int MAX_TLS_RECORD_OVERHEAD_BYTES = 256;
   private static final int MAX_TLS_FRAME_BYTES =
       TlsRecordObserver.TLS_HEADER_BYTES + TlsRecordObserver.MAX_TLS_RECORD_PAYLOAD_BYTES;
@@ -88,15 +91,17 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
   private static final AtomicLong NEXT_CONNECTION_ID = new AtomicLong(1);
 
   enum Mode {
-    SPLIT("split", SPLIT_API_PATH),
-    COALESCED("coalesced", COALESCED_API_PATH);
+    SPLIT("split", SPLIT_API_PATH, 1),
+    COALESCED("coalesced", COALESCED_API_PATH, 2);
 
     private final String value;
     private final String path;
+    private final int requestCount;
 
-    Mode(String value, String path) {
+    Mode(String value, String path, int requestCount) {
       this.value = value;
       this.path = path;
+      this.requestCount = requestCount;
     }
 
     String value() {
@@ -105,6 +110,30 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
 
     String path() {
       return path;
+    }
+
+    int requestCount() {
+      return requestCount;
+    }
+
+    int maxPlaintextBytes() {
+      return requestCount * MAX_REQUEST_BYTES;
+    }
+  }
+
+  private enum DeliveryShape {
+    SPLIT("split"),
+    PARSER_COALESCED("parser_coalesced"),
+    SERIALIZED_PROXY_FALLBACK("serialized_proxy_fallback");
+
+    private final String value;
+
+    DeliveryShape(String value) {
+      this.value = value;
+    }
+
+    private String value() {
+      return value;
     }
   }
 
@@ -123,6 +152,27 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
       String keyStorePassword,
       String tlsProtocol)
       throws Exception {
+    return start(
+        splitPort,
+        coalescedPort,
+        keyStorePath,
+        keyStorePassword,
+        tlsProtocol,
+        COALESCING_GRACE_MILLIS);
+  }
+
+  static TlsBoundaryHttpsServer start(
+      int splitPort,
+      int coalescedPort,
+      Path keyStorePath,
+      String keyStorePassword,
+      String tlsProtocol,
+      long coalescingGraceMillis)
+      throws Exception {
+    if (coalescingGraceMillis <= 0
+        || coalescingGraceMillis > MAX_COALESCING_GRACE_MILLIS) {
+      throw new IllegalArgumentException("coalescing grace is outside the supported bound");
+    }
     TlsContextFactory.Contexts contexts =
         TlsContextFactory.load(keyStorePath, keyStorePassword, tlsProtocol);
     EventLoopGroup acceptor =
@@ -144,7 +194,8 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
               acceptor,
               eventLoop,
               parserExecutor,
-              childChannels);
+              childChannels,
+              coalescingGraceMillis);
       coalesced =
           bind(
               coalescedPort,
@@ -154,7 +205,8 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
               acceptor,
               eventLoop,
               parserExecutor,
-              childChannels);
+              childChannels,
+              coalescingGraceMillis);
       return new TlsBoundaryHttpsServer(
           acceptor, eventLoop, parserExecutor, childChannels, split, coalesced);
     } catch (Exception failure) {
@@ -216,7 +268,8 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
       EventLoopGroup acceptor,
       EventLoopGroup eventLoop,
       DefaultEventExecutorGroup parserExecutor,
-      ChannelGroup childChannels)
+      ChannelGroup childChannels,
+      long coalescingGraceMillis)
       throws InterruptedException {
     ServerBootstrap bootstrap = new ServerBootstrap();
     bootstrap
@@ -232,7 +285,7 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
                   return;
                 }
                 childChannels.add(channel);
-                BoundaryState state = new BoundaryState(mode);
+                BoundaryState state = new BoundaryState(mode, coalescingGraceMillis);
                 SslHandler tls = contexts.serverContext().newHandler(channel.alloc());
                 tls.setHandshakeTimeoutMillis(TimeUnit.SECONDS.toMillis(5));
                 channel
@@ -254,7 +307,9 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
                 channel.pipeline().addLast("tls-handshake", new HandshakeHandler(state));
                 channel
                     .pipeline()
-                    .addLast("decrypted-boundary", new DecryptedBoundaryHandler(state));
+                    .addLast(
+                        "decrypted-boundary",
+                        new DecryptedBoundaryHandler(state, coalescingGraceMillis));
                 channel
                     .pipeline()
                     .addLast(parserExecutor, "parser-boundary", new ParserBoundaryHandler(state));
@@ -371,13 +426,19 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
 
   private static final class DecryptedBoundaryHandler extends ChannelInboundHandlerAdapter {
     private final BoundaryState state;
+    private final long coalescingGraceMillis;
     private ByteBuf aggregate;
+    private ByteBuf verificationAggregate;
     private MessageDigest inputDigest;
-    private int expectedRequestBytes = -1;
-    private boolean emitted;
+    private ScheduledFuture<?> coalescingGrace;
+    private int firstRequestBytes;
+    private boolean serializedFallback;
+    private boolean fastPathCommitted;
+    private boolean pairEmitted;
 
-    private DecryptedBoundaryHandler(BoundaryState state) {
+    private DecryptedBoundaryHandler(BoundaryState state, long coalescingGraceMillis) {
       this.state = state;
+      this.coalescingGraceMillis = coalescingGraceMillis;
       if (state.mode == Mode.COALESCED) {
         inputDigest = sha256();
       }
@@ -406,86 +467,241 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
 
     private void coalesce(ChannelHandlerContext context, ByteBuf plaintext) {
       try {
-        if (emitted) {
-          state.fail("plaintext_after_request");
+        if (pairEmitted) {
+          state.fail("plaintext_after_request_pair");
           context.close();
           return;
         }
         int readable = plaintext.readableBytes();
         int aggregateBytes = aggregate == null ? 0 : aggregate.readableBytes();
-        if (readable <= 0 || aggregateBytes > MAX_REQUEST_BYTES - readable) {
-          state.fail("request_too_large");
+        if (readable <= 0 || aggregateBytes > state.mode.maxPlaintextBytes() - readable) {
+          state.fail("request_pair_too_large");
           context.close();
           return;
         }
         updateDigest(inputDigest, plaintext);
         if (aggregate == null) {
-          aggregate = context.alloc().buffer(Math.min(MAX_REQUEST_BYTES, Math.max(4096, readable)));
+          aggregate =
+              context
+                  .alloc()
+                  .buffer(
+                      Math.min(state.mode.maxPlaintextBytes(), Math.max(4096, readable)),
+                      state.mode.maxPlaintextBytes());
         }
         aggregate.writeBytes(plaintext, plaintext.readerIndex(), readable);
 
-        if (expectedRequestBytes < 0) {
-          int headerBytes = findHeaderBytes(aggregate);
-          if (headerBytes < 0) {
-            if (aggregate.readableBytes() > MAX_HEADER_BYTES) {
-              state.fail("headers_too_large");
-              context.close();
-            }
-            return;
-          }
-          int contentLength = parseContentLength(aggregate, headerBytes);
-          if (contentLength < 0 || contentLength > MAX_BODY_BYTES) {
-            state.fail("invalid_content_length");
-            context.close();
-            return;
-          }
-          expectedRequestBytes = headerBytes + contentLength;
+        if (serializedFallback) {
+          completeSerializedSecondRequest(context);
+          return;
         }
 
-        int buffered = aggregate.readableBytes();
-        if (buffered > expectedRequestBytes) {
-          state.fail("multiple_requests_on_connection");
+        FrameResult framing = frameRequests(aggregate, state.mode.requestCount());
+        if (framing.failure != null) {
+          state.fail(framing.failure);
           context.close();
           return;
         }
-        if (buffered == expectedRequestBytes) {
-          ByteBuf complete = aggregate;
-          aggregate = null;
-          emitted = true;
-          byte[] before = inputDigest.digest();
-          byte[] after = digest(complete);
-          state.recordCoalescedPreservation(MessageDigest.isEqual(before, after));
-          context.fireChannelRead(complete);
+        if (!framing.complete) {
+          observeIncompletePair(context, framing);
+          return;
         }
+
+        completeParserCoalescedPair(context, framing);
       } finally {
         ReferenceCountUtil.release(plaintext);
       }
     }
 
+    private void observeIncompletePair(ChannelHandlerContext context, FrameResult framing) {
+      if (framing.frames.size() != 1) {
+        return;
+      }
+      int firstBytes = framing.frames.get(0).totalBytes;
+      if (aggregate.readableBytes() == firstBytes && !fastPathCommitted) {
+        scheduleCoalescingGrace(context);
+        return;
+      }
+      fastPathCommitted = true;
+      cancelCoalescingGrace();
+    }
+
+    private void scheduleCoalescingGrace(ChannelHandlerContext context) {
+      if (coalescingGrace != null) {
+        return;
+      }
+      coalescingGrace =
+          context
+              .executor()
+              .schedule(
+                  () -> beginSerializedFallback(context),
+                  coalescingGraceMillis,
+                  TimeUnit.MILLISECONDS);
+    }
+
+    private void beginSerializedFallback(ChannelHandlerContext context) {
+      coalescingGrace = null;
+      if (pairEmitted
+          || serializedFallback
+          || fastPathCommitted
+          || aggregate == null
+          || !context.channel().isActive()) {
+        return;
+      }
+      FrameResult first = frameRequests(aggregate, 1);
+      if (first.failure != null || !first.complete || first.frames.size() != 1) {
+        state.fail("coalescing_grace_state_mismatch");
+        context.close();
+        return;
+      }
+
+      ByteBuf complete = aggregate;
+      aggregate = null;
+      boolean forwarded = false;
+      try {
+        firstRequestBytes = complete.readableBytes();
+        verificationAggregate =
+            context
+                .alloc()
+                .buffer(
+                    Math.max(4096, firstRequestBytes), state.mode.maxPlaintextBytes());
+        verificationAggregate.writeBytes(
+            complete, complete.readerIndex(), complete.readableBytes());
+        boolean firstCopyExact =
+            MessageDigest.isEqual(digest(complete), digest(verificationAggregate));
+        serializedFallback = true;
+        if (!state.recordSerializedFirstFrame(
+            first.frames.get(0), firstCopyExact, verificationAggregate.readableBytes())) {
+          context.close();
+          return;
+        }
+        forwarded = true;
+      } finally {
+        if (!forwarded) {
+          complete.release();
+          releaseVerificationAggregate();
+        }
+      }
+      context.fireChannelRead(complete);
+    }
+
+    private void completeParserCoalescedPair(
+        ChannelHandlerContext context, FrameResult framing) {
+      cancelCoalescingGrace();
+      ByteBuf complete = aggregate;
+      aggregate = null;
+      boolean forwarded = false;
+      try {
+        pairEmitted = true;
+        byte[] before = inputDigest.digest();
+        byte[] after = digest(complete);
+        if (!state.recordParserCoalescedFrames(
+            framing.frames,
+            MessageDigest.isEqual(before, after),
+            complete.readableBytes())) {
+          context.close();
+          return;
+        }
+        forwarded = true;
+      } finally {
+        if (!forwarded) {
+          complete.release();
+        }
+      }
+      context.fireChannelRead(complete);
+    }
+
+    private void completeSerializedSecondRequest(ChannelHandlerContext context) {
+      FrameResult second = frameRequests(aggregate, 1);
+      if (second.failure != null) {
+        state.fail(second.failure);
+        context.close();
+        return;
+      }
+      if (!second.complete) {
+        return;
+      }
+      if (verificationAggregate == null
+          || verificationAggregate.readableBytes() != firstRequestBytes
+          || second.frames.size() != 1) {
+        state.fail("serialized_verification_state_mismatch");
+        context.close();
+        return;
+      }
+
+      ByteBuf complete = aggregate;
+      aggregate = null;
+      boolean forwarded = false;
+      try {
+        verificationAggregate.writeBytes(
+            complete, complete.readerIndex(), complete.readableBytes());
+        byte[] before = inputDigest.digest();
+        byte[] after = digest(verificationAggregate);
+        RequestFrame unshifted = second.frames.get(0);
+        RequestFrame shifted =
+            new RequestFrame(
+                firstRequestBytes + unshifted.startOffset,
+                unshifted.headerBytes,
+                unshifted.bodyBytes);
+        int verificationBytes = verificationAggregate.readableBytes();
+        releaseVerificationAggregate();
+        pairEmitted = true;
+        if (!state.recordSerializedSecondFrame(
+            shifted, MessageDigest.isEqual(before, after), verificationBytes)) {
+          context.close();
+          return;
+        }
+        forwarded = true;
+      } finally {
+        if (!forwarded) {
+          complete.release();
+          releaseVerificationAggregate();
+        }
+      }
+      context.fireChannelRead(complete);
+    }
+
     @Override
     public void channelInactive(ChannelHandlerContext context) {
-      releaseAggregate();
+      cancelCoalescingGrace();
+      releaseBuffers();
       state.connectionTerminated();
       context.fireChannelInactive();
     }
 
     @Override
     public void handlerRemoved(ChannelHandlerContext context) {
-      releaseAggregate();
+      cancelCoalescingGrace();
+      releaseBuffers();
       state.connectionTerminated();
     }
 
     @Override
     public void exceptionCaught(ChannelHandlerContext context, Throwable cause) {
       state.fail("decrypted_boundary_error");
-      releaseAggregate();
+      cancelCoalescingGrace();
+      releaseBuffers();
       context.close();
     }
 
-    private void releaseAggregate() {
+    private void cancelCoalescingGrace() {
+      if (coalescingGrace != null) {
+        coalescingGrace.cancel(false);
+        coalescingGrace = null;
+      }
+    }
+
+    private void releaseBuffers() {
       if (aggregate != null) {
         aggregate.release();
         aggregate = null;
+      }
+      releaseVerificationAggregate();
+    }
+
+    private void releaseVerificationAggregate() {
+      if (verificationAggregate != null) {
+        verificationAggregate.release();
+        verificationAggregate = null;
       }
     }
   }
@@ -499,13 +715,23 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
 
     @Override
     public void channelRead(ChannelHandlerContext context, Object message) {
-      if (!(message instanceof ByteBuf) || !state.recordParser((ByteBuf) message)) {
+      if (!(message instanceof ByteBuf)) {
         state.fail("invalid_parser_buffer");
         ReferenceCountUtil.release(message);
         context.close();
         return;
       }
-      context.fireChannelRead(message);
+      BoundaryState.ParserToken token = state.beginParser((ByteBuf) message);
+      if (token == null) {
+        ReferenceCountUtil.release(message);
+        context.close();
+        return;
+      }
+      try {
+        context.fireChannelRead(message);
+      } finally {
+        state.endParser(token);
+      }
     }
 
     @Override
@@ -524,7 +750,8 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
 
     @Override
     public void channelRead(ChannelHandlerContext context, Object message) {
-      if (message instanceof HttpRequest && !state.recordHttpRequestEmission()) {
+      if (message instanceof HttpRequest
+          && !state.recordHttpRequestEmission((HttpRequest) message)) {
         ReferenceCountUtil.release(message);
         context.close();
         return;
@@ -543,7 +770,7 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
     private final BoundaryState state;
     private final Mode mode;
     private final String configuredProtocol;
-    private boolean handled;
+    private final List<PendingRequest> pending = new ArrayList<>();
 
     private RequestHandler(BoundaryState state, Mode mode, String configuredProtocol) {
       this.state = state;
@@ -553,71 +780,147 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
 
     @Override
     protected void channelRead0(ChannelHandlerContext context, FullHttpRequest request) {
-      if (handled) {
-        state.fail("multiple_parsed_requests");
-        respond(context, HttpResponseStatus.BAD_REQUEST, "multiple requests are not supported\n");
+      if (pending.size() >= mode.requestCount()) {
+        reject(context, "trailing_http_request", HttpResponseStatus.BAD_REQUEST);
         return;
       }
-      handled = true;
-      state.requestFinished();
       if (!request.decoderResult().isSuccess()
           || request.method() != HttpMethod.POST
           || !mode.path().equals(request.uri())) {
-        state.fail("invalid_http_request");
-        respond(context, HttpResponseStatus.NOT_FOUND, "not found\n");
+        reject(context, "invalid_http_request", HttpResponseStatus.NOT_FOUND);
         return;
       }
 
+      int sequence = requestSequence(request);
+      int expectedSequence = pending.size() + 1;
+      if (sequence != expectedSequence || sequence > mode.requestCount()) {
+        reject(context, "invalid_request_sequence", HttpResponseStatus.BAD_REQUEST);
+        return;
+      }
       String marker = request.headers().get("x-obi-demo-id");
       if (marker == null || !MARKER_PATTERN.matcher(marker).matches()) {
-        state.fail("invalid_marker");
-        respond(context, HttpResponseStatus.BAD_REQUEST, "invalid x-obi-demo-id header\n");
+        reject(context, "invalid_marker", HttpResponseStatus.BAD_REQUEST);
+        return;
+      }
+      for (PendingRequest accepted : pending) {
+        if (accepted.marker.equals(marker)) {
+          reject(context, "duplicate_marker", HttpResponseStatus.BAD_REQUEST);
+          return;
+        }
+      }
+      boolean keepAlive = HttpUtil.isKeepAlive(request);
+      if ((mode == Mode.SPLIT && keepAlive)
+          || (mode == Mode.COALESCED && sequence == 1 && !keepAlive)) {
+        reject(context, "invalid_connection_lifecycle", HttpResponseStatus.BAD_REQUEST);
         return;
       }
       if (HttpUtil.isTransferEncodingChunked(request)
           || request.headers().getAll(HttpHeaderNames.CONTENT_LENGTH).size() != 1
           || HttpUtil.getContentLength(request, -1) != MIN_BODY_BYTES
           || !validPaddingHeaders(request)) {
-        state.fail("invalid_boundary_request_shape");
-        respond(context, HttpResponseStatus.BAD_REQUEST, "invalid boundary request shape\n");
+        reject(context, "invalid_boundary_request_shape", HttpResponseStatus.BAD_REQUEST);
         return;
       }
       int bodyBytes = request.content().readableBytes();
-      BoundaryEvidence evidence = state.evidence(bodyBytes);
+      if (!state.recordParsedRequest(sequence, bodyBytes)) {
+        context.close();
+        return;
+      }
+      pending.add(new PendingRequest(marker));
 
+      if (state.isSerializedFallback()) {
+        boolean close = sequence == mode.requestCount();
+        if (!state.recordResponse(sequence, close)) {
+          context.close();
+          return;
+        }
+        if (close) {
+          state.requestFinished();
+        }
+        BoundaryEvidence evidence = state.evidence();
+        sendEvidenceResponses(
+            context,
+            List.of(pending.get(sequence - 1)),
+            List.of(close),
+            evidence,
+            !close);
+        return;
+      }
+
+      if (pending.size() != mode.requestCount()) {
+        return;
+      }
+
+      List<Boolean> responseClose = expectedResponseClose(mode);
+      for (int index = 0; index < responseClose.size(); index++) {
+        if (!state.recordResponse(index + 1, responseClose.get(index))) {
+          context.close();
+          return;
+        }
+      }
+      state.requestFinished();
+      BoundaryEvidence evidence = state.evidence();
+      sendEvidenceResponses(context, pending, responseClose, evidence, false);
+    }
+
+    private void sendEvidenceResponses(
+        ChannelHandlerContext context,
+        List<PendingRequest> requests,
+        List<Boolean> closeOrder,
+        BoundaryEvidence evidence,
+        boolean flushKeepAlive) {
       SslHandler tls = context.pipeline().get(SslHandler.class);
       SSLSession session = tls == null ? null : tls.engine().getSession();
       String protocol = session == null ? configuredProtocol : session.getProtocol();
       String cipher = session == null ? "" : session.getCipherSuite();
       long connectionID = connectionID(context.channel());
       int remotePort = remotePort(context.channel().remoteAddress());
-      String body =
-          String.format(
-              Locale.ROOT,
-              "{\"marker\":\"%s\",\"secure\":true,\"protocol\":\"HTTP/1.1\","
-                  + "\"tls_protocol\":\"%s\",\"tls_cipher\":\"%s\","
-                  + "\"backend_connection_id\":%d,\"backend_remote_port\":%d,"
-                  + "\"backend_socket_fd\":0,\"tls_read_events\":%d,"
-                  + "\"tls_read_bytes\":%d,\"backend_kind\":\"netty-tls-boundary\","
-                  + "\"tls_boundary\":%s}%n",
-              ApacheJavaHttpsBackend.jsonEscape(marker),
-              ApacheJavaHttpsBackend.jsonEscape(protocol),
-              ApacheJavaHttpsBackend.jsonEscape(cipher),
-              connectionID,
-              remotePort,
-              ApacheJavaHttpsBackend.bridgeCounter("tlsReadEvents"),
-              ApacheJavaHttpsBackend.bridgeCounter("tlsReadBytes"),
-              evidence.toJson());
-      respond(
-          context,
-          evidence.passed ? HttpResponseStatus.OK : HttpResponseStatus.CONFLICT,
-          body);
+      long tlsReadEvents = ApacheJavaHttpsBackend.bridgeCounter("tlsReadEvents");
+      long tlsReadBytes = ApacheJavaHttpsBackend.bridgeCounter("tlsReadBytes");
+      String evidenceJson = evidence.toJson();
+      HttpResponseStatus status =
+          evidence.passed || evidence.partial()
+              ? HttpResponseStatus.OK
+              : HttpResponseStatus.CONFLICT;
+      for (int index = 0; index < requests.size(); index++) {
+        PendingRequest accepted = requests.get(index);
+        String body =
+            responseBody(
+                accepted.marker,
+                protocol,
+                cipher,
+                connectionID,
+                remotePort,
+                tlsReadEvents,
+                tlsReadBytes,
+                evidenceJson);
+        boolean close = closeOrder.get(index);
+        FullHttpResponse response = response(status, body, close);
+        if (close) {
+          context.writeAndFlush(response).addListener(ChannelFutureListener.CLOSE);
+        } else if (flushKeepAlive && index == requests.size() - 1) {
+          context.writeAndFlush(response);
+        } else {
+          context.write(response);
+        }
+      }
     }
 
     @Override
     public void exceptionCaught(ChannelHandlerContext context, Throwable cause) {
       state.fail("request_handler_error");
       context.close();
+    }
+
+    private void reject(
+        ChannelHandlerContext context, String reason, HttpResponseStatus splitStatus) {
+      state.fail(reason);
+      if (mode == Mode.SPLIT) {
+        context.writeAndFlush(response(splitStatus, "boundary request rejected\n", true))
+            .addListener(ChannelFutureListener.CLOSE);
+      } else {
+        context.close();
+      }
     }
 
     private static long connectionID(Channel channel) {
@@ -659,42 +962,93 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
       return true;
     }
 
-    private static void respond(
-        ChannelHandlerContext context, HttpResponseStatus status, String body) {
+    private static String responseBody(
+        String marker,
+        String protocol,
+        String cipher,
+        long connectionID,
+        int remotePort,
+        long tlsReadEvents,
+        long tlsReadBytes,
+        String evidenceJson) {
+      return String.format(
+          Locale.ROOT,
+          "{\"marker\":\"%s\",\"secure\":true,\"protocol\":\"HTTP/1.1\","
+              + "\"tls_protocol\":\"%s\",\"tls_cipher\":\"%s\","
+              + "\"backend_connection_id\":%d,\"backend_remote_port\":%d,"
+              + "\"backend_socket_fd\":0,\"tls_read_events\":%d,"
+              + "\"tls_read_bytes\":%d,\"backend_kind\":\"netty-tls-boundary\","
+              + "\"tls_boundary\":%s}%n",
+          ApacheJavaHttpsBackend.jsonEscape(marker),
+          ApacheJavaHttpsBackend.jsonEscape(protocol),
+          ApacheJavaHttpsBackend.jsonEscape(cipher),
+          connectionID,
+          remotePort,
+          tlsReadEvents,
+          tlsReadBytes,
+          evidenceJson);
+    }
+
+    private static FullHttpResponse response(
+        HttpResponseStatus status, String body, boolean close) {
       ByteBuf content = Unpooled.copiedBuffer(body, CharsetUtil.UTF_8);
       FullHttpResponse response =
           new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, status, content);
       response.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, content.readableBytes());
       response.headers().set(HttpHeaderNames.CONTENT_TYPE, "application/json; charset=utf-8");
       response.headers().set(HttpHeaderNames.CACHE_CONTROL, HttpHeaderValues.NO_STORE);
-      response.headers().set(HttpHeaderNames.CONNECTION, HttpHeaderValues.CLOSE);
-      context.writeAndFlush(response).addListener(ChannelFutureListener.CLOSE);
+      response
+          .headers()
+          .set(
+              HttpHeaderNames.CONNECTION,
+              close ? HttpHeaderValues.CLOSE : HttpHeaderValues.KEEP_ALIVE);
+      return response;
+    }
+
+    private static final class PendingRequest {
+      private final String marker;
+
+      private PendingRequest(String marker) {
+        this.marker = marker;
+      }
     }
   }
 
   private static final class BoundaryState {
     private final Mode mode;
+    private final long coalescingGraceMillis;
     private final List<BufferObservation> decrypted = new ArrayList<>();
     private final List<ParserObservation> parsers = new ArrayList<>();
+    private final List<Integer> emissionOrder = new ArrayList<>();
+    private final List<Integer> emissionParserOrder = new ArrayList<>();
+    private final List<Integer> requestOrder = new ArrayList<>();
+    private final List<Integer> parsedBodyBytes = new ArrayList<>();
+    private final List<Integer> responseOrder = new ArrayList<>();
+    private final List<Boolean> responseClose = new ArrayList<>();
+    private List<RequestFrame> framedRequests = List.of();
+    private DeliveryShape deliveryShape;
     private int eventSequence;
     private int observedPlaintextBytes;
+    private int pairVerificationBufferBytes;
     private int headerBytes;
     private int headerWindow;
     private int headerWindowBytes;
     private boolean handshakeComplete;
     private WireToken activeWire;
+    private ParserToken activeParser;
     private boolean splitBuffersUnchanged = true;
     private boolean coalescedBytesPreserved;
-    private boolean requestEmitted;
-    private int decryptedCallbacksAtRequestEmission;
-    private int parserCallbacksAtRequestEmission;
+    private boolean pairVerificationDigestExact;
     private ScheduledFuture<?> requestDeadline;
     private boolean terminal;
     private String failure = "none";
 
-    private BoundaryState(Mode mode) {
+    private BoundaryState(Mode mode, long coalescingGraceMillis) {
       this.mode = mode;
+      this.coalescingGraceMillis =
+          mode == Mode.COALESCED ? coalescingGraceMillis : 0;
       coalescedBytesPreserved = mode == Mode.SPLIT;
+      deliveryShape = mode == Mode.SPLIT ? DeliveryShape.SPLIT : null;
     }
 
     private synchronized void handshakeComplete(ChannelHandlerContext context) {
@@ -764,7 +1118,7 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
       int length = buffer.readableBytes();
       if (length <= 0
           || decrypted.size() >= MAX_TLS_RECORDS
-          || observedPlaintextBytes > MAX_REQUEST_BYTES - length) {
+          || observedPlaintextBytes > mode.maxPlaintextBytes() - length) {
         fail("invalid_plaintext_callback");
         return false;
       }
@@ -783,50 +1137,193 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
               activeWire.legacyVersion,
               activeWire.payloadLength,
               ++eventSequence));
-      observeHeader(buffer);
+      if (mode == Mode.SPLIT) {
+        observeSplitHeader(buffer);
+      }
+      observedPlaintextBytes += length;
       return "none".equals(failure);
     }
 
-    private synchronized boolean recordParser(ByteBuf buffer) {
-      if (parsers.size() >= MAX_TLS_RECORDS) {
+    private synchronized ParserToken beginParser(ByteBuf buffer) {
+      if (activeParser != null || parsers.size() >= MAX_TLS_RECORDS) {
         fail("too_many_parser_callbacks");
-        return false;
+        return null;
       }
       ParserObservation parser = new ParserObservation(buffer, ++eventSequence);
       parsers.add(parser);
+      ParserToken token = new ParserToken(parsers.size());
+      activeParser = token;
       if (mode == Mode.SPLIT) {
         int index = parsers.size() - 1;
         if (index >= decrypted.size() || !decrypted.get(index).sameBuffer(buffer)) {
           splitBuffersUnchanged = false;
           fail("split_buffer_changed");
         }
+      } else if (deliveryShape == DeliveryShape.PARSER_COALESCED) {
+        if (parsers.size() != 1) {
+          fail("coalesced_parser_callback_count");
+        }
+      } else if (deliveryShape == DeliveryShape.SERIALIZED_PROXY_FALLBACK) {
+        if (parsers.size() > mode.requestCount()) {
+          fail("serialized_parser_callback_count");
+        }
+      } else {
+        fail("parser_before_delivery_shape");
+      }
+      return "none".equals(failure) ? token : null;
+    }
+
+    private synchronized void endParser(ParserToken token) {
+      if (activeParser != token) {
+        fail("parser_scope_mismatch");
+      }
+      activeParser = null;
+    }
+
+    private synchronized boolean recordParserCoalescedFrames(
+        List<RequestFrame> frames, boolean preserved, int verificationBytes) {
+      if (mode != Mode.COALESCED
+          || deliveryShape != null
+          || !framedRequests.isEmpty()
+          || frames.size() != mode.requestCount()
+          || sumRequestBytes(frames) != observedPlaintextBytes
+          || verificationBytes != observedPlaintextBytes) {
+        fail("invalid_coalesced_request_frames");
+        return false;
+      }
+      deliveryShape = DeliveryShape.PARSER_COALESCED;
+      framedRequests = List.copyOf(frames);
+      coalescedBytesPreserved = preserved;
+      pairVerificationBufferBytes = verificationBytes;
+      pairVerificationDigestExact = preserved;
+      if (!preserved) {
+        fail("coalesced_bytes_changed");
       }
       return "none".equals(failure);
     }
 
-    private synchronized void recordCoalescedPreservation(boolean preserved) {
-      coalescedBytesPreserved = preserved;
-      if (!preserved) {
-        fail("coalesced_bytes_changed");
-      }
-    }
-
-    private synchronized boolean recordHttpRequestEmission() {
-      if (requestEmitted) {
-        fail("multiple_http_requests_emitted");
+    private synchronized boolean recordSerializedFirstFrame(
+        RequestFrame frame, boolean copyExact, int verificationBytes) {
+      if (mode != Mode.COALESCED
+          || deliveryShape != null
+          || !framedRequests.isEmpty()
+          || frame.startOffset != 0
+          || frame.totalBytes != observedPlaintextBytes
+          || verificationBytes != frame.totalBytes) {
+        fail("invalid_serialized_first_frame");
         return false;
       }
-      requestEmitted = true;
-      decryptedCallbacksAtRequestEmission = decrypted.size();
-      parserCallbacksAtRequestEmission = parsers.size();
-      if (headerBytes == 0 || decryptedCallbacksAtRequestEmission < 2) {
+      deliveryShape = DeliveryShape.SERIALIZED_PROXY_FALLBACK;
+      framedRequests = List.of(frame);
+      coalescedBytesPreserved = copyExact;
+      pairVerificationBufferBytes = verificationBytes;
+      if (!copyExact) {
+        fail("serialized_first_copy_changed");
+      }
+      return "none".equals(failure);
+    }
+
+    private synchronized boolean recordSerializedSecondFrame(
+        RequestFrame frame, boolean preserved, int verificationBytes) {
+      if (mode != Mode.COALESCED
+          || deliveryShape != DeliveryShape.SERIALIZED_PROXY_FALLBACK
+          || framedRequests.size() != 1
+          || frame.startOffset != framedRequests.get(0).totalBytes
+          || framedRequests.get(0).totalBytes + frame.totalBytes != observedPlaintextBytes
+          || verificationBytes != observedPlaintextBytes) {
+        fail("invalid_serialized_second_frame");
+        return false;
+      }
+      framedRequests = List.of(framedRequests.get(0), frame);
+      coalescedBytesPreserved = preserved;
+      pairVerificationBufferBytes = verificationBytes;
+      pairVerificationDigestExact = preserved;
+      if (!preserved) {
+        fail("serialized_pair_bytes_changed");
+      }
+      return "none".equals(failure);
+    }
+
+    private synchronized boolean isSerializedFallback() {
+      return deliveryShape == DeliveryShape.SERIALIZED_PROXY_FALLBACK;
+    }
+
+    private synchronized boolean recordHttpRequestEmission(HttpRequest request) {
+      int sequence = requestSequence(request);
+      int expected = emissionOrder.size() + 1;
+      int parserIndex = activeParser == null ? parsers.size() : activeParser.index;
+      if (parserIndex <= 0
+          || sequence != expected
+          || sequence > mode.requestCount()
+          || emissionOrder.size() >= mode.requestCount()) {
+        fail("invalid_http_request_emission");
+        return false;
+      }
+      emissionOrder.add(sequence);
+      emissionParserOrder.add(parserIndex);
+      if (mode == Mode.SPLIT && (headerBytes == 0 || decrypted.size() < 2)) {
         fail("request_emitted_before_header_boundaries");
       }
-      return true;
+      if (mode == Mode.COALESCED) {
+        int expectedParserIndex =
+            deliveryShape == DeliveryShape.PARSER_COALESCED ? 1 : sequence;
+        if (deliveryShape == null || parserIndex != expectedParserIndex) {
+          fail("coalesced_request_emitted_from_wrong_parser_callback");
+        }
+      }
+      return "none".equals(failure);
+    }
+
+    private synchronized boolean recordParsedRequest(int sequence, int bodyBytes) {
+      int expected = requestOrder.size() + 1;
+      if (sequence != expected
+          || sequence > mode.requestCount()
+          || bodyBytes != MIN_BODY_BYTES
+          || emissionOrder.size() < sequence
+          || emissionOrder.get(sequence - 1) != sequence) {
+        fail("invalid_parsed_request");
+        return false;
+      }
+      if (mode == Mode.SPLIT && framedRequests.isEmpty()) {
+        if (headerBytes < MIN_HEADER_BYTES
+            || observedPlaintextBytes != headerBytes + bodyBytes) {
+          fail("invalid_split_request_frame");
+          return false;
+        }
+        framedRequests = List.of(new RequestFrame(0, headerBytes, bodyBytes));
+      }
+      if (deliveryShape == null
+          || framedRequests.size() < sequence
+          || framedRequests.get(sequence - 1).bodyBytes != bodyBytes) {
+        fail("parsed_request_frame_mismatch");
+        return false;
+      }
+      requestOrder.add(sequence);
+      parsedBodyBytes.add(bodyBytes);
+      return "none".equals(failure);
+    }
+
+    private synchronized boolean recordResponse(int sequence, boolean close) {
+      int expected = responseOrder.size() + 1;
+      List<Boolean> expectedClose = expectedResponseClose(mode);
+      if (sequence != expected
+          || sequence > mode.requestCount()
+          || requestOrder.size() < sequence
+          || requestOrder.get(sequence - 1) != sequence
+          || close != expectedClose.get(sequence - 1)) {
+        fail("invalid_response_order");
+        return false;
+      }
+      responseOrder.add(sequence);
+      responseClose.add(close);
+      return "none".equals(failure);
     }
 
     private synchronized void requestFinished() {
-      if (terminal) {
+      if (terminal
+          || requestOrder.size() != mode.requestCount()
+          || responseOrder.size() != mode.requestCount()) {
+        fail("invalid_request_completion");
         return;
       }
       terminal = true;
@@ -834,6 +1331,9 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
     }
 
     private synchronized void connectionTerminated() {
+      if (!terminal) {
+        fail("connection_before_request_set_complete");
+      }
       terminal = true;
       cancelRequestDeadline();
     }
@@ -851,30 +1351,78 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
       }
     }
 
-    private synchronized BoundaryEvidence evidence(int bodyBytes) {
-      List<Integer> versions = new ArrayList<>(decrypted.size());
-      List<Integer> payloadLengths = new ArrayList<>(decrypted.size());
-      List<Integer> decryptedLengths = new ArrayList<>(decrypted.size());
+    private synchronized BoundaryEvidence evidence() {
+      boolean partialFallbackSnapshot =
+          deliveryShape == DeliveryShape.SERIALIZED_PROXY_FALLBACK
+              && responseOrder.equals(List.of(1));
+      List<RequestFrame> evidenceFrames =
+          partialFallbackSnapshot ? List.of(framedRequests.get(0)) : framedRequests;
+      int evidencePlaintextBytes = sumRequestBytes(evidenceFrames);
+      List<BufferObservation> evidenceDecrypted = new ArrayList<>();
+      int evidenceDecryptedBytes = 0;
       for (BufferObservation observation : decrypted) {
+        if (partialFallbackSnapshot && evidenceDecryptedBytes >= evidencePlaintextBytes) {
+          break;
+        }
+        evidenceDecrypted.add(observation);
+        evidenceDecryptedBytes += observation.readableBytes;
+      }
+      List<ParserObservation> evidenceParsers =
+          partialFallbackSnapshot && parsers.size() > 1
+              ? List.of(parsers.get(0))
+              : parsers;
+      List<Integer> evidenceEmissionOrder =
+          prefix(emissionOrder, evidenceFrames.size());
+      List<Integer> evidenceEmissionParserOrder =
+          prefix(emissionParserOrder, evidenceFrames.size());
+      List<Integer> evidenceRequestOrder = prefix(requestOrder, evidenceFrames.size());
+      List<Integer> evidenceParsedBodyBytes =
+          prefix(parsedBodyBytes, evidenceFrames.size());
+      int evidenceVerificationBytes =
+          partialFallbackSnapshot ? evidencePlaintextBytes : pairVerificationBufferBytes;
+      boolean evidenceVerificationDigestExact =
+          !partialFallbackSnapshot && pairVerificationDigestExact;
+
+      List<Integer> versions = new ArrayList<>(evidenceDecrypted.size());
+      List<Integer> payloadLengths = new ArrayList<>(evidenceDecrypted.size());
+      List<Integer> decryptedLengths = new ArrayList<>(evidenceDecrypted.size());
+      for (BufferObservation observation : evidenceDecrypted) {
         versions.add(observation.legacyVersion);
         payloadLengths.add(observation.payloadLength);
         decryptedLengths.add(observation.readableBytes);
       }
-      List<Integer> parserLengths = new ArrayList<>(parsers.size());
-      for (ParserObservation parser : parsers) {
+      List<Integer> parserLengths = new ArrayList<>(evidenceParsers.size());
+      for (ParserObservation parser : evidenceParsers) {
         parserLengths.add(parser.readableBytes);
       }
 
-      int requestBytes = sum(decryptedLengths);
-      int headerCallbackCount = callbacksCovering(decryptedLengths, headerBytes);
+      List<Integer> requestHeaderBytes = new ArrayList<>(evidenceFrames.size());
+      List<Integer> requestBodyBytes = new ArrayList<>(evidenceFrames.size());
+      List<Integer> requestTotalBytes = new ArrayList<>(evidenceFrames.size());
+      List<Integer> requestHeaderCallbackCounts = new ArrayList<>(evidenceFrames.size());
+      for (RequestFrame frame : evidenceFrames) {
+        requestHeaderBytes.add(frame.headerBytes);
+        requestBodyBytes.add(frame.bodyBytes);
+        requestTotalBytes.add(frame.totalBytes);
+        requestHeaderCallbackCounts.add(
+            callbacksIntersecting(
+                decryptedLengths,
+                frame.startOffset,
+                frame.startOffset + frame.headerBytes));
+      }
+
+      int decryptedTotalBytes = sum(decryptedLengths);
+      int parserTotalBytes = sum(parserLengths);
       boolean wirePairsExact =
           decryptedLengths.size() >= 2
               && decryptedLengths.size() == versions.size()
               && decryptedLengths.size() == payloadLengths.size();
-      boolean headerSpannedRecords =
-          headerBytes >= MIN_HEADER_BYTES
-              && headerCallbackCount >= 2
-              && decryptedCallbacksAtRequestEmission >= headerCallbackCount;
+      boolean headersSpannedRecords = !evidenceFrames.isEmpty();
+      for (int index = 0; headersSpannedRecords && index < evidenceFrames.size(); index++) {
+        headersSpannedRecords =
+            evidenceFrames.get(index).headerBytes >= MIN_HEADER_BYTES
+                && requestHeaderCallbackCounts.get(index) >= 2;
+      }
       boolean parserShapeExact;
       boolean handoffBeforeParse;
       if (mode == Mode.SPLIT) {
@@ -885,11 +1433,11 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
               decrypted.get(index).eventSequence < parsers.get(index).eventSequence
                   && decrypted.get(index).threadID != parsers.get(index).threadID;
         }
-      } else {
+      } else if (deliveryShape == DeliveryShape.PARSER_COALESCED) {
         parserShapeExact =
             coalescedBytesPreserved
                 && parserLengths.size() == 1
-                && parserLengths.get(0) == requestBytes;
+                && parserLengths.get(0) == decryptedTotalBytes;
         handoffBeforeParse = !decrypted.isEmpty() && parsers.size() == 1;
         for (BufferObservation observation : decrypted) {
           handoffBeforeParse =
@@ -897,63 +1445,164 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
                   && observation.eventSequence < parsers.get(0).eventSequence
                   && observation.threadID != parsers.get(0).threadID;
         }
+      } else if (deliveryShape == DeliveryShape.SERIALIZED_PROXY_FALLBACK) {
+        parserShapeExact =
+            coalescedBytesPreserved && parserLengths.size() == evidenceFrames.size();
+        for (int index = 0; parserShapeExact && index < parserLengths.size(); index++) {
+          parserShapeExact = parserLengths.get(index) == evidenceFrames.get(index).totalBytes;
+        }
+        handoffBeforeParse =
+            serializedHandoffBeforeParse(
+                evidenceFrames, evidenceDecrypted, evidenceParsers);
+      } else {
+        parserShapeExact = false;
+        handoffBeforeParse = false;
       }
+      List<Integer> expected = expectedOrder(mode.requestCount());
+      boolean requestsEmittedFromSingleParserCallback =
+          mode == Mode.SPLIT
+              ? evidenceEmissionParserOrder.size() == 1
+              : deliveryShape == DeliveryShape.PARSER_COALESCED
+                  && evidenceEmissionParserOrder.equals(List.of(1, 1))
+                  && evidenceParsers.size() == 1;
+      boolean emissionParserShapeExact =
+          mode == Mode.SPLIT
+              ? evidenceEmissionParserOrder.size() == 1
+              : deliveryShape == DeliveryShape.PARSER_COALESCED
+                  ? evidenceEmissionParserOrder.equals(List.of(1, 1))
+                  : evidenceEmissionParserOrder.equals(
+                      expectedOrder(evidenceEmissionParserOrder.size()));
       boolean requestComplete =
-          headerBytes > 0
-              && bodyBytes == MIN_BODY_BYTES
-              && requestBytes == headerBytes + bodyBytes;
+          evidenceFrames.size() == mode.requestCount()
+              && evidenceParsedBodyBytes.equals(requestBodyBytes)
+              && sum(requestTotalBytes) == decryptedTotalBytes;
+      boolean bytesPreserved =
+          requestComplete
+              && decryptedTotalBytes == parserTotalBytes
+              && (mode == Mode.SPLIT ? splitBuffersUnchanged : coalescedBytesPreserved);
+      boolean firstResponseKeepsAlive =
+          mode == Mode.COALESCED && !responseClose.isEmpty() && !responseClose.get(0);
+      boolean finalResponseCloses =
+          responseClose.size() == mode.requestCount()
+              && responseClose.get(responseClose.size() - 1);
+      boolean pairVerificationBounded =
+          mode == Mode.SPLIT
+              || evidenceVerificationBytes <= mode.maxPlaintextBytes();
+      boolean coalescedVerificationExact =
+          mode == Mode.SPLIT
+              || (evidenceVerificationDigestExact
+                  && evidenceVerificationBytes == decryptedTotalBytes);
+      String evidencePhase = requestComplete ? "final" : "partial";
+      String fallbackReason =
+          deliveryShape == DeliveryShape.SERIALIZED_PROXY_FALLBACK
+              ? "coalescing_grace_expired"
+              : "none";
       boolean passed =
           "none".equals(failure)
               && handshakeComplete
-              && requestEmitted
+              && "final".equals(evidencePhase)
+              && deliveryShape != null
+              && evidenceEmissionOrder.equals(expected)
+              && evidenceRequestOrder.equals(expected)
+              && responseOrder.equals(expected)
               && wirePairsExact
-              && headerSpannedRecords
+              && headersSpannedRecords
               && parserShapeExact
-              && coalescedBytesPreserved
+              && emissionParserShapeExact
               && handoffBeforeParse
-              && requestComplete;
+              && requestComplete
+              && bytesPreserved
+              && pairVerificationBounded
+              && coalescedVerificationExact
+              && finalResponseCloses
+              && (mode == Mode.SPLIT || firstResponseKeepsAlive);
       return new BoundaryEvidence(
           mode,
+          deliveryShape,
+          evidencePhase,
+          fallbackReason,
+          coalescingGraceMillis,
+          deliveryShape == DeliveryShape.SERIALIZED_PROXY_FALLBACK,
           passed,
           failure,
           requestComplete,
-          headerBytes,
-          bodyBytes,
-          requestBytes,
-          headerCallbackCount,
-          decryptedCallbacksAtRequestEmission,
-          parserCallbacksAtRequestEmission,
+          evidenceFrames.size(),
+          requestHeaderBytes,
+          requestBodyBytes,
+          requestTotalBytes,
+          requestHeaderCallbackCounts,
+          evidenceRequestOrder,
+          evidenceEmissionOrder,
+          evidenceEmissionParserOrder,
+          responseOrder,
+          responseClose,
           versions,
           payloadLengths,
           decryptedLengths,
           parserLengths,
+          decryptedTotalBytes,
+          parserTotalBytes,
+          evidenceVerificationBytes,
+          mode == Mode.COALESCED ? mode.maxPlaintextBytes() : 0,
+          evidenceVerificationDigestExact,
           wirePairsExact,
-          headerSpannedRecords,
+          headersSpannedRecords,
           parserShapeExact,
-          mode == Mode.COALESCED,
-          coalescedBytesPreserved,
-          splitBuffersUnchanged,
+          deliveryShape == DeliveryShape.PARSER_COALESCED,
+          requestsEmittedFromSingleParserCallback,
+          bytesPreserved,
+          mode == Mode.SPLIT && splitBuffersUnchanged,
           handoffBeforeParse,
-          true);
+          firstResponseKeepsAlive,
+          finalResponseCloses);
     }
 
-    private void observeHeader(ByteBuf buffer) {
+    private boolean serializedHandoffBeforeParse(
+        List<RequestFrame> frames,
+        List<BufferObservation> callbacks,
+        List<ParserObservation> parserCallbacks) {
+      if (parserCallbacks.size() != frames.size() || parserCallbacks.isEmpty()) {
+        return false;
+      }
+      for (int frameIndex = 0; frameIndex < frames.size(); frameIndex++) {
+        RequestFrame frame = frames.get(frameIndex);
+        ParserObservation parser = parserCallbacks.get(frameIndex);
+        int callbackStart = 0;
+        boolean observed = false;
+        for (BufferObservation callback : callbacks) {
+          int callbackEnd = callbackStart + callback.readableBytes;
+          if (callbackEnd > frame.startOffset
+              && callbackStart < frame.startOffset + frame.totalBytes) {
+            observed = true;
+            if (callback.eventSequence >= parser.eventSequence
+                || callback.threadID == parser.threadID) {
+              return false;
+            }
+          }
+          callbackStart = callbackEnd;
+        }
+        if (!observed) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    private void observeSplitHeader(ByteBuf buffer) {
       if (headerBytes != 0) {
-        observedPlaintextBytes += buffer.readableBytes();
         return;
       }
       int start = buffer.readerIndex();
       int end = buffer.writerIndex();
       for (int index = start; index < end; index++) {
-        observedPlaintextBytes++;
         headerWindow = (headerWindow << 8) | buffer.getUnsignedByte(index);
         if (headerWindowBytes < 4) {
           headerWindowBytes++;
         }
         if (headerWindowBytes == 4 && headerWindow == 0x0d0a0d0a) {
-          headerBytes = observedPlaintextBytes;
+          headerBytes = observedPlaintextBytes + index - start + 1;
         }
-        if (headerBytes == 0 && observedPlaintextBytes > MAX_HEADER_BYTES) {
+        if (headerBytes == 0 && observedPlaintextBytes + index - start + 1 > MAX_HEADER_BYTES) {
           fail("headers_too_large");
           return;
         }
@@ -969,6 +1618,52 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
         this.legacyVersion = legacyVersion;
         this.payloadLength = payloadLength;
       }
+    }
+
+    private static final class ParserToken {
+      private final int index;
+
+      private ParserToken(int index) {
+        this.index = index;
+      }
+    }
+  }
+
+  private static final class RequestFrame {
+    private final int startOffset;
+    private final int headerBytes;
+    private final int bodyBytes;
+    private final int totalBytes;
+
+    private RequestFrame(int startOffset, int headerBytes, int bodyBytes) {
+      this.startOffset = startOffset;
+      this.headerBytes = headerBytes;
+      this.bodyBytes = bodyBytes;
+      totalBytes = headerBytes + bodyBytes;
+    }
+  }
+
+  private static final class FrameResult {
+    private final boolean complete;
+    private final List<RequestFrame> frames;
+    private final String failure;
+
+    private FrameResult(boolean complete, List<RequestFrame> frames, String failure) {
+      this.complete = complete;
+      this.frames = List.copyOf(frames);
+      this.failure = failure;
+    }
+
+    private static FrameResult incomplete(List<RequestFrame> frames) {
+      return new FrameResult(false, frames, null);
+    }
+
+    private static FrameResult complete(List<RequestFrame> frames) {
+      return new FrameResult(true, frames, null);
+    }
+
+    private static FrameResult failed(String failure) {
+      return new FrameResult(false, List.of(), failure);
     }
   }
 
@@ -1016,119 +1711,234 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
 
   private static final class BoundaryEvidence {
     private final Mode mode;
+    private final DeliveryShape deliveryShape;
+    private final String evidencePhase;
+    private final String fallbackReason;
+    private final long coalescingGraceMillis;
+    private final boolean coalescingGraceExpired;
     private final boolean passed;
     private final String failure;
     private final boolean requestComplete;
-    private final int headerBytes;
-    private final int bodyBytes;
-    private final int requestBytes;
-    private final int headerCallbackCount;
-    private final int decryptedCallbacksAtRequestEmission;
-    private final int parserCallbacksAtRequestEmission;
+    private final int requestCount;
+    private final List<Integer> requestHeaderBytes;
+    private final List<Integer> requestBodyBytes;
+    private final List<Integer> requestTotalBytes;
+    private final List<Integer> requestHeaderCallbackCounts;
+    private final List<Integer> requestOrder;
+    private final List<Integer> emissionOrder;
+    private final List<Integer> emissionParserOrder;
+    private final List<Integer> responseOrder;
+    private final List<Boolean> responseClose;
     private final List<Integer> legacyVersions;
     private final List<Integer> payloadLengths;
     private final List<Integer> decryptedLengths;
     private final List<Integer> parserLengths;
+    private final int decryptedTotalBytes;
+    private final int parserTotalBytes;
+    private final int verificationBufferBytes;
+    private final int verificationBufferLimitBytes;
+    private final boolean verificationPairDigestExact;
     private final boolean wirePairsExact;
-    private final boolean headerSpannedRecords;
+    private final boolean headersSpannedRecords;
     private final boolean parserShapeExact;
     private final boolean parserFacingCoalesced;
+    private final boolean requestsEmittedFromSingleParserCallback;
     private final boolean requestBytesPreserved;
     private final boolean splitBuffersUnchanged;
     private final boolean handoffBeforeParse;
-    private final boolean closeRequested;
+    private final boolean firstResponseKeepsAlive;
+    private final boolean finalResponseCloses;
 
     private BoundaryEvidence(
         Mode mode,
+        DeliveryShape deliveryShape,
+        String evidencePhase,
+        String fallbackReason,
+        long coalescingGraceMillis,
+        boolean coalescingGraceExpired,
         boolean passed,
         String failure,
         boolean requestComplete,
-        int headerBytes,
-        int bodyBytes,
-        int requestBytes,
-        int headerCallbackCount,
-        int decryptedCallbacksAtRequestEmission,
-        int parserCallbacksAtRequestEmission,
+        int requestCount,
+        List<Integer> requestHeaderBytes,
+        List<Integer> requestBodyBytes,
+        List<Integer> requestTotalBytes,
+        List<Integer> requestHeaderCallbackCounts,
+        List<Integer> requestOrder,
+        List<Integer> emissionOrder,
+        List<Integer> emissionParserOrder,
+        List<Integer> responseOrder,
+        List<Boolean> responseClose,
         List<Integer> legacyVersions,
         List<Integer> payloadLengths,
         List<Integer> decryptedLengths,
         List<Integer> parserLengths,
+        int decryptedTotalBytes,
+        int parserTotalBytes,
+        int verificationBufferBytes,
+        int verificationBufferLimitBytes,
+        boolean verificationPairDigestExact,
         boolean wirePairsExact,
-        boolean headerSpannedRecords,
+        boolean headersSpannedRecords,
         boolean parserShapeExact,
         boolean parserFacingCoalesced,
+        boolean requestsEmittedFromSingleParserCallback,
         boolean requestBytesPreserved,
         boolean splitBuffersUnchanged,
         boolean handoffBeforeParse,
-        boolean closeRequested) {
+        boolean firstResponseKeepsAlive,
+        boolean finalResponseCloses) {
       this.mode = mode;
+      this.deliveryShape = deliveryShape;
+      this.evidencePhase = evidencePhase;
+      this.fallbackReason = fallbackReason;
+      this.coalescingGraceMillis = coalescingGraceMillis;
+      this.coalescingGraceExpired = coalescingGraceExpired;
       this.passed = passed;
       this.failure = failure;
       this.requestComplete = requestComplete;
-      this.headerBytes = headerBytes;
-      this.bodyBytes = bodyBytes;
-      this.requestBytes = requestBytes;
-      this.headerCallbackCount = headerCallbackCount;
-      this.decryptedCallbacksAtRequestEmission = decryptedCallbacksAtRequestEmission;
-      this.parserCallbacksAtRequestEmission = parserCallbacksAtRequestEmission;
+      this.requestCount = requestCount;
+      this.requestHeaderBytes = List.copyOf(requestHeaderBytes);
+      this.requestBodyBytes = List.copyOf(requestBodyBytes);
+      this.requestTotalBytes = List.copyOf(requestTotalBytes);
+      this.requestHeaderCallbackCounts = List.copyOf(requestHeaderCallbackCounts);
+      this.requestOrder = List.copyOf(requestOrder);
+      this.emissionOrder = List.copyOf(emissionOrder);
+      this.emissionParserOrder = List.copyOf(emissionParserOrder);
+      this.responseOrder = List.copyOf(responseOrder);
+      this.responseClose = List.copyOf(responseClose);
       this.legacyVersions = List.copyOf(legacyVersions);
       this.payloadLengths = List.copyOf(payloadLengths);
       this.decryptedLengths = List.copyOf(decryptedLengths);
       this.parserLengths = List.copyOf(parserLengths);
+      this.decryptedTotalBytes = decryptedTotalBytes;
+      this.parserTotalBytes = parserTotalBytes;
+      this.verificationBufferBytes = verificationBufferBytes;
+      this.verificationBufferLimitBytes = verificationBufferLimitBytes;
+      this.verificationPairDigestExact = verificationPairDigestExact;
       this.wirePairsExact = wirePairsExact;
-      this.headerSpannedRecords = headerSpannedRecords;
+      this.headersSpannedRecords = headersSpannedRecords;
       this.parserShapeExact = parserShapeExact;
       this.parserFacingCoalesced = parserFacingCoalesced;
+      this.requestsEmittedFromSingleParserCallback =
+          requestsEmittedFromSingleParserCallback;
       this.requestBytesPreserved = requestBytesPreserved;
       this.splitBuffersUnchanged = splitBuffersUnchanged;
       this.handoffBeforeParse = handoffBeforeParse;
-      this.closeRequested = closeRequested;
+      this.firstResponseKeepsAlive = firstResponseKeepsAlive;
+      this.finalResponseCloses = finalResponseCloses;
+    }
+
+    private boolean partial() {
+      return "partial".equals(evidencePhase);
     }
 
     private String toJson() {
       return String.format(
           Locale.ROOT,
-          "{\"mode\":\"%s\",\"passed\":%s,\"failure_reason\":\"%s\","
-              + "\"request_complete\":%s,\"header_bytes\":%d,\"body_bytes\":%d,"
-              + "\"request_bytes\":%d,\"header_decrypted_callback_count\":%d,"
-              + "\"decrypted_callbacks_before_request\":%d,"
-              + "\"parser_callbacks_before_request\":%d,"
+          "{\"mode\":\"%s\",\"delivery_shape\":\"%s\","
+              + "\"evidence_phase\":\"%s\",\"fallback_reason\":\"%s\","
+              + "\"coalescing_grace_millis\":%d,\"coalescing_grace_expired\":%s,"
+              + "\"passed\":%s,\"failure_reason\":\"%s\","
+              + "\"request_complete\":%s,\"request_count\":%d,"
+              + "\"request_header_bytes\":%s,\"request_body_bytes\":%s,"
+              + "\"request_total_bytes\":%s,"
+              + "\"request_header_decrypted_callback_counts\":%s,"
+              + "\"request_order\":%s,\"emission_order\":%s,"
+              + "\"emission_parser_callback_order\":%s,\"response_order\":%s,"
+              + "\"response_connection_close\":%s,"
               + "\"tls_application_record_legacy_versions\":%s,"
               + "\"tls_application_record_payload_lengths\":%s,"
               + "\"decrypted_callback_lengths\":%s,\"parser_callback_lengths\":%s,"
-              + "\"wire_decrypted_pairs_exact\":%s,\"header_spanned_records\":%s,"
+              + "\"decrypted_total_bytes\":%d,\"parser_total_bytes\":%d,"
+              + "\"parser_callback_count\":%d,"
+              + "\"verification_buffer_bytes\":%d,"
+              + "\"verification_buffer_limit_bytes\":%d,"
+              + "\"verification_pair_digest_exact\":%s,"
+              + "\"wire_decrypted_pairs_exact\":%s,\"headers_spanned_records\":%s,"
               + "\"parser_shape_exact\":%s,\"parser_facing_coalesced\":%s,"
-              + "\"request_bytes_preserved\":%s,\"split_buffers_forwarded_unchanged\":%s,"
-              + "\"handoff_before_parse\":%s,\"response_forces_connection_close\":%s}",
+              + "\"requests_emitted_from_single_parser_callback\":%s,"
+              + "\"request_bytes_preserved\":%s,"
+              + "\"split_buffers_forwarded_unchanged\":%s,"
+              + "\"handoff_before_parse\":%s,\"first_response_keeps_alive\":%s,"
+              + "\"response_forces_connection_close\":%s}",
           mode.value(),
+          deliveryShape.value(),
+          evidencePhase,
+          fallbackReason,
+          coalescingGraceMillis,
+          coalescingGraceExpired,
           passed,
           failure,
           requestComplete,
-          headerBytes,
-          bodyBytes,
-          requestBytes,
-          headerCallbackCount,
-          decryptedCallbacksAtRequestEmission,
-          parserCallbacksAtRequestEmission,
+          requestCount,
+          integerListJson(requestHeaderBytes),
+          integerListJson(requestBodyBytes),
+          integerListJson(requestTotalBytes),
+          integerListJson(requestHeaderCallbackCounts),
+          integerListJson(requestOrder),
+          integerListJson(emissionOrder),
+          integerListJson(emissionParserOrder),
+          integerListJson(responseOrder),
+          booleanListJson(responseClose),
           integerListJson(legacyVersions),
           integerListJson(payloadLengths),
           integerListJson(decryptedLengths),
           integerListJson(parserLengths),
+          decryptedTotalBytes,
+          parserTotalBytes,
+          parserLengths.size(),
+          verificationBufferBytes,
+          verificationBufferLimitBytes,
+          verificationPairDigestExact,
           wirePairsExact,
-          headerSpannedRecords,
+          headersSpannedRecords,
           parserShapeExact,
           parserFacingCoalesced,
+          requestsEmittedFromSingleParserCallback,
           requestBytesPreserved,
           splitBuffersUnchanged,
           handoffBeforeParse,
-          closeRequested);
+          firstResponseKeepsAlive,
+          finalResponseCloses);
     }
   }
 
-  private static int findHeaderBytes(ByteBuf buffer) {
+  private static FrameResult frameRequests(ByteBuf buffer, int expectedCount) {
+    int base = buffer.readerIndex();
+    int offset = base;
+    List<RequestFrame> frames = new ArrayList<>(expectedCount);
+    for (int index = 0; index < expectedCount; index++) {
+      int available = buffer.writerIndex() - offset;
+      int headerBytes = findHeaderBytes(buffer, offset);
+      if (headerBytes < 0) {
+        return available > MAX_HEADER_BYTES
+            ? FrameResult.failed("headers_too_large")
+            : FrameResult.incomplete(frames);
+      }
+      int bodyBytes = parseContentLength(buffer, offset, headerBytes);
+      if (bodyBytes < 0 || bodyBytes > MAX_BODY_BYTES) {
+        return FrameResult.failed("invalid_content_length");
+      }
+      RequestFrame frame = new RequestFrame(offset - base, headerBytes, bodyBytes);
+      if (frame.totalBytes > MAX_REQUEST_BYTES) {
+        return FrameResult.failed("request_too_large");
+      }
+      if (available < frame.totalBytes) {
+        return FrameResult.incomplete(frames);
+      }
+      frames.add(frame);
+      offset += frame.totalBytes;
+    }
+    if (offset != buffer.writerIndex()) {
+      return FrameResult.failed("trailing_request_bytes");
+    }
+    return FrameResult.complete(frames);
+  }
+
+  private static int findHeaderBytes(ByteBuf buffer, int start) {
     int window = 0;
     int windowBytes = 0;
-    int start = buffer.readerIndex();
     int limit = Math.min(buffer.writerIndex(), start + MAX_HEADER_BYTES + 1);
     for (int index = start; index < limit; index++) {
       window = (window << 8) | buffer.getUnsignedByte(index);
@@ -1142,8 +1952,7 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
     return -1;
   }
 
-  private static int parseContentLength(ByteBuf buffer, int headerBytes) {
-    int start = buffer.readerIndex();
+  private static int parseContentLength(ByteBuf buffer, int start, int headerBytes) {
     int end = start + headerBytes;
     int lineStart = start;
     boolean firstLine = true;
@@ -1266,21 +2075,68 @@ final class TlsBoundaryHttpsServer implements AutoCloseable {
     return total;
   }
 
-  private static int callbacksCovering(List<Integer> lengths, int bytes) {
-    if (bytes <= 0) {
+  private static List<Integer> prefix(List<Integer> values, int limit) {
+    return List.copyOf(values.subList(0, Math.min(values.size(), limit)));
+  }
+
+  private static int sumRequestBytes(List<RequestFrame> frames) {
+    int total = 0;
+    for (RequestFrame frame : frames) {
+      total += frame.totalBytes;
+    }
+    return total;
+  }
+
+  private static int callbacksIntersecting(List<Integer> lengths, int start, int end) {
+    if (start < 0 || end <= start) {
       return 0;
     }
-    int total = 0;
-    for (int index = 0; index < lengths.size(); index++) {
-      total += lengths.get(index);
-      if (total >= bytes) {
-        return index + 1;
+    int callbacks = 0;
+    int offset = 0;
+    for (int length : lengths) {
+      int callbackEnd = offset + length;
+      if (callbackEnd > start && offset < end) {
+        callbacks++;
+      }
+      offset = callbackEnd;
+      if (offset >= end) {
+        break;
       }
     }
-    return 0;
+    return callbacks;
+  }
+
+  private static int requestSequence(HttpRequest request) {
+    List<String> values = request.headers().getAll(SEQUENCE_HEADER);
+    if (values.size() != 1) {
+      return -1;
+    }
+    if ("1".equals(values.get(0))) {
+      return 1;
+    }
+    if ("2".equals(values.get(0))) {
+      return 2;
+    }
+    return -1;
+  }
+
+  private static List<Integer> expectedOrder(int count) {
+    List<Integer> order = new ArrayList<>(count);
+    for (int sequence = 1; sequence <= count; sequence++) {
+      order.add(sequence);
+    }
+    return List.copyOf(order);
+  }
+
+  private static List<Boolean> expectedResponseClose(Mode mode) {
+    return mode == Mode.SPLIT ? List.of(true) : List.of(false, true);
   }
 
   private static String integerListJson(List<Integer> values) {
+    return values.toString().replace(" ", "");
+  }
+
+  private static String booleanListJson(List<Boolean> values) {
     return values.toString().replace(" ", "");
   }
 

@@ -48,6 +48,7 @@ public final class RemoteParentHttp1Framer {
     private final Action action;
     private final long requestSequence;
     private final byte[] deferredPrefix;
+    private final byte[] telemetryPrefix;
     private final int offset;
     private final int length;
     private final boolean endOfMessage;
@@ -56,6 +57,7 @@ public final class RemoteParentHttp1Framer {
         Action action,
         long requestSequence,
         byte[] deferredPrefix,
+        byte[] telemetryPrefix,
         int offset,
         int length,
         boolean endOfMessage) {
@@ -63,6 +65,7 @@ public final class RemoteParentHttp1Framer {
       this.requestSequence = requestSequence;
       // The constructor is private and every non-empty caller passes a newly allocated copy.
       this.deferredPrefix = deferredPrefix;
+      this.telemetryPrefix = telemetryPrefix;
       this.offset = offset;
       this.length = length;
       this.endOfMessage = endOfMessage;
@@ -87,6 +90,14 @@ public final class RemoteParentHttp1Framer {
      */
     public byte[] deferredPrefix() {
       return deferredPrefix.length == 0 ? EMPTY : copyOf(deferredPrefix, deferredPrefix.length);
+    }
+
+    /**
+     * Returns bytes retained before this receive that must precede its source slice when an
+     * unsupported stream falls back to telemetry-only emission.
+     */
+    public byte[] telemetryPrefix() {
+      return telemetryPrefix.length == 0 ? EMPTY : copyOf(telemetryPrefix, telemetryPrefix.length);
     }
 
     /** Offset of this plan's non-deferred slice in the array passed to {@code accept}. */
@@ -164,13 +175,13 @@ public final class RemoteParentHttp1Framer {
     }
 
     if (length == 0) {
-      return new ReceivePlan(Action.NOOP, 0, EMPTY, offset, 0, false);
+      return new ReceivePlan(Action.NOOP, 0, EMPTY, EMPTY, offset, 0, false);
     }
     if (state == State.TERMINAL_UNTRACKED) {
-      return terminalPlan(Action.UNTRACKED, offset);
+      return terminalPlan(Action.UNTRACKED, offset, length, EMPTY);
     }
     if (state == State.TERMINAL_AMBIGUOUS) {
-      return terminalPlan(Action.AMBIGUOUS, offset);
+      return terminalPlan(Action.AMBIGUOUS, offset, 0, EMPTY);
     }
 
     int end = offset + length;
@@ -349,10 +360,18 @@ public final class RemoteParentHttp1Framer {
     }
 
     if (state == State.TERMINAL_UNTRACKED) {
-      return terminalPlan(Action.UNTRACKED, offset);
+      // Header completion clears and may shrink the shared framing buffer before later bytes in
+      // this same receive expose malformed body framing. In that case the exact pre-receive bytes
+      // already live in deferredPrefix; rebuilding them from the reused buffer would corrupt the
+      // telemetry fallback (or read beyond a newly shrunken buffer).
+      byte[] telemetryPrefix =
+          startedThisAccept ? deferredPrefix : copyOf(buffer, bytesBeforeAccept);
+      clearBuffer();
+      releaseOversizedBuffer();
+      return terminalPlan(Action.UNTRACKED, offset, length, telemetryPrefix);
     }
     if (state == State.TERMINAL_AMBIGUOUS) {
-      return terminalPlan(Action.AMBIGUOUS, offset);
+      return terminalPlan(Action.AMBIGUOUS, offset, 0, EMPTY);
     }
     if (startedThisAccept) {
       startReturnedSequence = activeRequestSequence;
@@ -360,15 +379,16 @@ public final class RemoteParentHttp1Framer {
           Action.START,
           activeRequestSequence,
           deferredPrefix,
+          EMPTY,
           planOffset,
           end - planOffset,
           endedThisAccept);
     }
     if (isPreStartState()) {
-      return new ReceivePlan(Action.DEFER, 0, EMPTY, offset, 0, false);
+      return new ReceivePlan(Action.DEFER, 0, EMPTY, EMPTY, offset, 0, false);
     }
     return new ReceivePlan(
-        Action.CONTINUE, activeRequestSequence, EMPTY, offset, length, endedThisAccept);
+        Action.CONTINUE, activeRequestSequence, EMPTY, EMPTY, offset, length, endedThisAccept);
   }
 
   /**
@@ -406,13 +426,38 @@ public final class RemoteParentHttp1Framer {
     extractionObservedSequence = 0;
   }
 
+  /** Permanently releases retained bytes and prevents this lifecycle from accepting more input. */
+  synchronized void discard() {
+    state = State.TERMINAL_UNTRACKED;
+    clearBuffer();
+    buffer = EMPTY;
+    headerBytes = 0;
+    trailerBytes = 0;
+    contentLengthSeen = false;
+    contentLength = 0;
+    transferEncodingSeen = false;
+    upgradeRequested = false;
+    bodyRemaining = 0;
+    activeRequestSequence = 0;
+    startReturnedSequence = 0;
+    extractionObservedSequence = 0;
+  }
+
+  /** Drains only never-emitted pre-START bytes, then permanently discards all framing state. */
+  synchronized byte[] drainDeferredForTelemetry() {
+    byte[] deferred = isPreStartState() ? copyOf(buffer, bufferLength) : EMPTY;
+    discard();
+    return deferred;
+  }
+
   /** Number of source octets currently retained for a future framing decision. */
   synchronized int retainedBytes() {
     return bufferLength;
   }
 
-  private ReceivePlan terminalPlan(Action action, int offset) {
-    return new ReceivePlan(action, startReturnedSequence, EMPTY, offset, 0, false);
+  private ReceivePlan terminalPlan(Action action, int offset, int length, byte[] telemetryPrefix) {
+    return new ReceivePlan(
+        action, startReturnedSequence, EMPTY, telemetryPrefix, offset, length, false);
   }
 
   private void beginRequestPrelude() {
@@ -905,8 +950,6 @@ public final class RemoteParentHttp1Framer {
 
   private void failUntracked() {
     state = State.TERMINAL_UNTRACKED;
-    clearBuffer();
-    releaseOversizedBuffer();
     bodyRemaining = 0;
   }
 

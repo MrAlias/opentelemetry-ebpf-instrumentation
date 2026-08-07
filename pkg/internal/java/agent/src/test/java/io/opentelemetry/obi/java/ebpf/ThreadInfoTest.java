@@ -720,6 +720,7 @@ class ThreadInfoTest {
 
   @Test
   void duplicateRestoreCannotReuseCachedLookupMetadata() {
+    ThreadInfo.setRemoteParentEnabled(true);
     List<EmittedOp> emitted = new ArrayList<>();
     ThreadInfo.setTaskContextEmitterForTest(
         (operation, value, token) -> emitted.add(new EmittedOp(operation, value, token)));
@@ -1165,7 +1166,9 @@ class ThreadInfoTest {
               first.getParentThreadId(),
               first.getHandoffToken(),
               first.getRemoteParentSocketContext(),
-              first.getRemoteParentSocketLifecycle()));
+              first.getRemoteParentSocketLifecycle(),
+              first.getRemoteParentReceiveContext(),
+              first.getRemoteParentBridgeEpoch()));
       try {
         assertEquals(ThreadInfo.REMOTE_PARENT_LOOKUP_TASK, ThreadInfo.remoteParentLookupSource());
         assertSame(exact.lifecycle, ThreadInfo.remoteParentLookupLifecycle());
@@ -1186,7 +1189,9 @@ class ThreadInfoTest {
               second.getParentThreadId(),
               second.getHandoffToken(),
               second.getRemoteParentSocketContext(),
-              second.getRemoteParentSocketLifecycle()));
+              second.getRemoteParentSocketLifecycle(),
+              second.getRemoteParentReceiveContext(),
+              second.getRemoteParentBridgeEpoch()));
       try {
         assertEquals(ThreadInfo.REMOTE_PARENT_LOOKUP_TASK, ThreadInfo.remoteParentLookupSource());
         assertSame(exact.lifecycle, ThreadInfo.remoteParentLookupLifecycle());

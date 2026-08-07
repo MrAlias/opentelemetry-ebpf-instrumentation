@@ -34,7 +34,9 @@ public enum OperationType {
   // append a nonempty plaintext fragment to an exact HTTP/1 receive sequence
   HTTP1_RECEIVE_CONTINUE((byte) 15),
   // discard an exact HTTP/1 receive sequence without a payload
-  HTTP1_RECEIVE_RESET((byte) 16);
+  HTTP1_RECEIVE_RESET((byte) 16),
+  // preserve generic receive telemetry without staging remote-parent authority
+  TELEMETRY_RECEIVE((byte) 17);
 
   public final byte code;
 

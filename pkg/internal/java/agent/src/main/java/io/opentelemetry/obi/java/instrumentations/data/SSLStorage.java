@@ -5,6 +5,11 @@
 
 package io.opentelemetry.obi.java.instrumentations.data;
 
+import io.opentelemetry.obi.java.BootstrapNative;
+import io.opentelemetry.obi.java.bridge.RemoteParentBridge;
+import io.opentelemetry.obi.java.ebpf.IOCTLPacket;
+import io.opentelemetry.obi.java.ebpf.NativeMemory;
+import io.opentelemetry.obi.java.ebpf.OperationType;
 import io.opentelemetry.obi.java.ebpf.ThreadInfo;
 import io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext.Lifecycle;
 import io.opentelemetry.obi.java.instrumentations.util.CappedConcurrentHashMap;
@@ -78,6 +83,7 @@ public class SSLStorage {
   private static final ThreadLocal<Integer> remoteParentUnwrapDepth = new ThreadLocal<>();
   private static volatile LongSupplier threadIdProviderForTest;
   private static volatile LongSupplier tlsConnectionMarkerClockForTest;
+  private static volatile Runnable beforeLegacyReceiveEmitForTest;
   private static final Object NO_NETTY_CONNECTION = new Object();
   private static final Object NETTY_CLOSE_HOOK_AVAILABLE = new Object();
   private static final AtomicBoolean channelStateCapacityExhausted = new AtomicBoolean();
@@ -351,6 +357,88 @@ public class SSLStorage {
     return isActive(owner) && owner.connection == connection && owner.remoteParentLifecycle.active()
         ? owner.remoteParentLifecycle
         : null;
+  }
+
+  /** Frames and emits plaintext against the exact active physical connection owner. */
+  public static int emitRemoteParentHttp1(
+      Connection connection, byte[] source, int offset, int length) {
+    ConnectionOwner owner =
+        connection == null ? null : asConnectionOwner(connection.getOwnerToken());
+    if (!isActive(owner) || owner.connection != connection) {
+      ThreadInfo.beginRemoteParentReceiveAttempt();
+      ThreadInfo.clearRemoteParentSocketFileDescriptor();
+      return -1;
+    }
+    return owner.remoteParentHttp1Receive.emit(connection, source, offset, length);
+  }
+
+  /** Emits plaintext from an SSLEngine receive while preserving disabled-mode legacy behavior. */
+  public static int emitRemoteParentReceive(
+      SSLEngine engine, Connection connection, byte[] plaintext, int offset, int length) {
+    try {
+      BootstrapNative.markTlsConnectionIfDue(engine, connection);
+    } catch (Throwable failure) {
+      if (debugOn) {
+        System.err.println("[SSLStorage] failed to mark TLS connection: " + failure);
+      }
+    }
+
+    int status;
+    long receiveBridgeEpoch = ThreadInfo.captureRemoteParentBridgeCapability();
+    if (receiveBridgeEpoch != 0L) {
+      status = emitRemoteParentHttp1(connection, plaintext, offset, length);
+    } else {
+      ConnectionOwner owner =
+          connection == null ? null : asConnectionOwner(connection.getOwnerToken());
+      if (isActive(owner) && owner.connection == connection) {
+        // The current fragment must still take the exact legacy path below. First retire any
+        // framing/capability issued by the previous provider epoch so later re-enablement cannot
+        // resume across plaintext that this framer never observed.
+        owner.remoteParentHttp1Receive.beforeLegacyReceive(connection);
+      }
+      NativeMemory packet = new NativeMemory(IOCTLPacket.packetPrefixSize + length);
+      int writeOffset =
+          IOCTLPacket.writePacketPrefix(packet, 0, OperationType.RECEIVE, connection, length);
+      IOCTLPacket.writePacketBuffer(packet, writeOffset, plaintext, offset, length);
+      Runnable beforeEmit = beforeLegacyReceiveEmitForTest;
+      if (beforeEmit != null) {
+        beforeEmit.run();
+      }
+      status = BootstrapNative.emitData(connection, packet.getAddress(), true, receiveBridgeEpoch);
+    }
+    if (status >= 0) {
+      RemoteParentBridge.recordTlsRead(length);
+    }
+    return status;
+  }
+
+  /** Resets local framing before invalidating the exact engine lifecycle. */
+  public static void invalidateRemoteParent(SSLEngine engine, Object expectedLifecycle) {
+    try {
+      closeRemoteParentHttp1(engine, expectedLifecycle);
+    } finally {
+      BootstrapNative.invalidateRemoteParentSocketFileDescriptor(expectedLifecycle);
+    }
+  }
+
+  /** Resets and releases framing state only for the exact still-current engine lifecycle. */
+  public static void closeRemoteParentHttp1(SSLEngine engine, Object expectedLifecycle) {
+    ConnectionOwner owner = connectionOwnerForSession(engine);
+    if (owner != null && owner.remoteParentLifecycle == expectedLifecycle && isActive(owner)) {
+      owner.remoteParentHttp1Receive.close(owner.connection);
+    }
+  }
+
+  /** Resets and releases framing state only for the exact still-current connection lifecycle. */
+  public static void closeRemoteParentHttp1(Connection connection, Object expectedLifecycle) {
+    ConnectionOwner owner =
+        connection == null ? null : asConnectionOwner(connection.getOwnerToken());
+    if (owner != null
+        && owner.connection == connection
+        && owner.remoteParentLifecycle == expectedLifecycle
+        && isActive(owner)) {
+      owner.remoteParentHttp1Receive.close(owner.connection);
+    }
   }
 
   /** Returns the exact active connection-owner lifecycle already associated with an engine. */
@@ -845,7 +933,13 @@ public class SSLStorage {
    */
   public static Object beginRemoteParentConnectionClose(Object channel, Connection connection) {
     ConnectionOwner owner = connectionOwnerForClose(channel, connection);
-    return owner == null ? null : owner.remoteParentLifecycle.beginCloseFence();
+    if (owner == null) {
+      return null;
+    }
+    // Drain bounded pre-START plaintext and reset an active request before tryClose can make the
+    // descriptor unusable. cleanupConnection repeats local release safely after the close exits.
+    owner.remoteParentHttp1Receive.close(owner.connection);
+    return owner.remoteParentLifecycle.beginCloseFence();
   }
 
   /**
@@ -1053,7 +1147,11 @@ public class SSLStorage {
 
   private static void cleanupConnectionOwner(ConnectionOwner owner) {
     if (owner != null) {
+      owner.remoteParentHttp1Receive.close(owner.connection);
       owner.remoteParentLifecycle.invalidate();
+      if (owner.connection.getOwnerToken() == owner) {
+        owner.connection.setOwnerToken(null);
+      }
     }
     if (owner != null && activeConnections.remove(owner.key, owner)) {
       owner.active = false;
@@ -1471,7 +1569,9 @@ public class SSLStorage {
             context.getParentThreadId(),
             context.getHandoffToken(),
             context.getRemoteParentSocketContext(),
-            context.getRemoteParentSocketLifecycle());
+            context.getRemoteParentSocketLifecycle(),
+            context.getRemoteParentReceiveContext(),
+            context.getRemoteParentBridgeEpoch());
     if (linked) {
       scopes.pop();
       scopes.push(Boolean.TRUE);
@@ -1538,7 +1638,9 @@ public class SSLStorage {
           parentThreadId,
           context.getHandoffToken(),
           context.getRemoteParentSocketContext(),
-          context.getRemoteParentSocketLifecycle());
+          context.getRemoteParentSocketLifecycle(),
+          context.getRemoteParentReceiveContext(),
+          context.getRemoteParentBridgeEpoch());
     }
     ThreadInfo.cancelTaskContext(context);
     return false;
@@ -1564,7 +1666,9 @@ public class SSLStorage {
             context.getParentThreadId(),
             context.getHandoffToken(),
             context.getRemoteParentSocketContext(),
-            context.getRemoteParentSocketLifecycle());
+            context.getRemoteParentSocketLifecycle(),
+            context.getRemoteParentReceiveContext(),
+            context.getRemoteParentBridgeEpoch());
     virtualThreadTaskScope.set(linked);
   }
 
@@ -1632,6 +1736,10 @@ public class SSLStorage {
     tlsConnectionMarkerClockForTest = clock;
   }
 
+  static void setBeforeLegacyReceiveEmitForTest(Runnable callback) {
+    beforeLegacyReceiveEmitForTest = callback;
+  }
+
   static final class TlsConnectionMarkerAttempt {
     private final ConnectionOwner owner;
     private final long processIncarnation;
@@ -1674,14 +1782,19 @@ public class SSLStorage {
     private final Connection connection;
     private final WeakReference<Object> physicalOwner;
     private final Lifecycle remoteParentLifecycle;
+    private final long remoteParentBridgeEpoch;
+    private final RemoteParentHttp1Receive remoteParentHttp1Receive;
     private volatile boolean active = true;
 
     ConnectionOwner(ExactConnection key, Object physicalOwner) {
       this.key = key;
       this.connection = key.connection;
       this.physicalOwner = new WeakReference<Object>(physicalOwner);
-      this.connection.setOwnerToken(this);
       this.remoteParentLifecycle = new Lifecycle(this.physicalOwner, this);
+      this.remoteParentBridgeEpoch = ThreadInfo.remoteParentBridgeEpoch();
+      this.remoteParentHttp1Receive =
+          new RemoteParentHttp1Receive(this.remoteParentLifecycle, this.remoteParentBridgeEpoch);
+      this.connection.setOwnerToken(this);
     }
 
     boolean hasPhysicalOwner(Object candidate) {

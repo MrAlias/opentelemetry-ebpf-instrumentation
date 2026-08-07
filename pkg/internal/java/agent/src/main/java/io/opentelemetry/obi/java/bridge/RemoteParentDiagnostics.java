@@ -100,6 +100,11 @@ public final class RemoteParentDiagnostics {
     increment(DISCARD_STATUS_BASE + normalized, failureReason("discard", normalized));
   }
 
+  static void receiveFailure(int status) {
+    int normalized = normalizeStatus(status);
+    increment(DISCARD_STATUS_BASE + normalized, failureReason("receive", normalized));
+  }
+
   static void discardReason(int reason) {
     if (reason == DISCARD_STANDARD_PARENT) {
       increment(DISCARD_STANDARD_PARENT_COUNTER, null);

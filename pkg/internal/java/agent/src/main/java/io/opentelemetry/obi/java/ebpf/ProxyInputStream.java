@@ -21,7 +21,7 @@ public class ProxyInputStream extends InputStream {
 
   @Override
   public int read() throws IOException {
-    Object lifecycle = BootstrapNative.currentRemoteParentSocketLifecycle(socket);
+    Object lifecycle = prepareRemoteParentSocketLifecycle();
     int value;
     try {
       value = delegate.read();
@@ -36,17 +36,16 @@ public class ProxyInputStream extends InputStream {
 
     byte[] singleByte = {(byte) value};
     try {
-      forwardRead(singleByte, 0, 1);
-    } catch (RuntimeException | Error failure) {
+      forwardRead(singleByte, 0, 1, lifecycle);
+    } catch (Throwable failure) {
       invalidateRemoteParentSocketFileDescriptor(lifecycle);
-      throw failure;
     }
     return value;
   }
 
   @Override
   public int read(byte[] b) throws IOException {
-    Object lifecycle = BootstrapNative.currentRemoteParentSocketLifecycle(socket);
+    Object lifecycle = prepareRemoteParentSocketLifecycle();
     int len;
     try {
       len = delegate.read(b);
@@ -56,10 +55,9 @@ public class ProxyInputStream extends InputStream {
     }
     if (len > 0) {
       try {
-        forwardRead(b, 0, len);
-      } catch (RuntimeException | Error failure) {
+        forwardRead(b, 0, len, lifecycle);
+      } catch (Throwable failure) {
         invalidateRemoteParentSocketFileDescriptor(lifecycle);
-        throw failure;
       }
     } else if (len < 0) {
       invalidateRemoteParentSocketFileDescriptor(lifecycle);
@@ -69,7 +67,7 @@ public class ProxyInputStream extends InputStream {
 
   @Override
   public int read(byte[] b, int off, int len) throws IOException {
-    Object lifecycle = BootstrapNative.currentRemoteParentSocketLifecycle(socket);
+    Object lifecycle = prepareRemoteParentSocketLifecycle();
     int bytesRead;
     try {
       bytesRead = delegate.read(b, off, len);
@@ -79,10 +77,9 @@ public class ProxyInputStream extends InputStream {
     }
     if (bytesRead > 0) {
       try {
-        forwardRead(b, off, bytesRead);
-      } catch (RuntimeException | Error failure) {
+        forwardRead(b, off, bytesRead, lifecycle);
+      } catch (Throwable failure) {
         invalidateRemoteParentSocketFileDescriptor(lifecycle);
-        throw failure;
       }
     } else if (bytesRead < 0) {
       invalidateRemoteParentSocketFileDescriptor(lifecycle);
@@ -91,13 +88,15 @@ public class ProxyInputStream extends InputStream {
   }
 
   void forwardRead(byte[] b, int off, int len) {
-    NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize + len);
-    writeReadPacket(p, socket, b, off, len);
-    BootstrapNative.emitData(socket, p.getAddress(), true);
+    forwardRead(b, off, len, prepareRemoteParentSocketLifecycle());
+  }
+
+  void forwardRead(byte[] b, int off, int len, Object lifecycle) {
+    BootstrapNative.emitTelemetryReceiveData(socket, lifecycle, b, off, len);
   }
 
   static int writeReadPacket(NativeMemory p, Socket socket, byte[] b, int off, int len) {
-    int wOff = IOCTLPacket.writePacketPrefix(p, 0, OperationType.RECEIVE, socket, len);
+    int wOff = IOCTLPacket.writeTelemetryReceivePacketPrefix(p, 0, socket, len);
     return IOCTLPacket.writePacketBuffer(p, wOff, b, off, len);
   }
 
@@ -112,10 +111,23 @@ public class ProxyInputStream extends InputStream {
   }
 
   private void invalidateRemoteParentSocketFileDescriptor(Object lifecycle) {
-    if (socket != null) {
-      BootstrapNative.invalidateRemoteParentSocketFileDescriptor(socket, lifecycle);
-    } else {
-      BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+    try {
+      if (socket != null) {
+        BootstrapNative.invalidateRemoteParentSocketFileDescriptor(socket, lifecycle);
+      } else {
+        BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+      }
+    } catch (Throwable failure) {
+      // Preserve the application's EOF or delegate exception if cleanup itself fails.
+    }
+  }
+
+  private Object prepareRemoteParentSocketLifecycle() {
+    try {
+      return BootstrapNative.prepareRemoteParentSocketLifecycle(socket);
+    } catch (Throwable failure) {
+      // Instrumentation must never prevent or replace the application read.
+      return null;
     }
   }
 }

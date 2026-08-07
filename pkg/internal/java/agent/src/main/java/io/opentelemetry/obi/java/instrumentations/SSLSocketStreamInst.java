@@ -94,7 +94,7 @@ public class SSLSocketStreamInst {
     @Advice.OnMethodEnter(suppress = Throwable.class)
     public static Object enter(@Advice.FieldValue("this$0") Object outer) {
       return outer instanceof Socket
-          ? BootstrapNative.currentRemoteParentSocketLifecycle((Socket) outer)
+          ? BootstrapNative.prepareRemoteParentSocketLifecycle((Socket) outer)
           : null;
     }
 
@@ -131,10 +131,7 @@ public class SSLSocketStreamInst {
         }
         if (socket != null) {
           try {
-            NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize + len);
-            int wOff = IOCTLPacket.writePacketPrefix(p, 0, OperationType.RECEIVE, socket, len);
-            IOCTLPacket.writePacketBuffer(p, wOff, b, 0, len);
-            BootstrapNative.emitData(socket, p.getAddress(), true);
+            BootstrapNative.emitTelemetryReceiveData(socket, lifecycle, b, 0, len);
           } catch (Throwable t) {
             BootstrapNative.invalidateRemoteParentSocketFileDescriptor(socket, lifecycle);
             if (SSLStorage.debugOn) {
@@ -152,7 +149,7 @@ public class SSLSocketStreamInst {
     @Advice.OnMethodEnter(suppress = Throwable.class)
     public static Object enter(@Advice.FieldValue("this$0") Object outer) {
       return outer instanceof Socket
-          ? BootstrapNative.currentRemoteParentSocketLifecycle((Socket) outer)
+          ? BootstrapNative.prepareRemoteParentSocketLifecycle((Socket) outer)
           : null;
     }
 
@@ -189,11 +186,7 @@ public class SSLSocketStreamInst {
         }
         if (socket != null) {
           try {
-            NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize + bytesRead);
-            int wOff =
-                IOCTLPacket.writePacketPrefix(p, 0, OperationType.RECEIVE, socket, bytesRead);
-            IOCTLPacket.writePacketBuffer(p, wOff, b, off, bytesRead);
-            BootstrapNative.emitData(socket, p.getAddress(), true);
+            BootstrapNative.emitTelemetryReceiveData(socket, lifecycle, b, off, bytesRead);
           } catch (Throwable t) {
             BootstrapNative.invalidateRemoteParentSocketFileDescriptor(socket, lifecycle);
             if (SSLStorage.debugOn) {

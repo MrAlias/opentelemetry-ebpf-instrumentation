@@ -114,6 +114,7 @@ enum {
   test_data_operation_http1_receive_start = 14,
   test_data_operation_http1_receive_continue = 15,
   test_data_operation_http1_receive_reset = 16,
+  test_data_operation_telemetry_receive = 17,
   test_data_operation_unknown = 0xff,
   test_data_signal_offset = 41,
 };
@@ -125,6 +126,7 @@ static int operation_has_data_signal_nonce(unsigned char operation) {
   case test_data_operation_http1_receive_start:
   case test_data_operation_http1_receive_continue:
   case test_data_operation_http1_receive_reset:
+  case test_data_operation_telemetry_receive:
     return 1;
   default:
     return 0;
@@ -1159,7 +1161,7 @@ static void test_http1_start_hard_ioctl_error_skips_acknowledgement(void) {
   fake_ioctl_error = ENOTTY;
 }
 
-static void test_http1_continue_and_reset_issue_only_ioctl(void) {
+static void test_http1_continuation_reset_and_telemetry_issue_only_ioctl(void) {
   fake_setsockopt_error = 0;
   fake_data_ack_error = ENOPROTOOPT;
   assert(obi_test_configure_remote_parent(1, "", 50, geteuid(), 82) == 1);
@@ -1167,6 +1169,7 @@ static void test_http1_continue_and_reset_issue_only_ioctl(void) {
   const unsigned char operations[] = {
       test_data_operation_http1_receive_continue,
       test_data_operation_http1_receive_reset,
+      test_data_operation_telemetry_receive,
   };
   const int ioctl_errors[] = {ENOTTY, EIO};
   for (size_t operation_index = 0;
@@ -1183,7 +1186,8 @@ static void test_http1_continue_and_reset_issue_only_ioctl(void) {
       memset(packet + test_data_signal_offset, 0xff, sizeof(uint64_t));
       int socket_fd = 60 + (int)operation_index;
       int expected_result = fake_ioctl_error == ENOTTY ? 0 : -1;
-      assert(obi_test_emit_data_on_socket(socket_fd, packet) == expected_result);
+      assert(obi_test_emit_data_on_socket(socket_fd, packet) ==
+             expected_result);
       assert(read_u64_le(packet, test_data_signal_offset) == 0);
       assert(atomic_load(&observed_setsockopt_calls) == 0);
       assert(atomic_load(&observed_getsockopt_calls) == 0);
@@ -2010,7 +2014,7 @@ int main(int argc, char **argv) {
   test_short_non_data_ioctl_packets_skip_nonce_snapshot();
   test_acknowledged_data_operations_preserve_transport_order();
   test_http1_start_hard_ioctl_error_skips_acknowledgement();
-  test_http1_continue_and_reset_issue_only_ioctl();
+  test_http1_continuation_reset_and_telemetry_issue_only_ioctl();
   test_data_emit_rejects_missing_acknowledgement();
   test_data_emit_falls_back_when_socket_negotiation_fails();
   test_retrieval_never_renegotiates_socket();

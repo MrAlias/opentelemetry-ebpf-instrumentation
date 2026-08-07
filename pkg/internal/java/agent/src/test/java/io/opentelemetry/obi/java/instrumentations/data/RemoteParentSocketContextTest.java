@@ -7,12 +7,23 @@ package io.opentelemetry.obi.java.instrumentations.data;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 
 import java.lang.ref.WeakReference;
 import java.net.Socket;
 import org.junit.jupiter.api.Test;
 
 class RemoteParentSocketContextTest {
+  @Test
+  void lifecycleIdsAreNonzeroAndDistinct() {
+    RemoteParentSocketContext.Lifecycle first = new RemoteParentSocketContext.Lifecycle();
+    RemoteParentSocketContext.Lifecycle second = new RemoteParentSocketContext.Lifecycle();
+
+    assertNotEquals(0L, first.id());
+    assertNotEquals(0L, second.id());
+    assertNotEquals(first.id(), second.id());
+  }
+
   @Test
   void socketLifecycleFailsClosedWhenItsWeakOwnerReferenceHasCleared() {
     RemoteParentSocketContext.Lifecycle lifecycle =

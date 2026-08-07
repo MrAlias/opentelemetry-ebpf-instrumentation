@@ -129,6 +129,24 @@ class AgentOptionsTest {
             "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext$Lifecycle$Lease"));
     assertTrue(
         Agent.isBootstrapHelperClassName(
+            "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext$ReceiveContext"));
+    assertTrue(
+        Agent.isBootstrapHelperClassName(
+            "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext$ExtractionObserver"));
+    assertTrue(
+        Agent.isBootstrapHelperClassName(
+            "io.opentelemetry.obi.java.instrumentations.data.RemoteParentHttp1Framer"));
+    assertTrue(
+        Agent.isBootstrapHelperClassName(
+            "io.opentelemetry.obi.java.instrumentations.data.RemoteParentHttp1Framer$1"));
+    assertTrue(
+        Agent.isBootstrapHelperClassName(
+            "io.opentelemetry.obi.java.instrumentations.data.RemoteParentHttp1Receive"));
+    assertTrue(
+        Agent.isBootstrapHelperClassName(
+            "io.opentelemetry.obi.java.instrumentations.data.RemoteParentHttp1Receive$Emitter"));
+    assertTrue(
+        Agent.isBootstrapHelperClassName(
             "io.opentelemetry.obi.java.instrumentations.util.CappedConcurrentHashMap$EvictionListener"));
     assertTrue(
         Agent.isBootstrapHelperClassName(

@@ -17,6 +17,7 @@ public class IOCTLPacket {
   public static final int http1LifecycleOffset = dataSignalOffset + Long.BYTES;
   public static final int http1RequestSequenceOffset = http1LifecycleOffset + Long.BYTES;
   public static final int http1PacketPrefixSize = http1RequestSequenceOffset + Long.BYTES;
+  public static final int http1MaxPayloadSize = 1 << 16;
 
   public static int writePacketPrefix(
       NativeMemory mem, int off, OperationType type, Socket socket, int bufLen) {
@@ -84,6 +85,25 @@ public class IOCTLPacket {
     return writeHttp1Identity(mem, off, lifecycleId, requestSequence);
   }
 
+  public static int writeTelemetryReceivePacketPrefix(
+      NativeMemory mem, int off, Connection connection, int bufLen) {
+    validateTelemetryReceiveLength(bufLen);
+    return writePacketPrefix(mem, off, OperationType.TELEMETRY_RECEIVE, connection, bufLen);
+  }
+
+  public static int writeTelemetryReceivePacketPrefix(
+      NativeMemory mem, int off, Socket socket, int bufLen) {
+    validateTelemetryReceiveLength(bufLen);
+    return writePacketPrefix(mem, off, OperationType.TELEMETRY_RECEIVE, socket, bufLen);
+  }
+
+  private static void validateTelemetryReceiveLength(int bufLen) {
+    if (bufLen <= 0 || bufLen > http1MaxPayloadSize) {
+      throw new IllegalArgumentException(
+          "telemetry receive fragment length must be between 1 and " + http1MaxPayloadSize);
+    }
+  }
+
   public static int writeHttp1PacketPrefix(
       NativeMemory mem,
       int off,
@@ -117,8 +137,9 @@ public class IOCTLPacket {
       throw new IllegalArgumentException("HTTP/1 request sequence must be nonzero");
     }
     if (type == OperationType.HTTP1_RECEIVE_START || type == OperationType.HTTP1_RECEIVE_CONTINUE) {
-      if (bufLen <= 0) {
-        throw new IllegalArgumentException("HTTP/1 receive fragment must be nonempty");
+      if (bufLen <= 0 || bufLen > http1MaxPayloadSize) {
+        throw new IllegalArgumentException(
+            "HTTP/1 receive fragment length must be between 1 and " + http1MaxPayloadSize);
       }
       return;
     }

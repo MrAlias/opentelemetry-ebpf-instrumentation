@@ -8,6 +8,7 @@ package io.opentelemetry.obi.java.instrumentations.data;
 import java.lang.ref.WeakReference;
 import java.net.Socket;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /** One-shot accepted-socket ownership shared by an exact task handoff. */
 public final class RemoteParentSocketContext {
@@ -110,8 +111,11 @@ public final class RemoteParentSocketContext {
 
   /** Shared, invalidatable ownership generation for one live socket or connection. */
   public static final class Lifecycle {
+    private static final AtomicLong nextLifecycleId = new AtomicLong(initialLifecycleId());
+
     private final Object lifecycleLock = new Object();
     private final AtomicInteger closeReferences;
+    private final long id;
     private final WeakReference<?> owner;
     private final boolean ownerRequired;
     private final ActiveCheck activity;
@@ -152,8 +156,14 @@ public final class RemoteParentSocketContext {
       this.owner = owner;
       this.ownerRequired = ownerRequired;
       this.activity = activity;
+      this.id = newLifecycleId();
       closeReferences = new AtomicInteger(closeTombstone ? 1 : 0);
       terminal = closeTombstone;
+    }
+
+    /** Process-local nonzero identity used to fence native request cursors. */
+    public long id() {
+      return id;
     }
 
     public static Lifecycle newCloseTombstone() {
@@ -387,5 +397,59 @@ public final class RemoteParentSocketContext {
     public interface ActiveCheck {
       boolean active();
     }
+
+    private static long newLifecycleId() {
+      long id;
+      do {
+        id = nextLifecycleId.getAndIncrement();
+      } while (id == 0L);
+      return id;
+    }
+
+    private static long initialLifecycleId() {
+      long seed = System.nanoTime() ^ System.currentTimeMillis();
+      seed ^= (long) System.identityHashCode(Lifecycle.class) << 32;
+      return seed == 0L ? 1L : seed;
+    }
+  }
+
+  /** Exact HTTP receive ownership carried from TLS plaintext to one extraction attempt. */
+  public static final class ReceiveContext {
+    private final Lifecycle lifecycle;
+    private final long requestSequence;
+    private final long bridgeEpoch;
+    private final ExtractionObserver observer;
+
+    ReceiveContext(
+        Lifecycle lifecycle, long requestSequence, long bridgeEpoch, ExtractionObserver observer) {
+      if (lifecycle == null || requestSequence <= 0L || bridgeEpoch == 0L || observer == null) {
+        throw new IllegalArgumentException("incomplete receive context");
+      }
+      this.lifecycle = lifecycle;
+      this.requestSequence = requestSequence;
+      this.bridgeEpoch = bridgeEpoch;
+      this.observer = observer;
+    }
+
+    public Lifecycle lifecycle() {
+      return lifecycle;
+    }
+
+    public long requestSequence() {
+      return requestSequence;
+    }
+
+    /** Process-wide bridge/provider epoch that issued this one-shot capability. */
+    public long bridgeEpoch() {
+      return bridgeEpoch;
+    }
+
+    public boolean extractionObserved() {
+      return lifecycle.active() && observer.extractionObserved(this);
+    }
+  }
+
+  interface ExtractionObserver {
+    boolean extractionObserved(ReceiveContext context);
   }
 }

@@ -32,6 +32,7 @@ class ProxyInputStreamTest {
     ThreadInfo.setRemoteParentEnabled(false);
     ThreadInfo.setTaskContextEmitterForTest(null);
     ThreadInfo.clearRemoteParentSocketFileDescriptor();
+    ThreadInfo.clearRemoteParentLookupSource();
   }
 
   @Test
@@ -43,6 +44,7 @@ class ProxyInputStreamTest {
     int end = ProxyInputStream.writeReadPacket(packet, null, buffer, 0, bytesRead);
 
     assertEquals(IOCTLPacket.packetPrefixSize + bytesRead, end);
+    assertEquals(OperationType.TELEMETRY_RECEIVE.code, packet.getBuffer().get(0));
     assertEquals(bytesRead, packet.getInt(IOCTLPacket.bufferLengthOffset));
     assertEquals(0L, packet.getLong(IOCTLPacket.dataSignalOffset));
     for (int i = 0; i < bytesRead; i++) {
@@ -187,18 +189,77 @@ class ProxyInputStreamTest {
   }
 
   @Test
-  void forwardingFailureInvalidatesTheStagedRemoteParentSocket() {
+  void forwardingFailureFailsOpenAndInvalidatesTheStagedRemoteParentSocket() throws Exception {
     ThreadInfo.setRemoteParentSocketFileDescriptor(49);
     ProxyInputStream failingForward =
         new ProxyInputStream(new ByteArrayInputStream(new byte[] {1}), null) {
           @Override
-          void forwardRead(byte[] b, int off, int len) {
+          void forwardRead(byte[] b, int off, int len, Object lifecycle) {
             throw new IllegalStateException("expected forwarding failure");
           }
         };
 
-    assertThrows(IllegalStateException.class, failingForward::read);
+    assertEquals(1, failingForward.read());
     assertEquals(-1, ThreadInfo.remoteParentSocketFileDescriptor());
+  }
+
+  @Test
+  void lifecyclePreparationFailurePreservesEveryReadOverload() throws Exception {
+    Socket failingSocket = socketWithFailingLifecyclePreparation();
+
+    ProxyInputStream single =
+        new ProxyInputStream(new ByteArrayInputStream(new byte[] {(byte) 0xA5}), failingSocket);
+    assertEquals(0xA5, single.read());
+
+    ProxyInputStream array =
+        new ProxyInputStream(new ByteArrayInputStream(new byte[] {1, 2}), failingSocket);
+    byte[] arrayBuffer = new byte[4];
+    assertEquals(2, array.read(arrayBuffer));
+    assertArrayEquals(new byte[] {1, 2, 0, 0}, arrayBuffer);
+
+    ProxyInputStream ranged =
+        new ProxyInputStream(new ByteArrayInputStream(new byte[] {3, 4}), failingSocket);
+    byte[] rangedBuffer = new byte[6];
+    assertEquals(2, ranged.read(rangedBuffer, 2, 3));
+    assertArrayEquals(new byte[] {0, 0, 3, 4, 0, 0}, rangedBuffer);
+  }
+
+  @Test
+  void lifecyclePreparationFailureDoesNotReplaceDelegateExceptions() {
+    IOException expected = new IOException("expected delegate failure");
+    InputStream failingDelegate =
+        new InputStream() {
+          @Override
+          public int read() throws IOException {
+            throw expected;
+          }
+
+          @Override
+          public int read(byte[] buffer) throws IOException {
+            throw expected;
+          }
+
+          @Override
+          public int read(byte[] buffer, int offset, int length) throws IOException {
+            throw expected;
+          }
+        };
+    Socket failingSocket = socketWithFailingLifecyclePreparation();
+
+    assertSame(
+        expected,
+        assertThrows(
+            IOException.class, () -> new ProxyInputStream(failingDelegate, failingSocket).read()));
+    assertSame(
+        expected,
+        assertThrows(
+            IOException.class,
+            () -> new ProxyInputStream(failingDelegate, failingSocket).read(new byte[1])));
+    assertSame(
+        expected,
+        assertThrows(
+            IOException.class,
+            () -> new ProxyInputStream(failingDelegate, failingSocket).read(new byte[1], 0, 1)));
   }
 
   @Test
@@ -306,10 +367,19 @@ class ProxyInputStreamTest {
     }
 
     @Override
-    void forwardRead(byte[] b, int off, int len) {
+    void forwardRead(byte[] b, int off, int len, Object lifecycle) {
       forwardedOffset = off;
       forwardedLength = len;
       forwardedBytes = Arrays.copyOfRange(b, off, off + len);
     }
+  }
+
+  private static Socket socketWithFailingLifecyclePreparation() {
+    return new Socket() {
+      @Override
+      public boolean isClosed() {
+        throw new AssertionError("expected lifecycle preparation failure");
+      }
+    };
   }
 }

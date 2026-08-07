@@ -7,6 +7,7 @@ package io.opentelemetry.obi.java.ebpf;
 
 import io.opentelemetry.obi.java.BootstrapNative;
 import io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext;
+import io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext.ReceiveContext;
 import io.opentelemetry.obi.java.instrumentations.data.TaskContext;
 import java.security.SecureRandom;
 import java.util.concurrent.atomic.AtomicLong;
@@ -30,10 +31,13 @@ public class ThreadInfo {
   private static final ThreadLocal<Byte> remoteParentLookupOverride = new ThreadLocal<>();
   private static final ThreadLocal<RemoteParentSocketContext.Lifecycle>
       remoteParentLookupLifecycle = new ThreadLocal<>();
+  private static final ThreadLocal<Long> remoteParentLookupBridgeEpoch = new ThreadLocal<>();
+  private static final ThreadLocal<ReceiveContext> remoteParentReceiveContext = new ThreadLocal<>();
   private static final ThreadLocal<Integer> remoteParentReceiveDepth = new ThreadLocal<>();
   private static final ThreadLocal<Long> remoteParentReceiveEpoch = new ThreadLocal<>();
   private static final Object taskAncestryPublicationLock = new Object();
   private static final AtomicLong nextTaskToken = new AtomicLong(initialTaskToken());
+  private static final AtomicLong remoteParentBridgeEpoch = new AtomicLong(1L);
   private static volatile LongSupplier processIncarnationSource = ThreadInfo::newProcessIncarnation;
   private static volatile long processIncarnation = initialProcessIncarnation();
   private static volatile boolean remoteParentEnabled;
@@ -93,11 +97,17 @@ public class ThreadInfo {
   public static TaskContext captureTaskContext(
       long parentThreadId, RemoteParentSocketContext.Lifecycle lifecycle) {
     boolean relayCapture = hasRemoteParentTaskLookupAuthority();
+    ReceiveContext receiveContext = remoteParentReceiveContext.get();
+    long bridgeEpoch = currentRemoteParentLookupBridgeEpoch();
     if (!remoteParentEnabled
         || lifecycle == null
         || !lifecycle.active()
         || !(hasRemoteParentDirectReceiveAuthority() || relayCapture)
         || remoteParentLookupLifecycle.get() != lifecycle
+        || !isCurrentRemoteParentBridgeCapability(bridgeEpoch)
+        || receiveContext != null
+            && (receiveContext.bridgeEpoch() != bridgeEpoch
+                || !isCurrentRemoteParentBridgeCapability(receiveContext.bridgeEpoch()))
         || onVirtualThread()) {
       return new TaskContext(onVirtualThread() ? 0L : parentThreadId, 0L);
     }
@@ -117,7 +127,16 @@ public class ThreadInfo {
     long token = newTaskToken();
     emitTaskContextOp(
         relayCapture ? OperationType.TASK_RELAY_CAPTURE : OperationType.TASK_CAPTURE, token, 0L);
-    return new TaskContext(parentThreadId, token, socketContext, lifecycle);
+    if (!isCurrentRemoteParentBridgeCapability(bridgeEpoch)
+        || receiveContext != null
+            && (receiveContext.lifecycle() != lifecycle
+                || receiveContext.bridgeEpoch() != bridgeEpoch
+                || !isCurrentRemoteParentBridgeCapability(receiveContext.bridgeEpoch()))) {
+      cancelTaskHandoff(token);
+      return new TaskContext(parentThreadId, 0L);
+    }
+    return new TaskContext(
+        parentThreadId, token, socketContext, lifecycle, receiveContext, bridgeEpoch);
   }
 
   public static void cancelTaskContext(TaskContext context) {
@@ -139,7 +158,7 @@ public class ThreadInfo {
 
   public static boolean enterTaskParentThreadContext(
       long threadId, long parentId, long handoffToken) {
-    return enterTaskParentThreadContext(threadId, parentId, handoffToken, null, null);
+    return enterTaskParentThreadContext(threadId, parentId, handoffToken, null, null, null);
   }
 
   public static boolean enterTaskParentThreadContext(
@@ -149,7 +168,8 @@ public class ThreadInfo {
         parentId,
         handoffToken,
         socketContext,
-        socketContext == null ? null : socketContext.lifecycle());
+        socketContext == null ? null : socketContext.lifecycle(),
+        null);
   }
 
   public static boolean enterTaskParentThreadContext(
@@ -158,6 +178,35 @@ public class ThreadInfo {
       long handoffToken,
       RemoteParentSocketContext socketContext,
       RemoteParentSocketContext.Lifecycle socketLifecycle) {
+    return enterTaskParentThreadContext(
+        threadId, parentId, handoffToken, socketContext, socketLifecycle, null);
+  }
+
+  public static boolean enterTaskParentThreadContext(
+      long threadId,
+      long parentId,
+      long handoffToken,
+      RemoteParentSocketContext socketContext,
+      RemoteParentSocketContext.Lifecycle socketLifecycle,
+      ReceiveContext receiveContext) {
+    return enterTaskParentThreadContext(
+        threadId,
+        parentId,
+        handoffToken,
+        socketContext,
+        socketLifecycle,
+        receiveContext,
+        receiveContext == null ? 0L : receiveContext.bridgeEpoch());
+  }
+
+  public static boolean enterTaskParentThreadContext(
+      long threadId,
+      long parentId,
+      long handoffToken,
+      RemoteParentSocketContext socketContext,
+      RemoteParentSocketContext.Lifecycle socketLifecycle,
+      ReceiveContext receiveContext,
+      long bridgeEpoch) {
     if (onVirtualThread() && handoffToken == 0L) {
       rejectTaskEntry(handoffToken);
       return false;
@@ -172,7 +221,12 @@ public class ThreadInfo {
         && (socketLifecycle != null && !socketLifecycle.active()
             || socketContext != null
                 && socketLifecycle != null
-                && !socketContext.hasLifecycle(socketLifecycle))) {
+                && !socketContext.hasLifecycle(socketLifecycle)
+            || bridgeEpoch != 0L && !isCurrentRemoteParentBridgeCapability(bridgeEpoch)
+            || receiveContext != null
+                && (receiveContext.lifecycle() != socketLifecycle
+                    || bridgeEpoch != 0L && receiveContext.bridgeEpoch() != bridgeEpoch
+                    || !isCurrentRemoteParentBridgeCapability(receiveContext.bridgeEpoch())))) {
       rejectTaskEntry(handoffToken);
       return false;
     }
@@ -191,6 +245,8 @@ public class ThreadInfo {
     byte previousLookupOverride = currentRemoteParentLookupOverride();
     long previousReceiveEpoch = currentRemoteParentReceiveEpoch();
     RemoteParentSocketContext.Lifecycle previousLookupLifecycle = remoteParentLookupLifecycle.get();
+    long previousLookupBridgeEpoch = currentRemoteParentLookupBridgeEpoch();
+    ReceiveContext previousReceiveContext = remoteParentReceiveContext.get();
     long target =
         state.enter(
             threadId,
@@ -200,7 +256,9 @@ public class ThreadInfo {
             remoteParentSocketContext.get(),
             previousLookupOverride,
             previousReceiveEpoch,
-            previousLookupLifecycle);
+            previousLookupLifecycle,
+            previousLookupBridgeEpoch,
+            previousReceiveContext);
     if (target == NO_TASK_RELAY_CHANGE) {
       failClosedTaskEntry(handoffToken, restoreToken);
       return false;
@@ -209,15 +267,27 @@ public class ThreadInfo {
     if (exactTokenHandoff) {
       remoteParentLookupOverride.set(LOOKUP_TASK);
       setRemoteParentLookupLifecycle(socketLifecycle);
+      setRemoteParentLookupBridgeEpoch(bridgeEpoch);
+      setRemoteParentReceiveContext(receiveContext, socketLifecycle);
     } else {
       blockRemoteParentLookup();
     }
     try {
       emitTaskParentContext(target, handoffToken, exactTokenHandoff);
+      if (bridgeEpoch != 0L && !isCurrentRemoteParentBridgeCapability(bridgeEpoch)
+          || receiveContext != null
+              && (bridgeEpoch != 0L && receiveContext.bridgeEpoch() != bridgeEpoch
+                  || !isCurrentRemoteParentBridgeCapability(receiveContext.bridgeEpoch()))) {
+        state.exit();
+        state.clearExitReferences();
+        failClosedTaskEntry(handoffToken, restoreToken);
+        return false;
+      }
       setRemoteParentSocketContext(socketContext);
       return true;
     } catch (Throwable failure) {
       remoteParentSocketContext.remove();
+      remoteParentReceiveContext.remove();
       state.exit();
       state.clearExitReferences();
       blockRemoteParentLookup();
@@ -242,6 +312,8 @@ public class ThreadInfo {
     byte previousLookupOverride = state.exitLookupOverride();
     long previousReceiveEpoch = state.exitReceiveEpoch();
     RemoteParentSocketContext.Lifecycle previousLookupLifecycle = state.exitLookupLifecycle();
+    long previousLookupBridgeEpoch = state.exitLookupBridgeEpoch();
+    ReceiveContext previousReceiveContext = state.exitReceiveContext();
     state.clearExitReferences();
     boolean restoreSucceeded = false;
     try {
@@ -255,13 +327,18 @@ public class ThreadInfo {
     } finally {
       if (restoreSucceeded
           && restoreRemoteParentLookup(
-              previousLookupOverride, previousReceiveEpoch, previousLookupLifecycle)) {
+              previousLookupOverride,
+              previousReceiveEpoch,
+              previousLookupLifecycle,
+              previousLookupBridgeEpoch)) {
         setRemoteParentSocketContext(previousSocketContext);
+        setRemoteParentReceiveContext(previousReceiveContext, previousLookupLifecycle);
       } else {
         if (previousSocketContext != null) {
           previousSocketContext.discard();
         }
         remoteParentSocketContext.remove();
+        remoteParentReceiveContext.remove();
         blockRemoteParentLookup();
       }
     }
@@ -269,6 +346,41 @@ public class ThreadInfo {
 
   public static void setRemoteParentEnabled(boolean enabled) {
     remoteParentEnabled = enabled;
+  }
+
+  /** Returns the process-wide provider epoch captured by receive and task capabilities. */
+  public static long remoteParentBridgeEpoch() {
+    return remoteParentBridgeEpoch.get();
+  }
+
+  /**
+   * Retires every capability issued by the previous bridge/provider configuration.
+   *
+   * <p>The practical overflow horizon is unreachable; skipping zero preserves its use as the
+   * unbound sentinel in bootstrap-safe handoff objects.
+   */
+  public static long advanceRemoteParentBridgeEpoch() {
+    long next = remoteParentBridgeEpoch.incrementAndGet();
+    if (next != 0L) {
+      return next;
+    }
+    return remoteParentBridgeEpoch.incrementAndGet();
+  }
+
+  /** Returns whether an exact receive/task capability belongs to the active provider epoch. */
+  public static boolean isCurrentRemoteParentBridgeEpoch(long epoch) {
+    return epoch != 0L && remoteParentBridgeEpoch.get() == epoch;
+  }
+
+  /** Returns whether an exact capability belongs to the currently enabled provider epoch. */
+  public static boolean isCurrentRemoteParentBridgeCapability(long epoch) {
+    return remoteParentEnabled && isCurrentRemoteParentBridgeEpoch(epoch);
+  }
+
+  /** Captures the exact currently enabled provider epoch, or zero when authority is unavailable. */
+  public static long captureRemoteParentBridgeCapability() {
+    long epoch = remoteParentBridgeEpoch.get();
+    return isCurrentRemoteParentBridgeCapability(epoch) ? epoch : 0L;
   }
 
   public static boolean isRemoteParentEnabled() {
@@ -327,17 +439,101 @@ public class ThreadInfo {
 
   /** Marks a successful receive and retains its physical lifecycle as a revocation fence. */
   public static void markRemoteParentDirectLookup(Object lifecycle) {
+    markRemoteParentDirectLookup(lifecycle, null);
+  }
+
+  /**
+   * Marks direct lookup only when one receive spans the same enabled provider epoch.
+   *
+   * <p>The post-check closes the race between the initial eligibility snapshot and publication of
+   * the thread-local capability. A later transition is also rejected by {@link
+   * #remoteParentLookupSource()} because the captured epoch remains attached to the lookup.
+   */
+  public static boolean markRemoteParentDirectLookupIfCurrent(Object lifecycle, long bridgeEpoch) {
+    if (!isCurrentRemoteParentBridgeCapability(bridgeEpoch)) {
+      blockRemoteParentLookup();
+      return false;
+    }
+    markRemoteParentDirectLookup(lifecycle, null);
+    if (currentRemoteParentLookupOverride() != LOOKUP_DIRECT
+        || currentRemoteParentLookupBridgeEpoch() != bridgeEpoch
+        || !isCurrentRemoteParentBridgeCapability(bridgeEpoch)) {
+      blockRemoteParentLookup();
+      return false;
+    }
+    return true;
+  }
+
+  /** Marks direct authority for one exact HTTP receive sequence. */
+  public static boolean markRemoteParentDirectReceiveContext(ReceiveContext receiveContext) {
+    if (receiveContext == null
+        || !receiveContext.lifecycle().active()
+        || !isCurrentRemoteParentBridgeCapability(receiveContext.bridgeEpoch())) {
+      blockRemoteParentLookup();
+      return false;
+    }
+    markRemoteParentDirectLookup(receiveContext.lifecycle(), receiveContext);
+    return currentRemoteParentLookupOverride() == LOOKUP_DIRECT
+        && remoteParentReceiveContext.get() == receiveContext;
+  }
+
+  private static void markRemoteParentDirectLookup(
+      Object lifecycle, ReceiveContext receiveContext) {
+    long bridgeEpoch =
+        receiveContext == null ? remoteParentBridgeEpoch() : receiveContext.bridgeEpoch();
+    if (!isCurrentRemoteParentBridgeEpoch(bridgeEpoch)) {
+      blockRemoteParentLookup();
+      return;
+    }
     if (lifecycle instanceof RemoteParentSocketContext.Lifecycle) {
       RemoteParentSocketContext.Lifecycle exact = (RemoteParentSocketContext.Lifecycle) lifecycle;
-      if (!exact.active()) {
+      if (!exact.active()
+          || receiveContext != null
+              && (receiveContext.lifecycle() != exact
+                  || !isCurrentRemoteParentBridgeCapability(receiveContext.bridgeEpoch()))) {
         blockRemoteParentLookup();
         return;
       }
       remoteParentLookupLifecycle.set(exact);
+      setRemoteParentLookupBridgeEpoch(bridgeEpoch);
+      setRemoteParentReceiveContext(receiveContext, exact);
     } else {
       remoteParentLookupLifecycle.remove();
+      setRemoteParentLookupBridgeEpoch(bridgeEpoch);
+      remoteParentReceiveContext.remove();
     }
     remoteParentLookupOverride.set(LOOKUP_DIRECT);
+    if (!isCurrentRemoteParentBridgeEpoch(bridgeEpoch)) {
+      blockRemoteParentLookup();
+    }
+  }
+
+  /** Atomically removes the exact sequence capability used by one extraction attempt. */
+  public static ReceiveContext takeRemoteParentReceiveContext() {
+    ReceiveContext context = remoteParentReceiveContext.get();
+    remoteParentReceiveContext.remove();
+    return context;
+  }
+
+  /** Completes one exact extraction attempt and prevents same-thread re-extraction. */
+  public static void finishRemoteParentExtraction(ReceiveContext context) {
+    finishRemoteParentExtractionAndValidate(context);
+  }
+
+  /** Completes extraction and reports whether its exact provider-epoch capability was current. */
+  public static boolean finishRemoteParentExtractionAndValidate(ReceiveContext context) {
+    if (context == null) {
+      return true;
+    }
+    // Extraction is a one-shot execution boundary. Advancing the epoch prevents an enclosing
+    // nested task scope from restoring a cached copy of this exact sequence after it is consumed.
+    advanceRemoteParentReceiveEpoch();
+    boolean observed = context.extractionObserved();
+    if (remoteParentReceiveContext.get() == null
+        && remoteParentLookupLifecycle.get() == context.lifecycle()) {
+      blockRemoteParentLookup();
+    }
+    return observed && isCurrentRemoteParentBridgeCapability(context.bridgeEpoch());
   }
 
   /** Returns positive evidence that this execution completed the current inbound receive. */
@@ -350,17 +546,49 @@ public class ThreadInfo {
       return false;
     }
     TaskRelayState state = taskRelayState.get();
-    return state != null && state.currentExact();
+    long bridgeEpoch = currentRemoteParentLookupBridgeEpoch();
+    return state != null
+        && state.currentExact()
+        && (bridgeEpoch == 0L || isCurrentRemoteParentBridgeCapability(bridgeEpoch));
   }
 
   /** Prevents an uncertain receive from falling back to either a task or a direct owner. */
   public static void blockRemoteParentLookup() {
     remoteParentLookupOverride.set(LOOKUP_BLOCKED);
     remoteParentLookupLifecycle.remove();
+    remoteParentLookupBridgeEpoch.remove();
+    remoteParentReceiveContext.remove();
+  }
+
+  /** Clears every thread-local Java capability after a bridge call loses provider eligibility. */
+  public static void revokeRemoteParentBridgeAuthority() {
+    clearRemoteParentSocketFileDescriptor();
+    blockRemoteParentLookup();
+  }
+
+  /** Revokes ambient authority only when it belongs to the terminal physical lifecycle. */
+  public static void revokeRemoteParentLookup(RemoteParentSocketContext.Lifecycle lifecycle) {
+    if (lifecycle != null
+        && (remoteParentLookupLifecycle.get() == lifecycle
+            || remoteParentReceiveContext.get() != null
+                && remoteParentReceiveContext.get().lifecycle() == lifecycle)) {
+      blockRemoteParentLookup();
+    }
   }
 
   /** Returns the most recent positively established execution source, or fail-closed BLOCKED. */
   public static int remoteParentLookupSource() {
+    long bridgeEpoch = currentRemoteParentLookupBridgeEpoch();
+    if (bridgeEpoch != 0L && !isCurrentRemoteParentBridgeCapability(bridgeEpoch)) {
+      blockRemoteParentLookup();
+      return REMOTE_PARENT_LOOKUP_BLOCKED;
+    }
+    ReceiveContext receiveContext = remoteParentReceiveContext.get();
+    if (receiveContext != null
+        && !isCurrentRemoteParentBridgeCapability(receiveContext.bridgeEpoch())) {
+      blockRemoteParentLookup();
+      return REMOTE_PARENT_LOOKUP_BLOCKED;
+    }
     byte lookupOverride = currentRemoteParentLookupOverride();
     if (lookupOverride == LOOKUP_BLOCKED) {
       return REMOTE_PARENT_LOOKUP_BLOCKED;
@@ -377,6 +605,8 @@ public class ThreadInfo {
   public static void clearRemoteParentLookupSource() {
     remoteParentLookupOverride.remove();
     remoteParentLookupLifecycle.remove();
+    remoteParentLookupBridgeEpoch.remove();
+    remoteParentReceiveContext.remove();
   }
 
   /** Returns the lifecycle that must remain live for a direct or task lookup. */
@@ -592,17 +822,29 @@ public class ThreadInfo {
     return epoch == null ? 0L : epoch;
   }
 
+  private static long currentRemoteParentLookupBridgeEpoch() {
+    Long epoch = remoteParentLookupBridgeEpoch.get();
+    return epoch == null ? 0L : epoch;
+  }
+
   private static void advanceRemoteParentReceiveEpoch() {
     long next = currentRemoteParentReceiveEpoch() + 1L;
     remoteParentReceiveEpoch.set(next == 0L ? 1L : next);
   }
 
   private static boolean restoreRemoteParentLookup(
-      byte lookupOverride, long receiveEpoch, RemoteParentSocketContext.Lifecycle lookupLifecycle) {
+      byte lookupOverride,
+      long receiveEpoch,
+      RemoteParentSocketContext.Lifecycle lookupLifecycle,
+      long lookupBridgeEpoch) {
     if (currentRemoteParentReceiveEpoch() != receiveEpoch) {
       blockRemoteParentLookup();
       return false;
     } else if (lookupLifecycle != null && !lookupLifecycle.active()) {
+      blockRemoteParentLookup();
+      return false;
+    } else if (lookupBridgeEpoch != 0L
+        && !isCurrentRemoteParentBridgeCapability(lookupBridgeEpoch)) {
       blockRemoteParentLookup();
       return false;
     } else if (lookupOverride == LOOKUP_DIRECT
@@ -613,6 +855,7 @@ public class ThreadInfo {
       remoteParentLookupOverride.remove();
     }
     setRemoteParentLookupLifecycle(lookupLifecycle);
+    setRemoteParentLookupBridgeEpoch(lookupBridgeEpoch);
     return true;
   }
 
@@ -622,6 +865,14 @@ public class ThreadInfo {
       remoteParentLookupLifecycle.remove();
     } else {
       remoteParentLookupLifecycle.set(lifecycle);
+    }
+  }
+
+  private static void setRemoteParentLookupBridgeEpoch(long epoch) {
+    if (epoch == 0L) {
+      remoteParentLookupBridgeEpoch.remove();
+    } else {
+      remoteParentLookupBridgeEpoch.set(epoch);
     }
   }
 
@@ -638,6 +889,21 @@ public class ThreadInfo {
       remoteParentSocketContext.remove();
     } else {
       remoteParentSocketContext.set(context);
+    }
+  }
+
+  private static void setRemoteParentReceiveContext(
+      ReceiveContext context, RemoteParentSocketContext.Lifecycle lifecycle) {
+    if (context == null) {
+      remoteParentReceiveContext.remove();
+    } else if (lifecycle != null
+        && context.lifecycle() == lifecycle
+        && lifecycle.active()
+        && isCurrentRemoteParentBridgeCapability(context.bridgeEpoch())) {
+      remoteParentReceiveContext.set(context);
+    } else {
+      remoteParentReceiveContext.remove();
+      blockRemoteParentLookup();
     }
   }
 
@@ -675,16 +941,20 @@ public class ThreadInfo {
     private boolean[] previousExact = new boolean[4];
     private byte[] previousLookupOverrides = new byte[4];
     private long[] previousReceiveEpochs = new long[4];
+    private long[] previousLookupBridgeEpochs = new long[4];
     private RemoteParentSocketContext.Lifecycle[] previousLookupLifecycles =
         new RemoteParentSocketContext.Lifecycle[4];
     private RemoteParentSocketContext[] previousSocketContexts = new RemoteParentSocketContext[4];
+    private ReceiveContext[] previousReceiveContexts = new ReceiveContext[4];
     private long exitToken;
     private boolean currentExact;
     private boolean exitExact;
     private byte exitLookupOverride;
     private long exitReceiveEpoch;
     private RemoteParentSocketContext.Lifecycle exitLookupLifecycle;
+    private long exitLookupBridgeEpoch;
     private RemoteParentSocketContext exitSocketContext;
+    private ReceiveContext exitReceiveContext;
     private int depth;
 
     long enter(long currentThreadId, long parentId, long restoreToken, boolean exactTokenHandoff) {
@@ -695,6 +965,8 @@ public class ThreadInfo {
           exactTokenHandoff,
           null,
           LOOKUP_DEFAULT,
+          0L,
+          null,
           0L,
           null);
     }
@@ -707,7 +979,9 @@ public class ThreadInfo {
         RemoteParentSocketContext previousSocketContext,
         byte previousLookupOverride,
         long previousReceiveEpoch,
-        RemoteParentSocketContext.Lifecycle previousLookupLifecycle) {
+        RemoteParentSocketContext.Lifecycle previousLookupLifecycle,
+        long previousLookupBridgeEpoch,
+        ReceiveContext previousReceiveContext) {
       if (parentId <= 0
           || depth >= MAX_TASK_RELAY_DEPTH
           || (!exactTokenHandoff && hasParent(parentId))) {
@@ -735,6 +1009,14 @@ public class ThreadInfo {
         System.arraycopy(
             previousReceiveEpochs, 0, expandedReceiveEpochs, 0, previousReceiveEpochs.length);
         previousReceiveEpochs = expandedReceiveEpochs;
+        long[] expandedLookupBridgeEpochs = new long[previousLookupBridgeEpochs.length * 2];
+        System.arraycopy(
+            previousLookupBridgeEpochs,
+            0,
+            expandedLookupBridgeEpochs,
+            0,
+            previousLookupBridgeEpochs.length);
+        previousLookupBridgeEpochs = expandedLookupBridgeEpochs;
         RemoteParentSocketContext.Lifecycle[] expandedLookupLifecycles =
             new RemoteParentSocketContext.Lifecycle[previousLookupLifecycles.length * 2];
         System.arraycopy(
@@ -749,6 +1031,11 @@ public class ThreadInfo {
         System.arraycopy(
             previousSocketContexts, 0, expandedSocketContexts, 0, previousSocketContexts.length);
         previousSocketContexts = expandedSocketContexts;
+        ReceiveContext[] expandedReceiveContexts =
+            new ReceiveContext[previousReceiveContexts.length * 2];
+        System.arraycopy(
+            previousReceiveContexts, 0, expandedReceiveContexts, 0, previousReceiveContexts.length);
+        previousReceiveContexts = expandedReceiveContexts;
       }
       previousParents[depth] = currentParent;
       previousTokens[depth] = restoreToken;
@@ -756,7 +1043,9 @@ public class ThreadInfo {
       previousLookupOverrides[depth] = previousLookupOverride;
       previousReceiveEpochs[depth] = previousReceiveEpoch;
       previousLookupLifecycles[depth] = previousLookupLifecycle;
+      previousLookupBridgeEpochs[depth] = previousLookupBridgeEpoch;
       previousSocketContexts[depth] = previousSocketContext;
+      previousReceiveContexts[depth] = previousReceiveContext;
       depth++;
       currentParent = parentId;
       currentExact = exactTokenHandoff;
@@ -774,14 +1063,18 @@ public class ThreadInfo {
       exitLookupOverride = previousLookupOverrides[depth];
       exitReceiveEpoch = previousReceiveEpochs[depth];
       exitLookupLifecycle = previousLookupLifecycles[depth];
+      exitLookupBridgeEpoch = previousLookupBridgeEpochs[depth];
       exitSocketContext = previousSocketContexts[depth];
+      exitReceiveContext = previousReceiveContexts[depth];
       previousParents[depth] = 0L;
       previousTokens[depth] = 0L;
       previousExact[depth] = false;
       previousLookupOverrides[depth] = LOOKUP_DEFAULT;
       previousReceiveEpochs[depth] = 0L;
       previousLookupLifecycles[depth] = null;
+      previousLookupBridgeEpochs[depth] = 0L;
       previousSocketContexts[depth] = null;
+      previousReceiveContexts[depth] = null;
       currentParent = previous;
       currentExact = exitExact;
       return previous == 0 ? threadId : previous;
@@ -835,13 +1128,23 @@ public class ThreadInfo {
       return exitLookupLifecycle;
     }
 
+    long exitLookupBridgeEpoch() {
+      return exitLookupBridgeEpoch;
+    }
+
     RemoteParentSocketContext exitSocketContext() {
       return exitSocketContext;
     }
 
+    ReceiveContext exitReceiveContext() {
+      return exitReceiveContext;
+    }
+
     void clearExitReferences() {
       exitLookupLifecycle = null;
+      exitLookupBridgeEpoch = 0L;
       exitSocketContext = null;
+      exitReceiveContext = null;
     }
   }
 

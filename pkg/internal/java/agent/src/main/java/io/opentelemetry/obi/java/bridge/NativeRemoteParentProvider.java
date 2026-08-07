@@ -9,6 +9,7 @@ import io.opentelemetry.obi.java.BootstrapNative;
 import io.opentelemetry.obi.java.ebpf.ThreadInfo;
 import io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext;
 import io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext.Lifecycle;
+import io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext.ReceiveContext;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.function.IntSupplier;
 import java.util.function.LongSupplier;
@@ -117,31 +118,43 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
     int lookupSource = ThreadInfo.remoteParentLookupSource();
     boolean taskScoped = lookupSource == ThreadInfo.REMOTE_PARENT_LOOKUP_TASK;
     RemoteParentSocketContext context = ThreadInfo.takeRemoteParentSocketContext();
+    ReceiveContext receiveContext = ThreadInfo.takeRemoteParentReceiveContext();
     Lifecycle.Lease lifecycleLease = null;
+    RemoteParentRecord result;
+    boolean receiveContextValid;
     try {
       if (lookupSource == ThreadInfo.REMOTE_PARENT_LOOKUP_BLOCKED) {
-        return RemoteParentRecord.statusOnly(RemoteParentStatus.MISSING);
-      }
-      if (!ensureReady()) {
-        return RemoteParentRecord.statusOnly(transportStatus);
-      }
-      Lifecycle lifecycle = ThreadInfo.remoteParentLookupLifecycle();
-      if (lifecycle != null) {
-        lifecycleLease = lifecycle.acquireLookupLease();
-        if (lifecycleLease == null) {
-          return RemoteParentRecord.statusOnly(RemoteParentStatus.MISSING);
+        result = RemoteParentRecord.statusOnly(RemoteParentStatus.MISSING);
+      } else if (receiveContext != null
+          && !ThreadInfo.isCurrentRemoteParentBridgeCapability(receiveContext.bridgeEpoch())) {
+        result = RemoteParentRecord.statusOnly(RemoteParentStatus.MISSING);
+      } else if (!ensureReady()) {
+        result = RemoteParentRecord.statusOnly(transportStatus);
+      } else {
+        Lifecycle lifecycle = ThreadInfo.remoteParentLookupLifecycle();
+        if (lifecycle != null) {
+          lifecycleLease = lifecycle.acquireLookupLease();
+        }
+        result =
+            lifecycle != null && lifecycleLease == null
+                ? RemoteParentRecord.statusOnly(RemoteParentStatus.MISSING)
+                : call(take, taskScoped, context);
+        if (receiveContext != null
+            && !ThreadInfo.isCurrentRemoteParentBridgeCapability(receiveContext.bridgeEpoch())) {
+          result = RemoteParentRecord.statusOnly(RemoteParentStatus.MISSING);
         }
       }
-      return call(take, taskScoped, context);
     } finally {
       if (lifecycleLease != null) {
         lifecycleLease.close();
       }
+      receiveContextValid = ThreadInfo.finishRemoteParentExtractionAndValidate(receiveContext);
       if (context != null) {
         context.discard();
       }
       ThreadInfo.clearRemoteParentSocketFileDescriptor();
     }
+    return receiveContextValid ? result : RemoteParentRecord.statusOnly(RemoteParentStatus.MISSING);
   }
 
   private RemoteParentRecord call(

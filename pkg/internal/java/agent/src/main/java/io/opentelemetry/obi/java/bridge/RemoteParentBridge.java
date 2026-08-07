@@ -5,6 +5,7 @@
 
 package io.opentelemetry.obi.java.bridge;
 
+import io.opentelemetry.obi.java.ebpf.ThreadInfo;
 import java.util.concurrent.atomic.AtomicReference;
 
 /** Bootstrap-visible handoff between the late-attached OBI helper and agent extensions. */
@@ -19,14 +20,27 @@ public final class RemoteParentBridge {
   }
 
   public static RemoteParentRecord takeRemoteParent() {
+    long bridgeEpoch = ThreadInfo.captureRemoteParentBridgeCapability();
+    if (bridgeEpoch == 0L) {
+      ThreadInfo.revokeRemoteParentBridgeAuthority();
+      RemoteParentRecord missing = RemoteParentRecord.statusOnly(RemoteParentStatus.MISSING);
+      RemoteParentDiagnostics.takeStatus(missing.getStatus());
+      return missing;
+    }
+    RemoteParentProvider selected = provider.get();
     RemoteParentRecord record;
     try {
-      record = provider.get().takeRemoteParent();
+      record = selected.takeRemoteParent();
     } catch (Throwable ignored) {
       record = RemoteParentRecord.statusOnly(RemoteParentStatus.TRANSPORT_ERROR);
     }
     if (record == null) {
       record = RemoteParentRecord.statusOnly(RemoteParentStatus.MALFORMED);
+    }
+    if (selected != provider.get()
+        || !ThreadInfo.isCurrentRemoteParentBridgeCapability(bridgeEpoch)) {
+      ThreadInfo.revokeRemoteParentBridgeAuthority();
+      record = RemoteParentRecord.statusOnly(RemoteParentStatus.MISSING);
     }
     RemoteParentDiagnostics.takeStatus(record.getStatus());
     if (record.getStatus() == RemoteParentStatus.VALID) {
@@ -41,14 +55,27 @@ public final class RemoteParentBridge {
 
   public static RemoteParentRecord discardRemoteParent(int reason) {
     RemoteParentDiagnostics.discardReason(reason);
+    long bridgeEpoch = ThreadInfo.captureRemoteParentBridgeCapability();
+    if (bridgeEpoch == 0L) {
+      ThreadInfo.revokeRemoteParentBridgeAuthority();
+      RemoteParentRecord missing = RemoteParentRecord.statusOnly(RemoteParentStatus.MISSING);
+      RemoteParentDiagnostics.discardStatus(missing.getStatus());
+      return missing;
+    }
+    RemoteParentProvider selected = provider.get();
     RemoteParentRecord record;
     try {
-      record = provider.get().discardRemoteParent();
+      record = selected.discardRemoteParent();
     } catch (Throwable ignored) {
       record = RemoteParentRecord.statusOnly(RemoteParentStatus.TRANSPORT_ERROR);
     }
     if (record == null) {
       record = RemoteParentRecord.statusOnly(RemoteParentStatus.MALFORMED);
+    }
+    if (selected != provider.get()
+        || !ThreadInfo.isCurrentRemoteParentBridgeCapability(bridgeEpoch)) {
+      ThreadInfo.revokeRemoteParentBridgeAuthority();
+      record = RemoteParentRecord.statusOnly(RemoteParentStatus.MISSING);
     }
     RemoteParentDiagnostics.discardStatus(record.getStatus());
     return record;
@@ -108,6 +135,17 @@ public final class RemoteParentBridge {
 
   public static void recordExtractionFailure(int reason) {
     RemoteParentDiagnostics.extractionFailure(reason);
+  }
+
+  /**
+   * Records a local receive drop without invoking the provider.
+   *
+   * <p>The existing {@code d_<status>} schema covers both native discard outcomes and local
+   * fail-closed drops. This keeps ambiguity reason-coded while avoiding a destructive provider
+   * lookup whose only purpose would be accounting.
+   */
+  public static void recordReceiveFailure(int status) {
+    RemoteParentDiagnostics.receiveFailure(status);
   }
 
   public static void recordExtensionEvent(int event, long count) {

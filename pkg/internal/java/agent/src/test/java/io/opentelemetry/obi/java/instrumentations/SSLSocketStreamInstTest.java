@@ -43,11 +43,11 @@ class SSLSocketStreamInstTest {
     NativeMemory packet = new NativeMemory(IOCTLPacket.packetPrefixSize + bytesRead + 1, true);
 
     // same call sequence the read advices inline
-    int wOff =
-        IOCTLPacket.writePacketPrefix(packet, 0, OperationType.RECEIVE, (Socket) null, bytesRead);
+    int wOff = IOCTLPacket.writeTelemetryReceivePacketPrefix(packet, 0, (Socket) null, bytesRead);
     int end = IOCTLPacket.writePacketBuffer(packet, wOff, buffer, 0, bytesRead);
 
     assertEquals(IOCTLPacket.packetPrefixSize + bytesRead, end);
+    assertEquals(OperationType.TELEMETRY_RECEIVE.code, packet.getBuffer().get(0));
     assertEquals(bytesRead, packet.getInt(IOCTLPacket.bufferLengthOffset));
     assertEquals(0L, packet.getLong(IOCTLPacket.dataSignalOffset));
     for (int i = 0; i < bytesRead; i++) {
@@ -151,6 +151,30 @@ class SSLSocketStreamInstTest {
                 "io/opentelemetry/obi/java/BootstrapNative",
                 "invalidateRemoteParentSocketFileDescriptor")
             > 0);
+    assertTrue(
+        staticInvocationCount(
+                transformed,
+                "read",
+                "([BII)I",
+                "io/opentelemetry/obi/java/BootstrapNative",
+                "prepareRemoteParentSocketLifecycle")
+            > 0);
+    assertEquals(
+        1,
+        staticInvocationCount(
+            transformed,
+            "read",
+            "([BII)I",
+            "io/opentelemetry/obi/java/BootstrapNative",
+            "emitTelemetryReceiveData"));
+    assertEquals(
+        0,
+        staticInvocationCount(
+            transformed,
+            "read",
+            "([BII)I",
+            "io/opentelemetry/obi/java/BootstrapNative",
+            "emitData"));
     assertTrue(
         staticInvocationCount(
                 transformed,

@@ -9,16 +9,22 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.opentelemetry.obi.java.BootstrapNative;
+import io.opentelemetry.obi.java.ebpf.NativeMemoryTestAccess;
 import io.opentelemetry.obi.java.ebpf.ThreadInfo;
+import io.opentelemetry.obi.java.instrumentations.data.Connection;
 import io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext.Lifecycle;
+import io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext.ReceiveContext;
 import io.opentelemetry.obi.java.instrumentations.data.SSLStorage;
 import io.opentelemetry.obi.java.instrumentations.data.TaskContext;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.net.InetAddress;
 import java.net.Socket;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -29,6 +35,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicReferenceArray;
+import java.util.function.LongBinaryOperator;
 import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
@@ -43,6 +50,9 @@ class NativeRemoteParentProviderTest {
     ThreadInfo.clearRemoteParentSocketFileDescriptor();
     ThreadInfo.clearRemoteParentLookupSource();
     setTaskContextEmitter(null);
+    setEmitDataOnSocket(null);
+    setBeforeLegacyReceiveEmit(null);
+    NativeMemoryTestAccess.setSyntheticAddress(false);
   }
 
   @Test
@@ -58,6 +68,281 @@ class NativeRemoteParentProviderTest {
     assertFalse(NativeRemoteParentProvider.requiresReconfiguration(RemoteParentStatus.STALE));
     assertFalse(
         NativeRemoteParentProvider.requiresReconfiguration(RemoteParentStatus.ALREADY_CONSUMED));
+  }
+
+  @Test
+  void disabledLegacyReceiveCannotBecomeAuthorityAfterSameEpochReenable() throws Exception {
+    AtomicInteger emissions = new AtomicInteger();
+    AtomicInteger nativeCalls = new AtomicInteger();
+    setEmitDataOnSocket(
+        (socketFileDescriptor, packetAddress) -> {
+          assertEquals(73, socketFileDescriptor);
+          emissions.incrementAndGet();
+          return 1;
+        });
+    NativeMemoryTestAccess.setSyntheticAddress(true);
+    ThreadInfo.setRemoteParentEnabled(false);
+    long disabledEpoch = ThreadInfo.remoteParentBridgeEpoch();
+    setBeforeLegacyReceiveEmit(() -> ThreadInfo.setRemoteParentEnabled(true));
+    Connection connection =
+        new Connection(
+            InetAddress.getLoopbackAddress(), 8443, InetAddress.getLoopbackAddress(), 42_000, 73);
+    Object physicalOwner = new Object();
+    assertSame(connection, SSLStorage.associateConnectionWithChannel(physicalOwner, connection));
+    NativeRemoteParentProvider provider =
+        readyProvider(
+            (take, taskScoped, socketFileDescriptor, response) -> {
+              nativeCalls.incrementAndGet();
+              return RemoteParentStatus.VALID;
+            });
+
+    try {
+      byte[] plaintext = "legacy".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+      assertEquals(
+          1, SSLStorage.emitRemoteParentReceive(null, connection, plaintext, 0, plaintext.length));
+
+      assertEquals(1, emissions.get());
+      assertEquals(-1, ThreadInfo.remoteParentSocketFileDescriptor());
+      assertEquals(ThreadInfo.REMOTE_PARENT_LOOKUP_BLOCKED, ThreadInfo.remoteParentLookupSource());
+
+      assertTrue(ThreadInfo.isRemoteParentEnabled());
+      assertEquals(disabledEpoch, ThreadInfo.remoteParentBridgeEpoch());
+      Lifecycle lifecycle = (Lifecycle) SSLStorage.remoteParentSocketLifecycle(connection);
+      TaskContext handoff = ThreadInfo.captureTaskContext(101L, lifecycle);
+      assertEquals(0L, handoff.getHandoffToken());
+      assertEquals(RemoteParentStatus.MISSING, provider.takeRemoteParent().getStatus());
+      assertEquals(0, nativeCalls.get());
+    } finally {
+      provider.close();
+      SSLStorage.cleanupConnection(connection);
+      // Keep the weak lifecycle owner live until cleanup completes.
+      assertNotNull(physicalOwner);
+    }
+  }
+
+  @Test
+  void acknowledgesTheExactReceiveOnlyAfterItsExtractorAttempt() throws Exception {
+    AtomicInteger observations = new AtomicInteger();
+    AtomicBoolean observedInsideNativeCall = new AtomicBoolean();
+    ReceiveContext receiveContext = receiveContext(new Lifecycle(), 7L, observations);
+    NativeRemoteParentProvider provider =
+        readyProvider(
+            RemoteParentTransport.UNIX,
+            (take, taskScoped, socketFileDescriptor, response) -> {
+              observedInsideNativeCall.set(observations.get() != 0);
+              return RemoteParentStatus.MISSING;
+            });
+    try {
+      assertTrue(ThreadInfo.markRemoteParentDirectReceiveContext(receiveContext));
+
+      assertEquals(RemoteParentStatus.MISSING, provider.takeRemoteParent().getStatus());
+
+      assertFalse(observedInsideNativeCall.get());
+      assertEquals(1, observations.get());
+      assertEquals(ThreadInfo.REMOTE_PARENT_LOOKUP_BLOCKED, ThreadInfo.remoteParentLookupSource());
+      assertEquals(RemoteParentStatus.MISSING, provider.takeRemoteParent().getStatus());
+      assertEquals(1, observations.get());
+    } finally {
+      provider.close();
+    }
+  }
+
+  @Test
+  void exactTaskHandoffCarriesTheReceiveSequenceToExtraction() throws Exception {
+    AtomicInteger observations = new AtomicInteger();
+    AtomicBoolean taskScoped = new AtomicBoolean();
+    Lifecycle lifecycle = new Lifecycle();
+    ReceiveContext receiveContext = receiveContext(lifecycle, 9L, observations);
+    NativeRemoteParentProvider provider =
+        readyProvider(
+            RemoteParentTransport.UNIX,
+            (take, task, socketFileDescriptor, response) -> {
+              taskScoped.set(task);
+              return RemoteParentStatus.MISSING;
+            });
+    setTaskContextEmitter((proxy, method, args) -> null);
+    ThreadInfo.setRemoteParentEnabled(true);
+    boolean entered = false;
+    try {
+      assertTrue(ThreadInfo.markRemoteParentDirectReceiveContext(receiveContext));
+      TaskContext handoff = ThreadInfo.captureTaskContext(101L, lifecycle);
+      assertSame(receiveContext, handoff.getRemoteParentReceiveContext());
+
+      entered =
+          ThreadInfo.enterTaskParentThreadContext(
+              202L,
+              handoff.getParentThreadId(),
+              handoff.getHandoffToken(),
+              handoff.getRemoteParentSocketContext(),
+              handoff.getRemoteParentSocketLifecycle(),
+              handoff.getRemoteParentReceiveContext());
+      assertTrue(entered);
+      assertEquals(RemoteParentStatus.MISSING, provider.takeRemoteParent().getStatus());
+
+      assertTrue(taskScoped.get());
+      assertEquals(1, observations.get());
+      ThreadInfo.restoreTaskParentThreadContext();
+      entered = false;
+      assertEquals(ThreadInfo.REMOTE_PARENT_LOOKUP_BLOCKED, ThreadInfo.remoteParentLookupSource());
+      assertNull(ThreadInfo.takeRemoteParentReceiveContext());
+    } finally {
+      if (entered) {
+        ThreadInfo.restoreTaskParentThreadContext();
+      }
+      provider.close();
+    }
+  }
+
+  @Test
+  void staleTaskHandoffCannotEnterAfterProviderEpochTransition() throws Exception {
+    AtomicInteger observations = new AtomicInteger();
+    Lifecycle lifecycle = new Lifecycle();
+    ReceiveContext receiveContext = receiveContext(lifecycle, 11L, observations);
+    List<io.opentelemetry.obi.java.ebpf.OperationType> operations = new ArrayList<>();
+    setTaskContextEmitter(
+        (proxy, method, args) -> {
+          operations.add((io.opentelemetry.obi.java.ebpf.OperationType) args[0]);
+          return null;
+        });
+    ThreadInfo.setRemoteParentEnabled(true);
+
+    assertTrue(ThreadInfo.markRemoteParentDirectReceiveContext(receiveContext));
+    TaskContext handoff = ThreadInfo.captureTaskContext(101L, lifecycle);
+    assertEquals(receiveContext.bridgeEpoch(), handoff.getRemoteParentBridgeEpoch());
+    assertTrue(handoff.getHandoffToken() != 0L);
+
+    ThreadInfo.advanceRemoteParentBridgeEpoch();
+
+    assertFalse(
+        ThreadInfo.enterTaskParentThreadContext(
+            202L,
+            handoff.getParentThreadId(),
+            handoff.getHandoffToken(),
+            handoff.getRemoteParentSocketContext(),
+            handoff.getRemoteParentSocketLifecycle(),
+            handoff.getRemoteParentReceiveContext()));
+    assertEquals(ThreadInfo.REMOTE_PARENT_LOOKUP_BLOCKED, ThreadInfo.remoteParentLookupSource());
+    assertEquals(
+        Arrays.asList(
+            io.opentelemetry.obi.java.ebpf.OperationType.TASK_CAPTURE,
+            io.opentelemetry.obi.java.ebpf.OperationType.TASK_CANCEL),
+        operations);
+    assertEquals(0, observations.get());
+  }
+
+  @Test
+  void staleDescriptorlessTaskHandoffCannotEnterAfterProviderEpochTransition() throws Exception {
+    Lifecycle lifecycle = new Lifecycle();
+    List<io.opentelemetry.obi.java.ebpf.OperationType> operations = new ArrayList<>();
+    setTaskContextEmitter(
+        (proxy, method, args) -> {
+          operations.add((io.opentelemetry.obi.java.ebpf.OperationType) args[0]);
+          return null;
+        });
+    ThreadInfo.setRemoteParentEnabled(true);
+
+    ThreadInfo.markRemoteParentDirectLookup(lifecycle);
+    TaskContext handoff = ThreadInfo.captureTaskContext(101L, lifecycle);
+    assertEquals(ThreadInfo.remoteParentBridgeEpoch(), handoff.getRemoteParentBridgeEpoch());
+    assertTrue(handoff.getHandoffToken() != 0L);
+    assertNull(handoff.getRemoteParentReceiveContext());
+
+    ThreadInfo.advanceRemoteParentBridgeEpoch();
+
+    assertFalse(
+        ThreadInfo.enterTaskParentThreadContext(
+            202L,
+            handoff.getParentThreadId(),
+            handoff.getHandoffToken(),
+            handoff.getRemoteParentSocketContext(),
+            handoff.getRemoteParentSocketLifecycle(),
+            handoff.getRemoteParentReceiveContext(),
+            handoff.getRemoteParentBridgeEpoch()));
+    assertEquals(ThreadInfo.REMOTE_PARENT_LOOKUP_BLOCKED, ThreadInfo.remoteParentLookupSource());
+    assertEquals(
+        Arrays.asList(
+            io.opentelemetry.obi.java.ebpf.OperationType.TASK_CAPTURE,
+            io.opentelemetry.obi.java.ebpf.OperationType.TASK_CANCEL),
+        operations);
+  }
+
+  @Test
+  void activeDescriptorlessTaskScopeLosesLookupAuthorityAfterProviderEpochTransition()
+      throws Exception {
+    Lifecycle lifecycle = new Lifecycle();
+    setTaskContextEmitter((proxy, method, args) -> null);
+    ThreadInfo.setRemoteParentEnabled(true);
+
+    ThreadInfo.markRemoteParentDirectLookup(lifecycle);
+    TaskContext handoff = ThreadInfo.captureTaskContext(101L, lifecycle);
+    assertTrue(
+        ThreadInfo.enterTaskParentThreadContext(
+            202L,
+            handoff.getParentThreadId(),
+            handoff.getHandoffToken(),
+            handoff.getRemoteParentSocketContext(),
+            handoff.getRemoteParentSocketLifecycle(),
+            handoff.getRemoteParentReceiveContext(),
+            handoff.getRemoteParentBridgeEpoch()));
+    try {
+      assertEquals(ThreadInfo.REMOTE_PARENT_LOOKUP_TASK, ThreadInfo.remoteParentLookupSource());
+
+      ThreadInfo.advanceRemoteParentBridgeEpoch();
+
+      assertEquals(ThreadInfo.REMOTE_PARENT_LOOKUP_BLOCKED, ThreadInfo.remoteParentLookupSource());
+    } finally {
+      ThreadInfo.restoreTaskParentThreadContext();
+    }
+  }
+
+  @Test
+  void providerEpochTransitionDuringNativeExtractionSuppressesAValidOldResponse() throws Exception {
+    CountDownLatch nativeEntered = new CountDownLatch(1);
+    CountDownLatch releaseNative = new CountDownLatch(1);
+    CountDownLatch lookupFinished = new CountDownLatch(1);
+    AtomicInteger observations = new AtomicInteger();
+    AtomicInteger status = new AtomicInteger(RemoteParentStatus.UNKNOWN);
+    AtomicReference<Throwable> failure = new AtomicReference<>();
+    Lifecycle lifecycle = new Lifecycle();
+    ReceiveContext receiveContext = receiveContext(lifecycle, 12L, observations);
+    byte[] valid = validResponse();
+    NativeRemoteParentProvider provider =
+        readyProvider(
+            RemoteParentTransport.UNIX,
+            (take, taskScoped, socketFileDescriptor, response) -> {
+              nativeEntered.countDown();
+              awaitUninterruptibly(releaseNative);
+              System.arraycopy(valid, 0, response, 0, valid.length);
+              return RemoteParentStatus.VALID;
+            });
+    Thread lookup =
+        new Thread(
+            () -> {
+              try {
+                assertTrue(ThreadInfo.markRemoteParentDirectReceiveContext(receiveContext));
+                status.set(provider.takeRemoteParent().getStatus());
+              } catch (Throwable thrown) {
+                failure.set(thrown);
+              } finally {
+                lookupFinished.countDown();
+              }
+            });
+
+    try {
+      lookup.start();
+      assertTrue(nativeEntered.await(5, TimeUnit.SECONDS));
+      ThreadInfo.advanceRemoteParentBridgeEpoch();
+      releaseNative.countDown();
+      assertTrue(lookupFinished.await(5, TimeUnit.SECONDS));
+
+      assertNull(failure.get());
+      assertEquals(RemoteParentStatus.MISSING, status.get());
+      assertEquals(1, observations.get());
+    } finally {
+      releaseNative.countDown();
+      lookup.join(TimeUnit.SECONDS.toMillis(5));
+      provider.close();
+    }
   }
 
   @Test
@@ -621,6 +906,7 @@ class NativeRemoteParentProviderTest {
 
   @Test
   void descriptorlessUnixLookupHoldsTheLifecycleLeaseUntilNativeReturns() throws Exception {
+    ThreadInfo.setRemoteParentEnabled(true);
     CountDownLatch nativeEntered = new CountDownLatch(1);
     CountDownLatch releaseNative = new CountDownLatch(1);
     CountDownLatch lookupFinished = new CountDownLatch(1);
@@ -683,6 +969,27 @@ class NativeRemoteParentProviderTest {
     return ThreadInfo.captureTaskContext(101L, lifecycle);
   }
 
+  private static ReceiveContext receiveContext(
+      Lifecycle lifecycle, long sequence, AtomicInteger observations) throws Exception {
+    ThreadInfo.setRemoteParentEnabled(true);
+    Class<?> observerType =
+        Class.forName(
+            "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext$ExtractionObserver");
+    Object observer =
+        Proxy.newProxyInstance(
+            observerType.getClassLoader(),
+            new Class<?>[] {observerType},
+            (proxy, method, args) -> {
+              observations.incrementAndGet();
+              return true;
+            });
+    Constructor<?> constructor = ReceiveContext.class.getDeclaredConstructors()[0];
+    constructor.setAccessible(true);
+    return (ReceiveContext)
+        constructor.newInstance(
+            lifecycle, sequence, ThreadInfo.remoteParentBridgeEpoch(), observer);
+  }
+
   private static void setTaskContextEmitter(java.lang.reflect.InvocationHandler handler)
       throws Exception {
     Class<?> emitter =
@@ -694,6 +1001,21 @@ class NativeRemoteParentProviderTest {
             ? null
             : Proxy.newProxyInstance(emitter.getClassLoader(), new Class<?>[] {emitter}, handler);
     setter.invoke(null, value);
+  }
+
+  private static void setEmitDataOnSocket(LongBinaryOperator emitter) throws Exception {
+    Method setter =
+        BootstrapNative.class.getDeclaredMethod(
+            "setEmitDataOnSocketForTest", LongBinaryOperator.class);
+    setter.setAccessible(true);
+    setter.invoke(null, emitter);
+  }
+
+  private static void setBeforeLegacyReceiveEmit(Runnable callback) throws Exception {
+    Method setter =
+        SSLStorage.class.getDeclaredMethod("setBeforeLegacyReceiveEmitForTest", Runnable.class);
+    setter.setAccessible(true);
+    setter.invoke(null, callback);
   }
 
   private static NativeRemoteParentProvider readyProvider() {

@@ -107,7 +107,9 @@ public class JavaForkJoinTaskInst {
             parentId,
             taskContext.getHandoffToken(),
             taskContext.getRemoteParentSocketContext(),
-            taskContext.getRemoteParentSocketLifecycle());
+            taskContext.getRemoteParentSocketLifecycle(),
+            taskContext.getRemoteParentReceiveContext(),
+            taskContext.getRemoteParentBridgeEpoch());
       }
       if (taskContext != null) {
         ThreadInfo.cancelTaskContext(taskContext);

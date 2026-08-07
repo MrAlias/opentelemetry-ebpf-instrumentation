@@ -60,6 +60,7 @@ class IOCTLPacketTest {
     assertEquals(14, OperationType.HTTP1_RECEIVE_START.code);
     assertEquals(15, OperationType.HTTP1_RECEIVE_CONTINUE.code);
     assertEquals(16, OperationType.HTTP1_RECEIVE_RESET.code);
+    assertEquals(17, OperationType.TELEMETRY_RECEIVE.code);
   }
 
   @Test
@@ -216,6 +217,31 @@ class IOCTLPacketTest {
 
     assertEquals(expected.length, newOff);
     assertArrayEquals(expected, packetBytes(mem, expected.length));
+  }
+
+  @Test
+  void telemetryReceiveUsesTheLegacyPrefixWithAZeroNonce() throws Exception {
+    InetAddress local = InetAddress.getByAddress(new byte[] {10, 11, 12, 13});
+    InetAddress remote = InetAddress.getByAddress(new byte[] {(byte) 192, 0, 2, 44});
+    Connection connection = new Connection(local, 0x1234, remote, 0x5678, 7);
+    NativeMemory mem = new NativeMemory(IOCTLPacket.packetPrefixSize, true);
+
+    int newOff = IOCTLPacket.writeTelemetryReceivePacketPrefix(mem, 0, connection, 4096);
+
+    assertEquals(IOCTLPacket.packetPrefixSize, newOff);
+    assertEquals(OperationType.TELEMETRY_RECEIVE.code, mem.getByte(0));
+    assertEquals(4096, mem.getInt(IOCTLPacket.bufferLengthOffset));
+    assertEquals(0L, mem.getLong(IOCTLPacket.dataSignalOffset));
+    assertEquals((short) connection.getRemotePort(), mem.getShort(33));
+    assertEquals((short) connection.getLocalPort(), mem.getShort(35));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> IOCTLPacket.writeTelemetryReceivePacketPrefix(mem, 0, connection, 0));
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            IOCTLPacket.writeTelemetryReceivePacketPrefix(
+                mem, 0, connection, IOCTLPacket.http1MaxPayloadSize + 1));
   }
 
   @Test

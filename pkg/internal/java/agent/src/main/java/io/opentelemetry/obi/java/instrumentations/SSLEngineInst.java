@@ -8,7 +8,6 @@ package io.opentelemetry.obi.java.instrumentations;
 import static io.opentelemetry.obi.java.instrumentations.util.ByteBufferExtractor.b;
 
 import io.opentelemetry.obi.java.BootstrapNative;
-import io.opentelemetry.obi.java.bridge.RemoteParentBridge;
 import io.opentelemetry.obi.java.ebpf.IOCTLPacket;
 import io.opentelemetry.obi.java.ebpf.NativeMemory;
 import io.opentelemetry.obi.java.ebpf.OperationType;
@@ -124,7 +123,7 @@ public class SSLEngineInst {
       try {
         if (saved == null) {
           lifecycle = SSLStorage.remoteParentSocketLifecycle(engine);
-          BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+          SSLStorage.invalidateRemoteParent(engine, lifecycle);
           return;
         }
         if (saved.length != 7 || !Boolean.TRUE.equals(saved[6])) {
@@ -139,7 +138,7 @@ public class SSLEngineInst {
         Connection scoped = (Connection) saved[4];
 
         if (throwable != null || src == null || dst == null || result == null) {
-          BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+          SSLStorage.invalidateRemoteParent(engine, lifecycle);
           return;
         }
 
@@ -147,12 +146,12 @@ public class SSLEngineInst {
         try {
           establishedSession = engine.getSession().getId().length > 0;
         } catch (Throwable failure) {
-          BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+          SSLStorage.invalidateRemoteParent(engine, lifecycle);
           return;
         }
         if (!establishedSession) {
           if (result.bytesProduced() > 0 || result.getStatus() == SSLEngineResult.Status.CLOSED) {
-            BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+            SSLStorage.invalidateRemoteParent(engine, lifecycle);
           }
           return;
         }
@@ -160,7 +159,7 @@ public class SSLEngineInst {
         try {
           if (result.bytesProduced() == 0) {
             if (result.getStatus() == SSLEngineResult.Status.CLOSED) {
-              BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+              SSLStorage.invalidateRemoteParent(engine, lifecycle);
             }
             return;
           }
@@ -171,7 +170,7 @@ public class SSLEngineInst {
           byte[] b = dstBuffer.array();
           int len = b(dstBuffer).position();
           if (len == 0) {
-            BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+            SSLStorage.invalidateRemoteParent(engine, lifecycle);
             return;
           }
 
@@ -179,12 +178,12 @@ public class SSLEngineInst {
               SSLStorage.claimConnectionForUnwrap(
                   engine, src, handoff, c, owner, scoped, result.bytesConsumed(), len);
           if (c == null) {
-            BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+            SSLStorage.invalidateRemoteParent(engine, lifecycle);
             return;
           }
           lifecycle = SSLStorage.remoteParentSocketLifecycle(c);
           if (lifecycle == null) {
-            BootstrapNative.invalidateRemoteParentSocketFileDescriptor(null);
+            SSLStorage.invalidateRemoteParent(engine, null);
             return;
           }
 
@@ -192,27 +191,14 @@ public class SSLEngineInst {
             System.err.println("[SSLEngineInst] unwrap:" + java.util.Arrays.toString(b));
           }
 
-          NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize + len);
-          int wOff = IOCTLPacket.writePacketPrefix(p, 0, OperationType.RECEIVE, c, len);
-          IOCTLPacket.writePacketBuffer(p, wOff, b, 0, len);
-          try {
-            BootstrapNative.markTlsConnectionIfDue(engine, c);
-          } catch (Throwable failure) {
-            if (SSLStorage.debugOn) {
-              System.err.println("[SSLEngineInst] failed to mark TLS connection: " + failure);
-            }
-          }
-          int emitStatus = BootstrapNative.emitData(c, p.getAddress(), true);
-          if (emitStatus >= 0) {
-            RemoteParentBridge.recordTlsRead(len);
-          }
+          SSLStorage.emitRemoteParentReceive(engine, c, b, 0, len);
           if (result.getStatus() == SSLEngineResult.Status.CLOSED) {
             // A final plaintext record can be useful, but it cannot leave a reusable
             // descriptor correlation behind after TLS has closed.
-            BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+            SSLStorage.invalidateRemoteParent(engine, lifecycle);
           }
         } catch (Throwable failure) {
-          BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+          SSLStorage.invalidateRemoteParent(engine, lifecycle);
           if (SSLStorage.debugOn) {
             System.err.println("[SSLEngineInst] Error in unwrap advice: " + failure);
           }
@@ -224,7 +210,7 @@ public class SSLEngineInst {
           } catch (Throwable ignored) {
           }
         }
-        BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+        SSLStorage.invalidateRemoteParent(engine, lifecycle);
         if (SSLStorage.debugOn) {
           System.err.println("[SSLEngineInst] Error preparing unwrap advice: " + failure);
         }
@@ -289,7 +275,7 @@ public class SSLEngineInst {
       try {
         if (saved == null) {
           lifecycle = SSLStorage.remoteParentSocketLifecycle(engine);
-          BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+          SSLStorage.invalidateRemoteParent(engine, lifecycle);
           return;
         }
         if (saved.length != 8 || !Boolean.TRUE.equals(saved[7])) {
@@ -305,12 +291,12 @@ public class SSLEngineInst {
         lifecycle = saved[6];
 
         if (throwable != null || src == null || dsts == null || result == null) {
-          BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+          SSLStorage.invalidateRemoteParent(engine, lifecycle);
           return;
         }
 
         if (dsts.length == 0) {
-          BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+          SSLStorage.invalidateRemoteParent(engine, lifecycle);
           return;
         }
 
@@ -318,12 +304,12 @@ public class SSLEngineInst {
         try {
           establishedSession = engine.getSession().getId().length > 0;
         } catch (Throwable failure) {
-          BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+          SSLStorage.invalidateRemoteParent(engine, lifecycle);
           return;
         }
         if (!establishedSession) {
           if (result.bytesProduced() > 0 || result.getStatus() == SSLEngineResult.Status.CLOSED) {
-            BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+            SSLStorage.invalidateRemoteParent(engine, lifecycle);
           }
           return;
         }
@@ -331,7 +317,7 @@ public class SSLEngineInst {
         if (result.bytesProduced() > 0) {
           try {
             if (savedDstPositions == null || savedDstBuffers == null) {
-              BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+              SSLStorage.invalidateRemoteParent(engine, lifecycle);
               return;
             }
 
@@ -342,7 +328,7 @@ public class SSLEngineInst {
             byte[] b = dstBuffer.array();
             int len = b(dstBuffer).position();
             if (len == 0) {
-              BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+              SSLStorage.invalidateRemoteParent(engine, lifecycle);
               return;
             }
 
@@ -350,12 +336,12 @@ public class SSLEngineInst {
                 SSLStorage.claimConnectionForUnwrap(
                     engine, src, handoff, c, owner, scoped, result.bytesConsumed(), len);
             if (c == null) {
-              BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+              SSLStorage.invalidateRemoteParent(engine, lifecycle);
               return;
             }
             lifecycle = SSLStorage.remoteParentSocketLifecycle(c);
             if (lifecycle == null) {
-              BootstrapNative.invalidateRemoteParentSocketFileDescriptor(null);
+              SSLStorage.invalidateRemoteParent(engine, null);
               return;
             }
 
@@ -363,32 +349,19 @@ public class SSLEngineInst {
               System.err.println("[SSLEngineInst] unwrap array:" + java.util.Arrays.toString(b));
             }
 
-            NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize + len);
-            int wOff = IOCTLPacket.writePacketPrefix(p, 0, OperationType.RECEIVE, c, len);
-            IOCTLPacket.writePacketBuffer(p, wOff, b, 0, len);
-            try {
-              BootstrapNative.markTlsConnectionIfDue(engine, c);
-            } catch (Throwable failure) {
-              if (SSLStorage.debugOn) {
-                System.err.println("[SSLEngineInst] failed to mark TLS connection: " + failure);
-              }
-            }
-            int emitStatus = BootstrapNative.emitData(c, p.getAddress(), true);
-            if (emitStatus >= 0) {
-              RemoteParentBridge.recordTlsRead(len);
-            }
+            SSLStorage.emitRemoteParentReceive(engine, c, b, 0, len);
             if (result.getStatus() == SSLEngineResult.Status.CLOSED) {
               // Preserve final plaintext while retiring its descriptor correlation immediately.
-              BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+              SSLStorage.invalidateRemoteParent(engine, lifecycle);
             }
           } catch (Throwable failure) {
-            BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+            SSLStorage.invalidateRemoteParent(engine, lifecycle);
             if (SSLStorage.debugOn) {
               System.err.println("[SSLEngineInst] Error in unwrap array advice: " + failure);
             }
           }
         } else if (result.getStatus() == SSLEngineResult.Status.CLOSED) {
-          BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+          SSLStorage.invalidateRemoteParent(engine, lifecycle);
         }
       } catch (Throwable failure) {
         if (lifecycle == null) {
@@ -397,7 +370,7 @@ public class SSLEngineInst {
           } catch (Throwable ignored) {
           }
         }
-        BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+        SSLStorage.invalidateRemoteParent(engine, lifecycle);
         if (SSLStorage.debugOn) {
           System.err.println("[SSLEngineInst] Error preparing unwrap array advice: " + failure);
         }
@@ -470,7 +443,7 @@ public class SSLEngineInst {
       try {
         if (saved == null) {
           lifecycle = SSLStorage.remoteParentSocketLifecycle(engine);
-          BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+          SSLStorage.invalidateRemoteParent(engine, lifecycle);
           return;
         }
         if (saved.length != 8 || !Boolean.TRUE.equals(saved[7])) {
@@ -493,7 +466,7 @@ public class SSLEngineInst {
             || length < 0
             || offset > dsts.length
             || length > dsts.length - offset) {
-          BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+          SSLStorage.invalidateRemoteParent(engine, lifecycle);
           return;
         }
 
@@ -501,12 +474,12 @@ public class SSLEngineInst {
         try {
           establishedSession = engine.getSession().getId().length > 0;
         } catch (Throwable failure) {
-          BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+          SSLStorage.invalidateRemoteParent(engine, lifecycle);
           return;
         }
         if (!establishedSession) {
           if (result.bytesProduced() > 0 || result.getStatus() == SSLEngineResult.Status.CLOSED) {
-            BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+            SSLStorage.invalidateRemoteParent(engine, lifecycle);
           }
           return;
         }
@@ -514,7 +487,7 @@ public class SSLEngineInst {
         if (result.bytesProduced() > 0) {
           try {
             if (savedDstPositions == null || savedDstBuffers == null) {
-              BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+              SSLStorage.invalidateRemoteParent(engine, lifecycle);
               return;
             }
 
@@ -527,7 +500,7 @@ public class SSLEngineInst {
             byte[] b = dstBuffer.array();
             int len = b(dstBuffer).position();
             if (len == 0) {
-              BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+              SSLStorage.invalidateRemoteParent(engine, lifecycle);
               return;
             }
 
@@ -535,12 +508,12 @@ public class SSLEngineInst {
                 SSLStorage.claimConnectionForUnwrap(
                     engine, src, handoff, c, owner, scoped, result.bytesConsumed(), len);
             if (c == null) {
-              BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+              SSLStorage.invalidateRemoteParent(engine, lifecycle);
               return;
             }
             lifecycle = SSLStorage.remoteParentSocketLifecycle(c);
             if (lifecycle == null) {
-              BootstrapNative.invalidateRemoteParentSocketFileDescriptor(null);
+              SSLStorage.invalidateRemoteParent(engine, null);
               return;
             }
 
@@ -549,32 +522,19 @@ public class SSLEngineInst {
                   "[SSLEngineInst] ranged unwrap array:" + java.util.Arrays.toString(b));
             }
 
-            NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize + len);
-            int wOff = IOCTLPacket.writePacketPrefix(p, 0, OperationType.RECEIVE, c, len);
-            IOCTLPacket.writePacketBuffer(p, wOff, b, 0, len);
-            try {
-              BootstrapNative.markTlsConnectionIfDue(engine, c);
-            } catch (Throwable failure) {
-              if (SSLStorage.debugOn) {
-                System.err.println("[SSLEngineInst] failed to mark TLS connection: " + failure);
-              }
-            }
-            int emitStatus = BootstrapNative.emitData(c, p.getAddress(), true);
-            if (emitStatus >= 0) {
-              RemoteParentBridge.recordTlsRead(len);
-            }
+            SSLStorage.emitRemoteParentReceive(engine, c, b, 0, len);
             if (result.getStatus() == SSLEngineResult.Status.CLOSED) {
               // Preserve final plaintext while retiring its descriptor correlation immediately.
-              BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+              SSLStorage.invalidateRemoteParent(engine, lifecycle);
             }
           } catch (Throwable failure) {
-            BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+            SSLStorage.invalidateRemoteParent(engine, lifecycle);
             if (SSLStorage.debugOn) {
               System.err.println("[SSLEngineInst] Error in ranged unwrap array advice: " + failure);
             }
           }
         } else if (result.getStatus() == SSLEngineResult.Status.CLOSED) {
-          BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+          SSLStorage.invalidateRemoteParent(engine, lifecycle);
         }
       } catch (Throwable failure) {
         if (lifecycle == null) {
@@ -583,7 +543,7 @@ public class SSLEngineInst {
           } catch (Throwable ignored) {
           }
         }
-        BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+        SSLStorage.invalidateRemoteParent(engine, lifecycle);
         if (SSLStorage.debugOn) {
           System.err.println(
               "[SSLEngineInst] Error preparing ranged unwrap array advice: " + failure);
@@ -598,10 +558,9 @@ public class SSLEngineInst {
     @Advice.OnMethodEnter(suppress = Throwable.class)
     public static void closeInbound(@Advice.This SSLEngine engine) {
       try {
-        BootstrapNative.invalidateRemoteParentSocketFileDescriptor(
-            SSLStorage.remoteParentSocketLifecycle(engine));
+        SSLStorage.invalidateRemoteParent(engine, SSLStorage.remoteParentSocketLifecycle(engine));
       } catch (Throwable failure) {
-        BootstrapNative.invalidateRemoteParentSocketFileDescriptor(null);
+        SSLStorage.invalidateRemoteParent(engine, null);
       }
     }
   }

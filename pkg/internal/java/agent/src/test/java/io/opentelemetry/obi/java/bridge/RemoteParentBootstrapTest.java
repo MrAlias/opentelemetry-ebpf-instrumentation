@@ -6,8 +6,10 @@
 package io.opentelemetry.obi.java.bridge;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.opentelemetry.obi.java.ebpf.ThreadInfo;
 import java.lang.reflect.Field;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.AfterEach;
@@ -33,6 +35,20 @@ class RemoteParentBootstrapTest {
     assertTrue(provider.closed.get());
     assertFalse(RemoteParentBootstrap.instrumentationInstallationClaimed());
     assertTrue(RemoteParentBootstrap.beginInstrumentationInstallation());
+  }
+
+  @Test
+  void providerTeardownAdvancesTheCapabilityEpochBeforeRemoval() throws Exception {
+    FakeProvider provider = new FakeProvider();
+    assertTrue(RemoteParentBootstrap.beginInstrumentationInstallation());
+    assertTrue(RemoteParentBridge.installProviderForTest(provider));
+    setInstalledProvider(provider);
+    long installedEpoch = ThreadInfo.remoteParentBridgeEpoch();
+
+    RemoteParentBootstrap.cancelInstrumentationInstallation();
+
+    assertNotEquals(installedEpoch, ThreadInfo.remoteParentBridgeEpoch());
+    assertTrue(provider.closed.get());
   }
 
   private static void setInstalledProvider(RemoteParentProvider provider) throws Exception {

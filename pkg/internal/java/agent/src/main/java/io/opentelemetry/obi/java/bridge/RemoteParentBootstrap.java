@@ -90,7 +90,11 @@ public final class RemoteParentBootstrap {
   }
 
   private static void clearProvider() {
+    // Publish disabled mode before advancing the epoch. A receive that already selected the
+    // enabled branch will fail its post-emission capability check; a later receive takes the exact
+    // legacy path and retires its owner before emitting the fragment.
     ThreadInfo.setRemoteParentEnabled(false);
+    ThreadInfo.advanceRemoteParentBridgeEpoch();
     ThreadInfo.clearRemoteParentSocketFileDescriptor();
     if (installed != null) {
       RemoteParentBridge.removeProvider(installed);

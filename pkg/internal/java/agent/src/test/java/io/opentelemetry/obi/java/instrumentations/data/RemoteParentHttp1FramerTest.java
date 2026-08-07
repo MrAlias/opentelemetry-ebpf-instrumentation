@@ -247,6 +247,23 @@ class RemoteParentHttp1FramerTest {
   }
 
   @Test
+  void malformedChunkAfterSplitHeaderPreservesDeferredTelemetryPrefix() {
+    byte[] deferred = ascii("POST / HTTP/1.1\r\nHost: example\r\nTransfer-Encoding: chunked\r\n");
+    byte[] completionAndMalformedChunk = ascii("\r\nz\r\n");
+    RemoteParentHttp1Framer framer = new RemoteParentHttp1Framer();
+
+    assertEquals(DEFER, framer.accept(deferred, 0, deferred.length).action());
+    RemoteParentHttp1Framer.ReceivePlan fallback =
+        framer.accept(completionAndMalformedChunk, 0, completionAndMalformedChunk.length);
+
+    assertEquals(UNTRACKED, fallback.action());
+    assertArrayEquals(deferred, fallback.telemetryPrefix());
+    assertEquals(0, fallback.offset());
+    assertEquals(completionAndMalformedChunk.length, fallback.length());
+    assertEquals(0, framer.retainedBytes());
+  }
+
+  @Test
   void coalescedMessagesAndUnacknowledgedOwnershipAreStickyAmbiguous() {
     byte[] one = ascii("GET /one HTTP/1.1\r\nHost: example.test\r\n\r\n");
     byte[] two = ascii("GET /two HTTP/1.1\r\nHost: example.test\r\n\r\n");

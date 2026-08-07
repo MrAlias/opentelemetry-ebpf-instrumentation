@@ -71,6 +71,7 @@ enum {
   obi_data_operation_http1_receive_start = 14,
   obi_data_operation_http1_receive_continue = 15,
   obi_data_operation_http1_receive_reset = 16,
+  obi_data_operation_telemetry_receive = 17,
   obi_data_signal_offset = 1 + 36 + sizeof(uint32_t),
 };
 
@@ -373,8 +374,10 @@ static int data_operation_requires_ack(unsigned char operation) {
   switch (operation) {
   case obi_data_operation_http1_receive_continue:
   case obi_data_operation_http1_receive_reset:
+  case obi_data_operation_telemetry_receive:
     // CONTINUE and RESET intentionally bypass configuration negotiation and
-    // data-signal acknowledgement; START already established the authority.
+    // data-signal acknowledgement; START already established the authority,
+    // while telemetry-only receives must never create one.
     return 0;
   case obi_data_operation_send:
   case obi_data_operation_receive:

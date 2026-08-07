@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.opentelemetry.obi.java.ebpf.ThreadInfo;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.List;
@@ -34,10 +35,14 @@ class RemoteParentBridgeTest {
   @BeforeEach
   void initialize() {
     RemoteParentBridge.resetForTest();
+    ThreadInfo.setRemoteParentEnabled(true);
+    ThreadInfo.revokeRemoteParentBridgeAuthority();
   }
 
   @AfterEach
   void reset() {
+    ThreadInfo.setRemoteParentEnabled(false);
+    ThreadInfo.revokeRemoteParentBridgeAuthority();
     RemoteParentBridge.resetForTest();
   }
 
@@ -62,6 +67,40 @@ class RemoteParentBridgeTest {
     assertEquals(
         "version=2,status=1,requested=0,selected=2,attempted=3,getsockopt=4,unix=1",
         RemoteParentBridge.transportConfigurationSnapshot());
+  }
+
+  @Test
+  void disabledBridgeSkipsTakeAndDiscardAndRevokesCurrentJavaAuthority() {
+    FakeProvider provider = new FakeProvider();
+    assertTrue(RemoteParentBridge.installProviderForTest(provider));
+
+    ThreadInfo.markRemoteParentDirectLookup();
+    ThreadInfo.setRemoteParentSocketFileDescriptor(81);
+    ThreadInfo.setRemoteParentEnabled(false);
+
+    assertEquals(RemoteParentStatus.MISSING, RemoteParentBridge.takeRemoteParent().getStatus());
+    assertEquals(0, provider.takes.get());
+    assertEquals(-1, ThreadInfo.remoteParentSocketFileDescriptor());
+    assertEquals(ThreadInfo.REMOTE_PARENT_LOOKUP_BLOCKED, ThreadInfo.remoteParentLookupSource());
+
+    ThreadInfo.markRemoteParentDirectLookup();
+    ThreadInfo.setRemoteParentSocketFileDescriptor(82);
+
+    assertEquals(RemoteParentStatus.MISSING, RemoteParentBridge.discardRemoteParent().getStatus());
+    assertEquals(0, provider.discards.get());
+    assertEquals(-1, ThreadInfo.remoteParentSocketFileDescriptor());
+    assertEquals(ThreadInfo.REMOTE_PARENT_LOOKUP_BLOCKED, ThreadInfo.remoteParentLookupSource());
+  }
+
+  @Test
+  void disableDuringTakeSuppressesTheLatchedProviderResultAndRevokesAuthority() throws Exception {
+    assertDisableDuringProviderCall(false);
+  }
+
+  @Test
+  void disableDuringDiscardSuppressesTheLatchedProviderResultAndRevokesAuthority()
+      throws Exception {
+    assertDisableDuringProviderCall(true);
   }
 
   @Test
@@ -337,6 +376,57 @@ class RemoteParentBridgeTest {
   }
 
   @Test
+  void localReceiveAmbiguityUsesStableDiscardSchemaWithoutInvokingProvider() {
+    FakeProvider provider = new FakeProvider();
+    assertTrue(RemoteParentBridge.installProviderForTest(provider));
+    Logger diagnosticsLogger = Logger.getLogger(RemoteParentDiagnostics.class.getName());
+    boolean useParentHandlers = diagnosticsLogger.getUseParentHandlers();
+    Level previousLevel = diagnosticsLogger.getLevel();
+    List<String> messages = new ArrayList<>();
+    Handler recordingHandler =
+        new Handler() {
+          @Override
+          public void publish(LogRecord record) {
+            if (record.getMessage().contains("reason=receive_ambiguous")) {
+              messages.add(record.getMessage());
+            }
+          }
+
+          @Override
+          public void flush() {}
+
+          @Override
+          public void close() {}
+        };
+    recordingHandler.setLevel(Level.ALL);
+    diagnosticsLogger.setUseParentHandlers(false);
+    diagnosticsLogger.setLevel(Level.ALL);
+    diagnosticsLogger.addHandler(recordingHandler);
+    try {
+      RemoteParentBridge.recordReceiveFailure(RemoteParentStatus.AMBIGUOUS);
+      RemoteParentBridge.recordReceiveFailure(RemoteParentStatus.AMBIGUOUS);
+      RemoteParentBridge.recordReceiveFailure(RemoteParentStatus.AMBIGUOUS);
+      RemoteParentBridge.recordReceiveFailure(RemoteParentStatus.UNSUPPORTED);
+      RemoteParentBridge.recordReceiveFailure(RemoteParentStatus.STALE);
+
+      assertEquals(0, provider.takes.get());
+      assertEquals(0, provider.discards.get());
+      assertTrue(RemoteParentBridge.diagnosticsSnapshot().contains("d_ambiguous=3"));
+      assertTrue(RemoteParentBridge.diagnosticsSnapshot().contains("d_unsupported=1"));
+      assertTrue(RemoteParentBridge.diagnosticsSnapshot().contains("d_stale=1"));
+      assertEquals(
+          java.util.Arrays.asList(
+              "OBI remote-parent diagnostics reason=receive_ambiguous count=1",
+              "OBI remote-parent diagnostics reason=receive_ambiguous count=2"),
+          messages);
+    } finally {
+      diagnosticsLogger.removeHandler(recordingHandler);
+      diagnosticsLogger.setLevel(previousLevel);
+      diagnosticsLogger.setUseParentHandlers(useParentHandlers);
+    }
+  }
+
+  @Test
   void reportsFixedSanitizedTakeAndExtractionCounters() {
     FakeProvider provider = new FakeProvider();
     assertTrue(RemoteParentBridge.installProviderForTest(provider));
@@ -430,6 +520,7 @@ class RemoteParentBridgeTest {
 
   private static final class FakeProvider implements RemoteParentProvider {
     private final AtomicInteger takes = new AtomicInteger();
+    private final AtomicInteger discards = new AtomicInteger();
     private final AtomicInteger abiCalls = new AtomicInteger();
     private final AtomicBoolean closed = new AtomicBoolean();
     private final AtomicInteger closeCount = new AtomicInteger();
@@ -459,6 +550,7 @@ class RemoteParentBridgeTest {
 
     @Override
     public RemoteParentRecord discardRemoteParent() {
+      discards.incrementAndGet();
       return RemoteParentRecord.statusOnly(RemoteParentStatus.MISSING);
     }
 
@@ -467,6 +559,91 @@ class RemoteParentBridgeTest {
       closeCount.incrementAndGet();
       closed.set(true);
     }
+  }
+
+  private void assertDisableDuringProviderCall(boolean discard) throws Exception {
+    LatchedProvider provider = new LatchedProvider();
+    assertTrue(RemoteParentBridge.installProviderForTest(provider));
+    AtomicInteger status = new AtomicInteger(RemoteParentStatus.UNKNOWN);
+    AtomicInteger descriptor = new AtomicInteger(Integer.MIN_VALUE);
+    AtomicInteger lookupSource = new AtomicInteger(Integer.MIN_VALUE);
+    AtomicReference<Throwable> failure = new AtomicReference<>();
+    Thread caller =
+        new Thread(
+            () -> {
+              try {
+                ThreadInfo.markRemoteParentDirectLookup();
+                ThreadInfo.setRemoteParentSocketFileDescriptor(83);
+                RemoteParentRecord record =
+                    discard
+                        ? RemoteParentBridge.discardRemoteParent()
+                        : RemoteParentBridge.takeRemoteParent();
+                status.set(record.getStatus());
+                descriptor.set(ThreadInfo.remoteParentSocketFileDescriptor());
+                lookupSource.set(ThreadInfo.remoteParentLookupSource());
+              } catch (Throwable thrown) {
+                failure.set(thrown);
+              }
+            },
+            discard ? "latched-discard" : "latched-take");
+
+    caller.start();
+    assertTrue(provider.entered.await(5, TimeUnit.SECONDS));
+    ThreadInfo.setRemoteParentEnabled(false);
+    provider.release.countDown();
+    caller.join(TimeUnit.SECONDS.toMillis(5));
+
+    assertFalse(caller.isAlive());
+    assertNull(failure.get());
+    assertEquals(RemoteParentStatus.MISSING, status.get());
+    assertEquals(-1, descriptor.get());
+    assertEquals(ThreadInfo.REMOTE_PARENT_LOOKUP_BLOCKED, lookupSource.get());
+    assertEquals(discard ? 0 : 1, provider.takes.get());
+    assertEquals(discard ? 1 : 0, provider.discards.get());
+  }
+
+  private static final class LatchedProvider implements RemoteParentProvider {
+    private final CountDownLatch entered = new CountDownLatch(1);
+    private final CountDownLatch release = new CountDownLatch(1);
+    private final AtomicInteger takes = new AtomicInteger();
+    private final AtomicInteger discards = new AtomicInteger();
+
+    @Override
+    public int abiVersion() {
+      return RemoteParentRecord.ABI_VERSION;
+    }
+
+    @Override
+    public RemoteParentRecord takeRemoteParent() {
+      takes.incrementAndGet();
+      return awaitAndReturnValid();
+    }
+
+    @Override
+    public RemoteParentRecord discardRemoteParent() {
+      discards.incrementAndGet();
+      return awaitAndReturnValid();
+    }
+
+    private RemoteParentRecord awaitAndReturnValid() {
+      entered.countDown();
+      boolean interrupted = false;
+      while (true) {
+        try {
+          release.await();
+          break;
+        } catch (InterruptedException ignored) {
+          interrupted = true;
+        }
+      }
+      if (interrupted) {
+        Thread.currentThread().interrupt();
+      }
+      return RemoteParentRecord.decode(RemoteParentRecordTest.validRecord());
+    }
+
+    @Override
+    public void close() {}
   }
 
   private static final class WrongVersionProvider implements RemoteParentProvider {

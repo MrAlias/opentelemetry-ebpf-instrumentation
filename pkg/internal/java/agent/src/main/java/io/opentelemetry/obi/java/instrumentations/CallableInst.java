@@ -69,7 +69,9 @@ public class CallableInst {
               parentId,
               taskContext.getHandoffToken(),
               taskContext.getRemoteParentSocketContext(),
-              taskContext.getRemoteParentSocketLifecycle());
+              taskContext.getRemoteParentSocketLifecycle(),
+              taskContext.getRemoteParentReceiveContext(),
+              taskContext.getRemoteParentBridgeEpoch());
         }
         ThreadInfo.cancelTaskContext(taskContext);
       }

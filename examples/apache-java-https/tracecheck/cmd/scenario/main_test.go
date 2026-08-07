@@ -241,6 +241,873 @@ func TestPressureUsesReasonCodedParentPolicy(t *testing.T) {
 	assert.Equal(t, tracecheck.ModePressure, expectation.Mode)
 }
 
+func TestCoalescedBridgeCorrelationAcceptsOnlyExactOrAmbiguousDrop(t *testing.T) {
+	cfg := config{
+		scenario:               "coalesced-bridge",
+		apacheService:          "apache-proxy",
+		coalescedSourceService: "coalesced-source",
+		javaService:            "java-backend",
+	}
+	first := requestCase{Marker: "first", Endpoint: "/api/coalesced-bridge"}
+	second := requestCase{Marker: "second", Endpoint: "/api/coalesced-bridge"}
+	exactSnapshots := coalescedSnapshots(first.Marker, second.Marker, [2]bool{})
+	exactUnion, err := coalescedSpanUnion(exactSnapshots)
+	require.NoError(t, err)
+	for index, request := range []requestCase{first, second} {
+		combined := exactSnapshots[index]
+		combined.Spans = exactUnion
+		outcome, candidates, chain, classifyErr := classifyCoalescedBridgeSnapshot(
+			cfg,
+			request,
+			first.Marker,
+			combined,
+		)
+		require.NoError(t, classifyErr)
+		assert.Equal(t, tracecheck.PressureParentExactHit, outcome)
+		assert.Equal(t, 1, candidates)
+		assert.True(t, chain)
+	}
+
+	rootSnapshots := coalescedSnapshots(first.Marker, second.Marker, [2]bool{true, true})
+	rootUnion, err := coalescedSpanUnion(rootSnapshots)
+	require.NoError(t, err)
+	for index, request := range []requestCase{first, second} {
+		combined := rootSnapshots[index]
+		combined.Spans = rootUnion
+		outcome, candidates, chain, classifyErr := classifyCoalescedBridgeSnapshot(
+			cfg,
+			request,
+			first.Marker,
+			combined,
+		)
+		require.NoError(t, classifyErr)
+		assert.Equal(t, tracecheck.PressureParentExplicitRoot, outcome)
+		assert.Equal(t, 1, candidates)
+		assert.True(t, chain)
+	}
+
+	exactSummary := coalescedBridgeCorrelationSummary{
+		ExactHitCount:          2,
+		SourceClientCandidates: 2,
+		TriggerChainProven:     true,
+	}
+	require.NoError(t, validateCoalescedBridgeCorrelation(&exactSummary, 2))
+	assert.Equal(t, "supported_exact", exactSummary.Outcome)
+
+	ambiguousSummary := coalescedBridgeCorrelationSummary{
+		ExplicitRootCount:      2,
+		SourceClientCandidates: 2,
+		TriggerChainProven:     true,
+		DiscardTotalDelta:      1,
+		DiscardAmbiguousDelta:  1,
+	}
+	require.NoError(t, validateCoalescedBridgeCorrelation(&ambiguousSummary, 2))
+	assert.Equal(t, "ambiguous_drop", ambiguousSummary.Outcome)
+
+	wrong := ambiguousSummary
+	wrong.WrongParentCount = 1
+	require.ErrorContains(t, validateCoalescedBridgeCorrelation(&wrong, 2), "incomplete")
+	mixed := ambiguousSummary
+	mixed.ExplicitRootCount = 1
+	mixed.ExactHitCount = 1
+	require.ErrorContains(t, validateCoalescedBridgeCorrelation(&mixed, 2), "all exact parents")
+	missingCandidate := ambiguousSummary
+	missingCandidate.SourceClientCandidates = 1
+	require.ErrorContains(t, validateCoalescedBridgeCorrelation(&missingCandidate, 2), "incomplete")
+	unexpectedDrop := exactSummary
+	unexpectedDrop.DiscardTotalDelta = 1
+	require.ErrorContains(t, validateCoalescedBridgeCorrelation(&unexpectedDrop, 2), "all exact parents")
+	mixedDrops := ambiguousSummary
+	mixedDrops.DiscardTotalDelta = 2
+	require.ErrorContains(t, validateCoalescedBridgeCorrelation(&mixedDrops, 2), "all exact parents")
+}
+
+func TestCoalescedBridgeCorrelationRejectsIncompleteTriggerChains(t *testing.T) {
+	cfg := config{
+		apacheService:          "apache-proxy",
+		coalescedSourceService: "coalesced-source",
+		javaService:            "java-backend",
+	}
+	request := requestCase{Marker: "second", Endpoint: "/api/coalesced-bridge"}
+	triggerMarker := "first"
+	tests := map[string]func([]tracecheck.Snapshot){
+		"missing Apache client": func(snapshots []tracecheck.Snapshot) {
+			snapshots[0].Spans[spanIndex(t, snapshots[0], "apache-proxy", "CLIENT")].ServiceName = "other"
+		},
+		"duplicate Apache client": func(snapshots []tracecheck.Snapshot) {
+			duplicate := snapshots[0].Spans[spanIndex(t, snapshots[0], "apache-proxy", "CLIENT")]
+			duplicate.SpanID = "apache-client-duplicate"
+			snapshots[0].Spans = append(snapshots[0].Spans, duplicate)
+		},
+		"wrong source parent": func(snapshots []tracecheck.Snapshot) {
+			snapshots[0].Spans[spanIndex(t, snapshots[0], "coalesced-source", "SERVER")].ParentSpanID = "foreign"
+		},
+		"source parent explicitly local": func(snapshots []tracecheck.Snapshot) {
+			snapshots[0].Spans[spanIndex(t, snapshots[0], "coalesced-source", "SERVER")].Flags = 0x101
+		},
+		"source trace flags changed": func(snapshots []tracecheck.Snapshot) {
+			snapshots[0].Spans[spanIndex(t, snapshots[0], "coalesced-source", "SERVER")].Flags = 0x300
+		},
+		"missing second source client": func(snapshots []tracecheck.Snapshot) {
+			index := spanIndex(t, snapshots[1], "coalesced-source", "CLIENT")
+			snapshots[1].Spans = append(snapshots[1].Spans[:index], snapshots[1].Spans[index+1:]...)
+		},
+		"unrelated second source client": func(snapshots []tracecheck.Snapshot) {
+			snapshots[1].Spans[spanIndex(t, snapshots[1], "coalesced-source", "CLIENT")].ParentSpanID = "foreign"
+		},
+		"extra marked Java server at wrong endpoint": func(snapshots []tracecheck.Snapshot) {
+			duplicate := snapshots[1].Spans[spanIndex(t, snapshots[1], "java-backend", "SERVER")]
+			duplicate.SpanID = "java-server-duplicate"
+			duplicate.Attributes = cloneStringMap(duplicate.Attributes)
+			duplicate.Attributes["http.route"] = "/wrong"
+			snapshots[1].Spans = append(snapshots[1].Spans, duplicate)
+		},
+		"related markerless Java server with wrong parent": func(snapshots []tracecheck.Snapshot) {
+			snapshots[1].RelatedSpans = append(snapshots[1].RelatedSpans, tracecheck.Span{
+				ServiceName:  "java-backend",
+				Kind:         "SERVER",
+				TraceID:      "source-trace",
+				SpanID:       "related-java-wrong-parent",
+				ParentSpanID: "foreign",
+				Flags:        0x301,
+			})
+		},
+		"related markerless Java server with changed flags": func(snapshots []tracecheck.Snapshot) {
+			snapshots[1].RelatedSpans = append(snapshots[1].RelatedSpans, tracecheck.Span{
+				ServiceName:  "java-backend",
+				Kind:         "SERVER",
+				TraceID:      "source-trace",
+				SpanID:       "related-java-changed-flags",
+				ParentSpanID: "source-client-2",
+				Flags:        0x300,
+			})
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			snapshots := coalescedSnapshots(triggerMarker, request.Marker, [2]bool{})
+			mutate(snapshots)
+			spanUnion, unionErr := coalescedSpanUnion(snapshots)
+			require.NoError(t, unionErr)
+			candidate := snapshots[1]
+			candidate.Spans = spanUnion
+			outcome, _, chain, err := classifyCoalescedBridgeSnapshot(
+				cfg,
+				request,
+				triggerMarker,
+				candidate,
+			)
+			assert.Equal(t, tracecheck.PressureParentUnresolved, outcome)
+			assert.False(t, chain)
+			require.Error(t, err)
+		})
+	}
+
+	t.Run("conflicting duplicate union identity", func(t *testing.T) {
+		snapshots := coalescedSnapshots(triggerMarker, request.Marker, [2]bool{})
+		conflict := snapshots[1].Spans[spanIndex(t, snapshots[1], "coalesced-source", "CLIENT")]
+		conflict.ParentSpanID = "foreign"
+		snapshots[0].Spans = append(snapshots[0].Spans, conflict)
+		_, err := coalescedSpanUnion(snapshots)
+		require.ErrorContains(t, err, "conflict")
+	})
+	t.Run("redacted related duplicate", func(t *testing.T) {
+		snapshots := coalescedSnapshots(triggerMarker, request.Marker, [2]bool{})
+		related := snapshots[0].Spans[spanIndex(t, snapshots[0], "coalesced-source", "SERVER")]
+		related.Name = ""
+		related.ScopeName = ""
+		related.Attributes = nil
+		snapshots[1].RelatedSpans = append(snapshots[1].RelatedSpans, related)
+		spans, err := coalescedSpanUnion(snapshots)
+		require.NoError(t, err)
+		assert.Len(t, spans, 6)
+		candidate := snapshots[1]
+		candidate.Spans = spans
+		candidate.RelatedSpans = nil
+		outcome, candidates, chain, err := classifyCoalescedBridgeSnapshot(
+			cfg,
+			request,
+			triggerMarker,
+			candidate,
+		)
+		require.NoError(t, err)
+		assert.Equal(t, tracecheck.PressureParentExactHit, outcome)
+		assert.Equal(t, 1, candidates)
+		assert.True(t, chain)
+	})
+}
+
+func TestCoalescedBridgeCorrelationRejectsWrongJavaParents(t *testing.T) {
+	cfg := config{
+		apacheService:          "apache-proxy",
+		coalescedSourceService: "coalesced-source",
+		javaService:            "java-backend",
+	}
+	request := requestCase{Marker: "second", Endpoint: "/api/coalesced-bridge"}
+	for name, flags := range map[string]uint32{
+		"parent not remote":   0x101,
+		"trace flags changed": 0x300,
+	} {
+		t.Run(name, func(t *testing.T) {
+			snapshots := coalescedSnapshots("first", request.Marker, [2]bool{})
+			snapshots[1].Spans[spanIndex(t, snapshots[1], "java-backend", "SERVER")].Flags = flags
+			spanUnion, err := coalescedSpanUnion(snapshots)
+			require.NoError(t, err)
+			candidate := snapshots[1]
+			candidate.Spans = spanUnion
+			outcome, _, _, err := classifyCoalescedBridgeSnapshot(
+				cfg,
+				request,
+				"first",
+				candidate,
+			)
+			assert.Equal(t, tracecheck.PressureParentWrong, outcome)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestCoalescedBridgeTrafficRequiresOneSourceWriteAndOneJavaReceive(t *testing.T) {
+	baseline := javaDiagnosticsSnapshot(t, 0)
+	requests, err := makeRequests(config{
+		scenario:              "coalesced-bridge",
+		javaDiagnosticsBefore: baseline,
+		seed:                  42,
+	})
+	require.NoError(t, err)
+	require.Len(t, requests, 2)
+	assert.NotEqual(t, requests[0].Marker, requests[1].Marker)
+	assert.Equal(t, "/api/coalesced-bridge", requests[0].Endpoint)
+	assert.True(t, requests[1].BridgeDiagnostics)
+
+	markers := []string{requests[0].Marker, requests[1].Marker}
+	evidence := &coalescedBridgeEvidence{
+		PlaintextCallbackCount:    1,
+		PlaintextCallbackBytes:    512,
+		PlaintextSHA256:           strings.Repeat("a", 64),
+		ParserRequestCount:        2,
+		ParserCallbackGenerations: []int{1, 1},
+		ParserMarkers:             markers,
+		RequestMarkersExact:       true,
+		OnePlaintextReceive:       true,
+		Passed:                    true,
+		FailureReason:             "none",
+	}
+	responses := []backendResponse{
+		{Marker: markers[0], Secure: true, Protocol: "HTTP/1.1", TLSProtocol: "TLSv1.3", TLSCipher: "cipher", BackendConnectionID: 1, BackendRemotePort: 2, BackendKind: "netty-coalesced-bridge", CoalescedBridge: evidence},
+		{Marker: markers[1], Secure: true, Protocol: "HTTP/1.1", TLSProtocol: "TLSv1.3", TLSCipher: "cipher", BackendConnectionID: 1, BackendRemotePort: 2, BackendKind: "netty-coalesced-bridge", CoalescedBridge: evidence},
+	}
+	for index := range responses {
+		require.NoError(t, validateCoalescedBackendResponse(
+			config{expectedTLS: "TLSv1.3"},
+			requests[index],
+			responses[index],
+			512,
+			strings.Repeat("a", 64),
+			markers,
+		))
+	}
+	connection := &connectionEvidence{
+		FrontendConnections:          1,
+		FrontendProtocol:             "HTTP/1.1",
+		SourceBackendTLSConnections:  1,
+		SourcePlaintextWriteCalls:    1,
+		SourcePlaintextWriteBytes:    512,
+		SourcePlaintextSHA256:        strings.Repeat("a", 64),
+		SourceRequestBoundaries:      2,
+		SourceTraceparentHeaderCount: 0,
+	}
+	require.NoError(t, validateConnectionShape("coalesced-bridge", responses, connection))
+	for name, digest := range map[string]string{
+		"non-hex source digest":   strings.Repeat("z", 64),
+		"different source digest": strings.Repeat("b", 64),
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := *connection
+			changed.SourcePlaintextSHA256 = digest
+			require.Error(t, validateConnectionShape("coalesced-bridge", responses, &changed))
+		})
+	}
+
+	evidence.ParserCallbackGenerations = []int{1, 2}
+	require.ErrorContains(t, validateCoalescedBackendResponse(
+		config{expectedTLS: "TLSv1.3"},
+		requests[0],
+		responses[0],
+		512,
+		strings.Repeat("a", 64),
+		markers,
+	), "one-plaintext")
+
+	evidence.ParserCallbackGenerations = []int{1, 1}
+	for name, test := range map[string]struct {
+		plaintextBytes int
+		digest         string
+		mutate         func(*coalescedBridgeEvidence)
+	}{
+		"byte count mismatch": {
+			plaintextBytes: 513,
+			digest:         strings.Repeat("a", 64),
+		},
+		"non-hex digest": {
+			plaintextBytes: 512,
+			digest:         strings.Repeat("z", 64),
+		},
+		"wrong-length digest": {
+			plaintextBytes: 512,
+			digest:         strings.Repeat("a", 62),
+		},
+		"different backend digest": {
+			plaintextBytes: 512,
+			digest:         strings.Repeat("a", 64),
+			mutate: func(value *coalescedBridgeEvidence) {
+				value.PlaintextSHA256 = strings.Repeat("b", 64)
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := *evidence
+			if test.mutate != nil {
+				test.mutate(&changed)
+			}
+			response := responses[0]
+			response.CoalescedBridge = &changed
+			require.ErrorContains(t, validateCoalescedBackendResponse(
+				config{expectedTLS: "TLSv1.3"},
+				requests[0],
+				response,
+				test.plaintextBytes,
+				test.digest,
+				markers,
+			), "one-plaintext")
+		})
+	}
+}
+
+func TestBoundedResponseReadsRejectOneByteOfOverflow(t *testing.T) {
+	for name, test := range map[string]struct {
+		size      int
+		wantError bool
+	}{
+		"exact bound":   {size: 32},
+		"one byte over": {size: 33, wantError: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			body := bytes.Repeat([]byte("x"), test.size)
+			read, err := readBoundedBody(bytes.NewReader(body), 32, "fixture")
+			if test.wantError {
+				require.ErrorContains(t, err, "exceeded")
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, body, read)
+		})
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		assert.Equal(t, "/api/coalesced-source", request.URL.Path)
+		writer.Header().Set("X-OBI-Coalesced-Source", "live")
+		body := append([]byte("{}"), bytes.Repeat(
+			[]byte(" "),
+			int(maximumCoalescedSourceBytes)-1,
+		)...)
+		_, err := writer.Write(body)
+		assert.NoError(t, err)
+	}))
+	defer server.Close()
+
+	_, _, _, _, err := sendCoalescedBridgeRequests(
+		context.Background(),
+		config{baseURL: server.URL, requestTimeout: time.Second},
+		[]requestCase{{Marker: "first"}, {Marker: "second"}},
+	)
+	require.ErrorContains(t, err, "exceeded")
+}
+
+func TestCancellationReconciliationMakesWrongParentsFatal(t *testing.T) {
+	cfg := config{apacheService: "apache-proxy", javaService: "java-backend"}
+	noDrops := diagnosticDropSummary{}
+	empty := tracecheck.Snapshot{Marker: "cancel"}
+	outcome, err := classifyCancellationSnapshot(cfg, "cancel", empty, noDrops)
+	assert.Equal(t, "unresolved", outcome)
+	require.ErrorContains(t, err, "one marked Apache")
+
+	missing := cancellationSnapshot("cancel", "trace", "client")
+	missing.Spans = missing.Spans[:1]
+	outcome, err = classifyCancellationSnapshot(cfg, "cancel", missing, noDrops)
+	require.NoError(t, err)
+	assert.Equal(t, "missing", outcome)
+	_, err = classifyCancellationSnapshot(cfg, "cancel", missing, diagnosticDrops("missing", 1))
+	require.ErrorContains(t, err, "zero receive drops")
+
+	exact := cancellationSnapshot("cancel", "trace", "client")
+	outcome, err = classifyCancellationSnapshot(cfg, "cancel", exact, noDrops)
+	require.NoError(t, err)
+	assert.Equal(t, "exact", outcome)
+	_, err = classifyCancellationSnapshot(cfg, "cancel", exact, diagnosticDrops("timeout", 1))
+	require.ErrorContains(t, err, "zero receive drops")
+
+	flagsChanged := cancellationSnapshot("cancel", "trace", "client")
+	flagsChanged.Spans[1].Flags = 0x300
+	outcome, err = classifyCancellationSnapshot(cfg, "cancel", flagsChanged, noDrops)
+	assert.Equal(t, "wrong_parent", outcome)
+	require.ErrorContains(t, err, "changed trace flags")
+
+	root := cancellationSnapshot("cancel", "trace", "")
+	outcome, err = classifyCancellationSnapshot(cfg, "cancel", root, diagnosticDrops("missing", 1))
+	require.NoError(t, err)
+	assert.Equal(t, "reason_coded_drop", outcome)
+	_, err = classifyCancellationSnapshot(cfg, "cancel", root, noDrops)
+	require.ErrorContains(t, err, "exactly one allowed reason-coded")
+	_, err = classifyCancellationSnapshot(cfg, "cancel", root, diagnosticDrops("missing", 2))
+	require.ErrorContains(t, err, "exactly one allowed reason-coded")
+	_, err = classifyCancellationSnapshot(cfg, "cancel", root, diagnosticDropSummary{
+		Reasons: []string{"missing", "ambiguous"},
+		Counts:  map[string]uint64{"missing": 1, "ambiguous": 1},
+		Total:   2,
+	})
+	require.ErrorContains(t, err, "exactly one allowed reason-coded")
+	_, err = classifyCancellationSnapshot(cfg, "cancel", root, diagnosticDrops("valid", 1))
+	require.ErrorContains(t, err, "exactly one allowed reason-coded")
+
+	wrong := cancellationSnapshot("cancel", "trace", "foreign")
+	outcome, err = classifyCancellationSnapshot(cfg, "cancel", wrong, noDrops)
+	assert.Equal(t, "wrong_parent", outcome)
+	require.ErrorContains(t, err, "did not identify")
+}
+
+func TestCancellationReconciliationRequiresOneExactApacheCandidate(t *testing.T) {
+	cfg := config{apacheService: "apache-proxy", javaService: "java-backend"}
+	for name, test := range map[string]struct {
+		snapshot tracecheck.Snapshot
+		drops    diagnosticDropSummary
+	}{
+		"missing": {
+			snapshot: func() tracecheck.Snapshot {
+				value := cancellationSnapshot("cancel", "trace", "client")
+				value.Spans = value.Spans[:1]
+				return value
+			}(),
+		},
+		"exact": {snapshot: cancellationSnapshot("cancel", "trace", "client")},
+		"root": {
+			snapshot: cancellationSnapshot("cancel", "trace", ""),
+			drops:    diagnosticDrops("missing", 1),
+		},
+	} {
+		t.Run(name+" missing Apache", func(t *testing.T) {
+			candidate := test.snapshot
+			candidate.Spans = append([]tracecheck.Span(nil), test.snapshot.Spans...)
+			candidate.Spans[0].ServiceName = "other"
+			outcome, err := classifyCancellationSnapshot(cfg, "cancel", candidate, test.drops)
+			assert.Equal(t, "unresolved", outcome)
+			require.ErrorContains(t, err, "one marked Apache")
+		})
+		t.Run(name+" duplicate Apache", func(t *testing.T) {
+			candidate := test.snapshot
+			candidate.Spans = append([]tracecheck.Span(nil), test.snapshot.Spans...)
+			duplicate := candidate.Spans[0]
+			duplicate.SpanID = "duplicate-client"
+			candidate.Spans = append(candidate.Spans, duplicate)
+			outcome, err := classifyCancellationSnapshot(cfg, "cancel", candidate, test.drops)
+			assert.Equal(t, "unresolved", outcome)
+			require.ErrorContains(t, err, "one marked Apache")
+		})
+	}
+	wrongApacheEndpoint := cancellationSnapshot("cancel", "trace", "client")
+	wrongApacheEndpoint.Spans[0].Attributes = cloneStringMap(wrongApacheEndpoint.Spans[0].Attributes)
+	wrongApacheEndpoint.Spans[0].Attributes["http.route"] = "/wrong"
+	outcome, err := classifyCancellationSnapshot(
+		cfg,
+		"cancel",
+		wrongApacheEndpoint,
+		diagnosticDropSummary{},
+	)
+	assert.Equal(t, "unresolved", outcome)
+	require.ErrorContains(t, err, "one marked Apache")
+
+	wrongEndpoint := cancellationSnapshot("cancel", "trace", "client")
+	wrongEndpoint.Spans[1].Attributes = cloneStringMap(wrongEndpoint.Spans[1].Attributes)
+	wrongEndpoint.Spans[1].Attributes["http.route"] = "/wrong"
+	outcome, err = classifyCancellationSnapshot(cfg, "cancel", wrongEndpoint, diagnosticDropSummary{})
+	assert.Equal(t, "unresolved", outcome)
+	require.ErrorContains(t, err, "wrong endpoint")
+
+	extraJava := cancellationSnapshot("cancel", "trace", "client")
+	duplicate := extraJava.Spans[1]
+	duplicate.SpanID = "duplicate-java"
+	duplicate.Attributes = cloneStringMap(duplicate.Attributes)
+	duplicate.Attributes["http.route"] = "/wrong"
+	extraJava.Spans = append(extraJava.Spans, duplicate)
+	outcome, err = classifyCancellationSnapshot(cfg, "cancel", extraJava, diagnosticDropSummary{})
+	assert.Equal(t, "unresolved", outcome)
+	require.ErrorContains(t, err, "one marked Java")
+
+	for name, related := range map[string]tracecheck.Span{
+		"related wrong parent": {
+			ServiceName:  "java-backend",
+			Kind:         "SERVER",
+			TraceID:      "trace",
+			SpanID:       "related-java-wrong-parent",
+			ParentSpanID: "foreign",
+			Flags:        0x301,
+		},
+		"related changed flags": {
+			ServiceName:  "java-backend",
+			Kind:         "SERVER",
+			TraceID:      "trace",
+			SpanID:       "related-java-changed-flags",
+			ParentSpanID: "client",
+			Flags:        0x300,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := cancellationSnapshot("cancel", "trace", "client")
+			candidate.Spans = candidate.Spans[:1]
+			candidate.RelatedSpans = []tracecheck.Span{related}
+			outcome, err := classifyCancellationSnapshot(
+				cfg,
+				"cancel",
+				candidate,
+				diagnosticDropSummary{},
+			)
+			assert.Equal(t, "unresolved", outcome)
+			require.ErrorContains(t, err, "unmatched Java")
+		})
+	}
+}
+
+func TestDiagnosticDeltasPreserveEveryCounterAndDropMagnitude(t *testing.T) {
+	before := javaDiagnosticsSnapshot(t, 0)
+	after := javaDiagnosticsSnapshotWithCounters(t, map[string]uint64{
+		"t_timeout": 3,
+		"d_valid":   1,
+		"d_missing": 2,
+	})
+	deltas, err := diagnosticCounterDeltas(before, after, "fixture")
+	require.NoError(t, err)
+	assert.EqualValues(t, 3, deltas["t_timeout"])
+	drops := summarizeDiagnosticDrops(deltas)
+	assert.Equal(t, []string{"valid", "missing"}, drops.Reasons)
+	assert.EqualValues(t, 1, drops.Counts["valid"])
+	assert.EqualValues(t, 2, drops.Counts["missing"])
+	assert.EqualValues(t, 3, drops.Total)
+
+	decreasedBefore := javaDiagnosticsSnapshotWithCounters(t, map[string]uint64{"t_valid": 2})
+	decreasedAfter := javaDiagnosticsSnapshotWithCounters(t, map[string]uint64{"t_valid": 1})
+	_, err = diagnosticCounterDeltas(decreasedBefore, decreasedAfter, "fixture")
+	require.ErrorContains(t, err, "decreased")
+}
+
+func TestDeterministicDiagnosticsRejectContradictoryPassedOutcomes(t *testing.T) {
+	exact := deterministicDiagnosticDeltas(2, "")
+	require.NoError(t, validateCoalescedDiagnosticDeltas(exact, "supported_exact"))
+	ambiguous := deterministicDiagnosticDeltas(0, "ambiguous")
+	require.NoError(t, validateCoalescedDiagnosticDeltas(ambiguous, "ambiguous_drop"))
+
+	for name, mutate := range map[string]func(map[string]uint64){
+		"unexpected take status": func(value map[string]uint64) { value["t_missing"] = 1 },
+		"unexpected drop status": func(value map[string]uint64) { value["d_timeout"] = 1 },
+		"unexpected failure":     func(value map[string]uint64) { value["provider_reject"] = 1 },
+		"unsampled take":         func(value map[string]uint64) { value["take_unsampled"] = 1 },
+		"standard discard":       func(value map[string]uint64) { value["discard_standard"] = 1 },
+		"sampled mismatch":       func(value map[string]uint64) { value["take_sampled"] = 1 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := cloneUint64Map(exact)
+			mutate(candidate)
+			require.Error(t, validateCoalescedDiagnosticDeltas(candidate, "supported_exact"))
+		})
+	}
+	for _, counter := range javaDeterministicFailureCounters {
+		t.Run("failure counter "+counter, func(t *testing.T) {
+			candidate := cloneUint64Map(exact)
+			candidate[counter] = 1
+			require.Error(t, validateCoalescedDiagnosticDeltas(candidate, "supported_exact"))
+		})
+	}
+	for _, counter := range []string{"d_unknown", "d_valid"} {
+		t.Run("unexpected "+counter, func(t *testing.T) {
+			candidate := cloneUint64Map(exact)
+			candidate[counter] = 1
+			require.Error(t, validateCoalescedDiagnosticDeltas(candidate, "supported_exact"))
+		})
+	}
+
+	extraAmbiguousDrop := cloneUint64Map(ambiguous)
+	extraAmbiguousDrop["d_timeout"] = 1
+	require.Error(t, validateCoalescedDiagnosticDeltas(extraAmbiguousDrop, "ambiguous_drop"))
+	ambiguousTake := cloneUint64Map(ambiguous)
+	ambiguousTake["t_valid"] = 1
+	ambiguousTake["take_sampled"] = 1
+	require.Error(t, validateCoalescedDiagnosticDeltas(ambiguousTake, "ambiguous_drop"))
+
+	require.NoError(t, validateCancellationDiagnosticDeltas(
+		deterministicDiagnosticDeltas(2, ""),
+		"exact",
+		diagnosticDropSummary{},
+	))
+	for _, valid := range []uint64{1, 2} {
+		require.NoError(t, validateCancellationDiagnosticDeltas(
+			deterministicDiagnosticDeltas(valid, ""),
+			"missing",
+			diagnosticDropSummary{},
+		))
+	}
+	reasonCoded := deterministicDiagnosticDeltas(1, "missing")
+	require.NoError(t, validateCancellationDiagnosticDeltas(
+		reasonCoded,
+		"reason_coded_drop",
+		diagnosticDrops("missing", 1),
+	))
+	for _, valid := range []uint64{0, 3} {
+		require.Error(t, validateCancellationDiagnosticDeltas(
+			deterministicDiagnosticDeltas(valid, ""),
+			"missing",
+			diagnosticDropSummary{},
+		))
+	}
+	doubleDrop := deterministicDiagnosticDeltas(1, "missing")
+	doubleDrop["d_missing"] = 2
+	require.Error(t, validateCancellationDiagnosticDeltas(
+		doubleDrop,
+		"reason_coded_drop",
+		diagnosticDrops("missing", 2),
+	))
+	mixedDrop := deterministicDiagnosticDeltas(1, "missing")
+	mixedDrop["d_ambiguous"] = 1
+	require.Error(t, validateCancellationDiagnosticDeltas(
+		mixedDrop,
+		"reason_coded_drop",
+		diagnosticDropSummary{
+			Reasons: []string{"missing", "ambiguous"},
+			Counts:  map[string]uint64{"missing": 1, "ambiguous": 1},
+			Total:   2,
+		},
+	))
+}
+
+func TestFaultEncodingAlwaysEmitsDropReasonArrays(t *testing.T) {
+	var output bytes.Buffer
+	require.NoError(t, encodeRunResult(&output, &runResult{Faults: []faultResult{
+		{ParentOutcome: "exact"},
+		{ParentOutcome: "missing"},
+		{ParentOutcome: "reason_coded_drop", DropReasons: []string{"timeout"}},
+	}}))
+	var decoded struct {
+		Faults []struct {
+			DropReasons []string `json:"drop_reasons"`
+		} `json:"faults"`
+	}
+	require.NoError(t, json.Unmarshal(output.Bytes(), &decoded))
+	require.Len(t, decoded.Faults, 3)
+	assert.NotNil(t, decoded.Faults[0].DropReasons)
+	assert.Empty(t, decoded.Faults[0].DropReasons)
+	assert.NotNil(t, decoded.Faults[1].DropReasons)
+	assert.Empty(t, decoded.Faults[1].DropReasons)
+	assert.Equal(t, []string{"timeout"}, decoded.Faults[2].DropReasons)
+}
+
+func TestConcurrencyWorkloadCarriesBoundedBarrierEvidence(t *testing.T) {
+	requests, err := makeRequests(config{scenario: "concurrency", requestCount: 4, seed: 42})
+	require.NoError(t, err)
+	for _, request := range requests {
+		assert.Equal(t, "c000000000000002a", request.ConcurrencyBatch)
+		assert.Equal(t, 4, request.ConcurrencyExpected)
+		assert.Zero(t, request.DelayMillis)
+	}
+	responses := make([]backendResponse, 4)
+	for index := range responses {
+		responses[index] = backendResponse{
+			BackendConnectionID:     uint64(index + 1),
+			BackendWorkerID:         uint64(index + 11),
+			ConcurrencyParticipants: 4,
+			ConcurrencyMaxActive:    4,
+			ConcurrencyArrival:      index + 1,
+			ConcurrencyRelease:      7,
+		}
+	}
+	evidence := buildConcurrencyEvidence(responses)
+	assert.Equal(t, 4, evidence.DistinctBackendWorkers)
+	assert.Equal(t, 4, evidence.DistinctConcurrencyArrivals)
+	assert.Equal(t, 4, evidence.ConcurrencyParticipants)
+	assert.Equal(t, 4, evidence.ConcurrencyMaxActive)
+	assert.Equal(t, uint64(7), evidence.ConcurrencyRelease)
+	require.NoError(t, validateConnectionShape("concurrency", responses, evidence))
+
+	for name, mutate := range map[string]func([]backendResponse){
+		"three of four workers": func(value []backendResponse) {
+			value[3].BackendWorkerID = value[0].BackendWorkerID
+		},
+		"duplicate arrival": func(value []backendResponse) {
+			value[3].ConcurrencyArrival = value[2].ConcurrencyArrival
+		},
+		"zero worker": func(value []backendResponse) {
+			value[3].BackendWorkerID = 0
+		},
+		"mismatched release": func(value []backendResponse) {
+			value[1].ConcurrencyRelease = 8
+		},
+		"zero release": func(value []backendResponse) {
+			for index := range value {
+				value[index].ConcurrencyRelease = 0
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := append([]backendResponse(nil), responses...)
+			mutate(candidate)
+			candidateEvidence := buildConcurrencyEvidence(candidate)
+			require.ErrorContains(t, validateConnectionShape(
+				"concurrency",
+				candidate,
+				candidateEvidence,
+			), "worker overlap")
+		})
+	}
+}
+
+func TestConcurrencyWorkloadRequiresSupportedBarrierSize(t *testing.T) {
+	for _, count := range []int{1, 65} {
+		_, err := makeRequests(config{scenario: "concurrency", requestCount: count, seed: 42})
+		require.ErrorContains(t, err, "requires between two and 64 requests")
+	}
+	for _, count := range []int{2, 64} {
+		requests, err := makeRequests(
+			config{scenario: "concurrency", requestCount: count, seed: 42},
+		)
+		require.NoError(t, err)
+		require.Len(t, requests, count)
+	}
+}
+
+func coalescedSnapshots(firstMarker, secondMarker string, javaRoots [2]bool) []tracecheck.Snapshot {
+	markers := [2]string{firstMarker, secondMarker}
+	snapshots := []tracecheck.Snapshot{{Marker: firstMarker}, {Marker: secondMarker}}
+	triggerAttributes := map[string]string{
+		"http.request.header.x-obi-demo-id": firstMarker,
+		"http.route":                        "/api/coalesced-source",
+	}
+	snapshots[0].Spans = append(snapshots[0].Spans,
+		tracecheck.Span{
+			ServiceName: "apache-proxy",
+			Kind:        "CLIENT",
+			TraceID:     "source-trace",
+			SpanID:      "apache-client",
+			Flags:       0x001,
+			Attributes:  cloneStringMap(triggerAttributes),
+		},
+		tracecheck.Span{
+			ServiceName:  "coalesced-source",
+			Kind:         "SERVER",
+			TraceID:      "source-trace",
+			SpanID:       "source-server",
+			ParentSpanID: "apache-client",
+			Flags:        0x001,
+			Attributes:   cloneStringMap(triggerAttributes),
+		},
+	)
+	for index, marker := range markers {
+		attributes := map[string]string{
+			"http.request.header.x-obi-demo-id": marker,
+			"http.route":                        "/api/coalesced-bridge",
+		}
+		sourceClientID := fmt.Sprintf("source-client-%d", index+1)
+		snapshots[index].Spans = append(snapshots[index].Spans, tracecheck.Span{
+			ServiceName:  "coalesced-source",
+			Kind:         "CLIENT",
+			TraceID:      "source-trace",
+			SpanID:       sourceClientID,
+			ParentSpanID: "source-server",
+			Flags:        0x001,
+			Attributes:   cloneStringMap(attributes),
+		})
+		javaTrace := "source-trace"
+		javaParent := sourceClientID
+		javaFlags := uint32(0x301)
+		if javaRoots[index] {
+			javaTrace = fmt.Sprintf("java-root-trace-%d", index+1)
+			javaParent = ""
+			javaFlags = 0x101
+		}
+		snapshots[index].Spans = append(snapshots[index].Spans, tracecheck.Span{
+			ServiceName:  "java-backend",
+			Kind:         "SERVER",
+			TraceID:      javaTrace,
+			SpanID:       fmt.Sprintf("java-server-%d", index+1),
+			ParentSpanID: javaParent,
+			Flags:        javaFlags,
+			Attributes:   cloneStringMap(attributes),
+		})
+	}
+	return snapshots
+}
+
+func spanIndex(t *testing.T, snapshot tracecheck.Snapshot, service, kind string) int {
+	t.Helper()
+	for index, span := range snapshot.Spans {
+		if span.ServiceName == service && strings.EqualFold(span.Kind, kind) {
+			return index
+		}
+	}
+	t.Fatalf("missing %s %s span in %+v", service, kind, snapshot)
+	return -1
+}
+
+func cloneStringMap(source map[string]string) map[string]string {
+	cloned := make(map[string]string, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func diagnosticDrops(status string, count uint64) diagnosticDropSummary {
+	return diagnosticDropSummary{
+		Reasons: []string{status},
+		Counts:  map[string]uint64{status: count},
+		Total:   count,
+	}
+}
+
+func deterministicDiagnosticDeltas(valid uint64, discardStatus string) map[string]uint64 {
+	deltas := make(map[string]uint64, len(javaDiagnosticsFieldNames))
+	for _, counter := range javaDiagnosticsFieldNames {
+		deltas[counter] = 0
+	}
+	deltas["t_valid"] = valid
+	deltas["take_sampled"] = valid
+	if discardStatus != "" {
+		deltas["d_"+discardStatus] = 1
+	}
+	return deltas
+}
+
+func cloneUint64Map(source map[string]uint64) map[string]uint64 {
+	cloned := make(map[string]uint64, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func cancellationSnapshot(marker, traceID, javaParent string) tracecheck.Snapshot {
+	attributes := map[string]string{
+		"http.request.header.x-obi-demo-id": marker,
+		"http.route":                        "/api/echo",
+	}
+	javaTrace := traceID
+	javaFlags := uint32(0x301)
+	if javaParent == "" {
+		javaTrace = "root-trace"
+		javaFlags = 0x101
+	}
+	return tracecheck.Snapshot{Marker: marker, Spans: []tracecheck.Span{
+		{ServiceName: "apache-proxy", Kind: "CLIENT", TraceID: traceID, SpanID: "client", Flags: 0x001, Attributes: attributes},
+		{ServiceName: "java-backend", Kind: "SERVER", TraceID: javaTrace, SpanID: "java", ParentSpanID: javaParent, Flags: javaFlags, Attributes: attributes},
+	}}
+}
+
 func TestRunResultEncodingKeepsPressureCountsOnSeparateLines(t *testing.T) {
 	var output bytes.Buffer
 	result := &runResult{
@@ -938,10 +1805,11 @@ func TestStressScenarioRequestsHaveBoundedShapes(t *testing.T) {
 		},
 		{
 			scenario: "tls-boundary",
-			count:    2,
+			count:    3,
 			check: func(t *testing.T, request requestCase) {
-				assert.Equal(t, "/api/tls-boundary", request.Endpoint)
+				assert.Equal(t, "/api/tls-boundary/split", request.Endpoint)
 				assert.Equal(t, "split", request.TLSBoundaryMode)
+				assert.True(t, request.CloseConnection)
 			},
 		},
 		{
@@ -1183,71 +2051,454 @@ func TestValidateDispatchResponseRequiresInvocationProof(t *testing.T) {
 	assert.Error(t, validateWorkloadResponse(request, response))
 }
 
-func TestTLSBoundaryRequestsAndEvidenceCoverBothDeterministicModes(t *testing.T) {
+func TestTLSBoundaryRequestsAndEvidenceCoverSplitAndCoalescedPair(t *testing.T) {
 	requests, err := makeRequests(config{scenario: "tls-boundary", seed: 42})
 	require.NoError(t, err)
-	require.Len(t, requests, 2)
+	require.Len(t, requests, 3)
+	assert.Equal(t, "/api/tls-boundary/split", requests[0].Endpoint)
 	assert.Equal(t, "split", requests[0].TLSBoundaryMode)
+	assert.Equal(t, 1, requests[0].TLSBoundarySequence)
+	assert.Equal(t, "/api/tls-boundary/coalesced", requests[1].Endpoint)
 	assert.Equal(t, "coalesced", requests[1].TLSBoundaryMode)
+	assert.Equal(t, 1, requests[1].TLSBoundarySequence)
+	assert.Equal(t, "/api/tls-boundary/coalesced", requests[2].Endpoint)
+	assert.Equal(t, "coalesced", requests[2].TLSBoundaryMode)
+	assert.Equal(t, 2, requests[2].TLSBoundarySequence)
+	require.ErrorContains(t, func() error {
+		_, requestErr := makeRequests(config{scenario: "tls-boundary", requestCount: 2, seed: 42})
+		return requestErr
+	}(), "requires exactly three requests")
 
-	for _, request := range requests {
+	for index, request := range requests {
 		httpRequest, requestErr := newHTTPRequest(
 			context.Background(),
 			config{baseURL: "http://127.0.0.1:18080"},
 			request,
 		)
 		require.NoError(t, requestErr)
-		assert.Equal(t, request.TLSBoundaryMode, httpRequest.URL.Query().Get("mode"))
+		assert.Equal(t, http.MethodPost, httpRequest.Method)
+		assert.Equal(t, request.Endpoint, httpRequest.URL.Path)
+		assert.Empty(t, httpRequest.URL.RawQuery)
+		assert.Equal(t, index != 1, httpRequest.Close)
+		assert.EqualValues(t, tlsBoundaryBodyBytes, httpRequest.ContentLength)
+		assert.Equal(t, strconv.Itoa(request.TLSBoundarySequence), httpRequest.Header.Get(tlsBoundarySequenceHeader))
+		body, readErr := io.ReadAll(httpRequest.Body)
+		require.NoError(t, readErr)
+		assert.Len(t, body, tlsBoundaryBodyBytes)
+		for index := range tlsBoundaryPaddingHeaderCount {
+			assert.Len(t, httpRequest.Header.Get(fmt.Sprintf("Z-OBI-Boundary-Pad-%d", index)), tlsBoundaryPaddingHeaderValueBytes)
+		}
 	}
 
-	split := backendResponse{TLSBoundary: &tlsBoundaryEvidence{
-		Mode:                               "split",
-		Passed:                             true,
-		ShapeExact:                         true,
-		ExpectedPlaintextCallbackLengths:   []int{3, 5},
-		ActualPlaintextCallbackLengths:     []int{3, 5},
-		TLSApplicationRecordLegacyVersions: []int{0x0303, 0x0303},
-		TLSApplicationRecordPayloadLengths: []int{20, 22},
-		WireTLSRecordShapeExact:            true,
-		RequestOrder:                       []int{1},
-		ResponseOrder:                      []int{1},
-		BuffersForwardedUnchanged:          true,
-		HandoffBeforeParse:                 true,
-		ConnectionClosed:                   true,
-	}}
+	split := backendResponse{
+		BackendKind: "netty-tls-boundary",
+		TLSBoundary: validTLSBoundaryEvidence("split"),
+	}
 	require.NoError(t, validateTLSBoundaryResponse(requests[0], split))
+	require.NoError(t, validateWorkloadResponse(requests[0], split))
 
-	coalesced := backendResponse{TLSBoundary: &tlsBoundaryEvidence{
-		Mode:                               "coalesced",
-		Passed:                             true,
-		ShapeExact:                         true,
-		ExpectedPlaintextCallbackLengths:   []int{8},
-		ActualPlaintextCallbackLengths:     []int{8},
-		TLSApplicationRecordLegacyVersions: []int{0x0303},
-		TLSApplicationRecordPayloadLengths: []int{25},
-		WireTLSRecordShapeExact:            true,
-		RequestOrder:                       []int{1, 2},
-		ResponseOrder:                      []int{1, 2},
-		BuffersForwardedUnchanged:          true,
-		HandoffBeforeParse:                 true,
-		ConnectionClosed:                   true,
-	}}
-	require.NoError(t, validateTLSBoundaryResponse(requests[1], coalesced))
-	coalesced.TLSBoundary.ActualPlaintextCallbackLengths = []int{4, 4}
-	assert.Error(t, validateTLSBoundaryResponse(requests[1], coalesced))
-	coalesced.TLSBoundary.ActualPlaintextCallbackLengths = []int{8}
-	coalesced.TLSBoundary.WireTLSRecordShapeExact = false
-	assert.Error(t, validateTLSBoundaryResponse(requests[1], coalesced))
-	coalesced.TLSBoundary.WireTLSRecordShapeExact = true
-	coalesced.TLSBoundary.TLSApplicationRecordLegacyVersions = []int{0x0302}
-	assert.Error(t, validateTLSBoundaryResponse(requests[1], coalesced))
-	coalesced.TLSBoundary.TLSApplicationRecordLegacyVersions = []int{0x0303}
-	coalesced.TLSBoundary.TLSApplicationRecordPayloadLengths = []int{8}
-	assert.Error(t, validateTLSBoundaryResponse(requests[1], coalesced))
-	coalesced.TLSBoundary.TLSApplicationRecordPayloadLengths = []int{265}
-	assert.Error(t, validateTLSBoundaryResponse(requests[1], coalesced))
-	coalesced.TLSBoundary.TLSApplicationRecordPayloadLengths = []int{25, 25}
-	assert.Error(t, validateTLSBoundaryResponse(requests[1], coalesced))
+	coalescedPartial := backendResponse{
+		BackendKind: "netty-tls-boundary",
+		TLSBoundary: validPartialTLSBoundaryEvidence(),
+	}
+	require.NoError(t, validateTLSBoundaryResponse(requests[1], coalescedPartial))
+	require.NoError(t, validateWorkloadResponse(requests[1], coalescedPartial))
+
+	coalescedFinal := backendResponse{
+		BackendKind: "netty-tls-boundary",
+		TLSBoundary: validTLSBoundaryEvidence("coalesced"),
+	}
+	require.NoError(t, validateTLSBoundaryResponse(requests[2], coalescedFinal))
+	require.NoError(t, validateWorkloadResponse(requests[2], coalescedFinal))
+
+	coalescedFinal.BackendKind = "netty"
+	assert.Error(t, validateWorkloadResponse(requests[2], coalescedFinal))
+}
+
+func TestValidateTLSBoundaryResponseRejectsEveryEvidenceInvariant(t *testing.T) {
+	request := requestCase{
+		Endpoint:            "/api/tls-boundary/coalesced",
+		TLSBoundaryMode:     "coalesced",
+		TLSBoundarySequence: 2,
+	}
+	tests := map[string]func(*tlsBoundaryEvidence){
+		"mode":                func(e *tlsBoundaryEvidence) { e.Mode = "split" },
+		"delivery shape":      func(e *tlsBoundaryEvidence) { e.DeliveryShape = tlsBoundaryDeliveryParserCoalesced },
+		"evidence phase":      func(e *tlsBoundaryEvidence) { e.EvidencePhase = tlsBoundaryEvidencePartial },
+		"fallback reason":     func(e *tlsBoundaryEvidence) { e.FallbackReason = "none" },
+		"grace lower bound":   func(e *tlsBoundaryEvidence) { e.CoalescingGraceMillis = 0 },
+		"grace upper bound":   func(e *tlsBoundaryEvidence) { e.CoalescingGraceMillis = tlsBoundaryMaxCoalescingGraceMillis + 1 },
+		"grace expiration":    func(e *tlsBoundaryEvidence) { e.CoalescingGraceExpired = false },
+		"verification bytes":  func(e *tlsBoundaryEvidence) { e.VerificationBufferBytes-- },
+		"verification bound":  func(e *tlsBoundaryEvidence) { e.VerificationBufferLimitBytes-- },
+		"verification digest": func(e *tlsBoundaryEvidence) { e.VerificationPairDigestExact = false },
+		"passed":              func(e *tlsBoundaryEvidence) { e.Passed = false },
+		"failure":             func(e *tlsBoundaryEvidence) { e.FailureReason = "bounded_failure" },
+		"request complete":    func(e *tlsBoundaryEvidence) { e.RequestComplete = false },
+		"request count":       func(e *tlsBoundaryEvidence) { e.RequestCount = 1 },
+		"request header cardinality": func(e *tlsBoundaryEvidence) {
+			e.RequestHeaderBytes = e.RequestHeaderBytes[:1]
+		},
+		"request body cardinality": func(e *tlsBoundaryEvidence) {
+			e.RequestBodyBytes = e.RequestBodyBytes[:1]
+		},
+		"request total cardinality": func(e *tlsBoundaryEvidence) {
+			e.RequestTotalBytes = e.RequestTotalBytes[:1]
+		},
+		"header callback cardinality": func(e *tlsBoundaryEvidence) {
+			e.RequestHeaderDecryptedCallbackCounts = e.RequestHeaderDecryptedCallbackCounts[:1]
+		},
+		"request order":            func(e *tlsBoundaryEvidence) { e.RequestOrder = []int{2, 1} },
+		"emission order":           func(e *tlsBoundaryEvidence) { e.EmissionOrder = []int{2, 1} },
+		"response order":           func(e *tlsBoundaryEvidence) { e.ResponseOrder = []int{2, 1} },
+		"response close order":     func(e *tlsBoundaryEvidence) { e.ResponseConnectionClose = []bool{true, true} },
+		"first response keepalive": func(e *tlsBoundaryEvidence) { e.FirstResponseKeepsAlive = false },
+		"wire pairs":               func(e *tlsBoundaryEvidence) { e.WireDecryptedPairsExact = false },
+		"header span":              func(e *tlsBoundaryEvidence) { e.HeadersSpannedRecords = false },
+		"parser shape":             func(e *tlsBoundaryEvidence) { e.ParserShapeExact = false },
+		"single parser emission":   func(e *tlsBoundaryEvidence) { e.RequestsEmittedFromSingleParserCallback = true },
+		"byte preservation":        func(e *tlsBoundaryEvidence) { e.RequestBytesPreserved = false },
+		"split forwarding flag":    func(e *tlsBoundaryEvidence) { e.SplitBuffersForwardedUnchanged = true },
+		"handoff":                  func(e *tlsBoundaryEvidence) { e.HandoffBeforeParse = false },
+		"forced close":             func(e *tlsBoundaryEvidence) { e.ResponseForcesConnectionClose = false },
+		"header lower bound":       func(e *tlsBoundaryEvidence) { e.RequestHeaderBytes[0] = tlsBoundaryMinHeaderBytes - 1 },
+		"header upper bound":       func(e *tlsBoundaryEvidence) { e.RequestHeaderBytes[0] = tlsBoundaryMaxHeaderBytes + 1 },
+		"body size":                func(e *tlsBoundaryEvidence) { e.RequestBodyBytes[0]-- },
+		"request byte equation":    func(e *tlsBoundaryEvidence) { e.RequestTotalBytes[0]++ },
+		"callback lower bound":     func(e *tlsBoundaryEvidence) { setTLSBoundaryCallbacks(e, []int{e.DecryptedTotalBytes}) },
+		"callback upper bound":     func(e *tlsBoundaryEvidence) { setTLSBoundaryCallbacks(e, make([]int, tlsBoundaryMaxCallbacks+1)) },
+		"record version count": func(e *tlsBoundaryEvidence) {
+			e.TLSApplicationRecordLegacyVersions = e.TLSApplicationRecordLegacyVersions[:6]
+		},
+		"record payload count": func(e *tlsBoundaryEvidence) {
+			e.TLSApplicationRecordPayloadLengths = e.TLSApplicationRecordPayloadLengths[:6]
+		},
+		"plaintext lower bound": func(e *tlsBoundaryEvidence) { e.DecryptedCallbackLengths[0] = 0 },
+		"plaintext upper bound": func(e *tlsBoundaryEvidence) { e.DecryptedCallbackLengths[0] = tlsBoundaryMaxPlaintextRecordBytes + 1 },
+		"legacy version":        func(e *tlsBoundaryEvidence) { e.TLSApplicationRecordLegacyVersions[0] = 0x0302 },
+		"record no overhead":    func(e *tlsBoundaryEvidence) { e.TLSApplicationRecordPayloadLengths[0] = e.DecryptedCallbackLengths[0] },
+		"record excess overhead": func(e *tlsBoundaryEvidence) {
+			e.TLSApplicationRecordPayloadLengths[0] = e.DecryptedCallbackLengths[0] + tlsBoundaryMaxRecordOverhead + 1
+		},
+		"record payload maximum": func(e *tlsBoundaryEvidence) {
+			e.TLSApplicationRecordPayloadLengths[0] = tlsBoundaryMaxRecordPayload + 1
+		},
+		"decrypted byte total": func(e *tlsBoundaryEvidence) { e.DecryptedCallbackLengths[6]-- },
+		"reported decrypted total": func(e *tlsBoundaryEvidence) {
+			e.DecryptedTotalBytes--
+		},
+		"parser byte total":     func(e *tlsBoundaryEvidence) { e.ParserCallbackLengths[0]-- },
+		"reported parser total": func(e *tlsBoundaryEvidence) { e.ParserTotalBytes-- },
+		"reported parser count": func(e *tlsBoundaryEvidence) { e.ParserCallbackCount = 1 },
+		"header callback lower": func(e *tlsBoundaryEvidence) { e.RequestHeaderDecryptedCallbackCounts[0] = 1 },
+		"header callback mismatch": func(e *tlsBoundaryEvidence) {
+			e.RequestHeaderDecryptedCallbackCounts[1]++
+		},
+		"parser facing flag": func(e *tlsBoundaryEvidence) { e.ParserFacingCoalesced = true },
+		"serialized parser count": func(e *tlsBoundaryEvidence) {
+			e.ParserCallbackLengths = []int{e.ParserTotalBytes}
+			e.ParserCallbackCount = 1
+		},
+		"serialized parser bytes": func(e *tlsBoundaryEvidence) { e.ParserCallbackLengths[0]-- },
+		"serialized emission order": func(e *tlsBoundaryEvidence) {
+			e.EmissionParserCallbackOrder = []int{1, 1}
+		},
+	}
+
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			evidence := validTLSBoundaryEvidence("coalesced")
+			mutate(evidence)
+			assert.Error(t, validateTLSBoundaryResponse(request, backendResponse{TLSBoundary: evidence}))
+		})
+	}
+
+	assert.Error(t, validateTLSBoundaryResponse(request, backendResponse{}))
+	unknown := validTLSBoundaryEvidence("coalesced")
+	request.TLSBoundaryMode = "approximate"
+	unknown.Mode = "approximate"
+	assert.Error(t, validateTLSBoundaryResponse(request, backendResponse{TLSBoundary: unknown}))
+	request.TLSBoundaryMode = "coalesced"
+	request.TLSBoundarySequence = 3
+	assert.Error(t, validateTLSBoundaryResponse(request, backendResponse{TLSBoundary: validTLSBoundaryEvidence("coalesced")}))
+}
+
+func TestValidateTLSBoundaryResponseRequiresTruthfulPartialFallback(t *testing.T) {
+	request := requestCase{
+		Endpoint:            "/api/tls-boundary/coalesced",
+		TLSBoundaryMode:     "coalesced",
+		TLSBoundarySequence: 1,
+	}
+	tests := map[string]func(*tlsBoundaryEvidence){
+		"delivery shape":      func(e *tlsBoundaryEvidence) { e.DeliveryShape = tlsBoundaryDeliveryParserCoalesced },
+		"evidence phase":      func(e *tlsBoundaryEvidence) { e.EvidencePhase = tlsBoundaryEvidenceFinal },
+		"fallback reason":     func(e *tlsBoundaryEvidence) { e.FallbackReason = "none" },
+		"grace":               func(e *tlsBoundaryEvidence) { e.CoalescingGraceMillis = 0 },
+		"grace expiration":    func(e *tlsBoundaryEvidence) { e.CoalescingGraceExpired = false },
+		"passed":              func(e *tlsBoundaryEvidence) { e.Passed = true },
+		"request complete":    func(e *tlsBoundaryEvidence) { e.RequestComplete = true },
+		"request count":       func(e *tlsBoundaryEvidence) { e.RequestCount = 2 },
+		"request order":       func(e *tlsBoundaryEvidence) { e.RequestOrder = []int{1, 2} },
+		"parser order":        func(e *tlsBoundaryEvidence) { e.EmissionParserCallbackOrder = []int{1, 2} },
+		"response order":      func(e *tlsBoundaryEvidence) { e.ResponseOrder = []int{1, 2} },
+		"response close":      func(e *tlsBoundaryEvidence) { e.ResponseConnectionClose = []bool{false, true} },
+		"parser facing":       func(e *tlsBoundaryEvidence) { e.ParserFacingCoalesced = true },
+		"single parser":       func(e *tlsBoundaryEvidence) { e.RequestsEmittedFromSingleParserCallback = true },
+		"byte preservation":   func(e *tlsBoundaryEvidence) { e.RequestBytesPreserved = true },
+		"split forwarding":    func(e *tlsBoundaryEvidence) { e.SplitBuffersForwardedUnchanged = true },
+		"forced close":        func(e *tlsBoundaryEvidence) { e.ResponseForcesConnectionClose = true },
+		"verification bytes":  func(e *tlsBoundaryEvidence) { e.VerificationBufferBytes-- },
+		"verification limit":  func(e *tlsBoundaryEvidence) { e.VerificationBufferLimitBytes-- },
+		"verification digest": func(e *tlsBoundaryEvidence) { e.VerificationPairDigestExact = true },
+		"parser bytes":        func(e *tlsBoundaryEvidence) { e.ParserCallbackLengths[0]-- },
+	}
+
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			evidence := validPartialTLSBoundaryEvidence()
+			mutate(evidence)
+			assert.Error(t, validateTLSBoundaryResponse(request, backendResponse{TLSBoundary: evidence}))
+		})
+	}
+	require.NoError(t, validateTLSBoundaryResponse(
+		request,
+		backendResponse{TLSBoundary: validPartialTLSBoundaryEvidence()},
+	))
+}
+
+func TestSerializedTLSBoundaryFinalEvidenceMonotonicallyExtendsPartial(t *testing.T) {
+	require.NoError(t, validateSerializedTLSBoundaryExtension(
+		validPartialTLSBoundaryEvidence(),
+		validTLSBoundaryEvidence("coalesced"),
+	))
+
+	tests := map[string]func(*tlsBoundaryEvidence, *tlsBoundaryEvidence){
+		"configuration": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+			final.CoalescingGraceMillis++
+		},
+		"phase": func(partial *tlsBoundaryEvidence, _ *tlsBoundaryEvidence) {
+			partial.EvidencePhase = tlsBoundaryEvidenceFinal
+		},
+		"request prefix": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+			final.RequestHeaderBytes[0]++
+		},
+		"record prefix": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+			final.TLSApplicationRecordPayloadLengths[0]++
+		},
+		"parser prefix": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+			final.ParserCallbackLengths[0]++
+		},
+		"close prefix": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+			final.ResponseConnectionClose[0] = true
+		},
+		"decrypted growth": func(partial *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+			final.DecryptedTotalBytes = partial.DecryptedTotalBytes
+		},
+		"parser growth": func(partial *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+			final.ParserTotalBytes = partial.ParserTotalBytes
+		},
+		"verification growth": func(partial *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+			final.VerificationBufferBytes = partial.VerificationBufferBytes
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			partial := validPartialTLSBoundaryEvidence()
+			final := validTLSBoundaryEvidence("coalesced")
+			mutate(partial, final)
+			assert.Error(t, validateSerializedTLSBoundaryExtension(partial, final))
+		})
+	}
+}
+
+func TestValidateTLSBoundaryResponseRejectsInvalidSplitShape(t *testing.T) {
+	request := requestCase{
+		Endpoint:            "/api/tls-boundary/split",
+		TLSBoundaryMode:     "split",
+		TLSBoundarySequence: 1,
+	}
+	tests := map[string]func(*tlsBoundaryEvidence){
+		"coalesced flag":          func(e *tlsBoundaryEvidence) { e.ParserFacingCoalesced = true },
+		"changed buffers":         func(e *tlsBoundaryEvidence) { e.SplitBuffersForwardedUnchanged = false },
+		"parser callback lengths": func(e *tlsBoundaryEvidence) { e.ParserCallbackLengths[0]-- },
+		"parser callback count":   func(e *tlsBoundaryEvidence) { e.ParserCallbackCount-- },
+		"emission parser order":   func(e *tlsBoundaryEvidence) { e.EmissionParserCallbackOrder = []int{1} },
+		"response close order":    func(e *tlsBoundaryEvidence) { e.ResponseConnectionClose = []bool{false} },
+		"first response keepalive": func(e *tlsBoundaryEvidence) {
+			e.FirstResponseKeepsAlive = true
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			evidence := validTLSBoundaryEvidence("split")
+			mutate(evidence)
+			assert.Error(t, validateTLSBoundaryResponse(request, backendResponse{TLSBoundary: evidence}))
+		})
+	}
+	request.TLSBoundarySequence = 2
+	assert.Error(t, validateTLSBoundaryResponse(request, backendResponse{TLSBoundary: validTLSBoundaryEvidence("split")}))
+}
+
+func TestValidateTLSBoundaryResponseAcceptsDeferredSplitEmissionCallback(t *testing.T) {
+	request := requestCase{
+		Endpoint:            "/api/tls-boundary/split",
+		TLSBoundaryMode:     "split",
+		TLSBoundarySequence: 1,
+	}
+	evidence := validTLSBoundaryEvidence("split")
+	evidence.EmissionParserCallbackOrder = []int{3}
+	require.Equal(t, []int{2}, evidence.RequestHeaderDecryptedCallbackCounts)
+	require.Equal(t, 4, evidence.ParserCallbackCount)
+	require.NoError(t, validateTLSBoundaryResponse(
+		request,
+		backendResponse{TLSBoundary: evidence},
+	))
+}
+
+func TestValidateTLSBoundaryResponseRejectsInvalidSplitEmissionCallback(t *testing.T) {
+	request := requestCase{
+		Endpoint:            "/api/tls-boundary/split",
+		TLSBoundaryMode:     "split",
+		TLSBoundarySequence: 1,
+	}
+	tests := []struct {
+		name      string
+		order     []int
+		wantError string
+	}{
+		{name: "too early", order: []int{1}, wantError: "before its headers completed"},
+		{name: "out of range lower", order: []int{0}, wantError: "out of range"},
+		{name: "out of range upper", order: []int{5}, wantError: "out of range"},
+		{name: "cardinality mismatch", order: []int{2, 2}, wantError: "cardinality does not match"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			evidence := validTLSBoundaryEvidence("split")
+			evidence.EmissionParserCallbackOrder = test.order
+			err := validateTLSBoundaryResponse(request, backendResponse{TLSBoundary: evidence})
+			assert.ErrorContains(t, err, test.wantError)
+		})
+	}
+}
+
+func validTLSBoundaryEvidence(mode string) *tlsBoundaryEvidence {
+	headerBytes := []int{18_100}
+	requestBytes := []int{headerBytes[0] + tlsBoundaryBodyBytes}
+	decrypted := []int{16_384, 16_384, 16_384, requestBytes[0] - 3*16_384}
+	requestOrder := []int{1}
+	responseClose := []bool{true}
+	evidence := &tlsBoundaryEvidence{
+		Mode:                                    mode,
+		DeliveryShape:                           tlsBoundaryDeliverySplit,
+		EvidencePhase:                           tlsBoundaryEvidenceFinal,
+		FallbackReason:                          "none",
+		Passed:                                  true,
+		FailureReason:                           "none",
+		RequestComplete:                         true,
+		RequestCount:                            1,
+		RequestHeaderBytes:                      headerBytes,
+		RequestBodyBytes:                        []int{tlsBoundaryBodyBytes},
+		RequestTotalBytes:                       requestBytes,
+		RequestHeaderDecryptedCallbackCounts:    []int{2},
+		RequestOrder:                            requestOrder,
+		EmissionOrder:                           append([]int(nil), requestOrder...),
+		EmissionParserCallbackOrder:             []int{2},
+		ResponseOrder:                           append([]int(nil), requestOrder...),
+		ResponseConnectionClose:                 responseClose,
+		DecryptedCallbackLengths:                append([]int(nil), decrypted...),
+		ParserCallbackLengths:                   append([]int(nil), decrypted...),
+		DecryptedTotalBytes:                     sumInts(decrypted),
+		ParserTotalBytes:                        sumInts(decrypted),
+		ParserCallbackCount:                     len(decrypted),
+		WireDecryptedPairsExact:                 true,
+		HeadersSpannedRecords:                   true,
+		ParserShapeExact:                        true,
+		RequestsEmittedFromSingleParserCallback: true,
+		RequestBytesPreserved:                   true,
+		SplitBuffersForwardedUnchanged:          true,
+		HandoffBeforeParse:                      true,
+		ResponseForcesConnectionClose:           true,
+	}
+	if mode == "coalesced" {
+		evidence.DeliveryShape = tlsBoundaryDeliverySerializedFallback
+		evidence.FallbackReason = tlsBoundaryFallbackGraceExpired
+		evidence.CoalescingGraceMillis = 150
+		evidence.CoalescingGraceExpired = true
+		evidence.VerificationBufferLimitBytes = tlsBoundaryMaxPairBytes
+		evidence.RequestCount = 2
+		evidence.RequestHeaderBytes = []int{18_100, 18_120}
+		evidence.RequestBodyBytes = []int{tlsBoundaryBodyBytes, tlsBoundaryBodyBytes}
+		evidence.RequestTotalBytes = []int{
+			evidence.RequestHeaderBytes[0] + tlsBoundaryBodyBytes,
+			evidence.RequestHeaderBytes[1] + tlsBoundaryBodyBytes,
+		}
+		firstCallbacks := []int{16_384, 16_384, 16_384, evidence.RequestTotalBytes[0] - 3*16_384}
+		secondCallbacks := []int{16_384, 16_384, 16_384, evidence.RequestTotalBytes[1] - 3*16_384}
+		decrypted = append(firstCallbacks, secondCallbacks...)
+		totalBytes := sumInts(evidence.RequestTotalBytes)
+		evidence.RequestHeaderDecryptedCallbackCounts = []int{2, 2}
+		evidence.RequestOrder = []int{1, 2}
+		evidence.EmissionOrder = []int{1, 2}
+		evidence.EmissionParserCallbackOrder = []int{1, 2}
+		evidence.ResponseOrder = []int{1, 2}
+		evidence.ResponseConnectionClose = []bool{false, true}
+		evidence.DecryptedCallbackLengths = append([]int(nil), decrypted...)
+		evidence.ParserCallbackLengths = append([]int(nil), evidence.RequestTotalBytes...)
+		evidence.DecryptedTotalBytes = totalBytes
+		evidence.ParserTotalBytes = totalBytes
+		evidence.ParserCallbackCount = 2
+		evidence.VerificationBufferBytes = totalBytes
+		evidence.VerificationPairDigestExact = true
+		evidence.RequestsEmittedFromSingleParserCallback = false
+		evidence.SplitBuffersForwardedUnchanged = false
+		evidence.FirstResponseKeepsAlive = true
+	}
+	setTLSBoundaryRecordEvidence(evidence)
+	return evidence
+}
+
+func validPartialTLSBoundaryEvidence() *tlsBoundaryEvidence {
+	evidence := validTLSBoundaryEvidence("coalesced")
+	evidence.EvidencePhase = tlsBoundaryEvidencePartial
+	evidence.Passed = false
+	evidence.RequestComplete = false
+	evidence.RequestCount = 1
+	evidence.RequestHeaderBytes = evidence.RequestHeaderBytes[:1]
+	evidence.RequestBodyBytes = evidence.RequestBodyBytes[:1]
+	evidence.RequestTotalBytes = evidence.RequestTotalBytes[:1]
+	evidence.RequestHeaderDecryptedCallbackCounts = evidence.RequestHeaderDecryptedCallbackCounts[:1]
+	evidence.RequestOrder = []int{1}
+	evidence.EmissionOrder = []int{1}
+	evidence.EmissionParserCallbackOrder = []int{1}
+	evidence.ResponseOrder = []int{1}
+	evidence.ResponseConnectionClose = []bool{false}
+	evidence.DecryptedCallbackLengths = evidence.DecryptedCallbackLengths[:4]
+	evidence.ParserCallbackLengths = evidence.ParserCallbackLengths[:1]
+	evidence.DecryptedTotalBytes = evidence.RequestTotalBytes[0]
+	evidence.ParserTotalBytes = evidence.RequestTotalBytes[0]
+	evidence.ParserCallbackCount = 1
+	evidence.VerificationBufferBytes = evidence.RequestTotalBytes[0]
+	evidence.VerificationPairDigestExact = false
+	evidence.RequestBytesPreserved = false
+	evidence.ResponseForcesConnectionClose = false
+	setTLSBoundaryRecordEvidence(evidence)
+	return evidence
+}
+
+func setTLSBoundaryCallbacks(evidence *tlsBoundaryEvidence, lengths []int) {
+	evidence.DecryptedCallbackLengths = append([]int(nil), lengths...)
+	setTLSBoundaryRecordEvidence(evidence)
+}
+
+func setTLSBoundaryRecordEvidence(evidence *tlsBoundaryEvidence) {
+	lengths := evidence.DecryptedCallbackLengths
+	evidence.TLSApplicationRecordLegacyVersions = make([]int, len(lengths))
+	evidence.TLSApplicationRecordPayloadLengths = make([]int, len(lengths))
+	for index, length := range lengths {
+		evidence.TLSApplicationRecordLegacyVersions[index] = 0x0303
+		evidence.TLSApplicationRecordPayloadLengths[index] = length + 17
+	}
 }
 
 func TestSummarizeLatenciesUsesNearestRank(t *testing.T) {
@@ -1287,6 +2538,183 @@ func TestWritePipelinedRequestsWritesEveryRequestBeforeResponses(t *testing.T) {
 		assert.Equal(t, i == len(requests)-1, request.URL.Query().Get("close") == "1")
 	}
 	assert.Zero(t, reader.Buffered())
+}
+
+func TestSendSequentialRequestsReadsFirstResponseBeforeSecondWrite(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = listener.Close() })
+
+	cfg := config{
+		baseURL:        "http://" + listener.Addr().String(),
+		scenario:       "tls-boundary",
+		seed:           42,
+		expectedTLS:    "TLSv1.3",
+		requestTimeout: 2 * time.Second,
+	}
+	requests, err := makeRequests(cfg)
+	require.NoError(t, err)
+
+	serverErr := make(chan error, 1)
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			serverErr <- acceptErr
+			return
+		}
+		defer connection.Close()
+		reader := bufio.NewReader(connection)
+		for index, requestCase := range requests[1:] {
+			request, readErr := http.ReadRequest(reader)
+			if readErr != nil {
+				serverErr <- fmt.Errorf("read request %d: %w", index, readErr)
+				return
+			}
+			body, bodyErr := io.ReadAll(request.Body)
+			if bodyErr != nil {
+				serverErr <- fmt.Errorf("read request %d body: %w", index, bodyErr)
+				return
+			}
+			if request.Method != http.MethodPost || request.URL.Path != requestCase.Endpoint ||
+				request.Header.Get(tlsBoundarySequenceHeader) != strconv.Itoa(index+1) ||
+				request.Close != (index == 1) || len(body) != tlsBoundaryBodyBytes {
+				serverErr <- fmt.Errorf("unexpected sequential request %d: method=%s path=%s sequence=%s close=%t body=%d", index, request.Method, request.URL.Path, request.Header.Get(tlsBoundarySequenceHeader), request.Close, len(body))
+				return
+			}
+			if index == 0 {
+				if deadlineErr := connection.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); deadlineErr != nil {
+					serverErr <- deadlineErr
+					return
+				}
+				if _, peekErr := reader.Peek(1); peekErr == nil {
+					serverErr <- errors.New("second request arrived before the first response")
+					return
+				} else if networkErr, ok := peekErr.(net.Error); !ok || !networkErr.Timeout() {
+					serverErr <- fmt.Errorf("wait for premature second request: %w", peekErr)
+					return
+				}
+				if deadlineErr := connection.SetReadDeadline(time.Time{}); deadlineErr != nil {
+					serverErr <- deadlineErr
+					return
+				}
+			}
+
+			evidence := validTLSBoundaryEvidence("coalesced")
+			if index == 0 {
+				evidence = validPartialTLSBoundaryEvidence()
+			}
+			responseBody, marshalErr := json.Marshal(backendResponse{
+				Marker:              requestCase.Marker,
+				Secure:              true,
+				BackendKind:         "netty-tls-boundary",
+				Protocol:            "HTTP/1.1",
+				TLSProtocol:         cfg.expectedTLS,
+				TLSCipher:           "TLS_AES_128_GCM_SHA256",
+				BackendConnectionID: 7,
+				BackendRemotePort:   41000,
+				TLSBoundary:         evidence,
+			})
+			if marshalErr != nil {
+				serverErr <- marshalErr
+				return
+			}
+			response := &http.Response{
+				StatusCode:    http.StatusOK,
+				ProtoMajor:    1,
+				ProtoMinor:    1,
+				Header:        make(http.Header),
+				Body:          io.NopCloser(bytes.NewReader(responseBody)),
+				ContentLength: int64(len(responseBody)),
+				Close:         index == 1,
+			}
+			if writeErr := response.Write(connection); writeErr != nil {
+				serverErr <- fmt.Errorf("write response %d: %w", index, writeErr)
+				return
+			}
+		}
+		serverErr <- nil
+	}()
+
+	responses, latencies, _, evidence, err := sendSequentialRequests(
+		context.Background(),
+		cfg,
+		requests[1:],
+	)
+	require.NoError(t, err)
+	require.NoError(t, <-serverErr)
+	require.Len(t, responses, 2)
+	require.Len(t, latencies, 2)
+	assert.Equal(t, 1, evidence.FrontendConnections)
+	assert.Equal(t, 2, evidence.SequentialRequests)
+	assert.Equal(t, 1, evidence.ResponsesReadBeforeNextWrite)
+	assert.Zero(t, evidence.PipelinedRequests)
+	assert.Zero(t, evidence.RequestsWrittenBeforeFirstRead)
+}
+
+func TestTLSBoundaryConnectionShapeRequiresOneCoalescedBackendConnection(t *testing.T) {
+	partialEvidence := validPartialTLSBoundaryEvidence()
+	finalEvidence := validTLSBoundaryEvidence("coalesced")
+	responses := []backendResponse{
+		{
+			BackendConnectionID: 1,
+			BackendRemotePort:   41001,
+			TLSProtocol:         "TLSv1.3",
+			TLSCipher:           "TLS_AES_256_GCM_SHA384",
+			TLSBoundary:         validTLSBoundaryEvidence("split"),
+		},
+		{
+			BackendConnectionID: 2,
+			BackendRemotePort:   41001,
+			TLSProtocol:         "TLSv1.3",
+			TLSCipher:           "TLS_AES_256_GCM_SHA384",
+			TLSBoundary:         partialEvidence,
+		},
+		{
+			BackendConnectionID: 2,
+			BackendRemotePort:   41001,
+			TLSProtocol:         "TLSv1.3",
+			TLSCipher:           "TLS_AES_256_GCM_SHA384",
+			TLSBoundary:         finalEvidence,
+		},
+	}
+	evidence := &connectionEvidence{
+		FrontendConnections:          2,
+		FrontendProtocol:             "HTTP/1.1",
+		SequentialRequests:           2,
+		ResponsesReadBeforeNextWrite: 1,
+	}
+	require.NoError(t, validateConnectionShape("tls-boundary", responses, evidence))
+
+	for name, mutate := range map[string]func([]backendResponse, *connectionEvidence){
+		"frontend evidence": func(_ []backendResponse, value *connectionEvidence) {
+			value.ResponsesReadBeforeNextWrite = 0
+		},
+		"backend connection": func(value []backendResponse, _ *connectionEvidence) {
+			value[2].BackendConnectionID = 3
+		},
+		"backend remote port": func(value []backendResponse, _ *connectionEvidence) {
+			value[2].BackendRemotePort++
+		},
+		"backend TLS protocol": func(value []backendResponse, _ *connectionEvidence) {
+			value[2].TLSProtocol = "TLSv1.2"
+		},
+		"final evidence": func(value []backendResponse, _ *connectionEvidence) {
+			changed := *value[2].TLSBoundary
+			changed.Passed = false
+			value[2].TLSBoundary = &changed
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidateResponses := append([]backendResponse(nil), responses...)
+			candidateEvidence := *evidence
+			mutate(candidateResponses, &candidateEvidence)
+			assert.Error(t, validateConnectionShape(
+				"tls-boundary",
+				candidateResponses,
+				&candidateEvidence,
+			))
+		})
+	}
 }
 
 func TestFDPortReuseEvidenceRequiresBothReusedIdentities(t *testing.T) {
@@ -1372,11 +2800,17 @@ func TestConnectionShapeUsesStableBackendIdentifiers(t *testing.T) {
 	}
 
 	churn := []backendResponse{
-		{BackendConnectionID: 1, BackendRemotePort: 41000},
-		{BackendConnectionID: 2, BackendRemotePort: 41000},
+		{BackendConnectionID: 1, BackendRemotePort: 41000, BackendWorkerID: 1, ConcurrencyArrival: 1, ConcurrencyParticipants: 2, ConcurrencyMaxActive: 2, ConcurrencyRelease: 1},
+		{BackendConnectionID: 2, BackendRemotePort: 41000, BackendWorkerID: 2, ConcurrencyArrival: 2, ConcurrencyParticipants: 2, ConcurrencyMaxActive: 2, ConcurrencyRelease: 1},
 	}
 	require.NoError(t, validateConnectionShape("connection-churn", churn, nil))
-	require.NoError(t, validateConnectionShape("concurrency", churn, nil))
+	require.NoError(t, validateConnectionShape("concurrency", churn, &connectionEvidence{
+		DistinctBackendWorkers:      2,
+		DistinctConcurrencyArrivals: 2,
+		ConcurrencyParticipants:     2,
+		ConcurrencyMaxActive:        2,
+		ConcurrencyRelease:          1,
+	}))
 
 	churn[1].BackendConnectionID = 1
 	require.Error(t, validateConnectionShape("connection-churn", churn, nil))

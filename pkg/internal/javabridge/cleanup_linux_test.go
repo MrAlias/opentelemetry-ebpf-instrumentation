@@ -25,7 +25,7 @@ func TestCleanupKernelMapLayouts(t *testing.T) {
 	assert.Equal(t, uintptr(24), unsafe.Sizeof(generationClaim{}))
 	assert.Equal(t, uintptr(23), unsafe.Offsetof(generationClaim{}.Reserved)+6)
 	assert.Equal(t, uintptr(40), unsafe.Sizeof(aliasReplayKey{}))
-	assert.Equal(t, uintptr(16), unsafe.Sizeof(aliasReplayValue{}))
+	assert.Equal(t, uintptr(72), unsafe.Sizeof(aliasReplayValue{}))
 	assert.Equal(t, uint8(0x47), generationGoProducerTag)
 }
 
@@ -1599,6 +1599,41 @@ func TestCleanupInfersRetirementWhenExitMarkerIsMissing(t *testing.T) {
 	assert.Empty(t, cleanup.maps.cookieConnections.(*fakeBridgeMap).values)
 	assert.Equal(t, identity, cleanup.maps.virtualThreads.(*fakeBridgeMap).values[carrier])
 	assert.Equal(t, identity, cleanup.maps.vtIdentities.(*fakeBridgeMap).values[virtualOwner])
+}
+
+func TestCleanupRetiredAliasedGenerationConvergesWithoutCurrentIncarnation(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, key.Generation)},
+		map[Identity]any{child: activeTaskLink(owner, key.Generation)}, nil,
+	)
+	state := handler.states.(*fakeBridgeMap).values[key].(stateValue)
+	replayKey := aliasReplayKeyForState(key, state)
+	initialReplay := handler.aliasReplays.(*fakeBridgeMap).values[replayKey].(aliasReplayValue)
+	cleanup := testCleanup(handler)
+	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+	delete(cleanup.maps.incarnations.(*fakeBridgeMap).values, javaProcessIdentity(owner))
+
+	sweepSeededGenerationToCompletion(t, cleanup, key, state.ProcessIncarnation)
+	assert.NotContains(t, cleanup.maps.remoteParents.(*fakeBridgeMap).values, owner)
+	assert.NotContains(t, cleanup.maps.owners.(*fakeBridgeMap).values, owner)
+	assert.NotContains(t, cleanup.maps.states.(*fakeBridgeMap).values, key)
+	assert.NotContains(t, cleanup.maps.generations.(*fakeBridgeMap).values, key)
+	for _, value := range cleanup.maps.connections.(*fakeBridgeMap).values {
+		assert.NotEqual(t, key.Generation, value.(connectionClaim).Generation)
+	}
+	for _, value := range cleanup.maps.cookieConnections.(*fakeBridgeMap).values {
+		assert.NotEqual(t, key.Generation, value.(connectionClaim).Generation)
+	}
+	finalReplay := cleanup.maps.aliasReplays.(*fakeBridgeMap).values[replayKey].(aliasReplayValue)
+	assert.True(t, validAliasReplayFinal(finalReplay))
+	assert.Equal(t, lifecycleStale, finalReplay.Lifecycle)
+	assert.Equal(t, aliasReplayBindingOf(initialReplay), aliasReplayBindingOf(finalReplay))
+	assert.NotContains(t, cleanup.maps.claims.(*fakeBridgeMap).values, key)
+	assert.NotContains(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values, owner)
+	assert.NotContains(t, cleanup.maps.ambiguity.(*fakeBridgeMap).values, key)
 }
 
 func TestCleanupDoesNotDeleteProcessIncarnation(t *testing.T) {

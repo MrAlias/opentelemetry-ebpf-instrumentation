@@ -160,7 +160,7 @@ static u8 test_http1_boundary_and_maybe_read(u8 wire_operation,
     return test_probe_read_user(claimed, sizeof(*claimed), uarg + 1) == 0;
 }
 
-static void test_http1_start_is_the_only_new_receive_boundary(void) {
+static void test_http1_start_is_the_only_http1_receive_boundary(void) {
     unsigned char packet[1 + sizeof(connection_info_t)] = {0};
     connection_info_t claimed = {0};
 
@@ -186,6 +186,47 @@ static void test_http1_start_is_the_only_new_receive_boundary(void) {
     if (test_http1_boundary_and_maybe_read(16, 1, packet, &claimed) || begin_sequence != 0 ||
         read_sequence != 0 || observed_process_capability != 0) {
         fail("HTTP/1 RESET crossed a receive boundary or probed a payload");
+    }
+}
+
+static u8 test_telemetry_boundary_and_read(u8 registered,
+                                           const unsigned char *uarg,
+                                           connection_info_t *claimed) {
+    const enum java_remote_parent_data_operation operation =
+        java_remote_parent_decode_data_operation(17);
+    if (java_remote_parent_data_receive_action(operation) !=
+        k_java_remote_parent_receive_action_telemetry) {
+        return 0;
+    }
+    const u64 process_capability = 0x1020304050607080ULL;
+    if (!java_remote_parent_begin_receive(
+            1,
+            1,
+            registered,
+            java_remote_parent_data_starts_receive_boundary(operation),
+            process_capability)) {
+        return 0;
+    }
+    return test_probe_read_user(claimed, sizeof(*claimed), uarg + 1) == 0;
+}
+
+static void test_telemetry_receive_is_a_fail_closed_boundary(void) {
+    unsigned char packet[1 + sizeof(connection_info_t)] = {0};
+    connection_info_t expected = {.s_port = 1234, .d_port = 443};
+    connection_info_t claimed = {0};
+    memcpy(packet + 1, &expected, sizeof(expected));
+
+    reset(packet + 1, 0);
+    if (!test_telemetry_boundary_and_read(1, packet, &claimed) || begin_sequence != 1 ||
+        read_sequence != 2 || observed_process_capability != 0x1020304050607080ULL ||
+        memcmp(&claimed, &expected, sizeof(expected)) != 0) {
+        fail("telemetry receive did not detach before reading its advisory tuple");
+    }
+
+    reset(packet + 1, 0);
+    if (test_telemetry_boundary_and_read(0, packet, &claimed) || begin_sequence != 1 ||
+        read_sequence != 0 || observed_process_capability != 0x1020304050607080ULL) {
+        fail("unregistered telemetry receive did not detach before rejection");
     }
 }
 
@@ -222,6 +263,11 @@ static void test_wire_operations_decode_without_direction_aliases(void) {
          k_java_remote_parent_parser_direction_invalid,
          k_java_remote_parent_receive_action_http1_reset,
          0},
+        {17,
+         k_java_remote_parent_data_operation_telemetry_receive,
+         TCP_RECV,
+         k_java_remote_parent_receive_action_telemetry,
+         1},
         {0,
          k_java_remote_parent_data_operation_invalid,
          k_java_remote_parent_parser_direction_invalid,
@@ -240,7 +286,11 @@ static void test_wire_operations_decode_without_direction_aliases(void) {
         if (operation != cases[index].operation ||
             java_remote_parent_data_parser_direction(operation) != cases[index].direction ||
             java_remote_parent_data_receive_action(operation) != cases[index].action ||
-            java_remote_parent_data_starts_receive_boundary(operation) != cases[index].boundary) {
+            java_remote_parent_data_starts_receive_boundary(operation) != cases[index].boundary ||
+            java_remote_parent_receive_action_allows_incoming_claim(cases[index].action) !=
+                (cases[index].action != k_java_remote_parent_receive_action_http1_continue &&
+                 cases[index].action != k_java_remote_parent_receive_action_http1_reset &&
+                 cases[index].action != k_java_remote_parent_receive_action_telemetry)) {
             fail("wire operation decode conflated parser direction and receive action");
         }
     }
@@ -248,7 +298,8 @@ static void test_wire_operations_decode_without_direction_aliases(void) {
     for (unsigned int wire = 0; wire <= 0xff; wire++) {
         const enum java_remote_parent_data_operation operation =
             java_remote_parent_decode_data_operation((u8)wire);
-        const u8 known = wire == 1 || wire == 2 || wire == 14 || wire == 15 || wire == 16;
+        const u8 known =
+            wire == 1 || wire == 2 || wire == 14 || wire == 15 || wire == 16 || wire == 17;
         if ((operation != k_java_remote_parent_data_operation_invalid) != known) {
             fail("wire operation decoder accepted an unspecified operation byte");
         }
@@ -272,7 +323,7 @@ static void test_http1_prefix_validation_is_exact(void) {
         k_java_remote_parent_data_operation_http1_receive_start;
     const enum java_remote_parent_data_operation continuation =
         k_java_remote_parent_data_operation_http1_receive_continue;
-    const enum java_remote_parent_data_operation reset =
+    const enum java_remote_parent_data_operation reset_operation =
         k_java_remote_parent_data_operation_http1_receive_reset;
 
     if (!java_remote_parent_http1_prefix_valid(start, 1, 3, 2, 1) ||
@@ -299,11 +350,11 @@ static void test_http1_prefix_validation_is_exact(void) {
         fail("HTTP/1 CONTINUE prefix validation accepted a malformed fragment");
     }
 
-    if (!java_remote_parent_http1_prefix_valid(reset, 0, 0, 2, 1) ||
-        java_remote_parent_http1_prefix_valid(reset, 1, 0, 2, 1) ||
-        java_remote_parent_http1_prefix_valid(reset, 0, 3, 2, 1) ||
-        java_remote_parent_http1_prefix_valid(reset, 0, 0, 0, 1) ||
-        java_remote_parent_http1_prefix_valid(reset, 0, 0, 2, 0) ||
+    if (!java_remote_parent_http1_prefix_valid(reset_operation, 0, 0, 2, 1) ||
+        java_remote_parent_http1_prefix_valid(reset_operation, 1, 0, 2, 1) ||
+        java_remote_parent_http1_prefix_valid(reset_operation, 0, 3, 2, 1) ||
+        java_remote_parent_http1_prefix_valid(reset_operation, 0, 0, 0, 1) ||
+        java_remote_parent_http1_prefix_valid(reset_operation, 0, 0, 2, 0) ||
         java_remote_parent_http1_prefix_valid(
             k_java_remote_parent_data_operation_receive, 1, 3, 2, 1) ||
         java_remote_parent_http1_prefix_valid(
@@ -312,14 +363,162 @@ static void test_http1_prefix_validation_is_exact(void) {
     }
 }
 
+static void test_http1_wire_nonce_composes_with_prepared_cursor(void) {
+    const u64 committed_start_nonce = 0x4142434445464748ULL;
+    const u64 lifecycle_id = 0x2122232425262728ULL;
+    const u64 request_sequence = 1;
+
+    if (!java_remote_parent_http1_prefix_valid(
+            k_java_remote_parent_data_operation_http1_receive_start,
+            1,
+            committed_start_nonce,
+            lifecycle_id,
+            request_sequence) ||
+        !java_remote_parent_http1_data_signal_exact(k_java_remote_parent_receive_action_http1_start,
+                                                    committed_start_nonce,
+                                                    committed_start_nonce)) {
+        fail("HTTP/1 START wire nonce did not match its prepared cursor");
+    }
+
+    // A CONTINUE cursor retains the nonzero nonce committed by START, while
+    // the CONTINUE packet itself must carry zero. Exercise both predicates
+    // together so the two valid representations cannot reject each other.
+    if (!java_remote_parent_http1_prefix_valid(
+            k_java_remote_parent_data_operation_http1_receive_continue,
+            1,
+            0,
+            lifecycle_id,
+            request_sequence) ||
+        !java_remote_parent_http1_data_signal_exact(
+            k_java_remote_parent_receive_action_http1_continue, committed_start_nonce, 0)) {
+        fail("HTTP/1 CONTINUE wire nonce did not compose with its committed START cursor");
+    }
+
+    if (java_remote_parent_http1_data_signal_exact(k_java_remote_parent_receive_action_http1_start,
+                                                   committed_start_nonce,
+                                                   committed_start_nonce + 1) ||
+        java_remote_parent_http1_data_signal_exact(
+            k_java_remote_parent_receive_action_http1_start, 0, 0) ||
+        java_remote_parent_http1_data_signal_exact(
+            k_java_remote_parent_receive_action_http1_continue, 0, 0) ||
+        java_remote_parent_http1_data_signal_exact(
+            k_java_remote_parent_receive_action_http1_continue,
+            committed_start_nonce,
+            committed_start_nonce) ||
+        java_remote_parent_http1_data_signal_exact(
+            k_java_remote_parent_receive_action_http1_reset, committed_start_nonce, 0) ||
+        java_remote_parent_http1_data_signal_exact(
+            k_java_remote_parent_receive_action_invalid, committed_start_nonce, 0)) {
+        fail("HTTP/1 prepared cursor accepted a mismatched wire nonce");
+    }
+}
+
+static void test_telemetry_prefix_validation_is_exact(void) {
+    if (!java_remote_parent_telemetry_prefix_valid(1, 0) ||
+        !java_remote_parent_telemetry_prefix_valid(k_java_remote_parent_data_max_payload_len, 0) ||
+        java_remote_parent_telemetry_prefix_valid(0, 0) ||
+        java_remote_parent_telemetry_prefix_valid(k_java_remote_parent_data_max_payload_len + 1,
+                                                  0) ||
+        java_remote_parent_telemetry_prefix_valid(1, 1)) {
+        fail("telemetry receive prefix validation accepted an unsafe packet");
+    }
+}
+
+static void test_http1_sys_ioctl_fallback_is_telemetry_only(void) {
+    const enum java_remote_parent_data_operation start =
+        k_java_remote_parent_data_operation_http1_receive_start;
+    const enum java_remote_parent_data_operation continuation =
+        k_java_remote_parent_data_operation_http1_receive_continue;
+    const enum java_remote_parent_data_operation reset_operation =
+        k_java_remote_parent_data_operation_http1_receive_reset;
+
+    const enum java_remote_parent_data_dispatch start_fallback =
+        java_remote_parent_select_data_dispatch(start, 0, 0);
+    const enum java_remote_parent_data_dispatch continue_fallback =
+        java_remote_parent_select_data_dispatch(continuation, 0, 0);
+    const enum java_remote_parent_data_dispatch reset_fallback =
+        java_remote_parent_select_data_dispatch(reset_operation, 0, 0);
+
+    if (start_fallback != k_java_remote_parent_data_dispatch_http1_telemetry ||
+        continue_fallback != k_java_remote_parent_data_dispatch_http1_telemetry ||
+        !java_remote_parent_data_dispatch_parses_payload(start, start_fallback) ||
+        !java_remote_parent_data_dispatch_parses_payload(continuation, continue_fallback) ||
+        java_remote_parent_data_dispatch_has_bridge_authority(start_fallback) ||
+        java_remote_parent_data_dispatch_has_bridge_authority(continue_fallback) ||
+        !java_remote_parent_data_dispatch_detaches_owner(start, start_fallback, 0) ||
+        java_remote_parent_data_dispatch_detaches_owner(continuation, continue_fallback, 0) ||
+        java_remote_parent_effective_receive_action(start, start_fallback) !=
+            k_java_remote_parent_receive_action_telemetry ||
+        java_remote_parent_effective_receive_action(continuation, continue_fallback) !=
+            k_java_remote_parent_receive_action_telemetry ||
+        java_remote_parent_receive_action_allows_incoming_claim(
+            java_remote_parent_effective_receive_action(start, start_fallback)) ||
+        java_remote_parent_receive_action_allows_incoming_claim(
+            java_remote_parent_effective_receive_action(continuation, continue_fallback)) ||
+        java_remote_parent_data_payload_offset(start) !=
+            k_java_remote_parent_data_http1_payload_offset ||
+        java_remote_parent_data_payload_offset(continuation) !=
+            k_java_remote_parent_data_http1_payload_offset ||
+        !java_remote_parent_http1_prefix_valid(
+            start, 1, 0x4142434445464748ULL, 0x2122232425262728ULL, 1)) {
+        fail("hook-unavailable HTTP/1 fragments retained bridge authority or lost telemetry");
+    }
+
+    if (reset_fallback != k_java_remote_parent_data_dispatch_ignore ||
+        java_remote_parent_data_dispatch_parses_payload(reset_operation, reset_fallback) ||
+        java_remote_parent_data_dispatch_has_bridge_authority(reset_fallback)) {
+        fail("hook-unavailable HTTP/1 RESET was not a state-free no-op");
+    }
+
+    for (size_t index = 0; index < 2; index++) {
+        const u8 data_hook_ready = index == 0;
+        const u8 file_available = index != 0;
+        if (java_remote_parent_select_data_dispatch(start, data_hook_ready, file_available) !=
+                k_java_remote_parent_data_dispatch_http1_telemetry ||
+            java_remote_parent_select_data_dispatch(
+                continuation, data_hook_ready, file_available) !=
+                k_java_remote_parent_data_dispatch_http1_telemetry ||
+            java_remote_parent_select_data_dispatch(
+                reset_operation, data_hook_ready, file_available) !=
+                k_java_remote_parent_data_dispatch_ignore) {
+            fail("HTTP/1 bridge authority did not require both the hook and live file");
+        }
+    }
+
+    const enum java_remote_parent_data_dispatch bridge =
+        java_remote_parent_select_data_dispatch(start, 1, 1);
+    if (bridge != k_java_remote_parent_data_dispatch_http1_bridge ||
+        !java_remote_parent_data_dispatch_has_bridge_authority(bridge) ||
+        java_remote_parent_effective_receive_action(start, bridge) !=
+            k_java_remote_parent_receive_action_http1_start) {
+        fail("file-bearing HTTP/1 START lost bridge authority");
+    }
+
+    unsigned char packet[1 + sizeof(connection_info_t)] = {0};
+    reset(packet + 1, 0);
+    if (!java_remote_parent_begin_receive(
+            1,
+            java_remote_parent_data_dispatch_detaches_owner(start, start_fallback, 0),
+            1,
+            java_remote_parent_data_starts_receive_boundary(start),
+            0x1020304050607080ULL) ||
+        begin_sequence != 1 || observed_process_capability != 0x1020304050607080ULL) {
+        fail("hook-unavailable START did not detach the stale exact SDK owner");
+    }
+}
+
 int main(void) {
     test_rejected_receive_detaches_before_the_failed_read();
     test_unregistered_receive_detaches_without_reading_the_claim();
     test_valid_receive_detaches_before_copying_the_claim();
     test_non_receives_and_disabled_bridges_do_not_detach();
-    test_http1_start_is_the_only_new_receive_boundary();
+    test_http1_start_is_the_only_http1_receive_boundary();
+    test_telemetry_receive_is_a_fail_closed_boundary();
     test_wire_operations_decode_without_direction_aliases();
     test_wire_offsets_match_the_java_packet_abi();
     test_http1_prefix_validation_is_exact();
+    test_http1_wire_nonce_composes_with_prepared_cursor();
+    test_telemetry_prefix_validation_is_exact();
+    test_http1_sys_ioctl_fallback_is_telemetry_only();
     return 0;
 }

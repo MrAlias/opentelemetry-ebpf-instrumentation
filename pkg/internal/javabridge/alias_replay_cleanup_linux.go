@@ -24,8 +24,34 @@ type aliasReplayNoCarrierObservation struct {
 	ObservedAt time.Duration
 }
 
+type aliasReplayCleanupProof struct {
+	replayKey  aliasReplayKey
+	state      stateValue
+	binding    aliasReplayBinding
+	generation aliasReplayGenerationProof
+	finalized  bool
+	finalValue aliasReplayValue // References is canonicalized to zero.
+}
+
 func aliasReplayGenerationKey(key aliasReplayKey) stateKey {
 	return stateKey{Owner: key.Owner, Generation: key.Generation}
+}
+
+func (c *Cleanup) aliasReplayGenerationMaps() aliasReplayGenerationMaps {
+	return aliasReplayGenerationMaps{
+		remoteParents:     c.maps.remoteParents,
+		incarnations:      c.maps.incarnations,
+		connections:       c.maps.connections,
+		cookieConnections: c.maps.cookieConnections,
+		ambiguity:         c.maps.ambiguity,
+		owners:            c.maps.owners,
+		states:            c.maps.states,
+		generations:       c.maps.generations,
+		terminals:         c.maps.terminals,
+		claims:            c.maps.claims,
+		aliasReplays:      c.maps.aliasReplays,
+		ownerGuards:       c.maps.ownerGuards,
+	}
 }
 
 func aliasReplayCarrier(key aliasReplayKey) aliasReplayCarrierKey {
@@ -54,12 +80,14 @@ func validAliasReplayDesiredLifecycle(lifecycle uint8) bool {
 }
 
 func validAliasReplayActive(value aliasReplayValue) bool {
-	return value.TransitionMonotonicNS != 0 && value.Lifecycle == lifecycleActive &&
+	return validAliasReplayBinding(value) && value.TransitionMonotonicNS != 0 &&
+		value.Lifecycle == lifecycleActive &&
 		value.DesiredLifecycle == 0 && value.ProducerTag == 0 && value.Reserved == 0
 }
 
 func validAliasReplayPublishing(value aliasReplayValue) bool {
-	return value.TransitionMonotonicNS != 0 && value.Lifecycle == lifecyclePublishing &&
+	return validAliasReplayBinding(value) && value.TransitionMonotonicNS != 0 &&
+		value.Lifecycle == lifecyclePublishing &&
 		validAliasReplayDesiredLifecycle(value.DesiredLifecycle) &&
 		(value.ProducerTag == 0 || value.ProducerTag == generationGoProducerTag) &&
 		value.Reserved == 0
@@ -74,7 +102,7 @@ func validUntaggedAliasReplayPublishing(value aliasReplayValue) bool {
 }
 
 func validAliasReplayFinal(value aliasReplayValue) bool {
-	return value.TransitionMonotonicNS != 0 &&
+	return validAliasReplayBinding(value) && value.TransitionMonotonicNS != 0 &&
 		validAliasReplayDesiredLifecycle(value.Lifecycle) && value.DesiredLifecycle == 0 &&
 		value.ProducerTag == 0 && value.Reserved == 0
 }
@@ -83,7 +111,7 @@ func (c *Cleanup) recordAliasReplayCleanupKey(
 	key stateKey,
 	observedMonotonicNS uint64,
 	processIncarnation uint64,
-) {
+) bool {
 	replayKey := aliasReplayKey{
 		Owner:               key.Owner,
 		Generation:          key.Generation,
@@ -91,12 +119,129 @@ func (c *Cleanup) recordAliasReplayCleanupKey(
 		ProcessIncarnation:  processIncarnation,
 	}
 	if !validAliasReplayKey(replayKey) {
-		return
+		// Malformed roots without a usable replay identity still need to reach
+		// the ordinary aliases==0 cleanup path. Only an exact-key replacement is
+		// a conflict that must stop a sweep.
+		return true
 	}
 	if c.aliasReplayCleanupKeys == nil {
 		c.aliasReplayCleanupKeys = make(map[stateKey]aliasReplayKey)
 	}
+	if current, present := c.aliasReplayCleanupKeys[key]; present {
+		return current == replayKey
+	}
+	if proof, present := c.aliasReplayCleanupProofs[key]; present &&
+		proof.replayKey != replayKey {
+		return false
+	}
 	c.aliasReplayCleanupKeys[key] = replayKey
+	return true
+}
+
+func (c *Cleanup) recordAliasReplayCleanupProof(
+	key stateKey,
+	replayKey aliasReplayKey,
+	value aliasReplayValue,
+	state stateValue,
+	generation aliasReplayGenerationProof,
+) bool {
+	if c.aliasReplayCleanupProofs == nil {
+		c.aliasReplayCleanupProofs = make(map[stateKey]*aliasReplayCleanupProof)
+	}
+	if current, present := c.aliasReplayCleanupProofs[key]; present {
+		// A sweep may encounter the same generation through more than one root.
+		// Once its full graph has been proved under E/G, a retry must not adopt a
+		// replacement successor after any replay or payload mutation has begun.
+		return current.replayKey == replayKey && current.state == state &&
+			current.binding == aliasReplayBindingOf(value) &&
+			current.generation == generation
+	}
+	c.aliasReplayCleanupProofs[key] = &aliasReplayCleanupProof{
+		replayKey: replayKey, state: state, binding: aliasReplayBindingOf(value),
+		generation: generation,
+	}
+	return true
+}
+
+func (c *Cleanup) aliasReplayCleanupProofMatches(
+	ownership generationCleanupOwnership,
+) (bool, error) {
+	key := ownership.fence.key
+	proof, present := c.aliasReplayCleanupProofs[key]
+	if !present {
+		return true, nil
+	}
+	replayKey := proof.replayKey
+	var current aliasReplayValue
+	if err := c.maps.aliasReplays.Lookup(&replayKey, &current); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !validAliasReplayBinding(current) || aliasReplayBindingOf(current) != proof.binding {
+		return false, nil
+	}
+	if proof.finalized &&
+		(!validAliasReplayFinal(current) ||
+			!aliasReplayProofValueEqual(current, proof.finalValue)) {
+		return false, nil
+	}
+	return aliasReplayGenerationContinuityMatches(
+		c.aliasReplayGenerationMaps(), aliasReplayGenerationAuthority{
+			claimPresent: true,
+			claim:        ownership.claim,
+			guardPresent: true,
+			guard:        ownership.fence.guardClaim,
+			ambiguity:    ownership.fence.markedAt,
+		}, key, proof.state, current, &proof.generation,
+	)
+}
+
+func (c *Cleanup) markAliasReplayCleanupProofFinal(
+	key stateKey,
+	lifecycle uint8,
+) bool {
+	proof, present := c.aliasReplayCleanupProofs[key]
+	if !present || !validAliasReplayTarget(lifecycle) {
+		return false
+	}
+	replayKey := proof.replayKey
+	var current aliasReplayValue
+	if c.maps.aliasReplays.Lookup(&replayKey, &current) != nil ||
+		!validAliasReplayFinal(current) || current.Lifecycle != lifecycle ||
+		aliasReplayBindingOf(current) != proof.binding {
+		return false
+	}
+	canonical := aliasReplayProofValue(current)
+	if proof.finalized {
+		return aliasReplayProofValueEqual(canonical, proof.finalValue)
+	}
+	proof.finalized = true
+	proof.finalValue = canonical
+	return true
+}
+
+func (c *Cleanup) aliasReplayCleanupFinalProofMatches(
+	key stateKey,
+) (bool, error) {
+	proof, present := c.aliasReplayCleanupProofs[key]
+	if !present {
+		return true, nil
+	}
+	if !proof.finalized {
+		return false, nil
+	}
+	replayKey := proof.replayKey
+	var current aliasReplayValue
+	if err := c.maps.aliasReplays.Lookup(&replayKey, &current); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return validAliasReplayFinal(current) &&
+		aliasReplayProofValueEqual(current, proof.finalValue), nil
 }
 
 func (c *Cleanup) snapshotAliasReplayState() error {
@@ -150,9 +295,11 @@ func (c *Cleanup) ensureStateAliasReplayFinal(
 	state stateValue,
 ) (bool, error) {
 	replayKey := aliasReplayKeyForState(key, state)
-	c.recordAliasReplayCleanupKey(
+	if !c.recordAliasReplayCleanupKey(
 		key, state.ObservedMonotonicNS, state.ProcessIncarnation,
-	)
+	) {
+		return false, nil
+	}
 	var replay aliasReplayValue
 	if err := c.maps.aliasReplays.Lookup(&replayKey, &replay); err != nil {
 		if errors.Is(err, ebpf.ErrKeyNotExist) {
@@ -160,11 +307,35 @@ func (c *Cleanup) ensureStateAliasReplayFinal(
 		}
 		return false, fmt.Errorf("looking up exact alias replay: %w", err)
 	}
+	generationProof, bindingMatches, err := aliasReplayBindingMatchesGeneration(
+		c.aliasReplayGenerationMaps(), aliasReplayGenerationAuthority{
+			claimPresent: true,
+			claim:        ownership.claim,
+			guardPresent: true,
+			guard:        ownership.fence.guardClaim,
+			ambiguity:    ownership.fence.markedAt,
+		}, key, state, replay,
+	)
+	if err != nil {
+		return false, fmt.Errorf("validating exact alias replay binding: %w", err)
+	}
+	if !bindingMatches {
+		return false, nil
+	}
+	if !c.recordAliasReplayCleanupProof(key, replayKey, replay, state, generationProof) {
+		return false, nil
+	}
 	if state.Aliases > 0 && replay.References == 0 {
 		return false, nil
 	}
 	ready, err := c.ensureExactAliasReplayFinal(ownership, replayKey, replay)
-	return ready, err
+	if err != nil || !ready {
+		return false, err
+	}
+	if !c.markAliasReplayCleanupProofFinal(key, ownership.claim.Reserved[0]) {
+		return false, nil
+	}
+	return c.generationCleanupFenceMatches(ownership)
 }
 
 func (c *Cleanup) ensureGenerationAliasReplaysFinal(
@@ -276,6 +447,10 @@ func (c *Cleanup) aliasReplayFenceRetirementSafe(
 ) (bool, error) {
 	if !c.aliasReplaySnapshotComplete {
 		return false, nil
+	}
+	proofMatches, err := c.aliasReplayCleanupFinalProofMatches(key)
+	if err != nil || !proofMatches {
+		return false, err
 	}
 	if claim == nil {
 		entries, err := c.currentGenerationAliasReplays(key)

@@ -734,37 +734,92 @@ static __always_inline bool is_conn_unreadable(const connection_info_t *conn) {
     return is_port_unreadable(conn->d_port) || is_port_unreadable(conn->s_port);
 }
 
-static __noinline void java_remote_parent_close_socket(struct sock *sk) {
+// Keep socket field decoding and tuple normalization in a sibling frame. The
+// close root later enters deep, mutually exclusive generation-cleanup leaves;
+// retaining parser scratch in that root would consume another legacy verifier
+// stack quantum throughout those calls.
+static __noinline void java_remote_parent_prepare_close_workspace(
+    struct sock *sk, java_remote_parent_close_workspace_t *workspace, u64 invocation_id) {
+    if (!sk || !java_remote_parent_close_workspace_owned(workspace, invocation_id)) {
+        return;
+    }
+
+    workspace->socket_cookie = BPF_CORE_READ(sk, __sk_common.skc_cookie.counter);
+    workspace->connection_netns = sock_port_ns_from_sk(sk).netns;
+    workspace->connection_netns_cookie = sock_netns_cookie_from_sk(sk);
+    workspace->connection_valid = parse_sock_info(sk, &workspace->process_connection.conn);
+    if (workspace->connection_valid) {
+        sort_connection_info(&workspace->process_connection.conn);
+    }
+}
+
+static __noinline void
+java_remote_parent_close_connection(java_remote_parent_close_workspace_t *workspace,
+                                    u64 invocation_id) {
+    if (!java_remote_parent_close_workspace_owned(workspace, invocation_id) ||
+        !workspace->connection_valid) {
+        return;
+    }
+
+    workspace->process_connection.pid = pid_from_pid_tgid(invocation_id);
+    if (workspace->connection_netns_cookie) {
+        if (ssl_prewrite_connection_should_cleanup(&workspace->process_connection,
+                                                   workspace->connection_netns_cookie)) {
+            cleanup_ssl_prewrite_connection(&workspace->process_connection.conn,
+                                            workspace->connection_netns_cookie);
+        }
+        java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(
+            &workspace->process_connection.conn,
+            workspace->connection_netns_cookie,
+            workspace->socket_cookie,
+            0);
+        delete_strict_incoming_trace(&workspace->process_connection.conn,
+                                     workspace->connection_netns_cookie);
+    } else if (workspace->connection_netns) {
+        java_remote_parent_mark_connection_ambiguous_in_netns_for_socket(
+            &workspace->process_connection.conn,
+            workspace->connection_netns,
+            workspace->socket_cookie);
+    }
+}
+
+static __always_inline void java_remote_parent_close_socket(struct sock *sk) {
     if (!java_remote_parent_enabled) {
         return;
     }
 
-    connection_info_t connection = {};
-    if (!parse_sock_info(sk, &connection)) {
+    const u64 invocation_id = bpf_get_current_pid_tgid();
+    java_remote_parent_close_workspace_t *workspace =
+        java_remote_parent_close_workspace_acquire(invocation_id);
+    if (!workspace) {
         return;
     }
-    sort_connection_info(&connection);
 
-    const u64 netns_cookie = sock_netns_cookie_from_sk(sk);
-    const u64 socket_cookie = BPF_CORE_READ(sk, __sk_common.skc_cookie.counter);
-    if (netns_cookie) {
-        const pid_connection_info_t process_connection = {
-            .conn = connection,
-            .pid = pid_from_pid_tgid(bpf_get_current_pid_tgid()),
-        };
-        if (ssl_prewrite_connection_should_cleanup(&process_connection, netns_cookie)) {
-            cleanup_ssl_prewrite_connection(&connection, netns_cookie);
-        }
-        java_remote_parent_mark_connection_ambiguous_in_netns_cookie_for_socket(
-            &connection, netns_cookie, socket_cookie, 0);
-        delete_strict_incoming_trace(&connection, netns_cookie);
-    } else {
-        const u32 netns = sock_port_ns_from_sk(sk).netns;
-        if (netns) {
-            java_remote_parent_mark_connection_ambiguous_in_netns_for_socket(
-                &connection, netns, socket_cookie);
-        }
+    java_remote_parent_prepare_close_workspace(sk, workspace, invocation_id);
+
+    if (workspace->socket_cookie) {
+        // security_file_ioctl runs while ioctl's fdget-held file reference is
+        // live. With a shared files table fdget takes an RCU file reference;
+        // its lightweight borrowed form is used only when files->count == 1,
+        // where no other task can close concurrently. tcp_close is reached
+        // only by final fput -> sock_close -> __sock_release -> inet_release.
+        // Therefore this final close cannot overlap a same-file Java ioctl.
+        // It may repair a stale guard and terminally delete the exact cursor
+        // without a close-handoff marker. An absent cursor is a terminal no-op
+        // apart from stale-guard repair. This hook is attached independently
+        // from the baseline tcp_close hook, so either may run first. If the
+        // baseline hook has already completed generation cleanup, recognize
+        // either its exact TAKE terminal or exact terminal-free absence instead
+        // of recreating an orphan M+ ambiguity fence. Any partial outcome fails
+        // this proof and uses the normal ambiguity path, which is fail-closed
+        // and converges through the bounded userspace generation sweeper. The
+        // closed socket's cursor and guard are terminally drained regardless;
+        // neither is SDK generation authority.
+        java_remote_parent_close_receive_cursor(workspace, invocation_id);
     }
+
+    java_remote_parent_close_connection(workspace, invocation_id);
+    java_remote_parent_close_workspace_release(workspace, invocation_id);
 }
 
 static __noinline int
@@ -833,8 +888,19 @@ java_remote_parent_tcp_close_main(struct pt_regs *ctx, struct sock *sk, long tim
 
 SEC("kprobe/tcp_close")
 int BPF_KPROBE(obi_kprobe_tcp_close, struct sock *sk, long timeout) {
-    java_remote_parent_close_socket(sk);
     return java_remote_parent_tcp_close_main(ctx, sk, timeout);
+}
+
+// Keep Java remote-parent terminal cleanup in an independently attached
+// tcp_close program. The baseline close probe is already at the verifier's
+// 64-map reference ceiling; separate attachment preserves that bound without
+// introducing a prog-array tail-call failure mode. Both programs are exact
+// and idempotent, so their kernel-defined attachment order is immaterial.
+SEC("kprobe/tcp_close")
+int BPF_KPROBE(obi_kprobe_java_remote_parent_tcp_close, struct sock *sk) {
+    (void)ctx;
+    java_remote_parent_close_socket(sk);
+    return 0;
 }
 
 SEC("kprobe/sock_def_error_report")

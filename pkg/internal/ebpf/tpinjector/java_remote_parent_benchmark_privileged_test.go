@@ -493,11 +493,15 @@ func runPrimaryOneShotBenchmark(
 		}
 		require.NoError(t, maps.JavaRemoteParentAliasReplays.Update(
 			replayKey,
-			BpfJavaRemoteParentJavaRemoteParentAliasReplayT{
-				TransitionMonotimeNs: observed,
-				References:           uint32(len(workers)),
-				Lifecycle:            benchmarkReplayActive,
-			},
+			javaRemoteParentActiveReplay(t,
+				observed,
+				uint32(len(workers)),
+				benchmarkReplayActive,
+				negotiation.Connection,
+				negotiation.ConnectionNetns,
+				generation,
+				pair.client,
+			),
 			ebpf.UpdateNoExist,
 		))
 		for _, worker := range workers {

@@ -32,6 +32,7 @@
 #include <shared/obi_ctx.h>
 
 #include <generictracer/java_remote_parent_receive.h>
+#include <generictracer/java_remote_parent_close.h>
 #include <generictracer/java_thread_mapping.h>
 
 enum { k_ioctl_magic_id = 0x0b10b1 };
@@ -49,9 +50,12 @@ enum {
     k_ioctl_java_vt_terminate = 11,
     k_ioctl_java_task_unlink = 12,
     k_ioctl_java_tls_connection = 13,
+    k_ioctl_java_http1_receive_start = 14,
+    k_ioctl_java_http1_receive_continue = 15,
+    k_ioctl_java_http1_receive_reset = 16,
+    k_ioctl_java_telemetry_receive = 17,
 };
 
-enum { k_ioctl_invalid_op = 0xff };
 enum { k_java_control_cleanup_required = 1 };
 enum java_ioctl_operation_mask : u8 {
     k_java_ioctl_control = 1 << 0,
@@ -61,15 +65,109 @@ enum java_ioctl_operation_mask : u8 {
 // bpf/common/large_buffers.h.
 enum { k_ioctl_max_payload_len = 1 << 16 };
 
-static __always_inline u8 cmd_to_op(u8 cmd) {
-    switch (cmd) {
-    case k_ioctl_java_send:
-        return TCP_SEND;
-    case k_ioctl_java_recv:
-        return TCP_RECV;
-    default:
-        return k_ioctl_invalid_op;
+_Static_assert(k_ioctl_java_http1_receive_start ==
+                   k_java_remote_parent_data_operation_http1_receive_start,
+               "Java HTTP/1 START operation mismatch");
+_Static_assert(k_ioctl_java_http1_receive_continue ==
+                   k_java_remote_parent_data_operation_http1_receive_continue,
+               "Java HTTP/1 CONTINUE operation mismatch");
+_Static_assert(k_ioctl_java_http1_receive_reset ==
+                   k_java_remote_parent_data_operation_http1_receive_reset,
+               "Java HTTP/1 RESET operation mismatch");
+_Static_assert(k_ioctl_java_telemetry_receive ==
+                   k_java_remote_parent_data_operation_telemetry_receive,
+               "Java telemetry RECEIVE operation mismatch");
+_Static_assert(sizeof(connection_info_t) <=
+                   offsetof(java_remote_parent_receive_context_t, generation),
+               "Java advisory tuple overlaps deferred netns-cookie scratch");
+_Static_assert(sizeof(connection_info_t) <= offsetof(java_remote_parent_receive_context_t, action),
+               "Java advisory tuple overlaps deferred orig-dport scratch");
+_Static_assert(offsetof(java_remote_parent_receive_context_t, generation) + sizeof(u64) <=
+                   sizeof(java_remote_parent_receive_context_t),
+               "Java deferred netns-cookie scratch exceeds receive context");
+_Static_assert(offsetof(java_remote_parent_receive_context_t, action) + sizeof(u16) <=
+                   sizeof(java_remote_parent_receive_context_t),
+               "Java deferred orig-dport scratch exceeds receive context");
+
+static __always_inline java_remote_parent_receive_cursor_t
+java_remote_parent_cursor_from_context(const java_remote_parent_receive_context_t *context) {
+    return (java_remote_parent_receive_cursor_t){
+        .owner =
+            {
+                .tid = context->owner_tid,
+                .pid = context->owner_pid,
+                .ns = context->owner_ns,
+            },
+        .state = context->action == k_java_remote_parent_receive_action_http1_start &&
+                         context->generation == 0
+                     ? k_java_remote_parent_receive_cursor_publishing
+                     : k_java_remote_parent_receive_cursor_valid,
+        .process_incarnation = context->process_incarnation,
+        .lifecycle_id = context->lifecycle_id,
+        .request_sequence = context->request_sequence,
+        .data_signal_nonce = context->data_signal_nonce,
+        .generation = context->generation,
+    };
+}
+
+static __always_inline void
+java_remote_parent_context_from_cursor(const java_remote_parent_receive_cursor_t *cursor,
+                                       enum java_remote_parent_receive_action action,
+                                       java_remote_parent_receive_context_t *context) {
+    *context = (java_remote_parent_receive_context_t){
+        .owner_tid = cursor->owner.tid,
+        .owner_pid = cursor->owner.pid,
+        .owner_ns = cursor->owner.ns,
+        .process_incarnation = cursor->process_incarnation,
+        .lifecycle_id = cursor->lifecycle_id,
+        .request_sequence = cursor->request_sequence,
+        .data_signal_nonce = cursor->data_signal_nonce,
+        .generation = cursor->generation,
+        .action = action,
+    };
+}
+
+static __always_inline u8
+java_remote_parent_receive_context_exact(const java_remote_parent_receive_context_t *context,
+                                         enum java_remote_parent_receive_action action,
+                                         u64 socket_cookie) {
+    if (!context || context->action != action || context->reserved ||
+        __builtin_memcmp(context->reserved2,
+                         (unsigned char[sizeof(context->reserved2)]){0},
+                         sizeof(context->reserved2)) != 0) {
+        return 0;
     }
+    const java_remote_parent_receive_cursor_t expected =
+        java_remote_parent_cursor_from_context(context);
+    if (bpf_map_lookup_elem(&jrp_recv_guard, &socket_cookie)) {
+        return 0;
+    }
+    const java_remote_parent_receive_cursor_t *stored =
+        bpf_map_lookup_elem(&jrp_recv_cur, &socket_cookie);
+    u8 exact = 0;
+    if (action == k_java_remote_parent_receive_action_http1_start) {
+        // This is the only path allowed to treat PUBLISHING as authority: the
+        // exact identity and nonce carried synchronously by START's own
+        // tail-call chain. Independent START/CONTINUE/RESET lookups use VALID
+        // predicates and reject this generation-zero state.
+        exact = java_remote_parent_receive_cursor_exact_publishing(stored, &expected);
+    } else {
+        exact = action == k_java_remote_parent_receive_action_http1_continue &&
+                java_remote_parent_receive_cursor_is_valid(&expected) &&
+                java_remote_parent_receive_cursor_equal(stored, &expected);
+    }
+    return exact && !bpf_map_lookup_elem(&jrp_recv_guard, &socket_cookie);
+}
+
+static __noinline u8
+java_remote_parent_ack_receive_generation(const java_remote_parent_receive_cursor_t *pending,
+                                          const connection_info_t *connection,
+                                          u32 connection_netns,
+                                          u64 socket_cookie,
+                                          u64 generation) {
+    (void)connection;
+    (void)connection_netns;
+    return java_remote_parent_receive_cursor_ack_generation(socket_cookie, pending, generation);
 }
 
 static __always_inline u8 java_connection_from_file(struct file *file,
@@ -109,27 +207,281 @@ static __always_inline u8 java_connection_from_file(struct file *file,
     return *netns != 0;
 }
 
-// Keep the payload path in a sibling BPF function so the receive-boundary
-// cleanup does not share its large stack frame. The boundary and registration
-// gate run in handle_java_ioctl before this function performs the first tuple
-// read.
-static __noinline int
-handle_java_data_ioctl(struct pt_regs *ctx, struct file *file, u64 id, unsigned char *uarg, u8 op) {
-    connection_info_t claimed = {0};
-    if (bpf_probe_read_user(&claimed, sizeof(claimed), uarg + 1) != 0) {
+// Phase A prepares every socket-authoritative HTTP/1 cursor transition in the
+// existing per-CPU scratch slots, but never performs generation detachment.
+// The security-file hook invokes the exact fence only after this frame has
+// returned, then phase C consumes the recorded transition.
+static __noinline u8
+handle_java_http1_bridge_prepare(struct file *file,
+                                 u64 process_capability,
+                                 unsigned char *uarg,
+                                 enum java_remote_parent_data_operation operation) {
+    const enum java_remote_parent_receive_action action =
+        java_remote_parent_data_receive_action(operation);
+    if (!file || (action != k_java_remote_parent_receive_action_http1_start &&
+                  action != k_java_remote_parent_receive_action_http1_continue &&
+                  action != k_java_remote_parent_receive_action_http1_reset)) {
+        return k_java_remote_parent_receive_ioctl_transition_invalid;
+    }
+
+    java_remote_parent_state_t *cursor_scratch = java_remote_parent_stage_state_mem();
+    java_remote_parent_incoming_t *context_scratch = java_remote_parent_incoming_snapshot_mem();
+    connection_info_t *connection = java_remote_parent_connection_snapshot_mem();
+    if (!cursor_scratch || !context_scratch || !connection) {
+        return k_java_remote_parent_receive_ioctl_transition_invalid;
+    }
+    java_remote_parent_receive_ioctl_workspace_t *workspace =
+        (java_remote_parent_receive_ioctl_workspace_t *)cursor_scratch;
+    java_remote_parent_receive_context_t *context =
+        (java_remote_parent_receive_context_t *)context_scratch;
+    __builtin_memset(workspace, 0, sizeof(*workspace));
+    __builtin_memset(context, 0, sizeof(*context));
+    __builtin_memset(connection, 0, sizeof(*connection));
+
+    // Reuse the not-yet-published context as short-lived preflight storage.
+    // It is cleared before any receive context becomes visible to phase C.
+    connection_info_t *claimed = (connection_info_t *)context;
+    if (bpf_probe_read_user(
+            claimed, sizeof(*claimed), uarg + k_java_remote_parent_data_connection_offset) != 0) {
+        return k_java_remote_parent_receive_ioctl_transition_invalid;
+    }
+    // Keep helper outputs beyond the 36-byte advisory tuple. In particular,
+    // context->reserved is inside connection_info_t's source-address bytes.
+    u16 *orig_dport = (u16 *)&context->action;
+    u64 *connection_netns_cookie = &context->generation;
+    if (!java_connection_from_file(file,
+                                   TCP_RECV,
+                                   connection,
+                                   orig_dport,
+                                   &workspace->connection_netns,
+                                   connection_netns_cookie,
+                                   &workspace->socket_cookie) ||
+        (!is_empty_connection_info(claimed) &&
+         __builtin_memcmp(claimed, connection, sizeof(*claimed)) != 0)) {
+        return k_java_remote_parent_receive_ioctl_transition_invalid;
+    }
+    sort_connection_info(connection);
+
+    u32 len = 0;
+    u64 data_signal_nonce = 0;
+    u64 lifecycle_id = 0;
+    u64 request_sequence = 0;
+    if (bpf_probe_read_user(&len, sizeof(len), uarg + k_java_remote_parent_data_length_offset) !=
+            0 ||
+        bpf_probe_read_user(&data_signal_nonce,
+                            sizeof(data_signal_nonce),
+                            uarg + k_java_remote_parent_data_signal_offset) != 0 ||
+        bpf_probe_read_user(&lifecycle_id,
+                            sizeof(lifecycle_id),
+                            uarg + k_java_remote_parent_data_http1_lifecycle_offset) != 0 ||
+        bpf_probe_read_user(&request_sequence,
+                            sizeof(request_sequence),
+                            uarg + k_java_remote_parent_data_http1_request_sequence_offset) != 0) {
+        return k_java_remote_parent_receive_ioctl_transition_invalid;
+    }
+
+    pid_key_t task = {0};
+    task_tid(&task);
+    const u64 process_incarnation = java_process_incarnation_for(&task);
+    const pid_key_t process = java_process_key(&task);
+    if (!workspace->connection_netns || !workspace->socket_cookie ||
+        process_incarnation != process_capability) {
+        return k_java_remote_parent_receive_ioctl_transition_invalid;
+    }
+    java_remote_parent_receive_ioctl_fence_context_init(context, *connection_netns_cookie);
+
+    const u8 prefix_valid = java_remote_parent_http1_prefix_valid(
+        operation, len, data_signal_nonce, lifecycle_id, request_sequence);
+    if (!prefix_valid || action == k_java_remote_parent_receive_action_http1_reset) {
+        // Malformed CONTINUE/RESET and normal RESET share the same deferred
+        // terminal transition. This removes the old cleanup_identity -> full
+        // fence edge from beneath the large payload frame.
+        if (action == k_java_remote_parent_receive_action_http1_start || !lifecycle_id ||
+            !request_sequence ||
+            !java_remote_parent_receive_cursor_reset(workspace->socket_cookie,
+                                                     &process,
+                                                     process_incarnation,
+                                                     lifecycle_id,
+                                                     request_sequence,
+                                                     &workspace->cursor)) {
+            return k_java_remote_parent_receive_ioctl_transition_invalid;
+        }
+        const enum java_remote_parent_receive_guard_result guard =
+            java_remote_parent_receive_cursor_guard_acquire(workspace->socket_cookie,
+                                                            &workspace->cursor);
+        if (guard == k_java_remote_parent_receive_guard_busy) {
+            return k_java_remote_parent_receive_ioctl_transition_invalid;
+        }
+        workspace->guard = guard;
+        if (guard == k_java_remote_parent_receive_guard_acquired) {
+            workspace->transition = k_java_remote_parent_receive_ioctl_transition_fence_retire;
+        } else {
+            // ERROR still fences the exact observed generation but has no
+            // cursor-mutation authority in phase C. fence_abort targets the
+            // predecessor slot by construction.
+            workspace->predecessor = workspace->cursor;
+            workspace->transition = k_java_remote_parent_receive_ioctl_transition_fence_abort;
+        }
+        return workspace->transition;
+    }
+
+    if (action == k_java_remote_parent_receive_action_http1_continue) {
+        if (!java_remote_parent_receive_cursor_continue(workspace->socket_cookie,
+                                                        &process,
+                                                        process_incarnation,
+                                                        lifecycle_id,
+                                                        request_sequence,
+                                                        &workspace->cursor) ||
+            !workspace->cursor.generation) {
+            return k_java_remote_parent_receive_ioctl_transition_invalid;
+        }
+        java_remote_parent_context_from_cursor(&workspace->cursor, action, context);
+        workspace->transition = k_java_remote_parent_receive_ioctl_transition_ready;
+        return workspace->transition;
+    }
+
+    const pid_key_t owner = java_remote_parent_current_owner();
+    workspace->cursor = java_remote_parent_receive_cursor_publishing_identity(
+        &owner, process_incarnation, lifecycle_id, request_sequence, data_signal_nonce);
+    if (!java_remote_parent_receive_cursor_snapshot_state(workspace->socket_cookie,
+                                                          &workspace->predecessor)) {
+        if (!java_remote_parent_receive_cursor_publish(workspace->socket_cookie,
+                                                       &workspace->cursor)) {
+            return k_java_remote_parent_receive_ioctl_transition_invalid;
+        }
+        java_remote_parent_publish_data_signal(data_signal_nonce);
+        java_remote_parent_context_from_cursor(&workspace->cursor, action, context);
+        workspace->transition = k_java_remote_parent_receive_ioctl_transition_ready;
+        return workspace->transition;
+    }
+    if (!java_remote_parent_receive_cursor_is_valid(&workspace->predecessor)) {
+        return k_java_remote_parent_receive_ioctl_transition_invalid;
+    }
+    const enum java_remote_parent_receive_guard_result guard =
+        java_remote_parent_receive_cursor_guard_acquire(workspace->socket_cookie,
+                                                        &workspace->predecessor);
+    if (guard == k_java_remote_parent_receive_guard_busy) {
+        return k_java_remote_parent_receive_ioctl_transition_invalid;
+    }
+    workspace->guard = guard;
+    workspace->transition = guard == k_java_remote_parent_receive_guard_acquired
+                                ? k_java_remote_parent_receive_ioctl_transition_fence_replace
+                                : k_java_remote_parent_receive_ioctl_transition_fence_abort;
+    return workspace->transition;
+}
+
+static __noinline u8 java_remote_parent_prepared_receive_exact(
+    const java_remote_parent_receive_ioctl_workspace_t *workspace,
+    const java_remote_parent_receive_context_t *context,
+    const connection_info_t *prepared_connection,
+    const connection_info_t *current_connection) {
+    if (!workspace || !context || !prepared_connection || !current_connection ||
+        !java_remote_parent_receive_ioctl_ready_context_exact(workspace, context) ||
+        __builtin_memcmp(prepared_connection, current_connection, sizeof(*prepared_connection)) !=
+            0 ||
+        bpf_map_lookup_elem(&jrp_recv_guard, &workspace->socket_cookie)) {
+        return 0;
+    }
+    const java_remote_parent_receive_cursor_t *stored =
+        bpf_map_lookup_elem(&jrp_recv_cur, &workspace->socket_cookie);
+    return java_remote_parent_receive_cursor_equal(stored, &workspace->cursor) &&
+           !bpf_map_lookup_elem(&jrp_recv_guard, &workspace->socket_cookie);
+}
+
+// Keep the receive-boundary detach in a small sibling that returns before the
+// large payload frame is entered. This preserves detach-before-registration-
+// return and detach-before-advisory-read without nesting the 200-byte owner
+// cleanup frame under handle_java_data_ioctl.
+static __noinline u64 handle_java_data_authority(u8 *registered) {
+    pid_key_t task = {0};
+    task_tid(&task);
+    const u64 process_capability = java_process_capability_for(&task);
+    if (!process_capability) {
+        return 0;
+    }
+    *registered = java_process_incarnation_for(&task) == process_capability;
+    return process_capability;
+}
+
+static __noinline u64 handle_java_data_gate(struct file *file,
+                                            enum java_remote_parent_data_operation operation) {
+    const u8 data_hook_ready =
+        java_remote_parent_enabled && java_remote_parent_data_hook_is_ready();
+    const enum java_remote_parent_data_dispatch dispatch =
+        java_remote_parent_select_data_dispatch(operation, data_hook_ready, file != NULL);
+    if (dispatch == k_java_remote_parent_data_dispatch_invalid ||
+        dispatch == k_java_remote_parent_data_dispatch_ignore) {
         return 0;
     }
 
-    bpf_dbg_printk("op=%d", op);
+    // Finish the stack-backed task/capability lookup before entering the deep
+    // receive-boundary detach. Only its scalar result remains live here.
+    u8 registered = 0;
+    const u64 process_capability = handle_java_data_authority(&registered);
+    if (!process_capability) {
+        return 0;
+    }
+    const u8 boundary_hook_ready =
+        java_remote_parent_data_dispatch_detaches_owner(operation, dispatch, data_hook_ready);
+    return java_remote_parent_begin_receive(
+               java_remote_parent_enabled,
+               boundary_hook_ready,
+               registered,
+               java_remote_parent_data_starts_receive_boundary(operation),
+               process_capability)
+               ? process_capability
+               : 0;
+}
+
+// Keep the payload path in a separate sibling so its connection and cursor
+// locals never overlap the receive-boundary cleanup frame.
+static __noinline int handle_java_data_ioctl(struct pt_regs *ctx,
+                                             struct file *file,
+                                             u64 process_capability,
+                                             unsigned char *uarg,
+                                             enum java_remote_parent_data_operation operation) {
+    const u8 data_hook_ready =
+        java_remote_parent_enabled && java_remote_parent_data_hook_is_ready();
+    const enum java_remote_parent_data_dispatch dispatch =
+        java_remote_parent_select_data_dispatch(operation, data_hook_ready, file != NULL);
+    const enum java_remote_parent_receive_action wire_receive_action =
+        java_remote_parent_data_receive_action(operation);
+    const enum java_remote_parent_receive_action receive_action =
+        java_remote_parent_effective_receive_action(operation, dispatch);
+    const u8 parser_direction = java_remote_parent_data_parser_direction(operation);
+    const u8 http1_receive =
+        wire_receive_action == k_java_remote_parent_receive_action_http1_start ||
+        wire_receive_action == k_java_remote_parent_receive_action_http1_continue ||
+        wire_receive_action == k_java_remote_parent_receive_action_http1_reset;
+    const u8 bridge_http1_receive = java_remote_parent_data_dispatch_has_bridge_authority(dispatch);
+    const u8 wire_telemetry_receive =
+        wire_receive_action == k_java_remote_parent_receive_action_telemetry;
+    const u8 telemetry_receive = receive_action == k_java_remote_parent_receive_action_telemetry;
+    if (dispatch == k_java_remote_parent_data_dispatch_invalid ||
+        dispatch == k_java_remote_parent_data_dispatch_ignore ||
+        receive_action == k_java_remote_parent_receive_action_invalid ||
+        (parser_direction == k_java_remote_parent_parser_direction_invalid &&
+         wire_receive_action != k_java_remote_parent_receive_action_http1_reset)) {
+        return 0;
+    }
+
+    connection_info_t claimed = {0};
+    if (bpf_probe_read_user(
+            &claimed, sizeof(claimed), uarg + k_java_remote_parent_data_connection_offset) != 0) {
+        return 0;
+    }
+
+    bpf_dbg_printk("op=%d", operation);
 
     pid_connection_info_t p_conn = {0};
     u16 orig_dport = 0;
     u32 connection_netns = 0;
     u64 connection_netns_cookie = 0;
     u64 socket_cookie = 0;
+    const u64 id = bpf_get_current_pid_tgid();
     if (file) {
         if (!java_connection_from_file(file,
-                                       op,
+                                       http1_receive ? TCP_RECV : parser_direction,
                                        &p_conn.conn,
                                        &orig_dport,
                                        &connection_netns,
@@ -148,11 +500,14 @@ handle_java_data_ioctl(struct pt_regs *ctx, struct file *file, u64 id, unsigned 
         sort_connection_info(&p_conn.conn);
         p_conn.pid = pid_from_pid_tgid(id);
     } else {
+        if (bridge_http1_receive) {
+            return 0;
+        }
         p_conn.conn = claimed;
         // The fallback preserves Java TLS telemetry when the file-bearing
         // hook is unavailable, but its user-claimed tuple is never eligible
         // to stage remote-parent bridge state.
-        orig_dport = op == TCP_RECV ? p_conn.conn.s_port : p_conn.conn.d_port;
+        orig_dport = parser_direction == TCP_RECV ? p_conn.conn.s_port : p_conn.conn.d_port;
         sort_connection_info(&p_conn.conn);
         p_conn.pid = pid_from_pid_tgid(id);
 
@@ -167,19 +522,40 @@ handle_java_data_ioctl(struct pt_regs *ctx, struct file *file, u64 id, unsigned 
     d_print_http_connection_info(&p_conn.conn);
 
     u32 len = 0;
-    if (bpf_probe_read_user(&len, sizeof(len), uarg + 1 + sizeof(connection_info_t)) != 0) {
+    if (bpf_probe_read_user(&len, sizeof(len), uarg + k_java_remote_parent_data_length_offset) !=
+        0) {
         return 0;
     }
     u64 data_signal_nonce = 0;
     if (bpf_probe_read_user(&data_signal_nonce,
                             sizeof(data_signal_nonce),
-                            uarg + 1 + sizeof(connection_info_t) + sizeof(len)) != 0 ||
-        (connection_netns && !data_signal_nonce)) {
+                            uarg + k_java_remote_parent_data_signal_offset) != 0) {
         return 0;
     }
-    if (java_remote_parent_enabled && java_remote_parent_data_hook_is_ready() && connection_netns &&
-        op == TCP_RECV) {
-        java_remote_parent_publish_data_signal(data_signal_nonce);
+
+    u64 lifecycle_id = 0;
+    u64 request_sequence = 0;
+    if (http1_receive) {
+        if (bpf_probe_read_user(&lifecycle_id,
+                                sizeof(lifecycle_id),
+                                uarg + k_java_remote_parent_data_http1_lifecycle_offset) != 0 ||
+            bpf_probe_read_user(&request_sequence,
+                                sizeof(request_sequence),
+                                uarg + k_java_remote_parent_data_http1_request_sequence_offset) !=
+                0) {
+            return 0;
+        }
+        if (!java_remote_parent_http1_prefix_valid(
+                operation, len, data_signal_nonce, lifecycle_id, request_sequence)) {
+            return 0;
+        }
+    }
+    if (wire_telemetry_receive &&
+        !java_remote_parent_telemetry_prefix_valid(len, data_signal_nonce)) {
+        return 0;
+    }
+    if (!http1_receive && !wire_telemetry_receive && connection_netns && !data_signal_nonce) {
+        return 0;
     }
 
     // Bound the parser-visible payload length before we touch the payload
@@ -189,9 +565,48 @@ handle_java_data_ioctl(struct pt_regs *ctx, struct file *file, u64 id, unsigned 
 
     bpf_dbg_printk("payload len=%d", max_len);
 
+    // These identities previously consumed 176 bytes in an already-large
+    // ioctl frame. Reuse two lifecycle scratch slots only until the parser
+    // tail call: the HTTP path copies receive_context into protocol_args before
+    // it reuses either slot for incoming staging.
+    java_remote_parent_state_t *cursor_scratch = java_remote_parent_stage_state_mem();
+    java_remote_parent_incoming_t *context_scratch = java_remote_parent_incoming_snapshot_mem();
+    connection_info_t *prepared_connection =
+        bridge_http1_receive ? java_remote_parent_connection_snapshot_mem() : NULL;
+    if (!cursor_scratch || !context_scratch || (bridge_http1_receive && !prepared_connection)) {
+        return 0;
+    }
+    java_remote_parent_receive_ioctl_workspace_t *receive_workspace =
+        (java_remote_parent_receive_ioctl_workspace_t *)cursor_scratch;
+    java_remote_parent_receive_context_t *receive_context =
+        (java_remote_parent_receive_context_t *)context_scratch;
+    if (bridge_http1_receive) {
+        if (wire_receive_action == k_java_remote_parent_receive_action_http1_reset ||
+            receive_context->action != wire_receive_action ||
+            receive_context->lifecycle_id != lifecycle_id ||
+            receive_context->request_sequence != request_sequence ||
+            !java_remote_parent_http1_data_signal_exact(
+                wire_receive_action, receive_context->data_signal_nonce, data_signal_nonce) ||
+            receive_context->process_incarnation != process_capability ||
+            receive_workspace->socket_cookie != socket_cookie ||
+            receive_workspace->connection_netns != connection_netns ||
+            !java_remote_parent_prepared_receive_exact(
+                receive_workspace, receive_context, prepared_connection, &p_conn.conn)) {
+            return 0;
+        }
+    } else {
+        __builtin_memset(receive_workspace, 0, sizeof(*receive_workspace));
+        __builtin_memset(receive_context, 0, sizeof(*receive_context));
+        if (telemetry_receive) {
+            receive_context->action = receive_action;
+        } else if (java_remote_parent_enabled && java_remote_parent_data_hook_is_ready() &&
+                   connection_netns && parser_direction == TCP_RECV) {
+            java_remote_parent_publish_data_signal(data_signal_nonce);
+        }
+    }
+
     if (max_len > 0) {
-        unsigned char *buf =
-            uarg + 1 + sizeof(connection_info_t) + sizeof(u32) + sizeof(data_signal_nonce);
+        unsigned char *buf = uarg + java_remote_parent_data_payload_offset(operation);
         // This path consumes one flat user pointer supplied from Java. The
         // security boundary here is "user memory vs. non-user memory", not
         // full range validation. We therefore verify that the claimed payload
@@ -200,26 +615,32 @@ handle_java_data_ioctl(struct pt_regs *ctx, struct file *file, u64 id, unsigned 
         // unchanged.
         unsigned char first = 0;
         if (bpf_probe_read_user(&first, sizeof(first), buf) != 0) {
-            return 0;
+            goto cleanup_http1_receive;
         }
         unsigned char last = 0;
         if (bpf_probe_read_user(&last, sizeof(last), buf + max_len - 1) != 0) {
-            return 0;
+            goto cleanup_http1_receive;
         }
 
         const u64 zero = 0;
         bpf_map_update_elem(&active_ssl_connections, &p_conn, &zero, BPF_NOEXIST);
-        handle_java_buf_with_connection(ctx,
-                                        &p_conn,
-                                        buf,
-                                        max_len,
-                                        op,
-                                        orig_dport,
-                                        connection_netns,
-                                        connection_netns_cookie,
-                                        socket_cookie);
+        handle_java_buf_with_connection(
+            ctx,
+            &p_conn,
+            buf,
+            max_len,
+            parser_direction,
+            orig_dport,
+            connection_netns,
+            connection_netns_cookie,
+            socket_cookie,
+            (bridge_http1_receive || telemetry_receive) ? receive_context : NULL);
     }
 
+cleanup_http1_receive:
+    // A successful tail call does not return. The shallow outer phase owns
+    // cleanup for every normal return, including preflight reread failures,
+    // so this large payload frame has no generation-fence call edge.
     return 0;
 }
 
@@ -453,11 +874,12 @@ static __noinline int handle_java_unregistered_control_ioctl(
     return 0;
 }
 
-static __noinline int handle_java_tls_connection_ioctl(struct file *file,
-                                                       unsigned char *uarg,
-                                                       const pid_key_t *task,
-                                                       u64 process_capability) {
-    if (!java_remote_parent_enabled || java_process_incarnation_for(task) != process_capability) {
+static __noinline int handle_java_tls_connection_ioctl(struct file *file, unsigned char *uarg) {
+    pid_key_t task = {0};
+    task_tid(&task);
+    const u64 process_capability = java_process_capability_for(&task);
+    if (!java_remote_parent_enabled || !process_capability ||
+        java_process_incarnation_for(&task) != process_capability) {
         return 0;
     }
 
@@ -587,30 +1009,132 @@ static __noinline int handle_java_control_ioctl(unsigned char *uarg,
     }
 }
 
-static __always_inline int handle_java_data_operation_ioctl(struct pt_regs *ctx,
-                                                            struct file *file,
-                                                            u64 id,
-                                                            unsigned char *uarg,
-                                                            u8 op_cmd,
-                                                            u8 op,
-                                                            const pid_key_t *task,
-                                                            u64 process_capability) {
-    const u8 registered = java_process_incarnation_for(task) == process_capability;
-    if (op != k_ioctl_invalid_op) {
-        if (!java_remote_parent_begin_receive(java_remote_parent_enabled,
-                                              java_remote_parent_enabled &&
-                                                  java_remote_parent_data_hook_is_ready(),
-                                              registered,
-                                              op == TCP_RECV,
-                                              process_capability)) {
+static __always_inline int
+handle_java_data_operation_ioctl(struct pt_regs *ctx,
+                                 struct file *file,
+                                 unsigned char *uarg,
+                                 enum java_remote_parent_data_operation operation) {
+    if (operation != k_java_remote_parent_data_operation_invalid) {
+        const u64 process_capability = handle_java_data_gate(file, operation);
+        if (!process_capability) {
             return 0;
         }
-        return handle_java_data_ioctl(ctx, file, id, uarg, op);
+        const u8 data_hook_ready =
+            java_remote_parent_enabled && java_remote_parent_data_hook_is_ready();
+        const enum java_remote_parent_data_dispatch dispatch =
+            java_remote_parent_select_data_dispatch(operation, data_hook_ready, file != NULL);
+        if (!java_remote_parent_data_dispatch_has_bridge_authority(dispatch)) {
+            return handle_java_data_ioctl(ctx, file, process_capability, uarg, operation);
+        }
+
+        const u8 transition =
+            handle_java_http1_bridge_prepare(file, process_capability, uarg, operation);
+        if (!java_remote_parent_receive_ioctl_transition_known(transition)) {
+            return 0;
+        }
+        if (java_remote_parent_receive_ioctl_transition_needs_fence(transition)) {
+            java_remote_parent_state_t *cursor_scratch = java_remote_parent_stage_state_mem();
+            java_remote_parent_receive_ioctl_workspace_t *workspace =
+                (java_remote_parent_receive_ioctl_workspace_t *)cursor_scratch;
+            java_remote_parent_receive_cursor_t *fence_cursor =
+                java_remote_parent_receive_ioctl_fence_cursor(workspace);
+            if (!workspace || !fence_cursor || workspace->transition != transition ||
+                !workspace->socket_cookie || !workspace->connection_netns ||
+                !java_remote_parent_receive_ioctl_fence_authorized(workspace)) {
+                return 0;
+            }
+
+            java_remote_parent_incoming_t *fence_context_scratch =
+                java_remote_parent_incoming_snapshot_mem();
+            const u64 connection_netns_cookie =
+                java_remote_parent_receive_ioctl_fence_context_cookie(
+                    (java_remote_parent_receive_context_t *)fence_context_scratch);
+            connection_info_t *prepared_connection = java_remote_parent_connection_snapshot_mem();
+            if (!connection_netns_cookie || !prepared_connection ||
+                is_empty_connection_info(prepared_connection)) {
+                return 0;
+            }
+
+            // The gate may already have completed exact terminal-free cleanup
+            // or observed a strict completed TAKE. Recognize those final forms
+            // without recreating M for a generation that no longer exists.
+            java_remote_parent_cleanup_receive_cursor_signal(fence_cursor);
+            u8 generation_fenced =
+                java_remote_parent_receive_generation_already_fenced(fence_cursor,
+                                                                     prepared_connection,
+                                                                     workspace->connection_netns,
+                                                                     connection_netns_cookie,
+                                                                     workspace->socket_cookie);
+            if (!generation_fenced) {
+                const java_remote_parent_key_t generation_key =
+                    java_remote_parent_state_key(&fence_cursor->owner, fence_cursor->generation);
+                // Zero-alias generations are the normal sequential HTTP/1
+                // case. Remove O/F/S/I/C before publishing the next cursor so
+                // no BPF_NOEXIST key can reject its STAGE transaction.
+                generation_fenced = java_remote_parent_cleanup_exact_receive_zero_alias(
+                    &generation_key,
+                    fence_cursor->process_incarnation,
+                    prepared_connection,
+                    workspace->connection_netns,
+                    workspace->socket_cookie);
+                if (!generation_fenced) {
+                    // A preserved async/task alias keeps S/I and clean M0, but
+                    // must detach O/F/C so both the old exact alias and the
+                    // immediate next socket generation remain usable.
+                    generation_fenced = java_remote_parent_detach_exact_receive_aliased(
+                        &generation_key,
+                        fence_cursor->process_incarnation,
+                        prepared_connection,
+                        workspace->connection_netns,
+                        workspace->socket_cookie);
+                }
+            }
+            // Any partial or destructive-fault form lands here. A nonzero
+            // exact marker revokes SDK authority while close/userspace
+            // convergence handles the retained graph.
+            if (!generation_fenced) {
+                generation_fenced = java_remote_parent_fence_receive_cursor_ambiguous(
+                    fence_cursor, fence_cursor->generation);
+            }
+            if (!generation_fenced && fence_cursor->generation) {
+                generation_fenced = java_remote_parent_fence_receive_cursor_ambiguous(
+                    fence_cursor, fence_cursor->generation);
+            }
+            if (!java_remote_parent_complete_receive_ioctl_transition(workspace,
+                                                                      generation_fenced)) {
+                return 0;
+            }
+            java_remote_parent_incoming_t *context_scratch =
+                java_remote_parent_incoming_snapshot_mem();
+            java_remote_parent_receive_context_t *receive_context =
+                (java_remote_parent_receive_context_t *)context_scratch;
+            if (!receive_context) {
+                java_remote_parent_cleanup_receive_cursor(
+                    &workspace->cursor, workspace->socket_cookie, workspace->cursor.generation);
+                return 0;
+            }
+            java_remote_parent_context_from_cursor(&workspace->cursor,
+                                                   k_java_remote_parent_receive_action_http1_start,
+                                                   receive_context);
+        }
+        const int result = handle_java_data_ioctl(ctx, file, process_capability, uarg, operation);
+        // Tail-call success never returns. Any normal return means preflight
+        // changed, the user payload became unreadable, or no parser accepted
+        // it. Re-fetch the exact prepared transition and retire only that
+        // cursor through the shallow M+ cleanup path.
+        java_remote_parent_state_t *cursor_scratch = java_remote_parent_stage_state_mem();
+        java_remote_parent_receive_ioctl_workspace_t *workspace =
+            (java_remote_parent_receive_ioctl_workspace_t *)cursor_scratch;
+        if (workspace &&
+            workspace->transition == k_java_remote_parent_receive_ioctl_transition_ready &&
+            workspace->socket_cookie && workspace->connection_netns && !workspace->reserved[0] &&
+            !workspace->reserved[1]) {
+            java_remote_parent_cleanup_receive_cursor(
+                &workspace->cursor, workspace->socket_cookie, workspace->cursor.generation);
+        }
+        return result;
     }
-    if (op_cmd == k_ioctl_java_tls_connection) {
-        return handle_java_tls_connection_ioctl(file, uarg, task, process_capability);
-    }
-    return 0;
+    return handle_java_tls_connection_ioctl(file, uarg);
 }
 
 static __always_inline int handle_java_ioctl(struct pt_regs *ctx,
@@ -618,32 +1142,31 @@ static __always_inline int handle_java_ioctl(struct pt_regs *ctx,
                                              u64 id,
                                              unsigned char *uarg,
                                              enum java_ioctl_operation_mask operation_mask) {
+    u8 op_cmd = 0;
+    if (bpf_probe_read_user(&op_cmd, sizeof(op_cmd), uarg) != 0) {
+        return 0;
+    }
+    const enum java_remote_parent_data_operation operation =
+        java_remote_parent_decode_data_operation(op_cmd);
+    const u8 data_operation = operation != k_java_remote_parent_data_operation_invalid ||
+                              op_cmd == k_ioctl_java_tls_connection;
+    // Keep the file-bearing hook's linked call graph data-only. The literal
+    // mask makes this branch compile-time separable, so security_file_ioctl
+    // cannot inherit unreachable lifecycle/control stack frames.
+    if (operation_mask == k_java_ioctl_data) {
+        return data_operation ? handle_java_data_operation_ioctl(ctx, file, uarg, operation) : 0;
+    }
+    if (data_operation) {
+        return (operation_mask & k_java_ioctl_data)
+                   ? handle_java_data_operation_ioctl(ctx, file, uarg, operation)
+                   : 0;
+    }
+
     pid_key_t task = {0};
     task_tid(&task);
     const u64 process_capability = java_process_capability_for(&task);
     if (!process_capability) {
         return 0;
-    }
-
-    u8 op_cmd = 0;
-    if (bpf_probe_read_user(&op_cmd, sizeof(op_cmd), uarg) != 0) {
-        return 0;
-    }
-    const u8 op = cmd_to_op(op_cmd);
-    const u8 data_operation = op != k_ioctl_invalid_op || op_cmd == k_ioctl_java_tls_connection;
-    // Keep the file-bearing hook's linked call graph data-only. The literal
-    // mask makes this branch compile-time separable, so security_file_ioctl
-    // cannot inherit unreachable lifecycle/control stack frames.
-    if (operation_mask == k_java_ioctl_data) {
-        return data_operation ? handle_java_data_operation_ioctl(
-                                    ctx, file, id, uarg, op_cmd, op, &task, process_capability)
-                              : 0;
-    }
-    if (data_operation) {
-        return (operation_mask & k_java_ioctl_data)
-                   ? handle_java_data_operation_ioctl(
-                         ctx, file, id, uarg, op_cmd, op, &task, process_capability)
-                   : 0;
     }
     const u8 registered = op_cmd == k_ioctl_java_process_register ||
                           java_process_incarnation_for(&task) == process_capability;

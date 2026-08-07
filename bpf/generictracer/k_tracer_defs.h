@@ -69,6 +69,8 @@ static __always_inline call_protocol_args_t *make_protocol_args(const pid_connec
     args->protocols = protocols;
     args->protocol_type = protocol_type_for_conn_info(info);
     args->java = 0;
+    __builtin_memset(
+        &args->java_remote_parent_receive, 0, sizeof(args->java_remote_parent_receive));
 
     args->pid_conn = *info;
     __builtin_memset(args->small_buf, 0, sizeof(args->small_buf));
@@ -121,15 +123,17 @@ static __always_inline void handle_ssl_prewrite_with_connection(void *ctx,
     bpf_tail_call(ctx, &jump_table, k_tail_handle_buf_with_args);
 }
 
-static __always_inline void handle_java_buf_with_connection(void *ctx,
-                                                            pid_connection_info_t *pid_conn,
-                                                            void *u_buf,
-                                                            int bytes_len,
-                                                            u8 direction,
-                                                            u16 orig_dport,
-                                                            u32 connection_netns,
-                                                            u64 connection_netns_cookie,
-                                                            u64 socket_cookie) {
+static __always_inline void
+handle_java_buf_with_connection(void *ctx,
+                                pid_connection_info_t *pid_conn,
+                                void *u_buf,
+                                int bytes_len,
+                                u8 direction,
+                                u16 orig_dport,
+                                u32 connection_netns,
+                                u64 connection_netns_cookie,
+                                u64 socket_cookie,
+                                const java_remote_parent_receive_context_t *receive_context) {
     call_protocol_args_t *args = make_protocol_args(pid_conn,
                                                     k_lw_thread_none,
                                                     k_protocol_selector_all,
@@ -146,6 +150,9 @@ static __always_inline void handle_java_buf_with_connection(void *ctx,
     args->connection_netns = connection_netns;
     args->connection_netns_cookie = connection_netns_cookie;
     args->connection_socket_cookie = socket_cookie;
+    if (receive_context) {
+        args->java_remote_parent_receive = *receive_context;
+    }
     bpf_tail_call(ctx, &jump_table, k_tail_handle_buf_with_args);
 }
 

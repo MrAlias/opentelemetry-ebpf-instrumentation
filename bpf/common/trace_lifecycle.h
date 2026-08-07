@@ -63,16 +63,17 @@ static __always_inline u8 find_trace_for_server_request_with_incoming(connection
                                                                       const u8 type,
                                                                       u64 netns_cookie,
                                                                       tp_info_pid_t *incoming,
-                                                                      u64 *incoming_generation) {
+                                                                      u64 *incoming_generation,
+                                                                      u8 allow_incoming_claim) {
     if (incoming_generation) {
         *incoming_generation = 0;
     }
     u8 found_tp = 0;
     connection_info_t sorted_conn = *conn;
     sort_connection_info(&sorted_conn);
-    u8 incoming_claim_allowed = 1;
+    u8 incoming_claim_allowed = allow_incoming_claim;
 #ifdef OBI_JAVA_REMOTE_PARENT_LIFECYCLE
-    if (java_remote_parent_enabled) {
+    if (java_remote_parent_enabled && incoming_claim_allowed) {
         pid_key_t task = {0};
         task_tid(&task);
         // Incarnations are published only by capability-authorized registration. Reusing that
@@ -132,7 +133,7 @@ static __always_inline u8 find_trace_for_server_request(connection_info_t *conn,
                                                         tp_info_t *tp,
                                                         const u8 type) {
     return find_trace_for_server_request_with_incoming(
-        conn, tp, type, task_netns_cookie(), NULL, NULL);
+        conn, tp, type, task_netns_cookie(), NULL, NULL, 1);
 }
 
 static __always_inline void server_or_client_trace(const u8 type,

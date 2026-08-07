@@ -141,17 +141,47 @@ func TestJavaDataHookAttachResultPublishesReadiness(t *testing.T) {
 	}
 
 	tracer := &Tracer{
-		cfg: &obi.Config{},
-		log: tlog(),
+		cfg:                     &obi.Config{},
+		log:                     tlog(),
+		javaRemoteParentEnabled: true,
 	}
 	tracer.bpfObjects.JavaRemoteParentDataHookReadiness = &ebpf.Map{}
-	attachResult := tracer.KProbes()["security_file_ioctl"].AttachResult
-	require.NotNil(t, attachResult)
+	tracer.bpfObjects.ObiKprobeJavaRemoteParentTcpClose = &ebpf.Program{}
+	probes := tracer.KProbes()
+	dataAttachResult := probes["security_file_ioctl"].AttachResult
+	closeProbe := probes["tcp_close/java_remote_parent"]
+	closeAttachResult := closeProbe.AttachResult
+	require.NotNil(t, dataAttachResult)
+	require.NotNil(t, closeAttachResult)
+	assert.True(t, closeProbe.Required)
+	assert.Equal(t, "tcp_close", closeProbe.KProbeTarget)
+	assert.Same(t, tracer.bpfObjects.ObiKprobeJavaRemoteParentTcpClose, closeProbe.Start)
+	assert.NotSame(t, probes["tcp_close"].Start, closeProbe.Start)
 
-	attachResult(nil)
-	attachResult(errors.New("missing security hook"))
+	dataAttachResult(nil)
+	closeAttachResult(nil)
+	closeAttachResult(errors.New("missing close hook"))
+	closeAttachResult(nil)
+	dataAttachResult(errors.New("missing security hook"))
 
-	assert.Equal(t, []uint32{1, 0}, states)
+	assert.Equal(t, []uint32{0, 1, 0, 1, 0}, states)
+
+	states = nil
+	reverse := &Tracer{
+		cfg:                     &obi.Config{},
+		log:                     tlog(),
+		javaRemoteParentEnabled: true,
+	}
+	reverse.bpfObjects.JavaRemoteParentDataHookReadiness = &ebpf.Map{}
+	reverse.bpfObjects.ObiKprobeJavaRemoteParentTcpClose = &ebpf.Program{}
+	reverseProbes := reverse.KProbes()
+	reverseProbes["tcp_close/java_remote_parent"].AttachResult(nil)
+	reverseProbes["security_file_ioctl"].AttachResult(nil)
+	assert.Equal(t, []uint32{0, 1}, states)
+
+	disabled := &Tracer{cfg: &obi.Config{}, log: tlog()}
+	_, found := disabled.KProbes()["tcp_close/java_remote_parent"]
+	assert.False(t, found)
 }
 
 func TestJavaRemoteParentRequiresSockOpsNetnsCookie(t *testing.T) {

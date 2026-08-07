@@ -46,6 +46,29 @@ enum call_protocol_flags : u32 {
     k_call_protocol_flag_ssl_postwrite_expected = 2,
 };
 
+typedef struct java_remote_parent_receive_context {
+    u32 owner_tid;
+    u32 owner_pid;
+    u32 owner_ns;
+    u32 reserved;
+    u64 process_incarnation;
+    u64 lifecycle_id;
+    u64 request_sequence;
+    u64 data_signal_nonce;
+    u64 generation;
+    u8 action;
+    unsigned char reserved2[7];
+} java_remote_parent_receive_context_t;
+
+_Static_assert(sizeof(java_remote_parent_receive_context_t) == 64,
+               "Java remote-parent receive context size mismatch");
+_Static_assert(offsetof(java_remote_parent_receive_context_t, process_incarnation) == 16,
+               "Java remote-parent receive context incarnation offset mismatch");
+_Static_assert(offsetof(java_remote_parent_receive_context_t, generation) == 48,
+               "Java remote-parent receive context generation offset mismatch");
+_Static_assert(offsetof(java_remote_parent_receive_context_t, action) == 56,
+               "Java remote-parent receive context action offset mismatch");
+
 typedef struct call_protocol_args {
     pid_connection_info_t pid_conn;
     enum protocol_type protocol_type;
@@ -68,6 +91,7 @@ typedef struct call_protocol_args {
     u64 u_buf;
     u64 ssl_handoff_id;
     u64 self_ref_parent_id;
+    java_remote_parent_receive_context_t java_remote_parent_receive;
     lw_thread_t lw_thread;
 } call_protocol_args_t;
 

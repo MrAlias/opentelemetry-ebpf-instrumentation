@@ -88,6 +88,7 @@ type Cleanup struct {
 	aliasReplayEntries           map[aliasReplayKey]aliasReplayValue
 	aliasReplayCarriers          map[aliasReplayCarrierKey]struct{}
 	aliasReplayCleanupKeys       map[stateKey]aliasReplayKey
+	aliasReplayCleanupProofs     map[stateKey]*aliasReplayCleanupProof
 	aliasReplayNoCarrier         map[aliasReplayKey]aliasReplayNoCarrierObservation
 	coordinator                  *GenerationCoordinator
 }
@@ -220,6 +221,7 @@ func (c *Cleanup) SweepWithStats() (CleanupStats, error) {
 	sweep.aliasReplayEntries = make(map[aliasReplayKey]aliasReplayValue)
 	sweep.aliasReplayCarriers = make(map[aliasReplayCarrierKey]struct{})
 	sweep.aliasReplayCleanupKeys = make(map[stateKey]aliasReplayKey)
+	sweep.aliasReplayCleanupProofs = make(map[stateKey]*aliasReplayCleanupProof)
 	if sweep.aliasReplayNoCarrier == nil {
 		sweep.aliasReplayNoCarrier = make(map[aliasReplayKey]aliasReplayNoCarrierObservation)
 	}
@@ -708,9 +710,11 @@ func (c *Cleanup) cleanupGenerationChecked(
 	if current != index {
 		return false, nil
 	}
-	c.recordAliasReplayCleanupKey(
+	if !c.recordAliasReplayCleanupKey(
 		key, index.ObservedMonotonicNS, index.ProcessIncarnation,
-	)
+	) {
+		return false, nil
+	}
 	if requireEvicted {
 		evicted, _, evictionErr := c.generationFallbackEvicted(key, index)
 		if evictionErr != nil {
@@ -1334,9 +1338,13 @@ func (c *Cleanup) generationCleanupFenceMatches(
 	if !ownership.ready {
 		return false, nil
 	}
-	return generationTeardownFenceMatches(
+	fenced, err := generationTeardownFenceMatches(
 		c.maps.claims, c.maps.ownerGuards, c.maps.ambiguity, ownership.fence,
 	)
+	if err != nil || !fenced {
+		return false, err
+	}
+	return c.aliasReplayCleanupProofMatches(ownership)
 }
 
 func (c *Cleanup) mutateGenerationCleanupFenced(

@@ -27,6 +27,10 @@ type bridgeMap interface {
 	Delete(key any) error
 }
 
+type bridgeMapLookup interface {
+	Lookup(key, valueOut any) error
+}
+
 type MapHandler struct {
 	remoteParents     bridgeMap
 	tasks             bridgeMap
@@ -98,6 +102,49 @@ type aliasReplayValue struct {
 	DesiredLifecycle      uint8
 	ProducerTag           uint8
 	Reserved              uint8
+	Connection            connectionInfo
+	ConnectionNetNS       uint32
+	ConnectionNetNSCookie uint64
+	SocketCookie          uint64
+}
+
+type aliasReplayBinding struct {
+	Connection            connectionInfo
+	ConnectionNetNS       uint32
+	ConnectionNetNSCookie uint64
+	SocketCookie          uint64
+}
+
+func aliasReplayBindingOf(value aliasReplayValue) aliasReplayBinding {
+	return aliasReplayBinding{
+		Connection:            value.Connection,
+		ConnectionNetNS:       value.ConnectionNetNS,
+		ConnectionNetNSCookie: value.ConnectionNetNSCookie,
+		SocketCookie:          value.SocketCookie,
+	}
+}
+
+// References and Aliases are XADD-managed carrier counts. They may change
+// while an exact generation claim and guard fence every immutable replay and
+// state field. Canonicalize only those counters for authority proofs; payload
+// compare-delete remains byte-exact so counter drift can defer physical
+// cleanup without suppressing an already committed delivery.
+func aliasReplayProofValue(value aliasReplayValue) aliasReplayValue {
+	value.References = 0
+	return value
+}
+
+func aliasReplayProofState(state stateValue) stateValue {
+	state.Aliases = 0
+	return state
+}
+
+func aliasReplayProofValueEqual(left, right aliasReplayValue) bool {
+	return aliasReplayProofValue(left) == aliasReplayProofValue(right)
+}
+
+func aliasReplayProofStateEqual(left, right stateValue) bool {
+	return aliasReplayProofState(left) == aliasReplayProofState(right)
 }
 
 type taskLink struct {
@@ -680,7 +727,19 @@ func (h *MapHandler) handle(
 			lifecycle = lifecycleStale
 		}
 	}
+	if status = h.revalidateAliasReplayGenerationTransition(
+		key, state, ownedClaim, replayTransition,
+	); status != StatusValid {
+		rollbackAllowed = false
+		return Record{Status: status}
+	}
 	if status = h.promoteGenerationClaim(key, &ownedClaim); status != StatusValid {
+		rollbackAllowed = false
+		return Record{Status: status}
+	}
+	if status = h.revalidateAliasReplayGenerationTransition(
+		key, state, ownedClaim, replayTransition,
+	); status != StatusValid {
 		rollbackAllowed = false
 		return Record{Status: status}
 	}
@@ -698,11 +757,14 @@ func (h *MapHandler) handle(
 	// The exact claim commits one-shot delivery. Cleanup is best-effort after
 	// the validated response has been copied: an incomplete finish retains its
 	// claim, ambiguity marker, and owner guard for the coordinated sweeper.
-	h.finishClaimedResult(
+	finishResult := h.finishClaimedResult(
 		owner, record, processIncarnation, lifecycle, &ownedClaim,
 	)
 	if operation == OperationDiscard {
 		return Record{Status: StatusMissing}
+	}
+	if finishResult.deliveryAuthorityFailed {
+		return Record{Status: StatusOverload}
 	}
 
 	return record
@@ -1752,10 +1814,36 @@ func (h *MapHandler) consume(
 			}
 			continue
 		}
+		if status = h.revalidateAliasReplayGenerationTransition(
+			key, state, *ownedClaim, replayTransition,
+		); status != StatusValid {
+			*ownedRollbackAllowed = false
+			if status == StatusTransportError {
+				return committed, StatusUnknown,
+					errors.New("revalidating alias replay generation proof before commit")
+			}
+			if len(candidates) == 1 {
+				return committed, status, nil
+			}
+			continue
+		}
 		if status = h.promoteGenerationClaim(key, ownedClaim); status != StatusValid {
 			*ownedRollbackAllowed = false
 			if status == StatusTransportError {
 				return committed, StatusUnknown, errors.New("promoting generation claim")
+			}
+			if len(candidates) == 1 {
+				return committed, status, nil
+			}
+			continue
+		}
+		if status = h.revalidateAliasReplayGenerationTransition(
+			key, state, *ownedClaim, replayTransition,
+		); status != StatusValid {
+			*ownedRollbackAllowed = false
+			if status == StatusTransportError {
+				return committed, StatusUnknown,
+					errors.New("revalidating alias replay generation proof after commit")
 			}
 			if len(candidates) == 1 {
 				return committed, status, nil
@@ -1801,20 +1889,30 @@ func (h *MapHandler) newGenerationClaim(
 }
 
 type generationFinishResult struct {
-	complete        bool
-	mutationStarted bool
+	complete                bool
+	mutationStarted         bool
+	successorRequired       bool
+	deliveryAuthorityFailed bool
 }
 
 type aliasReplayTransition struct {
 	key            aliasReplayKey
+	binding        aliasReplayBinding
+	generation     aliasReplayGenerationProof
+	ambiguity      uint64
 	claimTimestamp uint64
 	desired        uint8
 }
 
 type aliasReplayFinishProof struct {
-	key                 aliasReplayKey
-	transitionTimestamp uint64
-	lifecycle           uint8
+	key             aliasReplayKey
+	value           aliasReplayValue
+	generation      aliasReplayGenerationProof
+	authorityFailed bool
+}
+
+func (transition *aliasReplayTransition) bindingMatches(value aliasReplayValue) bool {
+	return transition != nil && transition.binding == aliasReplayBindingOf(value)
 }
 
 type connectionReleaseProof struct {
@@ -1846,14 +1944,849 @@ func validAliasReplayTarget(lifecycle uint8) bool {
 	return lifecycle >= lifecycleConsumed && lifecycle <= lifecycleAmbiguous
 }
 
+func validAliasReplayBinding(value aliasReplayValue) bool {
+	return validGenerationConnection(value.Connection) && value.ConnectionNetNS != 0 &&
+		value.ConnectionNetNSCookie != 0 && value.SocketCookie != 0
+}
+
+func aliasReplayBindingMatchesState(value aliasReplayValue, state stateValue) bool {
+	return validAliasReplayBinding(value) && value.Connection == state.Connection &&
+		value.ConnectionNetNS == state.ConnectionNetNS
+}
+
+type aliasReplayGenerationMaps struct {
+	remoteParents     bridgeMapLookup
+	incarnations      bridgeMapLookup
+	connections       bridgeMapLookup
+	cookieConnections bridgeMapLookup
+	ambiguity         bridgeMapLookup
+	owners            bridgeMapLookup
+	states            bridgeMapLookup
+	generations       bridgeMapLookup
+	terminals         bridgeMapLookup
+	claims            bridgeMapLookup
+	aliasReplays      bridgeMapLookup
+	ownerGuards       bridgeMapLookup
+}
+
+func (h *MapHandler) aliasReplayGenerationMaps() aliasReplayGenerationMaps {
+	return aliasReplayGenerationMaps{
+		remoteParents:     h.remoteParents,
+		incarnations:      h.incarnations,
+		connections:       h.connections,
+		cookieConnections: h.cookieConnections,
+		ambiguity:         h.ambiguity,
+		owners:            h.owners,
+		states:            h.states,
+		generations:       h.generations,
+		terminals:         h.terminals,
+		claims:            h.claims,
+		aliasReplays:      h.aliasReplays,
+		ownerGuards:       h.ownerGuards,
+	}
+}
+
+type aliasReplayGenerationAuthority struct {
+	claimPresent          bool
+	claim                 generationClaim
+	guardPresent          bool
+	guard                 generationClaim
+	ambiguity             uint64
+	requireOldIndex       bool
+	requireOldIncarnation bool
+}
+
+type aliasReplaySuccessorGraph struct {
+	binding            aliasReplayBinding
+	oldState           stateValue
+	oldIndexPresent    bool
+	oldIndex           generationIndexValue
+	oldIncarnation     uint64
+	connection         connectionClaim
+	owner              ownerValue
+	fallback           [RecordSize]byte
+	state              stateValue
+	index              generationIndexValue
+	processIncarnation uint64
+}
+
+type aliasReplayGenerationProof struct {
+	successor             bool
+	successorRequired     bool
+	oldState              stateValue
+	oldIndexPresent       bool
+	oldIndex              generationIndexValue
+	oldIncarnationPresent bool
+	oldIncarnation        uint64
+	binding               aliasReplayBinding
+	connectionPresent     bool
+	connection            connectionClaim
+	graph                 aliasReplaySuccessorGraph
+}
+
+type aliasReplayGenerationSnapshot struct {
+	replay                aliasReplayValue
+	oldState              stateValue
+	oldIndexPresent       bool
+	oldIndex              generationIndexValue
+	oldIncarnationPresent bool
+	oldIncarnation        uint64
+	ambiguity             uint64
+	claimPresent          bool
+	claim                 generationClaim
+	guardPresent          bool
+	guard                 generationClaim
+	connectionPresent     bool
+	connection            connectionClaim
+	cookie                connectionClaim
+	terminalPresent       bool
+	terminal              terminalValue
+	successor             bool
+	successorOwner        ownerValue
+	successorFallback     [RecordSize]byte
+	successorState        stateValue
+	successorIndex        generationIndexValue
+	successorIncarnation  uint64
+}
+
+func aliasReplayLookup[K comparable, V any](
+	m bridgeMapLookup,
+	key K,
+) (V, bool, error) {
+	var value V
+	if err := m.Lookup(&key, &value); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return value, false, nil
+		}
+		return value, false, err
+	}
+	return value, true, nil
+}
+
+func validAliasReplayAuthority(
+	key stateKey,
+	state stateValue,
+	authority aliasReplayGenerationAuthority,
+) bool {
+	if authority.claimPresent {
+		if authority.claim.ProcessIncarnation != state.ProcessIncarnation ||
+			(!validGenerationProducerClaim(authority.claim) &&
+				!validGenerationCleanupClaim(authority.claim)) {
+			return false
+		}
+	}
+	if authority.guardPresent {
+		if !authority.claimPresent {
+			return false
+		}
+		producerPair := validGenerationProducerClaim(authority.claim) &&
+			validGenerationProducerGuard(key, authority.guard)
+		cleanupPair := validGenerationCleanupClaim(authority.claim) &&
+			authority.guard.ProcessIncarnation == key.Generation &&
+			validGenerationCleanupGuard(key.Owner, authority.guard)
+		if !producerPair && !cleanupPair {
+			return false
+		}
+	}
+	return true
+}
+
+func aliasReplayOldTerminalLifecycle(
+	authority aliasReplayGenerationAuthority,
+) (uint8, bool) {
+	if !authority.claimPresent {
+		return 0, false
+	}
+	if validGoFinalGenerationClaim(authority.claim) {
+		return authority.claim.Lifecycle, true
+	}
+	if validGenerationCleanupClaim(authority.claim) &&
+		validAliasReplayTarget(authority.claim.Reserved[0]) {
+		return authority.claim.Reserved[0], true
+	}
+	return 0, false
+}
+
+func validAliasReplayTerminalForSuccessor(
+	key stateKey,
+	state stateValue,
+	authority aliasReplayGenerationAuthority,
+	terminal terminalValue,
+) bool {
+	lifecycle, ok := aliasReplayOldTerminalLifecycle(authority)
+	return ok && validTerminalValue(terminal) && terminal.Generation == key.Generation &&
+		terminal.ObservedMonotonicNS == state.ObservedMonotonicNS &&
+		terminal.ProcessIncarnation == state.ProcessIncarnation &&
+		terminal.Lifecycle == lifecycle
+}
+
+func aliasReplayConnectionMatchesBinding(
+	value aliasReplayValue,
+	connection connectionClaim,
+	owner Identity,
+) bool {
+	return connection.Owner == owner && connection.Reserved == 0 &&
+		connection.Reserved2 == 0 && connection.Generation != 0 &&
+		connection.NetNS == value.ConnectionNetNS &&
+		connection.NetNSCookie == value.ConnectionNetNSCookie &&
+		connection.IncomingGeneration != 0 && connection.SocketCookie == value.SocketCookie
+}
+
+func aliasReplaySameBindingSuccessorRequired(
+	maps aliasReplayGenerationMaps,
+	key stateKey,
+	value aliasReplayValue,
+) (bool, error) {
+	connectionKey := connectionInfoNS{
+		Connection: value.Connection,
+		NetNS:      value.ConnectionNetNS,
+	}
+	cookieKey := connectionInfoNetNSCookie{
+		Connection:  value.Connection,
+		NetNSCookie: value.ConnectionNetNSCookie,
+	}
+	connection, connectionPresent, err := aliasReplayLookup[connectionInfoNS, connectionClaim](
+		maps.connections, connectionKey,
+	)
+	if err != nil {
+		return false, err
+	}
+	cookie, cookiePresent, err := aliasReplayLookup[connectionInfoNetNSCookie, connectionClaim](
+		maps.cookieConnections, cookieKey,
+	)
+	if err != nil {
+		return false, err
+	}
+	if (connectionPresent && connection.Generation != 0 && connection.Generation != key.Generation) ||
+		(cookiePresent && cookie.Generation != 0 && cookie.Generation != key.Generation) {
+		return true, nil
+	}
+
+	owner, present, err := aliasReplayLookup[Identity, ownerValue](maps.owners, key.Owner)
+	if err != nil || !present || owner.Generation == 0 || owner.Generation == key.Generation {
+		return false, err
+	}
+	successorKey := stateKey{Owner: key.Owner, Generation: owner.Generation}
+	state, present, err := aliasReplayLookup[stateKey, stateValue](maps.states, successorKey)
+	if err != nil || !present {
+		return false, err
+	}
+	return state.Connection == value.Connection &&
+		state.ConnectionNetNS == value.ConnectionNetNS, nil
+}
+
+func readAliasReplayGenerationSnapshot(
+	maps aliasReplayGenerationMaps,
+	authority aliasReplayGenerationAuthority,
+	key stateKey,
+	state stateValue,
+	value aliasReplayValue,
+) (aliasReplayGenerationSnapshot, bool, error) {
+	var snapshot aliasReplayGenerationSnapshot
+	if !aliasReplayBindingMatchesState(value, state) ||
+		!validAliasReplayAuthority(key, state, authority) {
+		return snapshot, false, nil
+	}
+	replayKey := aliasReplayKeyForState(key, state)
+	currentReplay, present, err := aliasReplayLookup[aliasReplayKey, aliasReplayValue](
+		maps.aliasReplays, replayKey,
+	)
+	if err != nil || !present || !aliasReplayProofValueEqual(currentReplay, value) {
+		return snapshot, false, err
+	}
+	currentState, present, err := aliasReplayLookup[stateKey, stateValue](maps.states, key)
+	if err != nil || !present || !aliasReplayProofStateEqual(currentState, state) {
+		return snapshot, false, err
+	}
+	oldIndex, oldIndexPresent, err := aliasReplayLookup[stateKey, generationIndexValue](
+		maps.generations, key,
+	)
+	if err != nil || (oldIndexPresent &&
+		!validFinishGenerationIndex(key, oldIndex, currentState)) ||
+		(authority.requireOldIndex && !oldIndexPresent) {
+		return snapshot, false, err
+	}
+	process := javaProcessIdentity(key.Owner)
+	oldIncarnation, oldIncarnationPresent, err := aliasReplayLookup[Identity, uint64](
+		maps.incarnations, process,
+	)
+	if err != nil || (authority.requireOldIncarnation &&
+		(!oldIncarnationPresent || oldIncarnation != state.ProcessIncarnation)) {
+		return snapshot, false, err
+	}
+	markedAt, present, err := aliasReplayLookup[stateKey, uint64](maps.ambiguity, key)
+	if err != nil || !present || markedAt != authority.ambiguity {
+		return snapshot, false, err
+	}
+	claim, claimPresent, err := aliasReplayLookup[stateKey, generationClaim](maps.claims, key)
+	if err != nil || claimPresent != authority.claimPresent ||
+		(claimPresent && claim != authority.claim) {
+		return snapshot, false, err
+	}
+	guard, guardPresent, err := aliasReplayLookup[Identity, generationClaim](
+		maps.ownerGuards, key.Owner,
+	)
+	if err != nil || guardPresent != authority.guardPresent ||
+		(guardPresent && guard != authority.guard) {
+		return snapshot, false, err
+	}
+
+	connectionKey := connectionInfoNS{
+		Connection: value.Connection,
+		NetNS:      value.ConnectionNetNS,
+	}
+	cookieKey := connectionInfoNetNSCookie{
+		Connection:  value.Connection,
+		NetNSCookie: value.ConnectionNetNSCookie,
+	}
+	connection, connectionPresent, err := aliasReplayLookup[connectionInfoNS, connectionClaim](
+		maps.connections, connectionKey,
+	)
+	if err != nil {
+		return snapshot, false, err
+	}
+	cookie, cookiePresent, err := aliasReplayLookup[connectionInfoNetNSCookie, connectionClaim](
+		maps.cookieConnections, cookieKey,
+	)
+	if err != nil || connectionPresent != cookiePresent {
+		return snapshot, false, err
+	}
+
+	terminal, terminalPresent, err := aliasReplayLookup[Identity, terminalValue](
+		maps.terminals, key.Owner,
+	)
+	if err != nil {
+		return snapshot, false, err
+	}
+	snapshot = aliasReplayGenerationSnapshot{
+		replay:                aliasReplayProofValue(currentReplay),
+		oldState:              aliasReplayProofState(currentState),
+		oldIndexPresent:       oldIndexPresent,
+		oldIndex:              oldIndex,
+		oldIncarnationPresent: oldIncarnationPresent,
+		oldIncarnation:        oldIncarnation,
+		ambiguity:             markedAt,
+		claimPresent:          claimPresent,
+		claim:                 claim,
+		guardPresent:          guardPresent,
+		guard:                 guard,
+		connectionPresent:     connectionPresent,
+		connection:            connection,
+		cookie:                cookie,
+		terminalPresent:       terminalPresent,
+		terminal:              terminal,
+	}
+	if terminalPresent && !validAliasReplayTerminalForSuccessor(
+		key, state, authority, terminal,
+	) {
+		return snapshot, false, nil
+	}
+	if !connectionPresent {
+		return snapshot, true, nil
+	}
+	if connection != cookie ||
+		!aliasReplayConnectionMatchesBinding(value, connection, key.Owner) {
+		return snapshot, false, nil
+	}
+	if connection.Generation == key.Generation {
+		if !validConnectionClaim(
+			connection, key.Owner, key.Generation, value.ConnectionNetNS,
+		) {
+			return snapshot, false, nil
+		}
+		return snapshot, true, nil
+	}
+	if !oldIncarnationPresent || oldIncarnation != state.ProcessIncarnation {
+		// Cleanup may prove a retired old generation after its process-incarnation
+		// entry has disappeared. That retirement authority can never prove a live
+		// same-socket successor.
+		return snapshot, false, nil
+	}
+
+	successorKey := stateKey{Owner: key.Owner, Generation: connection.Generation}
+	owner, present, err := aliasReplayLookup[Identity, ownerValue](maps.owners, key.Owner)
+	if err != nil || !present || owner.Generation != successorKey.Generation ||
+		owner.ProcessIncarnation == 0 || owner.ProcessIncarnation != oldIncarnation ||
+		owner.Lifecycle != lifecycleActive ||
+		owner.Reserved != ([7]byte{}) {
+		return snapshot, false, err
+	}
+	successorIncarnation, present, err := aliasReplayLookup[Identity, uint64](
+		maps.incarnations, process,
+	)
+	if err != nil || !present || successorIncarnation != owner.ProcessIncarnation ||
+		successorIncarnation != oldIncarnation {
+		return snapshot, false, err
+	}
+	fallback, present, err := aliasReplayLookup[Identity, [RecordSize]byte](
+		maps.remoteParents, key.Owner,
+	)
+	if err != nil || !present {
+		return snapshot, false, err
+	}
+	successorState, present, err := aliasReplayLookup[stateKey, stateValue](maps.states, successorKey)
+	if err != nil || !present || successorState.Lifecycle != lifecycleActive ||
+		successorState.Reserved != ([3]byte{}) || successorState.ObservedMonotonicNS == 0 ||
+		successorState.Connection != value.Connection ||
+		successorState.ConnectionNetNS != value.ConnectionNetNS ||
+		successorState.ProcessIncarnation != owner.ProcessIncarnation ||
+		successorState.Response != fallback {
+		return snapshot, false, err
+	}
+	record, decodeErr := UnmarshalRecord(fallback[:])
+	if decodeErr != nil || record.Generation != successorKey.Generation ||
+		record.ObservedMonotonicNS != successorState.ObservedMonotonicNS ||
+		!record.IsValidRemoteParent() {
+		return snapshot, false, nil
+	}
+	index, present, err := aliasReplayLookup[stateKey, generationIndexValue](
+		maps.generations, successorKey,
+	)
+	if err != nil || !present || !validFinishGenerationIndex(successorKey, index, successorState) {
+		return snapshot, false, err
+	}
+	successorMarkedAt, present, err := aliasReplayLookup[stateKey, uint64](
+		maps.ambiguity, successorKey,
+	)
+	if err != nil || !present || successorMarkedAt != 0 {
+		return snapshot, false, err
+	}
+	_, successorClaimPresent, err := aliasReplayLookup[stateKey, generationClaim](
+		maps.claims, successorKey,
+	)
+	if err != nil || successorClaimPresent {
+		return snapshot, false, err
+	}
+	snapshot.successor = true
+	snapshot.successorOwner = owner
+	snapshot.successorFallback = fallback
+	snapshot.successorState = aliasReplayProofState(successorState)
+	snapshot.successorIndex = index
+	snapshot.successorIncarnation = successorIncarnation
+	return snapshot, true, nil
+}
+
+type aliasReplaySuccessorContinuitySnapshot struct {
+	oldStatePresent    bool
+	oldState           stateValue
+	oldIndexPresent    bool
+	oldIndex           generationIndexValue
+	connection         connectionClaim
+	cookie             connectionClaim
+	owner              ownerValue
+	fallback           [RecordSize]byte
+	state              stateValue
+	index              generationIndexValue
+	processIncarnation uint64
+	ambiguity          uint64
+	claim              generationClaim
+	guard              generationClaim
+	terminalPresent    bool
+	terminal           terminalValue
+}
+
+// readAliasReplaySuccessorContinuitySnapshot permits the old generation's S/I
+// payload to remain byte-identical or disappear during exact fenced teardown.
+// A replacement must never be mistaken for teardown progress. The same-socket
+// successor graph remains byte-identical throughout either old-payload shape.
+func readAliasReplaySuccessorContinuitySnapshot(
+	maps aliasReplayGenerationMaps,
+	authority aliasReplayGenerationAuthority,
+	key stateKey,
+	state stateValue,
+	value aliasReplayValue,
+	graph aliasReplaySuccessorGraph,
+) (aliasReplaySuccessorContinuitySnapshot, bool, error) {
+	var snapshot aliasReplaySuccessorContinuitySnapshot
+	if aliasReplayBindingOf(value) != graph.binding ||
+		!aliasReplayProofStateEqual(graph.oldState, state) ||
+		graph.connection.Generation == 0 || graph.connection.Generation == key.Generation ||
+		!aliasReplayConnectionMatchesBinding(value, graph.connection, key.Owner) {
+		return snapshot, false, nil
+	}
+	oldState, oldStatePresent, err := aliasReplayLookup[stateKey, stateValue](
+		maps.states, key,
+	)
+	if err != nil || (oldStatePresent &&
+		!aliasReplayProofStateEqual(oldState, graph.oldState)) {
+		return snapshot, false, err
+	}
+	oldIndex, oldIndexPresent, err := aliasReplayLookup[stateKey, generationIndexValue](
+		maps.generations, key,
+	)
+	if err != nil || (oldIndexPresent &&
+		(!graph.oldIndexPresent || oldIndex != graph.oldIndex)) {
+		return snapshot, false, err
+	}
+	connectionKey := connectionInfoNS{
+		Connection: graph.binding.Connection,
+		NetNS:      graph.binding.ConnectionNetNS,
+	}
+	cookieKey := connectionInfoNetNSCookie{
+		Connection:  graph.binding.Connection,
+		NetNSCookie: graph.binding.ConnectionNetNSCookie,
+	}
+	connection, present, err := aliasReplayLookup[connectionInfoNS, connectionClaim](
+		maps.connections, connectionKey,
+	)
+	if err != nil || !present || connection != graph.connection {
+		return snapshot, false, err
+	}
+	cookie, present, err := aliasReplayLookup[connectionInfoNetNSCookie, connectionClaim](
+		maps.cookieConnections, cookieKey,
+	)
+	if err != nil || !present || cookie != graph.connection {
+		return snapshot, false, err
+	}
+	successorKey := stateKey{Owner: key.Owner, Generation: graph.connection.Generation}
+	owner, present, err := aliasReplayLookup[Identity, ownerValue](maps.owners, key.Owner)
+	if err != nil || !present || owner != graph.owner {
+		return snapshot, false, err
+	}
+	fallback, present, err := aliasReplayLookup[Identity, [RecordSize]byte](
+		maps.remoteParents, key.Owner,
+	)
+	if err != nil || !present || fallback != graph.fallback {
+		return snapshot, false, err
+	}
+	successorState, present, err := aliasReplayLookup[stateKey, stateValue](
+		maps.states, successorKey,
+	)
+	if err != nil || !present || !aliasReplayProofStateEqual(successorState, graph.state) {
+		return snapshot, false, err
+	}
+	index, present, err := aliasReplayLookup[stateKey, generationIndexValue](
+		maps.generations, successorKey,
+	)
+	if err != nil || !present || index != graph.index {
+		return snapshot, false, err
+	}
+	processIncarnation, present, err := aliasReplayLookup[Identity, uint64](
+		maps.incarnations, javaProcessIdentity(key.Owner),
+	)
+	if err != nil || !present || processIncarnation != graph.processIncarnation {
+		return snapshot, false, err
+	}
+	ambiguity, present, err := aliasReplayLookup[stateKey, uint64](maps.ambiguity, successorKey)
+	if err != nil || !present || ambiguity != 0 {
+		return snapshot, false, err
+	}
+	_, claimPresent, err := aliasReplayLookup[stateKey, generationClaim](maps.claims, successorKey)
+	if err != nil || claimPresent {
+		return snapshot, false, err
+	}
+	oldAmbiguity, present, err := aliasReplayLookup[stateKey, uint64](maps.ambiguity, key)
+	if err != nil || !present || oldAmbiguity != authority.ambiguity {
+		return snapshot, false, err
+	}
+	oldClaim, present, err := aliasReplayLookup[stateKey, generationClaim](maps.claims, key)
+	if err != nil || !present || !authority.claimPresent || oldClaim != authority.claim {
+		return snapshot, false, err
+	}
+	oldGuard, present, err := aliasReplayLookup[Identity, generationClaim](
+		maps.ownerGuards, key.Owner,
+	)
+	if err != nil || !present || !authority.guardPresent || oldGuard != authority.guard {
+		return snapshot, false, err
+	}
+	terminal, terminalPresent, err := aliasReplayLookup[Identity, terminalValue](
+		maps.terminals, key.Owner,
+	)
+	if err != nil || (terminalPresent && !validAliasReplayTerminalForSuccessor(
+		key, state, authority, terminal,
+	)) {
+		return snapshot, false, err
+	}
+	snapshot = aliasReplaySuccessorContinuitySnapshot{
+		oldStatePresent:    oldStatePresent,
+		oldState:           aliasReplayProofState(oldState),
+		oldIndexPresent:    oldIndexPresent,
+		oldIndex:           oldIndex,
+		connection:         connection,
+		cookie:             cookie,
+		owner:              owner,
+		fallback:           fallback,
+		state:              aliasReplayProofState(successorState),
+		index:              index,
+		processIncarnation: processIncarnation,
+		ambiguity:          oldAmbiguity,
+		claim:              oldClaim,
+		guard:              oldGuard,
+		terminalPresent:    terminalPresent,
+		terminal:           terminal,
+	}
+	return snapshot, true, nil
+}
+
+type aliasReplayOldGenerationContinuitySnapshot struct {
+	statePresent       bool
+	state              stateValue
+	indexPresent       bool
+	index              generationIndexValue
+	incarnationPresent bool
+	incarnation        uint64
+	connectionPresent  bool
+	connection         connectionClaim
+	cookiePresent      bool
+	cookie             connectionClaim
+	ambiguity          uint64
+	claim              generationClaim
+	guard              generationClaim
+	terminalPresent    bool
+	terminal           terminalValue
+}
+
+// readAliasReplayOldGenerationContinuitySnapshot permits only the monotonic
+// shapes produced by exact teardown: an old C/S/I/incarnation entry may remain
+// byte-identical or become absent. It can never be replaced. A C successor is
+// handled separately by rebuilding the complete successor proof while old S/I
+// still provide authority.
+func readAliasReplayOldGenerationContinuitySnapshot(
+	maps aliasReplayGenerationMaps,
+	authority aliasReplayGenerationAuthority,
+	key stateKey,
+	state stateValue,
+	value aliasReplayValue,
+	proof aliasReplayGenerationProof,
+) (aliasReplayOldGenerationContinuitySnapshot, bool, error) {
+	var snapshot aliasReplayOldGenerationContinuitySnapshot
+	if aliasReplayBindingOf(value) != proof.binding ||
+		!aliasReplayBindingMatchesState(value, state) {
+		return snapshot, false, nil
+	}
+	currentState, statePresent, err := aliasReplayLookup[stateKey, stateValue](maps.states, key)
+	if err != nil || (statePresent && !aliasReplayProofStateEqual(currentState, state)) {
+		return snapshot, false, err
+	}
+	currentIndex, indexPresent, err := aliasReplayLookup[stateKey, generationIndexValue](
+		maps.generations, key,
+	)
+	if err != nil || (indexPresent &&
+		(!proof.oldIndexPresent || currentIndex != proof.oldIndex)) {
+		return snapshot, false, err
+	}
+	currentIncarnation, incarnationPresent, err := aliasReplayLookup[Identity, uint64](
+		maps.incarnations, javaProcessIdentity(key.Owner),
+	)
+	if err != nil || (incarnationPresent &&
+		(!proof.oldIncarnationPresent || currentIncarnation != proof.oldIncarnation)) {
+		return snapshot, false, err
+	}
+	connectionKey := connectionInfoNS{
+		Connection: proof.binding.Connection,
+		NetNS:      proof.binding.ConnectionNetNS,
+	}
+	cookieKey := connectionInfoNetNSCookie{
+		Connection:  proof.binding.Connection,
+		NetNSCookie: proof.binding.ConnectionNetNSCookie,
+	}
+	currentConnection, connectionPresent, err := aliasReplayLookup[connectionInfoNS, connectionClaim](
+		maps.connections, connectionKey,
+	)
+	if err != nil || (connectionPresent &&
+		(!proof.connectionPresent || currentConnection != proof.connection)) {
+		return snapshot, false, err
+	}
+	currentCookie, cookiePresent, err := aliasReplayLookup[connectionInfoNetNSCookie, connectionClaim](
+		maps.cookieConnections, cookieKey,
+	)
+	if err != nil || (cookiePresent &&
+		(!proof.connectionPresent || currentCookie != proof.connection)) {
+		return snapshot, false, err
+	}
+	ambiguity, present, err := aliasReplayLookup[stateKey, uint64](maps.ambiguity, key)
+	if err != nil || !present || ambiguity != authority.ambiguity {
+		return snapshot, false, err
+	}
+	claim, present, err := aliasReplayLookup[stateKey, generationClaim](maps.claims, key)
+	if err != nil || !present || !authority.claimPresent || claim != authority.claim {
+		return snapshot, false, err
+	}
+	guard, present, err := aliasReplayLookup[Identity, generationClaim](maps.ownerGuards, key.Owner)
+	if err != nil || !present || !authority.guardPresent || guard != authority.guard {
+		return snapshot, false, err
+	}
+	terminal, terminalPresent, err := aliasReplayLookup[Identity, terminalValue](
+		maps.terminals, key.Owner,
+	)
+	if err != nil || (terminalPresent && !validAliasReplayTerminalForSuccessor(
+		key, state, authority, terminal,
+	)) {
+		return snapshot, false, err
+	}
+	snapshot = aliasReplayOldGenerationContinuitySnapshot{
+		statePresent:       statePresent,
+		state:              aliasReplayProofState(currentState),
+		indexPresent:       indexPresent,
+		index:              currentIndex,
+		incarnationPresent: incarnationPresent,
+		incarnation:        currentIncarnation,
+		connectionPresent:  connectionPresent,
+		connection:         currentConnection,
+		cookiePresent:      cookiePresent,
+		cookie:             currentCookie,
+		ambiguity:          ambiguity,
+		claim:              claim,
+		guard:              guard,
+		terminalPresent:    terminalPresent,
+		terminal:           terminal,
+	}
+	return snapshot, true, nil
+}
+
+func aliasReplayOldGenerationContinuityMatches(
+	maps aliasReplayGenerationMaps,
+	authority aliasReplayGenerationAuthority,
+	key stateKey,
+	state stateValue,
+	value aliasReplayValue,
+	proof aliasReplayGenerationProof,
+) (bool, error) {
+	first, valid, err := readAliasReplayOldGenerationContinuitySnapshot(
+		maps, authority, key, state, value, proof,
+	)
+	if err != nil || !valid {
+		return false, err
+	}
+	second, valid, err := readAliasReplayOldGenerationContinuitySnapshot(
+		maps, authority, key, state, value, proof,
+	)
+	return err == nil && valid && first == second, err
+}
+
+func aliasReplayGenerationContinuityMatches(
+	maps aliasReplayGenerationMaps,
+	authority aliasReplayGenerationAuthority,
+	key stateKey,
+	state stateValue,
+	value aliasReplayValue,
+	proof *aliasReplayGenerationProof,
+) (bool, error) {
+	if proof == nil {
+		return false, nil
+	}
+	if proof.successor {
+		return aliasReplaySuccessorGraphMatches(
+			maps, authority, key, state, value, proof.graph,
+		)
+	}
+	successorRequired, err := aliasReplaySameBindingSuccessorRequired(maps, key, value)
+	if err != nil {
+		return false, err
+	}
+	proof.successorRequired = proof.successorRequired || successorRequired
+	if !proof.successorRequired {
+		oldMatches, err := aliasReplayOldGenerationContinuityMatches(
+			maps, authority, key, state, value, *proof,
+		)
+		if err != nil || oldMatches {
+			return oldMatches, err
+		}
+	}
+
+	// A successor may have committed after the pre-guard proof but before old G
+	// became visible. Adopt it only by rebuilding the full graph twice while old
+	// S/I are still exact; an incomplete or malformed replacement fails closed.
+	current, matches, err := aliasReplayBindingMatchesGeneration(
+		maps, authority, key, state, value,
+	)
+	if err != nil || !matches || !current.successor {
+		return false, err
+	}
+	*proof = current
+	return aliasReplaySuccessorGraphMatches(
+		maps, authority, key, state, value, proof.graph,
+	)
+}
+
+func aliasReplaySuccessorGraphMatches(
+	maps aliasReplayGenerationMaps,
+	authority aliasReplayGenerationAuthority,
+	key stateKey,
+	state stateValue,
+	value aliasReplayValue,
+	graph aliasReplaySuccessorGraph,
+) (bool, error) {
+	first, valid, err := readAliasReplaySuccessorContinuitySnapshot(
+		maps, authority, key, state, value, graph,
+	)
+	if err != nil || !valid {
+		return false, err
+	}
+	second, valid, err := readAliasReplaySuccessorContinuitySnapshot(
+		maps, authority, key, state, value, graph,
+	)
+	return err == nil && valid && first == second, err
+}
+
+// The replay binding is captured while the old generation has exact physical
+// twins. A later same-socket successor is acceptable only when its complete
+// logical publication graph is clean and byte-consistent. Read the entire
+// proof twice so no single mixed-generation observation can authorize old E.
+func aliasReplayBindingMatchesGeneration(
+	maps aliasReplayGenerationMaps,
+	authority aliasReplayGenerationAuthority,
+	key stateKey,
+	state stateValue,
+	value aliasReplayValue,
+) (aliasReplayGenerationProof, bool, error) {
+	var proof aliasReplayGenerationProof
+	successorRequired, err := aliasReplaySameBindingSuccessorRequired(maps, key, value)
+	if err != nil {
+		return proof, false, err
+	}
+	proof.successorRequired = successorRequired
+	first, valid, err := readAliasReplayGenerationSnapshot(
+		maps, authority, key, state, value,
+	)
+	if err != nil || !valid {
+		return proof, false, err
+	}
+	second, valid, err := readAliasReplayGenerationSnapshot(
+		maps, authority, key, state, value,
+	)
+	if err != nil || !valid || first != second {
+		return proof, false, err
+	}
+	proof.oldState = second.oldState
+	proof.oldIndexPresent = second.oldIndexPresent
+	proof.oldIndex = second.oldIndex
+	proof.oldIncarnationPresent = second.oldIncarnationPresent
+	proof.oldIncarnation = second.oldIncarnation
+	proof.binding = aliasReplayBindingOf(second.replay)
+	proof.connectionPresent = second.connectionPresent
+	proof.connection = second.connection
+	if !second.successor {
+		return proof, true, nil
+	}
+	proof.successor = true
+	proof.successorRequired = true
+	proof.graph = aliasReplaySuccessorGraph{
+		binding:            aliasReplayBindingOf(second.replay),
+		oldState:           second.oldState,
+		oldIndexPresent:    second.oldIndexPresent,
+		oldIndex:           second.oldIndex,
+		oldIncarnation:     second.oldIncarnation,
+		connection:         second.connection,
+		owner:              second.successorOwner,
+		fallback:           second.successorFallback,
+		state:              second.successorState,
+		index:              second.successorIndex,
+		processIncarnation: second.successorIncarnation,
+	}
+	return proof, true, nil
+}
+
 func validActiveAliasReplay(value aliasReplayValue) bool {
-	return value.TransitionMonotonicNS != 0 && value.Lifecycle == lifecycleActive &&
+	return validAliasReplayBinding(value) && value.TransitionMonotonicNS != 0 &&
+		value.Lifecycle == lifecycleActive &&
 		value.DesiredLifecycle == 0 &&
 		value.ProducerTag == 0 && value.Reserved == 0
 }
 
 func validPublishingAliasReplay(value aliasReplayValue) bool {
-	return value.TransitionMonotonicNS != 0 && value.Lifecycle == lifecyclePublishing &&
+	return validAliasReplayBinding(value) && value.TransitionMonotonicNS != 0 &&
+		value.Lifecycle == lifecyclePublishing &&
 		validAliasReplayTarget(value.DesiredLifecycle) &&
 		(value.ProducerTag == 0 || value.ProducerTag == generationGoProducerTag) &&
 		value.Reserved == 0
@@ -1870,7 +2803,8 @@ func validGoPublishingAliasReplay(
 }
 
 func validFinalAliasReplay(value aliasReplayValue) bool {
-	return value.TransitionMonotonicNS != 0 && validAliasReplayTarget(value.Lifecycle) &&
+	return validAliasReplayBinding(value) && value.TransitionMonotonicNS != 0 &&
+		validAliasReplayTarget(value.Lifecycle) &&
 		value.DesiredLifecycle == 0 && value.ProducerTag == 0 && value.Reserved == 0
 }
 
@@ -1916,6 +2850,37 @@ func (h *MapHandler) activeAliasReplay(
 		if claimed {
 			return nil, claimedStatus
 		}
+	}
+	markedAt, present, err := aliasReplayLookup[stateKey, uint64](h.ambiguity, key)
+	if err != nil {
+		return nil, StatusTransportError
+	}
+	if !present {
+		return nil, StatusAmbiguous
+	}
+	generationProof, bindingMatches, err := aliasReplayBindingMatchesGeneration(
+		h.aliasReplayGenerationMaps(), aliasReplayGenerationAuthority{
+			ambiguity: markedAt, requireOldIndex: true, requireOldIncarnation: true,
+		},
+		key, state, current,
+	)
+	if err != nil {
+		return nil, StatusTransportError
+	}
+	if !bindingMatches {
+		claimedStatus, claimed, claimErr := h.existingGenerationClaimStatus(candidate)
+		if claimErr != nil {
+			return nil, StatusTransportError
+		}
+		if claimed {
+			return nil, claimedStatus
+		}
+		if generationProof.successorRequired {
+			return nil, StatusOverload
+		}
+		return nil, StatusAmbiguous
+	}
+	if !validActiveAliasReplay(current) {
 		if validFinalAliasReplay(current) {
 			if candidate.TaskSource != (Identity{}) && current.References == 0 {
 				return nil, StatusAmbiguous
@@ -1929,7 +2894,12 @@ func (h *MapHandler) activeAliasReplay(
 	if state.Aliases > 0 && current.References == 0 {
 		return nil, StatusAmbiguous
 	}
-	return &aliasReplayTransition{key: replayKey}, StatusValid
+	return &aliasReplayTransition{
+		key:        replayKey,
+		binding:    aliasReplayBindingOf(current),
+		generation: generationProof,
+		ambiguity:  markedAt,
+	}, StatusValid
 }
 
 func (h *MapHandler) publishAliasReplayTransition(
@@ -1954,10 +2924,11 @@ func (h *MapHandler) publishAliasReplayTransition(
 		}
 		return StatusTransportError
 	}
-	if validGoPublishingAliasReplay(current, transition.claimTimestamp, desired) {
+	if validGoPublishingAliasReplay(current, transition.claimTimestamp, desired) &&
+		transition.bindingMatches(current) {
 		return StatusValid
 	}
-	if !validActiveAliasReplay(current) {
+	if !validActiveAliasReplay(current) || !transition.bindingMatches(current) {
 		return statusForAliasReplay(current)
 	}
 
@@ -1974,7 +2945,8 @@ func (h *MapHandler) publishAliasReplayTransition(
 		}
 		return StatusTransportError
 	}
-	if validGoPublishingAliasReplay(current, transition.claimTimestamp, desired) {
+	if validGoPublishingAliasReplay(current, transition.claimTimestamp, desired) &&
+		transition.bindingMatches(current) {
 		return StatusValid
 	}
 	if updateErr != nil {
@@ -1998,10 +2970,67 @@ func (h *MapHandler) revalidateAliasReplayTransition(
 	}
 	if validGoPublishingAliasReplay(
 		current, transition.claimTimestamp, transition.desired,
-	) {
+	) && transition.bindingMatches(current) {
 		return StatusValid
 	}
 	return statusForAliasReplay(current)
+}
+
+func (h *MapHandler) revalidateAliasReplayGenerationTransition(
+	key stateKey,
+	state stateValue,
+	claim generationClaim,
+	transition *aliasReplayTransition,
+) Status {
+	if transition == nil {
+		if state.Aliases != 0 {
+			return StatusAmbiguous
+		}
+		return StatusValid
+	}
+	if !validGenerationProducerClaim(claim) ||
+		aliasReplayKeyForState(key, state) != transition.key {
+		return StatusAmbiguous
+	}
+	desired := claim.Lifecycle
+	if claim.Lifecycle == lifecyclePublishing {
+		desired = claim.Reserved[0]
+	}
+	if !validAliasReplayTarget(desired) || transition.desired != desired {
+		return StatusAmbiguous
+	}
+	var current aliasReplayValue
+	if err := h.aliasReplays.Lookup(&transition.key, &current); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return StatusOverload
+		}
+		return StatusTransportError
+	}
+	if !validGoPublishingAliasReplay(
+		current, transition.claimTimestamp, transition.desired,
+	) || !transition.bindingMatches(current) {
+		return StatusAmbiguous
+	}
+	proof, matches, err := aliasReplayBindingMatchesGeneration(
+		h.aliasReplayGenerationMaps(), aliasReplayGenerationAuthority{
+			claimPresent:          true,
+			claim:                 claim,
+			ambiguity:             transition.ambiguity,
+			requireOldIndex:       true,
+			requireOldIncarnation: true,
+		}, key, state, current,
+	)
+	if err != nil {
+		return StatusTransportError
+	}
+	if !matches {
+		if proof.successorRequired {
+			return StatusOverload
+		}
+		return StatusAmbiguous
+	}
+	transition.generation = proof
+	return StatusValid
 }
 
 func validGoPublishingGenerationClaim(claim generationClaim) bool {
@@ -2094,7 +3123,7 @@ func (h *MapHandler) retargetPublishingClaimStale(
 		}
 		if !validGoPublishingAliasReplay(
 			currentReplay, transition.claimTimestamp, transition.desired,
-		) {
+		) || !transition.bindingMatches(currentReplay) {
 			return statusForAliasReplay(currentReplay)
 		}
 		staleReplay = currentReplay
@@ -2133,7 +3162,7 @@ func (h *MapHandler) retargetPublishingClaimStale(
 	}
 	if !validGoPublishingAliasReplay(
 		currentReplay, transition.claimTimestamp, transition.desired,
-	) {
+	) || !transition.bindingMatches(currentReplay) {
 		return statusForAliasReplay(currentReplay)
 	}
 	// Preserve the freshest reference snapshot from the exact read immediately
@@ -2148,7 +3177,8 @@ func (h *MapHandler) retargetPublishingClaimStale(
 		}
 		return StatusTransportError
 	}
-	if currentReplay == staleReplay {
+	if aliasReplayProofValueEqual(currentReplay, staleReplay) &&
+		transition.bindingMatches(currentReplay) {
 		transition.desired = lifecycleStale
 		return StatusValid
 	}
@@ -2173,7 +3203,7 @@ func (h *MapHandler) rollbackPublishingClaim(
 		}
 		if validGoPublishingAliasReplay(
 			current, transition.claimTimestamp, transition.desired,
-		) {
+		) && transition.bindingMatches(current) {
 			now := h.monoTimeNow()
 			if now <= 0 {
 				return false
@@ -2186,11 +3216,11 @@ func (h *MapHandler) rollbackPublishingClaim(
 			active.Reserved = 0
 			updateErr := h.aliasReplays.Update(&transition.key, &active, ebpf.UpdateExist)
 			if err := h.aliasReplays.Lookup(&transition.key, &current); err != nil ||
-				!validActiveAliasReplay(current) {
+				!validActiveAliasReplay(current) || !transition.bindingMatches(current) {
 				return false
 			}
 			_ = updateErr
-		} else if !validActiveAliasReplay(current) {
+		} else if !validActiveAliasReplay(current) || !transition.bindingMatches(current) {
 			return false
 		}
 	}
@@ -2226,21 +3256,54 @@ func (h *MapHandler) prepareAliasReplayFinish(
 		}
 		return nil, nil, StatusTransportError
 	}
-	if state.Aliases > 0 && current.References == 0 {
+	markedAt, present, err := aliasReplayLookup[stateKey, uint64](h.ambiguity, key)
+	if err != nil {
+		return nil, nil, StatusTransportError
+	}
+	if !present {
 		return nil, nil, StatusAmbiguous
 	}
+	generationProof, bindingMatches, err := aliasReplayBindingMatchesGeneration(
+		h.aliasReplayGenerationMaps(), aliasReplayGenerationAuthority{
+			claimPresent:          true,
+			claim:                 claim,
+			ambiguity:             markedAt,
+			requireOldIndex:       true,
+			requireOldIncarnation: true,
+		}, key, state, current,
+	)
+	if err != nil {
+		return nil, nil, StatusTransportError
+	}
+	if !bindingMatches {
+		if generationProof.successorRequired {
+			return nil, nil, StatusOverload
+		}
+		return nil, nil, StatusAmbiguous
+	}
+	// BPF releases a carrier by decrementing replay References before state
+	// Aliases. Once the exact final claim is committed, that reachable
+	// cross-map window is cleanup state rather than a loss of delivery
+	// authority. The immutable generation proof below still fences every
+	// binding and lifecycle field; pre-claim lookup continues to require a
+	// nonzero reference in activeAliasReplay.
 	if validFinalAliasReplay(current) {
 		if current.Lifecycle != lifecycle {
 			return nil, nil, StatusAmbiguous
 		}
 		return nil, &aliasReplayFinishProof{
-			key:                 replayKey,
-			transitionTimestamp: current.TransitionMonotonicNS,
-			lifecycle:           lifecycle,
+			key:        replayKey,
+			value:      aliasReplayProofValue(current),
+			generation: generationProof,
 		}, StatusValid
 	}
 
-	transition := &aliasReplayTransition{key: replayKey}
+	transition := &aliasReplayTransition{
+		key:        replayKey,
+		binding:    aliasReplayBindingOf(current),
+		generation: generationProof,
+		ambiguity:  markedAt,
+	}
 	if validActiveAliasReplay(current) {
 		if status := h.publishAliasReplayTransition(
 			transition, claim, lifecycle,
@@ -2251,7 +3314,7 @@ func (h *MapHandler) prepareAliasReplayFinish(
 	}
 	if validGoPublishingAliasReplay(
 		current, claim.ObservedMonotonicNS, lifecycle,
-	) {
+	) && transition.bindingMatches(current) {
 		transition.claimTimestamp = claim.ObservedMonotonicNS
 		transition.desired = lifecycle
 		return transition, nil, StatusValid
@@ -2265,7 +3328,7 @@ func (h *MapHandler) commitFinalAliasReplay(
 	lifecycle uint8,
 ) (*aliasReplayFinishProof, Status) {
 	if existingProof != nil {
-		if h.aliasReplayFinishProofValid(existingProof) {
+		if h.aliasReplayFinishProofValueValid(existingProof) {
 			return existingProof, StatusValid
 		}
 		return nil, StatusAmbiguous
@@ -2285,18 +3348,18 @@ func (h *MapHandler) commitFinalAliasReplay(
 		return nil, StatusTransportError
 	}
 	if validFinalAliasReplay(current) {
-		if current.Lifecycle != lifecycle {
+		if current.Lifecycle != lifecycle || !transition.bindingMatches(current) {
 			return nil, StatusAmbiguous
 		}
 		return &aliasReplayFinishProof{
-			key:                 transition.key,
-			transitionTimestamp: current.TransitionMonotonicNS,
-			lifecycle:           lifecycle,
+			key:        transition.key,
+			value:      aliasReplayProofValue(current),
+			generation: transition.generation,
 		}, StatusValid
 	}
 	if !validGoPublishingAliasReplay(
 		current, transition.claimTimestamp, transition.desired,
-	) {
+	) || !transition.bindingMatches(current) {
 		return nil, statusForAliasReplay(current)
 	}
 	now := h.monoTimeNow()
@@ -2316,11 +3379,12 @@ func (h *MapHandler) commitFinalAliasReplay(
 		}
 		return nil, StatusTransportError
 	}
-	if validFinalAliasReplay(current) && current.Lifecycle == lifecycle {
+	if validFinalAliasReplay(current) && current.Lifecycle == lifecycle &&
+		transition.bindingMatches(current) {
 		return &aliasReplayFinishProof{
-			key:                 transition.key,
-			transitionTimestamp: current.TransitionMonotonicNS,
-			lifecycle:           lifecycle,
+			key:        transition.key,
+			value:      aliasReplayProofValue(current),
+			generation: transition.generation,
 		}, StatusValid
 	}
 	if updateErr != nil {
@@ -2329,7 +3393,7 @@ func (h *MapHandler) commitFinalAliasReplay(
 	return nil, statusForAliasReplay(current)
 }
 
-func (h *MapHandler) aliasReplayFinishProofValid(
+func (h *MapHandler) aliasReplayFinishProofValueValid(
 	proof *aliasReplayFinishProof,
 ) bool {
 	if proof == nil {
@@ -2337,8 +3401,36 @@ func (h *MapHandler) aliasReplayFinishProofValid(
 	}
 	var current aliasReplayValue
 	return h.aliasReplays.Lookup(&proof.key, &current) == nil &&
-		validFinalAliasReplay(current) && current.Lifecycle == proof.lifecycle &&
-		current.TransitionMonotonicNS == proof.transitionTimestamp
+		validFinalAliasReplay(current) && aliasReplayProofValueEqual(current, proof.value)
+}
+
+func (h *MapHandler) aliasReplayFinishProofValid(
+	fence generationTeardownFence,
+	proof *aliasReplayFinishProof,
+) bool {
+	if proof == nil {
+		return true
+	}
+	if !h.aliasReplayFinishProofValueValid(proof) {
+		proof.authorityFailed = true
+		return false
+	}
+	matches, err := aliasReplayGenerationContinuityMatches(
+		h.aliasReplayGenerationMaps(), aliasReplayGenerationAuthority{
+			claimPresent:          true,
+			claim:                 fence.claim,
+			guardPresent:          true,
+			guard:                 fence.guardClaim,
+			ambiguity:             fence.markedAt,
+			requireOldIndex:       true,
+			requireOldIncarnation: true,
+		}, fence.key, proof.generation.oldState, proof.value, &proof.generation,
+	)
+	if err != nil || !matches {
+		proof.authorityFailed = true
+		return false
+	}
+	return true
 }
 
 func (h *MapHandler) finishClaimed(
@@ -2375,6 +3467,24 @@ func (h *MapHandler) finish(
 		return result
 	}
 	key := stateKey{Owner: owner, Generation: generation}
+	var replayTransitionForResult *aliasReplayTransition
+	var replayProofForResult *aliasReplayFinishProof
+	defer func() {
+		if (replayTransitionForResult != nil &&
+			(replayTransitionForResult.generation.successor ||
+				replayTransitionForResult.generation.successorRequired)) ||
+			(replayProofForResult != nil &&
+				(replayProofForResult.generation.successor ||
+					replayProofForResult.generation.successorRequired)) {
+			result.successorRequired = true
+		}
+		if replayProofForResult != nil && replayProofForResult.authorityFailed {
+			result.deliveryAuthorityFailed = true
+		}
+		if result.successorRequired && !result.complete {
+			result.deliveryAuthorityFailed = true
+		}
+	}()
 	ownedGuard := generationClaim{}
 	defer func() {
 		if !result.complete && claim.ObservedMonotonicNS != 0 {
@@ -2420,7 +3530,10 @@ func (h *MapHandler) finish(
 	replayTransition, existingReplayProof, replayStatus := h.prepareAliasReplayFinish(
 		key, state, *claim, lifecycle,
 	)
+	replayTransitionForResult = replayTransition
+	replayProofForResult = existingReplayProof
 	if replayStatus != StatusValid {
+		result.deliveryAuthorityFailed = state.Aliases > 0
 		return result
 	}
 
@@ -2453,7 +3566,8 @@ func (h *MapHandler) finish(
 	result.mutationStarted = true
 
 	var currentState stateValue
-	if err := h.states.Lookup(&key, &currentState); err != nil || currentState != state ||
+	if err := h.states.Lookup(&key, &currentState); err != nil ||
+		!aliasReplayProofStateEqual(currentState, state) ||
 		!validFinishState(currentState, record, processIncarnation) {
 		return result
 	}
@@ -2545,8 +3659,12 @@ func (h *MapHandler) finish(
 	replayProof, replayStatus := h.commitFinalAliasReplay(
 		replayTransition, existingReplayProof, lifecycle,
 	)
+	replayProofForResult = replayProof
 	if replayStatus != StatusValid ||
 		!h.finishBarriersValid(fence, publishedTerminal, replayProof) {
+		if replayStatus != StatusValid && (replayTransition != nil || existingReplayProof != nil) {
+			result.deliveryAuthorityFailed = true
+		}
 		return result
 	}
 
@@ -2679,7 +3797,7 @@ func (h *MapHandler) finishBarriersValid(
 		return false
 	}
 	if len(replayProof) > 1 ||
-		(len(replayProof) == 1 && !h.aliasReplayFinishProofValid(replayProof[0])) {
+		(len(replayProof) == 1 && !h.aliasReplayFinishProofValid(fence, replayProof[0])) {
 		return false
 	}
 	var current terminalValue
@@ -2841,6 +3959,29 @@ func (h *MapHandler) releaseConnectionFenced(
 ) (connectionReleaseProof, bool) {
 	connectionKey := connectionInfoNS{Connection: connection, NetNS: connectionNetNS}
 	proof := connectionReleaseProof{connectionKey: connectionKey}
+	if replayProof != nil && replayProof.generation.successor {
+		graph := replayProof.generation.graph
+		if graph.binding.Connection != connection ||
+			graph.binding.ConnectionNetNS != connectionNetNS {
+			return proof, false
+		}
+		proof.cookieKey = connectionInfoNetNSCookie{
+			Connection:  connection,
+			NetNSCookie: graph.binding.ConnectionNetNSCookie,
+		}
+		// A same-socket successor owns both physical indexes. Preserve them and
+		// prove their complete logical graph under old E/G instead of attempting
+		// an old-generation delete against reusable C keys.
+		if !h.finishBarriersValid(fence, terminal, replayProof) ||
+			!h.connectionGenerationReleased(
+				h.connections, proof.connectionKey, fence.key.Owner, fence.key.Generation,
+			) || !h.connectionGenerationReleased(
+			h.cookieConnections, proof.cookieKey, fence.key.Owner, fence.key.Generation,
+		) || !h.finishBarriersValid(fence, terminal, replayProof) {
+			return proof, false
+		}
+		return proof, true
+	}
 	var claim connectionClaim
 	if err := h.connections.Lookup(&connectionKey, &claim); err != nil ||
 		!validConnectionClaim(claim, fence.key.Owner, fence.key.Generation, connectionNetNS) {

@@ -151,16 +151,17 @@ func (i *instrumenter) instrumentProbes(exe *link.Executable, probes map[string]
 func (i *instrumenter) kprobes(p KprobesTracer) error {
 	log := ilog().With("probes", "kprobes")
 	for kfunc, kprobes := range p.KProbes() {
-		log.Debug("going to add kprobe to function", "function", kfunc, "probes", kprobes)
+		target := kprobeTarget(kfunc, kprobes)
+		log.Debug("going to add kprobe to function", "function", target, "probes", kprobes)
 
-		err := i.kprobe(kfunc, kprobes)
+		err := i.kprobe(target, kprobes)
 		reportKprobeAttachResult(kprobes, err)
 		if err != nil {
 			if kprobes.Required {
 				if i.metrics != nil {
 					i.metrics.InstrumentationError(i.processName, imetrics.InstrumentationErrorAttachingKprobe)
 				}
-				return fmt.Errorf("instrumenting function %q: %w", kfunc, err)
+				return fmt.Errorf("instrumenting function %q: %w", target, err)
 			}
 
 			log.Debug("error instrumenting kprobe", "function", kfunc, "error", err)
@@ -169,6 +170,13 @@ func (i *instrumenter) kprobes(p KprobesTracer) error {
 	}
 
 	return nil
+}
+
+func kprobeTarget(mapKey string, probe ebpfcommon.ProbeDesc) string {
+	if probe.KProbeTarget != "" {
+		return probe.KProbeTarget
+	}
+	return mapKey
 }
 
 func reportKprobeAttachResult(probe ebpfcommon.ProbeDesc, err error) {

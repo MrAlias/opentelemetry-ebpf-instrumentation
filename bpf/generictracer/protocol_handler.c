@@ -32,6 +32,10 @@ int obi_handle_buf_with_args(void *ctx) {
     if (args->protocols.http && is_http(args->small_buf, MIN_HTTP_SIZE, &args->packet_type)) {
         bpf_tail_call(ctx, &jump_table, k_tail_protocol_http);
     }
+    // Successful tail calls do not return. If HTTP was not selected or its
+    // first dispatch missed, retire START's exclusive PUBLISHING cursor before
+    // any sibling protocol tail call can consume this invocation.
+    java_remote_parent_cleanup_unacked_http1_start(args);
 
     if (args->flags & k_call_protocol_flag_ssl_prewrite) {
         return 0;

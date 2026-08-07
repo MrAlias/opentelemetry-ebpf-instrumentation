@@ -6,11 +6,15 @@
 package generictracer_test
 
 import (
+	"bytes"
+	_ "embed"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/btf"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
@@ -20,6 +24,12 @@ import (
 	"go.opentelemetry.io/obi/pkg/internal/ebpf/tpinjector"
 	"go.opentelemetry.io/obi/pkg/internal/javabridge"
 )
+
+//go:embed bpf_x86_bpfel.o
+var legacyBPFX86Object []byte
+
+//go:embed bpf_arm64_bpfel.o
+var legacyBPFARM64Object []byte
 
 func TestJavaRemoteParentSharedMapSpecsAreCompatible(t *testing.T) {
 	genericSpec, err := generictracer.LoadBpf()
@@ -52,21 +62,31 @@ func TestJavaRemoteParentSharedMapSpecsAreCompatible(t *testing.T) {
 				}
 			}
 			for _, loader := range []string{"generic", "bridge", "primary"} {
-				cursor := specs[loader].Maps["java_remote_parent_receive_cursors"]
+				cursor := specs[loader].Maps["jrp_recv_cur"]
 				require.NotNil(t, cursor, loader)
-				require.Equal(t, ebpf.LRUHash, cursor.Type, loader)
+				require.Equal(t, ebpf.Hash, cursor.Type, loader)
 				require.Equal(t, uint32(8), cursor.KeySize, loader)
 				require.Equal(t, uint32(56), cursor.ValueSize, loader)
 				require.Zero(t, cursor.Flags, loader)
 				require.Equal(t, ebpfconvenience.PinInternal, cursor.Pinning, loader)
+				guard := specs[loader].Maps["jrp_recv_guard"]
+				require.NotNil(t, guard, loader)
+				require.Equal(t, ebpf.Hash, guard.Type, loader)
+				require.Equal(t, uint32(8), guard.KeySize, loader)
+				require.Equal(t, uint32(56), guard.ValueSize, loader)
+				require.Zero(t, guard.Flags, loader)
+				require.Equal(t, ebpfconvenience.PinInternal, guard.Pinning, loader)
 				if enabled {
 					require.Greater(t, cursor.MaxEntries, uint32(1), loader)
+					require.Equal(t, cursor.MaxEntries, guard.MaxEntries, loader)
 				} else {
 					require.Equal(t, uint32(1), cursor.MaxEntries, loader)
+					require.Equal(t, uint32(1), guard.MaxEntries, loader)
 				}
 			}
 			for _, loader := range []string{"tp", "go"} {
-				require.NotContains(t, specs[loader].Maps, "java_remote_parent_receive_cursors")
+				require.NotContains(t, specs[loader].Maps, "jrp_recv_cur")
+				require.NotContains(t, specs[loader].Maps, "jrp_recv_guard")
 			}
 			for loader, spec := range specs {
 				for _, mapName := range []string{
@@ -235,6 +255,1145 @@ func TestBPFProgramsStayWithinVerifierMapLimit(t *testing.T) {
 	references := referencedProgramMaps(spec, tcpClose)
 	require.Len(t, references, verifierMapLimit)
 	require.Contains(t, references, "java_remote_parent_alias_replays")
+	require.NotContains(t, references, "jrp_recv_cur")
+	require.NotContains(t, references, "jrp_recv_guard")
+
+	javaClose := spec.Programs["obi_kprobe_java_remote_parent_tcp_close"]
+	require.NotNil(t, javaClose)
+	javaCloseReferences := referencedProgramMaps(spec, javaClose)
+	require.LessOrEqual(t, len(javaCloseReferences), verifierMapLimit)
+	require.Contains(t, javaCloseReferences, "jrp_recv_cur")
+	require.Contains(t, javaCloseReferences, "jrp_recv_guard")
+	require.NotContains(t, javaCloseReferences, "jump_table")
+}
+
+func TestJavaRemoteParentCloseWorkspaceIsPrivateAndBounded(t *testing.T) {
+	const workspaceName = "java_remote_parent_close_workspace_storage"
+
+	spec, err := generictracer.LoadBpf()
+	require.NoError(t, err)
+
+	workspace := spec.Maps[workspaceName]
+	require.NotNil(t, workspace)
+	require.Equal(t, ebpf.PerCPUArray, workspace.Type)
+	require.Equal(t, uint32(4), workspace.KeySize)
+	require.Equal(t, uint32(160), workspace.ValueSize)
+	require.Equal(t, uint32(1), workspace.MaxEntries)
+	require.Zero(t, workspace.Flags)
+	require.Equal(t, ebpf.PinNone, workspace.Pinning)
+
+	const javaCloseName = "obi_kprobe_java_remote_parent_tcp_close"
+	javaClose := spec.Programs[javaCloseName]
+	require.NotNil(t, javaClose)
+	require.Contains(t, referencedProgramMaps(spec, javaClose), workspaceName)
+
+	var referencingPrograms []string
+	for programName, program := range spec.Programs {
+		if _, referencesWorkspace := referencedProgramMaps(spec, program)[workspaceName]; referencesWorkspace {
+			referencingPrograms = append(referencingPrograms, programName)
+		}
+	}
+	require.ElementsMatch(t, []string{javaCloseName}, referencingPrograms)
+}
+
+const (
+	legacyBPFStackLimit   = 512
+	legacyBPFStackQuantum = 32
+	// Keep at least one allocation quantum below the verifier's hard limit so
+	// a small compiler spill cannot silently break the supported old-kernel
+	// matrix.
+	legacyBPFStackBudget = legacyBPFStackLimit - legacyBPFStackQuantum
+)
+
+type legacyBPFFrame struct {
+	name          string
+	raw           int
+	measured      bool
+	calls         []string
+	pointerParams [5]bool
+	start         int
+	end           int
+}
+
+func TestJavaRemoteParentCloseFitsLegacyCombinedStack(t *testing.T) {
+	const root = "obi_kprobe_java_remote_parent_tcp_close"
+
+	for _, object := range []struct {
+		name string
+		data []byte
+	}{
+		{name: "bpf_x86_bpfel.o", data: legacyBPFX86Object},
+		{name: "bpf_arm64_bpfel.o", data: legacyBPFARM64Object},
+	} {
+		t.Run(object.name, func(t *testing.T) {
+			spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(object.data))
+			require.NoError(t, err)
+			program := spec.Programs[root]
+			require.NotNil(t, program)
+
+			combined, path, err := legacyBPFCombinedStack(program.Instructions, root)
+			require.NoError(t, err)
+			t.Logf(
+				"legacy combined stack %d bytes (margin %d): %s",
+				combined,
+				legacyBPFStackLimit-combined,
+				strings.Join(path, " -> "),
+			)
+			require.LessOrEqualf(
+				t,
+				combined,
+				legacyBPFStackBudget,
+				"legacy combined stack %d exceeds %d-byte budget (kernel limit %d, margin %d); path: %s",
+				combined,
+				legacyBPFStackBudget,
+				legacyBPFStackLimit,
+				legacyBPFStackLimit-combined,
+				strings.Join(path, " -> "),
+			)
+		})
+	}
+}
+
+func TestLegacyBPFFrameDepthTracksDerivedFramePointers(t *testing.T) {
+	chained := asm.Instructions{
+		asm.Mov.Reg(asm.R2, asm.RFP),
+		asm.Add.Imm(asm.R2, -32),
+		asm.Mov.Reg(asm.R3, asm.R2),
+		asm.Add.Imm(asm.R3, -32),
+		asm.StoreImm(asm.R3, 0, 0, asm.DWord),
+	}
+
+	depth, err := legacyBPFFrameStackDepth(chained)
+	require.NoError(t, err)
+	require.Equal(t, 64, depth)
+
+	spilled := asm.Instructions{
+		asm.Mov.Reg(asm.R2, asm.RFP),
+		asm.Add.Imm(asm.R2, -32),
+		asm.StoreMem(asm.RFP, -8, asm.R2, asm.DWord),
+		asm.LoadMem(asm.R3, asm.RFP, -8, asm.DWord),
+		asm.Add.Imm(asm.R3, -32),
+		asm.StoreImm(asm.R3, 0, 0, asm.DWord),
+	}
+	depth, err = legacyBPFFrameStackDepth(spilled)
+	require.NoError(t, err)
+	require.Equal(t, 64, depth)
+
+	negativeParameter := asm.Instructions{
+		asm.Mov.Reg(asm.R2, asm.R1),
+		asm.Add.Imm(asm.R2, -8),
+		asm.StoreImm(asm.R2, 0, 0, asm.DWord),
+	}
+	_, err = legacyBPFFrameStackDepthForParams(
+		negativeParameter, [5]bool{true},
+	)
+	require.ErrorContains(t, err, "negative arithmetic on an external pointer parameter")
+
+	_, err = legacyBPFFrameStackDepthForParams(
+		asm.Instructions{asm.Mov.Reg(asm.R0, asm.R1), asm.Return()},
+		[5]bool{true},
+	)
+	require.ErrorContains(t, err, "returns a derived pointer")
+
+	_, err = legacyBPFFrameStackDepth(asm.Instructions{asm.LongJump("target")})
+	require.ErrorContains(t, err, "unsupported long jump")
+	_, err = legacyBPFFrameStackDepth(asm.Instructions{asm.FnTailCall.Call()})
+	require.ErrorContains(t, err, "unsupported tail call")
+	callback := asm.LoadImm(asm.R1, 0, asm.DWord).WithReference("callback")
+	callback.Src = asm.PseudoFunc
+	_, err = legacyBPFFrameStackDepth(asm.Instructions{callback})
+	require.ErrorContains(t, err, "unsupported function pointer")
+
+	knownOrUnknown := asm.Instructions{
+		asm.JEq.Imm(asm.R4, 0, "unknown"),
+		asm.Mov.Imm(asm.R2, 8),
+		asm.Ja.Label("join"),
+		asm.Mov.Reg(asm.R2, asm.R4),
+		asm.Mov.Reg(asm.R3, asm.R1),
+		asm.Add.Reg(asm.R3, asm.R2),
+		asm.StoreImm(asm.R3, 0, 0, asm.DWord),
+	}
+	knownOrUnknown[0].Offset = 2
+	knownOrUnknown[2].Offset = 1
+	_, err = legacyBPFFrameStackDepthForParams(knownOrUnknown, [5]bool{true})
+	require.ErrorContains(t, err, "derived pointer arithmetic uses an unknown register")
+
+	embeddedCallerStackPointer := asm.Instructions{
+		asm.LoadMem(asm.R2, asm.R1, 0, asm.DWord),
+		asm.Add.Imm(asm.R2, -64),
+		asm.StoreImm(asm.R2, 0, 0, asm.DWord),
+	}
+	_, err = legacyBPFFrameStackDepthForParams(
+		embeddedCallerStackPointer, [5]bool{true},
+	)
+	require.ErrorContains(t, err, "possible caller-stack pointer")
+
+	calleePointerParams := legacyBPFCallPointerParams{
+		"callee": {true},
+	}
+	unsafeAggregateCall := asm.Instructions{
+		asm.Mov.Reg(asm.R2, asm.RFP),
+		asm.Add.Imm(asm.R2, -64),
+		asm.StoreMem(asm.RFP, -16, asm.R2, asm.DWord),
+		asm.Mov.Reg(asm.R1, asm.RFP),
+		asm.Add.Imm(asm.R1, -16),
+		asm.Call.Label("callee"),
+		asm.Return(),
+	}
+	_, err = legacyBPFFrameStackDepthWithCalls(
+		unsafeAggregateCall, [5]bool{}, calleePointerParams, false,
+	)
+	require.ErrorContains(t, err, "reachable embedded pointer spill")
+
+	scalarAggregateCall := asm.Instructions{
+		asm.StoreImm(asm.RFP, -16, 1, asm.DWord),
+		asm.Mov.Reg(asm.R1, asm.RFP),
+		asm.Add.Imm(asm.R1, -16),
+		asm.Call.Label("callee"),
+		asm.Return(),
+	}
+	depth, err = legacyBPFFrameStackDepthWithCalls(
+		scalarAggregateCall, [5]bool{}, calleePointerParams, false,
+	)
+	require.NoError(t, err)
+	require.Equal(t, 16, depth)
+
+	joinedFrameOrExternalStore := asm.Instructions{
+		asm.JEq.Imm(asm.R4, 0, "external"),
+		asm.Mov.Reg(asm.R3, asm.RFP),
+		asm.Add.Imm(asm.R3, -16),
+		asm.Ja.Label("join"),
+		asm.Mov.Reg(asm.R3, asm.R1),
+		asm.Mov.Reg(asm.R2, asm.RFP),
+		asm.Add.Imm(asm.R2, -64),
+		asm.StoreMem(asm.R3, 0, asm.R2, asm.DWord),
+	}
+	joinedFrameOrExternalStore[0].Offset = 3
+	joinedFrameOrExternalStore[3].Offset = 1
+	_, err = legacyBPFFrameStackDepthForParams(
+		joinedFrameOrExternalStore, [5]bool{true},
+	)
+	require.ErrorContains(t, err, "stores a derived pointer outside the current stack frame")
+}
+
+func TestLegacyBPFCombinedStackRejectsEveryDeepSibling(t *testing.T) {
+	instructions := asm.Instructions{
+		legacyBPFSyntheticFunctionStart("root", asm.Mov.Imm(asm.R0, 0)),
+		asm.Call.Label("wide"),
+		asm.Call.Label("deep1"),
+		asm.Return(),
+		legacyBPFSyntheticFunctionStart(
+			"wide", asm.StoreImm(asm.RFP, -300, 0, asm.DWord),
+		),
+		asm.Return(),
+	}
+	for frame := 1; frame <= 8; frame++ {
+		name := fmt.Sprintf("deep%d", frame)
+		instructions = append(
+			instructions,
+			legacyBPFSyntheticFunctionStart(name, asm.Mov.Imm(asm.R0, 0)),
+		)
+		if frame < 8 {
+			instructions = append(instructions, asm.Call.Label(fmt.Sprintf("deep%d", frame+1)))
+		}
+		instructions = append(instructions, asm.Return())
+	}
+
+	_, _, err := legacyBPFCombinedStack(instructions, "root")
+	require.ErrorContains(t, err, "BPF call path exceeds eight frames")
+}
+
+func legacyBPFSyntheticFunctionStart(name string, instruction asm.Instruction) asm.Instruction {
+	function := &btf.Func{
+		Name: name,
+		Type: &btf.FuncProto{Return: &btf.Int{Size: 4}},
+	}
+	return btf.WithFuncMetadata(instruction, function).WithSymbol(name)
+}
+
+func legacyBPFCombinedStack(
+	instructions asm.Instructions,
+	root string,
+) (int, []string, error) {
+	frames, err := legacyBPFFrames(instructions)
+	if err != nil {
+		return 0, nil, err
+	}
+	callPointerParams := make(legacyBPFCallPointerParams, len(frames))
+	for name, frame := range frames {
+		callPointerParams[name] = frame.pointerParams
+	}
+
+	active := make(map[string]bool)
+	var walk func(string) (int, []string, error)
+	walk = func(name string) (int, []string, error) {
+		frame := frames[name]
+		if frame == nil {
+			return 0, nil, fmt.Errorf("BPF function %q has no frame metadata", name)
+		}
+		if active[name] {
+			return 0, nil, fmt.Errorf("recursive BPF call through %q", name)
+		}
+		if !frame.measured {
+			stackParams := frame.pointerParams
+			if name == root {
+				// Entry context is kernel-owned memory, never an ancestor BPF
+				// stack frame. Only subprogram pointer parameters can carry
+				// caller-stack provenance.
+				stackParams = [5]bool{}
+			}
+			depth, err := legacyBPFFrameStackDepthWithCalls(
+				instructions[frame.start:frame.end], stackParams, callPointerParams, false,
+			)
+			if err != nil {
+				return 0, nil, fmt.Errorf("measure BPF function %q: %w", frame.name, err)
+			}
+			frame.raw = depth
+			frame.measured = true
+		}
+		active[name] = true
+		defer delete(active, name)
+
+		rounded := legacyBPFRoundedFrame(frame.raw)
+		frameLabel := fmt.Sprintf("%s(%d->%d)", name, frame.raw, rounded)
+		maxChild := 0
+		var maxChildPath []string
+		for _, callee := range frame.calls {
+			child, childPath, err := walk(callee)
+			if err != nil {
+				return 0, nil, err
+			}
+			candidatePath := append([]string{frameLabel}, childPath...)
+			if len(candidatePath) > 8 {
+				return 0, nil, fmt.Errorf(
+					"BPF call path exceeds eight frames: %s",
+					strings.Join(candidatePath, " -> "),
+				)
+			}
+			if child > maxChild {
+				maxChild = child
+				maxChildPath = childPath
+			}
+		}
+
+		path := append([]string{frameLabel}, maxChildPath...)
+		return rounded + maxChild, path, nil
+	}
+
+	return walk(root)
+}
+
+func legacyBPFFrames(instructions asm.Instructions) (map[string]*legacyBPFFrame, error) {
+	frames := make(map[string]*legacyBPFFrame)
+	var current *legacyBPFFrame
+	for index := range instructions {
+		instruction := &instructions[index]
+		if function := btf.FuncMetadata(instruction); function != nil {
+			if current != nil {
+				current.end = index
+			}
+			symbol := instruction.Symbol()
+			if symbol == "" || symbol != function.Name {
+				return nil, fmt.Errorf(
+					"BTF function %q does not match instruction symbol %q",
+					function.Name,
+					symbol,
+				)
+			}
+			if frames[function.Name] != nil {
+				return nil, fmt.Errorf("duplicate BPF function %q", function.Name)
+			}
+			current = &legacyBPFFrame{name: function.Name, start: index}
+			prototype, ok := btf.UnderlyingType(function.Type).(*btf.FuncProto)
+			if !ok {
+				return nil, fmt.Errorf("BPF function %q has no prototype", function.Name)
+			}
+			if len(prototype.Params) > len(current.pointerParams) {
+				return nil, fmt.Errorf(
+					"BPF function %q has %d parameters; at most five are supported",
+					function.Name,
+					len(prototype.Params),
+				)
+			}
+			for parameter, definition := range prototype.Params {
+				_, current.pointerParams[parameter] =
+					btf.UnderlyingType(definition.Type).(*btf.Pointer)
+			}
+			frames[function.Name] = current
+		}
+		if current == nil {
+			return nil, fmt.Errorf("instruction %d precedes BTF function metadata", index)
+		}
+		if instruction.IsBuiltinCall() && instruction.Constant == int64(asm.FnTailCall) {
+			return nil, fmt.Errorf("tail call in BPF function %q is unsupported", current.name)
+		}
+		if instruction.OpCode.Class() == asm.Jump32Class &&
+			instruction.OpCode.JumpOp() == asm.Ja {
+			return nil, fmt.Errorf("long jump in BPF function %q is unsupported", current.name)
+		}
+		if instruction.IsLoadOfFunctionPointer() {
+			return nil, fmt.Errorf(
+				"function-pointer callback in BPF function %q is unsupported",
+				current.name,
+			)
+		}
+
+		if instruction.IsFunctionCall() {
+			callee := instruction.Reference()
+			if callee == "" {
+				return nil, fmt.Errorf(
+					"unresolved pseudo-call in %q at instruction %d",
+					current.name,
+					index,
+				)
+			}
+			current.calls = append(current.calls, callee)
+		}
+	}
+	if current == nil {
+		return nil, fmt.Errorf("BPF program has no function metadata")
+	}
+	current.end = len(instructions)
+
+	return frames, nil
+}
+
+const (
+	legacyBPFRegisterCount      = int(asm.RFP) + 1
+	legacyBPFMaxRegisterOffsets = 64
+)
+
+type legacyBPFCallPointerParams map[string][5]bool
+
+type legacyBPFRegisterState [legacyBPFRegisterCount]map[int]struct{}
+
+type legacyBPFFrameState struct {
+	frameOffsets         legacyBPFRegisterState
+	externalOffsets      legacyBPFRegisterState
+	constants            legacyBPFRegisterState
+	constantKnown        [legacyBPFRegisterCount]bool
+	possibleStackPointer [legacyBPFRegisterCount]bool
+	stackPointers        map[int]legacyBPFSpilledPointer
+}
+
+type legacyBPFSpilledPointer struct {
+	frameOffsets         map[int]struct{}
+	externalOffsets      map[int]struct{}
+	possibleStackPointer bool
+}
+
+func legacyBPFFrameStackDepth(instructions asm.Instructions) (int, error) {
+	return legacyBPFFrameStackDepthForParams(instructions, [5]bool{})
+}
+
+func legacyBPFFrameStackDepthForParams(
+	instructions asm.Instructions,
+	pointerParams [5]bool,
+) (int, error) {
+	return legacyBPFFrameStackDepthWithCalls(instructions, pointerParams, nil, true)
+}
+
+func legacyBPFFrameStackDepthWithCalls(
+	instructions asm.Instructions,
+	pointerParams [5]bool,
+	callPointerParams legacyBPFCallPointerParams,
+	taintExternalLoads bool,
+) (int, error) {
+	if len(instructions) == 0 {
+		return 0, fmt.Errorf("empty function")
+	}
+
+	rawPC := make([]int, len(instructions))
+	rawToIndex := make(map[int]int, len(instructions))
+	nextRawPC := 0
+	for index, instruction := range instructions {
+		rawPC[index] = nextRawPC
+		rawToIndex[nextRawPC] = index
+		nextRawPC += int(instruction.Width())
+	}
+
+	states := make([]legacyBPFFrameState, len(instructions))
+	reached := make([]bool, len(instructions))
+	queued := []int{0}
+	reached[0] = true
+	states[0].frameOffsets[asm.RFP] = map[int]struct{}{0: {}}
+	for parameter, pointer := range pointerParams {
+		if pointer {
+			states[0].externalOffsets[asm.R1+asm.Register(parameter)] =
+				map[int]struct{}{0: {}}
+		}
+	}
+	depth := 0
+
+	for len(queued) > 0 {
+		index := queued[0]
+		queued = queued[1:]
+		instruction := &instructions[index]
+		state := legacyBPFCloneFrameState(states[index])
+		legacyBPFRecordStateDepth(state.frameOffsets, &depth)
+
+		if instruction.IsBuiltinCall() && instruction.Constant == int64(asm.FnTailCall) {
+			return 0, fmt.Errorf("instruction %d uses an unsupported tail call", index)
+		}
+		if instruction.IsLoadOfFunctionPointer() {
+			return 0, fmt.Errorf("instruction %d loads an unsupported function pointer", index)
+		}
+		if err := legacyBPFApplyInstruction(
+			&state, instruction, &depth, callPointerParams, taintExternalLoads,
+		); err != nil {
+			return 0, fmt.Errorf("instruction %d (%v): %w", index, instruction, err)
+		}
+		if instruction.OpCode.Class() == asm.Jump32Class &&
+			instruction.OpCode.JumpOp() == asm.Ja {
+			return 0, fmt.Errorf("instruction %d uses an unsupported long jump", index)
+		}
+
+		successors := make([]int, 0, 2)
+		if instruction.OpCode.Class().IsJump() {
+			switch instruction.OpCode.JumpOp() {
+			case asm.Exit:
+				continue
+			case asm.Call:
+				if index+1 < len(instructions) {
+					successors = append(successors, index+1)
+				}
+			case asm.Ja:
+				target, err := legacyBPFJumpTarget(instruction, index, rawPC, rawToIndex)
+				if err != nil {
+					return 0, err
+				}
+				successors = append(successors, target)
+			default:
+				target, err := legacyBPFJumpTarget(instruction, index, rawPC, rawToIndex)
+				if err != nil {
+					return 0, err
+				}
+				successors = append(successors, target)
+				if index+1 < len(instructions) {
+					successors = append(successors, index+1)
+				}
+			}
+		} else if index+1 < len(instructions) {
+			successors = append(successors, index+1)
+		}
+
+		for _, successor := range successors {
+			if !reached[successor] {
+				states[successor] = legacyBPFCloneFrameState(state)
+				reached[successor] = true
+				queued = append(queued, successor)
+				continue
+			}
+			changed, err := legacyBPFMergeFrameState(&states[successor], state)
+			if err != nil {
+				return 0, fmt.Errorf("merge into instruction %d: %w", successor, err)
+			}
+			if changed {
+				queued = append(queued, successor)
+			}
+		}
+	}
+
+	return depth, nil
+}
+
+func legacyBPFApplyInstruction(
+	state *legacyBPFFrameState,
+	instruction *asm.Instruction,
+	depth *int,
+	callPointerParams legacyBPFCallPointerParams,
+	taintExternalLoads bool,
+) error {
+	class := instruction.OpCode.Class()
+	switch class {
+	case asm.LdXClass:
+		if err := legacyBPFRecordAccess(state, instruction.Src, int(instruction.Offset), depth); err != nil {
+			return err
+		}
+		frameOffsets, externalOffsets, possibleStackPointer, err :=
+			legacyBPFLoadStackPointer(state, instruction)
+		if err != nil {
+			return err
+		}
+		if taintExternalLoads && instruction.OpCode.Size() == asm.DWord &&
+			len(state.externalOffsets[instruction.Src]) > 0 {
+			// A pointer parameter can address a caller stack aggregate. A DWord
+			// field can therefore contain a spilled pointer whose verifier
+			// provenance must not disappear at the load boundary.
+			possibleStackPointer = true
+		}
+		state.frameOffsets[instruction.Dst] = frameOffsets
+		state.externalOffsets[instruction.Dst] = externalOffsets
+		state.constants[instruction.Dst] = nil
+		state.constantKnown[instruction.Dst] = false
+		state.possibleStackPointer[instruction.Dst] = possibleStackPointer
+	case asm.LdClass:
+		state.frameOffsets[instruction.Dst] = nil
+		state.externalOffsets[instruction.Dst] = nil
+		state.constants[instruction.Dst] = nil
+		state.constantKnown[instruction.Dst] = false
+		state.possibleStackPointer[instruction.Dst] = false
+	case asm.StClass, asm.StXClass:
+		if err := legacyBPFRecordAccess(state, instruction.Dst, int(instruction.Offset), depth); err != nil {
+			return err
+		}
+		legacyBPFClearDirectStackStore(state, instruction)
+		if class == asm.StXClass {
+			if err := legacyBPFStoreStackPointer(state, instruction); err != nil {
+				return err
+			}
+		}
+	case asm.ALUClass:
+		if legacyBPFRegisterHasPointer(state, instruction.Dst) ||
+			(instruction.OpCode.Source() == asm.RegSource &&
+				legacyBPFRegisterHasPointer(state, instruction.Src)) {
+			return fmt.Errorf("32-bit ALU operation on a frame-derived pointer")
+		}
+		state.frameOffsets[instruction.Dst] = nil
+		state.externalOffsets[instruction.Dst] = nil
+		state.constants[instruction.Dst] = nil
+		state.constantKnown[instruction.Dst] = false
+		state.possibleStackPointer[instruction.Dst] = false
+	case asm.ALU64Class:
+		if err := legacyBPFApplyALU64(state, instruction); err != nil {
+			return err
+		}
+	}
+
+	if class.IsJump() && instruction.OpCode.JumpOp() == asm.Call {
+		if instruction.IsFunctionCall() {
+			callee := instruction.Reference()
+			calleeParams, resolved := callPointerParams[callee]
+			for register := asm.R1; register <= asm.R5; register++ {
+				if state.possibleStackPointer[register] {
+					return fmt.Errorf(
+						"forwards a possible embedded caller-stack pointer %s to BPF function %q",
+						register,
+						callee,
+					)
+				}
+				parameter := int(register - asm.R1)
+				hasFramePointer := len(state.frameOffsets[register]) > 0
+				hasExternalPointer := len(state.externalOffsets[register]) > 0
+				if (hasFramePointer || hasExternalPointer) &&
+					(!resolved || !calleeParams[parameter]) {
+					return fmt.Errorf(
+						"passes stack-derived pointer %s to non-pointer parameter of BPF function %q",
+						register,
+						callee,
+					)
+				}
+				if hasFramePointer && legacyBPFFrameArgumentCanReachPointerSpill(state, register) {
+					return fmt.Errorf(
+						"passes current-frame pointer %s with a reachable embedded pointer spill to BPF function %q",
+						register,
+						callee,
+					)
+				}
+			}
+		}
+		for register := asm.R0; register <= asm.R5; register++ {
+			state.frameOffsets[register] = nil
+			state.externalOffsets[register] = nil
+			state.constants[register] = nil
+			state.constantKnown[register] = false
+			state.possibleStackPointer[register] = false
+		}
+	}
+	if class.IsJump() && instruction.OpCode.JumpOp() == asm.Exit &&
+		(legacyBPFRegisterHasPointer(state, asm.R0) || state.possibleStackPointer[asm.R0]) {
+		return fmt.Errorf("returns a derived pointer")
+	}
+	legacyBPFRecordStateDepth(state.frameOffsets, depth)
+	return nil
+}
+
+func legacyBPFApplyALU64(state *legacyBPFFrameState, instruction *asm.Instruction) error {
+	if instruction.Dst == asm.RFP {
+		return fmt.Errorf("writes frame pointer")
+	}
+	sourceIsRegister := instruction.OpCode.Source() == asm.RegSource
+	switch instruction.OpCode.ALUOp() {
+	case asm.Mov:
+		if sourceIsRegister {
+			state.frameOffsets[instruction.Dst] =
+				legacyBPFCloneOffsets(state.frameOffsets[instruction.Src])
+			state.externalOffsets[instruction.Dst] =
+				legacyBPFCloneOffsets(state.externalOffsets[instruction.Src])
+			state.constants[instruction.Dst] =
+				legacyBPFCloneOffsets(state.constants[instruction.Src])
+			state.constantKnown[instruction.Dst] = state.constantKnown[instruction.Src]
+			state.possibleStackPointer[instruction.Dst] =
+				state.possibleStackPointer[instruction.Src]
+		} else {
+			state.frameOffsets[instruction.Dst] = nil
+			state.externalOffsets[instruction.Dst] = nil
+			state.constants[instruction.Dst] = map[int]struct{}{int(instruction.Constant): {}}
+			state.constantKnown[instruction.Dst] = true
+			state.possibleStackPointer[instruction.Dst] = false
+		}
+	case asm.Add, asm.Sub:
+		if state.possibleStackPointer[instruction.Dst] ||
+			(sourceIsRegister && state.possibleStackPointer[instruction.Src]) {
+			return fmt.Errorf("arithmetic on a possible caller-stack pointer loaded through a parameter")
+		}
+		if sourceIsRegister {
+			destinationPointer := legacyBPFRegisterHasPointer(state, instruction.Dst)
+			sourcePointer := legacyBPFRegisterHasPointer(state, instruction.Src)
+			if destinationPointer && sourcePointer {
+				return fmt.Errorf("arithmetic combines two derived pointers")
+			}
+			if destinationPointer {
+				if !state.constantKnown[instruction.Src] {
+					return fmt.Errorf("derived pointer arithmetic uses an unknown register")
+				}
+				sign := 1
+				if instruction.OpCode.ALUOp() == asm.Sub {
+					sign = -1
+				}
+				state.frameOffsets[instruction.Dst] = legacyBPFCombineOffsets(
+					state.frameOffsets[instruction.Dst], state.constants[instruction.Src], sign,
+				)
+				state.externalOffsets[instruction.Dst] = legacyBPFCombineOffsets(
+					state.externalOffsets[instruction.Dst], state.constants[instruction.Src], sign,
+				)
+				state.constants[instruction.Dst] = nil
+				state.constantKnown[instruction.Dst] = false
+			} else if sourcePointer {
+				if instruction.OpCode.ALUOp() == asm.Sub {
+					return fmt.Errorf("subtracts a derived pointer from a scalar")
+				}
+				if !state.constantKnown[instruction.Dst] {
+					return fmt.Errorf("derived pointer arithmetic uses an unknown register")
+				}
+				state.frameOffsets[instruction.Dst] = legacyBPFCombineOffsets(
+					state.frameOffsets[instruction.Src], state.constants[instruction.Dst], 1,
+				)
+				state.externalOffsets[instruction.Dst] = legacyBPFCombineOffsets(
+					state.externalOffsets[instruction.Src], state.constants[instruction.Dst], 1,
+				)
+				state.constants[instruction.Dst] = nil
+				state.constantKnown[instruction.Dst] = false
+			} else {
+				if state.constantKnown[instruction.Dst] && state.constantKnown[instruction.Src] {
+					sign := 1
+					if instruction.OpCode.ALUOp() == asm.Sub {
+						sign = -1
+					}
+					state.constants[instruction.Dst] = legacyBPFCombineOffsets(
+						state.constants[instruction.Dst], state.constants[instruction.Src], sign,
+					)
+				} else {
+					state.constants[instruction.Dst] = nil
+					state.constantKnown[instruction.Dst] = false
+				}
+				state.frameOffsets[instruction.Dst] = nil
+				state.externalOffsets[instruction.Dst] = nil
+			}
+		} else {
+			delta := int(instruction.Constant)
+			if instruction.OpCode.ALUOp() == asm.Sub {
+				delta = -delta
+			}
+			if legacyBPFRegisterHasPointer(state, instruction.Dst) {
+				state.frameOffsets[instruction.Dst] =
+					legacyBPFAdjustOffsets(state.frameOffsets[instruction.Dst], delta)
+				state.externalOffsets[instruction.Dst] =
+					legacyBPFAdjustOffsets(state.externalOffsets[instruction.Dst], delta)
+				state.constants[instruction.Dst] = nil
+				state.constantKnown[instruction.Dst] = false
+			} else if state.constantKnown[instruction.Dst] {
+				state.constants[instruction.Dst] =
+					legacyBPFAdjustOffsets(state.constants[instruction.Dst], delta)
+			} else {
+				state.constants[instruction.Dst] = nil
+			}
+		}
+		for offset := range state.externalOffsets[instruction.Dst] {
+			if offset < 0 {
+				return fmt.Errorf("negative arithmetic on an external pointer parameter")
+			}
+		}
+	default:
+		if legacyBPFRegisterHasPointer(state, instruction.Dst) ||
+			(sourceIsRegister && legacyBPFRegisterHasPointer(state, instruction.Src)) {
+			return fmt.Errorf("unsupported ALU operation on a frame-derived pointer")
+		}
+		state.frameOffsets[instruction.Dst] = nil
+		state.externalOffsets[instruction.Dst] = nil
+		state.constants[instruction.Dst] = nil
+		state.constantKnown[instruction.Dst] = false
+		state.possibleStackPointer[instruction.Dst] = false
+	}
+	if len(state.frameOffsets[instruction.Dst]) > legacyBPFMaxRegisterOffsets ||
+		len(state.externalOffsets[instruction.Dst]) > legacyBPFMaxRegisterOffsets ||
+		len(state.constants[instruction.Dst]) > legacyBPFMaxRegisterOffsets {
+		return fmt.Errorf("too many frame-pointer offsets in register %s", instruction.Dst)
+	}
+	return nil
+}
+
+func legacyBPFRecordAccess(
+	state *legacyBPFFrameState,
+	register asm.Register,
+	offset int,
+	depth *int,
+) error {
+	if int(register) >= legacyBPFRegisterCount {
+		return fmt.Errorf("invalid memory-base register %s", register)
+	}
+	if state.possibleStackPointer[register] {
+		return fmt.Errorf("dereferences a possible caller-stack pointer loaded through a parameter")
+	}
+	for base := range state.frameOffsets[register] {
+		legacyBPFRecordOffset(base+offset, depth)
+	}
+	for base := range state.externalOffsets[register] {
+		if base+offset < 0 {
+			return fmt.Errorf("negative access through an external pointer parameter")
+		}
+	}
+	return nil
+}
+
+func legacyBPFClearDirectStackStore(
+	state *legacyBPFFrameState,
+	instruction *asm.Instruction,
+) {
+	if instruction.Dst != asm.RFP || len(state.stackPointers) == 0 {
+		return
+	}
+	storeStart := int(instruction.Offset)
+	storeEnd := storeStart + instruction.OpCode.Size().Sizeof()
+	for slot := range state.stackPointers {
+		if storeStart < slot+8 && slot < storeEnd {
+			delete(state.stackPointers, slot)
+		}
+	}
+}
+
+func legacyBPFFrameArgumentCanReachPointerSpill(
+	state *legacyBPFFrameState,
+	register asm.Register,
+) bool {
+	for base := range state.frameOffsets[register] {
+		for slot := range state.stackPointers {
+			// A callee may only move forward from a caller-stack argument.
+			// Any negative derivation is rejected while measuring that callee.
+			// Therefore only pointer spills at or above the argument base can
+			// be loaded through it and hide their verifier provenance.
+			if slot >= base && slot < 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func legacyBPFStoreStackPointer(
+	state *legacyBPFFrameState,
+	instruction *asm.Instruction,
+) error {
+	if !legacyBPFRegisterHasPointer(state, instruction.Src) &&
+		!state.possibleStackPointer[instruction.Src] {
+		return nil
+	}
+	if instruction.OpCode.Size() != asm.DWord {
+		return fmt.Errorf("stores a derived pointer with non-DWord width")
+	}
+	if len(state.externalOffsets[instruction.Dst]) > 0 {
+		return fmt.Errorf("stores a derived pointer outside the current stack frame")
+	}
+	if len(state.frameOffsets[instruction.Dst]) == 0 {
+		return fmt.Errorf("stores a derived pointer outside the current stack frame")
+	}
+	if state.stackPointers == nil {
+		state.stackPointers = make(map[int]legacyBPFSpilledPointer)
+	}
+	// Direct RFP stores clear definite overlaps above. For derived or joined
+	// bases, retain earlier provenance and union the new pointer. That can
+	// overcount ambiguous slot reuse but cannot hide a deeper verifier path.
+	for base := range state.frameOffsets[instruction.Dst] {
+		address := base + int(instruction.Offset)
+		if address >= 0 {
+			return fmt.Errorf("stores a derived pointer at non-stack offset %d", address)
+		}
+		slot := state.stackPointers[address]
+		slot.frameOffsets = legacyBPFUnionOffsets(
+			slot.frameOffsets, state.frameOffsets[instruction.Src],
+		)
+		slot.externalOffsets = legacyBPFUnionOffsets(
+			slot.externalOffsets, state.externalOffsets[instruction.Src],
+		)
+		slot.possibleStackPointer = slot.possibleStackPointer ||
+			state.possibleStackPointer[instruction.Src]
+		if len(slot.frameOffsets) > legacyBPFMaxRegisterOffsets ||
+			len(slot.externalOffsets) > legacyBPFMaxRegisterOffsets {
+			return fmt.Errorf("too many spilled pointer offsets at stack offset %d", address)
+		}
+		state.stackPointers[address] = slot
+	}
+	return nil
+}
+
+func legacyBPFLoadStackPointer(
+	state *legacyBPFFrameState,
+	instruction *asm.Instruction,
+) (map[int]struct{}, map[int]struct{}, bool, error) {
+	if instruction.OpCode.Size() != asm.DWord {
+		return nil, nil, false, nil
+	}
+	var frameOffsets map[int]struct{}
+	var externalOffsets map[int]struct{}
+	possibleStackPointer := false
+	for base := range state.frameOffsets[instruction.Src] {
+		address := base + int(instruction.Offset)
+		slot, ok := state.stackPointers[address]
+		if !ok {
+			continue
+		}
+		frameOffsets = legacyBPFUnionOffsets(frameOffsets, slot.frameOffsets)
+		externalOffsets = legacyBPFUnionOffsets(externalOffsets, slot.externalOffsets)
+		possibleStackPointer = possibleStackPointer || slot.possibleStackPointer
+	}
+	if len(frameOffsets) > legacyBPFMaxRegisterOffsets ||
+		len(externalOffsets) > legacyBPFMaxRegisterOffsets {
+		return nil, nil, false, fmt.Errorf("too many pointer offsets loaded from stack")
+	}
+	return frameOffsets, externalOffsets, possibleStackPointer, nil
+}
+
+func legacyBPFRegisterHasPointer(state *legacyBPFFrameState, register asm.Register) bool {
+	return len(state.frameOffsets[register]) > 0 || len(state.externalOffsets[register]) > 0
+}
+
+func legacyBPFAdjustOffsets(offsets map[int]struct{}, delta int) map[int]struct{} {
+	if len(offsets) == 0 {
+		return nil
+	}
+	adjusted := make(map[int]struct{}, len(offsets))
+	for offset := range offsets {
+		adjusted[offset+delta] = struct{}{}
+	}
+	return adjusted
+}
+
+func legacyBPFCombineOffsets(left, right map[int]struct{}, rightSign int) map[int]struct{} {
+	if len(left) == 0 || len(right) == 0 {
+		return nil
+	}
+	combined := make(map[int]struct{}, len(left)*len(right))
+	for leftValue := range left {
+		for rightValue := range right {
+			combined[leftValue+rightSign*rightValue] = struct{}{}
+		}
+	}
+	return combined
+}
+
+func legacyBPFUnionOffsets(destination, source map[int]struct{}) map[int]struct{} {
+	if len(source) == 0 {
+		return destination
+	}
+	if destination == nil {
+		destination = make(map[int]struct{}, len(source))
+	}
+	for offset := range source {
+		destination[offset] = struct{}{}
+	}
+	return destination
+}
+
+func legacyBPFRecordStateDepth(state legacyBPFRegisterState, depth *int) {
+	for _, offsets := range state {
+		for offset := range offsets {
+			legacyBPFRecordOffset(offset, depth)
+		}
+	}
+}
+
+func legacyBPFRecordOffset(offset int, depth *int) {
+	if offset < 0 {
+		*depth = max(*depth, -offset)
+	}
+}
+
+func legacyBPFJumpTarget(
+	instruction *asm.Instruction,
+	index int,
+	rawPC []int,
+	rawToIndex map[int]int,
+) (int, error) {
+	targetRaw := rawPC[index] + int(instruction.Width()) + int(instruction.Offset)
+	target, ok := rawToIndex[targetRaw]
+	if !ok {
+		return 0, fmt.Errorf(
+			"jump at instruction %d targets unknown raw instruction %d",
+			index,
+			targetRaw,
+		)
+	}
+	return target, nil
+}
+
+func legacyBPFCloneRegisterState(state legacyBPFRegisterState) legacyBPFRegisterState {
+	var clone legacyBPFRegisterState
+	for register, offsets := range state {
+		clone[register] = legacyBPFCloneOffsets(offsets)
+	}
+	return clone
+}
+
+func legacyBPFCloneFrameState(state legacyBPFFrameState) legacyBPFFrameState {
+	clone := legacyBPFFrameState{
+		frameOffsets:         legacyBPFCloneRegisterState(state.frameOffsets),
+		externalOffsets:      legacyBPFCloneRegisterState(state.externalOffsets),
+		constants:            legacyBPFCloneRegisterState(state.constants),
+		constantKnown:        state.constantKnown,
+		possibleStackPointer: state.possibleStackPointer,
+	}
+	if len(state.stackPointers) > 0 {
+		clone.stackPointers = make(map[int]legacyBPFSpilledPointer, len(state.stackPointers))
+		for address, pointer := range state.stackPointers {
+			clone.stackPointers[address] = legacyBPFSpilledPointer{
+				frameOffsets:         legacyBPFCloneOffsets(pointer.frameOffsets),
+				externalOffsets:      legacyBPFCloneOffsets(pointer.externalOffsets),
+				possibleStackPointer: pointer.possibleStackPointer,
+			}
+		}
+	}
+	return clone
+}
+
+func legacyBPFCloneOffsets(offsets map[int]struct{}) map[int]struct{} {
+	if len(offsets) == 0 {
+		return nil
+	}
+	clone := make(map[int]struct{}, len(offsets))
+	for offset := range offsets {
+		clone[offset] = struct{}{}
+	}
+	return clone
+}
+
+func legacyBPFMergeRegisterState(
+	destination *legacyBPFRegisterState,
+	source legacyBPFRegisterState,
+) (bool, error) {
+	changed := false
+	for register, offsets := range source {
+		if len(offsets) == 0 {
+			continue
+		}
+		if destination[register] == nil {
+			destination[register] = make(map[int]struct{}, len(offsets))
+		}
+		for offset := range offsets {
+			if _, exists := destination[register][offset]; exists {
+				continue
+			}
+			destination[register][offset] = struct{}{}
+			changed = true
+		}
+		if len(destination[register]) > legacyBPFMaxRegisterOffsets {
+			return false, fmt.Errorf("too many offsets in register r%d", register)
+		}
+	}
+	return changed, nil
+}
+
+func legacyBPFMergeFrameState(
+	destination *legacyBPFFrameState,
+	source legacyBPFFrameState,
+) (bool, error) {
+	frameChanged, err := legacyBPFMergeRegisterState(
+		&destination.frameOffsets, source.frameOffsets,
+	)
+	if err != nil {
+		return false, err
+	}
+	externalChanged, err := legacyBPFMergeRegisterState(
+		&destination.externalOffsets, source.externalOffsets,
+	)
+	if err != nil {
+		return false, err
+	}
+	constantsChanged := false
+	for register := range destination.constantKnown {
+		switch {
+		case destination.constantKnown[register] && source.constantKnown[register]:
+			if legacyBPFMergeOffsetsInto(
+				&destination.constants[register], source.constants[register],
+			) {
+				constantsChanged = true
+			}
+			if len(destination.constants[register]) > legacyBPFMaxRegisterOffsets {
+				return false, fmt.Errorf("too many constants in register r%d", register)
+			}
+		case destination.constantKnown[register] && !source.constantKnown[register]:
+			destination.constantKnown[register] = false
+			destination.constants[register] = nil
+			constantsChanged = true
+		case !destination.constantKnown[register]:
+			destination.constants[register] = nil
+		}
+	}
+	stackChanged := false
+	possibleStackPointerChanged := false
+	for register, possible := range source.possibleStackPointer {
+		if possible && !destination.possibleStackPointer[register] {
+			destination.possibleStackPointer[register] = true
+			possibleStackPointerChanged = true
+		}
+	}
+	if len(source.stackPointers) > 0 && destination.stackPointers == nil {
+		destination.stackPointers = make(map[int]legacyBPFSpilledPointer)
+	}
+	for address, sourcePointer := range source.stackPointers {
+		destinationPointer := destination.stackPointers[address]
+		changed := legacyBPFMergeOffsetsInto(
+			&destinationPointer.frameOffsets, sourcePointer.frameOffsets,
+		)
+		changed = legacyBPFMergeOffsetsInto(
+			&destinationPointer.externalOffsets, sourcePointer.externalOffsets,
+		) || changed
+		if sourcePointer.possibleStackPointer && !destinationPointer.possibleStackPointer {
+			destinationPointer.possibleStackPointer = true
+			changed = true
+		}
+		if len(destinationPointer.frameOffsets) > legacyBPFMaxRegisterOffsets ||
+			len(destinationPointer.externalOffsets) > legacyBPFMaxRegisterOffsets {
+			return false, fmt.Errorf("too many spilled offsets at stack offset %d", address)
+		}
+		if changed {
+			destination.stackPointers[address] = destinationPointer
+			stackChanged = true
+		}
+	}
+	return frameChanged || externalChanged || constantsChanged ||
+		possibleStackPointerChanged || stackChanged, nil
+}
+
+func legacyBPFMergeOffsetsInto(destination *map[int]struct{}, source map[int]struct{}) bool {
+	changed := false
+	if len(source) > 0 && *destination == nil {
+		*destination = make(map[int]struct{}, len(source))
+	}
+	for offset := range source {
+		if _, exists := (*destination)[offset]; exists {
+			continue
+		}
+		(*destination)[offset] = struct{}{}
+		changed = true
+	}
+	return changed
+}
+
+func legacyBPFRoundedFrame(raw int) int {
+	if raw < 1 {
+		raw = 1
+	}
+	return (raw + legacyBPFStackQuantum - 1) &^ (legacyBPFStackQuantum - 1)
 }
 
 func referencedProgramMaps(
@@ -393,7 +1552,7 @@ func TestJavaRemoteParentExactLifecycleMapsDoNotEvict(t *testing.T) {
 	require.NotNil(t, replays)
 	require.NotNil(t, guards)
 	require.Equal(t, uint32(40), replays.KeySize)
-	require.Equal(t, uint32(16), replays.ValueSize)
+	require.Equal(t, uint32(72), replays.ValueSize)
 	require.Equal(t, uint32(30_000), replays.MaxEntries)
 	require.Equal(t, ebpfconvenience.PinInternal, replays.Pinning)
 	require.Equal(t, uint32(12), guards.KeySize)

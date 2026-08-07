@@ -1654,6 +1654,70 @@ static void test_aliased_generation_blocks_a_second_stage_on_the_same_socket(voi
     }
 }
 
+static void test_zero_alias_cleanup_unblocks_a_second_stage_on_the_same_socket(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    const tp_info_pid_t raw = raw_parent(k_flag_sampled);
+    reset(&connection, &raw);
+    java_remote_parent_incoming_t first_handoff = {.generation = test_incoming_generation};
+    if (!apply_incoming_trace_candidate(
+            &(tp_info_t){}, &raw, &first_handoff.candidate, &first_handoff.generation)) {
+        fail("first zero-alias parent was not prepared");
+    }
+
+    const u64 first_generation = java_remote_parent_stage_incoming(&connection,
+                                                                   test_connection_netns,
+                                                                   test_connection_netns_cookie,
+                                                                   test_socket_cookie,
+                                                                   &first_handoff);
+    const java_remote_parent_key_t first_key = stored_state_key;
+    if (!first_generation || first_key.generation != first_generation || !owner_present ||
+        !fallback_present || !state_present || stored_state.aliases || !generation_index_present ||
+        !connection_present || !cookie_connection_present || !ambiguity_reserved(&first_key)) {
+        fail("first zero-alias generation was not staged");
+    }
+
+    if (!java_remote_parent_cleanup_exact_receive_zero_alias(&first_key,
+                                                             test_process_incarnation,
+                                                             &connection,
+                                                             test_connection_netns,
+                                                             test_socket_cookie) ||
+        owner_present || fallback_present || state_present || generation_index_present ||
+        connection_present || cookie_connection_present || exact_claim_present ||
+        detach_guard_present || find_ambiguity_entry(&first_key) ||
+        ambiguity_deleted_without_claim || rollback_delete_without_fences ||
+        delete_after_guard_release || unexpected_update || unexpected_delete) {
+        fail("zero-alias receive cleanup did not release the first logical graph");
+    }
+
+    incoming_generation++;
+    incoming_candidate = (incoming_trace_candidate_t){.candidate = raw};
+    incoming_claim = 1;
+    java_remote_parent_incoming_t second_handoff = {.generation = incoming_generation};
+    if (!apply_incoming_trace_candidate(
+            &(tp_info_t){}, &raw, &second_handoff.candidate, &second_handoff.generation)) {
+        fail("second zero-alias parent was not prepared");
+    }
+
+    const u64 second_generation = java_remote_parent_stage_incoming(&connection,
+                                                                    test_connection_netns,
+                                                                    test_connection_netns_cookie,
+                                                                    test_socket_cookie,
+                                                                    &second_handoff);
+    if (!second_generation || second_generation == first_generation || !owner_present ||
+        stored_owner.generation != second_generation || !fallback_present || !state_present ||
+        stored_state_key.generation != second_generation || stored_state.aliases ||
+        !generation_index_present || stored_generation_index_key.generation != second_generation ||
+        !connection_present || stored_connection.generation != second_generation ||
+        !cookie_connection_present || stored_cookie_connection.generation != second_generation ||
+        exact_claim_present || detach_guard_present || find_ambiguity_entry(&first_key) ||
+        !ambiguity_reserved(&stored_state_key) || ambiguity_count() != 1 ||
+        stats[k_java_remote_parent_stat_stage_valid] != 2 ||
+        stats[k_java_remote_parent_stat_stage_ambiguous] || unexpected_update ||
+        unexpected_delete) {
+        fail("zero-alias receive cleanup did not admit the immediate second stage");
+    }
+}
+
 static void test_terminal_generation_is_replaced_without_ambiguity(void) {
     const connection_info_t connection = {.s_port = 1234, .d_port = 443};
     const tp_info_pid_t raw = raw_parent(k_flag_sampled);
@@ -1853,6 +1917,7 @@ int main(void) {
     test_final_ambiguity_uses_serialized_cleanup();
     test_final_incoming_invalidation_uses_serialized_cleanup();
     test_inconsistent_physical_index_quarantines_stage();
+    test_zero_alias_cleanup_unblocks_a_second_stage_on_the_same_socket();
     test_aliased_generation_blocks_a_second_stage_on_the_same_socket();
     test_terminal_generation_is_replaced_without_ambiguity();
     return 0;

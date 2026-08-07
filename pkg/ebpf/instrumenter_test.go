@@ -31,6 +31,14 @@ import (
 	"go.opentelemetry.io/obi/pkg/pipe/msg"
 )
 
+func TestKprobeTargetUsesExplicitOverride(t *testing.T) {
+	assert.Equal(t, "tcp_close", kprobeTarget("tcp_close", ebpfcommon.ProbeDesc{}))
+	assert.Equal(t, "tcp_close", kprobeTarget(
+		"tcp_close/java_remote_parent",
+		ebpfcommon.ProbeDesc{KProbeTarget: "tcp_close"},
+	))
+}
+
 type probeDescMap map[string][]*ebpfcommon.ProbeDesc
 
 type testCase struct {

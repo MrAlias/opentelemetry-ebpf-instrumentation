@@ -429,7 +429,8 @@ func loadJavaRemoteParentFixture(t *testing.T) BpfJavaRemoteParentObjects {
 
 	var objects BpfJavaRemoteParentObjects
 	if err := spec.LoadAndAssign(&objects, nil); err != nil {
-		if errors.Is(err, unix.EPERM) {
+		var verifierErr *ebpf.VerifierError
+		if errors.Is(err, unix.EPERM) && !errors.As(err, &verifierErr) {
 			t.Skipf("insufficient capability to load Java bridge BPF programs: %v", err)
 		}
 		require.NoError(t, err)
@@ -856,11 +857,15 @@ func assertValidTaskDiscard(
 	}
 	require.NoError(t, maps.JavaRemoteParentAliasReplays.Update(
 		replayKey,
-		BpfJavaRemoteParentJavaRemoteParentAliasReplayT{
-			TransitionMonotimeNs: observed,
-			References:           1,
-			Lifecycle:            bridgeLifecycleActive,
-		},
+		javaRemoteParentActiveReplay(t,
+			observed,
+			1,
+			bridgeLifecycleActive,
+			negotiation.Connection,
+			negotiation.ConnectionNetns,
+			generation,
+			fd,
+		),
 		ebpf.UpdateNoExist,
 	))
 	task := BpfJavaRemoteParentJavaRemoteParentTaskT{
@@ -1129,11 +1134,15 @@ func assertConcurrentTakeIsOneShot(
 	}
 	require.NoError(t, maps.JavaRemoteParentAliasReplays.Update(
 		replayKey,
-		BpfJavaRemoteParentJavaRemoteParentAliasReplayT{
-			TransitionMonotimeNs: observed,
-			References:           uint32(len(workerKeys)),
-			Lifecycle:            bridgeLifecycleActive,
-		},
+		javaRemoteParentActiveReplay(t,
+			observed,
+			uint32(len(workerKeys)),
+			bridgeLifecycleActive,
+			negotiation.Connection,
+			negotiation.ConnectionNetns,
+			generation,
+			fd,
+		),
 		ebpf.UpdateNoExist,
 	))
 
@@ -1384,6 +1393,29 @@ func remoteParentTestNetNSCookie(netns uint32, generation uint64) uint64 {
 	}
 
 	return cookie
+}
+
+func javaRemoteParentActiveReplay(
+	t *testing.T,
+	transitionMonotimeNS uint64,
+	references uint32,
+	lifecycle uint8,
+	connection BpfJavaRemoteParentConnectionInfoT,
+	connectionNetns uint32,
+	generation uint64,
+	fd int,
+) BpfJavaRemoteParentJavaRemoteParentAliasReplayT {
+	t.Helper()
+
+	return BpfJavaRemoteParentJavaRemoteParentAliasReplayT{
+		TransitionMonotimeNs:  transitionMonotimeNS,
+		References:            references,
+		Lifecycle:             lifecycle,
+		Connection:            connection,
+		ConnectionNetns:       connectionNetns,
+		ConnectionNetnsCookie: remoteParentTestNetNSCookie(connectionNetns, generation),
+		SocketCookie:          socketCookie(t, fd),
+	}
 }
 
 func monotonicNowNS(t *testing.T) uint64 {

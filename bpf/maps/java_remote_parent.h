@@ -86,7 +86,32 @@ typedef struct java_remote_parent_alias_replay {
     u8 desired_lifecycle;
     u8 producer_tag;
     u8 reserved;
+    connection_info_t connection;
+    u32 connection_netns;
+    u64 connection_netns_cookie;
+    u64 socket_cookie;
 } java_remote_parent_alias_replay_t;
+
+typedef struct java_remote_parent_alias_replay_binding {
+    connection_info_t connection;
+    u32 connection_netns;
+    u64 connection_netns_cookie;
+    u64 socket_cookie;
+} java_remote_parent_alias_replay_binding_t;
+
+_Static_assert(sizeof(java_remote_parent_alias_replay_binding_t) == 56,
+               "java remote-parent alias replay binding size mismatch");
+
+typedef struct java_remote_parent_alias_replay_retain_workspace {
+    u32 busy;
+    u32 reserved;
+    java_remote_parent_alias_replay_key_t replay_key;
+    java_remote_parent_alias_replay_t snapshot;
+    java_remote_parent_connection_key_t connection_key;
+} java_remote_parent_alias_replay_retain_workspace_t;
+
+_Static_assert(sizeof(java_remote_parent_alias_replay_retain_workspace_t) == 168,
+               "java remote-parent alias replay retain workspace size mismatch");
 
 typedef struct java_remote_parent_cleanup_scratch {
     union {
@@ -192,7 +217,7 @@ _Static_assert(offsetof(java_remote_parent_alias_replay_key_t, generation_observ
                "java remote-parent alias replay key observation offset mismatch");
 _Static_assert(offsetof(java_remote_parent_alias_replay_key_t, process_incarnation) == 32,
                "java remote-parent alias replay key incarnation offset mismatch");
-_Static_assert(sizeof(java_remote_parent_alias_replay_t) == 16,
+_Static_assert(sizeof(java_remote_parent_alias_replay_t) == 72,
                "java remote-parent alias replay size mismatch");
 _Static_assert(offsetof(java_remote_parent_alias_replay_t, transition_monotime_ns) == 0,
                "java remote-parent alias replay transition offset mismatch");
@@ -206,6 +231,14 @@ _Static_assert(offsetof(java_remote_parent_alias_replay_t, producer_tag) == 14,
                "java remote-parent alias replay producer offset mismatch");
 _Static_assert(offsetof(java_remote_parent_alias_replay_t, reserved) == 15,
                "java remote-parent alias replay reserved offset mismatch");
+_Static_assert(offsetof(java_remote_parent_alias_replay_t, connection) == 16,
+               "java remote-parent alias replay connection offset mismatch");
+_Static_assert(offsetof(java_remote_parent_alias_replay_t, connection_netns) == 52,
+               "java remote-parent alias replay connection-netns offset mismatch");
+_Static_assert(offsetof(java_remote_parent_alias_replay_t, connection_netns_cookie) == 56,
+               "java remote-parent alias replay netns-cookie offset mismatch");
+_Static_assert(offsetof(java_remote_parent_alias_replay_t, socket_cookie) == 64,
+               "java remote-parent alias replay socket-cookie offset mismatch");
 _Static_assert(sizeof(java_remote_parent_cleanup_scratch_t) == 176,
                "java remote-parent cleanup scratch size mismatch");
 _Static_assert(sizeof(java_remote_parent_cleanup_workspace_t) == 184,
@@ -240,6 +273,8 @@ SCRATCH_MEM_TYPED(java_remote_parent_incoming_snapshot, java_remote_parent_incom
 SCRATCH_MEM_TYPED(java_remote_parent_connection_snapshot, connection_info_t)
 SCRATCH_MEM_TYPED(java_remote_parent_cleanup_workspace, java_remote_parent_cleanup_workspace_t)
 SCRATCH_MEM_TYPED(java_remote_parent_janitor_workspace, java_remote_parent_janitor_workspace_t)
+SCRATCH_MEM_TYPED(java_remote_parent_alias_replay_retain_workspace,
+                  java_remote_parent_alias_replay_retain_workspace_t)
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -366,10 +401,37 @@ static __always_inline u8 java_remote_parent_alias_replay_producer_valid(u8 prod
 }
 
 static __always_inline u8
+java_remote_parent_alias_replay_binding_valid(const java_remote_parent_alias_replay_t *replay) {
+    return replay && replay->connection_netns && replay->connection_netns_cookie &&
+           replay->socket_cookie && !is_empty_connection_info(&replay->connection);
+}
+
+static __always_inline void
+java_remote_parent_alias_replay_binding_snapshot(java_remote_parent_alias_replay_binding_t *binding,
+                                                 const java_remote_parent_alias_replay_t *replay) {
+    binding->connection = replay->connection;
+    binding->connection_netns = replay->connection_netns;
+    binding->connection_netns_cookie = replay->connection_netns_cookie;
+    binding->socket_cookie = replay->socket_cookie;
+}
+
+static __always_inline u8 java_remote_parent_alias_replay_binding_matches_snapshot(
+    const java_remote_parent_alias_replay_t *replay,
+    const java_remote_parent_alias_replay_binding_t *binding) {
+    return java_remote_parent_alias_replay_binding_valid(replay) && binding &&
+           replay->connection_netns == binding->connection_netns &&
+           replay->connection_netns_cookie == binding->connection_netns_cookie &&
+           replay->socket_cookie == binding->socket_cookie &&
+           __builtin_memcmp(
+               &replay->connection, &binding->connection, sizeof(replay->connection)) == 0;
+}
+
+static __always_inline u8
 java_remote_parent_alias_replay_active_valid(const java_remote_parent_alias_replay_key_t *key,
                                              const java_remote_parent_alias_replay_t *replay,
                                              u8 require_reference) {
-    return java_remote_parent_alias_replay_key_valid(key) && replay &&
+    return java_remote_parent_alias_replay_key_valid(key) &&
+           java_remote_parent_alias_replay_binding_valid(replay) &&
            replay->transition_monotime_ns && (!require_reference || replay->references) &&
            java_remote_parent_metadata_word(&replay->lifecycle) ==
                k_java_remote_parent_lifecycle_active;
@@ -379,8 +441,8 @@ static __always_inline u8
 java_remote_parent_alias_replay_publishing_valid(const java_remote_parent_alias_replay_key_t *key,
                                                  const java_remote_parent_alias_replay_t *replay,
                                                  u8 lifecycle) {
-    if (!java_remote_parent_alias_replay_key_valid(key) || !replay ||
-        !replay->transition_monotime_ns ||
+    if (!java_remote_parent_alias_replay_key_valid(key) ||
+        !java_remote_parent_alias_replay_binding_valid(replay) || !replay->transition_monotime_ns ||
         !java_remote_parent_alias_replay_lifecycle_final(lifecycle)) {
         return 0;
     }
@@ -394,7 +456,8 @@ static __always_inline u8
 java_remote_parent_alias_replay_final_valid(const java_remote_parent_alias_replay_key_t *key,
                                             const java_remote_parent_alias_replay_t *replay,
                                             u8 lifecycle) {
-    return java_remote_parent_alias_replay_key_valid(key) && replay &&
+    return java_remote_parent_alias_replay_key_valid(key) &&
+           java_remote_parent_alias_replay_binding_valid(replay) &&
            replay->transition_monotime_ns &&
            java_remote_parent_alias_replay_lifecycle_final(lifecycle) &&
            java_remote_parent_metadata_word(&replay->lifecycle) == lifecycle;
@@ -452,8 +515,9 @@ static __always_inline u8 java_remote_parent_generation_state_index_active_for_i
                key, process_incarnation, state->observed_monotime_ns);
 }
 
-static __always_inline u8 java_remote_parent_generation_state_active_for_incarnation(
-    const java_remote_parent_key_t *key, u64 process_incarnation) {
+static __noinline __attribute__((unused)) u8
+java_remote_parent_generation_state_active_for_incarnation(const java_remote_parent_key_t *key,
+                                                           u64 process_incarnation) {
     if (!java_remote_parent_generation_state_index_active_for_incarnation(key,
                                                                           process_incarnation)) {
         return 0;
@@ -490,8 +554,13 @@ static __always_inline u8 java_remote_parent_generation_observation_matches(
 // RESET removes an aliased generation's direct and physical cursors while its
 // exact task/handoff aliases remain authoritative. A different-generation
 // owner or connection may replace the singleton cursor after RESET.
-static __always_inline u8 java_remote_parent_generation_state_detached_for_incarnation(
-    const java_remote_parent_key_t *key, u64 process_incarnation) {
+static __always_inline u8 java_remote_parent_generation_state_detached_with_key(
+    const java_remote_parent_key_t *key,
+    u64 process_incarnation,
+    java_remote_parent_connection_key_t *connection_key) {
+    if (!connection_key) {
+        return 0;
+    }
     if (!java_remote_parent_generation_state_index_active_for_incarnation(key,
                                                                           process_incarnation)) {
         return 0;
@@ -512,25 +581,32 @@ static __always_inline u8 java_remote_parent_generation_state_detached_for_incar
         return 0;
     }
 
-    java_remote_parent_connection_key_t connection_key = {0};
     if (!java_remote_parent_connection_netns_key_init(
-            &connection_key, &state->connection, state->connection_netns)) {
+            connection_key, &state->connection, state->connection_netns)) {
         return 0;
     }
     const java_remote_parent_connection_t *staged =
-        bpf_map_lookup_elem(&java_remote_parent_connections, &connection_key.netns);
+        bpf_map_lookup_elem(&java_remote_parent_connections, &connection_key->netns);
     return !staged || staged->generation != key->generation ||
            !java_remote_parent_pid_key_equal(&staged->owner, &key->owner);
 }
 
-static __always_inline u8
+static __noinline __attribute__((unused)) u8
+java_remote_parent_generation_state_detached_for_incarnation(const java_remote_parent_key_t *key,
+                                                             u64 process_incarnation) {
+    java_remote_parent_connection_key_t connection_key = {0};
+    return java_remote_parent_generation_state_detached_with_key(
+        key, process_incarnation, &connection_key);
+}
+
+static __noinline __attribute__((unused)) u8
 java_remote_parent_generation_alias_active(const java_remote_parent_key_t *key) {
     const u64 process_incarnation = java_current_process_incarnation();
     return java_remote_parent_generation_state_active_for_incarnation(key, process_incarnation) ||
            java_remote_parent_generation_state_detached_for_incarnation(key, process_incarnation);
 }
 
-static __always_inline u8
+static __noinline __attribute__((unused)) u8
 java_remote_parent_generation_live_cursor_active(const java_remote_parent_key_t *key) {
     const u64 process_incarnation = java_current_process_incarnation();
     if (!java_remote_parent_generation_state_active_for_incarnation(key, process_incarnation)) {
@@ -605,42 +681,237 @@ static __always_inline void java_remote_parent_alias_replay_unwind_failed_retain
     java_remote_parent_alias_replay_release_reference(replay_key);
 }
 
-static __always_inline u8 java_remote_parent_alias_replay_retain(
-    const java_remote_parent_key_t *key, const java_remote_parent_alias_replay_key_t *replay_key) {
-    java_remote_parent_alias_replay_t *replay =
+static __always_inline u8 java_remote_parent_alias_replay_connection_matches(
+    const java_remote_parent_alias_replay_key_t *replay_key,
+    const java_remote_parent_alias_replay_t *replay,
+    const java_remote_parent_connection_t *connection,
+    u64 incoming_generation) {
+    volatile u64 mismatch = connection
+                                ? connection->reserved | connection->reserved2 |
+                                      (connection->generation ^ replay_key->generation) |
+                                      (connection->owner.tid ^ replay_key->owner.tid) |
+                                      (connection->owner.pid ^ replay_key->owner.pid) |
+                                      (connection->owner.ns ^ replay_key->owner.ns) |
+                                      (connection->netns ^ replay->connection_netns) |
+                                      (connection->netns_cookie ^ replay->connection_netns_cookie) |
+                                      (connection->incoming_generation ^ incoming_generation) |
+                                      (connection->socket_cookie ^ replay->socket_cookie)
+                                : 1;
+    return incoming_generation && mismatch == 0;
+}
+
+static __noinline __attribute__((unused)) u8 java_remote_parent_alias_replay_binding_twins_match(
+    const java_remote_parent_alias_replay_key_t *replay_key,
+    const java_remote_parent_alias_replay_t *replay,
+    java_remote_parent_connection_key_t *connection_key) {
+    if (!java_remote_parent_alias_replay_key_valid(replay_key) ||
+        !java_remote_parent_alias_replay_binding_valid(replay) || !connection_key) {
+        return 0;
+    }
+    if (!java_remote_parent_connection_netns_key_init(
+            connection_key, &replay->connection, replay->connection_netns)) {
+        return 0;
+    }
+    const java_remote_parent_connection_t *netns_value =
+        bpf_map_lookup_elem(&java_remote_parent_connections, &connection_key->netns);
+    const u64 incoming_generation = netns_value ? netns_value->incoming_generation : 0;
+    if (!java_remote_parent_alias_replay_connection_matches(
+            replay_key, replay, netns_value, incoming_generation)) {
+        return 0;
+    }
+    if (!java_remote_parent_connection_key_rekey_cookie(connection_key,
+                                                        replay->connection_netns_cookie)) {
+        return 0;
+    }
+    const java_remote_parent_connection_t *cookie_value =
+        bpf_map_lookup_elem(&java_remote_parent_cookie_connections, &connection_key->cookie);
+    if (!java_remote_parent_alias_replay_connection_matches(
+            replay_key, replay, cookie_value, incoming_generation) ||
+        !java_remote_parent_connection_key_rekey_netns(connection_key, replay->connection_netns)) {
+        return 0;
+    }
+    netns_value = bpf_map_lookup_elem(&java_remote_parent_connections, &connection_key->netns);
+    if (!java_remote_parent_alias_replay_connection_matches(
+            replay_key, replay, netns_value, incoming_generation) ||
+        !java_remote_parent_connection_key_rekey_cookie(connection_key,
+                                                        replay->connection_netns_cookie)) {
+        return 0;
+    }
+    cookie_value =
+        bpf_map_lookup_elem(&java_remote_parent_cookie_connections, &connection_key->cookie);
+    return java_remote_parent_alias_replay_connection_matches(
+        replay_key, replay, cookie_value, incoming_generation);
+}
+
+static __always_inline u8 java_remote_parent_alias_replay_capture_binding(
+    const java_remote_parent_key_t *key,
+    const java_remote_parent_alias_replay_key_t *replay_key,
+    java_remote_parent_alias_replay_t *replay,
+    java_remote_parent_connection_key_t *connection_key) {
+    const java_remote_parent_state_t *state = bpf_map_lookup_elem(&java_remote_parent_state, key);
+    if (!state || state->lifecycle != k_java_remote_parent_lifecycle_active ||
+        state->observed_monotime_ns != replay_key->generation_observed_monotime_ns ||
+        state->process_incarnation != replay_key->process_incarnation ||
+        state->response.status != k_java_remote_parent_status_valid ||
+        java_remote_parent_le64_to_cpu(state->response.generation_le) != key->generation ||
+        java_remote_parent_le64_to_cpu(state->response.observed_monotime_ns_le) !=
+            state->observed_monotime_ns ||
+        !state->connection_netns || is_empty_connection_info(&state->connection) ||
+        !java_remote_parent_generation_index_matches(
+            key, state->process_incarnation, state->observed_monotime_ns)) {
+        return 0;
+    }
+    // The replay binding stores connection_info_t immediately followed by the
+    // netns word, exactly matching connection_info_ns_t. Build that immutable
+    // prefix before lookup instead of carrying another 48-byte union key on
+    // this already-deep capture path.
+    replay->connection = state->connection;
+    replay->connection_netns = state->connection_netns;
+    const java_remote_parent_connection_t *netns_value =
+        bpf_map_lookup_elem(&java_remote_parent_connections, &replay->connection);
+    if (!netns_value || (netns_value->reserved | netns_value->reserved2) ||
+        netns_value->generation != key->generation ||
+        !java_remote_parent_pid_key_equal(&netns_value->owner, &key->owner) ||
+        netns_value->netns != state->connection_netns || !netns_value->netns_cookie ||
+        !netns_value->incoming_generation || !netns_value->socket_cookie) {
+        return 0;
+    }
+    replay->connection_netns_cookie = netns_value->netns_cookie;
+    replay->socket_cookie = netns_value->socket_cookie;
+    if (!java_remote_parent_alias_replay_binding_twins_match(replay_key, replay, connection_key)) {
+        return 0;
+    }
+    state = bpf_map_lookup_elem(&java_remote_parent_state, key);
+    return state && state->lifecycle == k_java_remote_parent_lifecycle_active &&
+           state->observed_monotime_ns == replay_key->generation_observed_monotime_ns &&
+           state->process_incarnation == replay_key->process_incarnation &&
+           state->connection_netns == replay->connection_netns &&
+           __builtin_memcmp(&state->connection, &replay->connection, sizeof(state->connection)) ==
+               0;
+}
+
+static __noinline __attribute__((unused)) u8 java_remote_parent_alias_replay_state_binding_matches(
+    const java_remote_parent_key_t *key,
+    const java_remote_parent_alias_replay_key_t *replay_key,
+    const java_remote_parent_alias_replay_t *replay) {
+    const java_remote_parent_state_t *state = bpf_map_lookup_elem(&java_remote_parent_state, key);
+    return state && java_remote_parent_alias_replay_binding_valid(replay) &&
+           state->lifecycle == k_java_remote_parent_lifecycle_active &&
+           state->observed_monotime_ns == replay_key->generation_observed_monotime_ns &&
+           state->process_incarnation == replay_key->process_incarnation &&
+           state->connection_netns == replay->connection_netns &&
+           __builtin_memcmp(&state->connection, &replay->connection, sizeof(state->connection)) ==
+               0;
+}
+
+static __always_inline u8 java_remote_parent_alias_replay_immutable_equal(
+    const java_remote_parent_alias_replay_t *left, const java_remote_parent_alias_replay_t *right) {
+    return left && right && left->transition_monotime_ns == right->transition_monotime_ns &&
+           java_remote_parent_metadata_word(&left->lifecycle) ==
+               java_remote_parent_metadata_word(&right->lifecycle) &&
+           left->connection_netns == right->connection_netns &&
+           left->connection_netns_cookie == right->connection_netns_cookie &&
+           left->socket_cookie == right->socket_cookie &&
+           __builtin_memcmp(&left->connection, &right->connection, sizeof(left->connection)) == 0;
+}
+
+// Returns 2 only when BPF_NOEXIST lost to an existing record and the caller
+// must retry through the existing-value path. Keeping creation and XADD
+// snapshots in sibling frames avoids stacking both 72-byte values on capture.
+static __noinline __attribute__((unused)) u8 java_remote_parent_alias_replay_retain_created(
+    const java_remote_parent_key_t *key,
+    const java_remote_parent_alias_replay_key_t *replay_key,
+    java_remote_parent_alias_replay_retain_workspace_t *workspace) {
+    if (!workspace) {
+        return 0;
+    }
+    __builtin_memset(&workspace->snapshot, 0, sizeof(workspace->snapshot));
+    workspace->snapshot = (java_remote_parent_alias_replay_t){
+        .transition_monotime_ns = bpf_ktime_get_ns(),
+        .references = 1,
+        .lifecycle = k_java_remote_parent_lifecycle_active,
+    };
+    if (!workspace->snapshot.transition_monotime_ns ||
+        !java_remote_parent_alias_replay_capture_binding(
+            key, replay_key, &workspace->snapshot, &workspace->connection_key)) {
+        return 0;
+    }
+    if (bpf_map_update_elem(
+            &java_remote_parent_alias_replays, replay_key, &workspace->snapshot, BPF_NOEXIST) !=
+        0) {
+        return 2;
+    }
+    const java_remote_parent_alias_replay_t *replay =
         bpf_map_lookup_elem(&java_remote_parent_alias_replays, replay_key);
-    if (!replay) {
-        const java_remote_parent_alias_replay_t created = {
-            .transition_monotime_ns = bpf_ktime_get_ns(),
-            .references = 1,
-            .lifecycle = k_java_remote_parent_lifecycle_active,
-        };
-        if (!created.transition_monotime_ns) {
-            return 0;
-        }
-        if (bpf_map_update_elem(
-                &java_remote_parent_alias_replays, replay_key, &created, BPF_NOEXIST) == 0) {
-            replay = bpf_map_lookup_elem(&java_remote_parent_alias_replays, replay_key);
-            if (java_remote_parent_alias_replay_active_valid(replay_key, replay, 1)) {
-                return 1;
-            }
-            java_remote_parent_alias_replay_unwind_failed_retain(key, replay_key);
-            return 0;
-        }
-        replay = bpf_map_lookup_elem(&java_remote_parent_alias_replays, replay_key);
+    if (java_remote_parent_alias_replay_active_valid(replay_key, replay, 1) &&
+        java_remote_parent_alias_replay_binding_twins_match(
+            replay_key, replay, &workspace->connection_key) &&
+        java_remote_parent_alias_replay_state_binding_matches(key, replay_key, replay)) {
+        return 1;
+    }
+    java_remote_parent_alias_replay_unwind_failed_retain(key, replay_key);
+    return 0;
+}
+
+static __noinline __attribute__((unused)) u8 java_remote_parent_alias_replay_retain_existing(
+    const java_remote_parent_key_t *key,
+    const java_remote_parent_alias_replay_key_t *replay_key,
+    java_remote_parent_alias_replay_t *replay,
+    java_remote_parent_alias_replay_retain_workspace_t *workspace) {
+    if (!workspace) {
+        return 0;
     }
     if (!java_remote_parent_alias_replay_active_valid(replay_key, replay, 0) ||
-        replay->references == ~(u32)0) {
+        replay->references == ~(u32)0 ||
+        !java_remote_parent_alias_replay_state_binding_matches(key, replay_key, replay)) {
+        return 0;
+    }
+    const java_remote_parent_state_t *state = bpf_map_lookup_elem(&java_remote_parent_state, key);
+    if (!state || (!java_remote_parent_generation_state_detached_with_key(
+                       key, state->process_incarnation, &workspace->connection_key) &&
+                   !java_remote_parent_alias_replay_binding_twins_match(
+                       replay_key, replay, &workspace->connection_key))) {
         return 0;
     }
 
+    workspace->snapshot = *replay;
     __sync_fetch_and_add(&replay->references, 1);
     replay = bpf_map_lookup_elem(&java_remote_parent_alias_replays, replay_key);
-    if (!java_remote_parent_alias_replay_active_valid(replay_key, replay, 1)) {
+    state = bpf_map_lookup_elem(&java_remote_parent_state, key);
+    if (!java_remote_parent_alias_replay_active_valid(replay_key, replay, 1) ||
+        !java_remote_parent_alias_replay_immutable_equal(&workspace->snapshot, replay) || !state ||
+        !java_remote_parent_alias_replay_state_binding_matches(key, replay_key, replay) ||
+        (!java_remote_parent_generation_state_detached_with_key(
+             key, state->process_incarnation, &workspace->connection_key) &&
+         !java_remote_parent_alias_replay_binding_twins_match(
+             replay_key, replay, &workspace->connection_key))) {
         java_remote_parent_alias_replay_unwind_failed_retain(key, replay_key);
         return 0;
     }
     return 1;
+}
+
+static __noinline __attribute__((unused)) u8 java_remote_parent_alias_replay_retain(
+    const java_remote_parent_key_t *key,
+    const java_remote_parent_alias_replay_key_t *replay_key,
+    java_remote_parent_alias_replay_retain_workspace_t *workspace) {
+    if (!workspace) {
+        return 0;
+    }
+    java_remote_parent_alias_replay_t *replay =
+        bpf_map_lookup_elem(&java_remote_parent_alias_replays, replay_key);
+    if (!replay) {
+        const u8 created =
+            java_remote_parent_alias_replay_retain_created(key, replay_key, workspace);
+        if (created != 2) {
+            return created;
+        }
+        replay = bpf_map_lookup_elem(&java_remote_parent_alias_replays, replay_key);
+        if (!replay) {
+            return 0;
+        }
+    }
+    return java_remote_parent_alias_replay_retain_existing(key, replay_key, replay, workspace);
 }
 
 static __always_inline void
@@ -668,56 +939,75 @@ java_remote_parent_release_state_alias(const java_remote_parent_key_t *key,
     }
 }
 
-static __always_inline u8 java_remote_parent_retain_generation_alias_with_authority(
-    const java_remote_parent_key_t *key, u64 observed_monotime_ns, u8 allow_detached) {
+static __noinline __attribute__((unused)) u8
+java_remote_parent_retain_generation_alias_with_authority(const java_remote_parent_key_t *key,
+                                                          u64 observed_monotime_ns,
+                                                          u8 allow_detached) {
+    java_remote_parent_alias_replay_retain_workspace_t *workspace =
+        java_remote_parent_alias_replay_retain_workspace_mem();
+    if (!workspace || workspace->busy) {
+        return 0;
+    }
+    workspace->busy = 1;
+    barrier();
+    u8 retained = 0;
     java_remote_parent_state_t *state = bpf_map_lookup_elem(&java_remote_parent_state, key);
     if (!state || !state->process_incarnation || state->aliases == ~(u32)0 ||
         state->observed_monotime_ns != observed_monotime_ns ||
         !java_remote_parent_generation_index_matches(
             key, state->process_incarnation, observed_monotime_ns)) {
-        return 0;
+        goto release_workspace;
     }
     const u64 process_incarnation = state->process_incarnation;
-    const java_remote_parent_alias_replay_key_t replay_key =
+    workspace->replay_key =
         java_remote_parent_alias_replay_key(key, observed_monotime_ns, process_incarnation);
     // Reserve replay capacity and a reference before the first validation that
     // could permit publication. Capacity exhaustion therefore cannot consume
     // E or publish an alias without durable exact replay authority.
-    if (!java_remote_parent_alias_replay_retain(key, &replay_key)) {
-        return 0;
+    if (!java_remote_parent_alias_replay_retain(key, &workspace->replay_key, workspace)) {
+        goto release_workspace;
     }
 
     if (java_remote_parent_alias_replay_generation_fenced(key) ||
         !java_remote_parent_generation_observation_matches(key, observed_monotime_ns) ||
         (allow_detached ? !java_remote_parent_generation_alias_active(key)
                         : !java_remote_parent_generation_live_cursor_active(key))) {
-        java_remote_parent_alias_replay_unwind_failed_retain(key, &replay_key);
-        return 0;
+        java_remote_parent_alias_replay_unwind_failed_retain(key, &workspace->replay_key);
+        goto release_workspace;
     }
     state = bpf_map_lookup_elem(&java_remote_parent_state, key);
     if (!state || state->aliases == ~(u32)0 || state->process_incarnation != process_incarnation ||
         state->observed_monotime_ns != observed_monotime_ns ||
         !java_remote_parent_generation_index_matches(
             key, process_incarnation, observed_monotime_ns)) {
-        java_remote_parent_alias_replay_unwind_failed_retain(key, &replay_key);
-        return 0;
+        java_remote_parent_alias_replay_unwind_failed_retain(key, &workspace->replay_key);
+        goto release_workspace;
     }
 
     __sync_fetch_and_add(&state->aliases, 1);
     const java_remote_parent_alias_replay_t *replay =
-        bpf_map_lookup_elem(&java_remote_parent_alias_replays, &replay_key);
+        bpf_map_lookup_elem(&java_remote_parent_alias_replays, &workspace->replay_key);
     if (java_remote_parent_alias_replay_generation_fenced(key) ||
-        !java_remote_parent_alias_replay_active_valid(&replay_key, replay, 1) ||
+        !java_remote_parent_alias_replay_active_valid(&workspace->replay_key, replay, 1) ||
         !java_remote_parent_generation_observation_matches(key, observed_monotime_ns) ||
         (allow_detached ? !java_remote_parent_generation_alias_active(key)
                         : !java_remote_parent_generation_live_cursor_active(key))) {
         // This retain has not published an alias. RESET either observes the
         // unwind under its guard or userspace reaps a later zero state/index.
         java_remote_parent_release_state_alias(key, observed_monotime_ns);
-        java_remote_parent_alias_replay_unwind_failed_retain(key, &replay_key);
-        return 0;
+        java_remote_parent_alias_replay_unwind_failed_retain(key, &workspace->replay_key);
+        goto release_workspace;
     }
-    return 1;
+    retained = 1;
+
+release_workspace:
+    workspace->reserved = 0;
+    __builtin_memset(&workspace->replay_key, 0, sizeof(workspace->replay_key));
+    __builtin_memset(&workspace->snapshot, 0, sizeof(workspace->snapshot));
+    __builtin_memset(&workspace->connection_key, 0, sizeof(workspace->connection_key));
+    barrier();
+    workspace->busy = 0;
+    return retained;
 }
 
 static __always_inline u8 java_remote_parent_retain_generation_alias(
@@ -782,8 +1072,9 @@ java_remote_parent_preserve_alias_barriers_valid(const java_remote_parent_key_t 
            java_remote_parent_generation_cleanly_reserved(key);
 }
 
-static __always_inline u8 java_remote_parent_preserve_authorized_aliased_generation(
-    const pid_key_t *owner, u64 process_capability) {
+static __noinline __attribute__((unused)) u8
+java_remote_parent_preserve_authorized_aliased_generation(const pid_key_t *owner,
+                                                          u64 process_capability) {
     if (!process_capability) {
         return 0;
     }
@@ -1187,6 +1478,7 @@ static __noinline void java_remote_parent_cleanup(const pid_key_t *owner) {
     }
     workspace->busy = 1;
     barrier();
+    barrier();
     java_remote_parent_cleanup_scratch_t *scratch = &workspace->scratch;
     __builtin_memset(scratch, 0, sizeof(*scratch));
     if (!java_remote_parent_cleanup_acquire(owner, scratch) ||
@@ -1316,13 +1608,21 @@ static __always_inline void java_remote_parent_detach_data_receive_owner(const p
     bpf_map_delete_elem(&java_remote_parent_data_signals, owner);
 }
 
+static __noinline __attribute__((unused)) enum java_vt_cleanup_translation_result
+java_remote_parent_data_receive_owners(u64 process_capability,
+                                       pid_key_t *carrier,
+                                       pid_key_t *owner) {
+    task_tid(carrier);
+    *owner = *carrier;
+    return java_vt_translate_tid_for_capability(owner, process_capability);
+}
+
 static __noinline __attribute__((unused)) void
 java_remote_parent_begin_data_receive_for_capability(u64 process_capability) {
     pid_key_t carrier = {0};
-    task_tid(&carrier);
-    pid_key_t owner = carrier;
+    pid_key_t owner = {0};
     const enum java_vt_cleanup_translation_result translation =
-        java_vt_translate_tid_for_capability(&owner, process_capability);
+        java_remote_parent_data_receive_owners(process_capability, &carrier, &owner);
     if (translation != k_java_vt_cleanup_translation_none) {
         java_remote_parent_detach_data_receive_owner(
             &owner, translation == k_java_vt_cleanup_translation_exact, process_capability);
@@ -1968,6 +2268,40 @@ java_remote_parent_exact_receive_completed_terminal_free(const java_remote_paren
         expected, connection, connection_netns, connection_netns_cookie, socket_cookie, NULL);
 }
 
+// An independently attached close hook can run after the baseline close hook
+// has already finished the same generation. Accept only the two strict final
+// forms that leave no payload for RESET to detach: an exact completed TAKE
+// terminal, or complete terminal-free cleanup. The terminal observation is
+// copied and then revalidated by completed_by_take, so an owner replacement
+// between the two lookups cannot be adopted.
+static __always_inline u8
+java_remote_parent_exact_receive_already_fenced(const java_remote_parent_key_t *expected,
+                                                u64 process_incarnation,
+                                                const connection_info_t *connection,
+                                                u32 connection_netns,
+                                                u64 connection_netns_cookie,
+                                                u64 socket_cookie) {
+    const java_remote_parent_terminal_t *terminal =
+        bpf_map_lookup_elem(&java_remote_parent_terminal, &expected->owner);
+    u64 observed_monotime_ns = 0;
+    if (terminal && terminal->generation == expected->generation &&
+        terminal->process_incarnation == process_incarnation) {
+        observed_monotime_ns = terminal->observed_monotime_ns;
+    }
+    if (observed_monotime_ns &&
+        java_remote_parent_exact_receive_completed_by_take(expected,
+                                                           process_incarnation,
+                                                           observed_monotime_ns,
+                                                           connection,
+                                                           connection_netns,
+                                                           connection_netns_cookie,
+                                                           socket_cookie)) {
+        return 1;
+    }
+    return java_remote_parent_exact_receive_completed_terminal_free(
+        expected, connection, connection_netns, connection_netns_cookie, socket_cookie);
+}
+
 static __noinline u8 java_remote_parent_cleanup_detached_zero_alias_once(
     const java_remote_parent_key_t *key, u64 process_incarnation, u64 observed_monotime_ns);
 
@@ -2139,11 +2473,11 @@ java_remote_parent_cleanup_exact_receive_zero_alias(const java_remote_parent_key
 // claim before the first destructive mutation; the owner guard closes the
 // claim-release window and prevents same-owner staging.
 static __noinline __attribute__((unused)) u8
-java_remote_parent_detach_exact_receive_generation(const java_remote_parent_key_t *expected,
-                                                   u64 process_incarnation,
-                                                   const connection_info_t *connection,
-                                                   u32 connection_netns,
-                                                   u64 socket_cookie) {
+java_remote_parent_detach_exact_receive_aliased(const java_remote_parent_key_t *expected,
+                                                u64 process_incarnation,
+                                                const connection_info_t *connection,
+                                                u32 connection_netns,
+                                                u64 socket_cookie) {
     enum java_remote_parent_exact_receive_generation_mode mode =
         java_remote_parent_exact_receive_generation_matches(
             expected, process_incarnation, connection, connection_netns, socket_cookie);
@@ -2152,12 +2486,8 @@ java_remote_parent_detach_exact_receive_generation(const java_remote_parent_key_
     }
     const java_remote_parent_state_t *state =
         bpf_map_lookup_elem(&java_remote_parent_state, expected);
-    if (!state) {
+    if (!state || !state->aliases) {
         return 0;
-    }
-    if (!state->aliases) {
-        return java_remote_parent_cleanup_exact_receive_zero_alias(
-            expected, process_incarnation, connection, connection_netns, socket_cookie);
     }
     const u64 observed_monotime_ns = state->observed_monotime_ns;
 
@@ -2294,6 +2624,29 @@ java_remote_parent_detach_exact_receive_generation(const java_remote_parent_key_
     // alias convergence or successor publication belongs to another operation.
     java_remote_parent_handoff_reset_fences(expected, scratch);
     return 1;
+}
+
+// Keep the mode dispatch in the caller's small frame so both 384-byte exact
+// leaves remain siblings. A noinline dispatcher would add another live frame
+// to close and ioctl roots that already approach the verifier's 512-byte
+// stack limit.
+static __always_inline __attribute__((unused)) u8
+java_remote_parent_detach_exact_receive_generation(const java_remote_parent_key_t *expected,
+                                                   u64 process_incarnation,
+                                                   const connection_info_t *connection,
+                                                   u32 connection_netns,
+                                                   u64 socket_cookie) {
+    const java_remote_parent_state_t *state =
+        bpf_map_lookup_elem(&java_remote_parent_state, expected);
+    if (!state) {
+        return 0;
+    }
+    if (state->aliases) {
+        return java_remote_parent_detach_exact_receive_aliased(
+            expected, process_incarnation, connection, connection_netns, socket_cookie);
+    }
+    return java_remote_parent_cleanup_exact_receive_zero_alias(
+        expected, process_incarnation, connection, connection_netns, socket_cookie);
 }
 
 static __always_inline u8 java_remote_parent_detached_zero_state_matches(
@@ -3235,12 +3588,34 @@ typedef struct java_remote_parent_resolution {
     java_remote_parent_key_t key;
     java_remote_parent_owner_t indexed;
     u64 observed_monotime_ns;
+    // Socket identity negotiated by the sockopt caller. FINISH uses this
+    // immutable authority when an aliased RESET has already detached the old
+    // generation's physical indexes and a same-socket successor is present.
+    u64 expected_socket_cookie;
+    u64 expected_generation;
+    java_remote_parent_alias_replay_binding_t replay_binding;
     u8 found;
     u8 ambiguous;
     u8 via_task;
     u8 via_replay;
-    unsigned char reserved[4];
+    u8 replay_binding_found;
+    unsigned char reserved[3];
 } java_remote_parent_resolution_t;
+
+typedef struct java_remote_parent_handoff_capture_workspace {
+    u32 busy;
+    u32 reserved;
+    java_remote_parent_resolution_t resolution;
+    java_remote_parent_task_t carrier;
+    java_remote_parent_key_t generation;
+    java_remote_parent_handoff_key_t handoff_key;
+} java_remote_parent_handoff_capture_workspace_t;
+
+_Static_assert(sizeof(java_remote_parent_handoff_capture_workspace_t) == 216,
+               "java remote-parent handoff capture workspace size mismatch");
+
+SCRATCH_MEM_TYPED(java_remote_parent_handoff_capture_workspace,
+                  java_remote_parent_handoff_capture_workspace_t)
 
 static __noinline __attribute__((unused)) void
 java_remote_parent_resolve_exact(java_remote_parent_resolution_t *resolution,
@@ -3559,7 +3934,9 @@ static __always_inline u8 java_remote_parent_exact_generation_active(
 
 static __always_inline u8 java_remote_parent_exact_generation_carrier_authoritative(
     const java_remote_parent_key_t *key, u64 observed_monotime_ns, u64 process_incarnation) {
-    if (java_remote_parent_exact_generation_active(key, observed_monotime_ns, 0)) {
+    if (java_remote_parent_generation_observation_matches(key, observed_monotime_ns) &&
+        (java_remote_parent_generation_state_active_for_incarnation(key, process_incarnation) ||
+         java_remote_parent_generation_state_detached_for_incarnation(key, process_incarnation))) {
         return 1;
     }
     const java_remote_parent_alias_replay_key_t replay_key =
@@ -3577,72 +3954,107 @@ static __always_inline u8 java_remote_parent_exact_generation_carrier_authoritat
     return transitioning && bpf_map_lookup_elem(&java_remote_parent_claims, key);
 }
 
+static __noinline __attribute__((unused)) u8 java_remote_parent_prepare_handoff_capture(
+    const pid_key_t *execution, java_remote_parent_handoff_capture_workspace_t *workspace) {
+    if (!workspace) {
+        return 0;
+    }
+    __builtin_memset(&workspace->resolution, 0, sizeof(workspace->resolution));
+    // A handler submission may capture only the generation staged directly by
+    // this execution's current receive. A task alias identifies an older exact
+    // execution scope, not the request currently entering a TLS handler.
+    java_remote_parent_resolve_exact(&workspace->resolution, execution, 0, 0);
+    if (workspace->resolution.ambiguous || !workspace->resolution.found ||
+        workspace->resolution.indexed.lifecycle != k_java_remote_parent_lifecycle_active ||
+        !java_remote_parent_exact_generation_active(
+            &workspace->resolution.key, workspace->resolution.observed_monotime_ns, 1)) {
+        return 0;
+    }
+
+    workspace->carrier = (java_remote_parent_task_t){
+        .owner = workspace->resolution.key.owner,
+        .generation = workspace->resolution.key.generation,
+        .observed_monotime_ns = workspace->resolution.observed_monotime_ns,
+    };
+    return 1;
+}
+
 static __always_inline void
 java_remote_parent_capture_handoff_for_execution(const pid_key_t *execution, u64 token) {
     if (!token) {
         return;
     }
 
-    java_remote_parent_resolution_t resolution = {0};
-    // A handler submission may capture only the generation staged directly by
-    // this execution's current receive. A task alias identifies an older exact
-    // execution scope, not the request currently entering a TLS handler.
-    java_remote_parent_resolve_exact(&resolution, execution, 0, 0);
-    if (resolution.ambiguous || !resolution.found ||
-        resolution.indexed.lifecycle != k_java_remote_parent_lifecycle_active ||
-        !java_remote_parent_exact_generation_active(
-            &resolution.key, resolution.observed_monotime_ns, 1)) {
+    java_remote_parent_handoff_capture_workspace_t *workspace =
+        java_remote_parent_handoff_capture_workspace_mem();
+    if (!workspace || workspace->busy) {
         return;
+    }
+    workspace->busy = 1;
+    barrier();
+    if (!java_remote_parent_prepare_handoff_capture(execution, workspace)) {
+        goto release_workspace;
+    }
+    workspace->generation =
+        java_remote_parent_state_key(&workspace->carrier.owner, workspace->carrier.generation);
+    workspace->handoff_key = java_remote_parent_handoff_key(execution, token);
+    if (bpf_map_lookup_elem(&java_remote_parent_handoff_claims, &workspace->handoff_key)) {
+        java_remote_parent_mark_exact_generation_ambiguous(&workspace->generation);
+        goto release_workspace;
     }
 
-    const java_remote_parent_handoff_key_t key = java_remote_parent_handoff_key(execution, token);
-    if (bpf_map_lookup_elem(&java_remote_parent_handoff_claims, &key)) {
-        java_remote_parent_mark_exact_generation_ambiguous(&resolution.key);
-        return;
+    if (!java_remote_parent_retain_generation_alias(&workspace->generation,
+                                                    workspace->carrier.observed_monotime_ns)) {
+        java_remote_parent_mark_exact_generation_ambiguous(&workspace->generation);
+        goto release_workspace;
     }
-
-    const java_remote_parent_task_t handoff = {
-        .owner = resolution.key.owner,
-        .generation = resolution.key.generation,
-        .observed_monotime_ns = resolution.observed_monotime_ns,
-    };
-    if (!java_remote_parent_retain_generation_alias(&resolution.key,
-                                                    resolution.observed_monotime_ns)) {
-        java_remote_parent_mark_exact_generation_ambiguous(&resolution.key);
-        return;
-    }
-    if (bpf_map_update_elem(&java_remote_parent_handoffs, &key, &handoff, BPF_NOEXIST) != 0) {
-        java_remote_parent_release_generation_alias(&resolution.key,
-                                                    resolution.observed_monotime_ns);
+    if (bpf_map_update_elem(&java_remote_parent_handoffs,
+                            &workspace->handoff_key,
+                            &workspace->carrier,
+                            BPF_NOEXIST) != 0) {
+        java_remote_parent_release_generation_alias(&workspace->generation,
+                                                    workspace->carrier.observed_monotime_ns);
         const java_remote_parent_task_t *existing =
-            bpf_map_lookup_elem(&java_remote_parent_handoffs, &key);
+            bpf_map_lookup_elem(&java_remote_parent_handoffs, &workspace->handoff_key);
         if (existing) {
-            const java_remote_parent_task_t copy = *existing;
-            const java_remote_parent_key_t existing_generation =
-                java_remote_parent_state_key(&copy.owner, copy.generation);
-            java_remote_parent_mark_exact_generation_ambiguous(&existing_generation);
-            java_remote_parent_mark_exact_generation_ambiguous(&resolution.key);
+            workspace->carrier = *existing;
+            java_remote_parent_mark_exact_generation_ambiguous(&workspace->generation);
+            workspace->generation = java_remote_parent_state_key(&workspace->carrier.owner,
+                                                                 workspace->carrier.generation);
+            java_remote_parent_mark_exact_generation_ambiguous(&workspace->generation);
         } else {
             java_remote_parent_stat_add(k_java_remote_parent_stat_stage_overload);
         }
-        return;
+        goto release_workspace;
     }
 
     const java_remote_parent_task_t *published =
-        bpf_map_lookup_elem(&java_remote_parent_handoffs, &key);
-    volatile u8 claimed = bpf_map_lookup_elem(&java_remote_parent_handoff_claims, &key) != NULL;
-    if (!published || published->generation != resolution.key.generation ||
-        published->observed_monotime_ns != resolution.observed_monotime_ns ||
-        !java_remote_parent_pid_key_equal(&published->owner, &resolution.key.owner) || claimed ||
+        bpf_map_lookup_elem(&java_remote_parent_handoffs, &workspace->handoff_key);
+    volatile u8 claimed =
+        bpf_map_lookup_elem(&java_remote_parent_handoff_claims, &workspace->handoff_key) != NULL;
+    if (!published || published->generation != workspace->generation.generation ||
+        published->observed_monotime_ns != workspace->carrier.observed_monotime_ns ||
+        !java_remote_parent_pid_key_equal(&published->owner, &workspace->generation.owner) ||
+        claimed ||
         !java_remote_parent_exact_generation_active(
-            &resolution.key, resolution.observed_monotime_ns, 0)) {
-        const long deleted = bpf_map_delete_elem(&java_remote_parent_handoffs, &key);
+            &workspace->generation, workspace->carrier.observed_monotime_ns, 0)) {
+        const long deleted =
+            bpf_map_delete_elem(&java_remote_parent_handoffs, &workspace->handoff_key);
         if (deleted == 0) {
-            java_remote_parent_release_generation_alias(&resolution.key,
-                                                        resolution.observed_monotime_ns);
-            java_remote_parent_mark_exact_generation_ambiguous(&resolution.key);
+            java_remote_parent_release_generation_alias(&workspace->generation,
+                                                        workspace->carrier.observed_monotime_ns);
+            java_remote_parent_mark_exact_generation_ambiguous(&workspace->generation);
         }
     }
+
+release_workspace:
+    workspace->reserved = 0;
+    __builtin_memset(&workspace->resolution, 0, sizeof(workspace->resolution));
+    __builtin_memset(&workspace->carrier, 0, sizeof(workspace->carrier));
+    __builtin_memset(&workspace->generation, 0, sizeof(workspace->generation));
+    __builtin_memset(&workspace->handoff_key, 0, sizeof(workspace->handoff_key));
+    barrier();
+    workspace->busy = 0;
 }
 
 static __always_inline void java_remote_parent_capture_handoff(u64 token) {
@@ -3773,61 +4185,88 @@ static __always_inline void java_remote_parent_capture_relay(const pid_key_t *ex
         return;
     }
 
+    java_remote_parent_handoff_capture_workspace_t *workspace =
+        java_remote_parent_handoff_capture_workspace_mem();
+    if (!workspace || workspace->busy) {
+        return;
+    }
+    workspace->busy = 1;
+    barrier();
     const java_remote_parent_task_t *linked =
         bpf_map_lookup_elem(&java_remote_parent_tasks, execution);
     if (!linked) {
-        return;
+        goto release_workspace;
     }
-    const java_remote_parent_task_t relay = *linked;
+    workspace->carrier = *linked;
 
-    const java_remote_parent_key_t generation =
-        java_remote_parent_state_key(&relay.owner, relay.generation);
-    if (!relay.generation || !relay.observed_monotime_ns ||
-        !java_remote_parent_exact_generation_active(&generation, relay.observed_monotime_ns, 0)) {
-        return;
+    workspace->generation =
+        java_remote_parent_state_key(&workspace->carrier.owner, workspace->carrier.generation);
+    if (!workspace->carrier.generation || !workspace->carrier.observed_monotime_ns ||
+        !java_remote_parent_exact_generation_active(
+            &workspace->generation, workspace->carrier.observed_monotime_ns, 0)) {
+        goto release_workspace;
     }
 
-    const java_remote_parent_handoff_key_t key = java_remote_parent_handoff_key(execution, token);
-    if (bpf_map_lookup_elem(&java_remote_parent_handoff_claims, &key)) {
-        java_remote_parent_mark_exact_generation_ambiguous(&generation);
-        return;
+    workspace->handoff_key = java_remote_parent_handoff_key(execution, token);
+    if (bpf_map_lookup_elem(&java_remote_parent_handoff_claims, &workspace->handoff_key)) {
+        java_remote_parent_mark_exact_generation_ambiguous(&workspace->generation);
+        goto release_workspace;
     }
-    if (!java_remote_parent_retain_detached_generation_alias(&generation,
-                                                             relay.observed_monotime_ns)) {
-        java_remote_parent_mark_exact_generation_ambiguous(&generation);
-        return;
+    if (!java_remote_parent_retain_detached_generation_alias(
+            &workspace->generation, workspace->carrier.observed_monotime_ns)) {
+        java_remote_parent_mark_exact_generation_ambiguous(&workspace->generation);
+        goto release_workspace;
     }
-    if (bpf_map_update_elem(&java_remote_parent_handoffs, &key, &relay, BPF_NOEXIST) != 0) {
-        java_remote_parent_release_generation_alias(&generation, relay.observed_monotime_ns);
+    if (bpf_map_update_elem(&java_remote_parent_handoffs,
+                            &workspace->handoff_key,
+                            &workspace->carrier,
+                            BPF_NOEXIST) != 0) {
+        java_remote_parent_release_generation_alias(&workspace->generation,
+                                                    workspace->carrier.observed_monotime_ns);
         const java_remote_parent_task_t *existing =
-            bpf_map_lookup_elem(&java_remote_parent_handoffs, &key);
+            bpf_map_lookup_elem(&java_remote_parent_handoffs, &workspace->handoff_key);
         if (existing) {
-            const java_remote_parent_task_t copy = *existing;
-            const java_remote_parent_key_t existing_generation =
-                java_remote_parent_state_key(&copy.owner, copy.generation);
-            java_remote_parent_mark_exact_generation_ambiguous(&existing_generation);
+            workspace->carrier = *existing;
         }
-        java_remote_parent_mark_exact_generation_ambiguous(&generation);
-        return;
+        java_remote_parent_mark_exact_generation_ambiguous(&workspace->generation);
+        if (existing) {
+            workspace->generation = java_remote_parent_state_key(&workspace->carrier.owner,
+                                                                 workspace->carrier.generation);
+            java_remote_parent_mark_exact_generation_ambiguous(&workspace->generation);
+        }
+        goto release_workspace;
     }
 
     const java_remote_parent_task_t *published =
-        bpf_map_lookup_elem(&java_remote_parent_handoffs, &key);
+        bpf_map_lookup_elem(&java_remote_parent_handoffs, &workspace->handoff_key);
     linked = bpf_map_lookup_elem(&java_remote_parent_tasks, execution);
-    volatile u8 claimed = bpf_map_lookup_elem(&java_remote_parent_handoff_claims, &key) != NULL;
-    if (!published || published->generation != relay.generation ||
-        published->observed_monotime_ns != relay.observed_monotime_ns ||
-        !java_remote_parent_pid_key_equal(&published->owner, &relay.owner) || !linked ||
-        linked->generation != relay.generation ||
-        linked->observed_monotime_ns != relay.observed_monotime_ns ||
-        !java_remote_parent_pid_key_equal(&linked->owner, &relay.owner) || claimed ||
-        !java_remote_parent_exact_generation_active(&generation, relay.observed_monotime_ns, 0)) {
-        const long deleted = bpf_map_delete_elem(&java_remote_parent_handoffs, &key);
+    volatile u8 claimed =
+        bpf_map_lookup_elem(&java_remote_parent_handoff_claims, &workspace->handoff_key) != NULL;
+    if (!published || published->generation != workspace->carrier.generation ||
+        published->observed_monotime_ns != workspace->carrier.observed_monotime_ns ||
+        !java_remote_parent_pid_key_equal(&published->owner, &workspace->carrier.owner) ||
+        !linked || linked->generation != workspace->carrier.generation ||
+        linked->observed_monotime_ns != workspace->carrier.observed_monotime_ns ||
+        !java_remote_parent_pid_key_equal(&linked->owner, &workspace->carrier.owner) || claimed ||
+        !java_remote_parent_exact_generation_active(
+            &workspace->generation, workspace->carrier.observed_monotime_ns, 0)) {
+        const long deleted =
+            bpf_map_delete_elem(&java_remote_parent_handoffs, &workspace->handoff_key);
         if (deleted == 0) {
-            java_remote_parent_release_generation_alias(&generation, relay.observed_monotime_ns);
-            java_remote_parent_mark_exact_generation_ambiguous(&generation);
+            java_remote_parent_release_generation_alias(&workspace->generation,
+                                                        workspace->carrier.observed_monotime_ns);
+            java_remote_parent_mark_exact_generation_ambiguous(&workspace->generation);
         }
     }
+
+release_workspace:
+    workspace->reserved = 0;
+    __builtin_memset(&workspace->resolution, 0, sizeof(workspace->resolution));
+    __builtin_memset(&workspace->carrier, 0, sizeof(workspace->carrier));
+    __builtin_memset(&workspace->generation, 0, sizeof(workspace->generation));
+    __builtin_memset(&workspace->handoff_key, 0, sizeof(workspace->handoff_key));
+    barrier();
+    workspace->busy = 0;
 }
 
 static __always_inline enum java_remote_parent_status
@@ -4039,7 +4478,10 @@ static __noinline __attribute__((unused)) u8 java_remote_parent_finish_alias_rep
         java_remote_parent_finish_alias_replay_key(resolution);
     const java_remote_parent_alias_replay_t *replay =
         bpf_map_lookup_elem(&java_remote_parent_alias_replays, &replay_key);
-    return owned_claim && replay && !replay->producer_tag &&
+    return owned_claim && replay && resolution->replay_binding_found &&
+           java_remote_parent_alias_replay_binding_matches_snapshot(replay,
+                                                                    &resolution->replay_binding) &&
+           !replay->producer_tag &&
            replay->transition_monotime_ns == owned_claim->observed_monotime_ns &&
            java_remote_parent_alias_replay_final_valid(&replay_key, replay, lifecycle);
 }
@@ -4126,7 +4568,9 @@ java_remote_parent_finish_barrier_core(const java_remote_parent_resolution_t *re
         java_remote_parent_finish_alias_replay_key(resolution);
     const java_remote_parent_alias_replay_t *replay =
         bpf_map_lookup_elem(&java_remote_parent_alias_replays, &replay_key);
-    if (!replay) {
+    if (!replay || !resolution->replay_binding_found ||
+        !java_remote_parent_alias_replay_binding_matches_snapshot(replay,
+                                                                  &resolution->replay_binding)) {
         return 0;
     }
     volatile u64 replay_mismatch =
@@ -4150,6 +4594,7 @@ java_remote_parent_finish_barriers_valid(const java_remote_parent_resolution_t *
 }
 
 typedef struct java_remote_parent_finish_connection {
+    u64 generation;
     u64 netns_cookie;
     u64 incoming_generation;
     u64 socket_cookie;
@@ -4157,8 +4602,28 @@ typedef struct java_remote_parent_finish_connection {
     u32 reserved;
 } java_remote_parent_finish_connection_t;
 
-_Static_assert(sizeof(java_remote_parent_finish_connection_t) == 32,
+_Static_assert(sizeof(java_remote_parent_finish_connection_t) == 40,
                "java remote-parent finish connection size mismatch");
+
+typedef struct java_remote_parent_retrieval_successor_workspace {
+    java_remote_parent_alias_replay_key_t replay_key;
+    java_remote_parent_connection_key_t connection_key;
+    java_remote_parent_finish_connection_t published;
+    java_remote_parent_key_t key;
+    pid_key_t process;
+    u32 reserved;
+} java_remote_parent_retrieval_successor_workspace_t;
+
+_Static_assert(sizeof(java_remote_parent_retrieval_successor_workspace_t) == 168,
+               "java remote-parent retrieval successor workspace size mismatch");
+
+typedef struct java_remote_parent_finish_workspace {
+    java_remote_parent_finish_guard_t guard;
+    java_remote_parent_retrieval_successor_workspace_t successor;
+} java_remote_parent_finish_workspace_t;
+
+_Static_assert(sizeof(java_remote_parent_finish_workspace_t) == 232,
+               "java remote-parent finish workspace size mismatch");
 
 static __noinline __attribute__((unused)) u8 java_remote_parent_finish_connection_matches(
     const java_remote_parent_resolution_t *resolution,
@@ -4168,7 +4633,7 @@ static __noinline __attribute__((unused)) u8 java_remote_parent_finish_connectio
         return 0;
     }
     volatile u64 mismatch = connection->reserved | connection->reserved2 |
-                            (connection->generation ^ resolution->key.generation) |
+                            (connection->generation ^ expected->generation) |
                             (connection->owner.tid ^ resolution->key.owner.tid) |
                             (connection->owner.pid ^ resolution->key.owner.pid) |
                             (connection->owner.ns ^ resolution->key.owner.ns) |
@@ -4177,6 +4642,206 @@ static __noinline __attribute__((unused)) u8 java_remote_parent_finish_connectio
                             (connection->incoming_generation ^ expected->incoming_generation) |
                             (connection->socket_cookie ^ expected->socket_cookie);
     return mismatch == 0;
+}
+
+static __noinline __attribute__((unused)) u8 java_remote_parent_detached_successor_state_matches(
+    const java_remote_parent_resolution_t *resolution,
+    const connection_info_t *expected_connection,
+    u32 expected_connection_netns,
+    java_remote_parent_retrieval_successor_workspace_t *workspace) {
+    if (!resolution || !expected_connection || !resolution->expected_generation ||
+        resolution->expected_generation == resolution->key.generation || !workspace) {
+        return 0;
+    }
+    workspace->key =
+        java_remote_parent_state_key(&resolution->key.owner, resolution->expected_generation);
+    workspace->process = java_process_key(&workspace->key.owner);
+    workspace->reserved = 0;
+    const u64 process_incarnation = resolution->indexed.process_incarnation;
+    const java_remote_parent_owner_t *owner =
+        bpf_map_lookup_elem(&java_remote_parent_owners, &workspace->key.owner);
+    const java_remote_parent_state_t *state =
+        bpf_map_lookup_elem(&java_remote_parent_state, &workspace->key);
+    const java_remote_parent_generation_index_t *index =
+        bpf_map_lookup_elem(&java_remote_parent_generation_index, &workspace->key);
+    const java_remote_parent_response_t *fallback =
+        bpf_map_lookup_elem(&java_remote_parent_fallback, &workspace->key.owner);
+    const java_remote_parent_claim_t *successor_claim =
+        bpf_map_lookup_elem(&java_remote_parent_claims, &workspace->key);
+    const u64 *marker = bpf_map_lookup_elem(&java_remote_parent_ambiguity, &workspace->key);
+    if (!process_incarnation || process_incarnation != java_current_process_incarnation() ||
+        !java_remote_parent_exact_receive_owner_matches(
+            owner, &workspace->key, process_incarnation) ||
+        !state ||
+        java_remote_parent_metadata_word(&state->lifecycle) !=
+            k_java_remote_parent_lifecycle_active ||
+        !state->observed_monotime_ns || state->process_incarnation != process_incarnation ||
+        state->connection_netns != expected_connection_netns ||
+        __builtin_memcmp(&state->connection, expected_connection, sizeof(*expected_connection)) !=
+            0 ||
+        state->response.status != k_java_remote_parent_status_valid ||
+        java_remote_parent_le64_to_cpu(state->response.generation_le) !=
+            workspace->key.generation ||
+        java_remote_parent_le64_to_cpu(state->response.observed_monotime_ns_le) !=
+            state->observed_monotime_ns ||
+        !index || index->reserved ||
+        !java_remote_parent_pid_key_equal(&index->process, &workspace->process) ||
+        index->process_incarnation != process_incarnation ||
+        index->observed_monotime_ns != state->observed_monotime_ns || !fallback ||
+        __builtin_memcmp(fallback, &state->response, sizeof(*fallback)) != 0 || !marker ||
+        *marker || successor_claim) {
+        return 0;
+    }
+    return 1;
+}
+
+static __noinline __attribute__((unused)) u8
+java_remote_parent_detached_successor_retrieval_authority_matches(
+    const java_remote_parent_resolution_t *resolution,
+    const java_remote_parent_retrieval_successor_workspace_t *workspace) {
+    if (!resolution || !workspace) {
+        return 0;
+    }
+    const java_remote_parent_claim_t *owner_guard =
+        bpf_map_lookup_elem(&java_remote_parent_owner_guards, &workspace->key.owner);
+    if (owner_guard) {
+        return 0;
+    }
+    const java_remote_parent_terminal_t *terminal =
+        bpf_map_lookup_elem(&java_remote_parent_terminal, &workspace->key.owner);
+    return !terminal ||
+           (resolution->via_replay && java_remote_parent_finish_terminal_record_valid(terminal) &&
+            terminal->generation == resolution->key.generation &&
+            terminal->observed_monotime_ns == resolution->observed_monotime_ns &&
+            terminal->process_incarnation == resolution->indexed.process_incarnation);
+}
+
+static __noinline __attribute__((unused)) u8
+java_remote_parent_detached_successor_finish_authority_matches(
+    const java_remote_parent_resolution_t *resolution,
+    const java_remote_parent_finish_guard_t *old_guard,
+    const java_remote_parent_retrieval_successor_workspace_t *workspace) {
+    if (!resolution || !old_guard || !workspace) {
+        return 0;
+    }
+    const java_remote_parent_claim_t *owner_guard =
+        bpf_map_lookup_elem(&java_remote_parent_owner_guards, &workspace->key.owner);
+    if (!owner_guard || !java_remote_parent_finish_guard_valid(resolution, old_guard)) {
+        return 0;
+    }
+    const java_remote_parent_terminal_t *terminal =
+        bpf_map_lookup_elem(&java_remote_parent_terminal, &workspace->key.owner);
+    return !terminal || (java_remote_parent_finish_terminal_record_valid(terminal) &&
+                         terminal->generation == resolution->key.generation &&
+                         terminal->observed_monotime_ns == resolution->observed_monotime_ns &&
+                         terminal->process_incarnation == resolution->indexed.process_incarnation);
+}
+
+static __noinline __attribute__((unused)) u8
+java_remote_parent_detached_old_binding_matches(const java_remote_parent_resolution_t *resolution,
+                                                const java_remote_parent_state_t *state,
+                                                const connection_info_t *expected_connection,
+                                                u32 expected_connection_netns,
+                                                u64 expected_socket_cookie) {
+    if (!resolution || !state || !expected_connection || !resolution->via_task ||
+        resolution->expected_generation != resolution->key.generation ||
+        !resolution->replay_binding_found ||
+        resolution->replay_binding.connection_netns != expected_connection_netns ||
+        resolution->replay_binding.socket_cookie != expected_socket_cookie ||
+        state->connection_netns != expected_connection_netns ||
+        __builtin_memcmp(&state->connection, expected_connection, sizeof(*expected_connection)) !=
+            0 ||
+        __builtin_memcmp(&resolution->replay_binding.connection,
+                         expected_connection,
+                         sizeof(*expected_connection)) != 0) {
+        return 0;
+    }
+    const java_remote_parent_alias_replay_key_t replay_key =
+        java_remote_parent_finish_alias_replay_key(resolution);
+    const java_remote_parent_alias_replay_t *replay =
+        bpf_map_lookup_elem(&java_remote_parent_alias_replays, &replay_key);
+    return java_remote_parent_alias_replay_binding_matches_snapshot(replay,
+                                                                    &resolution->replay_binding);
+}
+
+static __noinline __attribute__((unused)) u8
+java_remote_parent_retrieval_detached_successor_twins_match(
+    const java_remote_parent_resolution_t *resolution,
+    const connection_info_t *expected_connection,
+    u32 expected_connection_netns,
+    java_remote_parent_retrieval_successor_workspace_t *workspace) {
+    if (!resolution || !expected_connection || !resolution->via_task || resolution->ambiguous ||
+        !resolution->expected_generation ||
+        resolution->expected_generation == resolution->key.generation ||
+        !resolution->expected_socket_cookie || !workspace) {
+        return 0;
+    }
+    workspace->replay_key = java_remote_parent_finish_alias_replay_key(resolution);
+    const java_remote_parent_alias_replay_t *replay =
+        bpf_map_lookup_elem(&java_remote_parent_alias_replays, &workspace->replay_key);
+    if (!resolution->replay_binding_found ||
+        !java_remote_parent_alias_replay_binding_matches_snapshot(replay,
+                                                                  &resolution->replay_binding) ||
+        resolution->replay_binding.connection_netns != expected_connection_netns ||
+        resolution->replay_binding.socket_cookie != resolution->expected_socket_cookie ||
+        __builtin_memcmp(&resolution->replay_binding.connection,
+                         expected_connection,
+                         sizeof(*expected_connection)) != 0 ||
+        !java_remote_parent_detached_successor_state_matches(
+            resolution, expected_connection, expected_connection_netns, workspace) ||
+        !java_remote_parent_detached_successor_retrieval_authority_matches(resolution, workspace)) {
+        return 0;
+    }
+    __builtin_memset(&workspace->connection_key, 0, sizeof(workspace->connection_key));
+    if (!java_remote_parent_connection_netns_key_init(
+            &workspace->connection_key, expected_connection, expected_connection_netns)) {
+        return 0;
+    }
+    const java_remote_parent_connection_t *netns_value =
+        bpf_map_lookup_elem(&java_remote_parent_connections, &workspace->connection_key.netns);
+    if (!netns_value || (netns_value->reserved | netns_value->reserved2) ||
+        netns_value->generation != resolution->expected_generation ||
+        !java_remote_parent_pid_key_equal(&netns_value->owner, &resolution->key.owner) ||
+        netns_value->netns != expected_connection_netns ||
+        netns_value->netns_cookie != resolution->replay_binding.connection_netns_cookie ||
+        !netns_value->incoming_generation ||
+        netns_value->socket_cookie != resolution->expected_socket_cookie) {
+        return 0;
+    }
+    workspace->published = (java_remote_parent_finish_connection_t){
+        .generation = netns_value->generation,
+        .netns_cookie = netns_value->netns_cookie,
+        .incoming_generation = netns_value->incoming_generation,
+        .socket_cookie = netns_value->socket_cookie,
+        .netns = netns_value->netns,
+    };
+    if (!java_remote_parent_connection_key_rekey_cookie(&workspace->connection_key,
+                                                        workspace->published.netns_cookie)) {
+        return 0;
+    }
+    const java_remote_parent_connection_t *cookie_value = bpf_map_lookup_elem(
+        &java_remote_parent_cookie_connections, &workspace->connection_key.cookie);
+    if (!java_remote_parent_finish_connection_matches(
+            resolution, cookie_value, &workspace->published) ||
+        !java_remote_parent_connection_key_rekey_netns(&workspace->connection_key,
+                                                       workspace->published.netns)) {
+        return 0;
+    }
+    netns_value =
+        bpf_map_lookup_elem(&java_remote_parent_connections, &workspace->connection_key.netns);
+    if (!java_remote_parent_finish_connection_matches(
+            resolution, netns_value, &workspace->published) ||
+        !java_remote_parent_connection_key_rekey_cookie(&workspace->connection_key,
+                                                        workspace->published.netns_cookie)) {
+        return 0;
+    }
+    cookie_value = bpf_map_lookup_elem(&java_remote_parent_cookie_connections,
+                                       &workspace->connection_key.cookie);
+    return java_remote_parent_finish_connection_matches(
+               resolution, cookie_value, &workspace->published) &&
+           java_remote_parent_detached_successor_state_matches(
+               resolution, expected_connection, expected_connection_netns, workspace) &&
+           java_remote_parent_detached_successor_retrieval_authority_matches(resolution, workspace);
 }
 
 static __noinline __attribute__((unused)) u8
@@ -4341,20 +5006,27 @@ java_remote_parent_finish_publish_alias_replay(const java_remote_parent_resoluti
         java_remote_parent_finish_alias_replay_key(resolution);
     const java_remote_parent_alias_replay_t *replay =
         bpf_map_lookup_elem(&java_remote_parent_alias_replays, &replay_key);
-    if (replay && !replay->producer_tag &&
+    if (replay && resolution->replay_binding_found &&
+        java_remote_parent_alias_replay_binding_matches_snapshot(replay,
+                                                                 &resolution->replay_binding) &&
+        !replay->producer_tag &&
         replay->transition_monotime_ns == owned_claim->observed_monotime_ns &&
         java_remote_parent_alias_replay_final_valid(&replay_key, replay, lifecycle)) {
         return 1;
     }
 
-    if (java_remote_parent_alias_replay_active_valid(&replay_key, replay, 0)) {
+    if (java_remote_parent_alias_replay_active_valid(&replay_key, replay, 0) &&
+        resolution->replay_binding_found &&
+        java_remote_parent_alias_replay_binding_matches_snapshot(replay,
+                                                                 &resolution->replay_binding)) {
         const u32 references = replay->references;
-        const java_remote_parent_alias_replay_t publishing = {
-            .transition_monotime_ns = owned_claim->observed_monotime_ns,
-            .references = references,
-            .lifecycle = k_java_remote_parent_lifecycle_publishing,
-            .desired_lifecycle = lifecycle,
-        };
+        java_remote_parent_alias_replay_t publishing = *replay;
+        publishing.transition_monotime_ns = owned_claim->observed_monotime_ns;
+        publishing.references = references;
+        publishing.lifecycle = k_java_remote_parent_lifecycle_publishing;
+        publishing.desired_lifecycle = lifecycle;
+        publishing.producer_tag = 0;
+        publishing.reserved = 0;
         if (!java_remote_parent_finish_pre_replay_barriers_valid(
                 resolution, lifecycle, observed_monotime_ns, owned_claim, guard) ||
             bpf_map_update_elem(
@@ -4364,15 +5036,20 @@ java_remote_parent_finish_publish_alias_replay(const java_remote_parent_resoluti
         replay = bpf_map_lookup_elem(&java_remote_parent_alias_replays, &replay_key);
     }
 
-    if (replay && !replay->producer_tag &&
+    if (replay && resolution->replay_binding_found &&
+        java_remote_parent_alias_replay_binding_matches_snapshot(replay,
+                                                                 &resolution->replay_binding) &&
+        !replay->producer_tag &&
         replay->transition_monotime_ns == owned_claim->observed_monotime_ns &&
         java_remote_parent_alias_replay_publishing_valid(&replay_key, replay, lifecycle)) {
         const u32 references = replay->references;
-        const java_remote_parent_alias_replay_t completed = {
-            .transition_monotime_ns = owned_claim->observed_monotime_ns,
-            .references = references,
-            .lifecycle = lifecycle,
-        };
+        java_remote_parent_alias_replay_t completed = *replay;
+        completed.transition_monotime_ns = owned_claim->observed_monotime_ns;
+        completed.references = references;
+        completed.lifecycle = lifecycle;
+        completed.desired_lifecycle = 0;
+        completed.producer_tag = 0;
+        completed.reserved = 0;
         if (!java_remote_parent_finish_pre_replay_barriers_valid(
                 resolution, lifecycle, observed_monotime_ns, owned_claim, guard) ||
             bpf_map_update_elem(
@@ -4391,9 +5068,15 @@ java_remote_parent_finish_delete_physical(const java_remote_parent_resolution_t 
                                           const java_remote_parent_claim_t *owned_claim,
                                           u64 observed_monotime_ns,
                                           enum java_remote_parent_lifecycle lifecycle,
-                                          const java_remote_parent_finish_guard_t *guard) {
-    java_remote_parent_connection_key_t connection_key = {0};
-    java_remote_parent_finish_connection_t published = {0};
+                                          java_remote_parent_finish_workspace_t *workspace) {
+    if (!workspace) {
+        return 0;
+    }
+    const java_remote_parent_finish_guard_t *guard = &workspace->guard;
+    java_remote_parent_connection_key_t *connection_key = &workspace->successor.connection_key;
+    java_remote_parent_finish_connection_t *published = &workspace->successor.published;
+    __builtin_memset(connection_key, 0, sizeof(*connection_key));
+    __builtin_memset(published, 0, sizeof(*published));
     if (!java_remote_parent_finish_barriers_valid(
             resolution, lifecycle, observed_monotime_ns, owned_claim, guard)) {
         return 0;
@@ -4402,72 +5085,159 @@ java_remote_parent_finish_delete_physical(const java_remote_parent_resolution_t 
         bpf_map_lookup_elem(&java_remote_parent_state, &resolution->key);
     if (!java_remote_parent_finish_state_valid(resolution, state, observed_monotime_ns) ||
         !java_remote_parent_connection_netns_key_init(
-            &connection_key, &state->connection, state->connection_netns)) {
+            connection_key, &state->connection, state->connection_netns)) {
         return 0;
     }
-    const u32 connection_netns = connection_key.netns.netns;
+    const u32 connection_netns = connection_key->netns.netns;
     const java_remote_parent_connection_t *netns_value =
-        bpf_map_lookup_elem(&java_remote_parent_connections, &connection_key.netns);
+        bpf_map_lookup_elem(&java_remote_parent_connections, &connection_key->netns);
     const u8 netns_has_generation =
         netns_value && netns_value->generation == resolution->key.generation &&
         java_remote_parent_pid_key_equal(&netns_value->owner, &resolution->key.owner);
     if (guard->physical_detached) {
-        // Detached state no longer retains the network-namespace cookie, so
-        // BPF cannot reconstruct and prove absence of the cookie-keyed index.
-        // Keep every generation fence for userspace full-map convergence.
-        return 0;
+        if (resolution->ambiguous || !resolution->via_task || !resolution->expected_socket_cookie ||
+            !resolution->expected_generation || netns_has_generation) {
+            return 0;
+        }
+        // Before a successor DATA_ACK, the socket-local negotiation still
+        // names the detached generation itself. That immutable old-G binding
+        // is sufficient to finish its task-carried logical state; there is no
+        // successor to preserve and RESET already removed both old indexes.
+        if (resolution->expected_generation == resolution->key.generation) {
+            return java_remote_parent_detached_old_binding_matches(
+                       resolution,
+                       state,
+                       &state->connection,
+                       connection_netns,
+                       resolution->expected_socket_cookie) &&
+                   java_remote_parent_finish_barriers_valid(
+                       resolution, lifecycle, observed_monotime_ns, owned_claim, guard);
+        }
+        workspace->successor.replay_key = java_remote_parent_finish_alias_replay_key(resolution);
+        const java_remote_parent_alias_replay_t *replay = bpf_map_lookup_elem(
+            &java_remote_parent_alias_replays, &workspace->successor.replay_key);
+        if (!resolution->replay_binding_found ||
+            !java_remote_parent_alias_replay_binding_matches_snapshot(
+                replay, &resolution->replay_binding) ||
+            resolution->replay_binding.connection_netns != connection_netns ||
+            resolution->replay_binding.socket_cookie != resolution->expected_socket_cookie ||
+            __builtin_memcmp(&resolution->replay_binding.connection,
+                             &state->connection,
+                             sizeof(state->connection)) != 0 ||
+            !java_remote_parent_detached_successor_state_matches(
+                resolution, &state->connection, connection_netns, &workspace->successor) ||
+            !java_remote_parent_detached_successor_finish_authority_matches(
+                resolution, guard, &workspace->successor)) {
+            return 0;
+        }
+        // The old physical indexes were already detached by RESET. FINISH may
+        // retire the remaining task-carried logical generation only when the
+        // caller's negotiated socket now has one exact, clean successor under
+        // both connection indexes. This persistent twin proves that the
+        // absence observed by RESET belongs to this same socket rather than an
+        // absent, foreign, malformed, or partially published map state.
+        if (!netns_value || (netns_value->reserved | netns_value->reserved2) ||
+            netns_value->generation != resolution->expected_generation ||
+            !java_remote_parent_pid_key_equal(&netns_value->owner, &resolution->key.owner) ||
+            netns_value->netns != connection_netns ||
+            netns_value->netns_cookie != resolution->replay_binding.connection_netns_cookie ||
+            !netns_value->incoming_generation ||
+            netns_value->socket_cookie != resolution->expected_socket_cookie) {
+            return 0;
+        }
+        *published = (java_remote_parent_finish_connection_t){
+            .generation = netns_value->generation,
+            .netns_cookie = netns_value->netns_cookie,
+            .incoming_generation = netns_value->incoming_generation,
+            .socket_cookie = netns_value->socket_cookie,
+            .netns = netns_value->netns,
+        };
+        if (!java_remote_parent_finish_barriers_valid(
+                resolution, lifecycle, observed_monotime_ns, owned_claim, guard) ||
+            !java_remote_parent_connection_key_rekey_cookie(connection_key,
+                                                            published->netns_cookie)) {
+            return 0;
+        }
+        const java_remote_parent_connection_t *successor_cookie =
+            bpf_map_lookup_elem(&java_remote_parent_cookie_connections, &connection_key->cookie);
+        if (!java_remote_parent_finish_connection_matches(
+                resolution, successor_cookie, published) ||
+            !java_remote_parent_finish_barriers_valid(
+                resolution, lifecycle, observed_monotime_ns, owned_claim, guard) ||
+            !java_remote_parent_connection_key_rekey_netns(connection_key, published->netns)) {
+            return 0;
+        }
+        netns_value = bpf_map_lookup_elem(&java_remote_parent_connections, &connection_key->netns);
+        if (!java_remote_parent_finish_connection_matches(resolution, netns_value, published) ||
+            !java_remote_parent_finish_barriers_valid(
+                resolution, lifecycle, observed_monotime_ns, owned_claim, guard) ||
+            !java_remote_parent_connection_key_rekey_cookie(connection_key,
+                                                            published->netns_cookie)) {
+            return 0;
+        }
+        successor_cookie =
+            bpf_map_lookup_elem(&java_remote_parent_cookie_connections, &connection_key->cookie);
+        return java_remote_parent_finish_connection_matches(
+                   resolution, successor_cookie, published) &&
+               java_remote_parent_detached_successor_state_matches(
+                   resolution, &state->connection, connection_netns, &workspace->successor) &&
+               java_remote_parent_detached_successor_finish_authority_matches(
+                   resolution, guard, &workspace->successor) &&
+               java_remote_parent_finish_barriers_valid(
+                   resolution, lifecycle, observed_monotime_ns, owned_claim, guard);
     }
     if (!netns_has_generation || (netns_value->reserved | netns_value->reserved2) ||
         netns_value->netns != connection_netns || !netns_value->netns_cookie ||
         !netns_value->incoming_generation || !netns_value->socket_cookie) {
         return 0;
     }
-    published = (java_remote_parent_finish_connection_t){
+    *published = (java_remote_parent_finish_connection_t){
+        .generation = resolution->key.generation,
         .netns_cookie = netns_value->netns_cookie,
         .incoming_generation = netns_value->incoming_generation,
         .socket_cookie = netns_value->socket_cookie,
         .netns = netns_value->netns,
     };
 
-    if (!java_remote_parent_connection_key_rekey_cookie(&connection_key, published.netns_cookie)) {
+    if (!java_remote_parent_connection_key_rekey_cookie(connection_key, published->netns_cookie)) {
         return 0;
     }
     const java_remote_parent_connection_t *cookie_value =
-        bpf_map_lookup_elem(&java_remote_parent_cookie_connections, &connection_key.cookie);
-    if (!java_remote_parent_finish_connection_matches(resolution, cookie_value, &published) ||
+        bpf_map_lookup_elem(&java_remote_parent_cookie_connections, &connection_key->cookie);
+    if (!java_remote_parent_finish_connection_matches(resolution, cookie_value, published) ||
         !java_remote_parent_finish_barriers_valid(
             resolution, lifecycle, observed_monotime_ns, owned_claim, guard)) {
         return 0;
     }
-    bpf_map_delete_elem(&java_remote_parent_cookie_connections, &connection_key.cookie);
+    bpf_map_delete_elem(&java_remote_parent_cookie_connections, &connection_key->cookie);
     cookie_value =
-        bpf_map_lookup_elem(&java_remote_parent_cookie_connections, &connection_key.cookie);
+        bpf_map_lookup_elem(&java_remote_parent_cookie_connections, &connection_key->cookie);
     if (cookie_value && cookie_value->generation == resolution->key.generation &&
         java_remote_parent_pid_key_equal(&cookie_value->owner, &resolution->key.owner)) {
         return 0;
     }
 
-    if (!java_remote_parent_connection_key_rekey_netns(&connection_key, published.netns)) {
+    if (!java_remote_parent_connection_key_rekey_netns(connection_key, published->netns)) {
         return 0;
     }
-    netns_value = bpf_map_lookup_elem(&java_remote_parent_connections, &connection_key.netns);
-    if (!java_remote_parent_finish_connection_matches(resolution, netns_value, &published) ||
+    netns_value = bpf_map_lookup_elem(&java_remote_parent_connections, &connection_key->netns);
+    if (!java_remote_parent_finish_connection_matches(resolution, netns_value, published) ||
         !java_remote_parent_finish_barriers_valid(
             resolution, lifecycle, observed_monotime_ns, owned_claim, guard)) {
         return 0;
     }
-    bpf_map_delete_elem(&java_remote_parent_connections, &connection_key.netns);
-    netns_value = bpf_map_lookup_elem(&java_remote_parent_connections, &connection_key.netns);
+    bpf_map_delete_elem(&java_remote_parent_connections, &connection_key->netns);
+    netns_value = bpf_map_lookup_elem(&java_remote_parent_connections, &connection_key->netns);
     if (netns_value && netns_value->generation == resolution->key.generation &&
         java_remote_parent_pid_key_equal(&netns_value->owner, &resolution->key.owner)) {
         return 0;
     }
 
-    if (!java_remote_parent_connection_key_rekey_cookie(&connection_key, published.netns_cookie)) {
+    if (!java_remote_parent_connection_key_rekey_cookie(connection_key, published->netns_cookie)) {
         return 0;
     }
     cookie_value =
-        bpf_map_lookup_elem(&java_remote_parent_cookie_connections, &connection_key.cookie);
+        bpf_map_lookup_elem(&java_remote_parent_cookie_connections, &connection_key->cookie);
     const u8 cookie_absent =
         !cookie_value || cookie_value->generation != resolution->key.generation ||
         !java_remote_parent_pid_key_equal(&cookie_value->owner, &resolution->key.owner);
@@ -4600,7 +5370,10 @@ java_remote_parent_finish_release_claim(const java_remote_parent_resolution_t *r
                 java_remote_parent_finish_alias_replay_key(resolution);
             const java_remote_parent_alias_replay_t *replay =
                 bpf_map_lookup_elem(&java_remote_parent_alias_replays, &replay_key);
-            if (replay && !replay->references && !replay->producer_tag &&
+            if (replay && !replay->references && resolution->replay_binding_found &&
+                java_remote_parent_alias_replay_binding_matches_snapshot(
+                    replay, &resolution->replay_binding) &&
+                !replay->producer_tag &&
                 replay->transition_monotime_ns == replay_transition_monotime_ns &&
                 java_remote_parent_alias_replay_final_valid(&replay_key, replay, lifecycle)) {
                 bpf_map_delete_elem(&java_remote_parent_alias_replays, &replay_key);
@@ -4614,13 +5387,18 @@ java_remote_parent_finish_release_claim(const java_remote_parent_resolution_t *r
     return 1;
 }
 
-static __noinline __attribute__((unused)) void
+static __noinline __attribute__((unused)) u8
 java_remote_parent_finish_generation_with_guard(const java_remote_parent_resolution_t *resolution,
                                                 enum java_remote_parent_lifecycle lifecycle,
                                                 u64 observed_monotime_ns,
                                                 java_remote_parent_claim_t *owned_claim,
-                                                java_remote_parent_finish_guard_t *guard) {
+                                                java_remote_parent_finish_workspace_t *workspace) {
+    if (!workspace) {
+        return 0;
+    }
+    java_remote_parent_finish_guard_t *guard = &workspace->guard;
     __builtin_memset(guard, 0, sizeof(*guard));
+    u8 completed = 0;
     if (!owned_claim ||
         !java_remote_parent_finish_acquire_guard(
             resolution, lifecycle, observed_monotime_ns, owned_claim, guard) ||
@@ -4629,7 +5407,7 @@ java_remote_parent_finish_generation_with_guard(const java_remote_parent_resolut
         !java_remote_parent_finish_publish_alias_replay(
             resolution, lifecycle, observed_monotime_ns, owned_claim, guard) ||
         !java_remote_parent_finish_delete_physical(
-            resolution, owned_claim, observed_monotime_ns, lifecycle, guard) ||
+            resolution, owned_claim, observed_monotime_ns, lifecycle, workspace) ||
         !java_remote_parent_finish_delete_logical(
             resolution, lifecycle, observed_monotime_ns, owned_claim, guard) ||
         !java_remote_parent_finish_release_claim(
@@ -4637,11 +5415,14 @@ java_remote_parent_finish_generation_with_guard(const java_remote_parent_resolut
         if (owned_claim) {
             java_remote_parent_mark_exact_receive_cleanup_failed(&resolution->key, owned_claim);
         }
+    } else {
+        completed = 1;
     }
     // Payload work is over on both success and failure. Convert only exact
     // surviving invocation-local fences; fully released fences stay absent.
     java_remote_parent_handoff_exact_fence_pair(
         &resolution->key, owned_claim, &guard->key, &guard->claim);
+    return completed;
 }
 
 static __noinline __attribute__((unused)) void
@@ -4649,9 +5430,9 @@ java_remote_parent_finish_generation(const java_remote_parent_resolution_t *reso
                                      enum java_remote_parent_lifecycle lifecycle,
                                      u64 observed_monotime_ns,
                                      java_remote_parent_claim_t *owned_claim) {
-    java_remote_parent_finish_guard_t guard = {0};
+    java_remote_parent_finish_workspace_t workspace = {0};
     java_remote_parent_finish_generation_with_guard(
-        resolution, lifecycle, observed_monotime_ns, owned_claim, &guard);
+        resolution, lifecycle, observed_monotime_ns, owned_claim, &workspace);
 }
 
 static __noinline __attribute__((unused)) enum java_remote_parent_status
@@ -4704,12 +5485,6 @@ java_remote_parent_claim_status(const java_remote_parent_resolution_t *resolutio
 
 static __noinline __attribute__((unused)) u8 java_remote_parent_retrieval_task_link_matches(
     const java_remote_parent_resolution_t *resolution, const pid_key_t *execution);
-static __noinline __attribute__((unused)) u8
-java_remote_parent_retrieval_connection_matches(const java_remote_parent_resolution_t *resolution,
-                                                const java_remote_parent_state_t *state,
-                                                const connection_info_t *expected_connection,
-                                                u32 expected_connection_netns,
-                                                u64 expected_socket_cookie);
 
 typedef struct java_remote_parent_claim_options {
     u64 expected_socket_cookie;
@@ -4729,43 +5504,55 @@ typedef struct java_remote_parent_retrieval_workspace {
     u8 claim_found;
     u8 raced_claim_found;
     u16 reserved;
-    java_remote_parent_finish_guard_t finish_guard;
+    java_remote_parent_finish_workspace_t finish;
     java_remote_parent_task_t task;
+    java_remote_parent_claim_t claim_transaction;
 } java_remote_parent_retrieval_workspace_t;
 
-_Static_assert(sizeof(java_remote_parent_retrieval_workspace_t) == 224,
+_Static_assert(sizeof(java_remote_parent_retrieval_workspace_t) == 488,
                "java remote-parent retrieval workspace size mismatch");
 _Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, resolution) == 0,
                "java remote-parent retrieval resolution offset mismatch");
-_Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, owned_claim) == 64,
+_Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, owned_claim) == 136,
                "java remote-parent retrieval claim offset mismatch");
-_Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, claim_options) == 88,
+_Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, claim_options) == 160,
                "java remote-parent retrieval options offset mismatch");
-_Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, start) == 112,
+_Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, start) == 184,
                "java remote-parent retrieval start offset mismatch");
-_Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, claim_found) == 124,
+_Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, claim_found) == 196,
                "java remote-parent retrieval claim-found offset mismatch");
 _Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, raced_claim_found) ==
-                   125,
+                   197,
                "java remote-parent retrieval raced-claim offset mismatch");
-_Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, finish_guard) == 128,
-               "java remote-parent retrieval finish-guard offset mismatch");
-_Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, task) == 192,
+_Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, finish) == 200,
+               "java remote-parent retrieval finish offset mismatch");
+_Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, task) == 432,
                "java remote-parent retrieval task offset mismatch");
+_Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, claim_transaction) ==
+                   464,
+               "java remote-parent retrieval transaction offset mismatch");
+
+static __noinline __attribute__((unused)) u8 java_remote_parent_retrieval_connection_matches(
+    const java_remote_parent_resolution_t *resolution,
+    const java_remote_parent_state_t *state,
+    const connection_info_t *expected_connection,
+    java_remote_parent_retrieval_workspace_t *workspace);
 
 static __noinline __attribute__((unused)) enum java_remote_parent_status
 java_remote_parent_claim(const java_remote_parent_resolution_t *resolution,
                          const pid_key_t *execution,
                          const connection_info_t *expected_connection,
                          const java_remote_parent_claim_options_t *options,
-                         java_remote_parent_claim_t *owned_claim) {
-    if (!owned_claim || !options) {
+                         java_remote_parent_retrieval_workspace_t *workspace) {
+    java_remote_parent_claim_t *owned_claim = workspace ? &workspace->owned_claim : NULL;
+    java_remote_parent_claim_t *publishing_claim = workspace ? &workspace->claim_transaction : NULL;
+    if (!owned_claim || !publishing_claim || !options) {
         return k_java_remote_parent_status_overload;
     }
     __builtin_memset(owned_claim, 0, sizeof(*owned_claim));
+    __builtin_memset(publishing_claim, 0, sizeof(*publishing_claim));
     const enum java_remote_parent_lifecycle desired_lifecycle = options->desired_lifecycle;
     const u32 expected_connection_netns = options->expected_connection_netns;
-    const u64 expected_socket_cookie = options->expected_socket_cookie;
     const u64 max_age_ns = options->max_age_ns;
     if (!java_remote_parent_alias_replay_lifecycle_final(desired_lifecycle)) {
         return k_java_remote_parent_status_ambiguous;
@@ -4781,39 +5568,38 @@ java_remote_parent_claim(const java_remote_parent_resolution_t *resolution,
         bpf_map_lookup_elem(&java_remote_parent_state, &resolution->key);
     const u8 carrier_requires_replay =
         resolution->via_task || (preclaim_state && preclaim_state->aliases);
-    const java_remote_parent_alias_replay_key_t replay_key =
-        java_remote_parent_finish_alias_replay_key(resolution);
-    const java_remote_parent_alias_replay_t *preclaim_replay =
-        bpf_map_lookup_elem(&java_remote_parent_alias_replays, &replay_key);
+    workspace->finish.successor.replay_key = java_remote_parent_finish_alias_replay_key(resolution);
+    const java_remote_parent_alias_replay_t *preclaim_replay = bpf_map_lookup_elem(
+        &java_remote_parent_alias_replays, &workspace->finish.successor.replay_key);
     const u8 replay_required = carrier_requires_replay || preclaim_replay;
-    if (replay_required && !java_remote_parent_alias_replay_active_valid(
-                               &replay_key, preclaim_replay, carrier_requires_replay)) {
+    if (replay_required &&
+        !java_remote_parent_alias_replay_active_valid(
+            &workspace->finish.successor.replay_key, preclaim_replay, carrier_requires_replay)) {
         // Alias replay has its own bounded pool. Missing/capacity-conflicted
         // authority rejects the claim before E is inserted.
         return k_java_remote_parent_status_overload;
     }
-    const java_remote_parent_claim_t publishing_claim = {
+    *publishing_claim = (java_remote_parent_claim_t){
         .observed_monotime_ns = bpf_ktime_get_ns(),
         .process_incarnation = resolution->indexed.process_incarnation,
         .lifecycle = k_java_remote_parent_lifecycle_publishing,
         .reserved = {desired_lifecycle},
     };
-    if (!publishing_claim.observed_monotime_ns) {
+    if (!publishing_claim->observed_monotime_ns) {
         return k_java_remote_parent_status_overload;
     }
     if (bpf_map_update_elem(
-            &java_remote_parent_claims, &resolution->key, &publishing_claim, BPF_NOEXIST) == 0) {
+            &java_remote_parent_claims, &resolution->key, publishing_claim, BPF_NOEXIST) == 0) {
         if (java_remote_parent_owner_detach_guarded(&resolution->key.owner)) {
-            java_remote_parent_claim_t rollback = publishing_claim;
-            java_remote_parent_release_exact_receive_claim(&resolution->key, &rollback);
+            java_remote_parent_release_exact_receive_claim(&resolution->key, publishing_claim);
             return k_java_remote_parent_status_overload;
         }
         // E is still a nonterminal intent. Revalidate every delivery binding
         // before its one-shot semantic promotion.
         const java_remote_parent_state_t *state =
             bpf_map_lookup_elem(&java_remote_parent_state, &resolution->key);
-        const java_remote_parent_alias_replay_t *replay =
-            bpf_map_lookup_elem(&java_remote_parent_alias_replays, &replay_key);
+        const java_remote_parent_alias_replay_t *replay = bpf_map_lookup_elem(
+            &java_remote_parent_alias_replays, &workspace->finish.successor.replay_key);
         const u8 replay_still_required =
             replay_required || resolution->via_task || (state && state->aliases);
         const u8 replay_has_carrier = resolution->via_task || (state && state->aliases);
@@ -4828,15 +5614,20 @@ java_remote_parent_claim(const java_remote_parent_resolution_t *resolution,
             java_remote_parent_generation_index_matches(
                 &resolution->key, state->process_incarnation, resolution->observed_monotime_ns) &&
             java_remote_parent_finish_reservation_valid(&resolution->key, desired_lifecycle) &&
-            (!replay_still_required || java_remote_parent_alias_replay_active_valid(
-                                           &replay_key, replay, replay_has_carrier)) &&
+            (!replay_still_required ||
+             java_remote_parent_alias_replay_active_valid(
+                 &workspace->finish.successor.replay_key, replay, replay_has_carrier)) &&
             (!resolution->via_task ||
              java_remote_parent_retrieval_task_link_matches(resolution, execution)) &&
-            java_remote_parent_retrieval_connection_matches(resolution,
-                                                            state,
-                                                            expected_connection,
-                                                            expected_connection_netns,
-                                                            expected_socket_cookie)) {
+            java_remote_parent_retrieval_connection_matches(
+                resolution, state, expected_connection, workspace) &&
+            (!expected_connection ||
+             resolution->expected_generation == resolution->key.generation ||
+             java_remote_parent_retrieval_detached_successor_twins_match(
+                 resolution,
+                 expected_connection,
+                 expected_connection_netns,
+                 &workspace->finish.successor))) {
             enum java_remote_parent_lifecycle commit_lifecycle = desired_lifecycle;
             if ((commit_lifecycle == k_java_remote_parent_lifecycle_consumed ||
                  commit_lifecycle == k_java_remote_parent_lifecycle_discarded) &&
@@ -4844,42 +5635,37 @@ java_remote_parent_claim(const java_remote_parent_resolution_t *resolution,
                     bpf_ktime_get_ns(), state->observed_monotime_ns, max_age_ns)) {
                 commit_lifecycle = k_java_remote_parent_lifecycle_stale;
             }
-            const java_remote_parent_claim_t completed_claim = {
-                .observed_monotime_ns = publishing_claim.observed_monotime_ns,
-                .process_incarnation = publishing_claim.process_incarnation,
+            *owned_claim = (java_remote_parent_claim_t){
+                .observed_monotime_ns = publishing_claim->observed_monotime_ns,
+                .process_incarnation = publishing_claim->process_incarnation,
                 .lifecycle = commit_lifecycle,
             };
             // This BPF_EXIST update is the one-shot semantic linearization
             // point. Any uncertainty after it is committed uncertainty and
             // must retain exact fences rather than rolling the outcome back.
-            *owned_claim = completed_claim;
             const long promoted = bpf_map_update_elem(
-                &java_remote_parent_claims, &resolution->key, &completed_claim, BPF_EXIST);
+                &java_remote_parent_claims, &resolution->key, owned_claim, BPF_EXIST);
             const java_remote_parent_claim_t *published =
                 bpf_map_lookup_elem(&java_remote_parent_claims, &resolution->key);
-            if (java_remote_parent_claim_equal(published, &completed_claim)) {
+            if (java_remote_parent_claim_equal(published, owned_claim)) {
                 return k_java_remote_parent_status_valid;
             }
             if (promoted == 0) {
-                java_remote_parent_mark_exact_receive_cleanup_failed(&resolution->key,
-                                                                     &completed_claim);
+                java_remote_parent_mark_exact_receive_cleanup_failed(&resolution->key, owned_claim);
                 return k_java_remote_parent_status_overload;
             }
             const java_remote_parent_claim_t *intent =
                 bpf_map_lookup_elem(&java_remote_parent_claims, &resolution->key);
-            if (java_remote_parent_claim_equal(intent, &publishing_claim)) {
-                java_remote_parent_claim_t rollback = publishing_claim;
-                java_remote_parent_release_exact_receive_claim(&resolution->key, &rollback);
+            if (java_remote_parent_claim_equal(intent, publishing_claim)) {
+                java_remote_parent_release_exact_receive_claim(&resolution->key, publishing_claim);
                 java_remote_parent_ensure_exact_ambiguity(&resolution->key);
                 __builtin_memset(owned_claim, 0, sizeof(*owned_claim));
                 return k_java_remote_parent_status_overload;
             }
-            java_remote_parent_mark_exact_receive_cleanup_failed(&resolution->key,
-                                                                 &completed_claim);
+            java_remote_parent_mark_exact_receive_cleanup_failed(&resolution->key, owned_claim);
             return k_java_remote_parent_status_ambiguous;
         }
-        java_remote_parent_claim_t rollback = publishing_claim;
-        java_remote_parent_release_exact_receive_claim(&resolution->key, &rollback);
+        java_remote_parent_release_exact_receive_claim(&resolution->key, publishing_claim);
         java_remote_parent_ensure_exact_ambiguity(&resolution->key);
         return k_java_remote_parent_status_missing;
     }
@@ -4986,6 +5772,19 @@ java_remote_parent_retrieval_socket_not_rebound(const java_remote_parent_resolut
              (!exact_generation && current->socket_cookie == expected_socket_cookie));
 }
 
+static __always_inline u8 java_remote_parent_replay_transition_matches_claim(
+    const java_remote_parent_alias_replay_t *replay, const java_remote_parent_claim_t *claim) {
+    if (!replay || !replay->transition_monotime_ns || !claim || !claim->observed_monotime_ns) {
+        return 0;
+    }
+    // Fence handoff advances E's ABA timestamp while preserving the final
+    // replay's producer timestamp. A producer claim must still match exactly;
+    // its retained cleanup successor must be strictly newer.
+    return claim->lifecycle == k_java_remote_parent_lifecycle_cleanup
+               ? replay->transition_monotime_ns < claim->observed_monotime_ns
+               : replay->transition_monotime_ns == claim->observed_monotime_ns;
+}
+
 static __always_inline u8 java_remote_parent_retrieval_claim_binding_matches(
     const java_remote_parent_resolution_t *resolution,
     const pid_key_t *execution,
@@ -5004,7 +5803,42 @@ static __always_inline u8 java_remote_parent_retrieval_claim_binding_matches(
             resolution, expected_connection, expected_connection_netns, expected_socket_cookie)) {
         return 0;
     }
-    return java_remote_parent_retrieval_task_link_matches(resolution, execution);
+    if (!java_remote_parent_retrieval_task_link_matches(resolution, execution)) {
+        return 0;
+    }
+    if (!resolution->via_task) {
+        return 1;
+    }
+    const java_remote_parent_claim_t *claim =
+        bpf_map_lookup_elem(&java_remote_parent_claims, &resolution->key);
+    if (!claim || !claim->observed_monotime_ns ||
+        claim->process_incarnation != resolution->indexed.process_incarnation) {
+        return 0;
+    }
+    const u64 claim_tail = java_remote_parent_lifecycle_tail_word(&claim->lifecycle);
+    const u8 final_lifecycle = claim->lifecycle == k_java_remote_parent_lifecycle_cleanup
+                                   ? claim->reserved[0]
+                                   : claim->lifecycle;
+    if (!java_remote_parent_alias_replay_lifecycle_final(final_lifecycle) ||
+        (claim_tail != final_lifecycle &&
+         claim_tail != (k_java_remote_parent_lifecycle_cleanup | ((u64)final_lifecycle << 8))) ||
+        !resolution->replay_binding_found ||
+        resolution->replay_binding.connection_netns != expected_connection_netns ||
+        resolution->replay_binding.socket_cookie != expected_socket_cookie ||
+        __builtin_memcmp(&resolution->replay_binding.connection,
+                         expected_connection,
+                         sizeof(*expected_connection)) != 0) {
+        return 0;
+    }
+    const java_remote_parent_alias_replay_key_t replay_key =
+        java_remote_parent_finish_alias_replay_key(resolution);
+    const java_remote_parent_alias_replay_t *replay =
+        bpf_map_lookup_elem(&java_remote_parent_alias_replays, &replay_key);
+    return replay && replay->references &&
+           java_remote_parent_replay_transition_matches_claim(replay, claim) &&
+           java_remote_parent_alias_replay_final_valid(&replay_key, replay, final_lifecycle) &&
+           java_remote_parent_alias_replay_binding_matches_snapshot(replay,
+                                                                    &resolution->replay_binding);
 }
 
 static __always_inline u8 java_remote_parent_retrieval_claim_terminal_matches(
@@ -5013,13 +5847,23 @@ static __always_inline u8 java_remote_parent_retrieval_claim_terminal_matches(
     const java_remote_parent_state_t *state,
     const connection_info_t *expected_connection,
     u32 expected_connection_netns,
-    u64 expected_socket_cookie) {
+    u64 expected_socket_cookie,
+    java_remote_parent_retrieval_workspace_t *workspace) {
     const java_remote_parent_terminal_t *terminal =
         bpf_map_lookup_elem(&java_remote_parent_terminal, &resolution->key.owner);
+    const java_remote_parent_claim_t *terminal_claim =
+        bpf_map_lookup_elem(&java_remote_parent_claims, &resolution->key);
+    const u64 terminal_claim_tail =
+        terminal_claim ? java_remote_parent_lifecycle_tail_word(&terminal_claim->lifecycle) : 0;
     if (!java_remote_parent_finish_terminal_record_valid(terminal) ||
         terminal->generation != resolution->key.generation ||
         terminal->observed_monotime_ns != resolution->observed_monotime_ns ||
-        terminal->process_incarnation != resolution->indexed.process_incarnation) {
+        terminal->process_incarnation != resolution->indexed.process_incarnation ||
+        !terminal_claim || !terminal_claim->observed_monotime_ns ||
+        terminal_claim->process_incarnation != resolution->indexed.process_incarnation ||
+        (terminal_claim_tail != terminal->lifecycle &&
+         terminal_claim_tail !=
+             (k_java_remote_parent_lifecycle_cleanup | ((u64)terminal->lifecycle << 8)))) {
         return 0;
     }
     // A completed finish can remove every connection artifact before a
@@ -5027,12 +5871,35 @@ static __always_inline u8 java_remote_parent_retrieval_claim_terminal_matches(
     // has already revalidated its socket-local negotiation, so the exact
     // terminal remains the durable binding for this status-only replay. Task
     // provenance additionally requires the exact task link to remain bound.
-    return !resolution->via_task ||
-           (!state && (java_remote_parent_retrieval_task_link_matches(resolution, execution) &&
-                       java_remote_parent_retrieval_socket_not_rebound(resolution,
-                                                                       expected_connection,
-                                                                       expected_connection_netns,
-                                                                       expected_socket_cookie)));
+    if (!resolution->via_task) {
+        return 1;
+    }
+    if (state || !expected_connection || !resolution->replay_binding_found ||
+        resolution->replay_binding.connection_netns != expected_connection_netns ||
+        resolution->replay_binding.socket_cookie != expected_socket_cookie ||
+        __builtin_memcmp(&resolution->replay_binding.connection,
+                         expected_connection,
+                         sizeof(*expected_connection)) != 0 ||
+        !java_remote_parent_retrieval_task_link_matches(resolution, execution)) {
+        return 0;
+    }
+    const java_remote_parent_alias_replay_key_t replay_key =
+        java_remote_parent_finish_alias_replay_key(resolution);
+    const java_remote_parent_alias_replay_t *replay =
+        bpf_map_lookup_elem(&java_remote_parent_alias_replays, &replay_key);
+    if (!replay || !replay->references ||
+        !java_remote_parent_replay_transition_matches_claim(replay, terminal_claim) ||
+        !java_remote_parent_alias_replay_final_valid(&replay_key, replay, terminal->lifecycle) ||
+        !java_remote_parent_alias_replay_binding_matches_snapshot(replay,
+                                                                  &resolution->replay_binding)) {
+        return 0;
+    }
+    return resolution->expected_generation == resolution->key.generation ||
+           java_remote_parent_retrieval_detached_successor_twins_match(
+               resolution,
+               expected_connection,
+               expected_connection_netns,
+               &workspace->finish.successor);
 }
 
 static __always_inline u8 java_remote_parent_retrieval_alias_replay_binding_matches(
@@ -5041,23 +5908,48 @@ static __always_inline u8 java_remote_parent_retrieval_alias_replay_binding_matc
     const connection_info_t *expected_connection,
     u32 expected_connection_netns,
     u64 expected_generation,
-    u64 expected_socket_cookie) {
-    return resolution->via_replay && expected_generation == resolution->key.generation &&
-           java_remote_parent_retrieval_task_link_matches(resolution, execution) &&
-           java_remote_parent_retrieval_alias_replay_matches(resolution) &&
-           java_remote_parent_retrieval_socket_not_rebound(
-               resolution, expected_connection, expected_connection_netns, expected_socket_cookie);
-}
-
-static __noinline __attribute__((unused)) u8
-java_remote_parent_retrieval_connection_matches(const java_remote_parent_resolution_t *resolution,
-                                                const java_remote_parent_state_t *state,
-                                                const connection_info_t *expected_connection,
-                                                u32 expected_connection_netns,
-                                                u64 expected_socket_cookie) {
-    if (!java_remote_parent_retrieval_state_metadata_matches(resolution, state)) {
+    u64 expected_socket_cookie,
+    java_remote_parent_retrieval_workspace_t *workspace) {
+    if (!resolution->via_replay || !expected_connection || !expected_generation ||
+        !expected_socket_cookie ||
+        !java_remote_parent_retrieval_task_link_matches(resolution, execution) ||
+        !java_remote_parent_retrieval_alias_replay_matches(resolution)) {
         return 0;
     }
+    const java_remote_parent_alias_replay_key_t replay_key =
+        java_remote_parent_finish_alias_replay_key(resolution);
+    const java_remote_parent_alias_replay_t *replay =
+        bpf_map_lookup_elem(&java_remote_parent_alias_replays, &replay_key);
+    if (!resolution->replay_binding_found ||
+        !java_remote_parent_alias_replay_binding_matches_snapshot(replay,
+                                                                  &resolution->replay_binding) ||
+        !java_remote_parent_alias_replay_final_valid(
+            &replay_key, replay, resolution->indexed.lifecycle) ||
+        resolution->replay_binding.connection_netns != expected_connection_netns ||
+        resolution->replay_binding.socket_cookie != expected_socket_cookie ||
+        __builtin_memcmp(&resolution->replay_binding.connection,
+                         expected_connection,
+                         sizeof(*expected_connection)) != 0) {
+        return 0;
+    }
+    return expected_generation == resolution->key.generation ||
+           java_remote_parent_retrieval_detached_successor_twins_match(
+               resolution,
+               expected_connection,
+               expected_connection_netns,
+               &workspace->finish.successor);
+}
+
+static __noinline __attribute__((unused)) u8 java_remote_parent_retrieval_connection_matches(
+    const java_remote_parent_resolution_t *resolution,
+    const java_remote_parent_state_t *state,
+    const connection_info_t *expected_connection,
+    java_remote_parent_retrieval_workspace_t *workspace) {
+    if (!workspace || !java_remote_parent_retrieval_state_metadata_matches(resolution, state)) {
+        return 0;
+    }
+    const u32 expected_connection_netns = workspace->claim_options.expected_connection_netns;
+    const u64 expected_socket_cookie = workspace->claim_options.expected_socket_cookie;
     const u8 detached_task =
         resolution->via_task && java_remote_parent_generation_state_detached_for_incarnation(
                                     &resolution->key, state->process_incarnation);
@@ -5067,8 +5959,20 @@ java_remote_parent_retrieval_connection_matches(const java_remote_parent_resolut
                 &state->connection, expected_connection, sizeof(*expected_connection)) != 0) {
             return 0;
         }
-        return detached_task ||
-               java_remote_parent_connection_matches_socket_in_netns(expected_connection,
+        if (detached_task) {
+            if (resolution->expected_generation == resolution->key.generation) {
+                return java_remote_parent_detached_old_binding_matches(resolution,
+                                                                       state,
+                                                                       expected_connection,
+                                                                       expected_connection_netns,
+                                                                       expected_socket_cookie);
+            }
+            // Callers revalidate the successor replay/logical/physical twins
+            // immediately after this state-binding proof. Keep that proof a
+            // sibling call so cgroup sockopt does not accumulate both frames.
+            return 1;
+        }
+        return java_remote_parent_connection_matches_socket_in_netns(expected_connection,
                                                                      expected_connection_netns,
                                                                      &resolution->key.owner,
                                                                      resolution->key.generation,
@@ -5099,7 +6003,7 @@ java_remote_parent_retrieve_for_connection_with_workspace(
     pid_key_t *start = &workspace->start;
     *start = java_remote_parent_current_owner();
     java_remote_parent_resolution_t *resolution = &workspace->resolution;
-    java_remote_parent_finish_guard_t *finish_guard = &workspace->finish_guard;
+    java_remote_parent_finish_workspace_t *finish_workspace = &workspace->finish;
     if (source == k_java_remote_parent_source_direct) {
         java_remote_parent_resolve_exact(resolution, start, 0, 1);
     } else if (source == k_java_remote_parent_source_task) {
@@ -5109,18 +6013,57 @@ java_remote_parent_retrieve_for_connection_with_workspace(
         java_remote_parent_retrieval_stat(discard, k_java_remote_parent_status_malformed);
         return k_java_remote_parent_status_malformed;
     }
+    // Resolvers clear and rebuild the resolution, so bind the immutable
+    // sockopt-negotiated socket identity only after resolution completes.
+    resolution->expected_socket_cookie = expected_socket_cookie;
+    resolution->expected_generation = expected_generation;
+    workspace->claim_options = (java_remote_parent_claim_options_t){
+        .expected_socket_cookie = expected_socket_cookie,
+        .max_age_ns = max_age_ns,
+        .expected_connection_netns = expected_connection_netns,
+    };
+    const java_remote_parent_state_t *resolved_replay_state =
+        resolution->found ? bpf_map_lookup_elem(&java_remote_parent_state, &resolution->key) : NULL;
+    if (resolution->via_task || resolution->via_replay ||
+        (resolved_replay_state && resolved_replay_state->aliases)) {
+        const java_remote_parent_alias_replay_key_t replay_key =
+            java_remote_parent_finish_alias_replay_key(resolution);
+        const java_remote_parent_alias_replay_t *replay =
+            bpf_map_lookup_elem(&java_remote_parent_alias_replays, &replay_key);
+        if (replay && replay->references &&
+            java_remote_parent_alias_replay_reference_valid(&replay_key, replay)) {
+            java_remote_parent_alias_replay_binding_snapshot(&resolution->replay_binding, replay);
+            resolution->replay_binding_found = 1;
+        }
+    }
 
-    if (expected_connection && !expected_socket_cookie) {
+    if (expected_connection && (!expected_socket_cookie || !expected_generation)) {
         java_remote_parent_init_response(response, k_java_remote_parent_status_missing, 0, 0);
         java_remote_parent_retrieval_stat(discard, k_java_remote_parent_status_missing);
         return k_java_remote_parent_status_missing;
     }
     if (expected_connection && resolution->found && expected_generation &&
         resolution->key.generation != expected_generation) {
-        java_remote_parent_init_response(
-            response, k_java_remote_parent_status_missing, resolution->key.generation, 0);
-        java_remote_parent_retrieval_stat(discard, k_java_remote_parent_status_missing);
-        return k_java_remote_parent_status_missing;
+        const java_remote_parent_state_t *resolved_state =
+            bpf_map_lookup_elem(&java_remote_parent_state, &resolution->key);
+        const u8 detached_task = resolution->via_task && resolved_state &&
+                                 java_remote_parent_generation_state_detached_for_incarnation(
+                                     &resolution->key, resolved_state->process_incarnation);
+        const u8 bound_replay =
+            resolution->via_replay &&
+            java_remote_parent_retrieval_alias_replay_binding_matches(resolution,
+                                                                      start,
+                                                                      expected_connection,
+                                                                      expected_connection_netns,
+                                                                      expected_generation,
+                                                                      expected_socket_cookie,
+                                                                      workspace);
+        if (!detached_task && !bound_replay) {
+            java_remote_parent_init_response(
+                response, k_java_remote_parent_status_missing, resolution->key.generation, 0);
+            java_remote_parent_retrieval_stat(discard, k_java_remote_parent_status_missing);
+            return k_java_remote_parent_status_missing;
+        }
     }
     if (resolution->found && resolution->via_task &&
         !java_remote_parent_retrieval_task_link_matches(resolution, start)) {
@@ -5152,11 +6095,8 @@ java_remote_parent_retrieve_for_connection_with_workspace(
     if (expected_connection && resolution->found) {
         const java_remote_parent_state_t *bound_state =
             bpf_map_lookup_elem(&java_remote_parent_state, &resolution->key);
-        if (!java_remote_parent_retrieval_connection_matches(resolution,
-                                                             bound_state,
-                                                             expected_connection,
-                                                             expected_connection_netns,
-                                                             expected_socket_cookie) &&
+        if (!java_remote_parent_retrieval_connection_matches(
+                resolution, bound_state, expected_connection, workspace) &&
             !((*claim_found &&
                (java_remote_parent_retrieval_claim_binding_matches(resolution,
                                                                    start,
@@ -5169,17 +6109,40 @@ java_remote_parent_retrieve_for_connection_with_workspace(
                                                                     bound_state,
                                                                     expected_connection,
                                                                     expected_connection_netns,
-                                                                    expected_socket_cookie))) ||
-              java_remote_parent_retrieval_alias_replay_binding_matches(resolution,
-                                                                        start,
-                                                                        expected_connection,
-                                                                        expected_connection_netns,
-                                                                        expected_generation,
-                                                                        expected_socket_cookie))) {
+                                                                    expected_socket_cookie,
+                                                                    workspace))) ||
+              (!*claim_found &&
+               java_remote_parent_retrieval_alias_replay_binding_matches(resolution,
+                                                                         start,
+                                                                         expected_connection,
+                                                                         expected_connection_netns,
+                                                                         expected_generation,
+                                                                         expected_socket_cookie,
+                                                                         workspace)))) {
             java_remote_parent_init_response(
                 response, k_java_remote_parent_status_missing, resolution->key.generation, 0);
             java_remote_parent_retrieval_stat(discard, k_java_remote_parent_status_missing);
             return k_java_remote_parent_status_missing;
+        }
+    }
+    if (expected_connection && resolution->found && resolution->via_task &&
+        resolution->indexed.lifecycle == k_java_remote_parent_lifecycle_active &&
+        expected_generation != resolution->key.generation) {
+        const java_remote_parent_state_t *detached_state =
+            bpf_map_lookup_elem(&java_remote_parent_state, &resolution->key);
+        if (!detached_state ||
+            !java_remote_parent_generation_state_detached_for_incarnation(
+                &resolution->key, detached_state->process_incarnation) ||
+            !java_remote_parent_retrieval_detached_successor_twins_match(
+                resolution,
+                expected_connection,
+                expected_connection_netns,
+                &workspace->finish.successor) ||
+            !java_remote_parent_retrieval_task_link_matches(resolution, start)) {
+            java_remote_parent_init_response(
+                response, k_java_remote_parent_status_overload, resolution->key.generation, 0);
+            java_remote_parent_retrieval_stat(discard, k_java_remote_parent_status_overload);
+            return k_java_remote_parent_status_overload;
         }
     }
 
@@ -5210,7 +6173,7 @@ java_remote_parent_retrieve_for_connection_with_workspace(
                 .desired_lifecycle = k_java_remote_parent_lifecycle_ambiguous,
             };
             const enum java_remote_parent_status claim_status = java_remote_parent_claim(
-                resolution, start, expected_connection, claim_options, owned_claim);
+                resolution, start, expected_connection, claim_options, workspace);
             if (claim_status == k_java_remote_parent_status_valid) {
                 const java_remote_parent_state_t *state =
                     bpf_map_lookup_elem(&java_remote_parent_state, &resolution->key);
@@ -5222,7 +6185,7 @@ java_remote_parent_retrieve_for_connection_with_workspace(
                     k_java_remote_parent_lifecycle_ambiguous,
                     observed_monotime_ns,
                     owned_claim,
-                    finish_guard);
+                    finish_workspace);
             } else if (!owned_claim->observed_monotime_ns) {
                 u8 *raced_claim_found = &workspace->raced_claim_found;
                 const enum java_remote_parent_status raced_claim_status =
@@ -5321,8 +6284,8 @@ java_remote_parent_retrieve_for_connection_with_workspace(
         .expected_connection_netns = expected_connection_netns,
         .desired_lifecycle = desired_lifecycle,
     };
-    const enum java_remote_parent_status claim_status = java_remote_parent_claim(
-        resolution, start, expected_connection, claim_options, owned_claim);
+    const enum java_remote_parent_status claim_status =
+        java_remote_parent_claim(resolution, start, expected_connection, claim_options, workspace);
     const enum java_remote_parent_lifecycle committed_lifecycle =
         owned_claim->observed_monotime_ns ? owned_claim->lifecycle : desired_lifecycle;
     if (resolution->via_task &&
@@ -5332,7 +6295,7 @@ java_remote_parent_retrieve_for_connection_with_workspace(
                                                             committed_lifecycle,
                                                             resolution->observed_monotime_ns,
                                                             owned_claim,
-                                                            finish_guard);
+                                                            finish_workspace);
         }
         java_remote_parent_init_response(
             response, k_java_remote_parent_status_ambiguous, resolution->key.generation, 0);
@@ -5354,11 +6317,19 @@ java_remote_parent_retrieve_for_connection_with_workspace(
                                                           ? k_java_remote_parent_status_ambiguous
                                                           : k_java_remote_parent_status_missing;
         java_remote_parent_init_response(response, status, resolution->key.generation, 0);
-        java_remote_parent_finish_generation_with_guard(resolution,
-                                                        committed_lifecycle,
-                                                        resolution->observed_monotime_ns,
-                                                        owned_claim,
-                                                        finish_guard);
+        const u8 finish_completed =
+            java_remote_parent_finish_generation_with_guard(resolution,
+                                                            committed_lifecycle,
+                                                            resolution->observed_monotime_ns,
+                                                            owned_claim,
+                                                            finish_workspace);
+        if (resolution->via_task && expected_connection &&
+            expected_generation != resolution->key.generation && !finish_completed) {
+            java_remote_parent_init_response(
+                response, k_java_remote_parent_status_overload, resolution->key.generation, 0);
+            java_remote_parent_retrieval_stat(discard, k_java_remote_parent_status_overload);
+            return k_java_remote_parent_status_overload;
+        }
         java_remote_parent_retrieval_stat(discard, status);
         return status;
     }
@@ -5373,11 +6344,15 @@ java_remote_parent_retrieve_for_connection_with_workspace(
         !java_remote_parent_generation_index_matches(
             &resolution->key, state->process_incarnation, resolution->observed_monotime_ns) ||
         !java_remote_parent_generation_cleanly_reserved(&resolution->key) ||
-        !java_remote_parent_retrieval_connection_matches(resolution,
-                                                         state,
-                                                         expected_connection,
-                                                         expected_connection_netns,
-                                                         expected_socket_cookie) ||
+        !java_remote_parent_retrieval_connection_matches(
+            resolution, state, expected_connection, workspace) ||
+        (resolution->via_task && expected_connection &&
+         expected_generation != resolution->key.generation &&
+         !java_remote_parent_retrieval_detached_successor_twins_match(
+             resolution,
+             expected_connection,
+             expected_connection_netns,
+             &workspace->finish.successor)) ||
         (!resolution->via_task &&
          (!claimed_fallback || claimed_fallback->status != k_java_remote_parent_status_valid ||
           java_remote_parent_le64_to_cpu(claimed_fallback->generation_le) !=
@@ -5388,7 +6363,7 @@ java_remote_parent_retrieve_for_connection_with_workspace(
                                                         committed_lifecycle,
                                                         state->observed_monotime_ns,
                                                         owned_claim,
-                                                        finish_guard);
+                                                        finish_workspace);
         java_remote_parent_retrieval_stat(discard, k_java_remote_parent_status_ambiguous);
         return k_java_remote_parent_status_ambiguous;
     }
@@ -5401,7 +6376,7 @@ java_remote_parent_retrieve_for_connection_with_workspace(
                                                         committed_lifecycle,
                                                         state->observed_monotime_ns,
                                                         owned_claim,
-                                                        finish_guard);
+                                                        finish_workspace);
         java_remote_parent_retrieval_stat(discard, k_java_remote_parent_status_ambiguous);
         return k_java_remote_parent_status_ambiguous;
     }
@@ -5415,9 +6390,18 @@ java_remote_parent_retrieve_for_connection_with_workspace(
         copied_valid = 1;
     }
 
-    java_remote_parent_finish_generation_with_guard(
-        resolution, lifecycle, observed_monotime_ns, owned_claim, finish_guard);
+    const u8 finish_completed = java_remote_parent_finish_generation_with_guard(
+        resolution, lifecycle, observed_monotime_ns, owned_claim, finish_workspace);
 
+    if (resolution->via_task && expected_connection &&
+        expected_generation != resolution->key.generation && !finish_completed) {
+        java_remote_parent_init_response(response,
+                                         k_java_remote_parent_status_overload,
+                                         resolution->key.generation,
+                                         observed_monotime_ns);
+        java_remote_parent_retrieval_stat(discard, k_java_remote_parent_status_overload);
+        return k_java_remote_parent_status_overload;
+    }
     if (copied_valid) {
         java_remote_parent_retrieval_stat(0, k_java_remote_parent_status_valid);
         if (resolution->via_task) {

@@ -59,6 +59,7 @@ static u8 test_java_vt_delete_identity_if_matches(const pid_key_t *synthetic_own
 #define java_vt_delete_identity_if_matches test_java_vt_delete_identity_if_matches
 
 #include <maps/java_remote_parent.h>
+#include <generictracer/java_remote_parent_close.h>
 
 #undef java_process_capability_for
 #undef java_process_incarnation_for
@@ -78,6 +79,7 @@ static u8 test_java_vt_delete_identity_if_matches(const pid_key_t *synthetic_own
 
 enum {
     test_connection_netns = 42,
+    test_connection_netns_cookie = 84,
     test_process_incarnation = 9,
     test_trace_seed = 0x10,
     test_span_seed = 0x30,
@@ -133,8 +135,23 @@ static u8 authorized_translation_result;
 static u64 current_process_incarnation;
 static u64 current_ktime_ns;
 static java_remote_parent_state_t stage_state_scratch;
+static u64 stage_generation_sequence;
+static connection_info_netns_cookie_t stage_incoming_key_scratch;
+static connection_info_netns_cookie_t stage_incoming_key;
+static u64 stage_incoming_generation;
+static incoming_trace_candidate_t stage_incoming_candidate;
+static u8 stage_incoming_claim;
+static u32 stage_data_hook_readiness;
+static int stage_updates_enabled;
+static java_remote_parent_data_signal_key_t stage_ack_key;
+static java_remote_parent_data_ack_t stage_ack;
+static int stage_ack_present;
 static java_remote_parent_cleanup_workspace_t cleanup_workspace;
 static java_remote_parent_janitor_workspace_t janitor_workspace;
+static java_remote_parent_alias_replay_retain_workspace_t alias_replay_retain_workspace;
+static java_remote_parent_handoff_capture_workspace_t handoff_capture_workspace;
+static java_remote_parent_close_workspace_t close_workspace;
+static java_remote_parent_receive_cursor_t last_close_workspace_cursor;
 static java_remote_parent_owner_t stored_owner;
 static int owner_present;
 static java_remote_parent_owner_t child_owner;
@@ -172,6 +189,7 @@ static alias_replay_entry_t alias_replays[4];
 static int alias_replay_update_failures;
 static int disable_alias_replay_autoseed;
 static int replace_task_during_alias_replay_lookup;
+static int replace_alias_replay_binding_during_finish_lookup;
 static int increment_alias_replay_before_publishing_update;
 static int advance_time_after_claim_task_validation;
 static int zero_alias_replay_after_task_publish;
@@ -195,6 +213,25 @@ static java_remote_parent_claim_t stored_detach_guard;
 static int detach_guard_present;
 static java_remote_parent_terminal_t stored_terminal;
 static int terminal_present;
+static u64 receive_cursor_cookie;
+static java_remote_parent_receive_cursor_t receive_cursor;
+static int receive_cursor_present;
+static u64 receive_guard_cookie;
+static java_remote_parent_receive_cursor_t receive_guard;
+static int receive_guard_present;
+static int receive_guard_update_failures;
+static int replace_receive_cursor_after_guard_update;
+static int receive_cursor_update_failures;
+static int receive_cursor_delete_failures;
+static int receive_guard_delete_failures;
+static pid_key_t receive_data_signal_owner;
+static u64 receive_data_signal_nonce;
+static int receive_data_signal_present;
+static int receive_data_ack_delete_failures;
+static int receive_data_signal_delete_failures;
+static int receive_data_ack_delete_attempts;
+static int receive_data_signal_delete_attempts;
+static java_remote_parent_data_signal_key_t receive_deleted_ack_key;
 static int terminal_update_failures;
 static int replace_terminal_after_update;
 static u64 stats[k_java_remote_parent_stat_max];
@@ -260,6 +297,8 @@ static int replace_cookie_connection_before_delete;
 static int replace_connection_before_delete;
 static int replace_cookie_connection_after_delete;
 static int replace_connection_after_delete;
+static int replace_successor_cookie_after_claim;
+static int replace_successor_cookie_during_finish;
 static int reinsert_exact_cookie_connection_after_delete;
 static int reinsert_exact_connection_after_delete;
 static int reinsert_exact_cookie_connection_after_netns_delete;
@@ -268,6 +307,7 @@ static int ambiguity_update_failures;
 static int ambiguity_delete_failures;
 static int replace_ambiguity_after_failed_delete;
 static int replace_ambiguity_after_update;
+static int drop_ambiguity_after_update;
 static int exact_claim_delete_absent_on_failure;
 static int replace_exact_claim_on_delete_failure;
 static int inject_claim_after_detach_guard_delete;
@@ -288,10 +328,21 @@ static int unexpected_delete;
 
 static java_remote_parent_response_t
 seed_replacement_generation(const connection_info_t *connection);
+static alias_replay_entry_t *exact_test_alias_replay(void);
 
 static void fail(const char *message) {
     fprintf(stderr, "FAIL: %s\n", message);
     exit(1);
+}
+
+static int alias_replay_retain_workspace_zero(void) {
+    const java_remote_parent_alias_replay_retain_workspace_t zero = {0};
+    return memcmp(&alias_replay_retain_workspace, &zero, sizeof(zero)) == 0;
+}
+
+static int handoff_capture_workspace_zero(void) {
+    const java_remote_parent_handoff_capture_workspace_t zero = {0};
+    return memcmp(&handoff_capture_workspace, &zero, sizeof(zero)) == 0;
 }
 
 static int same_key(const void *left, const void *right, size_t size) {
@@ -363,8 +414,35 @@ static alias_replay_entry_t *seed_alias_replay(const java_remote_parent_key_t *g
         .transition_monotime_ns = test_now_ns,
         .references = references,
         .lifecycle = k_java_remote_parent_lifecycle_active,
+        .connection = generation->generation == test_replacement_generation
+                          ? replacement_state.connection
+                          : stored_state.connection,
+        .connection_netns = generation->generation == test_replacement_generation
+                                ? replacement_state.connection_netns
+                                : stored_state.connection_netns,
+        .connection_netns_cookie = generation->generation == test_replacement_generation
+                                       ? replacement_connection.netns_cookie
+                                       : stored_connection.netns_cookie,
+        .socket_cookie = generation->generation == test_replacement_generation
+                             ? replacement_connection.socket_cookie
+                             : stored_connection.socket_cookie,
     };
     return entry;
+}
+
+static java_remote_parent_alias_replay_t
+test_alias_replay_value(u32 references, u8 lifecycle, u8 desired_lifecycle, u8 producer_tag) {
+    return (java_remote_parent_alias_replay_t){
+        .transition_monotime_ns = test_now_ns,
+        .references = references,
+        .lifecycle = lifecycle,
+        .desired_lifecycle = desired_lifecycle,
+        .producer_tag = producer_tag,
+        .connection = {.s_port = 1234, .d_port = 443},
+        .connection_netns = test_connection_netns,
+        .connection_netns_cookie = test_connection_netns_cookie,
+        .socket_cookie = test_socket_cookie,
+    };
 }
 
 static int exact_adoption_fence_retained(const java_remote_parent_key_t *key) {
@@ -483,6 +561,41 @@ static int transfer_published_handoff(handoff_entry_t *handoff) {
 }
 
 static void *test_map_lookup(void *map, const void *key) {
+    if (map == &java_remote_parent_data_hook_readiness && *(const u32 *)key == 0) {
+        return &stage_data_hook_readiness;
+    }
+    if (map == &java_remote_parent_generation) {
+        return &stage_generation_sequence;
+    }
+    if (map == &incoming_trace_connection_key_storage) {
+        return &stage_incoming_key_scratch;
+    }
+    if (map == &incoming_trace_heads &&
+        same_key(key, &stage_incoming_key, sizeof(stage_incoming_key))) {
+        return &stage_incoming_generation;
+    }
+    if (map == &incoming_trace_candidates && *(const u64 *)key == stage_incoming_generation) {
+        return &stage_incoming_candidate;
+    }
+    if (map == &incoming_trace_claims && *(const u64 *)key == stage_incoming_generation) {
+        return &stage_incoming_claim;
+    }
+    if (map == &java_remote_parent_data_acks && stage_ack_present &&
+        same_key(key, &stage_ack_key, sizeof(stage_ack_key))) {
+        return &stage_ack;
+    }
+    if (map == &jrp_recv_cur && receive_cursor_present &&
+        *(const u64 *)key == receive_cursor_cookie) {
+        return &receive_cursor;
+    }
+    if (map == &jrp_recv_guard && receive_guard_present &&
+        *(const u64 *)key == receive_guard_cookie) {
+        return &receive_guard;
+    }
+    if (map == &java_remote_parent_data_signals && receive_data_signal_present &&
+        same_key(key, &receive_data_signal_owner, sizeof(receive_data_signal_owner))) {
+        return &receive_data_signal_nonce;
+    }
     if (map == &java_remote_parent_stage_state_storage) {
         return &stage_state_scratch;
     }
@@ -491,6 +604,15 @@ static void *test_map_lookup(void *map, const void *key) {
     }
     if (map == &java_remote_parent_janitor_workspace_storage) {
         return &janitor_workspace;
+    }
+    if (map == &java_remote_parent_alias_replay_retain_workspace_storage) {
+        return &alias_replay_retain_workspace;
+    }
+    if (map == &java_remote_parent_handoff_capture_workspace_storage) {
+        return &handoff_capture_workspace;
+    }
+    if (map == &java_remote_parent_close_workspace_storage && *(const u32 *)key == 0) {
+        return &close_workspace;
     }
     if (map == &java_remote_parent_owners && owner_present &&
         same_key(key, &test_owner, sizeof(test_owner))) {
@@ -547,6 +669,14 @@ static void *test_map_lookup(void *map, const void *key) {
     if (map == &java_remote_parent_cookie_connections && replacement_cookie_connection_present &&
         same_key(
             key, &replacement_cookie_connection_key, sizeof(replacement_cookie_connection_key))) {
+        if (claim_present && !terminal_present && replace_successor_cookie_after_claim) {
+            replace_successor_cookie_after_claim = 0;
+            replacement_cookie_connection.incoming_generation++;
+        }
+        if (claim_present && terminal_present && replace_successor_cookie_during_finish) {
+            replace_successor_cookie_during_finish = 0;
+            replacement_cookie_connection.incoming_generation++;
+        }
         return &replacement_cookie_connection;
     }
     if (map == &java_remote_parent_fallback && fallback_present &&
@@ -651,6 +781,12 @@ static void *test_map_lookup(void *map, const void *key) {
             stored_task.generation = test_replacement_generation;
             stored_task.observed_monotime_ns = test_now_ns;
         }
+        if (entry && replace_alias_replay_binding_during_finish_lookup && terminal_present &&
+            claim_present &&
+            java_remote_parent_alias_replay_lifecycle_final(entry->value.lifecycle)) {
+            replace_alias_replay_binding_during_finish_lookup = 0;
+            entry->value.socket_cookie++;
+        }
         return entry ? &entry->value : NULL;
     }
     if (map == &java_remote_parent_stats) {
@@ -723,6 +859,10 @@ static long update_ambiguity(const java_remote_parent_key_t *key,
             replace_ambiguity_after_update = 0;
             existing->observed_monotime_ns = *observed_monotime_ns + 1;
         }
+        if (drop_ambiguity_after_update) {
+            drop_ambiguity_after_update--;
+            existing->present = 0;
+        }
         return 0;
     }
     for (size_t i = 0; i < sizeof(ambiguities) / sizeof(ambiguities[0]); i++) {
@@ -733,6 +873,10 @@ static long update_ambiguity(const java_remote_parent_key_t *key,
             if (replace_ambiguity_after_update) {
                 replace_ambiguity_after_update = 0;
                 ambiguities[i].observed_monotime_ns = *observed_monotime_ns + 1;
+            }
+            if (drop_ambiguity_after_update) {
+                drop_ambiguity_after_update--;
+                ambiguities[i].present = 0;
             }
             return 0;
         }
@@ -781,6 +925,100 @@ static long update_alias_replay(const java_remote_parent_alias_replay_key_t *key
 
 static long
 test_map_update(void *map, const void *key, const void *value, unsigned long long flags) {
+    if (stage_updates_enabled && map == &java_remote_parent_data_acks && flags == BPF_ANY) {
+        stage_ack_key = *(const java_remote_parent_data_signal_key_t *)key;
+        stage_ack = *(const java_remote_parent_data_ack_t *)value;
+        stage_ack_present = 1;
+        return 0;
+    }
+    if (stage_updates_enabled && map == &java_remote_parent_owners &&
+        same_key(key, &test_owner, sizeof(test_owner)) &&
+        ((flags == BPF_NOEXIST && !owner_present) || (flags == BPF_EXIST && owner_present))) {
+        stored_owner = *(const java_remote_parent_owner_t *)value;
+        owner_present = 1;
+        return 0;
+    }
+    if (stage_updates_enabled && map == &java_remote_parent_state && flags == BPF_NOEXIST &&
+        !replacement_state_present && !same_key(key, &stored_state_key, sizeof(stored_state_key))) {
+        replacement_state_key = *(const java_remote_parent_key_t *)key;
+        replacement_state = *(const java_remote_parent_state_t *)value;
+        replacement_state_present = 1;
+        return 0;
+    }
+    if (stage_updates_enabled && map == &java_remote_parent_generation_index &&
+        flags == BPF_NOEXIST && !replacement_generation_index_present &&
+        !same_key(key, &stored_generation_index_key, sizeof(stored_generation_index_key))) {
+        replacement_generation_index_key = *(const java_remote_parent_key_t *)key;
+        replacement_generation_index = *(const java_remote_parent_generation_index_t *)value;
+        replacement_generation_index_present = 1;
+        return 0;
+    }
+    if (stage_updates_enabled && map == &java_remote_parent_connections && flags == BPF_NOEXIST &&
+        !connection_present && !replacement_connection_present) {
+        replacement_connection_key = *(const connection_info_ns_t *)key;
+        replacement_connection = *(const java_remote_parent_connection_t *)value;
+        replacement_connection_present = 1;
+        return 0;
+    }
+    if (stage_updates_enabled && map == &java_remote_parent_cookie_connections &&
+        flags == BPF_NOEXIST && !cookie_connection_present &&
+        !replacement_cookie_connection_present) {
+        replacement_cookie_connection_key = *(const connection_info_netns_cookie_t *)key;
+        replacement_cookie_connection = *(const java_remote_parent_connection_t *)value;
+        replacement_cookie_connection_present = 1;
+        return 0;
+    }
+    if (stage_updates_enabled && map == &java_remote_parent_fallback && flags == BPF_NOEXIST &&
+        same_key(key, &test_owner, sizeof(test_owner)) && !fallback_present) {
+        stored_fallback = *(const java_remote_parent_response_t *)value;
+        fallback_present = 1;
+        return 0;
+    }
+    if (map == &java_remote_parent_data_signals && flags == BPF_ANY) {
+        receive_data_signal_owner = *(const pid_key_t *)key;
+        receive_data_signal_nonce = *(const u64 *)value;
+        receive_data_signal_present = 1;
+        return 0;
+    }
+    if (map == &jrp_recv_cur) {
+        const u64 socket_cookie = *(const u64 *)key;
+        if (receive_cursor_update_failures) {
+            receive_cursor_update_failures--;
+            return -1;
+        }
+        if ((flags == BPF_EXIST &&
+             (!receive_cursor_present || receive_cursor_cookie != socket_cookie)) ||
+            (flags == BPF_NOEXIST && receive_cursor_present &&
+             receive_cursor_cookie == socket_cookie)) {
+            return -1;
+        }
+        receive_cursor_cookie = socket_cookie;
+        receive_cursor = *(const java_remote_parent_receive_cursor_t *)value;
+        receive_cursor_present = 1;
+        return 0;
+    }
+    if (map == &jrp_recv_guard) {
+        const u64 socket_cookie = *(const u64 *)key;
+        if (receive_guard_update_failures) {
+            receive_guard_update_failures--;
+            return -1;
+        }
+        if ((flags == BPF_EXIST &&
+             (!receive_guard_present || receive_guard_cookie != socket_cookie)) ||
+            (flags == BPF_NOEXIST && receive_guard_present &&
+             receive_guard_cookie == socket_cookie)) {
+            return -1;
+        }
+        receive_guard_cookie = socket_cookie;
+        receive_guard = *(const java_remote_parent_receive_cursor_t *)value;
+        receive_guard_present = 1;
+        if (replace_receive_cursor_after_guard_update) {
+            replace_receive_cursor_after_guard_update = 0;
+            receive_cursor.request_sequence++;
+            receive_cursor.generation = test_replacement_generation;
+        }
+        return 0;
+    }
     if (map == &java_remote_parent_handoffs) {
         return update_handoff(key, value, flags);
     }
@@ -996,6 +1234,43 @@ static long delete_handoff(const java_remote_parent_handoff_key_t *key) {
 }
 
 static long test_map_delete(void *map, const void *key) {
+    if (stage_updates_enabled && map == &java_remote_parent_fallback && !fallback_present &&
+        same_key(key, &test_owner, sizeof(test_owner))) {
+        return 0;
+    }
+    if (map == &jrp_recv_cur) {
+        const u64 socket_cookie = *(const u64 *)key;
+        if (!receive_cursor_present || receive_cursor_cookie != socket_cookie) {
+            return -1;
+        }
+        if (receive_cursor_delete_failures) {
+            receive_cursor_delete_failures--;
+            return -1;
+        }
+        receive_cursor_present = 0;
+        return 0;
+    }
+    if (map == &jrp_recv_guard) {
+        const u64 socket_cookie = *(const u64 *)key;
+        if (!receive_guard_present || receive_guard_cookie != socket_cookie) {
+            return -1;
+        }
+        if (receive_guard_delete_failures) {
+            receive_guard_delete_failures--;
+            return -1;
+        }
+        receive_guard_present = 0;
+        return 0;
+    }
+    if (map == &java_remote_parent_data_acks) {
+        receive_data_ack_delete_attempts++;
+        receive_deleted_ack_key = *(const java_remote_parent_data_signal_key_t *)key;
+        if (receive_data_ack_delete_failures) {
+            receive_data_ack_delete_failures--;
+            return -1;
+        }
+        return 0;
+    }
     if (map == &java_remote_parent_alias_replays) {
         alias_replay_entry_t *entry = find_alias_replay(key);
         if (!entry) {
@@ -1277,7 +1552,17 @@ static long test_map_delete(void *map, const void *key) {
         return -1;
     }
     if (map == &java_remote_parent_data_signals) {
-        return -1;
+        receive_data_signal_delete_attempts++;
+        if (!receive_data_signal_present ||
+            !same_key(key, &receive_data_signal_owner, sizeof(receive_data_signal_owner))) {
+            return -1;
+        }
+        if (receive_data_signal_delete_failures) {
+            receive_data_signal_delete_failures--;
+            return -1;
+        }
+        receive_data_signal_present = 0;
+        return 0;
     }
     if (map == &java_tasks) {
         if (expect_java_task_delete &&
@@ -1375,8 +1660,23 @@ static u8 test_java_vt_delete_identity_if_matches(const pid_key_t *synthetic_own
 static void seed_generation(const connection_info_t *connection) {
     current_task = test_owner;
     memset(&stage_state_scratch, 0, sizeof(stage_state_scratch));
+    stage_generation_sequence = test_replacement_generation - 1;
+    memset(&stage_incoming_key_scratch, 0, sizeof(stage_incoming_key_scratch));
+    memset(&stage_incoming_key, 0, sizeof(stage_incoming_key));
+    stage_incoming_generation = 0;
+    memset(&stage_incoming_candidate, 0, sizeof(stage_incoming_candidate));
+    stage_incoming_claim = 0;
+    stage_data_hook_readiness = k_java_remote_parent_data_hook_ready;
+    stage_updates_enabled = 0;
+    memset(&stage_ack_key, 0, sizeof(stage_ack_key));
+    memset(&stage_ack, 0, sizeof(stage_ack));
+    stage_ack_present = 0;
     memset(&cleanup_workspace, 0, sizeof(cleanup_workspace));
     memset(&janitor_workspace, 0, sizeof(janitor_workspace));
+    memset(&alias_replay_retain_workspace, 0, sizeof(alias_replay_retain_workspace));
+    memset(&handoff_capture_workspace, 0, sizeof(handoff_capture_workspace));
+    memset(&close_workspace, 0, sizeof(close_workspace));
+    memset(&last_close_workspace_cursor, 0, sizeof(last_close_workspace_cursor));
     memset(&stored_owner, 0, sizeof(stored_owner));
     memset(&child_owner, 0, sizeof(child_owner));
     memset(&stored_state, 0, sizeof(stored_state));
@@ -1400,6 +1700,8 @@ static void seed_generation(const connection_info_t *connection) {
     memset(&stored_detach_guard_key, 0, sizeof(stored_detach_guard_key));
     memset(&stored_detach_guard, 0, sizeof(stored_detach_guard));
     memset(&stored_terminal, 0, sizeof(stored_terminal));
+    memset(&receive_cursor, 0, sizeof(receive_cursor));
+    memset(&receive_guard, 0, sizeof(receive_guard));
     memset(stats, 0, sizeof(stats));
 
     owner_present = 1;
@@ -1423,11 +1725,29 @@ static void seed_generation(const connection_info_t *connection) {
     exact_claim_delete_failures = 0;
     detach_guard_present = 0;
     terminal_present = 0;
+    receive_cursor_cookie = 0;
+    receive_cursor_present = 0;
+    receive_guard_cookie = 0;
+    receive_guard_present = 0;
+    receive_guard_update_failures = 0;
+    replace_receive_cursor_after_guard_update = 0;
+    receive_cursor_update_failures = 0;
+    receive_cursor_delete_failures = 0;
+    receive_guard_delete_failures = 0;
+    memset(&receive_data_signal_owner, 0, sizeof(receive_data_signal_owner));
+    receive_data_signal_nonce = 0;
+    receive_data_signal_present = 0;
+    receive_data_ack_delete_failures = 0;
+    receive_data_signal_delete_failures = 0;
+    receive_data_ack_delete_attempts = 0;
+    receive_data_signal_delete_attempts = 0;
+    memset(&receive_deleted_ack_key, 0, sizeof(receive_deleted_ack_key));
     terminal_update_failures = 0;
     replace_terminal_after_update = 0;
     alias_replay_update_failures = 0;
     disable_alias_replay_autoseed = 0;
     replace_task_during_alias_replay_lookup = 0;
+    replace_alias_replay_binding_during_finish_lookup = 0;
     increment_alias_replay_before_publishing_update = 0;
     advance_time_after_claim_task_validation = 0;
     zero_alias_replay_after_task_publish = 0;
@@ -1494,6 +1814,8 @@ static void seed_generation(const connection_info_t *connection) {
     replace_connection_before_delete = 0;
     replace_cookie_connection_after_delete = 0;
     replace_connection_after_delete = 0;
+    replace_successor_cookie_after_claim = 0;
+    replace_successor_cookie_during_finish = 0;
     reinsert_exact_cookie_connection_after_delete = 0;
     reinsert_exact_connection_after_delete = 0;
     reinsert_exact_cookie_connection_after_netns_delete = 0;
@@ -1502,6 +1824,7 @@ static void seed_generation(const connection_info_t *connection) {
     ambiguity_delete_failures = 0;
     replace_ambiguity_after_failed_delete = 0;
     replace_ambiguity_after_update = 0;
+    drop_ambiguity_after_update = 0;
     exact_claim_delete_absent_on_failure = 0;
     replace_exact_claim_on_delete_failure = 0;
     inject_claim_after_detach_guard_delete = 0;
@@ -1561,7 +1884,7 @@ static void seed_generation(const connection_info_t *connection) {
     stored_connection_key = connection_info_with_netns(connection, test_connection_netns);
     stored_connection.owner = test_owner;
     stored_connection.generation = test_generation;
-    stored_connection.netns_cookie = 84;
+    stored_connection.netns_cookie = test_connection_netns_cookie;
     stored_connection.incoming_generation = 21;
     stored_connection.socket_cookie = test_socket_cookie;
     stored_connection.netns = test_connection_netns;
@@ -1569,6 +1892,77 @@ static void seed_generation(const connection_info_t *connection) {
     stored_cookie_connection_key.connection = *connection;
     stored_cookie_connection_key.netns_cookie = stored_connection.netns_cookie;
     stored_cookie_connection = stored_connection;
+}
+
+static void seed_receive_cursor(void) {
+    receive_cursor_cookie = test_socket_cookie;
+    receive_cursor = (java_remote_parent_receive_cursor_t){
+        .owner = test_owner,
+        .state = k_java_remote_parent_receive_cursor_valid,
+        .process_incarnation = test_process_incarnation,
+        .lifecycle_id = 0x1020304050607080ULL,
+        .request_sequence = 0x1122334455667788ULL,
+        .data_signal_nonce = 0x8877665544332211ULL,
+        .generation = test_generation,
+    };
+    receive_cursor_present = 1;
+    receive_guard_cookie = test_socket_cookie;
+    receive_guard = receive_cursor;
+    receive_guard_present = 1;
+}
+
+static java_remote_parent_incoming_t
+prepare_exact_stage_incoming(const connection_info_t *connection) {
+    tp_info_pid_t candidate = {
+        .tp = {.ts = test_now_ns, .flags = 1},
+        .valid = 1,
+        .provenance = k_tp_provenance_tcp_exact_flags,
+    };
+    for (u32 i = 0; i < sizeof(candidate.tp.trace_id); i++) {
+        candidate.tp.trace_id[i] = test_trace_seed + i;
+    }
+    for (u32 i = 0; i < sizeof(candidate.tp.span_id); i++) {
+        candidate.tp.span_id[i] = test_span_seed + i;
+    }
+    stage_incoming_generation = stored_connection.incoming_generation + 1;
+    stage_incoming_candidate = (incoming_trace_candidate_t){.candidate = candidate};
+    stage_incoming_claim = 1;
+    stage_incoming_key = (connection_info_netns_cookie_t){
+        .connection = *connection,
+        .netns_cookie = test_connection_netns_cookie,
+    };
+    return (java_remote_parent_incoming_t){
+        .candidate = candidate,
+        .generation = stage_incoming_generation,
+    };
+}
+
+static java_remote_parent_receive_context_t seed_unacked_receive_cursor(void) {
+    const java_remote_parent_receive_context_t context = {
+        .owner_tid = test_owner.tid,
+        .owner_pid = test_owner.pid,
+        .owner_ns = test_owner.ns,
+        .process_incarnation = test_process_incarnation,
+        .lifecycle_id = 0x1020304050607080ULL,
+        .request_sequence = 0x1122334455667788ULL,
+        .data_signal_nonce = 0x8877665544332211ULL,
+        .action = k_java_remote_parent_receive_action_http1_start,
+    };
+    receive_cursor_cookie = test_socket_cookie;
+    receive_cursor = (java_remote_parent_receive_cursor_t){
+        .owner = test_owner,
+        .state = k_java_remote_parent_receive_cursor_publishing,
+        .process_incarnation = context.process_incarnation,
+        .lifecycle_id = context.lifecycle_id,
+        .request_sequence = context.request_sequence,
+        .data_signal_nonce = context.data_signal_nonce,
+    };
+    receive_cursor_present = 1;
+    receive_guard_present = 0;
+    receive_data_signal_owner = test_owner;
+    receive_data_signal_nonce = context.data_signal_nonce;
+    receive_data_signal_present = 1;
+    return context;
 }
 
 static java_remote_parent_response_t
@@ -1840,31 +2234,20 @@ static void test_abi_tail_validation_is_byte_exact(void) {
         .generation_observed_monotime_ns = test_observed_monotime_ns,
         .process_incarnation = test_process_incarnation,
     };
-    java_remote_parent_alias_replay_t replay = {
-        .transition_monotime_ns = test_now_ns,
-        .references = 1,
-        .lifecycle = k_java_remote_parent_lifecycle_active,
-    };
+    java_remote_parent_alias_replay_t replay =
+        test_alias_replay_value(1, k_java_remote_parent_lifecycle_active, 0, 0);
     if (!java_remote_parent_alias_replay_active_valid(&replay_key, &replay, 1)) {
         fail("replay metadata rejected a clean active record");
     }
     for (u32 i = 0; i < 4; i++) {
-        replay = (java_remote_parent_alias_replay_t){
-            .transition_monotime_ns = test_now_ns,
-            .references = 1,
-            .lifecycle = k_java_remote_parent_lifecycle_active,
-        };
+        replay = test_alias_replay_value(1, k_java_remote_parent_lifecycle_active, 0, 0);
         ((u8 *)&replay.lifecycle)[i] ^= 0xff;
         if (java_remote_parent_alias_replay_active_valid(&replay_key, &replay, 1)) {
             fail("active replay metadata ignored a metadata byte");
         }
     }
-    replay = (java_remote_parent_alias_replay_t){
-        .transition_monotime_ns = test_now_ns,
-        .references = 1,
-        .lifecycle = k_java_remote_parent_lifecycle_publishing,
-        .desired_lifecycle = k_java_remote_parent_lifecycle_consumed,
-    };
+    replay = test_alias_replay_value(
+        1, k_java_remote_parent_lifecycle_publishing, k_java_remote_parent_lifecycle_consumed, 0);
     if (!java_remote_parent_alias_replay_publishing_valid(
             &replay_key, &replay, k_java_remote_parent_lifecycle_consumed)) {
         fail("replay metadata rejected a clean publishing record");
@@ -1887,11 +2270,7 @@ static void test_abi_tail_validation_is_byte_exact(void) {
             &replay_key, &replay, k_java_remote_parent_lifecycle_consumed)) {
         fail("replay metadata accepted an unknown producer tag");
     }
-    replay = (java_remote_parent_alias_replay_t){
-        .transition_monotime_ns = test_now_ns,
-        .references = 1,
-        .lifecycle = k_java_remote_parent_lifecycle_consumed,
-    };
+    replay = test_alias_replay_value(1, k_java_remote_parent_lifecycle_consumed, 0, 0);
     if (!java_remote_parent_alias_replay_final_valid(
             &replay_key, &replay, k_java_remote_parent_lifecycle_consumed)) {
         fail("replay metadata rejected a clean final record");
@@ -1904,6 +2283,18 @@ static void test_abi_tail_validation_is_byte_exact(void) {
             fail("final replay metadata ignored a metadata byte");
         }
     }
+    java_remote_parent_alias_replay_binding_t replay_binding = {0};
+    java_remote_parent_alias_replay_binding_snapshot(&replay_binding, &replay);
+    if (!java_remote_parent_alias_replay_binding_matches_snapshot(&replay, &replay_binding)) {
+        fail("replay binding rejected its byte-exact snapshot");
+    }
+    for (u32 i = 0; i < sizeof(replay_binding); i++) {
+        java_remote_parent_alias_replay_binding_t mutated = replay_binding;
+        ((u8 *)&mutated)[i] ^= 1;
+        if (java_remote_parent_alias_replay_binding_matches_snapshot(&replay, &mutated)) {
+            fail("replay binding ignored a snapshot byte");
+        }
+    }
 
     const java_remote_parent_resolution_t resolution = {
         .key =
@@ -1913,6 +2304,7 @@ static void test_abi_tail_validation_is_byte_exact(void) {
             },
     };
     const java_remote_parent_finish_connection_t expected_connection = {
+        .generation = test_generation,
         .netns_cookie = 84,
         .incoming_generation = 21,
         .socket_cookie = test_socket_cookie,
@@ -1953,6 +2345,7 @@ static void test_finish_connection_matcher_is_field_exact(void) {
             },
     };
     java_remote_parent_finish_connection_t expected = {
+        .generation = test_generation,
         .netns_cookie = 0x0123456789abcdef,
         .incoming_generation = 0xfedcba9876543210,
         .socket_cookie = test_socket_cookie,
@@ -2243,6 +2636,35 @@ static void test_capture_claim_race_releases_published_alias(void) {
     }
 }
 
+static void test_capture_workspaces_are_guarded_and_zeroized(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    alias_replay_retain_workspace.busy = 1;
+    if (java_remote_parent_retain_generation_alias(&stored_state_key, test_observed_monotime_ns) ||
+        stored_state.aliases || exact_test_alias_replay() ||
+        alias_replay_retain_workspace.busy != 1) {
+        fail("nested replay retain reused a busy per-CPU workspace");
+    }
+    alias_replay_retain_workspace.busy = 0;
+
+    const java_remote_parent_handoff_key_t handoff_key =
+        java_remote_parent_handoff_key(&test_owner, test_capture_race_token);
+    handoff_capture_workspace.busy = 1;
+    java_remote_parent_capture_handoff(test_capture_race_token);
+    if (find_handoff(&handoff_key) || stored_state.aliases || exact_test_alias_replay() ||
+        handoff_capture_workspace.busy != 1) {
+        fail("nested handoff capture reused a busy per-CPU workspace");
+    }
+    handoff_capture_workspace.busy = 0;
+
+    java_remote_parent_capture_handoff(test_capture_race_token);
+    if (!find_handoff(&handoff_key) || stored_state.aliases != 1 || !exact_test_alias_replay() ||
+        !alias_replay_retain_workspace_zero() || !handoff_capture_workspace_zero() ||
+        unexpected_update || unexpected_delete) {
+        fail("handoff capture did not zeroize and release its workspaces");
+    }
+}
+
 static void test_relay_claim_race_preserves_existing_task_alias(void) {
     const connection_info_t connection = {.s_port = 1234, .d_port = 443};
     seed_generation(&connection);
@@ -2266,6 +2688,7 @@ static void test_relay_claim_race_preserves_existing_task_alias(void) {
         injected_handoff_claims != 1 || inject_handoff_claim_on_publish ||
         aliases_at_handoff_publish != 2 || aliases_at_handoff_delete != 2 ||
         handoff_claim_update_attempts != 0 || !find_ambiguity(&stored_state_key) ||
+        !alias_replay_retain_workspace_zero() || !handoff_capture_workspace_zero() ||
         unexpected_update || unexpected_delete) {
         fail("relay publisher disturbed its existing task alias after a concurrent claim");
     }
@@ -3213,6 +3636,13 @@ static void test_detached_task_bridge_preserves_same_socket_replacement(void) {
     }
 
     const java_remote_parent_response_t replacement = seed_replacement_generation(&connection);
+    // The successor reuses the exact negotiated physical socket. Keep the
+    // helper's distinct-cookie default for the negative cases elsewhere.
+    replacement_connection.socket_cookie = test_socket_cookie;
+    replacement_connection.netns_cookie = test_connection_netns_cookie;
+    replacement_cookie_connection.socket_cookie = test_socket_cookie;
+    replacement_cookie_connection.netns_cookie = test_connection_netns_cookie;
+    replacement_cookie_connection_key.netns_cookie = test_connection_netns_cookie;
     current_task = test_child;
     memset(&response, 0, sizeof(response));
     if (java_remote_parent_retrieve_for_connection(&response,
@@ -3221,18 +3651,18 @@ static void test_detached_task_bridge_preserves_same_socket_replacement(void) {
                                                    k_java_remote_parent_source_task,
                                                    &connection,
                                                    test_connection_netns,
-                                                   test_generation,
+                                                   test_replacement_generation,
                                                    test_socket_cookie) !=
             k_java_remote_parent_status_valid ||
         java_remote_parent_le64_to_cpu(response.generation_le) != test_generation ||
-        !state_present || !generation_index_present || connection_present ||
+        state_present || generation_index_present || connection_present ||
         cookie_connection_present || !replacement_state_present ||
         !replacement_generation_index_present || !replacement_connection_present ||
         !replacement_cookie_connection_present || !owner_present || !fallback_present ||
         stored_owner.generation != test_replacement_generation ||
-        memcmp(&stored_fallback, &replacement, sizeof(replacement)) != 0 ||
-        !exact_finish_fences_retained(&stored_state_key, k_java_remote_parent_lifecycle_consumed) ||
-        !terminal_present || stored_terminal.generation != test_generation ||
+        memcmp(&stored_fallback, &replacement, sizeof(replacement)) != 0 || claim_present ||
+        detach_guard_present || find_ambiguity_entry(&stored_state_key) || !terminal_present ||
+        stored_terminal.generation != test_generation ||
         stored_terminal.lifecycle != k_java_remote_parent_lifecycle_consumed || !task_present ||
         unexpected_update || unexpected_delete) {
         fail("detached task TAKE disturbed a same-socket replacement generation");
@@ -3241,32 +3671,44 @@ static void test_detached_task_bridge_preserves_same_socket_replacement(void) {
     const java_remote_parent_response_t stale_response = response;
     connection_info_t wrong_connection = connection;
     wrong_connection.d_port++;
-    if (!task_retrieval_rejects_authority(&stale_response,
-                                          &connection,
+    memset(&response, 0, sizeof(response));
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_replacement_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_already_consumed ||
+        response.status != k_java_remote_parent_status_already_consumed ||
+        !task_retrieval_rejects_authority(&stale_response,
+                                          &wrong_connection,
                                           test_connection_netns,
                                           test_replacement_generation,
                                           test_socket_cookie,
                                           test_generation) ||
         !task_retrieval_rejects_authority(&stale_response,
-                                          &wrong_connection,
-                                          test_connection_netns,
-                                          test_generation,
-                                          test_socket_cookie,
-                                          test_generation) ||
-        !task_retrieval_rejects_authority(&stale_response,
                                           &connection,
                                           test_connection_netns + 1,
-                                          test_generation,
+                                          test_replacement_generation,
                                           test_socket_cookie,
                                           test_generation) ||
         !task_retrieval_rejects_authority(&stale_response,
                                           &connection,
                                           test_connection_netns,
-                                          test_generation,
+                                          test_replacement_generation,
                                           test_replacement_socket_cookie,
                                           test_generation) ||
+        !task_retrieval_rejects_authority(&stale_response,
+                                          &connection,
+                                          test_connection_netns,
+                                          test_direct_child_generation,
+                                          test_socket_cookie,
+                                          test_generation) ||
         stats[k_java_remote_parent_stat_take_missing] != 5 ||
-        !exact_finish_fences_retained(&stored_state_key, k_java_remote_parent_lifecycle_consumed) ||
+        stats[k_java_remote_parent_stat_take_already_consumed] != 1 || claim_present ||
+        detach_guard_present || find_ambiguity_entry(&stored_state_key) ||
         !replacement_state_present || !replacement_generation_index_present ||
         !replacement_connection_present || !replacement_cookie_connection_present ||
         unexpected_update || unexpected_delete) {
@@ -3280,15 +3722,15 @@ static void test_detached_task_bridge_preserves_same_socket_replacement(void) {
                                                    k_java_remote_parent_source_task,
                                                    &connection,
                                                    test_connection_netns,
-                                                   test_generation,
+                                                   test_replacement_generation,
                                                    test_socket_cookie) !=
             k_java_remote_parent_status_already_consumed ||
         response.status != k_java_remote_parent_status_already_consumed ||
         java_remote_parent_le64_to_cpu(response.generation_le) != test_generation ||
-        !exact_finish_fences_retained(&stored_state_key, k_java_remote_parent_lifecycle_consumed) ||
+        claim_present || detach_guard_present || find_ambiguity_entry(&stored_state_key) ||
         !replacement_state_present || !replacement_generation_index_present ||
         !replacement_connection_present || !replacement_cookie_connection_present ||
-        stats[k_java_remote_parent_stat_take_already_consumed] != 1 || unexpected_update ||
+        stats[k_java_remote_parent_stat_take_already_consumed] != 2 || unexpected_update ||
         unexpected_delete) {
         fail("repeated detached task TAKE did not preserve an already-consumed claim");
     }
@@ -3300,12 +3742,12 @@ static void test_detached_task_bridge_preserves_same_socket_replacement(void) {
                                                    k_java_remote_parent_source_task,
                                                    &connection,
                                                    test_connection_netns,
-                                                   test_generation,
+                                                   test_replacement_generation,
                                                    test_socket_cookie) !=
             k_java_remote_parent_status_already_consumed ||
         response.status != k_java_remote_parent_status_already_consumed ||
         java_remote_parent_le64_to_cpu(response.generation_le) != test_generation ||
-        !exact_finish_fences_retained(&stored_state_key, k_java_remote_parent_lifecycle_consumed) ||
+        claim_present || detach_guard_present || find_ambiguity_entry(&stored_state_key) ||
         !replacement_state_present || !replacement_generation_index_present ||
         !replacement_connection_present || !replacement_cookie_connection_present ||
         stats[k_java_remote_parent_stat_discard_already_consumed] != 1 || unexpected_update ||
@@ -3322,16 +3764,361 @@ static void test_detached_task_bridge_preserves_same_socket_replacement(void) {
                                                    &connection,
                                                    test_connection_netns,
                                                    test_replacement_generation,
-                                                   test_replacement_socket_cookie) !=
-            k_java_remote_parent_status_overload ||
-        response.status != k_java_remote_parent_status_overload ||
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_valid ||
+        response.status != k_java_remote_parent_status_valid ||
         java_remote_parent_le64_to_cpu(response.generation_le) != test_replacement_generation ||
-        !exact_finish_fences_retained(&stored_state_key, k_java_remote_parent_lifecycle_consumed) ||
-        !replacement_state_present || !replacement_generation_index_present ||
-        !replacement_connection_present || !replacement_cookie_connection_present ||
-        stats[k_java_remote_parent_stat_take_overload] != 1 || unexpected_update ||
+        memcmp(response.trace_id, replacement.trace_id, sizeof(response.trace_id)) != 0 ||
+        memcmp(response.span_id, replacement.span_id, sizeof(response.span_id)) != 0 ||
+        response.flags != replacement.flags || owner_present || fallback_present ||
+        replacement_state_present || replacement_generation_index_present ||
+        replacement_connection_present || replacement_cookie_connection_present || claim_present ||
+        detach_guard_present || find_ambiguity_entry(&replacement_state_key) || !terminal_present ||
+        stored_terminal.generation != test_replacement_generation ||
+        stored_terminal.lifecycle != k_java_remote_parent_lifecycle_consumed ||
+        stats[k_java_remote_parent_stat_take_valid] != 2 || unexpected_update ||
         unexpected_delete) {
-        fail("retained owner guard did not overload the replacement generation");
+        fail("detached task TAKE blocked or disturbed the replacement generation");
+    }
+}
+
+static void seed_detached_same_socket_successor(const connection_info_t *connection) {
+    seed_generation(connection);
+    seed_exact_receive_aliases(1);
+    if (!java_remote_parent_detach_exact_receive_generation(&stored_state_key,
+                                                            test_process_incarnation,
+                                                            connection,
+                                                            test_connection_netns,
+                                                            test_socket_cookie)) {
+        fail("could not seed detached predecessor for successor proof testing");
+    }
+    seed_replacement_generation(connection);
+    replacement_connection.netns_cookie = test_connection_netns_cookie;
+    replacement_connection.socket_cookie = test_socket_cookie;
+    replacement_cookie_connection_key.netns_cookie = test_connection_netns_cookie;
+    replacement_cookie_connection = replacement_connection;
+}
+
+static void assert_detached_successor_fault_rejected(u32 fault) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_detached_same_socket_successor(&connection);
+    switch (fault) {
+    case 0:
+        replacement_connection_present = 0;
+        break;
+    case 1:
+        replacement_cookie_connection_present = 0;
+        break;
+    case 2:
+        replacement_cookie_connection.incoming_generation++;
+        break;
+    case 3:
+        replacement_connection.owner = test_child;
+        replacement_cookie_connection.owner = test_child;
+        break;
+    case 4:
+        replacement_connection.socket_cookie = test_replacement_socket_cookie;
+        replacement_cookie_connection.socket_cookie = test_replacement_socket_cookie;
+        break;
+    case 5:
+        replacement_connection.generation = test_direct_child_generation;
+        replacement_cookie_connection.generation = test_direct_child_generation;
+        break;
+    case 6:
+        replacement_connection.reserved = 1;
+        replacement_cookie_connection.reserved = 1;
+        break;
+    case 7:
+        owner_present = 0;
+        break;
+    case 8:
+        fallback_present = 0;
+        break;
+    case 9:
+        replacement_state_present = 0;
+        break;
+    case 10:
+        replacement_generation_index_present = 0;
+        break;
+    case 11:
+        ambiguities[1].present = 0;
+        break;
+    case 12:
+        stored_claim_key = replacement_state_key;
+        stored_claim = (java_remote_parent_claim_t){
+            .observed_monotime_ns = test_now_ns,
+            .process_incarnation = test_process_incarnation,
+            .lifecycle = k_java_remote_parent_lifecycle_publishing,
+            .reserved = {[0] = k_java_remote_parent_lifecycle_consumed},
+        };
+        claim_present = 1;
+        break;
+    case 13:
+        stored_terminal = (java_remote_parent_terminal_t){
+            .generation = test_replacement_generation,
+            .observed_monotime_ns = test_now_ns,
+            .process_incarnation = test_process_incarnation,
+            .lifecycle = k_java_remote_parent_lifecycle_consumed,
+        };
+        terminal_present = 1;
+        break;
+    case 14:
+        stored_detach_guard_key = java_remote_parent_state_key(&test_owner, 0);
+        stored_detach_guard = (java_remote_parent_claim_t){
+            .observed_monotime_ns = test_now_ns,
+            .process_incarnation = test_replacement_generation,
+            .lifecycle = k_java_remote_parent_lifecycle_publishing,
+        };
+        detach_guard_present = 1;
+        break;
+    case 15:
+        stored_fallback.flags ^= 1;
+        break;
+    case 16:
+        replacement_state.connection.d_port++;
+        break;
+    case 17:
+        replacement_generation_index.observed_monotime_ns++;
+        break;
+    default:
+        fail("unknown successor proof fault fixture");
+    }
+    const int claim_was_present = claim_present;
+    const int guard_was_present = detach_guard_present;
+    const int terminal_was_present = terminal_present;
+    const u32 claim_attempts = exact_claim_update_attempts;
+    current_task = test_child;
+    java_remote_parent_response_t response = stored_state.response;
+    const enum java_remote_parent_status status =
+        java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_replacement_generation,
+                                                   test_socket_cookie);
+    if (status == k_java_remote_parent_status_valid ||
+        response.status == k_java_remote_parent_status_valid ||
+        exact_claim_update_attempts != claim_attempts || claim_present != claim_was_present ||
+        detach_guard_present != guard_was_present || terminal_present != terminal_was_present ||
+        !state_present || !generation_index_present || !task_present ||
+        find_ambiguity(&stored_state_key) || unexpected_update || unexpected_delete) {
+        fail("malformed successor authority reached E promotion or parent delivery");
+    }
+}
+
+static void test_detached_successor_full_proof_is_fail_closed(void) {
+    for (u32 fault = 0; fault <= 17; fault++) {
+        assert_detached_successor_fault_rejected(fault);
+    }
+
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_detached_same_socket_successor(&connection);
+    replace_successor_cookie_after_claim = 1;
+    const u32 preclaim_attempts = exact_claim_update_attempts;
+    current_task = test_child;
+    java_remote_parent_response_t response = stored_state.response;
+    enum java_remote_parent_status status =
+        java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_replacement_generation,
+                                                   test_socket_cookie);
+    if (status == k_java_remote_parent_status_valid ||
+        response.status == k_java_remote_parent_status_valid ||
+        replace_successor_cookie_after_claim || claim_present || detach_guard_present ||
+        exact_claim_update_attempts != preclaim_attempts + 1 ||
+        !find_ambiguity(&stored_state_key) || !state_present || !generation_index_present ||
+        !task_present || unexpected_update || unexpected_delete) {
+        fail("successor race after publishing E delivered a parent");
+    }
+
+    seed_detached_same_socket_successor(&connection);
+    replace_successor_cookie_during_finish = 1;
+    current_task = test_child;
+    response = stored_state.response;
+    status = java_remote_parent_retrieve_for_connection(&response,
+                                                        0,
+                                                        test_now_ns,
+                                                        k_java_remote_parent_source_task,
+                                                        &connection,
+                                                        test_connection_netns,
+                                                        test_replacement_generation,
+                                                        test_socket_cookie);
+    if (status != k_java_remote_parent_status_overload ||
+        response.status != k_java_remote_parent_status_overload ||
+        replace_successor_cookie_during_finish ||
+        !exact_finish_fences_retained(&stored_state_key, k_java_remote_parent_lifecycle_consumed) ||
+        !state_present || !generation_index_present || !task_present || unexpected_update ||
+        unexpected_delete) {
+        fail("successor race under the old owner guard escaped fail-closed fencing");
+    }
+}
+
+static void test_detached_pre_ack_binding_and_successor_alias_are_live(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    if (!java_remote_parent_detach_exact_receive_generation(&stored_state_key,
+                                                            test_process_incarnation,
+                                                            &connection,
+                                                            test_connection_netns,
+                                                            test_socket_cookie)) {
+        fail("could not seed detached pre-ACK task authority");
+    }
+    connection_info_t wrong_connection = connection;
+    wrong_connection.d_port++;
+    const java_remote_parent_response_t stale = stored_state.response;
+    current_task = test_child;
+    if (!task_retrieval_rejects_authority(&stale,
+                                          &wrong_connection,
+                                          test_connection_netns,
+                                          test_generation,
+                                          test_socket_cookie,
+                                          test_generation) ||
+        !task_retrieval_rejects_authority(&stale,
+                                          &connection,
+                                          test_connection_netns + 1,
+                                          test_generation,
+                                          test_socket_cookie,
+                                          test_generation) ||
+        !task_retrieval_rejects_authority(&stale,
+                                          &connection,
+                                          test_connection_netns,
+                                          test_generation,
+                                          test_replacement_socket_cookie,
+                                          test_generation) ||
+        claim_present || detach_guard_present || !state_present || !generation_index_present ||
+        !task_present || find_ambiguity(&stored_state_key)) {
+        fail("detached pre-ACK authority ignored durable replay binding");
+    }
+    // A partial successor publication is irrelevant while socket-local
+    // negotiation still names the detached old generation.
+    replacement_connection_key = connection_info_with_netns(&connection, test_connection_netns);
+    replacement_connection = (java_remote_parent_connection_t){
+        .owner = test_child,
+        .generation = test_replacement_generation,
+        .netns_cookie = test_connection_netns_cookie,
+        .incoming_generation = 22,
+        .socket_cookie = test_replacement_socket_cookie,
+        .netns = test_connection_netns,
+    };
+    replacement_connection_present = 1;
+    java_remote_parent_response_t response = stale;
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_valid ||
+        response.status != k_java_remote_parent_status_valid || state_present ||
+        generation_index_present || claim_present || detach_guard_present ||
+        find_ambiguity_entry(&stored_state_key) || !task_present) {
+        fail("detached pre-ACK exact binding did not finish independently of partial successor C");
+    }
+
+    seed_detached_same_socket_successor(&connection);
+    if (!java_remote_parent_retain_generation_alias(&replacement_state_key,
+                                                    replacement_state.observed_monotime_ns) ||
+        replacement_state.aliases != 1) {
+        fail("could not seed a legitimate aliased successor");
+    }
+    const java_remote_parent_alias_replay_key_t successor_replay_key =
+        java_remote_parent_alias_replay_key(&replacement_state_key,
+                                            replacement_state.observed_monotime_ns,
+                                            replacement_state.process_incarnation);
+    alias_replay_entry_t *successor_replay = find_alias_replay(&successor_replay_key);
+    if (!successor_replay || !successor_replay->present ||
+        memcmp(&successor_replay->key, &successor_replay_key, sizeof(successor_replay_key)) != 0) {
+        fail("successor alias did not publish its exact replay key");
+    }
+    const java_remote_parent_alias_replay_t successor_replay_value = successor_replay->value;
+    current_task = test_child;
+    response = stored_state.response;
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_replacement_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_valid ||
+        response.status != k_java_remote_parent_status_valid || !replacement_state_present ||
+        replacement_state.aliases != 1 || !replacement_generation_index_present ||
+        !replacement_connection_present || !replacement_cookie_connection_present ||
+        !successor_replay->present ||
+        memcmp(&successor_replay->key, &successor_replay_key, sizeof(successor_replay_key)) != 0 ||
+        memcmp(&successor_replay->value, &successor_replay_value, sizeof(successor_replay_value)) !=
+            0) {
+        fail("a clean successor alias blocked the old post-ACK task bridge");
+    }
+}
+
+static void test_direct_take_with_alias_publishes_bound_sibling_replay(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    current_task = test_owner;
+    java_remote_parent_response_t response = {0};
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_direct,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_valid ||
+        response.status != k_java_remote_parent_status_valid || state_present ||
+        generation_index_present || connection_present || cookie_connection_present ||
+        claim_present || detach_guard_present || !task_present || !exact_test_alias_replay() ||
+        exact_test_alias_replay()->value.lifecycle != k_java_remote_parent_lifecycle_consumed) {
+        fail("direct TAKE with a sibling alias did not publish bound replay authority");
+    }
+    current_task = test_child;
+    memset(&response, 0, sizeof(response));
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_already_consumed ||
+        response.status != k_java_remote_parent_status_already_consumed || !task_present ||
+        !exact_test_alias_replay() || unexpected_update || unexpected_delete) {
+        fail("sibling task lost the direct TAKE's bound terminal replay");
+    }
+}
+
+static void test_connection_bound_direct_take_requires_nonzero_generation(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    current_task = test_owner;
+    java_remote_parent_response_t response = stored_state.response;
+    if (java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_direct,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   0,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_missing ||
+        response.status != k_java_remote_parent_status_missing || !owner_present ||
+        !fallback_present || !state_present || !generation_index_present || !connection_present ||
+        !cookie_connection_present || claim_present || terminal_present ||
+        find_ambiguity(&stored_state_key) || unexpected_update || unexpected_delete) {
+        fail("connection-bound direct TAKE accepted a zero expected generation");
     }
 }
 
@@ -4730,10 +5517,10 @@ static void test_exact_receive_detach_preclaims_generation_before_guard(void) {
             k_java_remote_parent_status_valid ||
         response.status != k_java_remote_parent_status_valid ||
         java_remote_parent_le64_to_cpu(response.generation_le) != test_generation ||
-        owner_present || fallback_present || !state_present || !generation_index_present ||
-        connection_present || cookie_connection_present ||
-        !exact_finish_fences_retained(&stored_state_key, k_java_remote_parent_lifecycle_consumed) ||
-        !terminal_present || stored_terminal.generation != test_generation ||
+        owner_present || fallback_present || state_present || generation_index_present ||
+        connection_present || cookie_connection_present || claim_present || detach_guard_present ||
+        find_ambiguity_entry(&stored_state_key) || !terminal_present ||
+        stored_terminal.generation != test_generation ||
         stored_terminal.lifecycle != k_java_remote_parent_lifecycle_consumed || !task_present ||
         exact_claim_update_attempts != 2 || stats[k_java_remote_parent_stat_take_valid] != 1 ||
         stats[k_java_remote_parent_stat_handoff_valid] != 1 ||
@@ -5972,6 +6759,1288 @@ static void test_exact_receive_take_completion_requires_strict_postconditions(vo
     }
 }
 
+static int unacked_cleanup_left_generation_untouched(void) {
+    const ambiguity_entry_t *reservation = find_ambiguity_entry(&stored_state_key);
+    return owner_present && fallback_present && state_present && generation_index_present &&
+           connection_present && cookie_connection_present && !claim_present &&
+           !detach_guard_present && !terminal_present && reservation &&
+           !reservation->observed_monotime_ns;
+}
+
+static void test_unacked_publishing_cleanup_is_shallow_and_exact(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    const pid_key_t process = java_process_key(&test_owner);
+
+    seed_generation(&connection);
+    java_remote_parent_receive_context_t context = seed_unacked_receive_cursor();
+    java_remote_parent_cleanup_unacked_receive_context(&context, test_socket_cookie);
+    if (receive_cursor_present || receive_guard_present || receive_data_signal_present ||
+        receive_data_ack_delete_attempts != 1 || receive_data_signal_delete_attempts != 1 ||
+        !same_key(&receive_deleted_ack_key.process, &process, sizeof(process)) ||
+        receive_deleted_ack_key.reserved ||
+        receive_deleted_ack_key.nonce != context.data_signal_nonce ||
+        !unacked_cleanup_left_generation_untouched() || unexpected_update || unexpected_delete) {
+        fail("exact pre-ACK cleanup did not drain PUBLISHING without touching G/M");
+    }
+
+    seed_generation(&connection);
+    context = seed_unacked_receive_cursor();
+    receive_cursor.request_sequence++;
+    java_remote_parent_cleanup_unacked_receive_context(&context, test_socket_cookie);
+    if (!receive_cursor_present ||
+        receive_cursor.state != k_java_remote_parent_receive_cursor_publishing ||
+        receive_data_signal_present || !unacked_cleanup_left_generation_untouched() ||
+        unexpected_update || unexpected_delete) {
+        fail("mismatched pre-ACK cleanup mutated a foreign PUBLISHING cursor");
+    }
+
+    seed_generation(&connection);
+    context = seed_unacked_receive_cursor();
+    receive_cursor_update_failures = 1;
+    java_remote_parent_cleanup_unacked_receive_context(&context, test_socket_cookie);
+    if (!receive_cursor_present ||
+        receive_cursor.state != k_java_remote_parent_receive_cursor_publishing ||
+        receive_cursor_update_failures || !unacked_cleanup_left_generation_untouched() ||
+        unexpected_update || unexpected_delete) {
+        fail("failed pre-ACK RETIRING update was not left PUBLISHING fail closed");
+    }
+
+    seed_generation(&connection);
+    context = seed_unacked_receive_cursor();
+    receive_cursor_delete_failures = 1;
+    java_remote_parent_cleanup_unacked_receive_context(&context, test_socket_cookie);
+    if (!receive_cursor_present ||
+        receive_cursor.state != k_java_remote_parent_receive_cursor_retiring ||
+        receive_cursor_delete_failures || !unacked_cleanup_left_generation_untouched() ||
+        unexpected_update || unexpected_delete) {
+        fail("failed pre-ACK cursor delete did not leave RETIRING fail closed");
+    }
+
+    seed_generation(&connection);
+    context = seed_unacked_receive_cursor();
+    receive_data_ack_delete_failures = 1;
+    receive_data_signal_delete_failures = 1;
+    java_remote_parent_cleanup_unacked_receive_context(&context, test_socket_cookie);
+    if (receive_cursor_present || !receive_data_signal_present ||
+        receive_data_ack_delete_failures || receive_data_signal_delete_failures ||
+        receive_data_ack_delete_attempts != 1 || receive_data_signal_delete_attempts != 1 ||
+        !unacked_cleanup_left_generation_untouched() || unexpected_update || unexpected_delete) {
+        fail("signal cleanup faults prevented terminal PUBLISHING cleanup");
+    }
+
+    seed_generation(&connection);
+    context = seed_unacked_receive_cursor();
+    context.generation = test_generation;
+    java_remote_parent_cleanup_unacked_receive_context(&context, test_socket_cookie);
+    if (!receive_cursor_present || !receive_data_signal_present ||
+        receive_data_ack_delete_attempts || receive_data_signal_delete_attempts ||
+        !unacked_cleanup_left_generation_untouched() || unexpected_update || unexpected_delete) {
+        fail("pre-ACK cleanup adopted an ACKed context");
+    }
+}
+
+static void test_parser_failure_uses_pre_reserved_ambiguity_fence(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+
+    seed_generation(&connection);
+    seed_receive_cursor();
+    receive_guard_present = 0;
+    receive_data_signal_owner = test_owner;
+    receive_data_signal_nonce = receive_cursor.data_signal_nonce;
+    receive_data_signal_present = 1;
+    const java_remote_parent_receive_cursor_t expected = receive_cursor;
+    if (!java_remote_parent_cleanup_receive_cursor(
+            &expected, test_socket_cookie, test_generation) ||
+        receive_cursor_present || receive_guard_present || receive_data_signal_present ||
+        receive_data_ack_delete_attempts != 1 || receive_data_signal_delete_attempts != 1 ||
+        !find_ambiguity(&stored_state_key) || !owner_present || !state_present ||
+        !generation_index_present || !connection_present || !cookie_connection_present ||
+        unexpected_update || unexpected_delete) {
+        fail("parser failure did not fence M before draining its exact cursor");
+    }
+    java_remote_parent_response_t response = stored_state.response;
+    const enum java_remote_parent_status parser_fence_status =
+        java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_direct,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie);
+    if (parser_fence_status != k_java_remote_parent_status_ambiguous ||
+        response.status != k_java_remote_parent_status_ambiguous ||
+        java_remote_parent_le64_to_cpu(response.generation_le) != test_generation ||
+        owner_present || fallback_present || state_present || generation_index_present ||
+        connection_present || cookie_connection_present || claim_present || detach_guard_present ||
+        find_ambiguity_entry(&stored_state_key) || !terminal_present ||
+        stored_terminal.generation != test_generation ||
+        stored_terminal.process_incarnation != test_process_incarnation ||
+        stored_terminal.lifecycle != k_java_remote_parent_lifecycle_ambiguous ||
+        stats[k_java_remote_parent_stat_take_ambiguous] != 1 || unexpected_update ||
+        unexpected_delete) {
+        fail("parser M fence remained consumable by SDK TAKE");
+    }
+    const java_remote_parent_terminal_t expected_terminal = stored_terminal;
+    java_remote_parent_cleanup(&test_owner);
+    if (owner_present || fallback_present || state_present || generation_index_present ||
+        connection_present || cookie_connection_present || task_present || claim_present ||
+        detach_guard_present || find_ambiguity_entry(&stored_state_key) || !terminal_present ||
+        memcmp(&stored_terminal, &expected_terminal, sizeof(expected_terminal)) != 0 ||
+        unexpected_update || unexpected_delete) {
+        fail("baseline cleanup disturbed an SDK-converged ambiguous terminal");
+    }
+
+    seed_generation(&connection);
+    seed_receive_cursor();
+    receive_guard_present = 0;
+    const java_remote_parent_receive_cursor_t baseline_fenced = receive_cursor;
+    if (!java_remote_parent_cleanup_receive_cursor(
+            &baseline_fenced, test_socket_cookie, test_generation) ||
+        receive_cursor_present || receive_guard_present || !find_ambiguity(&stored_state_key)) {
+        fail("could not seed parser-fenced generation for baseline cleanup");
+    }
+    java_remote_parent_cleanup(&test_owner);
+    if (!owner_cleanup_payload_absent() || find_ambiguity_entry(&stored_state_key) ||
+        claim_present || detach_guard_present || unexpected_update || unexpected_delete) {
+        fail("baseline cleanup did not converge a parser-fenced generation");
+    }
+
+    seed_generation(&connection);
+    seed_receive_cursor();
+    receive_guard_present = 0;
+    ambiguities[0].observed_monotime_ns = test_now_ns;
+    const java_remote_parent_receive_cursor_t already_fenced = receive_cursor;
+    if (!java_remote_parent_cleanup_receive_cursor(
+            &already_fenced, test_socket_cookie, test_generation) ||
+        receive_cursor_present || receive_guard_present || !find_ambiguity(&stored_state_key) ||
+        unexpected_update || unexpected_delete) {
+        fail("parser cleanup did not accept an already-fenced generation");
+    }
+
+    seed_generation(&connection);
+    seed_receive_cursor();
+    receive_guard_present = 0;
+    const java_remote_parent_receive_cursor_t generation_mismatch = receive_cursor;
+    if (java_remote_parent_cleanup_receive_cursor(
+            &generation_mismatch, test_socket_cookie, test_replacement_generation) ||
+        !receive_cursor_present ||
+        receive_cursor.state != k_java_remote_parent_receive_cursor_valid ||
+        receive_guard_present || find_ambiguity(&stored_state_key) ||
+        receive_data_ack_delete_attempts || receive_data_signal_delete_attempts || !owner_present ||
+        !state_present || !generation_index_present || !connection_present ||
+        !cookie_connection_present || unexpected_update || unexpected_delete) {
+        fail("parser cleanup retired a VALID cursor under mismatched G authority");
+    }
+
+    seed_generation(&connection);
+    seed_receive_cursor();
+    const java_remote_parent_receive_cursor_t busy = receive_cursor;
+    if (java_remote_parent_cleanup_receive_cursor(&busy, test_socket_cookie, test_generation) ||
+        !receive_cursor_present || !receive_guard_present || find_ambiguity(&stored_state_key) ||
+        receive_data_ack_delete_attempts || receive_data_signal_delete_attempts ||
+        unexpected_update || unexpected_delete) {
+        fail("parser cleanup crossed an exact BUSY guard");
+    }
+
+    seed_generation(&connection);
+    seed_receive_cursor();
+    receive_guard.request_sequence++;
+    const java_remote_parent_receive_cursor_t foreign_guard = receive_cursor;
+    if (java_remote_parent_cleanup_receive_cursor(
+            &foreign_guard, test_socket_cookie, test_generation) ||
+        !receive_cursor_present || !receive_guard_present || find_ambiguity(&stored_state_key) ||
+        unexpected_update || unexpected_delete) {
+        fail("parser cleanup crossed a foreign BUSY guard");
+    }
+
+    seed_generation(&connection);
+    seed_receive_cursor();
+    receive_guard_present = 0;
+    replace_receive_cursor_after_guard_update = 1;
+    const java_remote_parent_receive_cursor_t predecessor = receive_cursor;
+    if (java_remote_parent_cleanup_receive_cursor(
+            &predecessor, test_socket_cookie, test_generation) ||
+        replace_receive_cursor_after_guard_update || !receive_cursor_present ||
+        receive_cursor.request_sequence == predecessor.request_sequence ||
+        receive_cursor.generation != test_replacement_generation || receive_guard_present ||
+        !find_ambiguity(&stored_state_key) || unexpected_update || unexpected_delete) {
+        fail("parser cleanup overwrote a successor observed after guard acquisition");
+    }
+
+    seed_generation(&connection);
+    seed_receive_cursor();
+    receive_guard_present = 0;
+    ambiguities[0].present = 0;
+    ambiguity_update_failures = 2;
+    const java_remote_parent_receive_cursor_t update_failure = receive_cursor;
+    if (java_remote_parent_cleanup_receive_cursor(
+            &update_failure, test_socket_cookie, test_generation) ||
+        ambiguity_update_failures || !receive_cursor_present ||
+        receive_cursor.state != k_java_remote_parent_receive_cursor_retiring ||
+        receive_guard_present || find_ambiguity_entry(&stored_state_key) || unexpected_update ||
+        unexpected_delete) {
+        fail("failed parser M update exposed a guard-free VALID cursor");
+    }
+    current_task = test_owner;
+    java_remote_parent_response_t missing_marker_response = stored_state.response;
+    enum java_remote_parent_status missing_marker_status =
+        java_remote_parent_retrieve_for_connection(&missing_marker_response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_direct,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie);
+    if (missing_marker_status == k_java_remote_parent_status_valid ||
+        missing_marker_response.status == k_java_remote_parent_status_valid || !state_present ||
+        !generation_index_present || !connection_present || !cookie_connection_present) {
+        fail("SDK direct TAKE adopted a parser generation after both M updates failed");
+    }
+
+    seed_generation(&connection);
+    seed_receive_cursor();
+    receive_guard_present = 0;
+    ambiguities[0].present = 0;
+    drop_ambiguity_after_update = 2;
+    const java_remote_parent_receive_cursor_t recheck_failure = receive_cursor;
+    if (java_remote_parent_cleanup_receive_cursor(
+            &recheck_failure, test_socket_cookie, test_generation) ||
+        drop_ambiguity_after_update || !receive_cursor_present ||
+        receive_cursor.state != k_java_remote_parent_receive_cursor_retiring ||
+        receive_guard_present || find_ambiguity_entry(&stored_state_key) || unexpected_update ||
+        unexpected_delete) {
+        fail("failed parser M recheck exposed a guard-free VALID cursor");
+    }
+    current_task = test_owner;
+    missing_marker_response = stored_state.response;
+    missing_marker_status =
+        java_remote_parent_retrieve_for_connection(&missing_marker_response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_direct,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie);
+    if (missing_marker_status == k_java_remote_parent_status_valid ||
+        missing_marker_response.status == k_java_remote_parent_status_valid || !state_present ||
+        !generation_index_present || !connection_present || !cookie_connection_present) {
+        fail("SDK direct TAKE adopted a parser generation after both M rechecks failed");
+    }
+
+    seed_generation(&connection);
+    seed_receive_cursor();
+    receive_guard_present = 0;
+    receive_guard_update_failures = 1;
+    ambiguities[0].present = 0;
+    ambiguity_update_failures = 1;
+    const java_remote_parent_receive_cursor_t double_fault = receive_cursor;
+    if (java_remote_parent_cleanup_receive_cursor(
+            &double_fault, test_socket_cookie, test_generation) ||
+        receive_guard_update_failures || ambiguity_update_failures || !receive_cursor_present ||
+        receive_cursor.state != k_java_remote_parent_receive_cursor_valid ||
+        receive_guard_present || !find_ambiguity(&stored_state_key) || unexpected_update ||
+        unexpected_delete) {
+        fail("guard ERROR plus first M fault left SDK generation authority unfenced");
+    }
+
+    seed_generation(&connection);
+    seed_receive_cursor();
+    receive_guard_present = 0;
+    receive_cursor_update_failures = 1;
+    const java_remote_parent_receive_cursor_t retiring_update_failure = receive_cursor;
+    if (java_remote_parent_cleanup_receive_cursor(
+            &retiring_update_failure, test_socket_cookie, test_generation) ||
+        receive_cursor_update_failures || !receive_cursor_present ||
+        receive_cursor.state != k_java_remote_parent_receive_cursor_valid ||
+        !receive_guard_present || !find_ambiguity(&stored_state_key) || unexpected_update ||
+        unexpected_delete) {
+        fail("failed parser RETIRING update released its exact guard");
+    }
+
+    seed_generation(&connection);
+    seed_receive_cursor();
+    receive_guard_present = 0;
+    receive_guard_delete_failures = 1;
+    const java_remote_parent_receive_cursor_t guard_release_failure = receive_cursor;
+    if (java_remote_parent_cleanup_receive_cursor(
+            &guard_release_failure, test_socket_cookie, test_generation) ||
+        receive_guard_delete_failures || !receive_cursor_present ||
+        receive_cursor.state != k_java_remote_parent_receive_cursor_retiring ||
+        !receive_guard_present || !find_ambiguity(&stored_state_key) || unexpected_update ||
+        unexpected_delete) {
+        fail("failed parser guard release did not retain guarded RETIRING");
+    }
+
+    seed_generation(&connection);
+    seed_receive_cursor();
+    receive_guard_present = 0;
+    receive_cursor_delete_failures = 1;
+    const java_remote_parent_receive_cursor_t cursor_delete_failure = receive_cursor;
+    if (java_remote_parent_cleanup_receive_cursor(
+            &cursor_delete_failure, test_socket_cookie, test_generation) ||
+        receive_cursor_delete_failures || !receive_cursor_present ||
+        receive_cursor.state != k_java_remote_parent_receive_cursor_retiring ||
+        receive_guard_present || !find_ambiguity(&stored_state_key) || unexpected_update ||
+        unexpected_delete) {
+        fail("failed parser cursor delete did not retain RETIRING after M+");
+    }
+
+    seed_generation(&connection);
+    seed_receive_cursor();
+    receive_guard_present = 0;
+    receive_cursor.state = k_java_remote_parent_receive_cursor_retiring;
+    const java_remote_parent_receive_cursor_t retiring = receive_cursor;
+    if (java_remote_parent_cleanup_receive_cursor(&retiring, test_socket_cookie, test_generation) ||
+        !receive_cursor_present || receive_guard_present || find_ambiguity(&stored_state_key) ||
+        unexpected_update || unexpected_delete) {
+        fail("parser cleanup adopted an independently RETIRING cursor");
+    }
+
+    seed_generation(&connection);
+    java_remote_parent_receive_context_t context = seed_unacked_receive_cursor();
+    const java_remote_parent_receive_cursor_t publishing = receive_cursor;
+    if (!java_remote_parent_cleanup_receive_cursor(&publishing, test_socket_cookie, 0) ||
+        receive_cursor_present || receive_guard_present || receive_data_signal_present ||
+        receive_data_ack_delete_attempts != 1 || receive_data_signal_delete_attempts != 1 ||
+        context.generation || !unacked_cleanup_left_generation_untouched() || unexpected_update ||
+        unexpected_delete) {
+        fail("generation-zero parser failure did not drain exact PUBLISHING state");
+    }
+
+    seed_generation(&connection);
+    context = seed_unacked_receive_cursor();
+    const java_remote_parent_receive_cursor_t staged_publishing = receive_cursor;
+    if (!java_remote_parent_cleanup_receive_cursor(
+            &staged_publishing, test_socket_cookie, test_generation) ||
+        receive_cursor_present || receive_guard_present || !find_ambiguity(&stored_state_key) ||
+        context.generation || !owner_present || !state_present || !generation_index_present ||
+        !connection_present || !cookie_connection_present || unexpected_update ||
+        unexpected_delete) {
+        fail("ACK failure did not fence staged G before draining PUBLISHING");
+    }
+
+    seed_generation(&connection);
+    seed_receive_cursor();
+    receive_guard_present = 0;
+    receive_data_signal_owner = test_owner;
+    receive_data_signal_nonce = receive_cursor.data_signal_nonce;
+    receive_data_signal_present = 1;
+    receive_data_ack_delete_failures = 1;
+    receive_data_signal_delete_failures = 1;
+    const java_remote_parent_receive_cursor_t signal_failure = receive_cursor;
+    if (!java_remote_parent_cleanup_receive_cursor(
+            &signal_failure, test_socket_cookie, test_generation) ||
+        receive_cursor_present || receive_guard_present || !receive_data_signal_present ||
+        receive_data_ack_delete_failures || receive_data_signal_delete_failures ||
+        receive_data_ack_delete_attempts != 1 || receive_data_signal_delete_attempts != 1 ||
+        !find_ambiguity(&stored_state_key) || unexpected_update || unexpected_delete) {
+        fail("bounded signal faults blocked parser generation fencing");
+    }
+}
+
+static java_remote_parent_receive_ioctl_workspace_t deferred_replace_workspace(void) {
+    java_remote_parent_receive_ioctl_workspace_t workspace = {
+        .predecessor = receive_cursor,
+        .socket_cookie = test_socket_cookie,
+        .connection_netns = test_connection_netns,
+        .transition = k_java_remote_parent_receive_ioctl_transition_fence_replace,
+        .guard = k_java_remote_parent_receive_guard_acquired,
+    };
+    workspace.cursor =
+        java_remote_parent_receive_cursor_publishing_identity(&test_owner,
+                                                              test_process_incarnation,
+                                                              receive_cursor.lifecycle_id + 1,
+                                                              receive_cursor.request_sequence + 1,
+                                                              receive_cursor.data_signal_nonce + 1);
+    return workspace;
+}
+
+static u8
+run_deferred_ioctl_generation_fence(java_remote_parent_receive_ioctl_workspace_t *workspace,
+                                    const connection_info_t *connection) {
+    if (!java_remote_parent_receive_ioctl_fence_authorized(workspace)) {
+        return 0;
+    }
+    java_remote_parent_receive_cursor_t *target =
+        java_remote_parent_receive_ioctl_fence_cursor(workspace);
+    java_remote_parent_cleanup_receive_cursor_signal(target);
+    u8 fenced = java_remote_parent_receive_generation_already_fenced(target,
+                                                                     connection,
+                                                                     workspace->connection_netns,
+                                                                     test_connection_netns_cookie,
+                                                                     workspace->socket_cookie);
+    if (!fenced) {
+        const java_remote_parent_key_t generation_key =
+            java_remote_parent_state_key(&target->owner, target->generation);
+        fenced = java_remote_parent_cleanup_exact_receive_zero_alias(&generation_key,
+                                                                     target->process_incarnation,
+                                                                     connection,
+                                                                     workspace->connection_netns,
+                                                                     workspace->socket_cookie);
+        if (!fenced) {
+            fenced = java_remote_parent_detach_exact_receive_aliased(&generation_key,
+                                                                     target->process_incarnation,
+                                                                     connection,
+                                                                     workspace->connection_netns,
+                                                                     workspace->socket_cookie);
+        }
+    }
+    if (!fenced) {
+        fenced = java_remote_parent_fence_receive_cursor_ambiguous(target, target->generation);
+    }
+    if (!fenced && target->generation) {
+        fenced = java_remote_parent_fence_receive_cursor_ambiguous(target, target->generation);
+    }
+    return fenced;
+}
+
+static void test_deferred_ioctl_transition_is_exact_and_fail_closed(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+
+    java_remote_parent_receive_context_t fence_context = {0};
+    java_remote_parent_receive_ioctl_fence_context_init(&fence_context,
+                                                        test_connection_netns_cookie);
+    if (java_remote_parent_receive_ioctl_fence_context_cookie(&fence_context) !=
+        test_connection_netns_cookie) {
+        fail("exact transition fence context rejected its live netns cookie");
+    }
+    java_remote_parent_receive_ioctl_fence_context_t *malformed_fence_context =
+        (java_remote_parent_receive_ioctl_fence_context_t *)&fence_context;
+    malformed_fence_context->tag ^= 1;
+    if (java_remote_parent_receive_ioctl_fence_context_cookie(&fence_context)) {
+        fail("transition fence context accepted a corrupt tag");
+    }
+    java_remote_parent_receive_ioctl_fence_context_init(&fence_context,
+                                                        test_connection_netns_cookie);
+    malformed_fence_context->reserved = 1;
+    if (java_remote_parent_receive_ioctl_fence_context_cookie(&fence_context)) {
+        fail("transition fence context accepted reserved metadata");
+    }
+    java_remote_parent_receive_ioctl_fence_context_init(&fence_context,
+                                                        test_connection_netns_cookie);
+    malformed_fence_context->zero_tail[sizeof(malformed_fence_context->zero_tail) - 1] = 1;
+    if (java_remote_parent_receive_ioctl_fence_context_cookie(&fence_context)) {
+        fail("transition fence context accepted a corrupt zero tail");
+    }
+
+    // The normal gate may finish a sequential zero-alias G before phase B.
+    // Strict final-form recognition must not recreate a non-evicting M+.
+    seed_generation(&connection);
+    seed_receive_cursor();
+    java_remote_parent_receive_ioctl_workspace_t workspace = deferred_replace_workspace();
+    java_remote_parent_begin_data_receive();
+    if (!owner_cleanup_payload_absent() || find_ambiguity_entry(&stored_state_key) ||
+        claim_present || detach_guard_present || !receive_cursor_present ||
+        !receive_guard_present) {
+        fail("receive gate did not finish the old zero-alias generation");
+    }
+    if (!run_deferred_ioctl_generation_fence(&workspace, &connection) ||
+        find_ambiguity_entry(&stored_state_key) ||
+        !java_remote_parent_complete_receive_ioctl_transition(&workspace, 1) ||
+        workspace.transition != k_java_remote_parent_receive_ioctl_transition_ready ||
+        !receive_cursor_present || receive_guard_present ||
+        memcmp(&receive_cursor, &workspace.cursor, sizeof(receive_cursor)) != 0) {
+        fail("phase B recreated M after strict terminal-free gate cleanup");
+    }
+
+    seed_generation(&connection);
+    seed_receive_cursor();
+    workspace = deferred_replace_workspace();
+    receive_data_signal_owner = test_owner;
+    receive_data_signal_nonce = workspace.predecessor.data_signal_nonce;
+    receive_data_signal_present = 1;
+    if (!run_deferred_ioctl_generation_fence(&workspace, &connection) ||
+        !java_remote_parent_complete_receive_ioctl_transition(&workspace, 1) ||
+        workspace.transition != k_java_remote_parent_receive_ioctl_transition_ready ||
+        workspace.guard || !receive_cursor_present || receive_guard_present ||
+        memcmp(&receive_cursor, &workspace.cursor, sizeof(receive_cursor)) != 0 ||
+        !receive_data_signal_present ||
+        receive_data_signal_nonce != workspace.cursor.data_signal_nonce || owner_present ||
+        fallback_present || state_present || generation_index_present || connection_present ||
+        cookie_connection_present || claim_present || detach_guard_present ||
+        find_ambiguity_entry(&stored_state_key) || unexpected_update || unexpected_delete) {
+        fail("deferred START did not remove zero-alias G before exact cursor replacement");
+    }
+    java_remote_parent_receive_context_t prepared_context = {
+        .owner_tid = workspace.cursor.owner.tid,
+        .owner_pid = workspace.cursor.owner.pid,
+        .owner_ns = workspace.cursor.owner.ns,
+        .process_incarnation = workspace.cursor.process_incarnation,
+        .lifecycle_id = workspace.cursor.lifecycle_id,
+        .request_sequence = workspace.cursor.request_sequence,
+        .data_signal_nonce = workspace.cursor.data_signal_nonce,
+        .generation = workspace.cursor.generation,
+        .action = k_java_remote_parent_receive_action_http1_start,
+    };
+    if (!java_remote_parent_receive_ioctl_ready_context_exact(&workspace, &prepared_context)) {
+        fail("prepared START context did not match its exact READY scratch");
+    }
+    prepared_context.action = k_java_remote_parent_receive_action_http1_continue;
+    if (java_remote_parent_receive_ioctl_ready_context_exact(&workspace, &prepared_context)) {
+        fail("prepared payload adopted START scratch as CONTINUE");
+    }
+    prepared_context.action = k_java_remote_parent_receive_action_http1_start;
+    prepared_context.reserved2[0] = 1;
+    if (java_remote_parent_receive_ioctl_ready_context_exact(&workspace, &prepared_context)) {
+        fail("prepared payload accepted corrupted reserved scratch");
+    }
+    java_remote_parent_receive_cursor_t snapshot = {0};
+    const pid_key_t process = java_process_key(&test_owner);
+    if (java_remote_parent_receive_cursor_continue(test_socket_cookie,
+                                                   &process,
+                                                   test_process_incarnation,
+                                                   workspace.cursor.lifecycle_id,
+                                                   workspace.cursor.request_sequence,
+                                                   &snapshot) ||
+        java_remote_parent_receive_cursor_start(test_socket_cookie,
+                                                &test_owner,
+                                                test_process_incarnation,
+                                                workspace.cursor.lifecycle_id + 1,
+                                                workspace.cursor.request_sequence + 1,
+                                                workspace.cursor.data_signal_nonce + 1)) {
+        fail("immediate next request adopted an unacknowledged replacement cursor");
+    }
+    java_remote_parent_cleanup(&test_owner);
+    memset(&snapshot, 0, sizeof(snapshot));
+    if (!owner_cleanup_payload_absent() || find_ambiguity_entry(&stored_state_key) ||
+        !receive_cursor_present ||
+        !java_remote_parent_receive_cursor_ack_generation(
+            test_socket_cookie, &workspace.cursor, test_replacement_generation) ||
+        !java_remote_parent_receive_cursor_continue(test_socket_cookie,
+                                                    &process,
+                                                    test_process_incarnation,
+                                                    workspace.cursor.lifecycle_id,
+                                                    workspace.cursor.request_sequence,
+                                                    &snapshot) ||
+        snapshot.generation != test_replacement_generation) {
+        fail("zero-alias cleanup did not leave immediate successor recovery unblocked");
+    }
+
+    seed_generation(&connection);
+    seed_receive_cursor();
+    seed_exact_receive_aliases(1);
+    workspace = deferred_replace_workspace();
+    java_remote_parent_begin_data_receive();
+    if (owner_present || fallback_present || !state_present || stored_state.aliases != 1 ||
+        !generation_index_present || !connection_present || !cookie_connection_present ||
+        !task_present || claim_present || detach_guard_present ||
+        !find_ambiguity_entry(&stored_state_key) || find_ambiguity(&stored_state_key)) {
+        fail("receive gate did not preserve the authorized aliased generation");
+    }
+    if (!run_deferred_ioctl_generation_fence(&workspace, &connection) ||
+        !java_remote_parent_complete_receive_ioctl_transition(&workspace, 1) ||
+        workspace.transition != k_java_remote_parent_receive_ioctl_transition_ready ||
+        workspace.guard || !receive_cursor_present || receive_guard_present ||
+        memcmp(&receive_cursor, &workspace.cursor, sizeof(receive_cursor)) != 0 || owner_present ||
+        fallback_present || !state_present || stored_state.aliases != 1 ||
+        !generation_index_present || connection_present || cookie_connection_present ||
+        !task_present || claim_present || detach_guard_present ||
+        !find_ambiguity_entry(&stored_state_key) || find_ambiguity(&stored_state_key) ||
+        unexpected_update || unexpected_delete) {
+        fail("aliased deferred START did not detach only its direct cursors");
+    }
+    java_remote_parent_resolution_t aliased_resolution = {0};
+    java_remote_parent_resolve_exact(&aliased_resolution, &test_owner, test_generation, 1);
+    if (!aliased_resolution.found || aliased_resolution.ambiguous ||
+        !same_key(&aliased_resolution.key, &stored_state_key, sizeof(stored_state_key)) ||
+        owner_present || fallback_present || !state_present || stored_state.aliases != 1 ||
+        !generation_index_present || connection_present || cookie_connection_present ||
+        !task_present || !find_ambiguity_entry(&stored_state_key) ||
+        find_ambiguity(&stored_state_key) || unexpected_update || unexpected_delete) {
+        fail("aliased detach revoked exact SDK alias authority");
+    }
+
+    const java_remote_parent_incoming_t second_incoming = prepare_exact_stage_incoming(&connection);
+    stage_updates_enabled = 1;
+    const u64 second_generation = java_remote_parent_stage_incoming(&connection,
+                                                                    test_connection_netns,
+                                                                    test_connection_netns_cookie,
+                                                                    test_socket_cookie,
+                                                                    &second_incoming);
+    stage_updates_enabled = 0;
+    if (!second_generation || second_generation != test_replacement_generation || !owner_present ||
+        stored_owner.generation != second_generation ||
+        stored_owner.lifecycle != k_java_remote_parent_lifecycle_active || !fallback_present ||
+        java_remote_parent_le64_to_cpu(stored_fallback.generation_le) != second_generation ||
+        !state_present || stored_state.aliases != 1 || !generation_index_present ||
+        connection_present || cookie_connection_present || !task_present ||
+        !replacement_state_present || replacement_state_key.generation != second_generation ||
+        !replacement_generation_index_present ||
+        replacement_generation_index_key.generation != second_generation ||
+        !replacement_connection_present || replacement_connection.generation != second_generation ||
+        !replacement_cookie_connection_present ||
+        replacement_cookie_connection.generation != second_generation || claim_present ||
+        detach_guard_present || !find_ambiguity_entry(&stored_state_key) ||
+        find_ambiguity(&stored_state_key) || !find_ambiguity_entry(&replacement_state_key) ||
+        find_ambiguity(&replacement_state_key) || !stage_ack_present ||
+        stage_ack_key.nonce != workspace.cursor.data_signal_nonce || stage_ack_key.reserved ||
+        stage_ack.reserved || stage_ack.generation != second_generation ||
+        memcmp(&stage_ack.connection, &connection, sizeof(connection)) != 0 ||
+        stage_ack.connection_netns != test_connection_netns ||
+        stats[k_java_remote_parent_stat_stage_valid] != 1 || unexpected_update ||
+        unexpected_delete) {
+        fail("aliased detach did not admit a simultaneous second socket generation");
+    }
+    const java_remote_parent_response_t expected_second_response = replacement_state.response;
+    const java_remote_parent_connection_t expected_second_connection = replacement_connection;
+    const java_remote_parent_connection_t expected_second_cookie_connection =
+        replacement_cookie_connection;
+    if (!java_remote_parent_receive_cursor_ack_generation(
+            test_socket_cookie, &workspace.cursor, stage_ack.generation)) {
+        fail("real second STAGE acknowledgement did not commit its exact cursor generation");
+    }
+    current_task = test_child;
+    java_remote_parent_response_t aliased_response = stored_state.response;
+    const enum java_remote_parent_status aliased_status =
+        java_remote_parent_retrieve_for_connection(&aliased_response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   second_generation,
+                                                   test_socket_cookie);
+    if (aliased_status != k_java_remote_parent_status_valid ||
+        aliased_response.status != k_java_remote_parent_status_valid ||
+        java_remote_parent_le64_to_cpu(aliased_response.generation_le) != test_generation ||
+        state_present || generation_index_present || connection_present ||
+        cookie_connection_present || !task_present || claim_present || detach_guard_present ||
+        find_ambiguity_entry(&stored_state_key) || !owner_present ||
+        stored_owner.generation != second_generation || !fallback_present ||
+        java_remote_parent_le64_to_cpu(stored_fallback.generation_le) != second_generation ||
+        !replacement_state_present ||
+        memcmp(&replacement_state.response,
+               &expected_second_response,
+               sizeof(expected_second_response)) != 0 ||
+        !replacement_generation_index_present || !replacement_connection_present ||
+        memcmp(&replacement_connection,
+               &expected_second_connection,
+               sizeof(expected_second_connection)) != 0 ||
+        !replacement_cookie_connection_present ||
+        memcmp(&replacement_cookie_connection,
+               &expected_second_cookie_connection,
+               sizeof(expected_second_cookie_connection)) != 0 ||
+        !find_ambiguity_entry(&replacement_state_key) || find_ambiguity(&replacement_state_key) ||
+        !terminal_present || stored_terminal.generation != test_generation ||
+        stored_terminal.lifecycle != k_java_remote_parent_lifecycle_consumed ||
+        stats[k_java_remote_parent_stat_take_valid] != 1 || unexpected_update ||
+        unexpected_delete) {
+        fail("aliased detach did not preserve one exact SDK task TAKE");
+    }
+
+    const pid_key_t aliased_process = java_process_key(&test_owner);
+    java_remote_parent_receive_cursor_t continued = {0};
+    if (!java_remote_parent_receive_cursor_continue(test_socket_cookie,
+                                                    &aliased_process,
+                                                    test_process_incarnation,
+                                                    workspace.cursor.lifecycle_id,
+                                                    workspace.cursor.request_sequence,
+                                                    &continued) ||
+        continued.generation != second_generation) {
+        fail("real second STAGE ACK did not enable exact cursor CONTINUE");
+    }
+
+    current_task = test_owner;
+    java_remote_parent_response_t second_response = expected_second_response;
+    if (java_remote_parent_retrieve_for_connection(&second_response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_direct,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   second_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_valid ||
+        second_response.status != k_java_remote_parent_status_valid ||
+        java_remote_parent_le64_to_cpu(second_response.generation_le) != second_generation ||
+        memcmp(second_response.trace_id,
+               expected_second_response.trace_id,
+               sizeof(second_response.trace_id)) != 0 ||
+        memcmp(second_response.span_id,
+               expected_second_response.span_id,
+               sizeof(second_response.span_id)) != 0 ||
+        second_response.flags != expected_second_response.flags || owner_present ||
+        fallback_present || replacement_state_present || replacement_generation_index_present ||
+        replacement_connection_present || replacement_cookie_connection_present || claim_present ||
+        detach_guard_present || find_ambiguity_entry(&replacement_state_key) || !terminal_present ||
+        stored_terminal.generation != second_generation ||
+        stored_terminal.lifecycle != k_java_remote_parent_lifecycle_consumed ||
+        stats[k_java_remote_parent_stat_take_valid] != 2 || unexpected_update ||
+        unexpected_delete) {
+        fail("old alias TAKE disturbed the directly retrievable successor generation");
+    }
+
+    seed_generation(&connection);
+    seed_receive_cursor();
+    seed_exact_receive_aliases(1);
+    workspace = deferred_replace_workspace();
+    owner_delete_failures = 2;
+    if (!run_deferred_ioctl_generation_fence(&workspace, &connection) || owner_delete_failures ||
+        !java_remote_parent_complete_receive_ioctl_transition(&workspace, 1) ||
+        workspace.transition != k_java_remote_parent_receive_ioctl_transition_ready ||
+        !receive_cursor_present || receive_guard_present ||
+        memcmp(&receive_cursor, &workspace.cursor, sizeof(receive_cursor)) != 0 || !owner_present ||
+        fallback_present || !state_present || stored_state.aliases != 1 ||
+        !generation_index_present || !connection_present || !cookie_connection_present ||
+        !task_present || !claim_present || !detach_guard_present ||
+        !find_ambiguity(&stored_state_key) || unexpected_update || unexpected_delete) {
+        fail("aliased destructive fault did not retain an exact M+/claim/guard fence");
+    }
+    current_task = test_child;
+    java_remote_parent_response_t fault_response = stored_state.response;
+    if (java_remote_parent_retrieve_for_connection(&fault_response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie) !=
+            k_java_remote_parent_status_overload ||
+        fault_response.status != k_java_remote_parent_status_overload || !claim_present ||
+        !detach_guard_present || !find_ambiguity(&stored_state_key) || !state_present ||
+        !generation_index_present || stats[k_java_remote_parent_stat_take_overload] != 1 ||
+        unexpected_update || unexpected_delete) {
+        fail("aliased destructive fault exposed a wrong SDK parent");
+    }
+
+    seed_generation(&connection);
+    seed_receive_cursor();
+    workspace = deferred_replace_workspace();
+    // Model a strict completed-by-TAKE predecessor between A and B. Phase B
+    // recognizes the final form without recreating M, and phase C may replace
+    // only the guarded old cursor; the completed terminal is untouched.
+    owner_present = 0;
+    fallback_present = 0;
+    state_present = 0;
+    generation_index_present = 0;
+    connection_present = 0;
+    cookie_connection_present = 0;
+    ambiguities[0].present = 0;
+    terminal_present = 1;
+    stored_terminal = (java_remote_parent_terminal_t){
+        .generation = test_generation,
+        .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
+        .lifecycle = k_java_remote_parent_lifecycle_consumed,
+    };
+    const java_remote_parent_terminal_t completed_terminal = stored_terminal;
+    if (!run_deferred_ioctl_generation_fence(&workspace, &connection) ||
+        !java_remote_parent_complete_receive_ioctl_transition(&workspace, 1) ||
+        !receive_cursor_present || receive_guard_present ||
+        memcmp(&receive_cursor, &workspace.cursor, sizeof(receive_cursor)) != 0 ||
+        find_ambiguity_entry(&stored_state_key) || !terminal_present ||
+        memcmp(&stored_terminal, &completed_terminal, sizeof(completed_terminal)) != 0) {
+        fail("deferred START disturbed a predecessor completed by TAKE");
+    }
+
+    seed_generation(&connection);
+    seed_receive_cursor();
+    workspace = deferred_replace_workspace();
+    java_remote_parent_receive_ioctl_workspace_t malformed = workspace;
+    malformed.transition = 0xff;
+    if (java_remote_parent_receive_ioctl_fence_authorized(&malformed)) {
+        fail("deferred fence accepted an unknown transition");
+    }
+    malformed = workspace;
+    malformed.reserved[0] = 1;
+    if (java_remote_parent_receive_ioctl_fence_authorized(&malformed)) {
+        fail("deferred fence accepted nonzero reserved scratch");
+    }
+    malformed = workspace;
+    malformed.guard = k_java_remote_parent_receive_guard_error;
+    if (java_remote_parent_receive_ioctl_fence_authorized(&malformed)) {
+        fail("deferred replacement accepted missing guard authority");
+    }
+
+    seed_generation(&connection);
+    seed_receive_cursor();
+    workspace = deferred_replace_workspace();
+    java_remote_parent_begin_data_receive();
+    if (!owner_cleanup_payload_absent() || find_ambiguity_entry(&stored_state_key)) {
+        fail("could not seed strict-final successor race");
+    }
+    if (!run_deferred_ioctl_generation_fence(&workspace, &connection)) {
+        fail("could not seed deferred successor race fence");
+    }
+    java_remote_parent_receive_cursor_t successor = receive_cursor;
+    successor.request_sequence++;
+    successor.generation = test_replacement_generation;
+    receive_cursor = successor;
+    if (java_remote_parent_complete_receive_ioctl_transition(&workspace, 1) ||
+        memcmp(&receive_cursor, &successor, sizeof(successor)) != 0 || !receive_guard_present ||
+        owner_present || fallback_present || state_present || generation_index_present ||
+        connection_present || cookie_connection_present ||
+        find_ambiguity_entry(&stored_state_key)) {
+        fail("phase C overwrote a foreign successor after strict-final recognition");
+    }
+
+    seed_generation(&connection);
+    seed_receive_cursor();
+    workspace = deferred_replace_workspace();
+    seed_exact_receive_aliases(1);
+    connection_present = 0;
+    ambiguities[0].present = 0;
+    ambiguity_update_failures = 2;
+    if (run_deferred_ioctl_generation_fence(&workspace, &connection) || ambiguity_update_failures ||
+        java_remote_parent_complete_receive_ioctl_transition(&workspace, 0) ||
+        !receive_cursor_present ||
+        receive_cursor.state != k_java_remote_parent_receive_cursor_retiring ||
+        receive_guard_present || find_ambiguity_entry(&stored_state_key) || !owner_present ||
+        !fallback_present || !state_present || stored_state.aliases != 1 ||
+        !generation_index_present || connection_present || !cookie_connection_present) {
+        fail("bounded deferred M failure exposed a guard-free VALID cursor");
+    }
+    current_task = test_child;
+    java_remote_parent_response_t deferred_missing_marker_response = stored_state.response;
+    enum java_remote_parent_status deferred_missing_marker_status =
+        java_remote_parent_retrieve_for_connection(&deferred_missing_marker_response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie);
+    if (deferred_missing_marker_status == k_java_remote_parent_status_valid ||
+        deferred_missing_marker_response.status == k_java_remote_parent_status_valid ||
+        !state_present || !generation_index_present || connection_present ||
+        !cookie_connection_present || !task_present) {
+        fail("SDK task TAKE adopted a partial deferred generation without M");
+    }
+    current_task = test_owner;
+    deferred_missing_marker_response = stored_state.response;
+    deferred_missing_marker_status =
+        java_remote_parent_retrieve_for_connection(&deferred_missing_marker_response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_direct,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie);
+    if (deferred_missing_marker_status == k_java_remote_parent_status_valid ||
+        deferred_missing_marker_response.status == k_java_remote_parent_status_valid ||
+        !state_present || !generation_index_present || connection_present ||
+        !cookie_connection_present) {
+        fail("SDK direct TAKE adopted a partial deferred generation without M");
+    }
+
+    seed_generation(&connection);
+    seed_receive_cursor();
+    workspace = deferred_replace_workspace();
+    if (!run_deferred_ioctl_generation_fence(&workspace, &connection)) {
+        fail("could not seed deferred replacement fault");
+    }
+    receive_cursor_update_failures = 1;
+    if (java_remote_parent_complete_receive_ioctl_transition(&workspace, 1) ||
+        receive_cursor_present || receive_guard_present || owner_present || fallback_present ||
+        state_present || generation_index_present || connection_present ||
+        cookie_connection_present || find_ambiguity_entry(&stored_state_key)) {
+        fail("failed deferred replacement did not terminally drain its predecessor");
+    }
+
+    seed_generation(&connection);
+    seed_receive_cursor();
+    workspace = deferred_replace_workspace();
+    if (!run_deferred_ioctl_generation_fence(&workspace, &connection)) {
+        fail("could not seed deferred guard-release fault");
+    }
+    receive_guard_delete_failures = 2;
+    if (java_remote_parent_complete_receive_ioctl_transition(&workspace, 1) ||
+        !receive_cursor_present ||
+        receive_cursor.state != k_java_remote_parent_receive_cursor_retiring ||
+        !receive_guard_present || owner_present || fallback_present || state_present ||
+        generation_index_present || connection_present || cookie_connection_present ||
+        find_ambiguity_entry(&stored_state_key)) {
+        fail("failed deferred guard release exposed a replacement PUBLISHING cursor");
+    }
+
+    seed_generation(&connection);
+    seed_receive_cursor();
+    workspace = (java_remote_parent_receive_ioctl_workspace_t){
+        .cursor = receive_cursor,
+        .socket_cookie = test_socket_cookie,
+        .connection_netns = test_connection_netns,
+        .transition = k_java_remote_parent_receive_ioctl_transition_fence_retire,
+        .guard = k_java_remote_parent_receive_guard_acquired,
+    };
+    if (!run_deferred_ioctl_generation_fence(&workspace, &connection) ||
+        java_remote_parent_complete_receive_ioctl_transition(&workspace, 1) ||
+        receive_cursor_present || receive_guard_present || owner_present || fallback_present ||
+        state_present || generation_index_present || connection_present ||
+        cookie_connection_present || claim_present || detach_guard_present ||
+        find_ambiguity_entry(&stored_state_key)) {
+        fail("deferred RESET did not remove its exact zero-alias generation");
+    }
+
+    seed_generation(&connection);
+    seed_receive_cursor();
+    receive_guard_present = 0;
+    workspace = (java_remote_parent_receive_ioctl_workspace_t){
+        .predecessor = receive_cursor,
+        .socket_cookie = test_socket_cookie,
+        .connection_netns = test_connection_netns,
+        .transition = k_java_remote_parent_receive_ioctl_transition_fence_abort,
+        .guard = k_java_remote_parent_receive_guard_error,
+    };
+    const java_remote_parent_receive_cursor_t guard_error_cursor = receive_cursor;
+    if (!run_deferred_ioctl_generation_fence(&workspace, &connection) ||
+        java_remote_parent_complete_receive_ioctl_transition(&workspace, 1) ||
+        !receive_cursor_present || receive_guard_present ||
+        memcmp(&receive_cursor, &guard_error_cursor, sizeof(receive_cursor)) != 0 ||
+        owner_present || fallback_present || state_present || generation_index_present ||
+        connection_present || cookie_connection_present || claim_present || detach_guard_present ||
+        find_ambiguity_entry(&stored_state_key)) {
+        fail("guard-ERROR RESET failed to clean exact G without cursor mutation");
+    }
+}
+
+static u8 run_close_receive_cursor(u64 socket_cookie,
+                                   const connection_info_t *connection,
+                                   u32 connection_netns,
+                                   u64 connection_netns_cookie) {
+    const u64 invocation_id = 0x7172737475767778ULL;
+    java_remote_parent_close_workspace_t *workspace =
+        java_remote_parent_close_workspace_acquire(invocation_id);
+    if (!workspace) {
+        return 0;
+    }
+    workspace->socket_cookie = socket_cookie;
+    workspace->connection_netns_cookie = connection_netns_cookie;
+    workspace->connection_netns = connection_netns;
+    workspace->connection_valid = connection != NULL;
+    if (connection) {
+        workspace->process_connection.conn = *connection;
+    }
+    const u8 result = java_remote_parent_close_receive_cursor(workspace, invocation_id);
+    last_close_workspace_cursor = workspace->cursor;
+    java_remote_parent_close_workspace_release(workspace, invocation_id);
+    return result;
+}
+
+static int close_workspace_payload_zero(void) {
+    const java_remote_parent_close_workspace_t zero = {0};
+    return memcmp(&close_workspace.socket_cookie,
+                  &zero.socket_cookie,
+                  sizeof(close_workspace) -
+                      offsetof(java_remote_parent_close_workspace_t, socket_cookie)) == 0;
+}
+
+static void test_close_workspace_is_guarded_and_zeroized(void) {
+    const u64 invocation_id = 0x1112131415161718ULL;
+    const u64 foreign_invocation_id = 0x2122232425262728ULL;
+
+    memset(&close_workspace, 0xa5, sizeof(close_workspace));
+    close_workspace.invocation_id = 0;
+    java_remote_parent_close_workspace_t *workspace =
+        java_remote_parent_close_workspace_acquire(invocation_id);
+    if (workspace != &close_workspace || workspace->invocation_id != invocation_id ||
+        !close_workspace_payload_zero()) {
+        fail("close workspace acquisition did not publish ownership before zeroizing payload");
+    }
+
+    memset(&workspace->socket_cookie,
+           0x5a,
+           sizeof(*workspace) - offsetof(java_remote_parent_close_workspace_t, socket_cookie));
+    const java_remote_parent_close_workspace_t occupied = *workspace;
+    if (java_remote_parent_close_workspace_acquire(invocation_id) ||
+        memcmp(workspace, &occupied, sizeof(occupied)) != 0 ||
+        java_remote_parent_close_workspace_acquire(foreign_invocation_id) ||
+        memcmp(workspace, &occupied, sizeof(occupied)) != 0) {
+        fail("close workspace allowed nested reuse or mutated the live owner payload");
+    }
+    java_remote_parent_close_workspace_release(workspace, foreign_invocation_id);
+    if (memcmp(workspace, &occupied, sizeof(occupied)) != 0) {
+        fail("foreign close workspace release mutated the live owner payload");
+    }
+    java_remote_parent_close_workspace_release(workspace, invocation_id);
+    const java_remote_parent_close_workspace_t zero = {0};
+    if (memcmp(&close_workspace, &zero, sizeof(zero)) != 0) {
+        fail("close workspace owner release did not clear payload before ownership");
+    }
+
+    workspace = java_remote_parent_close_workspace_acquire(invocation_id);
+    if (workspace != &close_workspace || workspace->invocation_id != invocation_id ||
+        !close_workspace_payload_zero()) {
+        fail("close workspace owner could not reacquire a clean slot");
+    }
+    workspace->socket_cookie = test_socket_cookie;
+    java_remote_parent_close_workspace_release(workspace, invocation_id);
+    if (memcmp(&close_workspace, &zero, sizeof(zero)) != 0) {
+        fail("reacquired close workspace did not return to an all-zero state");
+    }
+
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    seed_receive_cursor();
+    memset(&close_workspace, 0x6b, sizeof(close_workspace));
+    close_workspace.invocation_id = foreign_invocation_id;
+    const java_remote_parent_close_workspace_t busy_workspace = close_workspace;
+    const java_remote_parent_receive_cursor_t busy_cursor = receive_cursor;
+    const java_remote_parent_receive_cursor_t busy_guard = receive_guard;
+    const java_remote_parent_owner_t busy_owner = stored_owner;
+    const java_remote_parent_state_t busy_state = stored_state;
+    const java_remote_parent_generation_index_t busy_index = stored_generation_index;
+    const java_remote_parent_connection_t busy_connection = stored_connection;
+    const java_remote_parent_connection_t busy_cookie_connection = stored_cookie_connection;
+    const java_remote_parent_response_t busy_fallback = stored_fallback;
+    const ambiguity_entry_t busy_ambiguities[3] = {ambiguities[0], ambiguities[1], ambiguities[2]};
+    if (run_close_receive_cursor(
+            test_socket_cookie, &connection, test_connection_netns, test_connection_netns_cookie) ||
+        memcmp(&close_workspace, &busy_workspace, sizeof(busy_workspace)) != 0 ||
+        memcmp(&receive_cursor, &busy_cursor, sizeof(busy_cursor)) != 0 ||
+        memcmp(&receive_guard, &busy_guard, sizeof(busy_guard)) != 0 ||
+        memcmp(&stored_owner, &busy_owner, sizeof(busy_owner)) != 0 ||
+        memcmp(&stored_state, &busy_state, sizeof(busy_state)) != 0 ||
+        memcmp(&stored_generation_index, &busy_index, sizeof(busy_index)) != 0 ||
+        memcmp(&stored_connection, &busy_connection, sizeof(busy_connection)) != 0 ||
+        memcmp(&stored_cookie_connection,
+               &busy_cookie_connection,
+               sizeof(busy_cookie_connection)) != 0 ||
+        memcmp(&stored_fallback, &busy_fallback, sizeof(busy_fallback)) != 0 ||
+        memcmp(ambiguities, busy_ambiguities, sizeof(busy_ambiguities)) != 0 ||
+        !receive_cursor_present || !receive_guard_present || !owner_present || !state_present ||
+        !generation_index_present || !connection_present || !cookie_connection_present ||
+        !fallback_present || unexpected_update || unexpected_delete) {
+        fail("busy close workspace path mutated cursor or generation authority");
+    }
+    java_remote_parent_close_workspace_release(&close_workspace, foreign_invocation_id);
+    if (memcmp(&close_workspace, &zero, sizeof(zero)) != 0) {
+        fail("busy close workspace fixture did not release cleanly");
+    }
+}
+
+static void test_close_final_form_rejects_zero_generation_cursors(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    owner_present = 0;
+    state_present = 0;
+    generation_index_present = 0;
+    connection_present = 0;
+    cookie_connection_present = 0;
+    fallback_present = 0;
+    claim_present = 0;
+    detach_guard_present = 0;
+    terminal_present = 0;
+    memset(ambiguities, 0, sizeof(ambiguities));
+
+    java_remote_parent_receive_cursor_t cursor =
+        java_remote_parent_receive_cursor_publishing_identity(&test_owner,
+                                                              test_process_incarnation,
+                                                              0x1020304050607080ULL,
+                                                              0x1122334455667788ULL,
+                                                              0x8877665544332211ULL);
+    if (java_remote_parent_receive_generation_already_fenced(&cursor,
+                                                             &connection,
+                                                             test_connection_netns,
+                                                             test_connection_netns_cookie,
+                                                             test_socket_cookie)) {
+        fail("final-form recognition accepted generation-zero PUBLISHING");
+    }
+    cursor.state = k_java_remote_parent_receive_cursor_retiring;
+    if (java_remote_parent_receive_generation_already_fenced(&cursor,
+                                                             &connection,
+                                                             test_connection_netns,
+                                                             test_connection_netns_cookie,
+                                                             test_socket_cookie)) {
+        fail("final-form recognition accepted generation-zero RETIRING");
+    }
+}
+
+static void test_close_retiring_retries_are_state_exact(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+
+    // Baseline cleanup has already established terminal-free final form. A
+    // pre-existing RETIRING cursor must be recognized and survive one cursor
+    // delete fault without attempting a second state transition.
+    seed_generation(&connection);
+    seed_receive_cursor();
+    java_remote_parent_cleanup(&test_owner);
+    receive_cursor.state = k_java_remote_parent_receive_cursor_retiring;
+    receive_guard.state = k_java_remote_parent_receive_cursor_retiring;
+    receive_cursor_delete_failures = 1;
+    if (!run_close_receive_cursor(
+            test_socket_cookie, &connection, test_connection_netns, test_connection_netns_cookie) ||
+        receive_cursor_present || receive_guard_present || receive_cursor_delete_failures ||
+        last_close_workspace_cursor.state != k_java_remote_parent_receive_cursor_retiring ||
+        find_ambiguity_entry(&stored_state_key) || unexpected_update || unexpected_delete) {
+        fail("close did not recognize and retry an exact pre-existing RETIRING cursor");
+    }
+
+    // If RETIRING publication fails, the close caller must keep its immutable
+    // VALID snapshot. Persistent guard-delete faults then leave both exact map
+    // records byte-for-byte unchanged instead of inventing a RETIRING identity.
+    seed_generation(&connection);
+    seed_receive_cursor();
+    const java_remote_parent_receive_cursor_t expected_cursor = receive_cursor;
+    const java_remote_parent_receive_cursor_t expected_guard = receive_guard;
+    receive_guard_delete_failures = 4;
+    receive_cursor_update_failures = 1;
+    if (run_close_receive_cursor(
+            test_socket_cookie, &connection, test_connection_netns, test_connection_netns_cookie) ||
+        !receive_cursor_present || !receive_guard_present || receive_guard_delete_failures ||
+        receive_cursor_update_failures ||
+        memcmp(&receive_cursor, &expected_cursor, sizeof(expected_cursor)) != 0 ||
+        memcmp(&receive_guard, &expected_guard, sizeof(expected_guard)) != 0 ||
+        memcmp(&last_close_workspace_cursor, &expected_cursor, sizeof(expected_cursor)) != 0 ||
+        unexpected_update || unexpected_delete) {
+        fail("failed close RETIRING publication mutated its immutable VALID identity");
+    }
+}
+
+static void test_independent_close_hook_orders_are_exactly_fenced(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+
+    // Java close first: execute the production close branch. RESET removes the
+    // direct zero-alias generation and terminally deletes cursor plus guard.
+    // The baseline close cleanup that follows is an idempotent no-op.
+    seed_generation(&connection);
+    seed_receive_cursor();
+    if (!run_close_receive_cursor(test_socket_cookie,
+                                  &connection,
+                                  test_connection_netns,
+                                  stored_connection.netns_cookie) ||
+        receive_cursor_present || receive_guard_present || owner_present || fallback_present ||
+        state_present || generation_index_present || connection_present ||
+        cookie_connection_present || claim_present || detach_guard_present || terminal_present ||
+        find_ambiguity_entry(&stored_state_key)) {
+        fail("production Java-first close did not fence and delete cursor plus guard");
+    }
+    java_remote_parent_cleanup(&test_owner);
+    if (receive_cursor_present || receive_guard_present || owner_present || fallback_present ||
+        state_present || generation_index_present || connection_present ||
+        cookie_connection_present || claim_present || detach_guard_present || terminal_present ||
+        find_ambiguity_entry(&stored_state_key) || unexpected_update || unexpected_delete) {
+        fail("baseline cleanup after Java-first close recreated generation state");
+    }
+
+    // Baseline close first: complete terminal-free cleanup is a strict
+    // postcondition. The production Java branch must remove cursor plus guard
+    // without recreating M+.
+    seed_generation(&connection);
+    seed_receive_cursor();
+    java_remote_parent_cleanup(&test_owner);
+    if (!run_close_receive_cursor(test_socket_cookie,
+                                  &connection,
+                                  test_connection_netns,
+                                  stored_connection.netns_cookie) ||
+        receive_cursor_present || receive_guard_present || owner_present || fallback_present ||
+        state_present || generation_index_present || connection_present ||
+        cookie_connection_present || claim_present || detach_guard_present || terminal_present ||
+        find_ambiguity_entry(&stored_state_key) || unexpected_update || unexpected_delete) {
+        fail("production Java close did not accept baseline-first terminal-free cleanup");
+    }
+
+    // A completed TAKE deliberately retains its exact terminal. The Java hook
+    // must recognize that final form and delete cursor plus guard without M+.
+    seed_completed_exact_receive_take(&connection);
+    seed_receive_cursor();
+    if (!run_close_receive_cursor(test_socket_cookie,
+                                  &connection,
+                                  test_connection_netns,
+                                  stored_connection.netns_cookie) ||
+        receive_cursor_present || receive_guard_present ||
+        find_ambiguity_entry(&stored_state_key) || !terminal_present || unexpected_update ||
+        unexpected_delete) {
+        fail("production Java close did not accept baseline-first completed TAKE");
+    }
+
+    // An incomplete baseline cleanup is neither accepted final form. The
+    // production branch must preserve its surviving connection under M+ while
+    // still deleting cursor plus guard.
+    seed_generation(&connection);
+    seed_receive_cursor();
+    owner_present = 0;
+    fallback_present = 0;
+    state_present = 0;
+    generation_index_present = 0;
+    cookie_connection_present = 0;
+    ambiguities[0].present = 0;
+    if (!run_close_receive_cursor(test_socket_cookie,
+                                  &connection,
+                                  test_connection_netns,
+                                  stored_connection.netns_cookie) ||
+        receive_cursor_present || receive_guard_present || !find_ambiguity(&stored_state_key) ||
+        !connection_present || unexpected_update || unexpected_delete) {
+        fail("production partial-close branch did not fence fail closed with M+");
+    }
+
+    // A malformed/legacy partial generation can lack the normal pre-reserved
+    // M slot, and a saturated map can then reject insertion. The generation is
+    // already non-authoritative without clean M reservation; final fput must
+    // still reclaim cursor plus guard because they cannot protect SDK lookup.
+    seed_generation(&connection);
+    seed_receive_cursor();
+    owner_present = 0;
+    fallback_present = 0;
+    state_present = 0;
+    generation_index_present = 0;
+    cookie_connection_present = 0;
+    ambiguities[0].present = 0;
+    ambiguity_update_failures = 1;
+    if (!run_close_receive_cursor(test_socket_cookie,
+                                  &connection,
+                                  test_connection_netns,
+                                  stored_connection.netns_cookie) ||
+        receive_cursor_present || receive_guard_present || ambiguity_update_failures ||
+        find_ambiguity_entry(&stored_state_key) || !connection_present || unexpected_update ||
+        unexpected_delete) {
+        fail("failed M insertion retained final-fput cursor resources");
+    }
+
+    // The production branch gives exact non-allocating hash deletes bounded
+    // retries. Two injected guard failures are recovered after RETIRING.
+    seed_generation(&connection);
+    seed_receive_cursor();
+    java_remote_parent_cleanup(&test_owner);
+    receive_guard_delete_failures = 2;
+    if (!run_close_receive_cursor(test_socket_cookie,
+                                  &connection,
+                                  test_connection_netns,
+                                  stored_connection.netns_cookie) ||
+        receive_cursor_present || receive_guard_present || receive_guard_delete_failures ||
+        find_ambiguity_entry(&stored_state_key) || unexpected_update || unexpected_delete) {
+        fail("bounded close retries did not recover guard-delete faults");
+    }
+
+    // Two injected cursor failures likewise converge without a userspace
+    // cursor sweeper and without recreating a generation marker.
+    seed_generation(&connection);
+    seed_receive_cursor();
+    java_remote_parent_cleanup(&test_owner);
+    receive_cursor_delete_failures = 2;
+    if (!run_close_receive_cursor(test_socket_cookie,
+                                  &connection,
+                                  test_connection_netns,
+                                  stored_connection.netns_cookie) ||
+        receive_cursor_present || receive_guard_present || receive_cursor_delete_failures ||
+        find_ambiguity_entry(&stored_state_key) || unexpected_update || unexpected_delete) {
+        fail("bounded close retries did not recover cursor-delete faults");
+    }
+
+    // If RETIRING publication itself faults after the first delete attempt,
+    // retry the original exact cursor identity; final fput still drains both
+    // resources without depending on a later socket event.
+    seed_generation(&connection);
+    seed_receive_cursor();
+    java_remote_parent_cleanup(&test_owner);
+    receive_guard_delete_failures = 1;
+    receive_cursor_update_failures = 1;
+    if (!run_close_receive_cursor(test_socket_cookie,
+                                  &connection,
+                                  test_connection_netns,
+                                  stored_connection.netns_cookie) ||
+        receive_cursor_present || receive_guard_present || receive_guard_delete_failures ||
+        receive_cursor_update_failures || find_ambiguity_entry(&stored_state_key) ||
+        unexpected_update || unexpected_delete) {
+        fail("close retry did not recover a RETIRING update fault");
+    }
+}
+
 static void test_exact_receive_detach_preserves_post_guard_successors(void) {
     const connection_info_t connection = {.s_port = 1234, .d_port = 443};
 
@@ -6156,7 +8225,7 @@ static void test_exact_receive_connection_delete_rechecks_late_cookie(void) {
 }
 
 static java_remote_parent_resolution_t finish_resolution(void) {
-    return (java_remote_parent_resolution_t){
+    java_remote_parent_resolution_t resolution = {
         .key = stored_state_key,
         .indexed =
             {
@@ -6167,6 +8236,15 @@ static java_remote_parent_resolution_t finish_resolution(void) {
         .observed_monotime_ns = test_observed_monotime_ns,
         .found = 1,
     };
+    const java_remote_parent_alias_replay_key_t replay_key = java_remote_parent_alias_replay_key(
+        &stored_state_key, test_observed_monotime_ns, test_process_incarnation);
+    const alias_replay_entry_t *replay = find_alias_replay(&replay_key);
+    if (replay) {
+        java_remote_parent_alias_replay_binding_snapshot(&resolution.replay_binding,
+                                                         &replay->value);
+        resolution.replay_binding_found = 1;
+    }
+    return resolution;
 }
 
 static void seed_finish_claim(enum java_remote_parent_lifecycle lifecycle) {
@@ -6180,6 +8258,17 @@ static void seed_finish_claim(enum java_remote_parent_lifecycle lifecycle) {
 }
 
 static void finish_seeded_generation(enum java_remote_parent_lifecycle lifecycle) {
+    if (state_present && stored_state.aliases) {
+        const java_remote_parent_alias_replay_key_t replay_key =
+            java_remote_parent_alias_replay_key(
+                &stored_state_key, test_observed_monotime_ns, test_process_incarnation);
+        if (!find_alias_replay(&replay_key)) {
+            seed_alias_replay(&stored_state_key,
+                              test_observed_monotime_ns,
+                              test_process_incarnation,
+                              stored_state.aliases);
+        }
+    }
     const java_remote_parent_resolution_t resolution = finish_resolution();
     java_remote_parent_claim_t owned_claim = stored_claim;
     java_remote_parent_finish_generation(
@@ -6566,10 +8655,151 @@ static void test_live_task_finish_claim_release_preserves_repeat_status(void) {
     }
 }
 
+static void test_partial_task_finish_uses_durable_replay_binding(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    seed_finish_claim(k_java_remote_parent_lifecycle_consumed);
+    state_delete_failures = 1;
+    finish_seeded_generation(k_java_remote_parent_lifecycle_consumed);
+    if (state_delete_failures || !state_present || connection_present ||
+        cookie_connection_present || !claim_present || !detach_guard_present || !task_present ||
+        !exact_test_alias_replay() ||
+        exact_test_alias_replay()->value.lifecycle != k_java_remote_parent_lifecycle_consumed) {
+        fail("could not seed a partial aliased FINISH with durable replay binding");
+    }
+    current_task = test_child;
+    java_remote_parent_response_t response = {0};
+    const enum java_remote_parent_status exact_status =
+        java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie);
+    if (exact_status != k_java_remote_parent_status_already_consumed ||
+        response.status != k_java_remote_parent_status_already_consumed) {
+        fail("partial aliased FINISH lost exact bound repeat status");
+    }
+    const java_remote_parent_response_t stale = stored_state.response;
+    connection_info_t wrong_connection = connection;
+    wrong_connection.d_port++;
+    if (!task_retrieval_rejects_authority(&stale,
+                                          &wrong_connection,
+                                          test_connection_netns,
+                                          test_generation,
+                                          test_socket_cookie,
+                                          test_generation) ||
+        !task_retrieval_rejects_authority(&stale,
+                                          &connection,
+                                          test_connection_netns + 1,
+                                          test_generation,
+                                          test_socket_cookie,
+                                          test_generation) ||
+        !task_retrieval_rejects_authority(&stale,
+                                          &connection,
+                                          test_connection_netns,
+                                          test_generation,
+                                          test_replacement_socket_cookie,
+                                          test_generation) ||
+        !state_present || !claim_present || !detach_guard_present || !task_present ||
+        unexpected_update || unexpected_delete) {
+        fail("partial aliased FINISH accepted authority outside durable replay binding");
+    }
+}
+
 static alias_replay_entry_t *exact_test_alias_replay(void) {
     const java_remote_parent_alias_replay_key_t key = java_remote_parent_alias_replay_key(
         &stored_state_key, test_observed_monotime_ns, test_process_incarnation);
     return find_alias_replay(&key);
+}
+
+static alias_replay_entry_t *seed_retained_task_finish(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    seed_finish_claim(k_java_remote_parent_lifecycle_consumed);
+    exact_claim_delete_failures = 1;
+    finish_seeded_generation(k_java_remote_parent_lifecycle_consumed);
+    alias_replay_entry_t *replay = exact_test_alias_replay();
+    if (exact_claim_delete_failures || !finish_generation_artifacts_absent() || !task_present ||
+        !exact_finish_terminal_present(k_java_remote_parent_lifecycle_consumed) ||
+        !exact_finish_claim_guard_tail(&stored_state_key,
+                                       k_java_remote_parent_lifecycle_consumed) ||
+        !replay || !replay->value.references ||
+        replay->value.lifecycle != k_java_remote_parent_lifecycle_consumed || unexpected_update ||
+        unexpected_delete) {
+        fail("could not seed retained task finish replay fixture");
+    }
+    return replay;
+}
+
+static void assert_malformed_retained_task_replay_rejected(alias_replay_entry_t *replay,
+                                                           const char *message) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    const java_remote_parent_alias_replay_t replay_before = replay->value;
+    const java_remote_parent_claim_t claim_before = stored_claim;
+    const java_remote_parent_claim_t guard_before = stored_detach_guard;
+    const java_remote_parent_terminal_t terminal_before = stored_terminal;
+    const java_remote_parent_task_t task_before = stored_task;
+    current_task = test_child;
+    java_remote_parent_response_t response = {0};
+    const enum java_remote_parent_status status =
+        java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie);
+    if (status == k_java_remote_parent_status_valid ||
+        status == k_java_remote_parent_status_already_consumed || response.status != status ||
+        !replay->present || memcmp(&replay->value, &replay_before, sizeof(replay_before)) != 0 ||
+        !claim_present || memcmp(&stored_claim, &claim_before, sizeof(claim_before)) != 0 ||
+        !detach_guard_present ||
+        memcmp(&stored_detach_guard, &guard_before, sizeof(guard_before)) != 0 ||
+        !terminal_present ||
+        memcmp(&stored_terminal, &terminal_before, sizeof(terminal_before)) != 0 || !task_present ||
+        memcmp(&stored_task, &task_before, sizeof(task_before)) != 0 || unexpected_update ||
+        unexpected_delete) {
+        fail(message);
+    }
+}
+
+static void test_retained_task_finish_requires_exact_final_replay(void) {
+    alias_replay_entry_t *replay = seed_retained_task_finish();
+    replay->value.references = 0;
+    assert_malformed_retained_task_replay_rejected(
+        replay, "zero-reference final replay authorized a retained task outcome");
+
+    replay = seed_retained_task_finish();
+    replay->value.lifecycle = k_java_remote_parent_lifecycle_active;
+    assert_malformed_retained_task_replay_rejected(
+        replay, "active replay authorized a retained task outcome");
+
+    replay = seed_retained_task_finish();
+    replay->value.lifecycle = k_java_remote_parent_lifecycle_publishing;
+    replay->value.desired_lifecycle = k_java_remote_parent_lifecycle_consumed;
+    assert_malformed_retained_task_replay_rejected(
+        replay, "publishing replay authorized a retained task outcome");
+
+    replay = seed_retained_task_finish();
+    replay->value.lifecycle = k_java_remote_parent_lifecycle_discarded;
+    assert_malformed_retained_task_replay_rejected(
+        replay, "mismatched final replay lifecycle authorized a retained task outcome");
+
+    replay = seed_retained_task_finish();
+    stored_terminal.lifecycle = k_java_remote_parent_lifecycle_discarded;
+    assert_malformed_retained_task_replay_rejected(
+        replay, "mismatched terminal lifecycle authorized a retained task outcome");
+
+    replay = seed_retained_task_finish();
+    stored_claim.reserved[0] = k_java_remote_parent_lifecycle_discarded;
+    assert_malformed_retained_task_replay_rejected(
+        replay, "mismatched cleanup-claim lifecycle authorized a retained task outcome");
 }
 
 static void seed_two_task_aliases(const connection_info_t *connection) {
@@ -6736,12 +8966,8 @@ static void test_tagged_final_alias_replay_fails_closed(void) {
     seed_exact_receive_aliases(1);
     alias_replay_entry_t *replay = seed_alias_replay(
         &stored_state_key, test_observed_monotime_ns, test_process_incarnation, 1);
-    replay->value = (java_remote_parent_alias_replay_t){
-        .transition_monotime_ns = test_now_ns,
-        .references = 1,
-        .lifecycle = k_java_remote_parent_lifecycle_consumed,
-        .producer_tag = k_java_remote_parent_go_producer_tag,
-    };
+    replay->value = test_alias_replay_value(
+        1, k_java_remote_parent_lifecycle_consumed, 0, k_java_remote_parent_go_producer_tag);
     const java_remote_parent_alias_replay_t tagged_final = replay->value;
     owner_present = 0;
     state_present = 0;
@@ -6775,11 +9001,8 @@ static void test_zero_reference_publishing_replay_fails_closed(void) {
     seed_exact_receive_aliases(1);
     alias_replay_entry_t *replay = seed_alias_replay(
         &stored_state_key, test_observed_monotime_ns, test_process_incarnation, 0);
-    replay->value = (java_remote_parent_alias_replay_t){
-        .transition_monotime_ns = test_now_ns,
-        .lifecycle = k_java_remote_parent_lifecycle_publishing,
-        .desired_lifecycle = k_java_remote_parent_lifecycle_consumed,
-    };
+    replay->value = test_alias_replay_value(
+        0, k_java_remote_parent_lifecycle_publishing, k_java_remote_parent_lifecycle_consumed, 0);
     const java_remote_parent_alias_replay_t zero_reference_publishing = replay->value;
     stored_claim_key = stored_state_key;
     stored_claim = (java_remote_parent_claim_t){
@@ -7061,6 +9284,29 @@ static void test_replay_transition_failure_retains_finish_fences(void) {
     }
 }
 
+static void test_replay_binding_substitution_retains_finish_fences(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    seed_exact_receive_aliases(1);
+    alias_replay_entry_t *replay = seed_alias_replay(
+        &stored_state_key, test_observed_monotime_ns, test_process_incarnation, 1);
+    const u64 original_socket_cookie = replay->value.socket_cookie;
+    seed_finish_claim(k_java_remote_parent_lifecycle_consumed);
+    replace_alias_replay_binding_during_finish_lookup = 1;
+    finish_seeded_generation(k_java_remote_parent_lifecycle_consumed);
+    if (replace_alias_replay_binding_during_finish_lookup ||
+        !finish_generation_artifacts_present() ||
+        !exact_finish_terminal_present(k_java_remote_parent_lifecycle_consumed) ||
+        !exact_finish_fences_retained(&stored_state_key, k_java_remote_parent_lifecycle_consumed) ||
+        !replay->present || replay->value.references != 1 ||
+        replay->value.lifecycle != k_java_remote_parent_lifecycle_consumed ||
+        replay->value.transition_monotime_ns != test_now_ns ||
+        replay->value.socket_cookie != original_socket_cookie + 1 || unexpected_update ||
+        unexpected_delete) {
+        fail("replay binding substitution crossed FINISH barriers");
+    }
+}
+
 static void test_stale_retain_transition_is_overcount_only(void) {
     const connection_info_t connection = {.s_port = 1234, .d_port = 443};
     seed_generation(&connection);
@@ -7239,6 +9485,7 @@ int main(void) {
     test_finish_connection_matcher_is_field_exact();
     test_compact_finish_shapes_match_reference();
     test_claim_status_packed_classifier_matches_reference();
+    test_capture_workspaces_are_guarded_and_zeroized();
     test_capture_claim_race_releases_published_alias();
     test_relay_claim_race_preserves_existing_task_alias();
     test_capture_transfer_survives_claim_eviction();
@@ -7262,6 +9509,10 @@ int main(void) {
     test_captured_generation_survives_owner_reuse();
     test_alias_observation_rejects_same_generation_reuse();
     test_detached_task_bridge_preserves_same_socket_replacement();
+    test_detached_successor_full_proof_is_fail_closed();
+    test_detached_pre_ack_binding_and_successor_alias_are_live();
+    test_direct_take_with_alias_publishes_bound_sibling_replay();
+    test_connection_bound_direct_take_requires_nonzero_generation();
     test_task_claim_binding_rejects_reserved_state();
     test_detached_zero_cleanup_quarantines_retain_race();
     test_detached_zero_cleanup_retains_adoption_artifacts();
@@ -7300,6 +9551,13 @@ int main(void) {
     test_failed_guard_acquisition_preserves_identical_foreign_guard();
     test_exact_receive_zero_alias_claim_failures_are_fail_closed();
     test_exact_receive_take_completion_requires_strict_postconditions();
+    test_unacked_publishing_cleanup_is_shallow_and_exact();
+    test_parser_failure_uses_pre_reserved_ambiguity_fence();
+    test_deferred_ioctl_transition_is_exact_and_fail_closed();
+    test_close_workspace_is_guarded_and_zeroized();
+    test_close_final_form_rejects_zero_generation_cursors();
+    test_close_retiring_retries_are_state_exact();
+    test_independent_close_hook_orders_are_exactly_fenced();
     test_exact_receive_detach_preserves_post_guard_successors();
     test_zero_alias_reset_final_guard_release_preserves_successor();
     test_aliased_reset_final_guard_release_preserves_successor();
@@ -7310,6 +9568,8 @@ int main(void) {
     test_finish_release_failures_are_fenced();
     test_finish_final_guard_release_preserves_successor();
     test_live_task_finish_claim_release_preserves_repeat_status();
+    test_partial_task_finish_uses_durable_replay_binding();
+    test_retained_task_finish_requires_exact_final_replay();
     test_sibling_task_replays_after_successor_terminal();
     test_missing_alias_replay_overloads_before_exact_claim();
     test_alias_replay_capacity_rejects_retain_before_publication();
@@ -7321,6 +9581,7 @@ int main(void) {
     test_replay_binding_mismatch_is_missing_and_nonmutating();
     test_replay_task_rebind_fails_closed_without_retiring_authority();
     test_replay_transition_failure_retains_finish_fences();
+    test_replay_binding_substitution_retains_finish_fences();
     test_stale_retain_transition_is_overcount_only();
     test_ambiguous_alias_commit_replays_ambiguous();
     test_ttl_boundary_promotes_stale_and_replays_consumed();

@@ -31,18 +31,27 @@ static const u64 test_process_incarnation = 0x1112131415161718ULL;
 static const u64 test_lifecycle_id = 0x2122232425262728ULL;
 static const u64 test_request_sequence = 0x3132333435363738ULL;
 static const u64 test_data_signal_nonce = 0x4142434445464748ULL;
+static const pid_key_t replacement_owner = {.tid = 202, .pid = 10, .ns = 7};
 
-static u64 stored_socket_cookie;
-static java_remote_parent_receive_cursor_t stored_cursor;
+static u64 cursor_cookie;
+static java_remote_parent_receive_cursor_t cursor_value;
 static int cursor_present;
-static int update_failure;
-static int evict_on_update;
-static int delete_failure;
-static int update_calls;
-static int delete_calls;
-static int lookup_calls;
-static int corrupt_on_lookup;
-static unsigned long long observed_update_flags;
+static u64 guard_cookie;
+static java_remote_parent_receive_cursor_t guard_value;
+static int guard_present;
+static int cursor_update_failure;
+static int guard_update_failure;
+static int cursor_delete_failure;
+static int guard_delete_failure;
+static int replace_guard_on_delete_failure;
+static int cursor_update_calls;
+static int guard_update_calls;
+static int cursor_delete_calls;
+static int guard_delete_calls;
+static int cursor_lookup_calls;
+static int corrupt_cursor_lookup;
+static unsigned long long cursor_update_flags;
+static unsigned long long guard_update_flags;
 
 static void fail(const char *message) {
     fprintf(stderr, "FAIL: %s\n", message);
@@ -55,405 +64,625 @@ static int same_cursor(const java_remote_parent_receive_cursor_t *left,
 }
 
 static java_remote_parent_receive_cursor_t
-cursor(u64 lifecycle_id, u64 request_sequence, u64 generation) {
-    return (java_remote_parent_receive_cursor_t){
-        .owner = test_owner,
-        .process_incarnation = test_process_incarnation,
-        .lifecycle_id = lifecycle_id,
-        .request_sequence = request_sequence,
-        .data_signal_nonce = test_data_signal_nonce,
-        .generation = generation,
-    };
+publishing_for(const pid_key_t *owner, u64 lifecycle_id, u64 request_sequence, u64 nonce) {
+    return java_remote_parent_receive_cursor_publishing_identity(
+        owner, test_process_incarnation, lifecycle_id, request_sequence, nonce);
+}
+
+static java_remote_parent_receive_cursor_t publishing(void) {
+    return publishing_for(
+        &test_owner, test_lifecycle_id, test_request_sequence, test_data_signal_nonce);
+}
+
+static java_remote_parent_receive_cursor_t committed(u64 generation) {
+    java_remote_parent_receive_cursor_t value = publishing();
+    value.state = k_java_remote_parent_receive_cursor_valid;
+    value.generation = generation;
+    return value;
+}
+
+static java_remote_parent_receive_cursor_t
+retiring_from(const java_remote_parent_receive_cursor_t *value) {
+    return java_remote_parent_receive_cursor_retiring_identity(value);
 }
 
 static void reset(void) {
-    stored_socket_cookie = 0;
-    memset(&stored_cursor, 0, sizeof(stored_cursor));
+    cursor_cookie = 0;
+    memset(&cursor_value, 0, sizeof(cursor_value));
     cursor_present = 0;
-    update_failure = 0;
-    evict_on_update = 0;
-    delete_failure = 0;
-    update_calls = 0;
-    delete_calls = 0;
-    lookup_calls = 0;
-    corrupt_on_lookup = 0;
-    observed_update_flags = ~0ULL;
+    guard_cookie = 0;
+    memset(&guard_value, 0, sizeof(guard_value));
+    guard_present = 0;
+    cursor_update_failure = 0;
+    guard_update_failure = 0;
+    cursor_delete_failure = 0;
+    guard_delete_failure = 0;
+    replace_guard_on_delete_failure = 0;
+    cursor_update_calls = 0;
+    guard_update_calls = 0;
+    cursor_delete_calls = 0;
+    guard_delete_calls = 0;
+    cursor_lookup_calls = 0;
+    corrupt_cursor_lookup = 0;
+    cursor_update_flags = ~0ULL;
+    guard_update_flags = ~0ULL;
 }
 
-static void seed(const java_remote_parent_receive_cursor_t *value) {
-    stored_socket_cookie = test_socket_cookie;
-    stored_cursor = *value;
+static void seed_cursor(const java_remote_parent_receive_cursor_t *value) {
+    cursor_cookie = test_socket_cookie;
+    cursor_value = *value;
     cursor_present = 1;
 }
 
+static void seed_guard(const java_remote_parent_receive_cursor_t *value) {
+    guard_cookie = test_socket_cookie;
+    guard_value = *value;
+    guard_present = 1;
+}
+
 static void *test_map_lookup(void *map, const void *key) {
-    if (map != &java_remote_parent_receive_cursors || !cursor_present ||
-        *(const u64 *)key != stored_socket_cookie) {
-        return NULL;
+    const u64 cookie = *(const u64 *)key;
+    if (map == &jrp_recv_cur) {
+        if (!cursor_present || cookie != cursor_cookie) {
+            return NULL;
+        }
+        cursor_lookup_calls++;
+        if (corrupt_cursor_lookup == cursor_lookup_calls) {
+            cursor_value.request_sequence++;
+        }
+        return &cursor_value;
     }
-    lookup_calls++;
-    if (corrupt_on_lookup == lookup_calls) {
-        stored_cursor.request_sequence++;
+    if (map == &jrp_recv_guard && guard_present && cookie == guard_cookie) {
+        return &guard_value;
     }
-    return &stored_cursor;
+    return NULL;
 }
 
 static long
 test_map_update(void *map, const void *key, const void *value, unsigned long long flags) {
-    if (map != &java_remote_parent_receive_cursors) {
-        return -1;
+    const u64 cookie = *(const u64 *)key;
+    if (map == &jrp_recv_cur) {
+        cursor_update_calls++;
+        cursor_update_flags = flags;
+        if (cursor_update_failure ||
+            (flags == BPF_NOEXIST && cursor_present && cookie == cursor_cookie) ||
+            (flags == BPF_EXIST && (!cursor_present || cookie != cursor_cookie))) {
+            return -1;
+        }
+        cursor_cookie = cookie;
+        cursor_value = *(const java_remote_parent_receive_cursor_t *)value;
+        cursor_present = 1;
+        return 0;
     }
-    update_calls++;
-    observed_update_flags = flags;
-    if (evict_on_update) {
-        cursor_present = 0;
-        return -1;
+    if (map == &jrp_recv_guard) {
+        guard_update_calls++;
+        guard_update_flags = flags;
+        if (guard_update_failure || flags != BPF_NOEXIST ||
+            (guard_present && cookie == guard_cookie)) {
+            return -1;
+        }
+        guard_cookie = cookie;
+        guard_value = *(const java_remote_parent_receive_cursor_t *)value;
+        guard_present = 1;
+        return 0;
     }
-    if (update_failure) {
-        return -1;
-    }
-    if (flags == BPF_EXIST && (!cursor_present || *(const u64 *)key != stored_socket_cookie)) {
-        return -1;
-    }
-    stored_socket_cookie = *(const u64 *)key;
-    stored_cursor = *(const java_remote_parent_receive_cursor_t *)value;
-    cursor_present = 1;
-    return 0;
+    return -1;
 }
 
 static long test_map_delete(void *map, const void *key) {
-    if (map != &java_remote_parent_receive_cursors) {
-        return -1;
+    const u64 cookie = *(const u64 *)key;
+    if (map == &jrp_recv_cur) {
+        cursor_delete_calls++;
+        if (cursor_delete_failure || !cursor_present || cookie != cursor_cookie) {
+            return -1;
+        }
+        cursor_present = 0;
+        return 0;
     }
-    delete_calls++;
-    if (delete_failure || !cursor_present || *(const u64 *)key != stored_socket_cookie) {
-        return -1;
+    if (map == &jrp_recv_guard) {
+        guard_delete_calls++;
+        if (guard_delete_failure || !guard_present || cookie != guard_cookie) {
+            if (guard_delete_failure && replace_guard_on_delete_failure && guard_present &&
+                cookie == guard_cookie) {
+                guard_value.request_sequence++;
+            }
+            return -1;
+        }
+        guard_present = 0;
+        return 0;
     }
-    cursor_present = 0;
-    return 0;
+    return -1;
 }
 
-static void test_start_publishes_an_exact_pending_cursor(void) {
-    reset();
-    const java_remote_parent_receive_cursor_t old = cursor(~0ULL, ~0ULL, 99);
-    seed(&old);
+static void test_state_predicates_reject_non_authoritative_cursors(void) {
+    const java_remote_parent_receive_cursor_t pending = publishing();
+    const java_remote_parent_receive_cursor_t valid = committed(73);
+    const java_remote_parent_receive_cursor_t retiring = retiring_from(&valid);
 
+    if (sizeof(java_remote_parent_receive_cursor_t) != 56 ||
+        offsetof(java_remote_parent_receive_cursor_t, state) != 12 ||
+        !java_remote_parent_receive_cursor_is_publishing(&pending) ||
+        java_remote_parent_receive_cursor_valid(&pending) ||
+        !java_remote_parent_receive_cursor_valid(&valid) ||
+        java_remote_parent_receive_cursor_valid(&retiring) ||
+        java_remote_parent_receive_cursor_process_matches(
+            &pending, &test_process, test_process_incarnation) ||
+        java_remote_parent_receive_cursor_process_matches(
+            &retiring, &test_process, test_process_incarnation) ||
+        !java_remote_parent_receive_cursor_process_matches(
+            &valid, &test_process, test_process_incarnation)) {
+        fail("PUBLISHING/VALID/RETIRING authority predicates were not state exact");
+    }
+
+    java_remote_parent_receive_cursor_t malformed = pending;
+    malformed.generation = 1;
+    if (java_remote_parent_receive_cursor_state_known(&malformed)) {
+        fail("generation-bearing PUBLISHING was accepted");
+    }
+    malformed = valid;
+    malformed.generation = 0;
+    if (java_remote_parent_receive_cursor_state_known(&malformed)) {
+        fail("generation-zero VALID was accepted");
+    }
+
+    java_remote_parent_receive_cursor_t forged_context = pending;
+    forged_context.data_signal_nonce++;
+    if (!java_remote_parent_receive_cursor_exact_publishing(&pending, &pending) ||
+        java_remote_parent_receive_cursor_exact_publishing(&pending, &forged_context) ||
+        java_remote_parent_receive_cursor_exact_publishing(&valid, &pending)) {
+        fail("forged or stale tail-chain context authorized another PUBLISHING cursor");
+    }
+}
+
+static void test_absent_start_publishing_is_the_exclusive_lock(void) {
+    reset();
+    const java_remote_parent_receive_cursor_t pending = publishing();
     if (!java_remote_parent_receive_cursor_start(test_socket_cookie,
                                                  &test_owner,
                                                  test_process_incarnation,
-                                                 1,
-                                                 1,
+                                                 test_lifecycle_id,
+                                                 test_request_sequence,
                                                  test_data_signal_nonce) ||
-        update_calls != 1 || observed_update_flags != BPF_ANY || !cursor_present ||
-        stored_cursor.reserved != 0 || stored_cursor.lifecycle_id != 1 ||
-        stored_cursor.request_sequence != 1 || stored_cursor.generation != 0) {
-        fail("START did not replace the socket cursor with an exact pending identity");
+        !cursor_present || !same_cursor(&cursor_value, &pending) ||
+        cursor_update_flags != BPF_NOEXIST || guard_present || guard_update_calls != 0) {
+        fail("absent START did not publish its exact generation-zero lock");
     }
-}
-
-static void test_start_failure_preserves_the_previous_cursor(void) {
-    reset();
-    const java_remote_parent_receive_cursor_t old = cursor(90, 80, 70);
-    seed(&old);
-    update_failure = 1;
 
     if (java_remote_parent_receive_cursor_start(test_socket_cookie,
-                                                &test_owner,
+                                                &replacement_owner,
                                                 test_process_incarnation,
-                                                test_lifecycle_id,
-                                                test_request_sequence,
-                                                test_data_signal_nonce) ||
-        update_calls != 1 || !cursor_present || !same_cursor(&stored_cursor, &old)) {
-        fail("failed START publication destroyed or changed the previous cursor");
+                                                test_lifecycle_id + 1,
+                                                test_request_sequence + 1,
+                                                test_data_signal_nonce + 1) ||
+        java_remote_parent_receive_cursor_guard_acquire(test_socket_cookie, &pending) !=
+            k_java_remote_parent_receive_guard_error ||
+        guard_update_calls != 0 || !same_cursor(&cursor_value, &pending)) {
+        fail("a rival START or guard adopted another owner's PUBLISHING cursor");
     }
-}
-
-static void test_start_revalidates_the_pending_write(void) {
-    reset();
-    corrupt_on_lookup = 1;
-
-    if (java_remote_parent_receive_cursor_start(test_socket_cookie,
-                                                &test_owner,
-                                                test_process_incarnation,
-                                                test_lifecycle_id,
-                                                test_request_sequence,
-                                                test_data_signal_nonce) ||
-        update_calls != 1 || lookup_calls != 1 || !cursor_present ||
-        stored_cursor.request_sequence == test_request_sequence) {
-        fail("START accepted a cursor replaced before post-write verification");
-    }
-}
-
-static void test_start_rejects_incomplete_identities_without_writing(void) {
-    reset();
-    pid_key_t invalid_owner = test_owner;
-    invalid_owner.tid = 0;
-    if (java_remote_parent_receive_cursor_start(0,
-                                                &test_owner,
-                                                test_process_incarnation,
-                                                test_lifecycle_id,
-                                                test_request_sequence,
-                                                test_data_signal_nonce) ||
-        java_remote_parent_receive_cursor_start(test_socket_cookie,
-                                                NULL,
-                                                test_process_incarnation,
-                                                test_lifecycle_id,
-                                                test_request_sequence,
-                                                test_data_signal_nonce) ||
-        java_remote_parent_receive_cursor_start(test_socket_cookie,
-                                                &test_owner,
-                                                0,
-                                                test_lifecycle_id,
-                                                test_request_sequence,
-                                                test_data_signal_nonce) ||
-        java_remote_parent_receive_cursor_start(test_socket_cookie,
-                                                &test_owner,
-                                                test_process_incarnation,
-                                                0,
-                                                test_request_sequence,
-                                                test_data_signal_nonce) ||
-        java_remote_parent_receive_cursor_start(test_socket_cookie,
-                                                &test_owner,
-                                                test_process_incarnation,
-                                                test_lifecycle_id,
-                                                0,
-                                                test_data_signal_nonce) ||
-        java_remote_parent_receive_cursor_start(test_socket_cookie,
-                                                &test_owner,
-                                                test_process_incarnation,
-                                                test_lifecycle_id,
-                                                test_request_sequence,
-                                                0) ||
-        java_remote_parent_receive_cursor_start(test_socket_cookie,
-                                                &invalid_owner,
-                                                test_process_incarnation,
-                                                test_lifecycle_id,
-                                                test_request_sequence,
-                                                test_data_signal_nonce) ||
-        update_calls != 0 || cursor_present) {
-        fail("START wrote an incomplete cursor identity");
-    }
-
-    invalid_owner = test_owner;
-    invalid_owner.pid = 0;
-    if (java_remote_parent_receive_cursor_start(test_socket_cookie,
-                                                &invalid_owner,
-                                                test_process_incarnation,
-                                                test_lifecycle_id,
-                                                test_request_sequence,
-                                                test_data_signal_nonce)) {
-        fail("START accepted an owner with no process ID");
-    }
-    invalid_owner = test_owner;
-    invalid_owner.ns = 0;
-    if (java_remote_parent_receive_cursor_start(test_socket_cookie,
-                                                &invalid_owner,
-                                                test_process_incarnation,
-                                                test_lifecycle_id,
-                                                test_request_sequence,
-                                                test_data_signal_nonce)) {
-        fail("START accepted an owner with no PID namespace");
-    }
-}
-
-static void test_process_authority_ignores_owner_tid_only(void) {
-    const java_remote_parent_receive_cursor_t value =
-        cursor(test_lifecycle_id, test_request_sequence, 0);
-    if (!java_remote_parent_receive_cursor_process_matches(
-            &value, &test_process, test_process_incarnation)) {
-        fail("same-process authority rejected a different exact owner TID");
-    }
-
-    pid_key_t different = test_process;
-    different.pid++;
-    different.tid = different.pid;
-    if (java_remote_parent_receive_cursor_process_matches(
-            &value, &different, test_process_incarnation)) {
-        fail("process authority accepted a different PID");
-    }
-    different = test_process;
-    different.ns++;
-    if (java_remote_parent_receive_cursor_process_matches(
-            &value, &different, test_process_incarnation)) {
-        fail("process authority accepted a different PID namespace");
-    }
-    different = test_process;
-    different.tid++;
-    if (java_remote_parent_receive_cursor_process_matches(
-            &value, &different, test_process_incarnation)) {
-        fail("process authority accepted a noncanonical process key");
-    }
-    if (java_remote_parent_receive_cursor_process_matches(
-            &value, &test_process, test_process_incarnation + 1)) {
-        fail("process authority accepted a different JVM incarnation");
-    }
-}
-
-static void test_continue_and_reset_require_exact_opaque_identity(void) {
-    reset();
-    const java_remote_parent_receive_cursor_t value = cursor(~0ULL, 1, 73);
-    seed(&value);
-    java_remote_parent_receive_cursor_t snapshot = {0};
-
-    if (!java_remote_parent_receive_cursor_continue(
-            test_socket_cookie, &test_process, test_process_incarnation, ~0ULL, 1, &snapshot) ||
-        !same_cursor(&snapshot, &value)) {
-        fail("CONTINUE rejected an exact opaque lifecycle identity");
-    }
-
-    stored_cursor.generation = 0;
-    if (!java_remote_parent_receive_cursor_continue(
-            test_socket_cookie, &test_process, test_process_incarnation, ~0ULL, 1, &snapshot) ||
-        snapshot.generation != 0) {
-        fail("identity lookup incorrectly imposed ACK readiness on CONTINUE");
-    }
-    stored_cursor.generation = value.generation;
-    memset(&snapshot, 0, sizeof(snapshot));
-    if (!java_remote_parent_receive_cursor_reset(
-            test_socket_cookie, &test_process, test_process_incarnation, ~0ULL, 1, &snapshot) ||
-        !same_cursor(&snapshot, &value)) {
-        fail("RESET rejected an exact opaque lifecycle identity");
-    }
-
-    if (java_remote_parent_receive_cursor_continue(
-            test_socket_cookie, &test_process, test_process_incarnation, ~0ULL - 1, 1, &snapshot) ||
-        java_remote_parent_receive_cursor_continue(
-            test_socket_cookie, &test_process, test_process_incarnation, ~0ULL, 2, &snapshot)) {
-        fail("CONTINUE inferred ordering instead of requiring opaque equality");
-    }
-
-    stored_cursor.reserved = 1;
-    if (java_remote_parent_receive_cursor_reset(
-            test_socket_cookie, &test_process, test_process_incarnation, ~0ULL, 1, &snapshot)) {
-        fail("RESET accepted a cursor with nonzero reserved data");
-    }
-    stored_cursor.reserved = 0;
-    cursor_present = 0;
-    if (java_remote_parent_receive_cursor_continue(
-            test_socket_cookie, &test_process, test_process_incarnation, ~0ULL, 1, &snapshot)) {
-        fail("CONTINUE accepted a missing cursor");
-    }
-}
-
-static void test_exact_delete_never_removes_a_different_cursor(void) {
-    reset();
-    const java_remote_parent_receive_cursor_t value =
-        cursor(test_lifecycle_id, test_request_sequence, 73);
-    seed(&value);
-    java_remote_parent_receive_cursor_t mismatches[] = {
-        value,
-        value,
-        value,
-        value,
-    };
-    mismatches[0].lifecycle_id++;
-    mismatches[1].request_sequence++;
-    mismatches[2].data_signal_nonce++;
-    mismatches[3].generation++;
-    for (size_t index = 0; index < sizeof(mismatches) / sizeof(mismatches[0]); index++) {
-        if (java_remote_parent_receive_cursor_delete_exact(test_socket_cookie,
-                                                           &mismatches[index]) ||
-            delete_calls != 0 || !cursor_present) {
-            fail("exact delete removed a cursor with a different identity");
-        }
-    }
-    if (!java_remote_parent_receive_cursor_delete_exact(test_socket_cookie, &value) ||
-        delete_calls != 1 || cursor_present) {
-        fail("exact delete did not remove the matching cursor");
-    }
-
-    reset();
-    seed(&value);
-    delete_failure = 1;
-    if (java_remote_parent_receive_cursor_delete_exact(test_socket_cookie, &value) ||
-        delete_calls != 1 || !cursor_present) {
-        fail("exact delete reported success after a failed map deletion");
-    }
-}
-
-static void test_ack_commits_only_the_exact_pending_generation(void) {
-    reset();
-    const java_remote_parent_receive_cursor_t pending =
-        cursor(test_lifecycle_id, test_request_sequence, 0);
-    seed(&pending);
 
     if (!java_remote_parent_receive_cursor_ack_generation(test_socket_cookie, &pending, 73) ||
-        stored_cursor.generation != 73 || lookup_calls != 2 || update_calls != 1 ||
-        observed_update_flags != BPF_EXIST) {
-        fail("ACK did not commit and revalidate the exact pending generation");
-    }
-
-    const java_remote_parent_receive_cursor_t committed = stored_cursor;
-    if (java_remote_parent_receive_cursor_ack_generation(test_socket_cookie, &committed, 74) ||
-        stored_cursor.generation != 73) {
-        fail("ACK replaced a generation that was already committed");
+        !java_remote_parent_receive_cursor_is_valid(&cursor_value) ||
+        cursor_value.generation != 73) {
+        fail("the exact PUBLISHING owner could not ACK after a rival was rejected");
     }
 
     reset();
-    seed(&pending);
-    java_remote_parent_receive_cursor_t mismatches[] = {
-        pending,
-        pending,
-        pending,
-        pending,
-        pending,
+    seed_cursor(&pending);
+    if (!java_remote_parent_receive_cursor_mark_retiring_publishing(test_socket_cookie, &pending) ||
+        !java_remote_parent_receive_cursor_finish_retiring_publishing(test_socket_cookie,
+                                                                      &pending) ||
+        cursor_present || guard_present) {
+        fail("the exact PUBLISHING owner could not clean up a failed tail chain");
+    }
+}
+
+static void test_ack_is_exact_and_update_failure_is_fail_closed(void) {
+    const java_remote_parent_receive_cursor_t pending = publishing();
+
+    reset();
+    seed_cursor(&pending);
+    java_remote_parent_receive_cursor_t forged = pending;
+    forged.data_signal_nonce++;
+    if (java_remote_parent_receive_cursor_ack_generation(test_socket_cookie, &forged, 73) ||
+        java_remote_parent_receive_cursor_ack_generation(test_socket_cookie, &pending, 0) ||
+        cursor_update_calls != 0 || !same_cursor(&cursor_value, &pending)) {
+        fail("ACK accepted a forged identity, nonce, or zero generation");
+    }
+
+    cursor_update_failure = 1;
+    if (java_remote_parent_receive_cursor_ack_generation(test_socket_cookie, &pending, 73) ||
+        !same_cursor(&cursor_value, &pending) || cursor_update_calls != 1 ||
+        cursor_update_flags != BPF_EXIST) {
+        fail("failed ACK update changed or authorized PUBLISHING");
+    }
+    cursor_update_failure = 0;
+    if (!java_remote_parent_receive_cursor_mark_retiring_publishing(test_socket_cookie, &pending) ||
+        !java_remote_parent_receive_cursor_finish_retiring_publishing(test_socket_cookie,
+                                                                      &pending) ||
+        cursor_present) {
+        fail("ACK failure could not converge through exact PUBLISHING cleanup");
+    }
+}
+
+static void test_publishing_retirement_is_exact_and_fail_closed(void) {
+    const java_remote_parent_receive_cursor_t pending = publishing();
+    const java_remote_parent_receive_cursor_t retiring = retiring_from(&pending);
+    java_remote_parent_receive_cursor_t successor = pending;
+    successor.request_sequence++;
+
+    reset();
+    seed_cursor(&successor);
+    if (java_remote_parent_receive_cursor_mark_retiring_publishing(test_socket_cookie, &pending) ||
+        cursor_update_calls != 0 || !same_cursor(&cursor_value, &successor)) {
+        fail("PUBLISHING retirement accepted or changed a mismatched successor");
+    }
+
+    reset();
+    seed_cursor(&pending);
+    cursor_update_failure = 1;
+    if (java_remote_parent_receive_cursor_mark_retiring_publishing(test_socket_cookie, &pending) ||
+        cursor_update_calls != 1 || cursor_update_flags != BPF_EXIST ||
+        !same_cursor(&cursor_value, &pending)) {
+        fail("PUBLISHING retirement update failure did not preserve its exact cursor");
+    }
+
+    reset();
+    seed_cursor(&pending);
+    corrupt_cursor_lookup = 2;
+    if (java_remote_parent_receive_cursor_mark_retiring_publishing(test_socket_cookie, &pending) ||
+        cursor_update_calls != 1 || cursor_lookup_calls != 2 ||
+        same_cursor(&cursor_value, &retiring)) {
+        fail("PUBLISHING retirement accepted a cursor changed during revalidation");
+    }
+}
+
+static void test_guard_results_distinguish_busy_from_error(void) {
+    const java_remote_parent_receive_cursor_t old = committed(73);
+
+    reset();
+    seed_cursor(&old);
+    if (java_remote_parent_receive_cursor_guard_acquire(test_socket_cookie, &old) !=
+            k_java_remote_parent_receive_guard_acquired ||
+        !guard_present || !same_cursor(&guard_value, &old) || guard_update_flags != BPF_NOEXIST) {
+        fail("exact VALID guard acquisition failed");
+    }
+    java_remote_parent_receive_cursor_t foreign_guard = old;
+    foreign_guard.generation++;
+    guard_value = foreign_guard;
+    if (java_remote_parent_receive_cursor_guard_acquire(test_socket_cookie, &old) !=
+            k_java_remote_parent_receive_guard_busy ||
+        java_remote_parent_receive_cursor_guard_release(test_socket_cookie, &old) ||
+        !guard_present) {
+        fail("foreign exact-cookie guard was not BUSY or was released by a nonowner");
+    }
+
+    reset();
+    seed_cursor(&old);
+    seed_guard(&old);
+    guard_delete_failure = 1;
+    replace_guard_on_delete_failure = 1;
+    if (java_remote_parent_receive_cursor_guard_release(test_socket_cookie, &old) ||
+        !guard_present || same_cursor(&guard_value, &old)) {
+        fail("guard release accepted a different guard left after delete failure");
+    }
+
+    reset();
+    seed_cursor(&old);
+    guard_update_failure = 1;
+    if (java_remote_parent_receive_cursor_guard_acquire(test_socket_cookie, &old) !=
+            k_java_remote_parent_receive_guard_error ||
+        guard_present) {
+        fail("absent-key guard capacity failure was mistaken for BUSY");
+    }
+
+    reset();
+    java_remote_parent_receive_cursor_t successor = old;
+    successor.request_sequence++;
+    seed_cursor(&successor);
+    if (java_remote_parent_receive_cursor_guard_acquire(test_socket_cookie, &old) !=
+            k_java_remote_parent_receive_guard_error ||
+        guard_update_calls != 0) {
+        fail("mismatched cursor acquired an exact guard");
+    }
+    seed_guard(&foreign_guard);
+    if (java_remote_parent_receive_cursor_guard_acquire(test_socket_cookie, &old) !=
+        k_java_remote_parent_receive_guard_busy) {
+        fail("mismatched cursor ignored an existing exact-cookie guard");
+    }
+
+    reset();
+    seed_cursor(&old);
+    corrupt_cursor_lookup = 2;
+    if (java_remote_parent_receive_cursor_guard_acquire(test_socket_cookie, &old) !=
+            k_java_remote_parent_receive_guard_error ||
+        guard_present || guard_update_calls != 1 || guard_delete_calls != 1 ||
+        cursor_lookup_calls != 2 || same_cursor(&cursor_value, &old)) {
+        fail("post-insertion cursor mismatch did not roll back its exact guard");
+    }
+
+    reset();
+    seed_cursor(&old);
+    corrupt_cursor_lookup = 2;
+    guard_delete_failure = 1;
+    replace_guard_on_delete_failure = 1;
+    if (java_remote_parent_receive_cursor_guard_acquire(test_socket_cookie, &old) !=
+            k_java_remote_parent_receive_guard_error ||
+        !guard_present || same_cursor(&guard_value, &old) || guard_update_calls != 1 ||
+        guard_delete_calls != 1 || cursor_lookup_calls != 2) {
+        fail("failed post-insertion rollback disturbed a replacement guard or granted authority");
+    }
+}
+
+static void test_replacement_is_atomic_before_during_and_after_guard(void) {
+    const java_remote_parent_receive_cursor_t old = committed(73);
+    const java_remote_parent_receive_cursor_t next = publishing_for(&replacement_owner,
+                                                                    test_lifecycle_id + 1,
+                                                                    test_request_sequence + 1,
+                                                                    test_data_signal_nonce + 1);
+
+    reset();
+    java_remote_parent_receive_cursor_t successor = old;
+    successor.request_sequence++;
+    seed_cursor(&successor);
+    if (java_remote_parent_receive_cursor_guard_acquire(test_socket_cookie, &old) !=
+            k_java_remote_parent_receive_guard_error ||
+        java_remote_parent_receive_cursor_replace_locked(test_socket_cookie, &old, &next) ||
+        !same_cursor(&cursor_value, &successor)) {
+        fail("stale replacement mutated a successor before guard acquisition");
+    }
+
+    reset();
+    seed_cursor(&old);
+    if (java_remote_parent_receive_cursor_guard_acquire(test_socket_cookie, &old) !=
+        k_java_remote_parent_receive_guard_acquired) {
+        fail("replacement could not acquire predecessor guard");
+    }
+    cursor_value = successor;
+    if (java_remote_parent_receive_cursor_replace_locked(test_socket_cookie, &old, &next) ||
+        !java_remote_parent_receive_cursor_guard_release(test_socket_cookie, &old) ||
+        !same_cursor(&cursor_value, &successor)) {
+        fail("replacement overwrote a cursor changed during its exact guard");
+    }
+
+    reset();
+    seed_cursor(&old);
+    if (java_remote_parent_receive_cursor_guard_acquire(test_socket_cookie, &old) !=
+            k_java_remote_parent_receive_guard_acquired ||
+        !java_remote_parent_receive_cursor_replace_locked(test_socket_cookie, &old, &next) ||
+        !same_cursor(&cursor_value, &next) || cursor_update_flags != BPF_EXIST ||
+        !java_remote_parent_receive_cursor_guard_release(test_socket_cookie, &old) ||
+        guard_present ||
+        java_remote_parent_receive_cursor_guard_acquire(test_socket_cookie, &old) !=
+            k_java_remote_parent_receive_guard_error ||
+        !java_remote_parent_receive_cursor_ack_generation(test_socket_cookie, &next, 74) ||
+        cursor_value.generation != 74 ||
+        !java_remote_parent_receive_cursor_is_valid(&cursor_value)) {
+        fail("replacement did not transition VALID->PUBLISHING->VALID exactly");
+    }
+}
+
+static int terminal_valid(const java_remote_parent_receive_cursor_t *expected, int fence_success) {
+    const enum java_remote_parent_receive_guard_result result =
+        java_remote_parent_receive_cursor_guard_acquire(test_socket_cookie, expected);
+    if (result != k_java_remote_parent_receive_guard_acquired) {
+        return 0;
+    }
+    if (!java_remote_parent_receive_cursor_mark_retiring_locked(test_socket_cookie, expected)) {
+        return 0;
+    }
+    if (!fence_success) {
+        java_remote_parent_receive_cursor_guard_release(test_socket_cookie, expected);
+        return 0;
+    }
+    return java_remote_parent_receive_cursor_finish_retiring_guarded(test_socket_cookie, expected);
+}
+
+static void test_reset_terminal_order_and_faults_are_fail_closed(void) {
+    const java_remote_parent_receive_cursor_t old = committed(73);
+    const java_remote_parent_receive_cursor_t retiring = retiring_from(&old);
+
+    reset();
+    seed_cursor(&old);
+    if (!terminal_valid(&old, 1) || cursor_present || guard_present || guard_delete_calls != 1 ||
+        cursor_delete_calls != 1) {
+        fail("RESET did not delete guard before its RETIRING cursor");
+    }
+
+    reset();
+    seed_cursor(&old);
+    if (terminal_valid(&old, 0) || !cursor_present || !same_cursor(&cursor_value, &retiring) ||
+        guard_present || cursor_delete_calls != 0) {
+        fail("injected exact-fence failure did not retain a guard-free RETIRING tombstone");
+    }
+
+    reset();
+    seed_cursor(&old);
+    cursor_update_failure = 1;
+    if (terminal_valid(&old, 1) || !same_cursor(&cursor_value, &old) || !guard_present ||
+        guard_delete_calls != 0 || cursor_delete_calls != 0) {
+        fail("RETIRING update failure exposed an already-fenced VALID state");
+    }
+
+    reset();
+    seed_cursor(&old);
+    guard_delete_failure = 1;
+    if (terminal_valid(&old, 1) || !same_cursor(&cursor_value, &retiring) || !guard_present ||
+        cursor_delete_calls != 0) {
+        fail("guard-delete failure did not retain RETIRING before cursor deletion");
+    }
+
+    reset();
+    seed_cursor(&old);
+    cursor_delete_failure = 1;
+    if (terminal_valid(&old, 1) || !same_cursor(&cursor_value, &retiring) || guard_present ||
+        cursor_delete_calls != 1) {
+        fail("cursor-delete failure did not leave a guard-free RETIRING tombstone");
+    }
+}
+
+static void test_close_repairs_every_state_and_stale_guard(void) {
+    const java_remote_parent_receive_cursor_t valid_guard = committed(73);
+    const java_remote_parent_receive_cursor_t states[] = {
+        publishing(),
+        committed(73),
+        retiring_from(&(java_remote_parent_receive_cursor_t){
+            .owner = test_owner,
+            .state = k_java_remote_parent_receive_cursor_valid,
+            .process_incarnation = test_process_incarnation,
+            .lifecycle_id = test_lifecycle_id,
+            .request_sequence = test_request_sequence,
+            .data_signal_nonce = test_data_signal_nonce,
+            .generation = 73,
+        }),
     };
-    mismatches[0].owner.tid++;
-    mismatches[1].process_incarnation++;
-    mismatches[2].lifecycle_id++;
-    mismatches[3].request_sequence++;
-    mismatches[4].data_signal_nonce++;
-    for (size_t index = 0; index < sizeof(mismatches) / sizeof(mismatches[0]); index++) {
-        if (java_remote_parent_receive_cursor_ack_generation(
-                test_socket_cookie, &mismatches[index], 73) ||
-            stored_cursor.generation != 0) {
-            fail("ACK committed a mismatched pending identity");
+
+    for (size_t index = 0; index < sizeof(states) / sizeof(states[0]); index++) {
+        reset();
+        seed_cursor(&states[index]);
+        seed_guard(&valid_guard);
+        if (!java_remote_parent_receive_cursor_close_delete(test_socket_cookie, &states[index]) ||
+            cursor_present || guard_present || guard_delete_calls != 1 ||
+            cursor_delete_calls != 1) {
+            fail("tcp_close did not repair guard and delete an exact cursor state");
         }
     }
-    if (java_remote_parent_receive_cursor_ack_generation(test_socket_cookie, &pending, 0) ||
-        stored_cursor.generation != 0) {
-        fail("ACK committed a mismatched identity or zero generation");
+
+    reset();
+    seed_guard(&valid_guard);
+    if (!java_remote_parent_receive_cursor_close_stale_guard(test_socket_cookie) || guard_present ||
+        cursor_present || guard_delete_calls != 1) {
+        fail("absent-cursor close did not limit itself to stale-guard repair");
     }
 
     reset();
-    seed(&pending);
-    update_failure = 1;
-    if (java_remote_parent_receive_cursor_ack_generation(test_socket_cookie, &pending, 73) ||
-        stored_cursor.generation != 0 || update_calls != 1 || observed_update_flags != BPF_EXIST) {
-        fail("ACK changed a pending cursor after a failed generation update");
+    seed_guard(&valid_guard);
+    guard_delete_failure = 1;
+    if (java_remote_parent_receive_cursor_close_stale_guard(test_socket_cookie) || !guard_present ||
+        guard_delete_calls != 1) {
+        fail("failed close guard repair reported success or lost exclusion evidence");
     }
 
     reset();
-    seed(&pending);
-    evict_on_update = 1;
-    if (java_remote_parent_receive_cursor_ack_generation(test_socket_cookie, &pending, 73) ||
-        cursor_present || update_calls != 1) {
-        fail("ACK accepted a cursor evicted before its generation update");
+    const java_remote_parent_receive_cursor_t valid = committed(73);
+    const java_remote_parent_receive_cursor_t retiring = retiring_from(&valid);
+    seed_cursor(&valid);
+    seed_guard(&valid);
+    if (!java_remote_parent_receive_cursor_mark_retiring_close(test_socket_cookie, &valid) ||
+        !same_cursor(&cursor_value, &retiring)) {
+        fail("tuple/fence failure could not preserve exact RETIRING close evidence");
+    }
+    if (!java_remote_parent_receive_cursor_close_stale_guard(test_socket_cookie) ||
+        !cursor_present || guard_present || cursor_delete_calls != 0) {
+        fail("tuple/fence failure deleted RETIRING instead of retaining recovery evidence");
+    }
+    if (!java_remote_parent_receive_cursor_close_delete(test_socket_cookie, &retiring) ||
+        cursor_present || guard_present) {
+        fail("later close recovery could not drain retained RETIRING evidence");
+    }
+}
+
+static void test_cursor_and_guard_capacity_fail_independently_and_recover(void) {
+    const java_remote_parent_receive_cursor_t pending = publishing();
+    const java_remote_parent_receive_cursor_t valid = committed(73);
+
+    reset();
+    cursor_update_failure = 1; // models N occupied cursor slots
+    if (java_remote_parent_receive_cursor_publish(test_socket_cookie, &pending) ||
+        guard_update_calls != 0 || cursor_present || guard_present) {
+        fail("cursor saturation consumed or mutated guard capacity");
+    }
+    cursor_update_failure = 0;
+    if (!java_remote_parent_receive_cursor_publish(test_socket_cookie, &pending)) {
+        fail("cursor admission did not recover after cursor capacity returned");
     }
 
     reset();
-    if (java_remote_parent_receive_cursor_ack_generation(test_socket_cookie, &pending, 73) ||
-        update_calls != 0) {
-        fail("ACK accepted an already-evicted pending cursor");
+    seed_cursor(&valid);
+    guard_update_failure = 1; // models N occupied guard slots
+    if (java_remote_parent_receive_cursor_guard_acquire(test_socket_cookie, &valid) !=
+            k_java_remote_parent_receive_guard_error ||
+        cursor_update_calls != 0 || !same_cursor(&cursor_value, &valid)) {
+        fail("guard saturation consumed or mutated cursor capacity");
+    }
+    guard_update_failure = 0;
+    if (java_remote_parent_receive_cursor_guard_acquire(test_socket_cookie, &valid) !=
+            k_java_remote_parent_receive_guard_acquired ||
+        !java_remote_parent_receive_cursor_guard_release(test_socket_cookie, &valid) ||
+        guard_present) {
+        fail("guard acquisition did not recover after guard capacity returned");
+    }
+}
+
+static void test_snapshot_and_process_lookup_are_exact(void) {
+    reset();
+    const java_remote_parent_receive_cursor_t valid = committed(73);
+    seed_cursor(&valid);
+    java_remote_parent_receive_cursor_t snapshot = {0};
+    if (!java_remote_parent_receive_cursor_snapshot_state(test_socket_cookie, &snapshot) ||
+        !same_cursor(&snapshot, &valid) || cursor_lookup_calls != 2) {
+        fail("state snapshot did not copy and revalidate exact bytes");
+    }
+    memset(&snapshot, 0, sizeof(snapshot));
+    if (!java_remote_parent_receive_cursor_continue(test_socket_cookie,
+                                                    &test_process,
+                                                    test_process_incarnation,
+                                                    test_lifecycle_id,
+                                                    test_request_sequence,
+                                                    &snapshot) ||
+        !same_cursor(&snapshot, &valid)) {
+        fail("CONTINUE rejected its exact committed process identity");
     }
 
     reset();
-    seed(&pending);
-    corrupt_on_lookup = 2;
-    if (java_remote_parent_receive_cursor_ack_generation(test_socket_cookie, &pending, 73) ||
-        lookup_calls != 2 || stored_cursor.request_sequence == pending.request_sequence) {
-        fail("ACK accepted a cursor replaced before generation revalidation");
+    seed_cursor(&valid);
+    seed_guard(&valid);
+    memset(&snapshot, 0, sizeof(snapshot));
+    if (java_remote_parent_receive_cursor_continue(test_socket_cookie,
+                                                   &test_process,
+                                                   test_process_incarnation,
+                                                   test_lifecycle_id,
+                                                   test_request_sequence,
+                                                   &snapshot)) {
+        fail("CONTINUE consumed VALID while an exact transition guard was live");
+    }
+
+    reset();
+    seed_cursor(&valid);
+    corrupt_cursor_lookup = 2;
+    if (java_remote_parent_receive_cursor_snapshot_state(test_socket_cookie, &snapshot) ||
+        same_cursor(&cursor_value, &valid)) {
+        fail("snapshot accepted a cursor replaced during revalidation");
+    }
+
+    reset();
+    const java_remote_parent_receive_cursor_t pending = publishing();
+    seed_cursor(&pending);
+    if (java_remote_parent_receive_cursor_continue(test_socket_cookie,
+                                                   &test_process,
+                                                   test_process_incarnation,
+                                                   test_lifecycle_id,
+                                                   test_request_sequence,
+                                                   &snapshot) ||
+        java_remote_parent_receive_cursor_reset(test_socket_cookie,
+                                                &test_process,
+                                                test_process_incarnation,
+                                                test_lifecycle_id,
+                                                test_request_sequence,
+                                                &snapshot)) {
+        fail("CONTINUE/RESET adopted an independent PUBLISHING identity");
     }
 }
 
 int main(void) {
-    test_start_publishes_an_exact_pending_cursor();
-    test_start_failure_preserves_the_previous_cursor();
-    test_start_revalidates_the_pending_write();
-    test_start_rejects_incomplete_identities_without_writing();
-    test_process_authority_ignores_owner_tid_only();
-    test_continue_and_reset_require_exact_opaque_identity();
-    test_exact_delete_never_removes_a_different_cursor();
-    test_ack_commits_only_the_exact_pending_generation();
+    test_state_predicates_reject_non_authoritative_cursors();
+    test_absent_start_publishing_is_the_exclusive_lock();
+    test_ack_is_exact_and_update_failure_is_fail_closed();
+    test_publishing_retirement_is_exact_and_fail_closed();
+    test_guard_results_distinguish_busy_from_error();
+    test_replacement_is_atomic_before_during_and_after_guard();
+    test_reset_terminal_order_and_faults_are_fail_closed();
+    test_close_repairs_every_state_and_stale_guard();
+    test_cursor_and_guard_capacity_fail_independently_and_recover();
+    test_snapshot_and_process_lookup_are_exact();
     return 0;
 }

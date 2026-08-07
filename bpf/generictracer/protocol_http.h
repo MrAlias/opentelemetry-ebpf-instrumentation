@@ -49,6 +49,31 @@ volatile const u64 ssl_prewrite_max_age_ns;
 
 SCRATCH_MEM_SIZED(http_previous_trace_id, TRACE_ID_SIZE_BYTES);
 
+#ifdef OBI_JAVA_REMOTE_PARENT_LIFECYCLE
+// START's PUBLISHING cursor is an exclusive, generation-zero admission lock.
+// Every HTTP tail-chain exit before exact ACK must retire it, including tail
+// call misses and parser scratch/duplicate failures. Clear the invocation-local
+// context after cleanup so this helper is idempotent across nested exits.
+static __always_inline __attribute__((unused)) void
+java_remote_parent_cleanup_unacked_http1_start(call_protocol_args_t *args) {
+    if (!args ||
+        args->java_remote_parent_receive.action !=
+            k_java_remote_parent_receive_action_http1_start ||
+        args->java_remote_parent_receive.generation || !args->connection_socket_cookie) {
+        return;
+    }
+    java_remote_parent_cleanup_unacked_receive_context(&args->java_remote_parent_receive,
+                                                       args->connection_socket_cookie);
+    __builtin_memset(
+        &args->java_remote_parent_receive, 0, sizeof(args->java_remote_parent_receive));
+}
+#else
+static __always_inline void
+java_remote_parent_cleanup_unacked_http1_start(call_protocol_args_t *args) {
+    (void)args;
+}
+#endif
+
 // empty_http_info zeroes and return the unique percpu copy in the map
 // this function assumes that a given thread is not trying to use many
 // instances at the same time
@@ -438,6 +463,7 @@ int obi_continue2_protocol_http(struct pt_regs *ctx) {
 
     http_info_t *info = bpf_map_lookup_elem(&ongoing_http, &args->pid_conn);
     if (!info) {
+        java_remote_parent_cleanup_unacked_http1_start(args);
         return 0;
     }
 
@@ -528,6 +554,7 @@ static __always_inline int __obi_complete_protocol_http_tp(struct pt_regs *ctx,
                                                            http_connection_metadata_t *meta,
                                                            u8 ssl_prewrite,
                                                            u8 ssl_prewrite_published) {
+    java_remote_parent_cleanup_unacked_http1_start(args);
     if (ssl_prewrite) {
         if (!ssl_prewrite_published) {
             cleanup_http_info(&args->pid_conn);
@@ -619,6 +646,7 @@ int obi_continue_protocol_http_tp_validate(struct pt_regs *ctx) {
     const u8 ssl_prewrite = args->flags & k_call_protocol_flag_ssl_prewrite;
     http_info_t *info = bpf_map_lookup_elem(&ongoing_http, &args->pid_conn);
     if (!info && !ssl_prewrite) {
+        java_remote_parent_cleanup_unacked_http1_start(args);
         return 0;
     }
 
@@ -686,6 +714,7 @@ int obi_continue_protocol_http_tp(struct pt_regs *ctx) {
     const u8 ssl_prewrite = args->flags & k_call_protocol_flag_ssl_prewrite;
     http_info_t *info = bpf_map_lookup_elem(&ongoing_http, &args->pid_conn);
     if (!info && !ssl_prewrite) {
+        java_remote_parent_cleanup_unacked_http1_start(args);
         return 0;
     }
 
@@ -760,9 +789,18 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
 
 #ifdef OBI_JAVA_REMOTE_PARENT_LIFECYCLE
             java_remote_parent_incoming_t *java_incoming = NULL;
+            const enum java_remote_parent_receive_action java_receive_action =
+                args->java_remote_parent_receive.action;
+            const u8 java_http1_start =
+                java_receive_action == k_java_remote_parent_receive_action_http1_start;
+            const u8 java_http1_continue =
+                java_receive_action == k_java_remote_parent_receive_action_http1_continue;
+            const u8 java_telemetry_receive =
+                java_receive_action == k_java_remote_parent_receive_action_telemetry;
             if (java_remote_parent_enabled && java_remote_parent_data_hook_is_ready() &&
                 args->java && args->ssl && args->connection_netns &&
-                args->connection_netns_cookie && args->connection_socket_cookie) {
+                args->connection_netns_cookie && args->connection_socket_cookie &&
+                !java_http1_continue && !java_telemetry_receive) {
                 java_incoming = java_remote_parent_incoming_snapshot_mem();
             }
             found_tp = find_trace_for_server_request_with_incoming(
@@ -771,7 +809,8 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
                 EVENT_HTTP_REQUEST,
                 args->connection_netns_cookie,
                 java_incoming ? &java_incoming->candidate : NULL,
-                java_incoming ? &java_incoming->generation : NULL);
+                java_incoming ? &java_incoming->generation : NULL,
+                java_remote_parent_receive_action_allows_incoming_claim(java_receive_action));
             if (java_incoming && java_incoming->generation) {
                 u64 staged_generation = 0;
                 connection_info_t *java_connection = java_remote_parent_connection_snapshot_mem();
@@ -786,10 +825,37 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
                                                           args->connection_socket_cookie,
                                                           java_incoming);
                 }
+                if (staged_generation && java_http1_start) {
+                    const java_remote_parent_receive_cursor_t pending =
+                        java_remote_parent_cursor_from_context(&args->java_remote_parent_receive);
+                    if (java_remote_parent_ack_receive_generation(&pending,
+                                                                  java_connection,
+                                                                  args->connection_netns,
+                                                                  args->connection_socket_cookie,
+                                                                  staged_generation)) {
+                        args->java_remote_parent_receive.generation = staged_generation;
+                    } else {
+                        java_remote_parent_cleanup_receive_cursor(
+                            &pending, args->connection_socket_cookie, staged_generation);
+                        staged_generation = 0;
+                    }
+                }
                 if (!staged_generation) {
                     found_tp = 0;
                     tp_p->tp.flags = 1;
                 }
+            }
+            if (java_http1_start && !args->java_remote_parent_receive.generation) {
+                const java_remote_parent_receive_cursor_t pending =
+                    java_remote_parent_cursor_from_context(&args->java_remote_parent_receive);
+                connection_info_t *java_connection = java_remote_parent_connection_snapshot_mem();
+                if (java_connection) {
+                    __builtin_memcpy(
+                        java_connection, &args->pid_conn.conn, sizeof(*java_connection));
+                    sort_connection_info(java_connection);
+                }
+                java_remote_parent_cleanup_receive_cursor(
+                    &pending, args->connection_socket_cookie, 0);
             }
 #else
             // For server requests, we first look for TCP info (setup by TC ingress) and then we fall back to black-box info.
@@ -825,9 +891,11 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
     if (ssl_prewrite) {
         cleanup_http_info(&args->pid_conn);
     }
+    java_remote_parent_cleanup_unacked_http1_start(args);
     return 0;
 
 skip_tp:
+    java_remote_parent_cleanup_unacked_http1_start(args);
     if (ssl_prewrite) {
         cleanup_http_info(&args->pid_conn);
         return 0;
@@ -851,6 +919,7 @@ int obi_continue_protocol_http_legacy(struct pt_regs *ctx) {
     const u8 ssl_prewrite = args->flags & k_call_protocol_flag_ssl_prewrite;
     http_info_t *info = bpf_map_lookup_elem(&ongoing_http, &args->pid_conn);
     if (!info && !ssl_prewrite) {
+        java_remote_parent_cleanup_unacked_http1_start(args);
         return 0;
     }
 
@@ -868,6 +937,7 @@ int obi_continue_protocol_http(struct pt_regs *ctx) {
     const u8 ssl_prewrite = args->flags & k_call_protocol_flag_ssl_prewrite;
     http_info_t *info = bpf_map_lookup_elem(&ongoing_http, &args->pid_conn);
     if (!info && !ssl_prewrite) {
+        java_remote_parent_cleanup_unacked_http1_start(args);
         return 0;
     }
 
@@ -887,24 +957,49 @@ __obi_protocol_http(struct pt_regs *ctx, unsigned char *(*tp_loop_fn)(unsigned c
         return 0;
     }
 
+#ifdef OBI_JAVA_REMOTE_PARENT_LIFECYCLE
+    const enum java_remote_parent_receive_action java_receive_action =
+        args->java_remote_parent_receive.action;
+    if (java_receive_action == k_java_remote_parent_receive_action_http1_start ||
+        java_receive_action == k_java_remote_parent_receive_action_http1_continue) {
+        const u8 expected_generation =
+            java_receive_action == k_java_remote_parent_receive_action_http1_continue;
+        if (!args->java || !args->ssl || !args->connection_socket_cookie ||
+            (!!args->java_remote_parent_receive.generation != expected_generation) ||
+            !java_remote_parent_receive_context_exact(&args->java_remote_parent_receive,
+                                                      java_receive_action,
+                                                      args->connection_socket_cookie)) {
+            const java_remote_parent_receive_cursor_t expected =
+                java_remote_parent_cursor_from_context(&args->java_remote_parent_receive);
+            java_remote_parent_cleanup_receive_cursor(
+                &expected, args->connection_socket_cookie, expected.generation);
+            return 0;
+        }
+    }
+#endif
+
     if (args->flags & k_call_protocol_flag_ssl_prewrite) {
         if (!args->ssl || args->direction != TCP_SEND || args->packet_type != PACKET_TYPE_REQUEST) {
+            java_remote_parent_cleanup_unacked_http1_start(args);
             return 0;
         }
 
         if (!prepare_ssl_prewrite_request(args)) {
+            java_remote_parent_cleanup_unacked_http1_start(args);
             return 0;
         }
 
         args->use_bpf_loop = tp_loop_fn == bpf_strstr_tp_loop;
         bpf_tail_call(ctx, &jump_table, k_tail_continue_protocol_http);
         cleanup_http_info(&args->pid_conn);
+        java_remote_parent_cleanup_unacked_http1_start(args);
         return 0;
     }
 
     http_info_t *in = empty_http_info();
     if (!in) {
         bpf_dbg_printk("Error allocating http info from per CPU map");
+        java_remote_parent_cleanup_unacked_http1_start(args);
         return 0;
     }
 
@@ -930,6 +1025,7 @@ __obi_protocol_http(struct pt_regs *ctx, unsigned char *(*tp_loop_fn)(unsigned c
     if (!info) {
         bpf_dbg_printk("No info (or duplicate), pid=%d?", args->pid_conn.pid);
         dbg_print_http_connection_info(&args->pid_conn.conn);
+        java_remote_parent_cleanup_unacked_http1_start(args);
         return 0;
     }
 
@@ -941,7 +1037,7 @@ __obi_protocol_http(struct pt_regs *ctx, unsigned char *(*tp_loop_fn)(unsigned c
     if (http_info_begin_request(info, args->packet_type, args->direction)) {
         args->use_bpf_loop = tp_loop_fn == bpf_strstr_tp_loop;
         bpf_tail_call(ctx, &jump_table, k_tail_continue_protocol_http);
-
+        java_remote_parent_cleanup_unacked_http1_start(args);
         return 0;
     } else if ((args->packet_type == PACKET_TYPE_RESPONSE) && (info->status == 0)) {
         handle_http_response(args->small_buf,
@@ -982,6 +1078,7 @@ __obi_protocol_http(struct pt_regs *ctx, unsigned char *(*tp_loop_fn)(unsigned c
                                k_large_buf_action_append);
     }
 
+    java_remote_parent_cleanup_unacked_http1_start(args);
     return 0;
 }
 

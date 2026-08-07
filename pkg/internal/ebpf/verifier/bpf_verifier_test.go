@@ -16,6 +16,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/btf"
+	"github.com/cilium/ebpf/features"
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/stretchr/testify/require"
 
@@ -277,7 +278,6 @@ func TestBPFVerifierProductionProfiles(t *testing.T) {
 	if err := javabridge.HaveSockOpsNetnsCookie(); err != nil {
 		t.Skipf("Java remote-parent verifier paths are unavailable: %v", err)
 	}
-
 	loadAndVerify(t, "generictracer/apache-java-https", generictracerbpf.LoadBpf, map[string]any{
 		"wakeup_data_bytes":           uint32(232_000),
 		"filter_pids":                 int32(1),
@@ -296,5 +296,19 @@ func TestBPFVerifierProductionProfiles(t *testing.T) {
 		"java_remote_parent_enabled":  true,
 		"ssl_prewrite_max_age_ns":     uint64(30_000_000_000),
 		"jvm_sampling_interval_ns":    uint64(0),
+	})
+	if err := features.HaveProgramType(ebpf.CGroupSockopt); err != nil {
+		t.Logf("skipping Java remote-parent cgroup sockopt verifier profile: %v", err)
+		return
+	}
+	if err := features.HaveMapType(ebpf.SkStorage); err != nil {
+		t.Logf("skipping Java remote-parent socket-storage verifier profile: %v", err)
+		return
+	}
+	loadAndVerify(t, "tpinjector/java-remote-parent", tpinjectorbpf.LoadBpfJavaRemoteParent, map[string]any{
+		"filter_pids":                   int32(1),
+		"g_bpf_debug":                   false,
+		"java_remote_parent_enabled":    true,
+		"java_remote_parent_max_age_ns": uint64(30_000_000_000),
 	})
 }

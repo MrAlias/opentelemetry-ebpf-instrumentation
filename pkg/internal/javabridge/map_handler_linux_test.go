@@ -23,6 +23,39 @@ import (
 
 const testProcessIncarnation = uint64(0x123456789abcdef0)
 
+func boundAliasReplayForTest(value aliasReplayValue) aliasReplayValue {
+	value.Connection = connectionInfo{SourcePort: 1234, DestinationPort: 443}
+	value.ConnectionNetNS = 42
+	value.ConnectionNetNSCookie = 84
+	value.SocketCookie = 86
+	return value
+}
+
+func boundAliasReplayPointerForTest(value aliasReplayValue) *aliasReplayValue {
+	bound := boundAliasReplayForTest(value)
+	return &bound
+}
+
+func boundAliasReplayForStateForTest(
+	handler *MapHandler,
+	key stateKey,
+	state stateValue,
+	value aliasReplayValue,
+) aliasReplayValue {
+	claim := handler.connections.(*fakeBridgeMap).values[connectionInfoNS{
+		Connection: state.Connection,
+		NetNS:      state.ConnectionNetNS,
+	}].(connectionClaim)
+	if claim.Owner != key.Owner {
+		panic("test replay binding owner does not match generation owner")
+	}
+	value.Connection = state.Connection
+	value.ConnectionNetNS = state.ConnectionNetNS
+	value.ConnectionNetNSCookie = claim.NetNSCookie
+	value.SocketCookie = claim.SocketCookie
+	return value
+}
+
 type fakeBridgeMap struct {
 	mu                sync.Mutex
 	values            map[any]any
@@ -211,12 +244,600 @@ func TestMapHandlerKernelMapLayouts(t *testing.T) {
 	assert.Equal(t, uintptr(24), unsafe.Offsetof(replayKey.ObservedMonotonicNS))
 	assert.Equal(t, uintptr(32), unsafe.Offsetof(replayKey.ProcessIncarnation))
 	var replay aliasReplayValue
-	assert.Equal(t, uintptr(16), unsafe.Sizeof(replay))
+	assert.Equal(t, uintptr(72), unsafe.Sizeof(replay))
 	assert.Equal(t, uintptr(8), unsafe.Offsetof(replay.References))
 	assert.Equal(t, uintptr(12), unsafe.Offsetof(replay.Lifecycle))
 	assert.Equal(t, uintptr(13), unsafe.Offsetof(replay.DesiredLifecycle))
 	assert.Equal(t, uintptr(14), unsafe.Offsetof(replay.ProducerTag))
 	assert.Equal(t, uintptr(15), unsafe.Offsetof(replay.Reserved))
+	assert.Equal(t, uintptr(16), unsafe.Offsetof(replay.Connection))
+	assert.Equal(t, uintptr(52), unsafe.Offsetof(replay.ConnectionNetNS))
+	assert.Equal(t, uintptr(56), unsafe.Offsetof(replay.ConnectionNetNSCookie))
+	assert.Equal(t, uintptr(64), unsafe.Offsetof(replay.SocketCookie))
+}
+
+func TestAliasReplayValidatorsRequireCompleteBinding(t *testing.T) {
+	base := boundAliasReplayForTest(aliasReplayValue{
+		TransitionMonotonicNS: uint64(11 * time.Second),
+		References:            1,
+		Lifecycle:             lifecycleActive,
+	})
+	for _, test := range []struct {
+		name   string
+		mutate func(*aliasReplayValue)
+	}{
+		{name: "connection", mutate: func(value *aliasReplayValue) {
+			value.Connection = connectionInfo{}
+		}},
+		{name: "network namespace", mutate: func(value *aliasReplayValue) {
+			value.ConnectionNetNS = 0
+		}},
+		{name: "network namespace cookie", mutate: func(value *aliasReplayValue) {
+			value.ConnectionNetNSCookie = 0
+		}},
+		{name: "socket cookie", mutate: func(value *aliasReplayValue) {
+			value.SocketCookie = 0
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			active := base
+			test.mutate(&active)
+			assert.False(t, validActiveAliasReplay(active))
+			assert.False(t, validAliasReplayActive(active))
+
+			publishing := active
+			publishing.Lifecycle = lifecyclePublishing
+			publishing.DesiredLifecycle = lifecycleConsumed
+			publishing.ProducerTag = generationGoProducerTag
+			assert.False(t, validPublishingAliasReplay(publishing))
+			assert.False(t, validAliasReplayPublishing(publishing))
+			assert.False(t, validTaggedAliasReplayPublishing(publishing))
+
+			final := active
+			final.Lifecycle = lifecycleConsumed
+			assert.False(t, validFinalAliasReplay(final))
+			assert.False(t, validAliasReplayFinal(final))
+		})
+	}
+}
+
+func TestAliasReplayBindingRevalidatesStateAndConnectionTwins(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	for _, test := range []struct {
+		name      string
+		configure func(*MapHandler, stateKey, stateValue, aliasReplayValue)
+		expected  bool
+	}{
+		{name: "state replacement", configure: func(handler *MapHandler, key stateKey, state stateValue, _ aliasReplayValue) {
+			states := handler.states.(*fakeBridgeMap)
+			states.afterLookup = func(count int) {
+				if count != 1 {
+					return
+				}
+				replacement := state
+				replacement.ObservedMonotonicNS++
+				states.mu.Lock()
+				states.values[key] = replacement
+				states.mu.Unlock()
+			}
+		}},
+		{name: "connection replacement", configure: func(handler *MapHandler, _ stateKey, state stateValue, _ aliasReplayValue) {
+			connections := handler.connections.(*fakeBridgeMap)
+			connectionKey := connectionInfoNS{Connection: state.Connection, NetNS: state.ConnectionNetNS}
+			connections.afterLookup = func(count int) {
+				if count != 1 {
+					return
+				}
+				connections.mu.Lock()
+				replacement := connections.values[connectionKey].(connectionClaim)
+				replacement.SocketCookie++
+				connections.values[connectionKey] = replacement
+				connections.mu.Unlock()
+			}
+		}},
+		{name: "cookie connection replacement", configure: func(handler *MapHandler, _ stateKey, state stateValue, replay aliasReplayValue) {
+			cookies := handler.cookieConnections.(*fakeBridgeMap)
+			cookieKey := connectionInfoNetNSCookie{
+				Connection: state.Connection, NetNSCookie: replay.ConnectionNetNSCookie,
+			}
+			cookies.afterLookup = func(count int) {
+				if count != 1 {
+					return
+				}
+				cookies.mu.Lock()
+				replacement := cookies.values[cookieKey].(connectionClaim)
+				replacement.SocketCookie++
+				cookies.values[cookieKey] = replacement
+				cookies.mu.Unlock()
+			}
+		}},
+		{name: "both physical twins detached", configure: func(handler *MapHandler, _ stateKey, state stateValue, replay aliasReplayValue) {
+			delete(handler.connections.(*fakeBridgeMap).values, connectionInfoNS{
+				Connection: state.Connection, NetNS: state.ConnectionNetNS,
+			})
+			delete(handler.cookieConnections.(*fakeBridgeMap).values, connectionInfoNetNSCookie{
+				Connection: state.Connection, NetNSCookie: replay.ConnectionNetNSCookie,
+			})
+		}, expected: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler := testMapHandler(
+				map[Identity]any{owner: validEncodedRecord(t, key.Generation)}, nil, nil,
+			)
+			state := handler.states.(*fakeBridgeMap).values[key].(stateValue)
+			replay := boundAliasReplayForStateForTest(
+				handler, key, state, aliasReplayValue{
+					TransitionMonotonicNS: state.ObservedMonotonicNS,
+					Lifecycle:             lifecycleActive,
+				},
+			)
+			handler.aliasReplays.(*fakeBridgeMap).values[aliasReplayKeyForState(key, state)] = replay
+			test.configure(handler, key, state, replay)
+
+			_, matches, err := aliasReplayBindingMatchesGeneration(
+				handler.aliasReplayGenerationMaps(),
+				aliasReplayGenerationAuthority{},
+				key, state, replay,
+			)
+			require.NoError(t, err)
+			assert.Equal(t, test.expected, matches)
+		})
+	}
+}
+
+type sameSocketSuccessorSnapshot struct {
+	key           stateKey
+	owner         ownerValue
+	fallback      [RecordSize]byte
+	state         stateValue
+	index         generationIndexValue
+	replayKey     aliasReplayKey
+	replay        aliasReplayValue
+	connectionKey connectionInfoNS
+	cookieKey     connectionInfoNetNSCookie
+	connection    connectionClaim
+}
+
+func seedSameSocketSuccessorForTest(
+	t *testing.T,
+	handler *MapHandler,
+	oldKey stateKey,
+	oldState stateValue,
+	generation uint64,
+) sameSocketSuccessorSnapshot {
+	t.Helper()
+	require.NotZero(t, generation)
+	require.NotEqual(t, oldKey.Generation, generation)
+	connectionKey := connectionInfoNS{
+		Connection: oldState.Connection,
+		NetNS:      oldState.ConnectionNetNS,
+	}
+	oldConnection := handler.connections.(*fakeBridgeMap).values[connectionKey].(connectionClaim)
+	connection := oldConnection
+	connection.Generation = generation
+	connection.IncomingGeneration = generation + 1
+	if connection.IncomingGeneration == 0 {
+		connection.IncomingGeneration = 1
+	}
+	cookieKey := connectionInfoNetNSCookie{
+		Connection:  oldState.Connection,
+		NetNSCookie: connection.NetNSCookie,
+	}
+	fallback := validEncodedRecord(t, generation)
+	key := stateKey{Owner: oldKey.Owner, Generation: generation}
+	owner := ownerValue{
+		Generation: generation, ProcessIncarnation: oldState.ProcessIncarnation,
+		Lifecycle: lifecycleActive,
+	}
+	state := stateValue{
+		Lifecycle:           lifecycleActive,
+		Aliases:             1,
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		Connection:          oldState.Connection,
+		ConnectionNetNS:     oldState.ConnectionNetNS,
+		ProcessIncarnation:  oldState.ProcessIncarnation,
+		Response:            fallback,
+	}
+	index := generationIndexValue{
+		Process:             javaProcessIdentity(oldKey.Owner),
+		ProcessIncarnation:  oldState.ProcessIncarnation,
+		ObservedMonotonicNS: state.ObservedMonotonicNS,
+	}
+	handler.remoteParents.(*fakeBridgeMap).values[oldKey.Owner] = fallback
+	handler.owners.(*fakeBridgeMap).values[oldKey.Owner] = owner
+	handler.states.(*fakeBridgeMap).values[key] = state
+	handler.generations.(*fakeBridgeMap).values[key] = index
+	handler.ambiguity.(*fakeBridgeMap).values[key] = uint64(0)
+	handler.connections.(*fakeBridgeMap).values[connectionKey] = connection
+	handler.cookieConnections.(*fakeBridgeMap).values[cookieKey] = connection
+	replayKey := aliasReplayKeyForState(key, state)
+	replay := boundAliasReplayForStateForTest(
+		handler, key, state, aliasReplayValue{
+			TransitionMonotonicNS: state.ObservedMonotonicNS,
+			References:            state.Aliases,
+			Lifecycle:             lifecycleActive,
+		},
+	)
+	handler.aliasReplays.(*fakeBridgeMap).values[replayKey] = replay
+	delete(handler.claims.(*fakeBridgeMap).values, key)
+	delete(handler.terminals.(*fakeBridgeMap).values, oldKey.Owner)
+	return sameSocketSuccessorSnapshot{
+		key: key, owner: owner, fallback: fallback, state: state, index: index,
+		replayKey: replayKey, replay: replay,
+		connectionKey: connectionKey, cookieKey: cookieKey, connection: connection,
+	}
+}
+
+func assertSameSocketSuccessorUnchanged(
+	t *testing.T,
+	handler *MapHandler,
+	snapshot sameSocketSuccessorSnapshot,
+) {
+	t.Helper()
+	assert.Equal(t, snapshot.owner,
+		handler.owners.(*fakeBridgeMap).values[snapshot.key.Owner])
+	assert.Equal(t, snapshot.fallback,
+		handler.remoteParents.(*fakeBridgeMap).values[snapshot.key.Owner])
+	assert.Equal(t, snapshot.state,
+		handler.states.(*fakeBridgeMap).values[snapshot.key])
+	assert.Equal(t, snapshot.index,
+		handler.generations.(*fakeBridgeMap).values[snapshot.key])
+	assert.Equal(t, snapshot.replay,
+		handler.aliasReplays.(*fakeBridgeMap).values[snapshot.replayKey])
+	assert.Equal(t, uint64(0),
+		handler.ambiguity.(*fakeBridgeMap).values[snapshot.key])
+	assert.Equal(t, snapshot.connection,
+		handler.connections.(*fakeBridgeMap).values[snapshot.connectionKey])
+	assert.Equal(t, snapshot.connection,
+		handler.cookieConnections.(*fakeBridgeMap).values[snapshot.cookieKey])
+}
+
+func TestMapHandlerSameSocketSuccessorPreservesGraphWhileFinishingOldAlias(t *testing.T) {
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	oldKey := stateKey{Owner: owner, Generation: 10}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, oldKey.Generation)},
+		map[Identity]any{child: activeTaskLink(owner, oldKey.Generation)},
+		nil,
+	)
+	oldState := handler.states.(*fakeBridgeMap).values[oldKey].(stateValue)
+	oldReplayKey := aliasReplayKeyForState(oldKey, oldState)
+	initialReplay := handler.aliasReplays.(*fakeBridgeMap).values[oldReplayKey].(aliasReplayValue)
+	successor := seedSameSocketSuccessorForTest(t, handler, oldKey, oldState, 11)
+
+	result := handler.HandleTask(child, OperationTake)
+	require.Equal(t, StatusValid, result.Status)
+	assert.Equal(t, oldKey.Generation, result.Generation)
+	assert.True(t, result.IsValidRemoteParent())
+	assert.NotContains(t, handler.states.(*fakeBridgeMap).values, oldKey)
+	assert.NotContains(t, handler.generations.(*fakeBridgeMap).values, oldKey)
+	assert.NotContains(t, handler.ambiguity.(*fakeBridgeMap).values, oldKey)
+	assert.NotContains(t, handler.claims.(*fakeBridgeMap).values, oldKey)
+	assert.NotContains(t, handler.ownerGuards.(*fakeBridgeMap).values, owner)
+	assertSameSocketSuccessorUnchanged(t, handler, successor)
+	finalReplay := handler.aliasReplays.(*fakeBridgeMap).values[oldReplayKey].(aliasReplayValue)
+	assert.True(t, validFinalAliasReplay(finalReplay))
+	assert.Equal(t, lifecycleConsumed, finalReplay.Lifecycle)
+	assert.Equal(t, aliasReplayBindingOf(initialReplay), aliasReplayBindingOf(finalReplay))
+	assert.Equal(t, terminalValue{
+		Generation:          oldKey.Generation,
+		ObservedMonotonicNS: oldState.ObservedMonotonicNS,
+		ProcessIncarnation:  oldState.ProcessIncarnation,
+		Lifecycle:           lifecycleConsumed,
+	}, handler.terminals.(*fakeBridgeMap).values[owner])
+}
+
+func TestMapHandlerSameSocketSuccessorWithoutConnectionProofReturnsOverload(t *testing.T) {
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	oldKey := stateKey{Owner: owner, Generation: 10}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, oldKey.Generation)},
+		map[Identity]any{child: activeTaskLink(owner, oldKey.Generation)}, nil,
+	)
+	oldState := handler.states.(*fakeBridgeMap).values[oldKey].(stateValue)
+	oldReplayKey := aliasReplayKeyForState(oldKey, oldState)
+	oldReplay := handler.aliasReplays.(*fakeBridgeMap).values[oldReplayKey].(aliasReplayValue)
+	successor := seedSameSocketSuccessorForTest(t, handler, oldKey, oldState, 11)
+	delete(handler.connections.(*fakeBridgeMap).values, successor.connectionKey)
+	delete(handler.cookieConnections.(*fakeBridgeMap).values, successor.cookieKey)
+
+	result := handler.HandleTask(child, OperationTake)
+	assert.Equal(t, StatusOverload, result.Status)
+	assert.False(t, result.IsValidRemoteParent())
+	assert.Equal(t, oldState, handler.states.(*fakeBridgeMap).values[oldKey])
+	assert.Contains(t, handler.generations.(*fakeBridgeMap).values, oldKey)
+	assert.NotZero(t, handler.ambiguity.(*fakeBridgeMap).values[oldKey])
+	retainedClaim := handler.claims.(*fakeBridgeMap).values[oldKey].(generationClaim)
+	assert.True(t, validGenerationCleanupClaim(retainedClaim))
+	assert.Equal(t, lifecycleConsumed, retainedClaim.Reserved[0])
+	retainedGuard := handler.ownerGuards.(*fakeBridgeMap).values[owner].(generationClaim)
+	assert.True(t, validGenerationCleanupGuard(owner, retainedGuard))
+	finalReplay := handler.aliasReplays.(*fakeBridgeMap).values[oldReplayKey].(aliasReplayValue)
+	assert.True(t, validFinalAliasReplay(finalReplay))
+	assert.Equal(t, lifecycleConsumed, finalReplay.Lifecycle)
+	assert.Equal(t, aliasReplayBindingOf(oldReplay), aliasReplayBindingOf(finalReplay))
+	assert.Equal(t, successor.owner, handler.owners.(*fakeBridgeMap).values[owner])
+	assert.Equal(t, successor.fallback, handler.remoteParents.(*fakeBridgeMap).values[owner])
+	assert.Equal(t, successor.state, handler.states.(*fakeBridgeMap).values[successor.key])
+	assert.Equal(t, successor.index, handler.generations.(*fakeBridgeMap).values[successor.key])
+	assert.NotContains(t, handler.connections.(*fakeBridgeMap).values, successor.connectionKey)
+	assert.NotContains(t, handler.cookieConnections.(*fakeBridgeMap).values, successor.cookieKey)
+}
+
+func TestMapHandlerSameSocketSuccessorReplacementAfterClaimPromotionReturnsOverload(t *testing.T) {
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	oldKey := stateKey{Owner: owner, Generation: 10}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, oldKey.Generation)},
+		map[Identity]any{child: activeTaskLink(owner, oldKey.Generation)}, nil,
+	)
+	oldState := handler.states.(*fakeBridgeMap).values[oldKey].(stateValue)
+	oldReplayKey := aliasReplayKeyForState(oldKey, oldState)
+	successor := seedSameSocketSuccessorForTest(t, handler, oldKey, oldState, 11)
+	replaced := false
+	handler.claims.(*fakeBridgeMap).afterUpdate = func(updatedKey, updated any) {
+		claim, ok := updated.(generationClaim)
+		if replaced || !ok || updatedKey != oldKey || claim.Lifecycle != lifecycleConsumed {
+			return
+		}
+		replaced = true
+		value := handler.states.(*fakeBridgeMap).values[successor.key].(stateValue)
+		value.Reserved[0] = 1
+		handler.states.(*fakeBridgeMap).values[successor.key] = value
+	}
+
+	result := handler.HandleTask(child, OperationTake)
+	require.True(t, replaced)
+	assert.Equal(t, StatusOverload, result.Status)
+	assert.False(t, result.IsValidRemoteParent())
+	assert.Equal(t, oldState, handler.states.(*fakeBridgeMap).values[oldKey])
+	assert.Contains(t, handler.generations.(*fakeBridgeMap).values, oldKey)
+	assert.NotZero(t, handler.ambiguity.(*fakeBridgeMap).values[oldKey])
+	retained := handler.claims.(*fakeBridgeMap).values[oldKey].(generationClaim)
+	assert.True(t, validGenerationCleanupClaim(retained))
+	assert.NotContains(t, handler.ownerGuards.(*fakeBridgeMap).values, owner)
+	assert.NotContains(t, handler.terminals.(*fakeBridgeMap).values, owner)
+	replay := handler.aliasReplays.(*fakeBridgeMap).values[oldReplayKey].(aliasReplayValue)
+	assert.True(t, validPublishingAliasReplay(replay))
+	assert.Equal(t, successor.owner, handler.owners.(*fakeBridgeMap).values[owner])
+	assert.Equal(t, successor.fallback, handler.remoteParents.(*fakeBridgeMap).values[owner])
+	assert.Equal(t, successor.index, handler.generations.(*fakeBridgeMap).values[successor.key])
+	assert.Equal(t, successor.connection,
+		handler.connections.(*fakeBridgeMap).values[successor.connectionKey])
+	assert.Equal(t, successor.connection,
+		handler.cookieConnections.(*fakeBridgeMap).values[successor.cookieKey])
+	mutatedState := handler.states.(*fakeBridgeMap).values[successor.key].(stateValue)
+	assert.Equal(t, uint8(1), mutatedState.Reserved[0])
+	retry := handler.HandleTask(child, OperationTake)
+	assert.Equal(t, StatusAlreadyConsumed, retry.Status)
+	assert.False(t, retry.IsValidRemoteParent())
+}
+
+func TestMapHandlerSameSocketSuccessorReplacementAfterFinishGuardReturnsOverload(t *testing.T) {
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	oldKey := stateKey{Owner: owner, Generation: 10}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, oldKey.Generation)},
+		map[Identity]any{child: activeTaskLink(owner, oldKey.Generation)}, nil,
+	)
+	oldState := handler.states.(*fakeBridgeMap).values[oldKey].(stateValue)
+	oldReplayKey := aliasReplayKeyForState(oldKey, oldState)
+	successor := seedSameSocketSuccessorForTest(t, handler, oldKey, oldState, 11)
+	replaced := false
+	handler.ownerGuards.(*fakeBridgeMap).afterUpdate = func(updatedKey, _ any) {
+		if replaced || updatedKey != owner {
+			return
+		}
+		replaced = true
+		value := handler.states.(*fakeBridgeMap).values[successor.key].(stateValue)
+		value.Reserved[0] = 1
+		handler.states.(*fakeBridgeMap).values[successor.key] = value
+	}
+
+	result := handler.HandleTask(child, OperationTake)
+	require.True(t, replaced)
+	assert.Equal(t, StatusOverload, result.Status)
+	assert.False(t, result.IsValidRemoteParent())
+	assert.Equal(t, oldState, handler.states.(*fakeBridgeMap).values[oldKey])
+	assert.Contains(t, handler.generations.(*fakeBridgeMap).values, oldKey)
+	assert.NotZero(t, handler.ambiguity.(*fakeBridgeMap).values[oldKey])
+	retained := handler.claims.(*fakeBridgeMap).values[oldKey].(generationClaim)
+	assert.True(t, validGenerationCleanupClaim(retained))
+	guard := handler.ownerGuards.(*fakeBridgeMap).values[owner].(generationClaim)
+	assert.True(t, validGenerationCleanupGuard(owner, guard))
+	assert.Equal(t, terminalValue{
+		Generation: oldKey.Generation, ObservedMonotonicNS: oldState.ObservedMonotonicNS,
+		ProcessIncarnation: oldState.ProcessIncarnation, Lifecycle: lifecycleConsumed,
+	}, handler.terminals.(*fakeBridgeMap).values[owner])
+	finalReplay := handler.aliasReplays.(*fakeBridgeMap).values[oldReplayKey].(aliasReplayValue)
+	assert.True(t, validFinalAliasReplay(finalReplay))
+	assert.Equal(t, successor.owner, handler.owners.(*fakeBridgeMap).values[owner])
+	assert.Equal(t, successor.fallback, handler.remoteParents.(*fakeBridgeMap).values[owner])
+	assert.Equal(t, successor.index, handler.generations.(*fakeBridgeMap).values[successor.key])
+	assert.Equal(t, successor.connection,
+		handler.connections.(*fakeBridgeMap).values[successor.connectionKey])
+	assert.Equal(t, successor.connection,
+		handler.cookieConnections.(*fakeBridgeMap).values[successor.cookieKey])
+	mutatedState := handler.states.(*fakeBridgeMap).values[successor.key].(stateValue)
+	assert.Equal(t, uint8(1), mutatedState.Reserved[0])
+}
+
+func TestAliasReplaySameSocketSuccessorProofRequiresCompleteGraph(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	oldKey := stateKey{Owner: owner, Generation: 10}
+	for _, test := range []struct {
+		name   string
+		mutate func(*MapHandler, sameSocketSuccessorSnapshot)
+	}{
+		{name: "owner missing", mutate: func(handler *MapHandler, _ sameSocketSuccessorSnapshot) {
+			delete(handler.owners.(*fakeBridgeMap).values, owner)
+		}},
+		{name: "owner malformed", mutate: func(handler *MapHandler, successor sameSocketSuccessorSnapshot) {
+			value := successor.owner
+			value.Reserved[0] = 1
+			handler.owners.(*fakeBridgeMap).values[owner] = value
+		}},
+		{name: "fallback missing", mutate: func(handler *MapHandler, _ sameSocketSuccessorSnapshot) {
+			delete(handler.remoteParents.(*fakeBridgeMap).values, owner)
+		}},
+		{name: "fallback generation mismatch", mutate: func(handler *MapHandler, _ sameSocketSuccessorSnapshot) {
+			handler.remoteParents.(*fakeBridgeMap).values[owner] = validEncodedRecord(t, 12)
+		}},
+		{name: "state missing", mutate: func(handler *MapHandler, successor sameSocketSuccessorSnapshot) {
+			delete(handler.states.(*fakeBridgeMap).values, successor.key)
+		}},
+		{name: "state response mismatch", mutate: func(handler *MapHandler, successor sameSocketSuccessorSnapshot) {
+			value := successor.state
+			value.Response = validEncodedRecord(t, 12)
+			handler.states.(*fakeBridgeMap).values[successor.key] = value
+		}},
+		{name: "index missing", mutate: func(handler *MapHandler, successor sameSocketSuccessorSnapshot) {
+			delete(handler.generations.(*fakeBridgeMap).values, successor.key)
+		}},
+		{name: "index mismatch", mutate: func(handler *MapHandler, successor sameSocketSuccessorSnapshot) {
+			value := successor.index
+			value.ObservedMonotonicNS++
+			handler.generations.(*fakeBridgeMap).values[successor.key] = value
+		}},
+		{name: "process incarnation missing", mutate: func(handler *MapHandler, _ sameSocketSuccessorSnapshot) {
+			delete(handler.incarnations.(*fakeBridgeMap).values, javaProcessIdentity(owner))
+		}},
+		{name: "successor ambiguity missing", mutate: func(handler *MapHandler, successor sameSocketSuccessorSnapshot) {
+			delete(handler.ambiguity.(*fakeBridgeMap).values, successor.key)
+		}},
+		{name: "successor ambiguity nonzero", mutate: func(handler *MapHandler, successor sameSocketSuccessorSnapshot) {
+			handler.ambiguity.(*fakeBridgeMap).values[successor.key] = uint64(1)
+		}},
+		{name: "successor claim present", mutate: func(handler *MapHandler, successor sameSocketSuccessorSnapshot) {
+			handler.claims.(*fakeBridgeMap).values[successor.key] =
+				testGenerationClaim(lifecyclePublishing)
+		}},
+		{name: "netns connection missing", mutate: func(handler *MapHandler, successor sameSocketSuccessorSnapshot) {
+			delete(handler.connections.(*fakeBridgeMap).values, successor.connectionKey)
+		}},
+		{name: "cookie connection missing", mutate: func(handler *MapHandler, successor sameSocketSuccessorSnapshot) {
+			delete(handler.cookieConnections.(*fakeBridgeMap).values, successor.cookieKey)
+		}},
+		{name: "connection twins differ", mutate: func(handler *MapHandler, successor sameSocketSuccessorSnapshot) {
+			value := successor.connection
+			value.SocketCookie++
+			handler.cookieConnections.(*fakeBridgeMap).values[successor.cookieKey] = value
+		}},
+		{name: "connection binding changed", mutate: func(handler *MapHandler, successor sameSocketSuccessorSnapshot) {
+			value := successor.connection
+			value.SocketCookie++
+			handler.connections.(*fakeBridgeMap).values[successor.connectionKey] = value
+			handler.cookieConnections.(*fakeBridgeMap).values[successor.cookieKey] = value
+		}},
+		{name: "successor terminal", mutate: func(handler *MapHandler, successor sameSocketSuccessorSnapshot) {
+			handler.terminals.(*fakeBridgeMap).values[owner] = terminalValue{
+				Generation: successor.key.Generation, ObservedMonotonicNS: successor.state.ObservedMonotonicNS,
+				ProcessIncarnation: successor.state.ProcessIncarnation, Lifecycle: lifecycleConsumed,
+			}
+		}},
+		{name: "foreign terminal", mutate: func(handler *MapHandler, _ sameSocketSuccessorSnapshot) {
+			handler.terminals.(*fakeBridgeMap).values[owner] = terminalValue{
+				Generation: 12, ObservedMonotonicNS: uint64(12 * time.Second),
+				ProcessIncarnation: testProcessIncarnation, Lifecycle: lifecycleConsumed,
+			}
+		}},
+		{name: "malformed terminal", mutate: func(handler *MapHandler, _ sameSocketSuccessorSnapshot) {
+			handler.terminals.(*fakeBridgeMap).values[owner] = terminalValue{
+				Generation: oldKey.Generation, ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation: testProcessIncarnation, Lifecycle: lifecycleCleanup,
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler := testMapHandler(
+				map[Identity]any{owner: validEncodedRecord(t, oldKey.Generation)},
+				map[Identity]any{Identity{TID: 4, PID: 2, Namespace: 1}: activeTaskLink(owner, oldKey.Generation)},
+				nil,
+			)
+			oldState := handler.states.(*fakeBridgeMap).values[oldKey].(stateValue)
+			replay := handler.aliasReplays.(*fakeBridgeMap).
+				values[aliasReplayKeyForState(oldKey, oldState)].(aliasReplayValue)
+			successor := seedSameSocketSuccessorForTest(t, handler, oldKey, oldState, 11)
+			test.mutate(handler, successor)
+
+			_, matches, err := aliasReplayBindingMatchesGeneration(
+				handler.aliasReplayGenerationMaps(), aliasReplayGenerationAuthority{
+					ambiguity: 0, requireOldIndex: true, requireOldIncarnation: true,
+				}, oldKey, oldState, replay,
+			)
+			require.NoError(t, err)
+			assert.False(t, matches)
+		})
+	}
+}
+
+func TestAliasReplaySameSocketSuccessorProofAcceptsExactOldTerminal(t *testing.T) {
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	oldKey := stateKey{Owner: owner, Generation: 10}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, oldKey.Generation)},
+		map[Identity]any{child: activeTaskLink(owner, oldKey.Generation)}, nil,
+	)
+	oldState := handler.states.(*fakeBridgeMap).values[oldKey].(stateValue)
+	replay := handler.aliasReplays.(*fakeBridgeMap).
+		values[aliasReplayKeyForState(oldKey, oldState)].(aliasReplayValue)
+	seedSameSocketSuccessorForTest(t, handler, oldKey, oldState, 11)
+	claim := testGoGenerationClaim(lifecycleConsumed)
+	handler.claims.(*fakeBridgeMap).values[oldKey] = claim
+	handler.terminals.(*fakeBridgeMap).values[owner] = terminalValue{
+		Generation: oldKey.Generation, ObservedMonotonicNS: oldState.ObservedMonotonicNS,
+		ProcessIncarnation: oldState.ProcessIncarnation, Lifecycle: lifecycleConsumed,
+	}
+
+	proof, matches, err := aliasReplayBindingMatchesGeneration(
+		handler.aliasReplayGenerationMaps(), aliasReplayGenerationAuthority{
+			claimPresent: true, claim: claim, ambiguity: 0,
+			requireOldIndex: true, requireOldIncarnation: true,
+		}, oldKey, oldState, replay,
+	)
+	require.NoError(t, err)
+	assert.True(t, matches)
+	assert.True(t, proof.successor)
+}
+
+func TestAliasReplaySameSocketSuccessorProofRejectsReplacementBetweenPasses(t *testing.T) {
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	oldKey := stateKey{Owner: owner, Generation: 10}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, oldKey.Generation)},
+		map[Identity]any{child: activeTaskLink(owner, oldKey.Generation)}, nil,
+	)
+	oldState := handler.states.(*fakeBridgeMap).values[oldKey].(stateValue)
+	replay := handler.aliasReplays.(*fakeBridgeMap).
+		values[aliasReplayKeyForState(oldKey, oldState)].(aliasReplayValue)
+	seedSameSocketSuccessorForTest(t, handler, oldKey, oldState, 11)
+	owners := handler.owners.(*fakeBridgeMap)
+	replaced := false
+	owners.afterLookup = func(count int) {
+		if count != 1 || replaced {
+			return
+		}
+		replaced = true
+		value := owners.values[owner].(ownerValue)
+		value.Reserved[0] = 1
+		owners.values[owner] = value
+	}
+
+	_, matches, err := aliasReplayBindingMatchesGeneration(
+		handler.aliasReplayGenerationMaps(), aliasReplayGenerationAuthority{
+			ambiguity: 0, requireOldIndex: true, requireOldIncarnation: true,
+		}, oldKey, oldState, replay,
+	)
+	require.NoError(t, err)
+	assert.True(t, replaced)
+	assert.False(t, matches)
 }
 
 func TestFakeBridgeMapHonorsUpdateFlags(t *testing.T) {
@@ -514,21 +1135,22 @@ func TestMapHandlerRejectsMissingOwnerMap(t *testing.T) {
 
 func TestMinimizeDisabledMapsPreservesVirtualThreadTracingCapacity(t *testing.T) {
 	spec := &ebpf.CollectionSpec{Maps: map[string]*ebpf.MapSpec{
-		"incoming_trace_ambiguity":           {MaxEntries: 128},
-		"incoming_trace_candidates":          {MaxEntries: 128},
-		"incoming_trace_claims":              {MaxEntries: 128},
-		"incoming_trace_heads":               {MaxEntries: 128},
-		"java_authorized_processes":          {MaxEntries: 128},
-		"java_process_incarnations":          {MaxEntries: 128},
-		"java_remote_parent_receive_cursors": {MaxEntries: 128},
-		"java_thread_mapping_claims":         {MaxEntries: 128},
-		"java_vt_identities":                 {MaxEntries: 128},
-		"java_vt_threads":                    {MaxEntries: 128},
-		"sk_ssl_prewrite_map":                {Type: ebpf.SkStorage},
-		"ssl_prewrite_connection_ambiguity":  {MaxEntries: 128},
-		"ssl_prewrite_connection_claims":     {MaxEntries: 128},
-		"ssl_prewrite_connection_owners":     {MaxEntries: 128},
-		"ssl_prewrite_tp":                    {MaxEntries: 128},
+		"incoming_trace_ambiguity":          {MaxEntries: 128},
+		"incoming_trace_candidates":         {MaxEntries: 128},
+		"incoming_trace_claims":             {MaxEntries: 128},
+		"incoming_trace_heads":              {MaxEntries: 128},
+		"java_authorized_processes":         {MaxEntries: 128},
+		"java_process_incarnations":         {MaxEntries: 128},
+		"jrp_recv_cur":                      {MaxEntries: 128},
+		"jrp_recv_guard":                    {MaxEntries: 128},
+		"java_thread_mapping_claims":        {MaxEntries: 128},
+		"java_vt_identities":                {MaxEntries: 128},
+		"java_vt_threads":                   {MaxEntries: 128},
+		"sk_ssl_prewrite_map":               {Type: ebpf.SkStorage},
+		"ssl_prewrite_connection_ambiguity": {MaxEntries: 128},
+		"ssl_prewrite_connection_claims":    {MaxEntries: 128},
+		"ssl_prewrite_connection_owners":    {MaxEntries: 128},
+		"ssl_prewrite_tp":                   {MaxEntries: 128},
 	}}
 
 	MinimizeDisabledMaps(spec)
@@ -538,7 +1160,8 @@ func TestMinimizeDisabledMapsPreservesVirtualThreadTracingCapacity(t *testing.T)
 		"incoming_trace_candidates",
 		"incoming_trace_claims",
 		"incoming_trace_heads",
-		"java_remote_parent_receive_cursors",
+		"jrp_recv_cur",
+		"jrp_recv_guard",
 		"java_thread_mapping_claims",
 		"ssl_prewrite_connection_ambiguity",
 		"ssl_prewrite_connection_claims",
@@ -1091,11 +1714,11 @@ func TestMapHandlerExactClaimOutranksAliasReplay(t *testing.T) {
 	delete(handler.ambiguity.(*fakeBridgeMap).values, key)
 	handler.claims.(*fakeBridgeMap).values[key] = testGenerationClaim(lifecycleConsumed)
 	handler.aliasReplays.(*fakeBridgeMap).values[aliasReplayKeyForState(key, state)] =
-		aliasReplayValue{
+		boundAliasReplayForTest(aliasReplayValue{
 			TransitionMonotonicNS: uint64(11 * time.Second),
 			References:            1,
 			Lifecycle:             lifecycleAmbiguous,
-		}
+		})
 
 	result := handler.HandleTask(child, OperationTake)
 	assert.Equal(t, StatusAlreadyConsumed, result.Status)
@@ -1115,11 +1738,11 @@ func TestMapHandlerAliasReplayRequiresCurrentExactTaskLink(t *testing.T) {
 	delete(handler.generations.(*fakeBridgeMap).values, key)
 	delete(handler.ambiguity.(*fakeBridgeMap).values, key)
 	handler.aliasReplays.(*fakeBridgeMap).values[aliasReplayKeyForState(key, state)] =
-		aliasReplayValue{
+		boundAliasReplayForTest(aliasReplayValue{
 			TransitionMonotonicNS: uint64(11 * time.Second),
 			References:            1,
 			Lifecycle:             lifecycleConsumed,
-		}
+		})
 	replacement := activeTaskLink(owner, 11)
 	handler.aliasReplays.(*fakeBridgeMap).afterLookup = func(count int) {
 		if count == 1 {
@@ -1140,11 +1763,11 @@ func TestMapHandlerDirectLookupIgnoresAliasReplay(t *testing.T) {
 		Generation:          10,
 		ObservedMonotonicNS: uint64(10 * time.Second),
 		ProcessIncarnation:  testProcessIncarnation,
-	}] = aliasReplayValue{
+	}] = boundAliasReplayForTest(aliasReplayValue{
 		TransitionMonotonicNS: uint64(11 * time.Second),
 		References:            1,
 		Lifecycle:             lifecycleConsumed,
-	}
+	})
 
 	assert.Equal(t, StatusMissing, handler.Handle(owner, OperationTake).Status)
 }
@@ -1185,11 +1808,11 @@ func TestMapHandlerDirectLiveGenerationRequiresExactClaimForFinalAliasReplay(t *
 			key := stateKey{Owner: owner, Generation: 10}
 			state := handler.states.(*fakeBridgeMap).values[key].(stateValue)
 			replayKey := aliasReplayKeyForState(key, state)
-			replay := aliasReplayValue{
+			replay := boundAliasReplayForStateForTest(handler, key, state, aliasReplayValue{
 				TransitionMonotonicNS: uint64(11 * time.Second),
 				References:            state.Aliases,
 				Lifecycle:             lifecycleConsumed,
-			}
+			})
 			handler.aliasReplays.(*fakeBridgeMap).values[replayKey] = replay
 			if test.withClaim {
 				handler.claims.(*fakeBridgeMap).values[key] =
@@ -1226,15 +1849,101 @@ func TestMapHandlerTaskLiveGenerationMayReplayFinalAliasOutcome(t *testing.T) {
 			key := stateKey{Owner: owner, Generation: 10}
 			state := handler.states.(*fakeBridgeMap).values[key].(stateValue)
 			replayKey := aliasReplayKeyForState(key, state)
-			handler.aliasReplays.(*fakeBridgeMap).values[replayKey] = aliasReplayValue{
+			handler.aliasReplays.(*fakeBridgeMap).values[replayKey] = boundAliasReplayForStateForTest(handler, key, state, aliasReplayValue{
 				TransitionMonotonicNS: uint64(11 * time.Second),
 				References:            test.references,
 				Lifecycle:             lifecycleConsumed,
-			}
+			})
 
 			result := handler.HandleTask(child, OperationTake)
 			assert.Equal(t, test.expected, result.Status)
 			assert.False(t, result.IsValidRemoteParent())
+		})
+	}
+}
+
+func TestMapHandlerRejectsAliasReplayBindingMismatch(t *testing.T) {
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	for _, test := range []struct {
+		name   string
+		mutate func(*MapHandler, aliasReplayKey, stateValue)
+	}{
+		{name: "replay connection", mutate: func(handler *MapHandler, replayKey aliasReplayKey, _ stateValue) {
+			replay := handler.aliasReplays.(*fakeBridgeMap).values[replayKey].(aliasReplayValue)
+			replay.Connection.SourcePort++
+			handler.aliasReplays.(*fakeBridgeMap).values[replayKey] = replay
+		}},
+		{name: "replay network namespace", mutate: func(handler *MapHandler, replayKey aliasReplayKey, _ stateValue) {
+			replay := handler.aliasReplays.(*fakeBridgeMap).values[replayKey].(aliasReplayValue)
+			replay.ConnectionNetNS++
+			handler.aliasReplays.(*fakeBridgeMap).values[replayKey] = replay
+		}},
+		{name: "replay network namespace cookie", mutate: func(handler *MapHandler, replayKey aliasReplayKey, _ stateValue) {
+			replay := handler.aliasReplays.(*fakeBridgeMap).values[replayKey].(aliasReplayValue)
+			replay.ConnectionNetNSCookie++
+			handler.aliasReplays.(*fakeBridgeMap).values[replayKey] = replay
+		}},
+		{name: "replay socket cookie", mutate: func(handler *MapHandler, replayKey aliasReplayKey, _ stateValue) {
+			replay := handler.aliasReplays.(*fakeBridgeMap).values[replayKey].(aliasReplayValue)
+			replay.SocketCookie++
+			handler.aliasReplays.(*fakeBridgeMap).values[replayKey] = replay
+		}},
+		{name: "connection twins differ", mutate: func(handler *MapHandler, _ aliasReplayKey, state stateValue) {
+			connectionKey := connectionInfoNS{Connection: state.Connection, NetNS: state.ConnectionNetNS}
+			claim := handler.connections.(*fakeBridgeMap).values[connectionKey].(connectionClaim)
+			claim.SocketCookie++
+			handler.connections.(*fakeBridgeMap).values[connectionKey] = claim
+		}},
+		{name: "cookie twin missing", mutate: func(handler *MapHandler, replayKey aliasReplayKey, state stateValue) {
+			replay := handler.aliasReplays.(*fakeBridgeMap).values[replayKey].(aliasReplayValue)
+			delete(handler.cookieConnections.(*fakeBridgeMap).values, connectionInfoNetNSCookie{
+				Connection: state.Connection, NetNSCookie: replay.ConnectionNetNSCookie,
+			})
+		}},
+		{name: "foreign connection owner", mutate: func(handler *MapHandler, replayKey aliasReplayKey, state stateValue) {
+			replay := handler.aliasReplays.(*fakeBridgeMap).values[replayKey].(aliasReplayValue)
+			connectionKey := connectionInfoNS{Connection: state.Connection, NetNS: state.ConnectionNetNS}
+			cookieKey := connectionInfoNetNSCookie{
+				Connection: state.Connection, NetNSCookie: replay.ConnectionNetNSCookie,
+			}
+			claim := handler.connections.(*fakeBridgeMap).values[connectionKey].(connectionClaim)
+			claim.Owner.TID++
+			handler.connections.(*fakeBridgeMap).values[connectionKey] = claim
+			handler.cookieConnections.(*fakeBridgeMap).values[cookieKey] = claim
+		}},
+		{name: "malformed connection generation", mutate: func(handler *MapHandler, replayKey aliasReplayKey, state stateValue) {
+			replay := handler.aliasReplays.(*fakeBridgeMap).values[replayKey].(aliasReplayValue)
+			connectionKey := connectionInfoNS{Connection: state.Connection, NetNS: state.ConnectionNetNS}
+			cookieKey := connectionInfoNetNSCookie{
+				Connection: state.Connection, NetNSCookie: replay.ConnectionNetNSCookie,
+			}
+			claim := handler.connections.(*fakeBridgeMap).values[connectionKey].(connectionClaim)
+			claim.IncomingGeneration = 0
+			handler.connections.(*fakeBridgeMap).values[connectionKey] = claim
+			handler.cookieConnections.(*fakeBridgeMap).values[cookieKey] = claim
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler := testMapHandler(
+				map[Identity]any{owner: validEncodedRecord(t, key.Generation)},
+				map[Identity]any{child: activeTaskLink(owner, key.Generation)},
+				nil,
+			)
+			state := handler.states.(*fakeBridgeMap).values[key].(stateValue)
+			replayKey := aliasReplayKeyForState(key, state)
+			test.mutate(handler, replayKey, state)
+			mutatedReplay := handler.aliasReplays.(*fakeBridgeMap).values[replayKey].(aliasReplayValue)
+
+			result := handler.HandleTask(child, OperationTake)
+			assert.Equal(t, StatusAmbiguous, result.Status)
+			assert.False(t, result.IsValidRemoteParent())
+			assert.Equal(t, state, handler.states.(*fakeBridgeMap).values[key])
+			assert.Equal(t, mutatedReplay, handler.aliasReplays.(*fakeBridgeMap).values[replayKey])
+			assert.NotContains(t, handler.claims.(*fakeBridgeMap).values, key)
+			assert.NotContains(t, handler.ownerGuards.(*fakeBridgeMap).values, owner)
+			assert.NotContains(t, handler.terminals.(*fakeBridgeMap).values, owner)
 		})
 	}
 }
@@ -1249,26 +1958,26 @@ func TestMapHandlerTaskRejectsZeroReferenceAliasReplayWithoutClaim(t *testing.T)
 	}{
 		{
 			name: "active",
-			replay: aliasReplayValue{
+			replay: boundAliasReplayForTest(aliasReplayValue{
 				TransitionMonotonicNS: uint64(11 * time.Second),
 				Lifecycle:             lifecycleActive,
-			},
+			}),
 		},
 		{
 			name: "publishing",
-			replay: aliasReplayValue{
+			replay: boundAliasReplayForTest(aliasReplayValue{
 				TransitionMonotonicNS: uint64(11 * time.Second),
 				Lifecycle:             lifecyclePublishing,
 				DesiredLifecycle:      lifecycleConsumed,
 				ProducerTag:           generationGoProducerTag,
-			},
+			}),
 		},
 		{
 			name: "final",
-			replay: aliasReplayValue{
+			replay: boundAliasReplayForTest(aliasReplayValue{
 				TransitionMonotonicNS: uint64(11 * time.Second),
 				Lifecycle:             lifecycleConsumed,
-			},
+			}),
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -1308,12 +2017,12 @@ func TestMapHandlerExactPublishingClaimOutranksZeroReferenceReplay(t *testing.T)
 	require.True(t, ok)
 	handler.claims.(*fakeBridgeMap).values[key] = claim
 	handler.aliasReplays.(*fakeBridgeMap).values[aliasReplayKeyForState(key, state)] =
-		aliasReplayValue{
+		boundAliasReplayForTest(aliasReplayValue{
 			TransitionMonotonicNS: claim.ObservedMonotonicNS,
 			Lifecycle:             lifecyclePublishing,
 			DesiredLifecycle:      lifecycleConsumed,
 			ProducerTag:           generationGoProducerTag,
-		}
+		})
 
 	result := handler.HandleTask(child, OperationTake)
 	assert.Equal(t, StatusOverload, result.Status)
@@ -1381,10 +2090,11 @@ func TestMapHandlerAcceptsZeroReferenceActiveReplayWithoutAliases(t *testing.T) 
 	)
 	state := handler.states.(*fakeBridgeMap).values[key].(stateValue)
 	replayKey := aliasReplayKeyForState(key, state)
-	handler.aliasReplays.(*fakeBridgeMap).values[replayKey] = aliasReplayValue{
+	initialReplay := boundAliasReplayForStateForTest(handler, key, state, aliasReplayValue{
 		TransitionMonotonicNS: state.ObservedMonotonicNS,
 		Lifecycle:             lifecycleActive,
-	}
+	})
+	handler.aliasReplays.(*fakeBridgeMap).values[replayKey] = initialReplay
 
 	result := handler.Handle(owner, OperationTake)
 	assert.Equal(t, StatusValid, result.Status)
@@ -1393,6 +2103,7 @@ func TestMapHandlerAcceptsZeroReferenceActiveReplayWithoutAliases(t *testing.T) 
 	assert.True(t, validFinalAliasReplay(finalReplay))
 	assert.Equal(t, lifecycleConsumed, finalReplay.Lifecycle)
 	assert.Zero(t, finalReplay.References)
+	assert.Equal(t, aliasReplayBindingOf(initialReplay), aliasReplayBindingOf(finalReplay))
 }
 
 func TestMapHandlerAliasReplayCommitFailureRetainsGenerationFences(t *testing.T) {
@@ -1442,13 +2153,160 @@ func TestMapHandlerAliasReplayCommitFailureRetainsGenerationFences(t *testing.T)
 			test.configure(replays)
 
 			result := handler.HandleTask(child, OperationTake)
-			assert.Equal(t, StatusValid, result.Status)
+			assert.Equal(t, StatusOverload, result.Status)
+			assert.False(t, result.IsValidRemoteParent())
 			assert.Contains(t, handler.states.(*fakeBridgeMap).values, key)
 			assert.Contains(t, handler.generations.(*fakeBridgeMap).values, key)
 			assert.Contains(t, handler.claims.(*fakeBridgeMap).values, key)
 			assert.Contains(t, handler.ownerGuards.(*fakeBridgeMap).values, owner)
 			assert.NotZero(t, handler.ambiguity.(*fakeBridgeMap).values[key])
 		})
+	}
+}
+
+func TestMapHandlerAliasReplayFinishProofRejectsBindingSubstitution(t *testing.T) {
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	handler := testMapHandler(
+		map[Identity]any{owner: validEncodedRecord(t, key.Generation)},
+		map[Identity]any{child: activeTaskLink(owner, key.Generation)},
+		nil,
+	)
+	state := handler.states.(*fakeBridgeMap).values[key].(stateValue)
+	replayKey := aliasReplayKeyForState(key, state)
+	initialReplay := handler.aliasReplays.(*fakeBridgeMap).values[replayKey].(aliasReplayValue)
+	replays := handler.aliasReplays.(*fakeBridgeMap)
+	guards := handler.ownerGuards.(*fakeBridgeMap)
+	substituted := false
+	replays.afterUpdate = func(_ any, updated any) {
+		if updated.(aliasReplayValue).Lifecycle != lifecycleConsumed {
+			return
+		}
+		guards.afterLookupResult = func(lookedUpKey any, err error) {
+			if substituted || err != nil || lookedUpKey != owner {
+				return
+			}
+			substituted = true
+			replays.mu.Lock()
+			replacement := replays.values[replayKey].(aliasReplayValue)
+			replacement.SocketCookie++
+			replays.values[replayKey] = replacement
+			replays.mu.Unlock()
+		}
+	}
+
+	result := handler.HandleTask(child, OperationTake)
+	require.True(t, substituted)
+	assert.Equal(t, StatusOverload, result.Status)
+	assert.False(t, result.IsValidRemoteParent())
+	replacement := replays.values[replayKey].(aliasReplayValue)
+	assert.True(t, validFinalAliasReplay(replacement))
+	assert.NotEqual(t, aliasReplayBindingOf(initialReplay), aliasReplayBindingOf(replacement))
+	assert.Equal(t, state, handler.states.(*fakeBridgeMap).values[key])
+	assert.Contains(t, handler.generations.(*fakeBridgeMap).values, key)
+	assert.Contains(t, handler.claims.(*fakeBridgeMap).values, key)
+	assert.Contains(t, handler.ownerGuards.(*fakeBridgeMap).values, owner)
+	assert.NotZero(t, handler.ambiguity.(*fakeBridgeMap).values[key])
+}
+
+func TestMapHandlerAliasReplayProofAcceptsCarrierCounterDrift(t *testing.T) {
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+
+	for _, phase := range []string{"after claim commit", "after final replay publication"} {
+		for _, mutation := range []struct {
+			name       string
+			references bool
+			aliases    bool
+		}{
+			{name: "references", references: true},
+			{name: "aliases", aliases: true},
+			{name: "both", references: true, aliases: true},
+		} {
+			t.Run(phase+"/"+mutation.name, func(t *testing.T) {
+				handler := testMapHandler(
+					map[Identity]any{owner: validEncodedRecord(t, key.Generation)},
+					map[Identity]any{child: activeTaskLink(owner, key.Generation)},
+					nil,
+				)
+				states := handler.states.(*fakeBridgeMap)
+				state := states.values[key].(stateValue)
+				replayKey := aliasReplayKeyForState(key, state)
+				replays := handler.aliasReplays.(*fakeBridgeMap)
+				initialReplay := replays.values[replayKey].(aliasReplayValue)
+				guards := handler.ownerGuards.(*fakeBridgeMap)
+				drifted := false
+				driftCounters := func() {
+					if drifted {
+						return
+					}
+					drifted = true
+					if mutation.references {
+						replays.mu.Lock()
+						replay := replays.values[replayKey].(aliasReplayValue)
+						replay.References--
+						replays.values[replayKey] = replay
+						replays.mu.Unlock()
+					}
+					if mutation.aliases {
+						states.mu.Lock()
+						current := states.values[key].(stateValue)
+						current.Aliases--
+						states.values[key] = current
+						states.mu.Unlock()
+					}
+				}
+
+				switch phase {
+				case "after claim commit":
+					handler.claims.(*fakeBridgeMap).afterUpdate = func(_ any, updated any) {
+						if validGoFinalGenerationClaim(updated.(generationClaim)) {
+							driftCounters()
+						}
+					}
+				case "after final replay publication":
+					replays.afterUpdate = func(_ any, updated any) {
+						if updated.(aliasReplayValue).Lifecycle != lifecycleConsumed {
+							return
+						}
+						guards.afterLookupResult = func(lookedUpKey any, err error) {
+							if err == nil && lookedUpKey == owner {
+								driftCounters()
+							}
+						}
+					}
+				default:
+					t.Fatalf("unknown counter-drift phase %q", phase)
+				}
+
+				result := handler.HandleTask(child, OperationTake)
+				require.True(t, drifted)
+				assert.Equal(t, StatusValid, result.Status)
+				assert.True(t, result.IsValidRemoteParent())
+				finalReplay, present := replays.values[replayKey].(aliasReplayValue)
+				require.True(t, present)
+				assert.True(t, validFinalAliasReplay(finalReplay))
+				assert.Equal(t, lifecycleConsumed, finalReplay.Lifecycle)
+				assert.Equal(t, aliasReplayBindingOf(initialReplay), aliasReplayBindingOf(finalReplay))
+				if mutation.references {
+					assert.Zero(t, finalReplay.References)
+				} else {
+					assert.Equal(t, initialReplay.References, finalReplay.References)
+				}
+				finalState, statePresent := states.values[key].(stateValue)
+				if phase == "after final replay publication" && mutation.aliases {
+					require.True(t, statePresent)
+					assert.Zero(t, finalState.Aliases)
+					assert.Contains(t, handler.claims.(*fakeBridgeMap).values, key)
+					assert.Contains(t, guards.values, owner)
+					assert.NotZero(t, handler.ambiguity.(*fakeBridgeMap).values[key])
+				} else {
+					assert.False(t, statePresent)
+				}
+			})
+		}
 	}
 }
 
@@ -1829,15 +2687,17 @@ func TestMapHandlerRevalidatesExactTaskAuthority(t *testing.T) {
 		handler := newHandler(t)
 		oldKey := stateKey{Owner: owner, Generation: 10}
 		claims := handler.claims.(*fakeBridgeMap)
+		collided := false
 		claims.beforeUpdate = func(updatedKey, _ any, flags ebpf.MapUpdateFlags) {
 			if updatedKey != oldKey || flags != ebpf.UpdateNoExist {
 				return
 			}
+			collided = true
 			claims.values[oldKey] = testGenerationClaim(lifecycleConsumed)
 			claims.lookupErr = ebpf.ErrKeyNotExist
 		}
 		claims.afterLookupResult = func(key any, err error) {
-			if key == oldKey && errors.Is(err, ebpf.ErrKeyNotExist) {
+			if collided && key == oldKey && errors.Is(err, ebpf.ErrKeyNotExist) {
 				handler.tasks.(*fakeBridgeMap).values[child] = newLink
 			}
 		}
@@ -1845,6 +2705,7 @@ func TestMapHandlerRevalidatesExactTaskAuthority(t *testing.T) {
 		result := handler.HandleTask(child, OperationTake)
 		assert.Equal(t, StatusAmbiguous, result.Status)
 		assert.False(t, result.IsValidRemoteParent())
+		assert.True(t, collided)
 		assert.Equal(t, newLink, handler.tasks.(*fakeBridgeMap).values[child])
 		assert.Contains(t, claims.values, oldKey)
 	})
@@ -2358,11 +3219,11 @@ func TestMapHandlerRejectsStaleOrReusedExecutorLink(t *testing.T) {
 			state.Aliases = 1
 			handler.states.(*fakeBridgeMap).values[key] = state
 			handler.aliasReplays.(*fakeBridgeMap).values[aliasReplayKeyForState(key, state)] =
-				aliasReplayValue{
+				boundAliasReplayForStateForTest(handler, key, state, aliasReplayValue{
 					TransitionMonotonicNS: state.ObservedMonotonicNS,
 					References:            1,
 					Lifecycle:             lifecycleActive,
-				}
+				})
 		}
 
 		assert.Equal(t, StatusAmbiguous, handler.HandleTask(child, OperationTake).Status)
@@ -4463,10 +5324,10 @@ func TestMapHandlerFinishRejectsZeroReferenceReplayWithAliases(t *testing.T) {
 	state := handler.states.(*fakeBridgeMap).values[key].(stateValue)
 	require.Equal(t, uint32(1), state.Aliases)
 	replayKey := aliasReplayKeyForState(key, state)
-	zeroReferenceFinal := aliasReplayValue{
+	zeroReferenceFinal := boundAliasReplayForTest(aliasReplayValue{
 		TransitionMonotonicNS: uint64(11 * time.Second),
 		Lifecycle:             lifecycleConsumed,
-	}
+	})
 	handler.aliasReplays.(*fakeBridgeMap).values[replayKey] = zeroReferenceFinal
 	record, err := UnmarshalRecord(state.Response[:])
 	require.NoError(t, err)
@@ -4583,7 +5444,7 @@ func TestMapHandlerDetachedFinishRejectsPublishedTerminalReplacement(t *testing.
 	assert.Equal(t, oldKey.Generation, retainedGuard.ProcessIncarnation)
 }
 
-func TestMapHandlerAliasedFinishPreservesSuccessorTerminalAndCleansOldGeneration(t *testing.T) {
+func TestMapHandlerAliasedFinishRejectsSuccessorTerminalAndRetainsOldGeneration(t *testing.T) {
 	owner := Identity{TID: 3, PID: 2, Namespace: 1}
 	child := Identity{TID: 4, PID: 2, Namespace: 1}
 	handler := testMapHandler(
@@ -4606,31 +5467,36 @@ func TestMapHandlerAliasedFinishPreservesSuccessorTerminalAndCleansOldGeneration
 		Lifecycle:           lifecycleConsumed,
 	}
 	handler.terminals.(*fakeBridgeMap).values[owner] = successorTerminal
+	oldConnectionKey := connectionInfoNS{
+		Connection: oldState.Connection, NetNS: oldState.ConnectionNetNS,
+	}
+	oldConnection := handler.connections.(*fakeBridgeMap).values[oldConnectionKey].(connectionClaim)
+	oldCookieKey := connectionInfoNetNSCookie{
+		Connection: oldState.Connection, NetNSCookie: oldConnection.NetNSCookie,
+	}
 	claim := testGoGenerationClaim(lifecycleConsumed)
 	handler.claims.(*fakeBridgeMap).values[oldKey] = claim
 
 	result := handler.finish(
 		owner, oldRecord, testProcessIncarnation, lifecycleConsumed, &claim,
 	)
-	assert.True(t, result.complete)
+	assert.False(t, result.complete)
 	assert.True(t, result.mutationStarted)
 	assert.Equal(t, successorTerminal, handler.terminals.(*fakeBridgeMap).values[owner])
-	assert.NotContains(t, handler.states.(*fakeBridgeMap).values, oldKey)
-	assert.NotContains(t, handler.generations.(*fakeBridgeMap).values, oldKey)
+	assert.Equal(t, oldState, handler.states.(*fakeBridgeMap).values[oldKey])
+	assert.Contains(t, handler.generations.(*fakeBridgeMap).values, oldKey)
 	assert.Contains(t, handler.states.(*fakeBridgeMap).values, successorKey)
 	assert.Contains(t, handler.generations.(*fakeBridgeMap).values, successorKey)
 	assert.Equal(t, uint64(11),
 		handler.owners.(*fakeBridgeMap).values[owner].(ownerValue).Generation)
 	assert.Zero(t, claim)
-	assert.NotContains(t, handler.claims.(*fakeBridgeMap).values, oldKey)
+	retainedClaim := handler.claims.(*fakeBridgeMap).values[oldKey].(generationClaim)
+	assert.True(t, validGenerationCleanupClaim(retainedClaim))
+	assert.Equal(t, lifecycleConsumed, retainedClaim.Reserved[0])
 	assert.NotContains(t, handler.ownerGuards.(*fakeBridgeMap).values, owner)
-	assert.NotContains(t, handler.ambiguity.(*fakeBridgeMap).values, oldKey)
-	for _, value := range handler.connections.(*fakeBridgeMap).values {
-		assert.NotEqual(t, uint64(10), value.(connectionClaim).Generation)
-	}
-	for _, value := range handler.cookieConnections.(*fakeBridgeMap).values {
-		assert.NotEqual(t, uint64(10), value.(connectionClaim).Generation)
-	}
+	assert.NotZero(t, handler.ambiguity.(*fakeBridgeMap).values[oldKey])
+	assert.Equal(t, oldConnection, handler.connections.(*fakeBridgeMap).values[oldConnectionKey])
+	assert.Equal(t, oldConnection, handler.cookieConnections.(*fakeBridgeMap).values[oldCookieKey])
 }
 
 func TestMapHandlerRetainsUnaliasedGenerationWhenOwnerChangesDuringRevalidation(t *testing.T) {
@@ -4950,10 +5816,10 @@ func testMapHandler(remoteParents, tasks, ambiguity map[Identity]any) *MapHandle
 		replayKey := aliasReplayKeyForState(key, state)
 		replay, exists := handler.aliasReplays.(*fakeBridgeMap).values[replayKey].(aliasReplayValue)
 		if !exists {
-			replay = aliasReplayValue{
+			replay = boundAliasReplayForStateForTest(handler, key, state, aliasReplayValue{
 				TransitionMonotonicNS: state.ObservedMonotonicNS,
 				Lifecycle:             lifecycleActive,
-			}
+			})
 		}
 		replay.References++
 		handler.aliasReplays.(*fakeBridgeMap).values[replayKey] = replay

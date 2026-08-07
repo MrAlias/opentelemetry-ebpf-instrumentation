@@ -58,6 +58,8 @@ type Tracer struct {
 	javaAuthMu              sync.Mutex
 	javaAuthKeys            map[javaAuthorizationKey][]javaAuthorization
 	javaRemoteParentEnabled bool
+	javaDataHookAttached    bool
+	javaCloseHookAttached   bool
 	haveSockOpsNetnsCookie  func() error
 }
 
@@ -304,6 +306,8 @@ func (p *Tracer) SetupTailCalls() {
 		}
 	}
 
+	p.javaDataHookAttached = false
+	p.javaCloseHookAttached = false
 	p.setJavaRemoteParentDataHookReadiness(false)
 }
 
@@ -323,7 +327,17 @@ func (p *Tracer) setJavaRemoteParentDataHookReadiness(ready bool) {
 }
 
 func (p *Tracer) recordJavaDataHookAttachResult(err error) {
-	p.setJavaRemoteParentDataHookReadiness(err == nil)
+	p.javaDataHookAttached = err == nil
+	p.publishJavaRemoteParentDataHookReadiness()
+}
+
+func (p *Tracer) recordJavaCloseHookAttachResult(err error) {
+	p.javaCloseHookAttached = err == nil
+	p.publishJavaRemoteParentDataHookReadiness()
+}
+
+func (p *Tracer) publishJavaRemoteParentDataHookReadiness() {
+	p.setJavaRemoteParentDataHookReadiness(p.javaDataHookAttached && p.javaCloseHookAttached)
 }
 
 func (p *Tracer) constants() map[string]any {
@@ -490,6 +504,14 @@ func (p *Tracer) KProbes() map[string]ebpfcommon.ProbeDesc {
 			Start:        p.bpfObjects.ObiKprobeSecurityFileIoctl,
 			AttachResult: p.recordJavaDataHookAttachResult,
 		},
+	}
+	if p.javaRemoteParentEnabled {
+		kp["tcp_close/java_remote_parent"] = ebpfcommon.ProbeDesc{
+			Required:     true,
+			KProbeTarget: "tcp_close",
+			Start:        p.bpfObjects.ObiKprobeJavaRemoteParentTcpClose,
+			AttachResult: p.recordJavaCloseHookAttachResult,
+		}
 	}
 
 	if p.cfg.EBPF.ContextPropagation.IsEnabled() {

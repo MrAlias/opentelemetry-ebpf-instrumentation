@@ -121,6 +121,11 @@ type ProbeDesc struct {
 	// if the function has not been found in the executable
 	Required bool
 
+	// KProbeTarget overrides the KProbes map key as the kernel symbol to
+	// attach. This permits multiple independently loaded programs to observe
+	// the same kprobe without overloading a single ProbeDesc.
+	KProbeTarget string
+
 	// The eBPF program to attach to the symbol as a uprobe (either to the
 	// symbol name or to StartOffset)
 	Start *ebpf.Program

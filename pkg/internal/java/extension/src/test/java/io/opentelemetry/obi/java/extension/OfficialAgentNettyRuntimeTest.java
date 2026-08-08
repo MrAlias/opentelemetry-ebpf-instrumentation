@@ -214,6 +214,7 @@ class OfficialAgentNettyRuntimeTest {
     assertFalse(output.contains("LinkageError"), output);
     assertFalse(output.contains("ClassNotFoundException"), output);
     assertFalse(output.contains("Netty helper unavailable"), output);
+    assertFalse(output.contains("reason=receive_ambiguous"), output);
 
     List<String> outputLines = lines(output);
     assertTrue(prefix(outputLines, "OBI_NETTY_TASK\tTASK_CAPTURE\t").size() > 0, output);
@@ -226,31 +227,23 @@ class OfficialAgentNettyRuntimeTest {
       assertFalse(handlers.containsKey(id), "duplicate Netty handler result for " + id);
       handlers.put(id, handler);
       assertTrue(handler.channelFd >= 0, output);
-      assertTrue(handler.lifecycleIdentity != 0, output);
+      assertEquals(0, handler.lifecycleIdentity, output);
       assertNotEquals(handler.tlsThread, handler.requestThread, output);
       assertTrue(handler.tlsNativeThread > 0, output);
       assertTrue(handler.requestNativeThread > 0, output);
       assertNotEquals(handler.tlsNativeThread, handler.requestNativeThread, output);
-      assertEquals(2, handler.lookupSource, output);
-      assertTrue(handler.lifecycleActive, output);
+      assertEquals(3, handler.lookupSource, output);
+      assertFalse(handler.lifecycleActive, output);
       assertEquals(-1, handler.socketFileDescriptor, output);
     }
     assertEquals(handlers.get("A").channelId, handlers.get("B").channelId, output);
     assertEquals(handlers.get("A").channelId, handlers.get("C").channelId, output);
     assertEquals(handlers.get("A").channelFd, handlers.get("B").channelFd, output);
     assertEquals(handlers.get("A").channelFd, handlers.get("C").channelFd, output);
-    assertEquals(handlers.get("A").lifecycleIdentity, handlers.get("B").lifecycleIdentity, output);
-    assertEquals(handlers.get("A").lifecycleIdentity, handlers.get("C").lifecycleIdentity, output);
     assertNotEquals(handlers.get("A").channelId, handlers.get("P").channelId, output);
     assertNotEquals(handlers.get("A").channelId, handlers.get("Q").channelId, output);
     assertNotEquals(handlers.get("P").channelId, handlers.get("Q").channelId, output);
     assertNotEquals(handlers.get("P").channelFd, handlers.get("Q").channelFd, output);
-    assertNotEquals(
-        handlers.get("A").lifecycleIdentity, handlers.get("P").lifecycleIdentity, output);
-    assertNotEquals(
-        handlers.get("A").lifecycleIdentity, handlers.get("Q").lifecycleIdentity, output);
-    assertNotEquals(
-        handlers.get("P").lifecycleIdentity, handlers.get("Q").lifecycleIdentity, output);
 
     for (String id : new String[] {"A", "B", "C"}) {
       assertEquals(0, prefix(outputLines, "OBI_NETTY_HANDOFF\t" + id + "\t").size(), output);
@@ -264,7 +257,7 @@ class OfficialAgentNettyRuntimeTest {
       HandlerResult handler = handlers.get(id);
       assertEquals(handler.channelId, handoff.channelId, output);
       assertEquals(handler.channelFd, handoff.channelFd, output);
-      assertEquals(handler.lifecycleIdentity, handoff.lifecycleIdentity, output);
+      assertNotEquals(0, handoff.lifecycleIdentity, output);
       assertEquals(handler.tlsThread, handoff.tlsThread, output);
       assertEquals(handler.requestThread, handoff.requestThread, output);
       assertEquals(handler.tlsNativeThread, handoff.tlsNativeThread, output);
@@ -296,6 +289,8 @@ class OfficialAgentNettyRuntimeTest {
         output);
     assertNotEquals(
         handoffs.get("P").requestNativeThread, handoffs.get("Q").requestNativeThread, output);
+    assertNotEquals(
+        handoffs.get("P").lifecycleIdentity, handoffs.get("Q").lifecycleIdentity, output);
 
     assertEquals(4, prefix(outputLines, "OBI_NETTY_EDGE\t").size(), output);
     Map<Long, String> edgeTokens = new HashMap<>();
@@ -471,6 +466,7 @@ class OfficialAgentNettyRuntimeTest {
     assertAllPasses(lines, "P", invocations.get("P"), TRACE_P, PARENT_P, true, true);
     assertAllPasses(lines, "Q", invocations.get("Q"), TRACE_Q, PARENT_Q, true, false);
 
+    Map<String, AuthorityResult> exactAuthorities = new HashMap<>();
     for (String id : new String[] {"A", "B", "P", "Q"}) {
       assertEquals(
           "PROVIDER\tTAKE\t" + id + "\t1\t1\tVALID", only(lines, "PROVIDER\tTAKE\t" + id + "\t"));
@@ -479,10 +475,17 @@ class OfficialAgentNettyRuntimeTest {
       assertEquals(1, authority.pass);
       assertEquals(2, authority.lookupSource);
       assertTrue(authority.lifecycleActive);
-      assertEquals(handlers.get(id).lifecycleIdentity, authority.lifecycleIdentity);
+      assertNotEquals(0, authority.lifecycleIdentity);
       assertEquals(handlers.get(id).channelFd, authority.socketFileDescriptor);
       assertEquals(handlers.get(id).requestThread, authority.threadId);
       assertNotEquals(handlers.get(id).tlsThread, authority.threadId);
+      assertFalse(exactAuthorities.containsKey(id), "duplicate exact authority for " + id);
+      exactAuthorities.put(id, authority);
+      if ("P".equals(id) || "Q".equals(id)) {
+        HandoffResult handoff =
+            HandoffResult.parse(only(lines(output), "OBI_NETTY_HANDOFF\t" + id + "\t"));
+        assertEquals(handoff.lifecycleIdentity, authority.lifecycleIdentity);
+      }
     }
 
     int missingInvocations = invocations.get("C");
@@ -490,6 +493,7 @@ class OfficialAgentNettyRuntimeTest {
         missingInvocations * 2, prefix(lines, "PROVIDER\tTAKE\tC\t").size(), lines.toString());
     List<String> missingAuthority = prefix(lines, "AUTH\tTAKE\tC\t");
     assertEquals(missingInvocations * 2, missingAuthority.size(), lines.toString());
+    AuthorityResult firstMissingAuthority = null;
     for (int invocation = 1; invocation <= missingInvocations; invocation++) {
       for (int pass = 1; pass <= 2; pass++) {
         assertEquals(
@@ -498,18 +502,34 @@ class OfficialAgentNettyRuntimeTest {
             lines.toString());
         AuthorityResult authority =
             AuthorityResult.parse(only(lines, "AUTH\tTAKE\tC\t" + invocation + "\t" + pass + "\t"));
-        assertEquals(2, authority.lookupSource);
-        assertTrue(authority.lifecycleActive);
-        assertEquals(handlers.get("C").lifecycleIdentity, authority.lifecycleIdentity);
         assertEquals(handlers.get("C").requestThread, authority.threadId);
         assertNotEquals(handlers.get("C").tlsThread, authority.threadId);
         if (invocation == 1 && pass == 1) {
+          assertEquals(2, authority.lookupSource);
+          assertTrue(authority.lifecycleActive);
+          assertNotEquals(0, authority.lifecycleIdentity);
           assertEquals(handlers.get("C").channelFd, authority.socketFileDescriptor);
+          firstMissingAuthority = authority;
         } else {
+          assertEquals(3, authority.lookupSource);
+          assertFalse(authority.lifecycleActive);
+          assertEquals(0, authority.lifecycleIdentity);
           assertEquals(-1, authority.socketFileDescriptor);
         }
       }
     }
+    assertTrue(firstMissingAuthority != null, "missing first exact authority for C");
+    exactAuthorities.put("C", firstMissingAuthority);
+    assertEquals(
+        exactAuthorities.get("A").lifecycleIdentity, exactAuthorities.get("B").lifecycleIdentity);
+    assertEquals(
+        exactAuthorities.get("A").lifecycleIdentity, exactAuthorities.get("C").lifecycleIdentity);
+    assertNotEquals(
+        exactAuthorities.get("A").lifecycleIdentity, exactAuthorities.get("P").lifecycleIdentity);
+    assertNotEquals(
+        exactAuthorities.get("A").lifecycleIdentity, exactAuthorities.get("Q").lifecycleIdentity);
+    assertNotEquals(
+        exactAuthorities.get("P").lifecycleIdentity, exactAuthorities.get("Q").lifecycleIdentity);
     assertEquals(4 + missingInvocations * 2, prefix(lines, "PROVIDER\tTAKE\t").size());
     assertEquals(0, prefix(lines, "PROVIDER\tDISCARD\t").size(), lines.toString());
 
@@ -522,6 +542,8 @@ class OfficialAgentNettyRuntimeTest {
     assertEquals(0L, counter(diagnostics, "discard_standard"));
     assertEquals(0L, counter(diagnostics, "d_valid"));
     assertEquals(0L, counter(diagnostics, "d_missing"));
+    assertEquals(0L, counter(diagnostics, "t_ambiguous"));
+    assertEquals(0L, counter(diagnostics, "d_ambiguous"));
     assertTrue(counter(diagnostics, "tls_reads") > 0L);
     assertTrue(counter(diagnostics, "tls_bytes") > 0L);
 

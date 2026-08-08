@@ -1016,12 +1016,15 @@ public final class OfficialAgentNettyProbe {
       require(
           tlsNativeThread.longValue() != requestNativeThread,
           "Netty TLS handoff stayed on one native thread");
-      require(authority.source == 2, "Netty handler lost task lookup authority");
+      require(authority.source == 3, "Netty handler did not block consumed lookup authority");
+      require(!authority.directAuthority, "Netty handler retained direct receive authority");
+      require(!authority.lifecyclePresent, "Netty handler retained its consumed socket lifecycle");
+      require(authority.taskRelayState, "Netty handler lost its enclosing task relay state");
       require(
-          authority.lifecyclePresent && authority.lifecycleActive,
-          "Netty handler lost its socket lifecycle");
-      require(authority.taskRelayState, "Netty handler lost task relay state");
-      require(authority.exactTaskRelayState, "Netty handler lost exact task relay state");
+          authority.exactTaskRelayState, "Netty handler lost its enclosing exact task relay state");
+      require(
+          !authority.taskRelayTransportReferencesPresent,
+          "Netty handler retained task relay transport references");
       require(authority.socketFileDescriptor == -1, "Netty handler retained a consumed socket");
       require(!authority.socketContextPresent, "Netty handler retained a consumed socket context");
       MultiHopState state = context.channel().attr(MULTI_HOP_STATE).get();
@@ -1046,9 +1049,6 @@ public final class OfficialAgentNettyProbe {
         require(
             intermediate.threadId != requestThread,
             "Netty intermediate-to-request handoff stayed on one thread");
-        require(
-            intermediate.authority.lifecycleIdentity == authority.lifecycleIdentity,
-            "Netty intermediate handoff changed socket lifecycle");
         require(
             intermediate.authority.socketFileDescriptor == channelFd,
             "Netty intermediate handoff changed socket descriptor");
@@ -1113,7 +1113,7 @@ public final class OfficialAgentNettyProbe {
               + requestThread
               + "\t"
               + authority.source
-              + "\tLIVE\t"
+              + "\tNONE\t"
               + authority.socketFileDescriptor
               + "\t"
               + tlsNativeThread

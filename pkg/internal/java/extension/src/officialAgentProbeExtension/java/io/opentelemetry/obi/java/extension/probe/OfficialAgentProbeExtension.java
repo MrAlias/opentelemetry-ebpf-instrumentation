@@ -23,6 +23,7 @@ import io.opentelemetry.sdk.trace.ReadableSpan;
 import io.opentelemetry.sdk.trace.SpanProcessor;
 import io.opentelemetry.sdk.trace.data.SpanData;
 import java.io.IOException;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
@@ -40,6 +41,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /** Test-only official-agent extension for the isolated server runtime probes. */
 public final class OfficialAgentProbeExtension implements AutoConfigurationCustomizerProvider {
@@ -49,6 +51,7 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
   private static final String INSTALL_PROVIDER_PROPERTY =
       "obi.test.official.agent.probe.install-provider";
   private static final String REEXTRACT_ID_PROPERTY = "obi.test.official.agent.probe.reextract.id";
+  private static final String FRAMEWORK_JETTY = "jetty";
   private static final String FRAMEWORK_NETTY = "netty";
   private static final String FRAMEWORK_JAVA21_CONCURRENCY = "java21-concurrency";
   private static final String MODE_AUTO_UNAVAILABLE = "auto-unavailable";
@@ -100,6 +103,7 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
     ProbeOutput output = new ProbeOutput(requiredProperty(OUTPUT_PROPERTY));
     output.append("EXTENSION\tready");
     String framework = System.getProperty(FRAMEWORK_PROPERTY);
+    boolean jetty = FRAMEWORK_JETTY.equals(framework);
     boolean netty = FRAMEWORK_NETTY.equals(framework);
     boolean java21Concurrency = FRAMEWORK_JAVA21_CONCURRENCY.equals(framework);
     boolean installProvider =
@@ -109,7 +113,7 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
       throw new IllegalStateException("auto-unavailable mode must retain the native provider");
     }
     ProviderState provider =
-        installProvider ? ProviderState.install(output, netty, java21Concurrency) : null;
+        installProvider ? ProviderState.install(output, jetty, netty, java21Concurrency) : null;
     if (provider == null) {
       if (autoUnavailable) {
         output.append("PROVIDER\tretained\tbootstrap");
@@ -551,6 +555,7 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
     private final boolean netty;
     private final boolean java21Concurrency;
     private final AtomicBoolean reextractionStarted = new AtomicBoolean();
+    private final AtomicBoolean syntheticFaultExercised = new AtomicBoolean();
     private final ThreadLocal<Boolean> reextracting = new ThreadLocal<>();
 
     private RecordingObiPropagator(
@@ -585,6 +590,8 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
       if (id == null) {
         return delegate.extract(input, carrier, getter);
       }
+
+      exerciseSyntheticPostMarkFailure(input, carrier, getter, id);
 
       int invocation =
           EXTRACTION_CALLS.computeIfAbsent(id, ignored -> new AtomicInteger()).incrementAndGet();
@@ -631,7 +638,14 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
       Invocation previous = provider.current.get();
       provider.current.set(new Invocation(id, invocation, pass));
       try {
-        return delegate.extract(context, carrier, getter);
+        SyntheticReceiveScope receiveScope = provider.openSyntheticReceive(id, invocation, pass);
+        try {
+          return delegate.extract(context, carrier, getter);
+        } finally {
+          if (receiveScope != null) {
+            receiveScope.close();
+          }
+        }
       } finally {
         if (previous == null) {
           provider.current.remove();
@@ -639,6 +653,27 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
           provider.current.set(previous);
         }
       }
+    }
+
+    private <C> void exerciseSyntheticPostMarkFailure(
+        Context context, C carrier, TextMapGetter<C> getter, String id) {
+      if (!provider.armSyntheticPostMarkFailure()
+          || !syntheticFaultExercised.compareAndSet(false, true)) {
+        return;
+      }
+
+      Invocation previous = provider.current.get();
+      Object failedLifecycle;
+      long failedSequence;
+      try {
+        extractPass(context, carrier, getter, id, 0, 0);
+        throw new IllegalStateException("synthetic post-mark failure was not injected");
+      } catch (SyntheticPostMarkFailure expected) {
+        failedLifecycle = expected.lifecycle;
+        failedSequence = expected.sequence;
+      }
+      boolean invocationRestored = provider.current.get() == previous;
+      provider.verifySyntheticPostMarkFailure(failedLifecycle, failedSequence, invocationRestored);
     }
 
     private <C> String probeId(C carrier, TextMapGetter<C> getter) {
@@ -695,22 +730,28 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
     private final ThreadLocal<Invocation> current = new ThreadLocal<>();
     private final CountDownLatch parallelTakes = new CountDownLatch(2);
     private final AuthorityVerifier authorityVerifier;
+    private final ProviderCallCleanup providerCallCleanup;
+    private final SyntheticReceiveFixture syntheticReceiveFixture;
 
     private ProviderState(
         ProbeOutput output,
         Map<String, ScenarioState> scenarios,
         Object missing,
         Object alreadyConsumed,
-        AuthorityVerifier authorityVerifier) {
+        AuthorityVerifier authorityVerifier,
+        ProviderCallCleanup providerCallCleanup,
+        SyntheticReceiveFixture syntheticReceiveFixture) {
       this.output = output;
       this.scenarios = scenarios;
       this.missing = missing;
       this.alreadyConsumed = alreadyConsumed;
       this.authorityVerifier = authorityVerifier;
+      this.providerCallCleanup = providerCallCleanup;
+      this.syntheticReceiveFixture = syntheticReceiveFixture;
     }
 
     private static ProviderState install(
-        ProbeOutput output, boolean netty, boolean java21Concurrency) {
+        ProbeOutput output, boolean jetty, boolean netty, boolean java21Concurrency) {
       try {
         Class<?> bridge =
             Class.forName("io.opentelemetry.obi.java.bridge.RemoteParentBridge", true, null);
@@ -770,9 +811,19 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
         } else if (java21Concurrency) {
           authorityVerifier = Java21Authority.create();
         }
+        ProviderCallCleanup providerCallCleanup = ProviderCallCleanup.create();
+        SyntheticReceiveFixture syntheticReceiveFixture =
+            jetty ? SyntheticReceiveFixture.create(output, providerCallCleanup) : null;
 
         ProviderState state =
-            new ProviderState(output, scenarios, missing, alreadyConsumed, authorityVerifier);
+            new ProviderState(
+                output,
+                scenarios,
+                missing,
+                alreadyConsumed,
+                authorityVerifier,
+                providerCallCleanup,
+                syntheticReceiveFixture);
         Object provider = Proxy.newProxyInstance(null, new Class<?>[] {providerType}, state);
         requireBootstrap(provider.getClass(), "test provider");
         boolean installed =
@@ -784,6 +835,24 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
         return state;
       } catch (ReflectiveOperationException error) {
         throw new IllegalStateException("cannot install probe provider", error);
+      }
+    }
+
+    private SyntheticReceiveScope openSyntheticReceive(String id, int invocation, int pass) {
+      return syntheticReceiveFixture == null
+          ? null
+          : syntheticReceiveFixture.open(id, invocation, pass);
+    }
+
+    private boolean armSyntheticPostMarkFailure() {
+      return syntheticReceiveFixture != null && syntheticReceiveFixture.armPostMarkFailure();
+    }
+
+    private void verifySyntheticPostMarkFailure(
+        Object failedLifecycle, long failedSequence, boolean invocationRestored) {
+      if (syntheticReceiveFixture != null) {
+        syntheticReceiveFixture.verifyPostMarkFailure(
+            failedLifecycle, failedSequence, invocationRestored);
       }
     }
 
@@ -837,6 +906,42 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
     }
 
     private Object operation(String operation, boolean take) {
+      Object receiveContext;
+      try {
+        receiveContext = providerCallCleanup.takeReceiveContext();
+      } catch (ReflectiveOperationException error) {
+        output.append("ERROR\tprovider-receive-take\t" + token(error.getClass().getName()));
+        return missing;
+      }
+
+      Object result;
+      boolean receiveContextValid = false;
+      boolean cleanupSucceeded = true;
+      try {
+        result = scopedOperation(operation, take);
+      } finally {
+        try {
+          receiveContextValid = providerCallCleanup.finishReceiveContext(receiveContext);
+        } catch (ReflectiveOperationException error) {
+          cleanupSucceeded = false;
+          output.append("ERROR\tprovider-receive-finish\t" + token(error.getClass().getName()));
+        } finally {
+          try {
+            providerCallCleanup.clearSocketFileDescriptor();
+          } catch (ReflectiveOperationException error) {
+            cleanupSucceeded = false;
+            output.append("ERROR\tprovider-receive-clear\t" + token(error.getClass().getName()));
+          }
+        }
+      }
+      if (!cleanupSucceeded || !receiveContextValid) {
+        output.append("ERROR\tprovider-receive-invalid");
+        return missing;
+      }
+      return result;
+    }
+
+    private Object scopedOperation(String operation, boolean take) {
       Invocation invocation = current.get();
       if (invocation == null) {
         output.append("ERROR\tunscoped-provider-" + operation.toLowerCase());
@@ -892,6 +997,7 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
 
   private static final class NettyAuthority implements AuthorityVerifier {
     private static final int LOOKUP_TASK = 2;
+    private static final int LOOKUP_BLOCKED = 3;
 
     private final Method lookupSource;
     private final Method lookupLifecycle;
@@ -954,11 +1060,17 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
                 + "\t"
                 + threadId);
         boolean firstPass = invocation.invocation == 1 && invocation.pass == 1;
-        boolean valid =
-            source == LOOKUP_TASK
-                && active
-                && threadId > 0
-                && (firstPass ? socketFileDescriptor >= 0 : socketFileDescriptor == -1);
+        boolean valid;
+        if (firstPass) {
+          valid = source == LOOKUP_TASK && active && threadId > 0 && socketFileDescriptor >= 0;
+        } else {
+          valid =
+              source == LOOKUP_BLOCKED
+                  && !active
+                  && lifecycle == null
+                  && threadId > 0
+                  && socketFileDescriptor == -1;
+        }
         if (!valid) {
           output.append(
               "ERROR\tnetty-authority\t"
@@ -973,6 +1085,453 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
         output.append("ERROR\tnetty-authority-reflection\t" + token(error.getClass().getName()));
         return false;
       }
+    }
+  }
+
+  /** Mirrors the bootstrap provider's one-shot extraction cleanup around every probe call. */
+  private static final class ProviderCallCleanup {
+    private final Class<?> threadInfo;
+    private final Method takeReceiveContext;
+    private final Method finishReceiveContext;
+    private final Method clearSocketFileDescriptor;
+
+    private ProviderCallCleanup(
+        Class<?> threadInfo,
+        Method takeReceiveContext,
+        Method finishReceiveContext,
+        Method clearSocketFileDescriptor) {
+      this.threadInfo = threadInfo;
+      this.takeReceiveContext = takeReceiveContext;
+      this.finishReceiveContext = finishReceiveContext;
+      this.clearSocketFileDescriptor = clearSocketFileDescriptor;
+    }
+
+    private static ProviderCallCleanup create() throws ReflectiveOperationException {
+      Class<?> threadInfo = Class.forName("io.opentelemetry.obi.java.ebpf.ThreadInfo", true, null);
+      Class<?> receiveContext =
+          Class.forName(
+              "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext$ReceiveContext",
+              true,
+              null);
+      ProviderState.requireBootstrap(threadInfo, "provider receive cleanup");
+      ProviderState.requireBootstrap(receiveContext, "provider receive context");
+      return new ProviderCallCleanup(
+          threadInfo,
+          threadInfo.getMethod("takeRemoteParentReceiveContext"),
+          threadInfo.getMethod("finishRemoteParentExtractionAndValidate", receiveContext),
+          threadInfo.getMethod("clearRemoteParentSocketFileDescriptor"));
+    }
+
+    private Object takeReceiveContext() throws ReflectiveOperationException {
+      return takeReceiveContext.invoke(null);
+    }
+
+    private boolean finishReceiveContext(Object receiveContext)
+        throws ReflectiveOperationException {
+      return ((Boolean) finishReceiveContext.invoke(null, receiveContext)).booleanValue();
+    }
+
+    private void clearSocketFileDescriptor() throws ReflectiveOperationException {
+      clearSocketFileDescriptor.invoke(null);
+    }
+  }
+
+  /** Jetty fixture for an exact extraction when the packaged helper transport is disabled. */
+  private static final class SyntheticReceiveFixture {
+    private final ProbeOutput output;
+    private final ProviderCallCleanup providerCallCleanup;
+    private final Constructor<?> lifecycleConstructor;
+    private final Constructor<?> receiveContextConstructor;
+    private final Class<?> observerType;
+    private final Method lifecycleId;
+    private final Method lifecycleActive;
+    private final Method lifecycleInvalidate;
+    private final Method bridgeEpoch;
+    private final Method enabled;
+    private final Method setEnabled;
+    private final Method beginReceiveAttempt;
+    private final Method markReceiveContext;
+    private final Method clearLookup;
+    private final Field lookupOverrideState;
+    private final Field lookupLifecycleState;
+    private final Field lookupBridgeEpochState;
+    private final Field receiveContextState;
+    private final Field socketContextState;
+    private final AtomicLong nextSequence = new AtomicLong();
+    private final AtomicBoolean injectPostMarkFailure = new AtomicBoolean();
+    private final AtomicBoolean postMarkFailureArmed = new AtomicBoolean();
+
+    private int activeScopes;
+
+    private SyntheticReceiveFixture(
+        ProbeOutput output,
+        ProviderCallCleanup providerCallCleanup,
+        Constructor<?> lifecycleConstructor,
+        Constructor<?> receiveContextConstructor,
+        Class<?> observerType,
+        Method lifecycleId,
+        Method lifecycleActive,
+        Method lifecycleInvalidate,
+        Method bridgeEpoch,
+        Method enabled,
+        Method setEnabled,
+        Method beginReceiveAttempt,
+        Method markReceiveContext,
+        Method clearLookup,
+        Field lookupOverrideState,
+        Field lookupLifecycleState,
+        Field lookupBridgeEpochState,
+        Field receiveContextState,
+        Field socketContextState) {
+      this.output = output;
+      this.providerCallCleanup = providerCallCleanup;
+      this.lifecycleConstructor = lifecycleConstructor;
+      this.receiveContextConstructor = receiveContextConstructor;
+      this.observerType = observerType;
+      this.lifecycleId = lifecycleId;
+      this.lifecycleActive = lifecycleActive;
+      this.lifecycleInvalidate = lifecycleInvalidate;
+      this.bridgeEpoch = bridgeEpoch;
+      this.enabled = enabled;
+      this.setEnabled = setEnabled;
+      this.beginReceiveAttempt = beginReceiveAttempt;
+      this.markReceiveContext = markReceiveContext;
+      this.clearLookup = clearLookup;
+      this.lookupOverrideState = lookupOverrideState;
+      this.lookupLifecycleState = lookupLifecycleState;
+      this.lookupBridgeEpochState = lookupBridgeEpochState;
+      this.receiveContextState = receiveContextState;
+      this.socketContextState = socketContextState;
+    }
+
+    private static SyntheticReceiveFixture create(
+        ProbeOutput output, ProviderCallCleanup providerCallCleanup)
+        throws ReflectiveOperationException {
+      Class<?> threadInfo = providerCallCleanup.threadInfo;
+      Class<?> lifecycle =
+          Class.forName(
+              "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext$Lifecycle",
+              true,
+              null);
+      Class<?> receiveContext =
+          Class.forName(
+              "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext$ReceiveContext",
+              true,
+              null);
+      Class<?> observer =
+          Class.forName(
+              "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext$ExtractionObserver",
+              true,
+              null);
+      ProviderState.requireBootstrap(lifecycle, "synthetic Jetty lifecycle");
+      ProviderState.requireBootstrap(receiveContext, "synthetic Jetty receive context");
+      ProviderState.requireBootstrap(observer, "synthetic Jetty extraction observer");
+
+      Constructor<?> receiveContextConstructor =
+          receiveContext.getDeclaredConstructor(lifecycle, long.class, long.class, observer);
+      receiveContextConstructor.setAccessible(true);
+      if (Boolean.TRUE.equals(threadInfo.getMethod("isRemoteParentEnabled").invoke(null))) {
+        throw new IllegalStateException("synthetic Jetty fixture requires disabled transport");
+      }
+      Field lookupOverrideState = threadLocalField(threadInfo, "remoteParentLookupOverride");
+      Field lookupLifecycleState = threadLocalField(threadInfo, "remoteParentLookupLifecycle");
+      Field lookupBridgeEpochState = threadLocalField(threadInfo, "remoteParentLookupBridgeEpoch");
+      Field receiveContextState = threadLocalField(threadInfo, "remoteParentReceiveContext");
+      Field socketContextState = threadLocalField(threadInfo, "remoteParentSocketContext");
+      return new SyntheticReceiveFixture(
+          output,
+          providerCallCleanup,
+          lifecycle.getConstructor(),
+          receiveContextConstructor,
+          observer,
+          lifecycle.getMethod("id"),
+          lifecycle.getMethod("active"),
+          lifecycle.getMethod("invalidate"),
+          threadInfo.getMethod("remoteParentBridgeEpoch"),
+          threadInfo.getMethod("isRemoteParentEnabled"),
+          threadInfo.getMethod("setRemoteParentEnabled", boolean.class),
+          threadInfo.getMethod("beginRemoteParentReceiveAttempt"),
+          threadInfo.getMethod("markRemoteParentDirectReceiveContext", receiveContext),
+          threadInfo.getMethod("clearRemoteParentLookupSource"),
+          lookupOverrideState,
+          lookupLifecycleState,
+          lookupBridgeEpochState,
+          receiveContextState,
+          socketContextState);
+    }
+
+    private SyntheticReceiveScope open(String id, int invocation, int pass) {
+      Object lifecycle = null;
+      boolean enabledScopeAcquired = false;
+      boolean lookupStateMutated = false;
+      boolean ownershipTransferred = false;
+      try {
+        long sequence = nextSequence.incrementAndGet();
+        if (sequence <= 0L) {
+          throw new IllegalStateException("synthetic receive sequence exhausted");
+        }
+        lifecycle = lifecycleConstructor.newInstance();
+        SyntheticReceiveObserver observer = new SyntheticReceiveObserver();
+        Object observerProxy =
+            Proxy.newProxyInstance(null, new Class<?>[] {observerType}, observer);
+        long epoch = ((Long) bridgeEpoch.invoke(null)).longValue();
+        Object receiveContext =
+            receiveContextConstructor.newInstance(lifecycle, sequence, epoch, observerProxy);
+        observer.bind(receiveContext);
+
+        acquireEnabledScope();
+        enabledScopeAcquired = true;
+        lookupStateMutated = true;
+        beginReceiveAttempt.invoke(null);
+        if (!Boolean.TRUE.equals(markReceiveContext.invoke(null, receiveContext))) {
+          throw new IllegalStateException("cannot stage synthetic Jetty receive context");
+        }
+        if (injectPostMarkFailure.compareAndSet(true, false)) {
+          throw new SyntheticPostMarkFailure(lifecycle, sequence);
+        }
+        long lifecycleIdentifier = ((Long) lifecycleId.invoke(lifecycle)).longValue();
+        SyntheticReceiveScope scope =
+            new SyntheticReceiveScope(
+                this, id, invocation, pass, sequence, lifecycleIdentifier, lifecycle, observer);
+        ownershipTransferred = true;
+        return scope;
+      } catch (ReflectiveOperationException error) {
+        throw new IllegalStateException("cannot open synthetic Jetty receive", error);
+      } finally {
+        if (!ownershipTransferred) {
+          cleanupFailedOpen(lifecycle, lookupStateMutated, enabledScopeAcquired);
+        }
+      }
+    }
+
+    private boolean armPostMarkFailure() {
+      if (!postMarkFailureArmed.compareAndSet(false, true)) {
+        return false;
+      }
+      injectPostMarkFailure.set(true);
+      return true;
+    }
+
+    private void cleanupFailedOpen(
+        Object lifecycle, boolean lookupStateMutated, boolean enabledScopeAcquired) {
+      if (lookupStateMutated) {
+        invokeCleanup(providerCallCleanup.clearSocketFileDescriptor, null, "socket");
+        invokeCleanup(clearLookup, null, "lookup");
+      }
+      if (lifecycle != null) {
+        invokeCleanup(lifecycleInvalidate, lifecycle, "lifecycle");
+      }
+      if (enabledScopeAcquired) {
+        try {
+          releaseEnabledScope();
+        } catch (ReflectiveOperationException error) {
+          output.append(
+              "ERROR\tsynthetic-receive-open-cleanup-enabled\t"
+                  + token(error.getClass().getName()));
+        }
+      }
+    }
+
+    private void invokeCleanup(Method method, Object target, String state) {
+      try {
+        method.invoke(target);
+      } catch (ReflectiveOperationException error) {
+        output.append(
+            "ERROR\tsynthetic-receive-open-cleanup-"
+                + state
+                + "\t"
+                + token(error.getClass().getName()));
+      }
+    }
+
+    private void verifyPostMarkFailure(
+        Object failedLifecycle, long failedSequence, boolean invocationRestored) {
+      try {
+        boolean enabledValue = Boolean.TRUE.equals(enabled.invoke(null));
+        boolean lookupOverridePresent = threadLocalValue(lookupOverrideState) != null;
+        boolean lookupLifecyclePresent = threadLocalValue(lookupLifecycleState) != null;
+        boolean lookupBridgeEpochPresent = threadLocalValue(lookupBridgeEpochState) != null;
+        boolean receiveContextPresent = threadLocalValue(receiveContextState) != null;
+        boolean socketContextPresent = threadLocalValue(socketContextState) != null;
+        boolean failedLifecycleActive =
+            failedLifecycle != null && Boolean.TRUE.equals(lifecycleActive.invoke(failedLifecycle));
+        boolean cleared =
+            !enabledValue
+                && !lookupOverridePresent
+                && !lookupLifecyclePresent
+                && !lookupBridgeEpochPresent
+                && !receiveContextPresent
+                && !socketContextPresent
+                && !failedLifecycleActive
+                && activeScopes == 0
+                && failedSequence == 1L
+                && invocationRestored;
+        if (!cleared) {
+          output.append("ERROR\tsynthetic-post-mark-failure-not-cleared");
+          throw new IllegalStateException("synthetic post-mark failure leaked state");
+        }
+        output.append(
+            "SYNTHETIC_FAULT\tJETTY\tenabled=false,lookup=false,lifecycle=false,epoch=false,"
+                + "receive=false,socket=false,failed_lifecycle=false,active_scopes=0,"
+                + "invocation_restored=true,failed_sequence=1");
+      } catch (ReflectiveOperationException error) {
+        throw new IllegalStateException("cannot verify synthetic post-mark cleanup", error);
+      }
+    }
+
+    private static Field threadLocalField(Class<?> owner, String name)
+        throws ReflectiveOperationException {
+      Field field = owner.getDeclaredField(name);
+      field.setAccessible(true);
+      return field;
+    }
+
+    private static Object threadLocalValue(Field field) throws IllegalAccessException {
+      return ((ThreadLocal<?>) field.get(null)).get();
+    }
+
+    private synchronized void acquireEnabledScope() throws ReflectiveOperationException {
+      if (activeScopes == 0) {
+        if (Boolean.TRUE.equals(enabled.invoke(null))) {
+          throw new IllegalStateException("synthetic Jetty transport became enabled");
+        }
+        setEnabled.invoke(null, Boolean.TRUE);
+      }
+      activeScopes++;
+    }
+
+    private synchronized void releaseEnabledScope() throws ReflectiveOperationException {
+      if (activeScopes <= 0) {
+        throw new IllegalStateException("synthetic Jetty scope underflow");
+      }
+      activeScopes--;
+      if (activeScopes == 0) {
+        setEnabled.invoke(null, Boolean.FALSE);
+      }
+    }
+
+    private void close(SyntheticReceiveScope scope) {
+      boolean lifecycleStillActive = true;
+      try {
+        providerCallCleanup.clearSocketFileDescriptor();
+        clearLookup.invoke(null);
+        lifecycleInvalidate.invoke(scope.lifecycle);
+        lifecycleStillActive = Boolean.TRUE.equals(lifecycleActive.invoke(scope.lifecycle));
+      } catch (ReflectiveOperationException error) {
+        output.append("ERROR\tsynthetic-receive-close\t" + token(error.getClass().getName()));
+      } finally {
+        try {
+          releaseEnabledScope();
+        } catch (ReflectiveOperationException error) {
+          output.append("ERROR\tsynthetic-receive-disable\t" + token(error.getClass().getName()));
+        }
+      }
+      int observations = scope.observer.observations.get();
+      if (observations < 0 || observations > 1 || lifecycleStillActive) {
+        output.append(
+            "ERROR\tsynthetic-receive-lifecycle\t"
+                + scope.id
+                + "\t"
+                + scope.invocation
+                + "\t"
+                + scope.pass);
+      }
+      output.append(
+          "SYNTHETIC\tJETTY\t"
+              + scope.id
+              + "\t"
+              + scope.invocation
+              + "\t"
+              + scope.pass
+              + "\t"
+              + scope.sequence
+              + "\t"
+              + scope.lifecycleId
+              + "\t"
+              + observations
+              + "\t"
+              + lifecycleStillActive);
+    }
+  }
+
+  private static final class SyntheticPostMarkFailure extends RuntimeException {
+    private final Object lifecycle;
+    private final long sequence;
+
+    private SyntheticPostMarkFailure(Object lifecycle, long sequence) {
+      super("injected synthetic post-mark failure");
+      this.lifecycle = lifecycle;
+      this.sequence = sequence;
+    }
+  }
+
+  private static final class SyntheticReceiveScope implements AutoCloseable {
+    private final SyntheticReceiveFixture fixture;
+    private final String id;
+    private final int invocation;
+    private final int pass;
+    private final long sequence;
+    private final long lifecycleId;
+    private final Object lifecycle;
+    private final SyntheticReceiveObserver observer;
+    private final AtomicBoolean closed = new AtomicBoolean();
+
+    private SyntheticReceiveScope(
+        SyntheticReceiveFixture fixture,
+        String id,
+        int invocation,
+        int pass,
+        long sequence,
+        long lifecycleId,
+        Object lifecycle,
+        SyntheticReceiveObserver observer) {
+      this.fixture = fixture;
+      this.id = id;
+      this.invocation = invocation;
+      this.pass = pass;
+      this.sequence = sequence;
+      this.lifecycleId = lifecycleId;
+      this.lifecycle = lifecycle;
+      this.observer = observer;
+    }
+
+    @Override
+    public void close() {
+      if (closed.compareAndSet(false, true)) {
+        fixture.close(this);
+      }
+    }
+  }
+
+  private static final class SyntheticReceiveObserver implements InvocationHandler {
+    private final AtomicBoolean consumed = new AtomicBoolean();
+    private final AtomicInteger observations = new AtomicInteger();
+    private Object receiveContext;
+
+    private void bind(Object receiveContext) {
+      this.receiveContext = receiveContext;
+    }
+
+    @Override
+    public Object invoke(Object proxy, Method method, Object[] args) {
+      String name = method.getName();
+      if ("extractionObserved".equals(name)) {
+        observations.incrementAndGet();
+        return args != null
+            && args.length == 1
+            && args[0] == receiveContext
+            && consumed.compareAndSet(false, true);
+      }
+      if ("toString".equals(name)) {
+        return "SyntheticJettyReceiveObserver";
+      }
+      if ("hashCode".equals(name)) {
+        return System.identityHashCode(proxy);
+      }
+      if ("equals".equals(name)) {
+        return args != null && args.length == 1 && proxy == args[0];
+      }
+      throw new IllegalStateException("unexpected synthetic observer method " + token(name));
     }
   }
 

@@ -20,8 +20,10 @@ import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.jar.JarEntry;
@@ -267,6 +269,7 @@ class OfficialAgentJettyRuntimeTest {
       command.add("-Dotel.service.name=obi-official-agent-jetty-probe");
       command.add("-Dobi.test.official.agent.probe.output=" + result);
       command.add("-Dobi.test.official.agent.probe.mode=" + mode);
+      command.add("-Dobi.test.official.agent.probe.framework=jetty");
       if (MODE_DEFAULT.equals(mode)) {
         command.add("-Dobi.test.official.agent.probe.reextract.id=A");
       }
@@ -341,7 +344,68 @@ class OfficialAgentJettyRuntimeTest {
     assertEquals(1, count(lines, "PROVIDER\tready\tbootstrap"), lines.toString());
     assertEquals(1, count(lines, "WRAP\tobi\t1"), lines.toString());
     assertEquals(0, prefix(lines, "WRAP\tobi\t2").size(), lines.toString());
+    assertEquals(
+        1,
+        count(
+            lines,
+            "SYNTHETIC_FAULT\tJETTY\t"
+                + "enabled=false,lookup=false,lifecycle=false,epoch=false,receive=false,"
+                + "socket=false,failed_lifecycle=false,active_scopes=0,"
+                + "invocation_restored=true,failed_sequence=1"),
+        lines.toString());
+    assertTrue(!prefix(lines, "PASS\t").isEmpty(), "no extraction followed synthetic fault");
     assertEquals(0, prefix(lines, "ERROR\t").size(), lines.toString());
+    assertSyntheticExactReceives(lines);
+  }
+
+  private static void assertSyntheticExactReceives(List<String> lines) {
+    Set<String> passKeys = new HashSet<>();
+    for (String line : prefix(lines, "PASS\t")) {
+      String[] fields = line.split("\t", -1);
+      assertEquals(8, fields.length, line);
+      String key = fields[1] + "/" + fields[2] + "/" + fields[3];
+      assertTrue(passKeys.add(key), "duplicate pass " + line);
+    }
+
+    Map<String, Integer> providerCalls = new HashMap<>();
+    for (String operation : new String[] {"TAKE", "DISCARD"}) {
+      for (String line : prefix(lines, "PROVIDER\t" + operation + "\t")) {
+        String[] fields = line.split("\t", -1);
+        assertEquals(6, fields.length, line);
+        String key = fields[2] + "/" + fields[3] + "/" + fields[4];
+        int calls = providerCalls.getOrDefault(key, 0) + 1;
+        assertEquals(1, calls, "multiple provider calls for " + key + " in " + lines);
+        providerCalls.put(key, calls);
+      }
+    }
+
+    Set<String> syntheticKeys = new HashSet<>();
+    Set<String> observedKeys = new HashSet<>();
+    Set<Long> sequences = new HashSet<>();
+    Set<Long> lifecycles = new HashSet<>();
+    for (String line : prefix(lines, "SYNTHETIC\tJETTY\t")) {
+      String[] fields = line.split("\t", -1);
+      assertEquals(9, fields.length, line);
+      String key = fields[2] + "/" + fields[3] + "/" + fields[4];
+      long sequence = Long.parseLong(fields[5]);
+      long lifecycle = Long.parseLong(fields[6]);
+      int observations = Integer.parseInt(fields[7]);
+      assertTrue(syntheticKeys.add(key), "duplicate synthetic receive " + line);
+      assertTrue(sequence > 0L && sequences.add(sequence), "invalid synthetic sequence " + line);
+      assertTrue(
+          lifecycle != 0L && lifecycles.add(lifecycle), "invalid synthetic lifecycle " + line);
+      assertEquals(providerCalls.containsKey(key) ? 1 : 0, observations, line);
+      if (observations == 1) {
+        assertTrue(observedKeys.add(key), "duplicate observed synthetic receive " + line);
+      }
+      assertEquals("false", fields[8], line);
+    }
+    assertEquals(passKeys, syntheticKeys, lines.toString());
+    assertEquals(providerCalls.keySet(), observedKeys, lines.toString());
+    assertEquals(passKeys.size(), sequences.size(), lines.toString());
+    for (long sequence = 2L; sequence <= sequences.size() + 1L; sequence++) {
+      assertTrue(sequences.contains(sequence), "missing synthetic sequence " + sequence);
+    }
   }
 
   private static void assertHelperAbsentResult(List<String> resultLines, String output) {

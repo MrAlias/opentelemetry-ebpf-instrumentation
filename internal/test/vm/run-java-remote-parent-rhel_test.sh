@@ -165,6 +165,67 @@ assert_failed_gate_retained() {
     fi
 }
 
+write_verifier_log() {
+    local -r path="$1"
+    local -r include_generic="$2"
+    local -r include_sockopt="$3"
+    local -r top_level_result="$4"
+
+    track_fixture "$path"
+    {
+        printf '%s\n' "=== RUN   ${VERIFIER_TEST_NAME}"
+        if [[ "$include_generic" == true ]]; then
+            printf '%s\n' "--- PASS: ${VERIFIER_GENERIC_PROFILE} (0.01s)"
+        fi
+        if [[ "$include_sockopt" == true ]]; then
+            printf '%s\n' "--- PASS: ${VERIFIER_SOCKOPT_PROFILE} (0.01s)"
+        fi
+        printf '%s\n' "--- ${top_level_result}: ${VERIFIER_TEST_NAME} (0.02s)"
+    } > "$path"
+    chmod 600 -- "$path"
+}
+
+assert_verifier_log_accepted() {
+    local -r description="$1"
+    local -r path="$2"
+
+    require_production_verifier_profiles_passed "$path" || \
+        test_fail "verifier validator rejected ${description}"
+}
+
+assert_verifier_log_rejected() {
+    local -r description="$1"
+    local -r path="$2"
+
+    if (require_production_verifier_profiles_passed "$path" >/dev/null 2>&1); then
+        test_fail "verifier validator accepted ${description}"
+    fi
+}
+
+test_production_verifier_profile_validation() {
+    local -r valid="${TEST_TMP_DIR}/verifier-valid.log"
+    local -r missing_generic="${TEST_TMP_DIR}/verifier-missing-generic.log"
+    local -r missing_sockopt="${TEST_TMP_DIR}/verifier-missing-sockopt.log"
+    local -r skipped="${TEST_TMP_DIR}/verifier-skipped.log"
+    local -r spoofed="${TEST_TMP_DIR}/verifier-spoofed.log"
+
+    write_verifier_log "$valid" true true PASS
+    assert_verifier_log_accepted 'complete production profiles' "$valid"
+
+    write_verifier_log "$missing_generic" false true PASS
+    assert_verifier_log_rejected 'missing generic Java profile' "$missing_generic"
+
+    write_verifier_log "$missing_sockopt" true false PASS
+    assert_verifier_log_rejected 'missing cgroup sockopt profile' "$missing_sockopt"
+
+    write_verifier_log "$skipped" true true SKIP
+    assert_verifier_log_rejected 'skipped production profile test' "$skipped"
+
+    write_mutated_fixture \
+        "$spoofed" "$valid" 's/^--- PASS:/log prefix --- PASS:/'
+    assert_verifier_log_rejected 'prefixed PASS substrings' "$spoofed"
+}
+
 test_deterministic_artifact_path() {
     local -r artifact_dir="${TEST_TMP_DIR}/deterministic-artifact"
     local artifact_path=""
@@ -239,8 +300,9 @@ run_tests() {
         '0,/"operations_per_second":1000/s//"operations_per_second":999/'
     assert_artifact_rejected 'inconsistent throughput' "$inconsistent_throughput"
 
+    test_production_verifier_profile_validation
     test_deterministic_artifact_path
-    printf '%s\n' 'RHEL transport benchmark artifact validator tests passed'
+    printf '%s\n' 'RHEL verifier and transport benchmark validator tests passed'
 }
 
 if (($# != 0)); then

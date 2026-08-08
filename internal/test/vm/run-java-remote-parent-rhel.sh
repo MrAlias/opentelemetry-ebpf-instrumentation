@@ -7,6 +7,10 @@ set -Eeuo pipefail
 readonly OUTPUT_DIR="${TEST_OUTPUT:-testoutput}/java-remote-parent-rhel9.6-kernel-sockopt"
 readonly JAVA_AGENT_PATH="${OUTPUT_DIR}/java-artifacts/obi-java-agent.jar"
 readonly JAVA_AGENT_CHECKSUM="${OUTPUT_DIR}/java-agent.sha256"
+readonly VERIFIER_TEST_PATTERN='^TestBPFVerifierProductionProfiles$'
+readonly VERIFIER_TEST_NAME='TestBPFVerifierProductionProfiles'
+readonly VERIFIER_GENERIC_PROFILE='TestBPFVerifierProductionProfiles/generictracer/apache-java-https'
+readonly VERIFIER_SOCKOPT_PROFILE='TestBPFVerifierProductionProfiles/tpinjector/java-remote-parent'
 readonly PRIVILEGED_TEST_PATTERN='^(TestJavaRemoteParentPrimarySocketAuthority|TestJavaRemoteParentPrimaryRequiresAuthoritativeDataHook|TestJavaRemoteParentPrimaryJVMFaults|TestJavaRemoteParentNestedCgroupLifecycle|TestJavaRemoteParentCgroupLinkProcessDeathCleanup|TestJavaRemoteParentCgroupPartialAttachRollback|TestJavaRemoteParentBridgeLoadRequiresPrivileges)$'
 readonly BENCHMARK_TEST_PATTERN='^TestJavaRemoteParentTransportBenchmark$'
 
@@ -22,9 +26,17 @@ require_test_passed() {
     if grep -Eq -- '^[[:space:]]*--- SKIP:' "$output_file"; then
         fail "a required test skipped; see ${output_file}"
     fi
-    if ! grep -Fq -- "--- PASS: ${test_name} " "$output_file"; then
+    if ! grep -Eq -- "^[[:space:]]*--- PASS: ${test_name} \\(" "$output_file"; then
         fail "${test_name} did not report PASS; see ${output_file}"
     fi
+}
+
+require_production_verifier_profiles_passed() {
+    local -r output_file="$1"
+
+    require_test_passed "$output_file" "$VERIFIER_TEST_NAME"
+    require_test_passed "$output_file" "$VERIFIER_GENERIC_PROFILE"
+    require_test_passed "$output_file" "$VERIFIER_SOCKOPT_PROFILE"
 }
 
 require_private_benchmark_path() {
@@ -366,6 +378,20 @@ collect_kernel_evidence() {
     } 2>&1 | tee "$OUTPUT_DIR/bpftool-feature.txt"
 }
 
+run_production_verifier_profiles() {
+    local -r output_file="$OUTPUT_DIR/production-verifier-profiles.log"
+
+    go test \
+        -count=1 \
+        -timeout=20m \
+        -v \
+        -tags=bpf_verifier_tests \
+        -run "$VERIFIER_TEST_PATTERN" \
+        ./pkg/internal/ebpf/verifier/... 2>&1 | tee "$output_file"
+
+    require_production_verifier_profiles_passed "$output_file"
+}
+
 run_sockopt_authority_tests() {
     local -r output_file="$OUTPUT_DIR/privileged-tests.log"
 
@@ -431,6 +457,7 @@ main() {
     mkdir -p -- "$OUTPUT_DIR"
     collect_kernel_evidence
     require_java_agent
+    run_production_verifier_profiles
     run_sockopt_authority_tests
     run_transport_benchmark
 }

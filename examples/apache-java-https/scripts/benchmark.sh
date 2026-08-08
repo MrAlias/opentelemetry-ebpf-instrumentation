@@ -47,6 +47,8 @@ readonly MAX_SEED=9223372036854775807
 readonly MAX_JAVA_DIAGNOSTIC_COUNTER=999999999
 readonly MAX_BPF_OPERATION_COUNTER=9223372036854775807
 readonly MAX_JAVA_DIAGNOSTICS_SNAPSHOT_BYTES=4096
+readonly MAX_BENCHMARK_CA_CERTIFICATE_BYTES=16384
+readonly MAX_BENCHMARK_CA_METADATA_BYTES=16384
 readonly MAX_SUSTAINED_WORKLOAD_SUCCESSFUL_REQUESTS="$(((MAX_REPETITIONS + 1) * REQUEST_LIMIT))"
 readonly MAX_W3C_WORKLOAD_SUCCESSFUL_REQUESTS="$MAX_SUSTAINED_WORKLOAD_SUCCESSFUL_REQUESTS"
 readonly MAX_HELPER_IDLE_WORKLOAD_SUCCESSFUL_REQUESTS="$MAX_SUSTAINED_WORKLOAD_SUCCESSFUL_REQUESTS"
@@ -462,7 +464,7 @@ check_dependencies() {
     die "the benchmark harness requires Linux"
     return $?
   }
-  for command_name in awk chmod curl date docker env find flock git grep head id install jq mkdir mktemp mv rm setsid sort stat timeout tr uname wc; do
+  for command_name in awk chmod cmp curl date docker env find flock git grep head id install jq mkdir mktemp mv openssl rm setsid sort stat timeout tr uname wc; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
       missing+=("$command_name")
     fi
@@ -674,6 +676,184 @@ configure_compose() {
   [[ "$project" =~ ^${PROJECT_NAMESPACE}-[a-z0-9][a-z0-9_-]*$ &&
     ${#project} -le 63 ]] || return 1
   COMPOSE=(docker compose --project-name "$project" --file "$COMPOSE_FILE")
+}
+
+prepare_benchmark_ca() {
+  local -r result_directory="$1"
+  local -r cell_dir="$2"
+  local -r metadata="$result_directory/certificates.json"
+  local -r certificate="$cell_dir/preflight/benchmark-ca.crt"
+  local -r provenance="$cell_dir/preflight/benchmark-ca.json"
+  local -r source_identity="$cell_dir/preflight/benchmark-ca-source-identity.txt"
+  local -r source_service="apache-proxy"
+  local -r source_path="/run/obi-demo/certs/ca.crt"
+  local -a basic_constraints_lines=()
+  local -a temporary_paths=()
+  local basic_constraints=""
+  local container_id=""
+  local expected_fingerprint=""
+  local metadata_size=""
+  local observed_fingerprint=""
+  local observed_size=""
+  local temporary=""
+  local canonical=""
+  local temporary_identity=""
+  local temporary_metadata=""
+  local temporary_provenance=""
+
+  unset BENCHMARK_CA_SOURCE
+  [[ -f "$metadata" && ! -L "$metadata" &&
+    ! -e "$certificate" && ! -L "$certificate" &&
+    ! -e "$provenance" && ! -L "$provenance" &&
+    ! -e "$source_identity" && ! -L "$source_identity" ]] || return 1
+  temporary_metadata="$(mktemp "$cell_dir/preflight/.benchmark-ca-metadata.json.XXXXXX")" || return 1
+  temporary_paths+=("$temporary_metadata")
+  if ! head -c "$((MAX_BENCHMARK_CA_METADATA_BYTES + 1))" -- "$metadata" \
+    >"$temporary_metadata"; then
+    rm -f -- "${temporary_paths[@]}"
+    return 1
+  fi
+  metadata_size="$(stat --format '%s' -- "$temporary_metadata")" || {
+    rm -f -- "${temporary_paths[@]}"
+    return 1
+  }
+  if [[ ! "$metadata_size" =~ ^[1-9][0-9]*$ ]] ||
+    ((metadata_size > MAX_BENCHMARK_CA_METADATA_BYTES)); then
+    rm -f -- "${temporary_paths[@]}"
+    return 1
+  fi
+  expected_fingerprint="$(jq -ser '
+    if length == 1 then
+      .[0].ca_sha256 |
+      select(type == "string" and test("^([0-9A-F]{2}:){31}[0-9A-F]{2}$"))
+    else
+      empty
+    end
+  ' "$temporary_metadata")" || {
+    rm -f -- "${temporary_paths[@]}"
+    return 1
+  }
+  temporary="$(mktemp "$cell_dir/preflight/.benchmark-ca.crt.XXXXXX")" || {
+    rm -f -- "${temporary_paths[@]}"
+    return 1
+  }
+  temporary_paths+=("$temporary")
+  canonical="$(mktemp "$cell_dir/preflight/.benchmark-ca-canonical.crt.XXXXXX")" || {
+    rm -f -- "${temporary_paths[@]}"
+    return 1
+  }
+  temporary_paths+=("$canonical")
+  temporary_identity="$(mktemp "$cell_dir/preflight/.benchmark-ca-source-identity.txt.XXXXXX")" || {
+    rm -f -- "${temporary_paths[@]}"
+    return 1
+  }
+  temporary_paths+=("$temporary_identity")
+  temporary_provenance="$(mktemp "$cell_dir/preflight/.benchmark-ca.json.XXXXXX")" || {
+    rm -f -- "${temporary_paths[@]}"
+    return 1
+  }
+  temporary_paths+=("$temporary_provenance")
+  if ! capture_service_identity "$source_service" "$temporary_identity"; then
+    rm -f -- "${temporary_paths[@]}"
+    return 1
+  fi
+  container_id="$(identity_field "$temporary_identity" container_id)" || {
+    rm -f -- "${temporary_paths[@]}"
+    return 1
+  }
+
+  if ! run_bounded "$DOCKER_QUERY_TIMEOUT_SECONDS" \
+    docker exec "$container_id" cat "$source_path" 2>/dev/null | \
+    head -c "$((MAX_BENCHMARK_CA_CERTIFICATE_BYTES + 1))" >"$temporary"; then
+    rm -f -- "${temporary_paths[@]}"
+    return 1
+  fi
+  observed_size="$(stat --format '%s' -- "$temporary")" || {
+    rm -f -- "${temporary_paths[@]}"
+    return 1
+  }
+  if [[ ! "$observed_size" =~ ^[1-9][0-9]*$ ]] ||
+    ((observed_size > MAX_BENCHMARK_CA_CERTIFICATE_BYTES)) ||
+    ! openssl x509 -in "$temporary" -outform PEM -out "$canonical" 2>/dev/null ||
+    ! cmp -s -- "$temporary" "$canonical" ||
+    ! openssl x509 -checkend 3600 -noout -in "$temporary" >/dev/null 2>&1; then
+    rm -f -- "${temporary_paths[@]}"
+    return 1
+  fi
+  basic_constraints="$(
+    openssl x509 -noout -ext basicConstraints -in "$temporary" 2>/dev/null
+  )" || {
+    rm -f -- "${temporary_paths[@]}"
+    return 1
+  }
+  mapfile -t basic_constraints_lines <<<"$basic_constraints"
+  if ((${#basic_constraints_lines[@]} != 2)) ||
+    [[ "${basic_constraints_lines[0]:-}" != "X509v3 Basic Constraints: critical" ||
+      ! "${basic_constraints_lines[1]:-}" =~ ^[[:space:]]+CA:TRUE(,[[:space:]]pathlen:[0-9]+)?$ ]] ||
+    ! openssl verify -check_ss_sig -trusted "$temporary" "$temporary" >/dev/null 2>&1; then
+    rm -f -- "${temporary_paths[@]}"
+    return 1
+  fi
+  observed_fingerprint="$(
+    openssl x509 -noout -fingerprint -sha256 -in "$temporary" 2>/dev/null
+  )" || {
+    rm -f -- "${temporary_paths[@]}"
+    return 1
+  }
+  observed_fingerprint="${observed_fingerprint#*=}"
+  if [[ "$observed_fingerprint" != "$expected_fingerprint" ]]; then
+    rm -f -- "${temporary_paths[@]}"
+    return 1
+  fi
+  jq -n \
+    --arg source_service "$source_service" \
+    --arg source_path "$source_path" \
+    --arg source_identity "$(basename -- "$source_identity")" \
+    --arg source_container_id "$container_id" \
+    --arg certificate "$(basename -- "$certificate")" \
+    --arg expected_fingerprint "$expected_fingerprint" \
+    --arg observed_fingerprint "$observed_fingerprint" \
+    --argjson observed_size "$observed_size" '
+      {
+        source_service: $source_service,
+        source_path: $source_path,
+        source_identity: $source_identity,
+        source_container_id: $source_container_id,
+        certificate: $certificate,
+        expected_sha256_fingerprint: $expected_fingerprint,
+        observed_sha256_fingerprint: $observed_fingerprint,
+        size_bytes: $observed_size,
+        assertion: {
+          source_container_identity_verified: true,
+          recorded_fingerprint_matched: true,
+          canonical_single_pem_certificate: true,
+          private_key_or_keystore_copied: false
+        }
+      }
+    ' >"$temporary_provenance" || {
+    rm -f -- "${temporary_paths[@]}"
+    return 1
+  }
+  rm -f -- "$canonical" "$temporary_metadata" || {
+    rm -f -- "${temporary_paths[@]}"
+    return 1
+  }
+  chmod 0444 -- "$temporary" || {
+    rm -f -- "${temporary_paths[@]}"
+    return 1
+  }
+  chmod 0400 -- "$temporary_identity" "$temporary_provenance" || {
+    rm -f -- "${temporary_paths[@]}"
+    return 1
+  }
+  if ! mv -T -- "$temporary" "$certificate" ||
+    ! mv -T -- "$temporary_identity" "$source_identity" ||
+    ! mv -T -- "$temporary_provenance" "$provenance"; then
+    rm -f -- "${temporary_paths[@]}" "$certificate" "$source_identity" "$provenance"
+    return 1
+  fi
+  BENCHMARK_CA_SOURCE="$certificate"
+  export BENCHMARK_CA_SOURCE
 }
 
 write_manifest() {
@@ -1114,7 +1294,7 @@ capture_java_diagnostics() {
   if run_bounded "$DOCKER_QUERY_TIMEOUT_SECONDS" \
     curl --fail --silent --show-error --max-time 5 \
       --max-filesize "$MAX_JAVA_DIAGNOSTICS_SNAPSHOT_BYTES" \
-      --cacert "$RUNTIME_DIR/certs/ca.crt" \
+      --cacert "$BENCHMARK_CA_SOURCE" \
       "https://127.0.0.1:18443/obi-diagnostics" 2>"$output.stderr" | \
     head -c "$((MAX_JAVA_DIAGNOSTICS_SNAPSHOT_BYTES + 1))" >"$partial"; then
     captured_bytes="$(stat --format '%s' -- "$partial")" || return 1
@@ -2683,6 +2863,7 @@ start_cell_stack() {
 
   ACTIVE_PROJECT="$project"
   ACTIVE_CELL_DIR="$cell_dir"
+  unset BENCHMARK_CA_SOURCE
   if ! run_bounded "$RUNNER_START_TIMEOUT_SECONDS" env \
     COMPOSE_PROJECT_NAME="$project" \
     "$RUNNER" \
@@ -2699,6 +2880,7 @@ start_cell_stack() {
   validate_runner_result "$result_directory" || return 1
   validate_runner_environment "$result_directory" || return 1
   verify_preflight "$result_directory" || return 1
+  prepare_benchmark_ca "$result_directory" "$cell_dir" || return 1
   retain_runner_artifacts "$result_directory" "$cell_dir"
 }
 
@@ -2718,6 +2900,7 @@ cleanup_active_project() {
   ACTIVE_PROJECT=""
   ACTIVE_CELL_DIR=""
   COMPOSE=()
+  unset BENCHMARK_CA_SOURCE
 }
 
 write_cell_status() {

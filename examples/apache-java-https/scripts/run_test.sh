@@ -13919,8 +13919,12 @@ test_primary_live_fd_compose_topology_is_scoped() {
 test_benchmark_client_compose_topology_is_least_privilege() {
   local -r compose_file="$TEST_SCRIPT_DIR/../docker-compose.yml"
   local -r resolved_compose="$TEST_TMP_DIR/benchmark-client-resolved-compose.yaml"
+  local -r override_ca="$TEST_TMP_DIR/benchmark-client-override-ca.crt"
+  local -r override_resolved_compose="$TEST_TMP_DIR/benchmark-client-override-resolved-compose.yaml"
   local example_directory=""
   local benchmark_service=""
+  local override_benchmark_service=""
+  local override_benchmark_volumes=""
   local resolved_benchmark_service=""
   local benchmark_volumes=""
   local resolved_benchmark_volumes=""
@@ -13930,9 +13934,15 @@ test_benchmark_client_compose_topology_is_least_privilege() {
   local resolved_security_option_count=""
 
   example_directory="$(cd -- "$TEST_SCRIPT_DIR/.." && pwd -P)"
-  COMPOSE_PROFILES=tools docker compose --file "$compose_file" config >"$resolved_compose"
+  BENCHMARK_CA_SOURCE='' COMPOSE_PROFILES=tools \
+    docker compose --file "$compose_file" config >"$resolved_compose"
+  BENCHMARK_CA_SOURCE="$override_ca" COMPOSE_PROFILES=tools \
+    docker compose --file "$compose_file" config >"$override_resolved_compose"
   benchmark_service="$(compose_service_block "$compose_file" benchmark)"
   resolved_benchmark_service="$(compose_service_block "$resolved_compose" benchmark)"
+  override_benchmark_service="$(
+    compose_service_block "$override_resolved_compose" benchmark
+  )"
   benchmark_volumes="$(awk '
     $0 == "    volumes:" { inside = 1; next }
     inside && $0 ~ /^    [^[:space:]#][^:]*:/ { exit }
@@ -13943,6 +13953,11 @@ test_benchmark_client_compose_topology_is_least_privilege() {
     inside && $0 ~ /^    [^[:space:]#][^:]*:/ { exit }
     inside { print }
   ' <<<"$resolved_benchmark_service")"
+  override_benchmark_volumes="$(awk '
+    $0 == "    volumes:" { inside = 1; next }
+    inside && $0 ~ /^    [^[:space:]#][^:]*:/ { exit }
+    inside { print }
+  ' <<<"$override_benchmark_service")"
   resolved_security_options="$(awk '
     $0 == "    security_opt:" { inside = 1; next }
     inside && $0 ~ /^    [^[:space:]#][^:]*:/ { exit }
@@ -13965,7 +13980,7 @@ test_benchmark_client_compose_topology_is_least_privilege() {
     "$benchmark_service" != *'pid:'* &&
     "$benchmark_service" != *'userns_mode:'* &&
     "$raw_volume_count" == "1" &&
-    "$benchmark_volumes" == $'      - type: bind\n        source: ./.runtime/certs/ca.crt\n        target: /benchmark-ca.crt\n        read_only: true\n        bind:\n          create_host_path: false' ]] || {
+    "$benchmark_volumes" == $'      - type: bind\n        source: ${BENCHMARK_CA_SOURCE:-./.runtime/certs/ca.crt}\n        target: /benchmark-ca.crt\n        read_only: true\n        bind:\n          create_host_path: false' ]] || {
     printf 'benchmark client must retain its exact read-only CA-only topology\n' >&2
     return 1
   }
@@ -13983,6 +13998,12 @@ test_benchmark_client_compose_topology_is_least_privilege() {
     "$resolved_security_option_count" == "1" &&
     "$resolved_security_options" == '      - no-new-privileges:true' ]] || {
     printf 'resolved benchmark client topology exposed more than its verified CA\n' >&2
+    return 1
+  }
+  [[ "$override_benchmark_volumes" == $'      - type: bind\n        source: '"$override_ca"$'\n        target: /benchmark-ca.crt\n        read_only: true\n        bind:\n          create_host_path: false' &&
+    "$override_benchmark_volumes" != *'.key'* &&
+    "$override_benchmark_volumes" != *'.p12'* ]] || {
+    printf 'resolved benchmark client did not confine its explicit CA override\n' >&2
     return 1
   }
 }

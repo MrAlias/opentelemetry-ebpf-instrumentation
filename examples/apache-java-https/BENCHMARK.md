@@ -217,6 +217,16 @@ JSON, post-load sentinel, host environment, Docker stats and inspect records,
 `/proc` memory/fd/thread snapshots, OBI metrics when applicable, and requested
 Java diagnostics. The helper-idle midpoint is the documented exception: it
 omits Java diagnostics and records that explicit reason in `snapshot.json`.
+A clean preflight runs from a sealed source snapshot that is removed when the
+runner exits with its scoped stack still active. Before starting any sustained
+client, the harness therefore reads only the public CA certificate from the
+identity-verified live Apache proxy container, caps it at 16 KiB, requires one
+canonical PEM certificate with critical `CA:TRUE` constraints, a current
+validity window, and a valid self-signature under an isolated trust store, and
+matches its SHA-256 certificate fingerprint to the preflight's retained
+`certificates.json`. The read-only public certificate resides in the private
+per-cell artifact directory and is the only file mounted into the
+least-privileged benchmark client; no private key or PKCS#12 keystore is copied.
 A snapshot labelled `unsynchronized_midpoint` is a point sample while the load
 command is still running; it is not proof that traffic was live throughout the
 sample. The manifest includes a shell-escaped invocation for reproduction. On a

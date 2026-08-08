@@ -316,6 +316,7 @@ fake_write_runner_artifacts() {
   local -r selected_transport="$7"
   local -r project="$8"
   local assertion_scenario="concurrency"
+  local ca_fingerprint=""
   local index=0
 
   if [[ "$scenario" == w3c ]]; then
@@ -339,7 +340,16 @@ fake_write_runner_artifacts() {
   printf 'fake  bridge-artifacts.json\n' >"$result_directory/bridge-metadata.sha256"
   printf 'fake\n' >"$result_directory/bridge-source-revision.txt"
   printf 'fake\n' >"$result_directory/bridge-source-tree.sha256"
-  printf '{"certificate":"test-only"}\n' >"$result_directory/certificates.json"
+  if [[ -n "${FAKE_CA_FILE:-}" && -f "$FAKE_CA_FILE" ]]; then
+    ca_fingerprint="$(
+      openssl x509 -noout -fingerprint -sha256 -in "$FAKE_CA_FILE"
+    )" || return 64
+    ca_fingerprint="${ca_fingerprint#*=}"
+    jq -n --arg ca_sha256 "$ca_fingerprint" '{ca_sha256: $ca_sha256}' \
+      >"$result_directory/certificates.json"
+  else
+    printf '{"certificate":"test-only"}\n' >"$result_directory/certificates.json"
+  fi
   printf 'services: {}\n' >"$result_directory/compose-resolved.yaml"
   printf 'compose up\n' >"$result_directory/compose-up.log"
   printf 'NAME STATUS\n' >"$result_directory/compose-ps.txt"
@@ -727,6 +737,13 @@ fake_docker() {
     printf '"fake" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "0.01%%" "1MiB / 1GiB" "1" "0B / 0B"\n'
     return 0
   fi
+  if [[ "${1:-}" == exec ]]; then
+    [[ "${2:-}" == "$FAKE_CONTAINER_ID" && "${3:-}" == cat &&
+      "${4:-}" == /run/obi-demo/certs/ca.crt && $# == 4 &&
+      -n "${FAKE_CA_FILE:-}" && -f "$FAKE_CA_FILE" ]] || return 64
+    command cat -- "$FAKE_CA_FILE"
+    return 0
+  fi
   if [[ "${1:-}" == inspect ]]; then
     while (($# > 0)); do
       if [[ "$1" == --format ]]; then
@@ -869,6 +886,7 @@ esac
 source "$TEST_SCRIPT_DIR/benchmark.sh"
 
 TEST_TMP_DIR=""
+FAKE_CA_FILE=""
 
 cleanup_test() {
   if [[ "${KEEP_TEST_TMP:-false}" != "true" && -n "$TEST_TMP_DIR" && -d "$TEST_TMP_DIR" ]]; then
@@ -877,6 +895,27 @@ cleanup_test() {
 }
 
 trap cleanup_test EXIT
+
+prepare_fake_ca() {
+  local private_key=""
+
+  FAKE_CA_FILE="$TEST_TMP_DIR/fake-benchmark-ca.crt"
+  private_key="$TEST_TMP_DIR/fake-benchmark-ca.key"
+  openssl req \
+    -x509 \
+    -newkey rsa:2048 \
+    -nodes \
+    -sha256 \
+    -days 1 \
+    -set_serial 1 \
+    -subj '/CN=OBI benchmark harness test CA' \
+    -addext 'basicConstraints=critical,CA:TRUE,pathlen:0' \
+    -addext 'keyUsage=critical,keyCertSign,cRLSign' \
+    -keyout "$private_key" \
+    -out "$FAKE_CA_FILE" >/dev/null 2>&1
+  chmod 0600 -- "$private_key" "$FAKE_CA_FILE"
+  export FAKE_CA_FILE
+}
 
 # shellcheck disable=SC2034 # These globals are consumed by sourced benchmark.sh functions.
 reset_options() {
@@ -918,6 +957,7 @@ reset_options() {
   CELL_UPSTREAM_HANDOFF=""
   CELL_HELPER_IDLE=false
   COMPOSE=()
+  unset BENCHMARK_CA_SOURCE
 }
 
 expect_parse_failure() {
@@ -2660,6 +2700,255 @@ test_missing_runner_provenance_is_rejected() {
   fi
 }
 
+test_benchmark_ca_rejects_untrusted_inputs() (
+  local -r result_directory="$TEST_TMP_DIR/benchmark-ca-rejection-result"
+  local -r cell_dir="$TEST_TMP_DIR/benchmark-ca-rejection-cell"
+  local -r noncanonical="$TEST_TMP_DIR/noncanonical-benchmark-ca.crt"
+  local -r oversized="$TEST_TMP_DIR/oversized-benchmark-ca.crt"
+  local -r bad_signature="$TEST_TMP_DIR/bad-signature-benchmark-ca.crt"
+  local -r ambient_ca_directory="$TEST_TMP_DIR/ambient-benchmark-ca-directory"
+  local -r intermediate="$TEST_TMP_DIR/intermediate-benchmark-ca.crt"
+  local -r intermediate_csr="$TEST_TMP_DIR/intermediate-benchmark-ca.csr"
+  local -r intermediate_extensions="$TEST_TMP_DIR/intermediate-benchmark-ca-extensions.cnf"
+  local -r intermediate_key="$TEST_TMP_DIR/intermediate-benchmark-ca.key"
+  local -r non_ca="$TEST_TMP_DIR/non-ca-benchmark-certificate.crt"
+  local -r non_ca_key="$TEST_TMP_DIR/non-ca-benchmark-certificate.key"
+  local -r oversized_metadata="$TEST_TMP_DIR/oversized-benchmark-ca-metadata.json"
+  local -r multiple_metadata="$TEST_TMP_DIR/multiple-benchmark-ca-metadata.json"
+  local -r suppressed_stderr="$TEST_TMP_DIR/benchmark-ca-suppressed.stderr"
+  local actual_fingerprint=""
+  local ambient_ca_hash=""
+  local emit_hostile_stderr=true
+  local source_certificate="$FAKE_CA_FILE"
+
+  reset_options
+  mkdir -p -- "$result_directory" "$cell_dir/preflight"
+  printf '%s\n' \
+    '{"ca_sha256":"00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00"}' \
+    >"$result_directory/certificates.json"
+  capture_service_identity() {
+    local -r service="$1"
+    local -r output="$2"
+
+    [[ "$service" == apache-proxy ]] || return 64
+    {
+      printf 'service=apache-proxy\n'
+      printf 'container_id=%064d\n' 0
+      printf 'host_pid=1\n'
+      printf 'project=test-project\n'
+      printf 'owner_sentinel=acceptance-demo-v1\n'
+    } >"$output"
+  }
+  run_bounded() {
+    if [[ "$emit_hostile_stderr" == true ]]; then
+      head -c 32768 /dev/zero | tr '\0' x >&2
+    fi
+    command cat -- "$source_certificate"
+  }
+  if prepare_benchmark_ca "$result_directory" "$cell_dir" 2>"$suppressed_stderr"; then
+    printf 'benchmark CA accepted a mismatched retained fingerprint\n' >&2
+    return 1
+  fi
+  [[ ! -s "$suppressed_stderr" ]] || {
+    printf 'benchmark CA retrieval leaked hostile container stderr\n' >&2
+    return 1
+  }
+  emit_hostile_stderr=false
+  [[ ! -e "$cell_dir/preflight/benchmark-ca.crt" &&
+    ! -e "$cell_dir/preflight/benchmark-ca.json" &&
+    ! -e "$cell_dir/preflight/benchmark-ca-source-identity.txt" ]] || {
+    printf 'benchmark CA mismatch published an artifact\n' >&2
+    return 1
+  }
+
+  command cp -- "$FAKE_CA_FILE" "$noncanonical"
+  printf '%s\n' 'trailing payload' >>"$noncanonical"
+  source_certificate="$noncanonical"
+  actual_fingerprint="$(
+    openssl x509 -noout -fingerprint -sha256 -in "$FAKE_CA_FILE"
+  )" || return 1
+  actual_fingerprint="${actual_fingerprint#*=}"
+  jq -n --arg ca_sha256 "$actual_fingerprint" '{ca_sha256: $ca_sha256}' \
+    >"$result_directory/certificates.json"
+  if prepare_benchmark_ca "$result_directory" "$cell_dir"; then
+    printf 'benchmark CA accepted trailing non-certificate data\n' >&2
+    return 1
+  fi
+  [[ ! -e "$cell_dir/preflight/benchmark-ca.crt" &&
+    ! -e "$cell_dir/preflight/benchmark-ca.json" &&
+    ! -e "$cell_dir/preflight/benchmark-ca-source-identity.txt" ]] || {
+    printf 'noncanonical benchmark CA published an artifact\n' >&2
+    return 1
+  }
+
+  {
+    command cat -- "$FAKE_CA_FILE"
+    head -c "$MAX_BENCHMARK_CA_CERTIFICATE_BYTES" /dev/zero | tr '\0' x
+  } >"$oversized"
+  source_certificate="$oversized"
+  if prepare_benchmark_ca "$result_directory" "$cell_dir"; then
+    printf 'benchmark CA accepted an oversized source\n' >&2
+    return 1
+  fi
+  [[ ! -e "$cell_dir/preflight/benchmark-ca.crt" &&
+    ! -e "$cell_dir/preflight/benchmark-ca.json" &&
+    ! -e "$cell_dir/preflight/benchmark-ca-source-identity.txt" ]] || {
+    printf 'oversized benchmark CA published an artifact\n' >&2
+    return 1
+  }
+
+  openssl x509 -in "$FAKE_CA_FILE" -badsig -out "$bad_signature" 2>/dev/null
+  source_certificate="$bad_signature"
+  actual_fingerprint="$(
+    openssl x509 -noout -fingerprint -sha256 -in "$source_certificate"
+  )" || return 1
+  actual_fingerprint="${actual_fingerprint#*=}"
+  jq -n --arg ca_sha256 "$actual_fingerprint" '{ca_sha256: $ca_sha256}' \
+    >"$result_directory/certificates.json"
+  if prepare_benchmark_ca "$result_directory" "$cell_dir"; then
+    printf 'benchmark CA accepted an invalid self-signature\n' >&2
+    return 1
+  fi
+  [[ ! -e "$cell_dir/preflight/benchmark-ca.crt" &&
+    ! -e "$cell_dir/preflight/benchmark-ca.json" &&
+    ! -e "$cell_dir/preflight/benchmark-ca-source-identity.txt" ]] || {
+    printf 'bad-signature benchmark CA published an artifact\n' >&2
+    return 1
+  }
+
+  mkdir --mode=0700 -- "$ambient_ca_directory"
+  ambient_ca_hash="$(
+    openssl x509 -subject_hash -noout -in "$FAKE_CA_FILE"
+  )" || return 1
+  [[ "$ambient_ca_hash" =~ ^[0-9a-fA-F]+$ ]] || return 1
+  ln -s -- "$FAKE_CA_FILE" "$ambient_ca_directory/$ambient_ca_hash.0"
+  openssl req \
+    -new \
+    -newkey rsa:2048 \
+    -nodes \
+    -sha256 \
+    -subj '/CN=OBI benchmark harness intermediate test CA' \
+    -keyout "$intermediate_key" \
+    -out "$intermediate_csr" >/dev/null 2>&1
+  printf '%s\n' \
+    '[benchmark_intermediate]' \
+    'basicConstraints=critical,CA:TRUE,pathlen:0' \
+    'keyUsage=critical,keyCertSign,cRLSign' \
+    'subjectKeyIdentifier=hash' \
+    'authorityKeyIdentifier=keyid,issuer' \
+    >"$intermediate_extensions"
+  openssl x509 \
+    -req \
+    -sha256 \
+    -days 1 \
+    -set_serial 3 \
+    -in "$intermediate_csr" \
+    -CA "$FAKE_CA_FILE" \
+    -CAkey "$TEST_TMP_DIR/fake-benchmark-ca.key" \
+    -extfile "$intermediate_extensions" \
+    -extensions benchmark_intermediate \
+    -out "$intermediate" >/dev/null 2>&1
+  chmod 0600 -- \
+    "$intermediate" "$intermediate_csr" "$intermediate_extensions" "$intermediate_key"
+  SSL_CERT_DIR="$ambient_ca_directory" \
+    openssl verify -check_ss_sig -CAfile "$intermediate" "$intermediate" \
+      >/dev/null 2>&1 || {
+    printf 'ambient CA fixture did not reproduce the non-isolated trust chain\n' >&2
+    return 1
+  }
+  source_certificate="$intermediate"
+  actual_fingerprint="$(
+    openssl x509 -noout -fingerprint -sha256 -in "$source_certificate"
+  )" || return 1
+  actual_fingerprint="${actual_fingerprint#*=}"
+  jq -n --arg ca_sha256 "$actual_fingerprint" '{ca_sha256: $ca_sha256}' \
+    >"$result_directory/certificates.json"
+  if SSL_CERT_DIR="$ambient_ca_directory" \
+    prepare_benchmark_ca "$result_directory" "$cell_dir"; then
+    printf 'benchmark CA accepted an ambiently chained intermediate\n' >&2
+    return 1
+  fi
+  [[ ! -e "$cell_dir/preflight/benchmark-ca.crt" &&
+    ! -e "$cell_dir/preflight/benchmark-ca.json" &&
+    ! -e "$cell_dir/preflight/benchmark-ca-source-identity.txt" ]] || {
+    printf 'ambiently chained intermediate published a benchmark CA artifact\n' >&2
+    return 1
+  }
+
+  openssl req \
+    -x509 \
+    -newkey rsa:2048 \
+    -nodes \
+    -sha256 \
+    -days 1 \
+    -set_serial 2 \
+    -subj '/CN=OBI benchmark harness non-CA test certificate' \
+    -addext 'basicConstraints=critical,CA:FALSE' \
+    -keyout "$non_ca_key" \
+    -out "$non_ca" >/dev/null 2>&1
+  chmod 0600 -- "$non_ca_key" "$non_ca"
+  source_certificate="$non_ca"
+  actual_fingerprint="$(
+    openssl x509 -noout -fingerprint -sha256 -in "$source_certificate"
+  )" || return 1
+  actual_fingerprint="${actual_fingerprint#*=}"
+  jq -n --arg ca_sha256 "$actual_fingerprint" '{ca_sha256: $ca_sha256}' \
+    >"$result_directory/certificates.json"
+  if prepare_benchmark_ca "$result_directory" "$cell_dir"; then
+    printf 'benchmark CA accepted a CA:FALSE trust object\n' >&2
+    return 1
+  fi
+  [[ ! -e "$cell_dir/preflight/benchmark-ca.crt" &&
+    ! -e "$cell_dir/preflight/benchmark-ca.json" &&
+    ! -e "$cell_dir/preflight/benchmark-ca-source-identity.txt" ]] || {
+    printf 'non-CA benchmark certificate published an artifact\n' >&2
+    return 1
+  }
+
+  source_certificate="$FAKE_CA_FILE"
+  actual_fingerprint="$(
+    openssl x509 -noout -fingerprint -sha256 -in "$source_certificate"
+  )" || return 1
+  actual_fingerprint="${actual_fingerprint#*=}"
+  {
+    printf '{"ca_sha256":"%s","padding":"' "$actual_fingerprint"
+    head -c "$MAX_BENCHMARK_CA_METADATA_BYTES" /dev/zero | tr '\0' x
+    printf '"}\n'
+  } >"$oversized_metadata"
+  command cp -- "$oversized_metadata" "$result_directory/certificates.json"
+  if prepare_benchmark_ca "$result_directory" "$cell_dir"; then
+    printf 'benchmark CA accepted oversized retained metadata\n' >&2
+    return 1
+  fi
+  [[ ! -e "$cell_dir/preflight/benchmark-ca.crt" &&
+    ! -e "$cell_dir/preflight/benchmark-ca.json" &&
+    ! -e "$cell_dir/preflight/benchmark-ca-source-identity.txt" ]] || {
+    printf 'oversized benchmark CA metadata published an artifact\n' >&2
+    return 1
+  }
+
+  jq -n --arg ca_sha256 "$actual_fingerprint" '{ca_sha256: $ca_sha256}' \
+    >"$multiple_metadata"
+  jq -n --arg ca_sha256 "$actual_fingerprint" '{ca_sha256: $ca_sha256}' \
+    >>"$multiple_metadata"
+  command cp -- "$multiple_metadata" "$result_directory/certificates.json"
+  if prepare_benchmark_ca "$result_directory" "$cell_dir"; then
+    printf 'benchmark CA accepted multiple retained metadata documents\n' >&2
+    return 1
+  fi
+  [[ ! -e "$cell_dir/preflight/benchmark-ca.crt" &&
+    ! -e "$cell_dir/preflight/benchmark-ca.json" &&
+    ! -e "$cell_dir/preflight/benchmark-ca-source-identity.txt" ]] || {
+    printf 'multiple benchmark CA metadata documents published an artifact\n' >&2
+    return 1
+  }
+  [[ -z "$(find "$cell_dir/preflight" -mindepth 1 -maxdepth 1 \
+    -name '.benchmark-ca-*' -print -quit)" ]] || {
+    printf 'rejected benchmark CA input left a hidden temporary artifact\n' >&2
+    return 1
+  }
+)
+
 test_main_uses_runner_cleanup_and_retains_core_artifacts() {
   local -r fake_root="$TEST_TMP_DIR/fake-root"
   local -r fake_example="$fake_root/examples/apache-java-https"
@@ -2675,6 +2964,7 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
   local -r results_root="$fake_example/.runtime/results"
   local -r helper_events="$TEST_TMP_DIR/helper-idle-events.log"
   local -r expected_helper_events="$TEST_TMP_DIR/helper-idle-events.expected"
+  local cell=""
   local command_name=""
   local request=0
 
@@ -2774,6 +3064,37 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
     printf 'hermetic run did not retain the fixed bounded preflight request count\n' >&2
     return 1
   }
+  for cell in uninstrumented bridge-disabled getsockopt-hit unix-hit getsockopt-w3c getsockopt-helper-idle; do
+    [[ -f "$output/cells/$cell/preflight/benchmark-ca.crt" &&
+      "$(stat --format '%a' -- "$output/cells/$cell/preflight/benchmark-ca.crt")" == 444 &&
+      -f "$output/cells/$cell/preflight/benchmark-ca-source-identity.txt" &&
+      "$(stat --format '%a' -- "$output/cells/$cell/preflight/benchmark-ca-source-identity.txt")" == 400 ]] || {
+      printf 'benchmark cell %s omitted its private verified CA copy\n' "$cell" >&2
+      return 1
+    }
+    jq -e '
+      .source_service == "apache-proxy" and
+      .source_path == "/run/obi-demo/certs/ca.crt" and
+      .source_identity == "benchmark-ca-source-identity.txt" and
+      (.source_container_id | test("^[0-9a-f]{64}$")) and
+      .expected_sha256_fingerprint == .observed_sha256_fingerprint and
+      .size_bytes > 0 and
+      .assertion == {
+        source_container_identity_verified: true,
+        recorded_fingerprint_matched: true,
+        canonical_single_pem_certificate: true,
+        private_key_or_keystore_copied: false
+      }
+    ' "$output/cells/$cell/preflight/benchmark-ca.json" >/dev/null || {
+      printf 'benchmark cell %s omitted exact CA provenance\n' "$cell" >&2
+      return 1
+    }
+    grep -Fxq 'service=apache-proxy' \
+      "$output/cells/$cell/preflight/benchmark-ca-source-identity.txt" || {
+      printf 'benchmark cell %s omitted its verified CA source identity\n' "$cell" >&2
+      return 1
+    }
+  done
   jq -e '.status == "passed" and .requests == 16' \
     "$output/cells/unix-hit/postload-sentinel/status.json" >/dev/null || {
     printf 'hermetic run did not retain the post-load sentinel\n' >&2
@@ -3047,6 +3368,10 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
     printf 'helper-idle did not confine verified-CA direct HTTPS arguments to its six client runs\n' >&2
     return 1
   }
+  [[ "$(grep -Fc -- 'exec aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa cat /run/obi-demo/certs/ca.crt' "$docker_log")" == 6 ]] || {
+    printf 'hermetic run did not retrieve one verified public CA per cell\n' >&2
+    return 1
+  }
   ! grep -Fq down "$docker_log" || {
     printf 'hermetic run issued a raw Compose down\n' >&2
     return 1
@@ -3055,6 +3380,7 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
 
 main() {
   TEST_TMP_DIR="$(mktemp -d)"
+  prepare_fake_ca
   test_parser_defaults_and_boundaries
   test_lifecycle_tool_paths_must_be_absolute_regular
   test_lifecycle_tool_resolution_rejects_relative_paths
@@ -3085,6 +3411,7 @@ main() {
   test_pending_identity_never_signals_mismatched_live_job
   test_pending_identity_rejects_reused_session_promotion
   test_missing_runner_provenance_is_rejected
+  test_benchmark_ca_rejects_untrusted_inputs
   test_main_uses_runner_cleanup_and_retains_core_artifacts
   printf 'benchmark.sh tests passed\n'
 }

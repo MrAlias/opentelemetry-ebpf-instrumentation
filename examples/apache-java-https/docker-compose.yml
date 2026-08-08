@@ -161,7 +161,7 @@ services:
     read_only: true
     volumes:
       - type: bind
-        source: ./.runtime/certs/ca.crt
+        source: ${BENCHMARK_CA_SOURCE:-./.runtime/certs/ca.crt}
         target: /benchmark-ca.crt
         read_only: true
         bind:

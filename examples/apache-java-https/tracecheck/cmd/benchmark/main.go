@@ -21,7 +21,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -89,6 +88,14 @@ type measurements struct {
 	successes    uint64
 	failures     uint64
 	firstFailure string
+}
+
+type requestAdmissions struct {
+	mu       sync.Mutex
+	deadline time.Time
+	limit    uint64
+	requests uint64
+	now      func() time.Time
 }
 
 func main() {
@@ -307,14 +314,14 @@ func run(parent context.Context, cfg config) (runResult, error) {
 		},
 	}
 
-	var requests atomic.Uint64
 	measurements := measurements{latencies: make([]int64, 0, 1_024)}
 	start := make(chan struct{})
 	var waitGroup sync.WaitGroup
 	var ready sync.WaitGroup
 	ready.Add(cfg.concurrency)
-	var ctx context.Context
-	var cancel context.CancelFunc
+	var admissions *requestAdmissions
+	var requestParent context.Context
+	var cancelRequests context.CancelFunc
 	for worker := 0; worker < cfg.concurrency; worker++ {
 		waitGroup.Add(1)
 		go func() {
@@ -322,22 +329,22 @@ func run(parent context.Context, cfg config) (runResult, error) {
 			ready.Done()
 			<-start
 			for {
-				if ctx.Err() != nil {
+				if requestParent.Err() != nil {
 					return
 				}
-				requestNumber, reserved := reserveRequest(&requests, cfg.requestLimit)
+				requestNumber, reserved := admissions.reserve()
 				if !reserved {
 					return
 				}
 				requestStartedAt := time.Now()
-				err := sendRequest(ctx, client, targetURL, cfg, requestNumber)
+				err := sendRequest(requestParent, client, targetURL, cfg, requestNumber)
 				elapsed := time.Since(requestStartedAt).Nanoseconds()
 				if err != nil {
-					if ctx.Err() != nil {
+					if requestParent.Err() != nil {
 						return
 					}
 					measurements.recordFailure(err)
-					cancel()
+					cancelRequests()
 					return
 				}
 				measurements.recordSuccess(elapsed)
@@ -347,13 +354,14 @@ func run(parent context.Context, cfg config) (runResult, error) {
 	ready.Wait()
 	result.StartedAt = time.Now().UTC()
 	startedAt := time.Now()
-	ctx, cancel = context.WithTimeout(parent, cfg.duration)
-	defer cancel()
+	requestParent, cancelRequests = context.WithCancel(parent)
+	defer cancelRequests()
+	admissions = newRequestAdmissions(startedAt.Add(cfg.duration), cfg.requestLimit)
 	close(start)
 	waitGroup.Wait()
 	result.FinishedAt = time.Now().UTC()
 	result.TrafficElapsedNanos = time.Since(startedAt).Nanoseconds()
-	result.RequestLimitReached = requests.Load() == cfg.requestLimit
+	result.RequestLimitReached = admissions.count() == cfg.requestLimit
 	result.SuccessfulRequests, result.FailedRequests, result.FirstFailure, result.Latency = measurements.summary()
 	if result.TrafficElapsedNanos > 0 {
 		result.ThroughputPerSecond = float64(result.SuccessfulRequests) /
@@ -371,23 +379,35 @@ func run(parent context.Context, cfg config) (runResult, error) {
 	if result.SuccessfulRequests == 0 {
 		return result, errors.New("benchmark completed without a successful request")
 	}
-	if result.RequestLimitReached && result.TrafficElapsedNanos < cfg.duration.Nanoseconds() {
+	if result.RequestLimitReached {
 		return result, errors.New("request limit reached before the configured duration")
 	}
 	result.Status = "passed"
 	return result, nil
 }
 
-func reserveRequest(requests *atomic.Uint64, limit uint64) (uint64, bool) {
-	for {
-		current := requests.Load()
-		if current >= limit {
-			return 0, false
-		}
-		if requests.CompareAndSwap(current, current+1) {
-			return current + 1, true
-		}
+func newRequestAdmissions(deadline time.Time, limit uint64) *requestAdmissions {
+	return &requestAdmissions{
+		deadline: deadline,
+		limit:    limit,
+		now:      time.Now,
 	}
+}
+
+func (a *requestAdmissions) reserve() (uint64, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.now().Before(a.deadline) || a.requests >= a.limit {
+		return 0, false
+	}
+	a.requests++
+	return a.requests, true
+}
+
+func (a *requestAdmissions) count() uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.requests
 }
 
 func sendRequest(

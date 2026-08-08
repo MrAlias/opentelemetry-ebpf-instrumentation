@@ -1359,6 +1359,7 @@ test_json_validators_require_one_document() {
   local -r w3c_sentinel_result="$TEST_TMP_DIR/w3c-sentinel-result.json"
   local -r under_run_result="$TEST_TMP_DIR/under-run-result.json"
   local -r overrun_result="$TEST_TMP_DIR/overrun-result.json"
+  local -r drained_result="$TEST_TMP_DIR/drained-result.json"
   local -r non_numeric_metric_result="$TEST_TMP_DIR/non-numeric-metric-result.json"
   local -r fractional_metric_result="$TEST_TMP_DIR/fractional-metric-result.json"
 
@@ -1367,6 +1368,11 @@ test_json_validators_require_one_document() {
   write_valid_benchmark_result "$benchmark_result" 2
   validate_benchmark_result "$benchmark_result" 2 || {
     printf 'valid benchmark result was rejected\n' >&2
+    return 1
+  }
+  write_valid_benchmark_result "$drained_result" 2 1 0 3000000000
+  validate_benchmark_result "$drained_result" 2 || {
+    printf 'valid benchmark result with bounded in-flight drain was rejected\n' >&2
     return 1
   }
   jq --argjson elapsed_nanos 1999999999 \

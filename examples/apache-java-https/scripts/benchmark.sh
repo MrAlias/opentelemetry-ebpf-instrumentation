@@ -33,9 +33,9 @@ readonly PREFLIGHT_REQUESTS=16
 readonly SUSTAINED_LOAD_SEED=0
 readonly REQUEST_TIMEOUT_SECONDS=10
 readonly REQUEST_LIMIT=1000000
-# The benchmark client gives every request the same parent duration context.
-# This permits only scheduler and worker-drain jitter after that deadline; it
-# is deliberately independent of the external command's startup allowance.
+# The measurement deadline closes admissions while admitted requests drain
+# under their per-request deadline. Retained results bound that drain separately
+# from the external command's startup allowance.
 readonly MEASUREMENT_OVERRUN_TOLERANCE_SECONDS=2
 readonly MIN_DURATION_SECONDS=2
 readonly MAX_DURATION_SECONDS=600

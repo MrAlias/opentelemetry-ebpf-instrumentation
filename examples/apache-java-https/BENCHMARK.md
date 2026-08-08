@@ -129,13 +129,16 @@ controls. The same snapshots require `d_valid` to remain zero, proving no
 second discard consumed a valid record. The user seed applies only to the
 preflight and post-load tracecheck sentinel; the sustained W3C identifier
 sequence is deterministic through the client seed of zero. The retained client
-result must report traffic from the requested duration through that duration plus a
-two-second cancellation-drain tolerance. The client's per-request contexts
-derive from one shared measurement deadline, so this small tolerance is only
-for scheduler and worker shutdown jitter; the separate 30-second command-start
-allowance is not measurement time. Each cell ends with its fixed scenario-
-specific correctness sentinel before the harness invokes `run.sh --cleanup-only`
-for that project.
+result must report traffic from the requested duration through that duration
+plus a two-second in-flight-drain tolerance. A monotonic gate closes admissions
+at the measurement deadline, while admitted requests drain under their
+per-request deadline so server-completed requests remain in the client's
+success count. The client can wait for its configured per-request timeout, but
+the harness rejects a retained sample whose drain exceeds two seconds.
+Throughput uses the full admission-plus-drain wall time. The separate 30-second
+command-start allowance is not measurement time. Each cell ends with its fixed
+scenario-specific correctness sentinel before the harness invokes
+`run.sh --cleanup-only` for that project.
 
 The schema-v2 manifest preserves its `w3c_headers: false` baseline for existing
 consumers. Its authoritative per-cell traffic record is

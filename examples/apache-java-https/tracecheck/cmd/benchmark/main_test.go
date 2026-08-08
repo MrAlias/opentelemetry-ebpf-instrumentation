@@ -505,6 +505,220 @@ func TestRunReportsExternalCancellationAfterSuccess(t *testing.T) {
 	}
 }
 
+func TestRunDrainsInFlightRequestAfterDuration(t *testing.T) {
+	requestStarted := make(chan struct{})
+	allowResponse := make(chan struct{})
+	requestCanceled := make(chan struct{})
+	var serverRequests atomic.Uint64
+	var startedOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if got, want := request.Header.Get("traceparent"),
+			"00-000000000000002a0000000000000001-0000000000000001-01"; got != want {
+			t.Errorf("traceparent = %q, want %q", got, want)
+		}
+		serverRequests.Add(1)
+		startedOnce.Do(func() { close(requestStarted) })
+		select {
+		case <-allowResponse:
+			writer.WriteHeader(http.StatusOK)
+		case <-request.Context().Done():
+			close(requestCanceled)
+		}
+	}))
+	defer server.Close()
+
+	const duration = 200 * time.Millisecond
+	type outcome struct {
+		result runResult
+		err    error
+	}
+	completed := make(chan outcome, 1)
+	go func() {
+		result, err := run(context.Background(), config{
+			baseURL:        server.URL,
+			path:           "/api/echo",
+			connectionMode: "reuse",
+			duration:       duration,
+			requestTimeout: 5 * time.Second,
+			concurrency:    1,
+			requestLimit:   maxRequestLimit,
+			seed:           42,
+			w3c:            true,
+		})
+		completed <- outcome{result: result, err: err}
+	}()
+
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("benchmark did not start a request")
+	}
+	select {
+	case <-requestCanceled:
+		t.Fatal("measurement duration canceled an in-flight request")
+	case <-completed:
+		t.Fatal("benchmark completed before its in-flight request")
+	case <-time.After(duration + 100*time.Millisecond):
+	}
+	close(allowResponse)
+
+	select {
+	case finished := <-completed:
+		if finished.err != nil {
+			t.Fatalf("run() error = %v", finished.err)
+		}
+		if finished.result.Status != "passed" || finished.result.SuccessfulRequests != 1 ||
+			finished.result.FailedRequests != 0 || finished.result.Canceled ||
+			finished.result.RequestLimitReached {
+			t.Fatalf("unexpected result: %+v", finished.result)
+		}
+		if got := serverRequests.Load(); got != finished.result.SuccessfulRequests {
+			t.Fatalf("server requests = %d, successful requests = %d", got, finished.result.SuccessfulRequests)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("benchmark did not finish after its in-flight request completed")
+	}
+}
+
+func TestRequestAdmissionsEnforcesDeadlineAndLimit(t *testing.T) {
+	deadline := time.Unix(100, 0)
+
+	t.Run("deadline", func(t *testing.T) {
+		now := deadline.Add(-time.Nanosecond)
+		admissions := newRequestAdmissions(deadline, 2)
+		admissions.now = func() time.Time { return now }
+		if requestNumber, admitted := admissions.reserve(); !admitted || requestNumber != 1 {
+			t.Fatalf("reserve() = (%d, %t), want (1, true)", requestNumber, admitted)
+		}
+		now = deadline
+		if requestNumber, admitted := admissions.reserve(); admitted || requestNumber != 0 {
+			t.Fatalf("reserve() = (%d, %t) at deadline, want (0, false)", requestNumber, admitted)
+		}
+		if got := admissions.count(); got != 1 {
+			t.Fatalf("count() = %d, want 1", got)
+		}
+	})
+
+	t.Run("limit", func(t *testing.T) {
+		admissions := newRequestAdmissions(deadline, 1)
+		admissions.now = func() time.Time { return deadline.Add(-time.Nanosecond) }
+		if requestNumber, admitted := admissions.reserve(); !admitted || requestNumber != 1 {
+			t.Fatalf("reserve() = (%d, %t), want (1, true)", requestNumber, admitted)
+		}
+		if requestNumber, admitted := admissions.reserve(); admitted || requestNumber != 0 {
+			t.Fatalf("reserve() = (%d, %t) at limit, want (0, false)", requestNumber, admitted)
+		}
+		if got := admissions.count(); got != 1 {
+			t.Fatalf("count() = %d, want 1", got)
+		}
+	})
+}
+
+func TestRunRejectsRequestLimitReachedBeforeDurationAfterDrain(t *testing.T) {
+	requestStarted := make(chan struct{})
+	allowResponse := make(chan struct{})
+	var releaseResponse sync.Once
+	release := func() { releaseResponse.Do(func() { close(allowResponse) }) }
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		close(requestStarted)
+		<-allowResponse
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	defer release()
+
+	const duration = 200 * time.Millisecond
+	type outcome struct {
+		result runResult
+		err    error
+	}
+	completed := make(chan outcome, 1)
+	go func() {
+		result, err := run(context.Background(), config{
+			baseURL:        server.URL,
+			path:           "/api/echo",
+			connectionMode: "reuse",
+			duration:       duration,
+			requestTimeout: 5 * time.Second,
+			concurrency:    1,
+			requestLimit:   1,
+		})
+		completed <- outcome{result: result, err: err}
+	}()
+
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("benchmark did not start a request")
+	}
+	select {
+	case <-completed:
+		t.Fatal("benchmark completed before its admitted request")
+	case <-time.After(duration + 100*time.Millisecond):
+	}
+	release()
+
+	select {
+	case finished := <-completed:
+		if finished.err == nil {
+			t.Fatal("run() error = nil, want request-limit failure")
+		}
+		if finished.result.Status != "failed" || finished.result.SuccessfulRequests != 1 ||
+			finished.result.FailedRequests != 0 || !finished.result.RequestLimitReached ||
+			finished.result.Canceled {
+			t.Fatalf("unexpected result: %+v", finished.result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("benchmark did not report request-limit exhaustion after drain")
+	}
+}
+
+func TestRunReportsInFlightTimeoutAfterDuration(t *testing.T) {
+	requestStarted := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		close(requestStarted)
+		<-request.Context().Done()
+	}))
+	defer server.Close()
+
+	type outcome struct {
+		result runResult
+		err    error
+	}
+	completed := make(chan outcome, 1)
+	go func() {
+		result, err := run(context.Background(), config{
+			baseURL:        server.URL,
+			path:           "/api/echo",
+			connectionMode: "reuse",
+			duration:       200 * time.Millisecond,
+			requestTimeout: 400 * time.Millisecond,
+			concurrency:    1,
+			requestLimit:   maxRequestLimit,
+		})
+		completed <- outcome{result: result, err: err}
+	}()
+
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("benchmark did not start a request")
+	}
+	select {
+	case finished := <-completed:
+		if finished.err == nil {
+			t.Fatal("run() error = nil, want in-flight request timeout")
+		}
+		if finished.result.Status != "failed" || finished.result.SuccessfulRequests != 0 ||
+			finished.result.FailedRequests != 1 || finished.result.Canceled ||
+			finished.result.FirstFailure == "" {
+			t.Fatalf("unexpected result: %+v", finished.result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("benchmark did not report the in-flight request timeout")
+	}
+}
+
 func TestParseFlagsRejectsUnsafeWorkloadSettings(t *testing.T) {
 	for _, arguments := range [][]string{
 		{"--duration=0s"},

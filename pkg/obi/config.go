@@ -497,6 +497,7 @@ func (c *Config) Unmarshal(component *confmap.Conf) error {
 		Result:           c,
 		WeaklyTypedInput: true,
 		DecodeHook: mapstructure.ComposeDecodeHookFunc(
+			strictTraceExportTimeoutHookFunc(),
 			mapstructure.StringToTimeDurationHookFunc(),
 			mapstructure.TextUnmarshallerHookFunc(),
 			stringSliceToTextUnmarshalerHookFunc(),
@@ -508,6 +509,27 @@ func (c *Config) Unmarshal(component *confmap.Conf) error {
 	}
 
 	return dec.Decode(raw)
+}
+
+func strictTraceExportTimeoutHookFunc() mapstructure.DecodeHookFuncType {
+	timeoutType := reflect.TypeFor[otelcfg.TraceExportTimeout]()
+	return func(from reflect.Type, to reflect.Type, data any) (any, error) {
+		if to != timeoutType {
+			return data, nil
+		}
+		if from == nil || from.Kind() != reflect.String {
+			return nil, fmt.Errorf(
+				"otel_traces_export.export_timeout must be a Go duration string, got %T",
+				data,
+			)
+		}
+
+		var timeout otelcfg.TraceExportTimeout
+		if err := timeout.UnmarshalText([]byte(reflect.ValueOf(data).String())); err != nil {
+			return nil, err
+		}
+		return timeout, nil
+	}
 }
 
 func (c *Config) Log() {

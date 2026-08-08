@@ -78,9 +78,9 @@ func omitFieldsForYAML(input any, omitFields map[string]struct{}) map[string]any
 		if yamlTag == "" || yamlTag == "-" {
 			continue
 		}
-		yamlKey := yamlTag
-		if commaIdx := len(yamlTag); commaIdx != -1 {
-			yamlKey = yamlTag[:commaIdx]
+		yamlKey, options, _ := strings.Cut(yamlTag, ",")
+		if slices.Contains(strings.Split(options, ","), "omitempty") && val.Field(i).IsZero() {
+			continue
 		}
 
 		if _, omit := omitFields[yamlKey]; !omit {

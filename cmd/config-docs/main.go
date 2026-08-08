@@ -21,6 +21,7 @@ import (
 const (
 	durationPattern           = "^[0-9]+(ms|s|m)$"
 	durationNanosecondPattern = "^[0-9]+(ns|ms|s|m)$"
+	durationGoPattern         = "^[+]?(([0-9]+([.][0-9]*)?|[.][0-9]+)(ns|us|µs|μs|ms|s|m|h))+$"
 )
 
 // Schema represents a JSON Schema node (subset relevant for doc generation).
@@ -603,7 +604,9 @@ func (g *DocGenerator) typeString(original, resolved *Schema) string {
 		if resolved.Format == "ip" {
 			return "`ip`"
 		}
-		if resolved.Pattern == durationPattern || resolved.Pattern == durationNanosecondPattern {
+		if resolved.Pattern == durationPattern ||
+			resolved.Pattern == durationNanosecondPattern ||
+			resolved.Pattern == durationGoPattern {
 			return "`duration`"
 		}
 		return "`string`"

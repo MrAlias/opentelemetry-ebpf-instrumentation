@@ -22,6 +22,33 @@ func tlog() *slog.Logger {
 	return slog.With("component", "otelcfg.TracesConfig")
 }
 
+// TraceExportTimeout is a strictly positive Go duration used to bound each
+// trace export attempt.
+type TraceExportTimeout time.Duration
+
+func (t *TraceExportTimeout) UnmarshalText(text []byte) error {
+	parsed, err := time.ParseDuration(string(text))
+	if err != nil {
+		return fmt.Errorf("parse trace export timeout: %w", err)
+	}
+	if parsed <= 0 {
+		return fmt.Errorf("trace export timeout must be at least 1ns, got %q", text)
+	}
+	*t = TraceExportTimeout(parsed)
+	return nil
+}
+
+func (t *TraceExportTimeout) MarshalText() ([]byte, error) {
+	if t == nil {
+		return nil, nil
+	}
+	return []byte(t.Duration().String()), nil
+}
+
+func (t TraceExportTimeout) Duration() time.Duration {
+	return time.Duration(t)
+}
+
 type TracesConfig struct {
 	TracesConsumer consumer.Traces `yaml:"-"`
 	CommonEndpoint string          `yaml:"-" env:"OTEL_EXPORTER_OTLP_ENDPOINT" jsonschema:"format=uri"`
@@ -50,6 +77,11 @@ type TracesConfig struct {
 
 	// BatchTimeout is the time after which a batch will be sent regardless of its size.
 	BatchTimeout time.Duration `yaml:"batch_timeout" env:"OTEL_EBPF_OTLP_TRACES_BATCH_TIMEOUT"`
+
+	// ExportTimeout bounds each OTLP trace export attempt. It uses Go duration syntax and must resolve
+	// to at least one nanosecond; explicit zero, negative, sub-nanosecond, and overflowing values fail
+	// configuration decoding or validation. The existing five-second limit applies when unset.
+	ExportTimeout *TraceExportTimeout `yaml:"export_timeout,omitempty" env:"OTEL_EBPF_OTLP_TRACES_EXPORT_TIMEOUT" validate:"omitempty,gt=0" jsonschema:"pattern=^[+]?(([0-9]+([.][0-9]*)?|[.][0-9]+)(ns|us|µs|μs|ms|s|m|h))+$,example=1us"`
 
 	// Configuration options for BackOffConfig of the traces exporter.
 	// See https://github.com/open-telemetry/opentelemetry-collector/blob/main/config/configretry/backoff.go

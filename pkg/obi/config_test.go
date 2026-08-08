@@ -22,6 +22,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.opentelemetry.io/collector/confmap"
+
 	"go.opentelemetry.io/obi/pkg/appolly/meta"
 	"go.opentelemetry.io/obi/pkg/appolly/services"
 	"go.opentelemetry.io/obi/pkg/config"
@@ -43,6 +45,56 @@ import (
 )
 
 type envMap map[string]string
+
+type namedTraceExportTimeoutString string
+
+func TestConfigUnmarshalTraceExportTimeoutRequiresDurationString(t *testing.T) {
+	t.Run("accepts a positive duration string", func(t *testing.T) {
+		component := confmap.NewFromStringMap(map[string]any{
+			"otel_traces_export": map[string]any{"export_timeout": "1ms"},
+		})
+		var cfg Config
+
+		require.NoError(t, cfg.Unmarshal(component))
+		require.NotNil(t, cfg.Traces.ExportTimeout)
+		require.Equal(t, time.Millisecond, cfg.Traces.ExportTimeout.Duration())
+	})
+
+	t.Run("accepts a defined string type without panicking", func(t *testing.T) {
+		component := confmap.NewFromStringMap(map[string]any{
+			"otel_traces_export": map[string]any{
+				"export_timeout": namedTraceExportTimeoutString("2ms"),
+			},
+		})
+		var cfg Config
+
+		require.NoError(t, cfg.Unmarshal(component))
+		require.NotNil(t, cfg.Traces.ExportTimeout)
+		require.Equal(t, 2*time.Millisecond, cfg.Traces.ExportTimeout.Duration())
+	})
+
+	testCases := []struct {
+		name  string
+		value any
+	}{
+		{name: "integer", value: 1},
+		{name: "floating point", value: 1.0},
+		{name: "boolean true", value: true},
+		{name: "boolean false", value: false},
+		{name: "unitless string", value: "1"},
+		{name: "zero duration", value: "0s"},
+	}
+	for _, testCase := range testCases {
+		t.Run("rejects "+testCase.name, func(t *testing.T) {
+			component := confmap.NewFromStringMap(map[string]any{
+				"otel_traces_export": map[string]any{"export_timeout": testCase.value},
+			})
+			var cfg Config
+
+			require.Error(t, cfg.Unmarshal(component))
+		})
+	}
+}
 
 func TestJoinMetricsConfigIncludesPerServiceFeatures(t *testing.T) {
 	cfg := Config{

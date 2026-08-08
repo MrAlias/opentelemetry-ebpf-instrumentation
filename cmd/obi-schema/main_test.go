@@ -335,6 +335,69 @@ func TestJavaRemoteParentRetrievalTTLSchema(t *testing.T) {
 	assert.Regexp(t, retrievalTTL.Pattern, "1ns")
 }
 
+func TestTraceExportTimeoutSchema(t *testing.T) {
+	g := NewSchemaGenerator()
+	reflector := &jsonschema.Reflector{
+		RequiredFromJSONSchemaTags: true,
+		AllowAdditionalProperties:  true,
+		ExpandedStruct:             true,
+		FieldNameTag:               "yaml",
+		Mapper:                     g.customMapper(),
+	}
+	schema := reflector.Reflect(&obi.Config{})
+
+	traces, ok := schema.Definitions["TracesConfig"]
+	require.True(t, ok)
+	exportTimeout, ok := traces.Properties.Get("export_timeout")
+	require.True(t, ok)
+	assert.Equal(t, "string", exportTimeout.Type)
+
+	assert.Equal(
+		t,
+		"^[+]?(([0-9]+([.][0-9]*)?|[.][0-9]+)(ns|us|µs|μs|ms|s|m|h))+$",
+		exportTimeout.Pattern,
+	)
+	for _, valid := range []string{"1us", "1µs", "1μs", ".5s", "+1s", "1h30m"} {
+		assert.Regexp(t, exportTimeout.Pattern, valid)
+		parsed, err := time.ParseDuration(valid)
+		require.NoError(t, err)
+		require.Positive(t, parsed)
+	}
+	for _, invalid := range []string{"1", "forever"} {
+		assert.NotRegexp(t, exportTimeout.Pattern, invalid)
+		_, err := time.ParseDuration(invalid)
+		require.Error(t, err)
+	}
+
+	// The schema pattern describes the accepted positive Go-duration syntax.
+	// Numeric representability is checked when configuration loading calls
+	// time.ParseDuration, because JSON Schema regexes cannot perform duration
+	// arithmetic across compound units.
+	const overflow = "999999999999999999999h"
+	assert.Regexp(t, exportTimeout.Pattern, overflow)
+	_, err := time.ParseDuration(overflow)
+	require.Error(t, err)
+
+	// TraceExportTimeout decoding rejects explicit values that parse to zero.
+	// Unitless zero is not part of the schema contract.
+	assert.NotRegexp(t, exportTimeout.Pattern, "0")
+	parsed, err := time.ParseDuration("0")
+	require.NoError(t, err)
+	require.Zero(t, parsed)
+	for _, parsedZero := range []string{"0s", ".1ns"} {
+		assert.Regexp(t, exportTimeout.Pattern, parsedZero)
+		parsed, err = time.ParseDuration(parsedZero)
+		require.NoError(t, err)
+		require.Zero(t, parsed)
+	}
+
+	for _, negative := range []string{"-1s", "-0s", "-0.1ns"} {
+		assert.NotRegexp(t, exportTimeout.Pattern, negative)
+		_, err = time.ParseDuration(negative)
+		require.NoError(t, err)
+	}
+}
+
 func TestExtractEnums(t *testing.T) {
 	g := NewSchemaGenerator()
 

@@ -89,6 +89,7 @@ func TestTypeString(t *testing.T) {
 		{"boolean", &Schema{Type: "boolean"}, "`boolean`"},
 		{"duration", &Schema{Type: "string", Pattern: "^[0-9]+(ms|s|m)$"}, "`duration`"},
 		{"nanosecond duration", &Schema{Type: "string", Pattern: "^[0-9]+(ns|ms|s|m)$"}, "`duration`"},
+		{"Go duration", &Schema{Type: "string", Pattern: durationGoPattern}, "`duration`"},
 		{"string array", &Schema{Type: "array", Items: &Schema{Type: "string"}}, "`string`[]"},
 		{"oneOf", &Schema{OneOf: []*Schema{{Type: "string"}}}, "`string`"},
 		{"nil", nil, ""},

@@ -238,6 +238,7 @@ func queueInstrumentedTraces(
 	base exporter.Traces,
 	queueCfg configoptional.Optional[exporterhelper.QueueBatchConfig],
 	retryCfg configretry.BackOffConfig,
+	timeoutCfg exporterhelper.TimeoutConfig,
 ) (exporter.Traces, error) {
 	instrumented := instrumentTracesExporter(im, base)
 	return exporterhelper.NewTraces(ctx, set, cfg,
@@ -247,6 +248,7 @@ func queueInstrumentedTraces(
 		exporterhelper.WithCapabilities(consumer.Capabilities{MutatesData: false}),
 		exporterhelper.WithQueue(queueCfg),
 		exporterhelper.WithRetry(retryCfg),
+		exporterhelper.WithTimeout(timeoutCfg),
 	)
 }
 
@@ -286,14 +288,7 @@ func getTracesExporter(ctx context.Context, cfg otelcfg.TracesConfig, im imetric
 		disabledRetry.Enabled = false
 		config.QueueConfig = configoptional.None[exporterhelper.QueueBatchConfig]()
 		config.RetryConfig = disabledRetry
-		config.ClientConfig = confighttp.ClientConfig{
-			Endpoint: opts.Scheme + "://" + opts.Endpoint + opts.BaseURLPath,
-			TLS: configtls.ClientConfig{
-				Insecure:           opts.Insecure,
-				InsecureSkipVerify: cfg.InsecureSkipVerify,
-			},
-			Headers: convertHeaders(opts.Headers),
-		}
+		configureHTTPTraceClient(config, cfg, opts)
 		host := component.Host(emptyHost{})
 		if opts.UnixSocketAddr != "" {
 			mwID := component.MustNewID("obi_uds")
@@ -310,7 +305,16 @@ func getTracesExporter(ctx context.Context, cfg otelcfg.TracesConfig, im imetric
 			return nil, nil, err
 		}
 		// TODO: remove this once the batcher helper is added to otlphttpexporter
-		wrapped, err := queueInstrumentedTraces(ctx, set, cfg, im, exp, queueCfg, retryCfg)
+		wrapped, err := queueInstrumentedTraces(
+			ctx,
+			set,
+			cfg,
+			im,
+			exp,
+			queueCfg,
+			retryCfg,
+			exporterhelper.TimeoutConfig{Timeout: config.ClientConfig.Timeout},
+		)
 		if err != nil {
 			_ = exp.Shutdown(ctx)
 			return nil, nil, err
@@ -341,20 +345,22 @@ func getTracesExporter(ctx context.Context, cfg otelcfg.TracesConfig, im imetric
 		disabledRetry.Enabled = false
 		config.QueueConfig = configoptional.None[exporterhelper.QueueBatchConfig]()
 		config.RetryConfig = disabledRetry
-		config.ClientConfig = configgrpc.ClientConfig{
-			Endpoint: grpcEndpoint,
-			TLS: configtls.ClientConfig{
-				Insecure:           opts.Insecure,
-				InsecureSkipVerify: cfg.InsecureSkipVerify,
-			},
-			Headers: convertHeaders(opts.Headers),
-		}
+		configureGRPCTraceClient(config, cfg, opts, grpcEndpoint)
 		set := getTraceSettings(factory.Type(), cfg.SDKLogLevel)
 		exp, err := factory.CreateTraces(ctx, set, config)
 		if err != nil {
 			return nil, nil, err
 		}
-		wrapped, err := queueInstrumentedTraces(ctx, set, cfg, im, exp, queueCfg, retryCfg)
+		wrapped, err := queueInstrumentedTraces(
+			ctx,
+			set,
+			cfg,
+			im,
+			exp,
+			queueCfg,
+			retryCfg,
+			config.TimeoutConfig,
+		)
 		if err != nil {
 			_ = exp.Shutdown(ctx)
 			return nil, nil, err
@@ -377,6 +383,48 @@ func getTracesExporter(ctx context.Context, cfg otelcfg.TracesConfig, im imetric
 			proto, otelcfg.ProtocolGRPC, otelcfg.ProtocolHTTPJSON, otelcfg.ProtocolHTTPProtobuf))
 		return nil, nil, fmt.Errorf("invalid protocol value: %q", proto)
 	}
+}
+
+func configureHTTPTraceClient(
+	config *otlphttpexporter.Config,
+	cfg otelcfg.TracesConfig,
+	opts otelcfg.OTLPOptions,
+) {
+	config.ClientConfig = confighttp.ClientConfig{
+		Endpoint: opts.Scheme + "://" + opts.Endpoint + opts.BaseURLPath,
+		TLS: configtls.ClientConfig{
+			Insecure:           opts.Insecure,
+			InsecureSkipVerify: cfg.InsecureSkipVerify,
+		},
+		Headers: convertHeaders(opts.Headers),
+		Timeout: traceExportTimeout(cfg.ExportTimeout),
+	}
+}
+
+func configureGRPCTraceClient(
+	config *otlpexporter.Config,
+	cfg otelcfg.TracesConfig,
+	opts otelcfg.OTLPOptions,
+	endpoint string,
+) {
+	config.ClientConfig = configgrpc.ClientConfig{
+		Endpoint: endpoint,
+		TLS: configtls.ClientConfig{
+			Insecure:           opts.Insecure,
+			InsecureSkipVerify: cfg.InsecureSkipVerify,
+		},
+		Headers: convertHeaders(opts.Headers),
+	}
+	config.TimeoutConfig.Timeout = traceExportTimeout(cfg.ExportTimeout)
+}
+
+func traceExportTimeout(configured *otelcfg.TraceExportTimeout) time.Duration {
+	if configured != nil && configured.Duration() > 0 {
+		return configured.Duration()
+	}
+	// Preserve the effective limit that queueInstrumentedTraces applied before
+	// this option was configurable.
+	return exporterhelper.NewDefaultTimeoutConfig().Timeout
 }
 
 func getQueueConfig(cfg otelcfg.TracesConfig) configoptional.Optional[exporterhelper.QueueBatchConfig] {

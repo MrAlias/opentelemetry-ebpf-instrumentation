@@ -8,10 +8,13 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/caarlos0/env/v11"
+	"github.com/go-playground/validator/v10"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/pdata/ptrace"
@@ -372,13 +375,84 @@ func TestNormalizeQueueConfig_EnvVar(t *testing.T) {
 	defer RestoreEnvAfterExecution()()
 	t.Setenv("OTEL_EBPF_OTLP_TRACES_BATCH_MAX_SIZE", "75")
 	t.Setenv("OTEL_EBPF_OTLP_TRACES_QUEUE_SIZE", "600")
+	t.Setenv("OTEL_EBPF_OTLP_TRACES_EXPORT_TIMEOUT", "1us")
 
 	var cfg TracesConfig
 	require.NoError(t, env.Parse(&cfg))
 	assert.Equal(t, 75, cfg.BatchMaxSize)
 	assert.Equal(t, 600, cfg.QueueSize)
+	require.NotNil(t, cfg.ExportTimeout)
+	assert.Equal(t, time.Microsecond, cfg.ExportTimeout.Duration())
 
 	require.NoError(t, cfg.NormalizeQueueConfig())
 	assert.Equal(t, 75, cfg.BatchMaxSize)
 	assert.Equal(t, 600, cfg.QueueSize)
+}
+
+func TestTraceExportTimeoutRejectsExplicitNonPositiveValues(t *testing.T) {
+	testCases := []struct {
+		name      string
+		value     string
+		wantError bool
+	}{
+		{name: "positive", value: "1ns"},
+		{name: "unitless zero", value: "0", wantError: true},
+		{name: "zero", value: "0s", wantError: true},
+		{name: "positive sub-nanosecond", value: ".1ns", wantError: true},
+		{name: "signed zero", value: "-0s", wantError: true},
+		{name: "negative sub-nanosecond", value: "-0.1ns", wantError: true},
+		{name: "negative", value: "-1s", wantError: true},
+		{name: "overflow", value: "999999999999999999999h", wantError: true},
+	}
+
+	validate := validator.New(validator.WithRequiredStructEnabled())
+	for _, testCase := range testCases {
+		t.Run("environment/"+testCase.name, func(t *testing.T) {
+			t.Setenv("OTEL_EBPF_OTLP_TRACES_EXPORT_TIMEOUT", testCase.value)
+
+			var cfg TracesConfig
+			err := env.Parse(&cfg)
+			if testCase.wantError {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, cfg.ExportTimeout)
+			require.NoError(t, validate.Struct(cfg))
+		})
+
+		t.Run("YAML/"+testCase.name, func(t *testing.T) {
+			var cfg TracesConfig
+			err := yaml.Unmarshal(
+				[]byte("export_timeout: \""+testCase.value+"\"\n"),
+				&cfg,
+			)
+			if testCase.wantError {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, cfg.ExportTimeout)
+			require.NoError(t, validate.Struct(cfg))
+		})
+	}
+
+	var cfg TracesConfig
+	require.Nil(t, cfg.ExportTimeout)
+	require.NoError(t, validate.Struct(cfg))
+
+	zero := TraceExportTimeout(0)
+	cfg.ExportTimeout = &zero
+	require.Error(t, validate.Struct(cfg))
+}
+
+func TestTraceExportTimeoutYAMLMarshal(t *testing.T) {
+	encoded, err := yaml.Marshal(TracesConfig{})
+	require.NoError(t, err)
+	require.NotContains(t, string(encoded), "export_timeout")
+
+	timeout := TraceExportTimeout(time.Nanosecond)
+	encoded, err = yaml.Marshal(TracesConfig{ExportTimeout: &timeout})
+	require.NoError(t, err)
+	require.Contains(t, string(encoded), "export_timeout: 1ns")
 }

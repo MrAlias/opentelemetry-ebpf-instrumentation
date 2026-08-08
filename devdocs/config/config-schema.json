@@ -3005,6 +3005,18 @@
           "format": "uri",
           "x-env-var": "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
         },
+        "export_timeout": {
+          "type": "string",
+          "pattern": "^[+]?(([0-9]+([.][0-9]*)?|[.][0-9]+)(ns|us|µs|μs|ms|s|m|h))+$",
+          "description": "Bounds each OTLP trace export attempt. It uses Go duration syntax and must resolve to at least one nanosecond; explicit zero, negative, sub-nanosecond, and overflowing values fail configuration decoding or validation. The existing five-second limit applies when unset.",
+          "examples": [
+            "30s",
+            "5m",
+            "1ms",
+            "1us"
+          ],
+          "x-env-var": "OTEL_EBPF_OTLP_TRACES_EXPORT_TIMEOUT"
+        },
         "insecure_skip_verify": {
           "type": "boolean",
           "description": "Enables skipping TLS certificate verification (not standard, so we don't follow the same naming convention)",

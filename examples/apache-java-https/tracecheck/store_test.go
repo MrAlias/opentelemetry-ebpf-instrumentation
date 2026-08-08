@@ -5,6 +5,7 @@ package tracecheck
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -593,12 +594,89 @@ func TestStoreRetainedAccountingCannotBeMutatedByCaller(t *testing.T) {
 func TestStoreResetClearsRetainedByteDiagnostics(t *testing.T) {
 	store := NewStore(1, 16, 16)
 	store.Add([]Span{{SpanID: "one"}, {SpanID: "two"}})
-	store.Reset()
+	continuity := store.Reset()
 
 	snapshot := store.Snapshot("")
 	if snapshot.ReceivedBatches != 0 || snapshot.ReceivedSpans != 0 ||
 		snapshot.DroppedSpans != 0 || snapshot.RetainedBytes != 0 || len(snapshot.Spans) != 0 {
 		t.Fatalf("reset retained diagnostics: %#v", snapshot)
+	}
+	if snapshot.ReceiverContinuity != continuity {
+		t.Fatalf("reset continuity does not match snapshot: reset=%#v snapshot=%#v", continuity, snapshot)
+	}
+}
+
+func TestStoreSnapshotReportsStableReceiverContinuity(t *testing.T) {
+	store := NewStore(10, 16, 32)
+	initial := store.Snapshot("")
+	if initial.ReceiverInstanceID == "" || initial.ResetGeneration != 0 {
+		t.Fatalf("invalid initial receiver continuity: %#v", initial.ReceiverContinuity)
+	}
+
+	store.Add([]Span{{SpanID: "one"}})
+	afterAdd := store.Snapshot("")
+	if afterAdd.ReceiverContinuity != initial.ReceiverContinuity {
+		t.Fatalf("adding spans changed receiver continuity: before=%#v after=%#v",
+			initial.ReceiverContinuity, afterAdd.ReceiverContinuity)
+	}
+
+	firstReset := store.Reset()
+	if firstReset.ReceiverInstanceID != initial.ReceiverInstanceID ||
+		firstReset.ResetGeneration != initial.ResetGeneration+1 {
+		t.Fatalf("first reset did not advance continuity: before=%#v after=%#v",
+			initial.ReceiverContinuity, firstReset)
+	}
+	secondReset := store.Reset()
+	if secondReset.ReceiverInstanceID != initial.ReceiverInstanceID ||
+		secondReset.ResetGeneration != firstReset.ResetGeneration+1 {
+		t.Fatalf("second reset did not advance continuity: first=%#v second=%#v",
+			firstReset, secondReset)
+	}
+
+	other := NewStore(10, 16, 32).Snapshot("")
+	if other.ReceiverInstanceID == initial.ReceiverInstanceID {
+		t.Fatalf("distinct stores reused receiver instance ID %q", other.ReceiverInstanceID)
+	}
+}
+
+func TestStoreRejectsBatchAdmittedBeforeReset(t *testing.T) {
+	store := NewStore(10, 16, 32)
+	admission := store.Continuity()
+	reset := store.Reset()
+
+	if store.AddAtIfContinuity([]Span{{SpanID: "stale"}}, time.Now(), admission) {
+		t.Fatal("accepted a batch admitted before reset")
+	}
+	afterStale := store.Snapshot("")
+	if afterStale.ReceiverContinuity != reset || afterStale.ReceivedBatches != 0 ||
+		afterStale.ReceivedSpans != 0 || len(afterStale.Spans) != 0 {
+		t.Fatalf("stale batch changed reset epoch: %#v", afterStale)
+	}
+
+	if !store.AddAtIfContinuity([]Span{{SpanID: "current"}}, time.Now(), reset) {
+		t.Fatal("rejected a batch admitted after reset")
+	}
+	afterCurrent := store.Snapshot("")
+	if afterCurrent.ReceivedBatches != 1 || afterCurrent.ReceivedSpans != 1 ||
+		len(afterCurrent.Spans) != 1 || afterCurrent.Spans[0].SpanID != "current" {
+		t.Fatalf("current batch was not retained: %#v", afterCurrent)
+	}
+}
+
+func TestStoreResetAlwaysChangesContinuityAtGenerationExhaustion(t *testing.T) {
+	store := NewStore(10, 16, 32)
+	store.mu.Lock()
+	store.resetGeneration = math.MaxUint64
+	store.mu.Unlock()
+	before := store.Continuity()
+
+	after := store.Reset()
+	if after == before || after.ReceiverInstanceID == before.ReceiverInstanceID ||
+		after.ResetGeneration != 0 {
+		t.Fatalf("reset reused exhausted continuity: before=%#v after=%#v", before, after)
+	}
+	if store.AddAtIfContinuity([]Span{{SpanID: "stale"}}, time.Now(), before) {
+		t.Fatal("accepted a batch from the exhausted continuity namespace")
 	}
 }
 

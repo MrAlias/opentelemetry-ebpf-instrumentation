@@ -37,6 +37,11 @@ type receiver struct {
 	store *tracecheck.Store
 }
 
+type resetResponse struct {
+	tracecheck.ReceiverContinuity
+	Status string `json:"status"`
+}
+
 func main() {
 	os.Exit(mainExitCode())
 }
@@ -126,12 +131,15 @@ func (r *receiver) snapshot(writer http.ResponseWriter, request *http.Request) {
 }
 
 func (r *receiver) reset(writer http.ResponseWriter, _ *http.Request) {
-	r.store.Reset()
-	writeJSON(writer, http.StatusOK, map[string]string{"status": "reset"})
+	writeJSON(writer, http.StatusOK, resetResponse{
+		ReceiverContinuity: r.store.Reset(),
+		Status:             "reset",
+	})
 }
 
 func (r *receiver) traces(writer http.ResponseWriter, request *http.Request) {
 	receivedAt := time.Now()
+	continuity := r.store.Continuity()
 
 	if request.Header.Get("Content-Encoding") != "" {
 		writeError(writer, http.StatusUnsupportedMediaType, "compressed OTLP payloads are not enabled")
@@ -161,7 +169,11 @@ func (r *receiver) traces(writer http.ResponseWriter, request *http.Request) {
 	}
 
 	spans := tracecheck.Flatten(exportRequest.Traces())
-	r.store.AddAt(spans, receivedAt)
+	// A request attempt admitted before reset is acknowledged but cannot enter
+	// the new receiver epoch. Success avoids deliberately requesting a retry;
+	// because a lost response can still cause a new post-reset attempt, polling
+	// consumers must also use a run-unique marker and bounded settlement.
+	r.store.AddAtIfContinuity(spans, receivedAt, continuity)
 
 	exportResponse := ptraceotlp.NewExportResponse()
 	if contentType == "application/json" {

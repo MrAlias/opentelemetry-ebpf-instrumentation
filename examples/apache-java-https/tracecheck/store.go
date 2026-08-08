@@ -4,6 +4,7 @@
 package tracecheck
 
 import (
+	"crypto/rand"
 	"math"
 	"strings"
 	"sync"
@@ -39,6 +40,8 @@ type duplicateMarkerInfo struct {
 
 type Store struct {
 	mu                        sync.RWMutex
+	receiverInstanceID        string
+	resetGeneration           uint64
 	maxSpans                  int
 	maxValueBytes             uint64
 	maxRetainedBytes          uint64
@@ -63,9 +66,10 @@ func NewStore(maxSpans int, maxValueBytes, maxRetainedBytes uint64) *Store {
 		maxRetainedBytes = 1
 	}
 	return &Store{
-		maxSpans:         maxSpans,
-		maxValueBytes:    maxValueBytes,
-		maxRetainedBytes: maxRetainedBytes,
+		receiverInstanceID: rand.Text(),
+		maxSpans:           maxSpans,
+		maxValueBytes:      maxValueBytes,
+		maxRetainedBytes:   maxRetainedBytes,
 	}
 }
 
@@ -74,13 +78,37 @@ func (s *Store) Add(spans []Span) {
 }
 
 func (s *Store) AddAt(spans []Span, receivedAt time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.addAtLocked(spans, receivedAt)
+}
+
+// AddAtIfContinuity adds a batch only when the receiver has not reset since
+// the caller captured expected. This fences a single request attempt admitted
+// before a reset from repopulating the new receiver epoch after body decoding
+// completes. A later HTTP retry is a new admission and needs a run-unique
+// marker plus bounded settlement at the polling layer.
+func (s *Store) AddAtIfContinuity(
+	spans []Span,
+	receivedAt time.Time,
+	expected ReceiverContinuity,
+) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.receiverContinuityLocked() != expected {
+		return false
+	}
+	s.addAtLocked(spans, receivedAt)
+	return true
+}
+
+func (s *Store) addAtLocked(spans []Span, receivedAt time.Time) {
 	receivedUnixMilli := receivedAt.UnixMilli()
 	if receivedUnixMilli < 0 {
 		receivedUnixMilli = 0
 	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	s.receivedBatches = saturatingAdd(s.receivedBatches, 1)
 	s.receivedSpans = saturatingAdd(s.receivedSpans, uint64(len(spans)))
@@ -108,6 +136,13 @@ func (s *Store) AddAt(spans []Span, receivedAt time.Time) {
 	}
 }
 
+func (s *Store) Continuity() ReceiverContinuity {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.receiverContinuityLocked()
+}
+
 func cloneSpan(span Span) Span {
 	if span.Attributes == nil {
 		return span
@@ -120,10 +155,11 @@ func cloneSpan(span Span) Span {
 	return span
 }
 
-func (s *Store) Reset() {
+func (s *Store) Reset() ReceiverContinuity {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.advanceResetContinuityLocked()
 	s.spans = nil
 	s.retainedBytes = 0
 	s.receivedBatches = 0
@@ -132,6 +168,22 @@ func (s *Store) Reset() {
 	s.droppedCountSpans = 0
 	s.droppedValueLimitSpans = 0
 	s.droppedRetainedLimitSpans = 0
+	return s.receiverContinuityLocked()
+}
+
+func (s *Store) advanceResetContinuityLocked() {
+	if s.resetGeneration < math.MaxUint64 {
+		s.resetGeneration++
+		return
+	}
+
+	// A reset must always change the continuity pair. Rotate the opaque
+	// namespace before restarting the generation counter at exhaustion.
+	previous := s.receiverInstanceID
+	for s.receiverInstanceID == previous {
+		s.receiverInstanceID = rand.Text()
+	}
+	s.resetGeneration = 0
 }
 
 func (s *Store) Snapshot(marker string) Snapshot {
@@ -146,6 +198,7 @@ func (s *Store) Snapshot(marker string) Snapshot {
 	sortSpans(spans)
 
 	return Snapshot{
+		ReceiverContinuity:        s.receiverContinuityLocked(),
 		Marker:                    marker,
 		ReceivedBatches:           s.receivedBatches,
 		ReceivedSpans:             s.receivedSpans,
@@ -160,6 +213,13 @@ func (s *Store) Snapshot(marker string) Snapshot {
 		RelatedSpans:              relatedSpans,
 		OmittedRelatedSpans:       omittedRelatedSpans,
 		AmbiguousRelatedSpans:     ambiguousRelatedSpans,
+	}
+}
+
+func (s *Store) receiverContinuityLocked() ReceiverContinuity {
+	return ReceiverContinuity{
+		ReceiverInstanceID: s.receiverInstanceID,
+		ResetGeneration:    s.resetGeneration,
 	}
 }
 

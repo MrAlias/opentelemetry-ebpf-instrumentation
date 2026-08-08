@@ -44,8 +44,19 @@ type spanIdentity struct {
 	spanID  string
 }
 
+// ReceiverContinuity identifies one receiver process and its current reset
+// epoch. Consumers can use the pair to prove that cumulative snapshot state
+// came from one uninterrupted receiver generation. It does not identify a new
+// HTTP retry whose admission begins after a reset; polling protocols must also
+// use run-unique markers and a bounded settlement window.
+type ReceiverContinuity struct {
+	ReceiverInstanceID string `json:"receiver_instance_id"`
+	ResetGeneration    uint64 `json:"reset_generation"`
+}
+
 // Snapshot contains all bounded receiver state relevant to an assertion.
 type Snapshot struct {
+	ReceiverContinuity
 	Marker                    string `json:"marker,omitempty"`
 	ReceivedBatches           uint64 `json:"received_batches"`
 	ReceivedSpans             uint64 `json:"received_spans"`

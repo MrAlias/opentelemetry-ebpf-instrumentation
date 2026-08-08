@@ -26,6 +26,7 @@ import (
 const (
 	javaRemoteParentStatCount               = 35
 	javaRemoteParentStatStageValid          = 0
+	javaRemoteParentStatTakeValid           = 4
 	javaRemoteParentStatTakeUnauthorized    = 8
 	javaRemoteParentStatDiscardValid        = 12
 	javaRemoteParentStatDiscardUnauthorized = 16

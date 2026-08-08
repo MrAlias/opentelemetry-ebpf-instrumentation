@@ -240,6 +240,22 @@ test_deterministic_artifact_path() {
     fi
 }
 
+test_relative_agent_path_resolution() {
+    local -r fixture="${TEST_TMP_DIR}/obi-java-agent.jar"
+    local expected=""
+    local resolved=""
+
+    track_fixture "$fixture"
+    : > "$fixture"
+    expected="$(realpath "$fixture")"
+    resolved="$(
+        cd -- "$TEST_TMP_PARENT"
+        resolve_existing_path "$(basename -- "$TEST_TMP_DIR")/$(basename -- "$fixture")"
+    )"
+    [[ "$resolved" == "$expected" ]] || \
+        test_fail 'relative Java agent path did not resolve from the invoking directory'
+}
+
 run_tests() {
     local -r valid="${TEST_TMP_DIR}/valid.json"
     local -r strict_getsockopt_failure="${TEST_TMP_DIR}/strict-getsockopt-failure.json"
@@ -302,6 +318,7 @@ run_tests() {
 
     test_production_verifier_profile_validation
     test_deterministic_artifact_path
+    test_relative_agent_path_resolution
     printf '%s\n' 'RHEL verifier and transport benchmark validator tests passed'
 }
 

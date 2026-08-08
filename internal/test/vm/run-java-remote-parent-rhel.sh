@@ -11,12 +11,21 @@ readonly VERIFIER_TEST_PATTERN='^TestBPFVerifierProductionProfiles$'
 readonly VERIFIER_TEST_NAME='TestBPFVerifierProductionProfiles'
 readonly VERIFIER_GENERIC_PROFILE='TestBPFVerifierProductionProfiles/generictracer/apache-java-https'
 readonly VERIFIER_SOCKOPT_PROFILE='TestBPFVerifierProductionProfiles/tpinjector/java-remote-parent'
-readonly PRIVILEGED_TEST_PATTERN='^(TestJavaRemoteParentPrimarySocketAuthority|TestJavaRemoteParentPrimaryRequiresAuthoritativeDataHook|TestJavaRemoteParentPrimaryJVMFaults|TestJavaRemoteParentNestedCgroupLifecycle|TestJavaRemoteParentCgroupLinkProcessDeathCleanup|TestJavaRemoteParentCgroupPartialAttachRollback|TestJavaRemoteParentBridgeLoadRequiresPrivileges)$'
+readonly PRIVILEGED_TEST_PATTERN='^(TestJavaRemoteParentPrimarySocketAuthority|TestJavaRemoteParentPrimaryRequiresAuthoritativeDataHook|TestJavaRemoteParentPrimaryJVMFaults|TestJavaRemoteParentPrimaryJVMDirectSSLSocket|TestJavaRemoteParentNestedCgroupLifecycle|TestJavaRemoteParentCgroupLinkProcessDeathCleanup|TestJavaRemoteParentCgroupPartialAttachRollback|TestJavaRemoteParentBridgeLoadRequiresPrivileges)$'
 readonly BENCHMARK_TEST_PATTERN='^TestJavaRemoteParentTransportBenchmark$'
 
 fail() {
     printf 'ERROR: %s\n' "$*" >&2
     exit 1
+}
+
+resolve_existing_path() {
+    local -r path="$1"
+    local resolved=""
+
+    resolved="$(realpath "$path")" || \
+        fail "failed to resolve path: ${path}"
+    printf '%s\n' "$resolved"
 }
 
 require_test_passed() {
@@ -329,6 +338,7 @@ require_java_agent() {
     [[ -s "$JAVA_AGENT_PATH" ]] || fail "Java bridge agent artifact is unavailable at ${JAVA_AGENT_PATH}"
     [[ -s "$JAVA_AGENT_CHECKSUM" ]] || fail "Java bridge agent checksum is unavailable at ${JAVA_AGENT_CHECKSUM}"
     command -v java >/dev/null 2>&1 || fail 'Java runtime is unavailable'
+    command -v realpath >/dev/null 2>&1 || fail 'realpath is unavailable'
 
     java -version 2>&1 | tee "$OUTPUT_DIR/java-version.txt"
     sha256sum -c "$JAVA_AGENT_CHECKSUM" | tee "$OUTPUT_DIR/java-agent-verified.txt"
@@ -394,8 +404,11 @@ run_production_verifier_profiles() {
 
 run_sockopt_authority_tests() {
     local -r output_file="$OUTPUT_DIR/privileged-tests.log"
+    local java_agent_path=""
 
-    OBI_JAVA_REMOTE_PARENT_AGENT_JAR="$JAVA_AGENT_PATH" \
+    java_agent_path="$(resolve_existing_path "$JAVA_AGENT_PATH")"
+
+    OBI_JAVA_REMOTE_PARENT_AGENT_JAR="$java_agent_path" \
     OBI_REQUIRE_CGROUP_TOPOLOGY=1 go test \
         -count=1 \
         -timeout=10m \
@@ -410,6 +423,8 @@ run_sockopt_authority_tests() {
         TestJavaRemoteParentPrimaryRequiresAuthoritativeDataHook
     require_test_passed "$output_file" \
         TestJavaRemoteParentPrimaryJVMFaults
+    require_test_passed "$output_file" \
+        TestJavaRemoteParentPrimaryJVMDirectSSLSocket
     require_test_passed "$output_file" \
         TestJavaRemoteParentNestedCgroupLifecycle
     require_test_passed "$output_file" \

@@ -16,6 +16,11 @@ routes:
 
 otel_traces_export:
   endpoint: http://127.0.0.1:14318
+  batch_timeout: 15s
+  export_timeout: 5s
+  backoff_initial_interval: 100ms
+  backoff_max_interval: 1s
+  backoff_max_elapsed_time: 2s
 
 internal_metrics:
   exporter: prometheus

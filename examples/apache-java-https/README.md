@@ -574,9 +574,28 @@ hide an early export. After the deadline, it requires exactly one Java SDK
 server span from the `io.opentelemetry.jetty-11.0` scope, the Java duplicate
 suppression signal from OBI, and the normal exact-parent `basic` assertion.
 A single unscoped pre-detection OBI Java server span, when present, is retained as
-startup-window evidence; after suppression, the `basic` assertion must have
-only the normal Java SDK server span. Apache OBI spans are also allowed during
-the window.
+startup-window evidence. Its end timestamp, rather than its OTLP batch arrival
+order, must place it before the export boundary. After suppression, the `basic`
+assertion must have only the normal Java SDK server span. Apache OBI spans are
+also allowed during the window.
+
+The OBI OTLP batch timeout is pinned to 15 seconds, exporter retry time is
+bounded to 2 seconds, and each OBI export attempt is capped at 5 seconds. Their
+pinned delivery bound is 22 seconds (`15 + 2 + 5`); the integer-clock
+settlement interval is 23 seconds so it cannot end early because of `SECONDS`
+quantization. The Java batch export attempt is separately capped at 5 seconds,
+and Java OTLP retry is disabled for this deterministic control. Only after
+suppression readiness, the control re-fetches the cumulative receiver snapshot
+through that settlement interval and a final one-second poll. Its start is
+limited to the next integer-clock slack bucket and its termination grace is one
+second. Each control run uses a fresh request marker and binds every
+single-object snapshot to the receiver instance and reset generation observed
+before the request.
+Receiver counters and the optional startup span must remain monotonic; any
+receiver restart/reset, drop, omission, or ambiguous span identity fails the
+control closed with the discontinuous snapshot retained. These bounds keep an
+SDK-only poll from hiding a queued OBI batch, a retry from an earlier run,
+malformed span, or duplicate Java SDK export.
 
 The `all` suite includes this control, then restores the prior export-delay
 setting and a normal instrumented stack before the remaining scenarios.

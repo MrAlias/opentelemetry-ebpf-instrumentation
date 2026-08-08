@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # This harness intentionally overrides sourced run.sh globals and functions in isolated subshells.
-# shellcheck disable=SC2016,SC2030,SC2031,SC2034,SC2329
+# shellcheck disable=SC2016,SC2030,SC2031,SC2034,SC2317,SC2329
 
 set -Eeuo pipefail
 
@@ -202,6 +202,8 @@ test_successful_cleanup_invalidates_current_transport_before_down() {
   local -r prior_result="$results_root/prior"
   local -r foreign_result="$results_root/foreign"
   local -r down_marker="$result_dir/down"
+  local -r receiver_snapshot_temp="$result_dir/.delayed-otlp-receiver.signal"
+  local -r receiver_publication_temp="$result_dir/.delayed-ready.json.signal"
 
   mkdir -p -- "$result_dir" "$prior_result" "$foreign_result"
   printf 'compose_project=obi-apache-java-https-test\n' \
@@ -216,6 +218,8 @@ test_successful_cleanup_invalidates_current_transport_before_down() {
   printf 'prior-retained\n' >"$prior_result/java-selected-transport-configuration.txt"
   printf 'foreign-current\n' >"$foreign_result/java-transport-configuration.txt"
   printf 'foreign-retained\n' >"$foreign_result/java-selected-transport-configuration.txt"
+  printf 'snapshot\n' >"$receiver_snapshot_temp"
+  printf 'publication\n' >"$receiver_publication_temp"
   (
     PRESSURE_ACTIVE=false
     RESULTS_ROOT="$results_root"
@@ -233,8 +237,15 @@ test_successful_cleanup_invalidates_current_transport_before_down() {
     FAILURE_LINE=""
     FAILURE_STATUS=""
     FAILURE_COMMAND=""
+    DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP="$receiver_snapshot_temp"
+    DELAYED_OTLP_RECEIVER_PUBLICATION_TEMP="$receiver_publication_temp"
     cleanup_security_processes() { :; }
-    capture_evidence() { :; }
+    capture_evidence() {
+      [[ -z "$DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP" &&
+        -z "$DELAYED_OTLP_RECEIVER_PUBLICATION_TEMP" &&
+        ! -e "$receiver_snapshot_temp" &&
+        ! -e "$receiver_publication_temp" ]]
+    }
     safe_compose_down() {
       [[ "$BRIDGE_RUNNING" == "false" &&
         -z "$SELECTED_TRANSPORT" &&
@@ -252,6 +263,8 @@ test_successful_cleanup_invalidates_current_transport_before_down() {
     return 1
   }
   [[ -e "$down_marker" &&
+    ! -e "$receiver_snapshot_temp" &&
+    ! -e "$receiver_publication_temp" &&
     ! -e "$result_dir/java-transport-configuration.txt" &&
     "$(<"$result_dir/java-selected-transport-configuration.txt")" == "retained" &&
     ! -e "$prior_result/java-transport-configuration.txt" &&
@@ -260,6 +273,78 @@ test_successful_cleanup_invalidates_current_transport_before_down() {
     "$(<"$foreign_result/java-transport-configuration.txt")" == \
       "foreign-current" ]] || {
     printf 'successful cleanup retained stale current-generation selection evidence\n' >&2
+    return 1
+  }
+}
+
+test_delayed_otlp_temporary_cleanup_preserves_failure() {
+  local -r result_dir="$TEST_TMP_DIR/delayed-otlp-temporary-cleanup-failure"
+  local -r receiver_snapshot_temp="$result_dir/.delayed-otlp-receiver.failure"
+  local -r receiver_publication_temp="$result_dir/.delayed-ready.json.failure"
+  local cleanup_status=0
+  local full_cleanup_status=0
+
+  mkdir -- "$result_dir"
+  printf 'snapshot\n' >"$receiver_snapshot_temp"
+  printf 'publication\n' >"$receiver_publication_temp"
+  if (
+    DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP="$receiver_snapshot_temp"
+    DELAYED_OTLP_RECEIVER_PUBLICATION_TEMP="$receiver_publication_temp"
+    rm() {
+      if [[ "$3" == "$receiver_snapshot_temp" ]]; then
+        return 47
+      fi
+      return 53
+    }
+
+    cleanup_delayed_otlp_receiver_temporaries
+  ) >/dev/null 2>&1; then
+    printf 'delayed OTLP temporary cleanup ignored removal failure\n' >&2
+    return 1
+  else
+    cleanup_status=$?
+  fi
+  [[ "$cleanup_status" == "47" && -e "$receiver_snapshot_temp" &&
+    -e "$receiver_publication_temp" ]] || {
+    printf 'delayed OTLP temporary cleanup did not preserve its first failure\n' >&2
+    return 1
+  }
+
+  if (
+    PRESSURE_ACTIVE=false
+    STACK_STARTED=false
+    FAULT_BRIDGE_RUNNING=false
+    MATCHING_BRIDGE_RUNNING=false
+    RESULT_DIR="$result_dir"
+    RUN_STAGE="temporary-cleanup-test"
+    RUN_STATUS=passed
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP="$receiver_snapshot_temp"
+    DELAYED_OTLP_RECEIVER_PUBLICATION_TEMP="$receiver_publication_temp"
+    cleanup_security_processes() { :; }
+    capture_evidence() { :; }
+    write_run_status() { :; }
+    cleanup_source_snapshot_work_directory() { :; }
+    rm() {
+      if [[ "$3" == "$receiver_snapshot_temp" ]]; then
+        return 47
+      fi
+      return 53
+    }
+
+    cleanup
+  ) >/dev/null 2>&1; then
+    printf 'full cleanup ignored delayed OTLP temporary removal failure\n' >&2
+    return 1
+  else
+    full_cleanup_status=$?
+  fi
+  [[ "$full_cleanup_status" == "47" && -e "$receiver_snapshot_temp" &&
+    -e "$receiver_publication_temp" ]] || {
+    printf 'full cleanup did not preserve its first temporary failure\n' >&2
     return 1
   }
 }
@@ -1101,9 +1186,11 @@ test_control_modes_are_distinct() {
     unset OTEL_BSP_SCHEDULE_DELAY_VALUE
     export_compose_environment
     [[ "$OTEL_BSP_SCHEDULE_DELAY_VALUE" == \
-      "$DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS" ]]
+      "$DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS" &&
+      "$OTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED_VALUE" == \
+        "$DELAYED_OTLP_JAVA_RETRY_DISABLED" ]]
   ) || {
-    printf 'delayed OTLP suppression did not configure its export delay\n' >&2
+    printf 'delayed OTLP suppression did not configure bounded Java export\n' >&2
     return 1
   }
   if (
@@ -3318,8 +3405,468 @@ test_delayed_otlp_window_requires_a_fresh_generation() {
   [[ "$failure_status" == "1" && ! -e "$result_dir/expired-window.txt" ]] || return 1
 }
 
+test_delayed_otlp_settlement_covers_pinned_obi_delivery_bound() {
+  ((DELAYED_OTLP_POST_EXPORT_SETTLE_SECONDS ==
+    DELAYED_OTLP_OBI_BATCH_TIMEOUT_SECONDS +
+      DELAYED_OTLP_OBI_RETRY_MAX_ELAPSED_SECONDS +
+      DELAYED_OTLP_OBI_EXPORT_TIMEOUT_SECONDS +
+      DELAYED_OTLP_CLOCK_QUANTIZATION_SECONDS)) || return 1
+  ((DELAYED_OTLP_CLOCK_QUANTIZATION_SECONDS == 1)) || return 1
+  grep -Fqx \
+    "  batch_timeout: ${DELAYED_OTLP_OBI_BATCH_TIMEOUT_SECONDS}s" \
+    "$TEST_SCRIPT_DIR/../configs/obi.yaml" || return $?
+  grep -Fqx \
+    "  export_timeout: ${DELAYED_OTLP_OBI_EXPORT_TIMEOUT_SECONDS}s" \
+    "$TEST_SCRIPT_DIR/../configs/obi.yaml" || return $?
+  grep -Fqx '  backoff_initial_interval: 100ms' \
+    "$TEST_SCRIPT_DIR/../configs/obi.yaml" || return $?
+  grep -Fqx '  backoff_max_interval: 1s' \
+    "$TEST_SCRIPT_DIR/../configs/obi.yaml" || return $?
+  grep -Fqx \
+    "  backoff_max_elapsed_time: ${DELAYED_OTLP_OBI_RETRY_MAX_ELAPSED_SECONDS}s" \
+    "$TEST_SCRIPT_DIR/../configs/obi.yaml" || return $?
+  grep -Fqx '      OTEL_BSP_EXPORT_TIMEOUT: "5000"' \
+    "$TEST_SCRIPT_DIR/../docker-compose.yml" || return $?
+  grep -Fqx \
+    '      OTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED: "${OTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED_VALUE:-false}"' \
+    "$TEST_SCRIPT_DIR/../docker-compose.yml"
+}
+
+test_delayed_otlp_snapshot_fetch_wrapper_is_exact_and_bounded() (
+  local -r result_dir="$TEST_TMP_DIR/delayed-otlp-fetch-wrapper"
+  local -r fake_bin="$result_dir/bin"
+  local -r fake_timeout="$fake_bin/timeout"
+  local -r fake_curl="$fake_bin/curl"
+  local -r timeout_argument_log="$result_dir/timeout-arguments"
+  local -r argument_log="$result_dir/curl-arguments"
+  local -r output="$result_dir/snapshot.json"
+  local -r partial_output="$result_dir/partial.json"
+  local -r term_file="$result_dir/curl-term"
+  local -r pid_file="$result_dir/curl-pid"
+  local -a actual_timeout_arguments=()
+  local -a actual_arguments=()
+  local -a expected_timeout_arguments=(
+    --signal=TERM
+    "--kill-after=${DELAYED_OTLP_FETCH_KILL_GRACE_SECONDS}s"
+    2s
+    curl
+    --fail
+    --silent
+    --show-error
+    --get
+    --data-urlencode
+    "marker=$DELAYED_OTLP_PRIME_MARKER"
+    --output
+    "$output"
+    http://127.0.0.1:14318/snapshot
+  )
+  local -a expected_arguments=(
+    --fail
+    --silent
+    --show-error
+    --get
+    --data-urlencode
+    "marker=$DELAYED_OTLP_PRIME_MARKER"
+    --output
+    "$output"
+    http://127.0.0.1:14318/snapshot
+  )
+  local -i argument_index=0
+  local real_timeout=""
+  local timeout_version=""
+  local curl_pid=""
+  local process_state=""
+  local status=0
+
+  mkdir -p -- "$fake_bin"
+  real_timeout="$(command -v timeout)" || return $?
+  [[ "$real_timeout" == /* && -x "$real_timeout" ]] || return 1
+  timeout_version="$("$real_timeout" --version 2>/dev/null)" || return $?
+  [[ "$timeout_version" == *"GNU coreutils"* ]] || return 1
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -Eeuo pipefail' \
+    ': "${FAKE_TIMEOUT_ARGV_FILE:?}" "${REAL_TIMEOUT:?}"' \
+    'printf "%s\0" "$@" >"$FAKE_TIMEOUT_ARGV_FILE"' \
+    'exec "$REAL_TIMEOUT" "$@"' >"$fake_timeout"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -Eeuo pipefail' \
+    ': "${FAKE_CURL_ARGV_FILE:?}" "${FAKE_CURL_MODE:?}"' \
+    'printf "%s\0" "$@" >"$FAKE_CURL_ARGV_FILE"' \
+    'output=""' \
+    'previous=""' \
+    'for argument in "$@"; do' \
+    '  if [[ "$previous" == "--output" ]]; then output="$argument"; fi' \
+    '  previous="$argument"' \
+    'done' \
+    '[[ -n "$output" ]] || exit 91' \
+    'case "$FAKE_CURL_MODE" in' \
+    '  success)' \
+    '    printf "%s\n" "$FAKE_CURL_PAYLOAD" >"$output"' \
+    '    ;;' \
+    '  ignore-term)' \
+    '    printf "%s\n" partial >"$output"' \
+    '    on_term() { printf "%s\n" term >"$FAKE_CURL_TERM_FILE"; }' \
+    '    trap on_term TERM' \
+    '    printf "%s\n" "$BASHPID" >"$FAKE_CURL_PID_FILE"' \
+    '    SECONDS=0' \
+    '    while ((SECONDS < 10)); do sleep 1 || :; done' \
+    '    exit 99' \
+    '    ;;' \
+    '  *) exit 92 ;;' \
+    'esac' >"$fake_curl"
+  chmod 0755 "$fake_timeout" "$fake_curl"
+
+  export REAL_TIMEOUT="$real_timeout"
+  export PATH="$fake_bin:$PATH"
+  export FAKE_TIMEOUT_ARGV_FILE="$timeout_argument_log"
+  export FAKE_CURL_ARGV_FILE="$argument_log"
+  export FAKE_CURL_MODE=success
+  export FAKE_CURL_PAYLOAD='{"status":"ok"}'
+  fetch_delayed_otlp_receiver_snapshot "$output" 2 || return $?
+  [[ "$(<"$output")" == "$FAKE_CURL_PAYLOAD" ]] || return 1
+  mapfile -d '' -t actual_timeout_arguments <"$timeout_argument_log"
+  mapfile -d '' -t actual_arguments <"$argument_log"
+  ((${#actual_timeout_arguments[@]} == ${#expected_timeout_arguments[@]})) ||
+    return 1
+  for argument_index in "${!expected_timeout_arguments[@]}"; do
+    [[ "${actual_timeout_arguments[$argument_index]}" == \
+      "${expected_timeout_arguments[$argument_index]}" ]] || return 1
+  done
+  ((${#actual_arguments[@]} == ${#expected_arguments[@]})) || return 1
+  for argument_index in "${!expected_arguments[@]}"; do
+    [[ "${actual_arguments[$argument_index]}" == \
+      "${expected_arguments[$argument_index]}" ]] || return 1
+  done
+
+  export FAKE_CURL_MODE=ignore-term
+  export FAKE_CURL_TERM_FILE="$term_file"
+  export FAKE_CURL_PID_FILE="$pid_file"
+  expected_timeout_arguments[2]=1s
+  expected_timeout_arguments[11]="$partial_output"
+  expected_arguments[7]="$partial_output"
+  if (fetch_delayed_otlp_receiver_snapshot "$partial_output" 1) \
+    >/dev/null 2>&1; then
+    printf 'delayed OTLP fetch wrapper did not terminate a TERM-ignoring curl\n' >&2
+    return 1
+  else
+    status=$?
+  fi
+  mapfile -d '' -t actual_timeout_arguments <"$timeout_argument_log"
+  mapfile -d '' -t actual_arguments <"$argument_log"
+  [[ "$status" == "137" && "$(<"$partial_output")" == "partial" &&
+    "$(<"$term_file")" == "term" ]] || return 1
+  ((${#actual_timeout_arguments[@]} == ${#expected_timeout_arguments[@]})) ||
+    return 1
+  for argument_index in "${!expected_timeout_arguments[@]}"; do
+    [[ "${actual_timeout_arguments[$argument_index]}" == \
+      "${expected_timeout_arguments[$argument_index]}" ]] || return 1
+  done
+  ((${#actual_arguments[@]} == ${#expected_arguments[@]})) || return 1
+  for argument_index in "${!expected_arguments[@]}"; do
+    [[ "${actual_arguments[$argument_index]}" == \
+      "${expected_arguments[$argument_index]}" ]] || return 1
+  done
+
+  curl_pid="$(<"$pid_file")"
+  [[ "$curl_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  if kill -0 "$curl_pid" 2>/dev/null; then
+    process_state="$(
+      awk '$1 == "State:" { print $2; exit }' \
+        "/proc/$curl_pid/status" 2>/dev/null || true
+    )"
+    [[ "$process_state" == "Z" ]] || return 1
+  fi
+)
+
+test_delayed_otlp_run_identity_and_receiver_continuity() (
+  local -r result_dir="$TEST_TMP_DIR/delayed-otlp-continuity"
+  local -r nonce_counter="$result_dir/nonce-counter"
+  local -r baseline="$result_dir/baseline.json"
+  local -r reset="$result_dir/reset.json"
+  local -r restarted="$result_dir/restarted.json"
+  local -r malformed="$result_dir/malformed.json"
+  local -r progress="$result_dir/progress.json"
+  local -r receiver_instance_id="ABCDEFGHIJKLMNOPQRSTUVWX23"
+  local -r next_receiver_instance_id="ZYXWVUTSRQPONMLKJIHGFEDC32"
+  local -r reset_generation=7
+  local expected_instance_id_base64=""
+  local first_marker=""
+  local second_marker=""
+  local progress_output=""
+  local invalid_filter=""
+  local DELAYED_OTLP_RECEIVER_INSTANCE_ID_BASE64="stale-instance"
+  local DELAYED_OTLP_RECEIVER_RESET_GENERATION="99"
+  local DELAYED_OTLP_PRIME_MARKER="$DELAYED_OTLP_PRIME_MARKER_PREFIX"
+
+  mkdir -p -- "$result_dir"
+  printf '0\n' >"$nonce_counter"
+  delayed_otlp_run_nonce() {
+    local counter=""
+
+    counter="$(<"$nonce_counter")" || return $?
+    case "$counter" in
+      0) printf '00000000000000000000000000000001\n' ;;
+      1) printf '00000000000000000000000000000002\n' ;;
+      *) return 1 ;;
+    esac
+    printf '%s\n' "$((counter + 1))" >"$nonce_counter"
+  }
+
+  initialize_delayed_otlp_run_identity || return $?
+  first_marker="$DELAYED_OTLP_PRIME_MARKER"
+  [[ "$first_marker" == \
+      "$DELAYED_OTLP_PRIME_MARKER_PREFIX-00000000000000000000000000000001" &&
+    -z "$DELAYED_OTLP_RECEIVER_INSTANCE_ID_BASE64" &&
+    -z "$DELAYED_OTLP_RECEIVER_RESET_GENERATION" ]] || return 1
+
+  DELAYED_OTLP_RECEIVER_INSTANCE_ID_BASE64="stale-instance"
+  DELAYED_OTLP_RECEIVER_RESET_GENERATION="100"
+  initialize_delayed_otlp_run_identity || return $?
+  second_marker="$DELAYED_OTLP_PRIME_MARKER"
+  [[ "$second_marker" == \
+      "$DELAYED_OTLP_PRIME_MARKER_PREFIX-00000000000000000000000000000002" &&
+    "$second_marker" != "$first_marker" && ${#second_marker} -le 128 &&
+    -z "$DELAYED_OTLP_RECEIVER_INSTANCE_ID_BASE64" &&
+    -z "$DELAYED_OTLP_RECEIVER_RESET_GENERATION" ]] || return 1
+
+  delayed_otlp_run_nonce() { printf 'not-a-valid-nonce\n'; }
+  if initialize_delayed_otlp_run_identity; then
+    printf 'delayed OTLP run identity accepted a malformed nonce\n' >&2
+    return 1
+  fi
+  [[ "$DELAYED_OTLP_PRIME_MARKER" == "$second_marker" &&
+    -z "$DELAYED_OTLP_RECEIVER_INSTANCE_ID_BASE64" &&
+    -z "$DELAYED_OTLP_RECEIVER_RESET_GENERATION" ]] || return 1
+
+  jq -cn \
+    --arg marker "$DELAYED_OTLP_PRIME_MARKER" \
+    --arg receiver_instance_id "$receiver_instance_id" \
+    --argjson reset_generation "$reset_generation" '
+      {
+        receiver_instance_id: $receiver_instance_id,
+        reset_generation: $reset_generation,
+        marker: $marker,
+        received_batches: 0,
+        received_spans: 0,
+        spans: []
+      }
+    ' >"$baseline"
+  jq -c '.reset_generation += 1' "$baseline" >"$reset"
+  jq -c --arg receiver_instance_id "$next_receiver_instance_id" \
+    '.receiver_instance_id = $receiver_instance_id' "$baseline" >"$restarted"
+  jq -c '.reset_generation = 9007199254740992' "$baseline" >"$malformed"
+
+  jq -c --arg marker "$first_marker" '.marker = $marker' \
+    "$baseline" >"$progress"
+  if delayed_otlp_receiver_snapshot_is_empty "$progress"; then
+    printf 'delayed OTLP receiver accepted an earlier run marker\n' >&2
+    return 1
+  fi
+
+  capture_delayed_otlp_receiver_continuity "$baseline" || return $?
+  expected_instance_id_base64="$(jq -nr --arg value "$receiver_instance_id" \
+    '$value | @base64')" || return $?
+  [[ "$DELAYED_OTLP_RECEIVER_INSTANCE_ID_BASE64" == \
+      "$expected_instance_id_base64" &&
+    "$DELAYED_OTLP_RECEIVER_RESET_GENERATION" == "$reset_generation" ]] || return 1
+  delayed_otlp_receiver_snapshot_has_expected_continuity "$baseline" || return $?
+  if capture_delayed_otlp_receiver_continuity "$reset"; then
+    printf 'delayed OTLP receiver continuity was silently recaptured\n' >&2
+    return 1
+  fi
+  if delayed_otlp_receiver_snapshot_has_expected_continuity "$reset"; then
+    printf 'delayed OTLP receiver accepted a reset generation change\n' >&2
+    return 1
+  fi
+  if delayed_otlp_receiver_snapshot_has_expected_continuity "$restarted"; then
+    printf 'delayed OTLP receiver accepted an instance change\n' >&2
+    return 1
+  fi
+  if delayed_otlp_receiver_snapshot_has_expected_continuity "$malformed" 2>/dev/null; then
+    printf 'delayed OTLP receiver accepted an inexact JSON generation\n' >&2
+    return 1
+  fi
+
+  for invalid_filter in \
+    'del(.receiver_instance_id)' \
+    '.receiver_instance_id = ""' \
+    'del(.reset_generation)' \
+    '.reset_generation = 1.5' \
+    '.reset_generation = "7"'; do
+    jq -c "$invalid_filter" "$baseline" >"$malformed"
+    if delayed_otlp_receiver_snapshot_has_expected_continuity \
+      "$malformed" 2>/dev/null; then
+      printf 'delayed OTLP receiver accepted malformed continuity: %s\n' \
+        "$invalid_filter" >&2
+      return 1
+    fi
+  done
+
+  jq -cn \
+    --arg marker "$DELAYED_OTLP_PRIME_MARKER" \
+    --argjson maximum "$MAX_JSON_SAFE_INTEGER" '
+      {
+        marker: $marker,
+        received_batches: $maximum,
+        received_spans: $maximum,
+        dropped_spans: 0,
+        dropped_count_spans: 0,
+        dropped_value_limit_spans: 0,
+        dropped_retained_limit_spans: 0,
+        spans: []
+      }
+    ' >"$progress"
+  progress_output="$(delayed_otlp_receiver_snapshot_progress "$progress")" || return $?
+  [[ "$progress_output" == \
+    $MAX_JSON_SAFE_INTEGER$'\t'$MAX_JSON_SAFE_INTEGER$'\t0' ]] || return 1
+  for invalid_filter in \
+    '.received_batches = 9007199254740992' \
+    '.received_spans = 9.007199254740992e15' \
+    '.received_batches = -1' \
+    '.received_spans = 1.5' \
+    '.received_batches = "1"'; do
+    jq -c "$invalid_filter" "$progress" >"$malformed"
+    if delayed_otlp_receiver_snapshot_progress "$malformed" >/dev/null 2>&1; then
+      printf 'delayed OTLP receiver accepted an inexact counter: %s\n' \
+        "$invalid_filter" >&2
+      return 1
+    fi
+  done
+)
+
+test_delayed_otlp_pre_export_evidence_is_atomic() (
+  local -r result_dir="$TEST_TMP_DIR/delayed-otlp-pre-export-atomic"
+  local -r baseline="$result_dir/baseline.json"
+  local -r multi_document="$result_dir/multi-document.json"
+  local -r reset="$result_dir/reset.json"
+  local -r malformed="$result_dir/malformed.json"
+  local -r output="$result_dir/before-request.json"
+  local -r missing_output="$result_dir/missing-before-request.json"
+  local -r reset_output="$result_dir/before-export-reset.json"
+  local -r malformed_output="$result_dir/before-request-malformed.json"
+  local -r multi_baseline_output="$result_dir/before-request-multi.json"
+  local -r multi_pre_export_output="$result_dir/before-export-multi.json"
+  local DELAYED_OTLP_RECEIVER_INSTANCE_ID_BASE64=""
+  local DELAYED_OTLP_RECEIVER_RESET_GENERATION=""
+  local failure_status=0
+
+  mkdir -p -- "$result_dir"
+  RESULT_DIR="$result_dir"
+  jq -cn \
+    --arg marker "$DELAYED_OTLP_PRIME_MARKER" '
+      {
+        receiver_instance_id: "ABCDEFGHIJKLMNOPQRSTUVWX23",
+        reset_generation: 7,
+        marker: $marker,
+        received_batches: 0,
+        received_spans: 0,
+        spans: []
+      }
+    ' >"$baseline"
+  jq -c '.' "$baseline" "$baseline" >"$multi_document"
+  jq -c '.reset_generation += 1' "$baseline" >"$reset"
+  printf '{"receiver_instance_id":' >"$malformed"
+  printf 'existing\n' >"$output"
+  fetch_delayed_otlp_receiver_snapshot() {
+    [[ "$DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP" == "$1" ]] || return 1
+    printf 'partial\n' >"$1"
+    return 23
+  }
+  if assert_delayed_otlp_receiver_empty "$output" >/dev/null 2>&1; then
+    printf 'delayed OTLP baseline ignored a partial fetch failure\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "23" && "$(<"$output")" == "existing" &&
+    -z "$DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP" ]] || return 1
+
+  if assert_delayed_otlp_receiver_empty "$missing_output" >/dev/null 2>&1; then
+    printf 'delayed OTLP missing baseline ignored a partial fetch failure\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "23" && ! -e "$missing_output" &&
+    -z "$DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP" ]] || return 1
+
+  fetch_delayed_otlp_receiver_snapshot() {
+    install -m 0644 "$multi_document" "$1"
+  }
+  log_error() { :; }
+  if assert_delayed_otlp_receiver_empty "$multi_baseline_output"; then
+    printf 'delayed OTLP baseline accepted a multi-document snapshot\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "1" &&
+    -z "$DELAYED_OTLP_RECEIVER_INSTANCE_ID_BASE64" &&
+    -z "$DELAYED_OTLP_RECEIVER_RESET_GENERATION" &&
+    -z "$DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP" ]] || return 1
+  cmp -s -- "$multi_document" "$multi_baseline_output" || return 1
+
+  fetch_delayed_otlp_receiver_snapshot() {
+    install -m 0644 "$baseline" "$1"
+  }
+  assert_delayed_otlp_receiver_empty "$output" || return $?
+  [[ "$(<"$output")" == "$(<"$baseline")" &&
+    "$DELAYED_OTLP_RECEIVER_INSTANCE_ID_BASE64" == \
+      "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYMjM=" &&
+    "$DELAYED_OTLP_RECEIVER_RESET_GENERATION" == "7" &&
+    -z "$DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP" ]] || return 1
+
+  fetch_delayed_otlp_receiver_snapshot() {
+    install -m 0644 "$multi_document" "$1"
+  }
+  if assert_delayed_otlp_receiver_has_no_java_export \
+    "$multi_pre_export_output"; then
+    printf 'delayed OTLP pre-export check accepted a multi-document snapshot\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "1" &&
+    "$DELAYED_OTLP_RECEIVER_INSTANCE_ID_BASE64" == \
+      "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYMjM=" &&
+    "$DELAYED_OTLP_RECEIVER_RESET_GENERATION" == "7" &&
+    -z "$DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP" ]] || return 1
+  cmp -s -- "$multi_document" "$multi_pre_export_output" || return 1
+
+  fetch_delayed_otlp_receiver_snapshot() {
+    install -m 0644 "$reset" "$1"
+  }
+  if assert_delayed_otlp_receiver_has_no_java_export "$reset_output"; then
+    printf 'delayed OTLP pre-export evidence accepted a reset\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "1" &&
+    "$(<"$reset_output")" == "$(<"$reset")" &&
+    -z "$DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP" ]] || return 1
+
+  DELAYED_OTLP_RECEIVER_INSTANCE_ID_BASE64=""
+  DELAYED_OTLP_RECEIVER_RESET_GENERATION=""
+  fetch_delayed_otlp_receiver_snapshot() {
+    install -m 0644 "$malformed" "$1"
+  }
+  if assert_delayed_otlp_receiver_empty "$malformed_output" >/dev/null 2>&1; then
+    printf 'delayed OTLP baseline accepted malformed JSON\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "1" &&
+    "$(<"$malformed_output")" == "$(<"$malformed")" &&
+    -z "$DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP" ]]
+)
+
 test_delayed_otlp_receiver_snapshots_prove_export_boundary() {
   local -r snapshot="$TEST_TMP_DIR/delayed-otlp-receiver.json"
+  local -r duplicate_snapshot="$TEST_TMP_DIR/delayed-otlp-receiver-duplicate.json"
 
   printf '{"marker":"%s","received_batches":0,"received_spans":0,"spans":[]}' \
     "$DELAYED_OTLP_PRIME_MARKER" >"$snapshot"
@@ -3361,6 +3908,16 @@ test_delayed_otlp_receiver_snapshots_prove_export_boundary() {
     printf 'delayed OTLP receiver rejected a receipt timestamp at its deadline\n' >&2
     return 1
   }
+  jq -c '
+    .received_batches = 2 |
+    .received_spans = 2 |
+    .spans += [(.spans[1] | .trace_id = "00112233445566778899aabbccddeeff" |
+      .span_id = "0011223344556677")]
+  ' "$snapshot" >"$duplicate_snapshot"
+  if delayed_otlp_receiver_snapshot_has_java_export "$duplicate_snapshot"; then
+    printf 'delayed OTLP receiver accepted duplicate Java SDK exports\n' >&2
+    return 1
+  fi
 
   printf '%s' \
     '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
@@ -3404,25 +3961,39 @@ test_delayed_otlp_receiver_snapshots_prove_export_boundary() {
 
   printf '%s' \
     '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
-    '","received_batches":1,"received_spans":2,"spans":[{"service_name":"java-backend","scope_name":"' \
+    '","received_batches":2,"received_spans":2,"spans":[{"service_name":"java-backend","scope_name":"' \
     "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
     '","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
     "$DELAYED_OTLP_PRIME_MARKER" \
     '"},"received_unix_milli":101000},{"service_name":"java-backend","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
     "$DELAYED_OTLP_PRIME_MARKER" \
-    '"},"received_unix_milli":100999}]}' >"$snapshot"
+    '"},"start_unix_nano":100998000000,"end_unix_nano":100999000000,"received_unix_milli":101001}]}' >"$snapshot"
   delayed_otlp_receiver_snapshot_has_java_export "$snapshot" || {
     printf 'delayed OTLP receiver rejected the expected pre-detection OBI Java span\n' >&2
     return 1
   }
   delayed_otlp_receiver_snapshot_has_java_export_at_or_after_deadline "$snapshot" 101000 || {
-    printf 'delayed OTLP receiver rejected an OBI Java span from before the deadline\n' >&2
+    printf 'delayed OTLP receiver rejected a pre-deadline OBI span delivered after the SDK batch\n' >&2
     return 1
   }
 
   printf '%s' \
     '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
-    '","received_batches":1,"received_spans":3,"spans":[{"service_name":"java-backend","scope_name":"' \
+    '","received_batches":2,"received_spans":2,"spans":[{"service_name":"java-backend","scope_name":"' \
+    "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
+    '","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"},"received_unix_milli":101000},{"service_name":"java-backend","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"},"received_unix_milli":101001}]}' >"$snapshot"
+  if delayed_otlp_receiver_snapshot_has_java_export_at_or_after_deadline "$snapshot" 101000; then
+    printf 'delayed OTLP receiver accepted a pre-detection OBI span without its lifetime\n' >&2
+    return 1
+  fi
+
+  printf '%s' \
+    '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
+    '","received_batches":3,"received_spans":3,"spans":[{"service_name":"java-backend","scope_name":"' \
     "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
     '","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
     "$DELAYED_OTLP_PRIME_MARKER" \
@@ -3438,7 +4009,7 @@ test_delayed_otlp_receiver_snapshots_prove_export_boundary() {
 
   printf '%s' \
     '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
-    '","received_batches":1,"received_spans":2,"spans":[{"service_name":"java-backend","scope_name":"' \
+    '","received_batches":2,"received_spans":2,"spans":[{"service_name":"java-backend","scope_name":"' \
     "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
     '","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
     "$DELAYED_OTLP_PRIME_MARKER" \
@@ -3452,26 +4023,57 @@ test_delayed_otlp_receiver_snapshots_prove_export_boundary() {
 
   printf '%s' \
     '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
-    '","received_batches":1,"received_spans":2,"spans":[{"service_name":"java-backend","scope_name":"' \
+    '","received_batches":2,"received_spans":2,"spans":[{"service_name":"java-backend","scope_name":"' \
     "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
     '","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
     "$DELAYED_OTLP_PRIME_MARKER" \
     '"},"received_unix_milli":101000},{"service_name":"java-backend","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
     "$DELAYED_OTLP_PRIME_MARKER" \
-    '"},"received_unix_milli":101000}]}' >"$snapshot"
+    '"},"start_unix_nano":100999000000,"end_unix_nano":101000000000,"received_unix_milli":101001}]}' >"$snapshot"
   if delayed_otlp_receiver_snapshot_has_java_export_at_or_after_deadline "$snapshot" 101000; then
-    printf 'delayed OTLP receiver accepted an OBI Java span after suppression\n' >&2
+    printf 'delayed OTLP receiver accepted an OBI Java span completed at the export boundary\n' >&2
     return 1
   fi
 }
 
 test_delayed_otlp_receiver_wait_enforces_export_deadline() {
   local -r result_dir="$TEST_TMP_DIR/delayed-otlp-receiver-deadline"
+  local -r empty_fixture="$result_dir/java-export-empty.json"
   local -r early_fixture="$result_dir/java-export-early.json"
+  local -r sdk_fixture="$result_dir/java-export-sdk.json"
+  local -r obi_first_fixture="$result_dir/java-export-obi-first.json"
+  local -r advanced_sdk_fixture="$result_dir/java-export-sdk-advanced.json"
   local -r ready_fixture="$result_dir/java-export-ready.json"
+  local -r unexpected_fixture="$result_dir/java-export-unexpected.json"
+  local -r duplicate_fixture="$result_dir/java-export-duplicate.json"
+  local -r dropped_receiver_fixture="$result_dir/java-export-receiver-drop.json"
+  local -r omitted_receiver_fixture="$result_dir/java-export-receiver-omission.json"
+  local -r counter_regression_fixture="$result_dir/java-export-counter-regression.json"
+  local -r dropped_obi_fixture="$result_dir/java-export-dropped-obi.json"
+  local -r reset_fixture="$result_dir/java-export-reset.json"
+  local -r restart_fixture="$result_dir/java-export-restart.json"
+  local -r malformed_fixture="$result_dir/java-export-malformed.json"
+  local -r multi_discovery_fixture="$result_dir/java-export-multi-discovery.json"
+  local -r multi_settlement_fixture="$result_dir/java-export-multi-settlement.json"
+  local -r multi_final_fixture="$result_dir/java-export-multi-final.json"
+  local -r simulated_phase_seconds=100
+  local -r receiver_instance_id="ABCDEFGHIJKLMNOPQRSTUVWX23"
+  local -r next_receiver_instance_id="ZYXWVUTSRQPONMLKJIHGFEDC32"
+  local -r reset_generation=7
+  local DELAYED_OTLP_RECEIVER_INSTANCE_ID_BASE64=""
+  local DELAYED_OTLP_RECEIVER_RESET_GENERATION="$reset_generation"
+  local metadata_fixture=""
+  local metadata_name=""
+  local normalized_fixture=""
+  local receiver_fixture=""
   local failure_status=0
 
   mkdir -p -- "$result_dir"
+  DELAYED_OTLP_RECEIVER_INSTANCE_ID_BASE64="$(
+    jq -nr --arg value "$receiver_instance_id" '$value | @base64'
+  )" || return $?
+  printf '{"marker":"%s","received_batches":0,"received_spans":0,"spans":[]}' \
+    "$DELAYED_OTLP_PRIME_MARKER" >"$empty_fixture"
   printf '%s' \
     '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
     '","received_batches":1,"received_spans":1,"spans":[{"service_name":"java-backend","scope_name":"' \
@@ -3481,24 +4083,121 @@ test_delayed_otlp_receiver_wait_enforces_export_deadline() {
     '"},"received_unix_milli":100999}]}' >"$early_fixture"
   printf '%s' \
     '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
-    '","received_batches":1,"received_spans":2,"spans":[{"service_name":"java-backend","scope_name":"' \
+    '","received_batches":1,"received_spans":1,"spans":[{"service_name":"java-backend","scope_name":"' \
+    "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
+    '","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"},"received_unix_milli":101000}]}' >"$sdk_fixture"
+  printf '%s' \
+    '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
+    '","received_batches":1,"received_spans":1,"spans":[{"service_name":"java-backend","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"},"start_unix_nano":100998000000,"end_unix_nano":100999000000,"received_unix_milli":101001}]}' \
+    >"$obi_first_fixture"
+  printf '%s' \
+    '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
+    '","received_batches":2,"received_spans":2,"spans":[{"service_name":"java-backend","scope_name":"' \
+    "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
+    '","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"},"received_unix_milli":101000}]}' >"$advanced_sdk_fixture"
+  printf '%s' \
+    '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
+    '","received_batches":2,"received_spans":2,"spans":[{"service_name":"java-backend","scope_name":"' \
     "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
     '","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
     "$DELAYED_OTLP_PRIME_MARKER" \
     '"},"received_unix_milli":101000},{"service_name":"java-backend","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
     "$DELAYED_OTLP_PRIME_MARKER" \
-    '"},"received_unix_milli":100999}]}' >"$ready_fixture"
+    '"},"start_unix_nano":100998000000,"end_unix_nano":100999000000,"received_unix_milli":101001}]}' >"$ready_fixture"
+  printf '%s' \
+    '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
+    '","received_batches":2,"received_spans":2,"spans":[{"service_name":"java-backend","scope_name":"' \
+    "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
+    '","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"},"received_unix_milli":101000},{"service_name":"java-backend","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"},"start_unix_nano":100999000000,"end_unix_nano":101000000000,"received_unix_milli":101001}]}' >"$unexpected_fixture"
+  printf '%s' \
+    '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
+    '","received_batches":3,"received_spans":3,"ambiguous_related_spans":1,"spans":[{"service_name":"java-backend","scope_name":"' \
+    "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
+    '","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"},"received_unix_milli":101000}]}' >"$duplicate_fixture"
+  printf '%s' \
+    '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
+    '","received_batches":2,"received_spans":2,"dropped_spans":1,"dropped_value_limit_spans":1,"spans":[{"service_name":"java-backend","scope_name":"' \
+    "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
+    '","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"},"received_unix_milli":101000}]}' >"$dropped_receiver_fixture"
+  printf '%s' \
+    '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
+    '","received_batches":2,"received_spans":2,"omitted_related_spans":1,"spans":[{"service_name":"java-backend","scope_name":"' \
+    "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
+    '","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"},"received_unix_milli":101000}]}' >"$omitted_receiver_fixture"
+  command cp -- "$sdk_fixture" "$counter_regression_fixture"
+  printf '%s' \
+    '{"marker":"' "$DELAYED_OTLP_PRIME_MARKER" \
+    '","received_batches":3,"received_spans":3,"spans":[{"service_name":"java-backend","scope_name":"' \
+    "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
+    '","kind":"SERVER","attributes":{"http.request.header.x-obi-demo-id":"' \
+    "$DELAYED_OTLP_PRIME_MARKER" \
+    '"},"received_unix_milli":101000}]}' >"$dropped_obi_fixture"
+
+  for receiver_fixture in \
+    "$empty_fixture" \
+    "$early_fixture" \
+    "$sdk_fixture" \
+    "$obi_first_fixture" \
+    "$advanced_sdk_fixture" \
+    "$ready_fixture" \
+    "$unexpected_fixture" \
+    "$duplicate_fixture" \
+    "$dropped_receiver_fixture" \
+    "$omitted_receiver_fixture" \
+    "$counter_regression_fixture" \
+    "$dropped_obi_fixture"; do
+    normalized_fixture="$receiver_fixture.normalized"
+    jq -c \
+      --arg receiver_instance_id "$receiver_instance_id" \
+      --argjson reset_generation "$reset_generation" '
+      . + {
+        receiver_instance_id: $receiver_instance_id,
+        reset_generation: $reset_generation,
+        dropped_spans: (.dropped_spans // 0),
+        dropped_count_spans: (.dropped_count_spans // 0),
+        dropped_value_limit_spans: (.dropped_value_limit_spans // 0),
+        dropped_retained_limit_spans: (.dropped_retained_limit_spans // 0)
+      }
+    ' "$receiver_fixture" >"$normalized_fixture"
+    command mv -f -- "$normalized_fixture" "$receiver_fixture"
+  done
+  jq -c '.reset_generation += 1' "$sdk_fixture" >"$reset_fixture"
+  jq -c --arg receiver_instance_id "$next_receiver_instance_id" \
+    '.receiver_instance_id = $receiver_instance_id' \
+    "$empty_fixture" >"$restart_fixture"
+  printf '{"receiver_instance_id":' >"$malformed_fixture"
+  jq -c '.' "$empty_fixture" "$sdk_fixture" >"$multi_discovery_fixture"
+  jq -c '.' "$ready_fixture" "$ready_fixture" >"$multi_settlement_fixture"
+  jq -c '.' "$advanced_sdk_fixture" "$sdk_fixture" >"$multi_final_fixture"
 
   if (
     RESULT_DIR="$result_dir"
+    SECONDS=0
     fetch_delayed_otlp_receiver_snapshot() {
       install -m 0644 "$early_fixture" "$1"
     }
-    date() { return 1; }
     log_error() { :; }
 
     wait_for_delayed_otlp_receiver_export \
-      "$result_dir/ready-early.json" 1 101000 "$result_dir/early.json"
+      "$result_dir/ready-early.json" "$simulated_phase_seconds" 101000 \
+      "$result_dir/early.json" "$result_dir/unexpected-early.json" \
+      "$simulated_phase_seconds"
   ) >/dev/null 2>&1; then
     printf 'delayed OTLP receiver accepted an export before its deadline\n' >&2
     return 1
@@ -3506,45 +4205,815 @@ test_delayed_otlp_receiver_wait_enforces_export_deadline() {
     failure_status=$?
   fi
   [[ "$failure_status" == "1" && ! -e "$result_dir/ready-early.json" &&
+    ! -e "$result_dir/unexpected-early.json" &&
     "$(<"$result_dir/early.json")" == "$(<"$early_fixture")" ]] || {
     printf 'delayed OTLP receiver did not retain the early export evidence\n' >&2
     return 1
   }
 
   (
+    local -i fetch_calls=0
+    local -i sleep_calls=0
+
     RESULT_DIR="$result_dir"
+    SECONDS=0
     fetch_delayed_otlp_receiver_snapshot() {
-      install -m 0644 "$ready_fixture" "$1"
+      ((fetch_calls += 1))
+      [[ "$DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP" == "$1" ]] || return 1
+      case "$fetch_calls" in
+        1)
+          [[ "$2" == "10" ]] || return 1
+          install -m 0644 "$empty_fixture" "$1"
+          ;;
+        2)
+          [[ "$2" == "1" ]] || return 1
+          install -m 0644 "$sdk_fixture" "$1"
+          ;;
+        3)
+          [[ "$2" == "1" ]] || return 1
+          install -m 0644 "$ready_fixture" "$1"
+          ;;
+        *) return 1 ;;
+      esac
     }
-    date() { return 1; }
+    sleep() {
+      ((sleep_calls += 1))
+      SECONDS="$((SECONDS + simulated_phase_seconds))"
+    }
 
     wait_for_delayed_otlp_receiver_export \
-      "$result_dir/ready.json" 1 101000 "$result_dir/early-success.json"
+      "$result_dir/ready-boundary.json" "$simulated_phase_seconds" 101000 \
+      "$result_dir/early-boundary.json" \
+      "$result_dir/unexpected-boundary.json" "$simulated_phase_seconds"
+    [[ "$fetch_calls" == "3" && "$sleep_calls" == "2" ]]
   ) || {
-    printf 'delayed OTLP receiver rejected an export at its deadline\n' >&2
+    printf 'delayed OTLP receiver missed a boundary export or final settlement poll\n' >&2
+    return 1
+  }
+  [[ "$(<"$result_dir/ready-boundary.json")" == "$(<"$ready_fixture")" &&
+    ! -e "$result_dir/early-boundary.json" &&
+    ! -e "$result_dir/unexpected-boundary.json" ]] || return 1
+
+  (
+    local -i fetch_calls=0
+    local -i sleep_calls=0
+
+    RESULT_DIR="$result_dir"
+    SECONDS=0
+    fetch_delayed_otlp_receiver_snapshot() {
+      ((fetch_calls += 1))
+      case "$fetch_calls" in
+        1) install -m 0644 "$obi_first_fixture" "$1" ;;
+        2 | 3) install -m 0644 "$ready_fixture" "$1" ;;
+        *) return 1 ;;
+      esac
+    }
+    sleep() {
+      ((sleep_calls += 1))
+      if ((sleep_calls == 1)); then
+        SECONDS="$((SECONDS + 1))"
+      else
+        SECONDS="$((SECONDS + simulated_phase_seconds))"
+      fi
+    }
+
+    wait_for_delayed_otlp_receiver_export \
+      "$result_dir/obi-first-ready.json" "$simulated_phase_seconds" 101000 \
+      "$result_dir/obi-first-early.json" \
+      "$result_dir/obi-first-unexpected.json" "$simulated_phase_seconds"
+    [[ "$fetch_calls" == "3" && "$sleep_calls" == "2" ]]
+  ) || {
+    printf 'delayed OTLP receiver rejected OBI-before-SDK batch order\n' >&2
+    return 1
+  }
+  [[ "$(<"$result_dir/obi-first-ready.json")" == "$(<"$ready_fixture")" &&
+    ! -e "$result_dir/obi-first-early.json" &&
+    ! -e "$result_dir/obi-first-unexpected.json" ]] || return 1
+
+  if (
+    local -i fetch_calls=0
+
+    RESULT_DIR="$result_dir"
+    SECONDS=0
+    fetch_delayed_otlp_receiver_snapshot() {
+      ((fetch_calls += 1))
+      [[ "$fetch_calls" == "1" && "$2" == "10" ]] || return 91
+      install -m 0644 "$multi_discovery_fixture" "$1"
+    }
+    sleep() { return 47; }
+    log_error() { :; }
+
+    wait_for_delayed_otlp_receiver_export \
+      "$result_dir/multi-discovery-ready.json" "$simulated_phase_seconds" 101000 \
+      "$result_dir/multi-discovery-early.json" \
+      "$result_dir/multi-discovery-unexpected.json" "$simulated_phase_seconds"
+  ) >/dev/null 2>&1; then
+    printf 'delayed OTLP receiver accepted a multi-document discovery snapshot\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "1" &&
+    ! -e "$result_dir/multi-discovery-ready.json" &&
+    ! -e "$result_dir/multi-discovery-early.json" ]] || return 1
+  cmp -s -- "$multi_discovery_fixture" \
+    "$result_dir/multi-discovery-unexpected.json" || return 1
+
+  if (
+    local -i fetch_calls=0
+    local -i sleep_calls=0
+
+    RESULT_DIR="$result_dir"
+    SECONDS=0
+    fetch_delayed_otlp_receiver_snapshot() {
+      ((fetch_calls += 1))
+      [[ "$2" == "10" ]] || return 91
+      case "$fetch_calls" in
+        1) install -m 0644 "$sdk_fixture" "$1" ;;
+        2) install -m 0644 "$multi_settlement_fixture" "$1" ;;
+        *) return 91 ;;
+      esac
+    }
+    sleep() {
+      ((sleep_calls += 1))
+      if [[ "$sleep_calls" == "1" ]]; then
+        SECONDS="$((SECONDS + 1))"
+      else
+        return 47
+      fi
+    }
+    log_error() { :; }
+
+    wait_for_delayed_otlp_receiver_export \
+      "$result_dir/multi-settlement-ready.json" "$simulated_phase_seconds" 101000 \
+      "$result_dir/multi-settlement-early.json" \
+      "$result_dir/multi-settlement-unexpected.json" "$simulated_phase_seconds"
+  ) >/dev/null 2>&1; then
+    printf 'delayed OTLP receiver accepted a multi-document settlement snapshot\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "1" &&
+    ! -e "$result_dir/multi-settlement-ready.json" &&
+    ! -e "$result_dir/multi-settlement-early.json" ]] || return 1
+  cmp -s -- "$multi_settlement_fixture" \
+    "$result_dir/multi-settlement-unexpected.json" || return 1
+
+  if (
+    local -i fetch_calls=0
+    local -i sleep_calls=0
+
+    RESULT_DIR="$result_dir"
+    SECONDS=0
+    fetch_delayed_otlp_receiver_snapshot() {
+      ((fetch_calls += 1))
+      case "$fetch_calls" in
+        1)
+          [[ "$2" == "10" ]] || return 91
+          install -m 0644 "$sdk_fixture" "$1"
+          ;;
+        2)
+          [[ "$2" == "1" ]] || return 91
+          install -m 0644 "$multi_final_fixture" "$1"
+          ;;
+        *) return 91 ;;
+      esac
+    }
+    sleep() {
+      ((sleep_calls += 1))
+      [[ "$sleep_calls" == "1" ]] || return 47
+      SECONDS="$((SECONDS + simulated_phase_seconds))"
+    }
+    log_error() { :; }
+
+    wait_for_delayed_otlp_receiver_export \
+      "$result_dir/multi-final-ready.json" "$simulated_phase_seconds" 101000 \
+      "$result_dir/multi-final-early.json" \
+      "$result_dir/multi-final-unexpected.json" "$simulated_phase_seconds"
+  ) >/dev/null 2>&1; then
+    printf 'delayed OTLP receiver accepted a multi-document final snapshot\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "1" &&
+    ! -e "$result_dir/multi-final-ready.json" &&
+    ! -e "$result_dir/multi-final-early.json" ]] || return 1
+  cmp -s -- "$multi_final_fixture" \
+    "$result_dir/multi-final-unexpected.json" || return 1
+
+  if (
+    RESULT_DIR="$result_dir"
+    SECONDS=0
+    fetch_delayed_otlp_receiver_snapshot() {
+      install -m 0644 "$restart_fixture" "$1"
+    }
+    log_error() { :; }
+
+    wait_for_delayed_otlp_receiver_export \
+      "$result_dir/restart-ready.json" "$simulated_phase_seconds" 101000 \
+      "$result_dir/restart-early.json" "$result_dir/restart-unexpected.json" \
+      "$simulated_phase_seconds"
+  ) >/dev/null 2>&1; then
+    printf 'delayed OTLP receiver accepted a restarted discovery snapshot\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "1" && ! -e "$result_dir/restart-ready.json" &&
+    ! -e "$result_dir/restart-early.json" &&
+    "$(<"$result_dir/restart-unexpected.json")" == \
+      "$(<"$restart_fixture")" ]] || {
+    printf 'delayed OTLP receiver did not retain restart evidence\n' >&2
+    return 1
+  }
+
+  if (
+    local -i fetch_calls=0
+
+    RESULT_DIR="$result_dir"
+    SECONDS=0
+    fetch_delayed_otlp_receiver_snapshot() {
+      ((fetch_calls += 1))
+      case "$fetch_calls" in
+        1) install -m 0644 "$sdk_fixture" "$1" ;;
+        2) install -m 0644 "$reset_fixture" "$1" ;;
+        *) return 1 ;;
+      esac
+    }
+    sleep() { SECONDS="$((SECONDS + simulated_phase_seconds))"; }
+    log_error() { :; }
+
+    wait_for_delayed_otlp_receiver_export \
+      "$result_dir/reset-ready.json" "$simulated_phase_seconds" 101000 \
+      "$result_dir/reset-early.json" "$result_dir/reset-unexpected.json" \
+      "$simulated_phase_seconds"
+  ) >/dev/null 2>&1; then
+    printf 'delayed OTLP receiver accepted a reset during settlement\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "1" && ! -e "$result_dir/reset-ready.json" &&
+    ! -e "$result_dir/reset-early.json" &&
+    "$(<"$result_dir/reset-unexpected.json")" == "$(<"$reset_fixture")" ]] || {
+    printf 'delayed OTLP receiver did not retain reset evidence\n' >&2
+    return 1
+  }
+
+  if (
+    local -i fetch_calls=0
+
+    RESULT_DIR="$result_dir"
+    SECONDS=0
+    fetch_delayed_otlp_receiver_snapshot() {
+      ((fetch_calls += 1))
+      case "$fetch_calls" in
+        1) install -m 0644 "$sdk_fixture" "$1" ;;
+        2) install -m 0644 "$malformed_fixture" "$1" ;;
+        *) return 1 ;;
+      esac
+    }
+    sleep() { SECONDS="$((SECONDS + simulated_phase_seconds))"; }
+    log_error() { :; }
+
+    wait_for_delayed_otlp_receiver_export \
+      "$result_dir/malformed-ready.json" "$simulated_phase_seconds" 101000 \
+      "$result_dir/malformed-early.json" \
+      "$result_dir/malformed-unexpected.json" "$simulated_phase_seconds"
+  ) >/dev/null 2>&1; then
+    printf 'delayed OTLP receiver accepted malformed settlement JSON\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "1" && ! -e "$result_dir/malformed-ready.json" &&
+    ! -e "$result_dir/malformed-early.json" &&
+    "$(<"$result_dir/malformed-unexpected.json")" == \
+      "$(<"$malformed_fixture")" ]] || return 1
+
+  if (
+    local -i fetch_calls=0
+
+    RESULT_DIR="$result_dir"
+    SECONDS=0
+    fetch_delayed_otlp_receiver_snapshot() {
+      ((fetch_calls += 1))
+      install -m 0644 "$empty_fixture" "$1"
+    }
+    sleep() {
+      SECONDS="$((
+        SECONDS + simulated_phase_seconds +
+          DELAYED_OTLP_BOUNDARY_START_SLACK_SECONDS + 1
+      ))"
+    }
+    log_error() { :; }
+
+    if wait_for_delayed_otlp_receiver_export \
+      "$result_dir/overshoot-ready.json" "$simulated_phase_seconds" 101000 \
+      "$result_dir/overshoot-early.json" "$result_dir/overshoot-unexpected.json" \
+      "$simulated_phase_seconds"; then
+      return 1
+    fi
+    [[ "$fetch_calls" == "1" ]]
+  ) >/dev/null 2>&1; then
+    :
+  else
+    printf 'delayed OTLP receiver reopened an expired final-poll deadline\n' >&2
+    return 1
+  fi
+  [[ ! -e "$result_dir/overshoot-ready.json" &&
+    ! -e "$result_dir/overshoot-early.json" &&
+    "$(<"$result_dir/overshoot-unexpected.json")" == \
+      "$(<"$empty_fixture")" ]] || return 1
+
+  if (
+    RESULT_DIR="$result_dir"
+    SECONDS=0
+    fetch_delayed_otlp_receiver_snapshot() { return 19; }
+
+    wait_for_delayed_otlp_receiver_export \
+      "$result_dir/discovery-fetch.json" "$simulated_phase_seconds" 101000 \
+      "$result_dir/discovery-fetch-early.json" \
+      "$result_dir/discovery-fetch-unexpected.json" "$simulated_phase_seconds"
+  ) >/dev/null 2>&1; then
+    printf 'delayed OTLP receiver ignored a discovery fetch failure\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "19" && ! -e "$result_dir/discovery-fetch.json" &&
+    ! -e "$result_dir/discovery-fetch-early.json" &&
+    ! -e "$result_dir/discovery-fetch-unexpected.json" ]] || return 1
+
+  if (
+    RESULT_DIR="$result_dir"
+    SECONDS=0
+    fetch_delayed_otlp_receiver_snapshot() {
+      install -m 0644 "$empty_fixture" "$1"
+    }
+    sleep() { return 21; }
+
+    wait_for_delayed_otlp_receiver_export \
+      "$result_dir/discovery-sleep.json" "$simulated_phase_seconds" 101000 \
+      "$result_dir/discovery-sleep-early.json" \
+      "$result_dir/discovery-sleep-unexpected.json" "$simulated_phase_seconds"
+  ) >/dev/null 2>&1; then
+    printf 'delayed OTLP receiver ignored a discovery sleep failure\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "21" && ! -e "$result_dir/discovery-sleep.json" &&
+    ! -e "$result_dir/discovery-sleep-early.json" &&
+    ! -e "$result_dir/discovery-sleep-unexpected.json" ]] || return 1
+
+  (
+    local -i fetch_calls=0
+    local -i sleep_calls=0
+
+    RESULT_DIR="$result_dir"
+    SECONDS=0
+    fetch_delayed_otlp_receiver_snapshot() {
+      ((fetch_calls += 1))
+      case "$fetch_calls" in
+        1)
+          [[ "$2" == "3" ]] || return 1
+          install -m 0644 "$empty_fixture" "$1" || return $?
+          SECONDS="$((SECONDS + 3))"
+          ;;
+        2)
+          [[ "$2" == "1" ]] || return 1
+          install -m 0644 "$empty_fixture" "$1"
+          ;;
+        *) return 1 ;;
+      esac
+    }
+    sleep() { ((sleep_calls += 1)); }
+    log_error() { :; }
+
+    if wait_for_delayed_otlp_receiver_export \
+      "$result_dir/discovery-deadline.json" 3 101000 \
+      "$result_dir/discovery-deadline-early.json" \
+      "$result_dir/discovery-deadline-unexpected.json" 1; then
+      return 1
+    fi
+    [[ "$fetch_calls" == "2" && "$sleep_calls" == "0" ]] && ((SECONDS >= 3))
+  ) || {
+    printf 'delayed OTLP receiver did not cap discovery fetch by its deadline\n' >&2
+    return 1
+  }
+  [[ ! -e "$result_dir/discovery-deadline.json" &&
+    ! -e "$result_dir/discovery-deadline-early.json" &&
+    "$(<"$result_dir/discovery-deadline-unexpected.json")" == \
+      "$(<"$empty_fixture")" ]] || {
+    printf 'delayed OTLP receiver did not retain missing-export evidence\n' >&2
+    return 1
+  }
+
+  (
+    local -i fetch_calls=0
+
+    RESULT_DIR="$result_dir"
+    SECONDS=0
+    fetch_delayed_otlp_receiver_snapshot() {
+      ((fetch_calls += 1))
+      case "$fetch_calls" in
+        1) install -m 0644 "$sdk_fixture" "$1" ;;
+        2) install -m 0644 "$ready_fixture" "$1" ;;
+        *) return 1 ;;
+      esac
+    }
+    sleep() {
+      SECONDS="$((
+        SECONDS + simulated_phase_seconds +
+          DELAYED_OTLP_BOUNDARY_START_SLACK_SECONDS
+      ))"
+    }
+
+    wait_for_delayed_otlp_receiver_export \
+      "$result_dir/ready.json" "$simulated_phase_seconds" 101000 \
+      "$result_dir/early-success.json" "$result_dir/unexpected-success.json" \
+      "$simulated_phase_seconds"
+    [[ "$fetch_calls" == "2" ]]
+  ) || {
+    printf 'delayed OTLP receiver rejected a valid later OBI batch\n' >&2
     return 1
   }
   [[ "$(<"$result_dir/ready.json")" == "$(<"$ready_fixture")" &&
-    ! -e "$result_dir/early-success.json" ]] || {
+    ! -e "$result_dir/early-success.json" &&
+    ! -e "$result_dir/unexpected-success.json" ]] || {
     printf 'delayed OTLP receiver did not retain the deadline-ready snapshot\n' >&2
     return 1
   }
 
   if (
+    local -i fetch_calls=0
+
     RESULT_DIR="$result_dir"
-    fetch_delayed_otlp_receiver_snapshot() { return 23; }
+    SECONDS=0
+    fetch_delayed_otlp_receiver_snapshot() {
+      ((fetch_calls += 1))
+      case "$fetch_calls" in
+        1) install -m 0644 "$sdk_fixture" "$1" ;;
+        2) install -m 0644 "$early_fixture" "$1" ;;
+        *) return 1 ;;
+      esac
+    }
+    sleep() { SECONDS="$((SECONDS + simulated_phase_seconds))"; }
+    log_error() { :; }
 
     wait_for_delayed_otlp_receiver_export \
-      "$result_dir/fetch-failure.json" 1 101000 "$result_dir/fetch-early.json"
+      "$result_dir/ready-settlement-early.json" "$simulated_phase_seconds" 101000 \
+      "$result_dir/settlement-early.json" \
+      "$result_dir/unexpected-settlement-early.json" "$simulated_phase_seconds"
   ) >/dev/null 2>&1; then
-    printf 'delayed OTLP receiver ignored a snapshot fetch failure\n' >&2
+    printf 'delayed OTLP receiver accepted a later early SDK export\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "1" &&
+    ! -e "$result_dir/ready-settlement-early.json" &&
+    ! -e "$result_dir/unexpected-settlement-early.json" &&
+    "$(<"$result_dir/settlement-early.json")" == "$(<"$early_fixture")" ]] || {
+    printf 'delayed OTLP receiver did not retain settlement early evidence\n' >&2
+    return 1
+  }
+
+  if (
+    local -i fetch_calls=0
+
+    RESULT_DIR="$result_dir"
+    SECONDS=0
+    fetch_delayed_otlp_receiver_snapshot() {
+      ((fetch_calls += 1))
+      case "$fetch_calls" in
+        1) command cp -- "$sdk_fixture" "$1" ;;
+        2) command cp -- "$early_fixture" "$1" ;;
+        *) return 1 ;;
+      esac
+    }
+    sleep() { SECONDS="$((SECONDS + simulated_phase_seconds))"; }
+    install() {
+      [[ "$DELAYED_OTLP_RECEIVER_PUBLICATION_TEMP" == "$4" ]] || return 42
+      printf 'partial\n' >"$4"
+      return 43
+    }
+
+    wait_for_delayed_otlp_receiver_export \
+      "$result_dir/early-install-ready.json" "$simulated_phase_seconds" 101000 \
+      "$result_dir/early-install-failure.json" \
+      "$result_dir/early-install-unexpected.json" "$simulated_phase_seconds"
+  ) >/dev/null 2>&1; then
+    printf 'delayed OTLP receiver ignored settlement early publication failure\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "43" &&
+    ! -e "$result_dir/early-install-ready.json" &&
+    ! -e "$result_dir/early-install-failure.json" &&
+    ! -e "$result_dir/early-install-unexpected.json" &&
+    -z "$(find "$result_dir" -maxdepth 1 \
+      -name '.early-install-failure.json.*' -print -quit)" ]] || return 1
+
+  if (
+    local -i fetch_calls=0
+
+    RESULT_DIR="$result_dir"
+    SECONDS=0
+    fetch_delayed_otlp_receiver_snapshot() {
+      ((fetch_calls += 1))
+      case "$fetch_calls" in
+        1) install -m 0644 "$sdk_fixture" "$1" ;;
+        2) install -m 0644 "$unexpected_fixture" "$1" ;;
+        *) return 1 ;;
+      esac
+    }
+    sleep() { SECONDS="$((SECONDS + simulated_phase_seconds))"; }
+    log_error() { :; }
+
+    wait_for_delayed_otlp_receiver_export \
+      "$result_dir/ready-unexpected.json" "$simulated_phase_seconds" 101000 \
+      "$result_dir/early-unexpected.json" "$result_dir/unexpected.json" \
+      "$simulated_phase_seconds"
+  ) >/dev/null 2>&1; then
+    printf 'delayed OTLP receiver accepted a post-boundary OBI span\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "1" && ! -e "$result_dir/ready-unexpected.json" &&
+    ! -e "$result_dir/early-unexpected.json" &&
+    "$(<"$result_dir/unexpected.json")" == "$(<"$unexpected_fixture")" ]] || {
+    printf 'delayed OTLP receiver did not retain the unexpected span evidence\n' >&2
+    return 1
+  }
+
+  for metadata_name in ambiguous dropped omitted; do
+    case "$metadata_name" in
+      ambiguous) metadata_fixture="$duplicate_fixture" ;;
+      dropped) metadata_fixture="$dropped_receiver_fixture" ;;
+      omitted) metadata_fixture="$omitted_receiver_fixture" ;;
+      *) return 1 ;;
+    esac
+    failure_status=0
+    if (
+      local -i fetch_calls=0
+
+      RESULT_DIR="$result_dir"
+      SECONDS=0
+      fetch_delayed_otlp_receiver_snapshot() {
+        ((fetch_calls += 1))
+        case "$fetch_calls" in
+          1) install -m 0644 "$sdk_fixture" "$1" ;;
+          2) install -m 0644 "$metadata_fixture" "$1" ;;
+          *) return 1 ;;
+        esac
+      }
+      sleep() { SECONDS="$((SECONDS + simulated_phase_seconds))"; }
+      log_error() { :; }
+
+      wait_for_delayed_otlp_receiver_export \
+        "$result_dir/ready-$metadata_name.json" \
+        "$simulated_phase_seconds" 101000 \
+        "$result_dir/early-$metadata_name.json" \
+        "$result_dir/$metadata_name.json" "$simulated_phase_seconds"
+    ) >/dev/null 2>&1; then
+      printf 'delayed OTLP receiver accepted %s receiver metadata\n' \
+        "$metadata_name" >&2
+      return 1
+    else
+      failure_status=$?
+    fi
+    [[ "$failure_status" == "1" &&
+      ! -e "$result_dir/ready-$metadata_name.json" &&
+      ! -e "$result_dir/early-$metadata_name.json" &&
+      "$(<"$result_dir/$metadata_name.json")" == \
+        "$(<"$metadata_fixture")" ]] || {
+      printf 'delayed OTLP receiver did not retain %s metadata evidence\n' \
+        "$metadata_name" >&2
+      return 1
+    }
+  done
+
+  if (
+    local -i fetch_calls=0
+
+    RESULT_DIR="$result_dir"
+    SECONDS=0
+    fetch_delayed_otlp_receiver_snapshot() {
+      ((fetch_calls += 1))
+      case "$fetch_calls" in
+        1) install -m 0644 "$advanced_sdk_fixture" "$1" ;;
+        2) install -m 0644 "$counter_regression_fixture" "$1" ;;
+        *) return 1 ;;
+      esac
+    }
+    sleep() { SECONDS="$((SECONDS + simulated_phase_seconds))"; }
+    log_error() { :; }
+
+    wait_for_delayed_otlp_receiver_export \
+      "$result_dir/ready-counter-regression.json" "$simulated_phase_seconds" 101000 \
+      "$result_dir/early-counter-regression.json" \
+      "$result_dir/counter-regression.json" "$simulated_phase_seconds"
+  ) >/dev/null 2>&1; then
+    printf 'delayed OTLP receiver accepted decreasing cumulative counters\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "1" &&
+    ! -e "$result_dir/ready-counter-regression.json" &&
+    ! -e "$result_dir/early-counter-regression.json" &&
+    "$(<"$result_dir/counter-regression.json")" == \
+      "$(<"$counter_regression_fixture")" ]] || return 1
+
+  if (
+    local -i fetch_calls=0
+
+    RESULT_DIR="$result_dir"
+    SECONDS=0
+    fetch_delayed_otlp_receiver_snapshot() {
+      ((fetch_calls += 1))
+      case "$fetch_calls" in
+        1) install -m 0644 "$ready_fixture" "$1" ;;
+        2) install -m 0644 "$dropped_obi_fixture" "$1" ;;
+        *) return 1 ;;
+      esac
+    }
+    sleep() { SECONDS="$((SECONDS + simulated_phase_seconds))"; }
+    log_error() { :; }
+
+    wait_for_delayed_otlp_receiver_export \
+      "$result_dir/ready-dropped-obi.json" "$simulated_phase_seconds" 101000 \
+      "$result_dir/early-dropped-obi.json" "$result_dir/dropped-obi.json" \
+      "$simulated_phase_seconds"
+  ) >/dev/null 2>&1; then
+    printf 'delayed OTLP receiver accepted a disappearing startup OBI span\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "1" && ! -e "$result_dir/ready-dropped-obi.json" &&
+    ! -e "$result_dir/early-dropped-obi.json" &&
+    "$(<"$result_dir/dropped-obi.json")" == "$(<"$dropped_obi_fixture")" ]] || {
+    printf 'delayed OTLP receiver did not retain cumulative regression evidence\n' >&2
+    return 1
+  }
+
+  if (
+    local -i fetch_calls=0
+
+    RESULT_DIR="$result_dir"
+    SECONDS=0
+    fetch_delayed_otlp_receiver_snapshot() {
+      ((fetch_calls += 1))
+      case "$fetch_calls" in
+        1) command cp -- "$sdk_fixture" "$1" ;;
+        2) command cp -- "$unexpected_fixture" "$1" ;;
+        *) return 1 ;;
+      esac
+    }
+    sleep() { SECONDS="$((SECONDS + simulated_phase_seconds))"; }
+    install() {
+      [[ "$DELAYED_OTLP_RECEIVER_PUBLICATION_TEMP" == "$4" ]] || return 28
+      printf 'partial\n' >"$4"
+      return 29
+    }
+
+    wait_for_delayed_otlp_receiver_export \
+      "$result_dir/unexpected-install-ready.json" "$simulated_phase_seconds" 101000 \
+      "$result_dir/unexpected-install-early.json" \
+      "$result_dir/unexpected-install.json" "$simulated_phase_seconds"
+  ) >/dev/null 2>&1; then
+    printf 'delayed OTLP receiver ignored an unexpected-evidence publication failure\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "29" &&
+    ! -e "$result_dir/unexpected-install-ready.json" &&
+    ! -e "$result_dir/unexpected-install-early.json" &&
+    ! -e "$result_dir/unexpected-install.json" &&
+    -z "$(find "$result_dir" -maxdepth 1 \
+      -name '.unexpected-install.json.*' -print -quit)" ]] || {
+    printf 'delayed OTLP receiver did not fail closed on unexpected-evidence publication\n' >&2
+    return 1
+  }
+
+  if (
+    local -i fetch_calls=0
+
+    RESULT_DIR="$result_dir"
+    SECONDS=0
+    fetch_delayed_otlp_receiver_snapshot() {
+      ((fetch_calls += 1))
+      case "$fetch_calls" in
+        1) install -m 0644 "$sdk_fixture" "$1" ;;
+        *) return 23 ;;
+      esac
+    }
+    sleep() { SECONDS="$((SECONDS + simulated_phase_seconds))"; }
+
+    wait_for_delayed_otlp_receiver_export \
+      "$result_dir/fetch-failure.json" "$simulated_phase_seconds" 101000 \
+      "$result_dir/fetch-early.json" "$result_dir/fetch-unexpected.json" \
+      "$simulated_phase_seconds"
+  ) >/dev/null 2>&1; then
+    printf 'delayed OTLP receiver ignored a settlement snapshot fetch failure\n' >&2
     return 1
   else
     failure_status=$?
   fi
   [[ "$failure_status" == "23" && ! -e "$result_dir/fetch-failure.json" &&
-    ! -e "$result_dir/fetch-early.json" ]] || {
-    printf 'delayed OTLP receiver did not fail closed on a snapshot fetch gap\n' >&2
+    ! -e "$result_dir/fetch-early.json" &&
+    ! -e "$result_dir/fetch-unexpected.json" ]] || {
+    printf 'delayed OTLP receiver did not fail closed on a settlement snapshot gap\n' >&2
+    return 1
+  }
+
+  if (
+    RESULT_DIR="$result_dir"
+    SECONDS=0
+    fetch_delayed_otlp_receiver_snapshot() {
+      command cp -- "$sdk_fixture" "$1"
+    }
+    sleep() { SECONDS="$((SECONDS + simulated_phase_seconds))"; }
+    install() {
+      [[ "$DELAYED_OTLP_RECEIVER_PUBLICATION_TEMP" == "$4" ]] || return 30
+      printf 'partial\n' >"$4"
+      return 31
+    }
+
+    wait_for_delayed_otlp_receiver_export \
+      "$result_dir/final-install-failure.json" "$simulated_phase_seconds" 101000 \
+      "$result_dir/final-install-early.json" \
+      "$result_dir/final-install-unexpected.json" "$simulated_phase_seconds"
+  ) >/dev/null 2>&1; then
+    printf 'delayed OTLP receiver ignored final evidence publication failure\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "31" &&
+    ! -e "$result_dir/final-install-failure.json" &&
+    ! -e "$result_dir/final-install-early.json" &&
+    ! -e "$result_dir/final-install-unexpected.json" &&
+    -z "$(find "$result_dir" -maxdepth 1 \
+      -name '.final-install-failure.json.*' -print -quit)" ]] || {
+    printf 'delayed OTLP receiver did not fail closed on final evidence publication\n' >&2
+    return 1
+  }
+
+  printf 'existing\n' >"$result_dir/final-move-failure.json"
+  if (
+    mv() {
+      [[ "$DELAYED_OTLP_RECEIVER_PUBLICATION_TEMP" == "$3" ]] || return 40
+      return 41
+    }
+
+    publish_delayed_otlp_receiver_snapshot \
+      "$sdk_fixture" "$result_dir/final-move-failure.json"
+  ) >/dev/null 2>&1; then
+    printf 'delayed OTLP receiver ignored final evidence move failure\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "41" &&
+    "$(<"$result_dir/final-move-failure.json")" == "existing" &&
+    -z "$(find "$result_dir" -maxdepth 1 \
+      -name '.final-move-failure.json.*' -print -quit)" ]] || {
+    printf 'delayed OTLP receiver did not preserve atomic output on move failure\n' >&2
+    return 1
+  }
+
+  if (
+    RESULT_DIR="$result_dir"
+    SECONDS=0
+    fetch_delayed_otlp_receiver_snapshot() {
+      install -m 0644 "$sdk_fixture" "$1"
+    }
+    sleep() { return 37; }
+
+    wait_for_delayed_otlp_receiver_export \
+      "$result_dir/settle-sleep-failure.json" "$simulated_phase_seconds" 101000 \
+      "$result_dir/settle-sleep-early.json" \
+      "$result_dir/settle-sleep-unexpected.json" "$simulated_phase_seconds"
+  ) >/dev/null 2>&1; then
+    printf 'delayed OTLP receiver ignored settlement sleep failure\n' >&2
+    return 1
+  else
+    failure_status=$?
+  fi
+  [[ "$failure_status" == "37" &&
+    ! -e "$result_dir/settle-sleep-failure.json" &&
+    ! -e "$result_dir/settle-sleep-early.json" &&
+    ! -e "$result_dir/settle-sleep-unexpected.json" ]] || {
+    printf 'delayed OTLP receiver did not preserve settlement sleep failure\n' >&2
     return 1
   }
 }
@@ -3568,6 +5037,9 @@ test_delayed_otlp_suppression_control_has_one_pre_export_request() {
     DELAYED_OTLP_PROVIDER_READY_SINCE="provider-cursor"
     delayed_otlp_earliest_export_millisecond() {
       printf '900000\n'
+    }
+    delayed_otlp_run_nonce() {
+      printf '00000000000000000000000000000003\n'
     }
     assert_delayed_otlp_receiver_empty() {
       case "$receiver_empty_calls" in
@@ -3632,7 +5104,9 @@ test_delayed_otlp_suppression_control_has_one_pre_export_request() {
       [[ "$request_calls" == "1" && "$absence_calls" == "2" &&
         "$receiver_empty_calls" == "1" && "$2" == \
           "$DELAYED_OTLP_SUPPRESSION_TIMEOUT_SECONDS" && "$3" == "900000" &&
-        "${4##*/}" == "delayed-otlp-receiver-early.json" ]] || return 1
+        "${4##*/}" == "delayed-otlp-receiver-early.json" &&
+        "${5##*/}" == "delayed-otlp-receiver-unexpected.json" &&
+        "$6" == "$DELAYED_OTLP_POST_EXPORT_SETTLE_SECONDS" ]] || return 1
       printf 'receiver-ready:%s\n' "${1##*/}" >>"$observed"
     }
     wait_for_java_duplicate_suppression_without_prime() {
@@ -3678,8 +5152,8 @@ test_delayed_otlp_suppression_control_has_one_pre_export_request() {
     "sleep:$DELAYED_OTLP_PRE_EXPORT_WAIT_SECONDS" \
     'receiver-no-java:delayed-otlp-receiver-before-export.json' \
     'absent:duplicate-suppression-delayed-otlp-before-export.prom' \
-    'receiver-ready:delayed-otlp-receiver-ready.json' \
     'ready:duplicate-suppression-delayed-otlp-ready.prom' \
+    'receiver-ready:delayed-otlp-receiver-ready.json' \
     'transport' \
     'runtime' \
     'scenario:basic:delayed-otlp-suppression' >"$expected"
@@ -3703,13 +5177,18 @@ test_delayed_otlp_suppression_control_restores_schedule_delay() {
     SCENARIO_VARIANT=""
     DELAYED_OTLP_PROVIDER_READY_SINCE="provider-cursor"
     export OTEL_BSP_SCHEDULE_DELAY_VALUE=750
+    export OTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED_VALUE=false
     delayed_otlp_earliest_export_millisecond() {
       printf '900000\n'
     }
+    delayed_otlp_run_nonce() {
+      printf '00000000000000000000000000000004\n'
+    }
     recreate_instrumented_stack() {
-      printf 'recreate:%s:%s:%s:%s:%s:%s\n' \
+      printf 'recreate:%s:%s:%s:%s:%s:%s:%s\n' \
         "$1" "$2" "${3:-}" "${4:-}" "${5:-}" \
-        "$OTEL_BSP_SCHEDULE_DELAY_VALUE" >>"$observed"
+        "$OTEL_BSP_SCHEDULE_DELAY_VALUE" \
+        "$OTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED_VALUE" >>"$observed"
     }
     assert_delayed_otlp_receiver_empty() {
       printf 'receiver-empty:%s\n' "${1##*/}" >>"$observed"
@@ -3742,7 +5221,9 @@ test_delayed_otlp_suppression_control_restores_schedule_delay() {
     wait_for_delayed_otlp_receiver_export() {
       [[ "$2" == "$DELAYED_OTLP_SUPPRESSION_TIMEOUT_SECONDS" &&
         "$3" == "900000" &&
-        "${4##*/}" == "delayed-otlp-receiver-early.json" ]] || return 1
+        "${4##*/}" == "delayed-otlp-receiver-early.json" &&
+        "${5##*/}" == "delayed-otlp-receiver-unexpected.json" &&
+        "$6" == "$DELAYED_OTLP_POST_EXPORT_SETTLE_SECONDS" ]] || return 1
       printf 'receiver-ready:%s\n' "${1##*/}" >>"$observed"
     }
     wait_for_java_duplicate_suppression_without_prime() {
@@ -3762,14 +5243,16 @@ test_delayed_otlp_suppression_control_restores_schedule_delay() {
     }
 
     run_delayed_otlp_suppression_control
-    [[ "$OTEL_BSP_SCHEDULE_DELAY_VALUE" == "750" && -z "$SCENARIO_VARIANT" ]]
+    [[ "$OTEL_BSP_SCHEDULE_DELAY_VALUE" == "750" &&
+      "$OTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED_VALUE" == "false" &&
+      -z "$SCENARIO_VARIANT" ]]
   ) || {
     printf 'delayed OTLP suppression did not restore the prior schedule delay\n' >&2
     return 1
   }
 
   printf '%s\n' \
-    "recreate:tcp:delayed-otlp-suppression startup:getsockopt:false:true:$DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS" \
+    "recreate:tcp:delayed-otlp-suppression startup:getsockopt:false:true:$DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS:true" \
     'receiver-empty:delayed-otlp-receiver-before-request.json' \
     'absent:duplicate-suppression-delayed-otlp-before-request.prom' \
     "sleep:$JAVA_PROVIDER_RETRY_SETTLE_SECONDS" \
@@ -3779,12 +5262,12 @@ test_delayed_otlp_suppression_control_restores_schedule_delay() {
     "sleep:$DELAYED_OTLP_PRE_EXPORT_WAIT_SECONDS" \
     'receiver-no-java:delayed-otlp-receiver-before-export.json' \
     'absent:duplicate-suppression-delayed-otlp-before-export.prom' \
-    'receiver-ready:delayed-otlp-receiver-ready.json' \
     'ready:duplicate-suppression-delayed-otlp-ready.prom' \
+    'receiver-ready:delayed-otlp-receiver-ready.json' \
     'transport' \
     'runtime' \
     'scenario' \
-    'recreate:tcp:post-delayed-otlp suppression restoration::::750' >"$expected"
+    'recreate:tcp:post-delayed-otlp suppression restoration::::750:false' >"$expected"
   cmp -s -- "$expected" "$observed" || {
     printf 'delayed OTLP schedule-delay restoration changed:\n' >&2
     diff -u -- "$expected" "$observed" >&2 || true
@@ -3805,11 +5288,14 @@ test_delayed_otlp_suppression_recovers_after_startup_failure() {
     SCENARIO=all
     TRANSPORT=getsockopt
     export OTEL_BSP_SCHEDULE_DELAY_VALUE=750
+    export OTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED_VALUE=false
     recreate_instrumented_stack() {
       ((recreate_calls += 1))
-      printf 'recreate:%s:%s:%s:%s:%s\n' \
+      printf 'recreate:%s:%s:%s:%s:%s:%s\n' \
         "$2" "${4:-true}" "${5:-false}" \
-        "$OTEL_BSP_SCHEDULE_DELAY_VALUE" "$recreate_calls" >>"$observed"
+        "$OTEL_BSP_SCHEDULE_DELAY_VALUE" \
+        "$OTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED_VALUE" \
+        "$recreate_calls" >>"$observed"
       if [[ "$recreate_calls" == "1" ]]; then
         return 47
       fi
@@ -3827,7 +5313,7 @@ test_delayed_otlp_suppression_recovers_after_startup_failure() {
     failure_status=$?
   fi
   [[ "$failure_status" == "47" &&
-    "$(<"$observed")" == $"recreate:delayed-otlp-suppression startup:false:true:$DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS:1"$'\nrecreate:post-delayed-otlp suppression recovery:true:false:750:2' ]] || {
+    "$(<"$observed")" == $"recreate:delayed-otlp-suppression startup:false:true:$DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS:true:1"$'\nrecreate:post-delayed-otlp suppression recovery:true:false:750:false:2' ]] || {
     printf 'delayed OTLP startup failure did not restore the standard stack\n' >&2
     return 1
   }
@@ -9543,7 +11029,7 @@ test_helper_attach_runtime_requires_exact_dynamic_disable() {
   )
 }
 
-test_delayed_otlp_runtime_requires_exact_export_delay() {
+test_delayed_otlp_runtime_requires_bounded_export_contract() {
   local -r result_dir="$TEST_TMP_DIR/delayed-otlp-runtime"
   local runtime_environment=""
 
@@ -9582,7 +11068,8 @@ test_delayed_otlp_runtime_requires_exact_export_delay() {
       'JAVA_TOOL_OPTIONS=-javaagent:/otel/official-javaagent.jar' \
       'OTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar' \
       'OTEL_OBI_REMOTE_PARENT_ENABLED=true' \
-      "OTEL_BSP_SCHEDULE_DELAY=$DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS")"
+      "OTEL_BSP_SCHEDULE_DELAY=$DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS" \
+      'OTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED=true')"
     assert_runtime_contract delayed-otlp-suppression true || {
       printf 'delayed OTLP runtime rejected the exact export delay\n' >&2
       return 1
@@ -9593,12 +11080,15 @@ test_delayed_otlp_runtime_requires_exact_export_delay() {
     }
     grep -Fqx 'status=passed' \
       "$result_dir/runtime-assertions-delayed-otlp-suppression.txt"
+    grep -Fqx 'java_otlp_retry=disabled' \
+      "$result_dir/runtime-assertions-delayed-otlp-suppression.txt"
 
     for runtime_environment in \
       $'JAVA_TOOL_OPTIONS=-javaagent:/otel/official-javaagent.jar\nOTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar\nOTEL_OBI_REMOTE_PARENT_ENABLED=true' \
-      $'JAVA_TOOL_OPTIONS=-javaagent:/otel/official-javaagent.jar\nOTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar\nOTEL_OBI_REMOTE_PARENT_ENABLED=true\nOTEL_BSP_SCHEDULE_DELAY=100'; do
+      $'JAVA_TOOL_OPTIONS=-javaagent:/otel/official-javaagent.jar\nOTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar\nOTEL_OBI_REMOTE_PARENT_ENABLED=true\nOTEL_BSP_SCHEDULE_DELAY=100\nOTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED=true' \
+      $'JAVA_TOOL_OPTIONS=-javaagent:/otel/official-javaagent.jar\nOTEL_JAVAAGENT_EXTENSIONS=/otel/obi-otel-extension.jar\nOTEL_OBI_REMOTE_PARENT_ENABLED=true\nOTEL_BSP_SCHEDULE_DELAY=60000\nOTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED=false'; do
       if assert_runtime_contract delayed-otlp-suppression true >/dev/null 2>&1; then
-        printf 'delayed OTLP runtime accepted a missing or incorrect export delay\n' >&2
+        printf 'delayed OTLP runtime accepted an unbounded Java export contract\n' >&2
         return 1
       fi
     done
@@ -14106,6 +15596,7 @@ main() {
   test_project_name_validation
   test_compose_cleanup_requires_ownership_sentinel
   test_successful_cleanup_invalidates_current_transport_before_down
+  test_delayed_otlp_temporary_cleanup_preserves_failure
   test_cleanup_refuses_down_when_transport_invalidation_fails
   test_cleanup_failure_changes_successful_run_status
   test_primary_fault_recovery_marker_forces_cleanup_with_keep
@@ -14167,6 +15658,10 @@ main() {
   test_duplicate_suppression_wait_primes_java_export
   test_duplicate_suppression_absence_requires_a_clean_metric_snapshot
   test_delayed_otlp_window_requires_a_fresh_generation
+  test_delayed_otlp_settlement_covers_pinned_obi_delivery_bound
+  test_delayed_otlp_snapshot_fetch_wrapper_is_exact_and_bounded
+  test_delayed_otlp_run_identity_and_receiver_continuity
+  test_delayed_otlp_pre_export_evidence_is_atomic
   test_delayed_otlp_receiver_snapshots_prove_export_boundary
   test_delayed_otlp_receiver_wait_enforces_export_deadline
   test_delayed_otlp_suppression_control_has_one_pre_export_request
@@ -14260,7 +15755,7 @@ main() {
   test_extension_disabled_runtime_requires_explicit_false
   test_disabled_runtime_requires_explicit_transport_disable
   test_helper_attach_runtime_requires_exact_dynamic_disable
-  test_delayed_otlp_runtime_requires_exact_export_delay
+  test_delayed_otlp_runtime_requires_bounded_export_contract
   test_start_stack_invalidates_project_evidence_before_compose_up
   test_primary_w3c_fault_startup_uses_normal_runtime_contract
   test_instrumented_readiness_precedes_https_traffic
@@ -14320,4 +15815,6 @@ main() {
   printf 'demo harness tests passed\n'
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

@@ -8,6 +8,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd -P)"
 SCRIPT_NAME="$(basename -- "${BASH_SOURCE[0]}")"
 MAX_SHELL_INTEGER="9223372036854775807"
+MAX_JSON_SAFE_INTEGER="9007199254740991"
 MAX_UINT32_DECIMAL="4294967295"
 MAX_UINT64_DECIMAL="18446744073709551615"
 JAVA_DIAGNOSTIC_COUNTER_MAX="999999999"
@@ -21,7 +22,23 @@ DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS="$((DELAYED_OTLP_SCHEDULE_DELAY_SECONDS
 DELAYED_OTLP_PRE_EXPORT_WAIT_SECONDS=5
 DELAYED_OTLP_PRE_EXPORT_SAFETY_SECONDS=1
 DELAYED_OTLP_SUPPRESSION_TIMEOUT_SECONDS=70
-DELAYED_OTLP_PRIME_MARKER="delayed-otlp-suppression-prime"
+DELAYED_OTLP_OBI_BATCH_TIMEOUT_SECONDS=15
+DELAYED_OTLP_OBI_RETRY_MAX_ELAPSED_SECONDS=2
+DELAYED_OTLP_OBI_EXPORT_TIMEOUT_SECONDS=5
+DELAYED_OTLP_JAVA_RETRY_DISABLED=true
+DELAYED_OTLP_CLOCK_QUANTIZATION_SECONDS=1
+DELAYED_OTLP_BOUNDARY_POLL_SECONDS=1
+DELAYED_OTLP_BOUNDARY_START_SLACK_SECONDS=1
+DELAYED_OTLP_FETCH_KILL_GRACE_SECONDS=1
+DELAYED_OTLP_NONCE_TIMEOUT_SECONDS=5
+DELAYED_OTLP_POST_EXPORT_SETTLE_SECONDS="$((
+  DELAYED_OTLP_OBI_BATCH_TIMEOUT_SECONDS +
+    DELAYED_OTLP_OBI_RETRY_MAX_ELAPSED_SECONDS +
+    DELAYED_OTLP_OBI_EXPORT_TIMEOUT_SECONDS +
+    DELAYED_OTLP_CLOCK_QUANTIZATION_SECONDS
+))"
+DELAYED_OTLP_PRIME_MARKER_PREFIX="delayed-otlp-suppression-prime"
+DELAYED_OTLP_PRIME_MARKER="$DELAYED_OTLP_PRIME_MARKER_PREFIX"
 DELAYED_OTLP_JAVA_SERVER_SCOPE="io.opentelemetry.jetty-11.0"
 HELPER_ATTACH_FAILURE_JAVA_TOOL_OPTIONS="-javaagent:/otel/official-javaagent.jar -XX:-EnableDynamicAgentLoading"
 TRANSPORT_CONFIGURATION_MAX_BYTES=256
@@ -97,7 +114,8 @@ RESTART_RELEASE_OBI_READY="obi-ready"
 PRIMARY_FAULT_PRELOAD="/otel/libobi-java-remote-parent-fault.so"
 PRIMARY_FAULT_CONTROL_DIRECTORY="/run/obi-demo/fault"
 PRIMARY_FAULT_CONTROL_FILE="$PRIMARY_FAULT_CONTROL_DIRECTORY/java-remote-parent.mode"
-readonly SCRIPT_DIR REPO_ROOT SCRIPT_NAME MAX_SHELL_INTEGER MAX_UINT32_DECIMAL
+readonly SCRIPT_DIR REPO_ROOT SCRIPT_NAME MAX_SHELL_INTEGER MAX_JSON_SAFE_INTEGER
+readonly MAX_UINT32_DECIMAL
 readonly MAX_UINT64_DECIMAL JAVA_DIAGNOSTIC_COUNTER_MAX
 readonly BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS SCENARIO_RUN_TIMEOUT_SECONDS
 readonly JAVA_PROVIDER_RETRY_SETTLE_SECONDS
@@ -108,7 +126,17 @@ readonly DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS
 readonly DELAYED_OTLP_PRE_EXPORT_WAIT_SECONDS
 readonly DELAYED_OTLP_PRE_EXPORT_SAFETY_SECONDS
 readonly DELAYED_OTLP_SUPPRESSION_TIMEOUT_SECONDS
-readonly DELAYED_OTLP_PRIME_MARKER
+readonly DELAYED_OTLP_OBI_BATCH_TIMEOUT_SECONDS
+readonly DELAYED_OTLP_OBI_RETRY_MAX_ELAPSED_SECONDS
+readonly DELAYED_OTLP_OBI_EXPORT_TIMEOUT_SECONDS
+readonly DELAYED_OTLP_JAVA_RETRY_DISABLED
+readonly DELAYED_OTLP_CLOCK_QUANTIZATION_SECONDS
+readonly DELAYED_OTLP_BOUNDARY_POLL_SECONDS
+readonly DELAYED_OTLP_BOUNDARY_START_SLACK_SECONDS
+readonly DELAYED_OTLP_FETCH_KILL_GRACE_SECONDS
+readonly DELAYED_OTLP_NONCE_TIMEOUT_SECONDS
+readonly DELAYED_OTLP_POST_EXPORT_SETTLE_SECONDS
+readonly DELAYED_OTLP_PRIME_MARKER_PREFIX
 readonly DELAYED_OTLP_JAVA_SERVER_SCOPE
 readonly HELPER_ATTACH_FAILURE_JAVA_TOOL_OPTIONS
 readonly TRANSPORT_CONFIGURATION_MAX_BYTES
@@ -243,6 +271,11 @@ W3C_FAULT_DIAGNOSTICS_PREVIOUS=""
 MATCHING_VALID_TAKES=1
 SCENARIO_VARIANT=""
 DELAYED_OTLP_PROVIDER_READY_SINCE=""
+DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP=""
+DELAYED_OTLP_RECEIVER_PUBLICATION_TEMP=""
+# Base64 keeps the receiver's JSON string opaque and safe for shell comparison.
+DELAYED_OTLP_RECEIVER_INSTANCE_ID_BASE64=""
+DELAYED_OTLP_RECEIVER_RESET_GENERATION=""
 SECURITY_PROBE_MODE="abuse"
 SECURITY_PROBE_TIMEOUT="60s"
 PRIMARY_SECURITY_SAME_CGROUP_TIMEOUT="60s"
@@ -960,6 +993,18 @@ cleanup() {
 
   if [[ "$PRESSURE_ACTIVE" == "true" ]]; then
     cleanup_map_pressure_with_retries || true
+  fi
+  if cleanup_delayed_otlp_receiver_temporaries; then
+    :
+  else
+    cleanup_status=$?
+    log_error "could not remove delayed OTLP receiver temporary evidence"
+    if ((final_status == 0)); then
+      final_status="$cleanup_status"
+      record_failure \
+        "temporary-cleanup" 0 "$cleanup_status" \
+        "cleanup_delayed_otlp_receiver_temporaries"
+    fi
   fi
   cleanup_security_processes
   if [[ -n "${RESULT_DIR:-}" && -d "$RESULT_DIR" ]]; then
@@ -2109,8 +2154,10 @@ export_compose_environment() {
     export OTEL_JAVAAGENT_EXTENSIONS_VALUE="/otel/obi-otel-extension.jar"
     export OTEL_PROPAGATORS_VALUE="obi,tracecontext,baggage"
   fi
+  export OTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED_VALUE=false
   if [[ "$SCENARIO" == "delayed-otlp-suppression" ]]; then
     export OTEL_BSP_SCHEDULE_DELAY_VALUE="$DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS"
+    export OTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED_VALUE="$DELAYED_OTLP_JAVA_RETRY_DISABLED"
   fi
 }
 
@@ -2863,6 +2910,7 @@ assert_runtime_contract() {
   local obi_environment=""
   local bridge_transport_count=""
   local java_agent="absent"
+  local java_otlp_retry="not-configured"
   local dynamic_agent_loading="not-configured"
   local extension="absent"
   local bridge_transport="not-applicable"
@@ -2908,6 +2956,19 @@ assert_runtime_contract() {
     "$java_environment" \
     "OTEL_BSP_SCHEDULE_DELAY=$DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS"; then
     log_error "delayed OTLP control did not configure the expected Java export delay"
+    return 1
+  fi
+  if environment_has_line \
+    "$java_environment" \
+    "OTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED=true"; then
+    java_otlp_retry="disabled"
+  elif environment_has_line \
+    "$java_environment" \
+    "OTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED=false"; then
+    java_otlp_retry="enabled"
+  fi
+  if [[ "$mode" == "delayed-otlp-suppression" && "$java_otlp_retry" != "disabled" ]]; then
+    log_error "delayed OTLP control did not disable Java OTLP retries"
     return 1
   fi
 
@@ -3060,6 +3121,7 @@ assert_runtime_contract() {
     printf 'status=passed\n'
     printf 'java_container=%s\n' "$java_container"
     printf 'java_agent=%s\n' "$java_agent"
+    printf 'java_otlp_retry=%s\n' "$java_otlp_retry"
     printf 'dynamic_agent_loading=%s\n' "$dynamic_agent_loading"
     printf 'extension=%s\n' "$extension"
     printf 'obi_container=%s\n' "${obi_container:-absent}"
@@ -3154,18 +3216,285 @@ assert_java_duplicate_suppression_absent() {
   rm -f -- "$metrics" || return $?
 }
 
+delayed_otlp_run_nonce() {
+  local nonce=""
+
+  nonce="$(run_bounded "$DELAYED_OTLP_NONCE_TIMEOUT_SECONDS" openssl rand -hex 16)" ||
+    return $?
+  [[ "$nonce" =~ ^[[:xdigit:]]{32}$ ]] || return 1
+  printf '%s\n' "${nonce,,}"
+}
+
+initialize_delayed_otlp_run_identity() {
+  local nonce=""
+  local marker=""
+
+  nonce="$(delayed_otlp_run_nonce)" || return $?
+  [[ "$nonce" =~ ^[0-9a-f]{32}$ ]] || return 1
+  marker="$DELAYED_OTLP_PRIME_MARKER_PREFIX-$nonce"
+  ((${#marker} <= 128)) || return 1
+
+  DELAYED_OTLP_PRIME_MARKER="$marker"
+  DELAYED_OTLP_RECEIVER_INSTANCE_ID_BASE64=""
+  DELAYED_OTLP_RECEIVER_RESET_GENERATION=""
+}
+
+delayed_otlp_receiver_snapshot_is_single_object() {
+  local -r snapshot="$1"
+
+  jq -e -s 'length == 1 and (.[0] | type == "object")' \
+    "$snapshot" >/dev/null
+}
+
+delayed_otlp_receiver_snapshot_continuity() {
+  local -r snapshot="$1"
+
+  delayed_otlp_receiver_snapshot_is_single_object "$snapshot" || return $?
+  jq -er --argjson maximum "$MAX_JSON_SAFE_INTEGER" '
+    if
+      (.receiver_instance_id | type == "string") and
+      ((.receiver_instance_id | length) >= 1) and
+      (.reset_generation | type == "number") and
+      .reset_generation >= 0 and
+      .reset_generation <= $maximum and
+      .reset_generation == (.reset_generation | floor)
+    then
+      [(.receiver_instance_id | @base64),
+        (.reset_generation | floor | tostring)] | @tsv
+    else
+      error("invalid receiver continuity")
+    end
+  ' "$snapshot"
+}
+
+capture_delayed_otlp_receiver_continuity() {
+  local -r snapshot="$1"
+  local continuity=""
+  local receiver_instance_id=""
+  local reset_generation=""
+  local extra=""
+
+  [[ -z "$DELAYED_OTLP_RECEIVER_INSTANCE_ID_BASE64" &&
+    -z "$DELAYED_OTLP_RECEIVER_RESET_GENERATION" ]] || return 1
+  continuity="$(delayed_otlp_receiver_snapshot_continuity "$snapshot")" || return $?
+  IFS=$'\t' read -r receiver_instance_id reset_generation extra <<<"$continuity" ||
+    return $?
+  [[ -n "$receiver_instance_id" && -n "$reset_generation" && -z "$extra" ]] ||
+    return 1
+
+  DELAYED_OTLP_RECEIVER_INSTANCE_ID_BASE64="$receiver_instance_id"
+  DELAYED_OTLP_RECEIVER_RESET_GENERATION="$reset_generation"
+}
+
+delayed_otlp_receiver_snapshot_has_expected_continuity() {
+  local -r snapshot="$1"
+  local continuity=""
+  local receiver_instance_id=""
+  local reset_generation=""
+  local extra=""
+
+  [[ -n "$DELAYED_OTLP_RECEIVER_INSTANCE_ID_BASE64" &&
+    -n "$DELAYED_OTLP_RECEIVER_RESET_GENERATION" ]] || return 1
+  continuity="$(delayed_otlp_receiver_snapshot_continuity "$snapshot")" || return $?
+  IFS=$'\t' read -r receiver_instance_id reset_generation extra <<<"$continuity" ||
+    return $?
+  [[ -z "$extra" &&
+    "$receiver_instance_id" == "$DELAYED_OTLP_RECEIVER_INSTANCE_ID_BASE64" &&
+    "$reset_generation" == "$DELAYED_OTLP_RECEIVER_RESET_GENERATION" ]]
+}
+
 fetch_delayed_otlp_receiver_snapshot() {
   local -r output="$1"
+  local -r timeout_seconds="${2:-10}"
 
-  run_bounded 10 curl --fail --silent --show-error \
+  [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || return 1
+  timeout --signal=TERM \
+    --kill-after="${DELAYED_OTLP_FETCH_KILL_GRACE_SECONDS}s" \
+    "${timeout_seconds}s" curl --fail --silent --show-error \
     --get --data-urlencode "marker=$DELAYED_OTLP_PRIME_MARKER" \
     --output "$output" \
     "http://127.0.0.1:14318/snapshot"
 }
 
+create_delayed_otlp_receiver_snapshot_temp() {
+  local -r template="$1"
+  local status=0
+
+  [[ -n "$template" && -z "$DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP" ]] || return 1
+  if DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP="$(mktemp "$template")"; then
+    return 0
+  else
+    status=$?
+    DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP=""
+    return "$status"
+  fi
+}
+
+create_delayed_otlp_receiver_publication_temp() {
+  local -r template="$1"
+  local status=0
+
+  [[ -n "$template" && -z "$DELAYED_OTLP_RECEIVER_PUBLICATION_TEMP" ]] || return 1
+  if DELAYED_OTLP_RECEIVER_PUBLICATION_TEMP="$(mktemp "$template")"; then
+    return 0
+  else
+    status=$?
+    DELAYED_OTLP_RECEIVER_PUBLICATION_TEMP=""
+    return "$status"
+  fi
+}
+
+discard_delayed_otlp_receiver_snapshot_temp() {
+  local -r temporary="$1"
+  local status=0
+
+  [[ -n "$temporary" ]] || return 0
+  if rm -f -- "$temporary"; then
+    if [[ "$DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP" == "$temporary" ]]; then
+      DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP=""
+    fi
+    return 0
+  else
+    status=$?
+    return "$status"
+  fi
+}
+
+discard_delayed_otlp_receiver_publication_temp() {
+  local -r temporary="$1"
+  local status=0
+
+  [[ -n "$temporary" ]] || return 0
+  if rm -f -- "$temporary"; then
+    if [[ "$DELAYED_OTLP_RECEIVER_PUBLICATION_TEMP" == "$temporary" ]]; then
+      DELAYED_OTLP_RECEIVER_PUBLICATION_TEMP=""
+    fi
+    return 0
+  else
+    status=$?
+    return "$status"
+  fi
+}
+
+cleanup_delayed_otlp_receiver_temporaries() {
+  local status=0
+  local cleanup_status=0
+
+  if [[ -n "$DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP" ]]; then
+    if discard_delayed_otlp_receiver_snapshot_temp \
+      "$DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP"; then
+      :
+    else
+      cleanup_status=$?
+      if ((status == 0)); then
+        status="$cleanup_status"
+      fi
+    fi
+  fi
+  if [[ -n "$DELAYED_OTLP_RECEIVER_PUBLICATION_TEMP" ]]; then
+    if discard_delayed_otlp_receiver_publication_temp \
+      "$DELAYED_OTLP_RECEIVER_PUBLICATION_TEMP"; then
+      :
+    else
+      cleanup_status=$?
+      if ((status == 0)); then
+        status="$cleanup_status"
+      fi
+    fi
+  fi
+  return "$status"
+}
+
+delayed_otlp_receiver_snapshot_progress() {
+  local -r snapshot="$1"
+
+  delayed_otlp_receiver_snapshot_is_single_object "$snapshot" || return $?
+  jq -er --arg marker "$DELAYED_OTLP_PRIME_MARKER" \
+    --arg scope "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
+    --argjson maximum "$MAX_JSON_SAFE_INTEGER" '
+    if
+      (.received_batches | type == "number") and
+      (.received_spans | type == "number") and
+      (.dropped_spans | type == "number") and
+      (.dropped_count_spans | type == "number") and
+      (.dropped_value_limit_spans | type == "number") and
+      (.dropped_retained_limit_spans | type == "number") and
+      .received_batches >= 0 and
+      .received_spans >= 0 and
+      .received_batches <= $maximum and
+      .received_spans <= $maximum and
+      .received_batches == (.received_batches | floor) and
+      .received_spans == (.received_spans | floor) and
+      .dropped_spans == 0 and
+      .dropped_count_spans == 0 and
+      .dropped_value_limit_spans == 0 and
+      .dropped_retained_limit_spans == 0 and
+      ((has("omitted_related_spans") | not) or
+        ((.omitted_related_spans | type == "number") and
+          .omitted_related_spans == 0)) and
+      ((has("ambiguous_related_spans") | not) or
+        ((.ambiguous_related_spans | type == "number") and
+          .ambiguous_related_spans == 0)) and
+      (.spans | type == "array")
+    then
+      ([.spans[] |
+        select(
+          .service_name == "java-backend" and
+          .kind == "SERVER" and
+          .scope_name != $scope and
+          .attributes["http.request.header.x-obi-demo-id"] == $marker
+        )] | length) as $pre_detection_servers |
+      [.received_batches, .received_spans, $pre_detection_servers] | @tsv
+    else
+      error("invalid delayed OTLP receiver progress")
+    end
+  ' "$snapshot"
+}
+
+publish_delayed_otlp_receiver_snapshot() {
+  local -r snapshot="$1"
+  local -r output="$2"
+  local output_directory=""
+  local output_name=""
+  local temporary=""
+  local status=0
+
+  output_directory="$(dirname -- "$output")" || return $?
+  output_name="$(basename -- "$output")" || return $?
+  create_delayed_otlp_receiver_publication_temp \
+    "$output_directory/.${output_name}.XXXXXX" || return $?
+  temporary="$DELAYED_OTLP_RECEIVER_PUBLICATION_TEMP"
+  if install -m 0644 "$snapshot" "$temporary"; then
+    :
+  else
+    status=$?
+    discard_delayed_otlp_receiver_publication_temp "$temporary" || true
+    return "$status"
+  fi
+  if mv -f -- "$temporary" "$output"; then
+    DELAYED_OTLP_RECEIVER_PUBLICATION_TEMP=""
+    return 0
+  else
+    status=$?
+    discard_delayed_otlp_receiver_publication_temp "$temporary" || true
+    return "$status"
+  fi
+}
+
+retain_delayed_otlp_receiver_failure() {
+  local -r snapshot="$1"
+  local -r output="$2"
+  local -r message="$3"
+
+  publish_delayed_otlp_receiver_snapshot "$snapshot" "$output" || return $?
+  log_error "$message"
+  return 1
+}
+
 delayed_otlp_receiver_snapshot_is_empty() {
   local -r snapshot="$1"
 
+  delayed_otlp_receiver_snapshot_is_single_object "$snapshot" || return $?
   jq -e --arg marker "$DELAYED_OTLP_PRIME_MARKER" '
     .marker == $marker and
     .received_batches == 0 and
@@ -3177,6 +3506,7 @@ delayed_otlp_receiver_snapshot_is_empty() {
 delayed_otlp_receiver_snapshot_has_java_export() {
   local -r snapshot="$1"
 
+  delayed_otlp_receiver_snapshot_is_single_object "$snapshot" || return $?
   jq -e --arg marker "$DELAYED_OTLP_PRIME_MARKER" \
     --arg scope "$DELAYED_OTLP_JAVA_SERVER_SCOPE" '
     .marker == $marker and
@@ -3210,6 +3540,7 @@ delayed_otlp_receiver_snapshot_has_java_export_before_deadline() {
   local -r earliest_export_millisecond="$2"
 
   [[ "$earliest_export_millisecond" =~ ^[0-9]+$ ]] || return 1
+  delayed_otlp_receiver_snapshot_is_single_object "$snapshot" || return $?
   jq -e --arg marker "$DELAYED_OTLP_PRIME_MARKER" \
     --arg scope "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
     --argjson earliest_export_millisecond "$earliest_export_millisecond" '
@@ -3232,6 +3563,9 @@ delayed_otlp_receiver_snapshot_has_java_export_at_or_after_deadline() {
   local -r earliest_export_millisecond="$2"
 
   [[ "$earliest_export_millisecond" =~ ^[0-9]+$ ]] || return 1
+  delayed_otlp_receiver_snapshot_is_single_object "$snapshot" || return $?
+  # The collector can receive a pre-detection OBI span in a later OTLP batch.
+  # Classify that span by its lifetime while keeping the SDK receipt gate strict.
   delayed_otlp_receiver_snapshot_has_java_export "$snapshot" || return 1
   jq -e --arg marker "$DELAYED_OTLP_PRIME_MARKER" \
     --arg scope "$DELAYED_OTLP_JAVA_SERVER_SCOPE" \
@@ -3246,24 +3580,63 @@ delayed_otlp_receiver_snapshot_has_java_export_at_or_after_deadline() {
     [$java_servers[] | select(.scope_name != $scope)] as $pre_detection_servers |
     ($java_sdk_servers[0].received_unix_milli >= $earliest_export_millisecond) and
     ($pre_detection_servers | all(.[];
-      .received_unix_milli < $earliest_export_millisecond
+      (.start_unix_nano | type == "number") and
+      (.end_unix_nano | type == "number") and
+      .start_unix_nano > 0 and
+      .end_unix_nano >= .start_unix_nano and
+      .end_unix_nano < ($earliest_export_millisecond * 1000000)
     ))
   ' "$snapshot" >/dev/null
 }
 
 assert_delayed_otlp_receiver_empty() {
   local -r output="$1"
+  local snapshot=""
+  local status=0
+  local cleanup_status=0
 
-  fetch_delayed_otlp_receiver_snapshot "$output" || return $?
-  if ! delayed_otlp_receiver_snapshot_is_empty "$output"; then
-    log_error "trace receiver accepted an OTLP export before delayed export readiness"
-    return 1
+  create_delayed_otlp_receiver_snapshot_temp \
+    "$RESULT_DIR/.delayed-otlp-receiver.XXXXXX" || return $?
+  snapshot="$DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP"
+  if fetch_delayed_otlp_receiver_snapshot "$snapshot"; then
+    :
+  else
+    status=$?
+    discard_delayed_otlp_receiver_snapshot_temp "$snapshot" || true
+    return "$status"
   fi
+  if ! capture_delayed_otlp_receiver_continuity "$snapshot"; then
+    status=0
+    retain_delayed_otlp_receiver_failure \
+      "$snapshot" "$output" \
+      "trace receiver did not expose a fresh valid continuity token" || status=$?
+    discard_delayed_otlp_receiver_snapshot_temp "$snapshot" || true
+    return "$status"
+  fi
+  if ! delayed_otlp_receiver_snapshot_is_empty "$snapshot"; then
+    status=0
+    retain_delayed_otlp_receiver_failure \
+      "$snapshot" "$output" \
+      "trace receiver accepted an OTLP export before delayed export readiness" || status=$?
+    discard_delayed_otlp_receiver_snapshot_temp "$snapshot" || true
+    return "$status"
+  fi
+  publish_delayed_otlp_receiver_snapshot "$snapshot" "$output" || status=$?
+  if discard_delayed_otlp_receiver_snapshot_temp "$snapshot"; then
+    :
+  else
+    cleanup_status=$?
+    if ((status == 0)); then
+      status="$cleanup_status"
+    fi
+  fi
+  return "$status"
 }
 
 delayed_otlp_receiver_snapshot_has_no_java_export() {
   local -r snapshot="$1"
 
+  delayed_otlp_receiver_snapshot_is_single_object "$snapshot" || return $?
   jq -e --arg marker "$DELAYED_OTLP_PRIME_MARKER" \
     --arg scope "$DELAYED_OTLP_JAVA_SERVER_SCOPE" '
       .marker == $marker and
@@ -3280,12 +3653,46 @@ delayed_otlp_receiver_snapshot_has_no_java_export() {
 
 assert_delayed_otlp_receiver_has_no_java_export() {
   local -r output="$1"
+  local snapshot=""
+  local status=0
+  local cleanup_status=0
 
-  fetch_delayed_otlp_receiver_snapshot "$output" || return $?
-  if ! delayed_otlp_receiver_snapshot_has_no_java_export "$output"; then
-    log_error "trace receiver accepted the delayed Java OTLP export before readiness"
-    return 1
+  create_delayed_otlp_receiver_snapshot_temp \
+    "$RESULT_DIR/.delayed-otlp-receiver.XXXXXX" || return $?
+  snapshot="$DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP"
+  if fetch_delayed_otlp_receiver_snapshot "$snapshot"; then
+    :
+  else
+    status=$?
+    discard_delayed_otlp_receiver_snapshot_temp "$snapshot" || true
+    return "$status"
   fi
+  if ! delayed_otlp_receiver_snapshot_has_expected_continuity "$snapshot"; then
+    status=0
+    retain_delayed_otlp_receiver_failure \
+      "$snapshot" "$output" \
+      "trace receiver continuity changed before delayed export readiness" || status=$?
+    discard_delayed_otlp_receiver_snapshot_temp "$snapshot" || true
+    return "$status"
+  fi
+  if ! delayed_otlp_receiver_snapshot_has_no_java_export "$snapshot"; then
+    status=0
+    retain_delayed_otlp_receiver_failure \
+      "$snapshot" "$output" \
+      "trace receiver accepted the delayed Java OTLP export before readiness" || status=$?
+    discard_delayed_otlp_receiver_snapshot_temp "$snapshot" || true
+    return "$status"
+  fi
+  publish_delayed_otlp_receiver_snapshot "$snapshot" "$output" || status=$?
+  if discard_delayed_otlp_receiver_snapshot_temp "$snapshot"; then
+    :
+  else
+    cleanup_status=$?
+    if ((status == 0)); then
+      status="$cleanup_status"
+    fi
+  fi
+  return "$status"
 }
 
 wait_for_delayed_otlp_receiver_export() {
@@ -3293,62 +3700,147 @@ wait_for_delayed_otlp_receiver_export() {
   local -r timeout_seconds="${2:-$DELAYED_OTLP_SUPPRESSION_TIMEOUT_SECONDS}"
   local -r earliest_export_millisecond="${3:-}"
   local -r early_output="${4:-$output}"
+  local -r unexpected_output="${5:-$output}"
+  local -r settle_seconds="${6:-$DELAYED_OTLP_POST_EXPORT_SETTLE_SECONDS}"
   local snapshot=""
-  local -i elapsed=0
+  local snapshot_progress=""
+  local command_timeout=""
+  local phase="discovery"
+  local -i current_batches=0
+  local -i current_spans=0
+  local -i current_pre_detection=0
+  local -i previous_batches=-1
+  local -i previous_spans=-1
+  local -i previous_pre_detection=0
+  local -i phase_deadline=0
   local status=0
+  local boundary_polled=false
+  local poll_is_boundary=false
+  local snapshot_fetched=false
 
   [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || return 1
   [[ "$earliest_export_millisecond" =~ ^[0-9]+$ ]] || return 1
-  snapshot="$(mktemp "$RESULT_DIR/.delayed-otlp-receiver.XXXXXX")" || return $?
-  while ((elapsed < timeout_seconds)); do
-    if fetch_delayed_otlp_receiver_snapshot "$snapshot"; then
-      :
+  [[ "$settle_seconds" =~ ^[1-9][0-9]*$ ]] || return 1
+  create_delayed_otlp_receiver_snapshot_temp \
+    "$RESULT_DIR/.delayed-otlp-receiver.XXXXXX" || return $?
+  snapshot="$DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP"
+  phase_deadline="$((SECONDS + timeout_seconds))"
+
+  while :; do
+    poll_is_boundary=false
+    if ((SECONDS < phase_deadline)); then
+      command_timeout="$(remaining_timeout_seconds "$phase_deadline" 10)" || {
+        discard_delayed_otlp_receiver_snapshot_temp "$snapshot" || true
+        return 1
+      }
+    elif [[ "$boundary_polled" == "false" ]] &&
+      ((SECONDS <= phase_deadline + DELAYED_OTLP_BOUNDARY_START_SLACK_SECONDS)); then
+      # One one-second fetch samples the inclusive deadline without opening an
+      # unbounded command overrun.
+      command_timeout="$DELAYED_OTLP_BOUNDARY_POLL_SECONDS"
+      boundary_polled=true
+      poll_is_boundary=true
+    else
+      break
+    fi
+
+    if fetch_delayed_otlp_receiver_snapshot "$snapshot" "$command_timeout"; then
+      snapshot_fetched=true
     else
       status=$?
-      rm -f -- "$snapshot" || true
+      discard_delayed_otlp_receiver_snapshot_temp "$snapshot" || true
       return "$status"
     fi
-    if delayed_otlp_receiver_snapshot_has_no_java_export "$snapshot"; then
-      :
-    elif delayed_otlp_receiver_snapshot_has_java_export_before_deadline \
-      "$snapshot" "$earliest_export_millisecond"; then
-      if install -m 0644 "$snapshot" "$early_output"; then
-        :
-      else
+
+    if delayed_otlp_receiver_snapshot_has_expected_continuity "$snapshot" &&
+      snapshot_progress="$(delayed_otlp_receiver_snapshot_progress "$snapshot")" &&
+      IFS=$'\t' read -r current_batches current_spans current_pre_detection \
+        <<<"$snapshot_progress" &&
+      [[ "$current_batches" =~ ^[0-9]+$ && "$current_spans" =~ ^[0-9]+$ &&
+        "$current_pre_detection" =~ ^[0-9]+$ ]] &&
+      ((previous_batches < 0 ||
+        (current_batches >= previous_batches &&
+          current_spans >= previous_spans &&
+          current_pre_detection >= previous_pre_detection))); then
+      previous_batches="$current_batches"
+      previous_spans="$current_spans"
+      previous_pre_detection="$current_pre_detection"
+    else
+      status=0
+      retain_delayed_otlp_receiver_failure \
+        "$snapshot" "$unexpected_output" \
+        "trace receiver continuity changed, or its delayed snapshot regressed or was malformed" ||
         status=$?
-        rm -f -- "$snapshot" || true
-        return "$status"
-      fi
-      rm -f -- "$snapshot" || return $?
-      log_error "trace receiver accepted the delayed Java OTLP export before its configured deadline"
-      return 1
+      discard_delayed_otlp_receiver_snapshot_temp "$snapshot" || true
+      return "$status"
+    fi
+
+    if delayed_otlp_receiver_snapshot_has_java_export_before_deadline \
+      "$snapshot" "$earliest_export_millisecond"; then
+      status=0
+      retain_delayed_otlp_receiver_failure \
+        "$snapshot" "$early_output" \
+        "trace receiver accepted the delayed Java OTLP export before its configured deadline" || \
+        status=$?
+      discard_delayed_otlp_receiver_snapshot_temp "$snapshot" || true
+      return "$status"
     elif delayed_otlp_receiver_snapshot_has_java_export_at_or_after_deadline \
       "$snapshot" "$earliest_export_millisecond"; then
-      if install -m 0644 "$snapshot" "$output"; then
+      if [[ "$phase" == "discovery" ]]; then
+        phase="settlement"
+        phase_deadline="$((SECONDS + settle_seconds))"
+        boundary_polled=false
+      elif [[ "$poll_is_boundary" == "true" ]]; then
+        if publish_delayed_otlp_receiver_snapshot "$snapshot" "$output"; then
+          :
+        else
+          status=$?
+          discard_delayed_otlp_receiver_snapshot_temp "$snapshot" || true
+          return "$status"
+        fi
+        discard_delayed_otlp_receiver_snapshot_temp "$snapshot" || return $?
+        return 0
+      fi
+    elif delayed_otlp_receiver_snapshot_has_no_java_export "$snapshot" &&
+      [[ "$phase" == "discovery" ]]; then
+      if [[ "$poll_is_boundary" == "true" ]]; then
+        status=0
+        retain_delayed_otlp_receiver_failure \
+          "$snapshot" "$unexpected_output" \
+          "trace receiver did not retain the delayed Java OTLP export" || status=$?
+        discard_delayed_otlp_receiver_snapshot_temp "$snapshot" || true
+        return "$status"
+      fi
+    else
+      status=0
+      retain_delayed_otlp_receiver_failure \
+        "$snapshot" "$unexpected_output" \
+        "trace receiver retained an unexpected delayed Java server span" || status=$?
+      discard_delayed_otlp_receiver_snapshot_temp "$snapshot" || true
+      return "$status"
+    fi
+
+    if ((SECONDS < phase_deadline)); then
+      if sleep 1; then
         :
       else
         status=$?
-        rm -f -- "$snapshot" || true
+        discard_delayed_otlp_receiver_snapshot_temp "$snapshot" || true
         return "$status"
       fi
-      rm -f -- "$snapshot" || return $?
-      return 0
-    else
-      rm -f -- "$snapshot" || true
-      log_error "trace receiver retained an unexpected delayed Java server span"
-      return 1
     fi
-    if sleep 1; then
-      :
-    else
-      status=$?
-      rm -f -- "$snapshot" || true
-      return "$status"
-    fi
-    ((elapsed += 1))
   done
-  rm -f -- "$snapshot" || return $?
-  log_error "trace receiver did not retain the delayed Java OTLP export"
+
+  if [[ "$snapshot_fetched" == "true" ]]; then
+    status=0
+    retain_delayed_otlp_receiver_failure \
+      "$snapshot" "$unexpected_output" \
+      "trace receiver missed the bounded delayed OTLP final poll" || status=$?
+    discard_delayed_otlp_receiver_snapshot_temp "$snapshot" || true
+    return "$status"
+  fi
+  discard_delayed_otlp_receiver_snapshot_temp "$snapshot" || return $?
+  log_error "trace receiver did not complete delayed Java OTLP validation"
   return 1
 }
 
@@ -6514,6 +7006,7 @@ run_delayed_otlp_suppression_sequence() {
     return 1
   }
 
+  initialize_delayed_otlp_run_identity || return $?
   earliest_export_millisecond="$(delayed_otlp_earliest_export_millisecond)" || return $?
   assert_delayed_otlp_receiver_empty \
     "$RESULT_DIR/delayed-otlp-receiver-before-request.json" || return $?
@@ -6538,14 +7031,16 @@ run_delayed_otlp_suppression_sequence() {
     "$RESULT_DIR/delayed-otlp-receiver-before-export.json" || return $?
   assert_java_duplicate_suppression_absent \
     "$RESULT_DIR/duplicate-suppression-delayed-otlp-before-export.prom" || return $?
+  wait_for_java_duplicate_suppression_without_prime \
+    "$RESULT_DIR/duplicate-suppression-delayed-otlp-ready.prom" \
+    "$DELAYED_OTLP_SUPPRESSION_TIMEOUT_SECONDS" || return $?
   wait_for_delayed_otlp_receiver_export \
     "$RESULT_DIR/delayed-otlp-receiver-ready.json" \
     "$DELAYED_OTLP_SUPPRESSION_TIMEOUT_SECONDS" \
     "$earliest_export_millisecond" \
-    "$RESULT_DIR/delayed-otlp-receiver-early.json" || return $?
-  wait_for_java_duplicate_suppression_without_prime \
-    "$RESULT_DIR/duplicate-suppression-delayed-otlp-ready.prom" \
-    "$DELAYED_OTLP_SUPPRESSION_TIMEOUT_SECONDS" || return $?
+    "$RESULT_DIR/delayed-otlp-receiver-early.json" \
+    "$RESULT_DIR/delayed-otlp-receiver-unexpected.json" \
+    "$DELAYED_OTLP_POST_EXPORT_SETTLE_SECONDS" || return $?
   assert_selected_transport || return $?
   assert_runtime_contract delayed-otlp-suppression true || return $?
   SCENARIO_VARIANT="delayed-otlp-suppression"
@@ -6561,6 +7056,8 @@ run_delayed_otlp_suppression_sequence() {
 run_delayed_otlp_suppression_control() {
   local schedule_delay_previous=""
   local schedule_delay_was_set=false
+  local java_retry_disabled_previous=""
+  local java_retry_disabled_was_set=false
   local control_status=0
 
   if [[ "$SCENARIO" == "all" ]]; then
@@ -6568,7 +7065,12 @@ run_delayed_otlp_suppression_control() {
       schedule_delay_was_set=true
       schedule_delay_previous="$OTEL_BSP_SCHEDULE_DELAY_VALUE"
     fi
+    if [[ -v OTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED_VALUE ]]; then
+      java_retry_disabled_was_set=true
+      java_retry_disabled_previous="$OTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED_VALUE"
+    fi
     export OTEL_BSP_SCHEDULE_DELAY_VALUE="$DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS"
+    export OTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED_VALUE="$DELAYED_OTLP_JAVA_RETRY_DISABLED"
     if recreate_instrumented_stack \
       tcp "delayed-otlp-suppression startup" "$TRANSPORT" false true; then
       :
@@ -6590,6 +7092,11 @@ run_delayed_otlp_suppression_control() {
       export OTEL_BSP_SCHEDULE_DELAY_VALUE="$schedule_delay_previous"
     else
       unset OTEL_BSP_SCHEDULE_DELAY_VALUE
+    fi
+    if [[ "$java_retry_disabled_was_set" == "true" ]]; then
+      export OTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED_VALUE="$java_retry_disabled_previous"
+    else
+      unset OTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED_VALUE
     fi
     if ((control_status != 0)); then
       log_warn "restoring the standard instrumented stack after delayed OTLP control failure"

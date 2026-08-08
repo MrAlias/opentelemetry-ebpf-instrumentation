@@ -1,24 +1,37 @@
 # Java remote-parent bridge
 
 This document defines the version 1 result contract, version 3 fallback request,
-and ownership model used to hand
-an inbound OBI TCP-propagated parent to an unmodified OpenTelemetry-compatible
-Java agent. The initial bridge-parent scope is an HTTP/1.1 server request
-received through the exact `SSLEngine` connection path used by the Netty PoC.
-Inbound `SSLSocket` stream advice remains telemetry-only and cannot select a
-bridge parent; while the bridge is enabled it records a fixed `unsupported`
-receive outcome. HTTP/2 and other multiplexed protocols are not supported by
-this contract. The contract also requires at most one HTTP/1.1
-request ownership boundary per decrypted plaintext emission. A per-connection
-framer carries split request lines, headers, fixed bodies, chunk framing, and
-trailers across emissions. Pipelined or coalesced requests that cross two
-ownership boundaries in one emission are marked ambiguous and receive no
-bridge parent because one callback cannot safely publish two independently
-extractable BPF generations.
+and ownership model used to hand an inbound OBI TCP-propagated parent to an
+unmodified OpenTelemetry-compatible Java agent. The bridge-parent scope is an
+HTTP/1.1 server request received
+through either the exact `SSLEngine` connection path used by the Netty PoC or
+a stock-JSSE `SSLSocket` that directly owns its underlying socket descriptor.
+Direct ownership requires `BaseSSLSocketImpl.self` to identify that same
+`SSLSocket`, allowing the read and close advice to fence the descriptor with
+one exact socket lifecycle. A layered JSSE socket that wraps a caller-owned raw
+socket, or another ownership shape that cannot satisfy this identity, is
+non-authoritative: it cannot select a bridge parent and records the fixed
+`unsupported` receive outcome at most once for its physical lifecycle. HTTP/2
+and other multiplexed protocols are not supported by this contract. The
+contract also requires at most one HTTP/1.1 request ownership boundary per
+decrypted plaintext emission. A per-connection framer carries split request
+lines, headers, fixed bodies, chunk framing, and trailers across emissions.
+Pipelined or coalesced requests that cross two ownership boundaries in one
+emission are marked ambiguous and receive no bridge parent because one
+callback cannot safely publish two independently extractable BPF generations.
 
 The correctness invariant is strict: the bridge returns the parent owned by
 the current request or no parent. It never returns a parent owned by another
 request.
+
+The packaged direct-JSSE fixture exercises real TLS 1.2 and, when the target
+JSSE supports it, TLS 1.3 application reads and the Java receive lifecycle at
+unprivileged component scope. It deliberately selects the disabled transport,
+enables the receive path through a reflective test override, and reports both
+`ebpf=not_asserted` and `native_ack=absent`. It therefore does not prove a
+JNI/BPF acknowledgement, native retrieval, or official-agent server-span
+parent and does not promote a kernel, transport, JVM, or agent compatibility
+cell.
 
 ## Components and sequence
 
@@ -27,38 +40,48 @@ request.
 2. The receiving TCP sockops program validates and stages that candidate by
    connection. A second unconsumed candidate for the same connection marks the
    connection ambiguous instead of replacing the first candidate.
-3. The existing Java TLS receive advice synchronously reports decrypted bytes
-   before it returns them to the HTTP implementation. A serialized, bounded
-   HTTP/1.1 framer emits `START` only after validating a complete request
-   header, `CONTINUE` for later bytes owned by that request, and `RESET` when
-   the exact sequence terminates without a usable handoff. Unsupported streams
-   continue through a telemetry-only receive operation; ambiguous streams are
-   sticky and cannot select a parent. `SSLSocket` and wrapped `InputStream`
-   plaintext also use that non-authoritative telemetry operation regardless of
-   a concurrent enable/disable transition. `SSLEngine` correlation
-   prefers the exact connection scoped by the current Netty operation. The
-   generic `SocketChannel` fallback uses the exact `ByteBuffer` object from a
-   verified positive read; it never derives ownership from attacker-controlled
-   ciphertext. Duplicate and sliced buffer objects therefore miss rather than
-   aliasing their backing storage. The weak, bounded identity map does not retain
-   application buffers. Session-owner and marker caches likewise use bounded weak
-   identity keys so custom TLS engines and their defining class loaders can be
-   reclaimed. Capacity saturation rejects new identities; correlation fails
-   closed and an unrecorded marker remains eligible for retry. Marker attempts are
-   reserved atomically against the exact connection-owner generation before JNI,
-   so concurrent and failed calls still respect the bounded burst and retry
-   interval. A positive socket read beginning in fresh-fill state (position zero
-   with the full capacity writable) starts a new ownership generation, allowing
-   frameworks to reuse a drained pooled buffer. Reuse with retained ciphertext or
-   a concurrent claim remains ambiguous. A tentative handoff is claimed once only
-   after an established session consumes ciphertext and advances a destination
-   buffer with plaintext. Socket cleanup invalidates every outstanding handoff and
+3. The existing Java TLS receive advice synchronously reports
+   application-visible decrypted bytes before it returns them to the HTTP
+   implementation. The directly owned JSSE path captures the exact socket
+   lifecycle before each read. Instrumented `AppInputStream` and
+   `ProxyInputStream` callbacks share one nested-read scope: only the outermost
+   successful callback can emit its returned bytes, and every successful inner
+   callback must name the same socket and lifecycle. A conflicting nested
+   owner, EOF, or read failure poisons the exact lifecycle and fails closed;
+   close makes that lifecycle unavailable before the descriptor can be reused.
+   Layered and otherwise unsupported socket owners never emit a
+   bridge-authoritative operation through a caller-owned descriptor. The
+   `SSLEngine` path instead prefers the exact connection scoped by the current
+   Netty operation. Both authoritative paths feed a
+   serialized, bounded HTTP/1.1 framer. It emits `START` only after validating
+   a complete request header, `CONTINUE` for later bytes owned by that request,
+   and `RESET` when the exact sequence terminates without a usable handoff.
+   Ambiguous streams are sticky and cannot select a parent. A provider-epoch
+   transition permanently retires an established owner to telemetry-only
+   operation. The generic `SocketChannel` fallback uses the exact `ByteBuffer`
+   object from a verified positive read; it never derives ownership from
+   attacker-controlled ciphertext. Duplicate and sliced buffer objects
+   therefore miss rather than aliasing their backing storage. The weak,
+   bounded identity map does not retain application buffers. Session-owner and
+   marker caches likewise use bounded weak identity keys so custom TLS engines
+   and their defining class loaders can be reclaimed. Capacity saturation
+   rejects new identities; correlation fails closed and an unrecorded marker
+   remains eligible for retry. Marker attempts are reserved atomically against
+   the exact connection-owner generation before JNI, so concurrent and failed
+   calls still respect the bounded burst and retry interval. A positive socket
+   read beginning in fresh-fill state (position zero with the full capacity
+   writable) starts a new ownership generation, allowing frameworks to reuse a
+   drained pooled buffer. Reuse with retained ciphertext or a concurrent claim
+   remains ambiguous. A tentative handoff is claimed once only after an
+   established session consumes ciphertext and advances a destination buffer
+   with plaintext. Socket cleanup invalidates every outstanding handoff and
    cached session owner for the exact tuple and file descriptor. Conflicts and
    stale generations fail closed. The ownership contract requires exclusive
    mutable access to an exact `ByteBuffer` from socket read through its
-   corresponding unwrap or release. A buffer can cross threads with a happens-before
-   handoff, but concurrent mutation or reuse of a live alias across connections is
-   unsupported by both this correlation and `ByteBuffer` itself.
+   corresponding unwrap or release. A buffer can cross threads with a
+   happens-before handoff, but concurrent mutation or reuse of a live alias
+   across connections is unsupported by both this correlation and
+   `ByteBuffer` itself.
 4. The authenticated `START` first publishes a generation-zero cursor for the
    exact socket cookie, Java lifecycle, request sequence, and one-shot signal.
    When OBI recognizes the same HTTP/1.1 server request, the HTTP tail-call
@@ -330,6 +353,7 @@ The authoritative identities and transitions are:
 | Shared TLS prewrite | Host PID/TID, thread start time, unique handoff ID | Provisional request publishes an exact parent | Write and transport terminal outcomes, LRU eviction, restart |
 | TLS socket owner | Socket-local exact handoff key and trace | Exact prewrite reaches `sk_msg` | Option terminal outcome, socket close, stale or malformed recovery, restart |
 | TCP candidate | Sorted connection tuple | Valid inbound TCP option | HTTP parse take, ambiguity, LRU eviction, restart |
+| Java TLS receive owner | Exact `SSLEngine` connection owner or directly owned JSSE `Socket`, lifecycle, and bridge epoch | Application-visible HTTP/1.1 plaintext enters the per-owner framer | Terminal framing ambiguity, native failure, provider-epoch retirement, socket or channel close, weak-owner reclamation, active-connection eviction, restart |
 | HTTP/1 receive cursor | Socket cookie, exact Java lifecycle and request sequence | Authenticated `START` publishes `PUBLISHING`; HTTP acknowledgement commits `VALID` | Exact `RESET`, replacement, socket close, parse/ack/tail-call failure, restart |
 | Java request | PID namespace, process ID, logical TID | Parsed Java TLS HTTP/1.1 request | Take, discard, completion, stale sweep, exact process retirement, restart |
 | Task handoff | Process, PID namespace, opaque submission token, shared one-shot accepted-socket holder | Java submission capture | Exact one-shot link, cancellation, rejection, task-scope restoration, stale sweep, bounded-map eviction |

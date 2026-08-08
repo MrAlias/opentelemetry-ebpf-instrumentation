@@ -297,8 +297,12 @@ func TestJavaRemoteParentCloseWorkspaceIsPrivateAndBounded(t *testing.T) {
 }
 
 const (
-	legacyBPFStackLimit   = 512
-	legacyBPFStackQuantum = 32
+	legacyBPFStackLimit    = 512
+	legacyBPFStackQuantum  = 32
+	legacyBPFMaxCallFrames = 8
+	// A non-entry subprogram that directly tail-calls must have less than
+	// 256 bytes of previously accumulated caller stack on legacy kernels.
+	legacyBPFTailCallCallerStackLimit = 256
 	// Keep at least one allocation quantum below the verifier's hard limit so
 	// a small compiler spill cannot silently break the supported old-kernel
 	// matrix.
@@ -309,6 +313,7 @@ type legacyBPFFrame struct {
 	name          string
 	raw           int
 	measured      bool
+	hasTailCall   bool
 	calls         []string
 	pointerParams [5]bool
 	start         int
@@ -350,6 +355,84 @@ func TestJavaRemoteParentCloseFitsLegacyCombinedStack(t *testing.T) {
 				legacyBPFStackLimit-combined,
 				strings.Join(path, " -> "),
 			)
+		})
+	}
+}
+
+func TestJavaRemoteParentIoctlFitsLegacyCombinedStack(t *testing.T) {
+	const root = "obi_kprobe_security_file_ioctl"
+
+	for _, object := range []struct {
+		name string
+		data []byte
+	}{
+		{name: "bpf_x86_bpfel.o", data: legacyBPFX86Object},
+		{name: "bpf_arm64_bpfel.o", data: legacyBPFARM64Object},
+	} {
+		t.Run(object.name, func(t *testing.T) {
+			spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(object.data))
+			require.NoError(t, err)
+			program := spec.Programs[root]
+			require.NotNil(t, program)
+
+			frames, err := legacyBPFFrames(program.Instructions)
+			require.NoError(t, err)
+			rootFrame := frames[root]
+			require.NotNil(t, rootFrame)
+			callPointerParams := make(legacyBPFCallPointerParams, len(frames))
+			for name, frame := range frames {
+				callPointerParams[name] = frame.pointerParams
+			}
+			rootDepth, err := legacyBPFFrameStackDepthWithCalls(
+				program.Instructions[rootFrame.start:rootFrame.end],
+				[5]bool{},
+				callPointerParams,
+				false,
+			)
+			require.NoError(t, err)
+			rootRounded := legacyBPFRoundedFrame(rootDepth)
+			require.LessOrEqual(t, rootRounded, legacyBPFStackBudget)
+			require.NotEmpty(t, rootFrame.calls)
+			seenBranches := make(map[string]struct{}, len(rootFrame.calls))
+
+			for _, branch := range rootFrame.calls {
+				if _, seen := seenBranches[branch]; seen {
+					continue
+				}
+				seenBranches[branch] = struct{}{}
+				t.Run(branch, func(t *testing.T) {
+					// The root pass accounts for every current-frame pointer it derives.
+					// Analyze each direct branch separately so its kernel, user, and
+					// map-value parameters are not misclassified as ancestor stack;
+					// preserve the real prefix depth for the tail-call caller limit.
+					child, childPath, err := legacyBPFCombinedStackWithAncestor(
+						program.Instructions, branch, rootRounded, 1,
+					)
+					require.NoError(t, err)
+					combined := rootRounded + child
+					path := append(
+						[]string{fmt.Sprintf("%s(%d->%d)", root, rootDepth, rootRounded)},
+						childPath...,
+					)
+					t.Logf(
+						"legacy combined stack %d bytes (margin %d): %s",
+						combined,
+						legacyBPFStackLimit-combined,
+						strings.Join(path, " -> "),
+					)
+					require.LessOrEqualf(
+						t,
+						combined,
+						legacyBPFStackBudget,
+						"legacy combined stack %d exceeds %d-byte budget (kernel limit %d, margin %d); path: %s",
+						combined,
+						legacyBPFStackBudget,
+						legacyBPFStackLimit,
+						legacyBPFStackLimit-combined,
+						strings.Join(path, " -> "),
+					)
+				})
+			}
 		})
 	}
 }
@@ -397,8 +480,15 @@ func TestLegacyBPFFrameDepthTracksDerivedFramePointers(t *testing.T) {
 
 	_, err = legacyBPFFrameStackDepth(asm.Instructions{asm.LongJump("target")})
 	require.ErrorContains(t, err, "unsupported long jump")
-	_, err = legacyBPFFrameStackDepth(asm.Instructions{asm.FnTailCall.Call()})
-	require.ErrorContains(t, err, "unsupported tail call")
+	// A successful tail call does not return through this function, and its
+	// target is verified as a separate program. A failed tail call continues in
+	// this frame, so following fallthrough measures this function's return path.
+	depth, err = legacyBPFFrameStackDepth(asm.Instructions{
+		asm.FnTailCall.Call(),
+		asm.StoreImm(asm.RFP, -64, 0, asm.Word),
+	})
+	require.NoError(t, err)
+	require.Equal(t, 64, depth)
 	callback := asm.LoadImm(asm.R1, 0, asm.DWord).WithReference("callback")
 	callback.Src = asm.PseudoFunc
 	_, err = legacyBPFFrameStackDepth(asm.Instructions{callback})
@@ -500,7 +590,105 @@ func TestLegacyBPFCombinedStackRejectsEveryDeepSibling(t *testing.T) {
 	}
 
 	_, _, err := legacyBPFCombinedStack(instructions, "root")
-	require.ErrorContains(t, err, "BPF call path exceeds eight frames")
+	require.ErrorContains(t, err, "BPF call path exceeds 8 frames")
+}
+
+func TestLegacyBPFCombinedStackModelsPrefixedCallFrameLimit(t *testing.T) {
+	chain := func(frames int) asm.Instructions {
+		instructions := asm.Instructions{
+			legacyBPFSyntheticFunctionStart("entry", asm.Mov.Imm(asm.R0, 0)),
+			asm.Return(),
+		}
+		for frame := 1; frame <= frames; frame++ {
+			name := fmt.Sprintf("branch%d", frame)
+			instructions = append(
+				instructions,
+				legacyBPFSyntheticFunctionStart(
+					name, asm.StoreImm(asm.RFP, -32, 0, asm.Word),
+				),
+			)
+			if frame < frames {
+				instructions = append(
+					instructions, asm.Call.Label(fmt.Sprintf("branch%d", frame+1)),
+				)
+			}
+			instructions = append(instructions, asm.Return())
+		}
+		return instructions
+	}
+
+	combined, _, err := legacyBPFCombinedStackWithAncestor(chain(7), "branch1", 32, 1)
+	require.NoError(t, err)
+	require.Equal(t, 224, combined)
+
+	_, _, err = legacyBPFCombinedStackWithAncestor(chain(8), "branch1", 32, 1)
+	require.ErrorContains(t, err, "BPF call path exceeds 8 frames")
+}
+
+func TestLegacyBPFCombinedStackModelsTailCallCallerLimit(t *testing.T) {
+	directChild := func(rootDepth int, tailCall bool) asm.Instructions {
+		childCall := asm.Mov.Imm(asm.R0, 0)
+		if tailCall {
+			childCall = asm.FnTailCall.Call()
+		}
+		return asm.Instructions{
+			legacyBPFSyntheticFunctionStart(
+				"root", asm.StoreImm(asm.RFP, int16(-rootDepth), 0, asm.Word),
+			),
+			asm.Call.Label("tail"),
+			asm.Return(),
+			legacyBPFSyntheticFunctionStart(
+				"tail", asm.StoreImm(asm.RFP, -32, 0, asm.Word),
+			),
+			childCall,
+			asm.Return(),
+		}
+	}
+
+	entryTailCall := asm.Instructions{
+		legacyBPFSyntheticFunctionStart(
+			"root", asm.StoreImm(asm.RFP, -256, 0, asm.Word),
+		),
+		asm.FnTailCall.Call(),
+		asm.Return(),
+	}
+	combined, _, err := legacyBPFCombinedStack(entryTailCall, "root")
+	require.NoError(t, err)
+	require.Equal(t, 256, combined)
+
+	combined, _, err = legacyBPFCombinedStack(directChild(224, true), "root")
+	require.NoError(t, err)
+	require.Equal(t, 256, combined)
+
+	_, _, err = legacyBPFCombinedStack(directChild(256, true), "root")
+	require.ErrorContains(t, err, "tail-call subprogram")
+
+	nestedTailCall := asm.Instructions{
+		legacyBPFSyntheticFunctionStart(
+			"root", asm.StoreImm(asm.RFP, -224, 0, asm.Word),
+		),
+		asm.Call.Label("middle"),
+		asm.Return(),
+		legacyBPFSyntheticFunctionStart(
+			"middle", asm.StoreImm(asm.RFP, -32, 0, asm.Word),
+		),
+		asm.Call.Label("tail"),
+		asm.Return(),
+		legacyBPFSyntheticFunctionStart(
+			"tail", asm.StoreImm(asm.RFP, -32, 0, asm.Word),
+		),
+		asm.FnTailCall.Call(),
+		asm.Return(),
+	}
+	_, _, err = legacyBPFCombinedStack(nestedTailCall, "root")
+	require.ErrorContains(t, err, "tail-call subprogram")
+
+	combined, _, err = legacyBPFCombinedStack(directChild(256, false), "root")
+	require.NoError(t, err)
+	require.Equal(t, 288, combined)
+
+	_, _, err = legacyBPFCombinedStackWithAncestor(directChild(32, true), "tail", 256, 1)
+	require.ErrorContains(t, err, "tail-call subprogram")
 }
 
 func legacyBPFSyntheticFunctionStart(name string, instruction asm.Instruction) asm.Instruction {
@@ -515,6 +703,15 @@ func legacyBPFCombinedStack(
 	instructions asm.Instructions,
 	root string,
 ) (int, []string, error) {
+	return legacyBPFCombinedStackWithAncestor(instructions, root, 0, 0)
+}
+
+func legacyBPFCombinedStackWithAncestor(
+	instructions asm.Instructions,
+	root string,
+	ancestorDepth int,
+	ancestorFrames int,
+) (int, []string, error) {
 	frames, err := legacyBPFFrames(instructions)
 	if err != nil {
 		return 0, nil, err
@@ -525,14 +722,28 @@ func legacyBPFCombinedStack(
 	}
 
 	active := make(map[string]bool)
-	var walk func(string) (int, []string, error)
-	walk = func(name string) (int, []string, error) {
+	var walk func(string, int, int) (int, []string, error)
+	walk = func(name string, callerDepth, callerFrames int) (int, []string, error) {
 		frame := frames[name]
 		if frame == nil {
 			return 0, nil, fmt.Errorf("BPF function %q has no frame metadata", name)
 		}
 		if active[name] {
 			return 0, nil, fmt.Errorf("recursive BPF call through %q", name)
+		}
+		if callerFrames >= legacyBPFMaxCallFrames {
+			return 0, nil, fmt.Errorf(
+				"BPF call path exceeds %d frames at %q", legacyBPFMaxCallFrames, name,
+			)
+		}
+		if frame.start != 0 && frame.hasTailCall &&
+			callerDepth >= legacyBPFTailCallCallerStackLimit {
+			return 0, nil, fmt.Errorf(
+				"tail-call subprogram %q has %d bytes of caller stack; limit is less than %d",
+				name,
+				callerDepth,
+				legacyBPFTailCallCallerStackLimit,
+			)
 		}
 		if !frame.measured {
 			stackParams := frame.pointerParams
@@ -559,16 +770,11 @@ func legacyBPFCombinedStack(
 		maxChild := 0
 		var maxChildPath []string
 		for _, callee := range frame.calls {
-			child, childPath, err := walk(callee)
+			child, childPath, err := walk(
+				callee, callerDepth+rounded, callerFrames+1,
+			)
 			if err != nil {
 				return 0, nil, err
-			}
-			candidatePath := append([]string{frameLabel}, childPath...)
-			if len(candidatePath) > 8 {
-				return 0, nil, fmt.Errorf(
-					"BPF call path exceeds eight frames: %s",
-					strings.Join(candidatePath, " -> "),
-				)
 			}
 			if child > maxChild {
 				maxChild = child
@@ -580,7 +786,7 @@ func legacyBPFCombinedStack(
 		return rounded + maxChild, path, nil
 	}
 
-	return walk(root)
+	return walk(root, ancestorDepth, ancestorFrames)
 }
 
 func legacyBPFFrames(instructions asm.Instructions) (map[string]*legacyBPFFrame, error) {
@@ -624,9 +830,6 @@ func legacyBPFFrames(instructions asm.Instructions) (map[string]*legacyBPFFrame,
 		if current == nil {
 			return nil, fmt.Errorf("instruction %d precedes BTF function metadata", index)
 		}
-		if instruction.IsBuiltinCall() && instruction.Constant == int64(asm.FnTailCall) {
-			return nil, fmt.Errorf("tail call in BPF function %q is unsupported", current.name)
-		}
 		if instruction.OpCode.Class() == asm.Jump32Class &&
 			instruction.OpCode.JumpOp() == asm.Ja {
 			return nil, fmt.Errorf("long jump in BPF function %q is unsupported", current.name)
@@ -648,6 +851,9 @@ func legacyBPFFrames(instructions asm.Instructions) (map[string]*legacyBPFFrame,
 				)
 			}
 			current.calls = append(current.calls, callee)
+		}
+		if instruction.IsBuiltinCall() && instruction.Constant == int64(asm.FnTailCall) {
+			current.hasTailCall = true
 		}
 	}
 	if current == nil {
@@ -732,9 +938,6 @@ func legacyBPFFrameStackDepthWithCalls(
 		state := legacyBPFCloneFrameState(states[index])
 		legacyBPFRecordStateDepth(state.frameOffsets, &depth)
 
-		if instruction.IsBuiltinCall() && instruction.Constant == int64(asm.FnTailCall) {
-			return 0, fmt.Errorf("instruction %d uses an unsupported tail call", index)
-		}
 		if instruction.IsLoadOfFunctionPointer() {
 			return 0, fmt.Errorf("instruction %d loads an unsupported function pointer", index)
 		}
@@ -749,7 +952,13 @@ func legacyBPFFrameStackDepthWithCalls(
 		}
 
 		successors := make([]int, 0, 2)
-		if instruction.OpCode.Class().IsJump() {
+		if instruction.IsBuiltinCall() && instruction.Constant == int64(asm.FnTailCall) {
+			// The successful edge does not return through this function and its
+			// target is verified separately. Only helper failure falls through here.
+			if index+1 < len(instructions) {
+				successors = append(successors, index+1)
+			}
+		} else if instruction.OpCode.Class().IsJump() {
 			switch instruction.OpCode.JumpOp() {
 			case asm.Exit:
 				continue

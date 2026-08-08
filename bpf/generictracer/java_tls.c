@@ -388,10 +388,10 @@ static __noinline u8 java_remote_parent_prepared_receive_exact(
            !bpf_map_lookup_elem(&jrp_recv_guard, &workspace->socket_cookie);
 }
 
-// Keep the receive-boundary detach in a small sibling that returns before the
-// large payload frame is entered. This preserves detach-before-registration-
-// return and detach-before-advisory-read without nesting the 200-byte owner
-// cleanup frame under handle_java_data_ioctl.
+// Keep the stack-backed task/capability lookup in a sibling that returns before
+// the receive-boundary detach. The gate itself stays inline so the detach and
+// the large payload path are direct siblings of the hook instead of gaining an
+// otherwise-empty intermediate verifier frame.
 static __noinline u64 handle_java_data_authority(u8 *registered) {
     pid_key_t task = {0};
     task_tid(&task);
@@ -403,8 +403,8 @@ static __noinline u64 handle_java_data_authority(u8 *registered) {
     return process_capability;
 }
 
-static __noinline u64 handle_java_data_gate(struct file *file,
-                                            enum java_remote_parent_data_operation operation) {
+static __always_inline u64 handle_java_data_gate(
+    struct file *file, enum java_remote_parent_data_operation operation) {
     const u8 data_hook_ready =
         java_remote_parent_enabled && java_remote_parent_data_hook_is_ready();
     const enum java_remote_parent_data_dispatch dispatch =
@@ -1046,6 +1046,9 @@ handle_java_data_operation_ioctl(struct pt_regs *ctx,
 
             java_remote_parent_incoming_t *fence_context_scratch =
                 java_remote_parent_incoming_snapshot_mem();
+            if (!fence_context_scratch) {
+                return 0;
+            }
             const u64 connection_netns_cookie =
                 java_remote_parent_receive_ioctl_fence_context_cookie(
                     (java_remote_parent_receive_context_t *)fence_context_scratch);
@@ -1066,13 +1069,19 @@ handle_java_data_operation_ioctl(struct pt_regs *ctx,
                                                                      connection_netns_cookie,
                                                                      workspace->socket_cookie);
             if (!generation_fenced) {
-                const java_remote_parent_key_t generation_key =
+                // The fence context has been fully authenticated and its cookie
+                // is now held as a scalar. Reuse that private per-CPU scratch for
+                // the exact key so this hook's frame remains safe on legacy
+                // verifiers that round every call frame to 32-byte quanta.
+                java_remote_parent_key_t *generation_key =
+                    (java_remote_parent_key_t *)fence_context_scratch;
+                *generation_key =
                     java_remote_parent_state_key(&fence_cursor->owner, fence_cursor->generation);
                 // Zero-alias generations are the normal sequential HTTP/1
                 // case. Remove O/F/S/I/C before publishing the next cursor so
                 // no BPF_NOEXIST key can reject its STAGE transaction.
                 generation_fenced = java_remote_parent_cleanup_exact_receive_zero_alias(
-                    &generation_key,
+                    generation_key,
                     fence_cursor->process_incarnation,
                     prepared_connection,
                     workspace->connection_netns,
@@ -1082,7 +1091,7 @@ handle_java_data_operation_ioctl(struct pt_regs *ctx,
                     // must detach O/F/C so both the old exact alias and the
                     // immediate next socket generation remain usable.
                     generation_fenced = java_remote_parent_detach_exact_receive_aliased(
-                        &generation_key,
+                        generation_key,
                         fence_cursor->process_incarnation,
                         prepared_connection,
                         workspace->connection_netns,

@@ -40,6 +40,9 @@ _Static_assert(offsetof(java_remote_parent_receive_ioctl_fence_context_t, tag) =
                "Java receive fence context tag offset mismatch");
 _Static_assert(offsetof(java_remote_parent_receive_ioctl_fence_context_t, zero_tail) == 16,
                "Java receive fence context tail offset mismatch");
+_Static_assert(sizeof(java_remote_parent_key_t) <=
+                   sizeof(java_remote_parent_receive_ioctl_fence_context_t),
+               "Java receive generation key exceeds fence context scratch");
 
 typedef struct java_remote_parent_receive_ioctl_workspace {
     java_remote_parent_receive_cursor_t cursor;
@@ -170,7 +173,7 @@ java_remote_parent_receive_ioctl_fence_context_init(java_remote_parent_receive_c
     };
 }
 
-static __always_inline u64 java_remote_parent_receive_ioctl_fence_context_cookie(
+static __noinline u64 java_remote_parent_receive_ioctl_fence_context_cookie(
     const java_remote_parent_receive_context_t *context) {
     const java_remote_parent_receive_ioctl_fence_context_t *fence_context =
         (const java_remote_parent_receive_ioctl_fence_context_t *)context;

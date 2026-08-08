@@ -5,8 +5,6 @@
 
 package io.opentelemetry.obi.java;
 
-import io.opentelemetry.obi.java.bridge.RemoteParentBridge;
-import io.opentelemetry.obi.java.bridge.RemoteParentStatus;
 import io.opentelemetry.obi.java.ebpf.IOCTLPacket;
 import io.opentelemetry.obi.java.ebpf.NativeMemory;
 import io.opentelemetry.obi.java.ebpf.OperationType;
@@ -27,6 +25,7 @@ public final class BootstrapNative {
   private static volatile LongBinaryOperator emitDataOnSocketForTest;
   private static volatile BiFunction<Integer, NativeMemory, Integer> emitTelemetryReceiveForTest;
   private static volatile ToIntFunction<Socket> socketFileDescriptorForTest;
+  private static volatile ToIntFunction<Socket> directSocketFileDescriptorForTest;
 
   private BootstrapNative() {}
 
@@ -35,6 +34,9 @@ public final class BootstrapNative {
   public static native int gettid();
 
   public static native int socketFileDescriptor(Socket socket);
+
+  /** Returns a descriptor only when a JSSE socket directly owns its physical transport. */
+  public static native int directSocketFileDescriptor(Socket socket);
 
   public static int emitData(Socket socket, long argp, boolean receive) {
     long receiveBridgeEpoch = 0L;
@@ -171,11 +173,68 @@ public final class BootstrapNative {
   }
 
   /**
-   * Emits unsupported {@link Socket} plaintext as telemetry without granting bridge authority.
+   * Checks whether an exact socket generation directly owns the descriptor fenced by its close
+   * advice. Layered JSSE sockets are deliberately rejected because their caller-owned underlying
+   * {@link Socket} can close and reuse the descriptor outside this lifecycle.
+   */
+  public static boolean isDirectRemoteParentSocket(Socket socket, Object expectedLifecycle) {
+    Lifecycle lifecycle = exactSocketLifecycle(socket, expectedLifecycle);
+    if (lifecycle == null) {
+      return false;
+    }
+    Lifecycle.Lease lease = lifecycle.acquireLookupLease();
+    if (lease == null) {
+      return false;
+    }
+    try {
+      return resolveDirectSocketFileDescriptor(socket) >= 0;
+    } finally {
+      lease.close();
+    }
+  }
+
+  /** Frames application-visible plaintext only for an exact, directly owned JSSE socket. */
+  public static int emitRemoteParentSocketReceive(
+      Socket socket, Object expectedLifecycle, byte[] plaintext, int offset, int length) {
+    if (!isDirectRemoteParentSocket(socket, expectedLifecycle)) {
+      rejectUnsupportedRemoteParentSocket(socket, expectedLifecycle);
+      return -1;
+    }
+    return SSLStorage.emitRemoteParentSocketReceive(
+        socket, expectedLifecycle, plaintext, offset, length);
+  }
+
+  /** Emits one framed HTTP/1 operation for an exact direct-JSSE socket generation. */
+  public static int emitHttp1Data(
+      Socket socket,
+      Object expectedLifecycle,
+      long argp,
+      OperationType operation,
+      boolean primaryAcknowledged,
+      long receiveBridgeEpoch) {
+    if (operation == OperationType.HTTP1_RECEIVE_START) {
+      return emitDirectSocketData(socket, expectedLifecycle, argp, true, receiveBridgeEpoch);
+    }
+    if (operation != OperationType.HTTP1_RECEIVE_CONTINUE
+        && operation != OperationType.HTTP1_RECEIVE_RESET) {
+      throw new IllegalArgumentException("not an HTTP/1 receive operation: " + operation);
+    }
+    return emitDirectSocketDataWithoutAcknowledgement(
+        socket, expectedLifecycle, argp, operation, primaryAcknowledged, receiveBridgeEpoch);
+  }
+
+  /** Emits direct-socket telemetry without negotiating or retaining parent authority. */
+  public static int emitTelemetryReceiveData(Socket socket, Object expectedLifecycle, long argp) {
+    return emitDirectSocketDataWithoutAcknowledgement(
+        socket, expectedLifecycle, argp, OperationType.TELEMETRY_RECEIVE, false, 0L);
+  }
+
+  /**
+   * Emits directly owned {@link Socket} plaintext as telemetry without granting bridge authority.
    *
-   * <p>The exact lifecycle captured before the application read fences descriptor reuse for every
-   * fragment. Unlike the legacy receive operation, telemetry never stages a parent or retains a
-   * descriptor. The callback is split at the fixed wire ceiling without overlap or loss.
+   * <p>A layered JSSE socket is rejected because its outer lifecycle cannot fence the caller-owned
+   * raw socket against close and descriptor reuse. Direct telemetry is split at the fixed wire
+   * ceiling without overlap or loss and never stages a parent or retains a descriptor.
    */
   public static int emitTelemetryReceiveData(
       Socket socket, Object expectedLifecycle, byte[] plaintext, int offset, int length) {
@@ -203,9 +262,11 @@ public final class BootstrapNative {
         return -1;
       }
 
-      int socketFileDescriptor = resolveSocketFileDescriptor(socket);
+      int socketFileDescriptor = resolveDirectSocketFileDescriptor(socket);
       if (socketFileDescriptor < 0) {
-        terminalFailure = true;
+        // Unsupported layered/custom ownership is nonterminal for the outer lifecycle. Retain it
+        // so diagnostics stay bounded and later callbacks continue to fail closed without ever
+        // resolving or emitting through the caller-owned raw descriptor.
         return -1;
       }
 
@@ -241,18 +302,134 @@ public final class BootstrapNative {
       }
       ThreadInfo.clearRemoteParentSocketFileDescriptor();
       ThreadInfo.blockRemoteParentLookup();
-      if (terminalFailure && lifecycle != null) {
-        invalidateRemoteParentSocketFileDescriptor(socket, lifecycle);
-      }
       if (recordUnsupported
           || ThreadInfo.isRemoteParentEnabled()
           || !ThreadInfo.isCurrentRemoteParentBridgeEpoch(bridgeEpoch)) {
         try {
-          RemoteParentBridge.recordReceiveFailure(RemoteParentStatus.UNSUPPORTED);
+          SSLStorage.recordUnsupportedSocketReceive(socket, lifecycle);
         } catch (Throwable ignored) {
         }
       }
+      if (terminalFailure && lifecycle != null) {
+        invalidateRemoteParentSocketFileDescriptor(socket, lifecycle);
+      }
     }
+  }
+
+  /** Rejects plaintext whose physical socket owner is not fenced by the supplied lifecycle. */
+  public static void rejectUnsupportedRemoteParentSocket(Socket socket, Object expectedLifecycle) {
+    ThreadInfo.beginRemoteParentReceiveAttempt();
+    long bridgeEpoch = ThreadInfo.remoteParentBridgeEpoch();
+    boolean recordUnsupported = ThreadInfo.isRemoteParentEnabled();
+    Lifecycle lifecycle = exactSocketLifecycle(socket, expectedLifecycle);
+    ThreadInfo.clearRemoteParentSocketFileDescriptor();
+    ThreadInfo.blockRemoteParentLookup();
+    if (lifecycle == null) {
+      return;
+    }
+    if (recordUnsupported
+        || ThreadInfo.isRemoteParentEnabled()
+        || !ThreadInfo.isCurrentRemoteParentBridgeEpoch(bridgeEpoch)) {
+      try {
+        SSLStorage.recordUnsupportedSocketReceive(socket, lifecycle);
+      } catch (Throwable ignored) {
+      }
+    }
+  }
+
+  private static int emitDirectSocketData(
+      Socket socket,
+      Object expectedLifecycle,
+      long argp,
+      boolean receive,
+      long receiveBridgeEpoch) {
+    if (receive) {
+      ThreadInfo.beginRemoteParentReceiveAttempt();
+    }
+    Lifecycle lifecycle = exactSocketLifecycle(socket, expectedLifecycle);
+    if (lifecycle == null) {
+      finishEmitDataFailure(receive, expectedLifecycle);
+      return -1;
+    }
+    Lifecycle.Lease lease = lifecycle.acquireLookupLease();
+    if (lease == null) {
+      finishEmitDataFailure(receive, lifecycle);
+      return -1;
+    }
+    int socketFileDescriptor;
+    int result;
+    try {
+      socketFileDescriptor = resolveDirectSocketFileDescriptor(socket);
+      result = socketFileDescriptor < 0 ? -1 : callEmitDataOnSocket(socketFileDescriptor, argp);
+    } catch (Throwable failure) {
+      lease.close();
+      finishEmitDataFailure(receive, lifecycle);
+      throw failure;
+    }
+    lease.close();
+    return finishEmitData(socketFileDescriptor, result, receive, lifecycle, receiveBridgeEpoch);
+  }
+
+  private static int emitDirectSocketDataWithoutAcknowledgement(
+      Socket socket,
+      Object expectedLifecycle,
+      long argp,
+      OperationType operation,
+      boolean primaryAcknowledged,
+      long receiveBridgeEpoch) {
+    ThreadInfo.beginRemoteParentReceiveAttempt();
+    Lifecycle lifecycle = exactSocketLifecycle(socket, expectedLifecycle);
+    if (lifecycle == null) {
+      ThreadInfo.clearRemoteParentSocketFileDescriptor();
+      ThreadInfo.blockRemoteParentLookup();
+      return -1;
+    }
+    Lifecycle.Lease lease = lifecycle.acquireLookupLease();
+    if (lease == null) {
+      ThreadInfo.clearRemoteParentSocketFileDescriptor();
+      ThreadInfo.blockRemoteParentLookup();
+      return -1;
+    }
+    int socketFileDescriptor;
+    int result;
+    try {
+      socketFileDescriptor = resolveDirectSocketFileDescriptor(socket);
+      result = socketFileDescriptor < 0 ? -1 : callEmitDataOnSocket(socketFileDescriptor, argp);
+    } catch (Throwable failure) {
+      lease.close();
+      ThreadInfo.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+      throw failure;
+    }
+    lease.close();
+
+    if (result < 0 || !lifecycle.active()) {
+      ThreadInfo.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+      return result < 0 ? result : -1;
+    }
+    if (operation == OperationType.HTTP1_RECEIVE_RESET
+        || operation == OperationType.TELEMETRY_RECEIVE) {
+      ThreadInfo.clearRemoteParentSocketFileDescriptor();
+      ThreadInfo.blockRemoteParentLookup();
+      return result;
+    }
+    if (!ThreadInfo.markRemoteParentDirectLookupIfCurrent(lifecycle, receiveBridgeEpoch)) {
+      ThreadInfo.clearRemoteParentSocketFileDescriptor();
+      ThreadInfo.blockRemoteParentLookup();
+      return result;
+    }
+    if (!primaryAcknowledged) {
+      ThreadInfo.clearRemoteParentSocketFileDescriptor();
+      return result;
+    }
+    if (!ThreadInfo.setRemoteParentSocketFileDescriptor(socketFileDescriptor, lifecycle)) {
+      ThreadInfo.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+      return -1;
+    }
+    if (!ThreadInfo.isCurrentRemoteParentBridgeCapability(receiveBridgeEpoch)) {
+      ThreadInfo.clearRemoteParentSocketFileDescriptor();
+      ThreadInfo.blockRemoteParentLookup();
+    }
+    return result;
   }
 
   private static int emitReceiveDataWithoutAcknowledgement(
@@ -354,6 +531,22 @@ public final class BootstrapNative {
     return testResolver == null ? socketFileDescriptor(socket) : testResolver.applyAsInt(socket);
   }
 
+  private static int resolveDirectSocketFileDescriptor(Socket socket) {
+    ToIntFunction<Socket> testResolver = directSocketFileDescriptorForTest;
+    return testResolver == null
+        ? directSocketFileDescriptor(socket)
+        : testResolver.applyAsInt(socket);
+  }
+
+  private static Lifecycle exactSocketLifecycle(Socket socket, Object expectedLifecycle) {
+    Lifecycle lifecycle = asLifecycle(expectedLifecycle);
+    return socket != null
+            && lifecycle != null
+            && SSLStorage.currentRemoteParentSocketLifecycle(socket) == lifecycle
+        ? lifecycle
+        : null;
+  }
+
   private static int finishEmitData(
       int socketFileDescriptor,
       int result,
@@ -445,6 +638,58 @@ public final class BootstrapNative {
     ThreadInfo.clearRemoteParentSocketFileDescriptor();
   }
 
+  /** Enters a socket read and captures its exact lifecycle before application I/O. */
+  public static Object beginRemoteParentSocketRead(Socket socket) {
+    Object scope = SSLStorage.beginRemoteParentSocketRead();
+    try {
+      return new Object[] {scope, SSLStorage.prepareRemoteParentSocketLifecycle(socket)};
+    } catch (Throwable failure) {
+      SSLStorage.endRemoteParentSocketRead(scope);
+      throw failure;
+    }
+  }
+
+  /** Returns the exact lifecycle captured by {@link #beginRemoteParentSocketRead(Socket)}. */
+  public static Object remoteParentSocketReadLifecycle(Object readState) {
+    if (!(readState instanceof Object[])) {
+      return null;
+    }
+    Object[] state = (Object[]) readState;
+    return state.length == 2 ? state[1] : null;
+  }
+
+  /** Claims a read only when it is the application-visible outermost callback. */
+  public static boolean claimRemoteParentSocketRead(
+      Object readState, Socket socket, Object lifecycle) {
+    if (!(readState instanceof Object[])) {
+      return false;
+    }
+    Object[] state = (Object[]) readState;
+    return state.length == 2 && SSLStorage.claimRemoteParentSocketRead(state[0], socket, lifecycle);
+  }
+
+  /** Poisons any successful inner owner before an enclosing read reports failure or EOF. */
+  public static void abortRemoteParentSocketRead(Object readState) {
+    if (!(readState instanceof Object[])) {
+      return;
+    }
+    Object[] state = (Object[]) readState;
+    if (state.length == 2) {
+      SSLStorage.abortRemoteParentSocketRead(state[0]);
+    }
+  }
+
+  /** Balances {@link #beginRemoteParentSocketRead(Socket)} on every read exit. */
+  public static void endRemoteParentSocketRead(Object readState) {
+    if (!(readState instanceof Object[])) {
+      return;
+    }
+    Object[] state = (Object[]) readState;
+    if (state.length == 2) {
+      SSLStorage.endRemoteParentSocketRead(state[0]);
+    }
+  }
+
   /** Invalidates a terminal receive lifecycle, including queued task aliases. */
   public static void invalidateRemoteParentSocketFileDescriptor(Object lifecycle) {
     ThreadInfo.invalidateRemoteParentSocketFileDescriptor(lifecycle);
@@ -457,8 +702,8 @@ public final class BootstrapNative {
   }
 
   /**
-   * Invalidates the exact lifecycle observed at read entry, preventing a late callback from
-   * revoking a fresh retry lifecycle for the same socket object.
+   * Poisons the exact lifecycle observed at read entry, preventing a late callback from revoking a
+   * different lifecycle and preventing a later read from resuming mid-request with a fresh framer.
    */
   public static void invalidateRemoteParentSocketFileDescriptor(Socket socket, Object lifecycle) {
     if (socket == null) {
@@ -473,10 +718,8 @@ public final class BootstrapNative {
       ThreadInfo.blockRemoteParentLookup();
       return;
     }
-    Object invalidated = SSLStorage.invalidateRemoteParentSocketLifecycle(socket, lifecycle);
-    if (invalidated != null) {
-      ThreadInfo.invalidateRemoteParentSocketFileDescriptor(invalidated);
-    }
+    Object poisoned = SSLStorage.poisonRemoteParentSocketLifecycle(socket, lifecycle);
+    ThreadInfo.invalidateRemoteParentSocketFileDescriptor(poisoned == null ? lifecycle : poisoned);
   }
 
   /** Marks a socket closing while retaining an inactive tombstone until close returns. */
@@ -594,5 +837,9 @@ public final class BootstrapNative {
 
   static void setSocketFileDescriptorForTest(ToIntFunction<Socket> resolver) {
     socketFileDescriptorForTest = resolver;
+  }
+
+  static void setDirectSocketFileDescriptorForTest(ToIntFunction<Socket> resolver) {
+    directSocketFileDescriptorForTest = resolver;
   }
 }

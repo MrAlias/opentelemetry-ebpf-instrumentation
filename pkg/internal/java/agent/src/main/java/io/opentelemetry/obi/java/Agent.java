@@ -58,6 +58,7 @@ public class Agent {
                   "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$ExactConnection",
                   "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$NettyConnectionScope",
                   "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$NettyHandlerScope",
+                  "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$SocketOwner",
                   "io.opentelemetry.obi.java.instrumentations.data.SSLStorage$TlsConnectionMarkerAttempt",
                   "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext",
                   "io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext$Lookup",

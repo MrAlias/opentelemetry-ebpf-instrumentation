@@ -524,7 +524,8 @@ class RemoteParentHttp1ReceiveTest {
 
     @Override
     public int emit(
-        Connection connection,
+        Object transport,
+        Lifecycle lifecycle,
         OperationType operation,
         ReceiveContext context,
         byte[] first,

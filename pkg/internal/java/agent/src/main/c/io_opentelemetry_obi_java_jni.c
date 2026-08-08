@@ -197,6 +197,43 @@ static int socket_file_descriptor(JNIEnv *env, jobject socket, int allow_self) {
   return result;
 }
 
+/*
+ * Resolves a descriptor only when BaseSSLSocketImpl.self is the supplied
+ * SSLSocket itself. A layered JSSE socket delegates to a caller-owned raw
+ * Socket; the outer SSLSocket lifecycle cannot fence that raw Socket's close.
+ */
+static int direct_socket_file_descriptor(JNIEnv *env, jobject socket) {
+  if (socket == NULL) {
+    return -1;
+  }
+
+  jclass object_class = (*env)->GetObjectClass(env, socket);
+  if (object_class == NULL) {
+    clear_jni_exception(env);
+    return -1;
+  }
+  jfieldID self_field =
+      (*env)->GetFieldID(env, object_class, "self", "Ljava/net/Socket;");
+  if (self_field == NULL) {
+    clear_jni_exception(env);
+    (*env)->DeleteLocalRef(env, object_class);
+    return -1;
+  }
+  jobject self = (*env)->GetObjectField(env, socket, self_field);
+  if (self == NULL || (*env)->ExceptionCheck(env)) {
+    clear_jni_exception(env);
+    if (self != NULL) {
+      (*env)->DeleteLocalRef(env, self);
+    }
+    (*env)->DeleteLocalRef(env, object_class);
+    return -1;
+  }
+  int direct = (*env)->IsSameObject(env, socket, self);
+  (*env)->DeleteLocalRef(env, self);
+  (*env)->DeleteLocalRef(env, object_class);
+  return direct ? socket_file_descriptor(env, socket, 0) : -1;
+}
+
 static void write_u16_le(unsigned char *buffer, size_t offset, uint16_t value) {
   buffer[offset] = (unsigned char)(value & 0xff);
   buffer[offset + 1] = (unsigned char)(value >> 8);
@@ -1240,6 +1277,17 @@ JNIEXPORT jint JNICALL
 Java_io_opentelemetry_obi_java_BootstrapNative_socketFileDescriptor(
     JNIEnv *env, jclass clazz, jobject socket) {
   return (jint)socket_file_descriptor(env, socket, 1);
+}
+
+/*
+ * Class:     io_opentelemetry_obi_java_BootstrapNative
+ * Method:    directSocketFileDescriptor
+ * Signature: (Ljava/net/Socket;)I
+ */
+JNIEXPORT jint JNICALL
+Java_io_opentelemetry_obi_java_BootstrapNative_directSocketFileDescriptor(
+    JNIEnv *env, jclass clazz, jobject socket) {
+  return (jint)direct_socket_file_descriptor(env, socket);
 }
 
 /*

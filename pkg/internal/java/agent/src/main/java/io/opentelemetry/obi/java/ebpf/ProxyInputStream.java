@@ -21,78 +21,111 @@ public class ProxyInputStream extends InputStream {
 
   @Override
   public int read() throws IOException {
-    Object lifecycle = prepareRemoteParentSocketLifecycle();
-    int value;
+    Object readState = beginRemoteParentSocketRead();
+    Object lifecycle = remoteParentSocketReadLifecycle(readState);
     try {
-      value = delegate.read();
-    } catch (IOException | RuntimeException | Error failure) {
-      invalidateRemoteParentSocketFileDescriptor(lifecycle);
-      throw failure;
-    }
-    if (value < 0) {
-      invalidateRemoteParentSocketFileDescriptor(lifecycle);
-      return value;
-    }
+      int value;
+      try {
+        value = delegate.read();
+      } catch (IOException | RuntimeException | Error failure) {
+        abortRemoteParentSocketRead(readState);
+        invalidateRemoteParentSocketFileDescriptor(lifecycle);
+        throw failure;
+      }
+      if (value < 0) {
+        abortRemoteParentSocketRead(readState);
+        invalidateRemoteParentSocketFileDescriptor(lifecycle);
+        return value;
+      }
 
-    byte[] singleByte = {(byte) value};
-    try {
-      forwardRead(singleByte, 0, 1, lifecycle);
-    } catch (Throwable failure) {
-      invalidateRemoteParentSocketFileDescriptor(lifecycle);
+      byte[] singleByte = {(byte) value};
+      if (claimRemoteParentSocketRead(readState, lifecycle)) {
+        try {
+          forwardRead(singleByte, 0, 1, lifecycle);
+        } catch (Throwable failure) {
+          invalidateRemoteParentSocketFileDescriptor(lifecycle);
+        }
+      }
+      return value;
+    } finally {
+      endRemoteParentSocketRead(readState);
     }
-    return value;
   }
 
   @Override
   public int read(byte[] b) throws IOException {
-    Object lifecycle = prepareRemoteParentSocketLifecycle();
-    int len;
+    Object readState = beginRemoteParentSocketRead();
+    Object lifecycle = remoteParentSocketReadLifecycle(readState);
     try {
-      len = delegate.read(b);
-    } catch (IOException | RuntimeException | Error failure) {
-      invalidateRemoteParentSocketFileDescriptor(lifecycle);
-      throw failure;
-    }
-    if (len > 0) {
       try {
-        forwardRead(b, 0, len, lifecycle);
-      } catch (Throwable failure) {
+        int len = delegate.read(b);
+        if (len > 0 && claimRemoteParentSocketRead(readState, lifecycle)) {
+          try {
+            forwardRead(b, 0, len, lifecycle);
+          } catch (Throwable failure) {
+            invalidateRemoteParentSocketFileDescriptor(lifecycle);
+          }
+        } else if (len < 0) {
+          abortRemoteParentSocketRead(readState);
+          invalidateRemoteParentSocketFileDescriptor(lifecycle);
+        } else if (len == 0) {
+          abortRemoteParentSocketRead(readState);
+        }
+        return len;
+      } catch (IOException | RuntimeException | Error failure) {
+        abortRemoteParentSocketRead(readState);
         invalidateRemoteParentSocketFileDescriptor(lifecycle);
+        throw failure;
       }
-    } else if (len < 0) {
-      invalidateRemoteParentSocketFileDescriptor(lifecycle);
+    } finally {
+      endRemoteParentSocketRead(readState);
     }
-    return len;
   }
 
   @Override
   public int read(byte[] b, int off, int len) throws IOException {
-    Object lifecycle = prepareRemoteParentSocketLifecycle();
-    int bytesRead;
+    Object readState = beginRemoteParentSocketRead();
+    Object lifecycle = remoteParentSocketReadLifecycle(readState);
     try {
-      bytesRead = delegate.read(b, off, len);
-    } catch (IOException | RuntimeException | Error failure) {
-      invalidateRemoteParentSocketFileDescriptor(lifecycle);
-      throw failure;
-    }
-    if (bytesRead > 0) {
       try {
-        forwardRead(b, off, bytesRead, lifecycle);
-      } catch (Throwable failure) {
+        int bytesRead = delegate.read(b, off, len);
+        if (bytesRead > 0 && claimRemoteParentSocketRead(readState, lifecycle)) {
+          try {
+            forwardRead(b, off, bytesRead, lifecycle);
+          } catch (Throwable failure) {
+            invalidateRemoteParentSocketFileDescriptor(lifecycle);
+          }
+        } else if (bytesRead < 0) {
+          abortRemoteParentSocketRead(readState);
+          invalidateRemoteParentSocketFileDescriptor(lifecycle);
+        } else if (bytesRead == 0) {
+          abortRemoteParentSocketRead(readState);
+        }
+        return bytesRead;
+      } catch (IOException | RuntimeException | Error failure) {
+        abortRemoteParentSocketRead(readState);
         invalidateRemoteParentSocketFileDescriptor(lifecycle);
+        throw failure;
       }
-    } else if (bytesRead < 0) {
-      invalidateRemoteParentSocketFileDescriptor(lifecycle);
+    } finally {
+      endRemoteParentSocketRead(readState);
     }
-    return bytesRead;
   }
 
   void forwardRead(byte[] b, int off, int len) {
-    forwardRead(b, off, len, prepareRemoteParentSocketLifecycle());
+    Object readState = beginRemoteParentSocketRead();
+    try {
+      Object lifecycle = remoteParentSocketReadLifecycle(readState);
+      if (claimRemoteParentSocketRead(readState, lifecycle)) {
+        forwardRead(b, off, len, lifecycle);
+      }
+    } finally {
+      endRemoteParentSocketRead(readState);
+    }
   }
 
   void forwardRead(byte[] b, int off, int len, Object lifecycle) {
-    BootstrapNative.emitTelemetryReceiveData(socket, lifecycle, b, off, len);
+    BootstrapNative.emitRemoteParentSocketReceive(socket, lifecycle, b, off, len);
   }
 
   static int writeReadPacket(NativeMemory p, Socket socket, byte[] b, int off, int len) {
@@ -122,12 +155,44 @@ public class ProxyInputStream extends InputStream {
     }
   }
 
-  private Object prepareRemoteParentSocketLifecycle() {
+  private Object beginRemoteParentSocketRead() {
     try {
-      return BootstrapNative.prepareRemoteParentSocketLifecycle(socket);
+      return BootstrapNative.beginRemoteParentSocketRead(socket);
     } catch (Throwable failure) {
       // Instrumentation must never prevent or replace the application read.
       return null;
+    }
+  }
+
+  private static Object remoteParentSocketReadLifecycle(Object readState) {
+    try {
+      return BootstrapNative.remoteParentSocketReadLifecycle(readState);
+    } catch (Throwable failure) {
+      return null;
+    }
+  }
+
+  private boolean claimRemoteParentSocketRead(Object readState, Object lifecycle) {
+    try {
+      return BootstrapNative.claimRemoteParentSocketRead(readState, socket, lifecycle);
+    } catch (Throwable failure) {
+      return false;
+    }
+  }
+
+  private static void abortRemoteParentSocketRead(Object readState) {
+    try {
+      BootstrapNative.abortRemoteParentSocketRead(readState);
+    } catch (Throwable failure) {
+      // Instrumentation cleanup must not replace the application's result or exception.
+    }
+  }
+
+  private static void endRemoteParentSocketRead(Object readState) {
+    try {
+      BootstrapNative.endRemoteParentSocketRead(readState);
+    } catch (Throwable failure) {
+      // Instrumentation cleanup must not replace the application's result or exception.
     }
   }
 }

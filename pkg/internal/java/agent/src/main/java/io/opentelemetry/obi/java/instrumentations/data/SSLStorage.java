@@ -68,7 +68,7 @@ public class SSLStorage {
       new WeakIdentityConcurrentMap<>(MAX_CONCURRENT);
   private static final WeakIdentityConcurrentMap<Object> nettyCloseHookLoaders =
       new WeakIdentityConcurrentMap<>(MAX_CONCURRENT);
-  private static final WeakIdentityConcurrentMap<Lifecycle> socketRemoteParentLifecycles =
+  private static final WeakIdentityConcurrentMap<SocketOwner> socketRemoteParentOwners =
       new WeakIdentityConcurrentMap<>(MAX_CONCURRENT);
   private static final CappedConcurrentHashMap<ExactConnection, ConnectionOwner> activeConnections =
       new CappedConcurrentHashMap<>(MAX_CONCURRENT, new ActiveConnectionEvictionListener());
@@ -81,6 +81,7 @@ public class SSLStorage {
   private static final ThreadLocal<ArrayDeque<Boolean>> executorTaskScopes = new ThreadLocal<>();
   private static final ThreadLocal<Boolean> virtualThreadTaskScope = new ThreadLocal<>();
   private static final ThreadLocal<Integer> remoteParentUnwrapDepth = new ThreadLocal<>();
+  private static final ThreadLocal<Object[]> remoteParentSocketReadScope = new ThreadLocal<>();
   private static volatile LongSupplier threadIdProviderForTest;
   private static volatile LongSupplier tlsConnectionMarkerClockForTest;
   private static volatile Runnable beforeLegacyReceiveEmitForTest;
@@ -247,9 +248,152 @@ public class SSLStorage {
     remoteParentUnwrapDepth.remove();
   }
 
+  /**
+   * Enters one possibly nested {@code SSLSocket} stream read.
+   *
+   * <p>The shared scope lets only the outermost successful callback process plaintext. An inner
+   * default-JSSE read can fill a buffer that an enclosing proxy subsequently truncates or
+   * transforms, so it must not publish authority before the application-visible read completes.
+   */
+  public static Object beginRemoteParentSocketRead() {
+    ThreadInfo.beginRemoteParentReceiveScope();
+    Object[] scope = remoteParentSocketReadScope.get();
+    if (scope == null) {
+      // depth, deferred socket, deferred lifecycle, ambiguous nested ownership
+      scope = new Object[] {Integer.valueOf(1), null, null, Boolean.FALSE};
+      remoteParentSocketReadScope.set(scope);
+      return scope;
+    }
+    scope[0] = Integer.valueOf(((Integer) scope[0]).intValue() + 1);
+    return scope;
+  }
+
+  /**
+   * Claims only the application-visible, outermost callback across nested stream wrappers.
+   *
+   * <p>A successful inner callback records its exact socket generation but emits nothing. The
+   * outermost callback either consumes that same owner and processes its own returned bytes, or
+   * poisons both generations when a different socket is visible. Multiple nested owners are
+   * ambiguous and are all failed closed.
+   */
+  public static boolean claimRemoteParentSocketRead(
+      Object candidate, Socket socket, Object lifecycle) {
+    if (!(candidate instanceof Object[])) {
+      return false;
+    }
+    Object[] scope = (Object[]) candidate;
+    if (remoteParentSocketReadScope.get() != scope) {
+      return false;
+    }
+
+    int depth = ((Integer) scope[0]).intValue();
+    if (depth <= 1) {
+      Socket deferredSocket = scope[1] instanceof Socket ? (Socket) scope[1] : null;
+      Object deferredLifecycle = scope[2];
+      if (Boolean.TRUE.equals(scope[3])) {
+        poisonDeferredRemoteParentSocketRead(scope);
+        poisonRemoteParentSocketRead(socket, lifecycle);
+        return false;
+      }
+      if (deferredSocket == null) {
+        return true;
+      }
+      if (deferredSocket == socket && deferredLifecycle == lifecycle) {
+        scope[1] = null;
+        scope[2] = null;
+        return true;
+      }
+      poisonDeferredRemoteParentSocketRead(scope);
+      poisonRemoteParentSocketRead(socket, lifecycle);
+      scope[3] = Boolean.TRUE;
+      return false;
+    }
+
+    if (!(lifecycle instanceof Lifecycle) || socket == null) {
+      scope[3] = Boolean.TRUE;
+      return false;
+    }
+    if (Boolean.TRUE.equals(scope[3])) {
+      poisonRemoteParentSocketRead(socket, lifecycle);
+      return false;
+    }
+
+    Socket deferredSocket = scope[1] instanceof Socket ? (Socket) scope[1] : null;
+    Object deferredLifecycle = scope[2];
+    if (deferredSocket == null) {
+      scope[1] = socket;
+      scope[2] = lifecycle;
+      return false;
+    }
+    if (deferredSocket == socket && deferredLifecycle == lifecycle) {
+      return false;
+    }
+
+    poisonDeferredRemoteParentSocketRead(scope);
+    poisonRemoteParentSocketRead(socket, lifecycle);
+    scope[3] = Boolean.TRUE;
+    return false;
+  }
+
+  /** Poisons any successful inner owner when an enclosing read fails or reaches EOF. */
+  public static void abortRemoteParentSocketRead(Object candidate) {
+    if (!(candidate instanceof Object[])) {
+      return;
+    }
+    Object[] scope = (Object[]) candidate;
+    if (remoteParentSocketReadScope.get() == scope) {
+      poisonDeferredRemoteParentSocketRead(scope);
+      scope[3] = Boolean.TRUE;
+    }
+  }
+
+  /** Balances {@link #beginRemoteParentSocketRead()} on every application and advice exit. */
+  public static void endRemoteParentSocketRead(Object candidate) {
+    try {
+      if (!(candidate instanceof Object[])) {
+        return;
+      }
+      Object[] scope = (Object[]) candidate;
+      if (remoteParentSocketReadScope.get() != scope) {
+        return;
+      }
+      int depth = ((Integer) scope[0]).intValue();
+      if (depth <= 1) {
+        poisonDeferredRemoteParentSocketRead(scope);
+        remoteParentSocketReadScope.remove();
+      } else {
+        scope[0] = Integer.valueOf(depth - 1);
+      }
+    } finally {
+      ThreadInfo.endRemoteParentReceiveScope();
+    }
+  }
+
+  private static void poisonDeferredRemoteParentSocketRead(Object[] scope) {
+    Socket socket = scope[1] instanceof Socket ? (Socket) scope[1] : null;
+    Object lifecycle = scope[2];
+    scope[1] = null;
+    scope[2] = null;
+    poisonRemoteParentSocketRead(socket, lifecycle);
+  }
+
+  private static void poisonRemoteParentSocketRead(Socket socket, Object lifecycle) {
+    if (socket == null || !(lifecycle instanceof Lifecycle)) {
+      return;
+    }
+    try {
+      Object poisoned = poisonRemoteParentSocketLifecycle(socket, lifecycle);
+      ThreadInfo.invalidateRemoteParentSocketFileDescriptor(
+          poisoned == null ? lifecycle : poisoned);
+    } catch (Throwable ignored) {
+      // Nested-read bookkeeping must never replace the application's result or exception.
+    }
+  }
+
   /** Returns an existing lifecycle for a socket without allocating one on a terminal path. */
   public static Object currentRemoteParentSocketLifecycle(Socket socket) {
-    Lifecycle lifecycle = socket == null ? null : socketRemoteParentLifecycles.get(socket);
+    SocketOwner owner = socket == null ? null : socketRemoteParentOwners.get(socket);
+    Lifecycle lifecycle = owner == null ? null : owner.lifecycle;
     return lifecycle != null && lifecycle.active() ? lifecycle : null;
   }
 
@@ -268,22 +412,23 @@ public class SSLStorage {
     if (current != null) {
       return current;
     }
-    if (socketRemoteParentLifecycles.get(socket) != null) {
+    if (socketRemoteParentOwners.get(socket) != null) {
       return null;
     }
 
-    Lifecycle candidate = new Lifecycle(socket);
-    if (socketRemoteParentLifecycles.putIfAbsent(socket, candidate)) {
-      return candidate;
+    SocketOwner candidate = new SocketOwner(socket);
+    if (socketRemoteParentOwners.putIfAbsent(socket, candidate)) {
+      return candidate.lifecycle;
     }
     return currentRemoteParentSocketLifecycle(socket);
   }
 
   /**
-   * Invalidates and removes a terminal socket lifecycle.
+   * Explicitly invalidates and removes a socket lifecycle.
    *
-   * <p>When an expected lifecycle is supplied, a delayed callback can revoke only its original
-   * socket generation and never a lifecycle created after a retry or descriptor reuse.
+   * <p>This removable path is intended for deterministic cleanup and tests. Production terminal
+   * receive paths use {@link #poisonRemoteParentSocketLifecycle(Socket, Object)} so another read
+   * cannot resurrect a fresh parser on the same still-open socket.
    */
   public static Object invalidateRemoteParentSocketLifecycle(Socket socket, Object expected) {
     if (!(expected instanceof Lifecycle)) {
@@ -296,12 +441,47 @@ public class SSLStorage {
       return expectedLifecycle;
     }
 
-    Lifecycle lifecycle = socketRemoteParentLifecycles.get(socket);
+    SocketOwner owner = socketRemoteParentOwners.get(socket);
+    if (owner != null && owner.lifecycle == expectedLifecycle) {
+      owner.close(socket);
+    }
     expectedLifecycle.invalidate();
-    if (lifecycle == expectedLifecycle) {
-      socketRemoteParentLifecycles.remove(socket, expectedLifecycle);
+    if (owner != null && owner.lifecycle == expectedLifecycle) {
+      socketRemoteParentOwners.remove(socket, owner);
     }
     return expectedLifecycle;
+  }
+
+  /**
+   * Retires an exact socket lifecycle while retaining its inactive weak-map owner until close.
+   *
+   * <p>The retained owner is a fail-closed tombstone: subsequent reads cannot allocate a fresh
+   * framer and reinterpret continuation bytes as a new request. A delayed callback for an older
+   * lifecycle never closes or invalidates a newer exact owner.
+   */
+  public static Object poisonRemoteParentSocketLifecycle(Socket socket, Object expected) {
+    if (!(expected instanceof Lifecycle)) {
+      return null;
+    }
+
+    Lifecycle expectedLifecycle = (Lifecycle) expected;
+    if (socket == null) {
+      expectedLifecycle.invalidate();
+      return expectedLifecycle;
+    }
+
+    SocketOwner owner = socketRemoteParentOwners.get(socket);
+    if (owner == null || owner.lifecycle != expectedLifecycle) {
+      expectedLifecycle.invalidate();
+      return null;
+    }
+    try {
+      owner.close(socket);
+    } catch (Throwable ignored) {
+      // Poisoning is terminal even when best-effort framer/native cleanup fails.
+    }
+    expectedLifecycle.invalidate();
+    return socketRemoteParentOwners.get(socket) == owner ? expectedLifecycle : null;
   }
 
   /**
@@ -314,40 +494,94 @@ public class SSLStorage {
     }
 
     while (true) {
-      Lifecycle current = socketRemoteParentLifecycles.get(socket);
-      if (current != null && current.retainCloseTombstoneIfOpen()) {
-        return current;
+      SocketOwner current = socketRemoteParentOwners.get(socket);
+      if (current != null && current.lifecycle.retainCloseTombstoneIfOpen()) {
+        return current.lifecycle;
       }
 
-      Lifecycle tombstone = Lifecycle.newCloseTombstone();
+      SocketOwner tombstone = new SocketOwner(Lifecycle.newCloseTombstone());
       if (current == null) {
-        if (socketRemoteParentLifecycles.putIfAbsent(socket, tombstone)) {
-          return tombstone;
+        if (socketRemoteParentOwners.putIfAbsent(socket, tombstone)) {
+          return tombstone.lifecycle;
         }
         // putIfAbsent also returns false when the capped weak map has no room. Do not spin in a
         // close path in that case: another thread can be observed on the next get, while a still
         // absent socket must fail locally without revoking an unrelated lifecycle.
-        if (socketRemoteParentLifecycles.get(socket) == null) {
+        if (socketRemoteParentOwners.get(socket) == null) {
           return null;
         }
         continue;
       }
 
-      current.invalidate();
-      if (socketRemoteParentLifecycles.replace(socket, current, tombstone)) {
-        return tombstone;
+      current.close(socket);
+      current.lifecycle.invalidate();
+      if (socketRemoteParentOwners.replace(socket, current, tombstone)) {
+        return tombstone.lifecycle;
       }
     }
   }
 
   /** Removes the temporary close tombstone after the socket close method returns. */
   public static void finishRemoteParentSocketClose(Socket socket, Object lifecycle) {
-    if (socket != null
-        && lifecycle instanceof Lifecycle
-        && ((Lifecycle) lifecycle).isCloseTombstone()
-        && ((Lifecycle) lifecycle).releaseCloseTombstone()) {
-      socketRemoteParentLifecycles.remove(socket, (Lifecycle) lifecycle);
+    if (socket == null || !(lifecycle instanceof Lifecycle)) {
+      return;
     }
+    Lifecycle expected = (Lifecycle) lifecycle;
+    SocketOwner owner = socketRemoteParentOwners.get(socket);
+    if (owner != null
+        && owner.lifecycle == expected
+        && expected.isCloseTombstone()
+        && expected.releaseCloseTombstone()) {
+      socketRemoteParentOwners.remove(socket, owner);
+    }
+  }
+
+  /** Frames and emits plaintext for one exact direct-JSSE socket generation. */
+  public static int emitRemoteParentSocketReceive(
+      Socket socket, Object expectedLifecycle, byte[] plaintext, int offset, int length) {
+    SocketOwner owner = socket == null ? null : socketRemoteParentOwners.get(socket);
+    if (owner == null
+        || owner.lifecycle != expectedLifecycle
+        || owner.receive == null
+        || !owner.lifecycle.active()) {
+      ThreadInfo.beginRemoteParentReceiveAttempt();
+      ThreadInfo.clearRemoteParentSocketFileDescriptor();
+      ThreadInfo.blockRemoteParentLookup();
+      return -1;
+    }
+    int status;
+    try {
+      status = owner.receive.emit(socket, plaintext, offset, length);
+    } catch (Throwable failure) {
+      poisonSocketOwner(socket, owner);
+      throw failure;
+    }
+    if (status < 0) {
+      poisonSocketOwner(socket, owner);
+    } else {
+      RemoteParentBridge.recordTlsRead(length);
+    }
+    return status;
+  }
+
+  /** Records unsupported socket plaintext at most once for one exact socket generation. */
+  public static void recordUnsupportedSocketReceive(Socket socket, Object expectedLifecycle) {
+    SocketOwner owner = socket == null ? null : socketRemoteParentOwners.get(socket);
+    if (owner != null
+        && owner.lifecycle == expectedLifecycle
+        && owner.unsupportedRecorded.compareAndSet(false, true)) {
+      RemoteParentBridge.recordReceiveFailure(
+          io.opentelemetry.obi.java.bridge.RemoteParentStatus.UNSUPPORTED);
+    }
+  }
+
+  private static void poisonSocketOwner(Socket socket, SocketOwner owner) {
+    if (owner == null) {
+      return;
+    }
+    Object poisoned = poisonRemoteParentSocketLifecycle(socket, owner.lifecycle);
+    ThreadInfo.invalidateRemoteParentSocketFileDescriptor(
+        poisoned == null ? owner.lifecycle : poisoned);
   }
 
   /** Returns the exact active connection-owner lifecycle for an engine receive. */
@@ -1804,6 +2038,29 @@ public class SSLStorage {
     @Override
     public boolean active() {
       return isRegistered(this);
+    }
+  }
+
+  static final class SocketOwner {
+    private final Lifecycle lifecycle;
+    private final RemoteParentHttp1Receive receive;
+    private final AtomicBoolean unsupportedRecorded = new AtomicBoolean();
+
+    SocketOwner(Socket socket) {
+      this.lifecycle = new Lifecycle(socket);
+      this.receive =
+          new RemoteParentHttp1Receive(this.lifecycle, ThreadInfo.remoteParentBridgeEpoch());
+    }
+
+    SocketOwner(Lifecycle tombstone) {
+      this.lifecycle = tombstone;
+      this.receive = null;
+    }
+
+    void close(Socket socket) {
+      if (receive != null) {
+        receive.close(socket);
+      }
     }
   }
 

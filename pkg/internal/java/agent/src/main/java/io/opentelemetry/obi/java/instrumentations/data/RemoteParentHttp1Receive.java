@@ -16,6 +16,7 @@ import io.opentelemetry.obi.java.instrumentations.data.RemoteParentHttp1Framer.A
 import io.opentelemetry.obi.java.instrumentations.data.RemoteParentHttp1Framer.ReceivePlan;
 import io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext.Lifecycle;
 import io.opentelemetry.obi.java.instrumentations.data.RemoteParentSocketContext.ReceiveContext;
+import java.net.Socket;
 import java.util.function.IntConsumer;
 
 /** Serialized HTTP/1 receive framing and native emission for one physical connection lifecycle. */
@@ -70,8 +71,8 @@ final class RemoteParentHttp1Receive implements RemoteParentSocketContext.Extrac
     bridgeCapabilityIssued = ThreadInfo.isCurrentRemoteParentBridgeCapability(bridgeEpoch);
   }
 
-  synchronized int emit(Connection connection, byte[] source, int offset, int length) {
-    if (closed || connection == null || !lifecycle.active()) {
+  synchronized int emit(Object transport, byte[] source, int offset, int length) {
+    if (closed || !supportedTransport(transport) || !lifecycle.active()) {
       ThreadInfo.beginRemoteParentReceiveAttempt();
       ThreadInfo.clearRemoteParentSocketFileDescriptor();
       return -1;
@@ -83,8 +84,8 @@ final class RemoteParentHttp1Receive implements RemoteParentSocketContext.Extrac
       throw new IndexOutOfBoundsException("invalid source range");
     }
     if (bridgeRetired || !bridgeEpochCurrent()) {
-      int transitionStatus = retireBridgeEpoch(connection);
-      int telemetryStatus = emitTelemetryFragments(connection, EMPTY, source, offset, length);
+      int transitionStatus = retireBridgeEpoch(transport);
+      int telemetryStatus = emitTelemetryFragments(transport, EMPTY, source, offset, length);
       return mergeStatus(transitionStatus, telemetryStatus);
     }
 
@@ -97,19 +98,19 @@ final class RemoteParentHttp1Receive implements RemoteParentSocketContext.Extrac
     if (!bridgeEpochCurrent()) {
       if (action == Action.AMBIGUOUS) {
         recordTerminalFailureOnce(RemoteParentStatus.AMBIGUOUS);
-        return retireBridgeEpoch(connection);
+        return retireBridgeEpoch(transport);
       }
       if (action == Action.DEFER) {
         // The framer retained this callback together with any older prelude; retirement drains the
         // exact non-overlapping prefix once.
-        return retireBridgeEpoch(connection);
+        return retireBridgeEpoch(transport);
       }
       byte[] prefix =
           action == Action.START
               ? plan.deferredPrefix()
               : action == Action.UNTRACKED ? plan.telemetryPrefix() : EMPTY;
-      int transitionStatus = retireBridgeEpoch(connection);
-      int telemetryStatus = emitTelemetryFragments(connection, prefix, source, offset, length);
+      int transitionStatus = retireBridgeEpoch(transport);
+      int telemetryStatus = emitTelemetryFragments(transport, prefix, source, offset, length);
       return mergeStatus(transitionStatus, telemetryStatus);
     }
     if (action == Action.NOOP) {
@@ -121,19 +122,19 @@ final class RemoteParentHttp1Receive implements RemoteParentSocketContext.Extrac
     }
     if (action == Action.AMBIGUOUS) {
       recordTerminalFailureOnce(RemoteParentStatus.AMBIGUOUS);
-      int status = resetTerminalSequence(connection, plan.requestSequence());
+      int status = resetTerminalSequence(transport, plan.requestSequence());
       releaseActiveContext();
       return status;
     }
     if (action == Action.UNTRACKED) {
       recordTerminalFailureOnce(RemoteParentStatus.UNSUPPORTED);
-      int resetStatus = resetTerminalSequence(connection, plan.requestSequence());
+      int resetStatus = resetTerminalSequence(transport, plan.requestSequence());
       releaseActiveContext();
       if (resetStatus < 0) {
         return resetStatus;
       }
       return emitTelemetryFragments(
-          connection, plan.telemetryPrefix(), source, plan.offset(), plan.length());
+          transport, plan.telemetryPrefix(), source, plan.offset(), plan.length());
     }
 
     ReceiveContext context;
@@ -154,14 +155,14 @@ final class RemoteParentHttp1Receive implements RemoteParentSocketContext.Extrac
     }
 
     byte[] prefix = action == Action.START ? plan.deferredPrefix() : EMPTY;
-    int result = emitFragments(connection, operation, context, prefix, source, plan);
+    int result = emitFragments(transport, operation, context, prefix, source, plan);
     if (result < 0) {
       releaseActiveContext();
       return result;
     }
 
     if (bridgeRetired || !bridgeEpochCurrent()) {
-      return mergeStatus(result, retireBridgeEpoch(connection));
+      return mergeStatus(result, retireBridgeEpoch(transport));
     }
 
     if (extractionObservedSequence == context.requestSequence()) {
@@ -174,14 +175,14 @@ final class RemoteParentHttp1Receive implements RemoteParentSocketContext.Extrac
     }
     if (!ThreadInfo.markRemoteParentDirectReceiveContext(context)) {
       if (!bridgeEpochCurrent()) {
-        return mergeStatus(result, retireBridgeEpoch(connection));
+        return mergeStatus(result, retireBridgeEpoch(transport));
       }
       BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
       releaseActiveContext();
       return -1;
     }
     if (!bridgeEpochCurrent()) {
-      return mergeStatus(result, retireBridgeEpoch(connection));
+      return mergeStatus(result, retireBridgeEpoch(transport));
     }
     return result;
   }
@@ -202,12 +203,12 @@ final class RemoteParentHttp1Receive implements RemoteParentSocketContext.Extrac
   }
 
   /** Best-effort native reset followed by unconditional local release for a terminal owner. */
-  synchronized int close(Connection connection) {
+  synchronized int close(Object transport) {
     if (closed) {
       return 0;
     }
     if (bridgeRetired || !bridgeEpochCurrent()) {
-      int status = retireBridgeEpoch(connection);
+      int status = retireBridgeEpoch(transport);
       closed = true;
       ThreadInfo.beginRemoteParentReceiveAttempt();
       ThreadInfo.revokeRemoteParentLookup(lifecycle);
@@ -220,7 +221,7 @@ final class RemoteParentHttp1Receive implements RemoteParentSocketContext.Extrac
     ReceiveContext context = activeContext;
     if (context != null && lifecycle.active()) {
       try {
-        status = resetTerminalSequence(connection, context.requestSequence());
+        status = resetTerminalSequence(transport, context.requestSequence());
       } catch (Throwable failure) {
         status = -1;
       }
@@ -228,7 +229,7 @@ final class RemoteParentHttp1Receive implements RemoteParentSocketContext.Extrac
     releaseActiveContext();
     if (status >= 0 && deferred.length > 0 && lifecycle.active()) {
       try {
-        status = emitTelemetryFragments(connection, deferred, EMPTY, 0, 0);
+        status = emitTelemetryFragments(transport, deferred, EMPTY, 0, 0);
       } catch (Throwable failure) {
         status = -1;
       }
@@ -238,15 +239,15 @@ final class RemoteParentHttp1Receive implements RemoteParentSocketContext.Extrac
   }
 
   /** Retires authority before one disabled-mode fragment takes the exact legacy RECEIVE path. */
-  synchronized int beforeLegacyReceive(Connection connection) {
-    if (closed || connection == null || !lifecycle.active()) {
+  synchronized int beforeLegacyReceive(Object transport) {
+    if (closed || !supportedTransport(transport) || !lifecycle.active()) {
       return -1;
     }
-    return retireBridgeEpoch(connection);
+    return retireBridgeEpoch(transport);
   }
 
   private int emitFragments(
-      Connection connection,
+      Object transport,
       OperationType firstOperation,
       ReceiveContext context,
       byte[] prefix,
@@ -260,10 +261,10 @@ final class RemoteParentHttp1Receive implements RemoteParentSocketContext.Extrac
 
     while (prefixOffset < prefix.length || sourceRemaining > 0) {
       if (!bridgeEpochCurrent()) {
-        int transitionStatus = retireBridgeEpoch(connection);
+        int transitionStatus = retireBridgeEpoch(transport);
         int telemetryStatus =
             emitTelemetryFragments(
-                connection,
+                transport,
                 slice(prefix, prefixOffset, prefix.length - prefixOffset),
                 source,
                 sourceOffset,
@@ -277,7 +278,8 @@ final class RemoteParentHttp1Receive implements RemoteParentSocketContext.Extrac
               && extractionObservedSequence != context.requestSequence();
       int status =
           emitter.emit(
-              connection,
+              transport,
+              lifecycle,
               operation,
               context,
               prefix,
@@ -303,10 +305,10 @@ final class RemoteParentHttp1Receive implements RemoteParentSocketContext.Extrac
       sourceRemaining -= sourceLength;
       operation = OperationType.HTTP1_RECEIVE_CONTINUE;
       if (!bridgeEpochCurrent()) {
-        int transitionStatus = retireBridgeEpoch(connection);
+        int transitionStatus = retireBridgeEpoch(transport);
         int telemetryStatus =
             emitTelemetryFragments(
-                connection,
+                transport,
                 slice(prefix, prefixOffset, prefix.length - prefixOffset),
                 source,
                 sourceOffset,
@@ -318,7 +320,7 @@ final class RemoteParentHttp1Receive implements RemoteParentSocketContext.Extrac
   }
 
   private int emitTelemetryFragments(
-      Connection connection, byte[] prefix, byte[] source, int sourceOffset, int sourceLength) {
+      Object transport, byte[] prefix, byte[] source, int sourceOffset, int sourceLength) {
     int prefixOffset = 0;
     int sourceRemaining = sourceLength;
     int result = 0;
@@ -328,7 +330,8 @@ final class RemoteParentHttp1Receive implements RemoteParentSocketContext.Extrac
           Math.min(sourceRemaining, IOCTLPacket.http1MaxPayloadSize - prefixLength);
       int status =
           emitter.emit(
-              connection,
+              transport,
+              lifecycle,
               OperationType.TELEMETRY_RECEIVE,
               null,
               prefix,
@@ -357,7 +360,7 @@ final class RemoteParentHttp1Receive implements RemoteParentSocketContext.Extrac
    * never replayed. A native cursor that actually observed START is reset once, regardless of
    * acknowledgement, and every Java capability is released before this method returns.
    */
-  private int retireBridgeEpoch(Connection connection) {
+  private int retireBridgeEpoch(Object transport) {
     if (bridgeRetired) {
       return 0;
     }
@@ -373,7 +376,7 @@ final class RemoteParentHttp1Receive implements RemoteParentSocketContext.Extrac
         && nativeStartedSequence == context.requestSequence()
         && lifecycle.active()) {
       try {
-        resetStatus = resetTerminalSequence(connection, context.requestSequence(), false);
+        resetStatus = resetTerminalSequence(transport, context.requestSequence(), false);
       } catch (Throwable failure) {
         resetStatus = -1;
       }
@@ -384,7 +387,7 @@ final class RemoteParentHttp1Receive implements RemoteParentSocketContext.Extrac
     int telemetryStatus = 0;
     if (deferred.length > 0 && lifecycle.active()) {
       try {
-        telemetryStatus = emitTelemetryFragments(connection, deferred, EMPTY, 0, 0);
+        telemetryStatus = emitTelemetryFragments(transport, deferred, EMPTY, 0, 0);
       } catch (Throwable failure) {
         telemetryStatus = -1;
       }
@@ -411,12 +414,12 @@ final class RemoteParentHttp1Receive implements RemoteParentSocketContext.Extrac
     RemoteParentBridge.recordReceiveFailure(status);
   }
 
-  private int resetTerminalSequence(Connection connection, long requestSequence) {
-    return resetTerminalSequence(connection, requestSequence, true);
+  private int resetTerminalSequence(Object transport, long requestSequence) {
+    return resetTerminalSequence(transport, requestSequence, true);
   }
 
   private int resetTerminalSequence(
-      Connection connection, long requestSequence, boolean invalidateOnFailure) {
+      Object transport, long requestSequence, boolean invalidateOnFailure) {
     ThreadInfo.beginRemoteParentReceiveAttempt();
     ThreadInfo.clearRemoteParentSocketFileDescriptor();
     if (requestSequence <= 0L || requestSequence == resetSequence) {
@@ -436,7 +439,8 @@ final class RemoteParentHttp1Receive implements RemoteParentSocketContext.Extrac
     }
     int status =
         emitter.emit(
-            connection,
+            transport,
+            lifecycle,
             OperationType.HTTP1_RECEIVE_RESET,
             context,
             EMPTY,
@@ -479,7 +483,8 @@ final class RemoteParentHttp1Receive implements RemoteParentSocketContext.Extrac
   }
 
   private static int emitNative(
-      Connection connection,
+      Object transport,
+      Lifecycle lifecycle,
       OperationType operation,
       ReceiveContext context,
       byte[] first,
@@ -495,29 +500,70 @@ final class RemoteParentHttp1Receive implements RemoteParentSocketContext.Extrac
         new NativeMemory(
             (telemetry ? IOCTLPacket.packetPrefixSize : IOCTLPacket.http1PacketPrefixSize)
                 + payloadLength);
-    int writeOffset =
-        telemetry
-            ? IOCTLPacket.writeTelemetryReceivePacketPrefix(packet, 0, connection, payloadLength)
-            : IOCTLPacket.writeHttp1PacketPrefix(
-                packet,
-                0,
-                operation,
-                connection,
-                payloadLength,
-                context.lifecycle().id(),
-                context.requestSequence());
+    int writeOffset;
+    if (transport instanceof Connection) {
+      Connection connection = (Connection) transport;
+      writeOffset =
+          telemetry
+              ? IOCTLPacket.writeTelemetryReceivePacketPrefix(packet, 0, connection, payloadLength)
+              : IOCTLPacket.writeHttp1PacketPrefix(
+                  packet,
+                  0,
+                  operation,
+                  connection,
+                  payloadLength,
+                  context.lifecycle().id(),
+                  context.requestSequence());
+    } else if (transport instanceof Socket) {
+      Socket socket = (Socket) transport;
+      writeOffset =
+          telemetry
+              ? IOCTLPacket.writeTelemetryReceivePacketPrefix(packet, 0, socket, payloadLength)
+              : IOCTLPacket.writeHttp1PacketPrefix(
+                  packet,
+                  0,
+                  operation,
+                  socket,
+                  payloadLength,
+                  context.lifecycle().id(),
+                  context.requestSequence());
+    } else {
+      return -1;
+    }
     writeOffset =
         IOCTLPacket.writePacketBuffer(packet, writeOffset, first, firstOffset, firstLength);
     IOCTLPacket.writePacketBuffer(packet, writeOffset, second, secondOffset, secondLength);
+    if (transport instanceof Connection) {
+      Connection connection = (Connection) transport;
+      return telemetry
+          ? BootstrapNative.emitTelemetryReceiveData(connection, packet.getAddress())
+          : BootstrapNative.emitHttp1Data(
+              connection,
+              packet.getAddress(),
+              operation,
+              primaryAcknowledged,
+              context.bridgeEpoch());
+    }
+    Socket socket = (Socket) transport;
     return telemetry
-        ? BootstrapNative.emitTelemetryReceiveData(connection, packet.getAddress())
+        ? BootstrapNative.emitTelemetryReceiveData(socket, lifecycle, packet.getAddress())
         : BootstrapNative.emitHttp1Data(
-            connection, packet.getAddress(), operation, primaryAcknowledged, context.bridgeEpoch());
+            socket,
+            context.lifecycle(),
+            packet.getAddress(),
+            operation,
+            primaryAcknowledged,
+            context.bridgeEpoch());
+  }
+
+  private static boolean supportedTransport(Object transport) {
+    return transport instanceof Connection || transport instanceof Socket;
   }
 
   interface Emitter {
     int emit(
-        Connection connection,
+        Object transport,
+        Lifecycle lifecycle,
         OperationType operation,
         ReceiveContext context,
         byte[] first,

@@ -147,6 +147,38 @@ class SSLSocketStreamInstTest {
         staticInvocationCount(
                 transformed,
                 "read",
+                "([B)I",
+                "io/opentelemetry/obi/java/BootstrapNative",
+                "beginRemoteParentSocketRead")
+            > 0);
+    assertTrue(
+        staticInvocationCount(
+                transformed,
+                "read",
+                "([B)I",
+                "io/opentelemetry/obi/java/BootstrapNative",
+                "abortRemoteParentSocketRead")
+            > 0);
+    assertTrue(
+        staticInvocationCount(
+                transformed,
+                "read",
+                "([B)I",
+                "io/opentelemetry/obi/java/BootstrapNative",
+                "endRemoteParentSocketRead")
+            > 0);
+    assertEquals(
+        1,
+        staticInvocationCount(
+            transformed,
+            "read",
+            "([B)I",
+            "io/opentelemetry/obi/java/BootstrapNative",
+            "emitRemoteParentSocketReceive"));
+    assertTrue(
+        staticInvocationCount(
+                transformed,
+                "read",
                 "([BII)I",
                 "io/opentelemetry/obi/java/BootstrapNative",
                 "invalidateRemoteParentSocketFileDescriptor")
@@ -157,10 +189,26 @@ class SSLSocketStreamInstTest {
                 "read",
                 "([BII)I",
                 "io/opentelemetry/obi/java/BootstrapNative",
-                "prepareRemoteParentSocketLifecycle")
+                "beginRemoteParentSocketRead")
+            > 0);
+    assertTrue(
+        staticInvocationCount(
+                transformed,
+                "read",
+                "([BII)I",
+                "io/opentelemetry/obi/java/BootstrapNative",
+                "abortRemoteParentSocketRead")
+            > 0);
+    assertTrue(
+        staticInvocationCount(
+                transformed,
+                "read",
+                "([BII)I",
+                "io/opentelemetry/obi/java/BootstrapNative",
+                "endRemoteParentSocketRead")
             > 0);
     assertEquals(
-        1,
+        0,
         staticInvocationCount(
             transformed,
             "read",
@@ -174,7 +222,31 @@ class SSLSocketStreamInstTest {
             "read",
             "([BII)I",
             "io/opentelemetry/obi/java/BootstrapNative",
+            "rejectUnsupportedRemoteParentSocket"));
+    assertEquals(
+        1,
+        staticInvocationCount(
+            transformed,
+            "read",
+            "([BII)I",
+            "io/opentelemetry/obi/java/BootstrapNative",
+            "emitRemoteParentSocketReceive"));
+    assertEquals(
+        0,
+        staticInvocationCount(
+            transformed,
+            "read",
+            "([BII)I",
+            "io/opentelemetry/obi/java/BootstrapNative",
             "emitData"));
+    assertEquals(
+        0,
+        staticInvocationCount(
+            transformed,
+            "read",
+            "([BII)I",
+            "io/opentelemetry/obi/java/instrumentations/data/SSLStorage",
+            "emitRemoteParentSocketReceive"));
     assertTrue(
         staticInvocationCount(
                 transformed,

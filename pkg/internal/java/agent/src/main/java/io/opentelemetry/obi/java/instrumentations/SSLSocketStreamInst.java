@@ -94,33 +94,40 @@ public class SSLSocketStreamInst {
     @Advice.OnMethodEnter(suppress = Throwable.class)
     public static Object enter(@Advice.FieldValue("this$0") Object outer) {
       return outer instanceof Socket
-          ? BootstrapNative.prepareRemoteParentSocketLifecycle((Socket) outer)
+          ? BootstrapNative.beginRemoteParentSocketRead((Socket) outer)
           : null;
     }
 
     @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
     public static void read(
         @Advice.FieldValue("this$0") Object outer,
-        @Advice.Enter Object lifecycle,
+        @Advice.Enter Object readState,
         @Advice.Argument(0) byte[] b,
         @Advice.Return int len,
         @Advice.Thrown Throwable throwable) {
-
-      if (throwable != null || len < 0 || b == null) {
-        if (outer instanceof Socket) {
-          BootstrapNative.invalidateRemoteParentSocketFileDescriptor((Socket) outer, lifecycle);
-        } else {
-          BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
-        }
-        return;
-      }
-
-      if (len > 0) {
-        Socket socket = null;
-        if (outer instanceof Socket) {
-          socket = (Socket) outer;
+      Object lifecycle = null;
+      try {
+        lifecycle = BootstrapNative.remoteParentSocketReadLifecycle(readState);
+        if (throwable != null || len < 0 || b == null) {
+          BootstrapNative.abortRemoteParentSocketRead(readState);
+          if (outer instanceof Socket) {
+            BootstrapNative.invalidateRemoteParentSocketFileDescriptor((Socket) outer, lifecycle);
+          } else {
+            BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+          }
+          return;
         }
 
+        if (len == 0) {
+          BootstrapNative.abortRemoteParentSocketRead(readState);
+          return;
+        }
+
+        Socket socket = outer instanceof Socket ? (Socket) outer : null;
+        if (socket == null
+            || !BootstrapNative.claimRemoteParentSocketRead(readState, socket, lifecycle)) {
+          return;
+        }
         if (SSLStorage.debugOn) {
           System.err.println(
               "[SSLSocketStreamInst] InputStream.read() intercepted: "
@@ -129,18 +136,16 @@ public class SSLSocketStreamInst {
                   + ", socket "
                   + socket);
         }
-        if (socket != null) {
-          try {
-            BootstrapNative.emitTelemetryReceiveData(socket, lifecycle, b, 0, len);
-          } catch (Throwable t) {
-            BootstrapNative.invalidateRemoteParentSocketFileDescriptor(socket, lifecycle);
-            if (SSLStorage.debugOn) {
-              System.err.println("[SSLSocketStreamInst] Error in read advice: " + t.getMessage());
-            }
+        try {
+          BootstrapNative.emitRemoteParentSocketReceive(socket, lifecycle, b, 0, len);
+        } catch (Throwable t) {
+          BootstrapNative.invalidateRemoteParentSocketFileDescriptor(socket, lifecycle);
+          if (SSLStorage.debugOn) {
+            System.err.println("[SSLSocketStreamInst] Error in read advice: " + t.getMessage());
           }
-        } else {
-          BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
         }
+      } finally {
+        BootstrapNative.endRemoteParentSocketRead(readState);
       }
     }
   }
@@ -149,32 +154,40 @@ public class SSLSocketStreamInst {
     @Advice.OnMethodEnter(suppress = Throwable.class)
     public static Object enter(@Advice.FieldValue("this$0") Object outer) {
       return outer instanceof Socket
-          ? BootstrapNative.prepareRemoteParentSocketLifecycle((Socket) outer)
+          ? BootstrapNative.beginRemoteParentSocketRead((Socket) outer)
           : null;
     }
 
     @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
     public static void read(
         @Advice.FieldValue("this$0") Object outer,
-        @Advice.Enter Object lifecycle,
+        @Advice.Enter Object readState,
         @Advice.Argument(0) byte[] b,
         @Advice.Argument(1) int off,
         @Advice.Return int bytesRead,
         @Advice.Thrown Throwable throwable) {
-
-      if (throwable != null || bytesRead < 0 || b == null) {
-        if (outer instanceof Socket) {
-          BootstrapNative.invalidateRemoteParentSocketFileDescriptor((Socket) outer, lifecycle);
-        } else {
-          BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+      Object lifecycle = null;
+      try {
+        lifecycle = BootstrapNative.remoteParentSocketReadLifecycle(readState);
+        if (throwable != null || bytesRead < 0 || b == null) {
+          BootstrapNative.abortRemoteParentSocketRead(readState);
+          if (outer instanceof Socket) {
+            BootstrapNative.invalidateRemoteParentSocketFileDescriptor((Socket) outer, lifecycle);
+          } else {
+            BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
+          }
+          return;
         }
-        return;
-      }
 
-      if (bytesRead > 0) {
-        Socket socket = null;
-        if (outer instanceof Socket) {
-          socket = (Socket) outer;
+        if (bytesRead == 0) {
+          BootstrapNative.abortRemoteParentSocketRead(readState);
+          return;
+        }
+
+        Socket socket = outer instanceof Socket ? (Socket) outer : null;
+        if (socket == null
+            || !BootstrapNative.claimRemoteParentSocketRead(readState, socket, lifecycle)) {
+          return;
         }
         if (SSLStorage.debugOn) {
           System.err.println(
@@ -184,18 +197,16 @@ public class SSLSocketStreamInst {
                   + ", socket "
                   + socket);
         }
-        if (socket != null) {
-          try {
-            BootstrapNative.emitTelemetryReceiveData(socket, lifecycle, b, off, bytesRead);
-          } catch (Throwable t) {
-            BootstrapNative.invalidateRemoteParentSocketFileDescriptor(socket, lifecycle);
-            if (SSLStorage.debugOn) {
-              System.err.println("[SSLSocketStreamInst] Error in read advice: " + t.getMessage());
-            }
+        try {
+          BootstrapNative.emitRemoteParentSocketReceive(socket, lifecycle, b, off, bytesRead);
+        } catch (Throwable t) {
+          BootstrapNative.invalidateRemoteParentSocketFileDescriptor(socket, lifecycle);
+          if (SSLStorage.debugOn) {
+            System.err.println("[SSLSocketStreamInst] Error in read advice: " + t.getMessage());
           }
-        } else {
-          BootstrapNative.invalidateRemoteParentSocketFileDescriptor(lifecycle);
         }
+      } finally {
+        BootstrapNative.endRemoteParentSocketRead(readState);
       }
     }
   }

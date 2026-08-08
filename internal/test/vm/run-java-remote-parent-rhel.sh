@@ -11,7 +11,7 @@ readonly VERIFIER_TEST_PATTERN='^TestBPFVerifierProductionProfiles$'
 readonly VERIFIER_TEST_NAME='TestBPFVerifierProductionProfiles'
 readonly VERIFIER_GENERIC_PROFILE='TestBPFVerifierProductionProfiles/generictracer/apache-java-https'
 readonly VERIFIER_SOCKOPT_PROFILE='TestBPFVerifierProductionProfiles/tpinjector/java-remote-parent'
-readonly PRIVILEGED_TEST_PATTERN='^(TestJavaRemoteParentPrimarySocketAuthority|TestJavaRemoteParentPrimaryRequiresAuthoritativeDataHook|TestJavaRemoteParentPrimaryJVMFaults|TestJavaRemoteParentPrimaryJVMDirectSSLSocket|TestJavaRemoteParentNestedCgroupLifecycle|TestJavaRemoteParentCgroupLinkProcessDeathCleanup|TestJavaRemoteParentCgroupPartialAttachRollback|TestJavaRemoteParentBridgeLoadRequiresPrivileges)$'
+readonly PRIVILEGED_TEST_PATTERN='^(TestJavaRemoteParentPrimarySocketAuthority|TestJavaRemoteParentPrimaryRequiresAuthoritativeDataHook|TestJavaRemoteParentPrimaryJVMFaults|TestJavaRemoteParentPrimaryJVMDirectSSLSocket|TestJavaRemoteParentGenericJVMDirectSSLSocket|TestJavaRemoteParentNestedCgroupLifecycle|TestJavaRemoteParentCgroupLinkProcessDeathCleanup|TestJavaRemoteParentCgroupPartialAttachRollback|TestJavaRemoteParentBridgeLoadRequiresPrivileges)$'
 readonly BENCHMARK_TEST_PATTERN='^TestJavaRemoteParentTransportBenchmark$'
 
 fail() {
@@ -425,6 +425,8 @@ run_sockopt_authority_tests() {
         TestJavaRemoteParentPrimaryJVMFaults
     require_test_passed "$output_file" \
         TestJavaRemoteParentPrimaryJVMDirectSSLSocket
+    require_test_passed "$output_file" \
+        TestJavaRemoteParentGenericJVMDirectSSLSocket
     require_test_passed "$output_file" \
         TestJavaRemoteParentNestedCgroupLifecycle
     require_test_passed "$output_file" \

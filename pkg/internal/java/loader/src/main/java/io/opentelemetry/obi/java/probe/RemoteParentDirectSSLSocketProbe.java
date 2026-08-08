@@ -7,12 +7,15 @@ package io.opentelemetry.obi.java.probe;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileDescriptor;
 import java.io.FileInputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.Socket;
+import java.net.SocketImpl;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
 import java.security.MessageDigest;
@@ -36,13 +39,18 @@ public final class RemoteParentDirectSSLSocketProbe {
   private RemoteParentDirectSSLSocketProbe() {}
 
   public static void main(String[] args) throws Exception {
-    if (args.length != 3) {
-      throw new IllegalArgumentException("expected TLS protocol, key store, and password");
+    if (args.length != 3 && args.length != 4) {
+      throw new IllegalArgumentException(
+          "expected TLS protocol, key store, password, and optional await-close mode");
     }
 
     String requestedProtocol = args[0];
     File keyStoreFile = new File(args[1]);
     char[] password = args[2].toCharArray();
+    boolean awaitClose = args.length == 4;
+    if (awaitClose) {
+      require("await-close".equals(args[3]), "unknown probe mode");
+    }
     require(keyStoreFile.isFile() && keyStoreFile.length() > 0, "missing TLS key store");
 
     KeyStore keyStore = KeyStore.getInstance("PKCS12");
@@ -134,9 +142,11 @@ public final class RemoteParentDirectSSLSocketProbe {
           reads++;
         }
         require(Arrays.equals(REQUEST, received), "application-visible HTTP request changed");
-        require(
-            currentSocketLifecycle.invoke(null, socket) != null,
-            "application read created no receive generation");
+        Object receiveLifecycle = currentSocketLifecycle.invoke(null, socket);
+        require(receiveLifecycle != null, "application read created no receive generation");
+        long lifecycleId =
+            longValue(receiveLifecycle.getClass().getMethod("id").invoke(receiveLifecycle));
+        require(lifecycleId != 0L, "application receive generation has no identity");
 
         int descriptorBeforeTake = intValue(retainedSocketFileDescriptor.invoke(null));
         int sourceBeforeTake = intValue(lookupSource.invoke(null));
@@ -151,6 +161,8 @@ public final class RemoteParentDirectSSLSocketProbe {
                 + received.length
                 + " reads="
                 + reads
+                + " lifecycleId="
+                + Long.toUnsignedString(lifecycleId)
                 + " requestSha256="
                 + sha256(received));
 
@@ -183,8 +195,41 @@ public final class RemoteParentDirectSSLSocketProbe {
                 + Long.toUnsignedString(observed)
                 + " fdAfter="
                 + descriptorAfterTake);
+        if (awaitClose) {
+          awaitCommand(commands, "CLOSE");
+          closeDirectFileDescriptor(socket, directDescriptor);
+          require(
+              intValue(directSocketFileDescriptor.invoke(null, socket)) == -1,
+              "direct descriptor remained valid after raw close");
+          System.out.println("CLOSED fd=" + directDescriptor);
+          awaitCommand(commands, "EXIT");
+        }
       }
     }
+  }
+
+  private static void closeDirectFileDescriptor(Socket socket, int expectedDescriptor)
+      throws Exception {
+    // Bypass instrumented Socket.close() so the fixture can observe tcp_close before RESET advice.
+    Method getImpl = Socket.class.getDeclaredMethod("getImpl");
+    getImpl.setAccessible(true);
+    Object impl = getImpl.invoke(socket);
+    require(impl != null, "accepted JSSE socket has no implementation");
+
+    Method getFileDescriptor = SocketImpl.class.getDeclaredMethod("getFileDescriptor");
+    getFileDescriptor.setAccessible(true);
+    FileDescriptor descriptor = (FileDescriptor) getFileDescriptor.invoke(impl);
+    require(descriptor != null && descriptor.valid(), "accepted JSSE descriptor is invalid");
+    Field descriptorValue = FileDescriptor.class.getDeclaredField("fd");
+    descriptorValue.setAccessible(true);
+    require(
+        descriptorValue.getInt(descriptor) == expectedDescriptor,
+        "accepted JSSE descriptor identity changed");
+
+    Method close = FileDescriptor.class.getDeclaredMethod("close");
+    close.setAccessible(true);
+    close.invoke(descriptor);
+    require(!descriptor.valid(), "raw descriptor close did not invalidate the descriptor");
   }
 
   private static Certificate firstKeyCertificate(KeyStore keyStore) throws Exception {

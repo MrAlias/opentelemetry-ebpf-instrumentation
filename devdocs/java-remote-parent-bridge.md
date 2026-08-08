@@ -3,13 +3,18 @@
 This document defines the version 1 result contract, version 3 fallback request,
 and ownership model used to hand
 an inbound OBI TCP-propagated parent to an unmodified OpenTelemetry-compatible
-Java agent. The initial scope is an HTTP/1.1 server request received through
-Java TLS instrumentation. HTTP/2 and other multiplexed protocols are not
-supported by this contract. The contract also requires at most one HTTP/1.1
-request ownership boundary per decrypted plaintext emission. Pipelined or
-coalesced requests decoded from one emission are out of scope because they do
-not have distinct BPF generations; deployments that permit that processing
-must not rely on this bridge for remote-parent selection.
+Java agent. The initial bridge-parent scope is an HTTP/1.1 server request
+received through the exact `SSLEngine` connection path used by the Netty PoC.
+Inbound `SSLSocket` stream advice remains telemetry-only and cannot select a
+bridge parent; while the bridge is enabled it records a fixed `unsupported`
+receive outcome. HTTP/2 and other multiplexed protocols are not supported by
+this contract. The contract also requires at most one HTTP/1.1
+request ownership boundary per decrypted plaintext emission. A per-connection
+framer carries split request lines, headers, fixed bodies, chunk framing, and
+trailers across emissions. Pipelined or coalesced requests that cross two
+ownership boundaries in one emission are marked ambiguous and receive no
+bridge parent because one callback cannot safely publish two independently
+extractable BPF generations.
 
 The correctness invariant is strict: the bridge returns the parent owned by
 the current request or no parent. It never returns a parent owned by another
@@ -23,7 +28,14 @@ request.
    connection. A second unconsumed candidate for the same connection marks the
    connection ambiguous instead of replacing the first candidate.
 3. The existing Java TLS receive advice synchronously reports decrypted bytes
-   before it returns them to the HTTP implementation. `SSLEngine` correlation
+   before it returns them to the HTTP implementation. A serialized, bounded
+   HTTP/1.1 framer emits `START` only after validating a complete request
+   header, `CONTINUE` for later bytes owned by that request, and `RESET` when
+   the exact sequence terminates without a usable handoff. Unsupported streams
+   continue through a telemetry-only receive operation; ambiguous streams are
+   sticky and cannot select a parent. `SSLSocket` and wrapped `InputStream`
+   plaintext also use that non-authoritative telemetry operation regardless of
+   a concurrent enable/disable transition. `SSLEngine` correlation
    prefers the exact connection scoped by the current Netty operation. The
    generic `SocketChannel` fallback uses the exact `ByteBuffer` object from a
    verified positive read; it never derives ownership from attacker-controlled
@@ -47,9 +59,14 @@ request.
    corresponding unwrap or release. A buffer can cross threads with a happens-before
    handoff, but concurrent mutation or reuse of a live alias across connections is
    unsupported by both this correlation and `ByteBuffer` itself.
-4. When OBI recognizes an HTTP/1.1 server request, it moves the raw TCP
-   candidate to the current Java logical execution identity. This is separate
-   from both `incoming_trace_map` and the public `traces_ctx_v1` map.
+4. The authenticated `START` first publishes a generation-zero cursor for the
+   exact socket cookie, Java lifecycle, request sequence, and one-shot signal.
+   When OBI recognizes the same HTTP/1.1 server request, the HTTP tail-call
+   chain acknowledges that cursor with the nonzero BPF generation and moves
+   the raw TCP candidate to the current Java logical execution identity. This
+   is separate from both `incoming_trace_map` and the public `traces_ctx_v1`
+   map. A failed parse, failed acknowledgement, or missed tail call retires the
+   publishing cursor before it can authorize a later callback.
 5. Before starting its normal server span, the Java agent invokes the ordered
    propagator list. The `obi` propagator performs one synchronous bridge take
    and creates a remote `SpanContext` only for a valid version 1 record.
@@ -77,22 +94,33 @@ The equivalent system properties are:
 sequenceDiagram
     participant TCP as TCP option receiver
     participant BPF as eBPF request state
+    participant Daemon as OBI userspace
     participant JNI as Java helper and JNI
-    participant OBI as obi propagator
+    participant Prop as obi propagator
     participant W3C as stock tracecontext
     participant Agent as stock server instrumenter
 
+    Daemon->>BPF: Load hooks and authorize the exact JVM capability
+    Daemon->>JNI: Attach helper and register transport configuration
     TCP->>BPF: Stage exact candidate by connection and sequence
     JNI->>BPF: Report decrypted HTTP/1.1 bytes on the live socket
     BPF->>BPF: Move candidate to owner and generation
-    Agent->>OBI: Extract before starting the server span
-    OBI->>JNI: Take once with a bounded deadline
-    JNI->>BPF: Resolve the same socket, owner, and generation
-    BPF-->>OBI: Valid record or reason-coded miss
-    OBI-->>W3C: Candidate remote Context
+    Agent->>Prop: Extract before starting the server span
+    Prop->>JNI: Take once with a bounded deadline
+    alt cgroup socket-option primary
+        JNI->>BPF: Resolve the same socket, owner, and generation
+        BPF-->>JNI: Valid record or reason-coded miss
+    else credential-checked Unix fallback
+        JNI->>Daemon: Send one bounded take or discard request
+        Daemon->>BPF: Resolve the authenticated owner and generation
+        Daemon-->>JNI: Valid record or reason-coded miss
+    end
+    JNI-->>Prop: Valid record or reason-coded miss
+    Prop-->>W3C: Candidate remote Context
     W3C->>W3C: Apply the stock W3C parser
     W3C-->>Agent: W3C parent when valid, otherwise OBI candidate
     Agent->>Agent: Record final selection and start one server span
+    Daemon->>BPF: Sweep exact stale or retired state
 ```
 
 The OpenTelemetry SDK applies the extension's customizer to each configured
@@ -128,14 +156,19 @@ fixed `provider_reject` counter, and logs the fixed `provider_duplicate` reason
 on its own first-and-power-of-two cadence. The rejected candidate remains
 caller-owned and is never retained or described in diagnostics.
 
-Replacement is an explicit remove-then-install sequence. Removal atomically
-publishes the no-op provider and closes only the expected active instance; stale
-removal does nothing. The serialized OBI bootstrap performs removal before it
-constructs and configures a fresh replacement, so closing the old provider
-cannot tear down transport configured by the new one. Calls in the bounded gap
-see `missing`. A removed provider is retired and must not be installed again.
-Null, incompatible, and non-bootstrap candidates likewise leave the active
-provider unchanged and remain caller-owned.
+Replacement is an explicit remove-then-install sequence. Removal first disables
+native selection and advances a process-wide provider epoch, then atomically
+publishes the no-op provider and closes only the expected active instance;
+stale removal does nothing. Every connection framer, direct receive capability,
+and task handoff captures its issuing epoch. A mismatch permanently retires
+that connection owner to telemetry-only mode, drains any bounded pre-`START`
+prefix once, resets an emitted `START` once, and rejects stale lookup results
+both before and after the provider call. The serialized OBI bootstrap performs
+removal before it constructs and configures a fresh replacement, so closing the
+old provider cannot tear down transport configured by the new one. Calls in the
+bounded gap see `missing`. A removed provider is retired and must not be
+installed again. Null, incompatible, and non-bootstrap candidates likewise
+leave the active provider unchanged and remain caller-owned.
 
 The primary transport uses paired cgroup `setsockopt` and `getsockopt` hooks.
 A connected loopback socket is used only to probe hook availability. For each
@@ -297,8 +330,10 @@ The authoritative identities and transitions are:
 | Shared TLS prewrite | Host PID/TID, thread start time, unique handoff ID | Provisional request publishes an exact parent | Write and transport terminal outcomes, LRU eviction, restart |
 | TLS socket owner | Socket-local exact handoff key and trace | Exact prewrite reaches `sk_msg` | Option terminal outcome, socket close, stale or malformed recovery, restart |
 | TCP candidate | Sorted connection tuple | Valid inbound TCP option | HTTP parse take, ambiguity, LRU eviction, restart |
+| HTTP/1 receive cursor | Socket cookie, exact Java lifecycle and request sequence | Authenticated `START` publishes `PUBLISHING`; HTTP acknowledgement commits `VALID` | Exact `RESET`, replacement, socket close, parse/ack/tail-call failure, restart |
 | Java request | PID namespace, process ID, logical TID | Parsed Java TLS HTTP/1.1 request | Take, discard, completion, stale sweep, exact process retirement, restart |
 | Task handoff | Process, PID namespace, opaque submission token, shared one-shot accepted-socket holder | Java submission capture | Exact one-shot link, cancellation, rejection, task-scope restoration, stale sweep, bounded-map eviction |
+| Alias replay | Owner, generation, observation time, JVM capability, tuple, network namespace, namespace cookie, socket cookie | Exact task/handoff retain before carrier publication | Last carrier release after final outcome, coordinated sweep, restart |
 | Virtual thread | Stable virtual-thread identity across carrier mounts | Mount translates the carrier to the virtual-thread ID | Take, discard, virtual-thread termination, bounded-map eviction, restart |
 | Consumed | Original Java request key and generation | Atomic take or discard | TTL sweep, bounded-map eviction, restart |
 
@@ -374,15 +409,51 @@ Take and discard share the same one-shot claim. A successful discard returns a
 `discard/valid` diagnostic counter records successful resolution. A repeated
 take or discard returns `already consumed`.
 
+Task and handoff carriers reserve a non-evicting alias-replay record before
+they are published. Its key contains the full owner, generation, observation
+time, and JVM capability. Its value contains the reference count, transition
+metadata, and the immutable accepted-socket binding: full connection tuple,
+network namespace, namespace cookie, and socket cookie. Initial publication
+requires the active logical state, generation index, and both connection
+indexes to agree byte-for-byte. Retain rechecks the same state and connection
+twins around the reference increment. Finish copies the whole value through
+`ACTIVE`, `PUBLISHING`, and a final lifecycle, and every later barrier compares
+the captured binding. Capacity pressure or a substituted binding fails before
+a carrier or one-shot claim can gain authority. A direct take of a generation
+that already has aliases also captures this binding so sibling tasks can replay
+the exact final outcome after physical and logical cleanup.
+
+After aliased `RESET`, the old logical generation may remain task-only while
+its physical indexes are absent. Before `DATA_ACK`, socket-local negotiation
+still names the old generation, and only the exact durable replay tuple,
+network namespace, and socket cookie can finish it. After `DATA_ACK` names a
+successor, the old task may finish only when the successor has a complete,
+clean owner, fallback, state, generation index, zero ambiguity reservation,
+and exact connection-index twins for the same tuple, namespace, namespace
+cookie, and socket. The proof is repeated before claim insertion, after claim
+insertion, and under the old owner guard during finish. A successor may have
+its own aliases; the old finish neither consumes nor mutates the successor's
+alias-replay key or value. Missing, foreign, partial, rebound, or raced
+successor authority fails closed without returning a parent.
+
+Retained finish fences report a repeated terminal outcome only when the exact
+task link, claim lifecycle, terminal lifecycle, nonzero final replay reference,
+and replay binding remain coherent. Cleanup handoff advances the claim's ABA
+timestamp, so its final replay timestamp must be nonzero and strictly older;
+an unhanded producer claim requires exact timestamp equality. Active,
+publishing, zero-reference, lifecycle-mismatched, or binding-mismatched replay
+records never authorize `already consumed`.
+
 Every active request also has a non-evicting generation-index entry containing
 its process identity, registered capability, and observation time. The state, claim,
 and ambiguity maps remain `HASH` maps: eviction cannot erase a one-shot claim
 or resurrect an ambiguous generation. A userspace sweep revalidates the exact
 owner, generation, capability, and map value before deleting stale state,
-connections, fallback records, owners, claims, ambiguity markers, task links,
-handoffs, and handoff-claim tombstones. Cleanup keeps the generation claim
-through index and owner deletion, so a concurrent publisher cannot reuse the
-owner slot before cleanup releases it.
+connections, fallback records, owners, terminals, claims, owner guards,
+ambiguity markers, alias replays, task links, handoffs, and handoff-claim
+tombstones. Cleanup keeps the generation claim through index and owner
+deletion, so a concurrent publisher cannot reuse the owner slot before cleanup
+releases it.
 
 The shared bridge object observes `sched_process_exit` and records retirement
 only when the process's last thread exits. A retirement key includes the full
@@ -403,6 +474,97 @@ request is recognizable. When pipelined/coalesced data makes the connection to
 request mapping ambiguous, all affected candidates are dropped. This may
 disconnect a trace but cannot attach a request to the wrong trace. HTTP/2 needs
 a stream identity and is explicitly unsupported.
+
+The Apache/Java PoC has a dedicated live control for a downstream coalesced
+delivery shape; it does not rename Apache's serialized backend behavior as
+coalescing. Apache triggers a separately discovered source process, and that
+process performs exactly one bounded plaintext write containing two distinct
+HTTP/1.1 requests, without a `traceparent`, on one TLS connection to the
+instrumented Netty receive path. The backend independently proves one bounded
+post-`SslHandler` `channelRead`, the exact plaintext digest, and two parser
+emissions from that same callback generation. Netty can aggregate multiple
+`SSLEngine.unwrap` plaintext outputs into that callback, so this evidence does
+not prove that both request boundaries crossed one bridge-authoritative receive
+emission. The trace gate accepts only both exact source-client parents, or two
+explicit Java roots plus exactly one fixed `d_ambiguous` increment. Exact
+parents mean the bridge advice observed separable `SSLEngine` plaintext
+emissions before Netty combined them. The root branch proves one bounded,
+reason-coded ambiguity in the end-to-end candidate, injection, or Java receive
+path; the shared diagnostic does not attribute that ambiguity specifically to
+the receive framer. Mixed, wrong, or unresolved parents are fatal. The
+source-client span must descend from the Apache-triggered source server span,
+so the direct workload cannot silently replace the live application path. The
+target is parameterized for TLS 1.2 and TLS 1.3, and both
+receive-coordination maps must return to their exact pre-run occupancies in two
+consecutive bounded samples. A retained control can therefore validate these
+outcomes, but closing the coalesced-emission evidence gap requires observing
+the callback at the bridge's `SSLEngine` boundary and retaining the required
+Apache-client parent evidence.
+
+The PoC also retains the marker for its canceled-request control. After the
+successful retry returns an in-band diagnostics snapshot, bounded,
+order-independent polling classifies the canceled marker as an exact parent,
+no Java span, or one fixed reason-coded Java root; a foreign parent or changed
+trace flags fails. Its concurrency control uses a five-second, 2-to-64
+participant Jetty barrier and returns bounded worker identities, participant
+and maximum-active counts, arrival positions, and one shared release
+generation. Passing requires more than one simultaneous worker and more than
+one backend connection; request count alone is not concurrency evidence.
+
+The receive cursor is a two-map, non-evicting coordination protocol. The
+kernel-visible `jrp_recv_cur` and `jrp_recv_guard` maps are independent
+`BPF_MAP_TYPE_HASH` maps with 10,000 entries by default, eight-byte
+socket-cookie keys, and 56-byte exact cursor values. The standard global map
+scale factor applies to both maps; the checked-in PoC configuration leaves that
+factor at zero. Before traffic, the runner requires the live layouts to report
+exactly 10,000 entries each; the configuration value alone is not runtime
+evidence. `PUBLISHING` is itself
+the absent-slot lock and is usable only by the synchronous `START` tail-call
+chain. Only a nonzero generation in `VALID` is normal `CONTINUE`, `RESET`, or
+SDK authority. Live `START` replacement from `VALID` acquires and revalidates
+the exact guard, swaps directly to the successor `PUBLISHING`, then releases
+the predecessor guard. Live terminal deletion from `VALID` uses the exact
+guard, changes authority to `RETIRING`, releases the guard, and deletes the
+cursor last. Generation-zero `PUBLISHING` cleanup has no guard; it changes the
+exact cursor to `RETIRING` before deletion. After cursor-mutation authority is
+acquired, a failed step retains `PUBLISHING`, the exact guard, or `RETIRING` as
+a fail-closed exclusion. A pre-mutation guard error leaves `VALID` unchanged
+while phase B finalizes or ambiguity-fences its exact generation. Final
+`tcp_close` uses the exact close-delete exception described below. Cursor and
+guard capacity are independent, so filling one cannot silently consume the
+other's admission budget.
+
+File-backed HTTP/1 receive transitions run in three bounded phases. The first
+phase validates the live file/socket tuple and records the exact cursor,
+predecessor, socket cookie, network namespace, and transition in existing
+scratch maps. After that frame returns, the hook directly removes the exact
+logical graph for the normal zero-alias predecessor. This releases its owner
+key before the next STAGE transaction and prevents a deterministic
+`BPF_NOEXIST` conflict on sequential requests. The cleanup leaf runs directly
+from this shallow phase, rather than through the generic detach dispatcher, so
+its invocation-local workspace is never nested below the large payload frame.
+A successfully detached aliased predecessor preserves its pre-reserved zero
+ambiguity value. Strict already-completed final forms are accepted without
+recreating or promoting that reservation. Only partial or destructively
+faulted predecessor forms change the exact generation's reservation from zero
+to nonzero and re-read it before treating the generation as fenced; their
+retained graphs then converge at close time or in userspace. The final phase
+revalidates the exact cursor and guard before it replaces or retires anything.
+A payload tail call that does not succeed returns to a shallow outer cleanup
+phase, which fences and retires only the still-exact prepared cursor.
+
+The close hook does not need a third marker map. `security_file_ioctl` holds a
+file reference from `fdget()` through the security hook and releases it with
+`fdput()`. The final file release invokes `sock_close`, `inet_release`, and
+`tcp_close`; consequently, the same socket cookie cannot have a live ioctl
+writer when `tcp_close` performs exact fenced cleanup. Close may remove a stale
+guard and then the exact `PUBLISHING`, `VALID`, or `RETIRING` cursor. Tuple-read
+failure still fences cleanup by the cursor's generation and data signal before
+deleting authority. The design depends on the documented file-reference and
+final socket-release ordering. Runtime verifier, attach, and compatibility
+evidence—not a kernel version or lineage inference—determines whether a Linux
+or RHEL matrix cell is supported; this source-ordering argument does not
+promote any untested cell.
 
 ### Outbound TLS prewrite lifecycle
 
@@ -600,7 +762,14 @@ or caller-supplied identifiers. The bootstrap bridge exposes its fixed-cardinali
 Java counters through `RemoteParentBridge.diagnosticsSnapshot()`. The snapshot
 separates bridge lookup from take and discard statuses, extraction failures,
 provider and extension negotiation (including duplicate registration), and
-discards caused by an existing standard parent. Counter values use lower-case
+discards caused by an existing standard parent. A locally detected coalescing
+ambiguity increments the existing fixed `d_ambiguous` status counter without
+calling or consuming the provider. A physical HTTP/1 lifecycle that becomes
+unsupported records `d_unsupported` once before remaining telemetry-only, and
+an enabled lifecycle retired by a provider-epoch transition records `d_stale`
+once. Repeated fragments do not recount either terminal condition, and owners
+created while the bridge was never enabled do not create stale-transition
+noise. Counter values use lower-case
 base 36 so the complete bounded snapshot remains below one KiB at saturation.
 Failures are logged on the first
 observation and whenever the cumulative counter crosses a power-of-two boundary,

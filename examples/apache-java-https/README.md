@@ -21,18 +21,29 @@ trace-scenario
     v
 Apache HTTP Server 2.4 (mod_proxy_http + mod_ssl)
     |\
-    | \-- all demo routes except /api/netty-server:
+    | \-- ordinary routes:
     |     verified HTTPS, TLS 1.2 or 1.3, HTTP/1.1 :18443
     |     --> embedded Jetty
+    |\
+    | \-- /api/netty-server:
+    |     verified HTTPS, TLS 1.2 or 1.3, HTTP/1.1 :18444
+    |     --> inbound Netty fixture
+    |\
+    | \-- /api/tls-boundary/split and /api/tls-boundary/coalesced:
+    |     verified HTTPS, TLS 1.2 or 1.3, HTTP/1.1 :18445/:18446
+    |     --> dedicated Netty boundary listeners
     |
-    \---- /api/netty-server:
-          verified HTTPS, TLS 1.2 or 1.3, HTTP/1.1 :18444
+    \---- /api/coalesced-source:
+          loopback HTTP/1.1 :18081 --> instrumented Go source
+          --> verified TLS 1.2 or 1.3, HTTP/1.1 :18444
           --> inbound Netty fixture
 
-both Java fixtures + official Java agent + external OBI extension
+Java backend process + official Java agent + external OBI extension
+Go coalesced source + OBI instrumentation
 
 Apache OBI spans -------------------+
 Java agent spans -------------------+--> local OTLP/HTTP receiver :14318
+OBI internal metrics ------------------> loopback Prometheus :18990
 ```
 
 No vendor UI, account, access token, or proprietary backend is used. The
@@ -162,7 +173,8 @@ retains all four one-shot response modes and normal recovery.
   RHEL 8 backport).
 - Go 1.25.11 (for the repository and tracecheck tests).
 - `bash`, `curl`, `git`, `jq`, `openssl`, `sha256sum`, and GNU `timeout`.
-- Free loopback ports `14318`, `18080`, `18443`, and `18444`.
+- Free loopback ports `14318`, `18080`, `18081`, `18443`, `18444`, `18445`,
+  `18446`, and `18990`.
 - Internet access for pinned container images, Maven dependencies, and the
   selected official Java agent.
 
@@ -261,7 +273,10 @@ The default `all` suite runs, in order:
   and prove recovery;
 - sequential requests over one reused backend connection;
 - bodyless HTTP/1.1 requests written as one pipeline before any response read;
-- parallel requests that force multiple backend connections;
+- parallel requests that force multiple backend connections and enter one
+  bounded Jetty worker barrier; every response reports a worker identity,
+  common release generation, participant count, and maximum overlap, and the
+  control requires more than one backend worker and connection;
 - connection close/reopen churn;
 - closed and reopened connections that reuse one frontend ephemeral port and
   require observed frontend and Jetty file-descriptor reuse across distinct
@@ -274,7 +289,13 @@ The default `all` suite runs, in order:
   TLS 1.2 or TLS 1.3 backend protocol; the bounded wire observer retains only
   application-data type, legacy-version, length, and count metadata, never
   record contents;
-- a canceled request followed by a successful retry;
+- a separate live coalesced-parent control, triggered through Apache, whose
+  instrumented Go source performs one bounded plaintext write containing two
+  HTTP/1.1 request boundaries on one TLS connection to the real Netty receive
+  path;
+- a canceled request followed by a successful retry; the canceled marker is
+  retained and boundedly classified as exact, absent, or one fixed
+  reason-coded root, while any wrong parent fails the run;
 - order-independent handoff-claim LRU eviction under sustained concurrent
   pressure, with exact hits and explicit roots counted separately and
   reconciled across trace, bridge, and Java diagnostics;
@@ -303,23 +324,109 @@ Run the fallback transport and TLS version separately:
 ./examples/apache-java-https/run.sh --transport unix --tls TLSv1.2
 ```
 
-The `tls-boundary` target runs both the split and coalesced cases. It fails
-unless the post-handshake wire observer sees one bounded TLS application-data
-record for each planned plaintext write and the Netty server sees the exact
-corresponding decrypted callback shape. Run it once per declared protocol when
-iterating on that boundary:
+The `tls-boundary` target sends three fixed 32 KiB POST requests through Apache
+to dedicated Netty HTTPS listeners: one isolated split request, followed by two
+sequential requests on one frontend keep-alive connection and one reused
+Apache-to-Netty TLS connection. Three bounded padding headers make each actual
+backend header block exceed the TLS 16 KiB plaintext-record limit, so Java
+cannot emit that HTTP request to the server instrumentation until at least two
+post-handshake TLS records and decrypted callbacks have arrived. The split case
+forwards each natural callback unchanged to the HTTP parser. The fixture raises
+OBI's bounded HTTP capture buffer to 32 KiB so the deliberate 18 KiB header,
+including its allowlisted marker, remains parseable; the 32 KiB request body is
+not retained by the trace receiver.
+
+Apache `mod_proxy_http` does not forward the second backend request before its
+first backend response. The coalesced listener therefore waits for a bounded
+grace period: when the second request is already present it combines both real
+requests into one parser callback; on the live Apache path it emits the first
+request after the grace expires, returns the keep-alive response, then emits the
+second request and reports a bounded cumulative byte/digest verification. The
+partial and final responses label that path `serialized_proxy_fallback`; they
+do not claim that `SSLEngine` naturally returned one callback or that Apache
+backend-pipelined the pair. The direct Java socket test retains the
+`parser_coalesced` proof, but it has no Apache span and is not an exact-parent
+bridge result. This distinction follows the
+[bridge contract](../../devdocs/java-remote-parent-bridge.md): two requests
+decoded from one plaintext emission are deliberately unsupported for parent
+selection, while the live fallback preserves one request ownership boundary per
+parser emission.
+
+The live trace check requires each Java server span to have the exact Apache
+client span as its remote parent for the same marker and requires the pair to
+reuse one backend TLS identity. Evidence retains only bounded record metadata,
+byte counts, digest-equality booleans, lifecycle order, and delivery-shape
+labels. The runner also resolves both fixed-capacity receive coordination maps
+by their exact kernel layouts: `jrp_recv_cur` and `jrp_recv_guard` are distinct
+10,000-entry hash maps with 8-byte socket-cookie keys and 56-byte exact cursor
+values. It records both map IDs and occupancies before traffic, then reopens
+those same IDs after traffic. The scenario passes only after two consecutive
+bounded samples show both maps at their respective pre-run occupancies. The
+before, per-attempt, final, and status artifacts make cursor
+and guard cleanup independently auditable; neither map relies on a truncated,
+ambiguous kernel label.
+
+Internally, the fixture temporarily retains raw request bytes in a
+verification buffer capped at 144 KiB (`2 * MAX_REQUEST_BYTES`). On the
+serialized path it keeps request 1 until request 2 arrives, the connection
+closes, or the five-second absolute request deadline expires; it releases the
+combined buffer immediately after the final digest comparison. The coalescing
+grace defaults to 150 ms and constructors reject values above 1000 ms. This
+bounded delay and buffering belong only to the verification fixture—they are
+not bridge product behavior or performance evidence. Run once per declared
+protocol when iterating on that boundary:
 
 ```bash
 ./examples/apache-java-https/run.sh --scenario tls-boundary --tls TLSv1.2
 ./examples/apache-java-https/run.sh --scenario tls-boundary --tls TLSv1.3
 ```
 
-The clean full TLS 1.3
+The earlier clean full TLS 1.3
 [retained fixture evidence](evidence/otel-getsockopt-tls13-8282d2ed/README.md)
-records the exact two-record/two-callback split case and one-record/one-callback
-coalesced case on a nested Java-to-loopback-Netty connection. The exact
-Apache-client-to-Java-server parent belongs to the separate outer trigger, so a
-same-request correlated application-path proof remains required for issue #34.
+remains scoped to its nested Java-to-loopback-Netty connection and does not by
+itself prove the same-request conjunction. The current `tls-boundary` scenario
+performs the supported serialized conjunction on the real Apache-to-Java path;
+it is not relabeled as a coalesced bridge-parent result. The separate live
+control below exercises the actual two-boundary plaintext receive. A later
+retained acceptance bundle must be used for either durable result.
+
+The distinct `coalesced-bridge` target adds a live application-path control for
+the shape that the serialized Apache boundary pair cannot produce. It does not
+by itself close the retained issue #34 gap. Apache handles one marked trigger
+to `/api/coalesced-source`; it does not emit or receive the coalesced backend
+write. The separately discovered `coalesced-source` process follows that
+trigger on its own traced server-to-client chain, opens one TLS 1.2 or TLS 1.3
+connection to Netty, and calls `Write` once with two complete requests and no
+`traceparent` header. The Netty fixture accepts the control only when one
+bounded post-`SslHandler` `channelRead` contains the exact plaintext digest and
+its HTTP/1 parser emits both distinct markers from callback generation one.
+That callback can aggregate more than one `SSLEngine.unwrap` plaintext output,
+so it is not proof that the bridge saw both request boundaries in one
+authoritative receive emission. Raw plaintext is retained only in the
+fixture's 8 KiB verification buffer and is not exported.
+
+Trace polling is order-independent and remains stable for six seconds. It
+accepts exactly one of two mutually exclusive results: both Java spans have the
+matching instrumented source client spans as remote parents with unchanged
+trace flags, or both Java spans are explicit roots and the in-band diagnostics
+delta contains exactly one `d_ambiguous`. One exact and one root, a foreign
+parent, an unresolved marker, a missing trigger chain, or any other diagnostic
+shape fails. Exact parents mean the bridge advice observed separable
+`SSLEngine` plaintext emissions even though Netty later combined them. Two
+roots plus `d_ambiguous` prove one bounded, reason-coded ambiguity in the
+end-to-end candidate, injection, or Java receive path; the shared diagnostic
+cannot attribute it specifically to the framer. Neither branch gives the Java
+spans an Apache client parent: the source client spans instead descend from the
+Apache-triggered source server span. The runner snapshots and returns both
+receive-coordination maps to their steady pre-run occupancies around this
+control as well.
+
+Run the real control separately for both protocol versions:
+
+```bash
+./examples/apache-java-https/run.sh --scenario coalesced-bridge --tls TLSv1.2
+./examples/apache-java-https/run.sh --scenario coalesced-bridge --tls TLSv1.3
+```
 
 Exercise the Splunk distribution without changing the backend:
 
@@ -340,6 +447,10 @@ does not prove both paths.
 ./examples/apache-java-https/run.sh \
   --transport getsockopt \
   --scenario concurrency
+
+./examples/apache-java-https/run.sh \
+  --transport getsockopt \
+  --scenario coalesced-bridge
 
 ./examples/apache-java-https/run.sh \
   --transport getsockopt \
@@ -426,6 +537,8 @@ Before traffic begins, the orchestrator uses bounded waits for:
 - helper log `OBI remote-parent provider ready`;
 - Jetty log `Jetty HTTPS backend ready on 127.0.0.1:18443`;
 - Netty log `Netty HTTPS backend ready on 127.0.0.1:18444`;
+- boundary-listener logs for `127.0.0.1:18445` and `127.0.0.1:18446`;
+- the coalesced source's loopback health endpoint on `127.0.0.1:18081`;
 - the Java backend's loopback-only transport-configuration endpoint, whose
   fixed snapshot must prove the requested and selected transport;
 - extension log `OBI remote-parent propagator enabled`;
@@ -476,6 +589,7 @@ OBI accepts these environment overrides (the YAML equivalents are in
 | Setting | Value in this demo |
 | --- | --- |
 | `OTEL_EBPF_BPF_DISABLE_BLACK_BOX_CP` | `true` |
+| `OTEL_EBPF_BPF_BUFFER_SIZE_HTTP` | `32768` bytes, enough to parse the deliberate 18 KiB boundary header |
 | `OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT` | `disabled`, `auto`, `getsockopt`, or `unix` |
 | `OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_PATH` | `/var/run/obi/java-remote-parent.sock` |
 | `OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_GROUP_ID` | `65534` (the bounded Unix attacker fixture; the demo JVM runs as root) |
@@ -535,6 +649,10 @@ Every run retains a timestamped directory under `.runtime/results/` with:
 - before/after OBI metrics, Java bridge diagnostics, scoped container
   CPU/memory/PID samples, process RSS/thread/fd counts, and reason-coded metric
   deltas for every scenario repetition;
+- for `tls-boundary` and `coalesced-bridge`, the exact receive cursor and guard
+  map IDs and layouts, both pre-run occupancies, every bounded recovery attempt,
+  two consecutive samples in which both maps are at steady baseline, and the
+  same evidence embedded in the scenario status;
 - live pressure-helper output naming the exact BPF map ID, capacity, non-secret
   JVM PID/namespace identity, complete fill count, and scanned eviction count;
   a read-only preparation record retained before mutation; once-per-second
@@ -578,7 +696,11 @@ captures its baseline from the existing pre-control health request, validates
 the exact bounded schema, and chains response-to-response deltas while the
 fault suite remains serial. This avoids an extra bridge take and requires
 exactly the normalized Java status for each injected mode with no unexpected
-retrieval result. The restart-fault
+retrieval result. `coalesced-bridge` and `timeout-retry` likewise return their
+terminal fixed-schema snapshot in-band. The former records the mutually
+exclusive exact-or-`d_ambiguous` result; the latter retains the canceled marker
+and its exact, missing, or single reason-coded disposition. Neither control
+adds a post-workload diagnostic self-probe. The restart-fault
 interval also includes the after-restart diagnostics snapshot, the
 duplicate-suppression readiness request, and the single post-readiness
 transport-configuration request, so it requires exactly three non-workload
@@ -610,8 +732,9 @@ the retained `compose.log` in this order:
 1. `trace-receiver` must listen on `127.0.0.1:14318`.
 2. Jetty must report HTTP/1.1 and the selected TLS protocol.
 3. Apache must load `mod_ssl` and verify the generated CA and hostname.
-4. OBI must discover ports `18080`, `18443`, and `18444`, then report bridge
-   availability.
+4. OBI must discover Apache on `18080`, the coalesced source on `18081`, and
+   the Java listeners on `18443` through `18446`, expose its loopback internal
+   metrics on `18990`, then report bridge availability.
 5. The JVM must report provider, extension, and injected-instrumentation
    readiness messages. Its loopback-only `/obi-transport-configuration`
    endpoint must return a fixed snapshot that proves the requested and selected
@@ -657,22 +780,30 @@ result and do not promote the targeted run to an acceptance matrix cell.
 - Pipelining is exercised only on the plaintext HTTP/1.1 client-to-Apache hop.
   The scenario writes every request before reading a response and fails unless
   every response and exact parent is returned.
-- The final serial request, and every parallel request, sends `Connection:
-  close` and asks the backend to close its response. This preserves earlier
-  backend reuse while giving OBI a TCP close boundary that finishes delayed TLS
-  spans before trace assertions.
+- Outside the TLS-boundary fixture, the final serial request and every parallel
+  request send `Connection: close` and ask the backend to close its response.
+  This preserves earlier backend reuse while giving OBI a TCP close boundary
+  that finishes delayed TLS spans before trace assertions. The boundary client
+  instead keeps its frontend connection persistent for the pair, Apache emits
+  reusable backend requests, and the sequence-aware Netty fixture itself forces
+  the final backend response and TLS connection closed.
 - Readiness and metric-boundary health probes also ask Jetty to close the
   backend connection, preventing probe state from entering a measured scenario.
 - The slow-body control proves that each measured request after the baseline
   crosses at least two decrypted Java receive callbacks and that those
   callbacks account for at least the full 64 KiB body. It does not infer exact
   Apache/OpenSSL TLS record boundaries from the client-side write pattern.
-- The separate retained TLS-boundary fixture observes bounded post-handshake
-  TLS application-record version and length metadata without retaining payloads.
-  Its exact record/callback cardinality proof is scoped to the planned fixture
+- The earlier retained TLS-boundary fixture observes bounded post-handshake TLS
+  application-record version and length metadata without retaining payloads.
+  Its exact record/callback cardinality proof is scoped to planned fixture
   writes and does not claim a general one-write/one-record JSSE contract. The
-  fixture uses a nested Java-to-loopback-Netty connection; it does not prove
-  that the outer correlated Apache-to-Java request has the same boundary shape.
+  current same-path scenario instead frames actual Apache-to-Java records before
+  Netty decryption and fails on any record/callback shape it cannot associate
+  exactly. On the live Apache path, each supported request is parser-delivered
+  separately after its own records are aggregated. A direct Java socket control
+  proves that two requests can share one deliberately aggregated parser buffer;
+  that control has no bridge-parent assertion because the bridge contract marks
+  more than one request ownership boundary per plaintext emission unsupported.
 - The helper carries accepted-socket ownership through exact executor,
   ForkJoin, Netty-worker, and virtual-thread task contexts. Packaged-agent tests
   cover nested hops, cancellation, worker reuse, and Java 21 carrier migration.

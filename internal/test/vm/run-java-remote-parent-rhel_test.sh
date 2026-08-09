@@ -229,15 +229,67 @@ test_production_verifier_profile_validation() {
 test_deterministic_artifact_path() {
     local -r artifact_dir="${TEST_TMP_DIR}/deterministic-artifact"
     local artifact_path=""
+    local expected_path=""
 
     artifact_path="$(create_transport_benchmark_artifact_path "$artifact_dir")" || \
         test_fail 'failed to create the deterministic artifact path'
     TEST_DIRS+=("$artifact_dir")
-    [[ "$artifact_path" == "${artifact_dir}/benchmark.json" ]] || \
+    expected_path="$(cd -L -- "$artifact_dir" && pwd -L)/benchmark.json"
+    [[ "$artifact_path" == "$expected_path" ]] || \
         test_fail 'deterministic artifact path was not canonical'
     if (create_transport_benchmark_artifact_path "$artifact_dir" >/dev/null 2>&1); then
         test_fail 'deterministic artifact path allowed reuse'
     fi
+}
+
+test_relative_artifact_path_resolution() {
+    local -r artifact_name=relative-artifact
+    local -r artifact_dir="${TEST_TMP_DIR}/${artifact_name}"
+    local artifact_path=""
+    local expected_path=""
+
+    artifact_path="$(
+        cd -- "$TEST_TMP_DIR"
+        create_transport_benchmark_artifact_path "$artifact_name"
+    )" || test_fail 'failed to create the relative artifact path'
+    TEST_DIRS+=("$artifact_dir")
+    expected_path="$(cd -L -- "$artifact_dir" && pwd -L)/benchmark.json"
+    [[ "$artifact_path" == /* ]] || \
+        test_fail 'relative artifact path was not made absolute'
+    [[ "$artifact_path" == "$expected_path" ]] || \
+        test_fail 'relative artifact path was not resolved from the invoking directory'
+    track_fixture "$artifact_path"
+    (
+        cd -- "${SCRIPT_DIR}/../../../pkg/internal/ebpf/tpinjector"
+        : > "$artifact_path"
+    ) || test_fail 'artifact path changed under the Go package working directory'
+    [[ -f "$artifact_path" ]] || \
+        test_fail 'consumer did not publish through the resolved artifact path'
+}
+
+test_artifact_path_preserves_symlinks() {
+    local absolute_test_dir=""
+    local target_dir=""
+    local link_path=""
+    local artifact_dir=""
+    local artifact_path=""
+
+    absolute_test_dir="$(cd -L -- "$TEST_TMP_DIR" && pwd -L)"
+    target_dir="${absolute_test_dir}/artifact-target"
+    link_path="${absolute_test_dir}/artifact-link"
+    artifact_dir="${link_path}/transport-benchmark"
+
+    mkdir -m 700 -- "$target_dir"
+    TEST_DIRS+=("$target_dir")
+    ln -s -- "$(basename -- "$target_dir")" "$link_path"
+    track_fixture "$link_path"
+    artifact_path="$(create_transport_benchmark_artifact_path "$artifact_dir")" || \
+        test_fail 'failed to create an artifact directory beneath a symlink'
+    TEST_DIRS+=("${target_dir}/transport-benchmark")
+    [[ "$artifact_path" == "${artifact_dir}/benchmark.json" ]] || \
+        test_fail 'artifact path resolution concealed a symlink component'
+    [[ "$artifact_path" != "${target_dir}/transport-benchmark/benchmark.json" ]] || \
+        test_fail 'artifact path resolution returned the physical symlink target'
 }
 
 test_relative_agent_path_resolution() {
@@ -318,6 +370,8 @@ run_tests() {
 
     test_production_verifier_profile_validation
     test_deterministic_artifact_path
+    test_relative_artifact_path_resolution
+    test_artifact_path_preserves_symlinks
     test_relative_agent_path_resolution
     printf '%s\n' 'RHEL verifier and transport benchmark validator tests passed'
 }

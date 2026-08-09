@@ -324,6 +324,7 @@ transport_benchmark_artifact_gates_pass() {
 
 create_transport_benchmark_artifact_path() {
     local -r artifact_dir="$1"
+    local absolute_artifact_dir=""
 
     if [[ -e "$artifact_dir" || -L "$artifact_dir" ]]; then
         fail "transport benchmark artifact directory already exists: ${artifact_dir}"
@@ -331,7 +332,14 @@ create_transport_benchmark_artifact_path() {
     mkdir -m 700 -- "$artifact_dir" || \
         fail "failed to create transport benchmark artifact directory: ${artifact_dir}"
     require_private_benchmark_path "$artifact_dir" directory 700
-    printf '%s\n' "${artifact_dir}/benchmark.json"
+    # Go test changes to the package directory. Keep logical symlinks visible so
+    # the artifact writer can still reject them with O_NOFOLLOW.
+    absolute_artifact_dir="$(
+        unset CDPATH
+        cd -L -- "$artifact_dir" && pwd -L
+    )" || \
+        fail "failed to resolve transport benchmark artifact directory: ${artifact_dir}"
+    printf '%s\n' "${absolute_artifact_dir}/benchmark.json"
 }
 
 require_java_agent() {

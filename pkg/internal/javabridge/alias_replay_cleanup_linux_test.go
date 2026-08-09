@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -36,6 +37,11 @@ func aliasReplayCleanupFixture(t *testing.T) (*Cleanup, stateKey, stateValue) {
 		ProcessIncarnation: testProcessIncarnation,
 	}
 	return cleanup, key, state
+}
+
+func authorizeGenerationReplayScanForTest(cleanup *Cleanup, key stateKey) {
+	cleanup.generationReplayScanKey = key
+	cleanup.generationReplayScanKeySet = true
 }
 
 func seedAliasReplayBindingGenerationForTest(
@@ -285,7 +291,7 @@ func cleanupSameSocketSuccessorFixture(
 }
 
 func TestCleanupSameSocketSuccessorSurvivesOldAliasTeardown(t *testing.T) {
-	handler, cleanup, oldKey, oldState, replayKey, oldReplay, successor, _ :=
+	handler, cleanup, oldKey, oldState, replayKey, oldReplay, successor, oldTerminal :=
 		cleanupSameSocketSuccessorFixture(t)
 	seedAgedGenerationCleanupFence(t, cleanup, oldKey, oldState.ProcessIncarnation)
 
@@ -303,7 +309,7 @@ func TestCleanupSameSocketSuccessorSurvivesOldAliasTeardown(t *testing.T) {
 	assert.NotContains(t, handler.ambiguity.(*fakeBridgeMap).values, oldKey)
 	assert.NotContains(t, handler.claims.(*fakeBridgeMap).values, oldKey)
 	assert.NotContains(t, handler.ownerGuards.(*fakeBridgeMap).values, oldKey.Owner)
-	assert.NotContains(t, handler.terminals.(*fakeBridgeMap).values, oldKey.Owner)
+	assert.Equal(t, oldTerminal, handler.terminals.(*fakeBridgeMap).values[oldKey.Owner])
 	finalReplay, present := handler.aliasReplays.(*fakeBridgeMap).values[replayKey].(aliasReplayValue)
 	require.True(t, present)
 	assert.True(t, validAliasReplayFinal(finalReplay))
@@ -536,6 +542,7 @@ func TestCleanupAliasReplayReconcilesTaggedPublishingToAuthoritativeClaim(t *tes
 
 func TestCleanupGenerationReplayRescansAfterSweepSnapshot(t *testing.T) {
 	cleanup, key, state := aliasReplayCleanupFixture(t)
+	authorizeGenerationReplayScanForTest(cleanup, key)
 	ownership := seedAgedGenerationCleanupFence(
 		t, cleanup, key, state.ProcessIncarnation,
 	)
@@ -588,6 +595,7 @@ func TestCleanupMarkerFreeClaimTailRequiresMatchingFinalReplay(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			cleanup, key, state := aliasReplayCleanupFixture(t)
+			authorizeGenerationReplayScanForTest(cleanup, key)
 			claim := generationClaim{
 				ObservedMonotonicNS: uint64(60 * time.Second),
 				ProcessIncarnation:  state.ProcessIncarnation,
@@ -614,6 +622,87 @@ func TestCleanupMarkerFreeClaimTailRequiresMatchingFinalReplay(t *testing.T) {
 			} else {
 				assert.Contains(t, cleanup.maps.claims.(*fakeBridgeMap).values, key)
 			}
+		})
+	}
+}
+
+func TestCleanupMarkerFreeClaimTailSyntheticExemptionIsNarrow(t *testing.T) {
+	for _, test := range []struct {
+		name               string
+		processIncarnation func(stateKey) uint64
+		origin             uint8
+		tagged             bool
+		wantReleased       bool
+		failReplayScan     bool
+	}{
+		{
+			name: "synthetic ambiguous",
+			processIncarnation: func(key stateKey) uint64 {
+				return key.Generation
+			},
+			origin:         lifecycleAmbiguous,
+			tagged:         true,
+			wantReleased:   true,
+			failReplayScan: true,
+		},
+		{
+			name: "JVM ambiguous",
+			processIncarnation: func(stateKey) uint64 {
+				return testProcessIncarnation
+			},
+			origin: lifecycleAmbiguous,
+		},
+		{
+			name: "synthetic non-ambiguous",
+			processIncarnation: func(key stateKey) uint64 {
+				return key.Generation
+			},
+			origin: lifecycleStale,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			owner := Identity{TID: 3, PID: 2, Namespace: 1}
+			key := stateKey{Owner: owner, Generation: 10}
+			processIncarnation := test.processIncarnation(key)
+			claim := generationClaim{
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  processIncarnation,
+				Lifecycle:           lifecycleCleanup,
+				Reserved:            [7]byte{test.origin},
+			}
+			if test.tagged {
+				claim.Reserved[6] = generationGoProducerTag
+			}
+			cleanup := testCleanup(testMapHandler(nil, nil, nil))
+			cleanup.maps.claims.(*fakeBridgeMap).values[key] = claim
+			replayKey := aliasReplayKey{
+				Owner:               owner,
+				Generation:          key.Generation,
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  processIncarnation,
+			}
+			replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+			replays.values[replayKey] = activeAliasReplayForTest()
+			if test.failReplayScan {
+				replays.iterateErr = errors.New("injected replay scan failure")
+			} else {
+				require.NoError(t, cleanup.snapshotAliasReplayState())
+			}
+			cleanup.generationSnapshotComplete = true
+			cleanup.stateSnapshotComplete = true
+			cleanup.physicalGenerations = make(map[stateKey]struct{})
+
+			released, err := cleanup.releaseGenerationCleanupClaimTail(
+				key, claim, 41*time.Second,
+			)
+			require.NoError(t, err)
+			assert.Equal(t, test.wantReleased, released)
+			if test.wantReleased {
+				assert.NotContains(t, cleanup.maps.claims.(*fakeBridgeMap).values, key)
+			} else {
+				assert.Equal(t, claim, cleanup.maps.claims.(*fakeBridgeMap).values[key])
+			}
+			assert.Equal(t, activeAliasReplayForTest(), replays.values[replayKey])
 		})
 	}
 }
@@ -656,6 +745,7 @@ func TestCleanupClaimTailIgnoresUnrelatedIncarnationReplay(t *testing.T) {
 		Reserved:            [7]byte{lifecycleStale},
 	}
 	cleanup.maps.claims.(*fakeBridgeMap).values[key] = claim
+	authorizeGenerationReplayScanForTest(cleanup, key)
 	currentKey := aliasReplayKeyForState(key, state)
 	currentFinal := boundAliasReplayForTest(aliasReplayValue{
 		TransitionMonotonicNS: uint64(60 * time.Second),
@@ -821,6 +911,7 @@ func TestCleanupGuardOnlyTailAllowsFinalReplaysToOutliveFence(t *testing.T) {
 	guards.values[key.Owner] = guard
 
 	prepareAliasReplayTailSweep(t, cleanup)
+	authorizeGenerationReplayScanForTest(cleanup, key)
 	released, err := cleanup.releaseGenerationCleanupGuardTail(
 		key.Owner, guard, cleanup.monoTimeNow(),
 	)
@@ -1056,4 +1147,118 @@ func TestCleanupMalformedStateWithAliasAuthorityFailsClosed(t *testing.T) {
 			assert.Contains(t, cleanup.maps.states.(*fakeBridgeMap).values, key)
 		})
 	}
+}
+
+func TestCleanupTerminalAliasReplayFenceRetirementSafe(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	terminal := terminalValue{
+		Generation:          key.Generation,
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleConsumed,
+	}
+	replayKey := aliasReplayKeyForTerminal(key, terminal)
+	final := boundAliasReplayForTest(aliasReplayValue{
+		TransitionMonotonicNS: uint64(10 * time.Second),
+		References:            1,
+		Lifecycle:             terminal.Lifecycle,
+	})
+	newCleanup := func() (*Cleanup, *fakeBridgeMap) {
+		cleanup := testCleanup(testMapHandler(nil, nil, nil))
+		replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+		return cleanup, replays
+	}
+
+	t.Run("exact key absent ignores unrelated replay and iteration failure", func(t *testing.T) {
+		cleanup, replays := newCleanup()
+		unrelated := replayKey
+		unrelated.ProcessIncarnation++
+		replays.values[unrelated] = activeAliasReplayForTest()
+		replays.iterateErr = errors.New("unexpected iteration")
+		misses := 0
+		replays.afterLookupResult = func(lookedUp any, err error) {
+			if lookedUp == replayKey && errors.Is(err, ebpf.ErrKeyNotExist) {
+				misses++
+			}
+		}
+
+		safe, err := cleanup.terminalAliasReplayFenceRetirementSafe(key, terminal)
+		require.NoError(t, err)
+		assert.True(t, safe)
+		assert.Equal(t, 2, misses)
+		assert.Equal(t, activeAliasReplayForTest(), replays.values[unrelated])
+	})
+
+	t.Run("matching final", func(t *testing.T) {
+		cleanup, replays := newCleanup()
+		replays.values[replayKey] = final
+
+		safe, err := cleanup.terminalAliasReplayFenceRetirementSafe(key, terminal)
+		require.NoError(t, err)
+		assert.True(t, safe)
+		assert.Equal(t, 2, replays.lookupCount)
+	})
+
+	t.Run("conflicting final lifecycle", func(t *testing.T) {
+		cleanup, replays := newCleanup()
+		conflicting := final
+		conflicting.Lifecycle = lifecycleStale
+		replays.values[replayKey] = conflicting
+
+		safe, err := cleanup.terminalAliasReplayFenceRetirementSafe(key, terminal)
+		require.NoError(t, err)
+		assert.False(t, safe)
+	})
+
+	t.Run("active replay appears after first miss", func(t *testing.T) {
+		cleanup, replays := newCleanup()
+		misses := 0
+		replays.afterLookupResult = func(lookedUp any, err error) {
+			if lookedUp != replayKey || !errors.Is(err, ebpf.ErrKeyNotExist) {
+				return
+			}
+			misses++
+			if misses == 1 {
+				replays.mu.Lock()
+				replays.values[replayKey] = activeAliasReplayForTest()
+				replays.mu.Unlock()
+			}
+		}
+
+		safe, err := cleanup.terminalAliasReplayFenceRetirementSafe(key, terminal)
+		require.NoError(t, err)
+		assert.False(t, safe)
+	})
+
+	t.Run("matching final replaced after first hit", func(t *testing.T) {
+		cleanup, replays := newCleanup()
+		replays.values[replayKey] = final
+		hits := 0
+		replays.afterLookupResult = func(lookedUp any, err error) {
+			if lookedUp != replayKey || err != nil {
+				return
+			}
+			hits++
+			if hits == 1 {
+				replays.mu.Lock()
+				replays.values[replayKey] = activeAliasReplayForTest()
+				replays.mu.Unlock()
+			}
+		}
+
+		safe, err := cleanup.terminalAliasReplayFenceRetirementSafe(key, terminal)
+		require.NoError(t, err)
+		assert.False(t, safe)
+	})
+
+	t.Run("lookup error", func(t *testing.T) {
+		cleanup, replays := newCleanup()
+		replays.lookupErr = errors.New("injected lookup failure")
+
+		safe, err := cleanup.terminalAliasReplayFenceRetirementSafe(key, terminal)
+		assert.False(t, safe)
+		require.ErrorContains(t, err, "checking terminal alias replay")
+		require.ErrorContains(t, err, "injected lookup failure")
+	})
 }

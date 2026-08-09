@@ -66,11 +66,13 @@ type fakeBridgeMap struct {
 	updateErr         error
 	updateCommitErr   error
 	deleteErr         error
+	deleteCommitErr   error
 	iterateErr        error
 	afterIterate      func()
 	afterLookup       func(int)
 	afterLookupResult func(any, error)
 	beforeUpdate      func(any, any, ebpf.MapUpdateFlags)
+	afterFailedUpdate func()
 	afterUpdate       func(any, any)
 	afterDelete       func(any)
 }
@@ -155,7 +157,11 @@ func (m *fakeBridgeMap) Update(key, value any, flags ebpf.MapUpdateFlags) error 
 	m.updateCount++
 	if m.updateErr != nil {
 		err := m.updateErr
+		afterFailedUpdate := m.afterFailedUpdate
 		m.mu.Unlock()
+		if afterFailedUpdate != nil {
+			afterFailedUpdate()
+		}
 		return err
 	}
 	mapKey := indirectValue(key)
@@ -196,12 +202,13 @@ func (m *fakeBridgeMap) Delete(key any) error {
 		return ebpf.ErrKeyNotExist
 	}
 	delete(m.values, mapKey)
+	commitErr := m.deleteCommitErr
 	afterDelete := m.afterDelete
 	m.mu.Unlock()
 	if afterDelete != nil {
 		afterDelete(mapKey)
 	}
-	return nil
+	return commitErr
 }
 
 func indirectValue(value any) any {

@@ -6,8 +6,10 @@
 package javabridge // import "go.opentelemetry.io/obi/pkg/internal/javabridge"
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -65,35 +67,45 @@ type cleanupMaps struct {
 }
 
 type Cleanup struct {
-	maps                         cleanupMaps
-	ttl                          time.Duration
-	monoTimeNow                  func() time.Duration
-	physicalGenerations          map[stateKey]struct{}
-	physicalGenerationsByOwner   map[Identity][]stateKey
-	deferPhysicalGenerationScan  bool
-	currentSweepClaims           map[stateKey]generationClaim
-	currentSweepGuards           map[Identity]generationClaim
-	releasedSweepClaims          map[stateKey]generationClaim
-	releasedSweepGuards          map[Identity]generationClaim
-	releasedSweepAmbiguities     map[stateKey]uint64
-	currentSweepAmbiguities      map[stateKey]uint64
-	knownGenerations             map[stateKey]struct{}
-	knownGenerationsByOwner      map[Identity][]stateKey
-	knownLogicalKeys             map[stateKey]struct{}
-	knownLogicalKeysByOwner      map[Identity][]stateKey
-	generationSnapshotComplete   bool
-	stateSnapshotComplete        bool
-	aliasReplaySnapshotComplete  bool
-	aliasCarrierSnapshotComplete bool
-	aliasReplayEntries           map[aliasReplayKey]aliasReplayValue
-	aliasReplayCarriers          map[aliasReplayCarrierKey]struct{}
-	aliasReplayCleanupKeys       map[stateKey]aliasReplayKey
-	aliasReplayCleanupProofs     map[stateKey]*aliasReplayCleanupProof
-	aliasReplayNoCarrier         map[aliasReplayKey]aliasReplayNoCarrierObservation
-	coordinator                  *GenerationCoordinator
+	maps                          cleanupMaps
+	ttl                           time.Duration
+	monoTimeNow                   func() time.Duration
+	physicalGenerations           map[stateKey]struct{}
+	physicalGenerationsByOwner    map[Identity][]stateKey
+	deferPhysicalGenerationScan   bool
+	currentSweepClaims            map[stateKey]generationClaim
+	currentSweepGuards            map[Identity]generationClaim
+	releasedSweepClaims           map[stateKey]generationClaim
+	releasedSweepGuards           map[Identity]generationClaim
+	releasedSweepAmbiguities      map[stateKey]uint64
+	fenceRetirementAttempts       map[stateKey]struct{}
+	currentSweepAmbiguities       map[stateKey]uint64
+	knownGenerations              map[stateKey]struct{}
+	knownGenerationsByOwner       map[Identity][]stateKey
+	knownLogicalKeys              map[stateKey]struct{}
+	knownLogicalKeysByOwner       map[Identity][]stateKey
+	generationSnapshotComplete    bool
+	stateSnapshotComplete         bool
+	aliasReplaySnapshotComplete   bool
+	aliasCarrierSnapshotComplete  bool
+	aliasReplayEntries            map[aliasReplayKey]aliasReplayValue
+	aliasReplayCarriers           map[aliasReplayCarrierKey]struct{}
+	aliasReplayCleanupKeys        map[stateKey]aliasReplayKey
+	aliasReplayCleanupProofs      map[stateKey]*aliasReplayCleanupProof
+	retainedTerminalAuthorities   map[stateKey]terminalValue
+	aliasReplayNoCarrier          map[aliasReplayKey]aliasReplayNoCarrierObservation
+	generationReplayScanCursor    stateKey
+	generationReplayScanCursorSet bool
+	generationReplayScanKey       stateKey
+	generationReplayScanKeySet    bool
+	coordinator                   *GenerationCoordinator
 }
 
-const javaRemoteParentMinimumFenceAge = time.Second
+const (
+	javaRemoteParentMinimumFenceAge                         = time.Second
+	javaRemoteParentMaxExactTailClaims                      = 1024
+	javaRemoteParentMaxGenerationReplayScanAttemptsPerSweep = 1
+)
 
 // CleanupStats reports logical cleanup roots reclaimed by one sweep. Cleaned
 // counts each generation once, using its index or an orphan state, owner, or
@@ -114,15 +126,18 @@ type cleanupEntry[K, V any] struct {
 }
 
 type generationCleanupOwnership struct {
-	claim          generationClaim
-	inheritedFence bool
-	ambiguity      uint64
-	hasAmbiguity   bool
-	fence          generationTeardownFence
-	ready          bool
+	claim                      generationClaim
+	inheritedFence             bool
+	ambiguity                  uint64
+	hasAmbiguity               bool
+	fence                      generationTeardownFence
+	requireValidTerminalAbsent bool
+	ready                      bool
 }
 
 type generationCleanupRootRevalidator func() (bool, error)
+
+type generationCleanupCompletionValidator func(requireSnapshot bool) (bool, error)
 
 type handoffKey struct {
 	PID       uint32
@@ -204,6 +219,7 @@ func (c *Cleanup) SweepWithStats() (CleanupStats, error) {
 	err := c.sweepSSLPrewrite()
 	unlock := c.coordinator.lockCleanup()
 	defer unlock()
+	persistent := c
 	sweep := *c
 	sweep.physicalGenerations = nil
 	sweep.physicalGenerationsByOwner = nil
@@ -213,6 +229,7 @@ func (c *Cleanup) SweepWithStats() (CleanupStats, error) {
 	sweep.releasedSweepClaims = make(map[stateKey]generationClaim)
 	sweep.releasedSweepGuards = make(map[Identity]generationClaim)
 	sweep.releasedSweepAmbiguities = make(map[stateKey]uint64)
+	sweep.fenceRetirementAttempts = make(map[stateKey]struct{})
 	sweep.currentSweepAmbiguities = make(map[stateKey]uint64)
 	sweep.knownGenerations = make(map[stateKey]struct{})
 	sweep.knownGenerationsByOwner = make(map[Identity][]stateKey)
@@ -222,6 +239,13 @@ func (c *Cleanup) SweepWithStats() (CleanupStats, error) {
 	sweep.aliasReplayCarriers = make(map[aliasReplayCarrierKey]struct{})
 	sweep.aliasReplayCleanupKeys = make(map[stateKey]aliasReplayKey)
 	sweep.aliasReplayCleanupProofs = make(map[stateKey]*aliasReplayCleanupProof)
+	sweep.retainedTerminalAuthorities = make(map[stateKey]terminalValue)
+	sweep.generationReplayScanKey = stateKey{}
+	sweep.generationReplayScanKeySet = false
+	defer func() {
+		persistent.generationReplayScanCursor = sweep.generationReplayScanCursor
+		persistent.generationReplayScanCursorSet = sweep.generationReplayScanCursorSet
+	}()
 	if sweep.aliasReplayNoCarrier == nil {
 		sweep.aliasReplayNoCarrier = make(map[aliasReplayKey]aliasReplayNoCarrierObservation)
 	}
@@ -1222,18 +1246,195 @@ func (c *Cleanup) acquireOrAdoptGenerationCleanupGuard(
 	return guard, true, true, nil
 }
 
+func (c *Cleanup) upgradeExactMarkerTailClaimForArtifact(
+	key stateKey,
+	exact generationClaim,
+	processIncarnation uint64,
+	lifecycle uint8,
+	requireValidTerminalAbsent bool,
+	requiredGuard *generationClaim,
+	revalidateRoot generationCleanupRootRevalidator,
+) (generationCleanupOwnership, bool, error) {
+	if !validExactMarkerTailCleanupClaim(key, exact) || revalidateRoot == nil {
+		return generationCleanupOwnership{}, false, nil
+	}
+	validateRootAndClaim := func(expected generationClaim) (bool, error) {
+		rootMatches, err := revalidateRoot()
+		if err != nil || !rootMatches {
+			return false, err
+		}
+		return generationClaimMatches(c.maps.claims, key, expected)
+	}
+	valid, err := validateRootAndClaim(exact)
+	if err != nil || !valid {
+		return generationCleanupOwnership{}, false, err
+	}
+	var guard generationClaim
+	if requiredGuard != nil {
+		guard = *requiredGuard
+		if !validGenerationCleanupGuard(key.Owner, guard) ||
+			guard.ProcessIncarnation != key.Generation {
+			return generationCleanupOwnership{}, false, nil
+		}
+		guardMatches, err := generationGuardMatches(c.maps.ownerGuards, key.Owner, guard)
+		if err != nil || !guardMatches {
+			return generationCleanupOwnership{}, false, err
+		}
+	} else {
+		var guarded bool
+		var err error
+		guard, _, guarded, err = c.acquireOrAdoptGenerationCleanupGuard(key)
+		if err != nil || !guarded {
+			return generationCleanupOwnership{}, false, err
+		}
+	}
+	valid, err = validateRootAndClaim(exact)
+	if err != nil || !valid {
+		return generationCleanupOwnership{}, false, err
+	}
+	guardMatches, err := generationGuardMatches(c.maps.ownerGuards, key.Owner, guard)
+	if err != nil || !guardMatches {
+		return generationCleanupOwnership{}, false, err
+	}
+
+	// G blocks new owner-scoped producers before the exact-only E is atomically
+	// replaced. E therefore remains continuously present, while the fresh
+	// ordinary claim starts a new grace interval before M can complete the full
+	// mutable-artifact fence.
+	replacement, ok := c.newGenerationClaim(lifecycle, processIncarnation)
+	if !ok {
+		return generationCleanupOwnership{}, false,
+			errors.New("reading monotonic time for exact-tail artifact upgrade")
+	}
+	// Record the intended bytes before UpdateExist. If the kernel commits but
+	// both the syscall and immediate readback fail, no later root in this sweep
+	// may mistake the fresh replacement for an aged inherited claim.
+	c.recordCurrentSweepClaim(key, replacement)
+	updateErr := c.maps.claims.Update(&key, &replacement, ebpf.UpdateExist)
+	var current generationClaim
+	lookupErr := c.maps.claims.Lookup(&key, &current)
+	if lookupErr != nil {
+		if updateErr != nil {
+			return generationCleanupOwnership{}, false, errors.Join(
+				fmt.Errorf("upgrading exact-tail artifact claim: %w", updateErr),
+				fmt.Errorf("checking uncertain exact-tail artifact upgrade: %w", lookupErr),
+			)
+		}
+		return generationCleanupOwnership{}, false,
+			fmt.Errorf("checking exact-tail artifact upgrade: %w", lookupErr)
+	}
+	if current != replacement {
+		if updateErr != nil {
+			return generationCleanupOwnership{}, false,
+				fmt.Errorf("upgrading exact-tail artifact claim: %w", updateErr)
+		}
+		return generationCleanupOwnership{}, false,
+			errors.New("exact-tail artifact claim changed during upgrade")
+	}
+	ownership := generationCleanupOwnership{
+		claim:                      replacement,
+		requireValidTerminalAbsent: requireValidTerminalAbsent,
+	}
+	if updateErr != nil {
+		return ownership, false,
+			fmt.Errorf("upgrading exact-tail artifact claim: %w", updateErr)
+	}
+	valid, err = validateRootAndClaim(replacement)
+	if err != nil || !valid {
+		return ownership, false, err
+	}
+	guardMatches, err = generationGuardMatches(c.maps.ownerGuards, key.Owner, guard)
+	if err != nil || !guardMatches {
+		return ownership, false, err
+	}
+	return ownership, false, nil
+}
+
 func (c *Cleanup) claimGenerationCleanupForArtifact(
 	key stateKey,
 	processIncarnation uint64,
 	lifecycle uint8,
 	revalidateRoot ...generationCleanupRootRevalidator,
 ) (generationCleanupOwnership, bool, error) {
+	if len(revalidateRoot) != 1 || revalidateRoot[0] == nil {
+		return generationCleanupOwnership{}, false, nil
+	}
+	var terminal terminalValue
+	if err := c.maps.terminals.Lookup(&key.Owner, &terminal); err == nil {
+		if terminal.Generation == key.Generation && validTerminalValue(terminal) {
+			if processIncarnation != terminal.ProcessIncarnation ||
+				!c.recordAliasReplayCleanupKey(
+					key, terminal.ObservedMonotonicNS, terminal.ProcessIncarnation,
+				) {
+				return generationCleanupOwnership{}, false, nil
+			}
+			if current, present := c.retainedTerminalAuthorities[key]; present && current != terminal {
+				return generationCleanupOwnership{}, false, nil
+			}
+			if c.retainedTerminalAuthorities == nil {
+				c.retainedTerminalAuthorities = make(map[stateKey]terminalValue)
+			}
+			c.retainedTerminalAuthorities[key] = terminal
+			// T pins the exact replay status for any residual mutable-payload
+			// cleanup. It remains in the LRU map while the ordinary full fence uses
+			// T's lifecycle and provenance instead of deleting or retargeting it.
+			lifecycle = terminal.Lifecycle
+		}
+	} else if !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return generationCleanupOwnership{}, false,
+			fmt.Errorf("checking generation artifact terminal status: %w", err)
+	}
+	artifactRoot := revalidateRoot[0]
+	requireValidTerminalAbsent := true
+	if authority, present := c.retainedTerminalAuthorities[key]; present {
+		requireValidTerminalAbsent = false
+		revalidateRoot = []generationCleanupRootRevalidator{func() (bool, error) {
+			terminalMatches, err := cleanupExactMatches(c.maps.terminals, key.Owner, authority)
+			if err != nil || !terminalMatches {
+				return false, err
+			}
+			artifactMatches, err := artifactRoot()
+			if err != nil || !artifactMatches {
+				return false, err
+			}
+			return cleanupExactMatches(c.maps.terminals, key.Owner, authority)
+		}}
+	} else {
+		revalidateRoot = []generationCleanupRootRevalidator{func() (bool, error) {
+			terminalAbsent, err := c.validGenerationTerminalAbsent(key)
+			if err != nil || !terminalAbsent {
+				return false, err
+			}
+			artifactMatches, err := artifactRoot()
+			if err != nil || !artifactMatches {
+				return false, err
+			}
+			return c.validGenerationTerminalAbsent(key)
+		}}
+	}
 	var existing generationClaim
 	if err := c.maps.claims.Lookup(&key, &existing); err == nil {
+		if validExactMarkerTailCleanupClaim(key, existing) {
+			upgradeProcessIncarnation := processIncarnation
+			if upgradeProcessIncarnation == 0 {
+				upgradeProcessIncarnation = key.Generation
+			}
+			return c.upgradeExactMarkerTailClaimForArtifact(
+				key, existing, upgradeProcessIncarnation, lifecycle,
+				requireValidTerminalAbsent, nil, revalidateRoot[0],
+			)
+		}
 		if !validGenerationCleanupClaim(existing) {
 			return generationCleanupOwnership{}, false, nil
 		}
-		return c.claimGenerationCleanup(key, existing, revalidateRoot...)
+		if authority, present := c.retainedTerminalAuthorities[key]; present &&
+			(existing.ProcessIncarnation != authority.ProcessIncarnation ||
+				existing.Reserved[0] != authority.Lifecycle) {
+			return generationCleanupOwnership{}, false, nil
+		}
+		ownership, ready, err := c.claimGenerationCleanup(key, existing, revalidateRoot...)
+		ownership.requireValidTerminalAbsent = requireValidTerminalAbsent
+		return ownership, ready, err
 	} else if !errors.Is(err, ebpf.ErrKeyNotExist) {
 		return generationCleanupOwnership{}, false,
 			fmt.Errorf("checking retained generation cleanup claim: %w", err)
@@ -1253,7 +1454,98 @@ func (c *Cleanup) claimGenerationCleanupForArtifact(
 		return generationCleanupOwnership{}, false,
 			errors.New("reading monotonic time for generation artifact claim")
 	}
-	return c.claimGenerationCleanup(key, claim, revalidateRoot...)
+	ownership, ready, err := c.claimGenerationCleanup(key, claim, revalidateRoot...)
+	ownership.requireValidTerminalAbsent = requireValidTerminalAbsent
+	return ownership, ready, err
+}
+
+// claimGenerationCleanupWithGuard adopts an already-published exact owner
+// guard without ever creating one. Valid terminal status may recover a matching
+// teardown fence, but it is not payload authority and must not fence a newer
+// generation merely because status outlived its producer.
+func (c *Cleanup) claimGenerationCleanupWithGuard(
+	key stateKey,
+	processIncarnation uint64,
+	lifecycle uint8,
+	guard generationClaim,
+	markedAt uint64,
+	revalidateRoot generationCleanupRootRevalidator,
+) (generationCleanupOwnership, bool, error) {
+	if key.Generation == 0 || key.Reserved != 0 || processIncarnation == 0 ||
+		revalidateRoot == nil || !validGenerationCleanupGuard(key.Owner, guard) ||
+		guard.ProcessIncarnation != key.Generation || markedAt == 0 {
+		return generationCleanupOwnership{}, false, nil
+	}
+	rootMatches, err := revalidateRoot()
+	if err != nil || !rootMatches {
+		return generationCleanupOwnership{}, false, err
+	}
+	markerMatches, err := c.cleanupMarkerMatches(key, &markedAt)
+	if err != nil || !markerMatches {
+		return generationCleanupOwnership{}, false, err
+	}
+	guardMatches, err := generationGuardMatches(c.maps.ownerGuards, key.Owner, guard)
+	if err != nil || !guardMatches {
+		return generationCleanupOwnership{}, false, err
+	}
+
+	claim, ok := c.newGenerationClaim(lifecycle, processIncarnation)
+	if !ok {
+		return generationCleanupOwnership{}, false,
+			errors.New("reading monotonic time for guarded generation artifact claim")
+	}
+	ownership := generationCleanupOwnership{claim: claim}
+	if err := c.maps.claims.Update(&key, &claim, ebpf.UpdateNoExist); err == nil {
+		c.recordCurrentSweepClaim(key, claim)
+	} else if !errors.Is(err, ebpf.ErrKeyExist) {
+		return generationCleanupOwnership{}, false,
+			fmt.Errorf("claiming guarded generation cleanup: %w", err)
+	} else {
+		var existing generationClaim
+		if err := c.maps.claims.Lookup(&key, &existing); err != nil {
+			if errors.Is(err, ebpf.ErrKeyNotExist) {
+				return generationCleanupOwnership{}, false, nil
+			}
+			return generationCleanupOwnership{}, false,
+				fmt.Errorf("looking up guarded generation cleanup claim: %w", err)
+		}
+		if !validGenerationCleanupClaim(existing) {
+			return generationCleanupOwnership{}, false, nil
+		}
+		if existing.ProcessIncarnation != processIncarnation ||
+			existing.Reserved[0] != lifecycle {
+			return generationCleanupOwnership{}, false, nil
+		}
+		ownership.claim = existing
+		ownership.inheritedFence = true
+	}
+
+	rootMatches, err = revalidateRoot()
+	if err != nil || !rootMatches {
+		return ownership, false, err
+	}
+	ownership.ambiguity = markedAt
+	ownership.hasAmbiguity = true
+	ownership.fence = generationTeardownFence{
+		key: key, claim: ownership.claim, guardKey: key.Owner, guardClaim: guard,
+		markedAt: markedAt,
+	}
+	valid, err := generationTeardownFenceMatches(
+		c.maps.claims, c.maps.ownerGuards, c.maps.ambiguity, ownership.fence,
+	)
+	if err != nil || !valid {
+		return ownership, false, err
+	}
+	now := c.monoTimeNow()
+	_, markerTouchedThisSweep := c.currentSweepAmbiguities[key]
+	ready := !c.claimCreatedThisSweep(key, ownership.claim) &&
+		!c.guardCreatedThisSweep(key.Owner, guard) &&
+		!markerTouchedThisSweep &&
+		c.generationCleanupFenceExpired(now, ownership.claim.ObservedMonotonicNS) &&
+		c.generationCleanupFenceExpired(now, guard.ObservedMonotonicNS) &&
+		c.generationCleanupFenceExpired(now, markedAt)
+	ownership.ready = ready
+	return ownership, ready, nil
 }
 
 func (c *Cleanup) acquireOrAdoptGenerationTeardownFence(
@@ -1344,7 +1636,31 @@ func (c *Cleanup) generationCleanupFenceMatches(
 	if err != nil || !fenced {
 		return false, err
 	}
-	return c.aliasReplayCleanupProofMatches(ownership)
+	terminalAuthorityMatches := func() (bool, error) {
+		if terminal, present := c.retainedTerminalAuthorities[ownership.fence.key]; present {
+			if ownership.requireValidTerminalAbsent ||
+				ownership.claim.ProcessIncarnation != terminal.ProcessIncarnation ||
+				ownership.claim.Reserved[0] != terminal.Lifecycle {
+				return false, nil
+			}
+			return cleanupExactMatches(
+				c.maps.terminals, ownership.fence.key.Owner, terminal,
+			)
+		}
+		if ownership.requireValidTerminalAbsent {
+			return c.validGenerationTerminalAbsent(ownership.fence.key)
+		}
+		return true, nil
+	}
+	terminalMatches, terminalErr := terminalAuthorityMatches()
+	if terminalErr != nil || !terminalMatches {
+		return false, terminalErr
+	}
+	replayMatches, replayErr := c.aliasReplayCleanupProofMatches(ownership)
+	if replayErr != nil || !replayMatches {
+		return false, replayErr
+	}
+	return terminalAuthorityMatches()
 }
 
 func (c *Cleanup) mutateGenerationCleanupFenced(
@@ -1444,6 +1760,17 @@ func (c *Cleanup) recordReleasedSweepAmbiguity(key stateKey, markedAt uint64) {
 	}
 }
 
+func (c *Cleanup) recordFenceRetirementAttempt(key stateKey) {
+	if c.fenceRetirementAttempts != nil {
+		c.fenceRetirementAttempts[key] = struct{}{}
+	}
+}
+
+func (c *Cleanup) fenceRetirementAttempted(key stateKey) bool {
+	_, attempted := c.fenceRetirementAttempts[key]
+	return attempted
+}
+
 func (c *Cleanup) recordCurrentSweepGuard(key Identity, guard generationClaim) {
 	if c.currentSweepGuards != nil {
 		c.currentSweepGuards[key] = guard
@@ -1536,6 +1863,25 @@ func (c *Cleanup) newGenerationClaim(
 	}, true
 }
 
+func (c *Cleanup) newExactMarkerTailClaim(key stateKey) (generationClaim, bool) {
+	claim, ok := c.newGenerationClaim(lifecycleAmbiguous, key.Generation)
+	if !ok {
+		return generationClaim{}, false
+	}
+	claim.Reserved[6] = generationGoProducerTag
+	return claim, true
+}
+
+func validExactMarkerTailCleanupClaim(key stateKey, claim generationClaim) bool {
+	return key.Generation != 0 && key.Reserved == 0 &&
+		claim.ObservedMonotonicNS != 0 && claim.ProcessIncarnation == key.Generation &&
+		claim.Lifecycle == lifecycleCleanup &&
+		claim.Reserved == ([7]byte{
+			0: lifecycleAmbiguous,
+			6: generationGoProducerTag,
+		})
+}
+
 func (c *Cleanup) generationCleanupLogicalArtifactsAbsent(key stateKey) (bool, error) {
 	absent, err := c.generationCleanupNonIndexArtifactsAbsent(key)
 	if err != nil || !absent {
@@ -1581,16 +1927,47 @@ func (c *Cleanup) generationCleanupPayloadArtifactsAbsent(key stateKey) (bool, e
 		return false, fmt.Errorf("checking generation fallback cleanup: %w", err)
 	}
 
+	authority, retained := c.retainedTerminalAuthorities[key]
 	var terminal terminalValue
 	if err := c.maps.terminals.Lookup(&key.Owner, &terminal); err == nil {
-		if terminal.Generation == key.Generation {
+		if retained {
+			if terminal != authority || !validTerminalValue(terminal) {
+				return false, nil
+			}
+		} else if terminal.Generation == key.Generation {
 			return false, nil
 		}
-	} else if !errors.Is(err, ebpf.ErrKeyNotExist) {
+	} else if errors.Is(err, ebpf.ErrKeyNotExist) {
+		if retained {
+			return false, nil
+		}
+	} else {
 		return false, fmt.Errorf("checking generation terminal cleanup: %w", err)
 	}
 
 	return true, nil
+}
+
+func (c *Cleanup) generationTerminalAbsent(key stateKey) (bool, error) {
+	var terminal terminalValue
+	if err := c.maps.terminals.Lookup(&key.Owner, &terminal); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return true, nil
+		}
+		return false, fmt.Errorf("checking generation terminal absence: %w", err)
+	}
+	return terminal.Generation != key.Generation, nil
+}
+
+func (c *Cleanup) validGenerationTerminalAbsent(key stateKey) (bool, error) {
+	var terminal terminalValue
+	if err := c.maps.terminals.Lookup(&key.Owner, &terminal); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return true, nil
+		}
+		return false, fmt.Errorf("checking valid generation terminal absence: %w", err)
+	}
+	return terminal.Generation != key.Generation || !validTerminalValue(terminal), nil
 }
 
 func (c *Cleanup) generationConnectionArtifacts() (map[stateKey]struct{}, error) {
@@ -1696,6 +2073,166 @@ func (c *Cleanup) snapshotProvesGenerationCleanupComplete(
 	return c.generationCleanupArtifactsAbsent(key)
 }
 
+func (c *Cleanup) snapshotProvesExactTailPayloadComplete(
+	key stateKey,
+) (bool, error) {
+	if !c.generationSnapshotComplete || !c.stateSnapshotComplete ||
+		c.physicalGenerations == nil {
+		return false, nil
+	}
+	var generation generationIndexValue
+	if err := c.maps.generations.Lookup(&key, &generation); err == nil {
+		return false, nil
+	} else if !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return false, fmt.Errorf("checking exact-tail generation index: %w", err)
+	}
+	var state stateValue
+	if err := c.maps.states.Lookup(&key, &state); err == nil {
+		return false, nil
+	} else if !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return false, fmt.Errorf("checking exact-tail generation state: %w", err)
+	}
+	var owner ownerValue
+	if err := c.maps.owners.Lookup(&key.Owner, &owner); err == nil {
+		if owner.Generation == key.Generation {
+			return false, nil
+		}
+	} else if !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return false, fmt.Errorf("checking exact-tail generation owner: %w", err)
+	}
+	var encoded [RecordSize]byte
+	if err := c.maps.remoteParents.Lookup(&key.Owner, &encoded); err == nil {
+		record, decodeErr := UnmarshalRecord(encoded[:])
+		if decodeErr != nil || record.Generation == key.Generation {
+			return false, nil
+		}
+	} else if !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return false, fmt.Errorf("checking exact-tail fallback: %w", err)
+	}
+	var terminal terminalValue
+	if err := c.maps.terminals.Lookup(&key.Owner, &terminal); err == nil {
+		if terminal.Generation == key.Generation && !validTerminalValue(terminal) {
+			return false, nil
+		}
+	} else if !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return false, fmt.Errorf("checking exact-tail terminal: %w", err)
+	}
+	if _, present := c.physicalGenerations[key]; present {
+		return false, nil
+	}
+	// Acquisition never deletes payload, and every destructive phase first ages
+	// E through a later sweep. The complete per-sweep physical snapshot therefore
+	// observes publications from pre-E BPF critical sections without multiplying
+	// full-map scans by the number of exact tails.
+	return true, nil
+}
+
+func (c *Cleanup) terminalGenerationCleanupComplete(
+	key stateKey,
+	terminal terminalValue,
+	ownership generationCleanupOwnership,
+) (bool, error) {
+	if !validTerminalValue(terminal) || terminal.Generation != key.Generation ||
+		ownership.claim.ProcessIncarnation != terminal.ProcessIncarnation ||
+		ownership.claim.Reserved[0] != terminal.Lifecycle {
+		return false, nil
+	}
+	return c.exactTerminalGenerationCleanupComplete(key, terminal)
+}
+
+func (c *Cleanup) retainedTerminalGenerationCleanupComplete(
+	key stateKey,
+	terminal terminalValue,
+	ownership generationCleanupOwnership,
+	requireSnapshot bool,
+) (bool, error) {
+	if !validTerminalValue(terminal) || terminal.Generation != key.Generation ||
+		ownership.claim.ProcessIncarnation != terminal.ProcessIncarnation ||
+		ownership.claim.Reserved[0] != terminal.Lifecycle {
+		return false, nil
+	}
+	terminalMatches, err := cleanupExactMatches(c.maps.terminals, key.Owner, terminal)
+	if err != nil || !terminalMatches {
+		return false, err
+	}
+	var complete bool
+	if requireSnapshot {
+		complete, err = c.snapshotProvesGenerationCleanupComplete(key)
+	} else {
+		complete, err = c.finishGenerationCleanup(key)
+	}
+	if err != nil || !complete {
+		return false, err
+	}
+	replaySafe, err := c.terminalAliasReplayFenceRetirementSafe(key, terminal)
+	if err != nil || !replaySafe {
+		return false, err
+	}
+	return cleanupExactMatches(c.maps.terminals, key.Owner, terminal)
+}
+
+func (c *Cleanup) exactTerminalGenerationCleanupComplete(
+	key stateKey,
+	terminal terminalValue,
+) (bool, error) {
+	payloadComplete, err := c.exactTerminalGenerationPayloadComplete(key, terminal)
+	if err != nil || !payloadComplete {
+		return false, err
+	}
+	replaySafe, err := c.terminalAliasReplayFenceRetirementSafe(key, terminal)
+	if err != nil || !replaySafe {
+		return false, err
+	}
+	return cleanupExactMatches(c.maps.terminals, key.Owner, terminal)
+}
+
+func (c *Cleanup) exactTerminalGenerationPayloadComplete(
+	key stateKey,
+	terminal terminalValue,
+) (bool, error) {
+	if !validTerminalValue(terminal) || terminal.Generation != key.Generation {
+		return false, nil
+	}
+	terminalMatches, err := cleanupExactMatches(c.maps.terminals, key.Owner, terminal)
+	if err != nil || !terminalMatches {
+		return false, err
+	}
+	complete, err := c.snapshotProvesExactTailPayloadComplete(key)
+	if err != nil || !complete {
+		return false, err
+	}
+	return cleanupExactMatches(c.maps.terminals, key.Owner, terminal)
+}
+
+func (c *Cleanup) terminalTailCleanupAuthority(
+	key stateKey,
+	claim *generationClaim,
+	now time.Duration,
+) (terminalValue, bool, bool, error) {
+	var terminal terminalValue
+	if err := c.maps.terminals.Lookup(&key.Owner, &terminal); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return terminalValue{}, false, false, nil
+		}
+		return terminalValue{}, false, false,
+			fmt.Errorf("checking terminal fence tail: %w", err)
+	}
+	if terminal.Generation != key.Generation {
+		return terminalValue{}, false, false, nil
+	}
+	if !validTerminalValue(terminal) ||
+		!c.generationCleanupFenceExpired(now, terminal.ObservedMonotonicNS) {
+		return terminal, true, false, nil
+	}
+	if claim != nil &&
+		(claim.ProcessIncarnation != terminal.ProcessIncarnation ||
+			claim.Reserved[0] != terminal.Lifecycle) {
+		return terminal, true, false, nil
+	}
+	complete, err := c.exactTerminalGenerationCleanupComplete(key, terminal)
+	return terminal, true, complete, err
+}
+
 func (c *Cleanup) finishGenerationCleanupFenced(
 	key stateKey,
 	ownership generationCleanupOwnership,
@@ -1707,9 +2244,36 @@ func (c *Cleanup) finishGenerationCleanupFenced(
 	if !replayReady {
 		return false, nil
 	}
-	complete, err := c.finishGenerationCleanup(key)
-	if err != nil || !complete {
-		return complete, err
+	if terminal, present := c.retainedTerminalAuthorities[key]; present {
+		return c.finishGenerationCleanupFencedValidated(
+			key, ownership, func(requireSnapshot bool) (bool, error) {
+				return c.retainedTerminalGenerationCleanupComplete(
+					key, terminal, ownership, requireSnapshot,
+				)
+			},
+		)
+	}
+	return c.finishGenerationCleanupFencedValidated(
+		key, ownership, func(requireSnapshot bool) (bool, error) {
+			if requireSnapshot {
+				return c.snapshotProvesGenerationCleanupComplete(key)
+			}
+			return c.finishGenerationCleanup(key)
+		},
+	)
+}
+
+func (c *Cleanup) finishGenerationCleanupFencedValidated(
+	key stateKey,
+	ownership generationCleanupOwnership,
+	complete generationCleanupCompletionValidator,
+) (bool, error) {
+	if complete == nil {
+		return false, errors.New("missing generation cleanup completion validator")
+	}
+	completed, err := complete(false)
+	if err != nil || !completed {
+		return completed, err
 	}
 	valid, err := generationTeardownFenceMatches(
 		c.maps.claims, c.maps.ownerGuards, c.maps.ambiguity, ownership.fence,
@@ -1727,6 +2291,7 @@ func (c *Cleanup) finishGenerationCleanupFenced(
 		if marker != ownership.fence.markedAt {
 			return false, nil
 		}
+		c.recordFenceRetirementAttempt(key)
 		deleted, deleteErr := cleanupDeleteExact(
 			c.maps.ambiguity, key, ownership.fence.markedAt,
 		)
@@ -1765,9 +2330,9 @@ func (c *Cleanup) finishGenerationCleanupFenced(
 		c.recordReleasedSweepGuard(ownership.fence.guardKey, ownership.fence.guardClaim)
 		return true, nil
 	}
-	if absent, absentErr := c.generationCleanupArtifactsAbsent(key); absentErr != nil || !absent {
+	if completed, completeErr := complete(false); completeErr != nil || !completed {
 		return false, errors.Join(
-			absentErr, errors.New("generation reappeared before claim release"),
+			completeErr, errors.New("generation reappeared before claim release"),
 		)
 	}
 
@@ -1776,6 +2341,7 @@ func (c *Cleanup) finishGenerationCleanupFenced(
 		return false, fmt.Errorf("checking generation claim before release: %w", err)
 	}
 	if claimMatches {
+		c.recordFenceRetirementAttempt(key)
 		deleted, deleteErr := cleanupDeleteExact(c.maps.claims, key, ownership.claim)
 		if deleteErr != nil {
 			return false, fmt.Errorf("deleting final generation claim: %w", deleteErr)
@@ -1820,8 +2386,8 @@ func (c *Cleanup) finishGenerationCleanupFenced(
 	} else if !errors.Is(err, ebpf.ErrKeyNotExist) {
 		return false, err
 	}
-	complete, err = c.snapshotProvesGenerationCleanupComplete(key)
-	if err != nil || !complete {
+	completed, err = complete(true)
+	if err != nil || !completed {
 		return false, err
 	}
 
@@ -1862,6 +2428,23 @@ func (c *Cleanup) releaseGenerationCleanupClaimGuardTail(
 		c.guardCreatedThisSweep(guardKey, guard) ||
 		!c.generationCleanupFenceExpired(now, guard.ObservedMonotonicNS) {
 		return false, nil
+	}
+	_, terminalPresent, _, terminalErr := c.terminalTailCleanupAuthority(key, &claim, now)
+	if terminalErr != nil || terminalPresent {
+		return false, terminalErr
+	}
+	// Proving that a marker-free E/G tail contains exactly one unchanged replay
+	// requires complete HASH enumeration: replay epochs are part of the key and
+	// cannot be excluded with a point lookup. The unified claim/guard scheduler
+	// admits only one generation-wide replay proof while the coordinator's
+	// exclusive lock is held. A non-admitted tail remains fail closed.
+	if !c.generationReplayScanAuthorized(key) {
+		return false, nil
+	}
+	if handled, recoveryErr := c.recoverMarkerFreeActiveReplayTail(
+		key, claim, guard, now,
+	); recoveryErr != nil || handled {
+		return false, recoveryErr
 	}
 
 	markerAbsent := func() (bool, error) {
@@ -1908,6 +2491,7 @@ func (c *Cleanup) releaseGenerationCleanupClaimGuardTail(
 	if err != nil || !valid {
 		return false, err
 	}
+	c.recordFenceRetirementAttempt(key)
 	deleted, err := cleanupDeleteExact(c.maps.claims, key, claim)
 	if err != nil {
 		return false, fmt.Errorf("deleting marker-free generation claim: %w", err)
@@ -1944,36 +2528,257 @@ func (c *Cleanup) releaseGenerationCleanupClaimGuardTail(
 	return true, nil
 }
 
-func (c *Cleanup) releaseGenerationCleanupClaimTail(
+func generationCleanupTailKeyCompare(left, right stateKey) int {
+	if left.Owner.TID != right.Owner.TID {
+		return cmp.Compare(left.Owner.TID, right.Owner.TID)
+	}
+	if left.Owner.PID != right.Owner.PID {
+		return cmp.Compare(left.Owner.PID, right.Owner.PID)
+	}
+	if left.Owner.Namespace != right.Owner.Namespace {
+		return cmp.Compare(left.Owner.Namespace, right.Owner.Namespace)
+	}
+	if left.Reserved != right.Reserved {
+		return cmp.Compare(left.Reserved, right.Reserved)
+	}
+	if left.Generation != right.Generation {
+		return cmp.Compare(left.Generation, right.Generation)
+	}
+	return 0
+}
+
+func (c *Cleanup) orderedGenerationCleanupTailClaims(
+	claims []cleanupEntry[stateKey, generationClaim],
+) []cleanupEntry[stateKey, generationClaim] {
+	if len(claims) == 0 {
+		return nil
+	}
+	ordered := append([]cleanupEntry[stateKey, generationClaim](nil), claims...)
+	sort.Slice(ordered, func(i, j int) bool {
+		return generationCleanupTailKeyCompare(ordered[i].key, ordered[j].key) < 0
+	})
+	start := 0
+	if c.generationReplayScanCursorSet {
+		start = sort.Search(len(ordered), func(i int) bool {
+			return generationCleanupTailKeyCompare(
+				ordered[i].key, c.generationReplayScanCursor,
+			) > 0
+		})
+		if start == len(ordered) {
+			start = 0
+		}
+	}
+	if start == 0 {
+		return ordered
+	}
+	return append(ordered[start:], ordered[:start]...)
+}
+
+func (c *Cleanup) selectGenerationReplayScanKey(
+	claims []cleanupEntry[stateKey, generationClaim],
+	guards []cleanupEntry[Identity, generationClaim],
+	now time.Duration,
+	complete bool,
+) {
+	c.generationReplayScanKey = stateKey{}
+	c.generationReplayScanKeySet = false
+	if !complete || javaRemoteParentMaxGenerationReplayScanAttemptsPerSweep == 0 {
+		return
+	}
+
+	// Select from a single ordered union. If claims consumed a shared token in
+	// their earlier pass, a persistent claim backlog could starve the later
+	// guard-only pass. Advancing the cursor at selection also prevents a stale
+	// snapshot or repeated iterator error from pinning the scheduler.
+	allClaimKeys := make(map[stateKey]struct{}, len(claims))
+	candidates := make(map[stateKey]struct{}, len(claims)+len(guards))
+	for _, entry := range claims {
+		if entry.key.Generation != 0 && entry.key.Reserved == 0 {
+			allClaimKeys[entry.key] = struct{}{}
+		}
+		if entry.key.Generation == 0 || entry.key.Reserved != 0 ||
+			validExactMarkerTailCleanupClaim(entry.key, entry.value) ||
+			!validGenerationCleanupClaim(entry.value) ||
+			c.claimCreatedThisSweep(entry.key, entry.value) ||
+			c.fenceRetirementAttempted(entry.key) ||
+			!c.generationCleanupFenceExpired(now, entry.value.ObservedMonotonicNS) {
+			continue
+		}
+		candidates[entry.key] = struct{}{}
+	}
+	for _, entry := range guards {
+		key := stateKey{Owner: entry.key, Generation: entry.value.ProcessIncarnation}
+		if _, claimPresent := allClaimKeys[key]; claimPresent {
+			continue
+		}
+		if !validGenerationCleanupGuard(entry.key, entry.value) ||
+			c.guardCreatedThisSweep(entry.key, entry.value) ||
+			c.fenceRetirementAttempted(key) ||
+			!c.generationCleanupFenceExpired(now, entry.value.ObservedMonotonicNS) {
+			continue
+		}
+		candidates[key] = struct{}{}
+	}
+	if len(candidates) == 0 {
+		return
+	}
+
+	ordered := make([]stateKey, 0, len(candidates))
+	for key := range candidates {
+		ordered = append(ordered, key)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		return generationCleanupTailKeyCompare(ordered[i], ordered[j]) < 0
+	})
+	selected := 0
+	if c.generationReplayScanCursorSet {
+		selected = sort.Search(len(ordered), func(i int) bool {
+			return generationCleanupTailKeyCompare(
+				ordered[i], c.generationReplayScanCursor,
+			) > 0
+		})
+		if selected == len(ordered) {
+			selected = 0
+		}
+	}
+	c.generationReplayScanKey = ordered[selected]
+	c.generationReplayScanKeySet = true
+	c.generationReplayScanCursor = ordered[selected]
+	c.generationReplayScanCursorSet = true
+}
+
+func (c *Cleanup) generationReplayScanAuthorized(key stateKey) bool {
+	return c.generationReplayScanKeySet && c.generationReplayScanKey == key
+}
+
+func (c *Cleanup) recoverMarkerFreeActiveReplayTail(
 	key stateKey,
 	claim generationClaim,
+	guard generationClaim,
 	now time.Duration,
 ) (bool, error) {
-	if key.Generation == 0 || key.Reserved != 0 || !validGenerationCleanupClaim(claim) ||
-		c.claimCreatedThisSweep(key, claim) ||
-		!c.generationCleanupFenceExpired(now, claim.ObservedMonotonicNS) {
+	if !c.aliasReplaySnapshotComplete || !validGenerationCleanupClaim(claim) ||
+		!validAliasReplayDesiredLifecycle(claim.Reserved[0]) ||
+		!validGenerationCleanupGuard(key.Owner, guard) ||
+		guard.ProcessIncarnation != key.Generation ||
+		c.claimCreatedThisSweep(key, claim) || c.guardCreatedThisSweep(key.Owner, guard) ||
+		c.fenceRetirementAttempted(key) ||
+		!c.generationCleanupFenceExpired(now, claim.ObservedMonotonicNS) ||
+		!c.generationCleanupFenceExpired(now, guard.ObservedMonotonicNS) {
 		return false, nil
 	}
-	validate := func() (bool, error) {
-		var marker uint64
-		if err := c.maps.ambiguity.Lookup(&key, &marker); err == nil {
-			return false, nil
-		} else if !errors.Is(err, ebpf.ErrKeyNotExist) {
+	if released, ok := c.releasedSweepClaims[key]; ok && released == claim {
+		return false, nil
+	}
+	if released, ok := c.releasedSweepGuards[key.Owner]; ok && released == guard {
+		return false, nil
+	}
+	if _, released := c.releasedSweepAmbiguities[key]; released {
+		return false, nil
+	}
+	if !c.generationReplayScanAuthorized(key) {
+		return false, nil
+	}
+
+	// Successful full-fence retirement finalizes every matching replay before
+	// deleting M. Exactly one unchanged active replay from the complete opening
+	// snapshot is therefore positive evidence of an interrupted acquisition,
+	// rather than authority to widen an arbitrary marker-free E/G tail.
+	var replayKey aliasReplayKey
+	var replay aliasReplayValue
+	candidates := 0
+	for candidateKey, candidate := range c.aliasReplayEntries {
+		if candidateKey.Owner != key.Owner || candidateKey.Generation != key.Generation ||
+			candidateKey.ProcessIncarnation != claim.ProcessIncarnation {
+			continue
+		}
+		candidates++
+		replayKey = candidateKey
+		replay = candidate
+	}
+	if candidates != 1 || !validAliasReplayKey(replayKey) || !validAliasReplayActive(replay) {
+		return false, nil
+	}
+
+	currentReplayMatches := func() (bool, error) {
+		entries, err := c.currentGenerationAliasReplays(key)
+		if err != nil {
 			return false, err
 		}
-		guardAbsent, err := generationGuardAbsent(c.maps.ownerGuards, key.Owner)
-		if err != nil || !guardAbsent {
+		matching := 0
+		for _, entry := range entries {
+			if entry.key.ProcessIncarnation != claim.ProcessIncarnation {
+				continue
+			}
+			matching++
+			if entry.key != replayKey || entry.value != replay {
+				return false, nil
+			}
+		}
+		if matching != 1 {
+			return false, nil
+		}
+		return cleanupExactMatches(c.maps.aliasReplays, replayKey, replay)
+	}
+	for range 2 {
+		matches, err := currentReplayMatches()
+		if err != nil || !matches {
+			// The opening active replay selected this recovery path. Any later
+			// ambiguity preserves E/G instead of falling through to tail release.
+			return true, err
+		}
+	}
+
+	validate := func(expectedMarker *uint64) (bool, error) {
+		claimMatches, err := generationClaimMatches(c.maps.claims, key, claim)
+		if err != nil || !claimMatches {
+			return false, err
+		}
+		guardMatches, err := generationGuardMatches(c.maps.ownerGuards, key.Owner, guard)
+		if err != nil || !guardMatches {
+			return false, err
+		}
+		terminalAbsent, err := c.generationTerminalAbsent(key)
+		if err != nil || !terminalAbsent {
+			return false, err
+		}
+		markerMatches, err := c.cleanupMarkerMatches(key, expectedMarker)
+		if err != nil || !markerMatches {
 			return false, err
 		}
 		complete, err := c.snapshotProvesGenerationCleanupComplete(key)
 		if err != nil || !complete {
 			return false, err
 		}
-		replaySafe, err := c.aliasReplayFenceRetirementSafe(key, &claim)
-		if err != nil || !replaySafe {
+		liveComplete, err := c.generationCleanupArtifactsAbsent(key)
+		if err != nil || !liveComplete {
+			return false, err
+		}
+		replayMatches, err := currentReplayMatches()
+		if err != nil || !replayMatches {
 			return false, err
 		}
 		return generationClaimMatches(c.maps.claims, key, claim)
+	}
+	_, err := c.publishFreshGenerationCleanupMarkerExact(
+		key, now, "active-replay cleanup marker", validate,
+	)
+	return true, err
+}
+
+func (c *Cleanup) releaseGenerationCleanupClaimTail(
+	key stateKey,
+	claim generationClaim,
+	now time.Duration,
+) (bool, error) {
+	if (!validGenerationCleanupClaim(claim) &&
+		!validExactMarkerTailCleanupClaim(key, claim)) ||
+		c.claimCreatedThisSweep(key, claim) ||
+		!c.generationCleanupFenceExpired(now, claim.ObservedMonotonicNS) {
+		return false, nil
+	}
+	validate := func() (bool, error) {
+		return c.exactMarkerTailClaimMatches(key, claim, nil)
 	}
 	valid, err := validate()
 	if err != nil || !valid {
@@ -1983,12 +2788,70 @@ func (c *Cleanup) releaseGenerationCleanupClaimTail(
 	if err != nil || !valid {
 		return false, err
 	}
+	c.recordFenceRetirementAttempt(key)
 	deleted, err := cleanupDeleteExact(c.maps.claims, key, claim)
 	if err != nil || !deleted {
 		return false, err
 	}
 	c.recordReleasedSweepClaim(key, claim)
 	c.clearCurrentSweepClaim(key, claim)
+	return true, nil
+}
+
+func (c *Cleanup) releaseExactMarkerTailGuardTail(
+	key stateKey,
+	claim generationClaim,
+	guard generationClaim,
+	now time.Duration,
+	marker *uint64,
+) (bool, error) {
+	if !validExactMarkerTailCleanupClaim(key, claim) ||
+		!validGenerationCleanupGuard(key.Owner, guard) ||
+		guard.ProcessIncarnation != key.Generation ||
+		c.claimCreatedThisSweep(key, claim) ||
+		c.guardCreatedThisSweep(key.Owner, guard) ||
+		!c.generationCleanupFenceExpired(now, claim.ObservedMonotonicNS) ||
+		!c.generationCleanupFenceExpired(now, guard.ObservedMonotonicNS) ||
+		(marker != nil && (*marker == 0 ||
+			!c.generationCleanupFenceExpired(now, *marker))) {
+		return false, nil
+	}
+	validate := func() (bool, error) {
+		terminalAbsent, err := c.generationTerminalAbsent(key)
+		if err != nil || !terminalAbsent {
+			return false, err
+		}
+		markerMatches, err := c.cleanupMarkerMatches(key, marker)
+		if err != nil || !markerMatches {
+			return false, err
+		}
+		complete, err := c.snapshotProvesExactTailPayloadComplete(key)
+		if err != nil || !complete {
+			return false, err
+		}
+		claimMatches, err := generationClaimMatches(c.maps.claims, key, claim)
+		if err != nil || !claimMatches {
+			return false, err
+		}
+		guardMatches, err := generationGuardMatches(c.maps.ownerGuards, key.Owner, guard)
+		if err != nil || !guardMatches {
+			return false, err
+		}
+		return c.exactMarkerTailReplaySafe(key, &claim)
+	}
+	for range 2 {
+		valid, err := validate()
+		if err != nil || !valid {
+			return false, err
+		}
+	}
+	c.recordFenceRetirementAttempt(key)
+	deleted, err := cleanupDeleteExact(c.maps.ownerGuards, key.Owner, guard)
+	if err != nil || !deleted {
+		return false, err
+	}
+	c.recordReleasedSweepGuard(key.Owner, guard)
+	c.clearCurrentSweepGuard(key.Owner, guard)
 	return true, nil
 }
 
@@ -2104,6 +2967,10 @@ func (c *Cleanup) releaseGenerationPublishingCleanupTail(
 		return false, nil
 	}
 	validate := func() (bool, error) {
+		terminalAbsent, err := c.generationTerminalAbsent(key)
+		if err != nil || !terminalAbsent {
+			return false, err
+		}
 		markerMatches, err := c.cleanupMarkerMatches(key, marker)
 		if err != nil || !markerMatches {
 			return false, err
@@ -2140,6 +3007,7 @@ func (c *Cleanup) releaseGenerationPublishingCleanupTail(
 	if err != nil || !valid {
 		return false, err
 	}
+	c.recordFenceRetirementAttempt(key)
 	deleted, err := cleanupDeleteExact(c.maps.claims, key, claim)
 	if err != nil || !deleted {
 		return false, err
@@ -2148,6 +3016,10 @@ func (c *Cleanup) releaseGenerationPublishingCleanupTail(
 	c.clearCurrentSweepClaim(key, claim)
 	if !guardPresent {
 		return true, nil
+	}
+	terminalAbsent, err := c.generationTerminalAbsent(key)
+	if err != nil || !terminalAbsent {
+		return true, err
 	}
 	exactAbsent, err := generationClaimAbsent(c.maps.claims, key)
 	if err != nil || !exactAbsent {
@@ -2199,6 +3071,10 @@ func (c *Cleanup) releaseGenerationPublishingCleanupTail(
 	if replayErr != nil || !replaySafe {
 		return true, replayErr
 	}
+	terminalAbsent, err = c.generationTerminalAbsent(key)
+	if err != nil || !terminalAbsent {
+		return true, err
+	}
 	deleted, err = cleanupDeleteExact(c.maps.ownerGuards, key.Owner, guard)
 	if err != nil || !deleted {
 		return true, err
@@ -2233,19 +3109,178 @@ func (c *Cleanup) releaseGenerationCleanupMarkerGuardTail(
 	return false, nil
 }
 
-func (c *Cleanup) releaseGenerationCleanupMarkerTail(
+func (c *Cleanup) exactMarkerTailReplaySafe(
 	key stateKey,
+	claim *generationClaim,
+) (bool, error) {
+	var terminal terminalValue
+	if err := c.maps.terminals.Lookup(&key.Owner, &terminal); err == nil {
+		if terminal.Generation == key.Generation {
+			// T is retained status authority. Without matching owner-wide G, an
+			// exact-only recovery tail may not collapse its lifecycle/provenance
+			// into synthetic ambiguous E or retire the generation exclusion.
+			return false, nil
+		}
+	} else if !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return false, fmt.Errorf("checking exact-tail replay terminal: %w", err)
+	}
+	if claim != nil && !validExactMarkerTailCleanupClaim(key, *claim) {
+		// Ordinary retained producer/full-fence claims carry JVM provenance and
+		// committed status. Preserve their existing exact replay validation.
+		return c.aliasReplayFenceRetirementSafe(key, claim)
+	}
+	// Only the recognizable synthetic ambiguous E has no JVM provenance or
+	// committed non-ambiguous result. Other replay epochs are independent
+	// carrier/status authority and must not be inferred from HASH enumeration.
+	return true, nil
+}
+
+func (c *Cleanup) exactMarkerTailRootSafe(
+	key stateKey,
+	claim *generationClaim,
+	expectedMarker *uint64,
+) (bool, error) {
+	markerMatches, err := c.cleanupMarkerMatches(key, expectedMarker)
+	if err != nil || !markerMatches {
+		return false, err
+	}
+	guardAbsent, err := generationGuardAbsent(c.maps.ownerGuards, key.Owner)
+	if err != nil || !guardAbsent {
+		return false, err
+	}
+	complete, err := c.snapshotProvesExactTailPayloadComplete(key)
+	if err != nil || !complete {
+		return false, err
+	}
+	return c.exactMarkerTailReplaySafe(key, claim)
+}
+
+func (c *Cleanup) exactMarkerTailClaimMatches(
+	key stateKey,
+	claim generationClaim,
+	expectedMarker *uint64,
+) (bool, error) {
+	safe, err := c.exactMarkerTailRootSafe(key, &claim, expectedMarker)
+	if err != nil || !safe {
+		return false, err
+	}
+	return generationClaimMatches(c.maps.claims, key, claim)
+}
+
+func (c *Cleanup) claimGenerationCleanupMarkerTail(
+	key stateKey,
+	claim generationClaim,
+	markedAt uint64,
+) (bool, error) {
+	if key.Generation == 0 || key.Reserved != 0 || markedAt == 0 ||
+		!validExactMarkerTailCleanupClaim(key, claim) {
+		return false, errors.New("invalid exact marker-tail cleanup claim")
+	}
+	safe, err := c.exactMarkerTailRootSafe(key, &claim, &markedAt)
+	if err != nil || !safe {
+		return false, err
+	}
+	if updateErr := c.maps.claims.Update(&key, &claim, ebpf.UpdateNoExist); updateErr != nil {
+		if errors.Is(updateErr, ebpf.ErrKeyExist) {
+			return false, nil
+		}
+		matches, matchErr := generationClaimMatches(c.maps.claims, key, claim)
+		if matchErr != nil {
+			return false, errors.Join(
+				fmt.Errorf("claiming exact marker-tail cleanup: %w", updateErr),
+				fmt.Errorf("checking uncertain exact marker-tail claim: %w", matchErr),
+			)
+		}
+		if matches {
+			// The kernel may have committed UpdateNoExist even though userspace
+			// observed an error. Count and retain the exact exclusion so admission
+			// remains bounded and this sweep cannot retire uncertain authority.
+			c.recordCurrentSweepClaim(key, claim)
+			return true, fmt.Errorf("claiming exact marker-tail cleanup: %w", updateErr)
+		}
+		return false, fmt.Errorf("claiming exact marker-tail cleanup: %w", updateErr)
+	}
+	c.recordCurrentSweepClaim(key, claim)
+	for range 2 {
+		matches, matchErr := c.exactMarkerTailClaimMatches(key, claim, &markedAt)
+		if matchErr != nil || !matches {
+			// E is exact-generation fail-closed authority. If M, G, payload, or
+			// replay state changed after insertion, retain E for a later recovery
+			// pass rather than handing authority back at the race boundary.
+			return true, matchErr
+		}
+	}
+	return true, nil
+}
+
+func (c *Cleanup) releaseGenerationCleanupClaimMarkerTail(
+	key stateKey,
+	claim generationClaim,
 	markedAt uint64,
 	now time.Duration,
 ) (bool, error) {
 	if key.Generation == 0 || key.Reserved != 0 || markedAt == 0 ||
-		!c.generationCleanupFenceExpired(now, markedAt) {
+		!validExactMarkerTailCleanupClaim(key, claim) || c.claimCreatedThisSweep(key, claim) ||
+		!c.generationCleanupFenceExpired(now, markedAt) ||
+		!c.generationCleanupFenceExpired(now, claim.ObservedMonotonicNS) {
 		return false, nil
 	}
-	// M+ alone can be a paused producer after marker publication or a partial
-	// cleanup tail whose missing E/G cannot be distinguished without a durable
-	// root. Preserve it; a root-driven pass may reconstruct the complete tuple.
-	return false, nil
+	valid, err := c.exactMarkerTailClaimMatches(key, claim, &markedAt)
+	if err != nil || !valid {
+		return false, err
+	}
+	valid, err = c.exactMarkerTailClaimMatches(key, claim, &markedAt)
+	if err != nil || !valid {
+		return false, err
+	}
+
+	// Refresh E before M deletion so the marker-free phase has a durable grace
+	// epoch. E blocks exact numeric-generation reuse without blocking a different
+	// generation for the owner; aging it again after M disappears lets the next
+	// complete sweep observe any producer that passed a pre-E check before this
+	// phase. Fence retention is the quiescence bound for those BPF critical
+	// sections, just as it is for the full G/E/M protocol.
+	refreshed := generationClaim{
+		ObservedMonotonicNS: uint64(now),
+		ProcessIncarnation:  key.Generation,
+		Lifecycle:           lifecycleCleanup,
+		Reserved: [7]byte{
+			0: lifecycleAmbiguous,
+			6: generationGoProducerTag,
+		},
+	}
+	if updateErr := c.maps.claims.Update(&key, &refreshed, ebpf.UpdateExist); updateErr != nil {
+		matches, matchErr := generationClaimMatches(c.maps.claims, key, refreshed)
+		if matchErr != nil {
+			return false, errors.Join(
+				fmt.Errorf("refreshing exact marker-tail claim: %w", updateErr),
+				fmt.Errorf("checking uncertain refreshed exact claim: %w", matchErr),
+			)
+		}
+		if matches {
+			c.recordCurrentSweepClaim(key, refreshed)
+			return true, fmt.Errorf("refreshing exact marker-tail claim: %w", updateErr)
+		}
+		return false, fmt.Errorf("refreshing exact marker-tail claim: %w", updateErr)
+	}
+	c.recordCurrentSweepClaim(key, refreshed)
+	for range 2 {
+		matches, matchErr := c.exactMarkerTailClaimMatches(key, refreshed, &markedAt)
+		if matchErr != nil || !matches {
+			return true, matchErr
+		}
+	}
+
+	c.recordFenceRetirementAttempt(key)
+	deleted, err := cleanupDeleteExact(c.maps.ambiguity, key, markedAt)
+	if err != nil || !deleted {
+		return true, err
+	}
+	c.recordReleasedSweepAmbiguity(key, markedAt)
+	// Refreshed E is deliberately the final remaining generation mutation. A
+	// later sweep may release it only after another full retention interval and
+	// a new complete snapshot proves the exact payload still absent.
+	return true, nil
 }
 
 func (c *Cleanup) releaseGenerationCleanupReservedGuardTail(
@@ -2259,6 +3294,10 @@ func (c *Cleanup) releaseGenerationCleanupReservedGuardTail(
 		return false, nil
 	}
 	key := stateKey{Owner: guardKey, Generation: guard.ProcessIncarnation}
+	terminalAbsent, err := c.generationTerminalAbsent(key)
+	if err != nil || !terminalAbsent {
+		return false, err
+	}
 	exactAbsent, err := generationClaimAbsent(c.maps.claims, key)
 	if err != nil || !exactAbsent {
 		return false, err
@@ -2294,6 +3333,11 @@ func (c *Cleanup) releaseGenerationCleanupReservedGuardTail(
 	if err != nil || !guardMatches {
 		return false, err
 	}
+	terminalAbsent, err = c.generationTerminalAbsent(key)
+	if err != nil || !terminalAbsent {
+		return false, err
+	}
+	c.recordFenceRetirementAttempt(key)
 	deleted, err := cleanupDeleteExact(c.maps.ownerGuards, guardKey, guard)
 	if err != nil || !deleted {
 		return false, err
@@ -2323,6 +3367,10 @@ func (c *Cleanup) releaseGenerationCleanupGuardTail(
 		return false, nil
 	} else if !errors.Is(err, ebpf.ErrKeyNotExist) {
 		return false, err
+	}
+	_, terminalPresent, _, terminalErr := c.terminalTailCleanupAuthority(key, nil, now)
+	if terminalErr != nil || terminalPresent {
+		return false, terminalErr
 	}
 	complete, err := c.snapshotProvesGenerationCleanupComplete(key)
 	if err != nil || !complete {
@@ -2355,6 +3403,11 @@ func (c *Cleanup) releaseGenerationCleanupGuardTail(
 	if err != nil || !replaySafe {
 		return false, err
 	}
+	terminalAbsent, err := c.generationTerminalAbsent(key)
+	if err != nil || !terminalAbsent {
+		return false, err
+	}
+	c.recordFenceRetirementAttempt(key)
 	deleted, err := cleanupDeleteExact(c.maps.ownerGuards, guardKey, guard)
 	if err != nil || !deleted {
 		return false, err
@@ -2362,6 +3415,30 @@ func (c *Cleanup) releaseGenerationCleanupGuardTail(
 	c.recordReleasedSweepGuard(guardKey, guard)
 	c.clearCurrentSweepGuard(guardKey, guard)
 	return true, nil
+}
+
+func (c *Cleanup) retainedTerminalPhysicalFenceMatches(
+	key stateKey,
+	claim generationClaim,
+) (bool, error) {
+	terminal, retained := c.retainedTerminalAuthorities[key]
+	if !retained {
+		return c.validGenerationTerminalAbsent(key)
+	}
+	if !validTerminalValue(terminal) || terminal.Generation != key.Generation ||
+		claim.ProcessIncarnation != terminal.ProcessIncarnation ||
+		claim.Reserved[0] != terminal.Lifecycle {
+		return false, nil
+	}
+	terminalMatches, err := cleanupExactMatches(c.maps.terminals, key.Owner, terminal)
+	if err != nil || !terminalMatches {
+		return false, err
+	}
+	replaySafe, err := c.terminalAliasReplayFenceRetirementSafe(key, terminal)
+	if err != nil || !replaySafe {
+		return false, err
+	}
+	return cleanupExactMatches(c.maps.terminals, key.Owner, terminal)
 }
 
 func (c *Cleanup) generationCleanupPhysicalFenceAuthorizes(
@@ -2381,6 +3458,10 @@ func (c *Cleanup) generationCleanupPhysicalFenceAuthorizes(
 	if !validGenerationCleanupClaim(claim) || c.claimCreatedThisSweep(key, claim) ||
 		!c.generationCleanupFenceExpired(now, claim.ObservedMonotonicNS) {
 		return false, nil
+	}
+	terminalMatches, err := c.retainedTerminalPhysicalFenceMatches(key, claim)
+	if err != nil || !terminalMatches {
+		return false, err
 	}
 	var index generationIndexValue
 	if err := c.maps.generations.Lookup(&key, &index); err == nil {
@@ -2431,7 +3512,10 @@ func (c *Cleanup) generationCleanupPhysicalFenceAuthorizes(
 	if err != nil {
 		return false, fmt.Errorf("revalidating physical generation teardown fence: %w", err)
 	}
-	return valid, nil
+	if !valid {
+		return false, nil
+	}
+	return c.retainedTerminalPhysicalFenceMatches(key, claim)
 }
 
 func (c *Cleanup) lockGenerationOwner(
@@ -2627,6 +3711,11 @@ func (c *Cleanup) deleteTerminal(key stateKey, processIncarnation uint64) (bool,
 	if terminal.Generation != key.Generation || terminal.ProcessIncarnation != processIncarnation {
 		return false, nil
 	}
+	if validTerminalValue(terminal) {
+		// Valid T is bounded status authority. Its LRU eviction policy, not
+		// userspace generation cleanup, owns its eventual removal.
+		return false, nil
+	}
 	deleted, err := cleanupDeleteExact(c.maps.terminals, key.Owner, terminal)
 	if err != nil {
 		return deleted, fmt.Errorf("deleting generation terminal: %w", err)
@@ -2645,6 +3734,22 @@ const (
 	physicalGenerationConnectionRoot = uint8(iota + 1)
 	physicalGenerationCookieRoot
 )
+
+func (c *Cleanup) physicalGenerationCleanupProcessIncarnation(
+	key stateKey,
+) (uint64, error) {
+	var terminal terminalValue
+	if err := c.maps.terminals.Lookup(&key.Owner, &terminal); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return key.Generation, nil
+		}
+		return 0, fmt.Errorf("checking physical generation terminal provenance: %w", err)
+	}
+	if terminal.Generation == key.Generation && validTerminalValue(terminal) {
+		return terminal.ProcessIncarnation, nil
+	}
+	return key.Generation, nil
+}
 
 func validPhysicalGenerationConnectionRoot(
 	key connectionInfoNS,
@@ -2757,6 +3862,9 @@ func (c *Cleanup) cleanupRetainedGenerationClaim(
 	var terminal terminalValue
 	if err := c.maps.terminals.Lookup(&key.Owner, &terminal); err == nil {
 		if terminal.Generation == key.Generation {
+			if validTerminalValue(terminal) {
+				return false, nil
+			}
 			return c.quarantineMalformedTerminal(key.Owner, terminal)
 		}
 	} else if !errors.Is(err, ebpf.ErrKeyNotExist) {
@@ -2839,6 +3947,7 @@ func (c *Cleanup) sweepOrphans(
 	}
 	physicalCleanupNow := c.monoTimeNow()
 	physicalRoots := make(map[stateKey][]physicalGenerationCleanupRoot)
+	physicalCleanupOwnerships := make(map[stateKey]generationCleanupOwnership)
 	if connectionsErr == nil && cookieConnectionsErr == nil {
 		for _, entry := range connections {
 			if !validPhysicalGenerationConnectionRoot(entry.key, entry.value) {
@@ -2864,12 +3973,21 @@ func (c *Cleanup) sweepOrphans(
 		}
 		for key, roots := range physicalRoots {
 			rootSnapshot := roots
-			_, _, claimErr := c.claimGenerationCleanupForArtifact(
-				key, key.Generation, lifecycleAmbiguous,
+			processIncarnation, provenanceErr :=
+				c.physicalGenerationCleanupProcessIncarnation(key)
+			if provenanceErr != nil {
+				result = errors.Join(result, provenanceErr)
+				continue
+			}
+			ownership, ready, claimErr := c.claimGenerationCleanupForArtifact(
+				key, processIncarnation, lifecycleAmbiguous,
 				func() (bool, error) {
 					return c.physicalGenerationCleanupRootMatches(key, rootSnapshot)
 				},
 			)
+			if ready {
+				physicalCleanupOwnerships[key] = ownership
+			}
 			if claimErr != nil {
 				result = errors.Join(
 					result, fmt.Errorf("claiming physical-only generation cleanup: %w", claimErr),
@@ -2891,6 +4009,25 @@ func (c *Cleanup) sweepOrphans(
 		}
 		if !logicalAbsent {
 			return false
+		}
+		ownership, ready := physicalCleanupOwnerships[key]
+		if !ready {
+			return false
+		}
+		if terminal, retained := c.retainedTerminalAuthorities[key]; retained {
+			replayReady, replayErr := c.ensureTerminalAliasReplayFinal(
+				ownership, key, terminal,
+			)
+			if replayErr != nil {
+				result = errors.Join(
+					result,
+					fmt.Errorf("finalizing physical-generation terminal replay: %w", replayErr),
+				)
+				return false
+			}
+			if !replayReady {
+				return false
+			}
 		}
 		fenced, fenceErr := c.generationCleanupPhysicalFenceAuthorizes(key, physicalCleanupNow)
 		if fenceErr != nil {
@@ -2965,12 +4102,10 @@ func (c *Cleanup) sweepOrphans(
 	if err != nil {
 		result = errors.Join(result, fmt.Errorf("iterating terminal generations: %w", err))
 	}
-	terminalsNow := c.monoTimeNow()
 	for _, entry := range terminals {
 		generation := stateKey{Owner: entry.key, Generation: entry.value.Generation}
 		c.recordKnownGeneration(generation)
-		if entry.value.Generation == 0 || entry.value.ProcessIncarnation == 0 ||
-			entry.value.ObservedMonotonicNS == 0 || entry.value.Reserved != ([7]byte{}) {
+		if !validTerminalValue(entry.value) {
 			cleaned, cleanupErr := c.quarantineMalformedTerminal(entry.key, entry.value)
 			if cleaned {
 				if entry.value.Generation == 0 {
@@ -2984,31 +4119,8 @@ func (c *Cleanup) sweepOrphans(
 			}
 			continue
 		}
-		_, cleaned := cleanedGenerations[generation]
-		processRetired, retirementErr := c.processRetired(
-			retired,
-			javaProcessIdentity(entry.key),
-			entry.value.ProcessIncarnation,
-		)
-		if retirementErr != nil {
-			result = errors.Join(result, retirementErr)
-			continue
-		}
-		if !cleaned && !processRetired &&
-			!cleanupExpired(terminalsNow, entry.value.ObservedMonotonicNS, c.ttl) {
-			continue
-		}
-		cleaned, cleanupErr := c.cleanupOrphanOwner(entry.key, ownerValue{
-			Generation:         entry.value.Generation,
-			ProcessIncarnation: entry.value.ProcessIncarnation,
-			Lifecycle:          entry.value.Lifecycle,
-		})
-		if cleaned {
-			stats.recordGeneration(cleanedGenerations, generation, false)
-		}
-		if cleanupErr != nil {
-			result = errors.Join(result, cleanupErr)
-		}
+		// Valid T is retained status authority. Its matching fence is considered
+		// only in the final mutation pass, after every payload cleanup opportunity.
 	}
 
 	ambiguity, err := cleanupMapEntries[stateKey, uint64](c.maps.ambiguity)
@@ -3030,9 +4142,9 @@ func (c *Cleanup) sweepOrphans(
 		// and matching G=0 guard in the final fence pass below.
 	}
 
-	claims, err := cleanupMapEntries[stateKey, generationClaim](c.maps.claims)
-	if err != nil {
-		result = errors.Join(result, fmt.Errorf("iterating generation claims: %w", err))
+	claims, claimsErr := cleanupMapEntries[stateKey, generationClaim](c.maps.claims)
+	if claimsErr != nil {
+		result = errors.Join(result, fmt.Errorf("iterating generation claims: %w", claimsErr))
 	}
 	guards, guardErr := cleanupMapEntries[Identity, generationClaim](c.maps.ownerGuards)
 	if guardErr != nil {
@@ -3202,13 +4314,73 @@ func (c *Cleanup) sweepOrphans(
 		}
 	}
 
+	tailsNow := c.monoTimeNow()
+	orderedTailClaims := c.orderedGenerationCleanupTailClaims(claims)
+	for _, entry := range terminals {
+		if !validTerminalValue(entry.value) {
+			continue
+		}
+		generation := stateKey{Owner: entry.key, Generation: entry.value.Generation}
+		_, cleaned := cleanedGenerations[generation]
+		processRetired, retirementErr := c.processRetired(
+			retired, javaProcessIdentity(entry.key), entry.value.ProcessIncarnation,
+		)
+		if retirementErr != nil {
+			result = errors.Join(result, retirementErr)
+			continue
+		}
+		if !cleaned && !processRetired &&
+			!cleanupExpired(tailsNow, entry.value.ObservedMonotonicNS, c.ttl) {
+			continue
+		}
+		var guard generationClaim
+		if guardErr := c.maps.ownerGuards.Lookup(&entry.key, &guard); guardErr != nil {
+			if !errors.Is(guardErr, ebpf.ErrKeyNotExist) {
+				result = errors.Join(
+					result, fmt.Errorf("checking terminal cleanup guard: %w", guardErr),
+				)
+			}
+			continue
+		}
+		if !validGenerationCleanupGuard(entry.key, guard) ||
+			guard.ProcessIncarnation != generation.Generation {
+			continue
+		}
+		// From this point, matching T exclusively owns every fence shape for the
+		// generation. Record the attempt before any fallible operation so a failed
+		// or committed-but-reported-failed release cannot fall through to a generic
+		// path using stale M/E/G snapshots later in this sweep.
+		c.recordFenceRetirementAttempt(generation)
+		if _, cleanupErr := c.releaseTerminalGenerationFence(
+			entry.key, entry.value, guard,
+		); cleanupErr != nil {
+			result = errors.Join(result, cleanupErr)
+		}
+	}
+	c.selectGenerationReplayScanKey(
+		claims, guards, tailsNow, claimsErr == nil && guardErr == nil,
+	)
+
 	// This is the final mutation pass. Retire only a complete, aged exact
 	// teardown tuple, and do not touch generation artifacts afterward.
-	tailsNow := c.monoTimeNow()
-	for _, entry := range claims {
+	for _, entry := range orderedTailClaims {
+		if c.fenceRetirementAttempted(entry.key) {
+			continue
+		}
+		exactMarkerTail := validExactMarkerTailCleanupClaim(entry.key, entry.value)
 		if entry.key.Generation == 0 || entry.key.Reserved != 0 ||
-			!validGenerationCleanupClaim(entry.value) ||
+			(!validGenerationCleanupClaim(entry.value) && !exactMarkerTail) ||
 			c.claimCreatedThisSweep(entry.key, entry.value) {
+			continue
+		}
+		terminalAbsent, terminalErr := c.generationTerminalAbsent(entry.key)
+		if terminalErr != nil {
+			result = errors.Join(result, terminalErr)
+			continue
+		}
+		if !terminalAbsent {
+			// T is status authority for M/E/G, including M=0. The terminal pass
+			// either handled its exact tuple or deliberately preserved it.
 			continue
 		}
 		if released, ok := c.releasedSweepClaims[entry.key]; ok && released == entry.value {
@@ -3233,6 +4405,68 @@ func (c *Cleanup) sweepOrphans(
 		var marker uint64
 		markerErr := c.maps.ambiguity.Lookup(&entry.key, &marker)
 		if errors.Is(markerErr, ebpf.ErrKeyNotExist) {
+			guardAbsent, guardErr := generationGuardAbsent(
+				c.maps.ownerGuards, entry.key.Owner,
+			)
+			if guardErr != nil {
+				result = errors.Join(
+					result, fmt.Errorf("checking marker-free cleanup guard: %w", guardErr),
+				)
+				continue
+			}
+			if guardAbsent {
+				complete, completeErr := c.snapshotProvesExactTailPayloadComplete(entry.key)
+				if completeErr != nil {
+					result = errors.Join(
+						result,
+						fmt.Errorf("checking marker-free exact-tail completion: %w", completeErr),
+					)
+					continue
+				}
+				if complete {
+					// Synthetic exact tails use only point validation; ordinary
+					// claims require a full replay-map exclusion proof.
+					if !exactMarkerTail && !c.generationReplayScanAuthorized(entry.key) {
+						continue
+					}
+					if _, releaseErr := c.releaseGenerationCleanupClaimTail(
+						entry.key, entry.value, tailsNow,
+					); releaseErr != nil {
+						result = errors.Join(
+							result,
+							fmt.Errorf("releasing marker-free exact cleanup tail: %w", releaseErr),
+						)
+					}
+				}
+				// E without M/G is exact-generation fail-closed authority. Earlier
+				// mutable roots may acquire the full fence when payload exists; this
+				// rootless tail pass must never widen E into owner-wide G.
+				continue
+			}
+			if exactMarkerTail {
+				var guard generationClaim
+				if guardErr := c.maps.ownerGuards.Lookup(&entry.key.Owner, &guard); guardErr != nil {
+					if !errors.Is(guardErr, ebpf.ErrKeyNotExist) {
+						result = errors.Join(
+							result,
+							fmt.Errorf("checking exact-tail owner guard: %w", guardErr),
+						)
+					}
+					continue
+				}
+				if _, releaseErr := c.releaseExactMarkerTailGuardTail(
+					entry.key, entry.value, guard, tailsNow, nil,
+				); releaseErr != nil {
+					result = errors.Join(
+						result,
+						fmt.Errorf("releasing exact-tail owner guard: %w", releaseErr),
+					)
+				}
+				// Exact-only E is never widened into owner-wide G. A stranded G
+				// acquired for a disappeared artifact is retired first; E remains
+				// exact-generation authority for a later complete sweep.
+				continue
+			}
 			complete, completeErr := c.snapshotProvesGenerationCleanupComplete(entry.key)
 			if completeErr != nil {
 				result = errors.Join(
@@ -3244,10 +4478,6 @@ func (c *Cleanup) sweepOrphans(
 				var guard generationClaim
 				guardErr := c.maps.ownerGuards.Lookup(&entry.key.Owner, &guard)
 				switch {
-				case errors.Is(guardErr, ebpf.ErrKeyNotExist):
-					_, guardErr = c.releaseGenerationCleanupClaimTail(
-						entry.key, entry.value, tailsNow,
-					)
 				case guardErr == nil && validGenerationCleanupGuard(entry.key.Owner, guard) &&
 					guard.ProcessIncarnation == entry.key.Generation:
 					_, guardErr = c.releaseGenerationCleanupClaimGuardTail(
@@ -3267,6 +4497,10 @@ func (c *Cleanup) sweepOrphans(
 				continue
 			}
 			ownershipRoot := func() (bool, error) {
+				terminalAbsent, err := c.generationTerminalAbsent(entry.key)
+				if err != nil || !terminalAbsent {
+					return false, err
+				}
 				claimMatches, err := generationClaimMatches(c.maps.claims, entry.key, entry.value)
 				if err != nil || !claimMatches {
 					return false, err
@@ -3285,6 +4519,11 @@ func (c *Cleanup) sweepOrphans(
 			continue
 		}
 		if marker == 0 {
+			if exactMarkerTail {
+				// Synthetic exact-tail claims are created only behind M+. Any M=0
+				// shape is foreign or corrupted and remains fail closed.
+				continue
+			}
 			zero := uint64(0)
 			if entry.value.Reserved[0] == lifecyclePublishing {
 				if _, releaseErr := c.releaseGenerationPublishingCleanupTail(
@@ -3297,6 +4536,10 @@ func (c *Cleanup) sweepOrphans(
 				continue
 			}
 			ownershipRoot := func() (bool, error) {
+				terminalAbsent, err := c.generationTerminalAbsent(entry.key)
+				if err != nil || !terminalAbsent {
+					return false, err
+				}
 				claimMatches, err := generationClaimMatches(c.maps.claims, entry.key, entry.value)
 				if err != nil || !claimMatches {
 					return false, err
@@ -3310,8 +4553,63 @@ func (c *Cleanup) sweepOrphans(
 			}
 			continue
 		}
+		guardAbsent, guardErr := generationGuardAbsent(c.maps.ownerGuards, entry.key.Owner)
+		if guardErr != nil {
+			result = errors.Join(
+				result, fmt.Errorf("checking marked exact-tail cleanup guard: %w", guardErr),
+			)
+			continue
+		}
+		complete, completeErr := c.snapshotProvesExactTailPayloadComplete(entry.key)
+		if completeErr != nil {
+			result = errors.Join(
+				result, fmt.Errorf("checking marked exact-tail cleanup completion: %w", completeErr),
+			)
+			continue
+		}
+		if guardAbsent {
+			if complete {
+				if _, releaseErr := c.releaseGenerationCleanupClaimMarkerTail(
+					entry.key, entry.value, marker, tailsNow,
+				); releaseErr != nil {
+					result = errors.Join(
+						result, fmt.Errorf("releasing marked exact cleanup tail: %w", releaseErr),
+					)
+				}
+			}
+			continue
+		}
+		if exactMarkerTail {
+			if complete {
+				var guard generationClaim
+				if guardErr := c.maps.ownerGuards.Lookup(&entry.key.Owner, &guard); guardErr != nil {
+					if !errors.Is(guardErr, ebpf.ErrKeyNotExist) {
+						result = errors.Join(
+							result,
+							fmt.Errorf("checking marked exact-tail guard: %w", guardErr),
+						)
+					}
+					continue
+				}
+				if _, releaseErr := c.releaseExactMarkerTailGuardTail(
+					entry.key, entry.value, guard, tailsNow, &marker,
+				); releaseErr != nil {
+					result = errors.Join(
+						result,
+						fmt.Errorf("releasing marked exact-tail guard: %w", releaseErr),
+					)
+				}
+			}
+			// Exact-only E never adopts an owner-wide guard. A stranded G is
+			// retired first while exact M/E remain untouched.
+			continue
+		}
 		expectedMarker := marker
 		ownershipRoot := func() (bool, error) {
+			terminalAbsent, err := c.generationTerminalAbsent(entry.key)
+			if err != nil || !terminalAbsent {
+				return false, err
+			}
 			claimMatches, err := generationClaimMatches(c.maps.claims, entry.key, entry.value)
 			if err != nil || !claimMatches {
 				return false, err
@@ -3343,16 +4641,41 @@ func (c *Cleanup) sweepOrphans(
 		}
 	}
 
-	// Recover crash/failure tails around the required G -> E -> M acquisition
-	// and M -> E -> G retirement orders. A surviving M+ with no valid E may be
-	// a paused producer, so preserve it while reconstructing the missing E/G
-	// from that durable root; later sweeps age the completed tuple before any
-	// payload cleanup or fence retirement.
+	// Exact-only retirement claims share the producer E map. Their Go-only tag
+	// gives the complete claim snapshot durable provenance that concurrent BPF
+	// writers cannot forge. Since GenerationCoordinator serializes every Go
+	// cleanup admission, this bounds cleanup's discretionary contribution without
+	// pretending HASH iteration can bound unrelated BPF claims.
+	exactTailClaims := 0
+	for _, entry := range claims {
+		if validExactMarkerTailCleanupClaim(entry.key, entry.value) {
+			exactTailClaims++
+		}
+	}
+	exactTailClaimBudget := javaRemoteParentMaxExactTailClaims - min(
+		exactTailClaims, javaRemoteParentMaxExactTailClaims,
+	)
+	if claimsErr != nil {
+		exactTailClaimBudget = 0
+	}
+
+	// Recover crash/failure tails around exact marker publication and the full
+	// G -> E -> M cleanup order. A fresh M+ remains exact fail-closed authority
+	// without blocking a same-owner successor, so age it first. When complete
+	// snapshots prove the exact generation has no payload, add only E and age
+	// that exclusion before retiring M -> E. G remains necessary when cleanup
+	// must serialize an owner-keyed or shared physical payload mutation.
 	for _, entry := range ambiguity {
+		if c.fenceRetirementAttempted(entry.key) {
+			continue
+		}
 		if entry.key.Generation == 0 || entry.key.Reserved != 0 || entry.value == 0 {
 			continue
 		}
 		if released, ok := c.releasedSweepAmbiguities[entry.key]; ok && released == entry.value {
+			continue
+		}
+		if !c.generationCleanupFenceExpired(tailsNow, entry.value) {
 			continue
 		}
 		markerMatches, markerErr := c.cleanupMarkerMatches(entry.key, &entry.value)
@@ -3361,6 +4684,16 @@ func (c *Cleanup) sweepOrphans(
 			continue
 		}
 		if !markerMatches {
+			continue
+		}
+		terminalAbsent, terminalErr := c.generationTerminalAbsent(entry.key)
+		if terminalErr != nil {
+			result = errors.Join(result, terminalErr)
+			continue
+		}
+		if !terminalAbsent {
+			// Matching T exclusively owns terminal fence recovery. This point
+			// lookup also covers T inserted or omitted during HASH iteration.
 			continue
 		}
 		var claim generationClaim
@@ -3372,6 +4705,47 @@ func (c *Cleanup) sweepOrphans(
 			result = errors.Join(result, fmt.Errorf("checking partial cleanup claim: %w", err))
 			continue
 		}
+		guardAbsent, guardErr := generationGuardAbsent(c.maps.ownerGuards, entry.key.Owner)
+		if guardErr != nil {
+			result = errors.Join(
+				result, fmt.Errorf("checking partial cleanup guard: %w", guardErr),
+			)
+			continue
+		}
+		complete, completeErr := c.snapshotProvesExactTailPayloadComplete(entry.key)
+		if completeErr != nil {
+			result = errors.Join(
+				result, fmt.Errorf("checking partial cleanup completion: %w", completeErr),
+			)
+			continue
+		}
+		if guardAbsent {
+			if complete && exactTailClaimBudget > 0 {
+				claim, ok := c.newExactMarkerTailClaim(entry.key)
+				if !ok {
+					result = errors.Join(
+						result, errors.New("reading monotonic time for exact partial cleanup claim"),
+					)
+					continue
+				}
+				claimed, claimErr := c.claimGenerationCleanupMarkerTail(
+					entry.key, claim, entry.value,
+				)
+				if claimed {
+					exactTailClaimBudget--
+				}
+				if claimErr != nil {
+					// An unverified UpdateNoExist outcome may have committed a tagged
+					// claim even when readback also failed. Stop admission for this
+					// sweep so uncertainty cannot exceed cleanup's fixed contribution.
+					exactTailClaimBudget = 0
+					result = errors.Join(
+						result, fmt.Errorf("claiming exact marker-tail cleanup: %w", claimErr),
+					)
+				}
+			}
+			continue
+		}
 		claim, ok := c.newGenerationClaim(lifecycleAmbiguous, entry.key.Generation)
 		if !ok {
 			result = errors.Join(result, errors.New("reading monotonic time for partial cleanup claim"))
@@ -3380,6 +4754,10 @@ func (c *Cleanup) sweepOrphans(
 		expectedMarker := entry.value
 		if _, _, claimErr := c.claimGenerationCleanup(
 			entry.key, claim, func() (bool, error) {
+				terminalAbsent, err := c.generationTerminalAbsent(entry.key)
+				if err != nil || !terminalAbsent {
+					return false, err
+				}
 				return c.cleanupMarkerMatches(entry.key, &expectedMarker)
 			},
 		); claimErr != nil {
@@ -3387,6 +4765,10 @@ func (c *Cleanup) sweepOrphans(
 		}
 	}
 	for _, entry := range guards {
+		key := stateKey{Owner: entry.key, Generation: entry.value.ProcessIncarnation}
+		if c.fenceRetirementAttempted(key) {
+			continue
+		}
 		if released, ok := c.releasedSweepGuards[entry.key]; ok && released == entry.value {
 			// An earlier final-fence path already linearized release of this
 			// snapshotted guard. Never reuse the stale token against a later
@@ -3714,6 +5096,373 @@ func (c *Cleanup) quarantineMalformedTerminal(
 	owner Identity,
 	terminal terminalValue,
 ) (bool, error) {
+	return c.cleanupTerminal(owner, terminal, lifecycleStale)
+}
+
+func (c *Cleanup) upgradeExactMarkerTailClaimForTerminal(
+	key stateKey,
+	terminal terminalValue,
+	claim generationClaim,
+	guard generationClaim,
+	marker *uint64,
+	now time.Duration,
+) (bool, error) {
+	if !validTerminalValue(terminal) || terminal.Generation != key.Generation ||
+		!validExactMarkerTailCleanupClaim(key, claim) ||
+		!validGenerationCleanupGuard(key.Owner, guard) ||
+		guard.ProcessIncarnation != key.Generation ||
+		!c.generationCleanupFenceExpired(now, terminal.ObservedMonotonicNS) ||
+		!c.generationCleanupFenceExpired(now, claim.ObservedMonotonicNS) ||
+		!c.generationCleanupFenceExpired(now, guard.ObservedMonotonicNS) ||
+		(marker != nil && (*marker == 0 ||
+			!c.generationCleanupFenceExpired(now, *marker))) {
+		return false, nil
+	}
+	payloadComplete, err := c.exactTerminalGenerationPayloadComplete(key, terminal)
+	if err != nil || !payloadComplete {
+		return false, err
+	}
+	rootMatches := func() (bool, error) {
+		terminalMatches, err := cleanupExactMatches(c.maps.terminals, key.Owner, terminal)
+		if err != nil || !terminalMatches {
+			return false, err
+		}
+		markerMatches, err := c.cleanupMarkerMatches(key, marker)
+		if err != nil || !markerMatches {
+			return false, err
+		}
+		return cleanupExactMatches(c.maps.terminals, key.Owner, terminal)
+	}
+	ownership, _, err := c.upgradeExactMarkerTailClaimForArtifact(
+		key, claim, terminal.ProcessIncarnation, terminal.Lifecycle, false, &guard, rootMatches,
+	)
+	if err != nil || !validGenerationCleanupClaim(ownership.claim) {
+		return false, err
+	}
+	if marker == nil {
+		// Reconstruct M after the continuous-E upgrade so terminal replay can be
+		// finalized only under a complete T/G/E/M fence on a later aged sweep.
+		err = c.reconstructTerminalGenerationCleanupMarker(
+			key, terminal, ownership.claim, guard, now,
+		)
+	}
+	return false, err
+}
+
+func (c *Cleanup) releaseTerminalGenerationFence(
+	owner Identity,
+	terminal terminalValue,
+	guard generationClaim,
+) (bool, error) {
+	key := stateKey{Owner: owner, Generation: terminal.Generation}
+	if !validTerminalValue(terminal) ||
+		!validGenerationCleanupGuard(owner, guard) ||
+		guard.ProcessIncarnation != key.Generation ||
+		!c.recordAliasReplayCleanupKey(
+			key, terminal.ObservedMonotonicNS, terminal.ProcessIncarnation,
+		) {
+		return false, nil
+	}
+	now := c.monoTimeNow()
+	var markedAt uint64
+	if err := c.maps.ambiguity.Lookup(&key, &markedAt); err != nil {
+		if !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return false, fmt.Errorf("checking terminal cleanup marker: %w", err)
+		}
+		var claim generationClaim
+		if claimErr := c.maps.claims.Lookup(&key, &claim); claimErr == nil {
+			if validExactMarkerTailCleanupClaim(key, claim) {
+				return c.upgradeExactMarkerTailClaimForTerminal(
+					key, terminal, claim, guard, nil, now,
+				)
+			}
+			return c.releaseTerminalClaimGuardTail(key, terminal, claim, guard, now)
+		} else if !errors.Is(claimErr, ebpf.ErrKeyNotExist) {
+			return false, fmt.Errorf("checking terminal cleanup claim tail: %w", claimErr)
+		}
+		return c.releaseTerminalGuardTail(key, terminal, guard, now)
+	}
+	if markedAt == 0 {
+		// M=0 is a live publication reservation, not destructive authority.
+		return false, nil
+	}
+	var exactClaim generationClaim
+	if claimErr := c.maps.claims.Lookup(&key, &exactClaim); claimErr == nil {
+		if validExactMarkerTailCleanupClaim(key, exactClaim) {
+			return c.upgradeExactMarkerTailClaimForTerminal(
+				key, terminal, exactClaim, guard, &markedAt, now,
+			)
+		}
+	} else if !errors.Is(claimErr, ebpf.ErrKeyNotExist) {
+		return false, fmt.Errorf("checking marked terminal exact-tail claim: %w", claimErr)
+	}
+	rootMatches := func() (bool, error) {
+		return cleanupExactMatches(c.maps.terminals, owner, terminal)
+	}
+	ownership, ready, err := c.claimGenerationCleanupWithGuard(
+		key, terminal.ProcessIncarnation, terminal.Lifecycle, guard, markedAt, rootMatches,
+	)
+	if err != nil || !ready {
+		return false, err
+	}
+	replayReady, replayErr := c.ensureTerminalAliasReplayFinal(ownership, key, terminal)
+	if replayErr != nil {
+		return false, fmt.Errorf("checking terminal alias replay before fence retirement: %w", replayErr)
+	}
+	if !replayReady {
+		return false, nil
+	}
+	payloadComplete, payloadErr := c.exactTerminalGenerationPayloadComplete(key, terminal)
+	if payloadErr != nil || !payloadComplete {
+		return false, payloadErr
+	}
+	return c.finishGenerationCleanupFencedValidated(
+		key, ownership, func(bool) (bool, error) {
+			return c.terminalGenerationCleanupComplete(key, terminal, ownership)
+		},
+	)
+}
+
+func (c *Cleanup) releaseTerminalClaimGuardTail(
+	key stateKey,
+	terminal terminalValue,
+	claim generationClaim,
+	guard generationClaim,
+	now time.Duration,
+) (bool, error) {
+	if !validGenerationCleanupClaim(claim) ||
+		claim.ProcessIncarnation != terminal.ProcessIncarnation ||
+		claim.Reserved[0] != terminal.Lifecycle ||
+		c.claimCreatedThisSweep(key, claim) ||
+		c.guardCreatedThisSweep(key.Owner, guard) ||
+		!c.generationCleanupFenceExpired(now, terminal.ObservedMonotonicNS) ||
+		!c.generationCleanupFenceExpired(now, claim.ObservedMonotonicNS) ||
+		!c.generationCleanupFenceExpired(now, guard.ObservedMonotonicNS) {
+		return false, nil
+	}
+	payloadComplete, err := c.exactTerminalGenerationPayloadComplete(key, terminal)
+	if err != nil || !payloadComplete {
+		return false, err
+	}
+	replaySafe, err := c.terminalAliasReplayFenceRetirementSafe(key, terminal)
+	if err != nil {
+		return false, err
+	}
+	if !replaySafe {
+		// A previous exact-tail promotion can leave T/E/G but no M when marker
+		// publication fails. Reconstruct M only under the same exact T/E/G and
+		// replay epoch; the fresh marker then receives its own grace interval in
+		// the ordinary full-fence path.
+		return false, c.reconstructTerminalGenerationCleanupMarker(
+			key, terminal, claim, guard, now,
+		)
+	}
+	validate := func(requireClaim bool) (bool, error) {
+		markerAbsent, err := c.cleanupMarkerMatches(key, nil)
+		if err != nil || !markerAbsent {
+			return false, err
+		}
+		complete, err := c.exactTerminalGenerationCleanupComplete(key, terminal)
+		if err != nil || !complete {
+			return false, err
+		}
+		guardMatches, err := generationGuardMatches(c.maps.ownerGuards, key.Owner, guard)
+		if err != nil || !guardMatches {
+			return false, err
+		}
+		if requireClaim {
+			return generationClaimMatches(c.maps.claims, key, claim)
+		}
+		return generationClaimAbsent(c.maps.claims, key)
+	}
+	for range 2 {
+		valid, err := validate(true)
+		if err != nil || !valid {
+			return false, err
+		}
+	}
+	c.recordFenceRetirementAttempt(key)
+	deleted, err := cleanupDeleteExact(c.maps.claims, key, claim)
+	if err != nil || !deleted {
+		return false, err
+	}
+	c.recordReleasedSweepClaim(key, claim)
+	c.clearCurrentSweepClaim(key, claim)
+	valid, err := validate(false)
+	if err != nil || !valid {
+		return false, err
+	}
+	deleted, err = cleanupDeleteExact(c.maps.ownerGuards, key.Owner, guard)
+	if err != nil || !deleted {
+		return false, err
+	}
+	c.recordReleasedSweepGuard(key.Owner, guard)
+	c.clearCurrentSweepGuard(key.Owner, guard)
+	return true, nil
+}
+
+func (c *Cleanup) reconstructTerminalGenerationCleanupMarker(
+	key stateKey,
+	terminal terminalValue,
+	claim generationClaim,
+	guard generationClaim,
+	now time.Duration,
+) error {
+	if now <= 0 || !validTerminalValue(terminal) || terminal.Generation != key.Generation ||
+		!validGenerationCleanupClaim(claim) ||
+		claim.ProcessIncarnation != terminal.ProcessIncarnation ||
+		claim.Reserved[0] != terminal.Lifecycle ||
+		!validGenerationCleanupGuard(key.Owner, guard) ||
+		guard.ProcessIncarnation != key.Generation {
+		return nil
+	}
+	replayKey := aliasReplayKeyForTerminal(key, terminal)
+	var replay aliasReplayValue
+	if err := c.maps.aliasReplays.Lookup(&replayKey, &replay); err != nil {
+		return ignoreMissing(err)
+	}
+	if !validAliasReplayActive(replay) && !validTaggedAliasReplayPublishing(replay) {
+		// Untagged publishing may still have a live producer, while malformed or
+		// semantically conflicting final state is preservation authority.
+		return nil
+	}
+	validate := func(expectedMarker *uint64) (bool, error) {
+		terminalMatches, err := cleanupExactMatches(
+			c.maps.terminals, key.Owner, terminal,
+		)
+		if err != nil || !terminalMatches {
+			return false, err
+		}
+		claimMatches, err := generationClaimMatches(c.maps.claims, key, claim)
+		if err != nil || !claimMatches {
+			return false, err
+		}
+		guardMatches, err := generationGuardMatches(c.maps.ownerGuards, key.Owner, guard)
+		if err != nil || !guardMatches {
+			return false, err
+		}
+		markerMatches, err := c.cleanupMarkerMatches(key, expectedMarker)
+		if err != nil || !markerMatches {
+			return false, err
+		}
+		payloadComplete, err := c.exactTerminalGenerationPayloadComplete(key, terminal)
+		if err != nil || !payloadComplete {
+			return false, err
+		}
+		replayMatches, err := cleanupExactMatches(c.maps.aliasReplays, replayKey, replay)
+		if err != nil || !replayMatches {
+			return false, err
+		}
+		return cleanupExactMatches(c.maps.terminals, key.Owner, terminal)
+	}
+	_, err := c.publishFreshGenerationCleanupMarkerExact(
+		key, now, "terminal cleanup marker", validate,
+	)
+	return err
+}
+
+func (c *Cleanup) publishFreshGenerationCleanupMarkerExact(
+	key stateKey,
+	now time.Duration,
+	description string,
+	validate func(*uint64) (bool, error),
+) (bool, error) {
+	if key.Generation == 0 || key.Reserved != 0 || now <= 0 || validate == nil {
+		return false, nil
+	}
+	for range 2 {
+		valid, err := validate(nil)
+		if err != nil || !valid {
+			return false, err
+		}
+	}
+
+	markedAt := uint64(now)
+	if c.currentSweepAmbiguities != nil {
+		// Record intent before the syscall. A committed update with an error and
+		// failed readback must never be mistaken for an inherited aged marker.
+		c.currentSweepAmbiguities[key] = markedAt
+	}
+	updateErr := c.maps.ambiguity.Update(&key, &markedAt, ebpf.UpdateNoExist)
+	var current uint64
+	lookupErr := c.maps.ambiguity.Lookup(&key, &current)
+	if lookupErr != nil {
+		if updateErr != nil {
+			return false, errors.Join(
+				fmt.Errorf("publishing %s: %w", description, updateErr),
+				fmt.Errorf("checking uncertain %s: %w", description, lookupErr),
+			)
+		}
+		return false, fmt.Errorf("checking published %s: %w", description, lookupErr)
+	}
+	if current != markedAt {
+		if updateErr != nil {
+			return false, fmt.Errorf("publishing %s: %w", description, updateErr)
+		}
+		return false, fmt.Errorf("%s changed during publication", description)
+	}
+	valid, validationErr := validate(&markedAt)
+	if updateErr != nil {
+		updateErr = fmt.Errorf("publishing %s: %w", description, updateErr)
+	}
+	if validationErr != nil {
+		return false, errors.Join(updateErr, validationErr)
+	}
+	if !valid {
+		return false, updateErr
+	}
+	return updateErr == nil, updateErr
+}
+
+func (c *Cleanup) releaseTerminalGuardTail(
+	key stateKey,
+	terminal terminalValue,
+	guard generationClaim,
+	now time.Duration,
+) (bool, error) {
+	if c.guardCreatedThisSweep(key.Owner, guard) ||
+		!c.generationCleanupFenceExpired(now, terminal.ObservedMonotonicNS) ||
+		!c.generationCleanupFenceExpired(now, guard.ObservedMonotonicNS) {
+		return false, nil
+	}
+	validate := func() (bool, error) {
+		markerAbsent, err := c.cleanupMarkerMatches(key, nil)
+		if err != nil || !markerAbsent {
+			return false, err
+		}
+		claimAbsent, err := generationClaimAbsent(c.maps.claims, key)
+		if err != nil || !claimAbsent {
+			return false, err
+		}
+		complete, err := c.exactTerminalGenerationCleanupComplete(key, terminal)
+		if err != nil || !complete {
+			return false, err
+		}
+		return generationGuardMatches(c.maps.ownerGuards, key.Owner, guard)
+	}
+	for range 2 {
+		valid, err := validate()
+		if err != nil || !valid {
+			return false, err
+		}
+	}
+	deleted, err := cleanupDeleteExact(c.maps.ownerGuards, key.Owner, guard)
+	if err != nil || !deleted {
+		return false, err
+	}
+	c.recordReleasedSweepGuard(key.Owner, guard)
+	c.clearCurrentSweepGuard(key.Owner, guard)
+	return true, nil
+}
+
+func (c *Cleanup) cleanupTerminal(
+	owner Identity,
+	terminal terminalValue,
+	origin uint8,
+) (bool, error) {
+	if validTerminalValue(terminal) {
+		return false, nil
+	}
 	key := stateKey{Owner: owner, Generation: terminal.Generation}
 	if terminal.Generation == 0 {
 		// Terminal keys are owner-scoped and reusable. Without both generation
@@ -3721,7 +5470,7 @@ func (c *Cleanup) quarantineMalformedTerminal(
 		return false, nil
 	}
 	ownership, ready, err := c.claimGenerationCleanupForArtifact(
-		key, terminal.ProcessIncarnation, lifecycleStale,
+		key, terminal.ProcessIncarnation, origin,
 		func() (bool, error) {
 			return cleanupExactMatches(c.maps.terminals, owner, terminal)
 		},
@@ -3730,7 +5479,7 @@ func (c *Cleanup) quarantineMalformedTerminal(
 		return false, err
 	}
 	deleted, err := c.mutateGenerationCleanupFenced(
-		ownership, "malformed terminal deletion", func() (bool, error) {
+		ownership, "terminal deletion", func() (bool, error) {
 			return cleanupDeleteExact(c.maps.terminals, owner, terminal)
 		},
 	)
@@ -3739,7 +5488,7 @@ func (c *Cleanup) quarantineMalformedTerminal(
 	}
 	complete, completeErr := c.generationCleanupLogicalComplete(key)
 	if completeErr != nil {
-		return false, fmt.Errorf("verifying malformed terminal logical cleanup: %w", completeErr)
+		return false, fmt.Errorf("verifying terminal logical cleanup: %w", completeErr)
 	}
 	return complete, nil
 }
@@ -3818,14 +5567,15 @@ func (c *Cleanup) cleanupOrphanFallback(
 		}
 		var retained generationClaim
 		if err := c.maps.claims.Lookup(&key, &retained); err != nil ||
-			!validGenerationCleanupClaim(retained) {
+			(!validGenerationCleanupClaim(retained) &&
+				!validExactMarkerTailCleanupClaim(key, retained)) {
 			if err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 				return false, fmt.Errorf("checking ownerless fallback claim: %w", err)
 			}
 			return false, nil
 		}
-		ownership, ready, err := c.claimGenerationCleanup(
-			key, retained, func() (bool, error) {
+		ownership, ready, err := c.claimGenerationCleanupForArtifact(
+			key, retained.ProcessIncarnation, retained.Reserved[0], func() (bool, error) {
 				return cleanupExactMatches(c.maps.remoteParents, owner, encoded)
 			},
 		)
@@ -3856,14 +5606,15 @@ func (c *Cleanup) cleanupOrphanFallback(
 		}
 		var retained generationClaim
 		if err := c.maps.claims.Lookup(&key, &retained); err != nil ||
-			!validGenerationCleanupClaim(retained) {
+			(!validGenerationCleanupClaim(retained) &&
+				!validExactMarkerTailCleanupClaim(key, retained)) {
 			if err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 				return false, fmt.Errorf("checking detached fallback claim: %w", err)
 			}
 			return false, nil
 		}
-		ownership, ready, err := c.claimGenerationCleanup(
-			key, retained, func() (bool, error) {
+		ownership, ready, err := c.claimGenerationCleanupForArtifact(
+			key, retained.ProcessIncarnation, retained.Reserved[0], func() (bool, error) {
 				ownerMatches, matchErr := cleanupExactMatches(c.maps.owners, owner, indexed)
 				if matchErr != nil || !ownerMatches {
 					return false, matchErr

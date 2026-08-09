@@ -289,6 +289,90 @@ func (c *Cleanup) snapshotAliasReplayState() error {
 	return result
 }
 
+func aliasReplayKeyForTerminal(key stateKey, terminal terminalValue) aliasReplayKey {
+	return aliasReplayKey{
+		Owner:               key.Owner,
+		Generation:          key.Generation,
+		ObservedMonotonicNS: terminal.ObservedMonotonicNS,
+		ProcessIncarnation:  terminal.ProcessIncarnation,
+	}
+}
+
+// terminalAliasReplayFenceRetirementSafe checks only the replay epoch selected
+// by exact terminal authority. Other replay keys for the same numeric generation
+// carry a different observation or process incarnation and cannot authorize this
+// terminal's payload or lifecycle. Shared HASH iteration is deliberately not
+// used as absence authority: concurrent updates can make a successful iteration
+// omit keys without reporting an error.
+func (c *Cleanup) terminalAliasReplayFenceRetirementSafe(
+	key stateKey,
+	terminal terminalValue,
+) (bool, error) {
+	if key.Generation == 0 || key.Reserved != 0 || !validTerminalValue(terminal) ||
+		terminal.Generation != key.Generation {
+		return false, nil
+	}
+	replayKey := aliasReplayKeyForTerminal(key, terminal)
+	if !validAliasReplayKey(replayKey) {
+		return false, nil
+	}
+	for range 2 {
+		var replay aliasReplayValue
+		if err := c.maps.aliasReplays.Lookup(&replayKey, &replay); err != nil {
+			if errors.Is(err, ebpf.ErrKeyNotExist) {
+				continue
+			}
+			return false, fmt.Errorf("checking terminal alias replay: %w", err)
+		}
+		// References are deliberately mutable and are not part of lifecycle
+		// authority. Binding and transition metadata must be structurally final
+		// for the terminal's exact lifecycle on every point read.
+		if !validAliasReplayFinal(replay) || replay.Lifecycle != terminal.Lifecycle {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// ensureTerminalAliasReplayFinal prepares only T's exact replay epoch while the
+// complete M/E/G fence still matches. The later retirement validator is
+// deliberately read-only and never falls back to shared-map enumeration.
+func (c *Cleanup) ensureTerminalAliasReplayFinal(
+	ownership generationCleanupOwnership,
+	key stateKey,
+	terminal terminalValue,
+) (bool, error) {
+	if !validTerminalValue(terminal) || terminal.Generation != key.Generation ||
+		ownership.claim.ProcessIncarnation != terminal.ProcessIncarnation ||
+		ownership.claim.Reserved[0] != terminal.Lifecycle {
+		return false, nil
+	}
+	replayKey := aliasReplayKeyForTerminal(key, terminal)
+	if !validAliasReplayKey(replayKey) {
+		return false, nil
+	}
+	terminalMatches, err := cleanupExactMatches(c.maps.terminals, key.Owner, terminal)
+	if err != nil || !terminalMatches {
+		return false, err
+	}
+	var replay aliasReplayValue
+	if err := c.maps.aliasReplays.Lookup(&replayKey, &replay); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return cleanupExactMatches(c.maps.terminals, key.Owner, terminal)
+		}
+		return false, fmt.Errorf("looking up terminal alias replay: %w", err)
+	}
+	ready, err := c.ensureExactAliasReplayFinal(ownership, replayKey, replay)
+	if err != nil || !ready {
+		return false, err
+	}
+	terminalMatches, err = cleanupExactMatches(c.maps.terminals, key.Owner, terminal)
+	if err != nil || !terminalMatches {
+		return false, err
+	}
+	return c.terminalAliasReplayFenceRetirementSafe(key, terminal)
+}
+
 func (c *Cleanup) ensureStateAliasReplayFinal(
 	ownership generationCleanupOwnership,
 	key stateKey,
@@ -417,6 +501,11 @@ func (c *Cleanup) aliasReplayCandidates(
 			key: exact, value: current,
 		}}, true, nil
 	}
+	// Rootless tails have no exact replay epoch to point-read. Bound their
+	// generation-wide HASH enumeration under cleanup's exclusive coordinator.
+	if !c.generationReplayScanAuthorized(key) {
+		return nil, false, nil
+	}
 
 	entries, err := c.currentGenerationAliasReplays(key)
 	if err != nil {
@@ -453,6 +542,11 @@ func (c *Cleanup) aliasReplayFenceRetirementSafe(
 		return false, err
 	}
 	if claim == nil {
+		// G-only tails likewise lack an exact replay epoch. Deferral preserves G
+		// as fail-closed authority until this generation receives admission.
+		if !c.generationReplayScanAuthorized(key) {
+			return false, nil
+		}
 		entries, err := c.currentGenerationAliasReplays(key)
 		if err != nil {
 			return false, err

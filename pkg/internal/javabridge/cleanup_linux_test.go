@@ -9,6 +9,7 @@ import (
 	"errors"
 	"maps"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -52,6 +53,97 @@ func taggedGoPublishingGenerationClaim(
 	)
 	claim.Reserved[0] = target
 	return claim
+}
+
+func exactMarkerTailClaimForTest(
+	key stateKey,
+	observedMonotonicNS uint64,
+) generationClaim {
+	return generationClaim{
+		ObservedMonotonicNS: observedMonotonicNS,
+		ProcessIncarnation:  key.Generation,
+		Lifecycle:           lifecycleCleanup,
+		Reserved: [7]byte{
+			0: lifecycleAmbiguous,
+			6: generationGoProducerTag,
+		},
+	}
+}
+
+func pointerTo[T any](value T) *T { return &value }
+
+func TestValidExactMarkerTailCleanupClaimIsUnforgeablyNarrow(t *testing.T) {
+	key := stateKey{
+		Owner: Identity{TID: 3, PID: 2, Namespace: 1}, Generation: 10,
+	}
+	valid := exactMarkerTailClaimForTest(key, uint64(10*time.Second))
+	for _, test := range []struct {
+		name        string
+		key         stateKey
+		claim       generationClaim
+		wantExact   bool
+		wantGeneric bool
+	}{
+		{name: "tagged exact", key: key, claim: valid, wantExact: true},
+		{
+			name: "untagged BPF shape", key: key,
+			claim: func() generationClaim {
+				claim := valid
+				claim.Reserved[6] = 0
+				return claim
+			}(),
+			wantGeneric: true,
+		},
+		{
+			name: "tagged producer", key: key,
+			claim: taggedGoGenerationClaim(
+				lifecycleAmbiguous, uint64(10*time.Second), key.Generation,
+			),
+		},
+		{
+			name: "tagged publishing", key: key,
+			claim: taggedGoPublishingGenerationClaim(
+				lifecycleAmbiguous, uint64(10*time.Second), key.Generation,
+			),
+		},
+		{
+			name: "wrong tag", key: key,
+			claim: func() generationClaim { claim := valid; claim.Reserved[6]++; return claim }(),
+		},
+		{
+			name: "extra metadata", key: key,
+			claim: func() generationClaim { claim := valid; claim.Reserved[1] = 1; return claim }(),
+		},
+		{
+			name: "wrong incarnation", key: key,
+			claim: func() generationClaim { claim := valid; claim.ProcessIncarnation++; return claim }(),
+		},
+		{
+			name: "wrong origin", key: key,
+			claim: func() generationClaim { claim := valid; claim.Reserved[0] = lifecycleStale; return claim }(),
+		},
+		{
+			name: "wrong lifecycle", key: key,
+			claim: func() generationClaim { claim := valid; claim.Lifecycle = lifecycleConsumed; return claim }(),
+		},
+		{
+			name: "zero timestamp", key: key,
+			claim: func() generationClaim { claim := valid; claim.ObservedMonotonicNS = 0; return claim }(),
+		},
+		{
+			name: "malformed key",
+			key: stateKey{
+				Owner: key.Owner, Generation: key.Generation, Reserved: 1,
+			},
+			claim: valid,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.wantExact,
+				validExactMarkerTailCleanupClaim(test.key, test.claim))
+			assert.Equal(t, test.wantGeneric, validGenerationCleanupClaim(test.claim))
+		})
+	}
 }
 
 func generationRecoveryCleanup(t *testing.T) *Cleanup {
@@ -2437,6 +2529,7 @@ func TestCleanupFinalFenceReleaseConvergesWhenClaimDisappears(t *testing.T) {
 	cleanup.stateSnapshotComplete = true
 	cleanup.physicalGenerations = make(map[stateKey]struct{})
 	require.NoError(t, cleanup.snapshotAliasReplayState())
+	authorizeGenerationReplayScanForTest(cleanup, key)
 
 	claims := cleanup.maps.claims.(*fakeBridgeMap)
 	cleanup.maps.ambiguity.(*fakeBridgeMap).afterDelete = func(any) {
@@ -2490,15 +2583,2377 @@ func TestCleanupGuardReleaseFailureRetainsGuardTail(t *testing.T) {
 func TestCleanupReleasesAgedMarkerOnlyTailWithCompleteSnapshots(t *testing.T) {
 	owner := Identity{TID: 3, PID: 2, Namespace: 1}
 	cleanup := testCleanup(testMapHandler(nil, nil, nil))
-	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+	now := 41 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
 	key := stateKey{Owner: owner, Generation: 10}
 	cleanup.maps.ambiguity.(*fakeBridgeMap).values[key] = uint64(10 * time.Second)
+	guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
 
 	stats, err := cleanup.SweepWithStats()
 	require.NoError(t, err)
 	assert.Equal(t, CleanupStats{}, stats)
 	assert.Equal(t, uint64(10*time.Second),
 		cleanup.maps.ambiguity.(*fakeBridgeMap).values[key])
+	claim, ok := cleanup.maps.claims.(*fakeBridgeMap).values[key].(generationClaim)
+	require.True(t, ok)
+	assert.Equal(t, uint64(now), claim.ObservedMonotonicNS)
+	assert.Empty(t, guards.values)
+	assert.Zero(t, guards.updateCount)
+
+	now = 72*time.Second + time.Nanosecond
+	stats, err = cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	refreshed, ok := cleanup.maps.claims.(*fakeBridgeMap).values[key].(generationClaim)
+	require.True(t, ok)
+	assert.Equal(t, uint64(now), refreshed.ObservedMonotonicNS)
+	assert.Empty(t, guards.values)
+	assert.Zero(t, guards.updateCount)
+	assert.Empty(t, cleanup.maps.ambiguity.(*fakeBridgeMap).values)
+
+	now += 30*time.Second + time.Nanosecond
+	stats, err = cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+	assert.Empty(t, guards.values)
+	assert.Zero(t, guards.updateCount)
+	assert.Empty(t, cleanup.maps.ambiguity.(*fakeBridgeMap).values)
+}
+
+func TestCleanupCapsOutstandingExactMarkerTailClaims(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	for i := range javaRemoteParentMaxExactTailClaims {
+		tailKey := stateKey{
+			Owner: Identity{
+				TID: uint32(i + 100), PID: 99, Namespace: 1,
+			},
+			Generation: 1,
+		}
+		claims.values[tailKey] = exactMarkerTailClaimForTest(
+			tailKey, uint64(40*time.Second),
+		)
+	}
+	cleanup.maps.ambiguity.(*fakeBridgeMap).values[key] = uint64(10 * time.Second)
+
+	stats, err := cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Len(t, claims.values, javaRemoteParentMaxExactTailClaims)
+	assert.NotContains(t, claims.values, key)
+	assert.Equal(t, uint64(10*time.Second),
+		cleanup.maps.ambiguity.(*fakeBridgeMap).values[key])
+	assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+}
+
+func TestCleanupExactMarkerTailCommitErrorConsumesAdmissionBudget(t *testing.T) {
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	for i := range javaRemoteParentMaxExactTailClaims - 1 {
+		key := stateKey{
+			Owner:      Identity{TID: uint32(i + 100), PID: 99, Namespace: 1},
+			Generation: 1,
+		}
+		claims.values[key] = exactMarkerTailClaimForTest(key, uint64(40*time.Second))
+	}
+	first := stateKey{
+		Owner: Identity{TID: 3, PID: 2, Namespace: 1}, Generation: 10,
+	}
+	second := stateKey{
+		Owner: Identity{TID: 4, PID: 2, Namespace: 1}, Generation: 11,
+	}
+	markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+	markers.values[first] = uint64(10 * time.Second)
+	markers.values[second] = uint64(10 * time.Second)
+	claims.updateCommitErr = errors.New("injected committed update error")
+
+	stats, err := cleanup.SweepWithStats()
+	require.ErrorContains(t, err, "injected committed update error")
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Len(t, claims.values, javaRemoteParentMaxExactTailClaims)
+	_, firstClaimed := claims.values[first]
+	_, secondClaimed := claims.values[second]
+	assert.NotEqual(t, firstClaimed, secondClaimed)
+	assert.Equal(t, uint64(10*time.Second), markers.values[first])
+	assert.Equal(t, uint64(10*time.Second), markers.values[second])
+	assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+}
+
+func TestCleanupExactMarkerTailUncertainUpdateStopsAdmission(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		committed bool
+	}{
+		{name: "not committed"},
+		{name: "committed with error", committed: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cleanup := testCleanup(testMapHandler(nil, nil, nil))
+			cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+			claims := cleanup.maps.claims.(*fakeBridgeMap)
+			for i := range javaRemoteParentMaxExactTailClaims - 1 {
+				key := stateKey{
+					Owner:      Identity{TID: uint32(i + 100), PID: 99, Namespace: 1},
+					Generation: 1,
+				}
+				claims.values[key] = exactMarkerTailClaimForTest(
+					key, uint64(40*time.Second),
+				)
+			}
+			first := stateKey{
+				Owner: Identity{TID: 3, PID: 2, Namespace: 1}, Generation: 10,
+			}
+			second := stateKey{
+				Owner: Identity{TID: 4, PID: 2, Namespace: 1}, Generation: 11,
+			}
+			markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+			markers.values[first] = uint64(10 * time.Second)
+			markers.values[second] = uint64(10 * time.Second)
+			updateErr := errors.New("injected uncertain exact-tail update")
+			lookupErr := errors.New("injected uncertain exact-tail readback")
+			if test.committed {
+				claims.updateCommitErr = updateErr
+				claims.afterUpdate = func(any, any) { claims.lookupErr = lookupErr }
+			} else {
+				claims.updateErr = updateErr
+				claims.afterFailedUpdate = func() { claims.lookupErr = lookupErr }
+			}
+			claims.afterLookupResult = func(_ any, errorValue error) {
+				if errorValue == lookupErr {
+					claims.lookupErr = nil
+				}
+			}
+
+			stats, err := cleanup.SweepWithStats()
+			require.ErrorContains(t, err, updateErr.Error())
+			require.ErrorContains(t, err, lookupErr.Error())
+			assert.Equal(t, CleanupStats{}, stats)
+			_, firstClaimed := claims.values[first]
+			_, secondClaimed := claims.values[second]
+			if test.committed {
+				assert.Len(t, claims.values, javaRemoteParentMaxExactTailClaims)
+				assert.NotEqual(t, firstClaimed, secondClaimed)
+			} else {
+				assert.Len(t, claims.values, javaRemoteParentMaxExactTailClaims-1)
+				assert.False(t, firstClaimed)
+				assert.False(t, secondClaimed)
+			}
+			assert.Equal(t, uint64(10*time.Second), markers.values[first])
+			assert.Equal(t, uint64(10*time.Second), markers.values[second])
+			assert.Equal(t, 1, claims.updateCount)
+			assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+		})
+	}
+}
+
+func TestCleanupExactMarkerTailAdmissionRetriesAfterMapError(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	now := 41 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+	guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+	markers.values[key] = uint64(10 * time.Second)
+	claims.updateErr = errors.New("injected claim capacity error")
+
+	stats, err := cleanup.SweepWithStats()
+	require.ErrorContains(t, err, "injected claim capacity error")
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Empty(t, claims.values)
+	assert.Empty(t, guards.values)
+	assert.Zero(t, guards.updateCount)
+	assert.Equal(t, uint64(10*time.Second), markers.values[key])
+
+	claims.updateErr = nil
+	now++
+	stats, err = cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Contains(t, claims.values, key)
+	assert.Empty(t, guards.values)
+	assert.Zero(t, guards.updateCount)
+	assert.Equal(t, uint64(10*time.Second), markers.values[key])
+}
+
+func TestCleanupOrdinaryClaimsDoNotConsumeExactTailBudget(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	const ordinaryClaims = javaRemoteParentMaxExactTailClaims + 100
+	for i := range ordinaryClaims {
+		ordinaryKey := stateKey{
+			Owner:      Identity{TID: uint32(i + 100), PID: 99, Namespace: 1},
+			Generation: 1,
+		}
+		claims.values[ordinaryKey] = generationClaim{
+			ObservedMonotonicNS: uint64(40 * time.Second),
+			ProcessIncarnation:  testProcessIncarnation,
+			Lifecycle:           lifecycleConsumed,
+		}
+	}
+	cleanup.maps.ambiguity.(*fakeBridgeMap).values[key] = uint64(10 * time.Second)
+
+	stats, err := cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Len(t, claims.values, ordinaryClaims+1)
+	assert.Contains(t, claims.values, key)
+	assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+}
+
+func TestCleanupConcurrentUntaggedClaimsCannotConsumeOrForgeExactTailBudget(t *testing.T) {
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	for i := range javaRemoteParentMaxExactTailClaims - 1 {
+		key := stateKey{
+			Owner:      Identity{TID: uint32(i + 100), PID: 99, Namespace: 1},
+			Generation: 1,
+		}
+		claims.values[key] = exactMarkerTailClaimForTest(key, uint64(40*time.Second))
+	}
+	insertUntagged := func(offset uint32) {
+		for i := range javaRemoteParentMaxExactTailClaims {
+			key := stateKey{
+				Owner:      Identity{TID: uint32(i) + offset, PID: 98, Namespace: 1},
+				Generation: 2,
+			}
+			// This intentionally resembles the historical synthetic shape, but
+			// lacks the Go-only tag and therefore remains ordinary BPF authority.
+			claims.values[key] = generationClaim{
+				ObservedMonotonicNS: uint64(40 * time.Second),
+				ProcessIncarnation:  key.Generation,
+				Lifecycle:           lifecycleCleanup,
+				Reserved:            [7]byte{lifecycleAmbiguous},
+			}
+		}
+	}
+	insertUntagged(2000)
+	firstMarker := stateKey{
+		Owner: Identity{TID: 3, PID: 2, Namespace: 1}, Generation: 10,
+	}
+	secondMarker := stateKey{
+		Owner: Identity{TID: 4, PID: 2, Namespace: 1}, Generation: 11,
+	}
+	markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+	markers.values[firstMarker] = uint64(10 * time.Second)
+	markers.values[secondMarker] = uint64(10 * time.Second)
+	armed := false
+	markers.afterIterate = func() { armed = true }
+	injected := false
+	claims.afterIterate = func() {
+		if !armed || injected {
+			return
+		}
+		injected = true
+		insertUntagged(4000)
+	}
+
+	stats, err := cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	require.True(t, injected)
+	_, firstClaimed := claims.values[firstMarker]
+	_, secondClaimed := claims.values[secondMarker]
+	assert.NotEqual(t, firstClaimed, secondClaimed)
+	tagged := 0
+	untagged := 0
+	for rawKey, rawClaim := range claims.values {
+		key := rawKey.(stateKey)
+		claim := rawClaim.(generationClaim)
+		if validExactMarkerTailCleanupClaim(key, claim) {
+			tagged++
+		} else if claim.Reserved == ([7]byte{lifecycleAmbiguous}) {
+			untagged++
+		}
+	}
+	assert.Equal(t, javaRemoteParentMaxExactTailClaims, tagged)
+	assert.Equal(t, 2*javaRemoteParentMaxExactTailClaims, untagged)
+	assert.Len(t, claims.values, 3*javaRemoteParentMaxExactTailClaims)
+	assert.Equal(t, uint64(10*time.Second), markers.values[firstMarker])
+	assert.Equal(t, uint64(10*time.Second), markers.values[secondMarker])
+	assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+}
+
+func TestCleanupExactMarkerTailBacklogConvergesInBoundedBatches(t *testing.T) {
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	now := 41 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+	guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+	for i := range javaRemoteParentMaxExactTailClaims + 1 {
+		key := stateKey{
+			Owner:      Identity{TID: uint32(i + 100), PID: 99, Namespace: 1},
+			Generation: 1,
+		}
+		markers.values[key] = uint64(10 * time.Second)
+	}
+	sweep := func() {
+		t.Helper()
+		stats, err := cleanup.SweepWithStats()
+		require.NoError(t, err)
+		assert.Equal(t, CleanupStats{}, stats)
+		assert.Empty(t, guards.values)
+		assert.Zero(t, guards.updateCount)
+		for rawKey, rawClaim := range claims.values {
+			assert.True(t, validExactMarkerTailCleanupClaim(
+				rawKey.(stateKey), rawClaim.(generationClaim),
+			))
+		}
+	}
+
+	sweep()
+	assert.Len(t, claims.values, javaRemoteParentMaxExactTailClaims)
+	assert.Len(t, markers.values, javaRemoteParentMaxExactTailClaims+1)
+
+	now = 72*time.Second + time.Nanosecond
+	sweep()
+	assert.Len(t, claims.values, javaRemoteParentMaxExactTailClaims)
+	assert.Len(t, markers.values, 1)
+
+	now += 30*time.Second + time.Nanosecond
+	sweep()
+	assert.Empty(t, claims.values)
+	assert.Len(t, markers.values, 1)
+
+	now++
+	sweep()
+	assert.Len(t, claims.values, 1)
+	assert.Len(t, markers.values, 1)
+
+	now += 30*time.Second + time.Nanosecond
+	sweep()
+	assert.Len(t, claims.values, 1)
+	assert.Empty(t, markers.values)
+
+	now += 30*time.Second + time.Nanosecond
+	sweep()
+	assert.Empty(t, claims.values)
+	assert.Empty(t, markers.values)
+}
+
+func TestCleanupIncompleteClaimSnapshotDisablesExactTailAdmission(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+	cleanup.maps.ambiguity.(*fakeBridgeMap).values[key] = uint64(10 * time.Second)
+	cleanup.maps.claims.(*fakeBridgeMap).iterateErr = errors.New("injected claim scan failure")
+
+	stats, err := cleanup.SweepWithStats()
+	require.ErrorContains(t, err, "injected claim scan failure")
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+	assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+	assert.Equal(t, uint64(10*time.Second),
+		cleanup.maps.ambiguity.(*fakeBridgeMap).values[key])
+}
+
+func TestCleanupExactTailAdmissionRequiresCompletePayloadSnapshots(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		inject func(*Cleanup)
+	}{
+		{
+			name: "generation",
+			inject: func(cleanup *Cleanup) {
+				cleanup.maps.generations.(*fakeBridgeMap).iterateErr = errors.New("injected scan failure")
+			},
+		},
+		{
+			name: "state",
+			inject: func(cleanup *Cleanup) {
+				cleanup.maps.states.(*fakeBridgeMap).iterateErr = errors.New("injected scan failure")
+			},
+		},
+		{
+			name: "connection",
+			inject: func(cleanup *Cleanup) {
+				cleanup.maps.connections.(*fakeBridgeMap).iterateErr = errors.New("injected scan failure")
+			},
+		},
+		{
+			name: "cookie connection",
+			inject: func(cleanup *Cleanup) {
+				cleanup.maps.cookieConnections.(*fakeBridgeMap).iterateErr = errors.New("injected scan failure")
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			owner := Identity{TID: 3, PID: 2, Namespace: 1}
+			key := stateKey{Owner: owner, Generation: 10}
+			cleanup := testCleanup(testMapHandler(nil, nil, nil))
+			cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+			cleanup.maps.ambiguity.(*fakeBridgeMap).values[key] = uint64(10 * time.Second)
+			test.inject(cleanup)
+
+			stats, err := cleanup.SweepWithStats()
+			require.ErrorContains(t, err, "injected scan failure")
+			assert.Equal(t, CleanupStats{}, stats)
+			assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+			assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+			assert.Equal(t, uint64(10*time.Second),
+				cleanup.maps.ambiguity.(*fakeBridgeMap).values[key])
+		})
+	}
+}
+
+func TestCleanupExactTailAdmissionDoesNotRequireAliasReplaySnapshot(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+	cleanup.maps.ambiguity.(*fakeBridgeMap).values[key] = uint64(10 * time.Second)
+	cleanup.maps.aliasReplays.(*fakeBridgeMap).iterateErr = errors.New("injected scan failure")
+
+	stats, err := cleanup.SweepWithStats()
+	require.ErrorContains(t, err, "injected scan failure")
+	assert.Equal(t, CleanupStats{}, stats)
+	claim, present := cleanup.maps.claims.(*fakeBridgeMap).values[key].(generationClaim)
+	require.True(t, present)
+	assert.Equal(t, uint64(41*time.Second), claim.ObservedMonotonicNS)
+	assert.Equal(t, key.Generation, claim.ProcessIncarnation)
+	assert.Equal(t, [7]byte{
+		0: lifecycleAmbiguous,
+		6: generationGoProducerTag,
+	}, claim.Reserved)
+	assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+	assert.Equal(t, uint64(10*time.Second),
+		cleanup.maps.ambiguity.(*fakeBridgeMap).values[key])
+}
+
+func TestCleanupValidTerminalWithoutGuardRemainsStatusOnly(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	terminal := terminalValue{
+		Generation:          10,
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleConsumed,
+	}
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	cleanup.monoTimeNow = func() time.Duration { return 100 * time.Second }
+	cleanup.maps.terminals.(*fakeBridgeMap).values[owner] = terminal
+	guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+
+	stats, err := cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Equal(t, terminal, cleanup.maps.terminals.(*fakeBridgeMap).values[owner])
+	assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+	assert.Empty(t, guards.values)
+	assert.Zero(t, guards.updateCount)
+	assert.Empty(t, cleanup.maps.ambiguity.(*fakeBridgeMap).values)
+}
+
+func TestCleanupFreshTerminalExclusivelyOwnsEveryGenericFenceShape(t *testing.T) {
+	tests := []struct {
+		name        string
+		marker      *uint64
+		claimOrigin *uint8
+		guard       bool
+	}{
+		{name: "guard only", guard: true},
+		{name: "claim only", claimOrigin: pointerTo(lifecycleConsumed)},
+		{name: "claim and guard", claimOrigin: pointerTo(lifecyclePublishing), guard: true},
+		{name: "zero reservation and guard", marker: pointerTo(uint64(0)), guard: true},
+		{name: "zero reservation and semantic claim", marker: pointerTo(uint64(0)), claimOrigin: pointerTo(lifecycleConsumed)},
+		{name: "zero reservation semantic tuple", marker: pointerTo(uint64(0)), claimOrigin: pointerTo(lifecycleConsumed), guard: true},
+		{name: "zero reservation publishing tuple", marker: pointerTo(uint64(0)), claimOrigin: pointerTo(lifecyclePublishing), guard: true},
+		{name: "marker only", marker: pointerTo(uint64(10 * time.Second))},
+		{name: "marked claim without guard", marker: pointerTo(uint64(10 * time.Second)), claimOrigin: pointerTo(lifecycleConsumed)},
+		{name: "marked semantic tuple", marker: pointerTo(uint64(10 * time.Second)), claimOrigin: pointerTo(lifecycleConsumed), guard: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			owner := Identity{TID: 3, PID: 2, Namespace: 1}
+			key := stateKey{Owner: owner, Generation: 10}
+			terminal := terminalValue{
+				Generation:          key.Generation,
+				ObservedMonotonicNS: uint64(40 * time.Second),
+				ProcessIncarnation:  testProcessIncarnation,
+				Lifecycle:           lifecycleConsumed,
+			}
+			cleanup := testCleanup(testMapHandler(nil, nil, nil))
+			cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+			terminals := cleanup.maps.terminals.(*fakeBridgeMap)
+			claims := cleanup.maps.claims.(*fakeBridgeMap)
+			guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+			markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+			terminals.values[owner] = terminal
+			if test.claimOrigin != nil {
+				claims.values[key] = generationClaim{
+					ObservedMonotonicNS: uint64(10 * time.Second),
+					ProcessIncarnation:  terminal.ProcessIncarnation,
+					Lifecycle:           lifecycleCleanup,
+					Reserved:            [7]byte{*test.claimOrigin},
+				}
+			}
+			if test.guard {
+				guards.values[owner] = generationClaim{
+					ObservedMonotonicNS: uint64(10 * time.Second),
+					ProcessIncarnation:  key.Generation,
+					Lifecycle:           lifecycleCleanup,
+					Reserved:            [7]byte{lifecyclePublishing},
+				}
+			}
+			if test.marker != nil {
+				markers.values[key] = *test.marker
+			}
+			claimsBefore := maps.Clone(claims.values)
+			guardsBefore := maps.Clone(guards.values)
+			markersBefore := maps.Clone(markers.values)
+
+			stats, err := cleanup.SweepWithStats()
+			require.NoError(t, err)
+			assert.Equal(t, CleanupStats{}, stats)
+			assert.Equal(t, terminal, terminals.values[owner])
+			assert.Equal(t, claimsBefore, claims.values)
+			assert.Equal(t, guardsBefore, guards.values)
+			assert.Equal(t, markersBefore, markers.values)
+			assert.Zero(t, claims.updateCount)
+			assert.Zero(t, claims.deleteCount)
+			assert.Zero(t, guards.updateCount)
+			assert.Zero(t, guards.deleteCount)
+			assert.Zero(t, markers.updateCount)
+			assert.Zero(t, markers.deleteCount)
+		})
+	}
+}
+
+func TestCleanupTerminalInsertedAfterEnumerationBlocksGenericRecovery(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	terminal := terminalValue{
+		Generation:          key.Generation,
+		ObservedMonotonicNS: uint64(40 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleConsumed,
+	}
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+	terminals := cleanup.maps.terminals.(*fakeBridgeMap)
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+	markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+	guards.values[owner] = generationClaim{
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  key.Generation,
+		Lifecycle:           lifecycleCleanup,
+		Reserved:            [7]byte{lifecyclePublishing},
+	}
+	markers.values[key] = uint64(10 * time.Second)
+	terminals.afterIterate = func() { terminals.values[owner] = terminal }
+
+	stats, err := cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Equal(t, terminal, terminals.values[owner])
+	assert.Empty(t, claims.values)
+	assert.Zero(t, claims.updateCount)
+	assert.Len(t, guards.values, 1)
+	assert.Zero(t, guards.deleteCount)
+	assert.Equal(t, uint64(10*time.Second), markers.values[key])
+	assert.Zero(t, markers.deleteCount)
+}
+
+func TestCleanupFailedTerminalClaimDoesNotFallThroughToGenericRecovery(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		committed bool
+	}{
+		{name: "not committed"},
+		{name: "committed with error", committed: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			owner := Identity{TID: 3, PID: 2, Namespace: 1}
+			key := stateKey{Owner: owner, Generation: 10}
+			terminal := terminalValue{
+				Generation:          key.Generation,
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  testProcessIncarnation,
+				Lifecycle:           lifecycleConsumed,
+			}
+			guard := generationClaim{
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  key.Generation,
+				Lifecycle:           lifecycleCleanup,
+				Reserved:            [7]byte{lifecyclePublishing},
+			}
+			cleanup := testCleanup(testMapHandler(nil, nil, nil))
+			cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+			terminals := cleanup.maps.terminals.(*fakeBridgeMap)
+			claims := cleanup.maps.claims.(*fakeBridgeMap)
+			guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+			markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+			terminals.values[owner] = terminal
+			guards.values[owner] = guard
+			markers.values[key] = uint64(10 * time.Second)
+			injected := errors.New("injected terminal claim failure")
+			if test.committed {
+				claims.updateCommitErr = injected
+			} else {
+				claims.updateErr = injected
+			}
+
+			stats, err := cleanup.SweepWithStats()
+			require.ErrorContains(t, err, injected.Error())
+			assert.Equal(t, CleanupStats{}, stats)
+			assert.Equal(t, terminal, terminals.values[owner])
+			assert.Equal(t, guard, guards.values[owner])
+			assert.Equal(t, uint64(10*time.Second), markers.values[key])
+			assert.Equal(t, 1, claims.updateCount)
+			if test.committed {
+				claim, ok := claims.values[key].(generationClaim)
+				require.True(t, ok)
+				assert.Equal(t, terminal.ProcessIncarnation, claim.ProcessIncarnation)
+				assert.Equal(t, [7]byte{terminal.Lifecycle}, claim.Reserved)
+			} else {
+				assert.Empty(t, claims.values)
+			}
+		})
+	}
+}
+
+func TestCleanupArtifactClaimPinsTerminalInsertionAndReplacement(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		seed        bool
+		installHook func(*fakeBridgeMap, Identity, terminalValue) func() bool
+	}{
+		{
+			name: "inserted after initial miss",
+			installHook: func(terminals *fakeBridgeMap, owner Identity, terminal terminalValue) func() bool {
+				injected := false
+				terminals.afterLookupResult = func(key any, err error) {
+					if !injected && key == owner && errors.Is(err, ebpf.ErrKeyNotExist) {
+						injected = true
+						terminals.values[owner] = terminal
+					}
+				}
+				return func() bool { return injected }
+			},
+		},
+		{
+			name: "retained terminal replaced during revalidation",
+			seed: true,
+			installHook: func(terminals *fakeBridgeMap, owner Identity, terminal terminalValue) func() bool {
+				injected := false
+				terminals.afterLookup = func(count int) {
+					if count == 2 {
+						injected = true
+						replacement := terminal
+						replacement.ProcessIncarnation++
+						terminals.values[owner] = replacement
+					}
+				}
+				return func() bool { return injected }
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			owner := Identity{TID: 3, PID: 2, Namespace: 1}
+			key := stateKey{Owner: owner, Generation: 10}
+			terminal := terminalValue{
+				Generation:          key.Generation,
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  testProcessIncarnation,
+				Lifecycle:           lifecycleConsumed,
+			}
+			stateProcessIncarnation := key.Generation
+			if test.seed {
+				stateProcessIncarnation = terminal.ProcessIncarnation
+			}
+			state := stateValue{
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  stateProcessIncarnation,
+			}
+			cleanup := testCleanup(testMapHandler(nil, nil, nil))
+			cleanup.monoTimeNow = func() time.Duration { return 100 * time.Second }
+			cleanup.maps.states.(*fakeBridgeMap).values[key] = state
+			seedAgedGenerationCleanupFence(t, cleanup, key, state.ProcessIncarnation)
+			if test.seed {
+				claim := cleanup.maps.claims.(*fakeBridgeMap).values[key].(generationClaim)
+				claim.Reserved[0] = terminal.Lifecycle
+				cleanup.maps.claims.(*fakeBridgeMap).values[key] = claim
+			}
+			terminals := cleanup.maps.terminals.(*fakeBridgeMap)
+			if test.seed {
+				terminals.values[owner] = terminal
+			}
+			injected := test.installHook(terminals, owner, terminal)
+			claimsBefore := maps.Clone(cleanup.maps.claims.(*fakeBridgeMap).values)
+			guardsBefore := maps.Clone(cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+			markersBefore := maps.Clone(cleanup.maps.ambiguity.(*fakeBridgeMap).values)
+
+			cleaned, err := cleanup.quarantineMalformedState(key, state)
+			require.NoError(t, err)
+			require.True(t, injected())
+			assert.False(t, cleaned)
+			assert.Equal(t, state, cleanup.maps.states.(*fakeBridgeMap).values[key])
+			assert.Equal(t, claimsBefore, cleanup.maps.claims.(*fakeBridgeMap).values)
+			assert.Equal(t, guardsBefore, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+			assert.Equal(t, markersBefore, cleanup.maps.ambiguity.(*fakeBridgeMap).values)
+			assert.Contains(t, terminals.values, owner)
+		})
+	}
+}
+
+func TestCleanupInvalidLifecycleTerminalUsesFullRecoveryFence(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	terminal := terminalValue{
+		Generation:          key.Generation,
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleActive,
+	}
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+	cleanup.maps.terminals.(*fakeBridgeMap).values[owner] = terminal
+	cleanup.maps.ambiguity.(*fakeBridgeMap).values[key] = uint64(10 * time.Second)
+
+	stats, err := cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Equal(t, terminal, cleanup.maps.terminals.(*fakeBridgeMap).values[owner])
+	assert.Contains(t, cleanup.maps.claims.(*fakeBridgeMap).values, key)
+	assert.Contains(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values, owner)
+	assert.Equal(t, uint64(10*time.Second),
+		cleanup.maps.ambiguity.(*fakeBridgeMap).values[key])
+}
+
+func TestCleanupValidTerminalRecoversOnlyMatchingExistingGuard(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	terminal := terminalValue{
+		Generation:          key.Generation,
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleConsumed,
+	}
+	matchingGuard := generationClaim{
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  key.Generation,
+		Lifecycle:           lifecycleCleanup,
+		Reserved:            [7]byte{lifecyclePublishing},
+	}
+
+	t.Run("matching guard", func(t *testing.T) {
+		cleanup := testCleanup(testMapHandler(nil, nil, nil))
+		now := 41 * time.Second
+		cleanup.monoTimeNow = func() time.Duration { return now }
+		cleanup.maps.terminals.(*fakeBridgeMap).values[owner] = terminal
+		cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner] = matchingGuard
+		cleanup.maps.ambiguity.(*fakeBridgeMap).values[key] = uint64(10 * time.Second)
+
+		stats, err := cleanup.SweepWithStats()
+		require.NoError(t, err)
+		assert.Equal(t, CleanupStats{}, stats)
+		assert.Equal(t, terminal, cleanup.maps.terminals.(*fakeBridgeMap).values[owner])
+		claim, present := cleanup.maps.claims.(*fakeBridgeMap).values[key].(generationClaim)
+		require.True(t, present)
+		assert.Equal(t, terminal.ProcessIncarnation, claim.ProcessIncarnation)
+		assert.Equal(t, [7]byte{terminal.Lifecycle}, claim.Reserved)
+		assert.Equal(t, matchingGuard,
+			cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner])
+		assert.Equal(t, uint64(10*time.Second),
+			cleanup.maps.ambiguity.(*fakeBridgeMap).values[key])
+
+		now = 72*time.Second + time.Nanosecond
+		stats, err = cleanup.SweepWithStats()
+		require.NoError(t, err)
+		assert.Equal(t, CleanupStats{}, stats)
+		assert.Equal(t, terminal, cleanup.maps.terminals.(*fakeBridgeMap).values[owner])
+		assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+		assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+		assert.Empty(t, cleanup.maps.ambiguity.(*fakeBridgeMap).values)
+	})
+
+	t.Run("foreign guard", func(t *testing.T) {
+		foreign := matchingGuard
+		foreign.ProcessIncarnation++
+		foreign.ObservedMonotonicNS = uint64(40 * time.Second)
+		cleanup := testCleanup(testMapHandler(nil, nil, nil))
+		cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+		cleanup.maps.terminals.(*fakeBridgeMap).values[owner] = terminal
+		cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner] = foreign
+
+		stats, err := cleanup.SweepWithStats()
+		require.NoError(t, err)
+		assert.Equal(t, CleanupStats{}, stats)
+		assert.Equal(t, terminal, cleanup.maps.terminals.(*fakeBridgeMap).values[owner])
+		assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+		assert.Equal(t, foreign, cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner])
+		assert.Empty(t, cleanup.maps.ambiguity.(*fakeBridgeMap).values)
+	})
+}
+
+func TestCleanupValidTerminalRetiresCrashFenceTails(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		withClaim  bool
+		withReplay bool
+	}{
+		{name: "claim and guard", withClaim: true, withReplay: true},
+		{name: "guard only"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			owner := Identity{TID: 3, PID: 2, Namespace: 1}
+			key := stateKey{Owner: owner, Generation: 10}
+			terminal := terminalValue{
+				Generation:          key.Generation,
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  testProcessIncarnation,
+				Lifecycle:           lifecycleConsumed,
+			}
+			claim := generationClaim{
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  terminal.ProcessIncarnation,
+				Lifecycle:           lifecycleCleanup,
+				Reserved:            [7]byte{terminal.Lifecycle},
+			}
+			guard := generationClaim{
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  key.Generation,
+				Lifecycle:           lifecycleCleanup,
+				Reserved:            [7]byte{lifecyclePublishing},
+			}
+			cleanup := testCleanup(testMapHandler(nil, nil, nil))
+			cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+			cleanup.maps.terminals.(*fakeBridgeMap).values[owner] = terminal
+			cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner] = guard
+			if test.withClaim {
+				cleanup.maps.claims.(*fakeBridgeMap).values[key] = claim
+			}
+			if test.withReplay {
+				replayKey := aliasReplayKeyForTerminal(key, terminal)
+				cleanup.maps.aliasReplays.(*fakeBridgeMap).values[replayKey] =
+					boundAliasReplayForTest(aliasReplayValue{
+						TransitionMonotonicNS: uint64(10 * time.Second),
+						References:            1,
+						Lifecycle:             terminal.Lifecycle,
+					})
+			}
+
+			stats, err := cleanup.SweepWithStats()
+			require.NoError(t, err)
+			assert.Equal(t, CleanupStats{}, stats)
+			assert.Equal(t, terminal, cleanup.maps.terminals.(*fakeBridgeMap).values[owner])
+			assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+			assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+			assert.Empty(t, cleanup.maps.ambiguity.(*fakeBridgeMap).values)
+		})
+	}
+}
+
+func TestCleanupTerminalUpgradesStrandedExactTailBeforeRetirement(t *testing.T) {
+	for _, markerPresent := range []bool{false, true} {
+		name := "marker absent"
+		if markerPresent {
+			name = "marker present"
+		}
+		t.Run(name, func(t *testing.T) {
+			owner := Identity{TID: 3, PID: 2, Namespace: 1}
+			key := stateKey{Owner: owner, Generation: 10}
+			terminal := terminalValue{
+				Generation:          key.Generation,
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  testProcessIncarnation,
+				Lifecycle:           lifecycleConsumed,
+			}
+			guard := generationClaim{
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  key.Generation,
+				Lifecycle:           lifecycleCleanup,
+				Reserved:            [7]byte{lifecyclePublishing},
+			}
+			cleanup := testCleanup(testMapHandler(nil, nil, nil))
+			now := 41 * time.Second
+			cleanup.monoTimeNow = func() time.Duration { return now }
+			terminals := cleanup.maps.terminals.(*fakeBridgeMap)
+			claims := cleanup.maps.claims.(*fakeBridgeMap)
+			guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+			markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+			replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+			terminals.values[owner] = terminal
+			claims.values[key] = exactMarkerTailClaimForTest(key, uint64(10*time.Second))
+			guards.values[owner] = guard
+			if markerPresent {
+				markers.values[key] = uint64(10 * time.Second)
+			}
+			replayKey := aliasReplayKeyForTerminal(key, terminal)
+			replays.values[replayKey] = activeAliasReplayForTest()
+
+			stats, err := cleanup.SweepWithStats()
+			require.NoError(t, err)
+			assert.Equal(t, CleanupStats{}, stats)
+			upgraded := claims.values[key].(generationClaim)
+			assert.True(t, validGenerationCleanupClaim(upgraded))
+			assert.Equal(t, terminal.ProcessIncarnation, upgraded.ProcessIncarnation)
+			assert.Equal(t, [7]byte{terminal.Lifecycle}, upgraded.Reserved)
+			assert.Equal(t, uint64(now), upgraded.ObservedMonotonicNS)
+			assert.Equal(t, guard, guards.values[owner])
+			assert.Contains(t, markers.values, key)
+			assert.Equal(t, activeAliasReplayForTest(), replays.values[replayKey])
+
+			now += 30*time.Second + time.Nanosecond
+			stats, err = cleanup.SweepWithStats()
+			require.NoError(t, err)
+			assert.Equal(t, CleanupStats{}, stats)
+			assert.Equal(t, terminal, terminals.values[owner])
+			assert.Empty(t, claims.values)
+			assert.Empty(t, guards.values)
+			assert.Empty(t, markers.values)
+			finalReplay := replays.values[replayKey].(aliasReplayValue)
+			assert.True(t, validAliasReplayFinal(finalReplay))
+			assert.Equal(t, terminal.Lifecycle, finalReplay.Lifecycle)
+		})
+	}
+}
+
+func TestCleanupTerminalReconstructsMarkerAfterExactTailUpgradeFailure(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	terminal := terminalValue{
+		Generation:          key.Generation,
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleConsumed,
+	}
+	guard := generationClaim{
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  key.Generation,
+		Lifecycle:           lifecycleCleanup,
+		Reserved:            [7]byte{lifecyclePublishing},
+	}
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	now := 41 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+	terminals := cleanup.maps.terminals.(*fakeBridgeMap)
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+	markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+	replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+	terminals.values[owner] = terminal
+	claims.values[key] = exactMarkerTailClaimForTest(key, uint64(10*time.Second))
+	guards.values[owner] = guard
+	replayKey := aliasReplayKeyForTerminal(key, terminal)
+	replays.values[replayKey] = activeAliasReplayForTest()
+	injected := errors.New("injected marker reconstruction failure")
+	markers.updateErr = injected
+
+	stats, err := cleanup.SweepWithStats()
+	require.ErrorContains(t, err, injected.Error())
+	assert.Equal(t, CleanupStats{}, stats)
+	upgraded := claims.values[key].(generationClaim)
+	assert.True(t, validGenerationCleanupClaim(upgraded))
+	assert.Equal(t, terminal.ProcessIncarnation, upgraded.ProcessIncarnation)
+	assert.Equal(t, [7]byte{terminal.Lifecycle}, upgraded.Reserved)
+	assert.Empty(t, markers.values)
+	assert.Equal(t, activeAliasReplayForTest(), replays.values[replayKey])
+
+	markers.updateErr = nil
+	now += 30*time.Second + time.Nanosecond
+	stats, err = cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Equal(t, uint64(now), markers.values[key])
+	assert.Equal(t, activeAliasReplayForTest(), replays.values[replayKey])
+
+	now += 30*time.Second + time.Nanosecond
+	stats, err = cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Equal(t, terminal, terminals.values[owner])
+	assert.Empty(t, claims.values)
+	assert.Empty(t, guards.values)
+	assert.Empty(t, markers.values)
+	finalReplay := replays.values[replayKey].(aliasReplayValue)
+	assert.True(t, validAliasReplayFinal(finalReplay))
+	assert.Equal(t, terminal.Lifecycle, finalReplay.Lifecycle)
+}
+
+func TestCleanupTerminalMarkerReconstructionCommittedErrorConverges(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	terminal := terminalValue{
+		Generation:          key.Generation,
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleConsumed,
+	}
+	claim := generationClaim{
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  terminal.ProcessIncarnation,
+		Lifecycle:           lifecycleCleanup,
+		Reserved:            [7]byte{terminal.Lifecycle},
+	}
+	guard := generationClaim{
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  key.Generation,
+		Lifecycle:           lifecycleCleanup,
+		Reserved:            [7]byte{lifecyclePublishing},
+	}
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	now := 41 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+	cleanup.maps.terminals.(*fakeBridgeMap).values[owner] = terminal
+	cleanup.maps.claims.(*fakeBridgeMap).values[key] = claim
+	cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner] = guard
+	replayKey := aliasReplayKeyForTerminal(key, terminal)
+	cleanup.maps.aliasReplays.(*fakeBridgeMap).values[replayKey] = activeAliasReplayForTest()
+	markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+	injected := errors.New("injected committed marker reconstruction failure")
+	markers.updateCommitErr = injected
+
+	stats, err := cleanup.SweepWithStats()
+	require.ErrorContains(t, err, injected.Error())
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Equal(t, uint64(now), markers.values[key])
+	assert.Equal(t, claim, cleanup.maps.claims.(*fakeBridgeMap).values[key])
+	assert.Equal(t, guard, cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner])
+	assert.Equal(t, activeAliasReplayForTest(),
+		cleanup.maps.aliasReplays.(*fakeBridgeMap).values[replayKey])
+
+	markers.updateCommitErr = nil
+	now += 30*time.Second + time.Nanosecond
+	stats, err = cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+	assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+	assert.Empty(t, markers.values)
+	assert.True(t, validAliasReplayFinal(
+		cleanup.maps.aliasReplays.(*fakeBridgeMap).values[replayKey].(aliasReplayValue),
+	))
+}
+
+func TestCleanupTerminalMarkerReconstructionRejectsSuccessorTuple(t *testing.T) {
+	for _, replace := range []string{"claim", "guard", "replay"} {
+		t.Run(replace, func(t *testing.T) {
+			owner := Identity{TID: 3, PID: 2, Namespace: 1}
+			key := stateKey{Owner: owner, Generation: 10}
+			terminal := terminalValue{
+				Generation:          key.Generation,
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  testProcessIncarnation,
+				Lifecycle:           lifecycleConsumed,
+			}
+			claim := generationClaim{
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  terminal.ProcessIncarnation,
+				Lifecycle:           lifecycleCleanup,
+				Reserved:            [7]byte{terminal.Lifecycle},
+			}
+			guard := generationClaim{
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  key.Generation,
+				Lifecycle:           lifecycleCleanup,
+				Reserved:            [7]byte{lifecyclePublishing},
+			}
+			cleanup := testCleanup(testMapHandler(nil, nil, nil))
+			cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+			terminals := cleanup.maps.terminals.(*fakeBridgeMap)
+			claims := cleanup.maps.claims.(*fakeBridgeMap)
+			guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+			markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+			replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+			terminals.values[owner] = terminal
+			claims.values[key] = claim
+			guards.values[owner] = guard
+			replayKey := aliasReplayKeyForTerminal(key, terminal)
+			replays.values[replayKey] = activeAliasReplayForTest()
+			markers.beforeUpdate = func(any, any, ebpf.MapUpdateFlags) {
+				switch replace {
+				case "claim":
+					successor := claim
+					successor.ObservedMonotonicNS++
+					claims.values[key] = successor
+				case "guard":
+					successor := guard
+					successor.ObservedMonotonicNS++
+					guards.values[owner] = successor
+				case "replay":
+					successor := activeAliasReplayForTest()
+					successor.References++
+					replays.values[replayKey] = successor
+				}
+			}
+
+			stats, err := cleanup.SweepWithStats()
+			require.NoError(t, err)
+			assert.Equal(t, CleanupStats{}, stats)
+			assert.Equal(t, uint64(41*time.Second), markers.values[key])
+			assert.Zero(t, claims.deleteCount)
+			assert.Zero(t, guards.deleteCount)
+			assert.Equal(t, terminal, terminals.values[owner])
+		})
+	}
+}
+
+func TestCleanupTerminalExactTailUpgradeNeverReacquiresChangedGuard(t *testing.T) {
+	for _, replace := range []bool{false, true} {
+		name := "removed"
+		if replace {
+			name = "replaced"
+		}
+		t.Run(name, func(t *testing.T) {
+			owner := Identity{TID: 3, PID: 2, Namespace: 1}
+			key := stateKey{Owner: owner, Generation: 10}
+			terminal := terminalValue{
+				Generation:          key.Generation,
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  testProcessIncarnation,
+				Lifecycle:           lifecycleConsumed,
+			}
+			guard := generationClaim{
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  key.Generation,
+				Lifecycle:           lifecycleCleanup,
+				Reserved:            [7]byte{lifecyclePublishing},
+			}
+			cleanup := testCleanup(testMapHandler(nil, nil, nil))
+			cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+			cleanup.maps.terminals.(*fakeBridgeMap).values[owner] = terminal
+			claims := cleanup.maps.claims.(*fakeBridgeMap)
+			guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+			claims.values[key] = exactMarkerTailClaimForTest(key, uint64(10*time.Second))
+			guards.values[owner] = guard
+			claims.afterLookup = func(count int) {
+				if count != 1 {
+					return
+				}
+				if replace {
+					successor := guard
+					successor.ProcessIncarnation++
+					guards.values[owner] = successor
+				} else {
+					delete(guards.values, owner)
+				}
+			}
+
+			stats, err := cleanup.SweepWithStats()
+			require.NoError(t, err)
+			assert.Equal(t, CleanupStats{}, stats)
+			assert.True(t, validExactMarkerTailCleanupClaim(
+				key, claims.values[key].(generationClaim),
+			))
+			assert.Empty(t, cleanup.maps.ambiguity.(*fakeBridgeMap).values)
+			assert.Zero(t, guards.updateCount)
+			if replace {
+				assert.NotEqual(t, guard, guards.values[owner])
+			} else {
+				assert.Empty(t, guards.values)
+			}
+		})
+	}
+}
+
+func TestCleanupTerminalTailNeverRetiresCurrentSweepFenceParts(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	terminal := terminalValue{
+		Generation:          key.Generation,
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleConsumed,
+	}
+	claim := generationClaim{
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  terminal.ProcessIncarnation,
+		Lifecycle:           lifecycleCleanup,
+		Reserved:            [7]byte{terminal.Lifecycle},
+	}
+	guard := generationClaim{
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  key.Generation,
+		Lifecycle:           lifecycleCleanup,
+		Reserved:            [7]byte{lifecyclePublishing},
+	}
+
+	t.Run("claim and guard", func(t *testing.T) {
+		cleanup := testCleanup(testMapHandler(nil, nil, nil))
+		cleanup.generationSnapshotComplete = true
+		cleanup.stateSnapshotComplete = true
+		cleanup.physicalGenerations = map[stateKey]struct{}{}
+		cleanup.currentSweepClaims = map[stateKey]generationClaim{key: claim}
+		cleanup.currentSweepGuards = map[Identity]generationClaim{owner: guard}
+		cleanup.maps.terminals.(*fakeBridgeMap).values[owner] = terminal
+		cleanup.maps.claims.(*fakeBridgeMap).values[key] = claim
+		cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner] = guard
+
+		released, err := cleanup.releaseTerminalClaimGuardTail(
+			key, terminal, claim, guard, 100*time.Second,
+		)
+		require.NoError(t, err)
+		assert.False(t, released)
+		assert.Equal(t, claim, cleanup.maps.claims.(*fakeBridgeMap).values[key])
+		assert.Equal(t, guard, cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner])
+	})
+
+	t.Run("guard only", func(t *testing.T) {
+		cleanup := testCleanup(testMapHandler(nil, nil, nil))
+		cleanup.generationSnapshotComplete = true
+		cleanup.stateSnapshotComplete = true
+		cleanup.physicalGenerations = map[stateKey]struct{}{}
+		cleanup.currentSweepGuards = map[Identity]generationClaim{owner: guard}
+		cleanup.maps.terminals.(*fakeBridgeMap).values[owner] = terminal
+		cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner] = guard
+
+		released, err := cleanup.releaseTerminalGuardTail(
+			key, terminal, guard, 100*time.Second,
+		)
+		require.NoError(t, err)
+		assert.False(t, released)
+		assert.Equal(t, guard, cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner])
+	})
+}
+
+func TestCleanupGuardedTerminalFenceNeverAdoptsCurrentSweepMarker(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	claim := generationClaim{
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleCleanup,
+		Reserved:            [7]byte{lifecycleConsumed},
+	}
+	guard := generationClaim{
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  key.Generation,
+		Lifecycle:           lifecycleCleanup,
+		Reserved:            [7]byte{lifecyclePublishing},
+	}
+	markedAt := uint64(10 * time.Second)
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	cleanup.monoTimeNow = func() time.Duration { return 100 * time.Second }
+	cleanup.currentSweepAmbiguities = map[stateKey]uint64{key: markedAt}
+	cleanup.maps.claims.(*fakeBridgeMap).values[key] = claim
+	cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner] = guard
+	cleanup.maps.ambiguity.(*fakeBridgeMap).values[key] = markedAt
+
+	ownership, ready, err := cleanup.claimGenerationCleanupWithGuard(
+		key, claim.ProcessIncarnation, claim.Reserved[0], guard, markedAt,
+		func() (bool, error) { return true, nil },
+	)
+	require.NoError(t, err)
+	assert.False(t, ready)
+	assert.False(t, ownership.ready)
+	assert.Equal(t, markedAt, cleanup.maps.ambiguity.(*fakeBridgeMap).values[key])
+}
+
+func TestCleanupTerminalClaimDeleteFailureRetainsGuardForNextSweep(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		committed bool
+	}{
+		{name: "not committed"},
+		{name: "committed with error", committed: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			owner := Identity{TID: 3, PID: 2, Namespace: 1}
+			key := stateKey{Owner: owner, Generation: 10}
+			terminal := terminalValue{
+				Generation:          key.Generation,
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  testProcessIncarnation,
+				Lifecycle:           lifecycleConsumed,
+			}
+			claim := generationClaim{
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  terminal.ProcessIncarnation,
+				Lifecycle:           lifecycleCleanup,
+				Reserved:            [7]byte{terminal.Lifecycle},
+			}
+			guard := generationClaim{
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  key.Generation,
+				Lifecycle:           lifecycleCleanup,
+				Reserved:            [7]byte{lifecyclePublishing},
+			}
+			cleanup := testCleanup(testMapHandler(nil, nil, nil))
+			cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+			cleanup.maps.terminals.(*fakeBridgeMap).values[owner] = terminal
+			claims := cleanup.maps.claims.(*fakeBridgeMap)
+			guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+			claims.values[key] = claim
+			guards.values[owner] = guard
+			injected := errors.New("injected terminal claim deletion failure")
+			if test.committed {
+				claims.deleteCommitErr = injected
+			} else {
+				claims.deleteErr = injected
+			}
+
+			stats, err := cleanup.SweepWithStats()
+			require.ErrorContains(t, err, injected.Error())
+			assert.Equal(t, CleanupStats{}, stats)
+			if test.committed {
+				assert.NotContains(t, claims.values, key)
+			} else {
+				assert.Equal(t, claim, claims.values[key])
+			}
+			assert.Equal(t, guard, guards.values[owner])
+			assert.Zero(t, guards.deleteCount)
+			assert.Equal(t, terminal, cleanup.maps.terminals.(*fakeBridgeMap).values[owner])
+
+			claims.deleteErr = nil
+			claims.deleteCommitErr = nil
+			stats, err = cleanup.SweepWithStats()
+			require.NoError(t, err)
+			assert.Equal(t, CleanupStats{}, stats)
+			assert.Empty(t, claims.values)
+			assert.Empty(t, guards.values)
+			assert.Equal(t, terminal, cleanup.maps.terminals.(*fakeBridgeMap).values[owner])
+		})
+	}
+}
+
+func TestCleanupTerminalMarkerDeleteFailureRetainsLaterFences(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		committed bool
+	}{
+		{name: "not committed"},
+		{name: "committed with error", committed: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			owner := Identity{TID: 3, PID: 2, Namespace: 1}
+			key := stateKey{Owner: owner, Generation: 10}
+			terminal := terminalValue{
+				Generation:          key.Generation,
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  testProcessIncarnation,
+				Lifecycle:           lifecycleConsumed,
+			}
+			claim := generationClaim{
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  terminal.ProcessIncarnation,
+				Lifecycle:           lifecycleCleanup,
+				Reserved:            [7]byte{terminal.Lifecycle},
+			}
+			guard := generationClaim{
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  key.Generation,
+				Lifecycle:           lifecycleCleanup,
+				Reserved:            [7]byte{lifecyclePublishing},
+			}
+			cleanup := testCleanup(testMapHandler(nil, nil, nil))
+			cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+			cleanup.maps.terminals.(*fakeBridgeMap).values[owner] = terminal
+			claims := cleanup.maps.claims.(*fakeBridgeMap)
+			guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+			markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+			claims.values[key] = claim
+			guards.values[owner] = guard
+			markers.values[key] = uint64(10 * time.Second)
+			injected := errors.New("injected terminal marker deletion failure")
+			if test.committed {
+				markers.deleteCommitErr = injected
+			} else {
+				markers.deleteErr = injected
+			}
+
+			stats, err := cleanup.SweepWithStats()
+			require.ErrorContains(t, err, injected.Error())
+			assert.Equal(t, CleanupStats{}, stats)
+			if test.committed {
+				assert.NotContains(t, markers.values, key)
+			} else {
+				assert.Equal(t, uint64(10*time.Second), markers.values[key])
+			}
+			assert.Equal(t, claim, claims.values[key])
+			assert.Equal(t, guard, guards.values[owner])
+			assert.Zero(t, claims.deleteCount)
+			assert.Zero(t, guards.deleteCount)
+
+			markers.deleteErr = nil
+			markers.deleteCommitErr = nil
+			stats, err = cleanup.SweepWithStats()
+			require.NoError(t, err)
+			assert.Equal(t, CleanupStats{}, stats)
+			assert.Empty(t, markers.values)
+			assert.Empty(t, claims.values)
+			assert.Empty(t, guards.values)
+			assert.Equal(t, terminal, cleanup.maps.terminals.(*fakeBridgeMap).values[owner])
+		})
+	}
+}
+
+func TestCleanupTerminalGuardDeleteFailurePreservesTerminal(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		committed bool
+	}{
+		{name: "not committed"},
+		{name: "committed with error", committed: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			owner := Identity{TID: 3, PID: 2, Namespace: 1}
+			key := stateKey{Owner: owner, Generation: 10}
+			terminal := terminalValue{
+				Generation:          key.Generation,
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  testProcessIncarnation,
+				Lifecycle:           lifecycleConsumed,
+			}
+			guard := generationClaim{
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  key.Generation,
+				Lifecycle:           lifecycleCleanup,
+				Reserved:            [7]byte{lifecyclePublishing},
+			}
+			cleanup := testCleanup(testMapHandler(nil, nil, nil))
+			cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+			cleanup.maps.terminals.(*fakeBridgeMap).values[owner] = terminal
+			guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+			guards.values[owner] = guard
+			injected := errors.New("injected terminal guard deletion failure")
+			if test.committed {
+				guards.deleteCommitErr = injected
+			} else {
+				guards.deleteErr = injected
+			}
+
+			stats, err := cleanup.SweepWithStats()
+			require.ErrorContains(t, err, injected.Error())
+			assert.Equal(t, CleanupStats{}, stats)
+			if test.committed {
+				assert.Empty(t, guards.values)
+			} else {
+				assert.Equal(t, guard, guards.values[owner])
+			}
+			assert.Equal(t, terminal, cleanup.maps.terminals.(*fakeBridgeMap).values[owner])
+
+			guards.deleteErr = nil
+			guards.deleteCommitErr = nil
+			stats, err = cleanup.SweepWithStats()
+			require.NoError(t, err)
+			assert.Equal(t, CleanupStats{}, stats)
+			assert.Empty(t, guards.values)
+			assert.Equal(t, terminal, cleanup.maps.terminals.(*fakeBridgeMap).values[owner])
+		})
+	}
+}
+
+func TestCleanupTerminalClaimTailPinsAuthorityAfterClaimRelease(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	terminal := terminalValue{
+		Generation:          key.Generation,
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleConsumed,
+	}
+	claim := generationClaim{
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  terminal.ProcessIncarnation,
+		Lifecycle:           lifecycleCleanup,
+		Reserved:            [7]byte{terminal.Lifecycle},
+	}
+	guard := generationClaim{
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  key.Generation,
+		Lifecycle:           lifecycleCleanup,
+		Reserved:            [7]byte{lifecyclePublishing},
+	}
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+	terminals := cleanup.maps.terminals.(*fakeBridgeMap)
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+	terminals.values[owner] = terminal
+	claims.values[key] = claim
+	guards.values[owner] = guard
+	foreign := terminal
+	foreign.ProcessIncarnation++
+	claims.afterDelete = func(deleted any) {
+		if deleted == key {
+			terminals.values[owner] = foreign
+		}
+	}
+
+	stats, err := cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Empty(t, claims.values)
+	assert.Equal(t, guard, guards.values[owner])
+	assert.Zero(t, guards.deleteCount)
+	assert.Equal(t, foreign, terminals.values[owner])
+
+	claims.afterDelete = nil
+	terminals.values[owner] = terminal
+	stats, err = cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Empty(t, claims.values)
+	assert.Empty(t, guards.values)
+	assert.Equal(t, terminal, terminals.values[owner])
+}
+
+func TestCleanupTerminalFenceRetirementUsesOnlyExactReplay(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		replay       aliasReplayValue
+		hasReplay    bool
+		wantReleased bool
+	}{
+		{name: "missing", wantReleased: true},
+		{
+			name: "active finalized",
+			replay: boundAliasReplayForTest(aliasReplayValue{
+				TransitionMonotonicNS: uint64(10 * time.Second),
+				References:            1,
+				Lifecycle:             lifecycleActive,
+			}),
+			hasReplay:    true,
+			wantReleased: true,
+		},
+		{
+			name: "tagged publishing finalized",
+			replay: boundAliasReplayForTest(aliasReplayValue{
+				TransitionMonotonicNS: uint64(10 * time.Second),
+				References:            1,
+				Lifecycle:             lifecyclePublishing,
+				DesiredLifecycle:      lifecycleConsumed,
+				ProducerTag:           generationGoProducerTag,
+			}),
+			hasReplay:    true,
+			wantReleased: true,
+		},
+		{
+			name: "untagged publishing blocks",
+			replay: boundAliasReplayForTest(aliasReplayValue{
+				TransitionMonotonicNS: uint64(10 * time.Second),
+				References:            1,
+				Lifecycle:             lifecyclePublishing,
+				DesiredLifecycle:      lifecycleConsumed,
+			}),
+			hasReplay: true,
+		},
+		{
+			name: "wrong final lifecycle blocks",
+			replay: boundAliasReplayForTest(aliasReplayValue{
+				TransitionMonotonicNS: uint64(10 * time.Second),
+				References:            1,
+				Lifecycle:             lifecycleStale,
+			}),
+			hasReplay: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			owner := Identity{TID: 3, PID: 2, Namespace: 1}
+			key := stateKey{Owner: owner, Generation: 10}
+			terminal := terminalValue{
+				Generation:          key.Generation,
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  testProcessIncarnation,
+				Lifecycle:           lifecycleConsumed,
+			}
+			claim := generationClaim{
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  terminal.ProcessIncarnation,
+				Lifecycle:           lifecycleCleanup,
+				Reserved:            [7]byte{terminal.Lifecycle},
+			}
+			guard := generationClaim{
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  key.Generation,
+				Lifecycle:           lifecycleCleanup,
+				Reserved:            [7]byte{lifecyclePublishing},
+			}
+			cleanup := testCleanup(testMapHandler(nil, nil, nil))
+			cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+			cleanup.maps.terminals.(*fakeBridgeMap).values[owner] = terminal
+			cleanup.maps.claims.(*fakeBridgeMap).values[key] = claim
+			cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner] = guard
+			cleanup.maps.ambiguity.(*fakeBridgeMap).values[key] = uint64(10 * time.Second)
+			replayKey := aliasReplayKeyForTerminal(key, terminal)
+			replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+			if test.hasReplay {
+				replays.values[replayKey] = test.replay
+			}
+			unrelatedKey := replayKey
+			unrelatedKey.ProcessIncarnation++
+			unrelated := activeAliasReplayForTest()
+			replays.values[unrelatedKey] = unrelated
+
+			stats, err := cleanup.SweepWithStats()
+			require.NoError(t, err)
+			assert.Equal(t, CleanupStats{}, stats)
+			assert.Equal(t, terminal, cleanup.maps.terminals.(*fakeBridgeMap).values[owner])
+			assert.Equal(t, unrelated, replays.values[unrelatedKey])
+			if test.wantReleased {
+				assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+				assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+				assert.Empty(t, cleanup.maps.ambiguity.(*fakeBridgeMap).values)
+				if test.hasReplay {
+					final := replays.values[replayKey].(aliasReplayValue)
+					assert.True(t, validAliasReplayFinal(final))
+					assert.Equal(t, terminal.Lifecycle, final.Lifecycle)
+				}
+			} else {
+				assert.Equal(t, claim, cleanup.maps.claims.(*fakeBridgeMap).values[key])
+				assert.Equal(t, guard, cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner])
+				assert.Equal(t, uint64(10*time.Second),
+					cleanup.maps.ambiguity.(*fakeBridgeMap).values[key])
+			}
+		})
+	}
+}
+
+func TestCleanupAgedTerminalMarkerTailRequiresMatchingGuard(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	terminal := terminalValue{
+		Generation:          key.Generation,
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleConsumed,
+	}
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	now := 41 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+	cleanup.maps.terminals.(*fakeBridgeMap).values[owner] = terminal
+	cleanup.maps.ambiguity.(*fakeBridgeMap).values[key] = uint64(10 * time.Second)
+
+	stats, err := cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Equal(t, terminal, cleanup.maps.terminals.(*fakeBridgeMap).values[owner])
+	assert.Equal(t, uint64(10*time.Second),
+		cleanup.maps.ambiguity.(*fakeBridgeMap).values[key])
+	assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+	assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+
+	now = 72*time.Second + time.Nanosecond
+	stats, err = cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Equal(t, terminal, cleanup.maps.terminals.(*fakeBridgeMap).values[owner])
+	assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+	assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+	assert.Equal(t, uint64(10*time.Second),
+		cleanup.maps.ambiguity.(*fakeBridgeMap).values[key])
+}
+
+func TestCleanupMarkerFreeExactTailRetainsTerminalAndNeverCreatesGuard(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	terminal := terminalValue{
+		Generation:          key.Generation,
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleConsumed,
+	}
+	claim := exactMarkerTailClaimForTest(key, uint64(10*time.Second))
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+	cleanup.maps.terminals.(*fakeBridgeMap).values[owner] = terminal
+	cleanup.maps.claims.(*fakeBridgeMap).values[key] = claim
+	guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+
+	stats, err := cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Equal(t, terminal, cleanup.maps.terminals.(*fakeBridgeMap).values[owner])
+	assert.Equal(t, claim, cleanup.maps.claims.(*fakeBridgeMap).values[key])
+	assert.Empty(t, guards.values)
+	assert.Zero(t, guards.updateCount)
+	assert.Empty(t, cleanup.maps.ambiguity.(*fakeBridgeMap).values)
+}
+
+func TestCleanupExactTailReleasePreservesSuccessorReservation(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	oldClaim := exactMarkerTailClaimForTest(key, uint64(10*time.Second))
+	successor := generationClaim{
+		ObservedMonotonicNS: uint64(41 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleConsumed,
+	}
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+	claims.values[key] = oldClaim
+	claims.afterDelete = func(deleted any) {
+		if deleted == key {
+			claims.values[key] = successor
+			markers.values[key] = uint64(0)
+		}
+	}
+
+	stats, err := cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Equal(t, successor, claims.values[key])
+	assert.Equal(t, uint64(0), markers.values[key])
+	assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+}
+
+func TestCleanupExactTailConvergesAfterMarkerReleaseClaimFailure(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	claim := exactMarkerTailClaimForTest(key, uint64(10*time.Second))
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	now := 41 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+	cleanup.maps.claims.(*fakeBridgeMap).values[key] = claim
+	cleanup.maps.ambiguity.(*fakeBridgeMap).values[key] = uint64(10 * time.Second)
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+	markers.deleteErr = errors.New("injected exact marker release failure")
+
+	stats, err := cleanup.SweepWithStats()
+	require.ErrorContains(t, err, "injected exact marker release failure")
+	assert.Equal(t, CleanupStats{}, stats)
+	refreshed, ok := claims.values[key].(generationClaim)
+	require.True(t, ok)
+	assert.Equal(t, uint64(now), refreshed.ObservedMonotonicNS)
+	assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+	assert.Equal(t, uint64(10*time.Second), markers.values[key])
+
+	markers.deleteErr = nil
+	now = 72*time.Second + time.Nanosecond
+	stats, err = cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	refreshed, ok = claims.values[key].(generationClaim)
+	require.True(t, ok)
+	assert.Equal(t, uint64(now), refreshed.ObservedMonotonicNS)
+	assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+	assert.Empty(t, cleanup.maps.ambiguity.(*fakeBridgeMap).values)
+
+	now += 30*time.Second + time.Nanosecond
+	stats, err = cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Empty(t, claims.values)
+	assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+	assert.Empty(t, cleanup.maps.ambiguity.(*fakeBridgeMap).values)
+}
+
+func TestCleanupExactTailConvergesAfterClaimRefreshFailure(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		committed bool
+	}{
+		{name: "not committed"},
+		{name: "committed with error", committed: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			owner := Identity{TID: 3, PID: 2, Namespace: 1}
+			key := stateKey{Owner: owner, Generation: 10}
+			claim := exactMarkerTailClaimForTest(key, uint64(10*time.Second))
+			cleanup := testCleanup(testMapHandler(nil, nil, nil))
+			now := 41 * time.Second
+			cleanup.monoTimeNow = func() time.Duration { return now }
+			claims := cleanup.maps.claims.(*fakeBridgeMap)
+			markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+			guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+			claims.values[key] = claim
+			markers.values[key] = uint64(10 * time.Second)
+			injected := errors.New("injected exact claim refresh failure")
+			if test.committed {
+				claims.updateCommitErr = injected
+			} else {
+				claims.updateErr = injected
+			}
+
+			stats, err := cleanup.SweepWithStats()
+			require.ErrorContains(t, err, injected.Error())
+			assert.Equal(t, CleanupStats{}, stats)
+			retained, ok := claims.values[key].(generationClaim)
+			require.True(t, ok)
+			if test.committed {
+				assert.Equal(t, uint64(now), retained.ObservedMonotonicNS)
+			} else {
+				assert.Equal(t, claim, retained)
+			}
+			assert.Equal(t, uint64(10*time.Second), markers.values[key])
+			assert.Empty(t, guards.values)
+			assert.Zero(t, guards.updateCount)
+
+			claims.updateErr = nil
+			claims.updateCommitErr = nil
+			if test.committed {
+				// A committed refresh starts a new strict grace interval even when
+				// userspace observed an error.
+				now += 30 * time.Second
+				stats, err = cleanup.SweepWithStats()
+				require.NoError(t, err)
+				assert.Equal(t, CleanupStats{}, stats)
+				assert.Equal(t, retained, claims.values[key])
+				assert.Equal(t, uint64(10*time.Second), markers.values[key])
+				now++
+			}
+
+			stats, err = cleanup.SweepWithStats()
+			require.NoError(t, err)
+			assert.Equal(t, CleanupStats{}, stats)
+			refreshed, ok := claims.values[key].(generationClaim)
+			require.True(t, ok)
+			assert.Equal(t, uint64(now), refreshed.ObservedMonotonicNS)
+			assert.Empty(t, markers.values)
+			assert.Empty(t, guards.values)
+			assert.Zero(t, guards.updateCount)
+
+			now += 30*time.Second + time.Nanosecond
+			stats, err = cleanup.SweepWithStats()
+			require.NoError(t, err)
+			assert.Equal(t, CleanupStats{}, stats)
+			assert.Empty(t, claims.values)
+			assert.Empty(t, markers.values)
+			assert.Empty(t, guards.values)
+			assert.Zero(t, guards.updateCount)
+		})
+	}
+}
+
+func TestCleanupMarkerFreeExactTailRetriesClaimDelete(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	claim := exactMarkerTailClaimForTest(key, uint64(10*time.Second))
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+	claims.values[key] = claim
+	claims.deleteErr = errors.New("injected exact claim deletion failure")
+
+	stats, err := cleanup.SweepWithStats()
+	require.ErrorContains(t, err, claims.deleteErr.Error())
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Equal(t, claim, claims.values[key])
+	assert.Empty(t, cleanup.maps.ambiguity.(*fakeBridgeMap).values)
+	assert.Empty(t, guards.values)
+	assert.Zero(t, guards.updateCount)
+
+	claims.deleteErr = nil
+	stats, err = cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Empty(t, claims.values)
+	assert.Empty(t, cleanup.maps.ambiguity.(*fakeBridgeMap).values)
+	assert.Empty(t, guards.values)
+	assert.Zero(t, guards.updateCount)
+}
+
+func TestCleanupExactTailRetainsClaimWhenPhysicalPayloadAppearsAfterMarkerRelease(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	claim := exactMarkerTailClaimForTest(key, uint64(10*time.Second))
+	handler := testMapHandler(nil, nil, nil)
+	cleanup := testCleanup(handler)
+	now := 41 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+	cleanup.maps.claims.(*fakeBridgeMap).values[key] = claim
+	cleanup.maps.ambiguity.(*fakeBridgeMap).values[key] = uint64(10 * time.Second)
+	connectionKey := connectionInfoNS{
+		Connection: connectionInfo{SourcePort: 3, DestinationPort: 10},
+		NetNS:      owner.Namespace,
+	}
+	cleanup.maps.ambiguity.(*fakeBridgeMap).afterDelete = func(deleted any) {
+		if deleted == key {
+			seedConnectionClaim(handler, connectionKey, owner, key.Generation)
+		}
+	}
+
+	stats, err := cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	refreshed, ok := cleanup.maps.claims.(*fakeBridgeMap).values[key].(generationClaim)
+	require.True(t, ok)
+	assert.Equal(t, uint64(41*time.Second), refreshed.ObservedMonotonicNS)
+	assert.Equal(t, key.Generation, refreshed.ProcessIncarnation)
+	assert.Equal(t, lifecycleCleanup, refreshed.Lifecycle)
+	assert.Equal(t, [7]byte{
+		0: lifecycleAmbiguous,
+		6: generationGoProducerTag,
+	}, refreshed.Reserved)
+	assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+	assert.Empty(t, cleanup.maps.ambiguity.(*fakeBridgeMap).values)
+	assert.Contains(t, cleanup.maps.connections.(*fakeBridgeMap).values, connectionKey)
+	assert.NotEmpty(t, cleanup.maps.cookieConnections.(*fakeBridgeMap).values)
+
+	// The newly published physical root upgrades exact-only E to a full-fence
+	// claim without ever clearing E, and starts a fresh grace interval for G/E.
+	now++
+	stats, err = cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	upgraded, ok := cleanup.maps.claims.(*fakeBridgeMap).values[key].(generationClaim)
+	require.True(t, ok)
+	assert.True(t, validGenerationCleanupClaim(upgraded))
+	assert.False(t, validExactMarkerTailCleanupClaim(key, upgraded))
+	assert.Equal(t, uint64(now), upgraded.ObservedMonotonicNS)
+	assert.Equal(t, key.Generation, upgraded.ProcessIncarnation)
+	assert.Equal(t, [7]byte{lifecycleAmbiguous}, upgraded.Reserved)
+	guard, ok := cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner].(generationClaim)
+	require.True(t, ok)
+	assert.Equal(t, uint64(now), guard.ObservedMonotonicNS)
+	assert.Empty(t, cleanup.maps.ambiguity.(*fakeBridgeMap).values)
+	assert.Contains(t, cleanup.maps.connections.(*fakeBridgeMap).values, connectionKey)
+	assert.NotEmpty(t, cleanup.maps.cookieConnections.(*fakeBridgeMap).values)
+
+	// A later sweep may publish M, but M itself must age before payload deletion.
+	now += 30*time.Second + time.Nanosecond
+	stats, err = cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	markedAt, ok := cleanup.maps.ambiguity.(*fakeBridgeMap).values[key].(uint64)
+	require.True(t, ok)
+	assert.Equal(t, uint64(now), markedAt)
+	assert.Contains(t, cleanup.maps.connections.(*fakeBridgeMap).values, connectionKey)
+	assert.NotEmpty(t, cleanup.maps.cookieConnections.(*fakeBridgeMap).values)
+
+	now += 30*time.Second + time.Nanosecond
+	stats, err = cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Empty(t, cleanup.maps.connections.(*fakeBridgeMap).values)
+	assert.Empty(t, cleanup.maps.cookieConnections.(*fakeBridgeMap).values)
+	assert.Equal(t, upgraded, cleanup.maps.claims.(*fakeBridgeMap).values[key])
+	assert.Equal(t, guard, cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner])
+	assert.Equal(t, markedAt, cleanup.maps.ambiguity.(*fakeBridgeMap).values[key])
+
+	// The physical snapshot that authorized deletion remains fail-closed for the
+	// rest of that sweep. A new complete snapshot can retire M -> E -> G.
+	stats, err = cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+	assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+	assert.Empty(t, cleanup.maps.ambiguity.(*fakeBridgeMap).values)
+}
+
+func TestCleanupExactTailArtifactUpgradeFailureRemainsFailClosed(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		committed bool
+	}{
+		{name: "not committed"},
+		{name: "committed with error", committed: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			owner := Identity{TID: 3, PID: 2, Namespace: 1}
+			key := stateKey{Owner: owner, Generation: 10}
+			connectionKey := connectionInfoNS{
+				Connection: connectionInfo{SourcePort: 3, DestinationPort: 10},
+				NetNS:      owner.Namespace,
+			}
+			handler := testMapHandler(nil, nil, nil)
+			seedConnectionClaim(handler, connectionKey, owner, key.Generation)
+			cleanup := testCleanup(handler)
+			cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+			exact := exactMarkerTailClaimForTest(key, uint64(10*time.Second))
+			claims := cleanup.maps.claims.(*fakeBridgeMap)
+			guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+			markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+			claims.values[key] = exact
+			markers.values[key] = uint64(10 * time.Second)
+			injected := errors.New("injected exact-tail artifact upgrade failure")
+			if test.committed {
+				claims.updateCommitErr = injected
+			} else {
+				claims.updateErr = injected
+			}
+
+			stats, err := cleanup.SweepWithStats()
+			require.ErrorContains(t, err, injected.Error())
+			assert.Equal(t, CleanupStats{}, stats)
+			assert.Len(t, cleanup.maps.connections.(*fakeBridgeMap).values, 1)
+			assert.Len(t, cleanup.maps.cookieConnections.(*fakeBridgeMap).values, 1)
+			assert.Equal(t, uint64(10*time.Second), markers.values[key])
+			assert.Contains(t, guards.values, owner)
+			retained := claims.values[key].(generationClaim)
+			if test.committed {
+				assert.True(t, validGenerationCleanupClaim(retained))
+				assert.False(t, validExactMarkerTailCleanupClaim(key, retained))
+				assert.Equal(t, uint64(41*time.Second), retained.ObservedMonotonicNS)
+			} else {
+				assert.Equal(t, exact, retained)
+			}
+		})
+	}
+}
+
+func TestCleanupExactTailUnverifiableUpgradeStillStartsFreshGrace(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	connectionKey := connectionInfoNS{
+		Connection: connectionInfo{SourcePort: 3, DestinationPort: 10},
+		NetNS:      owner.Namespace,
+	}
+	handler := testMapHandler(nil, nil, nil)
+	seedConnectionClaim(handler, connectionKey, owner, key.Generation)
+	cleanup := testCleanup(handler)
+	now := 41 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+	cleanup.currentSweepClaims = make(map[stateKey]generationClaim)
+	cleanup.currentSweepGuards = make(map[Identity]generationClaim)
+	cleanup.currentSweepAmbiguities = make(map[stateKey]uint64)
+	cleanup.retainedTerminalAuthorities = make(map[stateKey]terminalValue)
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	claims.values[key] = exactMarkerTailClaimForTest(key, uint64(10*time.Second))
+	guard := generationClaim{
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  key.Generation,
+		Lifecycle:           lifecycleCleanup,
+		Reserved:            [7]byte{lifecyclePublishing},
+	}
+	cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner] = guard
+	cleanup.maps.ambiguity.(*fakeBridgeMap).values[key] = uint64(10 * time.Second)
+	root := func() (bool, error) {
+		connection := handler.connections.(*fakeBridgeMap).values[connectionKey].(connectionClaim)
+		return cleanupExactMatches(cleanup.maps.connections, connectionKey, connection)
+	}
+	updateErr := errors.New("injected committed exact-tail upgrade error")
+	lookupErr := errors.New("injected exact-tail upgrade readback error")
+	claims.updateCommitErr = updateErr
+	claims.afterUpdate = func(any, any) { claims.lookupErr = lookupErr }
+	claims.afterLookupResult = func(_ any, err error) {
+		if err == lookupErr {
+			claims.lookupErr = nil
+		}
+	}
+
+	_, ready, err := cleanup.claimGenerationCleanupForArtifact(
+		key, key.Generation, lifecycleAmbiguous, root,
+	)
+	require.ErrorContains(t, err, updateErr.Error())
+	require.ErrorContains(t, err, lookupErr.Error())
+	assert.False(t, ready)
+	replacement := claims.values[key].(generationClaim)
+	assert.True(t, validGenerationCleanupClaim(replacement))
+	assert.Equal(t, uint64(now), replacement.ObservedMonotonicNS)
+	assert.Equal(t, replacement, cleanup.currentSweepClaims[key])
+
+	claims.updateCommitErr = nil
+	claims.afterUpdate = nil
+	claims.afterLookupResult = nil
+	now = 100 * time.Second
+	_, ready, err = cleanup.claimGenerationCleanupForArtifact(
+		key, key.Generation, lifecycleAmbiguous, root,
+	)
+	require.NoError(t, err)
+	assert.False(t, ready)
+	assert.Equal(t, replacement, claims.values[key])
+	assert.Equal(t, guard, cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner])
+	assert.Equal(t, uint64(10*time.Second),
+		cleanup.maps.ambiguity.(*fakeBridgeMap).values[key])
+	assert.Len(t, cleanup.maps.connections.(*fakeBridgeMap).values, 1)
+	assert.Len(t, cleanup.maps.cookieConnections.(*fakeBridgeMap).values, 1)
+}
+
+func TestCleanupExactTailUpgradeAbortUnwindsStrandedGuard(t *testing.T) {
+	for _, markerPresent := range []bool{false, true} {
+		for _, failUpdate := range []bool{false, true} {
+			name := "root disappears after guard"
+			if failUpdate {
+				name = "noncommitted update and root disappears"
+			}
+			if markerPresent {
+				name += " with marker"
+			}
+			t.Run(name, func(t *testing.T) {
+				owner := Identity{TID: 3, PID: 2, Namespace: 1}
+				key := stateKey{Owner: owner, Generation: 10}
+				connectionKey := connectionInfoNS{
+					Connection: connectionInfo{SourcePort: 3, DestinationPort: 10},
+					NetNS:      owner.Namespace,
+				}
+				handler := testMapHandler(nil, nil, nil)
+				seedConnectionClaim(handler, connectionKey, owner, key.Generation)
+				cleanup := testCleanup(handler)
+				now := 41 * time.Second
+				cleanup.monoTimeNow = func() time.Duration { return now }
+				claims := cleanup.maps.claims.(*fakeBridgeMap)
+				guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+				markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+				connections := cleanup.maps.connections.(*fakeBridgeMap)
+				cookies := cleanup.maps.cookieConnections.(*fakeBridgeMap)
+				exact := exactMarkerTailClaimForTest(key, uint64(10*time.Second))
+				claims.values[key] = exact
+				if markerPresent {
+					markers.values[key] = uint64(10 * time.Second)
+				}
+				disappeared := false
+				disappear := func() {
+					if disappeared {
+						return
+					}
+					disappeared = true
+					clear(connections.values)
+					clear(cookies.values)
+				}
+				var injected error
+				if failUpdate {
+					injected = errors.New("injected exact-tail conversion failure")
+					claims.updateErr = injected
+					claims.afterFailedUpdate = disappear
+				} else {
+					guards.afterUpdate = func(any, any) { disappear() }
+				}
+
+				stats, err := cleanup.SweepWithStats()
+				if injected != nil {
+					require.ErrorContains(t, err, injected.Error())
+				} else {
+					require.NoError(t, err)
+				}
+				assert.Equal(t, CleanupStats{}, stats)
+				require.True(t, disappeared)
+				assert.Equal(t, exact, claims.values[key])
+				assert.Contains(t, guards.values, owner)
+				if markerPresent {
+					assert.Equal(t, uint64(10*time.Second), markers.values[key])
+				} else {
+					assert.Empty(t, markers.values)
+				}
+
+				claims.updateErr = nil
+				claims.afterFailedUpdate = nil
+				guards.afterUpdate = nil
+				now += 30*time.Second + time.Nanosecond
+				stats, err = cleanup.SweepWithStats()
+				require.NoError(t, err)
+				assert.Equal(t, CleanupStats{}, stats)
+				assert.Empty(t, guards.values)
+				assert.Equal(t, exact, claims.values[key])
+
+				stats, err = cleanup.SweepWithStats()
+				require.NoError(t, err)
+				assert.Equal(t, CleanupStats{}, stats)
+				if markerPresent {
+					refreshed := claims.values[key].(generationClaim)
+					assert.True(t, validExactMarkerTailCleanupClaim(key, refreshed))
+					assert.Empty(t, markers.values)
+					now += 30*time.Second + time.Nanosecond
+					stats, err = cleanup.SweepWithStats()
+					require.NoError(t, err)
+					assert.Equal(t, CleanupStats{}, stats)
+				}
+				assert.Empty(t, claims.values)
+				assert.Empty(t, guards.values)
+				assert.Empty(t, markers.values)
+			})
+		}
+	}
+}
+
+func TestCleanupExactTailLateStateUsesArtifactReplayProvenance(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	state := stateValue{
+		Lifecycle:           lifecycleActive,
+		Aliases:             2,
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		Connection: connectionInfo{
+			SourcePort: 1234, DestinationPort: 443,
+		},
+		ConnectionNetNS:    42,
+		ProcessIncarnation: testProcessIncarnation,
+	}
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	now := 41 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+	states := cleanup.maps.states.(*fakeBridgeMap)
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+	markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+	replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+	states.values[key] = state
+	claims.values[key] = exactMarkerTailClaimForTest(key, uint64(10*time.Second))
+	replayKey := aliasReplayKeyForState(key, state)
+	replays.values[replayKey] = boundAliasReplayForTest(aliasReplayValue{
+		TransitionMonotonicNS: uint64(10 * time.Second),
+		References:            state.Aliases,
+		Lifecycle:             lifecycleActive,
+	})
+
+	stats, err := cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	upgraded := claims.values[key].(generationClaim)
+	assert.True(t, validGenerationCleanupClaim(upgraded))
+	assert.Equal(t, state.ProcessIncarnation, upgraded.ProcessIncarnation)
+	assert.Equal(t, [7]byte{lifecycleStale}, upgraded.Reserved)
+	assert.Contains(t, guards.values, owner)
+	assert.Empty(t, markers.values)
+	assert.Equal(t, state, states.values[key])
+	assert.Equal(t, lifecycleActive, replays.values[replayKey].(aliasReplayValue).Lifecycle)
+
+	now += 30*time.Second + time.Nanosecond
+	stats, err = cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Contains(t, markers.values, key)
+	assert.Equal(t, state, states.values[key])
+
+	now += 30*time.Second + time.Nanosecond
+	stats, err = cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{Cleaned: 1}, stats)
+	assert.Empty(t, states.values)
+	finalReplay := replays.values[replayKey].(aliasReplayValue)
+	assert.True(t, validAliasReplayFinal(finalReplay))
+	assert.Equal(t, lifecycleStale, finalReplay.Lifecycle)
+	assert.Empty(t, claims.values)
+	assert.Empty(t, guards.values)
+	assert.Empty(t, markers.values)
+}
+
+func TestCleanupExactTailRetainsPostMarkerReleaseAuthority(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		inject func(*Cleanup, stateKey)
+		verify func(*testing.T, *Cleanup, stateKey)
+	}{
+		{
+			name: "identical marker",
+			inject: func(cleanup *Cleanup, key stateKey) {
+				cleanup.maps.ambiguity.(*fakeBridgeMap).values[key] = uint64(10 * time.Second)
+			},
+			verify: func(t *testing.T, cleanup *Cleanup, key stateKey) {
+				t.Helper()
+				assert.Equal(t, uint64(10*time.Second),
+					cleanup.maps.ambiguity.(*fakeBridgeMap).values[key])
+			},
+		},
+		{
+			name: "fresh marker",
+			inject: func(cleanup *Cleanup, key stateKey) {
+				cleanup.maps.ambiguity.(*fakeBridgeMap).values[key] = uint64(41 * time.Second)
+			},
+			verify: func(t *testing.T, cleanup *Cleanup, key stateKey) {
+				t.Helper()
+				assert.Equal(t, uint64(41*time.Second),
+					cleanup.maps.ambiguity.(*fakeBridgeMap).values[key])
+			},
+		},
+		{
+			name: "guard",
+			inject: func(cleanup *Cleanup, key stateKey) {
+				cleanup.maps.ownerGuards.(*fakeBridgeMap).values[key.Owner] = generationClaim{
+					ObservedMonotonicNS: uint64(41 * time.Second),
+					ProcessIncarnation:  key.Generation,
+					Lifecycle:           lifecycleCleanup,
+					Reserved:            [7]byte{lifecyclePublishing},
+				}
+			},
+			verify: func(t *testing.T, cleanup *Cleanup, key stateKey) {
+				t.Helper()
+				assert.Contains(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values, key.Owner)
+			},
+		},
+		{
+			name: "state",
+			inject: func(cleanup *Cleanup, key stateKey) {
+				cleanup.maps.states.(*fakeBridgeMap).values[key] = stateValue{
+					ObservedMonotonicNS: uint64(41 * time.Second),
+				}
+			},
+			verify: func(t *testing.T, cleanup *Cleanup, key stateKey) {
+				t.Helper()
+				assert.Contains(t, cleanup.maps.states.(*fakeBridgeMap).values, key)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			owner := Identity{TID: 3, PID: 2, Namespace: 1}
+			key := stateKey{Owner: owner, Generation: 10}
+			claim := exactMarkerTailClaimForTest(key, uint64(10*time.Second))
+			cleanup := testCleanup(testMapHandler(nil, nil, nil))
+			cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+			cleanup.maps.claims.(*fakeBridgeMap).values[key] = claim
+			cleanup.maps.ambiguity.(*fakeBridgeMap).values[key] = uint64(10 * time.Second)
+			cleanup.maps.ambiguity.(*fakeBridgeMap).afterDelete = func(deleted any) {
+				if deleted == key {
+					test.inject(cleanup, key)
+				}
+			}
+
+			stats, err := cleanup.SweepWithStats()
+			require.NoError(t, err)
+			assert.Equal(t, CleanupStats{}, stats)
+			refreshed, ok := cleanup.maps.claims.(*fakeBridgeMap).values[key].(generationClaim)
+			require.True(t, ok)
+			assert.Equal(t, uint64(41*time.Second), refreshed.ObservedMonotonicNS)
+			assert.Equal(t, [7]byte{
+				0: lifecycleAmbiguous,
+				6: generationGoProducerTag,
+			}, refreshed.Reserved)
+			test.verify(t, cleanup, key)
+		})
+	}
+}
+
+func TestCleanupExactTerminalTailIgnoresUnrelatedReplayEpoch(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	terminal := terminalValue{
+		Generation:          key.Generation,
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleConsumed,
+	}
+	claim := generationClaim{
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  terminal.ProcessIncarnation,
+		Lifecycle:           lifecycleCleanup,
+		Reserved:            [7]byte{terminal.Lifecycle},
+	}
+	guard := generationClaim{
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  key.Generation,
+		Lifecycle:           lifecycleCleanup,
+		Reserved:            [7]byte{lifecyclePublishing},
+	}
+	matchingKey := aliasReplayKey{
+		Owner:               owner,
+		Generation:          key.Generation,
+		ObservedMonotonicNS: terminal.ObservedMonotonicNS,
+		ProcessIncarnation:  terminal.ProcessIncarnation,
+	}
+	conflictingKey := matchingKey
+	conflictingKey.ObservedMonotonicNS--
+	conflictingKey.ProcessIncarnation++
+	matchingReplay := boundAliasReplayForTest(aliasReplayValue{
+		TransitionMonotonicNS: uint64(10 * time.Second),
+		References:            1,
+		Lifecycle:             lifecycleConsumed,
+	})
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+	cleanup.maps.terminals.(*fakeBridgeMap).values[owner] = terminal
+	cleanup.maps.claims.(*fakeBridgeMap).values[key] = claim
+	cleanup.maps.ambiguity.(*fakeBridgeMap).values[key] = uint64(10 * time.Second)
+	cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner] = guard
+	replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+	replays.values[matchingKey] = matchingReplay
+	replays.values[conflictingKey] = activeAliasReplayForTest()
+
+	stats, err := cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Equal(t, terminal, cleanup.maps.terminals.(*fakeBridgeMap).values[owner])
+	assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+	assert.Empty(t, cleanup.maps.ambiguity.(*fakeBridgeMap).values)
+	assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+	assert.Equal(t, matchingReplay, replays.values[matchingKey])
+	assert.Equal(t, activeAliasReplayForTest(), replays.values[conflictingKey])
 }
 
 func TestCleanupReleasesClaimGuardTailWithoutRecreatingMarker(t *testing.T) {
@@ -2582,44 +5037,44 @@ func TestCleanupReleasesClaimGuardTailWithoutRecreatingMarker(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, CleanupStats{}, stats)
 		assert.NotContains(t, claims.values, key)
-		assert.NotContains(t, guards.values, guardKey)
+		assert.Equal(t, guard, guards.values[guardKey])
 		assert.Equal(t, uint64(0), markers.values[key])
 	})
 }
 
-func TestCleanupMarkerOnlyTailRequiresStableAgedAbsenceProof(t *testing.T) {
+func TestCleanupExactMarkerTailClaimRequiresStableAbsenceProof(t *testing.T) {
 	owner := Identity{TID: 3, PID: 2, Namespace: 1}
 	key := stateKey{Owner: owner, Generation: 10}
 	markedAt := uint64(10 * time.Second)
+	claim := exactMarkerTailClaimForTest(key, uint64(41*time.Second))
 	newCleanup := func() *Cleanup {
 		cleanup := testCleanup(testMapHandler(nil, nil, nil))
 		cleanup.generationSnapshotComplete = true
 		cleanup.stateSnapshotComplete = true
 		cleanup.physicalGenerations = make(map[stateKey]struct{})
-		cleanup.currentSweepAmbiguities = make(map[stateKey]uint64)
 		cleanup.maps.ambiguity.(*fakeBridgeMap).values[key] = markedAt
 		return cleanup
 	}
 
-	t.Run("fresh marker", func(t *testing.T) {
+	t.Run("complete", func(t *testing.T) {
 		cleanup := newCleanup()
-		released, err := cleanup.releaseGenerationCleanupMarkerTail(
-			key, markedAt, 11*time.Second,
-		)
+		claimed, err := cleanup.claimGenerationCleanupMarkerTail(key, claim, markedAt)
 		require.NoError(t, err)
-		assert.False(t, released)
+		assert.True(t, claimed)
 		assert.Equal(t, markedAt, cleanup.maps.ambiguity.(*fakeBridgeMap).values[key])
+		assert.Equal(t, claim, cleanup.maps.claims.(*fakeBridgeMap).values[key])
+		assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
 	})
 
 	t.Run("incomplete snapshot", func(t *testing.T) {
 		cleanup := newCleanup()
 		cleanup.stateSnapshotComplete = false
-		released, err := cleanup.releaseGenerationCleanupMarkerTail(
-			key, markedAt, 41*time.Second,
-		)
+		claimed, err := cleanup.claimGenerationCleanupMarkerTail(key, claim, markedAt)
 		require.NoError(t, err)
-		assert.False(t, released)
+		assert.False(t, claimed)
 		assert.Equal(t, markedAt, cleanup.maps.ambiguity.(*fakeBridgeMap).values[key])
+		assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+		assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
 	})
 
 	t.Run("generation artifact", func(t *testing.T) {
@@ -2627,40 +5082,100 @@ func TestCleanupMarkerOnlyTailRequiresStableAgedAbsenceProof(t *testing.T) {
 		cleanup.maps.states.(*fakeBridgeMap).values[key] = stateValue{
 			ObservedMonotonicNS: uint64(5 * time.Second),
 		}
-		released, err := cleanup.releaseGenerationCleanupMarkerTail(
-			key, markedAt, 41*time.Second,
-		)
+		claimed, err := cleanup.claimGenerationCleanupMarkerTail(key, claim, markedAt)
 		require.NoError(t, err)
-		assert.False(t, released)
+		assert.False(t, claimed)
 		assert.Equal(t, markedAt, cleanup.maps.ambiguity.(*fakeBridgeMap).values[key])
+		assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+		assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
 	})
 
-	t.Run("reappearing exact claim", func(t *testing.T) {
+	t.Run("existing exact claim", func(t *testing.T) {
 		cleanup := newCleanup()
 		claims := cleanup.maps.claims.(*fakeBridgeMap)
-		injected := false
-		claims.afterLookupResult = func(lookedUp any, err error) {
-			if injected || lookedUp != key || !errors.Is(err, ebpf.ErrKeyNotExist) {
-				return
-			}
-			injected = true
-			claims.mu.Lock()
-			claims.values[key] = generationClaim{
-				ObservedMonotonicNS: uint64(40 * time.Second),
-				ProcessIncarnation:  testProcessIncarnation,
-				Lifecycle:           lifecycleConsumed,
-			}
-			claims.mu.Unlock()
+		existing := generationClaim{
+			ObservedMonotonicNS: uint64(40 * time.Second),
+			ProcessIncarnation:  testProcessIncarnation,
+			Lifecycle:           lifecycleConsumed,
 		}
-		released, err := cleanup.releaseGenerationCleanupMarkerTail(
-			key, markedAt, 41*time.Second,
-		)
+		claims.values[key] = existing
+		claimed, err := cleanup.claimGenerationCleanupMarkerTail(key, claim, markedAt)
 		require.NoError(t, err)
-		assert.False(t, injected)
-		assert.False(t, released)
+		assert.False(t, claimed)
 		assert.Equal(t, markedAt, cleanup.maps.ambiguity.(*fakeBridgeMap).values[key])
-		assert.NotContains(t, claims.values, key)
+		assert.Equal(t, existing, claims.values[key])
+		assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
 	})
+
+	t.Run("marker replacement retains exact claim", func(t *testing.T) {
+		cleanup := newCleanup()
+		claims := cleanup.maps.claims.(*fakeBridgeMap)
+		markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+		claims.afterUpdate = func(any, any) {
+			markers.values[key] = uint64(40 * time.Second)
+		}
+
+		claimed, err := cleanup.claimGenerationCleanupMarkerTail(key, claim, markedAt)
+		require.NoError(t, err)
+		assert.True(t, claimed)
+		assert.Equal(t, uint64(40*time.Second), markers.values[key])
+		assert.Equal(t, claim, claims.values[key])
+		assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+	})
+
+	for _, test := range []struct {
+		name   string
+		inject func(*Cleanup)
+	}{
+		{
+			name: "marker removal",
+			inject: func(cleanup *Cleanup) {
+				delete(cleanup.maps.ambiguity.(*fakeBridgeMap).values, key)
+			},
+		},
+		{
+			name: "guard publication",
+			inject: func(cleanup *Cleanup) {
+				cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner] = generationClaim{
+					ObservedMonotonicNS: uint64(41 * time.Second),
+					ProcessIncarnation:  key.Generation,
+					Lifecycle:           lifecycleCleanup,
+					Reserved:            [7]byte{lifecyclePublishing},
+				}
+			},
+		},
+		{
+			name: "state publication",
+			inject: func(cleanup *Cleanup) {
+				cleanup.maps.states.(*fakeBridgeMap).values[key] = stateValue{
+					ObservedMonotonicNS: uint64(41 * time.Second),
+				}
+			},
+		},
+		{
+			name: "generation publication",
+			inject: func(cleanup *Cleanup) {
+				cleanup.maps.generations.(*fakeBridgeMap).values[key] = generationIndexValue{
+					Process:             javaProcessIdentity(owner),
+					ObservedMonotonicNS: uint64(41 * time.Second),
+					ProcessIncarnation:  testProcessIncarnation,
+				}
+			},
+		},
+	} {
+		t.Run("after exact claim/"+test.name, func(t *testing.T) {
+			cleanup := newCleanup()
+			claims := cleanup.maps.claims.(*fakeBridgeMap)
+			guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+			claims.afterUpdate = func(any, any) { test.inject(cleanup) }
+
+			claimed, err := cleanup.claimGenerationCleanupMarkerTail(key, claim, markedAt)
+			require.NoError(t, err)
+			assert.True(t, claimed)
+			assert.Equal(t, claim, claims.values[key])
+			assert.Zero(t, guards.updateCount)
+		})
+	}
 }
 
 func TestCleanupReleasesPartialFenceTailsWithoutArtifactAuthority(t *testing.T) {
@@ -3157,7 +5672,7 @@ func TestCleanupMarkedPartialFenceReconstructsMissingClaims(t *testing.T) {
 			owner := Identity{TID: 3, PID: 2, Namespace: 1}
 			key := stateKey{Owner: owner, Generation: 10}
 			cleanup := testCleanup(testMapHandler(nil, nil, nil))
-			now := 41 * time.Second
+			now := 40 * time.Second
 			cleanup.monoTimeNow = func() time.Duration { return now }
 			cleanup.maps.ambiguity.(*fakeBridgeMap).values[key] = uint64(10 * time.Second)
 			if guardPresent {
@@ -3172,32 +5687,59 @@ func TestCleanupMarkedPartialFenceReconstructsMissingClaims(t *testing.T) {
 			stats, err := cleanup.SweepWithStats()
 			require.NoError(t, err)
 			assert.Equal(t, CleanupStats{}, stats)
+			assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+			if guardPresent {
+				assert.Contains(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values, owner)
+			} else {
+				assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+			}
+			assert.Equal(t, uint64(10*time.Second),
+				cleanup.maps.ambiguity.(*fakeBridgeMap).values[key])
+
+			// Reconstruction starts only after the marker crosses the strict
+			// retention boundary.
+			now += time.Nanosecond
+			stats, err = cleanup.SweepWithStats()
+			require.NoError(t, err)
+			assert.Equal(t, CleanupStats{}, stats)
 			claim, ok := cleanup.maps.claims.(*fakeBridgeMap).values[key].(generationClaim)
 			require.True(t, ok)
 			assert.Equal(t, uint64(now), claim.ObservedMonotonicNS)
 			assert.Equal(t, key.Generation, claim.ProcessIncarnation)
 			assert.Equal(t, lifecycleCleanup, claim.Lifecycle)
-			assert.Equal(t, [7]byte{lifecycleAmbiguous}, claim.Reserved)
-			guard, ok := cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner].(generationClaim)
-			require.True(t, ok)
+			expectedClaimMetadata := [7]byte{lifecycleAmbiguous}
+			if !guardPresent {
+				expectedClaimMetadata[6] = generationGoProducerTag
+			}
+			assert.Equal(t, expectedClaimMetadata, claim.Reserved)
+			var guard generationClaim
 			if guardPresent {
+				guard, ok = cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner].(generationClaim)
+				require.True(t, ok)
 				assert.Equal(t, uint64(10*time.Second), guard.ObservedMonotonicNS)
 			} else {
-				assert.Equal(t, uint64(now), guard.ObservedMonotonicNS)
+				assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
 			}
-			assert.Equal(t, key.Generation, guard.ProcessIncarnation)
-			assert.Equal(t, lifecycleCleanup, guard.Lifecycle)
-			assert.Equal(t, [7]byte{lifecyclePublishing}, guard.Reserved)
+			if guardPresent {
+				assert.Equal(t, key.Generation, guard.ProcessIncarnation)
+				assert.Equal(t, lifecycleCleanup, guard.Lifecycle)
+				assert.Equal(t, [7]byte{lifecyclePublishing}, guard.Reserved)
+			}
 			assert.Equal(t, uint64(10*time.Second),
 				cleanup.maps.ambiguity.(*fakeBridgeMap).values[key])
 
-			// The fresh synthetic E (and G, when absent) cannot be retired yet.
+			// The fresh synthetic E cannot be retired yet. Marker-only recovery
+			// deliberately does not introduce G.
 			now++
 			stats, err = cleanup.SweepWithStats()
 			require.NoError(t, err)
 			assert.Equal(t, CleanupStats{}, stats)
 			assert.Equal(t, claim, cleanup.maps.claims.(*fakeBridgeMap).values[key])
-			assert.Equal(t, guard, cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner])
+			if guardPresent {
+				assert.Equal(t, guard, cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner])
+			} else {
+				assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+			}
 			assert.Equal(t, uint64(10*time.Second),
 				cleanup.maps.ambiguity.(*fakeBridgeMap).values[key])
 
@@ -3211,13 +5753,1136 @@ func TestCleanupMarkedPartialFenceReconstructsMissingClaims(t *testing.T) {
 			cleanup.maps.ownerGuards.(*fakeBridgeMap).afterDelete = func(any) {
 				retirementOrder = append(retirementOrder, "guard")
 			}
-			now = 72*time.Second + time.Nanosecond
+			now = 70*time.Second + 2*time.Nanosecond
 			stats, err = cleanup.SweepWithStats()
 			require.NoError(t, err)
 			assert.Equal(t, CleanupStats{}, stats)
-			assert.Equal(t, []string{"marker", "claim", "guard"}, retirementOrder)
+			if guardPresent {
+				assert.Equal(t, []string{"marker", "claim", "guard"}, retirementOrder)
+				assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+				assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+				assert.Empty(t, cleanup.maps.ambiguity.(*fakeBridgeMap).values)
+				return
+			}
+			assert.Equal(t, []string{"marker"}, retirementOrder)
+			refreshed, ok := cleanup.maps.claims.(*fakeBridgeMap).values[key].(generationClaim)
+			require.True(t, ok)
+			assert.Equal(t, uint64(now), refreshed.ObservedMonotonicNS)
+			assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+			assert.Empty(t, cleanup.maps.ambiguity.(*fakeBridgeMap).values)
+
+			now += 30 * time.Second
+			stats, err = cleanup.SweepWithStats()
+			require.NoError(t, err)
+			assert.Equal(t, CleanupStats{}, stats)
+			assert.Equal(t, []string{"marker"}, retirementOrder)
+			assert.Equal(t, refreshed, cleanup.maps.claims.(*fakeBridgeMap).values[key])
+
+			now++
+			stats, err = cleanup.SweepWithStats()
+			require.NoError(t, err)
+			assert.Equal(t, CleanupStats{}, stats)
+			assert.Equal(t, []string{"marker", "claim"}, retirementOrder)
 			assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
 			assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+			assert.Empty(t, cleanup.maps.ambiguity.(*fakeBridgeMap).values)
+		})
+	}
+}
+
+func TestCleanupFreshMarkedTerminalDoesNotFenceSuccessor(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	oldKey := stateKey{Owner: owner, Generation: 10}
+	markedAt := uint64(40 * time.Second)
+	terminal := terminalValue{
+		Generation:          oldKey.Generation,
+		ObservedMonotonicNS: uint64(39 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleConsumed,
+	}
+	handler := testMapHandler(map[Identity]any{
+		owner: validEncodedRecordObservedAt(t, 11, 40*time.Second),
+	}, nil, nil)
+	cleanup := testCleanup(handler)
+	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+	cleanup.maps.terminals.(*fakeBridgeMap).values[owner] = terminal
+	cleanup.maps.ambiguity.(*fakeBridgeMap).values[oldKey] = markedAt
+
+	parentsBefore := maps.Clone(cleanup.maps.remoteParents.(*fakeBridgeMap).values)
+	ownersBefore := maps.Clone(cleanup.maps.owners.(*fakeBridgeMap).values)
+	statesBefore := maps.Clone(cleanup.maps.states.(*fakeBridgeMap).values)
+	generationsBefore := maps.Clone(cleanup.maps.generations.(*fakeBridgeMap).values)
+	connectionsBefore := maps.Clone(cleanup.maps.connections.(*fakeBridgeMap).values)
+	cookiesBefore := maps.Clone(cleanup.maps.cookieConnections.(*fakeBridgeMap).values)
+	terminalsBefore := maps.Clone(cleanup.maps.terminals.(*fakeBridgeMap).values)
+
+	stats, err := cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Equal(t, parentsBefore, cleanup.maps.remoteParents.(*fakeBridgeMap).values)
+	assert.Equal(t, ownersBefore, cleanup.maps.owners.(*fakeBridgeMap).values)
+	assert.Equal(t, statesBefore, cleanup.maps.states.(*fakeBridgeMap).values)
+	assert.Equal(t, generationsBefore, cleanup.maps.generations.(*fakeBridgeMap).values)
+	assert.Equal(t, connectionsBefore, cleanup.maps.connections.(*fakeBridgeMap).values)
+	assert.Equal(t, cookiesBefore, cleanup.maps.cookieConnections.(*fakeBridgeMap).values)
+	assert.Equal(t, terminalsBefore, cleanup.maps.terminals.(*fakeBridgeMap).values)
+	assert.Equal(t, markedAt, cleanup.maps.ambiguity.(*fakeBridgeMap).values[oldKey])
+	assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+	assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+}
+
+func TestCleanupAgedTerminalMarkerTailDoesNotFenceSuccessor(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	oldKey := stateKey{Owner: owner, Generation: 10}
+	oldTerminal := terminalValue{
+		Generation:          oldKey.Generation,
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleConsumed,
+	}
+	handler := testMapHandler(map[Identity]any{
+		owner: validEncodedRecordObservedAt(t, 11, 40*time.Second),
+	}, nil, nil)
+	handler.incarnations.(*fakeBridgeMap).values[javaProcessIdentity(owner)] =
+		testProcessIncarnation
+	cleanup := testCleanup(handler)
+	now := 41 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+	cleanup.maps.terminals.(*fakeBridgeMap).values[owner] = oldTerminal
+	cleanup.maps.ambiguity.(*fakeBridgeMap).values[oldKey] = uint64(10 * time.Second)
+	guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+	successorKey := stateKey{Owner: owner, Generation: 11}
+	refreshSuccessor := func(observed time.Duration) {
+		t.Helper()
+		encoded := validEncodedRecordObservedAt(t, successorKey.Generation, observed)
+		cleanup.maps.remoteParents.(*fakeBridgeMap).values[owner] = encoded
+		state := cleanup.maps.states.(*fakeBridgeMap).values[successorKey].(stateValue)
+		state.ObservedMonotonicNS = uint64(observed)
+		state.Response = encoded
+		cleanup.maps.states.(*fakeBridgeMap).values[successorKey] = state
+		index := cleanup.maps.generations.(*fakeBridgeMap).values[successorKey].(generationIndexValue)
+		index.ObservedMonotonicNS = uint64(observed)
+		cleanup.maps.generations.(*fakeBridgeMap).values[successorKey] = index
+	}
+	sweep := func() {
+		t.Helper()
+		refreshSuccessor(now)
+		parentsBefore := maps.Clone(cleanup.maps.remoteParents.(*fakeBridgeMap).values)
+		ownersBefore := maps.Clone(cleanup.maps.owners.(*fakeBridgeMap).values)
+		statesBefore := maps.Clone(cleanup.maps.states.(*fakeBridgeMap).values)
+		generationsBefore := maps.Clone(cleanup.maps.generations.(*fakeBridgeMap).values)
+		connectionsBefore := maps.Clone(cleanup.maps.connections.(*fakeBridgeMap).values)
+		cookiesBefore := maps.Clone(cleanup.maps.cookieConnections.(*fakeBridgeMap).values)
+		terminalsBefore := maps.Clone(cleanup.maps.terminals.(*fakeBridgeMap).values)
+		stats, err := cleanup.SweepWithStats()
+		require.NoError(t, err)
+		assert.Equal(t, CleanupStats{}, stats)
+		assert.Equal(t, parentsBefore, cleanup.maps.remoteParents.(*fakeBridgeMap).values)
+		assert.Equal(t, ownersBefore, cleanup.maps.owners.(*fakeBridgeMap).values)
+		assert.Equal(t, statesBefore, cleanup.maps.states.(*fakeBridgeMap).values)
+		assert.Equal(t, generationsBefore, cleanup.maps.generations.(*fakeBridgeMap).values)
+		assert.Equal(t, connectionsBefore, cleanup.maps.connections.(*fakeBridgeMap).values)
+		assert.Equal(t, cookiesBefore, cleanup.maps.cookieConnections.(*fakeBridgeMap).values)
+		assert.Equal(t, terminalsBefore, cleanup.maps.terminals.(*fakeBridgeMap).values)
+		assert.Empty(t, guards.values)
+		assert.Zero(t, guards.updateCount)
+	}
+
+	sweep()
+	assert.Equal(t, uint64(10*time.Second),
+		cleanup.maps.ambiguity.(*fakeBridgeMap).values[oldKey])
+	assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+
+	now = 72*time.Second + time.Nanosecond
+	sweep()
+	assert.Equal(t, uint64(10*time.Second),
+		cleanup.maps.ambiguity.(*fakeBridgeMap).values[oldKey])
+	assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+
+	now += 30*time.Second + time.Nanosecond
+	sweep()
+	assert.Equal(t, uint64(10*time.Second),
+		cleanup.maps.ambiguity.(*fakeBridgeMap).values[oldKey])
+	assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+}
+
+func TestCleanupMarkerAgeRevalidatesSnapshot(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+	markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+	markers.values[key] = uint64(10 * time.Second)
+	replaced := false
+	markers.afterIterate = func() {
+		replaced = true
+		markers.values[key] = uint64(40 * time.Second)
+	}
+
+	stats, err := cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	require.True(t, replaced)
+	assert.Equal(t, uint64(40*time.Second), markers.values[key])
+	assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+	assert.Empty(t, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+}
+
+func TestCleanupMarkerFreeActiveReplayTailReconstructsFence(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	claim := generationClaim{
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleCleanup,
+		Reserved:            [7]byte{lifecycleConsumed},
+	}
+	guard := generationClaim{
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  key.Generation,
+		Lifecycle:           lifecycleCleanup,
+		Reserved:            [7]byte{lifecyclePublishing},
+	}
+	replayKey := aliasReplayKey{
+		Owner:               owner,
+		Generation:          key.Generation,
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  claim.ProcessIncarnation,
+	}
+	activeReplay := activeAliasReplayForTest()
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	now := 41 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+	markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+	replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+	claims.values[key] = claim
+	guards.values[owner] = guard
+	replays.values[replayKey] = activeReplay
+
+	stats, err := cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Equal(t, claim, claims.values[key])
+	assert.Equal(t, guard, guards.values[owner])
+	assert.Equal(t, uint64(now), markers.values[key])
+	assert.Equal(t, activeReplay, replays.values[replayKey])
+
+	now += 30*time.Second + time.Nanosecond
+	stats, err = cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Empty(t, claims.values)
+	assert.Empty(t, guards.values)
+	assert.Empty(t, markers.values)
+	finalReplay := replays.values[replayKey].(aliasReplayValue)
+	assert.True(t, validAliasReplayFinal(finalReplay))
+	assert.Equal(t, lifecycleConsumed, finalReplay.Lifecycle)
+}
+
+func seedUnrelatedAliasReplaysForCleanupTest(replays *fakeBridgeMap, count uint32) {
+	for i := uint32(0); i < count; i++ {
+		replays.values[aliasReplayKey{
+			Owner: Identity{
+				TID: 1000 + i, PID: 1000 + i, Namespace: 2,
+			},
+			Generation:          20,
+			ObservedMonotonicNS: uint64(20*time.Second) + uint64(i),
+			ProcessIncarnation:  testProcessIncarnation + 1000 + uint64(i),
+		}] = activeAliasReplayForTest()
+	}
+}
+
+func TestCleanupMarkerFreeActiveReplayRecoveryIsBoundedAndFair(t *testing.T) {
+	const (
+		tails            = 8
+		unrelatedReplays = 32
+	)
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	now := 41 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+	markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+	replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+
+	for i := uint32(1); i <= tails; i++ {
+		owner := Identity{TID: i, PID: i, Namespace: 1}
+		key := stateKey{Owner: owner, Generation: 10}
+		claim := generationClaim{
+			ObservedMonotonicNS: uint64(10 * time.Second),
+			ProcessIncarnation:  testProcessIncarnation + uint64(i),
+			Lifecycle:           lifecycleCleanup,
+			Reserved:            [7]byte{lifecycleConsumed},
+		}
+		claims.values[key] = claim
+		guards.values[owner] = generationClaim{
+			ObservedMonotonicNS: uint64(10 * time.Second),
+			ProcessIncarnation:  key.Generation,
+			Lifecycle:           lifecycleCleanup,
+			Reserved:            [7]byte{lifecyclePublishing},
+		}
+		replays.values[aliasReplayKey{
+			Owner:               owner,
+			Generation:          key.Generation,
+			ObservedMonotonicNS: uint64(10 * time.Second),
+			ProcessIncarnation:  claim.ProcessIncarnation,
+		}] = activeAliasReplayForTest()
+	}
+	seedUnrelatedAliasReplaysForCleanupTest(replays, unrelatedReplays)
+
+	replayIterations := 0
+	replays.afterIterate = func() { replayIterations++ }
+	maxFullScansPerSweep := 2 +
+		5*int(javaRemoteParentMaxGenerationReplayScanAttemptsPerSweep)
+	for sweep := 1; sweep <= tails; sweep++ {
+		before := replayIterations
+		stats, err := cleanup.SweepWithStats()
+		require.NoError(t, err)
+		assert.Equal(t, CleanupStats{}, stats)
+		assert.LessOrEqual(t, replayIterations-before, maxFullScansPerSweep)
+		assert.Len(t, markers.values, sweep)
+		now++
+	}
+	assert.Len(t, claims.values, tails)
+	assert.Len(t, guards.values, tails)
+}
+
+func TestCleanupMarkerFreeClaimGuardFallbackIsBoundedAndFair(t *testing.T) {
+	const (
+		tails            = 8
+		unrelatedReplays = 32
+	)
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	now := 41 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+	markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+	replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+
+	for i := uint32(1); i <= tails; i++ {
+		owner := Identity{TID: i, PID: i, Namespace: 1}
+		key := stateKey{Owner: owner, Generation: 10}
+		claims.values[key] = generationClaim{
+			ObservedMonotonicNS: uint64(10 * time.Second),
+			ProcessIncarnation:  testProcessIncarnation + uint64(i),
+			Lifecycle:           lifecycleCleanup,
+			Reserved:            [7]byte{lifecycleConsumed},
+		}
+		guards.values[owner] = generationClaim{
+			ObservedMonotonicNS: uint64(10 * time.Second),
+			ProcessIncarnation:  key.Generation,
+			Lifecycle:           lifecycleCleanup,
+			Reserved:            [7]byte{lifecyclePublishing},
+		}
+	}
+	seedUnrelatedAliasReplaysForCleanupTest(replays, unrelatedReplays)
+
+	replayIterations := 0
+	replays.afterIterate = func() { replayIterations++ }
+	maxFullScansPerSweep := 2 +
+		3*int(javaRemoteParentMaxGenerationReplayScanAttemptsPerSweep)
+	for sweep := 1; sweep <= tails; sweep++ {
+		before := replayIterations
+		stats, err := cleanup.SweepWithStats()
+		require.NoError(t, err)
+		assert.Equal(t, CleanupStats{}, stats)
+		assert.LessOrEqual(t, replayIterations-before, maxFullScansPerSweep)
+		assert.Len(t, claims.values, tails-sweep)
+		assert.Len(t, guards.values, tails-sweep)
+		assert.Empty(t, markers.values)
+		now++
+	}
+}
+
+func TestCleanupMarkerFreeEOnlyReplayProofIsBoundedAndFair(t *testing.T) {
+	const (
+		tails            = 8
+		unrelatedReplays = 32
+	)
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	now := 41 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+
+	for i := uint32(1); i <= tails; i++ {
+		owner := Identity{TID: i, PID: i, Namespace: 1}
+		claims.values[stateKey{Owner: owner, Generation: 10}] = generationClaim{
+			ObservedMonotonicNS: uint64(10 * time.Second),
+			ProcessIncarnation:  testProcessIncarnation + uint64(i),
+			Lifecycle:           lifecycleCleanup,
+			Reserved:            [7]byte{lifecycleConsumed},
+		}
+	}
+	seedUnrelatedAliasReplaysForCleanupTest(replays, unrelatedReplays)
+
+	replayIterations := 0
+	replays.afterIterate = func() { replayIterations++ }
+	maxFullScansPerSweep := 2 +
+		2*int(javaRemoteParentMaxGenerationReplayScanAttemptsPerSweep)
+	for sweep := 1; sweep <= tails; sweep++ {
+		before := replayIterations
+		stats, err := cleanup.SweepWithStats()
+		require.NoError(t, err)
+		assert.Equal(t, CleanupStats{}, stats)
+		assert.LessOrEqual(t, replayIterations-before, maxFullScansPerSweep)
+		assert.Len(t, claims.values, tails-sweep)
+		now++
+	}
+}
+
+func TestCleanupPublishingZeroReservationReplayProofIsBoundedAndFair(t *testing.T) {
+	const (
+		tails            = 8
+		unrelatedReplays = 32
+	)
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	now := 41 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+	markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+	replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+
+	for i := uint32(1); i <= tails; i++ {
+		owner := Identity{TID: i, PID: i, Namespace: 1}
+		key := stateKey{Owner: owner, Generation: 10}
+		claims.values[key] = generationClaim{
+			ObservedMonotonicNS: uint64(10 * time.Second),
+			ProcessIncarnation:  testProcessIncarnation + uint64(i),
+			Lifecycle:           lifecycleCleanup,
+			Reserved:            [7]byte{lifecyclePublishing},
+		}
+		guards.values[owner] = generationClaim{
+			ObservedMonotonicNS: uint64(10 * time.Second),
+			ProcessIncarnation:  key.Generation,
+			Lifecycle:           lifecycleCleanup,
+			Reserved:            [7]byte{lifecyclePublishing},
+		}
+		markers.values[key] = uint64(0)
+	}
+	seedUnrelatedAliasReplaysForCleanupTest(replays, unrelatedReplays)
+
+	replayIterations := 0
+	replays.afterIterate = func() { replayIterations++ }
+	maxFullScansPerSweep := 2 +
+		4*int(javaRemoteParentMaxGenerationReplayScanAttemptsPerSweep)
+	for sweep := 1; sweep <= tails; sweep++ {
+		before := replayIterations
+		stats, err := cleanup.SweepWithStats()
+		require.NoError(t, err)
+		assert.Equal(t, CleanupStats{}, stats)
+		assert.LessOrEqual(t, replayIterations-before, maxFullScansPerSweep)
+		assert.Len(t, claims.values, tails-sweep)
+		assert.Len(t, guards.values, tails-sweep)
+		assert.Len(t, markers.values, tails)
+		now++
+	}
+}
+
+func TestCleanupGuardOnlyReplayProofIsBoundedAndFair(t *testing.T) {
+	const (
+		tails            = 8
+		unrelatedReplays = 32
+	)
+	for _, markerPresent := range []bool{false, true} {
+		name := "marker free"
+		if markerPresent {
+			name = "zero reservation"
+		}
+		t.Run(name, func(t *testing.T) {
+			cleanup := testCleanup(testMapHandler(nil, nil, nil))
+			now := 41 * time.Second
+			cleanup.monoTimeNow = func() time.Duration { return now }
+			guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+			markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+			replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+
+			for i := uint32(1); i <= tails; i++ {
+				owner := Identity{TID: i, PID: i, Namespace: 1}
+				key := stateKey{Owner: owner, Generation: 10}
+				guards.values[owner] = generationClaim{
+					ObservedMonotonicNS: uint64(10 * time.Second),
+					ProcessIncarnation:  key.Generation,
+					Lifecycle:           lifecycleCleanup,
+					Reserved:            [7]byte{lifecyclePublishing},
+				}
+				if markerPresent {
+					markers.values[key] = uint64(0)
+				}
+			}
+			seedUnrelatedAliasReplaysForCleanupTest(replays, unrelatedReplays)
+
+			replayIterations := 0
+			replays.afterIterate = func() { replayIterations++ }
+			maxFullScansPerSweep := 2 +
+				2*int(javaRemoteParentMaxGenerationReplayScanAttemptsPerSweep)
+			for sweep := 1; sweep <= tails; sweep++ {
+				before := replayIterations
+				stats, err := cleanup.SweepWithStats()
+				require.NoError(t, err)
+				assert.Equal(t, CleanupStats{}, stats)
+				assert.LessOrEqual(t, replayIterations-before, maxFullScansPerSweep)
+				assert.Len(t, guards.values, tails-sweep)
+				if markerPresent {
+					assert.Len(t, markers.values, tails)
+				} else {
+					assert.Empty(t, markers.values)
+				}
+				now++
+			}
+		})
+	}
+}
+
+func TestCleanupGenerationReplayScanSchedulerDoesNotStarveGuards(t *testing.T) {
+	const tailsPerClass = 4
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	now := 41 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+	replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+
+	for i := uint32(0); i < tailsPerClass; i++ {
+		claimOwner := Identity{TID: 2*i + 1, PID: 2*i + 1, Namespace: 1}
+		claims.values[stateKey{Owner: claimOwner, Generation: 10}] = generationClaim{
+			ObservedMonotonicNS: uint64(10 * time.Second),
+			ProcessIncarnation:  testProcessIncarnation + uint64(i),
+			Lifecycle:           lifecycleCleanup,
+			Reserved:            [7]byte{lifecycleConsumed},
+		}
+
+		guardOwner := Identity{TID: 2*i + 2, PID: 2*i + 2, Namespace: 1}
+		guards.values[guardOwner] = generationClaim{
+			ObservedMonotonicNS: uint64(10 * time.Second),
+			ProcessIncarnation:  10,
+			Lifecycle:           lifecycleCleanup,
+			Reserved:            [7]byte{lifecyclePublishing},
+		}
+	}
+	seedUnrelatedAliasReplaysForCleanupTest(replays, 32)
+
+	for sweep := 1; sweep <= 2*tailsPerClass; sweep++ {
+		stats, err := cleanup.SweepWithStats()
+		require.NoError(t, err)
+		assert.Equal(t, CleanupStats{}, stats)
+		assert.Equal(t, 2*tailsPerClass-sweep, len(claims.values)+len(guards.values))
+		if sweep%2 == 0 {
+			assert.Len(t, claims.values, tailsPerClass-sweep/2)
+			assert.Len(t, guards.values, tailsPerClass-sweep/2)
+		}
+		now++
+	}
+}
+
+func TestCleanupMarkedFullFenceReplayProofIsBoundedAndFair(t *testing.T) {
+	const (
+		tails            = 8
+		unrelatedReplays = 32
+	)
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	now := 41 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+	markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+	replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+
+	for i := uint32(1); i <= tails; i++ {
+		owner := Identity{TID: i, PID: i, Namespace: 1}
+		key := stateKey{Owner: owner, Generation: 10}
+		claims.values[key] = generationClaim{
+			ObservedMonotonicNS: uint64(10 * time.Second),
+			ProcessIncarnation:  testProcessIncarnation + uint64(i),
+			Lifecycle:           lifecycleCleanup,
+			Reserved:            [7]byte{lifecycleConsumed},
+		}
+		guards.values[owner] = generationClaim{
+			ObservedMonotonicNS: uint64(10 * time.Second),
+			ProcessIncarnation:  key.Generation,
+			Lifecycle:           lifecycleCleanup,
+			Reserved:            [7]byte{lifecyclePublishing},
+		}
+		markers.values[key] = uint64(10 * time.Second)
+	}
+	seedUnrelatedAliasReplaysForCleanupTest(replays, unrelatedReplays)
+
+	replayIterations := 0
+	replays.afterIterate = func() { replayIterations++ }
+	maxFullScansPerSweep := 2 +
+		3*int(javaRemoteParentMaxGenerationReplayScanAttemptsPerSweep)
+	for sweep := 1; sweep <= tails; sweep++ {
+		before := replayIterations
+		stats, err := cleanup.SweepWithStats()
+		require.NoError(t, err)
+		assert.Equal(t, CleanupStats{}, stats)
+		assert.LessOrEqual(t, replayIterations-before, maxFullScansPerSweep)
+		assert.Len(t, claims.values, tails-sweep)
+		assert.Len(t, guards.values, tails-sweep)
+		assert.Len(t, markers.values, tails-sweep)
+		now++
+	}
+}
+
+func TestCleanupExactTailBacklogDoesNotConsumeGenerationReplayScanAdmission(t *testing.T) {
+	const exactTails = 32
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+	for i := uint32(1); i <= exactTails; i++ {
+		key := stateKey{
+			Owner:      Identity{TID: i, PID: i, Namespace: 1},
+			Generation: 10,
+		}
+		claims.values[key] = generationClaim{
+			ObservedMonotonicNS: uint64(10 * time.Second),
+			ProcessIncarnation:  key.Generation,
+			Lifecycle:           lifecycleCleanup,
+			Reserved: [7]byte{
+				0: lifecycleAmbiguous,
+				6: generationGoProducerTag,
+			},
+		}
+	}
+	ordinaryKey := stateKey{
+		Owner:      Identity{TID: exactTails + 1, PID: exactTails + 1, Namespace: 1},
+		Generation: 10,
+	}
+	claims.values[ordinaryKey] = generationClaim{
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleCleanup,
+		Reserved:            [7]byte{lifecycleConsumed},
+	}
+	seedUnrelatedAliasReplaysForCleanupTest(replays, 32)
+
+	replayIterations := 0
+	replays.afterIterate = func() { replayIterations++ }
+	stats, err := cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Empty(t, claims.values)
+	assert.LessOrEqual(t, replayIterations,
+		2+2*int(javaRemoteParentMaxGenerationReplayScanAttemptsPerSweep))
+}
+
+func TestCleanupMarkerFreeReplayProofCursorSurvivesClaimChurn(t *testing.T) {
+	for _, failFirst := range []bool{false, true} {
+		name := "successful first proof"
+		if failFirst {
+			name = "failed first proof"
+		}
+		t.Run(name, func(t *testing.T) {
+			cleanup := testCleanup(testMapHandler(nil, nil, nil))
+			now := 41 * time.Second
+			cleanup.monoTimeNow = func() time.Duration { return now }
+			claims := cleanup.maps.claims.(*fakeBridgeMap)
+			guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+			markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+			replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+			seed := func(owner Identity) (stateKey, aliasReplayKey) {
+				key := stateKey{Owner: owner, Generation: 10}
+				claim := generationClaim{
+					ObservedMonotonicNS: uint64(10 * time.Second),
+					ProcessIncarnation:  testProcessIncarnation + uint64(owner.TID),
+					Lifecycle:           lifecycleCleanup,
+					Reserved:            [7]byte{lifecycleConsumed},
+				}
+				claims.values[key] = claim
+				guards.values[owner] = generationClaim{
+					ObservedMonotonicNS: uint64(10 * time.Second),
+					ProcessIncarnation:  key.Generation,
+					Lifecycle:           lifecycleCleanup,
+					Reserved:            [7]byte{lifecyclePublishing},
+				}
+				replayKey := aliasReplayKey{
+					Owner:               owner,
+					Generation:          key.Generation,
+					ObservedMonotonicNS: uint64(10 * time.Second),
+					ProcessIncarnation:  claim.ProcessIncarnation,
+				}
+				replays.values[replayKey] = activeAliasReplayForTest()
+				return key, replayKey
+			}
+
+			leftOwner := Identity{TID: 1, PID: 1, Namespace: 1}
+			targetOwner := Identity{TID: 2, PID: 2, Namespace: 1}
+			highOwner := Identity{TID: 3, PID: 3, Namespace: 1}
+			leftKey, leftReplayKey := seed(leftOwner)
+			targetKey, _ := seed(targetOwner)
+			injected := errors.New("injected first marker failure")
+			if failFirst {
+				markers.updateErr = injected
+			}
+
+			stats, err := cleanup.SweepWithStats()
+			if failFirst {
+				require.ErrorContains(t, err, injected.Error())
+			} else {
+				require.NoError(t, err)
+				assert.Contains(t, markers.values, leftKey)
+			}
+			assert.Equal(t, CleanupStats{}, stats)
+			assert.NotContains(t, markers.values, targetKey)
+
+			markers.updateErr = nil
+			delete(markers.values, leftKey)
+			delete(claims.values, leftKey)
+			delete(guards.values, leftOwner)
+			delete(replays.values, leftReplayKey)
+			highKey, _ := seed(highOwner)
+			now++
+
+			stats, err = cleanup.SweepWithStats()
+			require.NoError(t, err)
+			assert.Equal(t, CleanupStats{}, stats)
+			assert.Contains(t, markers.values, targetKey)
+			assert.NotContains(t, markers.values, highKey)
+		})
+	}
+}
+
+func TestCleanupGenerationReplayScanCursorAdvancesAfterError(t *testing.T) {
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	now := 41 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+	markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+	replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+	seed := func(owner Identity) stateKey {
+		key := stateKey{Owner: owner, Generation: 10}
+		claim := generationClaim{
+			ObservedMonotonicNS: uint64(10 * time.Second),
+			ProcessIncarnation:  testProcessIncarnation + uint64(owner.TID),
+			Lifecycle:           lifecycleCleanup,
+			Reserved:            [7]byte{lifecycleConsumed},
+		}
+		claims.values[key] = claim
+		guards.values[owner] = generationClaim{
+			ObservedMonotonicNS: uint64(10 * time.Second),
+			ProcessIncarnation:  key.Generation,
+			Lifecycle:           lifecycleCleanup,
+			Reserved:            [7]byte{lifecyclePublishing},
+		}
+		replays.values[aliasReplayKey{
+			Owner:               owner,
+			Generation:          key.Generation,
+			ObservedMonotonicNS: uint64(10 * time.Second),
+			ProcessIncarnation:  claim.ProcessIncarnation,
+		}] = activeAliasReplayForTest()
+		return key
+	}
+	left := seed(Identity{TID: 1, PID: 1, Namespace: 1})
+	target := seed(Identity{TID: 2, PID: 2, Namespace: 1})
+
+	injected := errors.New("injected marker publication failure")
+	markers.updateErr = injected
+	stats, err := cleanup.SweepWithStats()
+	require.ErrorContains(t, err, injected.Error())
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.NotContains(t, markers.values, left)
+	assert.NotContains(t, markers.values, target)
+
+	markers.updateErr = nil
+	now++
+	stats, err = cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.NotContains(t, markers.values, left)
+	assert.Contains(t, markers.values, target)
+
+	now++
+	stats, err = cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Contains(t, markers.values, left)
+	assert.Contains(t, markers.values, target)
+}
+
+func TestCleanupGenerationReplayScanIteratorErrorIsBoundedAndRotates(t *testing.T) {
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	now := 41 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+	keys := []stateKey{
+		{Owner: Identity{TID: 1, PID: 1, Namespace: 1}, Generation: 10},
+		{Owner: Identity{TID: 2, PID: 2, Namespace: 1}, Generation: 10},
+	}
+	for i, key := range keys {
+		claims.values[key] = generationClaim{
+			ObservedMonotonicNS: uint64(10 * time.Second),
+			ProcessIncarnation:  testProcessIncarnation + uint64(i),
+			Lifecycle:           lifecycleCleanup,
+			Reserved:            [7]byte{lifecycleConsumed},
+		}
+	}
+	seedUnrelatedAliasReplaysForCleanupTest(replays, 32)
+
+	injected := errors.New("injected generation replay iteration failure")
+	iterations := 0
+	replays.afterIterate = func() {
+		iterations++
+		switch iterations {
+		case 1:
+			replays.iterateErr = injected
+		case 2:
+			// Iterate captured the injected error before invoking this hook. Clear
+			// it so only the admitted proof fails and the final refresh succeeds.
+			replays.iterateErr = nil
+		}
+	}
+	stats, err := cleanup.SweepWithStats()
+	require.ErrorContains(t, err, injected.Error())
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Equal(t, 3, iterations)
+	assert.Contains(t, claims.values, keys[0])
+	assert.Contains(t, claims.values, keys[1])
+
+	replays.iterateErr = nil
+	replays.afterIterate = nil
+	now++
+	stats, err = cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Contains(t, claims.values, keys[0])
+	assert.NotContains(t, claims.values, keys[1])
+}
+
+func TestCleanupMarkerFreeReplayProofCursorSerializesConcurrentSweeps(t *testing.T) {
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+	markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+	replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+	for i := uint32(1); i <= 2; i++ {
+		owner := Identity{TID: i, PID: i, Namespace: 1}
+		key := stateKey{Owner: owner, Generation: 10}
+		claim := generationClaim{
+			ObservedMonotonicNS: uint64(10 * time.Second),
+			ProcessIncarnation:  testProcessIncarnation + uint64(i),
+			Lifecycle:           lifecycleCleanup,
+			Reserved:            [7]byte{lifecycleConsumed},
+		}
+		claims.values[key] = claim
+		guards.values[owner] = generationClaim{
+			ObservedMonotonicNS: uint64(10 * time.Second),
+			ProcessIncarnation:  key.Generation,
+			Lifecycle:           lifecycleCleanup,
+			Reserved:            [7]byte{lifecyclePublishing},
+		}
+		replays.values[aliasReplayKey{
+			Owner:               owner,
+			Generation:          key.Generation,
+			ObservedMonotonicNS: uint64(10 * time.Second),
+			ProcessIncarnation:  claim.ProcessIncarnation,
+		}] = activeAliasReplayForTest()
+	}
+
+	firstInside := make(chan struct{})
+	secondInside := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var releaseFirstOnce sync.Once
+	releaseFirstSweep := func() { releaseFirstOnce.Do(func() { close(releaseFirst) }) }
+	t.Cleanup(releaseFirstSweep)
+	var generationScans atomic.Int32
+	cleanup.maps.generations.(*fakeBridgeMap).afterIterate = func() {
+		switch generationScans.Add(1) {
+		case 1:
+			close(firstInside)
+			<-releaseFirst
+		case 2:
+			close(secondInside)
+		}
+	}
+
+	errs := make(chan error, 2)
+	go func() {
+		_, err := cleanup.SweepWithStats()
+		errs <- err
+	}()
+	require.Eventually(t, func() bool {
+		select {
+		case <-firstInside:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, time.Millisecond)
+
+	secondAtPrelock := make(chan struct{})
+	releaseSecondPrelock := make(chan struct{})
+	var releaseSecondOnce sync.Once
+	releaseSecondSweep := func() {
+		releaseSecondOnce.Do(func() { close(releaseSecondPrelock) })
+	}
+	t.Cleanup(releaseSecondSweep)
+	cleanup.maps.sslPrewriteConnectionAmbiguity.(*fakeBridgeMap).afterIterate = func() {
+		close(secondAtPrelock)
+		<-releaseSecondPrelock
+	}
+	go func() {
+		_, err := cleanup.SweepWithStats()
+		errs <- err
+	}()
+	require.Eventually(t, func() bool {
+		select {
+		case <-secondAtPrelock:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, time.Millisecond)
+	releaseSecondSweep()
+	assert.Never(t, func() bool {
+		select {
+		case <-secondInside:
+			return true
+		default:
+			return false
+		}
+	}, 50*time.Millisecond, time.Millisecond)
+
+	releaseFirstSweep()
+	for range 2 {
+		require.NoError(t, <-errs)
+	}
+	assert.Len(t, markers.values, 2)
+}
+
+func TestCleanupMarkerFreeActiveReplayTailFromLostArtifactConverges(t *testing.T) {
+	for _, committedError := range []bool{false, true} {
+		name := "successful claim"
+		if committedError {
+			name = "committed claim error"
+		}
+		t.Run(name, func(t *testing.T) {
+			owner := Identity{TID: 3, PID: 2, Namespace: 1}
+			key := stateKey{Owner: owner, Generation: 10}
+			state := stateValue{
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  testProcessIncarnation,
+				Lifecycle:           lifecycleActive,
+			}
+			cleanup := testCleanup(testMapHandler(nil, nil, nil))
+			now := 41 * time.Second
+			cleanup.monoTimeNow = func() time.Duration { return now }
+			states := cleanup.maps.states.(*fakeBridgeMap)
+			claims := cleanup.maps.claims.(*fakeBridgeMap)
+			guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+			markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+			replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+			states.values[key] = state
+			replayKey := aliasReplayKeyForState(key, state)
+			replays.values[replayKey] = activeAliasReplayForTest()
+			claims.afterUpdate = func(updatedKey, _ any) {
+				if updatedKey == key {
+					delete(states.values, key)
+				}
+			}
+			injected := errors.New("injected committed artifact-claim failure")
+			if committedError {
+				claims.updateCommitErr = injected
+			}
+
+			cleaned, err := cleanup.quarantineMalformedState(key, state)
+			assert.False(t, cleaned)
+			if committedError {
+				require.ErrorContains(t, err, injected.Error())
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Empty(t, states.values)
+			require.Len(t, claims.values, 1)
+			require.Len(t, guards.values, 1)
+			assert.Empty(t, markers.values)
+			assert.Equal(t, activeAliasReplayForTest(), replays.values[replayKey])
+
+			claims.updateCommitErr = nil
+			claims.afterUpdate = nil
+			now += 30*time.Second + time.Nanosecond
+			stats, err := cleanup.SweepWithStats()
+			require.NoError(t, err)
+			assert.Equal(t, CleanupStats{}, stats)
+			assert.Equal(t, uint64(now), markers.values[key])
+			assert.Equal(t, activeAliasReplayForTest(), replays.values[replayKey])
+
+			now += 30*time.Second + time.Nanosecond
+			stats, err = cleanup.SweepWithStats()
+			require.NoError(t, err)
+			assert.Equal(t, CleanupStats{}, stats)
+			assert.Empty(t, claims.values)
+			assert.Empty(t, guards.values)
+			assert.Empty(t, markers.values)
+			finalReplay := replays.values[replayKey].(aliasReplayValue)
+			assert.True(t, validAliasReplayFinal(finalReplay))
+			assert.Equal(t, lifecycleStale, finalReplay.Lifecycle)
+		})
+	}
+}
+
+func TestCleanupMarkerFreeActiveReplayMarkerUncertaintyConverges(t *testing.T) {
+	for _, mode := range []string{"not committed", "committed error", "committed unreadable"} {
+		t.Run(mode, func(t *testing.T) {
+			owner := Identity{TID: 3, PID: 2, Namespace: 1}
+			key := stateKey{Owner: owner, Generation: 10}
+			claim := generationClaim{
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  testProcessIncarnation,
+				Lifecycle:           lifecycleCleanup,
+				Reserved:            [7]byte{lifecycleConsumed},
+			}
+			guard := generationClaim{
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  key.Generation,
+				Lifecycle:           lifecycleCleanup,
+				Reserved:            [7]byte{lifecyclePublishing},
+			}
+			replayKey := aliasReplayKey{
+				Owner: owner, Generation: key.Generation,
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  claim.ProcessIncarnation,
+			}
+			cleanup := testCleanup(testMapHandler(nil, nil, nil))
+			now := 41 * time.Second
+			cleanup.monoTimeNow = func() time.Duration { return now }
+			claims := cleanup.maps.claims.(*fakeBridgeMap)
+			guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+			markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+			replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+			claims.values[key] = claim
+			guards.values[owner] = guard
+			replays.values[replayKey] = activeAliasReplayForTest()
+			injected := errors.New("injected marker publication uncertainty")
+			switch mode {
+			case "not committed":
+				markers.updateErr = injected
+			case "committed error":
+				markers.updateCommitErr = injected
+			case "committed unreadable":
+				markers.updateCommitErr = injected
+				markers.afterUpdate = func(any, any) { markers.lookupErr = injected }
+			}
+
+			stats, err := cleanup.SweepWithStats()
+			require.ErrorContains(t, err, injected.Error())
+			assert.Equal(t, CleanupStats{}, stats)
+			assert.Equal(t, claim, claims.values[key])
+			assert.Equal(t, guard, guards.values[owner])
+			assert.Equal(t, activeAliasReplayForTest(), replays.values[replayKey])
+			assert.Zero(t, claims.deleteCount)
+			assert.Zero(t, guards.deleteCount)
+			if mode == "not committed" {
+				assert.Empty(t, markers.values)
+			} else {
+				assert.Equal(t, uint64(now), markers.values[key])
+			}
+
+			markers.updateErr = nil
+			markers.updateCommitErr = nil
+			markers.lookupErr = nil
+			markers.afterUpdate = nil
+			if mode == "not committed" {
+				now++
+				stats, err = cleanup.SweepWithStats()
+				require.NoError(t, err)
+				assert.Equal(t, CleanupStats{}, stats)
+				assert.Equal(t, uint64(now), markers.values[key])
+			}
+			now += 30*time.Second + time.Nanosecond
+			stats, err = cleanup.SweepWithStats()
+			require.NoError(t, err)
+			assert.Equal(t, CleanupStats{}, stats)
+			assert.Empty(t, claims.values)
+			assert.Empty(t, guards.values)
+			assert.Empty(t, markers.values)
+			assert.True(t, validAliasReplayFinal(replays.values[replayKey].(aliasReplayValue)))
+		})
+	}
+}
+
+func TestCleanupMarkerFreeReplayRecoveryRequiresUniqueOpeningActiveEpoch(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		claimOrigin uint8
+		replays     func(stateKey, generationClaim) map[aliasReplayKey]any
+	}{
+		{
+			name:        "multiple active epochs",
+			claimOrigin: lifecycleConsumed,
+			replays: func(key stateKey, claim generationClaim) map[aliasReplayKey]any {
+				first := aliasReplayKey{Owner: key.Owner, Generation: key.Generation,
+					ObservedMonotonicNS: uint64(10 * time.Second),
+					ProcessIncarnation:  claim.ProcessIncarnation}
+				second := first
+				second.ObservedMonotonicNS++
+				return map[aliasReplayKey]any{
+					first: activeAliasReplayForTest(), second: activeAliasReplayForTest(),
+				}
+			},
+		},
+		{
+			name:        "publishing claim target",
+			claimOrigin: lifecyclePublishing,
+			replays: func(key stateKey, claim generationClaim) map[aliasReplayKey]any {
+				return map[aliasReplayKey]any{{
+					Owner: key.Owner, Generation: key.Generation,
+					ObservedMonotonicNS: uint64(10 * time.Second),
+					ProcessIncarnation:  claim.ProcessIncarnation,
+				}: activeAliasReplayForTest()}
+			},
+		},
+		{
+			name:        "untagged publishing replay",
+			claimOrigin: lifecycleConsumed,
+			replays: func(key stateKey, claim generationClaim) map[aliasReplayKey]any {
+				return map[aliasReplayKey]any{{
+					Owner: key.Owner, Generation: key.Generation,
+					ObservedMonotonicNS: uint64(10 * time.Second),
+					ProcessIncarnation:  claim.ProcessIncarnation,
+				}: boundAliasReplayForTest(aliasReplayValue{
+					TransitionMonotonicNS: uint64(10 * time.Second),
+					Lifecycle:             lifecyclePublishing,
+					DesiredLifecycle:      lifecycleConsumed,
+				})}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			owner := Identity{TID: 3, PID: 2, Namespace: 1}
+			key := stateKey{Owner: owner, Generation: 10}
+			claim := generationClaim{
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  testProcessIncarnation,
+				Lifecycle:           lifecycleCleanup,
+				Reserved:            [7]byte{test.claimOrigin},
+			}
+			guard := generationClaim{
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  key.Generation,
+				Lifecycle:           lifecycleCleanup,
+				Reserved:            [7]byte{lifecyclePublishing},
+			}
+			cleanup := testCleanup(testMapHandler(nil, nil, nil))
+			cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+			cleanup.maps.claims.(*fakeBridgeMap).values[key] = claim
+			cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner] = guard
+			for replayKey, replay := range test.replays(key, claim) {
+				cleanup.maps.aliasReplays.(*fakeBridgeMap).values[replayKey] = replay
+			}
+
+			stats, err := cleanup.SweepWithStats()
+			require.NoError(t, err)
+			assert.Equal(t, CleanupStats{}, stats)
+			assert.Equal(t, claim, cleanup.maps.claims.(*fakeBridgeMap).values[key])
+			assert.Equal(t, guard, cleanup.maps.ownerGuards.(*fakeBridgeMap).values[owner])
 			assert.Empty(t, cleanup.maps.ambiguity.(*fakeBridgeMap).values)
 		})
 	}
@@ -3541,6 +7206,261 @@ func TestCleanupPhysicalOnlyGenerationFenceLifecycle(t *testing.T) {
 	assert.Empty(t, claims.values)
 	assert.Empty(t, guards.values)
 	assert.Empty(t, markers.values)
+}
+
+func TestCleanupPhysicalOnlyTerminalFinalizesExactReplayBeforeDeletion(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		replay        aliasReplayValue
+		wantConverged bool
+	}{
+		{
+			name:          "active",
+			replay:        activeAliasReplayForTest(),
+			wantConverged: true,
+		},
+		{
+			name: "tagged publishing",
+			replay: boundAliasReplayForTest(aliasReplayValue{
+				TransitionMonotonicNS: uint64(10 * time.Second),
+				References:            1,
+				Lifecycle:             lifecyclePublishing,
+				DesiredLifecycle:      lifecycleConsumed,
+				ProducerTag:           generationGoProducerTag,
+			}),
+			wantConverged: true,
+		},
+		{
+			name: "untagged publishing",
+			replay: boundAliasReplayForTest(aliasReplayValue{
+				TransitionMonotonicNS: uint64(10 * time.Second),
+				References:            1,
+				Lifecycle:             lifecyclePublishing,
+				DesiredLifecycle:      lifecycleConsumed,
+			}),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			owner := Identity{TID: 3, PID: 2, Namespace: 1}
+			key := stateKey{Owner: owner, Generation: 10}
+			connectionKey := connectionInfoNS{
+				Connection: connectionInfo{SourcePort: 3, DestinationPort: 10},
+				NetNS:      owner.Namespace,
+			}
+			handler := testMapHandler(nil, nil, nil)
+			seedConnectionClaim(handler, connectionKey, owner, key.Generation)
+			cleanup := testCleanup(handler)
+			cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+			terminal := terminalValue{
+				Generation:          key.Generation,
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  testProcessIncarnation,
+				Lifecycle:           lifecycleConsumed,
+			}
+			claim := generationClaim{
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  terminal.ProcessIncarnation,
+				Lifecycle:           lifecycleCleanup,
+				Reserved:            [7]byte{terminal.Lifecycle},
+			}
+			guard := generationClaim{
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  key.Generation,
+				Lifecycle:           lifecycleCleanup,
+				Reserved:            [7]byte{lifecyclePublishing},
+			}
+			terminals := cleanup.maps.terminals.(*fakeBridgeMap)
+			claims := cleanup.maps.claims.(*fakeBridgeMap)
+			guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+			markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+			connections := cleanup.maps.connections.(*fakeBridgeMap)
+			cookies := cleanup.maps.cookieConnections.(*fakeBridgeMap)
+			replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+			terminals.values[owner] = terminal
+			claims.values[key] = claim
+			guards.values[owner] = guard
+			markers.values[key] = uint64(10 * time.Second)
+			replayKey := aliasReplayKeyForTerminal(key, terminal)
+			replays.values[replayKey] = test.replay
+
+			stats, err := cleanup.SweepWithStats()
+			require.NoError(t, err)
+			assert.Equal(t, CleanupStats{}, stats)
+			assert.Equal(t, terminal, terminals.values[owner])
+			assert.Equal(t, claim, claims.values[key])
+			assert.Equal(t, guard, guards.values[owner])
+			assert.Equal(t, uint64(10*time.Second), markers.values[key])
+			if !test.wantConverged {
+				assert.Len(t, connections.values, 1)
+				assert.Len(t, cookies.values, 1)
+				assert.Equal(t, test.replay, replays.values[replayKey])
+				return
+			}
+			assert.Empty(t, connections.values)
+			assert.Empty(t, cookies.values)
+			final := replays.values[replayKey].(aliasReplayValue)
+			assert.True(t, validAliasReplayFinal(final))
+			assert.Equal(t, terminal.Lifecycle, final.Lifecycle)
+
+			stats, err = cleanup.SweepWithStats()
+			require.NoError(t, err)
+			assert.Equal(t, CleanupStats{}, stats)
+			assert.Equal(t, terminal, terminals.values[owner])
+			assert.Empty(t, claims.values)
+			assert.Empty(t, guards.values)
+			assert.Empty(t, markers.values)
+		})
+	}
+}
+
+func TestCleanupExactTailPhysicalArtifactWithTerminalConverges(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	key := stateKey{Owner: owner, Generation: 10}
+	connectionKey := connectionInfoNS{
+		Connection: connectionInfo{SourcePort: 3, DestinationPort: 10},
+		NetNS:      owner.Namespace,
+	}
+	handler := testMapHandler(nil, nil, nil)
+	seedConnectionClaim(handler, connectionKey, owner, key.Generation)
+	cleanup := testCleanup(handler)
+	now := 41 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+	terminal := terminalValue{
+		Generation:          key.Generation,
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+		Lifecycle:           lifecycleConsumed,
+	}
+	terminals := cleanup.maps.terminals.(*fakeBridgeMap)
+	claims := cleanup.maps.claims.(*fakeBridgeMap)
+	guards := cleanup.maps.ownerGuards.(*fakeBridgeMap)
+	markers := cleanup.maps.ambiguity.(*fakeBridgeMap)
+	connections := cleanup.maps.connections.(*fakeBridgeMap)
+	cookies := cleanup.maps.cookieConnections.(*fakeBridgeMap)
+	replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+	terminals.values[owner] = terminal
+	claims.values[key] = exactMarkerTailClaimForTest(key, uint64(10*time.Second))
+	replayKey := aliasReplayKeyForTerminal(key, terminal)
+	replays.values[replayKey] = activeAliasReplayForTest()
+
+	stats, err := cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	upgraded := claims.values[key].(generationClaim)
+	assert.True(t, validGenerationCleanupClaim(upgraded))
+	assert.Equal(t, terminal.ProcessIncarnation, upgraded.ProcessIncarnation)
+	assert.Equal(t, [7]byte{terminal.Lifecycle}, upgraded.Reserved)
+	assert.Contains(t, guards.values, owner)
+	assert.Empty(t, markers.values)
+	assert.Len(t, connections.values, 1)
+	assert.Len(t, cookies.values, 1)
+	assert.Equal(t, activeAliasReplayForTest(), replays.values[replayKey])
+
+	now += 30*time.Second + time.Nanosecond
+	stats, err = cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Contains(t, markers.values, key)
+	assert.Len(t, connections.values, 1)
+	assert.Len(t, cookies.values, 1)
+
+	now += 30*time.Second + time.Nanosecond
+	stats, err = cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Empty(t, connections.values)
+	assert.Empty(t, cookies.values)
+	finalReplay := replays.values[replayKey].(aliasReplayValue)
+	assert.True(t, validAliasReplayFinal(finalReplay))
+	assert.Equal(t, terminal.Lifecycle, finalReplay.Lifecycle)
+	assert.Equal(t, terminal, terminals.values[owner])
+	assert.Contains(t, claims.values, key)
+	assert.Contains(t, guards.values, owner)
+	assert.Contains(t, markers.values, key)
+
+	stats, err = cleanup.SweepWithStats()
+	require.NoError(t, err)
+	assert.Equal(t, CleanupStats{}, stats)
+	assert.Equal(t, terminal, terminals.values[owner])
+	assert.Empty(t, claims.values)
+	assert.Empty(t, guards.values)
+	assert.Empty(t, markers.values)
+}
+
+func TestCleanupPhysicalFenceRevalidatesLateTerminalInsertion(t *testing.T) {
+	for _, test := range []struct {
+		name              string
+		insertAfterLookup int
+		wantCookieDeleted bool
+		wantError         bool
+	}{
+		{name: "during first authorization", insertAfterLookup: 1},
+		{
+			name:              "between cookie and connection",
+			insertAfterLookup: 2,
+			wantCookieDeleted: true,
+			wantError:         true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			owner := Identity{TID: 3, PID: 2, Namespace: 1}
+			key := stateKey{Owner: owner, Generation: 10}
+			connectionKey := connectionInfoNS{
+				Connection: connectionInfo{SourcePort: 3, DestinationPort: 10},
+				NetNS:      owner.Namespace,
+			}
+			handler := testMapHandler(nil, nil, nil)
+			seedConnectionClaim(handler, connectionKey, owner, key.Generation)
+			cleanup := testCleanup(handler)
+			cleanup.monoTimeNow = func() time.Duration { return 100 * time.Second }
+			seedAgedGenerationCleanupFence(t, cleanup, key, key.Generation)
+			terminal := terminalValue{
+				Generation:          key.Generation,
+				ObservedMonotonicNS: uint64(10 * time.Second),
+				ProcessIncarnation:  testProcessIncarnation,
+				Lifecycle:           lifecycleConsumed,
+			}
+			terminals := cleanup.maps.terminals.(*fakeBridgeMap)
+			injected := false
+			terminalMisses := 0
+			terminals.afterLookupResult = func(mapKey any, err error) {
+				if mapKey == owner && errors.Is(err, ebpf.ErrKeyNotExist) {
+					terminalMisses++
+					if !injected && terminalMisses == test.insertAfterLookup {
+						injected = true
+						terminals.values[owner] = terminal
+					}
+				}
+			}
+			connections := cleanup.maps.connections.(*fakeBridgeMap)
+			cookies := cleanup.maps.cookieConnections.(*fakeBridgeMap)
+			connection := connections.values[connectionKey].(connectionClaim)
+			claimsBefore := maps.Clone(cleanup.maps.claims.(*fakeBridgeMap).values)
+			guardsBefore := maps.Clone(cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+			markersBefore := maps.Clone(cleanup.maps.ambiguity.(*fakeBridgeMap).values)
+
+			deleted, err := cleanup.deleteConnectionIndexesFenced(
+				key, connectionKey, connection, 100*time.Second,
+			)
+			require.True(t, injected)
+			if test.wantError {
+				require.ErrorContains(t, err, "fence changed after cookie delete")
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, test.wantCookieDeleted, deleted)
+			assert.Contains(t, connections.values, connectionKey)
+			if test.wantCookieDeleted {
+				assert.Empty(t, cookies.values)
+			} else {
+				assert.Len(t, cookies.values, 1)
+			}
+			assert.Equal(t, claimsBefore, cleanup.maps.claims.(*fakeBridgeMap).values)
+			assert.Equal(t, guardsBefore, cleanup.maps.ownerGuards.(*fakeBridgeMap).values)
+			assert.Equal(t, markersBefore, cleanup.maps.ambiguity.(*fakeBridgeMap).values)
+			assert.Equal(t, terminal, terminals.values[owner])
+		})
+	}
 }
 
 func TestCleanupPhysicalOnlyRootReplacementStopsFenceAcquisition(t *testing.T) {

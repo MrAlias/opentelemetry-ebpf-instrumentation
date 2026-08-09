@@ -15393,49 +15393,2257 @@ benchmark_client_resolved_topology_is_least_privilege() {
   ' "$compose_json" >/dev/null
 }
 
+primary_live_fd_resolved_topology_is_scoped() {
+  local -r primary_fault_json="$1"
+  local -r live_fd_json="$2"
+
+  jq -e -s --slurpfile primary_fault "$primary_fault_json" '
+    length == 1
+    and ($primary_fault | length == 1)
+    and (
+      .[0] as $live_fd
+      | $live_fd.services["java-backend"] as $backend
+      | ($backend | type == "object")
+        and ($backend.user == "0:0")
+        and (($backend.privileged // false) == false)
+        and (($backend.pid // "") == "")
+        and (($backend.userns_mode // "") == "")
+        and (($backend.security_opt // []) == [])
+        and ($backend.cap_add == ["SYS_PTRACE"])
+        and (
+          ($live_fd | del(.services["java-backend"].cap_add)) == $primary_fault[0]
+        )
+    )
+  ' "$live_fd_json" >/dev/null
+}
+
+primary_fault_resolved_topology_is_scoped() {
+  local -r base_json="$1"
+  local -r primary_fault_json="$2"
+
+  jq -e -s --slurpfile base "$base_json" '
+    def normalize_environment:
+      if type == "array" then
+        map(
+          . as $entry
+          | ($entry | index("=")) as $separator
+          | {
+              key: $entry[0:$separator],
+              value: $entry[($separator + 1):]
+            }
+        )
+        | from_entries
+      else
+        .
+      end;
+    def normalize_environments:
+      .services |= with_entries(
+        .value |= (
+          if has("environment") then
+            .environment |= normalize_environment
+          else
+            .
+          end
+        )
+      );
+    length == 1
+    and ($base | length == 1)
+    and (
+      (.[0] | normalize_environments) as $primary_fault
+      | ($base[0] | normalize_environments) as $base_model
+      | $primary_fault.services["java-backend"] as $backend
+      | ($backend | type == "object")
+        and ($backend.user == "0:0")
+        and ($backend.environment.LD_PRELOAD ==
+          "/otel/libobi-java-remote-parent-fault.so")
+        and ($backend.environment.OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_FILE ==
+          "/run/obi-demo/fault/java-remote-parent.mode")
+        and ($backend.tmpfs == ["/run/obi-demo/fault:uid=0,gid=0,mode=0700"])
+        and (
+          (
+            $primary_fault
+            | del(
+                .services["java-backend"].user,
+                .services["java-backend"].environment.LD_PRELOAD,
+                .services["java-backend"].environment.OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_FILE,
+                .services["java-backend"].tmpfs
+              )
+          ) == $base_model
+        )
+    )
+  ' "$primary_fault_json" >/dev/null
+}
+
+assert_policy_rejection() {
+  local -r accepted_message="$1"
+  shift
+  local status=0
+
+  if "$@"; then
+    status=0
+  else
+    status=$?
+  fi
+  case "$status" in
+    0)
+      printf '%s\n' "$accepted_message" >&2
+      return 1
+      ;;
+    1)
+      return 0
+      ;;
+    *)
+      printf 'policy validator failed unexpectedly with status %d: %s\n' \
+        "$status" "$accepted_message" >&2
+      return "$status"
+      ;;
+  esac
+}
+
+assert_policy_acceptance() {
+  local -r rejected_message="$1"
+  shift
+  local status=0
+
+  if "$@"; then
+    return 0
+  else
+    status=$?
+  fi
+  if [[ "$status" == "1" ]]; then
+    printf '%s\n' "$rejected_message" >&2
+    return 1
+  fi
+  printf 'policy validator failed unexpectedly with status %d: %s\n' \
+    "$status" "$rejected_message" >&2
+  return "$status"
+}
+
+assert_json_fixture_shape() {
+  local -r fixture_file="$1"
+  local -r fixture_filter="$2"
+  local -r failure_message="$3"
+  local status=0
+
+  if jq -e "$fixture_filter" "$fixture_file" >/dev/null; then
+    return 0
+  else
+    status=$?
+  fi
+  if [[ "$status" == "1" ]]; then
+    printf '%s\n' "$failure_message" >&2
+    return 1
+  fi
+  printf 'fixture validation failed unexpectedly with status %d: %s\n' \
+    "$status" "$failure_message" >&2
+  return "$status"
+}
+
+resolve_compose_model_without_interpolation() {
+  local -r compose_json="$1"
+  shift
+  local -a compose_files=()
+  local compose_file=""
+
+  for compose_file in "$@"; do
+    compose_files+=(--file "$compose_file")
+  done
+  if ! COMPOSE_PROFILES='*' docker compose \
+    --project-name "$PROJECT_NAME" \
+    --project-directory "$TEST_SCRIPT_DIR/.." "${compose_files[@]}" \
+    config --format json --no-consistency --no-interpolate >"$compose_json"; then
+    return 2
+  fi
+}
+
+resolve_compose_fixture_without_interpolation() {
+  local -r compose_file="$1"
+  local -r compose_json="$2"
+
+  resolve_compose_model_without_interpolation "$compose_json" "$compose_file"
+}
+
+resolve_compose_fixture() {
+  local -r compose_file="$1"
+  local -r compose_json="$2"
+
+  if ! COMPOSE_PROFILES='*' docker compose \
+    --project-name "$PROJECT_NAME" \
+    --project-directory "$TEST_SCRIPT_DIR/.." --file "$compose_file" \
+    config --format json >"$compose_json"; then
+    return 2
+  fi
+}
+
+compose_overlay_is_interpolation_free() {
+  local -r compose_file="$1"
+  local -r compose_json="$TEST_TMP_DIR/compose-overlay-interpolation-check.json"
+
+  resolve_compose_fixture_without_interpolation \
+    "$compose_file" "$compose_json" || return $?
+  jq -e -s '
+      length == 1
+      and ([.[0] | .. | strings | select(contains("$"))] | length == 0)
+      and ([.[0] | .. | objects | keys[] | select(contains("$"))] | length == 0)
+    ' "$compose_json" >/dev/null
+}
+
+compose_source_model_build_arguments_are_allowlisted() {
+  local -r compose_json="$1"
+  local example_directory=""
+  local repository_root=""
+
+  example_directory="$(cd -- "$TEST_SCRIPT_DIR/.." && pwd -P)" || return 2
+  repository_root="$(cd -- "$example_directory/../.." && pwd -P)" || return 2
+  jq -e -s \
+    --arg example_directory "$example_directory" \
+    --arg repository_root "$repository_root" '
+    def normalize_build_arguments:
+      if type == "object" then
+        to_entries
+        | if all(
+            .[];
+            (.key | test("^[A-Za-z_][A-Za-z0-9_]*$"))
+            and ((.value | type) == "string")
+          ) then
+            .
+          else
+            null
+          end
+      elif type == "array" then
+        map(
+          if type == "string"
+            and test("^[A-Za-z_][A-Za-z0-9_]*=") then
+            (index("=")) as $separator
+            | {
+                key: .[0:$separator],
+                value: .[($separator + 1):]
+              }
+          else
+            null
+          end
+        ) as $arguments
+        | ($arguments | map(select(. != null) | .key)) as $keys
+        | if ($arguments | all(. != null))
+          and (($keys | length) == ($keys | unique | length)) then
+            $arguments
+          else
+            null
+          end
+      else
+        null
+      end;
+    def expected_obi_build_arguments:
+      [
+        {
+          key: "RELEASE_REVISION",
+          value: "local"
+        },
+        {
+          key: "RELEASE_VERSION",
+          value: "apache-java-https-demo"
+        }
+      ];
+    def build_is_allowlisted($service; $build):
+      if ($build | type) != "object" then
+        false
+      elif $service == "java-backend" then
+        $build == {
+          context: $example_directory,
+          dockerfile: "java/Dockerfile"
+        }
+      elif $service == "obi" then
+        (($build | keys) == ["args", "context", "dockerfile"])
+        and ($build.context == $repository_root)
+        and ($build.dockerfile == "Dockerfile")
+        and (
+          ($build.args | normalize_build_arguments) as $arguments
+          | ($arguments != null)
+            and (($arguments | sort_by([.key, .value]))
+              == (expected_obi_build_arguments | sort_by([.key, .value])))
+        )
+      elif $service == "trace-receiver" then
+        $build == {
+          context: $repository_root,
+          dockerfile: "examples/apache-java-https/tracecheck/Dockerfile"
+        }
+      else
+        false
+      end;
+    length == 1
+    and (.[0].services | type) == "object"
+    and all(
+      .[0].services | to_entries[];
+      . as $service
+      | if ($service.value | type) != "object" then
+          false
+        elif ($service.value | has("build")) then
+          build_is_allowlisted($service.key; $service.value.build)
+        else
+          true
+        end
+    )
+  ' "$compose_json" >/dev/null
+}
+
+compose_file_build_arguments_are_explicit() {
+  local -r compose_file="$1"
+  local -r compose_json="$TEST_TMP_DIR/compose-source-build-arguments.json"
+  local compose_help=""
+  local required_flag=""
+
+  compose_help="$(LC_ALL=C docker compose config --help 2>&1)" || return 2
+  for required_flag in \
+    --no-consistency \
+    --no-interpolate \
+    --no-normalize; do
+    if [[ ! "$compose_help" =~ (^|[[:space:]])${required_flag}([[:space:]]|$) ]]; then
+      printf 'docker compose config lacks required flag: %s\n' \
+        "$required_flag" >&2
+      return 2
+    fi
+  done
+  if ! COMPOSE_PROFILES='*' docker compose \
+    --project-name "$PROJECT_NAME" \
+    --project-directory "$TEST_SCRIPT_DIR/.." --file "$compose_file" \
+    config --format json --no-consistency --no-interpolate \
+    --no-normalize >"$compose_json"; then
+    return 2
+  fi
+  compose_source_model_build_arguments_are_allowlisted "$compose_json"
+}
+
+compose_runtime_model_interpolation_is_allowlisted() {
+  local -r compose_json="$1"
+  local -r expected_project_name="$PROJECT_NAME"
+  local example_directory=""
+  local expected_benchmark_source=""
+  local repository_root=""
+
+  example_directory="$(cd -- "$TEST_SCRIPT_DIR/.." && pwd -P)" || return 2
+  repository_root="$(cd -- "$example_directory/../.." && pwd -P)" || return 2
+  expected_benchmark_source="$example_directory/\${BENCHMARK_CA_SOURCE:-./.runtime/certs/ca.crt}"
+  jq -e -s \
+    --arg example_directory "$example_directory" \
+    --arg expected_project_name "$expected_project_name" \
+    --arg repository_root "$repository_root" \
+    --arg expected_benchmark_source "$expected_benchmark_source" '
+    def environment_array_keys:
+      map(
+        . as $entry
+        | ($entry | index("=")) as $separator
+        | $entry[0:$separator]
+      );
+    def environments_are_explicit:
+      (.services | type) == "object"
+      and all(
+        .services[];
+        if type != "object" then
+          false
+        elif has("environment") then
+          .environment as $environment
+          | if ($environment | type) == "array" then
+              all(
+                $environment[];
+                if type == "string" then
+                  test("^[A-Za-z_][A-Za-z0-9_]*=")
+                else
+                  false
+                end
+              )
+              and (
+                ($environment | environment_array_keys | length) ==
+                ($environment | environment_array_keys | unique | length)
+              )
+            elif ($environment | type) == "object" then
+              all(
+                $environment | to_entries[];
+                (.key | test("^[A-Za-z_][A-Za-z0-9_]*$"))
+                and ((.value | type) == "string")
+              )
+            else
+              false
+            end
+        else
+          true
+        end
+      );
+    def expected_obi_build_arguments:
+      [
+        {
+          key: "RELEASE_REVISION",
+          value: "local"
+        },
+        {
+          key: "RELEASE_VERSION",
+          value: "apache-java-https-demo"
+        }
+      ];
+    def normalize_build_arguments:
+      if type == "object" then
+        to_entries
+        | if all(
+            .[];
+            (.key | test("^[A-Za-z_][A-Za-z0-9_]*$"))
+            and ((.value | type) == "string")
+          ) then
+            .
+          else
+            null
+          end
+      elif type == "array" then
+        map(
+          if type == "string"
+            and test("^[A-Za-z_][A-Za-z0-9_]*=") then
+            (index("=")) as $separator
+            | {
+                key: .[0:$separator],
+                value: .[($separator + 1):]
+              }
+          else
+            null
+          end
+        ) as $arguments
+        | ($arguments | map(select(. != null) | .key)) as $keys
+        | if ($arguments | all(. != null))
+          and (($keys | length) == ($keys | unique | length)) then
+            $arguments
+          else
+            null
+          end
+      else
+        null
+      end;
+    def build_is_allowlisted($service; $build):
+      if ($build | type) != "object" then
+        false
+      elif $service == "java-backend" then
+        $build == {
+          context: $example_directory,
+          dockerfile: "java/Dockerfile"
+        }
+      elif $service == "obi" then
+        (($build | keys) == ["args", "context", "dockerfile"])
+        and ($build.context == $repository_root)
+        and ($build.dockerfile == "Dockerfile")
+        and (
+          ($build.args | normalize_build_arguments) as $arguments
+          | ($arguments != null)
+            and (($arguments | sort_by([.key, .value]))
+              == (expected_obi_build_arguments | sort_by([.key, .value])))
+        )
+      elif $service == "trace-receiver" then
+        $build == {
+          context: $repository_root,
+          dockerfile: "examples/apache-java-https/tracecheck/Dockerfile"
+        }
+      else
+        false
+      end;
+    def build_inputs_are_explicit:
+      all(
+        .services | to_entries[];
+        . as $service
+        | if ($service.value | type) != "object" then
+          false
+        elif ($service.value | has("build")) then
+          build_is_allowlisted($service.key; $service.value.build)
+        else
+          true
+        end
+      );
+    def service_environment_files_are_absent:
+      all(
+        .services[];
+        if type != "object" then
+          false
+        elif has("env_file") then
+          ((.env_file | type) == "array") and ((.env_file | length) == 0)
+        else
+          true
+        end
+      );
+    def dynamic_named_sources_are_absent:
+      (((.secrets // {}) | type) == "object")
+      and all(
+        (.secrets // {})[];
+        if type == "object" then
+          (has("environment") | not)
+          and (has("file") | not)
+          and ((.external // false) == false)
+        else
+          false
+        end
+      )
+      and (((.configs // {}) | type) == "object")
+      and all(
+        (.configs // {})[];
+        if type == "object" then
+          (has("environment") | not)
+          and (has("file") | not)
+          and ((.external // false) == false)
+        else
+          false
+        end
+      );
+    def expected_mounts:
+      [
+        {
+          service: "apache-proxy",
+          volume: {
+            bind: {create_host_path: true},
+            read_only: true,
+            source: "\($example_directory)/apache/httpd.conf",
+            target: "/usr/local/apache2/conf/httpd.conf",
+            type: "bind"
+          }
+        },
+        {
+          service: "apache-proxy",
+          volume: {
+            bind: {create_host_path: true},
+            read_only: true,
+            source: "\($example_directory)/.runtime/certs/ca.crt",
+            target: "/run/obi-demo/certs/ca.crt",
+            type: "bind"
+          }
+        },
+        {
+          service: "benchmark",
+          volume: {
+            bind: {create_host_path: false},
+            read_only: true,
+            source: $expected_benchmark_source,
+            target: "/benchmark-ca.crt",
+            type: "bind"
+          }
+        },
+        {
+          service: "bridge-fault",
+          volume: {
+            source: "java-remote-parent-socket",
+            target: "/var/run/obi",
+            type: "volume",
+            volume: {}
+          }
+        },
+        {
+          service: "coalesced-source",
+          volume: {
+            bind: {create_host_path: true},
+            read_only: true,
+            source: "\($example_directory)/.runtime/certs/ca.crt",
+            target: "/run/obi-demo/certs/ca.crt",
+            type: "bind"
+          }
+        },
+        {
+          service: "java-backend",
+          volume: {
+            bind: {create_host_path: true},
+            read_only: true,
+            source: "\($example_directory)/.runtime/certs/server.p12",
+            target: "/run/obi-demo/certs/server.p12",
+            type: "bind"
+          }
+        },
+        {
+          service: "java-backend",
+          volume: {
+            source: "java-remote-parent-socket",
+            target: "/var/run/obi",
+            type: "volume",
+            volume: {}
+          }
+        },
+        {
+          service: "obi",
+          volume: {
+            bind: {create_host_path: true},
+            read_only: true,
+            source: "\($example_directory)/configs/obi.yaml",
+            target: "/config/obi.yaml",
+            type: "bind"
+          }
+        },
+        {
+          service: "obi",
+          volume: {
+            source: "java-remote-parent-socket",
+            target: "/var/run/obi",
+            type: "volume",
+            volume: {}
+          }
+        },
+        {
+          service: "obi",
+          volume: {
+            bind: {create_host_path: true},
+            read_only: true,
+            source: "/sys/fs/cgroup",
+            target: "/sys/fs/cgroup",
+            type: "bind"
+          }
+        },
+        {
+          service: "obi",
+          volume: {
+            bind: {create_host_path: true},
+            read_only: true,
+            source: "/sys/kernel/security",
+            target: "/sys/kernel/security",
+            type: "bind"
+          }
+        },
+        {
+          service: "obi",
+          volume: {
+            bind: {create_host_path: true},
+            read_only: true,
+            source: "/sys/kernel/tracing",
+            target: "/sys/kernel/tracing",
+            type: "bind"
+          }
+        },
+        {
+          service: "obi",
+          volume: {
+            bind: {create_host_path: true},
+            read_only: true,
+            source: "/sys/kernel/debug",
+            target: "/sys/kernel/debug",
+            type: "bind"
+          }
+        },
+        {
+          service: "security-probe",
+          volume: {
+            source: "java-remote-parent-socket",
+            target: "/var/run/obi",
+            type: "volume",
+            volume: {}
+          }
+        },
+        {
+          service: "security-unix-sibling-probe",
+          volume: {
+            read_only: true,
+            source: "java-remote-parent-socket",
+            target: "/var/run/obi",
+            type: "volume",
+            volume: {}
+          }
+        },
+        {
+          service: "socket-init",
+          volume: {
+            source: "java-remote-parent-socket",
+            target: "/var/run/obi",
+            type: "volume",
+            volume: {}
+          }
+        }
+      ];
+    def mount_sort_key:
+      [.service, .volume.type, .volume.target, .volume.source];
+    def empty_attachment_field($field):
+      if has($field) then
+        (.[$field] == null)
+        or (.[$field] == false)
+        or (.[$field] == [])
+        or (.[$field] == {})
+      else
+        true
+      end;
+    def discard_empty_topology_fields:
+      with_entries(
+        select(
+          (.key == "service")
+          or (
+            (.value != null)
+            and (.value != false)
+            and (.value != "")
+            and (.value != [])
+            and (.value != {})
+          )
+        )
+      );
+    def discard_legacy_null_service_defaults:
+      if .command? == null then del(.command) else . end
+      | if .entrypoint? == null then del(.entrypoint) else . end;
+    def discard_legacy_false_volume_default:
+      if .external? == false then del(.external) else . end;
+    def normalize_environment:
+      if type == "array" then
+        map(
+          . as $entry
+          | ($entry | index("=")) as $separator
+          | {
+              key: $entry[0:$separator],
+              value: $entry[($separator + 1):]
+            }
+        )
+        | from_entries
+      else
+        .
+      end;
+    def service_execution_topology:
+      [
+        .services | to_entries[] as $service
+        | {
+            service: $service.key,
+            command: $service.value.command?,
+            entrypoint: $service.value.entrypoint?,
+            environment: (
+              $service.value.environment? | normalize_environment
+            )
+          }
+        | discard_empty_topology_fields
+      ]
+      | sort_by(.service);
+    def expected_service_execution_topology:
+      [
+        {
+          service: "apache-proxy",
+          environment: {
+            BACKEND_TLS_PROTOCOL: "${BACKEND_TLS_PROTOCOL:-TLSv1.3}"
+          }
+        },
+        {
+          service: "benchmark",
+          entrypoint: ["/trace-benchmark"]
+        },
+        {
+          service: "bridge-fault",
+          entrypoint: [
+            "/fault-bridge",
+            "--socket",
+            "/var/run/obi/java-remote-parent.sock",
+            "--matching-valid-takes",
+            "${MATCHING_VALID_TAKES:-1}"
+          ],
+          environment: {
+            FAULT_MODE: "${FAULT_MODE:-alternating}"
+          }
+        },
+        {
+          service: "coalesced-source",
+          entrypoint: ["/coalesced-source"],
+          environment: {
+            BACKEND_ADDRESS: "127.0.0.1:18444",
+            BACKEND_TLS_PROTOCOL: "${BACKEND_TLS_PROTOCOL:-TLSv1.3}",
+            CA_PATH: "/run/obi-demo/certs/ca.crt",
+            LISTEN_ADDRESS: "127.0.0.1:18081"
+          }
+        },
+        {
+          service: "java-backend",
+          environment: {
+            HTTPS_PORT: "18443",
+            JAVA_TOOL_OPTIONS:
+              "${JAVA_TOOL_OPTIONS_VALUE--javaagent:/otel/official-javaagent.jar}",
+            LD_PRELOAD: "/otel/libobi-java-remote-parent-fault.so",
+            NETTY_HTTPS_PORT: "18444",
+            OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_FILE:
+              "/run/obi-demo/fault/java-remote-parent.mode",
+            OTEL_BSP_EXPORT_TIMEOUT: "5000",
+            OTEL_BSP_SCHEDULE_DELAY:
+              "${OTEL_BSP_SCHEDULE_DELAY_VALUE:-100}",
+            OTEL_EXPORTER_OTLP_ENDPOINT: "http://127.0.0.1:14318",
+            OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf",
+            OTEL_INSTRUMENTATION_HTTP_SERVER_CAPTURE_REQUEST_HEADERS:
+              "x-obi-demo-id",
+            OTEL_JAVAAGENT_EXTENSIONS:
+              "${OTEL_JAVAAGENT_EXTENSIONS_VALUE-/otel/obi-otel-extension.jar}",
+            OTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED:
+              "${OTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED_VALUE:-false}",
+            OTEL_LOGS_EXPORTER: "none",
+            OTEL_METRICS_EXPORTER: "none",
+            OTEL_OBI_REMOTE_PARENT_ENABLED: "${EXTENSION_ENABLED:-true}",
+            OTEL_PROPAGATORS:
+              "${OTEL_PROPAGATORS_VALUE:-obi,tracecontext,baggage}",
+            OTEL_SERVICE_NAME: "java-backend",
+            OTEL_TRACES_SAMPLER: "always_on",
+            TLS_BOUNDARY_COALESCED_HTTPS_PORT: "18446",
+            TLS_BOUNDARY_SPLIT_HTTPS_PORT: "18445",
+            TLS_KEYSTORE_PASSWORD: "changeit",
+            TLS_KEYSTORE_PATH: "/run/obi-demo/certs/server.p12",
+            TLS_PROTOCOL: "${BACKEND_TLS_PROTOCOL:-TLSv1.3}",
+            TLS_RECEIVE_BOUNDARY_FIXTURE_ENABLED: "1"
+          }
+        },
+        {
+          service: "map-pressure",
+          entrypoint: ["/map-pressure"]
+        },
+        {
+          service: "map-state",
+          entrypoint: ["/map-state"]
+        },
+        {
+          service: "obi",
+          command: ["--config=/config/obi.yaml"],
+          environment: {
+            OTEL_EBPF_BPF_CONTEXT_PROPAGATION:
+              "${CONTEXT_PROPAGATION:-tcp}",
+            OTEL_EBPF_JAVA_REMOTE_PARENT_RETRIEVAL_TTL:
+              "${REMOTE_PARENT_RETRIEVAL_TTL:-0s}",
+            OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_GROUP_ID: "65534",
+            OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_PATH:
+              "/var/run/obi/java-remote-parent.sock",
+            OTEL_EBPF_JAVA_REMOTE_PARENT_TIMEOUT: "50ms",
+            OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT:
+              "${BRIDGE_TRANSPORT:-getsockopt}",
+            OTEL_EBPF_JAVA_REMOTE_PARENT_TTL:
+              "${REMOTE_PARENT_TTL:-30s}"
+          }
+        },
+        {
+          service: "scenario",
+          entrypoint: ["/trace-scenario"]
+        },
+        {
+          service: "security-probe",
+          entrypoint: [
+            "/security-probe",
+            "--socket",
+            "/var/run/obi/java-remote-parent.sock",
+            "--mode",
+            "${SECURITY_PROBE_MODE:-abuse}",
+            "--timeout",
+            "${SECURITY_PROBE_TIMEOUT:-60s}"
+          ]
+        },
+        {
+          service: "security-unix-sibling-probe",
+          entrypoint: [
+            "/security-probe",
+            "--socket",
+            "/var/run/obi/java-remote-parent.sock",
+            "--mode",
+            "abuse-race",
+            "--timeout",
+            "${SECURITY_PROBE_TIMEOUT:-60s}"
+          ]
+        },
+        {
+          service: "socket-init",
+          command: [
+            "chown 0:65534 /var/run/obi && chmod 0750 /var/run/obi"
+          ],
+          entrypoint: ["/bin/sh", "-ec"]
+        },
+        {
+          service: "trace-receiver",
+          environment: {
+            LISTEN_ADDRESS: "127.0.0.1:14318",
+            MAX_RETAINED_BYTES: "67108864",
+            MAX_SPANS: "10000",
+            MAX_VALUE_BYTES: "4096"
+          }
+        }
+      ];
+    def service_security_topology:
+      [
+        .services | to_entries[] as $service
+        | {
+            service: $service.key,
+            image: $service.value.image?,
+            labels: $service.value.labels?,
+            pull_policy: $service.value.pull_policy?,
+            restart: $service.value.restart?,
+            privileged: $service.value.privileged?,
+            cap_add: $service.value.cap_add?,
+            cap_drop: $service.value.cap_drop?,
+            group_add: $service.value.group_add?,
+            security_opt: $service.value.security_opt?,
+            read_only: $service.value.read_only?,
+            user: $service.value.user?,
+            network_mode: $service.value.network_mode?,
+            networks: $service.value.networks?,
+            ports: $service.value.ports?,
+            expose: $service.value.expose?,
+            extra_hosts: $service.value.extra_hosts?,
+            dns: $service.value.dns?,
+            dns_search: $service.value.dns_search?,
+            dns_opt: $service.value.dns_opt?,
+            external_links: $service.value.external_links?,
+            links: $service.value.links?,
+            pid: $service.value.pid?,
+            ipc: $service.value.ipc?,
+            uts: $service.value.uts?,
+            userns_mode: $service.value.userns_mode?,
+            cgroup: $service.value.cgroup?,
+            cgroup_parent: $service.value.cgroup_parent?,
+            runtime: $service.value.runtime?,
+            isolation: $service.value.isolation?,
+            sysctls: $service.value.sysctls?,
+            hostname: $service.value.hostname?,
+            domainname: $service.value.domainname?,
+            mac_address: $service.value.mac_address?
+          }
+        | discard_empty_topology_fields
+      ]
+      | sort_by(.service);
+    def service_key_topology:
+      [
+        .services | to_entries[]
+        | {
+            service: .key,
+            keys: (.value | discard_legacy_null_service_defaults | keys)
+          }
+      ]
+      | sort_by(.service);
+    def expected_service_key_topology:
+      [
+        {
+          service: "apache-proxy",
+          keys: [
+            "depends_on", "environment", "image", "labels",
+            "network_mode", "restart", "volumes"
+          ]
+        },
+        {
+          service: "benchmark",
+          keys: [
+            "cap_drop", "entrypoint", "image", "labels", "network_mode",
+            "profiles", "read_only", "security_opt", "user", "volumes"
+          ]
+        },
+        {
+          service: "bridge-fault",
+          keys: [
+            "entrypoint", "environment", "image", "labels",
+            "network_mode", "profiles", "user", "volumes"
+          ]
+        },
+        {
+          service: "coalesced-source",
+          keys: [
+            "depends_on", "entrypoint", "environment", "image", "labels",
+            "network_mode", "restart", "volumes"
+          ]
+        },
+        {
+          service: "java-backend",
+          keys: [
+            "build", "cap_add", "depends_on", "environment", "image",
+            "labels", "network_mode", "restart", "tmpfs", "user",
+            "volumes"
+          ]
+        },
+        {
+          service: "map-pressure",
+          keys: [
+            "entrypoint", "image", "labels", "network_mode", "privileged",
+            "profiles"
+          ]
+        },
+        {
+          service: "map-state",
+          keys: [
+            "entrypoint", "image", "labels", "network_mode", "privileged",
+            "profiles"
+          ]
+        },
+        {
+          service: "obi",
+          keys: [
+            "build", "command", "depends_on", "environment", "image",
+            "labels", "network_mode", "pid", "privileged", "restart",
+            "volumes"
+          ]
+        },
+        {
+          service: "scenario",
+          keys: ["entrypoint", "image", "labels", "network_mode", "profiles"]
+        },
+        {
+          service: "security-probe",
+          keys: [
+            "entrypoint", "image", "labels", "network_mode", "profiles",
+            "user", "volumes"
+          ]
+        },
+        {
+          service: "security-unix-sibling-probe",
+          keys: [
+            "cap_drop", "entrypoint", "image", "labels", "network_mode",
+            "profiles", "read_only", "security_opt", "user", "volumes"
+          ]
+        },
+        {
+          service: "socket-init",
+          keys: [
+            "command", "entrypoint", "image", "labels", "network_mode",
+            "restart", "user", "volumes"
+          ]
+        },
+        {
+          service: "trace-receiver",
+          keys: [
+            "build", "environment", "image", "labels", "network_mode",
+            "restart"
+          ]
+        }
+      ];
+    def dependency_topology:
+      [
+        .services | to_entries[]
+        | select(.value.depends_on? != null)
+        | {service: .key, depends_on: .value.depends_on}
+      ]
+      | sort_by(.service);
+    def expected_dependency_topology:
+      [
+        {
+          service: "apache-proxy",
+          depends_on: {
+            "coalesced-source": {
+              condition: "service_started",
+              required: true
+            },
+            "java-backend": {
+              condition: "service_started",
+              required: true
+            }
+          }
+        },
+        {
+          service: "coalesced-source",
+          depends_on: {
+            "java-backend": {
+              condition: "service_started",
+              required: true
+            }
+          }
+        },
+        {
+          service: "java-backend",
+          depends_on: {
+            "socket-init": {
+              condition: "service_completed_successfully",
+              required: true
+            },
+            "trace-receiver": {
+              condition: "service_started",
+              required: true
+            }
+          }
+        },
+        {
+          service: "obi",
+          depends_on: {
+            "apache-proxy": {
+              condition: "service_started",
+              required: true
+            },
+            "java-backend": {
+              condition: "service_started",
+              required: true
+            },
+            "socket-init": {
+              condition: "service_completed_successfully",
+              required: true
+            },
+            "trace-receiver": {
+              condition: "service_started",
+              required: true
+            }
+          }
+        }
+      ];
+    def ownership_labels:
+      {
+        "io.opentelemetry.obi.apache-java-https.owner":
+          "acceptance-demo-v1"
+      };
+    def apache_image:
+      "httpd:2.4.68-alpine@sha256:1b766f17b84026429b7cb243317b142921b24432336e798bc881c43f45ed9567";
+    def tracecheck_image:
+      "obi-apache-java-https-tracecheck:local";
+    def expected_service_security_topology:
+      [
+        {
+          service: "apache-proxy",
+          image: apache_image,
+          labels: ownership_labels,
+          network_mode: "host",
+          restart: "no"
+        },
+        {
+          service: "benchmark",
+          cap_drop: ["ALL"],
+          image: tracecheck_image,
+          labels: ownership_labels,
+          network_mode: "host",
+          read_only: true,
+          security_opt: ["no-new-privileges:true"],
+          user: "65532:65532"
+        },
+        {
+          service: "bridge-fault",
+          image: tracecheck_image,
+          labels: ownership_labels,
+          network_mode: "none",
+          user: "0:0"
+        },
+        {
+          service: "coalesced-source",
+          image: tracecheck_image,
+          labels: ownership_labels,
+          network_mode: "host",
+          restart: "no"
+        },
+        {
+          service: "java-backend",
+          cap_add: ["SYS_PTRACE"],
+          image: "obi-apache-java-https-backend:local",
+          labels: ownership_labels,
+          network_mode: "host",
+          restart: "no",
+          user: "0:0"
+        },
+        {
+          service: "map-pressure",
+          image: tracecheck_image,
+          labels: ownership_labels,
+          network_mode: "none",
+          privileged: true
+        },
+        {
+          service: "map-state",
+          image: tracecheck_image,
+          labels: ownership_labels,
+          network_mode: "none",
+          privileged: true
+        },
+        {
+          service: "obi",
+          image: "obi-apache-java-https:local",
+          labels: ownership_labels,
+          network_mode: "host",
+          pid: "host",
+          privileged: true,
+          restart: "no"
+        },
+        {
+          service: "scenario",
+          image: tracecheck_image,
+          labels: ownership_labels,
+          network_mode: "host"
+        },
+        {
+          service: "security-probe",
+          image: tracecheck_image,
+          labels: ownership_labels,
+          network_mode: "none",
+          user: "0:0"
+        },
+        {
+          service: "security-unix-sibling-probe",
+          cap_drop: ["ALL"],
+          image: tracecheck_image,
+          labels: ownership_labels,
+          network_mode: "none",
+          read_only: true,
+          security_opt: ["no-new-privileges:true"],
+          user: "65534:65534"
+        },
+        {
+          service: "socket-init",
+          image: apache_image,
+          labels: ownership_labels,
+          network_mode: "none",
+          restart: "no",
+          user: "0:0"
+        },
+        {
+          service: "trace-receiver",
+          image: tracecheck_image,
+          labels: ownership_labels,
+          network_mode: "host",
+          restart: "no"
+        }
+      ];
+    def mount_topology_is_allowlisted:
+      . as $model
+      | [
+          $model.services | to_entries[] as $service
+          | ($service.value.volumes? // []) as $volumes
+          | if ($volumes | type) == "array" then
+              $volumes[]
+              | if .type == "bind" then
+                  .bind = (
+                    (.bind // {}) + {
+                      create_host_path: (.bind.create_host_path? // false)
+                    }
+                  )
+                else
+                  .
+                end
+              | {service: $service.key, volume: .}
+            else
+              empty
+            end
+        ]
+        | sort_by(mount_sort_key) as $mounts
+      | [
+          $model.services | to_entries[] as $service
+          | select(
+              (($service.value.tmpfs? // []) | type) == "array"
+              and (($service.value.tmpfs? // []) | length) > 0
+            )
+          | {service: $service.key, tmpfs: $service.value.tmpfs}
+      ]
+        | sort_by(.service) as $tmpfs
+      | (expected_mounts | sort_by(mount_sort_key)) as $allowed_mounts
+      | [
+          {
+            service: "java-backend",
+            tmpfs: ["/run/obi-demo/fault:uid=0,gid=0,mode=0700"]
+          }
+        ] as $allowed_tmpfs
+      | (
+          all(
+            $model.services[];
+            (if has("volumes") then (.volumes | type) == "array" else true end)
+            and (if has("tmpfs") then (.tmpfs | type) == "array" else true end)
+            and empty_attachment_field("volumes_from")
+            and empty_attachment_field("devices")
+            and empty_attachment_field("device_cgroup_rules")
+            and empty_attachment_field("gpus")
+            and empty_attachment_field("blkio_config")
+            and empty_attachment_field("secrets")
+            and empty_attachment_field("configs")
+            and empty_attachment_field("credential_spec")
+            and empty_attachment_field("use_api_socket")
+            and empty_attachment_field("develop")
+            and empty_attachment_field("models")
+            and empty_attachment_field("provider")
+            and empty_attachment_field("label_file")
+            and empty_attachment_field("post_start")
+            and empty_attachment_field("pre_stop")
+            and empty_attachment_field("deploy")
+            and empty_attachment_field("scale")
+            and empty_attachment_field("container_name")
+            and empty_attachment_field("logging")
+            and empty_attachment_field("pids_limit")
+            and empty_attachment_field("shm_size")
+            and empty_attachment_field("oom_kill_disable")
+            and empty_attachment_field("oom_score_adj")
+            and empty_attachment_field("ulimits")
+            and empty_attachment_field("storage_opt")
+            and empty_attachment_field("init")
+            and empty_attachment_field("healthcheck")
+          )
+          and (($model.secrets // {}) == {})
+          and (($model.configs // {}) == {})
+          and (($model.models // {}) == {})
+          and ($model.name == $expected_project_name)
+          and (
+            ($model.volumes // {})
+            | with_entries(.value |= discard_legacy_false_volume_default)
+          ) == {
+              "java-remote-parent-socket": {
+                labels: {
+                  "io.opentelemetry.obi.apache-java-https.owner":
+                    "acceptance-demo-v1"
+                },
+                name: "\($expected_project_name)_java-remote-parent-socket"
+              }
+            }
+          and ($mounts == $allowed_mounts)
+          and ($tmpfs == $allowed_tmpfs)
+          and (($model | service_key_topology)
+            == expected_service_key_topology)
+          and (($model | dependency_topology)
+            == expected_dependency_topology)
+          and (($model | service_execution_topology)
+            == expected_service_execution_topology)
+          and (($model | service_security_topology)
+            == expected_service_security_topology)
+          and (
+            [
+              $model.services | to_entries[]
+              | select((.value.profiles // []) != [])
+              | {service: .key, profiles: .value.profiles}
+            ]
+            | sort_by(.service)
+          ) == [
+            {service: "benchmark", profiles: ["tools"]},
+            {service: "bridge-fault", profiles: ["tools"]},
+            {service: "map-pressure", profiles: ["tools"]},
+            {service: "map-state", profiles: ["tools"]},
+            {service: "scenario", profiles: ["tools"]},
+            {service: "security-probe", profiles: ["tools"]},
+            {service: "security-unix-sibling-probe", profiles: ["tools"]}
+          ]
+          and (
+            (($model.networks // {}) == {})
+            or (($model.networks // {}) == {
+              default: {
+                labels: {
+                  "io.opentelemetry.obi.apache-java-https.owner":
+                    "acceptance-demo-v1"
+                },
+                name: "\($expected_project_name)_default"
+              }
+            })
+          )
+        );
+    def normalize_environments:
+      .services |= with_entries(
+        .value |= (
+          if has("environment") then
+            .environment |= normalize_environment
+          else
+            .
+          end
+        )
+      );
+    def allowed_interpolations:
+      [
+        {
+          path: ["services", "apache-proxy", "environment", "BACKEND_TLS_PROTOCOL"],
+          value: "${BACKEND_TLS_PROTOCOL:-TLSv1.3}"
+        },
+        {
+          path: ["services", "bridge-fault", "environment", "FAULT_MODE"],
+          value: "${FAULT_MODE:-alternating}"
+        },
+        {
+          path: ["services", "coalesced-source", "environment", "BACKEND_TLS_PROTOCOL"],
+          value: "${BACKEND_TLS_PROTOCOL:-TLSv1.3}"
+        },
+        {
+          path: ["services", "java-backend", "environment", "JAVA_TOOL_OPTIONS"],
+          value: "${JAVA_TOOL_OPTIONS_VALUE--javaagent:/otel/official-javaagent.jar}"
+        },
+        {
+          path: ["services", "java-backend", "environment", "OTEL_BSP_SCHEDULE_DELAY"],
+          value: "${OTEL_BSP_SCHEDULE_DELAY_VALUE:-100}"
+        },
+        {
+          path: ["services", "java-backend", "environment", "OTEL_JAVAAGENT_EXTENSIONS"],
+          value: "${OTEL_JAVAAGENT_EXTENSIONS_VALUE-/otel/obi-otel-extension.jar}"
+        },
+        {
+          path: ["services", "java-backend", "environment", "OTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED"],
+          value: "${OTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED_VALUE:-false}"
+        },
+        {
+          path: ["services", "java-backend", "environment", "OTEL_OBI_REMOTE_PARENT_ENABLED"],
+          value: "${EXTENSION_ENABLED:-true}"
+        },
+        {
+          path: ["services", "java-backend", "environment", "OTEL_PROPAGATORS"],
+          value: "${OTEL_PROPAGATORS_VALUE:-obi,tracecontext,baggage}"
+        },
+        {
+          path: ["services", "java-backend", "environment", "TLS_PROTOCOL"],
+          value: "${BACKEND_TLS_PROTOCOL:-TLSv1.3}"
+        },
+        {
+          path: ["services", "obi", "environment", "OTEL_EBPF_BPF_CONTEXT_PROPAGATION"],
+          value: "${CONTEXT_PROPAGATION:-tcp}"
+        },
+        {
+          path: ["services", "obi", "environment", "OTEL_EBPF_JAVA_REMOTE_PARENT_RETRIEVAL_TTL"],
+          value: "${REMOTE_PARENT_RETRIEVAL_TTL:-0s}"
+        },
+        {
+          path: ["services", "obi", "environment", "OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT"],
+          value: "${BRIDGE_TRANSPORT:-getsockopt}"
+        },
+        {
+          path: ["services", "obi", "environment", "OTEL_EBPF_JAVA_REMOTE_PARENT_TTL"],
+          value: "${REMOTE_PARENT_TTL:-30s}"
+        },
+        {
+          path: ["services", "benchmark", "volumes", 0, "source"],
+          value: $expected_benchmark_source
+        },
+        {
+          path: ["services", "bridge-fault", "entrypoint", 4],
+          value: "${MATCHING_VALID_TAKES:-1}"
+        },
+        {
+          path: ["services", "security-probe", "entrypoint", 4],
+          value: "${SECURITY_PROBE_MODE:-abuse}"
+        },
+        {
+          path: ["services", "security-probe", "entrypoint", 6],
+          value: "${SECURITY_PROBE_TIMEOUT:-60s}"
+        },
+        {
+          path: ["services", "security-unix-sibling-probe", "entrypoint", 6],
+          value: "${SECURITY_PROBE_TIMEOUT:-60s}"
+        }
+      ];
+    length == 1
+    and (
+      .[0] as $model
+      | ($model | environments_are_explicit)
+        and ($model | build_inputs_are_explicit)
+        and ($model | service_environment_files_are_absent)
+        and ($model | dynamic_named_sources_are_absent)
+        and ($model | mount_topology_is_allowlisted)
+        and ([$model | .. | objects | keys[] | select(contains("$"))] | length == 0)
+        and (
+          [
+            ($model | normalize_environments)
+            | paths(scalars) as $path
+            | getpath($path) as $value
+            | select(
+                ([
+                  $path[]
+                  | strings
+                  | select(contains("$"))
+                ] | length) > 0
+                or ([
+                  $value
+                  | strings
+                  | select(contains("$"))
+                ] | length) > 0
+              )
+            | {path: $path, value: $value} as $entry
+            | select((allowed_interpolations | index($entry)) == null)
+          ]
+          | length == 0
+        )
+    )
+  ' "$compose_json" >/dev/null
+}
+
 test_primary_live_fd_compose_topology_is_scoped() {
   local -r compose_file="$TEST_SCRIPT_DIR/../docker-compose.yml"
   local -r primary_fault_file="$TEST_SCRIPT_DIR/../docker-compose.primary-fault.yml"
   local -r live_fd_file="$TEST_SCRIPT_DIR/../docker-compose.primary-live-fd.yml"
-  local -r base_resolved="$TEST_TMP_DIR/primary-live-fd-base-resolved.yaml"
-  local -r primary_fault_resolved="$TEST_TMP_DIR/primary-live-fd-fault-resolved.yaml"
-  local -r live_fd_resolved="$TEST_TMP_DIR/primary-live-fd-resolved.yaml"
-  local base_service=""
-  local primary_fault_service=""
-  local live_fd_service=""
-  local cap_add=""
-  local cap_add_count=""
+  local -r base_resolved="$TEST_TMP_DIR/primary-live-fd-base-resolved.json"
+  local -r primary_fault_resolved="$TEST_TMP_DIR/primary-live-fd-fault-resolved.json"
+  local -r live_fd_resolved="$TEST_TMP_DIR/primary-live-fd-resolved.json"
+  local -r custom_project_resolved="$TEST_TMP_DIR/primary-live-fd-custom-project.json"
+  local -r expanded_live_fd_resolved="$TEST_TMP_DIR/primary-live-fd-expanded-resolved.json"
+  local -r expanded_primary_fault_resolved="$TEST_TMP_DIR/primary-fault-expanded-resolved.json"
+  local -r interpolated_live_fd_file="$TEST_TMP_DIR/primary-live-fd-interpolated.yml"
+  local -r interpolated_live_fd_model="$TEST_TMP_DIR/primary-live-fd-interpolated-model.json"
+  local -r interpolated_overlay_key_file="$TEST_TMP_DIR/primary-live-fd-interpolated-key.yml"
+  local -r interpolated_overlay_key_model="$TEST_TMP_DIR/primary-live-fd-interpolated-key-model.json"
+  local -r uninterpolated_live_fd_resolved="$TEST_TMP_DIR/primary-live-fd-uninterpolated-resolved.json"
+  local -r interpolated_security_resolved="$TEST_TMP_DIR/primary-live-fd-interpolated-security.json"
+  local -r interpolated_ipc_resolved="$TEST_TMP_DIR/primary-live-fd-interpolated-ipc.json"
+  local -r interpolated_array_environment_resolved="$TEST_TMP_DIR/primary-live-fd-interpolated-array-environment.json"
+  local -r interpolated_object_environment_resolved="$TEST_TMP_DIR/primary-live-fd-interpolated-object-environment.json"
+  local -r interpolated_key_environment_resolved="$TEST_TMP_DIR/primary-live-fd-interpolated-key-environment.json"
+  local -r inherited_environment_resolved="$TEST_TMP_DIR/primary-live-fd-inherited-environment.json"
+  local -r multiline_environment_resolved="$TEST_TMP_DIR/primary-live-fd-multiline-environment.json"
+  local -r inherited_build_arg_file="$TEST_TMP_DIR/primary-live-fd-inherited-build-arg.yml"
+  local -r inherited_build_arg_resolved="$TEST_TMP_DIR/primary-live-fd-inherited-build-arg.json"
+  local -r safe_list_build_arg_file="$TEST_TMP_DIR/primary-live-fd-safe-list-build-arg.yml"
+  local -r safe_list_build_arg_resolved="$TEST_TMP_DIR/primary-live-fd-safe-list-build-arg.json"
+  local -r duplicate_list_build_arg_resolved="$TEST_TMP_DIR/primary-live-fd-duplicate-list-build-arg.json"
+  local -r host_build_context_resolved="$TEST_TMP_DIR/primary-live-fd-host-build-context.json"
+  local -r forwarded_build_ssh_file="$TEST_TMP_DIR/primary-live-fd-forwarded-build-ssh.yml"
+  local -r forwarded_build_ssh_resolved="$TEST_TMP_DIR/primary-live-fd-forwarded-build-ssh.json"
+  local -r optional_env_resolved="$TEST_TMP_DIR/primary-live-fd-optional-env-file.json"
+  local -r environment_secret_file="$TEST_TMP_DIR/primary-live-fd-environment-secret.yml"
+  local -r environment_secret_resolved="$TEST_TMP_DIR/primary-live-fd-environment-secret.json"
+  local -r file_secret_resolved="$TEST_TMP_DIR/primary-live-fd-file-secret.json"
+  local -r external_secret_resolved="$TEST_TMP_DIR/primary-live-fd-external-secret.json"
+  local -r environment_config_resolved="$TEST_TMP_DIR/primary-live-fd-environment-config.json"
+  local -r file_config_resolved="$TEST_TMP_DIR/primary-live-fd-file-config.json"
+  local -r external_volume_resolved="$TEST_TMP_DIR/primary-live-fd-external-volume.json"
+  local -r repurposed_socket_volume_resolved="$TEST_TMP_DIR/primary-live-fd-repurposed-socket-volume.json"
+  local -r direct_bind_resolved="$TEST_TMP_DIR/primary-live-fd-direct-bind.json"
+  local -r volumes_from_resolved="$TEST_TMP_DIR/primary-live-fd-volumes-from.json"
+  local -r expanded_service_security_resolved="$TEST_TMP_DIR/primary-live-fd-expanded-service-security.json"
+  local -r privileged_post_start_resolved="$TEST_TMP_DIR/primary-live-fd-privileged-post-start.json"
+  local -r privileged_pre_stop_resolved="$TEST_TMP_DIR/primary-live-fd-privileged-pre-stop.json"
+  local -r gpu_device_reservation_resolved="$TEST_TMP_DIR/primary-live-fd-gpu-device-reservation.json"
+  local -r unknown_service_key_resolved="$TEST_TMP_DIR/primary-live-fd-unknown-service-key.json"
+  local -r dependency_topology_resolved="$TEST_TMP_DIR/primary-live-fd-dependency-topology.json"
+  local -r changed_command_resolved="$TEST_TMP_DIR/primary-live-fd-changed-command.json"
+  local -r changed_entrypoint_resolved="$TEST_TMP_DIR/primary-live-fd-changed-entrypoint.json"
+  local -r changed_environment_resolved="$TEST_TMP_DIR/primary-live-fd-changed-environment.json"
+  local -r expanded_service_set_resolved="$TEST_TMP_DIR/primary-live-fd-expanded-service-set.json"
+  local -r expanded_service_network_resolved="$TEST_TMP_DIR/primary-live-fd-expanded-service-network.json"
+  local -r hidden_profile_file="$TEST_TMP_DIR/primary-live-fd-hidden-profile.yml"
+  local -ra runtime_environment=(
+    "COMPOSE_PROFILES=*"
+    "CONTEXT_PROPAGATION=tcp"
+    "BRIDGE_TRANSPORT=getsockopt"
+    "EXTENSION_ENABLED=true"
+    "JAVA_TOOL_OPTIONS_VALUE=-javaagent:/otel/official-javaagent.jar"
+    "OTEL_JAVAAGENT_EXTENSIONS_VALUE=/otel/obi-otel-extension.jar"
+    "OTEL_PROPAGATORS_VALUE=obi,tracecontext,baggage"
+  )
+  local compose_overlay=""
+  local resolved_compose=""
 
-  COMPOSE_PROFILES=tools docker compose --file "$compose_file" config >"$base_resolved"
-  COMPOSE_PROFILES=tools docker compose --file "$compose_file" \
-    --file "$primary_fault_file" config >"$primary_fault_resolved"
-  COMPOSE_PROFILES=tools docker compose --file "$compose_file" \
-    --file "$primary_fault_file" --file "$live_fd_file" config >"$live_fd_resolved"
-  base_service="$(compose_service_block "$base_resolved" java-backend)"
-  primary_fault_service="$(compose_service_block "$primary_fault_resolved" java-backend)"
-  live_fd_service="$(compose_service_block "$live_fd_resolved" java-backend)"
-  cap_add="$(awk '
-    $0 == "    cap_add:" { inside = 1; next }
-    inside && $0 ~ /^    [^[:space:]#][^:]*:/ { exit }
-    inside { print }
-  ' <<<"$live_fd_service")"
-  cap_add_count="$(awk '/^      - / { count += 1 } END { print count + 0 }' <<<"$cap_add")"
-
-  [[ "$base_service" != *'cap_add:'* && \
-    "$primary_fault_service" != *'cap_add:'* ]] || {
-    printf 'base or primary W3C fault runtime unexpectedly gained SYS_PTRACE\n' >&2
-    return 1
-  }
-  [[ "$live_fd_service" == *"user: '0:0'"* && \
-    "$live_fd_service" != *'privileged: true'* && \
-    "$live_fd_service" != *'pid: host'* && \
-    "$live_fd_service" != *'userns_mode: host'* && \
-    "$live_fd_service" != *'security_opt:'* && \
-    "$cap_add_count" == "1" && \
-    "$cap_add" == '      - SYS_PTRACE' ]] || {
-    printf 'primary live-descriptor runtime lost its scoped SYS_PTRACE topology\n' >&2
-    return 1
-  }
+  (
+    docker() {
+      if [[ "$*" == 'compose config --help' ]]; then
+        printf '%s\n' \
+          '--no-consistency' \
+          '--no-interpolate' \
+          '--no-normalize' || return 2
+        return 0
+      fi
+      command docker "$@"
+    }
+    assert_policy_acceptance \
+      'primary live-descriptor source rejected safe legacy Compose capabilities' \
+      compose_file_build_arguments_are_explicit "$compose_file" || return $?
+  ) || return $?
+  for compose_overlay in "$compose_file" "$primary_fault_file" "$live_fd_file"; do
+    assert_policy_acceptance \
+      'primary live-descriptor Compose files must use explicit build inputs' \
+      compose_file_build_arguments_are_explicit "$compose_overlay" || return $?
+  done
+  for compose_overlay in "$primary_fault_file" "$live_fd_file"; do
+    assert_policy_acceptance \
+      'primary live-descriptor overlays must not depend on runtime interpolation' \
+      compose_overlay_is_interpolation_free "$compose_overlay" || return $?
+  done
+  printf '%s\n' \
+    'services:' \
+    '  java-backend:' \
+    '    user: "\u0024{JAVA_BACKEND_USER:-0:0}"' \
+    >"$interpolated_live_fd_file" || return 2
+  resolve_compose_fixture_without_interpolation \
+    "$interpolated_live_fd_file" "$interpolated_live_fd_model" || return $?
+  assert_json_fixture_shape \
+    "$interpolated_live_fd_model" \
+    '.services["java-backend"].user == "${JAVA_BACKEND_USER:-0:0}"' \
+    'failed to construct the interpolated overlay regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor overlay accepted runtime interpolation' \
+    compose_overlay_is_interpolation_free "$interpolated_live_fd_file" || return $?
+  printf '%s\n' \
+    'services:' \
+    '  java-backend:' \
+    '    labels:' \
+    '      "\u0024{UNEXPECTED_LABEL_KEY:-obi.review}": safe' \
+    >"$interpolated_overlay_key_file" || return 2
+  resolve_compose_fixture_without_interpolation \
+    "$interpolated_overlay_key_file" "$interpolated_overlay_key_model" || return $?
+  assert_json_fixture_shape \
+    "$interpolated_overlay_key_model" \
+    '.services["java-backend"].labels | has("${UNEXPECTED_LABEL_KEY:-obi.review}")' \
+    'failed to construct the interpolated overlay key regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor overlay accepted an interpolated mapping key' \
+    compose_overlay_is_interpolation_free "$interpolated_overlay_key_file" || return $?
+  resolve_compose_model_without_interpolation \
+    "$uninterpolated_live_fd_resolved" \
+    "$compose_file" "$primary_fault_file" "$live_fd_file" || return $?
+  assert_policy_acceptance \
+    'primary live-descriptor runtime model contains unexpected host input or topology' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$uninterpolated_live_fd_resolved" || return $?
+  (
+    PROJECT_NAME="${PROJECT_NAMESPACE}-review"
+    resolve_compose_model_without_interpolation \
+      "$custom_project_resolved" \
+      "$compose_file" "$primary_fault_file" "$live_fd_file" || return $?
+    assert_policy_acceptance \
+      'primary live-descriptor runtime rejected a reserved project namespace' \
+      compose_runtime_model_interpolation_is_allowlisted \
+      "$custom_project_resolved" || return $?
+  ) || return $?
+  jq '.services["java-backend"].privileged = "${EXTENSION_ENABLED:-false}"' \
+    "$uninterpolated_live_fd_resolved" >"$interpolated_security_resolved" || return 2
+  assert_json_fixture_shape \
+    "$interpolated_security_resolved" \
+    '.services["java-backend"].privileged == "${EXTENSION_ENABLED:-false}"' \
+    'failed to construct the interpolated security regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor security topology accepted runtime interpolation' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$interpolated_security_resolved" || return $?
+  jq '.services["java-backend"].ipc = "${IPC_MODE:-private}"' \
+    "$uninterpolated_live_fd_resolved" >"$interpolated_ipc_resolved" || return 2
+  assert_json_fixture_shape \
+    "$interpolated_ipc_resolved" \
+    '.services["java-backend"].ipc == "${IPC_MODE:-private}"' \
+    'failed to construct the interpolated IPC regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor security topology accepted interpolated IPC mode' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$interpolated_ipc_resolved" || return $?
+  jq '
+    .services["java-backend"].environment = [
+      "LD_AUDIT=${JAVA_BACKEND_LD_AUDIT:-}"
+    ]
+  ' "$uninterpolated_live_fd_resolved" \
+    >"$interpolated_array_environment_resolved" || return 2
+  assert_json_fixture_shape \
+    "$interpolated_array_environment_resolved" \
+    '.services["java-backend"].environment == ["LD_AUDIT=${JAVA_BACKEND_LD_AUDIT:-}"]' \
+    'failed to construct the array environment regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted array environment interpolation' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$interpolated_array_environment_resolved" || return $?
+  jq '
+    .services["apache-proxy"].environment = {
+      "JDK_JAVA_OPTIONS": "${JDK_CONTROL:-}"
+    }
+  ' "$uninterpolated_live_fd_resolved" \
+    >"$interpolated_object_environment_resolved" || return 2
+  assert_json_fixture_shape \
+    "$interpolated_object_environment_resolved" \
+    '.services["apache-proxy"].environment == {"JDK_JAVA_OPTIONS": "${JDK_CONTROL:-}"}' \
+    'failed to construct the object environment regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted object environment interpolation' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$interpolated_object_environment_resolved" || return $?
+  jq '
+    .services["java-backend"].environment = [
+      "${JAVA_BACKEND_EXTRA_ENV:-SAFE_FLAG=1}"
+    ]
+  ' "$uninterpolated_live_fd_resolved" \
+    >"$interpolated_key_environment_resolved" || return 2
+  assert_json_fixture_shape \
+    "$interpolated_key_environment_resolved" \
+    '.services["java-backend"].environment == ["${JAVA_BACKEND_EXTRA_ENV:-SAFE_FLAG=1}"]' \
+    'failed to construct the interpolated environment key regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted an interpolated environment key' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$interpolated_key_environment_resolved" || return $?
+  jq '.services["java-backend"].environment = ["JDK_JAVA_OPTIONS"]' \
+    "$uninterpolated_live_fd_resolved" >"$inherited_environment_resolved" || return 2
+  assert_json_fixture_shape \
+    "$inherited_environment_resolved" \
+    '.services["java-backend"].environment == ["JDK_JAVA_OPTIONS"]' \
+    'failed to construct the inherited environment regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted inherited environment input' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$inherited_environment_resolved" || return $?
+  jq '
+    .services["java-backend"].environment = [
+      "JDK_JAVA_OPTIONS=-Dsafe=true\n${JDK_EXTRA_OPTIONS:-}"
+    ]
+  ' "$uninterpolated_live_fd_resolved" \
+    >"$multiline_environment_resolved" || return 2
+  assert_json_fixture_shape \
+    "$multiline_environment_resolved" \
+    '.services["java-backend"].environment == ["JDK_JAVA_OPTIONS=-Dsafe=true\n${JDK_EXTRA_OPTIONS:-}"]' \
+    'failed to construct the multiline environment regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted multiline environment interpolation' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$multiline_environment_resolved" || return $?
+  printf '%s\n' \
+    'services:' \
+    '  obi:' \
+    '    build:' \
+    '      context: ../..' \
+    '      dockerfile: Dockerfile' \
+    '      args:' \
+    '        TAG:' \
+    >"$inherited_build_arg_file" || return 2
+  (
+    export TAG=latest || return 2
+    resolve_compose_fixture \
+      "$inherited_build_arg_file" "$inherited_build_arg_resolved"
+  ) || return $?
+  assert_json_fixture_shape \
+    "$inherited_build_arg_resolved" \
+    '.services.obi.build.args.TAG == "latest"' \
+    'failed to construct the inherited build argument regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor source accepted an inherited build argument' \
+    compose_file_build_arguments_are_explicit \
+    "$inherited_build_arg_file" || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted an inherited build argument' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$inherited_build_arg_resolved" || return $?
+  printf '%s\n' \
+    'services:' \
+    '  obi:' \
+    '    build:' \
+    '      context: ../..' \
+    '      dockerfile: Dockerfile' \
+    '      args:' \
+    '        - RELEASE_REVISION=local' \
+    '        - RELEASE_VERSION=apache-java-https-demo' \
+    >"$safe_list_build_arg_file" || return 2
+  assert_policy_acceptance \
+    'primary live-descriptor source rejected exact list-form build arguments' \
+    compose_file_build_arguments_are_explicit \
+    "$safe_list_build_arg_file" || return $?
+  jq '
+    .services.obi.build.args = [
+      "RELEASE_REVISION=local",
+      "RELEASE_VERSION=apache-java-https-demo"
+    ]
+  ' "$uninterpolated_live_fd_resolved" >"$safe_list_build_arg_resolved" || return 2
+  assert_policy_acceptance \
+    'primary live-descriptor runtime rejected exact list-form build arguments' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$safe_list_build_arg_resolved" || return $?
+  jq '
+    .services.obi.build.args = [
+      "RELEASE_REVISION=local",
+      "RELEASE_REVISION=local"
+    ]
+  ' "$uninterpolated_live_fd_resolved" \
+    >"$duplicate_list_build_arg_resolved" || return 2
+  assert_json_fixture_shape \
+    "$duplicate_list_build_arg_resolved" \
+    '.services.obi.build.args == [
+      "RELEASE_REVISION=local",
+      "RELEASE_REVISION=local"
+    ]' \
+    'failed to construct the duplicate list build argument fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted duplicate list build arguments' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$duplicate_list_build_arg_resolved" || return $?
+  jq '
+    .services.obi.build.context = "/tmp/host-controlled-build-context"
+    | .services.obi.build.dockerfile_inline = "FROM scratch"
+  ' "$uninterpolated_live_fd_resolved" \
+    >"$host_build_context_resolved" || return 2
+  assert_json_fixture_shape \
+    "$host_build_context_resolved" \
+    '.services.obi.build.context == "/tmp/host-controlled-build-context"
+      and .services.obi.build.dockerfile_inline == "FROM scratch"' \
+    'failed to construct the host build input regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted host-controlled build inputs' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$host_build_context_resolved" || return $?
+  printf '%s\n' \
+    'services:' \
+    '  obi:' \
+    '    build:' \
+    '      context: ../..' \
+    '      dockerfile: Dockerfile' \
+    '      args:' \
+    '        RELEASE_REVISION: local' \
+    '        RELEASE_VERSION: apache-java-https-demo' \
+    '      ssh:' \
+    '        - default' \
+    >"$forwarded_build_ssh_file" || return 2
+  resolve_compose_fixture_without_interpolation \
+    "$forwarded_build_ssh_file" "$forwarded_build_ssh_resolved" || return $?
+  assert_json_fixture_shape \
+    "$forwarded_build_ssh_resolved" \
+    '(.services.obi.build.ssh == ["default"])
+      or ((.services.obi.build.ssh | type) == "object"
+        and (.services.obi.build.ssh | has("default"))
+        and (.services.obi.build.ssh.default == null))' \
+    'failed to construct the forwarded build SSH regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted forwarded build SSH credentials' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$forwarded_build_ssh_resolved" || return $?
+  jq '
+    .services["java-backend"].env_file = [
+      {
+        "path": "/tmp/obi-host-controlled-java.env",
+        "required": false
+      }
+    ]
+  ' "$uninterpolated_live_fd_resolved" >"$optional_env_resolved" || return 2
+  assert_json_fixture_shape \
+    "$optional_env_resolved" \
+    '.services["java-backend"].env_file == [{
+      "path": "/tmp/obi-host-controlled-java.env",
+      "required": false
+    }]' \
+    'failed to construct the optional environment file regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted an optional environment file' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$optional_env_resolved" || return $?
+  printf '%s\n' \
+    'services:' \
+    '  java-backend:' \
+    '    image: busybox:1.36' \
+    '    secrets:' \
+    '      - source: java-preload' \
+    '        target: /etc/ld.so.preload' \
+    'secrets:' \
+    '  java-preload:' \
+    '    environment: JAVA_PRELOAD_CONTENT' \
+    >"$environment_secret_file" || return 2
+  resolve_compose_fixture_without_interpolation \
+    "$environment_secret_file" "$environment_secret_resolved" || return $?
+  assert_json_fixture_shape \
+    "$environment_secret_resolved" \
+    '.secrets["java-preload"].environment == "JAVA_PRELOAD_CONTENT"
+      and .services["java-backend"].secrets[0].target == "/etc/ld.so.preload"' \
+    'failed to construct the environment-backed secret regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted an environment-backed secret' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$environment_secret_resolved" || return $?
+  jq '
+    del(.secrets["java-preload"].environment)
+    | .secrets["java-preload"].file = "/tmp/obi-host-controlled-secret"
+  ' "$environment_secret_resolved" >"$file_secret_resolved" || return 2
+  assert_json_fixture_shape \
+    "$file_secret_resolved" \
+    '.secrets["java-preload"].file == "/tmp/obi-host-controlled-secret"
+      and (.secrets["java-preload"] | has("environment") | not)' \
+    'failed to construct the file-backed secret regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted a file-backed secret' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$file_secret_resolved" || return $?
+  jq '
+    del(.secrets["java-preload"].environment)
+    | .secrets["java-preload"].external = true
+  ' "$environment_secret_resolved" >"$external_secret_resolved" || return 2
+  assert_json_fixture_shape \
+    "$external_secret_resolved" \
+    '.secrets["java-preload"].external == true
+      and (.secrets["java-preload"] | has("environment") | not)' \
+    'failed to construct the external secret regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted an external secret' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$external_secret_resolved" || return $?
+  jq '
+    .services["java-backend"].configs = [
+      {
+        "source": "java-options",
+        "target": "/opt/java-options"
+      }
+    ]
+    | .configs["java-options"] = {
+        "environment": "JAVA_OPTIONS_CONTENT"
+      }
+  ' "$uninterpolated_live_fd_resolved" \
+    >"$environment_config_resolved" || return 2
+  assert_json_fixture_shape \
+    "$environment_config_resolved" \
+    '.configs["java-options"].environment == "JAVA_OPTIONS_CONTENT"
+      and .services["java-backend"].configs[0].target == "/opt/java-options"' \
+    'failed to construct the environment-backed config regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted an environment-backed config' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$environment_config_resolved" || return $?
+  jq '
+    del(.configs["java-options"].environment)
+    | .configs["java-options"].file = "/tmp/obi-host-controlled-config"
+  ' "$environment_config_resolved" >"$file_config_resolved" || return 2
+  assert_json_fixture_shape \
+    "$file_config_resolved" \
+    '.configs["java-options"].file == "/tmp/obi-host-controlled-config"
+      and (.configs["java-options"] | has("environment") | not)' \
+    'failed to construct the file-backed config regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted a file-backed config' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$file_config_resolved" || return $?
+  jq '
+    .volumes["host-otel"] = {
+      "external": true,
+      "name": "host-otel"
+    }
+    | .services["java-backend"].volumes += [
+        {
+          "source": "host-otel",
+          "target": "/otel",
+          "type": "volume",
+          "volume": {}
+        }
+      ]
+  ' "$uninterpolated_live_fd_resolved" >"$external_volume_resolved" || return 2
+  assert_json_fixture_shape \
+    "$external_volume_resolved" \
+    '.volumes["host-otel"].external == true
+      and any(
+        .services["java-backend"].volumes[];
+        .source == "host-otel" and .target == "/otel"
+      )' \
+    'failed to construct the external volume regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted an external agent volume' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$external_volume_resolved" || return $?
+  jq '
+    .volumes["java-remote-parent-socket"] = {
+      "driver": "local",
+      "driver_opts": {
+        "device": "/tmp/host-controlled-socket",
+        "o": "bind",
+        "type": "none"
+      },
+      "name": "host-preseeded-socket"
+    }
+  ' "$uninterpolated_live_fd_resolved" \
+    >"$repurposed_socket_volume_resolved" || return 2
+  assert_json_fixture_shape \
+    "$repurposed_socket_volume_resolved" \
+    '.volumes["java-remote-parent-socket"].driver_opts.device
+      == "/tmp/host-controlled-socket"
+      and .volumes["java-remote-parent-socket"].name
+      == "host-preseeded-socket"' \
+    'failed to construct the repurposed socket volume regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted a repurposed socket volume' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$repurposed_socket_volume_resolved" || return $?
+  jq '
+    .services["java-backend"].volumes += [
+      {
+        "bind": {"create_host_path": false},
+        "read_only": true,
+        "source": "/tmp/host-controlled-otel",
+        "target": "/otel",
+        "type": "bind"
+      }
+    ]
+  ' "$uninterpolated_live_fd_resolved" >"$direct_bind_resolved" || return 2
+  assert_json_fixture_shape \
+    "$direct_bind_resolved" \
+    'any(
+      .services["java-backend"].volumes[];
+      .type == "bind"
+        and .source == "/tmp/host-controlled-otel"
+        and .target == "/otel"
+    )' \
+    'failed to construct the direct agent bind regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted a direct agent bind' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$direct_bind_resolved" || return $?
+  jq '
+    .services["java-backend"].volumes_from = ["container:host-payload:ro"]
+  ' "$uninterpolated_live_fd_resolved" >"$volumes_from_resolved" || return 2
+  assert_json_fixture_shape \
+    "$volumes_from_resolved" \
+    '.services["java-backend"].volumes_from
+      == ["container:host-payload:ro"]' \
+    'failed to construct the volumes-from regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted volumes-from host input' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$volumes_from_resolved" || return $?
+  jq '
+    .services["bridge-fault"] += {
+      "cap_add": ["NET_ADMIN"],
+      "cgroup": "host",
+      "cgroup_parent": "/host-controlled",
+      "dns": ["203.0.113.53"],
+      "dns_opt": ["use-vc"],
+      "dns_search": ["host.invalid"],
+      "extra_hosts": {"gateway": "host-gateway"},
+      "group_add": ["docker"],
+      "ipc": "host",
+      "isolation": "process",
+      "network_mode": "host",
+      "pid": "host",
+      "privileged": true,
+      "runtime": "runsc",
+      "security_opt": ["seccomp=unconfined"],
+      "sysctls": {"net.ipv4.ip_forward": "1"},
+      "userns_mode": "host",
+      "uts": "host"
+    }
+  ' "$uninterpolated_live_fd_resolved" \
+    >"$expanded_service_security_resolved" || return 2
+  assert_json_fixture_shape \
+    "$expanded_service_security_resolved" \
+    '.services["bridge-fault"].privileged == true
+      and .services["bridge-fault"].network_mode == "host"
+      and .services["bridge-fault"].pid == "host"
+      and .services["bridge-fault"].cap_add == ["NET_ADMIN"]' \
+    'failed to construct the service security topology regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted expanded service security topology' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$expanded_service_security_resolved" || return $?
+  jq '
+    .services["bridge-fault"].post_start = [
+      {
+        "command": ["/bin/true"],
+        "privileged": true,
+        "user": "0:0"
+      }
+    ]
+  ' "$uninterpolated_live_fd_resolved" \
+    >"$privileged_post_start_resolved" || return 2
+  assert_json_fixture_shape \
+    "$privileged_post_start_resolved" \
+    '.services["bridge-fault"].post_start == [{
+      "command": ["/bin/true"],
+      "privileged": true,
+      "user": "0:0"
+    }]' \
+    'failed to construct the privileged post-start regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted a privileged post-start hook' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$privileged_post_start_resolved" || return $?
+  jq '
+    .services["bridge-fault"].pre_stop = [
+      {
+        "command": ["/bin/true"],
+        "privileged": true,
+        "user": "0:0"
+      }
+    ]
+  ' "$uninterpolated_live_fd_resolved" \
+    >"$privileged_pre_stop_resolved" || return 2
+  assert_json_fixture_shape \
+    "$privileged_pre_stop_resolved" \
+    '.services["bridge-fault"].pre_stop == [{
+      "command": ["/bin/true"],
+      "privileged": true,
+      "user": "0:0"
+    }]' \
+    'failed to construct the privileged pre-stop regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted a privileged pre-stop hook' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$privileged_pre_stop_resolved" || return $?
+  jq '
+    .services["bridge-fault"].deploy.resources.reservations.devices = [
+      {
+        "capabilities": ["gpu"],
+        "count": "all",
+        "driver": "nvidia"
+      }
+    ]
+  ' "$uninterpolated_live_fd_resolved" \
+    >"$gpu_device_reservation_resolved" || return 2
+  assert_json_fixture_shape \
+    "$gpu_device_reservation_resolved" \
+    '.services["bridge-fault"].deploy.resources.reservations.devices == [{
+      "capabilities": ["gpu"],
+      "count": "all",
+      "driver": "nvidia"
+    }]' \
+    'failed to construct the GPU reservation regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted a GPU device reservation' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$gpu_device_reservation_resolved" || return $?
+  jq '.services.obi.cpu_rt_runtime = 950000' \
+    "$uninterpolated_live_fd_resolved" \
+    >"$unknown_service_key_resolved" || return 2
+  assert_json_fixture_shape \
+    "$unknown_service_key_resolved" \
+    '.services.obi.cpu_rt_runtime == 950000' \
+    'failed to construct the unknown service-key regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted an unknown service key' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$unknown_service_key_resolved" || return $?
+  jq '
+    .services["java-backend"].depends_on["trace-receiver"].condition =
+      "service_healthy"
+  ' "$uninterpolated_live_fd_resolved" \
+    >"$dependency_topology_resolved" || return 2
+  assert_json_fixture_shape \
+    "$dependency_topology_resolved" \
+    '.services["java-backend"].depends_on["trace-receiver"].condition
+      == "service_healthy"' \
+    'failed to construct the dependency topology regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted changed dependency topology' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$dependency_topology_resolved" || return $?
+  jq '
+    .services["socket-init"].command = [
+      "id > /var/run/obi/host-control"
+    ]
+  ' "$uninterpolated_live_fd_resolved" \
+    >"$changed_command_resolved" || return 2
+  assert_json_fixture_shape \
+    "$changed_command_resolved" \
+    '.services["socket-init"].command
+      == ["id > /var/run/obi/host-control"]' \
+    'failed to construct the changed command regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted a changed service command' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$changed_command_resolved" || return $?
+  jq '
+    .services["map-pressure"].entrypoint = [
+      "/bin/sh",
+      "-ec",
+      "id"
+    ]
+  ' "$uninterpolated_live_fd_resolved" \
+    >"$changed_entrypoint_resolved" || return 2
+  assert_json_fixture_shape \
+    "$changed_entrypoint_resolved" \
+    '.services["map-pressure"].entrypoint
+      == ["/bin/sh", "-ec", "id"]' \
+    'failed to construct the changed entrypoint regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted a changed service entrypoint' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$changed_entrypoint_resolved" || return $?
+  jq '
+    if (.services["java-backend"].environment | type) == "array" then
+      .services["java-backend"].environment |= map(
+        if startswith("LD_PRELOAD=") then
+          "LD_PRELOAD=/tmp/host-controlled.so"
+        else
+          .
+        end
+      )
+    else
+      .services["java-backend"].environment.LD_PRELOAD =
+        "/tmp/host-controlled.so"
+    end
+  ' "$uninterpolated_live_fd_resolved" \
+    >"$changed_environment_resolved" || return 2
+  assert_json_fixture_shape \
+    "$changed_environment_resolved" \
+    'if (.services["java-backend"].environment | type) == "array" then
+      any(
+        .services["java-backend"].environment[];
+        . == "LD_PRELOAD=/tmp/host-controlled.so"
+      )
+    else
+      .services["java-backend"].environment.LD_PRELOAD
+        == "/tmp/host-controlled.so"
+    end' \
+    'failed to construct the changed environment regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted changed service environment' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$changed_environment_resolved" || return $?
+  jq '
+    .services.hidden = {
+      "image": "busybox:1.36",
+      "network_mode": "host",
+      "privileged": true
+    }
+    | .services |= with_entries(.value |= del(.volumes, .tmpfs))
+    | del(.volumes)
+  ' "$uninterpolated_live_fd_resolved" \
+    >"$expanded_service_set_resolved" || return 2
+  assert_json_fixture_shape \
+    "$expanded_service_set_resolved" \
+    '.services.hidden.privileged == true
+      and (.volumes | not)
+      and all(.services[]; has("volumes") | not)' \
+    'failed to construct the expanded service-set regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted an expanded service set' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$expanded_service_set_resolved" || return $?
+  jq '
+    del(.services["bridge-fault"].network_mode)
+    | .services["bridge-fault"].networks = {
+        "default": {"aliases": ["fault-shadow"]}
+      }
+    | .services["bridge-fault"].ports = [
+        {
+          "mode": "ingress",
+          "protocol": "tcp",
+          "published": "18443",
+          "target": 443
+        }
+      ]
+    | .services["bridge-fault"].links = ["java-backend:backend"]
+    | .services["bridge-fault"].external_links = ["host-payload:payload"]
+  ' "$uninterpolated_live_fd_resolved" \
+    >"$expanded_service_network_resolved" || return 2
+  assert_json_fixture_shape \
+    "$expanded_service_network_resolved" \
+    '(.services["bridge-fault"] | has("network_mode") | not)
+      and .services["bridge-fault"].networks.default.aliases == ["fault-shadow"]
+      and .services["bridge-fault"].ports[0].published == "18443"' \
+    'failed to construct the service network topology regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted expanded service network topology' \
+    compose_runtime_model_interpolation_is_allowlisted \
+    "$expanded_service_network_resolved" || return $?
+  if ! env "${runtime_environment[@]}" docker compose \
+    --project-name "$PROJECT_NAME" --file "$compose_file" \
+    config --format json >"$base_resolved"; then
+    return 2
+  fi
+  if ! env "${runtime_environment[@]}" docker compose \
+    --project-name "$PROJECT_NAME" --file "$compose_file" \
+    --file "$primary_fault_file" config --format json >"$primary_fault_resolved"; then
+    return 2
+  fi
+  if ! env "${runtime_environment[@]}" docker compose \
+    --project-name "$PROJECT_NAME" --file "$compose_file" \
+    --file "$primary_fault_file" --file "$live_fd_file" \
+    config --format json >"$live_fd_resolved"; then
+    return 2
+  fi
+  assert_policy_acceptance \
+    'primary W3C fault runtime expanded beyond its scoped backend changes' \
+    primary_fault_resolved_topology_is_scoped \
+    "$base_resolved" "$primary_fault_resolved" || return $?
+  jq '
+    .services["unexpected-privileged-sidecar"] = {
+      "image": "busybox:1.36",
+      "privileged": true
+    }
+    | .services["java-backend"].depends_on["unexpected-privileged-sidecar"] = {
+        "condition": "service_started",
+        "required": true
+      }
+  ' "$primary_fault_resolved" >"$expanded_primary_fault_resolved" || return 2
+  assert_json_fixture_shape \
+    "$expanded_primary_fault_resolved" \
+    '.services["unexpected-privileged-sidecar"].privileged == true
+      and .services["java-backend"].depends_on["unexpected-privileged-sidecar"].required == true' \
+    'failed to construct the privileged dependency regression fixture' || return $?
+  assert_policy_rejection \
+    'primary W3C fault runtime accepted a privileged dependency' \
+    primary_fault_resolved_topology_is_scoped \
+    "$base_resolved" "$expanded_primary_fault_resolved" || return $?
+  for resolved_compose in "$base_resolved" "$primary_fault_resolved"; do
+    assert_policy_acceptance \
+      'base or primary W3C fault runtime unexpectedly gained SYS_PTRACE' \
+      jq -e -s '
+        length == 1
+        and (
+          .[0].services["java-backend"] as $backend
+          | ($backend | type == "object")
+            and (($backend.cap_add // []) == [])
+        )
+      ' "$resolved_compose" >/dev/null || return $?
+  done
+  assert_policy_acceptance \
+    'primary live-descriptor runtime lost its scoped SYS_PTRACE topology' \
+    primary_live_fd_resolved_topology_is_scoped \
+    "$primary_fault_resolved" "$live_fd_resolved" || return $?
+  printf '%s\n' \
+    'services:' \
+    '  unexpected-privileged-sidecar:' \
+    '    image: busybox:1.36' \
+    '    privileged: true' \
+    '    profiles: [hidden]' \
+    >"$hidden_profile_file" || return 2
+  if ! env "${runtime_environment[@]}" docker compose \
+    --project-name "$PROJECT_NAME" --file "$compose_file" \
+    --file "$primary_fault_file" --file "$live_fd_file" \
+    --file "$hidden_profile_file" config --format json \
+    >"$expanded_live_fd_resolved"; then
+    return 2
+  fi
+  assert_json_fixture_shape \
+    "$expanded_live_fd_resolved" \
+    '.services["unexpected-privileged-sidecar"].privileged == true
+      and .services["unexpected-privileged-sidecar"].profiles == ["hidden"]' \
+    'failed to render the hidden-profile topology regression fixture' || return $?
+  assert_policy_rejection \
+    'primary live-descriptor runtime accepted hidden-profile topology expansion' \
+    primary_live_fd_resolved_topology_is_scoped \
+    "$primary_fault_resolved" "$expanded_live_fd_resolved" || return $?
 }
 
 test_benchmark_client_compose_topology_is_least_privilege() {
@@ -15450,19 +17658,25 @@ test_benchmark_client_compose_topology_is_least_privilege() {
   local benchmark_volumes=""
   local raw_volume_count=""
 
-  example_directory="$(cd -- "$TEST_SCRIPT_DIR/.." && pwd -P)"
-  BENCHMARK_CA_SOURCE='' COMPOSE_PROFILES=tools \
-    docker compose --file "$compose_file" config --format json >"$resolved_compose"
-  BENCHMARK_CA_SOURCE="$override_ca" COMPOSE_PROFILES=tools \
-    docker compose --file "$compose_file" config --format json >"$override_resolved_compose"
-  benchmark_service="$(compose_service_block "$compose_file" benchmark)"
+  example_directory="$(cd -- "$TEST_SCRIPT_DIR/.." && pwd -P)" || return 2
+  if ! BENCHMARK_CA_SOURCE='' COMPOSE_PROFILES=tools \
+    docker compose --file "$compose_file" config --format json \
+    >"$resolved_compose"; then
+    return 2
+  fi
+  if ! BENCHMARK_CA_SOURCE="$override_ca" COMPOSE_PROFILES=tools \
+    docker compose --file "$compose_file" config --format json \
+    >"$override_resolved_compose"; then
+    return 2
+  fi
+  benchmark_service="$(compose_service_block "$compose_file" benchmark)" || return 2
   benchmark_volumes="$(awk '
     $0 == "    volumes:" { inside = 1; next }
     inside && $0 ~ /^    [^[:space:]#][^:]*:/ { exit }
     inside { print }
-  ' <<<"$benchmark_service")"
+  ' <<<"$benchmark_service")" || return 2
   raw_volume_count="$(awk '/^      - type: bind$/ { count += 1 } END { print count + 0 }' \
-    <<<"$benchmark_volumes")"
+    <<<"$benchmark_volumes")" || return 2
 
   [[ "$benchmark_service" == *'user: "65532:65532"'* &&
     "$benchmark_service" == *$'cap_drop:\n      - ALL'* &&
@@ -15478,30 +17692,26 @@ test_benchmark_client_compose_topology_is_least_privilege() {
     printf 'benchmark client must retain its exact read-only CA-only topology\n' >&2
     return 1
   }
-  benchmark_client_resolved_topology_is_least_privilege \
-    "$resolved_compose" "$example_directory/.runtime/certs/ca.crt" || {
-    printf 'resolved benchmark client topology exposed more than its verified CA\n' >&2
-    return 1
-  }
+  assert_policy_acceptance \
+    'resolved benchmark client topology exposed more than its verified CA' \
+    benchmark_client_resolved_topology_is_least_privilege \
+    "$resolved_compose" "$example_directory/.runtime/certs/ca.crt" || return $?
   jq 'del(.services.benchmark.volumes[0].bind.create_host_path)' \
-    "$resolved_compose" >"$omitted_false_compose"
-  benchmark_client_resolved_topology_is_least_privilege \
-    "$omitted_false_compose" "$example_directory/.runtime/certs/ca.crt" || {
-    printf 'resolved benchmark client rejected an omitted false bind option\n' >&2
-    return 1
-  }
+    "$resolved_compose" >"$omitted_false_compose" || return 2
+  assert_policy_acceptance \
+    'resolved benchmark client rejected an omitted false bind option' \
+    benchmark_client_resolved_topology_is_least_privilege \
+    "$omitted_false_compose" "$example_directory/.runtime/certs/ca.crt" || return $?
   jq '(.services.benchmark.privileged = true), .' \
-    "$resolved_compose" >"$multi_document_compose"
-  if benchmark_client_resolved_topology_is_least_privilege \
-    "$multi_document_compose" "$example_directory/.runtime/certs/ca.crt"; then
-    printf 'resolved benchmark client accepted multiple Compose documents\n' >&2
-    return 1
-  fi
-  benchmark_client_resolved_topology_is_least_privilege \
-    "$override_resolved_compose" "$override_ca" || {
-    printf 'resolved benchmark client did not confine its explicit CA override\n' >&2
-    return 1
-  }
+    "$resolved_compose" >"$multi_document_compose" || return 2
+  assert_policy_rejection \
+    'resolved benchmark client accepted multiple Compose documents' \
+    benchmark_client_resolved_topology_is_least_privilege \
+    "$multi_document_compose" "$example_directory/.runtime/certs/ca.crt" || return $?
+  assert_policy_acceptance \
+    'resolved benchmark client did not confine its explicit CA override' \
+    benchmark_client_resolved_topology_is_least_privilege \
+    "$override_resolved_compose" "$override_ca" || return $?
 }
 
 test_unix_security_probe_topology_is_least_privilege() {
@@ -15520,42 +17730,46 @@ test_unix_security_probe_topology_is_least_privilege() {
   local resolved_sibling_security_option_count=""
   local endpoint_volumes=""
 
-  grep -Fqx '    socket_group_id: 65534' "$obi_config"
-  COMPOSE_PROFILES=tools docker compose --file "$compose_file" config >"$resolved_compose"
-  socket_init_service="$(compose_service_block "$compose_file" socket-init)"
-  obi_service="$(compose_service_block "$compose_file" obi)"
-  sibling_service="$(compose_service_block "$compose_file" security-unix-sibling-probe)"
+  grep -Fqx '    socket_group_id: 65534' "$obi_config" || return $?
+  if ! COMPOSE_PROFILES=tools docker compose --file "$compose_file" config \
+    >"$resolved_compose"; then
+    return 2
+  fi
+  socket_init_service="$(compose_service_block "$compose_file" socket-init)" || return $?
+  obi_service="$(compose_service_block "$compose_file" obi)" || return $?
+  sibling_service="$(compose_service_block \
+    "$compose_file" security-unix-sibling-probe)" || return $?
   resolved_sibling_service="$(compose_service_block \
-    "$resolved_compose" security-unix-sibling-probe)"
-  endpoint_service="$(compose_service_block "$compose_file" security-probe)"
+    "$resolved_compose" security-unix-sibling-probe)" || return $?
+  endpoint_service="$(compose_service_block "$compose_file" security-probe)" || return $?
   sibling_volumes="$(awk '
     $0 == "    volumes:" { inside = 1; next }
     inside && $0 ~ /^    [^[:space:]#][^:]*:/ { exit }
     inside && $0 ~ /^      - / { print }
-  ' <<<"$sibling_service")"
+  ' <<<"$sibling_service")" || return $?
   resolved_sibling_volumes="$(awk '
     $0 == "    volumes:" { inside = 1; next }
     inside && $0 ~ /^    [^[:space:]#][^:]*:/ { exit }
     inside { print }
-  ' <<<"$resolved_sibling_service")"
+  ' <<<"$resolved_sibling_service")" || return $?
   resolved_sibling_volume_count="$(awk '
     /^      - type:/ { count += 1 }
     END { print count + 0 }
-  ' <<<"$resolved_sibling_volumes")"
+  ' <<<"$resolved_sibling_volumes")" || return $?
   resolved_sibling_security_options="$(awk '
     $0 == "    security_opt:" { inside = 1; next }
     inside && $0 ~ /^    [^[:space:]#][^:]*:/ { exit }
     inside { print }
-  ' <<<"$resolved_sibling_service")"
+  ' <<<"$resolved_sibling_service")" || return $?
   resolved_sibling_security_option_count="$(awk '
     /^      - / { count += 1 }
     END { print count + 0 }
-  ' <<<"$resolved_sibling_security_options")"
+  ' <<<"$resolved_sibling_security_options")" || return $?
   endpoint_volumes="$(awk '
     $0 == "    volumes:" { inside = 1; next }
     inside && $0 ~ /^    [^[:space:]#][^:]*:/ { exit }
     inside && $0 ~ /^      - / { print }
-  ' <<<"$endpoint_service")"
+  ' <<<"$endpoint_service")" || return $?
 
   [[ "$socket_init_service" == *'chown 0:65534 /var/run/obi && chmod 0750 /var/run/obi'* &&
     "$obi_service" == *'OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_GROUP_ID: "65534"'* ]] || {

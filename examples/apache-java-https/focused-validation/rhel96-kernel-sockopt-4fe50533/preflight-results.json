@@ -1,0 +1,80 @@
+{
+  "format": 1,
+  "kind": "focused-rhel-kernel-sockopt-preflight-results",
+  "acceptance_evidence": false,
+  "status": "passed",
+  "checks": {
+    "source_revision_match": "passed",
+    "java_agent": {
+      "artifact_nonempty": "passed",
+      "checksum_match": "passed"
+    },
+    "kernel": {
+      "pinned_digest_match": "passed",
+      "runtime_family": "passed",
+      "architecture": "passed",
+      "cgroup_v2": "passed",
+      "vmlinux_btf": "passed",
+      "bpftool": "passed"
+    },
+    "abi": {
+      "status": "passed",
+      "selected": 10,
+      "passed": 10,
+      "failed": 0,
+      "skipped": 0,
+      "tests": [
+        "TestRecordCorpus",
+        "TestRecordGoldenVector",
+        "TestRecordRejectsInvalidFraming",
+        "TestRecordDoesNotMarshalUnknownStatus",
+        "TestRecordRejectsFutureLargerRecordInVersionOne",
+        "TestVersionMismatchIsTyped",
+        "TestValidRemoteParentRejectsZeroIDs",
+        "TestRequestGoldenVector",
+        "TestRequestSourceIsExplicitOnTheWire",
+        "TestSampledAndUnsampledRoundTrip"
+      ]
+    },
+    "production_verifier": {
+      "status": "passed",
+      "required": 3,
+      "passed": 3,
+      "failed": 0,
+      "skipped": 0,
+      "profiles": [
+        "TestBPFVerifierProductionProfiles",
+        "TestBPFVerifierProductionProfiles/generictracer/apache-java-https",
+        "TestBPFVerifierProductionProfiles/tpinjector/java-remote-parent"
+      ]
+    },
+    "privileged_sockopt": {
+      "status": "passed",
+      "required": 9,
+      "passed": 9,
+      "failed": 0,
+      "skipped": 0,
+      "tests": [
+        "TestJavaRemoteParentPrimarySocketAuthority",
+        "TestJavaRemoteParentPrimaryRequiresAuthoritativeDataHook",
+        "TestJavaRemoteParentPrimaryJVMFaults",
+        "TestJavaRemoteParentPrimaryJVMDirectSSLSocket",
+        "TestJavaRemoteParentGenericJVMDirectSSLSocket",
+        "TestJavaRemoteParentNestedCgroupLifecycle",
+        "TestJavaRemoteParentCgroupLinkProcessDeathCleanup",
+        "TestJavaRemoteParentCgroupPartialAttachRollback",
+        "TestJavaRemoteParentBridgeLoadRequiresPrivileges"
+      ]
+    },
+    "transport_benchmark": {
+      "status": "passed",
+      "required_series": 6,
+      "correct_series": 6,
+      "gates_passed": 6,
+      "latency_threshold_gates_passed": 5,
+      "correctness_only_gates_passed": 1,
+      "failed": 0,
+      "skipped": 0
+    }
+  }
+}

@@ -1,0 +1,171 @@
+{
+  "format": 1,
+  "kind": "focused-go-transport-provider-microbenchmark",
+  "acceptance_evidence": false,
+  "status": "passed",
+  "benchmark": "java_remote_parent_transport",
+  "scope": {
+    "harness": "go_privileged_transport_provider",
+    "measures": [
+      "transport",
+      "provider"
+    ],
+    "excludes": [
+      "java",
+      "jni"
+    ],
+    "unix_timeout_deadline_ns": 50000000
+  },
+  "series": [
+    {
+      "transport": "getsockopt",
+      "outcome": "miss",
+      "warmup_rounds": 16,
+      "measurement_rounds": 512,
+      "samples": 4096,
+      "concurrency": 8,
+      "batch_elapsed_ns": 62955127,
+      "p50_ns": 1238,
+      "p95_ns": 1463,
+      "p99_ns": 1773,
+      "operations_per_second": 65062.21486933066,
+      "valid": 0,
+      "missing": 4096,
+      "already_consumed": 0,
+      "timeout": 0,
+      "errors": 0,
+      "correct": true,
+      "latency_gate": {
+        "kind": "p99_lt",
+        "p50_min_ns": 0,
+        "p99_max_ns": 1000000,
+        "passed": true
+      }
+    },
+    {
+      "transport": "getsockopt",
+      "outcome": "hit",
+      "warmup_rounds": 16,
+      "measurement_rounds": 512,
+      "samples": 4096,
+      "concurrency": 8,
+      "batch_elapsed_ns": 104088264,
+      "p50_ns": 4899,
+      "p95_ns": 6835,
+      "p99_ns": 17263,
+      "operations_per_second": 39351.21830833878,
+      "valid": 4096,
+      "missing": 0,
+      "already_consumed": 0,
+      "timeout": 0,
+      "errors": 0,
+      "correct": true,
+      "latency_gate": {
+        "kind": "p99_lt",
+        "p50_min_ns": 0,
+        "p99_max_ns": 1000000,
+        "passed": true
+      }
+    },
+    {
+      "transport": "getsockopt",
+      "outcome": "one_shot",
+      "warmup_rounds": 16,
+      "measurement_rounds": 512,
+      "samples": 4096,
+      "concurrency": 8,
+      "batch_elapsed_ns": 75387813,
+      "p50_ns": 1666,
+      "p95_ns": 6763,
+      "p99_ns": 8933,
+      "operations_per_second": 54332.38924174654,
+      "valid": 512,
+      "missing": 0,
+      "already_consumed": 3584,
+      "timeout": 0,
+      "errors": 0,
+      "correct": true,
+      "latency_gate": {
+        "kind": "correctness_only",
+        "p50_min_ns": 0,
+        "p99_max_ns": 0,
+        "passed": true
+      }
+    },
+    {
+      "transport": "unix",
+      "outcome": "miss",
+      "warmup_rounds": 8,
+      "measurement_rounds": 128,
+      "samples": 1024,
+      "concurrency": 8,
+      "batch_elapsed_ns": 80800912,
+      "p50_ns": 403497,
+      "p95_ns": 677034,
+      "p99_ns": 1046826,
+      "operations_per_second": 12673.12428354769,
+      "valid": 0,
+      "missing": 1024,
+      "already_consumed": 0,
+      "timeout": 0,
+      "errors": 0,
+      "correct": true,
+      "latency_gate": {
+        "kind": "p99_lt",
+        "p50_min_ns": 0,
+        "p99_max_ns": 50000000,
+        "passed": true
+      }
+    },
+    {
+      "transport": "unix",
+      "outcome": "hit",
+      "warmup_rounds": 8,
+      "measurement_rounds": 128,
+      "samples": 1024,
+      "concurrency": 8,
+      "batch_elapsed_ns": 176403725,
+      "p50_ns": 982326,
+      "p95_ns": 1510822,
+      "p99_ns": 2041275,
+      "operations_per_second": 5804.866082051271,
+      "valid": 1024,
+      "missing": 0,
+      "already_consumed": 0,
+      "timeout": 0,
+      "errors": 0,
+      "correct": true,
+      "latency_gate": {
+        "kind": "p99_lt",
+        "p50_min_ns": 0,
+        "p99_max_ns": 50000000,
+        "passed": true
+      }
+    },
+    {
+      "transport": "unix",
+      "outcome": "timeout",
+      "warmup_rounds": 8,
+      "measurement_rounds": 128,
+      "samples": 1024,
+      "concurrency": 8,
+      "batch_elapsed_ns": 6497197516,
+      "p50_ns": 50553250,
+      "p95_ns": 50794708,
+      "p99_ns": 50851686,
+      "operations_per_second": 157.60641376197927,
+      "valid": 0,
+      "missing": 0,
+      "already_consumed": 0,
+      "timeout": 1024,
+      "errors": 0,
+      "correct": true,
+      "latency_gate": {
+        "kind": "p50_gte_p99_lte",
+        "p50_min_ns": 50000000,
+        "p99_max_ns": 100000000,
+        "passed": true
+      }
+    }
+  ]
+}

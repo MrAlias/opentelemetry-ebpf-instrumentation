@@ -1,6 +1,7 @@
 # Benchmark plan and result matrix
 
-Status: **untested**
+Status: **partial — privileged Go transport/provider gates passed; sustained
+application and Java/JNI cells remain untested**
 
 Correctness has priority over throughput. Any wrong parent, duplicate Java
 server span, crash, unbounded resource growth, or application failure makes a
@@ -42,6 +43,13 @@ response. It measures a client deadline error, not a provider
 `StatusTimeout` response. A result that returns early or exceeds the bounded
 upper tail fails even when it has the expected timeout error.
 
+A digest-pinned RHEL 9.6 kernel run at
+`4fe50533cd1d66b6bb94f2ea34be4b03e3727849` passed all six correctness gates,
+including all five latency-threshold gates and the one-shot correctness-only
+gate. The sanitized
+[focused preflight record](focused-validation/rhel96-kernel-sockopt-4fe50533/README.md)
+retains the exact aggregate series and public artifact provenance.
+
 This is a Go transport/provider microbenchmark. The primary series attach the
 real cgroup `getsockopt` programs; the Unix miss/hit series exercise the Go Unix
 client, server admission, and map-provider path, while the timeout series uses
@@ -52,10 +60,10 @@ reported as Java/JNI lookup or end-to-end workload measurements.
 
 The opt-in privileged benchmark is intentionally not run as part of local
 validation. Local checks compile and test the artifact validation code; the
-digest-pinned final RHEL workflow supplies the required root privileges,
-cgroup/BPF facilities, fixed kernel identity, and retained execution evidence.
-Until that workflow passes and its artifact is inspected, every corresponding
-comparison-matrix cell remains `untested`.
+digest-pinned RHEL workflow supplies the required root privileges, cgroup/BPF
+facilities, fixed kernel identity, and retained execution evidence. The focused
+run above satisfies only the six Go transport/provider gates. Every application
+comparison-matrix cell below remains `untested`.
 
 The harness records the measured `passed` value for all six series and
 atomically publishes the artifact before asserting the latency gates. The VM
@@ -264,9 +272,10 @@ The six sustained core cells are not the complete #37 matrix. End-to-end
 Java/JNI primary and fallback miss/timeout cells, plus pressure cells, still
 require separately measured evidence before declaring the benchmark issue
 complete. The privileged Go transport artifact is complementary evidence; it
-does not fill those application-workload cells. No checked-in benchmark
-artifact exists yet, so this harness change does not turn the W3C row in the
-comparison matrix into a passed result.
+does not fill those application-workload cells. The checked-in
+[focused artifact](focused-validation/rhel96-kernel-sockopt-4fe50533/README.md)
+therefore does not turn the W3C row or any other application comparison-matrix
+row into a passed result.
 
 For focused runner iteration, use the same request count, repetitions, and
 seed for every mode:

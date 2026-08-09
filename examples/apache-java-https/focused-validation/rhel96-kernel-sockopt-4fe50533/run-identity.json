@@ -1,0 +1,27 @@
+{
+  "format": 1,
+  "kind": "focused-rhel-kernel-sockopt-preflight",
+  "source_revision": "4fe50533cd1d66b6bb94f2ea34be4b03e3727849",
+  "provenance": {
+    "repository": "MrAlias/opentelemetry-ebpf-instrumentation",
+    "workflow_run_url": "https://github.com/MrAlias/opentelemetry-ebpf-instrumentation/actions/runs/31323884217",
+    "artifact": {
+      "name": "java-remote-parent-rhel9.6-kernel-sockopt-31323884217",
+      "digest": "sha256:c52d96acd4cf105abd8f2fb57a86c752378663ee965045d39b9ad52b0ad0f4c5"
+    }
+  },
+  "environment": {
+    "kernel_target": "RHEL 9.6",
+    "architecture": "x86_64",
+    "kernel_family": "5.14",
+    "vm_userspace": "Alpine 3.23",
+    "cgroup_version": 2,
+    "vmlinux_btf": true,
+    "java_feature_version": 21
+  },
+  "scope": {
+    "transport": "getsockopt",
+    "acceptance_evidence": false,
+    "acceptance_evidence_reason": "targeted-rhel-vm-preflight"
+  }
+}

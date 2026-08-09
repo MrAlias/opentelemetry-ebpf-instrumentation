@@ -102,6 +102,7 @@ public final class VirtualThreadRuntimeProbe {
       LockSupport.unpark(virtualThreadReference.get());
       virtualThread.join(TimeUnit.SECONDS.toMillis(5));
       require(!virtualThread.isAlive(), "migrating virtual thread did not terminate");
+      awaitExecutionCount(scheduler, 2);
 
       require(firstCarrier.get() != null, "first carrier was not recorded");
       require(secondCarrier.get() != null, "second carrier was not recorded");

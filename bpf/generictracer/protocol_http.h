@@ -803,14 +803,25 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
                 !java_http1_continue && !java_telemetry_receive) {
                 java_incoming = java_remote_parent_incoming_snapshot_mem();
             }
-            found_tp = find_trace_for_server_request_with_incoming(
-                &args->pid_conn.conn,
-                &tp_p->tp,
-                EVENT_HTTP_REQUEST,
-                args->connection_netns_cookie,
-                java_incoming ? &java_incoming->candidate : NULL,
-                java_incoming ? &java_incoming->generation : NULL,
-                java_remote_parent_receive_action_allows_incoming_claim(java_receive_action));
+            if (java_incoming) {
+                found_tp = find_trace_for_server_request_with_incoming(
+                    &args->pid_conn.conn,
+                    &tp_p->tp,
+                    EVENT_HTTP_REQUEST,
+                    args->connection_netns_cookie,
+                    &java_incoming->candidate,
+                    &java_incoming->generation,
+                    java_remote_parent_receive_action_allows_incoming_claim(java_receive_action));
+            } else {
+                found_tp = find_trace_for_server_request_with_incoming(
+                    &args->pid_conn.conn,
+                    &tp_p->tp,
+                    EVENT_HTTP_REQUEST,
+                    args->connection_netns_cookie,
+                    NULL,
+                    NULL,
+                    java_remote_parent_receive_action_allows_incoming_claim(java_receive_action));
+            }
             if (java_incoming && java_incoming->generation) {
                 u64 staged_generation = 0;
                 connection_info_t *java_connection = java_remote_parent_connection_snapshot_mem();

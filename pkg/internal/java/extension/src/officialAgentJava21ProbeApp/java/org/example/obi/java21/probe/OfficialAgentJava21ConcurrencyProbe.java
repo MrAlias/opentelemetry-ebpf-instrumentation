@@ -47,6 +47,9 @@ public final class OfficialAgentJava21ConcurrencyProbe {
   private static final int CARRIERS = 4;
   private static final int PLATFORM_WORKERS = 4;
   private static final int FIRST_SOCKET_FILE_DESCRIPTOR = 200;
+  private static final int EVENT_MAP_CAPACITY =
+      Math.max(
+          (VIRTUAL_TASKS * 2) + RELAY_VIRTUAL_TASKS, VIRTUAL_TASKS + PLATFORM_TASKS + RELAY_TASKS);
   private static final long TIMEOUT_SECONDS = 10L;
   private static final String VIRTUAL = "VIRTUAL";
   private static final String PLATFORM = "PLATFORM";
@@ -68,30 +71,30 @@ public final class OfficialAgentJava21ConcurrencyProbe {
 
   private static final ThreadLocal<TaskLabel> ACTIVE_SUBMISSION = new ThreadLocal<TaskLabel>();
   private static final ConcurrentMap<Long, TaskCapture> CAPTURES =
-      new ConcurrentHashMap<Long, TaskCapture>();
+      new ConcurrentHashMap<Long, TaskCapture>(EVENT_MAP_CAPACITY);
   private static final ConcurrentMap<Long, TaskCapture> PENDING =
-      new ConcurrentHashMap<Long, TaskCapture>();
+      new ConcurrentHashMap<Long, TaskCapture>(EVENT_MAP_CAPACITY);
   private static final ConcurrentMap<String, TaskCompletion> COMPLETIONS =
-      new ConcurrentHashMap<String, TaskCompletion>();
+      new ConcurrentHashMap<String, TaskCompletion>(EVENT_MAP_CAPACITY);
   private static final ConcurrentLinkedQueue<TaskEvent> TASK_EVENTS =
       new ConcurrentLinkedQueue<TaskEvent>();
   private static final AtomicLong EVENT_SEQUENCE = new AtomicLong();
   private static final AtomicReference<Throwable> EVENT_FAILURE = new AtomicReference<Throwable>();
 
   private static final Set<Long> KNOWN_VIRTUAL_THREADS =
-      Collections.newSetFromMap(new ConcurrentHashMap<Long, Boolean>());
+      Collections.newSetFromMap(new ConcurrentHashMap<Long, Boolean>(EVENT_MAP_CAPACITY));
   private static final ConcurrentMap<Long, String> VIRTUAL_THREAD_IDS =
-      new ConcurrentHashMap<Long, String>();
+      new ConcurrentHashMap<Long, String>(EVENT_MAP_CAPACITY);
   private static final ConcurrentMap<Long, Long> MOUNTED_VIRTUAL_BY_NATIVE =
-      new ConcurrentHashMap<Long, Long>();
+      new ConcurrentHashMap<Long, Long>(EVENT_MAP_CAPACITY);
   private static final ConcurrentMap<Long, AtomicInteger> VIRTUAL_MOUNTS =
-      new ConcurrentHashMap<Long, AtomicInteger>();
+      new ConcurrentHashMap<Long, AtomicInteger>(EVENT_MAP_CAPACITY);
   private static final ConcurrentMap<Long, AtomicInteger> VIRTUAL_UNMOUNTS =
-      new ConcurrentHashMap<Long, AtomicInteger>();
+      new ConcurrentHashMap<Long, AtomicInteger>(EVENT_MAP_CAPACITY);
   private static final ConcurrentMap<Long, AtomicInteger> VIRTUAL_TERMINATIONS =
-      new ConcurrentHashMap<Long, AtomicInteger>();
+      new ConcurrentHashMap<Long, AtomicInteger>(EVENT_MAP_CAPACITY);
   private static final ConcurrentMap<Long, AtomicLong> FIRST_VIRTUAL_MOUNT_SEQUENCE =
-      new ConcurrentHashMap<Long, AtomicLong>();
+      new ConcurrentHashMap<Long, AtomicLong>(EVENT_MAP_CAPACITY);
 
   private static volatile Method getTid;
   private static volatile Field carrierThreadField;
@@ -100,6 +103,9 @@ public final class OfficialAgentJava21ConcurrencyProbe {
 
   public static void main(String[] args) throws Exception {
     require(javaFeatureVersion() == 21, "Java 21 is required");
+    // The test emitter runs inline from VirtualThread.mount, where map initialization must not
+    // yield.
+    initializeConcurrentEventMaps();
     HelperFixture fixture = HelperFixture.install();
     List<ExactNettyConnection> connections = new ArrayList<ExactNettyConnection>();
     try {
@@ -163,6 +169,27 @@ public final class OfficialAgentJava21ConcurrencyProbe {
         fixture.close();
       }
     }
+  }
+
+  private static void initializeConcurrentEventMaps() {
+    Long sentinel = Long.valueOf(Long.MIN_VALUE);
+    TaskLabel label = new TaskLabel("EVENT_MAP_WARMUP", false, -1L, -1L, null);
+    TaskCapture capture = new TaskCapture(label, "EVENT_MAP_WARMUP", -1L, -1L, -1L);
+    TaskCompletion completion = new TaskCompletion(capture, -1L, -1L, -1L, -1L);
+
+    initializeConcurrentMap(CAPTURES, sentinel, capture);
+    initializeConcurrentMap(PENDING, sentinel, capture);
+    initializeConcurrentMap(COMPLETIONS, label.id, completion);
+    initializeConcurrentMap(MOUNTED_VIRTUAL_BY_NATIVE, sentinel, sentinel);
+    initializeConcurrentMap(VIRTUAL_MOUNTS, sentinel, new AtomicInteger());
+    initializeConcurrentMap(VIRTUAL_UNMOUNTS, sentinel, new AtomicInteger());
+    initializeConcurrentMap(VIRTUAL_TERMINATIONS, sentinel, new AtomicInteger());
+    initializeConcurrentMap(FIRST_VIRTUAL_MOUNT_SEQUENCE, sentinel, new AtomicLong());
+  }
+
+  private static <K, V> void initializeConcurrentMap(ConcurrentMap<K, V> map, K key, V value) {
+    require(map.putIfAbsent(key, value) == null, "event-map warmup collision");
+    require(map.remove(key, value), "event-map warmup cleanup failed");
   }
 
   private static List<PlatformSubmission> reusablePlatformTasks() {

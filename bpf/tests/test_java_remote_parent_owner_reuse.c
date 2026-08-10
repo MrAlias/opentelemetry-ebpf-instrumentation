@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include <bpfcore/bpf_helpers.h>
+#include <common/trace_key.h>
 
 enum { BPF_ANY = 0, BPF_NOEXIST = 1, BPF_EXIST = 2 };
 
@@ -59,6 +60,38 @@ static u8 test_java_vt_delete_identity_if_matches(const pid_key_t *synthetic_own
 #define java_vt_delete_identity_if_matches test_java_vt_delete_identity_if_matches
 
 #include <maps/java_remote_parent.h>
+
+static u32 test_thread_mapping_tid_from_pid_tgid(u64 id);
+static u8 test_thread_mapping_register_process_incarnation(u64 incarnation);
+static tp_info_pid_t *test_thread_mapping_find_parent(trace_key_t *key);
+static u64 test_thread_mapping_extra_runtime_id(u64 id);
+static long test_thread_mapping_context_set(u64 id, const tp_info_t *info);
+static long test_thread_mapping_context_delete(u64 id);
+static long test_thread_mapping_probe_read_user(void *destination, u32 size, const void *source);
+
+#define JAVA_THREAD_MAPPING_PROCESS_KEY java_process_key
+#define JAVA_THREAD_MAPPING_TID_FROM_PID_TGID test_thread_mapping_tid_from_pid_tgid
+#define JAVA_THREAD_MAPPING_PROCESS_INCARNATION test_java_process_incarnation_for
+#define JAVA_THREAD_MAPPING_REGISTER_PROCESS_INCARNATION                                           \
+    test_thread_mapping_register_process_incarnation
+#define JAVA_THREAD_MAPPING_FIND_PARENT test_thread_mapping_find_parent
+#define JAVA_THREAD_MAPPING_EXTRA_RUNTIME_ID test_thread_mapping_extra_runtime_id
+#define JAVA_THREAD_MAPPING_CONTEXT_SET test_thread_mapping_context_set
+#define JAVA_THREAD_MAPPING_CONTEXT_DELETE test_thread_mapping_context_delete
+#define JAVA_THREAD_MAPPING_PROBE_READ_USER test_thread_mapping_probe_read_user
+
+#include <generictracer/java_thread_mapping.h>
+
+#undef JAVA_THREAD_MAPPING_PROBE_READ_USER
+#undef JAVA_THREAD_MAPPING_CONTEXT_DELETE
+#undef JAVA_THREAD_MAPPING_CONTEXT_SET
+#undef JAVA_THREAD_MAPPING_EXTRA_RUNTIME_ID
+#undef JAVA_THREAD_MAPPING_FIND_PARENT
+#undef JAVA_THREAD_MAPPING_REGISTER_PROCESS_INCARNATION
+#undef JAVA_THREAD_MAPPING_PROCESS_INCARNATION
+#undef JAVA_THREAD_MAPPING_TID_FROM_PID_TGID
+#undef JAVA_THREAD_MAPPING_PROCESS_KEY
+
 #include <generictracer/java_remote_parent_close.h>
 
 #undef java_process_capability_for
@@ -92,9 +125,9 @@ static const u64 test_observed_monotime_ns = 1000;
 static const u64 test_now_ns = 2000;
 static const u64 test_first_token = 1001;
 static const u64 test_cancelled_token = 1002;
+static const u64 test_missing_token = 1003;
 static const u64 test_capture_race_token = 2001;
 static const u64 test_relay_race_token = 2002;
-static const u64 test_capture_transfer_token = 3001;
 static const u64 test_relay_transfer_token = 3002;
 static const u64 test_task_only_capture_token = 4001;
 static const u64 test_receive_boundary_capture_token = 4002;
@@ -117,11 +150,29 @@ typedef struct handoff_claim_entry {
     int present;
 } handoff_claim_entry_t;
 
+typedef struct task_claim_entry {
+    pid_key_t key;
+    java_remote_parent_handoff_claim_t value;
+    int present;
+} task_claim_entry_t;
+
 typedef struct ambiguity_entry {
     java_remote_parent_key_t key;
     u64 observed_monotime_ns;
     int present;
 } ambiguity_entry_t;
+
+typedef struct legacy_java_task_entry {
+    pid_key_t child;
+    pid_key_t parent;
+    int present;
+} legacy_java_task_entry_t;
+
+typedef struct thread_mapping_claim_entry {
+    pid_key_t process;
+    java_thread_mapping_claim_t value;
+    int present;
+} thread_mapping_claim_entry_t;
 
 typedef struct alias_replay_entry {
     java_remote_parent_alias_replay_key_t key;
@@ -130,6 +181,7 @@ typedef struct alias_replay_entry {
 } alias_replay_entry_t;
 
 static pid_key_t current_task;
+static u64 registered_process_incarnation;
 static pid_key_t authorized_translation_owner;
 static u8 authorized_translation_result;
 static u64 current_process_incarnation;
@@ -184,8 +236,12 @@ static java_remote_parent_response_t stored_fallback;
 static int fallback_present;
 static handoff_entry_t handoffs[2];
 static handoff_claim_entry_t handoff_claims[2];
+static handoff_claim_entry_t handoff_mutations[2];
+static task_claim_entry_t task_claims[2];
 static ambiguity_entry_t ambiguities[3];
 static alias_replay_entry_t alias_replays[4];
+static legacy_java_task_entry_t legacy_java_tasks[4];
+static thread_mapping_claim_entry_t thread_mapping_claim;
 static int alias_replay_update_failures;
 static int disable_alias_replay_autoseed;
 static int replace_task_during_alias_replay_lookup;
@@ -238,16 +294,16 @@ static u64 stats[k_java_remote_parent_stat_max];
 static int handoff_claim_update_attempts;
 static int handoff_claim_update_successes;
 static int inject_handoff_claim_on_publish;
+static int inject_handoff_claim_on_collision;
 static int injected_handoff_claims;
+static int injected_handoff_claims_under_mutation;
+static int handoff_reclaim_lookup_count;
+static int handoff_claim_reclaim_lookup_count;
+static int inject_handoff_on_second_reclaim_check;
+static int replace_handoff_claim_on_second_reclaim_check;
+static java_remote_parent_task_t reclaim_injected_handoff;
 static u32 aliases_at_handoff_publish;
 static u32 aliases_at_handoff_delete;
-static int transfer_handoff_on_publish;
-static pid_key_t transfer_target;
-static u32 aliases_at_task_transfer;
-static int transfer_claim_publications;
-static int transfer_task_publications;
-static int transfer_handoff_deletes;
-static int transfer_claim_evictions;
 static int observe_alias_balance;
 static int alias_zero_observed;
 static int java_vt_thread_deletes;
@@ -349,6 +405,34 @@ static int same_key(const void *left, const void *right, size_t size) {
     return memcmp(left, right, size) == 0;
 }
 
+static legacy_java_task_entry_t *find_legacy_java_task(const pid_key_t *child) {
+    for (size_t i = 0; i < sizeof(legacy_java_tasks) / sizeof(legacy_java_tasks[0]); i++) {
+        if (legacy_java_tasks[i].present &&
+            same_key(child, &legacy_java_tasks[i].child, sizeof(*child))) {
+            return &legacy_java_tasks[i];
+        }
+    }
+    return NULL;
+}
+
+static void seed_legacy_java_task(const pid_key_t *child, const pid_key_t *parent) {
+    legacy_java_task_entry_t *entry = find_legacy_java_task(child);
+    if (!entry) {
+        for (size_t i = 0; i < sizeof(legacy_java_tasks) / sizeof(legacy_java_tasks[0]); i++) {
+            if (!legacy_java_tasks[i].present) {
+                entry = &legacy_java_tasks[i];
+                entry->child = *child;
+                entry->present = 1;
+                break;
+            }
+        }
+    }
+    if (!entry) {
+        fail("legacy java_tasks fixture capacity exhausted");
+    }
+    entry->parent = *parent;
+}
+
 static handoff_entry_t *find_handoff(const java_remote_parent_handoff_key_t *key) {
     for (size_t i = 0; i < sizeof(handoffs) / sizeof(handoffs[0]); i++) {
         if (handoffs[i].present && same_key(key, &handoffs[i].key, sizeof(*key))) {
@@ -362,6 +446,25 @@ static handoff_claim_entry_t *find_handoff_claim(const java_remote_parent_handof
     for (size_t i = 0; i < sizeof(handoff_claims) / sizeof(handoff_claims[0]); i++) {
         if (handoff_claims[i].present && same_key(key, &handoff_claims[i].key, sizeof(*key))) {
             return &handoff_claims[i];
+        }
+    }
+    return NULL;
+}
+
+static handoff_claim_entry_t *find_handoff_mutation(const java_remote_parent_handoff_key_t *key) {
+    for (size_t i = 0; i < sizeof(handoff_mutations) / sizeof(handoff_mutations[0]); i++) {
+        if (handoff_mutations[i].present &&
+            same_key(key, &handoff_mutations[i].key, sizeof(*key))) {
+            return &handoff_mutations[i];
+        }
+    }
+    return NULL;
+}
+
+static task_claim_entry_t *find_task_claim(const pid_key_t *key) {
+    for (size_t i = 0; i < sizeof(task_claims) / sizeof(task_claims[0]); i++) {
+        if (task_claims[i].present && same_key(key, &task_claims[i].key, sizeof(*key))) {
+            return &task_claims[i];
         }
     }
     return NULL;
@@ -500,67 +603,34 @@ static int owner_cleanup_payload_absent(void) {
            !connection_present && !cookie_connection_present && !task_present && !terminal_present;
 }
 
-static int inject_handoff_claim(const java_remote_parent_handoff_key_t *key) {
-    if (!inject_handoff_claim_on_publish) {
+static int inject_handoff_claim(const java_remote_parent_handoff_key_t *key, int *armed) {
+    if (!armed || !*armed) {
         return 0;
     }
-    inject_handoff_claim_on_publish = 0;
+    *armed = 0;
 
-    if (find_handoff_claim(key)) {
+    handoff_claim_entry_t *ticket = find_handoff_claim(key);
+    if (!ticket ||
+        !java_remote_parent_handoff_ticket_open(&ticket->value, key->process_incarnation)) {
         return -1;
     }
-    for (size_t i = 0; i < sizeof(handoff_claims) / sizeof(handoff_claims[0]); i++) {
-        if (!handoff_claims[i].present) {
-            handoff_claims[i].key = *key;
-            handoff_claims[i].value.observed_monotime_ns = test_now_ns;
-            handoff_claims[i].value.process_incarnation = test_process_incarnation;
-            handoff_claims[i].present = 1;
-            injected_handoff_claims++;
-            return 0;
-        }
+    ticket->present = 0;
+    injected_handoff_claims++;
+    if (find_handoff_mutation(key)) {
+        injected_handoff_claims_under_mutation++;
     }
-    return -1;
-}
-
-static int transfer_published_handoff(handoff_entry_t *handoff) {
-    if (!transfer_handoff_on_publish) {
-        return 0;
-    }
-    transfer_handoff_on_publish = 0;
-
-    handoff_claim_entry_t *claim = NULL;
-    for (size_t i = 0; i < sizeof(handoff_claims) / sizeof(handoff_claims[0]); i++) {
-        if (!handoff_claims[i].present) {
-            claim = &handoff_claims[i];
-            break;
-        }
-    }
-    if (!claim) {
-        return -1;
-    }
-
-    claim->key = handoff->key;
-    claim->value.observed_monotime_ns = test_now_ns;
-    claim->value.process_incarnation = test_process_incarnation;
-    claim->present = 1;
-    transfer_claim_publications++;
-
-    transferred_task_key = transfer_target;
-    transferred_task = handoff->value;
-    transferred_task_present = 1;
-    aliases_at_task_transfer = stored_state.aliases;
-    transfer_task_publications++;
-
-    aliases_at_handoff_delete = stored_state.aliases;
-    handoff->present = 0;
-    transfer_handoff_deletes++;
-
-    claim->present = 0;
-    transfer_claim_evictions++;
     return 0;
 }
 
 static void *test_map_lookup(void *map, const void *key) {
+    if (map == &java_tasks) {
+        legacy_java_task_entry_t *entry = find_legacy_java_task(key);
+        return entry ? &entry->parent : NULL;
+    }
+    if (map == &java_thread_mapping_claims && thread_mapping_claim.present &&
+        same_key(key, &thread_mapping_claim.process, sizeof(thread_mapping_claim.process))) {
+        return &thread_mapping_claim.value;
+    }
     if (map == &java_remote_parent_data_hook_readiness && *(const u32 *)key == 0) {
         return &stage_data_hook_readiness;
     }
@@ -685,10 +755,34 @@ static void *test_map_lookup(void *map, const void *key) {
     }
     if (map == &java_remote_parent_handoffs) {
         handoff_entry_t *entry = find_handoff(key);
+        handoff_reclaim_lookup_count++;
+        if (!entry && inject_handoff_on_second_reclaim_check && handoff_reclaim_lookup_count == 2) {
+            inject_handoff_on_second_reclaim_check = 0;
+            handoffs[0] = (handoff_entry_t){
+                .key = *(const java_remote_parent_handoff_key_t *)key,
+                .value = reclaim_injected_handoff,
+                .present = 1,
+            };
+            entry = &handoffs[0];
+        }
         return entry ? &entry->value : NULL;
     }
     if (map == &java_remote_parent_handoff_claims) {
         handoff_claim_entry_t *entry = find_handoff_claim(key);
+        handoff_claim_reclaim_lookup_count++;
+        if (entry && replace_handoff_claim_on_second_reclaim_check &&
+            handoff_claim_reclaim_lookup_count == 2) {
+            replace_handoff_claim_on_second_reclaim_check = 0;
+            entry->value.observed_monotime_ns++;
+        }
+        return entry ? &entry->value : NULL;
+    }
+    if (map == &java_remote_parent_handoff_mutations) {
+        handoff_claim_entry_t *entry = find_handoff_mutation(key);
+        return entry ? &entry->value : NULL;
+    }
+    if (map == &java_remote_parent_task_claims) {
+        task_claim_entry_t *entry = find_task_claim(key);
         return entry ? &entry->value : NULL;
     }
     if (map == &java_remote_parent_tasks && task_present &&
@@ -799,7 +893,12 @@ static void *test_map_lookup(void *map, const void *key) {
 static long update_handoff(const java_remote_parent_handoff_key_t *key,
                            const java_remote_parent_task_t *value,
                            unsigned long long flags) {
-    if (find_handoff(key) || flags != BPF_NOEXIST) {
+    handoff_entry_t *existing = find_handoff(key);
+    if (existing || flags != BPF_NOEXIST) {
+        if (existing && flags == BPF_NOEXIST &&
+            inject_handoff_claim(key, &inject_handoff_claim_on_collision) != 0) {
+            unexpected_update = 1;
+        }
         return -1;
     }
     for (size_t i = 0; i < sizeof(handoffs) / sizeof(handoffs[0]); i++) {
@@ -808,10 +907,7 @@ static long update_handoff(const java_remote_parent_handoff_key_t *key,
             handoffs[i].value = *value;
             handoffs[i].present = 1;
             aliases_at_handoff_publish = stored_state.aliases;
-            if (inject_handoff_claim(key) != 0) {
-                unexpected_update = 1;
-            }
-            if (transfer_published_handoff(&handoffs[i]) != 0) {
+            if (inject_handoff_claim(key, &inject_handoff_claim_on_publish) != 0) {
                 unexpected_update = 1;
             }
             return 0;
@@ -925,6 +1021,36 @@ static long update_alias_replay(const java_remote_parent_alias_replay_key_t *key
 
 static long
 test_map_update(void *map, const void *key, const void *value, unsigned long long flags) {
+    if (map == &java_tasks) {
+        legacy_java_task_entry_t *entry = find_legacy_java_task(key);
+        if ((flags == BPF_NOEXIST && entry) || (flags == BPF_EXIST && !entry)) {
+            return -1;
+        }
+        if (!entry) {
+            for (size_t i = 0; i < sizeof(legacy_java_tasks) / sizeof(legacy_java_tasks[0]); i++) {
+                if (!legacy_java_tasks[i].present) {
+                    entry = &legacy_java_tasks[i];
+                    entry->child = *(const pid_key_t *)key;
+                    entry->present = 1;
+                    break;
+                }
+            }
+        }
+        if (!entry) {
+            return -1;
+        }
+        entry->parent = *(const pid_key_t *)value;
+        return 0;
+    }
+    if (map == &java_thread_mapping_claims && flags == BPF_NOEXIST) {
+        if (thread_mapping_claim.present) {
+            return -1;
+        }
+        thread_mapping_claim.process = *(const pid_key_t *)key;
+        thread_mapping_claim.value = *(const java_thread_mapping_claim_t *)value;
+        thread_mapping_claim.present = 1;
+        return 0;
+    }
     if (stage_updates_enabled && map == &java_remote_parent_data_acks && flags == BPF_ANY) {
         stage_ack_key = *(const java_remote_parent_data_signal_key_t *)key;
         stage_ack = *(const java_remote_parent_data_ack_t *)value;
@@ -1024,6 +1150,34 @@ test_map_update(void *map, const void *key, const void *value, unsigned long lon
     }
     if (map == &java_remote_parent_handoff_claims) {
         return update_handoff_claim(key, value, flags);
+    }
+    if (map == &java_remote_parent_handoff_mutations) {
+        if (flags != BPF_NOEXIST || find_handoff_mutation(key)) {
+            return -1;
+        }
+        for (size_t i = 0; i < sizeof(handoff_mutations) / sizeof(handoff_mutations[0]); i++) {
+            if (!handoff_mutations[i].present) {
+                handoff_mutations[i].key = *(const java_remote_parent_handoff_key_t *)key;
+                handoff_mutations[i].value = *(const java_remote_parent_handoff_claim_t *)value;
+                handoff_mutations[i].present = 1;
+                return 0;
+            }
+        }
+        return -1;
+    }
+    if (map == &java_remote_parent_task_claims) {
+        if (flags != BPF_NOEXIST || find_task_claim(key)) {
+            return -1;
+        }
+        for (size_t i = 0; i < sizeof(task_claims) / sizeof(task_claims[0]); i++) {
+            if (!task_claims[i].present) {
+                task_claims[i].key = *(const pid_key_t *)key;
+                task_claims[i].value = *(const java_remote_parent_handoff_claim_t *)value;
+                task_claims[i].present = 1;
+                return 0;
+            }
+        }
+        return -1;
     }
     if (map == &java_remote_parent_ambiguity) {
         return update_ambiguity(key, value, flags);
@@ -1320,6 +1474,30 @@ static long test_map_delete(void *map, const void *key) {
     if (map == &java_remote_parent_handoffs) {
         return delete_handoff(key);
     }
+    if (map == &java_remote_parent_handoff_claims) {
+        handoff_claim_entry_t *entry = find_handoff_claim(key);
+        if (!entry) {
+            return -1;
+        }
+        entry->present = 0;
+        return 0;
+    }
+    if (map == &java_remote_parent_handoff_mutations) {
+        handoff_claim_entry_t *entry = find_handoff_mutation(key);
+        if (!entry) {
+            return -1;
+        }
+        entry->present = 0;
+        return 0;
+    }
+    if (map == &java_remote_parent_task_claims) {
+        task_claim_entry_t *entry = find_task_claim(key);
+        if (!entry) {
+            return -1;
+        }
+        entry->present = 0;
+        return 0;
+    }
     if (map == &java_remote_parent_ambiguity) {
         ambiguity_entry_t *entry = find_ambiguity_entry(key);
         if (!entry) {
@@ -1569,6 +1747,15 @@ static long test_map_delete(void *map, const void *key) {
             same_key(key, &expected_java_task_delete_key, sizeof(expected_java_task_delete_key))) {
             java_task_deletes++;
         }
+        legacy_java_task_entry_t *entry = find_legacy_java_task(key);
+        if (entry) {
+            entry->present = 0;
+        }
+        return 0;
+    }
+    if (map == &java_thread_mapping_claims && thread_mapping_claim.present &&
+        same_key(key, &thread_mapping_claim.process, sizeof(thread_mapping_claim.process))) {
+        thread_mapping_claim.present = 0;
         return 0;
     }
     if (map == &java_vt_threads) {
@@ -1619,13 +1806,47 @@ static u64 test_java_current_process_incarnation(void) {
 static u64 test_java_process_incarnation_for(const pid_key_t *owner) {
     const pid_key_t process = java_process_key(owner);
     const pid_key_t expected = java_process_key(&test_owner);
-    return same_key(&process, &expected, sizeof(process)) ? test_process_incarnation : 0;
+    return same_key(&process, &expected, sizeof(process)) ? registered_process_incarnation : 0;
 }
 
 static u64 test_java_process_capability_for(const pid_key_t *owner) {
     const pid_key_t process = java_process_key(owner);
     const pid_key_t expected = java_process_key(&test_owner);
     return same_key(&process, &expected, sizeof(process)) ? test_process_incarnation : 0;
+}
+
+static u32 test_thread_mapping_tid_from_pid_tgid(u64 id) {
+    return (u32)id;
+}
+
+static u8 test_thread_mapping_register_process_incarnation(u64 incarnation) {
+    registered_process_incarnation = incarnation;
+    return incarnation != 0;
+}
+
+static tp_info_pid_t *test_thread_mapping_find_parent(trace_key_t *key) {
+    (void)key;
+    return NULL;
+}
+
+static u64 test_thread_mapping_extra_runtime_id(u64 id) {
+    return id;
+}
+
+static long test_thread_mapping_context_set(u64 id, const tp_info_t *info) {
+    (void)id;
+    (void)info;
+    return 0;
+}
+
+static long test_thread_mapping_context_delete(u64 id) {
+    (void)id;
+    return 0;
+}
+
+static long test_thread_mapping_probe_read_user(void *destination, u32 size, const void *source) {
+    memcpy(destination, source, size);
+    return 0;
 }
 
 static u8 test_java_vt_prepare_unregistered_cleanup(const pid_key_t *carrier,
@@ -1659,6 +1880,7 @@ static u8 test_java_vt_delete_identity_if_matches(const pid_key_t *synthetic_own
 
 static void seed_generation(const connection_info_t *connection) {
     current_task = test_owner;
+    registered_process_incarnation = test_process_incarnation;
     memset(&stage_state_scratch, 0, sizeof(stage_state_scratch));
     stage_generation_sequence = test_replacement_generation - 1;
     memset(&stage_incoming_key_scratch, 0, sizeof(stage_incoming_key_scratch));
@@ -1690,8 +1912,12 @@ static void seed_generation(const connection_info_t *connection) {
     memset(&stored_fallback, 0, sizeof(stored_fallback));
     memset(handoffs, 0, sizeof(handoffs));
     memset(handoff_claims, 0, sizeof(handoff_claims));
+    memset(handoff_mutations, 0, sizeof(handoff_mutations));
+    memset(task_claims, 0, sizeof(task_claims));
     memset(ambiguities, 0, sizeof(ambiguities));
     memset(alias_replays, 0, sizeof(alias_replays));
+    memset(legacy_java_tasks, 0, sizeof(legacy_java_tasks));
+    memset(&thread_mapping_claim, 0, sizeof(thread_mapping_claim));
     memset(&stored_task, 0, sizeof(stored_task));
     stored_task_key = test_child;
     memset(&transferred_task_key, 0, sizeof(transferred_task_key));
@@ -1755,16 +1981,16 @@ static void seed_generation(const connection_info_t *connection) {
     handoff_claim_update_attempts = 0;
     handoff_claim_update_successes = 0;
     inject_handoff_claim_on_publish = 0;
+    inject_handoff_claim_on_collision = 0;
     injected_handoff_claims = 0;
+    injected_handoff_claims_under_mutation = 0;
+    handoff_reclaim_lookup_count = 0;
+    handoff_claim_reclaim_lookup_count = 0;
+    inject_handoff_on_second_reclaim_check = 0;
+    replace_handoff_claim_on_second_reclaim_check = 0;
+    memset(&reclaim_injected_handoff, 0, sizeof(reclaim_injected_handoff));
     aliases_at_handoff_publish = 0;
     aliases_at_handoff_delete = 0;
-    transfer_handoff_on_publish = 0;
-    transfer_target = (pid_key_t){0};
-    aliases_at_task_transfer = 0;
-    transfer_claim_publications = 0;
-    transfer_task_publications = 0;
-    transfer_handoff_deletes = 0;
-    transfer_claim_evictions = 0;
     observe_alias_balance = 0;
     alias_zero_observed = 0;
     java_vt_thread_deletes = 0;
@@ -2615,7 +2841,7 @@ static void test_compact_finish_shapes_match_reference(void) {
     }
 }
 
-static void test_capture_claim_race_releases_published_alias(void) {
+static void test_capture_claim_race_converges_published_alias_for_claimant(void) {
     const connection_info_t connection = {.s_port = 1234, .d_port = 443};
     seed_generation(&connection);
     const java_remote_parent_handoff_key_t handoff_key =
@@ -2624,15 +2850,12 @@ static void test_capture_claim_race_releases_published_alias(void) {
     inject_handoff_claim_on_publish = 1;
     java_remote_parent_capture_handoff(test_capture_race_token);
 
-    const handoff_claim_entry_t *claim = find_handoff_claim(&handoff_key);
-    if (stored_state.aliases != 0 || find_handoff(&handoff_key) || !claim ||
-        claim->value.observed_monotime_ns != test_now_ns ||
-        claim->value.process_incarnation != test_process_incarnation ||
+    if (stored_state.aliases || find_handoff(&handoff_key) || find_handoff_claim(&handoff_key) ||
         injected_handoff_claims != 1 || inject_handoff_claim_on_publish ||
         aliases_at_handoff_publish != 1 || aliases_at_handoff_delete != 1 ||
-        handoff_claim_update_attempts != 0 || !find_ambiguity(&stored_state_key) ||
-        unexpected_update || unexpected_delete) {
-        fail("capture publisher retained an alias after a concurrent claim");
+        handoff_claim_update_attempts != 1 || handoff_claim_update_successes != 1 ||
+        find_ambiguity(&stored_state_key) || unexpected_update || unexpected_delete) {
+        fail("capture publisher did not converge a concurrent handoff claim");
     }
 }
 
@@ -2665,14 +2888,52 @@ static void test_capture_workspaces_are_guarded_and_zeroized(void) {
     }
 }
 
-static void test_relay_claim_race_preserves_existing_task_alias(void) {
+static void test_full_handoff_ticket_map_rejects_capture_before_alias_publication(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    const java_remote_parent_handoff_key_t first =
+        java_remote_parent_handoff_key(&test_owner, test_cancelled_token);
+    const java_remote_parent_handoff_key_t second =
+        java_remote_parent_handoff_key(&test_owner, test_missing_token);
+    const java_remote_parent_handoff_key_t target =
+        java_remote_parent_handoff_key(&test_owner, test_capture_race_token);
+    handoff_claims[0] = (handoff_claim_entry_t){
+        .key = first,
+        .value =
+            {
+                .observed_monotime_ns = test_now_ns | k_java_remote_parent_handoff_open_tag,
+                .process_incarnation = test_process_incarnation,
+            },
+        .present = 1,
+    };
+    handoff_claims[1] = handoff_claims[0];
+    handoff_claims[1].key = second;
+    const handoff_claim_entry_t first_before = handoff_claims[0];
+    const handoff_claim_entry_t second_before = handoff_claims[1];
+
+    java_remote_parent_capture_handoff(test_capture_race_token);
+
+    if (memcmp(&handoff_claims[0], &first_before, sizeof(first_before)) != 0 ||
+        memcmp(&handoff_claims[1], &second_before, sizeof(second_before)) != 0 ||
+        find_handoff_claim(&target) || find_handoff(&target) || find_handoff_mutation(&target) ||
+        stored_state.aliases || exact_test_alias_replay() || handoff_claim_update_attempts != 1 ||
+        handoff_claim_update_successes || find_ambiguity(&stored_state_key) ||
+        !alias_replay_retain_workspace_zero() || !handoff_capture_workspace_zero() ||
+        unexpected_update || unexpected_delete) {
+        fail("full C admission retained an alias or published H");
+    }
+}
+
+static void test_relay_claim_race_converges_to_existing_task_alias(void) {
     const connection_info_t connection = {.s_port = 1234, .d_port = 443};
     seed_generation(&connection);
     stored_state.aliases = 1;
+    seed_alias_replay(&stored_state_key, test_observed_monotime_ns, test_process_incarnation, 1);
     stored_task = (java_remote_parent_task_t){
         .owner = test_owner,
         .generation = test_generation,
         .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
     };
     task_present = 1;
     const java_remote_parent_handoff_key_t handoff_key =
@@ -2681,84 +2942,123 @@ static void test_relay_claim_race_preserves_existing_task_alias(void) {
     inject_handoff_claim_on_publish = 1;
     java_remote_parent_capture_relay(&test_child, test_relay_race_token);
 
-    const handoff_claim_entry_t *claim = find_handoff_claim(&handoff_key);
-    if (stored_state.aliases != 1 || !task_present || find_handoff(&handoff_key) || !claim ||
-        claim->value.observed_monotime_ns != test_now_ns ||
-        claim->value.process_incarnation != test_process_incarnation ||
-        injected_handoff_claims != 1 || inject_handoff_claim_on_publish ||
-        aliases_at_handoff_publish != 2 || aliases_at_handoff_delete != 2 ||
-        handoff_claim_update_attempts != 0 || !find_ambiguity(&stored_state_key) ||
+    if (stored_state.aliases != 1 || !task_present || find_handoff(&handoff_key) ||
+        find_handoff_claim(&handoff_key) || injected_handoff_claims != 1 ||
+        inject_handoff_claim_on_publish || aliases_at_handoff_publish != 2 ||
+        aliases_at_handoff_delete != 2 || handoff_claim_update_attempts != 1 ||
+        handoff_claim_update_successes != 1 || find_ambiguity(&stored_state_key) ||
         !alias_replay_retain_workspace_zero() || !handoff_capture_workspace_zero() ||
         unexpected_update || unexpected_delete) {
-        fail("relay publisher disturbed its existing task alias after a concurrent claim");
+        fail("relay publisher did not converge a concurrent handoff claim");
     }
 }
 
-static void test_capture_transfer_survives_claim_eviction(void) {
+static void test_collision_claim_tombstone_drains_handoff_under_mutation(void) {
     const connection_info_t connection = {.s_port = 1234, .d_port = 443};
-    seed_generation(&connection);
-    const java_remote_parent_handoff_key_t handoff_key =
-        java_remote_parent_handoff_key(&test_owner, test_capture_transfer_token);
-
-    transfer_target = test_child;
-    transfer_handoff_on_publish = 1;
-    java_remote_parent_capture_handoff(test_capture_transfer_token);
-
-    const java_remote_parent_resolution_t transferred = java_remote_parent_resolve(&test_child, 0);
-    if (stored_state.aliases != 1 || aliases_at_handoff_publish != 1 ||
-        aliases_at_task_transfer != 1 || aliases_at_handoff_delete != 1 ||
-        find_handoff(&handoff_key) || find_handoff_claim(&handoff_key) ||
-        !transferred_task_present ||
-        !same_key(&transferred_task_key, &test_child, sizeof(test_child)) ||
-        transferred_task.generation != test_generation ||
-        !same_key(&transferred_task.owner, &test_owner, sizeof(test_owner)) ||
-        transfer_handoff_on_publish || transfer_claim_publications != 1 ||
-        transfer_task_publications != 1 || transfer_handoff_deletes != 1 ||
-        transfer_claim_evictions != 1 || find_ambiguity(&stored_state_key) || !transferred.found ||
-        transferred.ambiguous || !transferred.via_task ||
-        !same_key(&transferred.key, &stored_state_key, sizeof(stored_state_key)) ||
-        !java_remote_parent_exact_generation_active(
-            &stored_state_key, test_observed_monotime_ns, 0) ||
-        unexpected_update || unexpected_delete) {
-        fail("capture publisher poisoned ownership after the claimant claim was evicted");
-    }
-}
-
-static void test_relay_transfer_survives_claim_eviction(void) {
-    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
-    seed_generation(&connection);
-    stored_state.aliases = 1;
-    stored_task = (java_remote_parent_task_t){
+    const connection_info_t replacement = {.s_port = 2345, .d_port = 8443};
+    const java_remote_parent_task_t predecessor = {
         .owner = test_owner,
         .generation = test_generation,
         .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
     };
-    task_present = 1;
-    const java_remote_parent_handoff_key_t handoff_key =
-        java_remote_parent_handoff_key(&test_child, test_relay_transfer_token);
+    const java_remote_parent_task_t successor = {
+        .owner = test_owner,
+        .generation = test_replacement_generation,
+        .observed_monotime_ns = test_now_ns,
+        .process_incarnation = test_process_incarnation,
+    };
 
-    transfer_target = test_relay_child;
-    transfer_handoff_on_publish = 1;
-    java_remote_parent_capture_relay(&test_child, test_relay_transfer_token);
+    // Direct CAPTURE is publishing the successor while an older valid H owns
+    // the token. C arrives from the losing claimant inside the failed
+    // BPF_NOEXIST update, while M(H) is still held.
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    seed_alias_replay(&stored_state_key, test_observed_monotime_ns, test_process_incarnation, 1);
+    seed_replacement_generation(&replacement);
+    const java_remote_parent_state_t direct_successor_before = replacement_state;
+    const java_remote_parent_handoff_key_t direct_key =
+        java_remote_parent_handoff_key(&test_owner, test_capture_race_token);
+    handoffs[0] = (handoff_entry_t){
+        .key = direct_key,
+        .value = predecessor,
+        .present = 1,
+    };
+    inject_handoff_claim_on_collision = 1;
 
-    const java_remote_parent_resolution_t transferred =
-        java_remote_parent_resolve(&test_relay_child, 0);
-    if (stored_state.aliases != 2 || aliases_at_handoff_publish != 2 ||
-        aliases_at_task_transfer != 2 || aliases_at_handoff_delete != 2 || !task_present ||
-        find_handoff(&handoff_key) || find_handoff_claim(&handoff_key) ||
-        !transferred_task_present ||
-        !same_key(&transferred_task_key, &test_relay_child, sizeof(test_relay_child)) ||
-        transferred_task.generation != test_generation ||
-        !same_key(&transferred_task.owner, &test_owner, sizeof(test_owner)) ||
-        transfer_handoff_on_publish || transfer_claim_publications != 1 ||
-        transfer_task_publications != 1 || transfer_handoff_deletes != 1 ||
-        transfer_claim_evictions != 1 || find_ambiguity(&stored_state_key) || !transferred.found ||
-        transferred.ambiguous || !transferred.via_task ||
-        !same_key(&transferred.key, &stored_state_key, sizeof(stored_state_key)) ||
-        !java_remote_parent_exact_generation_active(
-            &stored_state_key, test_observed_monotime_ns, 0) ||
+    java_remote_parent_capture_handoff_for_capability(
+        &test_owner, test_capture_race_token, test_process_incarnation);
+
+    const java_remote_parent_alias_replay_key_t direct_successor_replay_key =
+        java_remote_parent_alias_replay_key(
+            &replacement_state_key, test_now_ns, test_process_incarnation);
+    const alias_replay_entry_t *direct_predecessor_replay = exact_test_alias_replay();
+    const alias_replay_entry_t *direct_successor_replay =
+        find_alias_replay(&direct_successor_replay_key);
+    if (find_handoff(&direct_key) || find_handoff_claim(&direct_key) ||
+        find_handoff_mutation(&direct_key) || stored_state.aliases || replacement_state.aliases ||
+        !direct_predecessor_replay || direct_predecessor_replay->value.references ||
+        !direct_successor_replay || direct_successor_replay->value.references ||
+        !replacement_state_present ||
+        memcmp(&replacement_state, &direct_successor_before, sizeof(replacement_state)) != 0 ||
+        !owner_present || stored_owner.generation != test_replacement_generation || task_present ||
+        transferred_task_present || !find_ambiguity(&stored_state_key) ||
+        !find_ambiguity(&replacement_state_key) || injected_handoff_claims != 1 ||
+        injected_handoff_claims_under_mutation != 1 || inject_handoff_claim_on_collision ||
+        aliases_at_handoff_publish || aliases_at_handoff_delete != 1 ||
+        handoff_claim_update_attempts != 1 || handoff_claim_update_successes != 1 ||
+        !alias_replay_retain_workspace_zero() || !handoff_capture_workspace_zero() ||
         unexpected_update || unexpected_delete) {
-        fail("relay publisher poisoned transferred ownership after the claimant claim was evicted");
+        fail("direct collision tail did not drain a claimed predecessor handoff safely");
+    }
+
+    // Relay publication retains one additional predecessor alias. Colliding
+    // with a successor H must unwind only that temporary retain, drain the
+    // successor's H alias, and leave the source task's alias byte-exact.
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    stored_task = predecessor;
+    task_present = 1;
+    seed_alias_replay(&stored_state_key, test_observed_monotime_ns, test_process_incarnation, 1);
+    seed_replacement_generation(&replacement);
+    replacement_state.aliases = 1;
+    seed_alias_replay(&replacement_state_key, test_now_ns, test_process_incarnation, 1);
+    java_remote_parent_state_t relay_successor_after = replacement_state;
+    relay_successor_after.aliases = 0;
+    const java_remote_parent_handoff_key_t relay_key =
+        java_remote_parent_handoff_key(&test_child, test_relay_race_token);
+    handoffs[0] = (handoff_entry_t){
+        .key = relay_key,
+        .value = successor,
+        .present = 1,
+    };
+    inject_handoff_claim_on_collision = 1;
+
+    java_remote_parent_capture_relay_for_capability(
+        &test_child, test_relay_race_token, test_process_incarnation);
+
+    const java_remote_parent_alias_replay_key_t relay_successor_replay_key =
+        java_remote_parent_alias_replay_key(
+            &replacement_state_key, test_now_ns, test_process_incarnation);
+    const alias_replay_entry_t *relay_predecessor_replay = exact_test_alias_replay();
+    const alias_replay_entry_t *relay_successor_replay =
+        find_alias_replay(&relay_successor_replay_key);
+    if (find_handoff(&relay_key) || find_handoff_claim(&relay_key) ||
+        find_handoff_mutation(&relay_key) || find_task_claim(&test_child) || !task_present ||
+        memcmp(&stored_task, &predecessor, sizeof(predecessor)) != 0 || stored_state.aliases != 1 ||
+        !relay_predecessor_replay || relay_predecessor_replay->value.references != 1 ||
+        !relay_successor_replay || relay_successor_replay->value.references ||
+        !replacement_state_present ||
+        memcmp(&replacement_state, &relay_successor_after, sizeof(replacement_state)) != 0 ||
+        !owner_present || stored_owner.generation != test_replacement_generation ||
+        transferred_task_present || !find_ambiguity(&stored_state_key) ||
+        !find_ambiguity(&replacement_state_key) || injected_handoff_claims != 1 ||
+        injected_handoff_claims_under_mutation != 1 || inject_handoff_claim_on_collision ||
+        aliases_at_handoff_publish || aliases_at_handoff_delete != 1 ||
+        handoff_claim_update_attempts != 1 || handoff_claim_update_successes != 1 ||
+        !alias_replay_retain_workspace_zero() || !handoff_capture_workspace_zero() ||
+        unexpected_update || unexpected_delete) {
+        fail("relay collision tail corrupted its task or successor handoff alias");
     }
 }
 
@@ -2770,6 +3070,7 @@ static void test_direct_capture_rejects_a_task_only_generation(void) {
         .owner = test_owner,
         .generation = test_generation,
         .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
     };
     task_present = 1;
     current_task = test_child;
@@ -2796,6 +3097,7 @@ static void test_direct_retrieval_rejects_a_task_only_generation(void) {
         .owner = test_owner,
         .generation = test_generation,
         .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
     };
     task_present = 1;
     current_task = test_child;
@@ -2828,17 +3130,18 @@ static void test_task_retrieval_rejects_malformed_task_links(void) {
         .reserved = 1,
         .generation = test_generation,
         .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
     };
     task_present = 1;
     current_task = test_child;
     enum java_remote_parent_status status =
         java_remote_parent_retrieve(&response, 0, test_now_ns, k_java_remote_parent_source_task);
     if (status != k_java_remote_parent_status_missing || task_present ||
-        stored_state.aliases != 0 || !owner_present || !state_present ||
+        stored_state.aliases != 1 || !owner_present || !state_present ||
         !generation_index_present || !connection_present || !cookie_connection_present ||
         !fallback_present || claim_present || terminal_present || unexpected_update ||
         unexpected_delete) {
-        fail("task retrieval accepted a nonzero reserved task link");
+        fail("task retrieval accepted or charged a nonzero reserved task link");
     }
 
     seed_generation(&connection);
@@ -2846,6 +3149,7 @@ static void test_task_retrieval_rejects_malformed_task_links(void) {
     stored_task = (java_remote_parent_task_t){
         .generation = test_generation,
         .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
     };
     task_present = 1;
     current_task = test_child;
@@ -2859,6 +3163,26 @@ static void test_task_retrieval_rejects_malformed_task_links(void) {
         unexpected_delete) {
         fail("task retrieval accepted an empty task owner");
     }
+
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = test_observed_monotime_ns,
+    };
+    task_present = 1;
+    current_task = test_child;
+    memset(&response, 0, sizeof(response));
+    status =
+        java_remote_parent_retrieve(&response, 0, test_now_ns, k_java_remote_parent_source_task);
+    if (status != k_java_remote_parent_status_missing || task_present ||
+        stored_state.aliases != 1 || !owner_present || !state_present ||
+        !generation_index_present || !connection_present || !cookie_connection_present ||
+        !fallback_present || claim_present || terminal_present || unexpected_update ||
+        unexpected_delete) {
+        fail("task retrieval retained or charged a zero-capability task link");
+    }
 }
 
 static void test_direct_capture_rejects_a_generation_detached_at_a_receive_boundary(void) {
@@ -2870,6 +3194,7 @@ static void test_direct_capture_rejects_a_generation_detached_at_a_receive_bound
         .owner = test_owner,
         .generation = test_generation,
         .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
     };
     task_present = 1;
 
@@ -2903,6 +3228,7 @@ static void test_registration_eviction_detaches_a_mounted_virtual_thread(void) {
         .owner = test_owner,
         .generation = test_generation,
         .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
     };
     task_present = 1;
 
@@ -2920,9 +3246,10 @@ static void test_registration_eviction_detaches_a_mounted_virtual_thread(void) {
 
     current_process_incarnation = test_process_incarnation;
     java_remote_parent_resolution_t direct = {0};
-    java_remote_parent_resolve_exact(&direct, &test_owner, 0, 0);
+    java_remote_parent_resolve_exact(&direct, &test_owner, 0, 0, test_process_incarnation);
     java_remote_parent_resolution_t exact_task = {0};
-    java_remote_parent_resolve_exact(&exact_task, &test_owner, test_generation, 1);
+    java_remote_parent_resolve_exact(
+        &exact_task, &test_owner, test_generation, 1, test_process_incarnation);
     if (direct.found || !exact_task.found || exact_task.ambiguous ||
         exact_task.key.generation != test_generation || unexpected_update || unexpected_delete) {
         fail("registration eviction left a mounted virtual thread's direct cursor visible");
@@ -2940,9 +3267,10 @@ static void test_registration_eviction_detaches_a_mounted_virtual_thread(void) {
     }
     current_process_incarnation = test_process_incarnation;
     direct = (java_remote_parent_resolution_t){0};
-    java_remote_parent_resolve_exact(&direct, &test_owner, 0, 0);
+    java_remote_parent_resolve_exact(&direct, &test_owner, 0, 0, test_process_incarnation);
     exact_task = (java_remote_parent_resolution_t){0};
-    java_remote_parent_resolve_exact(&exact_task, &test_owner, test_generation, 1);
+    java_remote_parent_resolve_exact(
+        &exact_task, &test_owner, test_generation, 1, test_process_incarnation);
     if (direct.found || exact_task.found) {
         fail("identity-guard recovery revived a zero-alias orphan generation");
     }
@@ -2957,6 +3285,7 @@ static void test_missing_identity_guard_destroys_a_mounted_virtual_thread_genera
         .owner = test_owner,
         .generation = test_generation,
         .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
     };
     task_present = 1;
 
@@ -2974,9 +3303,10 @@ static void test_missing_identity_guard_destroys_a_mounted_virtual_thread_genera
 
     current_process_incarnation = test_process_incarnation;
     java_remote_parent_resolution_t direct = {0};
-    java_remote_parent_resolve_exact(&direct, &test_owner, 0, 0);
+    java_remote_parent_resolve_exact(&direct, &test_owner, 0, 0, test_process_incarnation);
     java_remote_parent_resolution_t exact_task = {0};
-    java_remote_parent_resolve_exact(&exact_task, &test_owner, test_generation, 1);
+    java_remote_parent_resolve_exact(
+        &exact_task, &test_owner, test_generation, 1, test_process_incarnation);
     if (direct.found || exact_task.found || unexpected_update || unexpected_delete) {
         fail("identity-guard recovery revived a destructively detached generation");
     }
@@ -2991,13 +3321,14 @@ static void test_recreated_identity_guard_discards_the_shared_synthetic_owner(vo
         .owner = test_owner,
         .generation = test_generation,
         .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
     };
     task_present = 1;
 
     // A successful BPF_NOEXIST insertion may be the first guard or a guard
     // recreated after eviction. Mount handling must discard the shared low-31
     // synthetic key before publishing either case.
-    java_remote_parent_discard_virtual_thread_owner(&test_owner);
+    java_remote_parent_discard_virtual_thread_owner(&test_owner, test_process_incarnation);
     if (owner_present || fallback_present || state_present || generation_index_present ||
         connection_present || cookie_connection_present || task_present || claim_present ||
         terminal_present || unexpected_update || unexpected_delete) {
@@ -3009,7 +3340,8 @@ static void test_recreated_identity_guard_discards_the_shared_synthetic_owner(vo
     authorized_translation_result = k_java_vt_cleanup_translation_exact;
     java_remote_parent_begin_data_receive();
     java_remote_parent_resolution_t exact_task = {0};
-    java_remote_parent_resolve_exact(&exact_task, &test_owner, test_generation, 1);
+    java_remote_parent_resolve_exact(
+        &exact_task, &test_owner, test_generation, 1, test_process_incarnation);
     if (exact_task.found || unexpected_update || unexpected_delete) {
         fail("colliding remount revived a discarded synthetic task alias");
     }
@@ -3024,6 +3356,7 @@ static void assert_carrier_exit_destroys_mounted_owner(u8 translation_result) {
         .owner = test_owner,
         .generation = test_generation,
         .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
     };
     task_present = 1;
 
@@ -3055,6 +3388,7 @@ static void assert_unregistered_lifecycle_destroys_mounted_owner(u8 translation_
         .owner = test_owner,
         .generation = test_generation,
         .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
     };
     task_present = 1;
 
@@ -3089,6 +3423,7 @@ static void assert_unregistered_payload_destroys_parked_owner(void) {
         .owner = test_owner,
         .generation = test_generation,
         .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
     };
     task_present = 1;
 
@@ -3113,7 +3448,7 @@ static void assert_unregistered_payload_destroys_parked_owner(void) {
     authorized_translation_owner = test_owner;
     authorized_translation_result = k_java_vt_cleanup_translation_exact;
     java_remote_parent_resolution_t direct = {0};
-    java_remote_parent_resolve_exact(&direct, &test_owner, 0, 0);
+    java_remote_parent_resolve_exact(&direct, &test_owner, 0, 0, test_process_incarnation);
     const java_remote_parent_resolution_t task = java_remote_parent_resolve_task(&test_owner, 0);
     if (direct.found || task.found || unexpected_update || unexpected_delete) {
         fail("registration recovery revived a parked virtual-thread generation");
@@ -3135,6 +3470,7 @@ static void assert_unregistered_task_lifecycle_removes_stale_alias(u8 translatio
         .owner = test_owner,
         .generation = test_generation,
         .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
     };
     task_present = 1;
     authorized_translation_owner = test_owner;
@@ -3183,9 +3519,7 @@ static void test_unregistered_token_cancellation_cannot_replay_after_registratio
     // to the same {pid, namespace, token} cancellation key.
     java_remote_parent_cancel_handoff_for_capability(
         &carrier, test_cancelled_token, test_process_incarnation);
-    const handoff_claim_entry_t *claim = find_handoff_claim(&key);
-    if (find_handoff(&key) || !claim ||
-        claim->value.process_incarnation != test_process_incarnation || stored_state.aliases != 0 ||
+    if (find_handoff(&key) || find_handoff_claim(&key) || stored_state.aliases != 0 ||
         unexpected_update || unexpected_delete) {
         fail("unregistered cancellation retained a replayable task handoff");
     }
@@ -3211,6 +3545,7 @@ static void test_direct_capture_selects_a_new_receive_over_an_old_task_alias(voi
         .owner = test_owner,
         .generation = test_generation,
         .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
     };
     task_present = 1;
 
@@ -3265,6 +3600,7 @@ static void test_direct_child_conflict_marks_exact_generations(void) {
         .owner = test_owner,
         .generation = test_generation,
         .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
     };
     task_present = 1;
     child_owner = (java_remote_parent_owner_t){
@@ -3287,7 +3623,8 @@ static void test_direct_child_conflict_marks_exact_generations(void) {
     }
 
     java_remote_parent_resolution_t linked = {0};
-    java_remote_parent_resolve_exact(&linked, &test_owner, test_generation, 0);
+    java_remote_parent_resolve_exact(
+        &linked, &test_owner, test_generation, 0, test_process_incarnation);
     if (!linked.found || !linked.ambiguous ||
         !same_key(&linked.key, &stored_state_key, sizeof(stored_state_key)) ||
         java_remote_parent_exact_generation_active(
@@ -3312,10 +3649,987 @@ static void test_new_receive_cleans_unaliased_generation_with_the_same_socket_co
         .pid = test_owner.pid,
         .ns = test_owner.ns,
         .token = test_cancelled_token,
+        .process_incarnation = test_process_incarnation,
     };
     if (find_handoff(&handoff_key) || stored_state.aliases != 0 || unexpected_update ||
         unexpected_delete) {
         fail("cleaned same-socket generation was revived by a later task capture");
+    }
+}
+
+static void test_missing_handoff_never_fences_direct_generation(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    const java_remote_parent_response_t expected = stored_state.response;
+    const java_remote_parent_handoff_key_t retained_key =
+        java_remote_parent_handoff_key(&test_owner, test_first_token);
+    const java_remote_parent_handoff_key_t missing_key =
+        java_remote_parent_handoff_key(&test_owner, test_missing_token);
+    stored_task_key = test_owner;
+
+    java_remote_parent_capture_handoff(test_first_token);
+    ambiguity_entry_t *ambiguity = find_ambiguity_entry(&stored_state_key);
+    if (!find_handoff(&retained_key) || !ambiguity || ambiguity->observed_monotime_ns ||
+        stored_state.aliases != 1) {
+        fail("direct generation was not clean before missing handoff link");
+    }
+
+    java_remote_parent_link_handoff_for_capability(
+        &test_owner, test_missing_token, test_process_incarnation);
+    ambiguity = find_ambiguity_entry(&stored_state_key);
+    if (!ambiguity || ambiguity->observed_monotime_ns || find_handoff_claim(&missing_key) ||
+        !find_handoff(&retained_key) || task_present || stored_state.aliases != 1 ||
+        !owner_present || stored_owner.generation != test_generation || !state_present ||
+        stored_state.observed_monotime_ns != test_observed_monotime_ns ||
+        !generation_index_present ||
+        stored_generation_index.observed_monotime_ns != test_observed_monotime_ns ||
+        unexpected_update || unexpected_delete) {
+        fail("missing handoff fenced or mutated the direct generation");
+    }
+
+    java_remote_parent_link_handoff_for_capability(
+        &test_owner, test_first_token, test_process_incarnation);
+    ambiguity = find_ambiguity_entry(&stored_state_key);
+    if (!task_present || find_handoff(&retained_key) || !ambiguity ||
+        ambiguity->observed_monotime_ns || stored_state.aliases != 1 ||
+        stored_task.generation != test_generation ||
+        stored_task.observed_monotime_ns != test_observed_monotime_ns ||
+        !same_key(&stored_task.owner, &test_owner, sizeof(test_owner))) {
+        fail("valid handoff did not survive an earlier missing-token link");
+    }
+
+    current_task = test_owner;
+    java_remote_parent_response_t response = {0};
+    const enum java_remote_parent_status status =
+        java_remote_parent_retrieve_for_connection(&response,
+                                                   0,
+                                                   test_now_ns,
+                                                   k_java_remote_parent_source_task,
+                                                   &connection,
+                                                   test_connection_netns,
+                                                   test_generation,
+                                                   test_socket_cookie);
+    if (status != k_java_remote_parent_status_valid ||
+        java_remote_parent_le64_to_cpu(response.generation_le) != test_generation ||
+        memcmp(response.trace_id, expected.trace_id, sizeof(response.trace_id)) != 0 ||
+        memcmp(response.span_id, expected.span_id, sizeof(response.span_id)) != 0 ||
+        response.flags != expected.flags || unexpected_update || unexpected_delete) {
+        fail("missing-token isolation did not preserve exact task retrieval");
+    }
+}
+
+static void test_rejected_cycle_fences_only_authoritative_task_carrier(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    const java_remote_parent_handoff_key_t retained_key =
+        java_remote_parent_handoff_key(&test_owner, test_cancelled_token);
+
+    java_remote_parent_capture_handoff(test_first_token);
+    java_remote_parent_link_handoff_for_capability(
+        &test_child, test_first_token, test_process_incarnation);
+    java_remote_parent_capture_handoff(test_cancelled_token);
+    if (!task_present || !find_handoff(&retained_key) || stored_state.aliases != 2) {
+        fail("cycle fixture did not establish task and sibling handoff aliases");
+    }
+
+    child_owner = (java_remote_parent_owner_t){
+        .generation = test_direct_child_generation,
+        .process_incarnation = test_process_incarnation,
+        .lifecycle = k_java_remote_parent_lifecycle_active,
+    };
+    child_owner_present = 1;
+    const java_remote_parent_key_t direct_child_key =
+        java_remote_parent_state_key(&test_child, test_direct_child_generation);
+    if (!java_remote_parent_reserve_exact_ambiguity(&direct_child_key)) {
+        fail("cycle fixture could not reserve the direct-child ambiguity slot");
+    }
+    seed_legacy_java_task(&test_owner, &test_child);
+
+    handle_java_thread_mapping(
+        test_owner.tid, 0x1234, &test_child, &test_child, test_process_incarnation, 1);
+
+    ambiguity_entry_t *carrier_ambiguity = find_ambiguity_entry(&stored_state_key);
+    ambiguity_entry_t *direct_ambiguity = find_ambiguity_entry(&direct_child_key);
+    if (!carrier_ambiguity || !carrier_ambiguity->observed_monotime_ns || !direct_ambiguity ||
+        direct_ambiguity->observed_monotime_ns || task_present || stored_state.aliases != 1 ||
+        !find_handoff(&retained_key) || !child_owner_present ||
+        child_owner.generation != test_direct_child_generation || thread_mapping_claim.present ||
+        find_legacy_java_task(&test_child) || !find_legacy_java_task(&test_owner) ||
+        unexpected_update || unexpected_delete) {
+        fail("rejected legacy cycle did not isolate exact task-carrier ambiguity");
+    }
+}
+
+static void test_stale_task_observation_cannot_fence_same_key_successor(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    const u64 stale_observation = test_observed_monotime_ns - 1;
+    stored_state.aliases = 1;
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = stale_observation,
+        .process_incarnation = test_process_incarnation,
+    };
+    task_present = 1;
+    alias_replay_entry_t *stale_replay =
+        seed_alias_replay(&stored_state_key, stale_observation, test_process_incarnation, 1);
+    stale_replay->value.lifecycle = k_java_remote_parent_lifecycle_consumed;
+    seed_legacy_java_task(&test_owner, &test_child);
+
+    handle_java_thread_mapping(
+        test_owner.tid, 0x2345, &test_child, &test_child, test_process_incarnation, 1);
+
+    ambiguity_entry_t *ambiguity = find_ambiguity_entry(&stored_state_key);
+    if (!ambiguity || ambiguity->observed_monotime_ns || task_present ||
+        stored_state.aliases != 1 ||
+        stored_state.observed_monotime_ns != test_observed_monotime_ns ||
+        stored_state.process_incarnation != test_process_incarnation ||
+        stored_generation_index.observed_monotime_ns != test_observed_monotime_ns ||
+        stored_generation_index.process_incarnation != test_process_incarnation ||
+        thread_mapping_claim.present || unexpected_update || unexpected_delete) {
+        fail("stale task observation fenced or decremented a same-key successor");
+    }
+}
+
+static void test_stale_incarnation_cannot_retire_current_task_carrier(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    const u64 successor_incarnation = test_process_incarnation + 1;
+    seed_generation(&connection);
+    registered_process_incarnation = successor_incarnation;
+    stored_owner.process_incarnation = successor_incarnation;
+    stored_state.process_incarnation = successor_incarnation;
+    stored_generation_index.process_incarnation = successor_incarnation;
+    stored_state.aliases = 1;
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = successor_incarnation,
+    };
+    task_present = 1;
+
+    handle_java_thread_mapping(
+        test_owner.tid, 0x3456, &test_child, &test_child, test_process_incarnation, 1);
+
+    ambiguity_entry_t *ambiguity = find_ambiguity_entry(&stored_state_key);
+    if (!ambiguity || ambiguity->observed_monotime_ns || !task_present ||
+        stored_task.generation != test_generation ||
+        stored_task.observed_monotime_ns != test_observed_monotime_ns ||
+        stored_state.aliases != 1 || stored_state.process_incarnation != successor_incarnation ||
+        stored_generation_index.process_incarnation != successor_incarnation ||
+        stored_owner.process_incarnation != successor_incarnation || thread_mapping_claim.present ||
+        unexpected_update || unexpected_delete) {
+        fail("stale incarnation retired or fenced the current task carrier");
+    }
+}
+
+static void test_stale_incarnation_cannot_quarantine_malformed_successor_task_carrier(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    const u64 successor_incarnation = test_process_incarnation + 1;
+    seed_generation(&connection);
+    registered_process_incarnation = successor_incarnation;
+    stored_owner.process_incarnation = successor_incarnation;
+    stored_state.process_incarnation = successor_incarnation;
+    stored_generation_index.process_incarnation = successor_incarnation;
+    stored_state.aliases = 1;
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .reserved = 1,
+        .generation = test_generation,
+        .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = successor_incarnation,
+    };
+    task_present = 1;
+
+    java_remote_parent_unlink_task_for_capability(&test_child, test_process_incarnation);
+
+    if (!task_present || stored_task.reserved != 1 ||
+        stored_task.process_incarnation != successor_incarnation || stored_state.aliases != 1 ||
+        find_task_claim(&test_child) || find_ambiguity(&stored_state_key) || unexpected_update ||
+        unexpected_delete) {
+        fail("stale incarnation quarantined a malformed successor task carrier");
+    }
+}
+
+static void test_successor_incarnation_retires_valid_predecessor_task_carrier(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    const u64 successor_incarnation = test_process_incarnation + 1;
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
+    };
+    task_present = 1;
+    registered_process_incarnation = successor_incarnation;
+    current_process_incarnation = successor_incarnation;
+
+    const java_remote_parent_resolution_t resolution =
+        java_remote_parent_resolve_task(&test_child, 0);
+
+    if (resolution.found || task_present || stored_state.aliases != 0 ||
+        find_task_claim(&test_child) || unexpected_update || unexpected_delete) {
+        fail("successor incarnation did not retire a valid predecessor task carrier");
+    }
+}
+
+static void
+test_successor_incarnation_quarantines_malformed_predecessor_without_alias_charge(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    const u64 successor_incarnation = test_process_incarnation + 1;
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .reserved = 1,
+        .generation = test_generation,
+        .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
+    };
+    task_present = 1;
+    registered_process_incarnation = successor_incarnation;
+    current_process_incarnation = successor_incarnation;
+
+    const java_remote_parent_resolution_t resolution =
+        java_remote_parent_resolve_task(&test_child, 0);
+
+    if (resolution.found || task_present || stored_state.aliases != 1 ||
+        find_task_claim(&test_child) || unexpected_update || unexpected_delete) {
+        fail("successor incarnation charged a malformed predecessor task carrier");
+    }
+}
+
+static void
+assert_retrieval_capability_cannot_adopt_successor(enum java_remote_parent_source source) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    const u64 successor_incarnation = test_process_incarnation + 1;
+    seed_generation(&connection);
+    registered_process_incarnation = successor_incarnation;
+    current_process_incarnation = successor_incarnation;
+    stored_owner.process_incarnation = successor_incarnation;
+    stored_state.process_incarnation = successor_incarnation;
+    stored_generation_index.process_incarnation = successor_incarnation;
+    if (source == k_java_remote_parent_source_task) {
+        stored_state.aliases = 1;
+        stored_task = (java_remote_parent_task_t){
+            .owner = test_owner,
+            .generation = test_generation,
+            .observed_monotime_ns = test_observed_monotime_ns,
+            .process_incarnation = successor_incarnation,
+        };
+        task_present = 1;
+        current_task = test_child;
+    }
+
+    java_remote_parent_response_t response = {0};
+    java_remote_parent_retrieval_workspace_t workspace = {0};
+    const enum java_remote_parent_status status =
+        java_remote_parent_retrieve_for_connection_with_workspace(&response,
+                                                                  0,
+                                                                  test_now_ns,
+                                                                  source,
+                                                                  &connection,
+                                                                  test_connection_netns,
+                                                                  test_generation,
+                                                                  test_socket_cookie,
+                                                                  test_process_incarnation,
+                                                                  &workspace);
+
+    const u32 expected_aliases = source == k_java_remote_parent_source_task ? 1 : 0;
+    if (status != k_java_remote_parent_status_missing ||
+        response.status != k_java_remote_parent_status_missing || claim_present ||
+        find_ambiguity(&stored_state_key) || !owner_present || !state_present ||
+        !generation_index_present || !connection_present || !cookie_connection_present ||
+        !fallback_present || stored_state.aliases != expected_aliases ||
+        (source == k_java_remote_parent_source_task && !task_present) || unexpected_update ||
+        unexpected_delete) {
+        fail("admitted predecessor retrieval adopted successor-incarnation authority");
+    }
+}
+
+static void test_retrieval_capability_cannot_adopt_successor_incarnation(void) {
+    assert_retrieval_capability_cannot_adopt_successor(k_java_remote_parent_source_direct);
+    assert_retrieval_capability_cannot_adopt_successor(k_java_remote_parent_source_task);
+}
+
+static void test_capture_capability_cannot_adopt_successor_incarnation(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    const u64 successor_incarnation = test_process_incarnation + 1;
+    seed_generation(&connection);
+    registered_process_incarnation = successor_incarnation;
+    current_process_incarnation = successor_incarnation;
+    stored_owner.process_incarnation = successor_incarnation;
+    stored_state.process_incarnation = successor_incarnation;
+    stored_generation_index.process_incarnation = successor_incarnation;
+    const java_remote_parent_handoff_key_t predecessor_key =
+        java_remote_parent_handoff_key_for_capability(
+            &test_owner, test_capture_race_token, test_process_incarnation);
+    const java_remote_parent_handoff_key_t successor_key =
+        java_remote_parent_handoff_key_for_capability(
+            &test_owner, test_capture_race_token, successor_incarnation);
+
+    java_remote_parent_capture_handoff_for_capability(
+        &test_owner, test_capture_race_token, test_process_incarnation);
+
+    if (find_handoff(&predecessor_key) || find_handoff(&successor_key) || stored_state.aliases ||
+        find_ambiguity(&stored_state_key) || unexpected_update || unexpected_delete) {
+        fail("admitted predecessor capture adopted successor-incarnation authority");
+    }
+
+    seed_generation(&connection);
+    registered_process_incarnation = successor_incarnation;
+    current_process_incarnation = successor_incarnation;
+    stored_owner.process_incarnation = successor_incarnation;
+    stored_state.process_incarnation = successor_incarnation;
+    stored_generation_index.process_incarnation = successor_incarnation;
+    stored_state.aliases = 1;
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = successor_incarnation,
+    };
+    task_present = 1;
+    java_remote_parent_capture_relay_for_capability(
+        &test_child, test_relay_race_token, test_process_incarnation);
+    const java_remote_parent_handoff_key_t predecessor_relay_key =
+        java_remote_parent_handoff_key_for_capability(
+            &test_child, test_relay_race_token, test_process_incarnation);
+    const java_remote_parent_handoff_key_t successor_relay_key =
+        java_remote_parent_handoff_key_for_capability(
+            &test_child, test_relay_race_token, successor_incarnation);
+    if (find_handoff(&predecessor_relay_key) || find_handoff(&successor_relay_key) ||
+        !task_present || stored_state.aliases != 1 || find_task_claim(&test_child) ||
+        find_ambiguity(&stored_state_key) || unexpected_update || unexpected_delete) {
+        fail("admitted predecessor relay adopted successor-incarnation task authority");
+    }
+}
+
+static void test_capture_publishers_do_not_mutate_under_userspace_process_claim(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+
+    seed_generation(&connection);
+    thread_mapping_claim = (thread_mapping_claim_entry_t){
+        .process = java_process_key(&test_owner),
+        .value =
+            {
+                .child = test_owner,
+                .reserved = 0x80000001,
+                .process_incarnation = test_process_incarnation,
+            },
+        .present = 1,
+    };
+    const thread_mapping_claim_entry_t direct_claim = thread_mapping_claim;
+    const java_remote_parent_handoff_key_t direct_key =
+        java_remote_parent_handoff_key(&test_owner, test_capture_race_token);
+
+    java_remote_parent_capture_handoff_for_capability(
+        &test_owner, test_capture_race_token, test_process_incarnation);
+
+    if (find_handoff(&direct_key) || stored_state.aliases || exact_test_alias_replay() ||
+        memcmp(&thread_mapping_claim, &direct_claim, sizeof(direct_claim)) != 0 ||
+        find_handoff_claim(&direct_key) || find_handoff_mutation(&direct_key) ||
+        find_task_claim(&test_owner) || find_ambiguity(&stored_state_key) || unexpected_update ||
+        unexpected_delete) {
+        fail("direct capture mutated beneath a userspace process claim");
+    }
+
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
+    };
+    task_present = 1;
+    thread_mapping_claim = (thread_mapping_claim_entry_t){
+        .process = java_process_key(&test_child),
+        .value =
+            {
+                .child = test_child,
+                .reserved = 0x80000001,
+                .process_incarnation = test_process_incarnation,
+            },
+        .present = 1,
+    };
+    const thread_mapping_claim_entry_t relay_claim = thread_mapping_claim;
+    const java_remote_parent_handoff_key_t relay_key =
+        java_remote_parent_handoff_key(&test_child, test_relay_race_token);
+
+    java_remote_parent_capture_relay_for_capability(
+        &test_child, test_relay_race_token, test_process_incarnation);
+
+    if (find_handoff(&relay_key) || !task_present || stored_state.aliases != 1 ||
+        exact_test_alias_replay() ||
+        memcmp(&thread_mapping_claim, &relay_claim, sizeof(relay_claim)) != 0 ||
+        find_handoff_claim(&relay_key) || find_handoff_mutation(&relay_key) ||
+        find_task_claim(&test_child) || find_ambiguity(&stored_state_key) || unexpected_update ||
+        unexpected_delete) {
+        fail("relay capture mutated beneath a userspace process claim");
+    }
+}
+
+static void test_link_contention_terminally_cancels_exact_handoff_and_replay(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    seed_alias_replay(&stored_state_key, test_observed_monotime_ns, test_process_incarnation, 1);
+
+    const java_remote_parent_handoff_key_t handoff_key =
+        java_remote_parent_handoff_key_for_capability(
+            &test_child, test_capture_race_token, test_process_incarnation);
+    handoffs[0] = (handoff_entry_t){
+        .key = handoff_key,
+        .value =
+            {
+                .owner = test_owner,
+                .generation = test_generation,
+                .observed_monotime_ns = test_observed_monotime_ns,
+                .process_incarnation = test_process_incarnation,
+            },
+        .present = 1,
+    };
+    thread_mapping_claim = (thread_mapping_claim_entry_t){
+        .process = java_process_key(&test_owner),
+        .value =
+            {
+                .child = test_relay_child,
+                .reserved = 0x80000001,
+                .process_incarnation = test_process_incarnation,
+            },
+        .present = 1,
+    };
+    const thread_mapping_claim_entry_t foreign_claim = thread_mapping_claim;
+
+    java_thread_mapping_link_remote_execution(
+        &test_owner, &test_child, 123, test_capture_race_token, test_process_incarnation);
+
+    if (memcmp(&thread_mapping_claim, &foreign_claim, sizeof(foreign_claim)) != 0) {
+        fail("contended LINK replaced its foreign process claim");
+    }
+    if (find_handoff(&handoff_key) || find_handoff_claim(&handoff_key) ||
+        find_handoff_mutation(&handoff_key)) {
+        fail("contended LINK did not terminally cancel its exact H carrier");
+    }
+    if (find_task_claim(&test_child) || task_present) {
+        fail("contended LINK published a task carrier");
+    }
+    if (stored_state.aliases) {
+        fail("contended LINK did not release its generation alias");
+    }
+    const alias_replay_entry_t *replay = exact_test_alias_replay();
+    if (!replay || replay->value.references) {
+        fail("contended LINK retained a positive replay reference");
+    }
+    if (find_ambiguity(&stored_state_key) || unexpected_update || unexpected_delete) {
+        fail("contended LINK mutated unrelated generation state");
+    }
+}
+
+static void bind_replacement_generation_to_process_capability(u64 process_capability) {
+    registered_process_incarnation = process_capability;
+    current_process_incarnation = process_capability;
+    stored_owner.process_incarnation = process_capability;
+    replacement_state.process_incarnation = process_capability;
+    replacement_generation_index.process_incarnation = process_capability;
+}
+
+static void test_capture_collision_never_marks_foreign_capability(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    const connection_info_t replacement = {.s_port = 2345, .d_port = 8443};
+    const u64 successor_incarnation = test_process_incarnation + 1;
+
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    seed_replacement_generation(&replacement);
+    bind_replacement_generation_to_process_capability(successor_incarnation);
+    const java_remote_parent_task_t predecessor = {
+        .owner = test_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
+    };
+    const java_remote_parent_handoff_key_t direct_key =
+        java_remote_parent_handoff_key_for_capability(
+            &test_owner, test_capture_race_token, successor_incarnation);
+    handoffs[0] = (handoff_entry_t){
+        .key = direct_key,
+        .value = predecessor,
+        .present = 1,
+    };
+
+    java_remote_parent_capture_handoff_for_capability(
+        &test_owner, test_capture_race_token, successor_incarnation);
+
+    const ambiguity_entry_t *predecessor_ambiguity = find_ambiguity_entry(&stored_state_key);
+    const ambiguity_entry_t *successor_ambiguity = find_ambiguity_entry(&replacement_state_key);
+    const handoff_entry_t *direct = find_handoff(&direct_key);
+    if (direct || find_handoff_claim(&direct_key) || find_handoff_mutation(&direct_key) ||
+        stored_state.aliases != 1 || replacement_state.aliases != 0 || !predecessor_ambiguity ||
+        predecessor_ambiguity->observed_monotime_ns || !successor_ambiguity ||
+        !successor_ambiguity->observed_monotime_ns || find_task_claim(&test_owner) ||
+        unexpected_update || unexpected_delete) {
+        fail("direct capture collision marked a foreign-capability generation");
+    }
+
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    seed_replacement_generation(&replacement);
+    bind_replacement_generation_to_process_capability(successor_incarnation);
+    replacement_state.aliases = 1;
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .generation = test_replacement_generation,
+        .observed_monotime_ns = test_now_ns,
+        .process_incarnation = successor_incarnation,
+    };
+    task_present = 1;
+    const java_remote_parent_handoff_key_t relay_key =
+        java_remote_parent_handoff_key_for_capability(
+            &test_child, test_relay_race_token, successor_incarnation);
+    handoffs[0] = (handoff_entry_t){
+        .key = relay_key,
+        .value = predecessor,
+        .present = 1,
+    };
+
+    java_remote_parent_capture_relay_for_capability(
+        &test_child, test_relay_race_token, successor_incarnation);
+
+    predecessor_ambiguity = find_ambiguity_entry(&stored_state_key);
+    successor_ambiguity = find_ambiguity_entry(&replacement_state_key);
+    const handoff_entry_t *relay = find_handoff(&relay_key);
+    if (relay || find_handoff_claim(&relay_key) || find_handoff_mutation(&relay_key) ||
+        !task_present || stored_task.generation != test_replacement_generation ||
+        stored_task.process_incarnation != successor_incarnation || stored_state.aliases != 1 ||
+        replacement_state.aliases != 1 || !predecessor_ambiguity ||
+        predecessor_ambiguity->observed_monotime_ns || !successor_ambiguity ||
+        !successor_ambiguity->observed_monotime_ns || find_task_claim(&test_child) ||
+        unexpected_update || unexpected_delete) {
+        fail("relay capture collision marked a foreign-capability generation");
+    }
+}
+
+static void seed_handoff_mutation(const java_remote_parent_handoff_key_t *key) {
+    handoff_mutations[0] = (handoff_claim_entry_t){
+        .key = *key,
+        .value =
+            {
+                .observed_monotime_ns = test_now_ns,
+                .process_incarnation = key->process_incarnation,
+            },
+        .present = 1,
+    };
+}
+
+static void seed_terminal_handoff_claim(const java_remote_parent_handoff_key_t *key) {
+    handoff_claims[0] = (handoff_claim_entry_t){
+        .key = *key,
+        .value =
+            {
+                .observed_monotime_ns = test_now_ns,
+                .process_incarnation = key->process_incarnation,
+            },
+        .present = 1,
+    };
+}
+
+static void seed_open_handoff_ticket(const java_remote_parent_handoff_key_t *key) {
+    handoff_claims[0] = (handoff_claim_entry_t){
+        .key = *key,
+        .value =
+            {
+                .observed_monotime_ns = test_now_ns | k_java_remote_parent_handoff_open_tag,
+                .process_incarnation = key->process_incarnation,
+            },
+        .present = 1,
+    };
+}
+
+static void test_terminal_handoff_claim_reclamation_requires_exact_no_h_under_mutation(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    const java_remote_parent_handoff_key_t key =
+        java_remote_parent_handoff_key(&test_child, test_cancelled_token);
+
+    seed_generation(&connection);
+    seed_terminal_handoff_claim(&key);
+    seed_handoff_mutation(&key);
+    if (!java_remote_parent_release_terminal_handoff_claim(&key) || find_handoff_claim(&key) ||
+        !find_handoff_mutation(&key) || unexpected_delete) {
+        fail("exact no-H terminal claim was not reclaimed beneath M");
+    }
+
+    seed_generation(&connection);
+    seed_terminal_handoff_claim(&key);
+    seed_handoff_mutation(&key);
+    replace_handoff_claim_on_second_reclaim_check = 1;
+    if (java_remote_parent_release_terminal_handoff_claim(&key) ||
+        replace_handoff_claim_on_second_reclaim_check || !find_handoff_claim(&key) ||
+        find_handoff_claim(&key)->value.observed_monotime_ns != test_now_ns + 1 ||
+        !find_handoff_mutation(&key) || unexpected_delete) {
+        fail("terminal claim reclamation deleted a changed C snapshot");
+    }
+
+    seed_generation(&connection);
+    seed_terminal_handoff_claim(&key);
+    seed_handoff_mutation(&key);
+    reclaim_injected_handoff = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
+    };
+    inject_handoff_on_second_reclaim_check = 1;
+    if (java_remote_parent_release_terminal_handoff_claim(&key) ||
+        inject_handoff_on_second_reclaim_check || !find_handoff(&key) ||
+        !find_handoff_claim(&key) || !find_handoff_mutation(&key) || unexpected_delete) {
+        fail("terminal claim reclamation crossed its second H absence check");
+    }
+}
+
+static void test_untagged_handoff_claim_is_terminal_and_cannot_transfer(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    seed_alias_replay(&stored_state_key, test_observed_monotime_ns, test_process_incarnation, 1);
+    const java_remote_parent_handoff_key_t key =
+        java_remote_parent_handoff_key(&test_child, test_first_token);
+    handoffs[0] = (handoff_entry_t){
+        .key = key,
+        .value =
+            {
+                .owner = test_owner,
+                .generation = test_generation,
+                .observed_monotime_ns = test_observed_monotime_ns,
+                .process_incarnation = test_process_incarnation,
+            },
+        .present = 1,
+    };
+    seed_terminal_handoff_claim(&key);
+
+    if (!java_remote_parent_link_handoff_for_capability(
+            &test_child, test_first_token, test_process_incarnation)) {
+        fail("untagged handoff claim did not normalize its task slot");
+    }
+    const alias_replay_entry_t *replay = exact_test_alias_replay();
+    if (find_handoff(&key) || find_handoff_claim(&key) || find_handoff_mutation(&key) ||
+        find_task_claim(&test_child) || task_present || stored_state.aliases || !replay ||
+        replay->value.references || unexpected_update || unexpected_delete) {
+        fail("untagged rolling-version handoff claim authorized transfer");
+    }
+}
+
+static void test_handoff_mutation_fence_serializes_publishers_and_claimants(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+
+    seed_generation(&connection);
+    const java_remote_parent_handoff_key_t direct_key =
+        java_remote_parent_handoff_key(&test_owner, test_capture_race_token);
+    seed_handoff_mutation(&direct_key);
+    java_remote_parent_capture_handoff_for_capability(
+        &test_owner, test_capture_race_token, test_process_incarnation);
+    if (find_handoff(&direct_key) || stored_state.aliases || find_handoff_claim(&direct_key) ||
+        !find_handoff_mutation(&direct_key) || find_ambiguity(&stored_state_key) ||
+        unexpected_update || unexpected_delete) {
+        fail("contended direct capture mutated reusable handoff state");
+    }
+
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
+    };
+    task_present = 1;
+    const java_remote_parent_handoff_key_t relay_key =
+        java_remote_parent_handoff_key(&test_child, test_relay_race_token);
+    seed_handoff_mutation(&relay_key);
+    java_remote_parent_capture_relay_for_capability(
+        &test_child, test_relay_race_token, test_process_incarnation);
+    if (find_handoff(&relay_key) || !task_present || stored_state.aliases != 1 ||
+        find_handoff_claim(&relay_key) || !find_handoff_mutation(&relay_key) ||
+        find_task_claim(&test_child) || find_ambiguity(&stored_state_key) || unexpected_update ||
+        unexpected_delete) {
+        fail("contended relay capture mutated reusable handoff state");
+    }
+
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    seed_alias_replay(&stored_state_key, test_observed_monotime_ns, test_process_incarnation, 1);
+    const java_remote_parent_task_t carrier = {
+        .owner = test_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
+    };
+    const java_remote_parent_handoff_key_t cancel_key =
+        java_remote_parent_handoff_key(&test_child, test_cancelled_token);
+    handoffs[0] = (handoff_entry_t){
+        .key = cancel_key,
+        .value = carrier,
+        .present = 1,
+    };
+    seed_open_handoff_ticket(&cancel_key);
+    seed_handoff_mutation(&cancel_key);
+    java_remote_parent_cancel_handoff_for_capability(
+        &test_child, test_cancelled_token, test_process_incarnation);
+    if (!find_handoff(&cancel_key) || stored_state.aliases != 1 ||
+        find_handoff_claim(&cancel_key) || !find_handoff_mutation(&cancel_key) ||
+        unexpected_update || unexpected_delete) {
+        fail("contended cancellation did not terminally delete its OPEN ticket");
+    }
+    handoff_mutations[0].present = 0;
+    java_thread_mapping_link_remote_execution(
+        &test_owner, &test_child, 123, test_cancelled_token, test_process_incarnation);
+    const alias_replay_entry_t *cancel_replay = exact_test_alias_replay();
+    if (find_handoff(&cancel_key) || stored_state.aliases || find_handoff_claim(&cancel_key) ||
+        find_handoff_mutation(&cancel_key) || find_task_claim(&test_child) ||
+        thread_mapping_claim.present || task_present || !cancel_replay ||
+        cancel_replay->value.references || unexpected_update || unexpected_delete) {
+        fail("delayed LINK transferred a terminal handoff after M contention");
+    }
+
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    const java_remote_parent_handoff_key_t link_key =
+        java_remote_parent_handoff_key(&test_child, test_first_token);
+    handoffs[0] = (handoff_entry_t){
+        .key = link_key,
+        .value = carrier,
+        .present = 1,
+    };
+    seed_open_handoff_ticket(&link_key);
+    seed_handoff_mutation(&link_key);
+    if (!java_remote_parent_link_handoff_for_capability(
+            &test_child, test_first_token, test_process_incarnation) ||
+        !find_handoff(&link_key) || task_present || stored_state.aliases != 1 ||
+        find_handoff_claim(&link_key) || !find_handoff_mutation(&link_key) ||
+        find_task_claim(&test_child) || unexpected_update || unexpected_delete) {
+        fail("contended link did not normalize and terminally delete its OPEN ticket");
+    }
+    handoff_mutations[0].present = 0;
+    if (!java_remote_parent_link_handoff_for_capability(
+            &test_child, test_first_token, test_process_incarnation) ||
+        find_handoff(&link_key) || task_present || stored_state.aliases ||
+        find_handoff_claim(&link_key) || find_handoff_mutation(&link_key) ||
+        find_task_claim(&test_child) || unexpected_update || unexpected_delete) {
+        fail("serialized duplicate link did not converge to an explicit miss");
+    }
+}
+
+static void test_post_link_terminal_cancellation_preserves_transferred_task(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    const java_remote_parent_handoff_key_t handoff_key =
+        java_remote_parent_handoff_key(&test_child, test_first_token);
+
+    java_remote_parent_capture_handoff_for_capability(
+        &test_owner, test_first_token, test_process_incarnation);
+    const handoff_claim_entry_t *ticket = find_handoff_claim(&handoff_key);
+    if (!find_handoff(&handoff_key) || !ticket ||
+        !java_remote_parent_handoff_ticket_open(&ticket->value, test_process_incarnation) ||
+        find_handoff_mutation(&handoff_key) || task_present || stored_state.aliases != 1 ||
+        unexpected_update || unexpected_delete) {
+        fail("terminal cancellation fixture did not capture an exact handoff");
+    }
+
+    if (!java_thread_mapping_link_handoff_for_capability(
+            &test_child, &test_child, test_first_token, test_process_incarnation)) {
+        fail("terminal cancellation fixture did not link its exact handoff");
+    }
+    const java_remote_parent_task_t transferred = stored_task;
+    const alias_replay_entry_t *replay = exact_test_alias_replay();
+    if (!task_present || !same_key(&stored_task_key, &test_child, sizeof(stored_task_key)) ||
+        !same_key(&transferred.owner, &test_owner, sizeof(transferred.owner)) ||
+        transferred.generation != test_generation ||
+        transferred.observed_monotime_ns != test_observed_monotime_ns ||
+        transferred.process_incarnation != test_process_incarnation || find_handoff(&handoff_key) ||
+        find_handoff_claim(&handoff_key) || find_handoff_mutation(&handoff_key) ||
+        find_task_claim(&test_child) || thread_mapping_claim.present || stored_state.aliases != 1 ||
+        !replay || replay->value.references != 1 || unexpected_update || unexpected_delete) {
+        fail("successful exact link did not transfer one balanced task alias");
+    }
+
+    java_remote_parent_cancel_handoff_for_capability(
+        &test_child, test_first_token, test_process_incarnation);
+    java_remote_parent_cancel_handoff_for_capability(
+        &test_child, test_first_token, test_process_incarnation);
+
+    replay = exact_test_alias_replay();
+    if (!task_present || memcmp(&stored_task, &transferred, sizeof(transferred)) != 0 ||
+        stored_state.aliases != 1 || !replay || replay->value.references != 1 ||
+        find_handoff(&handoff_key) || find_handoff_claim(&handoff_key) ||
+        find_handoff_mutation(&handoff_key) || find_task_claim(&test_child) ||
+        thread_mapping_claim.present || unexpected_update || unexpected_delete) {
+        fail("post-link terminal cancellation mutated the transferred task alias");
+    }
+}
+
+static void seed_cross_process_carrier_generation(pid_key_t foreign_owner) {
+    stored_state_key = java_remote_parent_state_key(&foreign_owner, test_generation);
+    stored_generation_index_key = stored_state_key;
+    stored_generation_index.process = java_process_key(&foreign_owner);
+    stored_state.aliases = 1;
+    ambiguities[0].key = stored_state_key;
+}
+
+static void test_cross_process_carriers_are_quarantined_without_alias_charge(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    const pid_key_t foreign_owner = {.tid = 70, .pid = 50, .ns = 30};
+    const java_remote_parent_task_t malformed = {
+        .owner = foreign_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
+    };
+
+    seed_generation(&connection);
+    seed_cross_process_carrier_generation(foreign_owner);
+    stored_task = malformed;
+    task_present = 1;
+    const java_remote_parent_handoff_key_t relay_key =
+        java_remote_parent_handoff_key(&test_child, test_relay_race_token);
+    java_remote_parent_capture_relay(&test_child, test_relay_race_token);
+    if (task_present || find_handoff(&relay_key) || stored_state.aliases != 1 ||
+        find_ambiguity(&stored_state_key) || find_task_claim(&test_child) || unexpected_update ||
+        unexpected_delete) {
+        fail("relay capture published or charged a cross-process task carrier");
+    }
+
+    seed_generation(&connection);
+    seed_cross_process_carrier_generation(foreign_owner);
+    const java_remote_parent_handoff_key_t cancel_key =
+        java_remote_parent_handoff_key(&test_child, test_cancelled_token);
+    handoffs[0] = (handoff_entry_t){
+        .key = cancel_key,
+        .value = malformed,
+        .present = 1,
+    };
+    java_remote_parent_cancel_handoff_for_capability(
+        &test_child, test_cancelled_token, test_process_incarnation);
+    if (find_handoff(&cancel_key) || stored_state.aliases != 1 ||
+        find_ambiguity(&stored_state_key) || find_handoff_claim(&cancel_key) || unexpected_update ||
+        unexpected_delete) {
+        fail("handoff cancellation charged a cross-process carrier alias");
+    }
+
+    seed_generation(&connection);
+    seed_cross_process_carrier_generation(foreign_owner);
+    const java_remote_parent_handoff_key_t link_key =
+        java_remote_parent_handoff_key(&test_child, test_first_token);
+    handoffs[0] = (handoff_entry_t){
+        .key = link_key,
+        .value = malformed,
+        .present = 1,
+    };
+    java_remote_parent_link_handoff_for_capability(
+        &test_child, test_first_token, test_process_incarnation);
+    if (find_handoff(&link_key) || task_present || task_update_attempts ||
+        stored_state.aliases != 1 || find_ambiguity(&stored_state_key) ||
+        find_handoff_claim(&link_key) || find_task_claim(&test_child) || unexpected_update ||
+        unexpected_delete) {
+        fail("handoff link published or charged a cross-process carrier alias");
+    }
+}
+
+static void test_successor_link_retires_predecessor_task_slot(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    const connection_info_t replacement = {.s_port = 2345, .d_port = 8443};
+    const u64 successor_incarnation = test_process_incarnation + 1;
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
+    };
+    task_present = 1;
+    seed_replacement_generation(&replacement);
+    bind_replacement_generation_to_process_capability(successor_incarnation);
+    replacement_state.aliases = 1;
+    const java_remote_parent_task_t successor = {
+        .owner = test_owner,
+        .generation = test_replacement_generation,
+        .observed_monotime_ns = test_now_ns,
+        .process_incarnation = successor_incarnation,
+    };
+    const java_remote_parent_handoff_key_t handoff_key =
+        java_remote_parent_handoff_key_for_capability(
+            &test_child, test_first_token, successor_incarnation);
+    handoffs[0] = (handoff_entry_t){
+        .key = handoff_key,
+        .value = successor,
+        .present = 1,
+    };
+    seed_open_handoff_ticket(&handoff_key);
+
+    java_remote_parent_link_handoff_for_capability(
+        &test_child, test_first_token, successor_incarnation);
+
+    if (!task_present || memcmp(&stored_task, &successor, sizeof(successor)) != 0 ||
+        find_handoff(&handoff_key) || find_handoff_claim(&handoff_key) ||
+        find_task_claim(&test_child) || stored_state.aliases != 0 ||
+        replacement_state.aliases != 1 || task_update_attempts != 1 ||
+        find_ambiguity(&stored_state_key) || find_ambiguity(&replacement_state_key) ||
+        unexpected_update || unexpected_delete) {
+        fail("successor handoff was lost behind a predecessor task slot");
+    }
+}
+
+static void test_worker_exit_retires_remote_parent_task_slot(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    pid_key_t logical_owner = {0};
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
+    };
+    task_present = 1;
+
+    const enum java_vt_cleanup_translation_result translation =
+        java_remote_parent_cleanup_exiting_task_for_capability(
+            &test_child, test_process_incarnation, &logical_owner);
+    alias_replay_entry_t *replay = exact_test_alias_replay();
+    if (translation != k_java_vt_cleanup_translation_none || task_present ||
+        stored_state.aliases != 0 || (replay && replay->value.references) ||
+        find_task_claim(&test_child) ||
+        !same_key(&logical_owner, &test_child, sizeof(test_child)) || unexpected_update ||
+        unexpected_delete) {
+        fail("normal worker exit leaked its remote-parent task slot or alias");
+    }
+
+    const u64 successor_incarnation = test_process_incarnation + 1;
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
+    };
+    task_present = 1;
+    registered_process_incarnation = successor_incarnation;
+    current_process_incarnation = successor_incarnation;
+    memset(&logical_owner, 0, sizeof(logical_owner));
+
+    java_remote_parent_cleanup_exiting_task_for_capability(
+        &test_child, successor_incarnation, &logical_owner);
+    replay = exact_test_alias_replay();
+    if (task_present || stored_state.aliases != 0 || (replay && replay->value.references) ||
+        find_task_claim(&test_child) ||
+        !same_key(&logical_owner, &test_child, sizeof(test_child)) || unexpected_update ||
+        unexpected_delete) {
+        fail("successor worker exit leaked a predecessor task slot or alias");
     }
 }
 
@@ -3328,11 +4642,13 @@ static void test_captured_generation_survives_owner_reuse(void) {
         .pid = test_owner.pid,
         .ns = test_owner.ns,
         .token = test_first_token,
+        .process_incarnation = test_process_incarnation,
     };
     const java_remote_parent_handoff_key_t cancelled_handoff_key = {
         .pid = test_owner.pid,
         .ns = test_owner.ns,
         .token = test_cancelled_token,
+        .process_incarnation = test_process_incarnation,
     };
 
     java_remote_parent_capture_handoff(test_first_token);
@@ -3353,26 +4669,20 @@ static void test_captured_generation_survives_owner_reuse(void) {
 
     java_remote_parent_cancel_handoff(&test_owner, test_cancelled_token);
     java_remote_parent_cancel_handoff(&test_owner, test_cancelled_token);
-    const handoff_claim_entry_t *cancelled_claim = find_handoff_claim(&cancelled_handoff_key);
-    if (stored_state.aliases != 1 || find_handoff(&cancelled_handoff_key) || !cancelled_claim ||
-        cancelled_claim->value.observed_monotime_ns != test_now_ns ||
-        cancelled_claim->value.process_incarnation != test_process_incarnation ||
-        handoff_claim_update_attempts != 2 || handoff_claim_update_successes != 1 ||
-        !replacement_state_present || !replacement_generation_index_present ||
-        !replacement_connection_present || !replacement_cookie_connection_present ||
-        !owner_present || !fallback_present) {
+    if (stored_state.aliases != 1 || find_handoff(&cancelled_handoff_key) ||
+        find_handoff_claim(&cancelled_handoff_key) || handoff_claim_update_attempts != 2 ||
+        handoff_claim_update_successes != 2 || !replacement_state_present ||
+        !replacement_generation_index_present || !replacement_connection_present ||
+        !replacement_cookie_connection_present || !owner_present || !fallback_present) {
         fail("cancelling a detached sibling did not release exactly one alias");
     }
 
     observe_alias_balance = 1;
     java_remote_parent_link_handoff(&test_child, test_first_token);
     observe_alias_balance = 0;
-    const handoff_claim_entry_t *linked_claim = find_handoff_claim(&first_handoff_key);
     if (!task_present || stored_state.aliases != 1 || find_handoff(&first_handoff_key) ||
-        !linked_claim || linked_claim->value.observed_monotime_ns != test_now_ns ||
-        linked_claim->value.process_incarnation != test_process_incarnation ||
-        handoff_claim_update_attempts != 3 || handoff_claim_update_successes != 2 ||
-        stored_task.generation != test_generation ||
+        find_handoff_claim(&first_handoff_key) || handoff_claim_update_attempts != 2 ||
+        handoff_claim_update_successes != 2 || stored_task.generation != test_generation ||
         !same_key(&stored_task.owner, &test_owner, sizeof(test_owner)) || alias_zero_observed) {
         fail("linking the preserved handoff did not transfer its generation alias");
     }
@@ -3502,6 +4812,7 @@ static void seed_exact_receive_aliases(u32 aliases) {
         .owner = test_owner,
         .generation = test_generation,
         .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
     };
     task_present = 1;
     if (aliases > 1) {
@@ -3522,6 +4833,7 @@ static void test_alias_observation_rejects_same_generation_reuse(void) {
         .owner = test_owner,
         .generation = test_generation,
         .observed_monotime_ns = stale_observation,
+        .process_incarnation = test_process_incarnation,
     };
     task_present = 1;
     current_task = test_child;
@@ -4274,6 +5586,7 @@ static void test_cleanup_unlinks_exact_task_and_releases_final_replay_reference(
         .owner = test_owner,
         .generation = test_generation,
         .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
     };
     task_present = 1;
     alias_replay_entry_t *replay = seed_alias_replay(
@@ -4313,6 +5626,7 @@ static void test_cleanup_retains_foreign_generation_task_and_replay(void) {
         .owner = test_owner,
         .generation = test_replacement_generation,
         .observed_monotime_ns = test_now_ns,
+        .process_incarnation = test_process_incarnation,
     };
     task_present = 1;
     alias_replay_entry_t *replay =
@@ -5226,6 +6540,7 @@ static void test_exact_receive_detach_removes_only_unaliased_generation(void) {
         .owner = test_owner,
         .generation = test_replacement_generation,
         .observed_monotime_ns = test_now_ns,
+        .process_incarnation = test_process_incarnation,
     };
     task_present = 1;
     handoffs[0] = (handoff_entry_t){
@@ -7343,7 +8658,8 @@ static void test_deferred_ioctl_transition_is_exact_and_fail_closed(void) {
         fail("aliased deferred START did not detach only its direct cursors");
     }
     java_remote_parent_resolution_t aliased_resolution = {0};
-    java_remote_parent_resolve_exact(&aliased_resolution, &test_owner, test_generation, 1);
+    java_remote_parent_resolve_exact(
+        &aliased_resolution, &test_owner, test_generation, 1, test_process_incarnation);
     if (!aliased_resolution.found || aliased_resolution.ambiguous ||
         !same_key(&aliased_resolution.key, &stored_state_key, sizeof(stored_state_key)) ||
         owner_present || fallback_present || !state_present || stored_state.aliases != 1 ||
@@ -8911,7 +10227,7 @@ static void test_alias_replay_capacity_rejects_retain_before_publication(void) {
         java_remote_parent_handoff_key(&test_owner, test_capture_race_token);
     java_remote_parent_capture_handoff(test_capture_race_token);
     if (alias_replay_update_failures || stored_state.aliases || find_handoff(&handoff_key) ||
-        exact_test_alias_replay() || claim_present || exact_claim_update_attempts ||
+        exact_test_alias_replay() || claim_present || exact_claim_update_attempts != 1 ||
         !find_ambiguity(&stored_state_key) || unexpected_update || unexpected_delete) {
         fail("alias replay capacity failure published a carrier or consumed E");
     }
@@ -9044,9 +10360,11 @@ static alias_replay_entry_t *seed_publishing_handoff_replay(u32 references) {
                 .owner = test_owner,
                 .generation = test_generation,
                 .observed_monotime_ns = test_observed_monotime_ns,
+                .process_incarnation = test_process_incarnation,
             },
         .present = 1,
     };
+    seed_open_handoff_ticket(&handoff_key);
     state_present = 0;
     alias_replay_entry_t *replay = seed_alias_replay(
         &stored_state_key, test_observed_monotime_ns, test_process_incarnation, references);
@@ -9070,8 +10388,8 @@ static void test_zero_reference_publishing_replay_rejects_handoff_transfer(void)
     java_remote_parent_link_handoff(&test_child, test_first_token);
     if (find_handoff(&handoff_key) || task_present || task_update_attempts || !replay->present ||
         memcmp(&replay->value, &publishing, sizeof(publishing)) != 0 || !claim_present ||
-        !find_handoff_claim(&handoff_key) || handoff_claim_update_successes != 1 ||
-        unexpected_update || unexpected_delete) {
+        find_handoff_claim(&handoff_key) || handoff_claim_update_attempts ||
+        handoff_claim_update_successes || unexpected_update || unexpected_delete) {
         fail("zero-reference publishing replay authorized pre-link handoff transfer");
     }
 
@@ -9082,8 +10400,8 @@ static void test_zero_reference_publishing_replay_rejects_handoff_transfer(void)
         task_update_attempts != 1 || !replay->present || replay->value.references ||
         replay->value.lifecycle != k_java_remote_parent_lifecycle_publishing ||
         replay->value.desired_lifecycle != k_java_remote_parent_lifecycle_consumed ||
-        !claim_present || !find_handoff_claim(&handoff_key) ||
-        handoff_claim_update_successes != 1 || unexpected_update || unexpected_delete) {
+        !claim_present || find_handoff_claim(&handoff_key) || handoff_claim_update_attempts ||
+        handoff_claim_update_successes || unexpected_update || unexpected_delete) {
         fail("zero-reference publishing replay survived post-link authority validation");
     }
 }
@@ -9486,10 +10804,10 @@ int main(void) {
     test_compact_finish_shapes_match_reference();
     test_claim_status_packed_classifier_matches_reference();
     test_capture_workspaces_are_guarded_and_zeroized();
-    test_capture_claim_race_releases_published_alias();
-    test_relay_claim_race_preserves_existing_task_alias();
-    test_capture_transfer_survives_claim_eviction();
-    test_relay_transfer_survives_claim_eviction();
+    test_full_handoff_ticket_map_rejects_capture_before_alias_publication();
+    test_capture_claim_race_converges_published_alias_for_claimant();
+    test_relay_claim_race_converges_to_existing_task_alias();
+    test_collision_claim_tombstone_drains_handoff_under_mutation();
     test_direct_capture_rejects_a_task_only_generation();
     test_direct_retrieval_rejects_a_task_only_generation();
     test_task_retrieval_rejects_malformed_task_links();
@@ -9506,6 +10824,25 @@ int main(void) {
     test_retrieval_rejects_an_unknown_source_without_mutation();
     test_direct_child_conflict_marks_exact_generations();
     test_new_receive_cleans_unaliased_generation_with_the_same_socket_cookie();
+    test_missing_handoff_never_fences_direct_generation();
+    test_rejected_cycle_fences_only_authoritative_task_carrier();
+    test_stale_task_observation_cannot_fence_same_key_successor();
+    test_stale_incarnation_cannot_retire_current_task_carrier();
+    test_stale_incarnation_cannot_quarantine_malformed_successor_task_carrier();
+    test_successor_incarnation_retires_valid_predecessor_task_carrier();
+    test_successor_incarnation_quarantines_malformed_predecessor_without_alias_charge();
+    test_retrieval_capability_cannot_adopt_successor_incarnation();
+    test_capture_capability_cannot_adopt_successor_incarnation();
+    test_capture_publishers_do_not_mutate_under_userspace_process_claim();
+    test_link_contention_terminally_cancels_exact_handoff_and_replay();
+    test_capture_collision_never_marks_foreign_capability();
+    test_terminal_handoff_claim_reclamation_requires_exact_no_h_under_mutation();
+    test_untagged_handoff_claim_is_terminal_and_cannot_transfer();
+    test_handoff_mutation_fence_serializes_publishers_and_claimants();
+    test_post_link_terminal_cancellation_preserves_transferred_task();
+    test_cross_process_carriers_are_quarantined_without_alias_charge();
+    test_successor_link_retires_predecessor_task_slot();
+    test_worker_exit_retires_remote_parent_task_slot();
     test_captured_generation_survives_owner_reuse();
     test_alias_observation_rejects_same_generation_reuse();
     test_detached_task_bridge_preserves_same_socket_replacement();

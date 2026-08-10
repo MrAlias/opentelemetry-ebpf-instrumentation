@@ -10,7 +10,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
     __type(key, u32);
     __type(value, u32);
-    __uint(max_entries, 16);
+    __uint(max_entries, 20);
 } jump_table SEC(".maps");
 
 enum {
@@ -35,4 +35,12 @@ enum {
     k_tail_large_buf_emit_continue = 13,
     // Traceparent validation
     k_tail_continue_protocol_http_tp_validate = 14,
+    // Java remote-parent control carriers. These transactions are isolated
+    // program roots so legacy kernels never accumulate the syscall parser's
+    // stack with their replay/claim frames.
+    k_tail_java_task_capture = 15,
+    k_tail_java_task_relay_capture = 16,
+    k_tail_java_task_link = 17,
+    k_tail_java_control_cleanup = 18,
+    k_tail_java_threads = 19,
 };

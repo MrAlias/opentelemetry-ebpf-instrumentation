@@ -16,6 +16,8 @@
 #include <logenricher/path_resolver.h>
 #include <logenricher/types.h>
 
+#include <logenricher/maps/log_enricher_generations.h>
+#include <logenricher/maps/log_enricher_lifecycle_epochs.h>
 #include <logenricher/maps/log_enricher_pids.h>
 #include <logenricher/maps/log_events.h>
 #include <logenricher/maps/pid_fd.h>
@@ -26,6 +28,136 @@
 char __license[] SEC("license") = "Dual MIT/GPL";
 
 SCRATCH_MEM_SIZED(log_event, k_log_event_max_size);
+
+// Linux exposes /proc/<pid>/stat starttime in USER_HZ ticks. USER_HZ is 100
+// on both supported BPF targets, and nsec_to_clock_t() therefore performs
+// this exact division for task_struct's nanosecond start timestamp.
+static const u64 k_nsec_per_process_start_tick = 10000000ULL;
+
+static __always_inline u64 log_enricher_encode_stat_device(u32 dev) {
+    const u32 major = dev >> 20;
+    const u32 minor = dev & ((1U << 20) - 1);
+
+    // Match new_encode_dev(), which is the st_dev representation returned to userspace.
+    return (u64)((minor & 0xffU) | (major << 8) | ((minor & ~0xffU) << 12));
+}
+
+// Kernels predating task_struct::start_boottime called the /proc starttime
+// source real_start_time. The CO-RE flavor suffix maps this declaration back
+// to task_struct without requiring the build kernel to contain the old field.
+struct task_struct___real_start_time {
+    u64 real_start_time;
+} __attribute__((preserve_access_index));
+
+static __always_inline bool process_start_ticks(const struct task_struct *leader, u64 *ticks) {
+    u64 start_ns = 0;
+
+    if (bpf_core_field_exists(((struct task_struct *)0)->start_boottime)) {
+        start_ns = BPF_CORE_READ(leader, start_boottime);
+    } else if (bpf_core_field_exists(
+                   ((struct task_struct___real_start_time *)0)->real_start_time)) {
+        start_ns =
+            BPF_CORE_READ((const struct task_struct___real_start_time *)leader, real_start_time);
+    } else {
+        // start_time is intentionally not a fallback: unlike start_boottime
+        // (and its old real_start_time name), it does not provably match the
+        // starttime value exported by /proc/<pid>/stat across suspend.
+        return false;
+    }
+
+    *ticks = start_ns / k_nsec_per_process_start_tick;
+    return *ticks != 0;
+}
+
+static __always_inline bool
+log_enricher_generation_matches_task(const log_enricher_generation_t *generation,
+                                     const struct task_struct *task) {
+    if (!generation || !generation->process_instance_id || !generation->process_start_ticks ||
+        !generation->executable_device || !generation->executable_inode ||
+        !generation->lifecycle_epoch) {
+        return false;
+    }
+
+    const u32 tgid = bpf_get_current_pid_tgid() >> 32;
+    const u64 *lifecycle_epoch = bpf_map_lookup_elem(&log_enricher_lifecycle_epochs, &tgid);
+    if (!lifecycle_epoch) {
+        return false;
+    }
+    const u64 current_lifecycle_epoch = *lifecycle_epoch;
+    if (!current_lifecycle_epoch || current_lifecycle_epoch != generation->lifecycle_epoch) {
+        return false;
+    }
+
+    const struct task_struct *leader = BPF_CORE_READ(task, group_leader);
+    if (!leader) {
+        return false;
+    }
+
+    u64 current_start_ticks = 0;
+    if (!process_start_ticks(leader, &current_start_ticks) ||
+        current_start_ticks != generation->process_start_ticks) {
+        return false;
+    }
+
+    const struct mm_struct *mm = BPF_CORE_READ(leader, mm);
+    if (!mm) {
+        return false;
+    }
+    const struct file *executable = BPF_CORE_READ(mm, exe_file);
+    if (!executable) {
+        return false;
+    }
+    const struct inode *inode = BPF_CORE_READ(executable, f_inode);
+    if (!inode) {
+        return false;
+    }
+    const struct super_block *superblock = BPF_CORE_READ(inode, i_sb);
+    if (!superblock) {
+        return false;
+    }
+
+    const u32 raw_device = (u32)BPF_CORE_READ(superblock, s_dev);
+    const u64 current_device = log_enricher_encode_stat_device(raw_device);
+    const u64 current_inode = (u64)BPF_CORE_READ(inode, i_ino);
+    return current_device == generation->executable_device &&
+           current_inode == generation->executable_inode;
+}
+
+static __always_inline int log_enricher_retire_current_process(void) {
+    const u32 tgid = bpf_get_current_pid_tgid() >> 32;
+    u64 *lifecycle_epoch = bpf_map_lookup_elem(&log_enricher_lifecycle_epochs, &tgid);
+    if (!lifecycle_epoch) {
+        return 0;
+    }
+
+    // Epoch zero is never valid. Skip it on the practically unreachable wrap
+    // so no stale generation can become eligible through an ABA transition.
+    const u64 previous_epoch = __sync_fetch_and_add(lifecycle_epoch, 1);
+    if (previous_epoch == ~0ULL) {
+        __sync_fetch_and_add(lifecycle_epoch, 1);
+    }
+    bpf_map_delete_elem(&log_enricher_generations, &tgid);
+    return 0;
+}
+
+SEC("tracepoint/sched/sched_process_exec")
+int obi_log_enricher_process_exec(void *ctx) {
+    (void)ctx;
+
+    return log_enricher_retire_current_process();
+}
+
+SEC("tracepoint/sched/sched_process_exit")
+int obi_log_enricher_process_exit(void *ctx) {
+    (void)ctx;
+
+    const struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    if (BPF_CORE_READ(task, signal, live.counter) != 0) {
+        return 0;
+    }
+
+    return log_enricher_retire_current_process();
+}
 
 static __always_inline bool pid_tracked(const struct task_struct *task) {
     u32 ns_pid = 0;
@@ -107,6 +239,35 @@ static __always_inline u32 consume_iovec(log_event_t *e,
 
 static __always_inline int
 __write(struct kiocb *iocb, struct iov_iter *from, const int fd, const struct task_struct *task) {
+    const u64 pid_tgid = bpf_get_current_pid_tgid();
+    const u32 tgid = pid_tgid >> 32;
+    const log_enricher_generation_t *generation =
+        bpf_map_lookup_elem(&log_enricher_generations, &tgid);
+    if (!log_enricher_generation_matches_task(generation, task)) {
+        return 0;
+    }
+    const u64 process_instance_id = generation->process_instance_id;
+    const u64 lifecycle_epoch = generation->lifecycle_epoch;
+
+    const struct file *target = BPF_CORE_READ(iocb, ki_filp);
+    if (!target) {
+        return 0;
+    }
+    const struct inode *target_inode = BPF_CORE_READ(target, f_inode);
+    if (!target_inode) {
+        return 0;
+    }
+    const struct super_block *target_superblock = BPF_CORE_READ(target_inode, i_sb);
+    if (!target_superblock) {
+        return 0;
+    }
+    const u64 target_device =
+        log_enricher_encode_stat_device((u32)BPF_CORE_READ(target_superblock, s_dev));
+    const u64 target_inode_number = (u64)BPF_CORE_READ(target_inode, i_ino);
+    if (!target_device || !target_inode_number) {
+        return 0;
+    }
+
     iovec_iter_ctx ictx;
     get_iovec_ctx(&ictx, (struct iov_iter___dummy *)from);
 
@@ -121,9 +282,13 @@ __write(struct kiocb *iocb, struct iov_iter *from, const int fd, const struct ta
         return 0;
     }
 
-    const u64 pid_tgid = bpf_get_current_pid_tgid();
     obi_ctx_info_t *obi_ctx = obi_ctx__get(pid_tgid);
-    e->tgid = pid_tgid >> 32;
+    e->tgid = tgid;
+    e->process_instance_id = process_instance_id;
+    e->lifecycle_epoch = lifecycle_epoch;
+    e->target_device = target_device;
+    e->target_inode = target_inode_number;
+    e->reserved = 0;
     e->ctx = obi_ctx ? *obi_ctx : (obi_ctx_info_t){0};
     e->fd = fd;
 

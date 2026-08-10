@@ -74,6 +74,9 @@ type Maps struct {
 	OwnerGuards                    *ebpf.Map
 	Handoffs                       *ebpf.Map
 	HandoffClaims                  *ebpf.Map
+	HandoffMutations               *ebpf.Map
+	TaskClaims                     *ebpf.Map
+	ThreadMappingClaims            *ebpf.Map
 	Retired                        *ebpf.Map
 	SSLPrewriteTP                  *ebpf.Map
 	SSLPrewriteConnectionAmbiguity *ebpf.Map
@@ -152,6 +155,7 @@ type taskLink struct {
 	Reserved            uint32
 	Generation          uint64
 	ObservedMonotonicNS uint64
+	ProcessIncarnation  uint64
 }
 
 type connectionInfo struct {
@@ -1076,6 +1080,13 @@ func (h *MapHandler) resolveTask(
 		}
 		return nil, false, true
 	}
+	if processIncarnation == 0 || link.ProcessIncarnation == 0 ||
+		link.ProcessIncarnation != processIncarnation {
+		return nil, true, false
+	}
+	if !taskLinkOwnerMatchesProcess(link, start.PID, start.Namespace) {
+		return nil, true, false
+	}
 	current, expired := h.taskLinkFreshness(link)
 	if !current && !expired {
 		return nil, false, false
@@ -1088,14 +1099,14 @@ func (h *MapHandler) resolveTask(
 		return []resolvedCandidate{{
 			Owner:              link.Owner,
 			Generation:         link.Generation,
-			ProcessIncarnation: processIncarnation,
+			ProcessIncarnation: link.ProcessIncarnation,
 			ClaimOnly:          true,
 			TaskSource:         start,
 			TaskLink:           link,
 		}}, false, false
 	}
 	linked, found, failed := h.resolveOwner(
-		link.Owner, link.Generation, processIncarnation, true,
+		link.Owner, link.Generation, link.ProcessIncarnation, true,
 	)
 	if failed {
 		return nil, false, true
@@ -1114,7 +1125,7 @@ func (h *MapHandler) resolveTask(
 		return []resolvedCandidate{{
 			Owner:              link.Owner,
 			Generation:         link.Generation,
-			ProcessIncarnation: processIncarnation,
+			ProcessIncarnation: link.ProcessIncarnation,
 			ClaimOnly:          true,
 			TaskSource:         start,
 			TaskLink:           link,
@@ -1203,8 +1214,13 @@ func (h *MapHandler) candidateTaskLinkStatus(candidate resolvedCandidate) Status
 		return StatusValid
 	}
 	if candidate.TaskSource == (Identity{}) ||
+		!taskLinkOwnerMatchesProcess(
+			candidate.TaskLink, candidate.TaskSource.PID, candidate.TaskSource.Namespace,
+		) ||
 		candidate.TaskLink.Owner != candidate.Owner ||
 		candidate.TaskLink.Generation != candidate.Generation ||
+		candidate.TaskLink.ProcessIncarnation == 0 ||
+		candidate.TaskLink.ProcessIncarnation != candidate.ProcessIncarnation ||
 		candidate.TaskLink.Reserved != 0 {
 		return StatusAmbiguous
 	}
@@ -1537,10 +1553,15 @@ func javaVirtualThreadOwner(carrier Identity, virtualThreadID uint64) Identity {
 	return carrier
 }
 
+func taskLinkOwnerMatchesProcess(link taskLink, pid, namespace uint32) bool {
+	return link.Owner.PID == pid && link.Owner.Namespace == namespace
+}
+
 func (h *MapHandler) taskLinkFreshness(link taskLink) (current, expired bool) {
 	now := h.monoTimeNow()
 	if now <= 0 || link.Owner == (Identity{}) || link.Reserved != 0 ||
 		link.Generation == 0 || link.ObservedMonotonicNS == 0 ||
+		link.ProcessIncarnation == 0 ||
 		uint64(now) < link.ObservedMonotonicNS {
 		return false, false
 	}
@@ -3142,11 +3163,12 @@ func (h *MapHandler) retargetPublishingClaimStale(
 		}
 		return StatusTransportError
 	}
-	if currentClaim == staleClaim {
+	switch {
+	case currentClaim == staleClaim:
 		*claim = staleClaim
-	} else if updateErr != nil {
+	case updateErr != nil:
 		return StatusTransportError
-	} else {
+	default:
 		return statusForGenerationClaim(currentClaim, claim.ProcessIncarnation)
 	}
 

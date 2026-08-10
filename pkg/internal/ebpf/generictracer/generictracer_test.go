@@ -8,6 +8,7 @@ package generictracer
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -53,6 +54,12 @@ func makeKey(first, second uint32) uint64 {
 	return (uint64(first) << 32) | uint64(second)
 }
 
+type testCloserFunc func() error
+
+func (f testCloserFunc) Close() error {
+	return f()
+}
+
 func TestJavaProcessIdentityUsesInnermostNamespacePID(t *testing.T) {
 	original := findJavaNamespacedPIDs
 	findJavaNamespacedPIDs = func(app.PID) ([]app.PID, error) {
@@ -60,7 +67,7 @@ func TestJavaProcessIdentityUsesInnermostNamespacePID(t *testing.T) {
 	}
 	t.Cleanup(func() { findJavaNamespacedPIDs = original })
 
-	identity, err := javaProcessIdentity(9001, 1234)
+	identity, err := javaProcessIdentity(9001, 1234, nil)
 	require.NoError(t, err)
 	assert.Equal(t, uint32(7), identity.TID)
 	assert.Equal(t, uint32(7), identity.PID)
@@ -77,14 +84,152 @@ func TestDelayedJavaDeletionPreservesReplacementAuthorization(t *testing.T) {
 		identity:   old.identity,
 		capability: 22,
 	}
-	tracer := &Tracer{javaAuthKeys: map[javaAuthorizationKey][]javaAuthorization{
-		key: {old, replacement},
-	}}
+	oldFile := exec.New(exec.Init{Pid: key.pid})
+	replacementFile := exec.New(exec.Init{Pid: key.pid})
+	oldEvent := &javaAuthorizationEvent{authorization: old, file: oldFile, confirmed: true}
+	replacementEvent := &javaAuthorizationEvent{
+		authorization: replacement, file: replacementFile, confirmed: true,
+	}
+	tracer := &Tracer{
+		javaAuthKeys: map[javaAuthorizationKey][]javaAuthorization{
+			key: {old, replacement},
+		},
+		javaAuthEvents: map[javaAuthorizationKey][]*javaAuthorizationEvent{
+			key: {oldEvent, replacementEvent},
+		},
+	}
 
-	tracer.deauthorizeJavaProcess(key.pid, key.ns)
+	tracer.deauthorizeJavaProcess(key.pid, key.ns, oldFile)
 
 	require.Len(t, tracer.javaAuthKeys[key], 1)
 	assert.Equal(t, replacement, tracer.javaAuthKeys[key][0])
+	require.Len(t, tracer.javaAuthEvents[key], 1)
+	assert.Same(t, replacementEvent, tracer.javaAuthEvents[key][0])
+}
+
+func TestJavaDeletionMatchesExactFileLifetimeOutOfOrder(t *testing.T) {
+	originalFind := findJavaNamespacedPIDs
+	originalAuthorize := authorizeJavaProcessCapability
+	originalDeauthorize := deauthorizeJavaProcessCapability
+	originalSuspend := suspendJavaProcessAuthorization
+	t.Cleanup(func() {
+		findJavaNamespacedPIDs = originalFind
+		authorizeJavaProcessCapability = originalAuthorize
+		deauthorizeJavaProcessCapability = originalDeauthorize
+		suspendJavaProcessAuthorization = originalSuspend
+	})
+	findJavaNamespacedPIDs = func(app.PID) ([]app.PID, error) { return nil, nil }
+	var authorized uint64
+	authorizeJavaProcessCapability = func(
+		_ javabridge.Maps, _ javabridge.Identity, capability uint64,
+	) (bool, error) {
+		authorized = capability
+		return true, nil
+	}
+	suspendJavaProcessAuthorization = func(
+		_ javabridge.Maps, _ javabridge.Identity, capability uint64,
+	) error {
+		if authorized == capability {
+			authorized = 0
+		}
+		return nil
+	}
+	var deauthorized []uint64
+	deauthorizeJavaProcessCapability = func(
+		_ javabridge.Maps, _ javabridge.Identity, capability uint64, _ bool,
+	) error {
+		deauthorized = append(deauthorized, capability)
+		if authorized == capability {
+			authorized = 0
+		}
+		return nil
+	}
+
+	const pid = app.PID(9001)
+	const ns = uint32(1234)
+	key := javaAuthorizationKey{pid: pid, ns: ns}
+	newFile := func(capability uint64) *exec.FileInfo {
+		fi := exec.New(exec.Init{
+			Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+		})
+		fi.SetJavaAgentCapability(capability)
+		return fi
+	}
+	tracer := &Tracer{log: tlog(), javaRemoteParentEnabled: true}
+	tracer.bpfObjects.JavaAuthorizedProcesses = &ebpf.Map{}
+
+	predecessor := newFile(11)
+	replacement := newFile(22)
+	tracer.authorizeJavaProcess(pid, ns, predecessor)
+	tracer.authorizeJavaProcess(pid, ns, replacement)
+	require.Equal(t, uint64(22), authorized)
+
+	unknownLifetime := newFile(99)
+	tracer.deauthorizeJavaProcess(pid, ns, unknownLifetime)
+	assert.Equal(t, uint64(22), authorized)
+	require.Len(t, tracer.javaAuthEvents[key], 2)
+
+	// B can be observed deleted before delayed A. Exact matching removes only B.
+	tracer.deauthorizeJavaProcess(pid, ns, replacement)
+	assert.Zero(t, authorized)
+	assert.Zero(t, replacement.JavaAgentCapability())
+	require.Len(t, tracer.javaAuthEvents[key], 1)
+	assert.Same(t, predecessor, tracer.javaAuthEvents[key][0].file)
+	require.Len(t, tracer.javaAuthKeys[key], 1)
+	assert.Equal(t, uint64(11), tracer.javaAuthKeys[key][0].capability)
+
+	tracer.deauthorizeJavaProcess(pid, ns, predecessor)
+	assert.Equal(t, []uint64{22, 11}, deauthorized)
+	assert.NotContains(t, tracer.javaAuthEvents, key)
+	assert.NotContains(t, tracer.javaAuthKeys, key)
+
+	// The ordinary A-before-B order must preserve the replacement gate and Q.
+	predecessor = newFile(33)
+	replacement = newFile(44)
+	tracer.authorizeJavaProcess(pid, ns, predecessor)
+	tracer.authorizeJavaProcess(pid, ns, replacement)
+	tracer.deauthorizeJavaProcess(pid, ns, predecessor)
+	assert.Equal(t, uint64(44), authorized)
+	assert.Equal(t, uint64(44), replacement.JavaAgentCapability())
+	tracer.deauthorizeJavaProcess(pid, ns, replacement)
+	assert.Zero(t, authorized)
+	assert.Equal(t, []uint64{22, 11, 33, 44}, deauthorized)
+}
+
+func TestJavaAuthorizationEventSnapshotsCapabilityBeforeFileMutation(t *testing.T) {
+	originalFind := findJavaNamespacedPIDs
+	originalAuthorize := authorizeJavaProcessCapability
+	t.Cleanup(func() {
+		findJavaNamespacedPIDs = originalFind
+		authorizeJavaProcessCapability = originalAuthorize
+	})
+	findJavaNamespacedPIDs = func(app.PID) ([]app.PID, error) { return nil, nil }
+	var observed uint64
+	authorizeJavaProcessCapability = func(
+		_ javabridge.Maps, _ javabridge.Identity, capability uint64,
+	) (bool, error) {
+		observed = capability
+		return true, nil
+	}
+
+	const pid = app.PID(9001)
+	const ns = uint32(1234)
+	fi := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+	})
+	fi.SetJavaAgentCapability(11)
+	tracer := &Tracer{log: tlog(), javaRemoteParentEnabled: true}
+	tracer.bpfObjects.JavaAuthorizedProcesses = &ebpf.Map{}
+	event, created := tracer.beginJavaAuthorizationEvent(
+		javaAuthorizationKey{pid: pid, ns: ns}, fi,
+	)
+	require.True(t, created)
+	fi.SetJavaAgentCapability(22)
+
+	tracer.authorizeJavaProcessForEvent(pid, ns, fi, event)
+
+	assert.Equal(t, uint64(11), observed)
+	assert.Equal(t, uint64(11), fi.JavaAgentCapability())
 }
 
 func TestJavaAuthorizationDoesNotRequireRemoteParent(t *testing.T) {
@@ -111,6 +256,1293 @@ func TestJavaAuthorizationDoesNotRequireRemoteParent(t *testing.T) {
 	tracer.authorizeJavaProcess(pid, 1234, fileInfo)
 
 	assert.Equal(t, 1, identityCalls)
+	assert.Zero(t, fileInfo.JavaAgentCapability(), "failed identity resolution must gate attach")
+}
+
+func TestJavaAuthorizationRetiredCapabilityRotatesBeforeAttach(t *testing.T) {
+	originalFind := findJavaNamespacedPIDs
+	originalAuthorize := authorizeJavaProcessCapability
+	originalGenerate := generateJavaProcessCapability
+	t.Cleanup(func() {
+		findJavaNamespacedPIDs = originalFind
+		authorizeJavaProcessCapability = originalAuthorize
+		generateJavaProcessCapability = originalGenerate
+	})
+	findJavaNamespacedPIDs = func(app.PID) ([]app.PID, error) { return nil, nil }
+	var capabilities []uint64
+	authorizeJavaProcessCapability = func(
+		_ javabridge.Maps, _ javabridge.Identity, capability uint64,
+	) (bool, error) {
+		capabilities = append(capabilities, capability)
+		if capability == 11 {
+			return false, javabridge.ErrProcessCapabilityRetired
+		}
+		return true, nil
+	}
+	generateJavaProcessCapability = func() (uint64, error) { return 22, nil }
+
+	const pid = app.PID(9001)
+	fileInfo := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+	})
+	fileInfo.SetJavaAgentCapability(11)
+	tracer := &Tracer{
+		log: tlog(), javaRemoteParentEnabled: true,
+		javaAuthKeys: make(map[javaAuthorizationKey][]javaAuthorization),
+	}
+	tracer.bpfObjects.JavaAuthorizedProcesses = &ebpf.Map{}
+
+	tracer.authorizeJavaProcess(pid, 1234, fileInfo)
+
+	assert.Equal(t, []uint64{11, 22}, capabilities)
+	assert.Equal(t, uint64(22), fileInfo.JavaAgentCapability())
+	require.Len(t, tracer.javaAuthKeys[javaAuthorizationKey{pid: pid, ns: 1234}], 1)
+	assert.Equal(t, uint64(22),
+		tracer.javaAuthKeys[javaAuthorizationKey{pid: pid, ns: 1234}][0].capability)
+}
+
+func TestRepeatedConfirmedJavaLifetimeCompletesFreshAttachmentGate(t *testing.T) {
+	const pid = app.PID(9001)
+	key := javaAuthorizationKey{pid: pid, ns: 1234}
+	fileInfo := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+	})
+	event := &javaAuthorizationEvent{
+		sequence:  1,
+		file:      fileInfo,
+		confirmed: true,
+		authorization: javaAuthorization{
+			capability: 11,
+		},
+	}
+	tracer := &Tracer{
+		javaAuthEvents: map[javaAuthorizationKey][]*javaAuthorizationEvent{
+			key: {event},
+		},
+		javaAuthLatest: map[javaAuthorizationKey]uint64{key: event.sequence},
+	}
+	fileInfo.PrepareJavaAgentCapability(22)
+
+	got, created := tracer.beginJavaAuthorizationEvent(key, fileInfo)
+
+	assert.Same(t, event, got)
+	assert.False(t, created)
+	capability, err := fileInfo.WaitJavaAgentAuthorization(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, uint64(11), capability,
+		"a repeated FileInfo must reuse its already-confirmed exact capability")
+}
+
+func TestRepeatedInFlightJavaLifetimeChainsFreshAttachmentGate(t *testing.T) {
+	originalFind := findJavaNamespacedPIDs
+	originalAuthorize := authorizeJavaProcessCapability
+	t.Cleanup(func() {
+		findJavaNamespacedPIDs = originalFind
+		authorizeJavaProcessCapability = originalAuthorize
+	})
+	findJavaNamespacedPIDs = func(app.PID) ([]app.PID, error) { return nil, nil }
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Uint32
+	authorizeJavaProcessCapability = func(
+		javabridge.Maps, javabridge.Identity, uint64,
+	) (bool, error) {
+		calls.Add(1)
+		close(started)
+		<-release
+		return true, nil
+	}
+
+	const pid = app.PID(9001)
+	key := javaAuthorizationKey{pid: pid, ns: 1234}
+	fileInfo := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+	})
+	fileInfo.PrepareJavaAgentCapability(11)
+	tracer := &Tracer{log: tlog(), javaRemoteParentEnabled: true}
+	tracer.bpfObjects.JavaAuthorizedProcesses = &ebpf.Map{}
+	event, created := tracer.beginJavaAuthorizationEvent(key, fileInfo)
+	require.True(t, created)
+	require.True(t, tracer.supersedeJavaAuthorizationEvent(key, event, fileInfo))
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		tracer.authorizeJavaProcessForEvent(pid, key.ns, fileInfo, event)
+	}()
+	<-started
+
+	fileInfo.PrepareJavaAgentCapability(22)
+	got, created := tracer.beginJavaAuthorizationEvent(key, fileInfo)
+	assert.Same(t, event, got)
+	assert.False(t, created, "one FileInfo lifetime must run one authorization goroutine")
+	result := make(chan uint64, 1)
+	go func() {
+		capability, _ := fileInfo.WaitJavaAgentAuthorization(t.Context())
+		result <- capability
+	}()
+	select {
+	case capability := <-result:
+		t.Fatalf("fresh gate completed before the in-flight authorization: %d", capability)
+	default:
+	}
+
+	close(release)
+	<-done
+	assert.Equal(t, uint64(11), <-result)
+	assert.Equal(t, uint32(1), calls.Load())
+}
+
+func TestJavaRetiredRotationSkipsPendingSuspensionCapabilities(t *testing.T) {
+	originalFind := findJavaNamespacedPIDs
+	originalAuthorize := authorizeJavaProcessCapability
+	originalGenerate := generateJavaProcessCapability
+	t.Cleanup(func() {
+		findJavaNamespacedPIDs = originalFind
+		authorizeJavaProcessCapability = originalAuthorize
+		generateJavaProcessCapability = originalGenerate
+	})
+	findJavaNamespacedPIDs = func(app.PID) ([]app.PID, error) { return nil, nil }
+	var authorized []uint64
+	authorizeJavaProcessCapability = func(
+		_ javabridge.Maps, _ javabridge.Identity, capability uint64,
+	) (bool, error) {
+		authorized = append(authorized, capability)
+		if capability == 11 {
+			return false, javabridge.ErrProcessCapabilityRetired
+		}
+		return true, nil
+	}
+	generated := []uint64{22, 33}
+	generateJavaProcessCapability = func() (uint64, error) {
+		capability := generated[0]
+		generated = generated[1:]
+		return capability, nil
+	}
+
+	const pid = app.PID(9001)
+	key := javaAuthorizationKey{pid: pid, ns: 1234}
+	identity := javabridge.Identity{TID: uint32(pid), PID: uint32(pid), Namespace: key.ns}
+	fileInfo := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+	})
+	fileInfo.SetJavaAgentCapability(11)
+	tracer := &Tracer{
+		log: tlog(), javaRemoteParentEnabled: true,
+		javaSuspendPending: map[javaAuthorizationKey]map[javaAuthorization]struct{}{
+			key: {{identity: identity, capability: 22}: {}},
+		},
+	}
+	tracer.bpfObjects.JavaAuthorizedProcesses = &ebpf.Map{}
+
+	tracer.authorizeJavaProcess(pid, key.ns, fileInfo)
+
+	assert.Equal(t, []uint64{11, 33}, authorized)
+	assert.Equal(t, uint64(33), fileInfo.JavaAgentCapability())
+}
+
+func TestFailedJavaAllowTombstonePreservesReplacementAuthorization(t *testing.T) {
+	originalFind := findJavaNamespacedPIDs
+	originalAuthorize := authorizeJavaProcessCapability
+	originalDeauthorize := deauthorizeJavaProcessCapability
+	originalSuspend := suspendJavaProcessAuthorization
+	originalTimeout := javaAuthorizationRetryTimeout
+	t.Cleanup(func() {
+		findJavaNamespacedPIDs = originalFind
+		authorizeJavaProcessCapability = originalAuthorize
+		deauthorizeJavaProcessCapability = originalDeauthorize
+		suspendJavaProcessAuthorization = originalSuspend
+		javaAuthorizationRetryTimeout = originalTimeout
+	})
+	findJavaNamespacedPIDs = func(app.PID) ([]app.PID, error) { return nil, nil }
+	authorizeJavaProcessCapability = func(
+		_ javabridge.Maps, _ javabridge.Identity, capability uint64,
+	) (bool, error) {
+		if capability == 11 {
+			return false, errors.New("injected predecessor authorization failure")
+		}
+		return true, nil
+	}
+	suspendJavaProcessAuthorization = func(
+		javabridge.Maps, javabridge.Identity, uint64,
+	) error {
+		return nil
+	}
+	var removed []uint64
+	deauthorizeJavaProcessCapability = func(
+		_ javabridge.Maps, _ javabridge.Identity, capability uint64, _ bool,
+	) error {
+		removed = append(removed, capability)
+		return nil
+	}
+	javaAuthorizationRetryTimeout = 0
+
+	const pid = app.PID(9001)
+	key := javaAuthorizationKey{pid: pid, ns: 1234}
+	predecessor := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+	})
+	replacement := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+	})
+	tracer := &Tracer{log: tlog(), javaRemoteParentEnabled: true}
+	tracer.bpfObjects.JavaAuthorizedProcesses = &ebpf.Map{}
+
+	predecessor.SetJavaAgentCapability(11)
+	tracer.authorizeJavaProcess(pid, key.ns, predecessor)
+	assert.Zero(t, predecessor.JavaAgentCapability())
+	replacement.SetJavaAgentCapability(22)
+	tracer.authorizeJavaProcess(pid, key.ns, replacement)
+	require.Len(t, tracer.javaAuthEvents[key], 2)
+	assert.Equal(t, uint64(22), replacement.JavaAgentCapability())
+
+	tracer.deauthorizeJavaProcess(pid, key.ns, predecessor)
+	assert.Equal(t, uint64(22), replacement.JavaAgentCapability(),
+		"Block for failed A must not close replacement B's FileInfo gate")
+	assert.Empty(t, removed)
+	require.Len(t, tracer.javaAuthKeys[key], 1)
+	assert.Equal(t, uint64(22), tracer.javaAuthKeys[key][0].capability)
+
+	tracer.deauthorizeJavaProcess(pid, key.ns, replacement)
+	assert.Zero(t, replacement.JavaAgentCapability())
+	assert.Equal(t, []uint64{22}, removed)
+	assert.NotContains(t, tracer.javaAuthKeys, key)
+}
+
+func TestRepeatedJavaAllowUsesOneExactLifetimeEvent(t *testing.T) {
+	originalFind := findJavaNamespacedPIDs
+	originalAuthorize := authorizeJavaProcessCapability
+	originalDeauthorize := deauthorizeJavaProcessCapability
+	originalSuspend := suspendJavaProcessAuthorization
+	originalTimeout := javaAuthorizationRetryTimeout
+	t.Cleanup(func() {
+		findJavaNamespacedPIDs = originalFind
+		authorizeJavaProcessCapability = originalAuthorize
+		deauthorizeJavaProcessCapability = originalDeauthorize
+		suspendJavaProcessAuthorization = originalSuspend
+		javaAuthorizationRetryTimeout = originalTimeout
+	})
+	findJavaNamespacedPIDs = func(app.PID) ([]app.PID, error) { return nil, nil }
+	var attempts []uint64
+	authorizeJavaProcessCapability = func(
+		_ javabridge.Maps, _ javabridge.Identity, capability uint64,
+	) (bool, error) {
+		attempts = append(attempts, capability)
+		if capability == 11 {
+			return false, errors.New("injected first attempt failure")
+		}
+		return true, nil
+	}
+	suspendJavaProcessAuthorization = func(
+		javabridge.Maps, javabridge.Identity, uint64,
+	) error {
+		return nil
+	}
+	var deauthorized []uint64
+	deauthorizeJavaProcessCapability = func(
+		_ javabridge.Maps, _ javabridge.Identity, capability uint64, _ bool,
+	) error {
+		deauthorized = append(deauthorized, capability)
+		return nil
+	}
+	javaAuthorizationRetryTimeout = 0
+
+	const pid = app.PID(9001)
+	const ns = uint32(1234)
+	key := javaAuthorizationKey{pid: pid, ns: ns}
+	fi := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+	})
+	tracer := &Tracer{log: tlog(), javaRemoteParentEnabled: true}
+	tracer.bpfObjects.JavaAuthorizedProcesses = &ebpf.Map{}
+
+	fi.SetJavaAgentCapability(11)
+	tracer.authorizeJavaProcess(pid, ns, fi)
+	assert.Zero(t, fi.JavaAgentCapability())
+	require.Len(t, tracer.javaAuthEvents[key], 1)
+
+	fi.SetJavaAgentCapability(22)
+	tracer.authorizeJavaProcess(pid, ns, fi)
+	assert.Equal(t, []uint64{11, 22}, attempts)
+	assert.Equal(t, uint64(22), fi.JavaAgentCapability())
+	require.Len(t, tracer.javaAuthEvents[key], 1,
+		"one discovery lifetime must require exactly one deletion")
+
+	tracer.deauthorizeJavaProcess(pid, ns, fi)
+	assert.Equal(t, []uint64{22}, deauthorized)
+	assert.NotContains(t, tracer.javaAuthEvents, key)
+	assert.NotContains(t, tracer.javaAuthKeys, key)
+}
+
+func TestJavaAuthorizationWaitsPastOldRetryWindowForClaimRecovery(t *testing.T) {
+	originalFind := findJavaNamespacedPIDs
+	originalFindForOwner := findJavaNamespacedPIDsForOwner
+	originalAuthorize := authorizeJavaProcessCapability
+	originalValidateOwner := validateJavaProcessOwner
+	originalTimeout := javaAuthorizationRetryTimeout
+	originalInterval := javaAuthorizationRetryInterval
+	t.Cleanup(func() {
+		findJavaNamespacedPIDs = originalFind
+		findJavaNamespacedPIDsForOwner = originalFindForOwner
+		authorizeJavaProcessCapability = originalAuthorize
+		validateJavaProcessOwner = originalValidateOwner
+		javaAuthorizationRetryTimeout = originalTimeout
+		javaAuthorizationRetryInterval = originalInterval
+	})
+	findJavaNamespacedPIDs = func(app.PID) ([]app.PID, error) { return nil, nil }
+	findJavaNamespacedPIDsForOwner = func(app.PID, *exec.FileInfo) ([]app.PID, error) {
+		return nil, nil
+	}
+	validateJavaProcessOwner = func(app.PID, *exec.FileInfo) error { return nil }
+	started := time.Now()
+	authorizeJavaProcessCapability = func(
+		javabridge.Maps, javabridge.Identity, uint64,
+	) (bool, error) {
+		if time.Since(started) < 150*time.Millisecond {
+			return false, javabridge.ErrProcessClaimContended
+		}
+		return true, nil
+	}
+	javaAuthorizationRetryTimeout = 500 * time.Millisecond
+	javaAuthorizationRetryInterval = 5 * time.Millisecond
+
+	const pid = app.PID(9001)
+	const ns = uint32(1234)
+	fi := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava},
+		Pid:     pid, ProcessStart: 77,
+	})
+	fi.SetJavaAgentCapability(11)
+	tracer := &Tracer{log: tlog(), javaRemoteParentEnabled: true}
+	tracer.bpfObjects.JavaAuthorizedProcesses = &ebpf.Map{}
+
+	tracer.authorizeJavaProcess(pid, ns, fi)
+
+	assert.GreaterOrEqual(t, time.Since(started), 150*time.Millisecond)
+	assert.Equal(t, uint64(11), fi.JavaAgentCapability())
+}
+
+func TestJavaAuthorizationRejectsPIDReuseBeforePublishingAttachGate(t *testing.T) {
+	originalFind := findJavaNamespacedPIDs
+	originalFindForOwner := findJavaNamespacedPIDsForOwner
+	originalAuthorize := authorizeJavaProcessCapability
+	originalSuspend := suspendJavaProcessAuthorization
+	originalValidateOwner := validateJavaProcessOwner
+	t.Cleanup(func() {
+		findJavaNamespacedPIDs = originalFind
+		findJavaNamespacedPIDsForOwner = originalFindForOwner
+		authorizeJavaProcessCapability = originalAuthorize
+		suspendJavaProcessAuthorization = originalSuspend
+		validateJavaProcessOwner = originalValidateOwner
+	})
+	findJavaNamespacedPIDs = func(app.PID) ([]app.PID, error) { return nil, nil }
+	findJavaNamespacedPIDsForOwner = func(app.PID, *exec.FileInfo) ([]app.PID, error) {
+		return nil, nil
+	}
+	var startReads atomic.Int32
+	validateJavaProcessOwner = func(app.PID, *exec.FileInfo) error {
+		if startReads.Add(1) <= 2 {
+			return nil
+		}
+		return errors.New("injected PID reuse")
+	}
+	var authorized []uint64
+	authorizeJavaProcessCapability = func(
+		_ javabridge.Maps, _ javabridge.Identity, capability uint64,
+	) (bool, error) {
+		authorized = append(authorized, capability)
+		return true, nil
+	}
+	var suspended []uint64
+	suspendJavaProcessAuthorization = func(
+		_ javabridge.Maps, _ javabridge.Identity, capability uint64,
+	) error {
+		suspended = append(suspended, capability)
+		return nil
+	}
+
+	const pid = app.PID(9001)
+	const ns = uint32(1234)
+	fi := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava},
+		Pid:     pid, ProcessStart: 77,
+	})
+	fi.SetJavaAgentCapability(11)
+	tracer := &Tracer{log: tlog(), javaRemoteParentEnabled: true}
+	tracer.bpfObjects.JavaAuthorizedProcesses = &ebpf.Map{}
+
+	tracer.authorizeJavaProcess(pid, ns, fi)
+
+	assert.Equal(t, []uint64{11}, authorized)
+	assert.Equal(t, []uint64{11}, suspended)
+	assert.Zero(t, fi.JavaAgentCapability())
+}
+
+func TestFailedJavaReplacementRevokesPredecessorAuthorization(t *testing.T) {
+	originalFind := findJavaNamespacedPIDs
+	originalAuthorize := authorizeJavaProcessCapability
+	originalDeauthorize := deauthorizeJavaProcessCapability
+	originalSuspend := suspendJavaProcessAuthorization
+	t.Cleanup(func() {
+		findJavaNamespacedPIDs = originalFind
+		authorizeJavaProcessCapability = originalAuthorize
+		deauthorizeJavaProcessCapability = originalDeauthorize
+		suspendJavaProcessAuthorization = originalSuspend
+	})
+	var identityCalls atomic.Int32
+	findJavaNamespacedPIDs = func(app.PID) ([]app.PID, error) {
+		if identityCalls.Add(1) == 2 {
+			return nil, errors.New("injected replacement identity failure")
+		}
+		return nil, nil
+	}
+	var authorized uint64
+	authorizeJavaProcessCapability = func(
+		_ javabridge.Maps, _ javabridge.Identity, capability uint64,
+	) (bool, error) {
+		authorized = capability
+		return true, nil
+	}
+	var suspended []uint64
+	suspendJavaProcessAuthorization = func(
+		_ javabridge.Maps, _ javabridge.Identity, capability uint64,
+	) error {
+		suspended = append(suspended, capability)
+		if authorized == capability {
+			authorized = 0
+		}
+		return nil
+	}
+	deauthorizeJavaProcessCapability = func(
+		_ javabridge.Maps, _ javabridge.Identity, capability uint64, _ bool,
+	) error {
+		if authorized == capability {
+			authorized = 0
+		}
+		return nil
+	}
+
+	const pid = app.PID(9001)
+	key := javaAuthorizationKey{pid: pid, ns: 1234}
+	newFile := func(capability uint64) *exec.FileInfo {
+		fi := exec.New(exec.Init{
+			Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+		})
+		fi.SetJavaAgentCapability(capability)
+		return fi
+	}
+	predecessor := newFile(11)
+	replacement := newFile(22)
+	tracer := &Tracer{log: tlog(), javaRemoteParentEnabled: true}
+	tracer.bpfObjects.JavaAuthorizedProcesses = &ebpf.Map{}
+
+	tracer.authorizeJavaProcess(pid, key.ns, predecessor)
+	require.Equal(t, uint64(11), authorized)
+	tracer.authorizeJavaProcess(pid, key.ns, replacement)
+
+	assert.Zero(t, authorized, "failed B must not leave predecessor Q(A) live")
+	assert.Equal(t, []uint64{11}, suspended)
+	assert.Zero(t, predecessor.JavaAgentCapability())
+	assert.Zero(t, replacement.JavaAgentCapability())
+
+	tracer.deauthorizeJavaProcess(pid, key.ns, predecessor)
+	tracer.deauthorizeJavaProcess(pid, key.ns, replacement)
+	successor := newFile(33)
+	tracer.authorizeJavaProcess(pid, key.ns, successor)
+	require.Equal(t, uint64(33), authorized)
+	tracer.deauthorizeJavaProcess(pid, key.ns, successor)
+	assert.Zero(t, authorized)
+}
+
+func TestFailedJavaBlockDuringReplacementAttemptPreservesReplacement(t *testing.T) {
+	originalFind := findJavaNamespacedPIDs
+	originalAuthorize := authorizeJavaProcessCapability
+	originalSuspend := suspendJavaProcessAuthorization
+	originalTimeout := javaAuthorizationRetryTimeout
+	t.Cleanup(func() {
+		findJavaNamespacedPIDs = originalFind
+		authorizeJavaProcessCapability = originalAuthorize
+		suspendJavaProcessAuthorization = originalSuspend
+		javaAuthorizationRetryTimeout = originalTimeout
+	})
+	findJavaNamespacedPIDs = func(app.PID) ([]app.PID, error) { return nil, nil }
+	started := make(chan struct{})
+	release := make(chan struct{})
+	authorizeJavaProcessCapability = func(
+		_ javabridge.Maps, _ javabridge.Identity, capability uint64,
+	) (bool, error) {
+		if capability == 11 {
+			return false, errors.New("injected predecessor authorization failure")
+		}
+		close(started)
+		<-release
+		return true, nil
+	}
+	suspendJavaProcessAuthorization = func(
+		javabridge.Maps, javabridge.Identity, uint64,
+	) error {
+		return nil
+	}
+	javaAuthorizationRetryTimeout = 0
+
+	const pid = app.PID(9001)
+	key := javaAuthorizationKey{pid: pid, ns: 1234}
+	predecessor := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+	})
+	replacement := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+	})
+	tracer := &Tracer{log: tlog(), javaRemoteParentEnabled: true}
+	tracer.bpfObjects.JavaAuthorizedProcesses = &ebpf.Map{}
+	predecessor.SetJavaAgentCapability(11)
+	tracer.authorizeJavaProcess(pid, key.ns, predecessor)
+	replacement.SetJavaAgentCapability(22)
+
+	allowDone := make(chan struct{})
+	go func() {
+		defer close(allowDone)
+		tracer.authorizeJavaProcess(pid, key.ns, replacement)
+	}()
+	<-started
+	blockDone := make(chan struct{})
+	go func() {
+		defer close(blockDone)
+		tracer.deauthorizeJavaProcess(pid, key.ns, predecessor)
+	}()
+	close(release)
+	<-allowDone
+	<-blockDone
+
+	assert.Equal(t, uint64(22), replacement.JavaAgentCapability())
+	require.Len(t, tracer.javaAuthKeys[key], 1)
+	assert.Equal(t, uint64(22), tracer.javaAuthKeys[key][0].capability)
+}
+
+func TestOutOfOrderJavaAllowCompletionCannotOverwriteNewerEvent(t *testing.T) {
+	originalFind := findJavaNamespacedPIDs
+	originalAuthorize := authorizeJavaProcessCapability
+	t.Cleanup(func() {
+		findJavaNamespacedPIDs = originalFind
+		authorizeJavaProcessCapability = originalAuthorize
+	})
+	firstResolver := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var resolverCalls atomic.Int32
+	findJavaNamespacedPIDs = func(app.PID) ([]app.PID, error) {
+		if resolverCalls.Add(1) == 1 {
+			close(firstResolver)
+			<-releaseFirst
+		}
+		return nil, nil
+	}
+	var authorized []uint64
+	authorizeJavaProcessCapability = func(
+		_ javabridge.Maps, _ javabridge.Identity, capability uint64,
+	) (bool, error) {
+		authorized = append(authorized, capability)
+		return true, nil
+	}
+
+	const pid = app.PID(9001)
+	key := javaAuthorizationKey{pid: pid, ns: 1234}
+	predecessor := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+	})
+	replacement := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+	})
+	predecessor.SetJavaAgentCapability(11)
+	replacement.SetJavaAgentCapability(22)
+	tracer := &Tracer{log: tlog(), javaRemoteParentEnabled: true}
+	tracer.bpfObjects.JavaAuthorizedProcesses = &ebpf.Map{}
+
+	predecessorDone := make(chan struct{})
+	go func() {
+		defer close(predecessorDone)
+		tracer.authorizeJavaProcess(pid, key.ns, predecessor)
+	}()
+	<-firstResolver
+	assert.Zero(t, predecessor.JavaAgentCapability(),
+		"FileInfo gate must close before namespace resolution blocks")
+	tracer.authorizeJavaProcess(pid, key.ns, replacement)
+	close(releaseFirst)
+	<-predecessorDone
+
+	assert.Equal(t, []uint64{22}, authorized)
+	assert.Zero(t, predecessor.JavaAgentCapability())
+	assert.Equal(t, uint64(22), replacement.JavaAgentCapability())
+	require.Len(t, tracer.javaAuthKeys[key], 1)
+	assert.Equal(t, uint64(22), tracer.javaAuthKeys[key][0].capability)
+}
+
+func TestRemovedReplacementCannotMakeSupersededAllowCurrentAgain(t *testing.T) {
+	originalFind := findJavaNamespacedPIDs
+	originalAuthorize := authorizeJavaProcessCapability
+	t.Cleanup(func() {
+		findJavaNamespacedPIDs = originalFind
+		authorizeJavaProcessCapability = originalAuthorize
+	})
+	findJavaNamespacedPIDs = func(app.PID) ([]app.PID, error) { return nil, nil }
+	var authorized []uint64
+	authorizeJavaProcessCapability = func(
+		_ javabridge.Maps, _ javabridge.Identity, capability uint64,
+	) (bool, error) {
+		authorized = append(authorized, capability)
+		return true, nil
+	}
+
+	const pid = app.PID(9001)
+	const ns = uint32(1234)
+	key := javaAuthorizationKey{pid: pid, ns: ns}
+	predecessor := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+	})
+	replacement := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+	})
+	predecessor.SetJavaAgentCapability(11)
+	replacement.SetJavaAgentCapability(22)
+	tracer := &Tracer{log: tlog(), javaRemoteParentEnabled: true}
+	tracer.bpfObjects.JavaAuthorizedProcesses = &ebpf.Map{}
+
+	predecessorEvent, created := tracer.beginJavaAuthorizationEvent(key, predecessor)
+	require.True(t, created)
+	_, created = tracer.beginJavaAuthorizationEvent(key, replacement)
+	require.True(t, created)
+	tracer.deauthorizeJavaProcess(pid, ns, replacement)
+
+	tracer.authorizeJavaProcessForEvent(pid, ns, predecessor, predecessorEvent)
+
+	assert.Empty(t, authorized)
+	assert.Zero(t, predecessor.JavaAgentCapability())
+	require.Len(t, tracer.javaAuthEvents[key], 1)
+	assert.Same(t, predecessorEvent, tracer.javaAuthEvents[key][0])
+	assert.NotEqual(t, predecessorEvent.sequence, tracer.javaAuthLatest[key])
+}
+
+func TestContendedJavaAuthorizationDoesNotBlockUnrelatedDeletion(t *testing.T) {
+	originalFind := findJavaNamespacedPIDs
+	originalAuthorize := authorizeJavaProcessCapability
+	t.Cleanup(func() {
+		findJavaNamespacedPIDs = originalFind
+		authorizeJavaProcessCapability = originalAuthorize
+	})
+	findJavaNamespacedPIDs = func(app.PID) ([]app.PID, error) { return nil, nil }
+	started := make(chan struct{})
+	release := make(chan struct{})
+	authorizeJavaProcessCapability = func(
+		javabridge.Maps, javabridge.Identity, uint64,
+	) (bool, error) {
+		close(started)
+		<-release
+		return true, nil
+	}
+
+	const pid = app.PID(9001)
+	const ns = uint32(1234)
+	fi := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+	})
+	fi.SetJavaAgentCapability(11)
+	tracer := &Tracer{
+		log: tlog(), pidsFilter: &ebpfcommon.IdentityPidsFilter{},
+		javaRemoteParentEnabled: true,
+	}
+	tracer.bpfObjects.JavaAuthorizedProcesses = &ebpf.Map{}
+
+	allowDone := make(chan struct{})
+	go func() {
+		defer close(allowDone)
+		tracer.AllowPID(pid, ns, fi, fi)
+	}()
+	<-started
+
+	unrelated := exec.New(exec.Init{Pid: 42})
+	blockDone := make(chan struct{})
+	go func() {
+		defer close(blockDone)
+		tracer.BlockPID(42, ns, unrelated, unrelated)
+	}()
+	select {
+	case <-blockDone:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("unrelated BlockPID waited behind Java authorization")
+	}
+	close(release)
+	<-allowDone
+}
+
+func TestJavaPendingDeauthorizationDoesNotConsumeReplacementBlock(t *testing.T) {
+	originalFind := findJavaNamespacedPIDs
+	originalAuthorize := authorizeJavaProcessCapability
+	originalDeauthorize := deauthorizeJavaProcessCapability
+	t.Cleanup(func() {
+		findJavaNamespacedPIDs = originalFind
+		authorizeJavaProcessCapability = originalAuthorize
+		deauthorizeJavaProcessCapability = originalDeauthorize
+	})
+	findJavaNamespacedPIDs = func(app.PID) ([]app.PID, error) { return nil, nil }
+	authorizeJavaProcessCapability = func(
+		javabridge.Maps, javabridge.Identity, uint64,
+	) (bool, error) {
+		return true, nil
+	}
+	var removed []uint64
+	deauthorizeJavaProcessCapability = func(
+		_ javabridge.Maps, _ javabridge.Identity, capability uint64, _ bool,
+	) error {
+		removed = append(removed, capability)
+		if len(removed) == 1 {
+			return errors.New("transient deletion failure")
+		}
+		return nil
+	}
+
+	const pid = app.PID(9001)
+	key := javaAuthorizationKey{pid: pid, ns: 1234}
+	predecessor := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+	})
+	replacement := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+	})
+	predecessor.SetJavaAgentCapability(11)
+	tracer := &Tracer{
+		log: tlog(), javaRemoteParentEnabled: true,
+		javaAuthKeys: make(map[javaAuthorizationKey][]javaAuthorization),
+	}
+	tracer.bpfObjects.JavaAuthorizedProcesses = &ebpf.Map{}
+
+	tracer.authorizeJavaProcess(pid, key.ns, predecessor)
+	tracer.deauthorizeJavaProcess(pid, key.ns, predecessor)
+	require.Contains(t, tracer.javaDeauthPending, key)
+
+	replacement.SetJavaAgentCapability(22)
+	tracer.authorizeJavaProcess(pid, key.ns, replacement)
+	require.Len(t, tracer.javaAuthKeys[key], 1)
+	assert.Equal(t, uint64(22), tracer.javaAuthKeys[key][0].capability)
+
+	tracer.deauthorizeJavaProcess(pid, key.ns, replacement)
+	assert.Equal(t, []uint64{11, 22}, removed)
+	assert.NotContains(t, tracer.javaAuthKeys, key)
+	require.Contains(t, tracer.javaDeauthPending, key)
+
+	tracer.retryPendingJavaDeauthorizations()
+	assert.Equal(t, []uint64{11, 22, 11}, removed)
+	assert.NotContains(t, tracer.javaDeauthPending, key)
+}
+
+func TestJavaBlockCancelsAuthorizationWithoutWaitingForRetryLoop(t *testing.T) {
+	originalFind := findJavaNamespacedPIDs
+	originalAuthorize := authorizeJavaProcessCapability
+	originalDeauthorize := deauthorizeJavaProcessCapability
+	originalSuspend := suspendJavaProcessAuthorization
+	t.Cleanup(func() {
+		findJavaNamespacedPIDs = originalFind
+		authorizeJavaProcessCapability = originalAuthorize
+		deauthorizeJavaProcessCapability = originalDeauthorize
+		suspendJavaProcessAuthorization = originalSuspend
+	})
+	findJavaNamespacedPIDs = func(app.PID) ([]app.PID, error) { return nil, nil }
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var authorized atomic.Uint64
+	authorizeJavaProcessCapability = func(
+		_ javabridge.Maps, _ javabridge.Identity, capability uint64,
+	) (bool, error) {
+		close(started)
+		<-release
+		authorized.Store(capability)
+		return true, nil
+	}
+	deauthorizeJavaProcessCapability = func(
+		javabridge.Maps, javabridge.Identity, uint64, bool,
+	) error {
+		return nil
+	}
+	var suspensionCount atomic.Uint32
+	firstSuspension := make(chan struct{})
+	compensated := make(chan struct{})
+	suspendJavaProcessAuthorization = func(
+		_ javabridge.Maps, _ javabridge.Identity, capability uint64,
+	) error {
+		authorized.CompareAndSwap(capability, 0)
+		switch suspensionCount.Add(1) {
+		case 1:
+			close(firstSuspension)
+		case 2:
+			close(compensated)
+		}
+		return nil
+	}
+
+	const pid = app.PID(9001)
+	key := javaAuthorizationKey{pid: pid, ns: 1234}
+	fileInfo := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+	})
+	fileInfo.SetJavaAgentCapability(11)
+	tracer := &Tracer{
+		log: tlog(), javaRemoteParentEnabled: true,
+		javaAuthKeys: make(map[javaAuthorizationKey][]javaAuthorization),
+	}
+	tracer.bpfObjects.JavaAuthorizedProcesses = &ebpf.Map{}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		tracer.authorizeJavaProcess(pid, key.ns, fileInfo)
+	}()
+	<-started
+	blockDone := make(chan struct{})
+	go func() {
+		defer close(blockDone)
+		tracer.deauthorizeJavaProcess(pid, key.ns, fileInfo)
+	}()
+	<-firstSuspension
+	close(release)
+	<-compensated
+	<-blockDone
+	<-done
+
+	assert.Zero(t, authorized.Load(),
+		"stale authorization commit must be exactly suspended after Block")
+	assert.Equal(t, uint32(2), suspensionCount.Load(),
+		"Block and the stale post-call completion each need an exact suspension")
+	assert.Zero(t, fileInfo.JavaAgentCapability())
+	assert.NotContains(t, tracer.javaAuthKeys, key)
+}
+
+func TestJavaDisabledAuthorizationSerializesPublicAllowAndBlock(t *testing.T) {
+	originalFind := findJavaNamespacedPIDs
+	originalUpdate := updateJavaAuthorizedProcess
+	originalSuspend := suspendJavaProcessAuthorization
+	t.Cleanup(func() {
+		findJavaNamespacedPIDs = originalFind
+		updateJavaAuthorizedProcess = originalUpdate
+		suspendJavaProcessAuthorization = originalSuspend
+	})
+	findJavaNamespacedPIDs = func(app.PID) ([]app.PID, error) { return nil, nil }
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var authorized atomic.Uint64
+	updateJavaAuthorizedProcess = func(
+		_ *ebpf.Map, _ javabridge.Identity, capability uint64,
+	) error {
+		close(started)
+		<-release
+		authorized.Store(capability)
+		return nil
+	}
+	var suspensionCount atomic.Uint32
+	firstSuspension := make(chan struct{})
+	compensated := make(chan struct{})
+	suspendJavaProcessAuthorization = func(
+		_ javabridge.Maps, _ javabridge.Identity, capability uint64,
+	) error {
+		authorized.CompareAndSwap(capability, 0)
+		switch suspensionCount.Add(1) {
+		case 1:
+			close(firstSuspension)
+		case 2:
+			close(compensated)
+		}
+		return nil
+	}
+
+	const pid = app.PID(9001)
+	const ns = uint32(1234)
+	fileInfo := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+	})
+	fileInfo.SetJavaAgentCapability(11)
+	tracer := &Tracer{
+		log:                     tlog(),
+		pidsFilter:              &ebpfcommon.IdentityPidsFilter{},
+		javaRemoteParentEnabled: false,
+	}
+	tracer.bpfObjects.JavaAuthorizedProcesses = &ebpf.Map{}
+
+	tracer.AllowPID(pid, ns, fileInfo, fileInfo)
+	<-started
+	blockDone := make(chan struct{})
+	go func() {
+		defer close(blockDone)
+		tracer.BlockPID(pid, ns, fileInfo, fileInfo)
+	}()
+	<-firstSuspension
+	close(release)
+	<-compensated
+	<-blockDone
+	require.Eventually(t, func() bool {
+		tracer.javaAuthMu.Lock()
+		defer tracer.javaAuthMu.Unlock()
+		for _, event := range tracer.javaAuthEvents[javaAuthorizationKey{pid: pid, ns: ns}] {
+			if event.authorizing {
+				return false
+			}
+		}
+		return true
+	}, time.Second, time.Millisecond)
+
+	assert.Zero(t, authorized.Load(), "Block must remove a stale committed direct Q")
+	assert.Equal(t, uint32(2), suspensionCount.Load())
+	assert.Zero(t, fileInfo.JavaAgentCapability())
+	assert.Empty(t, tracer.javaAuthEvents)
+	assert.Empty(t, tracer.javaAuthKeys)
+}
+
+func TestJavaDisabledStalePublicationPreservesConfirmedReplacement(t *testing.T) {
+	originalFind := findJavaNamespacedPIDs
+	originalUpdate := updateJavaAuthorizedProcess
+	originalSuspend := suspendJavaProcessAuthorization
+	originalLock := lockJavaAuthorizationPublication
+	t.Cleanup(func() {
+		findJavaNamespacedPIDs = originalFind
+		updateJavaAuthorizedProcess = originalUpdate
+		suspendJavaProcessAuthorization = originalSuspend
+		lockJavaAuthorizationPublication = originalLock
+	})
+	findJavaNamespacedPIDs = func(app.PID) ([]app.PID, error) { return nil, nil }
+
+	var authorized atomic.Uint64
+	var updateCount atomic.Uint32
+	updateJavaAuthorizedProcess = func(
+		_ *ebpf.Map, _ javabridge.Identity, capability uint64,
+	) error {
+		updateCount.Add(1)
+		authorized.Store(capability)
+		return nil
+	}
+	suspendJavaProcessAuthorization = func(
+		_ javabridge.Maps, _ javabridge.Identity, capability uint64,
+	) error {
+		authorized.CompareAndSwap(capability, 0)
+		return nil
+	}
+
+	predecessorChecked := make(chan struct{})
+	releasePredecessor := make(chan struct{})
+	var lockCalls atomic.Uint32
+	lockJavaAuthorizationPublication = func(
+		coordinator *javaAuthorizationPublicationCoordinator,
+		key javaAuthorizationKey,
+	) func() {
+		if lockCalls.Add(1) == 1 {
+			close(predecessorChecked)
+			<-releasePredecessor
+		}
+		return coordinator.lock(key)
+	}
+
+	const pid = app.PID(9001)
+	const ns = uint32(1234)
+	key := javaAuthorizationKey{pid: pid, ns: ns}
+	newFile := func(capability uint64) *exec.FileInfo {
+		fi := exec.New(exec.Init{
+			Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+		})
+		fi.SetJavaAgentCapability(capability)
+		return fi
+	}
+	predecessor := newFile(11)
+	replacement := newFile(22)
+	tracer := &Tracer{log: tlog(), javaRemoteParentEnabled: false}
+	tracer.bpfObjects.JavaAuthorizedProcesses = &ebpf.Map{}
+
+	predecessorDone := make(chan struct{})
+	go func() {
+		defer close(predecessorDone)
+		tracer.authorizeJavaProcess(pid, ns, predecessor)
+	}()
+	select {
+	case <-predecessorChecked:
+	case <-time.After(time.Second):
+		close(releasePredecessor)
+		t.Fatal("predecessor did not reach the post-ownership publication boundary")
+	}
+
+	// Complete B while A is paused after its optimistic ownership check. The
+	// publication transaction must make A recheck before it can touch Q.
+	tracer.authorizeJavaProcess(pid, ns, replacement)
+	tracer.javaAuthMu.Lock()
+	events := tracer.javaAuthEvents[key]
+	replacementConfirmed := len(events) != 0 && events[len(events)-1].file == replacement &&
+		events[len(events)-1].confirmed
+	tracer.javaAuthMu.Unlock()
+	assert.True(t, replacementConfirmed, "replacement must confirm before predecessor resumes")
+	assert.Equal(t, uint64(22), authorized.Load())
+	assert.Equal(t, uint64(22), replacement.JavaAgentCapability())
+
+	close(releasePredecessor)
+	select {
+	case <-predecessorDone:
+	case <-time.After(time.Second):
+		t.Fatal("stale predecessor publication did not finish")
+	}
+
+	assert.Equal(t, uint32(1), updateCount.Load(), "stale A must not overwrite Q(B)")
+	assert.Equal(t, uint64(22), authorized.Load(), "Q must retain confirmed B")
+	assert.Zero(t, predecessor.JavaAgentCapability())
+	assert.Equal(t, uint64(22), replacement.JavaAgentCapability())
+	require.Len(t, tracer.javaAuthKeys[key], 1)
+	assert.Equal(t, uint64(22), tracer.javaAuthKeys[key][0].capability)
+}
+
+func TestJavaUnconfirmedAuthorizationRetriesExactSuspensionWithoutHistory(t *testing.T) {
+	originalFind := findJavaNamespacedPIDs
+	originalAuthorize := authorizeJavaProcessCapability
+	originalSuspend := suspendJavaProcessAuthorization
+	originalTimeout := javaAuthorizationRetryTimeout
+	t.Cleanup(func() {
+		findJavaNamespacedPIDs = originalFind
+		authorizeJavaProcessCapability = originalAuthorize
+		suspendJavaProcessAuthorization = originalSuspend
+		javaAuthorizationRetryTimeout = originalTimeout
+	})
+	findJavaNamespacedPIDs = func(app.PID) ([]app.PID, error) { return nil, nil }
+	authorizeJavaProcessCapability = func(
+		javabridge.Maps, javabridge.Identity, uint64,
+	) (bool, error) {
+		return false, errors.New("authorization commit is unknown")
+	}
+	javaAuthorizationRetryTimeout = 0
+	suspensions := 0
+	suspendJavaProcessAuthorization = func(
+		_ javabridge.Maps, _ javabridge.Identity, capability uint64,
+	) error {
+		assert.Equal(t, uint64(11), capability)
+		suspensions++
+		if suspensions == 1 {
+			return errors.New("suspension readback failed")
+		}
+		return nil
+	}
+
+	const pid = app.PID(9001)
+	key := javaAuthorizationKey{pid: pid, ns: 1234}
+	fileInfo := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+	})
+	fileInfo.SetJavaAgentCapability(11)
+	tracer := &Tracer{
+		log: tlog(), javaRemoteParentEnabled: true,
+		javaAuthKeys: make(map[javaAuthorizationKey][]javaAuthorization),
+	}
+	tracer.bpfObjects.JavaAuthorizedProcesses = &ebpf.Map{}
+
+	tracer.authorizeJavaProcess(pid, key.ns, fileInfo)
+
+	assert.Zero(t, fileInfo.JavaAgentCapability())
+	require.Contains(t, tracer.javaSuspendPending, key)
+	assert.NotContains(t, tracer.javaAuthKeys, key)
+
+	tracer.retryPendingJavaDeauthorizations()
+	assert.Equal(t, 2, suspensions)
+	assert.NotContains(t, tracer.javaSuspendPending, key)
+	require.Len(t, tracer.javaAuthEvents[key], 1,
+		"failed Allow must retain a tombstone for its paired Block")
+	assert.Contains(t, tracer.javaAuthVersions, key)
+
+	tracer.deauthorizeJavaProcess(pid, key.ns, fileInfo)
+	assert.NotContains(t, tracer.javaAuthEvents, key)
+	assert.NotContains(t, tracer.javaAuthVersions, key)
+}
+
+func TestJavaWorkerShutdownPrecedesResourceClose(t *testing.T) {
+	originalFind := findJavaNamespacedPIDs
+	originalAuthorize := authorizeJavaProcessCapability
+	originalSuspend := suspendJavaProcessAuthorization
+	t.Cleanup(func() {
+		findJavaNamespacedPIDs = originalFind
+		authorizeJavaProcessCapability = originalAuthorize
+		suspendJavaProcessAuthorization = originalSuspend
+	})
+	findJavaNamespacedPIDs = func(app.PID) ([]app.PID, error) { return nil, nil }
+
+	authorizationStarted := make(chan struct{})
+	releaseAuthorization := make(chan struct{})
+	operations := make(chan string, 3)
+	authorizeJavaProcessCapability = func(
+		javabridge.Maps, javabridge.Identity, uint64,
+	) (bool, error) {
+		close(authorizationStarted)
+		<-releaseAuthorization
+		operations <- "authorize"
+		return true, nil
+	}
+	suspendJavaProcessAuthorization = func(
+		javabridge.Maps, javabridge.Identity, uint64,
+	) error {
+		operations <- "suspend"
+		return nil
+	}
+
+	const pid = app.PID(9001)
+	const ns = uint32(1234)
+	fileInfo := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+	})
+	fileInfo.SetJavaAgentCapability(11)
+	tracer := &Tracer{
+		log: tlog(), pidsFilter: &ebpfcommon.IdentityPidsFilter{},
+		javaRemoteParentEnabled: true,
+	}
+	tracer.bpfObjects.JavaAuthorizedProcesses = &ebpf.Map{}
+	resourceCloser := newOrderedResourceCloser(
+		tracer.stopJavaWorkers,
+		testCloserFunc(func() error {
+			operations <- "close"
+			return nil
+		}),
+	)
+
+	tracer.AllowPID(pid, ns, fileInfo, fileInfo)
+	<-authorizationStarted
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- resourceCloser.Close() }()
+	select {
+	case err := <-closeDone:
+		close(releaseAuthorization)
+		t.Fatalf("resource close overtook the authorization worker: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseAuthorization)
+	require.NoError(t, <-closeDone)
+	assert.Equal(t, []string{"authorize", "suspend", "close"}, []string{
+		<-operations,
+		<-operations,
+		<-operations,
+	})
+	assert.Zero(t, fileInfo.JavaAgentCapability())
+}
+
+func TestPendingJavaDeauthorizationWorkerShutdownPrecedesResourceClose(t *testing.T) {
+	originalDeauthorize := deauthorizeJavaProcessCapability
+	originalInterval := javaDeauthorizationRetryInterval
+	t.Cleanup(func() {
+		deauthorizeJavaProcessCapability = originalDeauthorize
+		javaDeauthorizationRetryInterval = originalInterval
+	})
+	javaDeauthorizationRetryInterval = time.Millisecond
+
+	deauthorizationStarted := make(chan struct{})
+	releaseDeauthorization := make(chan struct{})
+	operations := make(chan string, 2)
+	deauthorizeJavaProcessCapability = func(
+		javabridge.Maps, javabridge.Identity, uint64, bool,
+	) error {
+		close(deauthorizationStarted)
+		<-releaseDeauthorization
+		operations <- "deauthorize"
+		return nil
+	}
+
+	key := javaAuthorizationKey{pid: 9001, ns: 1234}
+	authorization := javaAuthorization{
+		identity:   javabridge.Identity{TID: 9001, PID: 9001, Namespace: key.ns},
+		capability: 11,
+	}
+	tracer := &Tracer{
+		log: tlog(),
+		javaDeauthPending: map[javaAuthorizationKey]map[javaAuthorization]struct{}{
+			key: {authorization: {}},
+		},
+	}
+	tracer.bpfObjects.JavaAuthorizedProcesses = &ebpf.Map{}
+	require.True(t, tracer.startPendingJavaDeauthorizationWorker())
+	<-deauthorizationStarted
+	resourceCloser := newOrderedResourceCloser(
+		tracer.stopJavaWorkers,
+		testCloserFunc(func() error {
+			operations <- "close"
+			return nil
+		}),
+	)
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- resourceCloser.Close() }()
+	select {
+	case err := <-closeDone:
+		close(releaseDeauthorization)
+		t.Fatalf("resource close overtook the deauthorization worker: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseDeauthorization)
+	require.NoError(t, <-closeDone)
+	assert.Equal(t, []string{"deauthorize", "close"}, []string{
+		<-operations,
+		<-operations,
+	})
+}
+
+func TestJavaAuthorizationRetryWaitStopsOnCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan bool, 1)
+	go func() {
+		done <- waitJavaAuthorizationRetry(ctx, 11*time.Second)
+	}()
+	cancel()
+
+	select {
+	case completedInterval := <-done:
+		assert.False(t, completedInterval)
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("authorization retry did not stop promptly after cancellation")
+	}
+}
+
+func TestLateJavaAllowAndBlockFailClosedAfterShutdown(t *testing.T) {
+	originalAuthorize := authorizeJavaProcessCapability
+	t.Cleanup(func() { authorizeJavaProcessCapability = originalAuthorize })
+	var authorizationCalls atomic.Int32
+	authorizeJavaProcessCapability = func(
+		javabridge.Maps, javabridge.Identity, uint64,
+	) (bool, error) {
+		authorizationCalls.Add(1)
+		return true, nil
+	}
+
+	tracer := &Tracer{
+		log: tlog(), pidsFilter: &ebpfcommon.IdentityPidsFilter{},
+		javaRemoteParentEnabled: true,
+	}
+	tracer.bpfObjects.JavaAuthorizedProcesses = &ebpf.Map{}
+	tracer.stopJavaWorkers()
+
+	const pid = app.PID(9001)
+	const ns = uint32(1234)
+	allowed := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+	})
+	allowGeneration := allowed.PrepareJavaAgentCapability(11)
+	tracer.AllowPID(pid, ns, allowed, allowed)
+	capability, err := allowed.WaitJavaAgentAuthorizationGeneration(t.Context(), allowGeneration)
+	require.NoError(t, err)
+	assert.Zero(t, capability)
+
+	blocked := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+	})
+	blockGeneration := blocked.PrepareJavaAgentCapability(22)
+	tracer.BlockPID(pid, ns, blocked, blocked)
+	capability, err = blocked.WaitJavaAgentAuthorizationGeneration(t.Context(), blockGeneration)
+	require.NoError(t, err)
+	assert.Zero(t, capability)
+	assert.Zero(t, authorizationCalls.Load())
+	assert.Empty(t, tracer.javaAuthEvents)
+
+	parent := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid + 1,
+	})
+	parent.PrepareJavaAgentCapability(33)
+	childOwner := exec.New(exec.Init{Pid: pid + 2})
+	tracer.AllowPID(childOwner.Pid(), ns, parent, childOwner)
+	tracer.BlockPID(childOwner.Pid(), ns, parent, childOwner)
+	assert.Equal(t, uint64(33), parent.JavaAgentCapability(),
+		"a substituted child cannot fail the live parent's attachment gate during shutdown")
 }
 
 func TestJavaDataHookIsOptional(t *testing.T) {
@@ -182,6 +1614,25 @@ func TestJavaDataHookAttachResultPublishesReadiness(t *testing.T) {
 	disabled := &Tracer{cfg: &obi.Config{}, log: tlog()}
 	_, found := disabled.KProbes()["tcp_close/java_remote_parent"]
 	assert.False(t, found)
+}
+
+func TestJavaControlTailReadinessUsesExactBooleanState(t *testing.T) {
+	originalUpdate := updateJavaRemoteParentControlTailReadiness
+	t.Cleanup(func() { updateJavaRemoteParentControlTailReadiness = originalUpdate })
+
+	var states []uint32
+	updateJavaRemoteParentControlTailReadiness = func(_ *ebpf.Map, state uint32) error {
+		states = append(states, state)
+		return nil
+	}
+
+	tracer := &Tracer{log: tlog()}
+	tracer.bpfObjects.JavaRemoteParentControlTailReadiness = &ebpf.Map{}
+	tracer.setJavaRemoteParentControlTailReadiness(false)
+	tracer.setJavaRemoteParentControlTailReadiness(true)
+	tracer.setJavaRemoteParentControlTailReadiness(false)
+
+	assert.Equal(t, []uint32{0, 1, 0}, states)
 }
 
 func TestJavaRemoteParentRequiresSockOpsNetnsCookie(t *testing.T) {
@@ -520,10 +1971,11 @@ type fakeServiceFilter struct {
 	currentPIDsCalls *int
 }
 
-func (f fakeServiceFilter) AllowPID(app.PID, uint32, *exec.FileInfo, ebpfcommon.PIDType) {}
-func (f fakeServiceFilter) BlockPID(app.PID, uint32)                                     {}
-func (f fakeServiceFilter) ValidPID(app.PID, uint32, ebpfcommon.PIDType) bool            { return false }
-func (f fakeServiceFilter) Filter(inputSpans []request.Span) []request.Span              { return inputSpans }
+func (f fakeServiceFilter) AllowPID(app.PID, uint32, *exec.FileInfo, *exec.FileInfo, ebpfcommon.PIDType) {
+}
+func (f fakeServiceFilter) BlockPID(app.PID, uint32, *exec.FileInfo, *exec.FileInfo) {}
+func (f fakeServiceFilter) ValidPID(app.PID, uint32, ebpfcommon.PIDType) bool        { return false }
+func (f fakeServiceFilter) Filter(inputSpans []request.Span) []request.Span          { return inputSpans }
 func (f fakeServiceFilter) CurrentPIDs(ebpfcommon.PIDType) map[uint32]map[app.PID]svc.Attrs {
 	if f.currentPIDsCalls != nil {
 		(*f.currentPIDsCalls)++

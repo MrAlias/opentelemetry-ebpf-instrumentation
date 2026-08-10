@@ -39,7 +39,7 @@ func TestWatcher_Poll(t *testing.T) {
 		interval: time.Microsecond,
 		cfg:      &obi.Config{},
 		pidPorts: map[pidPort]ProcessAttrs{},
-		listProcesses: func(bool) (map[app.PID]ProcessAttrs, error) {
+		listProcesses: func(bool, map[app.PID]*processIdentityLease) (map[app.PID]ProcessAttrs, error) {
 			invocation++
 			switch invocation {
 			case 1:
@@ -123,6 +123,76 @@ func TestWatcher_Poll(t *testing.T) {
 	}
 }
 
+func TestWatcherCancellationUnblocksBackpressuredOutput(t *testing.T) {
+	first := ProcessAttrs{pid: 1}
+	second := ProcessAttrs{pid: 2}
+	polls := make(chan int, 2)
+	invocation := 0
+	output := msg.NewQueue[[]Event[ProcessAttrs]](msg.ChannelBufferLen(1))
+	blockedSubscriber := output.Subscribe()
+	acc := pollAccounter{
+		interval: time.Millisecond,
+		cfg:      &obi.Config{},
+		pids:     map[app.PID]ProcessAttrs{},
+		pidPorts: map[pidPort]ProcessAttrs{},
+		listProcesses: func(bool, map[app.PID]*processIdentityLease) (map[app.PID]ProcessAttrs, error) {
+			invocation++
+			polls <- invocation
+			if invocation == 1 {
+				return map[app.PID]ProcessAttrs{first.pid: first}, nil
+			}
+			return map[app.PID]ProcessAttrs{second.pid: second}, nil
+		},
+		executableReady: func(app.PID) (string, bool) { return "", true },
+		loadBPFWatcher: func(context.Context, *ebpfcommon.EBPFEventContext, *obi.Config, chan<- watcher.Event) error {
+			return nil
+		},
+		loadBPFLogger: func(context.Context, *ebpfcommon.EBPFEventContext, *obi.Config) error {
+			return nil
+		},
+		output: output,
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	exited := make(chan struct{})
+	go func() {
+		acc.run(ctx)
+		close(exited)
+	}()
+
+	assert.Equal(t, 1, testutil.ReadChannel(t, polls, testTimeout))
+	require.Eventually(t, func() bool { return len(blockedSubscriber) == 1 }, testTimeout, time.Millisecond)
+	assert.Equal(t, 2, testutil.ReadChannel(t, polls, testTimeout))
+
+	// The second delivery cannot fit in the subscriber. Cancellation must abort
+	// that send so run can execute its deferred cleanup and close the output.
+	cancel()
+	testutil.ReadChannel(t, exited, testTimeout)
+	assert.Empty(t, acc.pids, "cancellation must run the watcher's tracked-process cleanup")
+}
+
+func TestSnapshotDetectsNoGapPIDReuseByProcessStartTime(t *testing.T) {
+	const pid = app.PID(42)
+	oldProcess := ProcessAttrs{pid: pid, processStart: 100}
+	replacement := ProcessAttrs{pid: pid, processStart: 200}
+	acc := pollAccounter{
+		cfg:      &obi.Config{},
+		pids:     map[app.PID]ProcessAttrs{pid: oldProcess},
+		pidPorts: map[pidPort]ProcessAttrs{},
+		executableReady: func(app.PID) (string, bool) {
+			return "", true
+		},
+	}
+
+	events := acc.snapshot(map[app.PID]ProcessAttrs{pid: replacement})
+
+	require.Equal(t, []Event[ProcessAttrs]{
+		{Type: EventDeleted, Obj: oldProcess},
+		{Type: EventCreated, Obj: replacement},
+	}, events)
+	assert.Equal(t, replacement, acc.pids[pid])
+}
+
 func TestProcessNotReady(t *testing.T) {
 	// mocking a fake listProcesses method
 	p1 := ProcessAttrs{pid: 1, openPorts: []uint32{3030, 3031}}
@@ -135,7 +205,7 @@ func TestProcessNotReady(t *testing.T) {
 		interval: time.Microsecond,
 		cfg:      &obi.Config{},
 		pidPorts: map[pidPort]ProcessAttrs{},
-		listProcesses: func(bool) (map[app.PID]ProcessAttrs, error) {
+		listProcesses: func(bool, map[app.PID]*processIdentityLease) (map[app.PID]ProcessAttrs, error) {
 			return map[app.PID]ProcessAttrs{p1.pid: p1, p5.pid: p5, p2.pid: p2, p3.pid: p3, p4.pid: p4}, nil
 		},
 		executableReady: func(pid app.PID) (string, bool) {
@@ -149,7 +219,7 @@ func TestProcessNotReady(t *testing.T) {
 		},
 	}
 
-	procs, err := acc.listProcesses(true)
+	procs, err := acc.listProcesses(true, nil)
 	require.NoError(t, err)
 	assert.Len(t, procs, 5)
 	events := acc.snapshot(procs)
@@ -186,7 +256,7 @@ func TestPortsFetchRequired(t *testing.T) {
 		cfg:      cfg,
 		interval: time.Hour, // don't let the inner loop mess with our test
 		pidPorts: map[pidPort]ProcessAttrs{},
-		listProcesses: func(bool) (map[app.PID]ProcessAttrs, error) {
+		listProcesses: func(bool, map[app.PID]*processIdentityLease) (map[app.PID]ProcessAttrs, error) {
 			return nil, nil
 		},
 		executableReady: func(_ app.PID) (string, bool) {
@@ -259,6 +329,16 @@ func sort(events []Event[ProcessAttrs]) []Event[ProcessAttrs] {
 }
 
 func TestMinProcessAge(t *testing.T) {
+	originalAge := processAgeFunc
+	originalPIDs := processPidsFunc
+	originalIdentity := processIdentityForPIDFunc
+	originalValidation := validateProcessIdentityFunc
+	t.Cleanup(func() {
+		processAgeFunc = originalAge
+		processPidsFunc = originalPIDs
+		processIdentityForPIDFunc = originalIdentity
+		validateProcessIdentityFunc = originalValidation
+	})
 	count := 1
 	processAgeFunc = func(pid app.PID) time.Duration {
 		if pid == 3 {
@@ -271,6 +351,10 @@ func TestMinProcessAge(t *testing.T) {
 	processPidsFunc = func() ([]int32, error) {
 		return []int32{1, 2, 3}, nil
 	}
+	processIdentityForPIDFunc = func(app.PID) (*processIdentityLease, error) {
+		return nil, nil
+	}
+	validateProcessIdentityFunc = func(*processIdentityLease) error { return nil }
 
 	userConfig := bytes.NewBufferString("channel_buffer_len: 33")
 	t.Setenv("OTEL_EBPF_OPEN_PORT", "8080-8089")
@@ -284,7 +368,7 @@ func TestMinProcessAge(t *testing.T) {
 		cfg:      cfg,
 		interval: time.Hour, // don't let the inner loop mess with our test
 		pidPorts: map[pidPort]ProcessAttrs{},
-		listProcesses: func(bool) (map[app.PID]ProcessAttrs, error) {
+		listProcesses: func(bool, map[app.PID]*processIdentityLease) (map[app.PID]ProcessAttrs, error) {
 			return nil, nil
 		},
 		executableReady: func(_ app.PID) (string, bool) {
@@ -304,7 +388,7 @@ func TestMinProcessAge(t *testing.T) {
 		output:            msg.NewQueue[[]Event[ProcessAttrs]](msg.ChannelBufferLen(1)),
 	}
 
-	procs, err := fetchProcessPorts(false)
+	procs, err := fetchProcessPorts(false, nil)
 	require.NoError(t, err)
 	process, ok := procs[app.PID(1)]
 
@@ -319,7 +403,7 @@ func TestMinProcessAge(t *testing.T) {
 	assert.False(t, acc.processTooNew(process))
 
 	for range 10 {
-		procs, err = fetchProcessPorts(false)
+		procs, err = fetchProcessPorts(false, nil)
 		require.NoError(t, err)
 	}
 
@@ -341,7 +425,7 @@ func TestForgetPIDs_ReemitsExistingProcess(t *testing.T) {
 		cfg:      &obi.Config{},
 		pids:     map[app.PID]ProcessAttrs{},
 		pidPorts: map[pidPort]ProcessAttrs{},
-		listProcesses: func(bool) (map[app.PID]ProcessAttrs, error) {
+		listProcesses: func(bool, map[app.PID]*processIdentityLease) (map[app.PID]ProcessAttrs, error) {
 			return map[app.PID]ProcessAttrs{p1.pid: p1, p2.pid: p2}, nil
 		},
 		executableReady: func(app.PID) (string, bool) {
@@ -355,7 +439,7 @@ func TestForgetPIDs_ReemitsExistingProcess(t *testing.T) {
 		},
 		addedPIDsNotify: addedCh,
 	}
-	procs, err := acc.listProcesses(false)
+	procs, err := acc.listProcesses(false, nil)
 	require.NoError(t, err)
 	events := acc.snapshot(procs)
 	require.Len(t, events, 2)

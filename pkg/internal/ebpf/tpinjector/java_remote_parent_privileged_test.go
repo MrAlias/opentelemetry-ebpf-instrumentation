@@ -872,6 +872,7 @@ func assertValidTaskDiscard(
 		Owner:              generationOwner,
 		Generation:         generation,
 		ObservedMonotimeNs: observed,
+		ProcessIncarnation: capability,
 	}
 	require.NoError(t, maps.JavaRemoteParentTasks.Update(execution, task, ebpf.UpdateNoExist))
 	defer func() {
@@ -1152,6 +1153,7 @@ func assertConcurrentTakeIsOneShot(
 				Owner:              owner,
 				Generation:         generation,
 				ObservedMonotimeNs: observed,
+				ProcessIncarnation: capability,
 			}, ebpf.UpdateAny))
 	}
 	close(start)

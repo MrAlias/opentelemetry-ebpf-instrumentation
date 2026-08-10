@@ -25,30 +25,30 @@ import (
 
 type Tracer struct{}
 
-func New(_ *obi.Config, _ imetrics.Reporter) *Tracer                     { return nil }
-func (p *Tracer) AllowPID(_ app.PID, _ uint32, _ *exec.FileInfo)         {}
-func (p *Tracer) BlockPID(_ app.PID, _ uint32)                           {}
-func (p *Tracer) LoadSpecs() ([]*ebpfcommon.SpecBundle, error)           { return nil, nil }
-func (p *Tracer) AddCloser(_ ...io.Closer)                               {}
-func (p *Tracer) GoProbes() map[string][]*ebpfcommon.ProbeDesc           { return nil }
-func (p *Tracer) KProbes() map[string]ebpfcommon.ProbeDesc               { return nil }
-func (p *Tracer) UProbes() map[string]map[string][]*ebpfcommon.ProbeDesc { return nil }
-func (p *Tracer) USDTProbes() map[string][]*ebpfcommon.USDTProbeDesc     { return nil }
-func (p *Tracer) Tracepoints() map[string]ebpfcommon.ProbeDesc           { return nil }
-func (p *Tracer) SocketFilters() []*ebpf.Program                         { return nil }
-func (p *Tracer) SockMsgs() []ebpfcommon.SockMsg                         { return nil }
-func (p *Tracer) SockOps() []ebpfcommon.SockOps                          { return nil }
-func (p *Tracer) Iters() []*ebpfcommon.Iter                              { return nil }
-func (p *Tracer) Tracing() []*ebpfcommon.Tracing                         { return nil }
-func (p *Tracer) RecordInstrumentedLib(_ uint64, _ []io.Closer)          {}
-func (p *Tracer) AddInstrumentedLibRef(_ uint64)                         {}
-func (p *Tracer) UnlinkInstrumentedLib(_ uint64)                         {}
-func (p *Tracer) AlreadyInstrumentedLib(_ uint64) bool                   { return false }
+func New(_ *obi.Config, _ imetrics.Reporter) *Tracer                               { return nil }
+func (p *Tracer) AllowPID(_ app.PID, _ uint32, _ *exec.FileInfo, _ *exec.FileInfo) {}
+func (p *Tracer) BlockPID(_ app.PID, _ uint32, _ *exec.FileInfo, _ *exec.FileInfo) {}
+func (p *Tracer) LoadSpecs() ([]*ebpfcommon.SpecBundle, error)                     { return nil, nil }
+func (p *Tracer) AddCloser(_ ...io.Closer)                                         {}
+func (p *Tracer) GoProbes() map[string][]*ebpfcommon.ProbeDesc                     { return nil }
+func (p *Tracer) KProbes() map[string]ebpfcommon.ProbeDesc                         { return nil }
+func (p *Tracer) UProbes() map[string]map[string][]*ebpfcommon.ProbeDesc           { return nil }
+func (p *Tracer) USDTProbes() map[string][]*ebpfcommon.USDTProbeDesc               { return nil }
+func (p *Tracer) Tracepoints() map[string]ebpfcommon.ProbeDesc                     { return nil }
+func (p *Tracer) SocketFilters() []*ebpf.Program                                   { return nil }
+func (p *Tracer) SockMsgs() []ebpfcommon.SockMsg                                   { return nil }
+func (p *Tracer) SockOps() []ebpfcommon.SockOps                                    { return nil }
+func (p *Tracer) Iters() []*ebpfcommon.Iter                                        { return nil }
+func (p *Tracer) Tracing() []*ebpfcommon.Tracing                                   { return nil }
+func (p *Tracer) RecordInstrumentedLib(_ exec.FileID, _ []io.Closer)               {}
+func (p *Tracer) AddInstrumentedLibRef(_ exec.FileID)                              {}
+func (p *Tracer) UnlinkInstrumentedLib(_ exec.FileID)                              {}
+func (p *Tracer) AlreadyInstrumentedLib(_ exec.FileID) bool                        { return false }
 func (p *Tracer) Run(_ context.Context, _ *ebpfcommon.EBPFEventContext, _ *msg.Queue[[]request.Span]) {
 }
-func (p *Tracer) SetupTailCalls()                                     {}
-func (p *Tracer) RegisterOffsets(_ *exec.FileInfo, _ *goexec.Offsets) {}
-func (p *Tracer) ProcessBinary(_ *exec.FileInfo)                      {}
-func (p *Tracer) SetEventContext(_ *ebpfcommon.EBPFEventContext)      {}
-func (p *Tracer) Capabilities() ebpfcommon.TracerCapability           { return 0 }
-func (p *Tracer) Required() bool                                      { return false }
+func (p *Tracer) SetupTailCalls()                                           {}
+func (p *Tracer) RegisterOffsets(_ *exec.FileInfo, _ *goexec.Offsets) error { return nil }
+func (p *Tracer) ProcessBinary(_ *exec.FileInfo)                            {}
+func (p *Tracer) SetEventContext(_ *ebpfcommon.EBPFEventContext)            {}
+func (p *Tracer) Capabilities() ebpfcommon.TracerCapability                 { return 0 }
+func (p *Tracer) Required() bool                                            { return false }

@@ -868,13 +868,17 @@ java_remote_parent_tcp_close_main(struct pt_regs *ctx, struct sock *sk, long tim
         unreadable = is_conn_unreadable(&info.conn);
     }
 
-    force_sent_event(id, &sock_p, &info, unreadable);
+    force_sent_event_mode(id, &sock_p, &info, unreadable, 0);
 
     if (success) {
         //dbg_print_http_connection_info(&info.conn);
         info.pid = pid_from_pid_tgid(id);
-        terminate_http_request_if_needed(&info);
-        finish_ongoing_tcp_req(&info);
+        // The independently attached Java close hook fences this socket's
+        // exact generation. Keep heavyweight owner cleanup out of the
+        // baseline close program, where inlining the full lifecycle exceeds
+        // legacy verifier map limits; userspace converges the fenced generation.
+        terminate_http_request_if_needed_mode(&info, 0);
+        finish_ongoing_tcp_req_mode(&info, 0);
         bpf_map_delete_elem(&connection_tracker, &info.conn);
         const u64 netns_cookie = java_remote_parent_enabled ? sock_netns_cookie_from_sk(sk) : 0;
         delete_incoming_trace_in_netns_cookie(&info.conn, netns_cookie);
@@ -892,8 +896,9 @@ int BPF_KPROBE(obi_kprobe_tcp_close, struct sock *sk, long timeout) {
 }
 
 // Keep Java remote-parent terminal cleanup in an independently attached
-// tcp_close program. The baseline close probe is already at the verifier's
-// 64-map reference ceiling; separate attachment preserves that bound without
+// tcp_close program. Inlining exact generation cleanup into the baseline close
+// probe exceeds the verifier's 64-map reference limit; separate attachment
+// preserves that bound without
 // introducing a prog-array tail-call failure mode. Both programs are exact
 // and idempotent, so their kernel-defined attachment order is immaterial.
 SEC("kprobe/tcp_close")

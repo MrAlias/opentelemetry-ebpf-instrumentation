@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,6 +34,7 @@ type blockingTestAttacher struct {
 	initialized bool
 	cleaned     bool
 	deadline    bool
+	started     chan struct{}
 }
 
 type responseTestAttacher struct {
@@ -45,6 +47,55 @@ type lifecycleTestAttacher struct {
 	initCalls    int
 	attachCalls  int
 	cleanupCalls int
+}
+
+type exactTargetTestAttacher struct {
+	valid         atomic.Bool
+	bindCalls     atomic.Uint32
+	validateCalls atomic.Uint32
+	attachCalls   atomic.Uint32
+	closeCalls    atomic.Uint32
+	boundFromProc atomic.Bool
+	boundPID      int
+	boundStart    uint64
+}
+
+func (a *exactTargetTestAttacher) BindTarget(pid int, start uint64) error {
+	a.boundPID = pid
+	a.boundStart = start
+	a.bindCalls.Add(1)
+	a.valid.Store(true)
+	return nil
+}
+
+func (a *exactTargetTestAttacher) BindTargetFromProcFD(
+	pid int, start uint64, _ int,
+) error {
+	a.boundFromProc.Store(true)
+	return a.BindTarget(pid, start)
+}
+
+func (a *exactTargetTestAttacher) ValidateTarget() error {
+	a.validateCalls.Add(1)
+	if !a.valid.Load() {
+		return errors.New("prepared exact target exited")
+	}
+	return nil
+}
+
+func (a *exactTargetTestAttacher) CloseTarget() error {
+	a.closeCalls.Add(1)
+	return nil
+}
+
+func (*exactTargetTestAttacher) Init()          {}
+func (*exactTargetTestAttacher) Cleanup() error { return nil }
+
+func (a *exactTargetTestAttacher) AttachContext(
+	context.Context, int, []string, bool,
+) (io.ReadCloser, error) {
+	a.attachCalls.Add(1)
+	return nil, errors.New("unexpected attach to invalid exact target")
 }
 
 type testJavaAgentTarget struct {
@@ -69,6 +120,13 @@ func (t *testJavaAgentTarget) Close() error {
 
 func (a *responseTestAttacher) Init() {}
 
+func (a *responseTestAttacher) BindTarget(int, uint64) error { return nil }
+func (a *responseTestAttacher) BindTargetFromProcFD(int, uint64, int) error {
+	return nil
+}
+func (a *responseTestAttacher) ValidateTarget() error { return nil }
+func (a *responseTestAttacher) CloseTarget() error    { return nil }
+
 func (a *responseTestAttacher) Cleanup() error { return nil }
 
 func (a *responseTestAttacher) AttachContext(
@@ -84,6 +142,13 @@ func (a *lifecycleTestAttacher) Init() {
 	a.active = true
 	a.initCalls++
 }
+
+func (a *lifecycleTestAttacher) BindTarget(int, uint64) error { return nil }
+func (a *lifecycleTestAttacher) BindTargetFromProcFD(int, uint64, int) error {
+	return nil
+}
+func (a *lifecycleTestAttacher) ValidateTarget() error { return nil }
+func (a *lifecycleTestAttacher) CloseTarget() error    { return nil }
 
 func (a *lifecycleTestAttacher) Cleanup() error {
 	if !a.active {
@@ -112,6 +177,13 @@ func (a *blockingTestAttacher) Init() {
 	a.initialized = true
 }
 
+func (a *blockingTestAttacher) BindTarget(int, uint64) error { return nil }
+func (a *blockingTestAttacher) BindTargetFromProcFD(int, uint64, int) error {
+	return nil
+}
+func (a *blockingTestAttacher) ValidateTarget() error { return nil }
+func (a *blockingTestAttacher) CloseTarget() error    { return nil }
+
 func (a *blockingTestAttacher) Cleanup() error {
 	a.cleaned = true
 	return nil
@@ -121,6 +193,9 @@ func (a *blockingTestAttacher) AttachContext(
 	ctx context.Context, _ int, _ []string, _ bool,
 ) (io.ReadCloser, error) {
 	_, a.deadline = ctx.Deadline()
+	if a.started != nil {
+		close(a.started)
+	}
 	<-ctx.Done()
 	return nil, ctx.Err()
 }
@@ -144,24 +219,222 @@ func TestJavaInjectorAttachUsesConfiguredDeadlineAndCleansUp(t *testing.T) {
 	started := time.Now()
 	err := injector.NewExecutable(ie)
 	require.ErrorContains(t, err, "java attach timed out")
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.Less(t, time.Since(started), time.Second)
 	assert.True(t, attacher.initialized)
 	assert.True(t, attacher.deadline)
 	assert.True(t, attacher.cleaned)
 }
 
-func TestJavaInjectorPreparesStableProcessCapability(t *testing.T) {
+func TestJavaInjectorAttachPreservesCallerCancellation(t *testing.T) {
+	attacher := &blockingTestAttacher{started: make(chan struct{})}
+	originalFactory := newJavaAttacher
+	newJavaAttacher = func(*slog.Logger) javaAttacher { return attacher }
+	t.Cleanup(func() { newJavaAttacher = originalFactory })
+
+	injector := &JavaInjector{
+		cfg: &obi.Config{Java: obi.JavaConfig{Timeout: time.Minute}},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	ie := &ebpf.Instrumentable{
+		FileInfo: exec.New(exec.Init{Pid: 123}),
+		Type:     svc.InstrumentableJava,
+	}
+	ie.FileInfo.SetJavaAgentCapability(17)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() { result <- injector.NewExecutableContext(ctx, ie) }()
+	<-attacher.started
+	cancel()
+
+	err := <-result
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorContains(t, err, "java attach canceled")
+	require.NotContains(t, err.Error(), "timed out")
+	assert.True(t, attacher.initialized)
+	assert.True(t, attacher.deadline)
+	assert.True(t, attacher.cleaned)
+}
+
+func TestJavaInjectorPreparesFreshProcessCapabilityPerAttachment(t *testing.T) {
+	originalFactory := newJavaAttacher
+	newJavaAttacher = func(*slog.Logger) javaAttacher { return &responseTestAttacher{} }
+	t.Cleanup(func() { newJavaAttacher = originalFactory })
 	injector := &JavaInjector{}
 	ie := &ebpf.Instrumentable{
 		FileInfo: exec.New(exec.Init{Pid: 123}),
 		Type:     svc.InstrumentableJava,
 	}
 
-	require.NoError(t, injector.PrepareExecutable(ie))
+	first, err := injector.PrepareExecutable(ie)
+	require.NoError(t, err)
+	require.NotNil(t, first)
 	capability := ie.FileInfo.JavaAgentCapability()
 	require.NotZero(t, capability)
-	require.NoError(t, injector.PrepareExecutable(ie))
-	assert.Equal(t, capability, ie.FileInfo.JavaAgentCapability())
+	require.NoError(t, first.Close())
+	second, err := injector.PrepareExecutable(ie)
+	require.NoError(t, err)
+	require.NotNil(t, second)
+	t.Cleanup(func() { require.NoError(t, second.Close()) })
+	assert.NotZero(t, ie.FileInfo.JavaAgentCapability())
+	assert.NotEqual(t, capability, ie.FileInfo.JavaAgentCapability())
+}
+
+func TestJavaInjectorCapabilityGenerationFailureClosesRecycledAttachmentGate(t *testing.T) {
+	target := &exactTargetTestAttacher{}
+	originalFactory := newJavaAttacher
+	newJavaAttacher = func(*slog.Logger) javaAttacher { return target }
+	t.Cleanup(func() { newJavaAttacher = originalFactory })
+	originalRead := readJavaCapabilityRandom
+	t.Cleanup(func() { readJavaCapabilityRandom = originalRead })
+	readJavaCapabilityRandom = func([]byte) (int, error) {
+		return 0, errors.New("random source unavailable")
+	}
+	injector := &JavaInjector{}
+	ie := &ebpf.Instrumentable{
+		FileInfo: exec.New(exec.Init{Pid: 123}),
+		Type:     svc.InstrumentableJava,
+	}
+	ie.FileInfo.SetJavaAgentCapability(17)
+
+	prepared, err := injector.PrepareExecutable(ie)
+
+	assert.Nil(t, prepared)
+	require.ErrorContains(t, err, "random source unavailable")
+	assert.Zero(t, ie.FileInfo.JavaAgentCapability())
+	assert.Equal(t, uint32(1), target.closeCalls.Load())
+}
+
+func TestPreparedJavaTargetSurvivesAuthorizationWithoutNumericRebind(t *testing.T) {
+	target := &exactTargetTestAttacher{}
+	var factoryCalls atomic.Uint32
+	originalFactory := newJavaAttacher
+	newJavaAttacher = func(*slog.Logger) javaAttacher {
+		factoryCalls.Add(1)
+		return target
+	}
+	t.Cleanup(func() { newJavaAttacher = originalFactory })
+	originalStartTime := javaTargetProcessStartTime
+	javaTargetProcessStartTime = func(app.PID) (uint64, error) { return 77, nil }
+	t.Cleanup(func() { javaTargetProcessStartTime = originalStartTime })
+
+	injector := &JavaInjector{
+		cfg: &obi.Config{Java: obi.JavaConfig{Timeout: time.Second}},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	processHandle, err := os.Open("/proc/self")
+	require.NoError(t, err)
+	fileInfo := exec.New(exec.Init{
+		Pid:           123,
+		ProcessStart:  77,
+		ProcessHandle: processHandle,
+	})
+	t.Cleanup(func() { require.NoError(t, fileInfo.CloseProcessHandle()) })
+	ie := &ebpf.Instrumentable{FileInfo: fileInfo, Type: svc.InstrumentableJava}
+
+	prepared, err := injector.PrepareExecutable(ie)
+	require.NoError(t, err)
+	require.NotNil(t, prepared)
+	assert.Equal(t, uint32(1), factoryCalls.Load(), "target must be bound during preparation")
+	assert.Equal(t, uint32(1), target.bindCalls.Load())
+	assert.True(t, target.boundFromProc.Load())
+	assert.Equal(t, 123, target.boundPID)
+	assert.Equal(t, uint64(77), target.boundStart)
+
+	capability, generation := fileInfo.BeginJavaAgentAuthorization()
+	require.NotZero(t, capability)
+	require.NotZero(t, generation)
+	fileInfo.CompleteJavaAgentAuthorization(generation, capability)
+	// Model the prepared pidfd reporting that process A exited while the
+	// numeric PID and coarse /proc start tick now appear unchanged for B.
+	target.valid.Store(false)
+
+	err = prepared.NewExecutableContext(t.Context())
+	require.ErrorContains(t, err, "prepared exact target exited")
+	assert.Equal(t, uint32(1), factoryCalls.Load(), "readiness must not construct a successor attacher")
+	assert.Zero(t, target.attachCalls.Load(), "no attach command may reach a replacement target")
+	assert.Equal(t, uint32(1), target.closeCalls.Load())
+}
+
+func TestPreparedJavaTargetRequiresDiscoveryProcessHandle(t *testing.T) {
+	target := &exactTargetTestAttacher{}
+	originalFactory := newJavaAttacher
+	newJavaAttacher = func(*slog.Logger) javaAttacher { return target }
+	t.Cleanup(func() { newJavaAttacher = originalFactory })
+	originalStartTime := javaTargetProcessStartTime
+	javaTargetProcessStartTime = func(app.PID) (uint64, error) { return 77, nil }
+	t.Cleanup(func() { javaTargetProcessStartTime = originalStartTime })
+
+	injector := &JavaInjector{}
+	fileInfo := exec.New(exec.Init{Pid: 123, ProcessStart: 77})
+	prepared, err := injector.PrepareExecutable(&ebpf.Instrumentable{
+		FileInfo: fileInfo,
+		Type:     svc.InstrumentableJava,
+	})
+
+	require.Nil(t, prepared)
+	require.ErrorContains(t, err, "stable process handle is unavailable")
+	assert.Zero(t, target.bindCalls.Load())
+	assert.Zero(t, fileInfo.JavaAgentCapability())
+}
+
+func TestUnusedPreparedJavaTargetFailsReadinessClosedAndClosesOnce(t *testing.T) {
+	target := &exactTargetTestAttacher{}
+	originalFactory := newJavaAttacher
+	newJavaAttacher = func(*slog.Logger) javaAttacher { return target }
+	t.Cleanup(func() { newJavaAttacher = originalFactory })
+
+	injector := &JavaInjector{}
+	fileInfo := exec.New(exec.Init{Pid: 123})
+	ie := &ebpf.Instrumentable{FileInfo: fileInfo, Type: svc.InstrumentableJava}
+	prepared, err := injector.PrepareExecutable(ie)
+	require.NoError(t, err)
+	require.NotNil(t, prepared)
+
+	result := make(chan uint64, 1)
+	go func() {
+		capability, _ := fileInfo.WaitJavaAgentAuthorization(t.Context())
+		result <- capability
+	}()
+	require.NoError(t, prepared.Close())
+	assert.Zero(t, <-result)
+	assert.Zero(t, fileInfo.JavaAgentCapability())
+	require.NoError(t, prepared.Close())
+	assert.Equal(t, uint32(1), target.closeCalls.Load())
+}
+
+func TestJavaAttachGateIsProcessWideAndContextAware(t *testing.T) {
+	originalGate := javaAttachSerial
+	javaAttachSerial = make(chan struct{}, 1)
+	t.Cleanup(func() { javaAttachSerial = originalGate })
+
+	releaseFirst, err := acquireJavaAttach(t.Context())
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(t.Context())
+	secondResult := make(chan error, 1)
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		release, err := acquireJavaAttach(ctx)
+		if release != nil {
+			release()
+		}
+		secondResult <- err
+	}()
+	<-started
+	select {
+	case err := <-secondResult:
+		t.Fatalf("second process-wide attach entered while the gate was held: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	cancel()
+	require.ErrorIs(t, <-secondResult, context.Canceled)
+	releaseFirst()
+
+	releaseSecond, err := acquireJavaAttach(t.Context())
+	require.NoError(t, err)
+	releaseSecond()
 }
 
 func TestAttachOptionsIncludeProcessCapability(t *testing.T) {

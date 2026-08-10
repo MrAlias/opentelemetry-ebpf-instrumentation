@@ -8,6 +8,7 @@ package generictracer_test
 import (
 	"bytes"
 	_ "embed"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -253,8 +254,12 @@ func TestBPFProgramsStayWithinVerifierMapLimit(t *testing.T) {
 	tcpClose := spec.Programs["obi_kprobe_tcp_close"]
 	require.NotNil(t, tcpClose)
 	references := referencedProgramMaps(spec, tcpClose)
-	require.Len(t, references, verifierMapLimit)
-	require.Contains(t, references, "java_remote_parent_alias_replays")
+	require.LessOrEqual(t, len(references), verifierMapLimit)
+	// Exact Java generation cleanup runs in the independently attached close
+	// program. Keeping its lifecycle maps out of the baseline probe preserves
+	// verifier headroom for the ordinary HTTP/TCP close path.
+	require.NotContains(t, references, "java_remote_parent_alias_replays")
+	require.NotContains(t, references, "java_remote_parent_state")
 	require.NotContains(t, references, "jrp_recv_cur")
 	require.NotContains(t, references, "jrp_recv_guard")
 
@@ -374,7 +379,6 @@ func TestJavaRemoteParentIoctlFitsLegacyCombinedStack(t *testing.T) {
 			require.NoError(t, err)
 			program := spec.Programs[root]
 			require.NotNil(t, program)
-
 			frames, err := legacyBPFFrames(program.Instructions)
 			require.NoError(t, err)
 			rootFrame := frames[root]
@@ -431,6 +435,226 @@ func TestJavaRemoteParentIoctlFitsLegacyCombinedStack(t *testing.T) {
 						legacyBPFStackLimit-combined,
 						strings.Join(path, " -> "),
 					)
+				})
+			}
+		})
+	}
+}
+
+func TestJavaRemoteParentControlCarriersFitLegacyCombinedStack(t *testing.T) {
+	const (
+		root         = "obi_kprobe_sys_ioctl"
+		control      = "handle_java_control_ioctl"
+		legacyThread = "handle_java_legacy_threads_ioctl"
+		remoteThread = "handle_java_remote_threads_ioctl"
+		threadTail   = "obi_java_threads_tail"
+		marker       = "handle_java_thread_mapping_action"
+	)
+	controlBranches := []string{
+		"handle_java_task_cancel_ioctl",
+		"handle_java_task_unlink_ioctl",
+		legacyThread,
+		"handle_java_legacy_task_link_ioctl",
+	}
+	tailPrograms := []string{
+		"obi_java_task_capture_tail",
+		"obi_java_task_relay_capture_tail",
+		"obi_java_task_link_tail",
+		"obi_java_control_cleanup_tail",
+		threadTail,
+	}
+
+	for _, object := range []struct {
+		name string
+		data []byte
+	}{
+		{name: "bpf_x86_bpfel.o", data: legacyBPFX86Object},
+		{name: "bpf_arm64_bpfel.o", data: legacyBPFARM64Object},
+	} {
+		t.Run(object.name, func(t *testing.T) {
+			spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(object.data))
+			require.NoError(t, err)
+			program := spec.Programs[root]
+			require.NotNil(t, program)
+			frames, err := legacyBPFFrames(program.Instructions)
+			require.NoError(t, err)
+			require.Contains(t, frames[root].calls, control)
+			require.Contains(t, frames[root].calls, "prepare_java_control_tail")
+			require.Contains(t, frames[root].calls, "prepare_java_control_cleanup_tail")
+			require.Contains(t, frames[root].calls, "java_control_tail_dispatch_missed")
+			for _, branch := range controlBranches {
+				require.Contains(t, frames[control].calls, branch)
+			}
+			remoteProgram := spec.Programs[threadTail]
+			require.NotNil(t, remoteProgram)
+			remoteFrames, err := legacyBPFFrames(remoteProgram.Instructions)
+			require.NoError(t, err)
+			require.Contains(t, remoteFrames[threadTail].calls, remoteThread)
+			require.Contains(t, remoteFrames[remoteThread].calls, marker)
+			callPointerParams := make(legacyBPFCallPointerParams, len(frames))
+			for name, frame := range frames {
+				callPointerParams[name] = frame.pointerParams
+			}
+			measure := func(name string, stackParams [5]bool) int {
+				frame := frames[name]
+				require.NotNil(t, frame)
+				depth, err := legacyBPFFrameStackDepthWithCalls(
+					program.Instructions[frame.start:frame.end],
+					stackParams,
+					callPointerParams,
+					false,
+				)
+				require.NoError(t, err)
+				return legacyBPFRoundedFrame(depth)
+			}
+
+			rootDepth := measure(root, [5]bool{})
+			controlDepth := measure(control, [5]bool{})
+			for _, branch := range []string{
+				"prepare_java_control_tail",
+				"prepare_java_control_cleanup_tail",
+				"java_control_tail_dispatch_missed",
+			} {
+				t.Run(branch, func(t *testing.T) {
+					child, childPath, err := legacyBPFCombinedStackWithAncestor(
+						program.Instructions, branch, rootDepth, 1,
+					)
+					require.NoError(t, err)
+					combined := rootDepth + child
+					path := append(
+						[]string{fmt.Sprintf("%s(%d)", root, rootDepth)},
+						childPath...,
+					)
+					t.Logf(
+						"legacy %s dispatch stack %d bytes (margin %d): %s",
+						branch,
+						combined,
+						legacyBPFStackLimit-combined,
+						strings.Join(path, " -> "),
+					)
+					require.LessOrEqualf(
+						t,
+						combined,
+						legacyBPFStackBudget,
+						"legacy %s dispatch stack %d exceeds %d-byte budget (kernel limit %d, margin %d); path: %s",
+						branch,
+						combined,
+						legacyBPFStackBudget,
+						legacyBPFStackLimit,
+						legacyBPFStackLimit-combined,
+						strings.Join(path, " -> "),
+					)
+				})
+			}
+			ancestorDepth := rootDepth + controlDepth
+			for _, branch := range controlBranches {
+				t.Run(branch, func(t *testing.T) {
+					child, childPath, err := legacyBPFCombinedStackWithAncestor(
+						program.Instructions, branch, ancestorDepth, 2,
+					)
+					require.NoError(t, err)
+					combined := ancestorDepth + child
+					path := append(
+						[]string{
+							fmt.Sprintf("%s(%d)", root, rootDepth),
+							fmt.Sprintf("%s(%d)", control, controlDepth),
+						},
+						childPath...,
+					)
+					t.Logf(
+						"legacy %s carrier stack %d bytes (margin %d): %s",
+						branch,
+						combined,
+						legacyBPFStackLimit-combined,
+						strings.Join(path, " -> "),
+					)
+					require.LessOrEqualf(
+						t,
+						combined,
+						legacyBPFStackBudget,
+						"legacy %s carrier stack %d exceeds %d-byte budget (kernel limit %d, margin %d); path: %s",
+						branch,
+						combined,
+						legacyBPFStackBudget,
+						legacyBPFStackLimit,
+						legacyBPFStackLimit-combined,
+						strings.Join(path, " -> "),
+					)
+				})
+			}
+
+			// A successful tail call resets the verifier stack. Measure each
+			// carrier transaction from its own program root, while the generic
+			// ioctl test above independently covers parser preflight and miss
+			// cleanup in the originating syscall program.
+			for _, tailProgram := range tailPrograms {
+				t.Run(tailProgram, func(t *testing.T) {
+					target := spec.Programs[tailProgram]
+					require.NotNil(t, target)
+					combined, path, err := legacyBPFCombinedStack(
+						target.Instructions, tailProgram,
+					)
+					require.NoError(t, err)
+					t.Logf(
+						"legacy %s carrier stack %d bytes (margin %d): %s",
+						tailProgram,
+						combined,
+						legacyBPFStackLimit-combined,
+						strings.Join(path, " -> "),
+					)
+					require.LessOrEqualf(
+						t,
+						combined,
+						legacyBPFStackBudget,
+						"legacy %s carrier stack %d exceeds %d-byte budget (kernel limit %d, margin %d); path: %s",
+						tailProgram,
+						combined,
+						legacyBPFStackBudget,
+						legacyBPFStackLimit,
+						legacyBPFStackLimit-combined,
+						strings.Join(path, " -> "),
+					)
+				})
+			}
+		})
+	}
+}
+
+func TestJavaRemoteParentIoctlParserTailCallsStayInEntryFrame(t *testing.T) {
+	for _, root := range []string{
+		"obi_kprobe_security_file_ioctl",
+		"obi_kprobe_sys_ioctl",
+	} {
+		t.Run(root, func(t *testing.T) {
+			for _, object := range []struct {
+				name string
+				data []byte
+			}{
+				{name: "bpf_x86_bpfel.o", data: legacyBPFX86Object},
+				{name: "bpf_arm64_bpfel.o", data: legacyBPFARM64Object},
+			} {
+				t.Run(object.name, func(t *testing.T) {
+					spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(object.data))
+					require.NoError(t, err)
+					program := spec.Programs[root]
+					require.NotNil(t, program)
+
+					frames, err := legacyBPFFrames(program.Instructions)
+					require.NoError(t, err)
+					rootFrame := frames[root]
+					require.NotNil(t, rootFrame)
+					require.True(t, rootFrame.hasTailCall, "entry frame must dispatch prepared Java data")
+
+					for name, frame := range frames {
+						if name == root {
+							continue
+						}
+						require.Falsef(
+							t, frame.hasTailCall,
+							"subprogram %q must return preparation status to the entry frame before dispatch",
+							name,
+						)
+					}
 				})
 			}
 		})
@@ -822,8 +1046,14 @@ func legacyBPFFrames(instructions asm.Instructions) (map[string]*legacyBPFFrame,
 				)
 			}
 			for parameter, definition := range prototype.Params {
-				_, current.pointerParams[parameter] =
-					btf.UnderlyingType(definition.Type).(*btf.Pointer)
+				_, current.pointerParams[parameter] = btf.UnderlyingType(definition.Type).(*btf.Pointer)
+			}
+			// Registers beyond the declared prototype are ignored by the
+			// callee. Clang may leave a caller-stack pointer in one of those
+			// scratch argument registers; accepting it cannot expose caller
+			// memory because the callee has no parameter through which to use it.
+			for parameter := len(prototype.Params); parameter < len(current.pointerParams); parameter++ {
+				current.pointerParams[parameter] = true
 			}
 			frames[function.Name] = current
 		}
@@ -857,7 +1087,7 @@ func legacyBPFFrames(instructions asm.Instructions) (map[string]*legacyBPFFrame,
 		}
 	}
 	if current == nil {
-		return nil, fmt.Errorf("BPF program has no function metadata")
+		return nil, errors.New("BPF program has no function metadata")
 	}
 	current.end = len(instructions)
 
@@ -906,7 +1136,7 @@ func legacyBPFFrameStackDepthWithCalls(
 	taintExternalLoads bool,
 ) (int, error) {
 	if len(instructions) == 0 {
-		return 0, fmt.Errorf("empty function")
+		return 0, errors.New("empty function")
 	}
 
 	rawPC := make([]int, len(instructions))
@@ -925,8 +1155,7 @@ func legacyBPFFrameStackDepthWithCalls(
 	states[0].frameOffsets[asm.RFP] = map[int]struct{}{0: {}}
 	for parameter, pointer := range pointerParams {
 		if pointer {
-			states[0].externalOffsets[asm.R1+asm.Register(parameter)] =
-				map[int]struct{}{0: {}}
+			states[0].externalOffsets[asm.R1+asm.Register(parameter)] = map[int]struct{}{0: {}}
 		}
 	}
 	depth := 0
@@ -952,13 +1181,14 @@ func legacyBPFFrameStackDepthWithCalls(
 		}
 
 		successors := make([]int, 0, 2)
-		if instruction.IsBuiltinCall() && instruction.Constant == int64(asm.FnTailCall) {
+		switch {
+		case instruction.IsBuiltinCall() && instruction.Constant == int64(asm.FnTailCall):
 			// The successful edge does not return through this function and its
 			// target is verified separately. Only helper failure falls through here.
 			if index+1 < len(instructions) {
 				successors = append(successors, index+1)
 			}
-		} else if instruction.OpCode.Class().IsJump() {
+		case instruction.OpCode.Class().IsJump():
 			switch instruction.OpCode.JumpOp() {
 			case asm.Exit:
 				continue
@@ -982,7 +1212,7 @@ func legacyBPFFrameStackDepthWithCalls(
 					successors = append(successors, index+1)
 				}
 			}
-		} else if index+1 < len(instructions) {
+		case index+1 < len(instructions):
 			successors = append(successors, index+1)
 		}
 
@@ -1019,8 +1249,7 @@ func legacyBPFApplyInstruction(
 		if err := legacyBPFRecordAccess(state, instruction.Src, int(instruction.Offset), depth); err != nil {
 			return err
 		}
-		frameOffsets, externalOffsets, possibleStackPointer, err :=
-			legacyBPFLoadStackPointer(state, instruction)
+		frameOffsets, externalOffsets, possibleStackPointer, err := legacyBPFLoadStackPointer(state, instruction)
 		if err != nil {
 			return err
 		}
@@ -1056,7 +1285,7 @@ func legacyBPFApplyInstruction(
 		if legacyBPFRegisterHasPointer(state, instruction.Dst) ||
 			(instruction.OpCode.Source() == asm.RegSource &&
 				legacyBPFRegisterHasPointer(state, instruction.Src)) {
-			return fmt.Errorf("32-bit ALU operation on a frame-derived pointer")
+			return errors.New("32-bit ALU operation on a frame-derived pointer")
 		}
 		state.frameOffsets[instruction.Dst] = nil
 		state.externalOffsets[instruction.Dst] = nil
@@ -1111,7 +1340,7 @@ func legacyBPFApplyInstruction(
 	}
 	if class.IsJump() && instruction.OpCode.JumpOp() == asm.Exit &&
 		(legacyBPFRegisterHasPointer(state, asm.R0) || state.possibleStackPointer[asm.R0]) {
-		return fmt.Errorf("returns a derived pointer")
+		return errors.New("returns a derived pointer")
 	}
 	legacyBPFRecordStateDepth(state.frameOffsets, depth)
 	return nil
@@ -1119,21 +1348,17 @@ func legacyBPFApplyInstruction(
 
 func legacyBPFApplyALU64(state *legacyBPFFrameState, instruction *asm.Instruction) error {
 	if instruction.Dst == asm.RFP {
-		return fmt.Errorf("writes frame pointer")
+		return errors.New("writes frame pointer")
 	}
 	sourceIsRegister := instruction.OpCode.Source() == asm.RegSource
 	switch instruction.OpCode.ALUOp() {
 	case asm.Mov:
 		if sourceIsRegister {
-			state.frameOffsets[instruction.Dst] =
-				legacyBPFCloneOffsets(state.frameOffsets[instruction.Src])
-			state.externalOffsets[instruction.Dst] =
-				legacyBPFCloneOffsets(state.externalOffsets[instruction.Src])
-			state.constants[instruction.Dst] =
-				legacyBPFCloneOffsets(state.constants[instruction.Src])
+			state.frameOffsets[instruction.Dst] = legacyBPFCloneOffsets(state.frameOffsets[instruction.Src])
+			state.externalOffsets[instruction.Dst] = legacyBPFCloneOffsets(state.externalOffsets[instruction.Src])
+			state.constants[instruction.Dst] = legacyBPFCloneOffsets(state.constants[instruction.Src])
 			state.constantKnown[instruction.Dst] = state.constantKnown[instruction.Src]
-			state.possibleStackPointer[instruction.Dst] =
-				state.possibleStackPointer[instruction.Src]
+			state.possibleStackPointer[instruction.Dst] = state.possibleStackPointer[instruction.Src]
 		} else {
 			state.frameOffsets[instruction.Dst] = nil
 			state.externalOffsets[instruction.Dst] = nil
@@ -1144,17 +1369,18 @@ func legacyBPFApplyALU64(state *legacyBPFFrameState, instruction *asm.Instructio
 	case asm.Add, asm.Sub:
 		if state.possibleStackPointer[instruction.Dst] ||
 			(sourceIsRegister && state.possibleStackPointer[instruction.Src]) {
-			return fmt.Errorf("arithmetic on a possible caller-stack pointer loaded through a parameter")
+			return errors.New("arithmetic on a possible caller-stack pointer loaded through a parameter")
 		}
 		if sourceIsRegister {
 			destinationPointer := legacyBPFRegisterHasPointer(state, instruction.Dst)
 			sourcePointer := legacyBPFRegisterHasPointer(state, instruction.Src)
 			if destinationPointer && sourcePointer {
-				return fmt.Errorf("arithmetic combines two derived pointers")
+				return errors.New("arithmetic combines two derived pointers")
 			}
-			if destinationPointer {
+			switch {
+			case destinationPointer:
 				if !state.constantKnown[instruction.Src] {
-					return fmt.Errorf("derived pointer arithmetic uses an unknown register")
+					return errors.New("derived pointer arithmetic uses an unknown register")
 				}
 				sign := 1
 				if instruction.OpCode.ALUOp() == asm.Sub {
@@ -1168,12 +1394,12 @@ func legacyBPFApplyALU64(state *legacyBPFFrameState, instruction *asm.Instructio
 				)
 				state.constants[instruction.Dst] = nil
 				state.constantKnown[instruction.Dst] = false
-			} else if sourcePointer {
+			case sourcePointer:
 				if instruction.OpCode.ALUOp() == asm.Sub {
-					return fmt.Errorf("subtracts a derived pointer from a scalar")
+					return errors.New("subtracts a derived pointer from a scalar")
 				}
 				if !state.constantKnown[instruction.Dst] {
-					return fmt.Errorf("derived pointer arithmetic uses an unknown register")
+					return errors.New("derived pointer arithmetic uses an unknown register")
 				}
 				state.frameOffsets[instruction.Dst] = legacyBPFCombineOffsets(
 					state.frameOffsets[instruction.Src], state.constants[instruction.Dst], 1,
@@ -1183,7 +1409,7 @@ func legacyBPFApplyALU64(state *legacyBPFFrameState, instruction *asm.Instructio
 				)
 				state.constants[instruction.Dst] = nil
 				state.constantKnown[instruction.Dst] = false
-			} else {
+			default:
 				if state.constantKnown[instruction.Dst] && state.constantKnown[instruction.Src] {
 					sign := 1
 					if instruction.OpCode.ALUOp() == asm.Sub {
@@ -1204,29 +1430,27 @@ func legacyBPFApplyALU64(state *legacyBPFFrameState, instruction *asm.Instructio
 			if instruction.OpCode.ALUOp() == asm.Sub {
 				delta = -delta
 			}
-			if legacyBPFRegisterHasPointer(state, instruction.Dst) {
-				state.frameOffsets[instruction.Dst] =
-					legacyBPFAdjustOffsets(state.frameOffsets[instruction.Dst], delta)
-				state.externalOffsets[instruction.Dst] =
-					legacyBPFAdjustOffsets(state.externalOffsets[instruction.Dst], delta)
+			switch {
+			case legacyBPFRegisterHasPointer(state, instruction.Dst):
+				state.frameOffsets[instruction.Dst] = legacyBPFAdjustOffsets(state.frameOffsets[instruction.Dst], delta)
+				state.externalOffsets[instruction.Dst] = legacyBPFAdjustOffsets(state.externalOffsets[instruction.Dst], delta)
 				state.constants[instruction.Dst] = nil
 				state.constantKnown[instruction.Dst] = false
-			} else if state.constantKnown[instruction.Dst] {
-				state.constants[instruction.Dst] =
-					legacyBPFAdjustOffsets(state.constants[instruction.Dst], delta)
-			} else {
+			case state.constantKnown[instruction.Dst]:
+				state.constants[instruction.Dst] = legacyBPFAdjustOffsets(state.constants[instruction.Dst], delta)
+			default:
 				state.constants[instruction.Dst] = nil
 			}
 		}
 		for offset := range state.externalOffsets[instruction.Dst] {
 			if offset < 0 {
-				return fmt.Errorf("negative arithmetic on an external pointer parameter")
+				return errors.New("negative arithmetic on an external pointer parameter")
 			}
 		}
 	default:
 		if legacyBPFRegisterHasPointer(state, instruction.Dst) ||
 			(sourceIsRegister && legacyBPFRegisterHasPointer(state, instruction.Src)) {
-			return fmt.Errorf("unsupported ALU operation on a frame-derived pointer")
+			return errors.New("unsupported ALU operation on a frame-derived pointer")
 		}
 		state.frameOffsets[instruction.Dst] = nil
 		state.externalOffsets[instruction.Dst] = nil
@@ -1252,14 +1476,14 @@ func legacyBPFRecordAccess(
 		return fmt.Errorf("invalid memory-base register %s", register)
 	}
 	if state.possibleStackPointer[register] {
-		return fmt.Errorf("dereferences a possible caller-stack pointer loaded through a parameter")
+		return errors.New("dereferences a possible caller-stack pointer loaded through a parameter")
 	}
 	for base := range state.frameOffsets[register] {
 		legacyBPFRecordOffset(base+offset, depth)
 	}
 	for base := range state.externalOffsets[register] {
 		if base+offset < 0 {
-			return fmt.Errorf("negative access through an external pointer parameter")
+			return errors.New("negative access through an external pointer parameter")
 		}
 	}
 	return nil
@@ -1308,13 +1532,13 @@ func legacyBPFStoreStackPointer(
 		return nil
 	}
 	if instruction.OpCode.Size() != asm.DWord {
-		return fmt.Errorf("stores a derived pointer with non-DWord width")
+		return errors.New("stores a derived pointer with non-DWord width")
 	}
 	if len(state.externalOffsets[instruction.Dst]) > 0 {
-		return fmt.Errorf("stores a derived pointer outside the current stack frame")
+		return errors.New("stores a derived pointer outside the current stack frame")
 	}
 	if len(state.frameOffsets[instruction.Dst]) == 0 {
-		return fmt.Errorf("stores a derived pointer outside the current stack frame")
+		return errors.New("stores a derived pointer outside the current stack frame")
 	}
 	if state.stackPointers == nil {
 		state.stackPointers = make(map[int]legacyBPFSpilledPointer)
@@ -1367,7 +1591,7 @@ func legacyBPFLoadStackPointer(
 	}
 	if len(frameOffsets) > legacyBPFMaxRegisterOffsets ||
 		len(externalOffsets) > legacyBPFMaxRegisterOffsets {
-		return nil, nil, false, fmt.Errorf("too many pointer offsets loaded from stack")
+		return nil, nil, false, errors.New("too many pointer offsets loaded from stack")
 	}
 	return frameOffsets, externalOffsets, possibleStackPointer, nil
 }
@@ -1718,6 +1942,7 @@ func assertSharedMapSpecs(t *testing.T, left, right *ebpf.CollectionSpec) {
 			name != "java_authorized_processes" &&
 			name != "java_process_incarnations" &&
 			name != "java_retired_processes" &&
+			name != "java_thread_mapping_claims" &&
 			name != "java_vt_identities" &&
 			name != "java_vt_threads" {
 			continue
@@ -1747,8 +1972,14 @@ func TestJavaRemoteParentExactLifecycleMapsDoNotEvict(t *testing.T) {
 		"java_remote_parent_claims",
 		"java_remote_parent_owner_guards",
 		"java_remote_parent_generation_index",
+		"java_remote_parent_handoffs",
+		"java_remote_parent_handoff_claims",
+		"java_remote_parent_handoff_mutations",
 		"java_remote_parent_state",
+		"java_remote_parent_task_claims",
+		"java_remote_parent_tasks",
 		"java_retired_processes",
+		"java_thread_mapping_claims",
 		"java_vt_threads",
 	} {
 		require.Equal(t, ebpf.Hash, spec.Maps[name].Type, name)
@@ -1757,6 +1988,11 @@ func TestJavaRemoteParentExactLifecycleMapsDoNotEvict(t *testing.T) {
 	claims := spec.Maps["java_remote_parent_claims"]
 	replays := spec.Maps["java_remote_parent_alias_replays"]
 	guards := spec.Maps["java_remote_parent_owner_guards"]
+	tasks := spec.Maps["java_remote_parent_tasks"]
+	taskClaims := spec.Maps["java_remote_parent_task_claims"]
+	handoffs := spec.Maps["java_remote_parent_handoffs"]
+	handoffMutations := spec.Maps["java_remote_parent_handoff_mutations"]
+	handoffClaims := spec.Maps["java_remote_parent_handoff_claims"]
 	require.NotNil(t, claims)
 	require.NotNil(t, replays)
 	require.NotNil(t, guards)
@@ -1769,6 +2005,24 @@ func TestJavaRemoteParentExactLifecycleMapsDoNotEvict(t *testing.T) {
 	require.Equal(t, claims.MaxEntries, guards.MaxEntries)
 	require.Equal(t, claims.Flags, guards.Flags)
 	require.Equal(t, ebpfconvenience.PinInternal, guards.Pinning)
+	require.Equal(t, uint32(12), tasks.KeySize)
+	require.Equal(t, uint32(40), tasks.ValueSize)
+	require.Equal(t, tasks.MaxEntries, taskClaims.MaxEntries)
+	require.Equal(t, uint32(12), taskClaims.KeySize)
+	require.Equal(t, uint32(16), taskClaims.ValueSize)
+	require.Equal(t, ebpfconvenience.PinInternal, taskClaims.Pinning)
+	require.Equal(t, uint32(24), handoffs.KeySize)
+	require.Equal(t, ebpfconvenience.PinInternal, handoffs.Pinning)
+	require.Equal(t, tasks.MaxEntries, handoffs.MaxEntries)
+	require.Equal(t, uint32(24), handoffMutations.KeySize)
+	require.Equal(t, uint32(16), handoffMutations.ValueSize)
+	require.Equal(t, handoffs.MaxEntries, handoffMutations.MaxEntries)
+	require.Equal(t, ebpfconvenience.PinInternal, handoffMutations.Pinning)
+	require.Equal(t, ebpf.Hash, handoffClaims.Type)
+	require.Equal(t, uint32(24), handoffClaims.KeySize)
+	require.Equal(t, ebpfconvenience.PinInternal, handoffClaims.Pinning)
+	require.Equal(t, uint32(40), handoffs.ValueSize)
+	require.Equal(t, uint32(16), handoffClaims.ValueSize)
 }
 
 func TestJavaRemoteParentGenerationMapsArePerCPU(t *testing.T) {
@@ -1884,6 +2138,8 @@ func TestDisabledBridgeKeepsPerProcessAuthorizationCapacity(t *testing.T) {
 func TestJavaThreadMappingMapsSpec(t *testing.T) {
 	spec, err := generictracer.LoadBpf()
 	require.NoError(t, err)
+	bridgeSpec, err := tpinjector.LoadBpfJavaRemoteParentMaps()
+	require.NoError(t, err)
 
 	incarnations := spec.Maps["java_process_incarnations"]
 	require.NotNil(t, incarnations)
@@ -1896,7 +2152,12 @@ func TestJavaThreadMappingMapsSpec(t *testing.T) {
 	require.Equal(t, uint32(24), claims.ValueSize)
 	require.Greater(t, claims.MaxEntries, uint32(1))
 	require.Equal(t, ebpfconvenience.PinInternal, claims.Pinning)
+	bridgeClaims := bridgeSpec.Maps["java_thread_mapping_claims"]
+	require.NotNil(t, bridgeClaims)
+	assertMapSpecEqual(t, "java_thread_mapping_claims", claims, bridgeClaims)
 
 	javabridge.MinimizeDisabledMaps(spec)
 	require.Equal(t, uint32(1), claims.MaxEntries)
+	javabridge.MinimizeDisabledMaps(bridgeSpec)
+	require.Equal(t, uint32(1), bridgeClaims.MaxEntries)
 }

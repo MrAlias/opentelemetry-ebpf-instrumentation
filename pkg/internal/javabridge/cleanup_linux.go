@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -46,6 +47,7 @@ type cleanupMaps struct {
 	tasks                          cleanupMap
 	virtualThreads                 cleanupMap
 	vtIdentities                   cleanupMap
+	authorized                     cleanupMap
 	incarnations                   cleanupMap
 	connections                    cleanupMap
 	cookieConnections              cleanupMap
@@ -59,6 +61,9 @@ type cleanupMaps struct {
 	ownerGuards                    cleanupMap
 	handoffs                       cleanupMap
 	handoffClaims                  cleanupMap
+	handoffMutations               cleanupMap
+	taskClaims                     cleanupMap
+	threadMappingClaims            cleanupMap
 	retired                        cleanupMap
 	sslPrewrite                    cleanupMap
 	sslPrewriteConnectionAmbiguity cleanupMap
@@ -98,6 +103,7 @@ type Cleanup struct {
 	generationReplayScanCursorSet bool
 	generationReplayScanKey       stateKey
 	generationReplayScanKeySet    bool
+	processClaims                 map[Identity]threadMappingClaimValue
 	coordinator                   *GenerationCoordinator
 }
 
@@ -105,6 +111,31 @@ const (
 	javaRemoteParentMinimumFenceAge                         = time.Second
 	javaRemoteParentMaxExactTailClaims                      = 1024
 	javaRemoteParentMaxGenerationReplayScanAttemptsPerSweep = 1
+	// Kernel monotonic nanoseconds cannot reach these bits within the supported
+	// system lifetime. Tag userspace-owned T(execution) claims so an interrupted
+	// sweep can finish or release its exact fence on a later pass. M(H) uses the
+	// two tag bits as a small state machine: high-only is an ordinary cleanup M,
+	// both bits identify a resolved-C sweep, and second-only records proof that a
+	// terminal H is the sole remaining generation alias. This makes a partially
+	// completed replay -> state -> H drain crash-recoverable without changing H
+	// into a malformed carrier.
+	javaRemoteParentTaskCleanupClaimTag       = uint64(1) << 63
+	javaRemoteParentTerminalHandoffCleanupTag = uint64(1) << 62
+	javaRemoteParentProcessCleanupClaimTag    = uint32(1) << 31
+	// This E value is neither a producer handoff nor a generic generation
+	// cleanup claim. Only the M-derived terminal-H recovery path may adopt it.
+	javaRemoteParentTerminalHandoffGenerationClaimTag = uint8(0x48)
+)
+
+// Cleanup may recover a tagged userspace P(process) left by an interrupted
+// authorization transition. Serialize that recovery snapshot with live Go
+// authorization transactions so their finite claims are never adopted. A
+// separate global sweep lock prevents Cleanup instances with distinct
+// GenerationCoordinators from adopting the same recovered claim concurrently,
+// without making every authorization wait behind a full multi-map sweep.
+var (
+	javaProcessClaimCoordinator sync.Mutex
+	javaCleanupSweepCoordinator sync.Mutex
 )
 
 // CleanupStats reports logical cleanup roots reclaimed by one sweep. Cleaned
@@ -140,14 +171,25 @@ type generationCleanupRootRevalidator func() (bool, error)
 type generationCleanupCompletionValidator func(requireSnapshot bool) (bool, error)
 
 type handoffKey struct {
-	PID       uint32
-	Namespace uint32
-	Token     uint64
+	PID                uint32
+	Namespace          uint32
+	Token              uint64
+	ProcessIncarnation uint64
 }
 
 type handoffClaimValue struct {
 	ObservedMonotonicNS uint64
 	ProcessIncarnation  uint64
+}
+
+// threadMappingClaimValue mirrors java_thread_mapping_claim_t. BPF publishers
+// always publish Reserved == 0. Cleanup uses the high Reserved bit plus the
+// remaining value bits as an exact, crash-recoverable userspace ownership
+// token that BPF cannot adopt or release.
+type threadMappingClaimValue struct {
+	Child              Identity
+	Reserved           uint32
+	ProcessIncarnation uint64
 }
 
 type retiredProcessKey struct {
@@ -177,6 +219,7 @@ func NewCleanup(
 			tasks:                          wrap(maps.Tasks),
 			virtualThreads:                 wrap(maps.VirtualThreads),
 			vtIdentities:                   wrap(maps.VTIdentities),
+			authorized:                     wrap(maps.Authorized),
 			incarnations:                   wrap(maps.Incarnations),
 			connections:                    wrap(maps.Connections),
 			cookieConnections:              wrap(maps.CookieConnections),
@@ -190,6 +233,9 @@ func NewCleanup(
 			ownerGuards:                    wrap(maps.OwnerGuards),
 			handoffs:                       wrap(maps.Handoffs),
 			handoffClaims:                  wrap(maps.HandoffClaims),
+			handoffMutations:               wrap(maps.HandoffMutations),
+			taskClaims:                     wrap(maps.TaskClaims),
+			threadMappingClaims:            wrap(maps.ThreadMappingClaims),
 			retired:                        wrap(maps.Retired),
 			sslPrewrite:                    wrap(maps.SSLPrewriteTP),
 			sslPrewriteConnectionAmbiguity: wrap(maps.SSLPrewriteConnectionAmbiguity),
@@ -211,12 +257,13 @@ func (c *Cleanup) Sweep() error {
 // SweepWithStats reclaims expired, retired, malformed, orphaned, and provably
 // evicted bridge state. It reports successful reclamations even when another
 // cleanup target returns an error during the same sweep.
-func (c *Cleanup) SweepWithStats() (CleanupStats, error) {
-	var stats CleanupStats
+func (c *Cleanup) SweepWithStats() (stats CleanupStats, err error) {
 	if c == nil || !c.complete() {
 		return stats, errors.New("java remote-parent cleanup maps are incomplete")
 	}
-	err := c.sweepSSLPrewrite()
+	err = c.sweepSSLPrewrite()
+	javaCleanupSweepCoordinator.Lock()
+	defer javaCleanupSweepCoordinator.Unlock()
 	unlock := c.coordinator.lockCleanup()
 	defer unlock()
 	persistent := c
@@ -242,6 +289,7 @@ func (c *Cleanup) SweepWithStats() (CleanupStats, error) {
 	sweep.retainedTerminalAuthorities = make(map[stateKey]terminalValue)
 	sweep.generationReplayScanKey = stateKey{}
 	sweep.generationReplayScanKeySet = false
+	sweep.processClaims = make(map[Identity]threadMappingClaimValue)
 	defer func() {
 		persistent.generationReplayScanCursor = sweep.generationReplayScanCursor
 		persistent.generationReplayScanCursorSet = sweep.generationReplayScanCursorSet
@@ -250,6 +298,9 @@ func (c *Cleanup) SweepWithStats() (CleanupStats, error) {
 		sweep.aliasReplayNoCarrier = make(map[aliasReplayKey]aliasReplayNoCarrierObservation)
 	}
 	c = &sweep
+	defer func() {
+		err = errors.Join(err, c.releaseProcessCleanupClaims())
+	}()
 	if snapshotErr := c.snapshotAliasReplayState(); snapshotErr != nil {
 		err = errors.Join(err, snapshotErr)
 	}
@@ -272,6 +323,41 @@ func (c *Cleanup) SweepWithStats() (CleanupStats, error) {
 			continue
 		}
 		retired[entry.key] = struct{}{}
+	}
+	javaProcessClaimCoordinator.Lock()
+	processClaimErr := c.recoverProcessCleanupClaims()
+	javaProcessClaimCoordinator.Unlock()
+	if processClaimErr != nil {
+		err = errors.Join(err, processClaimErr)
+	}
+	if quiesceErr := c.quiesceRetiredProcessIncarnations(retired); quiesceErr != nil {
+		err = errors.Join(err, quiesceErr)
+	}
+	unauthorizedRetirementErr := c.recoverUnauthorizedProcessRetirements(retired)
+	defer func() {
+		err = errors.Join(err, unauthorizedRetirementErr)
+	}()
+	if taskClaimErr := c.sweepRetiredTaskClaims(retired); taskClaimErr != nil {
+		err = errors.Join(err, taskClaimErr)
+	}
+	if taskErr := c.sweepRetiredTasks(retired); taskErr != nil {
+		err = errors.Join(err, taskErr)
+	}
+	// Recover an interrupted exact-key M before asking this non-evicting map
+	// for another slot. Then reclaim resolved admission tickets before and
+	// after retired H cleanup. Retired cleanup itself needs only P -> M and
+	// never consumes C capacity.
+	if mutationErr := c.sweepRetiredHandoffMutations(retired); mutationErr != nil {
+		err = errors.Join(err, mutationErr)
+	}
+	if claimErr := c.sweepResolvedHandoffClaims(); claimErr != nil {
+		err = errors.Join(err, claimErr)
+	}
+	if handoffErr := c.sweepRetiredHandoffs(retired); handoffErr != nil {
+		err = errors.Join(err, handoffErr)
+	}
+	if claimErr := c.sweepResolvedHandoffClaims(); claimErr != nil {
+		err = errors.Join(err, claimErr)
 	}
 
 	generationEntries, generationErr := cleanupMapEntries[stateKey, generationIndexValue](
@@ -333,7 +419,7 @@ func (c *Cleanup) SweepWithStats() (CleanupStats, error) {
 			cleaned, cleanupErr := c.cleanupMalformedGenerationKey(entry.key, entry.value)
 			if cleaned {
 				stats.recordGeneration(
-					cleanedGenerations, canonicalGenerationKey(entry.key), false,
+					cleanedGenerations, canonicalGenerationKey(entry.key),
 				)
 			}
 			if cleanupErr != nil {
@@ -349,8 +435,7 @@ func (c *Cleanup) SweepWithStats() (CleanupStats, error) {
 			continue
 		}
 		if !processRetired {
-			_, coherentReservation, reservationErr :=
-				c.coherentGenerationPublishingReservation(entry.key)
+			_, coherentReservation, reservationErr := c.coherentGenerationPublishingReservation(entry.key)
 			if reservationErr != nil {
 				err = errors.Join(err, reservationErr)
 				continue
@@ -385,7 +470,7 @@ func (c *Cleanup) SweepWithStats() (CleanupStats, error) {
 			}
 		}
 		if cleaned {
-			stats.recordGeneration(cleanedGenerations, entry.key, false)
+			stats.recordGeneration(cleanedGenerations, entry.key)
 		}
 		if cleanupErr != nil {
 			err = errors.Join(err, cleanupErr)
@@ -407,57 +492,400 @@ func (c *Cleanup) SweepWithStats() (CleanupStats, error) {
 		if _, ok := retired[entry.key]; !ok {
 			continue
 		}
+		processRetired, retirementErr := c.processRetired(
+			retired, entry.key.Process, entry.key.ProcessIncarnation,
+		)
+		if retirementErr != nil {
+			err = errors.Join(err, retirementErr)
+			continue
+		}
+		if !processRetired {
+			continue
+		}
+		referenced, referenceErr := c.processRetirementReferenced(
+			entry.key.Process, entry.key.ProcessIncarnation,
+		)
+		if referenceErr != nil {
+			err = errors.Join(err, referenceErr)
+			continue
+		}
+		if referenced {
+			continue
+		}
 		deleted, deleteErr := cleanupDeleteExact(c.maps.retired, entry.key, entry.value)
 		if deleted {
 			stats.Cleaned++
+			// No exact carrier, replay, or subordinate cleanup reference remains.
+			// Open this process slot now so the same sweep can use bounded P/R
+			// capacity to publish a previously blocked retirement root below.
+			err = errors.Join(err, c.releaseProcessCleanupClaim(entry.key.Process))
 		}
 		if deleteErr != nil {
 			err = errors.Join(err, fmt.Errorf("deleting process retirement: %w", deleteErr))
 		}
 	}
+	// A saturated R map may have gained capacity only after the finalization
+	// loop above. Retry exact incarnation roots now; their carriers are handled
+	// on the next sweep, while their already-allocated incarnation slot prevents
+	// retirement authority from being lost in the meantime.
+	unauthorizedRetirementErr = c.recoverUnauthorizedProcessRetirements(retired)
 	return stats, err
 }
 
 func (s *CleanupStats) recordGeneration(
 	cleaned map[stateKey]struct{},
 	key stateKey,
-	evicted bool,
 ) {
 	if _, ok := cleaned[key]; ok {
 		return
 	}
 	cleaned[key] = struct{}{}
 	s.Cleaned++
-	if evicted {
-		s.Evicted++
-	}
 }
 
-func (c *Cleanup) processRetired(
-	retired map[retiredProcessKey]struct{},
+func javaRemoteParentProcessCleanupClaim(
+	now time.Duration,
+	process Identity,
+	processIncarnation uint64,
+) (threadMappingClaimValue, bool) {
+	observed := uint64(now)
+	if now <= 0 || observed&javaRemoteParentTaskCleanupClaimTag != 0 ||
+		process.PID == 0 || process.TID != process.PID || processIncarnation == 0 {
+		return threadMappingClaimValue{}, false
+	}
+	return threadMappingClaimValue{
+		Child: Identity{
+			TID:       uint32(observed),
+			PID:       process.PID,
+			Namespace: process.Namespace,
+		},
+		Reserved:           javaRemoteParentProcessCleanupClaimTag | uint32(observed>>32),
+		ProcessIncarnation: processIncarnation,
+	}, true
+}
+
+func validJavaRemoteParentProcessCleanupClaim(
+	process Identity,
+	claim threadMappingClaimValue,
+) bool {
+	if process.PID == 0 || process.TID != process.PID ||
+		claim.Reserved&javaRemoteParentProcessCleanupClaimTag == 0 ||
+		claim.Child.PID != process.PID || claim.Child.Namespace != process.Namespace ||
+		claim.ProcessIncarnation == 0 {
+		return false
+	}
+	observed := uint64(claim.Reserved&^javaRemoteParentProcessCleanupClaimTag)<<32 |
+		uint64(claim.Child.TID)
+	return observed != 0
+}
+
+func (c *Cleanup) recoverProcessCleanupClaims() error {
+	claims, err := cleanupMapEntries[Identity, threadMappingClaimValue](
+		c.maps.threadMappingClaims,
+	)
+	if err != nil {
+		return fmt.Errorf("iterating Java process cleanup claims: %w", err)
+	}
+	var result error
+	for _, entry := range claims {
+		if !validJavaRemoteParentProcessCleanupClaim(entry.key, entry.value) {
+			continue
+		}
+		matches, matchErr := cleanupExactMatches(
+			c.maps.threadMappingClaims, entry.key, entry.value,
+		)
+		if matchErr != nil {
+			result = errors.Join(result, fmt.Errorf(
+				"revalidating Java process cleanup claim: %w", matchErr,
+			))
+			continue
+		}
+		if matches {
+			c.processClaims[entry.key] = entry.value
+		}
+	}
+	return result
+}
+
+func (c *Cleanup) processAuthorizationRetires(
 	process Identity,
 	processIncarnation uint64,
 ) (bool, error) {
-	if _, ok := retired[retiredProcessKey{
-		Process:            process,
-		ProcessIncarnation: processIncarnation,
-	}]; ok {
-		return true, nil
-	}
-	var current uint64
-	if err := c.maps.incarnations.Lookup(&process, &current); err != nil {
+	var capability uint64
+	if err := c.maps.authorized.Lookup(&process, &capability); err != nil {
 		if errors.Is(err, ebpf.ErrKeyNotExist) {
 			return true, nil
 		}
-		return false, fmt.Errorf("looking up Java process incarnation: %w", err)
+		return false, err
 	}
-	return current != processIncarnation, nil
+	// Q == A is the only live authorization for I == A. Missing, malformed
+	// zero, and successor Q == B all make A quiescent: a delayed A publisher
+	// either already owns P or fails its post-claim I(A) revalidation, while B
+	// cannot publish until PROCESS_REGISTER installs I == B under the same P.
+	return capability != processIncarnation, nil
 }
 
-func (c *Cleanup) processCleanupSafe(
+func (c *Cleanup) recoverUnauthorizedProcessRetirements(
+	retired map[retiredProcessKey]struct{},
+) error {
+	incarnations, err := cleanupMapEntries[Identity, uint64](c.maps.incarnations)
+	if err != nil {
+		return fmt.Errorf("iterating Java process incarnations for retirement: %w", err)
+	}
+
+	var result error
+	for _, entry := range incarnations {
+		process := entry.key
+		processIncarnation := entry.value
+		if process.PID == 0 || process.TID != process.PID ||
+			processIncarnation == 0 || processIncarnation&(uint64(1)<<63) != 0 {
+			continue
+		}
+		retiring, authorizationErr := c.processAuthorizationRetires(
+			process, processIncarnation,
+		)
+		if authorizationErr != nil {
+			result = errors.Join(result, fmt.Errorf(
+				"looking up Java process authorization before retirement: %w",
+				authorizationErr,
+			))
+			continue
+		}
+		if !retiring {
+			continue
+		}
+
+		acquired, claimErr := c.acquireProcessCleanupClaim(process, processIncarnation)
+		if claimErr != nil {
+			result = errors.Join(result, claimErr)
+			continue
+		}
+		if !acquired {
+			continue
+		}
+
+		exactClaim, claimErr := c.processCleanupClaimExact(process)
+		if claimErr != nil || !exactClaim {
+			if claimErr != nil {
+				result = errors.Join(result, fmt.Errorf(
+					"revalidating Java process claim before retirement: %w", claimErr,
+				))
+			}
+			continue
+		}
+		var current uint64
+		if lookupErr := c.maps.incarnations.Lookup(&process, &current); lookupErr != nil {
+			if !errors.Is(lookupErr, ebpf.ErrKeyNotExist) {
+				result = errors.Join(result, fmt.Errorf(
+					"revalidating Java process incarnation before retirement: %w", lookupErr,
+				))
+			}
+			continue
+		}
+		if current != processIncarnation {
+			continue
+		}
+		retiring, authorizationErr = c.processAuthorizationRetires(
+			process, processIncarnation,
+		)
+		if authorizationErr != nil {
+			result = errors.Join(result, fmt.Errorf(
+				"revalidating Java process authorization before retirement: %w",
+				authorizationErr,
+			))
+			continue
+		}
+		if !retiring {
+			continue
+		}
+
+		retirement := retiredProcessKey{
+			Process: process, ProcessIncarnation: processIncarnation,
+		}
+		observed := uint64(c.monoTimeNow())
+		if observed == 0 || observed&(uint64(1)<<63) != 0 {
+			result = errors.Join(result, errors.New(
+				"creating Java process retirement observation",
+			))
+			continue
+		}
+		markerErr := c.maps.retired.Update(
+			&retirement, &observed, ebpf.UpdateNoExist,
+		)
+		if markerErr != nil {
+			var existing uint64
+			lookupErr := c.maps.retired.Lookup(&retirement, &existing)
+			if lookupErr != nil || existing == 0 {
+				if lookupErr != nil && !errors.Is(lookupErr, ebpf.ErrKeyNotExist) {
+					markerErr = errors.Join(markerErr, fmt.Errorf(
+						"revalidating Java process retirement marker: %w", lookupErr,
+					))
+				}
+				result = errors.Join(result, fmt.Errorf(
+					"publishing Java process retirement marker: %w", markerErr,
+				))
+				// A full R map must not also fill P with roots that made no
+				// progress. Releasing this exact idle claim lets the same sweep
+				// acquire P for unreferenced old R entries, finalize them, and
+				// retry publication after capacity has been recovered.
+				result = errors.Join(result, c.releaseProcessCleanupClaim(process))
+				continue
+			}
+		}
+		retired[retirement] = struct{}{}
+
+		exactClaim, claimErr = c.processCleanupClaimExact(process)
+		if claimErr != nil || !exactClaim {
+			if claimErr != nil {
+				result = errors.Join(result, fmt.Errorf(
+					"revalidating Java process claim after retirement: %w", claimErr,
+				))
+			}
+			continue
+		}
+		if lookupErr := c.maps.incarnations.Lookup(&process, &current); lookupErr != nil {
+			if !errors.Is(lookupErr, ebpf.ErrKeyNotExist) {
+				result = errors.Join(result, fmt.Errorf(
+					"revalidating Java process incarnation after retirement: %w", lookupErr,
+				))
+			}
+			continue
+		}
+		if current != processIncarnation {
+			continue
+		}
+		retiring, authorizationErr = c.processAuthorizationRetires(
+			process, processIncarnation,
+		)
+		if authorizationErr != nil {
+			result = errors.Join(result, fmt.Errorf(
+				"revalidating Java process authorization after retirement: %w",
+				authorizationErr,
+			))
+			continue
+		}
+		if !retiring {
+			continue
+		}
+		if _, deleteErr := cleanupDeleteExactOrCommitted(
+			c.maps.incarnations, process, processIncarnation,
+		); deleteErr != nil {
+			result = errors.Join(result, fmt.Errorf(
+				"deleting retired Java process incarnation: %w", deleteErr,
+			))
+		}
+	}
+	return result
+}
+
+// R(A) is a permanent boundary for capability A, even before its carrier
+// cleanup completes. Remove only an exact I(A) while holding P(process); a
+// successor I(B) is preserved. PROCESS_REGISTER refuses R(target), so once P
+// opens no ordinary packet can revive A through Q == I.
+func (c *Cleanup) quiesceRetiredProcessIncarnations(
+	retired map[retiredProcessKey]struct{},
+) error {
+	var result error
+	for entry := range retired {
+		acquired, claimErr := c.acquireProcessCleanupClaim(
+			entry.Process, entry.ProcessIncarnation,
+		)
+		if claimErr != nil {
+			result = errors.Join(result, fmt.Errorf(
+				"acquiring P for retired Java process: %w", claimErr,
+			))
+			continue
+		}
+		if !acquired {
+			continue
+		}
+		exact, claimErr := c.processCleanupClaimExact(entry.Process)
+		if claimErr != nil || !exact {
+			if claimErr != nil {
+				result = errors.Join(result, fmt.Errorf(
+					"revalidating P for retired Java process: %w", claimErr,
+				))
+			}
+			continue
+		}
+		if _, deleteErr := cleanupDeleteExactOrCommitted(
+			c.maps.incarnations, entry.Process, entry.ProcessIncarnation,
+		); deleteErr != nil {
+			result = errors.Join(result, fmt.Errorf(
+				"quiescing retired Java process incarnation: %w", deleteErr,
+			))
+		}
+	}
+	return result
+}
+
+func (c *Cleanup) processCleanupClaimExact(process Identity) (bool, error) {
+	claim, ok := c.processClaims[process]
+	if !ok {
+		return false, nil
+	}
+	var current threadMappingClaimValue
+	if err := c.maps.threadMappingClaims.Lookup(&process, &current); err != nil {
+		return false, ignoreMissing(err)
+	}
+	return current == claim, nil
+}
+
+func (c *Cleanup) acquireProcessCleanupClaim(
 	process Identity,
 	processIncarnation uint64,
 ) (bool, error) {
+	if c.processClaims == nil {
+		c.processClaims = make(map[Identity]threadMappingClaimValue)
+	}
+	if _, ok := c.processClaims[process]; ok {
+		return c.processCleanupClaimExact(process)
+	}
+	claim, valid := javaRemoteParentProcessCleanupClaim(
+		c.monoTimeNow(), process, processIncarnation,
+	)
+	if !valid {
+		return false, errors.New("creating Java process cleanup claim")
+	}
+	updateErr := c.maps.threadMappingClaims.Update(
+		&process, &claim, ebpf.UpdateNoExist,
+	)
+	if updateErr != nil && errors.Is(updateErr, ebpf.ErrKeyExist) {
+		return false, nil
+	}
+
+	var installed threadMappingClaimValue
+	lookupErr := c.maps.threadMappingClaims.Lookup(&process, &installed)
+	if lookupErr != nil || installed != claim {
+		if updateErr != nil {
+			return false, fmt.Errorf("acquiring Java process cleanup claim: %w", updateErr)
+		}
+		if lookupErr != nil {
+			return false, fmt.Errorf(
+				"revalidating Java process cleanup claim acquisition: %w", lookupErr,
+			)
+		}
+		return false, errors.New("revalidating acquired Java process cleanup claim")
+	}
+	c.processClaims[process] = claim
+	if updateErr != nil {
+		return true, fmt.Errorf("acquiring Java process cleanup claim: %w", updateErr)
+	}
+	return true, nil
+}
+
+func (c *Cleanup) processRetiredUnderClaim(
+	process Identity,
+	processIncarnation uint64,
+) (bool, error) {
+	exact, err := c.processCleanupClaimExact(process)
+	if err != nil {
+		return false, fmt.Errorf("revalidating Java process cleanup claim: %w", err)
+	}
+	if !exact {
+		return false, errors.New("java process cleanup claim changed")
+	}
+
 	var current uint64
 	if err := c.maps.incarnations.Lookup(&process, &current); err != nil {
 		if errors.Is(err, ebpf.ErrKeyNotExist) {
@@ -465,18 +893,1498 @@ func (c *Cleanup) processCleanupSafe(
 		}
 		return false, fmt.Errorf("revalidating Java process incarnation: %w", err)
 	}
-	return current == processIncarnation, nil
+	// I(A) remains a live carrier root until quiesceRetiredProcessIncarnations
+	// removes that exact value under P. PROCESS_REGISTER refuses R(A), so it can
+	// neither clear the marker nor revive A while cleanup is converging.
+	return current != processIncarnation, nil
+}
+
+func (c *Cleanup) exactProcessRetirementUnderClaim(
+	process Identity,
+	processIncarnation uint64,
+) (bool, error) {
+	exact, err := c.processCleanupClaimExact(process)
+	if err != nil {
+		return false, fmt.Errorf("revalidating Java process cleanup claim: %w", err)
+	}
+	if !exact {
+		return false, errors.New("java process cleanup claim changed")
+	}
+	key := retiredProcessKey{
+		Process: process, ProcessIncarnation: processIncarnation,
+	}
+	var observed uint64
+	if err := c.maps.retired.Lookup(&key, &observed); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("revalidating exact Java process retirement: %w", err)
+	}
+	return observed != 0, nil
+}
+
+func (c *Cleanup) processRetired(
+	retired map[retiredProcessKey]struct{},
+	process Identity,
+	processIncarnation uint64,
+) (bool, error) {
+	// Malformed roots do not expose a process capability that P can serialize.
+	// Their dedicated quarantine paths must establish their own exact fences.
+	if process.PID == 0 || process.TID != process.PID || processIncarnation == 0 {
+		return false, nil
+	}
+	if _, held := c.processClaims[process]; held {
+		isRetired, err := c.processRetiredUnderClaim(process, processIncarnation)
+		if err != nil || isRetired {
+			return isRetired, err
+		}
+		key := retiredProcessKey{
+			Process: process, ProcessIncarnation: processIncarnation,
+		}
+		// sched_process_exit does not take P and publishes the retirement
+		// marker before deauthorization removes the incarnation. Preserve the
+		// kernel marker: current == A may be that legitimate exit window.
+		delete(retired, key)
+		return false, nil
+	}
+
+	candidate := false
+	if _, ok := retired[retiredProcessKey{
+		Process:            process,
+		ProcessIncarnation: processIncarnation,
+	}]; ok {
+		candidate = true
+	} else {
+		var current uint64
+		if err := c.maps.incarnations.Lookup(&process, &current); err != nil {
+			if !errors.Is(err, ebpf.ErrKeyNotExist) {
+				return false, fmt.Errorf("looking up Java process incarnation: %w", err)
+			}
+			candidate = true
+		} else {
+			candidate = current != processIncarnation
+		}
+	}
+	if !candidate {
+		return false, nil
+	}
+
+	acquired, err := c.acquireProcessCleanupClaim(process, processIncarnation)
+	if err != nil || !acquired {
+		return false, err
+	}
+	isRetired, retirementErr := c.processRetiredUnderClaim(process, processIncarnation)
+	if retirementErr != nil || isRetired {
+		return isRetired, retirementErr
+	}
+	key := retiredProcessKey{
+		Process: process, ProcessIncarnation: processIncarnation,
+	}
+	delete(retired, key)
+	return false, nil
+}
+
+// processExactlyRetired adds durable writer-death authority to the weaker
+// quiescence proved by processRetired. P(process) serializes registration and
+// every alias publisher while cleanup runs, but incarnation absence alone is
+// not durable proof that the capability completed either last-thread exit or
+// an admitted A->B rotation. Deleting a task or handoff without its normal BPF
+// alias-release path therefore requires the exact retirement marker as well.
+func (c *Cleanup) processExactlyRetired(
+	retired map[retiredProcessKey]struct{},
+	process Identity,
+	processIncarnation uint64,
+) (bool, error) {
+	quiesced, err := c.processRetired(retired, process, processIncarnation)
+	if err != nil || !quiesced {
+		return false, err
+	}
+	return c.exactProcessRetirementUnderClaim(process, processIncarnation)
+}
+
+func (c *Cleanup) processCleanupSubordinateRemains(process Identity) (bool, error) {
+	taskClaims, err := cleanupMapEntries[Identity, handoffClaimValue](c.maps.taskClaims)
+	if err != nil {
+		return true, fmt.Errorf("iterating Java task cleanup claims before P release: %w", err)
+	}
+	for _, entry := range taskClaims {
+		if validJavaRemoteParentTaskCleanupClaim(entry.value) &&
+			javaProcessIdentity(entry.key) == process {
+			return true, nil
+		}
+	}
+
+	mutations, err := cleanupMapEntries[handoffKey, handoffClaimValue](
+		c.maps.handoffMutations,
+	)
+	if err != nil {
+		return true, fmt.Errorf("iterating Java handoff cleanup mutations before P release: %w", err)
+	}
+	for _, entry := range mutations {
+		if validJavaRemoteParentTaskCleanupClaim(entry.value) &&
+			entry.key.PID == process.PID && entry.key.Namespace == process.Namespace {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (c *Cleanup) processRetirementReferenced(
+	process Identity,
+	processIncarnation uint64,
+) (bool, error) {
+	tasks, err := cleanupMapEntries[Identity, taskLink](c.maps.tasks)
+	if err != nil {
+		return true, fmt.Errorf("iterating Java tasks before retirement release: %w", err)
+	}
+	for _, entry := range tasks {
+		if javaProcessIdentity(entry.key) == process &&
+			entry.value.ProcessIncarnation == processIncarnation {
+			return true, nil
+		}
+	}
+
+	handoffs, err := cleanupMapEntries[handoffKey, taskLink](c.maps.handoffs)
+	if err != nil {
+		return true, fmt.Errorf("iterating Java handoffs before retirement release: %w", err)
+	}
+	for _, entry := range handoffs {
+		if entry.key.PID == process.PID && entry.key.Namespace == process.Namespace &&
+			entry.key.ProcessIncarnation == processIncarnation {
+			return true, nil
+		}
+	}
+
+	replays, err := cleanupMapEntries[aliasReplayKey, aliasReplayValue](c.maps.aliasReplays)
+	if err != nil {
+		return true, fmt.Errorf("iterating Java alias replays before retirement release: %w", err)
+	}
+	for _, entry := range replays {
+		if javaProcessIdentity(entry.key.Owner) == process &&
+			entry.key.ProcessIncarnation == processIncarnation {
+			return true, nil
+		}
+	}
+
+	taskClaims, err := cleanupMapEntries[Identity, handoffClaimValue](c.maps.taskClaims)
+	if err != nil {
+		return true, fmt.Errorf("iterating Java task claims before retirement release: %w", err)
+	}
+	for _, entry := range taskClaims {
+		if javaProcessIdentity(entry.key) == process &&
+			entry.value.ProcessIncarnation == processIncarnation &&
+			validJavaRemoteParentTaskCleanupClaim(entry.value) {
+			return true, nil
+		}
+	}
+
+	mutations, err := cleanupMapEntries[handoffKey, handoffClaimValue](
+		c.maps.handoffMutations,
+	)
+	if err != nil {
+		return true, fmt.Errorf(
+			"iterating Java handoff mutations before retirement release: %w", err,
+		)
+	}
+	for _, entry := range mutations {
+		if entry.key.PID == process.PID && entry.key.Namespace == process.Namespace &&
+			entry.key.ProcessIncarnation == processIncarnation &&
+			validJavaRemoteParentTaskCleanupClaim(entry.value) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (c *Cleanup) releaseProcessCleanupClaims() error {
+	processes := make([]Identity, 0, len(c.processClaims))
+	for process := range c.processClaims {
+		processes = append(processes, process)
+	}
+	sort.Slice(processes, func(i, j int) bool {
+		if processes[i].Namespace != processes[j].Namespace {
+			return processes[i].Namespace < processes[j].Namespace
+		}
+		return processes[i].PID < processes[j].PID
+	})
+
+	var result error
+	for _, process := range processes {
+		result = errors.Join(result, c.releaseProcessCleanupClaim(process))
+	}
+	return result
+}
+
+func (c *Cleanup) releaseProcessCleanupClaim(process Identity) error {
+	claim, ok := c.processClaims[process]
+	if !ok {
+		return nil
+	}
+	remains, err := c.processCleanupSubordinateRemains(process)
+	if err != nil {
+		return err
+	}
+	if remains {
+		return nil
+	}
+	deleted, err := cleanupDeleteExactOrCommitted(
+		c.maps.threadMappingClaims, process, claim,
+	)
+	if err != nil {
+		return fmt.Errorf("releasing Java process cleanup claim: %w", err)
+	}
+	if deleted {
+		delete(c.processClaims, process)
+	}
+	return nil
+}
+
+func javaRemoteParentTaskCleanupClaim(
+	now time.Duration,
+	processIncarnation uint64,
+) (handoffClaimValue, bool) {
+	if now <= 0 || processIncarnation == 0 ||
+		uint64(now)&(javaRemoteParentTaskCleanupClaimTag|
+			javaRemoteParentTerminalHandoffCleanupTag) != 0 {
+		return handoffClaimValue{}, false
+	}
+	return handoffClaimValue{
+		ObservedMonotonicNS: uint64(now) | javaRemoteParentTaskCleanupClaimTag,
+		ProcessIncarnation:  processIncarnation,
+	}, true
+}
+
+func validJavaRemoteParentTaskCleanupClaim(claim handoffClaimValue) bool {
+	tags := claim.ObservedMonotonicNS & (javaRemoteParentTaskCleanupClaimTag |
+		javaRemoteParentTerminalHandoffCleanupTag)
+	return tags != 0 && claim.ProcessIncarnation != 0
+}
+
+func validJavaRemoteParentResolvedHandoffCleanupClaim(claim handoffClaimValue) bool {
+	tags := claim.ObservedMonotonicNS & (javaRemoteParentTaskCleanupClaimTag |
+		javaRemoteParentTerminalHandoffCleanupTag)
+	return tags == (javaRemoteParentTaskCleanupClaimTag|
+		javaRemoteParentTerminalHandoffCleanupTag) && claim.ProcessIncarnation != 0
+}
+
+func validJavaRemoteParentTerminalHandoffCleanupClaim(claim handoffClaimValue) bool {
+	tags := claim.ObservedMonotonicNS & (javaRemoteParentTaskCleanupClaimTag |
+		javaRemoteParentTerminalHandoffCleanupTag)
+	return tags == javaRemoteParentTerminalHandoffCleanupTag &&
+		claim.ProcessIncarnation != 0
+}
+
+func (c *Cleanup) releaseRecoveredTaskClaim(
+	key Identity,
+	claim handoffClaimValue,
+) error {
+	if _, err := cleanupDeleteExact(c.maps.taskClaims, key, claim); err != nil {
+		return fmt.Errorf("releasing recovered Java task claim: %w", err)
+	}
+	return nil
+}
+
+// Recover a userspace-owned T(execution) left by an interrupted sweep. The
+// exact claim remains the serialization fence while a retired A task is
+// removed. A live same-capability observation aborts task cleanup and releases
+// the tagged userspace claim so it cannot permanently block that process. A
+// successor B value is preserved. No task-map access is allowed after release.
+func (c *Cleanup) sweepRetiredTaskClaims(
+	retired map[retiredProcessKey]struct{},
+) error {
+	claims, err := cleanupMapEntries[Identity, handoffClaimValue](c.maps.taskClaims)
+	if err != nil {
+		return fmt.Errorf("iterating retired Java task claims: %w", err)
+	}
+	var result error
+	for _, entry := range claims {
+		if entry.key.PID == 0 || !validJavaRemoteParentTaskCleanupClaim(entry.value) {
+			continue
+		}
+		process := javaProcessIdentity(entry.key)
+		acquired, claimErr := c.acquireProcessCleanupClaim(
+			process, entry.value.ProcessIncarnation,
+		)
+		if claimErr != nil {
+			result = errors.Join(result, fmt.Errorf(
+				"acquiring P for recovered Java task claim: %w", claimErr,
+			))
+			continue
+		}
+		if !acquired {
+			continue
+		}
+		isRetired, retirementErr := c.processExactlyRetired(
+			retired, process, entry.value.ProcessIncarnation,
+		)
+		if retirementErr != nil {
+			result = errors.Join(result, fmt.Errorf(
+				"checking claimed Java task process retirement: %w", retirementErr,
+			))
+			continue
+		}
+		if !isRetired {
+			exact, claimErr := c.processCleanupClaimExact(process)
+			if claimErr != nil {
+				result = errors.Join(result, fmt.Errorf(
+					"revalidating live Java process cleanup claim: %w", claimErr,
+				))
+				continue
+			}
+			if !exact {
+				// A foreign PROCESS_REGISTER/TASK_LINK owns P. Do not open the
+				// recovered T beneath it; the next sweep can adopt T after P clears.
+				continue
+			}
+			result = errors.Join(
+				result, c.releaseRecoveredTaskClaim(entry.key, entry.value),
+			)
+			continue
+		}
+
+		var linked taskLink
+		lookupErr := c.maps.tasks.Lookup(&entry.key, &linked)
+		switch {
+		case lookupErr == nil && linked.ProcessIncarnation == entry.value.ProcessIncarnation:
+			// The initial retirement check only justified inspecting this
+			// userspace-owned fence. Revalidate after the exact task read and
+			// immediately before its deletion, matching the normal claim path.
+			isRetired, retirementErr = c.processExactlyRetired(
+				retired, process, entry.value.ProcessIncarnation,
+			)
+			if retirementErr != nil {
+				result = errors.Join(result, fmt.Errorf(
+					"revalidating claimed Java task process retirement before deletion: %w",
+					retirementErr,
+				))
+				continue
+			}
+			if !isRetired {
+				result = errors.Join(
+					result, c.releaseRecoveredTaskClaim(entry.key, entry.value),
+				)
+				continue
+			}
+			if _, deleteErr := cleanupDeleteExact(c.maps.tasks, entry.key, linked); deleteErr != nil {
+				result = errors.Join(result, fmt.Errorf(
+					"deleting task under recovered Java task claim: %w", deleteErr,
+				))
+			}
+		case lookupErr != nil && !errors.Is(lookupErr, ebpf.ErrKeyNotExist):
+			result = errors.Join(result, fmt.Errorf(
+				"looking up task under recovered Java task claim: %w", lookupErr,
+			))
+			continue
+		}
+
+		// Revalidate after the task mutation and before opening T. A conclusive
+		// same-capability registration is safe to release to because this path
+		// performs no further task-map access; uncertainty keeps the claim closed.
+		isRetired, retirementErr = c.processExactlyRetired(
+			retired, process, entry.value.ProcessIncarnation,
+		)
+		if retirementErr != nil {
+			result = errors.Join(result, fmt.Errorf(
+				"revalidating claimed Java task process retirement: %w", retirementErr,
+			))
+			continue
+		}
+		if !isRetired {
+			result = errors.Join(
+				result, c.releaseRecoveredTaskClaim(entry.key, entry.value),
+			)
+			continue
+		}
+		result = errors.Join(
+			result, c.releaseRecoveredTaskClaim(entry.key, entry.value),
+		)
+	}
+	return result
+}
+
+// Reclaim task carriers for retired process capabilities under the same
+// non-evicting T(execution) fence used by every BPF publisher. The task key is
+// reusable across process incarnations, so retirement and the exact A value
+// are both revalidated only after UpdateNoExist proves ownership of T. A BPF
+// successor either publishes before this claim and is preserved, or observes
+// the claim and cannot publish until the final exact release.
+func (c *Cleanup) sweepRetiredTasks(
+	retired map[retiredProcessKey]struct{},
+) error {
+	tasks, err := cleanupMapEntries[Identity, taskLink](c.maps.tasks)
+	if err != nil {
+		return fmt.Errorf("iterating retired Java tasks: %w", err)
+	}
+	var result error
+	for _, entry := range tasks {
+		if entry.key.PID == 0 || entry.value.ProcessIncarnation == 0 {
+			continue
+		}
+		process := javaProcessIdentity(entry.key)
+		isRetired, retirementErr := c.processExactlyRetired(
+			retired, process, entry.value.ProcessIncarnation,
+		)
+		if retirementErr != nil {
+			result = errors.Join(result, fmt.Errorf(
+				"checking Java task process retirement: %w", retirementErr,
+			))
+			continue
+		}
+		if !isRetired {
+			continue
+		}
+
+		claim, valid := javaRemoteParentTaskCleanupClaim(
+			c.monoTimeNow(), entry.value.ProcessIncarnation,
+		)
+		if !valid {
+			result = errors.Join(result, errors.New("creating Java task cleanup claim"))
+			continue
+		}
+		if updateErr := c.maps.taskClaims.Update(
+			&entry.key, &claim, ebpf.UpdateNoExist,
+		); updateErr != nil {
+			if !errors.Is(updateErr, ebpf.ErrKeyExist) {
+				result = errors.Join(result, fmt.Errorf(
+					"acquiring Java task claim: %w", updateErr,
+				))
+			}
+			continue
+		}
+
+		var installed handoffClaimValue
+		owned := c.maps.taskClaims.Lookup(&entry.key, &installed) == nil && installed == claim
+		if owned {
+			isRetired, retirementErr = c.processExactlyRetired(
+				retired, process, entry.value.ProcessIncarnation,
+			)
+			if retirementErr != nil {
+				result = errors.Join(result, fmt.Errorf(
+					"revalidating Java task process retirement: %w", retirementErr,
+				))
+			} else if isRetired {
+				if _, deleteErr := cleanupDeleteExact(
+					c.maps.tasks, entry.key, entry.value,
+				); deleteErr != nil {
+					result = errors.Join(result, fmt.Errorf(
+						"deleting retired Java task: %w", deleteErr,
+					))
+				}
+			}
+		} else {
+			result = errors.Join(result, errors.New("revalidating acquired Java task claim"))
+		}
+
+		// This exact release is the final operation for the task key. Even an
+		// uncertain task deletion must open T so later BPF cleanup can converge.
+		if _, releaseErr := cleanupDeleteExact(c.maps.taskClaims, entry.key, claim); releaseErr != nil {
+			result = errors.Join(result, fmt.Errorf(
+				"releasing Java task claim: %w", releaseErr,
+			))
+		}
+	}
+	return result
+}
+
+func (c *Cleanup) acquireHandoffCleanupMutation(
+	key handoffKey,
+) (handoffClaimValue, bool, error) {
+	claim, valid := javaRemoteParentTaskCleanupClaim(
+		c.monoTimeNow(), key.ProcessIncarnation,
+	)
+	if !valid {
+		return handoffClaimValue{}, false, errors.New("creating Java handoff cleanup mutation")
+	}
+	updateErr := c.maps.handoffMutations.Update(&key, &claim, ebpf.UpdateNoExist)
+	if updateErr != nil && errors.Is(updateErr, ebpf.ErrKeyExist) {
+		return handoffClaimValue{}, false, nil
+	}
+	var installed handoffClaimValue
+	lookupErr := c.maps.handoffMutations.Lookup(&key, &installed)
+	if lookupErr != nil || installed != claim {
+		if updateErr != nil {
+			return handoffClaimValue{}, false, fmt.Errorf(
+				"acquiring Java handoff cleanup mutation: %w", updateErr,
+			)
+		}
+		if lookupErr != nil {
+			return handoffClaimValue{}, false, fmt.Errorf(
+				"revalidating Java handoff cleanup mutation: %w", lookupErr,
+			)
+		}
+		return handoffClaimValue{}, false, errors.New(
+			"revalidating acquired Java handoff cleanup mutation",
+		)
+	}
+	if updateErr != nil {
+		return claim, true, fmt.Errorf("acquiring Java handoff cleanup mutation: %w", updateErr)
+	}
+	return claim, true, nil
+}
+
+func (c *Cleanup) releaseHandoffCleanupMutation(
+	key handoffKey,
+	claim handoffClaimValue,
+) error {
+	if _, err := cleanupDeleteExact(c.maps.handoffMutations, key, claim); err != nil {
+		return fmt.Errorf("releasing Java handoff cleanup mutation: %w", err)
+	}
+	return nil
+}
+
+type terminalHandoffAliasSnapshot struct {
+	stateKey      stateKey
+	state         stateValue
+	statePresent  bool
+	index         generationIndexValue
+	replayKey     aliasReplayKey
+	replay        aliasReplayValue
+	replayPresent bool
+}
+
+func validTerminalHandoffCarrier(key handoffKey, carrier taskLink) bool {
+	return validAliasReplayCarrierLink(carrier) &&
+		taskLinkOwnerMatchesProcess(carrier, key.PID, key.Namespace) &&
+		carrier.ProcessIncarnation == key.ProcessIncarnation
+}
+
+func validTerminalHandoffState(
+	key stateKey,
+	carrier taskLink,
+	state stateValue,
+) bool {
+	if key.Reserved != 0 || state.Lifecycle != lifecycleActive ||
+		state.Reserved != ([3]byte{}) ||
+		state.ObservedMonotonicNS != carrier.ObservedMonotonicNS ||
+		state.ProcessIncarnation != carrier.ProcessIncarnation ||
+		state.ConnectionNetNS == 0 || !validGenerationConnection(state.Connection) {
+		return false
+	}
+	record, err := UnmarshalRecord(state.Response[:])
+	return err == nil && record.IsValidRemoteParent() &&
+		record.Generation == key.Generation &&
+		record.ObservedMonotonicNS == carrier.ObservedMonotonicNS
+}
+
+func validTerminalHandoffReplay(replay aliasReplayValue) bool {
+	return validAliasReplayActive(replay) || validAliasReplayPublishing(replay) ||
+		validAliasReplayFinal(replay)
+}
+
+// terminalHandoffAliasSnapshot validates the exact generation carrier that H
+// names. Before M is tagged, both counts must be one: with P blocking new
+// retains and M stabilizing H, that proves no other carrier can still release
+// either counter. Once M is tagged, zero and absent values are resumable
+// completion states for an interrupted replay -> state drain.
+func (c *Cleanup) terminalHandoffAliasSnapshot(
+	carrier taskLink,
+	prepared bool,
+) (terminalHandoffAliasSnapshot, bool, error) {
+	snapshot := terminalHandoffAliasSnapshot{
+		stateKey: stateKey{Owner: carrier.Owner, Generation: carrier.Generation},
+		replayKey: aliasReplayKey{
+			Owner:               carrier.Owner,
+			Generation:          carrier.Generation,
+			ObservedMonotonicNS: carrier.ObservedMonotonicNS,
+			ProcessIncarnation:  carrier.ProcessIncarnation,
+		},
+	}
+
+	if err := c.maps.states.Lookup(&snapshot.stateKey, &snapshot.state); err != nil {
+		if !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return snapshot, false, fmt.Errorf("looking up terminal handoff state: %w", err)
+		}
+		if !prepared {
+			return snapshot, false, nil
+		}
+	} else {
+		snapshot.statePresent = true
+		if !validTerminalHandoffState(snapshot.stateKey, carrier, snapshot.state) ||
+			(prepared && snapshot.state.Aliases > 1) ||
+			(!prepared && snapshot.state.Aliases != 1) {
+			return snapshot, false, nil
+		}
+		if err := c.maps.generations.Lookup(&snapshot.stateKey, &snapshot.index); err != nil {
+			if errors.Is(err, ebpf.ErrKeyNotExist) {
+				return snapshot, false, nil
+			}
+			return snapshot, false, fmt.Errorf(
+				"looking up terminal handoff generation index: %w", err,
+			)
+		}
+		if !validFinishGenerationIndex(snapshot.stateKey, snapshot.index, snapshot.state) {
+			return snapshot, false, nil
+		}
+	}
+
+	if err := c.maps.aliasReplays.Lookup(&snapshot.replayKey, &snapshot.replay); err != nil {
+		if !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return snapshot, false, fmt.Errorf("looking up terminal handoff alias replay: %w", err)
+		}
+		if !prepared {
+			return snapshot, false, nil
+		}
+	} else {
+		snapshot.replayPresent = true
+		if !validTerminalHandoffReplay(snapshot.replay) ||
+			(prepared && snapshot.replay.References > 1) ||
+			(!prepared && snapshot.replay.References != 1) {
+			return snapshot, false, nil
+		}
+	}
+
+	if snapshot.statePresent && snapshot.replayPresent &&
+		!aliasReplayBindingMatchesState(snapshot.replay, snapshot.state) {
+		return snapshot, false, nil
+	}
+	if prepared && !snapshot.statePresent && snapshot.replayPresent &&
+		snapshot.replay.References != 0 {
+		return snapshot, false, nil
+	}
+	return snapshot, true, nil
+}
+
+func (c *Cleanup) terminalHandoffAliasSnapshotExact(
+	snapshot terminalHandoffAliasSnapshot,
+) (bool, error) {
+	exact, err := cleanupExactMatches(c.maps.states, snapshot.stateKey, snapshot.state)
+	if err != nil || !exact {
+		return exact, err
+	}
+	exact, err = cleanupExactMatches(c.maps.generations, snapshot.stateKey, snapshot.index)
+	if err != nil || !exact {
+		return exact, err
+	}
+	return cleanupExactMatches(c.maps.aliasReplays, snapshot.replayKey, snapshot.replay)
+}
+
+func (c *Cleanup) terminalHandoffClaimAbsent(key handoffKey) (bool, error) {
+	var claim handoffClaimValue
+	if err := c.maps.handoffClaims.Lookup(&key, &claim); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return true, nil
+		}
+		return false, err
+	}
+	return false, nil
+}
+
+// cleanupUpdateExactValue performs a whole-value transition only after two
+// exact reads. Callers must hold the map-specific serialization fence. An exact
+// replacement readback is authoritative even when Update reported an unknown
+// outcome; counter callers may also treat absence as completed teardown.
+func cleanupUpdateExactValue[K, V comparable](
+	m cleanupMap,
+	key K,
+	expected V,
+	replacement V,
+	missingComplete bool,
+) (bool, error) {
+	for range 2 {
+		var current V
+		if err := m.Lookup(&key, &current); err != nil {
+			if errors.Is(err, ebpf.ErrKeyNotExist) {
+				return missingComplete, nil
+			}
+			return false, err
+		}
+		if current == replacement {
+			return true, nil
+		}
+		if current != expected {
+			return false, nil
+		}
+	}
+
+	updateErr := m.Update(&key, &replacement, ebpf.UpdateExist)
+	var current V
+	lookupErr := m.Lookup(&key, &current)
+	if lookupErr == nil && current == replacement {
+		return true, nil
+	}
+	if errors.Is(lookupErr, ebpf.ErrKeyNotExist) && missingComplete {
+		return true, nil
+	}
+	if updateErr != nil && lookupErr != nil {
+		return false, errors.Join(updateErr, lookupErr)
+	}
+	if updateErr != nil {
+		return false, updateErr
+	}
+	if lookupErr != nil {
+		return false, lookupErr
+	}
+	return false, errors.New("exact cleanup value changed during update")
+}
+
+func (c *Cleanup) markResolvedHandoffCleanupMutation(
+	key handoffKey,
+	mutation *handoffClaimValue,
+) (bool, error) {
+	if validJavaRemoteParentResolvedHandoffCleanupClaim(*mutation) {
+		return true, nil
+	}
+	if !validJavaRemoteParentTaskCleanupClaim(*mutation) ||
+		mutation.ObservedMonotonicNS&javaRemoteParentTerminalHandoffCleanupTag != 0 {
+		return false, nil
+	}
+	resolved := *mutation
+	resolved.ObservedMonotonicNS |= javaRemoteParentTerminalHandoffCleanupTag
+	updated, err := cleanupUpdateExactValue(
+		c.maps.handoffMutations, key, *mutation, resolved, false,
+	)
+	if err != nil {
+		return false, fmt.Errorf("marking resolved Java handoff cleanup mutation: %w", err)
+	}
+	if updated {
+		*mutation = resolved
+	}
+	return updated, nil
+}
+
+func terminalHandoffGenerationCleanupClaim(
+	mutation handoffClaimValue,
+	carrier taskLink,
+) (stateKey, generationClaim, bool) {
+	key := stateKey{Owner: carrier.Owner, Generation: carrier.Generation}
+	observed := mutation.ObservedMonotonicNS &^
+		(javaRemoteParentTaskCleanupClaimTag | javaRemoteParentTerminalHandoffCleanupTag)
+	claim := generationClaim{
+		ObservedMonotonicNS: observed,
+		ProcessIncarnation:  key.Generation,
+		Lifecycle:           lifecycleCleanup,
+		Reserved: [7]byte{
+			0: lifecycleAmbiguous,
+			6: javaRemoteParentTerminalHandoffGenerationClaimTag,
+		},
+	}
+	return key, claim, validTerminalHandoffGenerationCleanupClaim(key, claim)
+}
+
+func validTerminalHandoffGenerationCleanupClaim(
+	key stateKey,
+	claim generationClaim,
+) bool {
+	return key.Owner != (Identity{}) && key.Generation != 0 && key.Reserved == 0 &&
+		claim.ObservedMonotonicNS != 0 && claim.ProcessIncarnation == key.Generation &&
+		claim.Lifecycle == lifecycleCleanup &&
+		claim.Reserved == ([7]byte{
+			0: lifecycleAmbiguous,
+			6: javaRemoteParentTerminalHandoffGenerationClaimTag,
+		})
+}
+
+// A generation finalizer can whole-update replay lifecycle and references
+// without P or M(H). Callers acquire this deterministic exact E claim after
+// P -> M; E holders never acquire M. E serializes that writer with terminal-H
+// counter updates, and its value is derived from durable M so a later sweep can
+// adopt or release it after any interrupted outcome.
+func (c *Cleanup) acquireTerminalHandoffGenerationClaim(
+	mutation handoffClaimValue,
+	carrier taskLink,
+) (stateKey, generationClaim, bool, error) {
+	key, claim, valid := terminalHandoffGenerationCleanupClaim(mutation, carrier)
+	if !valid {
+		return stateKey{}, generationClaim{}, false,
+			errors.New("creating terminal Java handoff generation claim")
+	}
+	updateErr := c.maps.claims.Update(&key, &claim, ebpf.UpdateNoExist)
+	var current generationClaim
+	lookupErr := c.maps.claims.Lookup(&key, &current)
+	if lookupErr == nil && current == claim {
+		c.recordCurrentSweepClaim(key, claim)
+		return key, claim, true, nil
+	}
+	if updateErr != nil && !errors.Is(updateErr, ebpf.ErrKeyExist) {
+		if lookupErr != nil {
+			return key, claim, false, errors.Join(updateErr, lookupErr)
+		}
+		return key, claim, false, updateErr
+	}
+	if lookupErr != nil && !errors.Is(lookupErr, ebpf.ErrKeyNotExist) {
+		return key, claim, false, lookupErr
+	}
+	return key, claim, false, nil
+}
+
+func (c *Cleanup) releaseTerminalHandoffGenerationClaim(
+	key stateKey,
+	claim generationClaim,
+) (bool, error) {
+	deleted, err := cleanupDeleteExactOrCommitted(c.maps.claims, key, claim)
+	if err != nil {
+		return false, err
+	}
+	if deleted {
+		c.clearCurrentSweepClaim(key, claim)
+		c.recordReleasedSweepClaim(key, claim)
+	}
+	return deleted, nil
+}
+
+func (c *Cleanup) releaseResolvedHandoffGenerationClaim(
+	key handoffKey,
+	mutation handoffClaimValue,
+) (bool, error) {
+	var carrier taskLink
+	if err := c.maps.handoffs.Lookup(&key, &carrier); err != nil {
+		return false, ignoreMissing(err)
+	}
+	if !validTerminalHandoffCarrier(key, carrier) {
+		return false, nil
+	}
+	generationKey, claim, valid := terminalHandoffGenerationCleanupClaim(mutation, carrier)
+	if !valid {
+		return false, nil
+	}
+	exact, err := cleanupExactMatches(c.maps.claims, generationKey, claim)
+	if err != nil || !exact {
+		return false, err
+	}
+	released, err := c.releaseTerminalHandoffGenerationClaim(generationKey, claim)
+	return !released, err
+}
+
+func (c *Cleanup) terminalHandoffStructuralFenceExact(
+	key handoffKey,
+	mutation handoffClaimValue,
+	carrier taskLink,
+) (bool, error) {
+	process := Identity{TID: key.PID, PID: key.PID, Namespace: key.Namespace}
+	exact, err := c.processCleanupClaimExact(process)
+	if err != nil || !exact {
+		return false, err
+	}
+	exact, err = cleanupExactMatches(c.maps.handoffMutations, key, mutation)
+	if err != nil || !exact {
+		return false, err
+	}
+	exact, err = cleanupExactMatches(c.maps.handoffs, key, carrier)
+	return exact, err
+}
+
+func (c *Cleanup) terminalHandoffFenceExact(
+	key handoffKey,
+	mutation handoffClaimValue,
+	carrier taskLink,
+) (bool, error) {
+	exact, err := c.terminalHandoffStructuralFenceExact(key, mutation, carrier)
+	if err != nil || !exact {
+		return exact, err
+	}
+	absent, err := c.terminalHandoffClaimAbsent(key)
+	if err != nil || !absent {
+		return false, err
+	}
+	return true, nil
+}
+
+func (c *Cleanup) terminalHandoffGenerationFenceExact(
+	key handoffKey,
+	mutation handoffClaimValue,
+	carrier taskLink,
+	generationKey stateKey,
+	claim generationClaim,
+) (bool, error) {
+	fenced, err := c.terminalHandoffStructuralFenceExact(key, mutation, carrier)
+	if err != nil || !fenced {
+		return fenced, err
+	}
+	return cleanupExactMatches(c.maps.claims, generationKey, claim)
+}
+
+func (c *Cleanup) terminalHandoffFullFenceExact(
+	key handoffKey,
+	mutation handoffClaimValue,
+	carrier taskLink,
+	generationKey stateKey,
+	claim generationClaim,
+) (bool, error) {
+	fenced, err := c.terminalHandoffGenerationFenceExact(
+		key, mutation, carrier, generationKey, claim,
+	)
+	if err != nil || !fenced {
+		return fenced, err
+	}
+	absent, err := c.terminalHandoffClaimAbsent(key)
+	if err != nil || !absent {
+		return false, err
+	}
+	return true, nil
+}
+
+func (c *Cleanup) prepareTerminalHandoffCleanup(
+	key handoffKey,
+	mutation *handoffClaimValue,
+) (bool, error) {
+	if !validJavaRemoteParentResolvedHandoffCleanupClaim(*mutation) {
+		return true, nil
+	}
+	var carrier taskLink
+	if err := c.maps.handoffs.Lookup(&key, &carrier); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return false, nil
+		}
+		return true, fmt.Errorf("looking up terminal Java handoff: %w", err)
+	}
+	if !validTerminalHandoffCarrier(key, carrier) {
+		return true, nil
+	}
+
+	fenced, err := c.terminalHandoffStructuralFenceExact(key, *mutation, carrier)
+	if err != nil {
+		return true, err
+	}
+	if !fenced {
+		return true, nil
+	}
+	absent, err := c.terminalHandoffClaimAbsent(key)
+	if err != nil {
+		return true, err
+	}
+	if !absent {
+		// Before the durable transition, a reappearing C means this was not the
+		// terminal observation. H remains an ordinary valid carrier, so M may open.
+		return false, nil
+	}
+	generationKey, generationClaim, claimed, err := c.acquireTerminalHandoffGenerationClaim(*mutation, carrier)
+	if err != nil {
+		return true, fmt.Errorf("acquiring terminal Java handoff generation claim: %w", err)
+	}
+	if !claimed {
+		return true, nil
+	}
+	fenced, err = c.terminalHandoffGenerationFenceExact(
+		key, *mutation, carrier, generationKey, generationClaim,
+	)
+	if err != nil || !fenced {
+		return true, err
+	}
+	absent, err = c.terminalHandoffClaimAbsent(key)
+	if err != nil {
+		return true, err
+	}
+	if !absent {
+		released, releaseErr := c.releaseTerminalHandoffGenerationClaim(
+			generationKey, generationClaim,
+		)
+		if releaseErr != nil {
+			return true, fmt.Errorf(
+				"releasing false-positive terminal handoff generation claim: %w", releaseErr,
+			)
+		}
+		return !released, nil
+	}
+
+	snapshot, ready, err := c.terminalHandoffAliasSnapshot(carrier, false)
+	if err != nil || !ready {
+		return true, err
+	}
+	exact, err := c.terminalHandoffAliasSnapshotExact(snapshot)
+	if err != nil {
+		return true, err
+	}
+	if !exact {
+		return true, nil
+	}
+	fenced, err = c.terminalHandoffFullFenceExact(
+		key, *mutation, carrier, generationKey, generationClaim,
+	)
+	if err != nil || !fenced {
+		return true, err
+	}
+
+	prepared := *mutation
+	prepared.ObservedMonotonicNS &^= javaRemoteParentTaskCleanupClaimTag
+	updated, err := cleanupUpdateExactValue(
+		c.maps.handoffMutations, key, *mutation, prepared, false,
+	)
+	if err != nil {
+		return true, fmt.Errorf("preparing terminal Java handoff cleanup: %w", err)
+	}
+	if !updated {
+		return true, nil
+	}
+	*mutation = prepared
+	return c.finishTerminalHandoffCleanup(key, mutation)
+}
+
+func (c *Cleanup) finishTerminalHandoffCleanup(
+	key handoffKey,
+	mutation *handoffClaimValue,
+) (bool, error) {
+	if !validJavaRemoteParentTerminalHandoffCleanupClaim(*mutation) {
+		return true, nil
+	}
+	var carrier taskLink
+	if err := c.maps.handoffs.Lookup(&key, &carrier); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return false, nil
+		}
+		return true, fmt.Errorf("looking up prepared terminal Java handoff: %w", err)
+	}
+	if !validTerminalHandoffCarrier(key, carrier) {
+		return true, nil
+	}
+	fenced, err := c.terminalHandoffFenceExact(key, *mutation, carrier)
+	if err != nil || !fenced {
+		return true, err
+	}
+	generationKey, generationClaim, claimed, err := c.acquireTerminalHandoffGenerationClaim(*mutation, carrier)
+	if err != nil {
+		return true, fmt.Errorf("acquiring prepared terminal handoff generation claim: %w", err)
+	}
+	if !claimed {
+		return true, nil
+	}
+	fenced, err = c.terminalHandoffFullFenceExact(
+		key, *mutation, carrier, generationKey, generationClaim,
+	)
+	if err != nil || !fenced {
+		return true, err
+	}
+
+	snapshot, ready, err := c.terminalHandoffAliasSnapshot(carrier, true)
+	if err != nil || !ready {
+		return true, err
+	}
+	fenced, err = c.terminalHandoffFullFenceExact(
+		key, *mutation, carrier, generationKey, generationClaim,
+	)
+	if err != nil || !fenced {
+		return true, err
+	}
+	if snapshot.replayPresent && snapshot.replay.References == 1 {
+		released := snapshot.replay
+		released.References = 0
+		updated, updateErr := cleanupUpdateExactValue(
+			c.maps.aliasReplays, snapshot.replayKey, snapshot.replay, released, true,
+		)
+		if updateErr != nil {
+			return true, fmt.Errorf("releasing terminal Java handoff replay reference: %w", updateErr)
+		}
+		if !updated {
+			return true, nil
+		}
+	}
+
+	fenced, err = c.terminalHandoffFullFenceExact(
+		key, *mutation, carrier, generationKey, generationClaim,
+	)
+	if err != nil || !fenced {
+		return true, err
+	}
+	if snapshot.statePresent && snapshot.state.Aliases == 1 {
+		released := snapshot.state
+		released.Aliases = 0
+		updated, updateErr := cleanupUpdateExactValue(
+			c.maps.states, snapshot.stateKey, snapshot.state, released, true,
+		)
+		if updateErr != nil {
+			return true, fmt.Errorf("releasing terminal Java handoff state alias: %w", updateErr)
+		}
+		if !updated {
+			return true, nil
+		}
+	}
+
+	fenced, err = c.terminalHandoffFullFenceExact(
+		key, *mutation, carrier, generationKey, generationClaim,
+	)
+	if err != nil || !fenced {
+		return true, err
+	}
+	released, releaseErr := c.releaseTerminalHandoffGenerationClaim(
+		generationKey, generationClaim,
+	)
+	if releaseErr != nil {
+		return true, fmt.Errorf("releasing terminal handoff generation claim: %w", releaseErr)
+	}
+	if !released {
+		return true, nil
+	}
+	fenced, err = c.terminalHandoffFenceExact(key, *mutation, carrier)
+	if err != nil || !fenced {
+		return true, err
+	}
+	deleted, deleteErr := cleanupDeleteExactOrCommitted(c.maps.handoffs, key, carrier)
+	if deleteErr != nil {
+		return true, fmt.Errorf("deleting terminal Java handoff: %w", deleteErr)
+	}
+	return !deleted, nil
+}
+
+func (c *Cleanup) recoverLiveHandoffMutation(
+	key handoffKey,
+	mutation *handoffClaimValue,
+) (bool, error) {
+	if validJavaRemoteParentTerminalHandoffCleanupClaim(*mutation) {
+		return c.finishTerminalHandoffCleanup(key, mutation)
+	}
+	if !validJavaRemoteParentResolvedHandoffCleanupClaim(*mutation) {
+		// Ordinary M may have come from an interrupted retired-H sweep that
+		// revalidated live. Only resolved-C provenance authorizes interpreting
+		// missing C as a terminal handoff observation.
+		return false, nil
+	}
+	absent, err := c.terminalHandoffClaimAbsent(key)
+	if err != nil {
+		return true, fmt.Errorf("checking recovered Java handoff claim: %w", err)
+	}
+	if !absent {
+		retain, releaseErr := c.releaseResolvedHandoffGenerationClaim(key, *mutation)
+		if releaseErr != nil {
+			return true, fmt.Errorf(
+				"releasing recovered resolved-handoff generation claim: %w", releaseErr,
+			)
+		}
+		return retain, nil
+	}
+	return c.prepareTerminalHandoffCleanup(key, mutation)
+}
+
+func (c *Cleanup) sweepRetiredHandoffMutations(
+	retired map[retiredProcessKey]struct{},
+) error {
+	mutations, err := cleanupMapEntries[handoffKey, handoffClaimValue](
+		c.maps.handoffMutations,
+	)
+	if err != nil {
+		return fmt.Errorf("iterating retired Java handoff cleanup mutations: %w", err)
+	}
+	var result error
+	for _, entry := range mutations {
+		if entry.key.PID == 0 || entry.key.Token == 0 ||
+			entry.key.ProcessIncarnation == 0 ||
+			!validJavaRemoteParentTaskCleanupClaim(entry.value) ||
+			entry.value.ProcessIncarnation != entry.key.ProcessIncarnation {
+			continue
+		}
+		exact, exactErr := cleanupExactMatches(
+			c.maps.handoffMutations, entry.key, entry.value,
+		)
+		if exactErr != nil {
+			result = errors.Join(result, fmt.Errorf(
+				"revalidating recovered Java handoff mutation: %w", exactErr,
+			))
+			continue
+		}
+		if !exact {
+			continue
+		}
+		process := Identity{
+			TID: entry.key.PID, PID: entry.key.PID, Namespace: entry.key.Namespace,
+		}
+		acquired, claimErr := c.acquireProcessCleanupClaim(
+			process, entry.key.ProcessIncarnation,
+		)
+		if claimErr != nil {
+			result = errors.Join(result, fmt.Errorf(
+				"acquiring P for recovered Java handoff mutation: %w", claimErr,
+			))
+			continue
+		}
+		if !acquired {
+			continue
+		}
+		mutation := entry.value
+		if validJavaRemoteParentTerminalHandoffCleanupClaim(mutation) {
+			retain, recoveryErr := c.finishTerminalHandoffCleanup(entry.key, &mutation)
+			if recoveryErr != nil {
+				result = errors.Join(result, recoveryErr)
+			}
+			if retain {
+				continue
+			}
+			if releaseErr := c.releaseHandoffCleanupMutation(
+				entry.key, mutation,
+			); releaseErr != nil {
+				result = errors.Join(result, releaseErr)
+			}
+			continue
+		}
+		processRetired, retirementErr := c.processExactlyRetired(
+			retired, process, entry.key.ProcessIncarnation,
+		)
+		if retirementErr != nil {
+			result = errors.Join(result, fmt.Errorf(
+				"checking recovered Java handoff process retirement: %w", retirementErr,
+			))
+			continue
+		}
+		if processRetired {
+			if validJavaRemoteParentResolvedHandoffCleanupClaim(mutation) {
+				retain, releaseErr := c.releaseResolvedHandoffGenerationClaim(
+					entry.key, mutation,
+				)
+				if releaseErr != nil {
+					result = errors.Join(result, fmt.Errorf(
+						"releasing retired resolved-handoff generation claim: %w", releaseErr,
+					))
+					continue
+				}
+				if retain {
+					continue
+				}
+			}
+			var handoff taskLink
+			if lookupErr := c.maps.handoffs.Lookup(&entry.key, &handoff); lookupErr == nil {
+				stillRetired, revalidateErr := c.processExactlyRetired(
+					retired, process, entry.key.ProcessIncarnation,
+				)
+				if revalidateErr != nil {
+					result = errors.Join(result, revalidateErr)
+					continue
+				}
+				if stillRetired {
+					if _, deleteErr := cleanupDeleteExact(
+						c.maps.handoffs, entry.key, handoff,
+					); deleteErr != nil {
+						result = errors.Join(result, fmt.Errorf(
+							"deleting handoff under recovered Java mutation: %w", deleteErr,
+						))
+						continue
+					}
+				}
+			} else if !errors.Is(lookupErr, ebpf.ErrKeyNotExist) {
+				result = errors.Join(result, fmt.Errorf(
+					"looking up handoff under recovered Java mutation: %w", lookupErr,
+				))
+				continue
+			}
+		} else {
+			exact, claimErr := c.processCleanupClaimExact(process)
+			if claimErr != nil {
+				result = errors.Join(result, fmt.Errorf(
+					"revalidating live Java handoff cleanup claim: %w", claimErr,
+				))
+				continue
+			}
+			if !exact {
+				// Preserve the recovered M beneath a foreign P owner.
+				continue
+			}
+			retain, recoveryErr := c.recoverLiveHandoffMutation(entry.key, &mutation)
+			if recoveryErr != nil {
+				result = errors.Join(result, recoveryErr)
+			}
+			if retain {
+				continue
+			}
+		}
+		if releaseErr := c.releaseHandoffCleanupMutation(entry.key, mutation); releaseErr != nil {
+			result = errors.Join(result, releaseErr)
+		}
+	}
+	return result
+}
+
+func (c *Cleanup) sweepRetiredHandoffs(
+	retired map[retiredProcessKey]struct{},
+) error {
+	handoffs, err := cleanupMapEntries[handoffKey, taskLink](c.maps.handoffs)
+	if err != nil {
+		return fmt.Errorf("iterating retired Java handoffs: %w", err)
+	}
+	var result error
+	for _, entry := range handoffs {
+		// Cooperative publishers never create a zero-PID, zero-token, or
+		// capability-less key. Leave malformed keys to fail closed: they have no
+		// exact process capability under which userspace can prove writer death.
+		if entry.key.PID == 0 || entry.key.Token == 0 ||
+			entry.key.ProcessIncarnation == 0 {
+			continue
+		}
+		process := Identity{
+			TID:       entry.key.PID,
+			PID:       entry.key.PID,
+			Namespace: entry.key.Namespace,
+		}
+		isRetired, retirementErr := c.processExactlyRetired(
+			retired, process, entry.key.ProcessIncarnation,
+		)
+		if retirementErr != nil {
+			result = errors.Join(result, fmt.Errorf(
+				"checking Java handoff process retirement: %w", retirementErr,
+			))
+			continue
+		}
+		if !isRetired {
+			continue
+		}
+		// P -> M(H). P proves that no positive publisher for this retired
+		// incarnation can begin, while M makes the reusable handoff key stable
+		// through the exact delete. Cleanup never inserts C(OPEN), so full C and
+		// M maps cannot form a cross-capacity dependency cycle.
+		mutation, acquired, mutationErr := c.acquireHandoffCleanupMutation(entry.key)
+		if mutationErr != nil {
+			result = errors.Join(result, mutationErr)
+			continue
+		}
+		if !acquired {
+			continue
+		}
+		isRetired, retirementErr = c.processExactlyRetired(
+			retired, process, entry.key.ProcessIncarnation,
+		)
+		if retirementErr != nil {
+			result = errors.Join(result, fmt.Errorf(
+				"revalidating Java handoff process retirement: %w", retirementErr,
+			))
+			continue
+		}
+		if !isRetired {
+			if releaseErr := c.releaseHandoffCleanupMutation(entry.key, mutation); releaseErr != nil {
+				result = errors.Join(result, releaseErr)
+			}
+			continue
+		}
+		if _, deleteErr := cleanupDeleteExact(c.maps.handoffs, entry.key, entry.value); deleteErr != nil {
+			result = errors.Join(result, fmt.Errorf(
+				"deleting retired Java handoff: %w", deleteErr,
+			))
+			// Deletion uncertainty keeps M and P closed for exact recovery.
+			continue
+		}
+		if releaseErr := c.releaseHandoffCleanupMutation(entry.key, mutation); releaseErr != nil {
+			result = errors.Join(result, releaseErr)
+		}
+	}
+	return result
+}
+
+// sweepResolvedHandoffClaims bounds the non-evicting C(OPEN) admission map to
+// handoffs that still exist. P -> M(H) blocks new alias retains before making
+// the reusable H key stable. C publishers use BPF_NOEXIST and revalidate their
+// exact ticket beneath M before exposure, so an exact no-H C beneath both
+// fences can be deleted without resurrecting H. If H exists, C is revalidated
+// before M opens: terminal C disappearance switches M to durable drain intent.
+func (c *Cleanup) sweepResolvedHandoffClaims() error {
+	claims, err := cleanupMapEntries[handoffKey, handoffClaimValue](
+		c.maps.handoffClaims,
+	)
+	if err != nil {
+		return fmt.Errorf("iterating resolved Java handoff claims: %w", err)
+	}
+
+	var result error
+	for _, entry := range claims {
+		if entry.key.PID == 0 || entry.key.Token == 0 ||
+			entry.key.ProcessIncarnation == 0 || entry.value.ObservedMonotonicNS == 0 ||
+			entry.value.ProcessIncarnation != entry.key.ProcessIncarnation {
+			continue
+		}
+		process := Identity{
+			TID: entry.key.PID, PID: entry.key.PID, Namespace: entry.key.Namespace,
+		}
+		processAcquired, processErr := c.acquireProcessCleanupClaim(
+			process, entry.key.ProcessIncarnation,
+		)
+		if processErr != nil {
+			result = errors.Join(result, fmt.Errorf(
+				"acquiring P for resolved Java handoff claim: %w", processErr,
+			))
+			continue
+		}
+		if !processAcquired {
+			continue
+		}
+
+		mutation, acquired, mutationErr := c.acquireHandoffCleanupMutation(entry.key)
+		if mutationErr != nil {
+			result = errors.Join(result, mutationErr)
+			// A committed-but-uncertain acquisition keeps M closed. The tagged
+			// mutation is recoverable by sweepRetiredHandoffMutations.
+			continue
+		}
+		if !acquired {
+			continue
+		}
+		marked, markErr := c.markResolvedHandoffCleanupMutation(entry.key, &mutation)
+		if markErr != nil {
+			result = errors.Join(result, markErr)
+			continue
+		}
+		if !marked {
+			continue
+		}
+
+		retainMutation, reclaimErr := c.reclaimHandoffClaimUnderMutation(
+			entry.key, entry.value, &mutation,
+		)
+		if reclaimErr != nil {
+			result = errors.Join(result, reclaimErr)
+		}
+		if retainMutation {
+			// A map error makes H/C state uncertain. Preserve M so no
+			// cooperative publisher can cross that uncertainty; its tagged value
+			// makes the fence recoverable on a later sweep.
+			continue
+		}
+		if releaseErr := c.releaseHandoffCleanupMutation(entry.key, mutation); releaseErr != nil {
+			result = errors.Join(result, releaseErr)
+		}
+	}
+	return result
+}
+
+// reclaimHandoffClaimUnderMutation returns whether M must remain installed.
+// The two exact C/H pairs are deliberately explicit: only their second pair
+// authorizes deletion, and cleanupDeleteExact adds the final exact-value reads
+// required before the kernel's key-only HASH delete.
+func (c *Cleanup) reclaimHandoffClaimUnderMutation(
+	key handoffKey,
+	expected handoffClaimValue,
+	mutation *handoffClaimValue,
+) (bool, error) {
+	for range 2 {
+		exact, claimErr := cleanupExactMatches(c.maps.handoffClaims, key, expected)
+		if claimErr != nil {
+			return true, fmt.Errorf("revalidating resolved Java handoff claim: %w", claimErr)
+		}
+		if !exact {
+			return false, nil
+		}
+
+		var handoff taskLink
+		handoffErr := c.maps.handoffs.Lookup(&key, &handoff)
+		if handoffErr == nil {
+			absent, claimErr := c.terminalHandoffClaimAbsent(key)
+			if claimErr != nil {
+				return true, fmt.Errorf(
+					"revalidating Java handoff claim after H observation: %w", claimErr,
+				)
+			}
+			if !absent {
+				return false, nil
+			}
+			return c.prepareTerminalHandoffCleanup(key, mutation)
+		}
+		if !errors.Is(handoffErr, ebpf.ErrKeyNotExist) {
+			return true, fmt.Errorf(
+				"revalidating resolved Java handoff absence: %w", handoffErr,
+			)
+		}
+	}
+
+	if _, deleteErr := cleanupDeleteExact(c.maps.handoffClaims, key, expected); deleteErr != nil {
+		return true, fmt.Errorf("deleting resolved Java handoff claim: %w", deleteErr)
+	}
+	return false, nil
 }
 
 func (c *Cleanup) complete() bool {
 	return c.coordinator != nil && c.maps.remoteParents != nil && c.maps.tasks != nil &&
 		c.maps.virtualThreads != nil && c.maps.vtIdentities != nil &&
-		c.maps.incarnations != nil && c.maps.connections != nil &&
+		c.maps.authorized != nil && c.maps.incarnations != nil && c.maps.connections != nil &&
 		c.maps.cookieConnections != nil &&
 		c.maps.ambiguity != nil && c.maps.owners != nil && c.maps.states != nil &&
 		c.maps.generations != nil && c.maps.terminals != nil && c.maps.claims != nil &&
 		c.maps.aliasReplays != nil && c.maps.ownerGuards != nil &&
-		c.maps.handoffs != nil && c.maps.handoffClaims != nil && c.maps.retired != nil &&
+		c.maps.handoffs != nil && c.maps.handoffClaims != nil &&
+		c.maps.handoffMutations != nil && c.maps.taskClaims != nil &&
+		c.maps.threadMappingClaims != nil &&
+		c.maps.retired != nil &&
 		c.maps.sslPrewrite != nil && c.maps.sslPrewriteConnectionAmbiguity != nil &&
 		c.maps.sslPrewriteConnectionClaims != nil && c.maps.sslPrewriteConnectionOwners != nil
 }
@@ -2208,29 +4116,28 @@ func (c *Cleanup) terminalTailCleanupAuthority(
 	key stateKey,
 	claim *generationClaim,
 	now time.Duration,
-) (terminalValue, bool, bool, error) {
+) (bool, error) {
 	var terminal terminalValue
 	if err := c.maps.terminals.Lookup(&key.Owner, &terminal); err != nil {
 		if errors.Is(err, ebpf.ErrKeyNotExist) {
-			return terminalValue{}, false, false, nil
+			return false, nil
 		}
-		return terminalValue{}, false, false,
-			fmt.Errorf("checking terminal fence tail: %w", err)
+		return false, fmt.Errorf("checking terminal fence tail: %w", err)
 	}
 	if terminal.Generation != key.Generation {
-		return terminalValue{}, false, false, nil
+		return false, nil
 	}
 	if !validTerminalValue(terminal) ||
 		!c.generationCleanupFenceExpired(now, terminal.ObservedMonotonicNS) {
-		return terminal, true, false, nil
+		return true, nil
 	}
 	if claim != nil &&
 		(claim.ProcessIncarnation != terminal.ProcessIncarnation ||
 			claim.Reserved[0] != terminal.Lifecycle) {
-		return terminal, true, false, nil
+		return true, nil
 	}
-	complete, err := c.exactTerminalGenerationCleanupComplete(key, terminal)
-	return terminal, true, complete, err
+	_, err := c.exactTerminalGenerationCleanupComplete(key, terminal)
+	return true, err
 }
 
 func (c *Cleanup) finishGenerationCleanupFenced(
@@ -2429,7 +4336,7 @@ func (c *Cleanup) releaseGenerationCleanupClaimGuardTail(
 		!c.generationCleanupFenceExpired(now, guard.ObservedMonotonicNS) {
 		return false, nil
 	}
-	_, terminalPresent, _, terminalErr := c.terminalTailCleanupAuthority(key, &claim, now)
+	terminalPresent, terminalErr := c.terminalTailCleanupAuthority(key, &claim, now)
 	if terminalErr != nil || terminalPresent {
 		return false, terminalErr
 	}
@@ -2760,7 +4667,7 @@ func (c *Cleanup) recoverMarkerFreeActiveReplayTail(
 		}
 		return generationClaimMatches(c.maps.claims, key, claim)
 	}
-	_, err := c.publishFreshGenerationCleanupMarkerExact(
+	err := c.publishFreshGenerationCleanupMarkerExact(
 		key, now, "active-replay cleanup marker", validate,
 	)
 	return true, err
@@ -2804,7 +4711,7 @@ func (c *Cleanup) releaseExactMarkerTailGuardTail(
 	guard generationClaim,
 	now time.Duration,
 	marker *uint64,
-) (bool, error) {
+) error {
 	if !validExactMarkerTailCleanupClaim(key, claim) ||
 		!validGenerationCleanupGuard(key.Owner, guard) ||
 		guard.ProcessIncarnation != key.Generation ||
@@ -2814,7 +4721,7 @@ func (c *Cleanup) releaseExactMarkerTailGuardTail(
 		!c.generationCleanupFenceExpired(now, guard.ObservedMonotonicNS) ||
 		(marker != nil && (*marker == 0 ||
 			!c.generationCleanupFenceExpired(now, *marker))) {
-		return false, nil
+		return nil
 	}
 	validate := func() (bool, error) {
 		terminalAbsent, err := c.generationTerminalAbsent(key)
@@ -2842,17 +4749,17 @@ func (c *Cleanup) releaseExactMarkerTailGuardTail(
 	for range 2 {
 		valid, err := validate()
 		if err != nil || !valid {
-			return false, err
+			return err
 		}
 	}
 	c.recordFenceRetirementAttempt(key)
 	deleted, err := cleanupDeleteExact(c.maps.ownerGuards, key.Owner, guard)
 	if err != nil || !deleted {
-		return false, err
+		return err
 	}
 	c.recordReleasedSweepGuard(key.Owner, guard)
 	c.clearCurrentSweepGuard(key.Owner, guard)
-	return true, nil
+	return nil
 }
 
 func (c *Cleanup) publishingCleanupRootCoherent(
@@ -3082,31 +4989,6 @@ func (c *Cleanup) releaseGenerationPublishingCleanupTail(
 	c.recordReleasedSweepGuard(key.Owner, guard)
 	c.clearCurrentSweepGuard(key.Owner, guard)
 	return true, nil
-}
-
-func (c *Cleanup) releaseGenerationCleanupMarkerGuardTail(
-	key stateKey,
-	markedAt uint64,
-	guard generationClaim,
-	now time.Duration,
-) (bool, error) {
-	guardKey := key.Owner
-	if key.Generation == 0 || key.Reserved != 0 || markedAt == 0 ||
-		!validGenerationCleanupGuard(guardKey, guard) ||
-		guard.ProcessIncarnation != key.Generation ||
-		c.guardCreatedThisSweep(guardKey, guard) ||
-		!c.generationCleanupFenceExpired(now, markedAt) ||
-		!c.generationCleanupFenceExpired(now, guard.ObservedMonotonicNS) {
-		return false, nil
-	}
-	if _, touched := c.currentSweepAmbiguities[key]; touched {
-		return false, nil
-	}
-	// M+ without E can be a paused producer between the required G -> E -> M
-	// acquisition steps. Neither M nor G is cleanup authority on its own, even
-	// after they age and even when a snapshot currently sees no payload. Preserve
-	// both until an independently selected generation root can fill E.
-	return false, nil
 }
 
 func (c *Cleanup) exactMarkerTailReplaySafe(
@@ -3368,7 +5250,7 @@ func (c *Cleanup) releaseGenerationCleanupGuardTail(
 	} else if !errors.Is(err, ebpf.ErrKeyNotExist) {
 		return false, err
 	}
-	_, terminalPresent, _, terminalErr := c.terminalTailCleanupAuthority(key, nil, now)
+	terminalPresent, terminalErr := c.terminalTailCleanupAuthority(key, nil, now)
 	if terminalErr != nil || terminalPresent {
 		return false, terminalErr
 	}
@@ -3897,9 +5779,7 @@ func (c *Cleanup) sweepOrphans(
 			entry.value.Reserved != ([3]byte{}) {
 			cleaned, cleanupErr := c.quarantineMalformedState(entry.key, entry.value)
 			if cleaned {
-				stats.recordGeneration(
-					cleanedGenerations, canonicalGenerationKey(entry.key), false,
-				)
+				stats.recordGeneration(cleanedGenerations, canonicalGenerationKey(entry.key))
 			}
 			if cleanupErr != nil {
 				result = errors.Join(result, cleanupErr)
@@ -3916,8 +5796,7 @@ func (c *Cleanup) sweepOrphans(
 			continue
 		}
 		if !processRetired {
-			_, coherentReservation, reservationErr :=
-				c.coherentGenerationPublishingReservation(entry.key)
+			_, coherentReservation, reservationErr := c.coherentGenerationPublishingReservation(entry.key)
 			if reservationErr != nil {
 				result = errors.Join(result, reservationErr)
 				continue
@@ -3932,7 +5811,7 @@ func (c *Cleanup) sweepOrphans(
 		}
 		cleaned, cleanupErr := c.cleanupOrphanState(entry.key, entry.value)
 		if cleaned {
-			stats.recordGeneration(cleanedGenerations, entry.key, false)
+			stats.recordGeneration(cleanedGenerations, entry.key)
 		}
 		if cleanupErr != nil {
 			result = errors.Join(result, cleanupErr)
@@ -3973,8 +5852,7 @@ func (c *Cleanup) sweepOrphans(
 		}
 		for key, roots := range physicalRoots {
 			rootSnapshot := roots
-			processIncarnation, provenanceErr :=
-				c.physicalGenerationCleanupProcessIncarnation(key)
+			processIncarnation, provenanceErr := c.physicalGenerationCleanupProcessIncarnation(key)
 			if provenanceErr != nil {
 				result = errors.Join(result, provenanceErr)
 				continue
@@ -4092,11 +5970,13 @@ func (c *Cleanup) sweepOrphans(
 			))
 		}
 	}
-	// Task links, handoff links, and handoff claims are bounded by LRU maps.
-	// Their presence is also a fail-closed protocol signal: deleting an aged
-	// claim could re-enable a delayed token, and LRU eviction could replace the
-	// enumerated value before a key-only userspace delete. Leave all three map
-	// families to BPF and the kernel's capacity bound.
+	// Live task and handoff links remain protocol-owned. Retired task links were
+	// reclaimed earlier while userspace held the exact T(execution) fence;
+	// retired handoff keys embed their capability and were likewise converged.
+	// Handoff admission tickets were reclaimed earlier only after exact no-H
+	// observations under M; untagged rolling-version values are treated just as
+	// conservatively. Foreign task mutation claims are synchronous BPF
+	// serialization fences and are never age-deleted here.
 
 	terminals, err := cleanupMapEntries[Identity, terminalValue](c.maps.terminals)
 	if err != nil {
@@ -4111,7 +5991,7 @@ func (c *Cleanup) sweepOrphans(
 				if entry.value.Generation == 0 {
 					stats.Cleaned++
 				} else {
-					stats.recordGeneration(cleanedGenerations, generation, false)
+					stats.recordGeneration(cleanedGenerations, generation)
 				}
 			}
 			if cleanupErr != nil {
@@ -4178,8 +6058,7 @@ func (c *Cleanup) sweepOrphans(
 			continue
 		}
 		if !processRetired {
-			_, coherentReservation, reservationErr :=
-				c.coherentGenerationPublishingReservation(generation)
+			_, coherentReservation, reservationErr := c.coherentGenerationPublishingReservation(generation)
 			if reservationErr != nil {
 				result = errors.Join(result, reservationErr)
 				continue
@@ -4198,7 +6077,7 @@ func (c *Cleanup) sweepOrphans(
 			cleaned, cleanupErr = c.cleanupOrphanOwner(entry.key, entry.value)
 		}
 		if cleaned {
-			stats.recordGeneration(cleanedGenerations, generation, false)
+			stats.recordGeneration(cleanedGenerations, generation)
 		}
 		if cleanupErr != nil {
 			result = errors.Join(result, cleanupErr)
@@ -4224,7 +6103,7 @@ func (c *Cleanup) sweepOrphans(
 			cleaned, quarantineErr := c.quarantineMalformedFallback(entry.key, entry.value)
 			if cleaned {
 				if malformedGeneration != (stateKey{}) {
-					stats.recordGeneration(cleanedGenerations, malformedGeneration, false)
+					stats.recordGeneration(cleanedGenerations, malformedGeneration)
 				} else {
 					stats.Cleaned++
 				}
@@ -4242,7 +6121,7 @@ func (c *Cleanup) sweepOrphans(
 					entry.key, fallbackOwner, entry.value, record,
 				)
 				if fallbackCleaned {
-					stats.recordGeneration(cleanedGenerations, key, false)
+					stats.recordGeneration(cleanedGenerations, key)
 				}
 				if cleanupErr != nil {
 					result = errors.Join(result, cleanupErr)
@@ -4259,8 +6138,7 @@ func (c *Cleanup) sweepOrphans(
 		if cleaned || !cleanupExpired(parentsNow, record.ObservedMonotonicNS, c.ttl) {
 			continue
 		}
-		publishingClaim, coherentReservation, reservationErr :=
-			c.coherentGenerationPublishingReservation(key)
+		publishingClaim, coherentReservation, reservationErr := c.coherentGenerationPublishingReservation(key)
 		if reservationErr != nil {
 			result = errors.Join(result, reservationErr)
 			continue
@@ -4281,7 +6159,7 @@ func (c *Cleanup) sweepOrphans(
 		if generationErr := c.maps.generations.Lookup(&key, &generation); generationErr == nil {
 			generationCleaned, cleanupErr := c.cleanupGeneration(key, generation)
 			if generationCleaned {
-				stats.recordGeneration(cleanedGenerations, key, false)
+				stats.recordGeneration(cleanedGenerations, key)
 			}
 			if cleanupErr != nil {
 				result = errors.Join(result, cleanupErr)
@@ -4295,7 +6173,7 @@ func (c *Cleanup) sweepOrphans(
 		if stateErr := c.maps.states.Lookup(&key, &state); stateErr == nil {
 			stateCleaned, cleanupErr := c.cleanupOrphanState(key, state)
 			if stateCleaned {
-				stats.recordGeneration(cleanedGenerations, key, false)
+				stats.recordGeneration(cleanedGenerations, key)
 			}
 			if cleanupErr != nil {
 				result = errors.Join(result, cleanupErr)
@@ -4307,7 +6185,7 @@ func (c *Cleanup) sweepOrphans(
 		}
 		fallbackCleaned, cleanupErr := c.cleanupOrphanFallback(entry.key, entry.value, record)
 		if fallbackCleaned {
-			stats.recordGeneration(cleanedGenerations, key, false)
+			stats.recordGeneration(cleanedGenerations, key)
 		}
 		if cleanupErr != nil {
 			result = errors.Join(result, cleanupErr)
@@ -4454,7 +6332,7 @@ func (c *Cleanup) sweepOrphans(
 					}
 					continue
 				}
-				if _, releaseErr := c.releaseExactMarkerTailGuardTail(
+				if releaseErr := c.releaseExactMarkerTailGuardTail(
 					entry.key, entry.value, guard, tailsNow, nil,
 				); releaseErr != nil {
 					result = errors.Join(
@@ -4477,9 +6355,8 @@ func (c *Cleanup) sweepOrphans(
 			if complete {
 				var guard generationClaim
 				guardErr := c.maps.ownerGuards.Lookup(&entry.key.Owner, &guard)
-				switch {
-				case guardErr == nil && validGenerationCleanupGuard(entry.key.Owner, guard) &&
-					guard.ProcessIncarnation == entry.key.Generation:
+				if guardErr == nil && validGenerationCleanupGuard(entry.key.Owner, guard) &&
+					guard.ProcessIncarnation == entry.key.Generation {
 					_, guardErr = c.releaseGenerationCleanupClaimGuardTail(
 						entry.key, entry.value, tailsNow,
 					)
@@ -4591,7 +6468,7 @@ func (c *Cleanup) sweepOrphans(
 					}
 					continue
 				}
-				if _, releaseErr := c.releaseExactMarkerTailGuardTail(
+				if releaseErr := c.releaseExactMarkerTailGuardTail(
 					entry.key, entry.value, guard, tailsNow, &marker,
 				); releaseErr != nil {
 					result = errors.Join(
@@ -4632,7 +6509,7 @@ func (c *Cleanup) sweepOrphans(
 			continue
 		}
 		if cleaned {
-			stats.recordGeneration(cleanedGenerations, entry.key, false)
+			stats.recordGeneration(cleanedGenerations, entry.key)
 		}
 		if _, finishErr := c.finishGenerationCleanupFenced(
 			entry.key, ownership,
@@ -5355,7 +7232,7 @@ func (c *Cleanup) reconstructTerminalGenerationCleanupMarker(
 		}
 		return cleanupExactMatches(c.maps.terminals, key.Owner, terminal)
 	}
-	_, err := c.publishFreshGenerationCleanupMarkerExact(
+	err := c.publishFreshGenerationCleanupMarkerExact(
 		key, now, "terminal cleanup marker", validate,
 	)
 	return err
@@ -5366,14 +7243,14 @@ func (c *Cleanup) publishFreshGenerationCleanupMarkerExact(
 	now time.Duration,
 	description string,
 	validate func(*uint64) (bool, error),
-) (bool, error) {
+) error {
 	if key.Generation == 0 || key.Reserved != 0 || now <= 0 || validate == nil {
-		return false, nil
+		return nil
 	}
 	for range 2 {
 		valid, err := validate(nil)
 		if err != nil || !valid {
-			return false, err
+			return err
 		}
 	}
 
@@ -5388,30 +7265,30 @@ func (c *Cleanup) publishFreshGenerationCleanupMarkerExact(
 	lookupErr := c.maps.ambiguity.Lookup(&key, &current)
 	if lookupErr != nil {
 		if updateErr != nil {
-			return false, errors.Join(
+			return errors.Join(
 				fmt.Errorf("publishing %s: %w", description, updateErr),
 				fmt.Errorf("checking uncertain %s: %w", description, lookupErr),
 			)
 		}
-		return false, fmt.Errorf("checking published %s: %w", description, lookupErr)
+		return fmt.Errorf("checking published %s: %w", description, lookupErr)
 	}
 	if current != markedAt {
 		if updateErr != nil {
-			return false, fmt.Errorf("publishing %s: %w", description, updateErr)
+			return fmt.Errorf("publishing %s: %w", description, updateErr)
 		}
-		return false, fmt.Errorf("%s changed during publication", description)
+		return fmt.Errorf("%s changed during publication", description)
 	}
 	valid, validationErr := validate(&markedAt)
 	if updateErr != nil {
 		updateErr = fmt.Errorf("publishing %s: %w", description, updateErr)
 	}
 	if validationErr != nil {
-		return false, errors.Join(updateErr, validationErr)
+		return errors.Join(updateErr, validationErr)
 	}
 	if !valid {
-		return false, updateErr
+		return updateErr
 	}
-	return updateErr == nil, updateErr
+	return updateErr
 }
 
 func (c *Cleanup) releaseTerminalGuardTail(

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+
+	"go.opentelemetry.io/obi/pkg/appolly/discover/exec"
 )
 
 type LibModule struct {
@@ -14,10 +16,10 @@ type LibModule struct {
 	Closers    []io.Closer
 }
 
-// Hold onto Linux inode numbers of files that are already instrumented, e.g. libssl.so.3
-type InstrumentedLibsT map[uint64]*LibModule
+// Hold onto identities of files that are already instrumented, e.g. libssl.so.3.
+type InstrumentedLibsT map[exec.FileID]*LibModule
 
-func (libs InstrumentedLibsT) At(id uint64) *LibModule {
+func (libs InstrumentedLibsT) At(id exec.FileID) *LibModule {
 	module, ok := libs[id]
 
 	if !ok {
@@ -28,7 +30,7 @@ func (libs InstrumentedLibsT) At(id uint64) *LibModule {
 	return module
 }
 
-func (libs InstrumentedLibsT) Find(id uint64) *LibModule {
+func (libs InstrumentedLibsT) Find(id exec.FileID) *LibModule {
 	module, ok := libs[id]
 
 	if ok {
@@ -38,22 +40,22 @@ func (libs InstrumentedLibsT) Find(id uint64) *LibModule {
 	return nil
 }
 
-func (libs InstrumentedLibsT) AddRef(id uint64) *LibModule {
+func (libs InstrumentedLibsT) AddRef(id exec.FileID) *LibModule {
 	module := libs.At(id)
 	module.References++
 
 	return module
 }
 
-func (libs InstrumentedLibsT) RemoveRef(id uint64) (*LibModule, error) {
+func (libs InstrumentedLibsT) RemoveRef(id exec.FileID) (*LibModule, error) {
 	module := libs.Find(id)
 
 	if module == nil {
-		return nil, fmt.Errorf("attempt to remove reference of unknown module: %d", id)
+		return nil, fmt.Errorf("attempt to remove reference of unknown module: device %d inode %d", id.Dev, id.Ino)
 	}
 
 	if module.References == 0 {
-		return module, fmt.Errorf("attempt to remove reference of unreferenced module: %d", id)
+		return module, fmt.Errorf("attempt to remove reference of unreferenced module: device %d inode %d", id.Dev, id.Ino)
 	}
 
 	module.References--

@@ -26,10 +26,14 @@ import (
 )
 
 const (
-	MaxNotifyFiles          = 256
-	maxNotifyScanEntries    = MaxNotifyFiles * 16
-	notifyDirectoryReadSize = 64
+	MaxNotifyFiles                = 256
+	maxNotifyScanEntries          = MaxNotifyFiles * 16
+	notifyDirectoryReadSize       = 64
+	maxOpenJ9RejectedClients      = 256
+	defaultOpenJ9HandshakeTimeout = time.Second
 )
+
+var openJ9HandshakeTimeout = defaultOpenJ9HandshakeTimeout
 
 type j9Attacher struct {
 	notifyLock [MaxNotifyFiles]int
@@ -365,16 +369,27 @@ func notifySemaphore(ctx context.Context, tmpPath string, value, notifyCount int
 	return nil
 }
 
-func acceptClient(ctx context.Context, s int, key uint64) (int, error) {
+func acceptClient(
+	ctx context.Context,
+	s int,
+	key uint64,
+	validatePeer ...func(int) error,
+) (int, error) {
 	if err := unix.SetNonblock(s, true); err != nil {
 		return -1, fmt.Errorf("could not make JVM response socket nonblocking: %w", err)
 	}
 
-	var nfd int
+	expected := fmt.Sprintf("ATTACH_CONNECTED %016x ", key)
+	rejected := 0
+	var lastRejected error
 	for {
 		if err := waitFD(ctx, s, unix.POLLIN); err != nil {
-			return -1, fmt.Errorf("jvm did not respond: %w", err)
+			return -1, errors.Join(
+				fmt.Errorf("jvm did not respond: %w", err),
+				lastRejected,
+			)
 		}
+		var nfd int
 		var err error
 		nfd, _, err = syscall.Accept(s)
 		if errors.Is(err, syscall.EINTR) || errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
@@ -383,35 +398,75 @@ func acceptClient(ctx context.Context, s int, key uint64) (int, error) {
 		if err != nil {
 			return -1, fmt.Errorf("jvm did not respond: %w", err)
 		}
-		break
-	}
-	if err := unix.SetNonblock(nfd, true); err != nil {
-		_ = syscall.Close(nfd)
-		return -1, fmt.Errorf("could not make JVM connection nonblocking: %w", err)
-	}
-
-	buf := make([]byte, 35)
-	off := 0
-	for off < len(buf) {
-		n, err := readContext(ctx, nfd, buf[off:])
-		if err != nil {
+		if err := unix.SetNonblock(nfd, true); err != nil {
 			_ = syscall.Close(nfd)
-			return -1, fmt.Errorf("the JVM connection was prematurely closed: %w", err)
+			return -1, fmt.Errorf("could not make JVM connection nonblocking: %w", err)
 		}
-		if n <= 0 {
+		loopback, err := openJ9ConnectionLoopback(nfd)
+		if err != nil || !loopback {
 			_ = syscall.Close(nfd)
-			return -1, fmt.Errorf("the JVM connection was prematurely closed: %w", io.ErrUnexpectedEOF)
+			rejected++
+			lastRejected = errors.Join(errOpenJ9PeerMismatch, err)
+			if rejected >= maxOpenJ9RejectedClients {
+				return -1, errors.New("too many rejected OpenJ9 attach clients")
+			}
+			continue
 		}
-		off += n
-	}
 
-	expected := fmt.Sprintf("ATTACH_CONNECTED %016x ", key)
-	if !bytes.Equal(buf[:len(expected)], []byte(expected)) {
-		_ = syscall.Close(nfd)
-		return -1, fmt.Errorf("unexpected JVM response %s", buf[:len(expected)])
+		buf := make([]byte, 35)
+		off := 0
+		handshakeCtx, cancelHandshake := context.WithTimeout(ctx, openJ9HandshakeTimeout)
+		for off < len(buf) {
+			n, err := readContext(handshakeCtx, nfd, buf[off:])
+			if err != nil {
+				_ = syscall.Close(nfd)
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					cancelHandshake()
+					return -1, ctxErr
+				}
+				lastRejected = fmt.Errorf("OpenJ9 client closed during handshake: %w", err)
+				break
+			}
+			if n <= 0 {
+				_ = syscall.Close(nfd)
+				lastRejected = fmt.Errorf("OpenJ9 client closed during handshake: %w", io.ErrUnexpectedEOF)
+				break
+			}
+			off += n
+		}
+		cancelHandshake()
+		if off != len(buf) {
+			rejected++
+			if rejected >= maxOpenJ9RejectedClients {
+				return -1, errors.New("too many rejected OpenJ9 attach clients")
+			}
+			continue
+		}
+		if !bytes.Equal(buf[:len(expected)], []byte(expected)) {
+			_ = syscall.Close(nfd)
+			rejected++
+			lastRejected = errors.New("OpenJ9 client supplied an invalid attach key")
+			if rejected >= maxOpenJ9RejectedClients {
+				return -1, errors.New("too many rejected OpenJ9 attach clients")
+			}
+			continue
+		}
+		if len(validatePeer) != 0 && validatePeer[0] != nil {
+			if err := validatePeer[0](nfd); err != nil {
+				_ = syscall.Close(nfd)
+				if !errors.Is(err, errOpenJ9PeerMismatch) {
+					return -1, fmt.Errorf("validating exact OpenJ9 client: %w", err)
+				}
+				rejected++
+				lastRejected = err
+				if rejected >= maxOpenJ9RejectedClients {
+					return -1, errors.New("too many rejected OpenJ9 attach clients")
+				}
+				continue
+			}
+		}
+		return nfd, nil
 	}
-
-	return nfd, nil
 }
 
 func (j *j9Attacher) lockNotificationFiles(ctx context.Context, tmpPath string) (int, error) {
@@ -596,7 +651,19 @@ func (j *j9Attacher) detachContext(ctx context.Context) error {
 	return errors.Join(detachErr, syscall.Close(fd))
 }
 
-func (j *j9Attacher) jattachOpenJ9(ctx context.Context, tmpPath string, nspid int, argv []string) (reader io.ReadCloser, err error) {
+func (j *j9Attacher) jattachOpenJ9(
+	ctx context.Context,
+	tmpPath string,
+	nspid int,
+	argv []string,
+	target *JAttacher,
+) (reader io.ReadCloser, err error) {
+	if target != nil {
+		if err := target.ValidateTarget(); err != nil {
+			return nil, fmt.Errorf("validating exact OpenJ9 target: %w", err)
+		}
+	}
+
 	attachLock, err := acquireLock(ctx, tmpPath, "", "_attachlock")
 	if err != nil {
 		return nil, fmt.Errorf("could not acquire attach lock: %w", err)
@@ -643,7 +710,23 @@ func (j *j9Attacher) jattachOpenJ9(ctx context.Context, tmpPath string, nspid in
 		return nil, fmt.Errorf("could not notify semaphore: %w", err)
 	}
 
-	fd, err := acceptClient(ctx, s, key)
+	var validatePeer func(int) error
+	if target != nil {
+		credentialsRestored := false
+		validatePeer = func(fd int) error {
+			if !credentialsRestored {
+				if err := setThreadCredentials(target.myUID, target.myGID); err != nil {
+					return fmt.Errorf(
+						"restoring tracer credentials before exact OpenJ9 verification: %w",
+						err,
+					)
+				}
+				credentialsRestored = true
+			}
+			return target.validateOpenJ9Peer(ctx, fd)
+		}
+	}
+	fd, err := acceptClient(ctx, s, key, validatePeer)
 	if err != nil {
 		return nil, err
 	}
@@ -673,6 +756,11 @@ func (j *j9Attacher) jattachOpenJ9(ctx context.Context, tmpPath string, nspid in
 	j.logger.Info("connected to remote JVM")
 
 	cmd := translateCommand(argv)
+	if target != nil {
+		if validationErr := target.ValidateTarget(); validationErr != nil {
+			return nil, fmt.Errorf("revalidating exact OpenJ9 target before command: %w", validationErr)
+		}
+	}
 
 	if writeErr := writeCommandContext(ctx, fd, cmd); writeErr != nil {
 		return nil, errors.Join(fmt.Errorf("error writing to socket: %w", writeErr), j.closeFD())

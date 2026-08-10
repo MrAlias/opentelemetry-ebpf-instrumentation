@@ -7,6 +7,9 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"go.opentelemetry.io/obi/pkg/appolly/discover/exec"
 )
 
 type dummyCloser struct {
@@ -21,7 +24,7 @@ func (d *dummyCloser) Close() error {
 func TestInstrumetedLibsT(t *testing.T) {
 	libs := make(InstrumentedLibsT)
 
-	const id = uint64(10)
+	id := exec.FileID{Dev: 1, Ino: 10}
 
 	assert.Nil(t, libs.Find(id))
 
@@ -32,7 +35,7 @@ func TestInstrumetedLibsT(t *testing.T) {
 	closer := &dummyCloser{closed: false}
 	module.Closers = append(module.Closers, closer)
 
-	removeRef := func(id uint64) *LibModule {
+	removeRef := func(id exec.FileID) *LibModule {
 		m, _ := libs.RemoveRef(id)
 		return m
 	}
@@ -58,4 +61,22 @@ func TestInstrumetedLibsT(t *testing.T) {
 	assert.True(t, closer.closed)
 
 	assert.Nil(t, libs.Find(id))
+}
+
+func TestInstrumentedLibsSeparateSameInodeOnDifferentDevices(t *testing.T) {
+	libs := make(InstrumentedLibsT)
+	first := exec.FileID{Dev: 1, Ino: 10}
+	second := exec.FileID{Dev: 2, Ino: 10}
+
+	firstModule := libs.AddRef(first)
+	secondModule := libs.AddRef(second)
+
+	require.NotSame(t, firstModule, secondModule)
+	assert.Same(t, firstModule, libs.Find(first))
+	assert.Same(t, secondModule, libs.Find(second))
+
+	_, err := libs.RemoveRef(first)
+	require.NoError(t, err)
+	assert.Nil(t, libs.Find(first))
+	assert.Same(t, secondModule, libs.Find(second))
 }

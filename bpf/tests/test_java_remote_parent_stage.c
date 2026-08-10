@@ -111,6 +111,7 @@ static u64 incoming_generation;
 static incoming_trace_candidate_t incoming_candidate;
 static u8 incoming_claim;
 static java_remote_parent_state_t stage_state_scratch;
+static java_remote_parent_alias_replay_retain_workspace_t alias_replay_retain_workspace;
 static java_remote_parent_owner_t stored_owner;
 static pid_key_t stored_owner_key;
 static int owner_present;
@@ -344,6 +345,9 @@ static void *test_map_lookup(void *map, const void *key) {
     }
     if (map == &java_remote_parent_stage_state_storage) {
         return &stage_state_scratch;
+    }
+    if (map == &java_remote_parent_alias_replay_retain_workspace_storage) {
+        return &alias_replay_retain_workspace;
     }
     if (map == &java_remote_parent_owners && owner_present &&
         same_key(key, &stored_owner_key, sizeof(stored_owner_key))) {
@@ -821,6 +825,7 @@ static void reset(const connection_info_t *connection, const tp_info_pid_t *inco
     incoming_candidate = (incoming_trace_candidate_t){.candidate = *incoming};
     incoming_claim = 1;
     memset(&stage_state_scratch, 0, sizeof(stage_state_scratch));
+    memset(&alias_replay_retain_workspace, 0, sizeof(alias_replay_retain_workspace));
     memset(&stored_owner, 0, sizeof(stored_owner));
     memset(&stored_state, 0, sizeof(stored_state));
     memset(&replacement_state, 0, sizeof(replacement_state));
@@ -1616,9 +1621,10 @@ static void test_aliased_generation_blocks_a_second_stage_on_the_same_socket(voi
     stored_state.aliases = 1;
     java_remote_parent_begin_data_receive();
     java_remote_parent_resolution_t direct = {0};
-    java_remote_parent_resolve_exact(&direct, &test_owner, 0, 0);
+    java_remote_parent_resolve_exact(&direct, &test_owner, 0, 0, test_process_incarnation);
     java_remote_parent_resolution_t exact_task = {0};
-    java_remote_parent_resolve_exact(&exact_task, &test_owner, first_generation, 1);
+    java_remote_parent_resolve_exact(
+        &exact_task, &test_owner, first_generation, 1, test_process_incarnation);
     if (owner_present || fallback_present || !state_present || !generation_index_present ||
         !connection_present || !cookie_connection_present || stored_state.aliases != 1 ||
         direct.found || !exact_task.found || exact_task.ambiguous ||

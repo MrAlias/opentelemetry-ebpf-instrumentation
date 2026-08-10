@@ -18,6 +18,9 @@ func FindINodeForPID(_ app.PID) (dev uint64, ino uint64, err error) {
 	return 0, 0, errors.New("FindINodeForPID is not supported on this platform")
 }
 
-func findExecElf(_ *services.ProcessInfo, _ *svc.Attrs) (*exec.FileInfo, error) {
+func findExecElf(process *services.ProcessInfo, _ *svc.Attrs) (*exec.FileInfo, error) {
+	if process != nil {
+		_ = process.CloseProcessHandle()
+	}
 	return nil, errors.New("findExecElf is not supported on this platform")
 }

@@ -158,7 +158,7 @@ func TestCleanupFinalAliasReplayProofAcceptsReferenceDrift(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ready)
 	final := replays.values[replayKey].(aliasReplayValue)
-	require.Greater(t, final.References, uint32(0))
+	require.Positive(t, final.References)
 	final.References--
 	replays.values[replayKey] = final
 
@@ -245,7 +245,8 @@ func TestCleanupRetiredAliasReplayCannotAuthorizeLiveSameSocketSuccessor(t *test
 func cleanupSameSocketSuccessorFixture(
 	t *testing.T,
 ) (*MapHandler, *Cleanup, stateKey, stateValue, aliasReplayKey, aliasReplayValue,
-	sameSocketSuccessorSnapshot, terminalValue) {
+	sameSocketSuccessorSnapshot, terminalValue,
+) {
 	t.Helper()
 	owner := Identity{TID: 3, PID: 2, Namespace: 1}
 	oldKey := stateKey{Owner: owner, Generation: 10}
@@ -265,7 +266,7 @@ func cleanupSameSocketSuccessorFixture(
 	)
 	handler.aliasReplays.(*fakeBridgeMap).values[replayKey] = oldReplay
 
-	successor := seedSameSocketSuccessorForTest(t, handler, oldKey, oldState, 11)
+	successor := seedSameSocketSuccessorForTest(t, handler, oldKey, oldState)
 	successor.fallback = validEncodedRecordObservedAt(t, 11, 40*time.Second)
 	successor.state.ObservedMonotonicNS = uint64(40 * time.Second)
 	successor.state.Response = successor.fallback
@@ -291,8 +292,7 @@ func cleanupSameSocketSuccessorFixture(
 }
 
 func TestCleanupSameSocketSuccessorSurvivesOldAliasTeardown(t *testing.T) {
-	handler, cleanup, oldKey, oldState, replayKey, oldReplay, successor, oldTerminal :=
-		cleanupSameSocketSuccessorFixture(t)
+	handler, cleanup, oldKey, oldState, replayKey, oldReplay, successor, oldTerminal := cleanupSameSocketSuccessorFixture(t)
 	seedAgedGenerationCleanupFence(t, cleanup, oldKey, oldState.ProcessIncarnation)
 
 	var total CleanupStats
@@ -322,8 +322,7 @@ func TestCleanupSameSocketSuccessorSurvivesOldAliasTeardown(t *testing.T) {
 func TestCleanupSameSocketSuccessorReplacementAfterReplayFinalizationRetainsOldFence(
 	t *testing.T,
 ) {
-	handler, cleanup, oldKey, oldState, replayKey, oldReplay, successor, oldTerminal :=
-		cleanupSameSocketSuccessorFixture(t)
+	handler, cleanup, oldKey, oldState, replayKey, oldReplay, successor, oldTerminal := cleanupSameSocketSuccessorFixture(t)
 	ownership := seedAgedGenerationCleanupFence(
 		t, cleanup, oldKey, oldState.ProcessIncarnation,
 	)
@@ -373,8 +372,7 @@ func TestCleanupAliasReplayProofFreezesExactReplayKeyAcrossSameSweepRoots(t *tes
 		{name: "old state and generation-index replacement", replaceState: true, replaceIndex: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			handler, cleanup, oldKey, oldState, replayKey, _, _, _ :=
-				cleanupSameSocketSuccessorFixture(t)
+			handler, cleanup, oldKey, oldState, replayKey, _, _, _ := cleanupSameSocketSuccessorFixture(t)
 			ownership := seedAgedGenerationCleanupFence(
 				t, cleanup, oldKey, oldState.ProcessIncarnation,
 			)
@@ -856,7 +854,19 @@ func prepareAliasReplayTailSweep(t *testing.T, cleanup *Cleanup) {
 	cleanup.physicalGenerations = make(map[stateKey]struct{})
 }
 
-func TestCleanupRetiresFinalAliasReplayAfterTwoCompleteNoCarrierSnapshots(t *testing.T) {
+func seedAliasReplayRetirements(
+	cleanup *Cleanup,
+	retired map[retiredProcessKey]struct{},
+) {
+	for key := range retired {
+		delete(cleanup.maps.incarnations.(*fakeBridgeMap).values, key.Process)
+		cleanup.maps.retired.(*fakeBridgeMap).values[key] = uint64(time.Second)
+	}
+}
+
+func TestCleanupRetiresFinalAliasReplayForRetiredProcessAfterTwoCompleteNoCarrierSnapshots(
+	t *testing.T,
+) {
 	cleanup, key, state := aliasReplayCleanupFixture(t)
 	replayKey := aliasReplayKeyForState(key, state)
 	final := boundAliasReplayForTest(aliasReplayValue{
@@ -868,19 +878,62 @@ func TestCleanupRetiresFinalAliasReplayAfterTwoCompleteNoCarrierSnapshots(t *tes
 	replays.values[replayKey] = final
 	now := 100 * time.Second
 	cleanup.monoTimeNow = func() time.Duration { return now }
+	retired := map[retiredProcessKey]struct{}{
+		{
+			Process:            javaProcessIdentity(key.Owner),
+			ProcessIncarnation: replayKey.ProcessIncarnation,
+		}: {},
+	}
+	seedAliasReplayRetirements(cleanup, retired)
 
 	prepareAliasReplayTailSweep(t, cleanup)
-	require.NoError(t, cleanup.sweepAliasReplayTails(nil))
+	require.NoError(t, cleanup.sweepAliasReplayTails(retired))
 	assert.Contains(t, replays.values, replayKey)
 
 	now += javaRemoteParentMinimumFenceAge - time.Nanosecond
 	prepareAliasReplayTailSweep(t, cleanup)
-	require.NoError(t, cleanup.sweepAliasReplayTails(nil))
+	require.NoError(t, cleanup.sweepAliasReplayTails(retired))
 	assert.Contains(t, replays.values, replayKey)
 
 	now += time.Nanosecond
 	prepareAliasReplayTailSweep(t, cleanup)
-	require.NoError(t, cleanup.sweepAliasReplayTails(nil))
+	require.NoError(t, cleanup.sweepAliasReplayTails(retired))
+	assert.NotContains(t, replays.values, replayKey)
+}
+
+func TestCleanupPreservesPositiveAliasReplayWithoutExactRetirementMarker(t *testing.T) {
+	cleanup, key, state := aliasReplayCleanupFixture(t)
+	replayKey := aliasReplayKeyForState(key, state)
+	replay := boundAliasReplayForTest(aliasReplayValue{
+		TransitionMonotonicNS: uint64(90 * time.Second),
+		References:            3,
+		Lifecycle:             lifecycleStale,
+	})
+	replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+	replays.values[replayKey] = replay
+	process := javaProcessIdentity(key.Owner)
+	delete(cleanup.maps.incarnations.(*fakeBridgeMap).values, process)
+	now := 100 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+
+	for range 3 {
+		prepareAliasReplayTailSweep(t, cleanup)
+		require.NoError(t, cleanup.sweepAliasReplayTails(nil))
+		now += javaRemoteParentMinimumFenceAge
+	}
+	assert.Equal(t, replay, replays.values[replayKey],
+		"incarnation absence and P do not exclude a delayed direct CAPTURE retain")
+
+	retiredKey := retiredProcessKey{
+		Process: process, ProcessIncarnation: replayKey.ProcessIncarnation,
+	}
+	cleanup.maps.retired.(*fakeBridgeMap).values[retiredKey] = uint64(time.Second)
+	retired := map[retiredProcessKey]struct{}{retiredKey: {}}
+	prepareAliasReplayTailSweep(t, cleanup)
+	require.NoError(t, cleanup.sweepAliasReplayTails(retired))
+	now += javaRemoteParentMinimumFenceAge
+	prepareAliasReplayTailSweep(t, cleanup)
+	require.NoError(t, cleanup.sweepAliasReplayTails(retired))
 	assert.NotContains(t, replays.values, replayKey)
 }
 
@@ -923,14 +976,25 @@ func TestCleanupGuardOnlyTailAllowsFinalReplaysToOutliveFence(t *testing.T) {
 
 	now := 100 * time.Second
 	cleanup.monoTimeNow = func() time.Duration { return now }
+	retired := map[retiredProcessKey]struct{}{
+		{
+			Process:            javaProcessIdentity(key.Owner),
+			ProcessIncarnation: replayKey.ProcessIncarnation,
+		}: {},
+		{
+			Process:            javaProcessIdentity(predecessorKey.Owner),
+			ProcessIncarnation: predecessorKey.ProcessIncarnation,
+		}: {},
+	}
+	seedAliasReplayRetirements(cleanup, retired)
 	prepareAliasReplayTailSweep(t, cleanup)
-	require.NoError(t, cleanup.sweepAliasReplayTails(nil))
+	require.NoError(t, cleanup.sweepAliasReplayTails(retired))
 	assert.Contains(t, replays.values, replayKey)
 	assert.Contains(t, replays.values, predecessorKey)
 
 	now += javaRemoteParentMinimumFenceAge
 	prepareAliasReplayTailSweep(t, cleanup)
-	require.NoError(t, cleanup.sweepAliasReplayTails(nil))
+	require.NoError(t, cleanup.sweepAliasReplayTails(retired))
 	assert.NotContains(t, replays.values, replayKey)
 	assert.NotContains(t, replays.values, predecessorKey)
 }
@@ -959,11 +1023,15 @@ func TestCleanupAliasReplayCarrierAndIncompleteSnapshotsPreserve(t *testing.T) {
 				Owner:               key.Owner,
 				Generation:          key.Generation,
 				ObservedMonotonicNS: state.ObservedMonotonicNS,
+				ProcessIncarnation:  testProcessIncarnation,
 			}
 			if test.taskCarrier {
 				tasks.values[carrierIdentity] = link
 			}
-			handoff := handoffKey{PID: 2, Namespace: 1, Token: 7}
+			handoff := handoffKey{
+				PID: 2, Namespace: 1, Token: 7,
+				ProcessIncarnation: testProcessIncarnation,
+			}
 			if test.handoffCarrier {
 				cleanup.maps.handoffs.(*fakeBridgeMap).values[handoff] = link
 			}
@@ -995,6 +1063,67 @@ func TestCleanupAliasReplayCarrierAndIncompleteSnapshotsPreserve(t *testing.T) {
 	}
 }
 
+func TestCleanupCrossProcessCarrierDoesNotPreserveAliasReplay(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		taskKey Identity
+		handoff handoffKey
+	}{
+		{
+			name:    "task PID mismatch",
+			taskKey: Identity{TID: 4, PID: 9, Namespace: 1},
+		},
+		{
+			name:    "task namespace mismatch",
+			taskKey: Identity{TID: 4, PID: 2, Namespace: 9},
+		},
+		{
+			name: "handoff PID mismatch",
+			handoff: handoffKey{
+				PID: 9, Namespace: 1, Token: 7,
+				ProcessIncarnation: testProcessIncarnation,
+			},
+		},
+		{
+			name: "handoff namespace mismatch",
+			handoff: handoffKey{
+				PID: 2, Namespace: 9, Token: 7,
+				ProcessIncarnation: testProcessIncarnation,
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cleanup, key, state := aliasReplayCleanupFixture(t)
+			replayKey := aliasReplayKeyForState(key, state)
+			cleanup.maps.aliasReplays.(*fakeBridgeMap).values[replayKey] = boundAliasReplayForTest(aliasReplayValue{
+				TransitionMonotonicNS: uint64(90 * time.Second),
+				Lifecycle:             lifecycleStale,
+			})
+			link := taskLink{
+				Owner:               key.Owner,
+				Generation:          key.Generation,
+				ObservedMonotonicNS: state.ObservedMonotonicNS,
+				ProcessIncarnation:  testProcessIncarnation,
+			}
+			if test.taskKey != (Identity{}) {
+				cleanup.maps.tasks.(*fakeBridgeMap).values[test.taskKey] = link
+			} else {
+				cleanup.maps.handoffs.(*fakeBridgeMap).values[test.handoff] = link
+			}
+
+			for _, now := range []time.Duration{100 * time.Second, 102 * time.Second} {
+				cleanup.monoTimeNow = func() time.Duration { return now }
+				require.NoError(t, cleanup.snapshotAliasReplayState())
+				cleanup.generationSnapshotComplete = true
+				cleanup.stateSnapshotComplete = true
+				cleanup.physicalGenerations = make(map[stateKey]struct{})
+				require.NoError(t, cleanup.sweepAliasReplayTails(nil))
+			}
+			assert.NotContains(t, cleanup.maps.aliasReplays.(*fakeBridgeMap).values, replayKey)
+		})
+	}
+}
+
 func TestCleanupAliasReplayValueChangeRestartsGrace(t *testing.T) {
 	cleanup, key, state := aliasReplayCleanupFixture(t)
 	replayKey := aliasReplayKeyForState(key, state)
@@ -1007,20 +1136,27 @@ func TestCleanupAliasReplayValueChangeRestartsGrace(t *testing.T) {
 	replays.values[replayKey] = initial
 	now := 100 * time.Second
 	cleanup.monoTimeNow = func() time.Duration { return now }
+	retired := map[retiredProcessKey]struct{}{
+		{
+			Process:            javaProcessIdentity(key.Owner),
+			ProcessIncarnation: replayKey.ProcessIncarnation,
+		}: {},
+	}
+	seedAliasReplayRetirements(cleanup, retired)
 	prepareAliasReplayTailSweep(t, cleanup)
-	require.NoError(t, cleanup.sweepAliasReplayTails(nil))
+	require.NoError(t, cleanup.sweepAliasReplayTails(retired))
 
 	changed := initial
 	changed.References++
 	replays.values[replayKey] = changed
 	now += javaRemoteParentMinimumFenceAge
 	prepareAliasReplayTailSweep(t, cleanup)
-	require.NoError(t, cleanup.sweepAliasReplayTails(nil))
+	require.NoError(t, cleanup.sweepAliasReplayTails(retired))
 	assert.Contains(t, replays.values, replayKey)
 
 	now += javaRemoteParentMinimumFenceAge
 	prepareAliasReplayTailSweep(t, cleanup)
-	require.NoError(t, cleanup.sweepAliasReplayTails(nil))
+	require.NoError(t, cleanup.sweepAliasReplayTails(retired))
 	assert.NotContains(t, replays.values, replayKey)
 }
 
@@ -1080,8 +1216,8 @@ func TestCleanupActiveAliasReplayNeedsZeroReferencesWhileLive(t *testing.T) {
 	}
 	assert.Contains(t, replays.values, replayKey)
 
-	// Once strict retrieval TTL proves that no alias can resume, a stable
-	// reference overcount is reclaimable under the same two-snapshot proof.
+	// Retrieval expiry is not publisher serialization: a live positive
+	// reference remains preservation authority even after TTL.
 	now = time.Duration(replayKey.ObservedMonotonicNS) + cleanup.ttl + time.Nanosecond
 	prepareAliasReplayTailSweep(t, cleanup)
 	require.NoError(t, cleanup.sweepAliasReplayTails(nil))
@@ -1089,6 +1225,20 @@ func TestCleanupActiveAliasReplayNeedsZeroReferencesWhileLive(t *testing.T) {
 	now += javaRemoteParentMinimumFenceAge
 	prepareAliasReplayTailSweep(t, cleanup)
 	require.NoError(t, cleanup.sweepAliasReplayTails(nil))
+	assert.Contains(t, replays.values, replayKey)
+
+	retired := map[retiredProcessKey]struct{}{
+		{
+			Process:            javaProcessIdentity(key.Owner),
+			ProcessIncarnation: replayKey.ProcessIncarnation,
+		}: {},
+	}
+	seedAliasReplayRetirements(cleanup, retired)
+	prepareAliasReplayTailSweep(t, cleanup)
+	require.NoError(t, cleanup.sweepAliasReplayTails(retired))
+	now += javaRemoteParentMinimumFenceAge
+	prepareAliasReplayTailSweep(t, cleanup)
+	require.NoError(t, cleanup.sweepAliasReplayTails(retired))
 	assert.NotContains(t, replays.values, replayKey)
 }
 
@@ -1121,6 +1271,27 @@ func TestCleanupMalformedAliasReplayStillRequiresGenerationArtifactAbsence(t *te
 	assert.NotContains(t, replays.values, replayKey)
 }
 
+func TestCleanupMalformedAliasReplayKeyDoesNotImmortalizePositiveReferences(t *testing.T) {
+	cleanup, key, state := aliasReplayCleanupFixture(t)
+	replayKey := aliasReplayKeyForState(key, state)
+	replayKey.Reserved = 1
+	replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+	replays.values[replayKey] = boundAliasReplayForTest(aliasReplayValue{
+		TransitionMonotonicNS: uint64(90 * time.Second),
+		References:            1,
+		Lifecycle:             lifecycleStale,
+	})
+	now := 100 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+
+	for range 2 {
+		prepareAliasReplayTailSweep(t, cleanup)
+		require.NoError(t, cleanup.sweepAliasReplayTails(nil))
+		now += javaRemoteParentMinimumFenceAge
+	}
+	assert.NotContains(t, replays.values, replayKey)
+}
+
 func TestCleanupMalformedStateWithAliasAuthorityFailsClosed(t *testing.T) {
 	for _, test := range []struct {
 		name    string
@@ -1137,8 +1308,7 @@ func TestCleanupMalformedStateWithAliasAuthorityFailsClosed(t *testing.T) {
 			cleanup.maps.states.(*fakeBridgeMap).values[key] = state
 			if test.replay {
 				replayKey := aliasReplayKeyForState(key, state)
-				cleanup.maps.aliasReplays.(*fakeBridgeMap).values[replayKey] =
-					activeAliasReplayForTest()
+				cleanup.maps.aliasReplays.(*fakeBridgeMap).values[replayKey] = activeAliasReplayForTest()
 			}
 
 			cleaned, err := cleanup.quarantineMalformedState(key, state)

@@ -16,6 +16,7 @@
 #include <common/trace_key.h>
 #include <common/trace_parent.h>
 
+#include <generictracer/java_ioctl.h>
 #include <generictracer/k_tracer_defs.h>
 #include <generictracer/maps/pid_tid_to_conn.h>
 
@@ -35,28 +36,12 @@
 #include <generictracer/java_remote_parent_close.h>
 #include <generictracer/java_thread_mapping.h>
 
-enum { k_ioctl_magic_id = 0x0b10b1 };
-enum {
-    k_ioctl_java_send = 1,
-    k_ioctl_java_recv = 2,
-    k_ioctl_java_threads = 3,
-    k_ioctl_java_vt_mount = 4,   // virtual thread mounted on this carrier
-    k_ioctl_java_vt_unmount = 5, // virtual thread unmounted from this carrier
-    k_ioctl_java_task_capture = 6,
-    k_ioctl_java_task_cancel = 7,
-    k_ioctl_java_task_link = 8,
-    k_ioctl_java_task_relay_capture = 9,
-    k_ioctl_java_process_register = 10,
-    k_ioctl_java_vt_terminate = 11,
-    k_ioctl_java_task_unlink = 12,
-    k_ioctl_java_tls_connection = 13,
-    k_ioctl_java_http1_receive_start = 14,
-    k_ioctl_java_http1_receive_continue = 15,
-    k_ioctl_java_http1_receive_reset = 16,
-    k_ioctl_java_telemetry_receive = 17,
-};
-
 enum { k_java_control_cleanup_required = 1 };
+enum java_control_tail_preflight_result : u8 {
+    k_java_control_tail_noop = 0,
+    k_java_control_tail_prepared = 1,
+    k_java_control_tail_cleanup_required = 2,
+};
 enum java_ioctl_operation_mask : u8 {
     k_java_ioctl_control = 1 << 0,
     k_java_ioctl_data = 1 << 1,
@@ -88,6 +73,35 @@ _Static_assert(offsetof(java_remote_parent_receive_context_t, generation) + size
 _Static_assert(offsetof(java_remote_parent_receive_context_t, action) + sizeof(u16) <=
                    sizeof(java_remote_parent_receive_context_t),
                "Java deferred orig-dport scratch exceeds receive context");
+
+typedef struct java_control_tail_workspace {
+    u64 invocation_id;
+    u64 process_capability;
+    u64 token;
+    pid_key_t task;
+    pid_key_t execution;
+    u8 operation;
+    u8 decoded;
+    unsigned char reserved[6];
+} java_control_tail_workspace_t;
+
+_Static_assert(sizeof(java_control_tail_workspace_t) == 56,
+               "Java control tail workspace size mismatch");
+
+SCRATCH_MEM_TYPED(java_control_tail_workspace, java_control_tail_workspace_t)
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, u32);
+    __type(value, u32);
+    __uint(max_entries, 1);
+} java_remote_parent_control_tail_readiness SEC(".maps");
+
+static __always_inline u8 java_remote_parent_control_tail_ready(void) {
+    const u32 zero = 0;
+    const u32 *ready = bpf_map_lookup_elem(&java_remote_parent_control_tail_readiness, &zero);
+    return ready && *ready == 1;
+}
 
 static __always_inline java_remote_parent_receive_cursor_t
 java_remote_parent_cursor_from_context(const java_remote_parent_receive_context_t *context) {
@@ -403,8 +417,8 @@ static __noinline u64 handle_java_data_authority(u8 *registered) {
     return process_capability;
 }
 
-static __always_inline u64 handle_java_data_gate(
-    struct file *file, enum java_remote_parent_data_operation operation) {
+static __always_inline u64 handle_java_data_gate(struct file *file,
+                                                 enum java_remote_parent_data_operation operation) {
     const u8 data_hook_ready =
         java_remote_parent_enabled && java_remote_parent_data_hook_is_ready();
     const enum java_remote_parent_data_dispatch dispatch =
@@ -435,11 +449,10 @@ static __always_inline u64 handle_java_data_gate(
 
 // Keep the payload path in a separate sibling so its connection and cursor
 // locals never overlap the receive-boundary cleanup frame.
-static __noinline int handle_java_data_ioctl(struct pt_regs *ctx,
-                                             struct file *file,
-                                             u64 process_capability,
-                                             unsigned char *uarg,
-                                             enum java_remote_parent_data_operation operation) {
+static __noinline int prepare_java_data_ioctl(struct file *file,
+                                              u64 process_capability,
+                                              unsigned char *uarg,
+                                              enum java_remote_parent_data_operation operation) {
     const u8 data_hook_ready =
         java_remote_parent_enabled && java_remote_parent_data_hook_is_ready();
     const enum java_remote_parent_data_dispatch dispatch =
@@ -624,8 +637,7 @@ static __noinline int handle_java_data_ioctl(struct pt_regs *ctx,
 
         const u64 zero = 0;
         bpf_map_update_elem(&active_ssl_connections, &p_conn, &zero, BPF_NOEXIST);
-        handle_java_buf_with_connection(
-            ctx,
+        return prepare_java_buf_with_connection(
             &p_conn,
             buf,
             max_len,
@@ -638,9 +650,8 @@ static __noinline int handle_java_data_ioctl(struct pt_regs *ctx,
     }
 
 cleanup_http1_receive:
-    // A successful tail call does not return. The shallow outer phase owns
-    // cleanup for every normal return, including preflight reread failures,
-    // so this large payload frame has no generation-fence call edge.
+    // The shallow outer phase owns parser dispatch and cleanup, so this large
+    // payload frame has neither a tail-call nor a generation-fence call edge.
     return 0;
 }
 
@@ -648,8 +659,6 @@ static __noinline int handle_java_unregistered_lifecycle_ioctl(unsigned char *ua
                                                                u8 op_cmd,
                                                                const pid_key_t *task,
                                                                u64 process_capability);
-static __noinline int handle_java_unregistered_control_ioctl(
-    unsigned char *uarg, u64 id, u8 op_cmd, const pid_key_t *task, u64 process_capability);
 
 static __noinline int handle_java_registered_lifecycle_ioctl(unsigned char *uarg,
                                                              u8 op_cmd,
@@ -689,7 +698,8 @@ static __noinline int handle_java_registered_lifecycle_ioctl(unsigned char *uarg
         if (mount_result == k_java_vt_mount_collision ||
             mount_result == k_java_vt_mount_stale_incarnation) {
             if (java_remote_parent_enabled) {
-                java_remote_parent_discard_virtual_thread_owner(&synthetic_owner);
+                java_remote_parent_discard_virtual_thread_owner(&synthetic_owner,
+                                                                process_capability);
             }
             if (mount_result == k_java_vt_mount_collision ||
                 !java_vt_replace_stale_identity(&synthetic_owner, &mount_identity)) {
@@ -708,7 +718,8 @@ static __noinline int handle_java_registered_lifecycle_ioctl(unsigned char *uarg
                 // A newly inserted LRU guard may replace an evicted full-width
                 // identity. Discard the shared synthetic key before publishing
                 // it, so neither the same nor a colliding VT can revive state.
-                java_remote_parent_discard_virtual_thread_owner(&synthetic_owner);
+                java_remote_parent_discard_virtual_thread_owner(&synthetic_owner,
+                                                                process_capability);
             }
         } else if (mount_result != k_java_vt_mount_success) {
             if (java_remote_parent_enabled) {
@@ -728,7 +739,8 @@ static __noinline int handle_java_registered_lifecycle_ioctl(unsigned char *uarg
         bpf_dbg_printk("Java virtual thread mount observed");
         if (!java_vt_publish_mount(&carrier, &mount_identity)) {
             if (java_remote_parent_enabled) {
-                java_remote_parent_discard_virtual_thread_owner(&synthetic_owner);
+                java_remote_parent_discard_virtual_thread_owner(&synthetic_owner,
+                                                                process_capability);
             }
             bpf_map_delete_elem(&java_vt_threads, &carrier);
         }
@@ -758,7 +770,7 @@ static __noinline int handle_java_registered_lifecycle_ioctl(unsigned char *uarg
             return 0;
         }
         if (java_remote_parent_enabled) {
-            java_remote_parent_discard_virtual_thread_owner(&owner);
+            java_remote_parent_discard_virtual_thread_owner(&owner, process_capability);
         }
         // Keep the full-width guard present until all state under its
         // synthetic key has been discarded.
@@ -843,37 +855,6 @@ static __noinline int handle_java_unregistered_lifecycle_ioctl(unsigned char *ua
     return 0;
 }
 
-static __noinline int handle_java_unregistered_control_ioctl(
-    unsigned char *uarg, u64 id, u8 op_cmd, const pid_key_t *task, u64 process_capability) {
-    const u8 token_operation =
-        op_cmd == k_ioctl_java_task_capture || op_cmd == k_ioctl_java_task_cancel ||
-        op_cmd == k_ioctl_java_task_relay_capture || op_cmd == k_ioctl_java_task_link;
-    if (token_operation) {
-        unsigned char *token_arg = uarg + 1;
-        if (op_cmd == k_ioctl_java_task_link) {
-            token_arg += sizeof(u64);
-        }
-        u64 token = 0;
-        if (bpf_probe_read_user(&token, sizeof(token), token_arg) == 0 &&
-            java_remote_parent_enabled) {
-            java_remote_parent_cancel_handoff_for_capability(task, token, process_capability);
-        }
-    }
-
-    const u8 execution_lifecycle = op_cmd == k_ioctl_java_threads ||
-                                   op_cmd == k_ioctl_java_task_link ||
-                                   op_cmd == k_ioctl_java_task_unlink;
-    if (!execution_lifecycle) {
-        return 0;
-    }
-    if (java_remote_parent_enabled) {
-        java_remote_parent_discard_unregistered_task_lifecycle(task, process_capability);
-    }
-    bpf_map_delete_elem(&java_tasks, task);
-    obi_ctx__del(id);
-    return 0;
-}
-
 static __noinline int handle_java_tls_connection_ioctl(struct file *file, unsigned char *uarg) {
     pid_key_t task = {0};
     task_tid(&task);
@@ -908,15 +889,6 @@ static __noinline int handle_java_tls_connection_ioctl(struct file *file, unsign
     return 0;
 }
 
-static __noinline int handle_java_task_capture_ioctl(unsigned char *uarg,
-                                                     const pid_key_t *execution) {
-    u64 token = 0;
-    if (bpf_probe_read_user(&token, sizeof(token), uarg + 1) == 0 && java_remote_parent_enabled) {
-        java_remote_parent_capture_handoff_for_execution(execution, token);
-    }
-    return 0;
-}
-
 static __noinline int handle_java_task_cancel_ioctl(unsigned char *uarg,
                                                     const pid_key_t *execution,
                                                     u64 process_capability) {
@@ -927,51 +899,351 @@ static __noinline int handle_java_task_cancel_ioctl(unsigned char *uarg,
     return 0;
 }
 
-static __noinline int handle_java_task_relay_capture_ioctl(unsigned char *uarg,
-                                                           const pid_key_t *execution) {
-    u64 token = 0;
-    if (bpf_probe_read_user(&token, sizeof(token), uarg + 1) == 0 && java_remote_parent_enabled) {
-        java_remote_parent_capture_relay(execution, token);
-    }
+static __noinline int handle_java_task_unlink_ioctl(const pid_key_t *task,
+                                                    const pid_key_t *execution,
+                                                    u64 id,
+                                                    u64 process_capability) {
+    java_thread_mapping_unlink_execution(
+        task, execution, id, process_capability, java_remote_parent_enabled);
     return 0;
 }
 
-static __noinline int
-handle_java_task_unlink_ioctl(const pid_key_t *task, const pid_key_t *execution, u64 id) {
-    java_thread_mapping_unlink_execution(task, execution, id, java_remote_parent_enabled);
+static __noinline void handle_java_thread_mapping_action(u64 action,
+                                                         const pid_key_t *task,
+                                                         const pid_key_t *execution,
+                                                         u64 process_capability) {
+    java_thread_mapping_finish_remote_action(action, task, execution, process_capability);
+}
+
+static __noinline int handle_java_remote_threads_ioctl(unsigned char *uarg,
+                                                       u64 id,
+                                                       const pid_key_t *task,
+                                                       const pid_key_t *execution,
+                                                       u64 process_capability) {
+    const u64 action =
+        handle_java_thread_mapping_ioctl_deferred(uarg, id, task, execution, process_capability, 1);
+    handle_java_thread_mapping_action(action, task, execution, process_capability);
     return 0;
 }
 
-static __noinline int handle_java_threads_ioctl(unsigned char *uarg,
-                                                u64 id,
-                                                const pid_key_t *task,
-                                                const pid_key_t *execution,
-                                                u64 process_capability) {
-    return handle_java_thread_mapping_ioctl(
-        uarg, id, task, execution, process_capability, java_remote_parent_enabled);
+static __noinline int handle_java_legacy_threads_ioctl(unsigned char *uarg,
+                                                       u64 id,
+                                                       const pid_key_t *task,
+                                                       const pid_key_t *execution,
+                                                       u64 process_capability) {
+    return handle_java_thread_mapping_ioctl(uarg, id, task, execution, process_capability, 0);
 }
 
-static __noinline int handle_java_task_link_ioctl(unsigned char *uarg,
-                                                  u64 id,
-                                                  const pid_key_t *task,
-                                                  const pid_key_t *execution,
-                                                  u64 process_capability) {
+static __noinline int handle_java_legacy_task_link_ioctl(unsigned char *uarg,
+                                                         u64 id,
+                                                         const pid_key_t *task,
+                                                         const pid_key_t *execution,
+                                                         u64 process_capability) {
     u64 parent_id = 0;
-    if (bpf_probe_read_user(&parent_id, sizeof(parent_id), uarg + 1) != 0) {
-        return 0;
-    }
     u64 token = 0;
-    if (bpf_probe_read_user(&token, sizeof(token), uarg + 1 + sizeof(parent_id)) != 0) {
-        return 0;
-    }
-
+    const u8 decoded =
+        bpf_probe_read_user(&parent_id, sizeof(parent_id), uarg + 1) == 0 &&
+        bpf_probe_read_user(&token, sizeof(token), uarg + 1 + sizeof(parent_id)) == 0;
     if (java_remote_parent_enabled) {
+        // Required carrier tail slots are published before probe attachment.
+        // If readiness is unavailable, fail closed before using only the
+        // legacy ancestry path; otherwise a preceding remote task carrier
+        // could survive LINK and become immediate stale ancestry.
+        java_remote_parent_unlink_task_for_capability(execution, process_capability);
+        if (decoded) {
+            java_remote_parent_cancel_handoff_for_capability(execution, token, process_capability);
+        }
+        // Enabled-mode ancestry publication must hold P(process). The legacy
+        // fallback cannot do that within this verifier-constrained frame, so
+        // a missing readiness/tail slot is terminal cleanup, never an untagged
+        // java_tasks publication that could cross PROCESS_REGISTER(A->B).
         bpf_map_delete_elem(&java_tasks, task);
         obi_ctx__del(id);
-        java_remote_parent_link_handoff_for_capability(execution, token, process_capability);
         return 0;
     }
-    return handle_java_thread_mapping(parent_id, id, task, execution, process_capability, 0);
+    if (!decoded) {
+        bpf_map_delete_elem(&java_tasks, task);
+        obi_ctx__del(id);
+        return 0;
+    }
+    // Keep the literal legacy mapper local to this readiness fallback. LLVM can
+    // then reuse this handler's task-link scratch after the remote carrier has
+    // been retired without globally inlining the same mapper into THREAD's
+    // deeper remote action frame.
+    pid_key_t parent = *task;
+    parent.tid = tid_from_pid_tgid(parent_id);
+    if (parent.tid == task->tid) {
+        bpf_map_delete_elem(&java_tasks, task);
+        obi_ctx__del(id);
+        return 0;
+    }
+    bpf_map_update_elem(&java_tasks, task, &parent, BPF_ANY);
+    tp_info_t context = {0};
+    const u8 context_found = java_thread_mapping_snapshot_context(parent_id, &parent, &context);
+    java_thread_mapping_publish_context(id, &context, context_found);
+    return 0;
+}
+
+static __always_inline void
+java_control_tail_workspace_release(java_control_tail_workspace_t *workspace, u64 invocation_id) {
+    if (!workspace || !invocation_id || workspace->invocation_id != invocation_id) {
+        return;
+    }
+    __builtin_memset(workspace, 0, sizeof(*workspace));
+    barrier();
+}
+
+static __noinline enum java_control_tail_preflight_result
+prepare_java_control_tail(unsigned char *uarg,
+                          u8 operation,
+                          const pid_key_t *task,
+                          u64 process_capability,
+                          u64 invocation_id) {
+    java_control_tail_workspace_t *workspace = java_control_tail_workspace_mem();
+    if (!workspace || workspace->invocation_id) {
+        return java_control_tail_workspace_miss_requires_cleanup(operation)
+                   ? k_java_control_tail_cleanup_required
+                   : k_java_control_tail_noop;
+    }
+
+    pid_key_t execution = *task;
+    if (java_vt_translate_tid_for_capability(&execution, process_capability) ==
+        k_java_vt_cleanup_translation_fallback) {
+        return k_java_control_tail_cleanup_required;
+    }
+
+    u64 token = 0;
+    u8 decoded = 0;
+    if (operation == k_ioctl_java_threads) {
+        decoded = 1;
+    } else if (operation == k_ioctl_java_task_link) {
+        u64 parent_id = 0;
+        decoded = bpf_probe_read_user(&parent_id, sizeof(parent_id), uarg + 1) == 0 &&
+                  bpf_probe_read_user(&token, sizeof(token), uarg + 1 + sizeof(parent_id)) == 0;
+        if (!decoded) {
+            token = 0;
+        }
+    } else if (bpf_probe_read_user(&token, sizeof(token), uarg + 1) == 0) {
+        decoded = 1;
+    } else {
+        return k_java_control_tail_noop;
+    }
+
+    workspace->process_capability = process_capability;
+    workspace->token = token;
+    workspace->task = *task;
+    workspace->execution = execution;
+    workspace->operation = operation;
+    workspace->decoded = decoded;
+    __builtin_memset(workspace->reserved, 0, sizeof(workspace->reserved));
+    barrier();
+    workspace->invocation_id = invocation_id;
+    return k_java_control_tail_prepared;
+}
+
+static __always_inline java_control_tail_workspace_t *java_control_tail_workspace_owned(void) {
+    java_control_tail_workspace_t *workspace = java_control_tail_workspace_mem();
+    const u64 invocation_id = bpf_get_current_pid_tgid();
+    if (!workspace || !invocation_id || workspace->invocation_id != invocation_id ||
+        !workspace->process_capability || workspace->reserved[0] || workspace->reserved[1] ||
+        workspace->reserved[2] || workspace->reserved[3] || workspace->reserved[4] ||
+        workspace->reserved[5]) {
+        return NULL;
+    }
+    return workspace;
+}
+
+static __always_inline java_control_tail_workspace_t *
+java_control_tail_workspace_current(u8 operation) {
+    java_control_tail_workspace_t *workspace = java_control_tail_workspace_owned();
+    return workspace && workspace->operation == operation ? workspace : NULL;
+}
+
+static __noinline enum java_control_tail_preflight_result
+prepare_java_control_cleanup_tail(unsigned char *uarg,
+                                  u8 operation,
+                                  const pid_key_t *task,
+                                  u64 process_capability,
+                                  u64 invocation_id) {
+    java_control_tail_workspace_t *workspace = java_control_tail_workspace_mem();
+    if (!workspace || workspace->invocation_id) {
+        return k_java_control_tail_noop;
+    }
+
+    pid_key_t execution = *task;
+    pid_key_t translated = execution;
+    if (java_vt_translate_tid_for_capability(&translated, process_capability) ==
+        k_java_vt_cleanup_translation_exact) {
+        execution = translated;
+    }
+
+    u64 token = 0;
+    u8 decoded = 0;
+    const u8 token_operation =
+        operation == k_ioctl_java_task_capture || operation == k_ioctl_java_task_cancel ||
+        operation == k_ioctl_java_task_relay_capture || operation == k_ioctl_java_task_link;
+    if (token_operation) {
+        unsigned char *token_arg = uarg + 1;
+        if (operation == k_ioctl_java_task_link) {
+            token_arg += sizeof(u64);
+        }
+        decoded = bpf_probe_read_user(&token, sizeof(token), token_arg) == 0;
+        if (!decoded) {
+            token = 0;
+        }
+    }
+
+    workspace->process_capability = process_capability;
+    workspace->token = token;
+    workspace->task = *task;
+    workspace->execution = execution;
+    workspace->operation = operation;
+    workspace->decoded = decoded;
+    __builtin_memset(workspace->reserved, 0, sizeof(workspace->reserved));
+    barrier();
+    workspace->invocation_id = invocation_id;
+    return k_java_control_tail_prepared;
+}
+
+static __noinline void java_control_tail_dispatch_missed(u64 invocation_id) {
+    java_control_tail_workspace_t *workspace = java_control_tail_workspace_mem();
+    if (!workspace || workspace->invocation_id != invocation_id) {
+        return;
+    }
+    // Install terminal claimant intent against the translated execution key,
+    // not merely the physical carrier passed to the generic cleanup path.
+    java_remote_parent_cancel_handoff_for_capability(
+        &workspace->execution, workspace->token, workspace->process_capability);
+    if (workspace->operation == k_ioctl_java_task_link) {
+        java_remote_parent_unlink_task_for_capability(&workspace->execution,
+                                                      workspace->process_capability);
+    }
+    java_control_tail_workspace_release(workspace, invocation_id);
+}
+
+SEC("kprobe/sys_ioctl")
+int BPF_KPROBE(obi_java_task_capture_tail) {
+    java_control_tail_workspace_t *workspace =
+        java_control_tail_workspace_current(k_ioctl_java_task_capture);
+    if (!workspace) {
+        return 0;
+    }
+    java_remote_parent_capture_handoff_for_capability(
+        &workspace->execution, workspace->token, workspace->process_capability);
+    java_control_tail_workspace_release(workspace, bpf_get_current_pid_tgid());
+    return 0;
+}
+
+SEC("kprobe/sys_ioctl")
+int BPF_KPROBE(obi_java_task_relay_capture_tail) {
+    java_control_tail_workspace_t *workspace =
+        java_control_tail_workspace_current(k_ioctl_java_task_relay_capture);
+    if (!workspace) {
+        return 0;
+    }
+    java_remote_parent_capture_relay_for_capability(
+        &workspace->execution, workspace->token, workspace->process_capability);
+    java_control_tail_workspace_release(workspace, bpf_get_current_pid_tgid());
+    return 0;
+}
+
+SEC("kprobe/sys_ioctl")
+int BPF_KPROBE(obi_java_task_link_tail) {
+    java_control_tail_workspace_t *workspace =
+        java_control_tail_workspace_current(k_ioctl_java_task_link);
+    if (!workspace) {
+        return 0;
+    }
+    java_thread_mapping_link_remote_execution(&workspace->task,
+                                              &workspace->execution,
+                                              workspace->invocation_id,
+                                              workspace->decoded ? workspace->token : 0,
+                                              workspace->process_capability);
+    java_control_tail_workspace_release(workspace, bpf_get_current_pid_tgid());
+    return 0;
+}
+
+SEC("kprobe/sys_ioctl")
+int BPF_KPROBE(obi_java_threads_tail) {
+    java_control_tail_workspace_t *workspace =
+        java_control_tail_workspace_current(k_ioctl_java_threads);
+    if (!workspace) {
+        return 0;
+    }
+
+    struct pt_regs *__ctx = (struct pt_regs *)PT_REGS_PARM1(ctx);
+    void *arg = NULL;
+    bpf_probe_read(&arg, sizeof(arg), (void *)&PT_REGS_PARM3(__ctx));
+    handle_java_remote_threads_ioctl((unsigned char *)arg,
+                                     workspace->invocation_id,
+                                     &workspace->task,
+                                     &workspace->execution,
+                                     workspace->process_capability);
+    java_control_tail_workspace_release(workspace, bpf_get_current_pid_tgid());
+    return 0;
+}
+
+SEC("kprobe/sys_ioctl")
+int BPF_KPROBE(obi_java_control_cleanup_tail) {
+    java_control_tail_workspace_t *workspace = java_control_tail_workspace_owned();
+    if (!workspace) {
+        return 0;
+    }
+
+    const u8 token_operation = workspace->operation == k_ioctl_java_task_capture ||
+                               workspace->operation == k_ioctl_java_task_cancel ||
+                               workspace->operation == k_ioctl_java_task_relay_capture ||
+                               workspace->operation == k_ioctl_java_task_link;
+    if (token_operation && workspace->decoded && workspace->token) {
+        java_remote_parent_cancel_handoff_for_capability(
+            &workspace->execution, workspace->token, workspace->process_capability);
+    }
+
+    const u8 execution_lifecycle = workspace->operation == k_ioctl_java_threads ||
+                                   workspace->operation == k_ioctl_java_task_link ||
+                                   workspace->operation == k_ioctl_java_task_unlink;
+    if (execution_lifecycle) {
+        java_remote_parent_discard_unregistered_task_lifecycle(&workspace->task,
+                                                               workspace->process_capability);
+        bpf_map_delete_elem(&java_tasks, &workspace->task);
+        obi_ctx__del(workspace->invocation_id);
+    }
+    java_control_tail_workspace_release(workspace, bpf_get_current_pid_tgid());
+    return 0;
+}
+
+static __always_inline void
+java_control_tail_miss_legacy_cleanup(u8 operation, const pid_key_t *task, u64 invocation_id) {
+    const u8 execution_lifecycle = operation == k_ioctl_java_threads ||
+                                   operation == k_ioctl_java_task_link ||
+                                   operation == k_ioctl_java_task_unlink;
+    if (execution_lifecycle) {
+        // The remote task alias remains fail-closed for coordinated userspace
+        // retirement if the pre-populated cleanup tail slot is unexpectedly
+        // absent. Never enter the deep remote cleanup graph from this parser.
+        bpf_map_delete_elem(&java_tasks, task);
+        obi_ctx__del(invocation_id);
+    }
+}
+
+static __always_inline int dispatch_java_control_cleanup_tail(struct pt_regs *ctx,
+                                                              unsigned char *uarg,
+                                                              u64 invocation_id,
+                                                              u8 operation,
+                                                              const pid_key_t *task,
+                                                              u64 process_capability) {
+    if (!java_remote_parent_control_tail_ready()) {
+        java_control_tail_miss_legacy_cleanup(operation, task, invocation_id);
+        return 0;
+    }
+    if (prepare_java_control_cleanup_tail(
+            uarg, operation, task, process_capability, invocation_id) ==
+        k_java_control_tail_prepared) {
+        bpf_tail_call(ctx, &jump_table, k_tail_java_control_cleanup);
+        java_control_tail_dispatch_missed(invocation_id);
+    }
+    java_control_tail_miss_legacy_cleanup(operation, task, invocation_id);
+    return 0;
 }
 
 static __noinline int handle_java_control_ioctl(unsigned char *uarg,
@@ -992,17 +1264,23 @@ static __noinline int handle_java_control_ioctl(unsigned char *uarg,
 
     switch (op_cmd) {
     case k_ioctl_java_task_capture:
-        return handle_java_task_capture_ioctl(uarg, &execution);
+        // The enabled bridge dispatches this operation from the shallow entry
+        // program. With the bridge disabled CAPTURE has no legacy effect.
+        return 0;
     case k_ioctl_java_task_cancel:
         return handle_java_task_cancel_ioctl(uarg, &execution, process_capability);
     case k_ioctl_java_task_relay_capture:
-        return handle_java_task_relay_capture_ioctl(uarg, &execution);
+        // As above, remote relay capture is tail-dispatched when enabled.
+        return 0;
     case k_ioctl_java_task_unlink:
-        return handle_java_task_unlink_ioctl(task, &execution, id);
+        return handle_java_task_unlink_ioctl(task, &execution, id, process_capability);
     case k_ioctl_java_threads:
-        return handle_java_threads_ioctl(uarg, id, task, &execution, process_capability);
+        if (java_remote_parent_enabled) {
+            return k_java_control_cleanup_required;
+        }
+        return handle_java_legacy_threads_ioctl(uarg, id, task, &execution, process_capability);
     case k_ioctl_java_task_link:
-        return handle_java_task_link_ioctl(uarg, id, task, &execution, process_capability);
+        return handle_java_legacy_task_link_ioctl(uarg, id, task, &execution, process_capability);
     default:
         bpf_dbg_printk("unknown cmd=%d", op_cmd);
         return 0;
@@ -1024,7 +1302,10 @@ handle_java_data_operation_ioctl(struct pt_regs *ctx,
         const enum java_remote_parent_data_dispatch dispatch =
             java_remote_parent_select_data_dispatch(operation, data_hook_ready, file != NULL);
         if (!java_remote_parent_data_dispatch_has_bridge_authority(dispatch)) {
-            return handle_java_data_ioctl(ctx, file, process_capability, uarg, operation);
+            if (prepare_java_data_ioctl(file, process_capability, uarg, operation)) {
+                bpf_tail_call(ctx, &jump_table, k_tail_handle_buf_with_args);
+            }
+            return 0;
         }
 
         const u8 transition =
@@ -1126,11 +1407,13 @@ handle_java_data_operation_ioctl(struct pt_regs *ctx,
                                                    k_java_remote_parent_receive_action_http1_start,
                                                    receive_context);
         }
-        const int result = handle_java_data_ioctl(ctx, file, process_capability, uarg, operation);
-        // Tail-call success never returns. Any normal return means preflight
-        // changed, the user payload became unreadable, or no parser accepted
-        // it. Re-fetch the exact prepared transition and retire only that
-        // cursor through the shallow M+ cleanup path.
+        if (prepare_java_data_ioctl(file, process_capability, uarg, operation)) {
+            // This tail call is deliberately issued from the shallow hook
+            // frame after the noinline payload preflight has returned. A
+            // successful dispatch replaces the whole BPF program; only a
+            // preflight failure or a missed tail call reaches cleanup below.
+            bpf_tail_call(ctx, &jump_table, k_tail_handle_buf_with_args);
+        }
         java_remote_parent_state_t *cursor_scratch = java_remote_parent_stage_state_mem();
         java_remote_parent_receive_ioctl_workspace_t *workspace =
             (java_remote_parent_receive_ioctl_workspace_t *)cursor_scratch;
@@ -1141,7 +1424,7 @@ handle_java_data_operation_ioctl(struct pt_regs *ctx,
             java_remote_parent_cleanup_receive_cursor(
                 &workspace->cursor, workspace->socket_cookie, workspace->cursor.generation);
         }
-        return result;
+        return 0;
     }
     return handle_java_tls_connection_ioctl(file, uarg);
 }
@@ -1185,15 +1468,46 @@ static __always_inline int handle_java_ioctl(struct pt_regs *ctx,
             return handle_java_unregistered_lifecycle_ioctl(
                 uarg, op_cmd, &task, process_capability);
         }
-        return handle_java_unregistered_control_ioctl(uarg, id, op_cmd, &task, process_capability);
+        return dispatch_java_control_cleanup_tail(ctx, uarg, id, op_cmd, &task, process_capability);
     }
     if (op_cmd == k_ioctl_java_process_register || op_cmd == k_ioctl_java_vt_mount ||
         op_cmd == k_ioctl_java_vt_unmount || op_cmd == k_ioctl_java_vt_terminate) {
         return handle_java_lifecycle_ioctl(uarg, op_cmd, &task, process_capability);
     }
+    // Replay retention and task-link claims are each safe on legacy kernels,
+    // but not when their rounded frames accumulate beneath this syscall
+    // parser. Prepare immutable per-CPU inputs in a sibling frame, then issue
+    // the tail call from the entry frame. SetupTailCalls populates these slots
+    // before any probe is attached. A missed dispatch is still fail-closed:
+    // CAPTURE/RELAY cancel the token and LINK destroys the execution scope.
+    const u8 remote_carrier_operation =
+        op_cmd == k_ioctl_java_task_capture || op_cmd == k_ioctl_java_task_relay_capture ||
+        op_cmd == k_ioctl_java_task_link || op_cmd == k_ioctl_java_threads;
+    if (remote_carrier_operation && java_remote_parent_enabled &&
+        java_remote_parent_control_tail_ready()) {
+        const enum java_control_tail_preflight_result prepared =
+            prepare_java_control_tail(uarg, op_cmd, &task, process_capability, id);
+        if (prepared == k_java_control_tail_prepared) {
+            const u32 target = op_cmd == k_ioctl_java_task_capture ? k_tail_java_task_capture
+                               : op_cmd == k_ioctl_java_task_relay_capture
+                                   ? k_tail_java_task_relay_capture
+                               : op_cmd == k_ioctl_java_task_link ? k_tail_java_task_link
+                                                                  : k_tail_java_threads;
+            bpf_tail_call(ctx, &jump_table, target);
+            bpf_tail_call(ctx, &jump_table, k_tail_java_control_cleanup);
+            java_control_tail_dispatch_missed(id);
+            java_control_tail_miss_legacy_cleanup(op_cmd, &task, id);
+            return 0;
+        }
+        if (prepared == k_java_control_tail_cleanup_required) {
+            return dispatch_java_control_cleanup_tail(
+                ctx, uarg, id, op_cmd, &task, process_capability);
+        }
+        return 0;
+    }
     if (handle_java_control_ioctl(uarg, op_cmd, &task, process_capability) ==
         k_java_control_cleanup_required) {
-        return handle_java_unregistered_control_ioctl(uarg, id, op_cmd, &task, process_capability);
+        return dispatch_java_control_cleanup_tail(ctx, uarg, id, op_cmd, &task, process_capability);
     }
     return 0;
 }

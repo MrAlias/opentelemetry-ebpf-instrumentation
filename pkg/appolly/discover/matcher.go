@@ -5,14 +5,9 @@ package discover // import "go.opentelemetry.io/obi/pkg/appolly/discover"
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"log/slog"
 	"os"
 	"slices"
-	"strings"
-
-	"github.com/shirou/gopsutil/v4/process"
 
 	"go.opentelemetry.io/obi/pkg/appolly/app"
 	"go.opentelemetry.io/obi/pkg/appolly/services"
@@ -116,6 +111,7 @@ func (m *Matcher) filter(events []Event[ProcessAttrs]) []Event[ProcessMatch] {
 				matches = append(matches, ev)
 			}
 		}
+		_ = ev.Obj.closeProcessIdentity()
 	}
 	return matches
 }
@@ -172,9 +168,16 @@ func (m *Matcher) filterCreated(obj ProcessAttrs) (Event[ProcessMatch], bool) {
 		m.Log.Debug("can't get information for process", "pid", obj.pid, "error", err)
 		return Event[ProcessMatch]{}, false
 	}
+	transferHandle := false
+	defer func() {
+		if !transferHandle {
+			_ = proc.CloseProcessHandle()
+		}
+	}()
 
 	if processMatch := m.matchCriteria(obj, proc); processMatch != nil {
-		m.ProcessHistory[obj.pid] = *processMatch
+		m.ProcessHistory[obj.pid] = processMatchForHistory(*processMatch)
+		transferHandle = true
 
 		return Event[ProcessMatch]{
 			Type: EventCreated,
@@ -188,7 +191,8 @@ func (m *Matcher) filterCreated(obj ProcessAttrs) (Event[ProcessMatch], bool) {
 
 		procMatch.Process = proc
 
-		m.ProcessHistory[obj.pid] = procMatch
+		m.ProcessHistory[obj.pid] = processMatchForHistory(procMatch)
+		transferHandle = true
 
 		return Event[ProcessMatch]{
 			Type: EventCreated,
@@ -197,6 +201,16 @@ func (m *Matcher) filterCreated(obj ProcessAttrs) (Event[ProcessMatch], bool) {
 	}
 
 	return Event[ProcessMatch]{}, false
+}
+
+func processMatchForHistory(processMatch ProcessMatch) ProcessMatch {
+	history := processMatch
+	if processMatch.Process != nil {
+		process := *processMatch.Process
+		process.ProcessHandle = nil
+		history.Process = &process
+	}
+	return history
 }
 
 func (m *Matcher) filterDeleted(obj ProcessAttrs) (Event[ProcessMatch], bool) {
@@ -522,32 +536,4 @@ func logDeprecationAndConflicts(cfg *obi.Config) {
 }
 
 // replaceable function to allow unit tests with faked processes
-var processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
-	proc, err := process.NewProcess(int32(pp.pid))
-	if err != nil {
-		return nil, fmt.Errorf("can't read process: %w", err)
-	}
-	ppid, _ := proc.Ppid()
-	exePath, err := proc.Exe()
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			// this might happen if you query from the port a service that does not have executable path.
-			// Since this value is just for attributing, we set a default placeholder
-			exePath = "unknown"
-		} else {
-			return nil, fmt.Errorf("can't read /proc/<pid>/fd information: %w", err)
-		}
-	}
-	cmdLine, err := proc.Cmdline()
-	// the command line includes the process name, let's get rid of it.
-	if err == nil {
-		_, cmdLine, _ = strings.Cut(cmdLine, " ")
-	}
-	return &services.ProcessInfo{
-		Pid:       app.PID(proc.Pid),
-		PPid:      app.PID(ppid),
-		ExePath:   exePath,
-		CmdArgs:   cmdLine,
-		OpenPorts: pp.openPorts,
-	}, nil
-}
+var processInfo = readProcessInfo

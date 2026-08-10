@@ -94,7 +94,9 @@ public final class NettyRuntimeProbe {
       require(
           count(events, "TASK_CAPTURE") == 1,
           "only the exact Netty-to-worker submission should be captured: " + events);
-      require(allCapturesLinked(events), "Netty-to-worker tokens were not linked: " + events);
+      require(
+          allCapturesHaveLinkedTerminalLifecycle(events),
+          "Netty-to-worker tokens did not terminate after linking: " + events);
 
       CountDownLatch reuseComplete = new CountDownLatch(2);
       AtomicInteger leakedDescriptors = new AtomicInteger();
@@ -157,9 +159,7 @@ public final class NettyRuntimeProbe {
       awaitNoContext(future);
       List<Event> cancellationEvents = snapshotSince(cancellationStart);
       require(
-          count(cancellationEvents, "TASK_CAPTURE") == 1
-              && count(cancellationEvents, "TASK_LINK") == 0
-              && count(cancellationEvents, "TASK_CANCEL") == 1,
+          hasExactPreLinkCancellation(cancellationEvents),
           "scheduled Netty cancellation did not release exactly one handoff: "
               + cancellationEvents);
 
@@ -186,9 +186,7 @@ public final class NettyRuntimeProbe {
       awaitNoContext(rejected);
       List<Event> rejectionEvents = snapshotSince(rejectionStart);
       require(
-          count(rejectionEvents, "TASK_CAPTURE") == 1
-              && count(rejectionEvents, "TASK_LINK") == 0
-              && count(rejectionEvents, "TASK_CANCEL") == 1,
+          hasExactPreLinkCancellation(rejectionEvents),
           "rejected Netty submission did not release exactly one handoff: " + rejectionEvents);
     } finally {
       releaseWorker.countDown();
@@ -231,7 +229,9 @@ public final class NettyRuntimeProbe {
       require(
           count(events, "TASK_CAPTURE") == 1,
           "scheduled Netty handoff was not captured exactly once: " + events);
-      require(allCapturesLinked(events), "scheduled Netty token was not linked: " + events);
+      require(
+          allCapturesHaveLinkedTerminalLifecycle(events),
+          "scheduled Netty token did not terminate after linking: " + events);
     } finally {
       clearSocketFileDescriptor();
       exact.close();
@@ -333,25 +333,70 @@ public final class NettyRuntimeProbe {
     return count;
   }
 
-  private static boolean allCapturesLinked(List<Event> events) {
+  private static boolean allCapturesHaveLinkedTerminalLifecycle(List<Event> events) {
     boolean captureFound = false;
-    for (Event capture : events) {
-      if (!"TASK_CAPTURE".equals(capture.operation) || capture.value == 0L) {
+    for (int captureIndex = 0; captureIndex < events.size(); captureIndex++) {
+      Event capture = events.get(captureIndex);
+      if (!"TASK_CAPTURE".equals(capture.operation)) {
         continue;
       }
+      if (capture.value == 0L) {
+        return false;
+      }
       captureFound = true;
-      boolean linked = false;
-      for (Event event : events) {
+      int linkIndex = -1;
+      int cancelIndex = -1;
+      int linkCount = 0;
+      int cancelCount = 0;
+      for (int index = 0; index < events.size(); index++) {
+        Event event = events.get(index);
         if ("TASK_LINK".equals(event.operation) && event.token == capture.value) {
-          linked = true;
-          break;
+          linkIndex = index;
+          linkCount++;
+        } else if ("TASK_CANCEL".equals(event.operation) && event.value == capture.value) {
+          cancelIndex = index;
+          cancelCount++;
         }
       }
-      if (!linked) {
+      if (linkCount != 1
+          || cancelCount != 1
+          || captureIndex >= linkIndex
+          || linkIndex >= cancelIndex) {
         return false;
       }
     }
     return captureFound;
+  }
+
+  private static boolean hasExactPreLinkCancellation(List<Event> events) {
+    Event capture = null;
+    int captureIndex = -1;
+    int cancelIndex = -1;
+    int linkCount = 0;
+    int cancelCount = 0;
+    for (int index = 0; index < events.size(); index++) {
+      Event event = events.get(index);
+      if ("TASK_CAPTURE".equals(event.operation)) {
+        if (capture != null || event.value == 0L) {
+          return false;
+        }
+        capture = event;
+        captureIndex = index;
+      }
+    }
+    if (capture == null) {
+      return false;
+    }
+    for (int index = 0; index < events.size(); index++) {
+      Event event = events.get(index);
+      if ("TASK_LINK".equals(event.operation) && event.token == capture.value) {
+        linkCount++;
+      } else if ("TASK_CANCEL".equals(event.operation) && event.value == capture.value) {
+        cancelIndex = index;
+        cancelCount++;
+      }
+    }
+    return linkCount == 0 && cancelCount == 1 && captureIndex < cancelIndex;
   }
 
   private static void require(boolean condition, String message) {

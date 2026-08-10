@@ -76,12 +76,18 @@ func New(pidFilter ebpfcommon.ServiceFilter, cfg *obi.Config, metrics imetrics.R
 	}
 }
 
-func (p *Tracer) AllowPID(pid app.PID, ns uint32, fi *exec.FileInfo) {
-	p.pidsFilter.AllowPID(pid, ns, fi, ebpfcommon.PIDTypeKProbes)
+func (p *Tracer) AllowPID(pid app.PID, ns uint32, fi, owner *exec.FileInfo) {
+	if owner == nil {
+		owner = fi
+	}
+	p.pidsFilter.AllowPID(pid, ns, fi, owner, ebpfcommon.PIDTypeKProbes)
 }
 
-func (p *Tracer) BlockPID(pid app.PID, ns uint32) {
-	p.pidsFilter.BlockPID(pid, ns)
+func (p *Tracer) BlockPID(pid app.PID, ns uint32, fi, owner *exec.FileInfo) {
+	if owner == nil {
+		owner = fi
+	}
+	p.pidsFilter.BlockPID(pid, ns, fi, owner)
 }
 
 func (p *Tracer) LoadSpecs() ([]*ebpfcommon.SpecBundle, error) {
@@ -108,7 +114,7 @@ func (p *Tracer) constants() map[string]any {
 	}
 }
 
-func (p *Tracer) RegisterOffsets(_ *exec.FileInfo, _ *goexec.Offsets) {}
+func (p *Tracer) RegisterOffsets(_ *exec.FileInfo, _ *goexec.Offsets) error { return nil }
 
 func (p *Tracer) ProcessBinary(_ *exec.FileInfo) {}
 
@@ -166,7 +172,7 @@ func (p *Tracer) Iters() []*ebpfcommon.Iter { return nil }
 
 func (p *Tracer) Tracing() []*ebpfcommon.Tracing { return nil }
 
-func (p *Tracer) RecordInstrumentedLib(id uint64, closers []io.Closer) {
+func (p *Tracer) RecordInstrumentedLib(id exec.FileID, closers []io.Closer) {
 	p.libsMux.Lock()
 	defer p.libsMux.Unlock()
 
@@ -176,33 +182,33 @@ func (p *Tracer) RecordInstrumentedLib(id uint64, closers []io.Closer) {
 		module.Closers = append(module.Closers, closers...)
 	}
 
-	p.log.Debug("Recorded instrumented Lib", "ino", id, "module", module)
+	p.log.Debug("Recorded instrumented Lib", "dev", id.Dev, "ino", id.Ino, "module", module)
 }
 
-func (p *Tracer) AddInstrumentedLibRef(id uint64) {
+func (p *Tracer) AddInstrumentedLibRef(id exec.FileID) {
 	p.RecordInstrumentedLib(id, nil)
 }
 
-func (p *Tracer) UnlinkInstrumentedLib(id uint64) {
+func (p *Tracer) UnlinkInstrumentedLib(id exec.FileID) {
 	p.libsMux.Lock()
 	defer p.libsMux.Unlock()
 
 	module, err := p.instrumentedLibs.RemoveRef(id)
 
-	p.log.Debug("Unlinking instrumented lib - before state", "ino", id, "module", module)
+	p.log.Debug("Unlinking instrumented lib - before state", "dev", id.Dev, "ino", id.Ino, "module", module)
 
 	if err != nil {
-		p.log.Debug("Error unlinking instrumented lib", "ino", id, "error", err)
+		p.log.Debug("Error unlinking instrumented lib", "dev", id.Dev, "ino", id.Ino, "error", err)
 	}
 }
 
-func (p *Tracer) AlreadyInstrumentedLib(id uint64) bool {
+func (p *Tracer) AlreadyInstrumentedLib(id exec.FileID) bool {
 	p.libsMux.Lock()
 	defer p.libsMux.Unlock()
 
 	module := p.instrumentedLibs.Find(id)
 
-	p.log.Debug("checking already instrumented Lib", "ino", id, "module", module)
+	p.log.Debug("checking already instrumented Lib", "dev", id.Dev, "ino", id.Ino, "module", module)
 	return module != nil
 }
 

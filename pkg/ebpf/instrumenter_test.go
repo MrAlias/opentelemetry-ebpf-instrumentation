@@ -96,6 +96,38 @@ func TestReportKprobeAttachResult(t *testing.T) {
 	assert.NoError(t, observed)
 }
 
+func TestAttachSocketFilterClosesSocketWhenAttachFails(t *testing.T) {
+	originalOpen := openPacketSocket
+	originalAttach := attachBPFToSocket
+	originalClose := closeSocketFD
+	t.Cleanup(func() {
+		openPacketSocket = originalOpen
+		attachBPFToSocket = originalAttach
+		closeSocketFD = originalClose
+	})
+
+	const fd = 47
+	attachErr := errors.New("attach failed")
+	closed := -1
+	openPacketSocket = func(_, _, _ int) (int, error) {
+		return fd, nil
+	}
+	attachBPFToSocket = func(gotFD, _, _, _ int) error {
+		assert.Equal(t, fd, gotFD)
+		return attachErr
+	}
+	closeSocketFD = func(gotFD int) error {
+		closed = gotFD
+		return nil
+	}
+
+	gotFD, err := attachSocketFilterFD(91)
+
+	assert.Equal(t, -1, gotFD)
+	require.ErrorIs(t, err, attachErr)
+	assert.Equal(t, fd, closed)
+}
+
 func TestGatherOffsetsResolvesSymbolSubstring(t *testing.T) {
 	reader := bytes.NewReader(testData())
 	assert.NotNil(t, reader)
@@ -354,7 +386,10 @@ func TestMatchVersionedUprobeLibrary(t *testing.T) {
 
 func TestUprobeModulesRespectsVersionedLibraryAnnotations(t *testing.T) {
 	i := &instrumenter{}
-	maps := makeProcMaps("/usr/local/lib/python3.11/lib-dynload/_asyncio.cpython-311-x86_64-linux-gnu.so")
+	modulePath := t.TempDir() + "/python3.11/_asyncio.cpython-311-x86_64-linux-gnu.so"
+	maps := makeProcMaps(modulePath)
+	maps[0].Dev = 9
+	maps[0].Inode = 42
 	tracer := stubTracer{
 		uprobes: map[string]map[string][]*ebpfcommon.ProbeDesc{
 			"_asyncio": {
@@ -369,10 +404,11 @@ func TestUprobeModulesRespectsVersionedLibraryAnnotations(t *testing.T) {
 		},
 	}
 
-	modules := i.uprobeModules(&tracer, 123, maps, "/proc/123/exe", 42, slog.Default())
+	exeID := exec.FileID{Dev: 7, Ino: 42}
+	modules := i.uprobeModules(&tracer, 123, maps, "/proc/123/exe", exeID, slog.Default())
 
 	require.Len(t, modules, 1)
-	module := modules[42]
+	module := modules[exec.FileID{Dev: 9, Ino: 42}]
 	require.NotNil(t, module)
 	require.Len(t, module.probes, 2)
 
@@ -388,22 +424,47 @@ func TestUprobeModulesRespectsVersionedLibraryAnnotations(t *testing.T) {
 	assert.NotContains(t, selectedSymbols, "task_step")
 }
 
+func TestUprobeModulesSeparateSameInodeOnDifferentDevices(t *testing.T) {
+	i := &instrumenter{}
+	maps := makeProcMaps(t.TempDir()+"/libfirst.so", t.TempDir()+"/libsecond.so")
+	maps[0].Dev, maps[0].Inode = 11, 42
+	maps[1].Dev, maps[1].Inode = 12, 42
+	tracer := stubTracer{uprobes: map[string]map[string][]*ebpfcommon.ProbeDesc{
+		"libfirst.so":  {"first": {{}}},
+		"libsecond.so": {"second": {{}}},
+	}}
+
+	modules := i.uprobeModules(
+		&tracer, 123, maps, "/proc/123/exe", exec.FileID{Dev: 10, Ino: 42}, slog.Default(),
+	)
+
+	require.Contains(t, modules, exec.FileID{Dev: 11, Ino: 42})
+	require.Contains(t, modules, exec.FileID{Dev: 12, Ino: 42})
+}
+
 func TestResolveInstrPathFallsBackToExecutableWhenLibraryMissing(t *testing.T) {
-	instrPath, ino, mappedPath, found := resolveInstrPath(123, "libmissing.so", nil, "/proc/123/exe", 42)
+	exeID := exec.FileID{Dev: 7, Ino: 42}
+	instrPath, id, mappedPath, found := resolveInstrPath(123, "libmissing.so", nil, "/proc/123/exe", exeID)
 
 	assert.False(t, found)
 	assert.Equal(t, "/proc/123/exe", instrPath)
-	assert.Equal(t, uint64(42), ino)
+	assert.Equal(t, exeID, id)
 	assert.Empty(t, mappedPath)
 }
 
 func TestResolveInstrPathUsesMappedPathWhenLibraryIsMapped(t *testing.T) {
-	instrPath, ino, mappedPath, found := resolveInstrPath(123, "libjvm.so", makeProcMaps("/usr/lib/libjvm.so"), "/proc/123/exe", 42)
+	mappedLib := t.TempDir() + "/libjvm.so"
+	maps := makeProcMaps(mappedLib)
+	maps[0].Dev = 9
+	maps[0].Inode = 42
+	instrPath, id, mappedPath, found := resolveInstrPath(
+		123, "libjvm.so", maps, "/proc/123/exe", exec.FileID{Dev: 7, Ino: 42},
+	)
 
 	assert.True(t, found)
-	assert.Equal(t, "/usr/lib/libjvm.so", instrPath)
-	assert.Equal(t, uint64(42), ino)
-	assert.Equal(t, "/usr/lib/libjvm.so", mappedPath)
+	assert.Equal(t, mappedLib, instrPath)
+	assert.Equal(t, exec.FileID{Dev: 9, Ino: 42}, id)
+	assert.Equal(t, mappedLib, mappedPath)
 }
 
 func TestUSDTIPMapPIDsIncludesNamespacedAliases(t *testing.T) {
@@ -603,29 +664,29 @@ type stubTracer struct {
 	uprobes map[string]map[string][]*ebpfcommon.ProbeDesc
 }
 
-func (s *stubTracer) AllowPID(app.PID, uint32, *exec.FileInfo)               {}
-func (s *stubTracer) BlockPID(app.PID, uint32)                               {}
-func (s *stubTracer) LoadSpecs() ([]*ebpfcommon.SpecBundle, error)           { return nil, nil }
-func (s *stubTracer) AddCloser(...io.Closer)                                 {}
-func (s *stubTracer) SetupTailCalls()                                        {}
-func (s *stubTracer) KProbes() map[string]ebpfcommon.ProbeDesc               { return nil }
-func (s *stubTracer) Tracepoints() map[string]ebpfcommon.ProbeDesc           { return nil }
-func (s *stubTracer) GoProbes() map[string][]*ebpfcommon.ProbeDesc           { return nil }
-func (s *stubTracer) UProbes() map[string]map[string][]*ebpfcommon.ProbeDesc { return s.uprobes }
-func (s *stubTracer) USDTProbes() map[string][]*ebpfcommon.USDTProbeDesc     { return nil }
-func (s *stubTracer) SocketFilters() []*ebpf.Program                         { return nil }
-func (s *stubTracer) SockMsgs() []ebpfcommon.SockMsg                         { return nil }
-func (s *stubTracer) SockOps() []ebpfcommon.SockOps                          { return nil }
-func (s *stubTracer) Iters() []*ebpfcommon.Iter                              { return nil }
-func (s *stubTracer) Tracing() []*ebpfcommon.Tracing                         { return nil }
-func (s *stubTracer) RecordInstrumentedLib(uint64, []io.Closer)              {}
-func (s *stubTracer) AddInstrumentedLibRef(uint64)                           {}
-func (s *stubTracer) AlreadyInstrumentedLib(uint64) bool                     { return false }
-func (s *stubTracer) UnlinkInstrumentedLib(uint64)                           {}
-func (s *stubTracer) RegisterOffsets(*exec.FileInfo, *goexec.Offsets)        {}
-func (s *stubTracer) ProcessBinary(*exec.FileInfo)                           {}
-func (s *stubTracer) Required() bool                                         { return false }
-func (s *stubTracer) SetEventContext(*ebpfcommon.EBPFEventContext)           {}
-func (s *stubTracer) Capabilities() ebpfcommon.TracerCapability              { return 0 }
+func (s *stubTracer) AllowPID(app.PID, uint32, *exec.FileInfo, *exec.FileInfo) {}
+func (s *stubTracer) BlockPID(app.PID, uint32, *exec.FileInfo, *exec.FileInfo) {}
+func (s *stubTracer) LoadSpecs() ([]*ebpfcommon.SpecBundle, error)             { return nil, nil }
+func (s *stubTracer) AddCloser(...io.Closer)                                   {}
+func (s *stubTracer) SetupTailCalls()                                          {}
+func (s *stubTracer) KProbes() map[string]ebpfcommon.ProbeDesc                 { return nil }
+func (s *stubTracer) Tracepoints() map[string]ebpfcommon.ProbeDesc             { return nil }
+func (s *stubTracer) GoProbes() map[string][]*ebpfcommon.ProbeDesc             { return nil }
+func (s *stubTracer) UProbes() map[string]map[string][]*ebpfcommon.ProbeDesc   { return s.uprobes }
+func (s *stubTracer) USDTProbes() map[string][]*ebpfcommon.USDTProbeDesc       { return nil }
+func (s *stubTracer) SocketFilters() []*ebpf.Program                           { return nil }
+func (s *stubTracer) SockMsgs() []ebpfcommon.SockMsg                           { return nil }
+func (s *stubTracer) SockOps() []ebpfcommon.SockOps                            { return nil }
+func (s *stubTracer) Iters() []*ebpfcommon.Iter                                { return nil }
+func (s *stubTracer) Tracing() []*ebpfcommon.Tracing                           { return nil }
+func (s *stubTracer) RecordInstrumentedLib(exec.FileID, []io.Closer)           {}
+func (s *stubTracer) AddInstrumentedLibRef(exec.FileID)                        {}
+func (s *stubTracer) AlreadyInstrumentedLib(exec.FileID) bool                  { return false }
+func (s *stubTracer) UnlinkInstrumentedLib(exec.FileID)                        {}
+func (s *stubTracer) RegisterOffsets(*exec.FileInfo, *goexec.Offsets) error    { return nil }
+func (s *stubTracer) ProcessBinary(*exec.FileInfo)                             {}
+func (s *stubTracer) Required() bool                                           { return false }
+func (s *stubTracer) SetEventContext(*ebpfcommon.EBPFEventContext)             {}
+func (s *stubTracer) Capabilities() ebpfcommon.TracerCapability                { return 0 }
 func (s *stubTracer) Run(context.Context, *ebpfcommon.EBPFEventContext, *msg.Queue[[]request.Span]) {
 }

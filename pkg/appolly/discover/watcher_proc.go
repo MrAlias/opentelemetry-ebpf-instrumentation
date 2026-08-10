@@ -60,14 +60,16 @@ type Event[T any] struct {
 }
 
 type ProcessAttrs struct {
-	pid            app.PID
-	openPorts      []uint32
-	metadata       map[string]string
-	podLabels      map[string]string
-	podAnnotations map[string]string
-	processAge     time.Duration
-	detectedType   svc.InstrumentableType
-	cmdArgs        string
+	pid             app.PID
+	openPorts       []uint32
+	metadata        map[string]string
+	podLabels       map[string]string
+	podAnnotations  map[string]string
+	processAge      time.Duration
+	processStart    uint64
+	processIdentity *processIdentityLease
+	detectedType    svc.InstrumentableType
+	cmdArgs         string
 }
 
 func wplog() *slog.Logger {
@@ -120,7 +122,7 @@ type pollAccounter struct {
 	// same process might appear several times
 	pidPorts map[pidPort]ProcessAttrs
 	// injectable function
-	listProcesses func(bool) (map[app.PID]ProcessAttrs, error)
+	listProcesses func(bool, map[app.PID]*processIdentityLease) (map[app.PID]ProcessAttrs, error)
 	// injectable function
 	executableReady func(app.PID) (string, bool)
 	// injectable function to load the bpf program
@@ -141,6 +143,7 @@ type pollAccounter struct {
 
 func (pa *pollAccounter) run(ctx context.Context) {
 	defer pa.output.Close()
+	defer pa.closeTrackedProcessIdentities()
 
 	log := slog.With("component", "discover.ProcessWatcher", "interval", pa.interval)
 
@@ -165,13 +168,21 @@ func (pa *pollAccounter) run(ctx context.Context) {
 	}
 
 	for {
-		procs, err := pa.listProcesses(pa.portFetchRequired())
+		identityHints := pa.retainTrackedProcessIdentities()
+		procs, err := pa.listProcesses(pa.portFetchRequired(), identityHints)
+		for _, identity := range identityHints {
+			_ = identity.close()
+		}
 		if err != nil {
 			log.Warn("can't get system processes", "error", err)
 		} else {
 			if events := pa.snapshot(procs); len(events) > 0 {
 				log.Debug("new process watching events", "len", len(events))
-				pa.output.Send(events)
+				pa.output.SendCtx(ctx, events)
+				if ctx.Err() != nil {
+					log.Debug("context canceled while sending process events. Exiting")
+					return
+				}
 			}
 		}
 		select {
@@ -182,6 +193,18 @@ func (pa *pollAccounter) run(ctx context.Context) {
 			// poll again
 		}
 	}
+}
+
+func (pa *pollAccounter) retainTrackedProcessIdentities() map[app.PID]*processIdentityLease {
+	pa.pidsMu.Lock()
+	defer pa.pidsMu.Unlock()
+	identities := make(map[app.PID]*processIdentityLease, len(pa.pids))
+	for pid, process := range pa.pids {
+		if retained := process.processIdentity.retain(); retained != nil {
+			identities[pid] = retained
+		}
+	}
+	return identities
 }
 
 // runAddedPIDsNotify runs in a goroutine; it receives PIDs added to the dynamic selector
@@ -207,6 +230,9 @@ func (pa *pollAccounter) forgetPIDs(pids []app.PID) {
 	pa.pidsMu.Lock()
 	defer pa.pidsMu.Unlock()
 	for _, pid := range pids {
+		if proc, ok := pa.pids[pid]; ok {
+			_ = proc.closeProcessIdentity()
+		}
 		delete(pa.pids, pid)
 	}
 	for pp := range pa.pidPorts {
@@ -217,6 +243,16 @@ func (pa *pollAccounter) forgetPIDs(pids []app.PID) {
 			}
 		}
 	}
+}
+
+func (pa *pollAccounter) closeTrackedProcessIdentities() {
+	pa.pidsMu.Lock()
+	defer pa.pidsMu.Unlock()
+	for pid, proc := range pa.pids {
+		_ = proc.closeProcessIdentity()
+		delete(pa.pids, pid)
+	}
+	clear(pa.pidPorts)
 }
 
 func (pa *pollAccounter) bpfWatcherIsReady() {
@@ -290,6 +326,40 @@ func (pa *pollAccounter) snapshot(fetchedProcs map[app.PID]ProcessAttrs) []Event
 	currentPidPorts := make(map[pidPort]ProcessAttrs, len(fetchedProcs))
 	reportedProcs := map[app.PID]struct{}{}
 	notReadyProcs := map[app.PID]struct{}{}
+	// A PID can disappear and be reused between adjacent polls. Compare the
+	// stable proc-directory identities rather than start ticks, which can collide
+	// when two lifetimes begin in the same clock tick.
+	for pid, current := range fetchedProcs {
+		previous, exists := pa.pids[pid]
+		if !exists {
+			continue
+		}
+		if sameProcessLifetime(previous, current) {
+			// Keep the original watcher-owned lease so already queued events remain
+			// backed by the same process anchor. The newly polled descriptor is no
+			// longer needed after proving the lifetime is unchanged.
+			if previous.processIdentity != nil &&
+				current.processIdentity != previous.processIdentity {
+				_ = current.closeProcessIdentity()
+				current.processIdentity = previous.processIdentity
+				fetchedProcs[pid] = current
+			}
+			continue
+		}
+		events = append(events, Event[ProcessAttrs]{
+			Type: EventDeleted,
+			Obj:  previous.withoutProcessIdentity(),
+		})
+		_ = previous.closeProcessIdentity()
+		delete(pa.pids, pid)
+		for key := range pa.pidPorts {
+			if key.Pid == pid {
+				delete(pa.pidPorts, key)
+			}
+		}
+		log.Debug("process PID was reused", "pid", pid,
+			"oldStart", previous.processStart, "newStart", current.processStart)
+	}
 	// notify processes that are new, or already existed but have a new connection
 	for pid, proc := range fetchedProcs {
 		// if the process does not have open ports, we might still notify it
@@ -301,13 +371,23 @@ func (pa *pollAccounter) snapshot(fetchedProcs map[app.PID]ProcessAttrs) []Event
 					notReadyProcs[pid] = struct{}{}
 					continue
 				}
-				events = append(events, Event[ProcessAttrs]{Type: EventCreated, Obj: proc})
+				if eventProc, ok := proc.retainProcessIdentity(); ok {
+					events = append(events, Event[ProcessAttrs]{Type: EventCreated, Obj: eventProc})
+				} else {
+					notReadyProcs[pid] = struct{}{}
+					continue
+				}
 				log.Debug("process added", "pid", pid)
 			}
 		} else {
 			for _, port := range proc.openPorts {
 				if pa.checkNewProcessConnectionNotification(proc, port, currentPidPorts, reportedProcs, notReadyProcs) {
-					events = append(events, Event[ProcessAttrs]{Type: EventCreated, Obj: proc})
+					if eventProc, ok := proc.retainProcessIdentity(); ok {
+						events = append(events, Event[ProcessAttrs]{Type: EventCreated, Obj: eventProc})
+					} else {
+						notReadyProcs[pid] = struct{}{}
+						continue
+					}
 					log.Debug("process added", "pid", pid, "port", port)
 					// skip checking new connections for that process
 					continue
@@ -319,7 +399,11 @@ func (pa *pollAccounter) snapshot(fetchedProcs map[app.PID]ProcessAttrs) []Event
 	// notify processes that are removed
 	for pid, proc := range pa.pids {
 		if _, ok := fetchedProcs[pid]; !ok {
-			events = append(events, Event[ProcessAttrs]{Type: EventDeleted, Obj: proc})
+			events = append(events, Event[ProcessAttrs]{
+				Type: EventDeleted,
+				Obj:  proc.withoutProcessIdentity(),
+			})
+			_ = proc.closeProcessIdentity()
 			log.Debug("process removed", "pid", pid)
 		}
 	}
@@ -329,6 +413,9 @@ func (pa *pollAccounter) snapshot(fetchedProcs map[app.PID]ProcessAttrs) []Event
 	// Remove the processes that are not fully instantiated from the list before
 	// caching the current pids in the snapshot.
 	for pid := range notReadyProcs {
+		if proc, ok := currentProcs[pid]; ok {
+			_ = proc.closeProcessIdentity()
+		}
 		delete(currentProcs, pid)
 	}
 
@@ -341,6 +428,18 @@ func (pa *pollAccounter) snapshot(fetchedProcs map[app.PID]ProcessAttrs) []Event
 	pa.pids = currentProcs
 	pa.pidPorts = currentPidPorts
 	return events
+}
+
+func sameProcessLifetime(previous, current ProcessAttrs) bool {
+	if previous.processIdentity != nil || current.processIdentity != nil {
+		return previous.processIdentity != nil && current.processIdentity != nil &&
+			sameProcessIdentity(previous.processIdentity, current.processIdentity)
+	}
+	if previous.processStart != 0 && current.processStart != 0 {
+		return previous.processStart == current.processStart
+	}
+	// Synthetic/non-Linux observations do not carry Linux process identities.
+	return true
 }
 
 func ExecutableReady(pid app.PID) (string, bool) {
@@ -363,7 +462,7 @@ func (pa *pollAccounter) checkNewProcessConnectionNotification(
 	reportedProcs, notReadyProcs map[app.PID]struct{},
 ) bool {
 	pp := pidPort{Pid: proc.pid, Port: port}
-	currentPidPorts[pp] = proc
+	currentPidPorts[pp] = proc.withoutProcessIdentity()
 	// the connection existed before iff we already had registered this pid/port pair
 	_, existingConnection := pa.pidPorts[pp]
 	// the proc existed before iff we already had registered this pid
@@ -526,11 +625,18 @@ func (r *procStatReader) processAge(pid app.PID) time.Duration {
 }
 
 // overridden in tests
-var processPidsFunc = process.Pids
+var (
+	processPidsFunc             = process.Pids
+	processIdentityForPIDFunc   = processIdentityForPID
+	validateProcessIdentityFunc = validateProcessIdentity
+)
 
 // fetchProcessConnections returns a map with the PIDs of all the running processes as a key,
 // and the open ports for the given process as a value
-func fetchProcessPorts(scanPorts bool) (map[app.PID]ProcessAttrs, error) {
+func fetchProcessPorts(
+	scanPorts bool,
+	identityHints map[app.PID]*processIdentityLease,
+) (map[app.PID]ProcessAttrs, error) {
 	log := wplog()
 	processes := map[app.PID]ProcessAttrs{}
 	pids, err := processPidsFunc()
@@ -539,12 +645,40 @@ func fetchProcessPorts(scanPorts bool) (map[app.PID]ProcessAttrs, error) {
 	}
 
 	for _, pid := range pids {
+		appPID := app.PID(pid)
+		identity := identityHints[appPID]
+		if identity != nil {
+			delete(identityHints, appPID)
+			if err := validateProcessIdentityFunc(identity); err != nil {
+				_ = identity.close()
+				identity = nil
+			}
+		}
+		if identity == nil {
+			var identityErr error
+			identity, identityErr = processIdentityForPIDFunc(appPID)
+			if identityErr != nil {
+				log.Debug("can't pin process identity. Skipping", "pid", pid, "error", identityErr)
+				continue
+			}
+		}
+		var startTime uint64
+		if _, start, _, _, ok := identity.metadata(); ok {
+			startTime = start
+		}
 		if !scanPorts {
-			processes[app.PID(pid)] = ProcessAttrs{pid: app.PID(pid), detectedType: svc.InstrumentableUnknown, openPorts: []uint32{}, processAge: processAgeFunc(app.PID(pid))}
+			age := processAgeFunc(appPID)
+			if err := validateProcessIdentityFunc(identity); err != nil {
+				_ = identity.close()
+				log.Debug("process identity changed during observation. Skipping", "pid", pid, "error", err)
+				continue
+			}
+			processes[appPID] = ProcessAttrs{pid: appPID, detectedType: svc.InstrumentableUnknown, openPorts: []uint32{}, processAge: age, processStart: startTime, processIdentity: identity}
 			continue
 		}
 		conns, err := net.ConnectionsPid("inet", pid)
 		if err != nil {
+			_ = identity.close()
 			log.Debug("can't get connections for process. Skipping", "pid", pid, "error", err)
 			continue
 		}
@@ -553,7 +687,12 @@ func fetchProcessPorts(scanPorts bool) (map[app.PID]ProcessAttrs, error) {
 		for _, conn := range conns {
 			openPorts = append(openPorts, conn.Laddr.Port)
 		}
-		processes[app.PID(pid)] = ProcessAttrs{pid: app.PID(pid), detectedType: svc.InstrumentableUnknown, openPorts: openPorts, processAge: time.Duration(0)}
+		if err := validateProcessIdentityFunc(identity); err != nil {
+			_ = identity.close()
+			log.Debug("process identity changed during port observation. Skipping", "pid", pid, "error", err)
+			continue
+		}
+		processes[appPID] = ProcessAttrs{pid: appPID, detectedType: svc.InstrumentableUnknown, openPorts: openPorts, processAge: time.Duration(0), processStart: startTime, processIdentity: identity}
 	}
 	return processes, nil
 }

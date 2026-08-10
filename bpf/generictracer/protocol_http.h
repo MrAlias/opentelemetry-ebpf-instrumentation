@@ -254,8 +254,9 @@ force_finish_possible_delayed_http_request(pid_connection_info_t *pid_conn) {
     cleanup_http_info(pid_conn);
 }
 
-static __always_inline void cleanup_http_request_data(pid_connection_info_t *pid_conn,
-                                                      http_info_t *info) {
+static __always_inline void cleanup_http_request_data_mode(pid_connection_info_t *pid_conn,
+                                                           http_info_t *info,
+                                                           u8 cleanup_java_remote_parent) {
     if (info) {
         if (info->type == EVENT_HTTP_REQUEST) {
             trace_key_t t_key = {0};
@@ -263,11 +264,16 @@ static __always_inline void cleanup_http_request_data(pid_connection_info_t *pid
             t_key.p_key.ns = info->pid.ns;
             t_key.p_key.tid = info->task_tid;
             t_key.p_key.pid = info->pid.user_pid;
-            delete_server_trace(pid_conn, &t_key);
+            delete_server_trace_mode(pid_conn, &t_key, cleanup_java_remote_parent);
         } else {
             delete_client_trace_info(pid_conn);
         }
     }
+}
+
+static __always_inline void cleanup_http_request_data(pid_connection_info_t *pid_conn,
+                                                      http_info_t *info) {
+    cleanup_http_request_data_mode(pid_conn, info, 1);
 }
 
 #define OBI_HTTP_TERMINATION_CONTEXT

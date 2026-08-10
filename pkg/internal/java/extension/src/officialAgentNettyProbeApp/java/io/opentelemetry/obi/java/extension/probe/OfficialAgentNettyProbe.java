@@ -113,6 +113,8 @@ public final class OfficialAgentNettyProbe {
       new ConcurrentHashMap<>();
   private static final ConcurrentMap<String, EdgeCompletion> COMPLETED_EDGES =
       new ConcurrentHashMap<>();
+  private static final ConcurrentMap<Long, EdgeCapture> TERMINAL_EDGE_CANCELLATIONS =
+      new ConcurrentHashMap<>();
   private static final AtomicLong TASK_EVENT_SEQUENCE = new AtomicLong();
   private static final AtomicReference<Throwable> EDGE_FAILURE = new AtomicReference<>();
   private static volatile Method getTid;
@@ -417,6 +419,9 @@ public final class OfficialAgentNettyProbe {
     require(
         COMPLETED_EDGES.size() == 4,
         "Netty completed edge count mismatch: " + COMPLETED_EDGES.keySet());
+    require(
+        TERMINAL_EDGE_CANCELLATIONS.size() == 4,
+        "Netty terminal edge cancellation count mismatch: " + TERMINAL_EDGE_CANCELLATIONS.keySet());
     for (String id : new String[] {"P", "Q"}) {
       require(
           COMPLETED_EDGES.containsKey(edgeKey(id, TLS_TO_INTERMEDIATE)),
@@ -1588,9 +1593,20 @@ public final class OfficialAgentNettyProbe {
         return;
       }
 
-      if ("TASK_CANCEL".equals(operation) && LABELLED_EDGE_CAPTURES.containsKey(value)) {
-        PENDING_EDGE_CAPTURES.remove(value);
-        throw new IllegalStateException("Netty edge token was cancelled: " + value);
+      if ("TASK_CANCEL".equals(operation)) {
+        EdgeCapture capture = LABELLED_EDGE_CAPTURES.get(value);
+        if (capture == null) {
+          return;
+        }
+        require(
+            !PENDING_EDGE_CAPTURES.remove(value, capture),
+            "Netty edge token was cancelled before link: " + value);
+        require(
+            COMPLETED_EDGES.containsKey(edgeKey(capture.label.id, capture.label.edge)),
+            "Netty edge token was cancelled before completion: " + value);
+        require(
+            TERMINAL_EDGE_CANCELLATIONS.putIfAbsent(value, capture) == null,
+            "duplicate Netty terminal edge cancellation: " + value);
       }
     } catch (Throwable failure) {
       EDGE_FAILURE.compareAndSet(null, failure);

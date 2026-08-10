@@ -20,14 +20,18 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"golang.org/x/sys/unix"
 
 	"go.opentelemetry.io/obi/pkg/appolly/app"
 	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
+	"go.opentelemetry.io/obi/pkg/appolly/discover/exec"
 	"go.opentelemetry.io/obi/pkg/ebpf"
 	ebpfcommon "go.opentelemetry.io/obi/pkg/ebpf/common"
 	"go.opentelemetry.io/obi/pkg/internal/jvmtools/jvm"
+	"go.opentelemetry.io/obi/pkg/internal/procs"
 	"go.opentelemetry.io/obi/pkg/obi"
 )
 
@@ -38,6 +42,7 @@ const (
 	maxJVMAttachResponseBytes        = 64 << 10
 	maxJavaAgentTempCreateAttempts   = 100
 	maxUID                           = uint64(1<<32 - 1)
+	javaAuthorizationReadyTimeout    = 12 * time.Second
 )
 
 //go:embed embedded/obi-java-agent.jar
@@ -58,13 +63,126 @@ type JavaInjector struct {
 }
 
 type javaAttacher interface {
+	BindTarget(int, uint64) error
+	BindTargetFromProcFD(int, uint64, int) error
+	ValidateTarget() error
+	CloseTarget() error
 	Init()
 	Cleanup() error
 	AttachContext(context.Context, int, []string, bool) (io.ReadCloser, error)
 }
 
+// PreparedExecutable owns the exact process handle captured before Java
+// authorization begins. Its attachment may run asynchronously, but it can
+// never look up a replacement process by numeric PID after readiness unblocks.
+type PreparedExecutable interface {
+	NewExecutableContext(context.Context) error
+	Close() error
+}
+
+type preparedExecutable struct {
+	mu                      sync.Mutex
+	injector                *JavaInjector
+	instrumentable          *ebpf.Instrumentable
+	attacher                javaAttacher
+	authorizationGeneration uint64
+	started                 bool
+	closed                  bool
+	closeErr                error
+}
+
+func (p *preparedExecutable) NewExecutableContext(ctx context.Context) (resultErr error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return errors.New("prepared Java target is already closed")
+	}
+	if p.started {
+		return errors.New("prepared Java target was already used")
+	}
+	p.started = true
+	resultErr = p.injector.newExecutableContext(
+		ctx,
+		p.instrumentable,
+		p.attacher,
+		p.authorizationGeneration,
+	)
+	return errors.Join(resultErr, p.closeLocked())
+}
+
+func (p *preparedExecutable) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.closeLocked()
+}
+
+func (p *preparedExecutable) closeLocked() error {
+	if !p.closed {
+		p.closed = true
+		// If this prepared operation was rejected or canceled before the tracer
+		// completed authorization, release only its exact readiness generation
+		// fail-closed. A stale or already-completed generation ignores this call.
+		p.instrumentable.FileInfo.CompleteJavaAgentAuthorization(
+			p.authorizationGeneration, 0,
+		)
+		p.closeErr = p.attacher.CloseTarget()
+	}
+	return p.closeErr
+}
+
 var newJavaAttacher = func(log *slog.Logger) javaAttacher {
 	return jvm.NewJAttacher(log)
+}
+
+var (
+	readJavaCapabilityRandom   = rand.Read
+	javaTargetProcessStartTime = procs.ProcessStartTime
+	javaAttachSerial           = make(chan struct{}, 1)
+)
+
+func acquireJavaAttach(ctx context.Context) (func(), error) {
+	select {
+	case javaAttachSerial <- struct{}{}:
+		return func() { <-javaAttachSerial }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func validateJavaTargetLifetime(fi *exec.FileInfo) error {
+	if fi == nil {
+		return errors.New("java process has no executable identity")
+	}
+	if fi.ProcessStartTime() == 0 {
+		return nil
+	}
+	current, err := javaTargetProcessStartTime(fi.Pid())
+	if err != nil {
+		return fmt.Errorf("revalidating Java target process lifetime: %w", err)
+	}
+	if current != fi.ProcessStartTime() {
+		return fmt.Errorf(
+			"revalidating Java target process lifetime: PID %d changed from start %d to %d",
+			fi.Pid(), fi.ProcessStartTime(), current,
+		)
+	}
+	return nil
+}
+
+func bindJavaTarget(attacher javaAttacher, fi *exec.FileInfo) error {
+	if fi == nil {
+		return errors.New("java process has no executable identity")
+	}
+	// A zero start time is retained only for legacy unit fixtures. Every Linux
+	// discovery FileInfo carries both a nonzero start token and a pinned procfd.
+	if fi.ProcessStartTime() == 0 {
+		return attacher.BindTarget(int(fi.Pid()), 0)
+	}
+	return fi.UseProcessHandle(func(procFD int) error {
+		return attacher.BindTargetFromProcFD(
+			int(fi.Pid()), fi.ProcessStartTime(), procFD,
+		)
+	})
 }
 
 func NewJavaInjector(cfg *obi.Config) (*JavaInjector, error) {
@@ -213,18 +331,67 @@ func (i *JavaInjector) findTempDir(root string, ie *ebpf.Instrumentable) (string
 }
 
 func (i *JavaInjector) NewExecutable(ie *ebpf.Instrumentable) error {
-	ctx, cancel := context.WithTimeout(context.Background(), i.cfg.Java.Timeout)
-	defer cancel()
+	return i.NewExecutableContext(context.Background(), ie)
+}
 
-	if ie.Type != svc.InstrumentableJava {
+func (i *JavaInjector) NewExecutableContext(
+	parent context.Context,
+	ie *ebpf.Instrumentable,
+) (resultErr error) {
+	if ie == nil || ie.Type != svc.InstrumentableJava {
 		return nil
 	}
-	capability := ie.FileInfo.JavaAgentCapability()
+	if err := validateJavaTargetLifetime(ie.FileInfo); err != nil {
+		return err
+	}
+	attacher := newJavaAttacher(i.log)
+	if err := bindJavaTarget(attacher, ie.FileInfo); err != nil {
+		return fmt.Errorf("binding exact Java target process: %w", err)
+	}
+	defer func() { resultErr = errors.Join(resultErr, attacher.CloseTarget()) }()
+	return i.newExecutableContext(parent, ie, attacher, 0)
+}
+
+func (i *JavaInjector) newExecutableContext(
+	parent context.Context,
+	ie *ebpf.Instrumentable,
+	attacher javaAttacher,
+	authorizationGeneration uint64,
+) error {
+	readyCtx, cancelReady := context.WithTimeout(parent, javaAuthorizationReadyTimeout)
+	var capability uint64
+	var err error
+	if authorizationGeneration == 0 {
+		capability, err = ie.FileInfo.WaitJavaAgentAuthorization(readyCtx)
+	} else {
+		capability, err = ie.FileInfo.WaitJavaAgentAuthorizationGeneration(
+			readyCtx, authorizationGeneration,
+		)
+	}
+	cancelReady()
+	if err != nil {
+		return fmt.Errorf("waiting for Java process authorization: %w", err)
+	}
 	if capability == 0 {
 		return &JavaInjectError{Message: "Java process capability was not prepared before attach"}
 	}
+	if err := parent.Err(); err != nil {
+		return fmt.Errorf("starting Java attach: %w", err)
+	}
+	releaseAttach, err := acquireJavaAttach(parent)
+	if err != nil {
+		return fmt.Errorf("waiting for the process-wide Java attach gate: %w", err)
+	}
+	defer releaseAttach()
+	if err := validateJavaTargetLifetime(ie.FileInfo); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(parent, i.cfg.Java.Timeout)
+	defer cancel()
 
-	attacher := newJavaAttacher(i.log)
+	if err := attacher.ValidateTarget(); err != nil {
+		return fmt.Errorf("revalidating exact Java target after authorization: %w", err)
+	}
 	ok, jdk8, err := i.verifyJVMVersion(ctx, attacher, ie.FileInfo.Pid())
 	if err != nil {
 		return i.attachError(ctx, ie, err)
@@ -246,11 +413,29 @@ func (i *JavaInjector) NewExecutable(ie *ebpf.Instrumentable) error {
 		i.log.Info("OpenTelemetry eBPF Java Agent already loaded, reconfiguring")
 	}
 
+	if err := validateJavaTargetLifetime(ie.FileInfo); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := attacher.ValidateTarget(); err != nil {
+		return fmt.Errorf("revalidating exact Java target before agent copy: %w", err)
+	}
 	i.log.Info("injecting OpenTelemetry eBPF instrumentation for Java process", "pid", ie.FileInfo.Pid())
-	agentPath, err := i.copyAgent(ie)
+	agentPath, err := i.copyAgent(ie, attacher.ValidateTarget)
 	if err != nil {
 		i.log.Error("failed to extract java agent", "pid", ie.FileInfo.Pid(), "error", err)
 		return err
+	}
+	if err := validateJavaTargetLifetime(ie.FileInfo); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := attacher.ValidateTarget(); err != nil {
+		return fmt.Errorf("revalidating exact Java target before agent load: %w", err)
 	}
 	if err := i.attachJDKAgentWithCapability(
 		ctx, attacher, ie.FileInfo.Pid(), agentPath, capability,
@@ -258,40 +443,75 @@ func (i *JavaInjector) NewExecutable(ie *ebpf.Instrumentable) error {
 		i.log.Error("couldn't attach OpenTelemetry eBPF Java Agent", "pid", ie.FileInfo.Pid(), "path", agentPath, "error", err)
 		return i.attachError(ctx, ie, err)
 	}
+	if err := validateJavaTargetLifetime(ie.FileInfo); err != nil {
+		return err
+	}
 
 	return nil
 }
 
-func (i *JavaInjector) PrepareExecutable(ie *ebpf.Instrumentable) error {
+func (i *JavaInjector) PrepareExecutable(
+	ie *ebpf.Instrumentable,
+) (_ PreparedExecutable, resultErr error) {
 	if ie == nil || ie.Type != svc.InstrumentableJava {
-		return nil
+		return nil, nil
 	}
 	if ie.FileInfo == nil {
-		return errors.New("java process has no executable identity")
+		return nil, errors.New("java process has no executable identity")
 	}
-	if ie.FileInfo.JavaAgentCapability() != 0 {
-		return nil
+	if err := validateJavaTargetLifetime(ie.FileInfo); err != nil {
+		return nil, err
 	}
-
+	// Every EventCreated/attachment attempt starts a fresh process epoch. A
+	// previous R(capability) marker is eventually removed after cleanup, so
+	// reusing the nonzero value already stored on a recycled FileInfo would
+	// otherwise reopen a retired capability after its transient marker is gone.
+	authorizationGeneration := ie.FileInfo.PrepareJavaAgentCapability(0)
+	attacher := newJavaAttacher(i.log)
+	if err := bindJavaTarget(attacher, ie.FileInfo); err != nil {
+		ie.FileInfo.CompleteJavaAgentAuthorization(authorizationGeneration, 0)
+		return nil, fmt.Errorf("binding prepared Java target process: %w", err)
+	}
+	defer func() {
+		if resultErr != nil {
+			ie.FileInfo.CompleteJavaAgentAuthorization(authorizationGeneration, 0)
+			resultErr = errors.Join(resultErr, attacher.CloseTarget())
+		}
+	}()
 	for range 4 {
 		var random [8]byte
-		if _, err := rand.Read(random[:]); err != nil {
-			return fmt.Errorf("generate Java process capability: %w", err)
+		if _, err := readJavaCapabilityRandom(random[:]); err != nil {
+			return nil, fmt.Errorf("generate Java process capability: %w", err)
 		}
 		capability := binary.LittleEndian.Uint64(random[:]) & uint64(1<<63-1)
 		if capability != 0 {
-			ie.FileInfo.SetJavaAgentCapability(capability)
-			return nil
+			if !ie.FileInfo.SetJavaAgentCapabilityForGeneration(
+				authorizationGeneration, capability,
+			) {
+				return nil, errors.New("prepared Java authorization generation was superseded")
+			}
+			return &preparedExecutable{
+				injector:                i,
+				instrumentable:          ie,
+				attacher:                attacher,
+				authorizationGeneration: authorizationGeneration,
+			}, nil
 		}
 	}
 
-	return errors.New("generate nonzero Java process capability")
+	return nil, errors.New("generate nonzero Java process capability")
 }
 
 func (i *JavaInjector) attachError(ctx context.Context, ie *ebpf.Instrumentable, err error) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
+		if errors.Is(ctxErr, context.Canceled) {
+			return fmt.Errorf("java attach canceled: %w", ctxErr)
+		}
 		i.log.Warn("java attach timed out", "timeout", i.cfg.Java.Timeout, "pid", ie.FileInfo.Pid())
-		return &JavaInjectError{Message: "java attach timed out"}
+		return errors.Join(
+			&JavaInjectError{Message: "java attach timed out"},
+			ctxErr,
+		)
 	}
 
 	return err
@@ -367,13 +587,21 @@ func createJavaAgentTempFile(dirFD int) (*os.File, string, error) {
 	return nil, "", fmt.Errorf("unable to allocate a unique OBI java agent name after %d attempts", maxJavaAgentTempCreateAttempts)
 }
 
-func (i *JavaInjector) copyAgent(ie *ebpf.Instrumentable) (string, error) {
+func (i *JavaInjector) copyAgent(
+	ie *ebpf.Instrumentable,
+	validateTarget ...func() error,
+) (string, error) {
 	root := rootDirForPID(ie.FileInfo.Pid())
 	rootFD, err := openRootDirectory(root)
 	if err != nil {
 		return "", fmt.Errorf("error accessing process root: %w", err)
 	}
 	defer unix.Close(rootFD)
+	if len(validateTarget) != 0 && validateTarget[0] != nil {
+		if err := validateTarget[0](); err != nil {
+			return "", fmt.Errorf("revalidating process after opening its root: %w", err)
+		}
+	}
 
 	tempDir, tempDirFD, err := i.findTempDirAt(rootFD, ie)
 	if err != nil {

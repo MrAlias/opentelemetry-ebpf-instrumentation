@@ -7,6 +7,7 @@ package jvm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,6 +21,10 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
+
+	"go.opentelemetry.io/obi/pkg/appolly/app"
+	"go.opentelemetry.io/obi/pkg/internal/procs"
 )
 
 func TestAttachContextReturnsCanceledContext(t *testing.T) {
@@ -99,6 +104,59 @@ func TestWriteHotspotCommandClosesSocketOnContextCancellation(t *testing.T) {
 	default:
 		t.Fatal("expected canceled context to close the socket")
 	}
+}
+
+func TestHotspotFallbackStillValidatesExactPeer(t *testing.T) {
+	start, err := procs.ProcessStartTime(app.PID(os.Getpid()))
+	require.NoError(t, err)
+	originalOpen := openJVMTargetPIDFD
+	originalSignal := signalJVMTargetPIDFD
+	openJVMTargetPIDFD = func(int, int) (int, error) { return -1, unix.ENOSYS }
+	signalJVMTargetPIDFD = func(int, syscall.Signal, *unix.Siginfo, int) error {
+		return nil
+	}
+	t.Cleanup(func() {
+		openJVMTargetPIDFD = originalOpen
+		signalJVMTargetPIDFD = originalSignal
+	})
+	target := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.NoError(t, target.BindTarget(os.Getpid(), start))
+	t.Cleanup(func() { require.NoError(t, target.CloseTarget()) })
+	require.Equal(t, -1, target.targetPIDFD)
+
+	const namespacePID = 9_999_990
+	path := filepath.Join(t.TempDir(), fmt.Sprintf(".java_pid%d", namespacePID))
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = listener.Close() })
+	accepted := make(chan struct{})
+	go func() {
+		connection, acceptErr := listener.AcceptUnix()
+		if acceptErr == nil {
+			_ = connection.Close()
+		}
+		close(accepted)
+	}()
+
+	peerErr := errors.New("test exact-peer rejection")
+	originalValidatePeer := validateHotspotSocketPeer
+	validationCalls := 0
+	validateHotspotSocketPeer = func(_ net.Conn, expectedPID int) error {
+		validationCalls++
+		require.Equal(t, expectedPID, os.Getpid())
+		return peerErr
+	}
+	t.Cleanup(func() { validateHotspotSocketPeer = originalValidatePeer })
+
+	reader, err := jattachHotspot(
+		t.Context(), os.Getpid(), namespacePID, os.Getpid(),
+		[]string{"jcmd"}, filepath.Dir(path),
+		slog.New(slog.NewTextHandler(io.Discard, nil)), target,
+	)
+	require.Nil(t, reader)
+	require.ErrorIs(t, err, peerErr)
+	require.Equal(t, 1, validationCalls)
+	<-accepted
 }
 
 type blockingConn struct {

@@ -68,26 +68,29 @@ static __always_inline bool should_ignore_unreadable(pid_connection_info_t *p_co
     return !http_info_complete(info);
 }
 
-static __always_inline void
-force_sent_event(u64 id, u64 *sock_p, pid_connection_info_t *p_conn, const bool unreadable) {
+static __always_inline void force_sent_event_mode(u64 id,
+                                                  u64 *sock_p,
+                                                  pid_connection_info_t *p_conn,
+                                                  const bool unreadable,
+                                                  u8 cleanup_java_remote_parent) {
     send_args_t *s_args = (send_args_t *)bpf_map_lookup_elem(&active_send_args, &id);
     if (s_args) {
         if (should_ignore_unreadable(&s_args->p_conn, unreadable)) {
             bpf_dbg_printk("ignoring force finish because of marked unreadable port");
-            terminate_http_request_if_needed(&s_args->p_conn);
+            terminate_http_request_if_needed_mode(&s_args->p_conn, cleanup_java_remote_parent);
         } else {
             bpf_dbg_printk("Checking if we need to finish the request per thread id");
-            force_terminate_http_request(&s_args->p_conn);
+            force_terminate_http_request_mode(&s_args->p_conn, cleanup_java_remote_parent);
         }
     } // see if we match on another thread, but same sock *
     s_args = (send_args_t *)bpf_map_lookup_elem(&active_send_sock_args, sock_p);
     if (s_args) {
         if (should_ignore_unreadable(&s_args->p_conn, unreadable)) {
             bpf_dbg_printk("ignoring force finish because of marked unreadable port");
-            terminate_http_request_if_needed(&s_args->p_conn);
+            terminate_http_request_if_needed_mode(&s_args->p_conn, cleanup_java_remote_parent);
         } else {
             bpf_dbg_printk("Checking if we need to finish the request per socket");
-            force_terminate_http_request(&s_args->p_conn);
+            force_terminate_http_request_mode(&s_args->p_conn, cleanup_java_remote_parent);
         }
     }
 
@@ -96,7 +99,12 @@ force_sent_event(u64 id, u64 *sock_p, pid_connection_info_t *p_conn, const bool 
             bpf_dbg_printk("ignoring force finish because of marked unreadable port");
         } else {
             bpf_dbg_printk("Checking if we need to finish the request per connection info");
-            force_terminate_http_request(p_conn);
+            force_terminate_http_request_mode(p_conn, cleanup_java_remote_parent);
         }
     }
+}
+
+static __always_inline void
+force_sent_event(u64 id, u64 *sock_p, pid_connection_info_t *p_conn, const bool unreadable) {
+    force_sent_event_mode(id, sock_p, p_conn, unreadable, 1);
 }

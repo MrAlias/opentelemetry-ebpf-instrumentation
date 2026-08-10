@@ -8,7 +8,9 @@ package jvm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -80,6 +82,134 @@ func TestAcceptOpenJ9ClientStopsAtContextDeadline(t *testing.T) {
 
 	require.Equal(t, -1, fd)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+func TestAcceptOpenJ9ClientRejectsDecoyAndContinues(t *testing.T) {
+	listener, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = syscall.Close(listener) })
+	require.NoError(t, unix.Bind(listener, &unix.SockaddrInet4{
+		Port: 0,
+		Addr: [4]byte{127, 0, 0, 1},
+	}))
+	require.NoError(t, unix.Listen(listener, 8))
+	address, err := unix.Getsockname(listener)
+	require.NoError(t, err)
+	port := address.(*unix.SockaddrInet4).Port
+
+	const key = uint64(0x1234)
+	handshake := append(
+		[]byte(fmt.Sprintf("ATTACH_CONNECTED %016x ", key)),
+		0,
+	)
+	wrong, err := net.Dial("tcp4", fmt.Sprintf("127.0.0.1:%d", port))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = wrong.Close() })
+	_, err = wrong.Write(handshake)
+	require.NoError(t, err)
+	right, err := net.Dial("tcp4", fmt.Sprintf("127.0.0.1:%d", port))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = right.Close() })
+	_, err = right.Write(handshake)
+	require.NoError(t, err)
+
+	validationCalls := 0
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	accepted, err := acceptClient(ctx, listener, key, func(int) error {
+		validationCalls++
+		if validationCalls == 1 {
+			return errOpenJ9PeerMismatch
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = syscall.Close(accepted) })
+	require.Equal(t, 2, validationCalls)
+}
+
+func TestAcceptOpenJ9ClientAuthenticatesBeforeExactPeerScan(t *testing.T) {
+	listener, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = syscall.Close(listener) })
+	require.NoError(t, unix.Bind(listener, &unix.SockaddrInet4{
+		Port: 0,
+		Addr: [4]byte{127, 0, 0, 1},
+	}))
+	require.NoError(t, unix.Listen(listener, 8))
+	address, err := unix.Getsockname(listener)
+	require.NoError(t, err)
+	port := address.(*unix.SockaddrInet4).Port
+
+	const key = uint64(0x1234)
+	wrong, err := net.Dial("tcp4", fmt.Sprintf("127.0.0.1:%d", port))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = wrong.Close() })
+	_, err = wrong.Write(make([]byte, 35))
+	require.NoError(t, err)
+	right, err := net.Dial("tcp4", fmt.Sprintf("127.0.0.1:%d", port))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = right.Close() })
+	handshake := append(
+		[]byte(fmt.Sprintf("ATTACH_CONNECTED %016x ", key)),
+		0,
+	)
+	_, err = right.Write(handshake)
+	require.NoError(t, err)
+
+	validationCalls := 0
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	accepted, err := acceptClient(ctx, listener, key, func(int) error {
+		validationCalls++
+		return nil
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = syscall.Close(accepted) })
+	require.Equal(t, 1, validationCalls)
+}
+
+func TestAcceptOpenJ9ClientBoundsUnauthenticatedHandshake(t *testing.T) {
+	listener, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = syscall.Close(listener) })
+	require.NoError(t, unix.Bind(listener, &unix.SockaddrInet4{
+		Port: 0,
+		Addr: [4]byte{127, 0, 0, 1},
+	}))
+	require.NoError(t, unix.Listen(listener, 8))
+	address, err := unix.Getsockname(listener)
+	require.NoError(t, err)
+	port := address.(*unix.SockaddrInet4).Port
+
+	originalTimeout := openJ9HandshakeTimeout
+	openJ9HandshakeTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { openJ9HandshakeTimeout = originalTimeout })
+	slow, err := net.Dial("tcp4", fmt.Sprintf("127.0.0.1:%d", port))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = slow.Close() })
+
+	const key = uint64(0x1234)
+	right, err := net.Dial("tcp4", fmt.Sprintf("127.0.0.1:%d", port))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = right.Close() })
+	handshake := append(
+		[]byte(fmt.Sprintf("ATTACH_CONNECTED %016x ", key)),
+		0,
+	)
+	_, err = right.Write(handshake)
+	require.NoError(t, err)
+
+	validationCalls := 0
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	accepted, err := acceptClient(ctx, listener, key, func(int) error {
+		validationCalls++
+		return nil
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = syscall.Close(accepted) })
+	require.Equal(t, 1, validationCalls)
 }
 
 func TestJ9ReaderAndDetachStopAtContextDeadline(t *testing.T) {

@@ -5,6 +5,7 @@ package discover
 
 import (
 	"log/slog"
+	"os"
 	"testing"
 	"time"
 
@@ -23,6 +24,58 @@ import (
 	"go.opentelemetry.io/obi/pkg/selection"
 	"go.opentelemetry.io/obi/pkg/transform"
 )
+
+func TestMatcherClosesRejectedProcessHandle(t *testing.T) {
+	originalProcessInfo := processInfo
+	t.Cleanup(func() { processInfo = originalProcessInfo })
+	handle, err := os.Open(t.TempDir())
+	require.NoError(t, err)
+	processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
+		return &services.ProcessInfo{
+			Pid:           pp.pid,
+			ProcessHandle: services.NewProcessHandle(handle),
+		}, nil
+	}
+	matcher := Matcher{
+		Log:            slog.Default(),
+		ProcessHistory: map[app.PID]ProcessMatch{},
+	}
+
+	_, matched := matcher.filterCreated(ProcessAttrs{pid: 42})
+	assert.False(t, matched)
+	_, err = handle.Stat()
+	assert.Error(t, err, "a rejected match must close its owned process handle")
+}
+
+func TestMatcherTransfersHandleWithoutRetainingItInHistory(t *testing.T) {
+	originalProcessInfo := processInfo
+	t.Cleanup(func() { processInfo = originalProcessInfo })
+	handle, err := os.Open(t.TempDir())
+	require.NoError(t, err)
+	processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
+		return &services.ProcessInfo{
+			Pid:           pp.pid,
+			PPid:          1,
+			ProcessHandle: services.NewProcessHandle(handle),
+		}, nil
+	}
+	matcher := Matcher{
+		Log: slog.Default(),
+		ProcessHistory: map[app.PID]ProcessMatch{
+			1: {Process: &services.ProcessInfo{Pid: 1}},
+		},
+	}
+
+	event, matched := matcher.filterCreated(ProcessAttrs{pid: 42})
+	require.True(t, matched)
+	require.NotNil(t, event.Obj.Process.ProcessHandle)
+	assert.Nil(t, matcher.ProcessHistory[42].Process.ProcessHandle)
+	transferred, err := event.Obj.Process.TakeProcessHandle()
+	require.NoError(t, err)
+	require.NoError(t, transferred.Close())
+	_, err = handle.Stat()
+	assert.Error(t, err, "the terminal owner must control the transferred handle")
+}
 
 // TestMatchersMutuallyExclusive wires CriteriaMatcher + DynamicMatcher like ProcessFinder.Start.
 // Exactly one path subscribes to the input: dynamic selector set → only DynamicMatcher runs;
@@ -51,7 +104,7 @@ func TestMatchersMutuallyExclusive(t *testing.T) {
 
 		swi := swarm.Instancer{}
 		swi.Add(criteriaMatcherProvider(&pipeConfig, inQ, outQ, cfgCriteria, sel), swarm.WithID("CriteriaMatcher"))
-		swi.Add(dynamicMatcherProvider(inQ, outQ, sel.appSignals()), swarm.WithID("DynamicMatcher"))
+		swi.Add(dynamicMatcherProvider(inQ, outQ, sel.appSignals(), nil), swarm.WithID("DynamicMatcher"))
 		runner, err := swi.Instance(t.Context())
 		require.NoError(t, err)
 		runner.Start(t.Context())
@@ -82,7 +135,7 @@ func TestMatchersMutuallyExclusive(t *testing.T) {
 
 		swi := swarm.Instancer{}
 		swi.Add(criteriaMatcherProvider(&pipeConfig, inQ, outQ, cfgCriteria, nil), swarm.WithID("CriteriaMatcher"))
-		swi.Add(dynamicMatcherProvider(inQ, outQ, nil), swarm.WithID("DynamicMatcher"))
+		swi.Add(dynamicMatcherProvider(inQ, outQ, nil, nil), swarm.WithID("DynamicMatcher"))
 		runner, err := swi.Instance(t.Context())
 		require.NoError(t, err)
 		runner.Start(t.Context())
@@ -508,7 +561,7 @@ func TestDynamicMatcher_ChildInheritsDynamicSelectorPID(t *testing.T) {
 		}[pp.pid]
 		return &services.ProcessInfo{Pid: pp.pid, ExePath: proc.Exe, PPid: proc.PPid, OpenPorts: pp.openPorts}, nil
 	}
-	runFn, err := dynamicMatcherProvider(discoveredProcesses, filteredProcessesQu, dynamicSelector.appSignals())(t.Context())
+	runFn, err := dynamicMatcherProvider(discoveredProcesses, filteredProcessesQu, dynamicSelector.appSignals(), nil)(t.Context())
 	require.NoError(t, err)
 	go runFn(t.Context())
 	time.Sleep(50 * time.Millisecond)
@@ -526,6 +579,291 @@ func TestDynamicMatcher_ChildInheritsDynamicSelectorPID(t *testing.T) {
 
 	assert.Equal(t, app.PID(101), matches[1].Obj.Process.Pid)
 	assert.Equal(t, app.PID(100), matches[1].Obj.DynamicSelectorPID)
+
+	discoveredProcesses.Close()
+	testutil.DrainUntilClosed(filteredProcesses)
+}
+
+func TestDynamicMatcher_RemovingOwnerDeletesAllDescendantsOnce(t *testing.T) {
+	matcher := DynamicMatcher{
+		Log: slog.Default(),
+		ProcessHistory: map[app.PID]ProcessMatch{
+			100: {Process: &services.ProcessInfo{Pid: 100}, DynamicSelectorPID: 100},
+			101: {Process: &services.ProcessInfo{Pid: 101, PPid: 100}, DynamicSelectorPID: 100},
+			102: {Process: &services.ProcessInfo{Pid: 102, PPid: 100}, DynamicSelectorPID: 100},
+			200: {Process: &services.ProcessInfo{Pid: 200}, DynamicSelectorPID: 200},
+		},
+	}
+
+	// Duplicate owner entries and an overlapping descendant PID must not
+	// duplicate deletes. Ownership comes from DynamicSelectorPID, not map keys.
+	deleted := matcher.syntheticDeletesForRemovedPIDs([]app.PID{100, 101, 100})
+	require.Len(t, deleted, 3)
+	assert.Equal(t, []app.PID{100, 101, 102}, []app.PID{
+		deleted[0].Obj.Process.Pid,
+		deleted[1].Obj.Process.Pid,
+		deleted[2].Obj.Process.Pid,
+	})
+	for _, event := range deleted {
+		assert.Equal(t, EventDeleted, event.Type)
+	}
+	assert.Equal(t, map[app.PID]ProcessMatch{
+		200: {Process: &services.ProcessInfo{Pid: 200}, DynamicSelectorPID: 200},
+	}, matcher.ProcessHistory)
+	assert.Equal(t, map[app.PID]struct{}{101: {}, 102: {}}, matcher.removedDescendants[100])
+	assert.Empty(t, matcher.syntheticDeletesForRemovedPIDs([]app.PID{100}))
+	_, matched := matcher.filterDeleted(ProcessAttrs{pid: 101})
+	assert.False(t, matched)
+	assert.Equal(t, map[app.PID]struct{}{102: {}}, matcher.removedDescendants[100],
+		"a descendant that exits while disabled must not be replayed on re-add")
+}
+
+func TestDynamicMatcher_ReaddRediscoversReplacementAndNewDescendantObservedWhileDisabled(t *testing.T) {
+	originalProcessInfo := processInfo
+	t.Cleanup(func() { processInfo = originalProcessInfo })
+
+	parents := map[app.PID]app.PID{
+		100: 0,
+		101: 100,
+		102: 101,
+		103: 102,
+	}
+	processInfo = func(attrs ProcessAttrs) (*services.ProcessInfo, error) {
+		return &services.ProcessInfo{
+			Pid:     attrs.pid,
+			PPid:    parents[attrs.pid],
+			ExePath: "/bin/process",
+		}, nil
+	}
+
+	dynamicSelector := NewDynamicPIDSelector()
+	dynamicSelector.AddPIDs(100)
+	matcher := DynamicMatcher{
+		Log:                  slog.Default(),
+		DynamicPIDSelector:   dynamicSelector.appSignals(),
+		ProcessHistory:       map[app.PID]ProcessMatch{},
+		RediscoverPIDsNotify: make(chan []app.PID, 1),
+	}
+
+	created := matcher.filter([]Event[ProcessAttrs]{
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 100}},
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 101}},
+	})
+	require.Len(t, created, 2)
+
+	dynamicSelector.RemovePIDs(100)
+	matcher.noteRemovedOwners([]app.PID{100})
+	require.Len(t, matcher.syntheticDeletesForRemovedPIDs([]app.PID{100}), 2)
+
+	// The old child exits while disabled, so it leaves both live caches. The
+	// removed owner remains an ancestry root for a later replacement.
+	assert.Empty(t, matcher.filter([]Event[ProcessAttrs]{
+		{Type: EventDeleted, Obj: ProcessAttrs{pid: 101}},
+	}))
+	assert.NotContains(t, matcher.removedDescendants[100], app.PID(101))
+	assert.NotContains(t, matcher.disabledTreeOwners, app.PID(101))
+
+	// The replacement and new descendants are rejected while the selector is
+	// off, but their disabled-tree lineage must be retained for the next re-add.
+	// Descendants deliberately precede their parents to model watcher map order.
+	assert.Empty(t, matcher.filter([]Event[ProcessAttrs]{
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 103}},
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 102}},
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 101}},
+	}))
+	assert.Equal(t, map[app.PID]struct{}{101: {}, 102: {}, 103: {}}, matcher.removedDescendants[100])
+
+	dynamicSelector.AddPIDs(100)
+	assert.Equal(t, []app.PID{100, 101, 102, 103}, matcher.rediscoveryPIDsForAddedOwners([]app.PID{100}))
+	assert.Empty(t, matcher.disabledTreeOwners, "a re-add must release all lineage entries for that owner")
+}
+
+func TestDynamicMatcher_IndependentlySelectedChildPromotesBeforeOldParentRemoval(t *testing.T) {
+	originalProcessInfo := processInfo
+	t.Cleanup(func() { processInfo = originalProcessInfo })
+	processInfo = func(attrs ProcessAttrs) (*services.ProcessInfo, error) {
+		return &services.ProcessInfo{Pid: attrs.pid, PPid: 100, ExePath: "/bin/child"}, nil
+	}
+
+	dynamicSelector := NewDynamicPIDSelector()
+	dynamicSelector.AddPIDs(100)
+	input := make(chan []Event[ProcessAttrs], 2)
+	added := make(chan []app.PID, 1)
+	removed := make(chan []app.PID, 1)
+	rediscover := make(chan []app.PID, 1)
+	outputQueue := msg.NewQueue[[]Event[ProcessMatch]](msg.ChannelBufferLen(4))
+	output := outputQueue.Subscribe()
+	matcher := DynamicMatcher{
+		Log:                slog.Default(),
+		DynamicPIDSelector: dynamicSelector.appSignals(),
+		Input:              input,
+		Output:             outputQueue,
+		ProcessHistory: map[app.PID]ProcessMatch{
+			100: {Process: &services.ProcessInfo{Pid: 100}, DynamicSelectorPID: 100},
+			101: {Process: &services.ProcessInfo{Pid: 101, PPid: 100}, DynamicSelectorPID: 100},
+		},
+		RediscoverPIDsNotify: rediscover,
+		AddedPIDsNotify:      added,
+		RemovedPIDsNotify:    removed,
+	}
+	done := make(chan struct{})
+	go func() {
+		matcher.Run(t.Context())
+		close(done)
+	}()
+
+	dynamicSelector.AddPIDs(101)
+	added <- []app.PID{101}
+	promotionDelete := testutil.ReadChannel(t, output, testTimeout)
+	require.Len(t, promotionDelete, 1)
+	assert.Equal(t, EventDeleted, promotionDelete[0].Type)
+	assert.Equal(t, app.PID(101), promotionDelete[0].Obj.Process.Pid)
+	assert.Equal(t, app.PID(100), promotionDelete[0].Obj.DynamicSelectorPID)
+	assert.Equal(t, []app.PID{101}, testutil.ReadChannel(t, rediscover, testTimeout))
+
+	input <- []Event[ProcessAttrs]{{Type: EventCreated, Obj: ProcessAttrs{pid: 101}}}
+	promotedCreate := testutil.ReadChannel(t, output, testTimeout)
+	require.Len(t, promotedCreate, 1)
+	assert.Equal(t, EventCreated, promotedCreate[0].Type)
+	assert.Equal(t, app.PID(101), promotedCreate[0].Obj.DynamicSelectorPID)
+
+	dynamicSelector.RemovePIDs(100)
+	removed <- []app.PID{100}
+	parentDelete := testutil.ReadChannel(t, output, testTimeout)
+	require.Len(t, parentDelete, 1)
+	assert.Equal(t, EventDeleted, parentDelete[0].Type)
+	assert.Equal(t, app.PID(100), parentDelete[0].Obj.Process.Pid)
+
+	close(input)
+	testutil.ReadChannel(t, done, testTimeout)
+	require.Len(t, matcher.ProcessHistory, 1)
+	assert.Equal(t, app.PID(101), matcher.ProcessHistory[101].DynamicSelectorPID,
+		"removing the old parent must preserve the independently selected child")
+}
+
+func TestDynamicMatcher_ReorderedAddRemoveNotificationsRediscoverOnce(t *testing.T) {
+	dynamicSelector := NewDynamicPIDSelector()
+	dynamicSelector.AddPIDs(100)
+	matcher := DynamicMatcher{
+		Log:                slog.Default(),
+		DynamicPIDSelector: dynamicSelector.appSignals(),
+		ProcessHistory: map[app.PID]ProcessMatch{
+			100: {Process: &services.ProcessInfo{Pid: 100}, DynamicSelectorPID: 100},
+			101: {Process: &services.ProcessInfo{Pid: 101, PPid: 100}, DynamicSelectorPID: 100},
+			102: {Process: &services.ProcessInfo{Pid: 102, PPid: 100}, DynamicSelectorPID: 100},
+		},
+		RediscoverPIDsNotify: make(chan []app.PID, 1),
+	}
+
+	// If the independent add stream is observed first, the existing admission
+	// defers feedback. The later removal edge sees the selector's re-added level
+	// and produces one complete owner+descendant rediscovery request.
+	assert.Empty(t, matcher.rediscoveryPIDsForAddedOwners([]app.PID{100}))
+	dynamicSelector.RemovePIDs(100)
+	dynamicSelector.AddPIDs(100)
+	matcher.noteRemovedOwners([]app.PID{100})
+	require.Len(t, matcher.syntheticDeletesForRemovedPIDs([]app.PID{100}), 3)
+	require.True(t, dynamicSelector.appSignals().IncludesPID(100))
+	assert.Equal(t, []app.PID{100, 101, 102}, matcher.rediscoveryPIDsForAddedOwners([]app.PID{100}))
+	assert.Empty(t, matcher.rediscoveryPIDsForAddedOwners([]app.PID{100}),
+		"the late add notification must not request a second forget")
+}
+
+func TestDynamicMatcher_RemoveAndReaddRediscoverLiveDescendants(t *testing.T) {
+	originalProcessInfo := processInfo
+	t.Cleanup(func() { processInfo = originalProcessInfo })
+
+	dynamicSelector := NewDynamicPIDSelector()
+	dynamicSelector.AddPIDs(100)
+	processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
+		parents := map[app.PID]app.PID{
+			100: 0,
+			101: 100,
+			102: 100,
+			103: 101,
+		}
+		return &services.ProcessInfo{
+			Pid:     pp.pid,
+			PPid:    parents[pp.pid],
+			ExePath: "/bin/process",
+		}, nil
+	}
+
+	discoveredProcesses := msg.NewQueue[[]Event[ProcessAttrs]](msg.ChannelBufferLen(10))
+	filteredProcessesQu := msg.NewQueue[[]Event[ProcessMatch]](msg.ChannelBufferLen(10))
+	filteredProcesses := filteredProcessesQu.Subscribe()
+	rediscoverPIDs := make(chan []app.PID, 4)
+	matcher := DynamicMatcher{
+		Log:                  slog.Default(),
+		DynamicPIDSelector:   dynamicSelector.appSignals(),
+		Input:                discoveredProcesses.Subscribe(),
+		Output:               filteredProcessesQu,
+		ProcessHistory:       map[app.PID]ProcessMatch{},
+		RediscoverPIDsNotify: rediscoverPIDs,
+		removedDescendants:   map[app.PID]map[app.PID]struct{}{},
+	}
+	go matcher.Run(t.Context())
+
+	// The initial add is relayed to the watcher through the same feedback path.
+	assert.Equal(t, []app.PID{100}, testutil.ReadChannel(t, rediscoverPIDs, testTimeout))
+
+	// Watcher maps are unordered: descendants can arrive before their owner.
+	// The matcher retries the batch until the entire inherited chain resolves.
+	discoveredProcesses.Send([]Event[ProcessAttrs]{
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 103}},
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 101}},
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 102}},
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 100}},
+	})
+	created := testutil.ReadChannel(t, filteredProcesses, testTimeout)
+	require.Len(t, created, 4)
+	assert.Equal(t, []app.PID{100, 101, 102, 103}, []app.PID{
+		created[0].Obj.Process.Pid,
+		created[1].Obj.Process.Pid,
+		created[2].Obj.Process.Pid,
+		created[3].Obj.Process.Pid,
+	})
+	for _, event := range created {
+		assert.Equal(t, app.PID(100), event.Obj.DynamicSelectorPID)
+	}
+
+	dynamicSelector.RemovePIDs(100)
+	deleted := testutil.ReadChannel(t, filteredProcesses, testTimeout)
+	require.Len(t, deleted, 4)
+	for _, event := range deleted {
+		assert.Equal(t, EventDeleted, event.Type)
+	}
+	assert.Empty(t, matcher.ProcessHistory, "owner removal must leave no stale descendant admissions")
+
+	dynamicSelector.AddPIDs(100)
+	assert.Equal(t, []app.PID{100, 101, 102, 103}, testutil.ReadChannel(t, rediscoverPIDs, testTimeout))
+	assert.NotContains(t, matcher.removedDescendants, app.PID(100), "a re-add transfers its remembered descendants exactly once")
+	testutil.ChannelEmpty(t, rediscoverPIDs, 100*time.Millisecond)
+	testutil.ChannelEmpty(t, filteredProcesses, 100*time.Millisecond)
+
+	// Simulate the watcher's forget/re-emit batch and verify all still-live
+	// descendants are admitted again, with no duplicate stale admission.
+	discoveredProcesses.Send([]Event[ProcessAttrs]{
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 103}},
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 102}},
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 101}},
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 100}},
+	})
+	recreated := testutil.ReadChannel(t, filteredProcesses, testTimeout)
+	require.Len(t, recreated, 4)
+	assert.Len(t, matcher.ProcessHistory, 4)
+	for _, event := range recreated {
+		assert.Equal(t, EventCreated, event.Type)
+		assert.Equal(t, app.PID(100), event.Obj.DynamicSelectorPID)
+	}
+
+	discoveredProcesses.Send([]Event[ProcessAttrs]{
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 100}},
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 101}},
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 102}},
+		{Type: EventCreated, Obj: ProcessAttrs{pid: 103}},
+	})
+	testutil.ChannelEmpty(t, filteredProcesses, 100*time.Millisecond)
 
 	discoveredProcesses.Close()
 	testutil.DrainUntilClosed(filteredProcesses)
@@ -816,7 +1154,7 @@ func TestCriteriaMatcher_DynamicTargetPIDs(t *testing.T) {
 	processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
 		return &services.ProcessInfo{Pid: pp.pid, ExePath: "/any/exe", OpenPorts: pp.openPorts}, nil
 	}
-	runFn, err := dynamicMatcherProvider(discoveredProcesses, filteredProcessesQu, dynamicSelector.appSignals())(t.Context())
+	runFn, err := dynamicMatcherProvider(discoveredProcesses, filteredProcessesQu, dynamicSelector.appSignals(), nil)(t.Context())
 	require.NoError(t, err)
 	go runFn(t.Context())
 	time.Sleep(50 * time.Millisecond)
@@ -866,7 +1204,7 @@ func TestCriteriaMatcher_DynamicTargetPIDs_RemoveNotification(t *testing.T) {
 	processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
 		return &services.ProcessInfo{Pid: pp.pid, ExePath: "/any/exe", OpenPorts: pp.openPorts}, nil
 	}
-	runFn, err := dynamicMatcherProvider(discoveredProcesses, filteredProcessesQu, dynamicSelector.appSignals())(t.Context())
+	runFn, err := dynamicMatcherProvider(discoveredProcesses, filteredProcessesQu, dynamicSelector.appSignals(), nil)(t.Context())
 	require.NoError(t, err)
 	go runFn(t.Context())
 	time.Sleep(50 * time.Millisecond)
@@ -912,7 +1250,7 @@ func TestCriteriaMatcher_DynamicTargetPIDs_WithOptions(t *testing.T) {
 	processInfo = func(pp ProcessAttrs) (*services.ProcessInfo, error) {
 		return &services.ProcessInfo{Pid: pp.pid, ExePath: "/any/exe", OpenPorts: pp.openPorts}, nil
 	}
-	runFn, err := dynamicMatcherProvider(discoveredProcesses, filteredProcessesQu, dynamicSelector.appSignals())(t.Context())
+	runFn, err := dynamicMatcherProvider(discoveredProcesses, filteredProcessesQu, dynamicSelector.appSignals(), nil)(t.Context())
 	require.NoError(t, err)
 	go runFn(t.Context())
 	time.Sleep(50 * time.Millisecond)

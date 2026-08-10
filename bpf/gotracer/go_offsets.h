@@ -167,17 +167,35 @@ typedef struct off_table {
     u64 table[_last_go_offset];
 } off_table_t;
 
+typedef struct go_offsets_key {
+    u64 dev;
+    u64 ino;
+} go_offsets_key_t;
+
+static __always_inline u64 encode_stat_device(u32 dev) {
+    const u32 major = dev >> 20;
+    const u32 minor = dev & ((1U << 20) - 1);
+
+    // Match new_encode_dev(), which is the st_dev representation returned to userspace.
+    return (u64)((minor & 0xffU) | (major << 8) | ((minor & ~0xffU) << 12));
+}
+
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __type(key, u64);           // key: inode
+    __type(key, go_offsets_key_t);
     __type(value, off_table_t); // the offset table
     __uint(max_entries, MAX_GO_PROGRAMS);
 } go_offsets_map SEC(".maps");
 
 static __always_inline off_table_t *get_offsets_table() {
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-    const u64 ino = (u64)BPF_CORE_READ(task, mm, exe_file, f_inode, i_ino);
-    return (off_table_t *)bpf_map_lookup_elem(&go_offsets_map, &ino);
+    struct inode *inode = BPF_CORE_READ(task, mm, exe_file, f_inode);
+    const u32 dev = (u32)BPF_CORE_READ(inode, i_sb, s_dev);
+    const go_offsets_key_t key = {
+        .dev = encode_stat_device(dev),
+        .ino = (u64)BPF_CORE_READ(inode, i_ino),
+    };
+    return (off_table_t *)bpf_map_lookup_elem(&go_offsets_map, &key);
 }
 
 static __always_inline u64 go_offset_of(off_table_t *ot, go_offset off) {

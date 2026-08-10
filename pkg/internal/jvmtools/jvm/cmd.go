@@ -16,15 +16,27 @@ import (
 	"runtime/debug"
 	"syscall"
 
+	"golang.org/x/sys/unix"
+
 	"go.opentelemetry.io/obi/pkg/internal/jvmtools/util"
+	"go.opentelemetry.io/obi/pkg/internal/procs"
 )
 
 type JAttacher struct {
-	logger     *slog.Logger
-	j9attacher *j9Attacher
-	myUID      int
-	myGID      int
+	logger       *slog.Logger
+	j9attacher   *j9Attacher
+	myUID        int
+	myGID        int
+	targetPID    int
+	targetStart  uint64
+	targetPIDFD  int
+	targetProcFD int
 }
+
+var (
+	openJVMTargetPIDFD   = unix.PidfdOpen
+	signalJVMTargetPIDFD = unix.PidfdSendSignal
+)
 
 func NewJAttacher(logger *slog.Logger) *JAttacher {
 	if logger == nil {
@@ -32,9 +44,174 @@ func NewJAttacher(logger *slog.Logger) *JAttacher {
 	}
 
 	return &JAttacher{
-		logger:     logger,
-		j9attacher: nil,
+		logger:       logger,
+		j9attacher:   nil,
+		targetPIDFD:  -1,
+		targetProcFD: -1,
 	}
+}
+
+// BindTarget pins the exact process that subsequent attach commands may
+// mutate. The stable proc-directory descriptor supports exact signaling on
+// older kernels; an anonymous pidfd is retained when available.
+func (j *JAttacher) BindTarget(pid int, processStart uint64) error {
+	if pid <= 0 || processStart == 0 {
+		return errors.New("exact JVM target requires a positive PID and process start time")
+	}
+	sourceProcFD, err := unix.Open(
+		fmt.Sprintf("/proc/%d", pid),
+		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC,
+		0,
+	)
+	if err != nil {
+		return fmt.Errorf("opening exact JVM proc directory: %w", err)
+	}
+	defer unix.Close(sourceProcFD)
+	return j.BindTargetFromProcFD(pid, processStart, sourceProcFD)
+}
+
+// BindTargetFromProcFD binds to the lifetime already pinned by sourceProcFD.
+// It never resolves the numeric /proc path; the attacher owns an independent
+// close-on-exec duplicate and revalidates it around optional pidfd_open.
+func (j *JAttacher) BindTargetFromProcFD(
+	pid int,
+	processStart uint64,
+	sourceProcFD int,
+) error {
+	if pid <= 0 || processStart == 0 || sourceProcFD < 0 {
+		return errors.New("exact JVM target requires a positive PID, process start time, and procfd")
+	}
+	if err := j.CloseTarget(); err != nil {
+		return err
+	}
+	procfd, err := unix.FcntlInt(
+		uintptr(sourceProcFD), unix.F_DUPFD_CLOEXEC, 0,
+	)
+	if err != nil {
+		return fmt.Errorf("duplicating exact JVM proc directory: %w", err)
+	}
+	j.targetPID = pid
+	j.targetStart = processStart
+	j.targetPIDFD = -1
+	j.targetProcFD = procfd
+	if err := j.validateProcIdentity(); err != nil {
+		return errors.Join(err, j.CloseTarget())
+	}
+	pidfd, pidfdErr := openJVMTargetPIDFD(pid, 0)
+	if pidfdErr != nil {
+		pidfd = -1
+	}
+	j.targetPIDFD = pidfd
+	if err := j.ValidateTarget(); err != nil {
+		return errors.Join(err, j.CloseTarget())
+	}
+	return nil
+}
+
+func (j *JAttacher) validateProcIdentity() error {
+	currentPID, currentStart, state, err := procs.ProcessIdentityFromProcFD(j.targetProcFD)
+	if err != nil {
+		return fmt.Errorf("reading exact JVM target identity: %w", err)
+	}
+	if state == 'Z' || state == 'X' || state == 'x' {
+		return errors.New("exact JVM target exited")
+	}
+	if int(currentPID) != j.targetPID {
+		return fmt.Errorf(
+			"exact JVM target procfd identifies PID %d, not %d",
+			currentPID, j.targetPID,
+		)
+	}
+	if currentStart != j.targetStart {
+		return fmt.Errorf(
+			"exact JVM target PID %d changed from start %d to %d",
+			j.targetPID, j.targetStart, currentStart,
+		)
+	}
+	return nil
+}
+
+func pidfdExited(pidfd int) (bool, error) {
+	pollFD := []unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}}
+	if _, err := unix.Poll(pollFD, 0); err != nil {
+		return false, err
+	}
+	if pollFD[0].Revents&unix.POLLNVAL != 0 {
+		return false, syscall.EBADF
+	}
+	return pollFD[0].Revents&(unix.POLLIN|unix.POLLHUP|unix.POLLERR) != 0, nil
+}
+
+// ValidateTarget proves that the process pinned by BindTarget is still alive
+// and still owns the original /proc lifetime before a namespace or attach
+// operation proceeds.
+func (j *JAttacher) ValidateTarget() error {
+	if j.targetProcFD < 0 {
+		return errors.New("exact JVM target is not bound")
+	}
+	if j.targetPIDFD >= 0 {
+		exited, err := pidfdExited(j.targetPIDFD)
+		if err != nil {
+			return fmt.Errorf("polling JVM target pidfd: %w", err)
+		}
+		if exited {
+			return errors.New("exact JVM target exited")
+		}
+	} else if err := signalJVMTargetPIDFD(j.targetProcFD, 0, nil, 0); err != nil {
+		return fmt.Errorf(
+			"exact dynamic Java attachment requires kernel pidfd_send_signal support: %w",
+			err,
+		)
+	}
+	if err := j.validateProcIdentity(); err != nil {
+		return err
+	}
+	if j.targetPIDFD >= 0 {
+		exited, err := pidfdExited(j.targetPIDFD)
+		if err != nil {
+			return fmt.Errorf("rechecking JVM target pidfd: %w", err)
+		}
+		if exited {
+			return errors.New("exact JVM target exited during validation")
+		}
+	} else if err := signalJVMTargetPIDFD(j.targetProcFD, 0, nil, 0); err != nil {
+		return fmt.Errorf("rechecking exact JVM target through procfd: %w", err)
+	}
+	return nil
+}
+
+func (j *JAttacher) CloseTarget() error {
+	pidfd := j.targetPIDFD
+	procfd := j.targetProcFD
+	j.targetPIDFD = -1
+	j.targetProcFD = -1
+	j.targetPID = 0
+	j.targetStart = 0
+	var closeErr error
+	if procfd >= 0 {
+		closeErr = errors.Join(closeErr, unix.Close(procfd))
+	}
+	if pidfd >= 0 {
+		closeErr = errors.Join(closeErr, unix.Close(pidfd))
+	}
+	return closeErr
+}
+
+func (j *JAttacher) signalTarget(pid int, signal syscall.Signal) error {
+	if j.targetProcFD < 0 {
+		return errors.New("cannot signal an unbound JVM target")
+	}
+	if pid != j.targetPID {
+		return fmt.Errorf("attach PID %d does not match bound JVM target %d", pid, j.targetPID)
+	}
+	if err := j.ValidateTarget(); err != nil {
+		return err
+	}
+	signalFD := j.targetPIDFD
+	if signalFD < 0 {
+		signalFD = j.targetProcFD
+	}
+	return signalJVMTargetPIDFD(signalFD, signal, nil, 0)
 }
 
 func (j *JAttacher) Init() {
@@ -43,29 +220,36 @@ func (j *JAttacher) Init() {
 }
 
 func (j *JAttacher) Cleanup() error {
-	var cleanupErr error
-
 	if j.j9attacher != nil {
-		cleanupErr = errors.Join(cleanupErr, j.j9attacher.detach())
+		return j.j9attacher.detach()
 	}
+	return nil
+}
 
-	// Credentials (euid/egid) are switched process-wide during Attach, so they
-	// must be restored here. Namespaces are NOT restored: the namespace switch
-	// happens only on the dedicated sacrificial thread spawned by Attach, which
-	// is destroyed once attach completes — the runtime's pool threads never
-	// leave their original namespaces, so there is nothing to roll back.
-	if err := syscall.Seteuid(j.myUID); err != nil {
-		cleanupErr = errors.Join(cleanupErr, err)
+func setThreadEffectiveID(trap uintptr, id int) error {
+	const unchangedID = ^uintptr(0)
+	_, _, errno := unix.RawSyscall(
+		trap, unchangedID, uintptr(id), unchangedID,
+	)
+	if errno != 0 {
+		return errno
 	}
-	if err := syscall.Setegid(j.myGID); err != nil {
-		cleanupErr = errors.Join(cleanupErr, err)
+	return nil
+}
+
+// setThreadCredentials intentionally uses raw Linux syscalls. Go's
+// syscall.Set{euid,egid} wrappers coordinate the change across every runtime
+// thread, which would make discovery, cleanup, and tracer goroutines run as the
+// target application during an asynchronous JVM attach. This function is used
+// only on the locked sacrificial thread that is destroyed after attach.
+func setThreadCredentials(uid, gid int) error {
+	if err := setThreadEffectiveID(unix.SYS_SETRESGID, gid); err != nil {
+		return fmt.Errorf("setting attach-thread effective GID %d: %w", gid, err)
 	}
-
-	// No need to restore the pid namespace, since we do this on a
-	// locked thread that's never unlocked, which means the Go runtime
-	// will destroy it when the goroutine ends.
-
-	return cleanupErr
+	if err := setThreadEffectiveID(unix.SYS_SETRESUID, uid); err != nil {
+		return fmt.Errorf("setting attach-thread effective UID %d: %w", uid, err)
+	}
+	return nil
 }
 
 func (j *JAttacher) Attach(pid int, argv []string, ignoreOnJ9 bool) (io.ReadCloser, error) {
@@ -74,6 +258,15 @@ func (j *JAttacher) Attach(pid int, argv []string, ignoreOnJ9 bool) (io.ReadClos
 
 func (j *JAttacher) AttachContext(ctx context.Context, pid int, argv []string, ignoreOnJ9 bool) (io.ReadCloser, error) {
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if j.targetProcFD < 0 {
+		return nil, errors.New("exact JVM target is not bound")
+	}
+	if pid != j.targetPID {
+		return nil, fmt.Errorf("attach PID %d does not match bound JVM target %d", pid, j.targetPID)
+	}
+	if err := j.ValidateTarget(); err != nil {
 		return nil, err
 	}
 
@@ -85,6 +278,9 @@ func (j *JAttacher) AttachContext(ctx context.Context, pid int, argv []string, i
 	// namespace, before we move anywhere.
 	if err := util.GetProcessInfo(pid, &targetUID, &targetGID, &nspid); err != nil {
 		return nil, fmt.Errorf("process not found: %d: %w", pid, err)
+	}
+	if err := j.ValidateTarget(); err != nil {
+		return nil, err
 	}
 
 	// Entering the target's mount namespace requires setns(CLONE_NEWNS), which
@@ -134,6 +330,9 @@ func (j *JAttacher) AttachContext(ctx context.Context, pid int, argv []string, i
 // never-unlocked OS thread (see Attach), because it both joins the target's
 // mount namespace and unshares CLONE_FS on the calling thread.
 func (j *JAttacher) attachInNamespace(ctx context.Context, pid, nspid, targetUID, targetGID int, argv []string, ignoreOnJ9 bool) (io.ReadCloser, error) {
+	if err := j.ValidateTarget(); err != nil {
+		return nil, err
+	}
 	// Container support: switch to the target namespaces.
 	// Network and IPC namespaces are essential for OpenJ9 connection.
 	if util.EnterNS(pid, "net") < 0 {
@@ -146,12 +345,17 @@ func (j *JAttacher) attachInNamespace(ctx context.Context, pid, nspid, targetUID
 	if mntChanged < 0 {
 		return nil, errors.New("failed to enter target mnt namespace")
 	}
+	if err := j.ValidateTarget(); err != nil {
+		return nil, err
+	}
 
-	// In HotSpot, dynamic attach is allowed only for the clients with the same euid/egid.
-	// If we are running under root, switch to the required euid/egid automatically.
-	if (j.myGID != targetGID && syscall.Setegid(targetGID) != nil) ||
-		(j.myUID != targetUID && syscall.Seteuid(targetUID) != nil) {
-		return nil, errors.New("failed to change credentials to match the target process")
+	// Dynamic attach requires the client to have the target's euid/egid. Change
+	// only this locked sacrificial OS thread; process-wide Go wrappers would
+	// transiently deprivilege every tracer and discovery goroutine.
+	if j.myGID != targetGID || j.myUID != targetUID {
+		if err := setThreadCredentials(targetUID, targetGID); err != nil {
+			return nil, fmt.Errorf("failed to change attach-thread credentials: %w", err)
+		}
 	}
 
 	attachPid := pid
@@ -177,8 +381,8 @@ func (j *JAttacher) attachInNamespace(ctx context.Context, pid, nspid, targetUID
 		}
 		j9attacher := newJ9Attacher(j.logger)
 		j.j9attacher = j9attacher
-		return j.j9attacher.jattachOpenJ9(ctx, tmpPath, nspid, argv)
+		return j.j9attacher.jattachOpenJ9(ctx, tmpPath, nspid, argv, j)
 	}
 
-	return jattachHotspot(ctx, pid, nspid, attachPid, argv, tmpPath, j.logger)
+	return jattachHotspot(ctx, pid, nspid, attachPid, argv, tmpPath, j.logger, j)
 }

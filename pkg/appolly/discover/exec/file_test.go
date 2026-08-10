@@ -4,11 +4,109 @@
 package exec
 
 import (
+	"context"
+	"errors"
 	"reflect"
 	"testing"
 
 	attr "go.opentelemetry.io/obi/pkg/export/attributes/names"
 )
+
+func TestFileInfoIDIncludesDeviceAndInode(t *testing.T) {
+	fi := New(Init{Dev: 7, Ino: 42})
+
+	if got, want := fi.ID(), (FileID{Dev: 7, Ino: 42}); got != want {
+		t.Fatalf("ID() = %+v, want %+v", got, want)
+	}
+}
+
+func TestJavaAuthorizationReadinessIsGenerationExact(t *testing.T) {
+	fi := New(Init{})
+	firstSequence := fi.PrepareJavaAgentCapability(11)
+	firstCapability, begunFirstSequence := fi.BeginJavaAgentAuthorization()
+	if firstCapability != 11 || begunFirstSequence != firstSequence {
+		t.Fatalf("first authorization = (%d, %d), want (11, %d)",
+			firstCapability, begunFirstSequence, firstSequence)
+	}
+	firstState := fi.javaAuth
+
+	secondSequence := fi.PrepareJavaAgentCapability(22)
+	if !firstState.completed || firstState.capability != 0 {
+		t.Fatal("superseded readiness generation did not fail closed")
+	}
+	select {
+	case <-firstState.done:
+	default:
+		t.Fatal("superseded readiness generation did not release its waiter")
+	}
+	secondCapability, begunSecondSequence := fi.BeginJavaAgentAuthorization()
+	if secondCapability != 22 || begunSecondSequence != secondSequence {
+		t.Fatalf("second authorization = (%d, %d), want (22, %d)",
+			secondCapability, begunSecondSequence, secondSequence)
+	}
+
+	result := make(chan uint64, 1)
+	errResult := make(chan error, 1)
+	go func() {
+		capability, err := fi.WaitJavaAgentAuthorization(t.Context())
+		result <- capability
+		errResult <- err
+	}()
+	fi.CompleteJavaAgentAuthorization(firstSequence, 11)
+	select {
+	case capability := <-result:
+		t.Fatalf("stale completion released current generation with capability %d", capability)
+	default:
+	}
+	fi.CompleteJavaAgentAuthorization(secondSequence, 22)
+	if capability := <-result; capability != 22 {
+		t.Fatalf("completed capability = %d, want 22", capability)
+	}
+	if err := <-errResult; err != nil {
+		t.Fatalf("waiting for completed authorization: %v", err)
+	}
+}
+
+func TestJavaAuthorizationReadinessHonorsCancellation(t *testing.T) {
+	fi := New(Init{})
+	fi.PrepareJavaAgentCapability(11)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	capability, err := fi.WaitJavaAgentAuthorization(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("wait error = %v, want context.Canceled", err)
+	}
+	if capability != 0 {
+		t.Fatalf("canceled wait capability = %d, want 0", capability)
+	}
+}
+
+func TestJavaAuthorizationGenerationRejectsStalePreparation(t *testing.T) {
+	fi := New(Init{})
+	firstSequence := fi.PrepareJavaAgentCapability(0)
+	secondSequence := fi.PrepareJavaAgentCapability(0)
+
+	if fi.SetJavaAgentCapabilityForGeneration(firstSequence, 11) {
+		t.Fatal("stale preparation overwrote the current capability")
+	}
+	if !fi.SetJavaAgentCapabilityForGeneration(secondSequence, 22) {
+		t.Fatal("current preparation could not publish its capability")
+	}
+	if capability := fi.JavaAgentCapability(); capability != 22 {
+		t.Fatalf("published capability = %d, want 22", capability)
+	}
+
+	capability, err := fi.WaitJavaAgentAuthorizationGeneration(
+		t.Context(), firstSequence,
+	)
+	if err == nil {
+		t.Fatal("stale exact-generation wait unexpectedly succeeded")
+	}
+	if capability != 0 {
+		t.Fatalf("stale exact-generation capability = %d, want 0", capability)
+	}
+}
 
 func TestApplyEnvVariables(t *testing.T) {
 	tests := []struct {

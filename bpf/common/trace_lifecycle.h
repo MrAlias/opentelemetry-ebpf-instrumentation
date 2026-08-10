@@ -24,10 +24,11 @@
 
 #include <shared/obi_ctx.h>
 
-static __always_inline void delete_server_trace(pid_connection_info_t *pid_conn,
-                                                trace_key_t *t_key) {
+static __always_inline void delete_server_trace_mode(pid_connection_info_t *pid_conn,
+                                                     trace_key_t *t_key,
+                                                     u8 cleanup_java_remote_parent) {
 #ifdef OBI_JAVA_REMOTE_PARENT_LIFECYCLE
-    if (java_remote_parent_enabled) {
+    if (cleanup_java_remote_parent && java_remote_parent_enabled) {
         java_remote_parent_cleanup(&t_key->p_key);
     }
 #endif
@@ -41,6 +42,11 @@ static __always_inline void delete_server_trace(pid_connection_info_t *pid_conn,
     if (!(t_key->p_key.tid & JAVA_VT_TID_FLAG)) {
         obi_ctx__del(bpf_get_current_pid_tgid());
     }
+}
+
+static __always_inline void delete_server_trace(pid_connection_info_t *pid_conn,
+                                                trace_key_t *t_key) {
+    delete_server_trace_mode(pid_conn, t_key, 1);
 }
 
 static __always_inline void delete_client_trace_info(pid_connection_info_t *pid_conn) {

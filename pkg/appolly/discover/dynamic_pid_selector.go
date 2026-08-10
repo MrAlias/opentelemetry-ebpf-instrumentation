@@ -333,10 +333,12 @@ type DynamicPIDSelector struct {
 	mu    sync.RWMutex
 	byPID map[app.PID]dynamicPIDRecord
 
-	fileInfoMu        sync.RWMutex
-	fileInfoByPID     map[app.PID]*exec.FileInfo
-	onFileInfoUpdated func(*exec.FileInfo)
-	attrsUpdatedCh    chan app.PID
+	fileInfoMu         sync.RWMutex
+	fileInfoByPID      map[app.PID]*exec.FileInfo
+	lifetimeOwnerByPID map[app.PID]*exec.FileInfo
+	fileInfosByOwner   map[app.PID]map[*exec.FileInfo]int
+	onFileInfoUpdated  func(*exec.FileInfo)
+	attrsUpdatedCh     chan app.PID
 
 	rootView           dynamicPIDSignalView
 	tracesView         dynamicPIDSignalView
@@ -359,9 +361,11 @@ func newDynamicPIDSignalView(parent *DynamicPIDSelector, mask dynamicPIDSignal) 
 // NewDynamicPIDSelector creates a new selector whose root Add/Remove methods apply to all signals.
 func NewDynamicPIDSelector() *DynamicPIDSelector {
 	d := &DynamicPIDSelector{
-		byPID:          map[app.PID]dynamicPIDRecord{},
-		fileInfoByPID:  map[app.PID]*exec.FileInfo{},
-		attrsUpdatedCh: make(chan app.PID, 64),
+		byPID:              map[app.PID]dynamicPIDRecord{},
+		fileInfoByPID:      map[app.PID]*exec.FileInfo{},
+		lifetimeOwnerByPID: map[app.PID]*exec.FileInfo{},
+		fileInfosByOwner:   map[app.PID]map[*exec.FileInfo]int{},
+		attrsUpdatedCh:     make(chan app.PID, 64),
 	}
 	d.rootView = newDynamicPIDSignalView(d, allSignalMask)
 	d.tracesView = newDynamicPIDSignalView(d, signalTraces)
@@ -392,29 +396,99 @@ func (d *DynamicPIDSelector) notifyAttrsUpdated(pid app.PID) {
 	}
 }
 
-// RegisterFileInfo records the live FileInfo for a dynamically selected PID after instrumentation.
-func (d *DynamicPIDSelector) RegisterFileInfo(pid app.PID, fi *exec.FileInfo) {
-	if fi == nil {
+// RegisterFileInfo records both identities for an admitted PID: serviceFI carries mutable service
+// metadata, while lifetimeOwner is the exact process-lifetime token used to reject stale removals.
+// Each exact PID registration contributes one reference to the set of service FileInfos that
+// inherit attributes from the same dynamic selector owner.
+func (d *DynamicPIDSelector) RegisterFileInfo(
+	pid app.PID,
+	serviceFI *exec.FileInfo,
+	lifetimeOwner *exec.FileInfo,
+) {
+	if serviceFI == nil || lifetimeOwner == nil {
+		return
+	}
+	// SetPID and registration must have one total order. A FileInfo can be built
+	// from an older selector snapshot and reach the attacher after SetPID has
+	// already committed newer attributes. Holding mu before fileInfoMu makes the
+	// registration visible either before SetPID's fanout or after its selector
+	// update, in which case we reconcile the FileInfo below before returning.
+	owner := dynamicSelectorOwner(serviceFI)
+	d.mu.RLock()
+	rec, ownerSelected := d.byPID[owner]
+	d.fileInfoMu.Lock()
+	if previous := d.fileInfoByPID[pid]; previous != nil {
+		if previous == serviceFI && d.lifetimeOwnerByPID[pid] == lifetimeOwner {
+			d.fileInfoMu.Unlock()
+			d.mu.RUnlock()
+			return
+		}
+		if previous != serviceFI {
+			d.removeFileInfoOwnerRef(previous)
+			d.addFileInfoOwnerRef(serviceFI)
+		}
+	} else {
+		d.addFileInfoOwnerRef(serviceFI)
+	}
+	d.fileInfoByPID[pid] = serviceFI
+	d.lifetimeOwnerByPID[pid] = lifetimeOwner
+	if ownerSelected {
+		applyDynamicPIDAttributes(serviceFI, rec.attrs)
+	}
+	d.fileInfoMu.Unlock()
+	d.mu.RUnlock()
+}
+
+// UnregisterFileInfo drops the registration only when lifetimeOwner matches the PID's current exact
+// process lifetime. Service FileInfo reference counts preserve metadata fanout while other admitted
+// PIDs still share that service identity.
+func (d *DynamicPIDSelector) UnregisterFileInfo(pid app.PID, lifetimeOwner *exec.FileInfo) {
+	if lifetimeOwner == nil {
 		return
 	}
 	d.fileInfoMu.Lock()
-	d.fileInfoByPID[pid] = fi
-	if owner := fi.ServiceAttrs().DynamicSelectorPID; owner != 0 && owner != pid {
-		d.fileInfoByPID[owner] = fi
+	if d.lifetimeOwnerByPID[pid] == lifetimeOwner {
+		serviceFI := d.fileInfoByPID[pid]
+		delete(d.fileInfoByPID, pid)
+		delete(d.lifetimeOwnerByPID, pid)
+		if serviceFI != nil {
+			d.removeFileInfoOwnerRef(serviceFI)
+		}
 	}
 	d.fileInfoMu.Unlock()
 }
 
-// UnregisterFileInfo drops FileInfo references for pid and its dynamic selector owner PID.
-func (d *DynamicPIDSelector) UnregisterFileInfo(pid app.PID, fi *exec.FileInfo) {
-	d.fileInfoMu.Lock()
-	delete(d.fileInfoByPID, pid)
-	if fi != nil {
-		if owner := fi.ServiceAttrs().DynamicSelectorPID; owner != 0 {
-			delete(d.fileInfoByPID, owner)
-		}
+func (d *DynamicPIDSelector) addFileInfoOwnerRef(fi *exec.FileInfo) {
+	owner := dynamicSelectorOwner(fi)
+	refs := d.fileInfosByOwner[owner]
+	if refs == nil {
+		refs = map[*exec.FileInfo]int{}
+		d.fileInfosByOwner[owner] = refs
 	}
-	d.fileInfoMu.Unlock()
+	refs[fi]++
+}
+
+func (d *DynamicPIDSelector) removeFileInfoOwnerRef(fi *exec.FileInfo) {
+	owner := dynamicSelectorOwner(fi)
+	refs := d.fileInfosByOwner[owner]
+	if refs == nil {
+		return
+	}
+	if refs[fi] > 1 {
+		refs[fi]--
+		return
+	}
+	delete(refs, fi)
+	if len(refs) == 0 {
+		delete(d.fileInfosByOwner, owner)
+	}
+}
+
+func dynamicSelectorOwner(fi *exec.FileInfo) app.PID {
+	if owner := fi.ServiceAttrs().DynamicSelectorPID; owner != 0 {
+		return owner
+	}
+	return fi.Pid()
 }
 
 func (d *DynamicPIDSelector) views() []*dynamicPIDSignalView {
@@ -560,6 +634,10 @@ func (d *DynamicPIDSelector) GetPID(pid uint32) (selection.DynamicPIDEntry, bool
 func (d *DynamicPIDSelector) SetPID(entry selection.DynamicPIDEntry) bool {
 	attrs := attrsFromEntry(entry)
 
+	// Lock ordering is always selector mu, then fileInfoMu. This closes the
+	// snapshot/register gap: a concurrent RegisterFileInfo either completes
+	// first and participates in this fanout, or observes attrs after this update
+	// and reconciles them as part of registration.
 	d.mu.Lock()
 	rec, ok := d.byPID[entry.PID]
 	if !ok {
@@ -570,21 +648,28 @@ func (d *DynamicPIDSelector) SetPID(entry selection.DynamicPIDEntry) bool {
 		signals: rec.signals,
 		attrs:   attrs,
 	}
+
+	d.fileInfoMu.Lock()
+	fileInfos := make([]*exec.FileInfo, 0, len(d.fileInfosByOwner[entry.PID]))
+	for fi := range d.fileInfosByOwner[entry.PID] {
+		if applyDynamicPIDAttributes(fi, attrs) {
+			fileInfos = append(fileInfos, fi)
+		}
+	}
+	cb := d.onFileInfoUpdated
+	d.fileInfoMu.Unlock()
 	d.mu.Unlock()
 
-	d.applyAttrsToInstrumented(entry.PID, attrs)
+	if cb != nil {
+		for _, fi := range fileInfos {
+			cb(fi)
+		}
+	}
 	d.notifyAttrsUpdated(entry.PID)
 	return true
 }
 
-func (d *DynamicPIDSelector) applyAttrsToInstrumented(pid app.PID, attrs dynamicPIDAttributes) {
-	d.fileInfoMu.RLock()
-	fi := d.fileInfoByPID[pid]
-	cb := d.onFileInfoUpdated
-	d.fileInfoMu.RUnlock()
-	if fi == nil {
-		return
-	}
+func applyDynamicPIDAttributes(fi *exec.FileInfo, attrs dynamicPIDAttributes) bool {
 	updated := false
 	if attrs.serviceName != "" || attrs.serviceNamespace != "" {
 		uid := fi.ServiceAttrs().UID
@@ -611,9 +696,7 @@ func (d *DynamicPIDSelector) applyAttrsToInstrumented(pid app.PID, attrs dynamic
 		fi.SetMetadata(metadata)
 		updated = true
 	}
-	if updated && cb != nil {
-		cb(fi)
-	}
+	return updated
 }
 
 func (v *dynamicPIDSignalView) contains(mask dynamicPIDSignal) bool {

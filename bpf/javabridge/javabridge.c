@@ -13,6 +13,7 @@
 #include <maps/java_remote_parent.h>
 #include <maps/java_remote_parent_receive_cursor.h>
 #include <maps/java_remote_parent_socket_cookie.h>
+#include <maps/java_thread_mapping_claims.h>
 
 #include <pid/pid.h>
 
@@ -428,6 +429,7 @@ static __always_inline int java_remote_parent_getsockopt_for_operation(
                                                               scratch->negotiation.connection_netns,
                                                               scratch->negotiation.generation,
                                                               socket_cookie,
+                                                              process_capability,
                                                               &scratch->retrieval);
 
     __builtin_memcpy(optval, &scratch->response, sizeof(scratch->response));

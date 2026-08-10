@@ -438,7 +438,7 @@ class OfficialAgentNettyRuntimeTest {
             outputLines, "OBI_NETTY_TASK\tTASK_LINK\t" + expectedParentThread + "\t" + edge.token),
         output);
     assertEquals(
-        0, count(outputLines, "OBI_NETTY_TASK\tTASK_CANCEL\t" + edge.token + "\t0"), output);
+        1, count(outputLines, "OBI_NETTY_TASK\tTASK_CANCEL\t" + edge.token + "\t0"), output);
   }
 
   private static void assertResult(

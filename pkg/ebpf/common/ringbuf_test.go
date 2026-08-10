@@ -38,7 +38,8 @@ func TestForwardRingbuf_CapacityFull(t *testing.T) {
 	forwardedMessagesQueue := msg.NewQueue[[]request.Span](msg.ChannelBufferLen(100))
 	forwardedMessages := forwardedMessagesQueue.Subscribe()
 	fltr := TestPidsFilter{services: map[app.PID]svc.Attrs{}}
-	fltr.AllowPID(1, 1, exec.New(exec.Init{Service: svc.Attrs{UID: svc.UID{Name: "myService"}}}), PIDTypeGo)
+	fileInfo := exec.New(exec.Init{Service: svc.Attrs{UID: svc.UID{Name: "myService"}}})
+	fltr.AllowPID(1, 1, fileInfo, fileInfo, PIDTypeGo)
 	cfg := &config.EBPFTracer{BatchLength: 10}
 	go ForwardRingbuf(
 		cfg,
@@ -96,7 +97,8 @@ func TestForwardRingbuf_Deadline(t *testing.T) {
 	forwardedMessagesQueue := msg.NewQueue[[]request.Span](msg.ChannelBufferLen(100))
 	forwardedMessages := forwardedMessagesQueue.Subscribe()
 	fltr := TestPidsFilter{services: map[app.PID]svc.Attrs{}}
-	fltr.AllowPID(1, 1, exec.New(exec.Init{Service: svc.Attrs{UID: svc.UID{Name: "myService"}}}), PIDTypeGo)
+	fileInfo := exec.New(exec.Init{Service: svc.Attrs{UID: svc.UID{Name: "myService"}}})
+	fltr.AllowPID(1, 1, fileInfo, fileInfo, PIDTypeGo)
 	cfg := &config.EBPFTracer{BatchLength: 10, BatchTimeout: 20 * time.Millisecond}
 	go ForwardRingbuf(
 		cfg,
@@ -404,11 +406,11 @@ type TestPidsFilter struct {
 	services map[app.PID]svc.Attrs
 }
 
-func (pf *TestPidsFilter) AllowPID(p app.PID, _ uint32, fi *exec.FileInfo, _ PIDType) {
+func (pf *TestPidsFilter) AllowPID(p app.PID, _ uint32, fi, _ *exec.FileInfo, _ PIDType) {
 	pf.services[p] = fi.ServiceAttrs()
 }
 
-func (pf *TestPidsFilter) BlockPID(p app.PID, _ uint32) {
+func (pf *TestPidsFilter) BlockPID(p app.PID, _ uint32, _, _ *exec.FileInfo) {
 	delete(pf.services, p)
 }
 

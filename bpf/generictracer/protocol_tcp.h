@@ -107,7 +107,9 @@ static __always_inline void tcp_get_or_set_trace_info(tcp_req_t *req,
     }
 }
 
-static __always_inline void cleanup_trace_info(tcp_req_t *tcp, pid_connection_info_t *pid_conn) {
+static __always_inline void cleanup_trace_info_mode(tcp_req_t *tcp,
+                                                    pid_connection_info_t *pid_conn,
+                                                    u8 cleanup_java_remote_parent) {
     if (tcp->direction == TCP_RECV) {
         trace_key_t t_key = {0};
         task_tid(&t_key.p_key);
@@ -116,10 +118,14 @@ static __always_inline void cleanup_trace_info(tcp_req_t *tcp, pid_connection_in
         }
         t_key.extra_id = tcp->extra_id;
 
-        delete_server_trace(pid_conn, &t_key);
+        delete_server_trace_mode(pid_conn, &t_key, cleanup_java_remote_parent);
     } else {
         delete_client_trace_info(pid_conn);
     }
+}
+
+static __always_inline void cleanup_trace_info(tcp_req_t *tcp, pid_connection_info_t *pid_conn) {
+    cleanup_trace_info_mode(tcp, pid_conn, 1);
 }
 
 static __always_inline void cleanup_tcp_trace_info_if_needed(pid_connection_info_t *pid_conn) {
@@ -129,7 +135,8 @@ static __always_inline void cleanup_tcp_trace_info_if_needed(pid_connection_info
     }
 }
 
-static __always_inline void finish_ongoing_tcp_req(pid_connection_info_t *pid_conn) {
+static __always_inline void finish_ongoing_tcp_req_mode(pid_connection_info_t *pid_conn,
+                                                        u8 cleanup_java_remote_parent) {
     tcp_req_t *existing_tcp = bpf_map_lookup_elem(&ongoing_tcp_req, pid_conn);
     if (!existing_tcp) {
         return;
@@ -144,8 +151,12 @@ static __always_inline void finish_ongoing_tcp_req(pid_connection_info_t *pid_co
         bpf_ringbuf_output(&events, existing_tcp, sizeof(*existing_tcp), get_flags());
     }
 
-    cleanup_trace_info(existing_tcp, pid_conn);
+    cleanup_trace_info_mode(existing_tcp, pid_conn, cleanup_java_remote_parent);
     bpf_map_delete_elem(&ongoing_tcp_req, pid_conn);
+}
+
+static __always_inline void finish_ongoing_tcp_req(pid_connection_info_t *pid_conn) {
+    finish_ongoing_tcp_req_mode(pid_conn, 1);
 }
 
 static __always_inline void unknown_send_large_buffer(tcp_req_t *req,

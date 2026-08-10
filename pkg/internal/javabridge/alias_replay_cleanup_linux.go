@@ -3,7 +3,7 @@
 
 //go:build linux
 
-package javabridge
+package javabridge // import "go.opentelemetry.io/obi/pkg/internal/javabridge"
 
 import (
 	"errors"
@@ -17,6 +17,7 @@ type aliasReplayCarrierKey struct {
 	Owner               Identity
 	Generation          uint64
 	ObservedMonotonicNS uint64
+	ProcessIncarnation  uint64
 }
 
 type aliasReplayNoCarrierObservation struct {
@@ -59,6 +60,7 @@ func aliasReplayCarrier(key aliasReplayKey) aliasReplayCarrierKey {
 		Owner:               key.Owner,
 		Generation:          key.Generation,
 		ObservedMonotonicNS: key.ObservedMonotonicNS,
+		ProcessIncarnation:  key.ProcessIncarnation,
 	}
 }
 
@@ -67,7 +69,13 @@ func aliasReplayCarrierForLink(link taskLink) aliasReplayCarrierKey {
 		Owner:               link.Owner,
 		Generation:          link.Generation,
 		ObservedMonotonicNS: link.ObservedMonotonicNS,
+		ProcessIncarnation:  link.ProcessIncarnation,
 	}
+}
+
+func validAliasReplayCarrierLink(link taskLink) bool {
+	return link.Owner != (Identity{}) && link.Reserved == 0 && link.Generation != 0 &&
+		link.ObservedMonotonicNS != 0 && link.ProcessIncarnation != 0
 }
 
 func validAliasReplayKey(key aliasReplayKey) bool {
@@ -95,10 +103,6 @@ func validAliasReplayPublishing(value aliasReplayValue) bool {
 
 func validTaggedAliasReplayPublishing(value aliasReplayValue) bool {
 	return validAliasReplayPublishing(value) && value.ProducerTag == generationGoProducerTag
-}
-
-func validUntaggedAliasReplayPublishing(value aliasReplayValue) bool {
-	return validAliasReplayPublishing(value) && value.ProducerTag == 0
 }
 
 func validAliasReplayFinal(value aliasReplayValue) bool {
@@ -267,12 +271,24 @@ func (c *Cleanup) snapshotAliasReplayState() error {
 	c.aliasCarrierSnapshotComplete = taskErr == nil && handoffErr == nil
 	if taskErr == nil {
 		for _, entry := range tasks {
-			c.aliasReplayCarriers[aliasReplayCarrierForLink(entry.value)] = struct{}{}
+			if validAliasReplayCarrierLink(entry.value) &&
+				taskLinkOwnerMatchesProcess(
+					entry.value, entry.key.PID, entry.key.Namespace,
+				) {
+				c.aliasReplayCarriers[aliasReplayCarrierForLink(entry.value)] = struct{}{}
+			}
 		}
 	}
 	if handoffErr == nil {
 		for _, entry := range handoffs {
-			c.aliasReplayCarriers[aliasReplayCarrierForLink(entry.value)] = struct{}{}
+			if entry.key.Token != 0 && entry.key.ProcessIncarnation != 0 &&
+				entry.key.ProcessIncarnation == entry.value.ProcessIncarnation &&
+				taskLinkOwnerMatchesProcess(
+					entry.value, entry.key.PID, entry.key.Namespace,
+				) &&
+				validAliasReplayCarrierLink(entry.value) {
+				c.aliasReplayCarriers[aliasReplayCarrierForLink(entry.value)] = struct{}{}
+			}
 		}
 	}
 
@@ -767,6 +783,7 @@ func (c *Cleanup) sweepAliasReplayTails(
 		valuePublishing := validAliasReplayPublishing(current)
 		valueMalformed := !validAliasReplayActive(current) && !valueFinal && !valuePublishing
 		processRetired := false
+		exactProcessRetirement := false
 		if keyValid {
 			var retirementErr error
 			processRetired, retirementErr = c.processRetired(
@@ -776,11 +793,29 @@ func (c *Cleanup) sweepAliasReplayTails(
 				result = errors.Join(result, retirementErr)
 				continue
 			}
+			if processRetired {
+				exactProcessRetirement, retirementErr = c.exactProcessRetirementUnderClaim(
+					javaProcessIdentity(key.Owner), key.ProcessIncarnation,
+				)
+				if retirementErr != nil {
+					result = errors.Join(result, retirementErr)
+					continue
+				}
+			}
 		}
 		expired := keyValid && cleanupExpired(now, key.ObservedMonotonicNS, c.ttl)
 		eligible := valueFinal || valueActiveZero || valueMalformed || !keyValid ||
 			processRetired || expired
-		if valuePublishing && !processRetired && !expired {
+		if keyValid && current.References > 0 && !valueMalformed &&
+			!exactProcessRetirement {
+			// HASH/LRU iteration is not absence authority across a concurrent
+			// HANDOFF->TASK transfer (and can miss a direct retain->handoff
+			// publication window). A live process's positive reference is the
+			// stronger fail-closed signal even when the carrier snapshots are
+			// both complete and the observation has aged past the retrieval TTL.
+			eligible = false
+		}
+		if valuePublishing && !exactProcessRetirement && !expired {
 			// Tagged publishing requires its exact cleanup fence to finish. Untagged
 			// publishing may be a preempted BPF producer. Neither is standalone
 			// reclamation authority.
@@ -811,6 +846,35 @@ func (c *Cleanup) sweepAliasReplayTails(
 		}
 		if now-observed.ObservedAt < javaRemoteParentMinimumFenceAge {
 			continue
+		}
+		if processRetired {
+			// The sweep-start retirement observation is only a candidate. P(process)
+			// remains held through this tail, but re-read both the exact claim and
+			// current incarnation immediately before the key-only replay delete.
+			stillRetired, retirementErr := c.processRetired(
+				retired, javaProcessIdentity(key.Owner), key.ProcessIncarnation,
+			)
+			if retirementErr != nil {
+				result = errors.Join(result, retirementErr)
+				continue
+			}
+			if !stillRetired {
+				delete(c.aliasReplayNoCarrier, key)
+				continue
+			}
+			if (current.References > 0 || valuePublishing) && exactProcessRetirement {
+				stillExact, exactErr := c.exactProcessRetirementUnderClaim(
+					javaProcessIdentity(key.Owner), key.ProcessIncarnation,
+				)
+				if exactErr != nil {
+					result = errors.Join(result, exactErr)
+					continue
+				}
+				if !stillExact {
+					delete(c.aliasReplayNoCarrier, key)
+					continue
+				}
+			}
 		}
 
 		deleted, deleteErr := cleanupDeleteExact(c.maps.aliasReplays, key, current)

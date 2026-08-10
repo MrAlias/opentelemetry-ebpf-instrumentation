@@ -62,6 +62,18 @@ static void force_terminate_http_request(pid_connection_info_t *connection) {
     }
 }
 
+static void terminate_http_request_if_needed_mode(pid_connection_info_t *connection,
+                                                  u8 cleanup_java_remote_parent) {
+    (void)cleanup_java_remote_parent;
+    terminate_http_request_if_needed(connection);
+}
+
+static void force_terminate_http_request_mode(pid_connection_info_t *connection,
+                                              u8 cleanup_java_remote_parent) {
+    (void)cleanup_java_remote_parent;
+    force_terminate_http_request(connection);
+}
+
 static void finish_possible_delayed_http_request(pid_connection_info_t *connection) {
     (void)connection;
 }

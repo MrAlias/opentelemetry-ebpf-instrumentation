@@ -43,11 +43,15 @@ static u64 process_incarnation;
 static int process_present;
 static u64 process_capability;
 static int authorization_present;
+static java_retired_process_key_t retired_key;
+static u64 retired_observed;
+static int retired_present;
 static pid_key_t mounted_key;
 static java_vt_identity_t mounted_value;
 static int mounted_present;
 static int mount_update_failure;
 static int registration_loss_after_mount_update;
+static int retirement_update_failure;
 static identity_slot_t identities[max_identities];
 
 static void fail(const char *message) {
@@ -75,6 +79,11 @@ static void *test_map_lookup(void *map, const void *key) {
     if (map == &java_process_incarnations) {
         return process_present && same_key(&process_key, key) ? &process_incarnation : NULL;
     }
+    if (map == &java_retired_processes) {
+        return retired_present && memcmp(&retired_key, key, sizeof(retired_key)) == 0
+                   ? &retired_observed
+                   : NULL;
+    }
     if (map == &java_vt_threads) {
         return mounted_present && same_key(&mounted_key, key) ? &mounted_value : NULL;
     }
@@ -94,6 +103,16 @@ test_map_update(void *map, const void *key, const void *value, unsigned long lon
         process_key = *(const pid_key_t *)key;
         process_incarnation = *(const u64 *)value;
         process_present = 1;
+        return 0;
+    }
+    if (map == &java_retired_processes) {
+        if (retirement_update_failure || (flags == BPF_NOEXIST && retired_present &&
+                                          memcmp(&retired_key, key, sizeof(retired_key)) == 0)) {
+            return -1;
+        }
+        retired_key = *(const java_retired_process_key_t *)key;
+        retired_observed = *(const u64 *)value;
+        retired_present = 1;
         return 0;
     }
     if (map == &java_vt_threads) {
@@ -150,6 +169,10 @@ static long test_map_delete(void *map, const void *key) {
         if (slot) {
             slot->present = 0;
         }
+    } else if (map == &java_retired_processes) {
+        if (retired_present && memcmp(&retired_key, key, sizeof(retired_key)) == 0) {
+            retired_present = 0;
+        }
     }
     return 0;
 }
@@ -163,9 +186,13 @@ static void reset(u64 incarnation) {
     process_present = 1;
     process_capability = incarnation;
     authorization_present = 1;
+    memset(&retired_key, 0, sizeof(retired_key));
+    retired_observed = 0;
+    retired_present = 0;
     mounted_present = 0;
     mount_update_failure = 0;
     registration_loss_after_mount_update = 0;
+    retirement_update_failure = 0;
 }
 
 static pid_key_t carrier(void) {
@@ -176,6 +203,89 @@ static pid_key_t carrier(void) {
     };
     process_key = java_process_key(&key);
     return key;
+}
+
+static void test_process_registration_rejects_exact_retirement(void) {
+    reset(10);
+    const pid_key_t thread = carrier();
+    retired_key = (java_retired_process_key_t){
+        .process = process_key,
+        .process_incarnation = process_incarnation,
+    };
+    retired_observed = 123;
+    retired_present = 1;
+
+    if (java_register_process_incarnation_for(&thread, process_incarnation) || !process_present ||
+        !retired_present) {
+        fail("process registration reopened its exact retirement marker");
+    }
+
+    retired_key.process_incarnation++;
+    retired_present = 1;
+    if (!java_register_process_incarnation_for(&thread, process_incarnation) || !retired_present) {
+        fail("process registration rejected or cleared a foreign retirement marker");
+    }
+}
+
+static void test_process_rotation_publishes_predecessor_retirement(void) {
+    reset(10);
+    const pid_key_t thread = carrier();
+    process_capability = 11;
+
+    if (!java_register_process_incarnation_for(&thread, process_capability) ||
+        process_incarnation != process_capability || !retired_present ||
+        !same_key(&retired_key.process, &process_key) || retired_key.process_incarnation != 10 ||
+        retired_observed != 10) {
+        fail("process rotation did not publish its predecessor retirement marker");
+    }
+
+    reset(10);
+    const pid_key_t failed_thread = carrier();
+    process_capability = 11;
+    retirement_update_failure = 1;
+    if (java_register_process_incarnation_for(&failed_thread, process_capability) ||
+        process_incarnation != 10 || retired_present) {
+        fail("process rotation proceeded without durable predecessor retirement");
+    }
+}
+
+static void test_process_retirement_requires_durable_exact_marker(void) {
+    reset(10);
+    (void)carrier();
+    retirement_update_failure = 1;
+    if (java_publish_process_retirement(&process_key, process_incarnation, 123)) {
+        fail("failed process retirement insert reported durable authority");
+    }
+
+    retired_key = (java_retired_process_key_t){
+        .process = process_key,
+        .process_incarnation = process_incarnation,
+    };
+    retired_observed = 456;
+    retired_present = 1;
+    if (!java_publish_process_retirement(&process_key, process_incarnation, 123)) {
+        fail("exact existing process retirement marker was not accepted");
+    }
+
+    retired_key.process_incarnation++;
+    if (java_publish_process_retirement(&process_key, process_incarnation, 123)) {
+        fail("foreign process retirement marker authorized exact retirement");
+    }
+    if (java_publish_process_retirement(&process_key, process_incarnation, 0)) {
+        fail("zero process retirement evidence was accepted");
+    }
+}
+
+static void test_disabled_process_rotation_ignores_retirement_map(void) {
+    reset(10);
+    const pid_key_t thread = carrier();
+    process_capability = 11;
+    retirement_update_failure = 1;
+
+    if (!java_register_process_incarnation_for(&thread, process_capability) ||
+        process_incarnation != process_capability || retired_present) {
+        fail("disabled process rotation depended on the retirement map");
+    }
 }
 
 static void test_park_remount_preserves_full_identity(void) {
@@ -453,6 +563,9 @@ static void test_mount_publication_revalidates_registration_and_authorization(vo
 
 int main(void) {
 #if TEST_JAVA_REMOTE_PARENT_ENABLED
+    test_process_registration_rejects_exact_retirement();
+    test_process_rotation_publishes_predecessor_retirement();
+    test_process_retirement_requires_durable_exact_marker();
     test_park_remount_preserves_full_identity();
     test_low_31_bit_collision_fails_closed();
     test_process_reuse_rejects_old_mount_and_replaces_guard();
@@ -461,12 +574,19 @@ int main(void) {
     test_payload_cleanup_survives_registration_loss_and_preserves_collisions();
     test_mount_publication_revalidates_registration_and_authorization();
     if (0) {
+        test_process_registration_rejects_exact_retirement();
+        test_process_rotation_publishes_predecessor_retirement();
+        test_process_retirement_requires_durable_exact_marker();
+        test_disabled_process_rotation_ignores_retirement_map();
         test_disabled_bridge_termination_deletes_registered_identity();
     }
 #else
     // Keep the enabled-mode cases type-checked by this build without running
     // assertions whose semantics deliberately depend on bridge translation.
     if (0) {
+        test_process_registration_rejects_exact_retirement();
+        test_process_rotation_publishes_predecessor_retirement();
+        test_process_retirement_requires_durable_exact_marker();
         test_park_remount_preserves_full_identity();
         test_low_31_bit_collision_fails_closed();
         test_process_reuse_rejects_old_mount_and_replaces_guard();
@@ -475,6 +595,7 @@ int main(void) {
         test_payload_cleanup_survives_registration_loss_and_preserves_collisions();
         test_mount_publication_revalidates_registration_and_authorization();
     }
+    test_disabled_process_rotation_ignores_retirement_map();
     test_disabled_bridge_termination_deletes_registered_identity();
 #endif
     return 0;

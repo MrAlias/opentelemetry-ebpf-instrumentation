@@ -96,11 +96,14 @@ func (pf *ProcessFinder) Start(ctx context.Context, opts ...ProcessFinderStartOp
 	swi := swarm.Instancer{}
 	processEvents := msgh.QueueFromConfig[[]Event[ProcessAttrs]](pf.cfg, "processEvents")
 
-	var addedPIDsCh <-chan []app.PID
+	var rediscoverPIDsCh chan []app.PID
 	if appDynamicSelector != nil {
-		addedPIDsCh = appDynamicSelector.AddedPIDsNotifyContext(ctx)
+		// DynamicMatcher is the sole producer for watcher rediscovery. It expands
+		// an added owner with descendants retired during the owner's removal,
+		// while this bounded channel applies backpressure instead of losing PIDs.
+		rediscoverPIDsCh = make(chan []app.PID, dynamicPIDNotifyBufferSize)
 	}
-	swi.Add(swarm.DirectInstance(ProcessWatcherFunc(pf.cfg, pf.ebpfEventContext, processEvents, configCriteria, addedPIDsCh)),
+	swi.Add(swarm.DirectInstance(ProcessWatcherFunc(pf.cfg, pf.ebpfEventContext, processEvents, configCriteria, rediscoverPIDsCh)),
 		swarm.WithID("ProcessWatcher"))
 
 	kubeEnrichedEvents := msgh.QueueFromConfig[[]Event[ProcessAttrs]](pf.cfg, "kubeEnrichedEvents")
@@ -128,7 +131,7 @@ func (pf *ProcessFinder) Start(ctx context.Context, opts ...ProcessFinderStartOp
 	criteriaFilteredEvents := msgh.QueueFromConfig[[]Event[ProcessMatch]](pf.cfg, "criteriaFilteredEvents")
 	swi.Add(criteriaMatcherProvider(pf.cfg, langEnrichedEvents, criteriaFilteredEvents, configCriteria, startConfig.dynamicPIDSelector),
 		swarm.WithID("CriteriaMatcher"))
-	swi.Add(dynamicMatcherProvider(langEnrichedEvents, criteriaFilteredEvents, appDynamicSelector),
+	swi.Add(dynamicMatcherProvider(langEnrichedEvents, criteriaFilteredEvents, appDynamicSelector, rediscoverPIDsCh),
 		swarm.WithID("DynamicMatcher"))
 
 	executableTypes := msgh.QueueFromConfig[[]Event[ebpf.Instrumentable]](pf.cfg, "executableTypes")

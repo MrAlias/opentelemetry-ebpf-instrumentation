@@ -94,10 +94,11 @@ type fakeRuntimeServiceFilter struct {
 	current map[uint32]map[app.PID]svc.Attrs
 }
 
-func (f fakeRuntimeServiceFilter) AllowPID(app.PID, uint32, *exec.FileInfo, PIDType) {}
-func (f fakeRuntimeServiceFilter) BlockPID(app.PID, uint32)                          {}
-func (f fakeRuntimeServiceFilter) ValidPID(app.PID, uint32, PIDType) bool            { return false }
-func (f fakeRuntimeServiceFilter) Filter(inputSpans []request.Span) []request.Span   { return inputSpans }
+func (f fakeRuntimeServiceFilter) AllowPID(app.PID, uint32, *exec.FileInfo, *exec.FileInfo, PIDType) {
+}
+func (f fakeRuntimeServiceFilter) BlockPID(app.PID, uint32, *exec.FileInfo, *exec.FileInfo) {}
+func (f fakeRuntimeServiceFilter) ValidPID(app.PID, uint32, PIDType) bool                   { return false }
+func (f fakeRuntimeServiceFilter) Filter(inputSpans []request.Span) []request.Span          { return inputSpans }
 func (f fakeRuntimeServiceFilter) CurrentPIDs(PIDType) map[uint32]map[app.PID]svc.Attrs {
 	return f.current
 }

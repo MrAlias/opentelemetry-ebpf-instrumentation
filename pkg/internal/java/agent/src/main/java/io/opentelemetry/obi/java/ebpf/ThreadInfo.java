@@ -125,7 +125,7 @@ public class ThreadInfo {
       socketContext = null;
     }
     long token = newTaskToken();
-    emitTaskContextOp(
+    emitProcessClaimedTaskContextOp(
         relayCapture ? OperationType.TASK_RELAY_CAPTURE : OperationType.TASK_CAPTURE, token, 0L);
     if (!isCurrentRemoteParentBridgeCapability(bridgeEpoch)
         || receiveContext != null
@@ -761,7 +761,7 @@ public class ThreadInfo {
 
   private static long captureRelayToken() {
     long token = newTaskToken();
-    emitTaskContextOp(OperationType.TASK_RELAY_CAPTURE, token, 0L);
+    emitProcessClaimedTaskContextOp(OperationType.TASK_RELAY_CAPTURE, token, 0L);
     return token;
   }
 
@@ -916,9 +916,29 @@ public class ThreadInfo {
     BootstrapNative.emitTaskContextOp(operation.code, value, token);
   }
 
+  private static void emitProcessClaimedTaskContextOp(
+      OperationType operation, long value, long token) {
+    // CAPTURE, RELAY_CAPTURE, and TASK_LINK share BPF P(process) with THREAD
+    // and PROCESS_REGISTER. Queue their synchronous ioctls on the same monitor
+    // so normal executor fan-out cannot lose publication to the fail-closed
+    // process fence. Destructive CANCEL/UNLINK operations remain independent.
+    synchronized (taskAncestryPublicationLock) {
+      emitTaskContextOp(operation, value, token);
+    }
+  }
+
   private static void emitTaskParentContext(long parentId, long token, boolean exactTokenHandoff) {
     if (exactTokenHandoff) {
-      emitTaskContextOp(OperationType.TASK_LINK, parentId, token);
+      synchronized (taskAncestryPublicationLock) {
+        try {
+          emitTaskContextOp(OperationType.TASK_LINK, parentId, token);
+        } finally {
+          // LINK is a one-shot token boundary. BPF cancellation is exact and
+          // cannot touch the transferred task carrier, so this is a no-op on
+          // success and drains H after decode, tail-dispatch, or claim failure.
+          emitTaskContextOp(OperationType.TASK_CANCEL, token, 0L);
+        }
+      }
     } else {
       sendParentThreadContext(parentId);
     }

@@ -5,8 +5,12 @@
 package exec // import "go.opentelemetry.io/obi/pkg/appolly/discover/exec"
 
 import (
+	"context"
 	"debug/elf"
+	"errors"
+	"fmt"
 	"maps"
+	"os"
 	"strings"
 	"sync"
 
@@ -24,57 +28,115 @@ const (
 	serviceNamespaceKey = "service.namespace"
 )
 
+// FileID identifies a file by its device and inode numbers.
+type FileID struct {
+	Dev uint64
+	Ino uint64
+}
+
 type Init struct {
-	Service        svc.Attrs
-	CmdExePath     string
-	ProExeLinkPath string
-	ELF            *elf.File
-	Pid            app.PID
-	Ppid           app.PID
-	Dev            uint64
-	Ino            uint64
-	Ns             uint32
+	Service           svc.Attrs
+	CmdExePath        string
+	ProExeLinkPath    string
+	ELF               *elf.File
+	Pid               app.PID
+	Ppid              app.PID
+	Dev               uint64
+	Ino               uint64
+	Ns                uint32
+	ProcessStart      uint64
+	ProcessInstanceID uint64
+	// ProcessHandle ownership transfers to the returned FileInfo. On Linux it
+	// must be a stable /proc/<pid> directory descriptor for ProcessStart.
+	ProcessHandle *os.File
 }
 
 type FileInfo struct {
-	mu             sync.RWMutex
-	service        svc.Attrs
-	cmdExePath     string
-	proExeLinkPath string
-	elfFile        *elf.File
-	pid            app.PID
-	ppid           app.PID
-	dev            uint64
-	ino            uint64
-	ns             uint32
-	javaCapability uint64
+	mu                sync.RWMutex
+	processHandleMu   sync.RWMutex
+	service           svc.Attrs
+	cmdExePath        string
+	proExeLinkPath    string
+	elfFile           *elf.File
+	pid               app.PID
+	ppid              app.PID
+	dev               uint64
+	ino               uint64
+	ns                uint32
+	processStart      uint64
+	processInstanceID uint64
+	processHandle     *os.File
+	javaCapability    uint64
+	javaAuthSeq       uint64
+	javaAuth          *javaAuthorizationState
+}
+
+type javaAuthorizationState struct {
+	sequence   uint64
+	done       chan struct{}
+	capability uint64
+	completed  bool
 }
 
 func New(init Init) *FileInfo {
 	return &FileInfo{
-		service:        init.Service,
-		cmdExePath:     init.CmdExePath,
-		proExeLinkPath: init.ProExeLinkPath,
-		elfFile:        init.ELF,
-		pid:            init.Pid,
-		ppid:           init.Ppid,
-		dev:            init.Dev,
-		ino:            init.Ino,
-		ns:             init.Ns,
+		service:           init.Service,
+		cmdExePath:        init.CmdExePath,
+		proExeLinkPath:    init.ProExeLinkPath,
+		elfFile:           init.ELF,
+		pid:               init.Pid,
+		ppid:              init.Ppid,
+		dev:               init.Dev,
+		ino:               init.Ino,
+		ns:                init.Ns,
+		processStart:      init.ProcessStart,
+		processInstanceID: init.ProcessInstanceID,
+		processHandle:     init.ProcessHandle,
 	}
 }
 
 // Identity getters. Fields are set at construction and never mutated, so
 // no locking is required.
 
-func (fi *FileInfo) Pid() app.PID           { return fi.pid }
-func (fi *FileInfo) Ppid() app.PID          { return fi.ppid }
-func (fi *FileInfo) Dev() uint64            { return fi.dev }
-func (fi *FileInfo) Ino() uint64            { return fi.ino }
-func (fi *FileInfo) Ns() uint32             { return fi.ns }
-func (fi *FileInfo) CmdExePath() string     { return fi.cmdExePath }
-func (fi *FileInfo) ProExeLinkPath() string { return fi.proExeLinkPath }
-func (fi *FileInfo) ELF() *elf.File         { return fi.elfFile }
+func (fi *FileInfo) Pid() app.PID              { return fi.pid }
+func (fi *FileInfo) Ppid() app.PID             { return fi.ppid }
+func (fi *FileInfo) Dev() uint64               { return fi.dev }
+func (fi *FileInfo) Ino() uint64               { return fi.ino }
+func (fi *FileInfo) ID() FileID                { return FileID{Dev: fi.dev, Ino: fi.ino} }
+func (fi *FileInfo) Ns() uint32                { return fi.ns }
+func (fi *FileInfo) ProcessStartTime() uint64  { return fi.processStart }
+func (fi *FileInfo) ProcessInstanceID() uint64 { return fi.processInstanceID }
+func (fi *FileInfo) CmdExePath() string        { return fi.cmdExePath }
+func (fi *FileInfo) ProExeLinkPath() string    { return fi.proExeLinkPath }
+func (fi *FileInfo) ELF() *elf.File            { return fi.elfFile }
+
+// UseProcessHandle runs use while the stable process descriptor remains open.
+// Callers that retain access after use returns must duplicate the descriptor.
+func (fi *FileInfo) UseProcessHandle(use func(int) error) error {
+	if use == nil {
+		return errors.New("stable process-handle callback is nil")
+	}
+	fi.processHandleMu.RLock()
+	defer fi.processHandleMu.RUnlock()
+	if fi.processHandle == nil {
+		return errors.New("stable process handle is unavailable")
+	}
+	return use(int(fi.processHandle.Fd()))
+}
+
+// CloseProcessHandle retires FileInfo's stable process descriptor. Prepared
+// operations own independent duplicates, so closing the discovery handle does
+// not race an already-started attachment.
+func (fi *FileInfo) CloseProcessHandle() error {
+	fi.processHandleMu.Lock()
+	handle := fi.processHandle
+	fi.processHandle = nil
+	fi.processHandleMu.Unlock()
+	if handle == nil {
+		return nil
+	}
+	return handle.Close()
+}
 
 func (fi *FileInfo) ExecutableName() string {
 	parts := strings.Split(fi.cmdExePath, "/")
@@ -109,6 +171,134 @@ func (fi *FileInfo) SetJavaAgentCapability(capability uint64) {
 	fi.mu.Lock()
 	defer fi.mu.Unlock()
 	fi.javaCapability = capability
+}
+
+// SetJavaAgentCapabilityForGeneration publishes a prepared capability only if
+// the caller still owns the current readiness generation. This prevents a slow
+// preparation from overwriting the capability of a newer operation.
+func (fi *FileInfo) SetJavaAgentCapabilityForGeneration(
+	sequence uint64,
+	capability uint64,
+) bool {
+	fi.mu.Lock()
+	defer fi.mu.Unlock()
+	if fi.javaAuth == nil || fi.javaAuth.sequence != sequence || fi.javaAuth.completed {
+		return false
+	}
+	fi.javaCapability = capability
+	return true
+}
+
+// PrepareJavaAgentCapability starts one attachment-authorization generation.
+// Any waiter for an unexpectedly superseded generation is released fail-closed.
+func (fi *FileInfo) PrepareJavaAgentCapability(capability uint64) uint64 {
+	fi.mu.Lock()
+	defer fi.mu.Unlock()
+	if fi.javaAuth != nil && !fi.javaAuth.completed {
+		fi.javaAuth.completed = true
+		fi.javaAuth.capability = 0
+		close(fi.javaAuth.done)
+	}
+	fi.javaAuthSeq++
+	if fi.javaAuthSeq == 0 {
+		fi.javaAuthSeq++
+	}
+	fi.javaCapability = capability
+	fi.javaAuth = &javaAuthorizationState{
+		sequence: fi.javaAuthSeq,
+		done:     make(chan struct{}),
+	}
+	return fi.javaAuthSeq
+}
+
+// BeginJavaAgentAuthorization snapshots and closes the attachment gate for the
+// current prepared generation. A zero sequence denotes legacy/test setup that
+// did not create a readiness waiter.
+func (fi *FileInfo) BeginJavaAgentAuthorization() (capability, sequence uint64) {
+	fi.mu.Lock()
+	defer fi.mu.Unlock()
+	capability = fi.javaCapability
+	fi.javaCapability = 0
+	if fi.javaAuth != nil && !fi.javaAuth.completed {
+		sequence = fi.javaAuth.sequence
+	}
+	return capability, sequence
+}
+
+// CompleteJavaAgentAuthorization publishes the exact generation's result and
+// wakes its Java attachment waiter. Stale completions are ignored.
+func (fi *FileInfo) CompleteJavaAgentAuthorization(sequence, capability uint64) {
+	fi.mu.Lock()
+	defer fi.mu.Unlock()
+	if sequence == 0 {
+		if fi.javaAuth == nil {
+			fi.javaCapability = capability
+		}
+		return
+	}
+	state := fi.javaAuth
+	if state == nil || state.sequence != sequence || state.completed {
+		return
+	}
+	state.capability = capability
+	state.completed = true
+	fi.javaCapability = capability
+	close(state.done)
+}
+
+// WaitJavaAgentAuthorization waits for the prepared generation captured at
+// call time. Its result cannot be confused with a later generation.
+func (fi *FileInfo) WaitJavaAgentAuthorization(ctx context.Context) (uint64, error) {
+	fi.mu.RLock()
+	state := fi.javaAuth
+	if state == nil {
+		capability := fi.javaCapability
+		fi.mu.RUnlock()
+		return capability, nil
+	}
+	fi.mu.RUnlock()
+	return fi.waitJavaAgentAuthorizationState(ctx, state)
+}
+
+// WaitJavaAgentAuthorizationGeneration waits only for the prepared generation
+// owned by one exact attachment operation. A replacement preparation cannot
+// make an older operation consume the replacement's capability or target.
+func (fi *FileInfo) WaitJavaAgentAuthorizationGeneration(
+	ctx context.Context,
+	sequence uint64,
+) (uint64, error) {
+	fi.mu.RLock()
+	state := fi.javaAuth
+	if state == nil || state.sequence != sequence {
+		fi.mu.RUnlock()
+		return 0, fmt.Errorf("java authorization generation %d was superseded", sequence)
+	}
+	fi.mu.RUnlock()
+	return fi.waitJavaAgentAuthorizationState(ctx, state)
+}
+
+func (fi *FileInfo) waitJavaAgentAuthorizationState(
+	ctx context.Context,
+	state *javaAuthorizationState,
+) (uint64, error) {
+	fi.mu.RLock()
+	if state.completed {
+		capability := state.capability
+		fi.mu.RUnlock()
+		return capability, nil
+	}
+	done := state.done
+	fi.mu.RUnlock()
+
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-done:
+		fi.mu.RLock()
+		capability := state.capability
+		fi.mu.RUnlock()
+		return capability, nil
+	}
 }
 
 func (fi *FileInfo) ExportsOTelMetrics() bool {

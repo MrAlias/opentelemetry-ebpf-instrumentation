@@ -168,7 +168,7 @@ static __always_inline u8 java_remote_parent_claim_equal_inline(
     return mismatch == 0;
 }
 
-static __noinline __attribute__((unused)) u8 java_remote_parent_claim_equal(
+static __always_inline __attribute__((unused)) u8 java_remote_parent_claim_equal(
     const java_remote_parent_claim_t *left, const java_remote_parent_claim_t *right) {
     return java_remote_parent_claim_equal_inline(left, right);
 }

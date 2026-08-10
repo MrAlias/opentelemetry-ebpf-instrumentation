@@ -103,6 +103,7 @@ func (wk *watcherKubeEnricher) On(event *informer.Event) error {
 // is received from different sources.
 func (wk *watcherKubeEnricher) enrich(_ context.Context) {
 	defer wk.output.Close()
+	defer wk.closeProcessIdentities()
 
 	wk.log.Debug("starting watcherKubeEnricher")
 	// the initialization needs to go in a different thread,
@@ -155,6 +156,8 @@ func (wk *watcherKubeEnricher) enrichProcessEvent(processEvents []Event[ProcessA
 					Type: EventCreated,
 					Obj:  procWithMeta,
 				})
+			} else {
+				_ = procEvent.Obj.closeProcessIdentity()
 			}
 		case EventDeleted:
 			wk.log.Debug("process stopped", "pid", procEvent.Obj.pid)
@@ -186,13 +189,41 @@ func (wk *watcherKubeEnricher) onNewProcess(procInfo ProcessAttrs) (ProcessAttrs
 
 	wk.log.Debug("found container info for process", "pid", procInfo.pid, "container", containerInfo.ContainerID)
 
-	wk.processByContainer[containerInfo.ContainerID] = append(wk.processByContainer[containerInfo.ContainerID], procInfo)
+	if !wk.cacheProcess(containerInfo.ContainerID, procInfo) {
+		return ProcessAttrs{}, false
+	}
 
 	if pod := wk.store.PodByContainerID(containerInfo.ContainerID); pod != nil {
 		wk.log.Debug("matched process with running container", "pid", procInfo.pid, "container", containerInfo.ContainerID)
 		procInfo = withMetadata(procInfo, pod.Meta, containerInfo.ContainerID)
 	}
 	return procInfo, true
+}
+
+// cacheProcess retains exactly one process identity per PID and container.
+// Dynamic selector remove/re-add cycles can re-emit a still-live PID without a
+// deletion event; replacing the cached lease prevents each cycle from pinning
+// another proc-directory descriptor until that process eventually exits.
+// wk.mt must be held by the caller.
+func (wk *watcherKubeEnricher) cacheProcess(
+	containerID string,
+	procInfo ProcessAttrs,
+) bool {
+	cached, ok := procInfo.retainProcessIdentity()
+	if !ok {
+		return false
+	}
+	processes := wk.processByContainer[containerID]
+	kept := processes[:0]
+	for _, existing := range processes {
+		if existing.pid == procInfo.pid {
+			_ = existing.closeProcessIdentity()
+			continue
+		}
+		kept = append(kept, existing)
+	}
+	wk.processByContainer[containerID] = append(kept, cached)
+	return true
 }
 
 func (wk *watcherKubeEnricher) onProcessTerminate(procInfo ProcessAttrs) {
@@ -208,6 +239,7 @@ func (wk *watcherKubeEnricher) onProcessTerminate(procInfo ProcessAttrs) {
 					filtered = append(filtered, pidProcInfo)
 					continue
 				}
+				_ = pidProcInfo.closeProcessIdentity()
 				wk.log.Debug("removing process mapping", "container", cnt.ContainerID, "pid", pidProcInfo.pid)
 			}
 			if len(filtered) == 0 {
@@ -230,9 +262,13 @@ func (wk *watcherKubeEnricher) onNewPod(pod *informer.ObjectMeta) []Event[Proces
 		if procInfos, ok := wk.processByContainer[cnt.Id]; ok {
 			for _, procInfo := range procInfos {
 				wk.log.Debug("matched pod with running process", "container", cnt.Id, "pid", procInfo.pid)
+				eventProc, ok := procInfo.retainProcessIdentity()
+				if !ok {
+					continue
+				}
 				events = append(events, Event[ProcessAttrs]{
 					Type: EventCreated,
-					Obj:  withMetadata(procInfo, pod, cnt.Id),
+					Obj:  withMetadata(eventProc, pod, cnt.Id),
 				})
 			}
 		}
@@ -247,9 +283,21 @@ func (wk *watcherKubeEnricher) onDeletedPod(pod *informer.ObjectMeta) {
 		if pbcs, ok := wk.processByContainer[cnt.Id]; ok {
 			for _, pbc := range pbcs {
 				delete(wk.containerByPID, pbc.pid)
+				_ = pbc.closeProcessIdentity()
 			}
 		}
 		delete(wk.processByContainer, cnt.Id)
+	}
+}
+
+func (wk *watcherKubeEnricher) closeProcessIdentities() {
+	wk.mt.Lock()
+	defer wk.mt.Unlock()
+	for containerID, processes := range wk.processByContainer {
+		for _, process := range processes {
+			_ = process.closeProcessIdentity()
+		}
+		delete(wk.processByContainer, containerID)
 	}
 }
 

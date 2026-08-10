@@ -4,6 +4,8 @@
 package procs // import "go.opentelemetry.io/obi/pkg/internal/procs"
 
 import (
+	"fmt"
+	"os"
 	"strings"
 
 	"github.com/prometheus/procfs"
@@ -44,4 +46,18 @@ func EnvVars(pid app.PID) (map[string]string, error) {
 	m := envStrsToMap(varsStr)
 
 	return m, nil
+}
+
+// EnvVarsFromProcFD reads the environment through a stable process-directory
+// descriptor instead of a reusable numeric /proc path.
+func EnvVarsFromProcFD(procFD int) (map[string]string, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/self/fd/%d/environ", procFD))
+	if err != nil {
+		return nil, err
+	}
+	data = []byte(strings.TrimSuffix(string(data), "\x00"))
+	if len(data) == 0 {
+		return map[string]string{}, nil
+	}
+	return envStrsToMap(strings.Split(string(data), "\x00")), nil
 }

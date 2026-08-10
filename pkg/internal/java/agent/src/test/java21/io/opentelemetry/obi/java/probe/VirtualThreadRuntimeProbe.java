@@ -120,7 +120,9 @@ public final class VirtualThreadRuntimeProbe {
       require(count(events, "VT_MOUNT") >= 2, "park/remount was not observed: " + events);
       require(count(events, "VT_UNMOUNT") >= 1, "unmount was not observed: " + events);
       require(count(events, "VT_TERMINATE") == 1, "termination was not observed once: " + events);
-      require(hasExactTaskLink(events), "start handoff token was not linked: " + events);
+      require(
+          hasExactLinkedTaskLifecycle(events),
+          "start handoff token did not terminate after linking: " + events);
       require(taskContext(virtualThread) == null, "completed virtual thread retained task context");
 
       int reuseStart = EVENTS.size();
@@ -188,7 +190,8 @@ public final class VirtualThreadRuntimeProbe {
     require(count(events, "VT_UNMOUNT") >= 1, "structured child unmount missing: " + events);
     require(count(events, "VT_TERMINATE") == 1, "structured child termination missing: " + events);
     require(
-        hasExactTaskLink(events), "StructuredTaskScope direct start was not captured: " + events);
+        hasExactLinkedTaskLifecycle(events),
+        "StructuredTaskScope direct start did not terminate after linking: " + events);
     require(taskContext(structuredChild) == null, "structured child retained task context");
     clearSocketFileDescriptor();
   }
@@ -226,8 +229,9 @@ public final class VirtualThreadRuntimeProbe {
           count(cancellationEvents, "VT_TERMINATE") == 1,
           "cancelled termination was not observed: " + cancellationEvents);
       require(
-          hasExactTaskLink(cancellationEvents),
-          "cancelled virtual-thread handoff was not exact: " + cancellationEvents);
+          hasExactLinkedTaskLifecycle(cancellationEvents),
+          "cancelled virtual-thread handoff did not terminate after linking: "
+              + cancellationEvents);
       require(taskContext(cancelled) == null, "cancelled virtual thread retained task context");
 
       AtomicInteger cancellationReuseDescriptor = new AtomicInteger(-2);
@@ -280,8 +284,8 @@ public final class VirtualThreadRuntimeProbe {
           count(mixedEvents, "TASK_CAPTURE") == 1,
           "mixed virtual start was not the only strict capture: " + mixedEvents);
       require(
-          hasExactTaskLink(mixedEvents),
-          "mixed virtual start handoff was not linked: " + mixedEvents);
+          hasExactLinkedTaskLifecycle(mixedEvents),
+          "mixed virtual start handoff did not terminate after linking: " + mixedEvents);
       require(platformSubmissionStart.get() >= 0, "platform submission event boundary was missing");
       List<Event> platformEvents = snapshotSince(platformSubmissionStart.get());
       require(
@@ -349,7 +353,9 @@ public final class VirtualThreadRuntimeProbe {
       require(
           count(events, "VT_TERMINATE") == threadCount,
           "concurrent terminations were not exact: " + events);
-      require(allCapturesLinked(events), "a concurrent handoff token was not linked: " + events);
+      require(
+          allCapturesHaveLinkedTerminalLifecycle(events),
+          "a concurrent handoff token did not terminate after linking: " + events);
       require(claimedDescriptors.get() == 1, "concurrent aliases did not claim exactly once");
       require(
           unexpectedDescriptors.get() == 0, "concurrent alias observed an unexpected descriptor");
@@ -453,35 +459,46 @@ public final class VirtualThreadRuntimeProbe {
     return events.stream().filter(event -> operation.equals(event.operation)).count();
   }
 
-  private static boolean hasExactTaskLink(List<Event> events) {
+  private static boolean hasExactLinkedTaskLifecycle(List<Event> events) {
     List<Event> captures =
         events.stream()
             .filter(event -> "TASK_CAPTURE".equals(event.operation))
             .collect(java.util.stream.Collectors.toList());
-    if (captures.size() != 1) {
-      return false;
-    }
-    long captureToken = captures.get(0).value;
-    return captureToken != 0L
-        && events.stream()
-            .anyMatch(event -> "TASK_LINK".equals(event.operation) && event.token == captureToken);
+    return captures.size() == 1 && hasLinkedTerminalLifecycle(events, captures.get(0));
   }
 
-  private static boolean allCapturesLinked(List<Event> events) {
+  private static boolean allCapturesHaveLinkedTerminalLifecycle(List<Event> events) {
     List<Event> captures =
         events.stream()
             .filter(event -> "TASK_CAPTURE".equals(event.operation))
             .collect(java.util.stream.Collectors.toList());
     return !captures.isEmpty()
-        && captures.stream()
-            .allMatch(
-                capture ->
-                    capture.value != 0L
-                        && events.stream()
-                            .anyMatch(
-                                event ->
-                                    "TASK_LINK".equals(event.operation)
-                                        && event.token == capture.value));
+        && captures.stream().allMatch(capture -> hasLinkedTerminalLifecycle(events, capture));
+  }
+
+  private static boolean hasLinkedTerminalLifecycle(List<Event> events, Event capture) {
+    if (capture.value == 0L) {
+      return false;
+    }
+    int captureIndex = events.indexOf(capture);
+    int linkIndex = -1;
+    int cancelIndex = -1;
+    int linkCount = 0;
+    int cancelCount = 0;
+    for (int index = 0; index < events.size(); index++) {
+      Event event = events.get(index);
+      if ("TASK_LINK".equals(event.operation) && event.token == capture.value) {
+        linkIndex = index;
+        linkCount++;
+      } else if ("TASK_CANCEL".equals(event.operation) && event.value == capture.value) {
+        cancelIndex = index;
+        cancelCount++;
+      }
+    }
+    return linkCount == 1
+        && cancelCount == 1
+        && captureIndex < linkIndex
+        && linkIndex < cancelIndex;
   }
 
   private static void require(boolean condition, String message) {

@@ -76,6 +76,8 @@ public final class OfficialAgentJava21ConcurrencyProbe {
       new ConcurrentHashMap<Long, TaskCapture>(EVENT_MAP_CAPACITY);
   private static final ConcurrentMap<String, TaskCompletion> COMPLETIONS =
       new ConcurrentHashMap<String, TaskCompletion>(EVENT_MAP_CAPACITY);
+  private static final ConcurrentMap<Long, TaskCapture> TERMINAL_CANCELLATIONS =
+      new ConcurrentHashMap<Long, TaskCapture>(EVENT_MAP_CAPACITY);
   private static final ConcurrentLinkedQueue<TaskEvent> TASK_EVENTS =
       new ConcurrentLinkedQueue<TaskEvent>();
   private static final AtomicLong EVENT_SEQUENCE = new AtomicLong();
@@ -180,6 +182,7 @@ public final class OfficialAgentJava21ConcurrencyProbe {
     initializeConcurrentMap(CAPTURES, sentinel, capture);
     initializeConcurrentMap(PENDING, sentinel, capture);
     initializeConcurrentMap(COMPLETIONS, label.id, completion);
+    initializeConcurrentMap(TERMINAL_CANCELLATIONS, sentinel, capture);
     initializeConcurrentMap(MOUNTED_VIRTUAL_BY_NATIVE, sentinel, sentinel);
     initializeConcurrentMap(VIRTUAL_MOUNTS, sentinel, new AtomicInteger());
     initializeConcurrentMap(VIRTUAL_UNMOUNTS, sentinel, new AtomicInteger());
@@ -398,7 +401,7 @@ public final class OfficialAgentJava21ConcurrencyProbe {
         end.taskRelayCaptures - start.taskRelayCaptures == RELAY_TASKS,
         "first-wave relay capture count mismatch");
     require(end.taskLinks - start.taskLinks == 24L, "first-wave link count mismatch");
-    require(end.taskCancels == start.taskCancels, "first-wave task cancellation");
+    require(end.taskCancels - start.taskCancels == 24L, "first-wave terminal cancellation count");
     require(end.taskUnlinks == start.taskUnlinks, "first-wave task unlink");
     require(PENDING.isEmpty(), "first-wave captures remained pending");
 
@@ -429,6 +432,9 @@ public final class OfficialAgentJava21ConcurrencyProbe {
           completion.linkChildJavaThreadId == descriptor.task.taskJavaThreadId,
           "link Java thread mismatch");
       require(capture.sequence < completion.sequence, "link preceded capture");
+      require(
+          TERMINAL_CANCELLATIONS.get(Long.valueOf(capture.token)) == capture,
+          "missing terminal task cancellation for " + descriptor.task.id);
       if (descriptor.task.virtual) {
         AtomicLong mount =
             FIRST_VIRTUAL_MOUNT_SEQUENCE.get(Long.valueOf(descriptor.task.taskJavaThreadId));
@@ -483,6 +489,9 @@ public final class OfficialAgentJava21ConcurrencyProbe {
           parentCompletion.sequence < capture.sequence,
           "relay capture preceded its parent task link");
       require(capture.sequence < completion.sequence, "relay link preceded capture");
+      require(
+          TERMINAL_CANCELLATIONS.get(Long.valueOf(capture.token)) == capture,
+          "missing terminal relay cancellation for " + descriptor.task.id);
       if (descriptor.virtualThread != null) {
         AtomicLong mount =
             FIRST_VIRTUAL_MOUNT_SEQUENCE.get(Long.valueOf(descriptor.task.taskJavaThreadId));
@@ -768,9 +777,22 @@ public final class OfficialAgentJava21ConcurrencyProbe {
             "duplicate task completion " + capture.label.id);
         return;
       }
-      if ("TASK_CANCEL".equals(operation) && CAPTURES.containsKey(Long.valueOf(value))) {
-        PENDING.remove(Long.valueOf(value));
-        throw new IllegalStateException("labelled task token was cancelled: " + value);
+      if ("TASK_CANCEL".equals(operation)) {
+        Long cancelledToken = Long.valueOf(value);
+        TaskCapture capture = CAPTURES.get(cancelledToken);
+        if (capture == null) {
+          return;
+        }
+        require(
+            !PENDING.remove(cancelledToken, capture),
+            "labelled task token was cancelled before link: " + value);
+        require(
+            COMPLETIONS.get(capture.label.id) != null,
+            "labelled task token was cancelled before completion: " + value);
+        require(
+            TERMINAL_CANCELLATIONS.putIfAbsent(cancelledToken, capture) == null,
+            "duplicate terminal task cancellation: " + value);
+        return;
       }
 
       if ("VT_MOUNT".equals(operation)) {

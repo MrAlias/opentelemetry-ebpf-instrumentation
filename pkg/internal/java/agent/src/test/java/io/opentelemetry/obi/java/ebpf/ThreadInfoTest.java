@@ -151,6 +151,81 @@ class ThreadInfoTest {
   }
 
   @Test
+  void exactTaskHandoffEmissionsAreSerializedAndTerminallyCancelled() throws Exception {
+    CountDownLatch firstEntered = new CountDownLatch(1);
+    CountDownLatch releaseFirst = new CountDownLatch(1);
+    AtomicInteger active = new AtomicInteger();
+    AtomicInteger maxActive = new AtomicInteger();
+    AtomicInteger failures = new AtomicInteger();
+    List<EmittedOp> emitted = Collections.synchronizedList(new ArrayList<>());
+    ThreadInfo.setTaskContextEmitterForTest(
+        (operation, value, token) -> {
+          int concurrent = active.incrementAndGet();
+          maxActive.accumulateAndGet(concurrent, Math::max);
+          try {
+            emitted.add(new EmittedOp(operation, value, token));
+            if (operation == OperationType.TASK_LINK && token == 11L) {
+              firstEntered.countDown();
+              if (!releaseFirst.await(5, TimeUnit.SECONDS)) {
+                throw new AssertionError("timed out waiting to release first task handoff");
+              }
+            }
+          } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(interrupted);
+          } finally {
+            active.decrementAndGet();
+          }
+        });
+
+    Thread first =
+        new Thread(
+            () -> {
+              try {
+                assertTrue(ThreadInfo.enterTaskParentThreadContext(901L, 101L, 11L));
+              } catch (Throwable failure) {
+                failures.incrementAndGet();
+              }
+            });
+    Thread second =
+        new Thread(
+            () -> {
+              try {
+                assertTrue(ThreadInfo.enterTaskParentThreadContext(902L, 202L, 22L));
+              } catch (Throwable failure) {
+                failures.incrementAndGet();
+              }
+            });
+
+    try {
+      first.start();
+      assertTrue(firstEntered.await(5, TimeUnit.SECONDS));
+      second.start();
+      long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+      while (second.getState() != Thread.State.BLOCKED && System.nanoTime() < deadline) {
+        Thread.sleep(1L);
+      }
+      assertEquals(Thread.State.BLOCKED, second.getState());
+      assertEquals(1, emitted.size());
+      assertEquals(1, maxActive.get());
+    } finally {
+      releaseFirst.countDown();
+      first.join(TimeUnit.SECONDS.toMillis(5));
+      second.join(TimeUnit.SECONDS.toMillis(5));
+    }
+
+    assertFalse(first.isAlive());
+    assertFalse(second.isAlive());
+    assertEquals(0, failures.get());
+    assertEquals(4, emitted.size());
+    assertOperation(emitted.get(0), OperationType.TASK_LINK, 101L, 11L);
+    assertOperation(emitted.get(1), OperationType.TASK_CANCEL, 11L, 0L);
+    assertOperation(emitted.get(2), OperationType.TASK_LINK, 202L, 22L);
+    assertOperation(emitted.get(3), OperationType.TASK_CANCEL, 22L, 0L);
+    assertEquals(1, maxActive.get());
+  }
+
+  @Test
   void threadContextEmissionsRemainSerializedAcrossRemoteParentActivation() throws Exception {
     ThreadInfo.setRemoteParentEnabled(false);
     CountDownLatch firstEntered = new CountDownLatch(1);
@@ -287,6 +362,39 @@ class ThreadInfoTest {
     assertEquals(0, failures.get());
     assertEquals(
         java.util.Arrays.asList(OperationType.THREAD, OperationType.PROCESS_REGISTER), emitted);
+  }
+
+  @Test
+  void processRegistrationWaitsForTaskCapturePublication() throws Exception {
+    ThreadInfo.setRemoteParentEnabled(true);
+    RemoteParentSocketContext.Lifecycle lifecycle = new RemoteParentSocketContext.Lifecycle();
+
+    assertProcessRegistrationWaitsForTaskPublication(
+        OperationType.TASK_CAPTURE,
+        () -> {
+          ThreadInfo.markRemoteParentDirectLookup(lifecycle);
+          TaskContext context = ThreadInfo.captureTaskContext(606L, lifecycle);
+          assertTrue(context.getHandoffToken() != 0L);
+          ThreadInfo.clearRemoteParentLookupSource();
+        },
+        java.util.Arrays.asList(OperationType.TASK_CAPTURE, OperationType.PROCESS_REGISTER));
+  }
+
+  @Test
+  void processRegistrationWaitsForTaskRelayCapturePublication() throws Exception {
+    assertProcessRegistrationWaitsForTaskPublication(
+        OperationType.TASK_RELAY_CAPTURE,
+        () -> assertTrue(captureRelayTokenForTest() != 0L),
+        java.util.Arrays.asList(OperationType.TASK_RELAY_CAPTURE, OperationType.PROCESS_REGISTER));
+  }
+
+  @Test
+  void processRegistrationWaitsForTaskLinkAndTerminalCancellation() throws Exception {
+    assertProcessRegistrationWaitsForTaskPublication(
+        OperationType.TASK_LINK,
+        () -> assertTrue(ThreadInfo.enterTaskParentThreadContext(901L, 606L, 11L)),
+        java.util.Arrays.asList(
+            OperationType.TASK_LINK, OperationType.TASK_CANCEL, OperationType.PROCESS_REGISTER));
   }
 
   @Test
@@ -936,18 +1044,17 @@ class ThreadInfoTest {
     ThreadInfo.restoreTaskParentThreadContext();
     ThreadInfo.restoreTaskParentThreadContext();
 
-    assertEquals(5, emitted.size());
-    assertEquals(OperationType.TASK_LINK, emitted.get(0).operation);
-    assertEquals(11L, emitted.get(0).token);
-    assertEquals(OperationType.TASK_RELAY_CAPTURE, emitted.get(1).operation);
-    long restoreToken = emitted.get(1).value;
+    assertEquals(8, emitted.size());
+    assertOperation(emitted.get(0), OperationType.TASK_LINK, 101L, 11L);
+    assertOperation(emitted.get(1), OperationType.TASK_CANCEL, 11L, 0L);
+    assertEquals(OperationType.TASK_RELAY_CAPTURE, emitted.get(2).operation);
+    long restoreToken = emitted.get(2).value;
     assertTrue(restoreToken != 0L);
-    assertEquals(OperationType.TASK_LINK, emitted.get(2).operation);
-    assertEquals(22L, emitted.get(2).token);
-    assertEquals(OperationType.TASK_LINK, emitted.get(3).operation);
-    assertEquals(restoreToken, emitted.get(3).token);
-    assertEquals(OperationType.THREAD, emitted.get(4).operation);
-    assertEquals(0L, emitted.get(4).token);
+    assertOperation(emitted.get(3), OperationType.TASK_LINK, 202L, 22L);
+    assertOperation(emitted.get(4), OperationType.TASK_CANCEL, 22L, 0L);
+    assertOperation(emitted.get(5), OperationType.TASK_LINK, 101L, restoreToken);
+    assertOperation(emitted.get(6), OperationType.TASK_CANCEL, restoreToken, 0L);
+    assertOperation(emitted.get(7), OperationType.THREAD, 900L, 0L);
   }
 
   @Test
@@ -962,18 +1069,16 @@ class ThreadInfoTest {
     ThreadInfo.restoreTaskParentThreadContext();
     ThreadInfo.restoreTaskParentThreadContext();
 
-    assertEquals(5, emitted.size());
-    assertEquals(OperationType.TASK_LINK, emitted.get(0).operation);
-    assertEquals(11L, emitted.get(0).token);
-    assertEquals(OperationType.TASK_RELAY_CAPTURE, emitted.get(1).operation);
-    long restoreToken = emitted.get(1).value;
+    assertEquals(7, emitted.size());
+    assertOperation(emitted.get(0), OperationType.TASK_LINK, 101L, 11L);
+    assertOperation(emitted.get(1), OperationType.TASK_CANCEL, 11L, 0L);
+    assertEquals(OperationType.TASK_RELAY_CAPTURE, emitted.get(2).operation);
+    long restoreToken = emitted.get(2).value;
     assertTrue(restoreToken != 0L);
-    assertEquals(OperationType.THREAD, emitted.get(2).operation);
-    assertEquals(202L, emitted.get(2).value);
-    assertEquals(OperationType.TASK_LINK, emitted.get(3).operation);
-    assertEquals(restoreToken, emitted.get(3).token);
-    assertEquals(OperationType.THREAD, emitted.get(4).operation);
-    assertEquals(900L, emitted.get(4).value);
+    assertOperation(emitted.get(3), OperationType.THREAD, 202L, 0L);
+    assertOperation(emitted.get(4), OperationType.TASK_LINK, 101L, restoreToken);
+    assertOperation(emitted.get(5), OperationType.TASK_CANCEL, restoreToken, 0L);
+    assertOperation(emitted.get(6), OperationType.THREAD, 900L, 0L);
   }
 
   @Test
@@ -988,15 +1093,12 @@ class ThreadInfoTest {
     ThreadInfo.restoreTaskParentThreadContext();
     ThreadInfo.restoreTaskParentThreadContext();
 
-    assertEquals(4, emitted.size());
-    assertEquals(OperationType.THREAD, emitted.get(0).operation);
-    assertEquals(101L, emitted.get(0).value);
-    assertEquals(OperationType.TASK_LINK, emitted.get(1).operation);
-    assertEquals(22L, emitted.get(1).token);
-    assertEquals(OperationType.THREAD, emitted.get(2).operation);
-    assertEquals(101L, emitted.get(2).value);
-    assertEquals(OperationType.THREAD, emitted.get(3).operation);
-    assertEquals(900L, emitted.get(3).value);
+    assertEquals(5, emitted.size());
+    assertOperation(emitted.get(0), OperationType.THREAD, 101L, 0L);
+    assertOperation(emitted.get(1), OperationType.TASK_LINK, 202L, 22L);
+    assertOperation(emitted.get(2), OperationType.TASK_CANCEL, 22L, 0L);
+    assertOperation(emitted.get(3), OperationType.THREAD, 101L, 0L);
+    assertOperation(emitted.get(4), OperationType.THREAD, 900L, 0L);
     assertEquals(
         0, emitted.stream().filter(op -> op.operation == OperationType.TASK_RELAY_CAPTURE).count());
   }
@@ -1200,14 +1302,16 @@ class ThreadInfoTest {
         ThreadInfo.restoreTaskParentThreadContext();
       }
       assertFalse(ThreadInfo.hasTaskRelayState());
-      assertEquals(6, emitted.size());
+      assertEquals(8, emitted.size());
       assertOperation(emitted.get(0), OperationType.TASK_CAPTURE, first.getHandoffToken(), 0L);
       assertOperation(emitted.get(1), OperationType.TASK_LINK, 101L, first.getHandoffToken());
+      assertOperation(emitted.get(2), OperationType.TASK_CANCEL, first.getHandoffToken(), 0L);
       assertOperation(
-          emitted.get(2), OperationType.TASK_RELAY_CAPTURE, second.getHandoffToken(), 0L);
-      assertOperation(emitted.get(3), OperationType.THREAD, 201L, 0L);
-      assertOperation(emitted.get(4), OperationType.TASK_LINK, 201L, second.getHandoffToken());
-      assertOperation(emitted.get(5), OperationType.THREAD, 301L, 0L);
+          emitted.get(3), OperationType.TASK_RELAY_CAPTURE, second.getHandoffToken(), 0L);
+      assertOperation(emitted.get(4), OperationType.THREAD, 201L, 0L);
+      assertOperation(emitted.get(5), OperationType.TASK_LINK, 201L, second.getHandoffToken());
+      assertOperation(emitted.get(6), OperationType.TASK_CANCEL, second.getHandoffToken(), 0L);
+      assertOperation(emitted.get(7), OperationType.THREAD, 301L, 0L);
     } finally {
       SSLStorage.untrackTask(firstTask);
       SSLStorage.untrackTask(secondTask);
@@ -1632,14 +1736,13 @@ class ThreadInfoTest {
 
       assertFalse(ThreadInfo.hasTaskRelayState());
       assertEquals(99, ThreadInfo.takeRemoteParentSocketFileDescriptor());
-      assertEquals(3, emitted.size());
+      assertEquals(4, emitted.size());
       assertEquals(OperationType.TASK_CAPTURE, emitted.get(0).operation);
       assertEquals(OperationType.TASK_LINK, emitted.get(1).operation);
       assertEquals(101L, emitted.get(1).value);
       assertEquals(handoffToken, emitted.get(1).token);
-      assertEquals(OperationType.THREAD, emitted.get(2).operation);
-      assertEquals(900L, emitted.get(2).value);
-      assertEquals(0L, emitted.get(2).token);
+      assertOperation(emitted.get(2), OperationType.TASK_CANCEL, handoffToken, 0L);
+      assertOperation(emitted.get(3), OperationType.THREAD, 900L, 0L);
     } finally {
       SSLStorage.untrackTask(task);
       exact.close();
@@ -1653,6 +1756,81 @@ class ThreadInfoTest {
               "setThreadIdProviderForTest", java.util.function.LongSupplier.class);
       setter.setAccessible(true);
       setter.invoke(null, provider);
+    } catch (ReflectiveOperationException failure) {
+      throw new AssertionError(failure);
+    }
+  }
+
+  private static void assertProcessRegistrationWaitsForTaskPublication(
+      OperationType blockedOperation, Runnable publication, List<OperationType> expected)
+      throws Exception {
+    ThreadInfo.setProcessIncarnation(707L);
+    CountDownLatch publicationEntered = new CountDownLatch(1);
+    CountDownLatch releasePublication = new CountDownLatch(1);
+    AtomicInteger failures = new AtomicInteger();
+    List<OperationType> emitted = Collections.synchronizedList(new ArrayList<>());
+    ThreadInfo.setTaskContextEmitterForTest(
+        (operation, value, token) -> {
+          emitted.add(operation);
+          if (operation == blockedOperation) {
+            publicationEntered.countDown();
+            try {
+              if (!releasePublication.await(5, TimeUnit.SECONDS)) {
+                throw new AssertionError("timed out waiting to release " + blockedOperation);
+              }
+            } catch (InterruptedException interrupted) {
+              Thread.currentThread().interrupt();
+              throw new AssertionError(interrupted);
+            }
+          }
+        });
+
+    Thread publisher =
+        new Thread(
+            () -> {
+              try {
+                publication.run();
+              } catch (Throwable failure) {
+                failures.incrementAndGet();
+              }
+            });
+    Thread registrar =
+        new Thread(
+            () -> {
+              try {
+                assertTrue(ThreadInfo.registerProcessIncarnation());
+              } catch (Throwable failure) {
+                failures.incrementAndGet();
+              }
+            });
+
+    try {
+      publisher.start();
+      assertTrue(publicationEntered.await(5, TimeUnit.SECONDS));
+      registrar.start();
+      long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+      while (registrar.getState() != Thread.State.BLOCKED && System.nanoTime() < deadline) {
+        Thread.sleep(1L);
+      }
+      assertEquals(Thread.State.BLOCKED, registrar.getState());
+      assertEquals(java.util.Arrays.asList(blockedOperation), emitted);
+    } finally {
+      releasePublication.countDown();
+      publisher.join(TimeUnit.SECONDS.toMillis(5));
+      registrar.join(TimeUnit.SECONDS.toMillis(5));
+    }
+
+    assertFalse(publisher.isAlive());
+    assertFalse(registrar.isAlive());
+    assertEquals(0, failures.get());
+    assertEquals(expected, emitted);
+  }
+
+  private static long captureRelayTokenForTest() {
+    try {
+      Method method = ThreadInfo.class.getDeclaredMethod("captureRelayToken");
+      method.setAccessible(true);
+      return ((Long) method.invoke(null)).longValue();
     } catch (ReflectiveOperationException failure) {
       throw new AssertionError(failure);
     }

@@ -32,10 +32,39 @@ enum {
 
 static const char k_newline = '\n';
 
+// Userspace publishes this exact process-lifetime identity before arming a
+// host TGID. Keep this ABI fixed-width: bpf2go mirrors it in Go and the BPF
+// program validates every field before touching the application's log buffer.
+typedef struct log_enricher_generation {
+    u64 process_instance_id;
+    u64 process_start_ticks;
+    u64 executable_device;
+    u64 executable_inode;
+    u64 lifecycle_epoch;
+} log_enricher_generation_t;
+
+_Static_assert(sizeof(log_enricher_generation_t) == 40,
+               "log enricher generation ABI size mismatch");
+_Static_assert(__builtin_offsetof(log_enricher_generation_t, process_instance_id) == 0,
+               "log enricher generation process-instance offset mismatch");
+_Static_assert(__builtin_offsetof(log_enricher_generation_t, process_start_ticks) == 8,
+               "log enricher generation process-start offset mismatch");
+_Static_assert(__builtin_offsetof(log_enricher_generation_t, executable_device) == 16,
+               "log enricher generation executable-device offset mismatch");
+_Static_assert(__builtin_offsetof(log_enricher_generation_t, executable_inode) == 24,
+               "log enricher generation executable-inode offset mismatch");
+_Static_assert(__builtin_offsetof(log_enricher_generation_t, lifecycle_epoch) == 32,
+               "log enricher generation lifecycle-epoch offset mismatch");
+
 typedef struct log_event {
     u32 tgid;
     u32 len;
+    u64 process_instance_id;
+    u64 lifecycle_epoch;
+    u64 target_device;
+    u64 target_inode;
     u32 fd;
+    u32 reserved;
     obi_ctx_info_t ctx;
     u8 file_path[k_pts_file_path_len_max];
     u8 log[];

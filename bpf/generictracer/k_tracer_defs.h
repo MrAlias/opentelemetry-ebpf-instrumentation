@@ -123,17 +123,16 @@ static __always_inline void handle_ssl_prewrite_with_connection(void *ctx,
     bpf_tail_call(ctx, &jump_table, k_tail_handle_buf_with_args);
 }
 
-static __always_inline void
-handle_java_buf_with_connection(void *ctx,
-                                pid_connection_info_t *pid_conn,
-                                void *u_buf,
-                                int bytes_len,
-                                u8 direction,
-                                u16 orig_dport,
-                                u32 connection_netns,
-                                u64 connection_netns_cookie,
-                                u64 socket_cookie,
-                                const java_remote_parent_receive_context_t *receive_context) {
+static __always_inline u8
+prepare_java_buf_with_connection(pid_connection_info_t *pid_conn,
+                                 void *u_buf,
+                                 int bytes_len,
+                                 u8 direction,
+                                 u16 orig_dport,
+                                 u32 connection_netns,
+                                 u64 connection_netns_cookie,
+                                 u64 socket_cookie,
+                                 const java_remote_parent_receive_context_t *receive_context) {
     call_protocol_args_t *args = make_protocol_args(pid_conn,
                                                     k_lw_thread_none,
                                                     k_protocol_selector_all,
@@ -143,7 +142,7 @@ handle_java_buf_with_connection(void *ctx,
                                                     direction,
                                                     orig_dport);
     if (!args) {
-        return;
+        return 0;
     }
 
     args->java = 1;
@@ -153,7 +152,7 @@ handle_java_buf_with_connection(void *ctx,
     if (receive_context) {
         args->java_remote_parent_receive = *receive_context;
     }
-    bpf_tail_call(ctx, &jump_table, k_tail_handle_buf_with_args);
+    return 1;
 }
 
 static __always_inline void handle_light_weight_thread_buf(void *ctx,

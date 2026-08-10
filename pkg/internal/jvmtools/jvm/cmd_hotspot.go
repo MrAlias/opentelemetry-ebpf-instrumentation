@@ -15,6 +15,8 @@ import (
 	"os"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // Check if remote JVM has already opened socket for Dynamic Attach
@@ -70,7 +72,12 @@ func sleepContext(ctx context.Context, duration time.Duration) error {
 
 // Force remote JVM to start Attach listener.
 // HotSpot will start Attach listener in response to SIGQUIT if it sees .attach_pid file
-func startAttachMechanism(ctx context.Context, pid, nspid, attachPid int, tmpPath string) error {
+func startAttachMechanism(
+	ctx context.Context,
+	pid, nspid, attachPid int,
+	tmpPath string,
+	target ...*JAttacher,
+) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -81,8 +88,14 @@ func startAttachMechanism(ctx context.Context, pid, nspid, attachPid int, tmpPat
 	}
 	defer os.Remove(path)
 
-	if err := syscall.Kill(pid, syscall.SIGQUIT); err != nil {
-		return err
+	var signalErr error
+	if len(target) != 0 && target[0] != nil {
+		signalErr = target[0].signalTarget(pid, syscall.SIGQUIT)
+	} else {
+		signalErr = syscall.Kill(pid, syscall.SIGQUIT)
+	}
+	if signalErr != nil {
+		return signalErr
 	}
 
 	ts := 20 * time.Millisecond
@@ -98,6 +111,36 @@ func startAttachMechanism(ctx context.Context, pid, nspid, attachPid int, tmpPat
 
 	return errors.New("could not start the attach mechanism")
 }
+
+func validateHotspotPeer(conn net.Conn, expectedPID int) error {
+	syscallConn, ok := conn.(syscall.Conn)
+	if !ok {
+		return errors.New("JVM socket does not expose peer credentials")
+	}
+	raw, err := syscallConn.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var credentialErr error
+	if err := raw.Control(func(fd uintptr) {
+		credentials, err := unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
+		if err != nil {
+			credentialErr = err
+			return
+		}
+		if int(credentials.Pid) != expectedPID {
+			credentialErr = fmt.Errorf(
+				"JVM socket peer PID %d does not match exact target %d",
+				credentials.Pid, expectedPID,
+			)
+		}
+	}); err != nil {
+		return err
+	}
+	return credentialErr
+}
+
+var validateHotspotSocketPeer = validateHotspotPeer
 
 // Connect to UNIX domain socket created by JVM for Dynamic Attach
 func connectSocket(ctx context.Context, pid int, tmpPath string) (net.Conn, error) {
@@ -134,9 +177,16 @@ func writeHotspotCommand(ctx context.Context, conn net.Conn, args []string) erro
 	return err
 }
 
-func jattachHotspot(ctx context.Context, pid, nspid, attachPid int, args []string, tmpPath string, logger *slog.Logger) (io.ReadCloser, error) {
+func jattachHotspot(
+	ctx context.Context,
+	pid, nspid, attachPid int,
+	args []string,
+	tmpPath string,
+	logger *slog.Logger,
+	target *JAttacher,
+) (io.ReadCloser, error) {
 	if !checkSocket(nspid, tmpPath) {
-		if err := startAttachMechanism(ctx, pid, nspid, attachPid, tmpPath); err != nil {
+		if err := startAttachMechanism(ctx, pid, nspid, attachPid, tmpPath, target); err != nil {
 			return nil, err
 		}
 	}
@@ -144,6 +194,20 @@ func jattachHotspot(ctx context.Context, pid, nspid, attachPid int, args []strin
 	conn, err := connectSocket(ctx, nspid, tmpPath)
 	if err != nil {
 		return nil, fmt.Errorf("could not connect to JVM socket: %w", err)
+	}
+	if target != nil {
+		if err := target.ValidateTarget(); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		if err := validateHotspotSocketPeer(conn, target.targetPID); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("validating exact JVM socket peer: %w", err)
+		}
+		if err := target.ValidateTarget(); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
 	}
 
 	logger.Debug("connected to the JVM")

@@ -1133,7 +1133,7 @@ func (r *javaRemoteParentRecordingReporter) JavaRemoteParent(
 	})
 }
 
-func TestJavaRemoteParentProcessExitCleanupIsRequired(t *testing.T) {
+func TestJavaRemoteParentProcessLifecycleCleanupIsRequired(t *testing.T) {
 	cfg := obi.DefaultConfig
 	require.NoError(t, cfg.EBPF.ContextPropagation.UnmarshalText([]byte("tcp")))
 	cfg.Java.RemoteParent.Transport = obi.JavaRemoteParentUnix
@@ -1143,14 +1143,28 @@ func TestJavaRemoteParentProcessExitCleanupIsRequired(t *testing.T) {
 	_, err := tracer.LoadSpecs()
 	require.NoError(t, err)
 	tracepoints := tracer.Tracepoints()
+	require.Contains(t, tracepoints, "sched/sched_process_exec")
+	assert.True(t, tracepoints["sched/sched_process_exec"].Required)
 	require.Contains(t, tracepoints, "sched/sched_process_exit")
 	assert.True(t, tracepoints["sched/sched_process_exit"].Required)
+
+	spec, err := LoadBpf()
+	require.NoError(t, err)
+	for name, section := range map[string]string{
+		"obi_java_remote_parent_process_exec": "tracepoint/sched/sched_process_exec",
+		"obi_java_remote_parent_process_exit": "tracepoint/sched/sched_process_exit",
+	} {
+		program := spec.Programs[name]
+		require.NotNil(t, program, name)
+		assert.Equal(t, section, program.SectionName, name)
+	}
 
 	disabledConfig := obi.DefaultConfig
 	require.NoError(t, disabledConfig.EBPF.ContextPropagation.UnmarshalText([]byte("tcp")))
 	disabled := New(&disabledConfig, nil)
 	_, err = disabled.LoadSpecs()
 	require.NoError(t, err)
+	assert.NotContains(t, disabled.Tracepoints(), "sched/sched_process_exec")
 	assert.NotContains(t, disabled.Tracepoints(), "sched/sched_process_exit")
 }
 

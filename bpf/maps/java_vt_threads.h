@@ -54,9 +54,10 @@ struct {
     __uint(pinning, OBI_PIN_INTERNAL);
 } java_process_incarnations SEC(".maps");
 
-// Last-thread exit records are consumed by the userspace sweeper. Including
-// the JVM incarnation in the key prevents a rapidly reused PID from replacing
-// or being mistaken for the process that actually exited.
+// Last-thread exit and admitted A->B rotation records are consumed by the
+// userspace sweeper. Including the JVM incarnation in the key prevents a
+// rapidly reused PID from replacing or being mistaken for the capability that
+// actually retired.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, java_retired_process_key_t);
@@ -141,17 +142,77 @@ static __always_inline u64 java_current_process_incarnation() {
     return java_process_incarnation_for(&task);
 }
 
-static __always_inline u8 java_register_process_incarnation(u64 incarnation) {
-    if (!incarnation) {
+static __always_inline u8 java_publish_process_retirement(const pid_key_t *process,
+                                                          u64 process_incarnation,
+                                                          u64 retirement_evidence) {
+    if (!process || process->pid == 0 || process->tid != process->pid || !process_incarnation ||
+        !retirement_evidence) {
         return 0;
     }
+    const java_retired_process_key_t retired = {
+        .process = *process,
+        .process_incarnation = process_incarnation,
+    };
+    if (bpf_map_update_elem(&java_retired_processes, &retired, &retirement_evidence, BPF_NOEXIST) ==
+        0) {
+        return 1;
+    }
+    const u64 *existing = bpf_map_lookup_elem(&java_retired_processes, &retired);
+    return existing && *existing;
+}
+
+static __always_inline u8 java_process_retirement_pending_for(const pid_key_t *task,
+                                                              u64 process_incarnation) {
+    if (!task || !process_incarnation) {
+        return 1;
+    }
+    const java_retired_process_key_t retired = {
+        .process = java_process_key(task),
+        .process_incarnation = process_incarnation,
+    };
+    // Presence, including a malformed zero value, closes this capability.
+    // Cleanup alone removes R after exact carrier/replay finalization; callers
+    // must use a fresh capability rather than reopening the retired epoch.
+    return bpf_map_lookup_elem(&java_retired_processes, &retired) != NULL;
+}
+
+static __always_inline u8 java_register_process_incarnation_for(const pid_key_t *task,
+                                                                u64 incarnation) {
+    if (!task || !incarnation) {
+        return 0;
+    }
+    if (java_process_capability_for(task) != incarnation) {
+        return 0;
+    }
+    if (java_remote_parent_enabled && java_process_retirement_pending_for(task, incarnation)) {
+        return 0;
+    }
+    const pid_key_t process = java_process_key(task);
+    const u64 previous_incarnation = java_process_incarnation_for(task);
+    if (java_remote_parent_enabled && previous_incarnation && previous_incarnation != incarnation) {
+        // PROCESS_REGISTER holds P(process). Every alias creator does too, so
+        // publishing R(A) here is equivalent to last-thread writer death: an
+        // admitted A publisher finishes first, while a delayed A publisher
+        // observes B after P opens and performs no persistent mutation.
+        // The value is only nonzero exact-deletion evidence. Last-thread exit
+        // stores its observation time; rotation can reuse the unpredictable
+        // predecessor capability because the key already prevents ABA reuse.
+        const u64 retirement_evidence = previous_incarnation;
+        if (!java_publish_process_retirement(&process, previous_incarnation, retirement_evidence)) {
+            return 0;
+        }
+    }
+    if (bpf_map_update_elem(&java_process_incarnations, &process, &incarnation, BPF_ANY) != 0) {
+        return 0;
+    }
+
+    return 1;
+}
+
+static __always_inline u8 java_register_process_incarnation(u64 incarnation) {
     pid_key_t task = {0};
     task_tid(&task);
-    if (!incarnation || java_process_capability_for(&task) != incarnation) {
-        return 0;
-    }
-    const pid_key_t process = java_process_key(&task);
-    return bpf_map_update_elem(&java_process_incarnations, &process, &incarnation, BPF_ANY) == 0;
+    return java_register_process_incarnation_for(&task, incarnation);
 }
 
 static __always_inline pid_key_t java_vt_synthetic_owner(const pid_key_t *carrier, u64 vt_id) {

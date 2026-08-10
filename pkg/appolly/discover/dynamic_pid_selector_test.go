@@ -479,7 +479,7 @@ func TestDynamicPIDSelector_SetPID_UpdatesFileInfo(t *testing.T) {
 			DynamicSelectorPID: 42,
 		},
 	})
-	d.RegisterFileInfo(42, fi)
+	d.RegisterFileInfo(42, fi, fi)
 
 	entry := selection.DynamicPIDEntry{
 		PID:         42,
@@ -495,12 +495,128 @@ func TestDynamicPIDSelector_SetPID_UpdatesFileInfo(t *testing.T) {
 	assert.Equal(t, "payments", snap.Metadata["team"])
 }
 
+func TestDynamicPIDSelector_RegisterReconcilesSetPIDCommittedAfterDiscoverySnapshot(t *testing.T) {
+	const (
+		ownerPID = app.PID(42)
+		childPID = app.PID(43)
+	)
+	d := NewDynamicPIDSelector()
+	d.AddPID(uint32(ownerPID), selection.DynamicPIDOptions{
+		ServiceName:      "discovery-snapshot",
+		ServiceNamespace: "old-namespace",
+		ResourceAttributes: map[string]string{
+			"generation": "old",
+		},
+	})
+
+	// Simulate a FileInfo built from the selector snapshot above. SetPID wins
+	// the race before the attacher registers this exact process lifetime.
+	staleService := exec.New(exec.Init{Pid: childPID, Service: svc.Attrs{
+		UID: svc.UID{
+			Name:      "discovery-snapshot",
+			Namespace: "old-namespace",
+		},
+		Metadata: map[attr.Name]string{
+			"generation": "old",
+			"preserved":  "yes",
+		},
+		DynamicSelectorPID: ownerPID,
+	}})
+	lifetime := exec.New(exec.Init{Pid: childPID})
+	require.True(t, d.SetPID(selection.DynamicPIDEntry{
+		PID:              ownerPID,
+		ServiceName:      "committed-service",
+		ServiceNamespace: "committed-namespace",
+		ResourceAttributes: map[string]string{
+			"generation": "new",
+			"team":       "platform",
+		},
+	}))
+
+	d.RegisterFileInfo(childPID, staleService, lifetime)
+
+	snap := staleService.ServiceAttrs()
+	assert.Equal(t, "committed-service", snap.UID.Name)
+	assert.Equal(t, "committed-namespace", snap.UID.Namespace)
+	assert.Equal(t, "new", snap.Metadata["generation"])
+	assert.Equal(t, "platform", snap.Metadata["team"])
+	assert.Equal(t, "yes", snap.Metadata["preserved"])
+	assert.Same(t, staleService, d.fileInfoByPID[childPID])
+	assert.Same(t, lifetime, d.lifetimeOwnerByPID[childPID])
+}
+
+func TestDynamicPIDSelector_SetPIDRegisterOverlapCannotMissCommittedAttributes(t *testing.T) {
+	const (
+		ownerPID = app.PID(42)
+		childPID = app.PID(43)
+	)
+	d := NewDynamicPIDSelector()
+	d.AddPID(uint32(ownerPID), selection.DynamicPIDOptions{ServiceName: "old"})
+
+	existing := exec.New(exec.Init{Pid: ownerPID, Service: svc.Attrs{
+		UID:                svc.UID{Name: "old"},
+		DynamicSelectorPID: ownerPID,
+	}})
+	d.RegisterFileInfo(ownerPID, existing, existing)
+
+	callbackStarted := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	d.SetOnFileInfoUpdated(func(fi *exec.FileInfo) {
+		if fi == existing {
+			close(callbackStarted)
+			<-releaseCallback
+		}
+	})
+	setDone := make(chan bool, 1)
+	go func() {
+		setDone <- d.SetPID(selection.DynamicPIDEntry{
+			PID:         ownerPID,
+			ServiceName: "committed",
+			ResourceAttributes: map[string]string{
+				"generation": "new",
+			},
+		})
+	}()
+
+	select {
+	case <-callbackStarted:
+	case <-time.After(time.Second):
+		t.Fatal("SetPID did not reach its update callback")
+	}
+
+	// SetPID has committed its selector state and completed the FileInfo set it
+	// observed. Register a stale discovery result while its callback is paused;
+	// registration must reconcile the committed state itself.
+	late := exec.New(exec.Init{Pid: childPID, Service: svc.Attrs{
+		UID:                svc.UID{Name: "old"},
+		DynamicSelectorPID: ownerPID,
+	}})
+	lifetime := exec.New(exec.Init{Pid: childPID})
+	registered := make(chan struct{})
+	go func() {
+		d.RegisterFileInfo(childPID, late, lifetime)
+		close(registered)
+	}()
+	select {
+	case <-registered:
+	case <-time.After(time.Second):
+		close(releaseCallback)
+		t.Fatal("RegisterFileInfo blocked behind an update callback")
+	}
+	close(releaseCallback)
+	assert.True(t, <-setDone)
+
+	snap := late.ServiceAttrs()
+	assert.Equal(t, "committed", snap.UID.Name)
+	assert.Equal(t, "new", snap.Metadata["generation"])
+}
+
 func TestDynamicPIDSelector_SetPID_NotifiesFileInfoUpdate(t *testing.T) {
 	d := NewDynamicPIDSelector()
 	d.AddPIDs(42)
 
 	fi := exec.New(exec.Init{Pid: 42, Service: svc.Attrs{DynamicSelectorPID: 42}})
-	d.RegisterFileInfo(42, fi)
+	d.RegisterFileInfo(42, fi, fi)
 
 	var notified *exec.FileInfo
 	d.SetOnFileInfoUpdated(func(updated *exec.FileInfo) { notified = updated })
@@ -510,6 +626,151 @@ func TestDynamicPIDSelector_SetPID_NotifiesFileInfoUpdate(t *testing.T) {
 		ServiceName: "metrics-svc",
 	}))
 	assert.Same(t, fi, notified)
+}
+
+func TestDynamicPIDSelector_SetPID_FansOutToOwnerAndDistinctChildren(t *testing.T) {
+	const (
+		ownerPID = app.PID(42)
+		childOne = app.PID(43)
+		childTwo = app.PID(44)
+	)
+	d := NewDynamicPIDSelector()
+	d.AddPIDs(uint32(ownerPID))
+
+	owner := exec.New(exec.Init{Pid: ownerPID, Service: svc.Attrs{
+		UID:                svc.UID{Name: "owner"},
+		DynamicSelectorPID: ownerPID,
+	}})
+	firstChild := exec.New(exec.Init{Pid: childOne, Service: svc.Attrs{
+		UID:                svc.UID{Name: "first-child"},
+		DynamicSelectorPID: ownerPID,
+	}})
+	secondChild := exec.New(exec.Init{Pid: childTwo, Service: svc.Attrs{
+		UID:                svc.UID{Name: "second-child"},
+		Metadata:           map[attr.Name]string{"existing": "preserved"},
+		DynamicSelectorPID: ownerPID,
+	}})
+	d.RegisterFileInfo(ownerPID, owner, owner)
+	d.RegisterFileInfo(childOne, firstChild, firstChild)
+	d.RegisterFileInfo(childTwo, secondChild, secondChild)
+
+	notified := map[*exec.FileInfo]int{}
+	d.SetOnFileInfoUpdated(func(fi *exec.FileInfo) { notified[fi]++ })
+	require.True(t, d.SetPID(selection.DynamicPIDEntry{
+		PID:              ownerPID,
+		ServiceName:      "updated-service",
+		ServiceNamespace: "updated-namespace",
+		ResourceAttributes: map[string]string{
+			"team": "platform",
+		},
+	}))
+
+	for _, fi := range []*exec.FileInfo{owner, firstChild, secondChild} {
+		snap := fi.ServiceAttrs()
+		assert.Equal(t, "updated-service", snap.UID.Name)
+		assert.Equal(t, "updated-namespace", snap.UID.Namespace)
+		assert.Equal(t, "platform", snap.Metadata["team"])
+		assert.Equal(t, 1, notified[fi], "each distinct FileInfo must be notified exactly once")
+		assert.Equal(t, 1, d.fileInfosByOwner[ownerPID][fi])
+	}
+	assert.Equal(t, "preserved", secondChild.ServiceAttrs().Metadata["existing"])
+	assert.Len(t, notified, 3)
+}
+
+func TestDynamicPIDSelector_SharedServiceFileInfoReferencesAreIdempotentAndKeyScoped(t *testing.T) {
+	const (
+		ownerPID = app.PID(42)
+		childOne = app.PID(43)
+		childTwo = app.PID(44)
+	)
+	d := NewDynamicPIDSelector()
+	d.AddPIDs(uint32(ownerPID))
+
+	shared := exec.New(exec.Init{Pid: ownerPID, Service: svc.Attrs{
+		UID:                svc.UID{Name: "shared"},
+		DynamicSelectorPID: ownerPID,
+	}})
+	firstChildLifetime := exec.New(exec.Init{Pid: childOne})
+	secondChildLifetime := exec.New(exec.Init{Pid: childTwo})
+	d.RegisterFileInfo(ownerPID, shared, shared)
+	d.RegisterFileInfo(ownerPID, shared, shared)
+	d.RegisterFileInfo(childOne, shared, firstChildLifetime)
+	d.RegisterFileInfo(childOne, shared, firstChildLifetime)
+	d.RegisterFileInfo(childTwo, shared, secondChildLifetime)
+
+	assert.Equal(t, 3, d.fileInfosByOwner[ownerPID][shared],
+		"duplicate registrations for the same PID, service, and lifetime must be idempotent")
+
+	notified := 0
+	d.SetOnFileInfoUpdated(func(fi *exec.FileInfo) {
+		assert.Same(t, shared, fi)
+		notified++
+	})
+	require.True(t, d.SetPID(selection.DynamicPIDEntry{PID: ownerPID, ServiceName: "before-exit"}))
+	assert.Equal(t, 1, notified, "one shared FileInfo must receive one callback")
+
+	d.UnregisterFileInfo(childOne, firstChildLifetime)
+	d.UnregisterFileInfo(childOne, firstChildLifetime)
+	assert.NotContains(t, d.fileInfoByPID, childOne)
+	assert.NotContains(t, d.lifetimeOwnerByPID, childOne)
+	assert.Same(t, shared, d.fileInfoByPID[ownerPID])
+	assert.Same(t, shared, d.fileInfoByPID[childTwo])
+	assert.Same(t, secondChildLifetime, d.lifetimeOwnerByPID[childTwo])
+	assert.Equal(t, 2, d.fileInfosByOwner[ownerPID][shared],
+		"retiring one child must preserve the parent and sibling references")
+
+	require.True(t, d.SetPID(selection.DynamicPIDEntry{PID: ownerPID, ServiceName: "after-exit"}))
+	assert.Equal(t, "after-exit", shared.ServiceAttrs().UID.Name)
+	assert.Equal(t, 2, notified)
+}
+
+func TestDynamicPIDSelector_LifetimeReplacementRejectsDelayedUnregister(t *testing.T) {
+	const (
+		ownerPID = app.PID(42)
+		childPID = app.PID(43)
+	)
+	d := NewDynamicPIDSelector()
+	d.AddPIDs(uint32(ownerPID))
+
+	sharedService := exec.New(exec.Init{Pid: ownerPID, Service: svc.Attrs{
+		UID:                svc.UID{Name: "shared-service"},
+		DynamicSelectorPID: ownerPID,
+	}})
+	oldLifetime := exec.New(exec.Init{Pid: childPID})
+	replacementLifetime := exec.New(exec.Init{Pid: childPID})
+	d.RegisterFileInfo(ownerPID, sharedService, sharedService)
+	d.RegisterFileInfo(childPID, sharedService, oldLifetime)
+	d.RegisterFileInfo(childPID, sharedService, replacementLifetime)
+	d.RegisterFileInfo(childPID, sharedService, replacementLifetime)
+
+	assert.Same(t, sharedService, d.fileInfoByPID[childPID])
+	assert.Same(t, replacementLifetime, d.lifetimeOwnerByPID[childPID])
+	assert.Equal(t, 2, d.fileInfosByOwner[ownerPID][sharedService],
+		"replacing only the lifetime token must not duplicate the shared service reference")
+
+	d.UnregisterFileInfo(childPID, oldLifetime)
+	assert.Same(t, sharedService, d.fileInfoByPID[childPID],
+		"a delayed old-lifetime retirement must preserve its replacement")
+	assert.Same(t, replacementLifetime, d.lifetimeOwnerByPID[childPID])
+	assert.Equal(t, 2, d.fileInfosByOwner[ownerPID][sharedService])
+
+	notified := 0
+	d.SetOnFileInfoUpdated(func(fi *exec.FileInfo) {
+		assert.Same(t, sharedService, fi)
+		notified++
+	})
+	require.True(t, d.SetPID(selection.DynamicPIDEntry{
+		PID:         ownerPID,
+		ServiceName: "replacement-live",
+		ResourceAttributes: map[string]string{
+			"generation": "new",
+		},
+	}))
+
+	snap := sharedService.ServiceAttrs()
+	assert.Equal(t, "replacement-live", snap.UID.Name)
+	assert.Equal(t, "new", snap.Metadata["generation"])
+	assert.Equal(t, 1, notified, "one shared service FileInfo must receive one callback")
 }
 
 func TestDynamicPIDSelector_SetPID_NotifiesAttrsUpdated(t *testing.T) {

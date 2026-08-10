@@ -20,19 +20,24 @@ static long test_map_delete(void *map, const void *key);
 
 #include <common/tp_info.h>
 #include <common/trace_key.h>
+#include <generictracer/java_ioctl.h>
 #include <pid/types/pid_key.h>
 
 static pid_key_t test_process_key(const pid_key_t *task);
 static u32 test_tid_from_pid_tgid(u64 id);
 static u64 test_process_incarnation(const pid_key_t *task);
 static u8 test_register_process_incarnation(u64 incarnation);
+static u8 test_process_retirement_pending(const pid_key_t *task, u64 incarnation);
 static u8 test_pid_key_equal(const pid_key_t *left, const pid_key_t *right);
 static u8 test_would_cycle(const pid_key_t *child, const pid_key_t *parent);
-static u8 test_mark_ambiguous(const pid_key_t *owner);
-static u8 test_guard_owner_reuse(const pid_key_t *owner);
-static void test_fail_handoff(const pid_key_t *child);
+static void test_fail_handoff(const pid_key_t *child, u64 process_incarnation);
 static void test_remote_parent_cleanup(const pid_key_t *owner);
 static void test_unlink_task(const pid_key_t *owner);
+static void test_unlink_task_for_capability(const pid_key_t *owner, u64 process_incarnation);
+static u8
+test_link_handoff_for_capability(const pid_key_t *owner, u64 token, u64 process_incarnation);
+static void
+test_cancel_handoff_for_capability(const pid_key_t *owner, u64 token, u64 process_incarnation);
 static tp_info_pid_t *test_find_parent(trace_key_t *key);
 static u64 test_extra_runtime_id(u64 id);
 static long test_context_set(u64 id, const tp_info_t *info);
@@ -43,13 +48,15 @@ static long test_probe_read_user(void *destination, u32 size, const void *source
 #define JAVA_THREAD_MAPPING_TID_FROM_PID_TGID test_tid_from_pid_tgid
 #define JAVA_THREAD_MAPPING_PROCESS_INCARNATION test_process_incarnation
 #define JAVA_THREAD_MAPPING_REGISTER_PROCESS_INCARNATION test_register_process_incarnation
+#define JAVA_THREAD_MAPPING_PROCESS_RETIREMENT_PENDING test_process_retirement_pending
 #define JAVA_THREAD_MAPPING_PID_KEY_EQUAL test_pid_key_equal
 #define JAVA_THREAD_MAPPING_WOULD_CYCLE test_would_cycle
-#define JAVA_THREAD_MAPPING_MARK_AMBIGUOUS test_mark_ambiguous
-#define JAVA_THREAD_MAPPING_GUARD_OWNER_REUSE test_guard_owner_reuse
 #define JAVA_THREAD_MAPPING_FAIL_HANDOFF test_fail_handoff
 #define JAVA_THREAD_MAPPING_REMOTE_PARENT_CLEANUP test_remote_parent_cleanup
 #define JAVA_THREAD_MAPPING_UNLINK_TASK test_unlink_task
+#define JAVA_THREAD_MAPPING_UNLINK_TASK_FOR_CAPABILITY test_unlink_task_for_capability
+#define JAVA_THREAD_MAPPING_LINK_HANDOFF_FOR_CAPABILITY test_link_handoff_for_capability
+#define JAVA_THREAD_MAPPING_CANCEL_HANDOFF_FOR_CAPABILITY test_cancel_handoff_for_capability
 #define JAVA_THREAD_MAPPING_FIND_PARENT test_find_parent
 #define JAVA_THREAD_MAPPING_EXTRA_RUNTIME_ID test_extra_runtime_id
 #define JAVA_THREAD_MAPPING_CONTEXT_SET test_context_set
@@ -64,14 +71,16 @@ static long test_probe_read_user(void *destination, u32 size, const void *source
 #undef JAVA_THREAD_MAPPING_EXTRA_RUNTIME_ID
 #undef JAVA_THREAD_MAPPING_FIND_PARENT
 #undef JAVA_THREAD_MAPPING_FAIL_HANDOFF
+#undef JAVA_THREAD_MAPPING_UNLINK_TASK_FOR_CAPABILITY
 #undef JAVA_THREAD_MAPPING_UNLINK_TASK
+#undef JAVA_THREAD_MAPPING_LINK_HANDOFF_FOR_CAPABILITY
+#undef JAVA_THREAD_MAPPING_CANCEL_HANDOFF_FOR_CAPABILITY
 #undef JAVA_THREAD_MAPPING_REMOTE_PARENT_CLEANUP
-#undef JAVA_THREAD_MAPPING_GUARD_OWNER_REUSE
-#undef JAVA_THREAD_MAPPING_MARK_AMBIGUOUS
 #undef JAVA_THREAD_MAPPING_WOULD_CYCLE
 #undef JAVA_THREAD_MAPPING_PID_KEY_EQUAL
 #undef JAVA_THREAD_MAPPING_PROCESS_INCARNATION
 #undef JAVA_THREAD_MAPPING_REGISTER_PROCESS_INCARNATION
+#undef JAVA_THREAD_MAPPING_PROCESS_RETIREMENT_PENDING
 #undef JAVA_THREAD_MAPPING_TID_FROM_PID_TGID
 #undef JAVA_THREAD_MAPPING_PROCESS_KEY
 #undef bpf_map_delete_elem
@@ -111,7 +120,7 @@ enum event_type {
     k_event_claim_update = 1,
     k_event_cycle_check = 2,
     k_event_task_update = 3,
-    k_event_guard_reuse = 4,
+    k_event_unlink_task = 4,
     k_event_fail_handoff = 5,
     k_event_find_parent = 6,
     k_event_context_set = 7,
@@ -151,6 +160,7 @@ static u8 fail_task_update;
 static u8 fail_context_update;
 static u8 fail_parent_read;
 static u8 fail_process_registration;
+static u8 retirement_pending;
 static u8 replace_claim_after_update;
 static u8 mutate_parent_trace_on_claim_delete;
 static enum injection_mode injection;
@@ -163,21 +173,25 @@ static int task_delete_count;
 static int claim_update_count;
 static int claim_delete_count;
 static int cycle_check_count;
-static int guard_reuse_count;
-static int ambiguous_count;
 static int fail_handoff_count;
 static int process_registration_count;
 static int remote_cleanup_count;
 static int unlink_task_count;
+static int link_handoff_count;
+static int cancel_handoff_count;
 static int find_parent_count;
 static int context_set_count;
 static int context_delete_count;
 static int probe_read_count;
-static pid_key_t last_guard_owner;
-static pid_key_t ambiguous_owners[k_max_claim_entries];
 static pid_key_t last_failed_handoff;
 static pid_key_t cleaned_owners[k_max_claim_entries];
 static pid_key_t last_unlinked_task;
+static pid_key_t last_linked_task;
+static u64 last_remote_parent_capability;
+static u64 last_handoff_token;
+static u64 last_cancelled_token;
+static u8 register_during_link;
+static u8 nested_registration_result;
 static trace_key_t last_trace_key;
 static u64 last_extra_runtime_id_input;
 
@@ -319,8 +333,6 @@ static void reset(void) {
     memset(&parent_trace, 0, sizeof(parent_trace));
     memset(&parent_trace_key, 0, sizeof(parent_trace_key));
     memset(events, 0, sizeof(events));
-    memset(&last_guard_owner, 0, sizeof(last_guard_owner));
-    memset(ambiguous_owners, 0, sizeof(ambiguous_owners));
     memset(&last_failed_handoff, 0, sizeof(last_failed_handoff));
     memset(&last_trace_key, 0, sizeof(last_trace_key));
     current_incarnation = test_incarnation;
@@ -329,6 +341,7 @@ static void reset(void) {
     fail_context_update = 0;
     fail_parent_read = 0;
     fail_process_registration = 0;
+    retirement_pending = 0;
     replace_claim_after_update = 0;
     mutate_parent_trace_on_claim_delete = 0;
     injection = k_inject_none;
@@ -340,19 +353,25 @@ static void reset(void) {
     claim_update_count = 0;
     claim_delete_count = 0;
     cycle_check_count = 0;
-    guard_reuse_count = 0;
-    ambiguous_count = 0;
     fail_handoff_count = 0;
     process_registration_count = 0;
     remote_cleanup_count = 0;
     unlink_task_count = 0;
+    link_handoff_count = 0;
+    cancel_handoff_count = 0;
     find_parent_count = 0;
     context_set_count = 0;
     context_delete_count = 0;
     probe_read_count = 0;
     last_extra_runtime_id_input = 0;
+    last_remote_parent_capability = 0;
+    last_handoff_token = 0;
+    last_cancelled_token = 0;
+    register_during_link = 0;
+    nested_registration_result = 0;
     memset(cleaned_owners, 0, sizeof(cleaned_owners));
     memset(&last_unlinked_task, 0, sizeof(last_unlinked_task));
+    memset(&last_linked_task, 0, sizeof(last_linked_task));
     store_task(sentinel_child, child_d);
     seed_context(sentinel_context_id, 0x7f);
 }
@@ -392,15 +411,6 @@ static void require_sentinel_state(const char *scenario) {
     }
 }
 
-static int saw_ambiguous_owner(const pid_key_t *owner) {
-    for (int i = 0; i < ambiguous_count; i++) {
-        if (same_key(&ambiguous_owners[i], owner)) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
 static int first_event(enum event_type event) {
     for (size_t i = 0; i < event_count; i++) {
         if (events[i] == event) {
@@ -428,12 +438,12 @@ static void test_safe_mapping_commits_before_context(void) {
     require_task(scenario, &child_a, &child_b);
     require_claim_released(scenario);
     require(cycle_check_count == 2, scenario, "mapping was not checked before and after publish");
-    require(guard_reuse_count == 1 && same_key(&last_guard_owner, &child_a),
+    require(unlink_task_count == 1 && same_key(&last_unlinked_task, &child_a),
             scenario,
-            "owner reuse guard did not run after replacing a parent");
-    require(fail_handoff_count == 1 && same_key(&last_failed_handoff, &child_a),
+            "accepted mapping did not retire its exact task carrier");
+    require(fail_handoff_count == 0,
             scenario,
-            "accepted mapping did not fail the strict handoff");
+            "accepted mapping poisoned an unrelated exact generation");
     require(find_parent_count == 1, scenario, "accepted mapping did not resolve its parent");
     require(same_key(&last_trace_key.p_key, &child_b), scenario, "resolver used wrong parent");
     require(last_extra_runtime_id_input == parent_id(&child_b),
@@ -449,10 +459,9 @@ static void test_safe_mapping_commits_before_context(void) {
             "published span id is wrong");
     require(first_event(k_event_claim_update) < first_event(k_event_task_update) &&
                 first_event(k_event_task_update) < first_event(k_event_find_parent) &&
-                first_event(k_event_find_parent) < first_event(k_event_guard_reuse) &&
-                first_event(k_event_guard_reuse) < first_event(k_event_fail_handoff) &&
-                first_event(k_event_fail_handoff) < first_event(k_event_context_set) &&
-                first_event(k_event_context_set) < first_event(k_event_claim_delete),
+                first_event(k_event_find_parent) < first_event(k_event_context_set) &&
+                first_event(k_event_context_set) < first_event(k_event_unlink_task) &&
+                first_event(k_event_unlink_task) < first_event(k_event_claim_delete),
             scenario,
             "publication side effects escaped the claim ordering");
     require_sentinel_state(scenario);
@@ -499,7 +508,9 @@ static void test_nested_reciprocal_contender_becomes_miss(void) {
     require(context_entry(child_context_id) != NULL, scenario, "winner lost exact context");
     require(claim_update_count == 2, scenario, "both publishers did not attempt the claim");
     require(claim_delete_count == 1, scenario, "contender released the winner's claim");
-    require(fail_handoff_count == 2, scenario, "winner or contender missed handoff cleanup");
+    require(fail_handoff_count == 0 && unlink_task_count == 1,
+            scenario,
+            "winner or contender used the wrong handoff cleanup");
     require(cycle_check_count == 2, scenario, "winner did not complete both checks");
     require(claim_count() == 0, scenario, "winner claim leaked");
     require_sentinel_state(scenario);
@@ -523,9 +534,9 @@ static void test_different_process_publishers_do_not_contend(void) {
     require(claim_count() == 0 && claim_update_count == 2 && claim_delete_count == 2,
             scenario,
             "independent process claims were not acquired and released separately");
-    require(fail_handoff_count == 2 && cycle_check_count == 4,
+    require(fail_handoff_count == 0 && unlink_task_count == 2 && cycle_check_count == 4,
             scenario,
-            "independent process publishers missed commit side effects");
+            "independent process publishers used the wrong commit side effects");
     require_sentinel_state(scenario);
 }
 
@@ -544,9 +555,10 @@ static void test_sequential_reciprocal_mapping_is_rejected(void) {
     require(context_entry(contender_context_id) == NULL,
             scenario,
             "rejected reciprocal mapping retained context");
-    require(ambiguous_count == 2 && saw_ambiguous_owner(&child_b) && saw_ambiguous_owner(&child_a),
+    require(fail_handoff_count == 1 && same_key(&last_failed_handoff, &child_b) &&
+                last_remote_parent_capability == test_incarnation,
             scenario,
-            "cyclic endpoints were not both marked ambiguous");
+            "cyclic ancestry did not retire only the logical task carrier");
     require(find_parent_count == 1, scenario, "rejected mapping reached parent resolution");
     require(claim_count() == 0 && claim_update_count == 2 && claim_delete_count == 2,
             scenario,
@@ -570,11 +582,10 @@ static void test_rogue_reverse_edge_is_caught_after_publish(void) {
     require(find_parent_count == 0 && context_set_count == 0,
             scenario,
             "postcheck rejection reached commit-only side effects");
-    require(guard_reuse_count == 0, scenario, "rejected mapping guarded owner reuse");
-    require(ambiguous_count == 2 && saw_ambiguous_owner(&child_a) &&
-                saw_ambiguous_owner(&child_b) && fail_handoff_count == 1,
+    require(fail_handoff_count == 1 && same_key(&last_failed_handoff, &child_a) &&
+                last_remote_parent_capability == test_incarnation,
             scenario,
-            "postcheck rejection missed fail-closed side effects");
+            "postcheck rejection did not isolate logical carrier cleanup");
     require_claim_released(scenario);
     require_sentinel_state(scenario);
 }
@@ -593,7 +604,7 @@ static void test_replacement_after_publish_is_not_deleted(void) {
             scenario,
             "superseded publication retained context");
     require(task_delete_count == 0, scenario, "superseding mapping was deleted");
-    require(find_parent_count == 0 && guard_reuse_count == 0,
+    require(find_parent_count == 0,
             scenario,
             "superseded publication reached commit-only side effects");
     require(fail_handoff_count == 1, scenario, "superseded publication did not fail handoff");
@@ -612,9 +623,7 @@ static void test_update_failure_clears_prior_state(void) {
 
     require_no_task(scenario, &child_a);
     require(context_entry(child_context_id) == NULL, scenario, "stale context survived failure");
-    require(find_parent_count == 0 && guard_reuse_count == 0,
-            scenario,
-            "failed update reached commit-only side effects");
+    require(find_parent_count == 0, scenario, "failed update reached commit-only side effects");
     require(fail_handoff_count == 1, scenario, "failed update did not fail handoff");
     require_claim_released(scenario);
     require_sentinel_state(scenario);
@@ -633,7 +642,8 @@ static void test_incarnation_change_rejects_publication(void) {
             "incarnation injection did not run");
     require_no_task(scenario, &child_a);
     require(context_entry(child_context_id) == NULL, scenario, "old incarnation kept context");
-    require(ambiguous_count == 1 && saw_ambiguous_owner(&child_a) && find_parent_count == 0,
+    require(fail_handoff_count == 1 && same_key(&last_failed_handoff, &child_a) &&
+                last_remote_parent_capability == test_incarnation && find_parent_count == 0,
             scenario,
             "incarnation mismatch did not reject before commit effects");
     require_claim_released(scenario);
@@ -659,9 +669,10 @@ static void test_incarnation_change_during_snapshot_rejects_publication(void) {
     require(find_parent_count == 1 && context_set_count == 0,
             scenario,
             "late incarnation change committed its context");
-    require(ambiguous_count == 1 && saw_ambiguous_owner(&child_a) && fail_handoff_count == 1,
+    require(fail_handoff_count == 1 && same_key(&last_failed_handoff, &child_a) &&
+                last_remote_parent_capability == test_incarnation,
             scenario,
-            "late incarnation change missed fail-closed side effects");
+            "late incarnation change did not isolate logical carrier cleanup");
     require_claim_released(scenario);
     require_sentinel_state(scenario);
 }
@@ -683,10 +694,10 @@ static void test_precheck_rejection_clears_outer_state(void) {
     require(task_update_count == 0 && find_parent_count == 0,
             scenario,
             "precheck rejection published or resolved a parent");
-    require(ambiguous_count == 2 && saw_ambiguous_owner(&child_a) &&
-                saw_ambiguous_owner(&child_b) && fail_handoff_count == 1,
+    require(fail_handoff_count == 1 && same_key(&last_failed_handoff, &child_a) &&
+                last_remote_parent_capability == test_incarnation,
             scenario,
-            "precheck rejection missed fail-closed side effects");
+            "precheck rejection did not isolate logical carrier cleanup");
     require_claim_released(scenario);
     require_sentinel_state(scenario);
 }
@@ -714,9 +725,9 @@ static void test_claim_contention_clears_only_contender_state(void) {
     require(claim_update_count == 1 && claim_delete_count == 0,
             scenario,
             "contender released a claim it did not own");
-    require(fail_handoff_count == 1 && same_key(&last_failed_handoff, &logical_vt),
+    require(fail_handoff_count == 0,
             scenario,
-            "logical virtual-thread handoff was not failed");
+            "process-claim contender mutated the logical remote carrier");
     require(task_update_count == 0 && find_parent_count == 0,
             scenario,
             "contender reached publication side effects");
@@ -744,9 +755,9 @@ static void test_claim_readback_replacement_is_not_released(void) {
     require(claim_update_count == 1 && claim_delete_count == 0,
             scenario,
             "claim verification released a value it did not own");
-    require(task_update_count == 0 && fail_handoff_count == 1,
+    require(task_update_count == 0 && fail_handoff_count == 0,
             scenario,
-            "failed claim verification reached publication or missed cleanup");
+            "failed claim verification reached publication or remote cleanup");
     require_sentinel_state(scenario);
 }
 
@@ -787,7 +798,7 @@ static void test_missing_parent_trace_deletes_stale_context(void) {
     require_sentinel_state(scenario);
 }
 
-static void test_parent_read_failure_and_self_mapping_fail_closed(void) {
+static void test_parent_read_failure_and_balanced_self_restore(void) {
     const char *read_scenario = "parent read failure";
     reset();
     store_task(child_a, child_c);
@@ -798,13 +809,13 @@ static void test_parent_read_failure_and_self_mapping_fail_closed(void) {
     require(context_entry(child_context_id) == NULL,
             read_scenario,
             "read failure retained stale context");
-    require(claim_update_count == 0 && fail_handoff_count == 1,
+    require(claim_update_count == 1 && claim_delete_count == 1 && fail_handoff_count == 1,
             read_scenario,
-            "read failure entered claim path or missed handoff cleanup");
+            "read failure did not fence handoff cleanup with the process claim");
     require(probe_read_count == 1, read_scenario, "parent payload was not read exactly once");
     require_sentinel_state(read_scenario);
 
-    const char *self_scenario = "self mapping";
+    const char *self_scenario = "balanced self restore";
     reset();
     store_task(child_a, child_c);
     seed_context(child_context_id, 0x11);
@@ -812,11 +823,13 @@ static void test_parent_read_failure_and_self_mapping_fail_closed(void) {
     require_no_task(self_scenario, &child_a);
     require(context_entry(child_context_id) == NULL,
             self_scenario,
-            "self mapping retained stale context");
-    require(claim_update_count == 0 && task_update_count == 0 && fail_handoff_count == 1,
+            "balanced self restore retained stale context");
+    require(claim_update_count == 1 && claim_delete_count == 1 && task_update_count == 0 &&
+                task_delete_count == 1 && context_delete_count == 1 && fail_handoff_count == 0 &&
+                unlink_task_count == 1 && same_key(&last_unlinked_task, &child_a),
             self_scenario,
-            "self mapping reached publication or missed cleanup");
-    require(probe_read_count == 1, self_scenario, "self mapping reread its parent payload");
+            "balanced self restore did not unlink without poisoning the exact generation");
+    require(probe_read_count == 1, self_scenario, "self restore reread its parent payload");
     require_sentinel_state(self_scenario);
 }
 
@@ -869,7 +882,8 @@ static void test_task_unlink_clears_physical_state_in_both_bridge_modes(void) {
     store_task(child_a, child_c);
     seed_context(child_context_id, 0x11);
 
-    java_thread_mapping_unlink_execution(&child_a, &logical_vt, child_context_id, 0);
+    java_thread_mapping_unlink_execution(
+        &child_a, &logical_vt, child_context_id, test_incarnation, 0);
 
     require_no_task(disabled_scenario, &child_a);
     require(context_entry(child_context_id) == NULL,
@@ -888,7 +902,8 @@ static void test_task_unlink_clears_physical_state_in_both_bridge_modes(void) {
     store_task(child_a, child_c);
     seed_context(child_context_id, 0x11);
 
-    java_thread_mapping_unlink_execution(&child_a, &logical_vt, child_context_id, 1);
+    java_thread_mapping_unlink_execution(
+        &child_a, &logical_vt, child_context_id, test_incarnation, 1);
 
     require_no_task(enabled_scenario, &child_a);
     require(context_entry(child_context_id) == NULL,
@@ -901,6 +916,57 @@ static void test_task_unlink_clears_physical_state_in_both_bridge_modes(void) {
             enabled_scenario,
             "remote-parent unlink did not target the logical execution");
     require_sentinel_state(enabled_scenario);
+}
+
+static void test_malformed_remote_task_link_clears_preceding_scope(void) {
+    const char *scenario = "malformed remote task link";
+    reset();
+    store_task(child_a, child_c);
+    seed_context(child_context_id, 0x11);
+
+    java_thread_mapping_link_remote_execution(
+        &child_a, &logical_vt, child_context_id, 0, test_incarnation);
+
+    require_no_task(scenario, &child_a);
+    require(context_entry(child_context_id) == NULL,
+            scenario,
+            "zero-token cleanup retained legacy context");
+    require(link_handoff_count == 1 && same_key(&last_linked_task, &logical_vt) &&
+                last_handoff_token == 0,
+            scenario,
+            "zero-token cleanup did not normalize the logical task slot");
+    require(
+        fail_handoff_count == 0, scenario, "successful zero-token cleanup poisoned its generation");
+    require_claim_released(scenario);
+    require_sentinel_state(scenario);
+
+    const char *contention = "malformed remote task link contention";
+    reset();
+    store_task(child_a, child_c);
+    seed_context(child_context_id, 0x22);
+    const pid_key_t process = test_process_key(&child_a);
+    store_claim(process,
+                (java_thread_mapping_claim_t){
+                    .child = child_b,
+                    .process_incarnation = test_incarnation,
+                });
+
+    java_thread_mapping_link_remote_execution(
+        &child_a, &logical_vt, child_context_id, 0, test_incarnation);
+
+    require_no_task(contention, &child_a);
+    require(context_entry(child_context_id) == NULL,
+            contention,
+            "contended zero-token cleanup retained legacy context");
+    require(link_handoff_count == 0 && fail_handoff_count == 0,
+            contention,
+            "contended zero-token cleanup mutated the logical carrier");
+    claim_entry_t *winner = claim_entry(&process);
+    require(winner && same_key(&winner->claim.child, &child_b) && claim_update_count == 1 &&
+                claim_delete_count == 0,
+            contention,
+            "contended zero-token cleanup disturbed the process-claim owner");
+    require_sentinel_state(contention);
 }
 
 static void test_process_registration_serializes_with_mapping_claim(void) {
@@ -934,10 +1000,10 @@ static void test_process_registration_serializes_with_mapping_claim(void) {
     require(claim_update_count == 1 && claim_delete_count == 0,
             contention_scenario,
             "contending registration released an unowned claim");
-    require(process_registration_count == 0 && remote_cleanup_count == 1 &&
-                unlink_task_count == 1 && same_key(&last_unlinked_task, &child_a),
+    require(process_registration_count == 0 && remote_cleanup_count == 0 &&
+                unlink_task_count == 0 && fail_handoff_count == 0,
             contention_scenario,
-            "contending registration missed fail-closed cleanup");
+            "contending registration mutated remote-parent state");
     require_sentinel_state(contention_scenario);
 
     const char *rotation_scenario = "registration rotation";
@@ -961,6 +1027,27 @@ static void test_process_registration_serializes_with_mapping_claim(void) {
     require_claim_released(rotation_scenario);
     require_sentinel_state(rotation_scenario);
 
+    const char *retired_scenario = "registration target retirement";
+    reset();
+    retirement_pending = 1;
+    store_task(child_a, child_c);
+    seed_context(child_context_id, 0x44);
+
+    require(!java_thread_mapping_register_process(
+                &child_a, &process, child_context_id, test_incarnation, 1),
+            retired_scenario,
+            "registration reopened a retired target capability");
+    require(current_incarnation == test_incarnation && process_registration_count == 0 &&
+                remote_cleanup_count == 0 && unlink_task_count == 0,
+            retired_scenario,
+            "retired target registration mutated process state");
+    require_task(retired_scenario, &child_a, &child_c);
+    require(context_entry(child_context_id) != NULL,
+            retired_scenario,
+            "retired target registration cleared operation-local state");
+    require_claim_released(retired_scenario);
+    require_sentinel_state(retired_scenario);
+
     const char *failure_scenario = "registration update failure";
     reset();
     fail_process_registration = 1;
@@ -973,6 +1060,98 @@ static void test_process_registration_serializes_with_mapping_claim(void) {
         process_registration_count == 1, failure_scenario, "registration update was not attempted");
     require_claim_released(failure_scenario);
     require_sentinel_state(failure_scenario);
+}
+
+static void test_userspace_process_claim_blocks_and_cannot_be_released_by_bpf(void) {
+    const char *scenario = "userspace process claim";
+    reset();
+    store_task(child_a, child_c);
+    seed_context(child_context_id, 0x33);
+    pid_key_t process = test_process_key(&child_a);
+    const java_thread_mapping_claim_t userspace = {
+        .child =
+            {
+                .tid = 0x12345678,
+                .pid = process.pid,
+                .ns = process.ns,
+            },
+        .reserved = 0x80000001,
+        .process_incarnation = test_incarnation,
+    };
+    store_claim(process, userspace);
+
+    require(!java_thread_mapping_register_process(
+                &child_a, &process, child_context_id, test_incarnation, 1),
+            scenario,
+            "PROCESS_REGISTER entered a userspace-owned P");
+    java_thread_mapping_link_remote_execution(
+        &child_a, &logical_vt, child_context_id, 0x1234, test_incarnation);
+    java_thread_mapping_release_claim(&process, &child_a, test_incarnation);
+
+    claim_entry_t *stored = claim_entry(&process);
+    require(stored && memcmp(&stored->claim, &userspace, sizeof(userspace)) == 0,
+            scenario,
+            "BPF adopted or released a tagged userspace P");
+    require_no_task(scenario, &child_a);
+    require(context_entry(child_context_id) == NULL,
+            scenario,
+            "TASK_LINK contention retained stale operation-local context");
+    require(claim_update_count == 2 && claim_delete_count == 0 && link_handoff_count == 0 &&
+                fail_handoff_count == 0 && remote_cleanup_count == 0 && unlink_task_count == 0,
+            scenario,
+            "userspace P contention mutated process ownership or remote-parent state");
+    require(cancel_handoff_count == 1 && same_key(&last_linked_task, &logical_vt) &&
+                last_cancelled_token == 0x1234 && last_remote_parent_capability == test_incarnation,
+            scenario,
+            "contended LINK did not terminally cancel its exact handoff token");
+    require_sentinel_state(scenario);
+}
+
+static void test_task_link_serializes_with_process_registration(void) {
+    const char *link_first = "task link precedes registration";
+    reset();
+    register_during_link = 1;
+    require(java_thread_mapping_link_handoff_for_capability(
+                &child_a, &logical_vt, 0x1234, test_incarnation),
+            link_first,
+            "admitted task link failed");
+    require(link_handoff_count == 1 && same_key(&last_linked_task, &logical_vt) &&
+                last_handoff_token == 0x1234 && last_remote_parent_capability == test_incarnation,
+            link_first,
+            "task link did not execute under the process claim");
+    require(cancel_handoff_count == 1 && last_cancelled_token == 0x1234,
+            link_first,
+            "successful task link did not perform its idempotent terminal cancel");
+    require(!nested_registration_result && current_incarnation == test_incarnation &&
+                process_registration_count == 0,
+            link_first,
+            "contending registration rotated the process during task link");
+    require(claim_count() == 0 && claim_update_count == 2 && claim_delete_count == 1,
+            link_first,
+            "process fence ownership was not preserved across contention");
+    require_sentinel_state(link_first);
+
+    const char *registration_first = "registration precedes stale task link";
+    reset();
+    pid_key_t process = test_process_key(&child_a);
+    require(java_thread_mapping_register_process(
+                &child_a, &process, child_context_id, replacement_incarnation, 1),
+            registration_first,
+            "successor registration failed");
+    require(!java_thread_mapping_link_handoff_for_capability(
+                &child_a, &logical_vt, 0x5678, test_incarnation),
+            registration_first,
+            "stale task link was admitted after process rotation");
+    require(current_incarnation == replacement_incarnation && link_handoff_count == 0,
+            registration_first,
+            "stale task link executed after process rotation");
+    require(cancel_handoff_count == 1 && last_cancelled_token == 0x5678,
+            registration_first,
+            "stale task link did not terminally cancel its exact handoff token");
+    require(claim_count() == 0 && claim_update_count == 2 && claim_delete_count == 2,
+            registration_first,
+            "registration/link process claims were not released exactly");
+    require_sentinel_state(registration_first);
 }
 
 static void test_decoded_parent_path_does_not_reread_user_memory(void) {
@@ -988,6 +1167,26 @@ static void test_decoded_parent_path_does_not_reread_user_memory(void) {
             scenario,
             "decoded parent did not publish legacy context");
     require(probe_read_count == 0, scenario, "decoded parent path reread user memory");
+    require_sentinel_state(scenario);
+}
+
+static void test_zero_logical_tid_releases_admitted_process_claim(void) {
+    const char *scenario = "zero logical tid";
+    reset();
+    seed_parent_trace(child_b, 1);
+    pid_key_t malformed = child_a;
+    malformed.tid = 0;
+
+    run_mapping(&child_a, &malformed, &child_b, child_context_id, 1);
+
+    require_task(scenario, &child_a, &child_b);
+    require(context_entry(child_context_id) != NULL,
+            scenario,
+            "admitted mapping did not publish its operation-local context");
+    require(fail_handoff_count == 0 && unlink_task_count == 0,
+            scenario,
+            "zero logical identity selected a remote carrier mutation");
+    require_claim_released(scenario);
     require_sentinel_state(scenario);
 }
 
@@ -1122,6 +1321,12 @@ static u8 test_register_process_incarnation(u64 incarnation) {
     return 1;
 }
 
+static u8 test_process_retirement_pending(const pid_key_t *task, u64 incarnation) {
+    (void)task;
+    (void)incarnation;
+    return retirement_pending;
+}
+
 static u8 test_pid_key_equal(const pid_key_t *left, const pid_key_t *right) {
     return same_key(left, right);
 }
@@ -1143,26 +1348,11 @@ static u8 test_would_cycle(const pid_key_t *child, const pid_key_t *parent) {
     return 1;
 }
 
-static u8 test_mark_ambiguous(const pid_key_t *owner) {
-    if (ambiguous_count >= k_max_claim_entries) {
-        fail("ambiguous owners", "too many ambiguity markers");
-    }
-    ambiguous_owners[ambiguous_count] = *owner;
-    ambiguous_count++;
-    return 1;
-}
-
-static u8 test_guard_owner_reuse(const pid_key_t *owner) {
-    record_event(k_event_guard_reuse);
-    guard_reuse_count++;
-    last_guard_owner = *owner;
-    return 1;
-}
-
-static void test_fail_handoff(const pid_key_t *child) {
+static void test_fail_handoff(const pid_key_t *child, u64 process_incarnation) {
     record_event(k_event_fail_handoff);
     fail_handoff_count++;
     last_failed_handoff = *child;
+    last_remote_parent_capability = process_incarnation;
 }
 
 static void test_remote_parent_cleanup(const pid_key_t *owner) {
@@ -1173,8 +1363,37 @@ static void test_remote_parent_cleanup(const pid_key_t *owner) {
 }
 
 static void test_unlink_task(const pid_key_t *owner) {
+    record_event(k_event_unlink_task);
     unlink_task_count++;
     last_unlinked_task = *owner;
+}
+
+static void test_unlink_task_for_capability(const pid_key_t *owner, u64 process_incarnation) {
+    test_unlink_task(owner);
+    last_remote_parent_capability = process_incarnation;
+}
+
+static u8
+test_link_handoff_for_capability(const pid_key_t *owner, u64 token, u64 process_incarnation) {
+    link_handoff_count++;
+    last_linked_task = *owner;
+    last_handoff_token = token;
+    last_remote_parent_capability = process_incarnation;
+    if (register_during_link) {
+        register_during_link = 0;
+        pid_key_t process = test_process_key(&child_a);
+        nested_registration_result = java_thread_mapping_register_process(
+            &child_a, &process, child_context_id, replacement_incarnation, 1);
+    }
+    return 1;
+}
+
+static void
+test_cancel_handoff_for_capability(const pid_key_t *owner, u64 token, u64 process_incarnation) {
+    cancel_handoff_count++;
+    last_linked_task = *owner;
+    last_cancelled_token = token;
+    last_remote_parent_capability = process_incarnation;
 }
 
 static tp_info_pid_t *test_find_parent(trace_key_t *key) {
@@ -1225,7 +1444,20 @@ static long test_probe_read_user(void *destination, u32 size, const void *source
     return 0;
 }
 
+static void test_unavailable_control_workspace_requires_thread_cleanup(void) {
+    require(java_control_tail_workspace_miss_requires_cleanup(k_ioctl_java_threads),
+            "control workspace miss",
+            "THREAD must clean stale execution ancestry");
+    require(java_control_tail_workspace_miss_requires_cleanup(k_ioctl_java_task_link),
+            "control workspace miss",
+            "TASK_LINK must clean stale execution ancestry");
+    require(!java_control_tail_workspace_miss_requires_cleanup(k_ioctl_java_task_capture),
+            "control workspace miss",
+            "TASK_CAPTURE must not be reclassified as an ancestry cleanup operation");
+}
+
 int main(void) {
+    test_unavailable_control_workspace_requires_thread_cleanup();
     test_safe_mapping_commits_before_context();
     test_parent_context_is_published_before_claim_release();
     test_nested_reciprocal_contender_becomes_miss();
@@ -1241,12 +1473,16 @@ int main(void) {
     test_claim_readback_replacement_is_not_released();
     test_context_update_failure_deletes_stale_context();
     test_missing_parent_trace_deletes_stale_context();
-    test_parent_read_failure_and_self_mapping_fail_closed();
+    test_parent_read_failure_and_balanced_self_restore();
     test_bridge_disabled_read_failure_preserves_legacy_state();
     test_bridge_disabled_self_restore_clears_legacy_state();
     test_task_unlink_clears_physical_state_in_both_bridge_modes();
+    test_malformed_remote_task_link_clears_preceding_scope();
     test_process_registration_serializes_with_mapping_claim();
+    test_userspace_process_claim_blocks_and_cannot_be_released_by_bpf();
+    test_task_link_serializes_with_process_registration();
     test_decoded_parent_path_does_not_reread_user_memory();
+    test_zero_logical_tid_releases_admitted_process_claim();
     test_bridge_disabled_legacy_mapping_is_preserved();
     puts("Java TLS thread-mapping tests passed");
     return 0;

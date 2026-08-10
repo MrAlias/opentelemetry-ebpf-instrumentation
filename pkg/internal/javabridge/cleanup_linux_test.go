@@ -20,14 +20,19 @@ import (
 )
 
 func TestCleanupKernelMapLayouts(t *testing.T) {
-	assert.Equal(t, uintptr(16), unsafe.Sizeof(handoffKey{}))
+	assert.Equal(t, uintptr(24), unsafe.Sizeof(handoffKey{}))
+	assert.Equal(t, uintptr(16), unsafe.Offsetof(handoffKey{}.ProcessIncarnation))
 	assert.Equal(t, uintptr(16), unsafe.Sizeof(handoffClaimValue{}))
+	assert.Equal(t, uintptr(24), unsafe.Sizeof(threadMappingClaimValue{}))
+	assert.Equal(t, uintptr(12), unsafe.Offsetof(threadMappingClaimValue{}.Reserved))
+	assert.Equal(t, uintptr(16), unsafe.Offsetof(threadMappingClaimValue{}.ProcessIncarnation))
 	assert.Equal(t, uintptr(24), unsafe.Sizeof(retiredProcessKey{}))
 	assert.Equal(t, uintptr(24), unsafe.Sizeof(generationClaim{}))
-	assert.Equal(t, uintptr(23), unsafe.Offsetof(generationClaim{}.Reserved)+6)
+	assert.Equal(t, unsafe.Offsetof(generationClaim{}.Reserved)+6, uintptr(23))
 	assert.Equal(t, uintptr(40), unsafe.Sizeof(aliasReplayKey{}))
 	assert.Equal(t, uintptr(72), unsafe.Sizeof(aliasReplayValue{}))
 	assert.Equal(t, uint8(0x47), generationGoProducerTag)
+	assert.Equal(t, uint8(0x48), javaRemoteParentTerminalHandoffGenerationClaimTag)
 }
 
 func taggedGoGenerationClaim(
@@ -1484,7 +1489,7 @@ func TestCleanupNoncanonicalLogicalKeysAreExactOnly(t *testing.T) {
 	}
 }
 
-func TestCleanupStatsCountRetirementWithoutDeletingTaskLink(t *testing.T) {
+func TestCleanupRetirementDeletesParkedTaskUnderExactClaim(t *testing.T) {
 	owner := Identity{TID: 3, PID: 2, Namespace: 1}
 	child := Identity{TID: 4, PID: 2, Namespace: 1}
 	handler := testMapHandler(nil, map[Identity]any{
@@ -1493,6 +1498,7 @@ func TestCleanupStatsCountRetirementWithoutDeletingTaskLink(t *testing.T) {
 	cleanup := testCleanup(handler)
 	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
 	process := javaProcessIdentity(owner)
+	delete(cleanup.maps.incarnations.(*fakeBridgeMap).values, process)
 	cleanup.maps.retired.(*fakeBridgeMap).values[retiredProcessKey{
 		Process:            process,
 		ProcessIncarnation: testProcessIncarnation,
@@ -1501,8 +1507,533 @@ func TestCleanupStatsCountRetirementWithoutDeletingTaskLink(t *testing.T) {
 	stats, err := cleanup.SweepWithStats()
 	require.NoError(t, err)
 	assert.Equal(t, CleanupStats{Cleaned: 1}, stats)
-	assert.NotEmpty(t, cleanup.maps.tasks.(*fakeBridgeMap).values)
+	assert.Empty(t, cleanup.maps.tasks.(*fakeBridgeMap).values)
+	assert.Empty(t, cleanup.maps.taskClaims.(*fakeBridgeMap).values)
 	assert.Empty(t, cleanup.maps.retired.(*fakeBridgeMap).values)
+}
+
+func TestJavaRemoteParentProcessCleanupClaimEncoding(t *testing.T) {
+	process := Identity{TID: 22, PID: 22, Namespace: 7}
+	claim, valid := javaRemoteParentProcessCleanupClaim(
+		(17*time.Second)+(23*time.Nanosecond), process, testProcessIncarnation,
+	)
+	require.True(t, valid)
+	assert.Equal(t, process.PID, claim.Child.PID)
+	assert.Equal(t, process.Namespace, claim.Child.Namespace)
+	assert.NotZero(t, claim.Reserved&javaRemoteParentProcessCleanupClaimTag)
+	assert.Equal(t, testProcessIncarnation, claim.ProcessIncarnation)
+	assert.True(t, validJavaRemoteParentProcessCleanupClaim(process, claim))
+
+	next, valid := javaRemoteParentProcessCleanupClaim(
+		(17*time.Second)+(24*time.Nanosecond), process, testProcessIncarnation,
+	)
+	require.True(t, valid)
+	assert.NotEqual(t, claim, next, "successive P claims need exact ABA identity")
+
+	_, valid = javaRemoteParentProcessCleanupClaim(0, process, testProcessIncarnation)
+	assert.False(t, valid)
+	_, valid = javaRemoteParentProcessCleanupClaim(time.Second, Identity{}, testProcessIncarnation)
+	assert.False(t, valid)
+	_, valid = javaRemoteParentProcessCleanupClaim(time.Second, process, 0)
+	assert.False(t, valid)
+}
+
+func TestCleanupPublishesRetirementBeforeDeletingUnauthorizedIncarnation(t *testing.T) {
+	handler := testMapHandler(nil, nil, nil)
+	cleanup := testCleanup(handler)
+	process := Identity{TID: 2, PID: 2, Namespace: 1}
+	delete(cleanup.maps.authorized.(*fakeBridgeMap).values, process)
+
+	require.NoError(t, cleanup.Sweep())
+
+	assert.NotContains(t, cleanup.maps.incarnations.(*fakeBridgeMap).values, process)
+	marker := retiredProcessKey{
+		Process: process, ProcessIncarnation: testProcessIncarnation,
+	}
+	assert.NotZero(t, cleanup.maps.retired.(*fakeBridgeMap).values[marker])
+	assert.NotContains(t, cleanup.maps.threadMappingClaims.(*fakeBridgeMap).values, process)
+}
+
+func TestCleanupRetiresPredecessorAcrossCapabilityRotationWindow(t *testing.T) {
+	handler := testMapHandler(nil, nil, nil)
+	cleanup := testCleanup(handler)
+	process := Identity{TID: 2, PID: 2, Namespace: 1}
+	cleanup.maps.authorized.(*fakeBridgeMap).values[process] = uint64(73)
+
+	require.NoError(t, cleanup.Sweep())
+
+	assert.Equal(t, uint64(73), cleanup.maps.authorized.(*fakeBridgeMap).values[process])
+	assert.NotContains(t, cleanup.maps.incarnations.(*fakeBridgeMap).values, process)
+	assert.NotZero(t, cleanup.maps.retired.(*fakeBridgeMap).values[retiredProcessKey{
+		Process: process, ProcessIncarnation: testProcessIncarnation,
+	}])
+}
+
+func TestCleanupRetirementMarkerFailurePreservesIncarnationAndRetries(t *testing.T) {
+	handler := testMapHandler(nil, nil, nil)
+	cleanup := testCleanup(handler)
+	process := Identity{TID: 2, PID: 2, Namespace: 1}
+	delete(cleanup.maps.authorized.(*fakeBridgeMap).values, process)
+	retired := cleanup.maps.retired.(*fakeBridgeMap)
+	retired.updateErr = errors.New("retirement map full")
+
+	err := cleanup.Sweep()
+	require.ErrorContains(t, err, "publishing Java process retirement marker")
+	assert.Equal(t, testProcessIncarnation,
+		cleanup.maps.incarnations.(*fakeBridgeMap).values[process])
+	assert.NotContains(t, cleanup.maps.threadMappingClaims.(*fakeBridgeMap).values, process)
+
+	retired.updateErr = nil
+	require.NoError(t, cleanup.Sweep())
+	assert.NotContains(t, cleanup.maps.incarnations.(*fakeBridgeMap).values, process)
+	assert.NotZero(t, retired.values[retiredProcessKey{
+		Process: process, ProcessIncarnation: testProcessIncarnation,
+	}])
+}
+
+func TestCleanupRetriesUnauthorizedRetirementAfterSameSweepCapacityRecovery(t *testing.T) {
+	handler := testMapHandler(nil, nil, nil)
+	cleanup := testCleanup(handler)
+	process := Identity{TID: 2, PID: 2, Namespace: 1}
+	delete(cleanup.maps.authorized.(*fakeBridgeMap).values, process)
+	retired := cleanup.maps.retired.(*fakeBridgeMap)
+	retired.updateErr = errors.New("retirement map full")
+	retired.afterFailedUpdate = func() {
+		retired.mu.Lock()
+		retired.updateErr = nil
+		retired.mu.Unlock()
+	}
+
+	require.NoError(t, cleanup.Sweep())
+	assert.NotContains(t, cleanup.maps.incarnations.(*fakeBridgeMap).values, process)
+	assert.NotZero(t, retired.values[retiredProcessKey{
+		Process: process, ProcessIncarnation: testProcessIncarnation,
+	}])
+}
+
+func TestCleanupRecoversCoupledProcessClaimAndRetirementCapacity(t *testing.T) {
+	handler := testMapHandler(nil, nil, nil)
+	cleanup := testCleanup(handler)
+	process := Identity{TID: 2, PID: 2, Namespace: 1}
+	delete(cleanup.maps.authorized.(*fakeBridgeMap).values, process)
+
+	// Fill R with an already-quiescent process. Its sweep-start marker holds one
+	// P slot until finalization, while the unauthorized current process uses the
+	// other slot and initially cannot publish its own marker. Cleanup must release
+	// that unsuccessful P root, finalize the old R/P pair, and retry in this sweep.
+	oldProcess := Identity{TID: 9, PID: 9, Namespace: 1}
+	oldRetirement := retiredProcessKey{
+		Process: oldProcess, ProcessIncarnation: 73,
+	}
+	retired := cleanup.maps.retired.(*fakeBridgeMap)
+	retired.maxEntries = 1
+	retired.values[oldRetirement] = uint64(10 * time.Second)
+	claims := cleanup.maps.threadMappingClaims.(*fakeBridgeMap)
+	claims.maxEntries = 2
+
+	require.NoError(t, cleanup.Sweep())
+
+	currentRetirement := retiredProcessKey{
+		Process: process, ProcessIncarnation: testProcessIncarnation,
+	}
+	assert.NotContains(t, retired.values, oldRetirement)
+	assert.NotZero(t, retired.values[currentRetirement])
+	assert.NotContains(t, cleanup.maps.incarnations.(*fakeBridgeMap).values, process)
+	assert.Empty(t, claims.values)
+}
+
+func TestCleanupForeignProcessClaimPreservesUnauthorizedIncarnation(t *testing.T) {
+	handler := testMapHandler(nil, nil, nil)
+	cleanup := testCleanup(handler)
+	process := Identity{TID: 2, PID: 2, Namespace: 1}
+	delete(cleanup.maps.authorized.(*fakeBridgeMap).values, process)
+	foreign := threadMappingClaimValue{
+		Child:              Identity{TID: 9, PID: 2, Namespace: 1},
+		ProcessIncarnation: testProcessIncarnation,
+	}
+	cleanup.maps.threadMappingClaims.(*fakeBridgeMap).values[process] = foreign
+
+	require.NoError(t, cleanup.Sweep())
+
+	assert.Equal(t, testProcessIncarnation,
+		cleanup.maps.incarnations.(*fakeBridgeMap).values[process])
+	assert.Equal(t, foreign, cleanup.maps.threadMappingClaims.(*fakeBridgeMap).values[process])
+	assert.Empty(t, cleanup.maps.retired.(*fakeBridgeMap).values)
+}
+
+func TestCleanupReauthorizationAfterMarkerPublicationPreservesIncarnation(t *testing.T) {
+	handler := testMapHandler(nil, nil, nil)
+	cleanup := testCleanup(handler)
+	process := Identity{TID: 2, PID: 2, Namespace: 1}
+	delete(cleanup.maps.authorized.(*fakeBridgeMap).values, process)
+	retired := cleanup.maps.retired.(*fakeBridgeMap)
+	retired.afterUpdate = func(any, any) {
+		authorized := cleanup.maps.authorized.(*fakeBridgeMap)
+		authorized.mu.Lock()
+		authorized.values[process] = testProcessIncarnation
+		authorized.mu.Unlock()
+	}
+
+	require.NoError(t, cleanup.Sweep())
+
+	assert.Equal(t, testProcessIncarnation,
+		cleanup.maps.incarnations.(*fakeBridgeMap).values[process])
+	assert.NotZero(t, retired.values[retiredProcessKey{
+		Process: process, ProcessIncarnation: testProcessIncarnation,
+	}])
+	assert.NotContains(t, cleanup.maps.threadMappingClaims.(*fakeBridgeMap).values, process)
+}
+
+func TestCleanupProcessClaimSerializesSameCapabilityRegistration(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	predecessor := activeTaskLink(owner, 10)
+	successor := activeTaskLink(owner, 11)
+	process := javaProcessIdentity(child)
+
+	t.Run("cleanup wins P before registration", func(t *testing.T) {
+		cleanup := testCleanup(testMapHandler(nil, map[Identity]any{child: predecessor}, nil))
+		cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+		delete(cleanup.maps.incarnations.(*fakeBridgeMap).values, process)
+		claims := cleanup.maps.threadMappingClaims.(*fakeBridgeMap)
+		tasks := cleanup.maps.tasks.(*fakeBridgeMap)
+		registrationBlocked := false
+		claims.afterUpdate = func(key, _ any) {
+			if key != process {
+				return
+			}
+			registration := threadMappingClaimValue{
+				Child: child, ProcessIncarnation: testProcessIncarnation,
+			}
+			registrationBlocked = errors.Is(
+				claims.Update(&process, &registration, ebpf.UpdateNoExist),
+				ebpf.ErrKeyExist,
+			)
+		}
+		claims.afterDelete = func(key any) {
+			if key == process {
+				cleanup.maps.incarnations.(*fakeBridgeMap).values[process] = testProcessIncarnation
+				tasks.values[child] = successor
+			}
+		}
+
+		require.NoError(t, cleanup.Sweep())
+		assert.True(t, registrationBlocked)
+		assert.Zero(t, tasks.deleteCount,
+			"incarnation absence without an exact marker cannot delete an alias-owning task")
+		assert.Equal(t, successor, tasks.values[child],
+			"registration may publish only after cleanup releases P")
+		assert.Empty(t, claims.values)
+	})
+
+	t.Run("registration wins P before cleanup", func(t *testing.T) {
+		cleanup := testCleanup(testMapHandler(nil, map[Identity]any{child: predecessor}, nil))
+		cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+		delete(cleanup.maps.incarnations.(*fakeBridgeMap).values, process)
+		registration := threadMappingClaimValue{
+			Child: child, ProcessIncarnation: testProcessIncarnation,
+		}
+		claims := cleanup.maps.threadMappingClaims.(*fakeBridgeMap)
+		claims.values[process] = registration
+
+		require.NoError(t, cleanup.Sweep())
+		assert.Equal(t, predecessor, cleanup.maps.tasks.(*fakeBridgeMap).values[child])
+		assert.Equal(t, registration, claims.values[process])
+	})
+}
+
+func TestCleanupRecoversProcessAndTaskClaimsBeforeLiveRegistration(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	link := activeTaskLink(owner, 10)
+	cleanup := testCleanup(testMapHandler(nil, map[Identity]any{child: link}, nil))
+	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+	process := javaProcessIdentity(child)
+	processClaim, valid := javaRemoteParentProcessCleanupClaim(
+		40*time.Second, process, testProcessIncarnation,
+	)
+	require.True(t, valid)
+	taskClaim, valid := javaRemoteParentTaskCleanupClaim(
+		40*time.Second, testProcessIncarnation,
+	)
+	require.True(t, valid)
+	cleanup.maps.threadMappingClaims.(*fakeBridgeMap).values[process] = processClaim
+	cleanup.maps.taskClaims.(*fakeBridgeMap).values[child] = taskClaim
+
+	require.NoError(t, cleanup.Sweep())
+	assert.Equal(t, link, cleanup.maps.tasks.(*fakeBridgeMap).values[child])
+	assert.Empty(t, cleanup.maps.taskClaims.(*fakeBridgeMap).values)
+	assert.Empty(t, cleanup.maps.threadMappingClaims.(*fakeBridgeMap).values)
+}
+
+func TestCleanupExitMarkerQuiescesExactVisibleIncarnation(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	link := activeTaskLink(owner, 10)
+	cleanup := testCleanup(testMapHandler(nil, map[Identity]any{child: link}, nil))
+	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+	process := javaProcessIdentity(child)
+	retiredKey := retiredProcessKey{
+		Process: process, ProcessIncarnation: testProcessIncarnation,
+	}
+	cleanup.maps.retired.(*fakeBridgeMap).values[retiredKey] = uint64(40 * time.Second)
+
+	require.NoError(t, cleanup.Sweep())
+	assert.NotContains(t, cleanup.maps.tasks.(*fakeBridgeMap).values, child)
+	assert.NotContains(t, cleanup.maps.incarnations.(*fakeBridgeMap).values, process)
+	assert.NotContains(t, cleanup.maps.retired.(*fakeBridgeMap).values, retiredKey)
+	assert.Empty(t, cleanup.maps.threadMappingClaims.(*fakeBridgeMap).values)
+}
+
+func TestCleanupFullDisjointHandoffMapsMakeProgress(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	process := javaProcessIdentity(child)
+	resolvedKey := handoffKey{
+		PID: 9, Namespace: child.Namespace, Token: 88,
+		ProcessIncarnation: testProcessIncarnation,
+	}
+	retiredKey := handoffKey{
+		PID: child.PID, Namespace: child.Namespace, Token: 77,
+		ProcessIncarnation: testProcessIncarnation,
+	}
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+	delete(cleanup.maps.incarnations.(*fakeBridgeMap).values, process)
+	seedProcessRetirementForTest(cleanup, process, testProcessIncarnation)
+
+	claims := cleanup.maps.handoffClaims.(*fakeBridgeMap)
+	claims.maxEntries = 1
+	claims.values[resolvedKey] = handoffClaimValue{
+		ObservedMonotonicNS: uint64(10*time.Second) | javaRemoteParentTaskCleanupClaimTag,
+		ProcessIncarnation:  testProcessIncarnation,
+	}
+
+	handoffs := cleanup.maps.handoffs.(*fakeBridgeMap)
+	handoffs.values[retiredKey] = activeTaskLink(owner, 10)
+	mutations := cleanup.maps.handoffMutations.(*fakeBridgeMap)
+	mutations.maxEntries = 1
+	mutation, valid := javaRemoteParentTaskCleanupClaim(
+		40*time.Second, testProcessIncarnation,
+	)
+	require.True(t, valid)
+	mutations.values[retiredKey] = mutation
+
+	require.NoError(t, cleanup.Sweep())
+	assert.Empty(t, handoffs.values,
+		"recovering the full M entry must retire H without first inserting C")
+	assert.Empty(t, claims.values,
+		"the resolved full-C entry must be reclaimed after M recovery frees capacity")
+	assert.Empty(t, mutations.values)
+	assert.Empty(t, cleanup.maps.threadMappingClaims.(*fakeBridgeMap).values)
+}
+
+func TestCleanupRecoversProcessAndHandoffMutationClaims(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	process := javaProcessIdentity(child)
+	key := handoffKey{
+		PID: child.PID, Namespace: child.Namespace, Token: 77,
+		ProcessIncarnation: testProcessIncarnation,
+	}
+	handoff := activeTaskLink(owner, 10)
+
+	for _, test := range []struct {
+		name    string
+		retired bool
+	}{
+		{name: "live capability"},
+		{name: "retired capability", retired: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cleanup := testCleanup(testMapHandler(nil, nil, nil))
+			cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+			cleanup.maps.handoffs.(*fakeBridgeMap).values[key] = handoff
+			processClaim, valid := javaRemoteParentProcessCleanupClaim(
+				40*time.Second, process, testProcessIncarnation,
+			)
+			require.True(t, valid)
+			mutation, valid := javaRemoteParentTaskCleanupClaim(
+				40*time.Second, testProcessIncarnation,
+			)
+			require.True(t, valid)
+			cleanup.maps.threadMappingClaims.(*fakeBridgeMap).values[process] = processClaim
+			cleanup.maps.handoffMutations.(*fakeBridgeMap).values[key] = mutation
+			if test.retired {
+				delete(cleanup.maps.incarnations.(*fakeBridgeMap).values, process)
+				seedProcessRetirementForTest(cleanup, process, testProcessIncarnation)
+			}
+
+			require.NoError(t, cleanup.Sweep())
+			if test.retired {
+				assert.NotContains(t, cleanup.maps.handoffs.(*fakeBridgeMap).values, key)
+				assert.NotContains(t, cleanup.maps.handoffClaims.(*fakeBridgeMap).values, key)
+			} else {
+				assert.Equal(t, handoff, cleanup.maps.handoffs.(*fakeBridgeMap).values[key])
+				assert.NotContains(t, cleanup.maps.handoffClaims.(*fakeBridgeMap).values, key,
+					"live recovery must not terminalize H")
+			}
+			assert.Empty(t, cleanup.maps.handoffMutations.(*fakeBridgeMap).values)
+			assert.Empty(t, cleanup.maps.threadMappingClaims.(*fakeBridgeMap).values)
+		})
+	}
+}
+
+func TestCleanupRetiredTaskClaimPreservesSuccessorRaces(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	predecessor := activeTaskLink(owner, 10)
+	successor := activeTaskLink(owner, 11)
+	successor.ProcessIncarnation++
+	process := javaProcessIdentity(child)
+
+	t.Run("replacement before claim", func(t *testing.T) {
+		cleanup := testCleanup(testMapHandler(nil, map[Identity]any{child: predecessor}, nil))
+		cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+		cleanup.maps.incarnations.(*fakeBridgeMap).values[process] = successor.ProcessIncarnation
+		seedProcessRetirementForTest(cleanup, process, predecessor.ProcessIncarnation)
+		tasks := cleanup.maps.tasks.(*fakeBridgeMap)
+		claims := cleanup.maps.taskClaims.(*fakeBridgeMap)
+		claims.beforeUpdate = func(any, any, ebpf.MapUpdateFlags) {
+			tasks.values[child] = successor
+		}
+
+		require.NoError(t, cleanup.Sweep())
+		assert.Equal(t, successor, tasks.values[child])
+		assert.Empty(t, claims.values)
+	})
+
+	t.Run("publisher waits for exact release", func(t *testing.T) {
+		cleanup := testCleanup(testMapHandler(nil, map[Identity]any{child: predecessor}, nil))
+		cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+		delete(cleanup.maps.incarnations.(*fakeBridgeMap).values, process)
+		seedProcessRetirementForTest(cleanup, process, predecessor.ProcessIncarnation)
+		tasks := cleanup.maps.tasks.(*fakeBridgeMap)
+		claims := cleanup.maps.taskClaims.(*fakeBridgeMap)
+		publisherBlocked := false
+		claims.afterUpdate = func(key, _ any) {
+			_, publisherBlocked = claims.values[key]
+		}
+		claims.afterDelete = func(key any) {
+			if key == child {
+				tasks.values[child] = successor
+			}
+		}
+
+		require.NoError(t, cleanup.Sweep())
+		assert.True(t, publisherBlocked)
+		assert.Equal(t, successor, tasks.values[child],
+			"no task mutation may occur after releasing T(execution)")
+		assert.Empty(t, claims.values)
+	})
+}
+
+func TestCleanupRetiredTaskClaimContentionAndRetirementRevalidation(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	link := activeTaskLink(owner, 10)
+	process := javaProcessIdentity(child)
+
+	t.Run("foreign claim preserves task", func(t *testing.T) {
+		cleanup := testCleanup(testMapHandler(nil, map[Identity]any{child: link}, nil))
+		cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+		delete(cleanup.maps.incarnations.(*fakeBridgeMap).values, process)
+		foreign := handoffClaimValue{
+			ObservedMonotonicNS: uint64(40 * time.Second),
+			ProcessIncarnation:  testProcessIncarnation,
+		}
+		claims := cleanup.maps.taskClaims.(*fakeBridgeMap)
+		claims.values[child] = foreign
+
+		require.NoError(t, cleanup.Sweep())
+		assert.Equal(t, link, cleanup.maps.tasks.(*fakeBridgeMap).values[child])
+		assert.Equal(t, foreign, claims.values[child])
+	})
+
+	t.Run("retirement revoked under claim", func(t *testing.T) {
+		cleanup := testCleanup(testMapHandler(nil, map[Identity]any{child: link}, nil))
+		cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+		incarnations := cleanup.maps.incarnations.(*fakeBridgeMap)
+		delete(incarnations.values, process)
+		seedProcessRetirementForTest(cleanup, process, link.ProcessIncarnation)
+		claims := cleanup.maps.taskClaims.(*fakeBridgeMap)
+		claims.afterUpdate = func(any, any) {
+			incarnations.values[process] = testProcessIncarnation
+		}
+
+		require.NoError(t, cleanup.Sweep())
+		assert.Equal(t, link, cleanup.maps.tasks.(*fakeBridgeMap).values[child])
+		assert.Empty(t, claims.values)
+	})
+}
+
+func TestCleanupRecoversTaggedRetiredTaskClaim(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	child := Identity{TID: 4, PID: 2, Namespace: 1}
+	link := activeTaskLink(owner, 10)
+	cleanup := testCleanup(testMapHandler(nil, map[Identity]any{child: link}, nil))
+	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+	process := javaProcessIdentity(child)
+	delete(cleanup.maps.incarnations.(*fakeBridgeMap).values, process)
+	seedProcessRetirementForTest(cleanup, process, link.ProcessIncarnation)
+	claim, valid := javaRemoteParentTaskCleanupClaim(40*time.Second, testProcessIncarnation)
+	require.True(t, valid)
+	cleanup.maps.taskClaims.(*fakeBridgeMap).values[child] = claim
+
+	require.NoError(t, cleanup.Sweep())
+	assert.Empty(t, cleanup.maps.tasks.(*fakeBridgeMap).values)
+	assert.Empty(t, cleanup.maps.taskClaims.(*fakeBridgeMap).values)
+}
+
+func TestCleanupRecoveredTaskClaimReleasesForLiveCapability(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		initiallyLive bool
+	}{
+		{name: "already live", initiallyLive: true},
+		{name: "becomes live before deletion"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			owner := Identity{TID: 3, PID: 2, Namespace: 1}
+			child := Identity{TID: 4, PID: 2, Namespace: 1}
+			link := activeTaskLink(owner, 10)
+			successor := activeTaskLink(owner, 11)
+			cleanup := testCleanup(testMapHandler(nil, map[Identity]any{child: link}, nil))
+			cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+			process := javaProcessIdentity(child)
+			incarnations := cleanup.maps.incarnations.(*fakeBridgeMap)
+			if !test.initiallyLive {
+				delete(incarnations.values, process)
+			}
+			claim, valid := javaRemoteParentTaskCleanupClaim(
+				40*time.Second, testProcessIncarnation,
+			)
+			require.True(t, valid)
+			claims := cleanup.maps.taskClaims.(*fakeBridgeMap)
+			claims.values[child] = claim
+			tasks := cleanup.maps.tasks.(*fakeBridgeMap)
+			if !test.initiallyLive {
+				tasks.afterLookup = func(count int) {
+					if count == 1 {
+						incarnations.values[process] = testProcessIncarnation
+					}
+				}
+			}
+			published := false
+			claims.afterDelete = func(key any) {
+				if key == child {
+					published = true
+					tasks.values[child] = successor
+				}
+			}
+
+			require.NoError(t, cleanup.Sweep())
+			assert.True(t, published)
+			assert.Zero(t, tasks.deleteCount)
+			assert.Equal(t, successor, tasks.values[child])
+			assert.Empty(t, claims.values)
+		})
+	}
 }
 
 func TestCleanupRemovesExpiredGenerationAndTombstones(t *testing.T) {
@@ -1518,7 +2049,10 @@ func TestCleanupRemovesExpiredGenerationAndTombstones(t *testing.T) {
 	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
 
 	key := stateKey{Owner: owner, Generation: 10}
-	handoff := handoffKey{PID: child.PID, Namespace: child.Namespace, Token: 77}
+	handoff := handoffKey{
+		PID: child.PID, Namespace: child.Namespace, Token: 77,
+		ProcessIncarnation: testProcessIncarnation,
+	}
 	cleanup.maps.handoffs.(*fakeBridgeMap).values[handoff] = activeTaskLink(owner, 10)
 	cleanup.maps.handoffClaims.(*fakeBridgeMap).values[handoff] = handoffClaimValue{
 		ObservedMonotonicNS: uint64(10 * time.Second),
@@ -1554,7 +2088,528 @@ func TestCleanupRemovesExpiredGenerationAndTombstones(t *testing.T) {
 	assert.NotEmpty(t, cleanup.maps.incarnations.(*fakeBridgeMap).values)
 }
 
-func TestCleanupNeverDeletesLRUHandoffClaims(t *testing.T) {
+func TestCleanupRemovesOnlyRetiredCapabilityHandoffs(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	process := javaProcessIdentity(owner)
+	predecessorIncarnation := testProcessIncarnation
+	successorIncarnation := testProcessIncarnation + 1
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+	cleanup.maps.incarnations.(*fakeBridgeMap).values[process] = successorIncarnation
+	cleanup.maps.authorized.(*fakeBridgeMap).values[process] = successorIncarnation
+	cleanup.maps.retired.(*fakeBridgeMap).values[retiredProcessKey{
+		Process:            process,
+		ProcessIncarnation: predecessorIncarnation,
+	}] = uint64(10 * time.Second)
+
+	predecessor := activeTaskLink(owner, 10)
+	predecessor.ProcessIncarnation = predecessorIncarnation
+	malformedPredecessor := predecessor
+	malformedPredecessor.Owner.PID++
+	malformedPredecessor.Reserved = 1
+	successor := activeTaskLink(owner, 11)
+	successor.ProcessIncarnation = successorIncarnation
+	malformedSuccessor := successor
+	malformedSuccessor.Reserved = 1
+	handoffs := cleanup.maps.handoffs.(*fakeBridgeMap)
+	retiredKey := handoffKey{
+		PID: owner.PID, Namespace: owner.Namespace, Token: 1,
+		ProcessIncarnation: predecessorIncarnation,
+	}
+	malformedRetiredKey := retiredKey
+	malformedRetiredKey.Token = 2
+	liveKey := handoffKey{
+		PID: owner.PID, Namespace: owner.Namespace, Token: 3,
+		ProcessIncarnation: successorIncarnation,
+	}
+	malformedLiveKey := liveKey
+	malformedLiveKey.Token = 4
+	handoffs.values[retiredKey] = predecessor
+	handoffs.values[malformedRetiredKey] = malformedPredecessor
+	handoffs.values[liveKey] = successor
+	handoffs.values[malformedLiveKey] = malformedSuccessor
+
+	require.NoError(t, cleanup.Sweep())
+	assert.NotContains(t, handoffs.values, retiredKey)
+	assert.NotContains(t, handoffs.values, malformedRetiredKey)
+	assert.Equal(t, successor, handoffs.values[liveKey])
+	assert.Equal(t, malformedSuccessor, handoffs.values[malformedLiveKey])
+}
+
+func TestCleanupRequiresExactRetirementMarkerBeforeCarrierReplaySeparation(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	now := 41 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+	process := javaProcessIdentity(owner)
+	delete(cleanup.maps.incarnations.(*fakeBridgeMap).values, process)
+	key := handoffKey{
+		PID: owner.PID, Namespace: owner.Namespace, Token: 1,
+		ProcessIncarnation: testProcessIncarnation,
+	}
+	link := activeTaskLink(owner, 10)
+	handoffs := cleanup.maps.handoffs.(*fakeBridgeMap)
+	handoffs.values[key] = link
+	replayKey := aliasReplayKey{
+		Owner:               link.Owner,
+		Generation:          link.Generation,
+		ObservedMonotonicNS: link.ObservedMonotonicNS,
+		ProcessIncarnation:  link.ProcessIncarnation,
+	}
+	replay := boundAliasReplayForTest(aliasReplayValue{
+		TransitionMonotonicNS: uint64(20 * time.Second),
+		References:            1,
+		Lifecycle:             lifecycleStale,
+	})
+	replays := cleanup.maps.aliasReplays.(*fakeBridgeMap)
+	replays.values[replayKey] = replay
+
+	require.NoError(t, cleanup.Sweep())
+	assert.Equal(t, link, handoffs.values[key])
+	assert.Equal(t, replay, replays.values[replayKey],
+		"incarnation absence under P cannot strand a positive replay by deleting its carrier")
+
+	seedProcessRetirementForTest(cleanup, process, testProcessIncarnation)
+	require.NoError(t, cleanup.Sweep())
+	assert.NotContains(t, handoffs.values, key)
+	assert.Contains(t, replays.values, replayKey)
+
+	now += javaRemoteParentMinimumFenceAge
+	require.NoError(t, cleanup.Sweep())
+	assert.NotContains(t, replays.values, replayKey)
+}
+
+func TestCleanupRetiredHandoffPreservesSameKeyReplacement(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	process := javaProcessIdentity(owner)
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+	cleanup.maps.incarnations.(*fakeBridgeMap).values[process] = testProcessIncarnation + 1
+	cleanup.maps.authorized.(*fakeBridgeMap).values[process] = testProcessIncarnation + 1
+	seedProcessRetirementForTest(cleanup, process, testProcessIncarnation)
+	key := handoffKey{
+		PID: owner.PID, Namespace: owner.Namespace, Token: 1,
+		ProcessIncarnation: testProcessIncarnation,
+	}
+	expected := activeTaskLink(owner, 10)
+	replacement := activeTaskLink(owner, 11)
+	handoffs := cleanup.maps.handoffs.(*fakeBridgeMap)
+	handoffs.values[key] = expected
+	handoffs.afterLookup = func(count int) {
+		if count != 1 {
+			return
+		}
+		handoffs.mu.Lock()
+		handoffs.values[key] = replacement
+		handoffs.mu.Unlock()
+	}
+
+	require.NoError(t, cleanup.Sweep())
+	assert.Equal(t, replacement, handoffs.values[key])
+}
+
+func TestCleanupRetiredHandoffNoLongerPinsPositiveAliasReplay(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	process := javaProcessIdentity(owner)
+	predecessorIncarnation := testProcessIncarnation
+	successorIncarnation := testProcessIncarnation + 1
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	cleanup.maps.incarnations.(*fakeBridgeMap).values[process] = successorIncarnation
+	cleanup.maps.retired.(*fakeBridgeMap).values[retiredProcessKey{
+		Process:            process,
+		ProcessIncarnation: predecessorIncarnation,
+	}] = uint64(90 * time.Second)
+	replayKey := aliasReplayKey{
+		Owner:               owner,
+		Generation:          10,
+		ObservedMonotonicNS: uint64(90 * time.Second),
+		ProcessIncarnation:  predecessorIncarnation,
+	}
+	cleanup.maps.aliasReplays.(*fakeBridgeMap).values[replayKey] = boundAliasReplayForTest(aliasReplayValue{
+		TransitionMonotonicNS: uint64(90 * time.Second),
+		References:            1,
+		Lifecycle:             lifecycleStale,
+	})
+	handoff := handoffKey{
+		PID: owner.PID, Namespace: owner.Namespace, Token: 1,
+		ProcessIncarnation: predecessorIncarnation,
+	}
+	link := activeTaskLink(owner, replayKey.Generation)
+	link.ObservedMonotonicNS = replayKey.ObservedMonotonicNS
+	link.ProcessIncarnation = predecessorIncarnation
+	cleanup.maps.handoffs.(*fakeBridgeMap).values[handoff] = link
+	now := 100 * time.Second
+	cleanup.monoTimeNow = func() time.Duration { return now }
+
+	require.NoError(t, cleanup.Sweep())
+	assert.NotContains(t, cleanup.maps.handoffs.(*fakeBridgeMap).values, handoff)
+	assert.Contains(t, cleanup.maps.aliasReplays.(*fakeBridgeMap).values, replayKey)
+
+	now += javaRemoteParentMinimumFenceAge
+	require.NoError(t, cleanup.Sweep())
+	assert.NotContains(t, cleanup.maps.aliasReplays.(*fakeBridgeMap).values, replayKey)
+}
+
+func TestCleanupReclaimsClaimCapacityAroundRetiredHandoff(t *testing.T) {
+	owner := Identity{TID: 3, PID: 2, Namespace: 1}
+	process := javaProcessIdentity(owner)
+	cleanup := testCleanup(testMapHandler(nil, nil, nil))
+	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+	delete(cleanup.maps.incarnations.(*fakeBridgeMap).values, process)
+	seedProcessRetirementForTest(cleanup, process, testProcessIncarnation)
+
+	resolvedKey := handoffKey{
+		PID: 9, Namespace: 1, Token: 8,
+		ProcessIncarnation: testProcessIncarnation,
+	}
+	retiredKey := handoffKey{
+		PID: owner.PID, Namespace: owner.Namespace, Token: 7,
+		ProcessIncarnation: testProcessIncarnation,
+	}
+	claims := cleanup.maps.handoffClaims.(*fakeBridgeMap)
+	claims.maxEntries = 1
+	claims.values[resolvedKey] = handoffClaimValue{
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+	}
+	handoffs := cleanup.maps.handoffs.(*fakeBridgeMap)
+	handoffs.values[retiredKey] = activeTaskLink(owner, 10)
+
+	require.NoError(t, cleanup.Sweep())
+	assert.NotContains(t, handoffs.values, retiredKey,
+		"retired-H cleanup must not depend on inserting another C entry")
+	assert.Empty(t, claims.values,
+		"the recurring no-H pass must reclaim resolved admission tickets")
+	assert.Empty(t, cleanup.maps.handoffMutations.(*fakeBridgeMap).values)
+}
+
+func TestCleanupReclaimsResolvedHandoffClaimUnderMutation(t *testing.T) {
+	key := handoffKey{
+		PID: 1, Namespace: 2, Token: 3,
+		ProcessIncarnation: testProcessIncarnation,
+	}
+	claim := handoffClaimValue{
+		ObservedMonotonicNS: uint64(10 * time.Second),
+		ProcessIncarnation:  testProcessIncarnation,
+	}
+
+	t.Run("exact no-H claim", func(t *testing.T) {
+		cleanup := testCleanup(testMapHandler(nil, nil, nil))
+		cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+		claims := cleanup.maps.handoffClaims.(*fakeBridgeMap)
+		claims.values[key] = claim
+
+		require.NoError(t, cleanup.Sweep())
+		assert.NotContains(t, claims.values, key)
+		assert.Empty(t, cleanup.maps.handoffMutations.(*fakeBridgeMap).values)
+	})
+
+	t.Run("second H check observes a publisher", func(t *testing.T) {
+		cleanup := testCleanup(testMapHandler(nil, nil, nil))
+		cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+		claims := cleanup.maps.handoffClaims.(*fakeBridgeMap)
+		claims.values[key] = claim
+		handoffs := cleanup.maps.handoffs.(*fakeBridgeMap)
+		mutations := cleanup.maps.handoffMutations.(*fakeBridgeMap)
+		carrier := activeTaskLink(Identity{TID: 4, PID: 1, Namespace: 2}, 10)
+		lookupsUnderMutation := 0
+		handoffs.afterLookupResult = func(lookupKey any, err error) {
+			if lookupKey != key {
+				return
+			}
+			assert.Contains(t, mutations.values, key)
+			lookupsUnderMutation++
+			if lookupsUnderMutation == 1 && errors.Is(err, ebpf.ErrKeyNotExist) {
+				handoffs.values[key] = carrier
+			}
+		}
+
+		require.NoError(t, cleanup.Sweep())
+		assert.GreaterOrEqual(t, lookupsUnderMutation, 2)
+		assert.Equal(t, carrier, handoffs.values[key])
+		assert.Equal(t, claim, claims.values[key])
+		assert.Empty(t, mutations.values)
+	})
+
+	t.Run("claim replacement after enumeration", func(t *testing.T) {
+		cleanup := testCleanup(testMapHandler(nil, nil, nil))
+		cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+		claims := cleanup.maps.handoffClaims.(*fakeBridgeMap)
+		claims.values[key] = claim
+		replacement := claim
+		replacement.ObservedMonotonicNS++
+		claims.afterIterate = func() { claims.values[key] = replacement }
+
+		require.NoError(t, cleanup.Sweep())
+		assert.NotContains(t, claims.values, key,
+			"the post-pass may safely reclaim the replacement after a new exact snapshot")
+		assert.Empty(t, cleanup.maps.handoffMutations.(*fakeBridgeMap).values)
+	})
+
+	t.Run("delete uncertainty retains recoverable M", func(t *testing.T) {
+		cleanup := testCleanup(testMapHandler(nil, nil, nil))
+		cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
+		claims := cleanup.maps.handoffClaims.(*fakeBridgeMap)
+		claims.values[key] = claim
+		injected := errors.New("injected handoff claim delete failure")
+		claims.deleteErr = injected
+
+		err := cleanup.Sweep()
+		require.ErrorContains(t, err, injected.Error())
+		assert.Equal(t, claim, claims.values[key])
+		mutations := cleanup.maps.handoffMutations.(*fakeBridgeMap)
+		mutation, present := mutations.values[key].(handoffClaimValue)
+		require.True(t, present)
+		assert.True(t, validJavaRemoteParentTaskCleanupClaim(mutation))
+
+		claims.deleteErr = nil
+		require.NoError(t, cleanup.Sweep())
+		assert.NotContains(t, claims.values, key)
+		assert.Empty(t, mutations.values)
+		assert.Empty(t, cleanup.maps.threadMappingClaims.(*fakeBridgeMap).values)
+	})
+}
+
+func terminalHandoffCleanupFixture(
+	t *testing.T,
+	references uint32,
+) (*Cleanup, handoffKey, handoffClaimValue, taskLink, stateKey, aliasReplayKey) {
+	t.Helper()
+	owner := Identity{TID: 4, PID: 1, Namespace: 2}
+	const generation = uint64(10)
+	handler := testMapHandler(map[Identity]any{
+		owner: validEncodedRecord(t, generation),
+	}, nil, nil)
+	process := javaProcessIdentity(owner)
+	handler.authorized.(*fakeBridgeMap).values[process] = testProcessIncarnation
+	handler.incarnations.(*fakeBridgeMap).values[process] = testProcessIncarnation
+
+	cleanup := testCleanup(handler)
+	cleanup.monoTimeNow = func() time.Duration { return 20 * time.Second }
+	key := handoffKey{
+		PID: owner.PID, Namespace: owner.Namespace, Token: 3,
+		ProcessIncarnation: testProcessIncarnation,
+	}
+	claim := handoffClaimValue{
+		ObservedMonotonicNS: uint64(10*time.Second) | javaRemoteParentTaskCleanupClaimTag,
+		ProcessIncarnation:  testProcessIncarnation,
+	}
+	carrier := activeTaskLink(owner, generation)
+	cleanup.maps.handoffClaims.(*fakeBridgeMap).values[key] = claim
+	cleanup.maps.handoffs.(*fakeBridgeMap).values[key] = carrier
+
+	generationKey := stateKey{Owner: owner, Generation: generation}
+	state := cleanup.maps.states.(*fakeBridgeMap).values[generationKey].(stateValue)
+	state.Aliases = references
+	cleanup.maps.states.(*fakeBridgeMap).values[generationKey] = state
+	replayKey := aliasReplayKeyForState(generationKey, state)
+	replay := boundAliasReplayForStateForTest(handler, generationKey, state, aliasReplayValue{
+		TransitionMonotonicNS: state.ObservedMonotonicNS,
+		References:            references,
+		Lifecycle:             lifecycleActive,
+	})
+	cleanup.maps.aliasReplays.(*fakeBridgeMap).values[replayKey] = replay
+	return cleanup, key, claim, carrier, generationKey, replayKey
+}
+
+func deleteTerminalHandoffClaimAfterHObservation(
+	t *testing.T,
+	cleanup *Cleanup,
+	key handoffKey,
+) *bool {
+	t.Helper()
+	deleted := new(bool)
+	handoffs := cleanup.maps.handoffs.(*fakeBridgeMap)
+	handoffs.afterLookupResult = func(lookupKey any, err error) {
+		if *deleted || lookupKey != key || err != nil {
+			return
+		}
+		assert.Contains(t, cleanup.maps.handoffMutations.(*fakeBridgeMap).values, key)
+		process := Identity{TID: key.PID, PID: key.PID, Namespace: key.Namespace}
+		assert.Contains(t, cleanup.maps.threadMappingClaims.(*fakeBridgeMap).values, process)
+		delete(cleanup.maps.handoffClaims.(*fakeBridgeMap).values, key)
+		*deleted = true
+	}
+	return deleted
+}
+
+func assertTerminalHandoffReferencesReleased(
+	t *testing.T,
+	cleanup *Cleanup,
+	generationKey stateKey,
+	replayKey aliasReplayKey,
+) {
+	t.Helper()
+	if state, present := cleanup.maps.states.(*fakeBridgeMap).values[generationKey].(stateValue); present {
+		assert.Zero(t, state.Aliases)
+	}
+	if replay, present := cleanup.maps.aliasReplays.(*fakeBridgeMap).values[replayKey].(aliasReplayValue); present {
+		assert.Zero(t, replay.References)
+	}
+}
+
+func TestCleanupDrainsHandoffWhenTerminalClaimDisappearsUnderMutation(t *testing.T) {
+	t.Run("terminal delete after H observation converges", func(t *testing.T) {
+		cleanup, key, _, carrier, generationKey, replayKey := terminalHandoffCleanupFixture(t, 1)
+		deleted := deleteTerminalHandoffClaimAfterHObservation(t, cleanup, key)
+		prepared := false
+		cleanup.maps.handoffMutations.(*fakeBridgeMap).afterUpdate = func(_ any, value any) {
+			prepared = prepared || validJavaRemoteParentTerminalHandoffCleanupClaim(
+				value.(handoffClaimValue),
+			)
+		}
+		counterUpdateFenced := false
+		cleanup.maps.aliasReplays.(*fakeBridgeMap).beforeUpdate = func(
+			updatedKey any,
+			updatedValue any,
+			_ ebpf.MapUpdateFlags,
+		) {
+			if updatedKey != replayKey || updatedValue.(aliasReplayValue).References != 0 {
+				return
+			}
+			mutation := cleanup.maps.handoffMutations.(*fakeBridgeMap).values[key].(handoffClaimValue)
+			claimKey, claim, valid := terminalHandoffGenerationCleanupClaim(mutation, carrier)
+			require.True(t, valid)
+			assert.Equal(t, claim, cleanup.maps.claims.(*fakeBridgeMap).values[claimKey])
+			counterUpdateFenced = true
+		}
+
+		require.NoError(t, cleanup.Sweep())
+		require.True(t, *deleted)
+		assert.True(t, prepared)
+		assert.True(t, counterUpdateFenced)
+		assert.NotContains(t, cleanup.maps.handoffClaims.(*fakeBridgeMap).values, key)
+		assert.NotContains(t, cleanup.maps.handoffs.(*fakeBridgeMap).values, key)
+		assert.Empty(t, cleanup.maps.handoffMutations.(*fakeBridgeMap).values)
+		assert.Empty(t, cleanup.maps.threadMappingClaims.(*fakeBridgeMap).values)
+		assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+		assertTerminalHandoffReferencesReleased(t, cleanup, generationKey, replayKey)
+	})
+
+	t.Run("claim replacement is not a terminal delete", func(t *testing.T) {
+		cleanup, key, claim, carrier, generationKey, replayKey := terminalHandoffCleanupFixture(t, 1)
+		replacement := claim
+		replacement.ObservedMonotonicNS++
+		replaced := false
+		cleanup.maps.handoffs.(*fakeBridgeMap).afterLookupResult = func(
+			lookupKey any,
+			err error,
+		) {
+			if replaced || lookupKey != key || err != nil {
+				return
+			}
+			cleanup.maps.handoffClaims.(*fakeBridgeMap).values[key] = replacement
+			replaced = true
+		}
+		prepared := false
+		cleanup.maps.handoffMutations.(*fakeBridgeMap).afterUpdate = func(_ any, value any) {
+			prepared = prepared || validJavaRemoteParentTerminalHandoffCleanupClaim(
+				value.(handoffClaimValue),
+			)
+		}
+
+		require.NoError(t, cleanup.Sweep())
+		require.True(t, replaced)
+		assert.False(t, prepared)
+		assert.Equal(t, replacement, cleanup.maps.handoffClaims.(*fakeBridgeMap).values[key])
+		assert.Equal(t, carrier, cleanup.maps.handoffs.(*fakeBridgeMap).values[key])
+		assert.Empty(t, cleanup.maps.handoffMutations.(*fakeBridgeMap).values)
+		assert.Empty(t, cleanup.maps.threadMappingClaims.(*fakeBridgeMap).values)
+		assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+		state := cleanup.maps.states.(*fakeBridgeMap).values[generationKey].(stateValue)
+		assert.Equal(t, uint32(1), state.Aliases)
+		replay := cleanup.maps.aliasReplays.(*fakeBridgeMap).values[replayKey].(aliasReplayValue)
+		assert.Equal(t, uint32(1), replay.References)
+	})
+
+	t.Run("non-unique counts retain recoverable intent", func(t *testing.T) {
+		cleanup, key, _, carrier, generationKey, replayKey := terminalHandoffCleanupFixture(t, 2)
+		deleted := deleteTerminalHandoffClaimAfterHObservation(t, cleanup, key)
+
+		require.NoError(t, cleanup.Sweep())
+		require.True(t, *deleted)
+		assert.Equal(t, carrier, cleanup.maps.handoffs.(*fakeBridgeMap).values[key])
+		mutation := cleanup.maps.handoffMutations.(*fakeBridgeMap).values[key].(handoffClaimValue)
+		assert.True(t, validJavaRemoteParentTaskCleanupClaim(mutation))
+		assert.False(t, validJavaRemoteParentTerminalHandoffCleanupClaim(mutation))
+		assert.NotEmpty(t, cleanup.maps.threadMappingClaims.(*fakeBridgeMap).values)
+		claimKey, generationClaim, valid := terminalHandoffGenerationCleanupClaim(mutation, carrier)
+		require.True(t, valid)
+		assert.Equal(t, generationClaim, cleanup.maps.claims.(*fakeBridgeMap).values[claimKey])
+		state := cleanup.maps.states.(*fakeBridgeMap).values[generationKey].(stateValue)
+		assert.Equal(t, uint32(2), state.Aliases)
+		replay := cleanup.maps.aliasReplays.(*fakeBridgeMap).values[replayKey].(aliasReplayValue)
+		assert.Equal(t, uint32(2), replay.References)
+
+		// A sibling carrier can finish its ordinary BPF release while P prevents
+		// replacement retains. Recovery then proves that H owns the final pair.
+		state.Aliases = 1
+		cleanup.maps.states.(*fakeBridgeMap).values[generationKey] = state
+		replay.References = 1
+		cleanup.maps.aliasReplays.(*fakeBridgeMap).values[replayKey] = replay
+		require.NoError(t, cleanup.Sweep())
+		assert.NotContains(t, cleanup.maps.handoffs.(*fakeBridgeMap).values, key)
+		assert.Empty(t, cleanup.maps.handoffMutations.(*fakeBridgeMap).values)
+		assert.Empty(t, cleanup.maps.threadMappingClaims.(*fakeBridgeMap).values)
+		assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+		assertTerminalHandoffReferencesReleased(t, cleanup, generationKey, replayKey)
+	})
+
+	t.Run("foreign generation claim preserves terminal H", func(t *testing.T) {
+		cleanup, key, _, carrier, generationKey, replayKey := terminalHandoffCleanupFixture(t, 1)
+		deleted := deleteTerminalHandoffClaimAfterHObservation(t, cleanup, key)
+		foreign := testGenerationClaim(lifecycleConsumed)
+		cleanup.maps.claims.(*fakeBridgeMap).values[generationKey] = foreign
+
+		require.NoError(t, cleanup.Sweep())
+		require.True(t, *deleted)
+		assert.Equal(t, carrier, cleanup.maps.handoffs.(*fakeBridgeMap).values[key])
+		assert.Equal(t, foreign, cleanup.maps.claims.(*fakeBridgeMap).values[generationKey])
+		mutation := cleanup.maps.handoffMutations.(*fakeBridgeMap).values[key].(handoffClaimValue)
+		assert.True(t, validJavaRemoteParentResolvedHandoffCleanupClaim(mutation))
+		assert.False(t, validJavaRemoteParentTerminalHandoffCleanupClaim(mutation))
+		state := cleanup.maps.states.(*fakeBridgeMap).values[generationKey].(stateValue)
+		assert.Equal(t, uint32(1), state.Aliases)
+		replay := cleanup.maps.aliasReplays.(*fakeBridgeMap).values[replayKey].(aliasReplayValue)
+		assert.Equal(t, uint32(1), replay.References)
+
+		delete(cleanup.maps.claims.(*fakeBridgeMap).values, generationKey)
+		require.NoError(t, cleanup.Sweep())
+		assert.NotContains(t, cleanup.maps.handoffs.(*fakeBridgeMap).values, key)
+		assert.Empty(t, cleanup.maps.handoffMutations.(*fakeBridgeMap).values)
+		assert.Empty(t, cleanup.maps.threadMappingClaims.(*fakeBridgeMap).values)
+		assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+		assertTerminalHandoffReferencesReleased(t, cleanup, generationKey, replayKey)
+	})
+
+	t.Run("replay update error keeps phase M and P", func(t *testing.T) {
+		cleanup, key, _, carrier, generationKey, replayKey := terminalHandoffCleanupFixture(t, 1)
+		deleted := deleteTerminalHandoffClaimAfterHObservation(t, cleanup, key)
+		injected := errors.New("injected terminal replay update failure")
+		cleanup.maps.aliasReplays.(*fakeBridgeMap).updateErr = injected
+
+		err := cleanup.Sweep()
+		require.ErrorContains(t, err, injected.Error())
+		require.True(t, *deleted)
+		assert.Equal(t, carrier, cleanup.maps.handoffs.(*fakeBridgeMap).values[key])
+		mutation := cleanup.maps.handoffMutations.(*fakeBridgeMap).values[key].(handoffClaimValue)
+		assert.True(t, validJavaRemoteParentTerminalHandoffCleanupClaim(mutation))
+		assert.NotEmpty(t, cleanup.maps.threadMappingClaims.(*fakeBridgeMap).values)
+		claimKey, generationClaim, valid := terminalHandoffGenerationCleanupClaim(mutation, carrier)
+		require.True(t, valid)
+		assert.Equal(t, generationClaim, cleanup.maps.claims.(*fakeBridgeMap).values[claimKey])
+
+		cleanup.maps.aliasReplays.(*fakeBridgeMap).updateErr = nil
+		require.NoError(t, cleanup.Sweep())
+		assert.NotContains(t, cleanup.maps.handoffs.(*fakeBridgeMap).values, key)
+		assert.Empty(t, cleanup.maps.handoffMutations.(*fakeBridgeMap).values)
+		assert.Empty(t, cleanup.maps.threadMappingClaims.(*fakeBridgeMap).values)
+		assert.Empty(t, cleanup.maps.claims.(*fakeBridgeMap).values)
+		assertTerminalHandoffReferencesReleased(t, cleanup, generationKey, replayKey)
+	})
+}
+
+func TestCleanupPreservesMalformedHandoffClaims(t *testing.T) {
 	cleanup := testCleanup(testMapHandler(nil, nil, nil))
 	cleanup.ttl = 30 * time.Second
 	cleanup.monoTimeNow = func() time.Duration { return 41 * time.Second }
@@ -1638,6 +2693,7 @@ func TestCleanupRetiredProcessDoesNotDeleteReusedPIDState(t *testing.T) {
 	cleanup.maps.vtIdentities.(*fakeBridgeMap).values[oldVirtualOwner] = oldIdentity
 	cleanup.maps.vtIdentities.(*fakeBridgeMap).values[newVirtualOwner] = newIdentity
 	cleanup.maps.incarnations.(*fakeBridgeMap).values[process] = testProcessIncarnation + 1
+	cleanup.maps.authorized.(*fakeBridgeMap).values[process] = testProcessIncarnation + 1
 	retirement := retiredProcessKey{
 		Process:            process,
 		ProcessIncarnation: testProcessIncarnation,
@@ -1734,6 +2790,7 @@ func TestCleanupDoesNotDeleteProcessIncarnation(t *testing.T) {
 	cleanup := testCleanup(handler)
 	incarnations := cleanup.maps.incarnations.(*fakeBridgeMap)
 	incarnations.values[process] = testProcessIncarnation + 1
+	cleanup.maps.authorized.(*fakeBridgeMap).values[process] = testProcessIncarnation + 1
 	retirement := retiredProcessKey{
 		Process:            process,
 		ProcessIncarnation: testProcessIncarnation,
@@ -1979,10 +3036,13 @@ func TestCleanupValidOrphanOwnerConvergesAndPreservesReplacement(t *testing.T) {
 	})
 }
 
-func TestCleanupNeverDeletesTaskOrHandoffLinks(t *testing.T) {
+func TestCleanupNeverDeletesLiveTaskOrHandoffLinks(t *testing.T) {
 	owner := Identity{TID: 3, PID: 2, Namespace: 1}
 	child := Identity{TID: 4, PID: 2, Namespace: 1}
-	handoff := handoffKey{PID: child.PID, Namespace: child.Namespace, Token: 77}
+	handoff := handoffKey{
+		PID: child.PID, Namespace: child.Namespace, Token: 77,
+		ProcessIncarnation: testProcessIncarnation,
+	}
 	stale := activeTaskLink(owner, 10)
 
 	for _, test := range []struct {
@@ -2028,6 +3088,7 @@ func testCleanup(handler *MapHandler) *Cleanup {
 			tasks:                          handler.tasks.(cleanupMap),
 			virtualThreads:                 handler.virtualThreads.(cleanupMap),
 			vtIdentities:                   handler.vtIdentities.(cleanupMap),
+			authorized:                     handler.authorized.(cleanupMap),
 			incarnations:                   handler.incarnations.(cleanupMap),
 			connections:                    handler.connections.(cleanupMap),
 			cookieConnections:              handler.cookieConnections.(cleanupMap),
@@ -2041,6 +3102,9 @@ func testCleanup(handler *MapHandler) *Cleanup {
 			ownerGuards:                    handler.ownerGuards.(cleanupMap),
 			handoffs:                       newMap(),
 			handoffClaims:                  newMap(),
+			handoffMutations:               newMap(),
+			taskClaims:                     newMap(),
+			threadMappingClaims:            newMap(),
 			retired:                        newMap(),
 			sslPrewrite:                    newMap(),
 			sslPrewriteConnectionAmbiguity: newMap(),
@@ -2050,8 +3114,20 @@ func testCleanup(handler *MapHandler) *Cleanup {
 		ttl:                  handler.ttl,
 		monoTimeNow:          handler.monoTimeNow,
 		aliasReplayNoCarrier: make(map[aliasReplayKey]aliasReplayNoCarrierObservation),
+		processClaims:        make(map[Identity]threadMappingClaimValue),
 		coordinator:          handler.coordinator,
 	}
+}
+
+func seedProcessRetirementForTest(
+	cleanup *Cleanup,
+	process Identity,
+	processIncarnation uint64,
+) {
+	cleanup.maps.retired.(*fakeBridgeMap).values[retiredProcessKey{
+		Process:            process,
+		ProcessIncarnation: processIncarnation,
+	}] = uint64(time.Second)
 }
 
 func seedAgedGenerationCleanupFence(
@@ -2353,8 +3429,7 @@ func TestCleanupRetainsIndexUntilPhysicalSnapshotConverges(t *testing.T) {
 func TestCleanupRetainedGenerationIndexDoesNotTouchCoherentSuccessor(t *testing.T) {
 	owner := Identity{TID: 3, PID: 2, Namespace: 1}
 	handler := testMapHandler(nil, nil, nil)
-	handler.remoteParents.(*fakeBridgeMap).values[owner] =
-		validEncodedRecordObservedAt(t, 11, 40*time.Second)
+	handler.remoteParents.(*fakeBridgeMap).values[owner] = validEncodedRecordObservedAt(t, 11, 40*time.Second)
 	seedOwnerState(handler, owner, 11)
 	oldKey := stateKey{Owner: owner, Generation: 10}
 	handler.generations.(*fakeBridgeMap).values[oldKey] = generationIndexValue{
@@ -2395,8 +3470,7 @@ func TestCleanupRetainedGenerationIndexDoesNotTouchCoherentSuccessor(t *testing.
 func TestCleanupRejectsIncoherentSuccessor(t *testing.T) {
 	owner := Identity{TID: 3, PID: 2, Namespace: 1}
 	handler := testMapHandler(nil, nil, nil)
-	handler.remoteParents.(*fakeBridgeMap).values[owner] =
-		validEncodedRecordObservedAt(t, 11, 40*time.Second)
+	handler.remoteParents.(*fakeBridgeMap).values[owner] = validEncodedRecordObservedAt(t, 11, 40*time.Second)
 	seedOwnerState(handler, owner, 11)
 	clear(handler.cookieConnections.(*fakeBridgeMap).values)
 	oldKey := stateKey{Owner: owner, Generation: 10}
@@ -2445,15 +3519,13 @@ func TestCleanupIncompleteLogicalSnapshotRetainsMarkerFreeFenceTail(t *testing.T
 		{
 			name: "generation scan",
 			inject: func(cleanup *Cleanup) {
-				cleanup.maps.generations.(*fakeBridgeMap).iterateErr =
-					errors.New("injected generation scan failure")
+				cleanup.maps.generations.(*fakeBridgeMap).iterateErr = errors.New("injected generation scan failure")
 			},
 		},
 		{
 			name: "state scan",
 			inject: func(cleanup *Cleanup) {
-				cleanup.maps.states.(*fakeBridgeMap).iterateErr =
-					errors.New("injected state scan failure")
+				cleanup.maps.states.(*fakeBridgeMap).iterateErr = errors.New("injected state scan failure")
 			},
 		},
 	} {
@@ -2724,7 +3796,7 @@ func TestCleanupExactMarkerTailUncertainUpdateStopsAdmission(t *testing.T) {
 				claims.afterFailedUpdate = func() { claims.lookupErr = lookupErr }
 			}
 			claims.afterLookupResult = func(_ any, errorValue error) {
-				if errorValue == lookupErr {
+				if errors.Is(errorValue, lookupErr) {
 					claims.lookupErr = nil
 				}
 			}
@@ -3437,12 +4509,11 @@ func TestCleanupValidTerminalRetiresCrashFenceTails(t *testing.T) {
 			}
 			if test.withReplay {
 				replayKey := aliasReplayKeyForTerminal(key, terminal)
-				cleanup.maps.aliasReplays.(*fakeBridgeMap).values[replayKey] =
-					boundAliasReplayForTest(aliasReplayValue{
-						TransitionMonotonicNS: uint64(10 * time.Second),
-						References:            1,
-						Lifecycle:             terminal.Lifecycle,
-					})
+				cleanup.maps.aliasReplays.(*fakeBridgeMap).values[replayKey] = boundAliasReplayForTest(aliasReplayValue{
+					TransitionMonotonicNS: uint64(10 * time.Second),
+					References:            1,
+					Lifecycle:             terminal.Lifecycle,
+				})
 			}
 
 			stats, err := cleanup.SweepWithStats()
@@ -4624,7 +5695,7 @@ func TestCleanupExactTailUnverifiableUpgradeStillStartsFreshGrace(t *testing.T) 
 	claims.updateCommitErr = updateErr
 	claims.afterUpdate = func(any, any) { claims.lookupErr = lookupErr }
 	claims.afterLookupResult = func(_ any, err error) {
-		if err == lookupErr {
+		if errors.Is(err, lookupErr) {
 			claims.lookupErr = nil
 		}
 	}
@@ -5217,8 +6288,7 @@ func TestCleanupReleasesPartialFenceTailsWithoutArtifactAuthority(t *testing.T) 
 func TestCleanupReleasesAgedGuardBehindZeroReservationWithoutTouchingGeneration(t *testing.T) {
 	owner := Identity{TID: 3, PID: 2, Namespace: 1}
 	handler := testMapHandler(nil, nil, nil)
-	handler.remoteParents.(*fakeBridgeMap).values[owner] =
-		validEncodedRecordObservedAt(t, 10, 40*time.Second)
+	handler.remoteParents.(*fakeBridgeMap).values[owner] = validEncodedRecordObservedAt(t, 10, 40*time.Second)
 	seedOwnerState(handler, owner, 10)
 	key := stateKey{Owner: owner, Generation: 10}
 	guardKey := owner
@@ -5341,7 +6411,7 @@ func TestCleanupConnectionDeletionRevalidatesFenceBetweenIndexes(t *testing.T) {
 
 	cleaned, err := cleanup.cleanupGeneration(key, index)
 	assert.True(t, hookCalled)
-	assert.Error(t, err)
+	require.Error(t, err)
 	assert.False(t, cleaned)
 	assert.Empty(t, cleanup.maps.cookieConnections.(*fakeBridgeMap).values)
 	assert.NotEmpty(t, cleanup.maps.connections.(*fakeBridgeMap).values)
@@ -5843,8 +6913,7 @@ func TestCleanupAgedTerminalMarkerTailDoesNotFenceSuccessor(t *testing.T) {
 	handler := testMapHandler(map[Identity]any{
 		owner: validEncodedRecordObservedAt(t, 11, 40*time.Second),
 	}, nil, nil)
-	handler.incarnations.(*fakeBridgeMap).values[javaProcessIdentity(owner)] =
-		testProcessIncarnation
+	handler.incarnations.(*fakeBridgeMap).values[javaProcessIdentity(owner)] = testProcessIncarnation
 	cleanup := testCleanup(handler)
 	now := 41 * time.Second
 	cleanup.monoTimeNow = func() time.Duration { return now }
@@ -5981,7 +7050,9 @@ func TestCleanupMarkerFreeActiveReplayTailReconstructsFence(t *testing.T) {
 	assert.Equal(t, lifecycleConsumed, finalReplay.Lifecycle)
 }
 
-func seedUnrelatedAliasReplaysForCleanupTest(replays *fakeBridgeMap, count uint32) {
+func seedUnrelatedAliasReplaysForCleanupTest(replays *fakeBridgeMap) {
+	const count = 32
+
 	for i := uint32(0); i < count; i++ {
 		replays.values[aliasReplayKey{
 			Owner: Identity{
@@ -5995,10 +7066,7 @@ func seedUnrelatedAliasReplaysForCleanupTest(replays *fakeBridgeMap, count uint3
 }
 
 func TestCleanupMarkerFreeActiveReplayRecoveryIsBoundedAndFair(t *testing.T) {
-	const (
-		tails            = 8
-		unrelatedReplays = 32
-	)
+	const tails = 8
 	cleanup := testCleanup(testMapHandler(nil, nil, nil))
 	now := 41 * time.Second
 	cleanup.monoTimeNow = func() time.Duration { return now }
@@ -6030,7 +7098,7 @@ func TestCleanupMarkerFreeActiveReplayRecoveryIsBoundedAndFair(t *testing.T) {
 			ProcessIncarnation:  claim.ProcessIncarnation,
 		}] = activeAliasReplayForTest()
 	}
-	seedUnrelatedAliasReplaysForCleanupTest(replays, unrelatedReplays)
+	seedUnrelatedAliasReplaysForCleanupTest(replays)
 
 	replayIterations := 0
 	replays.afterIterate = func() { replayIterations++ }
@@ -6050,10 +7118,7 @@ func TestCleanupMarkerFreeActiveReplayRecoveryIsBoundedAndFair(t *testing.T) {
 }
 
 func TestCleanupMarkerFreeClaimGuardFallbackIsBoundedAndFair(t *testing.T) {
-	const (
-		tails            = 8
-		unrelatedReplays = 32
-	)
+	const tails = 8
 	cleanup := testCleanup(testMapHandler(nil, nil, nil))
 	now := 41 * time.Second
 	cleanup.monoTimeNow = func() time.Duration { return now }
@@ -6078,7 +7143,7 @@ func TestCleanupMarkerFreeClaimGuardFallbackIsBoundedAndFair(t *testing.T) {
 			Reserved:            [7]byte{lifecyclePublishing},
 		}
 	}
-	seedUnrelatedAliasReplaysForCleanupTest(replays, unrelatedReplays)
+	seedUnrelatedAliasReplaysForCleanupTest(replays)
 
 	replayIterations := 0
 	replays.afterIterate = func() { replayIterations++ }
@@ -6098,10 +7163,7 @@ func TestCleanupMarkerFreeClaimGuardFallbackIsBoundedAndFair(t *testing.T) {
 }
 
 func TestCleanupMarkerFreeEOnlyReplayProofIsBoundedAndFair(t *testing.T) {
-	const (
-		tails            = 8
-		unrelatedReplays = 32
-	)
+	const tails = 8
 	cleanup := testCleanup(testMapHandler(nil, nil, nil))
 	now := 41 * time.Second
 	cleanup.monoTimeNow = func() time.Duration { return now }
@@ -6117,7 +7179,7 @@ func TestCleanupMarkerFreeEOnlyReplayProofIsBoundedAndFair(t *testing.T) {
 			Reserved:            [7]byte{lifecycleConsumed},
 		}
 	}
-	seedUnrelatedAliasReplaysForCleanupTest(replays, unrelatedReplays)
+	seedUnrelatedAliasReplaysForCleanupTest(replays)
 
 	replayIterations := 0
 	replays.afterIterate = func() { replayIterations++ }
@@ -6135,10 +7197,7 @@ func TestCleanupMarkerFreeEOnlyReplayProofIsBoundedAndFair(t *testing.T) {
 }
 
 func TestCleanupPublishingZeroReservationReplayProofIsBoundedAndFair(t *testing.T) {
-	const (
-		tails            = 8
-		unrelatedReplays = 32
-	)
+	const tails = 8
 	cleanup := testCleanup(testMapHandler(nil, nil, nil))
 	now := 41 * time.Second
 	cleanup.monoTimeNow = func() time.Duration { return now }
@@ -6164,7 +7223,7 @@ func TestCleanupPublishingZeroReservationReplayProofIsBoundedAndFair(t *testing.
 		}
 		markers.values[key] = uint64(0)
 	}
-	seedUnrelatedAliasReplaysForCleanupTest(replays, unrelatedReplays)
+	seedUnrelatedAliasReplaysForCleanupTest(replays)
 
 	replayIterations := 0
 	replays.afterIterate = func() { replayIterations++ }
@@ -6184,10 +7243,7 @@ func TestCleanupPublishingZeroReservationReplayProofIsBoundedAndFair(t *testing.
 }
 
 func TestCleanupGuardOnlyReplayProofIsBoundedAndFair(t *testing.T) {
-	const (
-		tails            = 8
-		unrelatedReplays = 32
-	)
+	const tails = 8
 	for _, markerPresent := range []bool{false, true} {
 		name := "marker free"
 		if markerPresent {
@@ -6214,7 +7270,7 @@ func TestCleanupGuardOnlyReplayProofIsBoundedAndFair(t *testing.T) {
 					markers.values[key] = uint64(0)
 				}
 			}
-			seedUnrelatedAliasReplaysForCleanupTest(replays, unrelatedReplays)
+			seedUnrelatedAliasReplaysForCleanupTest(replays)
 
 			replayIterations := 0
 			replays.afterIterate = func() { replayIterations++ }
@@ -6264,7 +7320,7 @@ func TestCleanupGenerationReplayScanSchedulerDoesNotStarveGuards(t *testing.T) {
 			Reserved:            [7]byte{lifecyclePublishing},
 		}
 	}
-	seedUnrelatedAliasReplaysForCleanupTest(replays, 32)
+	seedUnrelatedAliasReplaysForCleanupTest(replays)
 
 	for sweep := 1; sweep <= 2*tailsPerClass; sweep++ {
 		stats, err := cleanup.SweepWithStats()
@@ -6280,10 +7336,7 @@ func TestCleanupGenerationReplayScanSchedulerDoesNotStarveGuards(t *testing.T) {
 }
 
 func TestCleanupMarkedFullFenceReplayProofIsBoundedAndFair(t *testing.T) {
-	const (
-		tails            = 8
-		unrelatedReplays = 32
-	)
+	const tails = 8
 	cleanup := testCleanup(testMapHandler(nil, nil, nil))
 	now := 41 * time.Second
 	cleanup.monoTimeNow = func() time.Duration { return now }
@@ -6309,7 +7362,7 @@ func TestCleanupMarkedFullFenceReplayProofIsBoundedAndFair(t *testing.T) {
 		}
 		markers.values[key] = uint64(10 * time.Second)
 	}
-	seedUnrelatedAliasReplaysForCleanupTest(replays, unrelatedReplays)
+	seedUnrelatedAliasReplaysForCleanupTest(replays)
 
 	replayIterations := 0
 	replays.afterIterate = func() { replayIterations++ }
@@ -6359,7 +7412,7 @@ func TestCleanupExactTailBacklogDoesNotConsumeGenerationReplayScanAdmission(t *t
 		Lifecycle:           lifecycleCleanup,
 		Reserved:            [7]byte{lifecycleConsumed},
 	}
-	seedUnrelatedAliasReplaysForCleanupTest(replays, 32)
+	seedUnrelatedAliasReplaysForCleanupTest(replays)
 
 	replayIterations := 0
 	replays.afterIterate = func() { replayIterations++ }
@@ -6523,7 +7576,7 @@ func TestCleanupGenerationReplayScanIteratorErrorIsBoundedAndRotates(t *testing.
 			Reserved:            [7]byte{lifecycleConsumed},
 		}
 	}
-	seedUnrelatedAliasReplaysForCleanupTest(replays, 32)
+	seedUnrelatedAliasReplaysForCleanupTest(replays)
 
 	injected := errors.New("injected generation replay iteration failure")
 	iterations := 0
@@ -6818,9 +7871,11 @@ func TestCleanupMarkerFreeReplayRecoveryRequiresUniqueOpeningActiveEpoch(t *test
 			name:        "multiple active epochs",
 			claimOrigin: lifecycleConsumed,
 			replays: func(key stateKey, claim generationClaim) map[aliasReplayKey]any {
-				first := aliasReplayKey{Owner: key.Owner, Generation: key.Generation,
+				first := aliasReplayKey{
+					Owner: key.Owner, Generation: key.Generation,
 					ObservedMonotonicNS: uint64(10 * time.Second),
-					ProcessIncarnation:  claim.ProcessIncarnation}
+					ProcessIncarnation:  claim.ProcessIncarnation,
+				}
 				second := first
 				second.ObservedMonotonicNS++
 				return map[aliasReplayKey]any{
@@ -7616,8 +8671,7 @@ func TestCleanupPhysicalOnlyBootstrapRequiresCompletePhysicalScan(t *testing.T) 
 		{
 			name: "cookie scan",
 			inject: func(cleanup *Cleanup) {
-				cleanup.maps.cookieConnections.(*fakeBridgeMap).iterateErr =
-					errors.New("injected scan failure")
+				cleanup.maps.cookieConnections.(*fakeBridgeMap).iterateErr = errors.New("injected scan failure")
 			},
 		},
 	} {

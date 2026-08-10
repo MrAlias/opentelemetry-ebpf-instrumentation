@@ -53,16 +53,7 @@
 
 char __license[] SEC("license") = "Dual MIT/GPL";
 
-SEC("tracepoint/sched/sched_process_exit")
-int obi_java_remote_parent_process_exit(void *ctx) {
-    (void)ctx;
-
-    const struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-    // do_exit decrements signal->live before sched_process_exit on all supported kernels.
-    if (BPF_CORE_READ(task, signal, live.counter) != 0) {
-        return 0;
-    }
-
+static __always_inline int java_remote_parent_retire_current_process() {
     pid_key_t current = {0};
     task_tid(&current);
     const pid_key_t process = java_process_key(&current);
@@ -73,21 +64,49 @@ int obi_java_remote_parent_process_exit(void *ctx) {
     }
 
     const u64 process_incarnation = *registered;
+    u8 retirement_durable = !java_remote_parent_enabled;
     if (java_remote_parent_enabled) {
-        const java_retired_process_key_t key = {
-            .process = process,
-            .process_incarnation = process_incarnation,
-        };
         const u64 observed_monotime_ns = bpf_ktime_get_ns();
-        bpf_map_update_elem(&java_retired_processes, &key, &observed_monotime_ns, BPF_NOEXIST);
+        retirement_durable = java_publish_process_retirement(
+            &process,
+            process_incarnation,
+            observed_monotime_ns ? observed_monotime_ns : process_incarnation);
     }
 
     registered = bpf_map_lookup_elem(&java_process_incarnations, &process);
-    if (registered && *registered == process_incarnation) {
+    // R(A) is the durable authority for carrier deletion. If the bounded
+    // marker map is saturated, retain the already-allocated exact incarnation
+    // slot after deauthorization; userspace cleanup retries marker publication
+    // under P(process) before it removes A.
+    if (retirement_durable && registered && *registered == process_incarnation) {
         bpf_map_delete_elem(&java_process_incarnations, &process);
     }
     bpf_map_delete_elem(&java_authorized_processes, &process);
     return 0;
+}
+
+SEC("tracepoint/sched/sched_process_exec")
+int obi_java_remote_parent_process_exec(void *ctx) {
+    (void)ctx;
+
+    // This tracepoint runs only after a successful image replacement and
+    // before the replacement resumes in userspace. Retire the old exact
+    // incarnation even when exec selected the same device and inode, since
+    // neither /proc starttime nor executable identity changes in that case.
+    return java_remote_parent_retire_current_process();
+}
+
+SEC("tracepoint/sched/sched_process_exit")
+int obi_java_remote_parent_process_exit(void *ctx) {
+    (void)ctx;
+
+    const struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    // do_exit decrements signal->live before sched_process_exit on all supported kernels.
+    if (BPF_CORE_READ(task, signal, live.counter) != 0) {
+        return 0;
+    }
+
+    return java_remote_parent_retire_current_process();
 }
 
 // =============================================================================

@@ -17,12 +17,63 @@
 #include <maps/java_tasks.h>
 #include <maps/incoming_trace_map.h>
 #include <maps/java_remote_parent_shared.h>
+#include <maps/java_thread_mapping_claims.h>
 #include <maps/java_vt_threads.h>
 
 #include <pid/pid_helpers.h>
 #include <pid/types/pid_key.h>
 
 enum { k_java_remote_parent_max_ancestry = 3 };
+
+static __always_inline u8 java_remote_parent_process_claim_equal(
+    const java_thread_mapping_claim_t *left, const java_thread_mapping_claim_t *right) {
+    return left && right && left->reserved == 0 && right->reserved == 0 &&
+           left->process_incarnation == right->process_incarnation &&
+           left->child.tid == right->child.tid && left->child.pid == right->child.pid &&
+           left->child.ns == right->child.ns;
+}
+
+static __always_inline u8
+java_remote_parent_acquire_process_claim(const pid_key_t *execution,
+                                         u64 process_capability,
+                                         pid_key_t *process,
+                                         java_thread_mapping_claim_t *claim) {
+    if (!execution || !process_capability || !process || !claim) {
+        return 0;
+    }
+    *process = java_process_key(execution);
+    *claim = (java_thread_mapping_claim_t){
+        .child = *execution,
+        .process_incarnation = process_capability,
+    };
+    if (bpf_map_update_elem(&java_thread_mapping_claims, process, claim, BPF_NOEXIST) != 0) {
+        return 0;
+    }
+    const java_thread_mapping_claim_t *published =
+        bpf_map_lookup_elem(&java_thread_mapping_claims, process);
+    if (java_remote_parent_process_claim_equal(published, claim)) {
+        return 1;
+    }
+    published = bpf_map_lookup_elem(&java_thread_mapping_claims, process);
+    if (java_remote_parent_process_claim_equal(published, claim)) {
+        bpf_map_delete_elem(&java_thread_mapping_claims, process);
+    }
+    return 0;
+}
+
+static __always_inline void
+java_remote_parent_release_process_claim(const pid_key_t *process,
+                                         java_thread_mapping_claim_t *claim) {
+    if (!process || !claim) {
+        return;
+    }
+    const java_thread_mapping_claim_t *current =
+        bpf_map_lookup_elem(&java_thread_mapping_claims, process);
+    if (java_remote_parent_process_claim_equal(current, claim)) {
+        bpf_map_delete_elem(&java_thread_mapping_claims, process);
+    }
+    __builtin_memset(claim, 0, sizeof(*claim));
+}
 
 typedef struct java_remote_parent_terminal {
     u64 generation;
@@ -48,12 +99,14 @@ typedef struct java_remote_parent_task {
     u32 reserved;
     u64 generation;
     u64 observed_monotime_ns;
+    u64 process_incarnation;
 } java_remote_parent_task_t;
 
 typedef struct java_remote_parent_handoff_key {
     u32 pid;
     u32 ns;
     u64 token;
+    u64 process_incarnation;
 } java_remote_parent_handoff_key_t;
 
 typedef struct java_remote_parent_generation_index {
@@ -112,6 +165,28 @@ typedef struct java_remote_parent_alias_replay_retain_workspace {
 
 _Static_assert(sizeof(java_remote_parent_alias_replay_retain_workspace_t) == 168,
                "java remote-parent alias replay retain workspace size mismatch");
+
+// DATA_RECEIVE and alias retain are mutually exclusive ioctl phases. Reuse
+// the same guarded per-CPU storage so the exact owner/claim/guard tuple does
+// not consume a deep legacy-BPF call frame.
+typedef struct java_remote_parent_preserve_alias_workspace {
+    u32 busy;
+    u32 reserved;
+    java_remote_parent_owner_t expected;
+    java_remote_parent_key_t key;
+    java_remote_parent_claim_t claim;
+    java_remote_parent_key_t guard_key;
+    java_remote_parent_claim_t guard_claim;
+} java_remote_parent_preserve_alias_workspace_t;
+
+_Static_assert(sizeof(java_remote_parent_preserve_alias_workspace_t) == 128,
+               "java remote-parent preserve-alias workspace size mismatch");
+_Static_assert(sizeof(java_remote_parent_preserve_alias_workspace_t) <=
+                   sizeof(java_remote_parent_alias_replay_retain_workspace_t),
+               "java remote-parent preserve-alias workspace exceeds shared storage");
+_Static_assert(offsetof(java_remote_parent_preserve_alias_workspace_t, busy) ==
+                   offsetof(java_remote_parent_alias_replay_retain_workspace_t, busy),
+               "java remote-parent shared workspace busy offset mismatch");
 
 typedef struct java_remote_parent_cleanup_scratch {
     union {
@@ -199,9 +274,13 @@ _Static_assert(offsetof(java_remote_parent_terminal_t, reserved) == 25,
                "java remote-parent terminal reserved offset mismatch");
 _Static_assert(offsetof(java_remote_parent_task_t, generation) == 16,
                "java remote-parent task generation offset mismatch");
-_Static_assert(sizeof(java_remote_parent_task_t) == 32, "java remote-parent task size mismatch");
-_Static_assert(sizeof(java_remote_parent_handoff_key_t) == 16,
+_Static_assert(offsetof(java_remote_parent_task_t, process_incarnation) == 32,
+               "java remote-parent task process-incarnation offset mismatch");
+_Static_assert(sizeof(java_remote_parent_task_t) == 40, "java remote-parent task size mismatch");
+_Static_assert(sizeof(java_remote_parent_handoff_key_t) == 24,
                "java remote-parent handoff key size mismatch");
+_Static_assert(offsetof(java_remote_parent_handoff_key_t, process_incarnation) == 16,
+               "java remote-parent handoff key process-incarnation offset mismatch");
 _Static_assert(sizeof(java_remote_parent_generation_index_t) == 32,
                "java remote-parent generation index size mismatch");
 _Static_assert(sizeof(java_remote_parent_handoff_claim_t) == 16,
@@ -312,28 +391,270 @@ struct {
 } java_remote_parent_generation SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, pid_key_t);
     __type(value, java_remote_parent_task_t);
     __uint(max_entries, MAX_CONCURRENT_REQUESTS);
     __uint(pinning, OBI_PIN_INTERNAL);
 } java_remote_parent_tasks SEC(".maps");
 
+// A non-evicting per-execution claim serializes every cooperative task-carrier
+// publication and key-only delete. BPF maps do not provide compare-and-delete;
+// keeping this claim from the first authoritative snapshot through alias
+// bookkeeping makes the preceding full-value comparison meaningful.
 struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, pid_key_t);
+    __type(value, java_remote_parent_handoff_claim_t);
+    __uint(max_entries, MAX_CONCURRENT_REQUESTS);
+    __uint(pinning, OBI_PIN_INTERNAL);
+} java_remote_parent_task_claims SEC(".maps");
+
+struct {
+    // Every published value owns one exact generation alias. Silent LRU
+    // eviction has no release hook and would leak that reference, so capacity
+    // must reject publication and let the producer roll its retain back.
+    __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, java_remote_parent_handoff_key_t);
     __type(value, java_remote_parent_task_t);
     __uint(max_entries, MAX_CONCURRENT_REQUESTS);
     __uint(pinning, OBI_PIN_INTERNAL);
 } java_remote_parent_handoffs SEC(".maps");
 
+// Transient, non-evicting per-handoff-key ownership. Every cooperative
+// publisher, linker, and canceller holds M(H) across its first reusable-key
+// observation through the final key mutation and alias bookkeeping. This is
+// the compare-and-delete fence HASH maps otherwise lack.
 struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, java_remote_parent_handoff_key_t);
+    __type(value, java_remote_parent_handoff_claim_t);
+    __uint(max_entries, MAX_CONCURRENT_REQUESTS);
+    __uint(pinning, OBI_PIN_INTERNAL);
+} java_remote_parent_handoff_mutations SEC(".maps");
+
+struct {
+    // Non-evicting admission tickets for H. A publisher reserves tagged OPEN
+    // C before it can retain or publish H; LINK/CANCEL terminalize the token by
+    // deleting C. Thus capacity pressure rejects H admission instead of losing
+    // a one-shot terminal intent, and C absence can never authorize transfer.
+    __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, java_remote_parent_handoff_key_t);
     __type(value, java_remote_parent_handoff_claim_t);
     __uint(max_entries, MAX_CONCURRENT_REQUESTS);
     __uint(pinning, OBI_PIN_INTERNAL);
 } java_remote_parent_handoff_claims SEC(".maps");
+
+// ktime cannot reach the high bit during a supported system lifetime. Tagging
+// OPEN tickets in the existing value layout makes rolling/retained untagged
+// terminal claims conservative: new code treats them as already terminal.
+#define k_java_remote_parent_handoff_open_tag ((u64)1 << 63)
+
+static __always_inline u8
+java_remote_parent_task_claim_equal(const java_remote_parent_handoff_claim_t *left,
+                                    const java_remote_parent_handoff_claim_t *right) {
+    return left && right && left->observed_monotime_ns == right->observed_monotime_ns &&
+           left->process_incarnation == right->process_incarnation;
+}
+
+static __always_inline u8
+java_remote_parent_acquire_handoff_mutation(const java_remote_parent_handoff_key_t *key,
+                                            u64 process_capability,
+                                            java_remote_parent_handoff_claim_t *local_claim) {
+    if (!key || !process_capability || !local_claim ||
+        key->process_incarnation != process_capability) {
+        return 0;
+    }
+    *local_claim = (java_remote_parent_handoff_claim_t){
+        .observed_monotime_ns = bpf_ktime_get_ns(),
+        .process_incarnation = process_capability,
+    };
+    if (!local_claim->observed_monotime_ns ||
+        bpf_map_update_elem(&java_remote_parent_handoff_mutations, key, local_claim, BPF_NOEXIST) !=
+            0) {
+        __builtin_memset(local_claim, 0, sizeof(*local_claim));
+        return 0;
+    }
+    const java_remote_parent_handoff_claim_t *published =
+        bpf_map_lookup_elem(&java_remote_parent_handoff_mutations, key);
+    if (!java_remote_parent_task_claim_equal(published, local_claim)) {
+        __builtin_memset(local_claim, 0, sizeof(*local_claim));
+        return 0;
+    }
+    return 1;
+}
+
+static __always_inline u8 java_remote_parent_release_handoff_mutation(
+    const java_remote_parent_handoff_key_t *key, java_remote_parent_handoff_claim_t *local_claim) {
+    if (!key || !local_claim || !local_claim->observed_monotime_ns) {
+        return 0;
+    }
+    const java_remote_parent_handoff_claim_t *current =
+        bpf_map_lookup_elem(&java_remote_parent_handoff_mutations, key);
+    if (!java_remote_parent_task_claim_equal(current, local_claim) ||
+        bpf_map_delete_elem(&java_remote_parent_handoff_mutations, key) != 0) {
+        return 0;
+    }
+    __builtin_memset(local_claim, 0, sizeof(*local_claim));
+    return 1;
+}
+
+static __always_inline u8 java_remote_parent_handoff_ticket_open(
+    const java_remote_parent_handoff_claim_t *ticket, u64 process_capability) {
+    return ticket && process_capability && ticket->process_incarnation == process_capability &&
+           (ticket->observed_monotime_ns & k_java_remote_parent_handoff_open_tag) != 0 &&
+           (ticket->observed_monotime_ns & ~k_java_remote_parent_handoff_open_tag) != 0;
+}
+
+// Only the synchronous producer inserts C(OPEN), before contending for M or
+// retaining an alias. Consequently a full C map fails capture before H exists.
+static __always_inline u8
+java_remote_parent_reserve_handoff_ticket(const java_remote_parent_handoff_key_t *key,
+                                          u64 process_capability,
+                                          java_remote_parent_handoff_claim_t *local_ticket) {
+    if (!key || !process_capability || !local_ticket ||
+        key->process_incarnation != process_capability) {
+        return 0;
+    }
+    const u64 observed = bpf_ktime_get_ns();
+    if (!observed || (observed & k_java_remote_parent_handoff_open_tag) != 0) {
+        return 0;
+    }
+    *local_ticket = (java_remote_parent_handoff_claim_t){
+        .observed_monotime_ns = observed | k_java_remote_parent_handoff_open_tag,
+        .process_incarnation = process_capability,
+    };
+    if (bpf_map_update_elem(&java_remote_parent_handoff_claims, key, local_ticket, BPF_NOEXIST) !=
+        0) {
+        __builtin_memset(local_ticket, 0, sizeof(*local_ticket));
+        return 0;
+    }
+    const java_remote_parent_handoff_claim_t *published =
+        bpf_map_lookup_elem(&java_remote_parent_handoff_claims, key);
+    if (!java_remote_parent_task_claim_equal(published, local_ticket)) {
+        __builtin_memset(local_ticket, 0, sizeof(*local_ticket));
+        return 0;
+    }
+    return 1;
+}
+
+static __always_inline u8
+java_remote_parent_handoff_ticket_exact(const java_remote_parent_handoff_key_t *key,
+                                        const java_remote_parent_handoff_claim_t *expected) {
+    if (!key || !expected ||
+        !java_remote_parent_handoff_ticket_open(expected, key->process_incarnation)) {
+        return 0;
+    }
+    const java_remote_parent_handoff_claim_t *current =
+        bpf_map_lookup_elem(&java_remote_parent_handoff_claims, key);
+    return java_remote_parent_task_claim_equal(current, expected);
+}
+
+static __always_inline void
+java_remote_parent_release_open_handoff_ticket(const java_remote_parent_handoff_key_t *key,
+                                               java_remote_parent_handoff_claim_t *local_ticket) {
+    if (!key || !local_ticket || !java_remote_parent_handoff_ticket_exact(key, local_ticket)) {
+        return;
+    }
+    barrier();
+    const java_remote_parent_handoff_claim_t *current =
+        bpf_map_lookup_elem(&java_remote_parent_handoff_claims, key);
+    if (java_remote_parent_task_claim_equal(current, local_ticket)) {
+        bpf_map_delete_elem(&java_remote_parent_handoff_claims, key);
+    }
+    __builtin_memset(local_ticket, 0, sizeof(*local_ticket));
+}
+
+// Deleting C is the terminal linearization point. Exactly one claimant can
+// win transfer ownership; missing, untagged, changed, or delete-failed C is a
+// fail-closed terminal observation and can only help drain H under M.
+static __always_inline u8
+java_remote_parent_claim_handoff(const java_remote_parent_handoff_key_t *key,
+                                 u64 process_capability,
+                                 java_remote_parent_handoff_claim_t *local_ticket) {
+    if (!key || !process_capability || !local_ticket ||
+        key->process_incarnation != process_capability) {
+        return 0;
+    }
+    const java_remote_parent_handoff_claim_t *current =
+        bpf_map_lookup_elem(&java_remote_parent_handoff_claims, key);
+    if (!java_remote_parent_handoff_ticket_open(current, process_capability)) {
+        return 0;
+    }
+    *local_ticket = *current;
+    barrier();
+    current = bpf_map_lookup_elem(&java_remote_parent_handoff_claims, key);
+    if (!java_remote_parent_task_claim_equal(current, local_ticket) ||
+        bpf_map_delete_elem(&java_remote_parent_handoff_claims, key) != 0) {
+        __builtin_memset(local_ticket, 0, sizeof(*local_ticket));
+        return 0;
+    }
+    return 1;
+}
+
+// Call only while holding M(H). This removes an old untagged terminal value or
+// an abandoned OPEN reservation after H is conclusively absent. Cooperative
+// publishers use M from their C recheck through H publication, and unique
+// synchronous tokens prohibit a later producer from recreating this key.
+static __always_inline u8
+java_remote_parent_release_terminal_handoff_claim(const java_remote_parent_handoff_key_t *key) {
+    if (!key || bpf_map_lookup_elem(&java_remote_parent_handoffs, key)) {
+        return 0;
+    }
+    const java_remote_parent_handoff_claim_t *current =
+        bpf_map_lookup_elem(&java_remote_parent_handoff_claims, key);
+    if (!current) {
+        return 1;
+    }
+    const java_remote_parent_handoff_claim_t expected = *current;
+    barrier();
+    current = bpf_map_lookup_elem(&java_remote_parent_handoff_claims, key);
+    if (!java_remote_parent_task_claim_equal(current, &expected) ||
+        bpf_map_lookup_elem(&java_remote_parent_handoffs, key) ||
+        bpf_map_delete_elem(&java_remote_parent_handoff_claims, key) != 0) {
+        return 0;
+    }
+    return 1;
+}
+
+static __always_inline u8
+java_remote_parent_acquire_task_claim(const pid_key_t *execution,
+                                      u64 process_capability,
+                                      java_remote_parent_handoff_claim_t *local_claim) {
+    if (!execution || !process_capability || !local_claim) {
+        return 0;
+    }
+    *local_claim = (java_remote_parent_handoff_claim_t){
+        .observed_monotime_ns = bpf_ktime_get_ns(),
+        .process_incarnation = process_capability,
+    };
+    if (!local_claim->observed_monotime_ns ||
+        bpf_map_update_elem(&java_remote_parent_task_claims, execution, local_claim, BPF_NOEXIST) !=
+            0) {
+        __builtin_memset(local_claim, 0, sizeof(*local_claim));
+        return 0;
+    }
+    const java_remote_parent_handoff_claim_t *published =
+        bpf_map_lookup_elem(&java_remote_parent_task_claims, execution);
+    return java_remote_parent_task_claim_equal(published, local_claim);
+}
+
+static __always_inline u8 java_remote_parent_release_task_claim(
+    const pid_key_t *execution, java_remote_parent_handoff_claim_t *local_claim) {
+    if (!execution || !local_claim || !local_claim->observed_monotime_ns) {
+        return 0;
+    }
+    const java_remote_parent_handoff_claim_t *current =
+        bpf_map_lookup_elem(&java_remote_parent_task_claims, execution);
+    if (!java_remote_parent_task_claim_equal(current, local_claim)) {
+        return 0;
+    }
+    if (bpf_map_delete_elem(&java_remote_parent_task_claims, execution) != 0) {
+        return 0;
+    }
+    __builtin_memset(local_claim, 0, sizeof(*local_claim));
+    return 1;
+}
 
 // Alias replay capacity is deliberately partitioned from the one-shot claim
 // pool. It is a non-evicting HASH: capacity pressure rejects a new alias before
@@ -700,7 +1021,7 @@ static __always_inline u8 java_remote_parent_alias_replay_connection_matches(
     return incoming_generation && mismatch == 0;
 }
 
-static __noinline __attribute__((unused)) u8 java_remote_parent_alias_replay_binding_twins_match(
+static __always_inline u8 java_remote_parent_alias_replay_binding_twins_match(
     const java_remote_parent_alias_replay_key_t *replay_key,
     const java_remote_parent_alias_replay_t *replay,
     java_remote_parent_connection_key_t *connection_key) {
@@ -891,7 +1212,7 @@ static __noinline __attribute__((unused)) u8 java_remote_parent_alias_replay_ret
     return 1;
 }
 
-static __noinline __attribute__((unused)) u8 java_remote_parent_alias_replay_retain(
+static __always_inline u8 java_remote_parent_alias_replay_retain(
     const java_remote_parent_key_t *key,
     const java_remote_parent_alias_replay_key_t *replay_key,
     java_remote_parent_alias_replay_retain_workspace_t *workspace) {
@@ -915,11 +1236,14 @@ static __noinline __attribute__((unused)) u8 java_remote_parent_alias_replay_ret
 }
 
 static __always_inline void
-java_remote_parent_release_state_alias(const java_remote_parent_key_t *key,
-                                       u64 observed_monotime_ns) {
+java_remote_parent_release_state_alias_scoped(const java_remote_parent_key_t *key,
+                                              u64 observed_monotime_ns,
+                                              u64 expected_process_incarnation) {
     java_remote_parent_state_t *state = bpf_map_lookup_elem(&java_remote_parent_state, key);
     if (!state || state->lifecycle != k_java_remote_parent_lifecycle_active || !state->aliases ||
         state->observed_monotime_ns != observed_monotime_ns ||
+        (expected_process_incarnation &&
+         state->process_incarnation != expected_process_incarnation) ||
         state->response.status != k_java_remote_parent_status_valid ||
         java_remote_parent_le64_to_cpu(state->response.generation_le) != key->generation ||
         java_remote_parent_le64_to_cpu(state->response.observed_monotime_ns_le) !=
@@ -939,10 +1263,25 @@ java_remote_parent_release_state_alias(const java_remote_parent_key_t *key,
     }
 }
 
+static __always_inline void
+java_remote_parent_release_state_alias(const java_remote_parent_key_t *key,
+                                       u64 observed_monotime_ns) {
+    java_remote_parent_release_state_alias_scoped(key, observed_monotime_ns, 0);
+}
+
+static __always_inline void java_remote_parent_release_state_alias_for_capability(
+    const java_remote_parent_key_t *key, u64 observed_monotime_ns, u64 process_capability) {
+    if (process_capability) {
+        java_remote_parent_release_state_alias_scoped(
+            key, observed_monotime_ns, process_capability);
+    }
+}
+
 static __noinline __attribute__((unused)) u8
 java_remote_parent_retain_generation_alias_with_authority(const java_remote_parent_key_t *key,
                                                           u64 observed_monotime_ns,
-                                                          u8 allow_detached) {
+                                                          u8 allow_detached,
+                                                          u64 expected_process_incarnation) {
     java_remote_parent_alias_replay_retain_workspace_t *workspace =
         java_remote_parent_alias_replay_retain_workspace_mem();
     if (!workspace || workspace->busy) {
@@ -953,14 +1292,15 @@ java_remote_parent_retain_generation_alias_with_authority(const java_remote_pare
     u8 retained = 0;
     java_remote_parent_state_t *state = bpf_map_lookup_elem(&java_remote_parent_state, key);
     if (!state || !state->process_incarnation || state->aliases == ~(u32)0 ||
+        (expected_process_incarnation &&
+         state->process_incarnation != expected_process_incarnation) ||
         state->observed_monotime_ns != observed_monotime_ns ||
         !java_remote_parent_generation_index_matches(
             key, state->process_incarnation, observed_monotime_ns)) {
         goto release_workspace;
     }
-    const u64 process_incarnation = state->process_incarnation;
     workspace->replay_key =
-        java_remote_parent_alias_replay_key(key, observed_monotime_ns, process_incarnation);
+        java_remote_parent_alias_replay_key(key, observed_monotime_ns, state->process_incarnation);
     // Reserve replay capacity and a reference before the first validation that
     // could permit publication. Capacity exhaustion therefore cannot consume
     // E or publish an alias without durable exact replay authority.
@@ -976,10 +1316,11 @@ java_remote_parent_retain_generation_alias_with_authority(const java_remote_pare
         goto release_workspace;
     }
     state = bpf_map_lookup_elem(&java_remote_parent_state, key);
-    if (!state || state->aliases == ~(u32)0 || state->process_incarnation != process_incarnation ||
+    if (!state || state->aliases == ~(u32)0 ||
+        state->process_incarnation != workspace->replay_key.process_incarnation ||
         state->observed_monotime_ns != observed_monotime_ns ||
         !java_remote_parent_generation_index_matches(
-            key, process_incarnation, observed_monotime_ns)) {
+            key, workspace->replay_key.process_incarnation, observed_monotime_ns)) {
         java_remote_parent_alias_replay_unwind_failed_retain(key, &workspace->replay_key);
         goto release_workspace;
     }
@@ -994,7 +1335,8 @@ java_remote_parent_retain_generation_alias_with_authority(const java_remote_pare
                         : !java_remote_parent_generation_live_cursor_active(key))) {
         // This retain has not published an alias. RESET either observes the
         // unwind under its guard or userspace reaps a later zero state/index.
-        java_remote_parent_release_state_alias(key, observed_monotime_ns);
+        java_remote_parent_release_state_alias_scoped(
+            key, observed_monotime_ns, expected_process_incarnation);
         java_remote_parent_alias_replay_unwind_failed_retain(key, &workspace->replay_key);
         goto release_workspace;
     }
@@ -1012,12 +1354,26 @@ release_workspace:
 
 static __always_inline u8 java_remote_parent_retain_generation_alias(
     const java_remote_parent_key_t *key, u64 observed_monotime_ns) {
-    return java_remote_parent_retain_generation_alias_with_authority(key, observed_monotime_ns, 0);
+    return java_remote_parent_retain_generation_alias_with_authority(
+        key, observed_monotime_ns, 0, 0);
+}
+
+static __always_inline u8 java_remote_parent_retain_generation_alias_for_capability(
+    const java_remote_parent_key_t *key, u64 observed_monotime_ns, u64 process_capability) {
+    return process_capability && java_remote_parent_retain_generation_alias_with_authority(
+                                     key, observed_monotime_ns, 0, process_capability);
 }
 
 static __always_inline u8 java_remote_parent_retain_detached_generation_alias(
     const java_remote_parent_key_t *key, u64 observed_monotime_ns) {
-    return java_remote_parent_retain_generation_alias_with_authority(key, observed_monotime_ns, 1);
+    return java_remote_parent_retain_generation_alias_with_authority(
+        key, observed_monotime_ns, 1, 0);
+}
+
+static __always_inline u8 java_remote_parent_retain_detached_generation_alias_for_capability(
+    const java_remote_parent_key_t *key, u64 observed_monotime_ns, u64 process_capability) {
+    return process_capability && java_remote_parent_retain_generation_alias_with_authority(
+                                     key, observed_monotime_ns, 1, process_capability);
 }
 
 static __always_inline u8
@@ -1078,88 +1434,120 @@ java_remote_parent_preserve_authorized_aliased_generation(const pid_key_t *owner
     if (!process_capability) {
         return 0;
     }
+    java_remote_parent_preserve_alias_workspace_t *workspace =
+        (java_remote_parent_preserve_alias_workspace_t *)
+            java_remote_parent_alias_replay_retain_workspace_mem();
+    if (!workspace || workspace->busy) {
+        return 0;
+    }
+    workspace->busy = 1;
+    barrier();
+    u8 preserved = 0;
+
     const java_remote_parent_owner_t *indexed =
         bpf_map_lookup_elem(&java_remote_parent_owners, owner);
     if (!indexed || indexed->process_incarnation != process_capability ||
         indexed->lifecycle != k_java_remote_parent_lifecycle_active) {
-        return 0;
+        goto release_workspace;
     }
 
-    const java_remote_parent_owner_t expected = *indexed;
-    const java_remote_parent_key_t key = java_remote_parent_state_key(owner, expected.generation);
-    const java_remote_parent_state_t *state = bpf_map_lookup_elem(&java_remote_parent_state, &key);
-    if (!state || !state->aliases || state->process_incarnation != expected.process_incarnation ||
-        !java_remote_parent_generation_state_active_for_incarnation(&key, process_capability)) {
-        return 0;
+    workspace->expected = *indexed;
+    workspace->key = java_remote_parent_state_key(owner, workspace->expected.generation);
+    const java_remote_parent_state_t *state =
+        bpf_map_lookup_elem(&java_remote_parent_state, &workspace->key);
+    if (!state || !state->aliases ||
+        state->process_incarnation != workspace->expected.process_incarnation ||
+        !java_remote_parent_generation_state_active_for_incarnation(&workspace->key,
+                                                                    process_capability)) {
+        goto release_workspace;
     }
 
-    java_remote_parent_claim_t claim = {
+    workspace->claim = (java_remote_parent_claim_t){
         .observed_monotime_ns = bpf_ktime_get_ns(),
         .process_incarnation = process_capability,
         .lifecycle = k_java_remote_parent_lifecycle_publishing,
     };
-    if (!claim.observed_monotime_ns) {
-        return 0;
+    if (!workspace->claim.observed_monotime_ns) {
+        goto release_workspace;
     }
-    if (bpf_map_update_elem(&java_remote_parent_claims, &key, &claim, BPF_NOEXIST) != 0) {
-        __builtin_memset(&claim, 0, sizeof(claim));
-        return 0;
+    if (bpf_map_update_elem(
+            &java_remote_parent_claims, &workspace->key, &workspace->claim, BPF_NOEXIST) != 0) {
+        __builtin_memset(&workspace->claim, 0, sizeof(workspace->claim));
+        goto release_workspace;
     }
-    if (!java_remote_parent_exact_receive_claim_matches(&key, &claim)) {
-        java_remote_parent_handoff_exact_fence(&key, &claim);
-        return 0;
+    if (!java_remote_parent_exact_receive_claim_matches(&workspace->key, &workspace->claim)) {
+        java_remote_parent_handoff_exact_fence(&workspace->key, &workspace->claim);
+        goto release_workspace;
     }
 
-    const java_remote_parent_key_t guard_key = java_remote_parent_detach_guard_key(owner);
-    java_remote_parent_claim_t guard_claim = {0};
-    if (!java_remote_parent_acquire_detach_guard_at(&key, &guard_key, &guard_claim)) {
-        if (!java_remote_parent_release_exact_receive_claim(&key, &claim)) {
-            java_remote_parent_mark_exact_ambiguity(&key);
+    workspace->guard_key = java_remote_parent_detach_guard_key(owner);
+    if (!java_remote_parent_acquire_detach_guard_at(
+            &workspace->key, &workspace->guard_key, &workspace->guard_claim)) {
+        if (!java_remote_parent_release_exact_receive_claim(&workspace->key, &workspace->claim)) {
+            java_remote_parent_mark_exact_ambiguity(&workspace->key);
         }
-        java_remote_parent_handoff_exact_fence_pair(&key, &claim, &guard_key, &guard_claim);
-        return 0;
+        java_remote_parent_handoff_exact_fence_pair(
+            &workspace->key, &workspace->claim, &workspace->guard_key, &workspace->guard_claim);
+        goto release_workspace;
     }
 
     indexed = bpf_map_lookup_elem(&java_remote_parent_owners, owner);
-    state = bpf_map_lookup_elem(&java_remote_parent_state, &key);
-    if (!indexed || indexed->generation != expected.generation ||
-        indexed->process_incarnation != expected.process_incarnation ||
+    state = bpf_map_lookup_elem(&java_remote_parent_state, &workspace->key);
+    if (!indexed || indexed->generation != workspace->expected.generation ||
+        indexed->process_incarnation != workspace->expected.process_incarnation ||
         indexed->lifecycle != k_java_remote_parent_lifecycle_active || !state || !state->aliases ||
-        state->process_incarnation != expected.process_incarnation ||
-        !java_remote_parent_preserve_alias_barriers_valid(&key, &claim, &guard_key, &guard_claim)) {
+        state->process_incarnation != workspace->expected.process_incarnation ||
+        !java_remote_parent_preserve_alias_barriers_valid(
+            &workspace->key, &workspace->claim, &workspace->guard_key, &workspace->guard_claim)) {
         goto failed;
     }
 
     bpf_map_delete_elem(&java_remote_parent_owners, owner);
-    if (!java_remote_parent_preserve_alias_barriers_valid(&key, &claim, &guard_key, &guard_claim)) {
+    if (!java_remote_parent_preserve_alias_barriers_valid(
+            &workspace->key, &workspace->claim, &workspace->guard_key, &workspace->guard_claim)) {
         goto failed;
     }
-    java_remote_parent_cleanup_fallback_generation(owner, key.generation);
+    java_remote_parent_cleanup_fallback_generation(owner, workspace->key.generation);
 
     indexed = bpf_map_lookup_elem(&java_remote_parent_owners, owner);
-    state = bpf_map_lookup_elem(&java_remote_parent_state, &key);
+    state = bpf_map_lookup_elem(&java_remote_parent_state, &workspace->key);
     const u8 detached =
-        (!indexed || indexed->generation != expected.generation) &&
-        !java_remote_parent_fallback_has_generation(owner, key.generation) && state &&
+        (!indexed || indexed->generation != workspace->expected.generation) &&
+        !java_remote_parent_fallback_has_generation(owner, workspace->key.generation) && state &&
         state->aliases &&
-        java_remote_parent_generation_state_active_for_incarnation(&key, process_capability) &&
-        java_remote_parent_preserve_alias_barriers_valid(&key, &claim, &guard_key, &guard_claim);
+        java_remote_parent_generation_state_active_for_incarnation(&workspace->key,
+                                                                   process_capability) &&
+        java_remote_parent_preserve_alias_barriers_valid(
+            &workspace->key, &workspace->claim, &workspace->guard_key, &workspace->guard_claim);
     if (!detached) {
         goto failed;
     }
 
-    java_remote_parent_release_exact_receive_claim(&key, &claim);
-    if (!bpf_map_lookup_elem(&java_remote_parent_claims, &key) &&
-        java_remote_parent_generation_cleanly_reserved(&key)) {
-        java_remote_parent_release_exact_detach_guard_at(&guard_key, &guard_claim);
+    java_remote_parent_release_exact_receive_claim(&workspace->key, &workspace->claim);
+    if (!bpf_map_lookup_elem(&java_remote_parent_claims, &workspace->key) &&
+        java_remote_parent_generation_cleanly_reserved(&workspace->key)) {
+        java_remote_parent_release_exact_detach_guard_at(&workspace->guard_key,
+                                                         &workspace->guard_claim);
     }
-    java_remote_parent_handoff_exact_fence_pair(&key, &claim, &guard_key, &guard_claim);
-    return 1;
+    java_remote_parent_handoff_exact_fence_pair(
+        &workspace->key, &workspace->claim, &workspace->guard_key, &workspace->guard_claim);
+    preserved = 1;
+    goto release_workspace;
 
 failed:
-    java_remote_parent_mark_exact_ambiguity(&key);
-    java_remote_parent_handoff_exact_fence_pair(&key, &claim, &guard_key, &guard_claim);
-    return 0;
+    java_remote_parent_mark_exact_ambiguity(&workspace->key);
+    java_remote_parent_handoff_exact_fence_pair(
+        &workspace->key, &workspace->claim, &workspace->guard_key, &workspace->guard_claim);
+
+release_workspace:
+    workspace->reserved = 0;
+    __builtin_memset(&workspace->expected,
+                     0,
+                     sizeof(*workspace) -
+                         offsetof(java_remote_parent_preserve_alias_workspace_t, expected));
+    barrier();
+    workspace->busy = 0;
+    return preserved;
 }
 
 static __always_inline u8 java_remote_parent_task_mapping_would_cycle(const pid_key_t *child,
@@ -1201,6 +1589,16 @@ static __always_inline u8 java_remote_parent_delete_exact_receive_claim(
 static __always_inline u8 java_remote_parent_mark_exact_receive_cleanup_failed(
     const java_remote_parent_key_t *expected, const java_remote_parent_claim_t *local_claim);
 static __always_inline void java_remote_parent_unlink_task(const pid_key_t *child);
+static __always_inline void
+java_remote_parent_unlink_task_for_capability(const pid_key_t *execution, u64 process_capability);
+static __always_inline void java_remote_parent_unlink_task_if_matches(
+    const pid_key_t *execution, const java_remote_parent_task_t *expected, u64 process_capability);
+static __always_inline void java_remote_parent_quarantine_task_if_matches(
+    const pid_key_t *execution, const java_remote_parent_task_t *expected, u64 process_capability);
+static __always_inline void java_remote_parent_retire_predecessor_task_if_matches(
+    const pid_key_t *execution, const java_remote_parent_task_t *expected, u64 process_capability);
+static __always_inline u8 java_remote_parent_task_carrier_valid_for_execution(
+    const java_remote_parent_task_t *carrier, const pid_key_t *execution, u64 process_capability);
 
 static __always_inline u8
 java_remote_parent_cleanup_barriers_valid(const java_remote_parent_cleanup_scratch_t *scratch) {
@@ -1352,7 +1750,8 @@ java_remote_parent_cleanup_delete_physical(java_remote_parent_cleanup_scratch_t 
 static __always_inline u8 java_remote_parent_cleanup_unlink_deleted_state_task(
     java_remote_parent_cleanup_scratch_t *scratch, u64 observed_monotime_ns) {
     if (!observed_monotime_ns || !java_remote_parent_cleanup_barriers_valid(scratch) ||
-        bpf_map_lookup_elem(&java_remote_parent_state, &scratch->key)) {
+        bpf_map_lookup_elem(&java_remote_parent_state, &scratch->key) ||
+        bpf_map_lookup_elem(&java_remote_parent_task_claims, &scratch->key.owner)) {
         return 0;
     }
     const java_remote_parent_task_t *linked =
@@ -1362,6 +1761,7 @@ static __always_inline u8 java_remote_parent_cleanup_unlink_deleted_state_task(
     }
     if (linked->reserved || linked->generation != scratch->key.generation ||
         linked->observed_monotime_ns != observed_monotime_ns ||
+        linked->process_incarnation != scratch->claim.process_incarnation ||
         !java_remote_parent_pid_key_equal(&linked->owner, &scratch->key.owner)) {
         // A foreign task binding is not this cleanup's alias. Retain the owner
         // guard and let userspace converge it without deleting another
@@ -1373,14 +1773,19 @@ static __always_inline u8 java_remote_parent_cleanup_unlink_deleted_state_task(
     // key. Revalidate both the guard and the value immediately before the
     // key-only delete so a replacement observed before this point is retained.
     if (!java_remote_parent_cleanup_barriers_valid(scratch) ||
-        bpf_map_lookup_elem(&java_remote_parent_state, &scratch->key)) {
+        bpf_map_lookup_elem(&java_remote_parent_state, &scratch->key) ||
+        bpf_map_lookup_elem(&java_remote_parent_task_claims, &scratch->key.owner)) {
         return 0;
     }
     linked = bpf_map_lookup_elem(&java_remote_parent_tasks, &scratch->key.owner);
     if (!linked || linked->reserved || linked->generation != scratch->key.generation ||
         linked->observed_monotime_ns != observed_monotime_ns ||
+        linked->process_incarnation != scratch->claim.process_incarnation ||
         !java_remote_parent_pid_key_equal(&linked->owner, &scratch->key.owner)) {
         return linked == NULL;
+    }
+    if (bpf_map_lookup_elem(&java_remote_parent_task_claims, &scratch->key.owner)) {
+        return 0;
     }
     const long deleted = bpf_map_delete_elem(&java_remote_parent_tasks, &scratch->key.owner);
     linked = bpf_map_lookup_elem(&java_remote_parent_tasks, &scratch->key.owner);
@@ -1507,14 +1912,14 @@ static __always_inline void java_remote_parent_cleanup_current() {
 }
 
 static __always_inline void
-java_remote_parent_discard_virtual_thread_owner(const pid_key_t *owner) {
+java_remote_parent_discard_virtual_thread_owner(const pid_key_t *owner, u64 process_capability) {
     // A prior exact detach may already have removed the direct owner cursor
     // while preserving this synthetic owner's task-only alias. Authorized
     // virtual-thread teardown must unlink that alias even when cleanup has no
     // owner entry from which to discover the generation. Do this before
     // cleanup so no same-owner successor can be unlinked after cleanup releases
     // its final owner guard.
-    java_remote_parent_unlink_task(owner);
+    java_remote_parent_unlink_task_for_capability(owner, process_capability);
     java_remote_parent_cleanup(owner);
     bpf_map_delete_elem(&java_tasks, owner);
 }
@@ -1523,12 +1928,16 @@ static __always_inline enum java_vt_cleanup_translation_result
 java_remote_parent_cleanup_exiting_task_for_capability(const pid_key_t *carrier,
                                                        u64 process_capability,
                                                        pid_key_t *logical_owner) {
+    // A normal worker task link points at a different parent owner, so direct
+    // owner cleanup cannot discover it. Retire the non-evicting carrier slot
+    // and its exact alias on every admitted exit before handling VT ownership.
+    java_remote_parent_unlink_task_for_capability(carrier, process_capability);
     java_remote_parent_cleanup(carrier);
     *logical_owner = *carrier;
     const enum java_vt_cleanup_translation_result translation =
         java_vt_translate_tid_for_capability(logical_owner, process_capability);
     if (translation != k_java_vt_cleanup_translation_none) {
-        java_remote_parent_discard_virtual_thread_owner(logical_owner);
+        java_remote_parent_discard_virtual_thread_owner(logical_owner, process_capability);
     }
     return translation;
 }
@@ -1564,7 +1973,7 @@ static __always_inline void java_remote_parent_discard_unregistered_virtual_thre
 
     // A parked virtual thread has no java_vt_threads entry, so derive its
     // synthetic owner from the authorized payload and discard that key too.
-    java_remote_parent_discard_virtual_thread_owner(&requested_owner);
+    java_remote_parent_discard_virtual_thread_owner(&requested_owner, process_capability);
     if (invalidate_identity) {
         // Keep the reusable-key guard until every revivable state entry is
         // gone, and never delete a guard belonging to a low-31-bit collision.
@@ -1578,12 +1987,12 @@ java_remote_parent_discard_unregistered_task_lifecycle(const pid_key_t *carrier,
     pid_key_t logical_owner = *carrier;
     const enum java_vt_cleanup_translation_result translation =
         java_vt_translate_tid_for_capability(&logical_owner, process_capability);
-    java_remote_parent_unlink_task(carrier);
+    java_remote_parent_unlink_task_for_capability(carrier, process_capability);
     if (translation == k_java_vt_cleanup_translation_exact &&
         !java_remote_parent_pid_key_equal(carrier, &logical_owner)) {
-        java_remote_parent_unlink_task(&logical_owner);
+        java_remote_parent_unlink_task_for_capability(&logical_owner, process_capability);
     } else if (translation == k_java_vt_cleanup_translation_fallback) {
-        java_remote_parent_discard_virtual_thread_owner(&logical_owner);
+        java_remote_parent_discard_virtual_thread_owner(&logical_owner, process_capability);
     }
 }
 
@@ -1591,7 +2000,7 @@ static __always_inline void java_remote_parent_detach_data_receive_owner(const p
                                                                          u8 preserve_task_alias,
                                                                          u64 process_capability) {
     if (!preserve_task_alias) {
-        java_remote_parent_discard_virtual_thread_owner(owner);
+        java_remote_parent_discard_virtual_thread_owner(owner, process_capability);
     } else if (!java_remote_parent_preserve_authorized_aliased_generation(owner,
                                                                           process_capability)) {
         java_remote_parent_cleanup(owner);
@@ -1768,7 +2177,10 @@ static __always_inline u8 java_remote_parent_exact_receive_claim_matches(
     }
     const java_remote_parent_claim_t *claim =
         bpf_map_lookup_elem(&java_remote_parent_claims, expected);
-    return java_remote_parent_claim_equal(claim, local_claim);
+    // Keep the byte-exact comparison in this frame. The legacy ioctl path is
+    // already at its supported stack ceiling, and the noinline compatibility
+    // wrapper would add a separate 32-byte verifier frame for this leaf check.
+    return java_remote_parent_claim_equal_inline(claim, local_claim);
 }
 
 static __always_inline u8 java_remote_parent_delete_exact_receive_claim(
@@ -1778,14 +2190,14 @@ static __always_inline u8 java_remote_parent_delete_exact_receive_claim(
     }
     const java_remote_parent_claim_t *claim =
         bpf_map_lookup_elem(&java_remote_parent_claims, expected);
-    if (!java_remote_parent_claim_equal(claim, local_claim)) {
+    if (!java_remote_parent_claim_equal_inline(claim, local_claim)) {
         // Absence or replacement means the local claim was already released.
         return 1;
     }
     if (bpf_map_delete_elem(&java_remote_parent_claims, expected) != 0) {
         claim = bpf_map_lookup_elem(&java_remote_parent_claims, expected);
         // Report failure only while the exact local claim demonstrably remains.
-        return !java_remote_parent_claim_equal(claim, local_claim);
+        return !java_remote_parent_claim_equal_inline(claim, local_claim);
     }
     // Successful deletion is the release linearization point. A consumer may
     // publish a successor claim immediately afterward.
@@ -2758,6 +3170,18 @@ java_remote_parent_release_generation_alias(const java_remote_parent_key_t *key,
     java_remote_parent_release_state_alias(key, observed_monotime_ns);
 }
 
+static __always_inline void java_remote_parent_release_generation_alias_for_capability(
+    const java_remote_parent_key_t *key, u64 observed_monotime_ns, u64 process_capability) {
+    if (!process_capability) {
+        return;
+    }
+    const java_remote_parent_alias_replay_key_t replay_key =
+        java_remote_parent_alias_replay_key(key, observed_monotime_ns, process_capability);
+    java_remote_parent_alias_replay_release_reference(&replay_key);
+    java_remote_parent_release_state_alias_for_capability(
+        key, observed_monotime_ns, process_capability);
+}
+
 enum java_remote_parent_stage_leaf_result : u8 {
     k_java_remote_parent_stage_leaf_failed = 0,
     k_java_remote_parent_stage_leaf_valid = 1,
@@ -3593,6 +4017,7 @@ typedef struct java_remote_parent_resolution {
     // generation's physical indexes and a same-socket successor is present.
     u64 expected_socket_cookie;
     u64 expected_generation;
+    u64 expected_process_incarnation;
     java_remote_parent_alias_replay_binding_t replay_binding;
     u8 found;
     u8 ambiguous;
@@ -3609,9 +4034,12 @@ typedef struct java_remote_parent_handoff_capture_workspace {
     java_remote_parent_task_t carrier;
     java_remote_parent_key_t generation;
     java_remote_parent_handoff_key_t handoff_key;
+    java_remote_parent_handoff_claim_t task_claim;
+    java_remote_parent_handoff_claim_t handoff_ticket;
+    java_remote_parent_handoff_claim_t mutation_claim;
 } java_remote_parent_handoff_capture_workspace_t;
 
-_Static_assert(sizeof(java_remote_parent_handoff_capture_workspace_t) == 216,
+_Static_assert(sizeof(java_remote_parent_handoff_capture_workspace_t) == 288,
                "java remote-parent handoff capture workspace size mismatch");
 
 SCRATCH_MEM_TYPED(java_remote_parent_handoff_capture_workspace,
@@ -3621,8 +4049,8 @@ static __noinline __attribute__((unused)) void
 java_remote_parent_resolve_exact(java_remote_parent_resolution_t *resolution,
                                  const pid_key_t *owner,
                                  u64 expected_generation,
-                                 u8 include_terminal) {
-    const u64 process_incarnation = java_current_process_incarnation();
+                                 u8 include_terminal,
+                                 u64 process_incarnation) {
     if (!process_incarnation) {
         return;
     }
@@ -3690,12 +4118,44 @@ java_remote_parent_resolve_exact(java_remote_parent_resolution_t *resolution,
     }
 }
 
+// CAPTURE always asks for the current active owner with no terminal fallback
+// or expected generation. Keep that fixed contract in an actual three-argument
+// subprogram so clang cannot const-specialize a five-argument function while
+// retaining its stale BTF prototype. Older verifiers otherwise see unrelated
+// caller scratch in the elided argument registers.
+static __noinline __attribute__((unused)) void java_remote_parent_resolve_active_owner_exact(
+    java_remote_parent_resolution_t *resolution, const pid_key_t *owner, u64 process_incarnation) {
+    if (!process_incarnation) {
+        return;
+    }
+    const java_remote_parent_owner_t *indexed =
+        bpf_map_lookup_elem(&java_remote_parent_owners, owner);
+    if (!indexed || indexed->process_incarnation != process_incarnation) {
+        return;
+    }
+
+    resolution->key = java_remote_parent_state_key(owner, indexed->generation);
+    resolution->indexed = *indexed;
+    const java_remote_parent_state_t *state =
+        bpf_map_lookup_elem(&java_remote_parent_state, &resolution->key);
+    if (state && state->process_incarnation == process_incarnation &&
+        state->lifecycle == k_java_remote_parent_lifecycle_active &&
+        state->response.status == k_java_remote_parent_status_valid &&
+        java_remote_parent_le64_to_cpu(state->response.generation_le) == indexed->generation) {
+        resolution->observed_monotime_ns = state->observed_monotime_ns;
+    }
+    resolution->found = 1;
+    if (!java_remote_parent_generation_cleanly_reserved(&resolution->key)) {
+        resolution->ambiguous = 1;
+    }
+}
+
 static __noinline __attribute__((unused)) void
 java_remote_parent_resolve_alias_replay(java_remote_parent_resolution_t *resolution,
-                                        const java_remote_parent_task_t *task) {
-    const u64 process_incarnation = java_current_process_incarnation();
+                                        const java_remote_parent_task_t *task,
+                                        u64 process_incarnation) {
     if (!resolution || !task || !process_incarnation || !task->generation ||
-        !task->observed_monotime_ns) {
+        !task->observed_monotime_ns || task->process_incarnation != process_incarnation) {
         return;
     }
     const java_remote_parent_key_t generation =
@@ -3762,20 +4222,33 @@ java_remote_parent_resolve_alias_replay(java_remote_parent_resolution_t *resolut
 static __always_inline java_remote_parent_resolution_t
 java_remote_parent_resolve(const pid_key_t *start, u64 max_age_ns) {
     java_remote_parent_resolution_t resolution = {0};
-    java_remote_parent_resolve_exact(&resolution, start, 0, 0);
+    const u64 process_capability = java_process_incarnation_for(start);
+    java_remote_parent_resolve_exact(&resolution, start, 0, 0, process_capability);
     const u8 resolved_direct = resolution.found;
 
     const java_remote_parent_task_t *task = bpf_map_lookup_elem(&java_remote_parent_tasks, start);
     if (task) {
         const java_remote_parent_task_t copy = *task;
         const u64 now = bpf_ktime_get_ns();
-        if (!copy.generation || !copy.observed_monotime_ns || now < copy.observed_monotime_ns ||
-            (max_age_ns && now - copy.observed_monotime_ns > max_age_ns)) {
-            if (bpf_map_delete_elem(&java_remote_parent_tasks, start) == 0) {
-                const java_remote_parent_key_t generation =
-                    java_remote_parent_state_key(&copy.owner, copy.generation);
-                java_remote_parent_release_generation_alias(&generation, copy.observed_monotime_ns);
-            }
+        if (!copy.process_incarnation) {
+            java_remote_parent_quarantine_task_if_matches(start, &copy, process_capability);
+            return resolution;
+        }
+        if (copy.process_incarnation != process_capability) {
+            // The admitted successor may retire a byte-exact predecessor under
+            // T(successor). This prevents stale HASH entries from permanently
+            // blocking LINK without ever granting authority from the stored
+            // predecessor capability itself.
+            java_remote_parent_retire_predecessor_task_if_matches(start, &copy, process_capability);
+            return resolution;
+        }
+        if (!java_remote_parent_task_carrier_valid_for_execution(
+                &copy, start, process_capability) ||
+            now < copy.observed_monotime_ns) {
+            java_remote_parent_quarantine_task_if_matches(start, &copy, process_capability);
+            return resolution;
+        } else if (max_age_ns && now - copy.observed_monotime_ns > max_age_ns) {
+            java_remote_parent_unlink_task_if_matches(start, &copy, process_capability);
             return resolution;
         } else if (resolution.found &&
                    (!java_remote_parent_pid_key_equal(&resolution.key.owner, &copy.owner) ||
@@ -3786,31 +4259,29 @@ java_remote_parent_resolve(const pid_key_t *start, u64 max_age_ns) {
                 java_remote_parent_state_key(&copy.owner, copy.generation);
             java_remote_parent_mark_exact_generation_ambiguous(&linked_generation);
         } else if (!resolution.found) {
-            java_remote_parent_resolve_alias_replay(&resolution, &copy);
+            java_remote_parent_resolve_alias_replay(&resolution, &copy, process_capability);
             if (!resolution.found) {
-                java_remote_parent_resolve_exact(&resolution, &copy.owner, copy.generation, 1);
+                java_remote_parent_resolve_exact(
+                    &resolution, &copy.owner, copy.generation, 1, process_capability);
             }
         }
         if (resolution.found && !resolution.ambiguous &&
             java_remote_parent_pid_key_equal(&resolution.key.owner, &copy.owner) &&
             resolution.key.generation == copy.generation &&
+            resolution.indexed.process_incarnation == copy.process_incarnation &&
             resolution.observed_monotime_ns == copy.observed_monotime_ns) {
             resolution.via_task = 1;
         } else if (resolution.found &&
                    java_remote_parent_pid_key_equal(&resolution.key.owner, &copy.owner) &&
                    resolution.key.generation == copy.generation &&
                    resolution.observed_monotime_ns != copy.observed_monotime_ns) {
-            if (bpf_map_delete_elem(&java_remote_parent_tasks, start) == 0) {
-                const java_remote_parent_key_t generation =
-                    java_remote_parent_state_key(&copy.owner, copy.generation);
-                java_remote_parent_release_generation_alias(&generation, copy.observed_monotime_ns);
-            }
+            java_remote_parent_unlink_task_if_matches(start, &copy, copy.process_incarnation);
             if (!resolved_direct) {
                 __builtin_memset(&resolution, 0, sizeof(resolution));
             }
         }
     } else if (!resolution.found) {
-        java_remote_parent_resolve_exact(&resolution, start, 0, 1);
+        java_remote_parent_resolve_exact(&resolution, start, 0, 1, process_capability);
     }
 
     return resolution;
@@ -3820,7 +4291,8 @@ static __noinline __attribute__((unused)) void
 java_remote_parent_resolve_task_into(java_remote_parent_resolution_t *resolution,
                                      const pid_key_t *start,
                                      u64 max_age_ns,
-                                     java_remote_parent_task_t *copy) {
+                                     java_remote_parent_task_t *copy,
+                                     u64 process_capability) {
     __builtin_memset(resolution, 0, sizeof(*resolution));
     const java_remote_parent_task_t *task = bpf_map_lookup_elem(&java_remote_parent_tasks, start);
     if (!task) {
@@ -3829,13 +4301,17 @@ java_remote_parent_resolve_task_into(java_remote_parent_resolution_t *resolution
 
     *copy = *task;
     const u64 now = bpf_ktime_get_ns();
-    if (copy->reserved != 0 || (!copy->owner.tid && !copy->owner.pid && !copy->owner.ns) ||
-        !copy->generation || !copy->observed_monotime_ns || now < copy->observed_monotime_ns) {
-        if (bpf_map_delete_elem(&java_remote_parent_tasks, start) == 0) {
-            const java_remote_parent_key_t generation =
-                java_remote_parent_state_key(&copy->owner, copy->generation);
-            java_remote_parent_release_generation_alias(&generation, copy->observed_monotime_ns);
-        }
+    if (!copy->process_incarnation) {
+        java_remote_parent_quarantine_task_if_matches(start, copy, process_capability);
+        return;
+    }
+    if (copy->process_incarnation != process_capability) {
+        java_remote_parent_retire_predecessor_task_if_matches(start, copy, process_capability);
+        return;
+    }
+    if (!java_remote_parent_task_carrier_valid_for_execution(copy, start, process_capability) ||
+        now < copy->observed_monotime_ns) {
+        java_remote_parent_quarantine_task_if_matches(start, copy, process_capability);
         return;
     }
 
@@ -3843,34 +4319,34 @@ java_remote_parent_resolve_task_into(java_remote_parent_resolution_t *resolution
         // Expiry prevents a new delivery, but must not erase an already
         // committed exact one-shot result. Resolve terminal/replay authority
         // first so sibling tasks converge on the same status.
-        java_remote_parent_resolve_alias_replay(resolution, copy);
+        java_remote_parent_resolve_alias_replay(resolution, copy, process_capability);
         if (!resolution->found) {
-            java_remote_parent_resolve_exact(resolution, &copy->owner, copy->generation, 1);
+            java_remote_parent_resolve_exact(
+                resolution, &copy->owner, copy->generation, 1, process_capability);
         }
         if (resolution->found &&
             java_remote_parent_alias_replay_lifecycle_final(resolution->indexed.lifecycle) &&
             java_remote_parent_pid_key_equal(&resolution->key.owner, &copy->owner) &&
             resolution->key.generation == copy->generation &&
+            resolution->indexed.process_incarnation == copy->process_incarnation &&
             resolution->observed_monotime_ns == copy->observed_monotime_ns) {
             resolution->via_task = 1;
             return;
         }
         __builtin_memset(resolution, 0, sizeof(*resolution));
-        if (bpf_map_delete_elem(&java_remote_parent_tasks, start) == 0) {
-            const java_remote_parent_key_t generation =
-                java_remote_parent_state_key(&copy->owner, copy->generation);
-            java_remote_parent_release_generation_alias(&generation, copy->observed_monotime_ns);
-        }
+        java_remote_parent_unlink_task_if_matches(start, copy, copy->process_incarnation);
         return;
     }
 
-    java_remote_parent_resolve_alias_replay(resolution, copy);
+    java_remote_parent_resolve_alias_replay(resolution, copy, process_capability);
     if (!resolution->found) {
-        java_remote_parent_resolve_exact(resolution, &copy->owner, copy->generation, 1);
+        java_remote_parent_resolve_exact(
+            resolution, &copy->owner, copy->generation, 1, process_capability);
     }
     if (resolution->found &&
         java_remote_parent_pid_key_equal(&resolution->key.owner, &copy->owner) &&
         resolution->key.generation == copy->generation &&
+        resolution->indexed.process_incarnation == copy->process_incarnation &&
         resolution->observed_monotime_ns == copy->observed_monotime_ns) {
         // Keep the exact task provenance even when the generation is fenced.
         // A retained claim can then report the committed one-shot result while
@@ -3880,11 +4356,7 @@ java_remote_parent_resolve_task_into(java_remote_parent_resolution_t *resolution
                java_remote_parent_pid_key_equal(&resolution->key.owner, &copy->owner) &&
                resolution->key.generation == copy->generation &&
                resolution->observed_monotime_ns != copy->observed_monotime_ns) {
-        if (bpf_map_delete_elem(&java_remote_parent_tasks, start) == 0) {
-            const java_remote_parent_key_t generation =
-                java_remote_parent_state_key(&copy->owner, copy->generation);
-            java_remote_parent_release_generation_alias(&generation, copy->observed_monotime_ns);
-        }
+        java_remote_parent_unlink_task_if_matches(start, copy, copy->process_incarnation);
         __builtin_memset(resolution, 0, sizeof(*resolution));
     }
 }
@@ -3893,32 +4365,28 @@ static __always_inline java_remote_parent_resolution_t
 java_remote_parent_resolve_task(const pid_key_t *start, u64 max_age_ns) {
     java_remote_parent_resolution_t resolution = {0};
     java_remote_parent_task_t copy = {0};
-    java_remote_parent_resolve_task_into(&resolution, start, max_age_ns, &copy);
+    java_remote_parent_resolve_task_into(
+        &resolution, start, max_age_ns, &copy, java_process_incarnation_for(start));
     return resolution;
 }
 
-static __always_inline void java_remote_parent_unlink_task(const pid_key_t *child) {
-    const java_remote_parent_task_t *linked = bpf_map_lookup_elem(&java_remote_parent_tasks, child);
-    if (!linked) {
-        return;
-    }
-
-    const java_remote_parent_task_t copy = *linked;
-    if (bpf_map_delete_elem(&java_remote_parent_tasks, child) == 0) {
-        const java_remote_parent_key_t generation =
-            java_remote_parent_state_key(&copy.owner, copy.generation);
-        java_remote_parent_release_generation_alias(&generation, copy.observed_monotime_ns);
-    }
-}
-
 static __always_inline java_remote_parent_handoff_key_t
-java_remote_parent_handoff_key(const pid_key_t *execution, u64 token) {
+java_remote_parent_handoff_key_for_capability(const pid_key_t *execution,
+                                              u64 token,
+                                              u64 process_capability) {
     const java_remote_parent_handoff_key_t key = {
         .pid = execution->pid,
         .ns = execution->ns,
         .token = token,
+        .process_incarnation = process_capability,
     };
     return key;
+}
+
+static __always_inline java_remote_parent_handoff_key_t
+java_remote_parent_handoff_key(const pid_key_t *execution, u64 token) {
+    return java_remote_parent_handoff_key_for_capability(
+        execution, token, java_process_incarnation_for(execution));
 }
 
 static __always_inline u8 java_remote_parent_exact_generation_active(
@@ -3934,11 +4402,12 @@ static __always_inline u8 java_remote_parent_exact_generation_active(
 
 static __always_inline u8 java_remote_parent_exact_generation_carrier_authoritative(
     const java_remote_parent_key_t *key, u64 observed_monotime_ns, u64 process_incarnation) {
-    if (java_remote_parent_generation_observation_matches(key, observed_monotime_ns) &&
-        (java_remote_parent_generation_state_active_for_incarnation(key, process_incarnation) ||
-         java_remote_parent_generation_state_detached_for_incarnation(key, process_incarnation))) {
-        return 1;
-    }
+    // Every task and handoff carrier is published only after retaining one
+    // exact replay reference. Treat that durable reference as the carrier's
+    // authority instead of falling back to the larger mutable state graph.
+    // This is deliberately stricter: a carrier without replay provenance is
+    // corrupt and must fail closed even if an otherwise matching generation
+    // still happens to be active.
     const java_remote_parent_alias_replay_key_t replay_key =
         java_remote_parent_alias_replay_key(key, observed_monotime_ns, process_incarnation);
     const java_remote_parent_alias_replay_t *replay =
@@ -3947,244 +4416,273 @@ static __always_inline u8 java_remote_parent_exact_generation_carrier_authoritat
         java_remote_parent_alias_replay_final_valid(&replay_key, replay, replay->lifecycle)) {
         return 1;
     }
-    const u8 transitioning = java_remote_parent_alias_replay_active_valid(&replay_key, replay, 1) ||
-                             (replay && replay->references &&
-                              java_remote_parent_alias_replay_publishing_valid(
-                                  &replay_key, replay, replay->desired_lifecycle));
+    if (java_remote_parent_alias_replay_active_valid(&replay_key, replay, 1) &&
+        java_remote_parent_generation_observation_matches(key, observed_monotime_ns) &&
+        java_remote_parent_alias_replay_state_binding_matches(key, &replay_key, replay)) {
+        return 1;
+    }
+    const u8 transitioning = replay && replay->references &&
+                             java_remote_parent_alias_replay_publishing_valid(
+                                 &replay_key, replay, replay->desired_lifecycle);
     return transitioning && bpf_map_lookup_elem(&java_remote_parent_claims, key);
 }
 
-static __noinline __attribute__((unused)) u8 java_remote_parent_prepare_handoff_capture(
-    const pid_key_t *execution, java_remote_parent_handoff_capture_workspace_t *workspace) {
-    if (!workspace) {
+static __always_inline u8 java_remote_parent_task_carrier_valid_for_execution(
+    const java_remote_parent_task_t *carrier, const pid_key_t *execution, u64 process_capability) {
+    return carrier && execution && process_capability && carrier->reserved == 0 &&
+           (carrier->owner.tid || carrier->owner.pid || carrier->owner.ns) && carrier->generation &&
+           carrier->observed_monotime_ns && carrier->process_incarnation == process_capability &&
+           carrier->owner.pid == execution->pid && carrier->owner.ns == execution->ns;
+}
+
+static __always_inline u8 java_remote_parent_task_carrier_matches_current_generation(
+    const java_remote_parent_task_t *carrier, const pid_key_t *execution, u64 process_capability) {
+    if (!java_remote_parent_task_carrier_valid_for_execution(
+            carrier, execution, process_capability)) {
         return 0;
     }
-    __builtin_memset(&workspace->resolution, 0, sizeof(workspace->resolution));
-    // A handler submission may capture only the generation staged directly by
-    // this execution's current receive. A task alias identifies an older exact
-    // execution scope, not the request currently entering a TLS handler.
-    java_remote_parent_resolve_exact(&workspace->resolution, execution, 0, 0);
-    if (workspace->resolution.ambiguous || !workspace->resolution.found ||
-        workspace->resolution.indexed.lifecycle != k_java_remote_parent_lifecycle_active ||
-        !java_remote_parent_exact_generation_active(
-            &workspace->resolution.key, workspace->resolution.observed_monotime_ns, 1)) {
+    const java_remote_parent_key_t key =
+        java_remote_parent_state_key(&carrier->owner, carrier->generation);
+    return java_remote_parent_generation_observation_matches(&key, carrier->observed_monotime_ns) &&
+           java_remote_parent_generation_index_matches(
+               &key, process_capability, carrier->observed_monotime_ns);
+}
+
+static __noinline __attribute__((unused)) u8
+java_remote_parent_mark_current_generation_ambiguous_for_capability(
+    const java_remote_parent_key_t *key,
+    u64 observed_monotime_ns,
+    const pid_key_t *execution,
+    u64 process_capability) {
+    if (!key || !execution || key->reserved || !key->generation || !observed_monotime_ns ||
+        !process_capability || (!key->owner.tid && !key->owner.pid && !key->owner.ns) ||
+        key->owner.pid != execution->pid || key->owner.ns != execution->ns ||
+        !java_remote_parent_generation_observation_matches(key, observed_monotime_ns) ||
+        !java_remote_parent_generation_index_matches(
+            key, process_capability, observed_monotime_ns)) {
         return 0;
     }
 
-    workspace->carrier = (java_remote_parent_task_t){
-        .owner = workspace->resolution.key.owner,
-        .generation = workspace->resolution.key.generation,
-        .observed_monotime_ns = workspace->resolution.observed_monotime_ns,
-    };
-    return 1;
+    java_remote_parent_claim_t claim = {0};
+    if (!java_remote_parent_acquire_stage_claim(key, process_capability, &claim)) {
+        return 0;
+    }
+    if (!java_remote_parent_exact_receive_claim_matches(key, &claim) ||
+        !java_remote_parent_generation_observation_matches(key, observed_monotime_ns) ||
+        !java_remote_parent_generation_index_matches(
+            key, process_capability, observed_monotime_ns)) {
+        java_remote_parent_release_exact_receive_claim(key, &claim);
+        return 0;
+    }
+
+    const u8 marked = java_remote_parent_mark_exact_generation_ambiguous(key);
+    java_remote_parent_release_exact_receive_claim(key, &claim);
+    return marked;
+}
+
+static __always_inline u8 java_remote_parent_mark_carrier_generation_ambiguous_for_capability(
+    const java_remote_parent_task_t *carrier, const pid_key_t *execution, u64 process_capability) {
+    if (!java_remote_parent_task_carrier_valid_for_execution(
+            carrier, execution, process_capability)) {
+        return 0;
+    }
+    const java_remote_parent_key_t key =
+        java_remote_parent_state_key(&carrier->owner, carrier->generation);
+    return java_remote_parent_mark_current_generation_ambiguous_for_capability(
+        &key, carrier->observed_monotime_ns, execution, process_capability);
+}
+
+/*
+ * A task carrier may outlive its direct cursor, but a generation-global
+ * ambiguity marker may be written only while the current state/index still
+ * binds the carrier's observation and attempted process capability.
+ */
+static __always_inline u8 java_remote_parent_task_carrier_equal(
+    const java_remote_parent_task_t *left, const java_remote_parent_task_t *right) {
+    return left && right && left->reserved == right->reserved &&
+           left->generation == right->generation &&
+           left->observed_monotime_ns == right->observed_monotime_ns &&
+           left->process_incarnation == right->process_incarnation &&
+           java_remote_parent_pid_key_equal(&left->owner, &right->owner);
+}
+
+// A malformed carrier owns no scoped alias that can safely be decremented.
+// Serialize and remove only the byte-exact value so a non-evicting task-map
+// slot cannot permanently block LINK.
+static __always_inline void java_remote_parent_quarantine_task_if_matches(
+    const pid_key_t *execution, const java_remote_parent_task_t *expected, u64 process_capability) {
+    if (!expected || !process_capability ||
+        java_process_incarnation_for(execution) != process_capability) {
+        return;
+    }
+    java_remote_parent_handoff_claim_t task_claim = {0};
+    if (!java_remote_parent_acquire_task_claim(execution, process_capability, &task_claim)) {
+        return;
+    }
+    const java_remote_parent_task_t *current =
+        bpf_map_lookup_elem(&java_remote_parent_tasks, execution);
+    if (java_process_incarnation_for(execution) == process_capability &&
+        java_remote_parent_task_carrier_equal(current, expected)) {
+        bpf_map_delete_elem(&java_remote_parent_tasks, execution);
+    }
+    java_remote_parent_release_task_claim(execution, &task_claim);
+}
+
+static __always_inline u8 java_remote_parent_task_carrier_authorized_for_retirement(
+    const java_remote_parent_task_t *carrier, const pid_key_t *execution, u64 process_capability) {
+    if (!java_remote_parent_task_carrier_valid_for_execution(
+            carrier, execution, process_capability)) {
+        return 0;
+    }
+    if (java_remote_parent_task_carrier_matches_current_generation(
+            carrier, execution, process_capability)) {
+        return 1;
+    }
+    const java_remote_parent_key_t key =
+        java_remote_parent_state_key(&carrier->owner, carrier->generation);
+    return java_remote_parent_exact_generation_carrier_authoritative(
+        &key, carrier->observed_monotime_ns, process_capability);
 }
 
 static __always_inline void
-java_remote_parent_capture_handoff_for_execution(const pid_key_t *execution, u64 token) {
-    if (!token) {
+java_remote_parent_unlink_task_if_matches_under_claim(const pid_key_t *execution,
+                                                      const java_remote_parent_task_t *expected) {
+    const java_remote_parent_task_t *current =
+        bpf_map_lookup_elem(&java_remote_parent_tasks, execution);
+    if (!java_remote_parent_task_carrier_equal(current, expected)) {
         return;
     }
+    if (bpf_map_delete_elem(&java_remote_parent_tasks, execution) == 0) {
+        const java_remote_parent_key_t key =
+            java_remote_parent_state_key(&expected->owner, expected->generation);
+        java_remote_parent_release_generation_alias_for_capability(
+            &key, expected->observed_monotime_ns, expected->process_incarnation);
+    }
+}
 
-    java_remote_parent_handoff_capture_workspace_t *workspace =
-        java_remote_parent_handoff_capture_workspace_mem();
-    if (!workspace || workspace->busy) {
+// Normalize one non-evicting task slot while T is held. A same-capability
+// carrier must still prove current retirement authority before its alias is
+// charged. An admitted successor may retire a structurally valid predecessor;
+// malformed values own no provable alias and are exact-value quarantine only.
+static __always_inline u8 java_remote_parent_normalize_task_slot_for_capability_under_claim(
+    const pid_key_t *execution, u64 process_capability) {
+    if (!execution || !process_capability) {
+        return 0;
+    }
+    const java_remote_parent_task_t *linked =
+        bpf_map_lookup_elem(&java_remote_parent_tasks, execution);
+    if (!linked) {
+        return 1;
+    }
+    const java_remote_parent_task_t carrier = *linked;
+    const u8 structurally_valid =
+        carrier.process_incarnation && java_remote_parent_task_carrier_valid_for_execution(
+                                           &carrier, execution, carrier.process_incarnation);
+    const u8 same_capability = carrier.process_incarnation == process_capability;
+    if (same_capability && structurally_valid &&
+        !java_remote_parent_task_carrier_authorized_for_retirement(
+            &carrier, execution, process_capability)) {
+        return 0;
+    }
+    if (!same_capability && java_process_incarnation_for(execution) != process_capability) {
+        return 0;
+    }
+
+    const java_remote_parent_task_t *current =
+        bpf_map_lookup_elem(&java_remote_parent_tasks, execution);
+    if (!java_remote_parent_task_carrier_equal(current, &carrier) ||
+        (!same_capability && java_process_incarnation_for(execution) != process_capability)) {
+        return 0;
+    }
+    if (structurally_valid) {
+        java_remote_parent_unlink_task_if_matches_under_claim(execution, &carrier);
+    } else {
+        bpf_map_delete_elem(&java_remote_parent_tasks, execution);
+    }
+    return bpf_map_lookup_elem(&java_remote_parent_tasks, execution) == NULL;
+}
+
+static __always_inline void java_remote_parent_retire_predecessor_task_if_matches(
+    const pid_key_t *execution, const java_remote_parent_task_t *expected, u64 process_capability) {
+    if (!expected || !process_capability || !expected->process_incarnation ||
+        expected->process_incarnation == process_capability ||
+        java_process_incarnation_for(execution) != process_capability) {
         return;
     }
-    workspace->busy = 1;
-    barrier();
-    if (!java_remote_parent_prepare_handoff_capture(execution, workspace)) {
-        goto release_workspace;
+    java_remote_parent_handoff_claim_t task_claim = {0};
+    if (!java_remote_parent_acquire_task_claim(execution, process_capability, &task_claim)) {
+        return;
     }
-    workspace->generation =
-        java_remote_parent_state_key(&workspace->carrier.owner, workspace->carrier.generation);
-    workspace->handoff_key = java_remote_parent_handoff_key(execution, token);
-    if (bpf_map_lookup_elem(&java_remote_parent_handoff_claims, &workspace->handoff_key)) {
-        java_remote_parent_mark_exact_generation_ambiguous(&workspace->generation);
-        goto release_workspace;
-    }
-
-    if (!java_remote_parent_retain_generation_alias(&workspace->generation,
-                                                    workspace->carrier.observed_monotime_ns)) {
-        java_remote_parent_mark_exact_generation_ambiguous(&workspace->generation);
-        goto release_workspace;
-    }
-    if (bpf_map_update_elem(&java_remote_parent_handoffs,
-                            &workspace->handoff_key,
-                            &workspace->carrier,
-                            BPF_NOEXIST) != 0) {
-        java_remote_parent_release_generation_alias(&workspace->generation,
-                                                    workspace->carrier.observed_monotime_ns);
-        const java_remote_parent_task_t *existing =
-            bpf_map_lookup_elem(&java_remote_parent_handoffs, &workspace->handoff_key);
-        if (existing) {
-            workspace->carrier = *existing;
-            java_remote_parent_mark_exact_generation_ambiguous(&workspace->generation);
-            workspace->generation = java_remote_parent_state_key(&workspace->carrier.owner,
-                                                                 workspace->carrier.generation);
-            java_remote_parent_mark_exact_generation_ambiguous(&workspace->generation);
-        } else {
-            java_remote_parent_stat_add(k_java_remote_parent_stat_stage_overload);
+    // Revalidate successor authority after claim acquisition. T excludes a
+    // cooperative B publisher while the exact A value is compared and
+    // deleted. Only a structurally valid A carrier is charged against A's
+    // scoped alias provenance; malformed entries are quarantine-only.
+    if (java_process_incarnation_for(execution) == process_capability) {
+        const java_remote_parent_task_t *current =
+            bpf_map_lookup_elem(&java_remote_parent_tasks, execution);
+        if (java_remote_parent_task_carrier_equal(current, expected)) {
+            if (java_remote_parent_task_carrier_valid_for_execution(
+                    expected, execution, expected->process_incarnation)) {
+                java_remote_parent_unlink_task_if_matches_under_claim(execution, expected);
+            } else {
+                bpf_map_delete_elem(&java_remote_parent_tasks, execution);
+            }
         }
-        goto release_workspace;
     }
-
-    const java_remote_parent_task_t *published =
-        bpf_map_lookup_elem(&java_remote_parent_handoffs, &workspace->handoff_key);
-    volatile u8 claimed =
-        bpf_map_lookup_elem(&java_remote_parent_handoff_claims, &workspace->handoff_key) != NULL;
-    if (!published || published->generation != workspace->generation.generation ||
-        published->observed_monotime_ns != workspace->carrier.observed_monotime_ns ||
-        !java_remote_parent_pid_key_equal(&published->owner, &workspace->generation.owner) ||
-        claimed ||
-        !java_remote_parent_exact_generation_active(
-            &workspace->generation, workspace->carrier.observed_monotime_ns, 0)) {
-        const long deleted =
-            bpf_map_delete_elem(&java_remote_parent_handoffs, &workspace->handoff_key);
-        if (deleted == 0) {
-            java_remote_parent_release_generation_alias(&workspace->generation,
-                                                        workspace->carrier.observed_monotime_ns);
-            java_remote_parent_mark_exact_generation_ambiguous(&workspace->generation);
-        }
-    }
-
-release_workspace:
-    workspace->reserved = 0;
-    __builtin_memset(&workspace->resolution, 0, sizeof(workspace->resolution));
-    __builtin_memset(&workspace->carrier, 0, sizeof(workspace->carrier));
-    __builtin_memset(&workspace->generation, 0, sizeof(workspace->generation));
-    __builtin_memset(&workspace->handoff_key, 0, sizeof(workspace->handoff_key));
-    barrier();
-    workspace->busy = 0;
+    java_remote_parent_release_task_claim(execution, &task_claim);
 }
 
-static __always_inline void java_remote_parent_capture_handoff(u64 token) {
-    const pid_key_t execution = java_remote_parent_current_owner();
-    java_remote_parent_capture_handoff_for_execution(&execution, token);
+static __always_inline void java_remote_parent_unlink_task_if_matches(
+    const pid_key_t *execution, const java_remote_parent_task_t *expected, u64 process_capability) {
+    if (!expected || !process_capability || expected->process_incarnation != process_capability) {
+        return;
+    }
+    java_remote_parent_handoff_claim_t task_claim = {0};
+    if (!java_remote_parent_acquire_task_claim(execution, process_capability, &task_claim)) {
+        return;
+    }
+    java_remote_parent_unlink_task_if_matches_under_claim(execution, expected);
+    java_remote_parent_release_task_claim(execution, &task_claim);
 }
 
-static __always_inline void java_remote_parent_cancel_handoff_for_capability(
-    const pid_key_t *execution, u64 token, u64 process_capability) {
-    if (!token || !process_capability) {
+static __always_inline void java_remote_parent_unlink_task(const pid_key_t *execution) {
+    const u64 process_capability = java_current_process_incarnation();
+    java_remote_parent_handoff_claim_t task_claim = {0};
+    if (!process_capability ||
+        !java_remote_parent_acquire_task_claim(execution, process_capability, &task_claim)) {
         return;
     }
-    const java_remote_parent_handoff_key_t key = java_remote_parent_handoff_key(execution, token);
-    const java_remote_parent_handoff_claim_t claimed = {
-        .observed_monotime_ns = bpf_ktime_get_ns(),
-        .process_incarnation = process_capability,
-    };
-    if (bpf_map_update_elem(&java_remote_parent_handoff_claims, &key, &claimed, BPF_NOEXIST) != 0) {
-        return;
-    }
-
-    const java_remote_parent_task_t *found =
-        bpf_map_lookup_elem(&java_remote_parent_handoffs, &key);
-    if (!found) {
-        return;
-    }
-    const java_remote_parent_task_t handoff = *found;
-    if (bpf_map_delete_elem(&java_remote_parent_handoffs, &key) == 0) {
-        const java_remote_parent_key_t generation =
-            java_remote_parent_state_key(&handoff.owner, handoff.generation);
-        java_remote_parent_release_generation_alias(&generation, handoff.observed_monotime_ns);
-    }
+    java_remote_parent_normalize_task_slot_for_capability_under_claim(execution,
+                                                                      process_capability);
+    java_remote_parent_release_task_claim(execution, &task_claim);
 }
 
-static __always_inline void java_remote_parent_cancel_handoff(const pid_key_t *execution,
-                                                              u64 token) {
-    java_remote_parent_cancel_handoff_for_capability(
-        execution, token, java_process_incarnation_for(execution));
+static __always_inline void
+java_remote_parent_unlink_task_for_capability_under_claim(const pid_key_t *execution,
+                                                          u64 process_capability) {
+    java_remote_parent_normalize_task_slot_for_capability_under_claim(execution,
+                                                                      process_capability);
 }
 
-static __always_inline void java_remote_parent_fail_handoff(const pid_key_t *child) {
-    java_remote_parent_unlink_task(child);
-    java_remote_parent_mark_ambiguous(child);
+// T(process_capability) excludes cooperative task publishers while LINK makes
+// the non-evicting task slot available. A surviving predecessor capability may
+// be retired by the admitted successor, but only a structurally valid carrier
+// is charged for an alias. Malformed entries are exact-value quarantine only.
+// A same-capability carrier without current retirement authority is preserved
+// and blocks LINK rather than risking an unproved alias release.
+static __always_inline u8 java_remote_parent_prepare_task_slot_for_link_under_claim(
+    const pid_key_t *execution, u64 process_capability) {
+    if (!execution || !process_capability ||
+        java_process_incarnation_for(execution) != process_capability) {
+        return 0;
+    }
+    return java_remote_parent_normalize_task_slot_for_capability_under_claim(execution,
+                                                                             process_capability);
 }
 
-static __always_inline void java_remote_parent_link_handoff_for_capability(const pid_key_t *child,
-                                                                           u64 token,
-                                                                           u64 process_capability) {
-    // RESET uses the owner-scoped guard to serialize the key-only task-map
-    // delete. Do not remove or replace the guarded key from a concurrent
-    // handoff publication.
-    if (java_remote_parent_owner_detach_guarded(child)) {
-        return;
-    }
-    java_remote_parent_unlink_task(child);
-    if (!token || !process_capability) {
-        return;
-    }
-
-    const java_remote_parent_handoff_key_t key = java_remote_parent_handoff_key(child, token);
-    const java_remote_parent_handoff_claim_t claimed = {
-        .observed_monotime_ns = bpf_ktime_get_ns(),
-        .process_incarnation = process_capability,
-    };
-    if (bpf_map_update_elem(&java_remote_parent_handoff_claims, &key, &claimed, BPF_NOEXIST) != 0) {
-        java_remote_parent_fail_handoff(child);
-        return;
-    }
-
-    const java_remote_parent_task_t *found =
-        bpf_map_lookup_elem(&java_remote_parent_handoffs, &key);
-    if (!found) {
-        java_remote_parent_fail_handoff(child);
-        return;
-    }
-    const java_remote_parent_task_t handoff = *found;
-    if (bpf_map_delete_elem(&java_remote_parent_handoffs, &key) != 0) {
-        const java_remote_parent_key_t generation =
-            java_remote_parent_state_key(&handoff.owner, handoff.generation);
-        java_remote_parent_mark_exact_generation_ambiguous(&generation);
-        java_remote_parent_fail_handoff(child);
-        return;
-    }
-
-    const java_remote_parent_key_t generation =
-        java_remote_parent_state_key(&handoff.owner, handoff.generation);
-    if (!handoff.generation || !java_remote_parent_exact_generation_carrier_authoritative(
-                                   &generation, handoff.observed_monotime_ns, process_capability)) {
-        java_remote_parent_release_generation_alias(&generation, handoff.observed_monotime_ns);
-        java_remote_parent_fail_handoff(child);
-        return;
-    }
-
-    if (java_remote_parent_owner_detach_guarded(child)) {
-        java_remote_parent_release_generation_alias(&generation, handoff.observed_monotime_ns);
-        java_remote_parent_stat_add(k_java_remote_parent_stat_stage_overload);
-        return;
-    }
-    // The old binding was explicitly unlinked above. NOEXIST prevents a
-    // publisher that passed the guard check before RESET acquired it from
-    // overwriting the exact value RESET subsequently revalidated.
-    if (bpf_map_update_elem(&java_remote_parent_tasks, child, &handoff, BPF_NOEXIST) != 0) {
-        java_remote_parent_release_generation_alias(&generation, handoff.observed_monotime_ns);
-        if (java_remote_parent_owner_detach_guarded(child)) {
-            java_remote_parent_stat_add(k_java_remote_parent_stat_stage_overload);
-            return;
-        }
-        java_remote_parent_fail_handoff(child);
-        java_remote_parent_stat_add(k_java_remote_parent_stat_stage_overload);
-        return;
-    }
-    if (java_remote_parent_owner_detach_guarded(child) ||
-        !java_remote_parent_exact_generation_carrier_authoritative(
-            &generation, handoff.observed_monotime_ns, process_capability)) {
-        java_remote_parent_fail_handoff(child);
-        java_remote_parent_stat_add(k_java_remote_parent_stat_stage_overload);
-    }
-}
-
-static __always_inline void java_remote_parent_link_handoff(const pid_key_t *child, u64 token) {
-    java_remote_parent_link_handoff_for_capability(
-        child, token, java_process_incarnation_for(child));
-}
-
-static __always_inline void java_remote_parent_capture_relay(const pid_key_t *execution,
-                                                             u64 token) {
-    if (!token) {
-        return;
-    }
-
+static __always_inline void
+java_remote_parent_fail_task_carrier_for_capability_under_claim(const pid_key_t *execution,
+                                                                u64 process_capability) {
     java_remote_parent_handoff_capture_workspace_t *workspace =
         java_remote_parent_handoff_capture_workspace_mem();
     if (!workspace || workspace->busy) {
@@ -4198,75 +4696,573 @@ static __always_inline void java_remote_parent_capture_relay(const pid_key_t *ex
         goto release_workspace;
     }
     workspace->carrier = *linked;
+    if (!java_remote_parent_task_carrier_valid_for_execution(
+            &workspace->carrier, execution, process_capability)) {
+        java_remote_parent_normalize_task_slot_for_capability_under_claim(execution,
+                                                                          process_capability);
+        goto release_workspace;
+    }
+    if (!java_remote_parent_task_carrier_authorized_for_retirement(
+            &workspace->carrier, execution, process_capability)) {
+        goto release_workspace;
+    }
+    java_remote_parent_mark_carrier_generation_ambiguous_for_capability(
+        &workspace->carrier, execution, process_capability);
+    java_remote_parent_unlink_task_if_matches_under_claim(execution, &workspace->carrier);
 
+release_workspace:
+    __builtin_memset(&workspace->carrier, 0, sizeof(workspace->carrier));
+    barrier();
+    workspace->busy = 0;
+}
+
+static __always_inline void
+java_remote_parent_unlink_task_for_capability(const pid_key_t *execution, u64 process_capability) {
+    java_remote_parent_handoff_claim_t task_claim = {0};
+    if (!java_remote_parent_acquire_task_claim(execution, process_capability, &task_claim)) {
+        return;
+    }
+    java_remote_parent_unlink_task_for_capability_under_claim(execution, process_capability);
+    java_remote_parent_release_task_claim(execution, &task_claim);
+}
+
+static __always_inline void
+java_remote_parent_fail_task_carrier_for_capability(const pid_key_t *execution,
+                                                    u64 process_capability) {
+    java_remote_parent_handoff_claim_t task_claim = {0};
+    if (!java_remote_parent_acquire_task_claim(execution, process_capability, &task_claim)) {
+        return;
+    }
+    java_remote_parent_fail_task_carrier_for_capability_under_claim(execution, process_capability);
+    java_remote_parent_release_task_claim(execution, &task_claim);
+}
+
+static __noinline __attribute__((unused)) u8 java_remote_parent_prepare_handoff_capture(
+    const pid_key_t *execution,
+    u64 process_capability,
+    java_remote_parent_handoff_capture_workspace_t *workspace) {
+    if (!workspace || !process_capability) {
+        return 0;
+    }
+    __builtin_memset(&workspace->resolution, 0, sizeof(workspace->resolution));
+    // A handler submission may capture only the generation staged directly by
+    // this execution's current receive. A task alias identifies an older exact
+    // execution scope, not the request currently entering a TLS handler.
+    java_remote_parent_resolve_active_owner_exact(
+        &workspace->resolution, execution, process_capability);
+    if (workspace->resolution.ambiguous || !workspace->resolution.found ||
+        workspace->resolution.indexed.lifecycle != k_java_remote_parent_lifecycle_active ||
+        workspace->resolution.indexed.process_incarnation != process_capability ||
+        !java_remote_parent_exact_generation_active(
+            &workspace->resolution.key, workspace->resolution.observed_monotime_ns, 1)) {
+        return 0;
+    }
+
+    workspace->carrier = (java_remote_parent_task_t){
+        .owner = workspace->resolution.key.owner,
+        .generation = workspace->resolution.key.generation,
+        .observed_monotime_ns = workspace->resolution.observed_monotime_ns,
+        .process_incarnation = workspace->resolution.indexed.process_incarnation,
+    };
+    return 1;
+}
+
+// M(H) keeps H stable while this helper copies and removes the carrier. A
+// structurally valid carrier owns one exact alias; malformed bytes are only
+// quarantined because no generation-scoped decrement can be proved safe.
+// The caller supplies map-backed scratch on the deep publisher paths.
+static __always_inline u8
+java_remote_parent_drain_handoff_under_mutation(const java_remote_parent_handoff_key_t *key,
+                                                const pid_key_t *execution,
+                                                u64 process_capability,
+                                                java_remote_parent_task_t *carrier,
+                                                java_remote_parent_key_t *generation) {
+    const java_remote_parent_task_t *found = bpf_map_lookup_elem(&java_remote_parent_handoffs, key);
+    if (!found) {
+        return 1;
+    }
+    *carrier = *found;
+    if (!java_remote_parent_task_carrier_valid_for_execution(
+            carrier, execution, process_capability)) {
+        return bpf_map_delete_elem(&java_remote_parent_handoffs, key) == 0;
+    }
+    *generation = java_remote_parent_state_key(&carrier->owner, carrier->generation);
+    if (bpf_map_delete_elem(&java_remote_parent_handoffs, key) != 0) {
+        return 0;
+    }
+    java_remote_parent_release_generation_alias_for_capability(
+        generation, carrier->observed_monotime_ns, process_capability);
+    return 1;
+}
+
+static __always_inline void java_remote_parent_capture_handoff_for_capability(
+    const pid_key_t *execution, u64 token, u64 process_capability) {
+    if (!token || !process_capability) {
+        return;
+    }
+
+    pid_key_t process = {0};
+    java_thread_mapping_claim_t process_claim = {0};
+    if (!java_remote_parent_acquire_process_claim(
+            execution, process_capability, &process, &process_claim)) {
+        return;
+    }
+
+    java_remote_parent_handoff_capture_workspace_t *workspace =
+        java_remote_parent_handoff_capture_workspace_mem();
+    if (!workspace || workspace->busy) {
+        goto release_process_claim;
+    }
+    workspace->busy = 1;
+    barrier();
+    if (java_process_incarnation_for(execution) != process_capability) {
+        goto release_workspace;
+    }
+    if (!java_remote_parent_prepare_handoff_capture(execution, process_capability, workspace)) {
+        goto release_workspace;
+    }
     workspace->generation =
         java_remote_parent_state_key(&workspace->carrier.owner, workspace->carrier.generation);
-    if (!workspace->carrier.generation || !workspace->carrier.observed_monotime_ns ||
-        !java_remote_parent_exact_generation_active(
-            &workspace->generation, workspace->carrier.observed_monotime_ns, 0)) {
+    workspace->handoff_key =
+        java_remote_parent_handoff_key_for_capability(execution, token, process_capability);
+    if (!java_remote_parent_reserve_handoff_ticket(
+            &workspace->handoff_key, process_capability, &workspace->handoff_ticket)) {
+        goto release_workspace;
+    }
+    if (!java_remote_parent_acquire_handoff_mutation(
+            &workspace->handoff_key, process_capability, &workspace->mutation_claim)) {
+        goto release_workspace;
+    }
+    if (!java_remote_parent_handoff_ticket_exact(&workspace->handoff_key,
+                                                 &workspace->handoff_ticket)) {
         goto release_workspace;
     }
 
-    workspace->handoff_key = java_remote_parent_handoff_key(execution, token);
-    if (bpf_map_lookup_elem(&java_remote_parent_handoff_claims, &workspace->handoff_key)) {
-        java_remote_parent_mark_exact_generation_ambiguous(&workspace->generation);
-        goto release_workspace;
-    }
-    if (!java_remote_parent_retain_detached_generation_alias(
-            &workspace->generation, workspace->carrier.observed_monotime_ns)) {
-        java_remote_parent_mark_exact_generation_ambiguous(&workspace->generation);
+    if (!java_remote_parent_retain_generation_alias_for_capability(
+            &workspace->generation,
+            workspace->carrier.observed_monotime_ns,
+            workspace->carrier.process_incarnation)) {
+        java_remote_parent_mark_carrier_generation_ambiguous_for_capability(
+            &workspace->carrier, execution, process_capability);
         goto release_workspace;
     }
     if (bpf_map_update_elem(&java_remote_parent_handoffs,
                             &workspace->handoff_key,
                             &workspace->carrier,
                             BPF_NOEXIST) != 0) {
-        java_remote_parent_release_generation_alias(&workspace->generation,
-                                                    workspace->carrier.observed_monotime_ns);
+        java_remote_parent_release_generation_alias_for_capability(
+            &workspace->generation,
+            workspace->carrier.observed_monotime_ns,
+            workspace->carrier.process_incarnation);
+        java_remote_parent_mark_carrier_generation_ambiguous_for_capability(
+            &workspace->carrier, execution, process_capability);
         const java_remote_parent_task_t *existing =
             bpf_map_lookup_elem(&java_remote_parent_handoffs, &workspace->handoff_key);
         if (existing) {
-            workspace->carrier = *existing;
-        }
-        java_remote_parent_mark_exact_generation_ambiguous(&workspace->generation);
-        if (existing) {
-            workspace->generation = java_remote_parent_state_key(&workspace->carrier.owner,
-                                                                 workspace->carrier.generation);
-            java_remote_parent_mark_exact_generation_ambiguous(&workspace->generation);
+            java_remote_parent_mark_carrier_generation_ambiguous_for_capability(
+                existing, execution, process_capability);
+            // A reusable-token collision cannot remain transferable. Deleting
+            // our OPEN ticket terminalizes the old H before the M-held drain.
+            java_remote_parent_release_open_handoff_ticket(&workspace->handoff_key,
+                                                           &workspace->handoff_ticket);
+            java_remote_parent_drain_handoff_under_mutation(&workspace->handoff_key,
+                                                            execution,
+                                                            process_capability,
+                                                            &workspace->carrier,
+                                                            &workspace->generation);
+        } else {
+            java_remote_parent_stat_add(k_java_remote_parent_stat_stage_overload);
         }
         goto release_workspace;
     }
+    workspace->reserved = 1;
 
-    const java_remote_parent_task_t *published =
-        bpf_map_lookup_elem(&java_remote_parent_handoffs, &workspace->handoff_key);
-    linked = bpf_map_lookup_elem(&java_remote_parent_tasks, execution);
-    volatile u8 claimed =
-        bpf_map_lookup_elem(&java_remote_parent_handoff_claims, &workspace->handoff_key) != NULL;
-    if (!published || published->generation != workspace->carrier.generation ||
-        published->observed_monotime_ns != workspace->carrier.observed_monotime_ns ||
-        !java_remote_parent_pid_key_equal(&published->owner, &workspace->carrier.owner) ||
-        !linked || linked->generation != workspace->carrier.generation ||
-        linked->observed_monotime_ns != workspace->carrier.observed_monotime_ns ||
-        !java_remote_parent_pid_key_equal(&linked->owner, &workspace->carrier.owner) || claimed ||
-        !java_remote_parent_exact_generation_active(
-            &workspace->generation, workspace->carrier.observed_monotime_ns, 0)) {
-        const long deleted =
-            bpf_map_delete_elem(&java_remote_parent_handoffs, &workspace->handoff_key);
-        if (deleted == 0) {
-            java_remote_parent_release_generation_alias(&workspace->generation,
-                                                        workspace->carrier.observed_monotime_ns);
-            java_remote_parent_mark_exact_generation_ambiguous(&workspace->generation);
-        }
-    }
+    // A successful NOEXIST publication transfers the retained alias to H.
+    // The M-held release tail below performs the final C check before making
+    // that transfer visible to LINK/CANCEL.
 
 release_workspace:
+    if (workspace->mutation_claim.observed_monotime_ns) {
+        // OPEN C authorizes exposure only while it is still byte-exact. A
+        // terminal claimant deletes it before M; every M-held publisher exit
+        // therefore drains a published H if the ticket disappeared or changed.
+        const u8 expose_handoff =
+            workspace->reserved && java_remote_parent_handoff_ticket_exact(
+                                       &workspace->handoff_key, &workspace->handoff_ticket);
+        if (workspace->reserved && !expose_handoff) {
+            java_remote_parent_drain_handoff_under_mutation(&workspace->handoff_key,
+                                                            execution,
+                                                            process_capability,
+                                                            &workspace->carrier,
+                                                            &workspace->generation);
+        }
+        if (expose_handoff) {
+            // Ownership of the reservation moves to the exposed H.
+            __builtin_memset(&workspace->handoff_ticket, 0, sizeof(workspace->handoff_ticket));
+        } else {
+            java_remote_parent_release_open_handoff_ticket(&workspace->handoff_key,
+                                                           &workspace->handoff_ticket);
+        }
+        java_remote_parent_release_terminal_handoff_claim(&workspace->handoff_key);
+        java_remote_parent_release_handoff_mutation(&workspace->handoff_key,
+                                                    &workspace->mutation_claim);
+    }
+    // M acquisition can fail after C admission. The token is not exposed until
+    // this synchronous producer returns, so exact rollback is safe; a racing
+    // claimant may already have deleted the ticket and simply wins.
+    java_remote_parent_release_open_handoff_ticket(&workspace->handoff_key,
+                                                   &workspace->handoff_ticket);
     workspace->reserved = 0;
     __builtin_memset(&workspace->resolution, 0, sizeof(workspace->resolution));
     __builtin_memset(&workspace->carrier, 0, sizeof(workspace->carrier));
     __builtin_memset(&workspace->generation, 0, sizeof(workspace->generation));
     __builtin_memset(&workspace->handoff_key, 0, sizeof(workspace->handoff_key));
+    __builtin_memset(&workspace->task_claim, 0, sizeof(workspace->task_claim));
+    __builtin_memset(&workspace->handoff_ticket, 0, sizeof(workspace->handoff_ticket));
+    __builtin_memset(&workspace->mutation_claim, 0, sizeof(workspace->mutation_claim));
     barrier();
     workspace->busy = 0;
+
+release_process_claim:
+    java_remote_parent_release_process_claim(&process, &process_claim);
+}
+
+static __always_inline void
+java_remote_parent_capture_handoff_for_execution(const pid_key_t *execution, u64 token) {
+    java_remote_parent_capture_handoff_for_capability(
+        execution, token, java_process_incarnation_for(execution));
+}
+
+static __always_inline void java_remote_parent_capture_handoff(u64 token) {
+    const pid_key_t execution = java_remote_parent_current_owner();
+    java_remote_parent_capture_handoff_for_execution(&execution, token);
+}
+
+static __always_inline void java_remote_parent_cancel_handoff_for_capability(
+    const pid_key_t *execution, u64 token, u64 process_capability) {
+    if (!token || !process_capability) {
+        return;
+    }
+    const java_remote_parent_handoff_key_t key =
+        java_remote_parent_handoff_key_for_capability(execution, token, process_capability);
+    java_remote_parent_handoff_claim_t claimed = {0};
+    const u8 owns_handoff = java_remote_parent_claim_handoff(&key, process_capability, &claimed);
+    if (!owns_handoff && !bpf_map_lookup_elem(&java_remote_parent_handoffs, &key)) {
+        return;
+    }
+    java_remote_parent_handoff_claim_t mutation_claim = {0};
+    if (!java_remote_parent_acquire_handoff_mutation(&key, process_capability, &mutation_claim)) {
+        return;
+    }
+
+    const java_remote_parent_task_t *found =
+        bpf_map_lookup_elem(&java_remote_parent_handoffs, &key);
+    if (!found) {
+        goto release_mutation;
+    }
+    const java_remote_parent_task_t handoff = *found;
+    if (!java_remote_parent_task_carrier_valid_for_execution(
+            &handoff, execution, process_capability)) {
+        bpf_map_delete_elem(&java_remote_parent_handoffs, &key);
+        goto release_mutation;
+    }
+    if (bpf_map_delete_elem(&java_remote_parent_handoffs, &key) == 0) {
+        const java_remote_parent_key_t generation =
+            java_remote_parent_state_key(&handoff.owner, handoff.generation);
+        java_remote_parent_release_generation_alias_for_capability(
+            &generation, handoff.observed_monotime_ns, process_capability);
+    }
+
+release_mutation:
+    java_remote_parent_release_terminal_handoff_claim(&key);
+    java_remote_parent_release_handoff_mutation(&key, &mutation_claim);
+}
+
+static __always_inline void java_remote_parent_cancel_handoff(const pid_key_t *execution,
+                                                              u64 token) {
+    java_remote_parent_cancel_handoff_for_capability(
+        execution, token, java_process_incarnation_for(execution));
+}
+
+static __always_inline u8 java_remote_parent_link_handoff_for_capability(const pid_key_t *child,
+                                                                         u64 token,
+                                                                         u64 process_capability) {
+    java_remote_parent_handoff_claim_t task_claim = {0};
+    java_remote_parent_handoff_claim_t claimed = {0};
+    java_remote_parent_handoff_claim_t mutation_claim = {0};
+    java_remote_parent_handoff_key_t key = {0};
+    u8 normalized = 0;
+    u8 owns_handoff_claim = 0;
+    if (!process_capability ||
+        !java_remote_parent_acquire_task_claim(child, process_capability, &task_claim)) {
+        return 0;
+    }
+    // RESET uses the owner-scoped guard to serialize the key-only task-map
+    // delete. Holding T before checking O forms the other half of cleanup's
+    // two-fence handshake: a publisher that raced guard acquisition is visible
+    // to cleanup and must roll back before releasing T.
+    if (java_remote_parent_owner_detach_guarded(child)) {
+        goto release_task_claim;
+    }
+    if (!token) {
+        normalized = java_remote_parent_normalize_task_slot_for_capability_under_claim(
+            child, process_capability);
+        goto release_task_claim;
+    }
+
+    key = java_remote_parent_handoff_key_for_capability(child, token, process_capability);
+    if (java_remote_parent_owner_detach_guarded(child) ||
+        java_process_incarnation_for(child) != process_capability ||
+        !java_remote_parent_prepare_task_slot_for_link_under_claim(child, process_capability)) {
+        goto release_task_claim;
+    }
+    // From here onward, every exit either keeps this normalized empty slot or
+    // publishes one validated carrier into it while T remains held.
+    normalized = 1;
+
+    // P -> T -> terminal-delete C(OPEN) -> M. Delete success is the sole
+    // transfer winner. Missing, legacy-untagged, changed, or delete-failed C
+    // may still have a stranded H to drain, but can never authorize transfer.
+    owns_handoff_claim = java_remote_parent_claim_handoff(&key, process_capability, &claimed);
+    if ((!owns_handoff_claim && !bpf_map_lookup_elem(&java_remote_parent_handoffs, &key)) ||
+        !java_remote_parent_acquire_handoff_mutation(&key, process_capability, &mutation_claim)) {
+        goto release_task_claim;
+    }
+
+    const java_remote_parent_task_t *found =
+        bpf_map_lookup_elem(&java_remote_parent_handoffs, &key);
+    if (!found) {
+        goto release_mutation;
+    }
+    const java_remote_parent_task_t handoff = *found;
+    if (!java_remote_parent_task_carrier_valid_for_execution(&handoff, child, process_capability)) {
+        bpf_map_delete_elem(&java_remote_parent_handoffs, &key);
+        goto release_mutation;
+    }
+    if (bpf_map_delete_elem(&java_remote_parent_handoffs, &key) != 0) {
+        java_remote_parent_mark_carrier_generation_ambiguous_for_capability(
+            &handoff, child, process_capability);
+        goto release_mutation;
+    }
+
+    const java_remote_parent_key_t generation =
+        java_remote_parent_state_key(&handoff.owner, handoff.generation);
+    if (!owns_handoff_claim) {
+        // A previous claimant already made this token terminal. Help converge
+        // its stranded carrier, but never transfer it into this execution.
+        java_remote_parent_release_generation_alias_for_capability(
+            &generation, handoff.observed_monotime_ns, process_capability);
+        goto release_mutation;
+    }
+    if (!handoff.generation || !java_remote_parent_exact_generation_carrier_authoritative(
+                                   &generation, handoff.observed_monotime_ns, process_capability)) {
+        java_remote_parent_mark_carrier_generation_ambiguous_for_capability(
+            &handoff, child, process_capability);
+        java_remote_parent_release_generation_alias_for_capability(
+            &generation, handoff.observed_monotime_ns, process_capability);
+        goto release_mutation;
+    }
+
+    if (java_remote_parent_owner_detach_guarded(child) ||
+        java_process_incarnation_for(child) != process_capability) {
+        java_remote_parent_release_generation_alias_for_capability(
+            &generation, handoff.observed_monotime_ns, process_capability);
+        java_remote_parent_stat_add(k_java_remote_parent_stat_stage_overload);
+        goto release_mutation;
+    }
+    // The old binding was explicitly unlinked above. NOEXIST prevents a
+    // publisher that passed the guard check before RESET acquired it from
+    // overwriting the exact value RESET subsequently revalidated.
+    if (bpf_map_update_elem(&java_remote_parent_tasks, child, &handoff, BPF_NOEXIST) != 0) {
+        if (java_remote_parent_owner_detach_guarded(child)) {
+            java_remote_parent_release_generation_alias_for_capability(
+                &generation, handoff.observed_monotime_ns, process_capability);
+            java_remote_parent_stat_add(k_java_remote_parent_stat_stage_overload);
+            goto release_mutation;
+        }
+        const java_remote_parent_task_t *conflict =
+            bpf_map_lookup_elem(&java_remote_parent_tasks, child);
+        if (conflict) {
+            java_remote_parent_mark_carrier_generation_ambiguous_for_capability(
+                &handoff, child, process_capability);
+            java_remote_parent_fail_task_carrier_for_capability_under_claim(child,
+                                                                            process_capability);
+        }
+        java_remote_parent_release_generation_alias_for_capability(
+            &generation, handoff.observed_monotime_ns, process_capability);
+        java_remote_parent_stat_add(k_java_remote_parent_stat_stage_overload);
+        goto release_mutation;
+    }
+    const u8 guarded = java_remote_parent_owner_detach_guarded(child);
+    const u8 authoritative = java_remote_parent_exact_generation_carrier_authoritative(
+        &generation, handoff.observed_monotime_ns, process_capability);
+    const u8 current_process = java_process_incarnation_for(child) == process_capability;
+    if (guarded || !authoritative || !current_process) {
+        if (!authoritative) {
+            java_remote_parent_mark_carrier_generation_ambiguous_for_capability(
+                &handoff, child, process_capability);
+        }
+        // T excludes every cooperative replacement from the full-value check
+        // through the key-only delete and scoped alias release.
+        java_remote_parent_unlink_task_if_matches_under_claim(child, &handoff);
+        java_remote_parent_stat_add(k_java_remote_parent_stat_stage_overload);
+    }
+
+release_mutation:
+    if (mutation_claim.observed_monotime_ns) {
+        java_remote_parent_release_terminal_handoff_claim(&key);
+        java_remote_parent_release_handoff_mutation(&key, &mutation_claim);
+    }
+release_task_claim:
+    java_remote_parent_release_task_claim(child, &task_claim);
+    return normalized;
+}
+
+static __always_inline u8 java_remote_parent_link_handoff(const pid_key_t *child, u64 token) {
+    return java_remote_parent_link_handoff_for_capability(
+        child, token, java_process_incarnation_for(child));
+}
+
+static __always_inline void java_remote_parent_capture_relay_for_capability(
+    const pid_key_t *execution, u64 token, u64 process_capability) {
+    if (!token || !process_capability) {
+        return;
+    }
+
+    pid_key_t process = {0};
+    java_thread_mapping_claim_t process_claim = {0};
+    if (!java_remote_parent_acquire_process_claim(
+            execution, process_capability, &process, &process_claim)) {
+        return;
+    }
+
+    java_remote_parent_handoff_capture_workspace_t *workspace =
+        java_remote_parent_handoff_capture_workspace_mem();
+    if (!workspace || workspace->busy) {
+        goto release_process_claim;
+    }
+    workspace->busy = 1;
+    barrier();
+    if (java_process_incarnation_for(execution) != process_capability) {
+        goto release_workspace;
+    }
+    if (!java_remote_parent_acquire_task_claim(
+            execution, process_capability, &workspace->task_claim)) {
+        goto release_workspace;
+    }
+    const java_remote_parent_task_t *linked =
+        bpf_map_lookup_elem(&java_remote_parent_tasks, execution);
+    if (!linked) {
+        goto release_workspace;
+    }
+    workspace->carrier = *linked;
+
+    workspace->generation =
+        java_remote_parent_state_key(&workspace->carrier.owner, workspace->carrier.generation);
+    if (!java_remote_parent_task_carrier_valid_for_execution(
+            &workspace->carrier, execution, process_capability) ||
+        !java_remote_parent_exact_generation_active(
+            &workspace->generation, workspace->carrier.observed_monotime_ns, 0)) {
+        java_remote_parent_normalize_task_slot_for_capability_under_claim(execution,
+                                                                          process_capability);
+        goto release_workspace;
+    }
+
+    workspace->handoff_key =
+        java_remote_parent_handoff_key_for_capability(execution, token, process_capability);
+    if (!java_remote_parent_reserve_handoff_ticket(
+            &workspace->handoff_key, process_capability, &workspace->handoff_ticket)) {
+        goto release_workspace;
+    }
+    if (!java_remote_parent_acquire_handoff_mutation(
+            &workspace->handoff_key, process_capability, &workspace->mutation_claim)) {
+        goto release_workspace;
+    }
+    if (!java_remote_parent_handoff_ticket_exact(&workspace->handoff_key,
+                                                 &workspace->handoff_ticket)) {
+        goto release_workspace;
+    }
+    if (!java_remote_parent_retain_detached_generation_alias_for_capability(
+            &workspace->generation, workspace->carrier.observed_monotime_ns, process_capability)) {
+        java_remote_parent_mark_carrier_generation_ambiguous_for_capability(
+            &workspace->carrier, execution, process_capability);
+        goto release_workspace;
+    }
+    if (bpf_map_update_elem(&java_remote_parent_handoffs,
+                            &workspace->handoff_key,
+                            &workspace->carrier,
+                            BPF_NOEXIST) != 0) {
+        java_remote_parent_release_generation_alias_for_capability(
+            &workspace->generation, workspace->carrier.observed_monotime_ns, process_capability);
+        java_remote_parent_mark_carrier_generation_ambiguous_for_capability(
+            &workspace->carrier, execution, process_capability);
+        const java_remote_parent_task_t *existing =
+            bpf_map_lookup_elem(&java_remote_parent_handoffs, &workspace->handoff_key);
+        if (existing) {
+            java_remote_parent_mark_carrier_generation_ambiguous_for_capability(
+                existing, execution, process_capability);
+            java_remote_parent_release_open_handoff_ticket(&workspace->handoff_key,
+                                                           &workspace->handoff_ticket);
+            java_remote_parent_drain_handoff_under_mutation(&workspace->handoff_key,
+                                                            execution,
+                                                            process_capability,
+                                                            &workspace->carrier,
+                                                            &workspace->generation);
+        }
+        goto release_workspace;
+    }
+    workspace->reserved = 1;
+
+    // Publication transfers this additional alias to H while T and M(H) keep
+    // both source task and reusable key stable. The release tail performs the
+    // final C check before either fence becomes visible as free.
+
+release_workspace:
+    if (workspace->mutation_claim.observed_monotime_ns) {
+        const u8 expose_handoff =
+            workspace->reserved && java_remote_parent_handoff_ticket_exact(
+                                       &workspace->handoff_key, &workspace->handoff_ticket);
+        if (workspace->reserved && !expose_handoff) {
+            java_remote_parent_drain_handoff_under_mutation(&workspace->handoff_key,
+                                                            execution,
+                                                            process_capability,
+                                                            &workspace->carrier,
+                                                            &workspace->generation);
+        }
+        if (expose_handoff) {
+            __builtin_memset(&workspace->handoff_ticket, 0, sizeof(workspace->handoff_ticket));
+        } else {
+            java_remote_parent_release_open_handoff_ticket(&workspace->handoff_key,
+                                                           &workspace->handoff_ticket);
+        }
+        java_remote_parent_release_terminal_handoff_claim(&workspace->handoff_key);
+        java_remote_parent_release_handoff_mutation(&workspace->handoff_key,
+                                                    &workspace->mutation_claim);
+    }
+    if (workspace->task_claim.observed_monotime_ns) {
+        java_remote_parent_release_task_claim(execution, &workspace->task_claim);
+    }
+    java_remote_parent_release_open_handoff_ticket(&workspace->handoff_key,
+                                                   &workspace->handoff_ticket);
+    workspace->reserved = 0;
+    __builtin_memset(&workspace->resolution, 0, sizeof(workspace->resolution));
+    __builtin_memset(&workspace->carrier, 0, sizeof(workspace->carrier));
+    __builtin_memset(&workspace->generation, 0, sizeof(workspace->generation));
+    __builtin_memset(&workspace->handoff_key, 0, sizeof(workspace->handoff_key));
+    __builtin_memset(&workspace->task_claim, 0, sizeof(workspace->task_claim));
+    __builtin_memset(&workspace->handoff_ticket, 0, sizeof(workspace->handoff_ticket));
+    __builtin_memset(&workspace->mutation_claim, 0, sizeof(workspace->mutation_claim));
+    barrier();
+    workspace->busy = 0;
+
+release_process_claim:
+    java_remote_parent_release_process_claim(&process, &process_claim);
+}
+
+static __always_inline void java_remote_parent_capture_relay(const pid_key_t *execution,
+                                                             u64 token) {
+    java_remote_parent_capture_relay_for_capability(
+        execution, token, java_process_incarnation_for(execution));
 }
 
 static __always_inline enum java_remote_parent_status
@@ -5509,27 +6505,27 @@ typedef struct java_remote_parent_retrieval_workspace {
     java_remote_parent_claim_t claim_transaction;
 } java_remote_parent_retrieval_workspace_t;
 
-_Static_assert(sizeof(java_remote_parent_retrieval_workspace_t) == 488,
+_Static_assert(sizeof(java_remote_parent_retrieval_workspace_t) == 504,
                "java remote-parent retrieval workspace size mismatch");
 _Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, resolution) == 0,
                "java remote-parent retrieval resolution offset mismatch");
-_Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, owned_claim) == 136,
+_Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, owned_claim) == 144,
                "java remote-parent retrieval claim offset mismatch");
-_Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, claim_options) == 160,
+_Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, claim_options) == 168,
                "java remote-parent retrieval options offset mismatch");
-_Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, start) == 184,
+_Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, start) == 192,
                "java remote-parent retrieval start offset mismatch");
-_Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, claim_found) == 196,
+_Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, claim_found) == 204,
                "java remote-parent retrieval claim-found offset mismatch");
 _Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, raced_claim_found) ==
-                   197,
+                   205,
                "java remote-parent retrieval raced-claim offset mismatch");
-_Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, finish) == 200,
+_Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, finish) == 208,
                "java remote-parent retrieval finish offset mismatch");
-_Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, task) == 432,
+_Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, task) == 440,
                "java remote-parent retrieval task offset mismatch");
 _Static_assert(__builtin_offsetof(java_remote_parent_retrieval_workspace_t, claim_transaction) ==
-                   464,
+                   480,
                "java remote-parent retrieval transaction offset mismatch");
 
 static __noinline __attribute__((unused)) u8 java_remote_parent_retrieval_connection_matches(
@@ -5715,7 +6711,8 @@ static __noinline __attribute__((unused)) u8 java_remote_parent_retrieval_task_l
     return linked && !linked->reserved &&
            java_remote_parent_pid_key_equal(&linked->owner, &resolution->key.owner) &&
            linked->generation == resolution->key.generation &&
-           linked->observed_monotime_ns == resolution->observed_monotime_ns;
+           linked->observed_monotime_ns == resolution->observed_monotime_ns &&
+           linked->process_incarnation == resolution->indexed.process_incarnation;
 }
 
 static __noinline __attribute__((unused)) u8 java_remote_parent_retrieval_alias_replay_matches(
@@ -5998,6 +6995,7 @@ java_remote_parent_retrieve_for_connection_with_workspace(
     u32 expected_connection_netns,
     u64 expected_generation,
     u64 expected_socket_cookie,
+    u64 expected_process_incarnation,
     java_remote_parent_retrieval_workspace_t *workspace) {
     __builtin_memset(workspace, 0, sizeof(*workspace));
     pid_key_t *start = &workspace->start;
@@ -6005,9 +7003,10 @@ java_remote_parent_retrieve_for_connection_with_workspace(
     java_remote_parent_resolution_t *resolution = &workspace->resolution;
     java_remote_parent_finish_workspace_t *finish_workspace = &workspace->finish;
     if (source == k_java_remote_parent_source_direct) {
-        java_remote_parent_resolve_exact(resolution, start, 0, 1);
+        java_remote_parent_resolve_exact(resolution, start, 0, 1, expected_process_incarnation);
     } else if (source == k_java_remote_parent_source_task) {
-        java_remote_parent_resolve_task_into(resolution, start, max_age_ns, &workspace->task);
+        java_remote_parent_resolve_task_into(
+            resolution, start, max_age_ns, &workspace->task, expected_process_incarnation);
     } else {
         java_remote_parent_init_response(response, k_java_remote_parent_status_malformed, 0, 0);
         java_remote_parent_retrieval_stat(discard, k_java_remote_parent_status_malformed);
@@ -6017,6 +7016,7 @@ java_remote_parent_retrieve_for_connection_with_workspace(
     // sockopt-negotiated socket identity only after resolution completes.
     resolution->expected_socket_cookie = expected_socket_cookie;
     resolution->expected_generation = expected_generation;
+    resolution->expected_process_incarnation = expected_process_incarnation;
     workspace->claim_options = (java_remote_parent_claim_options_t){
         .expected_socket_cookie = expected_socket_cookie,
         .max_age_ns = max_age_ns,
@@ -6037,6 +7037,13 @@ java_remote_parent_retrieve_for_connection_with_workspace(
         }
     }
 
+    if (!expected_process_incarnation ||
+        (resolution->found &&
+         resolution->indexed.process_incarnation != expected_process_incarnation)) {
+        java_remote_parent_init_response(response, k_java_remote_parent_status_ambiguous, 0, 0);
+        java_remote_parent_retrieval_stat(discard, k_java_remote_parent_status_ambiguous);
+        return k_java_remote_parent_status_ambiguous;
+    }
     if (expected_connection && (!expected_socket_cookie || !expected_generation)) {
         java_remote_parent_init_response(response, k_java_remote_parent_status_missing, 0, 0);
         java_remote_parent_retrieval_stat(discard, k_java_remote_parent_status_missing);
@@ -6340,7 +7347,7 @@ java_remote_parent_retrieve_for_connection_with_workspace(
             bpf_map_lookup_elem(&java_remote_parent_fallback, &resolution->key.owner);
     }
     if (!java_remote_parent_retrieval_state_metadata_matches(resolution, state) ||
-        state->process_incarnation != java_current_process_incarnation() ||
+        state->process_incarnation != resolution->expected_process_incarnation ||
         !java_remote_parent_generation_index_matches(
             &resolution->key, state->process_incarnation, resolution->observed_monotime_ns) ||
         !java_remote_parent_generation_cleanly_reserved(&resolution->key) ||
@@ -6436,15 +7443,17 @@ java_remote_parent_retrieve_for_connection(java_remote_parent_response_t *respon
                                            u64 expected_generation,
                                            u64 expected_socket_cookie) {
     java_remote_parent_retrieval_workspace_t workspace = {0};
-    return java_remote_parent_retrieve_for_connection_with_workspace(response,
-                                                                     discard,
-                                                                     max_age_ns,
-                                                                     source,
-                                                                     expected_connection,
-                                                                     expected_connection_netns,
-                                                                     expected_generation,
-                                                                     expected_socket_cookie,
-                                                                     &workspace);
+    return java_remote_parent_retrieve_for_connection_with_workspace(
+        response,
+        discard,
+        max_age_ns,
+        source,
+        expected_connection,
+        expected_connection_netns,
+        expected_generation,
+        expected_socket_cookie,
+        java_current_process_incarnation(),
+        &workspace);
 }
 
 static __noinline __attribute__((unused)) enum java_remote_parent_status

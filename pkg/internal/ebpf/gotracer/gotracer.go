@@ -16,6 +16,7 @@ package gotracer // import "go.opentelemetry.io/obi/pkg/internal/ebpf/gotracer"
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -35,7 +36,6 @@ import (
 	"go.opentelemetry.io/obi/pkg/export/imetrics"
 	"go.opentelemetry.io/obi/pkg/internal/goexec"
 	"go.opentelemetry.io/obi/pkg/internal/javabridge"
-	"go.opentelemetry.io/obi/pkg/internal/procs"
 	"go.opentelemetry.io/obi/pkg/obi"
 	"go.opentelemetry.io/obi/pkg/pipe/msg"
 )
@@ -143,21 +143,29 @@ var goRuntimeMetricOffsetGroups = [...]struct {
 }
 
 type Tracer struct {
-	log                        *slog.Logger
-	pidsFilter                 ebpfcommon.ServiceFilter
-	cfg                        *config.EBPFTracer
-	metrics                    imetrics.Reporter
-	bpfObjects                 BpfObjects
-	closers                    []io.Closer
-	disabledRouteHarvesting    bool
-	javaRemoteParentConfigured bool
-	javaRemoteParentEnabled    bool
-	haveSockOpsNetnsCookie     func() error
-	supportsBPFLoop            bool
-	runtimeMetricTargetKeys    map[runtimeMetricTargetKey]BpfPidInfo
-	goChannelOffsetsByIno      map[uint64]bool
-	goRuntimeMetricMaskByIno   map[uint64]uint64
-	currentBinaryIno           uint64
+	log                         *slog.Logger
+	pidsFilter                  ebpfcommon.ServiceFilter
+	cfg                         *config.EBPFTracer
+	metrics                     imetrics.Reporter
+	bpfObjects                  BpfObjects
+	closers                     []io.Closer
+	disabledRouteHarvesting     bool
+	javaRemoteParentConfigured  bool
+	javaRemoteParentEnabled     bool
+	haveSockOpsNetnsCookie      func() error
+	supportsBPFLoop             bool
+	runtimeMetricTargetKeys     map[runtimeMetricTargetKey]BpfPidInfo
+	runtimeMetricTargetOwners   map[runtimeMetricTargetKey]*exec.FileInfo
+	goChannelOffsetsByFileID    map[exec.FileID]bool
+	goRuntimeMetricMaskByFileID map[exec.FileID]uint64
+	currentBinaryID             exec.FileID
+	// Test seams for the two lifecycle boundaries in RegisterOffsets/AllowPID.
+	// Production instances leave these nil and use the loaded BPF maps.
+	putGoOffsetsForTest                func(BpfGoOffsetsKeyT, BpfOffTableT) error
+	registerRuntimeMetricTargetForTest func(app.PID, uint32, *exec.FileInfo, *exec.FileInfo)
+	deleteRuntimeMetricTargetForTest   func(BpfPidInfo) error
+	putRuntimeMetricTargetForTest      func(BpfPidInfo, BpfGoRuntimeMetricTargetT) error
+	validateRuntimeMetricOwnerForTest  func(app.PID, *exec.FileInfo) error
 }
 
 func New(
@@ -177,28 +185,43 @@ func New(
 	}
 
 	return &Tracer{
-		log:                        log,
-		pidsFilter:                 pidFilter,
-		cfg:                        &cfg.EBPF,
-		metrics:                    metrics,
-		disabledRouteHarvesting:    disabledRouteHarvesting,
-		javaRemoteParentConfigured: cfg.Java.RemoteParent.Enabled(),
-		haveSockOpsNetnsCookie:     javabridge.HaveSockOpsNetnsCookie,
-		supportsBPFLoop:            ebpfcommon.SupportsEBPFLoops(log, cfg.EBPF.OverrideBPFLoopEnabled),
-		runtimeMetricTargetKeys:    map[runtimeMetricTargetKey]BpfPidInfo{},
-		goChannelOffsetsByIno:      map[uint64]bool{},
-		goRuntimeMetricMaskByIno:   map[uint64]uint64{},
+		log:                         log,
+		pidsFilter:                  pidFilter,
+		cfg:                         &cfg.EBPF,
+		metrics:                     metrics,
+		disabledRouteHarvesting:     disabledRouteHarvesting,
+		javaRemoteParentConfigured:  cfg.Java.RemoteParent.Enabled(),
+		haveSockOpsNetnsCookie:      javabridge.HaveSockOpsNetnsCookie,
+		supportsBPFLoop:             ebpfcommon.SupportsEBPFLoops(log, cfg.EBPF.OverrideBPFLoopEnabled),
+		runtimeMetricTargetKeys:     map[runtimeMetricTargetKey]BpfPidInfo{},
+		runtimeMetricTargetOwners:   map[runtimeMetricTargetKey]*exec.FileInfo{},
+		goChannelOffsetsByFileID:    map[exec.FileID]bool{},
+		goRuntimeMetricMaskByFileID: map[exec.FileID]uint64{},
 	}
 }
 
-func (p *Tracer) AllowPID(pid app.PID, ns uint32, fi *exec.FileInfo) {
-	p.pidsFilter.AllowPID(pid, ns, fi, ebpfcommon.PIDTypeGo)
-	p.registerRuntimeMetricTarget(pid, ns, fi)
+func (p *Tracer) AllowPID(pid app.PID, ns uint32, fi, owner *exec.FileInfo) {
+	if owner == nil {
+		owner = fi
+	}
+	// Process-scoped runtime addresses are unsafe after PID reuse. Retire every
+	// predecessor for this host PID before the trace admission becomes visible,
+	// including predecessors recorded under an earlier PID namespace. If BPF
+	// cleanup fails, keep the replacement fail-closed instead of allowing the old
+	// addresses and the new lifetime to coexist.
+	if !p.retireRuntimeMetricTargetReplacement(pid, ns, owner) {
+		return
+	}
+	p.pidsFilter.AllowPID(pid, ns, fi, owner, ebpfcommon.PIDTypeGo)
+	p.registerRuntimeMetricTarget(pid, ns, fi, owner)
 }
 
-func (p *Tracer) BlockPID(pid app.PID, ns uint32) {
-	p.deleteRuntimeMetricTarget(pid, ns)
-	p.pidsFilter.BlockPID(pid, ns)
+func (p *Tracer) BlockPID(pid app.PID, ns uint32, fi, owner *exec.FileInfo) {
+	if owner == nil {
+		owner = fi
+	}
+	p.deleteRuntimeMetricTarget(pid, ns, owner)
+	p.pidsFilter.BlockPID(pid, ns, fi, owner)
 }
 
 func (p *Tracer) supportsContextPropagation() bool {
@@ -314,9 +337,7 @@ func (p *Tracer) SetupTailCalls() {
 	}
 }
 
-func (p *Tracer) RegisterOffsets(fileInfo *exec.FileInfo, offsets *goexec.Offsets) {
-	p.recordGoChannelOffsetAvailability(fileInfo, offsets)
-
+func (p *Tracer) RegisterOffsets(fileInfo *exec.FileInfo, offsets *goexec.Offsets) error {
 	offTable := BpfOffTableT{}
 	initMissingGoChannelOffsets(&offTable)
 	// Set the field offsets and the logLevel for the Go BPF program in a map
@@ -458,20 +479,25 @@ func (p *Tracer) RegisterOffsets(fileInfo *exec.FileInfo, offsets *goexec.Offset
 		}
 	}
 
-	ino := fileInfo.Ino()
-	if err := p.bpfObjects.GoOffsetsMap.Put(ino, offTable); err != nil {
-		p.log.Error("setting Go offsets map failed", "pid", fileInfo.Pid(), "ino", ino, "error", err)
-		delete(p.goRuntimeMetricMaskByIno, ino)
-		p.deleteRuntimeMetricTarget(fileInfo.Pid(), fileInfo.Ns())
-		return
+	fileID := fileInfo.ID()
+	key := BpfGoOffsetsKeyT{Dev: fileID.Dev, Ino: fileID.Ino}
+	if err := p.putGoOffsets(key, offTable); err != nil {
+		return fmt.Errorf(
+			"setting Go offsets map for pid %d device %d inode %d: %w",
+			fileInfo.Pid(), fileID.Dev, fileID.Ino, err,
+		)
 	}
 
+	p.recordGoChannelOffsetAvailability(fileInfo, offsets)
 	p.recordGoRuntimeMetricAvailability(fileInfo, offsets)
-	if hasBaseGoRuntimeMetrics(p.goRuntimeMetricMaskByIno[ino]) {
-		p.registerRuntimeMetricTarget(fileInfo.Pid(), fileInfo.Ns(), fileInfo)
-	} else {
-		p.deleteRuntimeMetricTarget(fileInfo.Pid(), fileInfo.Ns())
+	return nil
+}
+
+func (p *Tracer) putGoOffsets(key BpfGoOffsetsKeyT, offsets BpfOffTableT) error {
+	if p.putGoOffsetsForTest != nil {
+		return p.putGoOffsetsForTest(key, offsets)
 	}
+	return p.bpfObjects.GoOffsetsMap.Put(key, offsets)
 }
 
 func initMissingGoChannelOffsets(offTable *BpfOffTableT) {
@@ -489,18 +515,19 @@ func (p *Tracer) recordGoChannelOffsetAvailability(fileInfo *exec.FileInfo, offs
 		return
 	}
 
-	if p.goChannelOffsetsByIno == nil {
-		p.goChannelOffsetsByIno = map[uint64]bool{}
+	if p.goChannelOffsetsByFileID == nil {
+		p.goChannelOffsetsByFileID = map[exec.FileID]bool{}
 	}
 
-	ino := fileInfo.Ino()
+	fileID := fileInfo.ID()
 	hasOffsets := offsets.HasGoChannelOffsets()
-	p.goChannelOffsetsByIno[ino] = hasOffsets
-	p.currentBinaryIno = ino
+	p.goChannelOffsetsByFileID[fileID] = hasOffsets
+	p.currentBinaryID = fileID
 
 	if !hasOffsets && p.log != nil {
 		p.log.Debug("skipping Go channel link probes for binary with missing runtime.hchan offsets",
-			"pid", fileInfo.Pid(), "ino", ino, "cmd", fileInfo.CmdExePath())
+			"pid", fileInfo.Pid(), "dev", fileID.Dev, "ino", fileID.Ino,
+			"cmd", fileInfo.CmdExePath())
 	}
 }
 
@@ -509,17 +536,18 @@ func (p *Tracer) recordGoRuntimeMetricAvailability(fileInfo *exec.FileInfo, offs
 		return
 	}
 
-	if p.goRuntimeMetricMaskByIno == nil {
-		p.goRuntimeMetricMaskByIno = map[uint64]uint64{}
+	if p.goRuntimeMetricMaskByFileID == nil {
+		p.goRuntimeMetricMaskByFileID = map[exec.FileID]uint64{}
 	}
 
-	ino := fileInfo.Ino()
+	fileID := fileInfo.ID()
 	mask := goRuntimeMetricMask(offsets)
 	supportsStableHeapSnapshotVersion, err := goexec.SupportsGoRuntimeMemoryMetrics(fileInfo.ELF())
 	if err != nil && p.log != nil {
 		p.log.Debug("Go runtime memory metric version detection failed",
 			"pid", fileInfo.Pid(),
-			"ino", ino,
+			"dev", fileID.Dev,
+			"ino", fileID.Ino,
 			"cmd", fileInfo.CmdExePath(),
 			"error", err)
 	}
@@ -537,18 +565,20 @@ func (p *Tracer) recordGoRuntimeMetricAvailability(fileInfo *exec.FileInfo, offs
 		if p.log != nil {
 			p.log.Warn("Go runtime heap metric symbol unresolved; using scalar fallback",
 				"pid", fileInfo.Pid(),
-				"ino", ino,
+				"dev", fileID.Dev,
+				"ino", fileID.Ino,
 				"cmd", fileInfo.CmdExePath(),
 				"missing_probe", goRuntimeMetricProbeSymbols[1],
 				"fallback_probe", goRuntimeMetricProbeSymbols[0])
 		}
 	}
-	p.goRuntimeMetricMaskByIno[ino] = mask
+	p.goRuntimeMetricMaskByFileID[fileID] = mask
 
 	if p.log != nil {
 		p.log.Debug("Go runtime metric availability",
 			"pid", fileInfo.Pid(),
-			"ino", ino,
+			"dev", fileID.Dev,
+			"ino", fileID.Ino,
 			"cmd", fileInfo.CmdExePath(),
 			"available_mask", mask,
 			"base_available", hasBaseGoRuntimeMetrics(mask),
@@ -589,30 +619,46 @@ func hasBaseGoRuntimeMetrics(mask uint64) bool {
 }
 
 // registerRuntimeMetricTarget writes per-process Go runtime global addresses
-// into BPF. Offsets stay inode-scoped in go_offsets_map, but these addresses
-// are process-scoped for PIE/ASLR and must follow the PID allow lifecycle.
-func (p *Tracer) registerRuntimeMetricTarget(pid app.PID, ns uint32, fileInfo *exec.FileInfo) {
+// into BPF. Offsets stay file-scoped in go_offsets_map, but these addresses are
+// process-scoped for PIE/ASLR and must follow the PID allow lifecycle.
+func (p *Tracer) registerRuntimeMetricTarget(
+	pid app.PID,
+	ns uint32,
+	fileInfo *exec.FileInfo,
+	owner *exec.FileInfo,
+) {
+	if owner == nil {
+		owner = fileInfo
+	}
+	if !p.retireRuntimeMetricTargetReplacement(pid, ns, owner) {
+		return
+	}
+	if p.registerRuntimeMetricTargetForTest != nil {
+		p.registerRuntimeMetricTargetForTest(pid, ns, fileInfo, owner)
+		return
+	}
 	if fileInfo == nil || p.bpfObjects.GoRuntimeMetricTargets == nil {
 		return
 	}
-	availableMask := p.goRuntimeMetricMaskByIno[fileInfo.Ino()]
+	fileID := fileInfo.ID()
+	availableMask := p.goRuntimeMetricMaskByFileID[fileID]
 	if !hasBaseGoRuntimeMetrics(availableMask) {
 		return
 	}
 
-	pidInfo, err := runtimeMetricPIDInfo(pid, ns)
+	pidInfo, err := runtimeMetricPIDInfo(pid, ns, owner)
 	if err != nil {
 		p.log.Debug("runtime metrics PID key lookup failed", "pid", pid, "ns", ns, "error", err)
 		return
 	}
 
-	symbols, err := goexec.ResolveRuntimeMetricSymbols(fileInfo, pid)
+	symbols, err := goexec.ResolveRuntimeMetricSymbols(fileInfo, owner)
 	if err != nil {
 		p.log.Debug("runtime metrics disabled for executable", "pid", pid, "ino", fileInfo.Ino(), "error", err)
 		return
 	}
 	availableMask = p.goRuntimeMetricMaskForSymbols(fileInfo, availableMask, symbols)
-	p.goRuntimeMetricMaskByIno[fileInfo.Ino()] = availableMask
+	p.goRuntimeMetricMaskByFileID[fileID] = availableMask
 
 	value := BpfGoRuntimeMetricTargetT{
 		MemstatsAddr:         symbols.MemstatsAddr,
@@ -623,15 +669,124 @@ func (p *Tracer) registerRuntimeMetricTarget(pid app.PID, ns uint32, fileInfo *e
 		SizeClassToSizesAddr: symbols.SizeClassToSizesAddr,
 	}
 
-	if err := p.bpfObjects.GoRuntimeMetricTargets.Put(pidInfo, value); err != nil {
-		p.log.Debug("setting runtime metric target failed", "pid", pid, "ino", fileInfo.Ino(), "error", err)
+	p.publishRuntimeMetricTarget(pid, ns, fileInfo, owner, pidInfo, value)
+}
+
+func (p *Tracer) publishRuntimeMetricTarget(
+	pid app.PID,
+	ns uint32,
+	fileInfo *exec.FileInfo,
+	owner *exec.FileInfo,
+	pidInfo BpfPidInfo,
+	value BpfGoRuntimeMetricTargetT,
+) {
+	if err := p.validateRuntimeMetricOwner(pid, owner); err != nil {
+		if p.log != nil {
+			p.log.Debug("runtime metric owner changed before target publication",
+				"pid", pid, "ns", ns, "error", err)
+		}
+		return
+	}
+	if err := p.putRuntimeMetricTarget(pidInfo, value); err != nil {
+		if p.log != nil {
+			p.log.Debug("setting runtime metric target failed",
+				"pid", pid, "ino", fileInfo.Ino(), "error", err)
+		}
 		return
 	}
 
 	if p.runtimeMetricTargetKeys == nil {
 		p.runtimeMetricTargetKeys = map[runtimeMetricTargetKey]BpfPidInfo{}
 	}
-	p.runtimeMetricTargetKeys[runtimeMetricTargetKey{pid: pid, ns: ns}] = pidInfo
+	if p.runtimeMetricTargetOwners == nil {
+		p.runtimeMetricTargetOwners = map[runtimeMetricTargetKey]*exec.FileInfo{}
+	}
+	key := runtimeMetricTargetKey{pid: pid, ns: ns}
+	p.runtimeMetricTargetKeys[key] = pidInfo
+	p.runtimeMetricTargetOwners[key] = owner
+
+	// Close the final validate-to-Put window. Tracking is published first so a
+	// failed rollback remains retryable by BlockPID or a replacement AllowPID.
+	if err := p.validateRuntimeMetricOwner(pid, owner); err != nil {
+		if p.log != nil {
+			p.log.Debug("runtime metric owner changed during target publication",
+				"pid", pid, "ns", ns, "error", err)
+		}
+		p.deleteRuntimeMetricTarget(pid, ns, owner)
+	}
+}
+
+func (p *Tracer) validateRuntimeMetricOwner(pid app.PID, owner *exec.FileInfo) error {
+	if p.validateRuntimeMetricOwnerForTest != nil {
+		return p.validateRuntimeMetricOwnerForTest(pid, owner)
+	}
+	return ebpfcommon.ValidateProcessOwner(pid, owner)
+}
+
+func (p *Tracer) putRuntimeMetricTarget(
+	pidInfo BpfPidInfo,
+	value BpfGoRuntimeMetricTargetT,
+) error {
+	if p.putRuntimeMetricTargetForTest != nil {
+		return p.putRuntimeMetricTargetForTest(pidInfo, value)
+	}
+	return p.bpfObjects.GoRuntimeMetricTargets.Put(pidInfo, value)
+}
+
+// retireRuntimeMetricTargetReplacement removes predecessor process-scoped
+// addresses before any replacement publication attempt. This must run before
+// all early returns: keeping the predecessor active is unsafe even when the
+// replacement cannot resolve its namespace aliases or load bias.
+func (p *Tracer) retireRuntimeMetricTargetReplacement(
+	pid app.PID,
+	ns uint32,
+	owner *exec.FileInfo,
+) bool {
+	currentKey := runtimeMetricTargetKey{pid: pid, ns: ns}
+	keys := make(map[runtimeMetricTargetKey]struct{})
+	for key := range p.runtimeMetricTargetKeys {
+		if key.pid == pid {
+			keys[key] = struct{}{}
+		}
+	}
+	for key := range p.runtimeMetricTargetOwners {
+		if key.pid == pid {
+			keys[key] = struct{}{}
+		}
+	}
+
+	for key := range keys {
+		previousOwner, ownerTracked := p.runtimeMetricTargetOwners[key]
+		if key == currentKey && ownerTracked && previousOwner == owner {
+			continue
+		}
+		if previousPIDInfo, targetTracked := p.runtimeMetricTargetKeys[key]; targetTracked {
+			if err := p.removeRuntimeMetricTarget(previousPIDInfo); err != nil {
+				if p.log != nil {
+					p.log.Warn("retiring predecessor runtime metric target failed",
+						"pid", pid, "previous_ns", key.ns, "new_ns", ns, "error", err)
+				}
+				return false
+			}
+		}
+		delete(p.runtimeMetricTargetKeys, key)
+		delete(p.runtimeMetricTargetOwners, key)
+	}
+	return true
+}
+
+func (p *Tracer) removeRuntimeMetricTarget(pidInfo BpfPidInfo) error {
+	if p.deleteRuntimeMetricTargetForTest != nil {
+		return p.deleteRuntimeMetricTargetForTest(pidInfo)
+	}
+	if p.bpfObjects.GoRuntimeMetricTargets == nil {
+		return nil
+	}
+	err := p.bpfObjects.GoRuntimeMetricTargets.Delete(pidInfo)
+	if errors.Is(err, ebpf.ErrKeyNotExist) {
+		return nil
+	}
+	return err
 }
 
 func (p *Tracer) goRuntimeMetricMaskForSymbols(
@@ -655,31 +810,40 @@ func (p *Tracer) goRuntimeMetricMaskForSymbols(
 
 // deleteRuntimeMetricTarget removes process-scoped runtime metadata whenever
 // the process is no longer eligible for runtime metric collection.
-func (p *Tracer) deleteRuntimeMetricTarget(pid app.PID, ns uint32) {
-	pidInfo, ok := p.runtimeMetricTargetKeys[runtimeMetricTargetKey{pid: pid, ns: ns}]
+func (p *Tracer) deleteRuntimeMetricTarget(pid app.PID, ns uint32, owner *exec.FileInfo) {
+	key := runtimeMetricTargetKey{pid: pid, ns: ns}
+	if owner != nil && p.runtimeMetricTargetOwners[key] != owner {
+		return
+	}
+	pidInfo, ok := p.runtimeMetricTargetKeys[key]
 	if !ok {
 		var err error
-		pidInfo, err = runtimeMetricPIDInfo(pid, ns)
+		pidInfo, err = runtimeMetricPIDInfo(pid, ns, nil)
 		if err != nil {
 			p.log.Debug("runtime metrics PID key lookup failed", "pid", pid, "ns", ns, "error", err)
 			return
 		}
 	}
 
-	if p.bpfObjects.GoRuntimeMetricTargets != nil {
-		_ = p.bpfObjects.GoRuntimeMetricTargets.Delete(pidInfo)
+	if err := p.removeRuntimeMetricTarget(pidInfo); err != nil {
+		if p.log != nil {
+			p.log.Warn("deleting runtime metric target failed",
+				"pid", pid, "ns", ns, "error", err)
+		}
+		return
 	}
-	delete(p.runtimeMetricTargetKeys, runtimeMetricTargetKey{pid: pid, ns: ns})
+	delete(p.runtimeMetricTargetKeys, key)
+	delete(p.runtimeMetricTargetOwners, key)
 }
 
-func runtimeMetricPIDInfo(pid app.PID, ns uint32) (BpfPidInfo, error) {
+func runtimeMetricPIDInfo(pid app.PID, ns uint32, owner *exec.FileInfo) (BpfPidInfo, error) {
 	pidInfo := BpfPidInfo{
 		HostPid: uint32(pid),
 		UserPid: uint32(pid),
 		Ns:      ns,
 	}
 
-	pids, err := procs.FindNamespacedPids(pid)
+	pids, err := ebpfcommon.NamespacedPIDsForOwner(pid, owner)
 	if err != nil {
 		return BpfPidInfo{}, fmt.Errorf("reading namespaced PIDs: %w", err)
 	}
@@ -697,11 +861,11 @@ func (p *Tracer) ProcessBinary(fileInfo *exec.FileInfo) {
 		return
 	}
 	if fileInfo == nil {
-		p.currentBinaryIno = 0
+		p.currentBinaryID = exec.FileID{}
 		return
 	}
 
-	p.currentBinaryIno = fileInfo.Ino()
+	p.currentBinaryID = fileInfo.ID()
 }
 
 func (p *Tracer) AddCloser(c ...io.Closer) {
@@ -1169,19 +1333,19 @@ func (p *Tracer) GoProbes() map[string][]*ebpfcommon.ProbeDesc {
 }
 
 func (p *Tracer) goChannelLinkProbesEnabled() bool {
-	if p == nil || p.currentBinaryIno == 0 {
+	if p == nil || p.currentBinaryID == (exec.FileID{}) {
 		return false
 	}
 
-	return p.goChannelOffsetsByIno[p.currentBinaryIno]
+	return p.goChannelOffsetsByFileID[p.currentBinaryID]
 }
 
 func (p *Tracer) goRuntimeHeapSnapshotProbeEnabled() bool {
-	if p == nil || p.currentBinaryIno == 0 {
+	if p == nil || p.currentBinaryID == (exec.FileID{}) {
 		return false
 	}
 
-	return p.goRuntimeMetricMaskByIno[p.currentBinaryIno]&goRuntimeMetricHeapSnapshotMask != 0
+	return p.goRuntimeMetricMaskByFileID[p.currentBinaryID]&goRuntimeMetricHeapSnapshotMask != 0
 }
 
 func (p *Tracer) KProbes() map[string]ebpfcommon.ProbeDesc {
@@ -1212,13 +1376,13 @@ func (p *Tracer) Iters() []*ebpfcommon.Iter { return nil }
 
 func (p *Tracer) Tracing() []*ebpfcommon.Tracing { return nil }
 
-func (p *Tracer) RecordInstrumentedLib(_ uint64, _ []io.Closer) {}
+func (p *Tracer) RecordInstrumentedLib(_ exec.FileID, _ []io.Closer) {}
 
-func (p *Tracer) AddInstrumentedLibRef(_ uint64) {}
+func (p *Tracer) AddInstrumentedLibRef(_ exec.FileID) {}
 
-func (p *Tracer) UnlinkInstrumentedLib(_ uint64) {}
+func (p *Tracer) UnlinkInstrumentedLib(_ exec.FileID) {}
 
-func (p *Tracer) AlreadyInstrumentedLib(_ uint64) bool {
+func (p *Tracer) AlreadyInstrumentedLib(_ exec.FileID) bool {
 	return false
 }
 

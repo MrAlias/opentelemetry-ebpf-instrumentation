@@ -69,9 +69,9 @@ func New(cfg *obi.Config, metrics imetrics.Reporter) *Tracer {
 	}
 }
 
-func (p *Tracer) AllowPID(app.PID, uint32, *exec.FileInfo) {}
+func (p *Tracer) AllowPID(app.PID, uint32, *exec.FileInfo, *exec.FileInfo) {}
 
-func (p *Tracer) BlockPID(app.PID, uint32) {
+func (p *Tracer) BlockPID(app.PID, uint32, *exec.FileInfo, *exec.FileInfo) {
 	if p.cfg == nil || !p.javaRemoteParentEnabled {
 		return
 	}
@@ -183,7 +183,7 @@ func (p *Tracer) iterConstants() map[string]any {
 
 func (p *Tracer) SetupTailCalls() {}
 
-func (p *Tracer) RegisterOffsets(_ *exec.FileInfo, _ *goexec.Offsets) {}
+func (p *Tracer) RegisterOffsets(_ *exec.FileInfo, _ *goexec.Offsets) error { return nil }
 
 func (p *Tracer) ProcessBinary(_ *exec.FileInfo) {}
 
@@ -210,6 +210,10 @@ func (p *Tracer) Tracepoints() map[string]ebpfcommon.ProbeDesc {
 		}
 	}
 	if p.javaRemoteParentEnabled {
+		tracepoints["sched/sched_process_exec"] = ebpfcommon.ProbeDesc{
+			Start:    p.bpfObjects.ObiJavaRemoteParentProcessExec,
+			Required: true,
+		}
 		tracepoints["sched/sched_process_exit"] = ebpfcommon.ProbeDesc{
 			Start:    p.bpfObjects.ObiJavaRemoteParentProcessExit,
 			Required: true,
@@ -282,13 +286,13 @@ func (p *Tracer) Tracing() []*ebpfcommon.Tracing {
 	return nil
 }
 
-func (p *Tracer) RecordInstrumentedLib(uint64, []io.Closer) {}
+func (p *Tracer) RecordInstrumentedLib(exec.FileID, []io.Closer) {}
 
-func (p *Tracer) AddInstrumentedLibRef(uint64) {}
+func (p *Tracer) AddInstrumentedLibRef(exec.FileID) {}
 
-func (p *Tracer) UnlinkInstrumentedLib(uint64) {}
+func (p *Tracer) UnlinkInstrumentedLib(exec.FileID) {}
 
-func (p *Tracer) AlreadyInstrumentedLib(uint64) bool {
+func (p *Tracer) AlreadyInstrumentedLib(exec.FileID) bool {
 	return false
 }
 

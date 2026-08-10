@@ -44,6 +44,8 @@ type instrumentedExecutable struct {
 	InstrumentationError error
 }
 
+var currentProcessParentPID = liveProcessParentPID
+
 // ExecTyperProvider classifies the discovered executables according to the
 // executable type (Go, generic...), and filters these executables
 // that are not instrumentable.
@@ -62,6 +64,9 @@ func ExecTyperProvider(
 		k8sInformer:         k8sInformer,
 		log:                 slog.With("component", "discover.ExecTyper"),
 		currentPids:         map[app.PID]*exec.FileInfo{},
+		pidOwners:           map[app.PID]*exec.FileInfo{},
+		tracerOwners:        map[app.PID]*exec.FileInfo{},
+		processLifecycles:   map[uint64]processLifecycle{},
 		instrumentableCache: instrumentableCache,
 	}
 	return func(_ context.Context) (swarm.RunFunc, error) {
@@ -72,6 +77,7 @@ func ExecTyperProvider(
 		in := input.Subscribe(msg.SubscriberName("ExecTyper"))
 		return func(ctx context.Context) {
 			defer output.Close()
+			defer t.closeProcessHandles()
 			swarms.ForEachInput(ctx, in, t.log.Debug, func(i []Event[ProcessMatch]) {
 				output.Send(t.FilterClassify(i))
 			})
@@ -79,12 +85,87 @@ func ExecTyperProvider(
 	}
 }
 
+func (t *typer) closeProcessHandles() {
+	closed := map[*exec.FileInfo]struct{}{}
+	for _, fi := range t.currentPids {
+		closed[fi] = struct{}{}
+		_ = fi.CloseProcessHandle()
+	}
+	for _, lifecycle := range t.processLifecycles {
+		if _, ok := closed[lifecycle.fileInfo]; ok {
+			continue
+		}
+		closed[lifecycle.fileInfo] = struct{}{}
+		_ = lifecycle.fileInfo.CloseProcessHandle()
+	}
+}
+
+func (t *typer) setCurrentPID(pid app.PID, fi *exec.FileInfo) {
+	if previous := t.currentPids[pid]; previous != nil && previous != fi {
+		_ = previous.CloseProcessHandle()
+	}
+	t.currentPids[pid] = fi
+	delete(t.pidOwners, pid)
+	delete(t.tracerOwners, pid)
+	if instanceID := fi.ProcessInstanceID(); instanceID != 0 {
+		if t.processLifecycles == nil {
+			t.processLifecycles = map[uint64]processLifecycle{}
+		}
+		t.processLifecycles[instanceID] = processLifecycle{
+			fileInfo:    fi,
+			tracerOwner: fi,
+		}
+	}
+}
+
+func (t *typer) setPIDOwners(pid app.PID, owner, tracerOwner *exec.FileInfo) {
+	if owner == nil {
+		return
+	}
+	if tracerOwner == nil {
+		tracerOwner = owner
+	}
+	if t.pidOwners == nil {
+		t.pidOwners = map[app.PID]*exec.FileInfo{}
+	}
+	if t.tracerOwners == nil {
+		t.tracerOwners = map[app.PID]*exec.FileInfo{}
+	}
+	t.pidOwners[pid] = owner
+	t.tracerOwners[pid] = tracerOwner
+	if instanceID := owner.ProcessInstanceID(); instanceID != 0 {
+		if t.processLifecycles == nil {
+			t.processLifecycles = map[uint64]processLifecycle{}
+		}
+		t.processLifecycles[instanceID] = processLifecycle{
+			fileInfo:    owner,
+			tracerOwner: tracerOwner,
+		}
+	}
+}
+
+type processLifecycle struct {
+	fileInfo    *exec.FileInfo
+	tracerOwner *exec.FileInfo
+}
+
 type typer struct {
-	cfg                 *obi.Config
-	metrics             imetrics.Reporter
-	k8sInformer         *kube.MetadataProvider
-	log                 *slog.Logger
-	currentPids         map[app.PID]*exec.FileInfo
+	cfg         *obi.Config
+	metrics     imetrics.Reporter
+	k8sInformer *kube.MetadataProvider
+	log         *slog.Logger
+	currentPids map[app.PID]*exec.FileInfo
+	// pidOwners records the FileInfo token used by monitorPIDs for each exact
+	// discovered process. Parent substitution intentionally makes this differ
+	// from currentPids[pid].
+	pidOwners map[app.PID]*exec.FileInfo
+	// tracerOwners records the executable tracer bucket independently from the
+	// exact PID lifetime token in pidOwners.
+	tracerOwners map[app.PID]*exec.FileInfo
+	// processLifecycles retains exact identities across numeric PID reuse until
+	// the corresponding deletion arrives. A stale deletion therefore cannot
+	// retire the replacement's current PID entry.
+	processLifecycles   map[uint64]processLifecycle
 	allGoFunctions      []string
 	instrumentableCache *lru.Cache[cacheKey, instrumentedExecutable]
 }
@@ -189,25 +270,21 @@ func (t *typer) FilterClassify(evs []Event[ProcessMatch]) []Event[ebpf.Instrumen
 			if elfFile, err := findExecElf(ev.Obj.Process, &svcID); err != nil {
 				t.log.Debug("error finding process ELF. Ignoring", "error", err)
 			} else {
-				t.currentPids[ev.Obj.Process.Pid] = elfFile
+				t.setCurrentPID(ev.Obj.Process.Pid, elfFile)
 				elfs = append(elfs, elfFile)
 			}
 		case EventDeleted:
-			if fInfo, ok := t.currentPids[ev.Obj.Process.Pid]; ok {
-				delete(t.currentPids, ev.Obj.Process.Pid)
-				if t.instrumentableCache != nil {
-					t.instrumentableCache.Remove(cacheKey{Dev: fInfo.Dev(), Ino: fInfo.Ino()})
-				}
+			if deleted, ok := t.deletedInstrumentable(ev.Obj.Process); ok {
 				out = append(out, Event[ebpf.Instrumentable]{
 					Type: EventDeleted,
-					Obj:  ebpf.Instrumentable{FileInfo: fInfo},
+					Obj:  deleted,
 				})
 			}
 		}
 	}
 
 	for i := range elfs {
-		inst := t.asInstrumentable(elfs[i])
+		inst := t.classifyInstrumentable(elfs[i])
 		t.log.Debug(
 			"found an instrumentable process",
 			"UID", inst.FileInfo.ServiceAttrs().UID,
@@ -218,13 +295,98 @@ func (t *typer) FilterClassify(evs []Event[ProcessMatch]) []Event[ebpf.Instrumen
 	return out
 }
 
+func (t *typer) classifyInstrumentable(discovered *exec.FileInfo) ebpf.Instrumentable {
+	inst := t.asInstrumentable(discovered)
+	inst.PIDOwners = make(map[app.PID]*exec.FileInfo, len(inst.ChildPids)+1)
+	for _, pid := range append([]app.PID{inst.FileInfo.Pid()}, inst.ChildPids...) {
+		owner := t.currentPids[pid]
+		if owner == nil && pid == discovered.Pid() {
+			owner = discovered
+		}
+		if owner == nil {
+			continue
+		}
+		inst.PIDOwners[pid] = owner
+		t.setPIDOwners(pid, owner, inst.FileInfo)
+	}
+	return inst
+}
+
+func (t *typer) deletedInstrumentable(process *services.ProcessInfo) (ebpf.Instrumentable, bool) {
+	if process == nil {
+		return ebpf.Instrumentable{}, false
+	}
+	pid := process.Pid
+	var lifecycle processLifecycle
+	if instanceID := process.ProcessInstanceID; instanceID != 0 {
+		var ok bool
+		lifecycle, ok = t.processLifecycles[instanceID]
+		if !ok {
+			current := t.currentPids[pid]
+			if current == nil || current.ProcessInstanceID() != instanceID {
+				return ebpf.Instrumentable{}, false
+			}
+			lifecycle = processLifecycle{
+				fileInfo:    current,
+				tracerOwner: t.tracerOwners[pid],
+			}
+		}
+		delete(t.processLifecycles, instanceID)
+	} else {
+		lifecycle = processLifecycle{
+			fileInfo:    t.currentPids[pid],
+			tracerOwner: t.tracerOwners[pid],
+		}
+	}
+	if lifecycle.fileInfo == nil {
+		return ebpf.Instrumentable{}, false
+	}
+	if lifecycle.tracerOwner == nil {
+		lifecycle.tracerOwner = lifecycle.fileInfo
+	}
+
+	if t.currentPids[pid] == lifecycle.fileInfo {
+		delete(t.currentPids, pid)
+		delete(t.pidOwners, pid)
+		delete(t.tracerOwners, pid)
+		if t.instrumentableCache != nil {
+			t.instrumentableCache.Remove(cacheKey{
+				Dev: lifecycle.fileInfo.Dev(),
+				Ino: lifecycle.fileInfo.Ino(),
+			})
+		}
+	}
+	_ = lifecycle.fileInfo.CloseProcessHandle()
+
+	return ebpf.Instrumentable{
+		FileInfo:    lifecycle.fileInfo,
+		PIDOwner:    lifecycle.fileInfo,
+		TracerOwner: lifecycle.tracerOwner,
+	}, true
+}
+
 // asInstrumentable classifies the type of executable (Go, generic...) and,
 // in case of belonging to a forked process, returns its parent.
 func (t *typer) asInstrumentable(execElf *exec.FileInfo) ebpf.Instrumentable {
 	log := t.log.With("pid", execElf.Pid(), "comm", execElf.CmdExePath())
 	if ic, ok := t.instrumentableCache.Get(cacheKey{Dev: execElf.Dev(), Ino: execElf.Ino()}); ok {
 		log.Debug("new instance of existing executable", "type", ic.Type)
-		return ebpf.Instrumentable{Type: ic.Type, FileInfo: execElf, Offsets: ic.Offsets, InstrumentationError: ic.InstrumentationError}
+		var child []app.PID
+		// A successful Go-offset classification intentionally instruments each
+		// process directly. All generic/proxy classifications still need exact
+		// parent selection even when their executable type came from the inode
+		// cache.
+		if ic.Offsets == nil || ic.InstrumentationError != nil {
+			execElf, child = t.selectExecutableParent(execElf, log)
+		}
+		return ebpf.Instrumentable{
+			Type:                 ic.Type,
+			FileInfo:             execElf,
+			ChildPids:            child,
+			Offsets:              ic.Offsets,
+			InstrumentationError: ic.InstrumentationError,
+			LogEnricherEnabled:   execElf.LogEnricherEnabled(),
+		}
 	}
 
 	log.Debug("getting instrumentable information")
@@ -247,19 +409,7 @@ func (t *typer) asInstrumentable(execElf *exec.FileInfo) ebpf.Instrumentable {
 		log.Debug("identified as a generic, non-Go executable")
 	}
 
-	// select the parent (or grandparent) of the executable, if any
-	var child []app.PID
-	parent, ok := t.currentPids[execElf.Ppid()]
-	for ok && execElf.Ppid() != execElf.Pid() &&
-		// we will ignore parent processes that are not the same executable. For example,
-		// to avoid wrongly instrumenting process launcher such as systemd or containerd-shimd
-		// when they launch an instrumentable service
-		execElf.CmdExePath() == parent.CmdExePath() {
-		log.Debug("replacing executable by its parent", "ppid", execElf.Ppid())
-		child = append(child, execElf.Pid())
-		execElf = parent
-		parent, ok = t.currentPids[parent.Ppid()]
-	}
+	execElf, child := t.selectExecutableParent(execElf, log)
 
 	// Typer finds the executable type again. The language decorator can skip certain type detection,
 	// for example, it will skip Linux system services. If the selection criteria brought us here on
@@ -287,6 +437,64 @@ func (t *typer) asInstrumentable(execElf *exec.FileInfo) ebpf.Instrumentable {
 		InstrumentationError: err,
 		LogEnricherEnabled:   execElf.LogEnricherEnabled(),
 	}
+}
+
+func (t *typer) selectExecutableParent(
+	discovered *exec.FileInfo,
+	log *slog.Logger,
+) (*exec.FileInfo, []app.PID) {
+	execElf := discovered
+	// On Linux, re-read each relationship through exact process handles. The
+	// child is confirmed again after validating each candidate so a parent that
+	// exited and reused its numeric PID between the two lookups cannot be adopted.
+	// The visited set also makes malformed or synthetic ancestry cycles fail
+	// closed.
+	var child []app.PID
+	visited := map[*exec.FileInfo]struct{}{execElf: {}}
+	parentPID, parentPIDOK := currentProcessParentPID(execElf)
+	for parentPIDOK && parentPID != execElf.Pid() {
+		parent, ok := t.currentPids[parentPID]
+		if !ok || parent == nil || !sameExecutableIdentity(parent, execElf) {
+			break
+		}
+		if _, seen := visited[parent]; seen {
+			break
+		}
+		if _, parentOK := currentProcessParentPID(parent); !parentOK {
+			break
+		}
+		confirmedParentPID, childOK := currentProcessParentPID(execElf)
+		if !childOK || confirmedParentPID != parentPID {
+			break
+		}
+		nextParentPID, parentOK := currentProcessParentPID(parent)
+		if !parentOK {
+			break
+		}
+
+		log.Debug("replacing executable by its parent", "ppid", parentPID)
+		child = append(child, execElf.Pid())
+		execElf = parent
+		visited[execElf] = struct{}{}
+		parentPID, parentPIDOK = nextParentPID, true
+	}
+	if execElf != discovered && discovered.ELF() != nil {
+		_ = discovered.ELF().Close()
+	}
+	return execElf, child
+}
+
+func sameExecutableIdentity(left, right *exec.FileInfo) bool {
+	if left == nil || right == nil || left.CmdExePath() != right.CmdExePath() {
+		return false
+	}
+	// Linux discovery always supplies the device/inode pair from a pinned
+	// executable. Zero pairs remain only for synthetic/non-Linux compatibility.
+	if left.Dev() == 0 && left.Ino() == 0 && right.Dev() == 0 && right.Ino() == 0 {
+		return true
+	}
+	return left.Dev() != 0 && left.Ino() != 0 &&
+		left.Dev() == right.Dev() && left.Ino() == right.Ino()
 }
 
 func (t *typer) inspectOffsets(execElf *exec.FileInfo) (*goexec.Offsets, bool, error) {

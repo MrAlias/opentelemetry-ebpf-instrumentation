@@ -59,6 +59,16 @@ type ProcessInfo struct {
 	ExePath   string
 	CmdArgs   string
 	OpenPorts []uint32
+	// ProcessStart is /proc/<pid>/stat field 22 in raw clock ticks. It is an
+	// identity token, not a wall-clock timestamp.
+	ProcessStart uint64
+	// ProcessInstanceID identifies this exact discovery admission. It remains
+	// stable in matcher history after ProcessHandle is consumed, allowing a
+	// delayed deletion to target the old lifetime rather than a reused PID.
+	ProcessInstanceID uint64
+	// ProcessHandle owns the stable watcher-observed process directory after a
+	// successful match. findExecElf consumes it exactly once.
+	ProcessHandle *ProcessHandle
 }
 
 type RouteHarvesterLanguage string

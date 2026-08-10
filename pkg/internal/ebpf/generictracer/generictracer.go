@@ -7,6 +7,9 @@ package generictracer // import "go.opentelemetry.io/obi/pkg/internal/ebpf/gener
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -41,26 +44,44 @@ import (
 //go:generate $BPF2GO -cc $BPF_CLANG -cflags $BPF_CFLAGS -target amd64,arm64 Bpf ../../../../bpf/generictracer/generictracer.c -- -I../../../../bpf
 
 type Tracer struct {
-	pidsFilter              ebpfcommon.ServiceFilter
-	cfg                     *obi.Config
-	metrics                 imetrics.Reporter
-	bpfObjects              BpfObjects
-	closers                 []io.Closer
-	log                     *slog.Logger
-	qdiscs                  map[ifaces.Interface]*netlink.GenericQdisc
-	egressFilters           map[ifaces.Interface]*netlink.BpfFilter
-	ingressFilters          map[ifaces.Interface]*netlink.BpfFilter
-	instrumentedLibs        ebpfcommon.InstrumentedLibsT
-	libsMux                 sync.Mutex
-	iters                   []*ebpfcommon.Iter
-	eventCtx                *ebpfcommon.EBPFEventContext
-	jvmUSDTManager          ebpfcommon.USDTSpecManager
-	javaAuthMu              sync.Mutex
-	javaAuthKeys            map[javaAuthorizationKey][]javaAuthorization
-	javaRemoteParentEnabled bool
-	javaDataHookAttached    bool
-	javaCloseHookAttached   bool
-	haveSockOpsNetnsCookie  func() error
+	pidsFilter               ebpfcommon.ServiceFilter
+	cfg                      *obi.Config
+	metrics                  imetrics.Reporter
+	bpfObjects               BpfObjects
+	closers                  []io.Closer
+	log                      *slog.Logger
+	qdiscs                   map[ifaces.Interface]*netlink.GenericQdisc
+	egressFilters            map[ifaces.Interface]*netlink.BpfFilter
+	ingressFilters           map[ifaces.Interface]*netlink.BpfFilter
+	instrumentedLibs         ebpfcommon.InstrumentedLibsT
+	libsMux                  sync.Mutex
+	iters                    []*ebpfcommon.Iter
+	eventCtx                 *ebpfcommon.EBPFEventContext
+	jvmUSDTManager           ebpfcommon.USDTSpecManager
+	javaLifecycleMu          sync.Mutex
+	javaWorkersMu            sync.Mutex
+	javaWorkersCtx           context.Context
+	javaWorkersCancel        context.CancelFunc
+	javaWorkersWG            sync.WaitGroup
+	javaWorkersStopping      bool
+	javaPendingWorkerStarted bool
+	javaAuthMu               sync.Mutex
+	javaAuthPublications     javaAuthorizationPublicationCoordinator
+	javaAuthKeys             map[javaAuthorizationKey][]javaAuthorization
+	javaDeauthPending        map[javaAuthorizationKey]map[javaAuthorization]struct{}
+	javaAuthAttempts         map[javaAuthorizationKey]javaAuthorization
+	javaAuthAttemptFiles     map[javaAuthorizationKey]*exec.FileInfo
+	javaAuthAttemptEvents    map[javaAuthorizationKey]*javaAuthorizationEvent
+	javaAuthFiles            map[javaAuthorizationKey]*exec.FileInfo
+	javaAuthEvents           map[javaAuthorizationKey][]*javaAuthorizationEvent
+	javaAuthLatest           map[javaAuthorizationKey]uint64
+	javaAuthVersions         map[javaAuthorizationKey]uint64
+	javaAuthSequence         uint64
+	javaSuspendPending       map[javaAuthorizationKey]map[javaAuthorization]struct{}
+	javaRemoteParentEnabled  bool
+	javaDataHookAttached     bool
+	javaCloseHookAttached    bool
+	haveSockOpsNetnsCookie   func() error
 }
 
 type javaAuthorizationKey struct {
@@ -73,12 +94,139 @@ type javaAuthorization struct {
 	capability uint64
 }
 
-var findJavaNamespacedPIDs = procs.FindNamespacedPids
+type javaAuthorizationPublicationCoordinator struct {
+	mu    sync.Mutex
+	locks map[javaAuthorizationKey]*javaAuthorizationPublicationLock
+}
+
+type javaAuthorizationPublicationLock struct {
+	mu   sync.Mutex
+	refs uint64
+}
+
+func (c *javaAuthorizationPublicationCoordinator) lock(
+	key javaAuthorizationKey,
+) func() {
+	c.mu.Lock()
+	if c.locks == nil {
+		c.locks = make(map[javaAuthorizationKey]*javaAuthorizationPublicationLock)
+	}
+	publicationLock := c.locks[key]
+	if publicationLock == nil {
+		publicationLock = &javaAuthorizationPublicationLock{}
+		c.locks[key] = publicationLock
+	}
+	publicationLock.refs++
+	c.mu.Unlock()
+
+	publicationLock.mu.Lock()
+	return func() {
+		publicationLock.mu.Unlock()
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		publicationLock.refs--
+		if publicationLock.refs == 0 && c.locks[key] == publicationLock {
+			delete(c.locks, key)
+		}
+	}
+}
+
+type orderedResourceCloser struct {
+	once        sync.Once
+	beforeClose func()
+	closers     []io.Closer
+	err         error
+}
+
+func newOrderedResourceCloser(beforeClose func(), closers ...io.Closer) *orderedResourceCloser {
+	return &orderedResourceCloser{
+		beforeClose: beforeClose,
+		closers:     append([]io.Closer(nil), closers...),
+	}
+}
+
+func (c *orderedResourceCloser) Close() error {
+	c.once.Do(func() {
+		if c.beforeClose != nil {
+			c.beforeClose()
+		}
+
+		errs := make([]error, len(c.closers))
+		var wg sync.WaitGroup
+		for i, closer := range c.closers {
+			if closer == nil {
+				continue
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				errs[i] = closer.Close()
+			}()
+		}
+		wg.Wait()
+		c.err = errors.Join(errs...)
+	})
+	return c.err
+}
+
+// javaAuthorizationEvent is one exact FileInfo process lifetime. Even an
+// ineligible or failed Java authorization retains a tombstone until the BlockPID
+// carrying that same FileInfo arrives. A reused pid/ns can therefore never make
+// a delayed deletion consume or deauthorize its replacement.
+type javaAuthorizationEvent struct {
+	sequence            uint64
+	requestedCapability uint64
+	authorizationGens   []uint64
+	authorization       javaAuthorization
+	file                *exec.FileInfo
+	prepared            bool
+	authorizing         bool
+	confirmed           bool
+	canceled            bool
+}
+
+var (
+	// Cleanup runs at most every ten seconds. A tagged userspace P(process)
+	// left by an ambiguous map transaction must receive one complete recovery
+	// sweep before a one-shot discovery lifetime gives up authorization.
+	javaAuthorizationRetryTimeout    = 11 * time.Second
+	javaAuthorizationRetryInterval   = 10 * time.Millisecond
+	javaDeauthorizationRetryInterval = time.Second
+)
+
+var (
+	findJavaNamespacedPIDs         = procs.FindNamespacedPids
+	findJavaNamespacedPIDsForOwner = ebpfcommon.NamespacedPIDsForOwner
+	validateJavaProcessOwner       = ebpfcommon.ValidateProcessOwner
+)
 
 var updateJavaRemoteParentDataHookReadiness = func(readiness *ebpf.Map, state uint32) error {
 	key := uint32(0)
 	return readiness.Update(&key, &state, ebpf.UpdateAny)
 }
+
+var updateJavaRemoteParentControlTailReadiness = func(readiness *ebpf.Map, state uint32) error {
+	key := uint32(0)
+	return readiness.Update(&key, &state, ebpf.UpdateAny)
+}
+
+var (
+	authorizeJavaProcessCapability   = javabridge.AuthorizeProcessCapability
+	deauthorizeJavaProcessCapability = javabridge.DeauthorizeProcessCapability
+	suspendJavaProcessAuthorization  = javabridge.SuspendProcessAuthorization
+	generateJavaProcessCapability    = newJavaProcessCapability
+	updateJavaAuthorizedProcess      = func(
+		m *ebpf.Map, identity javabridge.Identity, capability uint64,
+	) error {
+		return m.Update(&identity, capability, ebpf.UpdateAny)
+	}
+	lockJavaAuthorizationPublication = func(
+		coordinator *javaAuthorizationPublicationCoordinator,
+		key javaAuthorizationKey,
+	) func() {
+		return coordinator.lock(key)
+	}
+)
 
 func tlog() *slog.Logger {
 	return slog.With("component", "generic.Tracer")
@@ -97,8 +245,86 @@ func New(pidFilter ebpfcommon.ServiceFilter, cfg *obi.Config, metrics imetrics.R
 		libsMux:                sync.Mutex{},
 		iters:                  []*ebpfcommon.Iter{},
 		javaAuthKeys:           make(map[javaAuthorizationKey][]javaAuthorization),
+		javaDeauthPending:      make(map[javaAuthorizationKey]map[javaAuthorization]struct{}),
+		javaAuthAttempts:       make(map[javaAuthorizationKey]javaAuthorization),
+		javaAuthAttemptFiles:   make(map[javaAuthorizationKey]*exec.FileInfo),
+		javaAuthAttemptEvents:  make(map[javaAuthorizationKey]*javaAuthorizationEvent),
+		javaAuthFiles:          make(map[javaAuthorizationKey]*exec.FileInfo),
+		javaAuthEvents:         make(map[javaAuthorizationKey][]*javaAuthorizationEvent),
+		javaAuthLatest:         make(map[javaAuthorizationKey]uint64),
+		javaAuthVersions:       make(map[javaAuthorizationKey]uint64),
+		javaSuspendPending:     make(map[javaAuthorizationKey]map[javaAuthorization]struct{}),
 		haveSockOpsNetnsCookie: javabridge.HaveSockOpsNetnsCookie,
 	}
+}
+
+func (p *Tracer) startJavaWorker(worker func(context.Context)) bool {
+	p.javaWorkersMu.Lock()
+	defer p.javaWorkersMu.Unlock()
+	if p.javaWorkersStopping {
+		return false
+	}
+	if p.javaWorkersCtx == nil {
+		p.javaWorkersCtx, p.javaWorkersCancel = context.WithCancel(context.Background())
+	}
+	ctx := p.javaWorkersCtx
+	p.javaWorkersWG.Add(1)
+	go func() {
+		defer p.javaWorkersWG.Done()
+		worker(ctx)
+	}()
+	return true
+}
+
+func (p *Tracer) startPendingJavaDeauthorizationWorker() bool {
+	p.javaWorkersMu.Lock()
+	defer p.javaWorkersMu.Unlock()
+	if p.javaWorkersStopping || p.javaPendingWorkerStarted {
+		return false
+	}
+	if p.javaWorkersCtx == nil {
+		p.javaWorkersCtx, p.javaWorkersCancel = context.WithCancel(context.Background())
+	}
+	p.javaPendingWorkerStarted = true
+	ctx := p.javaWorkersCtx
+	p.javaWorkersWG.Add(1)
+	go func() {
+		defer p.javaWorkersWG.Done()
+		p.runPendingJavaDeauthorizations(ctx)
+	}()
+	return true
+}
+
+func (p *Tracer) javaWorkersAreStopping() bool {
+	p.javaWorkersMu.Lock()
+	defer p.javaWorkersMu.Unlock()
+	return p.javaWorkersStopping
+}
+
+func (p *Tracer) stopJavaWorkers() {
+	p.javaLifecycleMu.Lock()
+	p.javaWorkersMu.Lock()
+	p.javaWorkersStopping = true
+	cancel := p.javaWorkersCancel
+	p.javaWorkersMu.Unlock()
+	p.javaLifecycleMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	p.javaWorkersWG.Wait()
+	// Authorization workers can record an exact cleanup after the periodic
+	// worker observes cancellation. Reconcile once after every worker has joined.
+	p.retryPendingJavaDeauthorizations()
+}
+
+func failJavaAuthorizationFile(fi *exec.FileInfo) {
+	if fi == nil {
+		return
+	}
+	_, generation := fi.BeginJavaAgentAuthorization()
+	fi.CompleteJavaAgentAuthorization(generation, 0)
+	fi.SetJavaAgentCapability(0)
 }
 
 // Updating these requires updating the constants below in pid.h
@@ -152,21 +378,75 @@ func (p *Tracer) rebuildValidPids() {
 	}
 }
 
-func (p *Tracer) AllowPID(pid app.PID, ns uint32, fi *exec.FileInfo) {
-	p.pidsFilter.AllowPID(pid, ns, fi, ebpfcommon.PIDTypeKProbes)
+func (p *Tracer) AllowPID(
+	pid app.PID,
+	ns uint32,
+	fi *exec.FileInfo,
+	owner *exec.FileInfo,
+) {
+	if owner == nil {
+		owner = fi
+	}
+	p.javaLifecycleMu.Lock()
+	defer p.javaLifecycleMu.Unlock()
+	if p.javaWorkersAreStopping() {
+		if fi != nil && pid == fi.Pid() {
+			failJavaAuthorizationFile(fi)
+		}
+		return
+	}
+	var event *javaAuthorizationEvent
+	created := false
+	if fi != nil && pid == fi.Pid() {
+		event, created = p.beginJavaAuthorizationEvent(
+			javaAuthorizationKey{pid: pid, ns: ns}, fi,
+		)
+		if created && !p.supersedeJavaAuthorizationEvent(
+			javaAuthorizationKey{pid: pid, ns: ns}, event, fi,
+		) {
+			created = false
+		}
+	}
+	p.pidsFilter.AllowPID(pid, ns, fi, owner, ebpfcommon.PIDTypeKProbes)
 	p.rebuildValidPids()
-	p.authorizeJavaProcess(pid, ns, fi)
-	// Override potential negative cache entry for this PID
+	// Invalidate either sign of a cached decision. Writing a positive entry here
+	// would bypass the rebuilt valid_pids set even when exact-owner admission
+	// failed during a PID-reuse race. The next BPF event recomputes and caches the
+	// decision from the committed filter state.
 	if p.bpfObjects.PidCache != nil {
 		pidU32 := uint32(pid)
-		_ = p.bpfObjects.PidCache.Put(pidU32, pidU32)
+		_ = p.bpfObjects.PidCache.Delete(pidU32)
+	}
+	if created {
+		started := p.startJavaWorker(func(ctx context.Context) {
+			p.authorizeJavaProcessForEventContext(ctx, pid, ns, fi, event)
+		})
+		if !started {
+			p.completeJavaAuthorizationEvent(fi, event, 0)
+		}
 	}
 }
 
-func (p *Tracer) BlockPID(pid app.PID, ns uint32) {
-	p.pidsFilter.BlockPID(pid, ns)
+func (p *Tracer) BlockPID(
+	pid app.PID,
+	ns uint32,
+	fi *exec.FileInfo,
+	owner *exec.FileInfo,
+) {
+	if owner == nil {
+		owner = fi
+	}
+	p.javaLifecycleMu.Lock()
+	defer p.javaLifecycleMu.Unlock()
+	if p.javaWorkersAreStopping() {
+		if fi != nil && pid == fi.Pid() {
+			failJavaAuthorizationFile(fi)
+		}
+		return
+	}
+	p.pidsFilter.BlockPID(pid, ns, fi, owner)
 	p.rebuildValidPids()
-	p.deauthorizeJavaProcess(pid, ns)
+	p.deauthorizeJavaProcess(pid, ns, fi)
 	// Remove from cache so next access re-evaluates
 	if p.bpfObjects.PidCache != nil {
 		pidU32 := uint32(pid)
@@ -174,8 +454,18 @@ func (p *Tracer) BlockPID(pid app.PID, ns uint32) {
 	}
 }
 
-func javaProcessIdentity(pid app.PID, ns uint32) (javabridge.Identity, error) {
-	namespacePIDs, err := findJavaNamespacedPIDs(pid)
+func javaProcessIdentity(
+	pid app.PID,
+	ns uint32,
+	owner *exec.FileInfo,
+) (javabridge.Identity, error) {
+	var namespacePIDs []app.PID
+	var err error
+	if owner == nil || owner.ProcessStartTime() == 0 {
+		namespacePIDs, err = findJavaNamespacedPIDs(pid)
+	} else {
+		namespacePIDs, err = findJavaNamespacedPIDsForOwner(pid, owner)
+	}
 	if err != nil {
 		return javabridge.Identity{}, err
 	}
@@ -187,36 +477,648 @@ func javaProcessIdentity(pid app.PID, ns uint32) (javabridge.Identity, error) {
 	return javabridge.Identity{TID: namespacePID, PID: namespacePID, Namespace: ns}, nil
 }
 
-func (p *Tracer) authorizeJavaProcess(pid app.PID, ns uint32, fi *exec.FileInfo) {
-	if fi == nil || pid != fi.Pid() || fi.SDKLanguage() != svc.InstrumentableJava {
-		return
+func validateJavaProcessLifetime(pid app.PID, fi *exec.FileInfo) error {
+	if fi == nil || fi.ProcessStartTime() == 0 {
+		return nil
 	}
-	capability := fi.JavaAgentCapability()
-	if capability == 0 || p.bpfObjects.JavaAuthorizedProcesses == nil {
-		return
+	if err := validateJavaProcessOwner(pid, fi); err != nil {
+		return fmt.Errorf("revalidating Java process lifetime: %w", err)
 	}
+	return nil
+}
 
-	identity, err := javaProcessIdentity(pid, ns)
-	if err != nil {
-		p.log.Warn("unable to resolve exact Java process identity", "pid", pid, "ns", ns, "error", err)
+func waitJavaAuthorizationRetry(ctx context.Context, interval time.Duration) bool {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func (p *Tracer) ensureJavaAuthorizationStateLocked() {
+	if p.javaAuthKeys == nil {
+		p.javaAuthKeys = make(map[javaAuthorizationKey][]javaAuthorization)
+	}
+	if p.javaDeauthPending == nil {
+		p.javaDeauthPending = make(
+			map[javaAuthorizationKey]map[javaAuthorization]struct{},
+		)
+	}
+	if p.javaAuthAttempts == nil {
+		p.javaAuthAttempts = make(map[javaAuthorizationKey]javaAuthorization)
+	}
+	if p.javaAuthAttemptFiles == nil {
+		p.javaAuthAttemptFiles = make(map[javaAuthorizationKey]*exec.FileInfo)
+	}
+	if p.javaAuthAttemptEvents == nil {
+		p.javaAuthAttemptEvents = make(
+			map[javaAuthorizationKey]*javaAuthorizationEvent,
+		)
+	}
+	if p.javaAuthFiles == nil {
+		p.javaAuthFiles = make(map[javaAuthorizationKey]*exec.FileInfo)
+	}
+	if p.javaAuthEvents == nil {
+		p.javaAuthEvents = make(
+			map[javaAuthorizationKey][]*javaAuthorizationEvent,
+		)
+	}
+	if p.javaAuthLatest == nil {
+		p.javaAuthLatest = make(map[javaAuthorizationKey]uint64)
+	}
+	if p.javaAuthVersions == nil {
+		p.javaAuthVersions = make(map[javaAuthorizationKey]uint64)
+	}
+	if p.javaSuspendPending == nil {
+		p.javaSuspendPending = make(
+			map[javaAuthorizationKey]map[javaAuthorization]struct{},
+		)
+	}
+}
+
+func (p *Tracer) beginJavaAuthorizationEvent(
+	key javaAuthorizationKey,
+	fi *exec.FileInfo,
+) (*javaAuthorizationEvent, bool) {
+	p.javaAuthMu.Lock()
+	defer p.javaAuthMu.Unlock()
+	p.ensureJavaAuthorizationStateLocked()
+	events := p.javaAuthEvents[key]
+	for index, event := range events {
+		if event.file != fi || event.canceled {
+			continue
+		}
+		// One FileInfo is one discovery lifetime and receives one deletion.
+		// Repeated AllowPID notifications must not allocate another deletion
+		// reference, race a second authorization goroutine, or revive an older
+		// lifetime after a pid/ns replacement was observed.
+		if event.confirmed || index != len(events)-1 ||
+			p.javaAuthLatest[key] != event.sequence {
+			_, authorizationGen := fi.BeginJavaAgentAuthorization()
+			completionCapability := uint64(0)
+			if event.confirmed && index == len(events)-1 &&
+				p.javaAuthLatest[key] == event.sequence {
+				completionCapability = event.authorization.capability
+			}
+			fi.CompleteJavaAgentAuthorization(authorizationGen, completionCapability)
+			return event, false
+		}
+		requestedCapability, authorizationGen := fi.BeginJavaAgentAuthorization()
+		if event.authorizing {
+			event.authorizationGens = appendJavaAuthorizationGeneration(
+				event.authorizationGens, authorizationGen,
+			)
+			return event, false
+		}
+		// A completed but unconfirmed attempt did not publish the process
+		// authorization. Reuse the same discovery-lifetime event and retry the
+		// newly prepared capability instead of completing its readiness gate
+		// with zero. The previous authorization goroutine has already cleared
+		// authorizing while holding javaAuthMu, so replacing these attempt fields
+		// cannot race that goroutine.
+		if requestedCapability != 0 {
+			event.requestedCapability = requestedCapability
+			event.authorizationGens = []uint64{authorizationGen}
+			event.authorizing = true
+			return event, true
+		}
+		fi.CompleteJavaAgentAuthorization(authorizationGen, 0)
+		return event, false
+	}
+	requestedCapability, authorizationGen := fi.BeginJavaAgentAuthorization()
+	p.javaAuthSequence++
+	if p.javaAuthSequence == 0 {
+		p.javaAuthSequence++
+	}
+	event := &javaAuthorizationEvent{
+		sequence:            p.javaAuthSequence,
+		requestedCapability: requestedCapability,
+		authorizationGens:   []uint64{authorizationGen},
+		file:                fi,
+		authorizing:         true,
+	}
+	p.javaAuthEvents[key] = append(p.javaAuthEvents[key], event)
+	p.javaAuthLatest[key] = event.sequence
+	return event, true
+}
+
+func appendJavaAuthorizationGeneration(generations []uint64, generation uint64) []uint64 {
+	for _, current := range generations {
+		if current == generation {
+			return generations
+		}
+	}
+	return append(generations, generation)
+}
+
+func (p *Tracer) completeJavaAuthorizationEvent(
+	fi *exec.FileInfo,
+	event *javaAuthorizationEvent,
+	capability uint64,
+) {
+	p.javaAuthMu.Lock()
+	defer p.javaAuthMu.Unlock()
+	if event.canceled {
+		capability = 0
+	}
+	generations := append([]uint64(nil), event.authorizationGens...)
+	event.authorizationGens = nil
+	event.authorizing = false
+	for _, generation := range generations {
+		fi.CompleteJavaAgentAuthorization(generation, capability)
+	}
+}
+
+// authorizeJavaProcess is retained as a narrow test helper. Production
+// AllowPID enqueues its exact lifetime before any filter mutation so a
+// concurrent BlockPID cannot pass the boundary before its tombstone exists.
+//
+//nolint:unparam // Keep the explicit PID to exercise the FileInfo identity guard in tests.
+func (p *Tracer) authorizeJavaProcess(pid app.PID, ns uint32, fi *exec.FileInfo) {
+	if fi == nil || pid != fi.Pid() {
 		return
 	}
 	authorizationKey := javaAuthorizationKey{pid: pid, ns: ns}
-	p.javaAuthMu.Lock()
-	defer p.javaAuthMu.Unlock()
-	history := p.javaAuthKeys[authorizationKey]
-	if len(history) != 0 {
-		current := history[len(history)-1]
-		if current.identity == identity && current.capability == capability {
-			return
+	event, created := p.beginJavaAuthorizationEvent(authorizationKey, fi)
+	if !created {
+		return
+	}
+	p.authorizeJavaProcessForEvent(pid, ns, fi, event)
+}
+
+func (p *Tracer) javaCapabilityReservedLocked(
+	key javaAuthorizationKey,
+	capability uint64,
+) bool {
+	if capability == 0 || capability&(uint64(1)<<63) != 0 {
+		return true
+	}
+	for _, authorization := range p.javaAuthKeys[key] {
+		if authorization.capability == capability {
+			return true
 		}
 	}
+	if attempt, ok := p.javaAuthAttempts[key]; ok && attempt.capability == capability {
+		return true
+	}
+	for authorization := range p.javaSuspendPending[key] {
+		if authorization.capability == capability {
+			return true
+		}
+	}
+	for authorization := range p.javaDeauthPending[key] {
+		if authorization.capability == capability {
+			return true
+		}
+	}
+	return false
+}
 
-	if err := p.bpfObjects.JavaAuthorizedProcesses.Update(&identity, capability, ebpf.UpdateAny); err != nil {
-		p.log.Warn("unable to authorize Java process", "pid", pid, "ns", ns, "error", err)
+func (p *Tracer) generateUnreservedJavaCapabilityLocked(
+	key javaAuthorizationKey,
+) (uint64, error) {
+	for range 4 {
+		capability, err := generateJavaProcessCapability()
+		if err != nil {
+			return 0, err
+		}
+		if !p.javaCapabilityReservedLocked(key, capability) {
+			return capability, nil
+		}
+	}
+	return 0, errors.New("generating unreserved Java process capability")
+}
+
+func (p *Tracer) supersedeJavaAuthorizationEvent(
+	key javaAuthorizationKey,
+	event *javaAuthorizationEvent,
+	fi *exec.FileInfo,
+) bool {
+	p.javaAuthMu.Lock()
+	defer p.javaAuthMu.Unlock()
+	p.ensureJavaAuthorizationStateLocked()
+	events := p.javaAuthEvents[key]
+	if event == nil || event.canceled || len(events) == 0 || events[len(events)-1] != event ||
+		p.javaAuthLatest[key] != event.sequence {
+		if fi != nil {
+			fi.SetJavaAgentCapability(0)
+		}
+		return false
+	}
+	if event.prepared {
+		return true
+	}
+	if previous, ok := p.javaAuthAttempts[key]; ok &&
+		p.javaAuthAttemptEvents[key] != event {
+		previousFile := p.javaAuthAttemptFiles[key]
+		delete(p.javaAuthAttempts, key)
+		delete(p.javaAuthAttemptFiles, key)
+		delete(p.javaAuthAttemptEvents, key)
+		p.javaAuthSequence++
+		if p.javaAuthSequence == 0 {
+			p.javaAuthSequence++
+		}
+		p.javaAuthVersions[key] = p.javaAuthSequence
+		if previousFile != nil {
+			previousFile.SetJavaAgentCapability(0)
+		}
+		if err := suspendJavaProcessAuthorization(
+			p.javaProcessAuthorizationMaps(), previous.identity, previous.capability,
+		); err != nil {
+			p.recordPendingJavaSuspensionLocked(key, previous)
+		} else {
+			p.clearPendingJavaSuspensionLocked(key, previous)
+		}
+	}
+	if previousFile := p.javaAuthFiles[key]; previousFile != nil {
+		previousFile.SetJavaAgentCapability(0)
+	}
+	history := p.javaAuthKeys[key]
+	if len(history) == 0 {
+		event.prepared = true
+		return true
+	}
+	predecessor := history[len(history)-1]
+	if err := suspendJavaProcessAuthorization(
+		p.javaProcessAuthorizationMaps(), predecessor.identity, predecessor.capability,
+	); err != nil {
+		p.recordPendingJavaSuspensionLocked(key, predecessor)
+		if p.log != nil {
+			p.log.Warn("unable to suspend predecessor Java process authorization",
+				"pid", key.pid, "ns", key.ns, "error", err)
+		}
+	} else {
+		p.clearPendingJavaSuspensionLocked(key, predecessor)
+	}
+	event.prepared = true
+	return true
+}
+
+func (p *Tracer) authorizeJavaProcessForEvent(
+	pid app.PID,
+	ns uint32,
+	fi *exec.FileInfo,
+	event *javaAuthorizationEvent,
+) {
+	p.authorizeJavaProcessForEventContext(context.Background(), pid, ns, fi, event)
+}
+
+func (p *Tracer) authorizeJavaProcessForEventContext(
+	ctx context.Context,
+	pid app.PID,
+	ns uint32,
+	fi *exec.FileInfo,
+	event *javaAuthorizationEvent,
+) {
+	authorizationKey := javaAuthorizationKey{pid: pid, ns: ns}
+	if fi == nil || pid != fi.Pid() {
+		return
+	}
+	if event == nil {
+		fi.SetJavaAgentCapability(0)
+		return
+	}
+	completionCapability := uint64(0)
+	defer func() {
+		p.completeJavaAuthorizationEvent(fi, event, completionCapability)
+	}()
+	// beginJavaAuthorizationEvent snapshots the prepared capability before
+	// filter bookkeeping or a deauthorization retry can mutate the shared
+	// FileInfo. That immutable value identifies this lifecycle transaction.
+	capability := event.requestedCapability
+	if !p.supersedeJavaAuthorizationEvent(authorizationKey, event, fi) {
+		return
+	}
+	// FileInfo is the trace-attacher handoff gate. Close it before namespace
+	// resolution or any map access and reopen it only after this exact event's Q
+	// transaction has been confirmed.
+	fi.SetJavaAgentCapability(0)
+	if fi.SDKLanguage() != svc.InstrumentableJava || capability == 0 {
+		return
+	}
+	if p.bpfObjects.JavaAuthorizedProcesses == nil {
+		return
+	}
+	if lifetimeErr := validateJavaProcessLifetime(pid, fi); lifetimeErr != nil {
+		if p.log != nil {
+			p.log.Warn("Java process lifetime changed before authorization",
+				"pid", pid, "ns", ns, "error", lifetimeErr)
+		}
 		return
 	}
 
+	identity, err := javaProcessIdentity(pid, ns, fi)
+	if err != nil {
+		fi.SetJavaAgentCapability(0)
+		if p.log != nil {
+			p.log.Warn("unable to resolve exact Java process identity",
+				"pid", pid, "ns", ns, "error", err)
+		}
+		return
+	}
+	p.javaAuthMu.Lock()
+	p.ensureJavaAuthorizationStateLocked()
+	events := p.javaAuthEvents[authorizationKey]
+	if event.canceled || len(events) == 0 || events[len(events)-1] != event ||
+		p.javaAuthLatest[authorizationKey] != event.sequence {
+		fi.SetJavaAgentCapability(0)
+		p.pruneJavaAuthorizationStateLocked(authorizationKey)
+		p.javaAuthMu.Unlock()
+		return
+	}
+	if p.javaCapabilityReservedLocked(authorizationKey, capability) {
+		capability, err = p.generateUnreservedJavaCapabilityLocked(authorizationKey)
+		if err != nil {
+			p.javaAuthMu.Unlock()
+			return
+		}
+	}
+	if previous, ok := p.javaAuthAttempts[authorizationKey]; ok {
+		previousFile := p.javaAuthAttemptFiles[authorizationKey]
+		delete(p.javaAuthAttempts, authorizationKey)
+		delete(p.javaAuthAttemptFiles, authorizationKey)
+		delete(p.javaAuthAttemptEvents, authorizationKey)
+		if previousFile != nil {
+			previousFile.SetJavaAgentCapability(0)
+		}
+		if suspendErr := suspendJavaProcessAuthorization(
+			p.javaProcessAuthorizationMaps(), previous.identity, previous.capability,
+		); suspendErr != nil {
+			p.recordPendingJavaSuspensionLocked(authorizationKey, previous)
+		}
+	}
+	p.javaAuthSequence++
+	if p.javaAuthSequence == 0 {
+		p.javaAuthSequence++
+	}
+	version := p.javaAuthSequence
+	p.javaAuthVersions[authorizationKey] = version
+	attempt := javaAuthorization{identity: identity, capability: capability}
+	p.javaAuthAttempts[authorizationKey] = attempt
+	p.javaAuthAttemptFiles[authorizationKey] = fi
+	p.javaAuthAttemptEvents[authorizationKey] = event
+	p.javaAuthMu.Unlock()
+
+	authorized := false
+	if p.javaRemoteParentEnabled {
+		deadline := time.Now().Add(javaAuthorizationRetryTimeout)
+		rotations := 0
+	retryLoop:
+		for ctx.Err() == nil {
+
+			if lifetimeErr := validateJavaProcessLifetime(pid, fi); lifetimeErr != nil {
+				err = errors.Join(err, lifetimeErr)
+				break
+			}
+			p.javaAuthMu.Lock()
+			owned := p.javaAuthorizationAttemptOwnedLocked(
+				authorizationKey, version, attempt, event,
+			)
+			current := owned && ctx.Err() == nil && !event.canceled &&
+				p.javaAuthLatest[authorizationKey] == event.sequence
+			if !current {
+				detached := false
+				if owned {
+					detached = p.detachJavaAuthorizationAttemptLocked(
+						authorizationKey, version, attempt, event, fi,
+					)
+				}
+				if p.javaAuthFiles[authorizationKey] != fi {
+					fi.SetJavaAgentCapability(0)
+				}
+				p.javaAuthMu.Unlock()
+				if detached {
+					p.suspendDetachedJavaAuthorizationAttempt(authorizationKey, attempt)
+				}
+				return
+			}
+			p.javaAuthMu.Unlock()
+
+			// Do not hold the process-wide lifecycle state mutex across a map
+			// transaction or retry. BlockPID can cancel this exact event (and an
+			// unrelated process can progress) while the kernel operation runs.
+			// The post-call version check below converts any stale or ambiguous
+			// completion into an exact suspension of this unique capability.
+			authorized, err = authorizeJavaProcessCapability(
+				p.javaProcessAuthorizationMaps(), attempt.identity, attempt.capability,
+			)
+			p.javaAuthMu.Lock()
+			owned = p.javaAuthorizationAttemptOwnedLocked(
+				authorizationKey, version, attempt, event,
+			)
+			current = owned && ctx.Err() == nil && !event.canceled &&
+				p.javaAuthLatest[authorizationKey] == event.sequence
+			if !current && owned {
+				p.detachJavaAuthorizationAttemptLocked(
+					authorizationKey, version, attempt, event, fi,
+				)
+			}
+			if !current && p.javaAuthFiles[authorizationKey] != fi {
+				fi.SetJavaAgentCapability(0)
+			}
+			p.javaAuthMu.Unlock()
+			if !current {
+				// The map transaction ran without javaAuthMu. BlockPID may have
+				// suspended this capability before an in-flight transaction
+				// committed it, so every stale completion needs a second exact
+				// suspension even when Block already detached the attempt.
+				p.suspendDetachedJavaAuthorizationAttempt(authorizationKey, attempt)
+				return
+			}
+			if errors.Is(err, javabridge.ErrProcessCapabilityRetired) {
+				if rotations == 4 {
+					err = errors.Join(err, errors.New(
+						"exhausted fresh Java process capability attempts",
+					))
+					break
+				}
+				p.javaAuthMu.Lock()
+				current = p.javaAuthorizationAttemptOwnedLocked(
+					authorizationKey, version, attempt, event,
+				)
+				if !current || ctx.Err() != nil || event.canceled ||
+					p.javaAuthLatest[authorizationKey] != event.sequence {
+					p.javaAuthMu.Unlock()
+					continue
+				}
+				capability, generationErr := p.generateUnreservedJavaCapabilityLocked(authorizationKey)
+				if generationErr != nil {
+					p.javaAuthMu.Unlock()
+					err = errors.Join(err, generationErr)
+					break
+				}
+				rotations++
+				attempt.capability = capability
+				p.javaAuthAttempts[authorizationKey] = attempt
+				p.javaAuthMu.Unlock()
+				continue
+			}
+			if authorized || time.Now().After(deadline) {
+				break
+			}
+			if !waitJavaAuthorizationRetry(ctx, javaAuthorizationRetryInterval) {
+				break retryLoop
+			}
+		}
+		if err != nil && ctx.Err() == nil {
+			p.log.Warn("unable to complete Java process authorization",
+				"pid", pid, "ns", ns, "error", err)
+		}
+	} else {
+		// The disabled-mode direct map update participates in the same stale
+		// completion protocol as enabled authorization.
+		lifetimeErr := validateJavaProcessLifetime(pid, fi)
+		p.javaAuthMu.Lock()
+		owned := p.javaAuthorizationAttemptOwnedLocked(
+			authorizationKey, version, attempt, event,
+		)
+		current := owned && ctx.Err() == nil && !event.canceled &&
+			p.javaAuthLatest[authorizationKey] == event.sequence &&
+			lifetimeErr == nil
+		detached := false
+		if !current && owned {
+			detached = p.detachJavaAuthorizationAttemptLocked(
+				authorizationKey, version, attempt, event, fi,
+			)
+		}
+		p.javaAuthMu.Unlock()
+		if !current {
+			if detached {
+				p.suspendDetachedJavaAuthorizationAttempt(authorizationKey, attempt)
+			}
+			return
+		}
+
+		// A newer attempt can supersede this one immediately after the optimistic
+		// check above. Serialize the authoritative recheck, direct Q publication,
+		// and the common confirmation/compensation boundary for this pid/ns. A
+		// delayed predecessor can then observe a confirmed replacement, but can
+		// never overwrite it before applying its stale compensation.
+		unlockPublication := lockJavaAuthorizationPublication(
+			&p.javaAuthPublications, authorizationKey,
+		)
+		defer unlockPublication()
+
+		lifetimeErr = validateJavaProcessLifetime(pid, fi)
+		p.javaAuthMu.Lock()
+		owned = p.javaAuthorizationAttemptOwnedLocked(
+			authorizationKey, version, attempt, event,
+		)
+		current = owned && ctx.Err() == nil && !event.canceled &&
+			p.javaAuthLatest[authorizationKey] == event.sequence &&
+			lifetimeErr == nil
+		detached = false
+		if !current && owned {
+			detached = p.detachJavaAuthorizationAttemptLocked(
+				authorizationKey, version, attempt, event, fi,
+			)
+		}
+		p.javaAuthMu.Unlock()
+		if !current {
+			if detached {
+				p.suspendDetachedJavaAuthorizationAttempt(authorizationKey, attempt)
+			}
+			return
+		}
+
+		err = updateJavaAuthorizedProcess(
+			p.bpfObjects.JavaAuthorizedProcesses, identity, capability,
+		)
+		authorized = err == nil
+		p.javaAuthMu.Lock()
+		owned = p.javaAuthorizationAttemptOwnedLocked(
+			authorizationKey, version, attempt, event,
+		)
+		current = owned && ctx.Err() == nil && !event.canceled &&
+			p.javaAuthLatest[authorizationKey] == event.sequence
+		if !current && owned {
+			p.detachJavaAuthorizationAttemptLocked(
+				authorizationKey, version, attempt, event, fi,
+			)
+		}
+		p.javaAuthMu.Unlock()
+		if !current {
+			// Compensate a direct Q update that committed after BlockPID's
+			// first exact suspension while the key remains publication-serialized.
+			p.suspendDetachedJavaAuthorizationAttempt(authorizationKey, attempt)
+			fi.SetJavaAgentCapability(0)
+			return
+		}
+		if err != nil {
+			p.log.Warn("unable to authorize Java process", "pid", pid, "ns", ns, "error", err)
+		}
+	}
+
+	p.javaAuthMu.Lock()
+	owned := p.javaAuthorizationAttemptOwnedLocked(
+		authorizationKey, version, attempt, event,
+	)
+	if !owned || ctx.Err() != nil || event.canceled ||
+		p.javaAuthLatest[authorizationKey] != event.sequence {
+		if owned {
+			p.detachJavaAuthorizationAttemptLocked(
+				authorizationKey, version, attempt, event, fi,
+			)
+		}
+		if p.javaAuthFiles[authorizationKey] != fi {
+			fi.SetJavaAgentCapability(0)
+		}
+		p.javaAuthMu.Unlock()
+		// Reaching this boundary means an authorization map transaction has
+		// already run. Exact suspension is idempotent and cannot remove a
+		// replacement capability, so compensate regardless of which goroutine
+		// detached the attempt.
+		p.suspendDetachedJavaAuthorizationAttempt(authorizationKey, attempt)
+		return
+	}
+	defer p.javaAuthMu.Unlock()
+	delete(p.javaAuthAttempts, authorizationKey)
+	delete(p.javaAuthAttemptFiles, authorizationKey)
+	delete(p.javaAuthAttemptEvents, authorizationKey)
+	history := p.javaAuthKeys[authorizationKey]
+	if authorized {
+		if lifetimeErr := validateJavaProcessLifetime(pid, fi); lifetimeErr != nil {
+			authorized = false
+		}
+	}
+	if !authorized {
+		// traceAttacher reads this value after AllowPID returns. Clearing it is
+		// the attachment gate: a prepared agent never starts while Q is old or
+		// an authorization commit is ambiguous. Exact suspension cannot delete
+		// a concurrently confirmed replacement capability.
+		if suspendErr := suspendJavaProcessAuthorization(
+			p.javaProcessAuthorizationMaps(), attempt.identity, attempt.capability,
+		); suspendErr != nil {
+			p.recordPendingJavaSuspensionLocked(authorizationKey, attempt)
+			p.log.Warn("unable to suspend unconfirmed Java process authorization",
+				"pid", pid, "ns", ns, "error", suspendErr)
+		} else {
+			p.clearPendingJavaSuspensionLocked(authorizationKey, attempt)
+		}
+		if previousFile := p.javaAuthFiles[authorizationKey]; previousFile != nil &&
+			previousFile != fi {
+			previousFile.SetJavaAgentCapability(0)
+		}
+		fi.SetJavaAgentCapability(0)
+		p.pruneJavaAuthorizationStateLocked(authorizationKey)
+		return
+	}
+	capability = attempt.capability
+	p.clearPendingJavaSuspensionLocked(authorizationKey, attempt)
+	if previousFile := p.javaAuthFiles[authorizationKey]; previousFile != nil &&
+		previousFile != fi {
+		previousFile.SetJavaAgentCapability(0)
+	}
+	fi.SetJavaAgentCapability(capability)
+	completionCapability = capability
+	p.javaAuthFiles[authorizationKey] = fi
+	event.authorization = javaAuthorization{identity: identity, capability: capability}
+	event.file = fi
+	event.confirmed = true
+	event.requestedCapability = capability
 	// Do not delete the registered incarnation while rotating authorization.
 	// The new capability already fences subsequent ioctls, while an in-flight
 	// ioctl that captured the old capability must be allowed to finish its
@@ -228,26 +1130,320 @@ func (p *Tracer) authorizeJavaProcess(pid app.PID, ns uint32, fi *exec.FileInfo)
 	)
 }
 
-func (p *Tracer) deauthorizeJavaProcess(pid app.PID, ns uint32) {
+func (p *Tracer) javaAuthorizationAttemptOwnedLocked(
+	key javaAuthorizationKey,
+	version uint64,
+	attempt javaAuthorization,
+	event *javaAuthorizationEvent,
+) bool {
+	currentAttempt, exists := p.javaAuthAttempts[key]
+	return exists && p.javaAuthVersions[key] == version && currentAttempt == attempt &&
+		p.javaAuthAttemptEvents[key] == event
+}
+
+func (p *Tracer) detachJavaAuthorizationAttemptLocked(
+	key javaAuthorizationKey,
+	version uint64,
+	attempt javaAuthorization,
+	event *javaAuthorizationEvent,
+	fi *exec.FileInfo,
+) bool {
+	if !p.javaAuthorizationAttemptOwnedLocked(key, version, attempt, event) {
+		return false
+	}
+	delete(p.javaAuthAttempts, key)
+	delete(p.javaAuthAttemptFiles, key)
+	delete(p.javaAuthAttemptEvents, key)
+	p.javaAuthSequence++
+	if p.javaAuthSequence == 0 {
+		p.javaAuthSequence++
+	}
+	p.javaAuthVersions[key] = p.javaAuthSequence
+	if fi != nil && p.javaAuthFiles[key] != fi {
+		fi.SetJavaAgentCapability(0)
+	}
+	return true
+}
+
+func (p *Tracer) suspendDetachedJavaAuthorizationAttempt(
+	key javaAuthorizationKey,
+	attempt javaAuthorization,
+) {
+	err := suspendJavaProcessAuthorization(
+		p.javaProcessAuthorizationMaps(), attempt.identity, attempt.capability,
+	)
+	p.javaAuthMu.Lock()
+	defer p.javaAuthMu.Unlock()
+	if err != nil {
+		p.recordPendingJavaSuspensionLocked(key, attempt)
+		if p.log != nil {
+			p.log.Warn("unable to suspend stale Java process authorization",
+				"pid", key.pid, "ns", key.ns, "error", err)
+		}
+	} else {
+		p.clearPendingJavaSuspensionLocked(key, attempt)
+	}
+	p.pruneJavaAuthorizationStateLocked(key)
+}
+
+func newJavaProcessCapability() (uint64, error) {
+	for range 4 {
+		var random [8]byte
+		if _, err := rand.Read(random[:]); err != nil {
+			return 0, fmt.Errorf("generating fresh Java process capability: %w", err)
+		}
+		capability := binary.LittleEndian.Uint64(random[:]) & (uint64(1<<63) - 1)
+		if capability != 0 {
+			return capability, nil
+		}
+	}
+	return 0, errors.New("generating nonzero fresh Java process capability")
+}
+
+func (p *Tracer) recordPendingJavaSuspensionLocked(
+	key javaAuthorizationKey,
+	authorization javaAuthorization,
+) {
+	if p.javaSuspendPending == nil {
+		p.javaSuspendPending = make(
+			map[javaAuthorizationKey]map[javaAuthorization]struct{},
+		)
+	}
+	pending := p.javaSuspendPending[key]
+	if pending == nil {
+		pending = make(map[javaAuthorization]struct{})
+		p.javaSuspendPending[key] = pending
+	}
+	pending[authorization] = struct{}{}
+}
+
+func (p *Tracer) clearPendingJavaSuspensionLocked(
+	key javaAuthorizationKey,
+	authorization javaAuthorization,
+) {
+	pending := p.javaSuspendPending[key]
+	delete(pending, authorization)
+	if len(pending) == 0 {
+		delete(p.javaSuspendPending, key)
+	}
+}
+
+func (p *Tracer) recordPendingJavaDeauthorizationLocked(
+	key javaAuthorizationKey,
+	authorization javaAuthorization,
+) {
+	pending := p.javaDeauthPending[key]
+	if pending == nil {
+		pending = make(map[javaAuthorization]struct{})
+		p.javaDeauthPending[key] = pending
+	}
+	pending[authorization] = struct{}{}
+}
+
+func (p *Tracer) clearPendingJavaDeauthorizationLocked(
+	key javaAuthorizationKey,
+	authorization javaAuthorization,
+) {
+	pending := p.javaDeauthPending[key]
+	delete(pending, authorization)
+	if len(pending) == 0 {
+		delete(p.javaDeauthPending, key)
+	}
+}
+
+func (p *Tracer) deauthorizeJavaProcess(pid app.PID, ns uint32, fi *exec.FileInfo) {
 	p.javaAuthMu.Lock()
 	defer p.javaAuthMu.Unlock()
 	authorizationKey := javaAuthorizationKey{pid: pid, ns: ns}
-	history := p.javaAuthKeys[authorizationKey]
-	if len(history) == 0 {
+	p.ensureJavaAuthorizationStateLocked()
+	events := p.javaAuthEvents[authorizationKey]
+	match := -1
+	for index, event := range events {
+		if event.file == fi && !event.canceled {
+			match = index
+			break
+		}
+	}
+	if match < 0 {
+		p.pruneJavaAuthorizationStateLocked(authorizationKey)
 		return
 	}
-	authorization := history[0]
-	if len(history) > 1 {
-		p.javaAuthKeys[authorizationKey] = history[1:]
-		return
+	event := events[match]
+	if len(events) == 1 {
+		delete(p.javaAuthEvents, authorizationKey)
+	} else {
+		p.javaAuthEvents[authorizationKey] = append(events[:match], events[match+1:]...)
 	}
-	delete(p.javaAuthKeys, authorizationKey)
+	event.canceled = true
+	if event.file != nil {
+		event.file.SetJavaAgentCapability(0)
+		for _, generation := range event.authorizationGens {
+			event.file.CompleteJavaAgentAuthorization(generation, 0)
+		}
+		event.authorizationGens = nil
+		event.authorizing = false
+	}
 
-	if p.bpfObjects.JavaProcessIncarnations != nil {
-		_ = p.bpfObjects.JavaProcessIncarnations.Delete(&authorization.identity)
+	if attempt, ok := p.javaAuthAttempts[authorizationKey]; ok &&
+		p.javaAuthAttemptEvents[authorizationKey] == event {
+		attemptFile := p.javaAuthAttemptFiles[authorizationKey]
+		delete(p.javaAuthAttempts, authorizationKey)
+		delete(p.javaAuthAttemptFiles, authorizationKey)
+		delete(p.javaAuthAttemptEvents, authorizationKey)
+		p.javaAuthSequence++
+		if p.javaAuthSequence == 0 {
+			p.javaAuthSequence++
+		}
+		p.javaAuthVersions[authorizationKey] = p.javaAuthSequence
+		if attemptFile != nil {
+			attemptFile.SetJavaAgentCapability(0)
+		}
+		if err := suspendJavaProcessAuthorization(
+			p.javaProcessAuthorizationMaps(), attempt.identity, attempt.capability,
+		); err != nil {
+			p.recordPendingJavaSuspensionLocked(authorizationKey, attempt)
+			if p.log != nil {
+				p.log.Warn("unable to cancel pending Java process authorization",
+					"pid", pid, "ns", ns, "error", err)
+			}
+		} else {
+			p.clearPendingJavaSuspensionLocked(authorizationKey, attempt)
+		}
 	}
+	if !event.confirmed {
+		p.pruneJavaAuthorizationStateLocked(authorizationKey)
+		return
+	}
+	if p.javaAuthFiles[authorizationKey] == event.file {
+		delete(p.javaAuthFiles, authorizationKey)
+	}
+
+	history := p.javaAuthKeys[authorizationKey]
+	historyMatch := -1
+	for i, authorization := range history {
+		if authorization == event.authorization {
+			historyMatch = i
+			break
+		}
+	}
+	if historyMatch >= 0 {
+		history = append(history[:historyMatch], history[historyMatch+1:]...)
+	}
+	if len(history) == 0 {
+		delete(p.javaAuthKeys, authorizationKey)
+	} else {
+		p.javaAuthKeys[authorizationKey] = history
+	}
+
 	if p.bpfObjects.JavaAuthorizedProcesses != nil {
-		_ = p.bpfObjects.JavaAuthorizedProcesses.Delete(&authorization.identity)
+		if err := deauthorizeJavaProcessCapability(
+			p.javaProcessAuthorizationMaps(),
+			event.authorization.identity,
+			event.authorization.capability,
+			!p.javaRemoteParentEnabled,
+		); err != nil {
+			p.recordPendingJavaDeauthorizationLocked(authorizationKey, event.authorization)
+			if p.log != nil {
+				p.log.Warn("unable to deauthorize Java process",
+					"pid", authorizationKey.pid, "ns", authorizationKey.ns, "error", err)
+			}
+		} else {
+			p.clearPendingJavaDeauthorizationLocked(authorizationKey, event.authorization)
+		}
+	}
+	p.pruneJavaAuthorizationStateLocked(authorizationKey)
+}
+
+func (p *Tracer) retryPendingJavaDeauthorizations() {
+	p.javaAuthMu.Lock()
+	defer p.javaAuthMu.Unlock()
+	for key, pending := range p.javaSuspendPending {
+		for authorization := range pending {
+			if err := suspendJavaProcessAuthorization(
+				p.javaProcessAuthorizationMaps(),
+				authorization.identity,
+				authorization.capability,
+			); err != nil {
+				if p.log != nil {
+					p.log.Warn("unable to retry exact Java authorization suspension",
+						"pid", key.pid, "ns", key.ns, "error", err)
+				}
+				continue
+			}
+			delete(pending, authorization)
+		}
+		if len(pending) == 0 {
+			delete(p.javaSuspendPending, key)
+			p.pruneJavaAuthorizationStateLocked(key)
+		}
+	}
+	for key, pending := range p.javaDeauthPending {
+		for authorization := range pending {
+			if p.bpfObjects.JavaAuthorizedProcesses != nil {
+				if err := deauthorizeJavaProcessCapability(
+					p.javaProcessAuthorizationMaps(),
+					authorization.identity,
+					authorization.capability,
+					!p.javaRemoteParentEnabled,
+				); err != nil {
+					if p.log != nil {
+						p.log.Warn("unable to retry exact Java process deauthorization",
+							"pid", key.pid, "ns", key.ns, "error", err)
+					}
+					continue
+				}
+			}
+			delete(pending, authorization)
+		}
+		if len(pending) == 0 {
+			delete(p.javaDeauthPending, key)
+			p.pruneJavaAuthorizationStateLocked(key)
+		}
+	}
+}
+
+func (p *Tracer) pruneJavaAuthorizationStateLocked(key javaAuthorizationKey) {
+	if len(p.javaAuthEvents[key]) != 0 {
+		return
+	}
+	if len(p.javaAuthKeys[key]) != 0 {
+		return
+	}
+	if _, ok := p.javaAuthAttempts[key]; ok {
+		return
+	}
+	if len(p.javaDeauthPending[key]) != 0 {
+		return
+	}
+	if len(p.javaSuspendPending[key]) != 0 {
+		return
+	}
+	delete(p.javaAuthVersions, key)
+	delete(p.javaAuthAttemptFiles, key)
+	delete(p.javaAuthAttemptEvents, key)
+	delete(p.javaAuthFiles, key)
+	delete(p.javaAuthLatest, key)
+}
+
+func (p *Tracer) runPendingJavaDeauthorizations(ctx context.Context) {
+	ticker := time.NewTicker(javaDeauthorizationRetryInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.retryPendingJavaDeauthorizations()
+		}
+	}
+}
+
+func (p *Tracer) javaProcessAuthorizationMaps() javabridge.Maps {
+	return javabridge.Maps{
+		Authorized:          p.bpfObjects.JavaAuthorizedProcesses,
+		Incarnations:        p.bpfObjects.JavaProcessIncarnations,
+		ThreadMappingClaims: p.bpfObjects.JavaThreadMappingClaims,
+		Retired:             p.bpfObjects.JavaRetiredProcesses,
 	}
 }
 
@@ -273,6 +1469,7 @@ func (p *Tracer) LoadSpecs() ([]*ebpfcommon.SpecBundle, error) {
 }
 
 func (p *Tracer) SetupTailCalls() {
+	javaControlTailCallsReady := true
 	// Order must match the k_tail_* enum in bpf/generictracer/k_tracer_tailcall.h
 	for i, prog := range []*ebpf.Program{
 		// HTTP/1
@@ -296,19 +1493,47 @@ func (p *Tracer) SetupTailCalls() {
 		p.bpfObjects.ObiLargeBufEmitContinue, // 13  k_tail_large_buf_emit_continue
 		// Traceparent validation
 		p.bpfObjects.ObiContinueProtocolHttpTpValidate, // 14
+		// Java remote-parent control carriers
+		p.bpfObjects.ObiJavaTaskCaptureTail,      // 15 k_tail_java_task_capture
+		p.bpfObjects.ObiJavaTaskRelayCaptureTail, // 16 k_tail_java_task_relay_capture
+		p.bpfObjects.ObiJavaTaskLinkTail,         // 17 k_tail_java_task_link
+		p.bpfObjects.ObiJavaControlCleanupTail,   // 18 k_tail_java_control_cleanup
+		p.bpfObjects.ObiJavaThreadsTail,          // 19 k_tail_java_threads
 	} {
 		if prog == nil {
+			if i >= 15 {
+				javaControlTailCallsReady = false
+			}
 			continue
 		}
 		p.log.Debug("loading program into tail call jump table", "index", i, "program", prog.String())
 		if err := p.bpfObjects.JumpTable.Update(uint32(i), uint32(prog.FD()), ebpf.UpdateAny); err != nil {
 			p.log.Error("error loading info tail call jump table", "error", err)
+			if i >= 15 {
+				javaControlTailCallsReady = false
+			}
 		}
 	}
+	p.setJavaRemoteParentControlTailReadiness(javaControlTailCallsReady)
 
 	p.javaDataHookAttached = false
 	p.javaCloseHookAttached = false
 	p.setJavaRemoteParentDataHookReadiness(false)
+}
+
+func (p *Tracer) setJavaRemoteParentControlTailReadiness(ready bool) {
+	readiness := p.bpfObjects.JavaRemoteParentControlTailReadiness
+	if readiness == nil {
+		return
+	}
+
+	state := uint32(0)
+	if ready {
+		state = 1
+	}
+	if err := updateJavaRemoteParentControlTailReadiness(readiness, state); err != nil {
+		p.log.Warn("updating Java control tail-call readiness", "ready", ready, "error", err)
+	}
 }
 
 func (p *Tracer) setJavaRemoteParentDataHookReadiness(ready bool) {
@@ -395,12 +1620,19 @@ func (p *Tracer) constants() map[string]any {
 	return m
 }
 
-func (p *Tracer) RegisterOffsets(_ *exec.FileInfo, _ *goexec.Offsets) {}
+func (p *Tracer) RegisterOffsets(_ *exec.FileInfo, _ *goexec.Offsets) error { return nil }
 
 func (p *Tracer) ProcessBinary(_ *exec.FileInfo) {}
 
 func (p *Tracer) AddCloser(c ...io.Closer) {
 	p.closers = append(p.closers, c...)
+}
+
+func (p *Tracer) newResourceCloser() *orderedResourceCloser {
+	closers := make([]io.Closer, 0, len(p.closers)+1)
+	closers = append(closers, p.closers...)
+	closers = append(closers, &p.bpfObjects)
+	return newOrderedResourceCloser(p.stopJavaWorkers, closers...)
 }
 
 func (p *Tracer) GoProbes() map[string][]*ebpfcommon.ProbeDesc {
@@ -760,7 +1992,7 @@ func (p *Tracer) runItersForPids() {
 
 func (p *Tracer) Tracing() []*ebpfcommon.Tracing { return nil }
 
-func (p *Tracer) RecordInstrumentedLib(id uint64, closers []io.Closer) {
+func (p *Tracer) RecordInstrumentedLib(id exec.FileID, closers []io.Closer) {
 	p.libsMux.Lock()
 	defer p.libsMux.Unlock()
 
@@ -770,33 +2002,33 @@ func (p *Tracer) RecordInstrumentedLib(id uint64, closers []io.Closer) {
 		module.Closers = append(module.Closers, closers...)
 	}
 
-	p.log.Debug("Recorded instrumented Lib", "ino", id, "module", module)
+	p.log.Debug("Recorded instrumented Lib", "dev", id.Dev, "ino", id.Ino, "module", module)
 }
 
-func (p *Tracer) AddInstrumentedLibRef(id uint64) {
+func (p *Tracer) AddInstrumentedLibRef(id exec.FileID) {
 	p.RecordInstrumentedLib(id, nil)
 }
 
-func (p *Tracer) UnlinkInstrumentedLib(id uint64) {
+func (p *Tracer) UnlinkInstrumentedLib(id exec.FileID) {
 	p.libsMux.Lock()
 	defer p.libsMux.Unlock()
 
 	module, err := p.instrumentedLibs.RemoveRef(id)
 
-	p.log.Debug("Unlinking instrumented lib - before state", "ino", id, "module", module)
+	p.log.Debug("Unlinking instrumented lib - before state", "dev", id.Dev, "ino", id.Ino, "module", module)
 
 	if err != nil {
-		p.log.Debug("Error unlinking instrumented lib", "ino", id, "error", err)
+		p.log.Debug("Error unlinking instrumented lib", "dev", id.Dev, "ino", id.Ino, "error", err)
 	}
 }
 
-func (p *Tracer) AlreadyInstrumentedLib(id uint64) bool {
+func (p *Tracer) AlreadyInstrumentedLib(id exec.FileID) bool {
 	p.libsMux.Lock()
 	defer p.libsMux.Unlock()
 
 	module := p.instrumentedLibs.Find(id)
 
-	p.log.Debug("checking already instrumented Lib", "ino", id, "module", module)
+	p.log.Debug("checking already instrumented Lib", "dev", id.Dev, "ino", id.Ino, "module", module)
 	return module != nil
 }
 
@@ -806,6 +2038,8 @@ func (p *Tracer) Run(
 	eventsChan *msg.Queue[[]request.Span],
 ) {
 	p.eventCtx = ebpfEventContext
+	resourceCloser := p.newResourceCloser()
+	defer func() { _ = resourceCloser.Close() }()
 
 	// At this point we now have loaded the bpf objects, which means we should insert any
 	// pids that are allowed into the bpf map
@@ -821,6 +2055,7 @@ func (p *Tracer) Run(
 
 	go p.watchForMisclassifedEvents(ctx)
 	go p.lookForTimeouts(ctx, parseContext, timeoutTicker, eventsChan)
+	p.startPendingJavaDeauthorizationWorker()
 	defer timeoutTicker.Stop()
 
 	p.runItersForPids()
@@ -846,7 +2081,7 @@ func (p *Tracer) Run(
 		p.pidsFilter.Filter,
 		p.log,
 		p.metrics,
-	)(ctx, append(p.closers, &p.bpfObjects), eventsChan)
+	)(ctx, []io.Closer{resourceCloser}, eventsChan)
 }
 
 func (p *Tracer) jvmRuntimeMetricsEnabled() bool {

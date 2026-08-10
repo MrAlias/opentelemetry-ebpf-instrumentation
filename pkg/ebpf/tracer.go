@@ -5,8 +5,10 @@ package ebpf // import "go.opentelemetry.io/obi/pkg/ebpf"
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -31,10 +33,56 @@ type Instrumentable struct {
 	ChildPids []app.PID
 
 	FileInfo *exec.FileInfo
-	Offsets  *goexec.Offsets
-	Tracer   *ProcessTracer
+	// PIDOwner is the exact process-lifetime token for a deletion event.
+	PIDOwner *exec.FileInfo
+	// PIDOwners contains exact child-lifetime tokens for a creation event whose
+	// executable/service classification is shared through FileInfo.
+	PIDOwners map[app.PID]*exec.FileInfo
+	// TracerOwner identifies the executable tracer/process-instance bucket used
+	// by a deletion event. It can differ from PIDOwner after parent substitution.
+	TracerOwner *exec.FileInfo
+	Offsets     *goexec.Offsets
+	Tracer      *ProcessTracer
 
 	LogEnricherEnabled bool
+}
+
+// PIDOwnerFor returns the exact lifetime token for pid on a creation event.
+// Ordinary/self-owned PIDs fall back to FileInfo.
+func (ie *Instrumentable) PIDOwnerFor(pid app.PID) *exec.FileInfo {
+	if ie != nil && ie.PIDOwners != nil {
+		if owner := ie.PIDOwners[pid]; owner != nil {
+			return owner
+		}
+	}
+	if ie == nil {
+		return nil
+	}
+	return ie.FileInfo
+}
+
+// PIDOwnerFileInfo returns the exact FileInfo token used to admit this
+// instrumentable's PID. Ordinary events are self-owned.
+func (ie *Instrumentable) PIDOwnerFileInfo() *exec.FileInfo {
+	if ie != nil && ie.PIDOwner != nil {
+		return ie.PIDOwner
+	}
+	if ie == nil {
+		return nil
+	}
+	return ie.FileInfo
+}
+
+// TracerOwnerFileInfo returns the executable ownership bucket used to locate
+// and refcount the tracer handling this deletion.
+func (ie *Instrumentable) TracerOwnerFileInfo() *exec.FileInfo {
+	if ie != nil && ie.TracerOwner != nil {
+		return ie.TracerOwner
+	}
+	if ie == nil {
+		return nil
+	}
+	return ie.FileInfo
 }
 
 func (ie *Instrumentable) CopyToServiceAttributes() {
@@ -45,11 +93,12 @@ type PIDsAccounter interface {
 	// AllowPID notifies the tracer to accept traces from the given PID, sharing
 	// the FileInfo so mutable service state (flags, harvested routes, k8s
 	// metadata) goes through its synchronized API.
-	AllowPID(app.PID, uint32, *exec.FileInfo)
+	AllowPID(app.PID, uint32, *exec.FileInfo, *exec.FileInfo)
 	// BlockPID notifies the tracer to stop accepting traces from the process
-	// with the provided PID. After receiving them via ringbuffer, it should
-	// discard them.
-	BlockPID(app.PID, uint32)
+	// lifetime identified by the provided FileInfo. After receiving them via
+	// ringbuffer, it should discard them. The exact lifetime identity prevents
+	// a delayed deletion for a reused PID from blocking its replacement.
+	BlockPID(app.PID, uint32, *exec.FileInfo, *exec.FileInfo)
 }
 
 type CommonTracer interface {
@@ -107,11 +156,11 @@ type Tracer interface {
 	// The argument is the OS file id
 	// Closers are the associated closable resources to this lib, that may be
 	// closed when UnlinkInstrumentedLib() is called
-	RecordInstrumentedLib(uint64, []io.Closer)
-	AddInstrumentedLibRef(uint64)
-	AlreadyInstrumentedLib(uint64) bool
-	UnlinkInstrumentedLib(uint64)
-	RegisterOffsets(*exec.FileInfo, *goexec.Offsets)
+	RecordInstrumentedLib(exec.FileID, []io.Closer)
+	AddInstrumentedLibRef(exec.FileID)
+	AlreadyInstrumentedLib(exec.FileID) bool
+	UnlinkInstrumentedLib(exec.FileID)
+	RegisterOffsets(*exec.FileInfo, *goexec.Offsets) error
 	ProcessBinary(*exec.FileInfo)
 	SetEventContext(*ebpfcommon.EBPFEventContext)
 	Required() bool
@@ -141,28 +190,113 @@ const (
 // so that the GPU kernel event listener can find symbols names from addresses
 // in the ELF file.
 type ProcessTracer struct {
-	log             *slog.Logger
-	metrics         imetrics.Reporter
-	shutdownTimeout time.Duration
-	bpffsPath       string
+	log              *slog.Logger
+	metrics          imetrics.Reporter
+	shutdownTimeout  time.Duration
+	bpffsPath        string
+	lifecycleMu      sync.Mutex
+	initializing     bool
+	runStarted       bool
+	aborted          bool
+	abortErr         error
+	abortFn          func() error
+	loadedClosers    []io.Closer
+	loadContext      *ebpfcommon.EBPFEventContext
+	loadMaps         map[string]*ebpf.Map
+	loadCapabilities ebpfcommon.TracerCapability
 
 	Type            ProcessTracerType
-	Instrumentables map[uint64]*instrumenter
+	Instrumentables map[exec.FileID]*instrumenter
 	Programs        []Tracer
 }
 
-func (pt *ProcessTracer) AllowPID(pid app.PID, ns uint32, fi *exec.FileInfo) {
+var (
+	errProcessTracerInitializing = errors.New("process tracer initialization is in progress")
+	errProcessTracerRunning      = errors.New("process tracer has already started")
+	errProcessTracerAborted      = errors.New("process tracer has been aborted")
+)
+
+// Abort releases a newly initialized ProcessTracer that will not be run. It is
+// safe to call more than once; every caller observes the same cleanup result.
+func (pt *ProcessTracer) Abort() error {
+	if pt == nil {
+		return nil
+	}
+
+	pt.lifecycleMu.Lock()
+	defer pt.lifecycleMu.Unlock()
+
+	if pt.aborted {
+		return pt.abortErr
+	}
+	if pt.initializing {
+		return errProcessTracerInitializing
+	}
+	if pt.runStarted {
+		return errProcessTracerRunning
+	}
+
+	pt.aborted = true
+	if pt.abortFn != nil {
+		pt.abortErr = pt.abortFn()
+	}
+	return pt.abortErr
+}
+
+func (pt *ProcessTracer) beginInit() error {
+	pt.lifecycleMu.Lock()
+	defer pt.lifecycleMu.Unlock()
+	if pt.aborted {
+		return errProcessTracerAborted
+	}
+	if pt.initializing {
+		return errProcessTracerInitializing
+	}
+	if pt.runStarted {
+		return errProcessTracerRunning
+	}
+	pt.initializing = true
+	return nil
+}
+
+func (pt *ProcessTracer) finishInit() {
+	pt.lifecycleMu.Lock()
+	pt.initializing = false
+	pt.lifecycleMu.Unlock()
+}
+
+func (pt *ProcessTracer) beginRun() bool {
+	pt.lifecycleMu.Lock()
+	defer pt.lifecycleMu.Unlock()
+	if pt.aborted || pt.initializing || pt.runStarted {
+		return false
+	}
+	pt.runStarted = true
+	return true
+}
+
+func (pt *ProcessTracer) AllowPID(
+	pid app.PID,
+	ns uint32,
+	fi *exec.FileInfo,
+	owner *exec.FileInfo,
+) {
 	logEnricherEnabled := fi.LogEnricherEnabled()
 	for i := range pt.Programs {
 		if _, ok := pt.Programs[i].(*logenricher.Tracer); ok && !logEnricherEnabled {
 			continue
 		}
-		pt.Programs[i].AllowPID(pid, ns, fi)
+		pt.Programs[i].AllowPID(pid, ns, fi, owner)
 	}
 }
 
-func (pt *ProcessTracer) BlockPID(pid app.PID, ns uint32) {
+func (pt *ProcessTracer) BlockPID(
+	pid app.PID,
+	ns uint32,
+	fi *exec.FileInfo,
+	owner *exec.FileInfo,
+) {
 	for i := range pt.Programs {
-		pt.Programs[i].BlockPID(pid, ns)
+		pt.Programs[i].BlockPID(pid, ns, fi, owner)
 	}
 }

@@ -177,7 +177,7 @@ func startJVMRuntimeEventTracer(
 
 	fileInfo := javaProcessFileInfo(t, pid)
 	requireLibJVMMap(t, pid)
-	processTracer.AllowPID(pid, fileInfo.Ns(), fileInfo)
+	processTracer.AllowPID(pid, fileInfo.Ns(), fileInfo, fileInfo)
 
 	executable, err := link.OpenExecutable(fileInfo.ProExeLinkPath())
 	require.NoError(t, err)

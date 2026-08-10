@@ -36,6 +36,7 @@ class OfficialAgentJettyRuntimeTest {
   private static final String MODE_AUTO_UNAVAILABLE = "auto-unavailable";
   private static final String MODE_BLOCKING = "blocking";
   private static final String MODE_DEFAULT = "default";
+  private static final String MODE_FRAMEWORK_MISS = "framework-miss";
   private static final String MODE_HELPER_ABSENT = "helper-absent";
   private static final String MODE_NESTED = "nested";
   private static final String MODE_STANDARD_FIRST = "standard-first";
@@ -125,6 +126,20 @@ class OfficialAgentJettyRuntimeTest {
         distribution,
         version,
         MODE_BLOCKING,
+        "obi,tracecontext,baggage",
+        true,
+        null,
+        true);
+    runMode(
+        officialAgent,
+        expectedSha256,
+        helper,
+        extension,
+        probeExtension,
+        probeClasspath,
+        distribution,
+        version,
+        MODE_FRAMEWORK_MISS,
         "obi,tracecontext,baggage",
         true,
         null,
@@ -304,6 +319,8 @@ class OfficialAgentJettyRuntimeTest {
           assertBlockingResult(lines, output);
         } else if (MODE_DEFAULT.equals(mode)) {
           assertDefaultResult(lines, output);
+        } else if (MODE_FRAMEWORK_MISS.equals(mode)) {
+          assertFrameworkMissResult(lines, output);
         } else if (MODE_NESTED.equals(mode)) {
           assertTrue(nestedExpectedRoute != null, "missing nested route oracle");
           assertNestedResult(lines, output, MODE_NESTED, nestedExpectedRoute);
@@ -782,6 +799,96 @@ class OfficialAgentJettyRuntimeTest {
     assertEquals(2, prefix(outputLines, "OBI_DISPATCH\t").size(), output);
     assertEquals(0, prefix(outputLines, "OBI_DISPATCH\tEXECUTOR\t").size(), output);
     assertEquals(0, prefix(outputLines, "OBI_DISPATCH\tASYNC\t").size(), output);
+  }
+
+  private static void assertFrameworkMissResult(List<String> lines, String output) {
+    Map<String, Integer> invocations = new HashMap<>();
+    for (String id : new String[] {"X", "Y", "L", "K"}) {
+      int count = invocationCount(lines, id);
+      invocations.put(id, count);
+      assertDispatch(output, id);
+      assertAllPasses(lines, id, count, INVALID_TRACE, INVALID_SPAN, false, false);
+    }
+
+    assertEquals(1, count(lines, "FRAMEWORK_FIXTURE\tready"), lines.toString());
+    assertEquals(0, prefix(lines, "PROVIDER\tTAKE\tX\t").size(), lines.toString());
+    assertEquals(0, prefix(lines, "PROVIDER\tTAKE\tY\t").size(), lines.toString());
+    assertEquals(0, prefix(lines, "PROVIDER\tTAKE\tL\t").size(), lines.toString());
+    assertEquals(
+        invocations.get("K") * 2, prefix(lines, "PROVIDER\tTAKE\tK\t").size(), lines.toString());
+    assertProviderPasses(lines, "TAKE", "K", invocations.get("K"), "MISSING");
+
+    assertFrameworkMissLines(lines, "X", invocations.get("X"), "DEPTH", 3, 1);
+    assertFrameworkMissLines(lines, "Y", invocations.get("Y"), "CYCLE", 3, 2);
+    assertFrameworkMissLines(lines, "L", invocations.get("L"), "LATE", 3, 3);
+    assertFrameworkMissLines(lines, "K", invocations.get("K"), "TRANSPORT", 1, 0);
+
+    Map<String, Long> diagnostics = diagnostics(output, MODE_FRAMEWORK_MISS);
+    assertEquals((long) invocations.get("X") * 2L, counter(diagnostics, "framework_depth"));
+    assertEquals((long) invocations.get("Y") * 2L, counter(diagnostics, "framework_cycle"));
+    assertEquals((long) invocations.get("L") * 2L, counter(diagnostics, "framework_late"));
+    assertEquals((long) invocations.get("K") * 2L, counter(diagnostics, "transport_missing"));
+    long missing = 0L;
+    for (int count : invocations.values()) {
+      missing += count * 2L;
+    }
+    assertEquals(missing, counter(diagnostics, "t_missing"));
+    assertEquals(0L, counter(diagnostics, "t_valid"));
+    assertEquals(0L, counter(diagnostics, "t_transport_error"));
+    assertEquals(0L, counter(diagnostics, "take_sampled"));
+    assertEquals(0L, counter(diagnostics, "take_unsampled"));
+
+    Map<String, SpanResult> spans = spans(lines, 4);
+    for (String id : new String[] {"X", "Y", "L", "K"}) {
+      SpanResult span = required(spans, id);
+      assertEquals(INVALID_SPAN, span.parentSpanId, id);
+      assertFalse(span.parentRemote, id);
+      assertFalse(span.parentSampled, id);
+      assertTrue(span.sampled, id);
+    }
+
+    List<String> outputLines = lines(output);
+    assertEquals(
+        powerOfTwoCounts(counter(diagnostics, "framework_depth")),
+        diagnosticLogCounts(outputLines, "framework_depth"),
+        output);
+    assertEquals(
+        powerOfTwoCounts(counter(diagnostics, "framework_cycle")),
+        diagnosticLogCounts(outputLines, "framework_cycle"),
+        output);
+    assertEquals(
+        powerOfTwoCounts(counter(diagnostics, "framework_late")),
+        diagnosticLogCounts(outputLines, "framework_late"),
+        output);
+  }
+
+  private static void assertFrameworkMissLines(
+      List<String> lines,
+      String id,
+      int invocations,
+      String expectedLabel,
+      int expectedSource,
+      int expectedReason) {
+    List<String> records = prefix(lines, "FRAMEWORK_MISS\t" + id + "\t");
+    assertEquals(invocations * 2, records.size(), lines.toString());
+    for (String record : records) {
+      String[] fields = record.split("\\t", -1);
+      assertEquals(11, fields.length, record);
+      assertEquals(expectedLabel, fields[4], record);
+      int entered = Integer.parseInt(fields[5]);
+      int baselineDepth = Integer.parseInt(fields[6]);
+      assertEquals(baselineDepth, Integer.parseInt(fields[7]), record);
+      assertEquals(expectedSource, Integer.parseInt(fields[8]), record);
+      assertEquals(expectedReason, Integer.parseInt(fields[9]), record);
+      assertEquals(0, Integer.parseInt(fields[10]), record);
+      if ("DEPTH".equals(expectedLabel)) {
+        assertEquals(64, baselineDepth + entered, record);
+      } else if ("CYCLE".equals(expectedLabel)) {
+        assertEquals(2, entered, record);
+      } else {
+        assertEquals(0, entered, record);
+      }
+    }
   }
 
   private static void assertProviderPasses(

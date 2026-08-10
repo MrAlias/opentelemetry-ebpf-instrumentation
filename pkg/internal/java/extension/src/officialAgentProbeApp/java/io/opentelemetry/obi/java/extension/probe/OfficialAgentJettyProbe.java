@@ -41,6 +41,7 @@ public final class OfficialAgentJettyProbe {
   private static final String MODE_BLOCKING = "blocking";
   private static final String MODE_AUTO_UNAVAILABLE = "auto-unavailable";
   private static final String MODE_DEFAULT = "default";
+  private static final String MODE_FRAMEWORK_MISS = "framework-miss";
   private static final String MODE_HELPER_ABSENT = "helper-absent";
   private static final String MODE_NESTED = "nested";
   private static final String MODE_STANDARD_FIRST = "standard-first";
@@ -67,6 +68,7 @@ public final class OfficialAgentJettyProbe {
         MODE_BLOCKING.equals(mode)
             || MODE_AUTO_UNAVAILABLE.equals(mode)
             || MODE_DEFAULT.equals(mode)
+            || MODE_FRAMEWORK_MISS.equals(mode)
             || MODE_HELPER_ABSENT.equals(mode)
             || MODE_NESTED.equals(mode)
             || MODE_STANDARD_FIRST.equals(mode),
@@ -115,6 +117,9 @@ public final class OfficialAgentJettyProbe {
         }
         runW3cFallbackMode(port, mode);
         expectedSpans = 1;
+      } else if (MODE_FRAMEWORK_MISS.equals(mode)) {
+        runFrameworkMissMode(port);
+        expectedSpans = 4;
       } else if (MODE_NESTED.equals(mode)) {
         runNestedMode(port);
         expectedSpans = 1;
@@ -216,6 +221,18 @@ public final class OfficialAgentJettyProbe {
                       null,
                       true)),
           "blocking request T failed");
+    }
+  }
+
+  private static void runFrameworkMissMode(int port) throws Exception {
+    try (Socket socket = connect(port)) {
+      BufferedInputStream input = new BufferedInputStream(socket.getInputStream());
+      OutputStream request = socket.getOutputStream();
+      for (String id : new String[] {"X", "Y", "L", "K"}) {
+        require(
+            (id + ":ok").equals(send(request, input, id, null, false)),
+            "framework miss request " + id + " failed");
+      }
     }
   }
 
@@ -448,6 +465,10 @@ public final class OfficialAgentJettyProbe {
               || "P".equals(id)
               || "Q".equals(id)
               || "D".equals(id)
+              || "K".equals(id)
+              || "L".equals(id)
+              || "X".equals(id)
+              || "Y".equals(id)
               || "T".equals(id),
           "invalid probe id");
 

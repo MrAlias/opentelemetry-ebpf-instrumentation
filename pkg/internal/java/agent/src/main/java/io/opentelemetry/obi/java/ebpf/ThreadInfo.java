@@ -24,6 +24,10 @@ public class ThreadInfo {
   public static final int REMOTE_PARENT_LOOKUP_DIRECT = 1;
   public static final int REMOTE_PARENT_LOOKUP_TASK = 2;
   public static final int REMOTE_PARENT_LOOKUP_BLOCKED = 3;
+  public static final int REMOTE_PARENT_FRAMEWORK_MISS_NONE = 0;
+  public static final int REMOTE_PARENT_FRAMEWORK_MISS_DEPTH = 1;
+  public static final int REMOTE_PARENT_FRAMEWORK_MISS_CYCLE = 2;
+  public static final int REMOTE_PARENT_FRAMEWORK_MISS_LATE = 3;
 
   private static final ThreadLocal<TaskRelayState> taskRelayState = new ThreadLocal<>();
   private static final ThreadLocal<RemoteParentSocketContext> remoteParentSocketContext =
@@ -32,6 +36,7 @@ public class ThreadInfo {
   private static final ThreadLocal<RemoteParentSocketContext.Lifecycle>
       remoteParentLookupLifecycle = new ThreadLocal<>();
   private static final ThreadLocal<Long> remoteParentLookupBridgeEpoch = new ThreadLocal<>();
+  private static final ThreadLocal<Byte> remoteParentFrameworkMissReason = new ThreadLocal<>();
   private static final ThreadLocal<ReceiveContext> remoteParentReceiveContext = new ThreadLocal<>();
   private static final ThreadLocal<Integer> remoteParentReceiveDepth = new ThreadLocal<>();
   private static final ThreadLocal<Long> remoteParentReceiveEpoch = new ThreadLocal<>();
@@ -208,13 +213,13 @@ public class ThreadInfo {
       ReceiveContext receiveContext,
       long bridgeEpoch) {
     if (onVirtualThread() && handoffToken == 0L) {
-      rejectTaskEntry(handoffToken);
+      rejectTaskEntry(handoffToken, REMOTE_PARENT_FRAMEWORK_MISS_LATE);
       return false;
     }
 
     TaskRelayState state = taskRelayState.get();
     if (parentId <= 0 || (parentId == threadId && handoffToken == 0L)) {
-      rejectTaskEntry(handoffToken);
+      rejectTaskEntry(handoffToken, REMOTE_PARENT_FRAMEWORK_MISS_LATE);
       return false;
     }
     if (handoffToken != 0L
@@ -227,11 +232,11 @@ public class ThreadInfo {
                 && (receiveContext.lifecycle() != socketLifecycle
                     || bridgeEpoch != 0L && receiveContext.bridgeEpoch() != bridgeEpoch
                     || !isCurrentRemoteParentBridgeCapability(receiveContext.bridgeEpoch())))) {
-      rejectTaskEntry(handoffToken);
+      rejectTaskEntry(handoffToken, REMOTE_PARENT_FRAMEWORK_MISS_LATE);
       return false;
     }
     if (state != null && state.hasParent(parentId) && handoffToken == 0L) {
-      failClosedTaskEntry(handoffToken, 0L);
+      failClosedTaskEntry(handoffToken, 0L, REMOTE_PARENT_FRAMEWORK_MISS_CYCLE);
       return false;
     }
 
@@ -260,17 +265,23 @@ public class ThreadInfo {
             previousLookupBridgeEpoch,
             previousReceiveContext);
     if (target == NO_TASK_RELAY_CHANGE) {
-      failClosedTaskEntry(handoffToken, restoreToken);
+      failClosedTaskEntry(
+          handoffToken,
+          restoreToken,
+          state.atDepthLimit()
+              ? REMOTE_PARENT_FRAMEWORK_MISS_DEPTH
+              : REMOTE_PARENT_FRAMEWORK_MISS_CYCLE);
       return false;
     }
 
     if (exactTokenHandoff) {
+      clearRemoteParentFrameworkMissReason();
       remoteParentLookupOverride.set(LOOKUP_TASK);
       setRemoteParentLookupLifecycle(socketLifecycle);
       setRemoteParentLookupBridgeEpoch(bridgeEpoch);
       setRemoteParentReceiveContext(receiveContext, socketLifecycle);
     } else {
-      blockRemoteParentLookup();
+      blockRemoteParentLookup(REMOTE_PARENT_FRAMEWORK_MISS_LATE);
     }
     try {
       emitTaskParentContext(target, handoffToken, exactTokenHandoff);
@@ -280,7 +291,7 @@ public class ThreadInfo {
                   || !isCurrentRemoteParentBridgeCapability(receiveContext.bridgeEpoch()))) {
         state.exit();
         state.clearExitReferences();
-        failClosedTaskEntry(handoffToken, restoreToken);
+        failClosedTaskEntry(handoffToken, restoreToken, REMOTE_PARENT_FRAMEWORK_MISS_LATE);
         return false;
       }
       setRemoteParentSocketContext(socketContext);
@@ -290,7 +301,7 @@ public class ThreadInfo {
       remoteParentReceiveContext.remove();
       state.exit();
       state.clearExitReferences();
-      blockRemoteParentLookup();
+      blockRemoteParentLookup(REMOTE_PARENT_FRAMEWORK_MISS_LATE);
       bestEffortUnlinkTask(failure);
       cancelTaskHandoff(handoffToken);
       cancelTaskHandoff(restoreToken);
@@ -503,8 +514,9 @@ public class ThreadInfo {
       remoteParentReceiveContext.remove();
     }
     remoteParentLookupOverride.set(LOOKUP_DIRECT);
+    clearRemoteParentFrameworkMissReason();
     if (!isCurrentRemoteParentBridgeEpoch(bridgeEpoch)) {
-      blockRemoteParentLookup();
+      blockRemoteParentLookup(REMOTE_PARENT_FRAMEWORK_MISS_LATE);
     }
   }
 
@@ -554,10 +566,32 @@ public class ThreadInfo {
 
   /** Prevents an uncertain receive from falling back to either a task or a direct owner. */
   public static void blockRemoteParentLookup() {
+    blockRemoteParentLookup(REMOTE_PARENT_FRAMEWORK_MISS_NONE);
+  }
+
+  private static void blockRemoteParentLookup(int frameworkMissReason) {
     remoteParentLookupOverride.set(LOOKUP_BLOCKED);
     remoteParentLookupLifecycle.remove();
     remoteParentLookupBridgeEpoch.remove();
     remoteParentReceiveContext.remove();
+    if (frameworkMissReason == REMOTE_PARENT_FRAMEWORK_MISS_NONE) {
+      clearRemoteParentFrameworkMissReason();
+    } else {
+      remoteParentFrameworkMissReason.set((byte) frameworkMissReason);
+    }
+  }
+
+  /** Consumes the bounded reason why framework timing prevented a native lookup. */
+  public static int takeRemoteParentFrameworkMissReason() {
+    Byte reason = remoteParentFrameworkMissReason.get();
+    remoteParentFrameworkMissReason.remove();
+    if (reason == null) {
+      return REMOTE_PARENT_FRAMEWORK_MISS_NONE;
+    }
+    int value = reason.byteValue();
+    return value >= REMOTE_PARENT_FRAMEWORK_MISS_DEPTH && value <= REMOTE_PARENT_FRAMEWORK_MISS_LATE
+        ? value
+        : REMOTE_PARENT_FRAMEWORK_MISS_NONE;
   }
 
   /** Clears every thread-local Java capability after a bridge call loses provider eligibility. */
@@ -572,7 +606,7 @@ public class ThreadInfo {
         && (remoteParentLookupLifecycle.get() == lifecycle
             || remoteParentReceiveContext.get() != null
                 && remoteParentReceiveContext.get().lifecycle() == lifecycle)) {
-      blockRemoteParentLookup();
+      blockRemoteParentLookup(REMOTE_PARENT_FRAMEWORK_MISS_LATE);
     }
   }
 
@@ -580,13 +614,13 @@ public class ThreadInfo {
   public static int remoteParentLookupSource() {
     long bridgeEpoch = currentRemoteParentLookupBridgeEpoch();
     if (bridgeEpoch != 0L && !isCurrentRemoteParentBridgeCapability(bridgeEpoch)) {
-      blockRemoteParentLookup();
+      blockRemoteParentLookup(REMOTE_PARENT_FRAMEWORK_MISS_LATE);
       return REMOTE_PARENT_LOOKUP_BLOCKED;
     }
     ReceiveContext receiveContext = remoteParentReceiveContext.get();
     if (receiveContext != null
         && !isCurrentRemoteParentBridgeCapability(receiveContext.bridgeEpoch())) {
-      blockRemoteParentLookup();
+      blockRemoteParentLookup(REMOTE_PARENT_FRAMEWORK_MISS_LATE);
       return REMOTE_PARENT_LOOKUP_BLOCKED;
     }
     byte lookupOverride = currentRemoteParentLookupOverride();
@@ -594,9 +628,11 @@ public class ThreadInfo {
       return REMOTE_PARENT_LOOKUP_BLOCKED;
     }
     if (lookupOverride == LOOKUP_TASK) {
-      return hasRemoteParentTaskLookupAuthority()
-          ? REMOTE_PARENT_LOOKUP_TASK
-          : REMOTE_PARENT_LOOKUP_BLOCKED;
+      if (hasRemoteParentTaskLookupAuthority()) {
+        return REMOTE_PARENT_LOOKUP_TASK;
+      }
+      blockRemoteParentLookup(REMOTE_PARENT_FRAMEWORK_MISS_LATE);
+      return REMOTE_PARENT_LOOKUP_BLOCKED;
     }
     return REMOTE_PARENT_LOOKUP_DIRECT;
   }
@@ -607,6 +643,7 @@ public class ThreadInfo {
     remoteParentLookupLifecycle.remove();
     remoteParentLookupBridgeEpoch.remove();
     remoteParentReceiveContext.remove();
+    clearRemoteParentFrameworkMissReason();
   }
 
   /** Returns the lifecycle that must remain live for a direct or task lookup. */
@@ -619,14 +656,14 @@ public class ThreadInfo {
     if (remoteParentReceiveDepth.get() == null) {
       advanceRemoteParentReceiveEpoch();
     }
-    blockRemoteParentLookup();
+    blockRemoteParentLookup(REMOTE_PARENT_FRAMEWORK_MISS_LATE);
   }
 
   /** Enters an inbound TLS boundary that must never fall back to a task alias. */
   public static void beginRemoteParentReceiveScope() {
     Integer depth = remoteParentReceiveDepth.get();
     advanceRemoteParentReceiveEpoch();
-    blockRemoteParentLookup();
+    blockRemoteParentLookup(REMOTE_PARENT_FRAMEWORK_MISS_LATE);
     remoteParentReceiveDepth.set(depth == null ? 1 : depth + 1);
   }
 
@@ -648,7 +685,7 @@ public class ThreadInfo {
    */
   public static void invalidateRemoteParentSocketFileDescriptor(Object lifecycle) {
     advanceRemoteParentReceiveEpoch();
-    blockRemoteParentLookup();
+    blockRemoteParentLookup(REMOTE_PARENT_FRAMEWORK_MISS_LATE);
     if (lifecycle instanceof RemoteParentSocketContext.Lifecycle) {
       ((RemoteParentSocketContext.Lifecycle) lifecycle).invalidate();
       RemoteParentSocketContext current = remoteParentSocketContext.get();
@@ -792,23 +829,24 @@ public class ThreadInfo {
     return new SecureRandom().nextLong();
   }
 
-  private static void failClosedTaskEntry(long handoffToken, long restoreToken) {
+  private static void failClosedTaskEntry(
+      long handoffToken, long restoreToken, int frameworkMissReason) {
     try {
       emitTaskContextOp(OperationType.TASK_UNLINK, 0L, 0L);
     } finally {
       remoteParentSocketContext.remove();
-      blockRemoteParentLookup();
+      blockRemoteParentLookup(frameworkMissReason);
       cancelTaskHandoff(handoffToken);
       cancelTaskHandoff(restoreToken);
     }
   }
 
-  private static void rejectTaskEntry(long handoffToken) {
+  private static void rejectTaskEntry(long handoffToken, int frameworkMissReason) {
     try {
       cancelTaskHandoff(handoffToken);
     } finally {
       remoteParentSocketContext.remove();
-      blockRemoteParentLookup();
+      blockRemoteParentLookup(frameworkMissReason);
     }
   }
 
@@ -856,7 +894,16 @@ public class ThreadInfo {
     }
     setRemoteParentLookupLifecycle(lookupLifecycle);
     setRemoteParentLookupBridgeEpoch(lookupBridgeEpoch);
+    if (lookupOverride == LOOKUP_BLOCKED) {
+      remoteParentFrameworkMissReason.set((byte) REMOTE_PARENT_FRAMEWORK_MISS_LATE);
+    } else {
+      clearRemoteParentFrameworkMissReason();
+    }
     return true;
+  }
+
+  private static void clearRemoteParentFrameworkMissReason() {
+    remoteParentFrameworkMissReason.remove();
   }
 
   private static void setRemoteParentLookupLifecycle(
@@ -1126,6 +1173,10 @@ public class ThreadInfo {
         }
       }
       return false;
+    }
+
+    boolean atDepthLimit() {
+      return depth >= MAX_TASK_RELAY_DEPTH;
     }
 
     long exitToken() {

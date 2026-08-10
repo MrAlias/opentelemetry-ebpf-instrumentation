@@ -42,7 +42,11 @@ public final class RemoteParentDiagnostics {
   private static final int SNAPSHOT_COUNTER_COUNT =
       DISCARD_STATUS_BASE + RemoteParentStatus.DISABLED + 1;
   private static final int PROVIDER_DUPLICATE_EVENTS = SNAPSHOT_COUNTER_COUNT;
-  private static final int COUNTER_COUNT = PROVIDER_DUPLICATE_EVENTS + 1;
+  private static final int FRAMEWORK_DEPTH = PROVIDER_DUPLICATE_EVENTS + 1;
+  private static final int FRAMEWORK_CYCLE = FRAMEWORK_DEPTH + 1;
+  private static final int FRAMEWORK_LATE = FRAMEWORK_CYCLE + 1;
+  private static final int TRANSPORT_MISSING = FRAMEWORK_LATE + 1;
+  private static final int COUNTER_COUNT = TRANSPORT_MISSING + 1;
   static final long MAX_COUNTER_VALUE = 999_999_999L;
   private static final AtomicLongArray counters = new AtomicLongArray(COUNTER_COUNT);
   private static final Logger logger = Logger.getLogger(RemoteParentDiagnostics.class.getName());
@@ -103,6 +107,26 @@ public final class RemoteParentDiagnostics {
   static void receiveFailure(int status) {
     int normalized = normalizeStatus(status);
     increment(DISCARD_STATUS_BASE + normalized, failureReason("receive", normalized));
+  }
+
+  static void frameworkMiss(int reason) {
+    switch (reason) {
+      case io.opentelemetry.obi.java.ebpf.ThreadInfo.REMOTE_PARENT_FRAMEWORK_MISS_DEPTH:
+        increment(FRAMEWORK_DEPTH, "framework_depth");
+        break;
+      case io.opentelemetry.obi.java.ebpf.ThreadInfo.REMOTE_PARENT_FRAMEWORK_MISS_CYCLE:
+        increment(FRAMEWORK_CYCLE, "framework_cycle");
+        break;
+      case io.opentelemetry.obi.java.ebpf.ThreadInfo.REMOTE_PARENT_FRAMEWORK_MISS_LATE:
+        increment(FRAMEWORK_LATE, "framework_late");
+        break;
+      default:
+        break;
+    }
+  }
+
+  static void transportMissing() {
+    increment(TRANSPORT_MISSING, null);
   }
 
   static void discardReason(int reason) {
@@ -214,6 +238,10 @@ public final class RemoteParentDiagnostics {
     append(snapshot, "take_unsampled", counters.get(TAKE_UNSAMPLED));
     append(snapshot, "tls_reads", counters.get(TLS_READ_EVENTS));
     append(snapshot, "tls_bytes", counters.get(TLS_READ_BYTES));
+    append(snapshot, "framework_depth", counters.get(FRAMEWORK_DEPTH));
+    append(snapshot, "framework_cycle", counters.get(FRAMEWORK_CYCLE));
+    append(snapshot, "framework_late", counters.get(FRAMEWORK_LATE));
+    append(snapshot, "transport_missing", counters.get(TRANSPORT_MISSING));
     for (int status = RemoteParentStatus.UNKNOWN; status <= RemoteParentStatus.DISABLED; status++) {
       append(snapshot, "t_" + STATUS_NAMES[status], counters.get(TAKE_STATUS_BASE + status));
       append(snapshot, "d_" + STATUS_NAMES[status], counters.get(DISCARD_STATUS_BASE + status));

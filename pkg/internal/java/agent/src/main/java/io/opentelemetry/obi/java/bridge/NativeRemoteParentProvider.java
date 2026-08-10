@@ -193,11 +193,16 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
           return RemoteParentStatus.MISSING;
         }
       }
-      return socketCaller.call(
-          take,
-          taskScoped,
-          usesPrimarySocketLookup() && lookup != null ? lookup.socketFileDescriptor() : -1,
-          response);
+      int status =
+          socketCaller.call(
+              take,
+              taskScoped,
+              usesPrimarySocketLookup() && lookup != null ? lookup.socketFileDescriptor() : -1,
+              response);
+      if (take && status == RemoteParentStatus.MISSING) {
+        RemoteParentDiagnostics.transportMissing();
+      }
+      return status;
     } finally {
       if (lookup != null) {
         lookup.close();

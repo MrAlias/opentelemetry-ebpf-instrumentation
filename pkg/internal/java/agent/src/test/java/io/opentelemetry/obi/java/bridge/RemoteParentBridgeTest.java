@@ -70,6 +70,27 @@ class RemoteParentBridgeTest {
   }
 
   @Test
+  void frameworkTimingMissIsDistinctFromATransportMiss() {
+    CountingMissingProvider provider = new CountingMissingProvider();
+    assertTrue(RemoteParentBridge.installProviderForTest(provider));
+
+    ThreadInfo.beginRemoteParentReceiveAttempt();
+    assertEquals(RemoteParentStatus.MISSING, RemoteParentBridge.takeRemoteParent().getStatus());
+    assertEquals(0, provider.takes.get());
+
+    ThreadInfo.markRemoteParentDirectLookup();
+    assertEquals(RemoteParentStatus.MISSING, RemoteParentBridge.takeRemoteParent().getStatus());
+    assertEquals(1, provider.takes.get());
+
+    String diagnostics = RemoteParentBridge.diagnosticsSnapshot();
+    assertTrue(diagnostics.contains("framework_depth=0"), diagnostics);
+    assertTrue(diagnostics.contains("framework_cycle=0"), diagnostics);
+    assertTrue(diagnostics.contains("framework_late=1"), diagnostics);
+    assertTrue(diagnostics.contains("transport_missing=1"), diagnostics);
+    assertTrue(diagnostics.contains("t_missing=2"), diagnostics);
+  }
+
+  @Test
   void disabledBridgeSkipsTakeAndDiscardAndRevokesCurrentJavaAuthority() {
     FakeProvider provider = new FakeProvider();
     assertTrue(RemoteParentBridge.installProviderForTest(provider));
@@ -467,7 +488,7 @@ class RemoteParentBridgeTest {
   }
 
   @Test
-  void diagnosticsSnapshotStaysBelowOneKilobyteAtSaturation() throws Exception {
+  void diagnosticsSnapshotStaysBoundedAtSaturation() throws Exception {
     Field field = RemoteParentDiagnostics.class.getDeclaredField("counters");
     field.setAccessible(true);
     AtomicLongArray counters = (AtomicLongArray) field.get(null);
@@ -477,7 +498,7 @@ class RemoteParentBridgeTest {
 
     String snapshot = RemoteParentBridge.diagnosticsSnapshot();
 
-    assertTrue(snapshot.length() < 1024, snapshot);
+    assertTrue(snapshot.length() < 1_200, snapshot);
     assertTrue(snapshot.matches("[a-z0-9_=,]+"));
   }
 
@@ -559,6 +580,30 @@ class RemoteParentBridgeTest {
       closeCount.incrementAndGet();
       closed.set(true);
     }
+  }
+
+  private static final class CountingMissingProvider implements RemoteParentProvider {
+    private final AtomicInteger takes = new AtomicInteger();
+
+    @Override
+    public int abiVersion() {
+      return RemoteParentRecord.ABI_VERSION;
+    }
+
+    @Override
+    public RemoteParentRecord takeRemoteParent() {
+      takes.incrementAndGet();
+      RemoteParentBridge.recordTransportMissing();
+      return RemoteParentRecord.statusOnly(RemoteParentStatus.MISSING);
+    }
+
+    @Override
+    public RemoteParentRecord discardRemoteParent() {
+      return RemoteParentRecord.statusOnly(RemoteParentStatus.MISSING);
+    }
+
+    @Override
+    public void close() {}
   }
 
   private void assertDisableDuringProviderCall(boolean discard) throws Exception {

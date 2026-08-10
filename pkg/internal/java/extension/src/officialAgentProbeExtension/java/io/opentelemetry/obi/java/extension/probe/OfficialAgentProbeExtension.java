@@ -55,6 +55,7 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
   private static final String FRAMEWORK_NETTY = "netty";
   private static final String FRAMEWORK_JAVA21_CONCURRENCY = "java21-concurrency";
   private static final String MODE_AUTO_UNAVAILABLE = "auto-unavailable";
+  private static final String MODE_FRAMEWORK_MISS = "framework-miss";
   private static final String RAW_OBI_PROPAGATOR =
       "io.opentelemetry.obi.java.extension.ObiRemoteParentPropagator";
   private static final int STATUS_VALID = 1;
@@ -109,11 +110,14 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
     boolean installProvider =
         !"false".equalsIgnoreCase(System.getProperty(INSTALL_PROVIDER_PROPERTY));
     boolean autoUnavailable = MODE_AUTO_UNAVAILABLE.equals(System.getProperty(MODE_PROPERTY));
+    boolean frameworkMiss = MODE_FRAMEWORK_MISS.equals(System.getProperty(MODE_PROPERTY));
     if (autoUnavailable && installProvider) {
       throw new IllegalStateException("auto-unavailable mode must retain the native provider");
     }
     ProviderState provider =
-        installProvider ? ProviderState.install(output, jetty, netty, java21Concurrency) : null;
+        installProvider
+            ? ProviderState.install(output, jetty, netty, java21Concurrency, frameworkMiss)
+            : null;
     if (provider == null) {
       if (autoUnavailable) {
         output.append("PROVIDER\tretained\tbootstrap");
@@ -640,7 +644,14 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
       try {
         SyntheticReceiveScope receiveScope = provider.openSyntheticReceive(id, invocation, pass);
         try {
-          return delegate.extract(context, carrier, getter);
+          FrameworkMissScope frameworkMissScope = provider.openFrameworkMiss(id, invocation, pass);
+          try {
+            return delegate.extract(context, carrier, getter);
+          } finally {
+            if (frameworkMissScope != null) {
+              frameworkMissScope.close();
+            }
+          }
         } finally {
           if (receiveScope != null) {
             receiveScope.close();
@@ -693,7 +704,13 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
           || "P".equals(value)
           || "Q".equals(value)
           || "D".equals(value)
+          || "K".equals(value)
+          || "L".equals(value)
           || "T".equals(value)) {
+        return value;
+      }
+      if (("X".equals(value) || "Y".equals(value))
+          && MODE_FRAMEWORK_MISS.equals(System.getProperty(MODE_PROPERTY))) {
         return value;
       }
       return null;
@@ -732,6 +749,8 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
     private final AuthorityVerifier authorityVerifier;
     private final ProviderCallCleanup providerCallCleanup;
     private final SyntheticReceiveFixture syntheticReceiveFixture;
+    private final FrameworkMissFixture frameworkMissFixture;
+    private final Method recordTransportMissing;
 
     private ProviderState(
         ProbeOutput output,
@@ -740,7 +759,9 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
         Object alreadyConsumed,
         AuthorityVerifier authorityVerifier,
         ProviderCallCleanup providerCallCleanup,
-        SyntheticReceiveFixture syntheticReceiveFixture) {
+        SyntheticReceiveFixture syntheticReceiveFixture,
+        FrameworkMissFixture frameworkMissFixture,
+        Method recordTransportMissing) {
       this.output = output;
       this.scenarios = scenarios;
       this.missing = missing;
@@ -748,10 +769,16 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
       this.authorityVerifier = authorityVerifier;
       this.providerCallCleanup = providerCallCleanup;
       this.syntheticReceiveFixture = syntheticReceiveFixture;
+      this.frameworkMissFixture = frameworkMissFixture;
+      this.recordTransportMissing = recordTransportMissing;
     }
 
     private static ProviderState install(
-        ProbeOutput output, boolean jetty, boolean netty, boolean java21Concurrency) {
+        ProbeOutput output,
+        boolean jetty,
+        boolean netty,
+        boolean java21Concurrency,
+        boolean frameworkMiss) {
       try {
         Class<?> bridge =
             Class.forName("io.opentelemetry.obi.java.bridge.RemoteParentBridge", true, null);
@@ -796,6 +823,12 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
             "D", new ScenarioState(decode.invoke(null, record(TRACE_D_OBI, PARENT_D_OBI, 1, 8L))));
         scenarios.put(
             "T", new ScenarioState(decode.invoke(null, record(TRACE_T, PARENT_T, 1, 9L))));
+        if (frameworkMiss) {
+          scenarios.put("K", new ScenarioState(null));
+          scenarios.put("L", new ScenarioState(null));
+          scenarios.put("X", new ScenarioState(null));
+          scenarios.put("Y", new ScenarioState(null));
+        }
         if (java21Concurrency) {
           for (int index = 0; index < 16; index++) {
             addJava21Scenario(decode, scenarios, "V", index);
@@ -814,6 +847,8 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
         ProviderCallCleanup providerCallCleanup = ProviderCallCleanup.create();
         SyntheticReceiveFixture syntheticReceiveFixture =
             jetty ? SyntheticReceiveFixture.create(output, providerCallCleanup) : null;
+        FrameworkMissFixture frameworkMissFixture =
+            frameworkMiss ? FrameworkMissFixture.create(output) : null;
 
         ProviderState state =
             new ProviderState(
@@ -823,7 +858,9 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
                 alreadyConsumed,
                 authorityVerifier,
                 providerCallCleanup,
-                syntheticReceiveFixture);
+                syntheticReceiveFixture,
+                frameworkMissFixture,
+                bridge.getMethod("recordTransportMissing"));
         Object provider = Proxy.newProxyInstance(null, new Class<?>[] {providerType}, state);
         requireBootstrap(provider.getClass(), "test provider");
         boolean installed =
@@ -842,6 +879,10 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
       return syntheticReceiveFixture == null
           ? null
           : syntheticReceiveFixture.open(id, invocation, pass);
+    }
+
+    private FrameworkMissScope openFrameworkMiss(String id, int invocation, int pass) {
+      return frameworkMissFixture == null ? null : frameworkMissFixture.open(id, invocation, pass);
     }
 
     private boolean armSyntheticPostMarkFailure() {
@@ -957,6 +998,14 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
       }
 
       ProviderResult result = scenario.claim(missing, alreadyConsumed);
+      if (take && "MISSING".equals(result.status)) {
+        try {
+          recordTransportMissing.invoke(null);
+        } catch (ReflectiveOperationException error) {
+          output.append(
+              "ERROR\ttransport-missing-diagnostics\t" + token(error.getClass().getName()));
+        }
+      }
       output.append(
           "PROVIDER\t"
               + operation
@@ -1493,6 +1542,258 @@ public final class OfficialAgentProbeExtension implements AutoConfigurationCusto
       this.lifecycleId = lifecycleId;
       this.lifecycle = lifecycle;
       this.observer = observer;
+    }
+
+    @Override
+    public void close() {
+      if (closed.compareAndSet(false, true)) {
+        fixture.close(this);
+      }
+    }
+  }
+
+  /** Drives bounded framework authority misses around the real stock-agent extraction call. */
+  private static final class FrameworkMissFixture {
+    private static final int LOOKUP_DIRECT = 1;
+    private static final int LOOKUP_BLOCKED = 3;
+    private static final int MISS_NONE = 0;
+    private static final int MISS_DEPTH = 1;
+    private static final int MISS_CYCLE = 2;
+    private static final int MISS_LATE = 3;
+
+    private final ProbeOutput output;
+    private final Method enterTask;
+    private final Method restoreTask;
+    private final Method beginReceiveAttempt;
+    private final Method lookupSource;
+    private final Field taskRelayState;
+    private final Field taskRelayDepth;
+    private final Field frameworkMissReason;
+    private final int maxDepth;
+
+    private FrameworkMissFixture(
+        ProbeOutput output,
+        Method enterTask,
+        Method restoreTask,
+        Method beginReceiveAttempt,
+        Method lookupSource,
+        Field taskRelayState,
+        Field taskRelayDepth,
+        Field frameworkMissReason,
+        int maxDepth) {
+      this.output = output;
+      this.enterTask = enterTask;
+      this.restoreTask = restoreTask;
+      this.beginReceiveAttempt = beginReceiveAttempt;
+      this.lookupSource = lookupSource;
+      this.taskRelayState = taskRelayState;
+      this.taskRelayDepth = taskRelayDepth;
+      this.frameworkMissReason = frameworkMissReason;
+      this.maxDepth = maxDepth;
+    }
+
+    private static FrameworkMissFixture create(ProbeOutput output)
+        throws ReflectiveOperationException {
+      Class<?> threadInfo = Class.forName("io.opentelemetry.obi.java.ebpf.ThreadInfo", true, null);
+      Class<?> relayState =
+          Class.forName("io.opentelemetry.obi.java.ebpf.ThreadInfo$TaskRelayState", true, null);
+      Class<?> emitter =
+          Class.forName("io.opentelemetry.obi.java.ebpf.ThreadInfo$TaskContextEmitter", true, null);
+      ProviderState.requireBootstrap(threadInfo, "framework miss thread authority");
+      ProviderState.requireBootstrap(relayState, "framework miss relay state");
+      ProviderState.requireBootstrap(emitter, "framework miss task emitter");
+
+      Method setEmitter = threadInfo.getDeclaredMethod("setTaskContextEmitterForTest", emitter);
+      setEmitter.setAccessible(true);
+      Object noOpEmitter =
+          Proxy.newProxyInstance(
+              null,
+              new Class<?>[] {emitter},
+              (proxy, method, values) -> {
+                if ("toString".equals(method.getName())) {
+                  return "OfficialAgentFrameworkMissEmitter";
+                }
+                return null;
+              });
+      setEmitter.invoke(null, noOpEmitter);
+
+      Field relay = SyntheticReceiveFixture.threadLocalField(threadInfo, "taskRelayState");
+      Field depth = relayState.getDeclaredField("depth");
+      depth.setAccessible(true);
+      Field reason =
+          SyntheticReceiveFixture.threadLocalField(threadInfo, "remoteParentFrameworkMissReason");
+      Field limit = threadInfo.getDeclaredField("MAX_TASK_RELAY_DEPTH");
+      limit.setAccessible(true);
+      output.append("FRAMEWORK_FIXTURE\tready");
+      return new FrameworkMissFixture(
+          output,
+          threadInfo.getMethod("enterTaskParentThreadContext", long.class, long.class),
+          threadInfo.getMethod("restoreTaskParentThreadContext"),
+          threadInfo.getMethod("beginRemoteParentReceiveAttempt"),
+          threadInfo.getMethod("remoteParentLookupSource"),
+          relay,
+          depth,
+          reason,
+          limit.getInt(null));
+    }
+
+    private FrameworkMissScope open(String id, int invocation, int pass) {
+      int baselineDepth = relayDepth();
+      int entered = 0;
+      String label = "TRANSPORT";
+      long threadId = Thread.currentThread().getId();
+      long parentBase = 10_000_000L + invocation * 10_000L + pass * 100L;
+      try {
+        if ("X".equals(id)) {
+          label = "DEPTH";
+          while (entered <= maxDepth
+              && Boolean.TRUE.equals(
+                  enterTask.invoke(
+                      null, Long.valueOf(threadId), Long.valueOf(parentBase + entered + 1L)))) {
+            entered++;
+          }
+          if (baselineDepth + entered != maxDepth) {
+            throw new IllegalStateException("framework depth limit was not reached exactly");
+          }
+        } else if ("Y".equals(id)) {
+          label = "CYCLE";
+          if (!Boolean.TRUE.equals(
+                  enterTask.invoke(null, Long.valueOf(threadId), Long.valueOf(parentBase + 1L)))
+              || !Boolean.TRUE.equals(
+                  enterTask.invoke(null, Long.valueOf(threadId), Long.valueOf(parentBase + 2L)))) {
+            throw new IllegalStateException("framework cycle setup was rejected");
+          }
+          entered = 2;
+          if (Boolean.TRUE.equals(
+              enterTask.invoke(null, Long.valueOf(threadId), Long.valueOf(parentBase + 1L)))) {
+            throw new IllegalStateException("framework ancestor cycle was accepted");
+          }
+        } else if ("L".equals(id)) {
+          label = "LATE";
+          beginReceiveAttempt.invoke(null);
+        } else if (!"K".equals(id)) {
+          return null;
+        }
+
+        int source = ((Integer) lookupSource.invoke(null)).intValue();
+        int reason = frameworkMissReason();
+        int expectedReason =
+            "DEPTH".equals(label)
+                ? MISS_DEPTH
+                : "CYCLE".equals(label) ? MISS_CYCLE : "LATE".equals(label) ? MISS_LATE : MISS_NONE;
+        int expectedSource = "TRANSPORT".equals(label) ? LOOKUP_DIRECT : LOOKUP_BLOCKED;
+        if (source != expectedSource || reason != expectedReason) {
+          throw new IllegalStateException(
+              "unexpected framework miss source=" + source + " reason=" + reason);
+        }
+        return new FrameworkMissScope(
+            this, id, invocation, pass, label, entered, baselineDepth, source, reason);
+      } catch (ReflectiveOperationException failure) {
+        restoreAfterFailedOpen(entered);
+        throw new IllegalStateException("cannot stage framework miss", failure);
+      } catch (RuntimeException failure) {
+        restoreAfterFailedOpen(entered);
+        throw failure;
+      }
+    }
+
+    private void restoreAfterFailedOpen(int entered) {
+      for (int index = 0; index < entered; index++) {
+        try {
+          restoreTask.invoke(null);
+        } catch (ReflectiveOperationException ignored) {
+          return;
+        }
+      }
+    }
+
+    private int relayDepth() {
+      try {
+        Object state = ((ThreadLocal<?>) taskRelayState.get(null)).get();
+        return state == null ? 0 : taskRelayDepth.getInt(state);
+      } catch (ReflectiveOperationException failure) {
+        throw new IllegalStateException("cannot inspect task relay depth", failure);
+      }
+    }
+
+    private int frameworkMissReason() {
+      try {
+        Object reason = ((ThreadLocal<?>) frameworkMissReason.get(null)).get();
+        return reason == null ? MISS_NONE : ((Number) reason).intValue();
+      } catch (ReflectiveOperationException failure) {
+        throw new IllegalStateException("cannot inspect framework miss reason", failure);
+      }
+    }
+
+    private void close(FrameworkMissScope scope) {
+      try {
+        for (int index = 0; index < scope.entered; index++) {
+          restoreTask.invoke(null);
+        }
+        int finalDepth = relayDepth();
+        int remainingReason = frameworkMissReason();
+        if (finalDepth != scope.baselineDepth || remainingReason != MISS_NONE) {
+          throw new IllegalStateException(
+              "framework miss cleanup failed depth=" + finalDepth + " reason=" + remainingReason);
+        }
+        output.append(
+            "FRAMEWORK_MISS\t"
+                + scope.id
+                + "\t"
+                + scope.invocation
+                + "\t"
+                + scope.pass
+                + "\t"
+                + scope.label
+                + "\t"
+                + scope.entered
+                + "\t"
+                + scope.baselineDepth
+                + "\t"
+                + finalDepth
+                + "\t"
+                + scope.source
+                + "\t"
+                + scope.reason
+                + "\t"
+                + remainingReason);
+      } catch (ReflectiveOperationException failure) {
+        throw new IllegalStateException("cannot clean framework miss", failure);
+      }
+    }
+  }
+
+  private static final class FrameworkMissScope implements AutoCloseable {
+    private final FrameworkMissFixture fixture;
+    private final String id;
+    private final int invocation;
+    private final int pass;
+    private final String label;
+    private final int entered;
+    private final int baselineDepth;
+    private final int source;
+    private final int reason;
+    private final AtomicBoolean closed = new AtomicBoolean();
+
+    private FrameworkMissScope(
+        FrameworkMissFixture fixture,
+        String id,
+        int invocation,
+        int pass,
+        String label,
+        int entered,
+        int baselineDepth,
+        int source,
+        int reason) {
+      this.fixture = fixture;
+      this.id = id;
+      this.invocation = invocation;
+      this.pass = pass;
+      this.label = label;
+      this.entered = entered;
+      this.baselineDepth = baselineDepth;
+      this.source = source;
+      this.reason = reason;
     }
 
     @Override

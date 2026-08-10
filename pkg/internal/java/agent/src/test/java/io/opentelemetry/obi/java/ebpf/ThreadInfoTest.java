@@ -925,6 +925,12 @@ class ThreadInfoTest {
     assertFalse(
         ThreadInfo.enterTaskParentThreadContext(
             900L, 1_000L + ThreadInfo.MAX_TASK_RELAY_DEPTH, 999L));
+    assertEquals(
+        ThreadInfo.REMOTE_PARENT_FRAMEWORK_MISS_DEPTH,
+        ThreadInfo.takeRemoteParentFrameworkMissReason());
+    assertEquals(
+        ThreadInfo.REMOTE_PARENT_FRAMEWORK_MISS_NONE,
+        ThreadInfo.takeRemoteParentFrameworkMissReason());
 
     assertTrue(ThreadInfo.hasTaskRelayState());
     int rejected = emitted.size() - 4;
@@ -989,6 +995,9 @@ class ThreadInfoTest {
 
     assertTrue(ThreadInfo.enterTaskParentThreadContext(900L, 101L));
     assertEquals(ThreadInfo.REMOTE_PARENT_LOOKUP_BLOCKED, ThreadInfo.remoteParentLookupSource());
+    assertEquals(
+        ThreadInfo.REMOTE_PARENT_FRAMEWORK_MISS_LATE,
+        ThreadInfo.takeRemoteParentFrameworkMissReason());
     ThreadInfo.restoreTaskParentThreadContext();
 
     assertEquals(ThreadInfo.REMOTE_PARENT_LOOKUP_DIRECT, ThreadInfo.remoteParentLookupSource());
@@ -1028,6 +1037,9 @@ class ThreadInfoTest {
     assertFalse(ThreadInfo.enterTaskParentThreadContext(900L, 101L));
 
     assertEquals(OperationType.TASK_UNLINK, emitted.get(emitted.size() - 1).operation);
+    assertEquals(
+        ThreadInfo.REMOTE_PARENT_FRAMEWORK_MISS_CYCLE,
+        ThreadInfo.takeRemoteParentFrameworkMissReason());
     ThreadInfo.restoreTaskParentThreadContext();
     ThreadInfo.restoreTaskParentThreadContext();
   }

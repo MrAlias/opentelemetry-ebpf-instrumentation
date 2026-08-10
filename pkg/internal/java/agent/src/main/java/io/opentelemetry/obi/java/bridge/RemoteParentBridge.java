@@ -27,6 +27,14 @@ public final class RemoteParentBridge {
       RemoteParentDiagnostics.takeStatus(missing.getStatus());
       return missing;
     }
+    int frameworkMissReason = ThreadInfo.takeRemoteParentFrameworkMissReason();
+    if (frameworkMissReason != ThreadInfo.REMOTE_PARENT_FRAMEWORK_MISS_NONE) {
+      ThreadInfo.revokeRemoteParentBridgeAuthority();
+      RemoteParentRecord missing = RemoteParentRecord.statusOnly(RemoteParentStatus.MISSING);
+      RemoteParentDiagnostics.frameworkMiss(frameworkMissReason);
+      RemoteParentDiagnostics.takeStatus(missing.getStatus());
+      return missing;
+    }
     RemoteParentProvider selected = provider.get();
     RemoteParentRecord record;
     try {
@@ -146,6 +154,11 @@ public final class RemoteParentBridge {
    */
   public static void recordReceiveFailure(int status) {
     RemoteParentDiagnostics.receiveFailure(status);
+  }
+
+  /** Records a provider lookup that reached its native transport and found no parent. */
+  public static void recordTransportMissing() {
+    RemoteParentDiagnostics.transportMissing();
   }
 
   public static void recordExtensionEvent(int event, long count) {

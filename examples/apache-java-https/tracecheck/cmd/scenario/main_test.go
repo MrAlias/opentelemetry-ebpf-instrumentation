@@ -1604,7 +1604,7 @@ func TestBridgeDiagnosticsHeaderIsRequiredOnlyForOptedInRequest(t *testing.T) {
 }
 
 func TestJavaDiagnosticsSnapshotValidationIsExactAndBounded(t *testing.T) {
-	require.Len(t, javaDiagnosticsFieldNames, 50)
+	require.Len(t, javaDiagnosticsFieldNames, 54)
 	valid := javaDiagnosticsSnapshot(t, maxJavaDiagnosticsCounter-1)
 	sanitized, err := sanitizeJavaDiagnostics(valid)
 	require.NoError(t, err)
@@ -1632,8 +1632,8 @@ func TestJavaDiagnosticsSnapshotValidationIsExactAndBounded(t *testing.T) {
 		{name: "unavailable", snapshot: "unavailable", want: "unavailable"},
 		{name: "newline", snapshot: strings.Join(fields, ",") + "\n", want: "newline"},
 		{name: "carriage return", snapshot: strings.Join(fields, ",") + "\r", want: "newline"},
-		{name: "missing", snapshot: strings.Join(fields[:len(fields)-1], ","), want: "expected 50 fields"},
-		{name: "extra", snapshot: strings.Join(append(fields, "extra=0"), ","), want: "expected 50 fields"},
+		{name: "missing", snapshot: strings.Join(fields[:len(fields)-1], ","), want: "expected 54 fields"},
+		{name: "extra", snapshot: strings.Join(append(fields, "extra=0"), ","), want: "expected 54 fields"},
 		{name: "duplicate", snapshot: strings.Join(duplicate, ","), want: "duplicated"},
 		{name: "reordered", snapshot: strings.Join(reordered, ","), want: "expected"},
 		{name: "uppercase", snapshot: strings.Join(uppercase, ","), want: "invalid base36"},
@@ -1651,6 +1651,24 @@ func TestJavaDiagnosticsSnapshotValidationIsExactAndBounded(t *testing.T) {
 			require.ErrorContains(t, validationErr, test.want)
 		})
 	}
+}
+
+func TestJavaDiagnosticsKeepsFrameworkAndTransportMissesDistinct(t *testing.T) {
+	snapshot := javaDiagnosticsSnapshotWithCounters(t, map[string]uint64{
+		"framework_depth":   2,
+		"framework_cycle":   3,
+		"framework_late":    4,
+		"transport_missing": 5,
+		"t_missing":         14,
+	})
+
+	counters, err := javaDiagnosticsCounters(snapshot)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(2), counters["framework_depth"])
+	assert.Equal(t, uint64(3), counters["framework_cycle"])
+	assert.Equal(t, uint64(4), counters["framework_late"])
+	assert.Equal(t, uint64(5), counters["transport_missing"])
+	assert.Equal(t, uint64(14), counters["t_missing"])
 }
 
 func TestFaultDiagnosticsAreExposedOnlyAtTheTopLevel(t *testing.T) {

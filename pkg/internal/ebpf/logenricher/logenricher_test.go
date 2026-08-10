@@ -243,7 +243,7 @@ func TestProcessLifecycleTracepointsAdvanceEpochBeforeDisarm(t *testing.T) {
 	require.Contains(t, string(source), `SEC("tracepoint/sched/sched_process_exit")`)
 	require.Contains(t, string(source), "int obi_log_enricher_process_exit(void *ctx)")
 	require.Contains(t, string(source), "BPF_CORE_READ(task, signal, live.counter) != 0")
-	require.Contains(t, string(source), "previous_epoch == ~0ULL")
+	require.Contains(t, string(source), "if (*lifecycle_epoch == 0)")
 
 	for _, object := range []struct {
 		name string
@@ -294,7 +294,8 @@ func requireLifecycleRetirementOrdering(t *testing.T, program *ebpf.ProgramSpec)
 			}
 		}
 		atomicOp := instruction.OpCode.AtomicOp()
-		if atomicOp == asm.AddAtomic || atomicOp == asm.FetchAdd {
+		require.NotEqual(t, asm.FetchAdd, atomicOp, "BPF XADD return values are unsupported")
+		if atomicOp == asm.AddAtomic {
 			require.Equal(t, asm.DWord, instruction.OpCode.Size())
 			atomicIndices = append(atomicIndices, index)
 		}

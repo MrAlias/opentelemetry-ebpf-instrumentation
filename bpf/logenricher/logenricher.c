@@ -132,8 +132,10 @@ static __always_inline int log_enricher_retire_current_process(void) {
 
     // Epoch zero is never valid. Skip it on the practically unreachable wrap
     // so no stale generation can become eligible through an ABA transition.
-    const u64 previous_epoch = __sync_fetch_and_add(lifecycle_epoch, 1);
-    if (previous_epoch == ~0ULL) {
+    // BPF XADD cannot return its previous value, so re-read after the atomic
+    // increment and advance once more only when the stored epoch wrapped.
+    __sync_fetch_and_add(lifecycle_epoch, 1);
+    if (*lifecycle_epoch == 0) {
         __sync_fetch_and_add(lifecycle_epoch, 1);
     }
     bpf_map_delete_elem(&log_enricher_generations, &tgid);

@@ -45,11 +45,12 @@ func trustedTLSServer(t *testing.T, dnsNames []string, ipAddresses []net.IP) (*h
 		IPAddresses:           ipAddresses,
 	}
 	certificateDER, err := x509.CreateCertificate(
-		rand.Reader, certificateTemplate, certificateTemplate, &privateKey.PublicKey, privateKey)
+		rand.Reader, certificateTemplate, certificateTemplate, &privateKey.PublicKey, privateKey,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.WriteHeader(http.StatusOK)
 	}))
 	server.TLS = &tls.Config{
@@ -74,7 +75,7 @@ func TestRunMaintainsConfiguredConcurrency(t *testing.T) {
 	var firstWave atomic.Int64
 	entered := make(chan struct{}, 4)
 	release := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		current := active.Add(1)
 		defer active.Add(-1)
 		for {
@@ -380,7 +381,7 @@ func TestRunHonorsConnectionMode(t *testing.T) {
 }
 
 func TestRunReportsResponseFailures(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	defer server.Close()
@@ -404,12 +405,12 @@ func TestRunReportsResponseFailures(t *testing.T) {
 
 func TestRunDoesNotFollowRedirects(t *testing.T) {
 	var redirectedRequests atomic.Int64
-	redirectTarget := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	redirectTarget := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		redirectedRequests.Add(1)
 		writer.WriteHeader(http.StatusOK)
 	}))
 	defer redirectTarget.Close()
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.Header().Set("Location", redirectTarget.URL+"/unexpected")
 		writer.WriteHeader(http.StatusFound)
 	}))
@@ -433,7 +434,7 @@ func TestRunDoesNotFollowRedirects(t *testing.T) {
 }
 
 func TestRunRejectsOversizedResponseHeaders(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.Header().Set("X-OBI-Benchmark-Fill", strings.Repeat("x", maxResponseHeaderBytes))
 		writer.WriteHeader(http.StatusOK)
 	}))

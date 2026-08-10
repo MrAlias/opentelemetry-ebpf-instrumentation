@@ -986,14 +986,15 @@ func makeRequests(cfg config) ([]requestCase, error) {
 	if usesInBandJavaDiagnostics(cfg.scenario) {
 		requests[len(requests)-1].BridgeDiagnostics = true
 	}
-	if cfg.scenario == "tls-boundary" {
+	switch {
+	case cfg.scenario == "tls-boundary":
 		requests[0].CloseConnection = true
 		requests[2].CloseConnection = true
-	} else if parallelScenario(cfg.scenario) {
+	case parallelScenario(cfg.scenario):
 		for i := range requests {
 			requests[i].CloseConnection = true
 		}
-	} else {
+	default:
 		requests[len(requests)-1].CloseConnection = true
 	}
 	return requests, nil
@@ -1184,8 +1185,7 @@ func sendTLSBoundaryRequests(
 		return responses, latencies, time.Since(trafficStart), nil, fmt.Errorf("split TLS boundary request: %w", err)
 	}
 
-	coalescedResponses, coalescedLatencies, _, evidence, err :=
-		sendSequentialRequests(ctx, cfg, requests[1:])
+	coalescedResponses, coalescedLatencies, evidence, err := sendSequentialRequests(ctx, cfg, requests[1:])
 	copy(responses[1:], coalescedResponses)
 	copy(latencies[1:], coalescedLatencies)
 	if evidence != nil {
@@ -1326,18 +1326,18 @@ func sendSequentialRequests(
 	ctx context.Context,
 	cfg config,
 	requests []requestCase,
-) ([]backendResponse, []int64, time.Duration, *connectionEvidence, error) {
+) ([]backendResponse, []int64, *connectionEvidence, error) {
 	network, address, err := directTCPAddress(cfg.baseURL)
 	if err != nil {
-		return nil, nil, 0, nil, err
+		return nil, nil, nil, err
 	}
 	connection, err := (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, network, address)
 	if err != nil {
-		return nil, nil, 0, nil, fmt.Errorf("dial Apache for sequential HTTP/1.1 requests: %w", err)
+		return nil, nil, nil, fmt.Errorf("dial Apache for sequential HTTP/1.1 requests: %w", err)
 	}
 	defer connection.Close()
 	if err := setConnectionDeadline(ctx, connection, effectiveRequestTimeout(cfg)); err != nil {
-		return nil, nil, 0, nil, err
+		return nil, nil, nil, err
 	}
 	return sendSequentialRequestsOnConnection(ctx, connection, cfg, requests)
 }
@@ -1347,12 +1347,11 @@ func sendSequentialRequestsOnConnection(
 	connection net.Conn,
 	cfg config,
 	requests []requestCase,
-) ([]backendResponse, []int64, time.Duration, *connectionEvidence, error) {
+) ([]backendResponse, []int64, *connectionEvidence, error) {
 	if len(requests) < 2 {
-		return nil, nil, 0, nil, errors.New("sequential HTTP/1.1 traffic requires at least two requests")
+		return nil, nil, nil, errors.New("sequential HTTP/1.1 traffic requires at least two requests")
 	}
 
-	trafficStart := time.Now()
 	responses := make([]backendResponse, len(requests))
 	latencies := make([]int64, len(requests))
 	evidence := &connectionEvidence{
@@ -1366,25 +1365,25 @@ func sendSequentialRequestsOnConnection(
 		requestStart := time.Now()
 		request, buildErr := newHTTPRequest(ctx, cfg, requests[index])
 		if buildErr != nil {
-			return responses, latencies, time.Since(trafficStart), evidence, fmt.Errorf("build sequential request %d: %w", index, buildErr)
+			return responses, latencies, evidence, fmt.Errorf("build sequential request %d: %w", index, buildErr)
 		}
 		request.Proto = "HTTP/1.1"
 		request.ProtoMajor = 1
 		request.ProtoMinor = 1
 		if writeErr := request.Write(requestWriter); writeErr != nil {
-			return responses, latencies, time.Since(trafficStart), evidence, fmt.Errorf("write sequential request %d: %w", index, writeErr)
+			return responses, latencies, evidence, fmt.Errorf("write sequential request %d: %w", index, writeErr)
 		}
 		if flushErr := requestWriter.Flush(); flushErr != nil {
-			return responses, latencies, time.Since(trafficStart), evidence, fmt.Errorf("flush sequential request %d: %w", index, flushErr)
+			return responses, latencies, evidence, fmt.Errorf("flush sequential request %d: %w", index, flushErr)
 		}
 		response, readErr := http.ReadResponse(responseReader, request)
 		if readErr != nil {
-			return responses, latencies, time.Since(trafficStart), evidence, fmt.Errorf("read sequential response %d: %w", index, readErr)
+			return responses, latencies, evidence, fmt.Errorf("read sequential response %d: %w", index, readErr)
 		}
 		backend, decodeErr := decodeBackendResponse(response, cfg, requests[index])
 		latencies[index] = time.Since(requestStart).Nanoseconds()
 		if decodeErr != nil {
-			return responses, latencies, time.Since(trafficStart), evidence, fmt.Errorf("sequential response %d: %w", index, decodeErr)
+			return responses, latencies, evidence, fmt.Errorf("sequential response %d: %w", index, decodeErr)
 		}
 		responses[index] = backend
 		if index+1 < len(requests) {
@@ -1392,7 +1391,7 @@ func sendSequentialRequestsOnConnection(
 		}
 	}
 
-	return responses, latencies, time.Since(trafficStart), evidence, nil
+	return responses, latencies, evidence, nil
 }
 
 func sendPipelinedRequests(
@@ -2688,13 +2687,12 @@ func awaitCoalescedBridgeAssertions(
 				combined := passSnapshots[index]
 				combined.Spans = spanUnion
 				combined.RelatedSpans = nil
-				outcome, candidates, triggerChain, classifyErr :=
-					classifyCoalescedBridgeSnapshot(
-						cfg,
-						requests[index],
-						requests[0].Marker,
-						combined,
-					)
+				outcome, candidates, triggerChain, classifyErr := classifyCoalescedBridgeSnapshot(
+					cfg,
+					requests[index],
+					requests[0].Marker,
+					combined,
+				)
 				passOutcomes[index] = outcome
 				passSummary.SourceClientCandidates += candidates
 				passSummary.TriggerChainProven = passSummary.TriggerChainProven && triggerChain

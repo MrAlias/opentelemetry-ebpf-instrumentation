@@ -270,7 +270,7 @@ func validateTarget(info *ebpf.MapInfo, target targetShape, expectedMaxEntries u
 }
 
 type entryIterator interface {
-	Next(keyOut, valueOut interface{}) bool
+	Next(keyOut, valueOut any) bool
 	Err() error
 }
 

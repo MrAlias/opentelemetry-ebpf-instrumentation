@@ -365,7 +365,7 @@ func run(parent context.Context, cfg config) (runResult, error) {
 	result.SuccessfulRequests, result.FailedRequests, result.FirstFailure, result.Latency = measurements.summary()
 	if result.TrafficElapsedNanos > 0 {
 		result.ThroughputPerSecond = float64(result.SuccessfulRequests) /
-			(time.Duration(result.TrafficElapsedNanos).Seconds())
+			time.Duration(result.TrafficElapsedNanos).Seconds()
 	}
 
 	if err := parent.Err(); err != nil {

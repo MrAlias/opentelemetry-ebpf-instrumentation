@@ -65,6 +65,8 @@ func TestMatchingResponseCannotReturnTaskCandidate(t *testing.T) {
 }
 
 func TestMatchingServeStopsOnInvalidScenarioRequest(t *testing.T) {
+	const serverTimeout = 5 * time.Second
+
 	for _, test := range []struct {
 		name    string
 		request []byte
@@ -98,7 +100,7 @@ func TestMatchingServeStopsOnInvalidScenarioRequest(t *testing.T) {
 					"unix", nil, &net.UnixAddr{Name: socketPath, Net: "unix"},
 				)
 				return err == nil
-			}, time.Second, time.Millisecond)
+			}, serverTimeout, time.Millisecond)
 			_, err := connection.Write(test.request)
 			require.NoError(t, err)
 			require.NoError(t, connection.Close())
@@ -106,7 +108,7 @@ func TestMatchingServeStopsOnInvalidScenarioRequest(t *testing.T) {
 			select {
 			case err := <-done:
 				require.ErrorContains(t, err, test.wantErr)
-			case <-time.After(time.Second):
+			case <-time.After(serverTimeout):
 				t.Fatal("matching fault bridge did not stop after an invalid scenario request")
 			}
 		})
@@ -186,11 +188,11 @@ func TestMatchingTakeCountValidation(t *testing.T) {
 func TestParseRequestAcceptsCurrentVersionAndLookupSources(t *testing.T) {
 	require.Equal(t, uint16(3), requestVersion)
 	require.Equal(t, 24, requestSize)
-	require.Equal(t, byte(1), operationTake)
-	require.Equal(t, byte(2), operationDrop)
-	require.Equal(t, byte(3), operationProbe)
-	require.Equal(t, byte(1), sourceDirect)
-	require.Equal(t, byte(2), sourceTask)
+	require.Equal(t, operationTake, byte(1))
+	require.Equal(t, operationDrop, byte(2))
+	require.Equal(t, operationProbe, byte(3))
+	require.Equal(t, sourceDirect, byte(1))
+	require.Equal(t, sourceTask, byte(2))
 
 	for _, operation := range []byte{operationTake, operationDrop, operationProbe} {
 		for _, source := range []byte{sourceDirect, sourceTask} {

@@ -18,7 +18,7 @@ type fakeIterator struct {
 	err       error
 }
 
-func (iterator *fakeIterator) Next(_, _ interface{}) bool {
+func (iterator *fakeIterator) Next(_, _ any) bool {
 	if iterator.remaining == 0 {
 		return false
 	}
@@ -136,7 +136,7 @@ func TestResultJSONLocksBothMapEvidenceSchemas(t *testing.T) {
 		GuardEntries:    1,
 	})
 	require.NoError(t, err)
-	assert.Equal(
+	assert.JSONEq(
 		t,
 		`{"status":"passed","cursor_map_id":41,"cursor_map_name":"jrp_recv_cur","cursor_kernel_name":"jrp_recv_cur","cursor_map_type":"Hash","cursor_key_size":8,"cursor_value_size":56,"cursor_max_entries":10000,"cursor_entries":2,"guard_map_id":42,"guard_map_name":"jrp_recv_guard","guard_kernel_name":"jrp_recv_guard","guard_map_type":"Hash","guard_key_size":8,"guard_value_size":56,"guard_max_entries":10000,"guard_entries":1}`,
 		string(encoded),

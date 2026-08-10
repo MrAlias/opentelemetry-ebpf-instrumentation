@@ -66,16 +66,16 @@ func TestRequestTimeoutDefaultsAndRemainsWithinScenarioDeadline(t *testing.T) {
 		requestTimeout: 70 * time.Second,
 	}))
 
-	assert.NoError(t, validateTimeouts(config{
+	require.NoError(t, validateTimeouts(config{
 		timeout:        90 * time.Second,
 		requestTimeout: 70 * time.Second,
 	}))
-	assert.ErrorContains(t, validateTimeouts(config{
+	require.ErrorContains(t, validateTimeouts(config{
 		timeout:           90 * time.Second,
 		requestTimeout:    91 * time.Second,
 		requestTimeoutSet: true,
 	}), "request-timeout")
-	assert.NoError(t, validateTimeouts(config{
+	require.NoError(t, validateTimeouts(config{
 		timeout:        5 * time.Second,
 		requestTimeout: defaultRequestTimeout,
 	}))
@@ -172,7 +172,8 @@ func TestW3CMatchSendsCanonicalStandardParent(t *testing.T) {
 		requests[0],
 	)
 	require.NoError(t, err)
-	assert.Equal(t,
+	assert.Equal(
+		t,
 		"00-"+matchingW3CTraceID+"-"+matchingW3CParentSpanID+"-"+matchingW3CTraceFlags,
 		request.Header.Get("traceparent"),
 	)
@@ -213,7 +214,7 @@ func TestConcurrencyAssertionModesRetainOneWorkload(t *testing.T) {
 		})
 	}
 
-	assert.ErrorContains(t, validateAssertionMode(config{
+	require.ErrorContains(t, validateAssertionMode(config{
 		scenario:      "basic",
 		assertionMode: "disabled",
 	}), "requires concurrency")
@@ -632,7 +633,7 @@ func TestCancellationReconciliationMakesWrongParentsFatal(t *testing.T) {
 	assert.Equal(t, "unresolved", outcome)
 	require.ErrorContains(t, err, "one marked Apache")
 
-	missing := cancellationSnapshot("cancel", "trace", "client")
+	missing := cancellationSnapshot("client")
 	missing.Spans = missing.Spans[:1]
 	outcome, err = classifyCancellationSnapshot(cfg, "cancel", missing, noDrops)
 	require.NoError(t, err)
@@ -640,20 +641,20 @@ func TestCancellationReconciliationMakesWrongParentsFatal(t *testing.T) {
 	_, err = classifyCancellationSnapshot(cfg, "cancel", missing, diagnosticDrops("missing", 1))
 	require.ErrorContains(t, err, "zero receive drops")
 
-	exact := cancellationSnapshot("cancel", "trace", "client")
+	exact := cancellationSnapshot("client")
 	outcome, err = classifyCancellationSnapshot(cfg, "cancel", exact, noDrops)
 	require.NoError(t, err)
 	assert.Equal(t, "exact", outcome)
 	_, err = classifyCancellationSnapshot(cfg, "cancel", exact, diagnosticDrops("timeout", 1))
 	require.ErrorContains(t, err, "zero receive drops")
 
-	flagsChanged := cancellationSnapshot("cancel", "trace", "client")
+	flagsChanged := cancellationSnapshot("client")
 	flagsChanged.Spans[1].Flags = 0x300
 	outcome, err = classifyCancellationSnapshot(cfg, "cancel", flagsChanged, noDrops)
 	assert.Equal(t, "wrong_parent", outcome)
 	require.ErrorContains(t, err, "changed trace flags")
 
-	root := cancellationSnapshot("cancel", "trace", "")
+	root := cancellationSnapshot("")
 	outcome, err = classifyCancellationSnapshot(cfg, "cancel", root, diagnosticDrops("missing", 1))
 	require.NoError(t, err)
 	assert.Equal(t, "reason_coded_drop", outcome)
@@ -670,7 +671,7 @@ func TestCancellationReconciliationMakesWrongParentsFatal(t *testing.T) {
 	_, err = classifyCancellationSnapshot(cfg, "cancel", root, diagnosticDrops("valid", 1))
 	require.ErrorContains(t, err, "exactly one allowed reason-coded")
 
-	wrong := cancellationSnapshot("cancel", "trace", "foreign")
+	wrong := cancellationSnapshot("foreign")
 	outcome, err = classifyCancellationSnapshot(cfg, "cancel", wrong, noDrops)
 	assert.Equal(t, "wrong_parent", outcome)
 	require.ErrorContains(t, err, "did not identify")
@@ -684,14 +685,14 @@ func TestCancellationReconciliationRequiresOneExactApacheCandidate(t *testing.T)
 	}{
 		"missing": {
 			snapshot: func() tracecheck.Snapshot {
-				value := cancellationSnapshot("cancel", "trace", "client")
+				value := cancellationSnapshot("client")
 				value.Spans = value.Spans[:1]
 				return value
 			}(),
 		},
-		"exact": {snapshot: cancellationSnapshot("cancel", "trace", "client")},
+		"exact": {snapshot: cancellationSnapshot("client")},
 		"root": {
-			snapshot: cancellationSnapshot("cancel", "trace", ""),
+			snapshot: cancellationSnapshot(""),
 			drops:    diagnosticDrops("missing", 1),
 		},
 	} {
@@ -714,7 +715,7 @@ func TestCancellationReconciliationRequiresOneExactApacheCandidate(t *testing.T)
 			require.ErrorContains(t, err, "one marked Apache")
 		})
 	}
-	wrongApacheEndpoint := cancellationSnapshot("cancel", "trace", "client")
+	wrongApacheEndpoint := cancellationSnapshot("client")
 	wrongApacheEndpoint.Spans[0].Attributes = cloneStringMap(wrongApacheEndpoint.Spans[0].Attributes)
 	wrongApacheEndpoint.Spans[0].Attributes["http.route"] = "/wrong"
 	outcome, err := classifyCancellationSnapshot(
@@ -726,14 +727,14 @@ func TestCancellationReconciliationRequiresOneExactApacheCandidate(t *testing.T)
 	assert.Equal(t, "unresolved", outcome)
 	require.ErrorContains(t, err, "one marked Apache")
 
-	wrongEndpoint := cancellationSnapshot("cancel", "trace", "client")
+	wrongEndpoint := cancellationSnapshot("client")
 	wrongEndpoint.Spans[1].Attributes = cloneStringMap(wrongEndpoint.Spans[1].Attributes)
 	wrongEndpoint.Spans[1].Attributes["http.route"] = "/wrong"
 	outcome, err = classifyCancellationSnapshot(cfg, "cancel", wrongEndpoint, diagnosticDropSummary{})
 	assert.Equal(t, "unresolved", outcome)
 	require.ErrorContains(t, err, "wrong endpoint")
 
-	extraJava := cancellationSnapshot("cancel", "trace", "client")
+	extraJava := cancellationSnapshot("client")
 	duplicate := extraJava.Spans[1]
 	duplicate.SpanID = "duplicate-java"
 	duplicate.Attributes = cloneStringMap(duplicate.Attributes)
@@ -762,7 +763,7 @@ func TestCancellationReconciliationRequiresOneExactApacheCandidate(t *testing.T)
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			candidate := cancellationSnapshot("cancel", "trace", "client")
+			candidate := cancellationSnapshot("client")
 			candidate.Spans = candidate.Spans[:1]
 			candidate.RelatedSpans = []tracecheck.Span{related}
 			outcome, err := classifyCancellationSnapshot(
@@ -988,7 +989,8 @@ func coalescedSnapshots(firstMarker, secondMarker string, javaRoots [2]bool) []t
 		"http.request.header.x-obi-demo-id": firstMarker,
 		"http.route":                        "/api/coalesced-source",
 	}
-	snapshots[0].Spans = append(snapshots[0].Spans,
+	snapshots[0].Spans = append(
+		snapshots[0].Spans,
 		tracecheck.Span{
 			ServiceName: "apache-proxy",
 			Kind:        "CLIENT",
@@ -1091,7 +1093,12 @@ func cloneUint64Map(source map[string]uint64) map[string]uint64 {
 	return cloned
 }
 
-func cancellationSnapshot(marker, traceID, javaParent string) tracecheck.Snapshot {
+func cancellationSnapshot(javaParent string) tracecheck.Snapshot {
+	const (
+		marker  = "cancel"
+		traceID = "trace"
+	)
+
 	attributes := map[string]string{
 		"http.request.header.x-obi-demo-id": marker,
 		"http.route":                        "/api/echo",
@@ -2213,11 +2220,11 @@ func TestValidateTLSBoundaryResponseRejectsEveryEvidenceInvariant(t *testing.T) 
 		})
 	}
 
-	assert.Error(t, validateTLSBoundaryResponse(request, backendResponse{}))
+	require.Error(t, validateTLSBoundaryResponse(request, backendResponse{}))
 	unknown := validTLSBoundaryEvidence("coalesced")
 	request.TLSBoundaryMode = "approximate"
 	unknown.Mode = "approximate"
-	assert.Error(t, validateTLSBoundaryResponse(request, backendResponse{TLSBoundary: unknown}))
+	require.Error(t, validateTLSBoundaryResponse(request, backendResponse{TLSBoundary: unknown}))
 	request.TLSBoundaryMode = "coalesced"
 	request.TLSBoundarySequence = 3
 	assert.Error(t, validateTLSBoundaryResponse(request, backendResponse{TLSBoundary: validTLSBoundaryEvidence("coalesced")}))
@@ -2435,7 +2442,8 @@ func validTLSBoundaryEvidence(mode string) *tlsBoundaryEvidence {
 		}
 		firstCallbacks := []int{16_384, 16_384, 16_384, evidence.RequestTotalBytes[0] - 3*16_384}
 		secondCallbacks := []int{16_384, 16_384, 16_384, evidence.RequestTotalBytes[1] - 3*16_384}
-		decrypted = append(firstCallbacks, secondCallbacks...)
+		decrypted = append([]int(nil), firstCallbacks...)
+		decrypted = append(decrypted, secondCallbacks...)
 		totalBytes := sumInts(evidence.RequestTotalBytes)
 		evidence.RequestHeaderDecryptedCallbackCounts = []int{2, 2}
 		evidence.RequestOrder = []int{1, 2}
@@ -2589,9 +2597,12 @@ func TestSendSequentialRequestsReadsFirstResponseBeforeSecondWrite(t *testing.T)
 				if _, peekErr := reader.Peek(1); peekErr == nil {
 					serverErr <- errors.New("second request arrived before the first response")
 					return
-				} else if networkErr, ok := peekErr.(net.Error); !ok || !networkErr.Timeout() {
-					serverErr <- fmt.Errorf("wait for premature second request: %w", peekErr)
-					return
+				} else {
+					var networkErr net.Error
+					if !errors.As(peekErr, &networkErr) || !networkErr.Timeout() {
+						serverErr <- fmt.Errorf("wait for premature second request: %w", peekErr)
+						return
+					}
 				}
 				if deadlineErr := connection.SetReadDeadline(time.Time{}); deadlineErr != nil {
 					serverErr <- deadlineErr
@@ -2635,7 +2646,7 @@ func TestSendSequentialRequestsReadsFirstResponseBeforeSecondWrite(t *testing.T)
 		serverErr <- nil
 	}()
 
-	responses, latencies, _, evidence, err := sendSequentialRequests(
+	responses, latencies, evidence, err := sendSequentialRequests(
 		context.Background(),
 		cfg,
 		requests[1:],

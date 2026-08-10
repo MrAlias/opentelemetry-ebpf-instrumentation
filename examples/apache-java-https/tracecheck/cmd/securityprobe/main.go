@@ -553,7 +553,6 @@ func runAbuseProbe(
 	identityRequests := abuseIdentityRequests(uint32(syscall.Gettid()), forgedLiveTID)
 	request := identityRequests[0].payload
 	for _, identityRequest := range identityRequests {
-		identityRequest := identityRequest
 		if err := run(identityRequest.name, func() (string, error) {
 			return expectRoundTripStatus(socketPath, identityRequest.payload, statusUnauthorized)
 		}); err != nil {

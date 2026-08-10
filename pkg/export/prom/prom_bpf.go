@@ -6,6 +6,7 @@ package prom // import "go.opentelemetry.io/obi/pkg/export/prom"
 import (
 	"context"
 	"encoding"
+	"io"
 	"log/slog"
 	"strconv"
 	"sync"
@@ -86,9 +87,7 @@ func BPFMetrics(
 		}
 
 		return func(ctx context.Context) {
-			for _, run := range runFns {
-				run(ctx)
-			}
+			runBPFCollectors(ctx, slog.With("component", "prom.BPFCollector"), runFns)
 		}, nil
 	}
 }
@@ -96,7 +95,30 @@ func BPFMetrics(
 var (
 	newBPFCollectorFn         = newBPFCollector
 	newInternalBPFCollectorFn = newInternalBPFCollector
+	enableBPFStatsRuntimeFn   = enableBPFStatsRuntime
 )
+
+func runBPFCollectors(ctx context.Context, log *slog.Logger, runFns []swarm.RunFunc) {
+	stats, err := enableBPFStatsRuntimeFn()
+	if stats != nil {
+		defer func(stats io.Closer) {
+			if err := stats.Close(); err != nil {
+				log.Error("failed to disable runtime stats", "error", err)
+			}
+		}(stats)
+	}
+	if err != nil {
+		// Runtime statistics require a sufficiently recent kernel and privileges.
+		// Map metrics and any program statistics the kernel does expose remain
+		// useful, so failure to enable them must not disable the collector.
+		log.Error("failed to enable runtime stats", "error", err)
+	}
+
+	for _, run := range runFns {
+		run(ctx)
+	}
+	<-ctx.Done()
+}
 
 func internalMetricsEnabled(internalMetrics imetrics.Reporter) bool {
 	if internalMetrics == nil || imetrics.IsBuiltinNoopReporter(internalMetrics) {
@@ -246,8 +268,6 @@ func (bc *BPFCollector) collectMetrics() ([]ProbeMetrics, []BpfMapMetrics) {
 }
 
 func (bc *BPFCollector) getProbeMetrics() []ProbeMetrics {
-	bc.enableBPFStatsRuntime()
-
 	probeMetrics := make([]ProbeMetrics, 0)
 
 	for id := ebpf.ProgramID(0); ; {
@@ -270,10 +290,7 @@ func (bc *BPFCollector) getProbeMetrics() []ProbeMetrics {
 			continue
 		}
 
-		switch info.Type {
-		case ebpf.Kprobe, ebpf.SocketFilter, ebpf.SchedCLS, ebpf.SkMsg, ebpf.SockOps:
-		// Supported program types
-		default:
+		if !supportedBPFProgramType(info.Type) {
 			continue // Skip unsupported program types
 		}
 
@@ -314,6 +331,15 @@ func (bc *BPFCollector) getProbeMetrics() []ProbeMetrics {
 		})
 	}
 	return probeMetrics
+}
+
+func supportedBPFProgramType(programType ebpf.ProgramType) bool {
+	switch programType {
+	case ebpf.Kprobe, ebpf.SocketFilter, ebpf.SchedCLS, ebpf.SkMsg, ebpf.SockOps, ebpf.CGroupSockopt:
+		return true
+	default:
+		return false
+	}
 }
 
 func getFuncName(info *ebpf.ProgramInfo, id ebpf.ProgramID, log *slog.Logger) string {

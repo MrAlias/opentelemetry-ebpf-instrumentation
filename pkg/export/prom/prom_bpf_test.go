@@ -5,6 +5,8 @@ package prom
 
 import (
 	"context"
+	"errors"
+	"io"
 	"log/slog"
 	"sync/atomic"
 	"testing"
@@ -21,6 +23,7 @@ import (
 	"go.opentelemetry.io/obi/pkg/export/imetrics"
 	"go.opentelemetry.io/obi/pkg/export/otel/perapp"
 	"go.opentelemetry.io/obi/pkg/pipe/global"
+	"go.opentelemetry.io/obi/pkg/pipe/swarm"
 )
 
 func TestBPFCollectorEnabled(t *testing.T) {
@@ -79,6 +82,85 @@ func TestCollectMapOccupancyIncludesNonEvictingAndLRUHashes(t *testing.T) {
 	assert.False(t, collectMapOccupancy(ebpf.PerCPUHash, "java_remote_par"))
 }
 
+func TestSupportedBPFProgramTypeIncludesCGroupSockopt(t *testing.T) {
+	for _, programType := range []ebpf.ProgramType{
+		ebpf.Kprobe,
+		ebpf.SocketFilter,
+		ebpf.SchedCLS,
+		ebpf.SkMsg,
+		ebpf.SockOps,
+		ebpf.CGroupSockopt,
+	} {
+		assert.True(t, supportedBPFProgramType(programType), programType.String())
+	}
+	assert.False(t, supportedBPFProgramType(ebpf.TracePoint))
+}
+
+func TestRunBPFCollectorsRetainsOneStatsHandleUntilContextCancellation(t *testing.T) {
+	originalEnableBPFStatsRuntime := enableBPFStatsRuntimeFn
+	t.Cleanup(func() {
+		enableBPFStatsRuntimeFn = originalEnableBPFStatsRuntime
+	})
+
+	var enableCalls atomic.Int32
+	var closeCalls atomic.Int32
+	enableBPFStatsRuntimeFn = func() (io.Closer, error) {
+		enableCalls.Add(1)
+		return closeFunc(func() error {
+			closeCalls.Add(1)
+			return nil
+		}), nil
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	var runCalls atomic.Int32
+	runBPFCollectors(ctx, slog.Default(), []swarm.RunFunc{
+		func(context.Context) {
+			runCalls.Add(1)
+			assert.Equal(t, int32(1), enableCalls.Load())
+			assert.Zero(t, closeCalls.Load())
+		},
+		func(context.Context) {
+			runCalls.Add(1)
+			assert.Equal(t, int32(1), enableCalls.Load())
+			assert.Zero(t, closeCalls.Load())
+			cancel()
+		},
+	})
+
+	assert.Equal(t, int32(1), enableCalls.Load())
+	assert.Equal(t, int32(1), closeCalls.Load())
+	assert.Equal(t, int32(2), runCalls.Load())
+}
+
+func TestRunBPFCollectorsContinuesWhenRuntimeStatsAreUnavailable(t *testing.T) {
+	originalEnableBPFStatsRuntime := enableBPFStatsRuntimeFn
+	t.Cleanup(func() {
+		enableBPFStatsRuntimeFn = originalEnableBPFStatsRuntime
+	})
+
+	enableBPFStatsRuntimeFn = func() (io.Closer, error) {
+		return nil, errors.New("runtime stats unavailable")
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	var ran atomic.Bool
+	runBPFCollectors(ctx, slog.Default(), []swarm.RunFunc{
+		func(context.Context) {
+			ran.Store(true)
+			cancel()
+		},
+	})
+
+	assert.True(t, ran.Load())
+}
+
+type closeFunc func() error
+
+func (f closeFunc) Close() error {
+	return f()
+}
+
 func TestBPFMetricsCollectsInternalMetricsForPrometheusReporter(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	internalMetrics := imetrics.NewPrometheusReporter(
@@ -131,9 +213,7 @@ func TestBPFMetricsCollectsInternalMetricsForPrometheusReporter(t *testing.T) {
 	runFn, err := BPFMetrics(ctxInfo, &PrometheusConfig{}, &perapp.MetricsConfig{})(context.Background())
 	require.NoError(t, err)
 
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	runFn(ctx)
+	startBPFMetricsRun(t, runFn)
 
 	require.Eventually(t, func() bool {
 		probeExecutionsMetric := gatheredMetric(t, registry, "obi_bpf_probe_executions_total", map[string]string{
@@ -275,9 +355,7 @@ func TestBPFMetricsCollectsInternalMetricsWhenPrometheusEndpointEnabled(t *testi
 	runFn, err := BPFMetrics(ctxInfo, cfg, mpCfg)(context.Background())
 	require.NoError(t, err)
 
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	runFn(ctx)
+	startBPFMetricsRun(t, runFn)
 
 	promMetricsCh := make(chan prometheus.Metric, 4)
 	promCollector.Collect(promMetricsCh)
@@ -328,7 +406,7 @@ func TestBPFMetricsCollectsInternalMetricsWhenPrometheusEndpointEnabled(t *testi
 	}, time.Second, 10*time.Millisecond)
 }
 
-func TestBPFMetricsDoesNotStartInternalCollectorForZeroIntervalReporter(t *testing.T) {
+func TestBPFMetricsDoesNotCreateInternalCollectorForZeroIntervalReporter(t *testing.T) {
 	ctxInfo := &global.ContextInfo{
 		Metrics: imetrics.NewPrometheusReporter(
 			&imetrics.InternalMetricsConfig{},
@@ -356,35 +434,15 @@ func TestBPFMetricsDoesNotStartInternalCollectorForZeroIntervalReporter(t *testi
 		}
 	}
 
-	var internalCollectorStarted atomic.Bool
-	newInternalBPFCollectorFn = func(ctxInfo *global.ContextInfo, cfg *PrometheusConfig, mpCfg *perapp.MetricsConfig) *BPFCollector {
-		return &BPFCollector{
-			promCfg:         cfg,
-			commonCfg:       mpCfg,
-			internalMetrics: ctxInfo.Metrics,
-			ctxInfo:         ctxInfo,
-			probeMetrics: func() []ProbeMetrics {
-				internalCollectorStarted.Store(true)
-				return nil
-			},
-			mapMetrics: func() []BpfMapMetrics {
-				internalCollectorStarted.Store(true)
-				return nil
-			},
-		}
+	newInternalBPFCollectorFn = func(_ *global.ContextInfo, _ *PrometheusConfig, _ *perapp.MetricsConfig) *BPFCollector {
+		t.Fatal("zero-interval reporter unexpectedly created an internal BPF collector")
+		return nil
 	}
 
 	runFn, err := BPFMetrics(ctxInfo, cfg, mpCfg)(context.Background())
 	require.NoError(t, err)
 
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	require.NotPanics(t, func() {
-		runFn(ctx)
-	})
-
-	time.Sleep(10 * time.Millisecond)
-	assert.False(t, internalCollectorStarted.Load())
+	startBPFMetricsRun(t, runFn)
 }
 
 func gatheredMetric(t *testing.T, registry *prometheus.Registry, name string, labels map[string]string) *dto.Metric {
@@ -419,4 +477,23 @@ func metricLabelsMatch(metric *dto.Metric, labels map[string]string) bool {
 	}
 
 	return true
+}
+
+func startBPFMetricsRun(t *testing.T, runFn swarm.RunFunc) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runFn(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("BPF metrics run function did not stop after context cancellation")
+		}
+	})
 }

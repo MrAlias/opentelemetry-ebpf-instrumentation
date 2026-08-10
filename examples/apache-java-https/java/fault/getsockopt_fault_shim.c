@@ -33,7 +33,9 @@ enum {
   java_remote_parent_abi_version = 1,
   java_remote_parent_socket_level = 0x4f42,
   java_remote_parent_socket_take = 0x4a01,
+  java_remote_parent_socket_task_take = 0x4a06,
   java_remote_parent_status_valid = 1,
+  java_remote_parent_status_missing = 2,
   java_remote_parent_version_offset = 4,
   java_remote_parent_size_offset = 6,
   java_remote_parent_status_offset = 8,
@@ -50,7 +52,7 @@ enum {
   java_remote_parent_reserved_suffix_offset = 56,
   java_remote_parent_reserved_suffix_size = 8,
   java_remote_parent_fault_version = 2,
-  java_remote_parent_fault_mode_max_size = 64,
+  java_remote_parent_fault_mode_max_size = 96,
   java_remote_parent_fault_control_single_link_count = 1,
   java_remote_parent_fault_control_private_mode = 0600,
   /* The runner reserves a bounded 55-second proof window before release. */
@@ -90,6 +92,12 @@ static _Atomic int java_remote_parent_live_fd_barrier_observed_release_for_test;
 static _Atomic unsigned int
     java_remote_parent_wrong_live_socket_probe_count_for_test;
 static _Atomic int java_remote_parent_wrong_live_socket_probe_errno_for_test;
+static _Atomic unsigned int
+    java_remote_parent_same_fd_task_probe_count_for_test;
+static _Atomic int java_remote_parent_same_fd_task_probe_outcome_for_test;
+static _Atomic unsigned int
+    java_remote_parent_same_fd_thread_probe_count_for_test;
+static _Atomic int java_remote_parent_same_fd_thread_probe_outcome_for_test;
 
 void obi_demo_java_remote_parent_set_live_fd_barrier_timeout_for_test(
     int timeout_millis) {
@@ -142,6 +150,44 @@ obi_demo_java_remote_parent_wrong_live_socket_probe_count_for_test(void) {
 int obi_demo_java_remote_parent_wrong_live_socket_probe_errno_for_test(void) {
   return atomic_load_explicit(
       &java_remote_parent_wrong_live_socket_probe_errno_for_test,
+      memory_order_relaxed);
+}
+
+void obi_demo_java_remote_parent_reset_same_fd_probes_for_test(void) {
+  atomic_store_explicit(&java_remote_parent_same_fd_task_probe_count_for_test,
+                        0, memory_order_relaxed);
+  atomic_store_explicit(&java_remote_parent_same_fd_task_probe_outcome_for_test,
+                        0, memory_order_relaxed);
+  atomic_store_explicit(&java_remote_parent_same_fd_thread_probe_count_for_test,
+                        0, memory_order_relaxed);
+  atomic_store_explicit(
+      &java_remote_parent_same_fd_thread_probe_outcome_for_test, 0,
+      memory_order_relaxed);
+}
+
+unsigned int
+obi_demo_java_remote_parent_same_fd_task_probe_count_for_test(void) {
+  return atomic_load_explicit(
+      &java_remote_parent_same_fd_task_probe_count_for_test,
+      memory_order_relaxed);
+}
+
+int obi_demo_java_remote_parent_same_fd_task_probe_outcome_for_test(void) {
+  return atomic_load_explicit(
+      &java_remote_parent_same_fd_task_probe_outcome_for_test,
+      memory_order_relaxed);
+}
+
+unsigned int
+obi_demo_java_remote_parent_same_fd_thread_probe_count_for_test(void) {
+  return atomic_load_explicit(
+      &java_remote_parent_same_fd_thread_probe_count_for_test,
+      memory_order_relaxed);
+}
+
+int obi_demo_java_remote_parent_same_fd_thread_probe_outcome_for_test(void) {
+  return atomic_load_explicit(
+      &java_remote_parent_same_fd_thread_probe_outcome_for_test,
       memory_order_relaxed);
 }
 #endif
@@ -338,6 +384,165 @@ static bool java_remote_parent_is_exact_take_request(int socket, int level,
          optlen != NULL && *optlen == java_remote_parent_response_size;
 }
 
+enum java_remote_parent_probe_outcome {
+  java_remote_parent_probe_not_run,
+  java_remote_parent_probe_native_unsupported,
+  java_remote_parent_probe_missing,
+  java_remote_parent_probe_unsafe,
+};
+
+static enum java_remote_parent_probe_outcome
+java_remote_parent_classify_same_fd_probe(int result, int probe_errno,
+                                          const unsigned char *response,
+                                          socklen_t response_length) {
+  if (result == -1 &&
+      (probe_errno == ENOPROTOOPT || probe_errno == EOPNOTSUPP)) {
+    return java_remote_parent_probe_native_unsupported;
+  }
+  if (result == 0 && response_length == java_remote_parent_response_size &&
+      memcmp(response, java_remote_parent_magic,
+             sizeof(java_remote_parent_magic) - 1) == 0 &&
+      response[java_remote_parent_version_offset] ==
+          java_remote_parent_abi_version &&
+      response[java_remote_parent_version_offset + 1] == 0 &&
+      response[java_remote_parent_size_offset] ==
+          java_remote_parent_response_size &&
+      response[java_remote_parent_size_offset + 1] == 0 &&
+      response[java_remote_parent_status_offset] ==
+          java_remote_parent_status_missing &&
+      response[java_remote_parent_status_offset + 1] == 0 &&
+      java_remote_parent_bytes_are_zero(
+          response + java_remote_parent_reserved_prefix_offset,
+          java_remote_parent_reserved_prefix_size) &&
+      java_remote_parent_bytes_are_zero(response +
+                                            java_remote_parent_trace_id_offset,
+                                        java_remote_parent_trace_id_size) &&
+      java_remote_parent_bytes_are_zero(response +
+                                            java_remote_parent_span_id_offset,
+                                        java_remote_parent_span_id_size) &&
+      java_remote_parent_bytes_are_zero(
+          response + java_remote_parent_generation_offset,
+          java_remote_parent_generation_size) &&
+      java_remote_parent_bytes_are_zero(
+          response + java_remote_parent_observed_monotime_offset,
+          java_remote_parent_observed_monotime_size) &&
+      java_remote_parent_bytes_are_zero(
+          response + java_remote_parent_reserved_suffix_offset,
+          java_remote_parent_reserved_suffix_size)) {
+    return java_remote_parent_probe_missing;
+  }
+  return java_remote_parent_probe_unsafe;
+}
+
+#if defined(OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TESTING)
+int obi_demo_java_remote_parent_classify_same_fd_probe_for_test(
+    int result, int probe_errno, const unsigned char *response,
+    socklen_t response_length) {
+  return (int)java_remote_parent_classify_same_fd_probe(
+      result, probe_errno, response, response_length);
+}
+#endif
+
+static bool java_remote_parent_same_fd_probe_is_acceptable(
+    enum java_remote_parent_probe_outcome outcome) {
+#if defined(OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TESTING)
+  return outcome == java_remote_parent_probe_missing ||
+         outcome == java_remote_parent_probe_native_unsupported;
+#else
+  return outcome == java_remote_parent_probe_missing;
+#endif
+}
+
+static const char *java_remote_parent_probe_outcome_name(
+    enum java_remote_parent_probe_outcome outcome) {
+  switch (outcome) {
+  case java_remote_parent_probe_native_unsupported:
+    return "native-unsupported";
+  case java_remote_parent_probe_missing:
+    return "missing";
+  case java_remote_parent_probe_unsafe:
+    return "unsafe";
+  case java_remote_parent_probe_not_run:
+    return "not-run";
+  }
+  return "unsafe";
+}
+
+static enum java_remote_parent_probe_outcome
+java_remote_parent_probe_same_fd_option(int socket, int option) {
+  unsigned char response[java_remote_parent_response_size] = {0};
+  socklen_t response_length = sizeof(response);
+  errno = 0;
+  const int result = real_getsockopt(socket, java_remote_parent_socket_level,
+                                     option, response, &response_length);
+  const int probe_errno = errno;
+  return java_remote_parent_classify_same_fd_probe(result, probe_errno,
+                                                   response, response_length);
+}
+
+struct java_remote_parent_same_fd_thread_probe {
+  int socket;
+  enum java_remote_parent_probe_outcome outcome;
+};
+
+static void *java_remote_parent_probe_same_fd_from_thread(void *argument) {
+  struct java_remote_parent_same_fd_thread_probe *const probe = argument;
+  probe->outcome = java_remote_parent_probe_same_fd_option(
+      probe->socket, java_remote_parent_socket_take);
+  return NULL;
+}
+
+/* Challenge the held accepted socket without consuming the victim. The task
+ * option runs on the request thread but asks for a logical-execution mapping
+ * that was never published. The direct option runs on a distinct native
+ * thread, so its current TID cannot name the accepted request owner. */
+static bool java_remote_parent_probe_same_fd_executions(int socket) {
+  const enum java_remote_parent_probe_outcome task_outcome =
+      java_remote_parent_probe_same_fd_option(
+          socket, java_remote_parent_socket_task_take);
+#if defined(OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TESTING)
+  atomic_fetch_add_explicit(
+      &java_remote_parent_same_fd_task_probe_count_for_test, 1,
+      memory_order_relaxed);
+  atomic_store_explicit(&java_remote_parent_same_fd_task_probe_outcome_for_test,
+                        task_outcome, memory_order_relaxed);
+#endif
+  if (!java_remote_parent_same_fd_probe_is_acceptable(task_outcome)) {
+    errno = EPROTO;
+    return false;
+  }
+
+  struct java_remote_parent_same_fd_thread_probe probe = {
+      .socket = socket,
+      .outcome = java_remote_parent_probe_not_run,
+  };
+  pthread_t thread;
+  const int create_result = pthread_create(
+      &thread, NULL, java_remote_parent_probe_same_fd_from_thread, &probe);
+  if (create_result != 0) {
+    errno = create_result;
+    return false;
+  }
+  const int join_result = pthread_join(thread, NULL);
+  if (join_result != 0) {
+    errno = join_result;
+    return false;
+  }
+#if defined(OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TESTING)
+  atomic_fetch_add_explicit(
+      &java_remote_parent_same_fd_thread_probe_count_for_test, 1,
+      memory_order_relaxed);
+  atomic_store_explicit(
+      &java_remote_parent_same_fd_thread_probe_outcome_for_test, probe.outcome,
+      memory_order_relaxed);
+#endif
+  if (!java_remote_parent_same_fd_probe_is_acceptable(probe.outcome)) {
+    errno = EPROTO;
+    return false;
+  }
+  return true;
+}
+
 static bool java_remote_parent_close_wrong_live_socket_pair(int client,
                                                             int server) {
   int close_error = 0;
@@ -466,11 +671,31 @@ java_remote_parent_wait_for_live_fd_barrier(int socket, int level, int option,
     java_remote_parent_close_preserving_errno(descriptor);
     return -1;
   }
+  if (!java_remote_parent_probe_same_fd_executions(socket)) {
+    java_remote_parent_close_preserving_errno(descriptor);
+    return -1;
+  }
 
+  const enum java_remote_parent_probe_outcome task_outcome =
+#if defined(OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TESTING)
+      (enum java_remote_parent_probe_outcome)atomic_load_explicit(
+          &java_remote_parent_same_fd_task_probe_outcome_for_test,
+          memory_order_relaxed);
+  const enum java_remote_parent_probe_outcome thread_outcome =
+      (enum java_remote_parent_probe_outcome)atomic_load_explicit(
+          &java_remote_parent_same_fd_thread_probe_outcome_for_test,
+          memory_order_relaxed);
+#else
+      java_remote_parent_probe_missing;
+  const enum java_remote_parent_probe_outcome thread_outcome =
+      java_remote_parent_probe_missing;
+#endif
   char ready[java_remote_parent_fault_mode_max_size];
   const int ready_length =
-      snprintf(ready, sizeof(ready), "%s%d\n",
-               java_remote_parent_live_fd_ready_prefix, socket);
+      snprintf(ready, sizeof(ready), "%s%d:task=%s:thread=%s\n",
+               java_remote_parent_live_fd_ready_prefix, socket,
+               java_remote_parent_probe_outcome_name(task_outcome),
+               java_remote_parent_probe_outcome_name(thread_outcome));
   struct timespec deadline;
   if (ready_length <= 0 || (size_t)ready_length >= sizeof(ready)) {
     (void)close(descriptor);

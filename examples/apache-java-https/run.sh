@@ -8094,7 +8094,7 @@ read_primary_live_fd_barrier() {
     case "$size" in
       ""|*[!0-9]*) exit 65 ;;
     esac
-    [ "$size" -lt 64 ] || exit 65
+    [ "$size" -lt 96 ] || exit 65
     if IFS= read -r value <"$control_file"; then
       printf "%s\\n" "$value"
     fi
@@ -8117,7 +8117,11 @@ wait_for_primary_live_fd_barrier_ready() {
       ""|live-fd-barrier)
         ;;
       ready:*)
-        descriptor="$(primary_live_fd_descriptor "${value#ready:}")" || {
+        [[ "$value" =~ ^ready:([0-9]+):task=missing:thread=missing$ ]] || {
+          log_error "primary live-descriptor barrier did not prove both same-FD execution misses"
+          return 1
+        }
+        descriptor="$(primary_live_fd_descriptor "${BASH_REMATCH[1]}")" || {
           log_error "primary live-descriptor barrier returned an invalid descriptor"
           return 1
         }
@@ -8278,7 +8282,7 @@ release_primary_live_fd_barrier() {
     [ "$(stat -c "%u:%g:%a:%F" "$directory")" = "0:0:700:directory" ]
     [ -f "$control_file" ] && [ ! -L "$control_file" ]
     [ "$(stat -c "%u:%g:%a:%h:%F" "$control_file")" = "0:0:600:1:regular file" ]
-    [ "$(cat "$control_file")" = "ready:$descriptor" ]
+    [ "$(cat "$control_file")" = "ready:$descriptor:task=missing:thread=missing" ]
     before="$(stat -c "%d:%i:%u:%g:%a:%h" "$control_file")"
     printf "release:%s\\n" "$descriptor" >"$control_file"
     after="$(stat -c "%d:%i:%u:%g:%a:%h" "$control_file")"
@@ -8821,13 +8825,17 @@ run_primary_live_fd_security_control() (
     "$probe_delta" || return $?
   assert_primary_security_metric_delta "$probe_delta" negotiate 1 1 || return $?
   # The same-JVM decoy and the root PID 1-cgroup duplicated descriptor are
-  # both denied before the held victim is released.
+  # unauthorized. The held accepted socket also rejects one task-source lookup
+  # on the request thread and one direct lookup from a different native thread
+  # as missing, before the legitimate request-thread take is released.
   assert_primary_security_metric_delta "$probe_delta" take 2 2 || return $?
+  assert_security_metric_delta \
+    "$probe_delta" take missing getsockopt 2 2 || return $?
   (
     ALLOW_PRIMARY_SECURITY_METRICS=true
     # The victim has reached its Java getsockopt barrier, so its one inbound
     # context is staged before release. Only retrieval must remain denied.
-    assert_bridge_metric_delta "$probe_delta" getsockopt 0 0 0 1 1 false 0
+    assert_bridge_metric_delta "$probe_delta" getsockopt 0 0 2 1 1 false 0
   ) || {
     log_error "primary live-descriptor security probe produced a valid bridge retrieval"
     return 1
@@ -8874,9 +8882,11 @@ run_primary_live_fd_security_control() (
     "$full_delta" || return $?
   assert_primary_security_metric_delta "$full_delta" negotiate 1 1 || return $?
   assert_primary_security_metric_delta "$full_delta" take 2 2 || return $?
+  assert_security_metric_delta \
+    "$full_delta" take missing getsockopt 2 2 || return $?
   (
     ALLOW_PRIMARY_SECURITY_METRICS=true
-    assert_bridge_metric_delta "$full_delta" getsockopt 1 0 0 1 1 false 0
+    assert_bridge_metric_delta "$full_delta" getsockopt 1 0 2 1 1 false 0
   ) || {
     log_error "primary live-descriptor security metrics did not preserve one legitimate retrieval"
     return 1
@@ -8889,7 +8899,7 @@ run_primary_live_fd_security_control() (
   PRIMARY_FAULT_STACK_ACTIVE=false
   restore_required=false
   run_primary_live_fd_security_recovery_scenario "$original_variant" || return $?
-  printf '{"status":"passed","scenario":"primary-live-fd-security","probe":"%s","probe_status":"unverified","probe_verification":"metrics_verified","wrong_live_socket":"metrics_verified","duplicated_fd_wrong_process":"metrics_verified","attacker_identity":"root","attacker_cgroup":"pid1-verified-preexec","legitimate_victim":"passed","post_abuse_recovery":"passed","before_phase":"phases/%s","probe_phase":"phases/%s","after_phase":"phases/%s"}\n' \
+  printf '{"status":"passed","scenario":"primary-live-fd-security","probe":"%s","probe_status":"unverified","probe_verification":"metrics_verified","wrong_live_socket":"metrics_verified","duplicated_fd_wrong_process":"metrics_verified","wrong_current_tid_same_fd":"metrics_verified","wrong_logical_execution_same_fd":"metrics_verified","attacker_identity":"root","attacker_cgroup":"pid1-verified-preexec","legitimate_victim":"passed","post_abuse_recovery":"passed","before_phase":"phases/%s","probe_phase":"phases/%s","after_phase":"phases/%s"}\n' \
     "$(basename -- "$probe_output")" \
     "$before_phase" \
     "$probe_phase" \

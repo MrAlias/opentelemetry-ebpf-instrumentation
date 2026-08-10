@@ -25,4 +25,14 @@ void obi_demo_java_remote_parent_reset_wrong_live_socket_probe_for_test(void);
 unsigned int
 obi_demo_java_remote_parent_wrong_live_socket_probe_count_for_test(void);
 int obi_demo_java_remote_parent_wrong_live_socket_probe_errno_for_test(void);
+void obi_demo_java_remote_parent_reset_same_fd_probes_for_test(void);
+unsigned int
+obi_demo_java_remote_parent_same_fd_task_probe_count_for_test(void);
+int obi_demo_java_remote_parent_same_fd_task_probe_outcome_for_test(void);
+unsigned int
+obi_demo_java_remote_parent_same_fd_thread_probe_count_for_test(void);
+int obi_demo_java_remote_parent_same_fd_thread_probe_outcome_for_test(void);
+int obi_demo_java_remote_parent_classify_same_fd_probe_for_test(
+    int result, int probe_errno, const unsigned char *response,
+    socklen_t response_length);
 #endif

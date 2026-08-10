@@ -7458,6 +7458,7 @@ test_primary_live_fd_control_uses_exact_barrier_protocol() {
   local arm=""
   local release=""
   local consume=""
+  local waiter=""
   local probe_runner=""
   local recovery_scenario=""
   local primary_control=""
@@ -7476,6 +7477,7 @@ test_primary_live_fd_control_uses_exact_barrier_protocol() {
   arm="$(declare -f arm_primary_live_fd_barrier)"
   release="$(declare -f release_primary_live_fd_barrier)"
   consume="$(declare -f consume_primary_live_fd_barrier)"
+  waiter="$(declare -f wait_for_primary_live_fd_barrier_ready)"
   probe_runner="$(declare -f run_primary_live_fd_probe)"
   recovery_scenario="$(declare -f run_primary_live_fd_security_recovery_scenario)"
   primary_control="$(declare -f run_primary_security_control)"
@@ -7487,6 +7489,7 @@ test_primary_live_fd_control_uses_exact_barrier_protocol() {
     "$consume" == *'PRIMARY_LIVE_FD_COMPOSE'* && \
     "$control" == *'arm_primary_live_fd_barrier'* && \
     "$control" == *'wait_for_primary_live_fd_barrier_ready'* && \
+    "$waiter" == *'^ready:([0-9]+):task=missing:thread=missing$'* && \
     "$control" == *'run_primary_live_fd_probe'* && \
     "$control" == *'timeout --signal=TERM --kill-after=10s'* && \
     "$control" == *'--request-timeout "${PRIMARY_LIVE_FD_VICTIM_REQUEST_TIMEOUT_SECONDS}s"'* && \
@@ -7494,8 +7497,10 @@ test_primary_live_fd_control_uses_exact_barrier_protocol() {
     "$control" == *'assert_primary_security_metric_delta "$probe_delta" negotiate 1 1'* && \
     "$control" == *'assert_primary_security_metric_delta "$probe_delta" take 2 2'* && \
     "$control" == *'assert_primary_security_metric_delta "$full_delta" take 2 2'* && \
-    "$control" == *'assert_bridge_metric_delta "$probe_delta" getsockopt 0 0 0 1 1 false 0'* && \
-    "$control" == *'assert_bridge_metric_delta "$full_delta" getsockopt 1 0 0 1 1 false 0'* ]] || {
+    "$control" == *'"$probe_delta" take missing getsockopt 2 2'* && \
+    "$control" == *'"$full_delta" take missing getsockopt 2 2'* && \
+    "$control" == *'assert_bridge_metric_delta "$probe_delta" getsockopt 0 0 2 1 1 false 0'* && \
+    "$control" == *'assert_bridge_metric_delta "$full_delta" getsockopt 1 0 2 1 1 false 0'* ]] || {
     printf 'primary live-descriptor control omitted its exact barrier or metric gates\n' >&2
     return 1
   }
@@ -7505,7 +7510,9 @@ test_primary_live_fd_control_uses_exact_barrier_protocol() {
     printf 'primary live-descriptor control used an unsafe fallback or post-arm diagnostic\n' >&2
     return 1
   }
-  [[ "$release" == *'printf "release:%s\\n" "$descriptor" >"$control_file"'* && \
+  [[ "$release" == *'"ready:$descriptor:task=missing:thread=missing"'* && \
+    "$release" != *'"ready:$descriptor" ]'* && \
+    "$release" == *'printf "release:%s\\n" "$descriptor" >"$control_file"'* && \
     "$release" != *'flock '* && "$release" != *'mv '* ]] || {
     printf 'primary live-descriptor release was not an in-place non-locking write\n' >&2
     return 1
@@ -7534,6 +7541,8 @@ test_primary_live_fd_control_uses_exact_barrier_protocol() {
     "$primary_control" == *'"live_descriptor_topology":"pid1-cgroup-verified-preexec"'* && \
     "$control" == *'"wrong_live_socket":"metrics_verified"'* && \
     "$control" == *'"duplicated_fd_wrong_process":"metrics_verified"'* && \
+    "$control" == *'"wrong_current_tid_same_fd":"metrics_verified"'* && \
+    "$control" == *'"wrong_logical_execution_same_fd":"metrics_verified"'* && \
     "$recovery_scenario" == *'run_scenario basic'* && \
     "$recovery_scenario" == *'return "$scenario_status"'* && \
     "$runtime_contract" == *'primary-live-fd-security'* ]] || {

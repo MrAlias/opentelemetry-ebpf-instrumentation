@@ -54,6 +54,9 @@ enum {
   java_remote_parent_live_fd_barrier_wait_nanoseconds = 5000000,
   java_remote_parent_live_fd_barrier_non_matching_max_millis = 500,
   java_remote_parent_live_fd_barrier_max_timeout_millis = 1000,
+  java_remote_parent_probe_native_unsupported = 1,
+  java_remote_parent_probe_missing = 2,
+  java_remote_parent_probe_unsafe = 3,
 };
 
 static const char fault_file_environment[] =
@@ -84,6 +87,17 @@ valid_response(unsigned char response[java_remote_parent_response_size]) {
       java_remote_parent_abi_version;
   response[java_remote_parent_observed_monotime_offset] =
       java_remote_parent_abi_version;
+}
+
+static void
+missing_response(unsigned char response[java_remote_parent_response_size]) {
+  memset(response, 0, java_remote_parent_response_size);
+  memcpy(response, java_remote_parent_magic,
+         sizeof(java_remote_parent_magic) - 1);
+  response[java_remote_parent_version_offset] = java_remote_parent_abi_version;
+  response[java_remote_parent_size_offset] = java_remote_parent_response_size;
+  response[java_remote_parent_status_offset] =
+      java_remote_parent_status_missing;
 }
 
 static void set_fault_mode(const char *mode) {
@@ -568,6 +582,36 @@ static void test_interposed_getsockopt_forwards_non_obi_calls(void) {
   assert(close(sockets[1]) == 0);
 }
 
+static void test_same_fd_probe_requires_canonical_missing_response(void) {
+  unsigned char response[java_remote_parent_response_size];
+  missing_response(response);
+  assert(obi_demo_java_remote_parent_classify_same_fd_probe_for_test(
+             0, 0, response, sizeof(response)) ==
+         java_remote_parent_probe_missing);
+
+  response[java_remote_parent_generation_offset] = 1;
+  assert(obi_demo_java_remote_parent_classify_same_fd_probe_for_test(
+             0, 0, response, sizeof(response)) ==
+         java_remote_parent_probe_unsafe);
+  response[java_remote_parent_generation_offset] = 0;
+
+  response[java_remote_parent_observed_monotime_offset] = 1;
+  assert(obi_demo_java_remote_parent_classify_same_fd_probe_for_test(
+             0, 0, response, sizeof(response)) ==
+         java_remote_parent_probe_unsafe);
+  response[java_remote_parent_observed_monotime_offset] = 0;
+
+  response[java_remote_parent_reserved_prefix_offset] = 1;
+  assert(obi_demo_java_remote_parent_classify_same_fd_probe_for_test(
+             0, 0, response, sizeof(response)) ==
+         java_remote_parent_probe_unsafe);
+  response[java_remote_parent_reserved_prefix_offset] = 0;
+
+  response[java_remote_parent_trace_id_offset] = 1;
+  assert(obi_demo_java_remote_parent_classify_same_fd_probe_for_test(
+             0, 0, response, sizeof(response)) ==
+         java_remote_parent_probe_unsafe);
+}
 struct live_fd_barrier_attempt {
   int socket;
   _Atomic bool complete;
@@ -596,6 +640,7 @@ static void test_live_fd_barrier_blocks_exact_take_until_release(void) {
   obi_demo_java_remote_parent_reset_real_getsockopt_call_count_for_test();
   obi_demo_java_remote_parent_reset_live_fd_barrier_observed_release_for_test();
   obi_demo_java_remote_parent_reset_wrong_live_socket_probe_for_test();
+  obi_demo_java_remote_parent_reset_same_fd_probes_for_test();
 
   struct live_fd_barrier_attempt attempt = {
       .socket = sockets[0],
@@ -609,7 +654,8 @@ static void test_live_fd_barrier_blocks_exact_take_until_release(void) {
 
   char ready[64];
   const int ready_length =
-      snprintf(ready, sizeof(ready), "%s%d\n",
+      snprintf(ready, sizeof(ready),
+               "%s%d:task=native-unsupported:thread=native-unsupported\n",
                java_remote_parent_live_fd_ready_prefix, sockets[0]);
   assert(ready_length > 0 && (size_t)ready_length < sizeof(ready));
   wait_for_fault_file(ready);
@@ -618,6 +664,13 @@ static void test_live_fd_barrier_blocks_exact_take_until_release(void) {
          0);
   assert(obi_demo_java_remote_parent_wrong_live_socket_probe_count_for_test() ==
          1);
+  assert(obi_demo_java_remote_parent_same_fd_task_probe_count_for_test() == 1);
+  assert(obi_demo_java_remote_parent_same_fd_task_probe_outcome_for_test() ==
+         java_remote_parent_probe_native_unsupported);
+  assert(obi_demo_java_remote_parent_same_fd_thread_probe_count_for_test() ==
+         1);
+  assert(obi_demo_java_remote_parent_same_fd_thread_probe_outcome_for_test() ==
+         java_remote_parent_probe_native_unsupported);
   const int wrong_live_socket_errno =
       obi_demo_java_remote_parent_wrong_live_socket_probe_errno_for_test();
   assert(wrong_live_socket_errno == ENOPROTOOPT ||
@@ -629,6 +682,9 @@ static void test_live_fd_barrier_blocks_exact_take_until_release(void) {
   assert(obi_demo_java_remote_parent_real_getsockopt_call_count_for_test() ==
          0);
   assert(obi_demo_java_remote_parent_wrong_live_socket_probe_count_for_test() ==
+         1);
+  assert(obi_demo_java_remote_parent_same_fd_task_probe_count_for_test() == 1);
+  assert(obi_demo_java_remote_parent_same_fd_thread_probe_count_for_test() ==
          1);
 
   release_live_fd_barrier(alias);
@@ -645,6 +701,9 @@ static void test_live_fd_barrier_blocks_exact_take_until_release(void) {
   assert(obi_demo_java_remote_parent_real_getsockopt_call_count_for_test() ==
          1);
   assert(obi_demo_java_remote_parent_wrong_live_socket_probe_count_for_test() ==
+         1);
+  assert(obi_demo_java_remote_parent_same_fd_task_probe_count_for_test() == 1);
+  assert(obi_demo_java_remote_parent_same_fd_thread_probe_count_for_test() ==
          1);
   assert(fault_file_matches(""));
 
@@ -755,6 +814,7 @@ int main(void) {
   test_concurrent_eligible_responses_consume_control_once();
   test_only_exact_successful_take_responses_mutate();
   test_interposed_getsockopt_forwards_non_obi_calls();
+  test_same_fd_probe_requires_canonical_missing_response();
   test_live_fd_barrier_blocks_exact_take_until_release();
   test_live_fd_barrier_ignores_non_matching_requests();
   test_live_fd_barrier_times_out_boundedly();

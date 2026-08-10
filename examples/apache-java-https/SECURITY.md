@@ -59,7 +59,7 @@ silently to Unix.
 | malformed/zero trace or span ID | discarded; Java request remains healthy | pass | pass | [retained primary zero-ID controls and recovery](evidence/otel-getsockopt-tls13-e8db066a/README.md#retained-proof) and [Unix zero-ID fault graphs](evidence/otel-unix-tls12-bd1c9327/README.md#retained-proof) |
 | stale entry past TTL | miss; never a parent | pass | pass | [retained primary `1ns` TTL, W3C precedence, and recovery](evidence/otel-getsockopt-tls13-e8db066a/scenario-primary-w3c-stale.json) and [retained Unix `1ns` stale rejection, W3C precedence, and recovery](evidence/otel-unix-tls13-6c4a2505/unix-w3c-stale.json) |
 | explicit stale-generation mismatch | miss; never a parent; valid W3C still wins | untested | untested | restart and TTL-stale controls do not inject a mismatched generation |
-| live handoff-map pressure/eviction | order-independent eviction; exact hits, explicit roots, and actual upstream/retrieval reason counts reconciled by transport; zero wrong or unresolved parents; exact-key cleanup and steady-baseline recovery | pass | pass | [primary summary](evidence/otel-getsockopt-tls13-e8db066a/map-pressure-summary.json) and [Unix summary](evidence/otel-unix-tls12-bd1c9327/map-pressure-summary.json) |
+| live handoff-map capacity rejection | the non-evicting map rejects excess admission without evicting any admitted ticket; exact hits, explicit roots, and actual upstream/retrieval reason counts reconcile by transport; zero wrong or unresolved parents; exact-key cleanup and steady-baseline recovery | untested | untested | the retained summaries cover the superseded LRU-eviction design; a fresh HASH-capacity run is required |
 | OBI absent at JVM start, followed by late attach | Java root span and healthy response while absent; exact-parent recovery after attach | pass | pass | [primary](evidence/otel-getsockopt-tls13-e8db066a/scenario-fail-open-obi-absent.json) and [Unix](evidence/otel-unix-tls12-bd1c9327/scenario-fail-open-obi-absent.json) bounded startup-absence graphs plus their late-attach recovery scenarios |
 | OBI permanently absent for the JVM lifetime | ordinary Java-agent behavior remains healthy for the full process lifetime | untested | untested | retained late-attach sequences do not establish permanent process-lifetime absence |
 | OBI stop/restart during traffic | no wrong parent while absent; recovery only if claimed | pass | pass | [primary](evidence/otel-getsockopt-tls13-e8db066a/scenario-restart-fault.json) and [Unix](evidence/otel-unix-tls12-bd1c9327/scenario-restart-fault.json) restart traffic; this row does not claim a primary descriptor survived into a new OBI generation |
@@ -125,11 +125,12 @@ transport and remains untouched.
   whose derived deadline exceeds the ceiling are rejected before startup.
 - Keep a legitimate marked request pending while unauthorized consumers race,
   then require the legitimate exact parent assertion to pass.
-- Fill the discovered live handoff-claim LRU to its reported capacity plus one,
-  after retaining its exact map and JVM cleanup identity and arming cleanup.
-  Derive synthetic keys and fresh values from the one unambiguous live JVM
-  PID/namespace/incarnation, scan every synthetic key to prove at least one
-  order-independent eviction, and monitor exact-map occupancy above its
+- Fill the discovered live non-evicting handoff-claim `HASH` map until its first
+  bounded capacity rejection, after retaining its exact map and JVM cleanup
+  identity and arming cleanup. Derive synthetic keys and tagged `OPEN` values
+  from the one unambiguous live JVM PID/namespace/incarnation, scan every
+  successfully admitted synthetic key to prove that none was evicted, and
+  monitor exact-map occupancy above its
   pre-fill baseline once per second through the exact aggregate TCP-inject
   outcome total, retaining the terminal metric sample independently of later
   trace polling. Remove only those deterministic keys, verify every one is

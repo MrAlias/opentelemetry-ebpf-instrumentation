@@ -296,9 +296,9 @@ The default `all` suite runs, in order:
 - a canceled request followed by a successful retry; the canceled marker is
   retained and boundedly classified as exact, absent, or one fixed
   reason-coded root, while any wrong parent fails the run;
-- order-independent handoff-claim LRU eviction under sustained concurrent
-  pressure, with exact hits and explicit roots counted separately and
-  reconciled across trace, bridge, and Java diagnostics;
+- non-evicting handoff-claim capacity rejection under sustained concurrent
+  pressure, with every admitted synthetic ticket verified present and exact
+  hits and explicit roots reconciled across trace, bridge, and Java diagnostics;
 - servlet async and executor handoff across varied hop counts, cancellation,
   rejection, and timeout paths;
 - Java 21 virtual-thread migration, mixed execution, and cancellation paths;

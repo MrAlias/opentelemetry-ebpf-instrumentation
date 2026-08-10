@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"syscall"
 
 	"github.com/cilium/ebpf"
 )
@@ -18,13 +19,14 @@ import (
 const (
 	targetMapName      = "java_remote_parent_handoff_claims"
 	targetKernelName   = "java_remote_par"
-	targetKeySize      = 16
+	targetKeySize      = 24
 	targetValueSize    = 16
 	processMapName     = "java_process_incarnations"
 	processKernelName  = "java_process_in"
 	processKeySize     = 12
 	processValueSize   = 8
 	maxPressureEntries = 50_000
+	handoffOpenTag     = uint64(1) << 63
 )
 
 type config struct {
@@ -39,21 +41,22 @@ type config struct {
 }
 
 type result struct {
-	Status                string `json:"status"`
-	Mode                  string `json:"mode"`
-	MapID                 uint   `json:"map_id"`
-	MapName               string `json:"map_name"`
-	KernelName            string `json:"kernel_name"`
-	MapType               string `json:"map_type"`
-	MaxEntries            uint32 `json:"max_entries"`
-	ProcessMapID          uint   `json:"process_map_id"`
-	ProcessPID            uint32 `json:"process_pid"`
-	ProcessNamespace      uint32 `json:"process_namespace"`
-	TokenBase             uint64 `json:"token_base"`
-	Touched               uint32 `json:"touched"`
-	EvictedEntries        uint32 `json:"evicted_entries,omitempty"`
-	CleanupVerified       bool   `json:"cleanup_verified,omitempty"`
-	VerifiedAbsentEntries uint32 `json:"verified_absent_entries,omitempty"`
+	Status                  string `json:"status"`
+	Mode                    string `json:"mode"`
+	MapID                   uint   `json:"map_id"`
+	MapName                 string `json:"map_name"`
+	KernelName              string `json:"kernel_name"`
+	MapType                 string `json:"map_type"`
+	MaxEntries              uint32 `json:"max_entries"`
+	ProcessMapID            uint   `json:"process_map_id"`
+	ProcessPID              uint32 `json:"process_pid"`
+	ProcessNamespace        uint32 `json:"process_namespace"`
+	TokenBase               uint64 `json:"token_base"`
+	Touched                 uint32 `json:"touched"`
+	CapacityRejectedEntries uint32 `json:"capacity_rejected_entries,omitempty"`
+	VerifiedPresentEntries  uint32 `json:"verified_present_entries,omitempty"`
+	CleanupVerified         bool   `json:"cleanup_verified,omitempty"`
+	VerifiedAbsentEntries   uint32 `json:"verified_absent_entries,omitempty"`
 }
 
 type processIdentity struct {
@@ -245,7 +248,11 @@ func run(cfg config) (result, error) {
 				return result{}, monotimeErr
 			}
 			value := claimValue(observedMonotimeNS, identity.incarnation)
-			if err := target.Update(key, value, ebpf.UpdateAny); err != nil {
+			if err := target.Update(key, value, ebpf.UpdateNoExist); err != nil {
+				if isCapacityRejection(err) {
+					output.CapacityRejectedEntries++
+					break
+				}
 				cleanupFailedFill()
 				return result{}, fmt.Errorf("fill entry %d: %w", index, err)
 			}
@@ -259,13 +266,23 @@ func run(cfg config) (result, error) {
 				return result{}, fmt.Errorf("delete entry %d: %w", index, err)
 			}
 		}
+		if output.CapacityRejectedEntries != 0 {
+			break
+		}
 	}
 
 	if cfg.mode == "fill" {
-		output.EvictedEntries, err = countEvictedSyntheticEntries(
+		if output.CapacityRejectedEntries != 1 {
+			cleanupFailedFill()
+			return result{}, errors.New("non-evicting map accepted capacity plus one entries")
+		}
+		if filledEntries == 0 {
+			return result{}, errors.New("map reached capacity before admitting a synthetic ticket")
+		}
+		output.VerifiedPresentEntries, err = verifySyntheticEntriesPresent(
 			identity,
 			tokenBase,
-			entryCount,
+			filledEntries,
 			func(key []byte) error {
 				var value [targetValueSize]byte
 				return target.Lookup(key, &value)
@@ -293,27 +310,29 @@ func run(cfg config) (result, error) {
 	return output, nil
 }
 
-func countEvictedSyntheticEntries(
+func isCapacityRejection(err error) bool {
+	return errors.Is(err, syscall.E2BIG) || errors.Is(err, syscall.ENOSPC)
+}
+
+func verifySyntheticEntriesPresent(
 	identity processIdentity,
 	tokenBase uint64,
 	entryCount uint32,
 	lookup func([]byte) error,
 ) (uint32, error) {
-	evictedEntries := uint32(0)
+	presentEntries := uint32(0)
 	for index := uint32(0); index < entryCount; index++ {
 		err := lookup(syntheticKey(identity, tokenBase, index))
 		switch {
 		case err == nil:
+			presentEntries++
 		case errors.Is(err, ebpf.ErrKeyNotExist):
-			evictedEntries++
+			return 0, fmt.Errorf("synthetic entry %d was evicted", index)
 		default:
 			return 0, fmt.Errorf("lookup synthetic entry %d: %w", index, err)
 		}
 	}
-	if evictedEntries == 0 {
-		return 0, errors.New("no synthetic entries were evicted")
-	}
-	return evictedEntries, nil
+	return presentEntries, nil
 }
 
 func verifySyntheticEntriesAbsent(
@@ -585,7 +604,7 @@ func openTargetMap(requested ebpf.MapID) (*ebpf.Map, ebpf.MapID, error) {
 }
 
 func matchesTarget(info *ebpf.MapInfo) bool {
-	return info.Type == ebpf.LRUHash &&
+	return info.Type == ebpf.Hash &&
 		info.KeySize == targetKeySize &&
 		info.ValueSize == targetValueSize &&
 		info.Name == targetKernelName
@@ -619,6 +638,7 @@ func syntheticKey(identity processIdentity, tokenBase uint64, index uint32) []by
 	binary.LittleEndian.PutUint32(key[0:4], identity.pid)
 	binary.LittleEndian.PutUint32(key[4:8], identity.namespace)
 	binary.LittleEndian.PutUint64(key[8:16], syntheticToken(tokenBase, index))
+	binary.LittleEndian.PutUint64(key[16:24], identity.incarnation)
 	return key
 }
 
@@ -669,7 +689,7 @@ func validatePreparedProcessMapID(expected, actual ebpf.MapID) error {
 
 func claimValue(observedMonotimeNS, incarnation uint64) []byte {
 	value := make([]byte, targetValueSize)
-	binary.LittleEndian.PutUint64(value[0:8], observedMonotimeNS)
+	binary.LittleEndian.PutUint64(value[0:8], observedMonotimeNS|handoffOpenTag)
 	binary.LittleEndian.PutUint64(value[8:16], incarnation)
 	return value
 }

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"syscall"
 	"testing"
 
 	"github.com/cilium/ebpf"
@@ -28,6 +29,7 @@ func TestSyntheticKeysAreBoundedAndDeterministic(t *testing.T) {
 	assert.Equal(t, identity.namespace, binary.LittleEndian.Uint32(first[4:8]))
 	assert.EqualValues(t, 700, binary.LittleEndian.Uint64(first[8:16]))
 	assert.EqualValues(t, 701, binary.LittleEndian.Uint64(second[8:16]))
+	assert.Equal(t, identity.incarnation, binary.LittleEndian.Uint64(first[16:24]))
 }
 
 func TestTokenBaseIsNonzeroAndCannotOverflowEntryRange(t *testing.T) {
@@ -149,7 +151,7 @@ func TestResultJSONLocksModeSpecificEvidenceSchema(t *testing.T) {
 		MapID:            41,
 		MapName:          targetMapName,
 		KernelName:       targetKernelName,
-		MapType:          ebpf.LRUHash.String(),
+		MapType:          ebpf.Hash.String(),
 		MaxEntries:       10,
 		ProcessMapID:     42,
 		ProcessPID:       101,
@@ -164,18 +166,19 @@ func TestResultJSONLocksModeSpecificEvidenceSchema(t *testing.T) {
 		{
 			name: "prepare",
 			got:  func() result { output := base; output.Mode = "prepare"; return output }(),
-			want: `{"status":"passed","mode":"prepare","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"LRUHash","max_entries":10,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":18446744073709551605,"touched":0}`,
+			want: `{"status":"passed","mode":"prepare","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":18446744073709551605,"touched":0}`,
 		},
 		{
 			name: "fill",
 			got: func() result {
 				output := base
 				output.Mode = "fill"
-				output.Touched = 11
-				output.EvictedEntries = 2
+				output.Touched = 10
+				output.CapacityRejectedEntries = 1
+				output.VerifiedPresentEntries = 10
 				return output
 			}(),
-			want: `{"status":"passed","mode":"fill","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"LRUHash","max_entries":10,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":18446744073709551605,"touched":11,"evicted_entries":2}`,
+			want: `{"status":"passed","mode":"fill","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":18446744073709551605,"touched":10,"capacity_rejected_entries":1,"verified_present_entries":10}`,
 		},
 		{
 			name: "cleanup",
@@ -188,7 +191,7 @@ func TestResultJSONLocksModeSpecificEvidenceSchema(t *testing.T) {
 				output.VerifiedAbsentEntries = 11
 				return output
 			}(),
-			want: `{"status":"passed","mode":"cleanup","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"LRUHash","max_entries":10,"process_map_id":0,"process_pid":101,"process_namespace":202,"token_base":18446744073709551605,"touched":9,"cleanup_verified":true,"verified_absent_entries":11}`,
+			want: `{"status":"passed","mode":"cleanup","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10,"process_map_id":0,"process_pid":101,"process_namespace":202,"token_base":18446744073709551605,"touched":9,"cleanup_verified":true,"verified_absent_entries":11}`,
 		},
 	}
 
@@ -205,7 +208,8 @@ func TestClaimValueUsesFreshTimeAndLiveIncarnation(t *testing.T) {
 	value := claimValue(12345, 67890)
 
 	require.Len(t, value, targetValueSize)
-	assert.EqualValues(t, 12345, binary.LittleEndian.Uint64(value[0:8]))
+	assert.EqualValues(t, 12345, binary.LittleEndian.Uint64(value[0:8])&^handoffOpenTag)
+	assert.NotZero(t, binary.LittleEndian.Uint64(value[0:8])&handoffOpenTag)
 	assert.EqualValues(t, 67890, binary.LittleEndian.Uint64(value[8:16]))
 }
 
@@ -230,7 +234,7 @@ func TestDecodeProcessIdentityRequiresLiveProcessKey(t *testing.T) {
 
 func TestValidateTargetRequiresExactHandoffClaimMapShape(t *testing.T) {
 	valid := &ebpf.MapInfo{
-		Type:       ebpf.LRUHash,
+		Type:       ebpf.Hash,
 		KeySize:    targetKeySize,
 		ValueSize:  targetValueSize,
 		MaxEntries: 64,
@@ -239,7 +243,7 @@ func TestValidateTargetRequiresExactHandoffClaimMapShape(t *testing.T) {
 	require.NoError(t, validateTarget(valid, 64))
 
 	wrongType := *valid
-	wrongType.Type = ebpf.Hash
+	wrongType.Type = ebpf.LRUHash
 	require.Error(t, validateTarget(&wrongType, 64))
 	require.Error(t, validateTarget(valid, 63))
 }
@@ -309,67 +313,54 @@ func TestSelectRelatedMapIDRejectsMissingProgramRelatedProcessMap(t *testing.T) 
 	require.EqualError(t, err, "no process map is related to target map ID 41")
 }
 
-func TestCountEvictedSyntheticEntriesAcceptsAnyMissingKey(t *testing.T) {
+func TestVerifySyntheticEntriesPresentRequiresEveryKey(t *testing.T) {
 	identity := processIdentity{pid: 101, namespace: 202}
 	tokenBase := uint64(700)
 
-	evicted, err := countEvictedSyntheticEntries(
+	present, err := verifySyntheticEntriesPresent(
 		identity,
 		tokenBase,
-		5,
+		3,
+		func([]byte) error { return nil },
+	)
+
+	require.NoError(t, err)
+	assert.EqualValues(t, 3, present)
+
+	_, err = verifySyntheticEntriesPresent(
+		identity,
+		tokenBase,
+		3,
 		func(key []byte) error {
-			token := binary.LittleEndian.Uint64(key[8:16])
-			if token == tokenBase+2 || token == tokenBase+3 {
-				return ebpf.ErrKeyNotExist
+			if binary.LittleEndian.Uint64(key[8:16]) == tokenBase+1 {
+				return fmt.Errorf("lookup: %w", ebpf.ErrKeyNotExist)
 			}
 			return nil
 		},
 	)
-
-	require.NoError(t, err)
-	assert.EqualValues(t, 2, evicted)
+	require.EqualError(t, err, "synthetic entry 1 was evicted")
 }
 
-func TestCountEvictedSyntheticEntriesAcceptsWrappedMissingKey(t *testing.T) {
-	evicted, err := countEvictedSyntheticEntries(
-		processIdentity{pid: 101, namespace: 202},
-		700,
-		1,
-		func([]byte) error { return fmt.Errorf("lookup: %w", ebpf.ErrKeyNotExist) },
-	)
-
-	require.NoError(t, err)
-	assert.EqualValues(t, 1, evicted)
-}
-
-func TestCountEvictedSyntheticEntriesRequiresAnEviction(t *testing.T) {
-	_, err := countEvictedSyntheticEntries(
-		processIdentity{pid: 101, namespace: 202},
-		700,
-		4,
-		func([]byte) error { return nil },
-	)
-
-	require.EqualError(t, err, "no synthetic entries were evicted")
-}
-
-func TestCountEvictedSyntheticEntriesRejectsLookupErrors(t *testing.T) {
+func TestVerifySyntheticEntriesPresentRejectsLookupErrors(t *testing.T) {
 	lookupErr := errors.New("lookup failed")
 	lookupCount := 0
-	_, err := countEvictedSyntheticEntries(
+	_, err := verifySyntheticEntriesPresent(
 		processIdentity{pid: 101, namespace: 202},
 		700,
 		4,
 		func([]byte) error {
 			lookupCount++
-			if lookupCount == 1 {
-				return ebpf.ErrKeyNotExist
-			}
 			return lookupErr
 		},
 	)
 
 	require.ErrorIs(t, err, lookupErr)
+}
+
+func TestCapacityRejectionRecognizesKernelHashMapErrors(t *testing.T) {
+	assert.True(t, isCapacityRejection(fmt.Errorf("update: %w", syscall.E2BIG)))
+	assert.True(t, isCapacityRejection(fmt.Errorf("update: %w", syscall.ENOSPC)))
+	assert.False(t, isCapacityRejection(ebpf.ErrKeyExist))
 }
 
 func TestVerifySyntheticEntriesAbsentRequiresEveryKeyMissing(t *testing.T) {

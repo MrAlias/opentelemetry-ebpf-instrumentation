@@ -3159,8 +3159,8 @@ obi_java_remote_parent_operations_total{operation="take",status="unauthorized",t
 obi_java_remote_parent_operations_total{operation="take",status="unauthorized",transport="unix"} 12
 obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} 99
 obi_java_remote_parent_operations_total{operation="report",status="valid",transport="tcp"} 7
-obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7
-obi_bpf_map_max_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 10000
+obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7
+obi_bpf_map_max_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 10000
 obi_avoided_services{otel_metric_overflow="false",service_name="java-backend",service_namespace="apache-java-https",telemetry_type="traces"} 1
 EOF
 
@@ -5323,7 +5323,7 @@ test_pressure_map_metric_requires_exact_unique_series() {
   local -r metrics="$TEST_TMP_DIR/pressure-map-metric.prom"
 
   printf '%s\n' \
-    'obi_bpf_map_entries_total_shadow{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 9' \
+    'obi_bpf_map_entries_total_shadow{map_id="41",map_name="java_remote_par",map_type="hash"} 9' \
     >"$metrics"
   if pressure_map_metric "$metrics" obi_bpf_map_entries_total 41 >/dev/null; then
     printf 'pressure-map resolver accepted a prefixed metric name\n' >&2
@@ -5331,12 +5331,12 @@ test_pressure_map_metric_requires_exact_unique_series() {
   fi
 
   printf '%s\n' \
-    'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7' \
+    'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' \
     >>"$metrics"
   [[ "$(pressure_map_metric "$metrics" obi_bpf_map_entries_total 41)" == "41 7" ]]
 
   printf '%s\n' \
-    'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 8' \
+    'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 8' \
     >>"$metrics"
   if pressure_map_metric "$metrics" obi_bpf_map_entries_total 41 >/dev/null; then
     printf 'pressure-map resolver accepted duplicate exact-map series\n' >&2
@@ -5590,7 +5590,7 @@ test_pressure_monitor_uses_prefill_baseline() {
     : >"$PRESSURE_MONITOR_OUTPUT"
     fetch_obi_metrics() {
       printf '%s\n' \
-        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7' >"$1"
+        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' >"$1"
     }
     if (monitor_map_pressure); then
       printf 'pressure monitor accepted occupancy at the pre-fill baseline\n' >&2
@@ -5612,7 +5612,7 @@ test_pressure_monitor_uses_prefill_baseline() {
     : >"$PRESSURE_MONITOR_OUTPUT"
     fetch_obi_metrics() {
       printf '%s\n' \
-        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 18446744073709551625' >"$1"
+        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 18446744073709551625' >"$1"
     }
     if (monitor_map_pressure); then
       printf 'pressure monitor accepted an overflowing occupancy value\n' >&2
@@ -5632,7 +5632,7 @@ test_pressure_monitor_uses_prefill_baseline() {
     : >"$PRESSURE_MONITOR_OUTPUT"
     fetch_obi_metrics() {
       printf '%s\n' \
-        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 9' \
+        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 9' \
         'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} 6' >"$1"
     }
     if monitor_map_pressure; then
@@ -5658,12 +5658,12 @@ test_pressure_monitor_uses_prefill_baseline() {
       fetch_calls="$((fetch_calls + 1))"
       if ((fetch_calls < 3)); then
         printf '%s\n' \
-          'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 9' \
+          'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 9' \
           'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} 4' \
           "obi_java_remote_parent_operations_total{operation=\"report\",status=\"valid\",transport=\"tcp\"} $fetch_calls" >"$1"
       else
         printf '%s\n' \
-          'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7' \
+          'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' \
           'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} 4' \
           'obi_java_remote_parent_operations_total{operation="report",status="valid",transport="tcp"} 3' >"$1"
       fi
@@ -5690,7 +5690,7 @@ test_pressure_monitor_uses_prefill_baseline() {
     SELECTED_TRANSPORT=getsockopt
     fetch_obi_metrics() {
       printf '%s\n' \
-        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 9' \
+        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 9' \
         'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} 4' \
         'obi_java_remote_parent_operations_total{operation="inject",status="ambiguous",transport="tcp"} 1' >"$1"
     }
@@ -5740,7 +5740,7 @@ test_pressure_monitor_uses_prefill_baseline() {
         fixture_inject_total=5
       fi
       printf '%s\n' \
-        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 9' \
+        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 9' \
         "obi_java_remote_parent_operations_total{operation=\"inject\",status=\"valid\",transport=\"tcp\"} $fixture_inject_total" >"$1"
     }
     start_map_pressure_monitor
@@ -5753,21 +5753,21 @@ test_pressure_monitor_uses_prefill_baseline() {
 pressure_prepare_result() {
   local -r token_base="$1"
 
-  printf '{"status":"passed","mode":"prepare","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"LRUHash","max_entries":10,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":%s,"touched":0}\n' \
+  printf '{"status":"passed","mode":"prepare","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":%s,"touched":0}\n' \
     "$token_base"
 }
 
 pressure_fill_result() {
   local -r token_base="$1"
 
-  printf '{"status":"passed","mode":"fill","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"LRUHash","max_entries":10,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":%s,"touched":11,"evicted_entries":2}\n' \
+  printf '{"status":"passed","mode":"fill","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":%s,"touched":10,"capacity_rejected_entries":1,"verified_present_entries":10}\n' \
     "$token_base"
 }
 
 pressure_cleanup_result() {
   local -r token_base="$1"
 
-  printf '{"status":"passed","mode":"cleanup","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"LRUHash","max_entries":10,"process_map_id":0,"process_pid":101,"process_namespace":202,"token_base":%s,"touched":9,"cleanup_verified":true,"verified_absent_entries":11}\n' \
+  printf '{"status":"passed","mode":"cleanup","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10,"process_map_id":0,"process_pid":101,"process_namespace":202,"token_base":%s,"touched":10,"cleanup_verified":true,"verified_absent_entries":11}\n' \
     "$token_base"
 }
 
@@ -5801,7 +5801,7 @@ test_pressure_state_uses_baseline_and_retains_steady_recovery() {
     }
     fetch_obi_metrics() {
       printf '%s\n' \
-        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 8' >"$1"
+        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 8' >"$1"
     }
     wait_for_pressure_map_state pressured "$RESULT_DIR/pressured.prom" 1 1 1
     grep -Fq '} 8' "$RESULT_DIR/pressured.prom"
@@ -5827,7 +5827,7 @@ test_pressure_state_uses_baseline_and_retains_steady_recovery() {
         3) entries=3 ;;
         *) entries=2 ;;
       esac
-      printf 'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash",sample="%d"} %s\n' \
+      printf 'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash",sample="%d"} %s\n' \
         "$fetch_count" "$entries" >"$1"
     }
     wait_for_pressure_map_state recovered "$RESULT_DIR/recovered.prom" 5 2 5
@@ -5906,7 +5906,7 @@ test_pressure_state_fails_closed_on_evidence_write_error() {
     PRESSURE_MAP_BASELINE_ENTRIES=2
     fetch_obi_metrics() {
       printf '%s\n' \
-        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 3' >"$1"
+        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 3' >"$1"
     }
     install() {
       return 1
@@ -5930,7 +5930,7 @@ test_map_pressure_prepare_fill_cleanup_transaction() {
     COMPOSE=(fake-compose)
     SCENARIO_SEED=1
     printf '%s\n' \
-      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7' \
+      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' \
       'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} 3' \
       >"$RESULT_DIR/before.prom"
     SELECTED_TRANSPORT=getsockopt
@@ -5958,8 +5958,9 @@ test_map_pressure_prepare_fill_cleanup_transaction() {
       "$PRESSURE_MAP_BASELINE_ENTRIES" == "7" && \
       "$PRESSURE_PROCESS_MAP_ID" == "42" && \
       "$PRESSURE_TOKEN_BASE" == "$token_base" && \
-      "$PRESSURE_TOUCHED_ENTRIES" == "11" && \
-      "$PRESSURE_EVICTED_ENTRIES" == "2" ]] || {
+      "$PRESSURE_TOUCHED_ENTRIES" == "10" && \
+      "$PRESSURE_CAPACITY_REJECTED_ENTRIES" == "1" && \
+      "$PRESSURE_VERIFIED_PRESENT_ENTRIES" == "10" ]] || {
       printf 'map-pressure start did not retain its prepared identity and fill evidence\n' >&2
       return 1
     }
@@ -6023,7 +6024,7 @@ test_map_pressure_pre_mutation_failures_do_not_fill() {
     COMPOSE=(fake-compose)
     SCENARIO_SEED=1
     printf '%s\n' \
-      'obi_bpf_map_entries_total{map_id="99",map_name="java_remote_par",map_type="lru_hash"} 7' \
+      'obi_bpf_map_entries_total{map_id="99",map_name="java_remote_par",map_type="hash"} 7' \
       >"$RESULT_DIR/before.prom"
     run_bounded() {
       printf '%s\n' "$*" >>"$command_log"
@@ -6055,7 +6056,7 @@ test_map_pressure_fill_failure_uses_prepared_cleanup_identity() {
     COMPOSE=(fake-compose)
     SCENARIO_SEED=1
     printf '%s\n' \
-      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7' \
+      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' \
       >"$RESULT_DIR/before.prom"
     run_bounded() {
       printf '%s\n' "$*" >>"$command_log"
@@ -6092,7 +6093,7 @@ test_map_pressure_fill_failure_uses_prepared_cleanup_identity() {
     COMPOSE=(fake-compose)
     SCENARIO_SEED=1
     printf '%s\n' \
-      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7' \
+      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' \
       >"$RESULT_DIR/before.prom"
     run_bounded() {
       printf '%s\n' "$*" >>"$command_log"
@@ -6126,7 +6127,7 @@ test_map_pressure_cleanup_retries_keep_immutable_artifacts() {
     COMPOSE=(fake-compose)
     SCENARIO_SEED=1
     printf '%s\n' \
-      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7' \
+      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' \
       >"$RESULT_DIR/before.prom"
     run_bounded() {
       case " $* " in
@@ -6204,7 +6205,7 @@ test_map_pressure_cleanup_retries_keep_immutable_artifacts() {
     COMPOSE=(fake-compose)
     SCENARIO_SEED=1
     printf '%s\n' \
-      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7' \
+      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' \
       >"$RESULT_DIR/before.prom"
     run_bounded() {
       case " $* " in
@@ -6257,7 +6258,7 @@ test_map_pressure_cleanup_retries_keep_immutable_artifacts() {
     COMPOSE=(fake-compose)
     SCENARIO_SEED=1
     printf '%s\n' \
-      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7' \
+      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' \
       >"$RESULT_DIR/before.prom"
     run_bounded() {
       case " $* " in
@@ -6308,7 +6309,7 @@ test_map_pressure_cleanup_retries_keep_immutable_artifacts() {
     COMPOSE=(fake-compose)
     SCENARIO_SEED=1
     printf '%s\n' \
-      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7' \
+      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' \
       >"$RESULT_DIR/before.prom"
     run_bounded() {
       case " $* " in
@@ -6440,7 +6441,7 @@ test_map_pressure_canonical_promotion_rolls_back_partial_files() {
     COMPOSE=(fake-compose)
     SCENARIO_SEED=1
     printf '%s\n' \
-      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7' \
+      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' \
       >"$RESULT_DIR/before.prom"
     run_bounded() {
       case " $* " in
@@ -6491,7 +6492,7 @@ test_map_pressure_canonical_promotion_rolls_back_partial_files() {
     COMPOSE=(fake-compose)
     SCENARIO_SEED=1
     printf '%s\n' \
-      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="lru_hash"} 7' \
+      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' \
       >"$RESULT_DIR/before.prom"
     run_bounded() {
       case " $* " in

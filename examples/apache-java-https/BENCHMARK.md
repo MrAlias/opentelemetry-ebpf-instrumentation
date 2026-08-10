@@ -80,7 +80,7 @@ multiple candidates associated with one log.
 Run on one otherwise idle host with fixed CPU/memory limits, request mix,
 warmup, duration, concurrency, JVM flags, and agent artifact.
 
-| Mode | Throughput | p50 | p95 | p99 | CPU | RSS/native | FD/thread | Map occupancy/eviction | Status |
+| Mode | Throughput | p50 | p95 | p99 | CPU | RSS/native | FD/thread | Map occupancy/capacity | Status |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | uninstrumented JVM, OBI stopped | — | — | — | — | — | — | — | — | untested |
 | official agent and extension, bridge disabled | — | — | — | — | — | — | — | — | untested |
@@ -94,7 +94,7 @@ warmup, duration, concurrency, JVM flags, and agent artifact.
 | Java 21 virtual-thread handoff | — | — | — | — | — | — | — | — | untested |
 | Netty event-loop to worker handoff | — | — | — | — | — | — | — | — | untested |
 | repeated servlet async redispatch | — | — | — | — | — | — | — | — | untested |
-| map pressure/eviction | — | — | — | — | — | — | — | — | untested |
+| map pressure/capacity rejection | — | — | — | — | — | — | — | — | untested |
 
 ## Procedure
 
@@ -292,10 +292,11 @@ seed for every mode:
 Repeat with `--transport unix`; use the full `all` suite for the disabled,
 uninstrumented, W3C/no-state, miss, timeout, async-handoff, redispatch,
 virtual-thread, Netty, and restart controls. The pressure helper discovers the
-live handoff-claim LRU and records the exact map and JVM cleanup identity before
-mutation. It then arms cleanup, fills the reported capacity plus one, scans all
-synthetic keys to prove order-independent eviction, and uses fresh monotonic
-claim values tied to the one unambiguous live JVM incarnation. During 128
+live non-evicting handoff-claim `HASH` map and records the exact map and JVM
+cleanup identity before mutation. It then arms cleanup, inserts tagged `OPEN`
+admission tickets until the first bounded capacity rejection, and scans every
+successful synthetic key to prove that none was evicted. Values use fresh
+monotonic observations tied to the one unambiguous live JVM incarnation. During 128
 concurrent marked handoff requests it checks once per second that exact-map
 occupancy remains above the pre-fill baseline without requiring exact capacity.
 The monitor retains an independent terminal sample and stops when the exact

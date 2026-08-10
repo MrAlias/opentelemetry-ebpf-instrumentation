@@ -245,7 +245,8 @@ PRESSURE_ACTIVE=false
 PRESSURE_MAP_ID=""
 PRESSURE_MAP_MAX_ENTRIES=""
 PRESSURE_MAP_BASELINE_ENTRIES=""
-PRESSURE_EVICTED_ENTRIES=""
+PRESSURE_CAPACITY_REJECTED_ENTRIES=""
+PRESSURE_VERIFIED_PRESENT_ENTRIES=""
 PRESSURE_TOUCHED_ENTRIES=""
 PRESSURE_CLEANUP_ATTEMPT=0
 PRESSURE_CLEANUP_DEADLINE=0
@@ -4670,13 +4671,13 @@ pressure_result_has_contract() {
   record="$(pressure_result_record "$input")" || return 1
   case "$mode" in
     prepare)
-      pattern='^\{"status":"passed","mode":"prepare","map_id":'"$decimal"',"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"LRUHash","max_entries":'"$decimal"',"process_map_id":'"$decimal"',"process_pid":'"$decimal"',"process_namespace":'"$decimal"',"token_base":'"$decimal"',"touched":0\}$'
+      pattern='^\{"status":"passed","mode":"prepare","map_id":'"$decimal"',"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":'"$decimal"',"process_map_id":'"$decimal"',"process_pid":'"$decimal"',"process_namespace":'"$decimal"',"token_base":'"$decimal"',"touched":0\}$'
       ;;
     fill)
-      pattern='^\{"status":"passed","mode":"fill","map_id":'"$decimal"',"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"LRUHash","max_entries":'"$decimal"',"process_map_id":'"$decimal"',"process_pid":'"$decimal"',"process_namespace":'"$decimal"',"token_base":'"$decimal"',"touched":'"$decimal"',"evicted_entries":'"$decimal"'\}$'
+      pattern='^\{"status":"passed","mode":"fill","map_id":'"$decimal"',"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":'"$decimal"',"process_map_id":'"$decimal"',"process_pid":'"$decimal"',"process_namespace":'"$decimal"',"token_base":'"$decimal"',"touched":'"$decimal"',"capacity_rejected_entries":'"$decimal"',"verified_present_entries":'"$decimal"'\}$'
       ;;
     cleanup)
-      pattern='^\{"status":"passed","mode":"cleanup","map_id":'"$decimal"',"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"LRUHash","max_entries":'"$decimal"',"process_map_id":0,"process_pid":'"$decimal"',"process_namespace":'"$decimal"',"token_base":'"$decimal"',"touched":'"$decimal"',"cleanup_verified":true,"verified_absent_entries":'"$decimal"'\}$'
+      pattern='^\{"status":"passed","mode":"cleanup","map_id":'"$decimal"',"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":'"$decimal"',"process_map_id":0,"process_pid":'"$decimal"',"process_namespace":'"$decimal"',"token_base":'"$decimal"',"touched":'"$decimal"',"cleanup_verified":true,"verified_absent_entries":'"$decimal"'\}$'
       ;;
     *)
       return 1
@@ -5389,11 +5390,11 @@ start_map_pressure() {
   local fill_process_namespace=""
   local fill_token_base=""
   local fill_touched=""
-  local fill_evicted=""
+  local fill_capacity_rejected=""
+  local fill_verified_present=""
   local prepare_status=0
   local fill_status=0
   local start_status=0
-  local -i synthetic_entry_count=0
 
   if [[ "$PRESSURE_ACTIVE" == "true" ]]; then
     log_error "refusing to start map pressure while a prior cleanup is pending"
@@ -5405,7 +5406,8 @@ start_map_pressure() {
   PRESSURE_MAP_ID=""
   PRESSURE_MAP_MAX_ENTRIES=""
   PRESSURE_MAP_BASELINE_ENTRIES=""
-  PRESSURE_EVICTED_ENTRIES=""
+  PRESSURE_CAPACITY_REJECTED_ENTRIES=""
+  PRESSURE_VERIFIED_PRESENT_ENTRIES=""
   PRESSURE_TOUCHED_ENTRIES=""
   PRESSURE_CLEANUP_ATTEMPT=0
   PRESSURE_CLEANUP_DEADLINE=0
@@ -5549,26 +5551,30 @@ start_map_pressure() {
   fill_token_base="$(pressure_result_bounded_uint \
     "$fill_output" token_base "$MAX_UINT64_DECIMAL" false)" || fill_token_base=""
   fill_touched="$(pressure_result_bounded_uint \
-    "$fill_output" touched "$((PRESSURE_MAX_ENTRIES + 1))" false)" || fill_touched=""
-  fill_evicted="$(pressure_result_bounded_uint \
-    "$fill_output" evicted_entries "$((PRESSURE_MAX_ENTRIES + 1))" false)" || \
-    fill_evicted=""
-  synthetic_entry_count="$((PRESSURE_MAP_MAX_ENTRIES + 1))"
+    "$fill_output" touched "$PRESSURE_MAP_MAX_ENTRIES" false)" || fill_touched=""
+  fill_capacity_rejected="$(pressure_result_bounded_uint \
+    "$fill_output" capacity_rejected_entries 1 false)" || \
+    fill_capacity_rejected=""
+  fill_verified_present="$(pressure_result_bounded_uint \
+    "$fill_output" verified_present_entries "$PRESSURE_MAX_ENTRIES" false)" || \
+    fill_verified_present=""
   if [[ "$fill_map_id" != "$PRESSURE_MAP_ID" || \
     "$fill_max_entries" != "$PRESSURE_MAP_MAX_ENTRIES" || \
     "$fill_process_map_id" != "$PRESSURE_PROCESS_MAP_ID" || \
     "$fill_process_pid" != "$PRESSURE_PROCESS_PID" || \
     "$fill_process_namespace" != "$PRESSURE_PROCESS_NAMESPACE" || \
     "$fill_token_base" != "$PRESSURE_TOKEN_BASE" || \
-    "$fill_touched" != "$synthetic_entry_count" || \
-    -z "$fill_evicted" ]] || ((fill_evicted >= fill_touched)); then
-    log_error "map-pressure fill did not echo its prepared identity or prove order-independent eviction"
+    "$fill_capacity_rejected" != "1" || \
+    "$fill_verified_present" != "$fill_touched" ]] || \
+    ((fill_touched == 0 || fill_touched > PRESSURE_MAP_MAX_ENTRIES)); then
+    log_error "map-pressure fill did not echo its prepared identity or prove non-evicting capacity rejection"
     cleanup_map_pressure_with_retries || true
     return 1
   fi
   PRESSURE_TOUCHED_ENTRIES="$fill_touched"
-  PRESSURE_EVICTED_ENTRIES="$fill_evicted"
-  log_info "map pressure armed map_id=$PRESSURE_MAP_ID baseline=$PRESSURE_MAP_BASELINE_ENTRIES max_entries=$PRESSURE_MAP_MAX_ENTRIES touched=$PRESSURE_TOUCHED_ENTRIES evicted=$PRESSURE_EVICTED_ENTRIES"
+  PRESSURE_CAPACITY_REJECTED_ENTRIES="$fill_capacity_rejected"
+  PRESSURE_VERIFIED_PRESENT_ENTRIES="$fill_verified_present"
+  log_info "map pressure armed map_id=$PRESSURE_MAP_ID baseline=$PRESSURE_MAP_BASELINE_ENTRIES max_entries=$PRESSURE_MAP_MAX_ENTRIES touched=$PRESSURE_TOUCHED_ENTRIES capacity_rejected=$PRESSURE_CAPACITY_REJECTED_ENTRIES verified_present=$PRESSURE_VERIFIED_PRESENT_ENTRIES"
 
   if wait_for_pressure_map_state \
     pressured \
@@ -5715,7 +5721,7 @@ cleanup_map_pressure() {
       "$cleanup_output" token_base "$MAX_UINT64_DECIMAL" false)" || \
       cleanup_token_base=""
     cleanup_touched="$(pressure_result_bounded_uint \
-      "$cleanup_output" touched "$((PRESSURE_MAX_ENTRIES + 1))" true)" || \
+      "$cleanup_output" touched "$PRESSURE_MAP_MAX_ENTRIES" true)" || \
       cleanup_touched=""
     cleanup_verified="$(pressure_result_bool \
       "$cleanup_output" cleanup_verified)" || cleanup_verified=""
@@ -5732,7 +5738,8 @@ cleanup_map_pressure() {
       -n "$cleanup_touched" && \
       "$cleanup_verified" == "true" && \
       "$verified_absent" == "$synthetic_entry_count" ]] && \
-      ((cleanup_touched <= synthetic_entry_count)); then
+      { [[ -z "$PRESSURE_TOUCHED_ENTRIES" ]] || \
+        ((cleanup_touched <= PRESSURE_TOUCHED_ENTRIES)); }; then
       validation_status=passed
     else
       validation_status=failed

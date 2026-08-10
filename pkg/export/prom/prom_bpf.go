@@ -353,8 +353,11 @@ func (bc *BPFCollector) getMapMetrics() []BpfMapMetrics {
 			continue
 		}
 
-		// Only collect maps that are LRUHash
-		if info.Type != ebpf.LRUHash {
+		// Continue reporting all historical LRU occupancy. The Java bridge's
+		// lifecycle maps deliberately use non-evicting Hash so capacity pressure
+		// fails closed; admit only their shared truncated kernel name rather than
+		// every Hash map on the host, which would create unbounded cardinality.
+		if !collectMapOccupancy(info.Type, info.Name) {
 			continue
 		}
 
@@ -378,6 +381,11 @@ func (bc *BPFCollector) getMapMetrics() []BpfMapMetrics {
 		}
 	}
 	return mapMetrics
+}
+
+func collectMapOccupancy(mapType ebpf.MapType, mapName string) bool {
+	return mapType == ebpf.LRUHash ||
+		(mapType == ebpf.Hash && mapName == "java_remote_par")
 }
 
 func (bp *BPFProgram) calculateStats() (float64, uint64) {

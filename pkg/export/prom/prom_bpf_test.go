@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
@@ -67,6 +68,15 @@ func TestBPFCollectorEnabled(t *testing.T) {
 
 		assert.False(t, bpfCollectorEnabled(cfg, mpCfg, internalMetrics))
 	})
+}
+
+func TestCollectMapOccupancyIncludesNonEvictingAndLRUHashes(t *testing.T) {
+	assert.True(t, collectMapOccupancy(ebpf.Hash, "java_remote_par"))
+	assert.True(t, collectMapOccupancy(ebpf.LRUHash, "unrelated"))
+	assert.False(t, collectMapOccupancy(ebpf.Hash, "unrelated"))
+	assert.False(t, collectMapOccupancy(ebpf.Array, "java_remote_par"))
+	assert.False(t, collectMapOccupancy(ebpf.LRUCPUHash, "java_remote_par"))
+	assert.False(t, collectMapOccupancy(ebpf.PerCPUHash, "java_remote_par"))
 }
 
 func TestBPFMetricsCollectsInternalMetricsForPrometheusReporter(t *testing.T) {

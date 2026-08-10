@@ -8726,7 +8726,7 @@ write_diagnostics_fixture() {
   local -r standard="$7"
   local -r fault_status="${8:-}"
   local -r fault_count="${9:-0}"
-  local snapshot="cfg_on=0,cfg_off=0,provider_ok=0,provider_reject=0,provider_ver=0,extension_reg=0,lookup_ready=0,lookup_missing=0,lookup_version=0,lookup_error=0,record_version=0,invoke_error=0,discard_standard=$standard,extract_fields=0,extract_invalid=0,extract_error=0,registration_ok=0,registration_fail=0,take_sampled=$sampled,take_unsampled=$unsampled,tls_reads=0,tls_bytes=0"
+  local snapshot="cfg_on=0,cfg_off=0,provider_ok=0,provider_reject=0,provider_ver=0,extension_reg=0,lookup_ready=0,lookup_missing=0,lookup_version=0,lookup_error=0,record_version=0,invoke_error=0,discard_standard=$standard,extract_fields=0,extract_invalid=0,extract_error=0,registration_ok=0,registration_fail=0,take_sampled=$sampled,take_unsampled=$unsampled,tls_reads=0,tls_bytes=0,framework_depth=0,framework_cycle=0,framework_late=0,transport_missing=0"
   local status=""
   local value=0
 
@@ -8745,11 +8745,23 @@ write_diagnostics_fixture() {
 
 test_java_diagnostics_schema_is_exact() {
   local -r snapshot="$TEST_TMP_DIR/java-diagnostics-schema.txt"
+  local required_field=""
   local invalid_value=""
 
   write_diagnostics_fixture "$snapshot" 0 0 0 0 0 0
   assert_sanitized_java_diagnostics "$snapshot"
 
+  for required_field in framework_depth framework_cycle framework_late transport_missing; do
+    write_diagnostics_fixture "$snapshot" 0 0 0 0 0 0
+    sed -i "s/$required_field=0/${required_field}_renamed=0/" "$snapshot"
+    if assert_sanitized_java_diagnostics "$snapshot" >/dev/null 2>&1; then
+      printf 'Java diagnostics accepted missing required field=%s\n' \
+        "$required_field" >&2
+      return 1
+    fi
+  done
+
+  write_diagnostics_fixture "$snapshot" 0 0 0 0 0 0
   sed -i 's/cfg_on=0/secret=0/' "$snapshot"
   if assert_sanitized_java_diagnostics "$snapshot" >/dev/null 2>&1; then
     printf 'Java diagnostics accepted an unknown fixed-shape field\n' >&2
@@ -8897,7 +8909,7 @@ test_java_diagnostics_delta_is_exact() {
 
   write_diagnostics_fixture "$before" 0 0 0 0 0 0
   write_diagnostics_fixture "$after" 0 0 0 0 0 0 already_consumed 1
-  sed -i 's/t_missing=0/t_missing=1/' "$after"
+  sed -i 's/,t_missing=0/,t_missing=1/' "$after"
   write_java_diagnostics_delta "$before" "$after" "$delta"
   assert_java_diagnostics_delta "$delta" 0 0 0 1 0 0 0 already_consumed 1 || {
     printf 'Java diagnostics rejected an attributable already-consumed fault\n' >&2
@@ -8986,7 +8998,7 @@ test_pressure_unix_already_consumed_diagnostics_are_exact() {
 
   write_diagnostics_fixture "$before" 0 0 0 0 0 0
   write_diagnostics_fixture "$after" 3i 0 0 3i 0 0 already_consumed 2
-  sed -i 's/t_missing=0/t_missing=1/' "$after"
+  sed -i 's/,t_missing=0/,t_missing=1/' "$after"
   write_java_diagnostics_delta "$before" "$after" "$delta"
 
   if assert_java_diagnostics_delta "$delta" 126 0 0 3 126 0 0 \
@@ -10578,7 +10590,7 @@ test_restart_fault_diagnostics_require_overlap() {
 
   write_diagnostics_fixture "$before" 0 0 0 0 0 0
   write_diagnostics_fixture "$after" k 0 0 k 0 k timeout c
-  sed -i 's/t_missing=0/t_missing=3/' "$after"
+  sed -i 's/,t_missing=0/,t_missing=3/' "$after"
   write_java_diagnostics_delta "$before" "$after" "$delta"
   assert_restart_fault_diagnostics "$delta" 32 3 "$result"
   grep -Fqx 'non_workload_takes=3' "$result"
@@ -10589,7 +10601,7 @@ test_restart_fault_diagnostics_require_overlap() {
   grep -Fqx 'workload_fail_open_max=15' "$result"
 
   write_diagnostics_fixture "$after" k 0 0 j 0 k timeout c
-  sed -i 's/t_missing=0/t_missing=3/' "$after"
+  sed -i 's/,t_missing=0/,t_missing=3/' "$after"
   write_java_diagnostics_delta "$before" "$after" "$delta"
   if assert_restart_fault_diagnostics "$delta" 32 3 "$result" >/dev/null 2>&1; then
     printf 'restart diagnostics accepted sampled totals below valid takes\n' >&2
@@ -10597,7 +10609,7 @@ test_restart_fault_diagnostics_require_overlap() {
   fi
 
   write_diagnostics_fixture "$after" k 0 0 k 0 g timeout c
-  sed -i 's/t_missing=0/t_missing=3/' "$after"
+  sed -i 's/,t_missing=0/,t_missing=3/' "$after"
   write_java_diagnostics_delta "$before" "$after" "$delta"
   if assert_restart_fault_diagnostics "$delta" 32 3 "$result" >/dev/null 2>&1; then
     printf 'restart diagnostics accepted standard discards below valid workload bounds\n' >&2
@@ -10605,7 +10617,7 @@ test_restart_fault_diagnostics_require_overlap() {
   fi
 
   write_diagnostics_fixture "$after" k 0 0 k 0 l timeout c
-  sed -i 's/t_missing=0/t_missing=3/' "$after"
+  sed -i 's/,t_missing=0/,t_missing=3/' "$after"
   write_java_diagnostics_delta "$before" "$after" "$delta"
   if assert_restart_fault_diagnostics "$delta" 32 3 "$result" >/dev/null 2>&1; then
     printf 'restart diagnostics accepted standard discards above valid workload bounds\n' >&2
@@ -10625,7 +10637,7 @@ test_restart_fault_diagnostics_require_overlap() {
   grep -Fqx 'workload_fail_open_min=12' "$result"
   grep -Fqx 'workload_fail_open_max=15' "$result"
 
-  sed -i 's/t_missing=0/t_missing=1/' "$after"
+  sed -i 's/,t_missing=0/,t_missing=1/' "$after"
   write_java_diagnostics_delta "$before" "$after" "$delta"
   if assert_restart_fault_diagnostics "$delta" 32 3 "$result" >/dev/null 2>&1; then
     printf 'restart diagnostics accepted an additional take result\n' >&2
@@ -10640,7 +10652,7 @@ test_restart_fault_diagnostics_require_overlap() {
   fi
 
   write_diagnostics_fixture "$after" 6 0 0 6 0 6 timeout l
-  sed -i 's/t_missing=0/t_missing=1/' "$after"
+  sed -i 's/,t_missing=0/,t_missing=1/' "$after"
   write_java_diagnostics_delta "$before" "$after" "$delta"
   sed -i '/^t_valid /p' "$delta"
   if assert_restart_fault_diagnostics "$delta" 32 3 "$result" >/dev/null 2>&1; then
@@ -10656,7 +10668,7 @@ test_restart_fault_diagnostics_require_overlap() {
   fi
 
   write_diagnostics_fixture "$after" w 0 0 w 0 w
-  sed -i 's/t_missing=0/t_missing=3/' "$after"
+  sed -i 's/,t_missing=0/,t_missing=3/' "$after"
   write_java_diagnostics_delta "$before" "$after" "$delta"
   if assert_restart_fault_diagnostics "$delta" 32 3 "$result" >/dev/null 2>&1; then
     printf 'restart diagnostics accepted a run without an observed bridge fault\n' >&2

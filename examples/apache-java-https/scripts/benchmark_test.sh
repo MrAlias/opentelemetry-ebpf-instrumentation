@@ -25,6 +25,7 @@ readonly FAKE_JAVA_DIAGNOSTIC_COUNTER_NAMES=(
   lookup_ready lookup_missing lookup_version lookup_error record_version
   invoke_error discard_standard extract_fields extract_invalid extract_error
   registration_ok registration_fail take_sampled take_unsampled tls_reads tls_bytes
+  framework_depth framework_cycle framework_late transport_missing
   t_unknown d_unknown t_valid d_valid t_missing d_missing t_stale d_stale
   t_unsupported d_unsupported t_malformed d_malformed
   t_version_mismatch d_version_mismatch t_ambiguous d_ambiguous
@@ -1849,6 +1850,12 @@ test_w3c_discard_diagnostics_require_exact_delta() {
     reset_options
     cell_spec getsockopt-w3c
     write_valid_java_diagnostics_snapshot "$before" z z
+    if [[ "$(tr ',' '\n' <"$before" | wc -l)" != 54 ]] ||
+      ! grep -Fq 'tls_bytes=0,framework_depth=0,framework_cycle=0,framework_late=0,transport_missing=0' \
+        "$before"; then
+      printf 'diagnostic fixture does not match the exact 54-field production schema\n' >&2
+      return 1
+    fi
     write_valid_java_diagnostics_snapshot "$after" 17 17
     validate_java_diagnostics_counter_deltas \
       "$before" "$after" "$output" discard_standard 8 t_valid 8 d_valid 0 || {
@@ -1910,6 +1917,18 @@ test_w3c_discard_diagnostics_require_exact_delta() {
     awk -F, 'BEGIN {OFS=","} {first=$1; $1=$2; $2=first; print}' "$before" >"$before.reordered"
     if validate_java_diagnostics_snapshot "$before.reordered" >/dev/null 2>&1; then
       printf 'diagnostic validator accepted reordered counters\n' >&2
+      return 1
+    fi
+    sed 's/framework_depth=0,framework_cycle=0/framework_cycle=0,framework_depth=0/' \
+      "$before" >"$before.framework-reordered"
+    if validate_java_diagnostics_snapshot "$before.framework-reordered" >/dev/null 2>&1; then
+      printf 'diagnostic validator accepted reordered framework reason counters\n' >&2
+      return 1
+    fi
+    sed 's/framework_cycle=0/framework_depth=0/' \
+      "$before" >"$before.framework-duplicate"
+    if validate_java_diagnostics_snapshot "$before.framework-duplicate" >/dev/null 2>&1; then
+      printf 'diagnostic validator accepted a duplicate framework reason counter\n' >&2
       return 1
     fi
     printf '%s,%s\n' "$(<"$before")" "discard_standard=0" >"$before.duplicate"

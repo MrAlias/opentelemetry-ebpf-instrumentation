@@ -9539,6 +9539,7 @@ assert_sanitized_java_diagnostics() {
     lookup_ready lookup_missing lookup_version lookup_error record_version
     invoke_error discard_standard extract_fields extract_invalid extract_error
     registration_ok registration_fail take_sampled take_unsampled tls_reads tls_bytes
+    framework_depth framework_cycle framework_late transport_missing
     t_unknown d_unknown t_valid d_valid t_missing d_missing t_stale d_stale
     t_unsupported d_unsupported t_malformed d_malformed
     t_version_mismatch d_version_mismatch t_ambiguous d_ambiguous

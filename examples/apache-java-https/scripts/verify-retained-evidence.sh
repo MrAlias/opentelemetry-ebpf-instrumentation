@@ -18,14 +18,18 @@ TRUSTED_HEAD=""
 REPO_ROOT=""
 TMP_DIR=""
 BUNDLE_SNAPSHOT_ROOT=""
+REQUIRE_CURRENT_CODE=false
 
 usage() {
   printf '%s\n' \
-    "Usage: $SCRIPT_NAME BUNDLE_DIRECTORY" \
+    "Usage: $SCRIPT_NAME [--current-code] BUNDLE_DIRECTORY" \
     "" \
     "Verify one sanitized retained acceptance-evidence bundle in this Git checkout." \
     "The verifier checks the checksum manifest, canonical evidence identity, clean" \
-    "full-suite status, and source-tree provenance reconstructed from the recorded commit."
+    "full-suite status, and source-tree provenance reconstructed from the recorded commit." \
+    "By default, historical evidence remains valid for its recorded revision only." \
+    "--current-code also rejects changes after that revision except retained evidence" \
+    "publication and Markdown documentation in the repository's documentation locations."
 }
 
 die() {
@@ -72,7 +76,7 @@ sanitize_git_environment() {
 }
 
 assert_verification_tmp_parent_is_trusted() {
-  local -r tmp_parent="${1:-$VERIFICATION_TMP_PARENT}"
+  local -r tmp_parent="$VERIFICATION_TMP_PARENT"
   local root_physical=""
   local parent_physical=""
   local root_owner=""
@@ -676,6 +680,51 @@ validate_json_provenance() {
   }
 }
 
+is_current_code_compatible_path() {
+  local -r path="$1"
+
+  case "$path" in
+    examples/apache-java-https/evidence/*|\
+    examples/apache-java-https/focused-validation/*)
+      return 0
+      ;;
+    devdocs/*.md)
+      return 0
+      ;;
+    examples/apache-java-https/*.md)
+      [[ "${path#examples/apache-java-https/}" != */* ]]
+      return
+      ;;
+    *.md)
+      [[ "$path" != */* ]]
+      return
+      ;;
+  esac
+  return 1
+}
+
+validate_current_code_compatibility() {
+  local -r tested_revision="$1"
+  local changed_paths="$TMP_DIR/current-code-changed-paths"
+  local changed_path=""
+  local quoted_path=""
+
+  if ! git -C "$REPO_ROOT" merge-base --is-ancestor \
+    "$tested_revision" "$TRUSTED_HEAD"; then
+    die "current-code policy requires the tested revision to be an ancestor of current HEAD"
+  fi
+  git -C "$REPO_ROOT" diff --name-only --no-renames --no-ext-diff --no-textconv -z \
+    "$tested_revision" "$TRUSTED_HEAD" -- >"$changed_paths" || {
+    die "current-code policy could not compare the tested revision with current HEAD"
+  }
+  while IFS= read -r -d '' changed_path; do
+    if ! is_current_code_compatible_path "$changed_path"; then
+      printf -v quoted_path '%q' "$changed_path"
+      die "current-code policy rejects a post-test source change: $quoted_path"
+    fi
+  done <"$changed_paths"
+}
+
 validate_provenance() {
   local -r environment="$BUNDLE_DIR/environment.txt"
   local -r source_state="$BUNDLE_DIR/source-state.txt"
@@ -784,12 +833,19 @@ validate_provenance() {
   validate_json_provenance \
     "$evidence_id" "$environment_revision" "$environment_tree_sha256" \
     "$allow_historical_status_schema"
+  if [[ "$REQUIRE_CURRENT_CODE" == "true" ]]; then
+    validate_current_code_compatibility "$environment_revision"
+  fi
 }
 
 main() {
   if [[ $# == 1 && ( "$1" == "-h" || "$1" == "--help" ) ]]; then
     usage
     return 0
+  fi
+  if [[ ${1:-} == "--current-code" ]]; then
+    REQUIRE_CURRENT_CODE=true
+    shift
   fi
   (( $# == 1 )) || {
     usage >&2

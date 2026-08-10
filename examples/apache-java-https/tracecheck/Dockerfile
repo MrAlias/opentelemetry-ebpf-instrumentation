@@ -20,6 +20,9 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -trimpath -o /out/map-state \
     ./examples/apache-java-https/tracecheck/cmd/mapstate
 RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath -o /out/generation-fault \
+    ./examples/apache-java-https/tracecheck/cmd/generationfault
+RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -trimpath -o /out/fault-bridge \
     ./examples/apache-java-https/tracecheck/cmd/faultbridge
 RUN --mount=type=cache,target=/root/.cache/go-build \
@@ -35,6 +38,7 @@ COPY --from=builder /out/trace-scenario /trace-scenario
 COPY --from=builder /out/trace-benchmark /trace-benchmark
 COPY --from=builder /out/map-pressure /map-pressure
 COPY --from=builder /out/map-state /map-state
+COPY --from=builder /out/generation-fault /generation-fault
 COPY --from=builder /out/fault-bridge /fault-bridge
 COPY --from=builder /out/security-probe /security-probe
 COPY --from=builder /out/coalesced-source /coalesced-source

@@ -193,6 +193,23 @@ services:
       - tools
     labels: *demo-labels
 
+  generation-fault:
+    image: obi-apache-java-https-tracecheck:local
+    network_mode: none
+    privileged: true
+    read_only: true
+    entrypoint:
+      - /generation-fault
+    volumes:
+      - type: bind
+        source: ${GENERATION_FAULT_CONTROL_SOURCE:-./.runtime/generation-fault-control}
+        target: /control
+        bind:
+          create_host_path: false
+    profiles:
+      - tools
+    labels: *demo-labels
+
   bridge-fault:
     image: obi-apache-java-https-tracecheck:local
     network_mode: none

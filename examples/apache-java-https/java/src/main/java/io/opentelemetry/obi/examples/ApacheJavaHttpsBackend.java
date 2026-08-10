@@ -51,11 +51,17 @@ import org.eclipse.jetty.util.ssl.SslContextFactory;
 public final class ApacheJavaHttpsBackend {
   static final String BRIDGE_DIAGNOSTICS_HEADER = "X-OBI-Java-Diagnostics";
   static final String BRIDGE_DIAGNOSTICS_PARAMETER = "bridge_diagnostics";
+  static final String GENERATION_FENCE_HOLD_PARAMETER = "generation_fence_hold_ms";
   private static final int DEFAULT_PORT = 18443;
   private static final int DEFAULT_NETTY_PORT = 18444;
   private static final int DEFAULT_TLS_BOUNDARY_SPLIT_PORT = 18445;
   private static final int DEFAULT_TLS_BOUNDARY_COALESCED_PORT = 18446;
   private static final int MAX_DELAY_MILLIS = 1000;
+  static final int MAX_GENERATION_FENCE_HOLD_MILLIS = 20_000;
+  private static final boolean GENERATION_FENCE_HOLD_ENABLED =
+      "/otel/libobi-java-remote-parent-fault.so".equals(System.getenv("LD_PRELOAD"))
+          && "/run/obi-demo/fault/java-remote-parent.mode"
+              .equals(System.getenv("OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_FILE"));
   private static final int MAX_BODY_BYTES = 64 * 1024;
   private static final int MAX_HANDOFFS = 8;
   private static final int MAX_DISPATCH_ROUNDS = 8;
@@ -208,6 +214,8 @@ public final class ApacheJavaHttpsBackend {
     context.addServlet(new ServletHolder(new HealthServlet(tlsProtocol)), "/healthz");
     context.addServlet(new ServletHolder(new EchoServlet(tlsProtocol)), "/api/echo");
     context.addServlet(new ServletHolder(new EchoServlet(tlsProtocol)), "/api/obi-flags");
+    context.addServlet(
+        new ServletHolder(new GenerationFenceServlet(tlsProtocol)), "/api/generation-fence");
     context.addServlet(new ServletHolder(new DispatchServlet(tlsProtocol)), "/api/dispatch");
     context.addServlet(new ServletHolder(new HandoffServlet(tlsProtocol)), "/api/handoff");
     context.addServlet(new ServletHolder(new NettyHandoffServlet(tlsProtocol)), "/api/netty");
@@ -236,11 +244,17 @@ public final class ApacheJavaHttpsBackend {
     }
   }
 
-  private static final class EchoServlet extends HttpServlet {
+  private static class EchoServlet extends HttpServlet {
     private final String configuredProtocol;
+    private final boolean generationFenceRoute;
 
     private EchoServlet(String configuredProtocol) {
+      this(configuredProtocol, false);
+    }
+
+    private EchoServlet(String configuredProtocol, boolean generationFenceRoute) {
       this.configuredProtocol = configuredProtocol;
+      this.generationFenceRoute = generationFenceRoute;
     }
 
     @Override
@@ -268,6 +282,11 @@ public final class ApacheJavaHttpsBackend {
       }
 
       int delayMillis = parseDelay(request.getParameter("delay_ms"));
+      int generationFenceHoldMillis =
+          parseGenerationFenceHold(
+              request.getParameter(GENERATION_FENCE_HOLD_PARAMETER),
+              request.getParameter(BRIDGE_DIAGNOSTICS_PARAMETER),
+              generationFenceRoute && GENERATION_FENCE_HOLD_ENABLED);
 
       String concurrencyBatch = request.getParameter("concurrency_batch");
       String concurrencyExpected = request.getParameter("concurrency_expected");
@@ -298,9 +317,10 @@ public final class ApacheJavaHttpsBackend {
         response.setHeader("X-OBI-Concurrency-Arrival", Integer.toString(evidence.arrival));
         response.setHeader("X-OBI-Concurrency-Release", Long.toString(evidence.release));
       }
-      if (delayMillis > 0) {
+      int totalDelayMillis = delayMillis + generationFenceHoldMillis;
+      if (totalDelayMillis > 0) {
         try {
-          Thread.sleep(delayMillis);
+          Thread.sleep(totalDelayMillis);
         } catch (InterruptedException exception) {
           Thread.currentThread().interrupt();
           response.sendError(HttpServletResponse.SC_SERVICE_UNAVAILABLE, "request interrupted");
@@ -322,6 +342,12 @@ public final class ApacheJavaHttpsBackend {
         }
       }
       return true;
+    }
+  }
+
+  private static final class GenerationFenceServlet extends EchoServlet {
+    private GenerationFenceServlet(String configuredProtocol) {
+      super(configuredProtocol, true);
     }
   }
 
@@ -1193,6 +1219,30 @@ public final class ApacheJavaHttpsBackend {
       return delay;
     } catch (NumberFormatException exception) {
       throw new IllegalArgumentException("delay_ms must be an integer", exception);
+    }
+  }
+
+  static int parseGenerationFenceHold(
+      String raw, String bridgeDiagnostics, boolean generationFenceHoldEnabled) {
+    if (raw == null || raw.isEmpty()) {
+      return 0;
+    }
+    if (!generationFenceHoldEnabled || !"1".equals(bridgeDiagnostics)) {
+      throw new IllegalArgumentException(
+          GENERATION_FENCE_HOLD_PARAMETER + " is unavailable outside the bridge fault control");
+    }
+    try {
+      int delay = Integer.parseInt(raw);
+      if (delay < 1 || delay > MAX_GENERATION_FENCE_HOLD_MILLIS) {
+        throw new IllegalArgumentException(
+            GENERATION_FENCE_HOLD_PARAMETER
+                + " must be between 1 and "
+                + MAX_GENERATION_FENCE_HOLD_MILLIS);
+      }
+      return delay;
+    } catch (NumberFormatException exception) {
+      throw new IllegalArgumentException(
+          GENERATION_FENCE_HOLD_PARAMETER + " must be an integer", exception);
     }
   }
 

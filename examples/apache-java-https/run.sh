@@ -94,6 +94,12 @@ PRIMARY_LIVE_FD_VICTIM_TIMEOUT_SECONDS="$((
 ))"
 PRIMARY_LIVE_FD_VICTIM_REAP_TIMEOUT_SECONDS=15
 PRIMARY_LIVE_FD_FIXED_BUDGET_SECONDS=260
+GENERATION_FAULT_HELPER_TIMEOUT_SECONDS=60
+GENERATION_FAULT_RELEASE_TIMEOUT_SECONDS=45
+GENERATION_FAULT_READY_TIMEOUT_SECONDS=10
+GENERATION_FAULT_TAKE_FENCE_TIMEOUT_SECONDS=4
+GENERATION_FAULT_REAP_TIMEOUT_SECONDS=10
+GENERATION_FAULT_REQUEST_TIMEOUT_SECONDS=55
 SECURITY_PROBE_TIMEOUT_SLACK_SECONDS=60
 MAX_SECURITY_PROBE_TIMEOUT_SECONDS=3600
 PROJECT_NAMESPACE="obi-apache-java-https"
@@ -175,6 +181,10 @@ readonly PRIMARY_LIVE_FD_VICTIM_SUPERVISOR_SLACK_SECONDS
 readonly PRIMARY_LIVE_FD_VICTIM_TIMEOUT_SECONDS
 readonly PRIMARY_LIVE_FD_VICTIM_REAP_TIMEOUT_SECONDS
 readonly PRIMARY_LIVE_FD_FIXED_BUDGET_SECONDS
+readonly GENERATION_FAULT_HELPER_TIMEOUT_SECONDS GENERATION_FAULT_READY_TIMEOUT_SECONDS
+readonly GENERATION_FAULT_RELEASE_TIMEOUT_SECONDS GENERATION_FAULT_REAP_TIMEOUT_SECONDS
+readonly GENERATION_FAULT_TAKE_FENCE_TIMEOUT_SECONDS
+readonly GENERATION_FAULT_REQUEST_TIMEOUT_SECONDS
 readonly SECURITY_PROBE_TIMEOUT_SLACK_SECONDS
 readonly MAX_SECURITY_PROBE_TIMEOUT_SECONDS PROJECT_NAMESPACE
 readonly PROJECT_SENTINEL_LABEL PROJECT_SENTINEL_VALUE APACHE_EXPECTED_PROCESS_COUNT
@@ -328,7 +338,8 @@ Options:
                           coalesced-bridge, timeout-retry,
                           pressure, handoff, virtual-thread, netty, netty-server, dispatch,
                           w3c, w3c-match, obi-flags, w3c-fault, primary-w3c-fault,
-                          primary-w3c-stale, unix-w3c-stale, w3c-only,
+                          primary-generation-mismatch, primary-w3c-stale,
+                          unix-w3c-stale, w3c-only,
                           security, restart-fault, helper-attach-failure,
                           delayed-otlp-suppression, assertion-failure, fail-open,
                           restart, disabled, uninstrumented, benchmark-disabled,
@@ -515,7 +526,7 @@ parse_args() {
       ;;
   esac
   case "$SCENARIO" in
-    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|coalesced-bridge|timeout-retry|pressure|handoff|virtual-thread|netty|netty-server|dispatch|w3c|w3c-match|obi-flags|w3c-fault|primary-w3c-fault|primary-w3c-stale|unix-w3c-stale|w3c-only|security|restart-fault|helper-attach-failure|delayed-otlp-suppression|assertion-failure|fail-open|restart|disabled|uninstrumented|benchmark-disabled|benchmark-uninstrumented)
+    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|coalesced-bridge|timeout-retry|pressure|handoff|virtual-thread|netty|netty-server|dispatch|w3c|w3c-match|obi-flags|w3c-fault|primary-w3c-fault|primary-generation-mismatch|primary-w3c-stale|unix-w3c-stale|w3c-only|security|restart-fault|helper-attach-failure|delayed-otlp-suppression|assertion-failure|fail-open|restart|disabled|uninstrumented|benchmark-disabled|benchmark-uninstrumented)
       ;;
     *)
       die "unsupported scenario: $SCENARIO"
@@ -559,6 +570,14 @@ parse_args() {
   fi
   if [[ "$SCENARIO" == "primary-w3c-stale" && "$TRANSPORT" != "getsockopt" ]]; then
     die "the primary-w3c-stale scenario requires --transport getsockopt"
+  fi
+  if [[ "$SCENARIO" == "primary-generation-mismatch" && \
+    "$TRANSPORT" != "getsockopt" ]]; then
+    die "the primary-generation-mismatch scenario requires --transport getsockopt"
+  fi
+  if [[ "$SCENARIO" == "primary-generation-mismatch" && \
+    "$REQUEST_COUNT" != "0" && "$REQUEST_COUNT" != "1" ]]; then
+    die "the primary-generation-mismatch scenario requires exactly one request"
   fi
   if [[ "$SCENARIO" == "primary-w3c-stale" && "$REQUEST_COUNT" != "0" && "$REQUEST_COUNT" != "1" ]]; then
     die "the primary-w3c-stale scenario requires exactly one request"
@@ -976,6 +995,7 @@ cleanup() {
   if [[ -n "${RESULT_DIR:-}" && -d "$RESULT_DIR" ]]; then
     for primary_fault_recovery_marker in \
       "$RESULT_DIR/primary-w3c-fault-recovery-required" \
+      "$RESULT_DIR/primary-generation-mismatch-recovery-required" \
       "$RESULT_DIR/primary-live-fd-security-recovery-required"; do
       if [[ -e "$primary_fault_recovery_marker" || -L "$primary_fault_recovery_marker" ]]; then
         primary_fault_recovery_stage="${primary_fault_recovery_marker##*/}"
@@ -2169,9 +2189,9 @@ start_stack() {
   local -a recreate_arguments=()
 
   assert_clean_source_checkout_is_stable
-  # The primary fault scenario replaces the normal Java runtime only after startup.
+  # Primary fault scenarios replace the normal Java runtime only after startup.
   case "$runtime_contract_mode" in
-    primary-w3c-fault)
+    primary-w3c-fault|primary-generation-mismatch)
       runtime_contract_mode="basic"
       ;;
     benchmark-disabled)
@@ -2974,6 +2994,7 @@ assert_runtime_contract() {
   fi
 
   if [[ "$mode" == "primary-w3c-fault" || \
+    "$mode" == "primary-generation-mismatch" || \
     "$mode" == "primary-live-fd-security" ]]; then
     assert_primary_fault_runtime_contract "$java_container" "$java_environment" || return $?
   else
@@ -4173,6 +4194,75 @@ wait_for_bridge_metrics_quiescent() {
   done
   rm -f -- "$candidate" || return $?
   log_error "timed out waiting for $description (minimum success=$minimum_success stage=$minimum_stage, last success=${success:-unavailable} stage=${stage:-unavailable} report=${report:-unavailable})"
+  return 1
+}
+
+wait_for_bridge_take_attempts_quiescent() {
+  local -r expected_attempts="$1"
+  local -r expected_stage="$2"
+  local -r output="$3"
+  local -r description="$4"
+  local -r timeout_seconds="${5:-$BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS}"
+  local candidate=""
+  local fingerprint=""
+  local previous_fingerprint=""
+  local report=""
+  local stage=""
+  local attempts=""
+  local metrics_timeout=""
+  local -i deadline=0
+  local -i previous_report=-1
+
+  bounded_decimal "$expected_attempts" "$MAX_SHELL_INTEGER" true >/dev/null || return 1
+  bounded_decimal "$expected_stage" "$MAX_SHELL_INTEGER" true >/dev/null || return 1
+  bounded_decimal "$timeout_seconds" "$MAX_SHELL_INTEGER" false >/dev/null || return 1
+  [[ ! -e "$output" && ! -L "$output" ]] || return 1
+  candidate="$(mktemp "$RESULT_DIR/.bridge-take-fence.XXXXXX")" || return $?
+  deadline="$((SECONDS + timeout_seconds))"
+  while ((SECONDS < deadline)); do
+    metrics_timeout="$(remaining_timeout_seconds "$deadline" 5)" || break
+    if fetch_obi_metrics "$candidate" "$metrics_timeout" 2>/dev/null; then
+      attempts="$(bridge_take_attempt_total "$candidate")" || {
+        rm -f -- "$candidate"
+        return 1
+      }
+      stage="$(bridge_stage_total "$candidate")" || {
+        rm -f -- "$candidate"
+        return 1
+      }
+      report="$(bridge_report_total "$candidate")" || {
+        rm -f -- "$candidate"
+        return 1
+      }
+      fingerprint="$(bridge_metric_fingerprint "$candidate")" || {
+        rm -f -- "$candidate"
+        return 1
+      }
+      if [[ ! "$attempts" =~ ^[0-9]+$ || ! "$stage" =~ ^[0-9]+$ || \
+        ! "$report" =~ ^[0-9]+$ ]] || \
+        ((attempts > expected_attempts || stage > expected_stage)); then
+        rm -f -- "$candidate"
+        log_error "$description escaped its exact take fence (take=${attempts:-invalid}/$expected_attempts stage=${stage:-invalid}/$expected_stage)"
+        return 1
+      fi
+      if ((report > previous_report)); then
+        if [[ -n "$previous_fingerprint" && \
+          "$fingerprint" == "$previous_fingerprint" && \
+          "$attempts" == "$expected_attempts" && "$stage" == "$expected_stage" ]]; then
+          install -m 0644 "$candidate" "$output" || return $?
+          rm -f -- "$candidate" || return $?
+          return 0
+        fi
+        previous_report="$report"
+        previous_fingerprint="$fingerprint"
+      fi
+    fi
+    if ((SECONDS < deadline)); then
+      sleep 1 || return $?
+    fi
+  done
+  rm -f -- "$candidate" || return $?
+  log_error "timed out waiting for $description (exact take=$expected_attempts stage=$expected_stage, last take=${attempts:-unavailable} stage=${stage:-unavailable} report=${report:-unavailable})"
   return 1
 }
 
@@ -7914,6 +8004,9 @@ primary_w3c_fault_expected_java_status() {
     bad-size|zero-trace-id|zero-span-id)
       printf 'malformed\n'
       ;;
+    generation-mismatch)
+      printf 'missing\n'
+      ;;
     *)
       return 1
       ;;
@@ -8024,6 +8117,20 @@ primary_live_fd_descriptor() {
 
 arm_primary_live_fd_barrier() {
   local -r output="$1"
+  local -r stack="${2:-primary-live-fd}"
+  local -a compose_command=()
+
+  case "$stack" in
+    primary-live-fd)
+      compose_command=("${PRIMARY_LIVE_FD_COMPOSE[@]}")
+      ;;
+    primary-fault)
+      compose_command=("${PRIMARY_FAULT_COMPOSE[@]}")
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 
   [[ "$PRIMARY_FAULT_STACK_ACTIVE" == "true" ]] || {
     log_error "cannot arm the primary live-descriptor barrier outside its fault stack"
@@ -8035,7 +8142,7 @@ arm_primary_live_fd_barrier() {
   }
 
   # shellcheck disable=SC2016 # The fixed paths are positional parameters in the Java container.
-  run_bounded 15 "${PRIMARY_LIVE_FD_COMPOSE[@]}" exec --no-TTY --user 0:0 \
+  run_bounded 15 "${compose_command[@]}" exec --no-TTY --user 0:0 \
     java-backend /bin/sh -ec '
       set -eu
       directory=$1
@@ -8296,6 +8403,20 @@ release_primary_live_fd_barrier() {
 
 consume_primary_live_fd_barrier() {
   local -r output="$1"
+  local -r stack="${2:-primary-live-fd}"
+  local -a compose_command=()
+
+  case "$stack" in
+    primary-live-fd)
+      compose_command=("${PRIMARY_LIVE_FD_COMPOSE[@]}")
+      ;;
+    primary-fault)
+      compose_command=("${PRIMARY_FAULT_COMPOSE[@]}")
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 
   [[ "$PRIMARY_FAULT_STACK_ACTIVE" == "true" ]] || {
     log_error "cannot consume the primary live-descriptor barrier outside its fault stack"
@@ -8311,7 +8432,7 @@ consume_primary_live_fd_barrier() {
   # this exact inode, so ownership, mode, and link count are the stable
   # post-consumption metadata contract.
   # shellcheck disable=SC2016 # The fixed paths are positional parameters in the Java container.
-  run_bounded 10 "${PRIMARY_LIVE_FD_COMPOSE[@]}" exec --no-TTY --user 0:0 \
+  run_bounded 10 "${compose_command[@]}" exec --no-TTY --user 0:0 \
     java-backend /bin/sh -ec '
       set -eu
       directory=$1
@@ -8579,6 +8700,399 @@ run_primary_live_fd_security_recovery_scenario() {
   SCENARIO_VARIANT="$original_variant"
   return "$scenario_status"
 }
+
+process_namespace_identity_from_snapshot() {
+  local -r status_snapshot="$1"
+  local -r expected_process_pid="$2"
+  local process_pid=""
+  local process_namespace=""
+
+  bounded_decimal "$expected_process_pid" "$MAX_UINT32_DECIMAL" false >/dev/null || return 1
+  read -r process_pid process_namespace < <(
+    LC_ALL=C awk -v expected_process_pid="$expected_process_pid" '
+      $1 == "Tgid:" {
+        tgid_count++
+        if (NF != 2 || $2 !~ /^[1-9][0-9]*$/ || $2 != expected_process_pid) {
+          invalid = 1
+        }
+        next
+      }
+      $1 == "NSpid:" {
+        nspid_count++
+        if (NF < 2 || $NF != expected_process_pid) {
+          invalid = 1
+        }
+        for (field = 2; field <= NF; field++) {
+          if ($field !~ /^[1-9][0-9]*$/) {
+            invalid = 1
+          }
+        }
+        process_pid = $NF
+        next
+      }
+      $1 == "PidNamespace:" {
+        pid_namespace_count++
+        pid_namespace = $2
+        if (NF != 2 || pid_namespace !~ /^pid:\[[1-9][0-9]*\]$/) {
+          invalid = 1
+        }
+        next
+      }
+      $1 == "ChildPidNamespace:" {
+        child_namespace_count++
+        child_namespace = $2
+        if (NF != 2 || child_namespace !~ /^pid:\[[1-9][0-9]*\]$/) {
+          invalid = 1
+        }
+        next
+      }
+      $1 == "Comm:" {
+        comm_count++
+        if (NF != 2 || $2 != "java") {
+          invalid = 1
+        }
+        next
+      }
+      NF != 0 {
+        invalid = 1
+      }
+      END {
+        if (invalid || tgid_count != 1 || nspid_count != 1 ||
+          pid_namespace_count != 1 || child_namespace_count != 1 ||
+          comm_count != 1 || process_pid == "" ||
+          pid_namespace != child_namespace) {
+          exit 1
+        }
+        sub(/^pid:\[/, "", pid_namespace)
+        sub(/\]$/, "", pid_namespace)
+        print process_pid, pid_namespace
+      }
+    ' <<<"$status_snapshot"
+  ) || return $?
+  process_pid="$(bounded_decimal "$process_pid" "$MAX_UINT32_DECIMAL" false)" || return $?
+  process_namespace="$(
+    bounded_decimal "$process_namespace" "$MAX_UINT32_DECIMAL" false
+  )" || return $?
+  printf '%s %s\n' "$process_pid" "$process_namespace"
+}
+
+resolve_container_process_namespace_identity() {
+  local -r container="$1"
+  local status_snapshot=""
+
+  [[ "$container" =~ ^[a-f0-9]{64}$ ]] || return 1
+  # Read through the controlled container's private procfs. Host-side namespace
+  # symlink dereferences are ptrace-gated for ordinary Docker-group operators.
+  # shellcheck disable=SC2016 # The fixed proc paths are evaluated in the container.
+  status_snapshot="$(run_bounded 10 docker exec "$container" /bin/sh -ec '
+    set -eu
+    LC_ALL=C awk '\''$1 == "Tgid:" || $1 == "NSpid:" { print }'\'' /proc/1/status
+    printf "PidNamespace:\t%s\n" "$(readlink /proc/1/ns/pid)"
+    printf "ChildPidNamespace:\t%s\n" "$(readlink /proc/1/ns/pid_for_children)"
+    printf "Comm:\t%s\n" "$(cat /proc/1/comm)"
+  ')" || return $?
+  process_namespace_identity_from_snapshot "$status_snapshot" 1
+}
+
+wait_for_generation_fault_armed() {
+  local -r directory="$1"
+  local -r helper_pid="$2"
+  local -r expected_owner="$3"
+  local -r armed="$directory/armed"
+  local -i started_at="$SECONDS"
+  local metadata=""
+
+  [[ "$directory" == "$RESULT_DIR/generation-fault-control" && \
+    "$helper_pid" =~ ^[1-9][0-9]*$ && "$expected_owner" =~ ^[0-9]+$ ]] || return 1
+  while ((SECONDS - started_at < GENERATION_FAULT_READY_TIMEOUT_SECONDS)); do
+    if [[ -f "$armed" && ! -L "$armed" ]]; then
+      metadata="$(stat -c '%u:%g:%a:%h:%s' -- "$armed")" || return $?
+      [[ "$metadata" =~ ^([0-9]+):([0-9]+):600:1:6$ && \
+        "${BASH_REMATCH[1]}" == "$expected_owner" && \
+        "$(<"$armed")" == "armed" ]] || {
+        log_error "generation mismatch helper published an invalid armed record"
+        return 1
+      }
+      return 0
+    fi
+    if ! background_process_is_running "$helper_pid"; then
+      log_error "generation mismatch helper exited before mutation was armed"
+      return 1
+    fi
+    sleep 0.1
+  done
+  log_error "timed out waiting for the generation mismatch mutation"
+  return 1
+}
+
+publish_generation_fault_release() {
+  local -r directory="$1"
+  local -r expected_owner="$2"
+  local -r release="$directory/release"
+  local temporary=""
+
+  [[ "$directory" == "$RESULT_DIR/generation-fault-control" && \
+    "$expected_owner" == "$(id -u)" && -d "$directory" && ! -L "$directory" && \
+    ! -e "$release" && ! -L "$release" ]] || return 1
+  temporary="$(mktemp "$directory/.release.XXXXXX")" || return $?
+  if ! printf 'release\n' >"$temporary" || ! chmod 0600 -- "$temporary" || \
+    [[ "$(stat -c '%u:%a:%h:%s' -- "$temporary")" != "$expected_owner:600:1:8" ]] || \
+    ! mv -T -- "$temporary" "$release"; then
+    rm -f -- "$temporary" || true
+    return 1
+  fi
+  [[ -f "$release" && ! -L "$release" && "$(<"$release")" == "release" ]]
+}
+
+assert_generation_fault_helper_output() {
+  local -r output="$1"
+  local -r stderr_output="$2"
+
+  bounded_evidence_file "$output" 512 1 || return 1
+  bounded_evidence_file "$stderr_output" 4096 64 || return 1
+  [[ ! -s "$stderr_output" ]] || return 1
+  jq -e '
+    type == "object" and
+    ((keys | sort) == ["mode", "mutated", "restored", "status"]) and
+    .status == "passed" and
+    .mode == "generation-mismatch" and
+    .mutated == true and
+    .restored == true
+  ' "$output" >/dev/null
+}
+
+run_primary_generation_mismatch_control() (
+  local -r original_variant="$SCENARIO_VARIANT"
+  local -r recovery_marker="$RESULT_DIR/primary-generation-mismatch-recovery-required"
+  local -r control_directory="$RESULT_DIR/generation-fault-control"
+  local -r before_phase="primary-generation-mismatch-before"
+  local -r after_phase="primary-generation-mismatch-after"
+  local -r arm_evidence="$RESULT_DIR/primary-generation-mismatch-barrier-armed.txt"
+  local -r release_evidence="$RESULT_DIR/primary-generation-mismatch-barrier-released.txt"
+  local -r consumption_evidence="$RESULT_DIR/primary-generation-mismatch-barrier-consumed.txt"
+  local -r victim_output="$RESULT_DIR/scenario-primary-generation-mismatch.json"
+  local -r victim_stderr="$RESULT_DIR/scenario-primary-generation-mismatch.stderr.log"
+  local -r helper_output="$RESULT_DIR/generation-mismatch-helper.json"
+  local -r helper_stderr="$RESULT_DIR/generation-mismatch-helper.stderr.log"
+  local -r diagnostics_delta="$RESULT_DIR/phases/$after_phase/java-diagnostics.delta"
+  local -r metric_delta="$RESULT_DIR/phases/$after_phase/obi-metrics.delta"
+  local restore_required=false
+  local barrier_released=false
+  local helper_release_published=false
+  local java_container=""
+  local java_host_pid=""
+  local java_inspection_before=""
+  local java_inspection_after=""
+  local java_process_identity=""
+  local java_process_pid=""
+  local java_process_namespace=""
+  local inspected_container=""
+  local inspected_started_at=""
+  local inspection_extra=""
+  local control_owner=""
+  local descriptor=""
+  local victim_pid=""
+  local helper_pid=""
+  local before_stage=""
+  local before_take_attempts=""
+  local baseline_snapshot=""
+  local restore_status=0
+
+  # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
+  restore_primary_generation_mismatch_stack() {
+    local -r status="$?"
+
+    trap - EXIT
+    set +e
+    if [[ "$barrier_released" == "false" && -n "$descriptor" && -n "$java_container" ]]; then
+      release_primary_live_fd_barrier \
+        "$java_container" "$descriptor" \
+        "$RESULT_DIR/primary-generation-mismatch-emergency-barrier-release.txt" 5 || true
+      barrier_released=true
+    fi
+    if [[ "$helper_release_published" == "false" && -n "$control_owner" && \
+      -d "$control_directory" ]]; then
+      publish_generation_fault_release "$control_directory" "$control_owner" || true
+      helper_release_published=true
+    fi
+    if [[ "$helper_pid" =~ ^[1-9][0-9]*$ ]]; then
+      if ! wait_for_background_process "$helper_pid" "$GENERATION_FAULT_REAP_TIMEOUT_SECONDS"; then
+        if background_process_is_running "$helper_pid"; then
+          kill -TERM "$helper_pid" 2>/dev/null || true
+        fi
+        wait "$helper_pid" 2>/dev/null || true
+      fi
+      helper_pid=""
+    fi
+    if [[ "$victim_pid" =~ ^[1-9][0-9]*$ ]]; then
+      if background_process_is_running "$victim_pid"; then
+        kill -TERM "$victim_pid" 2>/dev/null || true
+      fi
+      wait "$victim_pid" 2>/dev/null || true
+      victim_pid=""
+    fi
+    rm -f -- "$control_directory/armed" "$control_directory/release" \
+      "$control_directory"/.release.* 2>/dev/null || true
+    rmdir -- "$control_directory" 2>/dev/null || true
+    if [[ "$restore_required" == "true" ]]; then
+      (
+        set -Eeuo pipefail
+        recreate_instrumented_stack \
+          tcp "post-primary generation mismatch recovery" getsockopt true false base
+        assert_runtime_contract basic true
+      )
+      restore_status=$?
+      if ((restore_status == 0)); then
+        rm -f -- "$recovery_marker" || restore_status=$?
+        PRIMARY_FAULT_STACK_ACTIVE=false
+      fi
+    fi
+    SCENARIO_VARIANT="$original_variant"
+    if ((status == 0 && restore_status != 0)); then
+      exit "$restore_status"
+    fi
+    exit "$status"
+  }
+
+  trap restore_primary_generation_mismatch_stack EXIT
+  [[ "$TRANSPORT" == "getsockopt" && "$SELECTED_TRANSPORT" == "getsockopt" && \
+    "$BRIDGE_RUNNING" == "true" ]] || {
+    log_error "the generation mismatch control requires a healthy forced getsockopt bridge"
+    return 1
+  }
+  [[ ! -e "$recovery_marker" && ! -L "$recovery_marker" && \
+    ! -e "$control_directory" && ! -L "$control_directory" ]] || return 1
+  (umask 077; printf 'recovery_required\n' >"$recovery_marker") || return $?
+  install -d -m 0700 -- "$control_directory" || return $?
+  control_owner="$(id -u)" || return $?
+
+  restore_required=true
+  PRIMARY_FAULT_STACK_ACTIVE=true
+  recreate_instrumented_stack \
+    tcp "primary generation mismatch preparation" getsockopt true false primary-fault || return $?
+  assert_runtime_contract primary-generation-mismatch true || return $?
+  java_container="$(run_bounded 10 "${PRIMARY_FAULT_COMPOSE[@]}" ps --quiet java-backend)" || return $?
+  [[ -n "$java_container" ]] || return 1
+  java_inspection_before="$(run_bounded 10 docker inspect \
+    --format '{{.Id}} {{.State.Pid}} {{.State.StartedAt}}' "$java_container")" || return $?
+  read -r inspected_container java_host_pid inspected_started_at inspection_extra \
+    <<<"$java_inspection_before" || return $?
+  [[ "$inspected_container" == "$java_container" && -n "$inspected_started_at" && \
+    "$inspected_started_at" != "0001-01-01T00:00:00Z" && -z "$inspection_extra" ]] || return 1
+  java_host_pid="$(bounded_decimal "$java_host_pid" "$MAX_UINT32_DECIMAL" false)" || return $?
+  java_process_identity="$(
+    resolve_container_process_namespace_identity "$java_container"
+  )" || return $?
+  read -r java_process_pid java_process_namespace inspection_extra \
+    <<<"$java_process_identity" || return $?
+  [[ -z "$inspection_extra" ]] || return 1
+  java_inspection_after="$(run_bounded 10 docker inspect \
+    --format '{{.Id}} {{.State.Pid}} {{.State.StartedAt}}' "$java_container")" || return $?
+  [[ "$java_inspection_after" == "$java_inspection_before" ]] || {
+    log_error "the controlled JVM changed while resolving its PID namespace identity"
+    return 1
+  }
+
+  mkdir -p -- "$RESULT_DIR/phases/$before_phase"
+  flush_bridge_metric_boundary \
+    primary-generation-mismatch 1 1 \
+    "$RESULT_DIR/phases/$before_phase/java-diagnostics.txt" || return $?
+  capture_phase_evidence "$before_phase" || return $?
+  before_stage="$(bridge_stage_total \
+    "$RESULT_DIR/phases/$before_phase/obi-metrics.prom")" || return $?
+  before_take_attempts="$(bridge_take_attempt_total \
+    "$RESULT_DIR/phases/$before_phase/obi-metrics.prom")" || return $?
+  ((before_take_attempts <= MAX_SHELL_INTEGER - 4)) || return 1
+  baseline_snapshot="$(<"$RESULT_DIR/phases/$before_phase/java-diagnostics.txt")"
+
+  arm_primary_live_fd_barrier "$arm_evidence" primary-fault || return $?
+  timeout --signal=TERM --kill-after=10s \
+    "${PRIMARY_LIVE_FD_VICTIM_TIMEOUT_SECONDS}s" \
+    "${PRIMARY_FAULT_COMPOSE[@]}" run --rm --no-deps --no-TTY scenario \
+      --scenario primary-w3c-fault \
+      --expected-tls "$TLS_PROTOCOL" \
+      --seed "$SCENARIO_SEED" \
+      --requests 1 \
+      --fault-mode generation-mismatch \
+      --java-diagnostics-before "$baseline_snapshot" \
+      --timeout 75s \
+      --request-timeout "${GENERATION_FAULT_REQUEST_TIMEOUT_SECONDS}s" \
+      </dev/null >"$victim_output" 2>"$victim_stderr" &
+  victim_pid=$!
+  descriptor="$(wait_for_primary_live_fd_barrier_ready "$java_container" "$victim_pid")" || return $?
+
+  GENERATION_FAULT_CONTROL_SOURCE="$control_directory" \
+    timeout --signal=TERM --kill-after=5s \
+      "${GENERATION_FAULT_HELPER_TIMEOUT_SECONDS}s" \
+      "${PRIMARY_FAULT_COMPOSE[@]}" run --rm --no-deps --no-TTY generation-fault \
+        --process-pid "$java_process_pid" \
+        --process-namespace "$java_process_namespace" \
+        --control-dir /control \
+        --control-owner "$control_owner" \
+        --timeout "${GENERATION_FAULT_RELEASE_TIMEOUT_SECONDS}s" \
+        </dev/null >"$helper_output" 2>"$helper_stderr" &
+  helper_pid=$!
+  wait_for_generation_fault_armed \
+    "$control_directory" "$helper_pid" "$control_owner" || return $?
+  ALLOW_PRIMARY_SECURITY_METRICS=true
+
+  release_primary_live_fd_barrier \
+    "$java_container" "$descriptor" "$release_evidence" || return $?
+  barrier_released=true
+  # The request's bounded post-extraction delay keeps the accepted connection
+  # alive while this exact attempt fence proves the unauthorized-socket
+  # preflight, both same-FD probes, and the generation-mismatched victim take
+  # ran before restoration.
+  wait_for_bridge_take_attempts_quiescent \
+    "$((before_take_attempts + 4))" "$((before_stage + 1))" \
+    "$RESULT_DIR/metrics-primary-generation-mismatch-take.prom" \
+    "primary generation mismatch take" \
+    "$GENERATION_FAULT_TAKE_FENCE_TIMEOUT_SECONDS" || return $?
+  publish_generation_fault_release "$control_directory" "$control_owner" || return $?
+  helper_release_published=true
+  wait_for_background_process "$helper_pid" "$GENERATION_FAULT_REAP_TIMEOUT_SECONDS" || return $?
+  helper_pid=""
+  assert_generation_fault_helper_output "$helper_output" "$helper_stderr" || return $?
+
+  wait_for_background_process "$victim_pid" "$PRIMARY_LIVE_FD_VICTIM_TIMEOUT_SECONDS" || return $?
+  victim_pid=""
+  consume_primary_live_fd_barrier "$consumption_evidence" primary-fault || return $?
+  capture_phase_evidence "$after_phase" || return $?
+  extract_fault_diagnostics_after \
+    "$victim_output" "$RESULT_DIR/phases/$after_phase/java-diagnostics.txt" || return $?
+  write_java_diagnostics_delta \
+    "$RESULT_DIR/phases/$before_phase/java-diagnostics.txt" \
+    "$RESULT_DIR/phases/$after_phase/java-diagnostics.txt" \
+    "$diagnostics_delta" || return $?
+  assert_w3c_fault_diagnostics_delta \
+    "$diagnostics_delta" generation-mismatch 1 || return $?
+  write_metrics_delta \
+    "$RESULT_DIR/phases/$before_phase/obi-metrics.prom" \
+    "$RESULT_DIR/phases/$after_phase/obi-metrics.prom" \
+    "$metric_delta" || return $?
+  assert_security_metric_delta \
+    "$metric_delta" take missing getsockopt 3 3 || return $?
+  assert_primary_security_metric_delta "$metric_delta" take 1 1 || return $?
+  assert_bridge_metric_delta \
+    "$metric_delta" getsockopt 0 0 3 1 1 false 0 || return $?
+
+  recreate_instrumented_stack \
+    tcp "post-primary generation mismatch recovery" getsockopt true false base || return $?
+  assert_runtime_contract basic true || return $?
+  rm -f -- "$recovery_marker" || return $?
+  PRIMARY_FAULT_STACK_ACTIVE=false
+  restore_required=false
+  rm -f -- "$control_directory/armed" "$control_directory/release" || return $?
+  rmdir -- "$control_directory" || return $?
+  SCENARIO_VARIANT="primary-generation-mismatch-recovery"
+  run_scenario basic || return $?
+  SCENARIO_VARIANT="$original_variant"
+  printf '{"status":"passed","scenario":"primary-generation-mismatch","live_owner_mutation":"verified","take_status":"missing","w3c_precedence":"passed","same_fd_execution_guards":"missing","exact_restore":"verified","post_fault_recovery":"passed","before_phase":"phases/%s","after_phase":"phases/%s"}\n' \
+    "$before_phase" "$after_phase" \
+    >"$RESULT_DIR/scenario-primary-generation-mismatch-status.json"
+
+  trap - EXIT
+)
 
 run_primary_live_fd_security_control() (
   local -r probe_source="$1"
@@ -10422,10 +10936,13 @@ execute_requested_scenarios() {
       run_scenario obi-flags
       if [[ "$TRANSPORT" == "getsockopt" && "$SELECTED_TRANSPORT" == "getsockopt" ]]; then
         run_primary_w3c_stale_control
+        run_primary_generation_mismatch_control
         run_primary_w3c_fault_control
       else
         record_unsupported_scenario \
           primary-w3c-stale "requires forced getsockopt transport"
+        record_unsupported_scenario \
+          primary-generation-mismatch "requires forced getsockopt transport"
         record_unsupported_scenario \
           primary-w3c-fault "requires forced getsockopt transport"
       fi
@@ -10503,6 +11020,9 @@ execute_requested_scenarios() {
       ;;
     primary-w3c-fault)
       run_primary_w3c_fault_control
+      ;;
+    primary-generation-mismatch)
+      run_primary_generation_mismatch_control
       ;;
     security)
       run_security_control
@@ -11634,6 +12154,10 @@ assert_w3c_fault_diagnostics_delta() {
       ;;
     version-mismatch)
       expected_fault_status=version_mismatch
+      expected_fault_count="$expected_requests"
+      ;;
+    generation-mismatch)
+      expected_fault_status=missing
       expected_fault_count="$expected_requests"
       ;;
     *)

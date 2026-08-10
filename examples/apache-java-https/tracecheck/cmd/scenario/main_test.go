@@ -1476,6 +1476,7 @@ func TestPrimaryW3CFaultRequestUsesW3CPrecedenceAndDiagnostics(t *testing.T) {
 		{faultMode: "bad-size", status: "malformed"},
 		{faultMode: "zero-trace-id", status: "malformed"},
 		{faultMode: "zero-span-id", status: "malformed"},
+		{faultMode: "generation-mismatch", status: "missing"},
 	}
 
 	for _, test := range tests {
@@ -1504,6 +1505,15 @@ func TestPrimaryW3CFaultRequestUsesW3CPrecedenceAndDiagnostics(t *testing.T) {
 			assert.NotEmpty(t, requestCase.W3CParentSpanID)
 			assert.True(t, requestCase.BridgeDiagnostics)
 			assert.True(t, requestCase.CloseConnection)
+			if test.faultMode == "generation-mismatch" {
+				assert.Zero(t, requestCase.DelayMillis)
+				assert.Equal(t, "/api/generation-fence", requestCase.Endpoint)
+				assert.Equal(t, 20_000, requestCase.GenerationFenceHoldMillis)
+			} else {
+				assert.Equal(t, "/api/echo", requestCase.Endpoint)
+				assert.Zero(t, requestCase.DelayMillis)
+				assert.Zero(t, requestCase.GenerationFenceHoldMillis)
+			}
 			assert.Equal(t, tracecheck.ModeW3C, expectationFor(cfg, requestCase).Mode)
 
 			request, requestErr := newHTTPRequest(
@@ -1514,6 +1524,12 @@ func TestPrimaryW3CFaultRequestUsesW3CPrecedenceAndDiagnostics(t *testing.T) {
 			require.NoError(t, requestErr)
 			assert.Equal(t, "1", request.URL.Query().Get("bridge_diagnostics"))
 			assert.Equal(t, "1", request.URL.Query().Get("close"))
+			if test.faultMode == "generation-mismatch" {
+				assert.Equal(t, "/api/generation-fence", request.URL.Path)
+				assert.Equal(t, "20000", request.URL.Query().Get("generation_fence_hold_ms"))
+			} else {
+				assert.Empty(t, request.URL.Query().Get("generation_fence_hold_ms"))
+			}
 
 			requestCase.BridgeDiagnostics = false
 			request, requestErr = newHTTPRequest(

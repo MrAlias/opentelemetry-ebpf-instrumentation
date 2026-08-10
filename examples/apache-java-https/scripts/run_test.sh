@@ -1427,7 +1427,7 @@ test_benchmark_controls_are_bounded() {
 
 test_all_suite_includes_every_scenario() {
   local -r actual="$TEST_TMP_DIR/all-scenarios.txt"
-  local -r expected=$'basic\nbasic\nsecurity\nkeepalive\npipelining\nconcurrency\nconnection-churn\nfd-port-reuse\nslow-body\ntls-boundary\ncoalesced-bridge\ntimeout-retry\npressure\nhandoff\nvirtual-thread\nnetty\nnetty-server\ndispatch\nw3c\nw3c-match\nobi-flags\nprimary-w3c-stale\nbasic\nprimary-w3c-fault\nprimary-w3c-fault\nprimary-w3c-fault\nprimary-w3c-fault\nbasic\nfail-open\nw3c-only\nrestart\nrestart-fault\nhelper-attach-failure\ndisabled\nw3c-only\nw3c-only\nuninstrumented'
+  local -r expected=$'basic\nbasic\nsecurity\nkeepalive\npipelining\nconcurrency\nconnection-churn\nfd-port-reuse\nslow-body\ntls-boundary\ncoalesced-bridge\ntimeout-retry\npressure\nhandoff\nvirtual-thread\nnetty\nnetty-server\ndispatch\nw3c\nw3c-match\nobi-flags\nprimary-w3c-stale\nbasic\nprimary-generation-mismatch\nbasic\nprimary-w3c-fault\nprimary-w3c-fault\nprimary-w3c-fault\nprimary-w3c-fault\nbasic\nfail-open\nw3c-only\nrestart\nrestart-fault\nhelper-attach-failure\ndisabled\nw3c-only\nw3c-only\nuninstrumented'
 
   (
     SCENARIO=all
@@ -1445,6 +1445,10 @@ test_all_suite_includes_every_scenario() {
     }
     run_primary_w3c_stale_control() {
       run_scenario primary-w3c-stale
+      run_scenario basic
+    }
+    run_primary_generation_mismatch_control() {
+      run_scenario primary-generation-mismatch
       run_scenario basic
     }
     run_primary_w3c_fault_control() {
@@ -1770,6 +1774,40 @@ test_primary_w3c_stale_requires_forced_primary() {
     parse_args --transport getsockopt --scenario primary-w3c-stale --requests 2
   ) >/dev/null 2>&1; then
     printf 'accepted the primary stale control with multiple requests\n' >&2
+    return 1
+  fi
+}
+
+test_primary_generation_mismatch_requires_one_forced_primary() {
+  (
+    TRANSPORT=getsockopt
+    SCENARIO=all
+    REQUEST_COUNT=0
+    parse_args \
+      --transport getsockopt --scenario primary-generation-mismatch --requests 1
+    [[ "$TRANSPORT" == "getsockopt" && \
+      "$SCENARIO" == "primary-generation-mismatch" && "$REQUEST_COUNT" == "1" ]]
+  ) || {
+    printf 'rejected the forced-primary generation mismatch control\n' >&2
+    return 1
+  }
+  if (
+    TRANSPORT=getsockopt
+    SCENARIO=all
+    REQUEST_COUNT=0
+    parse_args --transport unix --scenario primary-generation-mismatch
+  ) >/dev/null 2>&1; then
+    printf 'accepted generation mismatch without forced getsockopt\n' >&2
+    return 1
+  fi
+  if (
+    TRANSPORT=getsockopt
+    SCENARIO=all
+    REQUEST_COUNT=0
+    parse_args \
+      --transport getsockopt --scenario primary-generation-mismatch --requests 2
+  ) >/dev/null 2>&1; then
+    printf 'accepted generation mismatch with multiple requests\n' >&2
     return 1
   fi
 }
@@ -7303,6 +7341,285 @@ test_primary_security_probe_is_not_self_certifying() {
     printf 'primary security probes did not use isolated metric windows\n' >&2
     return 1
   }
+}
+
+test_generation_fault_protocol_and_output_are_exact() {
+  local -r result_dir="$TEST_TMP_DIR/generation-fault-protocol"
+  local -r control_dir="$result_dir/generation-fault-control"
+  local -r armed="$control_dir/armed"
+  local -r output="$result_dir/helper.json"
+  local -r stderr_output="$result_dir/helper.stderr"
+  local owner=""
+
+  install -d -m 0700 -- "$control_dir"
+  owner="$(id -u)" || return $?
+  printf 'armed\n' >"$armed"
+  chmod 0600 -- "$armed"
+  (
+    RESULT_DIR="$result_dir"
+    wait_for_generation_fault_armed "$control_dir" "$$" "$owner"
+  ) || {
+    printf 'generation fault rejected its exact armed record\n' >&2
+    return 1
+  }
+  chmod 0644 -- "$armed"
+  if (
+    RESULT_DIR="$result_dir"
+    wait_for_generation_fault_armed "$control_dir" "$$" "$owner"
+  ) >/dev/null 2>&1; then
+    printf 'generation fault accepted a permissive armed record\n' >&2
+    return 1
+  fi
+  chmod 0600 -- "$armed"
+
+  (
+    RESULT_DIR="$result_dir"
+    publish_generation_fault_release "$control_dir" "$owner"
+  ) || {
+    printf 'generation fault could not publish its exact release record\n' >&2
+    return 1
+  }
+  [[ "$(stat -c '%u:%a:%h:%s' -- "$control_dir/release")" == \
+    "$owner:600:1:8" && "$(<"$control_dir/release")" == release ]] || {
+    printf 'generation fault release metadata changed\n' >&2
+    return 1
+  }
+
+  printf '%s\n' \
+    '{"status":"passed","mode":"generation-mismatch","mutated":true,"restored":true}' \
+    >"$output"
+  : >"$stderr_output"
+  assert_generation_fault_helper_output "$output" "$stderr_output" || {
+    printf 'generation fault rejected its fixed helper output\n' >&2
+    return 1
+  }
+  printf '%s\n' \
+    '{"status":"passed","mode":"generation-mismatch","mutated":true,"restored":true,"generation":7}' \
+    >"$output"
+  if assert_generation_fault_helper_output "$output" "$stderr_output" \
+    >/dev/null 2>&1; then
+    printf 'generation fault helper output disclosed an extra field\n' >&2
+    return 1
+  fi
+}
+
+test_generation_process_identity_is_namespace_qualified() {
+  local -r valid_status=$'Tgid:\t1\nNSpid:\t123\t1\nPidNamespace:\tpid:[4026532999]\nChildPidNamespace:\tpid:[4026532999]\nComm:\tjava\n'
+  local identity=""
+  local invalid_status=""
+  local control=""
+  local resolver=""
+
+  identity="$(
+    process_namespace_identity_from_snapshot "$valid_status" 1
+  )" || return $?
+  [[ "$identity" == "1 4026532999" ]] || {
+    printf 'generation identity did not select the namespace-qualified JVM PID\n' >&2
+    return 1
+  }
+
+  for invalid_status in \
+    $'Tgid:\t2\nNSpid:\t123\t1\nPidNamespace:\tpid:[4026532999]\nChildPidNamespace:\tpid:[4026532999]\nComm:\tjava\n' \
+    $'Tgid:\t1\nNSpid:\t123\t2\nPidNamespace:\tpid:[4026532999]\nChildPidNamespace:\tpid:[4026532999]\nComm:\tjava\n' \
+    $'Tgid:\t1\nNSpid:\t123\t1\nNSpid:\t123\t1\nPidNamespace:\tpid:[4026532999]\nChildPidNamespace:\tpid:[4026532999]\nComm:\tjava\n' \
+    $'Tgid:\t1\nNSpid:\t123\t1\nPidNamespace:\tpid:[4026532999]\nChildPidNamespace:\tpid:[4026533000]\nComm:\tjava\n' \
+    $'Tgid:\t1\nNSpid:\t123\t1\nPidNamespace:\tpid:[4026532999]\nChildPidNamespace:\tpid:[4026532999]\nComm:\tnot-java\n'; do
+    if process_namespace_identity_from_snapshot "$invalid_status" 1 \
+      >/dev/null 2>&1; then
+      printf 'generation identity accepted an invalid proc status snapshot\n' >&2
+      return 1
+    fi
+  done
+  if process_namespace_identity_from_snapshot \
+    "${valid_status/pid:\[4026532999\]/pid:[0]}" 1 >/dev/null 2>&1 || \
+    process_namespace_identity_from_snapshot \
+      "${valid_status//4026532999/4294967296}" 1 >/dev/null 2>&1; then
+    printf 'generation identity accepted an invalid namespace inode\n' >&2
+    return 1
+  fi
+
+  control="$(declare -f run_primary_generation_mismatch_control)" || return $?
+  resolver="$(declare -f resolve_container_process_namespace_identity)" || return $?
+  [[ "$control" == *'resolve_container_process_namespace_identity "$java_container"'* && \
+    "$control" == *'"$java_inspection_after" == "$java_inspection_before"'* && \
+    "$control" == *'--process-pid "$java_process_pid"'* && \
+    "$control" == *'--process-namespace "$java_process_namespace"'* && \
+    "$control" != *'/proc/$java_host_pid/'* && \
+    "$resolver" == *'docker exec "$container"'* && \
+    "$resolver" == *'/proc/1/ns/pid)'* && \
+    "$resolver" == *'/proc/1/ns/pid_for_children)'* ]] || {
+    printf 'generation helper invocation lost its exact namespace-qualified identity\n' >&2
+    return 1
+  }
+}
+
+test_generation_mismatch_mutation_spans_the_victim_take() {
+  local -ri backend_hold_milliseconds=20000
+  local -ri proxy_timeout_seconds=45
+  local -ri proxy_slack_seconds=5
+  local control=""
+  local armed_line=""
+  local release_barrier_line=""
+  local take_fence_line=""
+  local restore_release_line=""
+  local helper_reap_line=""
+  local helper_verify_line=""
+  local victim_reap_line=""
+  local consume_line=""
+
+  control="$(declare -f run_primary_generation_mismatch_control)" || return $?
+  armed_line="$(awk '/wait_for_generation_fault_armed/ { line = NR } END { print line }' \
+    <<<"$control")"
+  release_barrier_line="$(awk '/release_primary_live_fd_barrier/ { line = NR } END { print line }' \
+    <<<"$control")"
+  take_fence_line="$(awk '/wait_for_bridge_take_attempts_quiescent/ { line = NR } END { print line }' \
+    <<<"$control")"
+  restore_release_line="$(awk '/publish_generation_fault_release/ { line = NR } END { print line }' \
+    <<<"$control")"
+  helper_reap_line="$(awk '/wait_for_background_process "\$helper_pid"/ { line = NR } END { print line }' \
+    <<<"$control")"
+  helper_verify_line="$(awk '/assert_generation_fault_helper_output/ { line = NR } END { print line }' \
+    <<<"$control")"
+  victim_reap_line="$(awk '/wait_for_background_process "\$victim_pid"/ { line = NR } END { print line }' \
+    <<<"$control")"
+  consume_line="$(awk '/consume_primary_live_fd_barrier/ { line = NR } END { print line }' \
+    <<<"$control")"
+
+  [[ "$armed_line" =~ ^[1-9][0-9]*$ && \
+    "$release_barrier_line" =~ ^[1-9][0-9]*$ && \
+    "$take_fence_line" =~ ^[1-9][0-9]*$ && \
+    "$restore_release_line" =~ ^[1-9][0-9]*$ && \
+    "$helper_reap_line" =~ ^[1-9][0-9]*$ && \
+    "$helper_verify_line" =~ ^[1-9][0-9]*$ && \
+    "$victim_reap_line" =~ ^[1-9][0-9]*$ && \
+    "$consume_line" =~ ^[1-9][0-9]*$ && \
+    armed_line -lt release_barrier_line && \
+    release_barrier_line -lt take_fence_line && \
+    take_fence_line -lt restore_release_line && \
+    restore_release_line -lt helper_reap_line && \
+    helper_reap_line -lt helper_verify_line && \
+    helper_verify_line -lt victim_reap_line && \
+    victim_reap_line -lt consume_line ]] || {
+    printf 'generation mutation no longer spans the exact victim take and restore fence\n' >&2
+    return 1
+  }
+  [[ "$control" == *'consume_primary_live_fd_barrier "$consumption_evidence" primary-fault'* && \
+    "$control" == *'ALLOW_PRIMARY_SECURITY_METRICS=true'* && \
+    "$control" == *'MAX_SHELL_INTEGER - 4'* && \
+    "$control" == *'"$((before_take_attempts + 4))"'* && \
+    "$control" == *'assert_security_metric_delta'* && \
+    "$control" == *'"$metric_delta" take missing getsockopt 3 3'* ]] || {
+    printf 'generation mismatch lost its fault-stack or bounded missing evidence\n' >&2
+    return 1
+  }
+  ((GENERATION_FAULT_TAKE_FENCE_TIMEOUT_SECONDS * 1000 + \
+      GENERATION_FAULT_REAP_TIMEOUT_SECONDS * 1000 + \
+      proxy_slack_seconds * 1000 < \
+      backend_hold_milliseconds && \
+    PRIMARY_LIVE_FD_BARRIER_READY_TIMEOUT_SECONDS + \
+      GENERATION_FAULT_READY_TIMEOUT_SECONDS + \
+      backend_hold_milliseconds / 1000 + \
+      proxy_slack_seconds < \
+      proxy_timeout_seconds && \
+    proxy_timeout_seconds < \
+      GENERATION_FAULT_REQUEST_TIMEOUT_SECONDS && \
+    GENERATION_FAULT_REQUEST_TIMEOUT_SECONDS < 75 && \
+    GENERATION_FAULT_RELEASE_TIMEOUT_SECONDS < \
+      GENERATION_FAULT_HELPER_TIMEOUT_SECONDS)) || {
+    printf 'generation mismatch deadlines no longer preserve restore slack\n' >&2
+    return 1
+  }
+  grep -Fq 'requests[i].Endpoint = "/api/generation-fence"' \
+    "$TEST_SCRIPT_DIR/../tracecheck/cmd/scenario/main.go" || {
+    printf 'generation mismatch request lost its dedicated backend endpoint\n' >&2
+    return 1
+  }
+  grep -Fq 'requests[i].GenerationFenceHoldMillis = 20_000' \
+    "$TEST_SCRIPT_DIR/../tracecheck/cmd/scenario/main.go" || {
+    printf 'generation mismatch request lost its bounded backend hold\n' >&2
+    return 1
+  }
+  grep -Fq 'static final int MAX_GENERATION_FENCE_HOLD_MILLIS = 20_000;' \
+    "$TEST_SCRIPT_DIR/../java/src/main/java/io/opentelemetry/obi/examples/ApacheJavaHttpsBackend.java" || {
+    printf 'generation mismatch backend hold no longer matches the request contract\n' >&2
+    return 1
+  }
+  local -r apache_config="$TEST_SCRIPT_DIR/../apache/httpd.conf"
+  local generation_route_line=""
+  local default_route_line=""
+  generation_route_line="$(grep -Fn \
+    'ProxyPass "/api/generation-fence" "https://localhost:18443/api/generation-fence" connectiontimeout=3 timeout=45' \
+    "$apache_config" | cut -d: -f1)" || return $?
+  default_route_line="$(grep -Fn \
+    'ProxyPass "/" "https://localhost:18443/" connectiontimeout=3 timeout=10' \
+    "$apache_config" | cut -d: -f1)" || return $?
+  [[ "$generation_route_line" =~ ^[1-9][0-9]*$ && \
+    "$default_route_line" =~ ^[1-9][0-9]*$ && \
+    generation_route_line -lt default_route_line ]] || {
+    printf 'generation mismatch route lost its dedicated ordered proxy timeout\n' >&2
+    return 1
+  }
+}
+
+test_generation_take_fence_waits_for_the_fourth_attempt() {
+  local -r result_dir="$TEST_TMP_DIR/generation-take-fence"
+  local -r output="$result_dir/take-fence.prom"
+  local -r overshoot_output="$result_dir/take-fence-overshoot.prom"
+
+  mkdir -p -- "$result_dir"
+  (
+    RESULT_DIR="$result_dir"
+    SELECTED_TRANSPORT=getsockopt
+    ALLOW_PRIMARY_SECURITY_METRICS=false
+    ALLOW_UNIX_SECURITY_METRICS=false
+    local -i fetches=0
+    fetch_obi_metrics() {
+      local -r destination="$1"
+      local missing=2
+
+      ((fetches += 1))
+      if ((fetches >= 2)); then
+        missing=3
+      fi
+      printf '%s\n' \
+        'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 7' \
+        "obi_java_remote_parent_operations_total{operation=\"take\",status=\"missing\",transport=\"getsockopt\"} $missing" \
+        'obi_java_remote_parent_operations_total{operation="take",status="unauthorized",transport="getsockopt"} 1' \
+        'obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} 11' \
+        "obi_java_remote_parent_operations_total{operation=\"report\",status=\"valid\",transport=\"tcp\"} $fetches" \
+        >"$destination"
+    }
+    sleep() { :; }
+
+    wait_for_bridge_take_attempts_quiescent \
+      11 11 "$output" "generation victim take" 5
+    [[ "$fetches" == 3 && "$(bridge_take_attempt_total "$output")" == 11 ]]
+  ) || {
+    printf 'generation take fence passed before observing the victim attempt\n' >&2
+    return 1
+  }
+
+  if (
+    RESULT_DIR="$result_dir"
+    SELECTED_TRANSPORT=getsockopt
+    ALLOW_PRIMARY_SECURITY_METRICS=false
+    ALLOW_UNIX_SECURITY_METRICS=false
+    fetch_obi_metrics() {
+      printf '%s\n' \
+        'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 7' \
+        'obi_java_remote_parent_operations_total{operation="take",status="missing",transport="getsockopt"} 4' \
+        'obi_java_remote_parent_operations_total{operation="take",status="unauthorized",transport="getsockopt"} 1' \
+        'obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} 11' \
+        'obi_java_remote_parent_operations_total{operation="report",status="valid",transport="tcp"} 1' \
+        >"$1"
+    }
+    sleep() { :; }
+    wait_for_bridge_take_attempts_quiescent \
+      11 11 "$overshoot_output" "generation victim take" 5
+  ) >/dev/null 2>&1; then
+    printf 'generation take fence accepted an overshot attempt count\n' >&2
+    return 1
+  fi
 }
 
 test_primary_live_fd_descriptor_is_exact_and_bounded() {
@@ -15728,16 +16045,19 @@ compose_runtime_model_interpolation_is_allowlisted() {
   local -r expected_project_name="$PROJECT_NAME"
   local example_directory=""
   local expected_benchmark_source=""
+  local expected_generation_source=""
   local repository_root=""
 
   example_directory="$(cd -- "$TEST_SCRIPT_DIR/.." && pwd -P)" || return 2
   repository_root="$(cd -- "$example_directory/../.." && pwd -P)" || return 2
   expected_benchmark_source="$example_directory/\${BENCHMARK_CA_SOURCE:-./.runtime/certs/ca.crt}"
+  expected_generation_source="$example_directory/\${GENERATION_FAULT_CONTROL_SOURCE:-./.runtime/generation-fault-control}"
   jq -e -s \
     --arg example_directory "$example_directory" \
     --arg expected_project_name "$expected_project_name" \
     --arg repository_root "$repository_root" \
-    --arg expected_benchmark_source "$expected_benchmark_source" '
+    --arg expected_benchmark_source "$expected_benchmark_source" \
+    --arg expected_generation_source "$expected_generation_source" '
     def environment_array_keys:
       map(
         . as $entry
@@ -15948,6 +16268,15 @@ compose_runtime_model_interpolation_is_allowlisted() {
           }
         },
         {
+          service: "generation-fault",
+          volume: {
+            bind: {create_host_path: false},
+            source: $expected_generation_source,
+            target: "/control",
+            type: "bind"
+          }
+        },
+        {
           service: "java-backend",
           volume: {
             bind: {create_host_path: true},
@@ -16147,6 +16476,10 @@ compose_runtime_model_interpolation_is_allowlisted() {
           }
         },
         {
+          service: "generation-fault",
+          entrypoint: ["/generation-fault"]
+        },
+        {
           service: "java-backend",
           environment: {
             HTTPS_PORT: "18443",
@@ -16335,6 +16668,13 @@ compose_runtime_model_interpolation_is_allowlisted() {
           ]
         },
         {
+          service: "generation-fault",
+          keys: [
+            "entrypoint", "image", "labels", "network_mode", "privileged",
+            "profiles", "read_only", "volumes"
+          ]
+        },
+        {
           service: "java-backend",
           keys: [
             "build", "cap_add", "depends_on", "environment", "image",
@@ -16504,6 +16844,14 @@ compose_runtime_model_interpolation_is_allowlisted() {
           labels: ownership_labels,
           network_mode: "host",
           restart: "no"
+        },
+        {
+          service: "generation-fault",
+          image: tracecheck_image,
+          labels: ownership_labels,
+          network_mode: "none",
+          privileged: true,
+          read_only: true
         },
         {
           service: "java-backend",
@@ -16683,6 +17031,7 @@ compose_runtime_model_interpolation_is_allowlisted() {
           ) == [
             {service: "benchmark", profiles: ["tools"]},
             {service: "bridge-fault", profiles: ["tools"]},
+            {service: "generation-fault", profiles: ["tools"]},
             {service: "map-pressure", profiles: ["tools"]},
             {service: "map-state", profiles: ["tools"]},
             {service: "scenario", profiles: ["tools"]},
@@ -16773,6 +17122,10 @@ compose_runtime_model_interpolation_is_allowlisted() {
         {
           path: ["services", "benchmark", "volumes", 0, "source"],
           value: $expected_benchmark_source
+        },
+        {
+          path: ["services", "generation-fault", "volumes", 0, "source"],
+          value: $expected_generation_source
         },
         {
           path: ["services", "bridge-fault", "entrypoint", 4],
@@ -17856,6 +18209,7 @@ main() {
   test_helper_attach_failure_dispatch_and_seed_are_exact
   test_w3c_fault_requires_forced_unix
   test_primary_w3c_stale_requires_forced_primary
+  test_primary_generation_mismatch_requires_one_forced_primary
   test_unix_w3c_stale_requires_forced_unix
   test_primary_w3c_fault_requires_forced_primary
   test_primary_w3c_fault_modes_are_exact
@@ -17925,6 +18279,10 @@ main() {
   test_primary_security_metrics_are_explicitly_scoped
   test_primary_security_identity_requires_same_cgroup_and_nonroot_user
   test_primary_security_probe_is_not_self_certifying
+  test_generation_fault_protocol_and_output_are_exact
+  test_generation_process_identity_is_namespace_qualified
+  test_generation_mismatch_mutation_spans_the_victim_take
+  test_generation_take_fence_waits_for_the_fourth_attempt
   test_primary_live_fd_descriptor_is_exact_and_bounded
   test_primary_live_fd_probe_result_is_exact
   test_primary_live_fd_barrier_consumption_accepts_empty_inode

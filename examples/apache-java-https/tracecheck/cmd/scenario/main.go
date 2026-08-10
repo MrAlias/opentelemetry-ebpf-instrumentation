@@ -58,31 +58,32 @@ type config struct {
 }
 
 type requestCase struct {
-	Marker              string `json:"marker"`
-	Endpoint            string `json:"endpoint"`
-	W3CTraceID          string `json:"w3c_trace_id,omitempty"`
-	W3CParentSpanID     string `json:"w3c_parent_span_id,omitempty"`
-	W3CTraceFlags       string `json:"w3c_trace_flags,omitempty"`
-	W3CCase             string `json:"w3c_case,omitempty"`
-	InjectedFaultMode   string `json:"injected_fault_mode,omitempty"`
-	ExpectedJavaStatus  string `json:"expected_java_status,omitempty"`
-	RestartPhase        string `json:"restart_phase,omitempty"`
-	InvalidW3C          bool   `json:"invalid_w3c,omitempty"`
-	HandoffHops         int    `json:"handoff_hops,omitempty"`
-	HandoffFault        string `json:"handoff_fault,omitempty"`
-	VirtualMixed        bool   `json:"virtual_mixed,omitempty"`
-	VirtualCancel       bool   `json:"virtual_cancel,omitempty"`
-	NettyCancel         bool   `json:"netty_cancel,omitempty"`
-	DispatchRounds      int    `json:"dispatch_rounds,omitempty"`
-	TLSBoundaryMode     string `json:"tls_boundary_mode,omitempty"`
-	TLSBoundarySequence int    `json:"tls_boundary_sequence,omitempty"`
-	ConcurrencyBatch    string `json:"concurrency_batch,omitempty"`
-	ConcurrencyExpected int    `json:"concurrency_expected,omitempty"`
-	DelayMillis         int    `json:"-"`
-	SlowBodyBytes       int    `json:"-"`
-	CloseConnection     bool   `json:"-"`
-	ObserveSocket       bool   `json:"-"`
-	BridgeDiagnostics   bool   `json:"-"`
+	Marker                    string `json:"marker"`
+	Endpoint                  string `json:"endpoint"`
+	W3CTraceID                string `json:"w3c_trace_id,omitempty"`
+	W3CParentSpanID           string `json:"w3c_parent_span_id,omitempty"`
+	W3CTraceFlags             string `json:"w3c_trace_flags,omitempty"`
+	W3CCase                   string `json:"w3c_case,omitempty"`
+	InjectedFaultMode         string `json:"injected_fault_mode,omitempty"`
+	ExpectedJavaStatus        string `json:"expected_java_status,omitempty"`
+	RestartPhase              string `json:"restart_phase,omitempty"`
+	InvalidW3C                bool   `json:"invalid_w3c,omitempty"`
+	HandoffHops               int    `json:"handoff_hops,omitempty"`
+	HandoffFault              string `json:"handoff_fault,omitempty"`
+	VirtualMixed              bool   `json:"virtual_mixed,omitempty"`
+	VirtualCancel             bool   `json:"virtual_cancel,omitempty"`
+	NettyCancel               bool   `json:"netty_cancel,omitempty"`
+	DispatchRounds            int    `json:"dispatch_rounds,omitempty"`
+	TLSBoundaryMode           string `json:"tls_boundary_mode,omitempty"`
+	TLSBoundarySequence       int    `json:"tls_boundary_sequence,omitempty"`
+	ConcurrencyBatch          string `json:"concurrency_batch,omitempty"`
+	ConcurrencyExpected       int    `json:"concurrency_expected,omitempty"`
+	DelayMillis               int    `json:"-"`
+	GenerationFenceHoldMillis int    `json:"-"`
+	SlowBodyBytes             int    `json:"-"`
+	CloseConnection           bool   `json:"-"`
+	ObserveSocket             bool   `json:"-"`
+	BridgeDiagnostics         bool   `json:"-"`
 }
 
 type backendResponse struct {
@@ -633,6 +634,8 @@ func expectedPrimaryJavaFaultStatus(faultMode string) (string, bool) {
 		return "version_mismatch", true
 	case "bad-size", "zero-trace-id", "zero-span-id":
 		return "malformed", true
+	case "generation-mismatch":
+		return "missing", true
 	default:
 		return "", false
 	}
@@ -960,6 +963,13 @@ func makeRequests(cfg config) ([]requestCase, error) {
 			}
 			requests[i].InjectedFaultMode = cfg.faultMode
 			requests[i].ExpectedJavaStatus = expectedStatus
+			if cfg.faultMode == "generation-mismatch" {
+				// Keep the accepted connection open after extraction so the
+				// coordinator can observe the missing take and restore the exact
+				// owner tuple before socket-close cleanup runs.
+				requests[i].Endpoint = "/api/generation-fence"
+				requests[i].GenerationFenceHoldMillis = 20_000
+			}
 			caseName := fmt.Sprintf(
 				"valid-w3c-primary-injected-%s-java-%s",
 				cfg.faultMode,
@@ -1757,6 +1767,14 @@ func newHTTPRequest(ctx context.Context, cfg config, requestCase requestCase) (*
 	if requestCase.DelayMillis > 0 {
 		query := requestURL.Query()
 		query.Set("delay_ms", strconv.Itoa(requestCase.DelayMillis))
+		requestURL.RawQuery = query.Encode()
+	}
+	if requestCase.GenerationFenceHoldMillis > 0 {
+		query := requestURL.Query()
+		query.Set(
+			"generation_fence_hold_ms",
+			strconv.Itoa(requestCase.GenerationFenceHoldMillis),
+		)
 		requestURL.RawQuery = query.Encode()
 	}
 	if requestCase.ConcurrencyBatch != "" {

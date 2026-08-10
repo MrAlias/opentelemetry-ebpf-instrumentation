@@ -36,6 +36,54 @@ class ApacheJavaHttpsBackendTest {
       "version=2,status=1,requested=2,selected=2,attempted=2,getsockopt=0,unix=1";
 
   @Test
+  void generationFenceHoldIsExplicitAndBounded() {
+    assertEquals(0, ApacheJavaHttpsBackend.parseGenerationFenceHold(null, null, false));
+    assertEquals(
+        ApacheJavaHttpsBackend.MAX_GENERATION_FENCE_HOLD_MILLIS,
+        ApacheJavaHttpsBackend.parseGenerationFenceHold("20000", "1", true));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> ApacheJavaHttpsBackend.parseGenerationFenceHold("20000", "1", false));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> ApacheJavaHttpsBackend.parseGenerationFenceHold("20000", null, true));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> ApacheJavaHttpsBackend.parseGenerationFenceHold("0", "1", true));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> ApacheJavaHttpsBackend.parseGenerationFenceHold("20001", "1", true));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> ApacheJavaHttpsBackend.parseGenerationFenceHold("not-a-number", "1", true));
+  }
+
+  @Test
+  void generationFenceServletPathIsExact() {
+    ServletContextHandler context = new ServletContextHandler();
+    ApacheJavaHttpsBackend.configureServlets(context, "TLSv1.3", null);
+
+    Map<String, String> generationFenceServlets = new HashMap<>();
+    String expectedClass =
+        ApacheJavaHttpsBackend.class.getName() + "$GenerationFenceServlet";
+    for (ServletMapping mapping : context.getServletHandler().getServletMappings()) {
+      String servletClass =
+          context
+              .getServletHandler()
+              .getServlet(mapping.getServletName())
+              .getHeldClass()
+              .getName();
+      if (!expectedClass.equals(servletClass)) {
+        continue;
+      }
+      for (String path : mapping.getPathSpecs()) {
+        assertNull(generationFenceServlets.put(path, servletClass));
+      }
+    }
+    assertEquals(Map.of("/api/generation-fence", expectedClass), generationFenceServlets);
+  }
+
+  @Test
   void diagnosticServletPathsAreExact() {
     ServletContextHandler context = new ServletContextHandler();
     ApacheJavaHttpsBackend.configureServlets(context, "TLSv1.3", null);

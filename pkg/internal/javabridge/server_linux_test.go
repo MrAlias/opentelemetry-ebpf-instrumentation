@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -1146,8 +1147,8 @@ func TestProcIdentityResolverRejectsLiveThreadFromAnotherProcess(t *testing.T) {
 	sharedNamespace := filepath.Join(root, "shared-pid-namespace")
 	require.NoError(t, os.WriteFile(sharedNamespace, nil, 0o600))
 	writeProcess := func(pid int32, namespacePID uint32) {
-		processDir := filepath.Join(root, fmt.Sprint(pid))
-		taskDir := filepath.Join(processDir, "task", fmt.Sprint(pid))
+		processDir := filepath.Join(root, strconv.Itoa(int(pid)))
+		taskDir := filepath.Join(processDir, "task", strconv.Itoa(int(pid)))
 		namespaceDir := filepath.Join(processDir, "ns")
 		require.NoError(t, os.MkdirAll(taskDir, 0o750))
 		require.NoError(t, os.MkdirAll(namespaceDir, 0o750))

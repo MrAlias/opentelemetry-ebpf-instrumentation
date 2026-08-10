@@ -198,7 +198,7 @@ func (c *Cleanup) recoverGoGenerationProducerClaim(
 	}
 
 	if !taggedGuard {
-		guardMatches, err = generationGuardMatches(c.maps.ownerGuards, key.Owner, guard)
+		_, err = generationGuardMatches(c.maps.ownerGuards, key.Owner, guard)
 		if err != nil {
 			return fmt.Errorf("revalidating adopted cleanup guard: %w", err)
 		}

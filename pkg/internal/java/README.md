@@ -220,6 +220,17 @@ java -javaagent:/path/to/obi-java-agent.jar=debug=true \
 
 or for dynamic attach
 
+Dynamic HotSpot attachment requires Linux `pidfd_send_signal` support
+(upstream Linux 5.1 or a distribution backport); OBI can use a stable
+`/proc/<pid>` descriptor when `pidfd_open` is unavailable. The descriptor is
+pinned while discovery constructs the executable identity and duplicated into
+each prepared attachment, so a delayed authorization never reopens a numeric
+PID. OpenJ9 additionally
+requires `pidfd_open` and `pidfd_getfd` (upstream Linux 5.6 or backports) to
+prove that the accepted TCP attach client is owned by the exact JVM. OBI fails
+closed when these exact-process primitives are unavailable and never falls
+back to a numeric PID signal or an unverified TCP peer.
+
 ```bash
 jattach <PID of Java program> load instrument false "/path/to/obi-java-agent.jar=debug=true"
 ```

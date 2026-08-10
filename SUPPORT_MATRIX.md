@@ -31,9 +31,19 @@ OBI supports Linux environments that meet all of the following requirements:
 | BTF | Kernel must expose BTF information |
 | CPU architecture | `amd64`, `arm64` |
 | Privileges | Root, or the Linux capabilities required by the enabled OBI features |
+| Dynamic Java agent attachment | Exact signaling requires `pidfd_send_signal` (upstream Linux `5.1+` or a distribution backport); OpenJ9 peer verification additionally requires `pidfd_open` and `pidfd_getfd` (upstream Linux `5.6+` or backports) |
 
 RHEL-based distributions in scope for the `4.18+` exception include RHEL 8, CentOS 8, Rocky Linux 8, AlmaLinux 8,
 and compatible derivatives that provide the required eBPF backports and BTF support.
+The RHEL `4.18+` exception covers OBI's baseline network instrumentation.
+HotSpot dynamic attachment also works when the distribution backports
+`pidfd_send_signal`, using a stable `/proc/<pid>` descriptor rather than a
+numeric PID. OBI pins that descriptor during executable discovery and
+duplicates it for each prepared attachment, so delayed authorization cannot
+follow a reused numeric PID. OpenJ9 attachment fails closed unless `pidfd_open` and
+`pidfd_getfd` are also available, because its TCP attach client otherwise
+cannot be bound atomically to the exact JVM. OBI never falls back to a numeric
+PID signal or an unverified OpenJ9 client.
 
 ## Validation Coverage
 

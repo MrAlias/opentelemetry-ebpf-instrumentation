@@ -356,7 +356,7 @@ The authoritative identities and transitions are:
 | Java TLS receive owner | Exact `SSLEngine` connection owner or directly owned JSSE `Socket`, lifecycle, and bridge epoch | Application-visible HTTP/1.1 plaintext enters the per-owner framer | Terminal framing ambiguity, native failure, provider-epoch retirement, socket or channel close, weak-owner reclamation, active-connection eviction, restart |
 | HTTP/1 receive cursor | Socket cookie, exact Java lifecycle and request sequence | Authenticated `START` publishes `PUBLISHING`; HTTP acknowledgement commits `VALID` | Exact `RESET`, replacement, socket close, parse/ack/tail-call failure, restart |
 | Java request | PID namespace, process ID, logical TID | Parsed Java TLS HTTP/1.1 request | Take, discard, completion, stale sweep, exact process retirement, restart |
-| Task handoff | Process, PID namespace, opaque submission token, shared one-shot accepted-socket holder | Java submission capture | Exact one-shot link, cancellation, rejection, task-scope restoration, stale sweep, bounded-map eviction |
+| Task handoff | Process, PID namespace, opaque submission token, JVM capability, shared one-shot accepted-socket holder | Java submission capture | Exact one-shot link, cancellation, rejection, task-scope restoration, exact process retirement |
 | Alias replay | Owner, generation, observation time, JVM capability, tuple, network namespace, namespace cookie, socket cookie | Exact task/handoff retain before carrier publication | Last carrier release after final outcome, coordinated sweep, restart |
 | Virtual thread | Stable virtual-thread identity across carrier mounts | Mount translates the carrier to the virtual-thread ID | Take, discard, virtual-thread termination, bounded-map eviction, restart |
 | Consumed | Original Java request key and generation | Atomic take or discard | TTL sweep, bounded-map eviction, restart |
@@ -387,7 +387,8 @@ the first fallible tuple read and before file, socket, namespace, or tuple
 validation. An early-rejected receive therefore cannot retrieve the preceding
 request. A generation already retained by an exact task alias remains present
 without a direct cursor and is reachable only through that exact task link.
-This boundary also applies when the LRU process-registration entry was evicted:
+This boundary also applies when the non-evicting process-registration entry is
+temporarily absent during authorization teardown or recovery:
 the non-evicting authorization capability may recover an exact mounted virtual
 thread identity for cleanup only, while ordinary translation and retrieval
 continue to require registration. The synthetic owner and its carrier are both
@@ -474,23 +475,73 @@ and ambiguity maps remain `HASH` maps: eviction cannot erase a one-shot claim
 or resurrect an ambiguous generation. A userspace sweep revalidates the exact
 owner, generation, capability, and map value before deleting stale state,
 connections, fallback records, owners, terminals, claims, owner guards,
-ambiguity markers, alias replays, task links, handoffs, and handoff-claim
-tombstones. Cleanup keeps the generation claim through index and owner
-deletion, so a concurrent publisher cannot reuse the owner slot before cleanup
-releases it.
+ambiguity markers, alias replays, task links, and handoffs. Handoff-claim
+entries are non-evicting admission tickets rather than terminal tombstones. A
+synchronous producer reserves a byte-exact, high-bit-tagged `OPEN` ticket
+before it can retain an alias or publish `H`. If `C` is full, capture fails
+before `H` exists. The process-local token is fresh and is not exposed until
+that reservation succeeds, so no later producer can recreate the same handoff
+key. `LINK` and `CANCEL` terminalize the token by deleting `OPEN` before
+contending for `M`; successful deletion is the only transfer winner. A missing,
+changed, delete-failed, or rolling-version untagged `C` can only drain `H`,
+never transfer it. The publisher revalidates its exact ticket under `M`
+immediately before exposure and drains its retained alias if terminal deletion
+won. Recurrent cleanup removes a byte-exact `C` only after repeated no-`H`
+observations under `M`. Cleanup keeps the generation claim through index and
+owner deletion, so a concurrent publisher cannot reuse the owner slot before
+cleanup releases it.
 
 The shared bridge object observes `sched_process_exit` and records retirement
-only when the process's last thread exits. A retirement key includes the full
-PID-namespace process identity and the unpredictable process capability. The
-sweeper uses that key to remove request generations from that JVM while
-preserving state registered by a later process that reused the same numeric
-PID. Reusable-key virtual-thread maps are not deleted asynchronously: every
-lookup revalidates the capability, and their LRU bounds stale entries
-until overwrite or eviction. This avoids deleting a newly published mapping
-after rapid PID, carrier, or virtual-thread-ID reuse. Process deletion
-notifications trigger an immediate sweep; a bounded periodic sweep handles
-missed notifications and TTL expiry. All lifecycle maps have fixed maximum
-sizes.
+when the process's last thread exits. `PROCESS_REGISTER` also records the exact
+predecessor capability before rotating from `A` to `B`. A retirement key
+includes the full PID-namespace process identity and the unpredictable process
+capability. Every alias-creating direct or relay capture acquires the same
+non-evicting `P(process)` claim, revalidates its capability, and keeps `P`
+outside `T(execution)` and `M(handoff)`. An `A` publisher that wins `P` therefore
+finishes before rotation records `R(A)`; one that loses observes `B` and makes
+no persistent mutation. This makes a rotation marker the same durable
+writer-death authority as the last-thread marker.
+
+The sweeper uses the capability-keyed marker to remove request generations
+while preserving state registered by a later incarnation or process that
+reused the same numeric PID. Retirement is only a cleanup candidate until the
+sweeper acquires `P`, reads the current incarnation again, and keeps `P`
+through every mutation authorized by that result. A matching incarnation is
+preserved until cleanup has established the exact retirement root under `P`;
+cleanup then removes only `I(A)` and leaves a successor `I(B)` intact.
+`PROCESS_REGISTER` never clears `R(target)` and refuses to register a
+capability once that exact retirement marker exists. Cleanup preserves the
+marker while its matching incarnation is still visible because last-thread
+exit publishes the marker before authorization teardown removes that
+incarnation, and a failed rotation may record `R(A)` while `A` remains current.
+Capabilities are fresh per attachment and are never deliberately re-authorized
+after retirement.
+
+A parked virtual thread may have no carrier mount from which kernel exit
+cleanup can reconstruct its synthetic task key. For that case the sweeper
+requires the durable exact retirement marker, then uses
+`P(process) -> T(execution)`, revalidates the exact old-capability task,
+deletes only that value, releases `T`, and releases `P` last. Handoff cleanup
+requires the same marker and uses `P(process) -> M(handoff)`: `P` excludes all
+positive publishers for the retired capability, while transient `M` keeps the
+reusable key stable through the exact delete. Userspace never inserts `C`.
+Each sweep first recovers tagged interrupted `M` entries, then reclaims no-`H`
+admission tickets, retires `H`, and runs the ticket pass again. Consequently a
+full `C` entry and a disjoint full `M` entry cannot wait on one another.
+Carrier deletion needs this stronger writer-death proof because userspace
+cannot run the normal BPF alias-release path. A positive-reference replay also
+requires the marker because direct capture and alias retention do not all take
+`P`; the marker is retained until task, handoff, replay, and tagged-claim scans
+have converged. Interrupted userspace `P`, `T`, and `M` claims are tagged and
+recovered by the next sweep. Recovery never opens a subordinate claim under a
+foreign `P`, and lookup uncertainty keeps the fences closed. Reusable
+virtual-thread lookups always revalidate
+capability; lifecycle events remove the non-evicting mount entries, while the
+bounded full-width identity guards may evict. This avoids deleting a newly
+published mapping after rapid PID, carrier, or virtual-thread-ID reuse. Process
+deletion notifications trigger an immediate sweep; a bounded periodic sweep
+handles missed notifications and TTL expiry. All lifecycle maps have fixed
+maximum sizes.
 
 Sequential HTTP/1.1 keepalive requests are supported because each parsed
 request creates and resolves a generation. Split reads may accumulate until a

@@ -35,4 +35,10 @@ int obi_demo_java_remote_parent_same_fd_thread_probe_outcome_for_test(void);
 int obi_demo_java_remote_parent_classify_same_fd_probe_for_test(
     int result, int probe_errno, const unsigned char *response,
     socklen_t response_length);
+void obi_demo_java_remote_parent_reset_auto_unavailable_counts_for_test(void);
+unsigned int
+obi_demo_java_remote_parent_auto_unavailable_health_count_for_test(void);
+unsigned int
+obi_demo_java_remote_parent_auto_unavailable_connect_count_for_test(void);
+unsigned int obi_demo_java_remote_parent_real_connect_count_for_test(void);
 #endif

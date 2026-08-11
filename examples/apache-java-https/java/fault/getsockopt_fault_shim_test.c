@@ -12,12 +12,15 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -27,6 +30,7 @@ enum {
   java_remote_parent_socket_level = 0x4f42,
   java_remote_parent_socket_take = 0x4a01,
   java_remote_parent_socket_discard = 0x4a02,
+  java_remote_parent_socket_health = 0x4a05,
   java_remote_parent_status_valid = 1,
   java_remote_parent_status_missing = 2,
   java_remote_parent_version_offset = 4,
@@ -63,6 +67,10 @@ static const char fault_file_environment[] =
     "OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_FILE";
 static const char java_remote_parent_magic[] = "OBIJ";
 static const char java_remote_parent_live_fd_barrier_mode[] = "live-fd-barrier";
+static const char java_remote_parent_auto_unavailable_mode[] =
+    "auto-unavailable";
+static const char java_remote_parent_unix_socket_path[] =
+    "/var/run/obi/java-remote-parent.sock";
 static const char java_remote_parent_live_fd_ready_prefix[] = "ready:";
 static const char java_remote_parent_live_fd_release_prefix[] = "release:";
 static char fault_file_path[] = "/tmp/obi-java-fault-shim.XXXXXX";
@@ -612,6 +620,319 @@ static void test_same_fd_probe_requires_canonical_missing_response(void) {
              0, 0, response, sizeof(response)) ==
          java_remote_parent_probe_unsafe);
 }
+
+struct auto_unavailable_attempt {
+  pthread_barrier_t *barrier;
+  int socket;
+  const struct sockaddr_un *address;
+  socklen_t address_length;
+  _Atomic bool complete;
+  int health_result;
+  int health_error;
+  int connect_result;
+  int connect_error;
+};
+
+static void *probe_auto_unavailable_concurrently(void *argument) {
+  struct auto_unavailable_attempt *const attempt = argument;
+  const int barrier_result = pthread_barrier_wait(attempt->barrier);
+  assert(barrier_result == 0 ||
+         barrier_result == PTHREAD_BARRIER_SERIAL_THREAD);
+
+  uint64_t health = 0;
+  socklen_t health_length = sizeof(health);
+  attempt->health_result =
+      getsockopt(attempt->socket, java_remote_parent_socket_level,
+                 java_remote_parent_socket_health, &health, &health_length);
+  attempt->health_error = errno;
+
+  const int client = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  assert(client >= 0);
+  attempt->connect_result =
+      connect(client, (const struct sockaddr *)attempt->address,
+              attempt->address_length);
+  attempt->connect_error = errno;
+  assert(close(client) == 0);
+  atomic_store_explicit(&attempt->complete, true, memory_order_release);
+  return NULL;
+}
+
+static unsigned int
+wait_for_auto_unavailable_attempts(struct auto_unavailable_attempt *attempts,
+                                   size_t attempt_count) {
+  const struct timespec delay = {
+      .tv_sec = 0,
+      .tv_nsec = java_remote_parent_live_fd_barrier_wait_nanoseconds,
+  };
+  for (unsigned int wait = 0;
+       wait < java_remote_parent_live_fd_barrier_wait_attempts; wait++) {
+    unsigned int completed = 0;
+    for (size_t index = 0; index < attempt_count; index++) {
+      if (atomic_load_explicit(&attempts[index].complete,
+                               memory_order_acquire)) {
+        completed++;
+      }
+    }
+    if (completed == attempt_count) {
+      return completed;
+    }
+    assert(nanosleep(&delay, NULL) == 0);
+  }
+  return 0;
+}
+
+static unsigned int run_auto_unavailable_attempts_while_exclusively_locked(
+    int socket, const struct sockaddr_un *address, socklen_t address_length,
+    struct auto_unavailable_attempt *attempts, pthread_t *threads,
+    size_t attempt_count) {
+  const int exclusive_reader =
+      open(fault_file_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  assert(exclusive_reader >= 0);
+  assert(flock(exclusive_reader, LOCK_EX | LOCK_NB) == 0);
+
+  pthread_barrier_t barrier;
+  assert(pthread_barrier_init(&barrier, NULL,
+                              (unsigned int)attempt_count + 1) == 0);
+  for (size_t index = 0; index < attempt_count; index++) {
+    attempts[index] = (struct auto_unavailable_attempt){
+        .barrier = &barrier,
+        .socket = socket,
+        .address = address,
+        .address_length = address_length,
+        .complete = false,
+        .health_result = 0,
+        .health_error = 0,
+        .connect_result = 0,
+        .connect_error = 0,
+    };
+    assert(pthread_create(&threads[index], NULL,
+                          probe_auto_unavailable_concurrently,
+                          &attempts[index]) == 0);
+  }
+  const int barrier_result = pthread_barrier_wait(&barrier);
+  assert(barrier_result == 0 ||
+         barrier_result == PTHREAD_BARRIER_SERIAL_THREAD);
+  const unsigned int completed_while_locked =
+      wait_for_auto_unavailable_attempts(attempts, attempt_count);
+  assert(flock(exclusive_reader, LOCK_UN) == 0);
+  assert(close(exclusive_reader) == 0);
+  for (size_t index = 0; index < attempt_count; index++) {
+    assert(pthread_join(threads[index], NULL) == 0);
+  }
+  assert(pthread_barrier_destroy(&barrier) == 0);
+  return completed_while_locked;
+}
+
+static void test_auto_unavailable_is_exact_persistent_and_recoverable(void) {
+  int sockets[2];
+  assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+  set_fault_mode(java_remote_parent_auto_unavailable_mode);
+  obi_demo_java_remote_parent_reset_auto_unavailable_counts_for_test();
+  obi_demo_java_remote_parent_reset_real_getsockopt_call_count_for_test();
+
+  struct sockaddr_un address;
+  memset(&address, 0, sizeof(address));
+  address.sun_family = AF_UNIX;
+  assert(strlen(java_remote_parent_unix_socket_path) <
+         sizeof(address.sun_path));
+  memcpy(address.sun_path, java_remote_parent_unix_socket_path,
+         sizeof(java_remote_parent_unix_socket_path));
+  const socklen_t address_length =
+      (socklen_t)(offsetof(struct sockaddr_un, sun_path) +
+                  sizeof(java_remote_parent_unix_socket_path));
+
+  pthread_t threads[java_remote_parent_concurrent_attempt_count];
+  struct auto_unavailable_attempt
+      attempts[java_remote_parent_concurrent_attempt_count];
+  assert(run_auto_unavailable_attempts_while_exclusively_locked(
+             sockets[0], &address, address_length, attempts, threads,
+             java_remote_parent_concurrent_attempt_count) ==
+         java_remote_parent_concurrent_attempt_count);
+  for (size_t index = 0; index < java_remote_parent_concurrent_attempt_count;
+       index++) {
+    assert(attempts[index].health_result == -1);
+    assert(attempts[index].health_error == ENOPROTOOPT);
+    assert(attempts[index].connect_result == -1);
+    assert(attempts[index].connect_error == ECONNREFUSED);
+  }
+
+  for (unsigned int attempt = 0; attempt < 2; attempt++) {
+    uint64_t health = 0;
+    socklen_t health_length = sizeof(health);
+    assert(getsockopt(sockets[0], java_remote_parent_socket_level,
+                      java_remote_parent_socket_health, &health,
+                      &health_length) == -1);
+    assert(errno == ENOPROTOOPT);
+
+    const int client = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    assert(client >= 0);
+    assert(connect(client, (const struct sockaddr *)&address, address_length) ==
+           -1);
+    assert(errno == ECONNREFUSED);
+    assert(close(client) == 0);
+    assert(fault_file_matches(java_remote_parent_auto_unavailable_mode));
+  }
+  assert(obi_demo_java_remote_parent_auto_unavailable_health_count_for_test() ==
+         java_remote_parent_concurrent_attempt_count + 2);
+  assert(
+      obi_demo_java_remote_parent_auto_unavailable_connect_count_for_test() ==
+      java_remote_parent_concurrent_attempt_count + 2);
+  assert(obi_demo_java_remote_parent_real_getsockopt_call_count_for_test() ==
+         0);
+  assert(obi_demo_java_remote_parent_real_connect_count_for_test() == 0);
+
+  int socket_type = 0;
+  socklen_t socket_type_length = sizeof(socket_type);
+  assert(getsockopt(sockets[0], SOL_SOCKET, SO_TYPE, &socket_type,
+                    &socket_type_length) == 0);
+  assert(socket_type == SOCK_STREAM);
+  assert(obi_demo_java_remote_parent_real_getsockopt_call_count_for_test() ==
+         1);
+
+  const int other = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  assert(other >= 0);
+  struct sockaddr_un other_address;
+  memset(&other_address, 0, sizeof(other_address));
+  other_address.sun_family = AF_UNIX;
+  assert(strlen(fault_symlink_path) < sizeof(other_address.sun_path));
+  memcpy(other_address.sun_path, fault_symlink_path,
+         strlen(fault_symlink_path) + 1);
+  const socklen_t other_length =
+      (socklen_t)(offsetof(struct sockaddr_un, sun_path) +
+                  strlen(fault_symlink_path) + 1);
+  assert(connect(other, (const struct sockaddr *)&other_address,
+                 other_length) == -1);
+  assert(errno == ENOENT);
+  assert(
+      obi_demo_java_remote_parent_auto_unavailable_connect_count_for_test() ==
+      java_remote_parent_concurrent_attempt_count + 2);
+  assert(obi_demo_java_remote_parent_real_connect_count_for_test() == 1);
+  assert(close(other) == 0);
+
+  const int trailing = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  assert(trailing >= 0);
+  struct sockaddr_un trailing_address = address;
+  trailing_address.sun_path[sizeof(java_remote_parent_unix_socket_path)] = 'x';
+  const int trailing_connect = connect(
+      trailing, (const struct sockaddr *)&trailing_address, address_length + 1);
+  assert(trailing_connect == 0 || trailing_connect == -1);
+  assert(
+      obi_demo_java_remote_parent_auto_unavailable_connect_count_for_test() ==
+      java_remote_parent_concurrent_attempt_count + 2);
+  assert(obi_demo_java_remote_parent_real_connect_count_for_test() == 2);
+  assert(close(trailing) == 0);
+
+  assert(connect(-1, (const struct sockaddr *)&address, address_length) == -1);
+  assert(errno == EBADF);
+  assert(
+      obi_demo_java_remote_parent_auto_unavailable_connect_count_for_test() ==
+      java_remote_parent_concurrent_attempt_count + 2);
+  assert(obi_demo_java_remote_parent_real_connect_count_for_test() == 3);
+
+  const struct sockaddr *const invalid_address =
+      (const struct sockaddr *)(uintptr_t)1;
+  assert(connect(-1, invalid_address, address_length) == -1);
+  assert(errno == EBADF);
+  assert(
+      obi_demo_java_remote_parent_auto_unavailable_connect_count_for_test() ==
+      java_remote_parent_concurrent_attempt_count + 2);
+  assert(obi_demo_java_remote_parent_real_connect_count_for_test() == 4);
+
+  const int non_socket = open(fault_file_path, O_RDONLY | O_CLOEXEC);
+  assert(non_socket >= 0);
+  assert(connect(non_socket, invalid_address, address_length) == -1);
+  assert(errno == ENOTSOCK || errno == EFAULT);
+  assert(
+      obi_demo_java_remote_parent_auto_unavailable_connect_count_for_test() ==
+      java_remote_parent_concurrent_attempt_count + 2);
+  assert(obi_demo_java_remote_parent_real_connect_count_for_test() == 5);
+  assert(close(non_socket) == 0);
+
+  const int inet = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  assert(inet >= 0);
+  const int inet_connect =
+      connect(inet, (const struct sockaddr *)&address, address_length);
+  assert(inet_connect == 0 || inet_connect == -1);
+  assert(
+      obi_demo_java_remote_parent_auto_unavailable_connect_count_for_test() ==
+      java_remote_parent_concurrent_attempt_count + 2);
+  assert(obi_demo_java_remote_parent_real_connect_count_for_test() == 6);
+  assert(close(inet) == 0);
+
+  const int datagram = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  assert(datagram >= 0);
+  const int datagram_connect =
+      connect(datagram, (const struct sockaddr *)&address, address_length);
+  assert(datagram_connect == 0 || datagram_connect == -1);
+  assert(
+      obi_demo_java_remote_parent_auto_unavailable_connect_count_for_test() ==
+      java_remote_parent_concurrent_attempt_count + 2);
+  assert(obi_demo_java_remote_parent_real_connect_count_for_test() == 7);
+  assert(close(datagram) == 0);
+
+  set_fault_mode(NULL);
+  assert(fault_file_matches(""));
+
+  uint64_t recovered_health = 0;
+  socklen_t recovered_health_length = sizeof(recovered_health);
+  assert(getsockopt(sockets[0], java_remote_parent_socket_level,
+                    java_remote_parent_socket_health, &recovered_health,
+                    &recovered_health_length) == -1);
+  assert(obi_demo_java_remote_parent_real_getsockopt_call_count_for_test() ==
+         2);
+  assert(obi_demo_java_remote_parent_auto_unavailable_health_count_for_test() ==
+         java_remote_parent_concurrent_attempt_count + 2);
+
+  const int recovered_client = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  assert(recovered_client >= 0);
+  const int recovered_connect = connect(
+      recovered_client, (const struct sockaddr *)&address, address_length);
+  assert(recovered_connect == 0 || recovered_connect == -1);
+  assert(obi_demo_java_remote_parent_real_connect_count_for_test() == 8);
+  assert(
+      obi_demo_java_remote_parent_auto_unavailable_connect_count_for_test() ==
+      java_remote_parent_concurrent_attempt_count + 2);
+  assert(close(recovered_client) == 0);
+
+  assert(close(sockets[0]) == 0);
+  assert(close(sockets[1]) == 0);
+}
+
+static void test_persistent_probe_does_not_wait_on_other_fault_modes(void) {
+  int sockets[2];
+  assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+  set_fault_mode(java_remote_parent_live_fd_barrier_mode);
+  obi_demo_java_remote_parent_reset_auto_unavailable_counts_for_test();
+  obi_demo_java_remote_parent_reset_real_getsockopt_call_count_for_test();
+
+  struct sockaddr_un address;
+  memset(&address, 0, sizeof(address));
+  address.sun_family = AF_UNIX;
+  memcpy(address.sun_path, java_remote_parent_unix_socket_path,
+         sizeof(java_remote_parent_unix_socket_path));
+  const socklen_t address_length =
+      (socklen_t)(offsetof(struct sockaddr_un, sun_path) +
+                  sizeof(java_remote_parent_unix_socket_path));
+
+  pthread_t thread;
+  struct auto_unavailable_attempt attempt;
+  assert(run_auto_unavailable_attempts_while_exclusively_locked(
+             sockets[0], &address, address_length, &attempt, &thread, 1) == 1);
+  assert(obi_demo_java_remote_parent_auto_unavailable_health_count_for_test() ==
+         0);
+  assert(
+      obi_demo_java_remote_parent_auto_unavailable_connect_count_for_test() ==
+      0);
+  assert(obi_demo_java_remote_parent_real_getsockopt_call_count_for_test() ==
+         1);
+  assert(obi_demo_java_remote_parent_real_connect_count_for_test() == 1);
+  assert(fault_file_matches(java_remote_parent_live_fd_barrier_mode));
+
+  set_fault_mode(NULL);
+  assert(close(sockets[0]) == 0);
+  assert(close(sockets[1]) == 0);
+}
+
 struct live_fd_barrier_attempt {
   int socket;
   _Atomic bool complete;
@@ -815,6 +1136,8 @@ int main(void) {
   test_only_exact_successful_take_responses_mutate();
   test_interposed_getsockopt_forwards_non_obi_calls();
   test_same_fd_probe_requires_canonical_missing_response();
+  test_auto_unavailable_is_exact_persistent_and_recoverable();
+  test_persistent_probe_does_not_wait_on_other_fault_modes();
   test_live_fd_barrier_blocks_exact_take_until_release();
   test_live_fd_barrier_ignores_non_matching_requests();
   test_live_fd_barrier_times_out_boundedly();

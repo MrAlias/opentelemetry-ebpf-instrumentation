@@ -14,12 +14,14 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -33,6 +35,7 @@ enum {
   java_remote_parent_abi_version = 1,
   java_remote_parent_socket_level = 0x4f42,
   java_remote_parent_socket_take = 0x4a01,
+  java_remote_parent_socket_health = 0x4a05,
   java_remote_parent_socket_task_take = 0x4a06,
   java_remote_parent_status_valid = 1,
   java_remote_parent_status_missing = 2,
@@ -66,6 +69,10 @@ static const char java_remote_parent_fault_file_environment[] =
     "OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_FILE";
 static const char java_remote_parent_magic[] = "OBIJ";
 static const char java_remote_parent_live_fd_barrier_mode[] = "live-fd-barrier";
+static const char java_remote_parent_auto_unavailable_mode[] =
+    "auto-unavailable";
+static const char java_remote_parent_unix_socket_path[] =
+    "/var/run/obi/java-remote-parent.sock";
 static const char java_remote_parent_live_fd_ready_prefix[] = "ready:";
 static const char java_remote_parent_live_fd_release_prefix[] = "release:";
 
@@ -79,9 +86,12 @@ enum java_remote_parent_fault_mode {
 };
 
 typedef int (*getsockopt_fn)(int, int, int, void *, socklen_t *);
+typedef int (*connect_fn)(int, __CONST_SOCKADDR_ARG, socklen_t);
 
 static getsockopt_fn real_getsockopt;
 static pthread_once_t real_getsockopt_once = PTHREAD_ONCE_INIT;
+static connect_fn real_connect;
+static pthread_once_t real_connect_once = PTHREAD_ONCE_INIT;
 
 #if defined(OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TESTING)
 static int java_remote_parent_live_fd_barrier_timeout_for_test =
@@ -98,6 +108,11 @@ static _Atomic int java_remote_parent_same_fd_task_probe_outcome_for_test;
 static _Atomic unsigned int
     java_remote_parent_same_fd_thread_probe_count_for_test;
 static _Atomic int java_remote_parent_same_fd_thread_probe_outcome_for_test;
+static _Atomic unsigned int
+    java_remote_parent_auto_unavailable_health_count_for_test;
+static _Atomic unsigned int
+    java_remote_parent_auto_unavailable_connect_count_for_test;
+static _Atomic unsigned int java_remote_parent_real_connect_count_for_test;
 
 void obi_demo_java_remote_parent_set_live_fd_barrier_timeout_for_test(
     int timeout_millis) {
@@ -190,9 +205,41 @@ int obi_demo_java_remote_parent_same_fd_thread_probe_outcome_for_test(void) {
       &java_remote_parent_same_fd_thread_probe_outcome_for_test,
       memory_order_relaxed);
 }
+
+void obi_demo_java_remote_parent_reset_auto_unavailable_counts_for_test(void) {
+  atomic_store_explicit(
+      &java_remote_parent_auto_unavailable_health_count_for_test, 0,
+      memory_order_relaxed);
+  atomic_store_explicit(
+      &java_remote_parent_auto_unavailable_connect_count_for_test, 0,
+      memory_order_relaxed);
+  atomic_store_explicit(&java_remote_parent_real_connect_count_for_test, 0,
+                        memory_order_relaxed);
+}
+
+unsigned int
+obi_demo_java_remote_parent_auto_unavailable_health_count_for_test(void) {
+  return atomic_load_explicit(
+      &java_remote_parent_auto_unavailable_health_count_for_test,
+      memory_order_relaxed);
+}
+
+unsigned int
+obi_demo_java_remote_parent_auto_unavailable_connect_count_for_test(void) {
+  return atomic_load_explicit(
+      &java_remote_parent_auto_unavailable_connect_count_for_test,
+      memory_order_relaxed);
+}
+
+unsigned int obi_demo_java_remote_parent_real_connect_count_for_test(void) {
+  return atomic_load_explicit(&java_remote_parent_real_connect_count_for_test,
+                              memory_order_relaxed);
+}
 #endif
 
 _Static_assert(sizeof(real_getsockopt) == sizeof(void *),
+               "dlsym function pointer size mismatch");
+_Static_assert(sizeof(real_connect) == sizeof(void *),
                "dlsym function pointer size mismatch");
 
 static bool java_remote_parent_fault_mode_matches(const char *value,
@@ -232,6 +279,24 @@ static bool java_remote_parent_fault_control_is_trusted(int descriptor) {
              java_remote_parent_fault_control_private_mode;
 }
 
+static int java_remote_parent_open_trusted_persistent_fault_control(void) {
+  const char *const path = getenv(java_remote_parent_fault_file_environment);
+  if (path == NULL || path[0] == '\0') {
+    return -1;
+  }
+
+  const int descriptor =
+      open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+  if (descriptor < 0) {
+    return -1;
+  }
+  if (!java_remote_parent_fault_control_is_trusted(descriptor)) {
+    (void)close(descriptor);
+    return -1;
+  }
+  return descriptor;
+}
+
 static int java_remote_parent_open_trusted_fault_control(void) {
   const char *const path = getenv(java_remote_parent_fault_file_environment);
   if (path == NULL || path[0] == '\0') {
@@ -243,13 +308,47 @@ static int java_remote_parent_open_trusted_fault_control(void) {
   if (descriptor < 0) {
     return -1;
   }
-  if (!java_remote_parent_fault_control_is_trusted(descriptor) ||
-      flock(descriptor, LOCK_EX | LOCK_NB) != 0 ||
+  if (!java_remote_parent_fault_control_is_trusted(descriptor)) {
+    (void)close(descriptor);
+    return -1;
+  }
+  int lock_result;
+  do {
+    lock_result = flock(descriptor, LOCK_EX | LOCK_NB);
+  } while (lock_result != 0 && errno == EINTR);
+  if (lock_result != 0 ||
       !java_remote_parent_fault_control_is_trusted(descriptor)) {
     (void)close(descriptor);
     return -1;
   }
   return descriptor;
+}
+
+static ssize_t java_remote_parent_read_fault_control(int descriptor,
+                                                     char *value,
+                                                     size_t value_size);
+
+static bool java_remote_parent_persistent_fault_enabled(const char *mode) {
+  const int descriptor =
+      java_remote_parent_open_trusted_persistent_fault_control();
+  if (descriptor < 0) {
+    return false;
+  }
+
+  char value[java_remote_parent_fault_mode_max_size];
+  ssize_t value_length;
+  do {
+    value_length = pread(descriptor, value, sizeof(value), 0);
+  } while (value_length < 0 && errno == EINTR);
+  const bool trusted_after_read =
+      java_remote_parent_fault_control_is_trusted(descriptor);
+  const bool enabled =
+      value_length > 0 &&
+      value_length < java_remote_parent_fault_mode_max_size &&
+      trusted_after_read &&
+      java_remote_parent_fault_mode_matches(value, (size_t)value_length, mode);
+  (void)close(descriptor);
+  return enabled;
 }
 
 static ssize_t java_remote_parent_read_fault_control(int descriptor,
@@ -891,11 +990,72 @@ static void resolve_real_getsockopt(void) {
   memcpy(&real_getsockopt, &symbol, sizeof(real_getsockopt));
 }
 
+static void resolve_real_connect(void) {
+  const void *const symbol = dlsym(RTLD_NEXT, "connect");
+  memcpy(&real_connect, &symbol, sizeof(real_connect));
+}
+
+static bool java_remote_parent_is_unix_stream_socket(int socket) {
+  if (socket < 0 ||
+      pthread_once(&real_getsockopt_once, resolve_real_getsockopt) != 0 ||
+      real_getsockopt == NULL) {
+    return false;
+  }
+
+  int domain = 0;
+  socklen_t domain_length = sizeof(domain);
+  int type = 0;
+  socklen_t type_length = sizeof(type);
+  return real_getsockopt(socket, SOL_SOCKET, SO_DOMAIN, &domain,
+                         &domain_length) == 0 &&
+         domain_length == sizeof(domain) && domain == AF_UNIX &&
+         real_getsockopt(socket, SOL_SOCKET, SO_TYPE, &type, &type_length) ==
+             0 &&
+         type_length == sizeof(type) && type == SOCK_STREAM;
+}
+
+static bool
+java_remote_parent_is_exact_health_request(int socket, int level, int option,
+                                           const void *optval,
+                                           const socklen_t *optlen) {
+  return socket >= 0 && level == java_remote_parent_socket_level &&
+         option == java_remote_parent_socket_health && optval != NULL &&
+         optlen != NULL && *optlen == sizeof(uint64_t);
+}
+
+static bool java_remote_parent_is_exact_unix_socket(
+    int socket, const struct sockaddr *address, socklen_t address_length) {
+  const size_t path_offset = offsetof(struct sockaddr_un, sun_path);
+  const size_t expected_path_size = sizeof(java_remote_parent_unix_socket_path);
+  if (address == NULL || address_length != path_offset + expected_path_size ||
+      !java_remote_parent_is_unix_stream_socket(socket) ||
+      address->sa_family != AF_UNIX) {
+    return false;
+  }
+  const struct sockaddr_un *const unix_address =
+      (const struct sockaddr_un *)address;
+  return memcmp(unix_address->sun_path, java_remote_parent_unix_socket_path,
+                expected_path_size) == 0;
+}
+
 int getsockopt(int socket, int level, int option, void *optval,
                socklen_t *optlen) {
   if (pthread_once(&real_getsockopt_once, resolve_real_getsockopt) != 0 ||
       real_getsockopt == NULL) {
     errno = ENOSYS;
+    return -1;
+  }
+
+  if (java_remote_parent_is_exact_health_request(socket, level, option, optval,
+                                                 optlen) &&
+      java_remote_parent_persistent_fault_enabled(
+          java_remote_parent_auto_unavailable_mode)) {
+#if defined(OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TESTING)
+    atomic_fetch_add_explicit(
+        &java_remote_parent_auto_unavailable_health_count_for_test, 1,
+        memory_order_relaxed);
+#endif
+    errno = ENOPROTOOPT;
     return -1;
   }
 
@@ -915,4 +1075,30 @@ int getsockopt(int socket, int level, int option, void *optval,
       result, level, option, optval, optlen);
   errno = saved_errno;
   return result;
+}
+
+int connect(int socket, __CONST_SOCKADDR_ARG address,
+            socklen_t address_length) {
+  if (java_remote_parent_is_exact_unix_socket(socket, address.__sockaddr__,
+                                              address_length) &&
+      java_remote_parent_persistent_fault_enabled(
+          java_remote_parent_auto_unavailable_mode)) {
+#if defined(OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TESTING)
+    atomic_fetch_add_explicit(
+        &java_remote_parent_auto_unavailable_connect_count_for_test, 1,
+        memory_order_relaxed);
+#endif
+    errno = ECONNREFUSED;
+    return -1;
+  }
+  if (pthread_once(&real_connect_once, resolve_real_connect) != 0 ||
+      real_connect == NULL) {
+    errno = ENOSYS;
+    return -1;
+  }
+#if defined(OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TESTING)
+  atomic_fetch_add_explicit(&java_remote_parent_real_connect_count_for_test, 1,
+                            memory_order_relaxed);
+#endif
+  return real_connect(socket, address, address_length);
 }

@@ -1468,10 +1468,9 @@ func (p *Tracer) LoadSpecs() ([]*ebpfcommon.SpecBundle, error) {
 	return []*ebpfcommon.SpecBundle{{Spec: spec, Objects: &p.bpfObjects, Constants: p.constants()}}, nil
 }
 
-func (p *Tracer) SetupTailCalls() {
-	javaControlTailCallsReady := true
-	// Order must match the k_tail_* enum in bpf/generictracer/k_tracer_tailcall.h
-	for i, prog := range []*ebpf.Program{
+func (p *Tracer) tailCallPrograms() []*ebpf.Program {
+	// Order must match the k_tail_* enum in bpf/generictracer/k_tracer_tailcall.h.
+	return []*ebpf.Program{
 		// HTTP/1
 		p.bpfObjects.ObiProtocolHttp,           // 0  k_tail_protocol_http
 		p.bpfObjects.ObiContinueProtocolHttp,   // 1  k_tail_continue_protocol_http
@@ -1499,7 +1498,13 @@ func (p *Tracer) SetupTailCalls() {
 		p.bpfObjects.ObiJavaTaskLinkTail,         // 17 k_tail_java_task_link
 		p.bpfObjects.ObiJavaControlCleanupTail,   // 18 k_tail_java_control_cleanup
 		p.bpfObjects.ObiJavaThreadsTail,          // 19 k_tail_java_threads
-	} {
+		p.bpfObjects.ObiJavaLifecycleTail,        // 20 k_tail_java_lifecycle
+	}
+}
+
+func (p *Tracer) SetupTailCalls() {
+	javaControlTailCallsReady := true
+	for i, prog := range p.tailCallPrograms() {
 		if prog == nil {
 			if i >= 15 {
 				javaControlTailCallsReady = false

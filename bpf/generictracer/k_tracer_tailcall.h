@@ -10,7 +10,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
     __type(key, u32);
     __type(value, u32);
-    __uint(max_entries, 20);
+    __uint(max_entries, 21);
 } jump_table SEC(".maps");
 
 enum {
@@ -43,4 +43,5 @@ enum {
     k_tail_java_task_link = 17,
     k_tail_java_control_cleanup = 18,
     k_tail_java_threads = 19,
+    k_tail_java_lifecycle = 20,
 };

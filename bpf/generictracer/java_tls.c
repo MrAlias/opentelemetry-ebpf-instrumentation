@@ -802,17 +802,6 @@ static __noinline int handle_java_registered_lifecycle_ioctl(unsigned char *uarg
     }
 }
 
-static __noinline int handle_java_lifecycle_ioctl(unsigned char *uarg,
-                                                  u8 op_cmd,
-                                                  const pid_key_t *task,
-                                                  u64 process_capability) {
-    if (op_cmd != k_ioctl_java_process_register &&
-        java_process_incarnation_for(task) != process_capability) {
-        return handle_java_unregistered_lifecycle_ioctl(uarg, op_cmd, task, process_capability);
-    }
-    return handle_java_registered_lifecycle_ioctl(uarg, op_cmd, task, process_capability);
-}
-
 static __noinline int handle_java_unregistered_lifecycle_ioctl(unsigned char *uarg,
                                                                u8 op_cmd,
                                                                const pid_key_t *task,
@@ -1041,6 +1030,25 @@ prepare_java_control_tail(unsigned char *uarg,
     return k_java_control_tail_prepared;
 }
 
+static __noinline enum java_control_tail_preflight_result prepare_java_lifecycle_tail(
+    u8 operation, const pid_key_t *task, u64 process_capability, u64 invocation_id) {
+    java_control_tail_workspace_t *workspace = java_control_tail_workspace_mem();
+    if (!workspace || workspace->invocation_id) {
+        return k_java_control_tail_noop;
+    }
+
+    workspace->process_capability = process_capability;
+    workspace->token = 0;
+    workspace->task = *task;
+    __builtin_memset(&workspace->execution, 0, sizeof(workspace->execution));
+    workspace->operation = operation;
+    workspace->decoded = 1;
+    __builtin_memset(workspace->reserved, 0, sizeof(workspace->reserved));
+    barrier();
+    workspace->invocation_id = invocation_id;
+    return k_java_control_tail_prepared;
+}
+
 static __always_inline java_control_tail_workspace_t *java_control_tail_workspace_owned(void) {
     java_control_tail_workspace_t *workspace = java_control_tail_workspace_mem();
     const u64 invocation_id = bpf_get_current_pid_tgid();
@@ -1057,6 +1065,37 @@ static __always_inline java_control_tail_workspace_t *
 java_control_tail_workspace_current(u8 operation) {
     java_control_tail_workspace_t *workspace = java_control_tail_workspace_owned();
     return workspace && workspace->operation == operation ? workspace : NULL;
+}
+
+SEC("kprobe/sys_ioctl")
+int BPF_KPROBE(obi_java_lifecycle_tail) {
+    java_control_tail_workspace_t *workspace = java_control_tail_workspace_owned();
+    if (!workspace || (workspace->operation != k_ioctl_java_process_register &&
+                       workspace->operation != k_ioctl_java_vt_mount &&
+                       workspace->operation != k_ioctl_java_vt_unmount &&
+                       workspace->operation != k_ioctl_java_vt_terminate)) {
+        return 0;
+    }
+
+    struct pt_regs *__ctx = (struct pt_regs *)PT_REGS_PARM1(ctx);
+    void *arg = NULL;
+    bpf_probe_read(&arg, sizeof(arg), (void *)&PT_REGS_PARM3(__ctx));
+    if (!arg) {
+        java_control_tail_workspace_release(workspace, bpf_get_current_pid_tgid());
+        return 0;
+    }
+
+    const u8 operation = workspace->operation;
+    if (operation != k_ioctl_java_process_register &&
+        java_process_incarnation_for(&workspace->task) != workspace->process_capability) {
+        handle_java_unregistered_lifecycle_ioctl(
+            arg, operation, &workspace->task, workspace->process_capability);
+    } else {
+        handle_java_registered_lifecycle_ioctl(
+            arg, operation, &workspace->task, workspace->process_capability);
+    }
+    java_control_tail_workspace_release(workspace, bpf_get_current_pid_tgid());
+    return 0;
 }
 
 static __noinline enum java_control_tail_preflight_result
@@ -1472,7 +1511,19 @@ static __always_inline int handle_java_ioctl(struct pt_regs *ctx,
     }
     if (op_cmd == k_ioctl_java_process_register || op_cmd == k_ioctl_java_vt_mount ||
         op_cmd == k_ioctl_java_vt_unmount || op_cmd == k_ioctl_java_vt_terminate) {
-        return handle_java_lifecycle_ioctl(uarg, op_cmd, &task, process_capability);
+        if (java_remote_parent_control_tail_ready() &&
+            prepare_java_lifecycle_tail(op_cmd, &task, process_capability, id) ==
+                k_java_control_tail_prepared) {
+            bpf_tail_call(ctx, &jump_table, k_tail_java_lifecycle);
+            java_control_tail_dispatch_missed(id);
+        }
+        // SetupTailCalls publishes the lifecycle slot before probe attachment.
+        // If readiness or dispatch is lost, run the already verifier-safe
+        // unregistered cleanup path so a later mount cannot revive stale state.
+        return op_cmd == k_ioctl_java_process_register
+                   ? 0
+                   : handle_java_unregistered_lifecycle_ioctl(
+                         uarg, op_cmd, &task, process_capability);
     }
     // Replay retention and task-link claims are each safe on legacy kernels,
     // but not when their rounded frames accumulate beneath this syscall

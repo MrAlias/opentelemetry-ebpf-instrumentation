@@ -1635,6 +1635,18 @@ func TestJavaControlTailReadinessUsesExactBooleanState(t *testing.T) {
 	assert.Equal(t, []uint32{0, 1, 0}, states)
 }
 
+func TestJavaLifecycleTailCallWiring(t *testing.T) {
+	const lifecycleSlot = 20
+
+	lifecycle := &ebpf.Program{}
+	tracer := &Tracer{}
+	tracer.bpfObjects.ObiJavaLifecycleTail = lifecycle
+
+	programs := tracer.tailCallPrograms()
+	require.Len(t, programs, lifecycleSlot+1)
+	require.Same(t, lifecycle, programs[lifecycleSlot])
+}
+
 func TestJavaRemoteParentRequiresSockOpsNetnsCookie(t *testing.T) {
 	unsupported := errors.New("network namespace cookie helper unavailable")
 	tests := []struct {

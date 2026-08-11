@@ -325,6 +325,72 @@ type legacyBPFFrame struct {
 	end           int
 }
 
+func TestJavaRemoteParentLifecycleTailFitsRHEL96CombinedStack(t *testing.T) {
+	const (
+		entry          = "obi_kprobe_sys_ioctl"
+		tail           = "obi_java_lifecycle_tail"
+		registered     = "handle_java_registered_lifecycle_ioctl"
+		unregistered   = "handle_java_unregistered_lifecycle_ioctl"
+		frameQuantum   = 16
+		stackBudget    = legacyBPFStackLimit - frameQuantum
+		lifecycleSlots = 21
+	)
+
+	for _, object := range []struct {
+		name string
+		data []byte
+	}{
+		{name: "bpf_x86_bpfel.o", data: legacyBPFX86Object},
+		{name: "bpf_arm64_bpfel.o", data: legacyBPFARM64Object},
+	} {
+		t.Run(object.name, func(t *testing.T) {
+			spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(object.data))
+			require.NoError(t, err)
+
+			jumpTable := spec.Maps["jump_table"]
+			require.NotNil(t, jumpTable)
+			require.Equal(t, uint32(lifecycleSlots), jumpTable.MaxEntries)
+
+			entryProgram := spec.Programs[entry]
+			require.NotNil(t, entryProgram)
+			entryFrames, err := legacyBPFFrames(entryProgram.Instructions)
+			require.NoError(t, err)
+			require.True(t, entryFrames[entry].hasTailCall)
+			require.Contains(t, entryFrames[entry].calls, "prepare_java_lifecycle_tail")
+			require.NotContains(t, entryFrames, registered)
+
+			tailProgram := spec.Programs[tail]
+			require.NotNil(t, tailProgram)
+			tailFrames, err := legacyBPFFrames(tailProgram.Instructions)
+			require.NoError(t, err)
+			require.Contains(t, tailFrames[tail].calls, registered)
+			require.Contains(t, tailFrames[tail].calls, unregistered)
+
+			combined, path, err := legacyBPFCombinedStackWithQuantum(
+				tailProgram.Instructions, tail, frameQuantum,
+			)
+			require.NoError(t, err)
+			t.Logf(
+				"RHEL 9.6 combined stack %d bytes (margin %d): %s",
+				combined,
+				legacyBPFStackLimit-combined,
+				strings.Join(path, " -> "),
+			)
+			require.LessOrEqualf(
+				t,
+				combined,
+				stackBudget,
+				"RHEL 9.6 combined stack %d exceeds %d-byte budget (kernel limit %d, margin %d); path: %s",
+				combined,
+				stackBudget,
+				legacyBPFStackLimit,
+				legacyBPFStackLimit-combined,
+				strings.Join(path, " -> "),
+			)
+		})
+	}
+}
+
 func TestJavaRemoteParentCloseFitsLegacyCombinedStack(t *testing.T) {
 	const root = "obi_kprobe_java_remote_parent_tcp_close"
 
@@ -927,7 +993,9 @@ func legacyBPFCombinedStack(
 	instructions asm.Instructions,
 	root string,
 ) (int, []string, error) {
-	return legacyBPFCombinedStackWithAncestor(instructions, root, 0, 0)
+	return legacyBPFCombinedStackWithAncestorAndQuantum(
+		instructions, root, 0, 0, legacyBPFStackQuantum,
+	)
 }
 
 func legacyBPFCombinedStackWithAncestor(
@@ -935,6 +1003,26 @@ func legacyBPFCombinedStackWithAncestor(
 	root string,
 	ancestorDepth int,
 	ancestorFrames int,
+) (int, []string, error) {
+	return legacyBPFCombinedStackWithAncestorAndQuantum(
+		instructions, root, ancestorDepth, ancestorFrames, legacyBPFStackQuantum,
+	)
+}
+
+func legacyBPFCombinedStackWithQuantum(
+	instructions asm.Instructions,
+	root string,
+	quantum int,
+) (int, []string, error) {
+	return legacyBPFCombinedStackWithAncestorAndQuantum(instructions, root, 0, 0, quantum)
+}
+
+func legacyBPFCombinedStackWithAncestorAndQuantum(
+	instructions asm.Instructions,
+	root string,
+	ancestorDepth int,
+	ancestorFrames int,
+	quantum int,
 ) (int, []string, error) {
 	frames, err := legacyBPFFrames(instructions)
 	if err != nil {
@@ -989,7 +1077,7 @@ func legacyBPFCombinedStackWithAncestor(
 		active[name] = true
 		defer delete(active, name)
 
-		rounded := legacyBPFRoundedFrame(frame.raw)
+		rounded := bpfRoundedFrame(frame.raw, quantum)
 		frameLabel := fmt.Sprintf("%s(%d->%d)", name, frame.raw, rounded)
 		maxChild := 0
 		var maxChildPath []string
@@ -1823,10 +1911,14 @@ func legacyBPFMergeOffsetsInto(destination *map[int]struct{}, source map[int]str
 }
 
 func legacyBPFRoundedFrame(raw int) int {
+	return bpfRoundedFrame(raw, legacyBPFStackQuantum)
+}
+
+func bpfRoundedFrame(raw, quantum int) int {
 	if raw < 1 {
 		raw = 1
 	}
-	return (raw + legacyBPFStackQuantum - 1) &^ (legacyBPFStackQuantum - 1)
+	return (raw + quantum - 1) &^ (quantum - 1)
 }
 
 func referencedProgramMaps(

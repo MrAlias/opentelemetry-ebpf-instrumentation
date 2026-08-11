@@ -1,7 +1,11 @@
 # Benchmark plan and result matrix
 
-Status: **partial — privileged Go transport/provider gates passed; sustained
-application and Java/JNI cells remain untested**
+Status: **partial — the core application harness and bounded/native fixtures
+are implemented, but no retained full application run completes the
+native-memory and attributable map-growth acceptance evidence**
+
+The retained benchmark evidence remains partial and does not close the open
+[MrAlias/opentelemetry-ebpf-instrumentation issue #37](https://github.com/MrAlias/opentelemetry-ebpf-instrumentation/issues/37).
 
 Correctness has priority over throughput. Any wrong parent, duplicate Java
 server span, crash, unbounded resource growth, or application failure makes a
@@ -20,6 +24,29 @@ performance cell fail regardless of latency.
   10% against the same official-agent baseline.
 
 These are PoC acceptance gates, not production SLOs.
+
+The harness mechanically evaluates the currently supported subset in
+`poc-gates.json`: zero failures in the six core correctness cells; exactly five
+steady-state repetitions; at most 10% median-throughput and median-p99
+regression for the comparable instrumented cells against `bridge-disabled`;
+and bounded process FD/thread growth from the before and idle-recovery samples.
+Unavailable required process samples fail that process dimension closed, and
+unavailable descriptive map samples prevent successful harness completion.
+
+The file does not claim a complete PoC result. The exported
+`java_remote_par` map series are host-global and carry no demo-project ownership
+label. The harness retains their before/recovery deltas descriptively with
+`ownership_attribution: false`, but the map dimension and overall gate remain
+`partial`/`not_evaluated` even when every visible series is stable. The
+overall status remains `partial` and its result becomes `failed` if a supported
+correctness, performance, or process-growth dimension fails; it can never be
+reported as a complete pass without attributable map evidence. The
+bridge-disabled cell still has the minimized bridge maps (maximum one entry),
+so its samples are required rather than treated as not applicable. JFR/NMT
+allocation, native/direct-memory growth, primary cgroup-sockopt program CPU,
+and BPF lock contention are also uncollected. A `passed` `summary.json` status
+means only that the requested harness execution completed; it is neither a
+passing PoC gate nor issue-acceptance evidence.
 
 ## Privileged transport microbenchmark
 
@@ -115,12 +142,59 @@ dedicated harness for the comparable core cells.
 | `getsockopt-w3c` | official Java agent, extension, and OBI | forced `getsockopt` | valid W3C parent wins; staged OBI candidate is discarded |
 | `getsockopt-helper-idle` | official Java agent, extension, and OBI | active forced `getsockopt`; direct Java HTTPS workload | no Apache upstream handoff in the exact window; not a state-map-miss proof |
 
+The default `--cells core` run produces the sustained application benchmark.
+`variance.json` retains each cell's five repetitions and their median and
+observed range. `poc-gates.json` applies the predeclared zero-failure and 10%
+regression thresholds to the supported core dimensions, while preserving the
+partial resource result described above.
+
+`--cells complete` additionally produces `lookup-paths.json` and
+`native-jni/benchmark.json`. It runs one bounded correctness execution for the
+getsockopt and Unix hit paths, getsockopt and Unix stale paths, Unix timeout,
+and getsockopt pressure. These artifacts use
+`bounded_correctness_observed_once`; they intentionally contain no application
+throughput or p50/p95/p99 claim. The pressure observation retains exact-parent
+and root counts, bounded capacity rejection, verified non-eviction for the
+non-evicting hash map, cleanup, and two canonical recovery Prometheus samples.
+Validation parses the baseline, pressured, traffic-complete, recovery samples,
+canonical recovered sample, and recovery-attempt log; it requires one stable
+map ID/type/capacity, the declared occupancy predicates, exactly two terminal
+consecutive recovery samples, and exact log/sample reconciliation. Nonempty or
+garbage files cannot satisfy that contract. It is one correctness observation,
+not a pressure performance benchmark.
+
+The native fixture executes 1,000 warmups and 10,000 measured operations for
+each getsockopt and Unix hit/miss/failure series and reports native p50/p95/p99.
+It builds the production C transport/provider implementation against
+deterministic syscall/socket fixtures. Before building, the harness asks
+`Makefile.jni` which `CC` it would use, honors an inherited `CC`, resolves and
+pins the compiler's canonical executable path, and records its SHA-256,
+version, flags, requested build command, and expanded Make command. Those
+compiler-version, dry-run, build, and native-fixture commands run with an empty
+inherited environment plus only `PATH=/usr/bin:/bin` and `LC_ALL=C`; dynamic
+loader variables are absent before `env -i` starts because Bash `exec -c`
+launches it with an empty environment. GNU Make control variables
+and compiler/linker search-path variables from the caller therefore cannot
+change the recorded or executed build. The harness verifies the four relevant
+tracked source/build inputs are clean before and after the build, copies those
+exact blob-verified inputs into a private, Make-safe `/tmp` staging directory,
+and never passes the user-selected artifact path to Make. It retains the
+before/after source identity and copied binary, then removes the staging tree.
+Those
+percentiles do not include the in-JVM Java-to-native transition or application
+request processing and are not acceptance evidence. `lookup-paths.json`
+therefore remains `partial_with_explicit_gaps`: application state-map misses
+and in-JVM transition percentiles are blocked. Its embedded observations carry
+explicit root-relative `source_artifact` and `link_base` fields; validation
+requires each full standalone artifact and every linked provenance/result file
+to resolve under the retained output root.
+
 For every cell, the harness first asks `run.sh` to retain a fixed 16-request,
 scenario-specific correctness preflight and leave only that scoped Compose
 project running. The hit controls use concurrent preflight traffic; the W3C
 control is serial so it can alternate exact valid-W3C and malformed-W3C cases.
-It then warms the existing locked-down `benchmark` Compose client and runs five
-to ten fixed-duration closed-loop repetitions. The client uses closed
+It then warms the existing locked-down `benchmark` Compose client and runs
+exactly five fixed-duration closed-loop repetitions. The client uses closed
 connections, `/api/echo?delay_ms=150`, and a fixed seed of zero. All cells
 except `getsockopt-w3c` deliberately send no W3C header. `getsockopt-w3c`
 sends a valid W3C `traceparent` on every sustained request. Its preflight and post-load sentinel
@@ -220,6 +294,17 @@ ports. It creates only project names in the demo's reserved Compose namespace
 and never calls raw `docker compose down`; teardown is delegated to the runner's
 ownership-checked cleanup path.
 
+Before any Compose execution, the harness rejects `DOCKER_HOST`, resolves the
+active Docker context and its Docker endpoint, and requires an absolute local
+`unix:///...` endpoint whose path is an existing non-symlink Unix socket.
+`docker-daemon.json` retains that context, endpoint, socket path, device, and
+inode, and successful summary publication re-resolves all of them. A TCP, SSH,
+missing, symlinked, changed, or otherwise non-socket endpoint is not accepted.
+This proves only the selected local filesystem socket endpoint; a Unix socket
+can proxy a remote daemon, so it does not prove Docker daemon process locality,
+host identity, or immutable hardware/kernel settings. `host-environment.txt`
+remains the descriptive host record.
+
 Run it on a Linux host with Docker Compose v2 plus the GNU/procps/util-linux
 tools it validates at startup, including `timeout`, `setsid`, `ps`, and `sleep`.
 
@@ -228,6 +313,28 @@ JSON, post-load sentinel, host environment, Docker stats and inspect records,
 `/proc` memory/fd/thread snapshots, OBI metrics when applicable, and requested
 Java diagnostics. The helper-idle midpoint is the documented exception: it
 omits Java diagnostics and records that explicit reason in `snapshot.json`.
+A process sample is available only when the Compose-owned full container ID,
+Docker-reported host PID, local `/proc/<pid>/stat` start time, and SHA-256 of
+the bounded local `/proc/<pid>/cgroup` file remain stable around collection,
+and that cgroup file contains the exact full 64-hex container ID at non-hex
+token boundaries. The explicit cgroup/container binding is retained in every
+available identity, snapshot, and process observation. The before and
+idle-recovery process-growth gate requires that entire identity and binding to
+match, preventing an unrelated process or a reused numeric PID from completing
+the gate. This process evidence is separate from the Unix-socket evidence.
+
+Every core cell, including uninstrumented, bridge-disabled, W3C, and
+helper-idle, must retain one clean application source identity. Complete mode
+extends the same identity to all four bounded cells and the native source
+artifact. `application-source-identity.json` requires identical revision,
+Git-tree identity, clean status, source-tree manifest, and tracked-patch digest
+across all requested cells, retains each runner's original patch-identity
+value, and derives a path-independent canonical patch identity from retained
+content digests. The harness independently regenerates the exact `git-tree-v2`
+mode/blob/path manifest from the recorded Git tree and requires every retained
+runner manifest to match it byte-for-byte. The live checkout is rechecked for
+revision/index/worktree/untracked-file drift both when this artifact is created
+and before a successful summary is published.
 A clean preflight runs from a sealed source snapshot that is removed when the
 runner exits with its scoped stack still active. Before starting any sustained
 client, the harness therefore reads only the public CA certificate from the
@@ -256,23 +363,32 @@ is the median of repetition p99 values, not a pooled all-request p99. Missing,
 malformed, failed, symlinked, or unexpected numeric repetition artifacts fail the
 harness instead of being dropped or converted to zero.
 
-Both `variance.json` and `summary.json` are descriptive, non-acceptance
-evidence: they apply no threshold, make no acceptable-regression decision, and
-do not establish a production SLO. `summary.json` also does not turn unavailable
-measurements into zeroes.
+`variance.json` is the application performance benchmark and is descriptive by
+itself; it does not establish a production SLO. `poc-gates.json` applies the
+predeclared threshold to its fixed-five-repetition medians, but its overall
+result remains partial because the map-growth dimension is not attributable.
+`summary.json` links both artifacts without turning unavailable measurements
+into zeroes or treating successful harness completion as issue acceptance.
 
-The initial harness intentionally records these #37 dimensions as
-`not_collected`: JNI lookup percentiles, JFR/NMT allocation/native/direct-memory
-summaries, primary cgroup-sockopt program CPU, BPF map insertion failures, map
-evictions, and BPF lock contention. Do not use the repository-wide
+The optional complete mode adds native transport/provider lookup percentiles
+and bounded pressure capacity/cleanup evidence as described above. It does not
+collect in-JVM JNI-transition percentiles, JFR/NMT
+allocation/native/direct-memory summaries, primary cgroup-sockopt program CPU,
+or BPF lock contention. Its capacity-rejection observation is not a general
+BPF map-insertion-failure counter, and its non-evicting-map check is not an
+eviction-rate benchmark. Do not use the repository-wide
 `scripts/bpf-metrics-sampler.sh` for this harness: it changes a host-global BPF
 statistics sysctl and is not scoped to the demo project.
 
-The six sustained core cells are not the complete #37 matrix. End-to-end
-Java/JNI primary and fallback miss/timeout cells, plus pressure cells, still
-require separately measured evidence before declaring the benchmark issue
-complete. The privileged Go transport artifact is complementary evidence; it
-does not fill those application-workload cells. The checked-in
+The six sustained core cells and the optional observed-once path controls are
+not the complete matrix for the open fork issue linked above. End-to-end
+application state-map miss performance,
+in-JVM Java-to-native transition percentiles, sustained stale/timeout/pressure
+performance, attributable map growth, and native-memory evidence still require
+separate measurement before declaring the benchmark issue complete. The
+privileged Go transport artifact and the native deterministic fixture are
+complementary evidence; neither fills those application-workload cells. The
+checked-in
 [focused artifact](focused-validation/rhel96-kernel-sockopt-4fe50533/README.md)
 therefore does not turn the W3C row or any other application comparison-matrix
 row into a passed result.
@@ -335,7 +451,7 @@ Retain raw summaries and the exact command with the result artifact. Do not
 enable host-global BPF statistics as part of a shared benchmark host without an
 explicit host-level measurement plan.
 
-The harness requires five to ten measurement repetitions and records the
+The harness requires exactly five measurement repetitions and records the
 per-cell median and observed spread in `variance.json`; report it with the
 fixed-host artifact rather than pooling transport configurations or lookup
 paths. Do not combine primary and fallback lookup latency into one percentile.

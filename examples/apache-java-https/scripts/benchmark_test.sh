@@ -120,13 +120,26 @@ fake_bpf_metrics_snapshot() {
   local discard=""
   local negotiate_missing=""
   local extra=""
+  local map_entries=1
+  local map_max_entries=10000
+  local project=""
 
   [[ -n "${FAKE_BPF_METRICS_FILE:-}" && -f "$FAKE_BPF_METRICS_FILE" ]] || return 64
   read -r report candidate inject stage handoff take discard negotiate_missing extra <"$FAKE_BPF_METRICS_FILE" || return 64
   [[ "$report" =~ ^[0-9]+$ && "$candidate" =~ ^[0-9]+$ && "$inject" =~ ^[0-9]+$ &&
     "$stage" =~ ^[0-9]+$ && "$handoff" =~ ^[0-9]+$ && "$take" =~ ^[0-9]+$ &&
     "$discard" =~ ^[0-9]+$ && "$negotiate_missing" =~ ^[0-9]+$ && -z "$extra" ]] || return 64
+  if [[ -n "${FAKE_COMPOSE_PROJECT_FILE:-}" &&
+    -f "$FAKE_COMPOSE_PROJECT_FILE" ]]; then
+    project="$(<"$FAKE_COMPOSE_PROJECT_FILE")"
+    if [[ "$project" == *-bridge-disabled ]]; then
+      map_entries=0
+      map_max_entries=1
+    fi
+  fi
   printf '%s\n' \
+    'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"}'" $map_entries" \
+    'obi_bpf_map_max_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"}'" $map_max_entries" \
     "obi_java_remote_parent_operations_total{operation=\"candidate\",status=\"valid\",transport=\"tcp\"} $candidate" \
     "obi_java_remote_parent_operations_total{operation=\"handoff\",status=\"valid\",transport=\"tcp\"} $handoff" \
     "obi_java_remote_parent_operations_total{operation=\"inject\",status=\"valid\",transport=\"tcp\"} $inject" \
@@ -307,6 +320,21 @@ fake_w3c_sentinel_result() {
     '
 }
 
+write_pressure_map_metrics_fixture() {
+  local -r output="$1"
+  local -r map_entries_count="$2"
+  local -r max_entries="${3:-50000}"
+
+  {
+    printf '%s %s\n' \
+      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"}' \
+      "$map_entries_count"
+    printf '%s %s\n' \
+      'obi_bpf_map_max_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"}' \
+      "$max_entries"
+  } >"$output"
+}
+
 fake_write_runner_artifacts() {
   local -r result_directory="$1"
   local -r transport="$2"
@@ -316,13 +344,34 @@ fake_write_runner_artifacts() {
   local -r assertion_mode="$6"
   local -r selected_transport="$7"
   local -r project="$8"
+  local -r requested_requests="${9:-$FAKE_PREFLIGHT_REQUESTS}"
   local assertion_scenario="concurrency"
+  local measurement_scenario="$scenario"
+  local measurement_requests="$requested_requests"
+  local bounded_path=false
   local ca_fingerprint=""
+  local source_revision="${FAKE_GIT_REVISION:-0123456789012345678901234567890123456789}"
+  local source_tree_sha256=""
+  local tracked_patch_sha256=""
+  local patch_identity_sha256=""
   local index=0
 
-  if [[ "$scenario" == w3c ]]; then
-    assertion_scenario=w3c
-  fi
+  case "$scenario" in
+    w3c) assertion_scenario=w3c ;;
+    primary-w3c-stale|unix-w3c-stale)
+      assertion_scenario="$scenario"
+      bounded_path=true
+      ;;
+    w3c-fault)
+      assertion_scenario='w3c-fault-timeout'
+      measurement_requests=1
+      bounded_path=true
+      ;;
+    pressure)
+      assertion_scenario=pressure
+      bounded_path=true
+      ;;
+  esac
   mkdir -p -- \
     "$result_directory/phases/$assertion_scenario-before" \
     "$result_directory/phases/$assertion_scenario-after"
@@ -331,10 +380,41 @@ fake_write_runner_artifacts() {
     >"$result_directory/run-status.json"
   write_runner_environment \
     "$result_directory/environment.txt" "$transport" "$agent" "$tls" "$scenario" \
-    "$FAKE_PREFLIGHT_REQUESTS" 1 "$SEED" "$project"
-  printf 'revision=fake\n' >"$result_directory/source-state.txt"
-  printf 'fake-source-tree\n' >"$result_directory/source-tree.manifest"
-  printf 'fake-git-status\n' >"$result_directory/git-status.txt"
+    "$requested_requests" 1 "$SEED" "$project"
+  if [[ -n "${FAKE_SOURCE_TREE_MANIFEST:-}" ]]; then
+    [[ -f "$FAKE_SOURCE_TREE_MANIFEST" && ! -L "$FAKE_SOURCE_TREE_MANIFEST" ]] || return 64
+    command cp -- "$FAKE_SOURCE_TREE_MANIFEST" "$result_directory/source-tree.manifest"
+  else
+    printf 'fake-source-tree\n' >"$result_directory/source-tree.manifest"
+  fi
+  : >"$result_directory/git-status.txt"
+  source_tree_sha256="$(sha256sum -- \
+    "$result_directory/source-tree.manifest")" || return 64
+  source_tree_sha256="${source_tree_sha256%% *}"
+  tracked_patch_sha256="$(printf '' | sha256sum)" || return 64
+  tracked_patch_sha256="${tracked_patch_sha256%% *}"
+  patch_identity_sha256="$({
+    sha256sum -- "$result_directory/git-status.txt"
+    sha256sum -- "$result_directory/source-tree.manifest"
+    printf '%s\n' "$tracked_patch_sha256"
+  } | sha256sum)" || return 64
+  patch_identity_sha256="${patch_identity_sha256%% *}"
+  {
+    printf 'revision=%s\n' "$source_revision"
+    printf 'dirty=false\n'
+    printf 'source_tree_sha256=%s\n' "$source_tree_sha256"
+    printf 'source_tree_manifest_schema=git-tree-v2\n'
+    printf 'tracked_patch_sha256=%s\n' "$tracked_patch_sha256"
+    printf 'patch_identity_sha256=%s\n' "$patch_identity_sha256"
+  } >"$result_directory/source-state.txt"
+  {
+    printf 'revision=%s\n' "$source_revision"
+    printf 'dirty=false\n'
+    printf 'source_tree_sha256=%s\n' "$source_tree_sha256"
+    printf 'source_tree_manifest_schema=git-tree-v2\n'
+    printf 'tracked_patch_sha256=%s\n' "$tracked_patch_sha256"
+    printf 'patch_identity_sha256=%s\n' "$patch_identity_sha256"
+  } >>"$result_directory/environment.txt"
   printf '{"distribution":"otel","checksum":"fake"}\n' >"$result_directory/official-javaagent.json"
   printf '{"obi_java_agent_sha256":"fake"}\n' >"$result_directory/bridge-artifacts.json"
   printf 'fake  obi-java-agent.jar\n' >"$result_directory/bridge-artifacts.sha256"
@@ -375,7 +455,87 @@ fake_write_runner_artifacts() {
     printf 'selected_transport=%s\n' "$selected_transport" \
       >"$result_directory/java-selected-transport-configuration.txt"
   fi
-  if [[ "$assertion_scenario" == w3c ]]; then
+  if [[ "$bounded_path" == true ]]; then
+    jq -n --arg scenario "$measurement_scenario" \
+      --arg tls "${FAKE_TLS_PROTOCOL:-TLSv1.3}" \
+      --argjson requests "$measurement_requests" '
+        {status: "passed", scenario: $scenario, request_count: $requests,
+         traffic_elapsed_nanos: 1000, throughput_per_second: 1,
+         latency: {p50_nanos: 1, p95_nanos: 2, p99_nanos: 3},
+         cases: [range(0; $requests) |
+           {latency_nanos: 1, request: {}, response: {tls_protocol: $tls}, trace: {}}]}
+      ' >"$result_directory/scenario-$assertion_scenario.json"
+    jq -n --arg scenario "$measurement_scenario" \
+      --arg result "scenario-$assertion_scenario.json" '
+        {status: "passed", scenario: $scenario, exit_status: 0,
+         metric_status: 0, result: $result}
+      ' >"$result_directory/scenario-$assertion_scenario-status.json"
+    printf 'scenario stderr\n' \
+      >"$result_directory/scenario-$assertion_scenario.stderr.log"
+    if [[ "$scenario" == primary-w3c-stale || "$scenario" == unix-w3c-stale ]]; then
+      jq -n '
+        {status: "passed", scenario: "basic", request_count: 1,
+         traffic_elapsed_nanos: 1000, throughput_per_second: 1,
+         latency: {p50_nanos: 1, p95_nanos: 2, p99_nanos: 3},
+         cases: [{latency_nanos: 1, request: {}, response: {}, trace: {}}]}
+      ' >"$result_directory/scenario-basic-$assertion_scenario-recovery.json"
+      jq -n --arg result "scenario-basic-$assertion_scenario-recovery.json" '
+        {status: "passed", scenario: "basic", exit_status: 0,
+         metric_status: 0, result: $result}
+      ' >"$result_directory/scenario-basic-$assertion_scenario-recovery-status.json"
+      : >"$result_directory/scenario-basic-$assertion_scenario-recovery.stderr.log"
+    elif [[ "$scenario" == w3c-fault ]]; then
+      : >"$result_directory/w3c-fault-timeout-bridge.log"
+    elif [[ "$scenario" == pressure ]]; then
+      jq '.pressure_correlation = {
+        exact_hit_count: 127, explicit_root_count: 1,
+        wrong_parent_count: 0, unresolved_count: 0
+      }' "$result_directory/scenario-pressure.json" \
+        >"$result_directory/scenario-pressure.json.tmp"
+      mv -T -- "$result_directory/scenario-pressure.json.tmp" \
+        "$result_directory/scenario-pressure.json"
+      jq '.pressure_correlation = {
+        trace: {exact_hit_count: 127, explicit_root_count: 1,
+          wrong_parent_count: 0, unresolved_count: 0},
+        bridge: {transport: "getsockopt"},
+        java_reconciliation_target: {take_valid_count: 127,
+          attributable_absence_count: 1, diagnostic_self_miss_count: 1}
+      }' "$result_directory/scenario-pressure-status.json" \
+        >"$result_directory/scenario-pressure-status.json.tmp"
+      mv -T -- "$result_directory/scenario-pressure-status.json.tmp" \
+        "$result_directory/scenario-pressure-status.json"
+      jq -n '
+        {status: "passed", mode: "fill",
+         map_name: "java_remote_parent_handoff_claims", kernel_name: "java_remote_par",
+         map_type: "Hash", map_id: 41, max_entries: 50000, touched: 49999,
+         capacity_rejected_entries: 1, verified_present_entries: 49999,
+         process_map_id: 42, process_pid: 43, process_namespace: 44, token_base: 1}
+      ' >"$result_directory/map-pressure-pressure-fill.json"
+      jq -n '
+        {status: "passed", mode: "cleanup", map_id: 41,
+         map_name: "java_remote_parent_handoff_claims", kernel_name: "java_remote_par",
+         map_type: "Hash", max_entries: 50000, process_map_id: 0,
+         process_pid: 43, process_namespace: 44, token_base: 1,
+         cleanup_verified: true, verified_absent_entries: 50001, touched: 0}
+      ' >"$result_directory/map-pressure-pressure-cleanup.json"
+      write_pressure_map_metrics_fixture \
+        "$result_directory/phases/pressure-before/obi-metrics.prom" 1
+      write_pressure_map_metrics_fixture \
+        "$result_directory/map-pressure-pressure-pressured.prom" 50000
+      write_pressure_map_metrics_fixture \
+        "$result_directory/map-pressure-pressure-traffic-complete.prom" 49999
+      write_pressure_map_metrics_fixture \
+        "$result_directory/map-pressure-pressure-recovered-sample-01.prom" 1
+      write_pressure_map_metrics_fixture \
+        "$result_directory/map-pressure-pressure-recovered-sample-02.prom" 1
+      command cp -- "$result_directory/map-pressure-pressure-recovered-sample-02.prom" \
+        "$result_directory/map-pressure-pressure-recovered.prom"
+      {
+        printf 'attempt=1 observed_at=2026-08-10T00:00:00Z entries=1 matched=true consecutive=1\n'
+        printf 'attempt=2 observed_at=2026-08-10T00:00:01Z entries=1 matched=true consecutive=2\n'
+      } >"$result_directory/map-pressure-pressure-recovered-samples.log"
+    fi
+  elif [[ "$assertion_scenario" == w3c ]]; then
     fake_w3c_sentinel_result \
       "$FAKE_PREFLIGHT_REQUESTS" "${SEED:-1}" "${FAKE_TLS_PROTOCOL:-TLSv1.3}" \
       >"$result_directory/scenario-w3c.json"
@@ -394,7 +554,7 @@ fake_write_runner_artifacts() {
     jq -n \
       --arg assertion_mode "$assertion_mode" \
       --arg tls "${FAKE_TLS_PROTOCOL:-TLSv1.3}" \
-      --argjson requests "$FAKE_PREFLIGHT_REQUESTS" \
+      --argjson requests "$requested_requests" \
       --argjson seed "${SEED:-1}" \
       '{
         status: "passed",
@@ -402,21 +562,59 @@ fake_write_runner_artifacts() {
         assertion_mode: $assertion_mode,
         request_count: $requests,
         seed: $seed,
-        cases: [range(0; $requests) | {response: {tls_protocol: $tls}}]
+        traffic_elapsed_nanos: 1000000,
+        throughput_per_second: $requests,
+        latency: {p50_nanos: 100, p95_nanos: 200, p99_nanos: 300},
+        cases: [range(0; $requests) | {
+          request: {},
+          response: {tls_protocol: $tls},
+          latency_nanos: 100,
+          trace: {}
+        }]
       }' >"$result_directory/scenario-concurrency.json"
-    jq -n '{status: "passed", scenario: "concurrency"}' \
+    jq -n '{status: "passed", scenario: "concurrency", exit_status: 0,
+      metric_status: 0, result: "scenario-concurrency.json"}' \
       >"$result_directory/scenario-concurrency-status.json"
     printf 'scenario stderr\n' >"$result_directory/scenario-concurrency.stderr.log"
   fi
   for index in before after; do
-    printf 'obi_java_remote_parent_operations_total 0\n' \
-      >"$result_directory/phases/$assertion_scenario-$index/obi-metrics.prom"
+    if [[ "$scenario" == pressure && "$index" == before ]]; then
+      write_pressure_map_metrics_fixture \
+        "$result_directory/phases/$assertion_scenario-$index/obi-metrics.prom" 1
+    else
+      printf 'obi_java_remote_parent_operations_total 0\n' \
+        >"$result_directory/phases/$assertion_scenario-$index/obi-metrics.prom"
+    fi
     printf 'java-diagnostics\n' \
       >"$result_directory/phases/$assertion_scenario-$index/java-diagnostics.txt"
   done
   if [[ "$assertion_scenario" == w3c ]]; then
     printf 'discard_standard before=4 after=12 delta=8\n' \
       >"$result_directory/phases/w3c-after/java-diagnostics.delta"
+  else
+    for index in \
+      unknown valid missing stale unsupported malformed version_mismatch ambiguous \
+      unauthorized already_consumed timeout overload transport_error disabled; do
+      if [[ "$bounded_path" == true ]]; then
+        local bounded_delta=0
+        case "$scenario:$index" in
+          primary-w3c-stale:stale|unix-w3c-stale:stale|w3c-fault:timeout)
+            bounded_delta=1
+            ;;
+          pressure:valid) bounded_delta=127 ;;
+          pressure:missing) bounded_delta=2 ;;
+        esac
+        printf 't_%s before=0 after=%s delta=%s\n' \
+          "$index" "$bounded_delta" "$bounded_delta"
+      elif [[ "$index" == valid ]]; then
+        printf 't_%s before=0 after=%s delta=%s\n' \
+          "$index" "$requested_requests" "$requested_requests"
+      elif [[ "$index" == missing ]]; then
+        printf 't_%s before=0 after=1 delta=1\n' "$index"
+      else
+        printf 't_%s before=0 after=0 delta=0\n' "$index"
+      fi
+    done >"$result_directory/phases/$assertion_scenario-after/java-diagnostics.delta"
   fi
 }
 
@@ -482,11 +680,23 @@ fake_runner() {
     return 0
   fi
   [[ "$project" =~ ^obi-apache-java-https-b-[0-9]+-[0-9]+-[a-z0-9-]+$ &&
-    "$requests" == "$FAKE_PREFLIGHT_REQUESTS" && "$keep" == "true" && -n "$seed" &&
+    "$requests" =~ ^[0-9]+$ && "$keep" == "true" && -n "$seed" &&
     ("$agent" == otel || "$agent" == splunk) && ("$tls" == TLSv1.2 || "$tls" == TLSv1.3) ]] || {
     printf 'invalid fake runner invocation\n' >&2
     return 64
   }
+  if [[ -n "${FAKE_COMPOSE_PROJECT_FILE:-}" ]]; then
+    local project_temporary=""
+    project_temporary="$(mktemp -- "${FAKE_COMPOSE_PROJECT_FILE}.tmp.XXXXXX")" || return 64
+    printf '%s\n' "$project" >"$project_temporary" || {
+      rm -f -- "$project_temporary"
+      return 64
+    }
+    mv -f -- "$project_temporary" "$FAKE_COMPOSE_PROJECT_FILE" || {
+      rm -f -- "$project_temporary"
+      return 64
+    }
+  fi
   case "$scenario" in
     benchmark-uninstrumented)
       [[ "$transport" == disabled ]] || return 64
@@ -504,9 +714,25 @@ fake_runner() {
       selected_transport="$transport"
       ;;
     w3c)
-      [[ "$transport" == getsockopt ]] || return 64
+      [[ "$transport" == getsockopt && "$requests" == "$FAKE_PREFLIGHT_REQUESTS" ]] || return 64
       assertion_mode="bridge"
       selected_transport="$transport"
+      ;;
+    primary-w3c-stale)
+      [[ "$transport" == getsockopt && "$requests" == 1 ]] || return 64
+      selected_transport=getsockopt
+      ;;
+    unix-w3c-stale)
+      [[ "$transport" == unix && "$requests" == 1 ]] || return 64
+      selected_transport=unix
+      ;;
+    w3c-fault)
+      [[ "$transport" == unix && "$requests" == 2 ]] || return 64
+      selected_transport=unix
+      ;;
+    pressure)
+      [[ "$transport" == getsockopt && "$requests" == 128 ]] || return 64
+      selected_transport=getsockopt
       ;;
     *)
       return 64
@@ -516,7 +742,7 @@ fake_runner() {
   SEED="$seed"
   fake_write_runner_artifacts \
     "$result_directory" "$transport" "$agent" "$tls" "$scenario" "$assertion_mode" \
-    "$selected_transport" "$project"
+    "$selected_transport" "$project" "$requests"
   printf 'start %s %s %s\n' "$project" "$transport" "$scenario" >>"$FAKE_RUNNER_LOG"
   printf 'start %s %s %s\n' "$project" "$transport" "$scenario" >>"$FAKE_EVENTS"
   printf '[fake] INFO: retained run evidence: %s\n' "$result_directory" >&2
@@ -716,6 +942,29 @@ fake_docker() {
     printf ' %q' "$argument" >>"$FAKE_DOCKER_LOG"
   done
   printf '\n' >>"$FAKE_DOCKER_LOG"
+  if [[ "${1:-}" == context && "${2:-}" == show && $# == 2 ]]; then
+    if [[ -n "${FAKE_DOCKER_CONTEXT_SHOW_COUNT_FILE:-}" ]]; then
+      local context_show_count=0
+      if [[ -f "$FAKE_DOCKER_CONTEXT_SHOW_COUNT_FILE" ]]; then
+        context_show_count="$(<"$FAKE_DOCKER_CONTEXT_SHOW_COUNT_FILE")"
+      fi
+      [[ "$context_show_count" =~ ^[0-9]+$ ]] || return 64
+      ((context_show_count += 1))
+      printf '%s\n' "$context_show_count" >"$FAKE_DOCKER_CONTEXT_SHOW_COUNT_FILE"
+      if [[ -n "${FAKE_DOCKER_CONTEXT_FAIL_AFTER:-}" &&
+        "$context_show_count" -gt "$FAKE_DOCKER_CONTEXT_FAIL_AFTER" ]]; then
+        return 70
+      fi
+    fi
+    printf '%s\n' "${FAKE_DOCKER_CONTEXT:-default}"
+    return 0
+  fi
+  if [[ "${1:-}" == context && "${2:-}" == inspect &&
+    "${3:-}" == "${FAKE_DOCKER_CONTEXT:-default}" &&
+    "${4:-}" == --format && $# == 5 ]]; then
+    printf '"%s"\n' "${FAKE_DOCKER_ENDPOINT:-unix:///var/run/docker.sock}"
+    return 0
+  fi
   if [[ "${1:-}" == compose && "${2:-}" == --project-name ]]; then
     project="${3:-}"
     [[ "$project" =~ ^[a-z0-9][a-z0-9_-]*$ &&
@@ -736,6 +985,37 @@ fake_docker() {
   fi
   if [[ "${1:-}" == stats ]]; then
     printf '"fake" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "0.01%%" "1MiB / 1GiB" "1" "0B / 0B"\n'
+    return 0
+  fi
+  if [[ "${1:-}" == image && "${2:-}" == inspect ]]; then
+    printf '[{"Id":"sha256:fixture"}]\n'
+    return 0
+  fi
+  if [[ "${1:-}" == run ]]; then
+    local mount=""
+    local mount_source=""
+    while (($# > 0)); do
+      case "$1" in
+        --mount)
+          mount="$2"
+          shift 2
+          ;;
+        --entrypoint)
+          if [[ "$2" == java ]]; then
+            printf 'openjdk version "fixture"\n'
+            return 0
+          fi
+          shift 2
+          ;;
+        *) shift ;;
+      esac
+    done
+    mount_source="${mount#*src=}"
+    mount_source="${mount_source%%,dst=*}"
+    [[ "$mount_source" == /* && "$mount_source" != "$mount" ]] || return 64
+    mkdir -p -- "$mount_source/linux"
+    printf '/* fixture jni.h */\n' >"$mount_source/jni.h"
+    printf '/* fixture jni_md.h */\n' >"$mount_source/linux/jni_md.h"
     return 0
   fi
   if [[ "${1:-}" == exec ]]; then
@@ -851,7 +1131,7 @@ fake_curl() {
 
 fake_git() {
   if [[ "${*: -1}" == HEAD ]]; then
-    printf '0123456789012345678901234567890123456789\n'
+    printf '%s\n' "${FAKE_GIT_REVISION:-0123456789012345678901234567890123456789}"
     return 0
   fi
   return 64
@@ -888,6 +1168,78 @@ source "$TEST_SCRIPT_DIR/benchmark.sh"
 
 TEST_TMP_DIR=""
 FAKE_CA_FILE=""
+
+create_unix_socket_fixture() {
+  local -r socket_path="$1"
+
+  [[ "$socket_path" == /* && ! -e "$socket_path" && ! -L "$socket_path" ]] || return 1
+  python3 - "$socket_path" <<'PY'
+import socket
+import sys
+
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.bind(sys.argv[1])
+sock.close()
+PY
+  [[ -S "$socket_path" && ! -L "$socket_path" ]]
+}
+
+run_benchmark_with_fake_bound_proc() {
+  local -r script="$1"
+  shift
+
+  bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    shift
+    capture_service_identity() {
+      local -r service="$1"
+      local -r output="$2"
+      {
+        printf "service=%s\n" "$service"
+        printf "container_id=%s\n" "$FAKE_CONTAINER_ID"
+        printf "host_pid=%s\n" "$FAKE_PID"
+        printf "proc_start_time=123456\n"
+        printf "proc_cgroup_sha256=%064d\n" 0
+        printf "proc_cgroup_container_binding=%s\n" \
+          "$PROC_CGROUP_CONTAINER_BINDING"
+        printf "project=%s\n" "$ACTIVE_PROJECT"
+        printf "owner_sentinel=%s\n" "$PROJECT_SENTINEL_VALUE"
+      } >"$output"
+    }
+    capture_proc_snapshot() {
+      local -r identity_file="$1"
+      local -r output="$2"
+      local container_id=""
+      local host_pid=""
+      container_id="$(identity_field "$identity_file" container_id)" || return 1
+      host_pid="$(identity_field "$identity_file" host_pid)" || return 1
+      {
+        printf "status=available\n"
+        printf "container_id=%s\n" "$container_id"
+        printf "host_pid=%s\n" "$host_pid"
+        printf "proc_start_time=123456\n"
+        printf "proc_cgroup_sha256=%064d\n" 0
+        printf "proc_cgroup_container_binding=%s\n" \
+          "$PROC_CGROUP_CONTAINER_BINDING"
+        printf "VmPeak:\t2048 kB\n"
+        printf "VmSize:\t2048 kB\n"
+        printf "VmRSS:\t1024 kB\n"
+        printf "VmData:\t512 kB\n"
+        printf "VmStk:\t128 kB\n"
+        printf "VmExe:\t64 kB\n"
+        printf "VmLib:\t256 kB\n"
+        printf "Threads:\t4\n"
+        printf "fd_count=8\n"
+        printf "task_count=4\n"
+        printf "stat=fixture-process-stat\n"
+      } >"$output"
+    }
+    trap '\''on_exit "$?"'\'' EXIT
+    trap '\''exit 130'\'' INT TERM
+    main "$@"
+  ' benchmark-fake-proc "$script" "$@"
+}
 
 cleanup_test() {
   if [[ "${KEEP_TEST_TMP:-false}" != "true" && -n "$TEST_TMP_DIR" && -d "$TEST_TMP_DIR" ]]; then
@@ -929,6 +1281,7 @@ reset_options() {
   CONCURRENCY=16
   REPETITIONS=5
   SEED=20260721
+  CELLS_MODE=core
   RUN_TOKEN=1234567890-12345
   SHOW_HELP=false
   OUTPUT_READY=false
@@ -939,6 +1292,12 @@ reset_options() {
   BENCHMARK_PID=""
   BENCHMARK_IDENTITY=""
   HARNESS_INVOCATION=""
+  DOCKER_ACTIVE_CONTEXT=""
+  DOCKER_ACTIVE_ENDPOINT=""
+  DOCKER_CONTEXT_OVERRIDE=""
+  DOCKER_ACTIVE_SOCKET_PATH=""
+  DOCKER_ACTIVE_SOCKET_DEVICE=""
+  DOCKER_ACTIVE_SOCKET_INODE=""
   CELL_SLUG=""
   CELL_TRANSPORT=""
   CELL_SCENARIO=""
@@ -957,6 +1316,13 @@ reset_options() {
   CELL_EXPECTED_TLS_VERIFICATION=""
   CELL_UPSTREAM_HANDOFF=""
   CELL_HELPER_IDLE=false
+  CELL_BOUNDED_PATH=false
+  CELL_PREFLIGHT_REQUESTS="$PREFLIGHT_REQUESTS"
+  CELL_MEASUREMENT_REQUESTS="$PREFLIGHT_REQUESTS"
+  CELL_RESULT_LABEL=""
+  CELL_PATH_CLASSIFICATION=""
+  CELL_EXPECTED_JAVA_STATUS=""
+  CELL_EXTRA_RUNNER_FILES=()
   COMPOSE=()
   unset BENCHMARK_CA_SOURCE
 }
@@ -979,7 +1345,7 @@ test_parser_defaults_and_boundaries() {
     parse_args --output "$output"
     [[ "$OUTPUT_DIR" == "$output" && "$AGENT" == otel && "$TLS_PROTOCOL" == TLSv1.3 &&
       "$WARMUP_SECONDS" == 10 && "$DURATION_SECONDS" == 30 && "$CONCURRENCY" == 16 &&
-      "$REPETITIONS" == 5 && "$SEED" == 20260721 ]]
+      "$REPETITIONS" == 5 && "$SEED" == 20260721 && "$CELLS_MODE" == core ]]
   ) || {
     printf 'default benchmark options changed unexpectedly\n' >&2
     return 1
@@ -987,10 +1353,19 @@ test_parser_defaults_and_boundaries() {
 
   (
     reset_options
+    parse_args --output "$output" --cells complete
+    [[ "$CELLS_MODE" == complete ]]
+  ) || {
+    printf 'complete benchmark cell set was rejected\n' >&2
+    return 1
+  }
+
+  (
+    reset_options
     parse_args --output "$output" --warmup-seconds 2 --duration-seconds 600 \
-      --concurrency 1 --repetitions 10 --seed 0 --cells core
+      --concurrency 1 --repetitions 5 --seed 0 --cells core
     [[ "$WARMUP_SECONDS" == 2 && "$DURATION_SECONDS" == 600 && "$CONCURRENCY" == 1 &&
-      "$REPETITIONS" == 10 && "$SEED" == 0 ]]
+      "$REPETITIONS" == 5 && "$SEED" == 0 ]]
   ) || {
     printf 'valid benchmark boundaries were rejected\n' >&2
     return 1
@@ -1002,6 +1377,8 @@ test_parser_defaults_and_boundaries() {
   expect_parse_failure --output "$output" --concurrency 0
   expect_parse_failure --output "$output" --concurrency 257
   expect_parse_failure --output "$output" --repetitions 4
+  expect_parse_failure --output "$output" --repetitions 6
+  expect_parse_failure --output "$output" --repetitions 10
   expect_parse_failure --output "$output" --repetitions 11
   expect_parse_failure --output "$output" --seed -1
   expect_parse_failure --output "$output" --seed 9223372036854775808
@@ -1133,6 +1510,525 @@ test_dependency_check_reports_invalid_lifecycle_tool_under_errexit() {
   }
 }
 
+test_docker_daemon_locality_is_verified_before_execution() (
+  local -r fake_bin="$TEST_TMP_DIR/docker-locality-bin"
+  local -r docker_log="$TEST_TMP_DIR/docker-locality.log"
+  local -r output="$TEST_TMP_DIR/docker-locality-output"
+  local -r socket_path="$TEST_TMP_DIR/docker-locality.sock"
+  local -r socket_symlink="$TEST_TMP_DIR/docker-locality-symlink.sock"
+  local -r compose_project="$TEST_TMP_DIR/docker-locality-project.txt"
+  local -r identity="$TEST_TMP_DIR/docker-locality-colliding-pid.txt"
+
+  mkdir -p -- "$fake_bin" "$output"
+  create_unix_socket_fixture "$socket_path"
+  ln -s -- "$TEST_SOURCE" "$fake_bin/docker"
+  : >"$docker_log"
+  reset_options
+  resolve_benchmark_identity_tools
+  PATH="$fake_bin:$PATH"
+  FAKE_DOCKER_LOG="$docker_log"
+  unset DOCKER_HOST DOCKER_CONTEXT
+  FAKE_DOCKER_CONTEXT=default
+  FAKE_DOCKER_ENDPOINT="unix://$socket_path"
+  FAKE_COMPOSE_PROJECT_FILE="$compose_project"
+  FAKE_CONTAINER_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  FAKE_PID="$$"
+  export PATH FAKE_DOCKER_LOG FAKE_DOCKER_CONTEXT FAKE_DOCKER_ENDPOINT \
+    FAKE_COMPOSE_PROJECT_FILE FAKE_CONTAINER_ID FAKE_PID
+  resolve_docker_daemon_locality || {
+    printf 'verified local Docker endpoint was rejected\n' >&2
+    return 1
+  }
+  OUTPUT_DIR="$output"
+  OUTPUT_READY=true
+  write_docker_daemon_provenance
+  validate_docker_daemon_provenance "$output/docker-daemon.json" || return 1
+  jq -e --arg endpoint "unix://$socket_path" --arg socket_path "$socket_path" '
+    .status == "verified_local_unix_socket_endpoint_only" and
+    .kind == "docker-endpoint-evidence" and .active_context == "default" and
+    .active_endpoint == $endpoint and .socket_path == $socket_path and
+    .endpoint_transport == "unix" and
+    .socket_evidence == "existing_non_symlink_unix_socket" and
+    .daemon_process_locality == "not_established_by_unix_socket_endpoint" and
+    .container_process_binding == "required_separately_for_each_process_sample" and
+    (.socket_device | type == "number") and (.socket_inode | type == "number") and
+    .verified_before_container_execution == true
+  ' "$output/docker-daemon.json" >/dev/null || return 1
+
+  FAKE_DOCKER_ENDPOINT="unix://$TEST_TMP_DIR/nonexistent-docker.sock"
+  if resolve_docker_daemon_locality >/dev/null 2>&1; then
+    printf 'Docker locality accepted a nonexistent Unix socket endpoint\n' >&2
+    return 1
+  fi
+  ln -s -- "$socket_path" "$socket_symlink"
+  FAKE_DOCKER_ENDPOINT="unix://$socket_symlink"
+  if resolve_docker_daemon_locality >/dev/null 2>&1; then
+    printf 'Docker locality accepted a symlink Unix socket endpoint\n' >&2
+    return 1
+  fi
+
+  DOCKER_HOST=tcp://remote.example.invalid:2376
+  if resolve_docker_daemon_locality >/dev/null 2>&1; then
+    printf 'Docker locality accepted DOCKER_HOST remote control\n' >&2
+    return 1
+  fi
+  unset DOCKER_HOST
+  DOCKER_HOST=""
+  export DOCKER_HOST
+  if resolve_docker_daemon_locality >/dev/null 2>&1; then
+    printf 'Docker locality accepted an inherited empty DOCKER_HOST override\n' >&2
+    return 1
+  fi
+  unset DOCKER_HOST
+  FAKE_DOCKER_CONTEXT=remote
+  FAKE_DOCKER_ENDPOINT=ssh://operator@remote.example.invalid
+  if resolve_docker_daemon_locality >/dev/null 2>&1; then
+    printf 'Docker locality accepted a remote SSH context endpoint\n' >&2
+    return 1
+  fi
+  FAKE_DOCKER_ENDPOINT=tcp://127.0.0.1:2375
+  if resolve_docker_daemon_locality >/dev/null 2>&1; then
+    printf 'Docker locality accepted a TCP daemon endpoint\n' >&2
+    return 1
+  fi
+  FAKE_DOCKER_ENDPOINT="unix://$socket_path"
+  DOCKER_CONTEXT=other
+  export DOCKER_CONTEXT
+  if resolve_docker_daemon_locality >/dev/null 2>&1; then
+    printf 'Docker locality accepted a mismatched active context override\n' >&2
+    return 1
+  fi
+  unset DOCKER_CONTEXT
+  printf 'fixture\n' >"$compose_project"
+  ACTIVE_PROJECT=fixture
+  COMPOSE=(docker compose --project-name fixture --file "$COMPOSE_FILE")
+  if capture_service_identity java-backend "$identity" >/dev/null 2>&1; then
+    printf 'container identity accepted a colliding local PID without exact cgroup binding\n' >&2
+    return 1
+  fi
+)
+
+test_manifest_bootstrap_survives_second_locality_query_failure() (
+  local -r fake_root="$TEST_TMP_DIR/locality-failure-root"
+  local -r fake_example="$fake_root/examples/apache-java-https"
+  local -r fake_bin="$TEST_TMP_DIR/locality-failure-bin"
+  local -r output_parent="$TEST_TMP_DIR/locality-failure-output"
+  local -r output="$output_parent/artifacts"
+  local -r docker_log="$TEST_TMP_DIR/locality-failure-docker.log"
+  local -r context_count="$TEST_TMP_DIR/locality-failure-context-count.txt"
+  local -r socket_path="$TEST_TMP_DIR/locality-failure.sock"
+  local status=0
+
+  mkdir -p -- "$fake_example/scripts" "$fake_example/.runtime" \
+    "$fake_bin" "$output_parent"
+  chmod 0755 -- "$fake_example/.runtime"
+  install --mode=0755 "$TEST_SCRIPT_DIR/benchmark.sh" \
+    "$fake_example/scripts/benchmark.sh"
+  ln -s -- "$TEST_SOURCE" "$fake_example/run.sh"
+  printf 'services: {}\n' >"$fake_example/docker-compose.yml"
+  ln -s -- "$TEST_SOURCE" "$fake_bin/docker"
+  : >"$docker_log"
+  create_unix_socket_fixture "$socket_path"
+  set +e
+  PATH="$fake_bin:$PATH" \
+    FAKE_DOCKER_CONTEXT=default \
+    FAKE_DOCKER_ENDPOINT="unix://$socket_path" \
+    FAKE_DOCKER_LOG="$docker_log" \
+    FAKE_DOCKER_CONTEXT_SHOW_COUNT_FILE="$context_count" \
+    FAKE_DOCKER_CONTEXT_FAIL_AFTER=1 \
+    "$fake_example/scripts/benchmark.sh" --output "$output" \
+      --warmup-seconds 2 --duration-seconds 2 --concurrency 1 \
+      --repetitions 5 --seed 17 >/dev/null 2>&1
+  status=$?
+  set -e
+  [[ "$status" != 0 && "$(<"$context_count")" == 2 ]] || {
+    printf 'second Docker locality query did not fail at the intended boundary\n' >&2
+    return 1
+  }
+  jq -e '
+    .status == "failed" and .docker_daemon == {
+      status: "requested_but_unavailable", path: null
+    } and .application_source == {
+      status: "requested_but_unavailable", path: null
+    }
+  ' "$output/summary.json" >/dev/null || {
+    printf 'early provenance failure did not retain a failed terminal summary\n' >&2
+    return 1
+  }
+  jq -e '.status == "failed" and .docker_endpoint_evidence == "docker-daemon.json"' \
+    "$output/manifest.json" >/dev/null || {
+    printf 'early provenance failure did not terminate its bootstrap manifest\n' >&2
+    return 1
+  }
+)
+
+test_benchmark_documentation_binds_partial_status_to_mralias_issue() (
+  local -r document="$TEST_SCRIPT_DIR/../BENCHMARK.md"
+  local -r issue_link='[MrAlias/opentelemetry-ebpf-instrumentation issue #37](https://github.com/MrAlias/opentelemetry-ebpf-instrumentation/issues/37)'
+  local flattened=""
+  local -a issue_lines=()
+
+  [[ "$(grep -Fc -- "$issue_link" "$document")" == 1 ]] || {
+    printf 'benchmark documentation does not identify the exact MrAlias fork issue once\n' >&2
+    return 1
+  }
+  mapfile -t issue_lines < <(grep -F -- '#37' "$document")
+  [[ "${#issue_lines[@]}" == 1 && "${issue_lines[0]}" == "$issue_link." ]] || {
+    printf 'benchmark documentation contains an ambiguous issue #37 reference\n' >&2
+    return 1
+  }
+  flattened="$(tr '\n' ' ' <"$document")" || return 1
+  [[ "$flattened" == *"The retained benchmark evidence remains partial and does not close the open $issue_link."* ]] || {
+    printf 'benchmark documentation does not keep the fork issue explicitly partial and open\n' >&2
+    return 1
+  }
+)
+
+test_proc_snapshot_requires_container_starttime_and_cgroup_identity() (
+  local -r fixture="$TEST_TMP_DIR/proc-identity"
+  local -r proc_root="$fixture/proc"
+  local -r pid=4242
+  local -r container_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  local -r wrong_container_id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  local -r identity="$fixture/identity.txt"
+  local -r snapshot="$fixture/snapshot.txt"
+  local current=""
+  local start_time=""
+  local cgroup_sha256=""
+  local binding=""
+  local field=0
+
+  mkdir -p -- "$proc_root/$pid/fd" "$proc_root/$pid/task"
+  touch -- "$proc_root/$pid/fd/3" "$proc_root/$pid/task/$pid"
+  {
+    printf '%s (fixture process) S' "$pid"
+    for ((field = 1; field <= 18; field++)); do
+      printf ' 1'
+    done
+    printf ' 777\n'
+  } >"$proc_root/$pid/stat"
+  printf 'Name:\tfixture\nThreads:\t1\n' >"$proc_root/$pid/status"
+  printf '0::/system.slice/docker-%s.scope\n' "$container_id" \
+    >"$proc_root/$pid/cgroup"
+  reset_options
+  resolve_benchmark_identity_tools
+  current="$(proc_identity_from_root "$proc_root" "$pid" "$container_id")" || {
+    printf 'could not capture the copied proc identity fixture\n' >&2
+    return 1
+  }
+  read -r start_time cgroup_sha256 binding <<<"$current" || return 1
+  [[ "$binding" == "$PROC_CGROUP_CONTAINER_BINDING" ]] || return 1
+  {
+    printf 'service=fixture\n'
+    printf 'container_id=%s\n' "$container_id"
+    printf 'host_pid=%s\n' "$pid"
+    printf 'proc_start_time=%s\n' "$start_time"
+    printf 'proc_cgroup_sha256=%s\n' "$cgroup_sha256"
+    printf 'proc_cgroup_container_binding=%s\n' "$binding"
+    printf 'project=fixture\n'
+    printf 'owner_sentinel=acceptance-demo-v1\n'
+  } >"$identity"
+  capture_proc_snapshot_from_root "$identity" "$snapshot" "$proc_root"
+  grep -Fxq status=available "$snapshot" &&
+    grep -Fxq "proc_start_time=$start_time" "$snapshot" &&
+    grep -Fxq "proc_cgroup_sha256=$cgroup_sha256" "$snapshot" &&
+    grep -Fxq "proc_cgroup_container_binding=$PROC_CGROUP_CONTAINER_BINDING" \
+      "$snapshot" || {
+    printf 'matching local process identity did not produce an available sample\n' >&2
+    return 1
+  }
+  sed -i "s/^proc_start_time=.*/proc_start_time=$((start_time + 1))/" "$identity"
+  capture_proc_snapshot_from_root "$identity" "$snapshot" "$proc_root"
+  grep -Fxq status=unavailable "$snapshot" || {
+    printf 'process snapshot accepted a reused PID start-time mismatch\n' >&2
+    return 1
+  }
+  sed -i "s/^proc_start_time=.*/proc_start_time=$start_time/" "$identity"
+  sed -i 's/^proc_cgroup_sha256=.*/proc_cgroup_sha256=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd/' \
+    "$identity"
+  capture_proc_snapshot_from_root "$identity" "$snapshot" "$proc_root"
+  grep -Fxq status=unavailable "$snapshot" || {
+    printf 'process snapshot accepted an unrelated cgroup identity\n' >&2
+    return 1
+  }
+  sed -i "s/^proc_cgroup_sha256=.*/proc_cgroup_sha256=$cgroup_sha256/" "$identity"
+
+  printf '0::/system.slice/no-container.scope\n' >"$proc_root/$pid/cgroup"
+  if proc_identity_from_root "$proc_root" "$pid" "$container_id" >/dev/null 2>&1; then
+    printf 'proc identity accepted a cgroup without a container ID\n' >&2
+    return 1
+  fi
+  printf '0::/system.slice/docker-%s.scope\n' "$wrong_container_id" \
+    >"$proc_root/$pid/cgroup"
+  if proc_identity_from_root "$proc_root" "$pid" "$container_id" >/dev/null 2>&1; then
+    printf 'proc identity accepted the wrong full container ID\n' >&2
+    return 1
+  fi
+  printf '0::/system.slice/docker-%s.scope\n' "${container_id:0:63}" \
+    >"$proc_root/$pid/cgroup"
+  if proc_identity_from_root "$proc_root" "$pid" "$container_id" >/dev/null 2>&1; then
+    printf 'proc identity accepted a prefix-only container ID\n' >&2
+    return 1
+  fi
+  {
+    printf '0::/system.slice/docker-%s.scope/' "$container_id"
+    head -c "$MAX_PROC_CGROUP_BYTES" /dev/zero | tr '\0' x
+  } >"$proc_root/$pid/cgroup"
+  if proc_identity_from_root "$proc_root" "$pid" "$container_id" >/dev/null 2>&1; then
+    printf 'proc identity accepted an oversized cgroup file\n' >&2
+    return 1
+  fi
+
+  printf '0::/system.slice/docker-%s.scope\n' "$container_id" \
+    >"$proc_root/$pid/cgroup"
+  current="$(proc_identity_from_root "$proc_root" "$pid" "$container_id")" || return 1
+  read -r start_time cgroup_sha256 binding <<<"$current" || return 1
+  sed -i "s/^proc_cgroup_sha256=.*/proc_cgroup_sha256=$cgroup_sha256/" "$identity"
+  printf '0::/alternate/docker-%s.scope\n' "$container_id" \
+    >"$proc_root/$pid/cgroup"
+  capture_proc_snapshot_from_root "$identity" "$snapshot" "$proc_root"
+  grep -Fxq status=unavailable "$snapshot" || {
+    printf 'process snapshot accepted cgroup identity drift\n' >&2
+    return 1
+  }
+)
+
+test_make_compiler_resolution_honors_and_pins_inherited_cc() (
+  local -r compiler_directory="$TEST_TMP_DIR/compiler-resolution"
+  local -r inherited_compiler="$compiler_directory/inherited-cc"
+  local -r expanded_command="$compiler_directory/expanded-build-command.txt"
+  local default_compiler=""
+  local flag=""
+
+  reset_options
+  mkdir -- "$compiler_directory"
+  install -m 0755 /bin/true "$inherited_compiler"
+  printf '$(shell /usr/bin/touch %s)\nCC = /bin/false\nCFLAGS = -DINJECTED\n' \
+    "$compiler_directory/makefiles-marker" >"$compiler_directory/injected.mk"
+  export MAKEFILES="$compiler_directory/injected.mk"
+  export MAKEFLAGS='CFLAGS=-DMAKEFLAGS_INJECTED'
+  export GNUMAKEFLAGS='CFLAGS=-DGNUMAKEFLAGS_INJECTED'
+  export MFLAGS='CFLAGS=-DMFLAGS_INJECTED'
+  export MAKEOVERRIDES='CFLAGS'
+  CC="$inherited_compiler"
+  export CC
+  resolve_native_benchmark_compiler || {
+    printf 'inherited CC could not be resolved through Makefile.jni\n' >&2
+    return 1
+  }
+  [[ "$NATIVE_BENCHMARK_COMPILER" == "$(readlink -f -- "$inherited_compiler")" &&
+    "$NATIVE_BENCHMARK_COMPILER_SELECTION" == inherited_CC &&
+    ! -e "$compiler_directory/makefiles-marker" ]] || {
+    printf 'inherited CC was not retained as the compiler selected by Make\n' >&2
+    return 1
+  }
+  {
+    printf '%s' "$NATIVE_BENCHMARK_COMPILER"
+    for flag in "${NATIVE_BENCHMARK_COMPILE_FLAGS[@]}"; do
+      printf ' %s' "$flag"
+    done
+    printf ' %s' \
+      'src/main/c/io_opentelemetry_obi_java_jni.c' \
+      'src/test/c/remote_parent_jni_benchmark.c'
+    for flag in "${NATIVE_BENCHMARK_LINK_FLAGS[@]}"; do
+      printf ' %s' "$flag"
+    done
+    printf ' -o /tmp/remote_parent_jni_benchmark\n'
+    printf '/tmp/remote_parent_jni_benchmark 10000\n'
+  } >"$expanded_command"
+  validate_native_expanded_build_command \
+    "$expanded_command" "$NATIVE_BENCHMARK_COMPILER" || {
+    printf 'expanded Make command did not prove the pinned compiler and flags\n' >&2
+    return 1
+  }
+  sed 's/ -DOBI_JNI_TESTING//' "$expanded_command" >"$expanded_command.invalid"
+  if validate_native_expanded_build_command \
+    "$expanded_command.invalid" "$NATIVE_BENCHMARK_COMPILER"; then
+    printf 'expanded Make validator accepted a missing production benchmark flag\n' >&2
+    return 1
+  fi
+
+  CC='cc -fno-omit-frame-pointer'
+  if resolve_native_benchmark_compiler >/dev/null 2>&1; then
+    printf 'compiler resolver accepted an ambiguous CC command with arguments\n' >&2
+    return 1
+  fi
+  CC="\$(shell /usr/bin/touch $compiler_directory/cc-marker)"
+  if resolve_native_benchmark_compiler >/dev/null 2>&1 ||
+    [[ -e "$compiler_directory/cc-marker" ]]; then
+    printf 'compiler resolver evaluated Make syntax from inherited CC\n' >&2
+    return 1
+  fi
+
+  unset CC
+  resolve_native_benchmark_compiler || {
+    printf 'Makefile.jni default compiler could not be resolved\n' >&2
+    return 1
+  }
+  default_compiler="$(readlink -f -- "$(type -P cc)")" || return 1
+  [[ "$NATIVE_BENCHMARK_COMPILER" == "$default_compiler" &&
+    "$NATIVE_BENCHMARK_COMPILER_SELECTION" == make_default ]] || {
+    printf 'compiler resolver did not use the actual Make default CC\n' >&2
+    return 1
+  }
+)
+
+test_native_make_environment_and_staging_are_hermetic() (
+  local -r fixture="$TEST_TMP_DIR/native-hermetic"
+  local -r compiler="$fixture/compiler"
+  local -r compiler_log="$fixture/compiler.log"
+  local -r runtime_log="$fixture/runtime.log"
+  local -r marker="$fixture/makefiles-marker"
+  local -r output_marker="$fixture/output-path-marker"
+  local -r build_command="$fixture/build-command.txt"
+  local staging=""
+  local hostile_output=""
+  local -a make_arguments=()
+
+  mkdir -- "$fixture"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -Eeuo pipefail' \
+    'if [[ "${1:-}" == --version ]]; then printf "fixture compiler\\n"; exit 0; fi' \
+    "printf 'args=' >$(printf '%q' "$compiler_log")" \
+    "printf '%q ' \"\$@\" >>$(printf '%q' "$compiler_log")" \
+    "printf '\\n' >>$(printf '%q' "$compiler_log")" \
+    "/usr/bin/env | /usr/bin/sort >>$(printf '%q' "$compiler_log")" \
+    'output=""' \
+    'while (($# > 0)); do if [[ "$1" == -o ]]; then output="$2"; shift 2; else shift; fi; done' \
+    '[[ "$output" == /* ]]' \
+    "printf '%s\\n' '#!/bin/sh' $(printf '%q' "/usr/bin/env | /usr/bin/sort >$runtime_log") 'exit 0' >\"\$output\"" \
+    '/usr/bin/chmod 0700 -- "$output"' \
+    >"$compiler"
+  chmod 0700 -- "$compiler"
+  {
+    printf 'CFLAGS = -DFIXED\n'
+    printf 'all:\n'
+    printf '\t$(CC) $(CFLAGS) -o $(BUILD_DIR)/artifact\n'
+    printf '\t$(BUILD_DIR)/artifact\n'
+  } >"$fixture/Makefile"
+  printf '$(shell /usr/bin/touch %s)\nCFLAGS = -DINJECTED\n' "$marker" \
+    >"$fixture/injected.mk"
+  resolve_native_benchmark_tools
+  staging="$(create_native_build_staging_directory)" || return 1
+  hostile_output="$fixture/\$(shell /usr/bin/touch $output_marker)"
+  OUTPUT_DIR="$hostile_output"
+  make_arguments=(
+    --no-print-directory --directory "$fixture" --file Makefile all
+    "CC=$compiler" "BUILD_DIR=$staging"
+  )
+  write_native_make_build_command \
+    "$build_command" 15 "${make_arguments[@]}" || return 1
+  export MAKEFILES="$fixture/injected.mk"
+  export MAKEFLAGS='CFLAGS=-DMAKEFLAGS_INJECTED'
+  export GNUMAKEFLAGS='CFLAGS=-DGNUMAKEFLAGS_INJECTED'
+  export MFLAGS='CFLAGS=-DMFLAGS_INJECTED'
+  export MAKEOVERRIDES='CFLAGS'
+  export CPATH="$fixture/hostile-cpath"
+  export C_INCLUDE_PATH="$fixture/hostile-include"
+  export GCC_EXEC_PREFIX="$fixture/hostile-gcc"
+  export COMPILER_PATH="$fixture/hostile-compiler-path"
+  export LIBRARY_PATH="$fixture/hostile-library"
+  export LD_AUDIT="$fixture/hostile-audit.so"
+  export LD_LIBRARY_PATH="$fixture/hostile-loader"
+  export LD_PRELOAD="$fixture/hostile-preload.so"
+  run_native_bounded 15 "$NATIVE_BENCHMARK_MAKE_COMMAND" \
+    "${make_arguments[@]}" || return 1
+  unset MAKEFILES MAKEFLAGS GNUMAKEFLAGS MFLAGS MAKEOVERRIDES CPATH \
+    C_INCLUDE_PATH GCC_EXEC_PREFIX COMPILER_PATH LIBRARY_PATH \
+    LD_AUDIT LD_LIBRARY_PATH LD_PRELOAD
+  [[ -x "$staging/artifact" && -s "$runtime_log" &&
+    ! -e "$marker" && ! -e "$output_marker" ]] || {
+    printf 'hostile Make or output-path input affected the staged build\n' >&2
+    return 1
+  }
+  grep -Fq -- '-DFIXED' "$compiler_log" &&
+    ! grep -Fq -- 'INJECTED' "$compiler_log" &&
+    ! grep -Eq '^(CPATH|C_INCLUDE_PATH|GCC_EXEC_PREFIX|COMPILER_PATH|LIBRARY_PATH|LD_AUDIT|LD_LIBRARY_PATH|LD_PRELOAD)=' \
+      "$compiler_log" &&
+    ! grep -Eq '^(CPATH|C_INCLUDE_PATH|GCC_EXEC_PREFIX|COMPILER_PATH|LIBRARY_PATH|LD_AUDIT|LD_LIBRARY_PATH|LD_PRELOAD)=' \
+      "$runtime_log" || {
+    printf 'native compiler or benchmark inherited an uncontrolled environment\n' >&2
+    return 1
+  }
+  grep -Fq -- "( exec -c $NATIVE_BENCHMARK_ENV_COMMAND -i" "$build_command" &&
+    grep -Fq -- "$NATIVE_BENCHMARK_ENV_COMMAND -i" "$build_command" &&
+    grep -Fq -- "PATH=/usr/bin:/bin" "$build_command" &&
+    grep -Fq -- "$NATIVE_BENCHMARK_MAKE_COMMAND" "$build_command" &&
+    ! grep -Fq -- "$hostile_output" "$build_command" || {
+    printf 'recorded native build command did not match the sanitized invocation\n' >&2
+    return 1
+  }
+  cleanup_native_build_staging_directory "$staging"
+  [[ ! -e "$staging" ]]
+)
+
+test_native_source_state_rejects_dirty_and_mutating_inputs() (
+  local -r repository="$TEST_TMP_DIR/native-source-repository"
+  local -r evidence="$TEST_TMP_DIR/native-source-evidence"
+  local -r filtered_path="${NATIVE_BENCHMARK_SOURCE_PATHS[2]}"
+  local -r filter="$TEST_TMP_DIR/native-source-clean-filter"
+  local filtered_blob=""
+  local head_blob=""
+  local path=""
+
+  mkdir -p -- "$repository" "$evidence"
+  for path in "${NATIVE_BENCHMARK_SOURCE_PATHS[@]}"; do
+    mkdir -p -- "$repository/${path%/*}"
+    printf 'fixture %s\n' "$path" >"$repository/$path"
+  done
+  git -C "$repository" init --quiet
+  git -C "$repository" config user.email benchmark@example.invalid
+  git -C "$repository" config user.name 'Benchmark Test'
+  git -C "$repository" config commit.gpgsign false
+  git -C "$repository" add -- "${NATIVE_BENCHMARK_SOURCE_PATHS[@]}"
+  git -C "$repository" commit --quiet -m fixture
+  capture_native_source_snapshot "$repository" "$evidence/source-state-before.json" || {
+    printf 'clean native source snapshot was rejected\n' >&2
+    return 1
+  }
+  printf 'mutated\n' >>"$repository/${NATIVE_BENCHMARK_SOURCE_PATHS[2]}"
+  if capture_native_source_snapshot "$repository" "$evidence/dirty.json"; then
+    printf 'dirty native source was accepted\n' >&2
+    return 1
+  fi
+  printf 'fixture %s\n' "$filtered_path" >"$repository/$filtered_path"
+  printf '%s\n' \
+    '#!/bin/sh' \
+    "printf '%s\\n' $(printf '%q' "fixture $filtered_path")" >"$filter"
+  chmod 0700 -- "$filter"
+  printf '%s filter=mask-dirty-native-source\n' "$filtered_path" \
+    >"$repository/.gitattributes"
+  git -C "$repository" config filter.mask-dirty-native-source.clean "$filter"
+  git -C "$repository" config filter.mask-dirty-native-source.required true
+  printf 'dirty content hidden by a Git clean filter\n' >"$repository/$filtered_path"
+  head_blob="$(git -C "$repository" rev-parse "HEAD:$filtered_path")" || return 1
+  filtered_blob="$(git -C "$repository" hash-object \
+    --path="$filtered_path" -- "$repository/$filtered_path")" || return 1
+  [[ "$filtered_blob" == "$head_blob" ]] || {
+    printf 'dirty-source filter fixture did not mask the working-tree mutation\n' >&2
+    return 1
+  }
+  if capture_native_source_snapshot "$repository" "$evidence/filtered-dirty.json"; then
+    printf 'native source identity trusted a Git clean filter over raw bytes\n' >&2
+    return 1
+  fi
+  rm -f -- "$repository/.gitattributes"
+  git -C "$repository" config --unset filter.mask-dirty-native-source.clean
+  git -C "$repository" config --unset filter.mask-dirty-native-source.required
+  printf 'fixture %s\n' "$filtered_path" >"$repository/$filtered_path"
+  capture_native_source_snapshot "$repository" "$evidence/source-state-after.json" || return 1
+  finalize_native_source_state \
+    "$evidence/source-state-before.json" "$evidence/source-state-after.json" \
+    "$evidence/source-state.json" || return 1
+  validate_native_source_state_schema "$evidence/source-state.json" || return 1
+  printf 'mutated during build\n' >>"$repository/${NATIVE_BENCHMARK_SOURCE_PATHS[3]}"
+  if capture_native_source_snapshot "$repository" "$evidence/mutated-after.json"; then
+    printf 'native source mutation between captures was accepted\n' >&2
+    return 1
+  fi
+)
+
 test_output_directory_is_absolute_fresh_private() {
   local -r private_output="$TEST_TMP_DIR/new output; literal-dollar\$"
   local -r existing_directory="$TEST_TMP_DIR/existing"
@@ -1232,6 +2128,1155 @@ getsockopt-helper-idle|getsockopt-helper-idle|getsockopt|concurrency||true|getso
 EOF
 }
 
+test_bounded_path_cell_mapping_is_exact() {
+  local cell=""
+  local expected=""
+
+  while IFS='|' read -r cell expected; do
+    (
+      reset_options
+      cell_spec "$cell"
+      [[ "$CELL_SLUG|$CELL_TRANSPORT|$CELL_SCENARIO|$CELL_PREFLIGHT_REQUESTS|$CELL_MEASUREMENT_REQUESTS|$CELL_RESULT_LABEL|$CELL_PATH_CLASSIFICATION|$CELL_EXPECTED_JAVA_STATUS|$CELL_BOUNDED_PATH" == "$expected" ]]
+    ) || {
+      printf 'incorrect bounded path cell mapping for %s\n' "$cell" >&2
+      return 1
+    }
+  done <<'EOF'
+getsockopt-stale|getsockopt-stale|getsockopt|primary-w3c-stale|1|1|primary-w3c-stale|failure|stale|true
+unix-stale|unix-stale|unix|unix-w3c-stale|1|1|unix-w3c-stale|failure|stale|true
+unix-timeout|unix-timeout|unix|w3c-fault|2|1|w3c-fault-timeout|failure|timeout|true
+getsockopt-pressure|getsockopt-pressure|getsockopt|pressure|128|128|pressure|pressure|mixed|true
+EOF
+
+  (
+    reset_options
+    cell_spec getsockopt-helper-idle
+    [[ "$CELL_PATH_CLASSIFICATION" == "" &&
+      "$CELL_EXPECTED_JAVA_STATUS" == "" &&
+      "$CELL_BOUNDED_PATH" == false ]]
+  ) || {
+    printf 'helper-idle was relabelled as a lookup miss\n' >&2
+    return 1
+  }
+}
+
+test_core_mode_does_not_publish_complete_only_path_observations() (
+  local -r calls="$TEST_TMP_DIR/core-path-observation.calls"
+
+  write_path_observation() {
+    printf '%s\n' "$1" >>"$calls"
+  }
+  reset_options
+  cell_spec getsockopt-hit
+  CELLS_MODE=core
+  write_core_hit_path_observation_if_requested /fixture/getsockopt-hit
+  [[ ! -e "$calls" ]] || {
+    printf 'core mode published a complete-only hit path observation\n' >&2
+    return 1
+  }
+  CELLS_MODE=complete
+  write_core_hit_path_observation_if_requested /fixture/getsockopt-hit
+  [[ "$(<"$calls")" == /fixture/getsockopt-hit ]] || return 1
+  cell_spec getsockopt-w3c
+  write_core_hit_path_observation_if_requested /fixture/getsockopt-w3c
+  [[ "$(wc -l <"$calls")" == 1 ]]
+)
+
+write_path_observation_fixture() {
+  local -r output="$1"
+  local -r cell="${2:-getsockopt-stale}"
+  local transport=""
+  local classification=""
+  local java_status=""
+  local label=""
+  local requested=0
+  local observed=0
+  local valid=0
+  local missing=0
+  local stale=0
+  local timeout_count=0
+  local pressure="null"
+
+  case "$cell" in
+    getsockopt-hit)
+      transport=getsockopt; classification=hit; java_status=valid
+      label=concurrency; requested=16; observed=16; valid=16; missing=1
+      ;;
+    unix-hit)
+      transport=unix; classification=hit; java_status=valid
+      label=concurrency; requested=16; observed=16; valid=16; missing=1
+      ;;
+    getsockopt-stale)
+      transport=getsockopt; classification=failure; java_status=stale
+      label=primary-w3c-stale; requested=1; observed=1; stale=1
+      ;;
+    unix-stale)
+      transport=unix; classification=failure; java_status=stale
+      label=unix-w3c-stale; requested=1; observed=1; stale=1
+      ;;
+    unix-timeout)
+      transport=unix; classification=failure; java_status=timeout
+      label='w3c-fault-timeout'; requested=2; observed=1; timeout_count=1
+      ;;
+    getsockopt-pressure)
+      transport=getsockopt; classification=pressure; java_status=mixed
+      label=pressure; requested=128; observed=128; valid=127; missing=2
+      pressure='{
+        "bounded":true,"exact_hit_count":127,"explicit_root_count":1,
+        "wrong_parent_count":0,"unresolved_count":0,"take_valid_count":127,
+        "attributable_absence_count":1,
+        "map_name":"java_remote_parent_handoff_claims","map_type":"Hash",
+        "map_id":41,"kernel_map_name":"java_remote_par","kernel_map_type":"hash",
+        "max_entries":50000,"touched_entries":49999,"capacity_rejected_entries":1,
+        "verified_present_entries":49999,"cleanup_verified":true,
+        "verified_absent_entries":50001,"occupancy_before_fill":1,
+        "occupancy_pressured":50000,"occupancy_traffic_complete":49999,
+        "occupancy_recovery_samples":[1,1],"occupancy_recovered":1,
+        "recovery_log_attempts":2,"recovery_samples":2
+      }'
+      ;;
+    *) return 1 ;;
+  esac
+  jq -n \
+    --arg cell "$cell" --arg transport "$transport" \
+    --arg classification "$classification" --arg java_status "$java_status" \
+    --arg label "$label" --argjson requested "$requested" \
+    --argjson observed "$observed" --argjson valid "$valid" \
+    --argjson missing "$missing" --argjson stale "$stale" \
+    --argjson timeout "$timeout_count" --argjson pressure "$pressure" '
+    {
+      schema_version: 1,
+      kind: "java-remote-parent-path-correctness-observation",
+      cell: $cell,
+      transport: $transport,
+      path_classification: $classification,
+      java_status: $java_status,
+      application_path: true,
+      observation: {
+        mode: "bounded_correctness_observed_once",
+        runner_execution_count: 1,
+        runner_requested_requests: $requested,
+        observed_requests: $observed,
+        result_status: "passed"
+      },
+      java_diagnostic_status_deltas: {
+        unknown: 0, valid: $valid, missing: $missing, stale: $stale, unsupported: 0,
+        malformed: 0, version_mismatch: 0, ambiguous: 0, unauthorized: 0,
+        already_consumed: 0, timeout: $timeout, overload: 0, transport_error: 0,
+        disabled: 0
+      },
+      performance_metrics: {
+        status: "not_evaluated_from_bounded_observation",
+        reason: "one correctness execution is not a benchmark"
+      },
+      pressure: $pressure,
+      source: {
+        result: ("preflight/runner/scenario-" + $label + ".json"),
+        status: ("preflight/runner/scenario-" + $label + "-status.json"),
+        java_diagnostics_delta: ("preflight/runner/phases/" + $label + "-after/java-diagnostics.delta")
+      },
+      provenance: {
+        host_environment: "../../host-environment.txt",
+        runner_environment: "preflight/runner/environment.txt",
+        runner_provenance: "preflight/runner/provenance.json",
+        source_state: "preflight/runner/source-state.txt"
+      },
+      limitations: {
+        state_map_miss_proved: false,
+        helper_idle_relabelled_as_miss: false
+      }
+    }
+  ' >"$output"
+}
+
+test_bounded_paths_are_correctness_observations_not_performance_samples() {
+  local -r observation="$TEST_TMP_DIR/path-observation.json"
+  local -r invalid="$TEST_TMP_DIR/path-observation-invalid.json"
+
+  write_path_observation_fixture "$observation"
+  validate_path_observation_schema "$observation" || {
+    printf 'valid bounded correctness observation was rejected\n' >&2
+    return 1
+  }
+  jq -e '
+    .observation.mode == "bounded_correctness_observed_once" and
+    .observation.runner_execution_count == 1 and
+    .observation.observed_requests == 1 and
+    .performance_metrics.status == "not_evaluated_from_bounded_observation" and
+    (has("end_to_end") | not) and
+    ([paths(scalars) as $path | $path[-1]] |
+      index("throughput_per_second") == null and
+      index("latency_p50_nanos") == null and
+      index("latency_p95_nanos") == null and
+      index("latency_p99_nanos") == null)
+  ' "$observation" >/dev/null || {
+    printf 'bounded path observation retained benchmark-like statistics\n' >&2
+    return 1
+  }
+
+  jq '.end_to_end = {throughput_per_second: 1, latency_p99_nanos: 1}' \
+    "$observation" >"$invalid"
+  if validate_path_observation_schema "$invalid"; then
+    printf 'bounded path schema accepted injected performance statistics\n' >&2
+    return 1
+  fi
+  jq '.observation.mode = "measured"' "$observation" >"$invalid"
+  if validate_path_observation_schema "$invalid"; then
+    printf 'bounded path schema accepted a benchmark-like coverage label\n' >&2
+    return 1
+  fi
+  jq '.cell = "unix-stale"' "$observation" >"$invalid"
+  if validate_path_observation_schema "$invalid"; then
+    printf 'path schema accepted a mismatched cell/transport/source contract\n' >&2
+    return 1
+  fi
+  jq '.pressure = {}' "$observation" >"$invalid"
+  if validate_path_observation_schema "$invalid"; then
+    printf 'path schema accepted pressure evidence on a stale cell\n' >&2
+    return 1
+  fi
+  write_path_observation_fixture "$observation" getsockopt-pressure
+  validate_path_observation_schema "$observation" || {
+    printf 'exact pressure observation was rejected\n' >&2
+    return 1
+  }
+  jq '.observation.runner_requested_requests = 127' "$observation" >"$invalid"
+  if validate_path_observation_schema "$invalid"; then
+    printf 'pressure observation accepted the wrong request count\n' >&2
+    return 1
+  fi
+  jq '.pressure.take_valid_count = 126' "$observation" >"$invalid"
+  if validate_path_observation_schema "$invalid"; then
+    printf 'pressure observation accepted incomplete Java reconciliation\n' >&2
+    return 1
+  fi
+  jq 'del(.pressure.recovery_samples)' "$observation" >"$invalid"
+  if validate_path_observation_schema "$invalid"; then
+    printf 'pressure observation accepted incomplete recovery evidence\n' >&2
+    return 1
+  fi
+  jq '.pressure = null' "$observation" >"$invalid"
+  if validate_path_observation_schema "$invalid"; then
+    printf 'pressure cell accepted missing pressure evidence\n' >&2
+    return 1
+  fi
+}
+
+test_pressure_recovery_evidence_parses_canonical_samples_and_log() (
+  local -r root="$TEST_TMP_DIR/pressure-recovery-evidence"
+  local -r observation="$root/path-observation.json"
+  local -r runner="$root/preflight/runner"
+  local -r sample_one="$runner/map-pressure-pressure-recovered-sample-01.prom"
+  local -r sample_two="$runner/map-pressure-pressure-recovered-sample-02.prom"
+  local -r recovered="$runner/map-pressure-pressure-recovered.prom"
+  local -r log="$runner/map-pressure-pressure-recovered-samples.log"
+  local -r pressured="$runner/map-pressure-pressure-pressured.prom"
+  local -r fill="$runner/map-pressure-pressure-fill.json"
+  local -r invalid_observation="$root/path-observation.invalid.json"
+  local evidence=""
+  local canonical_pressure=""
+
+  mkdir -p -- "$root"
+  write_path_observation_fixture "$observation" getsockopt-pressure
+  materialize_path_observation_sources "$observation"
+  evidence="$(pressure_recovery_evidence_json "$runner")" || {
+    printf 'production-shaped pressure recovery evidence was rejected\n' >&2
+    return 1
+  }
+  jq -e '
+    .map_id == 41 and .kernel_map_name == "java_remote_par" and
+    .map_type == "hash" and .max_entries == 50000 and
+    .baseline_entries == 1 and .pressured_entries == 50000 and
+    .traffic_complete_entries == 49999 and
+    .recovery_sample_count == 2 and .recovery_sample_entries == [1, 1] and
+    .recovered_entries == 1 and .recovery_log_attempts == 2
+  ' <<<"$evidence" >/dev/null || return 1
+  validate_pressure_cell_artifacts "$runner" || return 1
+  canonical_pressure="$(canonical_pressure_observation_json "$runner")" || return 1
+  jq -e --argjson canonical "$canonical_pressure" '.pressure == $canonical' \
+    "$observation" >/dev/null || {
+    printf 'pressure fixture diverged from the canonical raw evidence builder\n' >&2
+    return 1
+  }
+  validate_path_observation_source_artifacts "$observation" || return 1
+  jq '.pressure.occupancy_pressured = 49999' "$observation" >"$invalid_observation"
+  validate_path_observation_schema "$invalid_observation" || return 1
+  if validate_path_observation_source_artifacts "$invalid_observation"; then
+    printf 'pressure source validation accepted a stale derived occupancy\n' >&2
+    return 1
+  fi
+
+  command cp -- "$fill" "$fill.valid"
+  jq '.touched = 1 | .verified_present_entries = 1' "$fill" >"$fill.tmp"
+  mv -T -- "$fill.tmp" "$fill"
+  validate_pressure_cell_artifacts "$runner" || {
+    printf 'production-valid mutated fill fixture was rejected before reconciliation\n' >&2
+    return 1
+  }
+  if validate_path_observation_source_artifacts "$observation"; then
+    printf 'pressure source validation accepted stale touched-entry evidence\n' >&2
+    return 1
+  fi
+  mv -T -- "$fill.valid" "$fill"
+
+  command cp -- "$pressured" "$pressured.occupancy-valid"
+  write_pressure_map_metrics_fixture "$pressured" 2
+  validate_pressure_cell_artifacts "$runner" || {
+    printf 'production-valid mutated pressure occupancy was rejected before reconciliation\n' >&2
+    return 1
+  }
+  if validate_path_observation_source_artifacts "$observation"; then
+    printf 'pressure source validation accepted stale pressured occupancy evidence\n' >&2
+    return 1
+  fi
+  mv -T -- "$pressured.occupancy-valid" "$pressured"
+
+  command cp -- "$sample_one" "$sample_one.valid"
+  printf 'garbage\n' >"$sample_one"
+  if validate_pressure_cell_artifacts "$runner"; then
+    printf 'pressure validation accepted garbage recovery metrics\n' >&2
+    return 1
+  fi
+  mv -T -- "$sample_one.valid" "$sample_one"
+
+  command cp -- "$log" "$log.valid"
+  {
+    printf 'attempt=1 observed_at=2026-08-10T00:00:00Z entries=2 matched=true consecutive=1\n'
+    printf 'attempt=2 observed_at=2026-08-10T00:00:01Z entries=1 matched=true consecutive=2\n'
+  } >"$log"
+  if validate_pressure_cell_artifacts "$runner"; then
+    printf 'pressure validation accepted a log/sample occupancy mismatch\n' >&2
+    return 1
+  fi
+  mv -T -- "$log.valid" "$log"
+
+  command cp -- "$recovered" "$recovered.valid"
+  write_pressure_map_metrics_fixture "$recovered" 0
+  if validate_pressure_cell_artifacts "$runner"; then
+    printf 'pressure validation accepted a canonical/sample recovery mismatch\n' >&2
+    return 1
+  fi
+  mv -T -- "$recovered.valid" "$recovered"
+
+  command cp -- "$sample_two" \
+    "$runner/map-pressure-pressure-recovered-sample-03.prom"
+  if validate_pressure_cell_artifacts "$runner"; then
+    printf 'pressure validation accepted the wrong canonical recovery sample count\n' >&2
+    return 1
+  fi
+  rm -f -- "$runner/map-pressure-pressure-recovered-sample-03.prom"
+
+  command cp -- "$pressured" "$pressured.valid"
+  write_pressure_map_metrics_fixture "$pressured" 1
+  if validate_pressure_cell_artifacts "$runner"; then
+    printf 'pressure validation accepted missing pressured occupancy\n' >&2
+    return 1
+  fi
+  mv -T -- "$pressured.valid" "$pressured"
+)
+
+test_lookup_coverage_uses_observed_once_vocabulary() {
+  local -r root="$TEST_TMP_DIR/lookup-coverage"
+  local -r summary="$root/lookup-paths.json"
+  local -r invalid="$root/lookup-paths-invalid.json"
+
+  write_lookup_path_summary_fixture "$summary"
+  validate_lookup_path_summary_schema "$summary" || {
+    printf 'observed-once lookup coverage vocabulary was rejected\n' >&2
+    return 1
+  }
+  command cp -- "$root/docker-daemon.json" "$root/docker-daemon.json.valid"
+  printf '{}\n' >"$root/docker-daemon.json"
+  if validate_lookup_path_summary_schema "$summary"; then
+    printf 'lookup coverage accepted invalid local-daemon provenance\n' >&2
+    return 1
+  fi
+  mv -T -- "$root/docker-daemon.json.valid" "$root/docker-daemon.json"
+  command cp -- "$root/application-source-identity.json" \
+    "$root/application-source-identity.json.valid"
+  printf '{}\n' >"$root/application-source-identity.json"
+  if validate_lookup_path_summary_schema "$summary"; then
+    printf 'lookup coverage accepted invalid all-cell source provenance\n' >&2
+    return 1
+  fi
+  mv -T -- "$root/application-source-identity.json.valid" \
+    "$root/application-source-identity.json"
+  jq '.coverage.getsockopt.stale_failure = "measured"' "$summary" >"$invalid"
+  if validate_lookup_path_summary_schema "$invalid"; then
+    printf 'lookup coverage accepted a benchmark-like label for one correctness run\n' >&2
+    return 1
+  fi
+  jq '.paths[0].observation = {
+    schema_version: 1, kind: "java-remote-parent-path-correctness-observation",
+    cell: "getsockopt-hit", observation: {mode: "bounded_correctness_observed_once"}
+  }' "$summary" >"$invalid"
+  if validate_lookup_path_summary_schema "$invalid"; then
+    printf 'lookup coverage accepted a partial embedded path stub\n' >&2
+    return 1
+  fi
+  jq '.native_lookup_benchmark.benchmark = {
+    schema_version: 1, kind: "native-jni-lookup-benchmark",
+    status: "passed", series: [0,1,2,3,4,5]
+  }' "$summary" >"$invalid"
+  if validate_lookup_path_summary_schema "$invalid"; then
+    printf 'lookup coverage accepted a partial embedded native stub\n' >&2
+    return 1
+  fi
+  mv -- "$root/cells/getsockopt-hit/preflight/runner/environment.txt" \
+    "$root/cells/getsockopt-hit/preflight/runner/environment.txt.missing"
+  if validate_lookup_path_summary_schema "$summary"; then
+    printf 'lookup coverage accepted a broken embedded artifact link\n' >&2
+    return 1
+  fi
+  mv -- "$root/cells/getsockopt-hit/preflight/runner/environment.txt.missing" \
+    "$root/cells/getsockopt-hit/preflight/runner/environment.txt"
+  jq '.pressure_correlation.java_reconciliation_target.take_valid_count = 126' \
+    "$root/cells/getsockopt-pressure/preflight/runner/scenario-pressure-status.json" \
+    >"$root/cells/getsockopt-pressure/preflight/runner/scenario-pressure-status.json.invalid"
+  mv -- "$root/cells/getsockopt-pressure/preflight/runner/scenario-pressure-status.json" \
+    "$root/cells/getsockopt-pressure/preflight/runner/scenario-pressure-status.json.valid"
+  mv -- "$root/cells/getsockopt-pressure/preflight/runner/scenario-pressure-status.json.invalid" \
+    "$root/cells/getsockopt-pressure/preflight/runner/scenario-pressure-status.json"
+  if validate_lookup_path_summary_schema "$summary"; then
+    printf 'lookup coverage accepted an unreconciled 128-request pressure trace\n' >&2
+    return 1
+  fi
+  mv -- "$root/cells/getsockopt-pressure/preflight/runner/scenario-pressure-status.json.valid" \
+    "$root/cells/getsockopt-pressure/preflight/runner/scenario-pressure-status.json"
+}
+
+write_application_runner_source_fixture() {
+  local -r runner_directory="$1"
+  local -r revision="$2"
+  local -r marker_or_manifest="${3:-application-source-fixture}"
+  local tree_sha256=""
+  local tracked_patch_sha256=""
+  local patch_identity_sha256=""
+
+  mkdir -p -- "$runner_directory"
+  if [[ -f "$marker_or_manifest" && ! -L "$marker_or_manifest" ]]; then
+    command cp -- "$marker_or_manifest" "$runner_directory/source-tree.manifest"
+  else
+    printf '%s\n' "$marker_or_manifest" >"$runner_directory/source-tree.manifest"
+  fi
+  : >"$runner_directory/git-status.txt"
+  tree_sha256="$(sha256sum -- "$runner_directory/source-tree.manifest")" || return 1
+  tree_sha256="${tree_sha256%% *}"
+  tracked_patch_sha256="$(printf '' | sha256sum)" || return 1
+  tracked_patch_sha256="${tracked_patch_sha256%% *}"
+  patch_identity_sha256="$({
+    sha256sum -- "$runner_directory/git-status.txt"
+    sha256sum -- "$runner_directory/source-tree.manifest"
+    printf '%s\n' "$tracked_patch_sha256"
+  } | sha256sum)" || return 1
+  patch_identity_sha256="${patch_identity_sha256%% *}"
+  {
+    printf 'revision=%s\n' "$revision"
+    printf 'dirty=false\n'
+    printf 'source_tree_sha256=%s\n' "$tree_sha256"
+    printf 'source_tree_manifest_schema=git-tree-v2\n'
+    printf 'tracked_patch_sha256=%s\n' "$tracked_patch_sha256"
+    printf 'patch_identity_sha256=%s\n' "$patch_identity_sha256"
+  } >"$runner_directory/source-state.txt"
+  command cp -- "$runner_directory/source-state.txt" "$runner_directory/environment.txt"
+}
+
+write_application_source_identity_artifact_fixture() {
+  local -r root="$1"
+  local -r mode="$2"
+  local -r revision="$3"
+  local -r repository="${4:-$REPO_ROOT}"
+  local -r canonical_manifest="$root/.canonical-source-tree.manifest"
+  local cell=""
+  local runner_directory=""
+  local canonical_identity=""
+  local tree_sha256=""
+  local tracked_patch_sha256=""
+  local runner_patch_identity=""
+  local native_source_state="null"
+  local cells_json=""
+  local git_tree=""
+  local -a cells=("${CORE_CELLS[@]}")
+
+  if [[ "$mode" == complete ]]; then
+    cells+=("${BOUNDED_PATH_CELLS[@]}")
+    native_source_state='"native-jni/source-state.json"'
+  fi
+  git_tree="$(git -C "$repository" rev-parse "$revision^{tree}")" || return 1
+  write_git_tree_manifest_for_tree \
+    "$repository" "$git_tree" "$canonical_manifest" || return 1
+  for cell in "${cells[@]}"; do
+    runner_directory="$root/cells/$cell/preflight/runner"
+    write_application_runner_source_fixture \
+      "$runner_directory" "$revision" "$canonical_manifest"
+  done
+  rm -f -- "$canonical_manifest" || return 1
+  runner_directory="$root/cells/${cells[0]}/preflight/runner"
+  canonical_identity="$(canonical_application_patch_identity "$runner_directory")" || return 1
+  tree_sha256="$(runner_environment_value \
+    "$runner_directory/source-state.txt" source_tree_sha256)" || return 1
+  tracked_patch_sha256="$(runner_environment_value \
+    "$runner_directory/source-state.txt" tracked_patch_sha256)" || return 1
+  cells_json="$({
+    for cell in "${cells[@]}"; do
+      runner_patch_identity="$(runner_environment_value \
+        "$root/cells/$cell/preflight/runner/source-state.txt" \
+        patch_identity_sha256)" || return 1
+      jq -cn --arg cell "$cell" --arg identity "$runner_patch_identity" '
+        {
+          cell: $cell,
+          source_state: ("cells/" + $cell + "/preflight/runner/source-state.txt"),
+          source_tree_manifest: ("cells/" + $cell + "/preflight/runner/source-tree.manifest"),
+          git_status: ("cells/" + $cell + "/preflight/runner/git-status.txt"),
+          runner_environment: ("cells/" + $cell + "/preflight/runner/environment.txt"),
+          runner_patch_identity_sha256: $identity
+        }
+      '
+    done
+  } | jq -s .)" || return 1
+  printf 'git_revision=%s\n' "$revision" >"$root/host-environment.txt"
+  jq -n --arg mode "$mode" --arg revision "$revision" \
+    --arg tree_sha256 "$tree_sha256" --arg tracked_patch "$tracked_patch_sha256" \
+    --arg canonical "$canonical_identity" --arg git_tree "$git_tree" \
+    --argjson cells "$cells_json" \
+    --argjson native_source_state "$native_source_state" '
+      {
+        schema_version: 1,
+        kind: "benchmark-application-source-identity",
+        status: "clean_and_stable_across_all_requested_cells",
+        cells_mode: $mode,
+        revision: $revision,
+        git_tree: $git_tree,
+        source_tree_sha256: $tree_sha256,
+        source_tree_manifest_schema: "git-tree-v2",
+        tracked_patch_sha256: $tracked_patch,
+        canonical_patch_identity_sha256: $canonical,
+        host_environment: "host-environment.txt",
+        native_source_state: $native_source_state,
+        cells: $cells
+      }
+    ' >"$root/application-source-identity.json"
+  validate_application_source_identity_schema \
+    "$root/application-source-identity.json" "$repository" false
+}
+
+prepare_application_source_identity_fixture() {
+  local -r repository="$1"
+  local -r output="$2"
+  local -r mode="$3"
+  local revision=""
+  local git_tree=""
+  local canonical_manifest=""
+  local cell=""
+  local -a cells=("${CORE_CELLS[@]}")
+
+  mkdir -p -- "$repository" "$output/cells"
+  printf 'tracked application source\n' >"$repository/application.txt"
+  git -C "$repository" init --quiet
+  git -C "$repository" config user.email benchmark@example.invalid
+  git -C "$repository" config user.name 'Benchmark Test'
+  git -C "$repository" config commit.gpgsign false
+  git -C "$repository" add -- application.txt
+  git -C "$repository" commit --quiet -m fixture
+  revision="$(git -C "$repository" rev-parse HEAD)" || return 1
+  git_tree="$(git -C "$repository" rev-parse "$revision^{tree}")" || return 1
+  canonical_manifest="$output/.canonical-source-tree.manifest"
+  resolve_benchmark_identity_tools
+  write_git_tree_manifest_for_tree \
+    "$repository" "$git_tree" "$canonical_manifest" || return 1
+  if [[ "$mode" == complete ]]; then
+    cells+=("${BOUNDED_PATH_CELLS[@]}")
+  fi
+  for cell in "${cells[@]}"; do
+    write_application_runner_source_fixture \
+      "$output/cells/$cell/preflight/runner" "$revision" "$canonical_manifest"
+  done
+  rm -f -- "$canonical_manifest" || return 1
+  printf 'git_revision=%s\n' "$revision" >"$output/host-environment.txt"
+  if [[ "$mode" == complete ]]; then
+    mkdir -p -- "$output/native-jni"
+    write_native_source_state_fixture "$output/native-jni" "$revision"
+  fi
+  OUTPUT_DIR="$output"
+  OUTPUT_READY=true
+  CELLS_MODE="$mode"
+  write_application_source_identity "$repository"
+  validate_application_source_identity_schema \
+    "$output/application-source-identity.json" "$repository"
+}
+
+test_application_source_identity_is_exact_across_core_and_complete_cells() (
+  local -r core_repository="$TEST_TMP_DIR/application-source-core-repository"
+  local -r core_output="$TEST_TMP_DIR/application-source-core-output"
+  local -r complete_repository="$TEST_TMP_DIR/application-source-complete-repository"
+  local -r complete_output="$TEST_TMP_DIR/application-source-complete-output"
+  local -r alternate_revision=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  local revision=""
+
+  reset_options
+  resolve_benchmark_identity_tools
+  prepare_application_source_identity_fixture "$core_repository" "$core_output" core
+  revision="$(jq -er '.revision' "$core_output/application-source-identity.json")" || return 1
+  jq -e '
+    .status == "clean_and_stable_across_all_requested_cells" and
+    .cells_mode == "core" and (.cells | length) == 6 and
+    ([.cells[].cell] == [
+      "uninstrumented", "bridge-disabled", "getsockopt-hit", "unix-hit",
+      "getsockopt-w3c", "getsockopt-helper-idle"
+    ])
+  ' "$core_output/application-source-identity.json" >/dev/null || return 1
+
+  sed -i 's/^dirty=false$/dirty=true/' \
+    "$core_output/cells/bridge-disabled/preflight/runner/source-state.txt"
+  if validate_application_source_identity_schema \
+    "$core_output/application-source-identity.json" "$core_repository"; then
+    printf 'core source identity accepted a dirty bridge-disabled cell\n' >&2
+    return 1
+  fi
+  write_application_runner_source_fixture \
+    "$core_output/cells/bridge-disabled/preflight/runner" "$revision" \
+    "$core_output/cells/uninstrumented/preflight/runner/source-tree.manifest"
+  write_application_runner_source_fixture \
+    "$core_output/cells/getsockopt-w3c/preflight/runner" "$alternate_revision" \
+    "$core_output/cells/uninstrumented/preflight/runner/source-tree.manifest"
+  if validate_application_source_identity_schema \
+    "$core_output/application-source-identity.json" "$core_repository"; then
+    printf 'core source identity accepted per-cell revision drift\n' >&2
+    return 1
+  fi
+  write_application_runner_source_fixture \
+    "$core_output/cells/getsockopt-w3c/preflight/runner" "$revision" tree-drift
+  if validate_application_source_identity_schema \
+    "$core_output/application-source-identity.json" "$core_repository"; then
+    printf 'core source identity accepted per-cell tree drift\n' >&2
+    return 1
+  fi
+
+  reset_options
+  resolve_native_benchmark_tools
+  prepare_application_source_identity_fixture \
+    "$complete_repository" "$complete_output" complete
+  revision="$(jq -er '.revision' \
+    "$complete_output/application-source-identity.json")" || return 1
+  jq -e '.cells_mode == "complete" and (.cells | length) == 10 and
+    ([.cells[].cell][-4:] == [
+      "getsockopt-stale", "unix-stale", "unix-timeout", "getsockopt-pressure"
+    ])' "$complete_output/application-source-identity.json" >/dev/null || return 1
+  sed -i 's/^patch_identity_sha256=.*/patch_identity_sha256=0000000000000000000000000000000000000000000000000000000000000000/' \
+    "$complete_output/cells/getsockopt-pressure/preflight/runner/source-state.txt"
+  if validate_application_source_identity_schema \
+    "$complete_output/application-source-identity.json" "$complete_repository"; then
+    printf 'complete source identity accepted bounded-cell patch drift\n' >&2
+    return 1
+  fi
+  write_application_runner_source_fixture \
+    "$complete_output/cells/getsockopt-pressure/preflight/runner" "$revision" \
+    "$complete_output/cells/uninstrumented/preflight/runner/source-tree.manifest"
+  printf 'live checkout mutation\n' >>"$complete_repository/application.txt"
+  if validate_application_source_identity_schema \
+    "$complete_output/application-source-identity.json" "$complete_repository"; then
+    printf 'complete source identity accepted live checkout mutation\n' >&2
+    return 1
+  fi
+)
+
+test_application_source_identity_rejects_coordinated_manifest_forgery() (
+  local -r repository="$TEST_TMP_DIR/application-source-forgery-repository"
+  local -r output="$TEST_TMP_DIR/application-source-forgery-output"
+  local -r artifact="$output/application-source-identity.json"
+  local revision=""
+  local cell=""
+  local runner_directory=""
+  local tree_sha256=""
+  local canonical_identity=""
+  local runner_identity=""
+  local identities_json=""
+  local -a identities=()
+
+  reset_options
+  resolve_benchmark_identity_tools
+  prepare_application_source_identity_fixture "$repository" "$output" core
+  revision="$(jq -er '.revision' "$artifact")" || return 1
+  for cell in "${CORE_CELLS[@]}"; do
+    runner_directory="$output/cells/$cell/preflight/runner"
+    write_application_runner_source_fixture \
+      "$runner_directory" "$revision" coordinated-forged-manifest
+    runner_identity="$(runner_environment_value \
+      "$runner_directory/source-state.txt" patch_identity_sha256)" || return 1
+    identities+=("$(jq -cn --arg cell "$cell" --arg identity "$runner_identity" \
+      '{cell: $cell, identity: $identity}')") || return 1
+  done
+  runner_directory="$output/cells/${CORE_CELLS[0]}/preflight/runner"
+  tree_sha256="$(runner_environment_value \
+    "$runner_directory/source-state.txt" source_tree_sha256)" || return 1
+  canonical_identity="$(canonical_application_patch_identity "$runner_directory")" || return 1
+  identities_json="$(printf '%s\n' "${identities[@]}" | jq -s .)" || return 1
+  jq --arg tree_sha256 "$tree_sha256" --arg canonical "$canonical_identity" \
+    --argjson identities "$identities_json" '
+      .source_tree_sha256 = $tree_sha256 |
+      .canonical_patch_identity_sha256 = $canonical |
+      .cells |= map(. as $cell |
+        .runner_patch_identity_sha256 =
+          ($identities[] | select(.cell == $cell.cell) | .identity))
+    ' "$artifact" >"$artifact.tmp"
+  mv -T -- "$artifact.tmp" "$artifact"
+  if validate_application_source_identity_schema "$artifact" "$repository"; then
+    printf 'application source identity accepted a coordinated manifest forgery unrelated to its recorded Git tree\n' >&2
+    return 1
+  fi
+)
+
+write_native_jni_fixture() {
+  local -r output="$1"
+
+  {
+    printf '%s\n' 'benchmark=obi_java_remote_parent_native getsockopt_backend=deterministic_syscall_shim'
+    printf '%s\n' 'transport=getsockopt outcome=hit warmup_iterations=1000 iterations=10000 elapsed_ns=100000 ns_per_op=10.00 p50_ns=10 p95_ns=20 p99_ns=30 ops_per_second=100000000.00 status=1 checksum=10000'
+    printf '%s\n' 'transport=getsockopt outcome=miss warmup_iterations=1000 iterations=10000 elapsed_ns=110000 ns_per_op=11.00 p50_ns=11 p95_ns=21 p99_ns=31 ops_per_second=90909090.91 status=2 checksum=20000'
+    printf '%s\n' 'transport=getsockopt outcome=failure warmup_iterations=1000 iterations=10000 elapsed_ns=120000 ns_per_op=12.00 p50_ns=12 p95_ns=22 p99_ns=32 ops_per_second=83333333.33 status=12 checksum=120000'
+    printf '%s\n' 'transport=unix outcome=hit warmup_iterations=1000 iterations=10000 elapsed_ns=200000 ns_per_op=20.00 p50_ns=20 p95_ns=30 p99_ns=40 ops_per_second=50000000.00 status=1 checksum=10000'
+    printf '%s\n' 'transport=unix outcome=miss warmup_iterations=1000 iterations=10000 elapsed_ns=210000 ns_per_op=21.00 p50_ns=21 p95_ns=31 p99_ns=41 ops_per_second=47619047.62 status=2 checksum=20000'
+    printf '%s\n' 'transport=unix outcome=failure warmup_iterations=1000 iterations=10000 elapsed_ns=220000 ns_per_op=22.00 p50_ns=22 p95_ns=32 p99_ns=42 ops_per_second=45454545.45 status=12 checksum=120000'
+  } >"$output"
+}
+
+write_compiler_provenance_fixture() {
+  local -r output="$1"
+  local compiler=""
+  local compiler_sha256=""
+
+  compiler="$(readlink -f -- "$(type -P cc)")" || return 1
+  compiler_sha256="$(sha256sum -- "$compiler")" || return 1
+  compiler_sha256="${compiler_sha256%% *}"
+  jq -n --arg compiler "$compiler" --arg compiler_sha256 "$compiler_sha256" '
+    {
+      canonical_path: $compiler,
+      executable_sha256: $compiler_sha256,
+      selection: "make_default",
+      pinned_for_make: true,
+      environment: {
+        policy: "empty_parent_environment_with_explicit_allowlist",
+        parent_environment: {
+          path: "/usr/bin:/bin",
+          locale: "C",
+          allowed_variables: ["PATH", "LC_ALL"],
+          dynamic_loader_parent_cleared: true
+        },
+        controlled_make_environment: {
+          command_line_variables: ["BENCHMARK_ITERATIONS", "BUILD_DIR", "CC", "JAVA_HOME"],
+          make_generated_variables: ["MAKEFLAGS", "MAKELEVEL", "MAKEOVERRIDES", "MFLAGS"],
+          working_directory: "private_source_snapshot"
+        }
+      },
+      version: "compiler-version.txt",
+      compile_flags: [
+        "-fPIC", "-O2", "-Wall", "-Wextra", "-Wno-unused-parameter",
+        "-pthread", "-DOBI_JNI_TESTING"
+      ],
+      link_flags: ["-pthread"],
+      build_command: "build-command.txt",
+      expanded_build_command: "expanded-build-command.txt"
+    }
+  ' >"$output"
+}
+
+write_native_source_state_fixture() {
+  local -r directory="$1"
+  local -r revision="$2"
+  local paths_json=""
+  local identity=""
+  local path=""
+  local -a entries=()
+
+  for path in "${NATIVE_BENCHMARK_SOURCE_PATHS[@]}"; do
+    entries+=("$(jq -cn --arg path "$path" '
+      {path: $path, mode: "100644",
+       head_blob: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+       index_blob: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+       working_blob: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+       working_sha256: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}
+    ')") || return 1
+  done
+  paths_json="$(printf '%s\n' "${entries[@]}" | jq -s .)" || return 1
+  identity="$(jq -cnS --arg revision "$revision" --argjson paths "$paths_json" \
+    '{revision: $revision, paths: $paths}' | sha256sum)" || return 1
+  identity="${identity%% *}"
+  jq -n --arg revision "$revision" --arg identity "$identity" \
+    --argjson paths "$paths_json" '
+      {schema_version: 1, kind: "native-jni-source-snapshot", status: "clean",
+       revision: $revision, paths: $paths, content_identity: $identity}
+    ' >"$directory/source-state-before.json"
+  cp -- "$directory/source-state-before.json" "$directory/source-state-after.json"
+  finalize_native_source_state \
+    "$directory/source-state-before.json" "$directory/source-state-after.json" \
+    "$directory/source-state.json"
+  validate_native_source_state_schema "$directory/source-state.json"
+}
+
+write_normalized_native_jni_artifact_fixture() {
+  local -r output="$1"
+  local -r source_revision="${2:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}"
+  local -r fixture_directory="${output%/*}"
+  local -r raw="$fixture_directory/raw.txt"
+  local -r compiler_provenance="$fixture_directory/compiler-provenance.json"
+  local -r header_image="maven:test@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  local binary_sha256=""
+  local compiler=""
+
+  mkdir -p -- "$fixture_directory/build" "${fixture_directory%/*}"
+  write_native_jni_fixture "$raw"
+  printf 'native fixture binary\n' >"$fixture_directory/build/remote_parent_jni_benchmark"
+  chmod 0700 -- "$fixture_directory/build/remote_parent_jni_benchmark"
+  binary_sha256="$(sha256sum -- \
+    "$fixture_directory/build/remote_parent_jni_benchmark")" || return 1
+  binary_sha256="${binary_sha256%% *}"
+  printf 'host fixture\n' >"${fixture_directory%/*}/host-environment.txt"
+  : >"$fixture_directory/raw.stderr.log"
+  printf 'fixture compiler version\n' >"$fixture_directory/compiler-version.txt"
+  resolve_native_benchmark_tools || return 1
+  write_native_make_build_command "$fixture_directory/build-command.txt" 15 \
+    --silent --directory /tmp/native-source --file Makefile.jni benchmark \
+    CC=/usr/bin/cc BUILD_DIR=/tmp/native-build JAVA_HOME=/tmp/native-jdk \
+    BENCHMARK_ITERATIONS=10000 || return 1
+  compiler="$(readlink -f -- "$(type -P cc)")" || return 1
+  {
+    printf '%s' "$compiler"
+    printf ' %s' "${NATIVE_BENCHMARK_COMPILE_FLAGS[@]}"
+    printf ' %s' -I/tmp/native-jdk/include -I/tmp/native-jdk/include/linux \
+      src/main/c/io_opentelemetry_obi_java_jni.c \
+      src/test/c/remote_parent_jni_benchmark.c
+    printf ' %s' "${NATIVE_BENCHMARK_LINK_FLAGS[@]}"
+    printf ' -o /tmp/remote_parent_jni_benchmark\n'
+  } >"$fixture_directory/expanded-build-command.txt"
+  printf '/tmp/remote_parent_jni_benchmark 10000\n' \
+    >>"$fixture_directory/expanded-build-command.txt"
+  printf 'fixture java version\n' >"$fixture_directory/java-version.txt"
+  jq -n '{}' >"$fixture_directory/jdk-image.json"
+  write_native_source_state_fixture "$fixture_directory" "$source_revision"
+  write_compiler_provenance_fixture "$compiler_provenance"
+  normalize_native_jni_benchmark \
+    "$raw" "$binary_sha256" "$source_revision" "$header_image" \
+    "$compiler_provenance" "$fixture_directory/source-state.json" "$output"
+  validate_native_jni_benchmark_schema "$output"
+}
+
+materialize_path_observation_sources() {
+  local -r observation="$1"
+  local -r cell_directory="${observation%/*}"
+  local cell=""
+  local scenario=""
+  local label=""
+  local requests=0
+  local result_file=""
+  local status_file=""
+  local diagnostics_file=""
+  local status=""
+  local value=0
+  local -a statuses=(
+    unknown valid missing stale unsupported malformed version_mismatch ambiguous
+    unauthorized already_consumed timeout overload transport_error disabled
+  )
+
+  cell="$(jq -er '.cell' "$observation")" || return 1
+  case "$cell" in
+    getsockopt-hit|unix-hit) scenario=concurrency; label=concurrency; requests=16 ;;
+    getsockopt-stale) scenario=primary-w3c-stale; label=primary-w3c-stale; requests=1 ;;
+    unix-stale) scenario=unix-w3c-stale; label=unix-w3c-stale; requests=1 ;;
+    unix-timeout) scenario='w3c-fault'; label='w3c-fault-timeout'; requests=1 ;;
+    getsockopt-pressure) scenario=pressure; label=pressure; requests=128 ;;
+    *) return 1 ;;
+  esac
+  result_file="$cell_directory/preflight/runner/scenario-$label.json"
+  status_file="$cell_directory/preflight/runner/scenario-$label-status.json"
+  diagnostics_file="$cell_directory/preflight/runner/phases/$label-after/java-diagnostics.delta"
+  mkdir -p -- "${diagnostics_file%/*}"
+  jq -n --arg scenario "$scenario" --argjson requests "$requests" '
+    {status: "passed", scenario: $scenario, request_count: $requests,
+     traffic_elapsed_nanos: 1000, throughput_per_second: 1,
+     latency: {p50_nanos: 1, p95_nanos: 2, p99_nanos: 3},
+     cases: [range(0; $requests) |
+       {latency_nanos: 1, request: {}, response: {}, trace: {}}]}
+  ' >"$result_file"
+  if [[ "$cell" == "getsockopt-pressure" ]]; then
+    jq '.pressure_correlation = {
+      exact_hit_count: 127, explicit_root_count: 1,
+      wrong_parent_count: 0, unresolved_count: 0
+    }' "$result_file" >"$result_file.tmp"
+    mv -T -- "$result_file.tmp" "$result_file"
+    jq -n '
+      {status: "passed", scenario: "pressure", exit_status: 0, metric_status: 0,
+       result: "scenario-pressure.json",
+       pressure_correlation: {
+         trace: {exact_hit_count: 127, explicit_root_count: 1,
+           wrong_parent_count: 0, unresolved_count: 0},
+         bridge: {transport: "getsockopt"},
+         java_reconciliation_target: {take_valid_count: 127,
+           attributable_absence_count: 1, diagnostic_self_miss_count: 1}
+       }}
+    ' >"$status_file"
+    jq -n '
+      {status: "passed", mode: "fill",
+       map_name: "java_remote_parent_handoff_claims", kernel_name: "java_remote_par",
+       map_type: "Hash", map_id: 41, max_entries: 50000, touched: 49999,
+       capacity_rejected_entries: 1, verified_present_entries: 49999,
+       process_map_id: 42, process_pid: 43, process_namespace: 44, token_base: 1}
+    ' >"$cell_directory/preflight/runner/map-pressure-pressure-fill.json"
+    jq -n '
+      {status: "passed", mode: "cleanup", map_id: 41,
+       map_name: "java_remote_parent_handoff_claims", kernel_name: "java_remote_par",
+       map_type: "Hash", max_entries: 50000, process_map_id: 0,
+       process_pid: 43, process_namespace: 44, token_base: 1,
+       cleanup_verified: true, verified_absent_entries: 50001, touched: 0}
+    ' >"$cell_directory/preflight/runner/map-pressure-pressure-cleanup.json"
+    mkdir -p -- "$cell_directory/preflight/runner/phases/pressure-before"
+    write_pressure_map_metrics_fixture \
+      "$cell_directory/preflight/runner/phases/pressure-before/obi-metrics.prom" 1
+    write_pressure_map_metrics_fixture \
+      "$cell_directory/preflight/runner/map-pressure-pressure-pressured.prom" 50000
+    write_pressure_map_metrics_fixture \
+      "$cell_directory/preflight/runner/map-pressure-pressure-traffic-complete.prom" 49999
+    write_pressure_map_metrics_fixture \
+      "$cell_directory/preflight/runner/map-pressure-pressure-recovered-sample-01.prom" 1
+    write_pressure_map_metrics_fixture \
+      "$cell_directory/preflight/runner/map-pressure-pressure-recovered-sample-02.prom" 1
+    command cp -- \
+      "$cell_directory/preflight/runner/map-pressure-pressure-recovered-sample-02.prom" \
+      "$cell_directory/preflight/runner/map-pressure-pressure-recovered.prom"
+    {
+      printf 'attempt=1 observed_at=2026-08-10T00:00:00Z entries=1 matched=true consecutive=1\n'
+      printf 'attempt=2 observed_at=2026-08-10T00:00:01Z entries=1 matched=true consecutive=2\n'
+    } >"$cell_directory/preflight/runner/map-pressure-pressure-recovered-samples.log"
+  else
+    jq -n --arg scenario "$scenario" --arg result "scenario-$label.json" '
+      {status: "passed", scenario: $scenario, exit_status: 0,
+       metric_status: 0, result: $result}
+    ' >"$status_file"
+  fi
+  for status in "${statuses[@]}"; do
+    value="$(jq -er --arg status "$status" \
+      '.java_diagnostic_status_deltas[$status]' "$observation")" || return 1
+    printf 't_%s before=0 after=%s delta=%s\n' "$status" "$value" "$value"
+  done >"$diagnostics_file"
+  jq -n '{}' >"$cell_directory/preflight/runner/provenance.json"
+  write_application_runner_source_fixture \
+    "$cell_directory/preflight/runner" bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+}
+
+write_lookup_path_summary_fixture() {
+  local -r output="$1"
+  local -r root="${output%/*}"
+  local cell=""
+  local paths_json=""
+  local revision=""
+
+  mkdir -p -- "$root"
+  revision="$(git -C "$REPO_ROOT" rev-parse HEAD)" || return 1
+  if [[ ! -f "$root/native-jni/benchmark.json" ]]; then
+    write_normalized_native_jni_artifact_fixture \
+      "$root/native-jni/benchmark.json" "$revision"
+  fi
+  paths_json="$({
+    for cell in "${PATH_OBSERVATION_CELLS[@]}"; do
+      mkdir -p -- "$root/cells/$cell"
+      write_path_observation_fixture "$root/cells/$cell/path-observation.json" "$cell"
+      materialize_path_observation_sources "$root/cells/$cell/path-observation.json"
+      jq -cn --arg source_artifact "cells/$cell/path-observation.json" \
+        --arg link_base "cells/$cell/" \
+        --slurpfile observation "$root/cells/$cell/path-observation.json" '
+          {source_artifact: $source_artifact, link_base: $link_base,
+           observation: $observation[0]}
+      '
+    done
+  } | jq -s .)" || return 1
+  write_application_source_identity_artifact_fixture \
+    "$root" complete "$revision" "$REPO_ROOT"
+  jq -n '
+    {
+      schema_version: 2,
+      kind: "docker-endpoint-evidence",
+      status: "verified_local_unix_socket_endpoint_only",
+      active_context: "default",
+      active_endpoint: "unix:///var/run/docker.sock",
+      endpoint_transport: "unix",
+      socket_path: "/var/run/docker.sock",
+      socket_device: 1,
+      socket_inode: 1,
+      socket_evidence: "existing_non_symlink_unix_socket",
+      daemon_process_locality: "not_established_by_unix_socket_endpoint",
+      container_process_binding: "required_separately_for_each_process_sample",
+      docker_host_environment: "unset",
+      docker_context_environment: "unset",
+      verified_before_container_execution: true
+    }
+  ' >"$root/docker-daemon.json"
+  jq -n --argjson paths "$paths_json" \
+    --slurpfile native "$root/native-jni/benchmark.json" '
+    {
+      schema_version: 1,
+      kind: "java-remote-parent-path-observation-coverage",
+      status: "partial_with_explicit_gaps",
+      acceptance_evidence: false,
+      provenance: {
+        application_source_identity: "application-source-identity.json",
+        capture_scope: "single_harness_run_with_verified_unix_socket_and_per_sample_container_process_binding",
+        docker_daemon: "docker-daemon.json",
+        host_environment: "host-environment.txt"
+      },
+      native_lookup_benchmark: {
+        source_artifact: "native-jni/benchmark.json",
+        link_base: "native-jni/",
+        benchmark: $native[0]
+      },
+      paths: $paths,
+      coverage: {
+        getsockopt: {
+          hit: "correctness_observed_once", miss: "blocked",
+          stale_failure: "correctness_observed_once"
+        },
+        unix: {
+          hit: "correctness_observed_once", miss: "blocked",
+          stale_failure: "correctness_observed_once",
+          timeout_failure: "correctness_observed_once"
+        },
+        native_lookup: {
+          getsockopt_hit_miss_failure: "benchmark_measured",
+          unix_hit_miss_failure: "benchmark_measured"
+        },
+        pressure: "correctness_observed_once"
+      },
+      blocked_dimensions: [
+        {dimension: "application_state_map_miss", status: "blocked", reason: "fixture absent"},
+        {dimension: "in_jvm_java_to_native_transition_latency_percentiles", status: "blocked", reason: "diagnostic absent"}
+      ]
+    }
+  ' >"$output"
+  validate_lookup_path_summary_schema "$output"
+}
+
+test_native_jni_benchmark_normalization_is_strict() {
+  local -r native_directory="$TEST_TMP_DIR/native-normalization/native-jni"
+  local -r fixture="$native_directory/raw.txt"
+  local -r invalid_fixture="$native_directory/native-jni-invalid.txt"
+  local -r artifact="$native_directory/benchmark.json"
+  local -r invalid_artifact="$native_directory/native-jni-benchmark-invalid.json"
+  local -r compiler_provenance="$native_directory/compiler-provenance.json"
+  local -r source_revision="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  local -r header_image="maven:test@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  local binary_sha256=""
+  local compiler=""
+
+  write_normalized_native_jni_artifact_fixture "$artifact" || {
+    printf 'valid native JNI benchmark fixture was rejected\n' >&2
+    return 1
+  }
+  binary_sha256="$(jq -er '.provenance.binary_sha256' "$artifact")" || return 1
+  compiler="$(readlink -f -- "$(type -P cc)")" || return 1
+  jq -e --arg compiler "$compiler" '
+    [.series[] | [.transport, .outcome, .latency_p50_nanos,
+      .latency_p95_nanos, .latency_p99_nanos]] == [
+      ["getsockopt", "hit", 10, 20, 30],
+      ["getsockopt", "miss", 11, 21, 31],
+      ["getsockopt", "failure", 12, 22, 32],
+      ["unix", "hit", 20, 30, 40],
+      ["unix", "miss", 21, 31, 41],
+      ["unix", "failure", 22, 32, 42]
+    ] and
+    .provenance.compiler.canonical_path == $compiler and
+    .provenance.compiler.pinned_for_make == true and
+    .provenance.compiler.compile_flags == [
+      "-fPIC", "-O2", "-Wall", "-Wextra", "-Wno-unused-parameter",
+      "-pthread", "-DOBI_JNI_TESTING"
+    ] and
+    .provenance.compiler.link_flags == ["-pthread"]
+  ' "$artifact" >/dev/null || {
+    printf 'native JNI benchmark lost ordered hit/miss/failure percentiles\n' >&2
+    return 1
+  }
+
+  sed 's/outcome=miss warmup_iterations=1000 iterations=10000 elapsed_ns=110000/outcome=hit warmup_iterations=1000 iterations=10000 elapsed_ns=110000/' \
+    "$fixture" >"$invalid_fixture"
+  if normalize_native_jni_benchmark \
+    "$invalid_fixture" "$binary_sha256" "$source_revision" "$header_image" \
+    "$compiler_provenance" "$native_directory/source-state.json" \
+    "$invalid_artifact"; then
+    printf 'native JNI normalization accepted an out-of-contract series\n' >&2
+    return 1
+  fi
+
+  jq '.series[0].latency_p95_nanos = 5' "$artifact" >"$invalid_artifact"
+  if validate_native_jni_benchmark_schema "$invalid_artifact"; then
+    printf 'native JNI schema accepted non-monotonic percentiles\n' >&2
+    return 1
+  fi
+
+  jq '.provenance.compiler.canonical_path = "cc"' "$artifact" >"$invalid_artifact"
+  if validate_native_jni_benchmark_schema "$invalid_artifact"; then
+    printf 'native JNI schema accepted a non-canonical compiler path\n' >&2
+    return 1
+  fi
+}
+
+test_complete_manifest_links_bounded_artifacts_and_scopes() {
+  # shellcheck disable=SC2034 # Consumed dynamically by the sourced harness.
+  local OUTPUT_DIR=""
+  local CELLS_MODE=""
+  local STARTED_AT=""
+  local HARNESS_INVOCATION=""
+
+  reset_options
+  OUTPUT_DIR="$TEST_TMP_DIR/complete-manifest"
+  CELLS_MODE=complete
+  # shellcheck disable=SC2034 # Consumed dynamically by write_manifest.
+  STARTED_AT=2026-08-10T00:00:00Z
+  # shellcheck disable=SC2034 # Consumed dynamically by write_manifest.
+  HARNESS_INVOCATION='benchmark.sh --cells complete'
+  mkdir -- "$OUTPUT_DIR"
+  write_manifest
+  jq -e '
+    .cells_mode == "complete" and
+    .bounded_path_observations.requested == true and
+    .bounded_path_observations.cells == [
+      "getsockopt-stale", "unix-stale", "unix-timeout", "getsockopt-pressure"
+    ] and
+    .bounded_path_observations.native_jni_lookup == {
+      status: "requested", iterations_per_series: 10000,
+      artifact: "native-jni/benchmark.json"
+    } and
+    .bounded_path_observations.normalized_summary == "lookup-paths.json" and
+    .bounded_path_observations.application_state_map_miss.status == "blocked" and
+    .unavailable_dimensions.jni_lookup_latency_percentiles == "native_fixture_requested" and
+    .unavailable_dimensions.application_cpu_rss_fd_threads ==
+      "requested_for_bounded_growth_gate" and
+    .predeclared_poc_gates.repetitions.required == 5 and
+    .predeclared_poc_gates.steady_state_application == {
+      baseline_cell: "bridge-disabled",
+      comparison_cells: [
+        "getsockopt-hit", "unix-hit", "getsockopt-w3c"
+      ],
+      excluded_cells: {
+        uninstrumented: "no_official_agent",
+        getsockopt_helper_idle: "direct_java_workload_is_not_comparable_to_the_apache_baseline"
+      },
+      throughput_regression_max_percent: 10,
+      p99_latency_regression_max_percent: 10
+    } and
+    .predeclared_poc_gates.bounded_growth.unavailable_samples_fail_closed == true and
+    .predeclared_poc_gates.bounded_growth.java_bridge_map_evaluation == {
+      status: "partial_not_evaluated",
+      metric_scope: "host_global_java_remote_par_superset",
+      ownership_attribution: false,
+      required_descriptive_samples: true,
+      bridge_disabled_project_map_configured_max_entries: 1,
+      completion_requirement: "project_ownership_attribution_or_clean_host_proof"
+    } and
+    .predeclared_poc_gates.issue_acceptance_complete == false and
+    .unavailable_dimensions.jfr_nmt_allocation_native_direct_memory == "not_collected" and
+    .unavailable_dimensions.bpf_lock_contention == "not_collected" and
+    .unavailable_dimensions.bpf_map_evictions ==
+      "not_applicable_non_evicting_hash_pressure"
+  ' "$OUTPUT_DIR/manifest.json" >/dev/null
+}
+
 write_valid_benchmark_result() {
   local -r output="$1"
   local -r duration_seconds="$2"
@@ -1290,7 +3335,10 @@ write_variance_fixture_cell() {
 
   cell_spec "$cell" || return 1
   mkdir -p -- "$cell_dir/measurements" "$cell_dir/preflight"
-  jq -n --arg cell "$cell" '{status: "passed", cell: $cell}' >"$cell_dir/status.json"
+  jq -n --arg cell "$cell" '
+    {status: "passed", cell: $cell, reason: null,
+     completed_at: "2026-08-10T00:00:00Z"}
+  ' >"$cell_dir/status.json"
   jq -n --arg cell "$cell" '{cell: $cell}' >"$cell_dir/preflight/contract.json"
   for ((repetition = 1; repetition <= REPETITIONS; repetition++)); do
     printf -v repetition_label 'rep-%02d' "$repetition"
@@ -1318,6 +3366,83 @@ prepare_variance_fixture() {
   for cell in "${CORE_CELLS[@]}"; do
     write_variance_fixture_cell "$cell"
   done
+}
+
+write_proc_growth_fixture() {
+  local -r output="$1"
+  local -r pid="$2"
+  local -r fds="$3"
+  local -r threads="$4"
+  local -r container_id="${5:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
+  local -r start_time="${6:-$((pid * 10))}"
+  local -r cgroup_sha256="${7:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}"
+
+  {
+    printf 'status=available\n'
+    printf 'container_id=%s\n' "$container_id"
+    printf 'host_pid=%s\n' "$pid"
+    printf 'proc_start_time=%s\n' "$start_time"
+    printf 'proc_cgroup_sha256=%s\n' "$cgroup_sha256"
+    printf 'proc_cgroup_container_binding=%s\n' "$PROC_CGROUP_CONTAINER_BINDING"
+    printf 'fd_count=%s\n' "$fds"
+    printf 'task_count=%s\n' "$threads"
+  } >"$output"
+}
+
+write_java_map_growth_fixture() {
+  local -r output="$1"
+  local -r map_entries_count="$2"
+  local -r maximum="$3"
+
+  {
+    printf '%s\n' \
+      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"}'" $map_entries_count"
+    printf '%s\n' \
+      'obi_bpf_map_max_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"}'" $maximum"
+  } >"$output"
+}
+
+prepare_poc_gate_fixture() {
+  local -r output="$1"
+  local cell=""
+  local service=""
+  local cell_dir=""
+  local pid=100
+  local -a services=()
+
+  OUTPUT_DIR="$output"
+  OUTPUT_READY=true
+  REPETITIONS=5
+  DURATION_SECONDS=2
+  CONCURRENCY=1
+  mkdir -p -- "$OUTPUT_DIR/cells"
+  for cell in "${CORE_CELLS[@]}"; do
+    write_variance_fixture_cell "$cell" 10 0 2000000000 100 50 90 100
+    cell_spec "$cell" || return 1
+    cell_dir="$OUTPUT_DIR/cells/$cell"
+    mkdir -- "$cell_dir/resources-before" "$cell_dir/resources-idle-recovery"
+    services=(trace-receiver apache-proxy java-backend)
+    if [[ "$CELL_REQUIRES_OBI" == true ]]; then
+      services+=(obi)
+    fi
+    for service in "${services[@]}"; do
+      write_proc_growth_fixture \
+        "$cell_dir/resources-before/$service-proc.txt" "$pid" 20 8
+      write_proc_growth_fixture \
+        "$cell_dir/resources-idle-recovery/$service-proc.txt" "$pid" 20 8
+      ((pid += 1))
+    done
+    if [[ "$CELL_REQUIRES_OBI" == true ]]; then
+      if [[ "$cell" == "bridge-disabled" ]]; then
+        write_java_map_growth_fixture "$cell_dir/resources-before/obi-metrics.prom" 0 1
+        write_java_map_growth_fixture "$cell_dir/resources-idle-recovery/obi-metrics.prom" 0 1
+      else
+        write_java_map_growth_fixture "$cell_dir/resources-before/obi-metrics.prom" 2 10000
+        write_java_map_growth_fixture "$cell_dir/resources-idle-recovery/obi-metrics.prom" 1 10000
+      fi
+    fi
+  done
+  write_variance_summary
 }
 
 write_valid_sentinel() {
@@ -1581,6 +3706,8 @@ test_json_validators_require_one_document() {
 
 test_variance_summary_records_ordered_per_cell_statistics() (
   local -r output="$TEST_TMP_DIR/variance-summary"
+  local -r mutated="$TEST_TMP_DIR/variance-summary-mutated.json"
+  local canonical=""
   local repetition=0
   local repetition_label=""
   local -a successful_requests=(6 1 5 2 4 3)
@@ -1616,7 +3743,7 @@ test_variance_summary_records_ordered_per_cell_statistics() (
   }
   jq -e '
     .schema_version == 1 and
-    .kind == "descriptive-repetition-summary" and
+    .kind == "application-performance-repetition-summary" and
     .status == "complete" and
     .acceptance_evidence == false and
     .manifest == "manifest.json" and
@@ -1661,6 +3788,28 @@ test_variance_summary_records_ordered_per_cell_statistics() (
     printf 'variance summary did not preserve ordered samples or numeric per-cell statistics\n' >&2
     return 1
   }
+  canonical="$(variance_summary_json "$output")" || return 1
+  jq -e --argjson canonical "$canonical" '. == $canonical' \
+    "$output/variance.json" >/dev/null || {
+    printf 'variance writer diverged from its canonical source builder\n' >&2
+    return 1
+  }
+  jq '(.cells[] | select(.cell == "getsockopt-hit") |
+    .statistics.throughput_per_second.median) = 34' \
+    "$output/variance.json" >"$mutated"
+  if validate_variance_summary_schema "$mutated"; then
+    printf 'variance validator accepted a mutated derived statistic\n' >&2
+    return 1
+  fi
+  jq '.throughput_per_second = 61' \
+    "$output/cells/getsockopt-hit/measurements/rep-01.json" \
+    >"$output/cells/getsockopt-hit/measurements/rep-01.json.tmp"
+  mv -T -- "$output/cells/getsockopt-hit/measurements/rep-01.json.tmp" \
+    "$output/cells/getsockopt-hit/measurements/rep-01.json"
+  if validate_variance_summary_schema "$output/variance.json"; then
+    printf 'variance validator accepted an artifact stale against a raw repetition\n' >&2
+    return 1
+  fi
 )
 
 test_variance_summary_rejects_invalid_repetition_sets() (
@@ -1700,6 +3849,548 @@ test_variance_summary_rejects_invalid_repetition_sets() (
       return 1
     }
   done
+)
+
+rewrite_cell_performance_fixture() {
+  local -r cell="$1"
+  local -r throughput="$2"
+  local -r p99="$3"
+  local result=""
+  local temporary=""
+
+  for result in "$OUTPUT_DIR/cells/$cell/measurements"/rep-[0-9][0-9].json; do
+    temporary="$result.tmp"
+    jq --argjson throughput "$throughput" --argjson p99 "$p99" '
+      .throughput_per_second = $throughput |
+      .latency.p99_nanos = $p99
+    ' "$result" >"$temporary" || return 1
+    mv -T -- "$temporary" "$result" || return 1
+  done
+  rm -f -- "$OUTPUT_DIR/variance.json"
+  write_variance_summary
+}
+
+test_resource_growth_observations_fail_closed() (
+  local -r fixture="$TEST_TMP_DIR/resource-growth"
+  local process_json=""
+  local map_json=""
+
+  mkdir -- "$fixture"
+  write_proc_growth_fixture "$fixture/proc-before.txt" 101 20 8
+  write_proc_growth_fixture "$fixture/proc-recovery.txt" 101 19 7
+  process_json="$(process_growth_observation \
+    test-cell java-backend "$fixture/proc-before.txt" "$fixture/proc-recovery.txt")"
+  jq -e '
+    .status == "complete" and .result == "passed" and
+    (.container_id | test("^[0-9a-f]{64}$")) and
+    .host_pid == 101 and .proc_start_time == 1010 and
+    (.proc_cgroup_sha256 | test("^[0-9a-f]{64}$")) and
+    .proc_cgroup_container_binding == "full_container_id_at_non_hex_boundaries" and
+    .fd.delta == -1 and .threads.delta == -1
+  ' <<<"$process_json" >/dev/null || {
+    printf 'complete non-growing process samples did not pass\n' >&2
+    return 1
+  }
+
+  write_proc_growth_fixture "$fixture/proc-recovery.txt" 101 19 7 \
+    aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1011
+  process_json="$(process_growth_observation \
+    test-cell java-backend "$fixture/proc-before.txt" "$fixture/proc-recovery.txt")"
+  jq -e '.status == "partial" and .result == "not_evaluated" and
+    .reason == "service_container_or_process_identity_changed_between_required_samples"' \
+    <<<"$process_json" >/dev/null || {
+    printf 'PID start-time reuse was not rejected from process growth evidence\n' >&2
+    return 1
+  }
+
+  write_proc_growth_fixture "$fixture/proc-recovery.txt" 101 19 7 \
+    cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc 1010
+  process_json="$(process_growth_observation \
+    test-cell java-backend "$fixture/proc-before.txt" "$fixture/proc-recovery.txt")"
+  jq -e '.status == "partial" and .result == "not_evaluated" and
+    .reason == "service_container_or_process_identity_changed_between_required_samples"' \
+    <<<"$process_json" >/dev/null || {
+    printf 'unrelated container identity was not rejected from process growth evidence\n' >&2
+    return 1
+  }
+
+  write_proc_growth_fixture "$fixture/proc-recovery.txt" 101 19 7 \
+    aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1010 \
+    dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+  process_json="$(process_growth_observation \
+    test-cell java-backend "$fixture/proc-before.txt" "$fixture/proc-recovery.txt")"
+  jq -e '.status == "partial" and .result == "not_evaluated" and
+    .reason == "service_container_or_process_identity_changed_between_required_samples"' \
+    <<<"$process_json" >/dev/null || {
+    printf 'cgroup identity drift was not rejected from process growth evidence\n' >&2
+    return 1
+  }
+
+  printf 'status=unavailable\n' >"$fixture/proc-recovery.txt"
+  process_json="$(process_growth_observation \
+    test-cell java-backend "$fixture/proc-before.txt" "$fixture/proc-recovery.txt")"
+  jq -e '.status == "partial" and .result == "not_evaluated"' \
+    <<<"$process_json" >/dev/null || {
+    printf 'unavailable process sample was misrepresented as complete\n' >&2
+    return 1
+  }
+
+  write_java_map_growth_fixture "$fixture/map-before.prom" 2 10000
+  write_java_map_growth_fixture "$fixture/map-recovery.prom" 1 10000
+  map_json="$(java_bridge_map_growth_observation \
+    test-cell "$fixture/map-before.prom" "$fixture/map-recovery.prom")"
+  jq -e '
+    .status == "partial" and .result == "not_evaluated" and
+    .data_status == "complete" and
+    .descriptive_result == "stable_or_decreased" and
+    .scope == "host_global_java_remote_par_superset" and
+    .ownership_attribution == false and
+    .maps == [{
+      map_id: 41, map_name: "java_remote_par", map_type: "hash",
+      before_entries: 2, idle_recovery_entries: 1, delta: -1,
+      maximum_delta: 0, max_entries: 10000
+    }]
+  ' <<<"$map_json" >/dev/null || {
+    printf 'stable foreign-only Java map samples were treated as attributable gate evidence\n' >&2
+    return 1
+  }
+
+  printf '%s\n' \
+    'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 1' \
+    'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 1' \
+    'obi_bpf_map_max_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 10000' \
+    >"$fixture/map-recovery.prom"
+  map_json="$(java_bridge_map_growth_observation \
+    test-cell "$fixture/map-before.prom" "$fixture/map-recovery.prom")"
+  jq -e '.status == "partial" and .result == "not_evaluated"' \
+    <<<"$map_json" >/dev/null || {
+    printf 'duplicate Java map sample was misrepresented as complete\n' >&2
+    return 1
+  }
+
+  {
+    printf '%s\n' \
+      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 1' \
+      'obi_bpf_map_max_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 10000' \
+      'obi_bpf_map_entries_total{map_id="42",map_name="java_remote_par",map_type="hash"} 0' \
+      'obi_bpf_map_max_entries_total{map_id="42",map_name="java_remote_par",map_type="hash"} 1'
+  } >"$fixture/map-recovery.prom"
+  map_json="$(java_bridge_map_growth_observation \
+    test-cell "$fixture/map-before.prom" "$fixture/map-recovery.prom")"
+  jq -e '
+    .status == "partial" and .result == "not_evaluated" and
+    .data_status == "ambiguous" and
+    .descriptive_result == "series_set_changed_or_was_duplicate" and
+    .scope == "host_global_java_remote_par_superset" and
+    .ownership_attribution == false
+  ' <<<"$map_json" >/dev/null || {
+    printf 'foreign or newly visible Java map series did not prevent a pass\n' >&2
+    return 1
+  }
+)
+
+test_predeclared_poc_gate_stays_partial_and_evaluates_supported_dimensions() (
+  local -r stable_output="$TEST_TMP_DIR/poc-gate-stable"
+  local -r partial_output="$TEST_TMP_DIR/poc-gate-partial"
+  local -r map_partial_output="$TEST_TMP_DIR/poc-gate-map-partial"
+  local -r resource_failure_output="$TEST_TMP_DIR/poc-gate-resource-failure"
+  local -r correctness_failure_output="$TEST_TMP_DIR/poc-gate-correctness-failure"
+  local -r boundary_output="$TEST_TMP_DIR/poc-gate-boundary"
+  local -r performance_failure_output="$TEST_TMP_DIR/poc-gate-performance-failure"
+  local -r mutated_gate="$TEST_TMP_DIR/poc-gate-mutated.json"
+  local canonical_gate=""
+  local result=""
+
+  reset_options
+  prepare_poc_gate_fixture "$stable_output"
+  write_poc_gate_summary
+  validate_poc_gate_schema "$stable_output/poc-gates.json" || {
+    printf 'partial PoC fixture with complete descriptive samples was rejected\n' >&2
+    return 1
+  }
+  validate_supported_poc_dimensions_pass "$stable_output/poc-gates.json" || {
+    printf 'passing supported dimensions with complete descriptive samples was rejected\n' >&2
+    return 1
+  }
+  canonical_gate="$(poc_gate_summary_json "$stable_output")" || return 1
+  jq -e --argjson canonical "$canonical_gate" '. == $canonical' \
+    "$stable_output/poc-gates.json" >/dev/null || {
+    printf 'PoC writer diverged from its canonical source builder\n' >&2
+    return 1
+  }
+  jq '
+    .performance.comparisons[0].throughput_per_second.candidate_median = 1 |
+    .performance.comparisons[0].p99_latency_nanos.candidate_median = 1000
+  ' "$stable_output/poc-gates.json" >"$mutated_gate"
+  if validate_poc_gate_schema "$mutated_gate"; then
+    printf 'PoC validator accepted candidate metrics inconsistent with retained regressions\n' >&2
+    return 1
+  fi
+  jq '
+    .correctness.cells[0].status = "failed" |
+    .correctness.cells[0].reason = "forged" |
+    .correctness.observed_failures = 1 |
+    .correctness.result = "failed" |
+    .result = "failed"
+  ' "$stable_output/poc-gates.json" >"$mutated_gate"
+  if validate_poc_gate_schema "$mutated_gate"; then
+    printf 'PoC validator accepted a coordinated correctness-count forgery\n' >&2
+    return 1
+  fi
+  jq -e '
+    .status == "partial" and .result == "not_evaluated" and
+    .correctness.observed_failures == 0 and
+    .correctness.status == "complete" and .correctness.result == "passed" and
+    .performance.required_repetitions == 5 and
+    .performance.status == "complete" and .performance.result == "passed" and
+    all(.performance.comparisons[];
+      .throughput_per_second.regression_percent == 0 and
+      .p99_latency_nanos.regression_percent == 0 and
+      .result == "passed") and
+    .performance.excluded_cells.getsockopt_helper_idle ==
+      "direct_java_workload_is_not_comparable_to_the_apache_baseline" and
+    .resources.status == "partial" and .resources.result == "not_evaluated" and
+    .resources.process_dimension == {status: "complete", result: "passed"} and
+    .resources.map_dimension == {
+      status: "partial",
+      result: "not_evaluated",
+      reason: "host_global_metrics_do_not_attribute_visible_java_remote_par_series_to_this_demo_project",
+      descriptive_data_status: "complete"
+    } and
+    .resources.map_sampling_scope == {
+      metric_scope: "host_global_java_remote_par_superset",
+      ownership_attribution: false,
+      descriptive_interpretation: "stable_or_decreased_applies_to_every_visible_java_remote_par_series",
+      evaluation_policy: "not_evaluated_without_project_ownership_attribution_or_clean_host_proof"
+    } and
+    .resources.java_bridge_map_observations[0].cell == "bridge-disabled" and
+    .resources.java_bridge_map_observations[0].status == "partial" and
+    .resources.java_bridge_map_observations[0].result == "not_evaluated" and
+    .resources.java_bridge_map_observations[0].data_status == "complete" and
+    .resources.java_bridge_map_observations[0].descriptive_result == "stable_or_decreased" and
+    .resources.java_bridge_map_observations[0].maps == [{
+      map_id: 41, map_name: "java_remote_par", map_type: "hash",
+      before_entries: 0, idle_recovery_entries: 0, delta: 0,
+      maximum_delta: 0, max_entries: 1
+    }] and
+    all(.resources.java_bridge_map_observations[];
+      .scope == "host_global_java_remote_par_superset" and
+      .ownership_attribution == false and
+      .status == "partial" and .result == "not_evaluated") and
+    .issue_acceptance_complete == false and
+    .unmeasured_dimensions == {
+      jfr_nmt_allocation_native_direct_memory: "not_collected",
+      primary_cgroupsockopt_program_cpu: "not_collected",
+      bpf_lock_contention: "not_collected"
+    }
+  ' "$stable_output/poc-gates.json" >/dev/null || {
+    printf 'partial PoC gate omitted evaluated subsets or explicit acceptance gaps\n' >&2
+    return 1
+  }
+
+  reset_options
+  prepare_poc_gate_fixture "$partial_output"
+  printf 'status=unavailable\n' \
+    >"$partial_output/cells/unix-hit/resources-idle-recovery/java-backend-proc.txt"
+  write_poc_gate_summary
+  validate_poc_gate_schema "$partial_output/poc-gates.json" || {
+    printf 'partial PoC gate did not retain a valid fail-closed artifact\n' >&2
+    return 1
+  }
+  if validate_supported_poc_dimensions_pass "$partial_output/poc-gates.json"; then
+    printf 'supported PoC dimensions passed with an unavailable process sample\n' >&2
+    return 1
+  fi
+  jq -e '
+    .status == "partial" and .result == "not_evaluated" and
+    .resources.status == "partial" and .resources.result == "not_evaluated" and
+    .resources.process_dimension == {status: "partial", result: "not_evaluated"}
+  ' "$partial_output/poc-gates.json" >/dev/null || {
+    printf 'unavailable resource sample was claimed as collected or evaluated\n' >&2
+    return 1
+  }
+
+  reset_options
+  prepare_poc_gate_fixture "$map_partial_output"
+  printf '# required java_remote_par series unavailable\n' \
+    >"$map_partial_output/cells/bridge-disabled/resources-idle-recovery/obi-metrics.prom"
+  write_poc_gate_summary
+  validate_poc_gate_schema "$map_partial_output/poc-gates.json" || {
+    printf 'partial PoC gate rejected an honest unavailable map sample\n' >&2
+    return 1
+  }
+  if validate_supported_poc_dimensions_pass "$map_partial_output/poc-gates.json"; then
+    printf 'supported PoC dimensions passed without required descriptive map data\n' >&2
+    return 1
+  fi
+  jq -e '
+    .status == "partial" and .result == "not_evaluated" and
+    .resources.map_dimension == {
+      status: "partial",
+      result: "not_evaluated",
+      reason: "host_global_metrics_do_not_attribute_visible_java_remote_par_series_to_this_demo_project",
+      descriptive_data_status: "unavailable"
+    } and
+    (.resources.java_bridge_map_observations[] |
+      select(.cell == "bridge-disabled") |
+      .data_status == "unavailable" and
+      .descriptive_result == "not_available")
+  ' "$map_partial_output/poc-gates.json" >/dev/null || {
+    printf 'unavailable Java map data was claimed as collected\n' >&2
+    return 1
+  }
+
+  reset_options
+  prepare_poc_gate_fixture "$resource_failure_output"
+  write_proc_growth_fixture \
+    "$resource_failure_output/cells/getsockopt-hit/resources-idle-recovery/java-backend-proc.txt" \
+    109 21 8
+  write_poc_gate_summary
+  validate_poc_gate_schema "$resource_failure_output/poc-gates.json" || {
+    printf 'partial PoC artifact rejected an evaluated process-growth failure\n' >&2
+    return 1
+  }
+  jq -e '
+    .status == "partial" and .result == "failed" and
+    .resources.status == "partial" and .resources.result == "failed" and
+    .resources.process_dimension == {status: "complete", result: "failed"} and
+    (.resources.process_observations[] |
+      select(.cell == "getsockopt-hit" and .service == "java-backend") |
+      .status == "complete" and .result == "failed" and .fd.delta == 1)
+  ' "$resource_failure_output/poc-gates.json" >/dev/null || {
+    printf 'bounded process growth failure was not retained within the partial PoC gate\n' >&2
+    return 1
+  }
+  if validate_supported_poc_dimensions_pass "$resource_failure_output/poc-gates.json"; then
+    printf 'supported PoC dimensions passed despite positive FD growth\n' >&2
+    return 1
+  fi
+
+  reset_options
+  prepare_poc_gate_fixture "$correctness_failure_output"
+  jq '.status = "failed" | .reason = "fixture_correctness_failure"' \
+    "$correctness_failure_output/cells/unix-hit/status.json" \
+    >"$correctness_failure_output/cells/unix-hit/status.json.tmp"
+  mv -T -- \
+    "$correctness_failure_output/cells/unix-hit/status.json.tmp" \
+    "$correctness_failure_output/cells/unix-hit/status.json"
+  write_poc_gate_summary
+  validate_poc_gate_schema "$correctness_failure_output/poc-gates.json" || {
+    printf 'partial PoC artifact rejected a known correctness failure\n' >&2
+    return 1
+  }
+  jq -e '
+    .status == "partial" and .result == "failed" and
+    .correctness.status == "complete" and
+    .correctness.result == "failed" and
+    .correctness.observed_failures == 1 and
+    .resources.result == "not_evaluated"
+  ' "$correctness_failure_output/poc-gates.json" >/dev/null || {
+    printf 'known correctness failure did not propagate through the partial PoC gate\n' >&2
+    return 1
+  }
+  if validate_supported_poc_dimensions_pass \
+    "$correctness_failure_output/poc-gates.json"; then
+    printf 'supported PoC dimensions passed despite a correctness failure\n' >&2
+    return 1
+  fi
+
+  reset_options
+  prepare_poc_gate_fixture "$boundary_output"
+  rewrite_cell_performance_fixture getsockopt-hit 90 110
+  write_poc_gate_summary
+  validate_poc_gate_schema "$boundary_output/poc-gates.json" || {
+    printf 'exact ten-percent performance regression boundary invalidated the partial artifact\n' >&2
+    return 1
+  }
+  validate_supported_poc_dimensions_pass "$boundary_output/poc-gates.json" || {
+    printf 'exact ten-percent supported performance boundary did not pass\n' >&2
+    return 1
+  }
+  jq -e '
+    .status == "partial" and .result == "not_evaluated" and
+    .performance.status == "complete" and .performance.result == "passed" and
+    (.performance.comparisons[] | select(.cell == "getsockopt-hit") |
+      .throughput_per_second.regression_percent == 10 and
+      .p99_latency_nanos.regression_percent == 10 and .result == "passed")
+  ' "$boundary_output/poc-gates.json" >/dev/null || {
+    printf 'exact ten-percent performance boundary was not retained\n' >&2
+    return 1
+  }
+
+  reset_options
+  prepare_poc_gate_fixture "$performance_failure_output"
+  rewrite_cell_performance_fixture getsockopt-hit 89 111
+  write_poc_gate_summary
+  result="$performance_failure_output/poc-gates.json"
+  validate_poc_gate_schema "$result" || {
+    printf 'partial PoC artifact rejected an evaluated performance failure\n' >&2
+    return 1
+  }
+  jq -e '
+    .status == "partial" and .result == "failed" and
+    .performance.result == "failed" and
+    (.performance.comparisons[] | select(.cell == "getsockopt-hit") |
+      .throughput_per_second.regression_percent == 11 and
+      .p99_latency_nanos.regression_percent == 11 and
+      .result == "failed")
+  ' "$result" >/dev/null || {
+    printf 'greater-than-ten-percent performance regression did not fail\n' >&2
+    return 1
+  }
+  if validate_supported_poc_dimensions_pass "$result"; then
+    printf 'supported PoC dimensions passed despite a performance regression\n' >&2
+    return 1
+  fi
+
+  jq '.completed_at = "2026-08-10T00:00:01Z"' \
+    "$stable_output/cells/unix-hit/status.json" \
+    >"$stable_output/cells/unix-hit/status.json.tmp"
+  mv -T -- "$stable_output/cells/unix-hit/status.json.tmp" \
+    "$stable_output/cells/unix-hit/status.json"
+  if validate_poc_gate_schema "$stable_output/poc-gates.json"; then
+    printf 'PoC validator accepted an artifact stale against a retained cell status\n' >&2
+    return 1
+  fi
+)
+
+test_summary_resource_scope_is_independent_of_nonresource_failures() (
+  local -r performance_output="$TEST_TMP_DIR/summary-performance-only-failure"
+  local -r correctness_output="$TEST_TMP_DIR/summary-correctness-only-failure"
+  local -r process_output="$TEST_TMP_DIR/summary-process-growth-failure"
+
+  reset_options
+  prepare_poc_gate_fixture "$performance_output"
+  rewrite_cell_performance_fixture getsockopt-hit 89 111
+  write_poc_gate_summary
+  jq -n '{status: "in_progress"}' >"$performance_output/manifest.json"
+  write_summary failed
+
+  reset_options
+  prepare_poc_gate_fixture "$correctness_output"
+  jq '.status = "failed" | .reason = "fixture_correctness_failure"' \
+    "$correctness_output/cells/unix-hit/status.json" \
+    >"$correctness_output/cells/unix-hit/status.json.tmp"
+  mv -T -- "$correctness_output/cells/unix-hit/status.json.tmp" \
+    "$correctness_output/cells/unix-hit/status.json"
+  write_poc_gate_summary
+  jq -n '{status: "in_progress"}' >"$correctness_output/manifest.json"
+  write_summary failed
+
+  reset_options
+  prepare_poc_gate_fixture "$process_output"
+  write_proc_growth_fixture \
+    "$process_output/cells/getsockopt-hit/resources-idle-recovery/java-backend-proc.txt" \
+    109 21 8
+  write_poc_gate_summary
+  jq -n '{status: "in_progress"}' >"$process_output/manifest.json"
+  write_summary failed
+
+  jq -e '
+    .performance.result == "failed" and
+    .correctness.result == "passed" and
+    .resources.result == "not_evaluated" and
+    .resources.process_dimension == {status: "complete", result: "passed"}
+  ' "$performance_output/poc-gates.json" >/dev/null || {
+    printf 'performance-only fixture did not isolate its gate failure\n' >&2
+    return 1
+  }
+  jq -e '
+    .performance.result == "passed" and
+    .correctness.result == "failed" and
+    .resources.result == "not_evaluated" and
+    .resources.process_dimension == {status: "complete", result: "passed"}
+  ' "$correctness_output/poc-gates.json" >/dev/null || {
+    printf 'correctness-only fixture did not isolate its gate failure\n' >&2
+    return 1
+  }
+  jq -se '
+    length == 2 and all(.[0:2][];
+      .status == "failed" and .poc_gates.result == "failed" and
+      .measurement_scope.application_fd_threads_and_java_bridge_map_growth == {
+        status: "partial",
+        result: "not_evaluated",
+        process_fd_threads: {status: "complete", result: "passed"},
+        java_bridge_map: {
+          status: "partial",
+          result: "not_evaluated",
+          reason: "host_global_metrics_do_not_attribute_visible_java_remote_par_series_to_this_demo_project",
+          descriptive_data_status: "complete"
+        }
+      })
+  ' "$performance_output/summary.json" "$correctness_output/summary.json" \
+    >/dev/null || {
+    printf 'summary misattributed a nonresource failure to resource growth\n' >&2
+    return 1
+  }
+  jq -e '
+    .status == "failed" and .poc_gates.result == "failed" and
+    .measurement_scope.application_fd_threads_and_java_bridge_map_growth == {
+      status: "partial",
+      result: "failed",
+      process_fd_threads: {status: "complete", result: "failed"},
+      java_bridge_map: {
+        status: "partial",
+        result: "not_evaluated",
+        reason: "host_global_metrics_do_not_attribute_visible_java_remote_par_series_to_this_demo_project",
+        descriptive_data_status: "complete"
+      }
+    }
+  ' "$process_output/summary.json" >/dev/null || {
+    printf 'summary did not attribute an evaluated process-growth failure to resources\n' >&2
+    return 1
+  }
+)
+
+test_failed_complete_summary_reports_requested_artifact_state() (
+  local -r unavailable_output="$TEST_TMP_DIR/failed-complete-artifacts-unavailable"
+  local -r available_output="$TEST_TMP_DIR/failed-complete-artifacts-available"
+  local revision=""
+
+  reset_options
+  OUTPUT_DIR="$unavailable_output"
+  OUTPUT_READY=true
+  CELLS_MODE=complete
+  mkdir -p -- "$OUTPUT_DIR/cells"
+  jq -n '{status: "in_progress"}' >"$OUTPUT_DIR/manifest.json"
+  write_summary failed
+  jq -e '
+    .status == "failed" and
+    .lookup_paths == {status: "requested_but_unavailable", path: null} and
+    .native_jni_lookup == {status: "requested_but_unavailable", path: null} and
+    .measurement_scope.pressure_map_occupancy_and_capacity_rejection ==
+      "requested_but_unavailable"
+  ' "$OUTPUT_DIR/summary.json" >/dev/null || {
+    printf 'failed complete summary relabelled requested artifacts as not requested\n' >&2
+    return 1
+  }
+
+  reset_options
+  OUTPUT_DIR="$available_output"
+  OUTPUT_READY=true
+  CELLS_MODE=complete
+  mkdir -p -- "$OUTPUT_DIR/cells"
+  jq -n '{status: "in_progress"}' >"$OUTPUT_DIR/manifest.json"
+  revision="$(git -C "$REPO_ROOT" rev-parse HEAD)" || return 1
+  write_normalized_native_jni_artifact_fixture \
+    "$OUTPUT_DIR/native-jni/benchmark.json" "$revision"
+  write_lookup_path_summary_fixture "$OUTPUT_DIR/lookup-paths.json"
+  write_summary failed
+  jq -e '
+    .status == "failed" and
+    .lookup_paths == {status: "available", path: "lookup-paths.json"} and
+    .native_jni_lookup == {status: "available", path: "native-jni/benchmark.json"} and
+    .measurement_scope.pressure_map_occupancy_and_capacity_rejection ==
+      "bounded_correctness_observed_once"
+  ' "$OUTPUT_DIR/summary.json" >/dev/null || {
+    printf 'failed complete summary did not link valid retained artifacts\n' >&2
+    return 1
+  }
+  [[ -f "$OUTPUT_DIR/lookup-paths.json" &&
+    -f "$OUTPUT_DIR/native-jni/benchmark.json" ]] || {
+    printf 'failed complete summary removed valid retained artifacts\n' >&2
+    return 1
+  }
 )
 
 test_summary_marks_unavailable_variance_after_failure() (
@@ -2989,15 +5680,32 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
   local -r results_root="$fake_example/.runtime/results"
   local -r helper_events="$TEST_TMP_DIR/helper-idle-events.log"
   local -r expected_helper_events="$TEST_TMP_DIR/helper-idle-events.expected"
+  local -r docker_socket="$TEST_TMP_DIR/fake-docker.sock"
+  local -r source_tree_manifest="$TEST_TMP_DIR/fake-source-tree.manifest"
   local cell=""
   local command_name=""
   local request=0
+  local revision=""
+  local git_tree=""
 
   mkdir -p -- "$fake_example/scripts" "$fake_bin" "$output_parent" "$fake_example/.runtime"
   chmod 0755 -- "$fake_example/.runtime"
   install --mode=0755 "$TEST_SCRIPT_DIR/benchmark.sh" "$fake_example/scripts/benchmark.sh"
   ln -s -- "$TEST_SOURCE" "$fake_example/run.sh"
   printf 'services: {}\n' >"$fake_example/docker-compose.yml"
+  printf 'examples/apache-java-https/.runtime/\n' >"$fake_root/.gitignore"
+  git -C "$fake_root" init --quiet
+  git -C "$fake_root" config user.email benchmark@example.invalid
+  git -C "$fake_root" config user.name 'Benchmark Test'
+  git -C "$fake_root" config commit.gpgsign false
+  git -C "$fake_root" add -- .
+  git -C "$fake_root" commit --quiet -m fixture
+  revision="$(git -C "$fake_root" rev-parse HEAD)" || return 1
+  git_tree="$(git -C "$fake_root" rev-parse "$revision^{tree}")" || return 1
+  resolve_benchmark_identity_tools
+  write_git_tree_manifest_for_tree \
+    "$fake_root" "$git_tree" "$source_tree_manifest" || return 1
+  create_unix_socket_fixture "$docker_socket"
   for command_name in docker curl sleep git; do
     ln -s -- "$TEST_SOURCE" "$fake_bin/$command_name"
   done
@@ -3009,12 +5717,15 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
     FAKE_COMPOSE_PROJECT_FILE="$compose_project" \
     FAKE_DOCKER_LOG="$docker_log" \
     FAKE_DIAGNOSTICS_FILE="$diagnostics" \
+    FAKE_DOCKER_ENDPOINT="unix://$docker_socket" \
     FAKE_EVENTS="$events" \
+    FAKE_GIT_REVISION="$revision" \
     FAKE_PID="$$" \
     FAKE_RESULTS_ROOT="$results_root" \
     FAKE_RUNNER_LOG="$runner_log" \
+    FAKE_SOURCE_TREE_MANIFEST="$source_tree_manifest" \
     FAKE_TLS_PROTOCOL=TLSv1.2 \
-    "$fake_example/scripts/benchmark.sh" \
+    run_benchmark_with_fake_bound_proc "$fake_example/scripts/benchmark.sh" \
       --output "$output" \
       --agent splunk \
       --tls TLSv1.2 \
@@ -3031,14 +5742,72 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
     .acceptance_evidence == false and
     (.cells | length == 6) and
     all(.cells[]; .status == "passed") and
-    .variance == {status: "available", path: "variance.json"}
+    .variance == {status: "available", path: "variance.json"} and
+    .docker_daemon == {status: "verified_local_unix_socket_endpoint_only", path: "docker-daemon.json"} and
+    .application_source == {status: "clean_and_stable", path: "application-source-identity.json"} and
+    .poc_gates == {
+      status: "partial", path: "poc-gates.json", result: "not_evaluated"
+    } and
+    .measurement_scope.application_fd_threads_and_java_bridge_map_growth == {
+      status: "partial",
+      result: "not_evaluated",
+      process_fd_threads: {status: "complete", result: "passed"},
+      java_bridge_map: {
+        status: "partial",
+        result: "not_evaluated",
+        reason: "host_global_metrics_do_not_attribute_visible_java_remote_par_series_to_this_demo_project",
+        descriptive_data_status: "complete"
+      }
+    } and
+    (.notes | any(contains("passed summary status means the harness completed successfully")))
   ' "$output/summary.json" >/dev/null || {
-    printf 'hermetic run did not retain six passing core summaries\n' >&2
+    printf 'hermetic run misrepresented harness completion as a completed PoC gate\n' >&2
+    return 1
+  }
+  validate_application_source_identity_schema \
+    "$output/application-source-identity.json" "$fake_root" || return 1
+  jq -e '.cells_mode == "core" and (.cells | length) == 6 and
+    (.canonical_patch_identity_sha256 | test("^[0-9a-f]{64}$"))' \
+    "$output/application-source-identity.json" >/dev/null || return 1
+  jq -e '.status == "verified_local_unix_socket_endpoint_only" and
+    .socket_evidence == "existing_non_symlink_unix_socket" and
+    .daemon_process_locality == "not_established_by_unix_socket_endpoint"' \
+    "$output/docker-daemon.json" >/dev/null || return 1
+  grep -Eq '^container_id=[0-9a-f]{64}$' \
+    "$output/cells/getsockopt-hit/resources-before/java-backend-proc.txt" &&
+    grep -Eq '^proc_start_time=[1-9][0-9]*$' \
+      "$output/cells/getsockopt-hit/resources-before/java-backend-proc.txt" &&
+    grep -Eq '^proc_cgroup_sha256=[0-9a-f]{64}$' \
+      "$output/cells/getsockopt-hit/resources-before/java-backend-proc.txt" &&
+    grep -Fxq 'proc_cgroup_container_binding=full_container_id_at_non_hex_boundaries' \
+      "$output/cells/getsockopt-hit/resources-before/java-backend-proc.txt" || {
+    printf 'hermetic run omitted bound container/process identity evidence\n' >&2
+    return 1
+  }
+  jq -e '
+    .status == "partial" and .result == "not_evaluated" and
+    .issue_acceptance_complete == false and
+    .resources.map_dimension.status == "partial" and
+    .resources.map_dimension.result == "not_evaluated" and
+    .resources.map_sampling_scope.ownership_attribution == false and
+    (.resources.java_bridge_map_observations[] |
+      select(.cell == "bridge-disabled") |
+      .data_status == "complete" and
+      .descriptive_result == "stable_or_decreased" and
+      .maps == [{
+        map_id: 41, map_name: "java_remote_par", map_type: "hash",
+        before_entries: 0, idle_recovery_entries: 0, delta: 0,
+        maximum_delta: 0, max_entries: 1
+      }]) and
+    all(.resources.java_bridge_map_observations[];
+      .status == "partial" and .result == "not_evaluated")
+  ' "$output/poc-gates.json" >/dev/null || {
+    printf 'hermetic run allowed host-global map samples to complete the PoC gate\n' >&2
     return 1
   }
   jq -e '
     .schema_version == 1 and
-    .kind == "descriptive-repetition-summary" and
+    .kind == "application-performance-repetition-summary" and
     .status == "complete" and
     .acceptance_evidence == false and
     .aggregation.cross_cell_aggregation == false and
@@ -3403,19 +6172,259 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
   }
 }
 
+test_complete_mode_fake_run_publishes_resolvable_bounded_evidence() {
+  local -r fake_root="$TEST_TMP_DIR/fake-complete-root"
+  local -r fake_example="$fake_root/examples/apache-java-https"
+  local -r agent_directory="$fake_root/pkg/internal/java/agent"
+  local -r fake_bin="$TEST_TMP_DIR/fake-complete-bin"
+  local -r output_parent="$TEST_TMP_DIR/fake-complete-output"
+  local -r output_name='artifacts-$(shell printf INJECTED >&2)'
+  local -r output="$output_parent/$output_name"
+  local -r runner_log="$TEST_TMP_DIR/fake-complete-runner.log"
+  local -r docker_log="$TEST_TMP_DIR/fake-complete-docker.log"
+  local -r events="$TEST_TMP_DIR/fake-complete-events.log"
+  local -r diagnostics="$TEST_TMP_DIR/fake-complete-diagnostics.txt"
+  local -r bpf_metrics="$TEST_TMP_DIR/fake-complete-bpf-metrics.txt"
+  local -r compose_project="$TEST_TMP_DIR/fake-complete-compose-project.txt"
+  local -r results_root="$fake_example/.runtime/results"
+  local -r compiler="$TEST_TMP_DIR/fake-native-compiler"
+  local -r compiler_log="$TEST_TMP_DIR/fake-native-compiler.log"
+  local -r binary_template="$TEST_TMP_DIR/fake-native-binary"
+  local -r runtime_log="$TEST_TMP_DIR/fake-native-runtime.log"
+  local -r docker_socket="$TEST_TMP_DIR/fake-complete-docker.sock"
+  local -r source_tree_manifest="$TEST_TMP_DIR/fake-complete-source-tree.manifest"
+  local revision=""
+  local git_tree=""
+  local command_name=""
+
+  mkdir -p -- "$fake_example/scripts" "$fake_example/java" \
+    "$agent_directory/src/main/c" "$agent_directory/src/test/c" \
+    "$fake_bin" "$output_parent" "$fake_example/.runtime"
+  chmod 0755 -- "$fake_example/.runtime"
+  install --mode=0755 "$TEST_SCRIPT_DIR/benchmark.sh" "$fake_example/scripts/benchmark.sh"
+  ln -s -- "$TEST_SOURCE" "$fake_example/run.sh"
+  printf 'services: {}\n' >"$fake_example/docker-compose.yml"
+  printf '%s\n' \
+    'FROM maven:fixture@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc AS builder' \
+    >"$fake_example/java/Dockerfile"
+  {
+    printf 'CC ?= cc\n'
+    printf 'CFLAGS = -fPIC -O2 -Wall -Wextra -Wno-unused-parameter -pthread\n'
+    printf 'LDFLAGS = -pthread\n'
+    printf 'BENCHMARK_TARGET = $(BUILD_DIR)/remote_parent_jni_benchmark\n'
+    printf '.PHONY: benchmark\n'
+    printf 'benchmark: CFLAGS += -DOBI_JNI_TESTING\n'
+    printf 'benchmark:\n'
+    printf '\t$(CC) $(CFLAGS) -I$(JAVA_HOME)/include -I$(JAVA_HOME)/include/linux src/main/c/io_opentelemetry_obi_java_jni.c src/test/c/remote_parent_jni_benchmark.c $(LDFLAGS) -o $(BENCHMARK_TARGET)\n'
+    printf '\t$(BENCHMARK_TARGET) $(BENCHMARK_ITERATIONS)\n'
+  } >"$agent_directory/Makefile.jni"
+  printf '/* fixture production source */\n' \
+    >"$agent_directory/src/main/c/io_opentelemetry_obi_java_jni.c"
+  printf '/* fixture benchmark source */\n' \
+    >"$agent_directory/src/test/c/remote_parent_jni_benchmark.c"
+  printf 'examples/apache-java-https/.runtime/\n' >"$fake_root/.gitignore"
+  {
+    printf '#!/bin/sh\n'
+    printf '/usr/bin/env | /usr/bin/sort >%q\n' "$runtime_log"
+    printf 'printf "%%s\\n" %q\n' \
+      'benchmark=obi_java_remote_parent_native getsockopt_backend=deterministic_syscall_shim'
+    printf 'printf "%%s\\n" %q\n' \
+      'transport=getsockopt outcome=hit warmup_iterations=1000 iterations=10000 elapsed_ns=100000 ns_per_op=10.00 p50_ns=10 p95_ns=20 p99_ns=30 ops_per_second=100000000.00 status=1 checksum=10000'
+    printf 'printf "%%s\\n" %q\n' \
+      'transport=getsockopt outcome=miss warmup_iterations=1000 iterations=10000 elapsed_ns=110000 ns_per_op=11.00 p50_ns=11 p95_ns=21 p99_ns=31 ops_per_second=90909090.91 status=2 checksum=20000'
+    printf 'printf "%%s\\n" %q\n' \
+      'transport=getsockopt outcome=failure warmup_iterations=1000 iterations=10000 elapsed_ns=120000 ns_per_op=12.00 p50_ns=12 p95_ns=22 p99_ns=32 ops_per_second=83333333.33 status=12 checksum=120000'
+    printf 'printf "%%s\\n" %q\n' \
+      'transport=unix outcome=hit warmup_iterations=1000 iterations=10000 elapsed_ns=200000 ns_per_op=20.00 p50_ns=20 p95_ns=30 p99_ns=40 ops_per_second=50000000.00 status=1 checksum=10000'
+    printf 'printf "%%s\\n" %q\n' \
+      'transport=unix outcome=miss warmup_iterations=1000 iterations=10000 elapsed_ns=210000 ns_per_op=21.00 p50_ns=21 p95_ns=31 p99_ns=41 ops_per_second=47619047.62 status=2 checksum=20000'
+    printf 'printf "%%s\\n" %q\n' \
+      'transport=unix outcome=failure warmup_iterations=1000 iterations=10000 elapsed_ns=220000 ns_per_op=22.00 p50_ns=22 p95_ns=32 p99_ns=42 ops_per_second=45454545.45 status=12 checksum=120000'
+  } >"$binary_template"
+  chmod 0700 -- "$binary_template"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -Eeuo pipefail' \
+    'if [[ "${1:-}" == --version ]]; then printf "fixture compiler\\n"; exit 0; fi' \
+    "printf 'args=' >$(printf '%q' "$compiler_log")" \
+    "printf '%q ' \"\$@\" >>$(printf '%q' "$compiler_log")" \
+    "printf '\\n' >>$(printf '%q' "$compiler_log")" \
+    "/usr/bin/env | /usr/bin/sort >>$(printf '%q' "$compiler_log")" \
+    'output=""' \
+    'while (($# > 0)); do if [[ "$1" == -o ]]; then output="$2"; shift 2; else shift; fi; done' \
+    '[[ "$output" == /* ]]' \
+    "/usr/bin/install -m 0700 -- $(printf '%q' "$binary_template") \"\$output\"" \
+    >"$compiler"
+  chmod 0700 -- "$compiler"
+  git -C "$fake_root" init --quiet
+  git -C "$fake_root" config user.email benchmark@example.invalid
+  git -C "$fake_root" config user.name 'Benchmark Test'
+  git -C "$fake_root" config commit.gpgsign false
+  git -C "$fake_root" add -- .
+  git -C "$fake_root" commit --quiet -m fixture
+  revision="$(git -C "$fake_root" rev-parse HEAD)" || return 1
+  git_tree="$(git -C "$fake_root" rev-parse "$revision^{tree}")" || return 1
+  resolve_benchmark_identity_tools
+  write_git_tree_manifest_for_tree \
+    "$fake_root" "$git_tree" "$source_tree_manifest" || return 1
+  create_unix_socket_fixture "$docker_socket"
+  for command_name in docker curl sleep git; do
+    ln -s -- "$TEST_SOURCE" "$fake_bin/$command_name"
+  done
+  printf '0 0 0\n' >"$diagnostics"
+  printf '0 0 0 0 0 0 0 0\n' >"$bpf_metrics"
+  if ! PATH="$fake_bin:$PATH" \
+    CC="$compiler" \
+    MAKEFILES="$TEST_TMP_DIR/nonexistent-hostile.mk" \
+    MAKEFLAGS='CFLAGS=-DINJECTED' \
+    GNUMAKEFLAGS='CFLAGS=-DGNU_INJECTED' \
+    CPATH="$TEST_TMP_DIR/hostile-cpath" \
+    C_INCLUDE_PATH="$TEST_TMP_DIR/hostile-include" \
+    COMPILER_PATH="$TEST_TMP_DIR/hostile-compiler-path" \
+    GCC_EXEC_PREFIX="$TEST_TMP_DIR/hostile-gcc-prefix" \
+    LIBRARY_PATH="$TEST_TMP_DIR/hostile-library-path" \
+    FAKE_CONTAINER_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    FAKE_BPF_METRICS_FILE="$bpf_metrics" \
+    FAKE_COMPOSE_PROJECT_FILE="$compose_project" \
+    FAKE_DOCKER_LOG="$docker_log" \
+    FAKE_DIAGNOSTICS_FILE="$diagnostics" \
+    FAKE_DOCKER_ENDPOINT="unix://$docker_socket" \
+    FAKE_EVENTS="$events" \
+    FAKE_GIT_REVISION="$revision" \
+    FAKE_PID="$$" \
+    FAKE_RESULTS_ROOT="$results_root" \
+    FAKE_RUNNER_LOG="$runner_log" \
+    FAKE_SOURCE_TREE_MANIFEST="$source_tree_manifest" \
+    FAKE_TLS_PROTOCOL=TLSv1.2 \
+    run_benchmark_with_fake_bound_proc "$fake_example/scripts/benchmark.sh" \
+      --output "$output" --agent splunk --tls TLSv1.2 \
+      --warmup-seconds 2 --duration-seconds 2 --concurrency 1 \
+      --repetitions 5 --seed 17 --cells complete; then
+    printf 'fake complete-mode benchmark run failed\n' >&2
+    return 1
+  fi
+  jq -e '
+    .status == "passed" and .acceptance_evidence == false and
+    (.bounded_path_cells | map(.cell)) == [
+      "getsockopt-stale", "unix-stale", "unix-timeout", "getsockopt-pressure"
+    ] and all(.bounded_path_cells[]; .status == "passed") and
+    .lookup_paths == {status: "available", path: "lookup-paths.json"} and
+    .native_jni_lookup == {status: "available", path: "native-jni/benchmark.json"} and
+    .docker_daemon == {status: "verified_local_unix_socket_endpoint_only", path: "docker-daemon.json"} and
+    .application_source == {status: "clean_and_stable", path: "application-source-identity.json"} and
+    .measurement_scope.pressure_map_occupancy_and_capacity_rejection ==
+      "bounded_correctness_observed_once"
+  ' "$output/summary.json" >/dev/null || {
+    printf 'complete fake run did not publish bounded evidence honestly\n' >&2
+    return 1
+  }
+  validate_lookup_path_summary_schema \
+    "$output/lookup-paths.json" "$fake_root" || return 1
+  validate_native_jni_benchmark_schema "$output/native-jni/benchmark.json" || return 1
+  validate_application_source_identity_schema \
+    "$output/application-source-identity.json" "$fake_root" || return 1
+  jq -e '.cells_mode == "complete" and (.cells | length) == 10 and
+    (.cells | map(.cell))[-4:] == [
+      "getsockopt-stale", "unix-stale", "unix-timeout", "getsockopt-pressure"
+    ]' "$output/application-source-identity.json" >/dev/null || return 1
+  jq -e '
+    (.paths | length) == 6 and
+    all(.paths[];
+      (.source_artifact | test("^cells/[^/]+/path-observation\\.json$")) and
+      (.link_base | test("^cells/[^/]+/$")) and
+      .observation.observation.mode == "bounded_correctness_observed_once") and
+    .native_lookup_benchmark.source_artifact == "native-jni/benchmark.json" and
+    .provenance == {
+      application_source_identity: "application-source-identity.json",
+      capture_scope: "single_harness_run_with_verified_unix_socket_and_per_sample_container_process_binding",
+      docker_daemon: "docker-daemon.json",
+      host_environment: "host-environment.txt"
+    } and
+    (.paths[] | select(.observation.cell == "getsockopt-pressure") |
+      .observation.pressure |
+      .map_id == 41 and .kernel_map_name == "java_remote_par" and
+      .occupancy_before_fill == 1 and .occupancy_pressured == 50000 and
+      .occupancy_traffic_complete == 49999 and
+      .occupancy_recovery_samples == [1, 1] and .occupancy_recovered == 1 and
+      .recovery_samples == 2 and .recovery_log_attempts == 2)
+  ' "$output/lookup-paths.json" >/dev/null || return 1
+  jq -e '.status == "clean_and_stable" and
+    .captures == {before: "source-state-before.json", after: "source-state-after.json"}' \
+    "$output/native-jni/source-state.json" >/dev/null || return 1
+  [[ "$(grep -Fc cleanup "$events")" == 10 &&
+    -f "$output/cells/getsockopt-hit/path-observation.json" &&
+    -f "$output/cells/unix-hit/path-observation.json" &&
+    ! -e "$agent_directory/INJECTED" ]] || return 1
+  ! grep -R -Fq -- 'CFLAGS=-DINJECTED' "$output/native-jni" &&
+    ! grep -R -Fq -- 'printf INJECTED' "$output/native-jni" &&
+    grep -Fq -- '-DOBI_JNI_TESTING' "$compiler_log" &&
+    ! grep -Eq '^(CPATH|C_INCLUDE_PATH|COMPILER_PATH|GCC_EXEC_PREFIX|LIBRARY_PATH|LD_LIBRARY_PATH|LD_PRELOAD)=' \
+      "$compiler_log" &&
+    ! grep -Eq '^(CPATH|C_INCLUDE_PATH|COMPILER_PATH|GCC_EXEC_PREFIX|LIBRARY_PATH|LD_LIBRARY_PATH|LD_PRELOAD)=' \
+      "$runtime_log" &&
+    ! grep -Fq -- INJECTED "$runtime_log" || {
+    printf 'complete fake run leaked hostile path or compiler environment input\n' >&2
+    return 1
+  }
+}
+
 main() {
   TEST_TMP_DIR="$(mktemp -d)"
   prepare_fake_ca
+  if [[ "${BENCHMARK_TEST_ONLY:-}" == "core-mode" ]]; then
+    test_main_uses_runner_cleanup_and_retains_core_artifacts
+    printf 'benchmark.sh core-mode test passed\n'
+    return 0
+  fi
+  if [[ "${BENCHMARK_TEST_ONLY:-}" == "complete-mode" ]]; then
+    test_complete_mode_fake_run_publishes_resolvable_bounded_evidence
+    printf 'benchmark.sh complete-mode test passed\n'
+    return 0
+  fi
+  if [[ "${BENCHMARK_TEST_ONLY:-}" == "council-repairs" ]]; then
+    test_docker_daemon_locality_is_verified_before_execution
+    test_manifest_bootstrap_survives_second_locality_query_failure
+    test_benchmark_documentation_binds_partial_status_to_mralias_issue
+    test_proc_snapshot_requires_container_starttime_and_cgroup_identity
+    test_pressure_recovery_evidence_parses_canonical_samples_and_log
+    test_application_source_identity_is_exact_across_core_and_complete_cells
+    test_application_source_identity_rejects_coordinated_manifest_forgery
+    test_variance_summary_records_ordered_per_cell_statistics
+    test_variance_summary_rejects_invalid_repetition_sets
+    test_predeclared_poc_gate_stays_partial_and_evaluates_supported_dimensions
+    printf 'benchmark.sh council repair tests passed\n'
+    return 0
+  fi
   test_parser_defaults_and_boundaries
   test_lifecycle_tool_paths_must_be_absolute_regular
   test_lifecycle_tool_resolution_rejects_relative_paths
   test_dependency_check_reports_only_invalid_lifecycle_tool
   test_dependency_check_reports_invalid_lifecycle_tool_under_errexit
+  test_docker_daemon_locality_is_verified_before_execution
+  test_manifest_bootstrap_survives_second_locality_query_failure
+  test_benchmark_documentation_binds_partial_status_to_mralias_issue
+  test_proc_snapshot_requires_container_starttime_and_cgroup_identity
+  test_make_compiler_resolution_honors_and_pins_inherited_cc
+  test_native_make_environment_and_staging_are_hermetic
+  test_native_source_state_rejects_dirty_and_mutating_inputs
   test_output_directory_is_absolute_fresh_private
   test_core_cell_mapping_is_exact
+  test_bounded_path_cell_mapping_is_exact
+  test_core_mode_does_not_publish_complete_only_path_observations
+  test_bounded_paths_are_correctness_observations_not_performance_samples
+  test_pressure_recovery_evidence_parses_canonical_samples_and_log
+  test_lookup_coverage_uses_observed_once_vocabulary
+  test_application_source_identity_is_exact_across_core_and_complete_cells
+  test_application_source_identity_rejects_coordinated_manifest_forgery
+  test_native_jni_benchmark_normalization_is_strict
+  test_complete_manifest_links_bounded_artifacts_and_scopes
   test_json_validators_require_one_document
   test_variance_summary_records_ordered_per_cell_statistics
   test_variance_summary_rejects_invalid_repetition_sets
+  test_resource_growth_observations_fail_closed
+  test_predeclared_poc_gate_stays_partial_and_evaluates_supported_dimensions
+  test_summary_resource_scope_is_independent_of_nonresource_failures
+  test_failed_complete_summary_reports_requested_artifact_state
   test_summary_marks_unavailable_variance_after_failure
   test_failed_summary_refuses_unremovable_variance
   test_on_exit_rewrites_failed_summary_after_passed_summary_error
@@ -3438,6 +6447,7 @@ main() {
   test_missing_runner_provenance_is_rejected
   test_benchmark_ca_rejects_untrusted_inputs
   test_main_uses_runner_cleanup_and_retains_core_artifacts
+  test_complete_mode_fake_run_publishes_resolvable_bounded_evidence
   printf 'benchmark.sh tests passed\n'
 }
 

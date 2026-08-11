@@ -28,6 +28,12 @@ var javaRemoteParentGenericDirectJSSEProgramNames = map[string]struct{}{
 	"obi_continue_protocol_http_tp":           {},
 	"obi_continue_protocol_http_tp_validate":  {},
 	"obi_handle_buf_with_args":                {},
+	"obi_java_control_cleanup_tail":           {},
+	"obi_java_lifecycle_tail":                 {},
+	"obi_java_task_capture_tail":              {},
+	"obi_java_task_link_tail":                 {},
+	"obi_java_task_relay_capture_tail":        {},
+	"obi_java_threads_tail":                   {},
 	"obi_kprobe_java_remote_parent_tcp_close": {},
 	"obi_kprobe_security_file_ioctl":          {},
 	"obi_kprobe_sys_ioctl":                    {},
@@ -36,13 +42,20 @@ var javaRemoteParentGenericDirectJSSEProgramNames = map[string]struct{}{
 }
 
 type javaRemoteParentGenericDirectJSSEFixture struct {
-	JumpTable *ebpf.Map `ebpf:"jump_table"`
+	JumpTable                            *ebpf.Map `ebpf:"jump_table"`
+	JavaRemoteParentControlTailReadiness *ebpf.Map `ebpf:"java_remote_parent_control_tail_readiness"`
 
 	ObiContinue2ProtocolHTTP           *ebpf.Program `ebpf:"obi_continue2_protocol_http"`
 	ObiContinueProtocolHTTP            *ebpf.Program `ebpf:"obi_continue_protocol_http"`
 	ObiContinueProtocolHTTPTraceparent *ebpf.Program `ebpf:"obi_continue_protocol_http_tp"`
 	ObiContinueProtocolHTTPValidate    *ebpf.Program `ebpf:"obi_continue_protocol_http_tp_validate"`
 	ObiHandleBufWithArgs               *ebpf.Program `ebpf:"obi_handle_buf_with_args"`
+	ObiJavaControlCleanupTail          *ebpf.Program `ebpf:"obi_java_control_cleanup_tail"`
+	ObiJavaLifecycleTail               *ebpf.Program `ebpf:"obi_java_lifecycle_tail"`
+	ObiJavaTaskCaptureTail             *ebpf.Program `ebpf:"obi_java_task_capture_tail"`
+	ObiJavaTaskLinkTail                *ebpf.Program `ebpf:"obi_java_task_link_tail"`
+	ObiJavaTaskRelayCaptureTail        *ebpf.Program `ebpf:"obi_java_task_relay_capture_tail"`
+	ObiJavaThreadsTail                 *ebpf.Program `ebpf:"obi_java_threads_tail"`
 	ObiJavaRemoteParentTCPClose        *ebpf.Program `ebpf:"obi_kprobe_java_remote_parent_tcp_close"`
 	ObiSecurityFileIoctl               *ebpf.Program `ebpf:"obi_kprobe_security_file_ioctl"`
 	ObiSysIoctl                        *ebpf.Program `ebpf:"obi_kprobe_sys_ioctl"`
@@ -134,6 +147,12 @@ func (f *javaRemoteParentGenericDirectJSSEFixture) populateTailCalls(t *testing.
 		{slot: 5, program: f.ObiHandleBufWithArgs},
 		{slot: 13, program: f.ObiLargeBufEmitContinue},
 		{slot: 14, program: f.ObiContinueProtocolHTTPValidate},
+		{slot: 15, program: f.ObiJavaTaskCaptureTail},
+		{slot: 16, program: f.ObiJavaTaskRelayCaptureTail},
+		{slot: 17, program: f.ObiJavaTaskLinkTail},
+		{slot: 18, program: f.ObiJavaControlCleanupTail},
+		{slot: 19, program: f.ObiJavaThreadsTail},
+		{slot: 20, program: f.ObiJavaLifecycleTail},
 	} {
 		require.NotNil(t, entry.program)
 		require.NoError(t, f.JumpTable.Update(
@@ -142,6 +161,9 @@ func (f *javaRemoteParentGenericDirectJSSEFixture) populateTailCalls(t *testing.
 			ebpf.UpdateAny,
 		))
 	}
+	setJavaRemoteParentGenericDirectJSSEControlTailReadiness(
+		t, f.JavaRemoteParentControlTailReadiness, true,
+	)
 }
 
 func (f *javaRemoteParentGenericDirectJSSEFixture) attach(
@@ -181,6 +203,16 @@ func (f *javaRemoteParentGenericDirectJSSEFixture) close(readiness *ebpf.Map) er
 			closeErrors = append(closeErrors, fmt.Errorf("disabled Java data-hook readiness is %d", observed))
 		}
 	}
+	if err := f.JavaRemoteParentControlTailReadiness.Update(&key, &state, ebpf.UpdateAny); err != nil {
+		closeErrors = append(closeErrors, fmt.Errorf("disable Java control-tail readiness: %w", err))
+	} else {
+		var observed uint32
+		if err := f.JavaRemoteParentControlTailReadiness.Lookup(&key, &observed); err != nil {
+			closeErrors = append(closeErrors, fmt.Errorf("read disabled Java control-tail readiness: %w", err))
+		} else if observed != 0 {
+			closeErrors = append(closeErrors, fmt.Errorf("disabled Java control-tail readiness is %d", observed))
+		}
+	}
 
 	for index := len(f.links) - 1; index >= 0; index-- {
 		if err := f.links[index].Close(); err != nil {
@@ -201,11 +233,18 @@ func (f *javaRemoteParentGenericDirectJSSEFixture) closeObjects() error {
 		closer io.Closer
 	}{
 		{name: "jump_table", closer: f.JumpTable},
+		{name: "java_remote_parent_control_tail_readiness", closer: f.JavaRemoteParentControlTailReadiness},
 		{name: "obi_continue2_protocol_http", closer: f.ObiContinue2ProtocolHTTP},
 		{name: "obi_continue_protocol_http", closer: f.ObiContinueProtocolHTTP},
 		{name: "obi_continue_protocol_http_tp", closer: f.ObiContinueProtocolHTTPTraceparent},
 		{name: "obi_continue_protocol_http_tp_validate", closer: f.ObiContinueProtocolHTTPValidate},
 		{name: "obi_handle_buf_with_args", closer: f.ObiHandleBufWithArgs},
+		{name: "obi_java_control_cleanup_tail", closer: f.ObiJavaControlCleanupTail},
+		{name: "obi_java_lifecycle_tail", closer: f.ObiJavaLifecycleTail},
+		{name: "obi_java_task_capture_tail", closer: f.ObiJavaTaskCaptureTail},
+		{name: "obi_java_task_link_tail", closer: f.ObiJavaTaskLinkTail},
+		{name: "obi_java_task_relay_capture_tail", closer: f.ObiJavaTaskRelayCaptureTail},
+		{name: "obi_java_threads_tail", closer: f.ObiJavaThreadsTail},
 		{name: "obi_kprobe_java_remote_parent_tcp_close", closer: f.ObiJavaRemoteParentTCPClose},
 		{name: "obi_kprobe_security_file_ioctl", closer: f.ObiSecurityFileIoctl},
 		{name: "obi_kprobe_sys_ioctl", closer: f.ObiSysIoctl},
@@ -220,6 +259,22 @@ func (f *javaRemoteParentGenericDirectJSSEFixture) closeObjects() error {
 		}
 	}
 	return errors.Join(closeErrors...)
+}
+
+func setJavaRemoteParentGenericDirectJSSEControlTailReadiness(
+	t *testing.T,
+	readiness *ebpf.Map,
+	ready bool,
+) {
+	t.Helper()
+
+	key := uint32(0)
+	state := uint32(0)
+	if ready {
+		state = 1
+	}
+	require.NoError(t, readiness.Update(&key, &state, ebpf.UpdateAny))
+	assertJavaRemoteParentGenericDirectJSSEReadiness(t, readiness, state)
 }
 
 func javaRemoteParentGenericDirectJSSEMapReplacements(

@@ -53,6 +53,10 @@ final class BootstrapBridgeAccess implements BridgeAccess {
     this.bridgeClassResolver = bridgeClassResolver;
   }
 
+  void initializeDiagnosticsLogger() {
+    findBridge(false);
+  }
+
   @Override
   public BridgeResult takeRemoteParent() {
     ReflectiveAccess current = access;
@@ -78,11 +82,16 @@ final class BootstrapBridgeAccess implements BridgeAccess {
   }
 
   private ReflectiveAccess findBridge() {
+    return findBridge(true);
+  }
+
+  private ReflectiveAccess findBridge(boolean recordFailure) {
     long failureCount = 0L;
     int failureCounter = -1;
     String failureReason = null;
     Level failureLevel = null;
     ReflectiveAccess found = null;
+    Thread currentThread = Thread.currentThread();
     long now = System.nanoTime();
     String availability = bridgeAvailability();
     NegativeLookup currentNegative = negativeLookup;
@@ -93,8 +102,7 @@ final class BootstrapBridgeAccess implements BridgeAccess {
       if (access != null) {
         return access;
       }
-      Thread currentThread = Thread.currentThread();
-      if (lookupOwner == currentThread) {
+      if (lookupOwner != null) {
         return null;
       }
       now = System.nanoTime();
@@ -119,6 +127,7 @@ final class BootstrapBridgeAccess implements BridgeAccess {
           Method discard = bridge.getMethod("discardRemoteParent", int.class);
           Method extractionFailure = bridge.getMethod("recordExtractionFailure", int.class);
           Method extensionEvent = bridge.getMethod("recordExtensionEvent", int.class, long.class);
+          Method initializeDiagnosticsLogger = diagnosticsLoggerInitializer(bridge);
           Class<?> record = take.getReturnType();
           found =
               new ReflectiveAccess(
@@ -126,6 +135,7 @@ final class BootstrapBridgeAccess implements BridgeAccess {
                   discard,
                   extractionFailure,
                   extensionEvent,
+                  initializeDiagnosticsLogger,
                   record.getMethod("getAbiVersion"),
                   record.getMethod("getStatus"),
                   record.getMethod("getTraceFlags"),
@@ -140,25 +150,37 @@ final class BootstrapBridgeAccess implements BridgeAccess {
         failureCounter = LOCAL_LOOKUP_ERROR;
         failureReason = "bridge_lookup_error";
         failureLevel = Level.WARNING;
-      } finally {
-        lookupOwner = null;
       }
-      if (found != null) {
-        access = found;
-      } else {
-        failureCount = incrementLocalCounter(failureCounter);
-        nextLookupNanos = retryAt;
-        negativeLookup = new NegativeLookup(availability, retryAt);
+      if (found == null) {
+        lookupOwner = null;
+        if (recordFailure) {
+          failureCount = incrementLocalCounter(failureCounter);
+          nextLookupNanos = retryAt;
+          negativeLookup = new NegativeLookup(availability, retryAt);
+        }
       }
     }
     if (found != null) {
-      found.recordExtensionEvent(EVENT_EXTENSION_REGISTERED, 1L);
-      found.recordExtensionEvent(EVENT_LOOKUP_READY, 1L);
-      diagnosticAccess = found;
-      flushLocalCounters(found);
-      return found;
+      try {
+        found.initializeDiagnosticsLogger();
+        found.recordExtensionEvent(EVENT_EXTENSION_REGISTERED, 1L);
+        found.recordExtensionEvent(EVENT_LOOKUP_READY, 1L);
+        diagnosticAccess = found;
+        flushLocalCounters(found);
+      } finally {
+        synchronized (this) {
+          // Keep arbitrary JUL handlers outside the lookup monitor, but do
+          // not expose the bridge until post-agent warm-up and lifecycle
+          // publication have returned.
+          if (lookupOwner == currentThread) {
+            access = found;
+            lookupOwner = null;
+          }
+        }
+      }
+      return access;
     }
-    if (!flushLocalCountersIfReady()) {
+    if (recordFailure && !flushLocalCountersIfReady()) {
       logLocalFailure(failureReason, failureLevel, failureCount);
     }
     return null;
@@ -212,6 +234,14 @@ final class BootstrapBridgeAccess implements BridgeAccess {
   private static String bridgeAvailability() {
     try {
       return System.getProperty(BRIDGE_AVAILABILITY_PROPERTY);
+    } catch (Throwable ignored) {
+      return null;
+    }
+  }
+
+  private static Method diagnosticsLoggerInitializer(Class<?> bridge) {
+    try {
+      return bridge.getMethod("initializeDiagnosticsLogger");
     } catch (Throwable ignored) {
       return null;
     }
@@ -275,6 +305,7 @@ final class BootstrapBridgeAccess implements BridgeAccess {
     private final Method discard;
     private final Method extractionFailure;
     private final Method extensionEvent;
+    private final Method initializeDiagnosticsLogger;
     private final Method abiVersion;
     private final Method status;
     private final Method traceFlags;
@@ -286,6 +317,7 @@ final class BootstrapBridgeAccess implements BridgeAccess {
         Method discard,
         Method extractionFailure,
         Method extensionEvent,
+        Method initializeDiagnosticsLogger,
         Method abiVersion,
         Method status,
         Method traceFlags,
@@ -295,11 +327,22 @@ final class BootstrapBridgeAccess implements BridgeAccess {
       this.discard = discard;
       this.extractionFailure = extractionFailure;
       this.extensionEvent = extensionEvent;
+      this.initializeDiagnosticsLogger = initializeDiagnosticsLogger;
       this.abiVersion = abiVersion;
       this.status = status;
       this.traceFlags = traceFlags;
       this.traceId = traceId;
       this.parentSpanId = parentSpanId;
+    }
+
+    private void initializeDiagnosticsLogger() {
+      if (initializeDiagnosticsLogger == null) {
+        return;
+      }
+      try {
+        initializeDiagnosticsLogger.invoke(null);
+      } catch (Throwable ignored) {
+      }
     }
 
     private BridgeResult takeRemoteParent() {

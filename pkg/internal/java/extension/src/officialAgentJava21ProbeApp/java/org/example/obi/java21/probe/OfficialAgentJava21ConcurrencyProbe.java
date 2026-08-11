@@ -114,6 +114,7 @@ public final class OfficialAgentJava21ConcurrencyProbe {
       installVirtualThreadReflection();
       // Force official-agent autoconfiguration before worker baselines are captured.
       GlobalOpenTelemetry.get().getPropagators().getTextMapPropagator();
+      initializeOpenTelemetryApplicationPath();
       DeterministicVirtualScheduler scheduler = new DeterministicVirtualScheduler(CARRIERS);
       DeterministicPlatformExecutor platform = new DeterministicPlatformExecutor(PLATFORM_WORKERS);
       try {
@@ -154,6 +155,10 @@ public final class OfficialAgentJava21ConcurrencyProbe {
         require(scheduler.failure() == null, "virtual scheduler failed: " + scheduler.failure());
         require(platform.failure() == null, "platform executor failed: " + platform.failure());
 
+        Class<?> bridge =
+            Class.forName("io.opentelemetry.obi.java.bridge.RemoteParentBridge", true, null);
+        String diagnostics = (String) bridge.getMethod("diagnosticsSnapshot").invoke(null);
+        System.out.println("OBI_JAVA21_DIAGNOSTICS\t" + diagnostics);
         System.out.println(
             "OBI_JAVA21_PROBE\tpassed\tvirtual=34\tplatform=10\tcaptures=24\tlinks=24"
                 + "\trelays=4\tcarriers=4\tworkers=4");
@@ -171,6 +176,17 @@ public final class OfficialAgentJava21ConcurrencyProbe {
         fixture.close();
       }
     }
+  }
+
+  private static void initializeOpenTelemetryApplicationPath() {
+    require(Context.root() != null, "OpenTelemetry root context was unavailable");
+    Span span =
+        GlobalOpenTelemetry.getTracer("io.opentelemetry.obi.java21-concurrency-probe")
+            .spanBuilder("probe-initialization")
+            .setParent(Context.root())
+            .setSpanKind(SpanKind.INTERNAL)
+            .startSpan();
+    span.end();
   }
 
   private static void initializeConcurrentEventMaps() {
@@ -2193,13 +2209,15 @@ public final class OfficialAgentJava21ConcurrencyProbe {
     }
 
     @Override
-    public synchronized void close() throws InterruptedException {
-      if (closed) {
-        return;
-      }
-      closed = true;
-      for (BlockingQueue<SchedulerItem> queue : queues) {
-        queue.add(STOP);
+    public void close() throws InterruptedException {
+      synchronized (this) {
+        if (closed) {
+          return;
+        }
+        closed = true;
+        for (BlockingQueue<SchedulerItem> queue : queues) {
+          queue.add(STOP);
+        }
       }
       for (Thread worker : workers) {
         worker.join(TimeUnit.SECONDS.toMillis(5L));
@@ -2352,13 +2370,15 @@ public final class OfficialAgentJava21ConcurrencyProbe {
     }
 
     @Override
-    public synchronized void close() throws InterruptedException {
-      if (closed) {
-        return;
-      }
-      closed = true;
-      for (BlockingQueue<PlatformItem> queue : queues) {
-        queue.add(STOP);
+    public void close() throws InterruptedException {
+      synchronized (this) {
+        if (closed) {
+          return;
+        }
+        closed = true;
+        for (BlockingQueue<PlatformItem> queue : queues) {
+          queue.add(STOP);
+        }
       }
       for (Thread worker : workers) {
         worker.join(TimeUnit.SECONDS.toMillis(5L));

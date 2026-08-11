@@ -35,6 +35,8 @@ import org.junit.jupiter.api.Test;
 class OfficialAgentJava21ConcurrencyRuntimeTest {
   private static final String INVALID_TRACE = "00000000000000000000000000000000";
   private static final String INVALID_SPAN = "0000000000000000";
+  private static final String DIAGNOSTICS_LOGGER_INITIALIZED =
+      "OBI remote-parent diagnostics logger initialized";
   private static final String SUCCESS_MARKER =
       "OBI_JAVA21_PROBE\tpassed\tvirtual=34\tplatform=10\tcaptures=24\tlinks=24"
           + "\trelays=4\tcarriers=4\tworkers=4";
@@ -88,7 +90,18 @@ class OfficialAgentJava21ConcurrencyRuntimeTest {
         probeExtension,
         probeClasspath,
         distribution,
-        version);
+        version,
+        null);
+    runProbe(
+        officialAgent,
+        expectedSha256,
+        helper,
+        extension,
+        probeExtension,
+        probeClasspath,
+        distribution,
+        version,
+        "WARNING");
     assertEquals(expectedSha256, sha256(officialAgent.toPath()));
   }
 
@@ -100,14 +113,29 @@ class OfficialAgentJava21ConcurrencyRuntimeTest {
       File probeExtension,
       String probeClasspath,
       String distribution,
-      String version)
+      String version,
+      String diagnosticsLogLevel)
       throws Exception {
     Path directory = Files.createTempDirectory("obi-official-agent-java21-");
     Path result = directory.resolve("spans.tsv");
+    Path loggingConfiguration = directory.resolve("logging.properties");
     try {
       List<String> command = new ArrayList<>();
       command.add(new File(System.getProperty("java.home"), "bin/java").getAbsolutePath());
       command.add("--add-opens=java.base/java.lang=ALL-UNNAMED");
+      if (diagnosticsLogLevel != null) {
+        Files.write(
+            loggingConfiguration,
+            java.util.Arrays.asList(
+                "handlers=java.util.logging.ConsoleHandler",
+                ".level=INFO",
+                "java.util.logging.ConsoleHandler.level=ALL",
+                "java.util.logging.ConsoleHandler.formatter=java.util.logging.SimpleFormatter",
+                "io.opentelemetry.obi.java.bridge.RemoteParentDiagnostics.level="
+                    + diagnosticsLogLevel),
+            StandardCharsets.UTF_8);
+        command.add("-Djava.util.logging.config.file=" + loggingConfiguration);
+      }
       command.add("-javaagent:" + helper.getAbsolutePath() + "=remoteParentTransport=disabled");
       command.add("-javaagent:" + officialAgent.getAbsolutePath());
       command.add(
@@ -153,12 +181,21 @@ class OfficialAgentJava21ConcurrencyRuntimeTest {
       }
     } finally {
       Files.deleteIfExists(result);
+      Files.deleteIfExists(loggingConfiguration);
       Files.deleteIfExists(directory);
     }
   }
 
   private static void assertOutput(String output, String distribution, String version) {
-    assertEquals(1, count(outputLines(output), SUCCESS_MARKER), output);
+    List<String> lines = outputLines(output);
+    assertEquals(1, count(lines, SUCCESS_MARKER), output);
+    List<String> loggerInitialization = containing(lines, DIAGNOSTICS_LOGGER_INITIALIZED);
+    assertEquals(1, loggerInitialization.size(), output);
+    int initialization = lines.indexOf(loggerInitialization.get(0));
+    int firstBaseline = firstIndexWithPrefix(lines, "OBI_JAVA21_BASELINE\t");
+    int firstWave = lines.indexOf("OBI_JAVA21_WAVE\t1\tSTART");
+    assertTrue(
+        initialization >= 0 && initialization < firstBaseline && firstBaseline < firstWave, output);
     assertTrue(output.contains("OBI remote-parent compatibility"), output);
     assertTrue(output.contains(distribution), output);
     assertTrue(output.contains(version), output);
@@ -169,7 +206,17 @@ class OfficialAgentJava21ConcurrencyRuntimeTest {
   }
 
   private static void assertResult(List<String> lines, String output) {
-    ProbeRecords probe = ProbeRecords.parse(outputLines(output));
+    List<String> outputLines = outputLines(output);
+    ProbeRecords probe = ProbeRecords.parse(outputLines);
+    Map<String, Long> diagnostics = diagnostics(outputLines);
+    assertEquals(20L, counter(diagnostics, "t_valid"), output);
+    assertEquals(40L, counter(diagnostics, "t_missing"), output);
+    assertEquals(10L, counter(diagnostics, "take_sampled"), output);
+    assertEquals(10L, counter(diagnostics, "take_unsampled"), output);
+    assertEquals(0L, counter(diagnostics, "framework_depth"), output);
+    assertEquals(0L, counter(diagnostics, "framework_cycle"), output);
+    assertEquals(20L, counter(diagnostics, "framework_late"), output);
+    assertEquals(20L, counter(diagnostics, "transport_missing"), output);
     assertEquals(1, count(lines, "EXTENSION\tready"), lines.toString());
     assertEquals(1, count(lines, "PROVIDER\tready\tbootstrap"), lines.toString());
     assertEquals(1, count(lines, "WRAP\tobi\t1"), lines.toString());
@@ -208,39 +255,25 @@ class OfficialAgentJava21ConcurrencyRuntimeTest {
       assertEquals(first.sampled, second.sampled, passLines.toString());
 
       List<String> providerLines = prefix(lines, "PROVIDER\tTAKE\t" + id + "\t1\t");
-      assertEquals(firstWave ? 1 : 2, providerLines.size(), lines.toString());
-      ProviderResult firstProvider = ProviderResult.parse(providerLines.get(0));
-      assertEquals(1, firstProvider.pass, providerLines.toString());
-      assertEquals(firstWave ? "VALID" : "MISSING", firstProvider.status, providerLines.toString());
-      if (!firstWave) {
-        ProviderResult secondProvider = ProviderResult.parse(providerLines.get(1));
-        assertEquals(2, secondProvider.pass, providerLines.toString());
-        assertEquals("MISSING", secondProvider.status, providerLines.toString());
-      }
+      assertEquals(1, providerLines.size(), lines.toString());
+      ProviderResult providerResult = ProviderResult.parse(providerLines.get(0));
+      assertEquals(firstWave ? 1 : 2, providerResult.pass, providerLines.toString());
+      assertEquals(
+          firstWave ? "VALID" : "MISSING", providerResult.status, providerLines.toString());
 
       List<String> authorityLines = prefix(lines, "AUTH\tJAVA21\tTAKE\t" + id + "\t1\t");
-      assertEquals(firstWave ? 1 : 2, authorityLines.size(), lines.toString());
-      AuthorityResult firstAuthority = AuthorityResult.parse(authorityLines.get(0));
-      assertEquals(1, firstAuthority.pass, authorityLines.toString());
-      assertTrue(firstAuthority.javaThreadId > 0L, authorityLines.toString());
-      assertTrue(firstAuthority.nativeThreadId > 0L, authorityLines.toString());
-      if (!firstWave) {
-        AuthorityResult secondAuthority = AuthorityResult.parse(authorityLines.get(1));
-        assertEquals(2, secondAuthority.pass, authorityLines.toString());
-        assertEquals(
-            firstAuthority.javaThreadId, secondAuthority.javaThreadId, authorityLines.toString());
-        assertEquals(
-            firstAuthority.nativeThreadId,
-            secondAuthority.nativeThreadId,
-            authorityLines.toString());
-      }
+      assertEquals(1, authorityLines.size(), lines.toString());
+      AuthorityResult lookupAuthority = AuthorityResult.parse(authorityLines.get(0));
+      assertEquals(firstWave ? 1 : 2, lookupAuthority.pass, authorityLines.toString());
+      assertTrue(lookupAuthority.javaThreadId > 0L, authorityLines.toString());
+      assertTrue(lookupAuthority.nativeThreadId > 0L, authorityLines.toString());
 
       String spanStart = only(lines, "THREAD\tSPAN_START\t" + id + "\t");
       long spanStartThread = Long.parseLong(spanStart.split("\\t", -1)[3]);
-      assertEquals(firstAuthority.javaThreadId, spanStartThread, lines.toString());
+      assertEquals(lookupAuthority.javaThreadId, spanStartThread, lines.toString());
 
       SpanResult span = required(spans, id);
-      probe.assertOwner(id, firstAuthority, span);
+      probe.assertOwner(id, lookupAuthority, span);
       assertEquals("io.opentelemetry.obi.java21-concurrency-probe", span.scope, span.line);
       assertEquals("-", span.route, span.line);
       assertTrue(span.spanSampled, span.line);
@@ -258,17 +291,17 @@ class OfficialAgentJava21ConcurrencyRuntimeTest {
         assertEquals(expectedParent, first.spanId, passLines.toString());
         assertTrue(first.remote, passLines.toString());
         assertEquals(expectedSampled, first.sampled, passLines.toString());
-        assertEquals(2, firstAuthority.source, authorityLines.toString());
-        assertFalse(firstAuthority.direct, authorityLines.toString());
-        assertTrue(firstAuthority.lifecycleActive, authorityLines.toString());
-        assertNotEquals(0, firstAuthority.lifecycleIdentity, authorityLines.toString());
+        assertEquals(2, lookupAuthority.source, authorityLines.toString());
+        assertFalse(lookupAuthority.direct, authorityLines.toString());
+        assertTrue(lookupAuthority.lifecycleActive, authorityLines.toString());
+        assertNotEquals(0, lookupAuthority.lifecycleIdentity, authorityLines.toString());
         assertTrue(
-            lifecycleIdentities.add(firstAuthority.lifecycleIdentity),
-            "duplicate lifecycle identity " + firstAuthority.lifecycleIdentity);
+            lifecycleIdentities.add(lookupAuthority.lifecycleIdentity),
+            "duplicate lifecycle identity " + lookupAuthority.lifecycleIdentity);
         assertEquals(
-            200 + ordinal(id), firstAuthority.socketFileDescriptor, authorityLines.toString());
-        assertTrue(firstAuthority.exact, authorityLines.toString());
-        assertTrue(firstAuthority.socketContextPresent, authorityLines.toString());
+            200 + ordinal(id), lookupAuthority.socketFileDescriptor, authorityLines.toString());
+        assertTrue(lookupAuthority.exact, authorityLines.toString());
+        assertTrue(lookupAuthority.socketContextPresent, authorityLines.toString());
         assertEquals(expectedTrace, span.traceId, span.line);
         assertEquals(expectedParent, span.parentSpanId, span.line);
         assertTrue(span.parentRemote, span.line);
@@ -282,21 +315,13 @@ class OfficialAgentJava21ConcurrencyRuntimeTest {
         assertEquals(INVALID_SPAN, first.spanId, passLines.toString());
         assertFalse(first.remote, passLines.toString());
         assertFalse(first.sampled, passLines.toString());
-        assertEquals(3, firstAuthority.source, authorityLines.toString());
-        assertFalse(firstAuthority.direct, authorityLines.toString());
-        assertFalse(firstAuthority.lifecycleActive, authorityLines.toString());
-        assertEquals(0, firstAuthority.lifecycleIdentity, authorityLines.toString());
-        assertEquals(-1, firstAuthority.socketFileDescriptor, authorityLines.toString());
-        assertFalse(firstAuthority.exact, authorityLines.toString());
-        assertFalse(firstAuthority.socketContextPresent, authorityLines.toString());
-        AuthorityResult secondAuthority = AuthorityResult.parse(authorityLines.get(1));
-        assertEquals(3, secondAuthority.source, authorityLines.toString());
-        assertFalse(secondAuthority.direct, authorityLines.toString());
-        assertFalse(secondAuthority.lifecycleActive, authorityLines.toString());
-        assertEquals(0, secondAuthority.lifecycleIdentity, authorityLines.toString());
-        assertEquals(-1, secondAuthority.socketFileDescriptor, authorityLines.toString());
-        assertFalse(secondAuthority.exact, authorityLines.toString());
-        assertFalse(secondAuthority.socketContextPresent, authorityLines.toString());
+        assertEquals(3, lookupAuthority.source, authorityLines.toString());
+        assertFalse(lookupAuthority.direct, authorityLines.toString());
+        assertFalse(lookupAuthority.lifecycleActive, authorityLines.toString());
+        assertEquals(0, lookupAuthority.lifecycleIdentity, authorityLines.toString());
+        assertEquals(-1, lookupAuthority.socketFileDescriptor, authorityLines.toString());
+        assertFalse(lookupAuthority.exact, authorityLines.toString());
+        assertFalse(lookupAuthority.socketContextPresent, authorityLines.toString());
         assertEquals(INVALID_SPAN, span.parentSpanId, span.line);
         assertFalse(span.parentRemote, span.line);
         assertFalse(span.parentSampled, span.line);
@@ -331,10 +356,7 @@ class OfficialAgentJava21ConcurrencyRuntimeTest {
     for (String id : expectedIds) {
       expectedPasses.add(id + "/1");
       expectedPasses.add(id + "/2");
-      expectedProviderPasses.add(id + "/1");
-      if (id.startsWith("W2")) {
-        expectedProviderPasses.add(id + "/2");
-      }
+      expectedProviderPasses.add(id + (id.startsWith("W1") ? "/1" : "/2"));
     }
 
     Set<String> calls = new HashSet<>();
@@ -484,6 +506,26 @@ class OfficialAgentJava21ConcurrencyRuntimeTest {
     return lines;
   }
 
+  private static Map<String, Long> diagnostics(List<String> outputLines) {
+    String marker = "OBI_JAVA21_DIAGNOSTICS\t";
+    String line = only(outputLines, marker);
+    Map<String, Long> result = new HashMap<>();
+    for (String field : line.substring(marker.length()).split(",")) {
+      int separator = field.indexOf('=');
+      assertTrue(separator > 0 && separator < field.length() - 1, line);
+      String name = field.substring(0, separator);
+      assertFalse(result.containsKey(name), "duplicate diagnostics field " + name);
+      result.put(name, Long.parseLong(field.substring(separator + 1), Character.MAX_RADIX));
+    }
+    return result;
+  }
+
+  private static long counter(Map<String, Long> diagnostics, String name) {
+    Long value = diagnostics.get(name);
+    assertTrue(value != null, "missing diagnostics counter " + name);
+    return value;
+  }
+
   private static List<String> prefix(List<String> lines, String prefix) {
     List<String> matches = new ArrayList<>();
     for (String line : lines) {
@@ -492,6 +534,25 @@ class OfficialAgentJava21ConcurrencyRuntimeTest {
       }
     }
     return matches;
+  }
+
+  private static List<String> containing(List<String> lines, String value) {
+    List<String> matches = new ArrayList<>();
+    for (String line : lines) {
+      if (line.contains(value)) {
+        matches.add(line);
+      }
+    }
+    return matches;
+  }
+
+  private static int firstIndexWithPrefix(List<String> lines, String prefix) {
+    for (int index = 0; index < lines.size(); index++) {
+      if (lines.get(index).startsWith(prefix)) {
+        return index;
+      }
+    }
+    return -1;
   }
 
   private static String only(List<String> lines, String prefix) {
@@ -530,8 +591,12 @@ class OfficialAgentJava21ConcurrencyRuntimeTest {
     AtomicReference<Throwable> readerFailure = new AtomicReference<>();
     Thread reader = copyOutput(process.getInputStream(), output, readerFailure);
     boolean completed;
+    String timeoutThreadDump = "";
     try {
       completed = process.waitFor(timeoutSeconds, TimeUnit.SECONDS);
+      if (!completed && process.isAlive()) {
+        timeoutThreadDump = captureThreadDump(process);
+      }
     } finally {
       if (process.isAlive()) {
         process.destroy();
@@ -542,7 +607,7 @@ class OfficialAgentJava21ConcurrencyRuntimeTest {
       }
       reader.join(TimeUnit.SECONDS.toMillis(5));
     }
-    String text = new String(output.toByteArray(), StandardCharsets.UTF_8);
+    String text = new String(output.toByteArray(), StandardCharsets.UTF_8) + timeoutThreadDump;
     assertFalse(reader.isAlive(), name + " output reader did not finish\n" + text);
     Throwable readFailure = readerFailure.get();
     if (readFailure != null) {
@@ -552,6 +617,45 @@ class OfficialAgentJava21ConcurrencyRuntimeTest {
     assertFalse(process.isAlive(), name + " did not terminate\n" + text);
     assertEquals(0, process.exitValue(), text);
     return text;
+  }
+
+  private static String captureThreadDump(Process target) {
+    ByteArrayOutputStream output = new ByteArrayOutputStream();
+    AtomicReference<Throwable> readerFailure = new AtomicReference<>();
+    Process dumpProcess = null;
+    Thread reader = null;
+    try {
+      long pid = ((Number) Process.class.getMethod("pid").invoke(target)).longValue();
+      File jcmd = new File(System.getProperty("java.home"), "bin/jcmd");
+      dumpProcess =
+          new ProcessBuilder(jcmd.getAbsolutePath(), Long.toString(pid), "Thread.print", "-l")
+              .redirectErrorStream(true)
+              .start();
+      reader = copyOutput(dumpProcess.getInputStream(), output, readerFailure);
+      if (!dumpProcess.waitFor(10, TimeUnit.SECONDS)) {
+        dumpProcess.destroyForcibly();
+        dumpProcess.waitFor(2, TimeUnit.SECONDS);
+      }
+      reader.join(TimeUnit.SECONDS.toMillis(2));
+      Throwable failure = readerFailure.get();
+      if (failure != null) {
+        throw failure;
+      }
+      return "\nOBI_TEST_THREAD_DUMP\n" + new String(output.toByteArray(), StandardCharsets.UTF_8);
+    } catch (Throwable failure) {
+      return "\nOBI_TEST_THREAD_DUMP_UNAVAILABLE " + failure.getClass().getName() + "\n";
+    } finally {
+      if (dumpProcess != null && dumpProcess.isAlive()) {
+        dumpProcess.destroyForcibly();
+      }
+      if (reader != null && reader.isAlive()) {
+        try {
+          reader.join(TimeUnit.SECONDS.toMillis(2));
+        } catch (InterruptedException interrupted) {
+          Thread.currentThread().interrupt();
+        }
+      }
+    }
   }
 
   private static Thread copyOutput(
@@ -681,6 +785,8 @@ class OfficialAgentJava21ConcurrencyRuntimeTest {
         } else if ("OBI_JAVA21_PROBE".equals(fields[0])) {
           assertEquals(SUCCESS_MARKER, line);
           finalMarkers++;
+        } else if ("OBI_JAVA21_DIAGNOSTICS".equals(fields[0])) {
+          assertEquals(2, fields.length, line);
         } else {
           throw new AssertionError("unknown Java 21 probe record " + line);
         }

@@ -6,6 +6,8 @@
 package io.opentelemetry.obi.java.bridge;
 
 import java.util.concurrent.atomic.AtomicLongArray;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
 import java.util.logging.Logger;
 
 /** Fixed-size, bootstrap-safe diagnostics for the remote-parent handoff. */
@@ -47,9 +49,15 @@ public final class RemoteParentDiagnostics {
   private static final int FRAMEWORK_LATE = FRAMEWORK_CYCLE + 1;
   private static final int TRANSPORT_MISSING = FRAMEWORK_LATE + 1;
   private static final int COUNTER_COUNT = TRANSPORT_MISSING + 1;
+  private static final int LOGGER_UNINITIALIZED = 0;
+  private static final int LOGGER_INITIALIZING = 1;
+  private static final int LOGGER_INITIALIZED = 2;
   static final long MAX_COUNTER_VALUE = 999_999_999L;
   private static final AtomicLongArray counters = new AtomicLongArray(COUNTER_COUNT);
   private static final Logger logger = Logger.getLogger(RemoteParentDiagnostics.class.getName());
+  private static final Object loggerInitializationLock = new Object();
+  private static volatile boolean loggerInitializationRequested;
+  private static volatile int loggerInitializationState = LOGGER_UNINITIALIZED;
   private static final String[] STATUS_NAMES = {
     "unknown",
     "valid",
@@ -68,6 +76,38 @@ public final class RemoteParentDiagnostics {
   };
 
   private RemoteParentDiagnostics() {}
+
+  static void initializeLogger() {
+    loggerInitializationRequested = true;
+    initializeLoggerIfRequested();
+  }
+
+  private static void initializeLoggerIfRequested() {
+    if (!loggerInitializationRequested || loggerInitializationState != LOGGER_UNINITIALIZED) {
+      return;
+    }
+    Level initializationLevel;
+    synchronized (loggerInitializationLock) {
+      if (!loggerInitializationRequested || loggerInitializationState != LOGGER_UNINITIALIZED) {
+        return;
+      }
+      if (logger.isLoggable(Level.INFO)) {
+        initializationLevel = Level.INFO;
+      } else if (logger.isLoggable(Level.WARNING)) {
+        initializationLevel = Level.WARNING;
+      } else {
+        return;
+      }
+      loggerInitializationState = LOGGER_INITIALIZING;
+    }
+    try {
+      logger.log(
+          new LogRecord(initializationLevel, "OBI remote-parent diagnostics logger initialized"));
+    } catch (Throwable ignored) {
+    } finally {
+      loggerInitializationState = LOGGER_INITIALIZED;
+    }
+  }
 
   static void configuration(boolean enabled) {
     increment(enabled ? CONFIG_ENABLED : CONFIG_DISABLED, null);
@@ -253,6 +293,8 @@ public final class RemoteParentDiagnostics {
     for (int index = 0; index < COUNTER_COUNT; index++) {
       counters.set(index, 0L);
     }
+    loggerInitializationRequested = false;
+    loggerInitializationState = LOGGER_UNINITIALIZED;
   }
 
   private static int normalizeStatus(int status) {
@@ -289,6 +331,7 @@ public final class RemoteParentDiagnostics {
     if (failureReason != null
         && (current == 0L || Long.highestOneBit(current) != Long.highestOneBit(next))) {
       try {
+        initializeLoggerIfRequested();
         logger.warning("OBI remote-parent diagnostics reason=" + failureReason + " count=" + next);
       } catch (Throwable ignored) {
       }

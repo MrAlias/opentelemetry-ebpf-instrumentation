@@ -10,6 +10,7 @@ import io.opentelemetry.sdk.autoconfigure.spi.ConfigProperties;
 import io.opentelemetry.sdk.autoconfigure.spi.ConfigurablePropagatorProvider;
 import io.opentelemetry.sdk.autoconfigure.spi.ConfigurationException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Logger;
 
 public final class ObiConfigurablePropagatorProvider implements ConfigurablePropagatorProvider {
@@ -21,6 +22,8 @@ public final class ObiConfigurablePropagatorProvider implements ConfigurableProp
   private static final Logger logger =
       Logger.getLogger(ObiConfigurablePropagatorProvider.class.getName());
   private static final AtomicBoolean invalidEnabledPropertyReported = new AtomicBoolean();
+  private static final AtomicReference<BootstrapBridgeAccess>
+      diagnosticsLoggerInitializationTarget = new AtomicReference<>();
 
   @Override
   public TextMapPropagator getPropagator(ConfigProperties config) {
@@ -66,11 +69,18 @@ public final class ObiConfigurablePropagatorProvider implements ConfigurableProp
     } else {
       logger.info("OBI remote-parent propagator enabled");
     }
-    return new ObiRemoteParentPropagator(enabled, new BootstrapBridgeAccess());
+    BootstrapBridgeAccess bridge = new BootstrapBridgeAccess();
+    diagnosticsLoggerInitializationTarget.set(enabled ? bridge : null);
+    return new ObiRemoteParentPropagator(enabled, bridge);
+  }
+
+  static BootstrapBridgeAccess diagnosticsLoggerInitializationTarget() {
+    return diagnosticsLoggerInitializationTarget.get();
   }
 
   static void resetInvalidEnabledPropertyWarningForTest() {
     invalidEnabledPropertyReported.set(false);
+    diagnosticsLoggerInitializationTarget.set(null);
   }
 
   @Override

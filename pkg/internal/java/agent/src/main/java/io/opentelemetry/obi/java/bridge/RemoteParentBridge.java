@@ -181,6 +181,11 @@ public final class RemoteParentBridge {
     return RemoteParentDiagnostics.snapshot();
   }
 
+  /** Initializes diagnostics logging before concurrent bridge use. */
+  public static void initializeDiagnosticsLogger() {
+    RemoteParentDiagnostics.initializeLogger();
+  }
+
   public static String transportConfigurationSnapshot() {
     long configuration;
     try {

@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.opentelemetry.javaagent.extension.AgentListener;
 import io.opentelemetry.sdk.autoconfigure.spi.AutoConfigurationCustomizerProvider;
 import io.opentelemetry.sdk.autoconfigure.spi.ConfigProperties;
 import io.opentelemetry.sdk.autoconfigure.spi.ConfigurablePropagatorProvider;
@@ -20,6 +21,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.ServiceLoader;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
@@ -56,6 +59,42 @@ class ObiConfigurablePropagatorProviderTest {
       }
     }
     assertTrue(found);
+  }
+
+  @Test
+  void serviceLoaderFindsDiagnosticsAgentListener() {
+    boolean found = false;
+    for (AgentListener listener : ServiceLoader.load(AgentListener.class)) {
+      if (listener instanceof ObiDiagnosticsAgentListener) {
+        found = true;
+      }
+    }
+    assertTrue(found);
+  }
+
+  @Test
+  void postAgentListenerWarmsEnabledBridgeOnceBeforeDiagnosticsPublication() {
+    AgentCompatibility supported = AgentCompatibility.evaluate("2.28.1", "1.62.0", "1.62.0", 21);
+    AtomicInteger initializationCalls = new AtomicInteger();
+    AtomicInteger eventCalls = new AtomicInteger();
+    AtomicBoolean bridgeUsedBeforeInitialization = new AtomicBoolean();
+    DiagnosticsRemoteParentBridge.initializationCalls = initializationCalls;
+    DiagnosticsRemoteParentBridge.eventCalls = eventCalls;
+    DiagnosticsRemoteParentBridge.bridgeUsedBeforeInitialization = bridgeUsedBeforeInitialization;
+    ObiDiagnosticsAgentListener listener =
+        new ObiDiagnosticsAgentListener(
+            new BootstrapBridgeAccess(() -> DiagnosticsRemoteParentBridge.class));
+
+    listener.afterAgent(null);
+    assertEquals(0, initializationCalls.get());
+
+    new ObiConfigurablePropagatorProvider().getPropagator("true", supported);
+    listener.afterAgent(null);
+    listener.afterAgent(null);
+
+    assertEquals(1, initializationCalls.get());
+    assertEquals(2, eventCalls.get());
+    assertFalse(bridgeUsedBeforeInitialization.get());
   }
 
   @Test
@@ -259,6 +298,59 @@ class ObiConfigurablePropagatorProviderTest {
     @Override
     public Map<String, String> getMap(String name) {
       return Collections.emptyMap();
+    }
+  }
+
+  public static final class DiagnosticsRemoteParentBridge {
+    private static AtomicInteger initializationCalls;
+    private static AtomicInteger eventCalls;
+    private static AtomicBoolean bridgeUsedBeforeInitialization;
+
+    private DiagnosticsRemoteParentBridge() {}
+
+    public static int abiVersion() {
+      return 1;
+    }
+
+    public static DiagnosticsRemoteParentRecord takeRemoteParent() {
+      return new DiagnosticsRemoteParentRecord();
+    }
+
+    public static void discardRemoteParent(int reason) {}
+
+    public static void recordExtractionFailure(int reason) {}
+
+    public static void initializeDiagnosticsLogger() {
+      initializationCalls.compareAndSet(0, 1);
+    }
+
+    public static void recordExtensionEvent(int event, long count) {
+      eventCalls.incrementAndGet();
+      if (initializationCalls.get() == 0) {
+        bridgeUsedBeforeInitialization.set(true);
+      }
+    }
+  }
+
+  public static final class DiagnosticsRemoteParentRecord {
+    public int getAbiVersion() {
+      return 1;
+    }
+
+    public int getStatus() {
+      return BridgeResult.STATUS_MISSING;
+    }
+
+    public int getTraceFlags() {
+      return 0;
+    }
+
+    public String getTraceIdHex() {
+      return null;
+    }
+
+    public String getParentSpanIdHex() {
+      return null;
     }
   }
 }

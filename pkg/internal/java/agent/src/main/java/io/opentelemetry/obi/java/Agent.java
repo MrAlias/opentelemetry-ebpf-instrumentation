@@ -30,6 +30,8 @@ import net.bytebuddy.utility.JavaModule;
 public class Agent {
   private static final String REMOTE_PARENT_BOOTSTRAP_CLASS =
       "io.opentelemetry.obi.java.bridge.RemoteParentBootstrap";
+  private static final String REMOTE_PARENT_BRIDGE_CLASS =
+      "io.opentelemetry.obi.java.bridge.RemoteParentBridge";
   public static volatile boolean debugOn = false;
   private static final Logger logger = Logger.getLogger("Agent");
   private static volatile boolean agentLoaded = false;
@@ -162,12 +164,13 @@ public class Agent {
   // Main agent load and instrumentation code, this gets invoked directly with -javaagent on the
   // command line
   public static void premain(String agentArgs, Instrumentation inst) {
-    if (install(agentArgs, inst)) {
+    if (install(agentArgs, inst, false)) {
       logger.info("OBI Java instrumentation ready");
     }
   }
 
-  private static boolean install(String agentArgs, Instrumentation inst) {
+  private static boolean install(
+      String agentArgs, Instrumentation inst, boolean initializeDiagnosticsLogger) {
     String osName = System.getProperty("os.name").toLowerCase(Locale.getDefault());
     if (!osName.contains("linux")) {
       logger.info("OpenTelemetry eBPF Java Agent only supports Linux, ignoring load request");
@@ -175,14 +178,14 @@ public class Agent {
     }
 
     Map<String, String> opts = parseArgs(agentArgs);
-    if (reconfigureExistingInstallation(opts)) {
+    if (reconfigureExistingInstallation(opts, initializeDiagnosticsLogger)) {
       return false;
     }
 
     if (!claimLocalInstallation()) {
       synchronized (Agent.class) {
         if (agentLoaded) {
-          initializeRemoteParentBridge(opts);
+          initializeRemoteParentBridge(opts, initializeDiagnosticsLogger);
           logger.info("OpenTelemetry eBPF Java Agent already loaded; transport reconfigured");
         } else {
           logger.info("OpenTelemetry eBPF Java Agent installation already in progress");
@@ -203,11 +206,11 @@ public class Agent {
       installationClaimed = beginBootstrapInstallation();
       if (!installationClaimed) {
         clearLocalInstallationClaim(false);
-        initializeRemoteParentBridge(opts);
+        initializeRemoteParentBridge(opts, initializeDiagnosticsLogger);
         logger.info("OpenTelemetry eBPF Java Agent already installed; transport reconfigured");
         return false;
       }
-      initializeRemoteParentBridge(opts);
+      initializeRemoteParentBridge(opts, initializeDiagnosticsLogger);
       if (Agent.debugOn) {
         setupInstrumentationsDebugging();
       }
@@ -268,7 +271,7 @@ public class Agent {
 
   // Needed for Dynamic Agent Injection
   public static void agentmain(String args, Instrumentation inst) {
-    if (install(args, inst)) {
+    if (install(args, inst, true)) {
       retransformLoadedClasses(inst);
       logger.info("OBI Java instrumentation ready");
     }
@@ -325,7 +328,8 @@ public class Agent {
     }
   }
 
-  private static void initializeRemoteParentBridge(Map<String, String> opts) {
+  private static void initializeRemoteParentBridge(
+      Map<String, String> opts, boolean initializeDiagnosticsLogger) {
     String transport = opts.getOrDefault("remoteParentTransport", "disabled");
     String socketPath =
         opts.getOrDefault("remoteParentSocket", "/var/run/obi/java-remote-parent.sock");
@@ -336,6 +340,9 @@ public class Agent {
 
     try {
       Class<?> bootstrap = Class.forName(REMOTE_PARENT_BOOTSTRAP_CLASS, true, null);
+      if (initializeDiagnosticsLogger) {
+        initializeRemoteParentDiagnosticsLogger();
+      }
       java.lang.reflect.Method initialize =
           bootstrap.getMethod(
               "initialize", String.class, String.class, int.class, long.class, long.class);
@@ -355,14 +362,15 @@ public class Agent {
     }
   }
 
-  private static boolean reconfigureExistingInstallation(Map<String, String> opts) {
+  private static boolean reconfigureExistingInstallation(
+      Map<String, String> opts, boolean initializeDiagnosticsLogger) {
     try {
       Class<?> bootstrap = Class.forName(REMOTE_PARENT_BOOTSTRAP_CLASS, true, null);
       java.lang.reflect.Method claimed = bootstrap.getMethod("instrumentationInstallationClaimed");
       if (!Boolean.TRUE.equals(claimed.invoke(null))) {
         return false;
       }
-      initializeRemoteParentBridge(opts);
+      initializeRemoteParentBridge(opts, initializeDiagnosticsLogger);
       logger.info("OpenTelemetry eBPF Java Agent already installed; transport reconfigured");
       return true;
     } catch (ClassNotFoundException ignored) {
@@ -374,6 +382,14 @@ public class Agent {
               + "skipping duplicate installation",
           failure);
       return true;
+    }
+  }
+
+  private static void initializeRemoteParentDiagnosticsLogger() {
+    try {
+      Class<?> bridge = Class.forName(REMOTE_PARENT_BRIDGE_CLASS, true, null);
+      bridge.getMethod("initializeDiagnosticsLogger").invoke(null);
+    } catch (Throwable ignored) {
     }
   }
 

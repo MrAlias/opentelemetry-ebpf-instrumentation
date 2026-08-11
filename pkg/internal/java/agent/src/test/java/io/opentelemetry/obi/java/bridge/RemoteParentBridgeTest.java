@@ -324,6 +324,311 @@ class RemoteParentBridgeTest {
   }
 
   @Test
+  void initializesDiagnosticsLoggerOnceWithFixedInfoRecord() {
+    Logger diagnosticsLogger = Logger.getLogger(RemoteParentDiagnostics.class.getName());
+    boolean useParentHandlers = diagnosticsLogger.getUseParentHandlers();
+    Level previousLevel = diagnosticsLogger.getLevel();
+    List<LogRecord> records = new ArrayList<>();
+    Handler recordingHandler =
+        new Handler() {
+          @Override
+          public void publish(LogRecord record) {
+            records.add(record);
+          }
+
+          @Override
+          public void flush() {}
+
+          @Override
+          public void close() {}
+        };
+    recordingHandler.setLevel(Level.ALL);
+    diagnosticsLogger.setUseParentHandlers(false);
+    diagnosticsLogger.setLevel(Level.ALL);
+    diagnosticsLogger.addHandler(recordingHandler);
+    try {
+      RemoteParentBridge.initializeDiagnosticsLogger();
+      RemoteParentBridge.initializeDiagnosticsLogger();
+
+      assertEquals(1, records.size());
+      assertEquals(Level.INFO, records.get(0).getLevel());
+      assertEquals("OBI remote-parent diagnostics logger initialized", records.get(0).getMessage());
+      assertNull(records.get(0).getParameters());
+      assertNull(records.get(0).getThrown());
+    } finally {
+      diagnosticsLogger.removeHandler(recordingHandler);
+      diagnosticsLogger.setLevel(previousLevel);
+      diagnosticsLogger.setUseParentHandlers(useParentHandlers);
+    }
+  }
+
+  @Test
+  void initializesDiagnosticsLoggerAtWarningWithoutChangingTheConfiguredLevel() {
+    Logger diagnosticsLogger = Logger.getLogger(RemoteParentDiagnostics.class.getName());
+    boolean useParentHandlers = diagnosticsLogger.getUseParentHandlers();
+    Level previousLevel = diagnosticsLogger.getLevel();
+    List<LogRecord> records = new ArrayList<>();
+    Handler recordingHandler =
+        new Handler() {
+          @Override
+          public void publish(LogRecord record) {
+            records.add(record);
+          }
+
+          @Override
+          public void flush() {}
+
+          @Override
+          public void close() {}
+        };
+    recordingHandler.setLevel(Level.ALL);
+    diagnosticsLogger.setUseParentHandlers(false);
+    diagnosticsLogger.setLevel(Level.WARNING);
+    diagnosticsLogger.addHandler(recordingHandler);
+    try {
+      RemoteParentBridge.initializeDiagnosticsLogger();
+      RemoteParentBridge.initializeDiagnosticsLogger();
+
+      assertEquals(Level.WARNING, diagnosticsLogger.getLevel());
+      assertEquals(1, records.size());
+      assertEquals(Level.WARNING, records.get(0).getLevel());
+      assertEquals("OBI remote-parent diagnostics logger initialized", records.get(0).getMessage());
+    } finally {
+      diagnosticsLogger.removeHandler(recordingHandler);
+      diagnosticsLogger.setLevel(previousLevel);
+      diagnosticsLogger.setUseParentHandlers(useParentHandlers);
+    }
+  }
+
+  @Test
+  void failureBeforeExplicitWarmupCannotSatisfyDiagnosticsLoggerInitialization() {
+    Logger diagnosticsLogger = Logger.getLogger(RemoteParentDiagnostics.class.getName());
+    boolean useParentHandlers = diagnosticsLogger.getUseParentHandlers();
+    Level previousLevel = diagnosticsLogger.getLevel();
+    List<LogRecord> records = new ArrayList<>();
+    Handler recordingHandler =
+        new Handler() {
+          @Override
+          public void publish(LogRecord record) {
+            records.add(record);
+          }
+
+          @Override
+          public void flush() {}
+
+          @Override
+          public void close() {}
+        };
+    recordingHandler.setLevel(Level.ALL);
+    diagnosticsLogger.setUseParentHandlers(false);
+    diagnosticsLogger.setLevel(Level.ALL);
+    try {
+      assertFalse(RemoteParentBridge.installProviderForTest(null));
+      diagnosticsLogger.addHandler(recordingHandler);
+
+      RemoteParentBridge.initializeDiagnosticsLogger();
+      assertFalse(RemoteParentBridge.installProviderForTest(null));
+
+      assertEquals(2, records.size());
+      assertEquals("OBI remote-parent diagnostics logger initialized", records.get(0).getMessage());
+      assertEquals(Level.INFO, records.get(0).getLevel());
+      assertEquals(
+          "OBI remote-parent diagnostics reason=provider_rejected count=2",
+          records.get(1).getMessage());
+      assertEquals(Level.WARNING, records.get(1).getLevel());
+    } finally {
+      diagnosticsLogger.removeHandler(recordingHandler);
+      diagnosticsLogger.setLevel(previousLevel);
+      diagnosticsLogger.setUseParentHandlers(useParentHandlers);
+    }
+  }
+
+  @Test
+  void diagnosticsInitializationDoesNotBlockAHandlerSpawnedPeer() throws Exception {
+    Logger diagnosticsLogger = Logger.getLogger(RemoteParentDiagnostics.class.getName());
+    Field initializationLockField =
+        RemoteParentDiagnostics.class.getDeclaredField("loggerInitializationLock");
+    initializationLockField.setAccessible(true);
+    Object initializationLock = initializationLockField.get(null);
+    boolean useParentHandlers = diagnosticsLogger.getUseParentHandlers();
+    Level previousLevel = diagnosticsLogger.getLevel();
+    AtomicBoolean initializationHandlerEntered = new AtomicBoolean();
+    AtomicBoolean initializationHandlerHeldLock = new AtomicBoolean();
+    AtomicBoolean peerCompletedBeforeHandlerReturned = new AtomicBoolean();
+    AtomicReference<Throwable> peerFailure = new AtomicReference<>();
+    AtomicReference<Thread> peerThread = new AtomicReference<>();
+    Handler reentrantHandler =
+        new Handler() {
+          @Override
+          public void publish(LogRecord record) {
+            if (!"OBI remote-parent diagnostics logger initialized".equals(record.getMessage())
+                || !initializationHandlerEntered.compareAndSet(false, true)) {
+              return;
+            }
+            initializationHandlerHeldLock.set(Thread.holdsLock(initializationLock));
+            Thread peer =
+                new Thread(
+                    () -> {
+                      try {
+                        assertFalse(RemoteParentBridge.installProviderForTest(null));
+                      } catch (Throwable failure) {
+                        peerFailure.compareAndSet(null, failure);
+                      }
+                    },
+                    "obi-diagnostics-initialization-peer");
+            peer.setDaemon(true);
+            peerThread.set(peer);
+            peer.start();
+            try {
+              peer.join(TimeUnit.SECONDS.toMillis(2));
+              peerCompletedBeforeHandlerReturned.set(!peer.isAlive());
+            } catch (InterruptedException interrupted) {
+              Thread.currentThread().interrupt();
+              peerFailure.compareAndSet(null, interrupted);
+            }
+          }
+
+          @Override
+          public void flush() {}
+
+          @Override
+          public void close() {}
+        };
+    reentrantHandler.setLevel(Level.ALL);
+    diagnosticsLogger.setUseParentHandlers(false);
+    diagnosticsLogger.setLevel(Level.ALL);
+    diagnosticsLogger.addHandler(reentrantHandler);
+    try {
+      RemoteParentBridge.initializeDiagnosticsLogger();
+      Thread peer = peerThread.get();
+      if (peer != null) {
+        peer.join(TimeUnit.SECONDS.toMillis(5));
+      }
+
+      assertTrue(initializationHandlerEntered.get());
+      assertFalse(initializationHandlerHeldLock.get());
+      assertTrue(peerCompletedBeforeHandlerReturned.get());
+      assertTrue(peer != null && !peer.isAlive());
+      assertNull(peerFailure.get());
+    } finally {
+      diagnosticsLogger.removeHandler(reentrantHandler);
+      diagnosticsLogger.setLevel(previousLevel);
+      diagnosticsLogger.setUseParentHandlers(useParentHandlers);
+    }
+  }
+
+  @Test
+  void diagnosticsLoggerInitializationPreservesDisabledLoggerLevel() {
+    Logger diagnosticsLogger = Logger.getLogger(RemoteParentDiagnostics.class.getName());
+    boolean useParentHandlers = diagnosticsLogger.getUseParentHandlers();
+    Level previousLevel = diagnosticsLogger.getLevel();
+    AtomicInteger records = new AtomicInteger();
+    Handler recordingHandler =
+        new Handler() {
+          @Override
+          public void publish(LogRecord record) {
+            records.incrementAndGet();
+          }
+
+          @Override
+          public void flush() {}
+
+          @Override
+          public void close() {}
+        };
+    recordingHandler.setLevel(Level.ALL);
+    diagnosticsLogger.setUseParentHandlers(false);
+    diagnosticsLogger.setLevel(Level.OFF);
+    diagnosticsLogger.addHandler(recordingHandler);
+    try {
+      RemoteParentBridge.initializeDiagnosticsLogger();
+
+      assertEquals(Level.OFF, diagnosticsLogger.getLevel());
+      assertEquals(0, records.get());
+    } finally {
+      diagnosticsLogger.removeHandler(recordingHandler);
+      diagnosticsLogger.setLevel(previousLevel);
+      diagnosticsLogger.setUseParentHandlers(useParentHandlers);
+    }
+  }
+
+  @Test
+  void firstWarningRetriesLoggerInitializationAfterLoggingIsEnabled() {
+    Logger diagnosticsLogger = Logger.getLogger(RemoteParentDiagnostics.class.getName());
+    boolean useParentHandlers = diagnosticsLogger.getUseParentHandlers();
+    Level previousLevel = diagnosticsLogger.getLevel();
+    List<LogRecord> records = new ArrayList<>();
+    Handler recordingHandler =
+        new Handler() {
+          @Override
+          public void publish(LogRecord record) {
+            records.add(record);
+          }
+
+          @Override
+          public void flush() {}
+
+          @Override
+          public void close() {}
+        };
+    recordingHandler.setLevel(Level.ALL);
+    diagnosticsLogger.setUseParentHandlers(false);
+    diagnosticsLogger.setLevel(Level.OFF);
+    diagnosticsLogger.addHandler(recordingHandler);
+    try {
+      RemoteParentBridge.initializeDiagnosticsLogger();
+      assertEquals(0, records.size());
+
+      diagnosticsLogger.setLevel(Level.WARNING);
+      assertFalse(RemoteParentBridge.installProviderForTest(null));
+
+      assertEquals(2, records.size());
+      assertEquals("OBI remote-parent diagnostics logger initialized", records.get(0).getMessage());
+      assertEquals(Level.WARNING, records.get(0).getLevel());
+      assertEquals(
+          "OBI remote-parent diagnostics reason=provider_rejected count=1",
+          records.get(1).getMessage());
+      assertEquals(Level.WARNING, records.get(1).getLevel());
+    } finally {
+      diagnosticsLogger.removeHandler(recordingHandler);
+      diagnosticsLogger.setLevel(previousLevel);
+      diagnosticsLogger.setUseParentHandlers(useParentHandlers);
+    }
+  }
+
+  @Test
+  void diagnosticsLoggerInitializationCannotInterruptBridgeStartup() {
+    Logger diagnosticsLogger = Logger.getLogger(RemoteParentDiagnostics.class.getName());
+    boolean useParentHandlers = diagnosticsLogger.getUseParentHandlers();
+    Level previousLevel = diagnosticsLogger.getLevel();
+    Handler throwingHandler =
+        new Handler() {
+          @Override
+          public void publish(LogRecord record) {
+            throw new AssertionError("broken application log handler");
+          }
+
+          @Override
+          public void flush() {}
+
+          @Override
+          public void close() {}
+        };
+    throwingHandler.setLevel(Level.ALL);
+    diagnosticsLogger.setUseParentHandlers(false);
+    diagnosticsLogger.setLevel(Level.ALL);
+    diagnosticsLogger.addHandler(throwingHandler);
+    try {
+      RemoteParentBridge.initializeDiagnosticsLogger();
+      assertTrue(RemoteParentBridge.installProviderForTest(new FakeProvider()));
+    } finally {
+      diagnosticsLogger.removeHandler(throwingHandler);
+      diagnosticsLogger.setLevel(previousLevel);
+      diagnosticsLogger.setUseParentHandlers(useParentHandlers);
+    }
+  }
+
+  @Test
   void failureLoggingUsesABoundedSanitizedPowerOfTwoCadenceAcrossBatches() {
     Logger diagnosticsLogger = Logger.getLogger(RemoteParentDiagnostics.class.getName());
     boolean useParentHandlers = diagnosticsLogger.getUseParentHandlers();

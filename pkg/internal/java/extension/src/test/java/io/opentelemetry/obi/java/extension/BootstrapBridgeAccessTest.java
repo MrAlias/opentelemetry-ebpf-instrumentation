@@ -33,6 +33,7 @@ class BootstrapBridgeAccessTest {
   void resetDiagnostics() {
     BootstrapBridgeAccess.resetLocalDiagnosticsForTest();
     FakeRemoteParentBridge.reset();
+    BlockingDiagnosticsRemoteParentBridge.reset();
     System.clearProperty(BRIDGE_AVAILABILITY_PROPERTY);
   }
 
@@ -198,11 +199,124 @@ class BootstrapBridgeAccessTest {
     assertNull(threadFailure.get());
     assertEquals(BridgeResult.STATUS_MISSING, reentrantStatus.get());
     assertEquals(BridgeResult.STATUS_VALID, firstStatus.get());
-    assertEquals(BridgeResult.STATUS_VALID, secondStatus.get());
-    assertEquals(2, FakeRemoteParentBridge.takeCalls.get());
+    assertTrue(
+        secondStatus.get() == BridgeResult.STATUS_MISSING
+            || secondStatus.get() == BridgeResult.STATUS_VALID,
+        "concurrent lookup must either fail open during warmup or use the published bridge");
+    int expectedTakeCalls = secondStatus.get() == BridgeResult.STATUS_VALID ? 2 : 1;
+    assertEquals(expectedTakeCalls, FakeRemoteParentBridge.takeCalls.get());
+    assertEquals(BridgeResult.STATUS_VALID, bridge.takeRemoteParent().status);
+    assertEquals(expectedTakeCalls + 1, FakeRemoteParentBridge.takeCalls.get());
     assertTrue(
         Arrays.stream(BootstrapBridgeAccess.drainLocalCountersForTest())
             .allMatch(value -> value == 0L));
+  }
+
+  @Test
+  void initializesDiagnosticsLoggerBeforePublishingOrUsingBridge() {
+    BootstrapBridgeAccess bridge = new BootstrapBridgeAccess(() -> FakeRemoteParentBridge.class);
+
+    bridge.initializeDiagnosticsLogger();
+    bridge.initializeDiagnosticsLogger();
+
+    assertEquals(1, FakeRemoteParentBridge.diagnosticsLoggerInitializations.get());
+    assertEquals(1L, FakeRemoteParentBridge.eventCount(1));
+    assertEquals(1L, FakeRemoteParentBridge.eventCount(2));
+    assertEquals(0, FakeRemoteParentBridge.takeCalls.get());
+    assertFalse(FakeRemoteParentBridge.bridgeUsedBeforeDiagnosticsInitialization.get());
+    assertEquals(BridgeResult.STATUS_VALID, bridge.takeRemoteParent().status);
+    assertEquals(1L, FakeRemoteParentBridge.eventCount(1));
+    assertEquals(1L, FakeRemoteParentBridge.eventCount(2));
+    assertFalse(FakeRemoteParentBridge.bridgeUsedBeforeDiagnosticsInitialization.get());
+  }
+
+  @Test
+  void diagnosticsWarmupDoesNotNegativelyCacheAnAbsentHelper() {
+    AtomicInteger resolverCalls = new AtomicInteger();
+    BootstrapBridgeAccess bridge =
+        new BootstrapBridgeAccess(
+            () -> {
+              if (resolverCalls.incrementAndGet() == 1) {
+                throw new ClassNotFoundException("helper intentionally absent during warmup");
+              }
+              return FakeRemoteParentBridge.class;
+            });
+
+    bridge.initializeDiagnosticsLogger();
+
+    assertEquals(1, resolverCalls.get());
+    assertTrue(
+        Arrays.stream(BootstrapBridgeAccess.drainLocalCountersForTest())
+            .allMatch(value -> value == 0L));
+    assertEquals(BridgeResult.STATUS_VALID, bridge.takeRemoteParent().status);
+    assertEquals(2, resolverCalls.get());
+    assertEquals(1L, FakeRemoteParentBridge.eventCount(1));
+    assertEquals(1L, FakeRemoteParentBridge.eventCount(2));
+    assertEquals(0L, FakeRemoteParentBridge.eventCount(3));
+  }
+
+  @Test
+  void concurrentLazyLookupFailsOpenUntilDiagnosticsWarmupCompletes() throws Exception {
+    BlockingDiagnosticsRemoteParentBridge.prepare();
+    BootstrapBridgeAccess bridge =
+        new BootstrapBridgeAccess(() -> BlockingDiagnosticsRemoteParentBridge.class);
+    AtomicReference<Throwable> threadFailure = new AtomicReference<>();
+    AtomicInteger firstStatus = new AtomicInteger(-1);
+    AtomicInteger secondStatus = new AtomicInteger(-1);
+    Thread first = lookupThread(bridge, firstStatus, threadFailure, "obi-bridge-warmup-owner");
+    Thread second = lookupThread(bridge, secondStatus, threadFailure, "obi-bridge-warmup-peer");
+
+    first.start();
+    assertTrue(
+        BlockingDiagnosticsRemoteParentBridge.initializationStarted.await(5, TimeUnit.SECONDS),
+        "diagnostics warmup did not start");
+    second.start();
+    second.join(TimeUnit.SECONDS.toMillis(2));
+    boolean secondCompletedBeforeRelease = !second.isAlive();
+    int takesBeforeRelease = BlockingDiagnosticsRemoteParentBridge.takeCalls.get();
+    boolean usedBeforeInitialization =
+        BlockingDiagnosticsRemoteParentBridge.bridgeUsedBeforeInitialization.get();
+
+    BlockingDiagnosticsRemoteParentBridge.releaseInitialization.countDown();
+    first.join(TimeUnit.SECONDS.toMillis(5));
+    second.join(TimeUnit.SECONDS.toMillis(5));
+
+    assertTrue(secondCompletedBeforeRelease, "concurrent warmup lookup blocked on a JUL handler");
+    assertFalse(first.isAlive(), "warmup owner did not finish");
+    assertFalse(second.isAlive(), "warmup peer did not finish");
+    assertNull(threadFailure.get());
+    assertEquals(BridgeResult.STATUS_VALID, firstStatus.get());
+    assertEquals(BridgeResult.STATUS_MISSING, secondStatus.get());
+    assertEquals(0, takesBeforeRelease);
+    assertFalse(usedBeforeInitialization);
+    assertEquals(1, BlockingDiagnosticsRemoteParentBridge.takeCalls.get());
+    assertEquals(BridgeResult.STATUS_VALID, bridge.takeRemoteParent().status);
+    assertEquals(2, BlockingDiagnosticsRemoteParentBridge.takeCalls.get());
+    assertFalse(BlockingDiagnosticsRemoteParentBridge.bridgeUsedBeforeInitialization.get());
+  }
+
+  @Test
+  void diagnosticsInitializationFailureDoesNotDisableBridge() {
+    FakeRemoteParentBridge.failDiagnosticsLoggerInitialization.set(true);
+    BootstrapBridgeAccess bridge = new BootstrapBridgeAccess(() -> FakeRemoteParentBridge.class);
+
+    bridge.initializeDiagnosticsLogger();
+
+    assertEquals(1, FakeRemoteParentBridge.diagnosticsLoggerInitializations.get());
+    assertEquals(BridgeResult.STATUS_VALID, bridge.takeRemoteParent().status);
+    assertEquals(1L, FakeRemoteParentBridge.eventCount(1));
+    assertEquals(1L, FakeRemoteParentBridge.eventCount(2));
+  }
+
+  @Test
+  void bridgeWithoutDiagnosticsInitializerRemainsCompatible() {
+    BootstrapBridgeAccess bridge = new BootstrapBridgeAccess(() -> LegacyRemoteParentBridge.class);
+
+    bridge.initializeDiagnosticsLogger();
+
+    assertEquals(BridgeResult.STATUS_VALID, bridge.takeRemoteParent().status);
+    assertEquals(1L, FakeRemoteParentBridge.eventCount(1));
+    assertEquals(1L, FakeRemoteParentBridge.eventCount(2));
   }
 
   @Test
@@ -267,7 +381,7 @@ class BootstrapBridgeAccessTest {
   }
 
   @Test
-  void successfulLookupPublishesAccessBeforeDiagnosticsWithoutHoldingMonitor() throws Exception {
+  void successfulLookupFailsOpenDuringDiagnosticsWithoutHoldingMonitor() throws Exception {
     BootstrapBridgeAccess.resetLocalDiagnosticsForTest();
     BootstrapBridgeAccess missingBridge =
         new BootstrapBridgeAccess(
@@ -307,7 +421,7 @@ class BootstrapBridgeAccessTest {
     }
 
     assertNull(threadFailure.get());
-    assertEquals(BridgeResult.STATUS_VALID, callbackStatus.get());
+    assertEquals(BridgeResult.STATUS_MISSING, callbackStatus.get());
     assertEquals(1, successfulResolveCalls.get());
     assertEquals(1L, FakeRemoteParentBridge.eventCount(1));
     assertEquals(1L, FakeRemoteParentBridge.eventCount(2));
@@ -315,7 +429,7 @@ class BootstrapBridgeAccessTest {
     for (int event = 4; event < 9; event++) {
       assertEquals(0L, FakeRemoteParentBridge.eventCount(event));
     }
-    assertEquals(2, FakeRemoteParentBridge.takeCalls.get());
+    assertEquals(1, FakeRemoteParentBridge.takeCalls.get());
     assertFalse(FakeRemoteParentBridge.diagnosticsHeldLookupMonitor.get());
     assertTrue(
         Arrays.stream(BootstrapBridgeAccess.drainLocalCountersForTest())
@@ -573,6 +687,90 @@ class BootstrapBridgeAccessTest {
     }
   }
 
+  public static final class LegacyRemoteParentBridge {
+    private LegacyRemoteParentBridge() {}
+
+    public static int abiVersion() {
+      return FakeRemoteParentBridge.abiVersion();
+    }
+
+    public static FakeRemoteParentRecord takeRemoteParent() {
+      return FakeRemoteParentBridge.takeRemoteParent();
+    }
+
+    public static void discardRemoteParent(int reason) {
+      FakeRemoteParentBridge.discardRemoteParent(reason);
+    }
+
+    public static void recordExtractionFailure(int reason) {
+      FakeRemoteParentBridge.recordExtractionFailure(reason);
+    }
+
+    public static void recordExtensionEvent(int event, long count) {
+      FakeRemoteParentBridge.recordExtensionEvent(event, count);
+    }
+  }
+
+  public static final class BlockingDiagnosticsRemoteParentBridge {
+    private static final AtomicInteger takeCalls = new AtomicInteger();
+    private static final AtomicBoolean initialized = new AtomicBoolean();
+    private static final AtomicBoolean bridgeUsedBeforeInitialization = new AtomicBoolean();
+    private static volatile CountDownLatch initializationStarted = new CountDownLatch(0);
+    private static volatile CountDownLatch releaseInitialization = new CountDownLatch(0);
+
+    private BlockingDiagnosticsRemoteParentBridge() {}
+
+    public static int abiVersion() {
+      return 1;
+    }
+
+    public static FakeRemoteParentRecord takeRemoteParent() {
+      if (!initialized.get()) {
+        bridgeUsedBeforeInitialization.set(true);
+      }
+      takeCalls.incrementAndGet();
+      return new FakeRemoteParentRecord();
+    }
+
+    public static void initializeDiagnosticsLogger() {
+      initializationStarted.countDown();
+      try {
+        if (!releaseInitialization.await(10, TimeUnit.SECONDS)) {
+          throw new AssertionError("diagnostics warmup release timed out");
+        }
+        initialized.set(true);
+      } catch (InterruptedException interrupted) {
+        Thread.currentThread().interrupt();
+        throw new AssertionError("diagnostics warmup interrupted", interrupted);
+      }
+    }
+
+    public static void discardRemoteParent(int reason) {}
+
+    public static void recordExtractionFailure(int reason) {}
+
+    public static void recordExtensionEvent(int event, long count) {
+      if (!initialized.get()) {
+        bridgeUsedBeforeInitialization.set(true);
+      }
+    }
+
+    private static void prepare() {
+      reset();
+      initializationStarted = new CountDownLatch(1);
+      releaseInitialization = new CountDownLatch(1);
+    }
+
+    private static void reset() {
+      releaseInitialization.countDown();
+      initializationStarted = new CountDownLatch(0);
+      releaseInitialization = new CountDownLatch(0);
+      takeCalls.set(0);
+      initialized.set(false);
+      bridgeUsedBeforeInitialization.set(false);
+    }
+  }
+
   public static final class FakeRemoteParentBridge {
     private static final FakeRemoteParentRecord RECORD = new FakeRemoteParentRecord();
     private static final AtomicInteger takeCalls = new AtomicInteger();
@@ -580,6 +778,10 @@ class BootstrapBridgeAccessTest {
     private static final AtomicReference<Runnable> lookupMissingCallback = new AtomicReference<>();
     private static final AtomicReference<Object> lookupMonitor = new AtomicReference<>();
     private static final AtomicBoolean diagnosticsHeldLookupMonitor = new AtomicBoolean();
+    private static final AtomicInteger diagnosticsLoggerInitializations = new AtomicInteger();
+    private static final AtomicBoolean failDiagnosticsLoggerInitialization = new AtomicBoolean();
+    private static final AtomicBoolean bridgeUsedBeforeDiagnosticsInitialization =
+        new AtomicBoolean();
 
     private FakeRemoteParentBridge() {}
 
@@ -588,8 +790,18 @@ class BootstrapBridgeAccessTest {
     }
 
     public static FakeRemoteParentRecord takeRemoteParent() {
+      if (diagnosticsLoggerInitializations.get() == 0) {
+        bridgeUsedBeforeDiagnosticsInitialization.set(true);
+      }
       takeCalls.incrementAndGet();
       return RECORD;
+    }
+
+    public static void initializeDiagnosticsLogger() {
+      if (diagnosticsLoggerInitializations.compareAndSet(0, 1)
+          && failDiagnosticsLoggerInitialization.get()) {
+        throw new IllegalStateException("diagnostics initialization intentionally failed");
+      }
     }
 
     public static void discardRemoteParent(int reason) {}
@@ -597,6 +809,9 @@ class BootstrapBridgeAccessTest {
     public static void recordExtractionFailure(int reason) {}
 
     public static void recordExtensionEvent(int event, long count) {
+      if (diagnosticsLoggerInitializations.get() == 0) {
+        bridgeUsedBeforeDiagnosticsInitialization.set(true);
+      }
       Object monitor = lookupMonitor.get();
       if (monitor != null && Thread.holdsLock(monitor)) {
         diagnosticsHeldLookupMonitor.set(true);
@@ -625,6 +840,9 @@ class BootstrapBridgeAccessTest {
       lookupMissingCallback.set(null);
       lookupMonitor.set(null);
       diagnosticsHeldLookupMonitor.set(false);
+      diagnosticsLoggerInitializations.set(0);
+      failDiagnosticsLoggerInitialization.set(false);
+      bridgeUsedBeforeDiagnosticsInitialization.set(false);
     }
   }
 

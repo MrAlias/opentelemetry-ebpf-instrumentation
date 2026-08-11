@@ -12,6 +12,7 @@ plugins {
 version = rootProject.version
 
 val otelVersion = "1.62.0"
+val otelJavaagentVersion = "2.28.1-alpha"
 val jettyVersion = "11.0.26"
 val nettyVersion = "4.1.135.Final"
 
@@ -22,10 +23,18 @@ val officialAgentJava21ProbeApp = sourceSets.create("officialAgentJava21ProbeApp
 
 dependencies {
     compileOnly("io.opentelemetry:opentelemetry-api:$otelVersion")
+    compileOnly("io.opentelemetry:opentelemetry-sdk-extension-autoconfigure:$otelVersion")
     compileOnly("io.opentelemetry:opentelemetry-sdk-extension-autoconfigure-spi:$otelVersion")
+    compileOnly(
+        "io.opentelemetry.javaagent:opentelemetry-javaagent-extension-api:$otelJavaagentVersion",
+    )
 
     testImplementation("io.opentelemetry:opentelemetry-api:$otelVersion")
+    testImplementation("io.opentelemetry:opentelemetry-sdk-extension-autoconfigure:$otelVersion")
     testImplementation("io.opentelemetry:opentelemetry-sdk-extension-autoconfigure-spi:$otelVersion")
+    testImplementation(
+        "io.opentelemetry.javaagent:opentelemetry-javaagent-extension-api:$otelJavaagentVersion",
+    )
     testImplementation("org.junit.jupiter:junit-jupiter-api:5.14.4")
     testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.14.4")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher:1.14.4")
@@ -243,6 +252,16 @@ val verifyExtensionJar by tasks.registering {
             check(zip.getEntry(customizerService) != null) {
                 "Missing AutoConfigurationCustomizerProvider SPI metadata"
             }
+            val agentListenerService =
+                "META-INF/services/io.opentelemetry.javaagent.extension.AgentListener"
+            val agentListenerEntry = zip.getEntry(agentListenerService)
+            check(agentListenerEntry != null) { "Missing AgentListener SPI metadata" }
+            val agentListener =
+                zip.getInputStream(agentListenerEntry).bufferedReader(Charsets.UTF_8).use { it.readText() }.trim()
+            check(
+                agentListener ==
+                    "io.opentelemetry.obi.java.extension.ObiDiagnosticsAgentListener",
+            ) { "Unexpected AgentListener provider: $agentListener" }
             check(
                 zip.getEntry("io/opentelemetry/obi/java/extension/version.properties") != null,
             ) { "Missing extension compatibility version metadata" }

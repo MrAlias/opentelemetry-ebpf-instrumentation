@@ -90,7 +90,15 @@ func loadJavaRemoteParentGenericDirectJSSEFixture(
 	}))
 
 	replacements := javaRemoteParentGenericDirectJSSEMapReplacements(primary)
-	require.Len(t, replacements, 47)
+	exactOwnerReplacements := map[string]*ebpf.Map{
+		"java_remote_parent_handoff_mutations": primary.JavaRemoteParentHandoffMutations,
+		"java_remote_parent_task_claims":       primary.JavaRemoteParentTaskClaims,
+		"java_thread_mapping_claims":           primary.JavaThreadMappingClaims,
+	}
+	for name, expected := range exactOwnerReplacements {
+		require.Samef(t, expected, replacements[name], "replacement %q", name)
+	}
+	require.Len(t, replacements, 47+len(exactOwnerReplacements))
 	fixture := &javaRemoteParentGenericDirectJSSEFixture{}
 	err = spec.LoadAndAssign(fixture, &ebpf.CollectionOptions{
 		Programs:        ebpf.ProgramOptions{LogSizeStart: 640 * 1024},

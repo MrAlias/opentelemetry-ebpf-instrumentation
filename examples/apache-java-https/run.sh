@@ -6376,6 +6376,7 @@ coalesced_bridge_reconciliation() {
     "$SCENARIO_RECONCILIATION_MAX_LINES" || return 1
   jq -ce '
     def count: type == "number" and floor == . and . >= 0 and . <= 2;
+    def positive_bytes: type == "number" and floor == . and . >= 1 and . <= 8192;
     . as $result |
     if
       $result.status == "passed" and
@@ -6389,26 +6390,21 @@ coalesced_bridge_reconciliation() {
         ($correlation.explicit_root_count | count) and
         ($correlation.wrong_parent_count | count) and
         ($correlation.unresolved_count | count) and
-		$correlation.source_client_candidates == 2 and
-		$correlation.trigger_chain_proven == true and
-		($correlation.discard_total_delta | type == "number" and floor == . and . >= 0 and . <= 1) and
-		($correlation.discard_ambiguous_delta | type == "number" and floor == . and . >= 0 and . <= 1) and
+		$correlation.outcome == "receive_ambiguous" and
+		$correlation.exact_hit_count == 0 and
+		$correlation.explicit_root_count == 2 and
         $correlation.wrong_parent_count == 0 and
         $correlation.unresolved_count == 0 and
-        (
-          ($correlation.outcome == "supported_exact" and
-           $correlation.exact_hit_count == 2 and
-		   $correlation.explicit_root_count == 0 and
-		   $correlation.source_client_candidates == 2 and
-		   $correlation.discard_total_delta == 0 and
-		   $correlation.discard_ambiguous_delta == 0) or
-          ($correlation.outcome == "ambiguous_drop" and
-		   $correlation.exact_hit_count == 0 and
-		   $correlation.explicit_root_count == 2 and
-		   $correlation.source_client_candidates == 2 and
-		   $correlation.discard_total_delta == 1 and
-		   $correlation.discard_ambiguous_delta == 1)
-        )
+		$correlation.source_client_operations == 1 and
+		$correlation.source_client_marker == "absent" and
+		$correlation.apache_trigger_chain_proven == true and
+		$correlation.source_operation_chain_proven == true and
+		($correlation.source_plaintext_write_bytes | positive_bytes) and
+		$correlation.tls_read_delta == 1 and
+		$correlation.tls_bytes_delta == $correlation.source_plaintext_write_bytes and
+		$correlation.take_missing_delta == 2 and
+		$correlation.discard_total_delta == 1 and
+		$correlation.discard_ambiguous_delta == 1
       then $correlation else error("invalid coalesced bridge correlation") end
     else error("missing coalesced bridge correlation") end
   ' "$input"
@@ -8068,19 +8064,14 @@ run_scenario() {
           metric_status=1
         }
       else
-        log_error "coalesced bridge result did not report one supported correlation outcome"
+		log_error "coalesced receive control did not prove one fail-closed ambiguity outcome"
         scenario_reconciliation_json="null"
         scenario_status=1
       fi
       case "$coalesced_outcome" in
-        supported_exact)
-          expected_bridge_valid=2
-          expected_bridge_stage=2
-          ;;
-        ambiguous_drop)
+		receive_ambiguous)
           expected_bridge_valid=0
           expected_bridge_stage=0
-          include_ambiguous_candidates=true
           ;;
       esac
     elif ((scenario_status == 0)) && [[ "$name" == "timeout-retry" ]]; then
@@ -8178,9 +8169,9 @@ run_scenario() {
     if [[ "$retrieval_mode" == "normal" ]] && ! is_w3c_stale_scenario "$name"; then
       case "$name" in
         coalesced-bridge)
-          # The Apache-to-source trigger is a separate live path. Dedicated
-          # reconciliation below accounts for its TCP lifecycle without
-          # pretending Apache produced the coalesced plaintext write.
+		  # Go crypto/tls does not use the request-owned exact-prewrite path.
+		  # This negative control therefore requires a zero native bridge
+		  # lifecycle and a reason-coded ambiguity at the Java receive boundary.
           expected_bridge_lifecycle=0
           ;;
         timeout-retry)
@@ -14015,11 +14006,24 @@ assert_coalesced_bridge_metric_delta() {
 
   [[ -f "$input" && ! -L "$input" && \
     ( "$transport" == "getsockopt" || "$transport" == "unix" ) && \
-    ( "$outcome" == "supported_exact" || "$outcome" == "ambiguous_drop" ) ]] || return 1
+	"$outcome" == "receive_ambiguous" ]] || return 1
 
   awk \
-    -v selected="$transport" \
-    -v wanted_outcome="$outcome" '
+	-v selected="$transport" '
+    function decimal_sum(left, right, left_index, right_index, carry, total, output) {
+      left_index = length(left)
+      right_index = length(right)
+      carry = 0
+      output = ""
+      while (left_index > 0 || right_index > 0 || carry > 0) {
+        total = carry
+        if (left_index > 0) total += substr(left, left_index--, 1)
+        if (right_index > 0) total += substr(right, right_index--, 1)
+        output = (total % 10) output
+        carry = int(total / 10)
+      }
+      return output == "" ? "0" : output
+    }
     function label(line, name, value) {
       value = line
       sub("^.*" name "=\"", "", value)
@@ -14031,88 +14035,47 @@ assert_coalesced_bridge_metric_delta() {
       failed = 1
     }
     /^obi_java_remote_parent_operations_total/ {
+	  if ($0 !~ /^obi_java_remote_parent_operations_total\{operation="[a-z_]+",status="[a-z_]+",transport="(tcp|getsockopt|unix)"\} before=(0|[1-9][0-9]*) after=(0|[1-9][0-9]*) delta=(0|[1-9][0-9]*)$/) {
+		fail("metric schema", $0)
+		next
+	  }
       operation = label($0, "operation")
       status = label($0, "status")
       transport = label($0, "transport")
-      delta = ""
-      fields = 0
-      for (field = 1; field <= NF; field++) {
-        if ($field ~ /^delta=/) {
-          delta = $field
-          sub(/^delta=/, "", delta)
-          fields++
-        }
-      }
-      if (fields != 1 || delta !~ /^(0|[1-9][0-9]*)$/) {
-        fail("metric delta", $0)
-        next
-      }
-      if (operation == "take" || operation == "discard") {
-        if (transport != selected) {
-          if (delta != 0) fail("non-selected retrieval", $0)
-        } else if (status == "valid") {
-          if (operation == "take") takes += delta
-          else discards += delta
-        } else if (delta != 0) {
-          fail("retrieval result", $0)
-        }
-        next
-      }
-      if (transport == "tcp" && operation == "candidate") {
-        candidate_total += delta
-        if (status == "valid") candidate_valid += delta
-        else if (status == "ambiguous") candidate_ambiguous += delta
-        else if (delta != 0) fail("candidate result", $0)
-        next
-      }
-      if (transport == "tcp" && operation == "inject") {
-        inject_total += delta
-        if (status == "valid") inject_valid += delta
-        else if (status == "ambiguous") inject_ambiguous += delta
-        else if (delta != 0) fail("inject result", $0)
-        next
-      }
-      if (transport == "tcp" && operation == "stage") {
-        stage_total += delta
-        if (status == "valid") stage_valid += delta
-        else if (delta != 0) fail("stage result", $0)
-        next
-      }
-      if (transport == "tcp" && operation == "handoff") {
-        if (status == "valid") handoff_valid += delta
-        else if (delta != 0) fail("handoff result", $0)
-        next
-      }
+	  before = $2
+	  after = $3
+	  delta = $NF
+	  sub(/^before=/, "", before)
+	  sub(/^after=/, "", after)
+	  sub(/^delta=/, "", delta)
+	  if ("x" decimal_sum(before, delta) != "x" after) {
+		fail("metric arithmetic", $0)
+		next
+	  }
+	  key = operation SUBSEP status SUBSEP transport
+	  if (seen[key]++) fail("duplicate metric", $0)
+	  lifecycle = operation == "candidate" || operation == "inject" ||
+		operation == "stage" || operation == "take" ||
+		operation == "discard" || operation == "handoff"
+	  if (lifecycle) {
+		if (delta != 0) fail("nonzero lifecycle", $0)
+		next
+	  }
       allowed = operation == "negotiate" && status == "missing" && transport == selected
       allowed = allowed || (operation == "cleanup" && status == "valid" && transport == "tcp")
       allowed = allowed || (operation == "report" && status == "valid" && transport == "tcp")
+	  if (operation == "report" && status == "valid" && transport == "tcp") {
+		report_rows++
+		report_delta = delta
+	  }
       if (delta != 0 && !allowed) fail("operation result", $0)
     }
-    END {
-      if (wanted_outcome == "supported_exact") {
-        if (takes != 2 || discards != 0 || stage_valid != 2 || stage_total != 2 ||
-            handoff_valid > 2 || (selected != "getsockopt" && handoff_valid != 0) ||
-            inject_ambiguous != 0 || candidate_ambiguous != 0 ||
-            inject_total < 2 || inject_total > 3 || inject_valid != inject_total ||
-            candidate_total < 2 || candidate_total > 3 || candidate_valid != candidate_total) {
-          printf "supported coalesced bridge metric mismatch: take=%d discard=%d candidate=%d/%d inject=%d/%d stage=%d/%d handoff=%d\n",
-            takes, discards, candidate_valid, candidate_total, inject_valid, inject_total,
-            stage_valid, stage_total, handoff_valid > "/dev/stderr"
-          failed = 1
-        }
-      } else if (takes != 0 || discards != 0 || stage_total != 0 || handoff_valid != 0 ||
-                 inject_total != 2 || inject_valid < 1 || inject_ambiguous > 1 ||
-                 inject_valid + inject_ambiguous != inject_total ||
-                 candidate_total < 1 || candidate_total > 2 || candidate_valid < 1 ||
-                 candidate_valid + candidate_ambiguous != candidate_total) {
-        printf "ambiguous coalesced bridge metric mismatch: take=%d discard=%d candidate=%d/%d ambiguous=%d inject=%d/%d ambiguous=%d stage=%d handoff=%d\n",
-          takes, discards, candidate_valid, candidate_total, candidate_ambiguous,
-          inject_valid, inject_total, inject_ambiguous, stage_total,
-          handoff_valid > "/dev/stderr"
-        failed = 1
-      }
-      exit failed ? 1 : 0
-    }
+	END {
+	  if (report_rows != 1 || report_delta + 0 <= 0) {
+		fail("missing positive report fence", "report/valid/tcp")
+	  }
+	  exit failed ? 1 : 0
+	}
   ' "$input"
 }
 
@@ -14661,18 +14624,36 @@ assert_one_reason_coded_discard_diagnostics_delta() {
 assert_coalesced_bridge_diagnostics_delta() {
   local -r input="$1"
   local -r outcome="$2"
+	local name=""
+	local actual=""
+	local expected=""
+	local -a failure_counters=(
+	  provider_reject provider_ver lookup_missing lookup_version lookup_error
+	  record_version invoke_error extract_fields extract_invalid extract_error
+	  registration_fail
+	)
 
-  case "$outcome" in
-    supported_exact)
-      assert_java_diagnostics_delta "$input" 2 0 0 0 2 0 0 "" 0
-      ;;
-    ambiguous_drop)
-      assert_one_reason_coded_discard_diagnostics_delta "$input" 0 ambiguous
-      ;;
-    *)
-      return 1
-      ;;
-  esac
+	[[ "$outcome" == "receive_ambiguous" ]] || return 1
+	assert_java_diagnostics_delta_schema "$input" || return 1
+	while IFS= read -r name; do
+	  actual="$(java_diagnostic_delta "$input" "$name")" || return 1
+	  expected=0
+	  if [[ "$name" == "t_missing" ]]; then
+		expected=2
+	  elif [[ "$name" == "d_ambiguous" ]]; then
+		expected=1
+	  fi
+	  [[ "$actual" == "$expected" ]] || {
+		log_error "coalesced receive diagnostics expected $name=$expected, got $actual"
+		return 1
+	  }
+	done < <(awk '$1 ~ /^[td]_/ { print $1 }' "$input")
+	for name in "${failure_counters[@]}"; do
+	  [[ "$(java_diagnostic_delta "$input" "$name")" == "0" ]] || return 1
+	done
+	[[ "$(java_diagnostic_delta "$input" take_sampled)" == "0" && \
+	  "$(java_diagnostic_delta "$input" take_unsampled)" == "0" && \
+	  "$(java_diagnostic_delta "$input" discard_standard)" == "0" ]]
 }
 
 assert_timeout_cancellation_diagnostics_delta() {

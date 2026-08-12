@@ -6829,74 +6829,60 @@ test_reason_coded_scenario_reconciliation_is_exact() {
   local -r coalesced="$TEST_TMP_DIR/coalesced-reconciliation.json"
   local -r mutated="$TEST_TMP_DIR/reason-coded-reconciliation-mutated.json"
   local -r timeout="$TEST_TMP_DIR/timeout-reconciliation.json"
+	local mutation=""
+	local boundary=""
+	local -a coalesced_mutations=()
 
   printf '%s\n' \
-    '{"status":"passed","scenario":"coalesced-bridge","request_count":2,"coalesced_bridge_correlation":{"outcome":"supported_exact","exact_hit_count":2,"explicit_root_count":0,"wrong_parent_count":0,"unresolved_count":0,"source_client_candidates":2,"trigger_chain_proven":true,"discard_total_delta":0,"discard_ambiguous_delta":0}}' \
+	'{"status":"passed","scenario":"coalesced-bridge","request_count":2,"coalesced_bridge_correlation":{"outcome":"receive_ambiguous","exact_hit_count":0,"explicit_root_count":2,"wrong_parent_count":0,"unresolved_count":0,"source_client_operations":1,"source_client_marker":"absent","apache_trigger_chain_proven":true,"source_operation_chain_proven":true,"source_plaintext_write_bytes":338,"tls_read_delta":1,"tls_bytes_delta":338,"take_missing_delta":2,"discard_total_delta":1,"discard_ambiguous_delta":1}}' \
     >"$coalesced"
   [[ "$(coalesced_bridge_reconciliation "$coalesced" | jq -r '.outcome')" == \
-    "supported_exact" ]] || return 1
-  jq 'del(.coalesced_bridge_correlation.discard_total_delta)' \
-    "$coalesced" >"$mutated"
-  if coalesced_bridge_reconciliation "$mutated" >/dev/null 2>&1; then
-    printf 'coalesced reconciliation accepted a missing total discard count\n' >&2
-    return 1
-  fi
-  jq '.coalesced_bridge_correlation.discard_total_delta = null' \
-    "$coalesced" >"$mutated"
-  if coalesced_bridge_reconciliation "$mutated" >/dev/null 2>&1; then
-    printf 'coalesced reconciliation accepted a null total discard count\n' >&2
-    return 1
-  fi
-  jq '.coalesced_bridge_correlation.discard_total_delta = "0"' \
-    "$coalesced" >"$mutated"
-  if coalesced_bridge_reconciliation "$mutated" >/dev/null 2>&1; then
-    printf 'coalesced reconciliation accepted a string total discard count\n' >&2
-    return 1
-  fi
-  jq '.coalesced_bridge_correlation.discard_total_delta = 2' \
-    "$coalesced" >"$mutated"
-  if coalesced_bridge_reconciliation "$mutated" >/dev/null 2>&1; then
-    printf 'coalesced reconciliation accepted two total discards\n' >&2
-    return 1
-  fi
-  sed -i 's/"source_client_candidates":2/"source_client_candidates":1/' "$coalesced"
-  if coalesced_bridge_reconciliation "$coalesced" >/dev/null 2>&1; then
-    printf 'coalesced exact reconciliation accepted one source candidate for two parents\n' >&2
-    return 1
-  fi
-  sed -i 's/"source_client_candidates":1/"source_client_candidates":2/' "$coalesced"
-  sed -i 's/"discard_total_delta":0/"discard_total_delta":1/' "$coalesced"
-  if coalesced_bridge_reconciliation "$coalesced" >/dev/null 2>&1; then
-    printf 'coalesced exact reconciliation accepted an unexpected discard\n' >&2
-    return 1
-  fi
-  sed -i 's/"discard_total_delta":1/"discard_total_delta":0/' "$coalesced"
-  sed -i \
-    -e 's/"outcome":"supported_exact"/"outcome":"ambiguous_drop"/' \
-    -e 's/"exact_hit_count":2/"exact_hit_count":0/' \
-    -e 's/"explicit_root_count":0/"explicit_root_count":2/' \
-    -e 's/"discard_total_delta":0/"discard_total_delta":1/' \
-    -e 's/"discard_ambiguous_delta":0/"discard_ambiguous_delta":1/' \
-    "$coalesced"
-  [[ "$(coalesced_bridge_reconciliation "$coalesced" | jq -r '.outcome')" == \
-    "ambiguous_drop" ]] || return 1
-  sed -i 's/"source_client_candidates":2/"source_client_candidates":1/' "$coalesced"
-  if coalesced_bridge_reconciliation "$coalesced" >/dev/null 2>&1; then
-    printf 'coalesced ambiguous reconciliation accepted one source candidate\n' >&2
-    return 1
-  fi
-  sed -i 's/"source_client_candidates":1/"source_client_candidates":2/' "$coalesced"
-  sed -i 's/"discard_total_delta":1/"discard_total_delta":0/' "$coalesced"
-  if coalesced_bridge_reconciliation "$coalesced" >/dev/null 2>&1; then
-    printf 'coalesced ambiguous reconciliation accepted zero total discards\n' >&2
-    return 1
-  fi
-  sed -i 's/"discard_total_delta":0/"discard_total_delta":1/' "$coalesced"
-  sed -i 's/"wrong_parent_count":0/"wrong_parent_count":1/' "$coalesced"
-  if coalesced_bridge_reconciliation "$coalesced" >/dev/null 2>&1; then
-    printf 'coalesced reconciliation accepted a wrong parent\n' >&2
-    return 1
-  fi
+	"receive_ambiguous" ]] || return 1
+	for boundary in 1 8192; do
+	  jq ".coalesced_bridge_correlation.source_plaintext_write_bytes = $boundary |
+		.coalesced_bridge_correlation.tls_bytes_delta = $boundary" \
+		"$coalesced" >"$mutated"
+	  [[ "$(coalesced_bridge_reconciliation "$mutated" | jq -r '.outcome')" == \
+		"receive_ambiguous" ]] || {
+		printf 'coalesced receive reconciliation rejected byte boundary=%s\n' \
+		  "$boundary" >&2
+		return 1
+	  }
+	done
+	coalesced_mutations=(
+	  '.status = "failed"'
+	  '.scenario = "basic"'
+	  '.request_count = 1'
+	  '.coalesced_bridge_correlation.outcome = "supported_exact"'
+	  '.coalesced_bridge_correlation.exact_hit_count = 1'
+	  '.coalesced_bridge_correlation.explicit_root_count = 1'
+	  '.coalesced_bridge_correlation.wrong_parent_count = 1'
+	  '.coalesced_bridge_correlation.unresolved_count = 1'
+	  '.coalesced_bridge_correlation.source_client_operations = 0'
+	  '.coalesced_bridge_correlation.source_client_operations = 2'
+	  '.coalesced_bridge_correlation.source_client_marker = "first"'
+	  '.coalesced_bridge_correlation.apache_trigger_chain_proven = false'
+	  '.coalesced_bridge_correlation.source_operation_chain_proven = false'
+	  '.coalesced_bridge_correlation.source_plaintext_write_bytes = 0 | .coalesced_bridge_correlation.tls_bytes_delta = 0'
+	  '.coalesced_bridge_correlation.source_plaintext_write_bytes = 8193 | .coalesced_bridge_correlation.tls_bytes_delta = 8193'
+	  '.coalesced_bridge_correlation.source_plaintext_write_bytes = 1.5 | .coalesced_bridge_correlation.tls_bytes_delta = 1.5'
+	  '.coalesced_bridge_correlation.source_plaintext_write_bytes = "338" | .coalesced_bridge_correlation.tls_bytes_delta = "338"'
+	  '.coalesced_bridge_correlation.tls_read_delta = 0'
+	  '.coalesced_bridge_correlation.tls_bytes_delta = 337'
+	  '.coalesced_bridge_correlation.take_missing_delta = 1'
+	  '.coalesced_bridge_correlation.discard_total_delta = 0'
+	  '.coalesced_bridge_correlation.discard_total_delta = 2'
+	  '.coalesced_bridge_correlation.discard_ambiguous_delta = 0'
+	  '.coalesced_bridge_correlation.discard_ambiguous_delta = 2'
+	  'del(.coalesced_bridge_correlation.source_operation_chain_proven) | .coalesced_bridge_correlation.trigger_chain_proven = true'
+	)
+	for mutation in "${coalesced_mutations[@]}"; do
+	  jq "$mutation" "$coalesced" >"$mutated"
+	  if coalesced_bridge_reconciliation "$mutated" >/dev/null 2>&1; then
+		printf 'coalesced receive reconciliation accepted mutation: %s\n' "$mutation" >&2
+		return 1
+	  fi
+	done
 
   printf '%s\n' \
     '{"status":"passed","scenario":"timeout-retry","faults":[{"kind":"client-timeout","outcome":"deadline-exceeded-as-expected","marker":"timeout-retry-cancelled-42","parent_outcome":"exact","drop_reasons":[]}]}' \
@@ -7169,65 +7155,109 @@ EOF
 
 test_coalesced_bridge_metrics_follow_explicit_outcome() {
   local -r delta="$TEST_TMP_DIR/coalesced-bridge.delta"
+	local -r mutated="$TEST_TMP_DIR/coalesced-bridge-mutated.delta"
+	local operation=""
 
   printf '%s\n' \
-    'obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=0 after=2 delta=2' \
-    'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} before=0 after=2 delta=2' \
-    'obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=0 after=2 delta=2' \
-    'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} before=0 after=2 delta=2' \
-    'obi_java_remote_parent_operations_total{operation="handoff",status="valid",transport="tcp"} before=0 after=2 delta=2' \
+	'obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=0 after=0 delta=0' \
+	'obi_java_remote_parent_operations_total{operation="candidate",status="ambiguous",transport="tcp"} before=0 after=0 delta=0' \
+	'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} before=0 after=0 delta=0' \
+	'obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=0 after=0 delta=0' \
+	'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} before=0 after=0 delta=0' \
+	'obi_java_remote_parent_operations_total{operation="discard",status="missing",transport="unix"} before=0 after=0 delta=0' \
+	'obi_java_remote_parent_operations_total{operation="handoff",status="valid",transport="tcp"} before=0 after=0 delta=0' \
+	'obi_java_remote_parent_operations_total{operation="negotiate",status="missing",transport="getsockopt"} before=0 after=1 delta=1' \
+	'obi_java_remote_parent_operations_total{operation="cleanup",status="valid",transport="tcp"} before=7 after=9 delta=2' \
+	'obi_java_remote_parent_operations_total{operation="report",status="valid",transport="tcp"} before=9999999999999999 after=10000000000000001 delta=2' \
     >"$delta"
-  assert_coalesced_bridge_metric_delta "$delta" getsockopt supported_exact || {
-    printf 'coalesced bridge metrics rejected the explicit exact outcome\n' >&2
-    return 1
-  }
-  sed -i \
-    's/operation="handoff",status="valid",transport="tcp"} before=0 after=2 delta=2/operation="handoff",status="valid",transport="tcp"} before=0 after=1 delta=1/' \
-    "$delta"
-  assert_coalesced_bridge_metric_delta "$delta" getsockopt supported_exact || {
-    printf 'coalesced bridge metrics rejected a valid handoff subset\n' >&2
-    return 1
-  }
-  sed -i \
-    's/operation="handoff",status="valid",transport="tcp"} before=0 after=1 delta=1/operation="handoff",status="valid",transport="tcp"} before=0 after=2 delta=2/' \
-    "$delta"
-  sed -i \
-    's/operation="take",status="valid",transport="getsockopt"/operation="take",status="valid",transport="unix"/' \
-    "$delta"
-  if assert_coalesced_bridge_metric_delta \
-    "$delta" unix supported_exact >/dev/null 2>&1; then
-    printf 'coalesced bridge metrics accepted BPF handoffs for Unix retrieval\n' >&2
-    return 1
-  fi
-  sed -i '/operation="handoff",status="valid",transport="tcp"/d' "$delta"
-  assert_coalesced_bridge_metric_delta "$delta" unix supported_exact || {
-    printf 'coalesced bridge metrics rejected a Unix result without BPF handoffs\n' >&2
-    return 1
-  }
-
-  printf '%s\n' \
-    'obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=0 after=1 delta=1' \
-    'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} before=0 after=1 delta=1' \
-    'obi_java_remote_parent_operations_total{operation="inject",status="ambiguous",transport="tcp"} before=0 after=1 delta=1' \
-    'obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=0 after=0 delta=0' \
-    'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} before=0 after=0 delta=0' \
-    >"$delta"
-  assert_coalesced_bridge_metric_delta "$delta" getsockopt ambiguous_drop || {
-    printf 'coalesced bridge metrics rejected the explicit ambiguous outcome\n' >&2
-    return 1
-  }
-  sed -i \
-    's/operation="take",status="valid",transport="getsockopt"} before=0 after=0 delta=0/operation="take",status="valid",transport="getsockopt"} before=0 after=1 delta=1/' \
-    "$delta"
-  if assert_coalesced_bridge_metric_delta \
-    "$delta" getsockopt ambiguous_drop >/dev/null 2>&1; then
-    printf 'coalesced ambiguous metrics accepted a valid Java take\n' >&2
-    return 1
-  fi
+	assert_coalesced_bridge_metric_delta "$delta" getsockopt receive_ambiguous || {
+	  printf 'coalesced receive metrics rejected the zero-lifecycle outcome\n' >&2
+	  return 1
+	}
+	sed \
+	  's/operation="negotiate",status="missing",transport="getsockopt"/operation="negotiate",status="missing",transport="unix"/' \
+	  "$delta" >"$mutated"
+	assert_coalesced_bridge_metric_delta "$mutated" unix receive_ambiguous || {
+	  printf 'coalesced receive metrics rejected the Unix zero-lifecycle outcome\n' >&2
+	  return 1
+	}
+	: >"$mutated"
+	if assert_coalesced_bridge_metric_delta \
+	  "$mutated" getsockopt receive_ambiguous >/dev/null 2>&1; then
+	  printf 'coalesced receive metrics accepted empty evidence\n' >&2
+	  return 1
+	fi
+	printf '%s\n' \
+	  'obi_bpf_map_entries_total{map_id="1",map_name="java_remote_par",map_type="Hash"} before=0 after=0 delta=0' \
+	  >"$mutated"
+	if assert_coalesced_bridge_metric_delta \
+	  "$mutated" getsockopt receive_ambiguous >/dev/null 2>&1; then
+	  printf 'coalesced receive metrics accepted evidence without bridge operations\n' >&2
+	  return 1
+	fi
+	sed '/operation="report",status="valid",transport="tcp"/ s/before=9999999999999999 after=10000000000000001 delta=2/before=0 after=0 delta=0/' \
+	  "$delta" >"$mutated"
+	if assert_coalesced_bridge_metric_delta \
+	  "$mutated" getsockopt receive_ambiguous >/dev/null 2>&1; then
+	  printf 'coalesced receive metrics accepted a zero report fence\n' >&2
+	  return 1
+	fi
+	if assert_coalesced_bridge_metric_delta \
+	  "$delta" getsockopt supported_exact >/dev/null 2>&1; then
+	  printf 'coalesced receive metrics accepted the removed exact outcome\n' >&2
+	  return 1
+	fi
+	for operation in candidate inject stage take discard handoff; do
+	  awk -v wanted="$operation" '
+		!changed && index($0, "operation=\"" wanted "\"") {
+		  sub(/after=0 delta=0$/, "after=1 delta=1")
+		  changed = 1
+		}
+		{ print }
+		END { if (!changed) exit 1 }
+	  ' "$delta" >"$mutated"
+	  if assert_coalesced_bridge_metric_delta \
+		"$mutated" getsockopt receive_ambiguous >/dev/null 2>&1; then
+		printf 'coalesced receive metrics accepted nonzero %s lifecycle\n' "$operation" >&2
+		return 1
+	  fi
+	done
+	sed '/operation="candidate",status="ambiguous"/ s/after=0 delta=0/after=1 delta=1/' \
+	  "$delta" >"$mutated"
+	if assert_coalesced_bridge_metric_delta \
+	  "$mutated" getsockopt receive_ambiguous >/dev/null 2>&1; then
+	  printf 'coalesced receive metrics accepted a reason-coded native candidate\n' >&2
+	  return 1
+	fi
+	{ cat "$delta"; head -n 1 "$delta"; } >"$mutated"
+	if assert_coalesced_bridge_metric_delta \
+	  "$mutated" getsockopt receive_ambiguous >/dev/null 2>&1; then
+	  printf 'coalesced receive metrics accepted a duplicate series\n' >&2
+	  return 1
+	fi
+	sed '1s/,transport="tcp"/,extra="x",transport="tcp"/' "$delta" >"$mutated"
+	if assert_coalesced_bridge_metric_delta \
+	  "$mutated" getsockopt receive_ambiguous >/dev/null 2>&1; then
+	  printf 'coalesced receive metrics accepted an extra label\n' >&2
+	  return 1
+	fi
+	sed '1s/delta=0/delta=0 delta=0/' "$delta" >"$mutated"
+	if assert_coalesced_bridge_metric_delta \
+	  "$mutated" getsockopt receive_ambiguous >/dev/null 2>&1; then
+	  printf 'coalesced receive metrics accepted duplicate delta fields\n' >&2
+	  return 1
+	fi
+	sed '1s/after=0 delta=0/after=1 delta=0/' "$delta" >"$mutated"
+	if assert_coalesced_bridge_metric_delta \
+	  "$mutated" getsockopt receive_ambiguous >/dev/null 2>&1; then
+	  printf 'coalesced receive metrics accepted inconsistent counter arithmetic\n' >&2
+	  return 1
+	fi
 }
 
 test_timeout_cancellation_metrics_follow_explicit_outcome() {
   local -r delta="$TEST_TMP_DIR/timeout-cancellation.delta"
+  local -r mutated="$TEST_TMP_DIR/timeout-cancellation-mutated.delta"
   local local_reason=""
 
   printf '%s\n' \
@@ -7242,6 +7272,44 @@ test_timeout_cancellation_metrics_follow_explicit_outcome() {
     printf 'timeout cancellation metrics rejected the exact parent outcome\n' >&2
     return 1
   }
+
+  sed '/operation="handoff"/d' "$delta" >"$mutated"
+  assert_timeout_cancellation_metric_delta \
+    "$mutated" getsockopt exact 2 || {
+    printf 'timeout cancellation metrics rejected an omitted optional handoff\n' >&2
+    return 1
+  }
+  sed \
+    's/operation="handoff",status="valid",transport="tcp"} before=0 after=2 delta=2/operation="handoff",status="valid",transport="tcp"} before=0 after=0 delta=0/' \
+    "$delta" >"$mutated"
+  assert_timeout_cancellation_metric_delta \
+    "$mutated" getsockopt exact 2 || {
+    printf 'timeout cancellation metrics rejected an explicit zero handoff\n' >&2
+    return 1
+  }
+  { cat "$delta"; printf '%s\n' \
+      'obi_java_remote_parent_operations_total{operation="handoff",status="valid",transport="tcp"} before=9 after=9 delta=0'; } \
+    >"$mutated"
+  if assert_timeout_cancellation_metric_delta \
+    "$mutated" getsockopt exact 2 >/dev/null 2>&1; then
+    printf 'timeout cancellation metrics accepted duplicate handoff rows\n' >&2
+    return 1
+  fi
+  sed \
+    's/operation="handoff",status="valid",transport="tcp"} before=0 after=2 delta=2/operation="handoff",status="valid",extra="x",transport="tcp"} before=0 after=0 delta=0/' \
+    "$delta" >"$mutated"
+  if assert_timeout_cancellation_metric_delta \
+    "$mutated" getsockopt exact 2 >/dev/null 2>&1; then
+    printf 'timeout cancellation metrics accepted an extra handoff label\n' >&2
+    return 1
+  fi
+  sed '/operation="handoff"/ s/delta=2$/delta=2 delta=2/' \
+    "$delta" >"$mutated"
+  if assert_timeout_cancellation_metric_delta \
+    "$mutated" getsockopt exact 2 >/dev/null 2>&1; then
+    printf 'timeout cancellation metrics accepted duplicate handoff deltas\n' >&2
+    return 1
+  fi
 
   sed -i \
     's/operation="handoff",status="valid",transport="tcp"} before=0 after=2 delta=2/operation="handoff",status="valid",transport="tcp"} before=0 after=1 delta=1/' \
@@ -9171,23 +9239,70 @@ test_reason_coded_control_diagnostics_are_exact() {
   local -r after="$TEST_TMP_DIR/reason-coded-after.txt"
   local -r delta="$TEST_TMP_DIR/reason-coded.delta"
   local reconciliation=""
+	local mutation=""
 
   write_diagnostics_fixture "$before" 0 0 0 0 0 0
-  write_diagnostics_fixture "$after" 2 0 0 2 0 0
-  write_java_diagnostics_delta "$before" "$after" "$delta"
-  assert_coalesced_bridge_diagnostics_delta "$delta" supported_exact || return 1
-
-  write_diagnostics_fixture "$after" 0 0 0 0 0 0
-  sed -i 's/d_ambiguous=0/d_ambiguous=1/' "$after"
-  write_java_diagnostics_delta "$before" "$after" "$delta"
-  assert_coalesced_bridge_diagnostics_delta "$delta" ambiguous_drop || return 1
-  sed -i 's/d_missing before=0 after=0 delta=0/d_missing before=0 after=1 delta=1/' \
-    "$delta"
-  if assert_coalesced_bridge_diagnostics_delta \
-    "$delta" ambiguous_drop >/dev/null 2>&1; then
-    printf 'coalesced diagnostics accepted a second discard reason\n' >&2
-    return 1
-  fi
+	write_diagnostics_fixture "$after" 0 0 0 0 0 0
+	sed -i 's/,t_missing=0/,t_missing=2/' "$after"
+	sed -i 's/d_ambiguous=0/d_ambiguous=1/' "$after"
+	write_java_diagnostics_delta "$before" "$after" "$delta"
+	assert_coalesced_bridge_diagnostics_delta "$delta" receive_ambiguous || return 1
+	if assert_coalesced_bridge_diagnostics_delta \
+	  "$delta" supported_exact >/dev/null 2>&1; then
+	  printf 'coalesced diagnostics accepted the removed exact outcome\n' >&2
+	  return 1
+	fi
+	{ cat "$delta"; head -n 1 "$delta"; } >"$delta.invalid"
+	if assert_coalesced_bridge_diagnostics_delta \
+	  "$delta.invalid" receive_ambiguous >/dev/null 2>&1; then
+	  printf 'coalesced diagnostics accepted a duplicate schema row\n' >&2
+	  return 1
+	fi
+	write_java_diagnostics_delta "$before" "$after" "$delta"
+	sed -i 's/provider_reject before=0 after=0 delta=0/provider_reject before=0 after=1 delta=1/' \
+	  "$delta"
+	if assert_coalesced_bridge_diagnostics_delta \
+	  "$delta" receive_ambiguous >/dev/null 2>&1; then
+	  printf 'coalesced diagnostics accepted a deterministic failure counter\n' >&2
+	  return 1
+	fi
+	for mutation in \
+	  'take_sampled before=0 after=0 delta=0|take_sampled before=0 after=1 delta=1' \
+	  'take_unsampled before=0 after=0 delta=0|take_unsampled before=0 after=1 delta=1' \
+	  'discard_standard before=0 after=0 delta=0|discard_standard before=0 after=1 delta=1'; do
+	  write_java_diagnostics_delta "$before" "$after" "$delta"
+	  sed -i "s/${mutation%%|*}/${mutation#*|}/" "$delta"
+	  if assert_coalesced_bridge_diagnostics_delta \
+		"$delta" receive_ambiguous >/dev/null 2>&1; then
+		printf 'coalesced diagnostics accepted changed trace flags: %s\n' \
+		  "${mutation%% *}" >&2
+		return 1
+	  fi
+	done
+	write_java_diagnostics_delta "$before" "$after" "$delta"
+	sed -i 's/t_missing before=0 after=2 delta=2/t_missing before=0 after=1 delta=1/' \
+	  "$delta"
+	if assert_coalesced_bridge_diagnostics_delta \
+	  "$delta" receive_ambiguous >/dev/null 2>&1; then
+	  printf 'coalesced diagnostics accepted one missing take\n' >&2
+	  return 1
+	fi
+	write_java_diagnostics_delta "$before" "$after" "$delta"
+	sed -i 's/d_ambiguous before=0 after=1 delta=1/d_ambiguous before=0 after=2 delta=2/' \
+	  "$delta"
+	if assert_coalesced_bridge_diagnostics_delta \
+	  "$delta" receive_ambiguous >/dev/null 2>&1; then
+	  printf 'coalesced diagnostics accepted two ambiguity discards\n' >&2
+	  return 1
+	fi
+	write_java_diagnostics_delta "$before" "$after" "$delta"
+	sed -i 's/d_missing before=0 after=0 delta=0/d_missing before=0 after=1 delta=1/' \
+	  "$delta"
+	if assert_coalesced_bridge_diagnostics_delta \
+	  "$delta" receive_ambiguous >/dev/null 2>&1; then
+	  printf 'coalesced diagnostics accepted a second discard reason\n' >&2
+	  return 1
+	fi
 
   reconciliation='{"parent_outcome":"exact","drop_reasons":[]}'
   write_diagnostics_fixture "$after" 2 0 0 2 0 0

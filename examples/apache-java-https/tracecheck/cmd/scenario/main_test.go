@@ -242,7 +242,7 @@ func TestPressureUsesReasonCodedParentPolicy(t *testing.T) {
 	assert.Equal(t, tracecheck.ModePressure, expectation.Mode)
 }
 
-func TestCoalescedBridgeCorrelationAcceptsOnlyExactOrAmbiguousDrop(t *testing.T) {
+func TestCoalescedBridgeCorrelationAcceptsOnlyReceiveAmbiguity(t *testing.T) {
 	cfg := config{
 		scenario:               "coalesced-bridge",
 		apacheService:          "apache-proxy",
@@ -251,219 +251,197 @@ func TestCoalescedBridgeCorrelationAcceptsOnlyExactOrAmbiguousDrop(t *testing.T)
 	}
 	first := requestCase{Marker: "first", Endpoint: "/api/coalesced-bridge"}
 	second := requestCase{Marker: "second", Endpoint: "/api/coalesced-bridge"}
-	exactSnapshots := coalescedSnapshots(first.Marker, second.Marker, [2]bool{})
-	exactUnion, err := coalescedSpanUnion(exactSnapshots)
+	requests := []requestCase{first, second}
+	snapshots := coalescedSnapshots(first.Marker, second.Marker)
+	require.NoError(t, validateCoalescedSnapshotSet(cfg, requests, snapshots[:2], snapshots[2]))
+	spans, err := coalescedSpanUnion(snapshots)
 	require.NoError(t, err)
-	for index, request := range []requestCase{first, second} {
-		combined := exactSnapshots[index]
-		combined.Spans = exactUnion
-		outcome, candidates, chain, classifyErr := classifyCoalescedBridgeSnapshot(
-			cfg,
-			request,
-			first.Marker,
-			combined,
-		)
-		require.NoError(t, classifyErr)
-		assert.Equal(t, tracecheck.PressureParentExactHit, outcome)
-		assert.Equal(t, 1, candidates)
-		assert.True(t, chain)
-	}
-
-	rootSnapshots := coalescedSnapshots(first.Marker, second.Marker, [2]bool{true, true})
-	rootUnion, err := coalescedSpanUnion(rootSnapshots)
+	summary, err := classifyCoalescedBridgeAmbiguity(cfg, requests, spans)
 	require.NoError(t, err)
-	for index, request := range []requestCase{first, second} {
-		combined := rootSnapshots[index]
-		combined.Spans = rootUnion
-		outcome, candidates, chain, classifyErr := classifyCoalescedBridgeSnapshot(
-			cfg,
-			request,
-			first.Marker,
-			combined,
-		)
-		require.NoError(t, classifyErr)
-		assert.Equal(t, tracecheck.PressureParentExplicitRoot, outcome)
-		assert.Equal(t, 1, candidates)
-		assert.True(t, chain)
-	}
+	summary.SourcePlaintextWriteBytes = 338
+	summary.TLSReadDelta = 1
+	summary.TLSBytesDelta = 338
+	summary.TakeMissingDelta = 2
+	summary.DiscardTotalDelta = 1
+	summary.DiscardAmbiguousDelta = 1
+	require.NoError(t, validateCoalescedBridgeCorrelation(&summary, 2))
+	assert.Equal(t, "receive_ambiguous", summary.Outcome)
+	assert.Equal(t, 2, summary.ExplicitRootCount)
+	assert.Equal(t, 1, summary.SourceClientOperations)
+	assert.Equal(t, "absent", summary.SourceClientMarker)
+	assert.True(t, summary.ApacheTriggerChainProven)
+	assert.True(t, summary.SourceOperationChainProven)
 
-	exactSummary := coalescedBridgeCorrelationSummary{
-		ExactHitCount:          2,
-		SourceClientCandidates: 2,
-		TriggerChainProven:     true,
+	for name, mutate := range map[string]func(*coalescedBridgeCorrelationSummary){
+		"legacy exact outcome":      func(value *coalescedBridgeCorrelationSummary) { value.ExactHitCount = 2; value.ExplicitRootCount = 0 },
+		"wrong parent":              func(value *coalescedBridgeCorrelationSummary) { value.WrongParentCount = 1 },
+		"unresolved":                func(value *coalescedBridgeCorrelationSummary) { value.UnresolvedCount = 1 },
+		"missing source operation":  func(value *coalescedBridgeCorrelationSummary) { value.SourceClientOperations = 0 },
+		"marked source operation":   func(value *coalescedBridgeCorrelationSummary) { value.SourceClientMarker = "first" },
+		"broken Apache path":        func(value *coalescedBridgeCorrelationSummary) { value.ApacheTriggerChainProven = false },
+		"broken source path":        func(value *coalescedBridgeCorrelationSummary) { value.SourceOperationChainProven = false },
+		"missing TLS read":          func(value *coalescedBridgeCorrelationSummary) { value.TLSReadDelta = 0 },
+		"wrong TLS bytes":           func(value *coalescedBridgeCorrelationSummary) { value.TLSBytesDelta-- },
+		"missing take observations": func(value *coalescedBridgeCorrelationSummary) { value.TakeMissingDelta = 1 },
+		"missing ambiguity discard": func(value *coalescedBridgeCorrelationSummary) { value.DiscardTotalDelta = 0 },
+		"wrong discard reason":      func(value *coalescedBridgeCorrelationSummary) { value.DiscardAmbiguousDelta = 0 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := summary
+			mutate(&candidate)
+			require.Error(t, validateCoalescedBridgeCorrelation(&candidate, 2))
+		})
 	}
-	require.NoError(t, validateCoalescedBridgeCorrelation(&exactSummary, 2))
-	assert.Equal(t, "supported_exact", exactSummary.Outcome)
-
-	ambiguousSummary := coalescedBridgeCorrelationSummary{
-		ExplicitRootCount:      2,
-		SourceClientCandidates: 2,
-		TriggerChainProven:     true,
-		DiscardTotalDelta:      1,
-		DiscardAmbiguousDelta:  1,
-	}
-	require.NoError(t, validateCoalescedBridgeCorrelation(&ambiguousSummary, 2))
-	assert.Equal(t, "ambiguous_drop", ambiguousSummary.Outcome)
-
-	wrong := ambiguousSummary
-	wrong.WrongParentCount = 1
-	require.ErrorContains(t, validateCoalescedBridgeCorrelation(&wrong, 2), "incomplete")
-	mixed := ambiguousSummary
-	mixed.ExplicitRootCount = 1
-	mixed.ExactHitCount = 1
-	require.ErrorContains(t, validateCoalescedBridgeCorrelation(&mixed, 2), "all exact parents")
-	missingCandidate := ambiguousSummary
-	missingCandidate.SourceClientCandidates = 1
-	require.ErrorContains(t, validateCoalescedBridgeCorrelation(&missingCandidate, 2), "incomplete")
-	unexpectedDrop := exactSummary
-	unexpectedDrop.DiscardTotalDelta = 1
-	require.ErrorContains(t, validateCoalescedBridgeCorrelation(&unexpectedDrop, 2), "all exact parents")
-	mixedDrops := ambiguousSummary
-	mixedDrops.DiscardTotalDelta = 2
-	require.ErrorContains(t, validateCoalescedBridgeCorrelation(&mixedDrops, 2), "all exact parents")
 }
 
-func TestCoalescedBridgeCorrelationRejectsIncompleteTriggerChains(t *testing.T) {
+func TestCoalescedBridgeCorrelationRejectsInvalidTopology(t *testing.T) {
 	cfg := config{
 		apacheService:          "apache-proxy",
 		coalescedSourceService: "coalesced-source",
 		javaService:            "java-backend",
 	}
-	request := requestCase{Marker: "second", Endpoint: "/api/coalesced-bridge"}
-	triggerMarker := "first"
-	tests := map[string]func([]tracecheck.Snapshot){
-		"missing Apache client": func(snapshots []tracecheck.Snapshot) {
-			snapshots[0].Spans[spanIndex(t, snapshots[0], "apache-proxy", "CLIENT")].ServiceName = "other"
+	requests := []requestCase{
+		{Marker: "first", Endpoint: "/api/coalesced-bridge"},
+		{Marker: "second", Endpoint: "/api/coalesced-bridge"},
+	}
+	tests := map[string]func([]tracecheck.Span){
+		"missing Apache server": func(spans []tracecheck.Span) {
+			spans[coalescedSpanIndex(t, spans, "apache-proxy", "SERVER")].ServiceName = "other"
 		},
-		"duplicate Apache client": func(snapshots []tracecheck.Snapshot) {
-			duplicate := snapshots[0].Spans[spanIndex(t, snapshots[0], "apache-proxy", "CLIENT")]
+		"missing Apache client": func(spans []tracecheck.Span) {
+			spans[coalescedSpanIndex(t, spans, "apache-proxy", "CLIENT")].ServiceName = "other"
+		},
+		"duplicate Apache client": func(spans []tracecheck.Span) {
+			index := coalescedSpanIndex(t, spans, "apache-proxy", "CLIENT")
+			duplicate := spans[index]
 			duplicate.SpanID = "apache-client-duplicate"
-			snapshots[0].Spans = append(snapshots[0].Spans, duplicate)
+			spans[coalescedSpanIndex(t, spans, "apache-proxy", "INTERNAL")] = duplicate
 		},
-		"wrong source parent": func(snapshots []tracecheck.Snapshot) {
-			snapshots[0].Spans[spanIndex(t, snapshots[0], "coalesced-source", "SERVER")].ParentSpanID = "foreign"
+		"broken Apache ancestry": func(spans []tracecheck.Span) {
+			spans[coalescedSpanIndex(t, spans, "apache-proxy", "CLIENT")].ParentSpanID = "foreign"
 		},
-		"source parent explicitly local": func(snapshots []tracecheck.Snapshot) {
-			snapshots[0].Spans[spanIndex(t, snapshots[0], "coalesced-source", "SERVER")].Flags = 0x101
+		"source server has remote parent": func(spans []tracecheck.Span) {
+			spans[coalescedSpanIndex(t, spans, "coalesced-source", "SERVER")].ParentSpanID = "apache-client"
 		},
-		"source trace flags changed": func(snapshots []tracecheck.Snapshot) {
-			snapshots[0].Spans[spanIndex(t, snapshots[0], "coalesced-source", "SERVER")].Flags = 0x300
+		"missing source server": func(spans []tracecheck.Span) {
+			spans[coalescedSpanIndex(t, spans, "coalesced-source", "SERVER")].ServiceName = "other"
 		},
-		"missing second source client": func(snapshots []tracecheck.Snapshot) {
-			index := spanIndex(t, snapshots[1], "coalesced-source", "CLIENT")
-			snapshots[1].Spans = append(snapshots[1].Spans[:index], snapshots[1].Spans[index+1:]...)
+		"missing source operation": func(spans []tracecheck.Span) {
+			spans[coalescedSpanIndex(t, spans, "coalesced-source", "CLIENT")].ServiceName = "other"
 		},
-		"unrelated second source client": func(snapshots []tracecheck.Snapshot) {
-			snapshots[1].Spans[spanIndex(t, snapshots[1], "coalesced-source", "CLIENT")].ParentSpanID = "foreign"
+		"extra source operation": func(spans []tracecheck.Span) {
+			index := coalescedSpanIndex(t, spans, "coalesced-source", "CLIENT")
+			duplicate := spans[index]
+			duplicate.SpanID = "source-client-duplicate"
+			spans[coalescedSpanIndex(t, spans, "coalesced-source", "INTERNAL")] = duplicate
 		},
-		"extra marked Java server at wrong endpoint": func(snapshots []tracecheck.Snapshot) {
-			duplicate := snapshots[1].Spans[spanIndex(t, snapshots[1], "java-backend", "SERVER")]
-			duplicate.SpanID = "java-server-duplicate"
-			duplicate.Attributes = cloneStringMap(duplicate.Attributes)
-			duplicate.Attributes["http.route"] = "/wrong"
-			snapshots[1].Spans = append(snapshots[1].Spans, duplicate)
+		"broken source ancestry": func(spans []tracecheck.Span) {
+			spans[coalescedSpanIndex(t, spans, "coalesced-source", "CLIENT")].ParentSpanID = "foreign"
 		},
-		"related markerless Java server with wrong parent": func(snapshots []tracecheck.Snapshot) {
-			snapshots[1].RelatedSpans = append(snapshots[1].RelatedSpans, tracecheck.Span{
-				ServiceName:  "java-backend",
-				Kind:         "SERVER",
-				TraceID:      "source-trace",
-				SpanID:       "related-java-wrong-parent",
-				ParentSpanID: "foreign",
-				Flags:        0x301,
-			})
+		"marked source operation": func(spans []tracecheck.Span) {
+			spans[coalescedSpanIndex(t, spans, "coalesced-source", "CLIENT")].Attributes["http.request.header.x-obi-demo-id"] = "first"
 		},
-		"related markerless Java server with changed flags": func(snapshots []tracecheck.Snapshot) {
-			snapshots[1].RelatedSpans = append(snapshots[1].RelatedSpans, tracecheck.Span{
-				ServiceName:  "java-backend",
-				Kind:         "SERVER",
-				TraceID:      "source-trace",
-				SpanID:       "related-java-changed-flags",
-				ParentSpanID: "source-client-2",
-				Flags:        0x300,
-			})
+		"invalid source marker": func(spans []tracecheck.Span) {
+			spans[coalescedSpanIndex(t, spans, "coalesced-source", "CLIENT")].Attributes["obi.related.marker.invalid"] = "true"
+		},
+		"Java retained parent": func(spans []tracecheck.Span) {
+			spans[coalescedSpanIndex(t, spans, "java-backend", "SERVER")].ParentSpanID = "source-client"
+		},
+		"Java used wrong endpoint": func(spans []tracecheck.Span) {
+			spans[coalescedSpanIndex(t, spans, "java-backend", "SERVER")].Attributes["url.path"] = "/wrong"
+		},
+		"Java parent locality unknown": func(spans []tracecheck.Span) {
+			spans[coalescedSpanIndex(t, spans, "java-backend", "SERVER")].Flags = 0x003
+		},
+		"Java parent marked remote": func(spans []tracecheck.Span) {
+			spans[coalescedSpanIndex(t, spans, "java-backend", "SERVER")].Flags = 0x303
+		},
+		"Java reused source trace": func(spans []tracecheck.Span) {
+			spans[coalescedSpanIndex(t, spans, "java-backend", "SERVER")].TraceID = "source-trace"
+		},
+		"Java roots share trace": func(spans []tracecheck.Span) {
+			first := coalescedSpanIndex(t, spans, "java-backend", "SERVER")
+			for index := first + 1; index < len(spans); index++ {
+				if spans[index].ServiceName == "java-backend" && spans[index].Kind == "SERVER" {
+					spans[index].TraceID = spans[first].TraceID
+					return
+				}
+			}
 		},
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
-			snapshots := coalescedSnapshots(triggerMarker, request.Marker, [2]bool{})
-			mutate(snapshots)
-			spanUnion, unionErr := coalescedSpanUnion(snapshots)
-			require.NoError(t, unionErr)
-			candidate := snapshots[1]
-			candidate.Spans = spanUnion
-			outcome, _, chain, err := classifyCoalescedBridgeSnapshot(
-				cfg,
-				request,
-				triggerMarker,
-				candidate,
-			)
-			assert.Equal(t, tracecheck.PressureParentUnresolved, outcome)
-			assert.False(t, chain)
+			spans := cloneCoalescedSpans(coalescedSnapshots("first", "second")[2].Spans)
+			mutate(spans)
+			_, err := classifyCoalescedBridgeAmbiguity(cfg, requests, spans)
 			require.Error(t, err)
 		})
 	}
 
 	t.Run("conflicting duplicate union identity", func(t *testing.T) {
-		snapshots := coalescedSnapshots(triggerMarker, request.Marker, [2]bool{})
-		conflict := snapshots[1].Spans[spanIndex(t, snapshots[1], "coalesced-source", "CLIENT")]
+		snapshots := coalescedSnapshots("first", "second")
+		conflict := snapshots[2].Spans[coalescedSpanIndex(t, snapshots[2].Spans, "coalesced-source", "CLIENT")]
 		conflict.ParentSpanID = "foreign"
 		snapshots[0].Spans = append(snapshots[0].Spans, conflict)
 		_, err := coalescedSpanUnion(snapshots)
 		require.ErrorContains(t, err, "conflict")
 	})
-	t.Run("redacted related duplicate", func(t *testing.T) {
-		snapshots := coalescedSnapshots(triggerMarker, request.Marker, [2]bool{})
-		related := snapshots[0].Spans[spanIndex(t, snapshots[0], "coalesced-source", "SERVER")]
-		related.Name = ""
-		related.ScopeName = ""
-		related.Attributes = nil
-		snapshots[1].RelatedSpans = append(snapshots[1].RelatedSpans, related)
-		spans, err := coalescedSpanUnion(snapshots)
-		require.NoError(t, err)
-		assert.Len(t, spans, 6)
-		candidate := snapshots[1]
-		candidate.Spans = spans
-		candidate.RelatedSpans = nil
-		outcome, candidates, chain, err := classifyCoalescedBridgeSnapshot(
-			cfg,
-			request,
-			triggerMarker,
-			candidate,
-		)
-		require.NoError(t, err)
-		assert.Equal(t, tracecheck.PressureParentExactHit, outcome)
-		assert.Equal(t, 1, candidates)
-		assert.True(t, chain)
-	})
 }
 
-func TestCoalescedBridgeCorrelationRejectsWrongJavaParents(t *testing.T) {
+func TestCoalescedBridgeSnapshotsRequireContinuityAndNoLoss(t *testing.T) {
 	cfg := config{
 		apacheService:          "apache-proxy",
 		coalescedSourceService: "coalesced-source",
 		javaService:            "java-backend",
 	}
-	request := requestCase{Marker: "second", Endpoint: "/api/coalesced-bridge"}
-	for name, flags := range map[string]uint32{
-		"parent not remote":   0x101,
-		"trace flags changed": 0x300,
+	requests := []requestCase{
+		{Marker: "first", Endpoint: "/api/coalesced-bridge"},
+		{Marker: "second", Endpoint: "/api/coalesced-bridge"},
+	}
+	for name, mutate := range map[string]func([]tracecheck.Snapshot){
+		"changed receiver":     func(value []tracecheck.Snapshot) { value[1].ReceiverInstanceID = "other" },
+		"changed generation":   func(value []tracecheck.Snapshot) { value[2].ResetGeneration++ },
+		"empty receiver":       func(value []tracecheck.Snapshot) { value[2].ReceiverInstanceID = "" },
+		"marker mismatch":      func(value []tracecheck.Snapshot) { value[1].Marker = "other" },
+		"dropped span":         func(value []tracecheck.Snapshot) { value[2].DroppedSpans = 1 },
+		"omitted related span": func(value []tracecheck.Snapshot) { value[0].OmittedRelatedSpans = 1 },
+		"counter regression":   func(value []tracecheck.Snapshot) { value[2].ReceivedSpans = 1 },
+		"empty first marker view": func(value []tracecheck.Snapshot) {
+			value[0].Spans = nil
+		},
+		"missing first marker trigger path": func(value []tracecheck.Snapshot) {
+			value[0].Spans[coalescedSpanIndex(t, value[0].Spans, "apache-proxy", "CLIENT")].ServiceName = "other"
+		},
+		"wrong Java marker in marked view": func(value []tracecheck.Snapshot) {
+			index := coalescedSpanIndex(t, value[1].Spans, "java-backend", "SERVER")
+			value[1].Spans[index].Attributes["http.request.header.x-obi-demo-id"] = "first"
+		},
+		"Java boundary absent from unfiltered view": func(value []tracecheck.Snapshot) {
+			for index := range value[2].Spans {
+				if value[2].Spans[index].ServiceName == "java-backend" &&
+					tracecheck.MatchesMarker(value[2].Spans[index], "second") {
+					value[2].Spans = append(value[2].Spans[:index], value[2].Spans[index+1:]...)
+					return
+				}
+			}
+		},
+		"source operation only in marked related view": func(value []tracecheck.Snapshot) {
+			index := coalescedSpanIndex(t, value[2].Spans, "coalesced-source", "CLIENT")
+			value[0].RelatedSpans = append(value[0].RelatedSpans, value[2].Spans[index])
+			value[2].Spans = append(value[2].Spans[:index], value[2].Spans[index+1:]...)
+		},
+		"Apache trigger only in marked view": func(value []tracecheck.Snapshot) {
+			index := coalescedSpanIndex(t, value[2].Spans, "apache-proxy", "CLIENT")
+			value[2].Spans = append(value[2].Spans[:index], value[2].Spans[index+1:]...)
+		},
+		"duplicate identity": func(value []tracecheck.Snapshot) {
+			value[2].Spans = append(value[2].Spans, value[2].Spans[0])
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			snapshots := coalescedSnapshots("first", request.Marker, [2]bool{})
-			snapshots[1].Spans[spanIndex(t, snapshots[1], "java-backend", "SERVER")].Flags = flags
-			spanUnion, err := coalescedSpanUnion(snapshots)
-			require.NoError(t, err)
-			candidate := snapshots[1]
-			candidate.Spans = spanUnion
-			outcome, _, _, err := classifyCoalescedBridgeSnapshot(
-				cfg,
-				request,
-				"first",
-				candidate,
-			)
-			assert.Equal(t, tracecheck.PressureParentWrong, outcome)
-			require.Error(t, err)
+			snapshots := coalescedSnapshots("first", "second")
+			mutate(snapshots)
+			require.Error(t, validateCoalescedSnapshotSet(cfg, requests, snapshots[:2], snapshots[2]))
 		})
 	}
 }
@@ -801,13 +779,16 @@ func TestDiagnosticDeltasPreserveEveryCounterAndDropMagnitude(t *testing.T) {
 }
 
 func TestDeterministicDiagnosticsRejectContradictoryPassedOutcomes(t *testing.T) {
-	exact := deterministicDiagnosticDeltas(2, "")
-	require.NoError(t, validateCoalescedDiagnosticDeltas(exact, "supported_exact"))
 	ambiguous := deterministicDiagnosticDeltas(0, "ambiguous")
-	require.NoError(t, validateCoalescedDiagnosticDeltas(ambiguous, "ambiguous_drop"))
+	ambiguous["t_missing"] = 2
+	require.NoError(t, validateCoalescedDiagnosticDeltas(ambiguous, "receive_ambiguous"))
 
 	for name, mutate := range map[string]func(map[string]uint64){
-		"unexpected take status": func(value map[string]uint64) { value["t_missing"] = 1 },
+		"missing take status":    func(value map[string]uint64) { value["t_missing"] = 1 },
+		"extra take status":      func(value map[string]uint64) { value["t_missing"] = 3 },
+		"missing ambiguity":      func(value map[string]uint64) { value["d_ambiguous"] = 0 },
+		"extra ambiguity":        func(value map[string]uint64) { value["d_ambiguous"] = 2 },
+		"unexpected valid take":  func(value map[string]uint64) { value["t_valid"] = 1 },
 		"unexpected drop status": func(value map[string]uint64) { value["d_timeout"] = 1 },
 		"unexpected failure":     func(value map[string]uint64) { value["provider_reject"] = 1 },
 		"unsampled take":         func(value map[string]uint64) { value["take_unsampled"] = 1 },
@@ -815,33 +796,26 @@ func TestDeterministicDiagnosticsRejectContradictoryPassedOutcomes(t *testing.T)
 		"sampled mismatch":       func(value map[string]uint64) { value["take_sampled"] = 1 },
 	} {
 		t.Run(name, func(t *testing.T) {
-			candidate := cloneUint64Map(exact)
+			candidate := cloneUint64Map(ambiguous)
 			mutate(candidate)
-			require.Error(t, validateCoalescedDiagnosticDeltas(candidate, "supported_exact"))
+			require.Error(t, validateCoalescedDiagnosticDeltas(candidate, "receive_ambiguous"))
 		})
 	}
 	for _, counter := range javaDeterministicFailureCounters {
 		t.Run("failure counter "+counter, func(t *testing.T) {
-			candidate := cloneUint64Map(exact)
+			candidate := cloneUint64Map(ambiguous)
 			candidate[counter] = 1
-			require.Error(t, validateCoalescedDiagnosticDeltas(candidate, "supported_exact"))
+			require.Error(t, validateCoalescedDiagnosticDeltas(candidate, "receive_ambiguous"))
 		})
 	}
 	for _, counter := range []string{"d_unknown", "d_valid"} {
 		t.Run("unexpected "+counter, func(t *testing.T) {
-			candidate := cloneUint64Map(exact)
+			candidate := cloneUint64Map(ambiguous)
 			candidate[counter] = 1
-			require.Error(t, validateCoalescedDiagnosticDeltas(candidate, "supported_exact"))
+			require.Error(t, validateCoalescedDiagnosticDeltas(candidate, "receive_ambiguous"))
 		})
 	}
-
-	extraAmbiguousDrop := cloneUint64Map(ambiguous)
-	extraAmbiguousDrop["d_timeout"] = 1
-	require.Error(t, validateCoalescedDiagnosticDeltas(extraAmbiguousDrop, "ambiguous_drop"))
-	ambiguousTake := cloneUint64Map(ambiguous)
-	ambiguousTake["t_valid"] = 1
-	ambiguousTake["take_sampled"] = 1
-	require.Error(t, validateCoalescedDiagnosticDeltas(ambiguousTake, "ambiguous_drop"))
+	require.Error(t, validateCoalescedDiagnosticDeltas(ambiguous, "supported_exact"))
 
 	require.NoError(t, validateCancellationDiagnosticDeltas(
 		deterministicDiagnosticDeltas(2, ""),
@@ -982,67 +956,81 @@ func TestConcurrencyWorkloadRequiresSupportedBarrierSize(t *testing.T) {
 	}
 }
 
-func coalescedSnapshots(firstMarker, secondMarker string, javaRoots [2]bool) []tracecheck.Snapshot {
-	markers := [2]string{firstMarker, secondMarker}
-	snapshots := []tracecheck.Snapshot{{Marker: firstMarker}, {Marker: secondMarker}}
+func coalescedSnapshots(firstMarker, secondMarker string) []tracecheck.Snapshot {
+	continuity := tracecheck.ReceiverContinuity{
+		ReceiverInstanceID: "receiver-instance",
+		ResetGeneration:    1,
+	}
 	triggerAttributes := map[string]string{
 		"http.request.header.x-obi-demo-id": firstMarker,
 		"http.route":                        "/api/coalesced-source",
 	}
-	snapshots[0].Spans = append(
-		snapshots[0].Spans,
+	spans := []tracecheck.Span{
 		tracecheck.Span{
-			ServiceName: "apache-proxy",
-			Kind:        "CLIENT",
-			TraceID:     "source-trace",
-			SpanID:      "apache-client",
-			Flags:       0x001,
-			Attributes:  cloneStringMap(triggerAttributes),
+			ServiceName: "apache-proxy", Kind: "SERVER", TraceID: "apache-trace",
+			SpanID: "apache-server", Flags: 0x001, Attributes: cloneStringMap(triggerAttributes),
 		},
 		tracecheck.Span{
-			ServiceName:  "coalesced-source",
-			Kind:         "SERVER",
-			TraceID:      "source-trace",
-			SpanID:       "source-server",
-			ParentSpanID: "apache-client",
-			Flags:        0x001,
-			Attributes:   cloneStringMap(triggerAttributes),
+			ServiceName: "apache-proxy", Kind: "INTERNAL", TraceID: "apache-trace",
+			SpanID: "apache-processing", ParentSpanID: "apache-server",
 		},
-	)
-	for index, marker := range markers {
-		attributes := map[string]string{
-			"http.request.header.x-obi-demo-id": marker,
-			"http.route":                        "/api/coalesced-bridge",
-		}
-		sourceClientID := fmt.Sprintf("source-client-%d", index+1)
-		snapshots[index].Spans = append(snapshots[index].Spans, tracecheck.Span{
-			ServiceName:  "coalesced-source",
-			Kind:         "CLIENT",
-			TraceID:      "source-trace",
-			SpanID:       sourceClientID,
-			ParentSpanID: "source-server",
-			Flags:        0x001,
-			Attributes:   cloneStringMap(attributes),
-		})
-		javaTrace := "source-trace"
-		javaParent := sourceClientID
-		javaFlags := uint32(0x301)
-		if javaRoots[index] {
-			javaTrace = fmt.Sprintf("java-root-trace-%d", index+1)
-			javaParent = ""
-			javaFlags = 0x101
-		}
-		snapshots[index].Spans = append(snapshots[index].Spans, tracecheck.Span{
-			ServiceName:  "java-backend",
-			Kind:         "SERVER",
-			TraceID:      javaTrace,
-			SpanID:       fmt.Sprintf("java-server-%d", index+1),
-			ParentSpanID: javaParent,
-			Flags:        javaFlags,
-			Attributes:   cloneStringMap(attributes),
+		tracecheck.Span{
+			ServiceName: "apache-proxy", Kind: "CLIENT", TraceID: "apache-trace",
+			SpanID: "apache-client", ParentSpanID: "apache-processing", Flags: 0x001,
+			Attributes: cloneStringMap(triggerAttributes),
+		},
+		tracecheck.Span{
+			ServiceName: "coalesced-source", Kind: "SERVER", TraceID: "source-trace",
+			SpanID: "source-server", Flags: 0x001, Attributes: cloneStringMap(triggerAttributes),
+		},
+		tracecheck.Span{
+			ServiceName: "coalesced-source", Kind: "INTERNAL", TraceID: "source-trace",
+			SpanID: "source-processing", ParentSpanID: "source-server",
+		},
+		tracecheck.Span{
+			ServiceName: "coalesced-source", Kind: "CLIENT", TraceID: "source-trace",
+			SpanID: "source-client", ParentSpanID: "source-processing", Flags: 0x001,
+			Attributes: map[string]string{"url.path": "/api/coalesced-bridge"},
+		},
+	}
+	for index, marker := range []string{firstMarker, secondMarker} {
+		spans = append(spans, tracecheck.Span{
+			ServiceName: "java-backend", Kind: "SERVER",
+			TraceID: fmt.Sprintf("java-root-trace-%d", index+1),
+			SpanID:  fmt.Sprintf("java-server-%d", index+1), Flags: 0x103,
+			Attributes: map[string]string{
+				"http.request.header.x-obi-demo-id": marker,
+				"url.path":                          "/api/coalesced-bridge",
+			},
 		})
 	}
-	return snapshots
+	return []tracecheck.Snapshot{
+		{
+			ReceiverContinuity: continuity, Marker: firstMarker, ReceivedBatches: 8, ReceivedSpans: 8,
+			Spans: cloneCoalescedSpans([]tracecheck.Span{spans[0], spans[1], spans[2], spans[3], spans[6]}),
+		},
+		{
+			ReceiverContinuity: continuity, Marker: secondMarker, ReceivedBatches: 8, ReceivedSpans: 8,
+			Spans: cloneCoalescedSpans([]tracecheck.Span{spans[7]}),
+		},
+		{
+			ReceiverContinuity: continuity, ReceivedBatches: 8, ReceivedSpans: 8,
+			Spans: cloneCoalescedSpans(spans),
+		},
+	}
+}
+
+func cloneCoalescedSpans(source []tracecheck.Span) []tracecheck.Span {
+	cloned := append([]tracecheck.Span(nil), source...)
+	for index := range cloned {
+		cloned[index].Attributes = cloneStringMap(cloned[index].Attributes)
+	}
+	return cloned
+}
+
+func coalescedSpanIndex(t *testing.T, spans []tracecheck.Span, service, kind string) int {
+	t.Helper()
+	return spanIndex(t, tracecheck.Snapshot{Spans: spans}, service, kind)
 }
 
 func spanIndex(t *testing.T, snapshot tracecheck.Snapshot, service, kind string) int {

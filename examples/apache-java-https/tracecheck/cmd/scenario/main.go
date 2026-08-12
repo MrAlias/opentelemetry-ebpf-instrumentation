@@ -190,15 +190,21 @@ type pressureCorrelationSummary struct {
 }
 
 type coalescedBridgeCorrelationSummary struct {
-	Outcome                string `json:"outcome"`
-	ExactHitCount          int    `json:"exact_hit_count"`
-	ExplicitRootCount      int    `json:"explicit_root_count"`
-	WrongParentCount       int    `json:"wrong_parent_count"`
-	UnresolvedCount        int    `json:"unresolved_count"`
-	SourceClientCandidates int    `json:"source_client_candidates"`
-	TriggerChainProven     bool   `json:"trigger_chain_proven"`
-	DiscardTotalDelta      uint64 `json:"discard_total_delta"`
-	DiscardAmbiguousDelta  uint64 `json:"discard_ambiguous_delta"`
+	Outcome                    string `json:"outcome"`
+	ExactHitCount              int    `json:"exact_hit_count"`
+	ExplicitRootCount          int    `json:"explicit_root_count"`
+	WrongParentCount           int    `json:"wrong_parent_count"`
+	UnresolvedCount            int    `json:"unresolved_count"`
+	SourceClientOperations     int    `json:"source_client_operations"`
+	SourceClientMarker         string `json:"source_client_marker"`
+	ApacheTriggerChainProven   bool   `json:"apache_trigger_chain_proven"`
+	SourceOperationChainProven bool   `json:"source_operation_chain_proven"`
+	SourcePlaintextWriteBytes  int    `json:"source_plaintext_write_bytes"`
+	TLSReadDelta               uint64 `json:"tls_read_delta"`
+	TLSBytesDelta              uint64 `json:"tls_bytes_delta"`
+	TakeMissingDelta           uint64 `json:"take_missing_delta"`
+	DiscardTotalDelta          uint64 `json:"discard_total_delta"`
+	DiscardAmbiguousDelta      uint64 `json:"discard_ambiguous_delta"`
 }
 
 type diagnosticDropSummary struct {
@@ -714,6 +720,7 @@ func run(ctx context.Context, cfg config) (*runResult, error) {
 			ctx,
 			cfg,
 			requests,
+			result.ConnectionEvidence.SourcePlaintextWriteBytes,
 			result.JavaDiagnosticsAfter,
 			fetchSnapshot,
 		)
@@ -2658,6 +2665,7 @@ func awaitCoalescedBridgeAssertions(
 	ctx context.Context,
 	cfg config,
 	requests []requestCase,
+	sourcePlaintextWriteBytes int,
 	diagnosticsAfter string,
 	fetch snapshotFetcher,
 ) ([]tracecheck.Snapshot, []tracecheck.PressureParentOutcome, coalescedBridgeCorrelationSummary, error) {
@@ -2681,10 +2689,14 @@ func awaitCoalescedBridgeAssertions(
 		passSnapshots := make([]tracecheck.Snapshot, len(requests))
 		passOutcomes := make([]tracecheck.PressureParentOutcome, len(requests))
 		passSummary := coalescedBridgeCorrelationSummary{
-			DiscardTotalDelta:     drops.Total,
-			DiscardAmbiguousDelta: drops.Counts["ambiguous"],
-			TriggerChainProven:    true,
+			SourcePlaintextWriteBytes: sourcePlaintextWriteBytes,
+			TLSReadDelta:              diagnosticDeltas["tls_reads"],
+			TLSBytesDelta:             diagnosticDeltas["tls_bytes"],
+			TakeMissingDelta:          diagnosticDeltas["t_missing"],
+			DiscardTotalDelta:         drops.Total,
+			DiscardAmbiguousDelta:     drops.Counts["ambiguous"],
 		}
+		var unfiltered tracecheck.Snapshot
 		var passErrors markerErrorSummary
 		for index := range requests {
 			if err := ctx.Err(); err != nil {
@@ -2698,42 +2710,39 @@ func awaitCoalescedBridgeAssertions(
 			passSnapshots[index] = snapshot
 		}
 		if passErrors.count == 0 {
-			spanUnion, unionErr := coalescedSpanUnion(passSnapshots)
+			var fetchErr error
+			unfiltered, fetchErr = fetch(ctx, cfg.receiverURL, "")
+			if fetchErr != nil {
+				passErrors.add(fmt.Errorf("unfiltered receiver snapshot: %w", fetchErr))
+			}
+		}
+		if passErrors.count == 0 {
+			if snapshotErr := validateCoalescedSnapshotSet(cfg, requests, passSnapshots, unfiltered); snapshotErr != nil {
+				passErrors.add(snapshotErr)
+			}
+		}
+		if passErrors.count == 0 {
+			unionSnapshots := append(append([]tracecheck.Snapshot(nil), passSnapshots...), unfiltered)
+			spanUnion, unionErr := coalescedSpanUnion(unionSnapshots)
 			if unionErr != nil {
 				passErrors.add(unionErr)
-			}
-			for index := range requests {
-				if unionErr != nil {
-					break
-				}
-				combined := passSnapshots[index]
-				combined.Spans = spanUnion
-				combined.RelatedSpans = nil
-				outcome, candidates, triggerChain, classifyErr := classifyCoalescedBridgeSnapshot(
-					cfg,
-					requests[index],
-					requests[0].Marker,
-					combined,
-				)
-				passOutcomes[index] = outcome
-				passSummary.SourceClientCandidates += candidates
-				passSummary.TriggerChainProven = passSummary.TriggerChainProven && triggerChain
-				switch outcome {
-				case tracecheck.PressureParentExactHit:
-					passSummary.ExactHitCount++
-				case tracecheck.PressureParentExplicitRoot:
-					passSummary.ExplicitRootCount++
-				case tracecheck.PressureParentWrong:
-					passSummary.WrongParentCount++
-				default:
-					passSummary.UnresolvedCount++
-				}
+			} else {
+				classified, classifyErr := classifyCoalescedBridgeAmbiguity(cfg, requests, spanUnion)
+				classified.SourcePlaintextWriteBytes = sourcePlaintextWriteBytes
+				classified.TLSReadDelta = diagnosticDeltas["tls_reads"]
+				classified.TLSBytesDelta = diagnosticDeltas["tls_bytes"]
+				classified.DiscardTotalDelta = drops.Total
+				classified.DiscardAmbiguousDelta = drops.Counts["ambiguous"]
+				classified.TakeMissingDelta = diagnosticDeltas["t_missing"]
+				passSummary = classified
 				if classifyErr != nil {
-					passErrors.add(fmt.Errorf("marker %s: %w", requests[index].Marker, classifyErr))
+					passErrors.add(classifyErr)
+				} else {
+					for index := range passOutcomes {
+						passOutcomes[index] = tracecheck.PressureParentExplicitRoot
+					}
 				}
 			}
-		} else {
-			passSummary.TriggerChainProven = false
 		}
 		if correlationErr := validateCoalescedBridgeCorrelation(&passSummary, len(requests)); correlationErr != nil {
 			passErrors.add(correlationErr)
@@ -2763,6 +2772,136 @@ func awaitCoalescedBridgeAssertions(
 		case <-ticker.C:
 		}
 	}
+}
+
+func validateCoalescedSnapshotSet(
+	cfg config,
+	requests []requestCase,
+	marked []tracecheck.Snapshot,
+	unfiltered tracecheck.Snapshot,
+) error {
+	if len(requests) != 2 || len(marked) != len(requests) {
+		return fmt.Errorf("coalesced receiver expected two marked snapshots, got requests=%d snapshots=%d", len(requests), len(marked))
+	}
+	if unfiltered.Marker != "" || unfiltered.ReceiverInstanceID == "" {
+		return errors.New("coalesced unfiltered receiver snapshot is incomplete")
+	}
+	continuity := unfiltered.ReceiverContinuity
+	all := append(append([]tracecheck.Snapshot(nil), marked...), unfiltered)
+	for index, snapshot := range all {
+		if snapshot.ReceiverContinuity != continuity || snapshot.DroppedSpans != 0 ||
+			snapshot.DroppedCountSpans != 0 || snapshot.DroppedValueLimitSpans != 0 ||
+			snapshot.DroppedRetainedLimitSpans != 0 || snapshot.OmittedRelatedSpans != 0 ||
+			snapshot.AmbiguousRelatedSpans != 0 {
+			return fmt.Errorf("coalesced receiver snapshot %d lost continuity or spans", index)
+		}
+		seen := make(map[string]struct{}, len(snapshot.Spans)+len(snapshot.RelatedSpans))
+		for _, span := range append(append([]tracecheck.Span(nil), snapshot.Spans...), snapshot.RelatedSpans...) {
+			if zeroSpanID(span.TraceID) || zeroSpanID(span.SpanID) {
+				return fmt.Errorf("coalesced receiver snapshot %d contains a zero span identity", index)
+			}
+			identity := strings.ToLower(span.TraceID) + "/" + strings.ToLower(span.SpanID)
+			if _, exists := seen[identity]; exists {
+				return fmt.Errorf("coalesced receiver snapshot %d contains duplicate span identity %s", index, identity)
+			}
+			seen[identity] = struct{}{}
+		}
+	}
+	if len(unfiltered.RelatedSpans) != 0 {
+		return errors.New("coalesced unfiltered receiver snapshot contained related spans")
+	}
+	unfilteredSpans := make(map[string]tracecheck.Span, len(unfiltered.Spans))
+	for _, span := range unfiltered.Spans {
+		identity := strings.ToLower(span.TraceID) + "/" + strings.ToLower(span.SpanID)
+		unfilteredSpans[identity] = span
+	}
+	for index, snapshot := range marked {
+		for _, span := range snapshot.Spans {
+			identity := strings.ToLower(span.TraceID) + "/" + strings.ToLower(span.SpanID)
+			full, exists := unfilteredSpans[identity]
+			if !exists || !reflect.DeepEqual(span, full) {
+				return fmt.Errorf("coalesced marked snapshot %d is not an exact subset of the unfiltered view", index)
+			}
+		}
+		for _, span := range snapshot.RelatedSpans {
+			identity := strings.ToLower(span.TraceID) + "/" + strings.ToLower(span.SpanID)
+			full, exists := unfilteredSpans[identity]
+			if !exists || !sameCoalescedSpanLink(span, full) {
+				return fmt.Errorf("coalesced related snapshot %d is not a linked subset of the unfiltered view", index)
+			}
+		}
+	}
+	for index, request := range requests {
+		if request.Marker == "" || marked[index].Marker != request.Marker {
+			return fmt.Errorf("coalesced receiver snapshot %d used the wrong marker", index)
+		}
+		markedJava := selectExactSpans(
+			marked[index].Spans,
+			cfg.javaService,
+			"SERVER",
+			request.Endpoint,
+			request.Marker,
+		)
+		endpointJava := selectEndpointSpans(
+			marked[index].Spans,
+			cfg.javaService,
+			"SERVER",
+			request.Endpoint,
+		)
+		unfilteredJava := selectExactSpans(
+			unfiltered.Spans,
+			cfg.javaService,
+			"SERVER",
+			request.Endpoint,
+			request.Marker,
+		)
+		if len(markedJava) != 1 || len(endpointJava) != 1 || len(unfilteredJava) != 1 ||
+			!reflect.DeepEqual(markedJava[0], unfilteredJava[0]) {
+			return fmt.Errorf("coalesced receiver snapshot %d did not bind its marked Java boundary", index)
+		}
+		for _, span := range append(append([]tracecheck.Span(nil), marked[index].Spans...), marked[index].RelatedSpans...) {
+			marker, present, markerErr := coalescedSpanMarker(span)
+			if markerErr != nil || (present && marker != request.Marker) {
+				return fmt.Errorf("coalesced receiver snapshot %d contains a conflicting marker", index)
+			}
+		}
+		if unfiltered.ReceivedBatches < marked[index].ReceivedBatches ||
+			unfiltered.ReceivedSpans < marked[index].ReceivedSpans {
+			return fmt.Errorf("coalesced unfiltered receiver snapshot regressed before marker %s", request.Marker)
+		}
+	}
+	if requests[0].Marker == requests[1].Marker {
+		return errors.New("coalesced requests reused one marker")
+	}
+	triggerEndpoint := "/api/coalesced-source"
+	triggerMarker := requests[0].Marker
+	markedSourceServers := selectExactSpans(
+		marked[0].Spans,
+		cfg.coalescedSourceService,
+		"SERVER",
+		triggerEndpoint,
+		triggerMarker,
+	)
+	markedApacheServers := selectExactSpans(
+		marked[0].Spans,
+		cfg.apacheService,
+		"SERVER",
+		triggerEndpoint,
+		triggerMarker,
+	)
+	markedApacheClients := selectExactSpans(
+		marked[0].Spans,
+		cfg.apacheService,
+		"CLIENT",
+		triggerEndpoint,
+		triggerMarker,
+	)
+	if len(markedSourceServers) != 1 || len(markedApacheServers) != 1 ||
+		len(markedApacheClients) != 1 ||
+		!spanDescendsFromLocal(marked[0].Spans, markedApacheClients[0], markedApacheServers[0]) {
+		return errors.New("coalesced first marker snapshot did not retain its local trigger path")
+	}
+	return nil
 }
 
 func diagnosticCounterDeltas(before, after, label string) (map[string]uint64, error) {
@@ -2807,36 +2946,54 @@ func validateCoalescedBridgeCorrelation(
 	summary *coalescedBridgeCorrelationSummary,
 	requestCount int,
 ) error {
-	if summary.WrongParentCount != 0 || summary.UnresolvedCount != 0 ||
-		summary.SourceClientCandidates != requestCount || !summary.TriggerChainProven {
-		return fmt.Errorf("coalesced bridge correlation is incomplete: %+v", summary)
+	if requestCount != 2 || summary.ExactHitCount != 0 ||
+		summary.ExplicitRootCount != requestCount || summary.WrongParentCount != 0 ||
+		summary.UnresolvedCount != 0 || summary.SourceClientOperations != 1 ||
+		summary.SourceClientMarker != "absent" || !summary.ApacheTriggerChainProven ||
+		!summary.SourceOperationChainProven || summary.SourcePlaintextWriteBytes <= 0 ||
+		summary.TLSReadDelta != 1 || summary.TLSBytesDelta != uint64(summary.SourcePlaintextWriteBytes) ||
+		summary.TakeMissingDelta != 2 ||
+		summary.DiscardTotalDelta != 1 ||
+		summary.DiscardAmbiguousDelta != 1 {
+		return fmt.Errorf("coalesced receive ambiguity is incomplete: %+v", summary)
 	}
-	switch {
-	case summary.ExactHitCount == requestCount && summary.ExplicitRootCount == 0 &&
-		summary.DiscardTotalDelta == 0 && summary.DiscardAmbiguousDelta == 0:
-		summary.Outcome = "supported_exact"
-		return nil
-	case summary.ExactHitCount == 0 && summary.ExplicitRootCount == requestCount &&
-		summary.DiscardTotalDelta == 1 && summary.DiscardAmbiguousDelta == 1:
-		summary.Outcome = "ambiguous_drop"
-		return nil
-	default:
-		return fmt.Errorf(
-			"coalesced bridge expected all exact parents or two roots with one d_ambiguous drop, got %+v",
-			summary,
-		)
-	}
+	summary.Outcome = "receive_ambiguous"
+	return nil
 }
 
 func validateCoalescedDiagnosticDeltas(deltas map[string]uint64, outcome string) error {
-	switch outcome {
-	case "supported_exact":
-		return validateDeterministicDiagnosticDeltas(deltas, "coalesced exact", 2, 2, "")
-	case "ambiguous_drop":
-		return validateDeterministicDiagnosticDeltas(deltas, "coalesced ambiguous", 0, 0, "ambiguous")
-	default:
+	if outcome != "receive_ambiguous" {
 		return fmt.Errorf("coalesced diagnostics have an unsupported outcome %q", outcome)
 	}
+	for _, counter := range javaDiagnosticsFieldNames {
+		if !strings.HasPrefix(counter, "t_") && !strings.HasPrefix(counter, "d_") {
+			continue
+		}
+		expected := uint64(0)
+		if counter == "t_missing" {
+			expected = 2
+		} else if counter == "d_ambiguous" {
+			expected = 1
+		}
+		if deltas[counter] != expected {
+			return fmt.Errorf("coalesced receive ambiguity expected %s=%d, got %d", counter, expected, deltas[counter])
+		}
+	}
+	for _, counter := range javaDeterministicFailureCounters {
+		if deltas[counter] != 0 {
+			return fmt.Errorf("coalesced receive ambiguity expected %s=0, got %d", counter, deltas[counter])
+		}
+	}
+	if deltas["take_sampled"] != 0 || deltas["take_unsampled"] != 0 ||
+		deltas["discard_standard"] != 0 {
+		return fmt.Errorf(
+			"coalesced receive ambiguity changed sampling or standard-parent precedence: take_sampled=%d take_unsampled=%d discard_standard=%d",
+			deltas["take_sampled"],
+			deltas["take_unsampled"],
+			deltas["discard_standard"],
+		)
+	}
+	return nil
 }
 
 func validateCancellationDiagnosticDeltas(
@@ -2910,133 +3067,147 @@ func validateDeterministicDiagnosticDeltas(
 	return nil
 }
 
-func classifyCoalescedBridgeSnapshot(
+func classifyCoalescedBridgeAmbiguity(
 	cfg config,
-	request requestCase,
-	triggerMarker string,
-	snapshot tracecheck.Snapshot,
-) (tracecheck.PressureParentOutcome, int, bool, error) {
-	if snapshot.Marker != request.Marker || snapshot.DroppedSpans != 0 ||
-		snapshot.OmittedRelatedSpans != 0 || snapshot.AmbiguousRelatedSpans != 0 {
-		return tracecheck.PressureParentUnresolved, 0, false, errors.New("receiver snapshot is incomplete")
+	requests []requestCase,
+	spans []tracecheck.Span,
+) (coalescedBridgeCorrelationSummary, error) {
+	var summary coalescedBridgeCorrelationSummary
+	if len(requests) != 2 || requests[0].Endpoint == "" ||
+		requests[0].Endpoint != requests[1].Endpoint {
+		return summary, errors.New("coalesced receive ambiguity requires two requests at one endpoint")
 	}
-	spans := append(append([]tracecheck.Span(nil), snapshot.Spans...), snapshot.RelatedSpans...)
-	allJavaServers := selectServiceKindSpans(spans, cfg.javaService, "SERVER")
-	allSourceClients := selectServiceKindSpans(spans, cfg.coalescedSourceService, "CLIENT")
-	javaSpans := selectMarkedSpans(spans, cfg.javaService, "SERVER", request.Marker)
-	sourceClients := selectExactSpans(
+	javaServers := selectEndpointSpans(spans, cfg.javaService, "SERVER", requests[0].Endpoint)
+	if len(javaServers) != len(requests) {
+		return summary, fmt.Errorf("coalesced receive ambiguity expected two Java servers, got %d", len(javaServers))
+	}
+	markedJava := make([]tracecheck.Span, len(requests))
+	for index, request := range requests {
+		marked := selectMarkedSpans(spans, cfg.javaService, "SERVER", request.Marker)
+		if len(marked) != 1 || !tracecheck.MatchesEndpoint(marked[0], request.Endpoint) {
+			return summary, fmt.Errorf("coalesced marker %s selected %d Java servers at the wrong boundary", request.Marker, len(marked))
+		}
+		marker, present, markerErr := coalescedSpanMarker(marked[0])
+		if markerErr != nil {
+			return summary, fmt.Errorf("coalesced Java marker %s is invalid: %w", request.Marker, markerErr)
+		}
+		if !present || marker != request.Marker {
+			return summary, fmt.Errorf("coalesced Java marker %s is missing or different", request.Marker)
+		}
+		if !zeroSpanID(marked[0].ParentSpanID) {
+			summary.WrongParentCount++
+			return summary, fmt.Errorf("coalesced Java marker %s retained a parent", request.Marker)
+		}
+		if remote, known := tracecheck.ParentRemote(marked[0]); !known || remote {
+			summary.WrongParentCount++
+			return summary, fmt.Errorf("coalesced Java marker %s is not explicitly local", request.Marker)
+		}
+		markedJava[index] = marked[0]
+	}
+	if strings.EqualFold(markedJava[0].TraceID, markedJava[1].TraceID) {
+		return summary, errors.New("coalesced Java roots reused one trace")
+	}
+
+	sourceClients := selectEndpointSpans(
 		spans,
 		cfg.coalescedSourceService,
 		"CLIENT",
-		request.Endpoint,
-		request.Marker,
+		requests[0].Endpoint,
 	)
-	if len(allJavaServers) != 2 || len(allSourceClients) != 2 ||
-		len(javaSpans) != 1 || len(sourceClients) != 1 {
-		return tracecheck.PressureParentUnresolved, len(sourceClients), false,
-			fmt.Errorf(
-				"expected two total Java servers and source clients with one exact candidate, got Java=%d/%d source=%d/%d",
-				len(javaSpans),
-				len(allJavaServers),
-				len(sourceClients),
-				len(allSourceClients),
-			)
-	}
-	javaSpan := javaSpans[0]
-	if !tracecheck.MatchesEndpoint(javaSpan, request.Endpoint) {
-		return tracecheck.PressureParentUnresolved, 1, false,
-			fmt.Errorf("marked Java span used the wrong endpoint: %+v", javaSpan)
-	}
-	triggerChainErr := validateCoalescedTriggerChain(
-		cfg,
-		spans,
-		sourceClients[0],
-		triggerMarker,
-	)
-	triggerChain := triggerChainErr == nil
-	if triggerChainErr != nil {
-		return tracecheck.PressureParentUnresolved, 1, false, triggerChainErr
-	}
-	if zeroSpanID(javaSpan.ParentSpanID) {
-		if remote, _ := tracecheck.ParentRemote(javaSpan); remote {
-			return tracecheck.PressureParentWrong, len(sourceClients), triggerChain, errors.New("java root is marked remote")
-		}
-		if len(sourceClients) == 1 && strings.EqualFold(javaSpan.TraceID, sourceClients[0].TraceID) {
-			return tracecheck.PressureParentWrong, 1, triggerChain, errors.New("java root reused the source candidate trace")
-		}
-		return tracecheck.PressureParentExplicitRoot, len(sourceClients), triggerChain, nil
-	}
 	if len(sourceClients) != 1 {
-		return tracecheck.PressureParentWrong, 0, triggerChain, errors.New("java span has a parent without one exact source candidate")
+		return summary, fmt.Errorf("coalesced receive ambiguity expected one source operation, got %d", len(sourceClients))
 	}
-	candidate := sourceClients[0]
-	if strings.EqualFold(javaSpan.TraceID, candidate.TraceID) &&
-		strings.EqualFold(javaSpan.ParentSpanID, candidate.SpanID) {
-		if remote, known := tracecheck.ParentRemote(javaSpan); !known || !remote {
-			return tracecheck.PressureParentWrong, 1, triggerChain, errors.New("exact Java parent is not marked remote")
-		}
-		if tracecheck.TraceFlags(javaSpan) != tracecheck.TraceFlags(candidate) {
-			return tracecheck.PressureParentWrong, 1, triggerChain, errors.New("exact Java parent changed trace flags")
-		}
-		return tracecheck.PressureParentExactHit, 1, triggerChain, nil
+	if marker, present, markerErr := coalescedSpanMarker(sourceClients[0]); markerErr != nil {
+		return summary, fmt.Errorf("coalesced source operation marker is invalid: %w", markerErr)
+	} else if present {
+		return summary, fmt.Errorf("coalesced source operation retained marker %q", marker)
 	}
-	return tracecheck.PressureParentWrong, 1, triggerChain, fmt.Errorf(
-		"java parent %s/%s did not identify source client %s/%s",
-		javaSpan.TraceID,
-		javaSpan.ParentSpanID,
-		candidate.TraceID,
-		candidate.SpanID,
-	)
-}
+	summary.SourceClientOperations = 1
+	summary.SourceClientMarker = "absent"
 
-func validateCoalescedTriggerChain(
-	cfg config,
-	spans []tracecheck.Span,
-	sourceClient tracecheck.Span,
-	triggerMarker string,
-) error {
-	allSourceServers := selectServiceKindSpans(spans, cfg.coalescedSourceService, "SERVER")
-	allApacheClients := selectServiceKindSpans(spans, cfg.apacheService, "CLIENT")
-	sourceServers := selectExactSpans(
+	triggerEndpoint := "/api/coalesced-source"
+	triggerMarker := requests[0].Marker
+	sourceServers := selectEndpointSpans(
 		spans,
 		cfg.coalescedSourceService,
 		"SERVER",
-		"/api/coalesced-source",
-		triggerMarker,
+		triggerEndpoint,
 	)
-	apacheClients := selectExactSpans(
-		spans,
-		cfg.apacheService,
-		"CLIENT",
-		"/api/coalesced-source",
-		triggerMarker,
-	)
-	if len(allSourceServers) != 1 || len(allApacheClients) != 1 ||
-		len(sourceServers) != 1 || len(apacheClients) != 1 {
-		return fmt.Errorf(
-			"coalesced trigger requires one total and exact Apache client and source server, got Apache=%d/%d source=%d/%d",
-			len(apacheClients),
-			len(allApacheClients),
+	apacheServers := selectEndpointSpans(spans, cfg.apacheService, "SERVER", triggerEndpoint)
+	apacheClients := selectEndpointSpans(spans, cfg.apacheService, "CLIENT", triggerEndpoint)
+	if len(sourceServers) != 1 || len(apacheServers) != 1 || len(apacheClients) != 1 ||
+		len(selectExactSpans(spans, cfg.coalescedSourceService, "SERVER", triggerEndpoint, triggerMarker)) != 1 ||
+		len(selectExactSpans(spans, cfg.apacheService, "SERVER", triggerEndpoint, triggerMarker)) != 1 ||
+		len(selectExactSpans(spans, cfg.apacheService, "CLIENT", triggerEndpoint, triggerMarker)) != 1 {
+		return summary, fmt.Errorf(
+			"coalesced trigger paths are incomplete: source_server=%d apache_server=%d apache_client=%d",
 			len(sourceServers),
-			len(allSourceServers),
+			len(apacheServers),
+			len(apacheClients),
 		)
 	}
-	sourceServer := sourceServers[0]
-	apacheClient := apacheClients[0]
-	if !strings.EqualFold(sourceServer.TraceID, apacheClient.TraceID) ||
-		!strings.EqualFold(sourceServer.ParentSpanID, apacheClient.SpanID) {
-		return errors.New("coalesced source server did not use the Apache client as its parent")
+	for label, span := range map[string]tracecheck.Span{
+		"source server": sourceServers[0],
+		"Apache server": apacheServers[0],
+		"Apache client": apacheClients[0],
+	} {
+		marker, present, markerErr := coalescedSpanMarker(span)
+		if markerErr != nil {
+			return summary, fmt.Errorf("coalesced %s marker is invalid: %w", label, markerErr)
+		}
+		if !present || marker != triggerMarker {
+			return summary, fmt.Errorf("coalesced %s marker is missing or different", label)
+		}
 	}
-	if remote, known := tracecheck.ParentRemote(sourceServer); known && !remote {
-		return errors.New("coalesced source server parent is explicitly marked local")
+	if len(selectMarkedSpans(spans, cfg.coalescedSourceService, "SERVER", triggerMarker)) != 1 ||
+		len(selectMarkedSpans(spans, cfg.apacheService, "SERVER", triggerMarker)) != 1 ||
+		len(selectMarkedSpans(spans, cfg.apacheService, "CLIENT", triggerMarker)) != 1 {
+		return summary, errors.New("coalesced trigger marker appeared outside its unique chains")
 	}
-	if tracecheck.TraceFlags(sourceServer) != tracecheck.TraceFlags(apacheClient) {
-		return errors.New("coalesced source server changed the Apache trace flags")
+	if !zeroSpanID(sourceServers[0].ParentSpanID) || !zeroSpanID(apacheServers[0].ParentSpanID) {
+		return summary, errors.New("coalesced source and Apache trigger servers must be independent roots")
 	}
-	if !spanDescendsFromLocal(spans, sourceClient, sourceServer) {
-		return errors.New("coalesced source client does not descend from the triggered source server")
+	if strings.EqualFold(sourceServers[0].TraceID, apacheServers[0].TraceID) {
+		return summary, errors.New("coalesced unsupported sender unexpectedly propagated the Apache trace")
 	}
-	return nil
+	if !spanDescendsFromLocal(spans, sourceClients[0], sourceServers[0]) {
+		return summary, errors.New("coalesced source operation does not descend from its source server")
+	}
+	if !spanDescendsFromLocal(spans, apacheClients[0], apacheServers[0]) {
+		return summary, errors.New("coalesced Apache client does not descend from its Apache server")
+	}
+	summary.SourceOperationChainProven = true
+	summary.ApacheTriggerChainProven = true
+
+	for _, javaSpan := range markedJava {
+		if strings.EqualFold(javaSpan.TraceID, sourceServers[0].TraceID) ||
+			strings.EqualFold(javaSpan.TraceID, apacheServers[0].TraceID) {
+			return summary, errors.New("coalesced Java root reused a source or Apache trace")
+		}
+	}
+	summary.ExplicitRootCount = len(markedJava)
+	return summary, nil
+}
+
+func coalescedSpanMarker(span tracecheck.Span) (string, bool, error) {
+	marker := ""
+	found := false
+	for key, value := range span.Attributes {
+		switch strings.ToLower(key) {
+		case "obi.related.marker.invalid":
+			return "", false, errors.New("invalid marker attribute")
+		case "http.request.header.x-obi-demo-id", "http.request.header.x_obi_demo_id":
+			if value == "" {
+				return "", false, errors.New("empty marker attribute")
+			}
+			if found && value != marker {
+				return "", false, errors.New("conflicting marker attributes")
+			}
+			marker = value
+			found = true
+		}
+	}
+	return marker, found, nil
 }
 
 func selectExactSpans(
@@ -3050,6 +3221,22 @@ func selectExactSpans(
 	for _, span := range spans {
 		if span.ServiceName == service && strings.EqualFold(span.Kind, kind) &&
 			tracecheck.MatchesEndpoint(span, endpoint) && tracecheck.MatchesMarker(span, marker) {
+			selected = append(selected, span)
+		}
+	}
+	return selected
+}
+
+func selectEndpointSpans(
+	spans []tracecheck.Span,
+	service string,
+	kind string,
+	endpoint string,
+) []tracecheck.Span {
+	var selected []tracecheck.Span
+	for _, span := range spans {
+		if span.ServiceName == service && strings.EqualFold(span.Kind, kind) &&
+			tracecheck.MatchesEndpoint(span, endpoint) {
 			selected = append(selected, span)
 		}
 	}

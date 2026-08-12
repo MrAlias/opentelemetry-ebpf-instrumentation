@@ -390,36 +390,36 @@ it is not relabeled as a coalesced bridge-parent result. The separate live
 control below exercises the actual two-boundary plaintext receive. A later
 retained acceptance bundle must be used for either durable result.
 
-The distinct `coalesced-bridge` target adds a live application-path control for
-the shape that the serialized Apache boundary pair cannot produce. It does not
-by itself close the retained issue #34 gap. Apache handles one marked trigger
-to `/api/coalesced-source`; it does not emit or receive the coalesced backend
-write. The separately discovered `coalesced-source` process follows that
-trigger on its own traced server-to-client chain, opens one TLS 1.2 or TLS 1.3
-connection to Netty, and calls `Write` once with two complete requests and no
-`traceparent` header. The Netty fixture accepts the control only when one
-bounded post-`SslHandler` `channelRead` contains the exact plaintext digest and
-its HTTP/1 parser emits both distinct markers from callback generation one.
-That callback can aggregate more than one `SSLEngine.unwrap` plaintext output,
-so it is not proof that the bridge saw both request boundaries in one
-authoritative receive emission. Raw plaintext is retained only in the
-fixture's 8 KiB verification buffer and is not exported.
+The distinct `coalesced-bridge` target is a live negative control for an
+unsupported Go `crypto/tls` sender and a coalesced Java receive. It does not by
+itself close the retained issue #34 gap or claim positive end-to-end bridge
+propagation. Apache handles one marked trigger to `/api/coalesced-source`. The
+separately discovered `coalesced-source` process follows that trigger on its
+own local server-to-client trace, opens one TLS 1.2 or TLS 1.3 connection to
+Netty, and calls `Write` once with two complete requests and no `traceparent`
+header. The Go TLS probe reports that write as one generic HTTP transaction;
+it does not use the bridge's request-owned native exact-prewrite path. Generic
+payload propagation is disabled while bridge mode is enabled, so the Apache
+trigger trace and source trace intentionally remain separate and no native
+candidate, injection, stage, handoff, take, or discard is permitted.
 
-Trace polling is order-independent and remains stable for six seconds. It
-accepts exactly one of two mutually exclusive results: both Java spans have the
-matching instrumented source client spans as remote parents with unchanged
-trace flags, or both Java spans are explicit roots and the in-band diagnostics
-delta contains exactly one `d_ambiguous`. One exact and one root, a foreign
-parent, an unresolved marker, a missing trigger chain, or any other diagnostic
-shape fails. Exact parents mean the bridge advice observed separable
-`SSLEngine` plaintext emissions even though Netty later combined them. Two
-roots plus `d_ambiguous` prove one bounded, reason-coded ambiguity in the
-end-to-end candidate, injection, or Java receive path; the shared diagnostic
-cannot attribute it specifically to the framer. Neither branch gives the Java
-spans an Apache client parent: the source client spans instead descend from the
-Apache-triggered source server span. The runner snapshots and returns both
-receive-coordination maps to their steady pre-run occupancies around this
-control as well.
+The Netty fixture accepts the traffic shape only when one bounded
+post-`SslHandler` `channelRead` contains the exact plaintext digest and its
+HTTP/1 parser emits both distinct markers from callback generation one. Raw
+plaintext is retained only in the fixture's 8 KiB verification buffer and is
+not exported. Trace polling is order-independent and remains stable for six
+seconds. It fetches both marker views plus an unfiltered view from one receiver
+generation and requires: one markerless source client operation descending
+locally from the marked source server; one independent marked Apache
+server-to-client trigger chain; and exactly two distinct, explicitly local Java
+server roots, one per request marker. The Java diagnostics delta must be
+exactly `t_missing=2` and `d_ambiguous=1`, with no valid take, other result, or
+failure. Any receiver loss, foreign or unknown parent, trace reuse, missing
+local chain, marked second source operation, or nonzero native bridge lifecycle
+fails closed. The runner also returns both receive-coordination maps to their
+steady pre-run occupancies. A future exact-parent branch requires a supported
+exact-prewrite sender or new Go multi-request propagation support and must be
+added as a separate positive control.
 
 Run the real control separately for both protocol versions:
 
@@ -716,10 +716,11 @@ the exact bounded schema, and chains response-to-response deltas while the
 fault suite remains serial. This avoids an extra bridge take and requires
 exactly the normalized Java status for each injected mode with no unexpected
 retrieval result. `coalesced-bridge` and `timeout-retry` likewise return their
-terminal fixed-schema snapshot in-band. The former records the mutually
-exclusive exact-or-`d_ambiguous` result; the latter retains the canceled marker
-and its exact, missing, or single reason-coded disposition. Neither control
-adds a post-workload diagnostic self-probe. The restart-fault
+terminal fixed-schema snapshot in-band. The former records exactly two missing
+receives and one reason-coded ambiguity for its unsupported Go TLS/coalesced-
+receive control; the latter retains the canceled marker and its exact, missing,
+or single reason-coded disposition. Neither control adds a post-workload
+diagnostic self-probe. The restart-fault
 interval also includes the after-restart diagnostics snapshot, the
 duplicate-suppression readiness request, and the single post-readiness
 transport-configuration request, so it requires exactly three non-workload

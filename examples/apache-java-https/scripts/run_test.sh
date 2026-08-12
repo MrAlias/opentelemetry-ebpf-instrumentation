@@ -239,6 +239,8 @@ test_successful_cleanup_invalidates_current_transport_before_down() {
     FAILURE_COMMAND=""
     DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP="$receiver_snapshot_temp"
     DELAYED_OTLP_RECEIVER_PUBLICATION_TEMP="$receiver_publication_temp"
+    assert_permanent_absence_marker_matches_current_docker() { :; }
+    clear_pending_permanent_absence_recovery() { :; }
     cleanup_security_processes() { :; }
     capture_evidence() {
       [[ -z "$DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP" &&
@@ -373,6 +375,7 @@ test_cleanup_refuses_down_when_transport_invalidation_fails() {
     FAILURE_LINE=""
     FAILURE_STATUS=""
     FAILURE_COMMAND=""
+    assert_permanent_absence_marker_matches_current_docker() { :; }
     cleanup_security_processes() { :; }
     capture_evidence() { :; }
     invalidate_selected_transport() { return 29; }
@@ -425,6 +428,7 @@ test_cleanup_failure_changes_successful_run_status() {
     FAILURE_LINE=""
     FAILURE_STATUS=""
     FAILURE_COMMAND=""
+    assert_permanent_absence_marker_matches_current_docker() { :; }
     cleanup_security_processes() { :; }
     capture_evidence() { :; }
     safe_compose_down() {
@@ -484,6 +488,8 @@ test_primary_fault_recovery_marker_forces_cleanup_with_keep() {
     FAILURE_LINE=""
     FAILURE_STATUS=""
     FAILURE_COMMAND=""
+    assert_permanent_absence_marker_matches_current_docker() { :; }
+    clear_pending_permanent_absence_recovery() { :; }
     cleanup_security_processes() {
       :
     }
@@ -535,6 +541,8 @@ test_primary_live_fd_recovery_marker_forces_cleanup_with_keep() {
     FAILURE_LINE=""
     FAILURE_STATUS=""
     FAILURE_COMMAND=""
+    assert_permanent_absence_marker_matches_current_docker() { :; }
+    clear_pending_permanent_absence_recovery() { :; }
     cleanup_security_processes() {
       :
     }
@@ -570,6 +578,7 @@ test_primary_live_fd_recovery_marker_forces_cleanup_with_keep() {
 test_run_status_publication_failure_changes_successful_exit() {
   local -r result_dir="$TEST_TMP_DIR/run-status-publication-failure"
   local -r cleanup_log="$result_dir/cleanup.log"
+  local -r first_write="$result_dir/first-write"
   local cleanup_status=0
 
   mkdir -p -- "$result_dir"
@@ -586,7 +595,16 @@ test_run_status_publication_failure_changes_successful_exit() {
     FAILURE_LINE=""
     capture_evidence() { :; }
     cleanup_security_processes() { :; }
-    write_run_status() { return 29; }
+    eval "$(declare -f write_run_status | \
+      sed '1s/^write_run_status /write_run_status_original /')"
+    write_run_status() {
+      if [[ ! -e "$first_write" ]]; then
+        write_run_status_original "$@" || return $?
+        : >"$first_write"
+        return 29
+      fi
+      return 79
+    }
 
     cleanup
   ) >"$cleanup_log" 2>&1; then
@@ -602,6 +620,14 @@ test_run_status_publication_failure_changes_successful_exit() {
   }
   if grep -Fq 'retained run evidence' "$cleanup_log"; then
     printf 'cleanup claimed evidence retention after run-status publication failed\n' >&2
+    return 1
+  fi
+  [[ -e "$first_write" ]] || {
+    printf 'run-status failure test did not publish its initial passing status\n' >&2
+    return 1
+  }
+  if [[ -e "$result_dir/run-status.json" || -L "$result_dir/run-status.json" ]]; then
+    printf 'cleanup retained a stale passing status after failed retry\n' >&2
     return 1
   fi
 }
@@ -644,6 +670,10 @@ test_cleanup_only_invalidates_matching_project_evidence_before_down() {
   done
   printf 'retained\n' \
     >"$ambiguous_result/java-selected-transport-configuration.txt"
+  (umask 077; printf 'recovery_required\n' \
+    >"$matching_result/permanent-absence-recovery-required")
+  (umask 077; printf 'recovery_required\n' \
+    >"$foreign_result/permanent-absence-recovery-required")
 
   (
     RESULTS_ROOT="$results_root"
@@ -651,12 +681,16 @@ test_cleanup_only_invalidates_matching_project_evidence_before_down() {
     PROJECT_NAME="obi-apache-java-https-test"
     BRIDGE_RUNNING=true
     SELECTED_TRANSPORT=unix
+    assert_permanent_absence_marker_matches_current_docker() { :; }
+    clear_pending_permanent_absence_recovery() { :; }
     safe_compose_down() {
       [[ "$BRIDGE_RUNNING" == "false" &&
         -z "$SELECTED_TRANSPORT" &&
         ! -e "$matching_result/java-transport-configuration.txt" &&
         -e "$matching_result/java-selected-transport-configuration.txt" &&
         -e "$foreign_result/java-transport-configuration.txt" &&
+        -e "$matching_result/permanent-absence-recovery-required" &&
+        -e "$foreign_result/permanent-absence-recovery-required" &&
         ! -e "$ambiguous_result/java-transport-configuration.txt" &&
         -e "$nested_result/java-transport-configuration.txt" &&
         -e "$symlink_target/java-transport-configuration.txt" ]] || return 31
@@ -672,6 +706,10 @@ test_cleanup_only_invalidates_matching_project_evidence_before_down() {
     ! -e "$matching_result/java-transport-configuration.txt" &&
     "$(<"$matching_result/java-selected-transport-configuration.txt")" == "retained" &&
     "$(<"$foreign_result/java-transport-configuration.txt")" == "current" &&
+    "$(<"$matching_result/permanent-absence-recovery-required")" == \
+      "recovery_required" &&
+    "$(<"$foreign_result/permanent-absence-recovery-required")" == \
+      "recovery_required" &&
     "$(<"$ambiguous_result/java-selected-transport-configuration.txt")" == "retained" &&
     "$(<"$nested_result/java-transport-configuration.txt")" == "current" &&
     "$(<"$symlink_target/java-transport-configuration.txt")" == "current" ]] || {
@@ -729,6 +767,7 @@ test_cleanup_only_refuses_untrusted_current_evidence_identity() {
       PROJECT_NAME="obi-apache-java-https-test"
       BRIDGE_RUNNING=true
       SELECTED_TRANSPORT=unix
+      assert_permanent_absence_marker_matches_current_docker() { :; }
       safe_compose_down() {
         : >"$down_marker"
       }
@@ -771,6 +810,7 @@ test_cleanup_only_refuses_down_when_project_evidence_invalidation_fails() {
     PROJECT_NAME="obi-apache-java-https-test"
     BRIDGE_RUNNING=true
     SELECTED_TRANSPORT=unix
+    assert_permanent_absence_marker_matches_current_docker() { :; }
     rm() {
       return 29
     }
@@ -820,6 +860,7 @@ test_cleanup_only_fails_closed_on_project_matcher_error() {
     PROJECT_NAME="obi-apache-java-https-test"
     BRIDGE_RUNNING=true
     SELECTED_TRANSPORT=unix
+    assert_permanent_absence_marker_matches_current_docker() { :; }
     result_evidence_matches_project() {
       return 42
     }
@@ -850,6 +891,7 @@ test_main_propagates_cleanup_only_failure() {
     install_traps() { :; }
     parse_args() { CLEANUP_ONLY=true; }
     check_dependencies() { :; }
+    enter_project_guard() { :; }
     cleanup_only() { return 29; }
 
     run_demo --cleanup-only
@@ -1287,6 +1329,8 @@ test_benchmark_startup_selects_runtime_contract() {
     STACK_STARTED=false
     BRIDGE_RUNNING=false
     COMPOSE=(test-compose)
+    assert_project_docker_identity_unchanged() { :; }
+    assert_no_pending_permanent_absence_recovery() { :; }
     verify_compose_project_ownership() { :; }
     invalidate_project_transport_evidence() { :; }
     run_bounded() { :; }
@@ -1317,6 +1361,8 @@ test_benchmark_startup_selects_runtime_contract() {
     STACK_STARTED=false
     BRIDGE_RUNNING=false
     COMPOSE=(test-compose)
+    assert_project_docker_identity_unchanged() { :; }
+    assert_no_pending_permanent_absence_recovery() { :; }
     verify_compose_project_ownership() { :; }
     invalidate_project_transport_evidence() { :; }
     run_bounded() { :; }
@@ -1427,7 +1473,7 @@ test_benchmark_controls_are_bounded() {
 
 test_all_suite_includes_every_scenario() {
   local -r actual="$TEST_TMP_DIR/all-scenarios.txt"
-  local -r expected=$'basic\nbasic\nsecurity\nkeepalive\npipelining\nconcurrency\nconnection-churn\nfd-port-reuse\nslow-body\ntls-boundary\ncoalesced-bridge\ntimeout-retry\npressure\nhandoff\nvirtual-thread\nnetty\nnetty-server\ndispatch\nw3c\nw3c-match\nobi-flags\nprimary-w3c-stale\nbasic\nprimary-generation-mismatch\nbasic\nprimary-w3c-fault\nprimary-w3c-fault\nprimary-w3c-fault\nprimary-w3c-fault\nbasic\nfail-open\nw3c-only\nrestart\nrestart-fault\nhelper-attach-failure\ndisabled\nw3c-only\nw3c-only\nuninstrumented'
+  local -r expected=$'basic\nbasic\nsecurity\nkeepalive\npipelining\nconcurrency\nconnection-churn\nfd-port-reuse\nslow-body\ntls-boundary\ncoalesced-bridge\ntimeout-retry\npressure\nhandoff\nvirtual-thread\nnetty\nnetty-server\ndispatch\nw3c\nw3c-match\nobi-flags\nprimary-w3c-stale\nbasic\nprimary-generation-mismatch\nbasic\nprimary-w3c-fault\nprimary-w3c-fault\nprimary-w3c-fault\nprimary-w3c-fault\nbasic\npermanent-absence\nbasic\nfail-open\nw3c-only\nrestart\nrestart-fault\nhelper-attach-failure\ndisabled\nw3c-only\nw3c-only\nuninstrumented'
 
   (
     SCENARIO=all
@@ -1456,6 +1502,10 @@ test_all_suite_includes_every_scenario() {
       run_scenario primary-w3c-fault
       run_scenario primary-w3c-fault
       run_scenario primary-w3c-fault
+      run_scenario basic
+    }
+    run_permanent_absence_control() {
+      run_scenario permanent-absence
       run_scenario basic
     }
     record_unsupported_scenario() {
@@ -1515,6 +1565,10 @@ test_unix_all_suite_includes_fault_control() {
     run_w3c_fault_control() {
       run_scenario w3c-fault
     }
+    run_permanent_absence_control() {
+      run_scenario permanent-absence
+      run_scenario basic
+    }
     run_unix_security_control() {
       run_scenario security
     }
@@ -1546,7 +1600,7 @@ test_unix_all_suite_includes_fault_control() {
   )
 
   [[ "$(<"$actual")" == *$'basic\nbasic\nsecurity\nkeepalive'* && \
-    "$(<"$actual")" == *$'obi-flags\nunix-w3c-stale\nbasic\nw3c-fault\nfail-open'* &&
+    "$(<"$actual")" == *$'obi-flags\nunix-w3c-stale\nbasic\nw3c-fault\npermanent-absence\nbasic\nfail-open'* &&
     "$(<"$actual")" == *$'restart\nrestart-fault\nhelper-attach-failure'* ]] || {
     printf 'Unix all suite omitted the security or bounded W3C fault control\n' >&2
     return 1
@@ -1568,6 +1622,8 @@ test_run_demo_preserves_strict_scenario_execution() {
       TRANSPORT=getsockopt
     }
     check_dependencies() { :; }
+    enter_project_guard() { :; }
+    assert_no_pending_permanent_absence_recovery() { :; }
     prepare_directories() { :; }
     capture_source_state() { :; }
     prepare_certificates() { :; }
@@ -1607,6 +1663,8 @@ test_run_demo_preserves_strict_scenario_execution() {
       TRANSPORT=getsockopt
     }
     check_dependencies() { :; }
+    enter_project_guard() { :; }
+    assert_no_pending_permanent_absence_recovery() { :; }
     prepare_directories() { :; }
     capture_source_state() { :; }
     prepare_certificates() { :; }
@@ -1655,6 +1713,8 @@ test_delayed_otlp_run_demo_defers_runtime_evidence() {
       TRANSPORT=getsockopt
     }
     check_dependencies() { :; }
+    enter_project_guard() { :; }
+    assert_no_pending_permanent_absence_recovery() { :; }
     prepare_directories() { :; }
     capture_source_state() { :; }
     prepare_certificates() { :; }
@@ -2580,7 +2640,7 @@ test_tls_boundary_receive_cursor_map_evidence_is_exact_and_steady() {
         "$cursor_map_id" "$cursor_max_entries" "$cursor_entries" \
         "$guard_map_id" "$guard_max_entries" "$guard_entries" >"$output"
     }
-    sleep() { :; }
+    sleep() { : "$@"; }
 
     capture_receive_cursor_map_baseline tls-boundary >/dev/null
     [[ "$RECEIVE_CURSOR_MAP_ID" == "41" && \
@@ -11468,6 +11528,8 @@ test_start_stack_invalidates_project_evidence_before_compose_up() {
     BRIDGE_RUNNING=false
     COMMAND_TIMEOUT_SECONDS=5
     COMPOSE=(test-compose)
+    assert_project_docker_identity_unchanged() { :; }
+    assert_no_pending_permanent_absence_recovery() { :; }
     verify_compose_project_ownership() { return 0; }
     run_bounded() { return 0; }
     date() {
@@ -11516,6 +11578,8 @@ test_start_stack_invalidates_project_evidence_before_compose_up() {
     BRIDGE_RUNNING=false
     COMMAND_TIMEOUT_SECONDS=5
     COMPOSE=(test-compose)
+    assert_project_docker_identity_unchanged() { :; }
+    assert_no_pending_permanent_absence_recovery() { :; }
     verify_compose_project_ownership() { return 0; }
     run_bounded() { return 0; }
     rm() { return 29; }
@@ -11556,6 +11620,8 @@ test_primary_w3c_fault_startup_uses_normal_runtime_contract() {
     STACK_STARTED=false
     BRIDGE_RUNNING=false
     COMPOSE=(test-compose)
+    assert_project_docker_identity_unchanged() { :; }
+    assert_no_pending_permanent_absence_recovery() { :; }
     verify_compose_project_ownership() { return 0; }
     invalidate_project_transport_evidence() { return 0; }
     run_bounded() { return 0; }
@@ -11596,6 +11662,8 @@ test_instrumented_readiness_precedes_https_traffic() {
     STACK_STARTED=false
     BRIDGE_RUNNING=false
     COMPOSE=(test-compose)
+    assert_project_docker_identity_unchanged() { :; }
+    assert_no_pending_permanent_absence_recovery() { :; }
     verify_compose_project_ownership() {
       return 0
     }
@@ -11669,6 +11737,8 @@ test_instrumented_readiness_precedes_https_traffic() {
     STACK_STARTED=false
     BRIDGE_RUNNING=false
     COMPOSE=(test-compose)
+    assert_project_docker_identity_unchanged() { :; }
+    assert_no_pending_permanent_absence_recovery() { :; }
     verify_compose_project_ownership() { return 0; }
     run_bounded() { return 0; }
     run_logged_bounded() { return 0; }
@@ -11712,6 +11782,8 @@ test_delayed_otlp_startup_avoids_java_traffic() {
     STACK_STARTED=false
     BRIDGE_RUNNING=false
     COMPOSE=(test-compose)
+    assert_project_docker_identity_unchanged() { :; }
+    assert_no_pending_permanent_absence_recovery() { :; }
     verify_compose_project_ownership() {
       return 0
     }
@@ -12619,6 +12691,3731 @@ test_extension_disabled_control_uses_configuration_log() {
     diff -u -- "$expected" "$observed" >&2 || true
     return 1
   }
+}
+
+test_permanent_absence_requires_a_full_jvm_lifetime_boundary() {
+  local control=""
+  local global_marker_line=""
+  local disabled_line=""
+  local obi_stop_line=""
+  local java_start_line=""
+  local identity_before_line=""
+  local fail_open_line=""
+  local w3c_line=""
+  local registration_line=""
+  local logs_line=""
+  local identity_after_line=""
+  local final_obi_check_line=""
+  local java_stop_line=""
+  local recovery_line=""
+  local recovery_helper_line=""
+  local recovery_basic_line=""
+  local global_marker_clear_line=""
+  local local_marker_clear_line=""
+  local status_line=""
+
+  control="$(declare -f run_permanent_absence_control)" || return $?
+  global_marker_line="$(awk '/create_permanent_absence_global_marker/ { line = NR } END { print line }' <<<"$control")"
+  disabled_line="$(awk '/run_disabled_control/ { line = NR } END { print line }' <<<"$control")"
+  obi_stop_line="$(awk '/apache-proxy java-backend obi/ { line = NR } END { print line }' <<<"$control")"
+  java_start_line="$(awk '/java-backend apache-proxy/ { line = NR } END { print line }' <<<"$control")"
+  identity_before_line="$(awk '/capture_service_runtime_identity java-backend "\$identity_before"/ { line = NR } END { print line }' <<<"$control")"
+  fail_open_line="$(awk '/run_scenario fail-open/ { line = NR } END { print line }' <<<"$control")"
+  w3c_line="$(awk '/run_scenario w3c-only/ { line = NR } END { print line }' <<<"$control")"
+  registration_line="$(awk '/diagnostic_counter .* registration_fail/ { line = NR } END { print line }' <<<"$control")"
+  logs_line="$(awk '/assert_permanent_absence_logs_are_bounded/ { line = NR } END { print line }' <<<"$control")"
+  identity_after_line="$(awk '/capture_service_runtime_identity java-backend "\$identity_after"/ { line = NR } END { print line }' <<<"$control")"
+  final_obi_check_line="$(awk '/assert_compose_service_stopped obi/ { line = NR } END { print line }' <<<"$control")"
+  java_stop_line="$(awk '/stop_permanent_absence_jvm/ { line = NR } END { print line }' <<<"$control")"
+  recovery_line="$(awk '/complete_permanent_absence_recovery \|\| return/ { line = NR } END { print line }' <<<"$control")"
+  recovery_helper_line="$(awk '/recreate_instrumented_stack .*post-permanent absence recovery/ { print NR; exit }' <<<"$control")"
+  recovery_basic_line="$(awk '/run_scenario basic/ { print NR; exit }' <<<"$control")"
+  global_marker_clear_line="$(awk '/clear_pending_permanent_absence_recovery/ { print NR; exit }' <<<"$control")"
+  local_marker_clear_line="$(awk '/rm -f -- "\$recovery_marker"/ { print NR; exit }' <<<"$control")"
+  status_line="$(awk '/scenario-permanent-absence-status.json/ { line = NR } END { print line }' <<<"$control")"
+
+  [[ "$global_marker_line" =~ ^[1-9][0-9]*$ && \
+    "$disabled_line" =~ ^[1-9][0-9]*$ && \
+    "$obi_stop_line" =~ ^[1-9][0-9]*$ && \
+    "$java_start_line" =~ ^[1-9][0-9]*$ && \
+    "$identity_before_line" =~ ^[1-9][0-9]*$ && \
+    "$fail_open_line" =~ ^[1-9][0-9]*$ && \
+    "$w3c_line" =~ ^[1-9][0-9]*$ && \
+    "$registration_line" =~ ^[1-9][0-9]*$ && \
+    "$logs_line" =~ ^[1-9][0-9]*$ && \
+    "$identity_after_line" =~ ^[1-9][0-9]*$ && \
+    "$final_obi_check_line" =~ ^[1-9][0-9]*$ && \
+    "$java_stop_line" =~ ^[1-9][0-9]*$ && \
+    "$recovery_line" =~ ^[1-9][0-9]*$ && \
+    "$recovery_helper_line" =~ ^[1-9][0-9]*$ && \
+    "$recovery_basic_line" =~ ^[1-9][0-9]*$ && \
+    "$global_marker_clear_line" =~ ^[1-9][0-9]*$ && \
+    "$local_marker_clear_line" =~ ^[1-9][0-9]*$ && \
+    "$status_line" =~ ^[1-9][0-9]*$ && \
+    global_marker_line -lt disabled_line && \
+    disabled_line -lt obi_stop_line && \
+    obi_stop_line -lt java_start_line && \
+    java_start_line -lt identity_before_line && \
+    identity_before_line -lt fail_open_line && \
+    fail_open_line -lt w3c_line && \
+    w3c_line -lt registration_line && \
+    registration_line -lt logs_line && \
+    registration_line -lt identity_after_line && \
+    identity_after_line -lt final_obi_check_line && \
+    final_obi_check_line -lt java_stop_line && \
+    java_stop_line -lt logs_line && \
+    logs_line -lt recovery_line && \
+    recovery_line -lt status_line && \
+    recovery_helper_line -lt recovery_basic_line && \
+    recovery_basic_line -lt global_marker_clear_line && \
+    global_marker_clear_line -lt local_marker_clear_line ]] || {
+    printf 'permanent-absence control no longer fences absence, evidence, and recovery ordering\n' >&2
+    return 1
+  }
+  [[ "$control" == *'"obi_started_during_jvm_lifetime":false'* && \
+    "$control" == *'"disabled_baseline_equivalent":true'* && \
+    "$control" == *'"post_absence_recovery":"passed"'* && \
+    "$control" == *'registration_failures >= 1'* && \
+    "$control" == *'registration_failures <= PERMANENT_ABSENCE_REGISTRATION_FAILURE_MAX'* && \
+    "$control" == *'assert_runtime_identity_unchanged'* && \
+    "$control" == *'capture_bounded_permanent_absence_logs'* && \
+    "$control" == *'wait_for_bounded_permanent_absence_log'* && \
+    "$control" == *'assert_permanent_absence_logs_are_bounded'* ]] || {
+    printf 'permanent-absence control lost its baseline, bounded, identity, or recovery evidence\n' >&2
+    return 1
+  }
+  local transport=""
+  for transport in getsockopt unix auto; do
+    (
+      TRANSPORT=auto
+      SCENARIO=all
+      parse_args --transport "$transport" --scenario permanent-absence
+      [[ "$TRANSPORT" == "$transport" && "$SCENARIO" == permanent-absence ]]
+    ) || {
+      printf 'permanent-absence scenario rejected enabled transport %s\n' \
+        "$transport" >&2
+      return 1
+    }
+  done
+  if (parse_args --transport disabled --scenario permanent-absence) \
+    >/dev/null 2>&1; then
+    printf 'permanent-absence scenario accepted disabled transport\n' >&2
+    return 1
+  fi
+}
+
+test_permanent_absence_startup_uses_normal_runtime_contract() {
+  local -r result_dir="$TEST_TMP_DIR/permanent-absence-startup"
+
+  mkdir -p -- "$result_dir"
+  (
+    RESULT_DIR="$result_dir"
+    SCENARIO=permanent-absence
+    TRANSPORT=getsockopt
+    COMMAND_TIMEOUT_SECONDS=5
+    STACK_STARTED=false
+    BRIDGE_RUNNING=false
+    COMPOSE=(test-compose)
+    assert_project_docker_identity_unchanged() { :; }
+    assert_no_pending_permanent_absence_recovery() { :; }
+    verify_compose_project_ownership() { :; }
+    invalidate_project_transport_evidence() { :; }
+    run_bounded() { :; }
+    run_logged_bounded() { printf '%s\n' "$*" >"$result_dir/compose"; }
+    date() { printf 'startup-cursor\n'; }
+    wait_for_http() { :; }
+    wait_for_log() { :; }
+    wait_for_apache_instrumentation() { :; }
+    assert_selected_transport() { :; }
+    assert_apache_denies_java_diagnostics() { :; }
+    assert_runtime_contract() { printf '%s\n' "$1" >"$result_dir/runtime"; }
+
+    start_stack
+  ) || {
+    printf 'permanent-absence normal startup failed before control dispatch\n' >&2
+    return 1
+  }
+  [[ "$(<"$result_dir/compose")" == \
+      *"trace-receiver java-backend coalesced-source apache-proxy obi"* &&
+    "$(<"$result_dir/runtime")" == "basic" ]] || {
+    printf 'permanent-absence startup did not retain the normal OBI runtime\n' >&2
+    return 1
+  }
+}
+
+test_permanent_absence_startup_refuses_prior_run_recovery() {
+  local -r guard_root="$TEST_TMP_DIR/permanent-absence-shared-guard"
+  local -r worktree_b_results="$TEST_TMP_DIR/permanent-absence-worktree-b-results"
+  local -r project=obi-apache-java-https-test
+  local -r foreign_project=obi-apache-java-https-foreign
+  local -r docker_identity=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  local -r marker="$guard_root/$project.permanent-absence-recovery-required"
+  local -r mutation="$worktree_b_results/compose-up"
+
+  mkdir -m 0700 -- "$guard_root"
+  mkdir -p -- "$worktree_b_results"
+  (
+    PROJECT_NAME="$project"
+    umask 077
+    permanent_absence_global_marker_payload "$docker_identity" >"$marker"
+  )
+  if (
+    RESULTS_ROOT="$worktree_b_results"
+    RESULT_DIR="$worktree_b_results"
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_NAME="$project"
+    PROJECT_DOCKER_SERVER_ID_SHA256="$docker_identity"
+    SCENARIO=permanent-absence
+    TRANSPORT=getsockopt
+    COMPOSE=(test-compose)
+    assert_project_guard_held() { :; }
+    assert_project_docker_identity_unchanged() { :; }
+    assert_clean_source_checkout_is_stable() { :; }
+    run_logged_bounded() { : >"$mutation"; }
+
+    start_stack
+  ) >/dev/null 2>&1; then
+    printf 'permanent-absence startup ignored a prior run recovery marker\n' >&2
+    return 1
+  fi
+  [[ ! -e "$mutation" && ! -L "$mutation" ]] || {
+    printf 'permanent-absence startup mutated Compose across a worktree recovery fence\n' >&2
+    return 1
+  }
+
+  (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_NAME="$foreign_project"
+    PROJECT_DOCKER_SERVER_ID_SHA256="$docker_identity"
+    assert_project_guard_held() { :; }
+    assert_project_docker_identity_unchanged() { :; }
+    assert_no_pending_permanent_absence_recovery
+  ) || {
+    printf 'permanent-absence startup rejected a foreign project marker\n' >&2
+    return 1
+  }
+  printf 'corrupt\n' >"$marker"
+  chmod 0600 -- "$marker"
+  if (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_NAME="$project"
+    PROJECT_DOCKER_SERVER_ID_SHA256="$docker_identity"
+    assert_project_guard_held() { :; }
+    assert_project_docker_identity_unchanged() { :; }
+    assert_no_pending_permanent_absence_recovery
+  ) >/dev/null 2>&1; then
+    printf 'permanent-absence startup trusted a malformed host-shared marker\n' >&2
+    return 1
+  fi
+}
+
+test_permanent_absence_project_guard_is_host_shared() {
+  local -r guard_root="$TEST_TMP_DIR/permanent-absence-project-guard"
+  local -r project=obi-apache-java-https-lock-test
+  local -r other_project=obi-apache-java-https-other-lock-test
+  local -r lock_file="$guard_root/$project.lock"
+  local -r other_lock="$guard_root/$other_project.lock"
+  local -r ready="$guard_root/ready"
+  local -r release="$guard_root/release"
+  local -r observed="$guard_root/observed"
+  local -r signal_ready="$guard_root/signal-ready"
+  local -r signal_child_ready="$guard_root/signal-child-ready"
+  local -r signal_release="$guard_root/signal-release"
+  local -r signal_observed="$guard_root/signal-observed"
+  local -r group_child="$guard_root/group-child"
+  local -r group_outer="$guard_root/group-outer"
+  local -r group_outer_ready="$guard_root/group-outer-ready"
+  local -r group_child_ready="$guard_root/group-child-ready"
+  local -r group_trap_started="$guard_root/group-trap-started"
+  local -r group_repeated_signal="$guard_root/group-repeated-signal"
+  local -r group_observed="$guard_root/group-observed"
+  local -r group_supervisor="$guard_root/group-supervisor"
+  local -r reset_wrapper="$guard_root/reset-wrapper"
+  local -r reset_ready="$guard_root/reset-ready"
+  local -r reset_release="$guard_root/reset-release"
+  local -r reset_pass="$guard_root/reset-pass"
+  local -r reused_parent_ready="$guard_root/reused-parent-ready"
+  local -r reused_parent_release="$guard_root/reused-parent-release"
+  local -r reused_child_file="$guard_root/reused-child"
+  local guard_pid=""
+  local reset_forward_pid=""
+  local reset_holder_pid=""
+  local reused_parent_pid=""
+  local reused_child_pid=""
+  local reused_parent_start_time=""
+  local group_mode=""
+  local group_signal=""
+  local group_outer_pid=""
+  local group_supervisor_pid=""
+  local group_target_pid=""
+  local reset_children=""
+  local reset_child_pid=""
+  local reset_extra_child=""
+  local group_status=0
+  local reset_status=0
+  local expected_group_status=0
+  local expected_signal_status=0
+  local signal_name=""
+  local signal_status=0
+  local -i attempt=0
+  local definition=""
+  local armed_relay_definition=""
+  local armed_relay_without_arithmetic=""
+  local monitor_disable_line=""
+  local supervisor_identity_line=""
+
+  mkdir -m 0700 -- "$guard_root"
+  (umask 077; : >"$lock_file"; : >"$other_lock")
+  assert_private_project_guard_directory "$guard_root" || return 1
+  assert_private_project_guard_lock "$lock_file" || return 1
+  definition="$({
+    declare -f enter_project_guard
+    declare -f run_project_guard_relay
+    declare -f wait_for_project_guard_holder
+    declare -f publish_project_guard_supervisor_launched
+  })" || return 1
+  armed_relay_definition="$({
+    declare -f run_project_guard_relay
+    declare -f wait_for_project_guard_holder
+    declare -f forward_project_guard_signal
+    declare -f record_project_guard_pending_signal
+    declare -f record_project_guard_hup
+    declare -f record_project_guard_int
+    declare -f record_project_guard_term
+    declare -f project_guard_supervisor_is_running
+    declare -f project_guard_supervisor_identity_matches
+    declare -f load_project_guard_process_stat_identity
+    declare -f project_guard_child_signal_state
+    declare -f assert_private_project_guard_lock
+    declare -f assert_private_project_guard_directory
+    declare -f assert_private_project_guard_control_directory
+    declare -f project_guard_control_file_matches
+    declare -f publish_project_guard_control_file
+    declare -f remove_project_guard_control_directory
+    declare -f publish_project_guard_supervisor_identity
+    declare -f publish_project_guard_supervisor_acceptance
+    declare -f load_project_guard_supervisor_identity
+    declare -f load_project_guard_supervisor_launch
+    declare -f publish_project_guard_supervisor_launch_acceptance
+    declare -f publish_project_guard_terminal_decision
+    declare -f load_project_guard_holder_status
+    declare -f format_project_guard_holder_status_payload
+  })" || return 1
+  armed_relay_without_arithmetic="$(sed 's/\$((/ARITHMETIC(/g' \
+    <<<"$armed_relay_definition")" || return 1
+  monitor_disable_line="$(awk '/set \+m;/ { print NR; exit }' <<<"$definition")"
+  supervisor_identity_line="$(awk \
+    '/run_project_guard_relay/ { print NR; exit }' \
+    <<<"$definition")"
+  [[ "$definition" != *setsid* && \
+    "$definition" == *'set -m'* && \
+    "$definition" != *'kill -KILL -- "-$holder_pid"'* && \
+    "$definition" == *'--exclusive --nonblock --close'* && \
+    "$definition" == *'env --default-signal=HUP,INT,TERM'* && \
+    "$definition" == *'read_project_guard_supervisor_identity'* && \
+    "$definition" == *'supervisor-launched:$supervisor_pid:$supervisor_start_time'* && \
+    "$definition" == *'PROJECT_GUARD_FORWARDING_READY=true'* && \
+    "$definition" == *'trap record_project_guard_hup HUP'* && \
+    "$definition" != *'trap "" HUP INT TERM'* && \
+    "$definition" == *'wait_for_project_guard_holder "$holder_pid"'* && \
+    "$definition" == *'publish_project_guard_terminal_decision'* && \
+    "$armed_relay_without_arithmetic" != *'$('* && \
+    "$armed_relay_definition" != *'`'* && \
+    "$armed_relay_definition" != *'<('* && \
+    "$armed_relay_definition" != *'>('* && \
+    "$monitor_disable_line" =~ ^[1-9][0-9]*$ && \
+    "$supervisor_identity_line" =~ ^[1-9][0-9]*$ && \
+    monitor_disable_line -lt supervisor_identity_line ]] || {
+    printf 'project guard no longer keeps one signal-aware relay\n' >&2
+    return 1
+  }
+
+  flock --exclusive --nonblock --close "$lock_file" \
+    bash -c '
+      set -Eeuo pipefail
+      source "$1"
+      PROJECT_GUARD_ROOT=$2
+      PROJECT_NAME=$3
+      PROJECT_GUARD_HELD=true
+      PROJECT_GUARD_PARENT_PID=$PPID
+      PROJECT_GUARD_LOCK_IDENTITY=$(stat --format="%d:%i" -- "$4")
+      assert_project_guard_held
+      (assert_project_guard_held)
+      printf "guarded\n" >"$5"
+      : >"$6"
+      while [[ ! -e "$7" ]]; do sleep 0.01; done
+    ' bash "$TEST_SCRIPT_DIR/../run.sh" "$guard_root" "$project" \
+      "$lock_file" "$observed" "$ready" "$release" &
+  guard_pid=$!
+  for ((attempt = 0; attempt < 500; attempt++)); do
+    [[ -e "$ready" ]] && break
+    sleep 0.01
+  done
+  [[ -e "$ready" && "$(<"$observed")" == guarded ]] || {
+    kill -TERM "$guard_pid" 2>/dev/null || true
+    wait "$guard_pid" 2>/dev/null || true
+    printf 'project guard supervisor did not publish readiness\n' >&2
+    return 1
+  }
+  if flock --exclusive --nonblock "$lock_file" true; then
+    printf 'a second worktree acquired the same project lock\n' >&2
+    return 1
+  fi
+  flock --exclusive --nonblock "$other_lock" true || {
+    printf 'a distinct project suffix shared the wrong lock\n' >&2
+    return 1
+  }
+  : >"$release"
+  wait "$guard_pid" || return $?
+  flock --exclusive --nonblock "$lock_file" true || {
+    printf 'project lock was not released after guarded runner exit\n' >&2
+    return 1
+  }
+  (
+    PROJECT_GUARD_PENDING_SIGNAL=""
+    PROJECT_GUARD_SUPERVISOR_PID=""
+    PROJECT_GUARD_SUPERVISOR_START_TIME=""
+    forward_project_guard_signal HUP
+    forward_project_guard_signal TERM
+    [[ "$PROJECT_GUARD_PENDING_SIGNAL" == HUP ]]
+  ) || {
+    printf 'project guard lost or reordered a signal before supervisor publication\n' >&2
+    return 1
+  }
+  if ! (
+    sleep 10 &
+    PROJECT_GUARD_SUPERVISOR_PID=$!
+    PROJECT_GUARD_SUPERVISOR_START_TIME="$(project_guard_process_start_time \
+      "$PROJECT_GUARD_SUPERVISOR_PID")"
+    PROJECT_GUARD_FORWARDING_READY=true
+    PROJECT_GUARD_PENDING_SIGNAL=""
+    set +e
+    forward_project_guard_signal TERM >/dev/null 2>&1
+    signal_status=$?
+    set -e
+    [[ "$signal_status" == 1 && "$PROJECT_GUARD_PENDING_SIGNAL" == TERM ]] && \
+      project_guard_supervisor_is_running "$PROJECT_GUARD_SUPERVISOR_PID" || \
+      exit 1
+    kill -KILL "$PROJECT_GUARD_SUPERVISOR_PID" 2>/dev/null || true
+    for ((attempt = 0; attempt < 500; attempt++)); do
+      if ! project_guard_supervisor_is_running \
+        "$PROJECT_GUARD_SUPERVISOR_PID"; then
+        break
+      fi
+      sleep 0.01
+    done
+    if project_guard_supervisor_is_running "$PROJECT_GUARD_SUPERVISOR_PID"; then
+      exit 1
+    fi
+    wait "$PROJECT_GUARD_SUPERVISOR_PID" 2>/dev/null || true
+    [[ "$PROJECT_GUARD_PENDING_SIGNAL" == TERM ]]
+  ); then
+    printf 'project guard discarded an unverified signal-delivery request\n' >&2
+    return 1
+  fi
+
+  bash -c '
+    set -Eeuo pipefail
+    sleep 30 &
+    child_pid=$!
+    cleanup_child() {
+      kill -TERM "$child_pid" 2>/dev/null || true
+      wait "$child_pid" 2>/dev/null || true
+    }
+    trap cleanup_child EXIT
+    printf "%s\n" "$child_pid" >"$1"
+    : >"$2"
+    while [[ ! -e "$3" ]]; do sleep 0.01; done
+  ' bash "$reused_child_file" "$reused_parent_ready" \
+    "$reused_parent_release" &
+  reused_parent_pid=$!
+  for ((attempt = 0; attempt < 500; attempt++)); do
+    [[ -e "$reused_parent_ready" && -e "$reused_child_file" ]] && break
+    sleep 0.01
+  done
+  [[ -e "$reused_parent_ready" && -e "$reused_child_file" ]] || return 1
+  reused_child_pid="$(<"$reused_child_file")"
+  reused_parent_start_time="$(project_guard_process_start_time \
+    "$reused_parent_pid")" || return 1
+  PROJECT_GUARD_SUPERVISOR_PID="$reused_parent_pid"
+  PROJECT_GUARD_SUPERVISOR_START_TIME="$((reused_parent_start_time + 1))"
+  PROJECT_GUARD_FORWARDING_READY=true
+  PROJECT_GUARD_PENDING_SIGNAL=""
+  if forward_project_guard_signal TERM >/dev/null 2>&1; then
+    : >"$reused_parent_release"
+    wait "$reused_parent_pid" 2>/dev/null || true
+    printf 'project guard trusted a reused supervisor PID identity\n' >&2
+    return 1
+  fi
+  [[ "$PROJECT_GUARD_PENDING_SIGNAL" == TERM && \
+    -e "/proc/$reused_parent_pid" && -e "/proc/$reused_child_pid" ]] || {
+    : >"$reused_parent_release"
+    wait "$reused_parent_pid" 2>/dev/null || true
+    printf 'project guard killed through an unverified supervisor PID identity\n' >&2
+    return 1
+  }
+  : >"$reused_parent_release"
+  wait "$reused_parent_pid" || return $?
+  PROJECT_GUARD_PENDING_SIGNAL=""
+  PROJECT_GUARD_FORWARDING_READY=false
+  PROJECT_GUARD_SUPERVISOR_PID=""
+  PROJECT_GUARD_SUPERVISOR_START_TIME=""
+
+  for signal_name in HUP INT TERM; do
+    rm -f -- "$signal_ready" "$signal_child_ready" \
+      "$signal_release" "$signal_observed"
+    env --ignore-signal=HUP,INT,TERM \
+      flock --exclusive --nonblock --close "$lock_file" \
+      env --default-signal=HUP,INT,TERM bash -c '
+        set -Eeuo pipefail
+        handle_signal() {
+          local -r signal_name="$1"
+          local -r signal_status="$2"
+          local -r lock_file="$3"
+          local -r observed="$4"
+          if flock --exclusive --nonblock "$lock_file" true; then
+            printf "%s:released-too-early\n" "$signal_name" >"$observed"
+          else
+            printf "%s:held-through-trap\n" "$signal_name" >"$observed"
+          fi
+          exit "$signal_status"
+        }
+        trap '\''handle_signal HUP 129 "$1" "$3"'\'' HUP
+        trap '\''handle_signal INT 130 "$1" "$3"'\'' INT
+        trap '\''handle_signal TERM 130 "$1" "$3"'\'' TERM
+        : >"$2"
+        bash -c '\''
+          : >"$1"
+          while [[ ! -e "$2" ]]; do sleep 0.01; done
+        '\'' bash "$4" "$5"
+      ' bash "$lock_file" "$signal_ready" "$signal_observed" \
+        "$signal_child_ready" "$signal_release" &
+    PROJECT_GUARD_SUPERVISOR_PID=$!
+    PROJECT_GUARD_SUPERVISOR_START_TIME="$(project_guard_process_start_time \
+      "$PROJECT_GUARD_SUPERVISOR_PID")" || return 1
+    PROJECT_GUARD_FORWARDING_READY=true
+    PROJECT_GUARD_PENDING_SIGNAL=""
+    for ((attempt = 0; attempt < 500; attempt++)); do
+      [[ -e "$signal_ready" && -e "$signal_child_ready" ]] && break
+      sleep 0.01
+    done
+    if [[ ! -e "$signal_ready" || ! -e "$signal_child_ready" ]]; then
+      : >"$signal_release"
+      wait "$PROJECT_GUARD_SUPERVISOR_PID" 2>/dev/null || true
+      printf 'guarded worker did not publish %s child readiness\n' \
+        "$signal_name" >&2
+      return 1
+    fi
+    forward_project_guard_signal "$signal_name"
+    sleep 0.05
+    if [[ -e "$signal_observed" ]] || \
+      flock --exclusive --nonblock "$lock_file" true; then
+      : >"$signal_release"
+      wait "$PROJECT_GUARD_SUPERVISOR_PID" 2>/dev/null || true
+      printf 'project guard released before deferred %s recovery\n' \
+        "$signal_name" >&2
+      return 1
+    fi
+    : >"$signal_release"
+    if wait "$PROJECT_GUARD_SUPERVISOR_PID"; then
+      signal_status=0
+    else
+      signal_status=$?
+    fi
+    case "$signal_name" in
+      HUP) expected_signal_status=129 ;;
+      INT|TERM) expected_signal_status=130 ;;
+      *) return 1 ;;
+    esac
+    PROJECT_GUARD_SUPERVISOR_PID=""
+    PROJECT_GUARD_SUPERVISOR_START_TIME=""
+    PROJECT_GUARD_FORWARDING_READY=false
+    PROJECT_GUARD_PENDING_SIGNAL=""
+    [[ "$signal_status" == "$expected_signal_status" && \
+      "$(<"$signal_observed")" == \
+        "$signal_name:held-through-trap" ]] || {
+      printf 'project guard released before %s recovery completed\n' \
+        "$signal_name" >&2
+      return 1
+    }
+    flock --exclusive --nonblock "$lock_file" true || {
+      printf 'project guard remained locked after %s recovery\n' \
+        "$signal_name" >&2
+      return 1
+    }
+  done
+
+  cat >"$group_child" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+readonly lock_file="$1"
+readonly ready="$2"
+readonly trap_started="$3"
+readonly observed="$4"
+readonly repeated_signal="$5"
+readonly wait_fifo="$ready.wait"
+# Keep this adversarial private-process-group fixture inside Bash builtins.
+# Group-signalling a Bash process and its fork-before-exec child can corrupt
+# Bash's SIGCHLD bookkeeping; production cancellation targets only the
+# authenticated worker PID, which the preceding HUP/INT/TERM matrix covers
+# while that worker has a live external foreground child.
+handle_repeated_signal() {
+  : >"$repeated_signal"
+}
+handle_signal() {
+  local -r signal_name="$1"
+  local -r signal_status="$2"
+  trap handle_repeated_signal HUP INT TERM
+  : >"$trap_started"
+  read -r -t 0.3 _ <&9 || true
+  if [[ -e "$repeated_signal" ]]; then
+    read -r -t 0.3 _ <&9 || true
+  fi
+  if flock --exclusive --nonblock "$lock_file" true; then
+    printf "%s:released-before-child-trap\n" "$signal_name" >"$observed"
+  else
+    printf "%s:held-through-child-trap\n" "$signal_name" >"$observed"
+  fi
+  exit "$signal_status"
+}
+trap 'handle_signal INT 130' INT
+trap 'handle_signal HUP 129' HUP
+trap 'handle_signal TERM 143' TERM
+mkfifo -- "$wait_fifo"
+exec 9<>"$wait_fifo"
+rm -f -- "$wait_fifo"
+: >"$ready"
+while :; do read -r _ <&9 || true; done
+EOF
+  cat >"$group_outer" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+source "$1"
+readonly lock_file="$2"
+readonly child_script="$3"
+readonly child_ready="$4"
+readonly trap_started="$5"
+readonly observed="$6"
+readonly outer_ready="$7"
+readonly supervisor_file="$8"
+readonly repeated_signal="$9"
+local_status=0
+trap 'forward_project_guard_signal HUP' HUP
+trap 'forward_project_guard_signal INT' INT
+trap 'forward_project_guard_signal TERM' TERM
+set -m
+[[ "$-" == *m* ]] || exit 91
+set +m
+[[ "$-" != *m* ]] || exit 92
+(
+  exec setsid env --ignore-signal=HUP,INT,TERM \
+    flock --exclusive --nonblock --close --conflict-exit-code 75 \
+    "$lock_file" env --default-signal=HUP,INT,TERM \
+      "$child_script" "$lock_file" "$child_ready" "$trap_started" \
+        "$observed" "$repeated_signal"
+) &
+PROJECT_GUARD_SUPERVISOR_PID=$!
+PROJECT_GUARD_SUPERVISOR_START_TIME=$(project_guard_process_start_time \
+  "$PROJECT_GUARD_SUPERVISOR_PID")
+PROJECT_GUARD_FORWARDING_READY=true
+printf '%s\n' "$PROJECT_GUARD_SUPERVISOR_PID" >"$supervisor_file"
+: >"$outer_ready"
+while :; do
+  if wait "$PROJECT_GUARD_SUPERVISOR_PID"; then
+    local_status=0
+  else
+    local_status=$?
+  fi
+  if ! kill -0 "$PROJECT_GUARD_SUPERVISOR_PID" 2>/dev/null; then
+    break
+  fi
+done
+exit "$local_status"
+EOF
+  chmod 0700 -- "$group_child" "$group_outer"
+  for group_mode in \
+    outer-HUP outer-TERM outer-INT \
+    inner-HUP inner-TERM inner-INT; do
+    group_signal="${group_mode##*-}"
+    rm -f -- \
+      "$group_outer_ready" "$group_child_ready" \
+      "$group_trap_started" "$group_repeated_signal" \
+      "$group_observed" "$group_supervisor"
+    setsid env --default-signal=HUP,INT,TERM "$group_outer" \
+      "$TEST_SCRIPT_DIR/../run.sh" "$lock_file" "$group_child" \
+      "$group_child_ready" "$group_trap_started" "$group_observed" \
+      "$group_outer_ready" "$group_supervisor" "$group_repeated_signal" &
+    group_outer_pid=$!
+    for ((attempt = 0; attempt < 500; attempt++)); do
+      [[ -e "$group_outer_ready" && -e "$group_child_ready" && \
+        -e "$group_supervisor" ]] && break
+      sleep 0.01
+    done
+    if [[ ! -e "$group_outer_ready" || ! -e "$group_child_ready" || \
+      ! -e "$group_supervisor" ]]; then
+      kill -TERM -- "-$group_outer_pid" 2>/dev/null || true
+      wait "$group_outer_pid" 2>/dev/null || true
+      printf 'isolated project guard did not publish %s readiness\n' "$group_mode" >&2
+      return 1
+    fi
+    group_supervisor_pid="$(<"$group_supervisor")"
+    [[ "$group_supervisor_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    if [[ "$group_mode" == inner-* ]]; then
+      group_target_pid="$group_supervisor_pid"
+    else
+      group_target_pid="$group_outer_pid"
+    fi
+    kill -s "$group_signal" -- "-$group_target_pid" || return $?
+    for ((attempt = 0; attempt < 500; attempt++)); do
+      [[ -e "$group_trap_started" ]] && break
+      sleep 0.01
+    done
+    if [[ ! -e "$group_trap_started" ]]; then
+      kill -TERM -- "-$group_outer_pid" 2>/dev/null || true
+      wait "$group_outer_pid" 2>/dev/null || true
+      printf 'process-group %s did not reach the guarded child\n' \
+        "$group_mode" >&2
+      return 1
+    fi
+    if flock --exclusive --nonblock "$lock_file" true; then
+      wait "$group_outer_pid" 2>/dev/null || true
+      printf 'process-group %s released the lock during child recovery\n' \
+        "$group_mode" >&2
+      return 1
+    fi
+    if [[ "$group_mode" == outer-TERM ]]; then
+      kill -TERM -- "-$group_outer_pid" || return $?
+      if flock --exclusive --nonblock "$lock_file" true; then
+        wait "$group_outer_pid" 2>/dev/null || true
+        printf 'repeated TERM released the lock during child recovery\n' >&2
+        return 1
+      fi
+    fi
+    if wait "$group_outer_pid"; then
+      group_status=0
+    else
+      group_status=$?
+    fi
+    case "$group_signal" in
+      HUP) expected_group_status=129 ;;
+      INT) expected_group_status=130 ;;
+      TERM) expected_group_status=143 ;;
+      *) return 1 ;;
+    esac
+    [[ "$group_status" == "$expected_group_status" && \
+      "$(<"$group_observed")" == "$group_signal:held-through-child-trap" && \
+      ( "$group_mode" != outer-TERM || -e "$group_repeated_signal" ) ]] || {
+      printf 'isolated project guard did not retain the lock through %s recovery\n' \
+        "$group_mode" >&2
+      return 1
+    }
+    flock --exclusive --nonblock "$lock_file" true || {
+      printf 'isolated project guard retained the lock after %s recovery\n' \
+        "$group_mode" >&2
+      return 1
+    }
+  done
+
+  cat >"$reset_wrapper" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+readonly inherited_ready="$1"
+readonly release="$2"
+readonly pass="$3"
+: >"$inherited_ready"
+while [[ ! -e "$release" ]]; do sleep 0.01; done
+: >"$pass"
+EOF
+  chmod 0700 -- "$reset_wrapper"
+  env --ignore-signal=HUP,INT,TERM \
+    flock --exclusive --nonblock --close "$lock_file" \
+      "$reset_wrapper" "$reset_ready" "$reset_release" "$reset_pass" \
+      >/dev/null 2>&1 &
+  reset_holder_pid=$!
+  for ((attempt = 0; attempt < 500; attempt++)); do
+    [[ -e "$reset_ready" ]] && break
+    sleep 0.01
+  done
+  [[ -e "$reset_ready" ]] || {
+    kill -KILL "$reset_holder_pid" 2>/dev/null || true
+    wait "$reset_holder_pid" 2>/dev/null || true
+    printf 'ignored-signal guard child did not publish readiness\n' >&2
+    return 1
+  }
+  reset_children="$(<"/proc/$reset_holder_pid/task/$reset_holder_pid/children")" || \
+    return $?
+  read -r reset_child_pid reset_extra_child <<<"$reset_children"
+  [[ "$reset_child_pid" =~ ^[1-9][0-9]*$ && \
+    -z "$reset_extra_child" ]] || return 1
+  if project_guard_child_signal_state \
+    "$reset_child_pid" "$reset_holder_pid" TERM; then
+    printf 'project guard treated an ignored Bash child as signal-ready\n' >&2
+    return 1
+  else
+    reset_status=$?
+  fi
+  [[ "$reset_status" == 2 ]] || {
+    printf 'project guard mistook an ignored Bash child for the env launch stage\n' >&2
+    return 1
+  }
+  if (
+    PROJECT_GUARD_SIGNAL_RESET_EXECUTABLE="$(readlink -f -- \
+      "/proc/$reset_child_pid/exe")"
+    project_guard_child_signal_state \
+      "$reset_child_pid" "$reset_holder_pid" TERM
+  ); then
+    printf 'pre-reset guard child did not retain inherited SIG_IGN\n' >&2
+    return 1
+  else
+    reset_status=$?
+  fi
+  [[ "$reset_status" == 1 ]] || return 1
+  PROJECT_GUARD_SUPERVISOR_PID="$reset_holder_pid"
+  PROJECT_GUARD_SUPERVISOR_START_TIME="$(project_guard_process_start_time \
+    "$reset_holder_pid")" || return 1
+  PROJECT_GUARD_FORWARDING_READY=true
+  (
+    PROJECT_GUARD_SIGNAL_RESET_EXECUTABLE="$(readlink -f -- \
+      "/proc/$reset_child_pid/exe")"
+    forward_project_guard_signal TERM
+  ) &
+  reset_forward_pid=$!
+  for ((attempt = 0; attempt < 50; attempt++)); do
+    kill -0 "$reset_forward_pid" 2>/dev/null || break
+    sleep 0.01
+  done
+  if ! kill -0 "$reset_forward_pid" 2>/dev/null || \
+    flock --exclusive --nonblock "$lock_file" true; then
+    kill -KILL "$reset_holder_pid" "$reset_forward_pid" 2>/dev/null || true
+    wait "$reset_holder_pid" "$reset_forward_pid" 2>/dev/null || true
+    printf 'project guard discarded TERM or unlocked in the pre-reset window\n' >&2
+    return 1
+  fi
+  for ((attempt = 0; attempt < 500; attempt++)); do
+    kill -0 "$reset_forward_pid" 2>/dev/null || break
+    sleep 0.01
+  done
+  if kill -0 "$reset_forward_pid" 2>/dev/null; then
+    kill -KILL "$reset_holder_pid" "$reset_forward_pid" 2>/dev/null || true
+    wait "$reset_holder_pid" "$reset_forward_pid" 2>/dev/null || true
+    printf 'project guard signal forwarder exceeded its fixed retry bound\n' >&2
+    return 1
+  fi
+  wait "$reset_forward_pid" || return $?
+  : >"$reset_release"
+  if wait "$reset_holder_pid"; then
+    reset_status=0
+  else
+    reset_status=$?
+  fi
+  PROJECT_GUARD_SUPERVISOR_PID=""
+  PROJECT_GUARD_SUPERVISOR_START_TIME=""
+  PROJECT_GUARD_FORWARDING_READY=false
+  [[ "$reset_status" == 137 && ! -e "$reset_pass" && \
+    ! -e "/proc/$reset_child_pid" && \
+    ! -e "/proc/$reset_holder_pid" ]] || {
+    printf 'project guard discarded TERM before its child reset the signal\n' >&2
+    return 1
+  }
+  flock --exclusive --nonblock "$lock_file" true || {
+    printf 'project guard remained locked after the reset-race trap exited\n' >&2
+    return 1
+  }
+
+  chmod 0644 -- "$lock_file"
+  if assert_private_project_guard_lock "$lock_file"; then
+    printf 'project guard accepted a permissive lock file\n' >&2
+    return 1
+  fi
+  chmod 0600 -- "$lock_file"
+  ln -- "$lock_file" "$guard_root/hardlink.lock"
+  if assert_private_project_guard_lock "$lock_file"; then
+    printf 'project guard accepted a multiply linked lock file\n' >&2
+    return 1
+  fi
+  mkdir -m 0755 -- "$guard_root/permissive-directory"
+  if assert_private_project_guard_directory "$guard_root/permissive-directory"; then
+    printf 'project guard accepted a non-0700 parent directory\n' >&2
+    return 1
+  fi
+}
+
+test_project_guard_terminal_handoff_is_status_truthful() {
+  local -r guard_root="$TEST_TMP_DIR/project-guard-terminal-handoff"
+  local -r pre_ack_worker="$TEST_TMP_DIR/project-guard-pre-ack-worker"
+  local -r pre_ack_guarded="$TEST_TMP_DIR/project-guard-pre-ack-guarded"
+  local -r pre_ack_outer="$TEST_TMP_DIR/project-guard-pre-ack-outer"
+  local -r pre_ack_lock="$TEST_TMP_DIR/project-guard-pre-ack.lock"
+  local -r pre_ack_ready="$TEST_TMP_DIR/project-guard-pre-ack-ready"
+  local -r pre_ack_release="$TEST_TMP_DIR/project-guard-pre-ack-release"
+  local -r pre_ack_mutation="$TEST_TMP_DIR/project-guard-pre-ack-mutation"
+  local -r pre_ack_supervisor="$TEST_TMP_DIR/project-guard-pre-ack-supervisor"
+  local -r pre_ack_pending="$TEST_TMP_DIR/project-guard-pre-ack-pending"
+  local -r pre_ack_status="$TEST_TMP_DIR/project-guard-pre-ack-status"
+  local mode=""
+  local control_dir=""
+  local observed=""
+  local release=""
+  local worker_pid=""
+  local pre_ack_outer_pid=""
+  local pre_ack_supervisor_pid=""
+  local worker_status=0
+  local supervisor_start_time=""
+  local handoff_definition=""
+  local publication_definition=""
+  local existence_line=""
+  local validation_line=""
+  local -i attempt=0
+
+  mkdir -m 0700 -- "$guard_root"
+  handoff_definition="$(declare -f complete_project_guard_terminal_handoff)" || \
+    return 1
+  publication_definition="$(declare -f publish_project_guard_control_file)" || \
+    return 1
+  existence_line="$(awk '/\[\[ -e "\$decision_file"/ { print NR; exit }' \
+    <<<"$handoff_definition")"
+  validation_line="$(awk '/project_guard_control_file_matches "\$decision_file" commit/ { print NR; exit }' \
+    <<<"$handoff_definition")"
+  [[ "$existence_line" =~ ^[1-9][0-9]*$ && \
+    "$validation_line" =~ ^[1-9][0-9]*$ && \
+    existence_line -lt validation_line && \
+    "$publication_definition" != *project_guard_control_file_matches* ]] || {
+    printf 'project guard handoff lost its atomic publication boundary\n' >&2
+    return 1
+  }
+
+  cat >"$pre_ack_worker" <<'EOF'
+#!/usr/bin/env bash
+PROJECT_GUARD_PENDING_SIGNAL=""
+trap record_project_guard_hup HUP
+trap record_project_guard_int INT
+trap record_project_guard_term TERM
+set -Eeuo pipefail
+source "$1"
+PROJECT_GUARD_ROOT="$2"
+PROJECT_GUARD_CONTROL_DIR="$3"
+complete_project_guard_supervisor_identity_handoff
+relay_pid="$BASHPID"
+relay_start_time="$(read_project_guard_supervisor_identity \
+  "$PROJECT_GUARD_CONTROL_DIR/supervisor" "$relay_pid")"
+launch_signal=""
+env --ignore-signal=HUP,INT,TERM \
+  flock --exclusive --nonblock --close "$4" \
+    env --default-signal=HUP,INT,TERM \
+      "$5" "$1" "$PROJECT_GUARD_ROOT" "$PROJECT_GUARD_CONTROL_DIR" \
+        "$relay_pid" "$6" &
+holder_pid=$!
+for ((attempt = 0; attempt < 500; attempt++)); do
+  if [[ -e "$PROJECT_GUARD_CONTROL_DIR/supervisor-launched" ]]; then
+    holder_start_time="$(read_project_guard_supervisor_launch \
+      "$PROJECT_GUARD_CONTROL_DIR/supervisor-launched" \
+      "$relay_pid" "$relay_start_time" "$holder_pid")"
+    PROJECT_GUARD_SUPERVISOR_PID="$holder_pid"
+    PROJECT_GUARD_SUPERVISOR_START_TIME="$holder_start_time"
+    PROJECT_GUARD_FORWARDING_READY=true
+    break
+  fi
+  sleep 0.01 || true
+done
+[[ "$PROJECT_GUARD_FORWARDING_READY" == true ]]
+if [[ -n "$PROJECT_GUARD_PENDING_SIGNAL" ]]; then
+  launch_signal="$PROJECT_GUARD_PENDING_SIGNAL"
+  forward_project_guard_signal "$PROJECT_GUARD_PENDING_SIGNAL"
+fi
+[[ -z "$PROJECT_GUARD_PENDING_SIGNAL" ]]
+if [[ -z "$launch_signal" ]]; then
+  publish_project_guard_supervisor_launch_acceptance \
+    "$relay_pid" "$relay_start_time" "$holder_pid" "$holder_start_time"
+fi
+if wait "$holder_pid"; then
+  exit 0
+else
+  exit $?
+fi
+EOF
+  cat >"$pre_ack_guarded" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+source "$1"
+PROJECT_GUARD_ROOT="$2"
+PROJECT_GUARD_CONTROL_DIR="$3"
+readonly relay_pid="$4"
+readonly observed="$5"
+handle_pre_ack_term() {
+  printf 'canonical-130\n' >"$observed"
+  exit 130
+}
+trap handle_pre_ack_term TERM
+publish_project_guard_supervisor_launched "$relay_pid" "$PPID"
+wait_for_project_guard_supervisor_launch_acceptance "$relay_pid" "$PPID"
+while :; do sleep 0.01; done
+EOF
+  cat >"$pre_ack_outer" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+source "$1"
+PROJECT_GUARD_ROOT="$2"
+PROJECT_GUARD_CONTROL_DIR="$3"
+readonly worker_script="$4"
+readonly guarded_script="$5"
+readonly lock_file="$6"
+readonly ready="$7"
+readonly release="$8"
+readonly mutation="$9"
+readonly supervisor_file="${10}"
+readonly pending_file="${11}"
+readonly status_file="${12}"
+local_status=0
+PROJECT_GUARD_PENDING_SIGNAL=""
+PROJECT_GUARD_FORWARDING_READY=false
+forward_pre_ack_hup() { forward_project_guard_signal HUP || true; }
+forward_pre_ack_int() { forward_project_guard_signal INT || true; }
+forward_pre_ack_term() { forward_project_guard_signal TERM || true; }
+trap forward_pre_ack_hup HUP
+trap forward_pre_ack_int INT
+trap forward_pre_ack_term TERM
+set -m
+: | env --default-signal=HUP,INT,TERM setsid \
+  "$worker_script" "$1" "$PROJECT_GUARD_ROOT" \
+    "$PROJECT_GUARD_CONTROL_DIR" "$lock_file" "$guarded_script" "$mutation" &
+PROJECT_GUARD_SUPERVISOR_PID=$!
+set +m
+for ((attempt = 0; attempt < 500; attempt++)); do
+  [[ -e "$PROJECT_GUARD_CONTROL_DIR/supervisor" ]] && break
+  sleep 0.01 || true
+done
+PROJECT_GUARD_SUPERVISOR_START_TIME="$({
+  read_project_guard_supervisor_identity \
+    "$PROJECT_GUARD_CONTROL_DIR/supervisor" \
+    "$PROJECT_GUARD_SUPERVISOR_PID"
+})"
+printf '%s\n' "$PROJECT_GUARD_SUPERVISOR_PID" >"$supervisor_file"
+: >"$ready"
+while [[ ! -e "$release" ]]; do sleep 0.01 || true; done
+publish_project_guard_supervisor_acceptance \
+  "$PROJECT_GUARD_SUPERVISOR_PID" \
+  "$PROJECT_GUARD_SUPERVISOR_START_TIME"
+PROJECT_GUARD_FORWARDING_READY=true
+if wait "$PROJECT_GUARD_SUPERVISOR_PID"; then
+  local_status=0
+else
+  local_status=$?
+fi
+printf '%s\n' "$PROJECT_GUARD_PENDING_SIGNAL" >"$pending_file"
+printf '%s\n' "$local_status" >"$status_file"
+EOF
+  chmod 0700 -- "$pre_ack_worker" "$pre_ack_guarded" "$pre_ack_outer"
+  (umask 077; : >"$pre_ack_lock")
+  control_dir="$(mktemp -d "$guard_root/.terminal-handoff.XXXXXX")" || \
+    return 1
+  setsid "$pre_ack_outer" "$TEST_SCRIPT_DIR/../run.sh" "$guard_root" \
+    "$control_dir" "$pre_ack_worker" "$pre_ack_guarded" "$pre_ack_lock" \
+    "$pre_ack_ready" "$pre_ack_release" "$pre_ack_mutation" \
+    "$pre_ack_supervisor" "$pre_ack_pending" "$pre_ack_status" &
+  pre_ack_outer_pid=$!
+  for ((attempt = 0; attempt < 500; attempt++)); do
+    [[ -e "$pre_ack_ready" && -e "$pre_ack_supervisor" ]] && break
+    sleep 0.01
+  done
+  if [[ ! -e "$pre_ack_ready" || ! -e "$pre_ack_supervisor" ]]; then
+    kill -KILL -- "-$pre_ack_outer_pid" 2>/dev/null || true
+    wait "$pre_ack_outer_pid" 2>/dev/null || true
+    printf 'isolated pre-ack supervisor did not publish readiness\n' >&2
+    return 1
+  fi
+  pre_ack_supervisor_pid="$(<"$pre_ack_supervisor")"
+  [[ "$pre_ack_supervisor_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  kill -TERM -- "-$pre_ack_supervisor_pid" || return $?
+  sleep 0.1
+  [[ -e "/proc/$pre_ack_supervisor_pid" && \
+    ! -e "$pre_ack_mutation" ]] || {
+    : >"$pre_ack_release"
+    wait "$pre_ack_outer_pid" 2>/dev/null || true
+    printf 'process-group TERM killed or advanced the pre-ack supervisor\n' >&2
+    return 1
+  }
+  : >"$pre_ack_release"
+  wait "$pre_ack_outer_pid" || return $?
+  [[ "$(<"$pre_ack_mutation")" == canonical-130 && \
+    "$(<"$pre_ack_pending")" == "" && \
+    "$(<"$pre_ack_status")" == 130 ]] || {
+    printf 'isolated pre-ack TERM did not reach the guarded worker canonically\n' >&2
+    return 1
+  }
+  (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    remove_project_guard_control_directory "$control_dir"
+  ) || return $?
+
+  control_dir="$(mktemp -d "$guard_root/.terminal-handoff.XXXXXX")" || \
+    return 1
+  observed="$guard_root/supervisor-accepted-observed"
+  (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    complete_project_guard_supervisor_identity_handoff
+    : >"$observed"
+  ) &
+  worker_pid=$!
+  for ((attempt = 0; attempt < 500; attempt++)); do
+    [[ -e "$control_dir/supervisor" ]] && break
+    sleep 0.01
+  done
+  [[ -e "$control_dir/supervisor" ]] || return 1
+  supervisor_start_time="$({
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    read_project_guard_supervisor_identity \
+      "$control_dir/supervisor" "$worker_pid"
+  })" || return 1
+  [[ "$supervisor_start_time" =~ ^[0-9]+$ ]] || return 1
+  (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    PROJECT_GUARD_SUPERVISOR_PID="$worker_pid"
+    PROJECT_GUARD_SUPERVISOR_START_TIME="$supervisor_start_time"
+    PROJECT_GUARD_FORWARDING_READY=false
+    PROJECT_GUARD_PENDING_SIGNAL=""
+    forward_project_guard_signal TERM
+    [[ "$PROJECT_GUARD_PENDING_SIGNAL" == TERM ]] || exit 1
+    project_guard_supervisor_is_running \
+      "$worker_pid" "$supervisor_start_time" || exit 1
+    publish_project_guard_supervisor_acceptance \
+      "$worker_pid" "$supervisor_start_time"
+  ) || return $?
+  wait "$worker_pid" || return $?
+  [[ -e "$observed" ]] || {
+    printf 'project guard supervisor proceeded without a valid parent acceptance\n' >&2
+    return 1
+  }
+  rm -f -- "$observed"
+  if (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    read_project_guard_supervisor_identity \
+      "$control_dir/supervisor" "$((worker_pid + 1))"
+  ) >/dev/null 2>&1; then
+    printf 'project guard accepted a supervisor token for another PID\n' >&2
+    return 1
+  fi
+  chmod 0644 -- "$control_dir/supervisor"
+  if (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    read_project_guard_supervisor_identity \
+      "$control_dir/supervisor" "$worker_pid"
+  ) >/dev/null 2>&1; then
+    printf 'project guard accepted a permissive supervisor token\n' >&2
+    return 1
+  fi
+  chmod 0600 -- "$control_dir/supervisor"
+  (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    remove_project_guard_control_directory "$control_dir"
+  ) || return $?
+
+  control_dir="$(mktemp -d "$guard_root/.terminal-handoff.XXXXXX")" || \
+    return 1
+  observed="$guard_root/unaccepted-supervisor-mutation"
+  release="$guard_root/release-delayed-supervisor"
+  rm -f -- "$observed" "$release"
+  (
+    while [[ ! -e "$release" ]]; do sleep 0.01; done
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    sleep() { :; }
+    complete_project_guard_supervisor_identity_handoff
+    : >"$observed"
+  ) &
+  worker_pid=$!
+  for ((attempt = 0; attempt < 20; attempt++)); do
+    [[ ! -e "$control_dir/supervisor" && \
+      ! -L "$control_dir/supervisor" ]] || return 1
+    sleep 0.01
+  done
+  : >"$release"
+  if wait "$worker_pid"; then
+    worker_status=0
+  else
+    worker_status=$?
+  fi
+  [[ "$worker_status" != 0 && ! -e "$observed" && \
+    -f "$control_dir/supervisor" && \
+    ! -e "$control_dir/supervisor-accepted" && \
+    ! -L "$control_dir/supervisor-accepted" ]] || {
+    printf 'delayed supervisor proceeded after the parent abandoned its handshake\n' >&2
+    return 1
+  }
+  rm -f -- "$release"
+  (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    remove_project_guard_control_directory "$control_dir"
+  ) || return $?
+
+  control_dir="$(mktemp -d "$guard_root/.terminal-handoff.XXXXXX")" || \
+    return 1
+  (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    project_guard_control_file_matches() { return 97; }
+    publish_project_guard_control_file "$control_dir/decision" commit
+  ) || {
+    printf 'project guard treated post-rename readback as publication failure\n' >&2
+    return 1
+  }
+  (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    project_guard_control_file_matches "$control_dir/decision" commit
+    remove_project_guard_control_directory "$control_dir"
+  ) || return $?
+
+  control_dir="$(mktemp -d "$guard_root/.terminal-handoff.XXXXXX")" || \
+    return 1
+  (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    decision_checks=0
+    eval "$(declare -f project_guard_control_file_matches | \
+      sed '1s/^project_guard_control_file_matches /project_guard_control_file_matches_original /')"
+    project_guard_control_file_matches() {
+      if [[ "$1" == "$PROJECT_GUARD_CONTROL_DIR/decision" ]]; then
+        ((decision_checks += 1))
+        if ((decision_checks == 3)) && [[ ! -e "$1" && ! -L "$1" ]]; then
+          printf 'commit\n' >"$PROJECT_GUARD_CONTROL_DIR/race-publication"
+          chmod 0600 -- "$PROJECT_GUARD_CONTROL_DIR/race-publication"
+          mv --no-target-directory -- \
+            "$PROJECT_GUARD_CONTROL_DIR/race-publication" "$1"
+          return 1
+        fi
+      fi
+      project_guard_control_file_matches_original "$@"
+    }
+    sleep() {
+      : "$@"
+      if [[ ! -e "$PROJECT_GUARD_CONTROL_DIR/decision" && \
+        ! -L "$PROJECT_GUARD_CONTROL_DIR/decision" ]]; then
+        printf 'commit\n' >"$PROJECT_GUARD_CONTROL_DIR/race-publication"
+        chmod 0600 -- "$PROJECT_GUARD_CONTROL_DIR/race-publication"
+        mv --no-target-directory -- \
+          "$PROJECT_GUARD_CONTROL_DIR/race-publication" \
+          "$PROJECT_GUARD_CONTROL_DIR/decision"
+      fi
+    }
+    complete_project_guard_terminal_handoff
+  ) || {
+    printf 'project guard rejected a decision at the existence boundary\n' >&2
+    return 1
+  }
+  (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    remove_project_guard_control_directory "$control_dir"
+  ) || return $?
+
+  for mode in commit HUP TERM; do
+    control_dir="$(mktemp -d "$guard_root/.terminal-handoff.XXXXXX")" || \
+      return 1
+    observed="$control_dir/observed"
+    (
+      PROJECT_GUARD_ROOT="$guard_root"
+      PROJECT_GUARD_CONTROL_DIR="$control_dir"
+      PROJECT_GUARD_HANDOFF_SIGNAL_STATUS=0
+      complete_project_guard_terminal_handoff
+      printf '%s\n' "$PROJECT_GUARD_HANDOFF_SIGNAL_STATUS" >"$observed"
+    ) &
+    worker_pid=$!
+    for ((attempt = 0; attempt < 500; attempt++)); do
+      if (
+        PROJECT_GUARD_ROOT="$guard_root"
+        PROJECT_GUARD_CONTROL_DIR="$control_dir"
+        project_guard_control_file_matches "$control_dir/ready" ready
+      ); then
+        break
+      fi
+      sleep 0.01
+    done
+    if ! (
+      PROJECT_GUARD_ROOT="$guard_root"
+      PROJECT_GUARD_CONTROL_DIR="$control_dir"
+      project_guard_control_file_matches "$control_dir/ready" ready
+    ); then
+      kill -KILL "$worker_pid" 2>/dev/null || true
+      wait "$worker_pid" 2>/dev/null || true
+      printf 'project guard worker did not publish terminal readiness\n' >&2
+      return 1
+    fi
+    (
+      PROJECT_GUARD_ROOT="$guard_root"
+      PROJECT_GUARD_CONTROL_DIR="$control_dir"
+      PROJECT_GUARD_PENDING_SIGNAL=""
+      if [[ "$mode" != commit ]]; then
+        PROJECT_GUARD_PENDING_SIGNAL="$mode"
+      fi
+      publish_project_guard_terminal_decision
+    ) || return $?
+    wait "$worker_pid" || return $?
+    case "$mode" in
+      commit) [[ "$(<"$observed")" == 0 ]] || return 1 ;;
+      HUP) [[ "$(<"$observed")" == 129 ]] || return 1 ;;
+      TERM) [[ "$(<"$observed")" == 130 ]] || return 1 ;;
+      *) return 1 ;;
+    esac
+    rm -f -- "$observed"
+    (
+      PROJECT_GUARD_ROOT="$guard_root"
+      PROJECT_GUARD_CONTROL_DIR="$control_dir"
+      remove_project_guard_control_directory "$control_dir"
+    ) || return $?
+  done
+
+  control_dir="$(mktemp -d "$guard_root/.terminal-handoff.XXXXXX")" || \
+    return 1
+  observed="$guard_root/timeout-observed"
+  (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    if complete_project_guard_terminal_handoff; then
+      printf 'accepted\n' >"$observed"
+    else
+      printf 'rejected\n' >"$observed"
+    fi
+  ) &
+  worker_pid=$!
+  for ((attempt = 0; attempt < 500; attempt++)); do
+    [[ -e "$control_dir/ready" ]] && break
+    sleep 0.01
+  done
+  [[ -e "$control_dir/ready" ]] || return 1
+  (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    publish_project_guard_control_file "$control_dir/decision" corrupt
+  ) || return $?
+  wait "$worker_pid" || return $?
+  [[ "$(<"$observed")" == rejected ]] || {
+    printf 'project guard accepted a malformed terminal decision\n' >&2
+    return 1
+  }
+  rm -f -- "$observed" "$control_dir/decision"
+  (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    remove_project_guard_control_directory "$control_dir"
+  )
+
+  control_dir="$(mktemp -d "$guard_root/.terminal-handoff.XXXXXX")" || \
+    return 1
+  observed="$guard_root/timeout-observed"
+  (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    sleep() { :; }
+    if complete_project_guard_terminal_handoff; then
+      printf 'accepted\n' >"$observed"
+    else
+      printf 'timed-out\n' >"$observed"
+    fi
+  ) || return $?
+  [[ "$(<"$observed")" == timed-out && \
+    ! -e "$control_dir" && ! -L "$control_dir" ]] || {
+    printf 'project guard accepted or retained a missing terminal decision\n' >&2
+    return 1
+  }
+  rm -f -- "$observed"
+  (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    remove_project_guard_control_directory "$control_dir"
+  )
+}
+
+test_project_guard_terminal_handoff_wraps_real_runner() {
+  local -r fake_bin="$TEST_TMP_DIR/project-guard-runner-bin"
+  local -r docker_log="$TEST_TMP_DIR/project-guard-runner-docker.log"
+  local -r block_ready="$TEST_TMP_DIR/project-guard-runner-block-ready"
+  local -r block_release="$TEST_TMP_DIR/project-guard-runner-block-release"
+  local -r failed_launch_lock="$TEST_TMP_DIR/project-guard-failed-launch.lock"
+  local -r failed_launch_ready="$TEST_TMP_DIR/project-guard-failed-launch-ready"
+  local -r failed_launch_release="$TEST_TMP_DIR/project-guard-failed-launch-release"
+  local -r failed_launch_status="$TEST_TMP_DIR/project-guard-failed-launch-status"
+  local -r failed_launch_pending="$TEST_TMP_DIR/project-guard-failed-launch-pending"
+  local -r failed_launch_observed="$TEST_TMP_DIR/project-guard-failed-launch-observed"
+  local -r early_exit_lock="$TEST_TMP_DIR/project-guard-early-exit.lock"
+  local -r early_wait_ready="$TEST_TMP_DIR/project-guard-early-wait.ready"
+  local -r early_wait_release="$TEST_TMP_DIR/project-guard-early-wait.release"
+  local -r early_wait_status_file="$TEST_TMP_DIR/project-guard-early-wait.status"
+  local -r early_wait_pending_file="$TEST_TMP_DIR/project-guard-early-wait.pending"
+  local -r early_wait_observed="$TEST_TMP_DIR/project-guard-early-wait.observed"
+  local -r early_wait_escaped="$TEST_TMP_DIR/project-guard-early-wait.escaped"
+  local -r malformed_launch_project="obi-apache-java-https-handoff-failed-$BASHPID"
+  local -r malformed_launch_lock="/tmp/obi-apache-java-https-project-guard-$EUID/$malformed_launch_project.lock"
+  local -r malformed_launch_status="$TEST_TMP_DIR/project-guard-malformed-launch-status"
+  local -r pretrap_project="obi-apache-java-https-handoff-pretrap-$BASHPID"
+  local -r pretrap_lock="/tmp/obi-apache-java-https-project-guard-$EUID/$pretrap_project.lock"
+  local -r pretrap_ready="$TEST_TMP_DIR/project-guard-pretrap-ready"
+  local -r pretrap_direct_ready="$TEST_TMP_DIR/project-guard-pretrap-direct-ready"
+  local -r pretrap_runner="$(cd -- "$TEST_SCRIPT_DIR/.." && pwd -P)/run.sh"
+  local -r project="obi-apache-java-https-handoff-$BASHPID"
+  local -r lock_file="/tmp/obi-apache-java-https-project-guard-$EUID/$project.lock"
+  local failed_launch_waiter=""
+  local early_exit_holder=""
+  local early_exit_state=""
+  local early_exit_status=0
+  local early_terminal_code=""
+  local early_terminal_holder=""
+  local early_terminal_probe=""
+  local early_terminal_status_file=""
+  local early_terminal_pending_file=""
+  local early_wait_sender=""
+  local failed_launch_control=""
+  local exit_race_control=""
+  local exit_race_lock=""
+  local exit_race_ready=""
+  local exit_race_release=""
+  local exit_race_status=""
+  local exit_race_waits=""
+  local exit_race_holder_file=""
+  local exit_race_probe=""
+  local stale_wait_control=""
+  local stale_wait_lock=""
+  local stale_wait_release=""
+  local stale_wait_holder=""
+  local stale_wait_holder_pid=""
+  local stale_wait_relay_pid=""
+  local stale_wait_relay_start=""
+  local stale_wait_holder_start=""
+  local stale_wait_status=0
+  local holder_status_original=""
+  local holder_status_mutation=""
+  local accepted_control=""
+  local accepted_lock="$TEST_TMP_DIR/project-guard-accepted.lock"
+  local accepted_ready="$TEST_TMP_DIR/project-guard-accepted.ready"
+  local accepted_release="$TEST_TMP_DIR/project-guard-accepted.release"
+  local accepted_pids="$TEST_TMP_DIR/project-guard-accepted.pids"
+  local accepted_holder_file="$TEST_TMP_DIR/project-guard-accepted.holder"
+  local accepted_status="$TEST_TMP_DIR/project-guard-accepted.status"
+  local accepted_probe=""
+  local accepted_holder=""
+  local accepted_timeout=""
+  local accepted_leaf=""
+  local accepted_timeout_start=""
+  local accepted_leaf_start=""
+  local accepted_timeout_stat=""
+  local accepted_timeout_fields=""
+  local accepted_timeout_pgid=""
+  local accepted_extra=""
+  local accepted_missing_control=""
+  local accepted_missing_lock="$TEST_TMP_DIR/project-guard-accepted-missing.lock"
+  local accepted_missing_release="$TEST_TMP_DIR/project-guard-accepted-missing.release"
+  local accepted_missing_holder=""
+  local accepted_missing_start=""
+  local accepted_missing_status=0
+  local accepted_missing_mode=""
+  local protocol_latch_control=""
+  local protocol_latch_lock="$TEST_TMP_DIR/project-guard-protocol-latch.lock"
+  local protocol_latch_release="$TEST_TMP_DIR/project-guard-protocol-latch.release"
+  local protocol_latch_read_count="$TEST_TMP_DIR/project-guard-protocol-latch.read-count"
+  local protocol_latch_live_count="$TEST_TMP_DIR/project-guard-protocol-latch.live-count"
+  local protocol_latch_status=0
+  local failed_signal=""
+  local malformed_launch_control=""
+  local malformed_launch_relay=""
+  local relay_definition=""
+  local accepted_definition=""
+  local demo_definition=""
+  local accepted_latch_line=""
+  local accepted_forward_line=""
+  local accepted_publish_line=""
+  local demo_guard_line=""
+  local demo_recursive_line=""
+  local demo_dependency_lines=""
+  local demo_order_file="$TEST_TMP_DIR/project-guard-recursive-dependency-order"
+  local reap_calls=""
+  local real_bash=""
+  local runner_pid=""
+  local runner_status=0
+  local failed_launch_escaped=false
+  local malformed_launch_escaped=false
+  local -i attempt=0
+  local -i exit_race_poll=0
+
+  mkdir -p -- "$fake_bin"
+  cat >"$fake_bin/docker" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf '%s\n' "$*" >>"$PROJECT_GUARD_TEST_DOCKER_LOG"
+if [[ "${1:-}" == info ]]; then
+  printf '"project-guard-test-daemon"\n'
+fi
+if [[ -n "${PROJECT_GUARD_TEST_BLOCK_READY:-}" && "$*" == *" down "* ]]; then
+  : >"$PROJECT_GUARD_TEST_BLOCK_READY"
+  while [[ ! -e "$PROJECT_GUARD_TEST_BLOCK_RELEASE" ]]; do sleep 0.01; done
+fi
+EOF
+  chmod 0700 -- "$fake_bin/docker"
+  if ! COMPOSE_PROJECT_NAME="$project" \
+    PROJECT_GUARD_TEST_DOCKER_LOG="$docker_log" \
+    PATH="$fake_bin:$PATH" \
+    bash "$TEST_SCRIPT_DIR/../run.sh" --cleanup-only; then
+    printf 'real runner failed its project guard terminal handoff\n' >&2
+    return 1
+  fi
+  [[ -s "$docker_log" && -f "$lock_file" ]] || {
+    printf 'real runner skipped guarded cleanup-only execution\n' >&2
+    return 1
+  }
+  flock --exclusive --nonblock "$lock_file" true || {
+    printf 'real runner retained the project lock after terminal handoff\n' >&2
+    return 1
+  }
+  COMPOSE_PROJECT_NAME="$project" \
+    PROJECT_GUARD_TEST_DOCKER_LOG="$docker_log" \
+    PROJECT_GUARD_TEST_BLOCK_READY="$block_ready" \
+    PROJECT_GUARD_TEST_BLOCK_RELEASE="$block_release" \
+    PATH="$fake_bin:$PATH" \
+    bash "$TEST_SCRIPT_DIR/../run.sh" --cleanup-only &
+  runner_pid=$!
+  for ((attempt = 0; attempt < 500; attempt++)); do
+    [[ -e "$block_ready" ]] && break
+    sleep 0.01
+  done
+  if [[ ! -e "$block_ready" ]]; then
+    kill -KILL "$runner_pid" 2>/dev/null || true
+    wait "$runner_pid" 2>/dev/null || true
+    printf 'real guarded runner did not reach its blocking mutation\n' >&2
+    return 1
+  fi
+  kill -TERM "$runner_pid" || return $?
+  : >"$block_release"
+  if wait "$runner_pid"; then
+    runner_status=0
+  else
+    runner_status=$?
+  fi
+  [[ "$runner_status" == 130 ]] || {
+    printf 'real guarded runner lost TERM at terminal handoff: %s\n' \
+      "$runner_status" >&2
+    return 1
+  }
+  flock --exclusive --nonblock "$lock_file" true || {
+    printf 'interrupted runner retained the project lock after handoff\n' >&2
+    return 1
+  }
+  rm -f -- "$lock_file"
+
+  relay_definition="$(declare -f run_project_guard_relay)" || return 1
+  reap_calls="$(grep -F -c \
+    'wait_for_project_guard_holder "$holder_pid"' \
+    <<<"$relay_definition")" || return 1
+  [[ "$reap_calls" == 2 ]] || {
+    printf 'project guard launch failure bypassed its interruption-safe reap\n' >&2
+    return 1
+  }
+  accepted_definition="$(awk '
+    /PROJECT_GUARD_SUPERVISOR_START_TIME="\$holder_start_time"/ { accepted = 1 }
+    accepted { print }
+    /"\$launch_accepted"/ { exit }
+  ' <<<"$relay_definition")" || return 1
+  accepted_latch_line="$(awk \
+    '/launch_signal="\$PROJECT_GUARD_PENDING_SIGNAL"/ { print NR; exit }' \
+    <<<"$accepted_definition")"
+  accepted_forward_line="$(awk \
+    '/forward_project_guard_signal "\$PROJECT_GUARD_PENDING_SIGNAL"/ { print NR; exit }' \
+    <<<"$accepted_definition")"
+  accepted_publish_line="$(awk \
+    '/publish_project_guard_supervisor_launch_acceptance/ { print NR; exit }' \
+    <<<"$accepted_definition")"
+  [[ "$accepted_definition" == *'publish_project_guard_supervisor_launch_acceptance'* && \
+    "$accepted_definition" == *'launch_accepted=true'* && \
+    "$accepted_definition" == *'"$launch_accepted"'* && \
+    "$accepted_definition" != *'PROJECT_GUARD_HANDOFF_MAX_ATTEMPTS'* && \
+    "$accepted_definition" != *'kill -KILL -- "-$holder_pid"'* && \
+    "$accepted_latch_line" =~ ^[1-9][0-9]*$ && \
+    "$accepted_forward_line" =~ ^[1-9][0-9]*$ && \
+    "$accepted_publish_line" =~ ^[1-9][0-9]*$ && \
+    accepted_latch_line -lt accepted_forward_line && \
+    accepted_forward_line -lt accepted_publish_line ]] || {
+    printf 'accepted project guard launch reused the pre-launch kill boundary\n' >&2
+    return 1
+  }
+  demo_definition="$(declare -f run_demo)" || return 1
+  demo_guard_line="$(awk '/enter_project_guard "\$@"/ { print NR; exit }' \
+    <<<"$demo_definition")"
+  demo_recursive_line="$(awk \
+    '/if \[\[ "\$recursive_guard_launch" == true \]\]/ { print NR; exit }' \
+    <<<"$demo_definition")"
+  demo_dependency_lines="$(awk '/^[[:space:]]*check_dependencies;?$/ { print NR }' \
+    <<<"$demo_definition")"
+  [[ "$demo_definition" == *'recursive_guard_launch=true'* && \
+    "$demo_definition" == *'enter_project_guard "$@"'* && \
+    "$demo_definition" == *'if [[ "$recursive_guard_launch" == true ]]'* && \
+    "$demo_guard_line" =~ ^[1-9][0-9]*$ && \
+    "$demo_recursive_line" =~ ^[1-9][0-9]*$ && \
+    "$(wc -l <<<"$demo_dependency_lines")" == 2 && \
+    "$(tail -n 1 <<<"$demo_dependency_lines")" -gt "$demo_guard_line" && \
+    "$demo_recursive_line" -gt "$demo_guard_line" ]] || {
+    printf 'recursive dependency checks no longer follow guard acceptance\n' >&2
+    return 1
+  }
+  (
+    OBI_DEMO_PROJECT_GUARD_ACTIVE=1
+    CLEANUP_ONLY=true
+    install_traps() { :; }
+    parse_args() { :; }
+    enter_project_guard() { printf 'guard\n' >>"$demo_order_file"; }
+    check_dependencies() { printf 'dependencies\n' >>"$demo_order_file"; }
+    cleanup_only() { printf 'cleanup\n' >>"$demo_order_file"; }
+    run_demo --cleanup-only
+  ) || return $?
+  [[ "$(<"$demo_order_file")" == $'guard\ndependencies\ncleanup' ]] || {
+    printf 'recursive runner did not check dependencies after guard acceptance\n' >&2
+    return 1
+  }
+  (umask 077; : >"$early_exit_lock")
+  for failed_signal in HUP INT TERM; do
+    bash -c 'exit 75' &
+    early_exit_holder=$!
+    while [[ -r "/proc/$early_exit_holder/stat" ]]; do
+      read -r early_exit_state _ <<<"$(project_guard_process_stat_identity \
+        "$early_exit_holder" 2>/dev/null || true)"
+      [[ "$early_exit_state" == Z || "$early_exit_state" == X ]] && break
+      sleep 0.001
+    done
+    PROJECT_GUARD_PENDING_SIGNAL="$failed_signal"
+    PROJECT_GUARD_FORWARDING_READY=false
+    if wait_for_project_guard_holder \
+      "$early_exit_holder" "$early_exit_lock" \
+      "$BASHPID" "$(project_guard_process_start_time "$BASHPID")" \
+      "" false; then
+      early_exit_status=0
+    else
+      early_exit_status=$?
+    fi
+    [[ "$early_exit_status" == 75 && \
+      "$PROJECT_GUARD_PENDING_SIGNAL" == "$failed_signal" ]] || {
+      printf 'early guard exit lost status under pending %s: %s\n' \
+        "$failed_signal" "$early_exit_status" >&2
+      return 1
+    }
+  done
+  for early_terminal_code in 0 255; do
+    early_terminal_status_file="$TEST_TMP_DIR/project-guard-early-$early_terminal_code.status"
+    early_terminal_pending_file="$TEST_TMP_DIR/project-guard-early-$early_terminal_code.pending"
+    (
+      PROJECT_GUARD_PENDING_SIGNAL=TERM
+      PROJECT_GUARD_FORWARDING_READY=false
+      bash -c 'exit "$1"' bash "$early_terminal_code" &
+      early_terminal_holder=$!
+      while [[ -r "/proc/$early_terminal_holder/stat" ]]; do
+        read -r early_exit_state _ <<<"$(project_guard_process_stat_identity \
+          "$early_terminal_holder" 2>/dev/null || true)"
+        [[ "$early_exit_state" == Z || "$early_exit_state" == X ]] && break
+        sleep 0.001
+      done
+      if wait_for_project_guard_holder \
+        "$early_terminal_holder" "$early_exit_lock" \
+        "$BASHPID" "$(project_guard_process_start_time "$BASHPID")" \
+        "" false; then
+        early_exit_status=0
+      else
+        early_exit_status=$?
+      fi
+      printf '%s\n' "$early_exit_status" >"$early_terminal_status_file"
+      printf '%s\n' "$PROJECT_GUARD_PENDING_SIGNAL" \
+        >"$early_terminal_pending_file"
+    ) &
+    early_terminal_probe=$!
+    for ((attempt = 0; attempt < 300; attempt++)); do
+      kill -0 "$early_terminal_probe" 2>/dev/null || break
+      sleep 0.01
+    done
+    if kill -0 "$early_terminal_probe" 2>/dev/null; then
+      kill -KILL "$early_terminal_probe" 2>/dev/null || true
+      wait "$early_terminal_probe" 2>/dev/null || true
+      printf 'project guard livelocked on no-anchor status %s\n' \
+        "$early_terminal_code" >&2
+      return 1
+    fi
+    wait "$early_terminal_probe" || return $?
+    [[ "$(<"$early_terminal_status_file")" == 1 && \
+      "$(<"$early_terminal_pending_file")" == TERM ]] || {
+      printf 'project guard trusted ambiguous no-anchor status %s: %s\n' \
+        "$early_terminal_code" "$(<"$early_terminal_status_file")" >&2
+      return 1
+    }
+    rm -f -- "$early_terminal_status_file" "$early_terminal_pending_file"
+  done
+  PROJECT_GUARD_PENDING_SIGNAL=""
+  (
+    relay_pid="$BASHPID"
+    relay_start_time="$(project_guard_process_start_time "$relay_pid")"
+    PROJECT_GUARD_PENDING_SIGNAL=""
+    PROJECT_GUARD_FORWARDING_READY=false
+    record_early_wait_term() {
+      printf 'TERM\n' >"$early_wait_observed"
+      record_project_guard_pending_signal TERM || true
+    }
+    trap record_early_wait_term TERM
+    flock --exclusive --nonblock --close "$early_exit_lock" \
+      bash -c '
+        : >"$1"
+        while [[ ! -e "$2" ]]; do sleep 0.01; done
+        exit 41
+      ' bash "$early_wait_ready" "$early_wait_release" &
+    early_exit_holder=$!
+    (
+      while [[ ! -e "$early_wait_ready" ]]; do sleep 0.001; done
+      kill -TERM "$relay_pid"
+      sleep 0.005
+      kill -TERM "$relay_pid"
+      sleep 0.1
+      if flock --exclusive --nonblock "$early_exit_lock" true; then
+        : >"$early_wait_escaped"
+      fi
+      : >"$early_wait_release"
+    ) &
+    early_wait_sender=$!
+    if wait_for_project_guard_holder \
+      "$early_exit_holder" "$early_exit_lock" \
+      "$relay_pid" "$relay_start_time" "" false; then
+      early_exit_status=0
+    else
+      early_exit_status=$?
+    fi
+    wait "$early_wait_sender" 2>/dev/null || true
+    printf '%s\n' "$early_exit_status" >"$early_wait_status_file"
+    printf '%s\n' "$PROJECT_GUARD_PENDING_SIGNAL" \
+      >"$early_wait_pending_file"
+  ) || {
+    printf 'project guard interrupted-wait fixture failed before observation\n' >&2
+    return 1
+  }
+  [[ "$(<"$early_wait_status_file")" == 41 && \
+    "$(<"$early_wait_observed")" == TERM && \
+    ( -z "$(<"$early_wait_pending_file")" || \
+      "$(<"$early_wait_pending_file")" == TERM ) && \
+    ! -e "$early_wait_escaped" ]] || {
+    printf 'project guard confused an interrupted wait with holder exit status=%s observed=%s pending=%s escaped=%s\n' \
+      "$(<"$early_wait_status_file")" \
+      "$(<"$early_wait_observed")" \
+      "$(<"$early_wait_pending_file")" \
+      "$([[ -e "$early_wait_escaped" ]] && printf yes || printf no)" >&2
+    return 1
+  }
+  flock --exclusive --nonblock "$early_exit_lock" true || {
+    printf 'project guard retained its lock after interrupted-wait reap\n' >&2
+    return 1
+  }
+  rm -f -- "$early_exit_lock"
+  rm -f -- "$early_wait_ready" "$early_wait_release" \
+    "$early_wait_status_file" "$early_wait_pending_file" \
+    "$early_wait_observed" "$early_wait_escaped"
+  for failed_signal in HUP INT TERM; do
+    rm -f -- "$failed_launch_ready" "$failed_launch_release" \
+      "$failed_launch_status" "$failed_launch_pending" \
+      "$failed_launch_observed"
+    failed_launch_escaped=false
+    (umask 077; : >"$failed_launch_lock")
+    failed_launch_control="$(mktemp -d \
+      "/tmp/obi-apache-java-https-project-guard-$EUID/.terminal-handoff.XXXXXX")" || \
+      return 1
+    (
+      relay_pid="$BASHPID"
+      relay_start_time="$(project_guard_process_start_time "$relay_pid")"
+      PROJECT_GUARD_CONTROL_DIR="$failed_launch_control"
+      publish_project_guard_control_file \
+        "$PROJECT_GUARD_CONTROL_DIR/supervisor" \
+        "supervisor:$relay_pid:$relay_start_time"
+      publish_project_guard_control_file \
+        "$PROJECT_GUARD_CONTROL_DIR/supervisor-accepted" \
+        "supervisor-accepted:$relay_pid:$relay_start_time"
+      PROJECT_GUARD_PENDING_SIGNAL=""
+      PROJECT_GUARD_TEST_OBSERVED_SIGNAL=""
+      PROJECT_GUARD_FORWARDING_READY=false
+      record_failed_launch_signal() {
+        local -r signal_name="$1"
+
+        [[ -n "$PROJECT_GUARD_TEST_OBSERVED_SIGNAL" ]] || \
+          PROJECT_GUARD_TEST_OBSERVED_SIGNAL="$signal_name"
+        printf '%s\n' "$PROJECT_GUARD_TEST_OBSERVED_SIGNAL" \
+          >"$failed_launch_observed"
+        record_project_guard_pending_signal "$signal_name" || true
+      }
+      record_failed_launch_hup() { record_failed_launch_signal HUP; }
+      record_failed_launch_int() { record_failed_launch_signal INT; }
+      record_failed_launch_term() { record_failed_launch_signal TERM; }
+      trap record_failed_launch_hup HUP
+      trap record_failed_launch_int INT
+      trap record_failed_launch_term TERM
+      env --ignore-signal=HUP,INT,TERM \
+        flock --exclusive --nonblock --close "$failed_launch_lock" \
+          bash -c '
+            set -Eeuo pipefail
+            : >"$1"
+            while [[ ! -e "$2" ]]; do sleep 0.01; done
+            exit 41
+          ' bash "$failed_launch_ready" "$failed_launch_release" &
+      holder_pid=$!
+      holder_start_time="$(project_guard_process_start_time "$holder_pid")"
+      PROJECT_GUARD_STATUS_RELAY_PID="$relay_pid"
+      PROJECT_GUARD_STATUS_RELAY_START_TIME="$relay_start_time"
+      PROJECT_GUARD_STATUS_HOLDER_PID="$holder_pid"
+      PROJECT_GUARD_STATUS_HOLDER_START_TIME="$holder_start_time"
+      publish_project_guard_holder_status 41
+      if wait_for_project_guard_holder \
+        "$holder_pid" "$failed_launch_lock" \
+        "$relay_pid" "$relay_start_time" "$holder_start_time"; then
+        holder_status=0
+      else
+        holder_status=$?
+      fi
+      printf '%s\n' "$holder_status" >"$failed_launch_status"
+      printf '%s\n' "$PROJECT_GUARD_PENDING_SIGNAL" \
+        >"$failed_launch_pending"
+    ) &
+    failed_launch_waiter=$!
+    for ((attempt = 0; attempt < 500; attempt++)); do
+      [[ -e "$failed_launch_ready" ]] && break
+      sleep 0.01
+    done
+    if [[ ! -e "$failed_launch_ready" ]]; then
+      failed_launch_escaped=true
+    else
+      if ! kill -s "$failed_signal" "$failed_launch_waiter"; then
+        failed_launch_escaped=true
+      else
+        if [[ "$failed_signal" == TERM ]] && \
+          ! kill -TERM "$failed_launch_waiter"; then
+          failed_launch_escaped=true
+        fi
+        for ((attempt = 0; attempt < 500; attempt++)); do
+          [[ -s "$failed_launch_observed" ]] && break
+          sleep 0.01
+        done
+        [[ -s "$failed_launch_observed" ]] || \
+          failed_launch_escaped=true
+        if ! kill -0 "$failed_launch_waiter" 2>/dev/null || \
+          flock --exclusive --nonblock "$failed_launch_lock" true; then
+          failed_launch_escaped=true
+        fi
+      fi
+    fi
+    : >"$failed_launch_release"
+    wait "$failed_launch_waiter" || return $?
+    [[ "$failed_launch_escaped" == false && \
+      "$(<"$failed_launch_status")" == 41 && \
+      "$(<"$failed_launch_observed")" == "$failed_signal" && \
+      ( -z "$(<"$failed_launch_pending")" || \
+        "$(<"$failed_launch_pending")" == "$failed_signal" ) ]] || {
+      printf 'project guard returned before reaping its rejected launch signal=%s escaped=%s status=%s observed=%s pending=%s\n' \
+        "$failed_signal" "$failed_launch_escaped" \
+        "$(<"$failed_launch_status")" \
+        "$(<"$failed_launch_observed")" \
+        "$(<"$failed_launch_pending")" >&2
+      return 1
+    }
+    flock --exclusive --nonblock "$failed_launch_lock" true || {
+      printf 'rejected project guard launch retained its lock after reap\n' >&2
+      return 1
+    }
+    rm -f -- "$failed_launch_lock"
+    (
+      PROJECT_GUARD_CONTROL_DIR="$failed_launch_control"
+      remove_project_guard_control_directory "$failed_launch_control"
+    ) || return $?
+  done
+  rm -f -- "$failed_launch_ready" "$failed_launch_release" \
+    "$failed_launch_status" "$failed_launch_pending" \
+    "$failed_launch_observed"
+
+  # Bash can retain a phantom RUNNING job after TERM interrupts wait exactly
+  # as the holder exits. The authenticated terminal-status record, not `jobs`,
+  # must close that race and preserve the worker's arbitrary status.
+  for ((attempt = 0; attempt < 50; attempt++)); do
+    exit_race_control="$(mktemp -d \
+      "/tmp/obi-apache-java-https-project-guard-$EUID/.terminal-handoff.XXXXXX")" || \
+      return 1
+    exit_race_lock="$TEST_TMP_DIR/project-guard-exit-race-$attempt.lock"
+    exit_race_ready="$TEST_TMP_DIR/project-guard-exit-race-$attempt.ready"
+    exit_race_release="$TEST_TMP_DIR/project-guard-exit-race-$attempt.release"
+    exit_race_status="$TEST_TMP_DIR/project-guard-exit-race-$attempt.status"
+    exit_race_waits="$TEST_TMP_DIR/project-guard-exit-race-$attempt.waits"
+    exit_race_holder_file="$TEST_TMP_DIR/project-guard-exit-race-$attempt.holder"
+    (umask 077; : >"$exit_race_lock")
+    (
+      PROJECT_GUARD_CONTROL_DIR="$exit_race_control"
+      relay_pid="$BASHPID"
+      relay_start_time="$(project_guard_process_start_time "$relay_pid")"
+      publish_project_guard_control_file \
+        "$PROJECT_GUARD_CONTROL_DIR/supervisor" \
+        "supervisor:$relay_pid:$relay_start_time"
+      publish_project_guard_control_file \
+        "$PROJECT_GUARD_CONTROL_DIR/supervisor-accepted" \
+        "supervisor-accepted:$relay_pid:$relay_start_time"
+      PROJECT_GUARD_PENDING_SIGNAL=""
+      PROJECT_GUARD_FORWARDING_READY=false
+      trap record_project_guard_term TERM
+      env --ignore-signal=HUP,INT,TERM \
+        flock --exclusive --nonblock --close "$exit_race_lock" \
+          bash -c '
+            set -Eeuo pipefail
+            : >"$1"
+            while [[ ! -e "$2" ]]; do sleep 0.001; done
+            sleep 0.003
+            exit 41
+          ' bash "$exit_race_ready" "$exit_race_release" &
+      holder_pid=$!
+      printf '%s\n' "$holder_pid" >"$exit_race_holder_file"
+      holder_start_time="$(project_guard_process_start_time "$holder_pid")"
+      PROJECT_GUARD_STATUS_RELAY_PID="$relay_pid"
+      PROJECT_GUARD_STATUS_RELAY_START_TIME="$relay_start_time"
+      PROJECT_GUARD_STATUS_HOLDER_PID="$holder_pid"
+      PROJECT_GUARD_STATUS_HOLDER_START_TIME="$holder_start_time"
+      publish_project_guard_holder_status 41
+      : >"$exit_race_release"
+      if ((attempt == 0)); then
+        wait() {
+          printf '%s:%s\n' "$#" "$*" >>"$exit_race_waits"
+          builtin wait "$@"
+        }
+      fi
+      (sleep 0.004; kill -TERM "$relay_pid" 2>/dev/null || true) &
+      sender_pid=$!
+      if wait_for_project_guard_holder \
+        "$holder_pid" "$exit_race_lock" \
+        "$relay_pid" "$relay_start_time" "$holder_start_time"; then
+        holder_status=0
+      else
+        holder_status=$?
+      fi
+      wait "$sender_pid" 2>/dev/null || true
+      printf '%s\n' "$holder_status" >"$exit_race_status"
+      remove_project_guard_control_directory "$exit_race_control"
+    ) &
+    exit_race_probe=$!
+    for ((exit_race_poll = 0; exit_race_poll < 200; exit_race_poll++)); do
+      kill -0 "$exit_race_probe" 2>/dev/null || break
+      sleep 0.01
+    done
+    if kill -0 "$exit_race_probe" 2>/dev/null; then
+      kill -KILL "$exit_race_probe" 2>/dev/null || true
+      wait "$exit_race_probe" 2>/dev/null || true
+      printf 'project guard livelocked after an interrupted terminal wait\n' >&2
+      return 1
+    fi
+    wait "$exit_race_probe" || return $?
+    [[ "$(<"$exit_race_status")" == 41 ]] || {
+      printf 'project guard lost the authenticated exit-race status\n' >&2
+      return 1
+    }
+    if ((attempt == 0)) && \
+      ! grep -Fxq -- "1:$(<"$exit_race_holder_file")" \
+        "$exit_race_waits"; then
+      printf 'project guard did not child-table reap the exact holder\n' >&2
+      return 1
+    fi
+    flock --exclusive --nonblock "$exit_race_lock" true || {
+      printf 'project guard exit-race probe retained its lock\n' >&2
+      return 1
+    }
+    rm -f -- "$exit_race_lock" "$exit_race_ready" \
+      "$exit_race_release" "$exit_race_status" \
+      "$exit_race_waits" "$exit_race_holder_file"
+  done
+
+  stale_wait_control="$(mktemp -d \
+    "/tmp/obi-apache-java-https-project-guard-$EUID/.terminal-handoff.XXXXXX")" || \
+    return 1
+  stale_wait_lock="$TEST_TMP_DIR/project-guard-stale-wait.lock"
+  stale_wait_release="$TEST_TMP_DIR/project-guard-stale-wait.release"
+  (umask 077; : >"$stale_wait_lock")
+  PROJECT_GUARD_CONTROL_DIR="$stale_wait_control"
+  stale_wait_relay_pid="$BASHPID"
+  stale_wait_relay_start="$(project_guard_process_start_time \
+    "$stale_wait_relay_pid")"
+  publish_project_guard_control_file \
+    "$stale_wait_control/supervisor" \
+    "supervisor:$stale_wait_relay_pid:$stale_wait_relay_start"
+  publish_project_guard_control_file \
+    "$stale_wait_control/supervisor-accepted" \
+    "supervisor-accepted:$stale_wait_relay_pid:$stale_wait_relay_start"
+  env --ignore-signal=HUP,INT,TERM \
+    flock --exclusive --nonblock --close "$stale_wait_lock" \
+      bash -c '
+        while [[ ! -e "$1" ]]; do sleep 0.01; done
+        exit 41
+      ' bash "$stale_wait_release" &
+  stale_wait_holder=$!
+  stale_wait_holder_start="$(project_guard_process_start_time \
+    "$stale_wait_holder")"
+  PROJECT_GUARD_STATUS_RELAY_PID="$stale_wait_relay_pid"
+  PROJECT_GUARD_STATUS_RELAY_START_TIME="$stale_wait_relay_start"
+  PROJECT_GUARD_STATUS_HOLDER_PID="$stale_wait_holder"
+  PROJECT_GUARD_STATUS_HOLDER_START_TIME="$stale_wait_holder_start"
+  publish_project_guard_holder_status 41
+  if (
+    wait() { return 255; }
+    project_guard_supervisor_is_running() { return 1; }
+    wait_for_project_guard_holder \
+      "$stale_wait_holder" "$stale_wait_lock" \
+      "$stale_wait_relay_pid" "$stale_wait_relay_start" \
+      "$stale_wait_holder_start"
+  ); then
+    stale_wait_status=0
+  else
+    stale_wait_status=$?
+  fi
+  : >"$stale_wait_release"
+  wait "$stale_wait_holder" 2>/dev/null || true
+  [[ "$stale_wait_status" == 41 ]] || {
+    printf 'project guard trusted a phantom Bash job over terminal status\n' >&2
+    return 1
+  }
+  remove_project_guard_control_directory "$stale_wait_control" || return $?
+  rm -f -- "$stale_wait_lock" "$stale_wait_release"
+  PROJECT_GUARD_CONTROL_DIR=""
+  PROJECT_GUARD_STATUS_RELAY_PID=""
+  PROJECT_GUARD_STATUS_RELAY_START_TIME=""
+  PROJECT_GUARD_STATUS_HOLDER_PID=""
+  PROJECT_GUARD_STATUS_HOLDER_START_TIME=""
+
+  # The terminal record is private protocol input, not a hint: every byte,
+  # metadata field, and bound process identity must be exact.
+  stale_wait_control="$(mktemp -d \
+    "/tmp/obi-apache-java-https-project-guard-$EUID/.terminal-handoff.XXXXXX")" || \
+    return 1
+  PROJECT_GUARD_CONTROL_DIR="$stale_wait_control"
+  stale_wait_relay_pid="$BASHPID"
+  stale_wait_relay_start="$(project_guard_process_start_time \
+    "$stale_wait_relay_pid")"
+  stale_wait_holder_pid="$stale_wait_relay_pid"
+  stale_wait_holder_start="$stale_wait_relay_start"
+  holder_status_original="$(project_guard_holder_status_payload \
+    "$stale_wait_relay_pid" "$stale_wait_relay_start" \
+    "$stale_wait_holder_pid" "$stale_wait_holder_start" 41)" || return 1
+  publish_project_guard_control_file \
+    "$stale_wait_control/holder-status" "$holder_status_original" || return $?
+  [[ "$(read_project_guard_holder_status \
+    "$stale_wait_relay_pid" "$stale_wait_relay_start" \
+    "$stale_wait_holder_pid" "$stale_wait_holder_start")" == \
+    "$stale_wait_holder_start 41" ]] || return 1
+  for holder_status_mutation in \
+    "holder-status:$stale_wait_relay_pid:$stale_wait_relay_start:$stale_wait_holder_pid:$stale_wait_holder_start:041" \
+    "holder-status:$((stale_wait_relay_pid + 1)):$stale_wait_relay_start:$stale_wait_holder_pid:$stale_wait_holder_start:41" \
+    "holder-status:$stale_wait_relay_pid:$((stale_wait_relay_start + 1)):$stale_wait_holder_pid:$stale_wait_holder_start:41" \
+    "holder-status:$stale_wait_relay_pid:$stale_wait_relay_start:$((stale_wait_holder_pid + 1)):$stale_wait_holder_start:41" \
+    "holder-status:$stale_wait_relay_pid:$stale_wait_relay_start:$stale_wait_holder_pid:$((stale_wait_holder_start + 1)):41"; do
+    printf '%s\n' "$holder_status_mutation" >"$stale_wait_control/holder-status"
+    if read_project_guard_holder_status \
+      "$stale_wait_relay_pid" "$stale_wait_relay_start" \
+      "$stale_wait_holder_pid" "$stale_wait_holder_start" \
+      >/dev/null 2>&1; then
+      printf 'project guard accepted a mutated terminal status record\n' >&2
+      return 1
+    fi
+  done
+  printf '%s\n' "$holder_status_original" >"$stale_wait_control/holder-status"
+  chmod 0644 -- "$stale_wait_control/holder-status"
+  if read_project_guard_holder_status \
+    "$stale_wait_relay_pid" "$stale_wait_relay_start" \
+    "$stale_wait_holder_pid" "$stale_wait_holder_start" \
+    >/dev/null 2>&1; then
+    printf 'project guard accepted public terminal status metadata\n' >&2
+    return 1
+  fi
+  chmod 0600 -- "$stale_wait_control/holder-status"
+  ln "$stale_wait_control/holder-status" \
+    "$stale_wait_control/holder-status-link" || return $?
+  if read_project_guard_holder_status \
+    "$stale_wait_relay_pid" "$stale_wait_relay_start" \
+    "$stale_wait_holder_pid" "$stale_wait_holder_start" \
+    >/dev/null 2>&1; then
+    printf 'project guard accepted hard-linked terminal status evidence\n' >&2
+    return 1
+  fi
+  rm -f -- "$stale_wait_control/holder-status-link"
+  remove_project_guard_control_directory "$stale_wait_control" || return $?
+  PROJECT_GUARD_CONTROL_DIR=""
+
+  # Once malformed terminal protocol input is observed, a later valid-looking
+  # replacement cannot repair that invocation. Exercise the exact latch even
+  # across two liveness observations so a fast-path status return cannot skip
+  # the earlier failure.
+  protocol_latch_control="$(mktemp -d \
+    "/tmp/obi-apache-java-https-project-guard-$EUID/.terminal-handoff.XXXXXX")" || \
+    return 1
+  (umask 077; : >"$protocol_latch_lock")
+  printf 'corrupt\n' >"$protocol_latch_control/holder-status"
+  chmod 0600 -- "$protocol_latch_control/holder-status"
+  printf '0\n' >"$protocol_latch_read_count"
+  printf '0\n' >"$protocol_latch_live_count"
+  (
+    PROJECT_GUARD_CONTROL_DIR="$protocol_latch_control"
+    relay_pid="$BASHPID"
+    relay_start_time="$(project_guard_process_start_time "$relay_pid")"
+    bash -c 'while [[ ! -e "$1" ]]; do sleep 0.01; done; exit 41' \
+      bash "$protocol_latch_release" &
+    holder_pid=$!
+    holder_start_time="$(project_guard_process_start_time "$holder_pid")"
+    : >"$protocol_latch_release"
+    project_guard_supervisor_is_running() {
+      local count=""
+      count="$(<"$protocol_latch_live_count")"
+      printf '%s\n' "$((count + 1))" >"$protocol_latch_live_count"
+      # First top-level probe: terminal. First post-read probe: appear live so
+      # the loop observes the replacement. Every later probe: terminal.
+      [[ "$count" -eq 1 ]]
+    }
+    load_project_guard_holder_status() {
+      local count=""
+      count="$(<"$protocol_latch_read_count")"
+      printf '%s\n' "$((count + 1))" >"$protocol_latch_read_count"
+      if [[ "$count" -eq 0 ]]; then
+        return 1
+      fi
+      PROJECT_GUARD_LOADED_HOLDER_START_TIME="$holder_start_time"
+      PROJECT_GUARD_LOADED_HOLDER_STATUS=41
+    }
+    if wait_for_project_guard_holder \
+      "$holder_pid" "$protocol_latch_lock" \
+      "$relay_pid" "$relay_start_time" "$holder_start_time" false; then
+      protocol_status=0
+    else
+      protocol_status=$?
+    fi
+    [[ "$protocol_status" -eq 1 ]]
+  ) || {
+    printf 'project guard repaired a latched malformed terminal status\n' >&2
+    return 1
+  }
+  (
+    PROJECT_GUARD_CONTROL_DIR="$protocol_latch_control"
+    remove_project_guard_control_directory "$protocol_latch_control"
+  ) || return $?
+  rm -f -- "$protocol_latch_lock" "$protocol_latch_release" \
+    "$protocol_latch_read_count" "$protocol_latch_live_count"
+
+  # An accepted worker can legitimately spend longer than the launch
+  # handshake in cleanup and can run commands below GNU timeout's distinct
+  # process group. Cancellation must retain the relay and flock until that
+  # worker publishes and exits; killing the holder group would orphan timeout
+  # and its command while making the project lock acquirable.
+  accepted_control="$(mktemp -d \
+    "/tmp/obi-apache-java-https-project-guard-$EUID/.terminal-handoff.XXXXXX")" || \
+    return 1
+  (umask 077; : >"$accepted_lock")
+  (
+    PROJECT_GUARD_CONTROL_DIR="$accepted_control"
+    relay_pid="$BASHPID"
+    relay_start_time="$(project_guard_process_start_time "$relay_pid")"
+    publish_project_guard_control_file \
+      "$accepted_control/supervisor" \
+      "supervisor:$relay_pid:$relay_start_time"
+    publish_project_guard_control_file \
+      "$accepted_control/supervisor-accepted" \
+      "supervisor-accepted:$relay_pid:$relay_start_time"
+    set -m
+    env --ignore-signal=HUP,INT,TERM \
+      flock --exclusive --nonblock --close "$accepted_lock" \
+        env --default-signal=HUP,INT,TERM bash -c '
+          trap ":" TERM
+          timeout --signal=TERM --kill-after=1s 30s \
+            bash -c '\''
+              printf "%s %s\n" "$PPID" "$$" >"$1"
+              : >"$2"
+              while [[ ! -e "$3" ]]; do sleep 0.01; done
+            '\'' bash "$1" "$2" "$3"
+          exit 41
+        ' bash "$accepted_pids" "$accepted_ready" "$accepted_release" &
+    holder_pid=$!
+    set +m
+    printf '%s\n' "$holder_pid" >"$accepted_holder_file"
+    holder_start_time="$(project_guard_process_start_time "$holder_pid")"
+    PROJECT_GUARD_STATUS_RELAY_PID="$relay_pid"
+    PROJECT_GUARD_STATUS_RELAY_START_TIME="$relay_start_time"
+    PROJECT_GUARD_STATUS_HOLDER_PID="$holder_pid"
+    PROJECT_GUARD_STATUS_HOLDER_START_TIME="$holder_start_time"
+    publish_project_guard_holder_status 41
+    PROJECT_GUARD_PENDING_SIGNAL=TERM
+    PROJECT_GUARD_FORWARDING_READY=false
+    sleep() {
+      if [[ "${1:-}" == 0.01 ]]; then
+        command sleep 0.001
+      else
+        command sleep "$@"
+      fi
+    }
+    if wait_for_project_guard_holder \
+      "$holder_pid" "$accepted_lock" \
+      "$relay_pid" "$relay_start_time" "$holder_start_time" true; then
+      holder_status=0
+    else
+      holder_status=$?
+    fi
+    printf '%s\n' "$holder_status" >"$accepted_status"
+    remove_project_guard_control_directory "$accepted_control"
+  ) &
+  accepted_probe=$!
+  for ((attempt = 0; attempt < 500; attempt++)); do
+    [[ -e "$accepted_ready" && -s "$accepted_holder_file" && \
+      -s "$accepted_pids" ]] && break
+    sleep 0.01
+  done
+  if [[ ! -e "$accepted_ready" || ! -s "$accepted_holder_file" || \
+    ! -s "$accepted_pids" ]]; then
+    : >"$accepted_release"
+    kill -KILL "$accepted_probe" 2>/dev/null || true
+    wait "$accepted_probe" 2>/dev/null || true
+    printf 'accepted project guard fixture did not become ready\n' >&2
+    return 1
+  fi
+  accepted_holder="$(<"$accepted_holder_file")"
+  read -r accepted_timeout accepted_leaf accepted_extra <"$accepted_pids"
+  [[ "$accepted_holder" =~ ^[1-9][0-9]*$ && \
+    "$accepted_timeout" =~ ^[1-9][0-9]*$ && \
+    "$accepted_leaf" =~ ^[1-9][0-9]*$ && -z "$accepted_extra" ]] || return 1
+  accepted_timeout_start="$(project_guard_process_start_time \
+    "$accepted_timeout")" || return 1
+  accepted_leaf_start="$(project_guard_process_start_time \
+    "$accepted_leaf")" || return 1
+  accepted_timeout_stat="$(<"/proc/$accepted_timeout/stat")" || return 1
+  accepted_timeout_fields="${accepted_timeout_stat##*) }"
+  read -r -a accepted_timeout_fields <<<"$accepted_timeout_fields"
+  accepted_timeout_pgid="${accepted_timeout_fields[2]:-}"
+  [[ "$accepted_timeout_pgid" == "$accepted_timeout" && \
+    "$accepted_timeout_pgid" != "$accepted_holder" ]] || {
+    : >"$accepted_release"
+    wait "$accepted_probe" 2>/dev/null || true
+    printf 'accepted fixture did not create a nested timeout process group\n' >&2
+    return 1
+  }
+  # The helper's old 300-iteration cancellation budget is compressed to well
+  # below this delay. It must still be alive with the lock held afterward.
+  sleep 1
+  if ! kill -0 "$accepted_probe" 2>/dev/null || \
+    flock --exclusive --nonblock "$accepted_lock" true || \
+    ! project_guard_supervisor_identity_matches \
+      "$accepted_timeout" "$accepted_timeout_start" || \
+    ! project_guard_supervisor_identity_matches \
+      "$accepted_leaf" "$accepted_leaf_start"; then
+    : >"$accepted_release"
+    wait "$accepted_probe" 2>/dev/null || true
+    printf 'accepted project guard released before its worker lifetime ended\n' >&2
+    return 1
+  fi
+  : >"$accepted_release"
+  wait "$accepted_probe" || return $?
+  [[ "$(<"$accepted_status")" == 41 ]] || {
+    printf 'accepted project guard lost its authenticated terminal status\n' >&2
+    return 1
+  }
+  for ((attempt = 0; attempt < 500; attempt++)); do
+    if ! project_guard_supervisor_identity_matches \
+        "$accepted_timeout" "$accepted_timeout_start" && \
+      ! project_guard_supervisor_identity_matches \
+        "$accepted_leaf" "$accepted_leaf_start"; then
+      break
+    fi
+    sleep 0.01
+  done
+  if project_guard_supervisor_identity_matches \
+      "$accepted_timeout" "$accepted_timeout_start" || \
+    project_guard_supervisor_identity_matches \
+      "$accepted_leaf" "$accepted_leaf_start" || \
+    ! flock --exclusive --nonblock "$accepted_lock" true; then
+    printf 'accepted project guard retained a descendant or project lock\n' >&2
+    return 1
+  fi
+  rm -f -- "$accepted_lock" "$accepted_ready" "$accepted_release" \
+    "$accepted_pids" "$accepted_holder_file" "$accepted_status"
+
+  # Launch acceptance makes the worker's authenticated holder-status record
+  # mandatory. Before acceptance, the exact child-table status remains the
+  # authority for an early exit such as flock conflict.
+  (umask 077; : >"$accepted_missing_lock")
+  for accepted_missing_mode in true false; do
+    accepted_missing_control="$(mktemp -d \
+      "/tmp/obi-apache-java-https-project-guard-$EUID/.terminal-handoff.XXXXXX")" || \
+      return 1
+    accepted_missing_release="$TEST_TMP_DIR/project-guard-accepted-missing-$accepted_missing_mode.release"
+    rm -f -- "$accepted_missing_release"
+    (
+      PROJECT_GUARD_CONTROL_DIR="$accepted_missing_control"
+      PROJECT_GUARD_PENDING_SIGNAL=""
+      PROJECT_GUARD_FORWARDING_READY=false
+      relay_pid="$BASHPID"
+      relay_start_time="$(project_guard_process_start_time "$relay_pid")"
+      flock --exclusive --nonblock --close "$accepted_missing_lock" \
+        bash -c '
+          while [[ ! -e "$1" ]]; do sleep 0.01; done
+          exit 41
+        ' bash "$accepted_missing_release" &
+      accepted_missing_holder=$!
+      accepted_missing_start="$(project_guard_process_start_time \
+        "$accepted_missing_holder")"
+      : >"$accepted_missing_release"
+      if wait_for_project_guard_holder \
+        "$accepted_missing_holder" "$accepted_missing_lock" \
+        "$relay_pid" "$relay_start_time" "$accepted_missing_start" \
+        "$accepted_missing_mode"; then
+        accepted_missing_status=0
+      else
+        accepted_missing_status=$?
+      fi
+      remove_project_guard_control_directory "$accepted_missing_control"
+      printf '%s\n' "$accepted_missing_status"
+    ) >"$accepted_status" || return $?
+    if [[ "$accepted_missing_mode" == true ]]; then
+      [[ "$(<"$accepted_status")" == 1 ]] || {
+        printf 'accepted worker exited without mandatory holder status: %s\n' \
+          "$(<"$accepted_status")" >&2
+        return 1
+      }
+    else
+      [[ "$(<"$accepted_status")" == 41 ]] || {
+        printf 'pre-acceptance exit lost its exact child status: %s\n' \
+          "$(<"$accepted_status")" >&2
+        return 1
+      }
+    fi
+    flock --exclusive --nonblock "$accepted_missing_lock" true || {
+      printf 'missing-status fixture retained the project lock\n' >&2
+      return 1
+    }
+    rm -f -- "$accepted_missing_release" "$accepted_status"
+  done
+  rm -f -- "$accepted_missing_lock"
+
+  real_bash="$(type -P bash)" || return 1
+  [[ "$real_bash" == /* ]] || return 1
+  {
+    printf '#!%s\n' "$real_bash"
+    cat <<'EOF'
+set -Eeuo pipefail
+if [[ "${1:-}" == "$PROJECT_GUARD_PRETRAP_RUNNER" ]]; then
+  : >"$PROJECT_GUARD_PRETRAP_READY"
+  while :; do sleep 0.01; done
+fi
+exec "$PROJECT_GUARD_REAL_BASH" "$@"
+EOF
+  } >"$fake_bin/bash"
+  chmod 0700 -- "$fake_bin/bash"
+  : >"$docker_log"
+  setsid env --default-signal=HUP,INT,TERM \
+    COMPOSE_PROJECT_NAME="$pretrap_project" \
+    PROJECT_GUARD_TEST_DOCKER_LOG="$docker_log" \
+    PROJECT_GUARD_PRETRAP_RUNNER="$pretrap_runner" \
+    PROJECT_GUARD_PRETRAP_READY="$pretrap_ready" \
+    PROJECT_GUARD_REAL_BASH="$real_bash" \
+    PATH="$fake_bin:$PATH" \
+    "$real_bash" "$pretrap_runner" --cleanup-only &
+  runner_pid=$!
+  for ((attempt = 0; attempt < 500; attempt++)); do
+    [[ -e "$pretrap_ready" ]] && break
+    sleep 0.01
+  done
+  if [[ ! -e "$pretrap_ready" ]]; then
+    kill -KILL -- "-$runner_pid" 2>/dev/null || true
+    wait "$runner_pid" 2>/dev/null || true
+    printf 'real guarded worker did not expose its pre-trap launch boundary\n' >&2
+    return 1
+  fi
+  kill -TERM -- "-$runner_pid" || return $?
+  if wait "$runner_pid"; then
+    runner_status=0
+  else
+    runner_status=$?
+  fi
+  [[ "$runner_status" == 130 ]] || {
+    printf 'pre-trap process-group TERM was not canonical: %s\n' \
+      "$runner_status" >&2
+    return 1
+  }
+  flock --exclusive --nonblock "$pretrap_lock" true || {
+    printf 'pre-trap process-group TERM retained the project lock\n' >&2
+    return 1
+  }
+  [[ "$(<"$docker_log")" == 'compose version' ]] || {
+    printf 'pre-trap process-group TERM reached a Compose mutation\n' >&2
+    return 1
+  }
+  rm -f -- "$pretrap_lock" "$pretrap_ready" "$fake_bin/bash"
+
+  {
+    printf '#!%s\n' "$real_bash"
+    cat <<'EOF'
+set -Eeuo pipefail
+if [[ "${1:-}" == "$PROJECT_GUARD_PRETRAP_RUNNER" ]]; then
+  : >"$PROJECT_GUARD_PRETRAP_READY"
+  while :; do sleep 0.01; done
+fi
+exec "$PROJECT_GUARD_REAL_BASH" "$@"
+EOF
+  } >"$fake_bin/bash"
+  chmod 0700 -- "$fake_bin/bash"
+  : >"$docker_log"
+  COMPOSE_PROJECT_NAME="$pretrap_project" \
+    PROJECT_GUARD_TEST_DOCKER_LOG="$docker_log" \
+    PROJECT_GUARD_PRETRAP_RUNNER="$pretrap_runner" \
+    PROJECT_GUARD_PRETRAP_READY="$pretrap_direct_ready" \
+    PROJECT_GUARD_REAL_BASH="$real_bash" \
+    PATH="$fake_bin:$PATH" \
+    "$real_bash" "$pretrap_runner" --cleanup-only &
+  runner_pid=$!
+  for ((attempt = 0; attempt < 500; attempt++)); do
+    [[ -e "$pretrap_direct_ready" ]] && break
+    sleep 0.01
+  done
+  if [[ ! -e "$pretrap_direct_ready" ]]; then
+    kill -KILL "$runner_pid" 2>/dev/null || true
+    wait "$runner_pid" 2>/dev/null || true
+    printf 'direct guarded worker did not expose its pre-trap boundary\n' >&2
+    return 1
+  fi
+  kill -TERM "$runner_pid" || return $?
+  if wait "$runner_pid"; then
+    runner_status=0
+  else
+    runner_status=$?
+  fi
+  [[ "$runner_status" == 130 ]] || {
+    printf 'direct pre-trap TERM was not canonical: %s\n' \
+      "$runner_status" >&2
+    return 1
+  }
+  flock --exclusive --nonblock "$pretrap_lock" true || {
+    printf 'direct pre-trap TERM retained the project lock\n' >&2
+    return 1
+  }
+  [[ "$(<"$docker_log")" == 'compose version' ]] || {
+    printf 'direct pre-trap TERM reached a Compose mutation\n' >&2
+    return 1
+  }
+  rm -f -- "$pretrap_lock" "$pretrap_direct_ready" "$fake_bin/bash"
+
+  malformed_launch_control="$(mktemp -d \
+    "/tmp/obi-apache-java-https-project-guard-$EUID/.terminal-handoff.XXXXXX")" || \
+    return 1
+  (umask 077; : >"$malformed_launch_lock")
+  printf 'corrupt\n' >"$malformed_launch_control/supervisor-launched"
+  chmod 0600 -- "$malformed_launch_control/supervisor-launched"
+  (
+    export COMPOSE_PROJECT_NAME="$malformed_launch_project"
+    export PROJECT_GUARD_TEST_DOCKER_LOG="$docker_log"
+    export PATH="$fake_bin:$PATH"
+    PROJECT_GUARD_CONTROL_DIR="$malformed_launch_control"
+    PROJECT_GUARD_PENDING_SIGNAL=""
+    PROJECT_GUARD_FORWARDING_READY=false
+    PROJECT_GUARD_SUPERVISOR_PID=""
+    PROJECT_GUARD_SUPERVISOR_START_TIME=""
+    trap record_project_guard_hup HUP
+    trap record_project_guard_int INT
+    trap record_project_guard_term TERM
+    if run_project_guard_relay "$malformed_launch_lock" --cleanup-only; then
+      relay_status=0
+    else
+      relay_status=$?
+    fi
+    printf '%s\n' "$relay_status" >"$malformed_launch_status"
+  ) &
+  malformed_launch_relay=$!
+  for ((attempt = 0; attempt < 500; attempt++)); do
+    [[ -e "$malformed_launch_control/ready" ]] && break
+    sleep 0.01
+  done
+  if [[ ! -e "$malformed_launch_control/ready" ]]; then
+    malformed_launch_escaped=true
+  else
+    kill -TERM "$malformed_launch_relay" || malformed_launch_escaped=true
+    sleep 0.1
+    if kill -0 "$malformed_launch_relay" 2>/dev/null; then
+      if flock --exclusive --nonblock "$malformed_launch_lock" true || \
+        [[ ! -d "$malformed_launch_control" ]]; then
+        malformed_launch_escaped=true
+      fi
+    fi
+  fi
+  wait "$malformed_launch_relay" || return $?
+  (
+    PROJECT_GUARD_CONTROL_DIR="$malformed_launch_control"
+    remove_project_guard_control_directory "$malformed_launch_control"
+  ) || return $?
+  [[ "$malformed_launch_escaped" == false && \
+    "$(<"$malformed_launch_status")" == 1 && \
+    ! -e "$malformed_launch_control" && \
+    ! -L "$malformed_launch_control" ]] || {
+    printf 'malformed guarded launch escaped before terminal cleanup\n' >&2
+    return 1
+  }
+  flock --exclusive --nonblock "$malformed_launch_lock" true || {
+    printf 'malformed guarded launch retained its project lock\n' >&2
+    return 1
+  }
+  rm -f -- "$malformed_launch_lock" "$malformed_launch_status"
+}
+
+test_permanent_absence_global_marker_is_exact_and_daemon_bound() {
+  local -r guard_root="$TEST_TMP_DIR/permanent-absence-global-marker"
+  local -r project=obi-apache-java-https-marker-test
+  local -r docker_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  local -r docker_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  local -r marker="$guard_root/$project.permanent-absence-recovery-required"
+  local metadata=""
+
+  mkdir -m 0700 -- "$guard_root"
+  (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_NAME="$project"
+    PROJECT_DOCKER_SERVER_ID_SHA256="$docker_a"
+    assert_project_guard_held() { :; }
+    assert_project_docker_identity_unchanged() { :; }
+    create_permanent_absence_global_marker
+  ) || return $?
+  metadata="$(stat --format='%u:%a:%h' -- "$marker")" || return $?
+  [[ "$metadata" == "$EUID:600:1" ]] || {
+    printf 'global recovery marker metadata is not private: %s\n' "$metadata" >&2
+    return 1
+  }
+  (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_NAME="$project"
+    PROJECT_DOCKER_SERVER_ID_SHA256="$docker_a"
+    assert_project_guard_held() { :; }
+    [[ "$(read_permanent_absence_global_marker)" == "$docker_a" ]]
+  ) || {
+    printf 'global recovery marker content is not exact\n' >&2
+    return 1
+  }
+  if (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_NAME="$project"
+    PROJECT_DOCKER_SERVER_ID_SHA256="$docker_b"
+    assert_project_guard_held() { :; }
+    assert_project_docker_identity_unchanged() { :; }
+    clear_pending_permanent_absence_recovery
+  ) >/dev/null 2>&1; then
+    printf 'cleanup cleared recovery state for a different Docker server\n' >&2
+    return 1
+  fi
+  [[ -f "$marker" && ! -L "$marker" ]] || return 1
+  (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_NAME="$project"
+    PROJECT_DOCKER_SERVER_ID_SHA256="$docker_a"
+    assert_project_guard_held() { :; }
+    assert_project_docker_identity_unchanged() { :; }
+    clear_pending_permanent_absence_recovery
+  ) || return $?
+  [[ ! -e "$marker" && ! -L "$marker" ]] || {
+    printf 'verified same-daemon cleanup retained the global marker\n' >&2
+    return 1
+  }
+
+  (umask 077; printf 'corrupt\n' >"$marker")
+  if (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_NAME="$project"
+    PROJECT_DOCKER_SERVER_ID_SHA256="$docker_a"
+    assert_project_guard_held() { :; }
+    assert_project_docker_identity_unchanged() { :; }
+    clear_pending_permanent_absence_recovery
+  ) >/dev/null 2>&1; then
+    printf 'cleanup removed a malformed global recovery marker\n' >&2
+    return 1
+  fi
+  [[ -f "$marker" && "$(<"$marker")" == corrupt ]] || return 1
+}
+
+test_project_guard_docker_identity_capture_is_source_bounded() {
+  local -r guard_root="$TEST_TMP_DIR/project-guard-docker-identity"
+  local expected=""
+  local observed=""
+  local status=0
+
+  mkdir -m 0700 -- "$guard_root"
+  expected="$(printf '%s' 'SERVER_ID_1234' | sha256sum)" || return 1
+  expected="${expected%% *}"
+  observed="$({
+    PROJECT_GUARD_ROOT="$guard_root"
+    run_bounded() { printf '"SERVER_ID_1234"\n'; }
+    resolve_docker_server_identity
+  })" || return $?
+  [[ "$observed" == "$expected" ]] || {
+    printf 'project guard hashed the wrong bounded Docker server identity\n' >&2
+    return 1
+  }
+  if (
+    PROJECT_GUARD_ROOT="$guard_root"
+    run_bounded() {
+      head -c "$((DOCKER_SERVER_ID_MAX_BYTES + 1))" /dev/zero | tr '\0' x
+    }
+    resolve_docker_server_identity
+  ) >/dev/null 2>&1; then
+    printf 'project guard accepted an oversized Docker identity response\n' >&2
+    return 1
+  fi
+  if (
+    PROJECT_GUARD_ROOT="$guard_root"
+    run_bounded() {
+      printf '"SERVER_ID_1234"\n'
+      return 77
+    }
+    resolve_docker_server_identity
+  ) >/dev/null 2>&1; then
+    printf 'project guard ignored a failed Docker identity producer\n' >&2
+    return 1
+  else
+    status=$?
+  fi
+  [[ "$status" == 77 ]] || {
+    printf 'project guard lost Docker identity producer status: %s\n' "$status" >&2
+    return 1
+  }
+  if compgen -G "$guard_root/.docker-server-id.*" >/dev/null; then
+    printf 'project guard retained a Docker identity temporary\n' >&2
+    return 1
+  fi
+}
+
+test_permanent_absence_cleanup_only_clears_after_verified_down() {
+  local -r guard_root="$TEST_TMP_DIR/permanent-absence-cleanup-only"
+  local -r project=obi-apache-java-https-cleanup-test
+  local -r docker_identity=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+  local -r marker="$guard_root/$project.permanent-absence-recovery-required"
+  local -r observed="$guard_root/observed"
+
+  mkdir -m 0700 -- "$guard_root"
+  (
+    PROJECT_NAME="$project"
+    umask 077
+    permanent_absence_global_marker_payload "$docker_identity" >"$marker"
+  )
+  if (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_NAME="$project"
+    PROJECT_DOCKER_SERVER_ID_SHA256="$docker_identity"
+    BRIDGE_RUNNING=true
+    assert_project_guard_held() { :; }
+    assert_project_docker_identity_unchanged() { :; }
+    invalidate_project_transport_evidence() { printf 'invalidate\n' >>"$observed"; }
+    safe_compose_down() { printf 'down-failed\n' >>"$observed"; return 73; }
+    cleanup_only
+  ) >/dev/null 2>&1; then
+    printf 'cleanup-only ignored a failed verified down\n' >&2
+    return 1
+  fi
+  [[ -f "$marker" ]] || {
+    printf 'cleanup-only cleared recovery state after a failed down\n' >&2
+    return 1
+  }
+  (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_NAME="$project"
+    PROJECT_DOCKER_SERVER_ID_SHA256="$docker_identity"
+    BRIDGE_RUNNING=true
+    assert_project_guard_held() { :; }
+    assert_project_docker_identity_unchanged() { :; }
+    invalidate_project_transport_evidence() { printf 'invalidate\n' >>"$observed"; }
+    safe_compose_down() { printf 'down-verified\n' >>"$observed"; }
+    cleanup_only
+  ) || return $?
+  [[ ! -e "$marker" && ! -L "$marker" && \
+    "$(<"$observed")" == *'down-verified'* ]] || {
+    printf 'cleanup-only did not clear state after verified project absence\n' >&2
+    return 1
+  }
+}
+
+test_permanent_absence_global_marker_forces_exit_cleanup() {
+  local -r result_dir="$TEST_TMP_DIR/permanent-absence-global-cleanup-result"
+  local -r guard_root="$TEST_TMP_DIR/permanent-absence-global-cleanup-guard"
+  local -r project=obi-apache-java-https-global-cleanup-test
+  local -r docker_identity=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+  local -r marker="$guard_root/$project.permanent-absence-recovery-required"
+  local -r down_marker="$result_dir/down"
+  local cleanup_status=0
+
+  mkdir -p -- "$result_dir"
+  mkdir -m 0700 -- "$guard_root"
+  (
+    PROJECT_NAME="$project"
+    umask 077
+    permanent_absence_global_marker_payload "$docker_identity" >"$marker"
+  )
+  if (
+    RESULT_DIR="$result_dir"
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_NAME="$project"
+    PROJECT_GUARD_HELD=true
+    PROJECT_DOCKER_SERVER_ID_SHA256="$docker_identity"
+    STACK_STARTED=true
+    KEEP_RUNNING=true
+    BRIDGE_RUNNING=true
+    RUN_STATUS=passed
+    ACCEPTANCE_EVIDENCE=true
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    assert_project_guard_held() { :; }
+    assert_project_docker_identity_unchanged() { :; }
+    cleanup_security_processes() { :; }
+    cleanup_source_snapshot_work_directory() { :; }
+    capture_evidence() { :; }
+    invalidate_project_transport_evidence() { :; }
+    safe_compose_down() { : >"$down_marker"; }
+
+    cleanup
+  ) >/dev/null 2>&1; then
+    printf 'global recovery marker preserved a kept Compose stack\n' >&2
+    return 1
+  else
+    cleanup_status=$?
+  fi
+  [[ "$cleanup_status" == 1 && -e "$down_marker" && \
+    ! -e "$marker" && ! -L "$marker" ]] || {
+    printf 'global-only recovery state did not force verified exit cleanup\n' >&2
+    return 1
+  }
+}
+
+test_cleanup_signal_status_matches_retained_evidence() {
+  local -r root="$TEST_TMP_DIR/cleanup-signal-status"
+  local -r entry_result="$root/entry-result"
+  local -r entry_progress="$root/entry-progress"
+  local -r failed_entry_result="$root/failed-entry-result"
+  local -r failed_entry_progress="$root/failed-entry-progress"
+  local -r runtime_signal_result="$root/runtime-signal-result"
+  local -r runtime_signal_ready="$root/runtime-signal-ready"
+  local -r runtime_signal_progress="$root/runtime-signal-progress"
+  local -r capture_result="$root/capture-result"
+  local -r capture_ready="$root/capture-ready"
+  local -r capture_release="$root/capture-release"
+  local -r group_cleanup_result="$root/group-cleanup-result"
+  local -r group_cleanup_ready="$root/group-cleanup-ready"
+  local -r holder_publication_result="$root/holder-publication-result"
+  local -r holder_publication_calls="$root/holder-publication-calls"
+  local -r publication_result="$root/publication-result"
+  local -r publication_ready="$root/publication-ready"
+  local -r publication_release="$root/publication-release"
+  local -r post_publication_result="$root/post-publication-result"
+  local -r post_publication_ready="$root/post-publication-ready"
+  local -r post_publication_release="$root/post-publication-release"
+  local worker_pid=""
+  local worker_status=0
+  local -i attempt=0
+
+  mkdir -p -- \
+    "$entry_result" \
+    "$failed_entry_result" \
+    "$runtime_signal_result" \
+    "$capture_result" \
+    "$group_cleanup_result" \
+    "$holder_publication_result" \
+    "$publication_result" \
+    "$post_publication_result"
+  if (
+    RESULT_DIR="$entry_result"
+    STACK_STARTED=false
+    PROJECT_GUARD_HELD=false
+    RUN_STATUS=passed
+    RUN_STAGE=complete
+    ACCEPTANCE_EVIDENCE=true
+    ACCEPTANCE_EVIDENCE_REASON=""
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    CLEANUP_ENTRY_STATUS=""
+    CLEANUP_SIGNAL_STATUS=0
+    cleanup_entry_signal_sent=false
+    signal_at_cleanup_trap_boundary() {
+      if [[ "$cleanup_entry_signal_sent" == false ]]; then
+        cleanup_entry_signal_sent=true
+        trap - DEBUG
+        kill -TERM "$BASHPID"
+      fi
+    }
+    cleanup_security_processes() { :; }
+    capture_evidence() { : >"$entry_progress"; }
+    cleanup_source_snapshot_work_directory() { :; }
+    release_project_guard() { :; }
+    install_traps
+    CLEANUP_ENTRY_ACTIVE=true
+    set -T
+    trap signal_at_cleanup_trap_boundary DEBUG
+    exit 0
+  ) >/dev/null 2>&1; then
+    printf 'cleanup entry signal preserved a successful exit\n' >&2
+    return 1
+  else
+    worker_status=$?
+  fi
+  [[ "$worker_status" == 130 && -e "$entry_progress" ]] || {
+    printf 'cleanup entry signal bypassed recovery: status=%s progress=%s\n' \
+      "$worker_status" "$([[ -e "$entry_progress" ]] && printf yes || printf no)" >&2
+    return 1
+  }
+  jq -e '
+    .status == "failed" and .exit_status == 130 and
+    .failure_stage == "signal"
+  ' "$entry_result/run-status.json" >/dev/null || {
+    printf 'cleanup entry signal did not retain failed status\n' >&2
+    return 1
+  }
+
+  if (
+    RESULT_DIR="$failed_entry_result"
+    STACK_STARTED=false
+    PROJECT_GUARD_HELD=false
+    RUN_STATUS=passed
+    RUN_STAGE=complete
+    ACCEPTANCE_EVIDENCE=true
+    ACCEPTANCE_EVIDENCE_REASON=""
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    CLEANUP_ENTRY_ACTIVE=true
+    CLEANUP_ENTRY_STATUS=""
+    CLEANUP_SIGNAL_STATUS=0
+    cleanup_entry_debug_count=0
+    signal_during_failed_cleanup_entry() {
+      ((cleanup_entry_debug_count += 1))
+      if ((cleanup_entry_debug_count == 2)); then
+        trap - DEBUG
+        kill -TERM "$BASHPID"
+      fi
+    }
+    cleanup_security_processes() { :; }
+    capture_evidence() { : >"$failed_entry_progress"; }
+    cleanup_source_snapshot_work_directory() { :; }
+    release_project_guard() { :; }
+    install_traps
+    CLEANUP_ENTRY_ACTIVE=true
+    set -T
+    trap signal_during_failed_cleanup_entry DEBUG
+    exit 42
+  ) >/dev/null 2>&1; then
+    printf 'failed cleanup entry unexpectedly returned success\n' >&2
+    return 1
+  else
+    worker_status=$?
+  fi
+  [[ "$worker_status" == 42 && -e "$failed_entry_progress" ]] || {
+    printf 'cleanup entry signal replaced the prior failure: status=%s progress=%s\n' \
+      "$worker_status" \
+      "$([[ -e "$failed_entry_progress" ]] && printf yes || printf no)" >&2
+    return 1
+  }
+  jq -e '
+    .status == "failed" and .exit_status == 42
+  ' "$failed_entry_result/run-status.json" >/dev/null || {
+    printf 'cleanup entry signal did not preserve the prior failed status\n' >&2
+    return 1
+  }
+
+  (
+    RESULT_DIR="$runtime_signal_result"
+    STACK_STARTED=false
+    PROJECT_GUARD_HELD=false
+    RUN_STATUS=passed
+    RUN_STAGE=complete
+    ACCEPTANCE_EVIDENCE=true
+    ACCEPTANCE_EVIDENCE_REASON=""
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    CLEANUP_ENTRY_ACTIVE=""
+    CLEANUP_ENTRY_STATUS=""
+    CLEANUP_SIGNAL_STATUS=0
+    cleanup_security_processes() { :; }
+    capture_evidence() { : >"$runtime_signal_progress"; }
+    cleanup_source_snapshot_work_directory() { :; }
+    release_project_guard() { :; }
+    install_traps
+    : >"$runtime_signal_ready"
+    while :; do sleep 0.1; done
+  ) >/dev/null 2>&1 &
+  worker_pid=$!
+  for ((attempt = 0; attempt < 500; attempt++)); do
+    [[ -e "$runtime_signal_ready" ]] && break
+    sleep 0.01
+  done
+  [[ -e "$runtime_signal_ready" ]] || return 1
+  kill -TERM "$worker_pid" || return $?
+  if wait "$worker_pid"; then
+    worker_status=0
+  else
+    worker_status=$?
+  fi
+  [[ "$worker_status" == 130 && -e "$runtime_signal_progress" ]] || {
+    printf 'initial runtime TERM bypassed cleanup: status=%s progress=%s\n' \
+      "$worker_status" \
+      "$([[ -e "$runtime_signal_progress" ]] && printf yes || printf no)" >&2
+    return 1
+  }
+  jq -e '
+    .status == "failed" and .exit_status == 130 and
+    .failure_stage == "signal"
+  ' "$runtime_signal_result/run-status.json" >/dev/null || {
+    printf 'initial runtime TERM did not retain failed status\n' >&2
+    return 1
+  }
+
+  (
+    RESULT_DIR="$capture_result"
+    STACK_STARTED=false
+    PROJECT_GUARD_HELD=false
+    RUN_STATUS=passed
+    RUN_STAGE=complete
+    ACCEPTANCE_EVIDENCE=true
+    ACCEPTANCE_EVIDENCE_REASON=""
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    CLEANUP_SIGNAL_STATUS=0
+    trap record_cleanup_hup HUP
+    trap record_cleanup_int INT
+    trap record_cleanup_term TERM
+    cleanup_security_processes() { :; }
+    capture_evidence() {
+      : >"$capture_ready"
+      while [[ ! -e "$capture_release" ]]; do sleep 0.01; done
+    }
+    cleanup_source_snapshot_work_directory() { :; }
+    release_project_guard() { :; }
+    cleanup
+  ) >/dev/null 2>&1 &
+  worker_pid=$!
+  for ((attempt = 0; attempt < 500; attempt++)); do
+    [[ -e "$capture_ready" ]] && break
+    sleep 0.01
+  done
+  [[ -e "$capture_ready" ]] || return 1
+  kill -TERM "$worker_pid" || return $?
+  kill -TERM "$worker_pid" || return $?
+  : >"$capture_release"
+  if wait "$worker_pid"; then
+    worker_status=0
+  else
+    worker_status=$?
+  fi
+  [[ "$worker_status" == 130 ]] || {
+    printf 'cleanup lost its repeated TERM status: %s\n' "$worker_status" >&2
+    return 1
+  }
+  jq -e '
+    .status == "failed" and .exit_status == 130 and
+    .failure_stage == "signal"
+  ' "$capture_result/run-status.json" >/dev/null || {
+    printf 'cleanup retained a passing status after repeated TERM\n' >&2
+    return 1
+  }
+
+  setsid env --default-signal=HUP,INT,TERM bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    RESULT_DIR=$2
+    group_cleanup_ready=$3
+    STACK_STARTED=true
+    PROJECT_GUARD_HELD=false
+    KEEP_RUNNING=false
+    RUN_STATUS=passed
+    RUN_STAGE=complete
+    ACCEPTANCE_EVIDENCE=true
+    ACCEPTANCE_EVIDENCE_REASON=""
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    CLEANUP_SIGNAL_STATUS=0
+    trap record_cleanup_hup HUP
+    trap record_cleanup_int INT
+    trap record_cleanup_term TERM
+    cleanup_security_processes() { :; }
+    capture_evidence() { :; }
+    cleanup_source_snapshot_work_directory() { :; }
+    release_project_guard() { :; }
+    assert_permanent_absence_marker_matches_current_docker() { :; }
+    invalidate_project_transport_evidence() { :; }
+    clear_pending_permanent_absence_recovery() { :; }
+    safe_compose_down() {
+      : >"$group_cleanup_ready"
+      sleep 30
+    }
+    cleanup
+  ' bash "$TEST_SCRIPT_DIR/../run.sh" \
+    "$group_cleanup_result" "$group_cleanup_ready" \
+    >/dev/null 2>&1 &
+  worker_pid=$!
+  for ((attempt = 0; attempt < 500; attempt++)); do
+    [[ -e "$group_cleanup_ready" ]] && break
+    sleep 0.01
+  done
+  [[ -e "$group_cleanup_ready" ]] || return 1
+  kill -TERM -- "-$worker_pid" || return $?
+  if wait "$worker_pid"; then
+    worker_status=0
+  else
+    worker_status=$?
+  fi
+  [[ "$worker_status" == 130 ]] || {
+    printf 'process-group TERM was not canonical during cleanup: %s\n' \
+      "$worker_status" >&2
+    return 1
+  }
+  jq -e '
+    .status == "failed" and .exit_status == 130 and
+    .failure_stage == "signal"
+  ' "$group_cleanup_result/run-status.json" >/dev/null || {
+    printf 'process-group TERM cleanup evidence was not canonical\n' >&2
+    return 1
+  }
+
+  if (
+    RESULT_DIR="$holder_publication_result"
+    STACK_STARTED=false
+    PROJECT_GUARD_HELD=false
+    RUN_STATUS=passed
+    RUN_STAGE=complete
+    ACCEPTANCE_EVIDENCE=true
+    ACCEPTANCE_EVIDENCE_REASON=""
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    PROJECT_GUARD_STATUS_RELAY_PID=1
+    cleanup_security_processes() { :; }
+    capture_evidence() { :; }
+    cleanup_source_snapshot_work_directory() { :; }
+    release_project_guard() { :; }
+    publish_project_guard_holder_status_with_retries() {
+      printf '%s\n' "$1" >>"$holder_publication_calls"
+      [[ "$1" == 1 ]]
+    }
+    cleanup 0
+  ) >/dev/null 2>&1; then
+    printf 'cleanup preserved success after terminal-status publication failed\n' >&2
+    return 1
+  else
+    worker_status=$?
+  fi
+  [[ "$worker_status" == 1 && \
+    "$(<"$holder_publication_calls")" == $'0\n1' ]] || {
+    printf 'cleanup did not retry a canonical failed holder status\n' >&2
+    return 1
+  }
+  jq -e '
+    .status == "failed" and .exit_status == 1 and
+    .failure_stage == "project-guard-status"
+  ' "$holder_publication_result/run-status.json" >/dev/null || {
+    printf 'holder-status publication failure diverged from run evidence\n' >&2
+    return 1
+  }
+
+  (
+    RESULT_DIR="$publication_result"
+    STACK_STARTED=false
+    PROJECT_GUARD_HELD=false
+    RUN_STATUS=passed
+    RUN_STAGE=complete
+    ACCEPTANCE_EVIDENCE=true
+    ACCEPTANCE_EVIDENCE_REASON=""
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    local_write_count=0
+    eval "$(declare -f write_run_status | \
+      sed '1s/^write_run_status /write_run_status_original /')"
+    write_run_status() {
+      ((local_write_count += 1))
+      write_run_status_original "$@" || return $?
+      if ((local_write_count == 1)); then
+        : >"$publication_ready"
+        while [[ ! -e "$publication_release" ]]; do sleep 0.01; done
+      fi
+    }
+    cleanup_security_processes() { :; }
+    capture_evidence() { :; }
+    cleanup_source_snapshot_work_directory() { :; }
+    release_project_guard() { :; }
+    cleanup
+  ) >/dev/null 2>&1 &
+  worker_pid=$!
+  for ((attempt = 0; attempt < 500; attempt++)); do
+    [[ -e "$publication_ready" ]] && break
+    sleep 0.01
+  done
+  [[ -e "$publication_ready" ]] || return 1
+  kill -TERM "$worker_pid" || return $?
+  : >"$publication_release"
+  if wait "$worker_pid"; then
+    worker_status=0
+  else
+    worker_status=$?
+  fi
+  [[ "$worker_status" == 0 ]] || {
+    printf 'cleanup changed status after its terminal commit: %s\n' \
+      "$worker_status" >&2
+    return 1
+  }
+  jq -e '
+    .status == "passed" and .exit_status == 0 and
+    .failure_stage == "none"
+  ' "$publication_result/run-status.json" >/dev/null || {
+    printf 'cleanup status diverged after its terminal commit\n' >&2
+    return 1
+  }
+
+  (
+    RESULT_DIR="$post_publication_result"
+    STACK_STARTED=false
+    PROJECT_GUARD_HELD=false
+    RUN_STATUS=passed
+    RUN_STAGE=complete
+    ACCEPTANCE_EVIDENCE=true
+    ACCEPTANCE_EVIDENCE_REASON=""
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    log_info() {
+      if [[ "$*" == retained\ run\ evidence:* ]]; then
+        : >"$post_publication_ready"
+        while [[ ! -e "$post_publication_release" ]]; do sleep 0.01; done
+      fi
+    }
+    cleanup_security_processes() { :; }
+    capture_evidence() { :; }
+    cleanup_source_snapshot_work_directory() { :; }
+    release_project_guard() { :; }
+    cleanup
+  ) >/dev/null 2>&1 &
+  worker_pid=$!
+  for ((attempt = 0; attempt < 500; attempt++)); do
+    [[ -e "$post_publication_ready" ]] && break
+    sleep 0.01
+  done
+  [[ -e "$post_publication_ready" ]] || return 1
+  kill -TERM "$worker_pid" || return $?
+  : >"$post_publication_release"
+  if wait "$worker_pid"; then
+    worker_status=0
+  else
+    worker_status=$?
+  fi
+  [[ "$worker_status" == 0 ]] || {
+    printf 'cleanup changed status after published terminal commit: %s\n' \
+      "$worker_status" >&2
+    return 1
+  }
+  jq -e '
+    .status == "passed" and .exit_status == 0 and
+    .failure_stage == "none"
+  ' "$post_publication_result/run-status.json" >/dev/null || {
+    printf 'cleanup status diverged after terminal publication\n' >&2
+    return 1
+  }
+}
+
+test_permanent_absence_log_capture_is_source_bounded() {
+  local -r result_dir="$TEST_TMP_DIR/permanent-absence-log-capture"
+  local -r oversized="$result_dir/oversized.log"
+  local -r small="$result_dir/small.log"
+  local -r failed="$result_dir/failed.log"
+  local size=""
+  local status=0
+
+  mkdir -p -- "$result_dir"
+  if (
+    COMPOSE=(test-compose)
+    run_bounded() {
+      head -c "$((PERMANENT_ABSENCE_LOG_MAX_BYTES + 4096))" /dev/zero |
+        tr '\0' x
+    }
+    capture_bounded_permanent_absence_logs \
+      java-backend test-cursor "$oversized"
+  ) >/dev/null 2>&1; then
+    printf 'permanent-absence accepted an oversized live log stream\n' >&2
+    return 1
+  fi
+  size="$(stat -c '%s' -- "$oversized")" || return $?
+  [[ "$size" == "$PERMANENT_ABSENCE_LOG_MAX_BYTES" && \
+    -f "$oversized" && ! -L "$oversized" ]] || {
+    printf 'permanent-absence retained an unbounded failure log: %s\n' "$size" >&2
+    return 1
+  }
+
+  (
+    COMPOSE=(test-compose)
+    run_bounded() { printf 'OBI remote-parent propagator enabled\n'; }
+    capture_bounded_permanent_absence_logs \
+      java-backend test-cursor "$small"
+  ) || {
+    printf 'permanent-absence rejected a bounded live log stream\n' >&2
+    return 1
+  }
+  [[ "$(<"$small")" == 'OBI remote-parent propagator enabled' ]] || return 1
+
+  if (
+    COMPOSE=(test-compose)
+    run_bounded() {
+      printf 'partial log\n'
+      return 77
+    }
+    capture_bounded_permanent_absence_logs \
+      java-backend test-cursor "$failed"
+  ) >/dev/null 2>&1; then
+    printf 'permanent-absence ignored a failed log producer\n' >&2
+    return 1
+  else
+    status=$?
+  fi
+  [[ "$status" == 77 && "$(<"$failed")" == 'partial log' ]] || {
+    printf 'permanent-absence lost a bounded producer failure: %s\n' "$status" >&2
+    return 1
+  }
+}
+
+test_cleanup_compose_log_capture_is_source_bounded() {
+  local -r result_dir="$TEST_TMP_DIR/cleanup-compose-log-capture"
+  local -r exact="$result_dir/exact.log"
+  local -r oversized="$result_dir/oversized.log"
+  local -r too_many_lines="$result_dir/too-many-lines.log"
+  local -r failed="$result_dir/failed.log"
+  local -r capture_marker="$result_dir/capture-marker"
+  local size=""
+  local status=0
+
+  mkdir -p -- "$result_dir"
+  (
+    COMPOSE=(test-compose)
+    run_bounded() {
+      head -c "$COMPOSE_LOG_MAX_BYTES" /dev/zero | tr '\0' x
+    }
+    capture_bounded_compose_logs "$exact"
+  ) || {
+    printf 'cleanup rejected Compose logs at the exact byte bound\n' >&2
+    return 1
+  }
+  size="$(stat -c '%s' -- "$exact")" || return $?
+  [[ "$size" == "$COMPOSE_LOG_MAX_BYTES" ]] || return 1
+
+  if (
+    COMPOSE=(test-compose)
+    run_bounded() {
+      head -c "$((COMPOSE_LOG_MAX_BYTES + 1))" /dev/zero | tr '\0' x
+    }
+    capture_bounded_compose_logs "$oversized"
+  ) >/dev/null 2>&1; then
+    printf 'cleanup accepted a max-plus-one Compose log stream\n' >&2
+    return 1
+  fi
+  size="$(stat -c '%s' -- "$oversized")" || return $?
+  [[ "$size" == "$COMPOSE_LOG_MAX_BYTES" ]] || {
+    printf 'cleanup retained %s oversized Compose log bytes\n' "$size" >&2
+    return 1
+  }
+
+  if (
+    COMPOSE=(test-compose)
+    run_bounded() {
+      awk -v count="$((COMPOSE_LOG_MAX_LINES + 1))" \
+        'BEGIN { for (i = 0; i < count; i++) print "x" }'
+    }
+    capture_bounded_compose_logs "$too_many_lines"
+  ) >/dev/null 2>&1; then
+    printf 'cleanup accepted too many Compose log lines\n' >&2
+    return 1
+  fi
+  bounded_evidence_file \
+    "$too_many_lines" "$COMPOSE_LOG_MAX_BYTES" \
+    "$COMPOSE_LOG_MAX_LINES" || {
+    printf 'cleanup retained more than the bounded Compose log prefix\n' >&2
+    return 1
+  }
+  [[ "$(wc -l <"$too_many_lines")" == "$COMPOSE_LOG_MAX_LINES" ]] || return 1
+
+  if (
+    COMPOSE=(test-compose)
+    run_bounded() {
+      printf 'partial Compose log\n'
+      return 77
+    }
+    capture_bounded_compose_logs "$failed"
+  ) >/dev/null 2>&1; then
+    printf 'cleanup ignored a failed Compose log producer\n' >&2
+    return 1
+  else
+    status=$?
+  fi
+  [[ "$status" == 77 && "$(<"$failed")" == 'partial Compose log' ]] || {
+    printf 'cleanup lost a bounded Compose producer failure: %s\n' "$status" >&2
+    return 1
+  }
+
+  (
+    RESULT_DIR="$result_dir"
+    STACK_STARTED=false
+    COMPOSE=(test-compose)
+    run_bounded() { :; }
+    capture_bounded_compose_logs() { : >"$capture_marker"; return 71; }
+    curl() { :; }
+    capture_evidence
+  ) || return $?
+  [[ -e "$capture_marker" ]] || {
+    printf 'generic cleanup bypassed the bounded Compose log collector\n' >&2
+    return 1
+  }
+  if compgen -G "$result_dir/*.capture.*" >/dev/null; then
+    printf 'cleanup retained a Compose log capture temporary\n' >&2
+    return 1
+  fi
+}
+
+test_permanent_absence_readiness_is_source_bounded() {
+  local -r root="$TEST_TMP_DIR/permanent-absence-readiness"
+  local -r pattern='OBI remote-parent propagator enabled'
+  local result_dir=""
+  local retained_size=""
+  local status=0
+
+  result_dir="$root/success"
+  mkdir -p -- "$result_dir"
+  (
+    RESULT_DIR="$result_dir"
+    COMPOSE=(test-compose)
+    run_bounded() {
+      printf '%s' "$pattern"
+      head -c "$((PERMANENT_ABSENCE_LOG_MAX_BYTES - ${#pattern}))" \
+        /dev/zero | tr '\0' x
+    }
+    wait_for_bounded_permanent_absence_log \
+      java-backend "$pattern" test-readiness test-cursor
+  ) || {
+    printf 'permanent-absence rejected a bounded readiness record\n' >&2
+    return 1
+  }
+  [[ ! -e "$result_dir/permanent-absence-readiness.log" ]] || return 1
+
+  result_dir="$root/overflow"
+  mkdir -p -- "$result_dir"
+  if (
+    RESULT_DIR="$result_dir"
+    COMPOSE=(test-compose)
+    run_bounded() {
+      printf '%s\n' "$pattern"
+      head -c "$PERMANENT_ABSENCE_LOG_MAX_BYTES" /dev/zero | tr '\0' x
+    }
+    wait_for_bounded_permanent_absence_log \
+      java-backend "$pattern" test-readiness test-cursor
+  ) >/dev/null 2>&1; then
+    printf 'permanent-absence readiness accepted a max-plus-one stream\n' >&2
+    return 1
+  fi
+  retained_size="$(stat --format='%s' -- \
+    "$result_dir/permanent-absence-readiness.log")" || return $?
+  [[ "$retained_size" == "$PERMANENT_ABSENCE_LOG_MAX_BYTES" ]] || {
+    printf 'permanent-absence readiness retained %s overflow bytes\n' \
+      "$retained_size" >&2
+    return 1
+  }
+
+  result_dir="$root/producer-failure"
+  mkdir -p -- "$result_dir"
+  if (
+    RESULT_DIR="$result_dir"
+    COMPOSE=(test-compose)
+    run_bounded() {
+      printf '%s\n' "$pattern"
+      return 77
+    }
+    wait_for_bounded_permanent_absence_log \
+      java-backend "$pattern" test-readiness test-cursor
+  ) >/dev/null 2>&1; then
+    printf 'permanent-absence readiness accepted a failed producer\n' >&2
+    return 1
+  else
+    status=$?
+  fi
+  [[ "$status" == 77 && \
+    "$(<"$result_dir/permanent-absence-readiness.log")" == "$pattern" ]] || {
+    printf 'permanent-absence readiness lost a bounded producer failure\n' >&2
+    return 1
+  }
+
+  result_dir="$root/line-overflow"
+  mkdir -p -- "$result_dir"
+  if (
+    RESULT_DIR="$result_dir"
+    COMPOSE=(test-compose)
+    run_bounded() {
+      printf '%s\n' "$pattern"
+      awk -v count="$PERMANENT_ABSENCE_LOG_MAX_LINES" \
+        'BEGIN { for (i = 0; i < count; i++) print "x" }'
+    }
+    wait_for_bounded_permanent_absence_log \
+      java-backend "$pattern" test-readiness test-cursor
+  ) >/dev/null 2>&1; then
+    printf 'permanent-absence readiness accepted too many log lines\n' >&2
+    return 1
+  fi
+  bounded_evidence_file \
+    "$result_dir/permanent-absence-readiness.log" \
+    "$PERMANENT_ABSENCE_LOG_MAX_BYTES" \
+    "$PERMANENT_ABSENCE_LOG_MAX_LINES" || return $?
+  [[ "$(wc -l <"$result_dir/permanent-absence-readiness.log")" == \
+    "$PERMANENT_ABSENCE_LOG_MAX_LINES" ]] || return 1
+
+  result_dir="$root/timeout"
+  mkdir -p -- "$result_dir"
+  (
+    RESULT_DIR="$result_dir"
+    COMPOSE=(test-compose)
+    READINESS_TIMEOUT_SECONDS=2
+    SECONDS=0
+    run_bounded() { printf 'not-ready\n'; }
+    sleep() { SECONDS=$((SECONDS + 1)); }
+    if wait_for_bounded_permanent_absence_log \
+      java-backend "$pattern" test-readiness test-cursor; then
+      exit 1
+    fi
+    [[ "$(<"$result_dir/permanent-absence-readiness.log")" == not-ready ]]
+  ) >/dev/null 2>&1 || {
+    printf 'permanent-absence readiness timeout was not bounded and retained\n' >&2
+    return 1
+  }
+
+  result_dir="$root/sleep-failure"
+  mkdir -p -- "$result_dir"
+  if (
+    RESULT_DIR="$result_dir"
+    COMPOSE=(test-compose)
+    READINESS_TIMEOUT_SECONDS=2
+    SECONDS=0
+    run_bounded() { printf 'not-ready\n'; }
+    sleep() { return 42; }
+    wait_for_bounded_permanent_absence_log \
+      java-backend "$pattern" test-readiness test-cursor
+  ) >/dev/null 2>&1; then
+    printf 'permanent-absence readiness ignored a failed poll delay\n' >&2
+    return 1
+  else
+    status=$?
+  fi
+  [[ "$status" == 42 && \
+    ! -e "$result_dir/permanent-absence-readiness.log" ]] || {
+    printf 'permanent-absence readiness lost failed poll delay status: %s\n' \
+      "$status" >&2
+    return 1
+  }
+}
+
+test_permanent_absence_failure_stops_the_jvm_before_recovery() {
+  local -r result_dir="$TEST_TMP_DIR/permanent-absence-recovery"
+  local -r observed="$result_dir/observed"
+  local control_status=0
+  local absent_start_line=""
+  local failure_line=""
+  local stop_line=""
+  local recovery_line=""
+
+  mkdir -p -- "$result_dir"
+  if (
+    RESULT_DIR="$result_dir"
+    COMPOSE=(test-compose)
+    TRANSPORT=getsockopt
+    CONTEXT_PROPAGATION=tcp
+    SCENARIO_VARIANT=original
+    BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=getsockopt
+    : >"$observed"
+    assert_project_docker_identity_unchanged() { :; }
+    create_permanent_absence_global_marker() { :; }
+    clear_pending_permanent_absence_recovery() { :; }
+    run_disabled_control() {
+      printf 'disabled\n' >>"$observed"
+    }
+    capture_control_response() {
+      printf 'response:%s\n' "$1" >>"$observed"
+    }
+    invalidate_selected_transport() {
+      SELECTED_TRANSPORT=""
+      printf 'invalidate\n' >>"$observed"
+    }
+    date() {
+      printf 'absence-cursor\n'
+    }
+    run_bounded() {
+      printf 'bounded:%s\n' "$*" >>"$observed"
+      return 0
+    }
+    wait_for_http() {
+      printf 'http\n' >>"$observed"
+    }
+    wait_for_bounded_permanent_absence_log() {
+      printf 'log\n' >>"$observed"
+    }
+    assert_runtime_contract() {
+      printf 'runtime:%s\n' "$1" >>"$observed"
+      [[ "$1" != permanent-absence ]] || return 47
+    }
+    recreate_instrumented_stack() {
+      printf 'recovery:%s\n' "$2" >>"$observed"
+    }
+    run_scenario() {
+      printf 'scenario:%s\n' "$1" >>"$observed"
+    }
+
+    run_permanent_absence_control
+  ) >/dev/null 2>&1; then
+    printf 'permanent-absence control ignored its runtime validation failure\n' >&2
+    return 1
+  else
+    control_status=$?
+  fi
+  [[ "$control_status" == 47 && \
+    ! -e "$result_dir/permanent-absence-recovery-required" ]] || {
+    printf 'permanent-absence failure did not complete its recovery transaction\n' >&2
+    return 1
+  }
+  absent_start_line="$(awk '/up --detach --force-recreate java-backend apache-proxy/ { print NR; exit }' "$observed")"
+  failure_line="$(awk '/runtime:permanent-absence/ { print NR; exit }' "$observed")"
+  stop_line="$(awk '/stop --timeout 10 apache-proxy java-backend$/ { print NR; exit }' "$observed")"
+  recovery_line="$(awk '/recovery:post-permanent absence recovery/ { print NR; exit }' "$observed")"
+  [[ "$absent_start_line" =~ ^[1-9][0-9]*$ && \
+    "$failure_line" =~ ^[1-9][0-9]*$ && \
+    "$stop_line" =~ ^[1-9][0-9]*$ && \
+    "$recovery_line" =~ ^[1-9][0-9]*$ && \
+    absent_start_line -lt failure_line && failure_line -lt stop_line && \
+    stop_line -lt recovery_line ]] || {
+    printf 'permanent-absence failure started OBI before stopping the absence JVM\n' >&2
+    return 1
+  }
+}
+
+test_permanent_absence_identity_and_log_evidence_is_bounded() {
+  local -r result_dir="$TEST_TMP_DIR/permanent-absence-evidence"
+  local -r identity_before="$result_dir/identity-before.txt"
+  local -r identity_after="$result_dir/identity-after.txt"
+  local -r identity_link="$result_dir/identity-link.txt"
+  local -r logs="$result_dir/java.log"
+  local -i line_count=0
+
+  mkdir -p -- "$result_dir"
+  printf '%s\n' \
+    'container_id=0123456789abcdef' \
+    'host_pid=4242' \
+    'started_at=2026-08-11T00:00:00Z' \
+    >"$identity_before"
+  printf '%s\n' \
+    'container_id=0123456789abcdef' \
+    'host_pid=4242' \
+    'started_at=2026-08-11T00:00:00Z' \
+    >"$identity_after"
+  assert_runtime_identity_unchanged "$identity_before" "$identity_after" || {
+    printf 'permanent-absence rejected one unchanged JVM identity\n' >&2
+    return 1
+  }
+
+  printf '%s\n' \
+    'container_id=0123456789abcdef' \
+    'host_pid=4243' \
+    'started_at=2026-08-11T00:00:00Z' \
+    >"$identity_after"
+  if assert_runtime_identity_unchanged "$identity_before" "$identity_after" \
+    >/dev/null 2>&1; then
+    printf 'permanent-absence accepted a replaced JVM identity\n' >&2
+    return 1
+  fi
+  ln -s -- "$identity_before" "$identity_link"
+  if assert_runtime_identity_unchanged "$identity_link" "$identity_before" \
+    >/dev/null 2>&1; then
+    printf 'permanent-absence accepted symlink identity evidence\n' >&2
+    return 1
+  fi
+
+  printf 'OBI remote-parent propagator enabled\n' >"$logs"
+  for ((line_count = 1;
+    line_count < PERMANENT_ABSENCE_REMOTE_PARENT_LOG_MAX;
+    line_count++)); do
+    printf 'OBI remote-parent bridge unavailable retry=%d\n' "$line_count" \
+      >>"$logs"
+  done
+  assert_permanent_absence_logs_are_bounded "$logs" || {
+    printf 'permanent-absence rejected logs at the exact bound\n' >&2
+    return 1
+  }
+  printf 'OBI remote-parent bridge unavailable retry=overflow\n' >>"$logs"
+  if assert_permanent_absence_logs_are_bounded "$logs" >/dev/null 2>&1; then
+    printf 'permanent-absence accepted logs beyond the fixed bound\n' >&2
+    return 1
+  fi
+
+  printf 'OBI remote-parent propagator enabled\nOBI remote-parent ' >"$logs"
+  for ((line_count = 0; line_count < 1025; line_count++)); do
+    printf 'x' >>"$logs"
+  done
+  printf '\n' >>"$logs"
+  if assert_permanent_absence_logs_are_bounded "$logs" >/dev/null 2>&1; then
+    printf 'permanent-absence accepted an overlong diagnostic line\n' >&2
+    return 1
+  fi
+
+  printf '%s\n' \
+    'OBI remote-parent propagator enabled' \
+    'OBI remote-parent provider ready' \
+    >"$logs"
+  if assert_permanent_absence_logs_are_bounded "$logs" >/dev/null 2>&1; then
+    printf 'permanent-absence accepted false provider readiness\n' >&2
+    return 1
+  fi
+  printf '%s\n' \
+    'OBI remote-parent propagator enabled' \
+    'OBI Java instrumentation ready' \
+    >"$logs"
+  if assert_permanent_absence_logs_are_bounded "$logs" >/dev/null 2>&1; then
+    printf 'permanent-absence accepted false instrumentation readiness\n' >&2
+    return 1
+  fi
+}
+
+test_permanent_absence_refuses_recovery_if_jvm_stop_fails() {
+  local -r result_dir="$TEST_TMP_DIR/permanent-absence-stop-failure"
+  local -r observed="$result_dir/observed"
+  local control_status=0
+  local marker_metadata=""
+
+  mkdir -p -- "$result_dir"
+  if (
+    RESULT_DIR="$result_dir"
+    COMPOSE=(test-compose)
+    TRANSPORT=getsockopt
+    CONTEXT_PROPAGATION=tcp
+    SCENARIO_VARIANT=original
+    BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=getsockopt
+    : >"$observed"
+    assert_project_docker_identity_unchanged() { :; }
+    create_permanent_absence_global_marker() { :; }
+    clear_pending_permanent_absence_recovery() { :; }
+    run_disabled_control() { :; }
+    capture_control_response() { :; }
+    invalidate_selected_transport() { SELECTED_TRANSPORT=""; }
+    date() { printf 'absence-cursor\n'; }
+    run_bounded() {
+      printf 'bounded:%s\n' "$*" >>"$observed"
+      if [[ "$*" == \
+        '60 test-compose stop --timeout 10 apache-proxy java-backend' ]]; then
+        return 73
+      fi
+      return 0
+    }
+    wait_for_http() { :; }
+    wait_for_bounded_permanent_absence_log() { :; }
+    assert_runtime_contract() { return 47; }
+    recreate_instrumented_stack() {
+      printf 'recovery:%s\n' "$2" >>"$observed"
+    }
+
+    run_permanent_absence_control
+  ) >/dev/null 2>&1; then
+    printf 'permanent-absence ignored a runtime failure and failed JVM stop\n' >&2
+    return 1
+  else
+    control_status=$?
+  fi
+  [[ "$control_status" == 47 && \
+    -f "$result_dir/permanent-absence-recovery-required" && \
+    ! -L "$result_dir/permanent-absence-recovery-required" ]] || {
+    printf 'permanent-absence lost its original failure or recovery marker\n' >&2
+    return 1
+  }
+  marker_metadata="$(stat -c '%u:%a:%h:%s' -- \
+    "$result_dir/permanent-absence-recovery-required")" || return $?
+  [[ "$marker_metadata" == "$(id -u):600:1:18" ]] || {
+    printf 'permanent-absence recovery marker metadata changed: %s\n' \
+      "$marker_metadata" >&2
+    return 1
+  }
+  grep -Fxq \
+    'bounded:60 test-compose stop --timeout 10 apache-proxy java-backend' \
+    "$observed" || {
+    printf 'permanent-absence did not attempt to stop the absence JVM\n' >&2
+    return 1
+  }
+  if grep -Fq 'recovery:' "$observed"; then
+    printf 'permanent-absence started OBI while the absence JVM might be running\n' >&2
+    return 1
+  fi
+}
+
+test_permanent_absence_refuses_jvm_stop_after_docker_drift() {
+  local -r result_dir="$TEST_TMP_DIR/permanent-absence-docker-drift"
+  local -r marker="$result_dir/permanent-absence-recovery-required"
+  local -r mutation="$result_dir/compose-mutation"
+  local status=0
+
+  mkdir -p -- "$result_dir"
+  (umask 077; printf 'recovery_required\n' >"$marker")
+  if (
+    COMPOSE=(test-compose)
+    assert_project_docker_identity_unchanged() { return 88; }
+    run_bounded() { printf '%s\n' "$*" >"$mutation"; }
+    stop_permanent_absence_jvm
+  ) >/dev/null 2>&1; then
+    printf 'permanent-absence stopped a JVM after Docker identity drift\n' >&2
+    return 1
+  else
+    status=$?
+  fi
+  [[ "$status" == 88 && -f "$marker" && ! -L "$marker" && \
+    "$(<"$marker")" == recovery_required && \
+    ! -e "$mutation" && ! -L "$mutation" ]] || {
+    printf 'Docker identity drift mutated Compose or cleared recovery state\n' >&2
+    return 1
+  }
+}
+
+test_permanent_absence_refuses_stale_evidence_before_mutation() {
+  local stale_name=""
+  local result_dir=""
+  local mutation=""
+
+  for stale_name in \
+    permanent-absence-recovery-required \
+    permanent-absence-lifetime.txt; do
+    result_dir="$TEST_TMP_DIR/permanent-absence-stale-$stale_name"
+    mutation="$result_dir/mutated"
+    mkdir -p -- "$result_dir"
+    printf 'stale\n' >"$result_dir/$stale_name"
+    if (
+      RESULT_DIR="$result_dir"
+      TRANSPORT=auto
+      CONTEXT_PROPAGATION=tcp
+      SCENARIO_VARIANT=original
+      assert_project_docker_identity_unchanged() { :; }
+      run_disabled_control() { : >"$mutation"; }
+      run_permanent_absence_control
+    ) >/dev/null 2>&1; then
+      printf 'permanent-absence accepted stale evidence: %s\n' \
+        "$stale_name" >&2
+      return 1
+    fi
+    [[ ! -e "$mutation" && ! -L "$mutation" ]] || {
+      printf 'permanent-absence mutated the stack after stale evidence: %s\n' \
+        "$stale_name" >&2
+      return 1
+    }
+  done
 }
 
 test_late_attach_recycles_only_apache_after_readiness() {
@@ -13611,6 +17408,12 @@ test_start_failure_retains_command_boundary() {
     verify_compose_project_ownership() {
       return 0
     }
+    assert_project_docker_identity_unchanged() {
+      return 0
+    }
+    assert_no_pending_permanent_absence_recovery() {
+      return 0
+    }
 
     if start_stack; then
       printf 'failing Compose startup unexpectedly passed\n' >&2
@@ -13663,6 +17466,8 @@ test_pre_environment_failure_retains_acceptance_eligibility() {
     FAILURE_STATUS=""
     FAILURE_COMMAND=""
     check_dependencies() { :; }
+    enter_project_guard() { :; }
+    assert_no_pending_permanent_absence_recovery() { :; }
     prepare_directories() {
       RESULT_DIR="$result_dir"
       mkdir -p -- "$RESULT_DIR"
@@ -18374,6 +22179,25 @@ main() {
   test_uninstrumented_control_invalidates_before_stack_mutation
   test_standalone_restart_invalidates_before_stack_mutation
   test_extension_disabled_control_uses_configuration_log
+  test_permanent_absence_requires_a_full_jvm_lifetime_boundary
+  test_permanent_absence_startup_uses_normal_runtime_contract
+  test_permanent_absence_startup_refuses_prior_run_recovery
+  test_permanent_absence_project_guard_is_host_shared
+  test_project_guard_terminal_handoff_is_status_truthful
+  test_project_guard_terminal_handoff_wraps_real_runner
+  test_permanent_absence_global_marker_is_exact_and_daemon_bound
+  test_project_guard_docker_identity_capture_is_source_bounded
+  test_permanent_absence_cleanup_only_clears_after_verified_down
+  test_permanent_absence_global_marker_forces_exit_cleanup
+  test_cleanup_signal_status_matches_retained_evidence
+  test_permanent_absence_log_capture_is_source_bounded
+  test_cleanup_compose_log_capture_is_source_bounded
+  test_permanent_absence_readiness_is_source_bounded
+  test_permanent_absence_failure_stops_the_jvm_before_recovery
+  test_permanent_absence_identity_and_log_evidence_is_bounded
+  test_permanent_absence_refuses_recovery_if_jvm_stop_fails
+  test_permanent_absence_refuses_jvm_stop_after_docker_drift
+  test_permanent_absence_refuses_stale_evidence_before_mutation
   test_late_attach_recycles_only_apache_after_readiness
   test_control_response_normalizes_connection_diagnostics
   test_required_read_failures_do_not_publish_evidence

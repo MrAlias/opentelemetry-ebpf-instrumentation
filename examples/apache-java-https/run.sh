@@ -7788,6 +7788,7 @@ run_scenario() {
   local expected_bridge_stage=0
   local expected_bridge_missing=0
   local expected_bridge_stale=0
+  local expected_bridge_handoffs=0
   local include_ambiguous_candidates=false
   local expected_java_missing=0
   local pressure_hits=0
@@ -7883,6 +7884,11 @@ run_scenario() {
     expected_bridge_lifecycle="$expected_requests"
     expected_bridge_stage="$expected_requests"
     expected_bridge_stale=0
+    expected_bridge_handoffs=0
+    if [[ "$name" == "tls-boundary" && \
+      "$SELECTED_TRANSPORT" == "getsockopt" ]]; then
+      expected_bridge_handoffs="$expected_requests"
+    fi
     include_ambiguous_candidates=false
     if [[ "$retrieval_mode" == "helper-unavailable" ]]; then
       expected_bridge_valid=0
@@ -8292,7 +8298,8 @@ run_scenario() {
         "$expected_bridge_lifecycle" \
         "$expected_bridge_stage" \
         "$include_ambiguous_candidates" \
-        "$expected_bridge_stale"; then
+        "$expected_bridge_stale" \
+        "$expected_bridge_handoffs"; then
         metric_status=1
       fi
     fi
@@ -13772,6 +13779,7 @@ pressure_bridge_reconciliation() {
       if (inject_total != wanted_requests || inject_valid != candidate_total ||
           candidate_valid != stage_total || retrieval_valid != wanted_valid ||
           handoff_valid > retrieval_valid ||
+          (selected != "getsockopt" && handoff_valid != 0) ||
           wanted_valid + wanted_roots != wanted_requests) {
         printf "pressure bridge pipeline mismatch: requests=%d inject=%d/%d candidate=%d/%d stage=%d/%d retrieval=%d/%d handoff=%d expected_valid=%d roots=%d\n",
           wanted_requests, inject_valid, inject_total, candidate_valid, candidate_total,
@@ -13860,6 +13868,7 @@ assert_pressure_unix_already_consumed_diagnostics_delta() {
 }
 
 assert_bridge_metric_delta() {
+  (( $# >= 4 && $# <= 10 )) || return 1
   local -r input="$1"
   local -r transport="$2"
   local -r expected_takes="$3"
@@ -13869,9 +13878,14 @@ assert_bridge_metric_delta() {
   local -r expected_stage="${7:-$expected_upstream}"
   local -r include_ambiguous_candidates="${8:-false}"
   local -r expected_stale="${9:-0}"
+  local -r expected_handoffs="${10:-0}"
 
+  [[ "$transport" == "getsockopt" || "$transport" == "unix" ]] || return 1
   [[ "$include_ambiguous_candidates" == "true" || \
     "$include_ambiguous_candidates" == "false" ]] || return 1
+  bounded_decimal \
+    "$expected_handoffs" 1000 true >/dev/null || return 1
+  [[ "$transport" == "getsockopt" || "$expected_handoffs" == "0" ]] || return 1
 
   awk \
     -v selected="$transport" \
@@ -13881,6 +13895,7 @@ assert_bridge_metric_delta() {
     -v wanted_upstream="$expected_upstream" \
     -v wanted_stage="$expected_stage" \
     -v wanted_stale="$expected_stale" \
+    -v wanted_handoffs="$expected_handoffs" \
     -v include_ambiguous_candidates="$include_ambiguous_candidates" \
     -v allow_primary_security="$ALLOW_PRIMARY_SECURITY_METRICS" \
     -v allow_unix_security="$ALLOW_UNIX_SECURITY_METRICS" '
@@ -13895,13 +13910,15 @@ assert_bridge_metric_delta() {
       status = label($0, "status")
       transport = label($0, "transport")
       delta = ""
+      delta_fields = 0
       for (field = 1; field <= NF; field++) {
         if ($field ~ /^delta=/) {
           delta = $field
           sub(/^delta=/, "", delta)
+          delta_fields++
         }
       }
-      if (delta !~ /^-?[0-9]+$/ || delta < 0) {
+      if (delta_fields != 1 || delta !~ /^-?[0-9]+$/ || delta < 0) {
         printf "invalid bridge metric delta: %s\n", $0 > "/dev/stderr"
         failed = 1
         next
@@ -13925,6 +13942,20 @@ assert_bridge_metric_delta() {
           stale += delta
         } else if (delta != 0 && !security_allowed) {
           printf "unexpected bridge retrieval result: %s\n", $0 > "/dev/stderr"
+          failed = 1
+        }
+        next
+      }
+      if (index($1, "operation=\"handoff\"") != 0) {
+        handoff_rows++
+        if ($1 == "obi_java_remote_parent_operations_total{operation=\"handoff\",status=\"valid\",transport=\"tcp\"}" &&
+            delta ~ /^(0|[1-9][0-9]*)$/ && length(delta) <= 4 && delta + 0 <= 1000) {
+          handoffs += delta
+        } else if (delta != 0) {
+          printf "unexpected bridge handoff result: %s\n", $0 > "/dev/stderr"
+          failed = 1
+        } else {
+          printf "malformed bridge handoff result: %s\n", $0 > "/dev/stderr"
           failed = 1
         }
         next
@@ -13963,11 +13994,13 @@ assert_bridge_metric_delta() {
       if (candidate_total != wanted_upstream || injections != wanted_upstream ||
           stages != wanted_stage ||
           takes != wanted_takes || discards != wanted_discards || missing != wanted_missing ||
-          stale != wanted_stale) {
-        printf "expected lifecycle=%d/%d/%d %s take/valid=%d discard/valid=%d take/missing=%d take/stale=%d, got candidate-valid=%d candidate-ambiguous=%d inject=%d stage=%d take=%d discard=%d missing=%d stale=%d\n",
+          stale != wanted_stale || handoffs != wanted_handoffs || handoffs > takes ||
+          handoff_rows > 1) {
+        printf "expected lifecycle=%d/%d/%d %s take/valid=%d discard/valid=%d take/missing=%d take/stale=%d handoff/tcp/valid=%d, got candidate-valid=%d candidate-ambiguous=%d inject=%d stage=%d take=%d discard=%d missing=%d stale=%d handoff=%d\n",
           wanted_upstream, wanted_upstream, wanted_stage, selected,
-          wanted_takes, wanted_discards, wanted_missing, wanted_stale,
-          candidates, ambiguous_candidates, injections, stages, takes, discards, missing, stale > "/dev/stderr"
+          wanted_takes, wanted_discards, wanted_missing, wanted_stale, wanted_handoffs,
+          candidates, ambiguous_candidates, injections, stages, takes, discards, missing,
+          stale, handoffs > "/dev/stderr"
         failed = 1
       }
       exit failed ? 1 : 0
@@ -14058,7 +14091,8 @@ assert_coalesced_bridge_metric_delta() {
     END {
       if (wanted_outcome == "supported_exact") {
         if (takes != 2 || discards != 0 || stage_valid != 2 || stage_total != 2 ||
-            handoff_valid > 2 || inject_ambiguous != 0 || candidate_ambiguous != 0 ||
+            handoff_valid > 2 || (selected != "getsockopt" && handoff_valid != 0) ||
+            inject_ambiguous != 0 || candidate_ambiguous != 0 ||
             inject_total < 2 || inject_total > 3 || inject_valid != inject_total ||
             candidate_total < 2 || candidate_total > 3 || candidate_valid != candidate_total) {
           printf "supported coalesced bridge metric mismatch: take=%d discard=%d candidate=%d/%d inject=%d/%d stage=%d/%d handoff=%d\n",
@@ -14184,6 +14218,18 @@ assert_timeout_cancellation_metric_delta() {
         else if (delta != 0) fail("stage result", $0)
         next
       }
+      if (index($1, "operation=\"handoff\"") != 0) {
+        handoff_rows++
+        if ($1 == "obi_java_remote_parent_operations_total{operation=\"handoff\",status=\"valid\",transport=\"tcp\"}" &&
+            delta ~ /^(0|[1-9][0-9]*)$/ && length(delta) <= 1 && delta + 0 <= 2) {
+          handoff_valid += delta
+        } else if (delta != 0) {
+          fail("handoff result", $0)
+        } else {
+          fail("malformed handoff result", $0)
+        }
+        next
+      }
       allowed = operation == "negotiate" && status == "missing" && transport == selected
       allowed = allowed || (operation == "cleanup" && status == "valid" && transport == "tcp")
       allowed = allowed || (operation == "report" && status == "valid" && transport == "tcp")
@@ -14195,11 +14241,13 @@ assert_timeout_cancellation_metric_delta() {
           inject_valid != 2 || inject_total != 2 ||
           stage_valid != wanted_valid || stage_total != wanted_valid ||
           take_valid != wanted_valid || discard_total < minimum_discards ||
-          discard_total > maximum_discards || reason_discard != discard_total) {
-        printf "timeout cancellation metric mismatch: outcome=%s reason=%s candidate=%d/%d inject=%d/%d stage=%d/%d take=%d discard=%d reason-discard=%d\n",
+          discard_total > maximum_discards || reason_discard != discard_total ||
+          handoff_valid > take_valid || handoff_rows > 1 ||
+          (selected != "getsockopt" && handoff_valid != 0)) {
+        printf "timeout cancellation metric mismatch: outcome=%s reason=%s candidate=%d/%d inject=%d/%d stage=%d/%d take=%d discard=%d reason-discard=%d handoff=%d\n",
           wanted_outcome, wanted_reason, candidate_valid, candidate_total,
           inject_valid, inject_total, stage_valid, stage_total, take_valid,
-          discard_total, reason_discard > "/dev/stderr"
+          discard_total, reason_discard, handoff_valid > "/dev/stderr"
         failed = 1
       }
       exit failed ? 1 : 0

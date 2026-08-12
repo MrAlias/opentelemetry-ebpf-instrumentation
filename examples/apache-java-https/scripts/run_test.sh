@@ -6965,6 +6965,99 @@ test_reason_coded_scenario_reconciliation_is_exact() {
 test_bridge_metric_delta_requires_exact_one_shot_results() {
   local -r delta="$TEST_TMP_DIR/w3c-metrics.delta"
   local -r helper_delta="$TEST_TMP_DIR/helper-attach-metrics.delta"
+  local -r handoff_delta="$TEST_TMP_DIR/tls-handoff-metrics.delta"
+
+  cat >"$handoff_delta" <<'EOF'
+obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=3 after=6 delta=3
+obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} before=3 after=6 delta=3
+obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=3 after=6 delta=3
+obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} before=3 after=6 delta=3
+obi_java_remote_parent_operations_total{operation="handoff",status="valid",transport="tcp"} before=0 after=3 delta=3
+EOF
+  assert_bridge_metric_delta \
+    "$handoff_delta" getsockopt 3 0 0 3 3 false 0 3 || {
+    printf 'bridge metric delta rejected exact TLS handoffs\n' >&2
+    return 1
+  }
+  if assert_bridge_metric_delta \
+    "$handoff_delta" bogus 3 0 0 3 3 false 0 3 >/dev/null 2>&1 || \
+    assert_bridge_metric_delta \
+      "$handoff_delta" getsockopt 3 0 0 3 3 false 0 3 extra >/dev/null 2>&1; then
+    printf 'bridge metric delta accepted an invalid invocation\n' >&2
+    return 1
+  fi
+  if assert_bridge_metric_delta \
+    "$handoff_delta" getsockopt 3 0 0 3 3 false 0 >/dev/null 2>&1; then
+    printf 'bridge metric delta accepted TLS handoffs without an expectation\n' >&2
+    return 1
+  fi
+  if assert_bridge_metric_delta \
+    "$handoff_delta" getsockopt 3 0 0 3 3 false 0 2 >/dev/null 2>&1 || \
+    assert_bridge_metric_delta \
+      "$handoff_delta" getsockopt 3 0 0 3 3 false 0 4 >/dev/null 2>&1; then
+    printf 'bridge metric delta accepted an inexact TLS handoff count\n' >&2
+    return 1
+  fi
+  sed -i \
+    's/operation="handoff",status="valid",transport="tcp"/operation="handoff",status="missing",transport="tcp"/' \
+    "$handoff_delta"
+  if assert_bridge_metric_delta \
+    "$handoff_delta" getsockopt 3 0 0 3 3 false 0 3 >/dev/null 2>&1; then
+    printf 'bridge metric delta accepted a non-valid handoff\n' >&2
+    return 1
+  fi
+  sed -i \
+    's/operation="handoff",status="missing",transport="tcp"/operation="handoff",status="valid",transport="unix"/' \
+    "$handoff_delta"
+  if assert_bridge_metric_delta \
+    "$handoff_delta" getsockopt 3 0 0 3 3 false 0 3 >/dev/null 2>&1; then
+    printf 'bridge metric delta accepted a non-TCP handoff\n' >&2
+    return 1
+  fi
+  sed -i \
+    's/operation="handoff",status="valid",transport="unix"/operation="handoff",status="valid",transport="tcp"/' \
+    "$handoff_delta"
+  if assert_bridge_metric_delta \
+    "$handoff_delta" unix 3 0 0 3 3 false 0 3 >/dev/null 2>&1; then
+    printf 'bridge metric delta accepted BPF handoffs for Unix retrieval\n' >&2
+    return 1
+  fi
+  sed -i \
+    -e 's/operation="handoff",status="valid",transport="tcp"} before=0 after=3 delta=3/operation="handoff",status="valid",transport="tcp"} before=0 after=4 delta=4/' \
+    "$handoff_delta"
+  if assert_bridge_metric_delta \
+    "$handoff_delta" getsockopt 3 0 0 3 3 false 0 4 >/dev/null 2>&1; then
+    printf 'bridge metric delta accepted more handoffs than valid takes\n' >&2
+    return 1
+  fi
+  sed -i \
+    's/operation="handoff",status="valid",transport="tcp"} before=0 after=4 delta=4/operation="handoff",status="valid",transport="tcp"} before=0 after=3 delta=3/' \
+    "$handoff_delta"
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="handoff",status="valid",transport="tcp"} before=0 after=0 delta=0' \
+    >>"$handoff_delta"
+  if assert_bridge_metric_delta \
+    "$handoff_delta" getsockopt 3 0 0 3 3 false 0 3 >/dev/null 2>&1; then
+    printf 'bridge metric delta accepted duplicate handoff series\n' >&2
+    return 1
+  fi
+  sed -i '$d' "$handoff_delta"
+  sed -i \
+    's/transport="tcp"} before=0 after=3 delta=3/transport="tcp",extra="label"} before=0 after=3 delta=3/' \
+    "$handoff_delta"
+  if assert_bridge_metric_delta \
+    "$handoff_delta" getsockopt 3 0 0 3 3 false 0 3 >/dev/null 2>&1; then
+    printf 'bridge metric delta accepted an inexact handoff label schema\n' >&2
+    return 1
+  fi
+  sed -i \
+    's/transport="tcp",extra="label"} before=0 after=3 delta=3/transport="tcp"} before=0 after=3 delta=3 delta=3/' \
+    "$handoff_delta"
+  if assert_bridge_metric_delta \
+    "$handoff_delta" getsockopt 3 0 0 3 3 false 0 3 >/dev/null 2>&1; then
+    printf 'bridge metric delta accepted duplicate delta fields\n' >&2
+    return 1
+  fi
 
   cat >"$delta" <<'EOF'
 obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=3 after=5 delta=2
@@ -7082,9 +7175,33 @@ test_coalesced_bridge_metrics_follow_explicit_outcome() {
     'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} before=0 after=2 delta=2' \
     'obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=0 after=2 delta=2' \
     'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} before=0 after=2 delta=2' \
+    'obi_java_remote_parent_operations_total{operation="handoff",status="valid",transport="tcp"} before=0 after=2 delta=2' \
     >"$delta"
   assert_coalesced_bridge_metric_delta "$delta" getsockopt supported_exact || {
     printf 'coalesced bridge metrics rejected the explicit exact outcome\n' >&2
+    return 1
+  }
+  sed -i \
+    's/operation="handoff",status="valid",transport="tcp"} before=0 after=2 delta=2/operation="handoff",status="valid",transport="tcp"} before=0 after=1 delta=1/' \
+    "$delta"
+  assert_coalesced_bridge_metric_delta "$delta" getsockopt supported_exact || {
+    printf 'coalesced bridge metrics rejected a valid handoff subset\n' >&2
+    return 1
+  }
+  sed -i \
+    's/operation="handoff",status="valid",transport="tcp"} before=0 after=1 delta=1/operation="handoff",status="valid",transport="tcp"} before=0 after=2 delta=2/' \
+    "$delta"
+  sed -i \
+    's/operation="take",status="valid",transport="getsockopt"/operation="take",status="valid",transport="unix"/' \
+    "$delta"
+  if assert_coalesced_bridge_metric_delta \
+    "$delta" unix supported_exact >/dev/null 2>&1; then
+    printf 'coalesced bridge metrics accepted BPF handoffs for Unix retrieval\n' >&2
+    return 1
+  fi
+  sed -i '/operation="handoff",status="valid",transport="tcp"/d' "$delta"
+  assert_coalesced_bridge_metric_delta "$delta" unix supported_exact || {
+    printf 'coalesced bridge metrics rejected a Unix result without BPF handoffs\n' >&2
     return 1
   }
 
@@ -7118,6 +7235,7 @@ test_timeout_cancellation_metrics_follow_explicit_outcome() {
     'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} before=0 after=2 delta=2' \
     'obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=0 after=2 delta=2' \
     'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} before=0 after=2 delta=2' \
+    'obi_java_remote_parent_operations_total{operation="handoff",status="valid",transport="tcp"} before=0 after=2 delta=2' \
     >"$delta"
   assert_timeout_cancellation_metric_delta \
     "$delta" getsockopt exact 2 || {
@@ -7126,8 +7244,64 @@ test_timeout_cancellation_metrics_follow_explicit_outcome() {
   }
 
   sed -i \
+    's/operation="handoff",status="valid",transport="tcp"} before=0 after=2 delta=2/operation="handoff",status="valid",transport="tcp"} before=0 after=1 delta=1/' \
+    "$delta"
+  assert_timeout_cancellation_metric_delta \
+    "$delta" getsockopt exact 2 || {
+    printf 'timeout cancellation metrics rejected a valid handoff subset\n' >&2
+    return 1
+  }
+  sed -i \
+    's/operation="handoff",status="valid",transport="tcp"} before=0 after=1 delta=1/operation="handoff",status="valid",transport="tcp"} before=0 after=2 delta=2/' \
+    "$delta"
+  sed -i \
+    's/operation="handoff",status="valid",transport="tcp"} before=0 after=2 delta=2/operation="handoff",status="valid",transport="tcp"} before=0 after=3 delta=3/' \
+    "$delta"
+  if assert_timeout_cancellation_metric_delta \
+    "$delta" getsockopt exact 2 >/dev/null 2>&1; then
+    printf 'timeout cancellation metrics accepted more handoffs than valid takes\n' >&2
+    return 1
+  fi
+  sed -i \
+    's/operation="handoff",status="valid",transport="tcp"} before=0 after=3 delta=3/operation="handoff",status="missing",transport="tcp"} before=0 after=2 delta=2/' \
+    "$delta"
+  if assert_timeout_cancellation_metric_delta \
+    "$delta" getsockopt exact 2 >/dev/null 2>&1; then
+    printf 'timeout cancellation metrics accepted a non-valid handoff\n' >&2
+    return 1
+  fi
+  sed -i \
+    's/operation="handoff",status="missing",transport="tcp"} before=0 after=2 delta=2/operation="handoff",status="valid",transport="unix"} before=0 after=2 delta=2/' \
+    "$delta"
+  if assert_timeout_cancellation_metric_delta \
+    "$delta" getsockopt exact 2 >/dev/null 2>&1; then
+    printf 'timeout cancellation metrics accepted a non-TCP handoff\n' >&2
+    return 1
+  fi
+  sed -i \
+    -e 's/operation="take",status="valid",transport="getsockopt"} before=0 after=2 delta=2/operation="take",status="valid",transport="unix"} before=0 after=2 delta=2/' \
+    -e 's/operation="handoff",status="valid",transport="unix"} before=0 after=2 delta=2/operation="handoff",status="valid",transport="tcp"} before=0 after=2 delta=2/' \
+    "$delta"
+  if assert_timeout_cancellation_metric_delta \
+    "$delta" unix exact 2 >/dev/null 2>&1; then
+    printf 'timeout cancellation metrics accepted BPF handoffs for Unix retrieval\n' >&2
+    return 1
+  fi
+  sed -i \
+    -e 's/operation="take",status="valid",transport="unix"} before=0 after=2 delta=2/operation="take",status="valid",transport="getsockopt"} before=0 after=2 delta=2/' \
+    "$delta"
+
+  sed -i \
     -e 's/operation="stage",status="valid",transport="tcp"} before=0 after=2 delta=2/operation="stage",status="valid",transport="tcp"} before=0 after=1 delta=1/' \
     -e 's/operation="take",status="valid",transport="getsockopt"} before=0 after=2 delta=2/operation="take",status="valid",transport="getsockopt"} before=0 after=1 delta=1/' \
+    "$delta"
+  if assert_timeout_cancellation_metric_delta \
+    "$delta" getsockopt missing 1 >/dev/null 2>&1; then
+    printf 'timeout cancellation metrics accepted more handoffs than the missing outcome take\n' >&2
+    return 1
+  fi
+  sed -i \
+    's/operation="handoff",status="valid",transport="tcp"} before=0 after=2 delta=2/operation="handoff",status="valid",transport="tcp"} before=0 after=1 delta=1/' \
     "$delta"
   assert_timeout_cancellation_metric_delta \
     "$delta" getsockopt missing 1 || {
@@ -7267,6 +7441,14 @@ EOF
     printf 'pressure bridge hid overlapping Unix upstream and retrieval reasons\n' >&2
     return 1
   }
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="handoff",status="valid",transport="tcp"} before=0 after=1 delta=1' \
+    >>"$unix_delta"
+  if pressure_bridge_reconciliation \
+    "$unix_delta" unix 1 1 2 >/dev/null 2>&1; then
+    printf 'pressure bridge accepted BPF handoffs for Unix retrieval\n' >&2
+    return 1
+  fi
 }
 
 test_primary_security_metrics_are_explicitly_scoped() {
@@ -9859,21 +10041,27 @@ test_scenario_fences_metrics_around_diagnostics() {
     local -r wanted_unsampled="$6"
     local -r wanted_standard="$7"
     local -r wanted_request_argument="$8"
-    local -r call_log="$TEST_TMP_DIR/scenario-$name.calls"
+    local -r wanted_handoffs="$9"
+    local -r selected_transport="${10:-getsockopt}"
+    local -r repetitions="${11:-1}"
+    local -r call_log="$TEST_TMP_DIR/scenario-$name-$selected_transport.calls"
     local boundary_ran=false
+    local expected_run=0
+    local expected_label=""
     local expected_requests=0
-    local expected_calls_file="$RESULT_DIR/expected.calls"
+    local expected_calls_file=""
 
-    RESULT_DIR="$TEST_TMP_DIR/scenario-$name"
+    RESULT_DIR="$TEST_TMP_DIR/scenario-$name-$selected_transport"
+    expected_calls_file="$RESULT_DIR/expected.calls"
     mkdir -p -- "$RESULT_DIR"
     : >"$call_log"
     BRIDGE_RUNNING=true
     COMPOSE=(docker compose)
-    REPEAT_COUNT=1
+    REPEAT_COUNT="$repetitions"
     REQUEST_COUNT="$requests"
     SCENARIO_SEED=1
     SCENARIO_VARIANT=""
-    SELECTED_TRANSPORT=getsockopt
+    SELECTED_TRANSPORT="$selected_transport"
     TLS_PROTOCOL=TLSv1.3
     capture_java_diagnostics() {
       printf 'diagnostics:%s\n' "$1" >>"$call_log"
@@ -9921,7 +10109,8 @@ test_scenario_fences_metrics_around_diagnostics() {
       printf 'wait:%s:%s\n' "$1" "$2" >>"$call_log"
     }
     assert_bridge_metric_delta() {
-      return 0
+      [[ $# == 10 ]] || return 1
+      printf 'bridge:%s:%s\n' "$2" "${10}" >>"$call_log"
     }
     write_java_diagnostics_delta() {
       : >"$3"
@@ -9937,42 +10126,58 @@ test_scenario_fences_metrics_around_diagnostics() {
     run_scenario "$name" >/dev/null || return $?
 
     expected_requests="$(scenario_bridge_take_count "$name")"
-    {
-      printf 'boundary:%s\n' "$name"
-      printf 'diagnostics:%s-before\n' "$name"
-      printf 'wait:0:0\n'
-      printf 'evidence:%s-before\n' "$name"
-      if [[ "$name" == "tls-boundary" ]]; then
-        printf 'cursor-map-before:%s\n' "$name"
+    : >"$expected_calls_file"
+    for ((expected_run = 1; expected_run <= repetitions; expected_run++)); do
+      expected_label="$name"
+      if ((repetitions > 1)); then
+        printf -v expected_label '%s-run-%02d' "$name" "$expected_run"
       fi
-      printf 'scenario:%s\n' "$wanted_request_argument"
-      if [[ "$name" == "tls-boundary" ]]; then
-        printf 'cursor-map-after:%s\n' "$name"
-      fi
-      printf 'wait:%d:%d\n' "$expected_requests" "$expected_requests"
-      printf 'evidence:%s-after\n' "$name"
-      printf 'diagnostics:%s-after\n' "$name"
-    } >"$expected_calls_file"
+      {
+        printf 'boundary:%s\n' "$expected_label"
+        printf 'diagnostics:%s-before\n' "$expected_label"
+        printf 'wait:0:0\n'
+        printf 'evidence:%s-before\n' "$expected_label"
+        if [[ "$name" == "tls-boundary" ]]; then
+          printf 'cursor-map-before:%s\n' "$expected_label"
+        fi
+        printf 'scenario:%s\n' "$wanted_request_argument"
+        if [[ "$name" == "tls-boundary" ]]; then
+          printf 'cursor-map-after:%s\n' "$expected_label"
+        fi
+        printf 'wait:%d:%d\n' "$expected_requests" "$expected_requests"
+        printf 'evidence:%s-after\n' "$expected_label"
+        printf 'diagnostics:%s-after\n' "$expected_label"
+        printf 'bridge:%s:%s\n' "$selected_transport" "$wanted_handoffs"
+      } >>"$expected_calls_file"
+    done
     cmp -s -- "$expected_calls_file" "$call_log"
   )
 
-  run_accounting_case basic 1 1 1 1 0 0 1 || {
+  run_accounting_case basic 1 1 1 1 0 0 1 0 || {
     printf 'basic scenario did not fence metrics around diagnostics\n' >&2
     return 1
   }
-  run_accounting_case keepalive 0 10 1 10 0 0 default || {
+  run_accounting_case basic 1 1 1 1 0 0 1 0 unix || {
+    printf 'Unix basic scenario did not preserve a zero handoff expectation\n' >&2
+    return 1
+  }
+  run_accounting_case keepalive 0 10 1 10 0 0 default 0 || {
     printf 'keepalive scenario did not account for all acceptance requests\n' >&2
     return 1
   }
-  run_accounting_case keepalive 7 7 1 7 0 0 7 || {
+  run_accounting_case keepalive 7 7 1 7 0 0 7 0 || {
     printf 'targeted keepalive request count was not forwarded and accounted\n' >&2
     return 1
   }
-  run_accounting_case tls-boundary 0 3 1 3 0 0 3 || {
+  run_accounting_case tls-boundary 0 3 1 3 0 0 3 3 getsockopt 2 || {
     printf 'TLS-boundary scenario did not fence metrics around diagnostics\n' >&2
     return 1
   }
-  run_accounting_case obi-flags 4 4 1 2 2 0 4 || {
+  run_accounting_case tls-boundary 0 3 1 3 0 0 3 0 unix || {
+    printf 'Unix TLS-boundary scenario expected a BPF task handoff\n' >&2
+    return 1
+  }
+  run_accounting_case obi-flags 4 4 1 2 2 0 4 0 || {
     printf 'OBI-flags scenario did not preserve sampled and unsampled takes\n' >&2
     return 1
   }

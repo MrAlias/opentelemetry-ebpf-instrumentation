@@ -44,6 +44,26 @@ var spanSetWithPaths = []request.Span{
 	{Pid: request.PidInfo{UserPID: 1000, HostPID: 1234, Namespace: 44}},
 }
 
+type avoidedServiceRecord struct {
+	name      string
+	namespace string
+	instance  string
+}
+
+type avoidedServiceRecordingReporter struct {
+	imetrics.NoopReporter
+	metrics []avoidedServiceRecord
+	traces  []avoidedServiceRecord
+}
+
+func (r *avoidedServiceRecordingReporter) AvoidInstrumentationMetrics(name, namespace, instance string) {
+	r.metrics = append(r.metrics, avoidedServiceRecord{name: name, namespace: namespace, instance: instance})
+}
+
+func (r *avoidedServiceRecordingReporter) AvoidInstrumentationTraces(name, namespace, instance string) {
+	r.traces = append(r.traces, avoidedServiceRecord{name: name, namespace: namespace, instance: instance})
+}
+
 func allowTestPID(pf *PIDsFilter, pid app.PID, ns uint32, fi *exec.FileInfo, pidType PIDType) {
 	pf.AllowPID(pid, ns, fi, fi, pidType)
 }
@@ -459,6 +479,38 @@ func TestFilter_ExportsOTelDetection(t *testing.T) {
 	assert.False(t, fi.ExportsOTelMetricsSpan())
 	assert.False(t, fi.ExportsOTelMetrics())
 	assert.True(t, fi.ExportsOTelTraces())
+}
+
+func TestFilter_ExportsOTelDetectionReportsAvoidedTraceServiceOnce(t *testing.T) {
+	const defaultOtlpPort = 4317
+	reporter := &avoidedServiceRecordingReporter{}
+	pf := NewPIDsFilter(&services.DiscoveryConfig{}, slog.With("env", "testing"), reporter)
+
+	expected := avoidedServiceRecord{
+		name:      "java-backend",
+		namespace: "apache-java-https",
+		instance:  "java-1",
+	}
+	fi := exec.New(exec.Init{Service: svc.Attrs{UID: svc.UID{
+		Name:      expected.name,
+		Namespace: expected.namespace,
+		Instance:  expected.instance,
+	}}})
+	span := request.Span{
+		Type:         request.EventTypeHTTPClient,
+		Method:       "POST",
+		Path:         "/v1/traces",
+		RequestStart: 100,
+		End:          200,
+		Status:       200,
+	}
+
+	pf.checkIfExportsOTel(fi, &span, defaultOtlpPort)
+	pf.checkIfExportsOTel(fi, &span, defaultOtlpPort)
+
+	assert.True(t, fi.ExportsOTelTraces())
+	assert.Empty(t, reporter.metrics)
+	assert.Equal(t, []avoidedServiceRecord{expected}, reporter.traces)
 }
 
 func TestFilter_ExportsOTelSpanDetection(t *testing.T) {

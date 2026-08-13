@@ -18,6 +18,7 @@ MAX_UINT64_DECIMAL="18446744073709551615"
 JAVA_DIAGNOSTIC_COUNTER_MAX="999999999"
 BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS=35
 JAVA_PROVIDER_RETRY_SETTLE_SECONDS=2
+JAVA_DUPLICATE_SUPPRESSION_PRIME_INTERVAL_SECONDS=5
 PRIMARY_W3C_STALE_RETRIEVAL_TTL="1ns"
 UNIX_W3C_STALE_RETRIEVAL_TTL="1ns"
 JAVA_ATTACH_FAILURE_QUIET_SAMPLES=15
@@ -102,7 +103,10 @@ PRIMARY_LIVE_FD_VICTIM_TIMEOUT_SECONDS="$((
   PRIMARY_LIVE_FD_VICTIM_SUPERVISOR_SLACK_SECONDS
 ))"
 PRIMARY_LIVE_FD_VICTIM_REAP_TIMEOUT_SECONDS=15
-PRIMARY_LIVE_FD_FIXED_BUDGET_SECONDS=260
+# The three duplicate-suppression readiness windows (preparation, explicit
+# recovery, and EXIT recovery after a late failure) are accounted for
+# separately because they follow READINESS_TIMEOUT_SECONDS.
+PRIMARY_LIVE_FD_FIXED_BUDGET_SECONDS=200
 GENERATION_FAULT_HELPER_TIMEOUT_SECONDS=60
 GENERATION_FAULT_RELEASE_TIMEOUT_SECONDS=45
 GENERATION_FAULT_READY_TIMEOUT_SECONDS=10
@@ -144,6 +148,7 @@ readonly MAX_UINT32_DECIMAL
 readonly MAX_UINT64_DECIMAL JAVA_DIAGNOSTIC_COUNTER_MAX
 readonly BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS SCENARIO_RUN_TIMEOUT_SECONDS
 readonly JAVA_PROVIDER_RETRY_SETTLE_SECONDS
+readonly JAVA_DUPLICATE_SUPPRESSION_PRIME_INTERVAL_SECONDS
 readonly PRIMARY_W3C_STALE_RETRIEVAL_TTL UNIX_W3C_STALE_RETRIEVAL_TTL
 readonly JAVA_ATTACH_FAILURE_QUIET_SAMPLES
 readonly OBI_COMPOSE_STOP_GRACE_SECONDS
@@ -3818,11 +3823,13 @@ configure_security_probe_timeouts() {
   local -i repeat_seconds=$((
     REPEAT_COUNT * SECURITY_PROBE_SCENARIO_BUDGET_SECONDS
   ))
+  # Three readiness windows belong to the primary probe controls and three to
+  # the live-descriptor stack's preparation and two possible recovery checks.
   local -i maximum_readiness=$((
     (MAX_SECURITY_PROBE_TIMEOUT_SECONDS - repeat_seconds -
       SECURITY_PROBE_SAME_CGROUP_FIXED_BUDGET_SECONDS -
       SECURITY_PROBE_SIBLING_FIXED_BUDGET_SECONDS - PRIMARY_LIVE_FD_FIXED_BUDGET_SECONDS -
-      SECURITY_PROBE_TIMEOUT_SLACK_SECONDS) / 3
+      SECURITY_PROBE_TIMEOUT_SLACK_SECONDS) / 6
   ))
 
   ((READINESS_TIMEOUT_SECONDS <= maximum_readiness)) || {
@@ -4977,44 +4984,127 @@ assert_runtime_contract() {
 
 wait_for_java_duplicate_suppression() {
   local -r output="$1"
+  local -r timeout_seconds="${2:-$READINESS_TIMEOUT_SECONDS}"
 
-  run_bounded 10 curl --fail --silent --show-error \
-    "$APACHE_HTTPS_HEALTH_ENDPOINT" >/dev/null || return $?
-  wait_for_java_duplicate_suppression_without_prime "$output"
+  wait_for_java_duplicate_suppression_with_policy \
+    "$output" \
+    "$timeout_seconds" \
+    "$JAVA_DUPLICATE_SUPPRESSION_PRIME_INTERVAL_SECONDS"
 }
 
 wait_for_java_duplicate_suppression_without_prime() {
   local -r output="$1"
-  local -r timeout_seconds="${2:-20}"
-  local metrics=""
-  local -i elapsed=0
-  local status=0
+  local -r timeout_seconds="${2:-$DELAYED_OTLP_SUPPRESSION_TIMEOUT_SECONDS}"
 
-  [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || return 1
+  wait_for_java_duplicate_suppression_with_policy \
+    "$output" "$timeout_seconds" 0
+}
+
+wait_for_java_duplicate_suppression_with_policy() {
+  local -r output="$1"
+  local timeout_seconds=""
+  local prime_interval_seconds=""
+  local metrics=""
+  local last_metrics=""
+  local -i elapsed=0
+  local -i fetch_timeout=0
+  local last_metrics_ready=false
+  local -i next_prime_at=0
+  local -i remaining=0
+  local -i request_timeout=0
+  local -i started_at="$SECONDS"
+  local status=0
+  local suppression_present=false
+
+  timeout_seconds="$(bounded_decimal "$2" "$MAX_SHELL_INTEGER" false)" || return 1
+  prime_interval_seconds="$(bounded_decimal "$3" "$MAX_SHELL_INTEGER" true)" || return 1
   metrics="$(mktemp "$RESULT_DIR/.duplicate-suppression.XXXXXX")" || return $?
-  while ((elapsed < timeout_seconds)); do
-    if fetch_obi_metrics "$metrics" 2>/dev/null && \
-      java_duplicate_suppression_present "$metrics"; then
-      if install -m 0644 "$metrics" "$output"; then
+  last_metrics="$(mktemp "$RESULT_DIR/.duplicate-suppression-last.XXXXXX")" || {
+    status=$?
+    rm -f -- "$metrics" || true
+    return "$status"
+  }
+  while ((SECONDS - started_at < timeout_seconds)); do
+    elapsed="$((SECONDS - started_at))"
+    remaining="$((timeout_seconds - elapsed))"
+    if ((prime_interval_seconds > 0 && elapsed >= next_prime_at)); then
+      request_timeout="$remaining"
+      ((request_timeout <= 10)) || request_timeout=10
+      if run_bounded "$request_timeout" curl --fail --silent --show-error \
+        --max-time "$request_timeout" \
+        "$APACHE_HTTPS_HEALTH_ENDPOINT" >/dev/null; then
+        next_prime_at="$((elapsed + prime_interval_seconds))"
+      else
+        status=$?
+        if [[ "$last_metrics_ready" == "true" ]]; then
+          # Preserve the last complete scrape for the primary prime failure.
+          # Publication failure is secondary and must not replace its status.
+          install -m 0644 "$last_metrics" "$output" || true
+        fi
+        rm -f -- "$metrics" "$last_metrics" || true
+        return "$status"
+      fi
+    fi
+    elapsed="$((SECONDS - started_at))"
+    remaining="$((timeout_seconds - elapsed))"
+    ((remaining > 0)) || break
+    fetch_timeout="$remaining"
+    ((fetch_timeout <= 5)) || fetch_timeout=5
+    if fetch_obi_metrics "$metrics" "$fetch_timeout" 2>/dev/null; then
+      if install -m 0600 "$metrics" "$last_metrics"; then
+        last_metrics_ready=true
+      else
+        status=$?
+        rm -f -- "$metrics" "$last_metrics" || true
+        return "$status"
+      fi
+    fi
+    # A scrape that finishes on or after the deadline remains useful failure
+    # evidence, but must not turn an expired readiness window into success.
+    ((SECONDS - started_at < timeout_seconds)) || break
+    suppression_present=false
+    if [[ "$last_metrics_ready" == "true" ]] && \
+      java_duplicate_suppression_present "$last_metrics"; then
+      suppression_present=true
+    fi
+    # Predicate evaluation is part of the same wall-clock transaction on both
+    # its true and false paths.
+    ((SECONDS - started_at < timeout_seconds)) || break
+    if [[ "$suppression_present" == "true" ]]; then
+      if install -m 0644 "$last_metrics" "$output"; then
         :
       else
         status=$?
-        rm -f -- "$metrics" || true
+        rm -f -- "$metrics" "$last_metrics" || true
         return "$status"
       fi
-      rm -f -- "$metrics" || return $?
+      # Evidence publication is part of the bounded readiness transaction.
+      ((SECONDS - started_at < timeout_seconds)) || {
+        rm -f -- "$metrics" "$last_metrics" || true
+        log_error "OBI did not report Java duplicate-trace suppression"
+        return 1
+      }
+      rm -f -- "$metrics" "$last_metrics" || return $?
       return 0
     fi
     if sleep 1; then
       :
     else
       status=$?
-      rm -f -- "$metrics" || true
+      rm -f -- "$metrics" "$last_metrics" || true
       return "$status"
     fi
-    ((elapsed += 1))
   done
-  rm -f -- "$metrics" || return $?
+  if [[ "$last_metrics_ready" == "true" ]]; then
+    if install -m 0644 "$last_metrics" "$output"; then
+      :
+    else
+      status=$?
+      rm -f -- "$metrics" "$last_metrics" || true
+      return "$status"
+    fi
+  fi
+  rm -f -- "$metrics" "$last_metrics" || return $?
   log_error "OBI did not report Java duplicate-trace suppression"
   return 1
 }

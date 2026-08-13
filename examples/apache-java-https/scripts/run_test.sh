@@ -3313,6 +3313,7 @@ test_duplicate_suppression_wait_primes_java_export() {
   local -r result_dir="$TEST_TMP_DIR/duplicate-suppression-wait"
   local -r observed="$result_dir/observed"
   local -r metrics="$result_dir/suppression.prom"
+  local failure_status=0
 
   mkdir -p -- "$result_dir"
   (
@@ -3331,14 +3332,397 @@ test_duplicate_suppression_wait_primes_java_export() {
     printf 'duplicate suppression readiness did not become ready\n' >&2
     return 1
   }
-  grep -Fq "10 curl --fail --silent --show-error $APACHE_HTTPS_HEALTH_ENDPOINT" \
+  grep -Fq "10 curl --fail --silent --show-error --max-time 10 $APACHE_HTTPS_HEALTH_ENDPOINT" \
     "$observed" || {
     printf 'duplicate suppression readiness did not prime a Java export\n' >&2
     return 1
   }
   java_duplicate_suppression_present "$metrics"
+  [[ "$JAVA_DUPLICATE_SUPPRESSION_PRIME_INTERVAL_SECONDS" == "5" ]] || {
+    printf 'duplicate suppression readiness changed its re-prime cadence\n' >&2
+    return 1
+  }
 
-  local failure_status=0
+  (
+    local -i prime_calls=0
+    local -i fetch_calls=0
+    local -i first_prime_at=-1
+    local -i second_prime_at=-1
+    RESULT_DIR="$result_dir"
+    SECONDS=100
+    run_bounded() {
+      ((prime_calls += 1))
+      if ((prime_calls == 1)); then
+        first_prime_at="$((SECONDS - 100))"
+      elif ((prime_calls == 2)); then
+        second_prime_at="$((SECONDS - 100))"
+      fi
+    }
+    fetch_obi_metrics() {
+      ((fetch_calls += 1))
+      if ((prime_calls >= 2)); then
+        printf '%s\n' \
+          'obi_avoided_services{service_name="java-backend",service_namespace="apache-java-https",telemetry_type="traces"} 1' \
+          >"$1"
+      else
+        printf '# suppression pending after prime %d\n' "$prime_calls" >"$1"
+      fi
+    }
+    sleep() { SECONDS="$((SECONDS + $1))"; }
+
+    wait_for_java_duplicate_suppression \
+      "$result_dir/repeated-prime.prom" 20
+    [[ "$prime_calls" -eq 2 && "$fetch_calls" -ge 2 &&
+      "$fetch_calls" -le 7 && "$first_prime_at" -ge 0 &&
+      "$first_prime_at" -le 1 &&
+      "$second_prime_at" -ge $((first_prime_at + 5)) &&
+      "$second_prime_at" -le $((first_prime_at + 6)) ]] || return 1
+    java_duplicate_suppression_present "$result_dir/repeated-prime.prom"
+  ) || {
+    printf 'duplicate suppression readiness did not re-prime a missed Java export\n' >&2
+    return 1
+  }
+
+  (
+    RESULT_DIR="$result_dir"
+    wait_for_java_duplicate_suppression_with_policy() {
+      [[ "$1" == "$result_dir/default-readiness.prom" &&
+        "$2" == "$READINESS_TIMEOUT_SECONDS" &&
+        "$3" == "$JAVA_DUPLICATE_SUPPRESSION_PRIME_INTERVAL_SECONDS" ]]
+    }
+
+    wait_for_java_duplicate_suppression "$result_dir/default-readiness.prom"
+  ) || {
+    printf 'duplicate suppression readiness did not use the configured component deadline\n' >&2
+    return 1
+  }
+
+  (
+    local bounded_call=""
+    local curl_command=""
+    local curl_fail=""
+    local curl_max_time=""
+    local curl_max_time_flag=""
+    local curl_show_error=""
+    local curl_silent=""
+    local endpoint=""
+    local extra=""
+    local prime_timeout=""
+    RESULT_DIR="$result_dir"
+    SECONDS=100
+    run_bounded() {
+      bounded_call="$*"
+    }
+    fetch_obi_metrics() {
+      printf '%s\n' \
+        'obi_avoided_services{service_name="java-backend",service_namespace="apache-java-https",telemetry_type="traces"} 1' \
+        >"$1"
+    }
+
+    wait_for_java_duplicate_suppression \
+      "$result_dir/short-deadline.prom" 4
+    read -r prime_timeout curl_command curl_fail curl_silent curl_show_error \
+      curl_max_time_flag curl_max_time endpoint extra <<<"$bounded_call" || return 1
+    [[ "$prime_timeout" =~ ^[1-4]$ && "$curl_command" == "curl" &&
+      "$curl_fail" == "--fail" && "$curl_silent" == "--silent" &&
+      "$curl_show_error" == "--show-error" &&
+      "$curl_max_time_flag" == "--max-time" &&
+      "$curl_max_time" == "$prime_timeout" &&
+      "$endpoint" == "$APACHE_HTTPS_HEALTH_ENDPOINT" && -z "$extra" ]] || return 1
+    java_duplicate_suppression_present "$result_dir/short-deadline.prom"
+  ) || {
+    printf 'duplicate suppression readiness exceeded its short command bound\n' >&2
+    return 1
+  }
+
+  (
+    local -i prime_calls=0
+    local -i fetch_calls=0
+    local -i first_prime_at=-1
+    local -i second_prime_at=-1
+    local -i third_prime_at=-1
+    local last_prime_timeout=""
+    local timeout_status=0
+    RESULT_DIR="$result_dir"
+    SECONDS=100
+    run_bounded() {
+      ((prime_calls += 1))
+      if ((prime_calls == 1)); then
+        first_prime_at="$((SECONDS - 100))"
+      elif ((prime_calls == 2)); then
+        second_prime_at="$((SECONDS - 100))"
+      elif ((prime_calls == 3)); then
+        third_prime_at="$((SECONDS - 100))"
+      fi
+      last_prime_timeout="$1"
+    }
+    fetch_obi_metrics() {
+      ((fetch_calls += 1))
+      printf '# suppression still pending at scrape %d\n' "$fetch_calls" >"$1"
+    }
+    sleep() { SECONDS="$((SECONDS + $1))"; }
+
+    if wait_for_java_duplicate_suppression \
+      "$result_dir/repeated-prime-timeout.prom" 12 >/dev/null 2>&1; then
+      return 1
+    else
+      timeout_status=$?
+    fi
+    [[ "$timeout_status" == "1" && "$prime_calls" -eq 3 &&
+      "$fetch_calls" -ge 3 && "$fetch_calls" -le 12 &&
+      "$first_prime_at" -ge 0 && "$first_prime_at" -le 1 &&
+      "$second_prime_at" -ge $((first_prime_at + 5)) &&
+      "$second_prime_at" -le $((first_prime_at + 6)) &&
+      "$third_prime_at" -ge $((second_prime_at + 5)) &&
+      "$third_prime_at" -le $((second_prime_at + 6)) &&
+      "$last_prime_timeout" =~ ^[1-2]$ ]] || return 1
+    grep -Fqx "# suppression still pending at scrape $fetch_calls" \
+      "$result_dir/repeated-prime-timeout.prom"
+  ) || {
+    printf 'duplicate suppression readiness did not retain its bounded timeout evidence\n' >&2
+    return 1
+  }
+
+  (
+    local -i fetch_calls=0
+    local curl_command=""
+    local curl_fail=""
+    local curl_max_time=""
+    local curl_max_time_flag=""
+    local curl_show_error=""
+    local curl_silent=""
+    local endpoint=""
+    local extra=""
+    local fetch_timeout=""
+    local prime_timeout=""
+    local timeout_status=0
+    RESULT_DIR="$result_dir"
+    SECONDS=100
+    run_bounded() {
+      printf '%s\n' "$*" >"$result_dir/wall-clock-prime-call"
+      # Consume all but four seconds of the current remaining command bound.
+      SECONDS="$((SECONDS + $1 - 4))"
+    }
+    fetch_obi_metrics() {
+      ((fetch_calls += 1))
+      printf '%s\n' "$2" >"$result_dir/wall-clock-fetch-timeout"
+      SECONDS="$((SECONDS + $2))"
+      printf '%s\n' \
+        'obi_avoided_services{service_name="java-backend",service_namespace="apache-java-https",telemetry_type="traces"} 1' \
+        >"$1"
+    }
+    sleep() {
+      printf 'called\n' >"$result_dir/wall-clock-sleep-call"
+      SECONDS="$((SECONDS + $1))"
+    }
+
+    if wait_for_java_duplicate_suppression \
+      "$result_dir/wall-clock-timeout.prom" 10 >/dev/null 2>&1; then
+      return 1
+    else
+      timeout_status=$?
+    fi
+    [[ "$timeout_status" == "1" && "$fetch_calls" -eq 1 &&
+      ! -e "$result_dir/wall-clock-sleep-call" ]] || return 1
+    read -r prime_timeout curl_command curl_fail curl_silent curl_show_error \
+      curl_max_time_flag curl_max_time endpoint extra \
+      <"$result_dir/wall-clock-prime-call" || return 1
+    fetch_timeout="$(<"$result_dir/wall-clock-fetch-timeout")" || return 1
+    [[ "$prime_timeout" =~ ^[1-9]$|^10$ && "$curl_command" == "curl" &&
+      "$curl_fail" == "--fail" && "$curl_silent" == "--silent" &&
+      "$curl_show_error" == "--show-error" &&
+      "$curl_max_time_flag" == "--max-time" &&
+      "$curl_max_time" == "$prime_timeout" &&
+      "$endpoint" == "$APACHE_HTTPS_HEALTH_ENDPOINT" && -z "$extra" &&
+      "$fetch_timeout" =~ ^[1-4]$ ]] || return 1
+    java_duplicate_suppression_present \
+      "$result_dir/wall-clock-timeout.prom"
+  ) || {
+    printf 'duplicate suppression readiness accepted a scrape after its wall-clock deadline\n' >&2
+    return 1
+  }
+
+  (
+    local timeout_status=0
+    RESULT_DIR="$result_dir"
+    SECONDS=100
+    run_bounded() { return 0; }
+    fetch_obi_metrics() {
+      printf '%s\n' \
+        'obi_avoided_services{service_name="java-backend",service_namespace="apache-java-https",telemetry_type="traces"} 1' \
+        >"$1"
+    }
+    java_duplicate_suppression_present() {
+      SECONDS="$((SECONDS + 20))"
+      return 0
+    }
+    sleep() { printf 'called\n' >"$result_dir/predicate-sleep-call"; }
+
+    if wait_for_java_duplicate_suppression \
+      "$result_dir/predicate-timeout.prom" 20 >/dev/null 2>&1; then
+      return 1
+    else
+      timeout_status=$?
+    fi
+    [[ "$timeout_status" == "1" &&
+      ! -e "$result_dir/predicate-sleep-call" ]] || return 1
+    java_duplicate_suppression_present \
+      "$result_dir/predicate-timeout.prom"
+  ) || {
+    printf 'duplicate suppression readiness accepted a predicate after its deadline\n' >&2
+    return 1
+  }
+
+  (
+    local timeout_status=0
+    RESULT_DIR="$result_dir"
+    SECONDS=100
+    run_bounded() { return 0; }
+    fetch_obi_metrics() {
+      printf '# suppression remains absent\n' >"$1"
+    }
+    java_duplicate_suppression_present() {
+      SECONDS="$((SECONDS + 20))"
+      return 1
+    }
+    sleep() { printf 'called\n' >"$result_dir/false-predicate-sleep-call"; }
+
+    if wait_for_java_duplicate_suppression \
+      "$result_dir/false-predicate-timeout.prom" 20 >/dev/null 2>&1; then
+      return 1
+    else
+      timeout_status=$?
+    fi
+    [[ "$timeout_status" == "1" &&
+      ! -e "$result_dir/false-predicate-sleep-call" ]] || return 1
+    grep -Fqx '# suppression remains absent' \
+      "$result_dir/false-predicate-timeout.prom"
+  ) || {
+    printf 'duplicate suppression readiness slept after an expired false predicate\n' >&2
+    return 1
+  }
+
+  (
+    local -i publication_calls=0
+    local timeout_status=0
+    RESULT_DIR="$result_dir"
+    SECONDS=100
+    run_bounded() { return 0; }
+    fetch_obi_metrics() {
+      printf '%s\n' \
+        'obi_avoided_services{service_name="java-backend",service_namespace="apache-java-https",telemetry_type="traces"} 1' \
+        >"$1"
+    }
+    install() {
+      command install "$@" || return $?
+      if [[ "$*" == *" $result_dir/publication-timeout.prom" ]]; then
+        ((publication_calls += 1))
+        SECONDS="$((SECONDS + 20))"
+      fi
+    }
+    sleep() { return 1; }
+
+    if wait_for_java_duplicate_suppression \
+      "$result_dir/publication-timeout.prom" 20 >/dev/null 2>&1; then
+      return 1
+    else
+      timeout_status=$?
+    fi
+    [[ "$timeout_status" == "1" && "$publication_calls" -eq 1 ]] || return 1
+    java_duplicate_suppression_present \
+      "$result_dir/publication-timeout.prom"
+  ) || {
+    printf 'duplicate suppression readiness accepted publication after its deadline\n' >&2
+    return 1
+  }
+
+  (
+    local -i fetch_calls=0
+    local timeout_status=0
+    RESULT_DIR="$result_dir"
+    SECONDS=100
+    run_bounded() { return 0; }
+    fetch_obi_metrics() {
+      ((fetch_calls += 1))
+      if ((fetch_calls == 1)); then
+        printf '# last successful suppression scrape\n' >"$1"
+        return 0
+      fi
+      : >"$1"
+      return 1
+    }
+    sleep() { SECONDS="$((SECONDS + $1))"; }
+
+    if wait_for_java_duplicate_suppression \
+      "$result_dir/fetch-gap-timeout.prom" 12 >/dev/null 2>&1; then
+      return 1
+    else
+      timeout_status=$?
+    fi
+    [[ "$timeout_status" == "1" && "$fetch_calls" -ge 2 &&
+      "$fetch_calls" -le 12 ]] || return 1
+    grep -Fqx '# last successful suppression scrape' \
+      "$result_dir/fetch-gap-timeout.prom"
+  ) || {
+    printf 'duplicate suppression readiness lost its last successful timeout scrape\n' >&2
+    return 1
+  }
+
+  (
+    local -i fetch_calls=0
+    local -i prime_calls=0
+    local prime_status=0
+    RESULT_DIR="$result_dir"
+    SECONDS=100
+    run_bounded() {
+      ((prime_calls += 1))
+      ((prime_calls == 1)) && return 0
+      return 47
+    }
+    fetch_obi_metrics() {
+      ((fetch_calls += 1))
+      printf '# scrape retained before failed re-prime\n' >"$1"
+    }
+    sleep() { SECONDS="$((SECONDS + $1))"; }
+
+    if wait_for_java_duplicate_suppression \
+      "$result_dir/prime-failure-retained.prom" 20 >/dev/null 2>&1; then
+      return 1
+    else
+      prime_status=$?
+    fi
+    [[ "$prime_status" == "47" && "$prime_calls" -eq 2 &&
+      "$fetch_calls" -ge 1 && "$fetch_calls" -le 5 ]] || return 1
+    grep -Fqx '# scrape retained before failed re-prime' \
+      "$result_dir/prime-failure-retained.prom"
+  ) || {
+    printf 'duplicate suppression readiness lost evidence on re-prime failure\n' >&2
+    return 1
+  }
+
+  (
+    RESULT_DIR="$result_dir"
+    run_bounded() {
+      printf 'unexpected-prime\n' >>"$observed"
+      return 1
+    }
+    fetch_obi_metrics() {
+      printf '%s\n' \
+        'obi_avoided_services{service_name="java-backend",service_namespace="apache-java-https",telemetry_type="traces"} 1' \
+        >"$1"
+    }
+
+    wait_for_java_duplicate_suppression_without_prime \
+      "$result_dir/no-prime.prom" 30
+  ) || {
+    printf 'duplicate suppression passive readiness did not accept its metric\n' >&2
+    return 1
+  }
+  if grep -Fqx 'unexpected-prime' "$observed"; then
+    printf 'duplicate suppression passive readiness generated traffic\n' >&2
+    return 1
+  fi
+
   if (
     RESULT_DIR="$result_dir"
     run_bounded() { return 23; }
@@ -5510,6 +5894,7 @@ test_security_probe_window_covers_metric_fences() {
   (
     local -i configured_same_cgroup=0
     local -i configured_sibling=0
+    local -i required_full_control=0
     local -i required_same_cgroup=0
     local -i required_sibling=0
     local -i readiness_timeout=0
@@ -5525,15 +5910,18 @@ test_security_probe_window_covers_metric_fences() {
         (2 * readiness_timeout) + 193 + (repeat_count * 232)
       ))
       required_sibling=$((required_same_cgroup + readiness_timeout + 408))
+      required_full_control=$((
+        required_sibling + (3 * readiness_timeout) + PRIMARY_LIVE_FD_FIXED_BUDGET_SECONDS
+      ))
       ((configured_same_cgroup > required_same_cgroup)) || return 1
       ((configured_sibling > required_sibling)) || return 1
       ((configured_sibling > configured_same_cgroup)) || return 1
       ((configured_sibling <= MAX_SECURITY_PROBE_TIMEOUT_SECONDS)) || return 1
+      ((required_full_control < MAX_SECURITY_PROBE_TIMEOUT_SECONDS)) || return 1
     done <<'EOF'
 90 1
 120 1
-90 10
-119 10
+69 10
 EOF
     if (
       READINESS_TIMEOUT_SECONDS="$MAX_SHELL_INTEGER"
@@ -5543,7 +5931,7 @@ EOF
       return 1
     fi
     if (
-      READINESS_TIMEOUT_SECONDS=120
+      READINESS_TIMEOUT_SECONDS=70
       REPEAT_COUNT=10
       configure_security_probe_timeouts
     ) >/dev/null 2>&1; then

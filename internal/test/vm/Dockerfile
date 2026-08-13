@@ -23,7 +23,8 @@ RUN apk update && apk add --no-cache \
     iptables-legacy \
     make \
     openjdk21-jre-headless \
-    openrc
+    openrc \
+    util-linux-misc
 
 # Default iptables symlink to legacy; modules-load may relink to nft on
 # RHEL kernels that lack CONFIG_IP_NF_NAT modules.
@@ -131,7 +132,8 @@ RUN chmod +x /etc/init.d/modules-load && \
     rc-update add localmount default && \
     rc-update add docker default && \
     echo ttyS0::respawn:/sbin/agetty --autologin root ttyS0 vt100 >> /etc/inittab && \
-    mkdir -p /overlay/upper/testoutput /overlay/work /build /obi
+    mkdir -p /overlay/upper/testoutput /overlay/work /build /obi && \
+    chown 65534:65534 /overlay/upper
 
 # msize=524288: the default 9p block size (8192) silently truncates large
 # reads (e.g. go.sum ~100KB), surfacing as "malformed go.sum: wrong number
@@ -185,12 +187,13 @@ RUN cat <<'EOF' > /startup.sh
 
 export PATH=$PATH:/usr/local/go/bin
 export HOME=/root
-# Use /build (overlay-backed, ~20G) rather than tmpfs /tmp for Go's build
-# cache and tempdir. The Go toolchain writes hundreds of MB per build (vet
-# cfgs, importcfgs, intermediate objects), which exhausts the default
-# tmpfs allotment on a 2GB-RAM VM and breaks `run-bpf-verifier-vm`.
-export GOCACHE=/build/gocache
-export TMPDIR=/build/tmp
+# Use the VM image's private ext4 storage rather than either the repository
+# overlay or tmpfs /tmp. Go writes hundreds of MB per build, but those files
+# must not appear as source-tree changes in provenance-sensitive tests. The
+# overlay upper root is owned by the benchmark's unprivileged identity so the
+# merged /build repository is not root-owned when source provenance is read.
+export GOCACHE=/overlay/gocache
+export TMPDIR=/overlay/tmp
 mkdir -p "$HOME" "$GOCACHE" "$TMPDIR"
 git config --global --add safe.directory /build
 

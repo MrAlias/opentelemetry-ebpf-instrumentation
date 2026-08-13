@@ -140,15 +140,45 @@ jobs:
           MODULES_DIR: ${{ steps.kernel.outputs.modules-dir }}
         run: |
           set -Eeuo pipefail
-          mkdir -p testoutput/java-remote-parent-rhel9.6-kernel-sockopt
+          output_dir=testoutput/java-remote-parent-rhel9.6-kernel-sockopt
+          runner_uid="$(id -u)"
+          runner_gid="$(id -g)"
+          install -d -m 0700 "$output_dir"
+          vm_workdir="$(mktemp -d -- "$RUNNER_TEMP/java-remote-parent-rhel-vm.XXXXXX")"
+          chmod 0700 "$vm_workdir"
+          launch_status=0
+          set +e
           sudo make -C internal/test/vm \
-            WORKDIR="$(pwd)" \
+            WORKDIR="$vm_workdir" \
             KERNEL="$KERNEL" \
             MODULES_DIR="$MODULES_DIR" \
             ARCH=amd64 \
             TARGET_TEST=run-java-remote-parent-rhel-kernel-sockopt-vm \
-            2>&1 | tee testoutput/java-remote-parent-rhel9.6-kernel-sockopt/vm-console.log
+            2>&1 | tee "$output_dir/vm-console.log"
+          launch_status="${PIPESTATUS[0]}"
+          set -e
+          ownership_status=0
+          sudo chown -R -- "$runner_uid:$runner_gid" testoutput || ownership_status=$?
+          sudo chown -R -- "$runner_uid:$runner_gid" "$vm_workdir" || ownership_status=$?
+          cleanup_status=0
+          rm -rf -- "$vm_workdir" || cleanup_status=$?
+          if (( launch_status != 0 )); then
+            exit "$launch_status"
+          fi
+          (( ownership_status == 0 )) || exit "$ownership_status"
+          (( cleanup_status == 0 )) || exit "$cleanup_status"
           test -f testoutput/success
+
+      - name: Verify CI source remained clean
+        if: always()
+        run: |
+          set -Eeuo pipefail
+          status="$(git status --porcelain=v1 --untracked-files=all -- . ':!testoutput')"
+          if [[ -n "$status" ]]; then
+            printf '%s\n' 'CI source changed during RHEL validation:' >&2
+            printf '%s\n' "$status" >&2
+            exit 1
+          fi
 
       - name: Upload RHEL kernel sockopt preflight evidence
         if: always()

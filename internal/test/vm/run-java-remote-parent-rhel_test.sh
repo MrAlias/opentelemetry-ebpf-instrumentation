@@ -308,6 +308,147 @@ test_relative_agent_path_resolution() {
         test_fail 'relative Java agent path did not resolve from the invoking directory'
 }
 
+require_rhel_workflow_vm_contract() {
+    local -r workflow="$1"
+    local mktemp_line=""
+    local launch_line=""
+    local chown_line=""
+    local cleanup_line=""
+    local rethrow_line=""
+
+    grep -Fq -- "vm_workdir=\"\$(mktemp -d -- \"\$RUNNER_TEMP/java-remote-parent-rhel-vm.XXXXXX\")\"" \
+        "$workflow" || return 1
+    grep -Fq -- "WORKDIR=\"\$vm_workdir\"" "$workflow" || return 1
+    ! grep -Fq -- "WORKDIR=\"\$(pwd)\"" "$workflow" || return 1
+    grep -Fq -- "runner_uid=\"\$(id -u)\"" "$workflow" || return 1
+    grep -Fq -- "runner_gid=\"\$(id -g)\"" "$workflow" || return 1
+    grep -Fq -- "sudo chown -R -- \"\$runner_uid:\$runner_gid\" testoutput" "$workflow" || return 1
+    grep -Fq -- "exit \"\$launch_status\"" "$workflow" || return 1
+    grep -Fq -- "rm -rf -- \"\$vm_workdir\"" "$workflow" || return 1
+    mktemp_line="$(grep -Fn -- "vm_workdir=\"\$(mktemp -d --" "$workflow" | cut -d: -f1)"
+    launch_line="$(grep -Fn -- 'sudo make -C internal/test/vm' "$workflow" | cut -d: -f1)"
+    chown_line="$(grep -Fn -- "sudo chown -R -- \"\$runner_uid:\$runner_gid\" testoutput" "$workflow" | cut -d: -f1)"
+    cleanup_line="$(grep -Fn -- "rm -rf -- \"\$vm_workdir\"" "$workflow" | cut -d: -f1)"
+    rethrow_line="$(grep -Fn -- "exit \"\$launch_status\"" "$workflow" | cut -d: -f1)"
+    [[ "$mktemp_line" =~ ^[1-9][0-9]*$ && "$launch_line" =~ ^[1-9][0-9]*$ && \
+        "$chown_line" =~ ^[1-9][0-9]*$ && "$cleanup_line" =~ ^[1-9][0-9]*$ && \
+        "$rethrow_line" =~ ^[1-9][0-9]*$ && \
+        mktemp_line -lt launch_line && launch_line -lt chown_line && \
+        chown_line -lt cleanup_line && cleanup_line -lt rethrow_line ]]
+}
+
+require_rhel_vm_image_contract() {
+    local -r dockerfile="$1"
+
+    grep -Eq -- '^[[:space:]]+util-linux-misc$' "$dockerfile" || return 1
+    grep -Fq -- 'chown 65534:65534 /overlay/upper' "$dockerfile" || return 1
+    grep -Fq -- 'export GOCACHE=/overlay/gocache' "$dockerfile" || return 1
+    grep -Fq -- 'export TMPDIR=/overlay/tmp' "$dockerfile" || return 1
+    ! grep -Fq -- 'export GOCACHE=/build/' "$dockerfile" || return 1
+    ! grep -Fq -- 'export TMPDIR=/build/' "$dockerfile" || return 1
+}
+
+test_rhel_ci_is_private_and_preserves_launch_status() {
+    local -r workflow="${SCRIPT_DIR}/../../../.github/workflows/java_remote_parent_rhel.yml"
+    local -r valid="${TEST_TMP_DIR}/workflow-valid.yml"
+    local -r repo_workdir="${TEST_TMP_DIR}/workflow-repo-workdir.yml"
+    local -r missing_chown="${TEST_TMP_DIR}/workflow-missing-chown.yml"
+    local -r masked_status="${TEST_TMP_DIR}/workflow-masked-status.yml"
+    local -r missing_cleanup="${TEST_TMP_DIR}/workflow-missing-cleanup.yml"
+
+    track_fixture "$valid"
+    cp -- "$workflow" "$valid"
+    require_rhel_workflow_vm_contract "$valid" || \
+        test_fail 'RHEL workflow lost its private VM/status-recovery contract'
+    write_mutated_fixture "$repo_workdir" "$valid" \
+        "s/WORKDIR=\"\$vm_workdir\"/WORKDIR=\"\$(pwd)\"/"
+    write_mutated_fixture "$missing_chown" "$valid" \
+        "/sudo chown -R -- \"\$runner_uid:\$runner_gid\" testoutput/d"
+    write_mutated_fixture "$masked_status" "$valid" \
+        "s/exit \"\$launch_status\"/exit \"\$ownership_status\"/"
+    write_mutated_fixture "$missing_cleanup" "$valid" \
+        "/rm -rf -- \"\$vm_workdir\"/d"
+    for mutation in "$repo_workdir" "$missing_chown" "$masked_status" "$missing_cleanup"; do
+        if require_rhel_workflow_vm_contract "$mutation" >/dev/null 2>&1; then
+            test_fail "RHEL workflow validator accepted mutation: ${mutation}"
+        fi
+    done
+}
+
+test_rhel_vm_installs_setpriv_without_dirtying_source() {
+    local -r dockerfile="${SCRIPT_DIR}/Dockerfile"
+    local -r valid="${TEST_TMP_DIR}/Dockerfile.valid"
+    local -r missing_setpriv="${TEST_TMP_DIR}/Dockerfile.missing-setpriv"
+    local -r root_owned_source="${TEST_TMP_DIR}/Dockerfile.root-owned-source"
+    local -r repository_cache="${TEST_TMP_DIR}/Dockerfile.repository-cache"
+
+    track_fixture "$valid"
+    cp -- "$dockerfile" "$valid"
+    require_rhel_vm_image_contract "$valid" || \
+        test_fail 'RHEL VM image lost setpriv or private build storage'
+    write_mutated_fixture "$missing_setpriv" "$valid" '/^[[:space:]]*util-linux-misc$/d'
+    write_mutated_fixture "$root_owned_source" "$valid" \
+        '/chown 65534:65534 \/overlay\/upper/d'
+    write_mutated_fixture "$repository_cache" "$valid" \
+        's|export GOCACHE=/overlay/gocache|export GOCACHE=/build/gocache|'
+    for mutation in "$missing_setpriv" "$root_owned_source" "$repository_cache"; do
+        if require_rhel_vm_image_contract "$mutation" >/dev/null 2>&1; then
+            test_fail "RHEL VM image validator accepted mutation: ${mutation}"
+        fi
+    done
+}
+
+test_packaged_jvm_runner_contract() {
+    local build_function=""
+    local benchmark_function=""
+    local validation_function=""
+    local main_function=""
+    local transport_line=""
+    local packaged_line=""
+    local validate_line=""
+    local gate_line=""
+    local status_line=""
+
+    build_function="$(declare -f build_packaged_jvm_benchmark_test_binary)"
+    benchmark_function="$(declare -f run_packaged_jvm_benchmark)"
+    validation_function="$(declare -f require_packaged_jvm_benchmark_artifact)"
+    main_function="$(declare -f main)"
+    [[ "$build_function" == *'go test -c -tags=privileged_tests'* && \
+        "$build_function" == *'umask 077'* && \
+        "$benchmark_function" == *'command -v setpriv'* && \
+        "$benchmark_function" == *'benchmark_environment=("HOME=/root" "LANG=C" "LC_ALL=C" "PATH=/usr/local/go/bin:/usr/bin:/bin" "TMPDIR=/tmp" "TZ=UTC"'* && \
+        "$benchmark_function" == *"OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_EXCLUSIVE_CGROUP_BPF=\$PACKAGED_JVM_EXCLUSIVE_CGROUP_BPF_PREMISE"* && \
+        "$benchmark_function" == *"env -i \"\${benchmark_environment[@]}\""* && \
+        "$benchmark_function" == *'packaged-jvm-benchmark-root-environment.txt'* && \
+        "$benchmark_function" == *'userspace=Alpine Linux'* && \
+        "$benchmark_function" == *'kernel_input=RHEL 9.6 LVH pinned artifact'* && \
+        "$validation_function" == *'VALIDATE_CI_CROSSLINKS=1'* ]] || \
+        test_fail 'packaged JVM benchmark lost compile, environment, or identity contracts'
+
+    transport_line="$(awk '/run_transport_benchmark/ { line = NR } END { print line }' <<<"$main_function")"
+    packaged_line="$(awk '/run_packaged_jvm_benchmark/ { line = NR } END { print line }' <<<"$main_function")"
+    [[ "$transport_line" =~ ^[1-9][0-9]*$ && "$packaged_line" =~ ^[1-9][0-9]*$ && \
+        transport_line -lt packaged_line ]] || \
+        test_fail 'packaged JVM benchmark is not the final benchmark run'
+
+    validate_line="$(awk '/require_packaged_jvm_benchmark_artifact/ { print NR; exit }' <<<"$benchmark_function")"
+    gate_line="$(awk '/packaged_jvm_benchmark_artifact_gates_pass/ { print NR; exit }' <<<"$benchmark_function")"
+    status_line="$(awk '/test_status == 0/ { line = NR } END { print line }' <<<"$benchmark_function")"
+    [[ "$validate_line" =~ ^[1-9][0-9]*$ && "$gate_line" =~ ^[1-9][0-9]*$ && \
+        "$status_line" =~ ^[1-9][0-9]*$ && \
+        validate_line -lt gate_line && gate_line -lt status_line ]] || \
+        test_fail 'packaged JVM artifact is not validated before latency/test failure propagation'
+
+    if (require_packaged_jvm_benchmark_artifact \
+        "${TEST_TMP_DIR}/absent-packaged-jvm.json" \
+        "${TEST_TMP_DIR}/absent-validation.log" \
+        /missing/agent /missing/test 0123456789abcdef0123456789abcdef01234567 \
+        5.14.0-test /usr/bin/java /missing/sockopt.o /missing/sockops.o \
+        >/dev/null 2>&1); then
+        test_fail 'packaged JVM validator accepted an absent artifact'
+    fi
+}
+
 run_tests() {
     local -r valid="${TEST_TMP_DIR}/valid.json"
     local -r strict_getsockopt_failure="${TEST_TMP_DIR}/strict-getsockopt-failure.json"
@@ -373,6 +514,9 @@ run_tests() {
     test_relative_artifact_path_resolution
     test_artifact_path_preserves_symlinks
     test_relative_agent_path_resolution
+    test_rhel_ci_is_private_and_preserves_launch_status
+    test_rhel_vm_installs_setpriv_without_dirtying_source
+    test_packaged_jvm_runner_contract
     printf '%s\n' 'RHEL verifier and transport benchmark validator tests passed'
 }
 

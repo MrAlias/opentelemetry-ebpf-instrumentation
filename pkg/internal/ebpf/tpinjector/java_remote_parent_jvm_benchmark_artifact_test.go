@@ -8,6 +8,7 @@ package tpinjector
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -31,35 +32,43 @@ import (
 )
 
 const (
-	javaRemoteParentPackagedJVMBenchmarkEnv                   = "OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK"
-	javaRemoteParentPackagedJVMBenchmarkArtifactEnv           = "OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_ARTIFACT"
-	javaRemoteParentPackagedJVMBenchmarkValidateArtifactEnv   = "OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_VALIDATE_ARTIFACT"
-	javaRemoteParentPackagedJVMBenchmarkExclusiveCgroupBPFEnv = "OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_EXCLUSIVE_CGROUP_BPF"
-	packagedJVMBenchmarkArtifactSchemaVersion                 = 1
-	packagedJVMBenchmarkArtifactName                          = "java_remote_parent_packaged_jvm_getsockopt"
-	packagedJVMBenchmarkHarness                               = "packaged_agent_java_jni_cgroup_getsockopt"
-	packagedJVMBenchmarkWarmupIterations                      = 16
-	packagedJVMBenchmarkMeasurementIterations                 = 256
-	packagedJVMBenchmarkConcurrency                           = 1
-	packagedJVMBenchmarkJavaID                                = 65534
-	packagedJVMBenchmarkP99LimitNS                            = int64(time.Millisecond)
-	packagedJVMBenchmarkGateKind                              = "p99_lt"
-	packagedJVMBenchmarkTimedCall                             = "System.nanoTime around BootstrapNative.takeRemoteParent(fd,reused_byte_array)"
-	packagedJVMBenchmarkResponseStorage                       = "one reused 64-byte Java byte array"
-	packagedJVMBenchmarkAgentOptions                          = "remoteParentTransport=disabled"
-	packagedJVMBenchmarkProbeClass                            = "io.opentelemetry.obi.java.probe.RemoteParentGetsockoptBenchmarkProbe"
-	packagedJVMBenchmarkMissControl                           = "assert exact negotiated process, incarnation, connection, namespace, and generation; delete only java_remote_parent_state; retain and exactly assert owner and generation index; preserve generation; restore state; run full cleanup"
-	packagedJVMBenchmarkAgentBinding                          = "opened read-only fd 3; fstat and SHA-256 before and after execution"
-	packagedJVMBenchmarkMaxArtifactBytes                      = 1 << 20
-	packagedJVMBenchmarkEffectiveQueryFlag                    = "BPF_F_QUERY_EFFECTIVE"
-	packagedJVMBenchmarkCgroupRoot                            = "/sys/fs/cgroup"
-	packagedJVMBenchmarkRevisionAndIdentityMode               = "revision_and_identity"
-	packagedJVMBenchmarkBoundaryIdentityOnlyMode              = "boundary_identity_only"
-	packagedJVMBenchmarkRevisionAndIdentityEvidence           = "exact boundary identities and supported direct revisions unchanged"
-	packagedJVMBenchmarkBoundaryIdentityOnlyEvidence          = "exact boundary identities unchanged; attach-detach completed between queries cannot be excluded"
-	packagedJVMBenchmarkExclusiveTopologyPremise              = "operator_controlled_no_concurrent_cgroup_bpf_mutation"
-	packagedJVMBenchmarkRevisionPremiseNotRequired            = "not_required_all_direct_queries_revision_supported"
-	packagedJVMBenchmarkExpectedCalls                         = 2 * (packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations)
+	javaRemoteParentPackagedJVMBenchmarkEnv                     = "OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK"
+	javaRemoteParentPackagedJVMBenchmarkArtifactEnv             = "OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_ARTIFACT"
+	javaRemoteParentPackagedJVMBenchmarkValidateArtifactEnv     = "OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_VALIDATE_ARTIFACT"
+	javaRemoteParentPackagedJVMBenchmarkValidateCICrosslinksEnv = "OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_VALIDATE_CI_CROSSLINKS"
+	javaRemoteParentPackagedJVMBenchmarkValidateAgentEnv        = "OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_VALIDATE_AGENT"
+	javaRemoteParentPackagedJVMBenchmarkValidateTestBinaryEnv   = "OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_VALIDATE_TEST_BINARY"
+	javaRemoteParentPackagedJVMBenchmarkValidateRevisionEnv     = "OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_VALIDATE_REVISION"
+	javaRemoteParentPackagedJVMBenchmarkValidateKernelEnv       = "OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_VALIDATE_KERNEL"
+	javaRemoteParentPackagedJVMBenchmarkValidateJavaEnv         = "OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_VALIDATE_JAVA"
+	javaRemoteParentPackagedJVMBenchmarkValidateSockoptBPFEnv   = "OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_VALIDATE_SOCKOPT_BPF"
+	javaRemoteParentPackagedJVMBenchmarkValidateSockopsBPFEnv   = "OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_VALIDATE_SOCKOPS_BPF"
+	javaRemoteParentPackagedJVMBenchmarkExclusiveCgroupBPFEnv   = "OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_EXCLUSIVE_CGROUP_BPF"
+	packagedJVMBenchmarkArtifactSchemaVersion                   = 1
+	packagedJVMBenchmarkArtifactName                            = "java_remote_parent_packaged_jvm_getsockopt"
+	packagedJVMBenchmarkHarness                                 = "packaged_agent_java_jni_cgroup_getsockopt"
+	packagedJVMBenchmarkWarmupIterations                        = 16
+	packagedJVMBenchmarkMeasurementIterations                   = 256
+	packagedJVMBenchmarkConcurrency                             = 1
+	packagedJVMBenchmarkJavaID                                  = 65534
+	packagedJVMBenchmarkP99LimitNS                              = int64(time.Millisecond)
+	packagedJVMBenchmarkGateKind                                = "p99_lt"
+	packagedJVMBenchmarkTimedCall                               = "System.nanoTime around BootstrapNative.takeRemoteParent(fd,reused_byte_array)"
+	packagedJVMBenchmarkResponseStorage                         = "one reused 64-byte Java byte array"
+	packagedJVMBenchmarkAgentOptions                            = "remoteParentTransport=disabled"
+	packagedJVMBenchmarkProbeClass                              = "io.opentelemetry.obi.java.probe.RemoteParentGetsockoptBenchmarkProbe"
+	packagedJVMBenchmarkMissControl                             = "assert exact negotiated process, incarnation, connection, namespace, and generation; delete only java_remote_parent_state; retain and exactly assert owner and generation index; preserve generation; restore state; run full cleanup"
+	packagedJVMBenchmarkAgentBinding                            = "opened read-only fd 3; fstat and SHA-256 before and after execution"
+	packagedJVMBenchmarkMaxArtifactBytes                        = 1 << 20
+	packagedJVMBenchmarkEffectiveQueryFlag                      = "BPF_F_QUERY_EFFECTIVE"
+	packagedJVMBenchmarkCgroupRoot                              = "/sys/fs/cgroup"
+	packagedJVMBenchmarkRevisionAndIdentityMode                 = "revision_and_identity"
+	packagedJVMBenchmarkBoundaryIdentityOnlyMode                = "boundary_identity_only"
+	packagedJVMBenchmarkRevisionAndIdentityEvidence             = "exact boundary identities and supported direct revisions unchanged"
+	packagedJVMBenchmarkBoundaryIdentityOnlyEvidence            = "exact boundary identities unchanged; attach-detach completed between queries cannot be excluded"
+	packagedJVMBenchmarkExclusiveTopologyPremise                = "operator_controlled_no_concurrent_cgroup_bpf_mutation"
+	packagedJVMBenchmarkRevisionPremiseNotRequired              = "not_required_all_direct_queries_revision_supported"
+	packagedJVMBenchmarkExpectedCalls                           = 2 * (packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations)
 )
 
 var expectedPackagedJVMBenchmarkCgroupAttachTypes = []string{
@@ -159,6 +168,16 @@ type packagedJVMBenchmarkArtifactFileIdentity struct {
 type packagedJVMBenchmarkArtifactBlobIdentity struct {
 	SHA256 string `json:"sha256"`
 	Size   int    `json:"size"`
+}
+
+type packagedJVMBenchmarkArtifactCICrosslinks struct {
+	Revision           string
+	KernelRelease      string
+	JavaExecutable     string
+	AgentArtifact      packagedJVMBenchmarkArtifactFileIdentity
+	TestBinary         packagedJVMBenchmarkArtifactFileIdentity
+	SockoptBPFArtifact packagedJVMBenchmarkArtifactBlobIdentity
+	SockopsBPFArtifact packagedJVMBenchmarkArtifactBlobIdentity
 }
 
 type packagedJVMBenchmarkSourceOwner struct {
@@ -1124,6 +1143,113 @@ func validatePackagedJVMBenchmarkFileIdentity(identity packagedJVMBenchmarkArtif
 		return errors.New("SHA-256, device, inode, or size is invalid")
 	}
 	return nil
+}
+
+func packagedJVMBenchmarkFileIdentityAtPath(
+	path string,
+) (packagedJVMBenchmarkArtifactFileIdentity, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return packagedJVMBenchmarkArtifactFileIdentity{}, errors.New(
+			"packaged JVM benchmark crosslink path must be absolute and clean",
+		)
+	}
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return packagedJVMBenchmarkArtifactFileIdentity{}, fmt.Errorf(
+			"open packaged JVM benchmark crosslink: %w", err,
+		)
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		_ = unix.Close(fd)
+		return packagedJVMBenchmarkArtifactFileIdentity{}, errors.New(
+			"create packaged JVM benchmark crosslink file handle",
+		)
+	}
+	defer file.Close()
+
+	var before unix.Stat_t
+	if err := unix.Fstat(fd, &before); err != nil {
+		return packagedJVMBenchmarkArtifactFileIdentity{}, fmt.Errorf(
+			"stat packaged JVM benchmark crosslink: %w", err,
+		)
+	}
+	if before.Mode&unix.S_IFMT != unix.S_IFREG || before.Size <= 0 {
+		return packagedJVMBenchmarkArtifactFileIdentity{}, errors.New(
+			"packaged JVM benchmark crosslink is not a nonempty regular file",
+		)
+	}
+	digest := sha256.New()
+	if _, err := io.Copy(digest, io.NewSectionReader(file, 0, before.Size)); err != nil {
+		return packagedJVMBenchmarkArtifactFileIdentity{}, fmt.Errorf(
+			"hash packaged JVM benchmark crosslink: %w", err,
+		)
+	}
+	var after unix.Stat_t
+	if err := unix.Fstat(fd, &after); err != nil {
+		return packagedJVMBenchmarkArtifactFileIdentity{}, fmt.Errorf(
+			"restat packaged JVM benchmark crosslink: %w", err,
+		)
+	}
+	if before.Dev != after.Dev || before.Ino != after.Ino ||
+		before.Mode != after.Mode || before.Size != after.Size ||
+		before.Mtim != after.Mtim || before.Ctim != after.Ctim {
+		return packagedJVMBenchmarkArtifactFileIdentity{}, errors.New(
+			"packaged JVM benchmark crosslink changed while hashing",
+		)
+	}
+	return packagedJVMBenchmarkArtifactFileIdentity{
+		SHA256: hex.EncodeToString(digest.Sum(nil)),
+		Device: uint64(before.Dev),
+		Inode:  before.Ino,
+		Size:   before.Size,
+	}, nil
+}
+
+func validatePackagedJVMBenchmarkArtifactCICrosslinks(
+	artifact packagedJVMBenchmarkArtifact,
+	crosslinks packagedJVMBenchmarkArtifactCICrosslinks,
+) error {
+	if artifact.Source.Dirty || artifact.Source.Revision != crosslinks.Revision {
+		return errors.New("packaged JVM benchmark CI source crosslink is invalid")
+	}
+	if artifact.Runtime.KernelRelease != crosslinks.KernelRelease {
+		return errors.New("packaged JVM benchmark CI kernel crosslink is invalid")
+	}
+	if artifact.Runtime.JavaExecutable != crosslinks.JavaExecutable {
+		return errors.New("packaged JVM benchmark CI Java crosslink is invalid")
+	}
+	if artifact.Inputs.AgentArtifact != crosslinks.AgentArtifact {
+		return errors.New("packaged JVM benchmark CI agent artifact crosslink is invalid")
+	}
+	if artifact.Inputs.TestBinary != crosslinks.TestBinary {
+		return errors.New("packaged JVM benchmark CI test binary crosslink is invalid")
+	}
+	if artifact.Inputs.SockoptBPF != crosslinks.SockoptBPFArtifact {
+		return errors.New("packaged JVM benchmark CI sockopt BPF artifact crosslink is invalid")
+	}
+	if artifact.Inputs.SockopsBPF != crosslinks.SockopsBPFArtifact {
+		return errors.New("packaged JVM benchmark CI sockops BPF artifact crosslink is invalid")
+	}
+	return nil
+}
+
+func packagedJVMBenchmarkBlobIdentityAtPath(
+	path string,
+) (packagedJVMBenchmarkArtifactBlobIdentity, error) {
+	identity, err := packagedJVMBenchmarkFileIdentityAtPath(path)
+	if err != nil {
+		return packagedJVMBenchmarkArtifactBlobIdentity{}, err
+	}
+	if identity.Size > int64(math.MaxInt) {
+		return packagedJVMBenchmarkArtifactBlobIdentity{}, errors.New(
+			"packaged JVM benchmark BPF artifact is too large",
+		)
+	}
+	return packagedJVMBenchmarkArtifactBlobIdentity{
+		SHA256: identity.SHA256,
+		Size:   int(identity.Size),
+	}, nil
 }
 
 func validatePackagedJVMBenchmarkBlobIdentity(identity packagedJVMBenchmarkArtifactBlobIdentity) error {
@@ -2836,6 +2962,121 @@ func TestValidatePackagedJVMBenchmarkArtifactFile(t *testing.T) {
 	defer file.Close()
 	_, err = decodePackagedJVMBenchmarkArtifact(file)
 	require.NoError(t, err)
+}
+
+func TestValidatePackagedJVMBenchmarkArtifactCICrosslinks(t *testing.T) {
+	artifactPath := os.Getenv(javaRemoteParentPackagedJVMBenchmarkValidateArtifactEnv)
+	if artifactPath == "" ||
+		os.Getenv(javaRemoteParentPackagedJVMBenchmarkValidateCICrosslinksEnv) != "1" {
+		t.Skipf(
+			"set %s and %s=1 to validate packaged JVM benchmark CI crosslinks",
+			javaRemoteParentPackagedJVMBenchmarkValidateArtifactEnv,
+			javaRemoteParentPackagedJVMBenchmarkValidateCICrosslinksEnv,
+		)
+	}
+	revision := os.Getenv(javaRemoteParentPackagedJVMBenchmarkValidateRevisionEnv)
+	kernelRelease := os.Getenv(javaRemoteParentPackagedJVMBenchmarkValidateKernelEnv)
+	javaExecutable := os.Getenv(javaRemoteParentPackagedJVMBenchmarkValidateJavaEnv)
+	agentPath := os.Getenv(javaRemoteParentPackagedJVMBenchmarkValidateAgentEnv)
+	testBinaryPath := os.Getenv(javaRemoteParentPackagedJVMBenchmarkValidateTestBinaryEnv)
+	sockoptBPFPath := os.Getenv(javaRemoteParentPackagedJVMBenchmarkValidateSockoptBPFEnv)
+	sockopsBPFPath := os.Getenv(javaRemoteParentPackagedJVMBenchmarkValidateSockopsBPFEnv)
+	require.NotEmpty(t, revision)
+	require.NotEmpty(t, kernelRelease)
+	require.NotEmpty(t, javaExecutable)
+	require.NotEmpty(t, agentPath)
+	require.NotEmpty(t, testBinaryPath)
+	require.NotEmpty(t, sockoptBPFPath)
+	require.NotEmpty(t, sockopsBPFPath)
+
+	file, err := os.Open(artifactPath)
+	require.NoError(t, err)
+	defer file.Close()
+	artifact, err := decodePackagedJVMBenchmarkArtifact(file)
+	require.NoError(t, err)
+	agentIdentity, err := packagedJVMBenchmarkFileIdentityAtPath(agentPath)
+	require.NoError(t, err)
+	testBinaryIdentity, err := packagedJVMBenchmarkFileIdentityAtPath(testBinaryPath)
+	require.NoError(t, err)
+	sockoptBPFIdentity, err := packagedJVMBenchmarkBlobIdentityAtPath(sockoptBPFPath)
+	require.NoError(t, err)
+	sockopsBPFIdentity, err := packagedJVMBenchmarkBlobIdentityAtPath(sockopsBPFPath)
+	require.NoError(t, err)
+	require.NoError(t, validatePackagedJVMBenchmarkArtifactCICrosslinks(
+		artifact,
+		packagedJVMBenchmarkArtifactCICrosslinks{
+			Revision:           revision,
+			KernelRelease:      kernelRelease,
+			JavaExecutable:     javaExecutable,
+			AgentArtifact:      agentIdentity,
+			TestBinary:         testBinaryIdentity,
+			SockoptBPFArtifact: sockoptBPFIdentity,
+			SockopsBPFArtifact: sockopsBPFIdentity,
+		},
+	))
+}
+
+func TestValidatePackagedJVMBenchmarkArtifactCICrosslinksRejectsMutations(t *testing.T) {
+	artifact := validPackagedJVMBenchmarkArtifact()
+	artifact.Source = packagedJVMBenchmarkArtifactSource{
+		Revision:     "0123456789abcdef0123456789abcdef01234567",
+		Dirty:        false,
+		StatusSHA256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		PatchSHA256:  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+	}
+	crosslinks := packagedJVMBenchmarkArtifactCICrosslinks{
+		Revision:           artifact.Source.Revision,
+		KernelRelease:      artifact.Runtime.KernelRelease,
+		JavaExecutable:     artifact.Runtime.JavaExecutable,
+		AgentArtifact:      artifact.Inputs.AgentArtifact,
+		TestBinary:         artifact.Inputs.TestBinary,
+		SockoptBPFArtifact: artifact.Inputs.SockoptBPF,
+		SockopsBPFArtifact: artifact.Inputs.SockopsBPF,
+	}
+	require.NoError(t, validatePackagedJVMBenchmarkArtifactCICrosslinks(
+		artifact, crosslinks,
+	))
+
+	tests := []struct {
+		name   string
+		mutate func(*packagedJVMBenchmarkArtifact, *packagedJVMBenchmarkArtifactCICrosslinks)
+	}{
+		{"dirty source", func(a *packagedJVMBenchmarkArtifact, _ *packagedJVMBenchmarkArtifactCICrosslinks) {
+			a.Source.Dirty = true
+		}},
+		{"revision", func(_ *packagedJVMBenchmarkArtifact, value *packagedJVMBenchmarkArtifactCICrosslinks) {
+			value.Revision = "1123456789abcdef0123456789abcdef01234567"
+		}},
+		{"kernel", func(_ *packagedJVMBenchmarkArtifact, value *packagedJVMBenchmarkArtifactCICrosslinks) {
+			value.KernelRelease += ".changed"
+		}},
+		{"Java", func(_ *packagedJVMBenchmarkArtifact, value *packagedJVMBenchmarkArtifactCICrosslinks) {
+			value.JavaExecutable = "/different/java"
+		}},
+		{"agent", func(_ *packagedJVMBenchmarkArtifact, value *packagedJVMBenchmarkArtifactCICrosslinks) {
+			value.AgentArtifact.SHA256 = strings.Repeat("a", 64)
+		}},
+		{"test binary", func(_ *packagedJVMBenchmarkArtifact, value *packagedJVMBenchmarkArtifactCICrosslinks) {
+			value.TestBinary.Inode++
+		}},
+		{"sockopt BPF", func(_ *packagedJVMBenchmarkArtifact, value *packagedJVMBenchmarkArtifactCICrosslinks) {
+			value.SockoptBPFArtifact.Size++
+		}},
+		{"sockops BPF", func(_ *packagedJVMBenchmarkArtifact, value *packagedJVMBenchmarkArtifactCICrosslinks) {
+			value.SockopsBPFArtifact.SHA256 = strings.Repeat("b", 64)
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mutatedArtifact := artifact
+			mutatedCrosslinks := crosslinks
+			test.mutate(&mutatedArtifact, &mutatedCrosslinks)
+			require.Error(t, validatePackagedJVMBenchmarkArtifactCICrosslinks(
+				mutatedArtifact,
+				mutatedCrosslinks,
+			))
+		})
+	}
 }
 
 func validPackagedJVMBenchmarkArtifact() packagedJVMBenchmarkArtifact {

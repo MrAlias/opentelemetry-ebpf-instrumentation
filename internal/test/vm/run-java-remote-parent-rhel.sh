@@ -13,6 +13,12 @@ readonly VERIFIER_GENERIC_PROFILE='TestBPFVerifierProductionProfiles/generictrac
 readonly VERIFIER_SOCKOPT_PROFILE='TestBPFVerifierProductionProfiles/tpinjector/java-remote-parent'
 readonly PRIVILEGED_TEST_PATTERN='^(TestJavaRemoteParentPrimarySocketAuthority|TestJavaRemoteParentPrimaryRequiresAuthoritativeDataHook|TestJavaRemoteParentPrimaryJVMFaults|TestJavaRemoteParentPrimaryJVMDirectSSLSocket|TestJavaRemoteParentGenericJVMDirectSSLSocket|TestJavaRemoteParentNestedCgroupLifecycle|TestJavaRemoteParentCgroupLinkProcessDeathCleanup|TestJavaRemoteParentCgroupPartialAttachRollback|TestJavaRemoteParentBridgeLoadRequiresPrivileges)$'
 readonly BENCHMARK_TEST_PATTERN='^TestJavaRemoteParentTransportBenchmark$'
+readonly PACKAGED_JVM_BENCHMARK_TEST_PATTERN='^TestJavaRemoteParentPackagedJVMGetsockoptBenchmark$'
+readonly PACKAGED_JVM_BENCHMARK_TEST_NAME='TestJavaRemoteParentPackagedJVMGetsockoptBenchmark'
+readonly PACKAGED_JVM_ARTIFACT_VALIDATOR_PATTERN='^(TestValidatePackagedJVMBenchmarkArtifactFile|TestValidatePackagedJVMBenchmarkArtifactCICrosslinks)$'
+readonly PACKAGED_JVM_ARTIFACT_VALIDATOR_NAME='TestValidatePackagedJVMBenchmarkArtifactFile'
+readonly PACKAGED_JVM_ARTIFACT_CROSSLINK_VALIDATOR_NAME='TestValidatePackagedJVMBenchmarkArtifactCICrosslinks'
+readonly PACKAGED_JVM_EXCLUSIVE_CGROUP_BPF_PREMISE='operator_controlled_no_concurrent_cgroup_bpf_mutation'
 
 fail() {
     printf 'ERROR: %s\n' "$*" >&2
@@ -322,6 +328,43 @@ transport_benchmark_artifact_gates_pass() {
     ! grep -Fq -- '"passed":false' "$artifact_file"
 }
 
+packaged_jvm_benchmark_artifact_gates_pass() {
+    local -r artifact_file="$1"
+
+    ! grep -Fq -- '"passed":false' "$artifact_file"
+}
+
+require_packaged_jvm_benchmark_artifact() {
+    local -r artifact_file="$1"
+    local -r output_file="$2"
+    local -r agent_path="$3"
+    local -r test_binary="$4"
+    local -r source_revision="$5"
+    local -r kernel_release="$6"
+    local -r java_path="$7"
+    local -r sockopt_bpf_path="$8"
+    local -r sockops_bpf_path="$9"
+
+    require_private_benchmark_path "$artifact_file" 'regular file' 600
+    [[ -s "$artifact_file" ]] || \
+        fail "packaged JVM benchmark artifact is missing: ${artifact_file}"
+    OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_VALIDATE_ARTIFACT="$artifact_file" \
+        OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_VALIDATE_CI_CROSSLINKS=1 \
+        OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_VALIDATE_AGENT="$agent_path" \
+        OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_VALIDATE_TEST_BINARY="$test_binary" \
+        OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_VALIDATE_REVISION="$source_revision" \
+        OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_VALIDATE_KERNEL="$kernel_release" \
+        OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_VALIDATE_JAVA="$java_path" \
+        OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_VALIDATE_SOCKOPT_BPF="$sockopt_bpf_path" \
+        OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_VALIDATE_SOCKOPS_BPF="$sockops_bpf_path" \
+        "$OUTPUT_DIR/packaged-jvm-benchmark.test" \
+            -test.v \
+            -test.run "$PACKAGED_JVM_ARTIFACT_VALIDATOR_PATTERN" \
+            2>&1 | tee "$output_file"
+    require_test_passed "$output_file" "$PACKAGED_JVM_ARTIFACT_VALIDATOR_NAME"
+    require_test_passed "$output_file" "$PACKAGED_JVM_ARTIFACT_CROSSLINK_VALIDATOR_NAME"
+}
+
 create_transport_benchmark_artifact_path() {
     local -r artifact_dir="$1"
     local absolute_artifact_dir=""
@@ -351,6 +394,22 @@ require_java_agent() {
     java -version 2>&1 | tee "$OUTPUT_DIR/java-version.txt"
     sha256sum -c "$JAVA_AGENT_CHECKSUM" | tee "$OUTPUT_DIR/java-agent-verified.txt"
     sha256sum "$JAVA_AGENT_PATH" | tee "$OUTPUT_DIR/java-agent-vm.sha256"
+}
+
+build_packaged_jvm_benchmark_test_binary() {
+    local -r test_binary="$OUTPUT_DIR/packaged-jvm-benchmark.test"
+
+    [[ ! -e "$test_binary" && ! -L "$test_binary" ]] || \
+        fail "refusing to replace packaged JVM benchmark test binary: ${test_binary}"
+    (
+        umask 077
+        go test \
+            -c \
+            -tags=privileged_tests \
+            -o "$test_binary" \
+            ./pkg/internal/ebpf/tpinjector
+    )
+    require_private_benchmark_path "$test_binary" 'regular file' 700
 }
 
 collect_kernel_evidence() {
@@ -478,13 +537,127 @@ run_transport_benchmark() {
         TestJavaRemoteParentTransportBenchmark
 }
 
+run_packaged_jvm_benchmark() {
+    local -r output_file="$OUTPUT_DIR/packaged-jvm-benchmark.log"
+    local -r validation_output="$OUTPUT_DIR/packaged-jvm-benchmark-validation.log"
+    local -r artifact_dir="$OUTPUT_DIR/packaged-jvm-benchmark"
+    local -r identity_file="$OUTPUT_DIR/packaged-jvm-benchmark-identities.txt"
+    local artifact_file=""
+    local agent_path=""
+    local java_path=""
+    local setpriv_path=""
+    local sockopt_bpf_path=""
+    local sockops_bpf_path=""
+    local source_revision=""
+    local kernel_release=""
+    local test_status=0
+    local -a benchmark_environment=()
+
+    command -v setpriv >/dev/null 2>&1 || fail 'setpriv is unavailable'
+    command -v java >/dev/null 2>&1 || fail 'Java runtime is unavailable'
+    agent_path="$(resolve_existing_path "$JAVA_AGENT_PATH")" || \
+        fail 'failed to resolve the packaged JVM agent artifact'
+    java_path="$(resolve_existing_path "$(command -v java)")" || \
+        fail 'failed to resolve the packaged Java runtime'
+    setpriv_path="$(resolve_existing_path "$(command -v setpriv)")" || \
+        fail 'failed to resolve setpriv'
+    sockopt_bpf_path="$(resolve_existing_path \
+        pkg/internal/ebpf/tpinjector/bpfjavaremoteparent_x86_bpfel.o)" || \
+        fail 'failed to resolve the generated sockopt BPF artifact'
+    sockops_bpf_path="$(resolve_existing_path \
+        pkg/internal/ebpf/tpinjector/bpf_x86_bpfel.o)" || \
+        fail 'failed to resolve the generated sockops BPF artifact'
+    source_revision="$(git rev-parse HEAD)" || \
+        fail 'failed to resolve the packaged JVM benchmark source revision'
+    [[ "$source_revision" =~ ^[0-9a-f]{40}$ ]] || \
+        fail 'packaged JVM benchmark source revision is invalid'
+    [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] || \
+        fail 'packaged JVM benchmark requires a clean source tree'
+    kernel_release="$(uname -r)" || fail 'failed to resolve the VM kernel release'
+    artifact_file="$(create_transport_benchmark_artifact_path "$artifact_dir")" || \
+        fail 'failed to prepare the packaged JVM benchmark artifact path'
+    benchmark_environment=(
+        "HOME=/root"
+        "LANG=C"
+        "LC_ALL=C"
+        "PATH=/usr/local/go/bin:/usr/bin:/bin"
+        "TMPDIR=/tmp"
+        "TZ=UTC"
+        "OBI_JAVA_REMOTE_PARENT_AGENT_JAR=$agent_path"
+        "OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK=1"
+        "OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_ARTIFACT=$artifact_file"
+        "OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_EXCLUSIVE_CGROUP_BPF=$PACKAGED_JVM_EXCLUSIVE_CGROUP_BPF_PREMISE"
+    )
+
+    {
+        printf 'userspace=Alpine Linux\n'
+        printf 'kernel_input=RHEL 9.6 LVH pinned artifact\n'
+        printf 'kernel_release=%s\nsource_revision=%s\n' \
+            "$kernel_release" "$source_revision"
+        printf 'java=%s\nsetpriv=%s\nagent=%s\nsockopt_bpf=%s\nsockops_bpf=%s\n' \
+            "$java_path" "$setpriv_path" "$agent_path" \
+            "$sockopt_bpf_path" "$sockops_bpf_path"
+        printf 'exclusive_cgroup_bpf_premise=%s\n' \
+            "$PACKAGED_JVM_EXCLUSIVE_CGROUP_BPF_PREMISE"
+        "$java_path" -version 2>&1
+        cat /etc/os-release
+        go version
+        git --version
+        setpriv --version
+        apk info -e openjdk21-jre-headless util-linux-misc
+        apk info -a openjdk21-jre-headless util-linux-misc
+        sha256sum "$java_path" "$setpriv_path" "$agent_path" \
+            "$sockopt_bpf_path" "$sockops_bpf_path" \
+            "$OUTPUT_DIR/packaged-jvm-benchmark.test"
+    } > "$identity_file"
+    sha256sum "$identity_file" | tee "$OUTPUT_DIR/packaged-jvm-benchmark-identities.sha256"
+    env -i "${benchmark_environment[@]}" env | LC_ALL=C sort \
+        > "$OUTPUT_DIR/packaged-jvm-benchmark-root-environment.txt"
+    sha256sum "$OUTPUT_DIR/packaged-jvm-benchmark-root-environment.txt" | \
+        tee "$OUTPUT_DIR/packaged-jvm-benchmark-root-environment.sha256"
+
+    if env -i "${benchmark_environment[@]}" \
+        "$OUTPUT_DIR/packaged-jvm-benchmark.test" \
+            -test.v \
+            -test.timeout=10m \
+            -test.run "$PACKAGED_JVM_BENCHMARK_TEST_PATTERN" \
+            2>&1 | tee "$output_file"; then
+        test_status=0
+    else
+        test_status=$?
+    fi
+
+    # The benchmark publishes a structurally valid artifact before applying
+    # the latency gate. Validate and retain it even when the test reports a
+    # failed gate, then preserve the original test status.
+    require_packaged_jvm_benchmark_artifact \
+        "$artifact_file" \
+        "$validation_output" \
+        "$agent_path" \
+        "$OUTPUT_DIR/packaged-jvm-benchmark.test" \
+        "$source_revision" \
+        "$kernel_release" \
+        "$java_path" \
+        "$sockopt_bpf_path" \
+        "$sockops_bpf_path"
+    sha256sum "$artifact_file" | tee "$OUTPUT_DIR/packaged-jvm-benchmark.sha256"
+    packaged_jvm_benchmark_artifact_gates_pass "$artifact_file" || \
+        fail "packaged JVM benchmark artifact records a failed latency gate: ${artifact_file}"
+    (( test_status == 0 )) || \
+        fail "packaged JVM benchmark test failed with status ${test_status}; see ${output_file}"
+    require_test_passed "$output_file" "$PACKAGED_JVM_BENCHMARK_TEST_NAME"
+}
+
 main() {
     mkdir -p -- "$OUTPUT_DIR"
     collect_kernel_evidence
     require_java_agent
+    build_packaged_jvm_benchmark_test_binary
     run_production_verifier_profiles
     run_sockopt_authority_tests
     run_transport_benchmark
+    # Run last so earlier probes cannot perturb the packaged latency evidence.
+    run_packaged_jvm_benchmark
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

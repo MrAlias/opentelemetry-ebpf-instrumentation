@@ -82,7 +82,7 @@ readonly NATIVE_BENCHMARK_SOURCE_PATHS=(
 )
 readonly W3C_DISCARD_CELLS=(getsockopt-w3c)
 readonly PRESSURE_REQUESTS=128
-readonly PRESSURE_MAP_EXPECTED_MAX_ENTRIES=50000
+readonly PRESSURE_MAP_MAX_SUPPORTED_ENTRIES=50000
 readonly PRESSURE_RECOVERY_REQUIRED_SAMPLES=2
 readonly PROC_CGROUP_CONTAINER_BINDING="full_container_id_at_non_hex_boundaries"
 
@@ -5126,8 +5126,9 @@ pressure_recovery_evidence_json() {
   max_entries="$(jq -er '.max_entries' "$fill_file")" || return 1
   map_type="$(jq -er '.map_type | ascii_downcase' "$fill_file")" || return 1
   map_id="$(normalize_decimal "$map_id" 4294967295 false)" || return 1
-  [[ "$max_entries" == "$PRESSURE_MAP_EXPECTED_MAX_ENTRIES" &&
-    "$map_type" =~ ^[a-z0-9_]+$ && -s "$recovery_log" &&
+  max_entries="$(normalize_decimal \
+    "$max_entries" "$PRESSURE_MAP_MAX_SUPPORTED_ENTRIES" false)" || return 1
+  [[ "$map_type" =~ ^[a-z0-9_]+$ && -s "$recovery_log" &&
     -f "$recovery_log" && ! -L "$recovery_log" ]] || return 1
   baseline_json="$(pressure_map_sample_json \
     "$baseline_file" "$map_id" "$max_entries" "$map_type")" || return 1
@@ -5285,7 +5286,7 @@ validate_pressure_cell_artifacts() {
       (.pressure_correlation | type == "object") and
       .pressure_correlation == $status.pressure_correlation.trace)
   ' "$status_file" "$result_file" >/dev/null || return 1
-  jq -se --argjson expected_max_entries "$PRESSURE_MAP_EXPECTED_MAX_ENTRIES" '
+  jq -se --argjson max_supported_entries "$PRESSURE_MAP_MAX_SUPPORTED_ENTRIES" '
     def nonnegative_integer:
       type == "number" and isfinite and floor == . and . >= 0;
     def positive_integer: nonnegative_integer and . > 0;
@@ -5302,7 +5303,8 @@ validate_pressure_cell_artifacts() {
       .status == "passed" and .mode == "fill" and
       .map_name == "java_remote_parent_handoff_claims" and
       .kernel_name == "java_remote_par" and .map_type == "Hash" and
-      (.map_id | positive_integer) and .max_entries == $expected_max_entries and
+      (.map_id | positive_integer) and (.max_entries | positive_integer) and
+      .max_entries <= $max_supported_entries and
       (.process_map_id | positive_integer) and (.process_pid | positive_integer) and
       (.process_namespace | positive_integer) and (.token_base | positive_integer) and
       (.touched | positive_integer) and
@@ -5731,7 +5733,7 @@ validate_path_observation_schema() {
   [[ -f "$observation" && ! -L "$observation" ]] || return 1
   jq -se --argjson hit_requests "$PREFLIGHT_REQUESTS" \
     --argjson pressure_requests "$PRESSURE_REQUESTS" \
-    --argjson pressure_max_entries "$PRESSURE_MAP_EXPECTED_MAX_ENTRIES" \
+    --argjson pressure_max_supported_entries "$PRESSURE_MAP_MAX_SUPPORTED_ENTRIES" \
     --argjson recovery_samples "$PRESSURE_RECOVERY_REQUIRED_SAMPLES" '
     def nonnegative_integer:
       type == "number" and isfinite and floor == . and . >= 0;
@@ -5776,7 +5778,8 @@ validate_path_observation_schema() {
         .bounded == true and .map_name == "java_remote_parent_handoff_claims" and
         .kernel_map_name == "java_remote_par" and .map_type == "Hash" and
         .kernel_map_type == "hash" and (.map_id | positive_integer) and
-        .max_entries == $pressure_max_entries and
+        (.max_entries | positive_integer) and
+        .max_entries <= $pressure_max_supported_entries and
         (.touched_entries | positive_integer) and
         .touched_entries <= .max_entries and
         .occupancy_before_fill < .max_entries and

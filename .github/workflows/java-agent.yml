@@ -166,11 +166,22 @@ jobs:
           gradle test -I /tmp/obi-test-jvm.init.gradle --no-daemon --stacktrace
 
       - name: Verify official Java agent compatibility
+        id: official_agent_compatibility
         working-directory: .
         env:
           JAVA_HOME: ${{ steps.gradle-jdk.outputs.path }}
           OBI_TEST_JAVA_HOME: ${{ steps.test-jdk.outputs.path }}
+          TEST_JAVA: ${{ matrix.test-java }}
         run: |
+          set -Eeuo pipefail
+
+          evidence_dir="testoutput/java-agent-compatibility/java-${TEST_JAVA}"
+          mkdir -p -- "$evidence_dir"
+          git rev-parse HEAD > "$evidence_dir/source-commit.txt"
+          uname -a > "$evidence_dir/runner-uname.txt"
+          "$OBI_TEST_JAVA_HOME/bin/java" -version \
+            > "$evidence_dir/java-version.txt" 2>&1
+
           cat > /tmp/obi-agent-compatibility-jvm.init.gradle <<'EOF'
           allprojects {
             tasks.withType(Test).configureEach {
@@ -182,9 +193,15 @@ jobs:
           ./examples/apache-java-https/scripts/download-agent.sh \
             --distribution otel \
             --output /tmp/obi-agent-compatibility/otel/artifacts
+          cp -- \
+            /tmp/obi-agent-compatibility/otel/artifacts/official-javaagent.json \
+            "$evidence_dir/opentelemetry-agent.json"
           ./examples/apache-java-https/scripts/download-agent.sh \
             --distribution splunk \
             --output /tmp/obi-agent-compatibility/splunk/artifacts
+          cp -- \
+            /tmp/obi-agent-compatibility/splunk/artifacts/official-javaagent.json \
+            "$evidence_dir/splunk-agent.json"
 
           OBI_TEST_OTEL_AGENT=/tmp/obi-agent-compatibility/otel/artifacts/official-javaagent.jar \
           OBI_TEST_SPLUNK_AGENT=/tmp/obi-agent-compatibility/splunk/artifacts/official-javaagent.jar \
@@ -194,6 +211,167 @@ jobs:
               -I /tmp/obi-agent-compatibility-jvm.init.gradle \
               --no-daemon \
               --stacktrace
+
+      - name: Collect official Java agent compatibility evidence
+        if: always()
+        working-directory: .
+        env:
+          COMPATIBILITY_OUTCOME: ${{ steps.official_agent_compatibility.outcome }}
+          OBI_TEST_JAVA_HOME: ${{ steps.test-jdk.outputs.path }}
+          RUNNER_ARCHITECTURE: ${{ runner.arch }}
+          RUNNER_OPERATING_SYSTEM: ${{ runner.os }}
+          TEST_JAVA: ${{ matrix.test-java }}
+        run: |
+          set -Eeuo pipefail
+
+          evidence_dir="testoutput/java-agent-compatibility/java-${TEST_JAVA}"
+          test_results="pkg/internal/java/extension/build/test-results/officialAgentRuntimeTest"
+          evidence_status=0
+          mkdir -p -- "$evidence_dir"
+
+          if ! git rev-parse --verify HEAD > "$evidence_dir/source-commit.txt"; then
+            printf 'Checked-out source revision is unavailable.\n' \
+              > "$evidence_dir/source-commit-unavailable.txt"
+          fi
+          uname -a > "$evidence_dir/runner-uname.txt"
+          if [[ -x "$OBI_TEST_JAVA_HOME/bin/java" ]]; then
+            "$OBI_TEST_JAVA_HOME/bin/java" -version \
+              > "$evidence_dir/java-version.txt" 2>&1
+          else
+            printf 'Configured test JVM is unavailable: %s\n' \
+              "$OBI_TEST_JAVA_HOME" > "$evidence_dir/java-version-unavailable.txt"
+          fi
+
+          case "$COMPATIBILITY_OUTCOME" in
+            success)
+              cell_status=pass
+              ;;
+            failure)
+              cell_status=fail
+              ;;
+            skipped|cancelled)
+              cell_status=untested
+              ;;
+            *)
+              printf 'Unexpected compatibility outcome: %s\n' \
+                "$COMPATIBILITY_OUTCOME" >&2
+              exit 1
+              ;;
+          esac
+
+          if [[ -d "$test_results" ]]; then
+            mkdir -p -- "$evidence_dir/test-results"
+            cp -R -- "$test_results/." "$evidence_dir/test-results/"
+          else
+            printf 'Gradle produced no official-agent JUnit results.\n' \
+              > "$evidence_dir/test-results-missing.txt"
+          fi
+
+          if [[ "$COMPATIBILITY_OUTCOME" == "success" ]]; then
+            expected_results=(
+              OfficialAgentCompatibilityTest
+              OfficialAgentJettyRuntimeTest
+              OfficialAgentNettyRuntimeTest
+              OfficialAgentJava21ConcurrencyRuntimeTest
+            )
+            for result_class in "${expected_results[@]}"; do
+              result_file="$test_results/TEST-io.opentelemetry.obi.java.extension.${result_class}.xml"
+              if [[ ! -s "$result_file" || -L "$result_file" ]]; then
+                printf 'Missing nonempty JUnit result: %s\n' "$result_file" \
+                  >> "$evidence_dir/test-results-missing.txt"
+                evidence_status=1
+              fi
+            done
+            if ! python3 - "$TEST_JAVA" "$test_results" \
+              > "$evidence_dir/junit-summary.txt" <<'PY'
+          import pathlib
+          import sys
+          import xml.etree.ElementTree as ET
+
+          feature = int(sys.argv[1])
+          directory = pathlib.Path(sys.argv[2])
+          expected = {
+              "OfficialAgentCompatibilityTest",
+              "OfficialAgentJettyRuntimeTest",
+              "OfficialAgentNettyRuntimeTest",
+              "OfficialAgentJava21ConcurrencyRuntimeTest",
+          }
+          expected_skips = {8: 4, 11: 2, 17: 2, 21: 0}
+          observed = set()
+          totals = {"tests": 0, "skipped": 0, "failures": 0, "errors": 0}
+          for path in sorted(directory.glob("TEST-*.xml")):
+              name = path.name.removeprefix(
+                  "TEST-io.opentelemetry.obi.java.extension."
+              ).removesuffix(".xml")
+              if name not in expected:
+                  raise SystemExit(f"unexpected JUnit result: {path.name}")
+              if name in observed:
+                  raise SystemExit(f"duplicate JUnit result: {path.name}")
+              observed.add(name)
+              suite = ET.parse(path).getroot()
+              for field in totals:
+                  totals[field] += int(suite.attrib[field])
+          if observed != expected:
+              raise SystemExit(
+                  f"incomplete JUnit classes: observed={sorted(observed)!r}"
+              )
+          if totals != {
+              "tests": 8,
+              "skipped": expected_skips[feature],
+              "failures": 0,
+              "errors": 0,
+          }:
+              raise SystemExit(f"unexpected JUnit totals: {totals!r}")
+          print(
+              "tests={tests} skipped={skipped} failures={failures} errors={errors}".format(
+                  **totals
+              )
+          )
+          PY
+            then
+              printf 'Official-agent JUnit evidence failed exact validation.\n' \
+                >> "$evidence_dir/test-results-missing.txt"
+              evidence_status=1
+            fi
+            for metadata in opentelemetry-agent.json splunk-agent.json; do
+              if [[ ! -s "$evidence_dir/$metadata" || -L "$evidence_dir/$metadata" ]]; then
+                printf 'Missing nonempty agent metadata: %s\n' "$metadata" \
+                  >> "$evidence_dir/test-results-missing.txt"
+                evidence_status=1
+              fi
+            done
+            if [[ ! -s "$evidence_dir/source-commit.txt" ||
+              ! -s "$evidence_dir/runner-uname.txt" ||
+              ! -s "$evidence_dir/java-version.txt" ]]; then
+              printf 'Successful cell is missing baseline provenance.\n' \
+                >> "$evidence_dir/test-results-missing.txt"
+              evidence_status=1
+            fi
+            if ((evidence_status != 0)); then
+              cell_status=fail
+            fi
+          fi
+
+          {
+            printf 'format_version=1\n'
+            printf 'matrix_revision=official-agent-runtime-v1\n'
+            printf 'java_feature=%s\n' "$TEST_JAVA"
+            printf 'runner_os=%s\n' "$RUNNER_OPERATING_SYSTEM"
+            printf 'runner_arch=%s\n' "$RUNNER_ARCHITECTURE"
+            printf 'status_scope=officialAgentRuntimeTest\n'
+            printf 'status=%s\n' "$cell_status"
+          } > "$evidence_dir/matrix-cell.properties"
+
+          exit "$evidence_status"
+
+      - name: Upload official Java agent compatibility evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: java-agent-compatibility-java-${{ matrix.test-java }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: testoutput/java-agent-compatibility/java-${{ matrix.test-java }}
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Upload build artifacts
         if: matrix.test-java == 21

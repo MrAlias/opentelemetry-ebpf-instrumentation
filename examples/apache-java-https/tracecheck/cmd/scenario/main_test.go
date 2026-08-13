@@ -2415,6 +2415,334 @@ func TestTLSBoundaryRequestsAndEvidenceCoverSplitAndCoalescedPair(t *testing.T) 
 	assert.Error(t, validateWorkloadResponse(requests[2], coalescedFinal))
 }
 
+func TestTLSBoundaryCorrelationRequiresExactSameRequestConjunction(t *testing.T) {
+	cfg, cases := tlsBoundaryCorrelationCases(t)
+
+	summary, err := summarizeTLSBoundaryCorrelation(cfg, cases)
+	require.NoError(t, err)
+	require.NoError(t, validateTLSBoundaryCorrelation(summary, len(cases)))
+	assert.Equal(t, 3, summary.ExactParentCount)
+	assert.Zero(t, summary.WrongParentCount)
+	assert.Zero(t, summary.UnresolvedCount)
+	assert.Equal(t, 3, summary.SameRequestEvidenceCount)
+	require.Len(t, summary.Requests, 3)
+
+	assert.Equal(t, []int{4, 4, 4}, []int{
+		summary.Requests[0].DecryptedCallbackCount,
+		summary.Requests[1].DecryptedCallbackCount,
+		summary.Requests[2].DecryptedCallbackCount,
+	})
+	assert.Equal(t, []int{4, 1, 1}, []int{
+		summary.Requests[0].ParserCallbackCount,
+		summary.Requests[1].ParserCallbackCount,
+		summary.Requests[2].ParserCallbackCount,
+	})
+	assert.Equal(t, []string{
+		tlsBoundaryEvidenceFinal,
+		tlsBoundaryEvidencePartial,
+		tlsBoundaryEvidenceFinal,
+	}, []string{
+		summary.Requests[0].EvidencePhase,
+		summary.Requests[1].EvidencePhase,
+		summary.Requests[2].EvidencePhase,
+	})
+	for index, request := range summary.Requests {
+		assert.Equal(t, cases[index].Request.Marker, request.Marker)
+		assert.True(t, request.ExactParent)
+		assert.True(t, request.SameRequestEvidence)
+		assert.Equal(t, request.ApacheClientSpanID, request.JavaParentSpanID)
+		assert.Equal(t, request.RequestBytes, request.ParserBytes)
+		assert.Equal(t, request.DecryptedCallbackCount, request.TLSApplicationRecordCount)
+		assert.Equal(t, 2, request.HeaderDecryptedCallbackCount)
+	}
+
+	encoded, err := json.Marshal(runResult{TLSBoundaryCorrelation: &summary})
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), `"tls_boundary_correlation"`)
+	assert.Contains(t, string(encoded), `"same_request_evidence_count":3`)
+	assert.Contains(t, string(encoded), `"apache_client_span_id"`)
+}
+
+func TestReconcileTLSBoundaryResultRetainsEvidenceOnAssertionFailure(t *testing.T) {
+	cfg, cases := tlsBoundaryCorrelationCases(t)
+	requests := make([]requestCase, len(cases))
+	for index := range cases {
+		requests[index] = cases[index].Request
+	}
+	result := &runResult{Scenario: cfg.scenario, Cases: cases}
+	assertionFailure := errors.New("receiver snapshot remained incomplete")
+
+	err := reconcileTLSBoundaryResult(cfg, result, requests, assertionFailure)
+	require.ErrorIs(t, err, assertionFailure)
+	require.NotNil(t, result.TLSBoundaryCorrelation)
+	assert.Equal(t, 3, result.TLSBoundaryCorrelation.ExactParentCount)
+	assert.Zero(t, result.TLSBoundaryCorrelation.WrongParentCount)
+	assert.Zero(t, result.TLSBoundaryCorrelation.UnresolvedCount)
+	assert.Equal(t, 3, result.TLSBoundaryCorrelation.SameRequestEvidenceCount)
+	require.Len(t, result.TLSBoundaryCorrelation.Requests, 3)
+}
+
+func TestReconcileTLSBoundaryResultRetainsFailedCorrelationSummary(t *testing.T) {
+	cfg, cases := tlsBoundaryCorrelationCases(t)
+	cases[0].Trace.Spans[2].ParentSpanID = "000000000000ffff"
+	requests := make([]requestCase, len(cases))
+	for index := range cases {
+		requests[index] = cases[index].Request
+	}
+	result := &runResult{Scenario: cfg.scenario, Cases: cases}
+
+	err := reconcileTLSBoundaryResult(cfg, result, requests, nil)
+	require.ErrorContains(t, err, "identify Apache client span")
+	require.NotNil(t, result.TLSBoundaryCorrelation)
+	assert.Equal(t, 2, result.TLSBoundaryCorrelation.ExactParentCount)
+	assert.Equal(t, 1, result.TLSBoundaryCorrelation.WrongParentCount)
+	assert.Zero(t, result.TLSBoundaryCorrelation.UnresolvedCount)
+	assert.Equal(t, 3, result.TLSBoundaryCorrelation.SameRequestEvidenceCount)
+}
+
+func TestRunWiresTLSBoundaryCorrelationAndRetainsItOnAssertionFailure(t *testing.T) {
+	receiver := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/healthz":
+			writer.WriteHeader(http.StatusOK)
+		case request.Method == http.MethodPost && request.URL.Path == "/reset":
+			writer.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	t.Cleanup(receiver.Close)
+
+	cfg, cases := tlsBoundaryCorrelationCases(t)
+	cfg.receiverURL = receiver.URL
+	cfg.expectedTLS = "TLSv1.3"
+	cfg.timeout = time.Second
+
+	originalSend := sendRunRequests
+	originalAwait := awaitRunAssertions
+	t.Cleanup(func() {
+		sendRunRequests = originalSend
+		awaitRunAssertions = originalAwait
+	})
+	sendRunRequests = func(
+		_ context.Context,
+		actual config,
+		requests []requestCase,
+	) ([]backendResponse, []int64, time.Duration, *connectionEvidence, error) {
+		require.Equal(t, cfg.scenario, actual.scenario)
+		require.Len(t, requests, len(cases))
+		responses := make([]backendResponse, len(cases))
+		for index := range cases {
+			require.Equal(t, cases[index].Request, requests[index])
+			responses[index] = cases[index].Response
+			responses[index].Secure = true
+			responses[index].Protocol = "HTTP/1.1"
+			responses[index].TLSProtocol = cfg.expectedTLS
+			responses[index].TLSCipher = "TLS_AES_128_GCM_SHA256"
+			responses[index].BackendConnectionID = 1
+			responses[index].BackendRemotePort = 41001
+			if index > 0 {
+				responses[index].BackendConnectionID = 2
+				responses[index].BackendRemotePort = 41002
+			}
+		}
+		return responses, []int64{1, 2, 3}, time.Nanosecond, &connectionEvidence{
+			FrontendConnections:          2,
+			FrontendProtocol:             "HTTP/1.1",
+			SequentialRequests:           2,
+			ResponsesReadBeforeNextWrite: 1,
+		}, nil
+	}
+	assertionFailure := error(nil)
+	awaitRunAssertions = func(
+		_ context.Context,
+		_ config,
+		requests []requestCase,
+	) ([]tracecheck.Snapshot, error) {
+		snapshots := make([]tracecheck.Snapshot, len(cases))
+		for index := range cases {
+			require.Equal(t, cases[index].Request, requests[index])
+			snapshots[index] = cases[index].Trace
+		}
+		return snapshots, assertionFailure
+	}
+
+	result, err := run(context.Background(), cfg)
+	require.NoError(t, err)
+	require.NotNil(t, result.TLSBoundaryCorrelation)
+	assert.Equal(t, 3, result.TLSBoundaryCorrelation.ExactParentCount)
+	assert.Equal(t, 3, result.TLSBoundaryCorrelation.SameRequestEvidenceCount)
+
+	assertionFailure = errors.New("receiver snapshot remained incomplete")
+	failed, err := run(context.Background(), cfg)
+	require.ErrorIs(t, err, assertionFailure)
+	require.NotNil(t, failed.TLSBoundaryCorrelation)
+	assert.Equal(t, 3, failed.TLSBoundaryCorrelation.ExactParentCount)
+	assert.Equal(t, 3, failed.TLSBoundaryCorrelation.SameRequestEvidenceCount)
+}
+
+func TestTLSBoundaryCorrelationRejectsIndependentMutations(t *testing.T) {
+	tests := []struct {
+		name           string
+		mutate         func([]caseResult)
+		wantError      string
+		wantExact      int
+		wantWrong      int
+		wantUnresolved int
+		wantSame       int
+	}{
+		{
+			name: "wrong parent",
+			mutate: func(cases []caseResult) {
+				cases[0].Trace.Spans[2].ParentSpanID = "000000000000ffff"
+			},
+			wantError: "identify Apache client span",
+			wantExact: 2,
+			wantWrong: 1,
+			wantSame:  3,
+		},
+		{
+			name: "trace mismatch",
+			mutate: func(cases []caseResult) {
+				cases[0].Trace.Spans[2].TraceID = "0000000000000000000000000000ffff"
+			},
+			wantError: "identify Apache client span",
+			wantExact: 2,
+			wantWrong: 1,
+			wantSame:  3,
+		},
+		{
+			name: "primary related identity overlap",
+			mutate: func(cases []caseResult) {
+				cases[0].Trace.RelatedSpans = []tracecheck.Span{cases[0].Trace.Spans[1]}
+			},
+			wantError:      "exactly one Apache client candidate",
+			wantExact:      2,
+			wantUnresolved: 1,
+			wantSame:       3,
+		},
+		{
+			name: "non-canonical trace identity",
+			mutate: func(cases []caseResult) {
+				for index := range cases[0].Trace.Spans {
+					cases[0].Trace.Spans[index].TraceID = "ABCDEFABCDEFABCDEFABCDEFABCDEFAB"
+				}
+			},
+			wantError:      "non-canonical Apache trace ID",
+			wantExact:      2,
+			wantUnresolved: 1,
+			wantSame:       3,
+		},
+		{
+			name: "non-canonical span identity",
+			mutate: func(cases []caseResult) {
+				cases[0].Trace.Spans[1].SpanID = "not-a-span"
+				cases[0].Trace.Spans[2].ParentSpanID = "not-a-span"
+			},
+			wantError:      "non-canonical Apache client span ID",
+			wantExact:      2,
+			wantUnresolved: 1,
+			wantSame:       3,
+		},
+		{
+			name: "reused client and server span identity",
+			mutate: func(cases []caseResult) {
+				cases[0].Trace.Spans[2].SpanID = cases[0].Trace.Spans[1].SpanID
+			},
+			wantError:      "reused one span identity",
+			wantExact:      2,
+			wantUnresolved: 1,
+			wantSame:       3,
+		},
+		{
+			name: "snapshot marker mismatch",
+			mutate: func(cases []caseResult) {
+				cases[0].Trace.Marker = "different-marker"
+			},
+			wantError:      "expected snapshot marker",
+			wantExact:      2,
+			wantUnresolved: 1,
+			wantSame:       3,
+		},
+		{
+			name: "decrypted callback collapse",
+			mutate: func(cases []caseResult) {
+				evidence := cases[0].Response.TLSBoundary
+				requestBytes := evidence.RequestTotalBytes[0]
+				evidence.DecryptedCallbackLengths = []int{requestBytes}
+				evidence.ParserCallbackLengths = []int{requestBytes}
+				evidence.ParserCallbackCount = 1
+				evidence.RequestHeaderDecryptedCallbackCounts = []int{1}
+				evidence.EmissionParserCallbackOrder = []int{1}
+				setTLSBoundaryRecordEvidence(evidence)
+			},
+			wantError: "callback cardinality",
+			wantExact: 3,
+			wantSame:  2,
+		},
+		{
+			name: "parser length mismatch",
+			mutate: func(cases []caseResult) {
+				cases[2].Response.TLSBoundary.ParserCallbackLengths[1]--
+			},
+			wantError: "callback byte totals",
+			wantExact: 3,
+			wantSame:  2,
+		},
+		{
+			name: "partial phase mismatch",
+			mutate: func(cases []caseResult) {
+				cases[1].Response.TLSBoundary.EvidencePhase = tlsBoundaryEvidenceFinal
+			},
+			wantError: "not partial",
+			wantExact: 3,
+			wantSame:  1,
+		},
+		{
+			name: "final phase mismatch",
+			mutate: func(cases []caseResult) {
+				cases[2].Response.TLSBoundary.EvidencePhase = tlsBoundaryEvidencePartial
+			},
+			wantError: "not final",
+			wantExact: 3,
+			wantSame:  1,
+		},
+		{
+			name: "final digest mismatch",
+			mutate: func(cases []caseResult) {
+				cases[2].Response.TLSBoundary.VerificationPairDigestExact = false
+			},
+			wantError: "pair verification evidence",
+			wantExact: 3,
+			wantSame:  1,
+		},
+		{
+			name: "response marker mismatch",
+			mutate: func(cases []caseResult) {
+				cases[1].Response.Marker = cases[2].Request.Marker
+			},
+			wantError: "response marker",
+			wantExact: 3,
+			wantSame:  2,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg, cases := tlsBoundaryCorrelationCases(t)
+			test.mutate(cases)
+
+			summary, err := summarizeTLSBoundaryCorrelation(cfg, cases)
+			require.ErrorContains(t, err, test.wantError)
+			require.Error(t, validateTLSBoundaryCorrelation(summary, len(cases)))
+			assert.Equal(t, test.wantExact, summary.ExactParentCount)
+			assert.Equal(t, test.wantWrong, summary.WrongParentCount)
+			assert.Equal(t, test.wantUnresolved, summary.UnresolvedCount)
+			assert.Equal(t, test.wantSame, summary.SameRequestEvidenceCount)
+		})
+	}
+}
+
 func TestValidateTLSBoundaryResponseRejectsEveryEvidenceInvariant(t *testing.T) {
 	request := requestCase{
 		Endpoint:            "/api/tls-boundary/coalesced",
@@ -2573,22 +2901,64 @@ func TestSerializedTLSBoundaryFinalEvidenceMonotonicallyExtendsPartial(t *testin
 	))
 
 	tests := map[string]func(*tlsBoundaryEvidence, *tlsBoundaryEvidence){
-		"configuration": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+		"mode configuration": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+			final.Mode = "split"
+		},
+		"delivery configuration": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+			final.DeliveryShape = tlsBoundaryDeliveryParserCoalesced
+		},
+		"fallback configuration": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+			final.FallbackReason = "none"
+		},
+		"grace configuration": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
 			final.CoalescingGraceMillis++
+		},
+		"grace-expired configuration": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+			final.CoalescingGraceExpired = false
+		},
+		"verification-limit configuration": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+			final.VerificationBufferLimitBytes++
 		},
 		"phase": func(partial *tlsBoundaryEvidence, _ *tlsBoundaryEvidence) {
 			partial.EvidencePhase = tlsBoundaryEvidenceFinal
 		},
-		"request prefix": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+		"request-header prefix": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
 			final.RequestHeaderBytes[0]++
 		},
-		"record prefix": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+		"request-body prefix": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+			final.RequestBodyBytes[0]++
+		},
+		"request-total prefix": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+			final.RequestTotalBytes[0]++
+		},
+		"header-callback prefix": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+			final.RequestHeaderDecryptedCallbackCounts[0]++
+		},
+		"request-order prefix": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+			final.RequestOrder[0]++
+		},
+		"emission-order prefix": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+			final.EmissionOrder[0]++
+		},
+		"parser-order prefix": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+			final.EmissionParserCallbackOrder[0]++
+		},
+		"response-order prefix": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+			final.ResponseOrder[0]++
+		},
+		"record-version prefix": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+			final.TLSApplicationRecordLegacyVersions[0]++
+		},
+		"record-payload prefix": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
 			final.TLSApplicationRecordPayloadLengths[0]++
 		},
-		"parser prefix": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+		"decrypt-callback prefix": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+			final.DecryptedCallbackLengths[0]++
+		},
+		"parser-callback prefix": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
 			final.ParserCallbackLengths[0]++
 		},
-		"close prefix": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
+		"response-close prefix": func(_ *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
 			final.ResponseConnectionClose[0] = true
 		},
 		"decrypted growth": func(partial *tlsBoundaryEvidence, final *tlsBoundaryEvidence) {
@@ -2609,6 +2979,28 @@ func TestSerializedTLSBoundaryFinalEvidenceMonotonicallyExtendsPartial(t *testin
 			assert.Error(t, validateSerializedTLSBoundaryExtension(partial, final))
 		})
 	}
+}
+
+func TestPopulateTLSBoundaryRequestEvidenceRejectsCrossRequestDecryptCallback(t *testing.T) {
+	_, cases := tlsBoundaryCorrelationCases(t)
+	request := cases[2].Request
+	evidence := validTLSBoundaryEvidence("coalesced")
+	firstRequestLastCallback := 3
+	secondRequestFirstCallback := 4
+	evidence.DecryptedCallbackLengths[firstRequestLastCallback]++
+	evidence.DecryptedCallbackLengths[secondRequestFirstCallback]--
+	evidence.RequestHeaderDecryptedCallbackCounts[1]++
+	setTLSBoundaryRecordEvidence(evidence)
+	response := backendResponse{
+		Marker:      request.Marker,
+		BackendKind: "netty-tls-boundary",
+		TLSBoundary: evidence,
+	}
+
+	require.NoError(t, validateTLSBoundaryResponse(request, response))
+	var row tlsBoundaryRequestCorrelation
+	err := populateTLSBoundaryRequestEvidence(request, response, &row)
+	require.ErrorContains(t, err, "do not align with decrypted callback boundaries")
 }
 
 func TestValidateTLSBoundaryResponseRejectsInvalidSplitShape(t *testing.T) {
@@ -2785,6 +3177,75 @@ func validPartialTLSBoundaryEvidence() *tlsBoundaryEvidence {
 	evidence.ResponseForcesConnectionClose = false
 	setTLSBoundaryRecordEvidence(evidence)
 	return evidence
+}
+
+func tlsBoundaryCorrelationCases(t *testing.T) (config, []caseResult) {
+	t.Helper()
+	cfg := config{
+		scenario:      "tls-boundary",
+		seed:          42,
+		apacheService: "apache-proxy",
+		javaService:   "java-backend",
+	}
+	requests, err := makeRequests(cfg)
+	require.NoError(t, err)
+	require.Len(t, requests, 3)
+	evidence := []*tlsBoundaryEvidence{
+		validTLSBoundaryEvidence("split"),
+		validPartialTLSBoundaryEvidence(),
+		validTLSBoundaryEvidence("coalesced"),
+	}
+	cases := make([]caseResult, len(requests))
+	for index, request := range requests {
+		traceID := fmt.Sprintf("%032x", index+1)
+		apacheServerSpanID := fmt.Sprintf("%016x", index*3+1)
+		apacheClientSpanID := fmt.Sprintf("%016x", index*3+2)
+		javaServerSpanID := fmt.Sprintf("%016x", index*3+3)
+		attributes := map[string]string{
+			"http.request.header.x-obi-demo-id": request.Marker,
+			"http.route":                        request.Endpoint,
+		}
+		cases[index] = caseResult{
+			Request: request,
+			Response: backendResponse{
+				Marker:      request.Marker,
+				BackendKind: "netty-tls-boundary",
+				TLSBoundary: evidence[index],
+			},
+			Trace: tracecheck.Snapshot{
+				Marker: request.Marker,
+				Spans: []tracecheck.Span{
+					{
+						TraceID:     traceID,
+						SpanID:      apacheServerSpanID,
+						Flags:       0x001,
+						ServiceName: cfg.apacheService,
+						Kind:        "SERVER",
+						Attributes:  attributes,
+					},
+					{
+						TraceID:      traceID,
+						SpanID:       apacheClientSpanID,
+						ParentSpanID: apacheServerSpanID,
+						Flags:        0x001,
+						ServiceName:  cfg.apacheService,
+						Kind:         "CLIENT",
+						Attributes:   attributes,
+					},
+					{
+						TraceID:      traceID,
+						SpanID:       javaServerSpanID,
+						ParentSpanID: apacheClientSpanID,
+						Flags:        0x301,
+						ServiceName:  cfg.javaService,
+						Kind:         "SERVER",
+						Attributes:   attributes,
+					},
+				},
+			},
+		}
+	}
+	return cfg, cases
 }
 
 func setTLSBoundaryCallbacks(evidence *tlsBoundaryEvidence, lengths []int) {

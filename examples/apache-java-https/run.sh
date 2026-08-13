@@ -6513,6 +6513,93 @@ coalesced_bridge_reconciliation() {
   ' "$input"
 }
 
+tls_boundary_reconciliation() {
+  local -r input="$1"
+
+  bounded_evidence_file \
+    "$input" \
+    "$SCENARIO_RECONCILIATION_MAX_BYTES" \
+    "$SCENARIO_RECONCILIATION_MAX_LINES" || return 1
+  jq -sce '
+    def count: type == "number" and floor == . and . >= 0 and . <= 3;
+    def positive_bytes:
+      type == "number" and floor == . and . >= 1 and . <= 73728;
+    def positive_bounded:
+      type == "number" and floor == . and . >= 1 and . <= 32;
+    def trace_id:
+      type == "string" and
+      test("^[0-9a-f]{32}$") and . != "00000000000000000000000000000000";
+    def span_id:
+      type == "string" and
+      test("^[0-9a-f]{16}$") and . != "0000000000000000";
+    def marker($index):
+      type == "string" and
+      test("^tls-boundary-0" + ($index | tostring) + "-[0-9a-f]{16}$");
+    def common_row($index; $mode; $sequence; $phase; $shape):
+      type == "object" and
+      (.marker | marker($index)) and
+      .mode == $mode and
+      .sequence == $sequence and
+      .evidence_phase == $phase and
+      .delivery_shape == $shape and
+      (.trace_id | trace_id) and
+      (.apache_client_span_id | span_id) and
+      (.java_server_span_id | span_id) and
+      (.java_parent_span_id | span_id) and
+      .java_parent_span_id == .apache_client_span_id and
+      .java_server_span_id != .apache_client_span_id and
+      .exact_parent == true and
+      .same_request_evidence == true and
+      (.request_bytes | positive_bytes) and
+      (.tls_application_record_count | positive_bounded) and
+      .tls_application_record_count >= 2 and
+      (.decrypted_callback_count | positive_bounded) and
+      .decrypted_callback_count >= 2 and
+      .decrypted_callback_count == .tls_application_record_count and
+      (.header_decrypted_callback_count | positive_bounded) and
+      .header_decrypted_callback_count >= 2 and
+      .header_decrypted_callback_count <= .decrypted_callback_count and
+      (.parser_callback_count | positive_bounded) and
+      (.parser_bytes | positive_bytes) and
+      .parser_bytes == .request_bytes;
+    if length != 1 then error("expected exactly one TLS boundary result") else .[0] end |
+    . as $result |
+    if
+      $result.status == "passed" and
+      $result.scenario == "tls-boundary" and
+      $result.request_count == 3 and
+      ($result.tls_boundary_correlation | type == "object")
+    then
+      $result.tls_boundary_correlation as $correlation |
+      if
+        ($correlation.exact_parent_count | count) and
+        ($correlation.wrong_parent_count | count) and
+        ($correlation.unresolved_count | count) and
+        ($correlation.same_request_evidence_count | count) and
+        $correlation.exact_parent_count == 3 and
+        $correlation.wrong_parent_count == 0 and
+        $correlation.unresolved_count == 0 and
+        $correlation.same_request_evidence_count == 3 and
+        ($correlation.requests | type == "array" and length == 3) and
+        ($correlation.requests |
+          map([
+            .trace_id + "/" + .apache_client_span_id,
+            .trace_id + "/" + .java_server_span_id
+          ]) | add | unique | length == 6) and
+        ($correlation.requests[0] |
+          common_row(0; "split"; 1; "final"; "split") and
+          .parser_callback_count == .decrypted_callback_count) and
+        ($correlation.requests[1] |
+          common_row(1; "coalesced"; 1; "partial"; "serialized_proxy_fallback") and
+          .parser_callback_count == 1) and
+        ($correlation.requests[2] |
+          common_row(2; "coalesced"; 2; "final"; "serialized_proxy_fallback") and
+          .parser_callback_count == 1)
+      then $correlation else error("invalid TLS boundary correlation") end
+    else error("missing TLS boundary correlation") end
+  ' "$input"
+}
+
 timeout_cancellation_reconciliation() {
   local -r input="$1"
 
@@ -8233,6 +8320,12 @@ run_scenario() {
 		if ! scenario_reconciliation_json="$(concurrency_overlap_reconciliation \
 			"$output" "$expected_requests")"; then
 			log_error "concurrency result did not retain exact worker and arrival evidence"
+			scenario_reconciliation_json="null"
+			scenario_status=1
+		fi
+	elif ((scenario_status == 0)) && [[ "$name" == "tls-boundary" ]]; then
+		if ! scenario_reconciliation_json="$(tls_boundary_reconciliation "$output")"; then
+			log_error "TLS boundary result did not bind exact parents to same-request record evidence"
 			scenario_reconciliation_json="null"
 			scenario_status=1
 		fi

@@ -7259,6 +7259,72 @@ test_concurrency_overlap_reconciliation_is_exact() {
   fi
 }
 
+test_tls_boundary_reconciliation_binds_exact_parents_to_record_evidence() {
+  local -r result="$TEST_TMP_DIR/tls-boundary-reconciliation.json"
+  local -r mutated="$TEST_TMP_DIR/tls-boundary-reconciliation-mutated.json"
+  local mutation=""
+  local -a mutations=()
+
+  printf '%s\n' \
+    '{"status":"passed","scenario":"tls-boundary","request_count":3,"tls_boundary_correlation":{"exact_parent_count":3,"wrong_parent_count":0,"unresolved_count":0,"same_request_evidence_count":3,"requests":[{"marker":"tls-boundary-00-0000000000000001","mode":"split","sequence":1,"evidence_phase":"final","delivery_shape":"split","trace_id":"00000000000000000000000000000001","apache_client_span_id":"0000000000000001","java_server_span_id":"0000000000000011","java_parent_span_id":"0000000000000001","exact_parent":true,"same_request_evidence":true,"request_bytes":51201,"tls_application_record_count":15,"decrypted_callback_count":15,"header_decrypted_callback_count":9,"parser_callback_count":15,"parser_bytes":51201},{"marker":"tls-boundary-01-0000000000000002","mode":"coalesced","sequence":1,"evidence_phase":"partial","delivery_shape":"serialized_proxy_fallback","trace_id":"00000000000000000000000000000002","apache_client_span_id":"0000000000000002","java_server_span_id":"0000000000000012","java_parent_span_id":"0000000000000002","exact_parent":true,"same_request_evidence":true,"request_bytes":51201,"tls_application_record_count":15,"decrypted_callback_count":15,"header_decrypted_callback_count":9,"parser_callback_count":1,"parser_bytes":51201},{"marker":"tls-boundary-02-0000000000000003","mode":"coalesced","sequence":2,"evidence_phase":"final","delivery_shape":"serialized_proxy_fallback","trace_id":"00000000000000000000000000000003","apache_client_span_id":"0000000000000003","java_server_span_id":"0000000000000013","java_parent_span_id":"0000000000000003","exact_parent":true,"same_request_evidence":true,"request_bytes":51203,"tls_application_record_count":15,"decrypted_callback_count":15,"header_decrypted_callback_count":9,"parser_callback_count":1,"parser_bytes":51203}]}}' \
+    >"$result"
+  [[ "$(tls_boundary_reconciliation "$result" | jq -r '.exact_parent_count')" == "3" ]] || {
+    printf 'TLS boundary reconciliation rejected exact same-request evidence\n' >&2
+    return 1
+  }
+  {
+    cat -- "$result"
+    cat -- "$result"
+  } >"$mutated"
+  if tls_boundary_reconciliation "$mutated" >/dev/null 2>&1; then
+    printf 'TLS boundary reconciliation accepted multiple JSON documents\n' >&2
+    return 1
+  fi
+
+  mutations=(
+    '.status = "failed"'
+    '.scenario = "basic"'
+    '.request_count = 2'
+    '.tls_boundary_correlation.exact_parent_count = 2'
+    '.tls_boundary_correlation.wrong_parent_count = 1'
+    '.tls_boundary_correlation.unresolved_count = 1'
+    '.tls_boundary_correlation.same_request_evidence_count = 2'
+    '.tls_boundary_correlation.requests[0].marker = "tls-boundary-01-0000000000000001"'
+    '.tls_boundary_correlation.requests[0].trace_id = "0000000000000000000000000000000g"'
+    '.tls_boundary_correlation.requests[0].trace_id = "00000000000000000000000000000000"'
+    '.tls_boundary_correlation.requests[0].apache_client_span_id = "0000000000000000" | .tls_boundary_correlation.requests[0].java_parent_span_id = "0000000000000000"'
+    '.tls_boundary_correlation.requests[0].java_server_span_id = .tls_boundary_correlation.requests[0].apache_client_span_id'
+    '.tls_boundary_correlation.requests[0].java_parent_span_id = "0000000000000009"'
+    '.tls_boundary_correlation.requests[1].trace_id = .tls_boundary_correlation.requests[0].trace_id | .tls_boundary_correlation.requests[1].apache_client_span_id = .tls_boundary_correlation.requests[0].apache_client_span_id | .tls_boundary_correlation.requests[1].java_parent_span_id = .tls_boundary_correlation.requests[0].apache_client_span_id'
+    '.tls_boundary_correlation.requests[1].trace_id = .tls_boundary_correlation.requests[0].trace_id | .tls_boundary_correlation.requests[1].java_server_span_id = .tls_boundary_correlation.requests[0].java_server_span_id'
+    '.tls_boundary_correlation.requests[1].trace_id = .tls_boundary_correlation.requests[0].trace_id | .tls_boundary_correlation.requests[1].java_server_span_id = .tls_boundary_correlation.requests[0].apache_client_span_id'
+    '.tls_boundary_correlation.requests[0].exact_parent = false'
+    '.tls_boundary_correlation.requests[0].same_request_evidence = false'
+    '.tls_boundary_correlation.requests[0].request_bytes = 0 | .tls_boundary_correlation.requests[0].parser_bytes = 0'
+    '.tls_boundary_correlation.requests[0].request_bytes = 73729 | .tls_boundary_correlation.requests[0].parser_bytes = 73729'
+    '.tls_boundary_correlation.requests[0].tls_application_record_count = 1 | .tls_boundary_correlation.requests[0].decrypted_callback_count = 1 | .tls_boundary_correlation.requests[0].parser_callback_count = 1'
+    '.tls_boundary_correlation.requests[0].tls_application_record_count = 33 | .tls_boundary_correlation.requests[0].decrypted_callback_count = 33 | .tls_boundary_correlation.requests[0].parser_callback_count = 33'
+    '.tls_boundary_correlation.requests[0].decrypted_callback_count = 14'
+    '.tls_boundary_correlation.requests[0].header_decrypted_callback_count = 1'
+    '.tls_boundary_correlation.requests[0].parser_callback_count = 14'
+    '.tls_boundary_correlation.requests[0].parser_bytes = 51200'
+    '.tls_boundary_correlation.requests[1].evidence_phase = "final"'
+    '.tls_boundary_correlation.requests[1].delivery_shape = "parser_coalesced"'
+    '.tls_boundary_correlation.requests[1].parser_callback_count = 2'
+    '.tls_boundary_correlation.requests[2].sequence = 1'
+    '.tls_boundary_correlation.requests[2].evidence_phase = "partial"'
+    '.tls_boundary_correlation.requests |= [.[0], .[2], .[1]]'
+    '.tls_boundary_correlation.requests |= .[:2]'
+  )
+  for mutation in "${mutations[@]}"; do
+    jq "$mutation" "$result" >"$mutated"
+    if tls_boundary_reconciliation "$mutated" >/dev/null 2>&1; then
+      printf 'TLS boundary reconciliation accepted mutation: %s\n' "$mutation" >&2
+      return 1
+    fi
+  done
+}
+
 test_reason_coded_scenario_reconciliation_is_exact() {
   local -r coalesced="$TEST_TMP_DIR/coalesced-reconciliation.json"
   local -r mutated="$TEST_TMP_DIR/reason-coded-reconciliation-mutated.json"
@@ -10660,6 +10726,11 @@ test_scenario_fences_metrics_around_diagnostics() {
     assert_bridge_metric_delta() {
       [[ $# == 10 ]] || return 1
       printf 'bridge:%s:%s\n' "$2" "${10}" >>"$call_log"
+    }
+    tls_boundary_reconciliation() {
+      [[ "$name" == "tls-boundary" ]] || return 1
+      printf '%s\n' \
+        '{"exact_parent_count":3,"wrong_parent_count":0,"unresolved_count":0,"same_request_evidence_count":3,"requests":[]}'
     }
     write_java_diagnostics_delta() {
       : >"$3"
@@ -22996,6 +23067,7 @@ main() {
   test_bridge_take_count_includes_cancelled_request
   test_pressure_scenario_counts_are_unique_and_bounded
   test_concurrency_overlap_reconciliation_is_exact
+  test_tls_boundary_reconciliation_binds_exact_parents_to_record_evidence
   test_reason_coded_scenario_reconciliation_is_exact
   test_bridge_metric_delta_requires_exact_one_shot_results
   test_coalesced_bridge_metrics_follow_explicit_outcome

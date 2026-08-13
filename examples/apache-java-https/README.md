@@ -356,15 +356,21 @@ The live trace check requires each Java server span to have the exact Apache
 client span as its remote parent for the same marker and requires the pair to
 reuse one backend TLS identity. Evidence retains only bounded record metadata,
 byte counts, digest-equality booleans, lifecycle order, and delivery-shape
-labels. The runner also resolves both fixed-capacity receive coordination maps
-by their exact kernel layouts: `jrp_recv_cur` and `jrp_recv_guard` are distinct
-10,000-entry hash maps with 8-byte socket-cookie keys and 56-byte exact cursor
-values. It records both map IDs and occupancies before traffic, then reopens
-those same IDs after traffic. The scenario passes only after two consecutive
-bounded samples show both maps at their respective pre-run occupancies. The
-before, per-attempt, final, and status artifacts make cursor
-and guard cleanup independently auditable; neither map relies on a truncated,
-ambiguous kernel label.
+labels. The scenario result binds those two proof surfaces in one
+`tls_boundary_correlation` object: all three ordered rows must identify one
+canonical Apache client span and its exact Java server child, and the same row
+must account for that request's real TLS records, decrypted callbacks, parser
+callbacks, and bytes. The runner independently reconciles exact-parent and
+same-request counts as `3/3`, with zero wrong or unresolved parents. The runner
+also resolves both fixed-capacity receive coordination maps by their exact
+kernel layouts: `jrp_recv_cur` and `jrp_recv_guard` are distinct 10,000-entry
+hash maps with 8-byte socket-cookie keys and 56-byte exact cursor values. It
+records both map IDs and occupancies before traffic, then reopens those same IDs
+after traffic. The scenario passes only after two consecutive bounded samples
+show both maps at their respective pre-run occupancies. The before,
+per-attempt, final, and status artifacts make cursor and guard cleanup
+independently auditable; neither map relies on a truncated, ambiguous kernel
+label.
 
 Internally, the fixture temporarily retains raw request bytes in a
 verification buffer capped at 144 KiB (`2 * MAX_REQUEST_BYTES`). On the

@@ -189,6 +189,34 @@ type pressureCorrelationSummary struct {
 	UnresolvedCount   int `json:"unresolved_count"`
 }
 
+type tlsBoundaryRequestCorrelation struct {
+	Marker                       string `json:"marker"`
+	Mode                         string `json:"mode"`
+	Sequence                     int    `json:"sequence"`
+	EvidencePhase                string `json:"evidence_phase"`
+	DeliveryShape                string `json:"delivery_shape"`
+	TraceID                      string `json:"trace_id"`
+	ApacheClientSpanID           string `json:"apache_client_span_id"`
+	JavaServerSpanID             string `json:"java_server_span_id"`
+	JavaParentSpanID             string `json:"java_parent_span_id"`
+	ExactParent                  bool   `json:"exact_parent"`
+	SameRequestEvidence          bool   `json:"same_request_evidence"`
+	RequestBytes                 int    `json:"request_bytes"`
+	TLSApplicationRecordCount    int    `json:"tls_application_record_count"`
+	DecryptedCallbackCount       int    `json:"decrypted_callback_count"`
+	HeaderDecryptedCallbackCount int    `json:"header_decrypted_callback_count"`
+	ParserCallbackCount          int    `json:"parser_callback_count"`
+	ParserBytes                  int    `json:"parser_bytes"`
+}
+
+type tlsBoundaryCorrelationSummary struct {
+	ExactParentCount         int                             `json:"exact_parent_count"`
+	WrongParentCount         int                             `json:"wrong_parent_count"`
+	UnresolvedCount          int                             `json:"unresolved_count"`
+	SameRequestEvidenceCount int                             `json:"same_request_evidence_count"`
+	Requests                 []tlsBoundaryRequestCorrelation `json:"requests"`
+}
+
 type coalescedBridgeCorrelationSummary struct {
 	Outcome                    string `json:"outcome"`
 	ExactHitCount              int    `json:"exact_hit_count"`
@@ -289,6 +317,7 @@ type runResult struct {
 	Faults                     []faultResult                      `json:"faults,omitempty"`
 	ConnectionEvidence         *connectionEvidence                `json:"connection_evidence,omitempty"`
 	PressureCorrelation        *pressureCorrelationSummary        `json:"pressure_correlation,omitempty"`
+	TLSBoundaryCorrelation     *tlsBoundaryCorrelationSummary     `json:"tls_boundary_correlation,omitempty"`
 	CoalescedBridgeCorrelation *coalescedBridgeCorrelationSummary `json:"coalesced_bridge_correlation,omitempty"`
 	FaultDiagnosticsAfter      string                             `json:"fault_diagnostics_after,omitempty"`
 	JavaDiagnosticsAfter       string                             `json:"java_diagnostics_after,omitempty"`
@@ -404,6 +433,9 @@ var maxJavaDiagnosticsSnapshotLength = func() int {
 	}
 	return length
 }()
+
+var sendRunRequests = sendRequests
+var awaitRunAssertions = awaitAssertions
 
 func main() {
 	os.Exit(mainExitCode())
@@ -672,7 +704,7 @@ func run(ctx context.Context, cfg config) (*runResult, error) {
 	}
 	result.RequestCount = len(requests)
 
-	responses, latencies, elapsed, evidence, err := sendRequests(ctx, cfg, requests)
+	responses, latencies, elapsed, evidence, err := sendRunRequests(ctx, cfg, requests)
 	result.ConnectionEvidence = evidence
 	if err != nil {
 		return result, err
@@ -729,7 +761,7 @@ func run(ctx context.Context, cfg config) (*runResult, error) {
 			result.Cases[index].ParentOutcome = outcomes[index]
 		}
 	} else {
-		snapshots, assertionErr = awaitAssertions(ctx, cfg, requests)
+		snapshots, assertionErr = awaitRunAssertions(ctx, cfg, requests)
 	}
 	for i := range snapshots {
 		result.Cases[i].Trace = snapshots[i]
@@ -740,6 +772,7 @@ func run(ctx context.Context, cfg config) (*runResult, error) {
 		result.PressureCorrelation = &summary
 		pressureErr = validatePressureCorrelation(summary, len(requests))
 	}
+	assertionErr = reconcileTLSBoundaryResult(cfg, result, requests, assertionErr)
 	if assertionErr != nil {
 		return result, assertionErr
 	}
@@ -768,6 +801,24 @@ func run(ctx context.Context, cfg config) (*runResult, error) {
 	}
 
 	return result, nil
+}
+
+func reconcileTLSBoundaryResult(
+	cfg config,
+	result *runResult,
+	requests []requestCase,
+	assertionErr error,
+) error {
+	if cfg.scenario != "tls-boundary" {
+		return assertionErr
+	}
+	summary, correlationErr := summarizeTLSBoundaryCorrelation(cfg, result.Cases)
+	result.TLSBoundaryCorrelation = &summary
+	return errors.Join(
+		assertionErr,
+		correlationErr,
+		validateTLSBoundaryCorrelation(summary, len(requests)),
+	)
 }
 
 func makeRequests(cfg config) ([]requestCase, error) {
@@ -2504,6 +2555,402 @@ func validateSerializedTLSBoundaryExtension(
 		partial.DecryptedTotalBytes+final.RequestTotalBytes[1] != final.DecryptedTotalBytes ||
 		partial.ParserTotalBytes+final.RequestTotalBytes[1] != final.ParserTotalBytes {
 		return fmt.Errorf("serialized TLS boundary cumulative evidence is not a strict extension: partial=%+v final=%+v", partial, final)
+	}
+	return nil
+}
+
+func summarizeTLSBoundaryCorrelation(
+	cfg config,
+	cases []caseResult,
+) (tlsBoundaryCorrelationSummary, error) {
+	var summary tlsBoundaryCorrelationSummary
+	if cfg.scenario != "tls-boundary" {
+		return summary, fmt.Errorf(
+			"TLS boundary correlation requires the tls-boundary scenario, got %q",
+			cfg.scenario,
+		)
+	}
+
+	expected := [...]struct {
+		endpoint string
+		mode     string
+		sequence int
+	}{
+		{endpoint: "/api/tls-boundary/split", mode: "split", sequence: 1},
+		{endpoint: "/api/tls-boundary/coalesced", mode: "coalesced", sequence: 1},
+		{endpoint: "/api/tls-boundary/coalesced", mode: "coalesced", sequence: 2},
+	}
+	if len(cases) != len(expected) {
+		return summary, fmt.Errorf(
+			"TLS boundary correlation requires %d request results, got %d",
+			len(expected),
+			len(cases),
+		)
+	}
+
+	var correlationErrors []error
+	seenMarkers := make(map[string]struct{}, len(cases))
+	for index := range cases {
+		request := cases[index].Request
+		row := tlsBoundaryRequestCorrelation{
+			Marker:   request.Marker,
+			Mode:     request.TLSBoundaryMode,
+			Sequence: request.TLSBoundarySequence,
+		}
+		if evidence := cases[index].Response.TLSBoundary; evidence != nil {
+			row.EvidencePhase = evidence.EvidencePhase
+			row.DeliveryShape = evidence.DeliveryShape
+		}
+
+		if request.Marker == "" {
+			correlationErrors = append(correlationErrors, fmt.Errorf(
+				"TLS boundary request %d has an empty marker",
+				index,
+			))
+		} else if _, duplicate := seenMarkers[request.Marker]; duplicate {
+			correlationErrors = append(correlationErrors, fmt.Errorf(
+				"TLS boundary request %d reused marker %q",
+				index,
+				request.Marker,
+			))
+		} else {
+			seenMarkers[request.Marker] = struct{}{}
+		}
+		if request.Endpoint != expected[index].endpoint ||
+			request.TLSBoundaryMode != expected[index].mode ||
+			request.TLSBoundarySequence != expected[index].sequence {
+			correlationErrors = append(correlationErrors, fmt.Errorf(
+				"TLS boundary request %d has the wrong plan: endpoint=%q mode=%q sequence=%d",
+				index,
+				request.Endpoint,
+				request.TLSBoundaryMode,
+				request.TLSBoundarySequence,
+			))
+		}
+
+		spans := cases[index].Trace.Spans
+		apacheClients := selectExactSpans(
+			spans,
+			cfg.apacheService,
+			"CLIENT",
+			request.Endpoint,
+			request.Marker,
+		)
+		javaServers := selectExactSpans(
+			spans,
+			cfg.javaService,
+			"SERVER",
+			request.Endpoint,
+			request.Marker,
+		)
+		if len(apacheClients) == 1 {
+			row.TraceID = apacheClients[0].TraceID
+			row.ApacheClientSpanID = apacheClients[0].SpanID
+		}
+		if len(javaServers) == 1 {
+			row.JavaServerSpanID = javaServers[0].SpanID
+			row.JavaParentSpanID = javaServers[0].ParentSpanID
+		}
+
+		var graphErr error
+		if len(apacheClients) == 1 && len(javaServers) == 1 {
+			graphErr = validateTLSBoundarySpanIdentities(apacheClients[0], javaServers[0])
+		}
+		if graphErr == nil {
+			graphErr = tracecheck.AssertSnapshot(
+				cases[index].Trace,
+				expectationFor(cfg, request),
+			)
+		}
+		switch {
+		case graphErr == nil && len(apacheClients) == 1 && len(javaServers) == 1:
+			row.ExactParent = true
+			summary.ExactParentCount++
+		case len(apacheClients) == 1 && len(javaServers) == 1 &&
+			tlsBoundaryWrongParent(apacheClients[0], javaServers[0]):
+			summary.WrongParentCount++
+		case graphErr == nil:
+			summary.UnresolvedCount++
+			graphErr = errors.New("exact assertion did not retain one Apache client and one Java server")
+		default:
+			summary.UnresolvedCount++
+		}
+		if graphErr != nil {
+			correlationErrors = append(correlationErrors, fmt.Errorf(
+				"TLS boundary request %d exact Apache-to-Java graph: %w",
+				index,
+				graphErr,
+			))
+		}
+
+		if evidenceErr := populateTLSBoundaryRequestEvidence(
+			request,
+			cases[index].Response,
+			&row,
+		); evidenceErr != nil {
+			correlationErrors = append(correlationErrors, fmt.Errorf(
+				"TLS boundary request %d same-request evidence: %w",
+				index,
+				evidenceErr,
+			))
+		} else {
+			row.SameRequestEvidence = true
+			summary.SameRequestEvidenceCount++
+		}
+		summary.Requests = append(summary.Requests, row)
+	}
+
+	if extensionErr := validateSerializedTLSBoundaryExtension(
+		cases[1].Response.TLSBoundary,
+		cases[2].Response.TLSBoundary,
+	); extensionErr != nil {
+		for _, index := range []int{1, 2} {
+			if summary.Requests[index].SameRequestEvidence {
+				summary.Requests[index].SameRequestEvidence = false
+				summary.SameRequestEvidenceCount--
+			}
+		}
+		correlationErrors = append(correlationErrors, fmt.Errorf(
+			"TLS boundary coalesced partial/final evidence: %w",
+			extensionErr,
+		))
+	}
+	return summary, errors.Join(correlationErrors...)
+}
+
+func tlsBoundaryWrongParent(apacheClient, javaServer tracecheck.Span) bool {
+	if !canonicalTraceID(apacheClient.TraceID) || !canonicalSpanID(apacheClient.SpanID) ||
+		!canonicalTraceID(javaServer.TraceID) || !canonicalSpanID(javaServer.SpanID) ||
+		!canonicalSpanID(javaServer.ParentSpanID) {
+		return false
+	}
+	remote, known := tracecheck.ParentRemote(javaServer)
+	return !strings.EqualFold(apacheClient.TraceID, javaServer.TraceID) ||
+		!strings.EqualFold(apacheClient.SpanID, javaServer.ParentSpanID) ||
+		!known || !remote ||
+		tracecheck.TraceFlags(apacheClient) != tracecheck.TraceFlags(javaServer)
+}
+
+func validateTLSBoundarySpanIdentities(apacheClient, javaServer tracecheck.Span) error {
+	identities := [...]struct {
+		description string
+		value       string
+		trace       bool
+	}{
+		{description: "Apache trace ID", value: apacheClient.TraceID, trace: true},
+		{description: "Java trace ID", value: javaServer.TraceID, trace: true},
+		{description: "Apache client span ID", value: apacheClient.SpanID},
+		{description: "Java server span ID", value: javaServer.SpanID},
+		{description: "Java parent span ID", value: javaServer.ParentSpanID},
+	}
+	for _, identity := range identities {
+		valid := canonicalSpanID(identity.value)
+		if identity.trace {
+			valid = canonicalTraceID(identity.value)
+		}
+		if !valid {
+			return fmt.Errorf("non-canonical %s %q", identity.description, identity.value)
+		}
+	}
+	if strings.EqualFold(apacheClient.SpanID, javaServer.SpanID) {
+		return errors.New("Apache client and Java server reused one span identity")
+	}
+	return nil
+}
+
+func canonicalTraceID(value string) bool {
+	return canonicalHexID(value, 16)
+}
+
+func canonicalSpanID(value string) bool {
+	return canonicalHexID(value, 8)
+}
+
+func canonicalHexID(value string, byteLength int) bool {
+	if len(value) != hex.EncodedLen(byteLength) || value != strings.ToLower(value) {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	if err != nil {
+		return false
+	}
+	for _, value := range decoded {
+		if value != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func populateTLSBoundaryRequestEvidence(
+	request requestCase,
+	response backendResponse,
+	row *tlsBoundaryRequestCorrelation,
+) error {
+	if response.Marker != request.Marker {
+		return fmt.Errorf(
+			"response marker %q does not match request marker %q",
+			response.Marker,
+			request.Marker,
+		)
+	}
+	if response.BackendKind != "netty-tls-boundary" {
+		return fmt.Errorf(
+			"response backend %q is not the TLS boundary backend",
+			response.BackendKind,
+		)
+	}
+	if err := validateTLSBoundaryResponse(request, response); err != nil {
+		return err
+	}
+	evidence := response.TLSBoundary
+	requestIndex := request.TLSBoundarySequence - 1
+	if requestIndex < 0 || requestIndex >= len(evidence.RequestTotalBytes) ||
+		requestIndex >= len(evidence.RequestHeaderDecryptedCallbackCounts) {
+		return fmt.Errorf(
+			"request sequence %d is outside the evidence request set",
+			request.TLSBoundarySequence,
+		)
+	}
+	requestBytes := evidence.RequestTotalBytes[requestIndex]
+	requestOffset := sumInts(evidence.RequestTotalBytes[:requestIndex])
+	decryptedCallbackCount, aligned := exactCallbackSegmentCount(
+		evidence.DecryptedCallbackLengths,
+		requestOffset,
+		requestBytes,
+	)
+	if !aligned {
+		return fmt.Errorf(
+			"request sequence %d bytes do not align with decrypted callback boundaries",
+			request.TLSBoundarySequence,
+		)
+	}
+	parserCallbackCount, aligned := exactCallbackSegmentCount(
+		evidence.ParserCallbackLengths,
+		requestOffset,
+		requestBytes,
+	)
+	if !aligned {
+		return fmt.Errorf(
+			"request sequence %d bytes do not align with parser callback boundaries",
+			request.TLSBoundarySequence,
+		)
+	}
+	headerCallbackCount := evidence.RequestHeaderDecryptedCallbackCounts[requestIndex]
+	if decryptedCallbackCount < 2 || headerCallbackCount < 2 ||
+		headerCallbackCount > decryptedCallbackCount {
+		return fmt.Errorf(
+			"request sequence %d did not retain split TLS/decrypt callbacks: callbacks=%d header_callbacks=%d",
+			request.TLSBoundarySequence,
+			decryptedCallbackCount,
+			headerCallbackCount,
+		)
+	}
+
+	row.RequestBytes = requestBytes
+	row.TLSApplicationRecordCount = decryptedCallbackCount
+	row.DecryptedCallbackCount = decryptedCallbackCount
+	row.HeaderDecryptedCallbackCount = headerCallbackCount
+	row.ParserCallbackCount = parserCallbackCount
+	row.ParserBytes = requestBytes
+	return nil
+}
+
+func exactCallbackSegmentCount(lengths []int, start, length int) (int, bool) {
+	if start < 0 || length <= 0 || start > math.MaxInt-length {
+		return 0, false
+	}
+	end := start + length
+	offset := 0
+	startIndex := 0
+	started := start == 0
+	for index, callbackLength := range lengths {
+		if callbackLength <= 0 || offset > math.MaxInt-callbackLength {
+			return 0, false
+		}
+		if offset == start {
+			startIndex = index
+			started = true
+		}
+		offset += callbackLength
+		if !started && offset > start || started && offset > end {
+			return 0, false
+		}
+		if started && offset == end {
+			return index - startIndex + 1, true
+		}
+	}
+	return 0, false
+}
+
+func validateTLSBoundaryCorrelation(
+	summary tlsBoundaryCorrelationSummary,
+	requestCount int,
+) error {
+	if requestCount != 3 || len(summary.Requests) != requestCount {
+		return fmt.Errorf(
+			"TLS boundary correlation expected three request rows, got request_count=%d rows=%d",
+			requestCount,
+			len(summary.Requests),
+		)
+	}
+	exactParents := 0
+	sameRequestEvidence := 0
+	seenMarkers := make(map[string]struct{}, requestCount)
+	for index, request := range summary.Requests {
+		if request.Marker == "" {
+			return fmt.Errorf("TLS boundary correlation row %d has an empty marker", index)
+		}
+		if _, duplicate := seenMarkers[request.Marker]; duplicate {
+			return fmt.Errorf("TLS boundary correlation row %d duplicated marker %q", index, request.Marker)
+		}
+		seenMarkers[request.Marker] = struct{}{}
+		if request.ExactParent {
+			exactParents++
+			if !canonicalTraceID(request.TraceID) ||
+				!canonicalSpanID(request.ApacheClientSpanID) ||
+				!canonicalSpanID(request.JavaServerSpanID) ||
+				!canonicalSpanID(request.JavaParentSpanID) ||
+				!strings.EqualFold(request.ApacheClientSpanID, request.JavaParentSpanID) ||
+				strings.EqualFold(request.ApacheClientSpanID, request.JavaServerSpanID) {
+				return fmt.Errorf("TLS boundary correlation row %d has invalid exact-parent identities", index)
+			}
+		}
+		if request.SameRequestEvidence {
+			sameRequestEvidence++
+			if request.RequestBytes <= 0 || request.ParserBytes != request.RequestBytes ||
+				request.TLSApplicationRecordCount < 2 ||
+				request.DecryptedCallbackCount != request.TLSApplicationRecordCount ||
+				request.HeaderDecryptedCallbackCount < 2 ||
+				request.HeaderDecryptedCallbackCount > request.DecryptedCallbackCount ||
+				request.ParserCallbackCount < 1 {
+				return fmt.Errorf("TLS boundary correlation row %d has invalid same-request counts", index)
+			}
+		}
+	}
+	if summary.ExactParentCount != exactParents ||
+		summary.SameRequestEvidenceCount != sameRequestEvidence ||
+		summary.ExactParentCount+summary.WrongParentCount+summary.UnresolvedCount != requestCount {
+		return fmt.Errorf(
+			"TLS boundary correlation counts do not match rows: exact=%d/%d wrong=%d unresolved=%d same_request=%d/%d",
+			summary.ExactParentCount,
+			exactParents,
+			summary.WrongParentCount,
+			summary.UnresolvedCount,
+			summary.SameRequestEvidenceCount,
+			sameRequestEvidence,
+		)
+	}
+	if summary.ExactParentCount != requestCount || summary.WrongParentCount != 0 ||
+		summary.UnresolvedCount != 0 || summary.SameRequestEvidenceCount != requestCount {
+		return fmt.Errorf(
+			"TLS boundary correlation expected exact parents and same-request evidence=%d with wrong=0 unresolved=0, got exact=%d wrong=%d unresolved=%d same_request=%d",
+			requestCount,
+			summary.ExactParentCount,
+			summary.WrongParentCount,
+			summary.UnresolvedCount,
+			summary.SameRequestEvidenceCount,
+		)
 	}
 	return nil
 }

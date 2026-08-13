@@ -993,6 +993,153 @@ unix|status=1,version=2,requested=2,selected=2,attempted=2,getsockopt=0,unix=1
 EOF
 }
 
+test_auto_unavailable_configuration_requires_both_failed_attempts() {
+  local configuration=""
+  local status=""
+
+  for configuration in \
+    'version=2,status=12,requested=0,selected=255,attempted=3,getsockopt=4,unix=12' \
+    'version=2,status=8,requested=0,selected=255,attempted=3,getsockopt=10,unix=8' \
+    'version=2,status=13,requested=0,selected=255,attempted=3,getsockopt=12,unix=13'; do
+    auto_transports_unavailable_from_configuration "$configuration" || {
+      printf 'rejected exact auto-unavailable configuration: %s\n' \
+        "$configuration" >&2
+      return 1
+    }
+  done
+
+  while IFS= read -r configuration; do
+    if auto_transports_unavailable_from_configuration "$configuration"; then
+      printf 'accepted incomplete auto-unavailable configuration: %s\n' \
+        "$configuration" >&2
+      return 1
+    fi
+  done <<'EOF'
+version=1,status=12,requested=0,selected=255,attempted=3,getsockopt=4,unix=12
+version=2,status=12,requested=1,selected=255,attempted=3,getsockopt=4,unix=12
+version=2,status=12,requested=0,selected=0,attempted=3,getsockopt=4,unix=12
+version=2,status=12,requested=0,selected=255,attempted=1,getsockopt=4,unix=12
+version=2,status=12,requested=0,selected=255,attempted=2,getsockopt=4,unix=12
+version=2,status=12,requested=0,selected=255,attempted=3,getsockopt=1,unix=12
+version=2,status=12,requested=0,selected=255,attempted=3,getsockopt=4,unix=1
+version=2,status=10,requested=0,selected=255,attempted=3,getsockopt=4,unix=12
+version=2,status=12,requested=0,selected=255,attempted=3,getsockopt=4,unix=12,extra=0
+EOF
+
+  for status in {0..13}; do
+    configuration="version=2,status=12,requested=0,selected=255,attempted=3,getsockopt=$status,unix=12"
+    case "$status" in
+      4|5|8|10|11|12)
+        auto_transports_unavailable_from_configuration "$configuration" || {
+          printf 'rejected allowed primary failure status %s\n' "$status" >&2
+          return 1
+        }
+        ;;
+      *)
+        if auto_transports_unavailable_from_configuration "$configuration"; then
+          printf 'accepted forbidden primary failure status %s\n' "$status" >&2
+          return 1
+        fi
+        ;;
+    esac
+  done
+  for status in {0..13}; do
+    configuration="version=2,status=$status,requested=0,selected=255,attempted=3,getsockopt=4,unix=$status"
+    case "$status" in
+      3|4|5|6|7|8|9|10|11|12|13)
+        auto_transports_unavailable_from_configuration "$configuration" || {
+          printf 'rejected allowed Unix failure status %s\n' "$status" >&2
+          return 1
+        }
+        ;;
+      *)
+        if auto_transports_unavailable_from_configuration "$configuration"; then
+          printf 'accepted forbidden Unix failure status %s\n' "$status" >&2
+          return 1
+        fi
+        ;;
+    esac
+  done
+}
+
+test_auto_unavailable_configuration_wait_is_bounded_and_fail_closed() {
+  local -r success_dir="$TEST_TMP_DIR/auto-unavailable-configuration-success"
+  local -r failure_dir="$TEST_TMP_DIR/auto-unavailable-configuration-failure"
+  local -r exact='version=2,status=12,requested=0,selected=255,attempted=3,getsockopt=4,unix=12'
+  local -r incomplete='version=2,status=1,requested=0,selected=1,attempted=1,getsockopt=1,unix=0'
+
+  mkdir -p -- "$success_dir/certs" "$failure_dir/certs"
+  (
+    RESULT_DIR="$success_dir"
+    CERT_DIR="$success_dir/certs"
+    curl() {
+      local attempts=0
+
+      [[ "$#" == "12" &&
+        "$1" == "--fail" && "$2" == "--silent" && "$3" == "--show-error" &&
+        "$4" == "--max-time" && "$5" == "5" &&
+        "$6" == "--max-filesize" && "$7" == "$TRANSPORT_CONFIGURATION_MAX_BYTES" &&
+        "$8" == "--cacert" && "$9" == "$CERT_DIR/ca.crt" &&
+        "${10}" == "https://127.0.0.1:18443/obi-transport-configuration" &&
+        "${11}" == "--output" &&
+        "${12}" == "$RESULT_DIR"/.java-auto-unavailable-transport.* ]] || return 91
+      printf 'attempt\n' >>"$success_dir/curl-attempts"
+      attempts="$(wc -l <"$success_dir/curl-attempts")"
+      if ((attempts == 1)); then
+        printf '%s\n' "$incomplete" >"${@: -1}"
+      else
+        printf '%s\n' "$exact" >"${@: -1}"
+      fi
+    }
+    sleep() { :; }
+
+    wait_for_auto_transports_unavailable_configuration \
+      "$success_dir/java-auto-unavailable-transport-configuration.txt"
+  ) || {
+    printf 'bounded auto-unavailable wait rejected an eventual exact failure\n' >&2
+    return 1
+  }
+  [[ "$(wc -l <"$success_dir/curl-attempts")" == "2" &&
+    "$(<"$success_dir/java-auto-unavailable-transport-configuration.txt")" == \
+      "$exact" &&
+    "$(wc -l <"$success_dir/auto-unavailable-transport-attempts.txt")" == "2" ]] || {
+    printf 'auto-unavailable wait did not retain its exact attempt boundary\n' >&2
+    return 1
+  }
+
+  if (
+    RESULT_DIR="$failure_dir"
+    CERT_DIR="$failure_dir/certs"
+    curl() {
+      [[ "$#" == "12" &&
+        "$1" == "--fail" && "$2" == "--silent" && "$3" == "--show-error" &&
+        "$4" == "--max-time" && "$5" == "5" &&
+        "$6" == "--max-filesize" && "$7" == "$TRANSPORT_CONFIGURATION_MAX_BYTES" &&
+        "$8" == "--cacert" && "$9" == "$CERT_DIR/ca.crt" &&
+        "${10}" == "https://127.0.0.1:18443/obi-transport-configuration" &&
+        "${11}" == "--output" &&
+        "${12}" == "$RESULT_DIR"/.java-auto-unavailable-transport.* ]] || return 91
+      printf 'attempt\n' >>"$failure_dir/curl-attempts"
+      printf '%s\n' "$incomplete" >"${@: -1}"
+    }
+    sleep() { :; }
+
+    wait_for_auto_transports_unavailable_configuration \
+      "$failure_dir/java-auto-unavailable-transport-configuration.txt"
+  ) >/dev/null 2>&1; then
+    printf 'auto-unavailable wait accepted a permanently selected transport\n' >&2
+    return 1
+  fi
+  [[ "$(wc -l <"$failure_dir/curl-attempts")" == \
+      "$AUTO_UNAVAILABLE_CONFIGURATION_MAX_ATTEMPTS" &&
+    ! -e "$failure_dir/java-auto-unavailable-transport-configuration.txt" &&
+    "$(wc -l <"$failure_dir/auto-unavailable-transport-attempts.txt")" == \
+      "$AUTO_UNAVAILABLE_CONFIGURATION_MAX_ATTEMPTS" ]] || {
+    printf 'auto-unavailable wait escaped its configured attempt bound\n' >&2
+    return 1
+  }
+}
+
 test_selected_transport_uses_java_diagnostics() {
   local -r result_dir="$TEST_TMP_DIR/java-transport-configuration"
   local -r curl_attempts="$result_dir/curl-attempts"
@@ -1868,6 +2015,42 @@ test_primary_generation_mismatch_requires_one_forced_primary() {
       --transport getsockopt --scenario primary-generation-mismatch --requests 2
   ) >/dev/null 2>&1; then
     printf 'accepted generation mismatch with multiple requests\n' >&2
+    return 1
+  fi
+}
+
+test_auto_unavailable_requires_one_auto_request() {
+  (
+    TRANSPORT=getsockopt
+    SCENARIO=all
+    REQUEST_COUNT=0
+    parse_args --transport auto --scenario auto-unavailable --requests 1
+    [[ "$TRANSPORT" == "auto" && "$SCENARIO" == "auto-unavailable" && \
+      "$REQUEST_COUNT" == "1" ]]
+  ) || {
+    printf 'rejected the bounded auto-unavailable control\n' >&2
+    return 1
+  }
+  local transport=""
+  for transport in getsockopt unix; do
+    if (
+      TRANSPORT=auto
+      SCENARIO=all
+      REQUEST_COUNT=0
+      parse_args --transport "$transport" --scenario auto-unavailable
+    ) >/dev/null 2>&1; then
+      printf 'accepted auto-unavailable with forced %s transport\n' \
+        "$transport" >&2
+      return 1
+    fi
+  done
+  if (
+    TRANSPORT=auto
+    SCENARIO=all
+    REQUEST_COUNT=0
+    parse_args --transport auto --scenario auto-unavailable --requests 2
+  ) >/dev/null 2>&1; then
+    printf 'accepted auto-unavailable with multiple requests\n' >&2
     return 1
   fi
 }
@@ -9734,6 +9917,103 @@ test_java_diagnostics_delta_is_exact() {
   }
 }
 
+test_auto_unavailable_diagnostics_are_bounded_and_fail_closed() {
+  local -r before="$TEST_TMP_DIR/auto-unavailable-java-before.txt"
+  local -r after="$TEST_TMP_DIR/auto-unavailable-java-after.txt"
+  local -r delta="$TEST_TMP_DIR/auto-unavailable-java.delta"
+  local REPEAT_COUNT=1
+
+  write_diagnostics_fixture "$before" 0 0 0 0 0 0
+  write_diagnostics_fixture "$after" 0 0 0 0 0 0 transport_error 5
+  sed -i 's/registration_fail=0/registration_fail=2/' "$after"
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  assert_auto_unavailable_diagnostics_delta "$delta" || {
+    printf 'auto-unavailable diagnostics rejected bounded transport failures\n' >&2
+    return 1
+  }
+
+  write_diagnostics_fixture "$after" 1 0 0 0 0 0 transport_error 4
+  sed -i 's/registration_fail=0/registration_fail=2/' "$after"
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  if assert_auto_unavailable_diagnostics_delta "$delta" >/dev/null 2>&1; then
+    printf 'auto-unavailable diagnostics accepted an OBI parent\n' >&2
+    return 1
+  fi
+
+  write_diagnostics_fixture "$after" 0 0 0 0 0 0 transport_error 5
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  if assert_auto_unavailable_diagnostics_delta "$delta" >/dev/null 2>&1; then
+    printf 'auto-unavailable diagnostics accepted no failed registration\n' >&2
+    return 1
+  fi
+
+  sed -i 's/registration_fail=0/registration_fail=6/' "$after"
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  if assert_auto_unavailable_diagnostics_delta "$delta" >/dev/null 2>&1; then
+    printf 'auto-unavailable diagnostics accepted more retries than takes\n' >&2
+    return 1
+  fi
+
+  write_diagnostics_fixture "$after" 0 0 0 0 0 0 transport_error 17
+  sed -i 's/registration_fail=0/registration_fail=2/' "$after"
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  if assert_auto_unavailable_diagnostics_delta "$delta" >/dev/null 2>&1; then
+    printf 'auto-unavailable diagnostics accepted an unbounded take count\n' >&2
+    return 1
+  fi
+
+  write_diagnostics_fixture "$after" 0 0 0 0 0 0 missing 5
+  sed -i 's/registration_fail=0/registration_fail=2/' "$after"
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  if assert_auto_unavailable_diagnostics_delta "$delta" >/dev/null 2>&1; then
+    printf 'auto-unavailable diagnostics accepted unattributed misses\n' >&2
+    return 1
+  fi
+
+  write_diagnostics_fixture "$after" 0 0 0 0 0 0 transport_error 5
+  sed -i \
+    -e 's/registration_fail=0/registration_fail=2/' \
+    -e 's/d_transport_error=0/d_transport_error=1/' "$after"
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  if assert_auto_unavailable_diagnostics_delta "$delta" >/dev/null 2>&1; then
+    printf 'auto-unavailable diagnostics accepted a discard result\n' >&2
+    return 1
+  fi
+
+  REPEAT_COUNT=10
+  write_diagnostics_fixture "$after" 0 0 0 0 0 0 transport_error n
+  sed -i 's/registration_fail=0/registration_fail=2/' "$after"
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  assert_auto_unavailable_diagnostics_delta "$delta" || {
+    printf 'auto-unavailable diagnostics did not scale with repeated requests\n' >&2
+    return 1
+  }
+
+  write_diagnostics_fixture "$after" 0 0 0 0 0 0 transport_error m
+  sed -i 's/registration_fail=0/registration_fail=2/' "$after"
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  if assert_auto_unavailable_diagnostics_delta "$delta" >/dev/null 2>&1; then
+    printf 'auto-unavailable diagnostics accepted too few repeated takes\n' >&2
+    return 1
+  fi
+
+  write_diagnostics_fixture "$after" 0 0 0 0 0 0 transport_error y
+  sed -i 's/registration_fail=0/registration_fail=u/' "$after"
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  assert_auto_unavailable_diagnostics_delta "$delta" || {
+    printf 'auto-unavailable diagnostics rejected the repeated registration bound\n' >&2
+    return 1
+  }
+
+  write_diagnostics_fixture "$after" 0 0 0 0 0 0 transport_error y
+  sed -i 's/registration_fail=0/registration_fail=v/' "$after"
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  if assert_auto_unavailable_diagnostics_delta "$delta" >/dev/null 2>&1; then
+    printf 'auto-unavailable diagnostics accepted excessive repeated registration failures\n' >&2
+    return 1
+  fi
+}
+
 test_reason_coded_control_diagnostics_are_exact() {
   local -r before="$TEST_TMP_DIR/reason-coded-before.txt"
   local -r after="$TEST_TMP_DIR/reason-coded-after.txt"
@@ -13678,6 +13958,243 @@ test_permanent_absence_requires_a_full_jvm_lifetime_boundary() {
   fi
 }
 
+test_auto_unavailable_control_keeps_one_jvm_and_recovers() {
+  local -r result_dir="$TEST_TMP_DIR/auto-unavailable-control"
+  local -r observed="$result_dir/observed.txt"
+  local -r expected="$result_dir/expected.txt"
+
+  mkdir -p -- "$result_dir/certs"
+  (
+    RESULT_DIR="$result_dir"
+    CERT_DIR="$result_dir/certs"
+    TRANSPORT=auto
+    SELECTED_TRANSPORT=getsockopt
+    BRIDGE_RUNNING=true
+    CONTEXT_PROPAGATION=tcp
+    SCENARIO_VARIANT=""
+    REQUEST_COUNT=1000
+    REPEAT_COUNT=10
+    COMPOSE=(test-compose)
+    run_disabled_control() { printf 'disabled\n' >>"$observed"; }
+    capture_control_response() {
+      printf 'control:%s\n' "$1" >>"$observed"
+      printf '{"status":"ok"}\n' >"$RESULT_DIR/$1-response.normalized.json"
+      printf '200\n' >"$RESULT_DIR/$1-response.status"
+    }
+    cmp() {
+      local left=""
+      local right=""
+
+      [[ "$#" == "4" && "$1" == "-s" && "$2" == "--" ]] || return 92
+      left="$3"
+      right="$4"
+      printf 'cmp:%s:%s\n' "${left##*/}" "${right##*/}" >>"$observed"
+      command cmp "$@"
+    }
+    recreate_instrumented_stack() {
+      printf 'recreate:%s:%s:%s\n' "$1" "$2" "$3" >>"$observed"
+      SELECTED_TRANSPORT=getsockopt
+      BRIDGE_RUNNING=true
+    }
+    assert_runtime_contract() {
+      printf 'runtime:%s:%s\n' "$1" "${2:-false}" >>"$observed"
+    }
+    capture_service_runtime_identity() {
+      printf 'identity:%s\n' "${2##*/}" >>"$observed"
+      printf 'container_id=java-container\nhost_pid=123\nstarted_at=cursor\n' >"$2"
+    }
+    stop_obi_for_no_state_control() {
+      printf 'stop:%s\n' "$1" >>"$observed"
+      write_diagnostics_fixture "$2" 0 0 0 0 0 0
+      SELECTED_TRANSPORT=""
+      BRIDGE_RUNNING=false
+    }
+    sleep() { printf 'sleep:%s\n' "$1" >>"$observed"; }
+    run_scenario() {
+      printf 'scenario:%s:%s:requests=%s:repeat=%s\n' \
+        "$1" "${2:-true}" "$REQUEST_COUNT" "$REPEAT_COUNT" >>"$observed"
+    }
+    wait_for_auto_transports_unavailable_configuration() {
+      printf 'both-unavailable\n' >>"$observed"
+      printf '%s\n' \
+        'version=2,status=12,requested=0,selected=255,attempted=3,getsockopt=4,unix=12' \
+        >"$1"
+    }
+    capture_java_diagnostics() {
+      printf 'diagnostics:%s\n' "$1" >>"$observed"
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+      write_diagnostics_fixture \
+        "$RESULT_DIR/phases/$1/java-diagnostics.txt" 0 0 0 0 0 0 \
+        transport_error n
+      sed -i 's/registration_fail=0/registration_fail=2/' \
+        "$RESULT_DIR/phases/$1/java-diagnostics.txt"
+    }
+    assert_runtime_identity_unchanged() {
+      printf 'identity-unchanged:%s:%s:%s\n' \
+        "${1##*/}" "${2##*/}" "${3:-}" >>"$observed"
+      command cmp -s -- "$1" "$2"
+    }
+    assert_compose_service_stopped() {
+      printf 'stopped:%s:%s\n' "$1" "${2:-}" >>"$observed"
+    }
+    date() { printf 'recovery-cursor\n'; }
+    run_bounded() { printf 'bounded:%s\n' "$*" >>"$observed"; }
+    wait_for_log() {
+      printf 'log:%s:%s:%s:%s\n' \
+        "$1" "$2" "$3" "${4:-}" >>"$observed"
+    }
+    wait_for_apache_instrumentation() { printf 'apache-ready\n' >>"$observed"; }
+    wait_for_http() { printf 'http-ready\n' >>"$observed"; }
+    assert_selected_transport() {
+      printf 'selected:%s\n' "$1" >>"$observed"
+      SELECTED_TRANSPORT=getsockopt
+    }
+    wait_for_java_duplicate_suppression() { printf 'suppression-ready\n' >>"$observed"; }
+    eval "$(declare -f assert_auto_unavailable_diagnostics_delta | \
+      sed '1s/assert_auto_unavailable_diagnostics_delta/assert_auto_unavailable_diagnostics_delta_implementation/')"
+    assert_auto_unavailable_diagnostics_delta() {
+      printf 'diagnostics-assert:%s\n' "${1##*/}" >>"$observed"
+      assert_auto_unavailable_diagnostics_delta_implementation "$@"
+    }
+
+    run_auto_unavailable_control
+  ) || {
+    printf 'auto-unavailable application control failed its mocked lifecycle\n' >&2
+    return 1
+  }
+
+  printf '%s\n' \
+    'disabled' \
+    'control:auto-unavailable-disabled' \
+    'recreate:tcp:auto-unavailable preparation:auto' \
+    'runtime:basic:true' \
+    'identity:auto-unavailable-java-before.txt' \
+    'stop:auto-unavailable' \
+    'runtime:auto-unavailable:false' \
+    'control:auto-unavailable' \
+    'cmp:auto-unavailable-disabled-response.normalized.json:auto-unavailable-response.normalized.json' \
+    'cmp:auto-unavailable-disabled-response.status:auto-unavailable-response.status' \
+    "sleep:$JAVA_PROVIDER_RETRY_SETTLE_SECONDS" \
+    'scenario:fail-open:false:requests=1:repeat=10' \
+    'both-unavailable' \
+    'scenario:w3c-only:false:requests=1:repeat=10' \
+    'diagnostics:auto-unavailable-after' \
+    'diagnostics-assert:java-diagnostics.delta' \
+    'identity:auto-unavailable-java-fault.txt' \
+    'identity-unchanged:auto-unavailable-java-before.txt:auto-unavailable-java-fault.txt:auto-unavailable requests' \
+    'stopped:obi:auto-unavailable boundary' \
+    'bounded:120 test-compose up --detach --timeout 30 obi' \
+    'log:obi:Java remote parent bridge ready:auto-unavailable OBI recovery:recovery-cursor' \
+    "sleep:$JAVA_PROVIDER_RETRY_SETTLE_SECONDS" \
+    'apache-ready' \
+    'http-ready' \
+    'log:java-backend:OBI remote-parent provider ready:auto-unavailable Java provider recovery:recovery-cursor' \
+    'selected:auto' \
+    'suppression-ready' \
+    'runtime:basic:true' \
+    'identity:auto-unavailable-java-recovery.txt' \
+    'identity-unchanged:auto-unavailable-java-before.txt:auto-unavailable-java-recovery.txt:auto-unavailable recovery' \
+    'scenario:basic:true:requests=1:repeat=10' >"$expected"
+  cmp -s -- "$expected" "$observed" || {
+    printf 'auto-unavailable lifecycle ordering changed\n' >&2
+    diff -u -- "$expected" "$observed" >&2 || true
+    return 1
+  }
+  jq -e '
+    .status == "passed" and
+    .scenario == "auto-unavailable" and
+    .requested_transport == "auto" and
+    .attempted_transports == ["getsockopt", "unix"] and
+    .selected_transport == "none" and
+    .disabled_baseline_equivalent == true and
+    .fail_open == "passed" and
+    .w3c_precedence == "passed" and
+    .single_jvm_lifetime == true and
+    .retry_storm == "absent" and
+    .post_fault_recovery == "passed"
+  ' "$result_dir/scenario-auto-unavailable-status.json" >/dev/null || {
+    printf 'auto-unavailable status omitted its fail-closed contract\n' >&2
+    return 1
+  }
+
+  (
+    local dispatched=false
+
+    SCENARIO=auto-unavailable
+    run_auto_unavailable_control() { dispatched=true; }
+    execute_requested_scenarios
+    [[ "$dispatched" == "true" ]]
+  ) || {
+    printf 'auto-unavailable scenario did not dispatch its application control\n' >&2
+    return 1
+  }
+  local suite=""
+  suite="$(declare -f execute_requested_scenarios)" || return $?
+  [[ "$suite" == *'if [[ "$TRANSPORT" == "auto" ]]'* &&
+    "$suite" == *'run_auto_unavailable_control'* &&
+    "$suite" == *'auto-unavailable "requires auto transport selection"'* ]] || {
+    printf 'all-suite auto-unavailable coverage is no longer explicit\n' >&2
+    return 1
+  }
+}
+
+test_auto_unavailable_failure_restores_the_stack_and_status() {
+  local -r result_dir="$TEST_TMP_DIR/auto-unavailable-failure-cleanup"
+  local -r observed="$result_dir/observed.txt"
+  local status=0
+
+  mkdir -p -- "$result_dir/certs"
+  (
+    RESULT_DIR="$result_dir"
+    CERT_DIR="$result_dir/certs"
+    TRANSPORT=auto
+    SELECTED_TRANSPORT=getsockopt
+    BRIDGE_RUNNING=true
+    CONTEXT_PROPAGATION=tcp
+    SCENARIO_VARIANT="original"
+    COMPOSE=(test-compose)
+    run_disabled_control() { :; }
+    capture_control_response() {
+      printf '{"status":"ok"}\n' >"$RESULT_DIR/$1-response.normalized.json"
+      printf '200\n' >"$RESULT_DIR/$1-response.status"
+    }
+    recreate_instrumented_stack() {
+      printf 'recreate:%s:%s:%s:variant=%s\n' \
+        "$1" "$2" "$3" "$SCENARIO_VARIANT" >>"$observed"
+      SELECTED_TRANSPORT=getsockopt
+      BRIDGE_RUNNING=true
+    }
+    assert_runtime_contract() { :; }
+    capture_service_runtime_identity() {
+      printf 'container_id=java-container\nhost_pid=123\nstarted_at=cursor\n' >"$2"
+    }
+    stop_obi_for_no_state_control() {
+      printf 'stop:%s\n' "$1" >>"$observed"
+      write_diagnostics_fixture "$2" 0 0 0 0 0 0
+      SELECTED_TRANSPORT=""
+      BRIDGE_RUNNING=false
+    }
+    sleep() { :; }
+    run_scenario() { printf 'scenario:%s\n' "$1" >>"$observed"; }
+    wait_for_auto_transports_unavailable_configuration() {
+      printf 'configuration-failed\n' >>"$observed"
+      return 73
+    }
+
+    run_auto_unavailable_control
+  ) && status=0 || status=$?
+
+  [[ "$status" == "73" ]] || {
+    printf 'auto-unavailable cleanup replaced the primary failure status: %s\n' \
+      "$status" >&2
+    return 1
+  }
+  [[ "$(<"$observed")" == $'recreate:tcp:auto-unavailable preparation:auto:variant=original\nstop:auto-unavailable\nscenario:fail-open\nconfiguration-failed\nrecreate:tcp:auto-unavailable cleanup:auto:variant=auto-unavailable' ]] || {
+    printf 'auto-unavailable failure did not restore the instrumented stack\n' >&2
+    return 1
+  }
+}
+
 test_permanent_absence_startup_uses_normal_runtime_contract() {
   local -r result_dir="$TEST_TMP_DIR/permanent-absence-startup"
 
@@ -13713,6 +14230,46 @@ test_permanent_absence_startup_uses_normal_runtime_contract() {
       *"trace-receiver java-backend coalesced-source apache-proxy obi"* &&
     "$(<"$result_dir/runtime")" == "basic" ]] || {
     printf 'permanent-absence startup did not retain the normal OBI runtime\n' >&2
+    return 1
+  }
+}
+
+test_auto_unavailable_startup_uses_healthy_auto_contract() {
+  local -r result_dir="$TEST_TMP_DIR/auto-unavailable-startup"
+
+  mkdir -p -- "$result_dir"
+  (
+    RESULT_DIR="$result_dir"
+    SCENARIO=auto-unavailable
+    TRANSPORT=auto
+    COMMAND_TIMEOUT_SECONDS=5
+    STACK_STARTED=false
+    BRIDGE_RUNNING=false
+    COMPOSE=(test-compose)
+    assert_project_docker_identity_unchanged() { :; }
+    assert_no_pending_permanent_absence_recovery() { :; }
+    verify_compose_project_ownership() { :; }
+    invalidate_project_transport_evidence() { :; }
+    run_bounded() { :; }
+    run_logged_bounded() { printf '%s\n' "$*" >"$result_dir/compose"; }
+    date() { printf 'startup-cursor\n'; }
+    wait_for_http() { :; }
+    wait_for_log() { :; }
+    wait_for_apache_instrumentation() { :; }
+    assert_selected_transport() { printf '%s\n' "${1:-$TRANSPORT}" >"$result_dir/selected"; }
+    assert_apache_denies_java_diagnostics() { :; }
+    assert_runtime_contract() { printf '%s\n' "$1" >"$result_dir/runtime"; }
+
+    start_stack
+  ) || {
+    printf 'auto-unavailable normal startup failed before control dispatch\n' >&2
+    return 1
+  }
+  [[ "$(<"$result_dir/compose")" == \
+      *"trace-receiver java-backend coalesced-source apache-proxy obi"* &&
+    "$(<"$result_dir/selected")" == "auto" &&
+    "$(<"$result_dir/runtime")" == "basic" ]] || {
+    printf 'auto-unavailable startup did not establish a healthy auto bridge\n' >&2
     return 1
   }
 }
@@ -22990,6 +23547,8 @@ main() {
   test_custom_all_request_count_is_non_acceptance
   test_numeric_options_reject_overflow
   test_transport_configuration_parser_is_exact
+  test_auto_unavailable_configuration_requires_both_failed_attempts
+  test_auto_unavailable_configuration_wait_is_bounded_and_fail_closed
   test_selected_transport_uses_java_diagnostics
   test_transport_configuration_file_size_boundary_is_exact
   test_control_modes_are_distinct
@@ -23006,6 +23565,7 @@ main() {
   test_w3c_fault_requires_forced_unix
   test_primary_w3c_stale_requires_forced_primary
   test_primary_generation_mismatch_requires_one_forced_primary
+  test_auto_unavailable_requires_one_auto_request
   test_unix_w3c_stale_requires_forced_unix
   test_primary_w3c_fault_requires_forced_primary
   test_primary_w3c_fault_modes_are_exact
@@ -23103,6 +23663,7 @@ main() {
   test_unix_endpoint_restart_invalidates_before_stack_mutation
   test_java_diagnostics_schema_is_exact
   test_java_diagnostics_delta_is_exact
+  test_auto_unavailable_diagnostics_are_bounded_and_fail_closed
   test_reason_coded_control_diagnostics_are_exact
   test_pressure_unix_already_consumed_diagnostics_are_exact
   test_java_diagnostics_header_is_exact_and_piggybacked
@@ -23161,7 +23722,10 @@ main() {
   test_standalone_restart_invalidates_before_stack_mutation
   test_extension_disabled_control_uses_configuration_log
   test_permanent_absence_requires_a_full_jvm_lifetime_boundary
+  test_auto_unavailable_control_keeps_one_jvm_and_recovers
+  test_auto_unavailable_failure_restores_the_stack_and_status
   test_permanent_absence_startup_uses_normal_runtime_contract
+  test_auto_unavailable_startup_uses_healthy_auto_contract
   test_permanent_absence_startup_refuses_prior_run_recovery
   test_permanent_absence_project_guard_is_host_shared
   test_project_guard_terminal_handoff_is_status_truthful

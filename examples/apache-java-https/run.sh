@@ -118,6 +118,10 @@ PERMANENT_ABSENCE_REMOTE_PARENT_LOG_MAX=64
 PERMANENT_ABSENCE_LOG_MAX_BYTES=1048576
 PERMANENT_ABSENCE_LOG_MAX_LINES=10000
 PERMANENT_ABSENCE_LOG_CAPTURE_TIMEOUT_SECONDS=30
+AUTO_UNAVAILABLE_CONFIGURATION_MAX_ATTEMPTS=8
+AUTO_UNAVAILABLE_REGISTRATION_FAILURE_MAX=12
+AUTO_UNAVAILABLE_TAKE_MIN=5
+AUTO_UNAVAILABLE_TAKE_MAX=16
 COMPOSE_LOG_MAX_BYTES=1048576
 COMPOSE_LOG_MAX_LINES=10000
 COMPOSE_LOG_CAPTURE_TIMEOUT_SECONDS=30
@@ -216,6 +220,9 @@ readonly PERMANENT_ABSENCE_REGISTRATION_FAILURE_MAX
 readonly PERMANENT_ABSENCE_REMOTE_PARENT_LOG_MAX
 readonly PERMANENT_ABSENCE_LOG_MAX_BYTES PERMANENT_ABSENCE_LOG_MAX_LINES
 readonly PERMANENT_ABSENCE_LOG_CAPTURE_TIMEOUT_SECONDS
+readonly AUTO_UNAVAILABLE_CONFIGURATION_MAX_ATTEMPTS
+readonly AUTO_UNAVAILABLE_REGISTRATION_FAILURE_MAX
+readonly AUTO_UNAVAILABLE_TAKE_MIN AUTO_UNAVAILABLE_TAKE_MAX
 readonly COMPOSE_LOG_MAX_BYTES COMPOSE_LOG_MAX_LINES
 readonly COMPOSE_LOG_CAPTURE_TIMEOUT_SECONDS
 readonly DOCKER_SERVER_ID_MAX_BYTES
@@ -399,6 +406,7 @@ Options:
                           pressure, handoff, virtual-thread, netty, netty-server, dispatch,
                           w3c, w3c-match, obi-flags, w3c-fault, primary-w3c-fault,
                           primary-generation-mismatch, primary-w3c-stale, permanent-absence,
+                          auto-unavailable,
                           unix-w3c-stale, w3c-only,
                           security, restart-fault, helper-attach-failure,
                           delayed-otlp-suppression, assertion-failure, fail-open,
@@ -423,6 +431,7 @@ boundaries, the live coalesced receive control, timeout/retry, pressure,
 executor/virtual-thread/Netty handoff, inbound Netty TLS, async redispatch, W3C
 precedence/match/flags/fault/no-state controls, the primary stale-record control,
 the primary malformed-response control,
+auto selection with both primary and fallback unavailable,
 late attach, OBI restart during
 traffic, helper attach failure, bounded primary or fallback transport abuse
 controls, delayed first-OTLP suppression, Unix endpoint replacement when that transport is selected,
@@ -587,7 +596,7 @@ parse_args() {
       ;;
   esac
   case "$SCENARIO" in
-    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|coalesced-bridge|timeout-retry|pressure|handoff|virtual-thread|netty|netty-server|dispatch|w3c|w3c-match|obi-flags|w3c-fault|primary-w3c-fault|primary-generation-mismatch|primary-w3c-stale|unix-w3c-stale|w3c-only|security|restart-fault|helper-attach-failure|delayed-otlp-suppression|assertion-failure|fail-open|permanent-absence|restart|disabled|uninstrumented|benchmark-disabled|benchmark-uninstrumented)
+    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|coalesced-bridge|timeout-retry|pressure|handoff|virtual-thread|netty|netty-server|dispatch|w3c|w3c-match|obi-flags|w3c-fault|primary-w3c-fault|primary-generation-mismatch|primary-w3c-stale|unix-w3c-stale|w3c-only|security|restart-fault|helper-attach-failure|delayed-otlp-suppression|assertion-failure|fail-open|permanent-absence|auto-unavailable|restart|disabled|uninstrumented|benchmark-disabled|benchmark-uninstrumented)
       ;;
     *)
       die "unsupported scenario: $SCENARIO"
@@ -639,6 +648,13 @@ parse_args() {
   if [[ "$SCENARIO" == "primary-generation-mismatch" && \
     "$REQUEST_COUNT" != "0" && "$REQUEST_COUNT" != "1" ]]; then
     die "the primary-generation-mismatch scenario requires exactly one request"
+  fi
+  if [[ "$SCENARIO" == "auto-unavailable" && "$TRANSPORT" != "auto" ]]; then
+    die "the auto-unavailable scenario requires --transport auto"
+  fi
+  if [[ "$SCENARIO" == "auto-unavailable" && \
+    "$REQUEST_COUNT" != "0" && "$REQUEST_COUNT" != "1" ]]; then
+    die "the auto-unavailable scenario requires exactly one request"
   fi
   if [[ "$SCENARIO" == "primary-w3c-stale" && "$REQUEST_COUNT" != "0" && "$REQUEST_COUNT" != "1" ]]; then
     die "the primary-w3c-stale scenario requires exactly one request"
@@ -3905,7 +3921,7 @@ start_stack() {
   assert_no_pending_permanent_absence_recovery || return $?
   # These controls replace the normal Java runtime only after startup.
   case "$runtime_contract_mode" in
-    primary-w3c-fault|primary-generation-mismatch|permanent-absence)
+    primary-w3c-fault|primary-generation-mismatch|permanent-absence|auto-unavailable)
       runtime_contract_mode="basic"
       ;;
     benchmark-disabled)
@@ -4393,6 +4409,68 @@ selected_transport_from_configuration() {
   esac
 }
 
+auto_transports_unavailable_from_configuration() {
+  local -r configuration="$1"
+  local values=""
+  local version=""
+  local status=""
+  local requested=""
+  local selected=""
+  local attempted=""
+  local getsockopt=""
+  local unix=""
+
+  values="$(transport_configuration_values "$configuration")" || return 1
+  read -r version status requested selected attempted getsockopt unix <<<"$values"
+  ((version == 2 && requested == 0 && selected == 255 && attempted == 3 &&
+    status == unix)) || return 1
+  case "$getsockopt" in
+    4|5|8|10|11|12) ;;
+    *) return 1 ;;
+  esac
+  case "$unix" in
+    3|4|5|6|7|8|9|10|11|12|13) ;;
+    *) return 1 ;;
+  esac
+}
+
+wait_for_auto_transports_unavailable_configuration() {
+  local -r output="$1"
+  local -r attempts_output="$RESULT_DIR/auto-unavailable-transport-attempts.txt"
+  local candidate=""
+  local configuration=""
+  local -i attempt=0
+
+  [[ "$output" == "$RESULT_DIR/java-auto-unavailable-transport-configuration.txt" &&
+    ! -e "$output" && ! -L "$output" &&
+    ! -e "$attempts_output" && ! -L "$attempts_output" ]] || return 1
+  candidate="$(mktemp "$RESULT_DIR/.java-auto-unavailable-transport.XXXXXX")" || return $?
+  : >"$attempts_output" || return $?
+  for ((attempt = 1; attempt <= AUTO_UNAVAILABLE_CONFIGURATION_MAX_ATTEMPTS; attempt++)); do
+    if curl --fail --silent --show-error --max-time 5 \
+      --max-filesize "$TRANSPORT_CONFIGURATION_MAX_BYTES" \
+      --cacert "$CERT_DIR/ca.crt" \
+      "https://127.0.0.1:18443/obi-transport-configuration" \
+      --output "$candidate" 2>/dev/null &&
+      configuration="$(transport_configuration_from_file "$candidate")"; then
+      printf 'attempt=%d %s\n' "$attempt" "$configuration" >>"$attempts_output" || return $?
+      if auto_transports_unavailable_from_configuration "$configuration"; then
+        install -m 0644 "$candidate" "$output" || return $?
+        rm -f -- "$candidate" || return $?
+        return 0
+      fi
+    else
+      printf 'attempt=%d unavailable\n' "$attempt" >>"$attempts_output" || return $?
+    fi
+    if ((attempt < AUTO_UNAVAILABLE_CONFIGURATION_MAX_ATTEMPTS)); then
+      sleep 1 || return $?
+    fi
+  done
+  rm -f -- "$candidate" || return $?
+  log_error "auto transport did not report both primary and fallback unavailable"
+  return 1
+}
+
 invalidate_selected_transport() {
   if [[ -n "${RESULT_DIR:-}" ]]; then
     rm -f -- "$RESULT_DIR/java-transport-configuration.txt" || return $?
@@ -4845,7 +4923,8 @@ assert_runtime_contract() {
       log_error "uninstrumented control unexpectedly started OBI"
       return 1
     }
-  elif [[ "$mode" == "obi-absent" || "$mode" == "permanent-absence" ]]; then
+  elif [[ "$mode" == "obi-absent" || "$mode" == "permanent-absence" || \
+    "$mode" == "auto-unavailable" ]]; then
     [[ "$java_agent" == "official" && "$dynamic_agent_loading" == "enabled" &&
       "$extension" == "enabled" ]] || {
       log_error "OBI-absent control requires the official agent and enabled extension"
@@ -8814,12 +8893,14 @@ run_late_attach_control() {
 
 assert_compose_service_stopped() {
   local -r service="$1"
+  local -r boundary="${2:-permanent-absence boundary}"
   local running=""
 
   [[ "$service" =~ ^[a-z][a-z0-9-]{0,63}$ ]] || return 1
+  [[ "$boundary" =~ ^[a-z0-9][-a-z0-9\ ]{0,95}$ ]] || return 1
   running="$(run_bounded 10 "${COMPOSE[@]}" ps --quiet "$service" 2>/dev/null)" || return $?
   [[ -z "$running" ]] || {
-    log_error "$service remained running across a permanent-absence boundary"
+    log_error "$service remained running across the $boundary"
     return 1
   }
 }
@@ -8835,6 +8916,7 @@ stop_permanent_absence_jvm() {
 assert_runtime_identity_unchanged() {
   local -r before="$1"
   local -r after="$2"
+  local -r description="${3:-controlled requests}"
 
   [[ -f "$before" && ! -L "$before" && -f "$after" && ! -L "$after" ]] || return 1
   runtime_identity_field "$before" container_id >/dev/null || return 1
@@ -8844,7 +8926,7 @@ assert_runtime_identity_unchanged() {
   runtime_identity_field "$after" host_pid >/dev/null || return 1
   runtime_identity_field "$after" started_at >/dev/null || return 1
   cmp -s -- "$before" "$after" || {
-    log_error "the permanent-absence requests did not remain in one JVM lifetime"
+    log_error "the $description did not remain in one JVM lifetime"
     return 1
   }
 }
@@ -9180,6 +9262,127 @@ run_permanent_absence_control() (
   SCENARIO_VARIANT="$original_variant"
   printf '{"status":"passed","scenario":"permanent-absence","obi_started_during_jvm_lifetime":false,"single_jvm_lifetime":true,"disabled_baseline_equivalent":true,"fail_open":"passed","w3c_precedence":"passed","diagnostics":"bounded","post_absence_recovery":"passed"}\n' \
     >"$RESULT_DIR/scenario-permanent-absence-status.json"
+
+  trap - EXIT
+)
+
+run_auto_unavailable_control() (
+  # This lifecycle proof deliberately contributes one fail-open and one W3C
+  # request per repeat. A custom all-suite request count must not turn this
+  # bounded control into an unrelated bulk workload.
+  local -r REQUEST_COUNT=1
+  local -r original_variant="$SCENARIO_VARIANT"
+  local -r original_propagation="${CONTEXT_PROPAGATION:-tcp}"
+  local -r before_phase="auto-unavailable-before"
+  local -r after_phase="auto-unavailable-after"
+  local -r before_diagnostics="$RESULT_DIR/phases/$before_phase/java-diagnostics.txt"
+  local -r diagnostics_delta="$RESULT_DIR/phases/$after_phase/java-diagnostics.delta"
+  local -r transport_configuration="$RESULT_DIR/java-auto-unavailable-transport-configuration.txt"
+  local -r identity_before="$RESULT_DIR/auto-unavailable-java-before.txt"
+  local -r identity_fault="$RESULT_DIR/auto-unavailable-java-fault.txt"
+  local -r identity_recovery="$RESULT_DIR/auto-unavailable-java-recovery.txt"
+  local restart_since=""
+  local restore_required=false
+  local restore_status=0
+
+  # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
+  restore_auto_unavailable_stack() {
+    local -r status="$?"
+
+    trap - EXIT
+    set +e
+    if [[ "$restore_required" == "true" ]]; then
+      (
+        set -Eeuo pipefail
+        recreate_instrumented_stack \
+          "$original_propagation" "auto-unavailable cleanup" auto
+      )
+      restore_status=$?
+    fi
+    SCENARIO_VARIANT="$original_variant"
+    if ((status == 0 && restore_status != 0)); then
+      exit "$restore_status"
+    fi
+    exit "$status"
+  }
+
+  trap restore_auto_unavailable_stack EXIT
+  [[ "$TRANSPORT" == "auto" &&
+    ( "$SELECTED_TRANSPORT" == "getsockopt" || "$SELECTED_TRANSPORT" == "unix" ) &&
+    "$BRIDGE_RUNNING" == "true" ]] || {
+    log_error "the auto-unavailable control requires a healthy auto-selected bridge"
+    return 1
+  }
+  restore_required=true
+
+  run_disabled_control || return $?
+  capture_control_response auto-unavailable-disabled || return $?
+  recreate_instrumented_stack \
+    "$original_propagation" "auto-unavailable preparation" auto || return $?
+  assert_runtime_contract basic true || return $?
+  capture_service_runtime_identity java-backend "$identity_before" || return $?
+  mkdir -p -- "$RESULT_DIR/phases/$before_phase" || return $?
+  stop_obi_for_no_state_control auto-unavailable "$before_diagnostics" || return $?
+  assert_runtime_contract auto-unavailable || return $?
+
+  capture_control_response auto-unavailable || return $?
+  cmp -s -- \
+    "$RESULT_DIR/auto-unavailable-disabled-response.normalized.json" \
+    "$RESULT_DIR/auto-unavailable-response.normalized.json" || return $?
+  cmp -s -- \
+    "$RESULT_DIR/auto-unavailable-disabled-response.status" \
+    "$RESULT_DIR/auto-unavailable-response.status" || return $?
+
+  sleep "$JAVA_PROVIDER_RETRY_SETTLE_SECONDS" || return $?
+  SCENARIO_VARIANT="auto-unavailable"
+  run_scenario fail-open false || return $?
+  wait_for_auto_transports_unavailable_configuration \
+    "$transport_configuration" || return $?
+  run_scenario w3c-only false || return $?
+  capture_java_diagnostics "$after_phase" || return $?
+  write_java_diagnostics_delta \
+    "$before_diagnostics" \
+    "$RESULT_DIR/phases/$after_phase/java-diagnostics.txt" \
+    "$diagnostics_delta" || return $?
+  assert_auto_unavailable_diagnostics_delta "$diagnostics_delta" || return $?
+  capture_service_runtime_identity java-backend "$identity_fault" || return $?
+  assert_runtime_identity_unchanged \
+    "$identity_before" "$identity_fault" "auto-unavailable requests" || return $?
+  assert_compose_service_stopped obi "auto-unavailable boundary" || return $?
+
+  restart_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" || return $?
+  run_bounded 120 \
+    "${COMPOSE[@]}" up --detach \
+      --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" obi || return $?
+  wait_for_log \
+    obi \
+    "Java remote parent bridge ready" \
+    "auto-unavailable OBI recovery" \
+    "$restart_since" || return $?
+  sleep "$JAVA_PROVIDER_RETRY_SETTLE_SECONDS" || return $?
+  BRIDGE_RUNNING=true
+  wait_for_apache_instrumentation auto-unavailable-recovery || return $?
+  wait_for_http \
+    "$APACHE_HTTPS_HEALTH_ENDPOINT" \
+    "auto-unavailable Java provider recovery" || return $?
+  wait_for_log \
+    java-backend \
+    "OBI remote-parent provider ready" \
+    "auto-unavailable Java provider recovery" \
+    "$restart_since" || return $?
+  assert_selected_transport auto || return $?
+  wait_for_java_duplicate_suppression \
+    "$RESULT_DIR/duplicate-suppression-auto-unavailable-recovery.prom" || return $?
+  assert_runtime_contract basic true || return $?
+  capture_service_runtime_identity java-backend "$identity_recovery" || return $?
+  assert_runtime_identity_unchanged \
+    "$identity_before" "$identity_recovery" "auto-unavailable recovery" || return $?
+  SCENARIO_VARIANT="auto-unavailable-recovery"
+  run_scenario basic || return $?
+  SCENARIO_VARIANT="$original_variant"
+  restore_required=false
+  printf '{"status":"passed","scenario":"auto-unavailable","requested_transport":"auto","attempted_transports":["getsockopt","unix"],"selected_transport":"none","disabled_baseline_equivalent":true,"fail_open":"passed","w3c_precedence":"passed","single_jvm_lifetime":true,"retry_storm":"absent","post_fault_recovery":"passed"}\n' \
+    >"$RESULT_DIR/scenario-auto-unavailable-status.json"
 
   trap - EXIT
 )
@@ -13457,6 +13660,12 @@ execute_requested_scenarios() {
           w3c-fault "requires forced Unix transport"
       fi
       run_permanent_absence_control
+      if [[ "$TRANSPORT" == "auto" ]]; then
+        run_auto_unavailable_control
+      else
+        record_unsupported_scenario \
+          auto-unavailable "requires auto transport selection"
+      fi
       run_late_attach_control
       run_restart_during_traffic_control
       run_helper_attach_failure_control
@@ -13530,6 +13739,9 @@ execute_requested_scenarios() {
       ;;
     permanent-absence)
       run_permanent_absence_control
+      ;;
+    auto-unavailable)
+      run_auto_unavailable_control
       ;;
     security)
       run_security_control
@@ -14989,6 +15201,75 @@ assert_timeout_cancellation_diagnostics_delta() {
       return 1
       ;;
   esac
+}
+
+assert_auto_unavailable_diagnostics_delta() {
+  local -r input="$1"
+  local name=""
+  local actual=""
+  local take_total=0
+  local transport_failure_total=0
+  local registration_failures=""
+  local -i repeat_increment=0
+  local -i take_minimum=0
+  local -i take_maximum=0
+  local -i registration_maximum=0
+  local -a fixed_failures=(
+    provider_reject provider_ver lookup_missing lookup_version lookup_error
+    record_version invoke_error extract_fields extract_invalid extract_error
+  )
+
+  assert_java_diagnostics_delta_schema "$input" || return 1
+  bounded_decimal "$REPEAT_COUNT" 10 false >/dev/null || return 1
+  repeat_increment=$((2 * (REPEAT_COUNT - 1)))
+  take_minimum=$((AUTO_UNAVAILABLE_TAKE_MIN + repeat_increment))
+  take_maximum=$((AUTO_UNAVAILABLE_TAKE_MAX + repeat_increment))
+  registration_maximum=$((
+    AUTO_UNAVAILABLE_REGISTRATION_FAILURE_MAX + repeat_increment
+  ))
+  while IFS= read -r name; do
+    actual="$(java_diagnostic_delta "$input" "$name")" || return 1
+    if [[ "$name" == t_* ]]; then
+      take_total="$((take_total + actual))"
+      case "$name" in
+        t_missing|t_already_consumed)
+          ;;
+        t_unsupported|t_unauthorized|t_timeout|t_overload|t_transport_error)
+          transport_failure_total="$((transport_failure_total + actual))"
+          ;;
+        *)
+          ((actual == 0)) || {
+            log_error "auto-unavailable diagnostics reported unexpected $name=$actual"
+            return 1
+          }
+          ;;
+      esac
+    elif ((actual != 0)); then
+      log_error "auto-unavailable diagnostics reported unexpected $name=$actual"
+      return 1
+    fi
+  done < <(awk '$1 ~ /^[td]_/ { print $1 }' "$input")
+
+  ((take_total >= take_minimum &&
+    take_total <= take_maximum &&
+    transport_failure_total >= 1)) || {
+    log_error "auto-unavailable diagnostics did not retain a bounded attributable transport failure"
+    return 1
+  }
+  registration_failures="$(java_diagnostic_delta "$input" registration_fail)" || return 1
+  ((registration_failures >= 1 &&
+    registration_failures <= registration_maximum &&
+    registration_failures <= take_total)) || {
+    log_error "auto-unavailable transport registration retries were unbounded or absent"
+    return 1
+  }
+  for name in "${fixed_failures[@]}" take_sampled take_unsampled discard_standard; do
+    actual="$(java_diagnostic_delta "$input" "$name")" || return 1
+    ((actual == 0)) || {
+      log_error "auto-unavailable diagnostics reported unexpected $name=$actual"
+      return 1
+    }
+  done
 }
 
 assert_restart_fault_diagnostics() {

@@ -66,8 +66,108 @@ class NativeRemoteParentProviderTest {
     assertFalse(NativeRemoteParentProvider.requiresReconfiguration(RemoteParentStatus.VALID));
     assertFalse(NativeRemoteParentProvider.requiresReconfiguration(RemoteParentStatus.MISSING));
     assertFalse(NativeRemoteParentProvider.requiresReconfiguration(RemoteParentStatus.STALE));
+    assertFalse(NativeRemoteParentProvider.requiresReconfiguration(RemoteParentStatus.TIMEOUT));
     assertFalse(
         NativeRemoteParentProvider.requiresReconfiguration(RemoteParentStatus.ALREADY_CONSUMED));
+  }
+
+  @Test
+  void requestTimeoutDoesNotSuppressTheImmediateNextLookup() {
+    AtomicInteger configurationAttempts = new AtomicInteger();
+    AtomicInteger registrations = new AtomicInteger();
+    AtomicInteger socketCalls = new AtomicInteger();
+    NativeRemoteParentProvider provider =
+        new NativeRemoteParentProvider(
+            RemoteParentTransport.UNIX,
+            "/tmp/obi-java.sock",
+            50,
+            0,
+            (transport, path, timeout, uid, processIncarnation) -> {
+              configurationAttempts.incrementAndGet();
+              return configurationResult(transport, RemoteParentStatus.VALID);
+            },
+            () -> {
+              registrations.incrementAndGet();
+              return true;
+            },
+            (take, taskScoped, socketFileDescriptor, response) ->
+                socketCalls.getAndIncrement() == 0
+                    ? RemoteParentStatus.TIMEOUT
+                    : RemoteParentStatus.MISSING);
+
+    try {
+      assertEquals(RemoteParentStatus.TIMEOUT, provider.takeRemoteParent().getStatus());
+      assertTrue(provider.isReady());
+      assertEquals(RemoteParentStatus.MISSING, provider.takeRemoteParent().getStatus());
+      assertEquals(2, socketCalls.get());
+      assertEquals(1, configurationAttempts.get());
+      assertEquals(1, registrations.get());
+    } finally {
+      provider.close();
+    }
+  }
+
+  @Test
+  void requestTimeoutDoesNotSuppressConcurrentSiblingLookups() throws Exception {
+    int lanes = 16;
+    AtomicInteger socketCalls = new AtomicInteger();
+    AtomicReference<Throwable> failure = new AtomicReference<>();
+    CountDownLatch allStarted = new CountDownLatch(lanes);
+    CountDownLatch start = new CountDownLatch(1);
+    CountDownLatch timeoutObserved = new CountDownLatch(1);
+    NativeRemoteParentProvider provider =
+        readyProvider(
+            RemoteParentTransport.UNIX,
+            (take, taskScoped, socketFileDescriptor, response) ->
+                socketCalls.getAndIncrement() == 0
+                    ? RemoteParentStatus.TIMEOUT
+                    : RemoteParentStatus.MISSING);
+    List<Thread> threads = new ArrayList<>();
+
+    for (int lane = 0; lane < lanes; lane++) {
+      int laneIndex = lane;
+      threads.add(
+          new Thread(
+              () -> {
+                allStarted.countDown();
+                awaitUninterruptibly(start);
+                if (laneIndex != 0) {
+                  awaitUninterruptibly(timeoutObserved);
+                }
+                try {
+                  int expected =
+                      laneIndex == 0 ? RemoteParentStatus.TIMEOUT : RemoteParentStatus.MISSING;
+                  assertEquals(expected, provider.takeRemoteParent().getStatus());
+                } catch (Throwable throwable) {
+                  failure.compareAndSet(null, throwable);
+                } finally {
+                  if (laneIndex == 0) {
+                    timeoutObserved.countDown();
+                  }
+                }
+              }));
+    }
+
+    try {
+      for (Thread thread : threads) {
+        thread.start();
+      }
+      assertTrue(allStarted.await(5, TimeUnit.SECONDS));
+      start.countDown();
+      for (Thread thread : threads) {
+        thread.join(TimeUnit.SECONDS.toMillis(5));
+        assertFalse(thread.isAlive());
+      }
+      if (failure.get() != null) {
+        throw new AssertionError("concurrent remote-parent lookup failed", failure.get());
+      }
+      assertEquals(lanes, socketCalls.get());
+      assertTrue(provider.isReady());
+    } finally {
+      start.countDown();
+      timeoutObserved.countDown();
+      provider.close();
+    }
   }
 
   @Test

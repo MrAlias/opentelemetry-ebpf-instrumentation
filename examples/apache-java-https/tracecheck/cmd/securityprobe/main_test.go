@@ -185,6 +185,73 @@ func TestReadStatusRejectsContextBearingOrMalformedRecords(t *testing.T) {
 	}
 }
 
+func TestAbuseRaceAttemptAcceptsOnlyCompleteBoundedOutcomes(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		response []byte
+		wantErr  bool
+	}{
+		{name: "unauthorized", response: statusRecord(statusUnauthorized)},
+		{name: "timeout", response: statusRecord(statusTimeout)},
+		{name: "overload", response: statusRecord(statusOverload)},
+		{name: "valid", response: statusRecord(statusValid), wantErr: true},
+		{name: "other status", response: statusRecord(statusMalformed), wantErr: true},
+		{
+			name: "malformed",
+			response: func() []byte {
+				record := statusRecord(statusUnauthorized)
+				record[10] = 1
+				return record
+			}(),
+			wantErr: true,
+		},
+		{name: "truncated I/O", response: statusRecord(statusUnauthorized)[:recordSize-1], wantErr: true},
+		{
+			name:     "trailing byte",
+			response: append(statusRecord(statusUnauthorized), 1),
+			wantErr:  true,
+		},
+		{
+			name: "repeated response",
+			response: append(
+				statusRecord(statusUnauthorized), statusRecord(statusUnauthorized)...),
+			wantErr: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			socketPath := filepath.Join(t.TempDir(), "bridge.sock")
+			listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+			require.NoError(t, err)
+			defer listener.Close()
+
+			serverDone := make(chan error, 1)
+			go func() {
+				connection, acceptErr := listener.AcceptUnix()
+				if acceptErr != nil {
+					serverDone <- acceptErr
+					return
+				}
+				defer connection.Close()
+				request := make([]byte, requestSize)
+				if _, readErr := io.ReadFull(connection, request); readErr != nil {
+					serverDone <- readErr
+					return
+				}
+				_, writeErr := connection.Write(test.response)
+				serverDone <- writeErr
+			}()
+
+			err = expectAbuseRaceAttempt(socketPath, marshalRequest(42, 0x5ec0000000000001))
+			if test.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+			require.NoError(t, <-serverDone)
+		})
+	}
+}
+
 func TestPrimaryProbeReportsNativeResultsAsUnverified(t *testing.T) {
 	ready := make(chan struct{})
 	resume := make(chan os.Signal, 1)

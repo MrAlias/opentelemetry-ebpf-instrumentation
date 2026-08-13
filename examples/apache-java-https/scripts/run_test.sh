@@ -3487,6 +3487,8 @@ obi_java_remote_parent_operations_total{operation="discard",status="valid",trans
 obi_java_remote_parent_operations_total{operation="take",status="missing",transport="getsockopt"} 99
 obi_java_remote_parent_operations_total{operation="take",status="unauthorized",transport="getsockopt"} 11
 obi_java_remote_parent_operations_total{operation="take",status="unauthorized",transport="unix"} 12
+obi_java_remote_parent_operations_total{operation="take",status="timeout",transport="unix"} 15
+obi_java_remote_parent_operations_total{operation="take",status="overload",transport="unix"} 16
 obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} 99
 obi_java_remote_parent_operations_total{operation="report",status="valid",transport="tcp"} 7
 obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7
@@ -3525,6 +3527,16 @@ EOF
   sed -i 's/status="unauthorized",transport="unix"} 12/status="unauthorized",transport="unix"} 14/' "$metrics"
   [[ "$(bridge_metric_fingerprint "$metrics")" == "$fingerprint" ]] || {
     printf 'bridge fingerprint included allowed Unix-security noise\n' >&2
+    return 1
+  }
+  sed -i 's/status="timeout",transport="unix"} 15/status="timeout",transport="unix"} 17/' "$metrics"
+  [[ "$(bridge_metric_fingerprint "$metrics")" == "$fingerprint" ]] || {
+    printf 'bridge fingerprint included allowed Unix-security timeout noise\n' >&2
+    return 1
+  }
+  sed -i 's/status="overload",transport="unix"} 16/status="overload",transport="unix"} 18/' "$metrics"
+  [[ "$(bridge_metric_fingerprint "$metrics")" == "$fingerprint" ]] || {
+    printf 'bridge fingerprint included allowed Unix-security overload noise\n' >&2
     return 1
   }
   ALLOW_UNIX_SECURITY_METRICS=false
@@ -9196,6 +9208,8 @@ obi_java_remote_parent_operations_total{operation="inject",status="valid",transp
 obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=3 after=5 delta=2
 obi_java_remote_parent_operations_total{operation="take",status="valid",transport="unix"} before=3 after=5 delta=2
 obi_java_remote_parent_operations_total{operation="take",status="unauthorized",transport="unix"} before=4 after=12 delta=8
+obi_java_remote_parent_operations_total{operation="take",status="timeout",transport="unix"} before=0 after=3 delta=3
+obi_java_remote_parent_operations_total{operation="take",status="overload",transport="unix"} before=0 after=4 delta=4
 EOF
   if (
     ALLOW_UNIX_SECURITY_METRICS=false
@@ -9579,6 +9593,197 @@ test_unix_security_controls_use_isolated_topology_windows() {
     "$cleanup_control" == *'UNIX_SECURITY_PROBE_DIRECTORY'* && \
     "$cleanup_control" == *'"/proc/$1/comm"'* ]] || {
     printf 'Unix security controls lost topology, identity, or cleanup fencing\n' >&2
+    return 1
+  }
+}
+
+test_unix_sibling_ready_failure_retains_cleanup_ownership() {
+  local sibling_control=""
+  local ownership_line=""
+  local ready_line=""
+  local control_status=0
+
+  sibling_control="$(declare -f run_unix_sibling_security_control)"
+  ownership_line="$(awk '/UNIX_SECURITY_SIBLING_CONTAINER=.*run_bounded/ { print NR; exit }' \
+    <<<"$sibling_control")"
+  ready_line="$(awk '/wait_for_log/ { print NR; exit }' <<<"$sibling_control")"
+  [[ "$ownership_line" =~ ^[1-9][0-9]*$ && \
+    "$ready_line" =~ ^[1-9][0-9]*$ && \
+    ownership_line -lt ready_line ]] || {
+    printf 'Unix sibling cleanup ownership is assigned after the ready barrier\n' >&2
+    return 1
+  }
+
+  (
+    RESULT_DIR="$TEST_TMP_DIR/unix-sibling-ready-failure"
+    COMPOSE=(test-compose)
+    UNIX_SECURITY_SIBLING_CONTAINER=""
+    mkdir -p -- "$RESULT_DIR"
+    wait_for_unix_security_metrics_quiescent() {
+      :
+    }
+    log_info() {
+      :
+    }
+    run_bounded() {
+      if [[ " $* " == *' ps --all --quiet security-unix-sibling-probe '* ]]; then
+        printf 'owned-sibling-container\n'
+      fi
+    }
+    wait_for_log() {
+      [[ "$UNIX_SECURITY_SIBLING_CONTAINER" == "owned-sibling-container" ]] || return 42
+      return 41
+    }
+
+    if run_unix_sibling_security_control java-container; then
+      return 1
+    else
+      control_status=$?
+    fi
+    [[ "$control_status" == "41" && \
+      "$UNIX_SECURITY_SIBLING_CONTAINER" == "owned-sibling-container" ]]
+  ) || {
+    printf 'Unix sibling ready failure discarded cleanup ownership\n' >&2
+    return 1
+  }
+}
+
+test_unix_security_controls_validate_live_race_before_scenario_status() {
+  local sibling_control=""
+  local same_cgroup_control=""
+  local sibling_scenario_line=""
+  local sibling_scenario_status_line=""
+  local sibling_pre_liveness_line=""
+  local sibling_post_liveness_line=""
+  local sibling_logs_line=""
+  local sibling_output_line=""
+  local sibling_metric_line=""
+  local sibling_status_return_line=""
+  local same_cgroup_scenario_line=""
+  local same_cgroup_scenario_status_line=""
+  local same_cgroup_pre_liveness_line=""
+  local same_cgroup_post_liveness_line=""
+  local same_cgroup_output_line=""
+  local same_cgroup_metric_line=""
+  local same_cgroup_status_return_line=""
+
+  sibling_control="$(declare -f run_unix_sibling_security_control)"
+  same_cgroup_control="$(declare -f run_unix_same_cgroup_security_control)"
+  sibling_scenario_line="$(awk '/run_scenario concurrency false metrics/ { print NR; exit }' \
+    <<<"$sibling_control")"
+  sibling_scenario_status_line="$(awk '/scenario_status=\$\?/ { print NR; exit }' \
+    <<<"$sibling_control")"
+  sibling_pre_liveness_line="$(awk \
+    '/docker inspect --format.*State.Running/ && ++seen == 1 { print NR; exit }' \
+    <<<"$sibling_control")"
+  sibling_post_liveness_line="$(awk \
+    '/docker inspect --format.*State.Running/ && ++seen == 2 { print NR; exit }' \
+    <<<"$sibling_control")"
+  sibling_logs_line="$(awk '/docker logs/ { print NR; exit }' <<<"$sibling_control")"
+  sibling_output_line="$(awk '/assert_unix_abuse_race_output/ { print NR; exit }' \
+    <<<"$sibling_control")"
+  sibling_metric_line="$(awk '/if assert_security_metric_delta/ { print NR; exit }' \
+    <<<"$sibling_control")"
+  sibling_status_return_line="$(awk '/return "\$scenario_status"/ { print NR; exit }' \
+    <<<"$sibling_control")"
+  same_cgroup_scenario_line="$(awk '/run_scenario concurrency false metrics/ { print NR; exit }' \
+    <<<"$same_cgroup_control")"
+  same_cgroup_scenario_status_line="$(awk '/scenario_status=\$\?/ { print NR; exit }' \
+    <<<"$same_cgroup_control")"
+  same_cgroup_pre_liveness_line="$(awk \
+    '/background_process_is_running/ && ++seen == 1 { print NR; exit }' \
+    <<<"$same_cgroup_control")"
+  same_cgroup_post_liveness_line="$(awk \
+    '/background_process_is_running/ && ++seen == 2 { print NR; exit }' \
+    <<<"$same_cgroup_control")"
+  same_cgroup_output_line="$(awk '/assert_unix_abuse_race_output/ { print NR; exit }' \
+    <<<"$same_cgroup_control")"
+  same_cgroup_metric_line="$(awk '/if assert_security_metric_delta/ { print NR; exit }' \
+    <<<"$same_cgroup_control")"
+  same_cgroup_status_return_line="$(awk '/return "\$scenario_status"/ { print NR; exit }' \
+    <<<"$same_cgroup_control")"
+
+  [[ "$sibling_scenario_line" =~ ^[1-9][0-9]*$ && \
+    "$sibling_scenario_status_line" =~ ^[1-9][0-9]*$ && \
+    "$sibling_pre_liveness_line" =~ ^[1-9][0-9]*$ && \
+    "$sibling_post_liveness_line" =~ ^[1-9][0-9]*$ && \
+    "$sibling_logs_line" =~ ^[1-9][0-9]*$ && \
+    "$sibling_output_line" =~ ^[1-9][0-9]*$ && \
+    "$sibling_metric_line" =~ ^[1-9][0-9]*$ && \
+    "$sibling_status_return_line" =~ ^[1-9][0-9]*$ && \
+    sibling_pre_liveness_line -lt sibling_scenario_line && \
+    sibling_scenario_line -lt sibling_scenario_status_line && \
+    sibling_scenario_status_line -lt sibling_post_liveness_line && \
+    sibling_post_liveness_line -lt sibling_logs_line && \
+    sibling_logs_line -lt sibling_output_line && \
+    sibling_output_line -lt sibling_metric_line && \
+    sibling_metric_line -lt sibling_status_return_line && \
+    "$same_cgroup_scenario_line" =~ ^[1-9][0-9]*$ && \
+    "$same_cgroup_scenario_status_line" =~ ^[1-9][0-9]*$ && \
+    "$same_cgroup_pre_liveness_line" =~ ^[1-9][0-9]*$ && \
+    "$same_cgroup_post_liveness_line" =~ ^[1-9][0-9]*$ && \
+    "$same_cgroup_output_line" =~ ^[1-9][0-9]*$ && \
+    "$same_cgroup_metric_line" =~ ^[1-9][0-9]*$ && \
+    "$same_cgroup_status_return_line" =~ ^[1-9][0-9]*$ && \
+    same_cgroup_pre_liveness_line -lt same_cgroup_scenario_line && \
+    same_cgroup_scenario_line -lt same_cgroup_scenario_status_line && \
+    same_cgroup_scenario_status_line -lt same_cgroup_post_liveness_line && \
+    same_cgroup_post_liveness_line -lt same_cgroup_output_line && \
+    same_cgroup_output_line -lt same_cgroup_metric_line && \
+    same_cgroup_metric_line -lt same_cgroup_status_return_line ]] || {
+    printf 'Unix security controls decide scenario status before validating the live attacker window\n' >&2
+    return 1
+  }
+  [[ "$sibling_control" == *'run_scenario concurrency false metrics'* && \
+    "$same_cgroup_control" == *'run_scenario concurrency false metrics'* && \
+    "$sibling_control" == *'assert_security_metric_delta'*'take unauthorized unix 1'* && \
+    "$same_cgroup_control" == *'assert_security_metric_delta'*'take unauthorized unix 1'* && \
+    "$sibling_control" == *'probe_window_valid=false'* && \
+    "$same_cgroup_control" == *'probe_window_valid=false'* && \
+    "$sibling_control" != *'sleep '* && \
+    "$same_cgroup_control" != *'sleep '* ]] || {
+    printf 'Unix security controls weakened the attacker load or fail-closed evidence contract\n' >&2
+    return 1
+  }
+}
+
+test_unix_security_pre_scenario_death_retains_attacker_evidence() {
+  local sibling_control=""
+  local same_cgroup_control=""
+  local sibling_after_pre_fence=""
+  local sibling_pre_fence=""
+  local same_cgroup_after_pre_fence=""
+  local same_cgroup_pre_fence=""
+
+  sibling_control="$(declare -f run_unix_sibling_security_control)"
+  same_cgroup_control="$(declare -f run_unix_same_cgroup_security_control)"
+  sibling_after_pre_fence="${sibling_control#*Unix sibling security probe exited before the victim scenario}"
+  same_cgroup_after_pre_fence="${same_cgroup_control#*Unix same-cgroup security probe exited before the victim scenario}"
+  sibling_pre_fence="$(awk \
+    '/if \[\[ "\$running" != "true" \]\]/ { capture = 1 }
+     capture { print }
+     capture && /run_scenario concurrency false metrics/ { exit }' \
+    <<<"$sibling_control")"
+  same_cgroup_pre_fence="$(awk \
+    '/if ! background_process_is_running/ { capture = 1 }
+     capture { print }
+     capture && /run_scenario concurrency false metrics/ { exit }' \
+    <<<"$same_cgroup_control")"
+
+  [[ "$sibling_after_pre_fence" != "$sibling_control" && \
+    "$same_cgroup_after_pre_fence" != "$same_cgroup_control" && \
+    "$sibling_pre_fence" == *'probe_window_valid=false'* && \
+    "$sibling_pre_fence" == *'scenario_status=1'* && \
+    "$sibling_pre_fence" != *'return 1'* && \
+    "$same_cgroup_pre_fence" == *'probe_window_valid=false'* && \
+    "$same_cgroup_pre_fence" == *'scenario_status=1'* && \
+    "$same_cgroup_pre_fence" != *'return 1'* && \
+    "$sibling_after_pre_fence" == *'docker wait'* && \
+    "$sibling_after_pre_fence" == *'docker logs'* && \
+    "$sibling_after_pre_fence" == *'assert_unix_abuse_race_output "$output" false'* && \
+    "$same_cgroup_after_pre_fence" == *'wait_for_background_process'* && \
+    "$same_cgroup_after_pre_fence" == *'assert_unix_abuse_race_output "$output" true'* ]] || {
+    printf 'Unix security pre-scenario death discarded attacker logs or output evidence\n' >&2
     return 1
   }
 }
@@ -24326,6 +24531,9 @@ main() {
   test_unix_sibling_tmpfs_requires_empty_configuration
   test_unix_abuse_race_result_requires_every_case
   test_unix_security_controls_use_isolated_topology_windows
+  test_unix_sibling_ready_failure_retains_cleanup_ownership
+  test_unix_security_controls_validate_live_race_before_scenario_status
+  test_unix_security_pre_scenario_death_retains_attacker_evidence
   test_permissive_unix_directory_control_refuses_and_restores
   test_permissive_unix_directory_rejects_socket_probe_error
   test_unix_endpoint_restart_invalidates_before_stack_mutation

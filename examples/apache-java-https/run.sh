@@ -6227,11 +6227,15 @@ bridge_metric_fingerprint() {
       print
     }
     function operation_allowed_during_security_probe(line) {
-      if (line !~ /operation="take"/ || line !~ /status="unauthorized"/) {
+      if (line !~ /operation="take"/) {
         return 0
       }
-      return (allow_primary_security == "true" && line ~ /transport="getsockopt"/) ||
-        (allow_unix_security == "true" && line ~ /transport="unix"/)
+      if (allow_primary_security == "true" &&
+          line ~ /status="unauthorized"/ && line ~ /transport="getsockopt"/) {
+        return 1
+      }
+      return allow_unix_security == "true" &&
+        line ~ /status="(unauthorized|timeout|overload)"/ && line ~ /transport="unix"/
     }
   ' "$metrics" | LC_ALL=C sort | sha256sum | awk '{print $1}'
 }
@@ -13578,6 +13582,15 @@ run_unix_sibling_security_control() {
   local host_probe=""
   local probe_exit=""
   local running=""
+  local scenario_status=0
+  local inspect_status=0
+  local release_status=0
+  local wait_status=0
+  local log_status=0
+  local output_status=0
+  local metric_status=0
+  local current_metric_status=0
+  local probe_window_valid=true
   local run_number=0
   local phase_label=""
 
@@ -13590,16 +13603,16 @@ run_unix_sibling_security_control() {
   run_bounded 60 \
     "${COMPOSE[@]}" up --detach --no-deps --force-recreate \
     security-unix-sibling-probe || return $?
-  wait_for_log \
-    security-unix-sibling-probe \
-    "security probe abuse race ready" \
-    "Unix sibling abuse race barrier" || return $?
   UNIX_SECURITY_SIBLING_CONTAINER="$(run_bounded 10 \
     "${COMPOSE[@]}" ps --all --quiet security-unix-sibling-probe)"
   [[ -n "$UNIX_SECURITY_SIBLING_CONTAINER" ]] || {
     log_error "could not resolve the Unix sibling abuse-race container"
     return 1
   }
+  wait_for_log \
+    security-unix-sibling-probe \
+    "security probe abuse race ready" \
+    "Unix sibling abuse race barrier" || return $?
   assert_unix_sibling_security_topology \
     "$java_container" "$UNIX_SECURITY_SIBLING_CONTAINER" "$topology" || return $?
 
@@ -13608,37 +13621,108 @@ run_unix_sibling_security_control() {
   run_bounded 15 docker cp \
     "$UNIX_SECURITY_SIBLING_CONTAINER:/security-probe" "$host_probe" || return $?
 
-  (
-    SCENARIO_VARIANT="security-unix-sibling-victim"
-    ALLOW_UNIX_SECURITY_METRICS=true
-    run_scenario concurrency false metrics
-  ) || return $?
+  if running="$(run_bounded 10 docker inspect --format '{{.State.Running}}' \
+    "$UNIX_SECURITY_SIBLING_CONTAINER")"; then
+    :
+  else
+    inspect_status=$?
+    probe_window_valid=false
+    scenario_status=1
+    log_error "could not inspect the Unix sibling security probe before the victim scenario"
+  fi
+  if [[ "$running" != "true" ]]; then
+    probe_window_valid=false
+    scenario_status=1
+    log_error "Unix sibling security probe exited before the victim scenario"
+  fi
+
+  if [[ "$probe_window_valid" == "true" ]]; then
+    if (
+      SCENARIO_VARIANT="security-unix-sibling-victim"
+      ALLOW_UNIX_SECURITY_METRICS=true
+      run_scenario concurrency false metrics
+    ); then
+      scenario_status=0
+    else
+      scenario_status=$?
+    fi
+  fi
+
+  if running="$(run_bounded 10 docker inspect --format '{{.State.Running}}' \
+    "$UNIX_SECURITY_SIBLING_CONTAINER")"; then
+    inspect_status=0
+  else
+    inspect_status=$?
+    probe_window_valid=false
+    log_error "could not inspect the Unix sibling security probe after the victim scenario"
+  fi
+  if [[ "$running" != "true" ]]; then
+    probe_window_valid=false
+    log_error "Unix sibling security probe exited before release"
+  elif run_bounded 15 docker kill --signal SIGUSR1 \
+    "$UNIX_SECURITY_SIBLING_CONTAINER" >/dev/null; then
+    release_status=0
+  else
+    release_status=$?
+    probe_window_valid=false
+    log_error "could not release the Unix sibling security probe"
+  fi
+  if probe_exit="$(run_bounded 60 docker wait "$UNIX_SECURITY_SIBLING_CONTAINER")"; then
+    wait_status=0
+  else
+    wait_status=$?
+    probe_window_valid=false
+    log_error "could not reap the Unix sibling security probe"
+  fi
+  if [[ "$probe_exit" != "0" ]]; then
+    probe_window_valid=false
+    log_error "Unix sibling security probe exited with status $probe_exit"
+  fi
+  if run_bounded 15 docker logs "$UNIX_SECURITY_SIBLING_CONTAINER" >"$output"; then
+    log_status=0
+  else
+    log_status=$?
+    probe_window_valid=false
+    log_error "could not capture the Unix sibling security probe logs"
+  fi
+  if ((wait_status == 0)); then
+    UNIX_SECURITY_SIBLING_CONTAINER=""
+  fi
+  if assert_unix_abuse_race_output "$output" false; then
+    output_status=0
+  else
+    output_status=$?
+    probe_window_valid=false
+  fi
+  if [[ "$probe_window_valid" != "true" || \
+    "$inspect_status" != "0" || "$release_status" != "0" || \
+    "$wait_status" != "0" || "$log_status" != "0" || \
+    "$output_status" != "0" ]]; then
+    return 1
+  fi
+
   for ((run_number = 1; run_number <= REPEAT_COUNT; run_number++)); do
     phase_label="concurrency-security-unix-sibling-victim"
     if ((REPEAT_COUNT > 1)); then
       printf -v phase_label '%s-run-%02d' "$phase_label" "$run_number"
     fi
-    assert_security_metric_delta \
+    if assert_security_metric_delta \
       "$RESULT_DIR/phases/$phase_label-after/obi-metrics.delta" \
-      take unauthorized unix 1 || return $?
+      take unauthorized unix 1; then
+      :
+    else
+      current_metric_status=$?
+      if ((metric_status == 0)); then
+        metric_status=$current_metric_status
+      fi
+    fi
   done
-
-  running="$(run_bounded 10 docker inspect --format '{{.State.Running}}' \
-    "$UNIX_SECURITY_SIBLING_CONTAINER")" || return $?
-  [[ "$running" == "true" ]] || {
-    log_error "Unix sibling security probe exited before release"
-    return 1
-  }
-  run_bounded 15 docker kill --signal SIGUSR1 \
-    "$UNIX_SECURITY_SIBLING_CONTAINER" >/dev/null || return $?
-  probe_exit="$(run_bounded 60 docker wait "$UNIX_SECURITY_SIBLING_CONTAINER")" || return $?
-  [[ "$probe_exit" == "0" ]] || {
-    log_error "Unix sibling security probe exited with status $probe_exit"
-    return 1
-  }
-  run_bounded 15 docker logs "$UNIX_SECURITY_SIBLING_CONTAINER" >"$output" || return $?
-  UNIX_SECURITY_SIBLING_CONTAINER=""
-  assert_unix_abuse_race_output "$output" false || return $?
+  if ((metric_status != 0)); then
+    return "$metric_status"
+  fi
+  if ((scenario_status != 0)); then
+    return "$scenario_status"
+  fi
 
   if ! wait_for_unix_security_metrics_quiescent \
     "$after_metrics" \
@@ -13666,6 +13750,14 @@ run_unix_same_cgroup_security_control() {
   local probe_cgroup=""
   local probe_status=""
   local probe_exit=0
+  local scenario_status=0
+  local release_status=0
+  local wait_status=0
+  local output_status=0
+  local remove_status=0
+  local metric_status=0
+  local current_metric_status=0
+  local probe_window_valid=true
   local run_number=0
   local phase_label=""
 
@@ -13765,49 +13857,107 @@ run_unix_same_cgroup_security_control() {
     awk '/^(Uid|Gid|CapEff):/ { print }' <<<"$probe_status"
   } >"$identity"
 
-  (
-    SCENARIO_VARIANT="security-unix-same-cgroup-victim"
-    ALLOW_UNIX_SECURITY_METRICS=true
-    run_scenario concurrency false metrics
-  ) || return $?
+  if ! background_process_is_running "$UNIX_SECURITY_EXEC_PID"; then
+    probe_window_valid=false
+    scenario_status=1
+    log_error "Unix same-cgroup security probe exited before the victim scenario"
+  fi
+
+  if [[ "$probe_window_valid" == "true" ]]; then
+    if (
+      SCENARIO_VARIANT="security-unix-same-cgroup-victim"
+      ALLOW_UNIX_SECURITY_METRICS=true
+      run_scenario concurrency false metrics
+    ); then
+      scenario_status=0
+    else
+      scenario_status=$?
+    fi
+  fi
+
+  if ! background_process_is_running "$UNIX_SECURITY_EXEC_PID"; then
+    probe_window_valid=false
+    log_error "Unix same-cgroup security probe exited before release"
+  else
+    # Expanded by the container shell, not this process.
+    # shellcheck disable=SC2016
+    if run_bounded 10 docker exec "$java_container" /bin/sh -ec '
+      set -eu
+      name="$(cat "/proc/$1/comm" 2>/dev/null)"
+      [ "$name" = security-probe ]
+      kill -USR1 "$1"
+    ' sh "$UNIX_SECURITY_NAMESPACE_PID" 2>/dev/null; then
+      release_status=0
+    else
+      release_status=$?
+      probe_window_valid=false
+      log_error "could not release the Unix same-cgroup security probe"
+    fi
+  fi
+  if wait_for_background_process "$UNIX_SECURITY_EXEC_PID" 15; then
+    probe_exit=0
+    wait_status=0
+  else
+    probe_exit=$?
+    wait_status=$probe_exit
+  fi
+  # Only timeout leaves the child potentially live and therefore reserved for cleanup.
+  if ((wait_status != 124)); then
+    UNIX_SECURITY_EXEC_PID=""
+    UNIX_SECURITY_NAMESPACE_PID=""
+  fi
+  if ((probe_exit != 0)); then
+    probe_window_valid=false
+    log_error "Unix same-cgroup security probe exited with status $probe_exit"
+  fi
+  if assert_unix_abuse_race_output "$output" true; then
+    output_status=0
+  else
+    output_status=$?
+    probe_window_valid=false
+  fi
+
+  if [[ -z "$UNIX_SECURITY_EXEC_PID" ]]; then
+    if run_bounded 10 docker exec "$java_container" \
+      rm -rf -- "$probe_directory"; then
+      remove_status=0
+      UNIX_SECURITY_PROBE_DIRECTORY=""
+      UNIX_SECURITY_JAVA_CONTAINER=""
+    else
+      remove_status=$?
+      probe_window_valid=false
+      log_error "could not remove the Unix same-cgroup security probe directory"
+    fi
+  fi
+  if [[ "$probe_window_valid" != "true" || \
+    "$release_status" != "0" || "$wait_status" != "0" || \
+    "$output_status" != "0" || "$remove_status" != "0" ]]; then
+    return 1
+  fi
+
   for ((run_number = 1; run_number <= REPEAT_COUNT; run_number++)); do
     phase_label="concurrency-security-unix-same-cgroup-victim"
     if ((REPEAT_COUNT > 1)); then
       printf -v phase_label '%s-run-%02d' "$phase_label" "$run_number"
     fi
-    assert_security_metric_delta \
+    if assert_security_metric_delta \
       "$RESULT_DIR/phases/$phase_label-after/obi-metrics.delta" \
-      take unauthorized unix 1 || return $?
+      take unauthorized unix 1; then
+      :
+    else
+      current_metric_status=$?
+      if ((metric_status == 0)); then
+        metric_status=$current_metric_status
+      fi
+    fi
   done
-
-  background_process_is_running "$UNIX_SECURITY_EXEC_PID" || {
-    log_error "Unix same-cgroup security probe exited before release"
-    return 1
-  }
-  # Expanded by the container shell, not this process.
-  # shellcheck disable=SC2016
-  run_bounded 10 docker exec "$java_container" /bin/sh -ec '
-    set -eu
-    name="$(cat "/proc/$1/comm" 2>/dev/null)"
-    [ "$name" = security-probe ]
-    kill -USR1 "$1"
-  ' sh "$UNIX_SECURITY_NAMESPACE_PID" 2>/dev/null || return $?
-  if wait_for_background_process "$UNIX_SECURITY_EXEC_PID" 15; then
-    probe_exit=0
-  else
-    probe_exit=$?
+  if ((metric_status != 0)); then
+    return "$metric_status"
   fi
-  [[ "$probe_exit" == "0" ]] || {
-    log_error "Unix same-cgroup security probe exited with status $probe_exit"
-    return 1
-  }
-  UNIX_SECURITY_EXEC_PID=""
-  UNIX_SECURITY_NAMESPACE_PID=""
-  assert_unix_abuse_race_output "$output" true || return $?
+  if ((scenario_status != 0)); then
+    return "$scenario_status"
+  fi
 
-  run_bounded 10 docker exec "$java_container" \
-    rm -rf -- "$probe_directory" || return $?
-  UNIX_SECURITY_PROBE_DIRECTORY=""
   if ! wait_for_unix_security_metrics_quiescent \
     "$after_metrics" \
     "Unix same-cgroup security probe completion"; then
@@ -13815,7 +13965,6 @@ run_unix_same_cgroup_security_control() {
   fi
   write_metrics_delta "$before_metrics" "$after_metrics" "$metric_delta" || return $?
   assert_security_metric_delta "$metric_delta" take unauthorized unix 1 || return $?
-  UNIX_SECURITY_JAVA_CONTAINER=""
 }
 
 run_unix_peer_security_controls() {
@@ -14901,7 +15050,7 @@ assert_bridge_metric_delta() {
           operation == "take" && status == "unauthorized" &&
           transport == "getsockopt" && selected == "getsockopt"
         security_allowed = security_allowed || (allow_unix_security == "true" &&
-          operation == "take" && status == "unauthorized" &&
+          operation == "take" && status ~ /^(unauthorized|timeout|overload)$/ &&
           transport == "unix" && selected == "unix")
         if (transport == selected && status == "valid") {
           if (operation == "take") {

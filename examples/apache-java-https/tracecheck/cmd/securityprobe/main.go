@@ -623,8 +623,7 @@ func runAbuseRaceProbe(
 	result.Mode = "abuse-race"
 	attempts, err := runUnauthorizedRace(ctx, resume, ready, func() error {
 		request := marshalRequest(uint32(syscall.Gettid()), 0x5ec0000000000001)
-		_, attemptErr := expectRoundTripStatus(socketPath, request, statusUnauthorized)
-		return attemptErr
+		return expectAbuseRaceAttempt(socketPath, request)
 	})
 	if err != nil {
 		return probeResult{}, err
@@ -772,6 +771,27 @@ func expectRoundTripStatus(socketPath string, payload []byte, expected byte) (st
 	return statusName(status), nil
 }
 
+func expectAbuseRaceAttempt(socketPath string, payload []byte) error {
+	connection, err := dial(socketPath)
+	if err != nil {
+		return err
+	}
+	defer connection.Close()
+	if _, err := connection.Write(payload); err != nil {
+		return err
+	}
+	status, err := readSingleResponseStatus(connection)
+	if err != nil {
+		return err
+	}
+	switch status {
+	case statusUnauthorized, statusTimeout, statusOverload:
+		return nil
+	default:
+		return fmt.Errorf("expected unauthorized, timeout, or overload status, got %d", status)
+	}
+}
+
 func expectPartialStatus(socketPath string, payload []byte, expected byte) (string, error) {
 	connection, err := dial(socketPath)
 	if err != nil {
@@ -803,20 +823,28 @@ func expectSingleResponse(socketPath string, payload []byte, expected byte) (str
 	if _, err := connection.Write(payload); err != nil {
 		return "", err
 	}
-	status, err := readStatus(connection)
+	status, err := readSingleResponseStatus(connection)
 	if err != nil {
 		return "", err
 	}
 	if status != expected {
 		return "", fmt.Errorf("expected status %d, got %d", expected, status)
 	}
+	return statusName(status), nil
+}
+
+func readSingleResponseStatus(connection *net.UnixConn) (byte, error) {
+	status, err := readStatus(connection)
+	if err != nil {
+		return 0, err
+	}
 	var trailing [1]byte
 	if _, err := connection.Read(trailing[:]); err == nil {
-		return "", errors.New("connection accepted more than one request frame")
+		return 0, errors.New("connection accepted more than one request frame")
 	} else if !errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET) {
-		return "", fmt.Errorf("connection remained open after one request frame: %w", err)
+		return 0, fmt.Errorf("connection remained open after one request frame: %w", err)
 	}
-	return statusName(status), nil
+	return status, nil
 }
 
 func saturateAdmission(socketPath string) (string, error) {

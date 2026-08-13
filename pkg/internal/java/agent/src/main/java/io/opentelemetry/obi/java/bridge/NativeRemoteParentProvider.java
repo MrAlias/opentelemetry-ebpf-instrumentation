@@ -357,7 +357,6 @@ public final class NativeRemoteParentProvider implements RemoteParentProvider {
         || status == RemoteParentStatus.MALFORMED
         || status == RemoteParentStatus.VERSION_MISMATCH
         || status == RemoteParentStatus.UNAUTHORIZED
-        || status == RemoteParentStatus.TIMEOUT
         || status == RemoteParentStatus.OVERLOAD
         || status == RemoteParentStatus.TRANSPORT_ERROR
         || status == RemoteParentStatus.DISABLED;

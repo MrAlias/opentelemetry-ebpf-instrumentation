@@ -19,6 +19,16 @@ readonly PACKAGED_JVM_ARTIFACT_VALIDATOR_PATTERN='^(TestValidatePackagedJVMBench
 readonly PACKAGED_JVM_ARTIFACT_VALIDATOR_NAME='TestValidatePackagedJVMBenchmarkArtifactFile'
 readonly PACKAGED_JVM_ARTIFACT_CROSSLINK_VALIDATOR_NAME='TestValidatePackagedJVMBenchmarkArtifactCICrosslinks'
 readonly PACKAGED_JVM_EXCLUSIVE_CGROUP_BPF_PREMISE='operator_controlled_no_concurrent_cgroup_bpf_mutation'
+readonly PACKAGED_JVM_SETPRIV_PATH='/bin/setpriv'
+readonly -a PACKAGED_JVM_SETPRIV_OPTIONS=(
+    --reuid
+    --regid
+    --clear-groups
+    --no-new-privs
+    --inh-caps
+    --ambient-caps
+    --bounding-set
+)
 
 fail() {
     printf 'ERROR: %s\n' "$*" >&2
@@ -32,6 +42,21 @@ resolve_existing_path() {
     resolved="$(realpath "$path")" || \
         fail "failed to resolve path: ${path}"
     printf '%s\n' "$resolved"
+}
+
+validate_packaged_jvm_setpriv_identity() {
+    local -r path="$1"
+    local -r package_owner="$2"
+    local -r version="$3"
+    local -r help="$4"
+    local option=""
+
+    [[ "$path" == "$PACKAGED_JVM_SETPRIV_PATH" ]] || return 1
+    [[ "$package_owner" =~ ^/bin/setpriv[[:space:]]is[[:space:]]owned[[:space:]]by[[:space:]]setpriv-[0-9][0-9A-Za-z._+~-]*-r[0-9]+$ ]] || return 1
+    [[ "$version" =~ ^setpriv[[:space:]]from[[:space:]]util-linux[[:space:]][0-9]+([.][0-9]+){1,2}$ ]] || return 1
+    for option in "${PACKAGED_JVM_SETPRIV_OPTIONS[@]}"; do
+        grep -Fq -- "$option" <<<"$help" || return 1
+    done
 }
 
 require_test_passed() {
@@ -545,7 +570,11 @@ run_packaged_jvm_benchmark() {
     local artifact_file=""
     local agent_path=""
     local java_path=""
+    local setpriv_help=""
+    local setpriv_lookup=""
+    local setpriv_owner=""
     local setpriv_path=""
+    local setpriv_version=""
     local sockopt_bpf_path=""
     local sockops_bpf_path=""
     local source_revision=""
@@ -553,14 +582,30 @@ run_packaged_jvm_benchmark() {
     local test_status=0
     local -a benchmark_environment=()
 
-    command -v setpriv >/dev/null 2>&1 || fail 'setpriv is unavailable'
     command -v java >/dev/null 2>&1 || fail 'Java runtime is unavailable'
     agent_path="$(resolve_existing_path "$JAVA_AGENT_PATH")" || \
         fail 'failed to resolve the packaged JVM agent artifact'
     java_path="$(resolve_existing_path "$(command -v java)")" || \
         fail 'failed to resolve the packaged Java runtime'
-    setpriv_path="$(resolve_existing_path "$(command -v setpriv)")" || \
-        fail 'failed to resolve setpriv'
+    [[ -x "$PACKAGED_JVM_SETPRIV_PATH" ]] || \
+        fail "packaged JVM benchmark setpriv is unavailable: ${PACKAGED_JVM_SETPRIV_PATH}"
+    setpriv_path="$(resolve_existing_path "$PACKAGED_JVM_SETPRIV_PATH")" || \
+        fail 'failed to resolve packaged JVM benchmark setpriv'
+    setpriv_lookup="$(PATH=/usr/local/go/bin:/usr/bin:/bin command -v setpriv)" || \
+        fail 'setpriv is unavailable in the packaged JVM benchmark environment'
+    setpriv_lookup="$(resolve_existing_path "$setpriv_lookup")" || \
+        fail 'failed to resolve setpriv from the packaged JVM benchmark environment'
+    [[ "$setpriv_lookup" == "$setpriv_path" ]] || \
+        fail "packaged JVM benchmark resolves an unexpected setpriv: ${setpriv_lookup}"
+    setpriv_owner="$(apk info --who-owns "$PACKAGED_JVM_SETPRIV_PATH")" || \
+        fail 'failed to establish the packaged JVM benchmark setpriv package owner'
+    setpriv_version="$(LC_ALL=C "$setpriv_path" --version 2>&1)" || \
+        fail 'packaged JVM benchmark setpriv does not support --version'
+    setpriv_help="$(LC_ALL=C "$setpriv_path" --help 2>&1)" || \
+        fail 'failed to inspect packaged JVM benchmark setpriv options'
+    validate_packaged_jvm_setpriv_identity \
+        "$setpriv_path" "$setpriv_owner" "$setpriv_version" "$setpriv_help" || \
+        fail 'packaged JVM benchmark requires Alpine setpriv from util-linux with every privilege-drop option'
     sockopt_bpf_path="$(resolve_existing_path \
         pkg/internal/ebpf/tpinjector/bpfjavaremoteparent_x86_bpfel.o)" || \
         fail 'failed to resolve the generated sockopt BPF artifact'
@@ -597,15 +642,17 @@ run_packaged_jvm_benchmark() {
         printf 'java=%s\nsetpriv=%s\nagent=%s\nsockopt_bpf=%s\nsockops_bpf=%s\n' \
             "$java_path" "$setpriv_path" "$agent_path" \
             "$sockopt_bpf_path" "$sockops_bpf_path"
+        printf 'setpriv_package_owner=%s\nsetpriv_required_options=%s\n' \
+            "$setpriv_owner" "${PACKAGED_JVM_SETPRIV_OPTIONS[*]}"
         printf 'exclusive_cgroup_bpf_premise=%s\n' \
             "$PACKAGED_JVM_EXCLUSIVE_CGROUP_BPF_PREMISE"
         "$java_path" -version 2>&1
         cat /etc/os-release
         go version
         git --version
-        setpriv --version
-        apk info -e openjdk21-jre-headless util-linux-misc
-        apk info -a openjdk21-jre-headless util-linux-misc
+        "$setpriv_path" --version
+        apk info -e openjdk21-jre-headless setpriv
+        apk info -a openjdk21-jre-headless setpriv
         sha256sum "$java_path" "$setpriv_path" "$agent_path" \
             "$sockopt_bpf_path" "$sockops_bpf_path" \
             "$OUTPUT_DIR/packaged-jvm-benchmark.test"

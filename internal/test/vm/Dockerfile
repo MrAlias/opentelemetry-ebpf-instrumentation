@@ -24,7 +24,7 @@ RUN apk update && apk add --no-cache \
     make \
     openjdk21-jre-headless \
     openrc \
-    util-linux-misc
+    setpriv
 
 # Default iptables symlink to legacy; modules-load may relink to nft on
 # RHEL kernels that lack CONFIG_IP_NF_NAT modules.

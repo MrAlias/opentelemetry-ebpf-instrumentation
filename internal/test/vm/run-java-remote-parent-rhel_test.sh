@@ -340,7 +340,8 @@ require_rhel_workflow_vm_contract() {
 require_rhel_vm_image_contract() {
     local -r dockerfile="$1"
 
-    grep -Eq -- '^[[:space:]]+util-linux-misc$' "$dockerfile" || return 1
+    grep -Eq -- '^[[:space:]]+setpriv$' "$dockerfile" || return 1
+    ! grep -Eq -- '^[[:space:]]+(busybox|util-linux-misc)$' "$dockerfile" || return 1
     grep -Fq -- 'chown 65534:65534 /overlay/upper' "$dockerfile" || return 1
     grep -Fq -- 'export GOCACHE=/overlay/gocache' "$dockerfile" || return 1
     grep -Fq -- 'export TMPDIR=/overlay/tmp' "$dockerfile" || return 1
@@ -379,6 +380,8 @@ test_rhel_vm_installs_setpriv_without_dirtying_source() {
     local -r dockerfile="${SCRIPT_DIR}/Dockerfile"
     local -r valid="${TEST_TMP_DIR}/Dockerfile.valid"
     local -r missing_setpriv="${TEST_TMP_DIR}/Dockerfile.missing-setpriv"
+    local -r busybox_fallback="${TEST_TMP_DIR}/Dockerfile.busybox-fallback"
+    local -r util_linux_misc_fallback="${TEST_TMP_DIR}/Dockerfile.util-linux-misc-fallback"
     local -r root_owned_source="${TEST_TMP_DIR}/Dockerfile.root-owned-source"
     local -r repository_cache="${TEST_TMP_DIR}/Dockerfile.repository-cache"
 
@@ -386,14 +389,62 @@ test_rhel_vm_installs_setpriv_without_dirtying_source() {
     cp -- "$dockerfile" "$valid"
     require_rhel_vm_image_contract "$valid" || \
         test_fail 'RHEL VM image lost setpriv or private build storage'
-    write_mutated_fixture "$missing_setpriv" "$valid" '/^[[:space:]]*util-linux-misc$/d'
+    write_mutated_fixture "$missing_setpriv" "$valid" '/^[[:space:]]*setpriv$/d'
+    write_mutated_fixture "$busybox_fallback" "$valid" \
+        's/^[[:space:]]*setpriv$/    busybox/'
+    write_mutated_fixture "$util_linux_misc_fallback" "$valid" \
+        's/^[[:space:]]*setpriv$/    util-linux-misc/'
     write_mutated_fixture "$root_owned_source" "$valid" \
         '/chown 65534:65534 \/overlay\/upper/d'
     write_mutated_fixture "$repository_cache" "$valid" \
         's|export GOCACHE=/overlay/gocache|export GOCACHE=/build/gocache|'
-    for mutation in "$missing_setpriv" "$root_owned_source" "$repository_cache"; do
+    for mutation in \
+        "$missing_setpriv" \
+        "$busybox_fallback" \
+        "$util_linux_misc_fallback" \
+        "$root_owned_source" \
+        "$repository_cache"; do
         if require_rhel_vm_image_contract "$mutation" >/dev/null 2>&1; then
             test_fail "RHEL VM image validator accepted mutation: ${mutation}"
+        fi
+    done
+}
+
+test_packaged_jvm_setpriv_identity_contract() {
+    local -r valid_owner='/bin/setpriv is owned by setpriv-2.41.4-r0'
+    local -r valid_version='setpriv from util-linux 2.41.4'
+    local valid_help=""
+    local mutated_help=""
+    local option=""
+
+    valid_help="$(printf '%s\n' "${PACKAGED_JVM_SETPRIV_OPTIONS[@]}")"
+    validate_packaged_jvm_setpriv_identity \
+        /bin/setpriv "$valid_owner" "$valid_version" "$valid_help" || \
+        test_fail 'valid Alpine util-linux setpriv identity was rejected'
+
+    if validate_packaged_jvm_setpriv_identity \
+        /bin/busybox "$valid_owner" "$valid_version" "$valid_help"; then
+        test_fail 'non-canonical setpriv path was accepted'
+    fi
+    if validate_packaged_jvm_setpriv_identity \
+        /bin/setpriv '/bin/setpriv is owned by busybox-1.37.0-r30' \
+        "$valid_version" "$valid_help"; then
+        test_fail 'BusyBox-owned setpriv fallback was accepted'
+    fi
+    if validate_packaged_jvm_setpriv_identity \
+        /bin/setpriv "$valid_owner" 'BusyBox v1.37.0' "$valid_help"; then
+        test_fail 'non-util-linux setpriv version was accepted'
+    fi
+    if validate_packaged_jvm_setpriv_identity \
+        /bin/setpriv '/bin/setpriv is owned by util-linux-misc-2.41.4-r0' \
+        "$valid_version" "$valid_help"; then
+        test_fail 'util-linux-misc setpriv fallback was accepted'
+    fi
+    for option in "${PACKAGED_JVM_SETPRIV_OPTIONS[@]}"; do
+        mutated_help="${valid_help/"$option"/--unsupported-option}"
+        if validate_packaged_jvm_setpriv_identity \
+            /bin/setpriv "$valid_owner" "$valid_version" "$mutated_help"; then
+            test_fail "setpriv identity accepted missing option: ${option}"
         fi
     done
 }
@@ -415,7 +466,11 @@ test_packaged_jvm_runner_contract() {
     main_function="$(declare -f main)"
     [[ "$build_function" == *'go test -c -tags=privileged_tests'* && \
         "$build_function" == *'umask 077'* && \
-        "$benchmark_function" == *'command -v setpriv'* && \
+        "$benchmark_function" == *'PATH=/usr/local/go/bin:/usr/bin:/bin command -v setpriv'* && \
+        "$benchmark_function" == *"apk info --who-owns \"\$PACKAGED_JVM_SETPRIV_PATH\""* && \
+        "$benchmark_function" == *'validate_packaged_jvm_setpriv_identity'* && \
+        "$benchmark_function" == *"\"\$setpriv_path\" --version"* && \
+        "$benchmark_function" == *'apk info -e openjdk21-jre-headless setpriv'* && \
         "$benchmark_function" == *'benchmark_environment=("HOME=/root" "LANG=C" "LC_ALL=C" "PATH=/usr/local/go/bin:/usr/bin:/bin" "TMPDIR=/tmp" "TZ=UTC"'* && \
         "$benchmark_function" == *"OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_EXCLUSIVE_CGROUP_BPF=\$PACKAGED_JVM_EXCLUSIVE_CGROUP_BPF_PREMISE"* && \
         "$benchmark_function" == *"env -i \"\${benchmark_environment[@]}\""* && \
@@ -516,6 +571,7 @@ run_tests() {
     test_relative_agent_path_resolution
     test_rhel_ci_is_private_and_preserves_launch_status
     test_rhel_vm_installs_setpriv_without_dirtying_source
+    test_packaged_jvm_setpriv_identity_contract
     test_packaged_jvm_runner_contract
     printf '%s\n' 'RHEL verifier and transport benchmark validator tests passed'
 }

@@ -605,6 +605,11 @@ test_packaged_jvm_runner_contract() {
     local validate_line=""
     local gate_line=""
     local status_line=""
+    local test_binary_crosslink_line=""
+    local test_binary_execution_line=""
+    local test_binary_identity_line=""
+    local test_binary_literal_count=""
+    local test_binary_resolve_line=""
 
     build_function="$(declare -f build_packaged_jvm_benchmark_test_binary)"
     benchmark_function="$(declare -f run_packaged_jvm_benchmark)"
@@ -620,6 +625,7 @@ test_packaged_jvm_runner_contract() {
         "$benchmark_function" == *'build_packaged_jvm_source_git_command'* && \
         "$benchmark_function" == *"source_revision=\"\$(\"\${source_revision_command[@]}\")\""* && \
         "$benchmark_function" == *"source_status=\"\$(\"\${source_status_command[@]}\")\""* && \
+        "$benchmark_function" == *"test_binary_path=\"\$(resolve_existing_path \"\$OUTPUT_DIR/packaged-jvm-benchmark.test\")\""* && \
         "$benchmark_function" == *'write_packaged_jvm_command_argv source_revision_argv'* && \
         "$benchmark_function" == *'write_packaged_jvm_command_argv source_status_argv'* && \
         "$benchmark_function" != *"source_revision=\"\$(git "* && \
@@ -642,6 +648,32 @@ test_packaged_jvm_runner_contract() {
         "$source_git_function" == *"safe.directory=\$source_path"* && \
         "$source_git_function" == *"-C \"\$source_path\""* ]] || \
         test_fail 'packaged JVM benchmark lost compile, environment, or identity contracts'
+
+    test_binary_literal_count="$(
+        grep -Fo -- 'packaged-jvm-benchmark.test' <<<"$benchmark_function" | wc -l
+    )" || test_fail 'packaged JVM benchmark lost its test binary path'
+    [[ "$test_binary_literal_count" -eq 1 ]] || \
+        test_fail 'packaged JVM benchmark reused a raw test binary path after resolution'
+    test_binary_resolve_line="$(awk \
+        '/test_binary_path=.*resolve_existing_path/ { print NR; exit }' \
+        <<<"$benchmark_function")"
+    test_binary_identity_line="$(awk \
+        '/sha256sum .*test_binary_path/ { print NR; exit }' \
+        <<<"$benchmark_function")"
+    test_binary_execution_line="$(awk \
+        '/env -i .*test_binary_path/ { print NR; exit }' \
+        <<<"$benchmark_function")"
+    test_binary_crosslink_line="$(awk \
+        '/require_packaged_jvm_benchmark_artifact .*test_binary_path/ { print NR; exit }' \
+        <<<"$benchmark_function")"
+    [[ "$test_binary_resolve_line" =~ ^[1-9][0-9]*$ && \
+        "$test_binary_identity_line" =~ ^[1-9][0-9]*$ && \
+        "$test_binary_execution_line" =~ ^[1-9][0-9]*$ && \
+        "$test_binary_crosslink_line" =~ ^[1-9][0-9]*$ && \
+        test_binary_resolve_line -lt test_binary_identity_line && \
+        test_binary_identity_line -lt test_binary_execution_line && \
+        test_binary_execution_line -lt test_binary_crosslink_line ]] || \
+        test_fail 'packaged JVM benchmark did not resolve its test binary before every provenance use'
 
     transport_line="$(awk '/run_transport_benchmark/ { line = NR } END { print line }' <<<"$main_function")"
     packaged_line="$(awk '/run_packaged_jvm_benchmark/ { line = NR } END { print line }' <<<"$main_function")"

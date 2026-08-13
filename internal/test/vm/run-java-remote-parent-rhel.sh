@@ -643,6 +643,7 @@ run_packaged_jvm_benchmark() {
     local source_path=""
     local source_revision=""
     local source_status=""
+    local test_binary_path=""
     local kernel_release=""
     local test_status=0
     local -a benchmark_environment=()
@@ -652,6 +653,9 @@ run_packaged_jvm_benchmark() {
     command -v java >/dev/null 2>&1 || fail 'Java runtime is unavailable'
     agent_path="$(resolve_existing_path "$JAVA_AGENT_PATH")" || \
         fail 'failed to resolve the packaged JVM agent artifact'
+    test_binary_path="$(resolve_existing_path \
+        "$OUTPUT_DIR/packaged-jvm-benchmark.test")" || \
+        fail 'failed to resolve the packaged JVM benchmark test binary'
     java_path="$(resolve_existing_path "$(command -v java)")" || \
         fail 'failed to resolve the packaged Java runtime'
     [[ -x "$PACKAGED_JVM_SETPRIV_PATH" ]] || \
@@ -754,7 +758,7 @@ run_packaged_jvm_benchmark() {
         apk info -a openjdk21-jre-headless setpriv
         sha256sum "$java_path" "$setpriv_path" "$agent_path" \
             "$sockopt_bpf_path" "$sockops_bpf_path" \
-            "$OUTPUT_DIR/packaged-jvm-benchmark.test"
+            "$test_binary_path"
     } > "$identity_file"
     sha256sum "$identity_file" | tee "$OUTPUT_DIR/packaged-jvm-benchmark-identities.sha256"
     env -i "${benchmark_environment[@]}" env | LC_ALL=C sort \
@@ -763,7 +767,7 @@ run_packaged_jvm_benchmark() {
         tee "$OUTPUT_DIR/packaged-jvm-benchmark-root-environment.sha256"
 
     if env -i "${benchmark_environment[@]}" \
-        "$OUTPUT_DIR/packaged-jvm-benchmark.test" \
+        "$test_binary_path" \
             -test.v \
             -test.timeout=10m \
             -test.run "$PACKAGED_JVM_BENCHMARK_TEST_PATTERN" \
@@ -780,7 +784,7 @@ run_packaged_jvm_benchmark() {
         "$artifact_file" \
         "$validation_output" \
         "$agent_path" \
-        "$OUTPUT_DIR/packaged-jvm-benchmark.test" \
+        "$test_binary_path" \
         "$source_revision" \
         "$kernel_release" \
         "$java_path" \

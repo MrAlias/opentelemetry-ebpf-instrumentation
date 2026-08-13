@@ -1,5 +1,5 @@
-name: Java remote-parent RHEL kernel sockopt preflight
-run-name: Java remote-parent RHEL 9.6 kernel sockopt @ ${{ inputs.ref || github.sha }}
+name: Java remote-parent RHEL packaged-JVM transport preflight
+run-name: Java remote-parent RHEL 9.6 packaged-JVM transport @ ${{ inputs.ref || github.sha }}
 
 on:
   push:
@@ -20,9 +20,9 @@ permissions:
 
 jobs:
   validate:
-    name: RHEL 9.6 kernel sockopt preflight
+    name: RHEL 9.6 packaged-JVM transport preflight
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout selected ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -74,7 +74,13 @@ jobs:
           done
 
       - name: Validate transport benchmark artifact checks
-        run: bash internal/test/vm/run-java-remote-parent-rhel_test.sh
+        run: |
+          set -Eeuo pipefail
+          go test \
+            -count=1 \
+            -run '^(TestPackagedJVMBenchmarkArtifactV2StrictContract|TestPackagedJVMBenchmarkArtifactV2RejectsSemanticMutations|TestDecodePackagedJVMBenchmarkArtifactV2RejectsStructuralMutations)$' \
+            ./pkg/internal/ebpf/tpinjector
+          bash internal/test/vm/run-java-remote-parent-rhel_test.sh
 
       - name: Build Java bridge probe artifact
         run: |
@@ -134,7 +140,7 @@ jobs:
             exit 1
           fi
 
-      - name: Run kernel sockopt preflight in VM
+      - name: Run packaged-JVM transport preflight in VM
         env:
           KERNEL: ${{ steps.kernel.outputs.kernel }}
           MODULES_DIR: ${{ steps.kernel.outputs.modules-dir }}
@@ -180,7 +186,7 @@ jobs:
             exit 1
           fi
 
-      - name: Upload RHEL kernel sockopt preflight evidence
+      - name: Upload RHEL packaged-JVM transport evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

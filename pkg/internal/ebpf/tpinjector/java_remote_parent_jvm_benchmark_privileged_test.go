@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -22,6 +23,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -35,18 +37,16 @@ import (
 )
 
 const (
-	packagedJVMBenchmarkTimeout         = 3 * time.Minute
+	packagedJVMBenchmarkTimeout         = 8 * time.Minute
 	packagedJVMBenchmarkFirstGeneration = uint64(2_000_000)
 	packagedJVMBenchmarkCapability      = uint64(0x6e5d4c3b2a190817)
 )
 
-// TestJavaRemoteParentPackagedJVMGetsockoptBenchmark records single-thread hit and true state-map
-// miss latency through the packaged agent, a direct Java native call, JNI, the kernel syscall, and
-// the attached cgroup BPF program. It is intentionally opt-in and does not claim concurrency,
-// allocation, resource-growth, or application throughput evidence.
-func TestJavaRemoteParentPackagedJVMGetsockoptBenchmark(t *testing.T) {
+// TestJavaRemoteParentPackagedJVMTransportBenchmark records the concurrent packaged-JVM raw JNI
+// and bridge-provider paths through primary getsockopt and the production Unix fallback server.
+func TestJavaRemoteParentPackagedJVMTransportBenchmark(t *testing.T) {
 	if os.Getenv(javaRemoteParentPackagedJVMBenchmarkEnv) != "1" {
-		t.Skipf("set %s=1 to run the packaged JVM getsockopt benchmark", javaRemoteParentPackagedJVMBenchmarkEnv)
+		t.Skipf("set %s=1 to run the packaged JVM transport benchmark", javaRemoteParentPackagedJVMBenchmarkEnv)
 	}
 	artifactPath := os.Getenv(javaRemoteParentPackagedJVMBenchmarkArtifactEnv)
 	require.NotEmptyf(t, artifactPath, "set %s to a fresh artifact path", javaRemoteParentPackagedJVMBenchmarkArtifactEnv)
@@ -104,7 +104,10 @@ func TestJavaRemoteParentPackagedJVMGetsockoptBenchmark(t *testing.T) {
 		os.Getenv(javaRemoteParentPackagedJVMBenchmarkExclusiveCgroupBPFEnv),
 	)
 	require.NoError(t, err)
-	cgroupBPFStabilityTracker := newPackagedJVMBenchmarkCgroupBPFStabilityTracker()
+	expectedBatches := len(packagedJVMBenchmarkV2SeriesSpecs) *
+		(packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations)
+	cgroupBPFStabilityTracker :=
+		newPackagedJVMBenchmarkCgroupBPFStabilityTrackerForCalls(expectedBatches)
 
 	ctx, cancel := context.WithTimeout(context.Background(), packagedJVMBenchmarkTimeout)
 	defer cancel()
@@ -132,6 +135,7 @@ func TestJavaRemoteParentPackagedJVMGetsockoptBenchmark(t *testing.T) {
 		strconv.FormatUint(packagedJVMBenchmarkCapability, 10),
 		strconv.Itoa(packagedJVMBenchmarkWarmupIterations),
 		strconv.Itoa(packagedJVMBenchmarkMeasurementIterations),
+		strconv.Itoa(packagedJVMBenchmarkV2Concurrency),
 	)
 	command.Args[0] = shell.InvocationPath
 	command.Dir = "/"
@@ -179,33 +183,58 @@ func TestJavaRemoteParentPackagedJVMGetsockoptBenchmark(t *testing.T) {
 	port := parsePackagedJVMBenchmarkInt(t, listen, "port")
 	require.Greater(t, port, 0)
 	require.LessOrEqual(t, port, 65535)
-	connection, err := net.DialTCP(
-		"tcp4",
-		nil,
-		&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port},
-	)
-	require.NoError(t, err)
-	connectionClosed := false
+	connections := make([]*net.TCPConn, packagedJVMBenchmarkV2Concurrency)
 	defer func() {
-		if !connectionClosed {
-			_ = connection.Close()
+		for _, connection := range connections {
+			if connection != nil {
+				_ = connection.Close()
+			}
 		}
 	}()
+	for index := range connections {
+		connections[index], err = net.DialTCP(
+			"tcp4", nil, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port},
+		)
+		require.NoError(t, err)
+	}
 
-	ready := waitForPackagedJVMBenchmarkProbe(t, ctx, lines, "READY", &stderr)
-	requirePackagedJVMBenchmarkFields(t, ready, map[string]string{
-		"tid":                    ready["tid"],
-		"fd":                     ready["fd"],
-		"warmup_iterations":      strconv.Itoa(packagedJVMBenchmarkWarmupIterations),
-		"measurement_iterations": strconv.Itoa(packagedJVMBenchmarkMeasurementIterations),
-	})
-	tid := javaRemoteParentJVMProbeUint32(t, ready, "tid")
+	workers := make([]packagedJVMBenchmarkWorker, packagedJVMBenchmarkV2Concurrency)
+	nativeTIDs := map[uint32]struct{}{}
+	javaThreadIDs := map[int64]struct{}{}
+	for index := range workers {
+		ready := waitForPackagedJVMBenchmarkProbe(t, ctx, lines, "READY", &stderr)
+		requirePackagedJVMBenchmarkFields(t, ready, map[string]string{
+			"worker":                 strconv.Itoa(index),
+			"tid":                    ready["tid"],
+			"fd":                     ready["fd"],
+			"allocation_thread_id":   ready["allocation_thread_id"],
+			"warmup_iterations":      strconv.Itoa(packagedJVMBenchmarkWarmupIterations),
+			"measurement_iterations": strconv.Itoa(packagedJVMBenchmarkMeasurementIterations),
+			"workers":                strconv.Itoa(packagedJVMBenchmarkV2Concurrency),
+			"allocation_supported":   "1",
+			"allocation_enabled":     "1",
+		})
+		workers[index] = packagedJVMBenchmarkWorker{
+			index: index,
+			tid:   javaRemoteParentJVMProbeUint32(t, ready, "tid"),
+			javaThreadID: positivePackagedJVMBenchmarkProbeInt64(
+				t, ready, "allocation_thread_id",
+			),
+			javaFD:     javaRemoteParentJVMProbeInt(t, ready, "fd"),
+			connection: connections[index],
+		}
+		_, duplicateNativeTID := nativeTIDs[workers[index].tid]
+		require.False(t, duplicateNativeTID, "workers reused native TID %d", workers[index].tid)
+		nativeTIDs[workers[index].tid] = struct{}{}
+		_, duplicateJavaThreadID := javaThreadIDs[workers[index].javaThreadID]
+		require.False(t, duplicateJavaThreadID,
+			"workers reused Java allocation thread ID %d", workers[index].javaThreadID)
+		javaThreadIDs[workers[index].javaThreadID] = struct{}{}
+	}
 	requirePackagedJVMBenchmarkUnprivilegedProcess(t, command.Process.Pid)
 	descriptors, err := packagedJVMBenchmarkBPFDescriptors(command.Process.Pid)
 	require.NoError(t, err)
 	require.Empty(t, descriptors, "Java child received BPF descriptors: %v", descriptors)
-	javaSocketFD := javaRemoteParentJVMProbeInt(t, ready, "fd")
-	require.GreaterOrEqual(t, javaSocketFD, 0)
 	pidfd, err := unix.PidfdOpen(command.Process.Pid, 0)
 	require.NoError(t, err)
 	pidfdClosed := false
@@ -214,32 +243,80 @@ func TestJavaRemoteParentPackagedJVMGetsockoptBenchmark(t *testing.T) {
 			_ = unix.Close(pidfd)
 		}
 	}()
-	javaSocketDuplicate, err := unix.PidfdGetfd(pidfd, javaSocketFD, 0)
-	require.NoError(t, err)
-	javaSocketDuplicateClosed := false
+	workerDuplicatesClosed := false
 	defer func() {
-		if !javaSocketDuplicateClosed {
-			_ = unix.Close(javaSocketDuplicate)
+		if !workerDuplicatesClosed {
+			for _, worker := range workers {
+				if worker.duplicateFD >= 0 {
+					_ = unix.Close(worker.duplicateFD)
+				}
+				if worker.clientFD >= 0 {
+					_ = unix.Close(worker.clientFD)
+				}
+			}
 		}
 	}()
-	javaSocketCookie := socketCookie(t, javaSocketDuplicate)
-	var seededSocketCookie uint64
-	require.NoError(t, objects.JavaRemoteParentSocketCookies.Lookup(
-		uint32(javaSocketDuplicate), &seededSocketCookie,
-	))
-	require.Equal(t, javaSocketCookie, seededSocketCookie)
-
-	owner := process
-	owner.Tid = tid
-	connectionInfo := javaRemoteParentJVMConnectionInfo(t, connection)
 	netns := currentNamespaceID(t, fmt.Sprintf("/proc/%d/ns/net", command.Process.Pid))
+	for index := range workers {
+		require.GreaterOrEqual(t, workers[index].javaFD, 0)
+		workers[index].duplicateFD, err = unix.PidfdGetfd(pidfd, workers[index].javaFD, 0)
+		require.NoError(t, err)
+		workers[index].clientFD = duplicatePackagedJVMBenchmarkTCPFD(t, workers[index].connection)
+		workers[index].javaSocketCookie = socketCookie(t, workers[index].duplicateFD)
+		workers[index].clientSocketCookie = socketCookie(t, workers[index].clientFD)
+		workers[index].owner = process
+		workers[index].owner.Tid = workers[index].tid
+		workers[index].connectionInfo = javaRemoteParentJVMConnectionInfo(t, workers[index].connection)
+		workers[index].netns = netns
+		var seededSocketCookie uint64
+		require.NoError(t, objects.JavaRemoteParentSocketCookies.Lookup(
+			uint32(workers[index].duplicateFD), &seededSocketCookie,
+		))
+		require.Equal(t, workers[index].javaSocketCookie, seededSocketCookie)
+	}
+
 	nextGeneration := packagedJVMBenchmarkFirstGeneration
 	nextNonce := uint64(1)
-	samples := map[string][]int64{
-		"miss": make([]int64, 0, packagedJVMBenchmarkMeasurementIterations),
-		"hit":  make([]int64, 0, packagedJVMBenchmarkMeasurementIterations),
-	}
-	for _, outcome := range []string{"miss", "hit"} {
+	observations := make([]packagedJVMBenchmarkV2SeriesObservation, 0, len(packagedJVMBenchmarkV2SeriesSpecs))
+	for _, spec := range packagedJVMBenchmarkV2SeriesSpecs {
+		serverPath := "-"
+		serverUID := uint64(0)
+		var serverCounters *packagedJVMBenchmarkUnixCounters
+		stopServer := func() {}
+		if spec.Transport == "unix" {
+			serverPath, serverCounters, stopServer = startPackagedJVMBenchmarkUnixServer(
+				t, &objects.BpfJavaRemoteParentMaps, spec.Outcome == "timeout",
+			)
+		}
+		_, err = fmt.Fprintf(
+			stdin, "CONFIG %s %s %d %d\n",
+			spec.Transport, serverPath, packagedJVMBenchmarkV2TimeoutMillis, serverUID,
+		)
+		require.NoError(t, err)
+		configured := waitForPackagedJVMBenchmarkProbe(t, ctx, lines, "CONFIGURED", &stderr)
+		requirePackagedJVMBenchmarkFields(t, configured, map[string]string{
+			"transport":      spec.Transport,
+			"timeout_millis": strconv.Itoa(packagedJVMBenchmarkV2TimeoutMillis),
+			"server_uid":     strconv.FormatUint(serverUID, 10),
+		})
+
+		observation := packagedJVMBenchmarkV2SeriesObservation{
+			Spec:                   spec,
+			SamplesNS:              make([]int64, 0, packagedJVMBenchmarkV2Concurrency*packagedJVMBenchmarkMeasurementIterations),
+			AllocatedBytes:         make([]int64, 0, packagedJVMBenchmarkV2Concurrency*packagedJVMBenchmarkMeasurementIterations),
+			AllocationControlBytes: make([]int64, 0, packagedJVMBenchmarkV2Concurrency*packagedJVMBenchmarkMeasurementIterations),
+			Calls:                  packagedJVMBenchmarkExpectedCallsV2(spec),
+		}
+		var primaryStatsBefore [javaRemoteParentStatCount]uint64
+		if spec.Transport == "getsockopt" {
+			primaryStatsBefore = javaRemoteParentStats(t, objects.JavaRemoteParentStats)
+			observation.Calls.PrimaryBPFStatusBefore =
+				primaryStatsBefore[packagedJVMBenchmarkTakeStatIndex(t, spec.ExpectedStatus)]
+		}
+		if serverCounters != nil {
+			observation.Calls.UnixServerStatusBefore = serverCounters.status(spec.ExpectedStatus)
+		}
+
 		for _, phase := range []struct {
 			name       string
 			iterations int
@@ -249,145 +326,242 @@ func TestJavaRemoteParentPackagedJVMGetsockoptBenchmark(t *testing.T) {
 			{name: "measurement", iterations: packagedJVMBenchmarkMeasurementIterations, retain: true},
 		} {
 			for iteration := range phase.iterations {
-				generation := nextGeneration
-				nextGeneration++
-				stageRemoteParent(
-					t,
-					&objects.BpfJavaRemoteParentMaps,
-					process,
-					owner,
-					packagedJVMBenchmarkCapability,
-					connectionInfo,
-					netns,
-					javaSocketCookie,
-					generation,
-					nextNonce,
-				)
-				_, err = fmt.Fprintf(
-					stdin, "ARM %s %s %d %d\n", phase.name, outcome, iteration, generation,
-				)
-				require.NoError(t, err)
-				armed := waitForPackagedJVMBenchmarkProbe(t, ctx, lines, "ARMED", &stderr)
-				requirePackagedJVMBenchmarkFields(t, armed, map[string]string{
-					"phase":     phase.name,
-					"outcome":   outcome,
-					"iteration": strconv.Itoa(iteration),
-					"emit":      "1",
-					"nonce":     strconv.FormatUint(nextNonce, 10),
-				})
-
-				negotiation := socketNegotiation(
-					t, objects.JavaRemoteParentNegotiations, javaSocketDuplicate,
-				)
-				require.NoError(t, validatePackagedJVMBenchmarkNegotiationAuthority(
-					packagedJVMBenchmarkNegotiationAuthority{
-						Process:            negotiation.Process,
-						ProcessIncarnation: negotiation.ProcessIncarnation,
-						Connection:         negotiation.Connection,
-						ConnectionNetns:    negotiation.ConnectionNetns,
-						Generation:         negotiation.Generation,
-					},
-					packagedJVMBenchmarkNegotiationAuthority{
-						Process:            process,
-						ProcessIncarnation: packagedJVMBenchmarkCapability,
-						Connection:         connectionInfo,
-						ConnectionNetns:    netns,
-						Generation:         generation,
-					},
-				))
-				var missAuthority *packagedJVMBenchmarkMissAuthority
-				if outcome == "miss" {
-					// Delete only the acknowledged state. The owner and generation index remain
-					// authoritative and are asserted byte-for-byte around the timed lookup.
-					authority := removePackagedJVMBenchmarkStateOnly(
-						t,
-						&objects.BpfJavaRemoteParentMaps,
-						owner,
-						generation,
-					)
-					missAuthority = &authority
+				generations := make([]uint64, len(workers))
+				nonces := make([]uint64, len(workers))
+				expectedResponseGenerations := make([]uint64, len(workers))
+				missAuthorities := make([]*packagedJVMBenchmarkMissAuthority, len(workers))
+				negotiations := make([]BpfJavaRemoteParentJavaRemoteParentNegotiationT, len(workers))
+				for index := range workers {
+					if spec.Outcome == "hit" || spec.Outcome == "stale" || spec.Transport == "getsockopt" {
+						generations[index] = nextGeneration
+						nextGeneration++
+						observed := monotonicNowNS(t)
+						if spec.Outcome == "stale" {
+							require.Greater(t, observed, uint64(packagedJVMBenchmarkStaleAge.Nanoseconds()))
+							observed -= uint64(packagedJVMBenchmarkStaleAge.Nanoseconds())
+						}
+						cookie := workers[index].javaSocketCookie
+						if spec.Transport == "unix" {
+							cookie = workers[index].clientSocketCookie
+						}
+						stageRemoteParentAt(
+							t, &objects.BpfJavaRemoteParentMaps, process, workers[index].owner,
+							packagedJVMBenchmarkCapability, workers[index].connectionInfo,
+							workers[index].netns, cookie, generations[index], nextNonce, observed,
+						)
+						nonces[index] = nextNonce
+						if spec.Transport == "unix" {
+							require.NoError(t, acknowledgeRemoteParentData(workers[index].clientFD, nextNonce))
+						}
+						if spec.ExpectedStatus == int(javabridge.StatusValid) ||
+							(spec.Scope == "raw_jni" && spec.Transport == "getsockopt") {
+							expectedResponseGenerations[index] = generations[index]
+						}
+						nextNonce++
+					}
 				}
+				_, err = fmt.Fprintf(stdin, "ARM_BATCH %s %s %s %s %d %d",
+					phase.name, spec.Scope, spec.Transport, spec.Outcome, iteration, spec.ExpectedStatus)
+				require.NoError(t, err)
+				for _, generation := range expectedResponseGenerations {
+					_, err = fmt.Fprintf(stdin, " %d", generation)
+					require.NoError(t, err)
+				}
+				_, err = io.WriteString(stdin, "\n")
+				require.NoError(t, err)
+
+				for index := range workers {
+					armed := waitForPackagedJVMBenchmarkProbe(t, ctx, lines, "ARMED", &stderr)
+					expectedEmit := "0"
+					expectedNonce := "0"
+					if spec.Transport == "getsockopt" {
+						expectedEmit = "1"
+						expectedNonce = strconv.FormatUint(nextNonce-uint64(len(workers)-index), 10)
+					}
+					requirePackagedJVMBenchmarkFields(t, armed, map[string]string{
+						"phase": phase.name, "scope": spec.Scope, "transport": spec.Transport,
+						"outcome": spec.Outcome, "iteration": strconv.Itoa(iteration),
+						"worker": strconv.Itoa(index), "emit": expectedEmit, "nonce": expectedNonce,
+					})
+					if spec.Transport == "getsockopt" {
+						negotiations[index] = socketNegotiation(
+							t, objects.JavaRemoteParentNegotiations, workers[index].duplicateFD,
+						)
+						require.NoError(t, validatePackagedJVMBenchmarkNegotiationAuthority(
+							packagedJVMBenchmarkNegotiationAuthority{
+								Process:            negotiations[index].Process,
+								ProcessIncarnation: negotiations[index].ProcessIncarnation,
+								Connection:         negotiations[index].Connection,
+								ConnectionNetns:    negotiations[index].ConnectionNetns,
+								Generation:         negotiations[index].Generation,
+							},
+							packagedJVMBenchmarkNegotiationAuthority{
+								Process: process, ProcessIncarnation: packagedJVMBenchmarkCapability,
+								Connection:      workers[index].connectionInfo,
+								ConnectionNetns: workers[index].netns, Generation: generations[index],
+							},
+						))
+						if spec.Outcome == "miss" {
+							authority := removePackagedJVMBenchmarkStateOnly(
+								t, &objects.BpfJavaRemoteParentMaps,
+								workers[index].owner, generations[index],
+							)
+							missAuthorities[index] = &authority
+						}
+					}
+				}
+
 				preCallCgroupBPF, preCallQueryErr := tryQueryPackagedJVMBenchmarkCgroupBPF(cgroupPath)
 				require.NoError(t, cgroupBPFStabilityTracker.ObservePreCall(
 					attachedCgroupBPF, preCallCgroupBPF, preCallQueryErr,
 				))
-				_, err = fmt.Fprintf(stdin, "TAKE %s %s %d\n", phase.name, outcome, iteration)
+				_, err = fmt.Fprintf(
+					stdin, "TAKE_BATCH %s %s %s %s %d\n",
+					phase.name, spec.Scope, spec.Transport, spec.Outcome, iteration,
+				)
 				require.NoError(t, err)
-				sample := waitForPackagedJVMBenchmarkProbe(t, ctx, lines, "SAMPLE", &stderr)
+				batchSamples := make([]map[string]string, len(workers))
+				for index := range workers {
+					batchSamples[index] = waitForPackagedJVMBenchmarkProbe(t, ctx, lines, "SAMPLE", &stderr)
+				}
 				postCallCgroupBPF, postCallQueryErr := tryQueryPackagedJVMBenchmarkCgroupBPF(cgroupPath)
 				require.NoError(t, cgroupBPFStabilityTracker.ObservePostCall(
 					attachedCgroupBPF, postCallCgroupBPF, postCallQueryErr,
 				))
-				expectedStatus := javabridge.StatusMissing
-				if outcome == "hit" {
-					expectedStatus = javabridge.StatusValid
+				for index, sample := range batchSamples {
+					expectedBridgeCalls := "0"
+					if spec.Scope == "bridge_provider_jni" {
+						expectedBridgeCalls = "1"
+					}
+					requirePackagedJVMBenchmarkFields(t, sample, map[string]string{
+						"phase": phase.name, "scope": spec.Scope, "transport": spec.Transport,
+						"outcome": spec.Outcome, "iteration": strconv.Itoa(iteration),
+						"worker": strconv.Itoa(index), "status": strconv.Itoa(spec.ExpectedStatus),
+						"generation":               strconv.FormatUint(expectedResponseGenerations[index], 10),
+						"duration_ns":              sample["duration_ns"],
+						"allocated_bytes":          sample["allocated_bytes"],
+						"allocation_control_bytes": sample["allocation_control_bytes"],
+						"java_calls":               "1",
+						"native_calls":             "1",
+						"bridge_calls":             expectedBridgeCalls,
+					})
+					require.NoError(t, observation.Statuses.add(spec.ExpectedStatus))
+					observation.Calls.ObservedJavaCalls++
+					observation.Calls.ObservedNativeCalls++
+					if spec.Scope == "bridge_provider_jni" {
+						observation.Calls.ObservedBridgeCalls++
+					}
+					if phase.retain {
+						observation.SamplesNS = append(observation.SamplesNS,
+							positivePackagedJVMBenchmarkProbeInt64(t, sample, "duration_ns"))
+						observation.AllocatedBytes = append(observation.AllocatedBytes,
+							nonnegativePackagedJVMBenchmarkProbeInt64(t, sample, "allocated_bytes"))
+						observation.AllocationControlBytes = append(observation.AllocationControlBytes,
+							nonnegativePackagedJVMBenchmarkProbeInt64(t, sample, "allocation_control_bytes"))
+					}
 				}
-				requirePackagedJVMBenchmarkFields(t, sample, map[string]string{
-					"phase":       phase.name,
-					"outcome":     outcome,
-					"iteration":   strconv.Itoa(iteration),
-					"status":      strconv.Itoa(int(expectedStatus)),
-					"generation":  strconv.FormatUint(generation, 10),
-					"duration_ns": sample["duration_ns"],
-				})
-				duration := parsePackagedJVMBenchmarkInt64(t, sample, "duration_ns")
-				require.Positive(t, duration)
-				if outcome == "miss" {
-					requirePackagedJVMBenchmarkMissAuthority(t, &objects.BpfJavaRemoteParentMaps, *missAuthority)
-					restorePackagedJVMBenchmarkMissState(t, objects.JavaRemoteParentState, *missAuthority)
-					// Existing full cleanup runs only after the timed miss and exact restoration.
-					removeBenchmarkGeneration(
-						t,
-						&objects.BpfJavaRemoteParentMaps,
-						owner,
-						negotiation,
-						generation,
-					)
+
+				for index := range workers {
+					if generations[index] == 0 {
+						continue
+					}
+					if spec.Transport == "getsockopt" && spec.Outcome == "miss" {
+						requirePackagedJVMBenchmarkMissAuthority(
+							t, &objects.BpfJavaRemoteParentMaps, *missAuthorities[index],
+						)
+						restorePackagedJVMBenchmarkMissState(
+							t, objects.JavaRemoteParentState, *missAuthorities[index],
+						)
+						removeBenchmarkGeneration(
+							t, &objects.BpfJavaRemoteParentMaps, workers[index].owner,
+							negotiations[index], generations[index],
+						)
+					}
 					requirePackagedJVMBenchmarkGenerationCleaned(
-						t, &objects.BpfJavaRemoteParentMaps, owner, generation,
+						t, &objects.BpfJavaRemoteParentMaps, workers[index].owner, generations[index],
 					)
-				} else {
-					requirePackagedJVMBenchmarkGenerationCleaned(
-						t, &objects.BpfJavaRemoteParentMaps, owner, generation,
+					requirePackagedJVMBenchmarkDataAckMissing(
+						t, objects.JavaRemoteParentDataAcks, process, nonces[index],
 					)
 				}
-				requirePackagedJVMBenchmarkDataAckMissing(
-					t, objects.JavaRemoteParentDataAcks, process, nextNonce,
-				)
-				if phase.retain {
-					samples[outcome] = append(samples[outcome], duration)
-				}
-				nextNonce++
 			}
 		}
+
+		if spec.Transport == "getsockopt" {
+			primaryStatsAfter := javaRemoteParentStats(t, objects.JavaRemoteParentStats)
+			statIndex := packagedJVMBenchmarkTakeStatIndex(t, spec.ExpectedStatus)
+			observation.Calls.PrimaryBPFStatusAfter = primaryStatsAfter[statIndex]
+			observation.Calls.ObservedPrimaryBPFCalls = int(
+				observation.Calls.PrimaryBPFStatusAfter - observation.Calls.PrimaryBPFStatusBefore,
+			)
+			requirePackagedJVMBenchmarkExactTakeStats(
+				t, primaryStatsBefore, primaryStatsAfter, statIndex,
+				packagedJVMBenchmarkV2Concurrency*(packagedJVMBenchmarkWarmupIterations+packagedJVMBenchmarkMeasurementIterations),
+			)
+		}
+		if serverCounters != nil {
+			serverCounters.awaitStatus(
+				t, spec.ExpectedStatus,
+				packagedJVMBenchmarkV2Concurrency*(packagedJVMBenchmarkWarmupIterations+packagedJVMBenchmarkMeasurementIterations),
+			)
+			observation.Calls.UnixServerStatusAfter = serverCounters.status(spec.ExpectedStatus)
+			observedServerRequests := int(
+				observation.Calls.UnixServerStatusAfter - observation.Calls.UnixServerStatusBefore,
+			)
+			if spec.Outcome == "timeout" {
+				observation.Calls.ObservedTimeoutFullRequests = observedServerRequests
+			} else {
+				observation.Calls.ObservedUnixServerRequests = observedServerRequests
+			}
+			serverCounters.requireExactTakes(
+				t, spec.ExpectedStatus,
+				packagedJVMBenchmarkV2Concurrency*(packagedJVMBenchmarkWarmupIterations+packagedJVMBenchmarkMeasurementIterations),
+			)
+		}
+		stopServer()
+		observations = append(observations, observation)
 	}
 
+	retainedSamples := len(packagedJVMBenchmarkV2SeriesSpecs) *
+		packagedJVMBenchmarkV2Concurrency * packagedJVMBenchmarkMeasurementIterations
+	_, err = io.WriteString(stdin, "DONE\n")
+	require.NoError(t, err)
 	done := waitForPackagedJVMBenchmarkProbe(t, ctx, lines, "DONE", &stderr)
 	requirePackagedJVMBenchmarkFields(t, done, map[string]string{
-		"samples": strconv.Itoa(2 * packagedJVMBenchmarkMeasurementIterations),
+		"samples": strconv.Itoa(retainedSamples),
 	})
 	require.NoError(t, stdin.Close())
 	waitForPackagedJVMBenchmarkProbeEOF(t, ctx, lines, &stderr)
 	err = command.Wait()
 	waited = true
 	if ctx.Err() != nil {
-		t.Fatalf("packaged JVM getsockopt benchmark timed out: %s", stderr.String())
+		t.Fatalf("packaged JVM transport benchmark timed out: %s", stderr.String())
 	}
-	require.NoErrorf(t, err, "packaged JVM getsockopt benchmark failed:\n%s", stderr.String())
+	require.NoErrorf(t, err, "packaged JVM transport benchmark failed:\n%s", stderr.String())
 	require.NoError(t, validatePackagedJVMBenchmarkCgroupBPFSnapshotUnchanged(
 		attachedCgroupBPF,
 		queryPackagedJVMBenchmarkCgroupBPF(t, cgroupPath),
 	))
 	cgroupBPFAttribution.StabilityChecks = cgroupBPFStabilityTracker.Checks()
-	require.NoError(t, validatePackagedJVMBenchmarkCgroupBPFAttribution(
+	require.NoError(t, validatePackagedJVMBenchmarkCgroupBPFAttributionTopology(
 		cgroupBPFAttribution, cgroupPath,
 	))
+	require.Equal(t, expectedBatches, cgroupBPFAttribution.StabilityChecks.ExpectedCalls)
+	require.Equal(t, expectedBatches, cgroupBPFAttribution.StabilityChecks.ObservedPreCallSnapshots)
+	require.Equal(t, expectedBatches, cgroupBPFAttribution.StabilityChecks.ObservedPostCallSnapshots)
+	require.Zero(t, cgroupBPFAttribution.StabilityChecks.QueryErrors)
+	require.Zero(t, cgroupBPFAttribution.StabilityChecks.TopologyMismatches)
 
 	// Cleanup is part of the evidence gate: any failure is fatal and happens before publication.
-	require.NoError(t, connection.Close())
-	connectionClosed = true
-	require.NoError(t, unix.Close(javaSocketDuplicate))
-	javaSocketDuplicateClosed = true
+	for index := range workers {
+		require.NoError(t, connections[index].Close())
+		connections[index] = nil
+		require.NoError(t, unix.Close(workers[index].duplicateFD))
+		workers[index].duplicateFD = -1
+		require.NoError(t, unix.Close(workers[index].clientFD))
+		workers[index].clientFD = -1
+	}
+	workerDuplicatesClosed = true
 	require.NoError(t, unix.Close(pidfd))
 	pidfdClosed = true
 	deleteBenchmarkMapKey(t, objects.JavaProcessIncarnations, process)
@@ -425,7 +599,7 @@ func TestJavaRemoteParentPackagedJVMGetsockoptBenchmark(t *testing.T) {
 	runtimeIdentity := packagedJVMBenchmarkRuntimeIdentity(
 		t, java, javaEnvironment, cgroupPath,
 	)
-	artifact := newPackagedJVMBenchmarkArtifact(
+	artifact := newPackagedJVMBenchmarkArtifactV2(
 		startedAt,
 		sourceIdentity,
 		packagedJVMBenchmarkArtifactInputs{
@@ -437,20 +611,253 @@ func TestJavaRemoteParentPackagedJVMGetsockoptBenchmark(t *testing.T) {
 		},
 		cgroupBPFAttribution,
 		runtimeIdentity,
-		samples["miss"],
-		samples["hit"],
+		observations,
 	)
 	// Publish structurally valid failed measurements before enforcing the predeclared gate.
-	require.NoError(t, writePackagedJVMBenchmarkArtifact(artifactPath, artifact))
+	require.NoError(t, writePackagedJVMBenchmarkArtifactV2(artifactPath, artifact))
 	for _, series := range artifact.Series {
 		require.Truef(
 			t,
 			series.LatencyGate.Passed,
-			"packaged JVM benchmark %s failed p99 < %s: p99=%s",
-			series.Outcome,
-			time.Duration(series.LatencyGate.P99MaxNS),
+			"packaged JVM benchmark %s/%s/%s failed %s: p50=%s p99=%s p99_limit=%s",
+			series.Scope, series.Transport, series.Outcome, series.LatencyGate.Kind,
+			time.Duration(series.P50NS),
 			time.Duration(series.P99NS),
+			time.Duration(series.LatencyGate.P99MaxNS),
 		)
+	}
+}
+
+type packagedJVMBenchmarkWorker struct {
+	index              int
+	tid                uint32
+	javaThreadID       int64
+	javaFD             int
+	duplicateFD        int
+	clientFD           int
+	connection         *net.TCPConn
+	owner              BpfJavaRemoteParentPidKeyT
+	connectionInfo     BpfJavaRemoteParentConnectionInfoT
+	netns              uint32
+	javaSocketCookie   uint64
+	clientSocketCookie uint64
+}
+
+type packagedJVMBenchmarkUnixCounters struct {
+	mu       sync.Mutex
+	statuses [14]uint64
+}
+
+func (counters *packagedJVMBenchmarkUnixCounters) observe(
+	operation javabridge.Operation,
+	status javabridge.Status,
+) {
+	if operation != javabridge.OperationTake || status > javabridge.StatusDisabled {
+		return
+	}
+	counters.mu.Lock()
+	defer counters.mu.Unlock()
+	counters.statuses[status]++
+}
+
+func (counters *packagedJVMBenchmarkUnixCounters) status(status int) uint64 {
+	counters.mu.Lock()
+	defer counters.mu.Unlock()
+	if status < 0 || status >= len(counters.statuses) {
+		return 0
+	}
+	return counters.statuses[status]
+}
+
+func (counters *packagedJVMBenchmarkUnixCounters) requireExactTakes(
+	t *testing.T,
+	expectedStatus int,
+	expected int,
+) {
+	t.Helper()
+	counters.mu.Lock()
+	defer counters.mu.Unlock()
+	for status, count := range counters.statuses {
+		if status == expectedStatus {
+			require.Equal(t, uint64(expected), count, "unexpected Unix server status count")
+		} else {
+			require.Zero(t, count, "unexpected Unix server status %d", status)
+		}
+	}
+}
+
+func (counters *packagedJVMBenchmarkUnixCounters) awaitStatus(
+	t *testing.T,
+	status int,
+	expected int,
+) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		return counters.status(status) == uint64(expected)
+	}, 2*time.Second, time.Millisecond, "Unix server did not finish every observed request")
+}
+
+type packagedJVMBenchmarkTimeoutHandler struct{}
+
+func (packagedJVMBenchmarkTimeoutHandler) HandleAuthenticated(
+	ctx context.Context,
+	_ javabridge.Identity,
+	operation javabridge.Operation,
+	source javabridge.LookupSource,
+	processIncarnation uint64,
+) javabridge.Record {
+	if source != javabridge.LookupSourceDirect {
+		return javabridge.Record{Status: javabridge.StatusMalformed}
+	}
+	if processIncarnation != packagedJVMBenchmarkCapability {
+		return javabridge.Record{Status: javabridge.StatusUnauthorized}
+	}
+	if operation == javabridge.OperationNegotiate {
+		return javabridge.Record{Status: javabridge.StatusMissing}
+	}
+	if operation != javabridge.OperationTake {
+		return javabridge.Record{Status: javabridge.StatusMalformed}
+	}
+	<-ctx.Done()
+	return javabridge.Record{Status: javabridge.StatusTimeout}
+}
+
+func startPackagedJVMBenchmarkUnixServer(
+	t *testing.T,
+	maps *BpfJavaRemoteParentMaps,
+	timeout bool,
+) (string, *packagedJVMBenchmarkUnixCounters, func()) {
+	t.Helper()
+	directory := t.TempDir()
+	require.NoError(t, os.Chown(directory, 0, packagedJVMBenchmarkJavaID))
+	require.NoError(t, os.Chmod(directory, 0o750))
+	socketPath := filepath.Join(directory, "bridge.sock")
+	counters := &packagedJVMBenchmarkUnixCounters{}
+	var handler javabridge.Handler = javabridge.NewMapHandler(
+		javaRemoteParentBenchmarkMaps(maps),
+		packagedJVMBenchmarkRetrievalTTL,
+		javabridge.NewGenerationCoordinator(),
+	)
+	if timeout {
+		handler = packagedJVMBenchmarkTimeoutHandler{}
+	}
+	server, err := javabridge.NewServer(javabridge.ServerOptions{
+		SocketPath:    socketPath,
+		SocketGID:     packagedJVMBenchmarkJavaID,
+		Timeout:       time.Duration(packagedJVMBenchmarkV2TimeoutMillis) * time.Millisecond,
+		MaxConcurrent: packagedJVMBenchmarkV2Concurrency * 4,
+		Log:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Observe:       counters.observe,
+	}, handler)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(ctx) }()
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			cancel()
+			require.NoError(t, server.Close())
+			require.NoError(t, <-done)
+		})
+	}
+	t.Cleanup(stop)
+	return socketPath, counters, stop
+}
+
+func packagedJVMBenchmarkExpectedCallsV2(
+	spec packagedJVMBenchmarkV2SeriesSpec,
+) packagedJVMBenchmarkArtifactV2Calls {
+	total := packagedJVMBenchmarkV2Concurrency *
+		(packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations)
+	calls := packagedJVMBenchmarkArtifactV2Calls{
+		ExpectedJavaCalls:   total,
+		ExpectedNativeCalls: total,
+		PrimaryBPFStatus:    "not_applicable", UnixServerStatus: "not_applicable",
+	}
+	if spec.Scope == "bridge_provider_jni" {
+		calls.ExpectedBridgeCalls = total
+	}
+	if spec.Transport == "getsockopt" {
+		calls.ExpectedPrimaryBPFCalls = total
+		calls.PrimaryBPFStatus = javabridge.Status(spec.ExpectedStatus).String()
+	} else if spec.Outcome == "timeout" {
+		calls.ExpectedTimeoutFullRequests = total
+		calls.UnixServerStatus = javabridge.Status(spec.ExpectedStatus).String()
+	} else {
+		calls.ExpectedUnixServerRequests = total
+		calls.UnixServerStatus = javabridge.Status(spec.ExpectedStatus).String()
+	}
+	return calls
+}
+
+func duplicatePackagedJVMBenchmarkTCPFD(t *testing.T, connection *net.TCPConn) int {
+	t.Helper()
+	raw, err := connection.SyscallConn()
+	require.NoError(t, err)
+	duplicate := -1
+	var duplicateErr error
+	require.NoError(t, raw.Control(func(fd uintptr) {
+		duplicate, duplicateErr = unix.FcntlInt(fd, unix.F_DUPFD_CLOEXEC, 0)
+	}))
+	require.NoError(t, duplicateErr)
+	require.GreaterOrEqual(t, duplicate, 0)
+	return duplicate
+}
+
+func positivePackagedJVMBenchmarkProbeInt64(
+	t *testing.T,
+	values map[string]string,
+	key string,
+) int64 {
+	t.Helper()
+	value := parsePackagedJVMBenchmarkInt64(t, values, key)
+	require.Positive(t, value)
+	return value
+}
+
+func nonnegativePackagedJVMBenchmarkProbeInt64(
+	t *testing.T,
+	values map[string]string,
+	key string,
+) int64 {
+	t.Helper()
+	value := parsePackagedJVMBenchmarkInt64(t, values, key)
+	require.GreaterOrEqual(t, value, int64(0))
+	return value
+}
+
+func packagedJVMBenchmarkTakeStatIndex(t *testing.T, status int) int {
+	t.Helper()
+	switch javabridge.Status(status) {
+	case javabridge.StatusValid:
+		return 4
+	case javabridge.StatusMissing:
+		return 5
+	case javabridge.StatusStale:
+		return 6
+	default:
+		require.FailNowf(t, "unsupported primary status", "status=%d", status)
+		return -1
+	}
+}
+
+func requirePackagedJVMBenchmarkExactTakeStats(
+	t *testing.T,
+	before [javaRemoteParentStatCount]uint64,
+	after [javaRemoteParentStatCount]uint64,
+	expectedIndex int,
+	expectedDelta int,
+) {
+	t.Helper()
+	for index := 4; index < 12; index++ {
+		if index == expectedIndex {
+			require.Equal(t, before[index]+uint64(expectedDelta), after[index],
+				"unexpected primary BPF take status delta at index %d", index)
+		} else {
+			require.Equal(t, before[index], after[index],
+				"unexpected primary BPF take status changed at index %d", index)
+		}
 	}
 }
 

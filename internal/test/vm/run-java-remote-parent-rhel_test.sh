@@ -325,6 +325,10 @@ require_rhel_workflow_vm_contract() {
     grep -Fq -- "sudo chown -R -- \"\$runner_uid:\$runner_gid\" testoutput" "$workflow" || return 1
     grep -Fq -- "exit \"\$launch_status\"" "$workflow" || return 1
     grep -Fq -- "rm -rf -- \"\$vm_workdir\"" "$workflow" || return 1
+    grep -Fq -- 'timeout-minutes: 60' "$workflow" || return 1
+    grep -Fq -- 'TestPackagedJVMBenchmarkArtifactV2StrictContract' "$workflow" || return 1
+    grep -Fq -- 'TestPackagedJVMBenchmarkArtifactV2RejectsSemanticMutations' "$workflow" || return 1
+    grep -Fq -- 'TestDecodePackagedJVMBenchmarkArtifactV2RejectsStructuralMutations' "$workflow" || return 1
     mktemp_line="$(grep -Fn -- "vm_workdir=\"\$(mktemp -d --" "$workflow" | cut -d: -f1)"
     launch_line="$(grep -Fn -- 'sudo make -C internal/test/vm' "$workflow" | cut -d: -f1)"
     chown_line="$(grep -Fn -- "sudo chown -R -- \"\$runner_uid:\$runner_gid\" testoutput" "$workflow" | cut -d: -f1)"
@@ -616,6 +620,11 @@ test_packaged_jvm_runner_contract() {
     source_git_function="$(declare -f build_packaged_jvm_source_git_command)"
     validation_function="$(declare -f require_packaged_jvm_benchmark_artifact)"
     main_function="$(declare -f main)"
+    [[ "$PACKAGED_JVM_BENCHMARK_TEST_PATTERN" == \
+        '^TestJavaRemoteParentPackagedJVMTransportBenchmark$' && \
+        "$PACKAGED_JVM_BENCHMARK_TEST_NAME" == \
+        'TestJavaRemoteParentPackagedJVMTransportBenchmark' ]] || \
+        test_fail 'packaged JVM runner does not select the generalized transport benchmark'
     [[ "$build_function" == *'go test -c -tags=privileged_tests'* && \
         "$build_function" == *'umask 077'* && \
         "$benchmark_function" == *'PATH=/usr/local/go/bin:/usr/bin:/bin command -v setpriv'* && \

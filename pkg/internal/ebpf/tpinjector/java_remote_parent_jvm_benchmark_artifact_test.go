@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sort"
 	"strconv"
@@ -71,7 +72,49 @@ const (
 	packagedJVMBenchmarkExclusiveTopologyPremise                = "operator_controlled_no_concurrent_cgroup_bpf_mutation"
 	packagedJVMBenchmarkRevisionPremiseNotRequired              = "not_required_all_direct_queries_revision_supported"
 	packagedJVMBenchmarkExpectedCalls                           = 2 * (packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations)
+	packagedJVMBenchmarkArtifactV2SchemaVersion                 = 2
+	packagedJVMBenchmarkArtifactV2Name                          = "java_remote_parent_packaged_jvm_transport"
+	packagedJVMBenchmarkV2Harness                               = "packaged_agent_java_concurrent_transport"
+	packagedJVMBenchmarkV2Concurrency                           = 8
+	packagedJVMBenchmarkV2PrimaryP99LimitNS                     = int64(time.Millisecond)
+	packagedJVMBenchmarkV2UnixP99LimitNS                        = int64(50 * time.Millisecond)
+	packagedJVMBenchmarkV2TimeoutP50MinimumNS                   = int64(50 * time.Millisecond)
+	packagedJVMBenchmarkV2TimeoutP99LimitNS                     = int64(100 * time.Millisecond)
+	packagedJVMBenchmarkV2TimeoutMillis                         = 50
+	packagedJVMBenchmarkV2MaxArtifactBytes                      = packagedJVMBenchmarkMaxArtifactBytes
+	packagedJVMBenchmarkRetrievalTTL                            = 30 * time.Second
+	packagedJVMBenchmarkStaleAge                                = 31 * time.Second
 )
+
+var packagedJVMBenchmarkV2SeriesSpecs = []packagedJVMBenchmarkV2SeriesSpec{
+	{Scope: "raw_jni", Transport: "getsockopt", Outcome: "miss", ExpectedStatus: int(javabridge.StatusMissing)},
+	{Scope: "raw_jni", Transport: "getsockopt", Outcome: "hit", ExpectedStatus: int(javabridge.StatusValid)},
+	{Scope: "raw_jni", Transport: "getsockopt", Outcome: "stale", ExpectedStatus: int(javabridge.StatusStale)},
+	{Scope: "bridge_provider_jni", Transport: "getsockopt", Outcome: "miss", ExpectedStatus: int(javabridge.StatusMissing)},
+	{Scope: "bridge_provider_jni", Transport: "getsockopt", Outcome: "hit", ExpectedStatus: int(javabridge.StatusValid)},
+	{Scope: "bridge_provider_jni", Transport: "getsockopt", Outcome: "stale", ExpectedStatus: int(javabridge.StatusStale)},
+	{Scope: "raw_jni", Transport: "unix", Outcome: "miss", ExpectedStatus: int(javabridge.StatusMissing)},
+	{Scope: "raw_jni", Transport: "unix", Outcome: "hit", ExpectedStatus: int(javabridge.StatusValid)},
+	{Scope: "raw_jni", Transport: "unix", Outcome: "stale", ExpectedStatus: int(javabridge.StatusStale)},
+	{Scope: "bridge_provider_jni", Transport: "unix", Outcome: "miss", ExpectedStatus: int(javabridge.StatusMissing)},
+	{Scope: "bridge_provider_jni", Transport: "unix", Outcome: "hit", ExpectedStatus: int(javabridge.StatusValid)},
+	{Scope: "bridge_provider_jni", Transport: "unix", Outcome: "stale", ExpectedStatus: int(javabridge.StatusStale)},
+	{Scope: "raw_jni", Transport: "unix", Outcome: "timeout", ExpectedStatus: int(javabridge.StatusTimeout)},
+	{Scope: "bridge_provider_jni", Transport: "unix", Outcome: "timeout", ExpectedStatus: int(javabridge.StatusTimeout)},
+}
+
+var expectedPackagedJVMBenchmarkV2Provenance = packagedJVMBenchmarkArtifactV2Provenance{
+	Harness: packagedJVMBenchmarkV2Harness,
+	Measures: []string{
+		"packaged_agent", "java_workers", "raw_jni", "bridge_provider", "jni",
+		"kernel_getsockopt", "cgroup_bpf", "unix_server", "thread_allocated_bytes",
+	},
+	Excludes: []string{
+		"application_request", "instrumentation", "throughput", "application_throughput", "process_cpu",
+		"rss_growth", "native_memory_growth", "direct_memory_growth", "fd_growth",
+		"thread_growth", "map_growth", "run_to_run_variance", "native_sanitizers",
+	},
+}
 
 var expectedPackagedJVMBenchmarkCgroupAttachTypes = []string{
 	"CGroupGetsockopt",
@@ -327,6 +370,178 @@ type packagedJVMBenchmarkArtifactLatency struct {
 	Passed   bool   `json:"passed"`
 }
 
+// Schema v2 is additive to the retained schema-v1 contract above. It gives concurrency,
+// transport, provider, allocation, and exact call accounting their own identities instead of
+// changing the meaning of the single-thread getsockopt fields.
+type packagedJVMBenchmarkArtifactV2 struct {
+	SchemaVersion int                                      `json:"schema_version"`
+	Benchmark     string                                   `json:"benchmark"`
+	CreatedAt     string                                   `json:"created_at"`
+	Provenance    packagedJVMBenchmarkArtifactV2Provenance `json:"provenance"`
+	Source        packagedJVMBenchmarkArtifactSource       `json:"source"`
+	Inputs        packagedJVMBenchmarkArtifactInputs       `json:"inputs"`
+	Runtime       packagedJVMBenchmarkArtifactRuntime      `json:"runtime"`
+	Setup         packagedJVMBenchmarkArtifactV2Setup      `json:"setup"`
+	Series        []packagedJVMBenchmarkArtifactV2Series   `json:"series"`
+}
+
+type packagedJVMBenchmarkArtifactV2Provenance struct {
+	Harness   string                                       `json:"harness"`
+	Measures  []string                                     `json:"measures"`
+	Excludes  []string                                     `json:"excludes"`
+	CgroupBPF packagedJVMBenchmarkArtifactV2CgroupBPF      `json:"cgroup_bpf"`
+	Unix      packagedJVMBenchmarkArtifactV2UnixProvenance `json:"unix"`
+}
+
+type packagedJVMBenchmarkArtifactV2UnixProvenance struct {
+	Server             string `json:"server"`
+	Handler            string `json:"handler"`
+	Observer           string `json:"observer"`
+	TimeoutFixture     string `json:"timeout_fixture"`
+	SocketPathRetained bool   `json:"socket_path_retained"`
+}
+
+type packagedJVMBenchmarkArtifactV2CgroupBPF struct {
+	TargetCgroup             string                                    `json:"target_cgroup"`
+	CgroupHierarchy          []string                                  `json:"cgroup_hierarchy"`
+	EffectiveQueryFlag       string                                    `json:"effective_query_flag"`
+	EffectiveQueryFlags      uint32                                    `json:"effective_query_flags"`
+	PreAttachChainsEmpty     bool                                      `json:"pre_attach_chains_empty"`
+	StabilityMode            string                                    `json:"stability_mode"`
+	StabilityEvidence        string                                    `json:"stability_evidence"`
+	ExclusiveTopologyPremise string                                    `json:"exclusive_topology_premise"`
+	StabilityChecks          packagedJVMBenchmarkArtifactV2Stability   `json:"stability_checks"`
+	Chains                   []packagedJVMBenchmarkArtifactCgroupChain `json:"chains"`
+}
+
+type packagedJVMBenchmarkArtifactV2Stability struct {
+	ExpectedBatches            int `json:"expected_batches"`
+	ExpectedPrimaryCalls       int `json:"expected_primary_calls"`
+	ObservedPreBatchSnapshots  int `json:"observed_pre_batch_snapshots"`
+	ObservedPostBatchSnapshots int `json:"observed_post_batch_snapshots"`
+	QueryErrors                int `json:"query_errors"`
+	TopologyMismatches         int `json:"topology_mismatches"`
+}
+
+type packagedJVMBenchmarkArtifactV2Setup struct {
+	WarmupBatches          int      `json:"warmup_batches"`
+	MeasurementBatches     int      `json:"measurement_batches"`
+	Concurrency            int      `json:"concurrency"`
+	RetainedCallsPerSeries int      `json:"retained_calls_per_series"`
+	TotalCallsPerSeries    int      `json:"total_calls_per_series"`
+	BatchSynchronization   string   `json:"batch_synchronization"`
+	RawTimedCall           string   `json:"raw_timed_call"`
+	ProviderTimedCall      string   `json:"provider_timed_call"`
+	ResponseStorage        string   `json:"response_storage"`
+	AllocationMeasurement  string   `json:"allocation_measurement"`
+	AllocationControl      string   `json:"allocation_control"`
+	AgentOptions           string   `json:"agent_options"`
+	PrimaryMissControl     string   `json:"primary_miss_control"`
+	UnixMissControl        string   `json:"unix_miss_control"`
+	UnixTimeoutDeadlineNS  int64    `json:"unix_timeout_deadline_ns"`
+	RetrievalTTLNS         int64    `json:"retrieval_ttl_ns"`
+	StaleAgeNS             int64    `json:"stale_age_ns"`
+	UnixServerUID          int      `json:"unix_server_uid"`
+	UnixSocketGID          int      `json:"unix_socket_gid"`
+	UnixMaxConcurrent      int      `json:"unix_max_concurrent"`
+	AgentArtifactBinding   string   `json:"agent_artifact_binding"`
+	JVMArguments           []string `json:"jvm_arguments"`
+	Environment            []string `json:"environment"`
+}
+
+type packagedJVMBenchmarkV2SeriesSpec struct {
+	Scope          string
+	Transport      string
+	Outcome        string
+	ExpectedStatus int
+}
+
+type packagedJVMBenchmarkV2SeriesObservation struct {
+	Spec                   packagedJVMBenchmarkV2SeriesSpec
+	SamplesNS              []int64
+	AllocatedBytes         []int64
+	AllocationControlBytes []int64
+	Statuses               packagedJVMBenchmarkArtifactV2Statuses
+	Calls                  packagedJVMBenchmarkArtifactV2Calls
+}
+
+type packagedJVMBenchmarkArtifactV2Series struct {
+	Scope          string                                   `json:"scope"`
+	Transport      string                                   `json:"transport"`
+	Outcome        string                                   `json:"outcome"`
+	ExpectedStatus int                                      `json:"expected_status"`
+	SamplesNS      []int64                                  `json:"samples_ns"`
+	TotalTimedNS   int64                                    `json:"total_timed_ns"`
+	P50NS          int64                                    `json:"p50_ns"`
+	P95NS          int64                                    `json:"p95_ns"`
+	P99NS          int64                                    `json:"p99_ns"`
+	Statuses       packagedJVMBenchmarkArtifactV2Statuses   `json:"status_counts"`
+	Calls          packagedJVMBenchmarkArtifactV2Calls      `json:"call_counts"`
+	Allocation     packagedJVMBenchmarkArtifactV2Allocation `json:"allocation"`
+	Correct        bool                                     `json:"correct"`
+	LatencyGate    packagedJVMBenchmarkArtifactV2Latency    `json:"latency_gate"`
+}
+
+type packagedJVMBenchmarkArtifactV2Statuses struct {
+	Unknown         int `json:"unknown"`
+	Valid           int `json:"valid"`
+	Missing         int `json:"missing"`
+	Stale           int `json:"stale"`
+	Unsupported     int `json:"unsupported"`
+	Malformed       int `json:"malformed"`
+	VersionMismatch int `json:"version_mismatch"`
+	Ambiguous       int `json:"ambiguous"`
+	Unauthorized    int `json:"unauthorized"`
+	AlreadyConsumed int `json:"already_consumed"`
+	Timeout         int `json:"timeout"`
+	Overload        int `json:"overload"`
+	TransportError  int `json:"transport_error"`
+	Disabled        int `json:"disabled"`
+}
+
+type packagedJVMBenchmarkArtifactV2Calls struct {
+	ExpectedJavaCalls           int    `json:"expected_java_calls"`
+	ObservedJavaCalls           int    `json:"observed_java_calls"`
+	ExpectedNativeCalls         int    `json:"expected_native_calls"`
+	ObservedNativeCalls         int    `json:"observed_native_calls"`
+	ExpectedBridgeCalls         int    `json:"expected_bridge_calls"`
+	ObservedBridgeCalls         int    `json:"observed_bridge_calls"`
+	ExpectedPrimaryBPFCalls     int    `json:"expected_primary_bpf_calls"`
+	ObservedPrimaryBPFCalls     int    `json:"observed_primary_bpf_calls"`
+	PrimaryBPFStatus            string `json:"primary_bpf_status"`
+	PrimaryBPFStatusBefore      uint64 `json:"primary_bpf_status_before"`
+	PrimaryBPFStatusAfter       uint64 `json:"primary_bpf_status_after"`
+	ExpectedUnixServerRequests  int    `json:"expected_unix_server_requests"`
+	ObservedUnixServerRequests  int    `json:"observed_unix_server_requests"`
+	UnixServerStatus            string `json:"unix_server_status"`
+	UnixServerStatusBefore      uint64 `json:"unix_server_status_before"`
+	UnixServerStatusAfter       uint64 `json:"unix_server_status_after"`
+	ExpectedTimeoutFullRequests int    `json:"expected_timeout_full_requests"`
+	ObservedTimeoutFullRequests int    `json:"observed_timeout_full_requests"`
+}
+
+type packagedJVMBenchmarkArtifactV2Allocation struct {
+	Method              string  `json:"method"`
+	Control             string  `json:"control"`
+	SamplesBytes        []int64 `json:"samples_bytes"`
+	ControlSamplesBytes []int64 `json:"control_samples_bytes"`
+	TotalBytes          int64   `json:"total_bytes"`
+	P50Bytes            int64   `json:"p50_bytes"`
+	P95Bytes            int64   `json:"p95_bytes"`
+	P99Bytes            int64   `json:"p99_bytes"`
+	ControlTotalBytes   int64   `json:"control_total_bytes"`
+	ControlP50Bytes     int64   `json:"control_p50_bytes"`
+	ControlP95Bytes     int64   `json:"control_p95_bytes"`
+	ControlP99Bytes     int64   `json:"control_p99_bytes"`
+}
+
+type packagedJVMBenchmarkArtifactV2Latency struct {
+	Kind     string `json:"kind"`
+	P50MinNS int64  `json:"p50_min_ns"`
+	P99MaxNS int64  `json:"p99_max_ns"`
+	Passed   bool   `json:"passed"`
+}
+
 func newPackagedJVMBenchmarkArtifact(
 	createdAt time.Time,
 	source packagedJVMBenchmarkArtifactSource,
@@ -405,6 +620,214 @@ func summarizePackagedJVMBenchmarkSeries(
 func packagedJVMBenchmarkPercentile(sortedSamples []int64, percentage int) int64 {
 	rank := (len(sortedSamples)*percentage + 99) / 100
 	return sortedSamples[rank-1]
+}
+
+func newPackagedJVMBenchmarkArtifactV2(
+	createdAt time.Time,
+	source packagedJVMBenchmarkArtifactSource,
+	inputs packagedJVMBenchmarkArtifactInputs,
+	cgroupBPF packagedJVMBenchmarkArtifactCgroupBPF,
+	runtimeIdentity packagedJVMBenchmarkArtifactRuntime,
+	observations []packagedJVMBenchmarkV2SeriesObservation,
+) packagedJVMBenchmarkArtifactV2 {
+	series := make([]packagedJVMBenchmarkArtifactV2Series, len(observations))
+	for index := range observations {
+		series[index] = summarizePackagedJVMBenchmarkSeriesV2(observations[index])
+	}
+	totalBatches := len(packagedJVMBenchmarkV2SeriesSpecs) *
+		(packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations)
+	totalCalls := packagedJVMBenchmarkV2Concurrency *
+		(packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations)
+	primarySeries := 0
+	for _, spec := range packagedJVMBenchmarkV2SeriesSpecs {
+		if spec.Transport == "getsockopt" {
+			primarySeries++
+		}
+	}
+	return packagedJVMBenchmarkArtifactV2{
+		SchemaVersion: packagedJVMBenchmarkArtifactV2SchemaVersion,
+		Benchmark:     packagedJVMBenchmarkArtifactV2Name,
+		CreatedAt:     createdAt.UTC().Format(time.RFC3339Nano),
+		Provenance: packagedJVMBenchmarkArtifactV2Provenance{
+			Harness:  expectedPackagedJVMBenchmarkV2Provenance.Harness,
+			Measures: slices.Clone(expectedPackagedJVMBenchmarkV2Provenance.Measures),
+			Excludes: slices.Clone(expectedPackagedJVMBenchmarkV2Provenance.Excludes),
+			CgroupBPF: packagedJVMBenchmarkArtifactV2CgroupBPF{
+				TargetCgroup:             cgroupBPF.TargetCgroup,
+				CgroupHierarchy:          slices.Clone(cgroupBPF.CgroupHierarchy),
+				EffectiveQueryFlag:       cgroupBPF.EffectiveQueryFlag,
+				EffectiveQueryFlags:      cgroupBPF.EffectiveQueryFlags,
+				PreAttachChainsEmpty:     cgroupBPF.PreAttachChainsEmpty,
+				StabilityMode:            cgroupBPF.StabilityMode,
+				StabilityEvidence:        cgroupBPF.StabilityEvidence,
+				ExclusiveTopologyPremise: cgroupBPF.ExclusiveTopologyPremise,
+				StabilityChecks: packagedJVMBenchmarkArtifactV2Stability{
+					ExpectedBatches:            totalBatches,
+					ExpectedPrimaryCalls:       primarySeries * totalCalls,
+					ObservedPreBatchSnapshots:  cgroupBPF.StabilityChecks.ObservedPreCallSnapshots,
+					ObservedPostBatchSnapshots: cgroupBPF.StabilityChecks.ObservedPostCallSnapshots,
+					QueryErrors:                cgroupBPF.StabilityChecks.QueryErrors,
+					TopologyMismatches:         cgroupBPF.StabilityChecks.TopologyMismatches,
+				},
+				Chains: slices.Clone(cgroupBPF.Chains),
+			},
+			Unix: packagedJVMBenchmarkArtifactV2UnixProvenance{
+				Server:             "javabridge.NewServer production authenticated Unix server",
+				Handler:            "javabridge.NewMapHandler over the benchmark BPF maps",
+				Observer:           "ServerOptions.Observe exact operation/status counter",
+				TimeoutFixture:     "production Unix server handler waits for the request deadline and returns TIMEOUT after a complete authenticated request",
+				SocketPathRetained: false,
+			},
+		},
+		Source:  source,
+		Inputs:  inputs,
+		Runtime: runtimeIdentity,
+		Setup: packagedJVMBenchmarkArtifactV2Setup{
+			WarmupBatches:          packagedJVMBenchmarkWarmupIterations,
+			MeasurementBatches:     packagedJVMBenchmarkMeasurementIterations,
+			Concurrency:            packagedJVMBenchmarkV2Concurrency,
+			RetainedCallsPerSeries: packagedJVMBenchmarkV2Concurrency * packagedJVMBenchmarkMeasurementIterations,
+			TotalCallsPerSeries:    totalCalls,
+			BatchSynchronization:   "eight fixed worker threads stage authority, rendezvous, then share one release latch",
+			RawTimedCall:           "System.nanoTime and ThreadMXBean around BootstrapNative.takeRemoteParent(fd-or-minus-one,reused_byte_array)",
+			ProviderTimedCall:      "System.nanoTime and ThreadMXBean around RemoteParentBridge.takeRemoteParent()",
+			ResponseStorage:        "one reused 64-byte JNI response array per worker; provider uses its packaged pool",
+			AllocationMeasurement:  "com.sun.management.ThreadMXBean.getThreadAllocatedBytes keyed by the calling worker Java Thread.getId before and after the timed call",
+			AllocationControl:      "paired same-worker consecutive ThreadMXBean counter reads immediately before each call; retained separately without net-allocation claim",
+			AgentOptions:           packagedJVMBenchmarkAgentOptions,
+			PrimaryMissControl:     packagedJVMBenchmarkMissControl,
+			UnixMissControl:        "no staged owner generation for the exact authenticated worker TID; production MapHandler returns missing",
+			UnixTimeoutDeadlineNS:  int64(packagedJVMBenchmarkV2TimeoutMillis * time.Millisecond),
+			RetrievalTTLNS:         packagedJVMBenchmarkRetrievalTTL.Nanoseconds(),
+			StaleAgeNS:             packagedJVMBenchmarkStaleAge.Nanoseconds(),
+			UnixServerUID:          0,
+			UnixSocketGID:          packagedJVMBenchmarkJavaID,
+			UnixMaxConcurrent:      packagedJVMBenchmarkV2Concurrency * 4,
+			AgentArtifactBinding:   packagedJVMBenchmarkAgentBinding,
+			JVMArguments: []string{
+				"-javaagent:<agent-artifact-fd>=remoteParentTransport=disabled", "-cp",
+				"<agent-artifact-fd>", packagedJVMBenchmarkProbeClass,
+				"<host> <process-capability> <warmup-batches> <measurement-batches> <workers>",
+			},
+			Environment: slices.Clone(expectedPackagedJVMBenchmarkEnvironment),
+		},
+		Series: series,
+	}
+}
+
+func summarizePackagedJVMBenchmarkSeriesV2(
+	observation packagedJVMBenchmarkV2SeriesObservation,
+) packagedJVMBenchmarkArtifactV2Series {
+	samples := slices.Clone(observation.SamplesNS)
+	allocated := slices.Clone(observation.AllocatedBytes)
+	controls := slices.Clone(observation.AllocationControlBytes)
+	series := packagedJVMBenchmarkArtifactV2Series{
+		Scope:          observation.Spec.Scope,
+		Transport:      observation.Spec.Transport,
+		Outcome:        observation.Spec.Outcome,
+		ExpectedStatus: observation.Spec.ExpectedStatus,
+		SamplesNS:      samples,
+		Statuses:       observation.Statuses,
+		Calls:          observation.Calls,
+		Correct:        true,
+		Allocation: packagedJVMBenchmarkArtifactV2Allocation{
+			Method:              "com.sun.management.ThreadMXBean.getThreadAllocatedBytes",
+			Control:             "paired consecutive counter reads on the same worker",
+			SamplesBytes:        allocated,
+			ControlSamplesBytes: controls,
+		},
+	}
+	series.TotalTimedNS, series.P50NS, series.P95NS, series.P99NS =
+		packagedJVMBenchmarkV2Summary(samples)
+	series.Allocation.TotalBytes, series.Allocation.P50Bytes,
+		series.Allocation.P95Bytes, series.Allocation.P99Bytes =
+		packagedJVMBenchmarkV2Summary(allocated)
+	series.Allocation.ControlTotalBytes, series.Allocation.ControlP50Bytes,
+		series.Allocation.ControlP95Bytes, series.Allocation.ControlP99Bytes =
+		packagedJVMBenchmarkV2Summary(controls)
+	series.LatencyGate = packagedJVMBenchmarkV2Gate(observation.Spec, series.P50NS, series.P99NS)
+	return series
+}
+
+func packagedJVMBenchmarkV2Summary(samples []int64) (int64, int64, int64, int64) {
+	if len(samples) == 0 {
+		return 0, 0, 0, 0
+	}
+	sorted := slices.Clone(samples)
+	var total int64
+	for _, sample := range sorted {
+		total += sample
+	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	return total,
+		packagedJVMBenchmarkPercentile(sorted, 50),
+		packagedJVMBenchmarkPercentile(sorted, 95),
+		packagedJVMBenchmarkPercentile(sorted, 99)
+}
+
+func packagedJVMBenchmarkV2Gate(
+	spec packagedJVMBenchmarkV2SeriesSpec,
+	p50 int64,
+	p99 int64,
+) packagedJVMBenchmarkArtifactV2Latency {
+	gate := packagedJVMBenchmarkArtifactV2Latency{Kind: "p99_lt"}
+	switch {
+	case spec.Transport == "getsockopt":
+		gate.P99MaxNS = packagedJVMBenchmarkV2PrimaryP99LimitNS
+	case spec.Outcome == "timeout":
+		gate.Kind = "p50_gte_p99_lte"
+		gate.P50MinNS = packagedJVMBenchmarkV2TimeoutP50MinimumNS
+		gate.P99MaxNS = packagedJVMBenchmarkV2TimeoutP99LimitNS
+	default:
+		gate.P99MaxNS = packagedJVMBenchmarkV2UnixP99LimitNS
+	}
+	gate.Passed = p99 < gate.P99MaxNS
+	if gate.Kind == "p50_gte_p99_lte" {
+		gate.Passed = p50 >= gate.P50MinNS && p99 <= gate.P99MaxNS
+	}
+	return gate
+}
+
+func (counts *packagedJVMBenchmarkArtifactV2Statuses) add(status int) error {
+	switch javabridge.Status(status) {
+	case javabridge.StatusUnknown:
+		counts.Unknown++
+	case javabridge.StatusValid:
+		counts.Valid++
+	case javabridge.StatusMissing:
+		counts.Missing++
+	case javabridge.StatusStale:
+		counts.Stale++
+	case javabridge.StatusUnsupported:
+		counts.Unsupported++
+	case javabridge.StatusMalformed:
+		counts.Malformed++
+	case javabridge.StatusVersionMismatch:
+		counts.VersionMismatch++
+	case javabridge.StatusAmbiguous:
+		counts.Ambiguous++
+	case javabridge.StatusUnauthorized:
+		counts.Unauthorized++
+	case javabridge.StatusAlreadyConsumed:
+		counts.AlreadyConsumed++
+	case javabridge.StatusTimeout:
+		counts.Timeout++
+	case javabridge.StatusOverload:
+		counts.Overload++
+	case javabridge.StatusTransportError:
+		counts.TransportError++
+	case javabridge.StatusDisabled:
+		counts.Disabled++
+	default:
+		return fmt.Errorf("unknown packaged JVM benchmark status %d", status)
+	}
+	return nil
+}
+
+func (counts packagedJVMBenchmarkArtifactV2Statuses) total() int {
+	return counts.Unknown + counts.Valid + counts.Missing + counts.Stale + counts.Unsupported +
+		counts.Malformed + counts.VersionMismatch + counts.Ambiguous + counts.Unauthorized +
+		counts.AlreadyConsumed + counts.Timeout + counts.Overload + counts.TransportError + counts.Disabled
 }
 
 func packagedJVMBenchmarkEnvironment(environment []string) ([]string, error) {
@@ -878,9 +1301,15 @@ func validatePackagedJVMBenchmarkCgroupBPFSnapshotUnchanged(
 }
 
 func newPackagedJVMBenchmarkCgroupBPFStabilityTracker() *packagedJVMBenchmarkCgroupBPFStabilityTracker {
+	return newPackagedJVMBenchmarkCgroupBPFStabilityTrackerForCalls(packagedJVMBenchmarkExpectedCalls)
+}
+
+func newPackagedJVMBenchmarkCgroupBPFStabilityTrackerForCalls(
+	expectedCalls int,
+) *packagedJVMBenchmarkCgroupBPFStabilityTracker {
 	return &packagedJVMBenchmarkCgroupBPFStabilityTracker{
 		checks: packagedJVMBenchmarkArtifactStabilityChecks{
-			ExpectedCalls: packagedJVMBenchmarkExpectedCalls,
+			ExpectedCalls: expectedCalls,
 		},
 	}
 }
@@ -1370,6 +1799,18 @@ func validatePackagedJVMBenchmarkArtifactCICrosslinks(
 	return nil
 }
 
+func validatePackagedJVMBenchmarkArtifactV2CICrosslinks(
+	artifact packagedJVMBenchmarkArtifactV2,
+	crosslinks packagedJVMBenchmarkArtifactCICrosslinks,
+) error {
+	legacy := packagedJVMBenchmarkArtifact{
+		Source:  artifact.Source,
+		Inputs:  artifact.Inputs,
+		Runtime: artifact.Runtime,
+	}
+	return validatePackagedJVMBenchmarkArtifactCICrosslinks(legacy, crosslinks)
+}
+
 func packagedJVMBenchmarkBlobIdentityAtPath(
 	path string,
 ) (packagedJVMBenchmarkArtifactBlobIdentity, error) {
@@ -1482,6 +1923,389 @@ func validatePackagedJVMBenchmarkSeries(
 	return nil
 }
 
+func validatePackagedJVMBenchmarkArtifactV2(artifact packagedJVMBenchmarkArtifactV2) error {
+	if artifact.SchemaVersion != packagedJVMBenchmarkArtifactV2SchemaVersion ||
+		artifact.Benchmark != packagedJVMBenchmarkArtifactV2Name {
+		return fmt.Errorf("unexpected packaged JVM benchmark v2 identity: %d/%q", artifact.SchemaVersion, artifact.Benchmark)
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, artifact.CreatedAt)
+	if err != nil || createdAt.Location() != time.UTC {
+		return fmt.Errorf("invalid packaged JVM benchmark v2 creation time: %q", artifact.CreatedAt)
+	}
+	if artifact.Provenance.Harness != expectedPackagedJVMBenchmarkV2Provenance.Harness ||
+		!slices.Equal(artifact.Provenance.Measures, expectedPackagedJVMBenchmarkV2Provenance.Measures) ||
+		!slices.Equal(artifact.Provenance.Excludes, expectedPackagedJVMBenchmarkV2Provenance.Excludes) {
+		return errors.New("unexpected packaged JVM benchmark v2 provenance")
+	}
+	expectedUnix := packagedJVMBenchmarkArtifactV2UnixProvenance{
+		Server:             "javabridge.NewServer production authenticated Unix server",
+		Handler:            "javabridge.NewMapHandler over the benchmark BPF maps",
+		Observer:           "ServerOptions.Observe exact operation/status counter",
+		TimeoutFixture:     "production Unix server handler waits for the request deadline and returns TIMEOUT after a complete authenticated request",
+		SocketPathRetained: false,
+	}
+	if artifact.Provenance.Unix != expectedUnix {
+		return errors.New("unexpected packaged JVM benchmark v2 Unix provenance")
+	}
+	if err := validatePackagedJVMBenchmarkSource(artifact.Source); err != nil {
+		return err
+	}
+	if err := validatePackagedJVMBenchmarkInputs(artifact.Inputs); err != nil {
+		return err
+	}
+	if err := validatePackagedJVMBenchmarkRuntime(artifact.Runtime); err != nil {
+		return err
+	}
+	if err := validatePackagedJVMBenchmarkCgroupBPFV2(
+		artifact.Provenance.CgroupBPF, artifact.Runtime.CgroupPath,
+	); err != nil {
+		return err
+	}
+	totalCalls := packagedJVMBenchmarkV2Concurrency *
+		(packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations)
+	expectedSetup := packagedJVMBenchmarkArtifactV2Setup{
+		WarmupBatches:          packagedJVMBenchmarkWarmupIterations,
+		MeasurementBatches:     packagedJVMBenchmarkMeasurementIterations,
+		Concurrency:            packagedJVMBenchmarkV2Concurrency,
+		RetainedCallsPerSeries: packagedJVMBenchmarkV2Concurrency * packagedJVMBenchmarkMeasurementIterations,
+		TotalCallsPerSeries:    totalCalls,
+		BatchSynchronization:   "eight fixed worker threads stage authority, rendezvous, then share one release latch",
+		RawTimedCall:           "System.nanoTime and ThreadMXBean around BootstrapNative.takeRemoteParent(fd-or-minus-one,reused_byte_array)",
+		ProviderTimedCall:      "System.nanoTime and ThreadMXBean around RemoteParentBridge.takeRemoteParent()",
+		ResponseStorage:        "one reused 64-byte JNI response array per worker; provider uses its packaged pool",
+		AllocationMeasurement:  "com.sun.management.ThreadMXBean.getThreadAllocatedBytes keyed by the calling worker Java Thread.getId before and after the timed call",
+		AllocationControl:      "paired same-worker consecutive ThreadMXBean counter reads immediately before each call; retained separately without net-allocation claim",
+		AgentOptions:           packagedJVMBenchmarkAgentOptions,
+		PrimaryMissControl:     packagedJVMBenchmarkMissControl,
+		UnixMissControl:        "no staged owner generation for the exact authenticated worker TID; production MapHandler returns missing",
+		UnixTimeoutDeadlineNS:  int64(packagedJVMBenchmarkV2TimeoutMillis * time.Millisecond),
+		RetrievalTTLNS:         packagedJVMBenchmarkRetrievalTTL.Nanoseconds(),
+		StaleAgeNS:             packagedJVMBenchmarkStaleAge.Nanoseconds(),
+		UnixServerUID:          0,
+		UnixSocketGID:          packagedJVMBenchmarkJavaID,
+		UnixMaxConcurrent:      packagedJVMBenchmarkV2Concurrency * 4,
+		AgentArtifactBinding:   packagedJVMBenchmarkAgentBinding,
+		JVMArguments: []string{
+			"-javaagent:<agent-artifact-fd>=remoteParentTransport=disabled", "-cp",
+			"<agent-artifact-fd>", packagedJVMBenchmarkProbeClass,
+			"<host> <process-capability> <warmup-batches> <measurement-batches> <workers>",
+		},
+		Environment: slices.Clone(expectedPackagedJVMBenchmarkEnvironment),
+	}
+	if !packagedJVMBenchmarkV2SetupEqual(artifact.Setup, expectedSetup) {
+		return errors.New("unexpected packaged JVM benchmark v2 setup")
+	}
+	if len(artifact.Series) != len(packagedJVMBenchmarkV2SeriesSpecs) {
+		return fmt.Errorf("unexpected packaged JVM benchmark v2 series count: %d", len(artifact.Series))
+	}
+	for index, spec := range packagedJVMBenchmarkV2SeriesSpecs {
+		if err := validatePackagedJVMBenchmarkSeriesV2(artifact.Series[index], spec); err != nil {
+			return fmt.Errorf("packaged JVM benchmark v2 series %d: %w", index, err)
+		}
+	}
+	return nil
+}
+
+func packagedJVMBenchmarkV2SetupEqual(
+	actual packagedJVMBenchmarkArtifactV2Setup,
+	expected packagedJVMBenchmarkArtifactV2Setup,
+) bool {
+	return actual.WarmupBatches == expected.WarmupBatches &&
+		actual.MeasurementBatches == expected.MeasurementBatches &&
+		actual.Concurrency == expected.Concurrency &&
+		actual.RetainedCallsPerSeries == expected.RetainedCallsPerSeries &&
+		actual.TotalCallsPerSeries == expected.TotalCallsPerSeries &&
+		actual.BatchSynchronization == expected.BatchSynchronization &&
+		actual.RawTimedCall == expected.RawTimedCall &&
+		actual.ProviderTimedCall == expected.ProviderTimedCall &&
+		actual.ResponseStorage == expected.ResponseStorage &&
+		actual.AllocationMeasurement == expected.AllocationMeasurement &&
+		actual.AllocationControl == expected.AllocationControl &&
+		actual.AgentOptions == expected.AgentOptions &&
+		actual.PrimaryMissControl == expected.PrimaryMissControl &&
+		actual.UnixMissControl == expected.UnixMissControl &&
+		actual.UnixTimeoutDeadlineNS == expected.UnixTimeoutDeadlineNS &&
+		actual.RetrievalTTLNS == expected.RetrievalTTLNS &&
+		actual.StaleAgeNS == expected.StaleAgeNS &&
+		actual.UnixServerUID == expected.UnixServerUID &&
+		actual.UnixSocketGID == expected.UnixSocketGID &&
+		actual.UnixMaxConcurrent == expected.UnixMaxConcurrent &&
+		actual.AgentArtifactBinding == expected.AgentArtifactBinding &&
+		slices.Equal(actual.JVMArguments, expected.JVMArguments) &&
+		slices.Equal(actual.Environment, expected.Environment)
+}
+
+func validatePackagedJVMBenchmarkCgroupBPFV2(
+	cgroup packagedJVMBenchmarkArtifactV2CgroupBPF,
+	target string,
+) error {
+	totalBatches := len(packagedJVMBenchmarkV2SeriesSpecs) *
+		(packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations)
+	totalCalls := packagedJVMBenchmarkV2Concurrency *
+		(packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations)
+	primarySeries := 0
+	for _, spec := range packagedJVMBenchmarkV2SeriesSpecs {
+		if spec.Transport == "getsockopt" {
+			primarySeries++
+		}
+	}
+	checks := cgroup.StabilityChecks
+	if checks.ExpectedBatches != totalBatches ||
+		checks.ExpectedPrimaryCalls != primarySeries*totalCalls ||
+		checks.ObservedPreBatchSnapshots != totalBatches ||
+		checks.ObservedPostBatchSnapshots != totalBatches ||
+		checks.QueryErrors != 0 || checks.TopologyMismatches != 0 {
+		return errors.New("packaged JVM benchmark v2 BPF stability checks are incomplete or failed")
+	}
+	legacy := packagedJVMBenchmarkArtifactCgroupBPF{
+		TargetCgroup:             cgroup.TargetCgroup,
+		CgroupHierarchy:          cgroup.CgroupHierarchy,
+		EffectiveQueryFlag:       cgroup.EffectiveQueryFlag,
+		EffectiveQueryFlags:      cgroup.EffectiveQueryFlags,
+		PreAttachChainsEmpty:     cgroup.PreAttachChainsEmpty,
+		StabilityMode:            cgroup.StabilityMode,
+		StabilityEvidence:        cgroup.StabilityEvidence,
+		ExclusiveTopologyPremise: cgroup.ExclusiveTopologyPremise,
+		StabilityChecks: packagedJVMBenchmarkArtifactStabilityChecks{
+			ExpectedCalls:             totalBatches,
+			ObservedPreCallSnapshots:  checks.ObservedPreBatchSnapshots,
+			ObservedPostCallSnapshots: checks.ObservedPostBatchSnapshots,
+			QueryErrors:               checks.QueryErrors,
+			TopologyMismatches:        checks.TopologyMismatches,
+		},
+		Chains: cgroup.Chains,
+	}
+	return validatePackagedJVMBenchmarkCgroupBPFAttributionTopology(legacy, target)
+}
+
+func validatePackagedJVMBenchmarkSeriesV2(
+	series packagedJVMBenchmarkArtifactV2Series,
+	spec packagedJVMBenchmarkV2SeriesSpec,
+) error {
+	if series.Scope != spec.Scope || series.Transport != spec.Transport ||
+		series.Outcome != spec.Outcome || series.ExpectedStatus != spec.ExpectedStatus {
+		return fmt.Errorf("unexpected identity: got %s/%s/%s/%d", series.Scope, series.Transport, series.Outcome, series.ExpectedStatus)
+	}
+	retainedCalls := packagedJVMBenchmarkV2Concurrency * packagedJVMBenchmarkMeasurementIterations
+	if len(series.SamplesNS) != retainedCalls ||
+		len(series.Allocation.SamplesBytes) != retainedCalls ||
+		len(series.Allocation.ControlSamplesBytes) != retainedCalls {
+		return errors.New("unexpected packaged JVM benchmark v2 retained sample count")
+	}
+	if err := validatePackagedJVMBenchmarkV2Summary(
+		series.SamplesNS, true, series.TotalTimedNS, series.P50NS, series.P95NS, series.P99NS,
+	); err != nil {
+		return fmt.Errorf("latency: %w", err)
+	}
+	if series.Allocation.Method != "com.sun.management.ThreadMXBean.getThreadAllocatedBytes" ||
+		series.Allocation.Control != "paired consecutive counter reads on the same worker" {
+		return errors.New("unexpected packaged JVM benchmark v2 allocation method")
+	}
+	if err := validatePackagedJVMBenchmarkV2Summary(
+		series.Allocation.SamplesBytes, false, series.Allocation.TotalBytes,
+		series.Allocation.P50Bytes, series.Allocation.P95Bytes, series.Allocation.P99Bytes,
+	); err != nil {
+		return fmt.Errorf("allocation: %w", err)
+	}
+	if err := validatePackagedJVMBenchmarkV2Summary(
+		series.Allocation.ControlSamplesBytes, false, series.Allocation.ControlTotalBytes,
+		series.Allocation.ControlP50Bytes, series.Allocation.ControlP95Bytes,
+		series.Allocation.ControlP99Bytes,
+	); err != nil {
+		return fmt.Errorf("allocation control: %w", err)
+	}
+	totalCalls := packagedJVMBenchmarkV2Concurrency *
+		(packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations)
+	if series.Statuses.total() != totalCalls ||
+		packagedJVMBenchmarkV2StatusCount(series.Statuses, spec.ExpectedStatus) != totalCalls {
+		return errors.New("unexpected packaged JVM benchmark v2 status distribution")
+	}
+	expectedBridge := 0
+	if spec.Scope == "bridge_provider_jni" {
+		expectedBridge = totalCalls
+	}
+	expectedPrimary := 0
+	if spec.Transport == "getsockopt" {
+		expectedPrimary = totalCalls
+	}
+	expectedServer := 0
+	if spec.Transport == "unix" && spec.Outcome != "timeout" {
+		expectedServer = totalCalls
+	}
+	expectedTimeout := 0
+	if spec.Outcome == "timeout" {
+		expectedTimeout = totalCalls
+	}
+	expectedCalls := packagedJVMBenchmarkArtifactV2Calls{
+		ExpectedJavaCalls:           totalCalls,
+		ObservedJavaCalls:           totalCalls,
+		ExpectedNativeCalls:         totalCalls,
+		ObservedNativeCalls:         totalCalls,
+		ExpectedBridgeCalls:         expectedBridge,
+		ObservedBridgeCalls:         expectedBridge,
+		ExpectedPrimaryBPFCalls:     expectedPrimary,
+		ObservedPrimaryBPFCalls:     expectedPrimary,
+		PrimaryBPFStatus:            "not_applicable",
+		ExpectedUnixServerRequests:  expectedServer,
+		ObservedUnixServerRequests:  expectedServer,
+		UnixServerStatus:            "not_applicable",
+		ExpectedTimeoutFullRequests: expectedTimeout,
+		ObservedTimeoutFullRequests: expectedTimeout,
+	}
+	if expectedPrimary != 0 {
+		expectedCalls.PrimaryBPFStatus = javabridge.Status(spec.ExpectedStatus).String()
+		expectedCalls.PrimaryBPFStatusBefore = series.Calls.PrimaryBPFStatusBefore
+		expectedCalls.PrimaryBPFStatusAfter = series.Calls.PrimaryBPFStatusAfter
+		if series.Calls.PrimaryBPFStatusAfter < series.Calls.PrimaryBPFStatusBefore ||
+			series.Calls.PrimaryBPFStatusAfter-series.Calls.PrimaryBPFStatusBefore != uint64(expectedPrimary) {
+			return errors.New("packaged JVM benchmark v2 primary BPF status delta is inconsistent")
+		}
+	}
+	if expectedServer != 0 || expectedTimeout != 0 {
+		expectedCalls.UnixServerStatus = javabridge.Status(spec.ExpectedStatus).String()
+		expectedCalls.UnixServerStatusBefore = series.Calls.UnixServerStatusBefore
+		expectedCalls.UnixServerStatusAfter = series.Calls.UnixServerStatusAfter
+		expectedDelta := expectedServer + expectedTimeout
+		if series.Calls.UnixServerStatusAfter < series.Calls.UnixServerStatusBefore ||
+			series.Calls.UnixServerStatusAfter-series.Calls.UnixServerStatusBefore != uint64(expectedDelta) {
+			return errors.New("packaged JVM benchmark v2 Unix server status delta is inconsistent")
+		}
+	}
+	if series.Calls != expectedCalls {
+		return errors.New("packaged JVM benchmark v2 call deltas are incomplete or inconsistent")
+	}
+	if !series.Correct {
+		return errors.New("packaged JVM benchmark v2 series is not correct")
+	}
+	expectedGate := packagedJVMBenchmarkV2Gate(spec, series.P50NS, series.P99NS)
+	if series.LatencyGate != expectedGate {
+		return errors.New("inconsistent packaged JVM benchmark v2 latency gate")
+	}
+	return nil
+}
+
+func validatePackagedJVMBenchmarkV2Summary(
+	samples []int64,
+	positive bool,
+	total int64,
+	p50 int64,
+	p95 int64,
+	p99 int64,
+) error {
+	var recomputed int64
+	for _, sample := range samples {
+		if sample < 0 || (positive && sample == 0) {
+			return fmt.Errorf("invalid retained sample: %d", sample)
+		}
+		if sample > math.MaxInt64-recomputed {
+			return errors.New("retained sample total overflows int64")
+		}
+		recomputed += sample
+	}
+	sorted := slices.Clone(samples)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	if total != recomputed || p50 != packagedJVMBenchmarkPercentile(sorted, 50) ||
+		p95 != packagedJVMBenchmarkPercentile(sorted, 95) ||
+		p99 != packagedJVMBenchmarkPercentile(sorted, 99) {
+		return errors.New("summary does not match retained samples")
+	}
+	return nil
+}
+
+func packagedJVMBenchmarkV2StatusCount(
+	counts packagedJVMBenchmarkArtifactV2Statuses,
+	status int,
+) int {
+	switch javabridge.Status(status) {
+	case javabridge.StatusUnknown:
+		return counts.Unknown
+	case javabridge.StatusValid:
+		return counts.Valid
+	case javabridge.StatusMissing:
+		return counts.Missing
+	case javabridge.StatusStale:
+		return counts.Stale
+	case javabridge.StatusUnsupported:
+		return counts.Unsupported
+	case javabridge.StatusMalformed:
+		return counts.Malformed
+	case javabridge.StatusVersionMismatch:
+		return counts.VersionMismatch
+	case javabridge.StatusAmbiguous:
+		return counts.Ambiguous
+	case javabridge.StatusUnauthorized:
+		return counts.Unauthorized
+	case javabridge.StatusAlreadyConsumed:
+		return counts.AlreadyConsumed
+	case javabridge.StatusTimeout:
+		return counts.Timeout
+	case javabridge.StatusOverload:
+		return counts.Overload
+	case javabridge.StatusTransportError:
+		return counts.TransportError
+	case javabridge.StatusDisabled:
+		return counts.Disabled
+	default:
+		return -1
+	}
+}
+
+func writePackagedJVMBenchmarkArtifactV2(
+	artifactPath string,
+	artifact packagedJVMBenchmarkArtifactV2,
+) error {
+	if err := validatePackagedJVMBenchmarkArtifactV2(artifact); err != nil {
+		return err
+	}
+	payload, err := json.Marshal(artifact)
+	if err != nil {
+		return fmt.Errorf("marshal packaged JVM benchmark v2 artifact: %w", err)
+	}
+	payload = append(payload, '\n')
+	if len(payload) > packagedJVMBenchmarkV2MaxArtifactBytes {
+		return errors.New("packaged JVM benchmark v2 artifact is too large")
+	}
+
+	directoryFD, artifactName, err := openBenchmarkArtifactDirectory(artifactPath)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(directoryFD)
+	temporary, temporaryName, err := createBenchmarkArtifactTemporary(directoryFD)
+	if err != nil {
+		return err
+	}
+	temporaryClosed := false
+	published := false
+	defer func() {
+		if !temporaryClosed {
+			_ = temporary.Close()
+		}
+		if !published {
+			_ = unix.Unlinkat(directoryFD, temporaryName, 0)
+		}
+	}()
+	if _, err := temporary.Write(payload); err != nil {
+		return fmt.Errorf("write packaged JVM benchmark v2 artifact: %w", err)
+	}
+	if err := temporary.Chmod(0o600); err != nil {
+		return fmt.Errorf("set packaged JVM benchmark v2 artifact permissions: %w", err)
+	}
+	if err := temporary.Sync(); err != nil {
+		return fmt.Errorf("sync packaged JVM benchmark v2 artifact: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("close packaged JVM benchmark v2 artifact: %w", err)
+	}
+	temporaryClosed = true
+	if err := unix.Linkat(directoryFD, temporaryName, directoryFD, artifactName, 0); err != nil {
+		return fmt.Errorf("publish packaged JVM benchmark v2 artifact: %w", err)
+	}
+	published = true
+	_ = unix.Unlinkat(directoryFD, temporaryName, 0)
+	return unix.Fsync(directoryFD)
+}
+
 func writePackagedJVMBenchmarkArtifact(
 	artifactPath string,
 	artifact packagedJVMBenchmarkArtifact,
@@ -1569,6 +2393,96 @@ func decodePackagedJVMBenchmarkArtifact(input io.Reader) (packagedJVMBenchmarkAr
 		return artifact, err
 	}
 	return artifact, nil
+}
+
+func decodePackagedJVMBenchmarkArtifactV2(
+	input io.Reader,
+) (packagedJVMBenchmarkArtifactV2, error) {
+	payload, err := io.ReadAll(io.LimitReader(input, packagedJVMBenchmarkV2MaxArtifactBytes+1))
+	if err != nil {
+		return packagedJVMBenchmarkArtifactV2{}, fmt.Errorf("read packaged JVM benchmark v2 artifact: %w", err)
+	}
+	if len(payload) > packagedJVMBenchmarkV2MaxArtifactBytes {
+		return packagedJVMBenchmarkArtifactV2{}, errors.New("packaged JVM benchmark v2 artifact is too large")
+	}
+	if err := validatePackagedJVMBenchmarkV2UniqueJSON(payload); err != nil {
+		return packagedJVMBenchmarkArtifactV2{}, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	var artifact packagedJVMBenchmarkArtifactV2
+	if err := decoder.Decode(&artifact); err != nil {
+		return artifact, fmt.Errorf("decode packaged JVM benchmark v2 artifact: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return artifact, errors.New("packaged JVM benchmark v2 artifact has trailing JSON")
+	}
+	if err := validatePackagedJVMBenchmarkArtifactV2(artifact); err != nil {
+		return artifact, err
+	}
+	return artifact, nil
+}
+
+func validatePackagedJVMBenchmarkV2UniqueJSON(payload []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	if err := consumePackagedJVMBenchmarkJSONValue(
+		decoder, packagedJVMBenchmarkV2JSONSchema(), "$",
+	); err != nil {
+		return fmt.Errorf("validate packaged JVM benchmark v2 JSON: %w", err)
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("packaged JVM benchmark v2 artifact has trailing JSON")
+		}
+		return fmt.Errorf("inspect packaged JVM benchmark v2 trailing JSON: %w", err)
+	}
+	return nil
+}
+
+func packagedJVMBenchmarkV2JSONSchema() *packagedJVMBenchmarkJSONSchema {
+	return packagedJVMBenchmarkV2JSONSchemaForType(
+		reflect.TypeOf(packagedJVMBenchmarkArtifactV2{}),
+	)
+}
+
+func packagedJVMBenchmarkV2JSONSchemaForType(
+	typeOf reflect.Type,
+) *packagedJVMBenchmarkJSONSchema {
+	switch typeOf.Kind() {
+	case reflect.String:
+		return &packagedJVMBenchmarkJSONSchema{kind: packagedJVMBenchmarkJSONString}
+	case reflect.Bool:
+		return &packagedJVMBenchmarkJSONSchema{kind: packagedJVMBenchmarkJSONBoolean}
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return &packagedJVMBenchmarkJSONSchema{kind: packagedJVMBenchmarkJSONNumber}
+	case reflect.Slice, reflect.Array:
+		return &packagedJVMBenchmarkJSONSchema{
+			kind:    packagedJVMBenchmarkJSONKindArray,
+			element: packagedJVMBenchmarkV2JSONSchemaForType(typeOf.Elem()),
+		}
+	case reflect.Struct:
+		fields := make(map[string]*packagedJVMBenchmarkJSONSchema, typeOf.NumField())
+		for index := 0; index < typeOf.NumField(); index++ {
+			field := typeOf.Field(index)
+			name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+			if name == "" {
+				name = field.Name
+			}
+			if name == "-" {
+				continue
+			}
+			fields[name] = packagedJVMBenchmarkV2JSONSchemaForType(field.Type)
+		}
+		return &packagedJVMBenchmarkJSONSchema{
+			kind:   packagedJVMBenchmarkJSONKindObject,
+			fields: fields,
+		}
+	default:
+		panic(fmt.Sprintf("unsupported packaged JVM benchmark v2 JSON type %s", typeOf))
+	}
 }
 
 type packagedJVMBenchmarkJSONKind uint8
@@ -3285,7 +4199,7 @@ func TestValidatePackagedJVMBenchmarkArtifactFile(t *testing.T) {
 	file, err := os.Open(artifactPath)
 	require.NoError(t, err)
 	defer file.Close()
-	_, err = decodePackagedJVMBenchmarkArtifact(file)
+	_, err = decodePackagedJVMBenchmarkArtifactV2(file)
 	require.NoError(t, err)
 }
 
@@ -3317,7 +4231,7 @@ func TestValidatePackagedJVMBenchmarkArtifactCICrosslinks(t *testing.T) {
 	file, err := os.Open(artifactPath)
 	require.NoError(t, err)
 	defer file.Close()
-	artifact, err := decodePackagedJVMBenchmarkArtifact(file)
+	artifact, err := decodePackagedJVMBenchmarkArtifactV2(file)
 	require.NoError(t, err)
 	agentIdentity, err := packagedJVMBenchmarkFileIdentityAtPath(agentPath)
 	require.NoError(t, err)
@@ -3327,7 +4241,7 @@ func TestValidatePackagedJVMBenchmarkArtifactCICrosslinks(t *testing.T) {
 	require.NoError(t, err)
 	sockopsBPFIdentity, err := packagedJVMBenchmarkBlobIdentityAtPath(sockopsBPFPath)
 	require.NoError(t, err)
-	require.NoError(t, validatePackagedJVMBenchmarkArtifactCICrosslinks(
+	require.NoError(t, validatePackagedJVMBenchmarkArtifactV2CICrosslinks(
 		artifact,
 		packagedJVMBenchmarkArtifactCICrosslinks{
 			Revision:           revision,
@@ -3402,6 +4316,161 @@ func TestValidatePackagedJVMBenchmarkArtifactCICrosslinksRejectsMutations(t *tes
 			))
 		})
 	}
+}
+
+func TestPackagedJVMBenchmarkArtifactV2StrictContract(t *testing.T) {
+	artifact := validPackagedJVMBenchmarkArtifactV2()
+	require.NoError(t, validatePackagedJVMBenchmarkArtifactV2(artifact))
+	require.Len(t, artifact.Series, 14)
+	for index, spec := range packagedJVMBenchmarkV2SeriesSpecs {
+		require.Equal(t, spec.Scope, artifact.Series[index].Scope)
+		require.Equal(t, spec.Transport, artifact.Series[index].Transport)
+		require.Equal(t, spec.Outcome, artifact.Series[index].Outcome)
+		require.Equal(t, spec.ExpectedStatus, artifact.Series[index].ExpectedStatus)
+	}
+	payload, err := json.Marshal(artifact)
+	require.NoError(t, err)
+	require.Less(t, len(payload), packagedJVMBenchmarkV2MaxArtifactBytes)
+	decoded, err := decodePackagedJVMBenchmarkArtifactV2(bytes.NewReader(payload))
+	require.NoError(t, err)
+	require.Equal(t, artifact, decoded)
+}
+
+func TestPackagedJVMBenchmarkArtifactV2RejectsSemanticMutations(t *testing.T) {
+	tests := []struct {
+		name      string
+		mutate    func(*packagedJVMBenchmarkArtifactV2)
+		wantError string
+	}{
+		{"schema", func(a *packagedJVMBenchmarkArtifactV2) { a.SchemaVersion = 1 }, "v2 identity"},
+		{"series order", func(a *packagedJVMBenchmarkArtifactV2) { a.Series[0], a.Series[1] = a.Series[1], a.Series[0] }, "unexpected identity"},
+		{"latency sample", func(a *packagedJVMBenchmarkArtifactV2) { a.Series[0].SamplesNS[0]++ }, "summary does not match"},
+		{"allocation sample", func(a *packagedJVMBenchmarkArtifactV2) { a.Series[0].Allocation.SamplesBytes[0]++ }, "summary does not match"},
+		{"allocation control", func(a *packagedJVMBenchmarkArtifactV2) { a.Series[0].Allocation.ControlSamplesBytes[0]++ }, "summary does not match"},
+		{"status", func(a *packagedJVMBenchmarkArtifactV2) { a.Series[0].Statuses.Missing-- }, "status distribution"},
+		{"native calls", func(a *packagedJVMBenchmarkArtifactV2) { a.Series[0].Calls.ObservedNativeCalls-- }, "call deltas"},
+		{"BPF delta", func(a *packagedJVMBenchmarkArtifactV2) { a.Series[0].Calls.PrimaryBPFStatusAfter-- }, "BPF status delta"},
+		{"server delta", func(a *packagedJVMBenchmarkArtifactV2) { a.Series[6].Calls.UnixServerStatusAfter-- }, "Unix server status delta"},
+		{"gate", func(a *packagedJVMBenchmarkArtifactV2) { a.Series[0].LatencyGate.Passed = false }, "latency gate"},
+		{"batch snapshots", func(a *packagedJVMBenchmarkArtifactV2) {
+			a.Provenance.CgroupBPF.StabilityChecks.ObservedPostBatchSnapshots--
+		}, "stability checks"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			artifact := validPackagedJVMBenchmarkArtifactV2()
+			test.mutate(&artifact)
+			require.ErrorContains(t, validatePackagedJVMBenchmarkArtifactV2(artifact), test.wantError)
+		})
+	}
+}
+
+func TestDecodePackagedJVMBenchmarkArtifactV2RejectsStructuralMutations(t *testing.T) {
+	payload, err := json.Marshal(validPackagedJVMBenchmarkArtifactV2())
+	require.NoError(t, err)
+	tests := []struct {
+		name      string
+		payload   []byte
+		wantError string
+	}{
+		{
+			name: "unknown",
+			payload: bytes.Replace(payload, []byte(`{"schema_version":2,`),
+				[]byte(`{"unknown_root":0,"schema_version":2,`), 1),
+			wantError: "unknown field",
+		},
+		{
+			name: "duplicate",
+			payload: bytes.Replace(payload, []byte(`{"schema_version":2,`),
+				[]byte(`{"schema_version":2,"schema_version":2,`), 1),
+			wantError: "duplicate JSON name",
+		},
+		{
+			name:      "null",
+			payload:   bytes.Replace(payload, []byte(`"correct":true`), []byte(`"correct":null`), 1),
+			wantError: "must not be null",
+		},
+		{
+			name:      "omitted zero",
+			payload:   bytes.Replace(payload, []byte(`"unknown":0,`), nil, 1),
+			wantError: `missing required field "unknown"`,
+		},
+		{
+			name:      "trailing",
+			payload:   append(slices.Clone(payload), []byte(` {}`)...),
+			wantError: "trailing JSON",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := decodePackagedJVMBenchmarkArtifactV2(bytes.NewReader(test.payload))
+			require.ErrorContains(t, err, test.wantError)
+		})
+	}
+}
+
+func validPackagedJVMBenchmarkArtifactV2() packagedJVMBenchmarkArtifactV2 {
+	legacy := validPackagedJVMBenchmarkArtifact()
+	totalBatches := len(packagedJVMBenchmarkV2SeriesSpecs) *
+		(packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations)
+	legacy.Provenance.CgroupBPF.StabilityChecks = packagedJVMBenchmarkArtifactStabilityChecks{
+		ExpectedCalls:             totalBatches,
+		ObservedPreCallSnapshots:  totalBatches,
+		ObservedPostCallSnapshots: totalBatches,
+	}
+	retained := packagedJVMBenchmarkV2Concurrency * packagedJVMBenchmarkMeasurementIterations
+	total := packagedJVMBenchmarkV2Concurrency *
+		(packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations)
+	observations := make([]packagedJVMBenchmarkV2SeriesObservation, len(packagedJVMBenchmarkV2SeriesSpecs))
+	for index, spec := range packagedJVMBenchmarkV2SeriesSpecs {
+		latency := int64(100_000)
+		if spec.Transport == "unix" {
+			latency = int64(time.Millisecond)
+		}
+		if spec.Outcome == "timeout" {
+			latency = packagedJVMBenchmarkV2TimeoutP50MinimumNS
+		}
+		statuses := packagedJVMBenchmarkArtifactV2Statuses{}
+		for range total {
+			if err := statuses.add(spec.ExpectedStatus); err != nil {
+				panic(err)
+			}
+		}
+		calls := packagedJVMBenchmarkArtifactV2Calls{
+			ExpectedJavaCalls: total, ObservedJavaCalls: total,
+			ExpectedNativeCalls: total, ObservedNativeCalls: total,
+			PrimaryBPFStatus: "not_applicable", UnixServerStatus: "not_applicable",
+		}
+		if spec.Scope == "bridge_provider_jni" {
+			calls.ExpectedBridgeCalls, calls.ObservedBridgeCalls = total, total
+		}
+		if spec.Transport == "getsockopt" {
+			calls.ExpectedPrimaryBPFCalls, calls.ObservedPrimaryBPFCalls = total, total
+			calls.PrimaryBPFStatus = javabridge.Status(spec.ExpectedStatus).String()
+			calls.PrimaryBPFStatusBefore = uint64(100 + index*total)
+			calls.PrimaryBPFStatusAfter = calls.PrimaryBPFStatusBefore + uint64(total)
+		} else {
+			calls.UnixServerStatus = javabridge.Status(spec.ExpectedStatus).String()
+			calls.UnixServerStatusAfter = uint64(total)
+			if spec.Outcome == "timeout" {
+				calls.ExpectedTimeoutFullRequests, calls.ObservedTimeoutFullRequests = total, total
+			} else {
+				calls.ExpectedUnixServerRequests, calls.ObservedUnixServerRequests = total, total
+			}
+		}
+		observations[index] = packagedJVMBenchmarkV2SeriesObservation{
+			Spec:                   spec,
+			SamplesNS:              slices.Repeat([]int64{latency}, retained),
+			AllocatedBytes:         slices.Repeat([]int64{64}, retained),
+			AllocationControlBytes: slices.Repeat([]int64{0}, retained),
+			Statuses:               statuses,
+			Calls:                  calls,
+		}
+	}
+	return newPackagedJVMBenchmarkArtifactV2(
+		time.Date(2026, time.August, 13, 0, 0, 0, 0, time.UTC),
+		legacy.Source, legacy.Inputs, legacy.Provenance.CgroupBPF, legacy.Runtime, observations,
+	)
 }
 
 func validPackagedJVMBenchmarkArtifact() packagedJVMBenchmarkArtifact {

@@ -13,8 +13,8 @@ readonly VERIFIER_GENERIC_PROFILE='TestBPFVerifierProductionProfiles/generictrac
 readonly VERIFIER_SOCKOPT_PROFILE='TestBPFVerifierProductionProfiles/tpinjector/java-remote-parent'
 readonly PRIVILEGED_TEST_PATTERN='^(TestJavaRemoteParentPrimarySocketAuthority|TestJavaRemoteParentPrimaryRequiresAuthoritativeDataHook|TestJavaRemoteParentPrimaryJVMFaults|TestJavaRemoteParentPrimaryJVMDirectSSLSocket|TestJavaRemoteParentGenericJVMDirectSSLSocket|TestJavaRemoteParentNestedCgroupLifecycle|TestJavaRemoteParentCgroupLinkProcessDeathCleanup|TestJavaRemoteParentCgroupPartialAttachRollback|TestJavaRemoteParentBridgeLoadRequiresPrivileges)$'
 readonly BENCHMARK_TEST_PATTERN='^TestJavaRemoteParentTransportBenchmark$'
-readonly PACKAGED_JVM_BENCHMARK_TEST_PATTERN='^TestJavaRemoteParentPackagedJVMGetsockoptBenchmark$'
-readonly PACKAGED_JVM_BENCHMARK_TEST_NAME='TestJavaRemoteParentPackagedJVMGetsockoptBenchmark'
+readonly PACKAGED_JVM_BENCHMARK_TEST_PATTERN='^TestJavaRemoteParentPackagedJVMTransportBenchmark$'
+readonly PACKAGED_JVM_BENCHMARK_TEST_NAME='TestJavaRemoteParentPackagedJVMTransportBenchmark'
 readonly PACKAGED_JVM_ARTIFACT_VALIDATOR_PATTERN='^(TestValidatePackagedJVMBenchmarkArtifactFile|TestValidatePackagedJVMBenchmarkArtifactCICrosslinks)$'
 readonly PACKAGED_JVM_ARTIFACT_VALIDATOR_NAME='TestValidatePackagedJVMBenchmarkArtifactFile'
 readonly PACKAGED_JVM_ARTIFACT_CROSSLINK_VALIDATOR_NAME='TestValidatePackagedJVMBenchmarkArtifactCICrosslinks'
@@ -749,6 +749,10 @@ run_packaged_jvm_benchmark() {
         write_packaged_jvm_command_argv source_status_argv "${source_status_command[@]}"
         printf 'exclusive_cgroup_bpf_premise=%s\n' \
             "$PACKAGED_JVM_EXCLUSIVE_CGROUP_BPF_PREMISE"
+        printf '%s\n' \
+            'packaged_jvm_series=2_scopes_x_2_transports_x_hit_miss_stale_plus_2_unix_timeout' \
+            'packaged_jvm_workers=8' \
+            'packaged_jvm_allocation=com.sun.management.ThreadMXBean'
         "$java_path" -version 2>&1
         cat /etc/os-release
         go version

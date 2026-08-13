@@ -1,0 +1,89 @@
+{
+  "format": 1,
+  "kind": "focused-rhel96-packaged-jvm-getsockopt",
+  "provenance": {
+    "artifact_name": "java-remote-parent-rhel9.6-kernel-sockopt-31741417915",
+    "repository": "MrAlias/opentelemetry-ebpf-instrumentation",
+    "workflow": {
+      "conclusion": "success",
+      "path": ".github/workflows/java_remote_parent_rhel.yml",
+      "run_attempt": 1,
+      "run_url": "https://github.com/MrAlias/opentelemetry-ebpf-instrumentation/actions/runs/31741417915"
+    }
+  },
+  "raw_evidence": {
+    "github_archive": {
+      "retained_in_repository": false,
+      "sha256": "f8dc199c64a518dd0e6c957cc9f78259aa14e0ae420b0d6d3061144ba6fff367",
+      "size_bytes": 35934009,
+      "source_name": "java-remote-parent-rhel9.6-kernel-sockopt-31741417915"
+    },
+    "packaged_benchmark": {
+      "retained_in_repository": false,
+      "sha256": "8cc7c5b1815878d7ebb51b42eabdb48a08f27ff78f185d084d8d5dc281e82e17",
+      "size_bytes": 8761,
+      "source_filename": "benchmark.json"
+    }
+  },
+  "result": {
+    "benchmark": "passed",
+    "ci_compiled_crosslink_validator": "passed",
+    "ci_compiled_decoder": "passed",
+    "independent_compiled_decoder": "passed",
+    "sanitized_bundle": "passed"
+  },
+  "scope": {
+    "acceptance_evidence": false,
+    "advances_issues": [
+      11,
+      20,
+      37
+    ],
+    "closes_issues": [],
+    "evidence_class": "focused_non_acceptance",
+    "execution_environment": "github_actions_digest_pinned_rhel96_kernel_vm",
+    "limitations": [
+      "not_rhel_userspace_compatibility",
+      "not_apache_application_acceptance",
+      "no_provider_selection_or_record_decode",
+      "no_unix_fallback",
+      "no_throughput_or_sustained_load",
+      "no_allocations_or_resource_growth",
+      "no_concurrency_or_run_to_run_variance",
+      "revisionless_boundary_identity_only_topology"
+    ],
+    "public_ci_locator_available": true
+  },
+  "source": {
+    "clean": true,
+    "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "repository": "MrAlias/opentelemetry-ebpf-instrumentation",
+    "revision": "a9047a32788e545b0c24a17e620708b488120a74",
+    "status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "summary_file": "benchmark-summary.json",
+  "validation": {
+    "cleanup": {
+      "authorized_process_keys_absent": true,
+      "bpf_resources_closed": true,
+      "derivation": "successful benchmark publication gate",
+      "direct_hierarchy_chains_empty": true,
+      "effective_chains_empty": true,
+      "intended_program_ids_absent": true,
+      "process_incarnation_keys_absent": true
+    },
+    "compiled_crosslink_validator": {
+      "ci_result": "passed",
+      "test": "TestValidatePackagedJVMBenchmarkArtifactCICrosslinks"
+    },
+    "compiled_decoder": {
+      "ci_result": "passed",
+      "independent_result": "passed",
+      "loads_bpf": false,
+      "test": "TestValidatePackagedJVMBenchmarkArtifactFile"
+    },
+    "raw_archive_matches_github_metadata": true,
+    "raw_artifact_matches_declared_identity": true,
+    "raw_projection_recomputed": true
+  }
+}

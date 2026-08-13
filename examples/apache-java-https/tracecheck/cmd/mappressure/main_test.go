@@ -337,6 +337,8 @@ type fakePressureMap struct {
 	info       *ebpf.MapInfo
 	infoErr    error
 	lookup     func(key, value interface{}) error
+	update     func(key, value interface{}, flags ebpf.MapUpdateFlags) error
+	deleteKey  func(key interface{}) error
 	closeCalls int
 }
 
@@ -351,9 +353,114 @@ func (m *fakePressureMap) Lookup(key, value interface{}) error {
 	return m.lookup(key, value)
 }
 
+func (m *fakePressureMap) Update(key, value interface{}, flags ebpf.MapUpdateFlags) error {
+	if m.update == nil {
+		return errors.New("unexpected map update")
+	}
+	return m.update(key, value, flags)
+}
+
+func (m *fakePressureMap) Delete(key interface{}) error {
+	if m.deleteKey == nil {
+		return ebpf.ErrKeyNotExist
+	}
+	return m.deleteKey(key)
+}
+
+func (m *fakePressureMap) Iterate() *ebpf.MapIterator {
+	return nil
+}
+
 func (m *fakePressureMap) Close() error {
 	m.closeCalls++
 	return nil
+}
+
+func TestRunFillResultCarriesExactPreparedProcessEvidence(t *testing.T) {
+	const (
+		targetMapID  = ebpf.MapID(41)
+		processMapID = ebpf.MapID(42)
+		processPID   = uint32(101)
+		processNS    = uint32(202)
+		incarnation  = uint64(303)
+		tokenBase    = uint64(700)
+	)
+	processes := &fakePressureMap{lookup: processIdentityLookup(incarnation)}
+	target := &fakePressureMap{info: &ebpf.MapInfo{
+		Type:       ebpf.Hash,
+		KeySize:    targetKeySize,
+		ValueSize:  targetValueSize,
+		MaxEntries: 1,
+		Name:       targetKernelName,
+	}}
+	var insertedKey [targetKeySize]byte
+	var insertedValue [targetValueSize]byte
+	updateCalls := 0
+	target.update = func(key, value interface{}, flags ebpf.MapUpdateFlags) error {
+		updateCalls++
+		assert.Equal(t, ebpf.UpdateNoExist, flags)
+		if updateCalls == 2 {
+			return syscall.ENOSPC
+		}
+		copy(insertedKey[:], key.([]byte))
+		copy(insertedValue[:], value.([]byte))
+		return nil
+	}
+	target.lookup = func(key, value interface{}) error {
+		assert.Equal(t, insertedKey[:], key.([]byte))
+		copy(value.(*[targetValueSize]byte)[:], insertedValue[:])
+		return nil
+	}
+
+	output, err := runWithDependencies(
+		config{
+			mode:                 "fill",
+			mapID:                uint(targetMapID),
+			expectedMaxEntries:   1,
+			expectedProcessMapID: uint(processMapID),
+			processPID:           uint(processPID),
+			processNamespace:     uint(processNS),
+			tokenBase:            tokenBase,
+		},
+		runDependencies{
+			openTargetMap: func(id ebpf.MapID) (targetMapHandle, ebpf.MapID, error) {
+				assert.Equal(t, targetMapID, id)
+				return target, id, nil
+			},
+			openProcessMap: func(id ebpf.MapID) (pressureMapHandle, ebpf.MapID, error) {
+				assert.Equal(t, targetMapID, id)
+				return processes, processMapID, nil
+			},
+			monotonicNowNS: func() (uint64, error) { return 12345, nil },
+		},
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, result{
+		Status:                  "passed",
+		Mode:                    "fill",
+		MapID:                   uint(targetMapID),
+		MapName:                 targetMapName,
+		KernelName:              targetKernelName,
+		MapType:                 ebpf.Hash.String(),
+		MaxEntries:              1,
+		ProcessMapID:            uint(processMapID),
+		ProcessPID:              processPID,
+		ProcessNamespace:        processNS,
+		TokenBase:               tokenBase,
+		Touched:                 1,
+		CapacityRejectedEntries: 1,
+		VerifiedPresentEntries:  1,
+	}, output)
+	assert.NotZero(t, output.ProcessMapID)
+	assert.NotZero(t, output.ProcessPID)
+	assert.NotZero(t, output.ProcessNamespace)
+	assert.Equal(t, processPID, binary.LittleEndian.Uint32(insertedKey[0:4]))
+	assert.Equal(t, processNS, binary.LittleEndian.Uint32(insertedKey[4:8]))
+	assert.Equal(t, incarnation, binary.LittleEndian.Uint64(insertedKey[16:24]))
+	assert.Equal(t, 2, updateCalls)
+	assert.Equal(t, 1, target.closeCalls)
+	assert.Equal(t, 1, processes.closeCalls)
 }
 
 func TestDiscoverPressureMapsScopesToUniqueLiveControlledJVMSet(t *testing.T) {

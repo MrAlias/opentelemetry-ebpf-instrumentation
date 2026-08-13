@@ -156,18 +156,44 @@ func validateConfig(cfg config) error {
 	return nil
 }
 
+type runDependencies struct {
+	openTargetMap               func(ebpf.MapID) (targetMapHandle, ebpf.MapID, error)
+	openProcessMap              func(ebpf.MapID) (pressureMapHandle, ebpf.MapID, error)
+	openPressureMapsForIdentity func(
+		uint32, uint32,
+	) (pressureMapHandle, ebpf.MapID, targetMapHandle, ebpf.MapID, processIdentity, error)
+	monotonicNowNS func() (uint64, error)
+}
+
 func run(cfg config) (result, error) {
+	return runWithDependencies(cfg, runDependencies{
+		openTargetMap: func(id ebpf.MapID) (targetMapHandle, ebpf.MapID, error) {
+			return openTargetMap(id)
+		},
+		openProcessMap: func(id ebpf.MapID) (pressureMapHandle, ebpf.MapID, error) {
+			return openProcessMap(id)
+		},
+		openPressureMapsForIdentity: func(
+			pid, namespace uint32,
+		) (pressureMapHandle, ebpf.MapID, targetMapHandle, ebpf.MapID, processIdentity, error) {
+			return openPressureMapsForIdentity(pid, namespace)
+		},
+		monotonicNowNS: monotonicNowNS,
+	})
+}
+
+func runWithDependencies(cfg config, dependencies runDependencies) (result, error) {
 	if err := validateConfig(cfg); err != nil {
 		return result{}, err
 	}
-	var target *ebpf.Map
+	var target targetMapHandle
 	var mapID ebpf.MapID
-	var processes *ebpf.Map
+	var processes pressureMapHandle
 	var processMapID ebpf.MapID
 	var identity processIdentity
 	var err error
 	if cfg.mode == "prepare" {
-		processes, processMapID, target, mapID, identity, err = openPressureMapsForIdentity(
+		processes, processMapID, target, mapID, identity, err = dependencies.openPressureMapsForIdentity(
 			uint32(cfg.processPID),
 			uint32(cfg.processNamespace),
 		)
@@ -176,7 +202,7 @@ func run(cfg config) (result, error) {
 		}
 		defer processes.Close()
 	} else {
-		target, mapID, err = openTargetMap(ebpf.MapID(cfg.mapID))
+		target, mapID, err = dependencies.openTargetMap(ebpf.MapID(cfg.mapID))
 	}
 	if err != nil {
 		return result{}, err
@@ -206,7 +232,7 @@ func run(cfg config) (result, error) {
 	entryCount := info.MaxEntries + 1
 	tokenBase := cfg.tokenBase
 	if cfg.mode == "fill" {
-		processes, discoveredMapID, openErr := openProcessMap(mapID)
+		processes, discoveredMapID, openErr := dependencies.openProcessMap(mapID)
 		if openErr != nil {
 			return result{}, openErr
 		}
@@ -217,13 +243,14 @@ func run(cfg config) (result, error) {
 		); err != nil {
 			return result{}, err
 		}
-		identity, matched, identityErr := readMatchingProcessIdentity(
+		var matched bool
+		identity, matched, err = readMatchingProcessIdentity(
 			processes,
 			uint32(cfg.processPID),
 			uint32(cfg.processNamespace),
 		)
-		if identityErr != nil {
-			return result{}, identityErr
+		if err != nil {
+			return result{}, err
 		}
 		if !matched {
 			return result{}, errors.New("prepared JVM identity is absent from its process map")
@@ -289,7 +316,7 @@ func run(cfg config) (result, error) {
 		key := syntheticKey(identity, tokenBase, index)
 		switch cfg.mode {
 		case "fill":
-			observedMonotimeNS, monotimeErr := monotonicNowNS()
+			observedMonotimeNS, monotimeErr := dependencies.monotonicNowNS()
 			if monotimeErr != nil {
 				cleanupFailedFill()
 				return result{}, monotimeErr
@@ -341,7 +368,7 @@ type targetEntry struct {
 	value [targetValueSize]byte
 }
 
-func collectTargetEntries(target *ebpf.Map) ([]targetEntry, error) {
+func collectTargetEntries(target targetMapHandle) ([]targetEntry, error) {
 	entries := make([]targetEntry, 0)
 	var entry targetEntry
 	iterator := target.Iterate()
@@ -504,6 +531,13 @@ type pressureMapHandle interface {
 	Info() (*ebpf.MapInfo, error)
 	Lookup(key, value interface{}) error
 	Close() error
+}
+
+type targetMapHandle interface {
+	pressureMapHandle
+	Update(key, value interface{}, flags ebpf.MapUpdateFlags) error
+	Delete(key interface{}) error
+	Iterate() *ebpf.MapIterator
 }
 
 type pressureMapDiscovery struct {

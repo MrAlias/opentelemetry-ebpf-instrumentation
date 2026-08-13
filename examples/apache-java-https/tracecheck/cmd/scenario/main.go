@@ -3376,6 +3376,26 @@ func awaitCancellationReconciliation(
 	diagnosticsAfter string,
 	fetch snapshotFetcher,
 ) (tracecheck.Snapshot, string, []string, error) {
+	return awaitCancellationReconciliationWithTiming(
+		ctx,
+		cfg,
+		marker,
+		diagnosticsAfter,
+		fetch,
+		assertionQuiescence,
+		200*time.Millisecond,
+	)
+}
+
+func awaitCancellationReconciliationWithTiming(
+	ctx context.Context,
+	cfg config,
+	marker string,
+	diagnosticsAfter string,
+	fetch snapshotFetcher,
+	quiescence time.Duration,
+	pollInterval time.Duration,
+) (tracecheck.Snapshot, string, []string, error) {
 	diagnosticDeltas, err := diagnosticCounterDeltas(
 		cfg.javaDiagnosticsBefore,
 		diagnosticsAfter,
@@ -3385,14 +3405,24 @@ func awaitCancellationReconciliation(
 		return tracecheck.Snapshot{}, "", nil, err
 	}
 	drops := summarizeDiagnosticDrops(diagnosticDeltas)
-	ticker := time.NewTicker(200 * time.Millisecond)
+	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	var lastSnapshot tracecheck.Snapshot
 	var lastOutcome string
 	var lastErr error
-	var stableSince time.Time
+	var lastSemanticErr error
+	var validSince time.Time
 	for {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return lastSnapshot, lastOutcome, drops.Reasons,
+				traceAssertionDeadlineError(ctxErr, lastErr, lastSemanticErr)
+		}
 		snapshot, fetchErr := fetch(ctx, cfg.receiverURL, marker)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return lastSnapshot, lastOutcome, drops.Reasons,
+				traceAssertionDeadlineError(ctxErr, fetchErr, lastSemanticErr)
+		}
+		previousOutcome := lastOutcome
 		outcome := "unresolved"
 		classificationErr := fetchErr
 		if fetchErr == nil {
@@ -3405,22 +3435,38 @@ func awaitCancellationReconciliation(
 				)
 			}
 		}
-		if outcome != lastOutcome || errorText(classificationErr) != errorText(lastErr) {
-			stableSince = time.Now()
+		if fetchErr == nil {
+			lastSnapshot = snapshot
+			lastOutcome = outcome
+			lastSemanticErr = classificationErr
 		}
-		lastSnapshot = snapshot
-		lastOutcome = outcome
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return lastSnapshot, lastOutcome, drops.Reasons,
+				traceAssertionDeadlineError(ctxErr, classificationErr, lastSemanticErr)
+		}
+		// An incomplete snapshot is not terminal evidence: the Apache client
+		// candidate can follow the Java span in OBI's next trace-export batch.
+		// Only a complete allowed outcome begins the bounded stability window;
+		// every error remains fail-closed under the scenario context deadline.
+		if classificationErr == nil {
+			if validSince.IsZero() || lastErr != nil || outcome != previousOutcome {
+				validSince = time.Now()
+			}
+		} else {
+			validSince = time.Time{}
+		}
 		lastErr = classificationErr
-		if time.Since(stableSince) >= assertionQuiescence {
-			if classificationErr != nil {
-				return snapshot, outcome, drops.Reasons, classificationErr
+		if classificationErr == nil && time.Since(validSince) >= quiescence {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return lastSnapshot, lastOutcome, drops.Reasons,
+					traceAssertionDeadlineError(ctxErr, classificationErr, lastSemanticErr)
 			}
 			return snapshot, outcome, drops.Reasons, nil
 		}
 		select {
 		case <-ctx.Done():
 			return lastSnapshot, lastOutcome, drops.Reasons,
-				traceAssertionDeadlineError(ctx.Err(), lastErr, nil)
+				traceAssertionDeadlineError(ctx.Err(), lastErr, lastSemanticErr)
 		case <-ticker.C:
 		}
 	}
@@ -3517,13 +3563,6 @@ func reasonCodedJavaDiscard(status string) bool {
 		}
 	}
 	return false
-}
-
-func errorText(err error) string {
-	if err == nil {
-		return ""
-	}
-	return err.Error()
 }
 
 func awaitAssertions(

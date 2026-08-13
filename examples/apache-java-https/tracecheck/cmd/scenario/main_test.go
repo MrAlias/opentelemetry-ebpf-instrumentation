@@ -756,6 +756,277 @@ func TestCancellationReconciliationRequiresOneExactApacheCandidate(t *testing.T)
 	}
 }
 
+func cancellationReconciliationFixture(t *testing.T) (
+	config,
+	string,
+	tracecheck.Snapshot,
+	tracecheck.Snapshot,
+) {
+	t.Helper()
+	exact := cancellationSnapshot("client")
+	incomplete := exact
+	incomplete.Spans = append([]tracecheck.Span(nil), exact.Spans[1:]...)
+	return config{
+			apacheService:         "apache-proxy",
+			javaService:           "java-backend",
+			javaDiagnosticsBefore: javaDiagnosticsSnapshot(t, 0),
+		}, javaDiagnosticsSnapshotWithCounters(t, map[string]uint64{
+			"t_valid":      2,
+			"take_sampled": 2,
+		}), exact, incomplete
+}
+
+func TestCancellationReconciliationWaitsForLateExactApacheCandidate(t *testing.T) {
+	const marker = "cancel"
+	cfg, diagnosticsAfter, exact, incomplete := cancellationReconciliationFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	fetches := 0
+	receiverErr := errors.New("receiver unavailable")
+	fetch := func(_ context.Context, _ string, _ string) (tracecheck.Snapshot, error) {
+		fetches++
+		if fetches <= 2 {
+			return tracecheck.Snapshot{}, receiverErr
+		}
+		if fetches <= 4 {
+			return incomplete, nil
+		}
+		return exact, nil
+	}
+
+	snapshot, outcome, reasons, err := awaitCancellationReconciliationWithTiming(
+		ctx,
+		cfg,
+		marker,
+		diagnosticsAfter,
+		fetch,
+		5*time.Millisecond,
+		5*time.Millisecond,
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, "exact", outcome)
+	assert.Empty(t, reasons)
+	assert.Equal(t, exact, snapshot)
+	assert.GreaterOrEqual(t, fetches, 6)
+}
+
+func TestCancellationReconciliationRejectsSnapshotFetchedAfterDeadline(t *testing.T) {
+	cfg, diagnosticsAfter, exact, _ := cancellationReconciliationFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fetches := 0
+	fetch := func(_ context.Context, _ string, _ string) (tracecheck.Snapshot, error) {
+		fetches++
+		cancel()
+		return exact, nil
+	}
+
+	snapshot, outcome, _, err := awaitCancellationReconciliationWithTiming(
+		ctx,
+		cfg,
+		"cancel",
+		diagnosticsAfter,
+		fetch,
+		time.Nanosecond,
+		time.Millisecond,
+	)
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, tracecheck.Snapshot{}, snapshot)
+	assert.Empty(t, outcome)
+	assert.Equal(t, 1, fetches)
+}
+
+func TestCancellationReconciliationDoesNotFetchAfterDeadline(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	fetches := 0
+	fetch := func(_ context.Context, _ string, _ string) (tracecheck.Snapshot, error) {
+		fetches++
+		return tracecheck.Snapshot{}, nil
+	}
+
+	_, _, _, err := awaitCancellationReconciliationWithTiming(
+		ctx,
+		config{
+			javaDiagnosticsBefore: javaDiagnosticsSnapshot(t, 0),
+		},
+		"cancel",
+		javaDiagnosticsSnapshot(t, 0),
+		fetch,
+		time.Millisecond,
+		time.Millisecond,
+	)
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Zero(t, fetches)
+}
+
+func TestCancellationReconciliationPreservesEvidenceAcrossFetchFailure(t *testing.T) {
+	cfg, diagnosticsAfter, _, incomplete := cancellationReconciliationFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fetches := 0
+	receiverErr := errors.New("receiver unavailable")
+	fetch := func(_ context.Context, _ string, _ string) (tracecheck.Snapshot, error) {
+		fetches++
+		if fetches == 1 {
+			return incomplete, nil
+		}
+		if fetches == 2 {
+			return tracecheck.Snapshot{}, receiverErr
+		}
+		cancel()
+		return tracecheck.Snapshot{}, receiverErr
+	}
+
+	snapshot, outcome, _, err := awaitCancellationReconciliationWithTiming(
+		ctx,
+		cfg,
+		"cancel",
+		diagnosticsAfter,
+		fetch,
+		time.Millisecond,
+		time.Millisecond,
+	)
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, err, receiverErr)
+	require.ErrorContains(t, err, "one marked Apache")
+	assert.Equal(t, incomplete, snapshot)
+	assert.Equal(t, "unresolved", outcome)
+	assert.Equal(t, 3, fetches)
+}
+
+func TestCancellationReconciliationRetainsInvalidEvidenceUntilCancellation(t *testing.T) {
+	cfg, diagnosticsAfter, _, incomplete := cancellationReconciliationFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fetches := 0
+	fetch := func(_ context.Context, _ string, _ string) (tracecheck.Snapshot, error) {
+		fetches++
+		if fetches == 4 {
+			cancel()
+		}
+		return incomplete, nil
+	}
+
+	snapshot, outcome, _, err := awaitCancellationReconciliationWithTiming(
+		ctx,
+		cfg,
+		"cancel",
+		diagnosticsAfter,
+		fetch,
+		0,
+		time.Nanosecond,
+	)
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorContains(t, err, "one marked Apache")
+	assert.Equal(t, incomplete, snapshot)
+	assert.Equal(t, "unresolved", outcome)
+	assert.Equal(t, 4, fetches)
+}
+
+type failOnErrCallContext struct {
+	context.Context
+	calls  int
+	failAt int
+}
+
+func (ctx *failOnErrCallContext) Err() error {
+	ctx.calls++
+	if ctx.calls >= ctx.failAt {
+		return context.Canceled
+	}
+	return nil
+}
+
+func TestCancellationReconciliationRejectsDeadlineDuringClassification(t *testing.T) {
+	cfg, diagnosticsAfter, exact, _ := cancellationReconciliationFixture(t)
+	ctx := &failOnErrCallContext{Context: context.Background(), failAt: 3}
+	fetches := 0
+	fetch := func(_ context.Context, _ string, _ string) (tracecheck.Snapshot, error) {
+		fetches++
+		return exact, nil
+	}
+
+	snapshot, outcome, _, err := awaitCancellationReconciliationWithTiming(
+		ctx,
+		cfg,
+		"cancel",
+		diagnosticsAfter,
+		fetch,
+		0,
+		time.Millisecond,
+	)
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, exact, snapshot)
+	assert.Equal(t, "exact", outcome)
+	assert.Equal(t, 1, fetches)
+	assert.Equal(t, 3, ctx.calls)
+}
+
+func TestCancellationReconciliationRejectsDeadlineBeforeMaturedSuccess(t *testing.T) {
+	cfg, diagnosticsAfter, exact, _ := cancellationReconciliationFixture(t)
+	ctx := &failOnErrCallContext{Context: context.Background(), failAt: 4}
+	fetches := 0
+	fetch := func(_ context.Context, _ string, _ string) (tracecheck.Snapshot, error) {
+		fetches++
+		return exact, nil
+	}
+
+	snapshot, outcome, _, err := awaitCancellationReconciliationWithTiming(
+		ctx,
+		cfg,
+		"cancel",
+		diagnosticsAfter,
+		fetch,
+		0,
+		time.Millisecond,
+	)
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, exact, snapshot)
+	assert.Equal(t, "exact", outcome)
+	assert.Equal(t, 1, fetches)
+	assert.Equal(t, 4, ctx.calls)
+}
+
+func TestCancellationReconciliationRestartsQuiescenceWhenValidOutcomeChanges(t *testing.T) {
+	const quiescence = 5 * time.Millisecond
+	cfg, diagnosticsAfter, exact, _ := cancellationReconciliationFixture(t)
+	missing := exact
+	missing.Spans = append([]tracecheck.Span(nil), exact.Spans[:1]...)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	fetches := 0
+	fetch := func(_ context.Context, _ string, _ string) (tracecheck.Snapshot, error) {
+		fetches++
+		if fetches == 1 {
+			return missing, nil
+		}
+		return exact, nil
+	}
+
+	snapshot, outcome, _, err := awaitCancellationReconciliationWithTiming(
+		ctx,
+		cfg,
+		"cancel",
+		diagnosticsAfter,
+		fetch,
+		quiescence,
+		5*time.Millisecond,
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, exact, snapshot)
+	assert.Equal(t, "exact", outcome)
+	assert.GreaterOrEqual(t, fetches, 3)
+}
+
 func TestDiagnosticDeltasPreserveEveryCounterAndDropMagnitude(t *testing.T) {
 	before := javaDiagnosticsSnapshot(t, 0)
 	after := javaDiagnosticsSnapshotWithCounters(t, map[string]uint64{

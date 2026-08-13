@@ -5,6 +5,7 @@
 
 package io.opentelemetry.obi.java.bridge;
 
+import io.opentelemetry.obi.java.ebpf.ThreadInfo;
 import java.util.concurrent.TimeUnit;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
@@ -93,31 +94,84 @@ public class RemoteParentRecordBenchmark {
     public void close() {}
   }
 
+  @FunctionalInterface
+  interface BenchmarkInvocation {
+    RemoteParentRecord invoke();
+  }
+
+  static RemoteParentRecord installAndVerify(int status, BenchmarkInvocation invocation) {
+    resetBridge();
+    ThreadInfo.setRemoteParentEnabled(true);
+    try {
+      RemoteParentRecord probe = RemoteParentRecord.decode(record(RemoteParentStatus.VALID));
+      FixedProvider probeProvider = new FixedProvider(probe);
+      if (!RemoteParentBridge.installProviderForTest(probeProvider)) {
+        throw new IllegalStateException("could not install fixed remote-parent benchmark provider");
+      }
+      if (invocation.invoke() != probe) {
+        throw new IllegalStateException("fixed remote-parent benchmark provider was not invoked");
+      }
+      RemoteParentRecord measured = RemoteParentRecord.decode(record(status));
+      if (!RemoteParentBridge.removeProvider(probeProvider)
+          || !RemoteParentBridge.installProviderForTest(new FixedProvider(measured))) {
+        throw new IllegalStateException(
+            "could not install measured remote-parent benchmark provider");
+      }
+      return measured;
+    } catch (RuntimeException | Error failure) {
+      resetBridge();
+      throw failure;
+    }
+  }
+
+  private static void resetBridge() {
+    ThreadInfo.setRemoteParentEnabled(false);
+    ThreadInfo.clearRemoteParentLookupSource();
+    ThreadInfo.clearRemoteParentSocketFileDescriptor();
+    RemoteParentBridge.resetForTest();
+  }
+
   @State(Scope.Benchmark)
   public static class HitBridgeState {
+    private RemoteParentRecord expected;
+
     @Setup
     public void install() {
-      RemoteParentBridge.installProviderForTest(
-          new FixedProvider(RemoteParentRecord.decode(record(RemoteParentStatus.VALID))));
+      expected =
+          installAndVerify(
+              RemoteParentStatus.VALID,
+              () -> new RemoteParentRecordBenchmark().bridgeTakeHit(this));
     }
 
     @TearDown
     public void reset() {
-      RemoteParentBridge.resetForTest();
+      resetBridge();
+    }
+
+    RemoteParentRecord expected() {
+      return expected;
     }
   }
 
   @State(Scope.Benchmark)
   public static class MissBridgeState {
+    private RemoteParentRecord expected;
+
     @Setup
     public void install() {
-      RemoteParentBridge.installProviderForTest(
-          new FixedProvider(RemoteParentRecord.decode(record(RemoteParentStatus.MISSING))));
+      expected =
+          installAndVerify(
+              RemoteParentStatus.MISSING,
+              () -> new RemoteParentRecordBenchmark().bridgeTakeMiss(this));
     }
 
     @TearDown
     public void reset() {
-      RemoteParentBridge.resetForTest();
+      resetBridge();
+    }
+
+    RemoteParentRecord expected() {
+      return expected;
     }
   }
 }

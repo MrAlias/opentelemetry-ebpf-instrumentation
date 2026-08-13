@@ -245,6 +245,20 @@ jmh {
     jvmArgs.set(listOf("-Xmx2G"))
 }
 
+val verifyRemoteParentRecordBenchmark by tasks.registering(JavaExec::class) {
+    group = "verification"
+    description = "Verify that remote-parent bridge benchmarks invoke their measured providers"
+    dependsOn(tasks.named("jmhClasses"))
+    classpath = sourceSets.named("jmh").get().runtimeClasspath
+    mainClass.set(
+        "io.opentelemetry.obi.java.bridge.RemoteParentRecordBenchmarkVerifier",
+    )
+}
+
+tasks.named("check") {
+    dependsOn(verifyRemoteParentRecordBenchmark)
+}
+
 val nativeOnly: String? by project
 val nativeArches: List<String> = if (nativeOnly != null) {
     val osArch = System.getProperty("os.arch")

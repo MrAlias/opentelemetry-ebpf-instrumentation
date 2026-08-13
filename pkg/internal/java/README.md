@@ -330,9 +330,14 @@ gradle :agent:jmh \
 
 The native benchmark reports `ns_per_op`, p50, p95, and p99 for deterministic
 getsockopt and Unix transport fixtures. The JMH command reports average latency
-and `gc.alloc.rate.norm` for the decode and bridge hit/miss paths. The latter
-uses a fixed provider to isolate Java bridge and record allocations; it is not
-an end-to-end native transport or production performance measurement.
+and `gc.alloc.rate.norm` for the decode and bridge hit/miss paths. Decode cases
+cover record decoding and allocation. Bridge cases use a fixed provider that
+returns predecoded records, isolating Java bridge overhead from native transport
+and decoding; they are not an end-to-end native transport or production
+performance measurement. The ordinary Gradle `check` lifecycle also runs a
+source-coupled smoke check that requires both named bridge benchmarks to invoke
+the enabled fixed provider; this prevents a nominal hit or miss benchmark from
+silently measuring the disabled bridge fast path.
 
 ### Benchmark Results
 

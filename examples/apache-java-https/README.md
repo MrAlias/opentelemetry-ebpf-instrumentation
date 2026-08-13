@@ -719,6 +719,15 @@ acceptance-evidence eligibility reason for machine-readable triage, including
 failures that occur after the result directory exists but before
 `environment.txt` can be written.
 
+Every `scenario-*-status.json` produced by `run_scenario` names both phase
+directories and embeds each available fixed-schema Java diagnostics snapshot
+with its relative artifact reference, exact base-36 snapshot, and structured
+counter values. This evidence is published even when the scenario process or a
+later metric or diagnostic assertion fails. A snapshot that was never captured
+is represented as `null`; the runner never fabricates an after value, and a
+present malformed or symlinked snapshot fails the scenario instead of entering
+the status.
+
 Only a generated marker header is captured. The receiver rejects compressed or
 oversized requests, enforces configured count, per-string, and aggregate
 retained-byte ceilings, and strips arbitrary headers and bodies before writing

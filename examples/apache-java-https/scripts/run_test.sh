@@ -9736,6 +9736,229 @@ write_diagnostics_fixture() {
   printf '%s\n' "$snapshot" >"$output"
 }
 
+java_diagnostics_schema_from_source() {
+  local -r source="$1"
+
+  [[ -f "$source" && ! -L "$source" ]] || return 1
+  awk '
+    /private static final String\[\] STATUS_NAMES = \{/ {
+      in_status_names = 1
+      next
+    }
+    in_status_names && /};/ {
+      in_status_names = 0
+      next
+    }
+    in_status_names {
+      value = $0
+      if (value ~ /^[[:space:]]*"[a-z_]+",?[[:space:]]*$/) {
+        gsub(/[[:space:]",]/, "", value)
+        statuses[++status_count] = value
+      }
+      next
+    }
+    /public static String snapshot\(\)/ {
+      in_snapshot = 1
+      next
+    }
+    in_snapshot && /for \(int status =/ {
+      if ($0 !~ /^[[:space:]]*for \(int status = RemoteParentStatus\.UNKNOWN; status <= RemoteParentStatus\.DISABLED; status\+\+\) \{[[:space:]]*$/) {
+        invalid_status_loop = 1
+      } else {
+        status_loop_header++
+      }
+      in_status_loop = 1
+      next
+    }
+    in_snapshot && /return snapshot\.toString\(\);/ {
+      in_snapshot = 0
+      next
+    }
+    in_snapshot && !in_status_loop && /append\(snapshot, "[a-z_]+"/ {
+      value = $0
+      sub(/^.*append\(snapshot, "/, "", value)
+      sub(/".*$/, "", value)
+      fixed[++fixed_count] = value
+    }
+    in_snapshot && in_status_loop &&
+      /append\(snapshot, "t_" \+ STATUS_NAMES\[status\], counters\.get\(TAKE_STATUS_BASE \+ status\)\);/ {
+      take_status_append++
+    }
+    in_snapshot && in_status_loop &&
+      /append\(snapshot, "d_" \+ STATUS_NAMES\[status\], counters\.get\(DISCARD_STATUS_BASE \+ status\)\);/ {
+      discard_status_append++
+    }
+    END {
+      if (fixed_count != 26 || status_count != 14 ||
+          status_loop_header != 1 || invalid_status_loop != 0 ||
+          take_status_append != 1 || discard_status_append != 1) {
+        exit 1
+      }
+      for (cursor = 1; cursor <= fixed_count; cursor++) {
+        print fixed[cursor]
+      }
+      for (cursor = 1; cursor <= status_count; cursor++) {
+        print "t_" statuses[cursor]
+        print "d_" statuses[cursor]
+      }
+    }
+  ' "$source"
+}
+
+assert_java_diagnostics_schema_sources_are_coupled() {
+  local -r java_source="$1"
+  local -r documentation="$2"
+  local -r harness_snapshot="$3"
+  local source_schema=""
+  local harness_schema=""
+  local source_count=0
+  local documented_count=0
+  local documented_count_matches=0
+  local documented_fixed_count=0
+  local documented_fixed_count_matches=0
+  local documented_status_count=0
+  local documented_status_count_matches=0
+
+  [[ -f "$documentation" && ! -L "$documentation" ]] || return 1
+  assert_sanitized_java_diagnostics "$harness_snapshot" || return 1
+  source_schema="$(java_diagnostics_schema_from_source "$java_source")" || return $?
+  harness_schema="$(
+    awk -F, '
+      NR != 1 { exit 1 }
+      {
+        for (cursor = 1; cursor <= NF; cursor++) {
+          name = $cursor
+          sub(/=.*/, "", name)
+          print name
+        }
+      }
+    ' "$harness_snapshot"
+  )" || return $?
+  source_count="$(awk 'END { print NR + 0 }' <<<"$source_schema")" || return $?
+  read -r \
+    documented_count \
+    documented_count_matches \
+    documented_fixed_count \
+    documented_fixed_count_matches \
+    documented_status_count \
+    documented_status_count_matches < <(
+    awk '
+      /The Java snapshot has [0-9]+ fixed keys: [0-9]+ fixed/ {
+        value = $0
+        sub(/^.*The Java snapshot has /, "", value)
+        sub(/ fixed keys:.*$/, "", value)
+        count = value
+        matches++
+
+        value = $0
+        sub(/^.* fixed keys: /, "", value)
+        sub(/ fixed.*$/, "", value)
+        fixed_count = value
+        fixed_count_matches++
+      }
+      /discard counter for each of the [0-9]+ fixed statuses\./ {
+        value = $0
+        sub(/^.*discard counter for each of the /, "", value)
+        sub(/ fixed statuses\..*$/, "", value)
+        status_count = value
+        status_count_matches++
+      }
+      END {
+        print count + 0, matches + 0,
+          fixed_count + 0, fixed_count_matches + 0,
+          status_count + 0, status_count_matches + 0
+      }
+    ' "$documentation"
+  )
+
+  [[ "$source_count" == "54" &&
+    "$documented_count_matches" == "1" &&
+    "$documented_count" == "$source_count" &&
+    "$documented_fixed_count_matches" == "1" &&
+    "$documented_fixed_count" == "26" &&
+    "$documented_status_count_matches" == "1" &&
+    "$documented_status_count" == "14" &&
+    "$documented_count" == \
+      "$((documented_fixed_count + 2 * documented_status_count))" &&
+    "$harness_schema" == "$source_schema" ]]
+}
+
+test_java_diagnostics_schema_is_source_coupled() {
+  local -r java_source="$REPO_ROOT/pkg/internal/java/agent/src/main/java/io/opentelemetry/obi/java/bridge/RemoteParentDiagnostics.java"
+  local -r documentation="$REPO_ROOT/devdocs/java-remote-parent-bridge.md"
+  local -r snapshot="$TEST_TMP_DIR/java-diagnostics-coupled.txt"
+  local -r mutated_source="$TEST_TMP_DIR/RemoteParentDiagnostics.java"
+  local -r mutated_documentation="$TEST_TMP_DIR/java-remote-parent-bridge.md"
+
+  write_diagnostics_fixture "$snapshot" 0 0 0 0 0 0
+  cp -- "$java_source" "$mutated_source"
+  cp -- "$documentation" "$mutated_documentation"
+  assert_java_diagnostics_schema_sources_are_coupled \
+    "$java_source" "$documentation" "$snapshot" || {
+    printf 'Java diagnostics source, harness, and documentation schema drifted\n' >&2
+    return 1
+  }
+
+  sed -i '/append(snapshot, "transport_missing"/d' "$mutated_source"
+  if assert_java_diagnostics_schema_sources_are_coupled \
+    "$mutated_source" "$documentation" "$snapshot" >/dev/null 2>&1; then
+    printf 'Java diagnostics schema coupling missed a source mutation\n' >&2
+    return 1
+  fi
+
+  cp -- "$java_source" "$mutated_source"
+  sed -i 's/"t_" + STATUS_NAMES/"x_" + STATUS_NAMES/' "$mutated_source"
+  if assert_java_diagnostics_schema_sources_are_coupled \
+    "$mutated_source" "$documentation" "$snapshot" >/dev/null 2>&1; then
+    printf 'Java diagnostics schema coupling missed a dynamic source mutation\n' >&2
+    return 1
+  fi
+
+  cp -- "$java_source" "$mutated_source"
+  sed -i \
+    's/status <= RemoteParentStatus.DISABLED/status < RemoteParentStatus.DISABLED/' \
+    "$mutated_source"
+  if assert_java_diagnostics_schema_sources_are_coupled \
+    "$mutated_source" "$documentation" "$snapshot" >/dev/null 2>&1; then
+    printf 'Java diagnostics schema coupling missed a status-loop mutation\n' >&2
+    return 1
+  fi
+
+  cp -- "$java_source" "$mutated_source"
+  sed -i 's/framework_depth=0/framework_depth_renamed=0/' "$snapshot"
+  if assert_java_diagnostics_schema_sources_are_coupled \
+    "$mutated_source" "$documentation" "$snapshot" >/dev/null 2>&1; then
+    printf 'Java diagnostics schema coupling missed a harness mutation\n' >&2
+    return 1
+  fi
+
+  write_diagnostics_fixture "$snapshot" 0 0 0 0 0 0
+  sed -i 's/The Java snapshot has 54 fixed keys:/The Java snapshot has 53 fixed keys:/' \
+    "$mutated_documentation"
+  if assert_java_diagnostics_schema_sources_are_coupled \
+    "$java_source" "$mutated_documentation" "$snapshot" >/dev/null 2>&1; then
+    printf 'Java diagnostics schema coupling missed a documentation mutation\n' >&2
+    return 1
+  fi
+
+  cp -- "$documentation" "$mutated_documentation"
+  sed -i 's/fixed keys: 26 fixed/fixed keys: 25 fixed/' "$mutated_documentation"
+  if assert_java_diagnostics_schema_sources_are_coupled \
+    "$java_source" "$mutated_documentation" "$snapshot" >/dev/null 2>&1; then
+    printf 'Java diagnostics schema coupling missed a fixed-count mutation\n' >&2
+    return 1
+  fi
+
+  cp -- "$documentation" "$mutated_documentation"
+  sed -i 's/each of the 14 fixed statuses/each of the 13 fixed statuses/' \
+    "$mutated_documentation"
+  if assert_java_diagnostics_schema_sources_are_coupled \
+    "$java_source" "$mutated_documentation" "$snapshot" >/dev/null 2>&1; then
+    printf 'Java diagnostics schema coupling missed a status-count mutation\n' >&2
+    return 1
+  fi
+}
+
 test_java_diagnostics_schema_is_exact() {
   local -r snapshot="$TEST_TMP_DIR/java-diagnostics-schema.txt"
   local required_field=""
@@ -10961,7 +11184,8 @@ test_scenario_fences_metrics_around_diagnostics() {
     capture_java_diagnostics() {
       printf 'diagnostics:%s\n' "$1" >>"$call_log"
       mkdir -p -- "$RESULT_DIR/phases/$1"
-      printf 'fixture\n' >"$RESULT_DIR/phases/$1/java-diagnostics.txt"
+      write_diagnostics_fixture \
+        "$RESULT_DIR/phases/$1/java-diagnostics.txt" 0 0 0 0 0 0
     }
     flush_bridge_metric_boundary() {
       boundary_ran=true
@@ -11103,7 +11327,8 @@ test_pressure_scenario_reconciles_roots_with_bridge_and_java_counts() {
     flush_bridge_metric_boundary() { :; }
     capture_java_diagnostics() {
       mkdir -p -- "$RESULT_DIR/phases/$1"
-      printf 'fixture\n' >"$RESULT_DIR/phases/$1/java-diagnostics.txt"
+      write_diagnostics_fixture \
+        "$RESULT_DIR/phases/$1/java-diagnostics.txt" 0 0 0 0 0 0
     }
     capture_phase_evidence() {
       mkdir -p -- "$RESULT_DIR/phases/$1"
@@ -11188,7 +11413,8 @@ test_pressure_unix_scenario_uses_strict_already_consumed_reconciliation() {
     flush_bridge_metric_boundary() { :; }
     capture_java_diagnostics() {
       mkdir -p -- "$RESULT_DIR/phases/$1"
-      printf 'fixture\n' >"$RESULT_DIR/phases/$1/java-diagnostics.txt"
+      write_diagnostics_fixture \
+        "$RESULT_DIR/phases/$1/java-diagnostics.txt" 0 0 0 0 0 0
     }
     capture_phase_evidence() {
       mkdir -p -- "$RESULT_DIR/phases/$1"
@@ -11263,7 +11489,8 @@ test_pressure_failure_retains_wrong_parent_counts_and_cleans_up() {
     flush_bridge_metric_boundary() { :; }
     capture_java_diagnostics() {
       mkdir -p -- "$RESULT_DIR/phases/$1"
-      printf 'fixture\n' >"$RESULT_DIR/phases/$1/java-diagnostics.txt"
+      write_diagnostics_fixture \
+        "$RESULT_DIR/phases/$1/java-diagnostics.txt" 0 0 0 0 0 0
     }
     capture_phase_evidence() {
       mkdir -p -- "$RESULT_DIR/phases/$1"
@@ -11339,7 +11566,8 @@ test_pressure_empty_result_fails_closed_and_cleans_up() {
     flush_bridge_metric_boundary() { :; }
     capture_java_diagnostics() {
       mkdir -p -- "$RESULT_DIR/phases/$1"
-      printf 'fixture\n' >"$RESULT_DIR/phases/$1/java-diagnostics.txt"
+      write_diagnostics_fixture \
+        "$RESULT_DIR/phases/$1/java-diagnostics.txt" 0 0 0 0 0 0
     }
     capture_phase_evidence() {
       mkdir -p -- "$RESULT_DIR/phases/$1"
@@ -11402,7 +11630,8 @@ test_scenario_controls_matching_fixture_lifecycle() {
     capture_java_diagnostics() {
       printf 'diagnostics:%s\n' "$1" >>"$call_log"
       mkdir -p -- "$RESULT_DIR/phases/$1"
-      printf 'fixture\n' >"$RESULT_DIR/phases/$1/java-diagnostics.txt"
+      write_diagnostics_fixture \
+        "$RESULT_DIR/phases/$1/java-diagnostics.txt" 0 0 0 0 0 0
     }
     capture_phase_evidence() {
       printf 'evidence:%s\n' "$1" >>"$call_log"
@@ -18753,50 +18982,280 @@ EOF
 }
 
 test_scenario_failure_retains_after_evidence() {
-  local fail_compose="$TEST_TMP_DIR/fail-compose"
+  local -r fail_compose="$TEST_TMP_DIR/fail-compose"
+  local -r before_fixture="$TEST_TMP_DIR/scenario-failure-before.txt"
+  local -r after_fixture="$TEST_TMP_DIR/scenario-failure-after.txt"
+  local after_capture=""
 
   printf '%s\n' '#!/usr/bin/env sh' 'exit 17' >"$fail_compose"
   chmod 0755 "$fail_compose"
+  write_diagnostics_fixture "$before_fixture" 0 0 0 0 0 0
+  write_diagnostics_fixture "$after_fixture" 0 0 0 0 0 0 missing 1
 
-  (
-    RESULT_DIR="$TEST_TMP_DIR/scenario-failure"
+  for after_capture in available missing malformed; do
+    if ! (
+      local scenario_status=0
+      local -r result_dir="$TEST_TMP_DIR/scenario-failure-$after_capture"
+
+      RESULT_DIR="$result_dir"
+      mkdir -p -- "$RESULT_DIR"
+      COMPOSE=("$fail_compose")
+      BRIDGE_RUNNING=false
+      REQUEST_COUNT=0
+      REPEAT_COUNT=1
+      SCENARIO_SEED=1
+      SCENARIO_VARIANT=""
+      SELECTED_TRANSPORT=getsockopt
+      TLS_PROTOCOL=TLSv1.3
+      flush_bridge_metric_boundary() {
+        return 0
+      }
+      capture_phase_evidence() {
+        mkdir -p -- "$RESULT_DIR/phases/$1"
+        printf '# empty\n' >"$RESULT_DIR/phases/$1/obi-metrics.prom"
+      }
+      capture_java_diagnostics() {
+        local -r phase="$1"
+
+        mkdir -p -- "$RESULT_DIR/phases/$phase"
+        if [[ "$phase" == "basic-before" ]]; then
+          cp -- "$before_fixture" \
+            "$RESULT_DIR/phases/$phase/java-diagnostics.txt"
+        elif [[ "$after_capture" == "available" || \
+          "$after_capture" == "malformed" ]]; then
+          cp -- "$after_fixture" \
+            "$RESULT_DIR/phases/$phase/java-diagnostics.txt"
+          if [[ "$after_capture" == "malformed" ]]; then
+            sed -i 's/cfg_on=0/cfg_on=00/' \
+              "$RESULT_DIR/phases/$phase/java-diagnostics.txt"
+          fi
+        else
+          return 23
+        fi
+      }
+
+      if run_scenario basic >/dev/null 2>&1; then
+        printf 'failing scenario unexpectedly passed\n' >&2
+        return 1
+      else
+        scenario_status=$?
+      fi
+      [[ "$scenario_status" -eq 17 ]] || {
+        printf 'failing scenario returned %d, expected 17\n' "$scenario_status" >&2
+        return 1
+      }
+      [[ -s "$RESULT_DIR/scenario-basic-status.json" ]] || {
+        printf 'failing scenario omitted machine-readable status\n' >&2
+        return 1
+      }
+      [[ -f "$RESULT_DIR/phases/basic-after/obi-metrics.delta" ]] || {
+        printf 'failing scenario omitted after-phase metric delta\n' >&2
+        return 1
+      }
+      if grep -q 'status="missing"' "$RESULT_DIR/phases/basic-after/obi-metrics.delta"; then
+        printf 'diagnostic bridge lookup contaminated the scenario metric delta\n' >&2
+        return 1
+      fi
+      jq -e --arg before "$(<"$before_fixture")" '
+        .status == "failed" and
+        .exit_status == 17 and
+        .before_phase == "phases/basic-before" and
+        .after_phase == "phases/basic-after" and
+        .java_diagnostics.before.reference ==
+          "phases/basic-before/java-diagnostics.txt" and
+        .java_diagnostics.before.snapshot == $before and
+        .java_diagnostics.before.counters.cfg_on == "0"
+      ' "$RESULT_DIR/scenario-basic-status.json" >/dev/null || return 1
+      if [[ "$after_capture" == "available" ]]; then
+        jq -e --arg after "$(<"$after_fixture")" '
+          .metric_status == 0 and
+          .java_diagnostics.after.reference ==
+            "phases/basic-after/java-diagnostics.txt" and
+          .java_diagnostics.after.snapshot == $after and
+          .java_diagnostics.after.counters.t_missing == "1"
+        ' "$RESULT_DIR/scenario-basic-status.json" >/dev/null || return 1
+      elif [[ "$after_capture" == "missing" ]]; then
+        jq -e '
+          .metric_status == 1 and
+          .java_diagnostics.after == null
+        ' "$RESULT_DIR/scenario-basic-status.json" >/dev/null || return 1
+        [[ ! -e "$RESULT_DIR/phases/basic-after/java-diagnostics.txt" &&
+          ! -L "$RESULT_DIR/phases/basic-after/java-diagnostics.txt" ]] || return 1
+      else
+        jq -e '
+          .metric_status == 1 and
+          .java_diagnostics.after == null
+        ' "$RESULT_DIR/scenario-basic-status.json" >/dev/null || return 1
+        [[ -f "$RESULT_DIR/phases/basic-after/java-diagnostics.txt" &&
+          ! -L "$RESULT_DIR/phases/basic-after/java-diagnostics.txt" ]] || return 1
+      fi
+    ); then
+      printf 'scenario-process failure did not retain truthful %s diagnostics\n' \
+        "$after_capture" >&2
+      return 1
+    fi
+  done
+}
+
+test_in_band_scenario_failure_retains_partial_diagnostics() {
+  local -r result_dir="$TEST_TMP_DIR/in-band-scenario-failure"
+  local -r before_fixture="$TEST_TMP_DIR/in-band-scenario-before.txt"
+  local -r after_fixture="$TEST_TMP_DIR/in-band-scenario-after.txt"
+
+  write_diagnostics_fixture "$before_fixture" 0 0 0 0 0 0
+  write_diagnostics_fixture "$after_fixture" 0 0 0 0 0 0 missing 1
+  if ! (
+    local scenario_status=0
+
+    RESULT_DIR="$result_dir"
     mkdir -p -- "$RESULT_DIR"
-    COMPOSE=("$fail_compose")
+    COMPOSE=(docker compose)
     BRIDGE_RUNNING=false
     REQUEST_COUNT=0
     REPEAT_COUNT=1
+    SCENARIO_SEED=1
+    SCENARIO_VARIANT=""
+    SELECTED_TRANSPORT=getsockopt
+    TLS_PROTOCOL=TLSv1.3
+    RECEIVE_CURSOR_MAP_ID=""
+    RECEIVE_GUARD_MAP_ID=""
+    RECEIVE_CURSOR_MAP_STATUS_JSON="null"
+    flush_bridge_metric_boundary() {
+      return 0
+    }
+    capture_java_diagnostics() {
+      local -r phase="$1"
+
+      mkdir -p -- "$RESULT_DIR/phases/$phase"
+      cp -- "$before_fixture" \
+        "$RESULT_DIR/phases/$phase/java-diagnostics.txt"
+    }
+    capture_phase_evidence() {
+      mkdir -p -- "$RESULT_DIR/phases/$1"
+      printf '# empty\n' >"$RESULT_DIR/phases/$1/obi-metrics.prom"
+    }
+    capture_receive_cursor_map_baseline() {
+      return 0
+    }
+    run_bounded() {
+      printf '{\n  "status": "failed",\n  "scenario": "coalesced-bridge",\n  "java_diagnostics_after": "%s"\n}\n' \
+        "$(<"$after_fixture")"
+      return 17
+    }
+    write_metrics_delta() {
+      : >"$3"
+    }
+
+    if run_scenario coalesced-bridge >/dev/null 2>&1; then
+      printf 'failing in-band scenario unexpectedly passed\n' >&2
+      return 1
+    else
+      scenario_status=$?
+    fi
+    [[ "$scenario_status" -eq 17 ]] || return 1
+    jq -e --arg after "$(<"$after_fixture")" '
+      .status == "failed" and
+      .exit_status == 17 and
+      .metric_status == 0 and
+      .java_diagnostics.after.reference ==
+        "phases/coalesced-bridge-after/java-diagnostics.txt" and
+      .java_diagnostics.after.snapshot == $after and
+      .java_diagnostics.after.counters.t_missing == "1"
+    ' "$RESULT_DIR/scenario-coalesced-bridge-status.json" >/dev/null || return 1
+    grep -Fqx \
+      't_missing before=0 after=1 delta=1' \
+      "$RESULT_DIR/phases/coalesced-bridge-after/java-diagnostics.delta"
+  ); then
+    printf 'in-band scenario failure lost its partial diagnostics\n' >&2
+    return 1
+  fi
+}
+
+test_diagnostic_assertion_failure_retains_available_snapshots() {
+  local -r result_dir="$TEST_TMP_DIR/scenario-diagnostic-assertion-failure"
+  local -r before_fixture="$TEST_TMP_DIR/diagnostic-assertion-before.txt"
+  local -r after_fixture="$TEST_TMP_DIR/diagnostic-assertion-after.txt"
+
+  write_diagnostics_fixture "$before_fixture" 0 0 0 0 0 0
+  write_diagnostics_fixture "$after_fixture" 1 0 0 1 0 0 missing 1
+  if ! (
+    local scenario_status=0
+
+    RESULT_DIR="$result_dir"
+    mkdir -p -- "$RESULT_DIR"
+    COMPOSE=(docker compose)
+    BRIDGE_RUNNING=true
+    REQUEST_COUNT=0
+    REPEAT_COUNT=1
+    SCENARIO_SEED=1
+    SCENARIO_VARIANT=""
+    SELECTED_TRANSPORT=getsockopt
+    TLS_PROTOCOL=TLSv1.3
+    flush_bridge_metric_boundary() {
+      return 0
+    }
     capture_phase_evidence() {
       mkdir -p -- "$RESULT_DIR/phases/$1"
       printf '# empty\n' >"$RESULT_DIR/phases/$1/obi-metrics.prom"
     }
     capture_java_diagnostics() {
-      printf 'unavailable\n' >"$RESULT_DIR/phases/$1/java-diagnostics.txt"
+      local -r phase="$1"
+      local source="$after_fixture"
+
+      if [[ "$phase" == "basic-before" ]]; then
+        source="$before_fixture"
+      fi
+      mkdir -p -- "$RESULT_DIR/phases/$phase"
+      cp -- "$source" "$RESULT_DIR/phases/$phase/java-diagnostics.txt"
+    }
+    bridge_success_total() {
+      printf '0\n'
+    }
+    bridge_stage_total() {
+      printf '0\n'
+    }
+    run_bounded() {
+      printf '{"status":"passed","scenario":"basic"}\n'
+    }
+    wait_for_bridge_metrics_quiescent() {
+      return 0
+    }
+    write_metrics_delta() {
+      : >"$3"
+    }
+    assert_bridge_metric_delta() {
+      return 0
+    }
+    assert_java_diagnostics_delta() {
+      return 1
     }
 
-    local scenario_status=0
     if run_scenario basic >/dev/null 2>&1; then
-      printf 'failing scenario unexpectedly passed\n' >&2
+      printf 'scenario ignored the deliberate diagnostic assertion failure\n' >&2
       return 1
     else
       scenario_status=$?
     fi
-    [[ "$scenario_status" -eq 17 ]] || {
-      printf 'failing scenario returned %d, expected 17\n' "$scenario_status" >&2
-      return 1
-    }
-    [[ -s "$RESULT_DIR/scenario-basic-status.json" ]] || {
-      printf 'failing scenario omitted machine-readable status\n' >&2
-      return 1
-    }
-    [[ -f "$RESULT_DIR/phases/basic-after/obi-metrics.delta" ]] || {
-      printf 'failing scenario omitted after-phase metric delta\n' >&2
-      return 1
-    }
-    if grep -q 'status="missing"' "$RESULT_DIR/phases/basic-after/obi-metrics.delta"; then
-      printf 'diagnostic bridge lookup contaminated the scenario metric delta\n' >&2
-      return 1
-    fi
-  )
+    [[ "$scenario_status" -eq 1 ]] || return 1
+    jq -e \
+      --arg before "$(<"$before_fixture")" \
+      --arg after "$(<"$after_fixture")" '
+        .status == "failed" and
+        .exit_status == 0 and
+        .metric_status == 1 and
+        .java_diagnostics.before.reference ==
+          "phases/basic-before/java-diagnostics.txt" and
+        .java_diagnostics.before.snapshot == $before and
+        .java_diagnostics.after.reference ==
+          "phases/basic-after/java-diagnostics.txt" and
+        .java_diagnostics.after.snapshot == $after and
+        .java_diagnostics.after.counters.t_valid == "1" and
+        .java_diagnostics.after.counters.t_missing == "1"
+      ' "$RESULT_DIR/scenario-basic-status.json" >/dev/null
+  ); then
+    printf 'diagnostic assertion failure lost its last valid snapshots\n' >&2
+    return 1
+  fi
 }
 
 test_start_failure_retains_command_boundary() {
@@ -23661,6 +24120,7 @@ main() {
   test_permissive_unix_directory_control_refuses_and_restores
   test_permissive_unix_directory_rejects_socket_probe_error
   test_unix_endpoint_restart_invalidates_before_stack_mutation
+  test_java_diagnostics_schema_is_source_coupled
   test_java_diagnostics_schema_is_exact
   test_java_diagnostics_delta_is_exact
   test_auto_unavailable_diagnostics_are_bounded_and_fail_closed
@@ -23754,6 +24214,8 @@ main() {
   test_restart_fault_rejects_traffic_ending_before_first_barrier
   test_restart_failure_reaps_background_traffic
   test_scenario_failure_retains_after_evidence
+  test_in_band_scenario_failure_retains_partial_diagnostics
+  test_diagnostic_assertion_failure_retains_available_snapshots
   test_start_failure_retains_command_boundary
   test_pre_environment_failure_retains_acceptance_eligibility
   test_log_write_failure_is_not_ignored

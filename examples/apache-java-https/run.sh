@@ -8151,6 +8151,8 @@ run_scenario() {
   local expected_fault_count=0
   local fault_diagnostics_after=""
   local fault_diagnostics_delta=""
+  local before_diagnostics_status_json="null"
+  local after_diagnostics_status_json="null"
   local bridge_was_running=false
   local controlled_bridge_was_running=false
   local fixture_status=0
@@ -8257,6 +8259,8 @@ run_scenario() {
     timeout_parent_outcome=""
     timeout_drop_reason=""
     diagnostic_valid_takes=0
+    before_diagnostics_status_json="null"
+    after_diagnostics_status_json="null"
     label="$name"
     if [[ "$name" == "w3c-fault" ]]; then
       label="$name-$FAULT_MODE"
@@ -8375,7 +8379,7 @@ run_scenario() {
         scenario_status=$?
       fi
     fi
-    if ((scenario_status == 0)) && scenario_uses_in_band_java_diagnostics "$name"; then
+    if scenario_uses_in_band_java_diagnostics "$name"; then
       if ! mkdir -p -- "$RESULT_DIR/phases/$after_phase"; then
         metric_status=1
       elif ! extract_java_diagnostics_after "$output" "$after_diagnostics"; then
@@ -8720,6 +8724,22 @@ run_scenario() {
       ! stop_matching_bridge "$label" "$expected_requests"; then
       metric_status=1
     fi
+    if [[ "$diagnostics_enabled" == "true" ]]; then
+      if ! before_diagnostics_status_json="$(
+        java_diagnostics_phase_evidence_json "$before_phase"
+      )"; then
+        log_error "could not retain valid before-phase Java diagnostics for $label"
+        before_diagnostics_status_json="null"
+        metric_status=1
+      fi
+      if ! after_diagnostics_status_json="$(
+        java_diagnostics_phase_evidence_json "$after_phase"
+      )"; then
+        log_error "could not retain valid after-phase Java diagnostics for $label"
+        after_diagnostics_status_json="null"
+        metric_status=1
+      fi
+    fi
     if ((scenario_status != 0 || metric_status != 0)); then
       status_name="failed"
     fi
@@ -8733,7 +8753,7 @@ run_scenario() {
     if [[ "$name" == "tls-boundary" || "$name" == "coalesced-bridge" ]]; then
       receive_cursor_map_status_json="$RECEIVE_CURSOR_MAP_STATUS_JSON"
     fi
-    if ! printf '{\n  "status": "%s",\n  "scenario": "%s",\n  "exit_status": %d,\n  "metric_status": %d,\n  "pressure_correlation": %s,\n  "scenario_reconciliation": %s,\n  "receive_coordination_maps": %s,\n  "result": "%s",\n  "stderr": "%s",\n  "after_phase": "%s"\n}\n' \
+    if ! printf '{\n  "status": "%s",\n  "scenario": "%s",\n  "exit_status": %d,\n  "metric_status": %d,\n  "pressure_correlation": %s,\n  "scenario_reconciliation": %s,\n  "receive_coordination_maps": %s,\n  "java_diagnostics": {"before": %s, "after": %s},\n  "result": "%s",\n  "stderr": "%s",\n  "before_phase": "%s",\n  "after_phase": "%s"\n}\n' \
       "$status_name" \
       "$name" \
       "$scenario_status" \
@@ -8741,8 +8761,11 @@ run_scenario() {
       "$pressure_status_json" \
       "$scenario_reconciliation_json" \
       "$receive_cursor_map_status_json" \
+      "$before_diagnostics_status_json" \
+      "$after_diagnostics_status_json" \
       "$(basename -- "$output")" \
       "$(basename -- "$stderr_output")" \
+      "phases/$before_phase" \
       "phases/$after_phase" >"$RESULT_DIR/scenario-$label-status.json"; then
       return 1
     fi
@@ -12270,6 +12293,34 @@ assert_sanitized_java_diagnostics() {
     fi
     ((index += 1))
   done
+}
+
+java_diagnostics_phase_evidence_json() {
+  local -r phase="$1"
+  local -r reference="phases/$phase/java-diagnostics.txt"
+  local -r input="$RESULT_DIR/$reference"
+  local snapshot=""
+
+  if [[ ! -e "$input" && ! -L "$input" ]]; then
+    printf 'null\n'
+    return 0
+  fi
+  assert_sanitized_java_diagnostics "$input" || return $?
+  snapshot="$(<"$input")" || return $?
+  jq -cn \
+    --arg reference "$reference" \
+    --arg snapshot "$snapshot" '
+      {
+        reference: $reference,
+        snapshot: $snapshot,
+        counters: (
+          $snapshot
+          | split(",")
+          | map(split("=") | {(.[0]): .[1]})
+          | add
+        )
+      }
+    '
 }
 
 background_process_is_running() {

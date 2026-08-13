@@ -902,10 +902,11 @@ cannot be confused with an unauthorized caller. Cleanup and fallback-map
 eviction are emitted as counted `tcp` lifecycle operations and never contain
 map keys. A `tcp/report/valid` marker is emitted after each successful BPF
 counter pass at the configured BPF metric interval so observers can identify
-complete publications. The Java snapshot has 50 fixed keys:
-twenty-two configuration, registration, lookup, extraction, trace-flag, and
-decrypted-read counters plus take and discard counters for each of the fourteen
-statuses. None of these surfaces derives a label or key from request data.
+complete publications. The Java snapshot has 54 fixed keys: 26 fixed
+configuration, registration, lookup, extraction, standard-parent-discard,
+trace-flag, decrypted-read, framework-miss, and transport-availability counters
+plus one take and one discard counter for each of the 14 fixed statuses. None
+of these surfaces derives a label or key from request data.
 
 Retained acceptance bundles from revisions before the availability rename can
 contain `operation="select"`. That historical label means OBI-side transport

@@ -58,6 +58,17 @@ enum {
   java_remote_parent_fault_mode_max_size = 96,
   java_remote_parent_fault_control_single_link_count = 1,
   java_remote_parent_fault_control_private_mode = 0600,
+  java_remote_parent_unix_request_size = 24,
+  java_remote_parent_unix_request_version = 3,
+  java_remote_parent_unix_operation_take = 1,
+  java_remote_parent_unix_source_direct = 1,
+  java_remote_parent_unix_version_offset = 4,
+  java_remote_parent_unix_size_offset = 6,
+  java_remote_parent_unix_operation_offset = 8,
+  java_remote_parent_unix_source_offset = 9,
+  java_remote_parent_unix_reserved_offset = 10,
+  java_remote_parent_unix_reserved_size = 2,
+  java_remote_parent_unix_generation_barrier_timeout_millis = 25000,
   /* The runner reserves a bounded 55-second proof window before release. */
   java_remote_parent_live_fd_barrier_timeout_millis = 90000,
   java_remote_parent_live_fd_barrier_poll_nanoseconds = 10000000,
@@ -67,6 +78,10 @@ enum {
 
 static const char java_remote_parent_fault_file_environment[] =
     "OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_FILE";
+#if defined(OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TESTING)
+static const char java_remote_parent_unix_socket_path_test_environment[] =
+    "OBI_DEMO_JAVA_REMOTE_PARENT_UNIX_SOCKET_PATH_FOR_TEST";
+#endif
 static const char java_remote_parent_magic[] = "OBIJ";
 static const char java_remote_parent_live_fd_barrier_mode[] = "live-fd-barrier";
 static const char java_remote_parent_auto_unavailable_mode[] =
@@ -75,6 +90,12 @@ static const char java_remote_parent_unix_socket_path[] =
     "/var/run/obi/java-remote-parent.sock";
 static const char java_remote_parent_live_fd_ready_prefix[] = "ready:";
 static const char java_remote_parent_live_fd_release_prefix[] = "release:";
+static const char java_remote_parent_unix_generation_barrier_mode[] =
+    "unix-generation-barrier\n";
+static const char java_remote_parent_unix_generation_ready[] =
+    "ready:unix-generation\n";
+static const char java_remote_parent_unix_generation_release[] =
+    "release:unix-generation\n";
 
 enum java_remote_parent_fault_mode {
   java_remote_parent_fault_disabled,
@@ -87,15 +108,20 @@ enum java_remote_parent_fault_mode {
 
 typedef int (*getsockopt_fn)(int, int, int, void *, socklen_t *);
 typedef int (*connect_fn)(int, __CONST_SOCKADDR_ARG, socklen_t);
+typedef ssize_t (*send_fn)(int, const void *, size_t, int);
 
 static getsockopt_fn real_getsockopt;
 static pthread_once_t real_getsockopt_once = PTHREAD_ONCE_INIT;
 static connect_fn real_connect;
 static pthread_once_t real_connect_once = PTHREAD_ONCE_INIT;
+static send_fn real_send;
+static pthread_once_t real_send_once = PTHREAD_ONCE_INIT;
 
 #if defined(OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TESTING)
 static int java_remote_parent_live_fd_barrier_timeout_for_test =
     java_remote_parent_live_fd_barrier_timeout_millis;
+static int java_remote_parent_unix_generation_barrier_timeout_for_test =
+    java_remote_parent_unix_generation_barrier_timeout_millis;
 static _Atomic unsigned int
     java_remote_parent_real_getsockopt_call_count_for_test;
 static _Atomic int java_remote_parent_live_fd_barrier_observed_release_for_test;
@@ -113,6 +139,7 @@ static _Atomic unsigned int
 static _Atomic unsigned int
     java_remote_parent_auto_unavailable_connect_count_for_test;
 static _Atomic unsigned int java_remote_parent_real_connect_count_for_test;
+static _Atomic unsigned int java_remote_parent_real_send_call_count_for_test;
 
 void obi_demo_java_remote_parent_set_live_fd_barrier_timeout_for_test(
     int timeout_millis) {
@@ -235,12 +262,35 @@ unsigned int obi_demo_java_remote_parent_real_connect_count_for_test(void) {
   return atomic_load_explicit(&java_remote_parent_real_connect_count_for_test,
                               memory_order_relaxed);
 }
+
+void obi_demo_java_remote_parent_set_unix_generation_barrier_timeout_for_test(
+    int timeout_millis) {
+  java_remote_parent_unix_generation_barrier_timeout_for_test = timeout_millis;
+}
+
+void obi_demo_java_remote_parent_reset_real_send_call_count_for_test(void) {
+  atomic_store_explicit(&java_remote_parent_real_send_call_count_for_test, 0,
+                        memory_order_relaxed);
+}
+
+unsigned int obi_demo_java_remote_parent_real_send_call_count_for_test(void) {
+  return atomic_load_explicit(&java_remote_parent_real_send_call_count_for_test,
+                              memory_order_relaxed);
+}
 #endif
 
 _Static_assert(sizeof(real_getsockopt) == sizeof(void *),
                "dlsym function pointer size mismatch");
 _Static_assert(sizeof(real_connect) == sizeof(void *),
                "dlsym function pointer size mismatch");
+_Static_assert(sizeof(real_send) == sizeof(void *),
+               "dlsym function pointer size mismatch");
+_Static_assert(sizeof(java_remote_parent_unix_generation_barrier_mode) - 1 ==
+                   java_remote_parent_unix_request_size,
+               "Unix generation barrier arm size changed");
+_Static_assert(sizeof(java_remote_parent_unix_generation_release) - 1 ==
+                   java_remote_parent_unix_request_size,
+               "Unix generation barrier release size changed");
 
 static bool java_remote_parent_fault_mode_matches(const char *value,
                                                   size_t value_length,
@@ -995,6 +1045,11 @@ static void resolve_real_connect(void) {
   memcpy(&real_connect, &symbol, sizeof(real_connect));
 }
 
+static void resolve_real_send(void) {
+  const void *const symbol = dlsym(RTLD_NEXT, "send");
+  memcpy(&real_send, &symbol, sizeof(real_send));
+}
+
 static bool java_remote_parent_is_unix_stream_socket(int socket) {
   if (socket < 0 ||
       pthread_once(&real_getsockopt_once, resolve_real_getsockopt) != 0 ||
@@ -1026,16 +1081,236 @@ java_remote_parent_is_exact_health_request(int socket, int level, int option,
 static bool java_remote_parent_is_exact_unix_socket(
     int socket, const struct sockaddr *address, socklen_t address_length) {
   const size_t path_offset = offsetof(struct sockaddr_un, sun_path);
-  const size_t expected_path_size = sizeof(java_remote_parent_unix_socket_path);
+  const char *expected_path = java_remote_parent_unix_socket_path;
+#if defined(OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TESTING)
+  const char *const test_path =
+      getenv(java_remote_parent_unix_socket_path_test_environment);
+  if (test_path != NULL && test_path[0] == '/') {
+    expected_path = test_path;
+  }
+#endif
+  const size_t expected_path_size = strlen(expected_path) + 1;
   if (address == NULL || address_length != path_offset + expected_path_size ||
+      expected_path_size > sizeof(((struct sockaddr_un *)0)->sun_path) ||
       !java_remote_parent_is_unix_stream_socket(socket) ||
       address->sa_family != AF_UNIX) {
     return false;
   }
   const struct sockaddr_un *const unix_address =
       (const struct sockaddr_un *)address;
-  return memcmp(unix_address->sun_path, java_remote_parent_unix_socket_path,
-                expected_path_size) == 0;
+  return memcmp(unix_address->sun_path, expected_path, expected_path_size) == 0;
+}
+
+static bool java_remote_parent_is_exact_unix_peer(int socket) {
+  struct sockaddr_un peer;
+  memset(&peer, 0, sizeof(peer));
+  socklen_t peer_length = sizeof(peer);
+  return getpeername(socket, (struct sockaddr *)&peer, &peer_length) == 0 &&
+         java_remote_parent_is_exact_unix_socket(
+             socket, (const struct sockaddr *)&peer, peer_length);
+}
+
+static bool java_remote_parent_is_exact_unix_direct_take_send(
+    int socket, const void *buffer, size_t length, int flags) {
+  if (buffer == NULL || length != java_remote_parent_unix_request_size ||
+      flags != MSG_NOSIGNAL || !java_remote_parent_is_exact_unix_peer(socket)) {
+    return false;
+  }
+
+  const unsigned char *const request = buffer;
+  return memcmp(request, "OBIQ", 4) == 0 &&
+         request[java_remote_parent_unix_version_offset] ==
+             java_remote_parent_unix_request_version &&
+         request[java_remote_parent_unix_version_offset + 1] == 0 &&
+         request[java_remote_parent_unix_size_offset] ==
+             java_remote_parent_unix_request_size &&
+         request[java_remote_parent_unix_size_offset + 1] == 0 &&
+         request[java_remote_parent_unix_operation_offset] ==
+             java_remote_parent_unix_operation_take &&
+         request[java_remote_parent_unix_source_offset] ==
+             java_remote_parent_unix_source_direct &&
+         java_remote_parent_bytes_are_zero(
+             request + java_remote_parent_unix_reserved_offset,
+             java_remote_parent_unix_reserved_size);
+}
+
+static int java_remote_parent_unix_generation_barrier_timeout(void) {
+#if defined(OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TESTING)
+  return java_remote_parent_unix_generation_barrier_timeout_for_test;
+#else
+  return java_remote_parent_unix_generation_barrier_timeout_millis;
+#endif
+}
+
+static bool
+java_remote_parent_unix_generation_barrier_deadline(struct timespec *deadline) {
+  const int timeout_millis =
+      java_remote_parent_unix_generation_barrier_timeout();
+  if (timeout_millis <= 0 || clock_gettime(CLOCK_MONOTONIC, deadline) != 0) {
+    return false;
+  }
+  deadline->tv_sec += timeout_millis / 1000;
+  deadline->tv_nsec += (long)(timeout_millis % 1000) *
+                       java_remote_parent_nanoseconds_per_millisecond;
+  if (deadline->tv_nsec >= java_remote_parent_nanoseconds_per_second) {
+    deadline->tv_sec++;
+    deadline->tv_nsec -= java_remote_parent_nanoseconds_per_second;
+  }
+  return true;
+}
+
+static bool java_remote_parent_exact_bytes(const char *value,
+                                           ssize_t value_length,
+                                           const char *expected,
+                                           size_t expected_length) {
+  return value_length >= 0 && (size_t)value_length == expected_length &&
+         memcmp(value, expected, expected_length) == 0;
+}
+
+static bool java_remote_parent_bytes_are_prefix(const char *value,
+                                                ssize_t value_length,
+                                                const char *expected,
+                                                size_t expected_length) {
+  return value_length >= 0 && (size_t)value_length <= expected_length &&
+         memcmp(value, expected, (size_t)value_length) == 0;
+}
+
+static bool
+java_remote_parent_unix_generation_protocol_state(const char *value,
+                                                  ssize_t value_length) {
+  return java_remote_parent_bytes_are_prefix(
+             value, value_length,
+             java_remote_parent_unix_generation_barrier_mode,
+             sizeof(java_remote_parent_unix_generation_barrier_mode) - 1) ||
+         java_remote_parent_bytes_are_prefix(
+             value, value_length, java_remote_parent_unix_generation_ready,
+             sizeof(java_remote_parent_unix_generation_ready) - 1) ||
+         java_remote_parent_bytes_are_prefix(
+             value, value_length, java_remote_parent_unix_generation_release,
+             sizeof(java_remote_parent_unix_generation_release) - 1);
+}
+
+/* The exact direct-take request is held after its connected peer and complete
+ * OBIQ v3 frame have been authenticated, but before any byte reaches the map
+ * handler. The already-open, exclusively locked inode is the only release
+ * authority; replacing its pathname cannot release the request. */
+static int java_remote_parent_wait_for_unix_generation_barrier(
+    int socket, const void *buffer, size_t length, int flags) {
+  if (!java_remote_parent_is_exact_unix_direct_take_send(socket, buffer, length,
+                                                         flags)) {
+    return 0;
+  }
+
+  const char *const path = getenv(java_remote_parent_fault_file_environment);
+  if (path == NULL || path[0] == '\0') {
+    return 0;
+  }
+  const int descriptor =
+      open(path, O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+  if (descriptor < 0) {
+    return 0;
+  }
+  if (!java_remote_parent_fault_control_is_trusted(descriptor)) {
+    (void)close(descriptor);
+    return 0;
+  }
+
+  int lock_result;
+  do {
+    lock_result = flock(descriptor, LOCK_EX | LOCK_NB);
+  } while (lock_result != 0 && errno == EINTR);
+  if (lock_result != 0) {
+    char locked_value[java_remote_parent_fault_mode_max_size];
+    ssize_t locked_length;
+    do {
+      locked_length = pread(descriptor, locked_value, sizeof(locked_value), 0);
+    } while (locked_length < 0 && errno == EINTR);
+    const bool busy = java_remote_parent_fault_control_is_trusted(descriptor) &&
+                      java_remote_parent_unix_generation_protocol_state(
+                          locked_value, locked_length);
+    (void)close(descriptor);
+    if (busy) {
+      errno = EBUSY;
+      return -1;
+    }
+    return 0;
+  }
+  if (!java_remote_parent_fault_control_is_trusted(descriptor)) {
+    (void)close(descriptor);
+    return 0;
+  }
+
+  char value[java_remote_parent_fault_mode_max_size];
+  ssize_t value_length =
+      java_remote_parent_read_fault_control(descriptor, value, sizeof(value));
+  if (value_length < 0) {
+    java_remote_parent_close_preserving_errno(descriptor);
+    return -1;
+  }
+  if (!java_remote_parent_exact_bytes(
+          value, value_length, java_remote_parent_unix_generation_barrier_mode,
+          sizeof(java_remote_parent_unix_generation_barrier_mode) - 1)) {
+    const bool busy =
+        java_remote_parent_unix_generation_protocol_state(value, value_length);
+    (void)close(descriptor);
+    if (busy) {
+      errno = EBUSY;
+      return -1;
+    }
+    return 0;
+  }
+
+  if (!java_remote_parent_write_fault_control(
+          descriptor, java_remote_parent_unix_generation_ready,
+          sizeof(java_remote_parent_unix_generation_ready) - 1)) {
+    java_remote_parent_close_preserving_errno(descriptor);
+    return -1;
+  }
+  struct timespec deadline;
+  if (!java_remote_parent_unix_generation_barrier_deadline(&deadline)) {
+    (void)close(descriptor);
+    errno = ETIMEDOUT;
+    return -1;
+  }
+
+  for (;;) {
+    value_length =
+        java_remote_parent_read_fault_control(descriptor, value, sizeof(value));
+    if (value_length < 0 ||
+        !java_remote_parent_fault_control_is_trusted(descriptor)) {
+      if (value_length >= 0) {
+        errno = EACCES;
+      }
+      java_remote_parent_close_preserving_errno(descriptor);
+      return -1;
+    }
+    if (java_remote_parent_exact_bytes(
+            value, value_length, java_remote_parent_unix_generation_release,
+            sizeof(java_remote_parent_unix_generation_release) - 1)) {
+      if (!java_remote_parent_clear_fault_control(descriptor)) {
+        java_remote_parent_close_preserving_errno(descriptor);
+        return -1;
+      }
+      (void)close(descriptor);
+      return 0;
+    }
+
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+        java_remote_parent_timespec_at_or_after(&now, &deadline)) {
+      (void)close(descriptor);
+      errno = ETIMEDOUT;
+      return -1;
+    }
+    struct timespec poll_delay = {
+        .tv_sec = 0,
+        .tv_nsec = java_remote_parent_live_fd_barrier_poll_nanoseconds,
+    };
+    struct timespec remaining;
+    while (nanosleep(&poll_delay, &remaining) != 0 && errno == EINTR) {
+      poll_delay = remaining;
+    }
+  }
 }
 
 int getsockopt(int socket, int level, int option, void *optval,
@@ -1101,4 +1376,21 @@ int connect(int socket, __CONST_SOCKADDR_ARG address,
                             memory_order_relaxed);
 #endif
   return real_connect(socket, address, address_length);
+}
+
+ssize_t send(int socket, const void *buffer, size_t length, int flags) {
+  if (pthread_once(&real_send_once, resolve_real_send) != 0 ||
+      real_send == NULL) {
+    errno = ENOSYS;
+    return -1;
+  }
+  if (java_remote_parent_wait_for_unix_generation_barrier(socket, buffer,
+                                                          length, flags) != 0) {
+    return -1;
+  }
+#if defined(OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TESTING)
+  atomic_fetch_add_explicit(&java_remote_parent_real_send_call_count_for_test,
+                            1, memory_order_relaxed);
+#endif
+  return real_send(socket, buffer, length, flags);
 }

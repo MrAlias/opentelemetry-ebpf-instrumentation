@@ -1709,6 +1709,10 @@ test_unix_all_suite_includes_fault_control() {
       run_scenario unix-w3c-stale
       run_scenario basic
     }
+    run_unix_generation_mismatch_control() {
+      run_scenario unix-generation-mismatch
+      run_scenario basic
+    }
     run_w3c_fault_control() {
       run_scenario w3c-fault
     }
@@ -1747,7 +1751,7 @@ test_unix_all_suite_includes_fault_control() {
   )
 
   [[ "$(<"$actual")" == *$'basic\nbasic\nsecurity\nkeepalive'* && \
-    "$(<"$actual")" == *$'obi-flags\nunix-w3c-stale\nbasic\nw3c-fault\npermanent-absence\nbasic\nfail-open'* &&
+    "$(<"$actual")" == *$'obi-flags\nunix-w3c-stale\nbasic\nunix-generation-mismatch\nbasic\nw3c-fault\npermanent-absence\nbasic\nfail-open'* &&
     "$(<"$actual")" == *$'restart\nrestart-fault\nhelper-attach-failure'* ]] || {
     printf 'Unix all suite omitted the security or bounded W3C fault control\n' >&2
     return 1
@@ -2017,6 +2021,51 @@ test_primary_generation_mismatch_requires_one_forced_primary() {
     printf 'accepted generation mismatch with multiple requests\n' >&2
     return 1
   fi
+}
+
+test_unix_generation_mismatch_requires_one_forced_unix() {
+  (
+    TRANSPORT=getsockopt
+    SCENARIO=all
+    REQUEST_COUNT=0
+    parse_args --transport unix --scenario unix-generation-mismatch --requests 1
+    [[ "$TRANSPORT" == unix && "$SCENARIO" == unix-generation-mismatch && \
+      "$REQUEST_COUNT" == 1 ]]
+  ) || {
+    printf 'rejected the one-request forced-Unix generation control\n' >&2
+    return 1
+  }
+  local transport=""
+  for transport in getsockopt auto disabled; do
+    if (
+      TRANSPORT=unix
+      SCENARIO=all
+      REQUEST_COUNT=0
+      parse_args --transport "$transport" --scenario unix-generation-mismatch
+    ) >/dev/null 2>&1; then
+      printf 'accepted Unix generation control with transport %s\n' "$transport" >&2
+      return 1
+    fi
+  done
+  if (
+    TRANSPORT=unix
+    SCENARIO=all
+    REQUEST_COUNT=0
+    parse_args --transport unix --scenario unix-generation-mismatch --requests 2
+  ) >/dev/null 2>&1; then
+    printf 'accepted multiple Unix generation requests\n' >&2
+    return 1
+  fi
+  (
+    TRANSPORT=getsockopt
+    SCENARIO=all
+    REQUEST_COUNT=0
+    parse_args --transport unix --scenario unix-generation-mismatch
+    [[ "$REQUEST_COUNT" == 0 ]]
+  ) || {
+    printf 'Unix generation default request sentinel changed\n' >&2
+    return 1
+  }
 }
 
 test_auto_unavailable_requires_one_auto_request() {
@@ -8615,6 +8664,130 @@ test_generation_take_fence_waits_for_the_fourth_attempt() {
   fi
 }
 
+test_unix_generation_mismatch_control_is_exact_and_bounded() {
+  local -r result_dir="$TEST_TMP_DIR/unix-generation-control"
+  local -r before="$result_dir/before.txt"
+  local -r after="$result_dir/after.txt"
+  local -r delta="$result_dir/diagnostics.delta"
+  local -r metrics="$result_dir/metrics.delta"
+  local control=""
+  local line_ready=""
+  local line_armed=""
+  local line_release=""
+  local line_fence=""
+  local line_restore=""
+  local line_helper_reap=""
+  local line_helper_verify=""
+  local line_victim_reap=""
+  local line_consume=""
+
+  mkdir -p -- "$result_dir"
+  write_diagnostics_fixture "$before" 0 0 0 0 0 0
+  write_diagnostics_fixture "$after" 0 0 0 0 0 0 already_consumed 1
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  assert_unix_generation_mismatch_diagnostics_delta "$delta" 1 || {
+    printf 'Unix generation diagnostics rejected exact already_consumed evidence\n' >&2
+    return 1
+  }
+  for mutation in missing valid stale unauthorized; do
+    write_diagnostics_fixture "$after" 0 0 0 0 0 0 "$mutation" 1
+    write_java_diagnostics_delta "$before" "$after" "$delta"
+    if assert_unix_generation_mismatch_diagnostics_delta "$delta" 1 \
+      >/dev/null 2>&1; then
+      printf 'Unix generation diagnostics accepted %s\n' "$mutation" >&2
+      return 1
+    fi
+  done
+  write_diagnostics_fixture "$after" 0 0 0 0 0 0 already_consumed 2
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  if assert_unix_generation_mismatch_diagnostics_delta "$delta" 1 \
+    >/dev/null 2>&1; then
+    printf 'Unix generation diagnostics accepted two takes\n' >&2
+    return 1
+  fi
+
+  cat >"$metrics" <<'EOF'
+obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="take",status="already_consumed",transport="unix"} before=0 after=1 delta=1
+EOF
+  assert_security_metric_delta "$metrics" take already_consumed unix 1 1
+  assert_bridge_metric_delta "$metrics" unix 0 0 0 1 1 false 0 0 1
+  sed -i 's/status="already_consumed"/status="missing"/' "$metrics"
+  if assert_bridge_metric_delta "$metrics" unix 0 0 0 1 1 false 0 0 1 \
+    >/dev/null 2>&1; then
+    printf 'Unix generation metrics accepted missing instead of already_consumed\n' >&2
+    return 1
+  fi
+
+  control="$(declare -f run_unix_generation_mismatch_control)" || return $?
+  line_ready="$(awk '/wait_for_unix_generation_barrier_ready/ { line=NR } END { print line }' <<<"$control")"
+  line_armed="$(awk '/wait_for_generation_fault_armed/ { line=NR } END { print line }' <<<"$control")"
+  line_release="$(awk '/release_unix_generation_barrier/ { line=NR } END { print line }' <<<"$control")"
+  line_fence="$(awk '/wait_for_bridge_take_attempts_quiescent/ { line=NR } END { print line }' <<<"$control")"
+  line_restore="$(awk '/publish_generation_fault_release/ { line=NR } END { print line }' <<<"$control")"
+  line_helper_reap="$(awk '/wait_for_background_process "\$helper_pid"/ { line=NR } END { print line }' <<<"$control")"
+  line_helper_verify="$(awk '/assert_generation_fault_helper_output/ { line=NR } END { print line }' <<<"$control")"
+  line_victim_reap="$(awk '/wait_for_background_process "\$victim_pid"/ { line=NR } END { print line }' <<<"$control")"
+  line_consume="$(awk '/consume_unix_generation_barrier/ { line=NR } END { print line }' <<<"$control")"
+  ((line_ready < line_armed && line_armed < line_release &&
+    line_release < line_fence && line_fence < line_restore &&
+    line_restore < line_helper_reap && line_helper_reap < line_helper_verify &&
+    line_helper_verify < line_victim_reap && line_victim_reap < line_consume)) || {
+    printf 'Unix generation mutation no longer spans the exact send/take fence\n' >&2
+    return 1
+  }
+  assert_unix_generation_deadlines || return $?
+  grep -Fq 'java_remote_parent_unix_generation_barrier_timeout_millis = 25000' \
+    "$TEST_SCRIPT_DIR/../java/fault/getsockopt_fault_shim.c" || return 1
+  grep -Fq 'OTEL_EBPF_JAVA_REMOTE_PARENT_TIMEOUT: ${OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TIMEOUT:?}' \
+    "$TEST_SCRIPT_DIR/../docker-compose.primary-fault.yml" || return 1
+  grep -Fq 'OTEL_EBPF_JAVA_REMOTE_PARENT_TIMEOUT: 50ms' \
+    "$TEST_SCRIPT_DIR/../docker-compose.yml" || return 1
+  [[ "$control" == *'OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TIMEOUT="30s"'* && \
+    "$control" == *'OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TIMEOUT="50ms"'* && \
+    "$control" == *'"$((before_take_attempts + 1))" "$((before_stage + 1))"'* && \
+    "$control" == *'take already_consumed unix 1 1'* && \
+    "$control" == *'unix 0 0 0 1 1 false 0 0 1'* && \
+    "$control" == *'local -r status="$?"'* && \
+    "$control" == *'if ((status == 0 && restore_status != 0))'* ]] || {
+    printf 'Unix generation control lost its timeout, exact fence, or status preservation\n' >&2
+    return 1
+  }
+  local -r expected_status='{"status":"passed","scenario":"unix-generation-mismatch","transport":"unix","live_owner_mutation":"verified","barrier":"pre-send","bridge_timeout_ms":30000,"take_status":"already_consumed","wrong_parent_count":0,"w3c_precedence":"passed","exact_restore":"verified","post_fault_recovery":"passed","before_phase":"phases/unix-generation-mismatch-before","after_phase":"phases/unix-generation-mismatch-after"}'
+  [[ "$control" == *"$expected_status"* ]] || {
+    printf 'Unix generation final status schema changed\n' >&2
+    return 1
+  }
+  jq -e '
+    type == "object" and
+    ((keys | sort) == ["after_phase", "barrier", "before_phase", "bridge_timeout_ms", "exact_restore", "live_owner_mutation", "post_fault_recovery", "scenario", "status", "take_status", "transport", "w3c_precedence", "wrong_parent_count"]) and
+    ([keys[] | select(test("pid|tid|fd|generation|container|trace|span"))] | length == 0)
+  ' <<<"$expected_status" >/dev/null || return 1
+  local cleanup_definition=""
+  cleanup_definition="$(declare -f cleanup)" || return $?
+  [[ "$cleanup_definition" == *'unix-generation-mismatch-recovery-required'* && \
+    "$cleanup_definition" == *'force_stack_shutdown=true'* ]] || {
+    printf 'Unix generation recovery marker no longer forces global shutdown\n' >&2
+    return 1
+  }
+}
+
+test_unix_generation_target_dispatches_once() {
+  local -i calls=0
+  (
+    SCENARIO=unix-generation-mismatch
+    run_unix_generation_mismatch_control() { printf 'called\n' >>"$TEST_TMP_DIR/unix-generation-dispatch"; }
+    execute_requested_scenarios
+  )
+  calls="$(wc -l <"$TEST_TMP_DIR/unix-generation-dispatch")"
+  [[ "$calls" == 1 ]] || {
+    printf 'Unix generation target dispatched %s times\n' "$calls" >&2
+    return 1
+  }
+}
+
 test_primary_live_fd_descriptor_is_exact_and_bounded() {
   local descriptor=""
 
@@ -8784,9 +8957,9 @@ test_primary_live_fd_control_uses_exact_barrier_protocol() {
   local unsupported_cleanup_line=""
 
   control="$(declare -f run_primary_live_fd_security_control)"
-  arm="$(declare -f arm_primary_live_fd_barrier)"
+  arm="$(declare -f arm_primary_live_fd_barrier)$(declare -f arm_java_fault_control)"
   release="$(declare -f release_primary_live_fd_barrier)"
-  consume="$(declare -f consume_primary_live_fd_barrier)"
+  consume="$(declare -f consume_primary_live_fd_barrier)$(declare -f consume_java_fault_control)"
   waiter="$(declare -f wait_for_primary_live_fd_barrier_ready)"
   probe_runner="$(declare -f run_primary_live_fd_probe)"
   recovery_scenario="$(declare -f run_primary_live_fd_security_recovery_scenario)"
@@ -12496,6 +12669,39 @@ test_primary_fault_runtime_contract_is_exact_and_base_is_clean() {
       printf 'normal recovered runtime accepted a retained preload\n' >&2
       return 1
     fi
+  )
+}
+
+test_unix_generation_runtime_contract_is_exact_and_sanitized() {
+  local -r result_dir="$TEST_TMP_DIR/unix-generation-runtime"
+  local -r output="$result_dir/runtime.txt"
+  local runtime_environment=$'OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT=unix\nOTEL_EBPF_JAVA_REMOTE_PARENT_TIMEOUT=30s'
+
+  mkdir -p -- "$result_dir"
+  (
+    RESULT_DIR="$result_dir"
+    COMPOSE=(test-compose)
+    PRIMARY_FAULT_COMPOSE=(test-fault-compose)
+    run_bounded() {
+      case "$*" in
+        *'ps --quiet obi') printf 'obi-container\n' ;;
+        *'docker inspect --format '*' obi-container') printf '%s\n' "$runtime_environment" ;;
+        *) return 1 ;;
+      esac
+    }
+    assert_unix_generation_mismatch_runtime_contract "$output"
+    [[ "$(<"$output")" == $'status=passed\ntransport=unix\ntimeout=30s' ]]
+    assert_obi_remote_parent_timeout 30s
+
+    rm -f -- "$output"
+    runtime_environment=$'OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT=unix\nOTEL_EBPF_JAVA_REMOTE_PARENT_TIMEOUT=50ms'
+    if assert_unix_generation_mismatch_runtime_contract "$output" \
+      >/dev/null 2>&1; then
+      printf 'Unix generation runtime accepted the base 50ms timeout\n' >&2
+      return 1
+    fi
+    [[ ! -e "$output" ]]
+    assert_obi_remote_parent_timeout 50ms
   )
 }
 
@@ -24024,6 +24230,7 @@ main() {
   test_w3c_fault_requires_forced_unix
   test_primary_w3c_stale_requires_forced_primary
   test_primary_generation_mismatch_requires_one_forced_primary
+  test_unix_generation_mismatch_requires_one_forced_unix
   test_auto_unavailable_requires_one_auto_request
   test_unix_w3c_stale_requires_forced_unix
   test_primary_w3c_fault_requires_forced_primary
@@ -24099,6 +24306,8 @@ main() {
   test_generation_process_identity_is_namespace_qualified
   test_generation_mismatch_mutation_spans_the_victim_take
   test_generation_take_fence_waits_for_the_fourth_attempt
+  test_unix_generation_mismatch_control_is_exact_and_bounded
+  test_unix_generation_target_dispatches_once
   test_primary_live_fd_descriptor_is_exact_and_bounded
   test_primary_live_fd_probe_result_is_exact
   test_primary_live_fd_barrier_consumption_accepts_empty_inode
@@ -24156,6 +24365,7 @@ main() {
   test_pipeline_dependencies_are_declared
   test_runtime_environment_line_matching
   test_primary_fault_runtime_contract_is_exact_and_base_is_clean
+  test_unix_generation_runtime_contract_is_exact_and_sanitized
   test_primary_live_fd_runtime_topology_is_exact
   test_benchmark_client_compose_topology_is_least_privilege
   test_extension_disabled_runtime_requires_explicit_false

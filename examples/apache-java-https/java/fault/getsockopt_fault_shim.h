@@ -41,4 +41,8 @@ obi_demo_java_remote_parent_auto_unavailable_health_count_for_test(void);
 unsigned int
 obi_demo_java_remote_parent_auto_unavailable_connect_count_for_test(void);
 unsigned int obi_demo_java_remote_parent_real_connect_count_for_test(void);
+void obi_demo_java_remote_parent_set_unix_generation_barrier_timeout_for_test(
+    int timeout_millis);
+void obi_demo_java_remote_parent_reset_real_send_call_count_for_test(void);
+unsigned int obi_demo_java_remote_parent_real_send_call_count_for_test(void);
 #endif

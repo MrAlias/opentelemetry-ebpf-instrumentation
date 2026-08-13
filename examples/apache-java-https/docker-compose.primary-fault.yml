@@ -1,4 +1,7 @@
 services:
+  obi:
+    environment:
+      OTEL_EBPF_JAVA_REMOTE_PARENT_TIMEOUT: ${OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TIMEOUT:?}
   java-backend:
     user: "0:0"
     environment:

@@ -1825,7 +1825,7 @@ func TestPrimaryW3CFaultRequestUsesW3CPrecedenceAndDiagnostics(t *testing.T) {
 	require.ErrorContains(t, err, "requires exactly one request")
 }
 
-func TestPrimaryFaultDiagnosticsRequireOneExpectedStatus(t *testing.T) {
+func TestReasonCodedFaultDiagnosticsRequireOneExpectedStatus(t *testing.T) {
 	baseline := javaDiagnosticsSnapshot(t, 0)
 	for _, test := range []struct {
 		status string
@@ -1837,11 +1837,11 @@ func TestPrimaryFaultDiagnosticsRequireOneExpectedStatus(t *testing.T) {
 			after := javaDiagnosticsSnapshotWithCounters(t, map[string]uint64{
 				"t_" + test.status: 1,
 			})
-			require.NoError(t, assertPrimaryFaultDiagnostics(baseline, after, test.status))
+			require.NoError(t, assertReasonCodedFaultDiagnostics(baseline, after, test.status))
 			require.ErrorContains(
 				t,
-				assertPrimaryFaultDiagnostics(baseline, baseline, test.status),
-				"expected one primary Java",
+				assertReasonCodedFaultDiagnostics(baseline, baseline, test.status),
+				"expected one reason-coded Java",
 			)
 		})
 	}
@@ -1851,9 +1851,75 @@ func TestPrimaryFaultDiagnosticsRequireOneExpectedStatus(t *testing.T) {
 	})
 	require.ErrorContains(
 		t,
-		assertPrimaryFaultDiagnostics(before, javaDiagnosticsSnapshot(t, 0), "malformed"),
+		assertReasonCodedFaultDiagnostics(before, javaDiagnosticsSnapshot(t, 0), "malformed"),
 		"decreased",
 	)
+}
+
+func TestUnixGenerationMismatchUsesOneReasonCodedW3CRequest(t *testing.T) {
+	baseline := javaDiagnosticsSnapshot(t, 0)
+	cfg := config{
+		scenario:              "unix-generation-mismatch",
+		faultMode:             "generation-mismatch",
+		javaDiagnosticsBefore: baseline,
+		seed:                  42,
+	}
+
+	require.NoError(t, validateFaultMode(cfg))
+	require.NoError(t, validateJavaDiagnosticsBefore(cfg))
+	requests, err := makeRequests(cfg)
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+
+	requestCase := requests[0]
+	assert.Equal(t, "generation-mismatch", requestCase.InjectedFaultMode)
+	assert.Equal(t, "already_consumed", requestCase.ExpectedJavaStatus)
+	assert.Equal(t, "/api/generation-fence", requestCase.Endpoint)
+	assert.Equal(t, 20_000, requestCase.GenerationFenceHoldMillis)
+	assert.Equal(t, "valid-w3c-unix-generation-mismatch-java-already-consumed", requestCase.W3CCase)
+	assert.Equal(t, "01", requestCase.W3CTraceFlags)
+	assert.NotEmpty(t, requestCase.W3CTraceID)
+	assert.NotEmpty(t, requestCase.W3CParentSpanID)
+	assert.True(t, requestCase.BridgeDiagnostics)
+	assert.True(t, requestCase.CloseConnection)
+	assert.Equal(t, tracecheck.ModeW3C, expectationFor(cfg, requestCase).Mode)
+
+	request, err := newHTTPRequest(
+		context.Background(),
+		config{baseURL: "https://example.test", scenario: cfg.scenario},
+		requestCase,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "/api/generation-fence", request.URL.Path)
+	assert.Equal(t, "20000", request.URL.Query().Get("generation_fence_hold_ms"))
+	assert.Equal(t, "1", request.URL.Query().Get("bridge_diagnostics"))
+
+	for _, faultMode := range []string{"", "bad-size", "timeout"} {
+		require.Error(t, validateFaultMode(config{
+			scenario:  "unix-generation-mismatch",
+			faultMode: faultMode,
+		}), faultMode)
+	}
+	require.ErrorContains(t, validateJavaDiagnosticsBefore(config{
+		scenario:  "unix-generation-mismatch",
+		faultMode: "generation-mismatch",
+	}), "requires --java-diagnostics-before")
+	_, err = makeRequests(config{
+		scenario:              "unix-generation-mismatch",
+		faultMode:             "generation-mismatch",
+		javaDiagnosticsBefore: baseline,
+		requestCount:          2,
+	})
+	require.ErrorContains(t, err, "requires exactly one request")
+
+	after := javaDiagnosticsSnapshotWithCounters(t, map[string]uint64{
+		"t_already_consumed": 1,
+	})
+	require.NoError(t, assertReasonCodedFaultDiagnostics(
+		baseline,
+		after,
+		"already_consumed",
+	))
 }
 
 func TestBridgeDiagnosticsHeaderIsRequiredOnlyForOptedInRequest(t *testing.T) {
@@ -1948,7 +2014,7 @@ func TestJavaDiagnosticsKeepsFrameworkAndTransportMissesDistinct(t *testing.T) {
 
 func TestFaultDiagnosticsAreExposedOnlyAtTheTopLevel(t *testing.T) {
 	snapshot := javaDiagnosticsSnapshot(t, 0)
-	for _, scenario := range []string{"w3c-fault", "primary-w3c-fault"} {
+	for _, scenario := range []string{"w3c-fault", "primary-w3c-fault", "unix-generation-mismatch"} {
 		t.Run(scenario, func(t *testing.T) {
 			var output bytes.Buffer
 			require.NoError(t, encodeRunResult(&output, &runResult{

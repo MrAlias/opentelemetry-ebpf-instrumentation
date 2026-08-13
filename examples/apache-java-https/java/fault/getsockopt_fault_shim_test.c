@@ -7,6 +7,7 @@
 
 #include "getsockopt_fault_shim.h"
 
+#include <arpa/inet.h>
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -58,6 +59,15 @@ enum {
   java_remote_parent_live_fd_barrier_wait_nanoseconds = 5000000,
   java_remote_parent_live_fd_barrier_non_matching_max_millis = 500,
   java_remote_parent_live_fd_barrier_max_timeout_millis = 1000,
+  java_remote_parent_unix_request_size = 24,
+  java_remote_parent_unix_version_offset = 4,
+  java_remote_parent_unix_size_offset = 6,
+  java_remote_parent_unix_operation_offset = 8,
+  java_remote_parent_unix_source_offset = 9,
+  java_remote_parent_unix_reserved_offset = 10,
+  java_remote_parent_unix_generation_barrier_timeout_millis = 100,
+  java_remote_parent_unix_generation_non_matching_timeout_millis = 1000,
+  java_remote_parent_unix_generation_max_timeout_millis = 1000,
   java_remote_parent_probe_native_unsupported = 1,
   java_remote_parent_probe_missing = 2,
   java_remote_parent_probe_unsafe = 3,
@@ -65,6 +75,8 @@ enum {
 
 static const char fault_file_environment[] =
     "OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_FILE";
+static const char unix_socket_path_test_environment[] =
+    "OBI_DEMO_JAVA_REMOTE_PARENT_UNIX_SOCKET_PATH_FOR_TEST";
 static const char java_remote_parent_magic[] = "OBIJ";
 static const char java_remote_parent_live_fd_barrier_mode[] = "live-fd-barrier";
 static const char java_remote_parent_auto_unavailable_mode[] =
@@ -73,10 +85,25 @@ static const char java_remote_parent_unix_socket_path[] =
     "/var/run/obi/java-remote-parent.sock";
 static const char java_remote_parent_live_fd_ready_prefix[] = "ready:";
 static const char java_remote_parent_live_fd_release_prefix[] = "release:";
+static const char java_remote_parent_unix_generation_barrier_mode[] =
+    "unix-generation-barrier\n";
+static const char java_remote_parent_unix_generation_ready[] =
+    "ready:unix-generation\n";
+static const char java_remote_parent_unix_generation_release[] =
+    "release:unix-generation\n";
 static char fault_file_path[] = "/tmp/obi-java-fault-shim.XXXXXX";
 static char fault_directory_path[] = "/tmp/obi-java-fault-shim-dir.XXXXXX";
 static char fault_hardlink_path[] = "/tmp/obi-java-fault-shim-hardlink.XXXXXX";
 static char fault_symlink_path[] = "/tmp/obi-java-fault-shim-link.XXXXXX";
+static char unix_socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+static char other_unix_socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+
+_Static_assert(sizeof(java_remote_parent_unix_generation_barrier_mode) - 1 ==
+                   java_remote_parent_unix_request_size,
+               "Unix generation barrier arm size changed");
+_Static_assert(sizeof(java_remote_parent_unix_generation_release) - 1 ==
+                   java_remote_parent_unix_request_size,
+               "Unix generation barrier release size changed");
 
 static void
 valid_response(unsigned char response[java_remote_parent_response_size]) {
@@ -198,6 +225,111 @@ static int64_t monotonic_millis(void) {
   struct timespec value;
   assert(clock_gettime(CLOCK_MONOTONIC, &value) == 0);
   return (int64_t)value.tv_sec * 1000 + value.tv_nsec / 1000000;
+}
+
+static void valid_unix_request(
+    unsigned char request[java_remote_parent_unix_request_size]) {
+  memset(request, 0, java_remote_parent_unix_request_size);
+  memcpy(request, "OBIQ", 4);
+  request[java_remote_parent_unix_version_offset] = 3;
+  request[java_remote_parent_unix_size_offset] =
+      java_remote_parent_unix_request_size;
+  request[java_remote_parent_unix_operation_offset] = 1;
+  request[java_remote_parent_unix_source_offset] = 1;
+  request[12] = 7;
+  request[16] = 9;
+}
+
+struct named_unix_pair {
+  int listener;
+  int client;
+  int server;
+  const char *path;
+};
+
+static struct named_unix_pair open_named_unix_pair(const char *path,
+                                                   int socket_type) {
+  struct named_unix_pair pair = {
+      .listener = -1,
+      .client = -1,
+      .server = -1,
+      .path = path,
+  };
+  struct sockaddr_un address;
+  memset(&address, 0, sizeof(address));
+  address.sun_family = AF_UNIX;
+  const size_t path_size = strlen(path) + 1;
+  assert(path_size <= sizeof(address.sun_path));
+  memcpy(address.sun_path, path, path_size);
+  const socklen_t address_length =
+      (socklen_t)(offsetof(struct sockaddr_un, sun_path) + path_size);
+
+  assert(unlink(path) == 0 || errno == ENOENT);
+  pair.listener = socket(AF_UNIX, socket_type | SOCK_CLOEXEC, 0);
+  assert(pair.listener >= 0);
+  assert(bind(pair.listener, (const struct sockaddr *)&address,
+              address_length) == 0);
+  assert(listen(pair.listener, 1) == 0);
+  pair.client = socket(AF_UNIX, socket_type | SOCK_CLOEXEC, 0);
+  assert(pair.client >= 0);
+  assert(connect(pair.client, (const struct sockaddr *)&address,
+                 address_length) == 0);
+  pair.server = accept(pair.listener, NULL, NULL);
+  assert(pair.server >= 0);
+  assert(fcntl(pair.server, F_SETFD, FD_CLOEXEC) == 0);
+  return pair;
+}
+
+static void close_named_unix_pair(struct named_unix_pair *pair) {
+  assert(close(pair->client) == 0);
+  assert(close(pair->server) == 0);
+  assert(close(pair->listener) == 0);
+  assert(unlink(pair->path) == 0);
+  pair->client = -1;
+  pair->server = -1;
+  pair->listener = -1;
+}
+
+static void receive_exact_bytes(int socket, const unsigned char *expected,
+                                size_t expected_length) {
+  unsigned char actual[64];
+  assert(expected_length <= sizeof(actual));
+  const ssize_t received = recv(socket, actual, sizeof(actual), 0);
+  assert(received == (ssize_t)expected_length);
+  assert(memcmp(actual, expected, expected_length) == 0);
+}
+
+struct unix_generation_send_attempt {
+  int socket;
+  unsigned char request[java_remote_parent_unix_request_size];
+  size_t length;
+  int flags;
+  _Atomic bool complete;
+  ssize_t result;
+  int error;
+};
+
+static void *send_unix_generation_request(void *argument) {
+  struct unix_generation_send_attempt *const attempt = argument;
+  attempt->result =
+      send(attempt->socket, attempt->request, attempt->length, attempt->flags);
+  attempt->error = errno;
+  atomic_store_explicit(&attempt->complete, true, memory_order_release);
+  return NULL;
+}
+
+static struct unix_generation_send_attempt
+unix_generation_send_attempt(int socket) {
+  struct unix_generation_send_attempt attempt = {
+      .socket = socket,
+      .length = java_remote_parent_unix_request_size,
+      .flags = MSG_NOSIGNAL,
+      .complete = false,
+      .result = 0,
+      .error = 0,
+  };
+  valid_unix_request(attempt.request);
+  return attempt;
 }
 
 static void test_missing_empty_and_invalid_controls_do_not_mutate(void) {
@@ -1108,6 +1240,328 @@ static void test_live_fd_barrier_times_out_boundedly(void) {
   assert(close(sockets[1]) == 0);
 }
 
+static void test_unix_generation_barrier_blocks_exact_send_until_release(void) {
+  struct named_unix_pair pair =
+      open_named_unix_pair(unix_socket_path, SOCK_STREAM);
+  set_fault_mode(java_remote_parent_unix_generation_barrier_mode);
+  obi_demo_java_remote_parent_set_unix_generation_barrier_timeout_for_test(
+      java_remote_parent_unix_generation_non_matching_timeout_millis);
+  obi_demo_java_remote_parent_reset_real_send_call_count_for_test();
+
+  struct unix_generation_send_attempt attempt =
+      unix_generation_send_attempt(pair.client);
+  const unsigned char expected[java_remote_parent_unix_request_size] = {
+      'O', 'B', 'I', 'Q', 3, 0, 24, 0, 1, 1, 0, 0,
+      7,   0,   0,   0,   9, 0, 0,  0, 0, 0, 0, 0,
+  };
+  pthread_t thread;
+  assert(pthread_create(&thread, NULL, send_unix_generation_request,
+                        &attempt) == 0);
+  wait_for_fault_file(java_remote_parent_unix_generation_ready);
+  assert(!atomic_load_explicit(&attempt.complete, memory_order_acquire));
+  assert(obi_demo_java_remote_parent_real_send_call_count_for_test() == 0);
+
+  overwrite_fault_mode_in_place(java_remote_parent_unix_generation_release);
+  assert(pthread_join(thread, NULL) == 0);
+  assert(attempt.result == java_remote_parent_unix_request_size);
+  assert(obi_demo_java_remote_parent_real_send_call_count_for_test() == 1);
+  receive_exact_bytes(pair.server, expected, sizeof(expected));
+  assert(fault_file_matches(""));
+
+  attempt = unix_generation_send_attempt(pair.client);
+  assert(send(attempt.socket, attempt.request, attempt.length, attempt.flags) ==
+         -1);
+  assert(errno == EBUSY);
+  assert(obi_demo_java_remote_parent_real_send_call_count_for_test() == 1);
+
+  set_fault_mode(NULL);
+  close_named_unix_pair(&pair);
+}
+
+static void test_unix_generation_barrier_rejects_concurrent_claimant(void) {
+  struct named_unix_pair pair =
+      open_named_unix_pair(unix_socket_path, SOCK_STREAM);
+  set_fault_mode(java_remote_parent_unix_generation_barrier_mode);
+  obi_demo_java_remote_parent_set_unix_generation_barrier_timeout_for_test(
+      java_remote_parent_unix_generation_non_matching_timeout_millis);
+  obi_demo_java_remote_parent_reset_real_send_call_count_for_test();
+
+  struct unix_generation_send_attempt first =
+      unix_generation_send_attempt(pair.client);
+  pthread_t thread;
+  assert(pthread_create(&thread, NULL, send_unix_generation_request, &first) ==
+         0);
+  wait_for_fault_file(java_remote_parent_unix_generation_ready);
+
+  struct unix_generation_send_attempt second =
+      unix_generation_send_attempt(pair.client);
+  const int64_t started = monotonic_millis();
+  assert(send(second.socket, second.request, second.length, second.flags) ==
+         -1);
+  assert(errno == EBUSY);
+  assert(monotonic_millis() - started <
+         java_remote_parent_live_fd_barrier_non_matching_max_millis);
+  assert(obi_demo_java_remote_parent_real_send_call_count_for_test() == 0);
+
+  overwrite_fault_mode_in_place(java_remote_parent_unix_generation_release);
+  assert(pthread_join(thread, NULL) == 0);
+  assert(first.result == java_remote_parent_unix_request_size);
+  receive_exact_bytes(pair.server, first.request, first.length);
+  set_fault_mode(NULL);
+  close_named_unix_pair(&pair);
+}
+
+static void test_unix_generation_barrier_path_replacement_cannot_release(void) {
+  struct named_unix_pair pair =
+      open_named_unix_pair(unix_socket_path, SOCK_STREAM);
+  set_fault_mode(java_remote_parent_unix_generation_barrier_mode);
+  obi_demo_java_remote_parent_set_unix_generation_barrier_timeout_for_test(
+      java_remote_parent_unix_generation_barrier_timeout_millis);
+  obi_demo_java_remote_parent_reset_real_send_call_count_for_test();
+
+  struct unix_generation_send_attempt attempt =
+      unix_generation_send_attempt(pair.client);
+  pthread_t thread;
+  assert(pthread_create(&thread, NULL, send_unix_generation_request,
+                        &attempt) == 0);
+  wait_for_fault_file(java_remote_parent_unix_generation_ready);
+
+  char replaced_path[sizeof(fault_file_path) + 16];
+  const int replaced_length = snprintf(replaced_path, sizeof(replaced_path),
+                                       "%s.replaced", fault_file_path);
+  assert(replaced_length > 0 &&
+         (size_t)replaced_length < sizeof(replaced_path));
+  assert(unlink(replaced_path) == 0 || errno == ENOENT);
+  assert(rename(fault_file_path, replaced_path) == 0);
+  set_fault_mode(java_remote_parent_unix_generation_release);
+
+  assert(pthread_join(thread, NULL) == 0);
+  assert(attempt.result == -1);
+  assert(attempt.error == ETIMEDOUT);
+  assert(obi_demo_java_remote_parent_real_send_call_count_for_test() == 0);
+  assert(fault_file_matches(java_remote_parent_unix_generation_release));
+  assert(unlink(replaced_path) == 0);
+
+  set_fault_mode(NULL);
+  close_named_unix_pair(&pair);
+}
+
+static void test_unix_generation_barrier_times_out_without_send(void) {
+  struct named_unix_pair pair =
+      open_named_unix_pair(unix_socket_path, SOCK_STREAM);
+  set_fault_mode(java_remote_parent_unix_generation_barrier_mode);
+  obi_demo_java_remote_parent_set_unix_generation_barrier_timeout_for_test(
+      java_remote_parent_unix_generation_barrier_timeout_millis);
+  obi_demo_java_remote_parent_reset_real_send_call_count_for_test();
+
+  unsigned char request[java_remote_parent_unix_request_size];
+  valid_unix_request(request);
+  const int64_t started = monotonic_millis();
+  assert(send(pair.client, request, sizeof(request), MSG_NOSIGNAL) == -1);
+  const int64_t elapsed = monotonic_millis() - started;
+  assert(errno == ETIMEDOUT);
+  assert(elapsed >= java_remote_parent_unix_generation_barrier_timeout_millis);
+  assert(elapsed < java_remote_parent_unix_generation_max_timeout_millis);
+  assert(obi_demo_java_remote_parent_real_send_call_count_for_test() == 0);
+  assert(fault_file_matches(java_remote_parent_unix_generation_ready));
+
+  assert(send(pair.client, request, sizeof(request), MSG_NOSIGNAL) == -1);
+  assert(errno == EBUSY);
+  assert(obi_demo_java_remote_parent_real_send_call_count_for_test() == 0);
+  overwrite_fault_mode_in_place(java_remote_parent_unix_generation_release);
+  assert(send(pair.client, request, sizeof(request), MSG_NOSIGNAL) == -1);
+  assert(errno == EBUSY);
+  assert(obi_demo_java_remote_parent_real_send_call_count_for_test() == 0);
+  set_fault_mode(NULL);
+  close_named_unix_pair(&pair);
+}
+
+static void assert_send_forwards(int client, int server,
+                                 const unsigned char *request, size_t length,
+                                 int flags) {
+  const unsigned int before =
+      obi_demo_java_remote_parent_real_send_call_count_for_test();
+  const ssize_t result = send(client, request, length, flags);
+  if (result != (ssize_t)length) {
+    fprintf(stderr,
+            "unexpected forwarded send result=%zd errno=%d length=%zu flags=%d "
+            "before=%u version=%u/%u size=%u/%u operation=%u source=%u "
+            "reserved=%u/%u\n",
+            result, errno, length, flags, before,
+            request[java_remote_parent_unix_version_offset],
+            request[java_remote_parent_unix_version_offset + 1],
+            request[java_remote_parent_unix_size_offset],
+            request[java_remote_parent_unix_size_offset + 1],
+            request[java_remote_parent_unix_operation_offset],
+            request[java_remote_parent_unix_source_offset],
+            request[java_remote_parent_unix_reserved_offset],
+            request[java_remote_parent_unix_reserved_offset + 1]);
+  }
+  assert(result == (ssize_t)length);
+  assert(obi_demo_java_remote_parent_real_send_call_count_for_test() ==
+         before + 1);
+  receive_exact_bytes(server, request, length);
+}
+
+static void assert_unix_generation_send_bypasses(int client, int server,
+                                                 const unsigned char *request,
+                                                 size_t length, int flags) {
+  set_fault_mode(java_remote_parent_unix_generation_barrier_mode);
+  assert_send_forwards(client, server, request, length, flags);
+  assert(fault_file_matches(java_remote_parent_unix_generation_barrier_mode));
+}
+
+static void
+test_unix_generation_barrier_matches_only_exact_frame_and_peer(void) {
+  struct named_unix_pair pair =
+      open_named_unix_pair(unix_socket_path, SOCK_STREAM);
+  obi_demo_java_remote_parent_set_unix_generation_barrier_timeout_for_test(
+      java_remote_parent_unix_generation_non_matching_timeout_millis);
+  obi_demo_java_remote_parent_reset_real_send_call_count_for_test();
+  unsigned char request[java_remote_parent_unix_request_size];
+  valid_unix_request(request);
+
+  const size_t offsets[] = {
+      0,
+      java_remote_parent_unix_version_offset,
+      java_remote_parent_unix_size_offset,
+      java_remote_parent_unix_operation_offset,
+      java_remote_parent_unix_source_offset,
+      java_remote_parent_unix_reserved_offset,
+      java_remote_parent_unix_reserved_offset + 1,
+  };
+  for (size_t index = 0; index < sizeof(offsets) / sizeof(offsets[0]);
+       index++) {
+    valid_unix_request(request);
+    request[offsets[index]]++;
+    assert_unix_generation_send_bypasses(pair.client, pair.server, request,
+                                         sizeof(request), MSG_NOSIGNAL);
+  }
+  valid_unix_request(request);
+  request[java_remote_parent_unix_version_offset + 1] = 1;
+  assert_unix_generation_send_bypasses(pair.client, pair.server, request,
+                                       sizeof(request), MSG_NOSIGNAL);
+  valid_unix_request(request);
+  request[java_remote_parent_unix_size_offset + 1] = 1;
+  assert_unix_generation_send_bypasses(pair.client, pair.server, request,
+                                       sizeof(request), MSG_NOSIGNAL);
+  valid_unix_request(request);
+  assert_unix_generation_send_bypasses(pair.client, pair.server, request,
+                                       sizeof(request) - 1, MSG_NOSIGNAL);
+  valid_unix_request(request);
+  assert_unix_generation_send_bypasses(pair.client, pair.server, request,
+                                       sizeof(request), 0);
+
+  struct named_unix_pair wrong_peer =
+      open_named_unix_pair(other_unix_socket_path, SOCK_STREAM);
+  valid_unix_request(request);
+  assert_unix_generation_send_bypasses(wrong_peer.client, wrong_peer.server,
+                                       request, sizeof(request), MSG_NOSIGNAL);
+
+  int unnamed[2];
+  assert(socketpair(AF_UNIX, SOCK_STREAM, 0, unnamed) == 0);
+  valid_unix_request(request);
+  assert_unix_generation_send_bypasses(unnamed[0], unnamed[1], request,
+                                       sizeof(request), MSG_NOSIGNAL);
+  assert(close(unnamed[0]) == 0);
+  assert(close(unnamed[1]) == 0);
+
+  close_named_unix_pair(&pair);
+
+  struct named_unix_pair seqpacket =
+      open_named_unix_pair(unix_socket_path, SOCK_SEQPACKET);
+  valid_unix_request(request);
+  assert_unix_generation_send_bypasses(seqpacket.client, seqpacket.server,
+                                       request, sizeof(request), MSG_NOSIGNAL);
+
+  int udp_server = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  int udp_client = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  assert(udp_server >= 0 && udp_client >= 0);
+  struct sockaddr_in address;
+  memset(&address, 0, sizeof(address));
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  assert(bind(udp_server, (const struct sockaddr *)&address, sizeof(address)) ==
+         0);
+  socklen_t address_length = sizeof(address);
+  assert(getsockname(udp_server, (struct sockaddr *)&address,
+                     &address_length) == 0);
+  assert(connect(udp_client, (const struct sockaddr *)&address,
+                 address_length) == 0);
+  valid_unix_request(request);
+  assert_unix_generation_send_bypasses(udp_client, udp_server, request,
+                                       sizeof(request), MSG_NOSIGNAL);
+  assert(close(udp_client) == 0);
+  assert(close(udp_server) == 0);
+
+  set_fault_mode(NULL);
+  close_named_unix_pair(&seqpacket);
+  close_named_unix_pair(&wrong_peer);
+}
+
+static void test_unix_generation_barrier_rejects_untrusted_controls(void) {
+  struct named_unix_pair pair =
+      open_named_unix_pair(unix_socket_path, SOCK_STREAM);
+  unsigned char request[java_remote_parent_unix_request_size];
+  valid_unix_request(request);
+  obi_demo_java_remote_parent_reset_real_send_call_count_for_test();
+
+  set_fault_mode(java_remote_parent_unix_generation_barrier_mode);
+  assert(chmod(fault_file_path,
+               java_remote_parent_fault_file_group_writable_mode) == 0);
+  assert_send_forwards(pair.client, pair.server, request, sizeof(request),
+                       MSG_NOSIGNAL);
+  assert(chmod(fault_file_path, java_remote_parent_fault_file_private_mode) ==
+         0);
+
+  set_fault_mode(java_remote_parent_unix_generation_barrier_mode);
+  assert(link(fault_file_path, fault_hardlink_path) == 0);
+  assert_send_forwards(pair.client, pair.server, request, sizeof(request),
+                       MSG_NOSIGNAL);
+  assert(unlink(fault_hardlink_path) == 0);
+
+  assert(symlink(fault_file_path, fault_symlink_path) == 0);
+  assert(setenv(fault_file_environment, fault_symlink_path, 1) == 0);
+  assert(send(pair.client, request, sizeof(request), MSG_NOSIGNAL) ==
+         (ssize_t)sizeof(request));
+  receive_exact_bytes(pair.server, request, sizeof(request));
+  assert(unlink(fault_symlink_path) == 0);
+  assert(setenv(fault_file_environment, fault_file_path, 1) == 0);
+
+  assert(setenv(fault_file_environment, fault_directory_path, 1) == 0);
+  assert_send_forwards(pair.client, pair.server, request, sizeof(request),
+                       MSG_NOSIGNAL);
+  assert(setenv(fault_file_environment, fault_symlink_path, 1) == 0);
+  assert(mkfifo(fault_symlink_path,
+                java_remote_parent_fault_file_private_mode) == 0);
+  assert_send_forwards(pair.client, pair.server, request, sizeof(request),
+                       MSG_NOSIGNAL);
+  assert(unlink(fault_symlink_path) == 0);
+  assert(setenv(fault_file_environment, fault_file_path, 1) == 0);
+
+  if (geteuid() == 0) {
+    set_fault_mode(java_remote_parent_unix_generation_barrier_mode);
+    assert(chown(fault_file_path, 65534, 65534) == 0);
+    assert_send_forwards(pair.client, pair.server, request, sizeof(request),
+                         MSG_NOSIGNAL);
+    assert(chown(fault_file_path, 0, 0) == 0);
+  }
+
+  char oversized[96 + 1];
+  memset(oversized, 'x', sizeof(oversized) - 1);
+  oversized[sizeof(oversized) - 1] = '\0';
+  set_fault_mode(oversized);
+  assert_send_forwards(pair.client, pair.server, request, sizeof(request),
+                       MSG_NOSIGNAL);
+  set_fault_mode("other-mode\n");
+  assert_send_forwards(pair.client, pair.server, request, sizeof(request),
+                       MSG_NOSIGNAL);
+  assert(fault_file_matches("other-mode\n"));
+
+  set_fault_mode(NULL);
+  close_named_unix_pair(&pair);
+}
+
 int main(void) {
   const char *const original_file = getenv(fault_file_environment);
   char *const saved_file = original_file == NULL ? NULL : strdup(original_file);
@@ -1125,6 +1579,16 @@ int main(void) {
   assert(close(symlink_descriptor) == 0);
   assert(unlink(fault_symlink_path) == 0);
   assert(setenv(fault_file_environment, fault_file_path, 1) == 0);
+  const int unix_path_length =
+      snprintf(unix_socket_path, sizeof(unix_socket_path),
+               "/tmp/obi-java-fault-shim-peer-%ld.sock", (long)getpid());
+  assert(unix_path_length > 0 &&
+         (size_t)unix_path_length < sizeof(unix_socket_path));
+  const int other_unix_path_length =
+      snprintf(other_unix_socket_path, sizeof(other_unix_socket_path),
+               "/tmp/obi-java-fault-shim-other-%ld.sock", (long)getpid());
+  assert(other_unix_path_length > 0 &&
+         (size_t)other_unix_path_length < sizeof(other_unix_socket_path));
 
   test_missing_empty_and_invalid_controls_do_not_mutate();
   test_version_mismatch_mode();
@@ -1141,6 +1605,14 @@ int main(void) {
   test_live_fd_barrier_blocks_exact_take_until_release();
   test_live_fd_barrier_ignores_non_matching_requests();
   test_live_fd_barrier_times_out_boundedly();
+  assert(setenv(unix_socket_path_test_environment, unix_socket_path, 1) == 0);
+  test_unix_generation_barrier_blocks_exact_send_until_release();
+  test_unix_generation_barrier_rejects_concurrent_claimant();
+  test_unix_generation_barrier_path_replacement_cannot_release();
+  test_unix_generation_barrier_times_out_without_send();
+  test_unix_generation_barrier_matches_only_exact_frame_and_peer();
+  test_unix_generation_barrier_rejects_untrusted_controls();
+  assert(unsetenv(unix_socket_path_test_environment) == 0);
 
   assert(unlink(fault_file_path) == 0);
   assert(rmdir(fault_directory_path) == 0);

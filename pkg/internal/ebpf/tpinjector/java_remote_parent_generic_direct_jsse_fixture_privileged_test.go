@@ -104,9 +104,9 @@ func loadJavaRemoteParentGenericDirectJSSEFixture(
 
 	replacements := javaRemoteParentGenericDirectJSSEMapReplacements(primary)
 	exactOwnerReplacements := map[string]*ebpf.Map{
-		"java_remote_parent_handoff_mutations": primary.JavaRemoteParentHandoffMutations,
-		"java_remote_parent_task_claims":       primary.JavaRemoteParentTaskClaims,
-		"java_thread_mapping_claims":           primary.JavaThreadMappingClaims,
+		"jrp_handoff_mut":                primary.JrpHandoffMut,
+		"java_remote_parent_task_claims": primary.JavaRemoteParentTaskClaims,
+		"java_thread_mapping_claims":     primary.JavaThreadMappingClaims,
 	}
 	for name, expected := range exactOwnerReplacements {
 		require.Samef(t, expected, replacements[name], "replacement %q", name)
@@ -309,7 +309,7 @@ func javaRemoteParentGenericDirectJSSEMapReplacements(
 		"java_remote_parent_generation_index":                      primary.JavaRemoteParentGenerationIndex,
 		"java_remote_parent_handoff_capture_workspace_storage":     primary.JavaRemoteParentHandoffCaptureWorkspaceStorage,
 		"java_remote_parent_handoff_claims":                        primary.JavaRemoteParentHandoffClaims,
-		"java_remote_parent_handoff_mutations":                     primary.JavaRemoteParentHandoffMutations,
+		"jrp_handoff_mut":                                          primary.JrpHandoffMut,
 		"java_remote_parent_handoffs":                              primary.JavaRemoteParentHandoffs,
 		"java_remote_parent_incoming_snapshot_storage":             primary.JavaRemoteParentIncomingSnapshotStorage,
 		"java_remote_parent_janitor_workspace_storage":             primary.JavaRemoteParentJanitorWorkspaceStorage,

@@ -23,7 +23,7 @@ var disabledBridgeMapNames = [...]string{
 	"java_remote_parent_fallback",
 	"java_remote_parent_generation_index",
 	"java_remote_parent_handoff_claims",
-	"java_remote_parent_handoff_mutations",
+	"jrp_handoff_mut",
 	"java_remote_parent_handoffs",
 	"java_remote_parent_owners",
 	"java_remote_parent_owner_guards",

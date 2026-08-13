@@ -778,7 +778,7 @@ func javaRemoteParentBenchmarkMaps(maps *BpfJavaRemoteParentMaps) javabridge.Map
 		OwnerGuards:         maps.JavaRemoteParentOwnerGuards,
 		Handoffs:            maps.JavaRemoteParentHandoffs,
 		HandoffClaims:       maps.JavaRemoteParentHandoffClaims,
-		HandoffMutations:    maps.JavaRemoteParentHandoffMutations,
+		HandoffMutations:    maps.JrpHandoffMut,
 		TaskClaims:          maps.JavaRemoteParentTaskClaims,
 		ThreadMappingClaims: maps.JavaThreadMappingClaims,
 		Retired:             maps.JavaRetiredProcesses,

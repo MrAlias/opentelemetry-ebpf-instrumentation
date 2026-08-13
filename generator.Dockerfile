@@ -47,7 +47,10 @@ export BPF2GO=/go/bin/bpf2go
 export BPF_CLANG=clang-22
 export BPF_CFLAGS="-O2 -g -Wall -Werror"
 export GOCACHE=/tmp/go-build
-make generate
+if [ "\$#" -eq 0 ]; then
+  set -- make generate/all
+fi
+exec "\$@"
 EOF
 
 RUN chmod +x /generate.sh

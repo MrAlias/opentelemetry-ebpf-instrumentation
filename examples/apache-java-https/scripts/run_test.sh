@@ -6243,6 +6243,10 @@ pressure_prepare_result() {
     "$token_base"
 }
 
+resolve_map_pressure_java_identity() {
+  printf '%064d 303 2026-08-13T00:00:00Z 101 202\n' 0
+}
+
 pressure_fill_result() {
   local -r token_base="$1"
 
@@ -6417,6 +6421,8 @@ test_map_pressure_prepare_fill_cleanup_transaction() {
     SCENARIO_SEED=1
     printf '%s\n' \
       'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' \
+      'obi_bpf_map_entries_total{map_id="43",map_name="jrp_handoff_mut",map_type="hash"} 0' \
+      'obi_bpf_map_entries_total{map_id="99",map_name="java_remote_par",map_type="hash"} 0' \
       'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} 3' \
       >"$RESULT_DIR/before.prom"
     SELECTED_TRANSPORT=getsockopt
@@ -6456,7 +6462,8 @@ test_map_pressure_prepare_fill_cleanup_transaction() {
       return 1
     }
     [[ "$(wc -l <"$command_log")" -eq 3 ]]
-    sed -n '1p' "$command_log" | grep -Fq -- '--mode prepare'
+    sed -n '1p' "$command_log" | grep -Fq -- \
+      '--process-pid 101 --process-namespace 202 --seed 1 --mode prepare'
     sed -n '2p' "$command_log" | grep -Fq -- \
       "--map-id 41 --expected-max-entries 10 --expected-process-map-id 42 --process-pid 101 --process-namespace 202 --token-base $token_base --seed 1 --mode fill"
     sed -n '3p' "$command_log" | grep -Fq -- \
@@ -6482,7 +6489,9 @@ test_map_pressure_pre_mutation_failures_do_not_fill() {
     mkdir -p -- "$RESULT_DIR"
     COMPOSE=(fake-compose)
     SCENARIO_SEED=1
-    : >"$RESULT_DIR/before.prom"
+    printf '%s\n' \
+      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' \
+      >"$RESULT_DIR/before.prom"
     run_bounded() {
       printf '%s\n' "$*" >>"$command_log"
       pressure_prepare_result 700
@@ -6498,6 +6507,43 @@ test_map_pressure_pre_mutation_failures_do_not_fill() {
     if grep -Fq -- '--mode fill' "$command_log" || \
       grep -Fq -- '--mode cleanup' "$command_log"; then
       printf 'map-pressure mutated state after invalid prepare evidence\n' >&2
+      return 1
+    fi
+  )
+
+  (
+    local -r command_log="$TEST_TMP_DIR/pressure-replaced-container.commands"
+    local -r identity_marker="$TEST_TMP_DIR/pressure-replaced-container.identity"
+
+    RESULT_DIR="$TEST_TMP_DIR/pressure-replaced-container"
+    mkdir -p -- "$RESULT_DIR"
+    COMPOSE=(fake-compose)
+    SCENARIO_SEED=1
+    printf '%s\n' \
+      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' \
+      >"$RESULT_DIR/before.prom"
+    resolve_map_pressure_java_identity() {
+      if [[ ! -e "$identity_marker" ]]; then
+        : >"$identity_marker"
+        printf '%064d 303 2026-08-13T00:00:00Z 101 202\n' 0
+      else
+        printf '%064d 404 2026-08-13T00:01:00Z 101 202\n' 1
+      fi
+    }
+    run_bounded() {
+      printf '%s\n' "$*" >>"$command_log"
+      pressure_prepare_result 700
+    }
+
+    SELECTED_TRANSPORT=getsockopt
+    if start_map_pressure pressure-test "$RESULT_DIR/before.prom" 1 >/dev/null 2>&1; then
+      printf 'map-pressure start accepted a replaced controlled JVM container\n' >&2
+      return 1
+    fi
+    [[ "$PRESSURE_ACTIVE" == "false" && "$(wc -l <"$command_log")" -eq 1 ]]
+    if grep -Fq -- '--mode fill' "$command_log" || \
+      grep -Fq -- '--mode cleanup' "$command_log"; then
+      printf 'map-pressure mutated state after controlled JVM replacement\n' >&2
       return 1
     fi
   )
@@ -20240,6 +20286,42 @@ test_demo_uses_only_explicit_tcp_context() {
   grep -Fqx '  disable_black_box_cp: true' "$obi_config"
 }
 
+test_obi_image_build_regenerates_bpf_hermetically() {
+  local -r repository_root="$TEST_SCRIPT_DIR/../../.."
+  local -r dockerignore="$repository_root/.dockerignore"
+  local -r generator="$repository_root/generator.Dockerfile"
+  local -r makefile="$repository_root/Makefile"
+  local pattern=""
+
+  for pattern in \
+    '**/*_bpfel.go' \
+    '**/*_bpfeb.go' \
+    '**/*_bpfel.o' \
+    '**/*_bpfeb.o' \
+    '**/*_bpfel.go.d' \
+    '**/*_bpfeb.go.d'; do
+    [[ "$(grep -Fxc -- "$pattern" "$dockerignore")" == 1 ]] || {
+      printf 'Docker build context admits ignored generated BPF input: %s\n' "$pattern" >&2
+      return 1
+    }
+  done
+  grep -Fqx '  set -- make generate/all' "$generator" || {
+    printf 'pinned generator does not force BPF regeneration by default\n' >&2
+    return 1
+  }
+  awk '
+    /^docker-generate:/ { in_target = 1; next }
+    in_target && /^[^[:space:]#][^:]*:/ { exit }
+    in_target && /--entrypoint \/bin\/sh/ { entrypoint++ }
+    in_target && /export BPF_CLANG=clang-22/ { clang++ }
+    in_target && /exec make generate\/all/ { forced++ }
+    END { exit entrypoint == 1 && clang == 1 && forced == 1 ? 0 : 1 }
+  ' "$makefile" || {
+    printf 'docker-generate no longer bypasses the pinned incremental entrypoint\n' >&2
+    return 1
+  }
+}
+
 test_demo_obi_lifecycle_timeouts_are_explicit() {
   local -r obi_config="$TEST_SCRIPT_DIR/../configs/obi.yaml"
   local -r compose_file="$TEST_SCRIPT_DIR/../docker-compose.yml"
@@ -23060,6 +23142,7 @@ main() {
   test_apache_diagnostic_denial_matrix_is_exact
   test_compatibility_matrix_lists_deployment_modes
   test_demo_uses_only_explicit_tcp_context
+  test_obi_image_build_regenerates_bpf_hermetically
   test_demo_obi_lifecycle_timeouts_are_explicit
   test_primary_live_fd_compose_topology_is_scoped
   test_unix_security_probe_topology_is_least_privilege

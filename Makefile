@@ -213,7 +213,7 @@ update-offsets:
 #                        Use after: git clean -dxf, initial clone, or when in doubt.
 #
 #   make docker-generate - Generate in Docker container (for reproducible builds)
-#                          Mounts workspace and runs 'make generate' inside container.
+#                          Mounts workspace and force-regenerates every eBPF artifact.
 #                          Image: $(GEN_IMG)
 #
 # How it works:
@@ -280,8 +280,14 @@ docker-generate:
 		-v "$$_git_common_dir:/src/.gitrepo:ro,z" \
 		-e GIT_DIR="/src/.gitrepo$${_git_dir#$$_git_common_dir}" \
 		-w /src \
+		--entrypoint /bin/sh \
 		$(GEN_IMG) \
-		make generate
+		-ec 'export PATH="/usr/lib/llvm22/bin:$$PATH"; \
+			export BPF2GO=/go/bin/bpf2go; \
+			export BPF_CLANG=clang-22; \
+			export BPF_CFLAGS="-O2 -g -Wall -Werror"; \
+			export GOCACHE=/tmp/go-build; \
+			exec make generate/all'
 
 .PHONY: verify
 verify: prereqs go-mod-tidy lint test license-header-check

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"syscall"
 	"testing"
 
@@ -75,12 +76,13 @@ func TestValidateConfigRequiresModeSpecificIdentity(t *testing.T) {
 		cfg     config
 		wantErr bool
 	}{
-		{name: "prepare", cfg: config{mode: "prepare"}},
+		{name: "prepare", cfg: config{mode: "prepare", processPID: 101, processNamespace: 202}},
 		{name: "fill", cfg: validFill},
 		{name: "cleanup", cfg: validCleanup},
 		{name: "invalid mode", cfg: config{mode: "invalid"}, wantErr: true},
-		{name: "prepare map identity", cfg: config{mode: "prepare", mapID: 41}, wantErr: true},
-		{name: "prepare process identity", cfg: config{mode: "prepare", processPID: 101}, wantErr: true},
+		{name: "prepare missing process identity", cfg: config{mode: "prepare"}, wantErr: true},
+		{name: "prepare partial process identity", cfg: config{mode: "prepare", processPID: 101}, wantErr: true},
+		{name: "prepare map identity", cfg: config{mode: "prepare", mapID: 41, processPID: 101, processNamespace: 202}, wantErr: true},
 		{name: "missing map ID", cfg: func() config { cfg := validFill; cfg.mapID = 0; return cfg }(), wantErr: true},
 		{name: "missing capacity", cfg: func() config { cfg := validFill; cfg.expectedMaxEntries = 0; return cfg }(), wantErr: true},
 		{name: "missing process map ID", cfg: func() config { cfg := validFill; cfg.expectedProcessMapID = 0; return cfg }(), wantErr: true},
@@ -88,7 +90,7 @@ func TestValidateConfigRequiresModeSpecificIdentity(t *testing.T) {
 		{name: "missing process namespace", cfg: func() config { cfg := validFill; cfg.processNamespace = 0; return cfg }(), wantErr: true},
 		{name: "missing token base", cfg: func() config { cfg := validFill; cfg.tokenBase = 0; return cfg }(), wantErr: true},
 		{name: "cleanup process map ID", cfg: func() config { cfg := validCleanup; cfg.expectedProcessMapID = 42; return cfg }(), wantErr: true},
-		{name: "capacity too large", cfg: config{mode: "prepare", expectedMaxEntries: maxPressureEntries + 1}, wantErr: true},
+		{name: "capacity too large", cfg: config{mode: "fill", mapID: 41, expectedMaxEntries: maxPressureEntries + 1, expectedProcessMapID: 42, processPID: 101, processNamespace: 202, tokenBase: 700}, wantErr: true},
 	}
 
 	for _, test := range tests {
@@ -250,17 +252,35 @@ func TestValidateTargetRequiresExactHandoffClaimMapShape(t *testing.T) {
 
 func TestMatchesProcessMapRequiresExactIncarnationMapShape(t *testing.T) {
 	valid := &ebpf.MapInfo{
-		Type:       ebpf.LRUHash,
+		Type:       ebpf.Hash,
 		KeySize:    processKeySize,
 		ValueSize:  processValueSize,
 		MaxEntries: 64,
 		Name:       processKernelName,
 	}
 	assert.True(t, matchesProcessMap(valid))
+	wrongType := *valid
+	wrongType.Type = ebpf.LRUHash
+	assert.False(t, matchesProcessMap(&wrongType))
 
 	wrongKey := *valid
 	wrongKey.KeySize++
 	assert.False(t, matchesProcessMap(&wrongKey))
+}
+
+func TestMatchesTargetRejectsSameShapeMutationMap(t *testing.T) {
+	claims := &ebpf.MapInfo{
+		Type:       ebpf.Hash,
+		KeySize:    targetKeySize,
+		ValueSize:  targetValueSize,
+		MaxEntries: 64,
+		Name:       targetKernelName,
+	}
+	assert.True(t, matchesTarget(claims))
+
+	mutation := *claims
+	mutation.Name = "jrp_handoff_mut"
+	assert.False(t, matchesTarget(&mutation))
 }
 
 func TestAddRelatedMapIDsIncludesOnlyTargetPrograms(t *testing.T) {
@@ -313,6 +333,187 @@ func TestSelectRelatedMapIDRejectsMissingProgramRelatedProcessMap(t *testing.T) 
 	require.EqualError(t, err, "no process map is related to target map ID 41")
 }
 
+type fakePressureMap struct {
+	info       *ebpf.MapInfo
+	infoErr    error
+	lookup     func(key, value interface{}) error
+	closeCalls int
+}
+
+func (m *fakePressureMap) Info() (*ebpf.MapInfo, error) {
+	return m.info, m.infoErr
+}
+
+func (m *fakePressureMap) Lookup(key, value interface{}) error {
+	if m.lookup == nil {
+		return ebpf.ErrKeyNotExist
+	}
+	return m.lookup(key, value)
+}
+
+func (m *fakePressureMap) Close() error {
+	m.closeCalls++
+	return nil
+}
+
+func TestDiscoverPressureMapsScopesToUniqueLiveControlledJVMSet(t *testing.T) {
+	processInfo := &ebpf.MapInfo{
+		Type: ebpf.Hash, KeySize: processKeySize, ValueSize: processValueSize,
+		Name: processKernelName,
+	}
+	unrelatedInfo := &ebpf.MapInfo{Type: ebpf.Array, KeySize: 4, ValueSize: 8, Name: "other"}
+	orphan := &fakePressureMap{info: processInfo}
+	unrelated := &fakePressureMap{info: unrelatedInfo}
+	selected := &fakePressureMap{info: processInfo}
+	target := &fakePressureMap{info: &ebpf.MapInfo{
+		Type: ebpf.Hash, KeySize: targetKeySize, ValueSize: targetValueSize,
+		Name: targetKernelName,
+	}}
+	var lookedUpKeys [][processKeySize]byte
+	lookup := func(key, value interface{}) error {
+		gotKey := key.([processKeySize]byte)
+		lookedUpKeys = append(lookedUpKeys, gotKey)
+		binary.LittleEndian.PutUint64(value.(*[processValueSize]byte)[:], 303)
+		return nil
+	}
+	orphan.lookup = lookup
+	selected.lookup = lookup
+	discovery := pressureMapDiscovery{
+		nextMapID: mapIDSequence(10, 20, 30),
+		openMap: func(id ebpf.MapID) (pressureMapHandle, error) {
+			switch id {
+			case 10:
+				return orphan, nil
+			case 20:
+				return unrelated, nil
+			case 30:
+				return selected, nil
+			default:
+				return nil, os.ErrNotExist
+			}
+		},
+		relatedTarget: func(id ebpf.MapID) (pressureMapHandle, ebpf.MapID, error) {
+			if id == 10 {
+				return nil, 0, fmt.Errorf("%w: map ID %d", errMapNotReferenced, id)
+			}
+			require.Equal(t, ebpf.MapID(30), id)
+			return target, 31, nil
+		},
+	}
+
+	processes, processID, claims, claimsID, identity, err :=
+		discoverPressureMapsForIdentity(discovery, 101, 202)
+
+	require.NoError(t, err)
+	assert.Same(t, selected, processes)
+	assert.Equal(t, ebpf.MapID(30), processID)
+	assert.Same(t, target, claims)
+	assert.Equal(t, ebpf.MapID(31), claimsID)
+	assert.Equal(t, processIdentity{pid: 101, namespace: 202, incarnation: 303}, identity)
+	require.Len(t, lookedUpKeys, 3)
+	for _, key := range lookedUpKeys {
+		assert.EqualValues(t, 101, binary.LittleEndian.Uint32(key[0:4]))
+		assert.EqualValues(t, 101, binary.LittleEndian.Uint32(key[4:8]))
+		assert.EqualValues(t, 202, binary.LittleEndian.Uint32(key[8:12]))
+	}
+	assert.Equal(t, 1, orphan.closeCalls)
+	assert.Equal(t, 1, unrelated.closeCalls)
+	assert.Zero(t, selected.closeCalls)
+	assert.Zero(t, target.closeCalls)
+	require.NoError(t, processes.Close())
+	require.NoError(t, claims.Close())
+}
+
+func TestDiscoverPressureMapsRejectsMultipleLiveControlledJVMSets(t *testing.T) {
+	processInfo := &ebpf.MapInfo{
+		Type: ebpf.Hash, KeySize: processKeySize, ValueSize: processValueSize,
+		Name: processKernelName,
+	}
+	first := &fakePressureMap{info: processInfo, lookup: processIdentityLookup(303)}
+	second := &fakePressureMap{info: processInfo, lookup: processIdentityLookup(404)}
+	firstTarget := &fakePressureMap{info: &ebpf.MapInfo{Name: targetKernelName}}
+	secondTarget := &fakePressureMap{info: &ebpf.MapInfo{Name: targetKernelName}}
+	discovery := pressureMapDiscovery{
+		nextMapID: mapIDSequence(10, 20),
+		openMap: func(id ebpf.MapID) (pressureMapHandle, error) {
+			if id == 10 {
+				return first, nil
+			}
+			return second, nil
+		},
+		relatedTarget: func(id ebpf.MapID) (pressureMapHandle, ebpf.MapID, error) {
+			if id == 10 {
+				return firstTarget, 11, nil
+			}
+			return secondTarget, 21, nil
+		},
+	}
+
+	_, _, _, _, _, err := discoverPressureMapsForIdentity(discovery, 101, 202)
+
+	require.EqualError(t, err, "multiple live map sets contain the controlled JVM")
+	assert.Equal(t, 1, first.closeCalls)
+	assert.Equal(t, 1, second.closeCalls)
+	assert.Equal(t, 1, firstTarget.closeCalls)
+	assert.Equal(t, 1, secondTarget.closeCalls)
+}
+
+func TestDiscoverPressureMapsRejectsIdentityChangeBeforeReturn(t *testing.T) {
+	process := &fakePressureMap{info: &ebpf.MapInfo{
+		Type: ebpf.Hash, KeySize: processKeySize, ValueSize: processValueSize,
+		Name: processKernelName,
+	}}
+	lookupCalls := 0
+	process.lookup = func(key, value interface{}) error {
+		lookupCalls++
+		incarnation := uint64(303)
+		if lookupCalls > 1 {
+			incarnation = 404
+		}
+		return processIdentityLookup(incarnation)(key, value)
+	}
+	target := &fakePressureMap{info: &ebpf.MapInfo{Name: targetKernelName}}
+	discovery := pressureMapDiscovery{
+		nextMapID: mapIDSequence(10),
+		openMap: func(ebpf.MapID) (pressureMapHandle, error) {
+			return process, nil
+		},
+		relatedTarget: func(ebpf.MapID) (pressureMapHandle, ebpf.MapID, error) {
+			return target, 11, nil
+		},
+	}
+
+	_, _, _, _, _, err := discoverPressureMapsForIdentity(discovery, 101, 202)
+
+	require.EqualError(t, err, "controlled JVM identity changed during map discovery")
+	assert.Equal(t, 1, process.closeCalls)
+	assert.Equal(t, 1, target.closeCalls)
+}
+
+func mapIDSequence(ids ...ebpf.MapID) func(ebpf.MapID) (ebpf.MapID, error) {
+	return func(current ebpf.MapID) (ebpf.MapID, error) {
+		for _, id := range ids {
+			if id > current {
+				return id, nil
+			}
+		}
+		return 0, os.ErrNotExist
+	}
+}
+
+func processIdentityLookup(incarnation uint64) func(key, value interface{}) error {
+	return func(key, value interface{}) error {
+		got := key.([processKeySize]byte)
+		if binary.LittleEndian.Uint32(got[0:4]) != 101 ||
+			binary.LittleEndian.Uint32(got[4:8]) != 101 ||
+			binary.LittleEndian.Uint32(got[8:12]) != 202 {
+			return ebpf.ErrKeyNotExist
+		}
+		binary.LittleEndian.PutUint64(value.(*[processValueSize]byte)[:], incarnation)
+		return nil
+	}
+}
+
 func TestVerifySyntheticEntriesPresentRequiresEveryKey(t *testing.T) {
 	identity := processIdentity{pid: 101, namespace: 202}
 	tokenBase := uint64(700)
@@ -363,39 +564,93 @@ func TestCapacityRejectionRecognizesKernelHashMapErrors(t *testing.T) {
 	assert.False(t, isCapacityRejection(ebpf.ErrKeyExist))
 }
 
-func TestVerifySyntheticEntriesAbsentRequiresEveryKeyMissing(t *testing.T) {
+func TestCleanupSyntheticEntriesUsesFullLiveIncarnationKeys(t *testing.T) {
 	identity := processIdentity{pid: 101, namespace: 202}
-	verified, err := verifySyntheticEntriesAbsent(
-		identity,
-		700,
-		3,
-		func([]byte) error { return ebpf.ErrKeyNotExist },
-	)
-	require.NoError(t, err)
-	assert.EqualValues(t, 3, verified)
-
-	_, err = verifySyntheticEntriesAbsent(
-		identity,
-		700,
-		3,
-		func(key []byte) error {
-			if binary.LittleEndian.Uint64(key[8:16]) == 701 {
-				return nil
+	matchingIdentity := processIdentity{pid: 101, namespace: 202, incarnation: 303}
+	otherIncarnation := processIdentity{pid: 101, namespace: 202, incarnation: 404}
+	otherProcess := processIdentity{pid: 102, namespace: 202, incarnation: 303}
+	entries := []targetEntry{
+		targetEntryForTest(matchingIdentity, 700),
+		targetEntryForTest(otherIncarnation, 701),
+		targetEntryForTest(otherIncarnation, 699),
+		targetEntryForTest(otherIncarnation, 703),
+		targetEntryForTest(otherProcess, 700),
+	}
+	deleted := make(map[[targetKeySize]byte]struct{})
+	collect := func() ([]targetEntry, error) {
+		remaining := make([]targetEntry, 0, len(entries))
+		for _, entry := range entries {
+			if _, found := deleted[entry.key]; !found {
+				remaining = append(remaining, entry)
 			}
-			return ebpf.ErrKeyNotExist
+		}
+		return remaining, nil
+	}
+
+	touched, verified, err := cleanupSyntheticEntries(
+		identity,
+		700,
+		3,
+		collect,
+		func(key []byte) error {
+			var exact [targetKeySize]byte
+			copy(exact[:], key)
+			deleted[exact] = struct{}{}
+			return nil
 		},
 	)
-	require.EqualError(t, err, "synthetic entry 1 remains after cleanup")
+
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, touched)
+	assert.EqualValues(t, 3, verified)
+	assert.Len(t, deleted, 2)
+	assert.NotContains(t, deleted, entries[2].key)
+	assert.NotContains(t, deleted, entries[3].key)
+	assert.NotContains(t, deleted, entries[4].key)
 }
 
-func TestVerifySyntheticEntriesAbsentRejectsLookupErrors(t *testing.T) {
-	lookupErr := errors.New("lookup failed")
-	_, err := verifySyntheticEntriesAbsent(
-		processIdentity{pid: 101, namespace: 202},
-		700,
-		1,
-		func([]byte) error { return lookupErr },
+func TestCleanupSyntheticEntriesRejectsInvalidInRangeEntry(t *testing.T) {
+	identity := processIdentity{pid: 101, namespace: 202}
+	valid := targetEntryForTest(
+		processIdentity{pid: 101, namespace: 202, incarnation: 303}, 700,
 	)
+	tests := map[string]func(*targetEntry){
+		"zero key incarnation": func(entry *targetEntry) {
+			binary.LittleEndian.PutUint64(entry.key[16:24], 0)
+		},
+		"mismatched value incarnation": func(entry *targetEntry) {
+			binary.LittleEndian.PutUint64(entry.value[8:16], 404)
+		},
+		"closed ticket": func(entry *targetEntry) {
+			binary.LittleEndian.PutUint64(entry.value[0:8], 12345)
+		},
+		"open tag without monotime": func(entry *targetEntry) {
+			binary.LittleEndian.PutUint64(entry.value[0:8], handoffOpenTag)
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			invalid := valid
+			mutate(&invalid)
+			deleteCalled := false
 
-	require.ErrorIs(t, err, lookupErr)
+			_, _, err := cleanupSyntheticEntries(
+				identity,
+				700,
+				3,
+				func() ([]targetEntry, error) { return []targetEntry{invalid}, nil },
+				func([]byte) error { deleteCalled = true; return nil },
+			)
+
+			require.EqualError(t, err, "synthetic entry has an invalid incarnation or ticket")
+			assert.False(t, deleteCalled)
+		})
+	}
+}
+
+func targetEntryForTest(identity processIdentity, token uint64) targetEntry {
+	var entry targetEntry
+	copy(entry.key[:], syntheticKey(identity, token, 0))
+	copy(entry.value[:], claimValue(12345, identity.incarnation))
+	return entry
 }

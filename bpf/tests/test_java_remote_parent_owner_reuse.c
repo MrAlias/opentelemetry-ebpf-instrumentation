@@ -777,7 +777,7 @@ static void *test_map_lookup(void *map, const void *key) {
         }
         return entry ? &entry->value : NULL;
     }
-    if (map == &java_remote_parent_handoff_mutations) {
+    if (map == &jrp_handoff_mut) {
         handoff_claim_entry_t *entry = find_handoff_mutation(key);
         return entry ? &entry->value : NULL;
     }
@@ -1151,7 +1151,7 @@ test_map_update(void *map, const void *key, const void *value, unsigned long lon
     if (map == &java_remote_parent_handoff_claims) {
         return update_handoff_claim(key, value, flags);
     }
-    if (map == &java_remote_parent_handoff_mutations) {
+    if (map == &jrp_handoff_mut) {
         if (flags != BPF_NOEXIST || find_handoff_mutation(key)) {
             return -1;
         }
@@ -1482,7 +1482,7 @@ static long test_map_delete(void *map, const void *key) {
         entry->present = 0;
         return 0;
     }
-    if (map == &java_remote_parent_handoff_mutations) {
+    if (map == &jrp_handoff_mut) {
         handoff_claim_entry_t *entry = find_handoff_mutation(key);
         if (!entry) {
             return -1;

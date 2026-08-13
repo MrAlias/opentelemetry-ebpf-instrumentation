@@ -171,14 +171,17 @@ or credential topology; do not mark it pass.
   server timeouts, and sanitized attributes. The demo uses smaller 10,000-span,
   4 KiB-string, and 64 MiB aggregate limits. Count, value, and aggregate drops
   are reason-coded in assertion snapshots and fail the scenario.
-- The pressure helper is an acceptance-only privileged container. It requires
-  one exact live claim map and one unambiguous nonzero JVM-incarnation entry,
-  matched by kernel-visible name, type, key/value shape, and optional map ID.
-  It refuses ambiguous matches, bounds accepted capacity, uses fresh monotonic
-  timestamps, and never emits the incarnation capability. Cleanup uses the
-  captured non-secret PID, namespace, and random per-run token base to
-  reconstruct only its synthetic keys, verifies each key is absent afterward,
-  and remains possible after the JVM identity entry disappears.
+- The pressure helper is an acceptance-only privileged container. Preparation
+  point-lookups the controlled JVM's exact PID and PID-namespace identity, then
+  requires one live program-related process-map and handoff-claim-map pair.
+  Foreign and orphan map sets are ignored; multiple valid pairs fail closed.
+  The harness binds that result to a stable Docker container identity and uses
+  only the returned claim-map ID for host-global metric lookup. The helper
+  bounds accepted capacity, uses fresh monotonic timestamps, and never emits
+  the JVM incarnation capability. Cleanup instead scans only the captured PID,
+  namespace, and random per-run token range, validates each matching key's
+  incarnation and open ticket, deletes the exact full keys, and verifies that
+  no key in that bounded range remains after the JVM identity entry disappears.
 - The Unix fault responder is an acceptance-only, single-request-at-a-time
   service with named stale/malformed, timeout, disconnect, overload,
   truncation, envelope, version, and zero-ID modes. It uses strict request ABI

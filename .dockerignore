@@ -11,3 +11,11 @@ pkg/internal/java/**/out/
 pkg/internal/java/loader/src/main/resources/agent/
 examples/apache-java-https/.runtime/
 .git/objects/
+# Never let ignored, locally generated eBPF artifacts short-circuit the pinned
+# generator used by the image build.
+**/*_bpfel.go
+**/*_bpfeb.go
+**/*_bpfel.o
+**/*_bpfeb.o
+**/*_bpfel.go.d
+**/*_bpfeb.go.d

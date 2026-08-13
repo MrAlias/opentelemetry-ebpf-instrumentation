@@ -431,7 +431,7 @@ struct {
     __type(value, java_remote_parent_handoff_claim_t);
     __uint(max_entries, MAX_CONCURRENT_REQUESTS);
     __uint(pinning, OBI_PIN_INTERNAL);
-} java_remote_parent_handoff_mutations SEC(".maps");
+} jrp_handoff_mut SEC(".maps");
 
 struct {
     // Non-evicting admission tickets for H. A publisher reserves tagged OPEN
@@ -470,13 +470,12 @@ java_remote_parent_acquire_handoff_mutation(const java_remote_parent_handoff_key
         .process_incarnation = process_capability,
     };
     if (!local_claim->observed_monotime_ns ||
-        bpf_map_update_elem(&java_remote_parent_handoff_mutations, key, local_claim, BPF_NOEXIST) !=
-            0) {
+        bpf_map_update_elem(&jrp_handoff_mut, key, local_claim, BPF_NOEXIST) != 0) {
         __builtin_memset(local_claim, 0, sizeof(*local_claim));
         return 0;
     }
     const java_remote_parent_handoff_claim_t *published =
-        bpf_map_lookup_elem(&java_remote_parent_handoff_mutations, key);
+        bpf_map_lookup_elem(&jrp_handoff_mut, key);
     if (!java_remote_parent_task_claim_equal(published, local_claim)) {
         __builtin_memset(local_claim, 0, sizeof(*local_claim));
         return 0;
@@ -489,10 +488,9 @@ static __always_inline u8 java_remote_parent_release_handoff_mutation(
     if (!key || !local_claim || !local_claim->observed_monotime_ns) {
         return 0;
     }
-    const java_remote_parent_handoff_claim_t *current =
-        bpf_map_lookup_elem(&java_remote_parent_handoff_mutations, key);
+    const java_remote_parent_handoff_claim_t *current = bpf_map_lookup_elem(&jrp_handoff_mut, key);
     if (!java_remote_parent_task_claim_equal(current, local_claim) ||
-        bpf_map_delete_elem(&java_remote_parent_handoff_mutations, key) != 0) {
+        bpf_map_delete_elem(&jrp_handoff_mut, key) != 0) {
         return 0;
     }
     __builtin_memset(local_claim, 0, sizeof(*local_claim));

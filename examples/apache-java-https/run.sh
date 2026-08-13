@@ -7391,6 +7391,45 @@ stop_map_pressure_monitor() {
   fi
 }
 
+resolve_map_pressure_java_identity() {
+  local java_container=""
+  local inspection_before=""
+  local inspection_after=""
+  local inspected_container=""
+  local host_pid=""
+  local started_at=""
+  local identity=""
+  local process_pid=""
+  local process_namespace=""
+  local extra=""
+
+  java_container="$(run_bounded 10 "${COMPOSE[@]}" ps --quiet java-backend)" || return $?
+  [[ -n "$java_container" ]] || {
+    log_error "Java backend container identity is unavailable for map pressure"
+    return 1
+  }
+  inspection_before="$(run_bounded 10 docker inspect \
+    --format '{{.Id}} {{.State.Pid}} {{.State.StartedAt}}' "$java_container")" || return $?
+  read -r inspected_container host_pid started_at extra <<<"$inspection_before" || return $?
+  [[ "$inspected_container" == "$java_container" && "$host_pid" =~ ^[1-9][0-9]*$ && \
+    -n "$started_at" && "$started_at" != "0001-01-01T00:00:00Z" && -z "$extra" ]] || return 1
+  identity="$(resolve_container_process_namespace_identity "$java_container")" || return $?
+  read -r process_pid process_namespace extra <<<"$identity" || return $?
+  [[ -z "$extra" ]] || return 1
+  inspection_after="$(run_bounded 10 docker inspect \
+    --format '{{.Id}} {{.State.Pid}} {{.State.StartedAt}}' "$java_container")" || return $?
+  [[ "$inspection_after" == "$inspection_before" ]] || {
+    log_error "the controlled JVM changed while resolving map-pressure identity"
+    return 1
+  }
+  printf '%s %s %s %s %s\n' \
+    "$inspected_container" \
+    "$host_pid" \
+    "$started_at" \
+    "$process_pid" \
+    "$process_namespace"
+}
+
 start_map_pressure() {
   local -r label="$1"
   local -r baseline_metrics="$2"
@@ -7421,6 +7460,14 @@ start_map_pressure() {
   local prepare_status=0
   local fill_status=0
   local start_status=0
+  local java_identity=""
+  local java_container_id=""
+  local java_host_pid=""
+  local java_started_at=""
+  local java_process_pid=""
+  local java_process_namespace=""
+  local confirmed_java_identity=""
+  local inspection_extra=""
 
   if [[ "$PRESSURE_ACTIVE" == "true" ]]; then
     log_error "refusing to start map pressure while a prior cleanup is pending"
@@ -7446,12 +7493,28 @@ start_map_pressure() {
   PRESSURE_MONITOR_FINAL_OUTPUT=""
   PRESSURE_MONITOR_STATUS=0
   PRESSURE_INJECT_TARGET=""
+  java_identity="$(resolve_map_pressure_java_identity)" || return $?
+  read -r \
+    java_container_id \
+    java_host_pid \
+    java_started_at \
+    java_process_pid \
+    java_process_namespace \
+    inspection_extra <<<"$java_identity" || return $?
+  [[ "$java_container_id" =~ ^[a-f0-9]{64}$ && \
+    "$java_host_pid" =~ ^[1-9][0-9]*$ && \
+    -n "$java_started_at" && \
+    "$java_process_pid" =~ ^[1-9][0-9]*$ && \
+    "$java_process_namespace" =~ ^[1-9][0-9]*$ && \
+    -z "$inspection_extra" ]] || return 1
   prepare_output="$RESULT_DIR/map-pressure-$label-prepare.json"
   prepare_stderr="$RESULT_DIR/map-pressure-$label-prepare.stderr.log"
   if run_map_pressure_helper \
     "$prepare_output" \
     "$prepare_stderr" \
     "$PRESSURE_HELPER_TIMEOUT_SECONDS" \
+    --process-pid "$java_process_pid" \
+    --process-namespace "$java_process_namespace" \
     --seed "$PRESSURE_SEED" \
     --mode prepare; then
     prepare_status=0
@@ -7465,6 +7528,11 @@ start_map_pressure() {
     log_error "map-pressure prepare output does not match the exact evidence contract"
     return 1
   fi
+  confirmed_java_identity="$(resolve_map_pressure_java_identity)" || return $?
+  [[ "$confirmed_java_identity" == "$java_identity" ]] || {
+    log_error "the controlled JVM changed during map-pressure preparation"
+    return 1
+  }
   prepare_map_id="$(pressure_result_bounded_uint \
     "$prepare_output" map_id "$MAX_UINT32_DECIMAL" false)" || {
     log_error "map-pressure prepare returned an invalid map ID"
@@ -7499,15 +7567,23 @@ start_map_pressure() {
   resolved="$(pressure_map_metric \
     "$baseline_metrics" \
     obi_bpf_map_entries_total \
-    "$prepare_map_id")"
+    "$prepare_map_id")" || {
+    log_error "pre-fill handoff-claim occupancy is unavailable for the prepared map"
+    return 1
+  }
   baseline_map_id="${resolved%% *}"
   baseline_entries="${resolved#* }"
+  baseline_entries="$(bounded_decimal \
+    "$baseline_entries" "$PRESSURE_MAX_ENTRIES" true)" || {
+    log_error "pre-fill handoff-claim occupancy is invalid"
+    return 1
+  }
+
   if [[ "$baseline_map_id" != "$prepare_map_id" ]] || \
-    ! baseline_entries="$(bounded_decimal \
-      "$baseline_entries" \
-      "$((prepare_max_entries - 1))" \
-      true)"; then
-    log_error "pre-fill handoff-claim occupancy is unavailable or not below capacity"
+    [[ "$prepare_process_pid" != "$java_process_pid" ]] || \
+    [[ "$prepare_process_namespace" != "$java_process_namespace" ]] || \
+    ((baseline_entries >= prepare_max_entries)); then
+    log_error "map-pressure prepare did not preserve the scoped map identity and capacity"
     return 1
   fi
   baseline_inject_total="$(bridge_inject_attempt_total "$baseline_metrics")" || {

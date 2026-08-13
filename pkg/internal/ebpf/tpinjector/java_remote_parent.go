@@ -703,7 +703,7 @@ func (p *Tracer) javaRemoteParentMaps() javabridge.Maps {
 		OwnerGuards:         p.bpfJavaRemoteParentMaps.JavaRemoteParentOwnerGuards,
 		Handoffs:            p.bpfJavaRemoteParentMaps.JavaRemoteParentHandoffs,
 		HandoffClaims:       p.bpfJavaRemoteParentMaps.JavaRemoteParentHandoffClaims,
-		HandoffMutations:    p.bpfJavaRemoteParentMaps.JavaRemoteParentHandoffMutations,
+		HandoffMutations:    p.bpfJavaRemoteParentMaps.JrpHandoffMut,
 		TaskClaims:          p.bpfJavaRemoteParentMaps.JavaRemoteParentTaskClaims,
 		ThreadMappingClaims: p.bpfJavaRemoteParentMaps.JavaThreadMappingClaims,
 		Retired:             p.bpfJavaRemoteParentMaps.JavaRetiredProcesses,

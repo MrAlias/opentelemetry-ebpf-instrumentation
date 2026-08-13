@@ -133,8 +133,8 @@ func validateConfig(cfg config) error {
 	}
 	if cfg.mode == "prepare" &&
 		(cfg.mapID != 0 || cfg.expectedMaxEntries != 0 || cfg.expectedProcessMapID != 0 ||
-			cfg.processPID != 0 || cfg.processNamespace != 0 || cfg.tokenBase != 0) {
-		return errors.New("map and process identity flags are not valid in prepare mode")
+			cfg.processPID == 0 || cfg.processNamespace == 0 || cfg.tokenBase != 0) {
+		return errors.New("prepare requires only process-pid and process-namespace")
 	}
 	if cfg.mode == "fill" &&
 		(cfg.mapID == 0 || cfg.expectedMaxEntries == 0 || cfg.expectedProcessMapID == 0 ||
@@ -160,55 +160,88 @@ func run(cfg config) (result, error) {
 	if err := validateConfig(cfg); err != nil {
 		return result{}, err
 	}
-	target, mapID, err := openTargetMap(ebpf.MapID(cfg.mapID))
+	var target *ebpf.Map
+	var mapID ebpf.MapID
+	var processes *ebpf.Map
+	var processMapID ebpf.MapID
+	var identity processIdentity
+	var err error
+	if cfg.mode == "prepare" {
+		processes, processMapID, target, mapID, identity, err = openPressureMapsForIdentity(
+			uint32(cfg.processPID),
+			uint32(cfg.processNamespace),
+		)
+		if err != nil {
+			return result{}, err
+		}
+		defer processes.Close()
+	} else {
+		target, mapID, err = openTargetMap(ebpf.MapID(cfg.mapID))
+	}
 	if err != nil {
 		return result{}, err
 	}
 	defer target.Close()
+	if cfg.mode == "prepare" {
+		confirmed, matched, confirmErr := readMatchingProcessIdentity(
+			processes,
+			uint32(cfg.processPID),
+			uint32(cfg.processNamespace),
+		)
+		if confirmErr != nil {
+			return result{}, confirmErr
+		}
+		if !matched || confirmed != identity {
+			return result{}, errors.New("controlled JVM identity changed during map discovery")
+		}
+	}
 
 	info, err := target.Info()
 	if err != nil {
-		return result{}, fmt.Errorf("inspect map ID %d: %w", cfg.mapID, err)
+		return result{}, fmt.Errorf("inspect map ID %d: %w", mapID, err)
 	}
 	if err := validateTarget(info, uint32(cfg.expectedMaxEntries)); err != nil {
 		return result{}, err
 	}
 	entryCount := info.MaxEntries + 1
-	var identity processIdentity
-	var processMapID ebpf.MapID
 	tokenBase := cfg.tokenBase
-	if cfg.mode == "prepare" || cfg.mode == "fill" {
+	if cfg.mode == "fill" {
 		processes, discoveredMapID, openErr := openProcessMap(mapID)
 		if openErr != nil {
 			return result{}, openErr
 		}
 		defer processes.Close()
-		if cfg.mode == "fill" {
-			if err := validatePreparedProcessMapID(
-				ebpf.MapID(cfg.expectedProcessMapID),
-				discoveredMapID,
-			); err != nil {
-				return result{}, err
-			}
-		}
-		identity, err = readProcessIdentity(processes)
-		if err != nil {
+		if err := validatePreparedProcessMapID(
+			ebpf.MapID(cfg.expectedProcessMapID),
+			discoveredMapID,
+		); err != nil {
 			return result{}, err
 		}
+		identity, matched, identityErr := readMatchingProcessIdentity(
+			processes,
+			uint32(cfg.processPID),
+			uint32(cfg.processNamespace),
+		)
+		if identityErr != nil {
+			return result{}, identityErr
+		}
+		if !matched {
+			return result{}, errors.New("prepared JVM identity is absent from its process map")
+		}
 		processMapID = discoveredMapID
-		if cfg.mode == "prepare" {
-			tokenBase, err = newTokenBase(uint64(cfg.seed), entryCount)
-			if err != nil {
-				return result{}, err
-			}
-		} else if err := validatePreparedProcessIdentity(
+		if err := validatePreparedProcessIdentity(
 			uint32(cfg.processPID),
 			uint32(cfg.processNamespace),
 			identity,
 		); err != nil {
 			return result{}, err
 		}
-	} else {
+	} else if cfg.mode == "prepare" {
+		tokenBase, err = newTokenBase(uint64(cfg.seed), entryCount)
+		if err != nil {
+			return result{}, err
+		}
+	} else if cfg.mode == "cleanup" {
 		identity.pid = uint32(cfg.processPID)
 		identity.namespace = uint32(cfg.processNamespace)
 	}
@@ -238,6 +271,20 @@ func run(cfg config) (result, error) {
 			_ = target.Delete(syntheticKey(identity, tokenBase, index))
 		}
 	}
+	if cfg.mode == "cleanup" {
+		output.Touched, output.VerifiedAbsentEntries, err = cleanupSyntheticEntries(
+			identity,
+			tokenBase,
+			entryCount,
+			func() ([]targetEntry, error) { return collectTargetEntries(target) },
+			func(key []byte) error { return target.Delete(key) },
+		)
+		if err != nil {
+			return result{}, err
+		}
+		output.CleanupVerified = true
+		return output, nil
+	}
 	for index := uint32(0); index < entryCount; index++ {
 		key := syntheticKey(identity, tokenBase, index)
 		switch cfg.mode {
@@ -258,13 +305,6 @@ func run(cfg config) (result, error) {
 			}
 			output.Touched++
 			filledEntries++
-		case "cleanup":
-			err := target.Delete(key)
-			if err == nil {
-				output.Touched++
-			} else if !errors.Is(err, ebpf.ErrKeyNotExist) {
-				return result{}, fmt.Errorf("delete entry %d: %w", index, err)
-			}
 		}
 		if output.CapacityRejectedEntries != 0 {
 			break
@@ -292,22 +332,89 @@ func run(cfg config) (result, error) {
 			cleanupFailedFill()
 			return result{}, err
 		}
-	} else {
-		output.VerifiedAbsentEntries, err = verifySyntheticEntriesAbsent(
-			identity,
-			tokenBase,
-			entryCount,
-			func(key []byte) error {
-				var value [targetValueSize]byte
-				return target.Lookup(key, &value)
-			},
-		)
-		if err != nil {
-			return result{}, err
-		}
-		output.CleanupVerified = true
 	}
 	return output, nil
+}
+
+type targetEntry struct {
+	key   [targetKeySize]byte
+	value [targetValueSize]byte
+}
+
+func collectTargetEntries(target *ebpf.Map) ([]targetEntry, error) {
+	entries := make([]targetEntry, 0)
+	var entry targetEntry
+	iterator := target.Iterate()
+	for iterator.Next(&entry.key, &entry.value) {
+		entries = append(entries, entry)
+	}
+	if err := iterator.Err(); err != nil {
+		return nil, fmt.Errorf("iterate %s: %w", targetMapName, err)
+	}
+	return entries, nil
+}
+
+func cleanupSyntheticEntries(
+	identity processIdentity,
+	tokenBase uint64,
+	entryCount uint32,
+	collect func() ([]targetEntry, error),
+	deleteKey func([]byte) error,
+) (uint32, uint32, error) {
+	entries, err := collect()
+	if err != nil {
+		return 0, 0, err
+	}
+	keys := make([][targetKeySize]byte, 0)
+	for _, entry := range entries {
+		if !syntheticKeyInRange(entry.key, identity, tokenBase, entryCount) {
+			continue
+		}
+		if !syntheticEntryValueMatchesKey(entry) {
+			return 0, 0, errors.New("synthetic entry has an invalid incarnation or ticket")
+		}
+		if uint32(len(keys)) >= entryCount {
+			return 0, 0, errors.New("synthetic entry scan exceeded its bounded token range")
+		}
+		keys = append(keys, entry.key)
+	}
+	for index := range keys {
+		if err := deleteKey(keys[index][:]); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return uint32(index), 0, fmt.Errorf("delete synthetic entry %d: %w", index, err)
+		}
+	}
+	remaining, err := collect()
+	if err != nil {
+		return uint32(len(keys)), 0, err
+	}
+	for _, entry := range remaining {
+		if syntheticKeyInRange(entry.key, identity, tokenBase, entryCount) {
+			return uint32(len(keys)), 0, errors.New("synthetic entry remains after cleanup")
+		}
+	}
+	return uint32(len(keys)), entryCount, nil
+}
+
+func syntheticKeyInRange(
+	key [targetKeySize]byte, identity processIdentity, tokenBase uint64, entryCount uint32,
+) bool {
+	if entryCount == 0 ||
+		binary.LittleEndian.Uint32(key[0:4]) != identity.pid ||
+		binary.LittleEndian.Uint32(key[4:8]) != identity.namespace {
+		return false
+	}
+	token := binary.LittleEndian.Uint64(key[8:16])
+	return token >= tokenBase && token-tokenBase < uint64(entryCount)
+}
+
+func syntheticEntryValueMatchesKey(entry targetEntry) bool {
+	incarnation := binary.LittleEndian.Uint64(entry.key[16:24])
+	valueTicket := binary.LittleEndian.Uint64(entry.value[0:8])
+	valueIncarnation := binary.LittleEndian.Uint64(entry.value[8:16])
+	return incarnation != 0 &&
+		incarnation == valueIncarnation &&
+		valueTicket&handoffOpenTag != 0 &&
+		valueTicket&^handoffOpenTag != 0
 }
 
 func isCapacityRejection(err error) bool {
@@ -335,27 +442,6 @@ func verifySyntheticEntriesPresent(
 	return presentEntries, nil
 }
 
-func verifySyntheticEntriesAbsent(
-	identity processIdentity,
-	tokenBase uint64,
-	entryCount uint32,
-	lookup func([]byte) error,
-) (uint32, error) {
-	absentEntries := uint32(0)
-	for index := uint32(0); index < entryCount; index++ {
-		err := lookup(syntheticKey(identity, tokenBase, index))
-		switch {
-		case errors.Is(err, ebpf.ErrKeyNotExist):
-			absentEntries++
-		case err == nil:
-			return 0, fmt.Errorf("synthetic entry %d remains after cleanup", index)
-		default:
-			return 0, fmt.Errorf("verify synthetic entry %d cleanup: %w", index, err)
-		}
-	}
-	return absentEntries, nil
-}
-
 func openProcessMap(targetID ebpf.MapID) (*ebpf.Map, ebpf.MapID, error) {
 	relatedMapIDs, err := mapsRelatedToTarget(targetID)
 	if err != nil {
@@ -379,10 +465,22 @@ func openProcessMap(targetID ebpf.MapID) (*ebpf.Map, ebpf.MapID, error) {
 		}
 		candidate, err := ebpf.NewMapFromID(id)
 		if err != nil {
-			continue
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			closeMaps(candidates)
+			return nil, 0, fmt.Errorf("open program-related map ID %d: %w", id, err)
 		}
 		info, err := candidate.Info()
-		if err != nil || !matchesProcessMap(info) {
+		if err != nil {
+			candidate.Close()
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			closeMaps(candidates)
+			return nil, 0, fmt.Errorf("inspect program-related map ID %d: %w", id, err)
+		}
+		if !matchesProcessMap(info) {
 			candidate.Close()
 			continue
 		}
@@ -399,6 +497,197 @@ func openProcessMap(targetID ebpf.MapID) (*ebpf.Map, ebpf.MapID, error) {
 	found := candidates[foundID]
 	delete(candidates, foundID)
 	closeMaps(candidates)
+	return found, foundID, nil
+}
+
+type pressureMapHandle interface {
+	Info() (*ebpf.MapInfo, error)
+	Lookup(key, value interface{}) error
+	Close() error
+}
+
+type pressureMapDiscovery struct {
+	nextMapID     func(ebpf.MapID) (ebpf.MapID, error)
+	openMap       func(ebpf.MapID) (pressureMapHandle, error)
+	relatedTarget func(ebpf.MapID) (pressureMapHandle, ebpf.MapID, error)
+}
+
+func openPressureMapsForIdentity(
+	wantedPID, wantedNamespace uint32,
+) (*ebpf.Map, ebpf.MapID, *ebpf.Map, ebpf.MapID, processIdentity, error) {
+	processes, processMapID, target, targetMapID, identity, err :=
+		discoverPressureMapsForIdentity(
+			pressureMapDiscovery{
+				nextMapID: ebpf.MapGetNextID,
+				openMap: func(id ebpf.MapID) (pressureMapHandle, error) {
+					return ebpf.NewMapFromID(id)
+				},
+				relatedTarget: func(id ebpf.MapID) (pressureMapHandle, ebpf.MapID, error) {
+					return openRelatedTargetMap(id)
+				},
+			},
+			wantedPID,
+			wantedNamespace,
+		)
+	if err != nil {
+		return nil, 0, nil, 0, processIdentity{}, err
+	}
+	processMap, processOK := processes.(*ebpf.Map)
+	targetMap, targetOK := target.(*ebpf.Map)
+	if !processOK || !targetOK {
+		_ = processes.Close()
+		_ = target.Close()
+		return nil, 0, nil, 0, processIdentity{}, errors.New("map discovery returned an invalid handle")
+	}
+	return processMap, processMapID, targetMap, targetMapID, identity, nil
+}
+
+func discoverPressureMapsForIdentity(
+	discovery pressureMapDiscovery,
+	wantedPID, wantedNamespace uint32,
+) (pressureMapHandle, ebpf.MapID, pressureMapHandle, ebpf.MapID, processIdentity, error) {
+	var foundProcess pressureMapHandle
+	var foundProcessID ebpf.MapID
+	var foundTarget pressureMapHandle
+	var foundTargetID ebpf.MapID
+	var foundIdentity processIdentity
+	for id := ebpf.MapID(0); ; {
+		next, err := discovery.nextMapID(id)
+		if errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if err != nil {
+			closePressureMapPair(foundProcess, foundTarget)
+			return nil, 0, nil, 0, processIdentity{}, fmt.Errorf("enumerate process maps after ID %d: %w", id, err)
+		}
+		id = next
+		candidate, err := discovery.openMap(id)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			closePressureMapPair(foundProcess, foundTarget)
+			return nil, 0, nil, 0, processIdentity{}, fmt.Errorf("open process map ID %d: %w", id, err)
+		}
+		info, err := candidate.Info()
+		if err != nil {
+			candidate.Close()
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			closePressureMapPair(foundProcess, foundTarget)
+			return nil, 0, nil, 0, processIdentity{}, fmt.Errorf("inspect process map ID %d: %w", id, err)
+		}
+		if !matchesProcessMap(info) {
+			candidate.Close()
+			continue
+		}
+		identity, matched, err := readMatchingProcessIdentity(candidate, wantedPID, wantedNamespace)
+		if err != nil {
+			candidate.Close()
+			closePressureMapPair(foundProcess, foundTarget)
+			return nil, 0, nil, 0, processIdentity{}, err
+		}
+		if !matched {
+			candidate.Close()
+			continue
+		}
+		target, targetID, err := discovery.relatedTarget(id)
+		if err != nil {
+			candidate.Close()
+			if errors.Is(err, errNoRelatedTargetMap) || errors.Is(err, errMapNotReferenced) {
+				continue
+			}
+			closePressureMapPair(foundProcess, foundTarget)
+			return nil, 0, nil, 0, processIdentity{}, err
+		}
+		if foundProcess != nil {
+			candidate.Close()
+			target.Close()
+			closePressureMapPair(foundProcess, foundTarget)
+			return nil, 0, nil, 0, processIdentity{}, errors.New("multiple live map sets contain the controlled JVM")
+		}
+		foundProcess = candidate
+		foundProcessID = id
+		foundTarget = target
+		foundTargetID = targetID
+		foundIdentity = identity
+	}
+	if foundProcess == nil {
+		return nil, 0, nil, 0, processIdentity{}, errors.New("controlled JVM map set was not found")
+	}
+	confirmed, matched, err := readMatchingProcessIdentity(
+		foundProcess,
+		wantedPID,
+		wantedNamespace,
+	)
+	if err != nil {
+		closePressureMapPair(foundProcess, foundTarget)
+		return nil, 0, nil, 0, processIdentity{}, err
+	}
+	if !matched || confirmed != foundIdentity {
+		closePressureMapPair(foundProcess, foundTarget)
+		return nil, 0, nil, 0, processIdentity{}, errors.New("controlled JVM identity changed during map discovery")
+	}
+	return foundProcess, foundProcessID, foundTarget, foundTargetID, foundIdentity, nil
+}
+
+var errNoRelatedTargetMap = errors.New("no related target map")
+var errMapNotReferenced = errors.New("map is not referenced by a live program")
+
+func closePressureMapPair(first, second pressureMapHandle) {
+	if first != nil {
+		_ = first.Close()
+	}
+	if second != nil {
+		_ = second.Close()
+	}
+}
+
+func openRelatedTargetMap(processMapID ebpf.MapID) (*ebpf.Map, ebpf.MapID, error) {
+	related, err := mapsRelatedToTarget(processMapID)
+	if err != nil {
+		return nil, 0, err
+	}
+	var found *ebpf.Map
+	var foundID ebpf.MapID
+	for id := range related {
+		candidate, err := ebpf.NewMapFromID(id)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if found != nil {
+				found.Close()
+			}
+			return nil, 0, fmt.Errorf("open program-related map ID %d: %w", id, err)
+		}
+		info, err := candidate.Info()
+		if err != nil {
+			candidate.Close()
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if found != nil {
+				found.Close()
+			}
+			return nil, 0, fmt.Errorf("inspect program-related map ID %d: %w", id, err)
+		}
+		if !matchesTarget(info) {
+			candidate.Close()
+			continue
+		}
+		if found != nil {
+			candidate.Close()
+			found.Close()
+			return nil, 0, fmt.Errorf("multiple target maps are related to process map ID %d", processMapID)
+		}
+		found = candidate
+		foundID = id
+	}
+	if found == nil {
+		return nil, 0, fmt.Errorf("%w: process map ID %d", errNoRelatedTargetMap, processMapID)
+	}
 	return found, foundID, nil
 }
 
@@ -419,16 +708,19 @@ func mapsRelatedToTarget(targetID ebpf.MapID) (map[ebpf.MapID]struct{}, error) {
 
 		program, err := ebpf.NewProgramFromID(id)
 		if err != nil {
-			continue
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, fmt.Errorf("open program ID %d: %w", id, err)
 		}
 		info, infoErr := program.Info()
 		program.Close()
 		if infoErr != nil {
-			continue
+			return nil, fmt.Errorf("inspect program ID %d: %w", id, infoErr)
 		}
 		mapIDs, available := info.MapIDs()
 		if !available {
-			continue
+			return nil, fmt.Errorf("program map relationships are unavailable for program ID %d", id)
 		}
 		mapIDsAvailable = true
 		if !addRelatedMapIDs(targetID, mapIDs, related) {
@@ -441,7 +733,7 @@ func mapsRelatedToTarget(targetID ebpf.MapID) (map[ebpf.MapID]struct{}, error) {
 		if !mapIDsAvailable {
 			return nil, errors.New("program map relationships are unavailable")
 		}
-		return nil, fmt.Errorf("no live program references target map ID %d", targetID)
+		return nil, fmt.Errorf("%w: map ID %d", errMapNotReferenced, targetID)
 	}
 	return related, nil
 }
@@ -492,42 +784,25 @@ func closeMaps(maps map[ebpf.MapID]*ebpf.Map) {
 	}
 }
 
-func readProcessIdentity(processes *ebpf.Map) (processIdentity, error) {
-	info, err := processes.Info()
-	if err != nil {
-		return processIdentity{}, fmt.Errorf("inspect %s: %w", processMapName, err)
-	}
-	if !matchesProcessMap(info) {
-		return processIdentity{}, fmt.Errorf(
-			"map does not match %s layout: type=%s key=%d value=%d",
-			processMapName,
-			info.Type,
-			info.KeySize,
-			info.ValueSize,
-		)
-	}
-
-	var selected processIdentity
+func readMatchingProcessIdentity(
+	processes interface {
+		Lookup(key, value interface{}) error
+	},
+	wantedPID, wantedNamespace uint32,
+) (processIdentity, bool, error) {
 	var key [processKeySize]byte
 	var value [processValueSize]byte
-	iterator := processes.Iterate()
-	for iterator.Next(&key, &value) {
-		identity, decodeErr := decodeProcessIdentity(key[:], value[:])
-		if decodeErr != nil {
-			return processIdentity{}, decodeErr
+	binary.LittleEndian.PutUint32(key[0:4], wantedPID)
+	binary.LittleEndian.PutUint32(key[4:8], wantedPID)
+	binary.LittleEndian.PutUint32(key[8:12], wantedNamespace)
+	if err := processes.Lookup(key, &value); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return processIdentity{}, false, nil
 		}
-		if selected.incarnation != 0 {
-			return processIdentity{}, fmt.Errorf("multiple live JVM identities found in %s", processMapName)
-		}
-		selected = identity
+		return processIdentity{}, false, fmt.Errorf("lookup controlled JVM in %s: %w", processMapName, err)
 	}
-	if err := iterator.Err(); err != nil {
-		return processIdentity{}, fmt.Errorf("iterate %s: %w", processMapName, err)
-	}
-	if selected.incarnation == 0 {
-		return processIdentity{}, fmt.Errorf("no live JVM identity found in %s", processMapName)
-	}
-	return selected, nil
+	identity, err := decodeProcessIdentity(key[:], value[:])
+	return identity, err == nil, err
 }
 
 func decodeProcessIdentity(key, value []byte) (processIdentity, error) {
@@ -551,7 +826,7 @@ func decodeProcessIdentity(key, value []byte) (processIdentity, error) {
 }
 
 func matchesProcessMap(info *ebpf.MapInfo) bool {
-	return info.Type == ebpf.LRUHash &&
+	return info.Type == ebpf.Hash &&
 		info.KeySize == processKeySize &&
 		info.ValueSize == processValueSize &&
 		info.Name == processKernelName

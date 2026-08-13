@@ -2030,6 +2030,7 @@ func assertSharedMapSpecs(t *testing.T, left, right *ebpf.CollectionSpec) {
 			!strings.HasPrefix(name, "ssl_prewrite_connection_") &&
 			name != "ssl_to_conn" &&
 			!strings.HasPrefix(name, "incoming_trace_") &&
+			name != "jrp_handoff_mut" &&
 			!strings.HasPrefix(name, "java_remote_parent_") &&
 			name != "java_authorized_processes" &&
 			name != "java_process_incarnations" &&
@@ -2066,7 +2067,7 @@ func TestJavaRemoteParentExactLifecycleMapsDoNotEvict(t *testing.T) {
 		"java_remote_parent_generation_index",
 		"java_remote_parent_handoffs",
 		"java_remote_parent_handoff_claims",
-		"java_remote_parent_handoff_mutations",
+		"jrp_handoff_mut",
 		"java_remote_parent_state",
 		"java_remote_parent_task_claims",
 		"java_remote_parent_tasks",
@@ -2083,7 +2084,7 @@ func TestJavaRemoteParentExactLifecycleMapsDoNotEvict(t *testing.T) {
 	tasks := spec.Maps["java_remote_parent_tasks"]
 	taskClaims := spec.Maps["java_remote_parent_task_claims"]
 	handoffs := spec.Maps["java_remote_parent_handoffs"]
-	handoffMutations := spec.Maps["java_remote_parent_handoff_mutations"]
+	handoffMutations := spec.Maps["jrp_handoff_mut"]
 	handoffClaims := spec.Maps["java_remote_parent_handoff_claims"]
 	require.NotNil(t, claims)
 	require.NotNil(t, replays)
@@ -2110,6 +2111,9 @@ func TestJavaRemoteParentExactLifecycleMapsDoNotEvict(t *testing.T) {
 	require.Equal(t, uint32(16), handoffMutations.ValueSize)
 	require.Equal(t, handoffs.MaxEntries, handoffMutations.MaxEntries)
 	require.Equal(t, ebpfconvenience.PinInternal, handoffMutations.Pinning)
+	require.Equal(t, "jrp_handoff_mut", handoffMutations.Name)
+	require.Equal(t, "java_remote_parent_handoff_claims", handoffClaims.Name)
+	require.NotEqual(t, handoffMutations.Name[:15], handoffClaims.Name[:15])
 	require.Equal(t, ebpf.Hash, handoffClaims.Type)
 	require.Equal(t, uint32(24), handoffClaims.KeySize)
 	require.Equal(t, ebpfconvenience.PinInternal, handoffClaims.Pinning)

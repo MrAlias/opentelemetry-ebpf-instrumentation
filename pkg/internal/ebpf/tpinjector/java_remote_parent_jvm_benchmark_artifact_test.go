@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -33,6 +34,156 @@ import (
 
 	"go.opentelemetry.io/obi/pkg/internal/javabridge"
 )
+
+func TestPackagedJVMBenchmarkProbeSerializesPrimaryArmAndKeepsTakeConcurrent(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	require.True(t, ok)
+	probePath := filepath.Join(filepath.Dir(thisFile), "../../java/loader/src/main/java/io/opentelemetry/obi/java/probe/RemoteParentGetsockoptBenchmarkProbe.java")
+	source, err := os.ReadFile(probePath)
+	require.NoError(t, err)
+	text := string(source)
+	require.NoError(t, validatePackagedJVMBenchmarkProbeSource(text))
+
+	mutations := []struct {
+		name   string
+		mutate func(string) string
+	}{
+		{
+			name: "single-worker latch widened",
+			mutate: func(source string) string {
+				return strings.Replace(
+					source,
+					"return new Batch(phase, scope, transport, outcome, iteration, expectedStatus, 1);",
+					"return new Batch(phase, scope, transport, outcome, iteration, expectedStatus, workers);",
+					1,
+				)
+			},
+		},
+		{
+			name: "single-worker latch widened to eight",
+			mutate: func(source string) string {
+				return strings.Replace(
+					source,
+					"return new Batch(phase, scope, transport, outcome, iteration, expectedStatus, 1);",
+					"return new Batch(phase, scope, transport, outcome, iteration, expectedStatus, 8);",
+					1,
+				)
+			},
+		},
+		{
+			name: "primary arm loop reversed",
+			mutate: func(source string) string {
+				return mutatePackagedJVMBenchmarkProbeMethod(source, "private static void armBatch", "private static int takeBatch", func(method string) string {
+					primary := strings.Index(method, "// Primary DATA_ACK uses a process-global native nonce.")
+					if primary < 0 {
+						return method
+					}
+					prefix, body := method[:primary], method[primary:]
+					body = strings.Replace(body, "for (int index = 0; index < workers.length; index++) {", "for (int index = workers.length - 1; index >= 0; index--) {", 1)
+					return prefix + body
+				})
+			},
+		},
+		{
+			name: "primary arm shares batch latch",
+			mutate: func(source string) string {
+				return mutatePackagedJVMBenchmarkProbeMethod(source, "private static void armBatch", "private static int takeBatch", func(method string) string {
+					return strings.Replace(method, "worker.submit(Job.arm(workerBatch, generation));", "worker.submit(Job.arm(batch, generation));", 1)
+				})
+			},
+		},
+		{
+			name: "Unix ARM serialized",
+			mutate: func(source string) string {
+				return mutatePackagedJVMBenchmarkProbeMethod(source, "private static void armBatch", "private static int takeBatch", func(method string) string {
+					return strings.Replace(method, "workers[index].submit(Job.arm(batch, generation));", "workers[index].submit(Job.arm(batch.forSingleWorker(), generation));", 1)
+				})
+			},
+		},
+		{
+			name: "Unix ARM shared release removed",
+			mutate: func(source string) string {
+				return mutatePackagedJVMBenchmarkProbeMethod(source, "private static void armBatch", "private static int takeBatch", func(method string) string {
+					return strings.Replace(method, "      batch.releaseAndAwait();", "      // release removed", 1)
+				})
+			},
+		},
+		{
+			name: "TAKE uses per-worker latch",
+			mutate: func(source string) string {
+				return mutatePackagedJVMBenchmarkProbeMethod(source, "private static int takeBatch", "private static final class Batch", func(method string) string {
+					return strings.Replace(method, "workers[worker.index].submit(Job.take(batch, worker.armedGeneration, worker.armedStatus));", "workers[worker.index].submit(Job.take(batch.forSingleWorker(), worker.armedGeneration, worker.armedStatus));", 1)
+				})
+			},
+		},
+		{
+			name: "TAKE sequential release",
+			mutate: func(source string) string {
+				return mutatePackagedJVMBenchmarkProbeMethod(source, "private static int takeBatch", "private static final class Batch", func(method string) string {
+					return strings.Replace(method, "    batch.releaseAndAwait();", "    // sequential release", 1)
+				})
+			},
+		},
+	}
+	for _, mutation := range mutations {
+		mutation := mutation
+		t.Run(mutation.name, func(t *testing.T) {
+			require.Error(t, validatePackagedJVMBenchmarkProbeSource(mutation.mutate(text)))
+		})
+	}
+}
+
+func mutatePackagedJVMBenchmarkProbeMethod(
+	source, startMarker, endMarker string, mutate func(string) string,
+) string {
+	start := strings.Index(source, startMarker)
+	end := strings.Index(source, endMarker)
+	if start < 0 || end <= start {
+		return source
+	}
+	return source[:start] + mutate(source[start:end]) + source[end:]
+}
+
+func validatePackagedJVMBenchmarkProbeSource(source string) error {
+	armStart := strings.Index(source, "private static void armBatch")
+	takeStart := strings.Index(source, "private static int takeBatch")
+	batchStart := strings.Index(source, "private static final class Batch")
+	if armStart < 0 || takeStart <= armStart || batchStart <= takeStart {
+		return errors.New("packaged JVM benchmark probe methods are not ordered")
+	}
+	arm := source[armStart:takeStart]
+	take := source[takeStart:batchStart]
+	unixStart := strings.Index(arm, "if (!\"getsockopt\".equals(batch.transport)) {")
+	primaryStart := strings.Index(arm, "// Primary DATA_ACK uses a process-global native nonce.")
+	if unixStart < 0 || primaryStart <= unixStart {
+		return errors.New("packaged JVM benchmark probe lacks ARM transport split")
+	}
+	unixArm, primaryArm := arm[unixStart:primaryStart], arm[primaryStart:]
+	if strings.Contains(unixArm, "forSingleWorker") ||
+		!strings.Contains(unixArm, "workers[index].submit(Job.arm(batch, generation));") ||
+		strings.Count(unixArm, "batch.releaseAndAwait();") != 1 {
+		return errors.New("Unix ARM must use one concurrent shared latch")
+	}
+	if strings.Contains(primaryArm, "batch.releaseAndAwait();") ||
+		!strings.Contains(primaryArm, "for (int index = 0; index < workers.length; index++) {") ||
+		!strings.Contains(primaryArm, "Worker worker = workers[index];") ||
+		!strings.Contains(primaryArm, "Batch workerBatch = batch.forSingleWorker();") ||
+		!strings.Contains(primaryArm, "worker.submit(Job.arm(workerBatch, generation));") ||
+		strings.Count(primaryArm, "workerBatch.releaseAndAwait();") != 1 {
+		return errors.New("getsockopt primary ARM must serialize one-worker latches in index order")
+	}
+	if !strings.Contains(source, "Batch forSingleWorker() {\n      return new Batch(phase, scope, transport, outcome, iteration, expectedStatus, 1);\n    }") {
+		return errors.New("primary ARM worker latch must have one permit")
+	}
+	if !strings.Contains(take, "Batch batch = Batch.from(fields, workers.length, true);") ||
+		!strings.Contains(take, "workers[worker.index].submit(Job.take(batch, worker.armedGeneration, worker.armedStatus));") ||
+		strings.Count(take, "batch.releaseAndAwait();") != 1 ||
+		strings.Contains(take, "forSingleWorker") ||
+		strings.Contains(take, "workerBatch") {
+		return errors.New("TAKE must retain one concurrent eight-worker latch")
+	}
+	return nil
+}
 
 const (
 	javaRemoteParentPackagedJVMBenchmarkEnv                     = "OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK"
@@ -688,7 +839,7 @@ func newPackagedJVMBenchmarkArtifactV2(
 			Concurrency:            packagedJVMBenchmarkV2Concurrency,
 			RetainedCallsPerSeries: packagedJVMBenchmarkV2Concurrency * packagedJVMBenchmarkMeasurementIterations,
 			TotalCallsPerSeries:    totalCalls,
-			BatchSynchronization:   "eight fixed worker threads stage authority, rendezvous, then share one release latch",
+			BatchSynchronization:   "getsockopt primary nonce/ACK arming is untimed and serialized in ascending worker-index order with a distinct one-worker latch per ARM; Unix ARM and timed TAKE each rendezvous/release a shared concurrent eight-worker latch",
 			RawTimedCall:           "System.nanoTime and ThreadMXBean around BootstrapNative.takeRemoteParent(fd-or-minus-one,reused_byte_array)",
 			ProviderTimedCall:      "System.nanoTime and ThreadMXBean around RemoteParentBridge.takeRemoteParent()",
 			ResponseStorage:        "one reused 64-byte JNI response array per worker; provider uses its packaged pool",
@@ -1969,7 +2120,7 @@ func validatePackagedJVMBenchmarkArtifactV2(artifact packagedJVMBenchmarkArtifac
 		Concurrency:            packagedJVMBenchmarkV2Concurrency,
 		RetainedCallsPerSeries: packagedJVMBenchmarkV2Concurrency * packagedJVMBenchmarkMeasurementIterations,
 		TotalCallsPerSeries:    totalCalls,
-		BatchSynchronization:   "eight fixed worker threads stage authority, rendezvous, then share one release latch",
+		BatchSynchronization:   "getsockopt primary nonce/ACK arming is untimed and serialized in ascending worker-index order with a distinct one-worker latch per ARM; Unix ARM and timed TAKE each rendezvous/release a shared concurrent eight-worker latch",
 		RawTimedCall:           "System.nanoTime and ThreadMXBean around BootstrapNative.takeRemoteParent(fd-or-minus-one,reused_byte_array)",
 		ProviderTimedCall:      "System.nanoTime and ThreadMXBean around RemoteParentBridge.takeRemoteParent()",
 		ResponseStorage:        "one reused 64-byte JNI response array per worker; provider uses its packaged pool",

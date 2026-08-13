@@ -159,12 +159,38 @@ public final class RemoteParentGetsockoptBenchmarkProbe {
       throw new IllegalStateException("unexpected ARM_BATCH command");
     }
     Batch batch = Batch.from(fields, workers.length, false);
+    if (!"getsockopt".equals(batch.transport)) {
+      for (int index = 0; index < workers.length; index++) {
+        long generation = Long.parseUnsignedLong(fields[7 + index]);
+        workers[index].submit(Job.arm(batch, generation));
+      }
+      batch.releaseAndAwait();
+      for (Worker worker : workers) {
+        Result result = worker.result();
+        result.rethrow();
+        print(
+            "ARMED phase=%s scope=%s transport=%s outcome=%s iteration=%d worker=%d emit=%d"
+                + " nonce=%s",
+            batch.phase,
+            batch.scope,
+            batch.transport,
+            batch.outcome,
+            batch.iteration,
+            worker.index,
+            result.emit,
+            Long.toUnsignedString(result.nonce));
+      }
+      return;
+    }
+    // Primary DATA_ACK uses a process-global native nonce. Arm getsockopt
+    // workers one at a time so each staged nonce remains bound to its worker's
+    // socket and generation. TAKE_BATCH retains one concurrent latch.
     for (int index = 0; index < workers.length; index++) {
       long generation = Long.parseUnsignedLong(fields[7 + index]);
-      workers[index].submit(Job.arm(batch, generation));
-    }
-    batch.releaseAndAwait();
-    for (Worker worker : workers) {
+      Worker worker = workers[index];
+      Batch workerBatch = batch.forSingleWorker();
+      worker.submit(Job.arm(workerBatch, generation));
+      workerBatch.releaseAndAwait();
       Result result = worker.result();
       result.rethrow();
       print(
@@ -174,7 +200,7 @@ public final class RemoteParentGetsockoptBenchmarkProbe {
           batch.transport,
           batch.outcome,
           batch.iteration,
-          worker.index,
+          index,
           result.emit,
           Long.toUnsignedString(result.nonce));
     }
@@ -266,6 +292,10 @@ public final class RemoteParentGetsockoptBenchmarkProbe {
         throw new IllegalStateException("unexpected transport: " + transport);
       }
       return new Batch(phase, scope, transport, outcome, iteration, status, workers);
+    }
+
+    Batch forSingleWorker() {
+      return new Batch(phase, scope, transport, outcome, iteration, expectedStatus, 1);
     }
 
     void releaseAndAwait() throws InterruptedException {

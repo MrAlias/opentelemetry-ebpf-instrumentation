@@ -19,7 +19,17 @@ readonly PACKAGED_JVM_ARTIFACT_VALIDATOR_PATTERN='^(TestValidatePackagedJVMBench
 readonly PACKAGED_JVM_ARTIFACT_VALIDATOR_NAME='TestValidatePackagedJVMBenchmarkArtifactFile'
 readonly PACKAGED_JVM_ARTIFACT_CROSSLINK_VALIDATOR_NAME='TestValidatePackagedJVMBenchmarkArtifactCICrosslinks'
 readonly PACKAGED_JVM_EXCLUSIVE_CGROUP_BPF_PREMISE='operator_controlled_no_concurrent_cgroup_bpf_mutation'
+readonly PACKAGED_JVM_GIT_PATH='/usr/bin/git'
 readonly PACKAGED_JVM_SETPRIV_PATH='/bin/setpriv'
+readonly PACKAGED_JVM_SOURCE_PATH='/build'
+readonly PACKAGED_JVM_SOURCE_UID='65534'
+readonly PACKAGED_JVM_SOURCE_GID='65534'
+readonly -a PACKAGED_JVM_SOURCE_GIT_ENVIRONMENT=(
+    HOME=/nonexistent
+    LANG=C
+    LC_ALL=C
+    PATH=/usr/bin:/bin
+)
 readonly -a PACKAGED_JVM_SETPRIV_OPTIONS=(
     --reuid
     --regid
@@ -57,6 +67,56 @@ validate_packaged_jvm_setpriv_identity() {
     for option in "${PACKAGED_JVM_SETPRIV_OPTIONS[@]}"; do
         grep -Fq -- "$option" <<<"$help" || return 1
     done
+}
+
+validate_packaged_jvm_source_identity() {
+    local -r path="$1"
+    local -r owner="$2"
+
+    [[ "$path" == "$PACKAGED_JVM_SOURCE_PATH" ]] || return 1
+    [[ "$owner" == "${PACKAGED_JVM_SOURCE_UID}:${PACKAGED_JVM_SOURCE_GID}" ]]
+}
+
+build_packaged_jvm_source_git_command() {
+    local -r output_name="$1"
+    local -r setpriv_path="$2"
+    local -r git_path="$3"
+    local -r source_path="$4"
+    local -r source_owner="$5"
+    shift 5
+    local -n output="$output_name"
+
+    [[ "$setpriv_path" == "$PACKAGED_JVM_SETPRIV_PATH" ]] || return 1
+    [[ "$git_path" == "$PACKAGED_JVM_GIT_PATH" ]] || return 1
+    validate_packaged_jvm_source_identity "$source_path" "$source_owner" || return 1
+    # output is a caller-owned nameref; ShellCheck cannot follow the reference.
+    # shellcheck disable=SC2034
+    output=(
+        "$setpriv_path"
+        "--reuid=$PACKAGED_JVM_SOURCE_UID"
+        "--regid=$PACKAGED_JVM_SOURCE_GID"
+        --clear-groups
+        --no-new-privs
+        --inh-caps=-all
+        --ambient-caps=-all
+        --bounding-set=-all
+        --
+        /usr/bin/env -i
+        "${PACKAGED_JVM_SOURCE_GIT_ENVIRONMENT[@]}"
+        "$git_path"
+        -c "safe.directory=$source_path"
+        -C "$source_path"
+        "$@"
+    )
+}
+
+write_packaged_jvm_command_argv() {
+    local -r name="$1"
+    shift
+
+    printf '%s=' "$name"
+    printf ' %q' "$@"
+    printf '\n'
 }
 
 require_test_passed() {
@@ -569,6 +629,8 @@ run_packaged_jvm_benchmark() {
     local -r identity_file="$OUTPUT_DIR/packaged-jvm-benchmark-identities.txt"
     local artifact_file=""
     local agent_path=""
+    local git_lookup=""
+    local git_path=""
     local java_path=""
     local setpriv_help=""
     local setpriv_lookup=""
@@ -577,10 +639,15 @@ run_packaged_jvm_benchmark() {
     local setpriv_version=""
     local sockopt_bpf_path=""
     local sockops_bpf_path=""
+    local source_owner=""
+    local source_path=""
     local source_revision=""
+    local source_status=""
     local kernel_release=""
     local test_status=0
     local -a benchmark_environment=()
+    local -a source_revision_command=()
+    local -a source_status_command=()
 
     command -v java >/dev/null 2>&1 || fail 'Java runtime is unavailable'
     agent_path="$(resolve_existing_path "$JAVA_AGENT_PATH")" || \
@@ -606,17 +673,45 @@ run_packaged_jvm_benchmark() {
     validate_packaged_jvm_setpriv_identity \
         "$setpriv_path" "$setpriv_owner" "$setpriv_version" "$setpriv_help" || \
         fail 'packaged JVM benchmark requires Alpine setpriv from util-linux with every privilege-drop option'
+    [[ -x "$PACKAGED_JVM_GIT_PATH" ]] || \
+        fail "packaged JVM benchmark git is unavailable: ${PACKAGED_JVM_GIT_PATH}"
+    git_path="$(resolve_existing_path "$PACKAGED_JVM_GIT_PATH")" || \
+        fail 'failed to resolve packaged JVM benchmark git'
+    git_lookup="$(PATH=/usr/local/go/bin:/usr/bin:/bin command -v git)" || \
+        fail 'git is unavailable in the packaged JVM benchmark environment'
+    git_lookup="$(resolve_existing_path "$git_lookup")" || \
+        fail 'failed to resolve git from the packaged JVM benchmark environment'
+    [[ "$git_lookup" == "$git_path" ]] || \
+        fail "packaged JVM benchmark resolves an unexpected git: ${git_lookup}"
+    source_path="$(resolve_existing_path .)" || \
+        fail 'failed to resolve the packaged JVM benchmark source path'
+    [[ "$source_path" == "$PACKAGED_JVM_SOURCE_PATH" && -d "$source_path" ]] || \
+        fail "packaged JVM benchmark requires the canonical source directory ${PACKAGED_JVM_SOURCE_PATH}"
+    source_owner="$(stat -c '%u:%g' -- "$source_path")" || \
+        fail 'failed to establish the packaged JVM benchmark source owner'
+    validate_packaged_jvm_source_identity "$source_path" "$source_owner" || \
+        fail "packaged JVM benchmark requires ${PACKAGED_JVM_SOURCE_PATH} owned by ${PACKAGED_JVM_SOURCE_UID}:${PACKAGED_JVM_SOURCE_GID}"
     sockopt_bpf_path="$(resolve_existing_path \
         pkg/internal/ebpf/tpinjector/bpfjavaremoteparent_x86_bpfel.o)" || \
         fail 'failed to resolve the generated sockopt BPF artifact'
     sockops_bpf_path="$(resolve_existing_path \
         pkg/internal/ebpf/tpinjector/bpf_x86_bpfel.o)" || \
         fail 'failed to resolve the generated sockops BPF artifact'
-    source_revision="$(git rev-parse HEAD)" || \
+    build_packaged_jvm_source_git_command \
+        source_revision_command "$setpriv_path" "$git_path" "$source_path" "$source_owner" \
+        rev-parse --verify 'HEAD^{commit}' || \
+        fail 'failed to build the packaged JVM source revision command'
+    source_revision="$("${source_revision_command[@]}")" || \
         fail 'failed to resolve the packaged JVM benchmark source revision'
     [[ "$source_revision" =~ ^[0-9a-f]{40}$ ]] || \
         fail 'packaged JVM benchmark source revision is invalid'
-    [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] || \
+    build_packaged_jvm_source_git_command \
+        source_status_command "$setpriv_path" "$git_path" "$source_path" "$source_owner" \
+        status --porcelain=v1 --untracked-files=all || \
+        fail 'failed to build the packaged JVM source status command'
+    source_status="$("${source_status_command[@]}")" || \
+        fail 'failed to inspect the packaged JVM benchmark source status'
+    [[ -z "$source_status" ]] || \
         fail 'packaged JVM benchmark requires a clean source tree'
     kernel_release="$(uname -r)" || fail 'failed to resolve the VM kernel release'
     artifact_file="$(create_transport_benchmark_artifact_path "$artifact_dir")" || \
@@ -644,12 +739,16 @@ run_packaged_jvm_benchmark() {
             "$sockopt_bpf_path" "$sockops_bpf_path"
         printf 'setpriv_package_owner=%s\nsetpriv_required_options=%s\n' \
             "$setpriv_owner" "${PACKAGED_JVM_SETPRIV_OPTIONS[*]}"
+        printf 'source_path=%s\nsource_owner=%s\nsource_git=%s\n' \
+            "$source_path" "$source_owner" "$git_path"
+        write_packaged_jvm_command_argv source_revision_argv "${source_revision_command[@]}"
+        write_packaged_jvm_command_argv source_status_argv "${source_status_command[@]}"
         printf 'exclusive_cgroup_bpf_premise=%s\n' \
             "$PACKAGED_JVM_EXCLUSIVE_CGROUP_BPF_PREMISE"
         "$java_path" -version 2>&1
         cat /etc/os-release
         go version
-        git --version
+        "$git_path" --version
         "$setpriv_path" --version
         apk info -e openjdk21-jre-headless setpriv
         apk info -a openjdk21-jre-headless setpriv

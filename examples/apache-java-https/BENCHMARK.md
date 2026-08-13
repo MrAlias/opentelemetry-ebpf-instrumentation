@@ -149,7 +149,8 @@ or container type. It rejects case-folded aliases, unknown fields, trailing JSON
 and duplicate names at every nesting depth.
 The root harness runs every source-identity Git command through `setpriv` as the
 verified non-root owner shared by the canonical package directory and discovered
-repository root; it does not add a `safe.directory` exception.
+repository root. Each invocation adds only that canonical path as a command-scoped
+`safe.directory`; the harness does not persist or globally broaden Git trust.
 
 Before attaching, the fixture requires all three effective chains and every
 ancestor's direct chain to be empty, so inherited host programs fail the run.

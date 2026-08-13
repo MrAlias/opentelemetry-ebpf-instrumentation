@@ -1152,7 +1152,7 @@ func packagedJVMBenchmarkSourceIdentity(
 	))
 
 	repositoryOutput := packagedJVMBenchmarkGitOutput(
-		t, setpriv, git, workingDirectory, workingDirectoryOwner, environment,
+		t, setpriv, git, workingDirectory, workingDirectory, workingDirectoryOwner, environment,
 		"rev-parse", "--show-toplevel",
 	)
 	repository := strings.TrimSpace(string(repositoryOutput))
@@ -1172,28 +1172,28 @@ func packagedJVMBenchmarkSourceIdentity(
 		uint32(os.Geteuid()), workingDirectoryOwner, repositoryOwner,
 	))
 	require.Equal(t, "true", strings.TrimSpace(string(packagedJVMBenchmarkGitOutput(
-		t, setpriv, git, repository, repositoryOwner, environment,
+		t, setpriv, git, repository, repository, repositoryOwner, environment,
 		"rev-parse", "--is-inside-work-tree",
 	))))
 
 	revision := strings.TrimSpace(string(packagedJVMBenchmarkGitOutput(
-		t, setpriv, git, repository, repositoryOwner, environment,
+		t, setpriv, git, repository, repository, repositoryOwner, environment,
 		"rev-parse", "--verify", "HEAD^{commit}",
 	)))
 	status := packagedJVMBenchmarkGitOutput(
-		t, setpriv, git, repository, repositoryOwner, environment,
+		t, setpriv, git, repository, repository, repositoryOwner, environment,
 		"status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none",
 	)
 	staged := packagedJVMBenchmarkGitOutput(
-		t, setpriv, git, repository, repositoryOwner, environment,
+		t, setpriv, git, repository, repository, repositoryOwner, environment,
 		"diff", "--cached", "--binary", "--no-ext-diff", "--submodule=diff", "HEAD", "--",
 	)
 	unstaged := packagedJVMBenchmarkGitOutput(
-		t, setpriv, git, repository, repositoryOwner, environment,
+		t, setpriv, git, repository, repository, repositoryOwner, environment,
 		"diff", "--binary", "--no-ext-diff", "--submodule=diff", "--",
 	)
 	untracked := packagedJVMBenchmarkGitOutput(
-		t, setpriv, git, repository, repositoryOwner, environment,
+		t, setpriv, git, repository, repository, repositoryOwner, environment,
 		"ls-files", "--others", "--exclude-standard", "-z",
 	)
 
@@ -1229,14 +1229,15 @@ func packagedJVMBenchmarkGitOutput(
 	t *testing.T,
 	setpriv string,
 	git string,
-	repository string,
+	safeDirectory string,
+	workingDirectory string,
 	owner packagedJVMBenchmarkSourceOwner,
 	environment []string,
 	arguments ...string,
 ) []byte {
 	t.Helper()
 	commandArguments, err := packagedJVMBenchmarkGitCommandArguments(
-		git, repository, owner, arguments...,
+		git, safeDirectory, workingDirectory, owner, arguments...,
 	)
 	require.NoError(t, err)
 	command := exec.Command(setpriv, commandArguments...)

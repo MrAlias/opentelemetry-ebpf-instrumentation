@@ -347,6 +347,11 @@ require_rhel_vm_image_contract() {
     grep -Fq -- 'export TMPDIR=/overlay/tmp' "$dockerfile" || return 1
     ! grep -Fq -- 'export GOCACHE=/build/' "$dockerfile" || return 1
     ! grep -Fq -- 'export TMPDIR=/build/' "$dockerfile" || return 1
+    ! grep -Fq -- 'safe.directory' "$dockerfile" || return 1
+    grep -Fq -- "if [ \"\$target\" = \"run-java-remote-parent-rhel-kernel-sockopt-vm\" ]; then" \
+        "$dockerfile" || return 1
+    grep -Fq -- 'bash internal/test/vm/run-java-remote-parent-rhel.sh' "$dockerfile" || return 1
+    ! grep -Fq -- "cd /build && make \$target" "$dockerfile" || return 1
 }
 
 test_rhel_ci_is_private_and_preserves_launch_status() {
@@ -384,6 +389,8 @@ test_rhel_vm_installs_setpriv_without_dirtying_source() {
     local -r util_linux_misc_fallback="${TEST_TMP_DIR}/Dockerfile.util-linux-misc-fallback"
     local -r root_owned_source="${TEST_TMP_DIR}/Dockerfile.root-owned-source"
     local -r repository_cache="${TEST_TMP_DIR}/Dockerfile.repository-cache"
+    local -r global_source_trust="${TEST_TMP_DIR}/Dockerfile.global-source-trust"
+    local -r root_make_source_git="${TEST_TMP_DIR}/Dockerfile.root-make-source-git"
 
     track_fixture "$valid"
     cp -- "$dockerfile" "$valid"
@@ -398,14 +405,152 @@ test_rhel_vm_installs_setpriv_without_dirtying_source() {
         '/chown 65534:65534 \/overlay\/upper/d'
     write_mutated_fixture "$repository_cache" "$valid" \
         's|export GOCACHE=/overlay/gocache|export GOCACHE=/build/gocache|'
+    write_mutated_fixture "$global_source_trust" "$valid" \
+        's|echo "--- mount state ---"|git config --global --add safe.directory /build\
+echo "--- mount state ---"|'
+    write_mutated_fixture "$root_make_source_git" "$valid" \
+        "s|bash internal/test/vm/run-java-remote-parent-rhel.sh|make \"\$target\" TEST_PATTERN=\"\$test_pattern\" RUN_NUMBER=\"\$run_number\"|"
     for mutation in \
         "$missing_setpriv" \
         "$busybox_fallback" \
         "$util_linux_misc_fallback" \
         "$root_owned_source" \
-        "$repository_cache"; do
+        "$repository_cache" \
+        "$global_source_trust" \
+        "$root_make_source_git"; do
         if require_rhel_vm_image_contract "$mutation" >/dev/null 2>&1; then
             test_fail "RHEL VM image validator accepted mutation: ${mutation}"
+        fi
+    done
+}
+
+test_packaged_jvm_source_git_contract() {
+    local -a command=()
+    local -a status_command=()
+    local -a expected=(
+        /bin/setpriv
+        --reuid=65534
+        --regid=65534
+        --clear-groups
+        --no-new-privs
+        --inh-caps=-all
+        --ambient-caps=-all
+        --bounding-set=-all
+        --
+        /usr/bin/env
+        -i
+        HOME=/nonexistent
+        LANG=C
+        LC_ALL=C
+        PATH=/usr/bin:/bin
+        /usr/bin/git
+        -c
+        safe.directory=/build
+        -C
+        /build
+        rev-parse
+        --verify
+        'HEAD^{commit}'
+    )
+    local -a expected_status=(
+        /bin/setpriv
+        --reuid=65534
+        --regid=65534
+        --clear-groups
+        --no-new-privs
+        --inh-caps=-all
+        --ambient-caps=-all
+        --bounding-set=-all
+        --
+        /usr/bin/env
+        -i
+        HOME=/nonexistent
+        LANG=C
+        LC_ALL=C
+        PATH=/usr/bin:/bin
+        /usr/bin/git
+        -c
+        safe.directory=/build
+        -C
+        /build
+        status
+        --porcelain=v1
+        --untracked-files=all
+    )
+    local index=0
+    local rendered_command=""
+    local source_git_function=""
+
+    validate_packaged_jvm_source_identity /build 65534:65534 || \
+        test_fail 'exact packaged JVM source identity was rejected'
+    for mutation in \
+        '/workspace 65534:65534' \
+        '/build/.. 65534:65534' \
+        '/build 0:0' \
+        '/build 65534:0' \
+        '/build 0:65534' \
+        '/build 65533:65534' \
+        '/build 65534:65533'; do
+        # The mutation fixtures contain no whitespace in either field.
+        read -r path owner <<<"$mutation"
+        if validate_packaged_jvm_source_identity "$path" "$owner"; then
+            test_fail "packaged JVM source identity accepted mutation: ${mutation}"
+        fi
+    done
+
+    build_packaged_jvm_source_git_command \
+        command /bin/setpriv /usr/bin/git /build 65534:65534 \
+        rev-parse --verify 'HEAD^{commit}' || \
+        test_fail 'failed to build exact packaged JVM source Git command'
+    [[ ${#command[@]} -eq ${#expected[@]} ]] || \
+        test_fail 'packaged JVM source Git argv length changed'
+    for ((index = 0; index < ${#expected[@]}; index++)); do
+        [[ "${command[index]}" == "${expected[index]}" ]] || \
+            test_fail "packaged JVM source Git argv changed at index ${index}"
+    done
+    rendered_command="$(write_packaged_jvm_command_argv source_revision_argv "${command[@]}")"
+    [[ "$rendered_command" == 'source_revision_argv= /bin/setpriv --reuid=65534 --regid=65534 --clear-groups --no-new-privs --inh-caps=-all --ambient-caps=-all --bounding-set=-all -- /usr/bin/env -i HOME=/nonexistent LANG=C LC_ALL=C PATH=/usr/bin:/bin /usr/bin/git -c safe.directory=/build -C /build rev-parse --verify HEAD\^\{commit\}' ]] || \
+        test_fail 'packaged JVM source revision argv recording changed'
+    build_packaged_jvm_source_git_command \
+        status_command /bin/setpriv /usr/bin/git /build 65534:65534 \
+        status --porcelain=v1 --untracked-files=all || \
+        test_fail 'failed to build exact packaged JVM source status command'
+    [[ ${#status_command[@]} -eq ${#expected_status[@]} ]] || \
+        test_fail 'packaged JVM source status Git argv length changed'
+    for ((index = 0; index < ${#expected_status[@]}; index++)); do
+        [[ "${status_command[index]}" == "${expected_status[index]}" ]] || \
+            test_fail "packaged JVM source status Git argv changed at index ${index}"
+    done
+    rendered_command="$(write_packaged_jvm_command_argv source_status_argv "${status_command[@]}")"
+    [[ "$rendered_command" == 'source_status_argv= /bin/setpriv --reuid=65534 --regid=65534 --clear-groups --no-new-privs --inh-caps=-all --ambient-caps=-all --bounding-set=-all -- /usr/bin/env -i HOME=/nonexistent LANG=C LC_ALL=C PATH=/usr/bin:/bin /usr/bin/git -c safe.directory=/build -C /build status --porcelain=v1 --untracked-files=all' ]] || \
+        test_fail 'packaged JVM source status argv recording changed'
+
+    source_git_function="$(declare -f build_packaged_jvm_source_git_command)"
+    for required in \
+        '/usr/bin/env -i' \
+        "\"\${PACKAGED_JVM_SOURCE_GIT_ENVIRONMENT[@]}\"" \
+        "-c \"safe.directory=\$source_path\"" \
+        "-C \"\$source_path\""; do
+        [[ "$source_git_function" == *"$required"* ]] || \
+            test_fail "packaged JVM source Git command lost contract: ${required}"
+    done
+    for forbidden in \
+        'safe.directory=*' \
+        'git config --global' \
+        'HOME=/root'; do
+        [[ "$source_git_function" != *"$forbidden"* ]] || \
+            test_fail "packaged JVM source Git command added forbidden trust/environment: ${forbidden}"
+    done
+
+    for mutation in \
+        '/usr/bin/setpriv /usr/bin/git /build 65534:65534' \
+        '/bin/setpriv /bin/git /build 65534:65534' \
+        '/bin/setpriv /usr/bin/git /workspace 65534:65534' \
+        '/bin/setpriv /usr/bin/git /build 0:0'; do
+        read -r setpriv git path owner <<<"$mutation"
+        if build_packaged_jvm_source_git_command \
+            command "$setpriv" "$git" "$path" "$owner" rev-parse HEAD; then
+            test_fail "packaged JVM source Git command accepted mutation: ${mutation}"
         fi
     done
 }
@@ -452,6 +597,7 @@ test_packaged_jvm_setpriv_identity_contract() {
 test_packaged_jvm_runner_contract() {
     local build_function=""
     local benchmark_function=""
+    local source_git_function=""
     local validation_function=""
     local main_function=""
     local transport_line=""
@@ -462,6 +608,7 @@ test_packaged_jvm_runner_contract() {
 
     build_function="$(declare -f build_packaged_jvm_benchmark_test_binary)"
     benchmark_function="$(declare -f run_packaged_jvm_benchmark)"
+    source_git_function="$(declare -f build_packaged_jvm_source_git_command)"
     validation_function="$(declare -f require_packaged_jvm_benchmark_artifact)"
     main_function="$(declare -f main)"
     [[ "$build_function" == *'go test -c -tags=privileged_tests'* && \
@@ -469,6 +616,14 @@ test_packaged_jvm_runner_contract() {
         "$benchmark_function" == *'PATH=/usr/local/go/bin:/usr/bin:/bin command -v setpriv'* && \
         "$benchmark_function" == *"apk info --who-owns \"\$PACKAGED_JVM_SETPRIV_PATH\""* && \
         "$benchmark_function" == *'validate_packaged_jvm_setpriv_identity'* && \
+        "$benchmark_function" == *"validate_packaged_jvm_source_identity \"\$source_path\" \"\$source_owner\""* && \
+        "$benchmark_function" == *'build_packaged_jvm_source_git_command'* && \
+        "$benchmark_function" == *"source_revision=\"\$(\"\${source_revision_command[@]}\")\""* && \
+        "$benchmark_function" == *"source_status=\"\$(\"\${source_status_command[@]}\")\""* && \
+        "$benchmark_function" == *'write_packaged_jvm_command_argv source_revision_argv'* && \
+        "$benchmark_function" == *'write_packaged_jvm_command_argv source_status_argv'* && \
+        "$benchmark_function" != *"source_revision=\"\$(git "* && \
+        "$benchmark_function" != *"source_status=\"\$(git "* && \
         "$benchmark_function" == *"\"\$setpriv_path\" --version"* && \
         "$benchmark_function" == *'apk info -e openjdk21-jre-headless setpriv'* && \
         "$benchmark_function" == *'benchmark_environment=("HOME=/root" "LANG=C" "LC_ALL=C" "PATH=/usr/local/go/bin:/usr/bin:/bin" "TMPDIR=/tmp" "TZ=UTC"'* && \
@@ -477,7 +632,15 @@ test_packaged_jvm_runner_contract() {
         "$benchmark_function" == *'packaged-jvm-benchmark-root-environment.txt'* && \
         "$benchmark_function" == *'userspace=Alpine Linux'* && \
         "$benchmark_function" == *'kernel_input=RHEL 9.6 LVH pinned artifact'* && \
-        "$validation_function" == *'VALIDATE_CI_CROSSLINKS=1'* ]] || \
+        "$validation_function" == *'VALIDATE_CI_CROSSLINKS=1'* && \
+        "$source_git_function" == *'--no-new-privs'* && \
+        "$source_git_function" == *'--inh-caps=-all'* && \
+        "$source_git_function" == *'--ambient-caps=-all'* && \
+        "$source_git_function" == *'--bounding-set=-all'* && \
+        "$source_git_function" == *'/usr/bin/env -i'* && \
+        "$source_git_function" == *"\"\${PACKAGED_JVM_SOURCE_GIT_ENVIRONMENT[@]}\""* && \
+        "$source_git_function" == *"safe.directory=\$source_path"* && \
+        "$source_git_function" == *"-C \"\$source_path\""* ]] || \
         test_fail 'packaged JVM benchmark lost compile, environment, or identity contracts'
 
     transport_line="$(awk '/run_transport_benchmark/ { line = NR } END { print line }' <<<"$main_function")"
@@ -571,6 +734,7 @@ run_tests() {
     test_relative_agent_path_resolution
     test_rhel_ci_is_private_and_preserves_launch_status
     test_rhel_vm_installs_setpriv_without_dirtying_source
+    test_packaged_jvm_source_git_contract
     test_packaged_jvm_setpriv_identity_contract
     test_packaged_jvm_runner_contract
     printf '%s\n' 'RHEL verifier and transport benchmark validator tests passed'

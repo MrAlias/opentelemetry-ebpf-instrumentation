@@ -16,6 +16,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -509,15 +510,22 @@ func validatePackagedJVMBenchmarkSourceOwnership(
 
 func packagedJVMBenchmarkGitCommandArguments(
 	git string,
-	repository string,
+	safeDirectory string,
+	workingDirectory string,
 	owner packagedJVMBenchmarkSourceOwner,
 	arguments ...string,
 ) ([]string, error) {
 	if !filepath.IsAbs(git) || filepath.Clean(git) != git {
 		return nil, errors.New("packaged JVM benchmark git executable must be an absolute clean path")
 	}
-	if !filepath.IsAbs(repository) || filepath.Clean(repository) != repository {
-		return nil, errors.New("packaged JVM benchmark git repository must be an absolute clean path")
+	if !filepath.IsAbs(safeDirectory) || filepath.Clean(safeDirectory) != safeDirectory {
+		return nil, errors.New("packaged JVM benchmark Git safe directory must be an absolute clean path")
+	}
+	if strings.ContainsAny(safeDirectory, "*?") {
+		return nil, errors.New("packaged JVM benchmark Git safe directory must not contain wildcards")
+	}
+	if !filepath.IsAbs(workingDirectory) || filepath.Clean(workingDirectory) != workingDirectory {
+		return nil, errors.New("packaged JVM benchmark Git working directory must be an absolute clean path")
 	}
 	if owner.UID == 0 || owner.GID == 0 {
 		return nil, errors.New("packaged JVM benchmark git command requires a non-root source owner")
@@ -532,8 +540,10 @@ func packagedJVMBenchmarkGitCommandArguments(
 		"--bounding-set=-all",
 		"--",
 		git,
+		"-c",
+		"safe.directory=" + safeDirectory,
 		"-C",
-		repository,
+		workingDirectory,
 	}
 	return append(commandArguments, arguments...), nil
 }
@@ -1913,13 +1923,14 @@ func TestValidatePackagedJVMBenchmarkProbeEOFFailsClosed(t *testing.T) {
 	)
 }
 
-func TestPackagedJVMBenchmarkGitCommandDropsRootHarnessToExactSourceOwner(t *testing.T) {
+func TestPackagedJVMBenchmarkGitCommandScopesTrustAndDropsToExactSourceOwner(t *testing.T) {
 	owner := packagedJVMBenchmarkSourceOwner{UID: 1002, GID: 1005}
 	require.NoError(t, validatePackagedJVMBenchmarkSourceOwnership(0, owner, owner))
 
 	arguments, err := packagedJVMBenchmarkGitCommandArguments(
 		"/usr/bin/git",
 		"/workspace/repository",
+		"/workspace/repository/pkg",
 		owner,
 		"rev-parse",
 		"--show-toplevel",
@@ -1935,11 +1946,55 @@ func TestPackagedJVMBenchmarkGitCommandDropsRootHarnessToExactSourceOwner(t *tes
 		"--bounding-set=-all",
 		"--",
 		"/usr/bin/git",
+		"-c",
+		"safe.directory=/workspace/repository",
 		"-C",
-		"/workspace/repository",
+		"/workspace/repository/pkg",
 		"rev-parse",
 		"--show-toplevel",
 	}, arguments)
+}
+
+func TestPackagedJVMBenchmarkGitCommandScopesDubiousOwnershipTrust(t *testing.T) {
+	git, err := exec.LookPath("git")
+	require.NoError(t, err)
+	git, err = filepath.EvalSymlinks(git)
+	require.NoError(t, err)
+	repository := t.TempDir()
+	command := exec.Command(git, "init", "--quiet", repository)
+	command.Env = expectedPackagedJVMBenchmarkEnvironment
+	require.NoError(t, command.Run())
+	workingDirectory := filepath.Join(repository, "pkg")
+	require.NoError(t, os.Mkdir(workingDirectory, 0o755))
+
+	owner := packagedJVMBenchmarkSourceOwner{UID: 1002, GID: 1005}
+	arguments, err := packagedJVMBenchmarkGitCommandArguments(
+		git,
+		repository,
+		workingDirectory,
+		owner,
+		"rev-parse",
+		"--show-toplevel",
+	)
+	require.NoError(t, err)
+	gitArgumentsIndex := slices.Index(arguments, git)
+	require.NotEqual(t, -1, gitArgumentsIndex)
+
+	dubiousEnvironment := append(
+		slices.Clone(expectedPackagedJVMBenchmarkEnvironment),
+		"GIT_TEST_ASSUME_DIFFERENT_OWNER=1",
+	)
+	withoutScopedTrust := exec.Command(git, arguments[gitArgumentsIndex+3:]...)
+	withoutScopedTrust.Env = dubiousEnvironment
+	output, err := withoutScopedTrust.CombinedOutput()
+	require.Error(t, err)
+	require.Contains(t, string(output), "dubious ownership")
+
+	withScopedTrust := exec.Command(git, arguments[gitArgumentsIndex+1:]...)
+	withScopedTrust.Env = dubiousEnvironment
+	output, err = withScopedTrust.Output()
+	require.NoError(t, err)
+	require.Equal(t, repository, strings.TrimSpace(string(output)))
 }
 
 func TestPackagedJVMBenchmarkSourceOwnershipAndGitCommandRejectMutations(t *testing.T) {
@@ -1986,26 +2041,69 @@ func TestPackagedJVMBenchmarkSourceOwnershipAndGitCommandRejectMutations(t *test
 		{
 			name: "relative git",
 			validate: func() error {
-				_, err := packagedJVMBenchmarkGitCommandArguments("git", "/workspace/repository", owner)
+				_, err := packagedJVMBenchmarkGitCommandArguments(
+					"git", "/workspace/repository", "/workspace/repository/pkg", owner,
+				)
 				return err
 			},
 			wantError: "git executable must be an absolute clean path",
 		},
 		{
-			name: "unclean repository",
+			name: "relative safe directory",
 			validate: func() error {
 				_, err := packagedJVMBenchmarkGitCommandArguments(
-					"/usr/bin/git", "/workspace/../workspace/repository", owner,
+					"/usr/bin/git", "workspace/repository", "/workspace/repository/pkg", owner,
 				)
 				return err
 			},
-			wantError: "git repository must be an absolute clean path",
+			wantError: "safe directory must be an absolute clean path",
+		},
+		{
+			name: "unclean safe directory",
+			validate: func() error {
+				_, err := packagedJVMBenchmarkGitCommandArguments(
+					"/usr/bin/git", "/workspace/../workspace/repository", "/workspace/repository/pkg", owner,
+				)
+				return err
+			},
+			wantError: "safe directory must be an absolute clean path",
+		},
+		{
+			name: "wildcard safe directory",
+			validate: func() error {
+				_, err := packagedJVMBenchmarkGitCommandArguments(
+					"/usr/bin/git", "/workspace/*", "/workspace/repository/pkg", owner,
+				)
+				return err
+			},
+			wantError: "safe directory must not contain wildcards",
+		},
+		{
+			name: "relative working directory",
+			validate: func() error {
+				_, err := packagedJVMBenchmarkGitCommandArguments(
+					"/usr/bin/git", "/workspace/repository", "workspace/repository/pkg", owner,
+				)
+				return err
+			},
+			wantError: "working directory must be an absolute clean path",
+		},
+		{
+			name: "unclean working directory",
+			validate: func() error {
+				_, err := packagedJVMBenchmarkGitCommandArguments(
+					"/usr/bin/git", "/workspace/repository", "/workspace/repository/../repository/pkg", owner,
+				)
+				return err
+			},
+			wantError: "working directory must be an absolute clean path",
 		},
 		{
 			name: "root command owner",
 			validate: func() error {
 				_, err := packagedJVMBenchmarkGitCommandArguments(
-					"/usr/bin/git", "/workspace/repository", packagedJVMBenchmarkSourceOwner{},
+					"/usr/bin/git", "/workspace/repository", "/workspace/repository/pkg",
+					packagedJVMBenchmarkSourceOwner{},
 				)
 				return err
 			},

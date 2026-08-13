@@ -195,7 +195,6 @@ export HOME=/root
 export GOCACHE=/overlay/gocache
 export TMPDIR=/overlay/tmp
 mkdir -p "$HOME" "$GOCACHE" "$TMPDIR"
-git config --global --add safe.directory /build
 
 echo "--- mount state ---"
 mount | grep -E "cgroup|sys/fs" || true
@@ -274,7 +273,14 @@ if [ -n "$target" ]; then
         docker load -i /precompiled-tests/base-images.tar
     fi
 
-    cd /build && make $target TEST_PATTERN="$test_pattern" RUN_NUMBER="$run_number" && touch /build/testoutput/success
+    cd /build
+    if [ "$target" = "run-java-remote-parent-rhel-kernel-sockopt-vm" ]; then
+        # This target's source identity must not run through Make's root-level
+        # Git expansions. Its Bash runner drops only the bounded Git commands.
+        bash internal/test/vm/run-java-remote-parent-rhel.sh
+    else
+        make "$target" TEST_PATTERN="$test_pattern" RUN_NUMBER="$run_number"
+    fi && touch /build/testoutput/success
     poweroff
 else
     echo "Entering interactive mode (no /build/testoutput/test-env)"

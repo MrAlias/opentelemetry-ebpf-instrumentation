@@ -8683,6 +8683,9 @@ test_unix_generation_mismatch_control_is_exact_and_bounded() {
   local -r delta="$result_dir/diagnostics.delta"
   local -r metrics="$result_dir/metrics.delta"
   local control=""
+  local runtime_contract=""
+  local barrier_helpers=""
+  local unix_compose_use_count=""
   local line_ready=""
   local line_armed=""
   local line_release=""
@@ -8734,6 +8737,15 @@ EOF
   fi
 
   control="$(declare -f run_unix_generation_mismatch_control)" || return $?
+  runtime_contract="$(declare -f assert_unix_generation_mismatch_runtime_contract)" || return $?
+  barrier_helpers="$(
+    declare -f arm_unix_generation_barrier
+    declare -f consume_unix_generation_barrier
+  )" || return $?
+  unix_compose_use_count="$(
+    grep -Fo '${UNIX_GENERATION_FAULT_COMPOSE[@]}' <<<"$control" |
+      awk 'END { print NR + 0 }'
+  )" || return $?
   line_ready="$(awk '/wait_for_unix_generation_barrier_ready/ { line=NR } END { print line }' <<<"$control")"
   line_armed="$(awk '/wait_for_generation_fault_armed/ { line=NR } END { print line }' <<<"$control")"
   line_release="$(awk '/release_unix_generation_barrier/ { line=NR } END { print line }' <<<"$control")"
@@ -8753,18 +8765,29 @@ EOF
   assert_unix_generation_deadlines || return $?
   grep -Fq 'java_remote_parent_unix_generation_barrier_timeout_millis = 25000' \
     "$TEST_SCRIPT_DIR/../java/fault/getsockopt_fault_shim.c" || return 1
-  grep -Fq 'OTEL_EBPF_JAVA_REMOTE_PARENT_TIMEOUT: ${OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TIMEOUT:?}' \
+  grep -Fqx '      OTEL_EBPF_JAVA_REMOTE_PARENT_TIMEOUT: 30s' \
+    "$TEST_SCRIPT_DIR/../docker-compose.unix-generation-fault.yml" || return 1
+  ! grep -Fq 'OTEL_EBPF_JAVA_REMOTE_PARENT_TIMEOUT:' \
     "$TEST_SCRIPT_DIR/../docker-compose.primary-fault.yml" || return 1
   grep -Fq 'OTEL_EBPF_JAVA_REMOTE_PARENT_TIMEOUT: 50ms' \
     "$TEST_SCRIPT_DIR/../docker-compose.yml" || return 1
-  [[ "$control" == *'OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TIMEOUT="30s"'* && \
-    "$control" == *'OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TIMEOUT="50ms"'* && \
+  [[ "$control" == *'unix true false unix-generation-fault'* && \
+    "$unix_compose_use_count" == 3 && \
+    "$control" != *'${PRIMARY_FAULT_COMPOSE[@]}'* && \
+    "$control" != *'OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TIMEOUT'* && \
     "$control" == *'"$((before_take_attempts + 1))" "$((before_stage + 1))"'* && \
     "$control" == *'take already_consumed unix 1 1'* && \
     "$control" == *'unix 0 0 0 1 1 false 0 0 1'* && \
     "$control" == *'local -r status="$?"'* && \
     "$control" == *'if ((status == 0 && restore_status != 0))'* ]] || {
     printf 'Unix generation control lost its timeout, exact fence, or status preservation\n' >&2
+    return 1
+  }
+  [[ "$runtime_contract" == *'"${UNIX_GENERATION_FAULT_COMPOSE[@]}" ps --quiet obi'* && \
+    "$runtime_contract" != *'${PRIMARY_FAULT_COMPOSE[@]}'* && \
+    "$(grep -Fc 'unix-generation-fault' <<<"$barrier_helpers")" == 2 && \
+    "$barrier_helpers" != *'primary-fault'* ]] || {
+    printf 'Unix generation runtime checks or barrier helpers escaped the static overlay\n' >&2
     return 1
   }
   local -r expected_status='{"status":"passed","scenario":"unix-generation-mismatch","transport":"unix","live_owner_mutation":"verified","barrier":"pre-send","bridge_timeout_ms":30000,"take_status":"already_consumed","wrong_parent_count":0,"w3c_precedence":"passed","exact_restore":"verified","post_fault_recovery":"passed","before_phase":"phases/unix-generation-mismatch-before","after_phase":"phases/unix-generation-mismatch-after"}'
@@ -20647,6 +20670,7 @@ prepare_fixture_source_snapshot() {
       COMPOSE_FILE="$REPO_ROOT/examples/apache-java-https/docker-compose.yml"
       PRIMARY_FAULT_COMPOSE_FILE="$REPO_ROOT/examples/apache-java-https/docker-compose.primary-fault.yml"
       PRIMARY_LIVE_FD_COMPOSE_FILE="$REPO_ROOT/examples/apache-java-https/docker-compose.primary-live-fd.yml"
+      UNIX_GENERATION_FAULT_COMPOSE_FILE="$REPO_ROOT/examples/apache-java-https/docker-compose.unix-generation-fault.yml"
       COMPOSE_PROJECT_DIRECTORY="$REPO_ROOT/examples/apache-java-https"
       COMPOSE=(
         docker compose --project-name "$PROJECT_NAME" \
@@ -20661,6 +20685,11 @@ prepare_fixture_source_snapshot() {
         docker compose --project-name "$PROJECT_NAME" \
           --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE" \
           --file "$PRIMARY_FAULT_COMPOSE_FILE" --file "$PRIMARY_LIVE_FD_COMPOSE_FILE"
+      )
+      UNIX_GENERATION_FAULT_COMPOSE=(
+        docker compose --project-name "$PROJECT_NAME" \
+          --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE" \
+          --file "$PRIMARY_FAULT_COMPOSE_FILE" --file "$UNIX_GENERATION_FAULT_COMPOSE_FILE"
       )
 
       unset GIT_NO_REPLACE_OBJECTS
@@ -20680,6 +20709,21 @@ prepare_fixture_source_snapshot() {
           "$SOURCE_SNAPSHOT_DIR/examples/apache-java-https/docker-compose.primary-fault.yml" && \
         "$PRIMARY_LIVE_FD_COMPOSE_FILE" == \
           "$SOURCE_SNAPSHOT_DIR/examples/apache-java-https/docker-compose.primary-live-fd.yml" && \
+        "$UNIX_GENERATION_FAULT_COMPOSE_FILE" == \
+          "$SOURCE_SNAPSHOT_DIR/examples/apache-java-https/docker-compose.unix-generation-fault.yml" && \
+        "${#UNIX_GENERATION_FAULT_COMPOSE[@]}" == 12 && \
+        "${UNIX_GENERATION_FAULT_COMPOSE[0]}" == docker && \
+        "${UNIX_GENERATION_FAULT_COMPOSE[1]}" == compose && \
+        "${UNIX_GENERATION_FAULT_COMPOSE[2]}" == --project-name && \
+        "${UNIX_GENERATION_FAULT_COMPOSE[3]}" == "$PROJECT_NAME" && \
+        "${UNIX_GENERATION_FAULT_COMPOSE[4]}" == --project-directory && \
+        "${UNIX_GENERATION_FAULT_COMPOSE[5]}" == "$SOURCE_SNAPSHOT_DIR/examples/apache-java-https" && \
+        "${UNIX_GENERATION_FAULT_COMPOSE[6]}" == --file && \
+        "${UNIX_GENERATION_FAULT_COMPOSE[7]}" == "$COMPOSE_FILE" && \
+        "${UNIX_GENERATION_FAULT_COMPOSE[8]}" == --file && \
+        "${UNIX_GENERATION_FAULT_COMPOSE[9]}" == "$PRIMARY_FAULT_COMPOSE_FILE" && \
+        "${UNIX_GENERATION_FAULT_COMPOSE[10]}" == --file && \
+        "${UNIX_GENERATION_FAULT_COMPOSE[11]}" == "$UNIX_GENERATION_FAULT_COMPOSE_FILE" && \
         "${COMPOSE[*]}" == *"--project-directory $SOURCE_SNAPSHOT_DIR/examples/apache-java-https"* && \
         ! -e "$SOURCE_SNAPSHOT_DIR/ignored-build-input" && \
         -L "$SOURCE_SNAPSHOT_DIR/link" && \
@@ -21177,6 +21221,8 @@ test_source_controls_and_bridge_export_use_private_work_directory() {
     >"$source_repository/examples/apache-java-https/docker-compose.primary-fault.yml"
   printf 'services: {}\n' \
     >"$source_repository/examples/apache-java-https/docker-compose.primary-live-fd.yml"
+  printf 'services: {}\n' \
+    >"$source_repository/examples/apache-java-https/docker-compose.unix-generation-fault.yml"
   printf 'FROM scratch\nCOPY . /source\n' >"$source_repository/javaagent.Dockerfile"
   git -C "$source_repository" add -- .
   git -C "$source_repository" commit --quiet -m 'Create private source-work fixture'
@@ -21332,6 +21378,8 @@ test_clean_source_snapshot_uses_pinned_git_inputs() {
     >"$source_repository/examples/apache-java-https/docker-compose.primary-fault.yml"
   printf 'services: {}\n' \
     >"$source_repository/examples/apache-java-https/docker-compose.primary-live-fd.yml"
+  printf 'services: {}\n' \
+    >"$source_repository/examples/apache-java-https/docker-compose.unix-generation-fault.yml"
   printf 'FROM scratch\nCOPY . /source\n' >"$source_repository/javaagent.Dockerfile"
   git -C "$source_repository" add -- .
   git -C "$source_repository" commit --quiet -m 'Create source snapshot fixture'
@@ -23406,9 +23454,11 @@ test_primary_live_fd_compose_topology_is_scoped() {
   local -r compose_file="$TEST_SCRIPT_DIR/../docker-compose.yml"
   local -r primary_fault_file="$TEST_SCRIPT_DIR/../docker-compose.primary-fault.yml"
   local -r live_fd_file="$TEST_SCRIPT_DIR/../docker-compose.primary-live-fd.yml"
+  local -r unix_generation_fault_file="$TEST_SCRIPT_DIR/../docker-compose.unix-generation-fault.yml"
   local -r base_resolved="$TEST_TMP_DIR/primary-live-fd-base-resolved.json"
   local -r primary_fault_resolved="$TEST_TMP_DIR/primary-live-fd-fault-resolved.json"
   local -r live_fd_resolved="$TEST_TMP_DIR/primary-live-fd-resolved.json"
+  local -r unix_generation_fault_resolved="$TEST_TMP_DIR/unix-generation-fault-resolved.json"
   local -r custom_project_resolved="$TEST_TMP_DIR/primary-live-fd-custom-project.json"
   local -r expanded_live_fd_resolved="$TEST_TMP_DIR/primary-live-fd-expanded-resolved.json"
   local -r expanded_primary_fault_resolved="$TEST_TMP_DIR/primary-fault-expanded-resolved.json"
@@ -23482,12 +23532,14 @@ test_primary_live_fd_compose_topology_is_scoped() {
       'primary live-descriptor source rejected safe legacy Compose capabilities' \
       compose_file_build_arguments_are_explicit "$compose_file" || return $?
   ) || return $?
-  for compose_overlay in "$compose_file" "$primary_fault_file" "$live_fd_file"; do
+  for compose_overlay in \
+    "$compose_file" "$primary_fault_file" "$live_fd_file" "$unix_generation_fault_file"; do
     assert_policy_acceptance \
       'primary live-descriptor Compose files must use explicit build inputs' \
       compose_file_build_arguments_are_explicit "$compose_overlay" || return $?
   done
-  for compose_overlay in "$primary_fault_file" "$live_fd_file"; do
+  for compose_overlay in \
+    "$primary_fault_file" "$live_fd_file" "$unix_generation_fault_file"; do
     assert_policy_acceptance \
       'primary live-descriptor overlays must not depend on runtime interpolation' \
       compose_overlay_is_interpolation_free "$compose_overlay" || return $?
@@ -24168,6 +24220,26 @@ test_primary_live_fd_compose_topology_is_scoped() {
     config --format json >"$live_fd_resolved"; then
     return 2
   fi
+  if ! env "${runtime_environment[@]}" docker compose \
+    --project-name "$PROJECT_NAME" --file "$compose_file" \
+    --file "$primary_fault_file" --file "$unix_generation_fault_file" \
+    config --format json >"$unix_generation_fault_resolved"; then
+    return 2
+  fi
+  assert_policy_acceptance \
+    'Unix generation fault runtime lost its static timeout-only override' \
+    jq -e -s '
+      length == 3
+      and .[0].services.obi.environment.OTEL_EBPF_JAVA_REMOTE_PARENT_TIMEOUT == "50ms"
+      and .[1].services.obi.environment.OTEL_EBPF_JAVA_REMOTE_PARENT_TIMEOUT == "50ms"
+      and .[2].services.obi.environment.OTEL_EBPF_JAVA_REMOTE_PARENT_TIMEOUT == "30s"
+      and (
+        (.[1] | del(.services.obi.environment.OTEL_EBPF_JAVA_REMOTE_PARENT_TIMEOUT))
+        ==
+        (.[2] | del(.services.obi.environment.OTEL_EBPF_JAVA_REMOTE_PARENT_TIMEOUT))
+      )
+    ' "$base_resolved" "$primary_fault_resolved" \
+      "$unix_generation_fault_resolved" >/dev/null || return $?
   assert_policy_acceptance \
     'primary W3C fault runtime expanded beyond its scoped backend changes' \
     primary_fault_resolved_topology_is_scoped \

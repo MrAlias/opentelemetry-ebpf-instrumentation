@@ -1,0 +1,4 @@
+services:
+  obi:
+    environment:
+      OTEL_EBPF_JAVA_REMOTE_PARENT_TIMEOUT: 30s

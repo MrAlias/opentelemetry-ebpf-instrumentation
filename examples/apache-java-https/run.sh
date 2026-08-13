@@ -266,13 +266,13 @@ PROJECT_GUARD_ROOT="/tmp/obi-apache-java-https-project-guard-$EUID"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 PRIMARY_FAULT_COMPOSE_FILE="$SCRIPT_DIR/docker-compose.primary-fault.yml"
 PRIMARY_LIVE_FD_COMPOSE_FILE="$SCRIPT_DIR/docker-compose.primary-live-fd.yml"
+UNIX_GENERATION_FAULT_COMPOSE_FILE="$SCRIPT_DIR/docker-compose.unix-generation-fault.yml"
 COMPOSE_PROJECT_DIRECTORY="$SCRIPT_DIR"
 PROJECT_NAME="${COMPOSE_PROJECT_NAME:-$PROJECT_NAMESPACE}"
 
 TRANSPORT="getsockopt"
 REMOTE_PARENT_TTL="30s"
 REMOTE_PARENT_RETRIEVAL_TTL="0s"
-OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TIMEOUT="50ms"
 AGENT_DISTRIBUTION="otel"
 TLS_PROTOCOL="TLSv1.3"
 SCENARIO="all"
@@ -404,6 +404,11 @@ declare -a PRIMARY_LIVE_FD_COMPOSE=(
   docker compose --project-name "$PROJECT_NAME" \
     --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE" \
     --file "$PRIMARY_FAULT_COMPOSE_FILE" --file "$PRIMARY_LIVE_FD_COMPOSE_FILE"
+)
+declare -a UNIX_GENERATION_FAULT_COMPOSE=(
+  docker compose --project-name "$PROJECT_NAME" \
+    --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE" \
+    --file "$PRIMARY_FAULT_COMPOSE_FILE" --file "$UNIX_GENERATION_FAULT_COMPOSE_FILE"
 )
 
 usage() {
@@ -3582,6 +3587,7 @@ prepare_source_snapshot() {
   local snapshot_compose_file=""
   local snapshot_fault_compose_file=""
   local snapshot_live_fd_compose_file=""
+  local snapshot_unix_generation_fault_compose_file=""
   local source_artifact_dir="$ARTIFACT_DIR"
   local artifact_file=""
   local -a reusable_bridge_artifact_files=(
@@ -3623,9 +3629,12 @@ prepare_source_snapshot() {
   snapshot_compose_file="$SOURCE_SNAPSHOT_SCRIPT_DIR/docker-compose.yml"
   snapshot_fault_compose_file="$SOURCE_SNAPSHOT_SCRIPT_DIR/docker-compose.primary-fault.yml"
   snapshot_live_fd_compose_file="$SOURCE_SNAPSHOT_SCRIPT_DIR/docker-compose.primary-live-fd.yml"
+  snapshot_unix_generation_fault_compose_file="$SOURCE_SNAPSHOT_SCRIPT_DIR/docker-compose.unix-generation-fault.yml"
   [[ -f "$snapshot_compose_file" && ! -L "$snapshot_compose_file" && \
     -f "$snapshot_fault_compose_file" && ! -L "$snapshot_fault_compose_file" && \
-    -f "$snapshot_live_fd_compose_file" && ! -L "$snapshot_live_fd_compose_file" ]] || {
+    -f "$snapshot_live_fd_compose_file" && ! -L "$snapshot_live_fd_compose_file" && \
+    -f "$snapshot_unix_generation_fault_compose_file" && \
+    ! -L "$snapshot_unix_generation_fault_compose_file" ]] || {
     die "source snapshot lacks the demo Compose configuration"
   }
 
@@ -3641,6 +3650,7 @@ prepare_source_snapshot() {
   COMPOSE_FILE="$snapshot_compose_file"
   PRIMARY_FAULT_COMPOSE_FILE="$snapshot_fault_compose_file"
   PRIMARY_LIVE_FD_COMPOSE_FILE="$snapshot_live_fd_compose_file"
+  UNIX_GENERATION_FAULT_COMPOSE_FILE="$snapshot_unix_generation_fault_compose_file"
   COMPOSE_PROJECT_DIRECTORY="$SOURCE_SNAPSHOT_SCRIPT_DIR"
   COMPOSE=(
     docker compose --project-name "$PROJECT_NAME" \
@@ -3655,6 +3665,11 @@ prepare_source_snapshot() {
     docker compose --project-name "$PROJECT_NAME" \
       --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE" \
       --file "$PRIMARY_FAULT_COMPOSE_FILE" --file "$PRIMARY_LIVE_FD_COMPOSE_FILE"
+  )
+  UNIX_GENERATION_FAULT_COMPOSE=(
+    docker compose --project-name "$PROJECT_NAME" \
+      --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE" \
+      --file "$PRIMARY_FAULT_COMPOSE_FILE" --file "$UNIX_GENERATION_FAULT_COMPOSE_FILE"
   )
   assert_clean_source_checkout_is_stable
 }
@@ -3916,8 +3931,6 @@ export_compose_environment() {
   export BRIDGE_TRANSPORT="$TRANSPORT"
   export REMOTE_PARENT_TTL
   export REMOTE_PARENT_RETRIEVAL_TTL
-  OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TIMEOUT="50ms"
-  export OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TIMEOUT
   export BACKEND_TLS_PROTOCOL="$TLS_PROTOCOL"
   CONTEXT_PROPAGATION="tcp"
   export CONTEXT_PROPAGATION
@@ -4827,7 +4840,7 @@ assert_unix_generation_mismatch_runtime_contract() {
   local timeout_count=""
 
   [[ ! -e "$output" && ! -L "$output" ]] || return 1
-  obi_container="$(run_bounded 10 "${PRIMARY_FAULT_COMPOSE[@]}" ps --quiet obi)" || return $?
+  obi_container="$(run_bounded 10 "${UNIX_GENERATION_FAULT_COMPOSE[@]}" ps --quiet obi)" || return $?
   [[ -n "$obi_container" ]] || return 1
   environment="$(run_bounded 10 docker inspect \
     --format '{{range .Config.Env}}{{println .}}{{end}}' "$obi_container")" || return $?
@@ -9812,6 +9825,9 @@ recreate_instrumented_stack() {
     primary-live-fd)
       compose_command=("${PRIMARY_LIVE_FD_COMPOSE[@]}")
       ;;
+    unix-generation-fault)
+      compose_command=("${UNIX_GENERATION_FAULT_COMPOSE[@]}")
+      ;;
     *)
       log_error "unsupported instrumented-stack Compose flavor: $compose_flavor"
       return 1
@@ -9837,7 +9853,8 @@ recreate_instrumented_stack() {
   invalidate_selected_transport || return $?
   BRIDGE_RUNNING=false
   if [[ "$compose_flavor" == "primary-fault" || \
-    "$compose_flavor" == "primary-live-fd" ]]; then
+    "$compose_flavor" == "primary-live-fd" || \
+    "$compose_flavor" == "unix-generation-fault" ]]; then
     run_bounded 30 "${compose_command[@]}" config --quiet || return $?
     run_bounded 30 "${compose_command[@]}" config \
       >"$RESULT_DIR/compose-${compose_flavor}-resolved.yaml" || return $?
@@ -10941,6 +10958,9 @@ arm_java_fault_control() {
     primary-fault)
       compose_command=("${PRIMARY_FAULT_COMPOSE[@]}")
       ;;
+    unix-generation-fault)
+      compose_command=("${UNIX_GENERATION_FAULT_COMPOSE[@]}")
+      ;;
     *)
       return 1
       ;;
@@ -10999,7 +11019,7 @@ arm_primary_live_fd_barrier() {
 }
 
 arm_unix_generation_barrier() {
-  arm_java_fault_control "$1" primary-fault unix-generation-barrier
+  arm_java_fault_control "$1" unix-generation-fault unix-generation-barrier
 }
 
 read_java_fault_control() {
@@ -11302,6 +11322,9 @@ consume_java_fault_control() {
     primary-fault)
       compose_command=("${PRIMARY_FAULT_COMPOSE[@]}")
       ;;
+    unix-generation-fault)
+      compose_command=("${UNIX_GENERATION_FAULT_COMPOSE[@]}")
+      ;;
     *)
       return 1
       ;;
@@ -11347,7 +11370,7 @@ consume_primary_live_fd_barrier() {
 }
 
 consume_unix_generation_barrier() {
-  consume_java_fault_control "$1" primary-fault
+  consume_java_fault_control "$1" unix-generation-fault
 }
 
 run_primary_w3c_fault_scenario() {
@@ -12068,8 +12091,6 @@ run_unix_generation_mismatch_control() (
     if [[ "$restore_required" == "true" ]]; then
       (
         set -Eeuo pipefail
-        OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TIMEOUT="50ms"
-        export OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TIMEOUT
         recreate_instrumented_stack \
           tcp "post-Unix generation mismatch recovery" unix true false base
         assert_runtime_contract basic true
@@ -12103,13 +12124,11 @@ run_unix_generation_mismatch_control() (
 
   restore_required=true
   PRIMARY_FAULT_STACK_ACTIVE=true
-  OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TIMEOUT="30s"
-  export OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TIMEOUT
   recreate_instrumented_stack \
-    tcp "Unix generation mismatch preparation" unix true false primary-fault || return $?
+    tcp "Unix generation mismatch preparation" unix true false unix-generation-fault || return $?
   assert_runtime_contract unix-generation-mismatch true || return $?
   assert_unix_generation_mismatch_runtime_contract "$runtime_evidence" || return $?
-  java_container="$(run_bounded 10 "${PRIMARY_FAULT_COMPOSE[@]}" ps --quiet java-backend)" || return $?
+  java_container="$(run_bounded 10 "${UNIX_GENERATION_FAULT_COMPOSE[@]}" ps --quiet java-backend)" || return $?
   [[ -n "$java_container" ]] || return 1
   java_inspection_before="$(run_bounded 10 docker inspect \
     --format '{{.Id}} {{.State.Pid}} {{.State.StartedAt}}' "$java_container")" || return $?
@@ -12143,7 +12162,7 @@ run_unix_generation_mismatch_control() (
   arm_unix_generation_barrier "$arm_evidence" || return $?
   timeout --signal=TERM --kill-after=10s \
     "${PRIMARY_LIVE_FD_VICTIM_TIMEOUT_SECONDS}s" \
-    "${PRIMARY_FAULT_COMPOSE[@]}" run --rm --no-deps --no-TTY scenario \
+    "${UNIX_GENERATION_FAULT_COMPOSE[@]}" run --rm --no-deps --no-TTY scenario \
       --scenario unix-generation-mismatch \
       --expected-tls "$TLS_PROTOCOL" \
       --seed "$SCENARIO_SEED" \
@@ -12160,7 +12179,7 @@ run_unix_generation_mismatch_control() (
   GENERATION_FAULT_CONTROL_SOURCE="$control_directory" \
     timeout --signal=TERM --kill-after=5s \
       "${GENERATION_FAULT_HELPER_TIMEOUT_SECONDS}s" \
-      "${PRIMARY_FAULT_COMPOSE[@]}" run --rm --no-deps --no-TTY generation-fault \
+      "${UNIX_GENERATION_FAULT_COMPOSE[@]}" run --rm --no-deps --no-TTY generation-fault \
         --process-pid "$java_process_pid" \
         --process-namespace "$java_process_namespace" \
         --control-dir /control \
@@ -12203,8 +12222,6 @@ run_unix_generation_mismatch_control() (
   assert_bridge_metric_delta \
     "$metric_delta" unix 0 0 0 1 1 false 0 0 1 || return $?
 
-  OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TIMEOUT="50ms"
-  export OBI_DEMO_JAVA_REMOTE_PARENT_FAULT_TIMEOUT
   recreate_instrumented_stack \
     tcp "post-Unix generation mismatch recovery" unix true false base || return $?
   assert_runtime_contract basic true || return $?

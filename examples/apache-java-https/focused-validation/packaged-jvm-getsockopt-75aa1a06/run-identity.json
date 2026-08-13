@@ -1,0 +1,56 @@
+{
+  "format": 1,
+  "kind": "focused-packaged-jvm-getsockopt",
+  "raw_artifact": {
+    "retained": false,
+    "sha256": "ad9f0cd2b2d33dc0402821eb87b3de9e0c23750a423cba262246964841e9b7a5",
+    "size_bytes": 9837,
+    "source_filename": "packaged-jvm-getsockopt.json"
+  },
+  "result": {
+    "benchmark": "passed",
+    "compiled_decoder": "passed",
+    "sanitized_bundle": "passed"
+  },
+  "scope": {
+    "acceptance_evidence": false,
+    "advances_issues": [
+      11,
+      20,
+      37
+    ],
+    "closes_issues": [],
+    "evidence_class": "focused_non_acceptance",
+    "execution_environment": "local_upstream_host",
+    "limitations": [
+      "no_public_ci_locator",
+      "not_rhel9_matrix_evidence",
+      "not_apache_application_acceptance",
+      "no_allocations_or_resource_growth",
+      "no_concurrency_or_run_to_run_variance"
+    ],
+    "public_ci_locator_available": false,
+    "public_ci_locator_reason": "execution was a local upstream-host run"
+  },
+  "source": {
+    "clean": true,
+    "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "repository": "MrAlias/opentelemetry-ebpf-instrumentation",
+    "revision": "75aa1a06afad7777cfc67b0632ae8f3402f40264",
+    "status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "summary_file": "benchmark-summary.json",
+  "validation": {
+    "compiled_decoder": {
+      "loads_bpf": false,
+      "result": "passed",
+      "test": "TestValidatePackagedJVMBenchmarkArtifactFile"
+    },
+    "post_run_topology": {
+      "direct_hierarchy_chains_empty": true,
+      "effective_chains_empty": true,
+      "intended_program_ids_absent": true
+    },
+    "raw_artifact_matches_declared_identity": true
+  }
+}

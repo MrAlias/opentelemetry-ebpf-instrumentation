@@ -205,7 +205,9 @@ selection or record decoding, application instrumentation or request latency,
 Unix fallback, throughput, allocations, process/native resource growth, or
 concurrency or run-to-run variance. It supplies neither the concurrent
 acceptance evidence in issue #11 nor the allocation/resource-growth evidence
-in issues #20 and #37.
+in issues #20 and #37. The retained local upstream-host result below is focused
+non-acceptance evidence: it advances, but does not complete, the Java/JNI
+latency evidence for #11, #20, and #37.
 
 Build the packaged agent first. On an otherwise idle privileged cgroup-v2 host,
 create a fresh artifact path in an existing owner-private directory and run:
@@ -255,9 +257,12 @@ go test ./pkg/internal/ebpf/tpinjector \
   -run '^TestValidatePackagedJVMBenchmarkArtifactFile$' -count=1 -v
 ```
 
-No retained packaged-JVM latency artifact is checked into this tree. Until the
-fixture is executed on the required upstream and RHEL 9 kernel environments,
-these hit/miss latency cells remain implemented but unmeasured.
+A sanitized [local upstream-host focused record](focused-validation/packaged-jvm-getsockopt-75aa1a06/README.md)
+retains 256 measured samples per series and passed both predeclared gates: miss
+p99 was 19,997 ns and hit p99 was 25,049 ns. The run has no public CI locator
+and is explicitly non-acceptance evidence. A retained RHEL 9 execution and the
+broader application, allocation, resource, concurrency, and variance evidence
+remain unmeasured.
 
 ## Comparison matrix
 
@@ -337,16 +342,18 @@ tracked source/build inputs are clean before and after the build, copies those
 exact blob-verified inputs into a private, Make-safe `/tmp` staging directory,
 and never passes the user-selected artifact path to Make. It retains the
 before/after source identity and copied binary, then removes the staging tree.
-Those
-percentiles do not include the in-JVM Java-to-native transition or application
+Those percentiles do not include the in-JVM Java-to-native transition or application
 request processing and are not acceptance evidence. `lookup-paths.json`
 therefore remains `partial_with_explicit_gaps`: application state-map misses
 and in-JVM transition percentiles are not collected by that integrated
-harness. The separate packaged-JVM fixture above implements accepted-socket
-hit/miss JNI sampling, but has no retained run. Its embedded observations carry
-explicit root-relative `source_artifact` and `link_base` fields; validation
-requires each full standalone artifact and every linked provenance/result file
-to resolve under the retained output root.
+harness. The separate packaged-JVM fixture above now has one sanitized
+[local upstream-host focused run](focused-validation/packaged-jvm-getsockopt-75aa1a06/README.md)
+for accepted-socket hit/miss JNI sampling. That local result is non-acceptance
+evidence, has no public CI locator, and does not fill the integrated harness or
+RHEL 9 cells. The integrated harness's embedded observations carry explicit
+root-relative `source_artifact` and `link_base` fields; validation requires each
+full standalone artifact and every linked provenance/result file to resolve
+under the retained output root.
 
 For every cell, the harness first asks `run.sh` to retain a fixed 16-request,
 scenario-specific correctness preflight and leave only that scoped Compose

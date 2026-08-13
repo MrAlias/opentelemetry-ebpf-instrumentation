@@ -27,6 +27,12 @@ configure<SpotlessExtension> {
     }
 }
 
+dependencies {
+    // Diagnostic probes are packaged in the outer agent and resolve these classes from the
+    // bootstrap copy installed by the nested agent at runtime. Keep them off the outer JAR.
+    compileOnly(project(":agent"))
+}
+
 val copyAgentShadowJar by tasks.registering(Copy::class) {
     dependsOn(":agent:shadowJar")
     from(project(":agent").tasks.named("shadowJar").get().outputs.files)

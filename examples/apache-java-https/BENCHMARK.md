@@ -102,6 +102,163 @@ failure. The VM path is deterministically
 runner refuses to reuse an existing artifact directory, so a rerun cannot leave
 multiple candidates associated with one log.
 
+### Packaged-JVM JNI getsockopt microbenchmark
+
+An additional opt-in fixture,
+`TestJavaRemoteParentPackagedJVMGetsockoptBenchmark`, closes one narrower
+measurement gap left by the Go transport benchmark. It starts the packaged OBI
+agent, creates a real Java `ServerSocket.accept()` socket, and records 256 miss
+and 256 hit samples after 16 per-series warmups. Each sample brackets exactly
+one call to `BootstrapNative.takeRemoteParent(fd, reusedByteArray)` with
+`System.nanoTime()`. The call crosses Java, JNI, the real kernel `getsockopt`,
+and the attached cgroup BPF program. Map staging, socket acknowledgement, and
+Go/Java command coordination are outside the timed region.
+
+The miss control is not the native `fd < 0` shortcut: the fixture first stages
+and acknowledges a generation on the accepted socket. It requires the exact
+staged process, incarnation, connection tuple, network namespace, and generation
+in the resulting socket negotiation before capturing the exact state, owner, and
+generation-index values and deleting only `java_remote_parent_state`.
+It asserts that the owner and generation index remain byte-for-byte unchanged
+before and after the timed call. The `StatusMissing` response must preserve the
+negotiated generation. After timing, the fixture restores the captured state
+exactly and invokes the existing full-generation cleanup. The hit control also
+requires the exact staged generation and verifies one-shot cleanup. Cleanup
+failures are fatal and prevent artifact publication.
+
+The schema-v1 artifact retains every measured nanosecond sample, recomputable
+p50/p95/p99 and total timed duration, exact hit/miss status counts, Java version
+and executable, kernel release, architecture, CPU model, logical CPU count,
+total memory, cgroup-v2 path, and declared JVM arguments. Retained provenance
+includes the Git revision plus a clean/dirty status hash and content-sensitive
+patch hash, the Go toolchain and opened test-binary identity, the opened agent
+descriptor's device/inode/size/SHA-256 identity, and SHA-256/size identities of
+the exact embedded cgroup-sockopt and sockops BPF byte blobs supplied to the
+loaders. It also records the target cgroup hierarchy and the effective
+`BPF_F_QUERY_EFFECTIVE` chains for getsockopt, setsockopt, and sockops: attach
+type, intended loaded program ID/tag/name/type, effective program order and
+revision capability/value, and every ancestor's direct program IDs/tags plus
+revision capability/value. It also records that pre-attach chains were empty,
+the selected stability mode and evidence boundary, and the exact exclusive-
+topology premise when required. Source identity, both opened files, both BPF
+blobs, and the attributed program chains are checked again after execution; a
+mismatch fails before publication. Before typed decode,
+the artifact validator traverses the full schema and requires every field exactly
+once with canonical spelling, a non-null value, and the declared JSON primitive
+or container type. It rejects case-folded aliases, unknown fields, trailing JSON,
+and duplicate names at every nesting depth.
+The root harness runs every source-identity Git command through `setpriv` as the
+verified non-root owner shared by the canonical package directory and discovered
+repository root; it does not add a `safe.directory` exception.
+
+Before attaching, the fixture requires all three effective chains and every
+ancestor's direct chain to be empty, so inherited host programs fail the run.
+After attachment, each effective chain must contain exactly its one intended
+program attached directly at the target cgroup. The cgroup BPF query ABI does
+not provide a revision for `BPF_F_QUERY_EFFECTIVE`; every effective query is
+therefore recorded as `revision_supported=false`, `revision=0`, and compared by
+exact ordered program identity. Direct-revision support is recorded separately
+for every attach type and every cgroup in the hierarchy: a nonzero direct-query
+revision means supported, while zero means unsupported. The artifact claims
+revision-backed stability only when every direct query supports revisions.
+
+Immediately before releasing each timed JNI call and immediately after its
+response, the fixture requeries all three effective chains and every ancestor
+and compares exact ordered program IDs/tags/names/types with the post-attach
+baseline. When every direct query across all three attach types and the full
+hierarchy establishes revision support, the artifact records
+`stability_mode=revision_and_identity`; all direct revisions must also remain
+unchanged, so an attach/detach that restores the same IDs still fails. If any
+direct query lacks revisions, the fixture uses
+`stability_mode=boundary_identity_only` only when the operator supplies the
+exact premise
+`operator_controlled_no_concurrent_cgroup_bpf_mutation`. This mode retains all
+steady foreign-chain and before/after identity checks, but explicitly cannot
+exclude an attach and detach completed wholly between two queries. The artifact
+records that limitation; the premise is an operator attestation, not measured
+proof. A final matching snapshot is required before publication, and cleanup
+must restore the empty pre-attach topology: all three effective chains and every
+direct ancestor/target chain are empty.
+
+Retained `stability_checks` evidence binds these assertions to the actual call
+loop. It requires `expected_calls=544`, exactly 544 successful pre-call and 544
+successful post-call snapshots across warmup and measurement calls, and zero
+query errors or topology mismatches. The counters advance only after the real
+query and comparison path succeeds; missing observations or nonzero failure
+counters invalidate the artifact.
+
+The Java child receives a fixed minimal environment (`HOME`, `LANG`, `LC_ALL`,
+`PATH`, `TMPDIR`, and `TZ`) rather than the root harness environment. The
+harness fails closed if loader or implicit-JVM controls such as `LD_PRELOAD`,
+`LD_AUDIT`, `LD_LIBRARY_PATH`, `JAVA_TOOL_OPTIONS`, `_JAVA_OPTIONS`,
+`JDK_JAVA_OPTIONS`, or `CLASSPATH` are present. The artifact records the exact
+allowlisted environment. Its predeclared exploratory PoC gate is p99 below 1 ms
+for both series. The writer publishes a structurally valid failed measurement
+before the test enforces that gate. Probe stdout is a closed protocol: any line
+whose prefix or fields do not match the next expected message, or any output
+after `DONE`, fails immediately. The harness also fails on scanner/read errors
+and requires a verified clean stdout EOF after `DONE` before it waits for the
+Java process.
+
+This fixture is deliberately single-threaded. It does not measure provider
+selection or record decoding, application instrumentation or request latency,
+Unix fallback, throughput, allocations, process/native resource growth, or
+concurrency or run-to-run variance. It supplies neither the concurrent
+acceptance evidence in issue #11 nor the allocation/resource-growth evidence
+in issues #20 and #37.
+
+Build the packaged agent first. On an otherwise idle privileged cgroup-v2 host,
+create a fresh artifact path in an existing owner-private directory and run:
+
+```bash
+cd pkg/internal/java
+gradle copyLoaderJar --no-daemon
+cd ../../..
+
+benchmark_parent="$(mktemp -d)"
+chmod 700 "$benchmark_parent"
+artifact_path="$benchmark_parent/packaged-jvm-getsockopt.json"
+OBI_JAVA_REMOTE_PARENT_AGENT_JAR="$PWD/pkg/internal/java/build/obi-java-agent.jar" \
+OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK=1 \
+OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_ARTIFACT="$artifact_path" \
+go test -tags=privileged_tests ./pkg/internal/ebpf/tpinjector \
+  -run '^TestJavaRemoteParentPackagedJVMGetsockoptBenchmark$' -count=1 -v
+```
+
+On a kernel where any direct cgroup query in the target hierarchy does not
+expose a revision (including older enterprise kernels), run only on an otherwise
+idle, operator-controlled cgroup BPF topology and add:
+
+```bash
+OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_EXCLUSIVE_CGROUP_BPF=operator_controlled_no_concurrent_cgroup_bpf_mutation
+```
+
+Without that exact opt-in, a revisionless run fails before Java starts and no
+artifact is published.
+
+The command must run with the BPF, cgroup-attach, and `pidfd_getfd` privileges
+already required by the packaged-JVM correctness fixture. The root Go harness
+opens the packaged agent with `O_NOFOLLOW`, binds its device/inode/size/SHA-256
+identity with `fstat` and reads on that already-open descriptor before and after
+execution, and passes the same descriptor to the child as read-only fd 3. It
+then starts Java as UID/GID 65534 with empty supplementary groups, all inheritable,
+permitted, effective, bounding, and ambient capability sets empty, and
+`no_new_privs` set. Before sampling, it inspects the exact Java PID and every
+stable JVM thread and fails if those properties changed or any BPF map, program,
+link, BTF, or token descriptor is present. It grants no BPF capabilities or map
+descriptors to the Java child and passes no bpffs path. Validate a retained
+artifact without loading BPF:
+
+```bash
+OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_VALIDATE_ARTIFACT="$artifact_path" \
+go test ./pkg/internal/ebpf/tpinjector \
+  -run '^TestValidatePackagedJVMBenchmarkArtifactFile$' -count=1 -v
+```
+
+No retained packaged-JVM latency artifact is checked into this tree. Until the
+fixture is executed on the required upstream and RHEL 9 kernel environments,
+these hit/miss latency cells remain implemented but unmeasured.
+
 ## Comparison matrix
 
 Run on one otherwise idle host with fixed CPU/memory limits, request mix,
@@ -184,7 +341,9 @@ Those
 percentiles do not include the in-JVM Java-to-native transition or application
 request processing and are not acceptance evidence. `lookup-paths.json`
 therefore remains `partial_with_explicit_gaps`: application state-map misses
-and in-JVM transition percentiles are blocked. Its embedded observations carry
+and in-JVM transition percentiles are not collected by that integrated
+harness. The separate packaged-JVM fixture above implements accepted-socket
+hit/miss JNI sampling, but has no retained run. Its embedded observations carry
 explicit root-relative `source_artifact` and `link_base` fields; validation
 requires each full standalone artifact and every linked provenance/result file
 to resolve under the retained output root.
@@ -372,7 +531,7 @@ into zeroes or treating successful harness completion as issue acceptance.
 
 The optional complete mode adds native transport/provider lookup percentiles
 and bounded pressure capacity/cleanup evidence as described above. It does not
-collect in-JVM JNI-transition percentiles, JFR/NMT
+invoke the separate packaged-JVM JNI fixture or collect JFR/NMT
 allocation/native/direct-memory summaries, primary cgroup-sockopt program CPU,
 or BPF lock contention. Its capacity-rejection observation is not a general
 BPF map-insertion-failure counter, and its non-evicting-map check is not an
@@ -383,7 +542,7 @@ statistics sysctl and is not scoped to the demo project.
 The six sustained core cells and the optional observed-once path controls are
 not the complete matrix for the open fork issue linked above. End-to-end
 application state-map miss performance,
-in-JVM Java-to-native transition percentiles, sustained stale/timeout/pressure
+retained and concurrent Java-to-native transition percentiles, sustained stale/timeout/pressure
 performance, attributable map growth, and native-memory evidence still require
 separate measurement before declaring the benchmark issue complete. The
 privileged Go transport artifact and the native deterministic fixture are

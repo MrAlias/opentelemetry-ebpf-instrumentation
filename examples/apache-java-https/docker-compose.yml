@@ -110,11 +110,13 @@ services:
         RELEASE_VERSION: apache-java-https-demo
         RELEASE_REVISION: local
     image: obi-apache-java-https:local
+    init: false
     command:
       - --config=/config/obi.yaml
     network_mode: host
     pid: host
     privileged: true
+    stop_grace_period: 30s
     environment:
       OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT: ${BRIDGE_TRANSPORT:-getsockopt}
       OTEL_EBPF_JAVA_REMOTE_PARENT_SOCKET_PATH: /var/run/obi/java-remote-parent.sock

@@ -81,3 +81,4 @@ discovery:
       open_ports: 18081
 
 log_level: info
+shutdown_timeout: 10s

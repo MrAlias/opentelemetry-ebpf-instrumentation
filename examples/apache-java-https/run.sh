@@ -21,6 +21,11 @@ JAVA_PROVIDER_RETRY_SETTLE_SECONDS=2
 PRIMARY_W3C_STALE_RETRIEVAL_TTL="1ns"
 UNIX_W3C_STALE_RETRIEVAL_TTL="1ns"
 JAVA_ATTACH_FAILURE_QUIET_SAMPLES=15
+OBI_COMPOSE_STOP_GRACE_SECONDS=30
+OBI_COMPOSE_COMMAND_TIMEOUT_SECONDS=60
+# Compose may apply the stop grace once per service in reverse dependency
+# order. The full five-service down path therefore needs a larger outer bound.
+OBI_COMPOSE_MULTI_SERVICE_COMMAND_TIMEOUT_SECONDS=180
 DELAYED_OTLP_SCHEDULE_DELAY_SECONDS=60
 DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS="$((DELAYED_OTLP_SCHEDULE_DELAY_SECONDS * 1000))"
 DELAYED_OTLP_PRE_EXPORT_WAIT_SECONDS=5
@@ -141,6 +146,9 @@ readonly BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS SCENARIO_RUN_TIMEOUT_SECONDS
 readonly JAVA_PROVIDER_RETRY_SETTLE_SECONDS
 readonly PRIMARY_W3C_STALE_RETRIEVAL_TTL UNIX_W3C_STALE_RETRIEVAL_TTL
 readonly JAVA_ATTACH_FAILURE_QUIET_SAMPLES
+readonly OBI_COMPOSE_STOP_GRACE_SECONDS
+readonly OBI_COMPOSE_COMMAND_TIMEOUT_SECONDS
+readonly OBI_COMPOSE_MULTI_SERVICE_COMMAND_TIMEOUT_SECONDS
 readonly DELAYED_OTLP_SCHEDULE_DELAY_SECONDS
 readonly DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS
 readonly DELAYED_OTLP_PRE_EXPORT_WAIT_SECONDS
@@ -927,9 +935,10 @@ safe_compose_down() {
     log_error "refusing destructive cleanup for unverified Compose project $PROJECT_NAME"
     return 1
   }
-  run_bounded 60 \
+  run_bounded "$OBI_COMPOSE_MULTI_SERVICE_COMMAND_TIMEOUT_SECONDS" \
     "${COMPOSE[@]}" --profile '*' \
-    down --volumes --remove-orphans --timeout 10 || return
+    down --volumes --remove-orphans \
+      --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" || return
   verify_compose_project_absent
 }
 
@@ -3929,11 +3938,15 @@ start_stack() {
   fi
   if uses_uninstrumented_runtime; then
     run_logged_bounded "$RESULT_DIR/compose-up.log" "$COMMAND_TIMEOUT_SECONDS" \
-      "${COMPOSE[@]}" up --build --detach "${recreate_arguments[@]}" \
+      "${COMPOSE[@]}" up --build --detach \
+        --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" \
+        "${recreate_arguments[@]}" \
         trace-receiver java-backend coalesced-source apache-proxy || start_status=$?
   else
     run_logged_bounded "$RESULT_DIR/compose-up.log" "$COMMAND_TIMEOUT_SECONDS" \
-      "${COMPOSE[@]}" up --build --detach "${recreate_arguments[@]}" \
+      "${COMPOSE[@]}" up --build --detach \
+        --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" \
+        "${recreate_arguments[@]}" \
         trace-receiver java-backend coalesced-source apache-proxy obi || start_status=$?
   fi
   if ((start_status != 0)); then
@@ -8447,7 +8460,8 @@ stop_obi_for_no_state_control() {
   log_info "stopping OBI for the $label control"
   invalidate_selected_transport || return $?
   BRIDGE_RUNNING=false
-  if run_bounded 60 "${COMPOSE[@]}" stop --timeout 10 obi; then
+  if run_bounded "$OBI_COMPOSE_COMMAND_TIMEOUT_SECONDS" \
+    "${COMPOSE[@]}" stop --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" obi; then
     :
   else
     stop_status=$?
@@ -8495,7 +8509,9 @@ run_late_attach_control() {
 
   attach_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" || return $?
   log_info "starting OBI and requiring late helper attach without a JVM restart"
-  run_bounded 120 "${COMPOSE[@]}" up --detach obi || return $?
+  run_bounded 120 \
+    "${COMPOSE[@]}" up --detach \
+      --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" obi || return $?
   wait_for_log \
     obi \
     "Java remote parent bridge ready" \
@@ -8842,7 +8858,8 @@ run_permanent_absence_control() (
   invalidate_selected_transport || return $?
   BRIDGE_RUNNING=false
   assert_project_docker_identity_unchanged || return $?
-  run_bounded 60 "${COMPOSE[@]}" stop --timeout 10 \
+  run_bounded "$OBI_COMPOSE_MULTI_SERVICE_COMMAND_TIMEOUT_SECONDS" \
+    "${COMPOSE[@]}" stop --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" \
     apache-proxy java-backend obi || return $?
   assert_compose_service_stopped apache-proxy || return $?
   assert_compose_service_stopped java-backend || return $?
@@ -9070,7 +9087,9 @@ run_restart_during_traffic_control() (
 
   invalidate_selected_transport || return $?
   BRIDGE_RUNNING=false
-  run_bounded 60 "${COMPOSE[@]}" stop --timeout 5 obi || return $?
+  run_bounded "$OBI_COMPOSE_COMMAND_TIMEOUT_SECONDS" \
+    "${COMPOSE[@]}" stop --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" obi || \
+    return $?
   publish_restart_control_release \
     "$control_dir" \
     "$RESTART_RELEASE_OBI_STOPPED" || return $?
@@ -9080,7 +9099,9 @@ run_restart_during_traffic_control() (
     "traffic while OBI was stopped" \
     "$scenario_pid" || return $?
   restart_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" || return $?
-  run_bounded 120 "${COMPOSE[@]}" up --detach obi || return $?
+  run_bounded 120 \
+    "${COMPOSE[@]}" up --detach \
+      --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" obi || return $?
   wait_for_log \
     obi \
     "Java remote parent bridge ready" \
@@ -9237,7 +9258,8 @@ recreate_instrumented_stack() {
       >"$RESULT_DIR/compose-${compose_flavor}-resolved.yaml" || return $?
   fi
   run_bounded 180 \
-    "${compose_command[@]}" up --detach --force-recreate \
+    "${compose_command[@]}" up --detach \
+      --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" --force-recreate \
       "${services[@]}" || return $?
   if [[ "$fresh_trace_receiver" == "true" ]]; then
     wait_for_http "http://127.0.0.1:14318/healthz" \
@@ -12528,7 +12550,9 @@ run_unix_permissive_directory_control() {
   log_info "proving the Unix bridge refuses a world-accessible socket directory"
   invalidate_selected_transport || return $?
   BRIDGE_RUNNING=false
-  run_bounded 30 "${COMPOSE[@]}" stop --timeout 10 obi || return $?
+  run_bounded "$OBI_COMPOSE_COMMAND_TIMEOUT_SECONDS" \
+    "${COMPOSE[@]}" stop --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" obi || \
+    return $?
   run_bounded 10 "${COMPOSE[@]}" exec --no-TTY java-backend \
     chmod 0777 /var/run/obi || return $?
   UNIX_SECURITY_DIRECTORY_RELAXED=true
@@ -12541,7 +12565,9 @@ run_unix_permissive_directory_control() {
 
   failure_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" || return $?
   run_bounded 60 \
-    "${COMPOSE[@]}" up --detach --no-deps --force-recreate obi || return $?
+    "${COMPOSE[@]}" up --detach \
+      --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" \
+      --no-deps --force-recreate obi || return $?
   wait_for_log \
     obi \
     "$UNIX_PERMISSION_REFUSAL_PATTERN" \
@@ -12573,7 +12599,9 @@ run_unix_permissive_directory_control() {
   run_bounded 15 "${COMPOSE[@]}" logs --no-color --since "$failure_since" \
     obi >"$obi_log" || return $?
 
-  run_bounded 30 "${COMPOSE[@]}" stop --timeout 10 obi || return $?
+  run_bounded "$OBI_COMPOSE_COMMAND_TIMEOUT_SECONDS" \
+    "${COMPOSE[@]}" stop --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" obi || \
+    return $?
   run_bounded 10 "${COMPOSE[@]}" exec --no-TTY java-backend \
     chmod 0750 /var/run/obi || return $?
   run_bounded 10 "${COMPOSE[@]}" exec --no-TTY java-backend \
@@ -12585,7 +12613,9 @@ run_unix_permissive_directory_control() {
   UNIX_SECURITY_DIRECTORY_RELAXED=false
   recovery_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" || return $?
   run_bounded 60 \
-    "${COMPOSE[@]}" up --detach --no-deps --force-recreate obi || return $?
+    "${COMPOSE[@]}" up --detach \
+      --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" \
+      --no-deps --force-recreate obi || return $?
   wait_for_log \
     obi \
     "Java remote parent bridge ready" \
@@ -12913,7 +12943,9 @@ run_unix_security_control() {
   restart_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" || return $?
   invalidate_selected_transport || return $?
   BRIDGE_RUNNING=false
-  run_bounded 60 "${COMPOSE[@]}" restart --timeout 10 obi || return $?
+  run_bounded "$OBI_COMPOSE_COMMAND_TIMEOUT_SECONDS" \
+    "${COMPOSE[@]}" restart --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" obi || \
+    return $?
   wait_for_log \
     obi \
     "refusing to replace non-socket Java bridge path" \
@@ -13033,7 +13065,8 @@ run_disabled_control() {
     "${COMPOSE[@]}" config >"$RESULT_DIR/compose-disabled-control.yaml" || return $?
   recreate_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" || return $?
   run_bounded 120 \
-    "${COMPOSE[@]}" up --detach --force-recreate \
+    "${COMPOSE[@]}" up --detach \
+      --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" --force-recreate \
       java-backend apache-proxy obi || return $?
   wait_for_log \
     java-backend \
@@ -13063,7 +13096,9 @@ run_uninstrumented_control() {
   export JAVA_TOOL_OPTIONS_VALUE=""
   export OTEL_JAVAAGENT_EXTENSIONS_VALUE=""
   export OTEL_PROPAGATORS_VALUE="tracecontext,baggage"
-  run_bounded 60 "${COMPOSE[@]}" stop --timeout 10 obi || return $?
+  run_bounded "$OBI_COMPOSE_COMMAND_TIMEOUT_SECONDS" \
+    "${COMPOSE[@]}" stop --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" obi || \
+    return $?
   run_bounded 30 \
     "${COMPOSE[@]}" config >"$RESULT_DIR/compose-uninstrumented-control.yaml" || return $?
   run_bounded 120 \
@@ -13180,7 +13215,9 @@ execute_requested_scenarios() {
       restart_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" || return $?
       invalidate_selected_transport || return $?
       BRIDGE_RUNNING=false
-      run_bounded 60 "${COMPOSE[@]}" restart --timeout 10 obi || return $?
+      run_bounded "$OBI_COMPOSE_COMMAND_TIMEOUT_SECONDS" \
+        "${COMPOSE[@]}" restart \
+          --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" obi || return $?
       wait_for_log \
         obi \
         "Java remote parent bridge ready" \

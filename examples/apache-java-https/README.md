@@ -687,6 +687,11 @@ Every run retains a timestamped directory under `.runtime/results/` with:
   and the Java-service duplicate-suppression metric; after each normal OBI
   create/restart, a non-measured health request drives behavioral detection
   and asserted traffic starts only after the new process reports suppression.
+  The host-PID OBI service explicitly disables any daemon-default init shim,
+  keeping Docker's recorded PID bound to `/obi` resource evidence, and uses a
+  30-second Compose stop grace around its explicit 10-second internal shutdown
+  bound. Force-recreates can unload tracers and let Docker reap the process
+  before it may escalate to `SIGKILL`.
   The delayed-first-OTLP control is distinct: it sends one marked prime request
   only after safe startup and performs no generic Java health request before it;
 - final receiver snapshot, Compose state, and component logs.

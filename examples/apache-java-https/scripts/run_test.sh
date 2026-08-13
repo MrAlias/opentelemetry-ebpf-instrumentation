@@ -116,7 +116,7 @@ case "$1 $2" in
     fi
     ;;
   "compose --project-name")
-    [[ "$*" == *" --profile * down --volumes --remove-orphans --timeout 10" ]] || {
+    [[ "$*" == *" --profile * down --volumes --remove-orphans --timeout 30" ]] || {
       printf 'cleanup omitted all Compose profiles: %s\n' "$*" >&2
       exit 65
     }
@@ -150,7 +150,7 @@ EOF
     printf 'ownership verification omitted stopped project containers\n' >&2
     return 1
   }
-  grep -Fq ' --profile * down --volumes --remove-orphans --timeout 10' "$docker_log" || {
+  grep -Fq ' --profile * down --volumes --remove-orphans --timeout 30' "$docker_log" || {
     printf 'cleanup did not activate every Compose profile\n' >&2
     return 1
   }
@@ -2290,7 +2290,7 @@ test_primary_w3c_fault_recreation_uses_the_overlay_only() {
   grep -Fqx 'bounded:30 fault-compose config --quiet' "$observed"
   grep -Fqx 'bounded:30 fault-compose config' "$observed"
   grep -Fqx \
-    'bounded:180 fault-compose up --detach --force-recreate java-backend apache-proxy obi' \
+    'bounded:180 fault-compose up --detach --timeout 30 --force-recreate java-backend apache-proxy obi' \
     "$observed"
   if grep -Fq 'base-compose up' "$observed"; then
     printf 'primary fault recreation used the base Compose command for its JVM\n' >&2
@@ -8746,7 +8746,7 @@ test_permissive_unix_directory_control_refuses_and_restores() {
     run_bounded() {
       shift
       case " $* " in
-        *" stop --timeout 10 obi "*)
+        *" stop --timeout 30 obi "*)
           [[ "$BRIDGE_RUNNING" == "false" &&
             -z "$SELECTED_TRANSPORT" &&
             ! -e "$RESULT_DIR/java-transport-configuration.txt" &&
@@ -8769,7 +8769,7 @@ test_permissive_unix_directory_control_refuses_and_restores() {
         *" test -S /var/run/obi/java-remote-parent.sock "*)
           return 1
           ;;
-        *" up --detach --no-deps --force-recreate obi "*)
+        *" up --detach --timeout 30 --no-deps --force-recreate obi "*)
           if [[ "$directory_mode" == "0750" ]]; then
             : >"$provider_ready"
             printf 'provider-ready\n' >>"$observed"
@@ -8852,7 +8852,7 @@ test_permissive_unix_directory_control_refuses_and_restores() {
     "$result_dir/security-permissive-directory-obi.log"
   grep -Fq 'logs --no-color --since security-failure-cursor obi' "$observed"
   awk '
-    /up --detach --no-deps --force-recreate obi/ { recovery = NR }
+    /up --detach --timeout 30 --no-deps --force-recreate obi/ { recovery = NR }
     $0 == "cursor:security-recovery" { recovery_cursor = NR }
     $0 == "log:post-permission Unix bridge recovery:security-recovery-cursor" {
       bridge = NR
@@ -8980,7 +8980,7 @@ test_unix_endpoint_restart_invalidates_before_stack_mutation() {
           printf '%s\n' \
             '{"status":"passed","mode":"abuse-race","attempts":1,"name":"concurrent-repeated-unauthorized","outcome":"bounded"}'
           ;;
-        *" restart --timeout 10 obi "*)
+        *" restart --timeout 30 obi "*)
           [[ "$BRIDGE_RUNNING" == "false" &&
             -z "$SELECTED_TRANSPORT" &&
             ! -e "$RESULT_DIR/java-transport-configuration.txt" &&
@@ -9589,7 +9589,7 @@ test_pre_stop_diagnostics_failure_does_not_stop_obi() {
     return 1
   fi
   grep -Fqx 'evidence:w3c-fault-obi-running' "$calls"
-  grep -Fq 'stop:60 docker compose stop --timeout 10 obi' "$calls"
+  grep -Fq 'stop:60 docker compose stop --timeout 30 obi' "$calls"
 
   printf 'current\n' >"$result_dir/java-transport-configuration.txt"
   if (
@@ -11814,6 +11814,55 @@ test_delayed_otlp_runtime_requires_bounded_export_contract() {
   )
 }
 
+test_start_stack_reconciles_retained_obi_with_explicit_grace() {
+  local -r result_dir="$TEST_TMP_DIR/start-stack-retained-obi"
+  local -r observed="$result_dir/observed"
+  local start_status=0
+
+  mkdir -p -- "$result_dir"
+  if (
+    RESULT_DIR="$result_dir"
+    SCENARIO=delayed-otlp-suppression
+    TRANSPORT=getsockopt
+    STACK_STARTED=false
+    BRIDGE_RUNNING=false
+    COMMAND_TIMEOUT_SECONDS=5
+    COMPOSE=(test-compose)
+    assert_project_docker_identity_unchanged() { :; }
+    assert_clean_source_checkout_is_stable() { :; }
+    assert_no_pending_permanent_absence_recovery() { :; }
+    verify_compose_project_ownership() { return 0; }
+    invalidate_project_transport_evidence() { return 0; }
+    run_bounded() { return 0; }
+    date() { printf 'retained-start-cursor\n'; }
+    run_logged_bounded() {
+      local -r output="$1"
+      local -r seconds="$2"
+      shift 2
+
+      printf '%s\n' "$*" >"$observed"
+      [[ "$output" == "$RESULT_DIR/compose-up.log" &&
+        "$seconds" == "$COMMAND_TIMEOUT_SECONDS" &&
+        "$*" == "test-compose up --build --detach --timeout 30 --force-recreate trace-receiver java-backend coalesced-source apache-proxy obi" ]] ||
+        return 63
+      return 41
+    }
+
+    start_stack
+  ) >/dev/null 2>&1; then
+    printf 'retained OBI startup ignored the injected Compose boundary\n' >&2
+    return 1
+  else
+    start_status=$?
+  fi
+  [[ "$start_status" == 41 &&
+    "$(<"$observed")" == \
+      'test-compose up --build --detach --timeout 30 --force-recreate trace-receiver java-backend coalesced-source apache-proxy obi' ]] || {
+    printf 'retained OBI startup omitted its explicit Compose stop grace\n' >&2
+    return 1
+  }
+}
+
 test_start_stack_invalidates_project_evidence_before_compose_up() {
   local -r results_root="$TEST_TMP_DIR/start-stack-invalidation"
   local -r result_dir="$results_root/current"
@@ -12111,7 +12160,7 @@ test_delayed_otlp_startup_avoids_java_traffic() {
       return 0
     }
     run_logged_bounded() {
-      [[ "$*" == *"up --build --detach --force-recreate trace-receiver java-backend coalesced-source apache-proxy obi"* ]] ||
+      [[ "$*" == *"up --build --detach --timeout 30 --force-recreate trace-receiver java-backend coalesced-source apache-proxy obi"* ]] ||
         return 1
       printf 'compose:up\n' >>"$observed"
     }
@@ -12214,7 +12263,7 @@ test_delayed_otlp_recreate_avoids_java_traffic() {
   }
 
   printf '%s\n' \
-    'compose:180 test-compose up --detach --force-recreate trace-receiver java-backend apache-proxy obi' \
+    'compose:180 test-compose up --detach --timeout 30 --force-recreate trace-receiver java-backend apache-proxy obi' \
     'http:delayed-otlp-suppression trace receiver' \
     'log:delayed-otlp-suppression OBI remote-parent bridge' \
     'log:delayed-otlp-suppression external OTel extension' \
@@ -12627,7 +12676,7 @@ test_recreated_stack_readiness_uses_log_cursor() {
   }
 
   printf '%s\n' \
-    'compose:180 test-compose up --detach --force-recreate java-backend apache-proxy obi' \
+    'compose:180 test-compose up --detach --timeout 30 --force-recreate java-backend apache-proxy obi' \
     'log:restoration OBI remote-parent bridge:recreate-cursor' \
     'log:restoration external OTel extension:recreate-cursor' \
     'log:restoration injected Java instrumentation:recreate-cursor' \
@@ -12702,7 +12751,7 @@ test_disabled_control_waits_for_instrumentation() {
 
   printf '%s\n' \
     'compose:30 test-compose config' \
-    'compose:120 test-compose up --detach --force-recreate java-backend apache-proxy obi' \
+    'compose:120 test-compose up --detach --timeout 30 --force-recreate java-backend apache-proxy obi' \
     'log:disabled-control external extension:disabled-cursor' \
     'log:disabled-control Java instrumentation:disabled-cursor' \
     'apache:disabled-control' \
@@ -16793,7 +16842,7 @@ test_late_attach_recycles_only_apache_after_readiness() {
     'runtime:obi-absent' \
     'scenario:fail-open:obi-absent' \
     'scenario:w3c-only:obi-absent' \
-    'compose:120 test-compose up --detach obi' \
+    'compose:120 test-compose up --detach --timeout 30 obi' \
     'log:late-attach OBI remote-parent bridge:late-attach-cursor' \
     'log:late-attached Java helper:late-attach-cursor' \
     'log:late-attached Java instrumentation:late-attach-cursor' \
@@ -17247,7 +17296,7 @@ test_standalone_restart_waits_for_apache_instrumentation() {
         ! -e "$RESULT_DIR/java-transport-configuration.txt" &&
         -e "$RESULT_DIR/java-selected-transport-configuration.txt" ]] || return 31
       printf 'compose:%s\n' "$*" >>"$observed"
-      if [[ " $* " == *" restart --timeout 10 obi "* ]]; then
+      if [[ " $* " == *" restart --timeout 30 obi "* ]]; then
         : >"$provider_ready"
         printf 'provider-ready\n' >>"$observed"
       fi
@@ -17291,7 +17340,7 @@ test_standalone_restart_waits_for_apache_instrumentation() {
 
   printf '%s\n' \
     'cursor:restart' \
-    'compose:60 test-compose restart --timeout 10 obi' \
+    'compose:60 test-compose restart --timeout 30 obi' \
     'provider-ready' \
     'log:restarted OBI remote-parent bridge:restart-cursor' \
     'apache:restart' \
@@ -17320,12 +17369,12 @@ test_restart_fault_recovery_waits_for_apache_instrumentation() {
 set -Eeuo pipefail
 printf 'compose:%s\n' "$*" >>"$RESTART_SUCCESS_OBSERVED"
 case " $* " in
-  *" stop --timeout 5 obi "*)
+  *" stop --timeout 30 obi "*)
     [[ ! -e "$RESTART_SUCCESS_RESULT_DIR/java-transport-configuration.txt" ]]
     [[ "$(<"$RESTART_SUCCESS_RESULT_DIR/java-selected-transport-configuration.txt")" == "retained" ]]
     printf 'transport-invalidated\n' >>"$RESTART_SUCCESS_OBSERVED"
     ;;
-  *" up --detach obi "*)
+  *" up --detach --timeout 30 obi "*)
     : >"$RESTART_SUCCESS_PROVIDER_READY"
     printf 'provider-ready\n' >>"$RESTART_SUCCESS_OBSERVED"
     ;;
@@ -17443,9 +17492,9 @@ EOF
   awk '
     $0 == "traffic:before-stop" { before = NR }
     $0 == "transport-invalidated" { invalidated = NR }
-    $0 == "compose:stop --timeout 5 obi" { stopped = NR }
+    $0 == "compose:stop --timeout 30 obi" { stopped = NR }
     $0 == "traffic:obi-stopped" { outage = NR }
-    $0 == "compose:up --detach obi" { started = NR }
+    $0 == "compose:up --detach --timeout 30 obi" { started = NR }
     $0 == "provider-ready" { provider_ready = NR }
     /^cursor:/ { cursor_line[substr($0, 8)] = NR }
     /^log:OBI bridge restarted during traffic:/ {
@@ -17547,7 +17596,7 @@ EOF
     printf 'ended restart traffic returned %d, expected status 1\n' "$status" >&2
     return 1
   }
-  if grep -Fq 'stop --timeout 5 obi' "$observed"; then
+  if grep -Fq 'stop --timeout 30 obi' "$observed"; then
     printf 'restart control stopped OBI without active pre-stop traffic\n' >&2
     return 1
   fi
@@ -17579,7 +17628,7 @@ case " $* " in
       "$RESTART_FAILURE_CONTROL/pre-stop-ready"
     while true; do sleep 1; done
     ;;
-  *" stop --timeout 5 obi "*) exit 23 ;;
+  *" stop --timeout 30 obi "*) exit 23 ;;
   *) exit 0 ;;
 esac
 EOF
@@ -19803,12 +19852,76 @@ test_demo_uses_only_explicit_tcp_context() {
   grep -Fqx '  disable_black_box_cp: true' "$obi_config"
 }
 
-test_demo_java_attach_timeout_is_explicit() {
+test_demo_obi_lifecycle_timeouts_are_explicit() {
   local -r obi_config="$TEST_SCRIPT_DIR/../configs/obi.yaml"
   local -r compose_file="$TEST_SCRIPT_DIR/../docker-compose.yml"
+  local -r obi_dockerfile="$TEST_SCRIPT_DIR/../../../Dockerfile"
+  local lifecycle_functions=""
+  local obi_service=""
+  local startup_functions=""
 
   grep -Fqx '  attach_timeout: 30s' "$obi_config"
+  grep -Fqx 'shutdown_timeout: 10s' "$obi_config"
+  [[ "$OBI_COMPOSE_STOP_GRACE_SECONDS" == 30 &&
+    "$OBI_COMPOSE_COMMAND_TIMEOUT_SECONDS" == 60 &&
+    "$OBI_COMPOSE_MULTI_SERVICE_COMMAND_TIMEOUT_SECONDS" == 180 ]] || return 1
+  ((OBI_COMPOSE_MULTI_SERVICE_COMMAND_TIMEOUT_SECONDS >=
+    (OBI_COMPOSE_STOP_GRACE_SECONDS * 5) + 30)) || return 1
   ! grep -Fq 'OTEL_EBPF_JAVAAGENT_ATTACH_TIMEOUT:' "$compose_file"
+  obi_service="$(compose_service_block "$compose_file" obi)" || return $?
+  grep -Fqx '    stop_grace_period: 30s' <<<"$obi_service" || return $?
+  grep -Fqx '    init: false' <<<"$obi_service" || return $?
+  [[ "$(grep -Fc 'ENTRYPOINT [ "/obi" ]' "$obi_dockerfile")" == 1 ]] || {
+    printf 'OBI lifecycle no longer targets the direct /obi entrypoint\n' >&2
+    return 1
+  }
+  lifecycle_functions="$({
+    declare -f safe_compose_down
+    declare -f stop_obi_for_no_state_control
+    declare -f run_permanent_absence_control
+    declare -f run_restart_during_traffic_control
+    declare -f run_unix_permissive_directory_control
+    declare -f run_unix_security_control
+    declare -f run_uninstrumented_control
+    declare -f execute_requested_scenarios
+  })" || return $?
+  [[ "$(awk '
+      index($0, "--timeout \"$OBI_COMPOSE_STOP_GRACE_SECONDS\"") &&
+        ($0 ~ / down / || $0 ~ / stop / || $0 ~ / restart /) { count++ }
+      END { print count + 0 }
+    ' <<<"$lifecycle_functions")" == 9 &&
+    "$(grep -Fc -- \
+      'run_bounded "$OBI_COMPOSE_COMMAND_TIMEOUT_SECONDS"' \
+      <<<"$lifecycle_functions")" == 7 &&
+    "$(grep -Fc -- \
+      'run_bounded "$OBI_COMPOSE_MULTI_SERVICE_COMMAND_TIMEOUT_SECONDS"' \
+      <<<"$lifecycle_functions")" == 2 ]] || {
+    printf 'OBI lifecycle commands diverged from the shared shutdown grace\n' >&2
+    return 1
+  }
+  if grep -Eq -- '--timeout (5|10) .*obi([ ;]|$)' \
+    <<<"$lifecycle_functions"; then
+    printf 'OBI lifecycle retained a shorter explicit stop timeout\n' >&2
+    return 1
+  fi
+  startup_functions="$({
+    declare -f start_stack
+    declare -f run_late_attach_control
+    declare -f run_restart_during_traffic_control
+    declare -f recreate_instrumented_stack
+    declare -f run_unix_permissive_directory_control
+    declare -f run_disabled_control
+  })" || return $?
+  [[ "$(awk '
+      index($0, " up ") &&
+        index($0, "--timeout \"$OBI_COMPOSE_STOP_GRACE_SECONDS\"") {
+        count++
+      }
+      END { print count + 0 }
+    ' <<<"$startup_functions")" == 8 ]] || {
+    printf 'OBI startup reconciliation omitted the shared stop grace\n' >&2
+    return 1
+  }
 }
 
 compose_service_block() {
@@ -20535,6 +20648,7 @@ compose_runtime_model_interpolation_is_allowlisted() {
       with_entries(
         select(
           (.key == "service")
+          or ((.key == "init") and (.value == false))
           or (
             (.value != null)
             and (.value != false)
@@ -20732,6 +20846,8 @@ compose_runtime_model_interpolation_is_allowlisted() {
             labels: $service.value.labels?,
             pull_policy: $service.value.pull_policy?,
             restart: $service.value.restart?,
+            init: $service.value.init?,
+            stop_grace_period: $service.value.stop_grace_period?,
             privileged: $service.value.privileged?,
             cap_add: $service.value.cap_add?,
             cap_drop: $service.value.cap_drop?,
@@ -20836,9 +20952,9 @@ compose_runtime_model_interpolation_is_allowlisted() {
         {
           service: "obi",
           keys: [
-            "build", "command", "depends_on", "environment", "image",
+            "build", "command", "depends_on", "environment", "image", "init",
             "labels", "network_mode", "pid", "privileged", "restart",
-            "volumes"
+            "stop_grace_period", "volumes"
           ]
         },
         {
@@ -21016,11 +21132,13 @@ compose_runtime_model_interpolation_is_allowlisted() {
         {
           service: "obi",
           image: "obi-apache-java-https:local",
+          init: false,
           labels: ownership_labels,
           network_mode: "host",
           pid: "host",
           privileged: true,
-          restart: "no"
+          restart: "no",
+          stop_grace_period: "30s"
         },
         {
           service: "scenario",
@@ -22481,6 +22599,7 @@ main() {
   test_disabled_runtime_requires_explicit_transport_disable
   test_helper_attach_runtime_requires_exact_dynamic_disable
   test_delayed_otlp_runtime_requires_bounded_export_contract
+  test_start_stack_reconciles_retained_obi_with_explicit_grace
   test_start_stack_invalidates_project_evidence_before_compose_up
   test_primary_w3c_fault_startup_uses_normal_runtime_contract
   test_instrumented_readiness_precedes_https_traffic
@@ -22553,7 +22672,7 @@ main() {
   test_apache_diagnostic_denial_matrix_is_exact
   test_compatibility_matrix_lists_deployment_modes
   test_demo_uses_only_explicit_tcp_context
-  test_demo_java_attach_timeout_is_explicit
+  test_demo_obi_lifecycle_timeouts_are_explicit
   test_primary_live_fd_compose_topology_is_scoped
   test_unix_security_probe_topology_is_least_privilege
   printf 'demo harness tests passed\n'

@@ -98,6 +98,9 @@ public final class ApacheJavaHttpsBackend {
   private ApacheJavaHttpsBackend() {}
 
   public static void main(String[] args) throws Exception {
+    if (PidReuseProbe.runIfConfigured()) {
+      return;
+    }
     int port =
         parsePort("HTTPS_PORT", environment("HTTPS_PORT", Integer.toString(DEFAULT_PORT)));
     int nettyPort =

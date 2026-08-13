@@ -31,6 +31,9 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -trimpath -o /out/coalesced-source \
     ./examples/apache-java-https/tracecheck/cmd/coalescedsource
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath -o /out/pid-reuse \
+    ./examples/apache-java-https/tracecheck/cmd/pidreuse
 
 FROM scratch
 COPY --from=builder /out/trace-receiver /trace-receiver
@@ -42,4 +45,5 @@ COPY --from=builder /out/generation-fault /generation-fault
 COPY --from=builder /out/fault-bridge /fault-bridge
 COPY --from=builder /out/security-probe /security-probe
 COPY --from=builder /out/coalesced-source /coalesced-source
+COPY --from=builder /out/pid-reuse /pid-reuse
 ENTRYPOINT ["/trace-receiver"]

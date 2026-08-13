@@ -1,0 +1,54 @@
+services:
+  # The supervisor is PID 1 in Docker's default private PID namespace. It uses
+  # these two capabilities only to select a numeric PID and irreversibly drop
+  # the controlled JVM's full capability sets before exec.
+  java-backend:
+    user: "0:0"
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHECKPOINT_RESTORE
+      - SETPCAP
+    # Docker otherwise masks /proc/sys read-only. This exposes the
+    # namespace-local ns_last_pid selector without making the container
+    # privileged; no-new-privileges remains locked across the JVM exec.
+    security_opt:
+      - systempaths=unconfined
+      - no-new-privileges:true
+    entrypoint:
+      - /otel/pid-reuse-supervisor
+      - --control-dir
+      - /run/obi-demo/pid-reuse
+      - --target-pid
+      - "4242"
+      - --socket-fd
+      - "198"
+      - --
+      - java
+      - -jar
+      - /app/backend.jar
+    volumes:
+      - pid-reuse-control:/run/obi-demo/pid-reuse
+
+  # The controller has no network and a read-only root. Privilege is scoped to
+  # its short-lived BPF-map transaction; its only writable path is the private
+  # control volume shared with the supervisor.
+  pid-reuse:
+    image: obi-apache-java-https-tracecheck:local
+    network_mode: none
+    user: "0:0"
+    privileged: true
+    read_only: true
+    entrypoint:
+      - /pid-reuse
+    volumes:
+      - pid-reuse-control:/control
+    profiles:
+      - tools
+    labels:
+      io.opentelemetry.obi.apache-java-https.owner: acceptance-demo-v1
+
+volumes:
+  pid-reuse-control:
+    labels:
+      io.opentelemetry.obi.apache-java-https.owner: acceptance-demo-v1

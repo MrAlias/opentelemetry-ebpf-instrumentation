@@ -20671,6 +20671,7 @@ prepare_fixture_source_snapshot() {
       PRIMARY_FAULT_COMPOSE_FILE="$REPO_ROOT/examples/apache-java-https/docker-compose.primary-fault.yml"
       PRIMARY_LIVE_FD_COMPOSE_FILE="$REPO_ROOT/examples/apache-java-https/docker-compose.primary-live-fd.yml"
       UNIX_GENERATION_FAULT_COMPOSE_FILE="$REPO_ROOT/examples/apache-java-https/docker-compose.unix-generation-fault.yml"
+      PID_REUSE_COMPOSE_FILE="$REPO_ROOT/examples/apache-java-https/docker-compose.pid-reuse.yml"
       COMPOSE_PROJECT_DIRECTORY="$REPO_ROOT/examples/apache-java-https"
       COMPOSE=(
         docker compose --project-name "$PROJECT_NAME" \
@@ -20690,6 +20691,11 @@ prepare_fixture_source_snapshot() {
         docker compose --project-name "$PROJECT_NAME" \
           --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE" \
           --file "$PRIMARY_FAULT_COMPOSE_FILE" --file "$UNIX_GENERATION_FAULT_COMPOSE_FILE"
+      )
+      PID_REUSE_COMPOSE=(
+        docker compose --project-name "$PROJECT_NAME" \
+          --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE" \
+          --file "$PID_REUSE_COMPOSE_FILE"
       )
 
       unset GIT_NO_REPLACE_OBJECTS
@@ -20711,6 +20717,8 @@ prepare_fixture_source_snapshot() {
           "$SOURCE_SNAPSHOT_DIR/examples/apache-java-https/docker-compose.primary-live-fd.yml" && \
         "$UNIX_GENERATION_FAULT_COMPOSE_FILE" == \
           "$SOURCE_SNAPSHOT_DIR/examples/apache-java-https/docker-compose.unix-generation-fault.yml" && \
+        "$PID_REUSE_COMPOSE_FILE" == \
+          "$SOURCE_SNAPSHOT_DIR/examples/apache-java-https/docker-compose.pid-reuse.yml" && \
         "${#UNIX_GENERATION_FAULT_COMPOSE[@]}" == 12 && \
         "${UNIX_GENERATION_FAULT_COMPOSE[0]}" == docker && \
         "${UNIX_GENERATION_FAULT_COMPOSE[1]}" == compose && \
@@ -20724,6 +20732,17 @@ prepare_fixture_source_snapshot() {
         "${UNIX_GENERATION_FAULT_COMPOSE[9]}" == "$PRIMARY_FAULT_COMPOSE_FILE" && \
         "${UNIX_GENERATION_FAULT_COMPOSE[10]}" == --file && \
         "${UNIX_GENERATION_FAULT_COMPOSE[11]}" == "$UNIX_GENERATION_FAULT_COMPOSE_FILE" && \
+        "${#PID_REUSE_COMPOSE[@]}" == 10 && \
+        "${PID_REUSE_COMPOSE[0]}" == docker && \
+        "${PID_REUSE_COMPOSE[1]}" == compose && \
+        "${PID_REUSE_COMPOSE[2]}" == --project-name && \
+        "${PID_REUSE_COMPOSE[3]}" == "$PROJECT_NAME" && \
+        "${PID_REUSE_COMPOSE[4]}" == --project-directory && \
+        "${PID_REUSE_COMPOSE[5]}" == "$SOURCE_SNAPSHOT_DIR/examples/apache-java-https" && \
+        "${PID_REUSE_COMPOSE[6]}" == --file && \
+        "${PID_REUSE_COMPOSE[7]}" == "$COMPOSE_FILE" && \
+        "${PID_REUSE_COMPOSE[8]}" == --file && \
+        "${PID_REUSE_COMPOSE[9]}" == "$PID_REUSE_COMPOSE_FILE" && \
         "${COMPOSE[*]}" == *"--project-directory $SOURCE_SNAPSHOT_DIR/examples/apache-java-https"* && \
         ! -e "$SOURCE_SNAPSHOT_DIR/ignored-build-input" && \
         -L "$SOURCE_SNAPSHOT_DIR/link" && \
@@ -21223,6 +21242,8 @@ test_source_controls_and_bridge_export_use_private_work_directory() {
     >"$source_repository/examples/apache-java-https/docker-compose.primary-live-fd.yml"
   printf 'services: {}\n' \
     >"$source_repository/examples/apache-java-https/docker-compose.unix-generation-fault.yml"
+  printf 'services: {}\n' \
+    >"$source_repository/examples/apache-java-https/docker-compose.pid-reuse.yml"
   printf 'FROM scratch\nCOPY . /source\n' >"$source_repository/javaagent.Dockerfile"
   git -C "$source_repository" add -- .
   git -C "$source_repository" commit --quiet -m 'Create private source-work fixture'
@@ -21380,6 +21401,8 @@ test_clean_source_snapshot_uses_pinned_git_inputs() {
     >"$source_repository/examples/apache-java-https/docker-compose.primary-live-fd.yml"
   printf 'services: {}\n' \
     >"$source_repository/examples/apache-java-https/docker-compose.unix-generation-fault.yml"
+  printf 'services: {}\n' \
+    >"$source_repository/examples/apache-java-https/docker-compose.pid-reuse.yml"
   printf 'FROM scratch\nCOPY . /source\n' >"$source_repository/javaagent.Dockerfile"
   git -C "$source_repository" add -- .
   git -C "$source_repository" commit --quiet -m 'Create source snapshot fixture'
@@ -24469,6 +24492,358 @@ test_unix_security_probe_topology_is_least_privilege() {
   }
 }
 
+write_pid_reuse_public_fixture() {
+  local -r output="$1"
+  local -r transport="$2"
+  local negative_status="ambiguous"
+
+  if [[ "$transport" == "getsockopt" ]]; then
+    negative_status="unsupported"
+  fi
+  jq -cn \
+    --arg transport "$transport" \
+    --arg negative_status "$negative_status" '
+      {
+        schema: "obi-pid-reuse-public-v1",
+        status: "passed",
+        transport: $transport,
+        private_pid_namespace: true,
+        same_namespace_inode: true,
+        same_numeric_pid: true,
+        same_numeric_tid: true,
+        a_reaped_before_b: true,
+        different_lifetime: true,
+        obi_capabilities_nonzero: true,
+        obi_capabilities_distinct: true,
+        authorization_maps_agree: true,
+        jvm_a_privileges_dropped: true,
+        jvm_b_privileges_dropped: true,
+        normal_cleanup: "completed",
+        residue: "injected_after_a_reap",
+        same_primary_socket: true,
+        negative_status: $negative_status,
+        injected_residue_rejected: true,
+        injected_residue_preserved: true,
+        w3c_fail_open: true,
+        recovery_status: "valid",
+        recovery_parent_exact: true,
+        private_artifacts_removed: true
+      }
+    ' >"$output"
+}
+
+test_pid_reuse_arguments_are_exact() {
+  local transport=""
+
+  for transport in getsockopt unix; do
+    (
+      SCENARIO=all
+      TRANSPORT=getsockopt
+      REQUEST_COUNT=0
+      REPEAT_COUNT=1
+      CLEANUP_ONLY=false
+      parse_args --scenario pid-reuse --transport "$transport"
+      [[ "$SCENARIO" == pid-reuse && "$TRANSPORT" == "$transport" && \
+        "$REQUEST_COUNT" == 0 && "$REPEAT_COUNT" == 1 ]]
+    ) || {
+      printf 'PID reuse rejected forced %s transport\n' "$transport" >&2
+      return 1
+    }
+  done
+  if (
+    SCENARIO=all
+    TRANSPORT=getsockopt
+    REQUEST_COUNT=0
+    REPEAT_COUNT=1
+    parse_args --scenario pid-reuse --transport auto
+  ) >/dev/null 2>&1; then
+    printf 'PID reuse accepted auto transport\n' >&2
+    return 1
+  fi
+  if (
+    SCENARIO=all
+    TRANSPORT=getsockopt
+    REQUEST_COUNT=0
+    REPEAT_COUNT=1
+    parse_args --scenario pid-reuse --requests 1
+  ) >/dev/null 2>&1; then
+    printf 'PID reuse accepted a custom request count\n' >&2
+    return 1
+  fi
+  if (
+    SCENARIO=all
+    TRANSPORT=getsockopt
+    REQUEST_COUNT=0
+    REPEAT_COUNT=1
+    parse_args --scenario pid-reuse --repeat 2
+  ) >/dev/null 2>&1; then
+    printf 'PID reuse accepted more than one lifecycle pair\n' >&2
+    return 1
+  fi
+}
+
+test_pid_reuse_public_result_is_closed_and_mutation_sensitive() {
+  local -r valid_primary="$TEST_TMP_DIR/pid-reuse-primary.json"
+  local -r valid_unix="$TEST_TMP_DIR/pid-reuse-unix.json"
+  local -r mutation="$TEST_TMP_DIR/pid-reuse-mutation.json"
+
+  write_pid_reuse_public_fixture "$valid_primary" getsockopt
+  write_pid_reuse_public_fixture "$valid_unix" unix
+  pid_reuse_result_has_contract "$valid_primary" getsockopt || return 1
+  pid_reuse_result_has_contract "$valid_unix" unix || return 1
+  jq -c '.normal_cleanup = "pending"' "$valid_primary" >"$mutation"
+  if pid_reuse_result_has_contract "$mutation" getsockopt; then
+    printf 'PID reuse accepted an incomplete cleanup outcome\n' >&2
+    return 1
+  fi
+  local filter=""
+  for filter in \
+    '.pid = 4242' \
+    'del(.same_numeric_tid)' \
+    '.w3c_fail_open = false' \
+    '.negative_status = "ambiguous"' \
+    '.residue = "production_cleanup_residue"' \
+    '.obi_capabilities_distinct = false' \
+    '.jvm_a_privileges_dropped = false' \
+    '.jvm_b_privileges_dropped = false'; do
+    jq -c "$filter" "$valid_primary" >"$mutation"
+    if pid_reuse_result_has_contract "$mutation" getsockopt; then
+      printf 'PID reuse public schema accepted mutation: %s\n' "$filter" >&2
+      return 1
+    fi
+  done
+  {
+    cat "$valid_primary"
+    cat "$valid_primary"
+  } >"$mutation"
+  if pid_reuse_result_has_contract "$mutation" getsockopt; then
+    printf 'PID reuse public schema accepted multiple records\n' >&2
+    return 1
+  fi
+}
+
+write_pid_reuse_compose_model_fixture() {
+  local -r output="$1"
+
+  jq -n '
+    {
+      services: {
+        "java-backend": {
+          user: "0:0",
+          cap_drop: ["ALL"],
+          cap_add: ["CHECKPOINT_RESTORE", "SETPCAP"],
+          security_opt: ["systempaths=unconfined", "no-new-privileges:true"],
+          entrypoint: [
+            "/otel/pid-reuse-supervisor",
+            "--control-dir", "/run/obi-demo/pid-reuse",
+            "--target-pid", "4242",
+            "--socket-fd", "198",
+            "--", "java", "-jar", "/app/backend.jar"
+          ],
+          volumes: [
+            {
+              type: "volume",
+              source: "pid-reuse-control",
+              target: "/run/obi-demo/pid-reuse"
+            }
+          ]
+        },
+        "pid-reuse": {
+          user: "0:0",
+          network_mode: "none",
+          privileged: true,
+          read_only: true,
+          entrypoint: ["/pid-reuse"],
+          profiles: ["tools"],
+          volumes: [
+            {
+              type: "volume",
+              source: "pid-reuse-control",
+              target: "/control"
+            }
+          ]
+        }
+      },
+      volumes: {"pid-reuse-control": {}}
+    }
+  ' >"$output"
+}
+
+test_pid_reuse_compose_model_is_exact_and_mutation_sensitive() {
+  local -r valid="$TEST_TMP_DIR/pid-reuse-compose-valid.json"
+  local -r mutation="$TEST_TMP_DIR/pid-reuse-compose-mutation.json"
+  local filter=""
+
+  write_pid_reuse_compose_model_fixture "$valid"
+  pid_reuse_compose_model_has_contract "$valid" || {
+    printf 'PID reuse Compose contract rejected the exact model\n' >&2
+    return 1
+  }
+  for filter in \
+    '.services["java-backend"].pid = "host"' \
+    '.services["java-backend"].cap_add += ["SYS_ADMIN"]' \
+    '.services["java-backend"].security_opt = ["no-new-privileges:true"]' \
+    '.services["java-backend"].security_opt = ["systempaths=unconfined"]' \
+    '.services["java-backend"].security_opt += ["seccomp=unconfined"]' \
+    '.services["java-backend"].entrypoint[4] = "4243"' \
+    '.services["java-backend"].volumes[0].read_only = true' \
+    '.services["pid-reuse"].privileged = false' \
+    '.services["pid-reuse"].network_mode = "host"' \
+    '.services["pid-reuse"].volumes += [{type:"bind",source:"/",target:"/host"}]'; do
+    jq "$filter" "$valid" >"$mutation"
+    if pid_reuse_compose_model_has_contract "$mutation"; then
+      printf 'PID reuse Compose contract accepted mutation: %s\n' "$filter" >&2
+      return 1
+    fi
+  done
+}
+
+test_pid_reuse_runtime_security_options_are_exact() {
+  local security_options=""
+
+  pid_reuse_java_security_options_have_contract \
+    '["systempaths=unconfined","no-new-privileges:true"]' || return 1
+  for security_options in \
+    'null' \
+    '[]' \
+    '["systempaths=unconfined"]' \
+    '["no-new-privileges:true"]' \
+    '["systempaths=unconfined","no-new-privileges:false"]' \
+    '["systempaths=unconfined","no-new-privileges:true","seccomp=unconfined"]'; do
+    if pid_reuse_java_security_options_have_contract "$security_options"; then
+      printf 'PID reuse runtime accepted security options: %s\n' \
+        "$security_options" >&2
+      return 1
+    fi
+  done
+}
+
+test_pid_reuse_static_overlay_and_build_wiring_are_exact() {
+  local -r overlay="$TEST_SCRIPT_DIR/../docker-compose.pid-reuse.yml"
+  local -r java_dockerfile="$TEST_SCRIPT_DIR/../java/Dockerfile"
+  local -r tracecheck_dockerfile="$TEST_SCRIPT_DIR/../tracecheck/Dockerfile"
+  local -r controller_source="$TEST_SCRIPT_DIR/../tracecheck/cmd/pidreuse/main.go"
+  local -r java_probe_source="$TEST_SCRIPT_DIR/../java/src/main/java/io/opentelemetry/obi/examples/PidReuseProbe.java"
+  local -r supervisor_source="$TEST_SCRIPT_DIR/../java/pidreuse/pid_reuse_supervisor.c"
+  local -r production_source="$TEST_SCRIPT_DIR/../../../pkg/internal/ebpf/tpinjector/java_remote_parent.go"
+  local overlay_contents=""
+
+  overlay_contents="$(<"$overlay")" || return 1
+  [[ "$overlay_contents" != *'${'* && \
+    "$overlay_contents" == *$'cap_add:\n      - CHECKPOINT_RESTORE\n      - SETPCAP'* && \
+    "$overlay_contents" == *$'security_opt:\n      - systempaths=unconfined\n      - no-new-privileges:true'* && \
+    "$overlay_contents" == *'/otel/pid-reuse-supervisor'* && \
+    "$overlay_contents" == *'pid-reuse-control:/run/obi-demo/pid-reuse'* && \
+    "$overlay_contents" == *'network_mode: none'* && \
+    "$overlay_contents" == *'privileged: true'* && \
+    "$overlay_contents" == *'read_only: true'* && \
+    "$overlay_contents" == *'pid-reuse-control:/control'* && \
+    "$overlay_contents" != *$'    pid:'* ]] || {
+    printf 'PID reuse overlay lost its interpolation-free private topology\n' >&2
+    return 1
+  }
+  if ! grep -Fq 'pid-reuse-supervisor-test' "$java_dockerfile" || \
+    ! grep -Fq 'COPY --from=fault-builder /build/pid-reuse-supervisor /otel/pid-reuse-supervisor' \
+      "$java_dockerfile" || \
+    ! grep -Fq './examples/apache-java-https/tracecheck/cmd/pidreuse' \
+      "$tracecheck_dockerfile" || \
+    ! grep -Fq 'COPY --from=builder /out/pid-reuse /pid-reuse' \
+      "$tracecheck_dockerfile"; then
+    printf 'PID reuse image build lost a tested fixture binary\n' >&2
+    return 1
+  fi
+  if ! grep -Fq 'javaRemoteParentPollInterval            = 10 * time.Second' \
+      "$production_source" || \
+    ! grep -Fq 'productionCleanupSweepInterval = 10 * time.Second' \
+      "$controller_source" || \
+    ! grep -Fq 'observeNormalCleanup(ctx, aGraph)' "$controller_source" || \
+    ! grep -Fq 'jvm-a-attestation' "$controller_source" || \
+    ! grep -Fq 'jvm-b-attestation' "$controller_source" || \
+    grep -Fq 'return "pending"' "$controller_source" || \
+    ! grep -Fq 'Files.readString(Path.of("/proc/self/status")' "$java_probe_source" || \
+    ! grep -Fq 'Files.readString(Path.of("/proc/self/stat")' "$java_probe_source" || \
+    ! grep -Fq 'Set.of("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb", "NoNewPrivs")' \
+      "$java_probe_source" || \
+    ! grep -Fq 'PR_CAPBSET_DROP' "$supervisor_source" || \
+    ! grep -Fq 'PR_SET_NO_NEW_PRIVS' "$supervisor_source"; then
+    printf 'PID reuse cleanup cadence or post-exec privilege attestation lost source binding\n' >&2
+    return 1
+  fi
+  [[ "${#UNIX_GENERATION_FAULT_COMPOSE[@]}" == 12 && \
+    "${UNIX_GENERATION_FAULT_COMPOSE[9]}" == "$PRIMARY_FAULT_COMPOSE_FILE" && \
+    "${UNIX_GENERATION_FAULT_COMPOSE[11]}" == "$UNIX_GENERATION_FAULT_COMPOSE_FILE" && \
+    "${#PID_REUSE_COMPOSE[@]}" == 10 && \
+    "${PID_REUSE_COMPOSE[9]}" == "$PID_REUSE_COMPOSE_FILE" ]] || {
+    printf 'PID reuse wiring changed the Unix-generation overlay vector\n' >&2
+    return 1
+  }
+}
+
+test_pid_reuse_controller_precedes_backend_readiness() {
+  local -r result_dir="$TEST_TMP_DIR/pid-reuse-readiness"
+  local -r observed="$result_dir/observed"
+
+  mkdir -p -- "$result_dir"
+  (
+    RESULT_DIR="$result_dir"
+    SCENARIO="pid-reuse"
+    TRANSPORT=getsockopt
+    COMMAND_TIMEOUT_SECONDS=5
+    STACK_STARTED=false
+    BRIDGE_RUNNING=false
+    COMPOSE=(test-compose)
+    assert_project_docker_identity_unchanged() { :; }
+    assert_clean_source_checkout_is_stable() { :; }
+    assert_no_pending_permanent_absence_recovery() { :; }
+    verify_compose_project_ownership() { :; }
+    invalidate_project_transport_evidence() { :; }
+    run_bounded() { :; }
+    run_logged_bounded() { printf 'compose:up\n' >>"$observed"; }
+    date() { printf 'startup-cursor\n'; }
+    assert_pid_reuse_compose_contract() { printf 'compose:contract\n' >>"$observed"; }
+    wait_for_http() { printf 'http:%s\n' "$2" >>"$observed"; }
+    wait_for_log() { printf 'log:%s\n' "$3" >>"$observed"; }
+    run_pid_reuse_controller() { printf 'pid-reuse:controller\n' >>"$observed"; }
+    assert_selected_transport() { printf 'transport\n' >>"$observed"; }
+    wait_for_apache_instrumentation() { printf 'apache\n' >>"$observed"; }
+    assert_apache_denies_java_diagnostics() { printf 'denials\n' >>"$observed"; }
+    assert_runtime_contract() { [[ "$1" == basic ]]; }
+    assert_pid_reuse_runtime_contract() { printf 'pid-reuse:runtime\n' >>"$observed"; }
+
+    start_stack
+  ) || {
+    printf 'PID reuse readiness-order probe failed\n' >&2
+    return 1
+  }
+  awk '
+    $0 == "log:OBI remote-parent bridge" { bridge = NR }
+    $0 == "pid-reuse:controller" { controller = NR }
+    $0 == "log:external OTel extension" { extension = NR }
+    END { exit !(bridge > 0 && bridge < controller && controller < extension) }
+  ' "$observed" || {
+    printf 'PID reuse controller did not fence backend readiness\n' >&2
+    return 1
+  }
+}
+
+test_pid_reuse_dispatch_runs_only_recovered_basic() {
+  local -r observed="$TEST_TMP_DIR/pid-reuse-dispatch"
+
+  (
+    SCENARIO="pid-reuse"
+    SCENARIO_VARIANT=""
+    run_scenario() {
+      printf '%s:%s\n' "$1" "$SCENARIO_VARIANT" >>"$observed"
+    }
+    execute_requested_scenarios
+    [[ -z "$SCENARIO_VARIANT" ]]
+  ) || return 1
+  [[ "$(<"$observed")" == 'basic:pid-reuse-recovery' ]] || {
+    printf 'PID reuse dispatch did not run the exact recovered basic scenario\n' >&2
+    return 1
+  }
+}
+
 main() {
   TEST_TMP_DIR="$(mktemp -d)"
   test_project_name_validation
@@ -24511,6 +24886,13 @@ main() {
   test_auto_unavailable_requires_one_auto_request
   test_unix_w3c_stale_requires_forced_unix
   test_primary_w3c_fault_requires_forced_primary
+  test_pid_reuse_arguments_are_exact
+  test_pid_reuse_public_result_is_closed_and_mutation_sensitive
+  test_pid_reuse_compose_model_is_exact_and_mutation_sensitive
+  test_pid_reuse_runtime_security_options_are_exact
+  test_pid_reuse_static_overlay_and_build_wiring_are_exact
+  test_pid_reuse_controller_precedes_backend_readiness
+  test_pid_reuse_dispatch_runs_only_recovered_basic
   test_primary_w3c_fault_modes_are_exact
   test_primary_w3c_fault_control_scripts_publish_and_consume_exactly
   test_primary_w3c_stale_control_restores_the_normal_ttls

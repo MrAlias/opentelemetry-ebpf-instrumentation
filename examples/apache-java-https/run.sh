@@ -53,6 +53,12 @@ DELAYED_OTLP_JAVA_SERVER_SCOPE="io.opentelemetry.jetty-11.0"
 HELPER_ATTACH_FAILURE_JAVA_TOOL_OPTIONS="-javaagent:/otel/official-javaagent.jar -XX:-EnableDynamicAgentLoading"
 TRANSPORT_CONFIGURATION_MAX_BYTES=256
 SCENARIO_RUN_TIMEOUT_SECONDS=120
+PID_REUSE_CONTROLLER_TIMEOUT_SECONDS=150
+PID_REUSE_CONTROLLER_INNER_TIMEOUT="120s"
+PID_REUSE_RESULT_MAX_BYTES=4096
+PID_REUSE_RESULT_MAX_LINES=1
+PID_REUSE_STDERR_MAX_BYTES=65536
+PID_REUSE_STDERR_MAX_LINES=512
 PRESSURE_STATE_TIMEOUT_SECONDS=10
 PRESSURE_MONITOR_METRICS_TIMEOUT_SECONDS=5
 PRESSURE_MONITOR_POLL_INTERVAL_SECONDS=1
@@ -159,6 +165,10 @@ readonly SCRIPT_DIR REPO_ROOT SCRIPT_NAME MAX_SHELL_INTEGER MAX_JSON_SAFE_INTEGE
 readonly MAX_UINT32_DECIMAL
 readonly MAX_UINT64_DECIMAL JAVA_DIAGNOSTIC_COUNTER_MAX
 readonly BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS SCENARIO_RUN_TIMEOUT_SECONDS
+readonly PID_REUSE_CONTROLLER_TIMEOUT_SECONDS
+readonly PID_REUSE_CONTROLLER_INNER_TIMEOUT
+readonly PID_REUSE_RESULT_MAX_BYTES PID_REUSE_RESULT_MAX_LINES
+readonly PID_REUSE_STDERR_MAX_BYTES PID_REUSE_STDERR_MAX_LINES
 readonly JAVA_PROVIDER_RETRY_SETTLE_SECONDS
 readonly JAVA_DUPLICATE_SUPPRESSION_PRIME_INTERVAL_SECONDS
 readonly PRIMARY_W3C_STALE_RETRIEVAL_TTL UNIX_W3C_STALE_RETRIEVAL_TTL
@@ -267,6 +277,7 @@ COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 PRIMARY_FAULT_COMPOSE_FILE="$SCRIPT_DIR/docker-compose.primary-fault.yml"
 PRIMARY_LIVE_FD_COMPOSE_FILE="$SCRIPT_DIR/docker-compose.primary-live-fd.yml"
 UNIX_GENERATION_FAULT_COMPOSE_FILE="$SCRIPT_DIR/docker-compose.unix-generation-fault.yml"
+PID_REUSE_COMPOSE_FILE="$SCRIPT_DIR/docker-compose.pid-reuse.yml"
 COMPOSE_PROJECT_DIRECTORY="$SCRIPT_DIR"
 PROJECT_NAME="${COMPOSE_PROJECT_NAME:-$PROJECT_NAMESPACE}"
 
@@ -410,6 +421,11 @@ declare -a UNIX_GENERATION_FAULT_COMPOSE=(
     --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE" \
     --file "$PRIMARY_FAULT_COMPOSE_FILE" --file "$UNIX_GENERATION_FAULT_COMPOSE_FILE"
 )
+declare -a PID_REUSE_COMPOSE=(
+  docker compose --project-name "$PROJECT_NAME" \
+    --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE" \
+    --file "$PID_REUSE_COMPOSE_FILE"
+)
 
 usage() {
   cat <<EOF
@@ -428,6 +444,7 @@ Options:
                           pressure, handoff, virtual-thread, netty, netty-server, dispatch,
                           w3c, w3c-match, obi-flags, w3c-fault, primary-w3c-fault,
                           primary-generation-mismatch, unix-generation-mismatch,
+                          pid-reuse,
                           primary-w3c-stale, permanent-absence,
                           auto-unavailable,
                           unix-w3c-stale, w3c-only,
@@ -619,7 +636,7 @@ parse_args() {
       ;;
   esac
   case "$SCENARIO" in
-    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|coalesced-bridge|timeout-retry|pressure|handoff|virtual-thread|netty|netty-server|dispatch|w3c|w3c-match|obi-flags|w3c-fault|primary-w3c-fault|primary-generation-mismatch|unix-generation-mismatch|primary-w3c-stale|unix-w3c-stale|w3c-only|security|restart-fault|helper-attach-failure|delayed-otlp-suppression|assertion-failure|fail-open|permanent-absence|auto-unavailable|restart|disabled|uninstrumented|benchmark-disabled|benchmark-uninstrumented)
+    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|coalesced-bridge|timeout-retry|pressure|handoff|virtual-thread|netty|netty-server|dispatch|w3c|w3c-match|obi-flags|w3c-fault|primary-w3c-fault|primary-generation-mismatch|unix-generation-mismatch|pid-reuse|primary-w3c-stale|unix-w3c-stale|w3c-only|security|restart-fault|helper-attach-failure|delayed-otlp-suppression|assertion-failure|fail-open|permanent-absence|auto-unavailable|restart|disabled|uninstrumented|benchmark-disabled|benchmark-uninstrumented)
       ;;
     *)
       die "unsupported scenario: $SCENARIO"
@@ -679,6 +696,16 @@ parse_args() {
   if [[ "$SCENARIO" == "unix-generation-mismatch" && \
     "$REQUEST_COUNT" != "0" && "$REQUEST_COUNT" != "1" ]]; then
     die "the unix-generation-mismatch scenario requires exactly one request"
+  fi
+  if [[ "$SCENARIO" == "pid-reuse" && \
+    "$TRANSPORT" != "getsockopt" && "$TRANSPORT" != "unix" ]]; then
+    die "the pid-reuse scenario requires forced getsockopt or Unix transport"
+  fi
+  if [[ "$SCENARIO" == "pid-reuse" && "$REQUEST_COUNT" != "0" ]]; then
+    die "the pid-reuse scenario does not accept a custom request count"
+  fi
+  if [[ "$SCENARIO" == "pid-reuse" && "$REPEAT_COUNT" != "1" ]]; then
+    die "the pid-reuse scenario requires exactly one lifecycle pair"
   fi
   if [[ "$SCENARIO" == "auto-unavailable" && "$TRANSPORT" != "auto" ]]; then
     die "the auto-unavailable scenario requires --transport auto"
@@ -3588,6 +3615,7 @@ prepare_source_snapshot() {
   local snapshot_fault_compose_file=""
   local snapshot_live_fd_compose_file=""
   local snapshot_unix_generation_fault_compose_file=""
+  local snapshot_pid_reuse_compose_file=""
   local source_artifact_dir="$ARTIFACT_DIR"
   local artifact_file=""
   local -a reusable_bridge_artifact_files=(
@@ -3630,11 +3658,14 @@ prepare_source_snapshot() {
   snapshot_fault_compose_file="$SOURCE_SNAPSHOT_SCRIPT_DIR/docker-compose.primary-fault.yml"
   snapshot_live_fd_compose_file="$SOURCE_SNAPSHOT_SCRIPT_DIR/docker-compose.primary-live-fd.yml"
   snapshot_unix_generation_fault_compose_file="$SOURCE_SNAPSHOT_SCRIPT_DIR/docker-compose.unix-generation-fault.yml"
+  snapshot_pid_reuse_compose_file="$SOURCE_SNAPSHOT_SCRIPT_DIR/docker-compose.pid-reuse.yml"
   [[ -f "$snapshot_compose_file" && ! -L "$snapshot_compose_file" && \
     -f "$snapshot_fault_compose_file" && ! -L "$snapshot_fault_compose_file" && \
     -f "$snapshot_live_fd_compose_file" && ! -L "$snapshot_live_fd_compose_file" && \
     -f "$snapshot_unix_generation_fault_compose_file" && \
-    ! -L "$snapshot_unix_generation_fault_compose_file" ]] || {
+    ! -L "$snapshot_unix_generation_fault_compose_file" && \
+    -f "$snapshot_pid_reuse_compose_file" && \
+    ! -L "$snapshot_pid_reuse_compose_file" ]] || {
     die "source snapshot lacks the demo Compose configuration"
   }
 
@@ -3651,6 +3682,7 @@ prepare_source_snapshot() {
   PRIMARY_FAULT_COMPOSE_FILE="$snapshot_fault_compose_file"
   PRIMARY_LIVE_FD_COMPOSE_FILE="$snapshot_live_fd_compose_file"
   UNIX_GENERATION_FAULT_COMPOSE_FILE="$snapshot_unix_generation_fault_compose_file"
+  PID_REUSE_COMPOSE_FILE="$snapshot_pid_reuse_compose_file"
   COMPOSE_PROJECT_DIRECTORY="$SOURCE_SNAPSHOT_SCRIPT_DIR"
   COMPOSE=(
     docker compose --project-name "$PROJECT_NAME" \
@@ -3670,6 +3702,11 @@ prepare_source_snapshot() {
     docker compose --project-name "$PROJECT_NAME" \
       --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE" \
       --file "$PRIMARY_FAULT_COMPOSE_FILE" --file "$UNIX_GENERATION_FAULT_COMPOSE_FILE"
+  )
+  PID_REUSE_COMPOSE=(
+    docker compose --project-name "$PROJECT_NAME" \
+      --project-directory "$COMPOSE_PROJECT_DIRECTORY" --file "$COMPOSE_FILE" \
+      --file "$PID_REUSE_COMPOSE_FILE"
   )
   assert_clean_source_checkout_is_stable
 }
@@ -3950,6 +3987,247 @@ export_compose_environment() {
     export OTEL_BSP_SCHEDULE_DELAY_VALUE="$DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS"
     export OTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED_VALUE="$DELAYED_OTLP_JAVA_RETRY_DISABLED"
   fi
+  if [[ "$SCENARIO" == "pid-reuse" ]]; then
+    COMPOSE=("${PID_REUSE_COMPOSE[@]}")
+  fi
+}
+
+pid_reuse_compose_model_has_contract() {
+  local -r input="$1"
+
+  jq -e -s '
+    length == 1 and
+    (.[0] | type == "object") and
+    (.[0].services["java-backend"] as $java |
+      ($java.user == "0:0") and
+      (($java.privileged // false) == false) and
+      (($java.pid // "") == "") and
+      (($java.cap_drop | map(sub("^CAP_"; "")) | sort) == ["ALL"]) and
+      (($java.cap_add | map(sub("^CAP_"; "")) | sort) ==
+        ["CHECKPOINT_RESTORE", "SETPCAP"]) and
+      (($java.security_opt | sort) ==
+        ["no-new-privileges:true", "systempaths=unconfined"]) and
+      ($java.entrypoint == [
+        "/otel/pid-reuse-supervisor",
+        "--control-dir", "/run/obi-demo/pid-reuse",
+        "--target-pid", "4242",
+        "--socket-fd", "198",
+        "--", "java", "-jar", "/app/backend.jar"
+      ]) and
+      ([$java.volumes[] |
+        select(.type == "volume" and
+          .source == "pid-reuse-control" and
+          .target == "/run/obi-demo/pid-reuse" and
+          ((.read_only // false) == false))] | length == 1)) and
+    (.[0].services["pid-reuse"] as $controller |
+      ($controller.user == "0:0") and
+      ($controller.network_mode == "none") and
+      ($controller.privileged == true) and
+      ($controller.read_only == true) and
+      ($controller.entrypoint == ["/pid-reuse"]) and
+      ($controller.profiles == ["tools"]) and
+      (($controller.cap_add // []) == []) and
+      (($controller.cap_drop // []) == []) and
+      (($controller.volumes | length) == 1) and
+      ($controller.volumes[0].type == "volume") and
+      ($controller.volumes[0].source == "pid-reuse-control") and
+      ($controller.volumes[0].target == "/control") and
+      (($controller.volumes[0].read_only // false) == false)) and
+    (.[0].volumes["pid-reuse-control"] | type == "object")
+  ' "$input" >/dev/null
+}
+
+assert_pid_reuse_compose_contract() {
+  local -r output="$RESULT_DIR/compose-pid-reuse.json"
+
+  run_bounded 30 "${COMPOSE[@]}" --profile tools \
+    config --format json >"$output" || return $?
+  bounded_evidence_file "$output" 1048576 20000 || {
+    log_error "PID reuse resolved Compose model exceeded its evidence bounds"
+    return 1
+  }
+  pid_reuse_compose_model_has_contract "$output" || {
+    log_error "PID reuse resolved Compose model violates its exact topology contract"
+    return 1
+  }
+}
+
+pid_reuse_result_has_contract() {
+  local -r input="$1"
+  local -r transport="$2"
+
+  [[ "$transport" == "getsockopt" || "$transport" == "unix" ]] || return 1
+  bounded_evidence_file \
+    "$input" "$PID_REUSE_RESULT_MAX_BYTES" "$PID_REUSE_RESULT_MAX_LINES" || return 1
+  jq -e -s --arg transport "$transport" '
+    length == 1 and
+    (.[0] |
+      type == "object" and
+      ((keys | sort) == ([
+        "a_reaped_before_b",
+        "authorization_maps_agree",
+        "different_lifetime",
+        "injected_residue_preserved",
+        "injected_residue_rejected",
+        "jvm_a_privileges_dropped",
+        "jvm_b_privileges_dropped",
+        "negative_status",
+        "normal_cleanup",
+        "obi_capabilities_distinct",
+        "obi_capabilities_nonzero",
+        "private_artifacts_removed",
+        "private_pid_namespace",
+        "recovery_parent_exact",
+        "recovery_status",
+        "residue",
+        "same_namespace_inode",
+        "same_numeric_pid",
+        "same_numeric_tid",
+        "same_primary_socket",
+        "schema",
+        "status",
+        "transport",
+        "w3c_fail_open"
+      ] | sort)) and
+      .schema == "obi-pid-reuse-public-v1" and
+      .status == "passed" and
+      .transport == $transport and
+      .private_pid_namespace == true and
+      .same_namespace_inode == true and
+      .same_numeric_pid == true and
+      .same_numeric_tid == true and
+      .a_reaped_before_b == true and
+      .different_lifetime == true and
+      .obi_capabilities_nonzero == true and
+      .obi_capabilities_distinct == true and
+      .authorization_maps_agree == true and
+      .jvm_a_privileges_dropped == true and
+      .jvm_b_privileges_dropped == true and
+      .normal_cleanup == "completed" and
+      .residue == "injected_after_a_reap" and
+      .same_primary_socket == true and
+      .negative_status == (if $transport == "getsockopt" then "unsupported" else "ambiguous" end) and
+      .injected_residue_rejected == true and
+      .injected_residue_preserved == true and
+      .w3c_fail_open == true and
+      .recovery_status == "valid" and
+      .recovery_parent_exact == true and
+      .private_artifacts_removed == true)
+  ' "$input" >/dev/null
+}
+
+pid_reuse_java_security_options_have_contract() {
+  local -r input="$1"
+
+  jq -e '
+    type == "array" and
+    (sort == ["no-new-privileges:true", "systempaths=unconfined"])
+  ' <<<"$input" >/dev/null
+}
+
+run_pid_reuse_controller() {
+  local -r output="$RESULT_DIR/pid-reuse-controller.json"
+  local -r stderr_output="$RESULT_DIR/pid-reuse-controller.stderr.log"
+  local command_status=0
+
+  log_info "running real numeric PID/TID reuse control for forced $TRANSPORT transport"
+  run_bounded "$PID_REUSE_CONTROLLER_TIMEOUT_SECONDS" \
+    "${COMPOSE[@]}" run --rm --no-deps --no-TTY pid-reuse \
+      --control-dir /control \
+      --transport "$TRANSPORT" \
+      --timeout "$PID_REUSE_CONTROLLER_INNER_TIMEOUT" \
+      >"$output" 2>"$stderr_output" || command_status=$?
+  bounded_evidence_file \
+    "$output" "$PID_REUSE_RESULT_MAX_BYTES" "$PID_REUSE_RESULT_MAX_LINES" || {
+    log_error "PID reuse controller stdout violated its evidence bounds"
+    return 1
+  }
+  bounded_evidence_file \
+    "$stderr_output" "$PID_REUSE_STDERR_MAX_BYTES" "$PID_REUSE_STDERR_MAX_LINES" || {
+    log_error "PID reuse controller stderr violated its evidence bounds"
+    return 1
+  }
+  if [[ -s "$stderr_output" ]]; then
+    sed -n 'p' "$stderr_output" >&2 || return $?
+    log_error "PID reuse controller produced unexpected stderr"
+    return 1
+  fi
+  ((command_status == 0)) || return "$command_status"
+  pid_reuse_result_has_contract "$output" "$TRANSPORT" || {
+    log_error "PID reuse controller result violates the closed public schema"
+    return 1
+  }
+}
+
+assert_pid_reuse_runtime_contract() {
+  local java_container=""
+  local privileged=""
+  local pid_mode=""
+  local user=""
+  local cap_drop=""
+  local cap_add=""
+  local security_options=""
+  local entrypoint=""
+  local mounts=""
+  local host_pid=""
+  local namespace_pid=""
+  local java_pid_namespace=""
+  local host_pid_namespace=""
+
+  java_container="$(run_bounded 10 \
+    "${COMPOSE[@]}" ps --quiet java-backend)" || return $?
+  [[ -n "$java_container" ]] || return 1
+  privileged="$(run_bounded 10 docker inspect \
+    --format '{{.HostConfig.Privileged}}' "$java_container")" || return $?
+  pid_mode="$(run_bounded 10 docker inspect \
+    --format '{{.HostConfig.PidMode}}' "$java_container")" || return $?
+  user="$(run_bounded 10 docker inspect \
+    --format '{{.Config.User}}' "$java_container")" || return $?
+  cap_drop="$(run_bounded 10 docker inspect \
+    --format '{{json .HostConfig.CapDrop}}' "$java_container")" || return $?
+  cap_add="$(run_bounded 10 docker inspect \
+    --format '{{json .HostConfig.CapAdd}}' "$java_container")" || return $?
+  security_options="$(run_bounded 10 docker inspect \
+    --format '{{json .HostConfig.SecurityOpt}}' "$java_container")" || return $?
+  entrypoint="$(run_bounded 10 docker inspect \
+    --format '{{json .Config.Entrypoint}}' "$java_container")" || return $?
+  mounts="$(run_bounded 10 docker inspect \
+    --format '{{json .Mounts}}' "$java_container")" || return $?
+  host_pid="$(run_bounded 10 docker inspect \
+    --format '{{.State.Pid}}' "$java_container")" || return $?
+
+  [[ "$privileged" == "false" && -z "$pid_mode" && "$user" == "0:0" && \
+    "$host_pid" =~ ^[1-9][0-9]*$ ]] || {
+    log_error "PID reuse Java runtime lost its unprivileged private-PID topology"
+    return 1
+  }
+  jq -e 'map(sub("^CAP_"; "")) | sort == ["ALL"]' \
+    <<<"$cap_drop" >/dev/null || return 1
+  jq -e 'map(sub("^CAP_"; "")) | sort == ["CHECKPOINT_RESTORE", "SETPCAP"]' \
+    <<<"$cap_add" >/dev/null || return 1
+  pid_reuse_java_security_options_have_contract "$security_options" || {
+    log_error "PID reuse Java runtime cannot write namespace-local ns_last_pid safely"
+    return 1
+  }
+  jq -e '. == [
+    "/otel/pid-reuse-supervisor",
+    "--control-dir", "/run/obi-demo/pid-reuse",
+    "--target-pid", "4242",
+    "--socket-fd", "198",
+    "--", "java", "-jar", "/app/backend.jar"
+  ]' <<<"$entrypoint" >/dev/null || return 1
+  jq -e '
+    [.[] | select(.Type == "volume" and
+      .Destination == "/run/obi-demo/pid-reuse" and .RW == true)] | length == 1
+  ' <<<"$mounts" >/dev/null || return 1
+  namespace_pid="$(awk '$1 == "NSpid:" { print $NF }' "/proc/$host_pid/status")" || return $?
+  java_pid_namespace="$(readlink "/proc/$host_pid/ns/pid")" || return $?
+  host_pid_namespace="$(readlink /proc/self/ns/pid)" || return $?
+  [[ "$namespace_pid" == "1" && \
+    "$java_pid_namespace" != "$host_pid_namespace" ]] || {
+    log_error "PID reuse supervisor is not PID 1 in a host-distinct PID namespace"
+    return 1
+  }
 }
 
 start_stack() {
@@ -3963,7 +4241,7 @@ start_stack() {
   assert_no_pending_permanent_absence_recovery || return $?
   # These controls replace the normal Java runtime only after startup.
   case "$runtime_contract_mode" in
-    primary-w3c-fault|primary-generation-mismatch|unix-generation-mismatch|permanent-absence|auto-unavailable)
+    primary-w3c-fault|primary-generation-mismatch|unix-generation-mismatch|pid-reuse|permanent-absence|auto-unavailable)
       runtime_contract_mode="basic"
       ;;
     benchmark-disabled)
@@ -3986,6 +4264,9 @@ start_stack() {
   run_bounded 30 "${COMPOSE[@]}" config --quiet || return $?
   run_bounded 30 \
     "${COMPOSE[@]}" config >"$RESULT_DIR/compose-resolved.yaml" || return $?
+  if [[ "$SCENARIO" == "pid-reuse" ]]; then
+    assert_pid_reuse_compose_contract || return $?
+  fi
 
   invalidate_project_transport_evidence || return $?
   log_info "building and starting the demo stack"
@@ -4029,6 +4310,9 @@ start_stack() {
       "Java remote parent bridge ready" \
       "OBI remote-parent bridge" \
       "$startup_since" || return $?
+    if [[ "$SCENARIO" == "pid-reuse" ]]; then
+      run_pid_reuse_controller || return $?
+    fi
     wait_for_log \
       java-backend \
       "OBI remote-parent propagator enabled" \
@@ -4096,6 +4380,9 @@ start_stack() {
   fi
   assert_apache_denies_java_diagnostics || return $?
   assert_runtime_contract "$runtime_contract_mode" || return $?
+  if [[ "$SCENARIO" == "pid-reuse" ]]; then
+    assert_pid_reuse_runtime_contract || return $?
+  fi
 }
 
 remaining_timeout_seconds() {
@@ -14366,6 +14653,11 @@ execute_requested_scenarios() {
       ;;
     unix-generation-mismatch)
       run_unix_generation_mismatch_control
+      ;;
+    pid-reuse)
+      SCENARIO_VARIANT="pid-reuse-recovery"
+      run_scenario basic
+      SCENARIO_VARIANT=""
       ;;
     primary-w3c-fault)
       run_primary_w3c_fault_control

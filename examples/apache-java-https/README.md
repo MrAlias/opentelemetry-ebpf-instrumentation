@@ -129,9 +129,9 @@ The checked-in #28 matrix is explicit about which layer proves each case:
 | valid W3C and malformed primary response | `primary-w3c-fault`: version, declared-size, zero-trace-ID, and zero-span-ID responses, exact W3C parent, then normal recovery | [current primary acceptance](evidence/otel-getsockopt-tls13-e8db066a/README.md#retained-proof) |
 | valid W3C and stale Unix state | `unix-w3c-stale`: forced `unix` retrieval TTL of `1ns`, exact W3C parent, one workload stale bridge take with an in-band terminal diagnostics snapshot, then normal-TTL recovery | [current Unix acceptance](evidence/otel-unix-tls13-6c4a2505/README.md#retained-proof) |
 | sampled and unsampled OBI flags | `obi-flags`: exact IDs and flags plus counter/diagnostic assertions | [graph](evidence/otel-getsockopt-tls13-e8db066a/scenario-obi-flags.json) and [passing assertion status](evidence/otel-getsockopt-tls13-e8db066a/scenario-obi-flags-status.json); ordinary phase values are omitted |
-| repeated extraction | `OfficialAgentJettyRuntimeTest` drives the registered stock-agent extraction chain at least twice for one request and requires one `VALID` take followed by `ALREADY_CONSUMED` | [Java Agent CI run 105](https://github.com/MrAlias/opentelemetry-ebpf-instrumentation/actions/runs/31675830100) passed with pinned, checksum-verified OpenTelemetry 2.28.1 and Splunk 2.28.0 agents |
-| nested/duplicate server instrumentation | `OfficialAgentJettyRuntimeTest` activates stock Jetty and Servlet server advice, compares a Servlet-disabled control, and requires exactly one exported Jetty server span | [Java Agent CI run 105](https://github.com/MrAlias/opentelemetry-ebpf-instrumentation/actions/runs/31675830100) passed across Java 8, 11, 17, and 21; Jetty 11 runtime cases execute where supported |
-| async/executor/Netty/virtual-thread handoff | dedicated exact-parent application scenarios plus stock-agent Jetty depth-64, ancestor-cycle, late-framework, Netty relay/cleanup, and Java 21 carrier-reuse controls | [current primary acceptance](evidence/otel-getsockopt-tls13-e8db066a/README.md#retained-proof) and [Java Agent CI run 105](https://github.com/MrAlias/opentelemetry-ebpf-instrumentation/actions/runs/31675830100); broader framework/environment expansion remains tracked by #38 |
+| repeated extraction | `OfficialAgentJettyRuntimeTest` drives the registered stock-agent extraction chain at least twice for one request and requires one `VALID` take followed by `ALREADY_CONSUMED` | The [retained official-agent runtime matrix](focused-validation/official-agent-runtime-9b66f39e/README.md) passed with pinned, checksum-verified OpenTelemetry 2.28.1 and Splunk 2.28.0 agents |
+| nested/duplicate server instrumentation | `OfficialAgentJettyRuntimeTest` activates stock Jetty and Servlet server advice, compares a Servlet-disabled control, and requires exactly one exported Jetty server span | The [retained official-agent runtime matrix](focused-validation/official-agent-runtime-9b66f39e/README.md) passed across Java 8, 11, 17, and 21; Jetty 11 is explicitly unsupported on Java 8 and passes on 11, 17, and 21 |
+| async/executor/Netty/virtual-thread handoff | dedicated exact-parent application scenarios plus stock-agent Jetty depth-64, ancestor-cycle, late-framework, Netty relay/cleanup, and Java 21 carrier-reuse controls | [current primary acceptance](evidence/otel-getsockopt-tls13-e8db066a/README.md#retained-proof) and the [retained official-agent runtime matrix](focused-validation/official-agent-runtime-9b66f39e/README.md); broader framework/environment expansion remains tracked by #38 |
 | inbound Netty receive-to-extraction | `netty-server`: Apache-to-inbound-Netty HTTPS with exact remote parent | [bounded fixture passed](evidence/otel-getsockopt-tls13-e8db066a/scenario-netty-server.json); arbitrary Netty frameworks or applications remain unproven |
 | sequential keepalive, HTTP/1.1 pipelining, parallel connections, and fd/port reuse | dedicated exact-parent scenarios with connection evidence | [current primary acceptance](evidence/otel-getsockopt-tls13-e8db066a/README.md#retained-proof) |
 
@@ -230,6 +230,15 @@ Central and verifies it before use:
 | --- | --- | --- |
 | OpenTelemetry | 2.28.1 | `faa89bdeebf9b1f52be4a4374689176717b02a59df2d8f8b6eb9aa39f9292589` |
 | Splunk | 2.28.0 | `70d177dd63a4bbdb153e65c962ff678ed98b5555ff5bb63afdb6e7fff05c1351` |
+
+The [retained stock-agent CI record](focused-validation/official-agent-runtime-9b66f39e/README.md)
+binds these pins to source revision
+`9b66f39eb0e5897b6b27d999e461267dfa85fd70`, four Linux `X64`/`x86_64`
+Java 8/11/17/21 cells, exact JUnit totals, and the raw GitHub artifact archive
+digests. It closes issue #27's declared stock-agent compatibility range when
+read with the existing Java 21 privileged Compose cells. It does not mark Java
+8, 11, or 17 as privileged Compose passes, establish `arm64`, or close the
+broader issue #23 or issue #38 matrices.
 
 Container base images are pinned by digest. The repository Java build exports
 the separately reviewed `obi-java-agent.jar` helper and
@@ -746,7 +755,9 @@ A dirty source tree, `--skip-bridge-build`, an individually targeted scenario,
 or `--scenario all --requests N` is explicitly labeled non-acceptance evidence.
 Only a clean, fresh-build full `all` run with the default per-scenario request
 counts is eligible to populate the result matrices.
-The clean focused primary-control record is retained separately in
+Reviewer-facing scoped records are listed in the
+[focused-validation index](focused-validation/README.md). The clean focused
+primary-control record is retained separately in
 [focused-validation/primary-getsockopt-8f0aa1f6](focused-validation/primary-getsockopt-8f0aa1f6/README.md)
 so its isolation and fail-open outcomes can be reviewed without being promoted
 to an acceptance cell. That historical record predates the live-descriptor

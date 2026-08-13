@@ -1,0 +1,80 @@
+{
+  "format": 1,
+  "kind": "focused-official-agent-runtime-compatibility",
+  "matrix_revision": "official-agent-runtime-v1",
+  "source_revision": "9b66f39eb0e5897b6b27d999e461267dfa85fd70",
+  "provenance": {
+    "repository": "MrAlias/opentelemetry-ebpf-instrumentation",
+    "workflow": "Java Agent CI",
+    "workflow_path": ".github/workflows/java-agent.yml",
+    "workflow_run_url": "https://github.com/MrAlias/opentelemetry-ebpf-instrumentation/actions/runs/31695707017",
+    "run_id": 31695707017,
+    "run_number": 107,
+    "run_attempt": 1,
+    "event": "workflow_dispatch",
+    "status": "completed",
+    "conclusion": "success",
+    "artifacts": [
+      {
+        "java_feature": 8,
+        "name": "java-agent-compatibility-java-8-31695707017-1",
+        "archive_size_bytes": 5631,
+        "digest": "sha256:a557db1d8b4094d5637f088bb31638360af04d7b64038eff7bfa283f07635f94"
+      },
+      {
+        "java_feature": 11,
+        "name": "java-agent-compatibility-java-11-31695707017-1",
+        "archive_size_bytes": 5331,
+        "digest": "sha256:da103526b191c5af90720edd53455d5110ba3f9a8dc5cd4cffdacb48f478f1bf"
+      },
+      {
+        "java_feature": 17,
+        "name": "java-agent-compatibility-java-17-31695707017-1",
+        "archive_size_bytes": 5335,
+        "digest": "sha256:d14f27e2fd92f2686e37eb8c0af6f2dbc26ecf3393874f9c83c7947cb41e05a1"
+      },
+      {
+        "java_feature": 21,
+        "name": "java-agent-compatibility-java-21-31695707017-1",
+        "archive_size_bytes": 4847,
+        "digest": "sha256:9f53b0dfce32686b391957668435984afa090feb7bd7786e95128818a4a33145"
+      }
+    ]
+  },
+  "agent_artifacts": [
+    {
+      "distribution": "opentelemetry",
+      "artifact_distribution": "otel",
+      "version": "2.28.1",
+      "sha256": "faa89bdeebf9b1f52be4a4374689176717b02a59df2d8f8b6eb9aa39f9292589",
+      "url": "https://repo.maven.apache.org/maven2/io/opentelemetry/javaagent/opentelemetry-javaagent/2.28.1/opentelemetry-javaagent-2.28.1.jar"
+    },
+    {
+      "distribution": "splunk",
+      "artifact_distribution": "splunk",
+      "version": "2.28.0",
+      "embedded_opentelemetry_version": "2.28.1",
+      "sha256": "70d177dd63a4bbdb153e65c962ff678ed98b5555ff5bb63afdb6e7fff05c1351",
+      "url": "https://repo.maven.apache.org/maven2/com/splunk/splunk-otel-javaagent/2.28.0/splunk-otel-javaagent-2.28.0.jar"
+    }
+  ],
+  "validation": {
+    "github_archive_digests_verified": true,
+    "independent_maven_agent_sha256_verified": true,
+    "source_revision_matches_run_and_all_artifacts": true
+  },
+  "scope": {
+    "supports_issue": 27,
+    "stock_official_agent_runtime": true,
+    "privileged_compose": false,
+    "apache_acceptance_matrix_cell": false,
+    "runner_architectures": [
+      "X64/x86_64"
+    ],
+    "does_not_establish": [
+      "arm64",
+      "issue-23-helper-lifecycle-matrix",
+      "issue-38-broader-environment-matrix"
+    ]
+  }
+}

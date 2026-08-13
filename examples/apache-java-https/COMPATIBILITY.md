@@ -127,13 +127,36 @@ The external extension has a deliberately narrow runtime gate:
 | OpenTelemetry API | 1.62.0 |
 | OpenTelemetry autoconfigure SPI | 1.62.0 |
 
-The Java CI workflow is configured to execute the test suite on all four JVM
-versions and, for every JVM matrix entry, download both unmodified official
-agents and prove that each loads the separately built external extension.
-Boundary tests require adjacent agent, API, SPI, and JVM versions to be
-rejected with a deterministic reason. These checks establish the declared
-compatibility contract when they pass; they do not replace a privileged
-Compose run for a matrix cell below.
+The retained [official-agent runtime record](focused-validation/official-agent-runtime-9b66f39e/README.md)
+comes from one exact successful Java CI execution at source revision
+`9b66f39eb0e5897b6b27d999e461267dfa85fd70`. For every JVM entry, the workflow
+downloaded both unmodified official agents, verified their checksums, loaded
+the separately built external extension, and ran the same startup and server
+parentage tests.
+
+Stock-agent CI matrix revision: `official-agent-runtime-v1`.
+
+| JVM | Agent | Extension startup | Jetty 11.0.26 | Netty 4.1.135.Final | Java 21 concurrency | JUnit cell |
+| --- | --- | --- | --- | --- | --- | --- |
+| 8 | OpenTelemetry 2.28.1 | pass | unsupported | pass | skipped: requires Java 21 | 8 tests, 4 skipped, 0 failures/errors |
+| 8 | Splunk 2.28.0 | pass | unsupported | pass | skipped: requires Java 21 | same Java 8 artifact cell |
+| 11 | OpenTelemetry 2.28.1 | pass | pass | pass | skipped: requires Java 21 | 8 tests, 2 skipped, 0 failures/errors |
+| 11 | Splunk 2.28.0 | pass | pass | pass | skipped: requires Java 21 | same Java 11 artifact cell |
+| 17 | OpenTelemetry 2.28.1 | pass | pass | pass | skipped: requires Java 21 | 8 tests, 2 skipped, 0 failures/errors |
+| 17 | Splunk 2.28.0 | pass | pass | pass | skipped: requires Java 21 | same Java 17 artifact cell |
+| 21 | OpenTelemetry 2.28.1 | pass | pass | pass | pass | 8 tests, 0 skipped, 0 failures/errors |
+| 21 | Splunk 2.28.0 | pass | pass | pass | pass | same Java 21 artifact cell |
+
+Java 8's Jetty result is `unsupported`, not a failure or an inferred pass:
+Jetty 11 requires Java 11 or newer. The Java 21 concurrency skips on Java 8,
+11, and 17 are likewise exact expected fixture limits. All four cells ran on
+Linux GitHub runners reporting `X64`, with `x86_64` from uname. No `arm64`
+result follows. Boundary tests in the same successful jobs require adjacent
+agent, API, SPI, and JVM versions to be rejected with a deterministic reason.
+
+This stock-agent matrix establishes issue #27's declared runtime contract. It
+does not replace a privileged Compose application run or expand issue #23 or
+issue #38. The privileged Compose matrix therefore remains:
 
 | JVM | OpenTelemetry 2.28.1 | Splunk 2.28.0 | Evidence |
 | --- | --- | --- | --- |

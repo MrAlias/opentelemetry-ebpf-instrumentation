@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"testing/iotest"
 	"time"
@@ -417,6 +418,131 @@ func packagedJVMBenchmarkEnvironment(environment []string) ([]string, error) {
 		}
 	}
 	return slices.Clone(expectedPackagedJVMBenchmarkEnvironment), nil
+}
+
+type packagedJVMBenchmarkExecutableBinding struct {
+	InvocationPath string
+	ResolvedPath   string
+}
+
+type packagedJVMBenchmarkProbeLog struct {
+	mu     sync.Mutex
+	output bytes.Buffer
+}
+
+func (log *packagedJVMBenchmarkProbeLog) Write(value []byte) (int, error) {
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	return log.output.Write(value)
+}
+
+func (log *packagedJVMBenchmarkProbeLog) String() string {
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	return log.output.String()
+}
+
+// bindPackagedJVMBenchmarkExecutable validates and binds the executable reached by path while
+// preserving its invocation identity. Multicall executables such as BusyBox select an applet from
+// argv[0], so the resolved file must be executed with the original sh path as argv[0].
+func bindPackagedJVMBenchmarkExecutable(
+	path string,
+) (packagedJVMBenchmarkExecutableBinding, error) {
+	invocation, err := filepath.Abs(path)
+	if err != nil {
+		return packagedJVMBenchmarkExecutableBinding{}, fmt.Errorf(
+			"resolve executable invocation path: %w", err,
+		)
+	}
+	invocation = filepath.Clean(invocation)
+	if !filepath.IsAbs(invocation) {
+		return packagedJVMBenchmarkExecutableBinding{}, errors.New(
+			"executable invocation path is not absolute",
+		)
+	}
+	resolved, err := filepath.EvalSymlinks(invocation)
+	if err != nil {
+		return packagedJVMBenchmarkExecutableBinding{}, fmt.Errorf(
+			"resolve executable invocation symlinks: %w", err,
+		)
+	}
+	resolved = filepath.Clean(resolved)
+	if !filepath.IsAbs(resolved) {
+		return packagedJVMBenchmarkExecutableBinding{}, errors.New(
+			"resolved executable path is not absolute",
+		)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return packagedJVMBenchmarkExecutableBinding{}, fmt.Errorf(
+			"stat resolved executable: %w", err,
+		)
+	}
+	if !info.Mode().IsRegular() {
+		return packagedJVMBenchmarkExecutableBinding{}, errors.New(
+			"resolved executable is not a regular file",
+		)
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		return packagedJVMBenchmarkExecutableBinding{}, errors.New(
+			"resolved executable is not executable",
+		)
+	}
+	for component := resolved; ; component = filepath.Dir(component) {
+		var stat unix.Stat_t
+		if err := unix.Lstat(component, &stat); err != nil {
+			return packagedJVMBenchmarkExecutableBinding{}, fmt.Errorf(
+				"inspect resolved executable path component %s: %w", component, err,
+			)
+		}
+		if stat.Uid != 0 || stat.Mode&0o022 != 0 {
+			return packagedJVMBenchmarkExecutableBinding{}, fmt.Errorf(
+				"resolved executable path component %s is not root-controlled", component,
+			)
+		}
+		if component == string(filepath.Separator) {
+			break
+		}
+	}
+	return packagedJVMBenchmarkExecutableBinding{
+		InvocationPath: invocation,
+		ResolvedPath:   resolved,
+	}, nil
+}
+
+func packagedJVMBenchmarkEarlyLaunchDiagnostic(
+	command *exec.Cmd,
+	stderr fmt.Stringer,
+) (bool, string) {
+	if command == nil || command.Process == nil {
+		return false, "launcher process was not started"
+	}
+	pidfd, err := unix.PidfdOpen(command.Process.Pid, 0)
+	if err != nil {
+		return false, fmt.Sprintf(
+			"launcher exit state unavailable: %v; stderr=%q", err, strings.TrimSpace(stderr.String()),
+		)
+	}
+	defer unix.Close(pidfd)
+
+	poll := []unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}}
+	count, err := unix.Poll(poll, 100)
+	if err != nil {
+		return false, fmt.Sprintf(
+			"launcher exit poll failed: %v; stderr=%q", err, strings.TrimSpace(stderr.String()),
+		)
+	}
+	if count == 0 || poll[0].Revents == 0 {
+		return false, fmt.Sprintf(
+			"launcher was still running; stderr=%q", strings.TrimSpace(stderr.String()),
+		)
+	}
+	waitErr := command.Wait()
+	return true, fmt.Sprintf(
+		"launcher exited before process identity was available: %v; stderr=%q",
+		waitErr,
+		strings.TrimSpace(stderr.String()),
+	)
 }
 
 func parsePackagedJVMBenchmarkProbeLine(
@@ -1810,6 +1936,107 @@ func TestPackagedJVMBenchmarkEnvironmentIsMinimal(t *testing.T) {
 		_, forbidden := forbiddenPackagedJVMBenchmarkEnvironment[name]
 		require.Falsef(t, forbidden, "minimal environment contains forbidden variable %s", name)
 	}
+}
+
+func TestPackagedJVMBenchmarkShellInvocationPreservesMulticallApplet(t *testing.T) {
+	directory := t.TempDir()
+	shellPath, err := exec.LookPath("sh")
+	require.NoError(t, err)
+	shell, err := bindPackagedJVMBenchmarkExecutable(shellPath)
+	require.NoError(t, err)
+	invocationLink := filepath.Join(directory, "sh")
+	require.NoError(t, os.Symlink(shell.ResolvedPath, invocationLink))
+
+	binding, err := bindPackagedJVMBenchmarkExecutable(invocationLink)
+	require.NoError(t, err)
+	require.Equal(t, invocationLink, binding.InvocationPath)
+	require.Equal(t, shell.ResolvedPath, binding.ResolvedPath)
+
+	retarget := filepath.Join(directory, "retarget")
+	require.NoError(t, os.WriteFile(retarget, []byte("#!/bin/sh\nexit 99\n"), 0o700))
+	require.NoError(t, os.Remove(invocationLink))
+	require.NoError(t, os.Symlink(retarget, invocationLink))
+	mutatedTarget, err := filepath.EvalSymlinks(invocationLink)
+	require.NoError(t, err)
+	require.NotEqual(t, binding.ResolvedPath, mutatedTarget)
+
+	command := exec.Command(
+		binding.ResolvedPath,
+		"-c",
+		`IFS= read -r _ || exit 1; exec "$@"`,
+		"sh",
+		"/bin/true",
+	)
+	command.Args[0] = binding.InvocationPath
+	require.Equal(t, binding.ResolvedPath, command.Path)
+	require.Equal(t, binding.InvocationPath, command.Args[0])
+	stdin, err := command.StdinPipe()
+	require.NoError(t, err)
+	var stderr packagedJVMBenchmarkProbeLog
+	command.Stderr = &stderr
+	require.NoError(t, command.Start())
+	waited := false
+	defer func() {
+		_ = stdin.Close()
+		if waited {
+			return
+		}
+		_ = command.Process.Kill()
+		_ = command.Wait()
+	}()
+
+	var namespace unix.Stat_t
+	require.NoError(t, unix.Stat(
+		fmt.Sprintf("/proc/%d/ns/pid_for_children", command.Process.Pid),
+		&namespace,
+	))
+	exited, diagnostic := packagedJVMBenchmarkEarlyLaunchDiagnostic(command, &stderr)
+	require.False(t, exited)
+	require.Contains(t, diagnostic, "launcher was still running")
+	_, err = io.WriteString(stdin, "\n")
+	require.NoError(t, err)
+	require.NoError(t, stdin.Close())
+	require.NoErrorf(t, command.Wait(), "multicall shell gate stderr: %s", stderr.String())
+	waited = true
+
+	broken := exec.Command(
+		binding.ResolvedPath,
+		"-c",
+		`printf '%s\n' 'synthetic early launch failure' >&2; exit 127`,
+	)
+	broken.Args[0] = binding.InvocationPath
+	var brokenStderr packagedJVMBenchmarkProbeLog
+	broken.Stderr = &brokenStderr
+	require.NoError(t, broken.Start())
+	exited, diagnostic = packagedJVMBenchmarkEarlyLaunchDiagnostic(broken, &brokenStderr)
+	require.True(t, exited)
+	require.Contains(t, diagnostic, "exit status 127")
+	require.Contains(t, diagnostic, "synthetic early launch failure")
+}
+
+func TestPackagedJVMBenchmarkExecutableInvocationPathRejectsInvalidTargets(t *testing.T) {
+	directory := t.TempDir()
+	missing := filepath.Join(directory, "missing")
+	_, err := bindPackagedJVMBenchmarkExecutable(missing)
+	require.ErrorContains(t, err, "resolve executable invocation symlinks")
+
+	brokenLink := filepath.Join(directory, "broken-link")
+	require.NoError(t, os.Symlink(missing, brokenLink))
+	_, err = bindPackagedJVMBenchmarkExecutable(brokenLink)
+	require.ErrorContains(t, err, "resolve executable invocation symlinks")
+
+	notExecutable := filepath.Join(directory, "not-executable")
+	require.NoError(t, os.WriteFile(notExecutable, []byte("not executable\n"), 0o600))
+	_, err = bindPackagedJVMBenchmarkExecutable(notExecutable)
+	require.ErrorContains(t, err, "resolved executable is not executable")
+
+	_, err = bindPackagedJVMBenchmarkExecutable(directory)
+	require.ErrorContains(t, err, "resolved executable is not a regular file")
+
+	untrusted := filepath.Join(directory, "untrusted-executable")
+	require.NoError(t, os.WriteFile(untrusted, []byte("#!/bin/sh\nexit 0\n"), 0o777))
+	_, err = bindPackagedJVMBenchmarkExecutable(untrusted)
+	require.ErrorContains(t, err, "is not root-controlled")
 }
 
 func TestPackagedJVMBenchmarkEnvironmentRejectsLoaderAndJVMControls(t *testing.T) {

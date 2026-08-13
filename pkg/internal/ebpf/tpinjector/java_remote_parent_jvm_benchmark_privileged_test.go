@@ -57,9 +57,10 @@ func TestJavaRemoteParentPackagedJVMGetsockoptBenchmark(t *testing.T) {
 	setpriv, err := exec.LookPath("setpriv")
 	require.NoError(t, err)
 	setpriv = canonicalPackagedJVMBenchmarkPath(t, setpriv, "setpriv executable")
-	shell, err := exec.LookPath("sh")
+	shellPath, err := exec.LookPath("sh")
 	require.NoError(t, err)
-	shell = canonicalPackagedJVMBenchmarkPath(t, shell, "shell executable")
+	shell, err := bindPackagedJVMBenchmarkExecutable(shellPath)
+	require.NoError(t, err)
 	javaEnvironment, err := packagedJVMBenchmarkEnvironment(os.Environ())
 	require.NoError(t, err)
 	sourceIdentity := packagedJVMBenchmarkSourceIdentity(t, setpriv, javaEnvironment)
@@ -109,7 +110,7 @@ func TestJavaRemoteParentPackagedJVMGetsockoptBenchmark(t *testing.T) {
 	defer cancel()
 	command := exec.CommandContext(
 		ctx,
-		shell,
+		shell.ResolvedPath,
 		"-c",
 		`IFS= read -r _; exec "$@"`,
 		"sh",
@@ -132,6 +133,7 @@ func TestJavaRemoteParentPackagedJVMGetsockoptBenchmark(t *testing.T) {
 		strconv.Itoa(packagedJVMBenchmarkWarmupIterations),
 		strconv.Itoa(packagedJVMBenchmarkMeasurementIterations),
 	)
+	command.Args[0] = shell.InvocationPath
 	command.Dir = "/"
 	command.Env = javaEnvironment
 	command.ExtraFiles = []*os.File{agentArtifact}
@@ -144,17 +146,22 @@ func TestJavaRemoteParentPackagedJVMGetsockoptBenchmark(t *testing.T) {
 	require.NoError(t, command.Start())
 	waited := false
 	defer func() {
+		_ = stdin.Close()
 		if waited {
 			return
 		}
-		_ = stdin.Close()
 		if command.Process != nil {
 			_ = command.Process.Kill()
 		}
 		_ = command.Wait()
 	}()
 
-	process := javaRemoteParentProcessKey(t, command.Process.Pid)
+	process, err := packagedJVMBenchmarkProcessKey(command.Process.Pid)
+	if err != nil {
+		exited, diagnostic := packagedJVMBenchmarkEarlyLaunchDiagnostic(command, &stderr)
+		waited = exited
+		require.NoErrorf(t, err, "resolve gated launcher process identity: %s", diagnostic)
+	}
 	require.NoError(t, objects.JavaAuthorizedProcesses.Update(
 		process, packagedJVMBenchmarkCapability, ebpf.UpdateAny,
 	))
@@ -1075,6 +1082,28 @@ func canonicalPackagedJVMBenchmarkPath(t *testing.T, path string, name string) s
 	require.NoErrorf(t, err, "stat %s", name)
 	require.Truef(t, info.Mode().IsRegular(), "%s is not a regular file", name)
 	return canonical
+}
+
+func packagedJVMBenchmarkProcessKey(pid int) (BpfJavaRemoteParentPidKeyT, error) {
+	if pid <= 0 || uint64(pid) > uint64(^uint32(0)) {
+		return BpfJavaRemoteParentPidKeyT{}, fmt.Errorf("invalid gated launcher process ID %d", pid)
+	}
+	path := fmt.Sprintf("/proc/%d/ns/pid_for_children", pid)
+	var stat unix.Stat_t
+	if err := unix.Stat(path, &stat); err != nil {
+		return BpfJavaRemoteParentPidKeyT{}, fmt.Errorf("stat gated launcher PID namespace %s: %w", path, err)
+	}
+	if stat.Ino > uint64(^uint32(0)) {
+		return BpfJavaRemoteParentPidKeyT{}, fmt.Errorf(
+			"gated launcher PID namespace inode %d exceeds uint32", stat.Ino,
+		)
+	}
+	processID := uint32(pid)
+	return BpfJavaRemoteParentPidKeyT{
+		Tid: processID,
+		Pid: processID,
+		Ns:  uint32(stat.Ino),
+	}, nil
 }
 
 func openPackagedJVMBenchmarkRegularFile(t *testing.T, path string, name string) *os.File {

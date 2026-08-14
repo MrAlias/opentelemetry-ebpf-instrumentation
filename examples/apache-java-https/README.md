@@ -221,6 +221,50 @@ resulting helper and external-extension checksums with the run. Do not replace
 those artifacts manually. `--skip-bridge-build` is only for checksum-verified,
 targeted local iteration and is never acceptance evidence.
 
+### Exact component build mapping
+
+The clean-host `run.sh` command above is the canonical build command. It builds
+from a private snapshot of the recorded source tree, copies the two exported
+JARs into the scoped runtime artifact directory, records their checksums, and
+then runs Compose with `--build`. The underlying build boundaries are:
+
+| Requested component | Exact build boundary and output |
+| --- | --- |
+| OBI | The `obi` service in `docker-compose.yml` builds the repository-root `Dockerfile` with `RELEASE_VERSION=apache-java-https-demo` and `RELEASE_REVISION=local`. |
+| JNI library | The `jni-builder` stage in `javaagent.Dockerfile` runs `make -f Makefile.jni` for both `linux-amd64` and `linux-aarch64`, producing `libobijni.so` files that are embedded in the helper JAR. |
+| dynamically attached helper | The `export` stage in `javaagent.Dockerfile` exports `obi-java-agent.jar`. |
+| Java-agent extension | The same `export` stage exports the separately loaded `obi-otel-extension.jar`. |
+
+For a non-acceptance inspection build from the repository root, these are the
+exact standalone commands represented by those two runner boundaries:
+
+```bash
+(
+  set -Eeuo pipefail
+  bridge_export="$(mktemp -d)"
+  trap 'rm -rf -- "$bridge_export"' EXIT
+  docker build \
+    --file javaagent.Dockerfile \
+    --target export \
+    --output "type=local,dest=$bridge_export" \
+    .
+  sha256sum \
+    "$bridge_export/obi-java-agent.jar" \
+    "$bridge_export/obi-otel-extension.jar"
+)
+
+docker compose \
+  --project-name obi-apache-java-https \
+  --project-directory examples/apache-java-https \
+  --file examples/apache-java-https/docker-compose.yml \
+  build obi
+```
+
+These standalone commands do not create acceptance evidence. Acceptance still
+requires the clean `run.sh` invocation, which binds the source snapshot, build
+logs, checksums, resolved Compose model, runtime assertions, and cleanup into
+one result.
+
 ## Reproducible inputs
 
 `scripts/download-agent.sh` downloads exactly one unmodified agent from Maven
@@ -317,6 +361,19 @@ The default `all` suite runs, in order:
   route, with a separate exact-parent assertion for each request;
 - repeated real Jetty async redispatch with exactly one Java server span;
 - valid W3C precedence and invalid-W3C fallback to OBI;
+- forced-primary stale (`primary-w3c-stale`), generation-mismatch
+  (`primary-generation-mismatch`), and ABI-version/declared-size/zero-ID
+  (`primary-w3c-fault`) fail-open controls, or the transport-applicable
+  forced-Unix stale (`unix-w3c-stale`), generation-mismatch
+  (`unix-generation-mismatch`), and responder-fault (`w3c-fault`) controls;
+  controls for the other forced transport are retained as `unsupported`, never
+  as passes;
+- one complete JVM lifetime with OBI permanently absent (`permanent-absence`),
+  followed by a fresh JVM and exact-parent recovery;
+- when `--transport auto` is selected, one JVM lifetime with both primary and
+  Unix retrieval unavailable (`auto-unavailable`), followed by recovery;
+  forced-primary and forced-Unix runs retain that mode-specific control as
+  `unsupported`;
 - a JVM started while OBI is absent, with root and valid-W3C behavior before
   late helper attach and exact-parent recovery without a JVM restart;
 - valid-W3C traffic spanning an enforced OBI stop interval and restart,
@@ -326,6 +383,21 @@ The default `all` suite runs, in order:
   disabled;
 - an uninstrumented JVM, with OBI stopped, whose HTTP response must match the
   instrumented control and whose marker must produce no spans.
+
+The genuine PID-reuse allocator control is deliberately targeted and is not
+part of `all`. Start it only with a fresh scoped Compose project:
+
+```bash
+./examples/apache-java-https/run.sh --cleanup-only
+./examples/apache-java-https/run.sh \
+  --transport getsockopt \
+  --scenario pid-reuse
+```
+
+It runs the PID-namespace allocator/controller before Java backend readiness,
+then runs only the recovered `basic` exact-parent assertion. Because it is an
+individually targeted scenario, its result is always labeled non-acceptance
+evidence and cannot promote a compatibility or final-result cell.
 
 Run the fallback transport and TLS version separately:
 

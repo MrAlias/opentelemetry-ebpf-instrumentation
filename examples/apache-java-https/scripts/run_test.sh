@@ -21718,6 +21718,407 @@ test_apache_diagnostic_denial_matrix_is_exact() {
   }
 }
 
+workflow_run_script() {
+  local -r workflow="$1"
+  local -r step_name="$2"
+
+  awk -v step="      - name: $step_name" '
+    $0 == step { in_step = 1; next }
+    in_step && /^      - name:/ { exit }
+    in_step && $0 == "        run: |" { in_run = 1; next }
+    in_run && $0 == "" { print; next }
+    in_run && substr($0, 1, 10) == "          " {
+      print substr($0, 11)
+      next
+    }
+    in_run { exit }
+    END { if (!in_run) exit 1 }
+  ' "$workflow"
+}
+
+github_multiline_output() {
+  local -r output="$1"
+  local -r name="$2"
+
+  awk -v name="$name" '
+    index($0, name "<<") == 1 {
+      delimiter = substr($0, length(name) + 3)
+      found = 1
+      next
+    }
+    found && $0 == delimiter { complete = 1; exit }
+    found { print }
+    END { if (!found || !complete) exit 1 }
+  ' "$output"
+}
+
+assert_markdown_target_script_contract() {
+  local -r script="$1"
+
+  [[ "$(grep -Fc 'markdown_targets+=(":./$path")' "$script")" == "1" ]] || return 1
+  ! grep -Fq 'escape_markdownlint_glob' "$script" || return 1
+  ! grep -Fq 'markdown_targets+=("./$path")' "$script" || return 1
+}
+
+write_legacy_markdown_target_mutant() {
+  local -r source_script="$1"
+  local -r mutant_script="$2"
+  local line=""
+
+  while IFS= read -r line; do
+    if [[ "$line" == "declare -a markdown_paths=()" ]]; then
+      cat <<'EOF'
+escape_markdownlint_glob() {
+  local -r path="$1"
+  local escaped="./"
+  local character=""
+  local -i index=0
+
+  for ((index = 0; index < ${#path}; index++)); do
+    character="${path:index:1}"
+    case "$character" in
+      '\\'|'*'|'?'|'['|']'|'{'|'}'|'('|')'|'!'|'+'|'@')
+        escaped+="\\$character"
+        ;;
+      *)
+        escaped+="$character"
+        ;;
+    esac
+  done
+  printf '%s\n' "$escaped"
+}
+EOF
+    fi
+    if [[ "$line" == *'markdown_targets+=(":./$path")'* ]]; then
+      printf '%s\n' '    markdown_targets+=("$(escape_markdownlint_glob "$path")")'
+    else
+      printf '%s\n' "$line"
+    fi
+  done <"$source_script" >"$mutant_script"
+}
+
+run_markdown_change_detector() {
+  local -r repository="$1"
+  local -r script="$2"
+  local -r event_name="$3"
+  local -r base_sha="$4"
+  local -r head_sha="$5"
+  local -r before_sha="$6"
+  local -r after_sha="$7"
+  local -r output="$8"
+
+  : >"$output"
+  (
+    cd -- "$repository"
+    EVENT_NAME="$event_name" \
+      BASE_SHA="$base_sha" \
+      HEAD_SHA="$head_sha" \
+      BEFORE_SHA="$before_sha" \
+      AFTER_SHA="$after_sha" \
+      GITHUB_OUTPUT="$output" \
+      bash "$script"
+  ) >/dev/null
+}
+
+test_markdown_workflow_preserves_literal_nonempty_targets() {
+  local -r workflow="$TEST_SCRIPT_DIR/../../../.github/workflows/markdown-fail-fast.yml"
+  local -r fixture_root="$TEST_TMP_DIR/markdown-workflow-fixture"
+  local -r repository="$fixture_root/repository"
+  local -r changes_script="$fixture_root/get-changed-files.sh"
+  local -r targets_script="$fixture_root/validate-targets.sh"
+  local -r raw_targets_script="$fixture_root/raw-targets.sh"
+  local -r legacy_targets_script="$fixture_root/legacy-targets.sh"
+  local -r changes_output="$fixture_root/changes.output"
+  local -r targets_output="$fixture_root/targets.output"
+  local -r raw_targets_output="$fixture_root/raw-targets.output"
+  local -r legacy_targets_output="$fixture_root/legacy-targets.output"
+  local -r collapsed_output="$fixture_root/collapsed.output"
+  local -r injection_sentinel="$repository/markdown-injected"
+  local before_sha=""
+  local after_sha=""
+  local changed_count=""
+  local changed_paths=""
+  local collapsed_paths=""
+  local markdown_targets=""
+  local raw_targets=""
+  local legacy_targets=""
+  local -a expected_paths=(
+    'docs/$(touch markdown-injected).md'
+    'docs/literal\backslash.md'
+    'docs/plain.md'
+    'docs/space [literal]*?.md'
+    'docs/{brace}!@.md'
+  )
+  local -a expected_targets=(
+    ':./docs/$(touch markdown-injected).md'
+    ':./docs/literal\backslash.md'
+    ':./docs/plain.md'
+    ':./docs/space [literal]*?.md'
+    ':./docs/{brace}!@.md'
+  )
+  local path=""
+
+  mkdir -p -- "$repository/docs"
+  git -C "$repository" init -q
+  git -C "$repository" config user.name markdown-workflow-test
+  git -C "$repository" config user.email markdown-workflow-test@example.invalid
+  git -C "$repository" config commit.gpgsign false
+  printf 'seed\n' >"$repository/seed.txt"
+  git -C "$repository" add -- seed.txt
+  git -C "$repository" commit -qm seed
+  before_sha="$(git -C "$repository" rev-parse HEAD)"
+  for path in "${expected_paths[@]}"; do
+    printf '# test\n' >"$repository/$path"
+  done
+  git -C "$repository" add -- docs
+  git -C "$repository" commit -qm markdown
+  after_sha="$(git -C "$repository" rev-parse HEAD)"
+
+  workflow_run_script "$workflow" "Get changed files" >"$changes_script"
+  workflow_run_script "$workflow" "Validate and encode lint targets" >"$targets_script"
+  assert_markdown_target_script_contract "$targets_script" || {
+    printf 'Markdown workflow does not use one pinned literal target per path\n' >&2
+    return 1
+  }
+  run_markdown_change_detector "$repository" "$changes_script" push '' '' \
+    "$before_sha" "$after_sha" "$changes_output"
+
+  changed_count="$(awk -F= '$1 == "md_count" { print $2 }' "$changes_output")"
+  changed_paths="$(github_multiline_output "$changes_output" md_paths)"
+  [[ "$changed_count" == "${#expected_paths[@]}" && \
+    "$changed_paths" == "$(printf '%s\n' "${expected_paths[@]}")" ]] || {
+    printf 'Markdown workflow did not preserve exact line-delimited paths\n' >&2
+    return 1
+  }
+
+  (
+    cd -- "$repository"
+    EXPECTED_COUNT="$changed_count" \
+      MARKDOWN_PATHS="$changed_paths" \
+      GITHUB_OUTPUT="$targets_output" \
+      bash "$targets_script"
+  ) >/dev/null
+  markdown_targets="$(github_multiline_output "$targets_output" globs)"
+  [[ "$markdown_targets" == "$(printf '%s\n' "${expected_targets[@]}")" && \
+    ! -e "$injection_sentinel" ]] || {
+    printf 'Markdown workflow did not emit exact colon-literal targets safely\n' >&2
+    return 1
+  }
+
+  sed 's|markdown_targets+=(":./$path")|markdown_targets+=("./$path")|' \
+    "$targets_script" >"$raw_targets_script"
+  if assert_markdown_target_script_contract "$raw_targets_script"; then
+    printf 'Markdown target contract accepted the former raw-glob mutation\n' >&2
+    return 1
+  fi
+  (
+    cd -- "$repository"
+    EXPECTED_COUNT="$changed_count" MARKDOWN_PATHS="$changed_paths" \
+      GITHUB_OUTPUT="$raw_targets_output" bash "$raw_targets_script"
+  ) >/dev/null
+  raw_targets="$(github_multiline_output "$raw_targets_output" globs)"
+  [[ "$raw_targets" != "$markdown_targets" ]] || {
+    printf 'Raw-glob mutation was not distinguished from literal targets\n' >&2
+    return 1
+  }
+
+  write_legacy_markdown_target_mutant "$targets_script" "$legacy_targets_script"
+  if assert_markdown_target_script_contract "$legacy_targets_script"; then
+    printf 'Markdown target contract accepted the former escaping mutation\n' >&2
+    return 1
+  fi
+  (
+    cd -- "$repository"
+    EXPECTED_COUNT="$changed_count" MARKDOWN_PATHS="$changed_paths" \
+      GITHUB_OUTPUT="$legacy_targets_output" bash "$legacy_targets_script"
+  ) >/dev/null
+  legacy_targets="$(github_multiline_output "$legacy_targets_output" globs)"
+  [[ "$legacy_targets" != "$markdown_targets" ]] || {
+    printf 'Legacy escaping mutation was not distinguished from literal targets\n' >&2
+    return 1
+  }
+
+  collapsed_paths="${changed_paths//$'\n'/ }"
+  if (
+    cd -- "$repository"
+    EXPECTED_COUNT="$changed_count" \
+      MARKDOWN_PATHS="$collapsed_paths" \
+      GITHUB_OUTPUT="$collapsed_output" \
+      bash "$targets_script"
+  ) >/dev/null 2>&1; then
+    printf 'Markdown workflow accepted the former space-collapsed zero-file handoff\n' >&2
+    return 1
+  fi
+  if (
+    cd -- "$repository"
+    EXPECTED_COUNT=1 MARKDOWN_PATHS='' GITHUB_OUTPUT="$collapsed_output" \
+      bash "$targets_script"
+  ) >/dev/null 2>&1; then
+    printf 'Markdown workflow accepted a nonempty count with zero lint targets\n' >&2
+    return 1
+  fi
+}
+
+test_markdown_workflow_uses_exact_event_ranges() {
+  local -r workflow="$TEST_SCRIPT_DIR/../../../.github/workflows/markdown-fail-fast.yml"
+  local -r fixture_root="$TEST_TMP_DIR/markdown-range-fixture"
+  local -r push_repository="$fixture_root/push-repository"
+  local -r pr_repository="$fixture_root/pr-repository"
+  local -r changes_script="$fixture_root/get-changed-files.sh"
+  local -r output="$fixture_root/changes.output"
+  local -r zero_sha="0000000000000000000000000000000000000000"
+  local push_before=""
+  local push_after=""
+  local type_change_after=""
+  local common_sha=""
+  local base_sha=""
+  local head_sha=""
+  local count=""
+  local paths=""
+
+  mkdir -p -- "$push_repository/docs" "$pr_repository/docs"
+  workflow_run_script "$workflow" "Get changed files" >"$changes_script"
+
+  git -C "$push_repository" init -q
+  git -C "$push_repository" config user.name markdown-workflow-test
+  git -C "$push_repository" config user.email markdown-workflow-test@example.invalid
+  git -C "$push_repository" config commit.gpgsign false
+  printf '# preexisting\n' >"$push_repository/docs/preexisting.md"
+  git -C "$push_repository" add -- docs/preexisting.md
+  git -C "$push_repository" commit -qm seed
+  push_before="$(git -C "$push_repository" rev-parse HEAD)"
+  printf '# earlier\n' >"$push_repository/docs/earlier.md"
+  git -C "$push_repository" add -- docs/earlier.md
+  git -C "$push_repository" commit -qm earlier-markdown
+  printf 'last commit is not Markdown\n' >"$push_repository/last.txt"
+  git -C "$push_repository" add -- last.txt
+  git -C "$push_repository" commit -qm last-non-markdown
+  push_after="$(git -C "$push_repository" rev-parse HEAD)"
+
+  run_markdown_change_detector "$push_repository" "$changes_script" push '' '' \
+    "$push_before" "$push_after" "$output"
+  count="$(awk -F= '$1 == "md_count" { print $2 }' "$output")"
+  paths="$(github_multiline_output "$output" md_paths)"
+  [[ "$count" == "1" && "$paths" == "docs/earlier.md" ]] || {
+    printf 'Push range omitted Markdown from an earlier pushed commit\n' >&2
+    return 1
+  }
+
+  run_markdown_change_detector "$push_repository" "$changes_script" push '' '' \
+    "$zero_sha" "$push_after" "$output"
+  count="$(awk -F= '$1 == "md_count" { print $2 }' "$output")"
+  paths="$(github_multiline_output "$output" md_paths)"
+  [[ "$count" == "2" && \
+    "$paths" == "$(printf '%s\n' docs/earlier.md docs/preexisting.md)" ]] || {
+    printf 'New-ref push did not conservatively lint all current Markdown\n' >&2
+    return 1
+  }
+  if run_markdown_change_detector "$push_repository" "$changes_script" push '' '' \
+    ffffffffffffffffffffffffffffffffffffffff "$push_after" "$output" \
+    >/dev/null 2>&1; then
+    printf 'Push range accepted an unavailable before commit\n' >&2
+    return 1
+  fi
+
+  ln -sfn ../last.txt "$push_repository/docs/preexisting.md"
+  git -C "$push_repository" add -- docs/preexisting.md
+  git -C "$push_repository" commit -qm markdown-symlink-type-change
+  type_change_after="$(git -C "$push_repository" rev-parse HEAD)"
+  if run_markdown_change_detector "$push_repository" "$changes_script" push '' '' \
+    "$push_after" "$type_change_after" "$output" >/dev/null 2>&1; then
+    printf 'Push range accepted a Markdown regular-to-symlink type change\n' >&2
+    return 1
+  fi
+
+  git -C "$pr_repository" init -q
+  git -C "$pr_repository" config user.name markdown-workflow-test
+  git -C "$pr_repository" config user.email markdown-workflow-test@example.invalid
+  git -C "$pr_repository" config commit.gpgsign false
+  printf '# common\n' >"$pr_repository/docs/base-only.md"
+  git -C "$pr_repository" add -- docs/base-only.md
+  git -C "$pr_repository" commit -qm common
+  common_sha="$(git -C "$pr_repository" rev-parse HEAD)"
+  git -C "$pr_repository" checkout -qb target
+  printf '# target-only change\n' >"$pr_repository/docs/base-only.md"
+  git -C "$pr_repository" add -- docs/base-only.md
+  git -C "$pr_repository" commit -qm target-only-markdown
+  base_sha="$(git -C "$pr_repository" rev-parse HEAD)"
+  git -C "$pr_repository" checkout -qb pull-request "$common_sha"
+  printf '# pull request\n' >"$pr_repository/docs/pr-only.md"
+  git -C "$pr_repository" add -- docs/pr-only.md
+  git -C "$pr_repository" commit -qm pull-request-markdown
+  head_sha="$(git -C "$pr_repository" rev-parse HEAD)"
+
+  run_markdown_change_detector "$pr_repository" "$changes_script" pull_request \
+    "$base_sha" "$head_sha" '' '' "$output"
+  count="$(awk -F= '$1 == "md_count" { print $2 }' "$output")"
+  paths="$(github_multiline_output "$output" md_paths)"
+  [[ "$count" == "1" && "$paths" == "docs/pr-only.md" ]] || {
+    printf 'Pull-request range included target-branch-only Markdown\n' >&2
+    return 1
+  }
+}
+
+assert_runbook_build_and_control_contract() {
+  local -r readme="$1"
+  local -r runner="$TEST_SCRIPT_DIR/../run.sh"
+  local -r javaagent_dockerfile="$TEST_SCRIPT_DIR/../../../javaagent.Dockerfile"
+  local -r compose="$TEST_SCRIPT_DIR/../docker-compose.yml"
+  local control=""
+  local -a controls=(
+    primary-generation-mismatch
+    unix-generation-mismatch
+    permanent-absence
+    auto-unavailable
+    pid-reuse
+  )
+
+  for control in "${controls[@]}"; do
+    grep -Fq -- "$control" "$runner" || return 1
+    grep -Fq -- "$control" "$readme" || return 1
+  done
+  grep -Fq -- '--scenario pid-reuse' "$readme" || return 1
+  grep -Fq 'deliberately targeted and is not' "$readme" || return 1
+  grep -Fq 'its result is always labeled non-acceptance' "$readme" || return 1
+  grep -Fq 'evidence and cannot promote a compatibility or final-result cell.' \
+    "$readme" || return 1
+
+  grep -Fq 'docker build \' "$readme" || return 1
+  grep -Fq '    --file javaagent.Dockerfile \' "$readme" || return 1
+  grep -Fq '    --target export \' "$readme" || return 1
+  grep -Fq '    --output "type=local,dest=$bridge_export" \' "$readme" || return 1
+  grep -Fq '  build obi' "$readme" || return 1
+  grep -Fq '    docker build \' "$runner" || return 1
+  grep -Fq '      --target export \' "$runner" || return 1
+  grep -Fq 'make -f Makefile.jni' "$javaagent_dockerfile" || return 1
+  grep -Fq 'obi-java-agent.jar' "$javaagent_dockerfile" || return 1
+  grep -Fq 'obi-otel-extension.jar' "$javaagent_dockerfile" || return 1
+  grep -Fqx '  obi:' "$compose" || return 1
+  grep -Fqx '      dockerfile: Dockerfile' "$compose" || return 1
+}
+
+test_runbook_build_and_control_contract_is_mutation_sensitive() {
+  local -r readme="$TEST_SCRIPT_DIR/../README.md"
+  local -r missing_control="$TEST_TMP_DIR/runbook-missing-control.md"
+  local -r stale_build="$TEST_TMP_DIR/runbook-stale-build.md"
+
+  assert_runbook_build_and_control_contract "$readme" || {
+    printf 'Runbook does not match the current CLI and build boundaries\n' >&2
+    return 1
+  }
+  sed 's/--scenario pid-reuse/--scenario stale-pid-reuse/' \
+    "$readme" >"$missing_control"
+  if assert_runbook_build_and_control_contract "$missing_control"; then
+    printf 'Runbook contract accepted a stale PID-reuse command\n' >&2
+    return 1
+  fi
+  sed 's/--target export/--target stale-export/' "$readme" >"$stale_build"
+  if assert_runbook_build_and_control_contract "$stale_build"; then
+    printf 'Runbook contract accepted a stale bridge export target\n' >&2
+    return 1
+  fi
+}
+
 compatibility_matrix_revision() {
   local -r matrix="$1"
 
@@ -26036,6 +26437,9 @@ main() {
   test_java_build_uses_isolated_gradle_home
   test_demo_diagnostics_are_loopback_only
   test_apache_diagnostic_denial_matrix_is_exact
+  test_markdown_workflow_preserves_literal_nonempty_targets
+  test_markdown_workflow_uses_exact_event_ranges
+  test_runbook_build_and_control_contract_is_mutation_sensitive
   test_compatibility_matrix_lists_deployment_modes
   test_demo_uses_only_explicit_tcp_context
   test_obi_image_build_regenerates_bpf_hermetically

@@ -3998,6 +3998,54 @@ pid_reuse_compose_model_has_contract() {
   jq -e -s '
     length == 1 and
     (.[0] | type == "object") and
+    (.[0].services["socket-init"] as $init |
+      ($init.user == "0:0") and
+      ($init.network_mode == "none") and
+      (($init.privileged // false) == false) and
+      ($init.read_only == true) and
+      (($init.cap_drop | map(sub("^CAP_"; "")) | sort) == ["ALL"]) and
+      (($init.cap_add | map(sub("^CAP_"; "")) | sort) ==
+        ["CHOWN", "DAC_READ_SEARCH"]) and
+      (($init.security_opt | sort) == ["no-new-privileges:true"]) and
+      ($init.entrypoint == ["/bin/sh", "-ec"]) and
+      (($init.command | length) == 1) and
+      (($init.command[0] | split("\n")) == [
+        "umask 077",
+        "chown 0:65534 /var/run/obi",
+        "chmod 0750 /var/run/obi",
+        "test -f /run/obi-demo/pid-reuse-keystore-source/server.p12",
+        "test ! -L /run/obi-demo/pid-reuse-keystore-source/server.p12",
+        "test -s /run/obi-demo/pid-reuse-keystore-source/server.p12",
+        "stat -c \u0027%a:%h:%F\u0027 /run/obi-demo/pid-reuse-keystore-source/server.p12 | grep -Ex \u0027(400|600):1:regular file\u0027 >/dev/null",
+        "chown 0:0 /run/obi-demo/pid-reuse-keystore",
+        "chmod 0700 /run/obi-demo/pid-reuse-keystore",
+        "test ! -e /run/obi-demo/pid-reuse-keystore/server.p12",
+        "test ! -L /run/obi-demo/pid-reuse-keystore/server.p12",
+        "set -C",
+        "cat /run/obi-demo/pid-reuse-keystore-source/server.p12 > /run/obi-demo/pid-reuse-keystore/server.p12",
+        "chmod 0600 /run/obi-demo/pid-reuse-keystore/server.p12",
+        "stat -c \u0027%u:%g:%a:%h:%F\u0027 /run/obi-demo/pid-reuse-keystore/server.p12 | grep -Fx \u00270:0:600:1:regular file\u0027 >/dev/null",
+        "test -s /run/obi-demo/pid-reuse-keystore/server.p12",
+        "cmp -s /run/obi-demo/pid-reuse-keystore-source/server.p12 /run/obi-demo/pid-reuse-keystore/server.p12",
+        ""
+      ]) and
+      (($init.volumes | length) == 3) and
+      ([$init.volumes[] |
+        select(.type == "volume" and
+          .source == "java-remote-parent-socket" and
+          .target == "/var/run/obi" and
+          ((.read_only // false) == false))] | length == 1) and
+      ([$init.volumes[] |
+        select(.type == "bind" and
+          (.source | endswith("/.runtime/certs/server.p12")) and
+          .target == "/run/obi-demo/pid-reuse-keystore-source/server.p12" and
+          .read_only == true and
+          .bind.create_host_path == false)] | length == 1) and
+      ([$init.volumes[] |
+        select(.type == "volume" and
+          .source == "pid-reuse-keystore" and
+          .target == "/run/obi-demo/pid-reuse-keystore" and
+          ((.read_only // false) == false))] | length == 1)) and
     (.[0].services["java-backend"] as $java |
       ($java.user == "0:0") and
       (($java.privileged // false) == false) and
@@ -4014,11 +4062,29 @@ pid_reuse_compose_model_has_contract() {
         "--socket-fd", "198",
         "--", "java", "-jar", "/app/backend.jar"
       ]) and
+      ($java.environment.TLS_KEYSTORE_PATH ==
+        "/run/obi-demo/pid-reuse-keystore/server.p12") and
+      (($java.volumes | length) == 4) and
+      ([$java.volumes[] |
+        select(.type == "bind" and
+          (.source | endswith("/.runtime/certs/server.p12")) and
+          .target == "/run/obi-demo/certs/server.p12" and
+          .read_only == true)] | length == 1) and
+      ([$java.volumes[] |
+        select(.type == "volume" and
+          .source == "java-remote-parent-socket" and
+          .target == "/var/run/obi" and
+          ((.read_only // false) == false))] | length == 1) and
       ([$java.volumes[] |
         select(.type == "volume" and
           .source == "pid-reuse-control" and
           .target == "/run/obi-demo/pid-reuse" and
-          ((.read_only // false) == false))] | length == 1)) and
+          ((.read_only // false) == false))] | length == 1) and
+      ([$java.volumes[] |
+        select(.type == "volume" and
+          .source == "pid-reuse-keystore" and
+          .target == "/run/obi-demo/pid-reuse-keystore" and
+          .read_only == true)] | length == 1)) and
     (.[0].services["pid-reuse"] as $controller |
       ($controller.user == "0:0") and
       ($controller.network_mode == "none") and
@@ -4033,7 +4099,13 @@ pid_reuse_compose_model_has_contract() {
       ($controller.volumes[0].source == "pid-reuse-control") and
       ($controller.volumes[0].target == "/control") and
       (($controller.volumes[0].read_only // false) == false)) and
-    (.[0].volumes["pid-reuse-control"] | type == "object")
+    ((.[0].volumes | keys | sort) ==
+      ["java-remote-parent-socket", "pid-reuse-control", "pid-reuse-keystore"]) and
+    (.[0].volumes["pid-reuse-control"] | type == "object") and
+    (.[0].volumes["pid-reuse-keystore"] as $keystore |
+      ($keystore | type == "object") and
+      ($keystore.labels["io.opentelemetry.obi.apache-java-https.owner"] ==
+        "acceptance-demo-v1"))
   ' "$input" >/dev/null
 }
 
@@ -4302,8 +4374,74 @@ pid_reuse_supervisor_namespace_attestation_from_snapshots() {
   printf '%s\t%s\n' "$host_pid" "$pid_namespace_depth"
 }
 
+pid_reuse_runtime_keystore_has_contract() {
+  local -r input="$1"
+
+  jq -e '
+    length == 2 and
+    (.[0] as $init | .[1] as $java |
+      ($init.State.Status == "exited") and
+      ($init.State.Running == false) and
+      ($init.State.Paused == false) and
+      ($init.State.Restarting == false) and
+      ($init.State.OOMKilled == false) and
+      ($init.State.Dead == false) and
+      ($init.State.ExitCode == 0) and
+      ($init.State.Error == "") and
+      ($init.Config.User == "0:0") and
+      ($init.HostConfig.NetworkMode == "none") and
+      ($init.HostConfig.Privileged == false) and
+      ($init.HostConfig.ReadonlyRootfs == true) and
+      (($init.HostConfig.CapDrop | map(sub("^CAP_"; "")) | sort) == ["ALL"]) and
+      (($init.HostConfig.CapAdd | map(sub("^CAP_"; "")) | sort) ==
+        ["CHOWN", "DAC_READ_SEARCH"]) and
+      (($init.HostConfig.SecurityOpt | sort) == ["no-new-privileges:true"]) and
+      (($init.Mounts | length) == 3) and
+      ([$init.Mounts[] |
+        select(.Type == "volume" and
+          .Destination == "/var/run/obi" and
+          .RW == true)] | length == 1) and
+      ([$init.Mounts[] |
+        select(.Type == "bind" and
+          (.Source | endswith("/.runtime/certs/server.p12")) and
+          .Destination == "/run/obi-demo/pid-reuse-keystore-source/server.p12" and
+          .RW == false)] | length == 1) and
+      ([$init.Mounts[] |
+        select(.Type == "volume" and
+          .Destination == "/run/obi-demo/pid-reuse-keystore" and
+          .RW == true)] as $init_keystore |
+        ($init_keystore | length) == 1 and
+        ($init_keystore[0].Name | type == "string" and length > 0) and
+        (($java.Mounts | length) == 4) and
+        ([$java.Mounts[] |
+          select(.Type == "bind" and
+            (.Source | endswith("/.runtime/certs/server.p12")) and
+            .Destination == "/run/obi-demo/certs/server.p12" and
+            .RW == false)] | length == 1) and
+        ([$java.Mounts[] |
+          select(.Type == "volume" and
+            .Destination == "/var/run/obi" and
+            .RW == true)] | length == 1) and
+        ([$java.Mounts[] |
+          select(.Type == "volume" and
+            .Destination == "/run/obi-demo/pid-reuse" and
+            .RW == true)] | length == 1) and
+        ([ $java.Config.Env[] |
+          select(startswith("TLS_KEYSTORE_PATH=")) ] ==
+          ["TLS_KEYSTORE_PATH=/run/obi-demo/pid-reuse-keystore/server.p12"]) and
+        ([$java.Mounts[] |
+          select(.Type == "volume" and
+            .Destination == "/run/obi-demo/pid-reuse-keystore" and
+            .RW == false)] as $java_keystore |
+          ($java_keystore | length) == 1 and
+          $java_keystore[0].Name == $init_keystore[0].Name)))
+  ' "$input" >/dev/null
+}
+
 assert_pid_reuse_runtime_contract() {
   local java_container=""
+  local socket_init_container=""
+  local runtime_keystore_evidence="$RESULT_DIR/pid-reuse-keystore-runtime.json"
   local privileged=""
   local pid_mode=""
   local user=""
@@ -4324,10 +4462,22 @@ assert_pid_reuse_runtime_contract() {
   local status_snapshot=""
   local pid_namespace_depth=""
 
+  socket_init_container="$(run_bounded 10 \
+    "${COMPOSE[@]}" ps --all --quiet socket-init)" || return $?
   java_container="$(run_bounded 10 \
     "${COMPOSE[@]}" ps --quiet java-backend)" || return $?
-  [[ -n "$java_container" ]] || {
-    log_error "PID reuse Java supervisor is not running before the controller"
+  [[ -n "$socket_init_container" && -n "$java_container" ]] || {
+    log_error "PID reuse keystore initializer or Java supervisor is absent before the controller"
+    return 1
+  }
+  run_bounded 10 docker inspect \
+    "$socket_init_container" "$java_container" >"$runtime_keystore_evidence" || return $?
+  bounded_evidence_file "$runtime_keystore_evidence" 1048576 20000 || {
+    log_error "PID reuse runtime keystore evidence exceeded its bounds"
+    return 1
+  }
+  pid_reuse_runtime_keystore_has_contract "$runtime_keystore_evidence" || {
+    log_error "PID reuse runtime did not realize the private one-run keystore contract"
     return 1
   }
   privileged="$(run_bounded 10 docker inspect \
@@ -4463,6 +4613,12 @@ start_stack() {
   verify_compose_project_ownership || {
     die "reserved Compose project ownership could not be verified"
   }
+  if [[ "$SCENARIO" == "pid-reuse" ]]; then
+    verify_compose_project_absent || {
+      log_error "PID reuse requires a fresh Compose project; run --cleanup-only first"
+      return 1
+    }
+  fi
   log_info "validating resolved Compose configuration"
   RUN_STAGE="compose-configuration"
   if [[ -n "$SOURCE_SNAPSHOT_DIR" ]]; then
@@ -16626,6 +16782,10 @@ write_run_status() {
 }
 
 cleanup_only() {
+  # Cleanup must use the superset model so resources declared only by an
+  # optional scenario overlay (notably the private PID-reuse keystore volume)
+  # cannot survive a later base-model cleanup.
+  COMPOSE=("${PID_REUSE_COMPOSE[@]}")
   assert_permanent_absence_marker_matches_current_docker || return $?
   invalidate_project_transport_evidence || return $?
   BRIDGE_RUNNING=false

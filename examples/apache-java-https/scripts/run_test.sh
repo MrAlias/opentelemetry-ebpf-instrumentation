@@ -718,6 +718,41 @@ test_cleanup_only_invalidates_matching_project_evidence_before_down() {
   }
 }
 
+test_cleanup_only_selects_pid_reuse_compose_superset() {
+  local -r down_marker="$TEST_TMP_DIR/cleanup-only-pid-reuse-compose-down"
+
+  (
+    COMPOSE=(docker compose --project-name cleanup-test --file base.yml)
+    PID_REUSE_COMPOSE=(
+      docker compose --project-name cleanup-test --file base.yml
+      --file docker-compose.pid-reuse.yml
+    )
+    BRIDGE_RUNNING=true
+    assert_permanent_absence_marker_matches_current_docker() { :; }
+    invalidate_project_transport_evidence() { :; }
+    clear_pending_permanent_absence_recovery() { :; }
+    safe_compose_down() {
+      local -i index=0
+
+      ((${#COMPOSE[@]} == ${#PID_REUSE_COMPOSE[@]})) || return 31
+      for ((index = 0; index < ${#COMPOSE[@]}; index++)); do
+        [[ "${COMPOSE[index]}" == "${PID_REUSE_COMPOSE[index]}" ]] || return 31
+      done
+      [[ "$BRIDGE_RUNNING" == "false" ]] || return 31
+      : >"$down_marker"
+    }
+
+    cleanup_only
+  ) || {
+    printf 'cleanup-only did not select the PID-reuse Compose superset\n' >&2
+    return 1
+  }
+  [[ -e "$down_marker" ]] || {
+    printf 'cleanup-only did not run Compose down with the PID-reuse model\n' >&2
+    return 1
+  }
+}
+
 test_cleanup_only_refuses_untrusted_current_evidence_identity() {
   local mode=""
   local results_root=""
@@ -24628,6 +24663,37 @@ write_pid_reuse_compose_model_fixture() {
   jq -n '
     {
       services: {
+        "socket-init": {
+          user: "0:0",
+          network_mode: "none",
+          read_only: true,
+          cap_drop: ["ALL"],
+          cap_add: ["CHOWN", "DAC_READ_SEARCH"],
+          security_opt: ["no-new-privileges:true"],
+          entrypoint: ["/bin/sh", "-ec"],
+          command: [
+            "umask 077\nchown 0:65534 /var/run/obi\nchmod 0750 /var/run/obi\ntest -f /run/obi-demo/pid-reuse-keystore-source/server.p12\ntest ! -L /run/obi-demo/pid-reuse-keystore-source/server.p12\ntest -s /run/obi-demo/pid-reuse-keystore-source/server.p12\nstat -c \u0027%a:%h:%F\u0027 /run/obi-demo/pid-reuse-keystore-source/server.p12 | grep -Ex \u0027(400|600):1:regular file\u0027 >/dev/null\nchown 0:0 /run/obi-demo/pid-reuse-keystore\nchmod 0700 /run/obi-demo/pid-reuse-keystore\ntest ! -e /run/obi-demo/pid-reuse-keystore/server.p12\ntest ! -L /run/obi-demo/pid-reuse-keystore/server.p12\nset -C\ncat /run/obi-demo/pid-reuse-keystore-source/server.p12 > /run/obi-demo/pid-reuse-keystore/server.p12\nchmod 0600 /run/obi-demo/pid-reuse-keystore/server.p12\nstat -c \u0027%u:%g:%a:%h:%F\u0027 /run/obi-demo/pid-reuse-keystore/server.p12 | grep -Fx \u00270:0:600:1:regular file\u0027 >/dev/null\ntest -s /run/obi-demo/pid-reuse-keystore/server.p12\ncmp -s /run/obi-demo/pid-reuse-keystore-source/server.p12 /run/obi-demo/pid-reuse-keystore/server.p12\n"
+          ],
+          volumes: [
+            {
+              type: "volume",
+              source: "java-remote-parent-socket",
+              target: "/var/run/obi"
+            },
+            {
+              type: "bind",
+              source: "/sealed/examples/apache-java-https/.runtime/certs/server.p12",
+              target: "/run/obi-demo/pid-reuse-keystore-source/server.p12",
+              read_only: true,
+              bind: {create_host_path: false}
+            },
+            {
+              type: "volume",
+              source: "pid-reuse-keystore",
+              target: "/run/obi-demo/pid-reuse-keystore"
+            }
+          ]
+        },
         "java-backend": {
           user: "0:0",
           cap_drop: ["ALL"],
@@ -24644,11 +24710,31 @@ write_pid_reuse_compose_model_fixture() {
             "--socket-fd", "198",
             "--", "java", "-jar", "/app/backend.jar"
           ],
+          environment: {
+            TLS_KEYSTORE_PATH: "/run/obi-demo/pid-reuse-keystore/server.p12"
+          },
           volumes: [
+            {
+              type: "bind",
+              source: "/sealed/examples/apache-java-https/.runtime/certs/server.p12",
+              target: "/run/obi-demo/certs/server.p12",
+              read_only: true
+            },
+            {
+              type: "volume",
+              source: "java-remote-parent-socket",
+              target: "/var/run/obi"
+            },
             {
               type: "volume",
               source: "pid-reuse-control",
               target: "/run/obi-demo/pid-reuse"
+            },
+            {
+              type: "volume",
+              source: "pid-reuse-keystore",
+              target: "/run/obi-demo/pid-reuse-keystore",
+              read_only: true
             }
           ]
         },
@@ -24668,7 +24754,15 @@ write_pid_reuse_compose_model_fixture() {
           ]
         }
       },
-      volumes: {"pid-reuse-control": {}}
+      volumes: {
+        "java-remote-parent-socket": {},
+        "pid-reuse-control": {},
+        "pid-reuse-keystore": {
+          labels: {
+            "io.opentelemetry.obi.apache-java-https.owner": "acceptance-demo-v1"
+          }
+        }
+      }
     }
   ' >"$output"
 }
@@ -24684,6 +24778,18 @@ test_pid_reuse_compose_model_is_exact_and_mutation_sensitive() {
     return 1
   }
   for filter in \
+    '.services["socket-init"].network_mode = "host"' \
+    '.services["socket-init"].read_only = false' \
+    '.services["socket-init"].cap_add += ["DAC_OVERRIDE"]' \
+    '.services["socket-init"].security_opt = []' \
+    '.services["socket-init"].command[0] |= sub("set -C\\n"; "")' \
+    '.services["socket-init"].command[0] |= sub("chmod 0600 /run/obi-demo/pid-reuse-keystore/server.p12\\n"; "")' \
+    '.services["socket-init"].command[0] |= sub("cmp -s /run/obi-demo/pid-reuse-keystore-source/server.p12 /run/obi-demo/pid-reuse-keystore/server.p12\\n"; "")' \
+    '.services["socket-init"].volumes[1].source = "/tmp/server.p12"' \
+    '.services["socket-init"].volumes[1].read_only = false' \
+    '.services["socket-init"].volumes[1].bind.create_host_path = true' \
+    '.services["socket-init"].volumes[2].read_only = true' \
+    '.services["socket-init"].volumes += [{type:"bind",source:"/",target:"/host"}]' \
     '.services["java-backend"].pid = "host"' \
     '.services["java-backend"].cap_add += ["SYS_ADMIN"]' \
     '.services["java-backend"].security_opt = ["no-new-privileges:true"]' \
@@ -24691,13 +24797,135 @@ test_pid_reuse_compose_model_is_exact_and_mutation_sensitive() {
     '.services["java-backend"].security_opt -= ["apparmor=unconfined"]' \
     '.services["java-backend"].security_opt += ["seccomp=unconfined"]' \
     '.services["java-backend"].entrypoint[4] = "4243"' \
-    '.services["java-backend"].volumes[0].read_only = true' \
+    '.services["java-backend"].volumes[2].read_only = true' \
+    '.services["java-backend"].environment.TLS_KEYSTORE_PATH = "/run/obi-demo/certs/server.p12"' \
+    '.services["java-backend"].volumes[3].read_only = false' \
+    '.services["java-backend"].volumes += [{type:"bind",source:"/",target:"/host"}]' \
     '.services["pid-reuse"].privileged = false' \
     '.services["pid-reuse"].network_mode = "host"' \
-    '.services["pid-reuse"].volumes += [{type:"bind",source:"/",target:"/host"}]'; do
+    '.services["pid-reuse"].volumes += [{type:"bind",source:"/",target:"/host"}]' \
+    'del(.volumes["pid-reuse-keystore"].labels)'; do
     jq "$filter" "$valid" >"$mutation"
     if pid_reuse_compose_model_has_contract "$mutation"; then
       printf 'PID reuse Compose contract accepted mutation: %s\n' "$filter" >&2
+      return 1
+    fi
+  done
+}
+
+write_pid_reuse_runtime_keystore_fixture() {
+  local -r output="$1"
+
+  jq -n '
+    [
+      {
+        State: {
+          Status: "exited",
+          Running: false,
+          Paused: false,
+          Restarting: false,
+          OOMKilled: false,
+          Dead: false,
+          ExitCode: 0,
+          Error: ""
+        },
+        Config: {User: "0:0"},
+        HostConfig: {
+          NetworkMode: "none",
+          Privileged: false,
+          ReadonlyRootfs: true,
+          CapDrop: ["ALL"],
+          CapAdd: ["CAP_CHOWN", "CAP_DAC_READ_SEARCH"],
+          SecurityOpt: ["no-new-privileges:true"]
+        },
+        Mounts: [
+          {
+            Type: "volume",
+            Name: "obi-apache-java-https_java-remote-parent-socket",
+            Destination: "/var/run/obi",
+            RW: true
+          },
+          {
+            Type: "bind",
+            Source: "/sealed/examples/apache-java-https/.runtime/certs/server.p12",
+            Destination: "/run/obi-demo/pid-reuse-keystore-source/server.p12",
+            RW: false
+          },
+          {
+            Type: "volume",
+            Name: "obi-apache-java-https_pid-reuse-keystore",
+            Destination: "/run/obi-demo/pid-reuse-keystore",
+            RW: true
+          }
+        ]
+      },
+      {
+        Config: {
+          Env: [
+            "HTTPS_PORT=18443",
+            "TLS_KEYSTORE_PATH=/run/obi-demo/pid-reuse-keystore/server.p12"
+          ]
+        },
+        Mounts: [
+          {
+            Type: "bind",
+            Source: "/sealed/examples/apache-java-https/.runtime/certs/server.p12",
+            Destination: "/run/obi-demo/certs/server.p12",
+            RW: false
+          },
+          {
+            Type: "volume",
+            Name: "obi-apache-java-https_java-remote-parent-socket",
+            Destination: "/var/run/obi",
+            RW: true
+          },
+          {
+            Type: "volume",
+            Name: "obi-apache-java-https_pid-reuse-control",
+            Destination: "/run/obi-demo/pid-reuse",
+            RW: true
+          },
+          {
+            Type: "volume",
+            Name: "obi-apache-java-https_pid-reuse-keystore",
+            Destination: "/run/obi-demo/pid-reuse-keystore",
+            RW: false
+          }
+        ]
+      }
+    ]
+  ' >"$output"
+}
+
+test_pid_reuse_runtime_keystore_is_exact_and_mutation_sensitive() {
+  local -r valid="$TEST_TMP_DIR/pid-reuse-keystore-runtime-valid.json"
+  local -r mutation="$TEST_TMP_DIR/pid-reuse-keystore-runtime-mutation.json"
+  local filter=""
+
+  write_pid_reuse_runtime_keystore_fixture "$valid"
+  pid_reuse_runtime_keystore_has_contract "$valid" || {
+    printf 'PID reuse runtime keystore contract rejected the exact fixture\n' >&2
+    return 1
+  }
+  for filter in \
+    '.[0].State.Status = "running"' \
+    '.[0].State.ExitCode = 1' \
+    '.[0].State.OOMKilled = true' \
+    '.[0].HostConfig.NetworkMode = "default"' \
+    '.[0].HostConfig.ReadonlyRootfs = false' \
+    '.[0].HostConfig.CapAdd += ["CAP_DAC_OVERRIDE"]' \
+    '.[0].HostConfig.SecurityOpt = []' \
+    '.[0].Mounts[1].RW = true' \
+    '.[0].Mounts[2].RW = false' \
+    '.[0].Mounts += [{Type:"bind",Source:"/",Destination:"/host",RW:true}]' \
+    '.[1].Config.Env[1] = "TLS_KEYSTORE_PATH=/run/obi-demo/certs/server.p12"' \
+    '.[1].Config.Env += ["TLS_KEYSTORE_PATH=/duplicate"]' \
+    '.[1].Mounts[3].RW = true' \
+    '.[1].Mounts[3].Name = "other-volume"' \
+    '.[1].Mounts += [{Type:"bind",Source:"/",Destination:"/host",RW:true}]'; do
+    jq "$filter" "$valid" >"$mutation"
+    if pid_reuse_runtime_keystore_has_contract "$mutation"; then
+      printf 'PID reuse runtime keystore accepted mutation: %s\n' "$filter" >&2
       return 1
     fi
   done
@@ -24998,6 +25226,16 @@ test_pid_reuse_static_overlay_and_build_wiring_are_exact() {
 
   overlay_contents="$(<"$overlay")" || return 1
   [[ "$overlay_contents" != *'${'* && \
+    "$overlay_contents" == *$'  socket-init:\n    read_only: true'* && \
+    "$overlay_contents" == *$'    cap_add:\n      - CHOWN\n      - DAC_READ_SEARCH'* && \
+    "$overlay_contents" == *'no-new-privileges:true'* && \
+    "$overlay_contents" == *'source: ./.runtime/certs/server.p12'* && \
+    "$overlay_contents" == *'create_host_path: false'* && \
+    "$overlay_contents" == *'set -C'* && \
+    "$overlay_contents" == *'chmod 0600 /run/obi-demo/pid-reuse-keystore/server.p12'* && \
+    "$overlay_contents" == *'cmp -s /run/obi-demo/pid-reuse-keystore-source/server.p12 /run/obi-demo/pid-reuse-keystore/server.p12'* && \
+    "$overlay_contents" == *'TLS_KEYSTORE_PATH: /run/obi-demo/pid-reuse-keystore/server.p12'* && \
+    "$overlay_contents" == *'pid-reuse-keystore:/run/obi-demo/pid-reuse-keystore:ro'* && \
     "$overlay_contents" == *$'cap_add:\n      - CHECKPOINT_RESTORE\n      - SETPCAP'* && \
     "$overlay_contents" == *$'security_opt:\n      - systempaths=unconfined\n      - apparmor=unconfined\n      - no-new-privileges:true'* && \
     "$overlay_contents" == *'/otel/pid-reuse-supervisor'* && \
@@ -25087,6 +25325,7 @@ test_pid_reuse_controller_precedes_backend_readiness() {
     assert_clean_source_checkout_is_stable() { :; }
     assert_no_pending_permanent_absence_recovery() { :; }
     verify_compose_project_ownership() { :; }
+    verify_compose_project_absent() { printf 'compose:absent\n' >>"$observed"; }
     invalidate_project_transport_evidence() { :; }
     run_bounded() { :; }
     run_logged_bounded() { printf 'compose:up\n' >>"$observed"; }
@@ -25107,11 +25346,17 @@ test_pid_reuse_controller_precedes_backend_readiness() {
     return 1
   }
   awk '
+    $0 == "compose:absent" { absent = NR }
+    $0 == "compose:contract" { contract = NR }
+    $0 == "compose:up" { up = NR }
     $0 == "log:OBI remote-parent bridge" { bridge = NR }
     $0 == "pid-reuse:controller" { controller = NR }
     $0 == "log:external OTel extension" { extension = NR }
     $0 == "pid-reuse:runtime" { runtime = NR }
-    END { exit !(bridge > 0 && bridge < runtime && runtime < controller && controller < extension) }
+    END {
+      exit !(absent > 0 && absent < contract && contract < up &&
+        bridge > 0 && bridge < runtime && runtime < controller && controller < extension)
+    }
   ' "$observed" || {
     printf 'PID reuse controller did not fence backend readiness\n' >&2
     return 1
@@ -25148,6 +25393,7 @@ main() {
   test_primary_live_fd_recovery_marker_forces_cleanup_with_keep
   test_run_status_publication_failure_changes_successful_exit
   test_cleanup_only_invalidates_matching_project_evidence_before_down
+  test_cleanup_only_selects_pid_reuse_compose_superset
   test_cleanup_only_refuses_untrusted_current_evidence_identity
   test_cleanup_only_refuses_down_when_project_evidence_invalidation_fails
   test_cleanup_only_fails_closed_on_project_matcher_error
@@ -25181,6 +25427,7 @@ main() {
   test_pid_reuse_arguments_are_exact
   test_pid_reuse_public_result_is_closed_and_mutation_sensitive
   test_pid_reuse_compose_model_is_exact_and_mutation_sensitive
+  test_pid_reuse_runtime_keystore_is_exact_and_mutation_sensitive
   test_pid_reuse_runtime_sandbox_is_exact_and_normalization_tolerant
   test_pid_reuse_runtime_pid_namespace_attestation_is_mutation_sensitive
   test_pid_reuse_runtime_state_attestation_rejects_exit_and_pid_change

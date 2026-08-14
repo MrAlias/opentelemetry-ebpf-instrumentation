@@ -1,4 +1,43 @@
 services:
+  socket-init:
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_READ_SEARCH
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - |
+        umask 077
+        chown 0:65534 /var/run/obi
+        chmod 0750 /var/run/obi
+        test -f /run/obi-demo/pid-reuse-keystore-source/server.p12
+        test ! -L /run/obi-demo/pid-reuse-keystore-source/server.p12
+        test -s /run/obi-demo/pid-reuse-keystore-source/server.p12
+        stat -c '%a:%h:%F' /run/obi-demo/pid-reuse-keystore-source/server.p12 | grep -Ex '(400|600):1:regular file' >/dev/null
+        chown 0:0 /run/obi-demo/pid-reuse-keystore
+        chmod 0700 /run/obi-demo/pid-reuse-keystore
+        test ! -e /run/obi-demo/pid-reuse-keystore/server.p12
+        test ! -L /run/obi-demo/pid-reuse-keystore/server.p12
+        set -C
+        cat /run/obi-demo/pid-reuse-keystore-source/server.p12 > /run/obi-demo/pid-reuse-keystore/server.p12
+        chmod 0600 /run/obi-demo/pid-reuse-keystore/server.p12
+        stat -c '%u:%g:%a:%h:%F' /run/obi-demo/pid-reuse-keystore/server.p12 | grep -Fx '0:0:600:1:regular file' >/dev/null
+        test -s /run/obi-demo/pid-reuse-keystore/server.p12
+        cmp -s /run/obi-demo/pid-reuse-keystore-source/server.p12 /run/obi-demo/pid-reuse-keystore/server.p12
+    volumes:
+      - type: bind
+        source: ./.runtime/certs/server.p12
+        target: /run/obi-demo/pid-reuse-keystore-source/server.p12
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: volume
+        source: pid-reuse-keystore
+        target: /run/obi-demo/pid-reuse-keystore
+
   # The supervisor is PID 1 in Docker's default private PID namespace. It uses
   # these two capabilities only to select a numeric PID and irreversibly drop
   # the controlled JVM's full capability sets before exec.
@@ -29,8 +68,11 @@ services:
       - java
       - -jar
       - /app/backend.jar
+    environment:
+      TLS_KEYSTORE_PATH: /run/obi-demo/pid-reuse-keystore/server.p12
     volumes:
       - pid-reuse-control:/run/obi-demo/pid-reuse
+      - pid-reuse-keystore:/run/obi-demo/pid-reuse-keystore:ro
 
   # The controller has no network and a read-only root. Privilege is scoped to
   # its short-lived BPF-map transaction; its only writable path is the private
@@ -52,5 +94,8 @@ services:
 
 volumes:
   pid-reuse-control:
+    labels:
+      io.opentelemetry.obi.apache-java-https.owner: acceptance-demo-v1
+  pid-reuse-keystore:
     labels:
       io.opentelemetry.obi.apache-java-https.owner: acceptance-demo-v1

@@ -711,6 +711,212 @@ func TestPackagedJVMBenchmarkGuardedUnixRemovalRejectsReplacements(t *testing.T)
 	}
 }
 
+type packagedJVMBenchmarkExpectedStaleResidue struct {
+	Generation         uint64
+	ObservedMonotimeNS uint64
+	ProcessIncarnation uint64
+}
+
+func packagedJVMBenchmarkExpectedStaleResponse(
+	expected packagedJVMBenchmarkExpectedStaleResidue,
+) BpfJavaRemoteParentJavaRemoteParentResponseT {
+	return BpfJavaRemoteParentJavaRemoteParentResponseT{
+		Magic:                [4]uint8{'O', 'B', 'I', 'J'},
+		VersionLe:            javabridge.Version,
+		SizeLe:               javabridge.RecordSize,
+		Status:               uint8(javabridge.StatusValid),
+		Flags:                1,
+		TraceId:              [16]uint8{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		SpanId:               [8]uint8{17, 18, 19, 20, 21, 22, 23, 24},
+		GenerationLe:         expected.Generation,
+		ObservedMonotimeNsLe: expected.ObservedMonotimeNS,
+	}
+}
+
+func validatePackagedJVMBenchmarkExpectedStaleResidue(
+	expected packagedJVMBenchmarkExpectedStaleResidue,
+) error {
+	if expected.Generation == 0 || expected.ObservedMonotimeNS == 0 ||
+		expected.ProcessIncarnation != packagedJVMBenchmarkCapability {
+		return errors.New("packaged JVM Unix boundary lacks exact final stale-series authority")
+	}
+	return nil
+}
+
+func validatePackagedJVMBenchmarkStaleFallback(
+	expected packagedJVMBenchmarkExpectedStaleResidue,
+	actual BpfJavaRemoteParentJavaRemoteParentResponseT,
+) error {
+	if err := validatePackagedJVMBenchmarkExpectedStaleResidue(expected); err != nil {
+		return err
+	}
+	want := packagedJVMBenchmarkExpectedStaleResponse(expected)
+	if !reflect.DeepEqual(want, actual) {
+		return errors.New("packaged JVM Unix boundary fallback is not the exact final stale-series record")
+	}
+	return nil
+}
+
+func validatePackagedJVMBenchmarkStaleTerminal(
+	expected packagedJVMBenchmarkExpectedStaleResidue,
+	actual BpfJavaRemoteParentJavaRemoteParentTerminalT,
+) error {
+	if err := validatePackagedJVMBenchmarkExpectedStaleResidue(expected); err != nil {
+		return err
+	}
+	want := BpfJavaRemoteParentJavaRemoteParentTerminalT{
+		Generation:         expected.Generation,
+		ObservedMonotimeNs: expected.ObservedMonotimeNS,
+		ProcessIncarnation: expected.ProcessIncarnation,
+		Lifecycle:          packagedJVMBenchmarkLifecycleStale,
+	}
+	if !reflect.DeepEqual(want, actual) {
+		return errors.New("packaged JVM Unix boundary terminal is not the exact final stale-series lifecycle")
+	}
+	return nil
+}
+
+func cleanPackagedJVMBenchmarkExactResidue(
+	lookup func() (bool, error),
+	validate func() error,
+	deleteExact func() error,
+	requireAbsent func() error,
+) error {
+	present, err := lookup()
+	if err != nil {
+		return err
+	}
+	if !present {
+		return requireAbsent()
+	}
+	if err := validate(); err != nil {
+		return err
+	}
+	return errors.Join(deleteExact(), requireAbsent())
+}
+
+func TestPackagedJVMBenchmarkStaleBoundaryIdentityRejectsMutations(t *testing.T) {
+	require.Equal(t, uint8(4), packagedJVMBenchmarkLifecycleStale)
+	expected := packagedJVMBenchmarkExpectedStaleResidue{
+		Generation:         71,
+		ObservedMonotimeNS: 83,
+		ProcessIncarnation: packagedJVMBenchmarkCapability,
+	}
+	fallback := packagedJVMBenchmarkExpectedStaleResponse(expected)
+	terminal := BpfJavaRemoteParentJavaRemoteParentTerminalT{
+		Generation:         expected.Generation,
+		ObservedMonotimeNs: expected.ObservedMonotimeNS,
+		ProcessIncarnation: expected.ProcessIncarnation,
+		Lifecycle:          packagedJVMBenchmarkLifecycleStale,
+	}
+	require.NoError(t, validatePackagedJVMBenchmarkStaleFallback(expected, fallback))
+	require.NoError(t, validatePackagedJVMBenchmarkStaleTerminal(expected, terminal))
+
+	for _, mutation := range []struct {
+		name   string
+		mutate func(*packagedJVMBenchmarkExpectedStaleResidue, *BpfJavaRemoteParentJavaRemoteParentResponseT, *BpfJavaRemoteParentJavaRemoteParentTerminalT)
+	}{
+		{"expected generation missing", func(expected *packagedJVMBenchmarkExpectedStaleResidue, _ *BpfJavaRemoteParentJavaRemoteParentResponseT, _ *BpfJavaRemoteParentJavaRemoteParentTerminalT) {
+			expected.Generation = 0
+		}},
+		{"expected timestamp missing", func(expected *packagedJVMBenchmarkExpectedStaleResidue, _ *BpfJavaRemoteParentJavaRemoteParentResponseT, _ *BpfJavaRemoteParentJavaRemoteParentTerminalT) {
+			expected.ObservedMonotimeNS = 0
+		}},
+		{"expected incarnation changed", func(expected *packagedJVMBenchmarkExpectedStaleResidue, _ *BpfJavaRemoteParentJavaRemoteParentResponseT, _ *BpfJavaRemoteParentJavaRemoteParentTerminalT) {
+			expected.ProcessIncarnation++
+		}},
+		{"fallback generation changed", func(_ *packagedJVMBenchmarkExpectedStaleResidue, fallback *BpfJavaRemoteParentJavaRemoteParentResponseT, _ *BpfJavaRemoteParentJavaRemoteParentTerminalT) {
+			fallback.GenerationLe++
+		}},
+		{"fallback timestamp changed", func(_ *packagedJVMBenchmarkExpectedStaleResidue, fallback *BpfJavaRemoteParentJavaRemoteParentResponseT, _ *BpfJavaRemoteParentJavaRemoteParentTerminalT) {
+			fallback.ObservedMonotimeNsLe++
+		}},
+		{"fallback status changed", func(_ *packagedJVMBenchmarkExpectedStaleResidue, fallback *BpfJavaRemoteParentJavaRemoteParentResponseT, _ *BpfJavaRemoteParentJavaRemoteParentTerminalT) {
+			fallback.Status = uint8(javabridge.StatusStale)
+		}},
+		{"fallback trace changed", func(_ *packagedJVMBenchmarkExpectedStaleResidue, fallback *BpfJavaRemoteParentJavaRemoteParentResponseT, _ *BpfJavaRemoteParentJavaRemoteParentTerminalT) {
+			fallback.TraceId[0]++
+		}},
+		{"terminal generation changed", func(_ *packagedJVMBenchmarkExpectedStaleResidue, _ *BpfJavaRemoteParentJavaRemoteParentResponseT, terminal *BpfJavaRemoteParentJavaRemoteParentTerminalT) {
+			terminal.Generation++
+		}},
+		{"terminal timestamp changed", func(_ *packagedJVMBenchmarkExpectedStaleResidue, _ *BpfJavaRemoteParentJavaRemoteParentResponseT, terminal *BpfJavaRemoteParentJavaRemoteParentTerminalT) {
+			terminal.ObservedMonotimeNs++
+		}},
+		{"terminal incarnation changed", func(_ *packagedJVMBenchmarkExpectedStaleResidue, _ *BpfJavaRemoteParentJavaRemoteParentResponseT, terminal *BpfJavaRemoteParentJavaRemoteParentTerminalT) {
+			terminal.ProcessIncarnation++
+		}},
+		{"terminal lifecycle changed", func(_ *packagedJVMBenchmarkExpectedStaleResidue, _ *BpfJavaRemoteParentJavaRemoteParentResponseT, terminal *BpfJavaRemoteParentJavaRemoteParentTerminalT) {
+			terminal.Lifecycle--
+		}},
+		{"terminal reserved changed", func(_ *packagedJVMBenchmarkExpectedStaleResidue, _ *BpfJavaRemoteParentJavaRemoteParentResponseT, terminal *BpfJavaRemoteParentJavaRemoteParentTerminalT) {
+			terminal.Reserved[0]++
+		}},
+	} {
+		mutation := mutation
+		t.Run(mutation.name, func(t *testing.T) {
+			mutatedExpected := expected
+			mutatedFallback := fallback
+			mutatedTerminal := terminal
+			mutation.mutate(&mutatedExpected, &mutatedFallback, &mutatedTerminal)
+			require.True(t,
+				validatePackagedJVMBenchmarkStaleFallback(mutatedExpected, mutatedFallback) != nil ||
+					validatePackagedJVMBenchmarkStaleTerminal(mutatedExpected, mutatedTerminal) != nil,
+			)
+		})
+	}
+}
+
+func TestCleanPackagedJVMBenchmarkExactResidue(t *testing.T) {
+	t.Run("validated exact key is deleted and read back absent", func(t *testing.T) {
+		calls := make([]string, 0, 4)
+		err := cleanPackagedJVMBenchmarkExactResidue(
+			func() (bool, error) { calls = append(calls, "lookup"); return true, nil },
+			func() error { calls = append(calls, "validate"); return nil },
+			func() error { calls = append(calls, "delete"); return nil },
+			func() error { calls = append(calls, "readback"); return nil },
+		)
+		require.NoError(t, err)
+		require.Equal(t, []string{"lookup", "validate", "delete", "readback"}, calls)
+	})
+	t.Run("identity mismatch is never deleted", func(t *testing.T) {
+		deleteCalls := 0
+		readbackCalls := 0
+		err := cleanPackagedJVMBenchmarkExactResidue(
+			func() (bool, error) { return true, nil },
+			func() error { return errors.New("injected identity mismatch") },
+			func() error { deleteCalls++; return nil },
+			func() error { readbackCalls++; return nil },
+		)
+		require.ErrorContains(t, err, "injected identity mismatch")
+		require.Zero(t, deleteCalls)
+		require.Zero(t, readbackCalls)
+	})
+	t.Run("absent key is still proved absent", func(t *testing.T) {
+		deleteCalls := 0
+		readbackCalls := 0
+		require.NoError(t, cleanPackagedJVMBenchmarkExactResidue(
+			func() (bool, error) { return false, nil },
+			func() error { return errors.New("validation must not run") },
+			func() error { deleteCalls++; return nil },
+			func() error { readbackCalls++; return nil },
+		))
+		require.Zero(t, deleteCalls)
+		require.Equal(t, 1, readbackCalls)
+	})
+	t.Run("delete failure still performs absence readback", func(t *testing.T) {
+		readbackCalls := 0
+		err := cleanPackagedJVMBenchmarkExactResidue(
+			func() (bool, error) { return true, nil },
+			func() error { return nil },
+			func() error { return errors.New("injected exact delete failure") },
+			func() error { readbackCalls++; return nil },
+		)
+		require.ErrorContains(t, err, "injected exact delete failure")
+		require.Equal(t, 1, readbackCalls)
+	})
+}
+
 func TestPackagedJVMBenchmarkUnixSocketRootIdentityRejectsMutations(t *testing.T) {
 	valid := unix.Stat_t{
 		Dev: 11, Ino: 22, Mode: unix.S_IFDIR | unix.S_ISVTX | 0o777, Uid: 0, Gid: 0,
@@ -965,6 +1171,119 @@ func TestPackagedJVMBenchmarkUnixTransitionFixtureContract(t *testing.T) {
 			name: "per-series stop omitted",
 			mutate: func(source string) string {
 				return strings.Replace(source, "\t\trequire.NoError(t, stopServer())\n", "", 1)
+			},
+		},
+		{
+			name: "stale generation capture disconnected",
+			mutate: func(source string) string {
+				return strings.Replace(source, "Generation:         generations[index],", "Generation:         0,", 1)
+			},
+		},
+		{
+			name: "stale timestamp capture disconnected",
+			mutate: func(source string) string {
+				return strings.Replace(source, "ObservedMonotimeNS: observed,", "ObservedMonotimeNS: 0,", 1)
+			},
+		},
+		{
+			name: "stale boundary cleanup omitted",
+			mutate: func(source string) string {
+				return strings.Replace(
+					source,
+					"\t\tif spec.Outcome == \"stale\" {\n\t\t\trequirePackagedJVMBenchmarkStaleBoundaryClean(\n\t\t\t\tt, &objects.BpfJavaRemoteParentMaps, workers, expectedStaleResidue,\n\t\t\t)\n\t\t}\n",
+					"",
+					1,
+				)
+			},
+		},
+		{
+			name: "stale boundary moved after observation retention",
+			mutate: func(source string) string {
+				boundary := "\t\tif spec.Outcome == \"stale\" {\n\t\t\trequirePackagedJVMBenchmarkStaleBoundaryClean(\n\t\t\t\tt, &objects.BpfJavaRemoteParentMaps, workers, expectedStaleResidue,\n\t\t\t)\n\t\t}\n"
+				without := strings.Replace(source, boundary, "", 1)
+				return strings.Replace(
+					without,
+					"\t\tobservations = append(observations, observation)\n",
+					"\t\tobservations = append(observations, observation)\n"+boundary,
+					1,
+				)
+			},
+		},
+		{
+			name: "fallback preflight identity validation omitted",
+			mutate: func(source string) string {
+				return strings.Replace(
+					source,
+					"\t\tif fallbackPresent {\n\t\t\trequire.NoError(t, validatePackagedJVMBenchmarkStaleFallback(expected, fallback))\n\t\t}\n",
+					"",
+					1,
+				)
+			},
+		},
+		{
+			name: "terminal preflight identity validation omitted",
+			mutate: func(source string) string {
+				return strings.Replace(
+					source,
+					"\t\tif terminalPresent {\n\t\t\trequire.NoError(t, validatePackagedJVMBenchmarkStaleTerminal(expected, terminal))\n\t\t}\n",
+					"",
+					1,
+				)
+			},
+		},
+		{
+			name: "fallback exact deletion omitted",
+			mutate: func(source string) string {
+				return strings.Replace(
+					source,
+					"func() error { return maps.JavaRemoteParentFallback.Delete(owner) }",
+					"func() error { return nil }",
+					1,
+				)
+			},
+		},
+		{
+			name: "terminal exact deletion omitted",
+			mutate: func(source string) string {
+				return strings.Replace(
+					source,
+					"func() error { return maps.JavaRemoteParentTerminal.Delete(owner) }",
+					"func() error { return nil }",
+					1,
+				)
+			},
+		},
+		{
+			name: "fallback absence readback omitted",
+			mutate: func(source string) string {
+				return strings.Replace(
+					source,
+					"return requirePackagedJVMBenchmarkExactMapKeyAbsent(\n\t\t\t\t\tmaps.JavaRemoteParentFallback, owner,\n\t\t\t\t)",
+					"return nil",
+					1,
+				)
+			},
+		},
+		{
+			name: "direct task residue proof omitted",
+			mutate: func(source string) string {
+				return strings.Replace(
+					source,
+					"\t\trequireBenchmarkMapKeyAbsent(t, maps.JavaRemoteParentTasks, owner)\n",
+					"",
+					1,
+				)
+			},
+		},
+		{
+			name: "boundary changed to map sweep",
+			mutate: func(source string) string {
+				return strings.Replace(
+					source,
+					"\trequire.Len(t, expectedResidue, len(workers))\n",
+					"\trequire.Len(t, expectedResidue, len(workers))\n\tmaps.JavaRemoteParentFallback.Iterate()\n",
+					1,
+				)
 			},
 		},
 		{
@@ -1353,9 +1672,77 @@ func validatePackagedJVMBenchmarkUnixTransitionSource(source string) error {
 		return errors.New("packaged JVM Unix transition lacks ordered pre/post non-mutating authority evidence and exact NEGOTIATE observation")
 	}
 	manualSeriesStop := strings.Index(transition, "\n\t\trequire.NoError(t, stopServer())\n")
+	staleCapture := strings.Index(
+		transition,
+		"expectedStaleResidue[index] = packagedJVMBenchmarkExpectedStaleResidue{",
+	)
+	staleBoundary := strings.Index(
+		transition,
+		"if spec.Outcome == \"stale\" {\n\t\t\trequirePackagedJVMBenchmarkStaleBoundaryClean(",
+	)
 	observationAppend := strings.Index(transition, "observations = append(observations, observation)")
-	if manualSeriesStop < 0 || observationAppend <= manualSeriesStop {
-		return errors.New("packaged JVM Unix fixture must remove each server directory before retaining observations")
+	if strings.Count(transition, "requirePackagedJVMBenchmarkStaleBoundaryClean(") != 1 ||
+		staleCapture < 0 || manualSeriesStop < 0 || staleBoundary <= manualSeriesStop ||
+		observationAppend <= staleBoundary ||
+		!strings.Contains(transition, "Generation:         generations[index]") ||
+		!strings.Contains(transition, "ObservedMonotimeNS: observed") ||
+		!strings.Contains(transition, "ProcessIncarnation: packagedJVMBenchmarkCapability") {
+		return errors.New("packaged JVM Unix fixture must capture final stale identity, stop its server, clean exact direct residue, and only then retain observations or issue the next CONFIG")
+	}
+
+	boundary, err := packagedJVMBenchmarkSourceSection(
+		source,
+		"func requirePackagedJVMBenchmarkStaleBoundaryClean(",
+		"func packagedJVMBenchmarkRuntimeIdentity(",
+	)
+	if err != nil {
+		return err
+	}
+	for _, required := range []string{
+		"validatePackagedJVMBenchmarkExpectedStaleResidue(expected)",
+		"maps.JavaRemoteParentFallback, owner, &fallback",
+		"validatePackagedJVMBenchmarkStaleFallback(expected, fallback)",
+		"maps.JavaRemoteParentTerminal, owner, &terminal",
+		"validatePackagedJVMBenchmarkStaleTerminal(expected, terminal)",
+		"fallbackPresent && !terminalPresent",
+		"cleanPackagedJVMBenchmarkExactResidue(",
+		"maps.JavaRemoteParentFallback.Delete(owner)",
+		"maps.JavaRemoteParentTerminal.Delete(owner)",
+		"requirePackagedJVMBenchmarkExactMapKeyAbsent(",
+		"Owner: owner, Generation: expected.Generation",
+		"GenerationObservedMonotimeNs: expected.ObservedMonotimeNS",
+		"ProcessIncarnation:           expected.ProcessIncarnation",
+		"maps.JavaRemoteParentState, key",
+		"maps.JavaRemoteParentGenerationIndex, key",
+		"maps.JavaRemoteParentOwners, owner",
+		"maps.JavaRemoteParentAmbiguity, key",
+		"maps.JavaRemoteParentClaims, key",
+		"maps.JavaRemoteParentOwnerGuards, owner",
+		"maps.JavaRemoteParentAliasReplays, replayKey",
+		"maps.JavaRemoteParentTasks, owner",
+		"maps.JavaRemoteParentTaskClaims, owner",
+	} {
+		if !strings.Contains(boundary, required) {
+			return fmt.Errorf("packaged JVM stale boundary lacks exact cleanup contract %q", required)
+		}
+	}
+	if strings.Contains(boundary, ".Iterate(") ||
+		strings.Contains(boundary, "JavaAuthorizedProcesses") ||
+		strings.Contains(boundary, "JavaProcessIncarnations") ||
+		strings.Count(boundary, ".Delete(owner)") != 2 ||
+		strings.Count(boundary, "requirePackagedJVMBenchmarkExactMapKeyAbsent(") != 4 {
+		return errors.New("packaged JVM stale boundary must delete only validated exact fallback and terminal owner keys")
+	}
+	fallbackValidation := strings.Index(
+		boundary, "validatePackagedJVMBenchmarkStaleFallback(expected, fallback)",
+	)
+	terminalValidation := strings.Index(
+		boundary, "validatePackagedJVMBenchmarkStaleTerminal(expected, terminal)",
+	)
+	firstDelete := strings.Index(boundary, ".Delete(owner)")
+	if fallbackValidation < 0 || terminalValidation <= fallbackValidation ||
+		firstDelete <= terminalValidation {
+		return errors.New("packaged JVM stale boundary must validate both optional identities before either exact deletion")
 	}
 
 	counters, err := packagedJVMBenchmarkSourceSection(
@@ -1401,6 +1788,8 @@ const (
 	packagedJVMBenchmarkMeasurementIterations                   = 256
 	packagedJVMBenchmarkConcurrency                             = 1
 	packagedJVMBenchmarkJavaID                                  = 65534
+	packagedJVMBenchmarkCapability                              = uint64(0x6e5d4c3b2a190817)
+	packagedJVMBenchmarkLifecycleStale                          = uint8(4)
 	packagedJVMBenchmarkP99LimitNS                              = int64(time.Millisecond)
 	packagedJVMBenchmarkGateKind                                = "p99_lt"
 	packagedJVMBenchmarkTimedCall                               = "System.nanoTime around BootstrapNative.takeRemoteParent(fd,reused_byte_array)"
@@ -1435,7 +1824,7 @@ const (
 	packagedJVMBenchmarkUnixSocketPrefix                        = "obi-packaged-jvm-unix-"
 	packagedJVMBenchmarkUnixProbeEnv                            = "OBI_JAVA_REMOTE_PARENT_UNIX_SOCKET_PROBE"
 	packagedJVMBenchmarkUnixProbePathEnv                        = "OBI_JAVA_REMOTE_PARENT_UNIX_SOCKET_PATH"
-	packagedJVMBenchmarkUnixSetupControl                        = "direct root-owned 0750 directory beneath nofollow-opened root:root sticky /tmp whose device and inode remain stable across setup; pinned nofollow root, child, and socket identities retained through one-shot server close/wait and identity-checked root-relative socket and child unlink; path ENOENT plus pinned inode link-count-zero proofs before closing fixture FDs; credential-dropped JVM lstat and access preflight; non-mutating exact authorized/incarnation capability and retirement-absence checks before and after CONFIG; exactly one NEGOTIATE/MISSING configuration before retaining each series"
+	packagedJVMBenchmarkUnixSetupControl                        = "direct root-owned 0750 directory beneath nofollow-opened root:root sticky /tmp whose device and inode remain stable across setup; pinned nofollow root, child, and socket identities retained through one-shot server close/wait and identity-checked root-relative socket and child unlink; path ENOENT plus pinned inode link-count-zero proofs before closing fixture FDs; credential-dropped JVM lstat and access preflight; non-mutating exact authorized/incarnation capability and retirement-absence checks before and after CONFIG; exactly one NEGOTIATE/MISSING configuration; after every stale series validate and exact-key delete only the final per-worker stale fallback and terminal, then prove the direct owner-generation state, index, owner, ambiguity, claim, guard, replay, and task surface absent before retaining the series or issuing the next CONFIG"
 )
 
 var packagedJVMBenchmarkV2SeriesSpecs = []packagedJVMBenchmarkV2SeriesSpec{

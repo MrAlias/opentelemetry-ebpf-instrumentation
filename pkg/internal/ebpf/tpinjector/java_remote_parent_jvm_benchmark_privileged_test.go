@@ -39,7 +39,6 @@ import (
 const (
 	packagedJVMBenchmarkTimeout         = 8 * time.Minute
 	packagedJVMBenchmarkFirstGeneration = uint64(2_000_000)
-	packagedJVMBenchmarkCapability      = uint64(0x6e5d4c3b2a190817)
 )
 
 // TestJavaRemoteParentPackagedJVMTransportBenchmark records the concurrent packaged-JVM raw JNI
@@ -281,6 +280,9 @@ func TestJavaRemoteParentPackagedJVMTransportBenchmark(t *testing.T) {
 	for _, spec := range packagedJVMBenchmarkV2SeriesSpecs {
 		serverPath := "-"
 		serverUID := uint64(0)
+		expectedStaleResidue := make(
+			[]packagedJVMBenchmarkExpectedStaleResidue, len(workers),
+		)
 		var serverCounters *packagedJVMBenchmarkUnixCounters
 		stopServer := func() error { return nil }
 		if spec.Transport == "unix" {
@@ -349,6 +351,11 @@ func TestJavaRemoteParentPackagedJVMTransportBenchmark(t *testing.T) {
 						if spec.Outcome == "stale" {
 							require.Greater(t, observed, uint64(packagedJVMBenchmarkStaleAge.Nanoseconds()))
 							observed -= uint64(packagedJVMBenchmarkStaleAge.Nanoseconds())
+							expectedStaleResidue[index] = packagedJVMBenchmarkExpectedStaleResidue{
+								Generation:         generations[index],
+								ObservedMonotimeNS: observed,
+								ProcessIncarnation: packagedJVMBenchmarkCapability,
+							}
 						}
 						cookie := workers[index].javaSocketCookie
 						if spec.Transport == "unix" {
@@ -529,6 +536,11 @@ func TestJavaRemoteParentPackagedJVMTransportBenchmark(t *testing.T) {
 			)
 		}
 		require.NoError(t, stopServer())
+		if spec.Outcome == "stale" {
+			requirePackagedJVMBenchmarkStaleBoundaryClean(
+				t, &objects.BpfJavaRemoteParentMaps, workers, expectedStaleResidue,
+			)
+		}
 		observations = append(observations, observation)
 	}
 
@@ -1775,6 +1787,128 @@ func requirePackagedJVMBenchmarkGenerationCleaned(
 	requireBenchmarkMapKeyAbsent(t, maps.JavaRemoteParentState, key)
 	requireBenchmarkMapKeyAbsent(t, maps.JavaRemoteParentGenerationIndex, key)
 	requireBenchmarkMapKeyAbsent(t, maps.JavaRemoteParentOwners, owner)
+}
+
+func packagedJVMBenchmarkOptionalMapLookup(
+	benchmarkMap *ebpf.Map,
+	key any,
+	valueOut any,
+) (bool, error) {
+	err := benchmarkMap.Lookup(key, valueOut)
+	if errors.Is(err, ebpf.ErrKeyNotExist) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func requirePackagedJVMBenchmarkExactMapKeyAbsent(
+	benchmarkMap *ebpf.Map,
+	key any,
+) error {
+	value, err := benchmarkMap.LookupBytes(key)
+	if err != nil {
+		return err
+	}
+	if value != nil {
+		return errors.New("packaged JVM Unix boundary map key remains present")
+	}
+	return nil
+}
+
+func requirePackagedJVMBenchmarkStaleBoundaryClean(
+	t *testing.T,
+	maps *BpfJavaRemoteParentMaps,
+	workers []packagedJVMBenchmarkWorker,
+	expectedResidue []packagedJVMBenchmarkExpectedStaleResidue,
+) {
+	t.Helper()
+	require.Len(t, expectedResidue, len(workers))
+	for index := range workers {
+		owner := workers[index].owner
+		expected := expectedResidue[index]
+		require.NoError(t, validatePackagedJVMBenchmarkExpectedStaleResidue(expected))
+
+		var fallback BpfJavaRemoteParentJavaRemoteParentResponseT
+		fallbackPresent, err := packagedJVMBenchmarkOptionalMapLookup(
+			maps.JavaRemoteParentFallback, owner, &fallback,
+		)
+		require.NoError(t, err)
+		if fallbackPresent {
+			require.NoError(t, validatePackagedJVMBenchmarkStaleFallback(expected, fallback))
+		}
+
+		var terminal BpfJavaRemoteParentJavaRemoteParentTerminalT
+		terminalPresent, err := packagedJVMBenchmarkOptionalMapLookup(
+			maps.JavaRemoteParentTerminal, owner, &terminal,
+		)
+		require.NoError(t, err)
+		if terminalPresent {
+			require.NoError(t, validatePackagedJVMBenchmarkStaleTerminal(expected, terminal))
+		}
+		require.False(
+			t,
+			fallbackPresent && !terminalPresent,
+			"exact stale fallback lacks its process-incarnation terminal authority",
+		)
+
+		require.NoError(t, cleanPackagedJVMBenchmarkExactResidue(
+			func() (bool, error) {
+				return packagedJVMBenchmarkOptionalMapLookup(
+					maps.JavaRemoteParentFallback, owner, &fallback,
+				)
+			},
+			func() error {
+				return validatePackagedJVMBenchmarkStaleFallback(expected, fallback)
+			},
+			func() error { return maps.JavaRemoteParentFallback.Delete(owner) },
+			func() error {
+				return requirePackagedJVMBenchmarkExactMapKeyAbsent(
+					maps.JavaRemoteParentFallback, owner,
+				)
+			},
+		))
+		require.NoError(t, cleanPackagedJVMBenchmarkExactResidue(
+			func() (bool, error) {
+				return packagedJVMBenchmarkOptionalMapLookup(
+					maps.JavaRemoteParentTerminal, owner, &terminal,
+				)
+			},
+			func() error {
+				return validatePackagedJVMBenchmarkStaleTerminal(expected, terminal)
+			},
+			func() error { return maps.JavaRemoteParentTerminal.Delete(owner) },
+			func() error {
+				return requirePackagedJVMBenchmarkExactMapKeyAbsent(
+					maps.JavaRemoteParentTerminal, owner,
+				)
+			},
+		))
+		require.NoError(t, requirePackagedJVMBenchmarkExactMapKeyAbsent(
+			maps.JavaRemoteParentFallback, owner,
+		))
+		require.NoError(t, requirePackagedJVMBenchmarkExactMapKeyAbsent(
+			maps.JavaRemoteParentTerminal, owner,
+		))
+
+		key := BpfJavaRemoteParentJavaRemoteParentKeyT{
+			Owner: owner, Generation: expected.Generation,
+		}
+		replayKey := BpfJavaRemoteParentJavaRemoteParentAliasReplayKeyT{
+			Owner:                        owner,
+			Generation:                   expected.Generation,
+			GenerationObservedMonotimeNs: expected.ObservedMonotimeNS,
+			ProcessIncarnation:           expected.ProcessIncarnation,
+		}
+		requireBenchmarkMapKeyAbsent(t, maps.JavaRemoteParentState, key)
+		requireBenchmarkMapKeyAbsent(t, maps.JavaRemoteParentGenerationIndex, key)
+		requireBenchmarkMapKeyAbsent(t, maps.JavaRemoteParentOwners, owner)
+		requireBenchmarkMapKeyAbsent(t, maps.JavaRemoteParentAmbiguity, key)
+		requireBenchmarkMapKeyAbsent(t, maps.JavaRemoteParentClaims, key)
+		requireBenchmarkMapKeyAbsent(t, maps.JavaRemoteParentOwnerGuards, owner)
+		requireBenchmarkMapKeyAbsent(t, maps.JavaRemoteParentAliasReplays, replayKey)
+		requireBenchmarkMapKeyAbsent(t, maps.JavaRemoteParentTasks, owner)
+		requireBenchmarkMapKeyAbsent(t, maps.JavaRemoteParentTaskClaims, owner)
+	}
 }
 
 func packagedJVMBenchmarkRuntimeIdentity(

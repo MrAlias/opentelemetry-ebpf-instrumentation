@@ -109,6 +109,45 @@ func TestPackagedJVMBenchmarkProbeSerializesPrimaryArmAndKeepsTakeConcurrent(t *
 			},
 		},
 		{
+			name: "Unix staged emit removed",
+			mutate: func(source string) string {
+				return strings.Replace(
+					source,
+					`if ("getsockopt".equals(job.batch.transport) || stagedUnix)`,
+					`if ("getsockopt".equals(job.batch.transport))`,
+					1,
+				)
+			},
+		},
+		{
+			name: "Unix staged emit uses no Java FD",
+			mutate: func(source string) string {
+				return strings.Replace(
+					source,
+					"BootstrapNative.emitData(socketFileDescriptor, packet.getAddress(), true)",
+					"BootstrapNative.emitData(-1, packet.getAddress(), true)",
+					1,
+				)
+			},
+		},
+		{
+			name: "Unix staged nonce capture removed",
+			mutate: func(source string) string {
+				return strings.Replace(source, "next.nonce = packet.getLong(41);", "next.nonce = 0L;", 1)
+			},
+		},
+		{
+			name: "Unix staged emit result changed to primary",
+			mutate: func(source string) string {
+				return strings.Replace(
+					source,
+					`int expectedEmit = "getsockopt".equals(job.batch.transport) ? 1 : 0;`,
+					"int expectedEmit = 1;",
+					1,
+				)
+			},
+		},
+		{
 			name: "TAKE uses per-worker latch",
 			mutate: func(source string) string {
 				return mutatePackagedJVMBenchmarkProbeMethod(source, "private static int takeBatch", "private static final class Batch", func(method string) string {
@@ -181,6 +220,23 @@ func validatePackagedJVMBenchmarkProbeSource(source string) error {
 		strings.Contains(take, "forSingleWorker") ||
 		strings.Contains(take, "workerBatch") {
 		return errors.New("TAKE must retain one concurrent eight-worker latch")
+	}
+	for _, required := range []string{
+		`"unix".equals(job.batch.transport)`,
+		`("hit".equals(job.batch.outcome) || "stale".equals(job.batch.outcome))`,
+		`if ("getsockopt".equals(job.batch.transport) || stagedUnix)`,
+		"BootstrapNative.emitData(socketFileDescriptor, packet.getAddress(), true)",
+		"next.nonce = packet.getLong(41);",
+		`int expectedEmit = "getsockopt".equals(job.batch.transport) ? 1 : 0;`,
+		"if (next.emit != expectedEmit)",
+		"if (next.nonce == 0L)",
+	} {
+		if !strings.Contains(source, required) {
+			return fmt.Errorf("packaged JVM benchmark probe lacks staged Unix Java-FD emission contract %q", required)
+		}
+	}
+	if strings.Count(source, "BootstrapNative.emitData(socketFileDescriptor, packet.getAddress(), true)") != 1 {
+		return errors.New("packaged JVM benchmark probe must emit exactly once per staged worker ARM")
 	}
 	return nil
 }
@@ -717,6 +773,163 @@ type packagedJVMBenchmarkExpectedStaleResidue struct {
 	ProcessIncarnation uint64
 }
 
+type packagedJVMBenchmarkExpectedSyntheticData struct {
+	Process         BpfJavaRemoteParentPidKeyT
+	Owner           BpfJavaRemoteParentPidKeyT
+	Connection      BpfJavaRemoteParentConnectionInfoT
+	ConnectionNetns uint32
+	Generation      uint64
+	Nonce           uint64
+}
+
+func packagedJVMBenchmarkUnixStaged(spec packagedJVMBenchmarkV2SeriesSpec) bool {
+	return spec.Transport == "unix" && (spec.Outcome == "hit" || spec.Outcome == "stale")
+}
+
+func validatePackagedJVMBenchmarkNonceBlock(start uint64, nonces []uint64) error {
+	if start == 0 || len(nonces) == 0 {
+		return errors.New("packaged JVM Unix ARM nonce block is empty or starts at zero")
+	}
+	if uint64(len(nonces)) > ^uint64(0)-start {
+		return errors.New("packaged JVM Unix ARM nonce block would overflow the next native nonce")
+	}
+	end := start + uint64(len(nonces)) - 1
+	seen := make(map[uint64]struct{}, len(nonces))
+	for _, nonce := range nonces {
+		if nonce < start || nonce > end {
+			return errors.New("packaged JVM Unix ARM nonce is outside the exact native block")
+		}
+		if _, duplicate := seen[nonce]; duplicate {
+			return errors.New("packaged JVM Unix ARM nonce block contains a duplicate")
+		}
+		seen[nonce] = struct{}{}
+	}
+	return nil
+}
+
+func packagedJVMBenchmarkExpectedSyntheticDataAck(
+	expected packagedJVMBenchmarkExpectedSyntheticData,
+) BpfJavaRemoteParentJavaRemoteParentDataAckT {
+	return BpfJavaRemoteParentJavaRemoteParentDataAckT{
+		Owner:           expected.Owner,
+		Generation:      expected.Generation,
+		Connection:      expected.Connection,
+		ConnectionNetns: expected.ConnectionNetns,
+	}
+}
+
+func validatePackagedJVMBenchmarkSyntheticDataAck(
+	expected packagedJVMBenchmarkExpectedSyntheticData,
+	key BpfJavaRemoteParentJavaRemoteParentDataSignalKeyT,
+	actual BpfJavaRemoteParentJavaRemoteParentDataAckT,
+) error {
+	if expected.Process == (BpfJavaRemoteParentPidKeyT{}) ||
+		expected.Owner == (BpfJavaRemoteParentPidKeyT{}) ||
+		reflect.DeepEqual(expected.Connection, BpfJavaRemoteParentConnectionInfoT{}) ||
+		expected.ConnectionNetns == 0 ||
+		expected.Generation == 0 || expected.Nonce == 0 {
+		return errors.New("packaged JVM Unix synthetic DATA_ACK lacks exact authority")
+	}
+	wantKey := BpfJavaRemoteParentJavaRemoteParentDataSignalKeyT{
+		Process: expected.Process,
+		Nonce:   expected.Nonce,
+	}
+	if !reflect.DeepEqual(wantKey, key) ||
+		!reflect.DeepEqual(packagedJVMBenchmarkExpectedSyntheticDataAck(expected), actual) {
+		return errors.New("packaged JVM Unix synthetic DATA_ACK identity changed")
+	}
+	return nil
+}
+
+func validatePackagedJVMBenchmarkSyntheticDataSignal(expected, actual uint64) error {
+	if expected == 0 || actual != expected {
+		return errors.New("packaged JVM Unix process-global data signal changed")
+	}
+	return nil
+}
+
+func TestValidatePackagedJVMBenchmarkNonceBlock(t *testing.T) {
+	require.NoError(t, validatePackagedJVMBenchmarkNonceBlock(41, []uint64{43, 41, 42}))
+	for _, testCase := range []struct {
+		name   string
+		start  uint64
+		nonces []uint64
+	}{
+		{name: "zero start", start: 0, nonces: []uint64{1}},
+		{name: "empty", start: 1},
+		{name: "zero nonce", start: 1, nonces: []uint64{0}},
+		{name: "duplicate", start: 7, nonces: []uint64{7, 7}},
+		{name: "gap", start: 7, nonces: []uint64{7, 9}},
+		{name: "below block", start: 7, nonces: []uint64{6, 7}},
+		{name: "next nonce overflow", start: ^uint64(0) - 1, nonces: []uint64{^uint64(0) - 1, ^uint64(0)}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			require.Error(t, validatePackagedJVMBenchmarkNonceBlock(testCase.start, testCase.nonces))
+		})
+	}
+}
+
+func TestPackagedJVMBenchmarkSyntheticDataIdentityRejectsMutations(t *testing.T) {
+	expected := packagedJVMBenchmarkExpectedSyntheticData{
+		Process:         BpfJavaRemoteParentPidKeyT{Tid: 11, Pid: 11, Ns: 13},
+		Owner:           BpfJavaRemoteParentPidKeyT{Tid: 17, Pid: 11, Ns: 13},
+		Connection:      BpfJavaRemoteParentConnectionInfoT{S_port: 19, D_port: 23},
+		ConnectionNetns: 29,
+		Generation:      31,
+		Nonce:           37,
+	}
+	key := BpfJavaRemoteParentJavaRemoteParentDataSignalKeyT{
+		Process: expected.Process, Nonce: expected.Nonce,
+	}
+	ack := packagedJVMBenchmarkExpectedSyntheticDataAck(expected)
+	require.NoError(t, validatePackagedJVMBenchmarkSyntheticDataAck(expected, key, ack))
+	require.NoError(t, validatePackagedJVMBenchmarkSyntheticDataSignal(expected.Nonce, expected.Nonce))
+
+	for _, mutation := range []struct {
+		name   string
+		mutate func(*packagedJVMBenchmarkExpectedSyntheticData, *BpfJavaRemoteParentJavaRemoteParentDataSignalKeyT, *BpfJavaRemoteParentJavaRemoteParentDataAckT)
+	}{
+		{"expected process missing", func(expected *packagedJVMBenchmarkExpectedSyntheticData, _ *BpfJavaRemoteParentJavaRemoteParentDataSignalKeyT, _ *BpfJavaRemoteParentJavaRemoteParentDataAckT) {
+			expected.Process = BpfJavaRemoteParentPidKeyT{}
+		}},
+		{"expected connection missing", func(expected *packagedJVMBenchmarkExpectedSyntheticData, _ *BpfJavaRemoteParentJavaRemoteParentDataSignalKeyT, _ *BpfJavaRemoteParentJavaRemoteParentDataAckT) {
+			expected.Connection = BpfJavaRemoteParentConnectionInfoT{}
+		}},
+		{"key process changed", func(_ *packagedJVMBenchmarkExpectedSyntheticData, key *BpfJavaRemoteParentJavaRemoteParentDataSignalKeyT, _ *BpfJavaRemoteParentJavaRemoteParentDataAckT) {
+			key.Process.Pid++
+		}},
+		{"key nonce changed", func(_ *packagedJVMBenchmarkExpectedSyntheticData, key *BpfJavaRemoteParentJavaRemoteParentDataSignalKeyT, _ *BpfJavaRemoteParentJavaRemoteParentDataAckT) {
+			key.Nonce++
+		}},
+		{"owner changed", func(_ *packagedJVMBenchmarkExpectedSyntheticData, _ *BpfJavaRemoteParentJavaRemoteParentDataSignalKeyT, ack *BpfJavaRemoteParentJavaRemoteParentDataAckT) {
+			ack.Owner.Tid++
+		}},
+		{"generation changed", func(_ *packagedJVMBenchmarkExpectedSyntheticData, _ *BpfJavaRemoteParentJavaRemoteParentDataSignalKeyT, ack *BpfJavaRemoteParentJavaRemoteParentDataAckT) {
+			ack.Generation++
+		}},
+		{"connection changed", func(_ *packagedJVMBenchmarkExpectedSyntheticData, _ *BpfJavaRemoteParentJavaRemoteParentDataSignalKeyT, ack *BpfJavaRemoteParentJavaRemoteParentDataAckT) {
+			ack.Connection.S_port++
+		}},
+		{"network namespace changed", func(_ *packagedJVMBenchmarkExpectedSyntheticData, _ *BpfJavaRemoteParentJavaRemoteParentDataSignalKeyT, ack *BpfJavaRemoteParentJavaRemoteParentDataAckT) {
+			ack.ConnectionNetns++
+		}},
+		{"reserved changed", func(_ *packagedJVMBenchmarkExpectedSyntheticData, _ *BpfJavaRemoteParentJavaRemoteParentDataSignalKeyT, ack *BpfJavaRemoteParentJavaRemoteParentDataAckT) {
+			ack.Reserved++
+		}},
+	} {
+		t.Run(mutation.name, func(t *testing.T) {
+			mutatedExpected := expected
+			mutatedKey := key
+			mutatedAck := ack
+			mutation.mutate(&mutatedExpected, &mutatedKey, &mutatedAck)
+			require.Error(t, validatePackagedJVMBenchmarkSyntheticDataAck(
+				mutatedExpected, mutatedKey, mutatedAck,
+			))
+		})
+	}
+	require.Error(t, validatePackagedJVMBenchmarkSyntheticDataSignal(expected.Nonce, expected.Nonce+1))
+}
+
 func packagedJVMBenchmarkExpectedStaleResponse(
 	expected packagedJVMBenchmarkExpectedStaleResidue,
 ) BpfJavaRemoteParentJavaRemoteParentResponseT {
@@ -1180,6 +1393,121 @@ func TestPackagedJVMBenchmarkUnixTransitionFixtureContract(t *testing.T) {
 			},
 		},
 		{
+			name: "Unix stage uses peer socket cookie",
+			mutate: func(source string) string {
+				return strings.Replace(
+					source,
+					"workers[index].netns, workers[index].javaSocketCookie,\n\t\t\t\t\t\t\tgenerations[index], nonces[index], observedMonotimeNS[index]",
+					"workers[index].netns, workers[index].clientSocketCookie,\n\t\t\t\t\t\t\tgenerations[index], nonces[index], observedMonotimeNS[index]",
+					1,
+				)
+			},
+		},
+		{
+			name: "Unix native nonce block validation omitted",
+			mutate: func(source string) string {
+				return strings.Replace(
+					source,
+					"\t\t\t\trequire.NoError(t, validatePackagedJVMBenchmarkNonceBlock(nextNonce, nonces))\n",
+					"",
+					1,
+				)
+			},
+		},
+		{
+			name: "Go-side Unix DATA_ACK reintroduced",
+			mutate: func(source string) string {
+				return strings.Replace(
+					source,
+					"\t\t\t\tpreCallCgroupBPF, preCallQueryErr :=",
+					"\t\t\t\tacknowledgeRemoteParentData(workers[0].duplicateFD, nonces[0])\n\t\t\t\tpreCallCgroupBPF, preCallQueryErr :=",
+					1,
+				)
+			},
+		},
+		{
+			name: "Unix synthetic cleanup omitted",
+			mutate: func(source string) string {
+				return strings.Replace(
+					source,
+					"requirePackagedJVMBenchmarkUnixSyntheticDataClean(",
+					"omittedPackagedJVMBenchmarkUnixSyntheticDataClean(",
+					1,
+				)
+			},
+		},
+		{
+			name: "Unix synthetic cleanup moved before TAKE",
+			mutate: func(source string) string {
+				call := strings.Index(source, "requirePackagedJVMBenchmarkUnixSyntheticDataClean(")
+				if call < 0 {
+					return source
+				}
+				start := strings.LastIndex(source[:call], "\t\t\t\tif unixStaged {")
+				endOffset := strings.Index(source[call:], "\n\t\t\t\t}")
+				if start < 0 || endOffset < 0 {
+					return source
+				}
+				end := call + endOffset + len("\n\t\t\t\t}")
+				block := source[start:end] + "\n"
+				without := source[:start] + source[end+1:]
+				marker := strings.Index(without, "\t\t\t\tpreCallCgroupBPF, preCallQueryErr :=")
+				if marker < 0 {
+					return source
+				}
+				return without[:marker] + block + without[marker:]
+			},
+		},
+		{
+			name: "Unix synthetic DATA_ACK preflight omitted",
+			mutate: func(source string) string {
+				return strings.Replace(
+					source,
+					"validatePackagedJVMBenchmarkSyntheticDataAck(",
+					"omittedPackagedJVMBenchmarkSyntheticDataAck(",
+					1,
+				)
+			},
+		},
+		{
+			name: "Unix synthetic signal preflight omitted",
+			mutate: func(source string) string {
+				return strings.Replace(
+					source,
+					"validatePackagedJVMBenchmarkSyntheticDataSignal(",
+					"omittedPackagedJVMBenchmarkSyntheticDataSignal(",
+					1,
+				)
+			},
+		},
+		{
+			name: "Unix synthetic DATA_ACK delete omitted",
+			mutate: func(source string) string {
+				return strings.Replace(
+					source, "maps.JavaRemoteParentDataAcks.Delete(key)", "error(nil)", 1,
+				)
+			},
+		},
+		{
+			name: "Unix synthetic signal delete omitted",
+			mutate: func(source string) string {
+				return strings.Replace(
+					source, "maps.JavaRemoteParentDataSignals.Delete(process)", "error(nil)", 1,
+				)
+			},
+		},
+		{
+			name: "Unix synthetic DATA_ACK absence readback omitted",
+			mutate: func(source string) string {
+				return strings.Replace(
+					source,
+					"return requirePackagedJVMBenchmarkExactMapKeyAbsent(\n\t\t\t\t\t\tmaps.JavaRemoteParentDataAcks, key,\n\t\t\t\t\t)",
+					"return error(nil)",
+					1,
+				)
+			},
+		},
+		{
 			name: "stale timestamp capture disconnected",
 			mutate: func(source string) string {
 				return strings.Replace(source, "ObservedMonotimeNS: observed,", "ObservedMonotimeNS: 0,", 1)
@@ -1441,6 +1769,11 @@ func packagedJVMBenchmarkSourceSection(source, startMarker, endMarker string) (s
 }
 
 func validatePackagedJVMBenchmarkUnixTransitionSource(source string) error {
+	if strings.Contains(source, "clientFD") || strings.Contains(source, "clientSocketCookie") ||
+		strings.Contains(source, "duplicatePackagedJVMBenchmarkTCPFD") ||
+		strings.Contains(source, "acknowledgeRemoteParentData(") {
+		return errors.New("packaged JVM Unix staging must use the Java FD identity without a Go-side DATA_ACK")
+	}
 	directorySetup, err := packagedJVMBenchmarkSourceSection(
 		source,
 		"func newPackagedJVMBenchmarkUnixSocketDirectory(",
@@ -1671,6 +2004,42 @@ func validatePackagedJVMBenchmarkUnixTransitionSource(source string) error {
 		lastAuthority <= configurationObserved {
 		return errors.New("packaged JVM Unix transition lacks ordered pre/post non-mutating authority evidence and exact NEGOTIATE observation")
 	}
+	armedResult := strings.Index(
+		transition,
+		"waitForPackagedJVMBenchmarkProbe(t, ctx, lines, \"ARMED\"",
+	)
+	nonceBlock := strings.Index(
+		transition,
+		"validatePackagedJVMBenchmarkNonceBlock(nextNonce, nonces)",
+	)
+	unixJavaCookieStage := strings.LastIndex(
+		transition,
+		"workers[index].netns, workers[index].javaSocketCookie,",
+	)
+	takeWrite := strings.Index(transition, "stdin, \"TAKE_BATCH %s %s %s %s %d\\n\"")
+	sampleValidation := strings.Index(transition, "for index, sample := range batchSamples")
+	syntheticCleanup := strings.Index(
+		transition,
+		"requirePackagedJVMBenchmarkUnixSyntheticDataClean(",
+	)
+	for _, required := range []string{
+		"unixStaged := packagedJVMBenchmarkUnixStaged(spec)",
+		"nonces[index] = parsePackagedJVMBenchmarkUint64(t, armed, \"nonce\")",
+		"validatePackagedJVMBenchmarkNonceBlock(nextNonce, nonces)",
+		"nextNonce += uint64(len(nonces))",
+		"workers[index].netns, workers[index].javaSocketCookie,",
+		"generations[index], nonces[index], observedMonotimeNS[index]",
+		"requirePackagedJVMBenchmarkUnixSyntheticDataClean(",
+	} {
+		if !strings.Contains(transition, required) {
+			return fmt.Errorf("packaged JVM Unix staged-data transition lacks %q", required)
+		}
+	}
+	if armedResult < 0 || nonceBlock <= armedResult || unixJavaCookieStage <= nonceBlock ||
+		takeWrite <= unixJavaCookieStage || sampleValidation <= takeWrite ||
+		syntheticCleanup <= sampleValidation {
+		return errors.New("packaged JVM Unix staged data must bind returned Java nonces before TAKE and exact-clean synthetic residue after samples")
+	}
 	manualSeriesStop := strings.Index(transition, "\n\t\trequire.NoError(t, stopServer())\n")
 	staleCapture := strings.Index(
 		transition,
@@ -1743,6 +2112,54 @@ func validatePackagedJVMBenchmarkUnixTransitionSource(source string) error {
 	if fallbackValidation < 0 || terminalValidation <= fallbackValidation ||
 		firstDelete <= terminalValidation {
 		return errors.New("packaged JVM stale boundary must validate both optional identities before either exact deletion")
+	}
+
+	syntheticData, err := packagedJVMBenchmarkSourceSection(
+		source,
+		"func requirePackagedJVMBenchmarkUnixSyntheticDataClean(",
+		"type packagedJVMBenchmarkMissAuthority struct {",
+	)
+	if err != nil {
+		return err
+	}
+	for _, required := range []string{
+		"packagedJVMBenchmarkExpectedSyntheticData{",
+		"Process:         process",
+		"Owner:           workers[index].owner",
+		"Connection:      workers[index].connectionInfo",
+		"ConnectionNetns: workers[index].netns",
+		"Generation:      generations[index]",
+		"Nonce:           nonces[index]",
+		"maps.JavaRemoteParentDataAcks.Lookup(keys[index], &acknowledgement)",
+		"validatePackagedJVMBenchmarkSyntheticDataAck(",
+		"maps.JavaRemoteParentDataSignals.Lookup(process, &signal)",
+		"validatePackagedJVMBenchmarkSyntheticDataSignal(",
+		"nonces[len(nonces)-1], signal",
+		"cleanPackagedJVMBenchmarkExactResidue(",
+		"packagedJVMBenchmarkOptionalMapLookup(",
+		"maps.JavaRemoteParentDataAcks.Delete(key)",
+		"maps.JavaRemoteParentDataAcks, key,",
+		"maps.JavaRemoteParentDataSignals.Delete(process)",
+		"maps.JavaRemoteParentDataSignals, process,",
+	} {
+		if !strings.Contains(syntheticData, required) {
+			return fmt.Errorf("packaged JVM Unix synthetic data cleanup lacks %q", required)
+		}
+	}
+	lastPreflight := strings.Index(
+		syntheticData,
+		"validatePackagedJVMBenchmarkSyntheticDataSignal(",
+	)
+	firstSyntheticDelete := strings.Index(syntheticData, "maps.JavaRemoteParentDataAcks.Delete(key)")
+	if lastPreflight < 0 || firstSyntheticDelete <= lastPreflight ||
+		strings.Count(syntheticData, "validatePackagedJVMBenchmarkSyntheticDataAck(") != 2 ||
+		strings.Count(syntheticData, "validatePackagedJVMBenchmarkSyntheticDataSignal(") != 2 ||
+		strings.Count(syntheticData, "cleanPackagedJVMBenchmarkExactResidue(") != 2 ||
+		strings.Count(syntheticData, "requirePackagedJVMBenchmarkExactMapKeyAbsent(") != 2 ||
+		strings.Contains(syntheticData, ".Update(") || strings.Contains(syntheticData, ".Iterate(") ||
+		strings.Contains(syntheticData, "JavaAuthorizedProcesses") ||
+		strings.Contains(syntheticData, "JavaProcessIncarnations") {
+		return errors.New("packaged JVM Unix synthetic data cleanup must preflight every exact key before bounded deletion and readback")
 	}
 
 	counters, err := packagedJVMBenchmarkSourceSection(
@@ -2429,7 +2846,7 @@ func newPackagedJVMBenchmarkArtifactV2(
 			Concurrency:            packagedJVMBenchmarkV2Concurrency,
 			RetainedCallsPerSeries: packagedJVMBenchmarkV2Concurrency * packagedJVMBenchmarkMeasurementIterations,
 			TotalCallsPerSeries:    totalCalls,
-			BatchSynchronization:   "getsockopt primary nonce/ACK arming is untimed and serialized in ascending worker-index order with a distinct one-worker latch per ARM; Unix ARM and timed TAKE each rendezvous/release a shared concurrent eight-worker latch",
+			BatchSynchronization:   "getsockopt primary nonce/ACK arming is untimed and serialized in ascending worker-index order with a distinct one-worker latch per ARM; staged Unix hit/stale ARM emits on each Java worker FD with a shared concurrent eight-worker latch, validates the exact returned process-global nonce block, stages with Java socket cookies before TAKE, and exact-cleans synthetic signal/ACK fixture keys after TAKE outside timing; Unix miss/timeout ARM and every timed TAKE use a shared concurrent eight-worker latch",
 			RawTimedCall:           "System.nanoTime and ThreadMXBean around BootstrapNative.takeRemoteParent(fd-or-minus-one,reused_byte_array)",
 			ProviderTimedCall:      "System.nanoTime and ThreadMXBean around RemoteParentBridge.takeRemoteParent()",
 			ResponseStorage:        "one reused 64-byte JNI response array per worker; provider uses its packaged pool",
@@ -3710,7 +4127,7 @@ func validatePackagedJVMBenchmarkArtifactV2(artifact packagedJVMBenchmarkArtifac
 		Concurrency:            packagedJVMBenchmarkV2Concurrency,
 		RetainedCallsPerSeries: packagedJVMBenchmarkV2Concurrency * packagedJVMBenchmarkMeasurementIterations,
 		TotalCallsPerSeries:    totalCalls,
-		BatchSynchronization:   "getsockopt primary nonce/ACK arming is untimed and serialized in ascending worker-index order with a distinct one-worker latch per ARM; Unix ARM and timed TAKE each rendezvous/release a shared concurrent eight-worker latch",
+		BatchSynchronization:   "getsockopt primary nonce/ACK arming is untimed and serialized in ascending worker-index order with a distinct one-worker latch per ARM; staged Unix hit/stale ARM emits on each Java worker FD with a shared concurrent eight-worker latch, validates the exact returned process-global nonce block, stages with Java socket cookies before TAKE, and exact-cleans synthetic signal/ACK fixture keys after TAKE outside timing; Unix miss/timeout ARM and every timed TAKE use a shared concurrent eight-worker latch",
 		RawTimedCall:           "System.nanoTime and ThreadMXBean around BootstrapNative.takeRemoteParent(fd-or-minus-one,reused_byte_array)",
 		ProviderTimedCall:      "System.nanoTime and ThreadMXBean around RemoteParentBridge.takeRemoteParent()",
 		ResponseStorage:        "one reused 64-byte JNI response array per worker; provider uses its packaged pool",

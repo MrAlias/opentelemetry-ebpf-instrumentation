@@ -249,9 +249,6 @@ func TestJavaRemoteParentPackagedJVMTransportBenchmark(t *testing.T) {
 				if worker.duplicateFD >= 0 {
 					_ = unix.Close(worker.duplicateFD)
 				}
-				if worker.clientFD >= 0 {
-					_ = unix.Close(worker.clientFD)
-				}
 			}
 		}
 	}()
@@ -260,9 +257,7 @@ func TestJavaRemoteParentPackagedJVMTransportBenchmark(t *testing.T) {
 		require.GreaterOrEqual(t, workers[index].javaFD, 0)
 		workers[index].duplicateFD, err = unix.PidfdGetfd(pidfd, workers[index].javaFD, 0)
 		require.NoError(t, err)
-		workers[index].clientFD = duplicatePackagedJVMBenchmarkTCPFD(t, workers[index].connection)
 		workers[index].javaSocketCookie = socketCookie(t, workers[index].duplicateFD)
-		workers[index].clientSocketCookie = socketCookie(t, workers[index].clientFD)
 		workers[index].owner = process
 		workers[index].owner.Tid = workers[index].tid
 		workers[index].connectionInfo = javaRemoteParentJVMConnectionInfo(t, workers[index].connection)
@@ -340,41 +335,41 @@ func TestJavaRemoteParentPackagedJVMTransportBenchmark(t *testing.T) {
 			for iteration := range phase.iterations {
 				generations := make([]uint64, len(workers))
 				nonces := make([]uint64, len(workers))
+				observedMonotimeNS := make([]uint64, len(workers))
 				expectedResponseGenerations := make([]uint64, len(workers))
 				missAuthorities := make([]*packagedJVMBenchmarkMissAuthority, len(workers))
 				negotiations := make([]BpfJavaRemoteParentJavaRemoteParentNegotiationT, len(workers))
+				unixStaged := packagedJVMBenchmarkUnixStaged(spec)
 				for index := range workers {
 					if spec.Outcome == "hit" || spec.Outcome == "stale" || spec.Transport == "getsockopt" {
 						generations[index] = nextGeneration
 						nextGeneration++
 						observed := monotonicNowNS(t)
+						observedMonotimeNS[index] = observed
 						if spec.Outcome == "stale" {
 							require.Greater(t, observed, uint64(packagedJVMBenchmarkStaleAge.Nanoseconds()))
 							observed -= uint64(packagedJVMBenchmarkStaleAge.Nanoseconds())
+							observedMonotimeNS[index] = observed
 							expectedStaleResidue[index] = packagedJVMBenchmarkExpectedStaleResidue{
 								Generation:         generations[index],
 								ObservedMonotimeNS: observed,
 								ProcessIncarnation: packagedJVMBenchmarkCapability,
 							}
 						}
-						cookie := workers[index].javaSocketCookie
-						if spec.Transport == "unix" {
-							cookie = workers[index].clientSocketCookie
-						}
-						stageRemoteParentAt(
-							t, &objects.BpfJavaRemoteParentMaps, process, workers[index].owner,
-							packagedJVMBenchmarkCapability, workers[index].connectionInfo,
-							workers[index].netns, cookie, generations[index], nextNonce, observed,
-						)
-						nonces[index] = nextNonce
-						if spec.Transport == "unix" {
-							require.NoError(t, acknowledgeRemoteParentData(workers[index].clientFD, nextNonce))
+						if spec.Transport == "getsockopt" {
+							stageRemoteParentAt(
+								t, &objects.BpfJavaRemoteParentMaps, process, workers[index].owner,
+								packagedJVMBenchmarkCapability, workers[index].connectionInfo,
+								workers[index].netns, workers[index].javaSocketCookie,
+								generations[index], nextNonce, observed,
+							)
+							nonces[index] = nextNonce
+							nextNonce++
 						}
 						if spec.ExpectedStatus == int(javabridge.StatusValid) ||
 							(spec.Scope == "raw_jni" && spec.Transport == "getsockopt") {
 							expectedResponseGenerations[index] = generations[index]
 						}
-						nextNonce++
 					}
 				}
 				_, err = fmt.Fprintf(stdin, "ARM_BATCH %s %s %s %s %d %d",
@@ -394,12 +389,18 @@ func TestJavaRemoteParentPackagedJVMTransportBenchmark(t *testing.T) {
 					if spec.Transport == "getsockopt" {
 						expectedEmit = "1"
 						expectedNonce = strconv.FormatUint(nextNonce-uint64(len(workers)-index), 10)
+					} else if unixStaged {
+						expectedNonce = armed["nonce"]
 					}
 					requirePackagedJVMBenchmarkFields(t, armed, map[string]string{
 						"phase": phase.name, "scope": spec.Scope, "transport": spec.Transport,
 						"outcome": spec.Outcome, "iteration": strconv.Itoa(iteration),
 						"worker": strconv.Itoa(index), "emit": expectedEmit, "nonce": expectedNonce,
 					})
+					if unixStaged {
+						nonces[index] = parsePackagedJVMBenchmarkUint64(t, armed, "nonce")
+						require.NotZero(t, nonces[index])
+					}
 					if spec.Transport == "getsockopt" {
 						negotiations[index] = socketNegotiation(
 							t, objects.JavaRemoteParentNegotiations, workers[index].duplicateFD,
@@ -425,6 +426,18 @@ func TestJavaRemoteParentPackagedJVMTransportBenchmark(t *testing.T) {
 							)
 							missAuthorities[index] = &authority
 						}
+					}
+				}
+				if unixStaged {
+					require.NoError(t, validatePackagedJVMBenchmarkNonceBlock(nextNonce, nonces))
+					nextNonce += uint64(len(nonces))
+					for index := range workers {
+						stageRemoteParentAt(
+							t, &objects.BpfJavaRemoteParentMaps, process, workers[index].owner,
+							packagedJVMBenchmarkCapability, workers[index].connectionInfo,
+							workers[index].netns, workers[index].javaSocketCookie,
+							generations[index], nonces[index], observedMonotimeNS[index],
+						)
 					}
 				}
 
@@ -497,8 +510,15 @@ func TestJavaRemoteParentPackagedJVMTransportBenchmark(t *testing.T) {
 					requirePackagedJVMBenchmarkGenerationCleaned(
 						t, &objects.BpfJavaRemoteParentMaps, workers[index].owner, generations[index],
 					)
-					requirePackagedJVMBenchmarkDataAckMissing(
-						t, objects.JavaRemoteParentDataAcks, process, nonces[index],
+					if spec.Transport == "getsockopt" {
+						requirePackagedJVMBenchmarkDataAckMissing(
+							t, objects.JavaRemoteParentDataAcks, process, nonces[index],
+						)
+					}
+				}
+				if unixStaged {
+					requirePackagedJVMBenchmarkUnixSyntheticDataClean(
+						t, &objects.BpfJavaRemoteParentMaps, process, workers, generations, nonces,
 					)
 				}
 			}
@@ -580,8 +600,6 @@ func TestJavaRemoteParentPackagedJVMTransportBenchmark(t *testing.T) {
 		connections[index] = nil
 		require.NoError(t, unix.Close(workers[index].duplicateFD))
 		workers[index].duplicateFD = -1
-		require.NoError(t, unix.Close(workers[index].clientFD))
-		workers[index].clientFD = -1
 	}
 	workerDuplicatesClosed = true
 	require.NoError(t, unix.Close(pidfd))
@@ -651,18 +669,16 @@ func TestJavaRemoteParentPackagedJVMTransportBenchmark(t *testing.T) {
 }
 
 type packagedJVMBenchmarkWorker struct {
-	index              int
-	tid                uint32
-	javaThreadID       int64
-	javaFD             int
-	duplicateFD        int
-	clientFD           int
-	connection         *net.TCPConn
-	owner              BpfJavaRemoteParentPidKeyT
-	connectionInfo     BpfJavaRemoteParentConnectionInfoT
-	netns              uint32
-	javaSocketCookie   uint64
-	clientSocketCookie uint64
+	index            int
+	tid              uint32
+	javaThreadID     int64
+	javaFD           int
+	duplicateFD      int
+	connection       *net.TCPConn
+	owner            BpfJavaRemoteParentPidKeyT
+	connectionInfo   BpfJavaRemoteParentConnectionInfoT
+	netns            uint32
+	javaSocketCookie uint64
 }
 
 type packagedJVMBenchmarkUnixCounters struct {
@@ -1228,20 +1244,6 @@ func packagedJVMBenchmarkExpectedCallsV2(
 	return calls
 }
 
-func duplicatePackagedJVMBenchmarkTCPFD(t *testing.T, connection *net.TCPConn) int {
-	t.Helper()
-	raw, err := connection.SyscallConn()
-	require.NoError(t, err)
-	duplicate := -1
-	var duplicateErr error
-	require.NoError(t, raw.Control(func(fd uintptr) {
-		duplicate, duplicateErr = unix.FcntlInt(fd, unix.F_DUPFD_CLOEXEC, 0)
-	}))
-	require.NoError(t, duplicateErr)
-	require.GreaterOrEqual(t, duplicate, 0)
-	return duplicate
-}
-
 func positivePackagedJVMBenchmarkProbeInt64(
 	t *testing.T,
 	values map[string]string,
@@ -1685,6 +1687,17 @@ func parsePackagedJVMBenchmarkInt(t *testing.T, fields map[string]string, name s
 	return parsed
 }
 
+func parsePackagedJVMBenchmarkUint64(t *testing.T, fields map[string]string, name string) uint64 {
+	t.Helper()
+	value, ok := fields[name]
+	require.Truef(t, ok, "missing packaged JVM probe field %q", name)
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	require.NoErrorf(t, err, "invalid packaged JVM probe field %q", name)
+	require.Equalf(t, strconv.FormatUint(parsed, 10), value,
+		"non-canonical packaged JVM probe field %q", name)
+	return parsed
+}
+
 func parsePackagedJVMBenchmarkInt64(t *testing.T, fields map[string]string, name string) int64 {
 	t.Helper()
 	value, ok := fields[name]
@@ -1707,6 +1720,95 @@ func requirePackagedJVMBenchmarkDataAckMissing(
 	}
 	var acknowledgement BpfJavaRemoteParentJavaRemoteParentDataAckT
 	require.ErrorIs(t, dataAcks.Lookup(key, &acknowledgement), ebpf.ErrKeyNotExist)
+}
+
+func requirePackagedJVMBenchmarkUnixSyntheticDataClean(
+	t *testing.T,
+	maps *BpfJavaRemoteParentMaps,
+	process BpfJavaRemoteParentPidKeyT,
+	workers []packagedJVMBenchmarkWorker,
+	generations []uint64,
+	nonces []uint64,
+) {
+	t.Helper()
+	require.Len(t, generations, len(workers))
+	require.Len(t, nonces, len(workers))
+
+	keys := make([]BpfJavaRemoteParentJavaRemoteParentDataSignalKeyT, len(workers))
+	expectedData := make([]packagedJVMBenchmarkExpectedSyntheticData, len(workers))
+	for index := range workers {
+		expectedData[index] = packagedJVMBenchmarkExpectedSyntheticData{
+			Process:         process,
+			Owner:           workers[index].owner,
+			Connection:      workers[index].connectionInfo,
+			ConnectionNetns: workers[index].netns,
+			Generation:      generations[index],
+			Nonce:           nonces[index],
+		}
+		keys[index] = BpfJavaRemoteParentJavaRemoteParentDataSignalKeyT{
+			Process: process,
+			Nonce:   nonces[index],
+		}
+		var acknowledgement BpfJavaRemoteParentJavaRemoteParentDataAckT
+		require.NoError(t, maps.JavaRemoteParentDataAcks.Lookup(keys[index], &acknowledgement))
+		require.NoError(t, validatePackagedJVMBenchmarkSyntheticDataAck(
+			expectedData[index], keys[index], acknowledgement,
+		))
+	}
+
+	var signal uint64
+	require.NoError(t, maps.JavaRemoteParentDataSignals.Lookup(process, &signal))
+	require.NoError(t, validatePackagedJVMBenchmarkSyntheticDataSignal(
+		nonces[len(nonces)-1], signal,
+	))
+
+	var cleanupErr error
+	for index, key := range keys {
+		var acknowledgement BpfJavaRemoteParentJavaRemoteParentDataAckT
+		cleanupErr = errors.Join(
+			cleanupErr,
+			cleanPackagedJVMBenchmarkExactResidue(
+				func() (bool, error) {
+					return packagedJVMBenchmarkOptionalMapLookup(
+						maps.JavaRemoteParentDataAcks, key, &acknowledgement,
+					)
+				},
+				func() error {
+					return validatePackagedJVMBenchmarkSyntheticDataAck(
+						expectedData[index], key, acknowledgement,
+					)
+				},
+				func() error { return maps.JavaRemoteParentDataAcks.Delete(key) },
+				func() error {
+					return requirePackagedJVMBenchmarkExactMapKeyAbsent(
+						maps.JavaRemoteParentDataAcks, key,
+					)
+				},
+			),
+		)
+	}
+	cleanupErr = errors.Join(
+		cleanupErr,
+		cleanPackagedJVMBenchmarkExactResidue(
+			func() (bool, error) {
+				return packagedJVMBenchmarkOptionalMapLookup(
+					maps.JavaRemoteParentDataSignals, process, &signal,
+				)
+			},
+			func() error {
+				return validatePackagedJVMBenchmarkSyntheticDataSignal(
+					nonces[len(nonces)-1], signal,
+				)
+			},
+			func() error { return maps.JavaRemoteParentDataSignals.Delete(process) },
+			func() error {
+				return requirePackagedJVMBenchmarkExactMapKeyAbsent(
+					maps.JavaRemoteParentDataSignals, process,
+				)
+			},
+		),
+	)
+	require.NoError(t, cleanupErr)
 }
 
 type packagedJVMBenchmarkMissAuthority struct {

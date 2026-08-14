@@ -435,12 +435,19 @@ public final class RemoteParentGetsockoptBenchmarkProbe {
           readySignaled = true;
           job.batch.start.await();
           if (job.arm) {
-            if ("getsockopt".equals(job.batch.transport)) {
+            boolean stagedUnix =
+                "unix".equals(job.batch.transport)
+                    && ("hit".equals(job.batch.outcome) || "stale".equals(job.batch.outcome));
+            if ("getsockopt".equals(job.batch.transport) || stagedUnix) {
               next.emit = BootstrapNative.emitData(socketFileDescriptor, packet.getAddress(), true);
               next.nonce = packet.getLong(41);
-              if (next.emit != 1) {
+              int expectedEmit = "getsockopt".equals(job.batch.transport) ? 1 : 0;
+              if (next.emit != expectedEmit) {
                 throw new IllegalStateException(
-                    "primary data acknowledgement failed: " + next.emit);
+                    "unexpected data emission result: got " + next.emit + ", want " + expectedEmit);
+              }
+              if (next.nonce == 0L) {
+                throw new IllegalStateException("data emission returned a zero nonce");
               }
             }
             armedGeneration = job.expectedGeneration;

@@ -77,9 +77,54 @@ static void test_control_directory_metadata(void) {
   assert(!control_directory_metadata_is_safe(&metadata));
 }
 
+static void test_preparation_contract(void) {
+  const struct supervisor_config config = {
+      .control_dir = "/run/obi-demo/pid-reuse",
+      .target_pid = 4242,
+      .socket_fd = 198,
+      .child_argv = NULL,
+  };
+
+  assert(preparation_child_pid_is_safe(2, config.target_pid));
+  assert(!preparation_child_pid_is_safe(1, config.target_pid));
+  assert(!preparation_child_pid_is_safe(4242, config.target_pid));
+  assert(controlled_phase_is_valid("A"));
+  assert(controlled_phase_is_valid("B"));
+  assert(!controlled_phase_is_valid(PREPARE_PHASE));
+  assert(!controlled_phase_is_valid(NULL));
+
+  assert(setenv("OBI_PID_REUSE_SOCKET_FD", "stale", 1) == 0);
+  configure_preparation_environment(&config);
+  assert(strcmp(getenv("OBI_PID_REUSE_PHASE"), PREPARE_PHASE) == 0);
+  assert(strcmp(getenv("OBI_PID_REUSE_CONTROL_DIR"), config.control_dir) == 0);
+  assert(getenv("OBI_PID_REUSE_SOCKET_FD") == NULL);
+
+  configure_controlled_environment(&config, "A");
+  assert(strcmp(getenv("OBI_PID_REUSE_PHASE"), "A") == 0);
+  assert(strcmp(getenv("OBI_PID_REUSE_CONTROL_DIR"), config.control_dir) == 0);
+  assert(strcmp(getenv("OBI_PID_REUSE_SOCKET_FD"), "198") == 0);
+
+  assert(control_contents_are_exact(PREPARE_MARKER_CONTENTS,
+                                    strlen(PREPARE_MARKER_CONTENTS),
+                                    PREPARE_MARKER_CONTENTS));
+  assert(!control_contents_are_exact(
+      "prepare-ready-v1", strlen("prepare-ready-v1"), PREPARE_MARKER_CONTENTS));
+  assert(!control_contents_are_exact("prepare-ready-v2\n",
+                                     strlen("prepare-ready-v2\n"),
+                                     PREPARE_MARKER_CONTENTS));
+  assert(child_exited_cleanly(W_EXITCODE(0, 0)));
+  assert(!child_exited_cleanly(W_EXITCODE(1, 0)));
+  assert(!child_exited_cleanly(SIGKILL));
+
+  assert(unsetenv("OBI_PID_REUSE_PHASE") == 0);
+  assert(unsetenv("OBI_PID_REUSE_CONTROL_DIR") == 0);
+  assert(unsetenv("OBI_PID_REUSE_SOCKET_FD") == 0);
+}
+
 int main(void) {
   test_numbers_and_paths();
   test_identity_reuse_contract();
   test_control_directory_metadata();
+  test_preparation_contract();
   return 0;
 }

@@ -45,6 +45,9 @@
 #define DEFAULT_SOCKET_FD 198
 #define CONTROL_TIMEOUT_SECONDS 120
 #define MAX_CONTROL_FILE_BYTES 4096
+#define PREPARE_PHASE "PREPARE"
+#define PREPARE_MARKER_NAME "prepare-ready"
+#define PREPARE_MARKER_CONTENTS "prepare-ready-v1\n"
 
 struct supervisor_config {
   const char *control_dir;
@@ -66,7 +69,7 @@ struct child_identity {
 };
 
 static volatile sig_atomic_t termination_signal;
-static pid_t active_child = -1;
+static volatile sig_atomic_t active_child = -1;
 
 static void fail_errno(const char *message) {
   const int saved_errno = errno;
@@ -302,6 +305,13 @@ static void publish_control_file(int directory_fd, const char *name,
   }
 }
 
+static bool control_contents_are_exact(const char *contents, size_t length,
+                                       const char *expected) {
+  const size_t expected_length = strlen(expected);
+  return length == expected_length &&
+         memcmp(contents, expected, expected_length) == 0;
+}
+
 static bool exact_control_file_present(int directory_fd, const char *name,
                                        const char *expected) {
   char contents[128];
@@ -332,11 +342,23 @@ static bool exact_control_file_present(int directory_fd, const char *name,
   if (close(descriptor) != 0) {
     fail_errno("close control command");
   }
-  if ((size_t)length != expected_length ||
-      memcmp(contents, expected, expected_length) != 0) {
+  if (!control_contents_are_exact(contents, (size_t)length, expected)) {
     fail_message("control command has unexpected contents");
   }
   return true;
+}
+
+static void remove_exact_control_file(int directory_fd, const char *name,
+                                      const char *expected) {
+  if (!exact_control_file_present(directory_fd, name, expected)) {
+    fail_message("required control file is absent");
+  }
+  if (unlinkat(directory_fd, name, 0) != 0) {
+    fail_errno("remove consumed control file");
+  }
+  if (fsync(directory_fd) != 0) {
+    fail_errno("sync consumed control file removal");
+  }
 }
 
 static void handle_termination(int signal_number) {
@@ -355,6 +377,21 @@ static void install_signal_handlers(void) {
       sigaction(SIGINT, &action, NULL) != 0 ||
       sigaction(SIGHUP, &action, NULL) != 0) {
     fail_errno("install signal handler");
+  }
+}
+
+static void restore_child_signal_dispositions(void) {
+  struct sigaction action;
+  memset(&action, 0, sizeof(action));
+  action.sa_handler = SIG_DFL;
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGTERM, &action, NULL) != 0 ||
+      sigaction(SIGINT, &action, NULL) != 0 ||
+      sigaction(SIGHUP, &action, NULL) != 0) {
+    fail_errno("restore child signal dispositions");
+  }
+  if (termination_signal != 0) {
+    _exit(128 + termination_signal);
   }
 }
 
@@ -597,16 +634,88 @@ static void drop_child_privileges(void) {
   }
 }
 
+static bool preparation_child_pid_is_safe(pid_t child, uint32_t target_pid) {
+  return child > 1 && (uint32_t)child != target_pid;
+}
+
+static bool controlled_phase_is_valid(const char *phase) {
+  return phase != NULL && (strcmp(phase, "A") == 0 || strcmp(phase, "B") == 0);
+}
+
+static void
+configure_preparation_environment(const struct supervisor_config *config) {
+  if (unsetenv("OBI_PID_REUSE_SOCKET_FD") != 0 ||
+      setenv("OBI_PID_REUSE_PHASE", PREPARE_PHASE, 1) != 0 ||
+      setenv("OBI_PID_REUSE_CONTROL_DIR", config->control_dir, 1) != 0) {
+    fail_errno("configure preparatory JVM environment");
+  }
+}
+
+static void
+configure_controlled_environment(const struct supervisor_config *config,
+                                 const char *phase) {
+  char descriptor[32];
+
+  if (!controlled_phase_is_valid(phase)) {
+    fail_message("controlled JVM phase is invalid");
+  }
+  if (setenv("OBI_PID_REUSE_PHASE", phase, 1) != 0 ||
+      setenv("OBI_PID_REUSE_CONTROL_DIR", config->control_dir, 1) != 0 ||
+      snprintf(descriptor, sizeof(descriptor), "%d", config->socket_fd) >=
+          (int)sizeof(descriptor) ||
+      setenv("OBI_PID_REUSE_SOCKET_FD", descriptor, 1) != 0) {
+    fail_errno("configure controlled JVM environment");
+  }
+}
+
+static pid_t start_preparation_child(const struct supervisor_config *config) {
+  pid_t child = fork();
+
+  if (child < 0) {
+    fail_errno("fork preparatory JVM");
+  }
+  if (child == 0) {
+    restore_child_signal_dispositions();
+    if (!preparation_child_pid_is_safe(getpid(), config->target_pid) ||
+        getpid() != (pid_t)syscall(SYS_gettid)) {
+      fail_message("preparatory JVM received an unsafe process identity");
+    }
+    errno = 0;
+    if (fcntl(config->socket_fd, F_GETFD) != -1 || errno != EBADF) {
+      fail_message("preparatory JVM inherited the reserved probe descriptor");
+    }
+    configure_preparation_environment(config);
+    drop_child_privileges();
+    execvp(config->child_argv[0], config->child_argv);
+    fail_errno("execute preparatory JVM");
+  }
+  if (!preparation_child_pid_is_safe(child, config->target_pid)) {
+    (void)kill(child, SIGKILL);
+    (void)waitpid(child, NULL, 0);
+    fail_message("preparatory JVM collided with the controlled target PID");
+  }
+  active_child = child;
+  if (termination_signal != 0) {
+    (void)kill(child, termination_signal);
+    fail_message("terminated while starting preparatory JVM");
+  }
+  return child;
+}
+
 static pid_t start_child(const struct supervisor_config *config,
                          const char *phase, int inherited_socket) {
   pid_t child;
 
+  if (!controlled_phase_is_valid(phase)) {
+    fail_message("controlled JVM phase is invalid");
+  }
   write_ns_last_pid(config->target_pid);
   child = fork();
   if (child < 0) {
     fail_errno("fork controlled JVM");
   }
   if (child == 0) {
+    restore_child_signal_dispositions();
     if ((uint32_t)getpid() != config->target_pid ||
         getpid() != (pid_t)syscall(SYS_gettid)) {
       fail_message(
@@ -620,18 +729,7 @@ static pid_t start_child(const struct supervisor_config *config,
     } else if (fcntl(config->socket_fd, F_SETFD, 0) != 0) {
       fail_errno("clear inherited Java probe socket close-on-exec flag");
     }
-    if (setenv("OBI_PID_REUSE_PHASE", phase, 1) != 0 ||
-        setenv("OBI_PID_REUSE_CONTROL_DIR", config->control_dir, 1) != 0) {
-      fail_errno("configure controlled JVM environment");
-    }
-    {
-      char descriptor[32];
-      if (snprintf(descriptor, sizeof(descriptor), "%d", config->socket_fd) >=
-              (int)sizeof(descriptor) ||
-          setenv("OBI_PID_REUSE_SOCKET_FD", descriptor, 1) != 0) {
-        fail_errno("configure controlled JVM socket descriptor");
-      }
-    }
+    configure_controlled_environment(config, phase);
     drop_child_privileges();
     execvp(config->child_argv[0], config->child_argv);
     fail_errno("execute controlled JVM");
@@ -643,6 +741,10 @@ static pid_t start_child(const struct supervisor_config *config,
                  "numeric PID/TID");
   }
   active_child = child;
+  if (termination_signal != 0) {
+    (void)kill(child, termination_signal);
+    fail_message("terminated while starting controlled JVM");
+  }
   return child;
 }
 
@@ -659,8 +761,67 @@ static int wait_for_child(pid_t child) {
   return status;
 }
 
+static bool child_exited_cleanly(int status) {
+  return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static void wait_for_preparation_child(int directory_fd, pid_t child) {
+  struct timespec started;
+  struct timespec now;
+  const struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000};
+
+  if (clock_gettime(CLOCK_MONOTONIC, &started) != 0) {
+    fail_errno("read preparatory JVM start time");
+  }
+  for (;;) {
+    int status = 0;
+    const pid_t result = waitpid(child, &status, WNOHANG);
+
+    if (result < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      active_child = -1;
+      fail_errno("reap preparatory JVM");
+    }
+    const bool marker_present = exact_control_file_present(
+        directory_fd, PREPARE_MARKER_NAME, PREPARE_MARKER_CONTENTS);
+    if (result == child) {
+      active_child = -1;
+      if (termination_signal != 0) {
+        fail_message("terminated while reaping preparatory JVM");
+      }
+      if (!child_exited_cleanly(status)) {
+        fail_message("preparatory JVM did not exit successfully");
+      }
+      if (!marker_present) {
+        fail_message("preparatory JVM exited without its readiness marker");
+      }
+      remove_exact_control_file(directory_fd, PREPARE_MARKER_NAME,
+                                PREPARE_MARKER_CONTENTS);
+      return;
+    }
+    if (termination_signal != 0) {
+      (void)kill(child, SIGKILL);
+      (void)wait_for_child(child);
+      fail_message("terminated while waiting for preparatory JVM");
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+      fail_errno("read preparatory JVM wait time");
+    }
+    if (now.tv_sec - started.tv_sec >= CONTROL_TIMEOUT_SECONDS) {
+      (void)kill(child, SIGKILL);
+      (void)wait_for_child(child);
+      fail_message("timed out waiting for preparatory JVM");
+    }
+    if (nanosleep(&pause, NULL) != 0 && errno != EINTR) {
+      fail_errno("pause for preparatory JVM");
+    }
+  }
+}
+
 static void require_clean_phase_exit(int status) {
-  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+  if (!child_exited_cleanly(status)) {
     fail_message("phase A controlled JVM did not exit successfully");
   }
 }
@@ -715,6 +876,11 @@ int main(int argc, char **argv) {
   make_control_directory(config.control_dir);
   control_directory = open_control_directory(config.control_dir);
   install_signal_handlers();
+  child = start_preparation_child(&config);
+  wait_for_preparation_child(control_directory, child);
+  if (termination_signal != 0) {
+    fail_message("terminated after preparatory JVM readiness");
+  }
   create_tcp_pair(&client_socket, &peer_socket);
 
   child = start_child(&config, "A", client_socket);

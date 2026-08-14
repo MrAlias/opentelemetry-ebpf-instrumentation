@@ -53,6 +53,40 @@ class PidReuseProbeTest {
   }
 
   @Test
+  void preparationIsSocketlessAndRequiresAnExactSelectedTransport() {
+    Map<String, String> environment = new HashMap<>();
+    environment.put("OBI_PID_REUSE_PHASE", "PREPARE");
+    environment.put("OBI_PID_REUSE_CONTROL_DIR", "/run/obi-demo/pid-reuse");
+    PidReuseProbe.Config preparation = PidReuseProbe.parseConfig(environment);
+    assertEquals("PREPARE", preparation.phase());
+    assertEquals(-1, preparation.socketFileDescriptor());
+    assertThrows(IllegalStateException.class, () -> PidReuseProbe.preparationMarker(preparation));
+    assertEquals(
+        "prepare-ready-v1\n",
+        PidReuseProbe.preparationMarker(preparation.withTransport("getsockopt")));
+    assertEquals(
+        "prepare-ready-v1\n", PidReuseProbe.preparationMarker(preparation.withTransport("unix")));
+
+    Map<String, String> withDescriptor = new HashMap<>(environment);
+    withDescriptor.put("OBI_PID_REUSE_SOCKET_FD", "198");
+    assertThrows(IllegalArgumentException.class, () -> PidReuseProbe.parseConfig(withDescriptor));
+    Map<String, String> withoutDirectory = new HashMap<>(environment);
+    withoutDirectory.remove("OBI_PID_REUSE_CONTROL_DIR");
+    assertThrows(IllegalArgumentException.class, () -> PidReuseProbe.parseConfig(withoutDirectory));
+
+    for (String phase : new String[] {"A", "B"}) {
+      Map<String, String> controlled = new HashMap<>(environment);
+      controlled.put("OBI_PID_REUSE_PHASE", phase);
+      assertThrows(IllegalArgumentException.class, () -> PidReuseProbe.parseConfig(controlled));
+      controlled.put("OBI_PID_REUSE_SOCKET_FD", "198");
+      PidReuseProbe.Config parsed = PidReuseProbe.parseConfig(controlled);
+      assertEquals(198, parsed.socketFileDescriptor());
+      PidReuseProbe.Config selected = parsed.withTransport("getsockopt");
+      assertThrows(IllegalStateException.class, () -> PidReuseProbe.preparationMarker(selected));
+    }
+  }
+
+  @Test
   void acceptsOnlyExactForcedTransportSnapshots() {
     assertEquals(
         "getsockopt",

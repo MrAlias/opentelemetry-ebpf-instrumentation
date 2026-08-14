@@ -25210,6 +25210,315 @@ pid_reuse_backend_startup_order_is_safe() {
   ' <<<"$main_source"
 }
 
+pid_reuse_supervisor_preparation_order_is_safe() {
+  local -r supervisor_source="$1"
+
+  [[ "$supervisor_source" == *'#define PREPARE_PHASE "PREPARE"'* &&
+    "$supervisor_source" == *'#define PREPARE_MARKER_NAME "prepare-ready"'* &&
+    "$supervisor_source" == *'#define PREPARE_MARKER_CONTENTS "prepare-ready-v1\n"'* &&
+    "$supervisor_source" == *'static volatile sig_atomic_t active_child = -1;'* ]] || return 1
+  awk '
+    { line[NR] = $0 }
+    $0 == "static void restore_child_signal_dispositions(void) {" {
+      restore_signals = NR
+      restore_signals_count++
+      in_restore_signals = 1
+    }
+    $0 == "static void wait_for_control_file(int directory_fd, const char *name," {
+      in_restore_signals = 0
+    }
+    in_restore_signals && $0 == "  action.sa_handler = SIG_DFL;" {
+      restore_default = NR
+      restore_default_count++
+    }
+    in_restore_signals && index($0, "sigaction(SIGTERM, &action, NULL)") {
+      restore_term_count++
+    }
+    in_restore_signals && index($0, "sigaction(SIGINT, &action, NULL)") {
+      restore_int_count++
+    }
+    in_restore_signals && index($0, "sigaction(SIGHUP, &action, NULL)") {
+      restore_hup_count++
+    }
+    in_restore_signals && $0 == "  if (termination_signal != 0) {" {
+      restore_latch = NR
+      restore_latch_count++
+    }
+    in_restore_signals && $0 == "    _exit(128 + termination_signal);" {
+      restore_exit = NR
+      restore_exit_count++
+    }
+    $0 == "configure_preparation_environment(const struct supervisor_config *config) {" {
+      environment = NR
+      environment_count++
+    }
+    index($0, "unsetenv(\"OBI_PID_REUSE_SOCKET_FD\")") {
+      unset_socket = NR
+      unset_socket_count++
+    }
+    index($0, "setenv(\"OBI_PID_REUSE_PHASE\", PREPARE_PHASE, 1)") {
+      prepare_phase = NR
+      prepare_phase_count++
+    }
+    $0 == "static pid_t start_preparation_child(const struct supervisor_config *config) {" {
+      preparation = NR
+      preparation_count++
+    }
+    $0 == "    restore_child_signal_dispositions();" {
+      if (!preparation_restore) {
+        preparation_restore = NR
+      } else {
+        controlled_restore = NR
+      }
+      restore_call_count++
+    }
+    index($0, "fcntl(config->socket_fd, F_GETFD)") {
+      reserved_fd = NR
+      reserved_fd_count++
+    }
+    $0 == "    configure_preparation_environment(config);" {
+      prepare_environment = NR
+      prepare_environment_count++
+    }
+    $0 == "    drop_child_privileges();" {
+      if (!preparation_drop) {
+        preparation_drop = NR
+      } else {
+        controlled_drop = NR
+      }
+      drop_count++
+    }
+    $0 == "    execvp(config->child_argv[0], config->child_argv);" {
+      if (!preparation_exec) {
+        preparation_exec = NR
+      } else {
+        controlled_exec = NR
+      }
+      exec_count++
+    }
+    index($0, "preparation_child_pid_is_safe(getpid(), config->target_pid)") {
+      child_pid_guard = NR
+      child_pid_guard_count++
+    }
+    index($0, "preparation_child_pid_is_safe(child, config->target_pid)") {
+      parent_pid_guard = NR
+      parent_pid_guard_count++
+    }
+    $0 == "  active_child = child;" && preparation && !controlled {
+      preparation_active = NR
+      preparation_active_count++
+    }
+    $0 == "    fail_message(\"terminated while starting preparatory JVM\");" {
+      preparation_signal = NR
+      preparation_signal_count++
+    }
+    $0 == "static pid_t start_child(const struct supervisor_config *config," {
+      controlled = NR
+      controlled_count++
+    }
+    index($0, "(uint32_t)getpid() != config->target_pid") {
+      controlled_child_pid_guard = NR
+      controlled_child_pid_guard_count++
+    }
+    $0 == "  if (!controlled_phase_is_valid(phase)) {" && controlled {
+      controlled_phase_check = NR
+      controlled_phase_check_count++
+    }
+    $0 == "  write_ns_last_pid(config->target_pid);" {
+      controlled_target_force = NR
+      controlled_target_force_count++
+    }
+    $0 == "  child = fork();" {
+      controlled_fork = NR
+      controlled_fork_count++
+    }
+    $0 == "  active_child = child;" && controlled {
+      controlled_active = NR
+      controlled_active_count++
+    }
+    $0 == "    fail_message(\"terminated while starting controlled JVM\");" {
+      controlled_signal = NR
+      controlled_signal_count++
+    }
+    index($0, "dup3(") && preparation && !controlled {
+      preparation_dup++
+    }
+    index($0, "write_ns_last_pid(") && preparation && !controlled {
+      preparation_target_force++
+    }
+    index($0, "setenv(\"OBI_PID_REUSE_SOCKET_FD\"") && preparation && !controlled {
+      preparation_socket_export++
+    }
+    $0 == "static void wait_for_preparation_child(int directory_fd, pid_t child) {" {
+      wait_preparation = NR
+      wait_preparation_count++
+    }
+    index($0, "waitpid(child, &status, WNOHANG)") {
+      nonblocking_reap = NR
+      nonblocking_reap_count++
+    }
+    index($0, "directory_fd, PREPARE_MARKER_NAME, PREPARE_MARKER_CONTENTS)") {
+      if (!marker_check) {
+        marker_check = NR
+      }
+      marker_check_count++
+    }
+    $0 == "      if (!child_exited_cleanly(status)) {" {
+      clean_reap = NR
+      clean_reap_count++
+    }
+    $0 == "      remove_exact_control_file(directory_fd, PREPARE_MARKER_NAME," {
+      marker_remove = NR
+      marker_remove_count++
+    }
+    $0 == "  child = start_preparation_child(&config);" {
+      main_prepare = NR
+      main_prepare_count++
+    }
+    $0 == "  wait_for_preparation_child(control_directory, child);" {
+      main_wait = NR
+      main_wait_count++
+    }
+    $0 == "    fail_message(\"terminated after preparatory JVM readiness\");" {
+      main_signal_fence = NR
+      main_signal_fence_count++
+    }
+    $0 == "  create_tcp_pair(&client_socket, &peer_socket);" {
+      main_pair = NR
+      main_pair_count++
+    }
+    $0 == "  child = start_child(&config, \"A\", client_socket);" {
+      main_a = NR
+      main_a_count++
+    }
+    END {
+      if (environment_count != 1 || unset_socket_count != 1 ||
+          restore_signals_count != 1 || restore_default_count != 1 ||
+          restore_term_count != 1 || restore_int_count != 1 ||
+          restore_hup_count != 1 || restore_latch_count != 1 ||
+          restore_exit_count != 1 || restore_call_count != 2 ||
+          prepare_phase_count != 1 || preparation_count != 1 ||
+          reserved_fd_count != 1 || prepare_environment_count != 1 ||
+          drop_count != 2 || exec_count != 2 || child_pid_guard_count != 1 ||
+          parent_pid_guard_count != 1 || preparation_active_count != 1 ||
+          preparation_signal_count != 1 || controlled_count != 1 ||
+          controlled_phase_check_count != 1 || controlled_child_pid_guard_count != 1 ||
+          controlled_target_force_count != 1 || controlled_fork_count != 1 ||
+          controlled_active_count != 1 || controlled_signal_count != 1 ||
+          preparation_dup != 0 || preparation_target_force != 0 ||
+          preparation_socket_export != 0 || wait_preparation_count != 1 ||
+          nonblocking_reap_count != 1 || marker_check_count != 1 ||
+          clean_reap_count != 1 || marker_remove_count != 1 ||
+          main_prepare_count != 1 || main_wait_count != 1 ||
+          main_signal_fence_count != 1 ||
+          main_pair_count != 1 || main_a_count != 1) {
+        exit 1
+      }
+      if (!(restore_signals < restore_default && restore_default < restore_latch &&
+            restore_latch < restore_exit && restore_exit < environment &&
+            environment < unset_socket && unset_socket < prepare_phase &&
+            preparation < preparation_restore &&
+            preparation_restore < child_pid_guard && child_pid_guard < reserved_fd &&
+            reserved_fd < prepare_environment &&
+            prepare_environment < preparation_drop &&
+            preparation_drop < preparation_exec &&
+            preparation_exec < parent_pid_guard &&
+            parent_pid_guard < preparation_active &&
+            line[preparation_signal - 2] == "  if (termination_signal != 0) {" &&
+            line[preparation_signal - 1] == "    (void)kill(child, termination_signal);" &&
+            preparation_active < preparation_signal && preparation_signal < controlled &&
+            controlled < controlled_phase_check &&
+            controlled_phase_check < controlled_target_force &&
+            controlled_target_force < controlled_fork &&
+            controlled_fork < controlled_restore &&
+            controlled_restore < controlled_child_pid_guard &&
+            controlled_child_pid_guard < controlled_drop && controlled_drop < controlled_exec &&
+            controlled_exec < controlled_active &&
+            line[controlled_signal - 2] == "  if (termination_signal != 0) {" &&
+            line[controlled_signal - 1] == "    (void)kill(child, termination_signal);" &&
+            controlled_active < controlled_signal &&
+            wait_preparation < nonblocking_reap &&
+            nonblocking_reap < marker_check && marker_check < clean_reap &&
+            clean_reap < marker_remove && main_prepare < main_wait &&
+            line[main_signal_fence - 1] == "  if (termination_signal != 0) {" &&
+            line[main_signal_fence + 1] == "  }" &&
+            main_wait < main_signal_fence && main_signal_fence < main_pair &&
+            main_pair < main_a)) {
+        exit 1
+      }
+    }
+  ' <<<"$supervisor_source"
+}
+
+pid_reuse_java_preparation_order_is_safe() {
+  local -r probe_source="$1"
+
+  awk '
+    $0 == "    validateControlDirectory(config.controlDirectory());" {
+      validate = NR
+      validate_count++
+    }
+    $0 == "    awaitBridgeInitialization();" {
+      bridge = NR
+      bridge_count++
+    }
+    $0 == "    config = config.withTransport(selectedForcedTransport());" {
+      transport = NR
+      transport_count++
+    }
+    $0 == "    RuntimePrivilegeAttestation attestation = readRuntimePrivilegeAttestation();" {
+      privilege = NR
+      privilege_count++
+    }
+    $0 == "    if (config.phase().equals(PREPARE_PHASE)) {" {
+      prepare = NR
+      prepare_count++
+    }
+    index($0, "publish(config.controlDirectory(), \"prepare-ready\", preparationMarker(config))") {
+      marker = NR
+      marker_count++
+    }
+    $0 == "      return true;" {
+      if (!prepare_return) {
+        prepare_return = NR
+      } else {
+        phase_a_return = NR
+      }
+      true_return_count++
+    }
+    index($0, "config.phase().equals(\"A\") ? \"jvm-a-attestation\" : \"jvm-b-attestation\"") {
+      attestation_publish = NR
+      attestation_publish_count++
+    }
+    $0 == "    if (config.phase().equals(\"A\")) {" {
+      phase_a = NR
+      phase_a_count++
+    }
+    $0 == "      runPhaseA(config);" {
+      run_a = NR
+      run_a_count++
+    }
+    $0 == "    runPhaseB(config);" {
+      run_b = NR
+      run_b_count++
+    }
+    END {
+      if (validate_count != 1 || bridge_count != 1 || transport_count != 1 ||
+          privilege_count != 1 || prepare_count != 1 || marker_count != 1 ||
+          true_return_count != 2 || attestation_publish_count != 1 ||
+          phase_a_count != 1 || run_a_count != 1 || run_b_count != 1) {
+        exit 1
+      }
+      if (!(validate < bridge && bridge < transport && transport < privilege &&
+            privilege < prepare && prepare < marker && marker < prepare_return &&
+            prepare_return < attestation_publish && attestation_publish < phase_a &&
+            phase_a < run_a && run_a < phase_a_return && phase_a_return < run_b)) {
+        exit 1
+      }
+    }
+  ' <<<"$probe_source"
+}
+
 test_pid_reuse_static_overlay_and_build_wiring_are_exact() {
   local -r overlay="$TEST_SCRIPT_DIR/../docker-compose.pid-reuse.yml"
   local -r java_dockerfile="$TEST_SCRIPT_DIR/../java/Dockerfile"
@@ -25219,10 +25528,19 @@ test_pid_reuse_static_overlay_and_build_wiring_are_exact() {
   local -r java_probe_source="$TEST_SCRIPT_DIR/../java/src/main/java/io/opentelemetry/obi/examples/PidReuseProbe.java"
   local -r supervisor_source="$TEST_SCRIPT_DIR/../java/pidreuse/pid_reuse_supervisor.c"
   local -r production_source="$TEST_SCRIPT_DIR/../../../pkg/internal/ebpf/tpinjector/java_remote_parent.go"
+  local a_before_reap_mutation=""
   local backend_main=""
+  local controlled_start_signal_mutation=""
+  local controlled_restore_mutation=""
+  local create_before_prepare_mutation=""
   local probe_block=""
+  local probe_contents=""
+  local signal_fence_mutation=""
+  local start_signal_mutation=""
   local mutation=""
   local overlay_contents=""
+  local supervisor_contents=""
+  local target_force_mutation=""
 
   overlay_contents="$(<"$overlay")" || return 1
   [[ "$overlay_contents" != *'${'* && \
@@ -25295,6 +25613,73 @@ test_pid_reuse_static_overlay_and_build_wiring_are_exact() {
     "${backend_main/"$probe_block"/$'      if (PidReuseProbe.runIfConfigured()) {\n      }'}"; do
     if pid_reuse_backend_startup_order_is_safe "$mutation"; then
       printf 'PID reuse backend startup accepted a probe-order mutation\n' >&2
+      return 1
+    fi
+  done
+  probe_contents="$(<"$java_probe_source")" || return $?
+  if ! pid_reuse_java_preparation_order_is_safe "$probe_contents"; then
+    printf 'PID reuse Java preparation lost its attached privilege-checked fence\n' >&2
+    return 1
+  fi
+  for mutation in \
+    "${probe_contents/$'    awaitBridgeInitialization();\n'/}" \
+    "${probe_contents/$'    config = config.withTransport(selectedForcedTransport());\n'/}" \
+    "${probe_contents/$'    RuntimePrivilegeAttestation attestation = readRuntimePrivilegeAttestation();\n'/}" \
+    "${probe_contents/$'    RuntimePrivilegeAttestation attestation = readRuntimePrivilegeAttestation();\n    if (config.phase().equals(PREPARE_PHASE)) {'/$'    if (config.phase().equals(PREPARE_PHASE)) {\n      RuntimePrivilegeAttestation attestation = readRuntimePrivilegeAttestation();'}" \
+    "${probe_contents/$'      publish(config.controlDirectory(), "prepare-ready", preparationMarker(config));\n      return true;'/$'      publish(config.controlDirectory(), "prepare-ready", preparationMarker(config));'}" \
+    "${probe_contents/preparationMarker(config)/\"prepare-ready-v2\\n\"}"; do
+    if pid_reuse_java_preparation_order_is_safe "$mutation"; then
+      printf 'PID reuse Java accepted a preparation-fence mutation\n' >&2
+      return 1
+    fi
+  done
+  supervisor_contents="$(<"$supervisor_source")" || return $?
+  if ! pid_reuse_supervisor_preparation_order_is_safe "$supervisor_contents"; then
+    printf 'PID reuse supervisor lost its pre-socket preparatory JVM fence\n' >&2
+    return 1
+  fi
+  target_force_mutation="${supervisor_contents/$'  write_ns_last_pid(config->target_pid);\n'/}"
+  target_force_mutation="${target_force_mutation/$'  child = start_preparation_child(&config);'/$'  write_ns_last_pid(config.target_pid);\n  child = start_preparation_child(&config);'}"
+  create_before_prepare_mutation="${supervisor_contents/$'  create_tcp_pair(&client_socket, &peer_socket);\n'/}"
+  create_before_prepare_mutation="${create_before_prepare_mutation/$'  child = start_preparation_child(&config);'/$'  create_tcp_pair(&client_socket, &peer_socket);\n  child = start_preparation_child(&config);'}"
+  a_before_reap_mutation="${supervisor_contents/$'  wait_for_preparation_child(control_directory, child);\n'/}"
+  a_before_reap_mutation="${a_before_reap_mutation/$'  child = start_child(&config, "A", client_socket);'/$'  child = start_child(&config, "A", client_socket);\n  wait_for_preparation_child(control_directory, child);'}"
+  signal_fence_mutation="${supervisor_contents/$'  if (termination_signal != 0) {\n    fail_message("terminated after preparatory JVM readiness");\n  }\n'/}"
+  start_signal_mutation="${supervisor_contents/$'  if (termination_signal != 0) {\n    (void)kill(child, termination_signal);\n    fail_message("terminated while starting preparatory JVM");\n  }\n'/}"
+  controlled_start_signal_mutation="${supervisor_contents/$'  if (termination_signal != 0) {\n    (void)kill(child, termination_signal);\n    fail_message("terminated while starting controlled JVM");\n  }\n'/}"
+  controlled_restore_mutation="${supervisor_contents/$'  if (child == 0) {\n    restore_child_signal_dispositions();\n    if ((uint32_t)getpid() != config->target_pid'/$'  if (child == 0) {\n    if ((uint32_t)getpid() != config->target_pid'}"
+  [[ "$create_before_prepare_mutation" != "$supervisor_contents" &&
+    "$a_before_reap_mutation" != "$supervisor_contents" &&
+    "$signal_fence_mutation" != "$supervisor_contents" &&
+    "$start_signal_mutation" != "$supervisor_contents" &&
+    "$controlled_start_signal_mutation" != "$supervisor_contents" &&
+    "$controlled_restore_mutation" != "$supervisor_contents" &&
+    "$target_force_mutation" != "$supervisor_contents" ]] || {
+    printf 'PID reuse supervisor mutation setup did not change the source\n' >&2
+    return 1
+  }
+  for mutation in \
+    "$create_before_prepare_mutation" \
+    "$a_before_reap_mutation" \
+    "$signal_fence_mutation" \
+    "$start_signal_mutation" \
+    "$controlled_start_signal_mutation" \
+    "${supervisor_contents/$'    restore_child_signal_dispositions();\n'/}" \
+    "$controlled_restore_mutation" \
+    "${supervisor_contents/action.sa_handler = SIG_DFL;/action.sa_handler = handle_termination;}" \
+    "${supervisor_contents/$'    _exit(128 + termination_signal);\n'/}" \
+    "${supervisor_contents/static volatile sig_atomic_t active_child = -1;/static pid_t active_child = -1;}" \
+    "${supervisor_contents/$'    configure_preparation_environment(config);\n'/}" \
+    "${supervisor_contents/$'    drop_child_privileges();\n    execvp(config->child_argv[0], config->child_argv);'/$'    execvp(config->child_argv[0], config->child_argv);'}" \
+    "${supervisor_contents/$'    configure_preparation_environment(config);'/$'    configure_controlled_environment(config, "A");'}" \
+    "${supervisor_contents/$'!preparation_child_pid_is_safe(getpid(), config->target_pid) ||\n        '/}" \
+    "${supervisor_contents/$'    configure_preparation_environment(config);'/$'    write_ns_last_pid(config->target_pid);\n    configure_preparation_environment(config);'}" \
+    "${supervisor_contents/$'    configure_preparation_environment(config);'/$'    setenv("OBI_PID_REUSE_SOCKET_FD", "198", 1);\n    configure_preparation_environment(config);'}" \
+    "$target_force_mutation" \
+    "${supervisor_contents/PREPARE_MARKER_CONTENTS \"prepare-ready-v1\\n\"/PREPARE_MARKER_CONTENTS \"prepare-ready-v2\\n\"}" \
+    "${supervisor_contents/$'      remove_exact_control_file(directory_fd, PREPARE_MARKER_NAME,\n                                PREPARE_MARKER_CONTENTS);\n'/}"; do
+    if pid_reuse_supervisor_preparation_order_is_safe "$mutation"; then
+      printf 'PID reuse supervisor accepted a preparation-order mutation\n' >&2
       return 1
     fi
   done

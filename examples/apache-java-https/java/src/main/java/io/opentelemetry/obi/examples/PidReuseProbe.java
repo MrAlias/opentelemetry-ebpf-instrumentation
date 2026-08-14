@@ -32,6 +32,8 @@ import java.util.function.LongSupplier;
 
 /** Deterministic application-side half of the real numeric PID/TID reuse fixture. */
 final class PidReuseProbe {
+  private static final String PREPARE_PHASE = "PREPARE";
+  private static final String PREPARE_MARKER = "prepare-ready-v1\n";
   private static final Duration CONTROL_TIMEOUT = Duration.ofSeconds(120);
   private static final Duration POLL_INTERVAL = Duration.ofMillis(10);
   private static final int RECORD_SIZE = 64;
@@ -62,6 +64,10 @@ final class PidReuseProbe {
     awaitBridgeInitialization();
     config = config.withTransport(selectedForcedTransport());
     RuntimePrivilegeAttestation attestation = readRuntimePrivilegeAttestation();
+    if (config.phase().equals(PREPARE_PHASE)) {
+      publish(config.controlDirectory(), "prepare-ready", preparationMarker(config));
+      return true;
+    }
     publish(
         config.controlDirectory(),
         config.phase().equals("A") ? "jvm-a-attestation" : "jvm-b-attestation",
@@ -148,26 +154,39 @@ final class PidReuseProbe {
     if (!any) {
       return null;
     }
-    if (!(phase != null
-        && (phase.equals("A") || phase.equals("B"))
-        && directory != null
-        && descriptor != null)) {
+    boolean preparation = PREPARE_PHASE.equals(phase);
+    boolean controlled = "A".equals(phase) || "B".equals(phase);
+    if (directory == null
+        || (!preparation && !controlled)
+        || (preparation && descriptor != null)
+        || (controlled && descriptor == null)) {
       throw new IllegalArgumentException("PID reuse probe environment is incomplete or invalid");
     }
     Path path = Path.of(directory);
     if (!path.isAbsolute() || !path.normalize().equals(path) || directory.endsWith("/")) {
       throw new IllegalArgumentException("PID reuse control directory must be an absolute clean path");
     }
-    int fd;
-    try {
-      fd = Integer.parseUnsignedInt(descriptor);
-    } catch (NumberFormatException failure) {
-      throw new IllegalArgumentException("PID reuse socket descriptor is invalid", failure);
-    }
-    if (fd < 3) {
-      throw new IllegalArgumentException("PID reuse socket descriptor must be at least 3");
+    int fd = -1;
+    if (controlled) {
+      try {
+        fd = Integer.parseUnsignedInt(descriptor);
+      } catch (NumberFormatException failure) {
+        throw new IllegalArgumentException("PID reuse socket descriptor is invalid", failure);
+      }
+      if (fd < 3) {
+        throw new IllegalArgumentException("PID reuse socket descriptor must be at least 3");
+      }
     }
     return new Config(phase, path, "", fd);
+  }
+
+  static String preparationMarker(Config config) {
+    if (!config.phase().equals(PREPARE_PHASE)
+        || config.socketFileDescriptor() != -1
+        || !(config.transport().equals("getsockopt") || config.transport().equals("unix"))) {
+      throw new IllegalStateException("PID reuse preparation state is invalid");
+    }
+    return PREPARE_MARKER;
   }
 
   private static void validateControlDirectory(Path directory) throws IOException {

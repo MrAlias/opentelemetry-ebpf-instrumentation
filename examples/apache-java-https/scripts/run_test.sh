@@ -24925,14 +24925,75 @@ test_pid_reuse_runtime_state_attestation_rejects_exit_and_pid_change() {
   done
 }
 
+pid_reuse_backend_startup_order_is_safe() {
+  local -r main_source="$1"
+
+  awk '
+    { line[NR] = $0 }
+    index($0, "NettyHttpsServer.start(") {
+      netty = NR
+      netty_count++
+    }
+    index($0, "TlsBoundaryHttpsServer.start(") {
+      tls_boundary = NR
+      tls_boundary_count++
+    }
+    $0 == "      server.start();" {
+      jetty = NR
+      jetty_count++
+    }
+    $0 == "      if (PidReuseProbe.runIfConfigured()) {" {
+      probe = NR
+      probe_count++
+    }
+    index($0, "Jetty HTTPS backend ready on") {
+      readiness = NR
+      readiness_count++
+    }
+    $0 == "      server.join();" {
+      join = NR
+      join_count++
+    }
+    $0 == "    } finally {" {
+      cleanup = NR
+      cleanup_count++
+    }
+    $0 == "      stop(server, nettyServer, tlsBoundaryServer, tlsBoundaryFixture);" {
+      stop = NR
+      stop_count++
+    }
+    END {
+      if (netty_count != 1 || tls_boundary_count != 1 || jetty_count != 1 ||
+          probe_count != 1 || readiness_count != 1 || join_count != 1 ||
+          cleanup_count != 1 || stop_count != 1) {
+        exit 1
+      }
+      if (!(netty < jetty && tls_boundary < jetty && jetty < probe &&
+            probe < readiness && readiness < join && join < cleanup &&
+            cleanup < stop)) {
+        exit 1
+      }
+      if (probe != jetty + 1 ||
+          line[probe + 1] != "        return;" ||
+          line[probe + 2] != "      }") {
+        exit 1
+      }
+    }
+  ' <<<"$main_source"
+}
+
 test_pid_reuse_static_overlay_and_build_wiring_are_exact() {
   local -r overlay="$TEST_SCRIPT_DIR/../docker-compose.pid-reuse.yml"
   local -r java_dockerfile="$TEST_SCRIPT_DIR/../java/Dockerfile"
+  local -r java_backend_source="$TEST_SCRIPT_DIR/../java/src/main/java/io/opentelemetry/obi/examples/ApacheJavaHttpsBackend.java"
   local -r tracecheck_dockerfile="$TEST_SCRIPT_DIR/../tracecheck/Dockerfile"
   local -r controller_source="$TEST_SCRIPT_DIR/../tracecheck/cmd/pidreuse/main.go"
   local -r java_probe_source="$TEST_SCRIPT_DIR/../java/src/main/java/io/opentelemetry/obi/examples/PidReuseProbe.java"
   local -r supervisor_source="$TEST_SCRIPT_DIR/../java/pidreuse/pid_reuse_supervisor.c"
   local -r production_source="$TEST_SCRIPT_DIR/../../../pkg/internal/ebpf/tpinjector/java_remote_parent.go"
+  local backend_main=""
+  local probe_block=""
+  local mutation=""
   local overlay_contents=""
 
   overlay_contents="$(<"$overlay")" || return 1
@@ -24976,6 +25037,29 @@ test_pid_reuse_static_overlay_and_build_wiring_are_exact() {
     printf 'PID reuse cleanup cadence or post-exec privilege attestation lost source binding\n' >&2
     return 1
   fi
+  backend_main="$(
+    awk '
+      $0 == "  public static void main(String[] args) throws Exception {" {
+        in_main = 1
+      }
+      in_main { print }
+      in_main && $0 == "  }" { exit }
+    ' "$java_backend_source"
+  )" || return $?
+  probe_block=$'      if (PidReuseProbe.runIfConfigured()) {\n        return;\n      }'
+  if ! pid_reuse_backend_startup_order_is_safe "$backend_main"; then
+    printf 'PID reuse probe no longer follows live listeners and precedes readiness\n' >&2
+    return 1
+  fi
+  for mutation in \
+    "${backend_main/"$probe_block"/}" \
+    "${backend_main/$'      server.start();\n'"$probe_block"/$probe_block$'\n      server.start();'}" \
+    "${backend_main/"$probe_block"/$'      if (PidReuseProbe.runIfConfigured()) {\n      }'}"; do
+    if pid_reuse_backend_startup_order_is_safe "$mutation"; then
+      printf 'PID reuse backend startup accepted a probe-order mutation\n' >&2
+      return 1
+    fi
+  done
   [[ "${#UNIX_GENERATION_FAULT_COMPOSE[@]}" == 12 && \
     "${UNIX_GENERATION_FAULT_COMPOSE[9]}" == "$PRIMARY_FAULT_COMPOSE_FILE" && \
     "${UNIX_GENERATION_FAULT_COMPOSE[11]}" == "$UNIX_GENERATION_FAULT_COMPOSE_FILE" && \

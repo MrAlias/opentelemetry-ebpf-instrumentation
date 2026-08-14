@@ -98,9 +98,6 @@ public final class ApacheJavaHttpsBackend {
   private ApacheJavaHttpsBackend() {}
 
   public static void main(String[] args) throws Exception {
-    if (PidReuseProbe.runIfConfigured()) {
-      return;
-    }
     int port =
         parsePort("HTTPS_PORT", environment("HTTPS_PORT", Integer.toString(DEFAULT_PORT)));
     int nettyPort =
@@ -184,6 +181,9 @@ public final class ApacheJavaHttpsBackend {
                           tlsBoundaryFixture),
                   "jetty-shutdown"));
       server.start();
+      if (PidReuseProbe.runIfConfigured()) {
+        return;
+      }
       System.out.printf(
           Locale.ROOT,
           "Jetty HTTPS backend ready on 127.0.0.1:%d with %s and HTTP/1.1%n",

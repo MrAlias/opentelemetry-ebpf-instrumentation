@@ -102,39 +102,38 @@ failure. The VM path is deterministically
 runner refuses to reuse an existing artifact directory, so a rerun cannot leave
 multiple candidates associated with one log.
 
-### Packaged-JVM JNI getsockopt microbenchmark
+### Packaged-JVM concurrent transport microbenchmark
 
-An additional opt-in fixture,
-`TestJavaRemoteParentPackagedJVMGetsockoptBenchmark`, closes one narrower
-measurement gap left by the Go transport benchmark. It starts the packaged OBI
-agent, creates a real Java `ServerSocket.accept()` socket, and records 256 miss
-and 256 hit samples after 16 per-series warmups. Each sample brackets exactly
-one call to `BootstrapNative.takeRemoteParent(fd, reusedByteArray)` with
-`System.nanoTime()`. The call crosses Java, JNI, the real kernel `getsockopt`,
-and the attached cgroup BPF program. Map staging, socket acknowledgement, and
-Go/Java command coordination are outside the timed region.
+The opt-in `TestJavaRemoteParentPackagedJVMTransportBenchmark` closes a
+narrower measurement gap left by the Go transport benchmark. It starts the
+packaged OBI agent and eight Java workers. Its 14 ordered series cover raw JNI
+and bridge/provider JNI scopes across `getsockopt` miss/hit/stale and Unix
+miss/hit/stale/timeout. Each series runs 16 warmup batches and 256 measurement
+batches, retaining 2,048 calls after 128 warmup calls. Each sample brackets one
+raw `BootstrapNative.takeRemoteParent` or bridge/provider
+`RemoteParentBridge.takeRemoteParent` call with `System.nanoTime()` and the
+same-thread allocated-byte counter. Staging, acknowledgement, and Go/Java
+coordination remain outside the timed region.
 
-The miss control is not the native `fd < 0` shortcut: the fixture first stages
-and acknowledges a generation on the accepted socket. It requires the exact
-staged process, incarnation, connection tuple, network namespace, and generation
-in the resulting socket negotiation before capturing the exact state, owner, and
-generation-index values and deleting only `java_remote_parent_state`.
-It asserts that the owner and generation index remain byte-for-byte unchanged
-before and after the timed call. The `StatusMissing` response must preserve the
-negotiated generation. After timing, the fixture restores the captured state
-exactly and invokes the existing full-generation cleanup. The hit control also
-requires the exact staged generation and verifies one-shot cleanup. Cleanup
-failures are fatal and prevent artifact publication.
+The `getsockopt` miss control is not the native `fd < 0` shortcut: it stages
+and acknowledges a generation on each accepted socket, requires the exact
+process, incarnation, connection tuple, network namespace, and generation,
+then deletes only `java_remote_parent_state`. Owner and generation-index values
+must remain byte-for-byte unchanged, and the missing response preserves the
+negotiated generation. Hit and stale controls likewise bind the exact staged
+generation and cleanup. Unix series use the production authenticated server
+and map handler; miss, hit, stale, and full-request timeout status accounting
+must match exactly. Cleanup failures are fatal and prevent publication.
 
-The schema-v1 artifact retains every measured nanosecond sample, recomputable
-p50/p95/p99 and total timed duration, exact hit/miss status counts, Java version
-and executable, kernel release, architecture, CPU model, logical CPU count,
-total memory, cgroup-v2 path, and declared JVM arguments. Retained provenance
-includes the Git revision plus a clean/dirty status hash and content-sensitive
-patch hash, the Go toolchain and opened test-binary identity, the opened agent
-descriptor's device/inode/size/SHA-256 identity, and SHA-256/size identities of
-the exact embedded cgroup-sockopt and sockops BPF byte blobs supplied to the
-loaders. It also records the target cgroup hierarchy and the effective
+The schema-v2 artifact retains every measured nanosecond sample and every
+same-worker allocated-byte and paired control sample, with recomputable totals
+and nearest-rank p50/p95/p99 values. It records all status counts; exact
+expected/observed Java, native, bridge, primary-BPF, Unix-server, and timeout
+calls; correctness; and each predeclared gate. Runtime and retained provenance
+include the Git revision and clean-tree hashes, Go toolchain, opened test-binary
+and agent device/inode/size/SHA-256 identities, exact embedded BPF blob
+SHA-256/size identities, Java/kernel/CPU/memory/cgroup facts, and declared JVM
+arguments. It also records the target cgroup hierarchy and the effective
 `BPF_F_QUERY_EFFECTIVE` chains for getsockopt, setsockopt, and sockops: attach
 type, intended loaded program ID/tag/name/type, effective program order and
 revision capability/value, and every ancestor's direct program IDs/tags plus
@@ -163,8 +162,8 @@ for every attach type and every cgroup in the hierarchy: a nonzero direct-query
 revision means supported, while zero means unsupported. The artifact claims
 revision-backed stability only when every direct query supports revisions.
 
-Immediately before releasing each timed JNI call and immediately after its
-response, the fixture requeries all three effective chains and every ancestor
+Immediately before releasing each concurrent timed batch and immediately after
+its responses, the fixture requeries all three effective chains and every ancestor
 and compares exact ordered program IDs/tags/names/types with the post-attach
 baseline. When every direct query across all three attach types and the full
 hierarchy establishes revision support, the artifact records
@@ -181,34 +180,34 @@ proof. A final matching snapshot is required before publication, and cleanup
 must restore the empty pre-attach topology: all three effective chains and every
 direct ancestor/target chain are empty.
 
-Retained `stability_checks` evidence binds these assertions to the actual call
-loop. It requires `expected_calls=544`, exactly 544 successful pre-call and 544
-successful post-call snapshots across warmup and measurement calls, and zero
-query errors or topology mismatches. The counters advance only after the real
-query and comparison path succeeds; missing observations or nonzero failure
-counters invalidate the artifact.
+Retained `stability_checks` evidence binds these assertions to the actual batch
+loop. It requires 3,808 expected batches, 13,056 expected primary calls,
+exactly 3,808 successful pre-batch and 3,808 successful post-batch snapshots,
+and zero query errors or topology mismatches. Counters advance only after the
+real query/comparison path succeeds; missing observations or failures
+invalidate the artifact.
 
 The Java child receives a fixed minimal environment (`HOME`, `LANG`, `LC_ALL`,
 `PATH`, `TMPDIR`, and `TZ`) rather than the root harness environment. The
 harness fails closed if loader or implicit-JVM controls such as `LD_PRELOAD`,
 `LD_AUDIT`, `LD_LIBRARY_PATH`, `JAVA_TOOL_OPTIONS`, `_JAVA_OPTIONS`,
 `JDK_JAVA_OPTIONS`, or `CLASSPATH` are present. The artifact records the exact
-allowlisted environment. Its predeclared exploratory PoC gate is p99 below 1 ms
-for both series. The writer publishes a structurally valid failed measurement
-before the test enforces that gate. Probe stdout is a closed protocol: any line
+allowlisted environment. The exploratory gates are p99 below 1 ms for
+`getsockopt`, p99 below 50 ms for non-timeout Unix, and timeout p50 at or above
+50 ms with p99 at or below 100 ms. The writer publishes a structurally valid
+failed measurement before enforcing those gates. Probe stdout is a closed protocol: any line
 whose prefix or fields do not match the next expected message, or any output
 after `DONE`, fails immediately. The harness also fails on scanner/read errors
 and requires a verified clean stdout EOF after `DONE` before it waits for the
 Java process.
 
-This fixture is deliberately single-threaded. It does not measure provider
-selection or record decoding, application instrumentation or request latency,
-Unix fallback, throughput, allocations, process/native resource growth, or
-concurrency or run-to-run variance. It supplies neither the concurrent
-acceptance evidence in issue #11 nor the allocation/resource-growth evidence
-in issues #20 and #37. The retained local upstream-host result below is focused
-non-acceptance evidence: it advances, but does not complete, the Java/JNI
-latency evidence for #11, #20, and #37.
+This is an eight-worker transport microbenchmark, not sustained application
+concurrency. It does not measure application instrumentation, request latency
+or throughput, process CPU, RSS/native/direct-memory, FD/thread/map growth,
+run-to-run variance, or native-sanitizer behavior. `ThreadMXBean` allocated-byte
+samples are bounded Java observations, not JFR/NMT or native-memory evidence.
+The retained result below is focused non-acceptance evidence: it advances
+issues #11, #18, #20, and #37 and closes none.
 
 Build the packaged agent first. On an otherwise idle privileged cgroup-v2 host,
 create a fresh artifact path in an existing owner-private directory and run:
@@ -220,12 +219,12 @@ cd ../../..
 
 benchmark_parent="$(mktemp -d)"
 chmod 700 "$benchmark_parent"
-artifact_path="$benchmark_parent/packaged-jvm-getsockopt.json"
+artifact_path="$benchmark_parent/packaged-jvm-transports.json"
 OBI_JAVA_REMOTE_PARENT_AGENT_JAR="$PWD/pkg/internal/java/build/obi-java-agent.jar" \
 OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK=1 \
 OBI_JAVA_REMOTE_PARENT_PACKAGED_JVM_BENCHMARK_ARTIFACT="$artifact_path" \
 go test -tags=privileged_tests ./pkg/internal/ebpf/tpinjector \
-  -run '^TestJavaRemoteParentPackagedJVMGetsockoptBenchmark$' -count=1 -v
+  -run '^TestJavaRemoteParentPackagedJVMTransportBenchmark$' -count=1 -v
 ```
 
 On a kernel where any direct cgroup query in the target hierarchy does not
@@ -258,12 +257,13 @@ go test ./pkg/internal/ebpf/tpinjector \
   -run '^TestValidatePackagedJVMBenchmarkArtifactFile$' -count=1 -v
 ```
 
-A sanitized [local upstream-host focused record](focused-validation/packaged-jvm-getsockopt-75aa1a06/README.md)
-retains 256 measured samples per series and passed both predeclared gates: miss
-p99 was 19,997 ns and hit p99 was 25,049 ns. The run has no public CI locator
-and is explicitly non-acceptance evidence. A retained RHEL 9 execution and the
-broader application, allocation, resource, concurrency, and variance evidence
-remain unmeasured.
+A sanitized [digest-pinned RHEL 9.6 focused record](focused-validation/packaged-jvm-transports-rhel96-a86faf01/README.md)
+retains all 14 schema-v2 raw-JNI and bridge/provider-JNI series. The
+eight-worker run retained 2,048 latency and paired thread-allocation/control
+samples per series; every series was correct and passed its predeclared gate.
+It is focused non-acceptance evidence. Sustained application throughput and
+latency, process/native resource growth, attributable map growth, CPU
+isolation, and run-to-run variance remain unmeasured.
 
 ## Comparison matrix
 
@@ -343,15 +343,15 @@ tracked source/build inputs are clean before and after the build, copies those
 exact blob-verified inputs into a private, Make-safe `/tmp` staging directory,
 and never passes the user-selected artifact path to Make. It retains the
 before/after source identity and copied binary, then removes the staging tree.
-Those percentiles do not include the in-JVM Java-to-native transition or application
-request processing and are not acceptance evidence. `lookup-paths.json`
-therefore remains `partial_with_explicit_gaps`: application state-map misses
-and in-JVM transition percentiles are not collected by that integrated
-harness. The separate packaged-JVM fixture above now has one sanitized
-[local upstream-host focused run](focused-validation/packaged-jvm-getsockopt-75aa1a06/README.md)
-for accepted-socket hit/miss JNI sampling. That local result is non-acceptance
-evidence, has no public CI locator, and does not fill the integrated harness or
-RHEL 9 cells. The integrated harness's embedded observations carry explicit
+Those percentiles do not include the in-JVM Java-to-native transition or
+application request processing and are not acceptance evidence.
+`lookup-paths.json` therefore remains `partial_with_explicit_gaps`: the
+integrated harness does not collect application state-map misses or in-JVM
+transition percentiles. The separate packaged-JVM fixture above has a
+sanitized [digest-pinned RHEL 9.6 focused run](focused-validation/packaged-jvm-transports-rhel96-a86faf01/README.md)
+for concurrent raw-JNI and bridge/provider-JNI `getsockopt` and Unix
+miss/hit/stale/timeout sampling. This focused result does not fill the
+integrated application harness. The integrated harness's embedded observations carry explicit
 root-relative `source_artifact` and `link_base` fields; validation requires each
 full standalone artifact and every linked provenance/result file to resolve
 under the retained output root.
@@ -539,7 +539,7 @@ into zeroes or treating successful harness completion as issue acceptance.
 
 The optional complete mode adds native transport/provider lookup percentiles
 and bounded pressure capacity/cleanup evidence as described above. It does not
-invoke the separate packaged-JVM JNI fixture or collect JFR/NMT
+invoke the separate packaged-JVM transport fixture or collect JFR/NMT
 allocation/native/direct-memory summaries, primary cgroup-sockopt program CPU,
 or BPF lock contention. Its capacity-rejection observation is not a general
 BPF map-insertion-failure counter, and its non-evicting-map check is not an
@@ -547,18 +547,17 @@ eviction-rate benchmark. Do not use the repository-wide
 `scripts/bpf-metrics-sampler.sh` for this harness: it changes a host-global BPF
 statistics sysctl and is not scoped to the demo project.
 
-The six sustained core cells and the optional observed-once path controls are
-not the complete matrix for the open fork issue linked above. End-to-end
-application state-map miss performance,
-retained and concurrent Java-to-native transition percentiles, sustained stale/timeout/pressure
-performance, attributable map growth, and native-memory evidence still require
-separate measurement before declaring the benchmark issue complete. The
-privileged Go transport artifact and the native deterministic fixture are
-complementary evidence; neither fills those application-workload cells. The
-checked-in
-[focused artifact](focused-validation/rhel96-kernel-sockopt-4fe50533/README.md)
-therefore does not turn the W3C row or any other application comparison-matrix
-row into a passed result.
+The six sustained core cells and optional observed-once path controls are not
+the complete matrix for the open fork issue linked above. The retained
+[packaged-JVM transport record](focused-validation/packaged-jvm-transports-rhel96-a86faf01/README.md)
+supplies bounded eight-worker Java-to-native and bridge/provider percentiles
+plus per-thread allocation observations. End-to-end application state-map-miss
+performance, sustained application stale/timeout/pressure performance,
+attributable map growth, native-memory evidence, CPU isolation, and run-to-run
+variance still require separate measurement before declaring the benchmark
+issue complete. The privileged Go transport artifact, native deterministic
+fixture, and packaged-JVM record are complementary evidence; none fills those
+application-workload cells or turns a comparison-matrix row into a pass.
 
 For focused runner iteration, use the same request count, repetitions, and
 seed for every mode:

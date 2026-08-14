@@ -24745,6 +24745,186 @@ test_pid_reuse_runtime_sandbox_is_exact_and_normalization_tolerant() {
   done
 }
 
+test_pid_reuse_runtime_pid_namespace_attestation_is_mutation_sensitive() {
+  local -r valid_snapshot=$'Name:\tpid-reuse-super\nTgid:\t31415\nPid:\t31415\nNStgid:\t31415\t1\nNSpid:\t31415\t1\n'
+  local -r nested_snapshot=$'Name:\tpid-reuse-super\nTgid:\t31415\nPid:\t31415\nNStgid:\t31415\t2718\t1\nNSpid:\t31415\t2718\t1\n'
+  local depth=""
+  local snapshot=""
+  local runtime_contract=""
+  local lifecycle_contract=""
+  local state_inspect_count=0
+
+  depth="$(
+    pid_reuse_supervisor_pid_namespace_depth_from_snapshot \
+      "$valid_snapshot" 31415
+  )" || return $?
+  [[ "$depth" == "2" ]] || {
+    printf 'PID reuse namespace attestation lost its host-to-private depth\n' >&2
+    return 1
+  }
+  depth="$(
+    pid_reuse_supervisor_pid_namespace_depth_from_snapshot \
+      "$nested_snapshot" 31415
+  )" || return $?
+  [[ "$depth" == "3" ]] || {
+    printf 'PID reuse namespace attestation rejected a valid nested host path\n' >&2
+    return 1
+  }
+
+  for snapshot in \
+    $'Name:\tpid-reuse-super\nTgid:\t31415\nPid:\t31415\nNStgid:\t31415\nNSpid:\t31415\n' \
+    $'Name:\tpid-reuse-super\nTgid:\t31415\nPid:\t31415\nNStgid:\t31415\t2\nNSpid:\t31415\t2\n' \
+    $'Name:\tpid-reuse-super\nTgid:\t31415\nPid:\t31415\nNStgid:\t2718\t1\nNSpid:\t2718\t1\n' \
+    $'Name:\tpid-reuse-super\nTgid:\t31416\nPid:\t31415\nNStgid:\t31415\t1\nNSpid:\t31415\t1\n' \
+    $'Name:\tpid-reuse-super\nTgid:\t31415\nPid:\t31416\nNStgid:\t31415\t1\nNSpid:\t31415\t1\n' \
+    $'Name:\tpid-reuse-super\nPid:\t31415\nNStgid:\t31415\t1\nNSpid:\t31415\t1\n' \
+    $'Name:\tpid-reuse-super\nTgid:\t31415\nNStgid:\t31415\t1\nNSpid:\t31415\t1\n' \
+    $'Name:\tpid-reuse-super\nTgid:\t31415\nPid:\t31415\nNStgid:\t31415\t1\n' \
+    $'Name:\tpid-reuse-super\nTgid:\t31415\nPid:\t31415\nNSpid:\t31415\t1\n' \
+    $'Name:\tpid-reuse-super\nTgid:\t31415\nPid:\t31415\nNStgid:\t31415\t1\nNStgid:\t31415\t1\nNSpid:\t31415\t1\n' \
+    $'Name:\tpid-reuse-super\nTgid:\t31415\nPid:\t31415\nNStgid:\t31415\t1\nNSpid:\t31415\t1\nNSpid:\t31415\t1\n' \
+    $'Name:\tpid-reuse-super\nTgid:\t31415\nPid:\t31415\nNStgid:\t31415\t2719\t1\nNSpid:\t31415\t2718\t1\n' \
+    $'Name:\tpid-reuse-super\nTgid:\t31415\nPid:\t31415\nNStgid:\t31415\tinvalid\t1\nNSpid:\t31415\tinvalid\t1\n' \
+    $'Name:\tpid-reuse-super\nTgid:\t31415\nPid:\t31415\nNStgid:\t31415\t0\t1\nNSpid:\t31415\t0\t1\n' \
+    $'Name:\tpid-reuse-super\nTgid:\t31415\nPid:\t31415\nNStgid:\t31415\t4294967296\t1\nNSpid:\t31415\t4294967296\t1\n'; do
+    if pid_reuse_supervisor_pid_namespace_depth_from_snapshot \
+      "$snapshot" 31415 >/dev/null 2>&1; then
+      printf 'PID reuse namespace attestation accepted an invalid status snapshot\n' >&2
+      return 1
+    fi
+  done
+  if pid_reuse_supervisor_pid_namespace_depth_from_snapshot \
+    "$valid_snapshot" 031415 >/dev/null 2>&1; then
+    printf 'PID reuse namespace attestation accepted a noncanonical Docker host PID\n' >&2
+    return 1
+  fi
+
+  runtime_contract="$(declare -f assert_pid_reuse_runtime_contract)" || return $?
+  lifecycle_contract="$(
+    declare -f pid_reuse_supervisor_namespace_attestation_from_snapshots
+  )" || return $?
+  state_inspect_count="$(
+    grep -oF -- "--format '{{json .State}}'" <<<"$runtime_contract" | wc -l
+  )" || return $?
+  [[ "$runtime_contract" == *'"/proc/$host_pid/status"'* &&
+    "$runtime_contract" == *'pid_reuse_supervisor_namespace_attestation_from_snapshots'* &&
+    "$runtime_contract" == *'identical multi-level NSpid/NStgid records ending in PID 1'* &&
+    "$state_inspect_count" == 2 &&
+    "$lifecycle_contract" == *'runtime_identity_after" == "$runtime_identity_before'* &&
+    "$lifecycle_contract" == *'pid_reuse_running_container_state_identity_from_snapshot'* &&
+    "$lifecycle_contract" == *'pid_reuse_supervisor_pid_namespace_depth_from_snapshot'* &&
+    "$runtime_contract" != *'"/proc/$host_pid/ns/pid"'* &&
+    "$runtime_contract" != *'/proc/self/ns/pid'* ]] || {
+    printf 'PID reuse runtime lost its ptrace-independent namespace attestation\n' >&2
+    return 1
+  }
+}
+
+test_pid_reuse_runtime_state_attestation_rejects_exit_and_pid_change() {
+  local -r started_at="2026-08-14T04:00:00.000000000Z"
+  local -r valid_state="{\"Status\":\"running\",\"Running\":true,\"Paused\":false,\"Restarting\":false,\"Dead\":false,\"Pid\":31415,\"StartedAt\":\"$started_at\"}"
+  local -r valid_status=$'Name:\tpid-reuse-super\nTgid:\t31415\nPid:\t31415\nNStgid:\t31415\t1\nNSpid:\t31415\t1\n'
+  local mutation=""
+  local identity=""
+  local attestation=""
+  local attestation_status=0
+
+  identity="$(
+    pid_reuse_running_container_state_identity_from_snapshot "$valid_state"
+  )" || return $?
+  [[ "$identity" == $'31415\t'"$started_at" ]] || {
+    printf 'PID reuse runtime state lost its stable process identity\n' >&2
+    return 1
+  }
+  for mutation in \
+    '.Status = "exited" | .Running = false | .Pid = 0' \
+    '.Paused = true' \
+    '.Restarting = true' \
+    '.Dead = true' \
+    '.Pid = 0' \
+    '.Pid = 31415.5' \
+    '.Pid = 4294967296' \
+    '.StartedAt = "0001-01-01T00:00:00Z"' \
+    'del(.Running)' \
+    'del(.StartedAt)'; do
+    if pid_reuse_running_container_state_identity_from_snapshot \
+      "$(jq -c "$mutation" <<<"$valid_state")" >/dev/null 2>&1; then
+      printf 'PID reuse runtime state accepted mutation: %s\n' "$mutation" >&2
+      return 1
+    fi
+  done
+  identity="$(
+    pid_reuse_running_container_state_identity_from_snapshot \
+      "$(jq -c '.Pid = 31416' <<<"$valid_state")"
+  )" || return $?
+  [[ "$identity" != $'31415\t'"$started_at" ]] || {
+    printf 'PID reuse runtime state did not expose a changed Docker PID\n' >&2
+    return 1
+  }
+  identity="$(
+    pid_reuse_running_container_state_identity_from_snapshot \
+      "$(jq -c '.StartedAt = "2026-08-14T04:01:00Z"' <<<"$valid_state")"
+  )" || return $?
+  [[ "$identity" != $'31415\t'"$started_at" ]] || {
+    printf 'PID reuse runtime state did not expose a changed start identity\n' >&2
+    return 1
+  }
+
+  attestation="$(
+    pid_reuse_supervisor_namespace_attestation_from_snapshots \
+      "$valid_state" "$valid_status" "$valid_state"
+  )" || return $?
+  [[ "$attestation" == $'31415\t2' ]] || {
+    printf 'PID reuse combined attestation lost its exact identity/depth\n' >&2
+    return 1
+  }
+  for mutation in \
+    'before-exited|10' \
+    'after-exited|11' \
+    'pid-changed|12' \
+    'start-changed|12' \
+    'status-invalid|13'; do
+    attestation_status=0
+    case "${mutation%%|*}" in
+      before-exited)
+        pid_reuse_supervisor_namespace_attestation_from_snapshots \
+          "$(jq -c '.Status = "exited" | .Running = false | .Pid = 0' \
+            <<<"$valid_state")" \
+          "$valid_status" "$valid_state" >/dev/null 2>&1 || \
+          attestation_status=$?
+        ;;
+      after-exited)
+        pid_reuse_supervisor_namespace_attestation_from_snapshots \
+          "$valid_state" "$valid_status" \
+          "$(jq -c '.Status = "exited" | .Running = false | .Pid = 0' \
+            <<<"$valid_state")" >/dev/null 2>&1 || attestation_status=$?
+        ;;
+      pid-changed)
+        pid_reuse_supervisor_namespace_attestation_from_snapshots \
+          "$valid_state" "$valid_status" \
+          "$(jq -c '.Pid = 31416' <<<"$valid_state")" \
+          >/dev/null 2>&1 || attestation_status=$?
+        ;;
+      start-changed)
+        pid_reuse_supervisor_namespace_attestation_from_snapshots \
+          "$valid_state" "$valid_status" \
+          "$(jq -c '.StartedAt = "2026-08-14T04:01:00Z"' \
+            <<<"$valid_state")" >/dev/null 2>&1 || attestation_status=$?
+        ;;
+      status-invalid)
+        pid_reuse_supervisor_namespace_attestation_from_snapshots \
+          "$valid_state" "${valid_status/NSpid:/NSpid-invalid:}" \
+          "$valid_state" >/dev/null 2>&1 || attestation_status=$?
+        ;;
+    esac
+    [[ "$attestation_status" == "${mutation#*|}" ]] || {
+      printf 'PID reuse combined attestation mutation %s returned %s\n' \
+        "${mutation%%|*}" "$attestation_status" >&2
+      return 1
+    }
+  done
+}
+
 test_pid_reuse_static_overlay_and_build_wiring_are_exact() {
   local -r overlay="$TEST_SCRIPT_DIR/../docker-compose.pid-reuse.yml"
   local -r java_dockerfile="$TEST_SCRIPT_DIR/../java/Dockerfile"
@@ -24918,6 +25098,8 @@ main() {
   test_pid_reuse_public_result_is_closed_and_mutation_sensitive
   test_pid_reuse_compose_model_is_exact_and_mutation_sensitive
   test_pid_reuse_runtime_sandbox_is_exact_and_normalization_tolerant
+  test_pid_reuse_runtime_pid_namespace_attestation_is_mutation_sensitive
+  test_pid_reuse_runtime_state_attestation_rejects_exit_and_pid_change
   test_pid_reuse_static_overlay_and_build_wiring_are_exact
   test_pid_reuse_controller_precedes_backend_readiness
   test_pid_reuse_dispatch_runs_only_recovered_basic

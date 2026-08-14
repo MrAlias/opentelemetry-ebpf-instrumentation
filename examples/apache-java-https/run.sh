@@ -4170,6 +4170,138 @@ run_pid_reuse_controller() {
   }
 }
 
+pid_reuse_supervisor_pid_namespace_depth_from_snapshot() {
+  local -r status_snapshot="$1"
+  local -r raw_host_pid="$2"
+  local host_pid=""
+
+  host_pid="$(
+    bounded_decimal "$raw_host_pid" "$MAX_UINT32_DECIMAL" false
+  )" || return $?
+  [[ "$host_pid" == "$raw_host_pid" ]] || return 1
+  LC_ALL=C awk \
+    -v expected_host_pid="$host_pid" \
+    -v maximum_pid="$MAX_UINT32_DECIMAL" '
+    function valid_pid(value) {
+      return value ~ /^[1-9][0-9]*$/ &&
+        (length(value) < length(maximum_pid) ||
+          (length(value) == length(maximum_pid) &&
+            ("p" value) <= ("p" maximum_pid)))
+    }
+    function same_pid(left, right) {
+      return ("p" left) == ("p" right)
+    }
+    $1 == "Pid:" {
+      pid_count++
+      if (NF != 2 || !valid_pid($2) ||
+        !same_pid($2, expected_host_pid)) {
+        invalid = 1
+      }
+      next
+    }
+    $1 == "Tgid:" {
+      tgid_count++
+      if (NF != 2 || !valid_pid($2) ||
+        !same_pid($2, expected_host_pid)) {
+        invalid = 1
+      }
+      next
+    }
+    $1 == "NSpid:" {
+      nspid_count++
+      nspid_depth = NF - 1
+      if (NF < 3 || !same_pid($2, expected_host_pid) ||
+        !same_pid($NF, "1")) {
+        invalid = 1
+      }
+      for (field = 2; field <= NF; field++) {
+        if (!valid_pid($field)) {
+          invalid = 1
+        }
+        nspid[field - 1] = $field
+      }
+      next
+    }
+    $1 == "NStgid:" {
+      nstgid_count++
+      nstgid_depth = NF - 1
+      if (NF < 3 || !same_pid($2, expected_host_pid) ||
+        !same_pid($NF, "1")) {
+        invalid = 1
+      }
+      for (field = 2; field <= NF; field++) {
+        if (!valid_pid($field)) {
+          invalid = 1
+        }
+        nstgid[field - 1] = $field
+      }
+      next
+    }
+    END {
+      if (invalid || pid_count != 1 || tgid_count != 1 ||
+        nspid_count != 1 || nstgid_count != 1 || nspid_depth < 2 ||
+        nstgid_depth != nspid_depth) {
+        exit 1
+      }
+      for (field = 1; field <= nspid_depth; field++) {
+        if (!same_pid(nspid[field], nstgid[field])) {
+          exit 1
+        }
+      }
+      print nspid_depth
+    }
+  ' <<<"$status_snapshot"
+}
+
+pid_reuse_running_container_state_identity_from_snapshot() {
+  local -r state_snapshot="$1"
+
+  jq -er '
+    if type == "object" and
+      .Status == "running" and
+      .Running == true and
+      .Paused == false and
+      .Restarting == false and
+      .Dead == false and
+      (.Pid |
+        type == "number" and . == floor and . >= 1 and . <= 4294967295) and
+      (.StartedAt |
+        type == "string" and length > 0 and
+        . != "0001-01-01T00:00:00Z")
+    then
+      "\(.Pid)\t\(.StartedAt)"
+    else
+      empty
+    end
+  ' <<<"$state_snapshot"
+}
+
+pid_reuse_supervisor_namespace_attestation_from_snapshots() {
+  local -r runtime_state_before="$1"
+  local -r status_snapshot="$2"
+  local -r runtime_state_after="$3"
+  local runtime_identity_before=""
+  local runtime_identity_after=""
+  local host_pid=""
+  local pid_namespace_depth=""
+
+  runtime_identity_before="$(
+    pid_reuse_running_container_state_identity_from_snapshot \
+      "$runtime_state_before"
+  )" || return 10
+  runtime_identity_after="$(
+    pid_reuse_running_container_state_identity_from_snapshot \
+      "$runtime_state_after"
+  )" || return 11
+  [[ "$runtime_identity_after" == "$runtime_identity_before" ]] || return 12
+  host_pid="${runtime_identity_before%%$'\t'*}"
+  pid_namespace_depth="$(
+    pid_reuse_supervisor_pid_namespace_depth_from_snapshot \
+      "$status_snapshot" "$host_pid"
+  )" || return 13
+  printf '%s\t%s\n' "$host_pid" "$pid_namespace_depth"
+}
+
 assert_pid_reuse_runtime_contract() {
   local java_container=""
   local privileged=""
@@ -4183,10 +4315,14 @@ assert_pid_reuse_runtime_contract() {
   local readonly_paths=""
   local entrypoint=""
   local mounts=""
+  local runtime_state_before=""
+  local runtime_state_after=""
+  local runtime_identity_before=""
+  local namespace_attestation=""
+  local namespace_attestation_status=0
   local host_pid=""
-  local namespace_pid=""
-  local java_pid_namespace=""
-  local host_pid_namespace=""
+  local status_snapshot=""
+  local pid_namespace_depth=""
 
   java_container="$(run_bounded 10 \
     "${COMPOSE[@]}" ps --quiet java-backend)" || return $?
@@ -4216,11 +4352,9 @@ assert_pid_reuse_runtime_contract() {
     --format '{{json .Config.Entrypoint}}' "$java_container")" || return $?
   mounts="$(run_bounded 10 docker inspect \
     --format '{{json .Mounts}}' "$java_container")" || return $?
-  host_pid="$(run_bounded 10 docker inspect \
-    --format '{{.State.Pid}}' "$java_container")" || return $?
 
   [[ "$privileged" == "false" && -z "$pid_mode" && "$user" == "0:0" && \
-    "$host_pid" =~ ^[1-9][0-9]*$ ]] || {
+    -n "$java_container" ]] || {
     log_error "PID reuse Java runtime lost its unprivileged private-PID topology"
     return 1
   }
@@ -4244,14 +4378,63 @@ assert_pid_reuse_runtime_contract() {
     [.[] | select(.Type == "volume" and
       .Destination == "/run/obi-demo/pid-reuse" and .RW == true)] | length == 1
   ' <<<"$mounts" >/dev/null || return 1
-  namespace_pid="$(awk '$1 == "NSpid:" { print $NF }' "/proc/$host_pid/status")" || return $?
-  java_pid_namespace="$(readlink "/proc/$host_pid/ns/pid")" || return $?
-  host_pid_namespace="$(readlink /proc/self/ns/pid)" || return $?
-  [[ "$namespace_pid" == "1" && \
-    "$java_pid_namespace" != "$host_pid_namespace" ]] || {
-    log_error "PID reuse supervisor is not PID 1 in a host-distinct PID namespace"
+  # NSpid is ordered from the namespace that mounted this host procfs into
+  # successively nested namespaces. A matching first value, at least one inner
+  # value, and a final value of 1 prove the live supervisor topology without a
+  # ptrace-gated /proc/<pid>/ns/pid dereference.
+  if ! runtime_state_before="$(run_bounded 10 docker inspect \
+    --format '{{json .State}}' "$java_container")"; then
+    log_error "could not inspect PID reuse Java supervisor state before namespace attestation"
+    return 1
+  fi
+  runtime_identity_before="$(
+    pid_reuse_running_container_state_identity_from_snapshot \
+      "$runtime_state_before"
+  )" || {
+    log_error "PID reuse Java supervisor was not running, unpaused, unrestarting, and live before namespace attestation"
     return 1
   }
+  host_pid="${runtime_identity_before%%$'\t'*}"
+  status_snapshot="$(<"/proc/$host_pid/status")" || {
+    log_error "could not read host proc status for PID reuse Java supervisor (host PID $host_pid)"
+    return 1
+  }
+  if ! runtime_state_after="$(run_bounded 10 docker inspect \
+    --format '{{json .State}}' "$java_container")"; then
+    log_error "could not inspect PID reuse Java supervisor state after namespace attestation"
+    return 1
+  fi
+  namespace_attestation="$(
+    pid_reuse_supervisor_namespace_attestation_from_snapshots \
+      "$runtime_state_before" "$status_snapshot" "$runtime_state_after"
+  )" || namespace_attestation_status=$?
+  case "$namespace_attestation_status" in
+    0)
+      ;;
+    10)
+      log_error "PID reuse Java supervisor state became invalid before namespace attestation"
+      return 1
+      ;;
+    11)
+      log_error "PID reuse Java supervisor was not running, unpaused, unrestarting, and live after namespace attestation"
+      return 1
+      ;;
+    12)
+      log_error "PID reuse Java supervisor changed Docker PID or start identity during namespace attestation"
+      return 1
+      ;;
+    13)
+      log_error "PID reuse supervisor status did not contain singular matching Pid/Tgid and identical multi-level NSpid/NStgid records ending in PID 1"
+      return 1
+      ;;
+    *)
+      log_error "PID reuse supervisor namespace attestation failed unexpectedly (status $namespace_attestation_status)"
+      return 1
+      ;;
+  esac
+  host_pid="${namespace_attestation%%$'\t'*}"
+  pid_namespace_depth="${namespace_attestation#*$'\t'}"
+  log_info "PID reuse supervisor namespace attestation: Docker host PID $host_pid maps through $pid_namespace_depth PID namespaces to inner PID 1"
 }
 
 start_stack() {

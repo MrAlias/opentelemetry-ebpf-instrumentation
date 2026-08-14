@@ -282,10 +282,14 @@ func TestJavaRemoteParentPackagedJVMTransportBenchmark(t *testing.T) {
 		serverPath := "-"
 		serverUID := uint64(0)
 		var serverCounters *packagedJVMBenchmarkUnixCounters
-		stopServer := func() {}
+		stopServer := func() error { return nil }
 		if spec.Transport == "unix" {
 			serverPath, serverCounters, stopServer = startPackagedJVMBenchmarkUnixServer(
-				t, &objects.BpfJavaRemoteParentMaps, spec.Outcome == "timeout",
+				t, ctx, setpriv, testBinary, &objects.BpfJavaRemoteParentMaps,
+				spec.Outcome == "timeout",
+			)
+			requirePackagedJVMBenchmarkUnixTransitionAuthority(
+				t, &objects.BpfJavaRemoteParentMaps, process,
 			)
 		}
 		_, err = fmt.Fprintf(
@@ -299,6 +303,12 @@ func TestJavaRemoteParentPackagedJVMTransportBenchmark(t *testing.T) {
 			"timeout_millis": strconv.Itoa(packagedJVMBenchmarkV2TimeoutMillis),
 			"server_uid":     strconv.FormatUint(serverUID, 10),
 		})
+		if serverCounters != nil {
+			serverCounters.requireExactConfiguration(t)
+			requirePackagedJVMBenchmarkUnixTransitionAuthority(
+				t, &objects.BpfJavaRemoteParentMaps, process,
+			)
+		}
 
 		observation := packagedJVMBenchmarkV2SeriesObservation{
 			Spec:                   spec,
@@ -518,7 +528,7 @@ func TestJavaRemoteParentPackagedJVMTransportBenchmark(t *testing.T) {
 				packagedJVMBenchmarkV2Concurrency*(packagedJVMBenchmarkWarmupIterations+packagedJVMBenchmarkMeasurementIterations),
 			)
 		}
-		stopServer()
+		require.NoError(t, stopServer())
 		observations = append(observations, observation)
 	}
 
@@ -644,29 +654,48 @@ type packagedJVMBenchmarkWorker struct {
 }
 
 type packagedJVMBenchmarkUnixCounters struct {
-	mu       sync.Mutex
-	statuses [14]uint64
+	mu                sync.Mutex
+	takeStatuses      [14]uint64
+	negotiateStatuses [14]uint64
 }
 
 func (counters *packagedJVMBenchmarkUnixCounters) observe(
 	operation javabridge.Operation,
 	status javabridge.Status,
 ) {
-	if operation != javabridge.OperationTake || status > javabridge.StatusDisabled {
+	if status > javabridge.StatusDisabled {
 		return
 	}
 	counters.mu.Lock()
 	defer counters.mu.Unlock()
-	counters.statuses[status]++
+	switch operation {
+	case javabridge.OperationTake:
+		counters.takeStatuses[status]++
+	case javabridge.OperationNegotiate:
+		counters.negotiateStatuses[status]++
+	}
 }
 
 func (counters *packagedJVMBenchmarkUnixCounters) status(status int) uint64 {
 	counters.mu.Lock()
 	defer counters.mu.Unlock()
-	if status < 0 || status >= len(counters.statuses) {
+	if status < 0 || status >= len(counters.takeStatuses) {
 		return 0
 	}
-	return counters.statuses[status]
+	return counters.takeStatuses[status]
+}
+
+func (counters *packagedJVMBenchmarkUnixCounters) requireExactConfiguration(t *testing.T) {
+	t.Helper()
+	counters.mu.Lock()
+	defer counters.mu.Unlock()
+	for status, count := range counters.negotiateStatuses {
+		if status == int(javabridge.StatusMissing) {
+			require.Equal(t, uint64(1), count, "unexpected Unix configuration status count")
+		} else {
+			require.Zero(t, count, "unexpected Unix configuration status %d", status)
+		}
+	}
 }
 
 func (counters *packagedJVMBenchmarkUnixCounters) requireExactTakes(
@@ -677,7 +706,7 @@ func (counters *packagedJVMBenchmarkUnixCounters) requireExactTakes(
 	t.Helper()
 	counters.mu.Lock()
 	defer counters.mu.Unlock()
-	for status, count := range counters.statuses {
+	for status, count := range counters.takeStatuses {
 		if status == expectedStatus {
 			require.Equal(t, uint64(expected), count, "unexpected Unix server status count")
 		} else {
@@ -722,16 +751,327 @@ func (packagedJVMBenchmarkTimeoutHandler) HandleAuthenticated(
 	return javabridge.Record{Status: javabridge.StatusTimeout}
 }
 
+type packagedJVMBenchmarkUnixSocketDirectoryFixture struct {
+	path              string
+	name              string
+	rootFD            int
+	childFD           int
+	socketFD          int
+	rootIdentity      unix.Stat_t
+	directoryIdentity unix.Stat_t
+	socketIdentity    unix.Stat_t
+	socketName        string
+}
+
+func newPackagedJVMBenchmarkUnixSocketDirectory(
+	t *testing.T,
+) (*packagedJVMBenchmarkUnixSocketDirectoryFixture, *packagedJVMBenchmarkTeardown) {
+	t.Helper()
+	rootFD, err := unix.Open(
+		packagedJVMBenchmarkUnixSocketRoot,
+		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC,
+		0,
+	)
+	require.NoError(t, err)
+	fixture := &packagedJVMBenchmarkUnixSocketDirectoryFixture{
+		rootFD: rootFD, childFD: -1, socketFD: -1,
+	}
+	setupComplete := false
+	defer func() {
+		if setupComplete {
+			return
+		}
+		if fixture.socketFD >= 0 {
+			_ = unix.Close(fixture.socketFD)
+		}
+		if fixture.childFD >= 0 {
+			_ = unix.Close(fixture.childFD)
+		}
+		if fixture.name != "" {
+			_ = unix.Unlinkat(fixture.rootFD, fixture.name, unix.AT_REMOVEDIR)
+		}
+		_ = unix.Close(fixture.rootFD)
+	}()
+
+	var rootBefore unix.Stat_t
+	require.NoError(t, unix.Fstat(fixture.rootFD, &rootBefore))
+	require.NoError(t, validatePackagedJVMBenchmarkUnixSocketRoot(rootBefore))
+	fixture.rootIdentity = rootBefore
+	fixture.path, err = os.MkdirTemp(
+		packagedJVMBenchmarkUnixSocketRoot, packagedJVMBenchmarkUnixSocketPrefix,
+	)
+	require.NoError(t, err)
+	require.Equal(t, packagedJVMBenchmarkUnixSocketRoot, filepath.Dir(fixture.path))
+	fixture.name = filepath.Base(fixture.path)
+	fixture.childFD, err = unix.Openat(
+		fixture.rootFD,
+		fixture.name,
+		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC,
+		0,
+	)
+	require.NoError(t, err)
+	require.NoError(t, unix.Fchown(fixture.childFD, 0, packagedJVMBenchmarkJavaID))
+	require.NoError(t, unix.Fchmod(fixture.childFD, 0o750))
+	require.NoError(t, unix.Fstat(fixture.childFD, &fixture.directoryIdentity))
+	var directoryEntry unix.Stat_t
+	require.NoError(t, unix.Fstatat(
+		fixture.rootFD, fixture.name, &directoryEntry, unix.AT_SYMLINK_NOFOLLOW,
+	))
+	require.NoError(t, validatePackagedJVMBenchmarkUnixSocketDirectoryIdentity(
+		fixture.directoryIdentity, directoryEntry,
+	))
+	var rootAfter unix.Stat_t
+	require.NoError(t, unix.Lstat(packagedJVMBenchmarkUnixSocketRoot, &rootAfter))
+	require.NoError(t, validatePackagedJVMBenchmarkUnixSocketRootIdentity(rootBefore, rootAfter))
+
+	removeDirectory := newPackagedJVMBenchmarkUnixDirectoryTeardown(
+		fixture.removeDirectoryIfSame,
+		fixture.requireDirectoryAbsent,
+		fixture.requireDirectoryUnlinked,
+		fixture.closeSocket,
+		fixture.closeChildDirectory,
+		fixture.closeRootDirectory,
+	)
+	t.Cleanup(func() {
+		if err := removeDirectory.Run(); err != nil {
+			t.Errorf("clean up packaged JVM Unix socket directory: %v", err)
+		}
+	})
+	setupComplete = true
+	return fixture, removeDirectory
+}
+
+func (fixture *packagedJVMBenchmarkUnixSocketDirectoryFixture) pinSocket(name string) error {
+	if name == "" || filepath.Base(name) != name || name == "." || name == ".." {
+		return fmt.Errorf("invalid packaged JVM Unix socket name %q", name)
+	}
+	socketFD, err := unix.Openat(
+		fixture.childFD, name, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0,
+	)
+	if err != nil {
+		return err
+	}
+	open := true
+	defer func() {
+		if open {
+			_ = unix.Close(socketFD)
+		}
+	}()
+	var pinned unix.Stat_t
+	if err := unix.Fstat(socketFD, &pinned); err != nil {
+		return err
+	}
+	var entry unix.Stat_t
+	if err := unix.Fstatat(fixture.childFD, name, &entry, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return err
+	}
+	if err := validatePackagedJVMBenchmarkUnixSocketIdentity(pinned, entry); err != nil {
+		return err
+	}
+	fixture.socketFD = socketFD
+	fixture.socketIdentity = pinned
+	fixture.socketName = name
+	open = false
+	return nil
+}
+
+func (fixture *packagedJVMBenchmarkUnixSocketDirectoryFixture) requireDirectoryBinding() error {
+	var pinned unix.Stat_t
+	if err := unix.Fstat(fixture.childFD, &pinned); err != nil {
+		return err
+	}
+	if err := validatePackagedJVMBenchmarkUnixSocketDirectoryIdentity(
+		fixture.directoryIdentity, pinned,
+	); err != nil {
+		return packagedJVMBenchmarkPermanentTeardownFailure(err)
+	}
+	var entry unix.Stat_t
+	if err := unix.Fstatat(
+		fixture.rootFD, fixture.name, &entry, unix.AT_SYMLINK_NOFOLLOW,
+	); err != nil {
+		return err
+	}
+	if err := validatePackagedJVMBenchmarkUnixSocketDirectoryIdentity(
+		fixture.directoryIdentity, entry,
+	); err != nil {
+		return packagedJVMBenchmarkPermanentTeardownFailure(err)
+	}
+	return nil
+}
+
+func (fixture *packagedJVMBenchmarkUnixSocketDirectoryFixture) removeSocketIfSame() error {
+	if fixture.socketFD < 0 || fixture.socketName == "" {
+		return packagedJVMBenchmarkPermanentTeardownFailure(
+			errors.New("packaged JVM Unix socket identity was not pinned"),
+		)
+	}
+	if err := fixture.requireDirectoryBinding(); err != nil {
+		return err
+	}
+	var pinned unix.Stat_t
+	if err := unix.Fstat(fixture.socketFD, &pinned); err != nil {
+		return err
+	}
+	if err := validatePackagedJVMBenchmarkUnixSocketIdentity(
+		fixture.socketIdentity, pinned,
+	); err != nil {
+		return packagedJVMBenchmarkPermanentTeardownFailure(err)
+	}
+	var entry unix.Stat_t
+	err := unix.Fstatat(
+		fixture.childFD, fixture.socketName, &entry, unix.AT_SYMLINK_NOFOLLOW,
+	)
+	if errors.Is(err, unix.ENOENT) {
+		return fixture.requireSocketUnlinked()
+	}
+	if err != nil {
+		return err
+	}
+	return removePackagedJVMBenchmarkUnixEntryIfSame(
+		fixture.socketIdentity,
+		entry,
+		validatePackagedJVMBenchmarkUnixSocketIdentity,
+		func() error {
+			if err := unix.Unlinkat(fixture.childFD, fixture.socketName, 0); err != nil {
+				return err
+			}
+			return fixture.requireSocketAbsentAndUnlinked()
+		},
+	)
+}
+
+func (fixture *packagedJVMBenchmarkUnixSocketDirectoryFixture) requireSocketAbsentAndUnlinked() error {
+	var entry unix.Stat_t
+	err := unix.Fstatat(
+		fixture.childFD, fixture.socketName, &entry, unix.AT_SYMLINK_NOFOLLOW,
+	)
+	if !errors.Is(err, unix.ENOENT) {
+		if err != nil {
+			return err
+		}
+		return errors.New("packaged JVM Unix socket path remains present")
+	}
+	return fixture.requireSocketUnlinked()
+}
+
+func (fixture *packagedJVMBenchmarkUnixSocketDirectoryFixture) requireSocketUnlinked() error {
+	var pinned unix.Stat_t
+	if err := unix.Fstat(fixture.socketFD, &pinned); err != nil {
+		return err
+	}
+	if err := validatePackagedJVMBenchmarkUnixSocketIdentity(
+		fixture.socketIdentity, pinned,
+	); err != nil {
+		return packagedJVMBenchmarkPermanentTeardownFailure(err)
+	}
+	if pinned.Nlink != 0 {
+		return fmt.Errorf("pinned packaged JVM Unix socket link count is %d, want 0", pinned.Nlink)
+	}
+	return nil
+}
+
+func (fixture *packagedJVMBenchmarkUnixSocketDirectoryFixture) removeDirectoryIfSame() error {
+	var rootCurrent unix.Stat_t
+	if err := unix.Fstat(fixture.rootFD, &rootCurrent); err != nil {
+		return err
+	}
+	if err := validatePackagedJVMBenchmarkUnixSocketRootIdentity(
+		fixture.rootIdentity, rootCurrent,
+	); err != nil {
+		return packagedJVMBenchmarkPermanentTeardownFailure(err)
+	}
+	var entry unix.Stat_t
+	err := unix.Fstatat(
+		fixture.rootFD, fixture.name, &entry, unix.AT_SYMLINK_NOFOLLOW,
+	)
+	if errors.Is(err, unix.ENOENT) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var pinned unix.Stat_t
+	if err := unix.Fstat(fixture.childFD, &pinned); err != nil {
+		return err
+	}
+	if err := validatePackagedJVMBenchmarkUnixSocketDirectoryIdentity(
+		fixture.directoryIdentity, pinned,
+	); err != nil {
+		return packagedJVMBenchmarkPermanentTeardownFailure(err)
+	}
+	return removePackagedJVMBenchmarkUnixEntryIfSame(
+		fixture.directoryIdentity,
+		entry,
+		validatePackagedJVMBenchmarkUnixSocketDirectoryIdentity,
+		func() error {
+			return unix.Unlinkat(fixture.rootFD, fixture.name, unix.AT_REMOVEDIR)
+		},
+	)
+}
+
+func (fixture *packagedJVMBenchmarkUnixSocketDirectoryFixture) requireDirectoryAbsent() error {
+	var entry unix.Stat_t
+	err := unix.Fstatat(
+		fixture.rootFD, fixture.name, &entry, unix.AT_SYMLINK_NOFOLLOW,
+	)
+	if errors.Is(err, unix.ENOENT) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return errors.New("packaged JVM Unix socket directory remains present")
+}
+
+func (fixture *packagedJVMBenchmarkUnixSocketDirectoryFixture) requireDirectoryUnlinked() error {
+	var pinned unix.Stat_t
+	if err := unix.Fstat(fixture.childFD, &pinned); err != nil {
+		return err
+	}
+	if err := validatePackagedJVMBenchmarkUnixSocketDirectoryIdentity(
+		fixture.directoryIdentity, pinned,
+	); err != nil {
+		return packagedJVMBenchmarkPermanentTeardownFailure(err)
+	}
+	if pinned.Nlink != 0 {
+		return fmt.Errorf("pinned packaged JVM Unix socket directory link count is %d, want 0", pinned.Nlink)
+	}
+	return nil
+}
+
+func (fixture *packagedJVMBenchmarkUnixSocketDirectoryFixture) closeSocket() error {
+	if fixture.socketFD < 0 {
+		return nil
+	}
+	fd := fixture.socketFD
+	fixture.socketFD = -1
+	return unix.Close(fd)
+}
+
+func (fixture *packagedJVMBenchmarkUnixSocketDirectoryFixture) closeChildDirectory() error {
+	fd := fixture.childFD
+	fixture.childFD = -1
+	return unix.Close(fd)
+}
+
+func (fixture *packagedJVMBenchmarkUnixSocketDirectoryFixture) closeRootDirectory() error {
+	fd := fixture.rootFD
+	fixture.rootFD = -1
+	return unix.Close(fd)
+}
+
 func startPackagedJVMBenchmarkUnixServer(
 	t *testing.T,
+	benchmarkCtx context.Context,
+	setpriv string,
+	testBinary *os.File,
 	maps *BpfJavaRemoteParentMaps,
 	timeout bool,
-) (string, *packagedJVMBenchmarkUnixCounters, func()) {
+) (string, *packagedJVMBenchmarkUnixCounters, func() error) {
 	t.Helper()
-	directory := t.TempDir()
-	require.NoError(t, os.Chown(directory, 0, packagedJVMBenchmarkJavaID))
-	require.NoError(t, os.Chmod(directory, 0o750))
-	socketPath := filepath.Join(directory, "bridge.sock")
+	socketDirectory, removeDirectory := newPackagedJVMBenchmarkUnixSocketDirectory(t)
+	const socketName = "bridge.sock"
+	socketPath := filepath.Join(socketDirectory.path, socketName)
 	counters := &packagedJVMBenchmarkUnixCounters{}
 	var handler javabridge.Handler = javabridge.NewMapHandler(
 		javaRemoteParentBenchmarkMaps(maps),
@@ -750,19 +1090,104 @@ func startPackagedJVMBenchmarkUnixServer(
 		Observe:       counters.observe,
 	}, handler)
 	require.NoError(t, err)
+	if err := socketDirectory.pinSocket(socketName); err != nil {
+		cleanupErr := errors.Join(server.Close(), removeDirectory.Run())
+		require.NoError(t, errors.Join(
+			fmt.Errorf("pin packaged JVM Unix socket identity: %w", err), cleanupErr,
+		))
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(ctx) }()
-	var once sync.Once
-	stop := func() {
-		once.Do(func() {
-			cancel()
-			require.NoError(t, server.Close())
-			require.NoError(t, <-done)
-		})
-	}
-	t.Cleanup(stop)
+	teardown := newPackagedJVMBenchmarkUnixServerTeardown(
+		cancel,
+		server.Close,
+		func() error { return <-done },
+		socketDirectory.removeSocketIfSame,
+		removeDirectory.Run,
+	)
+	stop := teardown.Run
+	t.Cleanup(func() {
+		if err := stop(); err != nil {
+			t.Errorf("clean up packaged JVM Unix server: %v", err)
+		}
+	})
+	requirePackagedJVMBenchmarkUnixSocketReachableAsJava(
+		t, benchmarkCtx, setpriv, testBinary, socketPath,
+	)
 	return socketPath, counters, stop
+}
+
+func requirePackagedJVMBenchmarkUnixSocketReachableAsJava(
+	t *testing.T,
+	ctx context.Context,
+	setpriv string,
+	testBinary *os.File,
+	socketPath string,
+) {
+	t.Helper()
+	command := exec.CommandContext(
+		ctx,
+		setpriv,
+		"--reuid="+strconv.Itoa(packagedJVMBenchmarkJavaID),
+		"--regid="+strconv.Itoa(packagedJVMBenchmarkJavaID),
+		"--clear-groups",
+		"--no-new-privs",
+		"--inh-caps=-all",
+		"--ambient-caps=-all",
+		"--bounding-set=-all",
+		"--",
+		"/proc/self/fd/3",
+		"-test.run=^TestJavaRemoteParentPackagedJVMUnixSocketCredentialProbe$",
+		"-test.count=1",
+	)
+	command.Dir = "/"
+	command.Env = append([]string{}, expectedPackagedJVMBenchmarkEnvironment...)
+	command.Env = append(
+		command.Env,
+		packagedJVMBenchmarkUnixProbeEnv+"=1",
+		packagedJVMBenchmarkUnixProbePathEnv+"="+socketPath,
+	)
+	command.ExtraFiles = []*os.File{testBinary}
+	output, err := command.CombinedOutput()
+	require.NoErrorf(t, err, "credential-dropped Unix socket reachability probe: %s", output)
+}
+
+func TestJavaRemoteParentPackagedJVMUnixSocketCredentialProbe(t *testing.T) {
+	if os.Getenv(packagedJVMBenchmarkUnixProbeEnv) != "1" {
+		t.Skip("credential-dropped packaged JVM Unix socket probe helper")
+	}
+	require.Equal(t, packagedJVMBenchmarkJavaID, os.Getuid())
+	require.Equal(t, packagedJVMBenchmarkJavaID, os.Geteuid())
+	require.Equal(t, packagedJVMBenchmarkJavaID, os.Getgid())
+	require.Equal(t, packagedJVMBenchmarkJavaID, os.Getegid())
+	socketPath := os.Getenv(packagedJVMBenchmarkUnixProbePathEnv)
+	require.NotEmpty(t, socketPath)
+	var stat unix.Stat_t
+	require.NoError(t, unix.Lstat(socketPath, &stat))
+	require.Equal(t, uint32(unix.S_IFSOCK), stat.Mode&unix.S_IFMT)
+	require.Zero(t, stat.Uid)
+	require.Equal(t, uint32(packagedJVMBenchmarkJavaID), stat.Gid)
+	require.Equal(t, uint32(0o660), stat.Mode&0o777)
+	require.NoError(t, unix.Access(socketPath, unix.R_OK|unix.W_OK))
+}
+
+func requirePackagedJVMBenchmarkUnixTransitionAuthority(
+	t *testing.T,
+	maps *BpfJavaRemoteParentMaps,
+	process BpfJavaRemoteParentPidKeyT,
+) {
+	t.Helper()
+	var capability uint64
+	require.NoError(t, maps.JavaAuthorizedProcesses.Lookup(process, &capability))
+	require.Equal(t, packagedJVMBenchmarkCapability, capability)
+	var incarnation uint64
+	require.NoError(t, maps.JavaProcessIncarnations.Lookup(process, &incarnation))
+	require.Equal(t, packagedJVMBenchmarkCapability, incarnation)
+	requireBenchmarkMapKeyAbsent(t, maps.JavaRetiredProcesses,
+		BpfJavaRemoteParentJavaRetiredProcessKeyT{
+			Process: process, ProcessIncarnation: packagedJVMBenchmarkCapability,
+		})
 }
 
 func packagedJVMBenchmarkExpectedCallsV2(

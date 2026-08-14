@@ -16,6 +16,8 @@ import java.nio.ByteOrder;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 
 class PidReuseProbeTest {
@@ -148,6 +150,99 @@ class PidReuseProbeTest {
     response = validRecord();
     response[56] = 1;
     assertFalse(PidReuseProbe.decodeRecord(1, response).valid());
+  }
+
+  @Test
+  void bridgeInitializationWaitsForLateBootstrapAttachAndFailsClosed() throws Exception {
+    AtomicInteger attempts = new AtomicInteger();
+    AtomicInteger sleeps = new AtomicInteger();
+    AtomicLong now = new AtomicLong();
+    PidReuseProbe.awaitBridgeInitialization(
+        (name, initialize, loader) -> {
+          assertEquals("io.opentelemetry.obi.java.ebpf.ThreadInfo", name);
+          assertTrue(initialize);
+          assertNull(loader);
+          int current = attempts.incrementAndGet();
+          if (current <= 2) {
+            throw new ClassNotFoundException("bootstrap helper not attached yet");
+          }
+          LateBridge.enabled = true;
+          LateBridge.incarnation = 42L;
+          return LateBridge.class;
+        },
+        10L,
+        now::get,
+        milliseconds -> {
+          assertEquals(10L, milliseconds);
+          sleeps.incrementAndGet();
+          now.incrementAndGet();
+        });
+    assertEquals(3, attempts.get());
+    assertEquals(2, sleeps.get());
+
+    AtomicInteger readinessAttempts = new AtomicInteger();
+    AtomicInteger readinessSleeps = new AtomicInteger();
+    AtomicLong readinessNow = new AtomicLong();
+    PidReuseProbe.awaitBridgeInitialization(
+        (name, initialize, loader) -> {
+          int current = readinessAttempts.incrementAndGet();
+          LateBridge.enabled = current >= 2;
+          LateBridge.incarnation = current == 2 ? 0L : 43L;
+          return LateBridge.class;
+        },
+        10L,
+        readinessNow::get,
+        milliseconds -> {
+          readinessSleeps.incrementAndGet();
+          readinessNow.incrementAndGet();
+        });
+    assertEquals(3, readinessAttempts.get());
+    assertEquals(2, readinessSleeps.get());
+
+    AtomicInteger missingAttempts = new AtomicInteger();
+    AtomicInteger missingSleeps = new AtomicInteger();
+    AtomicLong missingNow = new AtomicLong();
+    assertThrows(
+        IllegalStateException.class,
+        () ->
+            PidReuseProbe.awaitBridgeInitialization(
+                (name, initialize, loader) -> {
+                  missingAttempts.incrementAndGet();
+                  throw new ClassNotFoundException("bootstrap helper remains absent");
+                },
+                2L,
+                missingNow::get,
+                milliseconds -> {
+                  assertEquals(10L, milliseconds);
+                  missingSleeps.incrementAndGet();
+                  missingNow.incrementAndGet();
+                }));
+    assertEquals(3, missingAttempts.get());
+    assertEquals(2, missingSleeps.get());
+
+    AtomicInteger unexpectedSleeps = new AtomicInteger();
+    assertThrows(
+        NoSuchMethodException.class,
+        () ->
+            PidReuseProbe.awaitBridgeInitialization(
+                (name, initialize, loader) -> String.class,
+                10L,
+                () -> 0L,
+                milliseconds -> unexpectedSleeps.incrementAndGet()));
+    assertEquals(0, unexpectedSleeps.get());
+  }
+
+  static final class LateBridge {
+    static boolean enabled;
+    static long incarnation;
+
+    public static boolean isRemoteParentEnabled() {
+      return enabled;
+    }
+
+    public static long processIncarnation() {
+      return incarnation;
+    }
   }
 
   private static Map<String, String> validEnvironment() {

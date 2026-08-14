@@ -28,6 +28,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 
 /** Deterministic application-side half of the real numeric PID/TID reuse fixture. */
 final class PidReuseProbe {
@@ -186,20 +187,52 @@ final class PidReuseProbe {
   }
 
   private static void awaitBridgeInitialization() throws Exception {
-    Class<?> threadInfo =
-        Class.forName("io.opentelemetry.obi.java.ebpf.ThreadInfo", true, null);
-    Method enabled = threadInfo.getMethod("isRemoteParentEnabled");
-    Method incarnation = threadInfo.getMethod("processIncarnation");
-    long deadline = System.nanoTime() + CONTROL_TIMEOUT.toNanos();
+    awaitBridgeInitialization(
+        Class::forName, CONTROL_TIMEOUT.toNanos(), System::nanoTime, Thread::sleep);
+  }
+
+  static void awaitBridgeInitialization(
+      BootstrapClassLookup classLookup,
+      long timeoutNanos,
+      LongSupplier nanoTime,
+      PollSleeper sleeper)
+      throws Exception {
+    if (timeoutNanos <= 0L) {
+      throw new IllegalArgumentException("bridge initialization timeout must be positive");
+    }
+    long start = nanoTime.getAsLong();
     do {
-      boolean bridgeEnabled = Boolean.TRUE.equals(enabled.invoke(null));
-      long capability = ((Number) incarnation.invoke(null)).longValue();
-      if (bridgeEnabled && capability != 0L) {
-        return;
+      try {
+        Class<?> threadInfo =
+            classLookup.load("io.opentelemetry.obi.java.ebpf.ThreadInfo", true, null);
+        Method enabled = threadInfo.getMethod("isRemoteParentEnabled");
+        Method incarnation = threadInfo.getMethod("processIncarnation");
+        boolean bridgeEnabled = Boolean.TRUE.equals(enabled.invoke(null));
+        long capability = ((Number) incarnation.invoke(null)).longValue();
+        if (bridgeEnabled && capability != 0L) {
+          return;
+        }
+      } catch (ClassNotFoundException notAttachedYet) {
+        // OBI appends its helper classes to the bootstrap class path during
+        // dynamic attach. The controlled JVM can enter this probe first.
       }
-      Thread.sleep(POLL_INTERVAL.toMillis());
-    } while (System.nanoTime() < deadline);
+      if (nanoTime.getAsLong() - start >= timeoutNanos) {
+        break;
+      }
+      sleeper.sleep(POLL_INTERVAL.toMillis());
+    } while (true);
     throw new IllegalStateException("timed out waiting for the OBI remote-parent bridge");
+  }
+
+  @FunctionalInterface
+  interface BootstrapClassLookup {
+    Class<?> load(String name, boolean initialize, ClassLoader loader)
+        throws ClassNotFoundException;
+  }
+
+  @FunctionalInterface
+  interface PollSleeper {
+    void sleep(long milliseconds) throws InterruptedException;
   }
 
   private static String selectedForcedTransport() throws Exception {

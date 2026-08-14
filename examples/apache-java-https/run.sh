@@ -4006,7 +4006,7 @@ pid_reuse_compose_model_has_contract() {
       (($java.cap_add | map(sub("^CAP_"; "")) | sort) ==
         ["CHECKPOINT_RESTORE", "SETPCAP"]) and
       (($java.security_opt | sort) ==
-        ["no-new-privileges:true", "systempaths=unconfined"]) and
+        ["apparmor=unconfined", "no-new-privileges:true", "systempaths=unconfined"]) and
       ($java.entrypoint == [
         "/otel/pid-reuse-supervisor",
         "--control-dir", "/run/obi-demo/pid-reuse",
@@ -4116,13 +4116,24 @@ pid_reuse_result_has_contract() {
   ' "$input" >/dev/null
 }
 
-pid_reuse_java_security_options_have_contract() {
-  local -r input="$1"
+pid_reuse_java_sandbox_has_contract() {
+  local -r apparmor_profile="$1"
+  local -r security_options="$2"
+  local -r masked_paths="$3"
+  local -r readonly_paths="$4"
 
+  [[ -z "$apparmor_profile" || "$apparmor_profile" == "unconfined" ]] || return 1
   jq -e '
     type == "array" and
-    (sort == ["no-new-privileges:true", "systempaths=unconfined"])
-  ' <<<"$input" >/dev/null
+    (length == (unique | length)) and
+    ([.[] | select(. == "no-new-privileges:true")] | length == 1) and
+    all(.[];
+      . == "no-new-privileges:true" or
+      . == "systempaths=unconfined" or
+      . == "apparmor=unconfined")
+  ' <<<"$security_options" >/dev/null || return 1
+  jq -e 'type == "array" and length == 0' <<<"$masked_paths" >/dev/null || return 1
+  jq -e 'type == "array" and length == 0' <<<"$readonly_paths" >/dev/null
 }
 
 run_pid_reuse_controller() {
@@ -4166,7 +4177,10 @@ assert_pid_reuse_runtime_contract() {
   local user=""
   local cap_drop=""
   local cap_add=""
+  local apparmor_profile=""
   local security_options=""
+  local masked_paths=""
+  local readonly_paths=""
   local entrypoint=""
   local mounts=""
   local host_pid=""
@@ -4176,7 +4190,10 @@ assert_pid_reuse_runtime_contract() {
 
   java_container="$(run_bounded 10 \
     "${COMPOSE[@]}" ps --quiet java-backend)" || return $?
-  [[ -n "$java_container" ]] || return 1
+  [[ -n "$java_container" ]] || {
+    log_error "PID reuse Java supervisor is not running before the controller"
+    return 1
+  }
   privileged="$(run_bounded 10 docker inspect \
     --format '{{.HostConfig.Privileged}}' "$java_container")" || return $?
   pid_mode="$(run_bounded 10 docker inspect \
@@ -4187,8 +4204,14 @@ assert_pid_reuse_runtime_contract() {
     --format '{{json .HostConfig.CapDrop}}' "$java_container")" || return $?
   cap_add="$(run_bounded 10 docker inspect \
     --format '{{json .HostConfig.CapAdd}}' "$java_container")" || return $?
+  apparmor_profile="$(run_bounded 10 docker inspect \
+    --format '{{.AppArmorProfile}}' "$java_container")" || return $?
   security_options="$(run_bounded 10 docker inspect \
     --format '{{json .HostConfig.SecurityOpt}}' "$java_container")" || return $?
+  masked_paths="$(run_bounded 10 docker inspect \
+    --format '{{json .HostConfig.MaskedPaths}}' "$java_container")" || return $?
+  readonly_paths="$(run_bounded 10 docker inspect \
+    --format '{{json .HostConfig.ReadonlyPaths}}' "$java_container")" || return $?
   entrypoint="$(run_bounded 10 docker inspect \
     --format '{{json .Config.Entrypoint}}' "$java_container")" || return $?
   mounts="$(run_bounded 10 docker inspect \
@@ -4205,8 +4228,9 @@ assert_pid_reuse_runtime_contract() {
     <<<"$cap_drop" >/dev/null || return 1
   jq -e 'map(sub("^CAP_"; "")) | sort == ["CHECKPOINT_RESTORE", "SETPCAP"]' \
     <<<"$cap_add" >/dev/null || return 1
-  pid_reuse_java_security_options_have_contract "$security_options" || {
-    log_error "PID reuse Java runtime cannot write namespace-local ns_last_pid safely"
+  pid_reuse_java_sandbox_has_contract \
+    "$apparmor_profile" "$security_options" "$masked_paths" "$readonly_paths" || {
+    log_error "PID reuse Java runtime cannot access namespace-local ns_last_pid safely"
     return 1
   }
   jq -e '. == [
@@ -4311,6 +4335,7 @@ start_stack() {
       "OBI remote-parent bridge" \
       "$startup_since" || return $?
     if [[ "$SCENARIO" == "pid-reuse" ]]; then
+      assert_pid_reuse_runtime_contract || return $?
       run_pid_reuse_controller || return $?
     fi
     wait_for_log \
@@ -4380,9 +4405,6 @@ start_stack() {
   fi
   assert_apache_denies_java_diagnostics || return $?
   assert_runtime_contract "$runtime_contract_mode" || return $?
-  if [[ "$SCENARIO" == "pid-reuse" ]]; then
-    assert_pid_reuse_runtime_contract || return $?
-  fi
 }
 
 remaining_timeout_seconds() {

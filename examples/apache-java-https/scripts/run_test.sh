@@ -24632,7 +24632,11 @@ write_pid_reuse_compose_model_fixture() {
           user: "0:0",
           cap_drop: ["ALL"],
           cap_add: ["CHECKPOINT_RESTORE", "SETPCAP"],
-          security_opt: ["systempaths=unconfined", "no-new-privileges:true"],
+          security_opt: [
+            "systempaths=unconfined",
+            "apparmor=unconfined",
+            "no-new-privileges:true"
+          ],
           entrypoint: [
             "/otel/pid-reuse-supervisor",
             "--control-dir", "/run/obi-demo/pid-reuse",
@@ -24684,6 +24688,7 @@ test_pid_reuse_compose_model_is_exact_and_mutation_sensitive() {
     '.services["java-backend"].cap_add += ["SYS_ADMIN"]' \
     '.services["java-backend"].security_opt = ["no-new-privileges:true"]' \
     '.services["java-backend"].security_opt = ["systempaths=unconfined"]' \
+    '.services["java-backend"].security_opt -= ["apparmor=unconfined"]' \
     '.services["java-backend"].security_opt += ["seccomp=unconfined"]' \
     '.services["java-backend"].entrypoint[4] = "4243"' \
     '.services["java-backend"].volumes[0].read_only = true' \
@@ -24698,23 +24703,45 @@ test_pid_reuse_compose_model_is_exact_and_mutation_sensitive() {
   done
 }
 
-test_pid_reuse_runtime_security_options_are_exact() {
-  local security_options=""
+test_pid_reuse_runtime_sandbox_is_exact_and_normalization_tolerant() {
+  local apparmor_profile=""
+  local security_options='["no-new-privileges:true"]'
+  local masked_paths='[]'
+  local readonly_paths='[]'
+  local mutation=""
 
-  pid_reuse_java_security_options_have_contract \
-    '["systempaths=unconfined","no-new-privileges:true"]' || return 1
-  for security_options in \
-    'null' \
-    '[]' \
-    '["systempaths=unconfined"]' \
-    '["no-new-privileges:true"]' \
-    '["systempaths=unconfined","no-new-privileges:false"]' \
-    '["systempaths=unconfined","no-new-privileges:true","seccomp=unconfined"]'; do
-    if pid_reuse_java_security_options_have_contract "$security_options"; then
-      printf 'PID reuse runtime accepted security options: %s\n' \
-        "$security_options" >&2
+  pid_reuse_java_sandbox_has_contract \
+    "$apparmor_profile" "$security_options" "$masked_paths" "$readonly_paths" || return 1
+  pid_reuse_java_sandbox_has_contract unconfined \
+    '["apparmor=unconfined","no-new-privileges:true","systempaths=unconfined"]' \
+    "$masked_paths" "$readonly_paths" || return 1
+
+  for mutation in \
+    'apparmor|docker-default' \
+    'security|null' \
+    'security|[]' \
+    'security|["systempaths=unconfined"]' \
+    'security|["no-new-privileges:false"]' \
+    'security|["no-new-privileges:true","no-new-privileges:true"]' \
+    'security|["no-new-privileges:true","seccomp=unconfined"]' \
+    'masked|["/proc/sys"]' \
+    'readonly|["/proc/sys"]'; do
+    case "$mutation" in
+      apparmor\|*) apparmor_profile="${mutation#*|}" ;;
+      security\|*) security_options="${mutation#*|}" ;;
+      masked\|*) masked_paths="${mutation#*|}" ;;
+      readonly\|*) readonly_paths="${mutation#*|}" ;;
+    esac
+    if pid_reuse_java_sandbox_has_contract \
+      "$apparmor_profile" "$security_options" "$masked_paths" "$readonly_paths"; then
+      printf 'PID reuse runtime accepted sandbox mutation: %s\n' \
+        "$mutation" >&2
       return 1
     fi
+    apparmor_profile=""
+    security_options='["no-new-privileges:true"]'
+    masked_paths='[]'
+    readonly_paths='[]'
   done
 }
 
@@ -24731,7 +24758,7 @@ test_pid_reuse_static_overlay_and_build_wiring_are_exact() {
   overlay_contents="$(<"$overlay")" || return 1
   [[ "$overlay_contents" != *'${'* && \
     "$overlay_contents" == *$'cap_add:\n      - CHECKPOINT_RESTORE\n      - SETPCAP'* && \
-    "$overlay_contents" == *$'security_opt:\n      - systempaths=unconfined\n      - no-new-privileges:true'* && \
+    "$overlay_contents" == *$'security_opt:\n      - systempaths=unconfined\n      - apparmor=unconfined\n      - no-new-privileges:true'* && \
     "$overlay_contents" == *'/otel/pid-reuse-supervisor'* && \
     "$overlay_contents" == *'pid-reuse-control:/run/obi-demo/pid-reuse'* && \
     "$overlay_contents" == *'network_mode: none'* && \
@@ -24819,7 +24846,8 @@ test_pid_reuse_controller_precedes_backend_readiness() {
     $0 == "log:OBI remote-parent bridge" { bridge = NR }
     $0 == "pid-reuse:controller" { controller = NR }
     $0 == "log:external OTel extension" { extension = NR }
-    END { exit !(bridge > 0 && bridge < controller && controller < extension) }
+    $0 == "pid-reuse:runtime" { runtime = NR }
+    END { exit !(bridge > 0 && bridge < runtime && runtime < controller && controller < extension) }
   ' "$observed" || {
     printf 'PID reuse controller did not fence backend readiness\n' >&2
     return 1
@@ -24889,7 +24917,7 @@ main() {
   test_pid_reuse_arguments_are_exact
   test_pid_reuse_public_result_is_closed_and_mutation_sensitive
   test_pid_reuse_compose_model_is_exact_and_mutation_sensitive
-  test_pid_reuse_runtime_security_options_are_exact
+  test_pid_reuse_runtime_sandbox_is_exact_and_normalization_tolerant
   test_pid_reuse_static_overlay_and_build_wiring_are_exact
   test_pid_reuse_controller_precedes_backend_readiness
   test_pid_reuse_dispatch_runs_only_recovered_basic

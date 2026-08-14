@@ -9,11 +9,13 @@ services:
     cap_add:
       - CHECKPOINT_RESTORE
       - SETPCAP
-    # Docker otherwise masks /proc/sys read-only. This exposes the
-    # namespace-local ns_last_pid selector without making the container
+    # Docker otherwise masks /proc/sys read-only, while docker-default denies
+    # ns_last_pid even after that mask is removed. These two narrow overrides
+    # expose the namespace-local selector without making the container
     # privileged; no-new-privileges remains locked across the JVM exec.
     security_opt:
       - systempaths=unconfined
+      - apparmor=unconfined
       - no-new-privileges:true
     entrypoint:
       - /otel/pid-reuse-supervisor

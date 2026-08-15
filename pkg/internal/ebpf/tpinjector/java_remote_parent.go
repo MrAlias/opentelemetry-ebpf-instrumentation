@@ -397,8 +397,15 @@ func (p *Tracer) logJavaRemoteParentUnavailable(
 		message,
 		"stage", string(stage),
 		"reason", reason,
-		"error", err,
 	)
+	if err != nil {
+		p.log.Debug(
+			message,
+			"stage", string(stage),
+			"reason", reason,
+			"error", err,
+		)
+	}
 	return reason
 }
 
@@ -565,6 +572,10 @@ func (p *Tracer) javaRemoteParentFallbackEnabled() bool {
 func (p *Tracer) reportJavaRemoteParentReady(transport obi.JavaRemoteParentTransport) {
 	p.log.Info(
 		"Java remote parent bridge ready",
+		"transport", transport,
+	)
+	p.log.Debug(
+		"Java remote parent bridge ready details",
 		"transport", transport,
 		"socket_path", p.cfg.Java.RemoteParent.SocketPath,
 	)

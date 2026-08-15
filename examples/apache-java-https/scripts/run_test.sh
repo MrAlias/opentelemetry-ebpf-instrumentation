@@ -469,6 +469,72 @@ test_cleanup_failure_changes_successful_run_status() {
   }
 }
 
+test_cleanup_promoted_failure_seals_before_recovery() {
+  local -r result_dir="$TEST_TMP_DIR/cleanup-promoted-failure"
+  local cleanup_status=0
+
+  mkdir -p -- "$result_dir/phases/fault" "$result_dir/phases/recovery"
+  write_diagnostics_fixture \
+    "$result_dir/phases/fault/java-diagnostics.txt" 0 1 0 0 0 0
+  write_diagnostics_fixture \
+    "$result_dir/phases/recovery/java-diagnostics.txt" 1 0 0 1 0 0
+  printf 'recovery_required\n' \
+    >"$result_dir/primary-w3c-fault-recovery-required"
+  if (
+    PRESSURE_ACTIVE=false
+    RESULTS_ROOT="$TEST_TMP_DIR/cleanup-promoted-failure-results"
+    RESULT_DIR="$result_dir"
+    STACK_STARTED=false
+    KEEP_RUNNING=false
+    BRIDGE_RUNNING=true
+    MATCHING_BRIDGE_RUNNING=false
+    FAULT_BRIDGE_RUNNING=false
+    PRIMARY_FAULT_STACK_ACTIVE=false
+    TMP_DIR=""
+    RUN_STATUS=passed
+    ACCEPTANCE_EVIDENCE=true
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    PROJECT_GUARD_HELD=false
+    PROJECT_GUARD_STATUS_RELAY_PID=""
+    CLEANUP_SIGNAL_STATUS=0
+    record_last_java_diagnostics_phase fault || return 1
+    cleanup_security_processes() {
+      record_last_java_diagnostics_phase recovery || true
+    }
+    capture_evidence() {
+      record_last_java_diagnostics_phase recovery || true
+    }
+
+    cleanup 0
+  ) >/dev/null 2>&1; then
+    printf 'incomplete recovery marker preserved a successful cleanup status\n' >&2
+    return 1
+  else
+    cleanup_status=$?
+  fi
+  [[ "$cleanup_status" == 1 ]] || {
+    printf 'promoted cleanup failure returned status %s instead of 1\n' \
+      "$cleanup_status" >&2
+    return 1
+  }
+  jq -e '
+    .sealed == true and .available == true and .phase == "fault"
+  ' "$result_dir/terminal-java-diagnostics.json" >/dev/null || {
+    printf 'cleanup recovery replaced the promoted failure diagnostic boundary\n' >&2
+    return 1
+  }
+  jq -e '
+    .status == "failed" and .exit_status == 1 and
+    .java_bridge_diagnostics.phase == "fault"
+  ' "$result_dir/run-status.json" >/dev/null || {
+    printf 'promoted cleanup failure status and diagnostics diverged\n' >&2
+    return 1
+  }
+}
+
 test_primary_fault_recovery_marker_forces_cleanup_with_keep() {
   local -r result_dir="$TEST_TMP_DIR/primary-fault-recovery-marker"
   local -r down_marker="$result_dir/down"
@@ -630,6 +696,443 @@ test_run_status_publication_failure_changes_successful_exit() {
     printf 'cleanup retained a stale passing status after failed retry\n' >&2
     return 1
   fi
+}
+
+test_run_status_commit_failure_preserves_authoritative_status() {
+  local -r side_effect_dir="$TEST_TMP_DIR/run-status-commit-side-effect"
+  local -r side_effect_log="$side_effect_dir/cleanup.log"
+  local -r side_effect_holder="$side_effect_dir/holder.log"
+  local -r read_fault_dir="$TEST_TMP_DIR/run-status-commit-read-fault"
+  local -r read_fault_log="$read_fault_dir/cleanup.log"
+  local -r read_fault_holder="$read_fault_dir/holder.log"
+
+  mkdir -p -- "$side_effect_dir" "$read_fault_dir"
+  if ! (
+    PRESSURE_ACTIVE=false
+    FAULT_BRIDGE_RUNNING=false
+    MATCHING_BRIDGE_RUNNING=false
+    STACK_STARTED=false
+    RESULT_DIR="$side_effect_dir"
+    TMP_DIR=""
+    RUN_STATUS=passed
+    ACCEPTANCE_EVIDENCE=true
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    PROJECT_GUARD_STATUS_RELAY_PID=1
+    capture_evidence() { :; }
+    cleanup_security_processes() { :; }
+    publish_project_guard_holder_status_with_retries() {
+      printf '%s\n' "$1" >>"$side_effect_holder"
+    }
+    eval "$(declare -f commit_published_run_status | \
+      sed '1s/^commit_published_run_status /commit_published_run_status_original /')"
+    commit_published_run_status() {
+      commit_published_run_status_original || return $?
+      return 47
+    }
+
+    cleanup 0
+  ) >"$side_effect_log" 2>&1; then
+    printf 'post-unlink commit error changed the authoritative success\n' >&2
+    return 1
+  fi
+  [[ "$(<"$side_effect_holder")" == 0 &&
+    "$(stat -Lc '%h' -- "$side_effect_dir/run-status.json")" == 1 ]] || {
+    printf 'post-unlink commit error diverged from the holder status\n' >&2
+    return 1
+  }
+  jq -e '.status == "passed" and .exit_status == 0' \
+    "$side_effect_dir/run-status.json" >/dev/null || {
+    printf 'post-unlink commit error rewrote authoritative run evidence\n' >&2
+    return 1
+  }
+
+  if ! (
+    local holder_published=false
+    PRESSURE_ACTIVE=false
+    FAULT_BRIDGE_RUNNING=false
+    MATCHING_BRIDGE_RUNNING=false
+    STACK_STARTED=false
+    RESULT_DIR="$read_fault_dir"
+    TMP_DIR=""
+    RUN_STATUS=passed
+    ACCEPTANCE_EVIDENCE=true
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    PROJECT_GUARD_STATUS_RELAY_PID=1
+    capture_evidence() { :; }
+    cleanup_security_processes() { :; }
+    publish_project_guard_holder_status_with_retries() {
+      printf '%s\n' "$1" >>"$read_fault_holder" || return $?
+      holder_published=true
+    }
+    sha256sum() {
+      local target="${*: -1}"
+
+      if [[ "$holder_published" == true &&
+        ( "$target" == "$RESULT_DIR/run-status.json" ||
+          "$target" == "$RUN_STATUS_PUBLICATION_HANDLE" ) ]]; then
+        return 47
+      fi
+      command sha256sum "$@"
+    }
+
+    cleanup 0
+  ) >"$read_fault_log" 2>&1; then
+    printf 'pre-unlink commit read fault changed the authoritative success\n' >&2
+    return 1
+  fi
+  [[ "$(<"$read_fault_holder")" == 0 &&
+    "$(stat -Lc '%h' -- "$read_fault_dir/run-status.json")" == 2 ]] || {
+    printf 'pre-unlink commit read fault lost its verified ownership handle\n' >&2
+    return 1
+  }
+  jq -e '.status == "passed" and .exit_status == 0' \
+    "$read_fault_dir/run-status.json" >/dev/null || {
+    printf 'pre-unlink commit read fault rewrote authoritative run evidence\n' >&2
+    return 1
+  }
+}
+
+test_run_status_link_side_effect_failure_changes_successful_exit() {
+  local -r result_dir="$TEST_TMP_DIR/run-status-link-side-effect-failure"
+  local -r link_marker="$result_dir/link-side-effect"
+  local cleanup_status=0
+
+  mkdir -p -- "$result_dir"
+  if (
+    PRESSURE_ACTIVE=false
+    FAULT_BRIDGE_RUNNING=false
+    MATCHING_BRIDGE_RUNNING=false
+    STACK_STARTED=false
+    RESULT_DIR="$result_dir"
+    TMP_DIR=""
+    RUN_STATUS=passed
+    ACCEPTANCE_EVIDENCE=true
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    capture_evidence() { :; }
+    cleanup_security_processes() { :; }
+    ln() {
+      local destination="${*: -1}"
+
+      if [[ "$destination" == "$RESULT_DIR/run-status.json" &&
+        ! -e "$link_marker" ]]; then
+        command ln "$@" || return $?
+        : >"$link_marker" || return $?
+        return 79
+      fi
+      command ln "$@"
+    }
+
+    cleanup
+  ) >/dev/null 2>&1; then
+    printf 'run-status link side-effect failure preserved a successful exit\n' >&2
+    return 1
+  else
+    cleanup_status=$?
+  fi
+  [[ "$cleanup_status" == 79 && -f "$link_marker" ]] || {
+    printf 'run-status link side-effect failure returned the wrong status\n' >&2
+    return 1
+  }
+  jq -e '
+    .status == "failed" and .exit_status == 79 and
+    .failure_stage == "evidence-publication"
+  ' "$result_dir/run-status.json" >/dev/null || {
+    printf 'run-status link side effect retained stale passing evidence\n' >&2
+    return 1
+  }
+  [[ "$(stat -Lc '%h' -- "$result_dir/run-status.json")" == 1 ]] || {
+    printf 'run-status link side-effect recovery retained an ownership link\n' >&2
+    return 1
+  }
+}
+
+test_run_status_link_side_effect_with_verifier_fault_cannot_leave_stale_status() {
+  local -r result_dir="$TEST_TMP_DIR/run-status-link-side-effect-verifier-failure"
+  local -r link_marker="$result_dir/link-side-effect"
+  local cleanup_status=0
+
+  mkdir -p -- "$result_dir"
+  if (
+    PRESSURE_ACTIVE=false
+    FAULT_BRIDGE_RUNNING=false
+    MATCHING_BRIDGE_RUNNING=false
+    STACK_STARTED=false
+    RESULT_DIR="$result_dir"
+    TMP_DIR=""
+    RUN_STATUS=passed
+    ACCEPTANCE_EVIDENCE=true
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    capture_evidence() { :; }
+    cleanup_security_processes() { :; }
+    ln() {
+      local destination="${*: -1}"
+
+      if [[ "$destination" == "$RESULT_DIR/run-status.json" &&
+        ! -e "$link_marker" ]]; then
+        command ln "$@" || return $?
+        : >"$link_marker" || return $?
+        return 79
+      fi
+      command ln "$@"
+    }
+    stat() {
+      local target="${*: -1}"
+
+      if [[ -e "$link_marker" &&
+        ( "$target" == "$RESULT_DIR/run-status.json" ||
+          "$target" == "$RUN_STATUS_PUBLICATION_HANDLE" ) ]]; then
+        return 47
+      fi
+      command stat "$@"
+    }
+
+    cleanup 0
+  ) >/dev/null 2>&1; then
+    printf 'combined link/verifier failure preserved a successful exit\n' >&2
+    return 1
+  else
+    cleanup_status=$?
+  fi
+  [[ "$cleanup_status" == 79 && -e "$link_marker" ]] || {
+    printf 'combined link/verifier failure returned the wrong status\n' >&2
+    return 1
+  }
+  if [[ -e "$result_dir/run-status.json" ||
+    -L "$result_dir/run-status.json" ]]; then
+    printf 'combined link/verifier failure retained stale passing evidence\n' >&2
+    return 1
+  fi
+  if compgen -G "$result_dir/.run-status.*" >/dev/null; then
+    printf 'combined link/verifier failure retained an ownership handle\n' >&2
+    return 1
+  fi
+}
+
+test_run_status_post_link_verifier_failure_cannot_leave_stale_status() {
+  local -r result_dir="$TEST_TMP_DIR/run-status-post-link-verifier-failure"
+  local cleanup_status=0
+
+  mkdir -p -- "$result_dir"
+  if (
+    PRESSURE_ACTIVE=false
+    FAULT_BRIDGE_RUNNING=false
+    MATCHING_BRIDGE_RUNNING=false
+    STACK_STARTED=false
+    RESULT_DIR="$result_dir"
+    TMP_DIR=""
+    RUN_STATUS=passed
+    ACCEPTANCE_EVIDENCE=true
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    capture_evidence() { :; }
+    cleanup_security_processes() { :; }
+    stat() {
+      local target="${*: -1}"
+
+      if [[ "$target" == "$RESULT_DIR/run-status.json" ]]; then
+        return 47
+      fi
+      command stat "$@"
+    }
+
+    cleanup 0
+  ) >/dev/null 2>&1; then
+    printf 'post-link verifier failure preserved a successful exit\n' >&2
+    return 1
+  else
+    cleanup_status=$?
+  fi
+  [[ "$cleanup_status" == 1 &&
+    ! -e "$result_dir/run-status.json" &&
+    ! -L "$result_dir/run-status.json" ]] || {
+    printf 'post-link verifier failure retained stale passing evidence\n' >&2
+    return 1
+  }
+  if compgen -G "$result_dir/.run-status.*" >/dev/null; then
+    printf 'post-link verifier failure retained an ownership handle\n' >&2
+    return 1
+  fi
+}
+
+test_holder_failure_with_verifier_fault_cannot_leave_stale_status() {
+  local -r result_dir="$TEST_TMP_DIR/run-status-holder-verifier-failure"
+  local -r holder_log="$result_dir/holder.log"
+  local holder_failed=false
+  local cleanup_status=0
+
+  mkdir -p -- "$result_dir"
+  if (
+    PRESSURE_ACTIVE=false
+    FAULT_BRIDGE_RUNNING=false
+    MATCHING_BRIDGE_RUNNING=false
+    STACK_STARTED=false
+    RESULT_DIR="$result_dir"
+    TMP_DIR=""
+    RUN_STATUS=failed
+    ACCEPTANCE_EVIDENCE=false
+    FAILURE_STAGE=scenario
+    FAILURE_LINE=41
+    PROJECT_GUARD_STATUS_RELAY_PID=1
+    capture_evidence() { :; }
+    cleanup_security_processes() { :; }
+    publish_project_guard_holder_status_with_retries() {
+      printf '%s\n' "$1" >>"$holder_log" || return $?
+      if [[ "$holder_failed" == false ]]; then
+        holder_failed=true
+        return 79
+      fi
+    }
+    stat() {
+      local target="${*: -1}"
+
+      if [[ "$holder_failed" == true &&
+        ( "$target" == "$RESULT_DIR/run-status.json" ||
+          "$target" == "$RUN_STATUS_PUBLICATION_HANDLE" ) ]]; then
+        return 47
+      fi
+      command stat "$@"
+    }
+
+    cleanup 17
+  ) >/dev/null 2>&1; then
+    printf 'holder failure with verifier fault preserved the original status\n' >&2
+    return 1
+  else
+    cleanup_status=$?
+  fi
+  [[ "$cleanup_status" == 1 && "$(<"$holder_log")" == $'17\n1' ]] || {
+    printf 'holder failure with verifier fault diverged from relay fallback\n' >&2
+    return 1
+  }
+  if [[ -e "$result_dir/run-status.json" ||
+    -L "$result_dir/run-status.json" ]]; then
+    printf 'holder failure with verifier fault retained stale run evidence\n' >&2
+    return 1
+  fi
+  if compgen -G "$result_dir/.run-status.*" >/dev/null; then
+    printf 'holder failure with verifier fault retained an ownership handle\n' >&2
+    return 1
+  fi
+}
+
+test_project_guard_holder_retry_accepts_exact_side_effect() {
+  local -r control_dir="$TEST_TMP_DIR/project-guard-holder-side-effect"
+
+  mkdir -m 0700 -- "$control_dir"
+  (
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    PROJECT_GUARD_STATUS_RELAY_PID=101
+    PROJECT_GUARD_STATUS_RELAY_START_TIME=102
+    PROJECT_GUARD_STATUS_HOLDER_PID=103
+    PROJECT_GUARD_STATUS_HOLDER_START_TIME=104
+    publish_project_guard_holder_status() {
+      format_project_guard_holder_status_payload \
+        "$PROJECT_GUARD_STATUS_RELAY_PID" \
+        "$PROJECT_GUARD_STATUS_RELAY_START_TIME" \
+        "$PROJECT_GUARD_STATUS_HOLDER_PID" \
+        "$PROJECT_GUARD_STATUS_HOLDER_START_TIME" \
+        "$1" || return 1
+      printf '%s\n' "$PROJECT_GUARD_FORMATTED_HOLDER_STATUS" \
+        >"$PROJECT_GUARD_CONTROL_DIR/holder-status" || return $?
+      chmod 0600 -- "$PROJECT_GUARD_CONTROL_DIR/holder-status" || return $?
+      return 79
+    }
+
+    publish_project_guard_holder_status_with_retries 17 || return 1
+    project_guard_control_file_matches \
+      "$PROJECT_GUARD_CONTROL_DIR/holder-status" \
+      'holder-status:101:102:103:104:17'
+  ) || {
+    printf 'holder-status retry rejected an exact publish side effect\n' >&2
+    return 1
+  }
+}
+
+test_holder_atomic_side_effect_is_terminal_authority() {
+  local -r result_dir="$TEST_TMP_DIR/project-guard-holder-terminal-authority"
+  local -r guard_root="$TEST_TMP_DIR/project-guard-holder-terminal-root"
+  local -r control_dir="$guard_root/.terminal-handoff.sidefx"
+  local -r link_marker="$result_dir/holder-link-created"
+  local -r verifier_marker="$result_dir/holder-verifier-failed"
+
+  mkdir -p -- "$result_dir"
+  mkdir -p -- "$guard_root"
+  mkdir -m 0700 -- "$control_dir"
+  printf 'supervisor:101:102\n' >"$control_dir/supervisor"
+  printf 'supervisor-accepted:101:102\n' >"$control_dir/supervisor-accepted"
+  chmod 0600 -- \
+    "$control_dir/supervisor" "$control_dir/supervisor-accepted"
+
+  if ! (
+    PRESSURE_ACTIVE=false
+    FAULT_BRIDGE_RUNNING=false
+    MATCHING_BRIDGE_RUNNING=false
+    STACK_STARTED=false
+    RESULT_DIR="$result_dir"
+    TMP_DIR=""
+    RUN_STATUS=passed
+    ACCEPTANCE_EVIDENCE=true
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    PROJECT_GUARD_STATUS_RELAY_PID=101
+    PROJECT_GUARD_STATUS_RELAY_START_TIME=102
+    PROJECT_GUARD_STATUS_HOLDER_PID=103
+    PROJECT_GUARD_STATUS_HOLDER_START_TIME=104
+    PROJECT_GUARD_HOLDER_PUBLICATION_ATTEMPTED=false
+    capture_evidence() { :; }
+    cleanup_security_processes() { :; }
+    complete_project_guard_terminal_handoff() { :; }
+    project_guard_supervisor_identity_matches() { :; }
+    eval "$(declare -f project_guard_control_file_matches | \
+      sed '1s/^project_guard_control_file_matches /project_guard_control_file_matches_original /')"
+    project_guard_control_file_matches() {
+      if [[ "$1" == "$PROJECT_GUARD_CONTROL_DIR/holder-status" &&
+        -e "$link_marker" && ! -e "$verifier_marker" ]]; then
+        : >"$verifier_marker" || return $?
+        return 47
+      fi
+      project_guard_control_file_matches_original "$@"
+    }
+    env() {
+      local destination="${*: -1}"
+
+      if [[ "$destination" == "$PROJECT_GUARD_CONTROL_DIR/holder-status" &&
+        ! -e "$link_marker" ]]; then
+        command env "$@" || return $?
+        : >"$link_marker" || return $?
+        return 79
+      fi
+      command env "$@"
+    }
+
+    cleanup 0
+  ) >/dev/null 2>&1; then
+    printf 'holder atomic side effect changed the terminal worker status\n' >&2
+    return 1
+  fi
+  [[ -e "$link_marker" && -e "$verifier_marker" ]] || {
+    printf 'holder authority test did not exercise its publish/read failures\n' >&2
+    return 1
+  }
+  jq -e '.status == "passed" and .exit_status == 0' \
+    "$result_dir/run-status.json" >/dev/null || {
+    printf 'holder atomic side effect rewrote canonical run evidence\n' >&2
+    return 1
+  }
+  (
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    load_project_guard_holder_status 101 102 103 104
+    [[ "$PROJECT_GUARD_LOADED_HOLDER_STATUS" == 0 ]]
+  ) || {
+    printf 'relay parser rejected the committed holder authority\n' >&2
+    return 1
+  }
 }
 
 test_cleanup_only_invalidates_matching_project_evidence_before_down() {
@@ -2332,6 +2835,9 @@ test_primary_w3c_stale_control_restores_the_normal_ttls() {
       printf 'scenario:%s:%s:retention_ttl=%s:retrieval_ttl=%s\n' \
         "$1" "$SCENARIO_VARIANT" "$REMOTE_PARENT_TTL" "$REMOTE_PARENT_RETRIEVAL_TTL" >>"$observed"
     }
+    capture_terminal_java_diagnostics_recovery_boundary() { :; }
+    commit_terminal_java_diagnostics_recovery_boundary() { :; }
+    clear_terminal_java_diagnostics_recovery_boundary() { :; }
 
     run_primary_w3c_stale_control
     [[ "$REMOTE_PARENT_TTL" == "30s" && "$REMOTE_PARENT_RETRIEVAL_TTL" == "0s" && \
@@ -2366,6 +2872,9 @@ test_unix_w3c_stale_control_restores_the_normal_ttls() {
       printf 'scenario:%s:%s:retention_ttl=%s:retrieval_ttl=%s\n' \
         "$1" "$SCENARIO_VARIANT" "$REMOTE_PARENT_TTL" "$REMOTE_PARENT_RETRIEVAL_TTL" >>"$observed"
     }
+    capture_terminal_java_diagnostics_recovery_boundary() { :; }
+    commit_terminal_java_diagnostics_recovery_boundary() { :; }
+    clear_terminal_java_diagnostics_recovery_boundary() { :; }
 
     run_unix_w3c_stale_control
     [[ "$REMOTE_PARENT_TTL" == "30s" && "$REMOTE_PARENT_RETRIEVAL_TTL" == "0s" && \
@@ -2417,6 +2926,220 @@ test_unix_w3c_stale_control_recovers_after_a_failed_stale_assertion() {
   local -r expected=$'recreate:Unix W3C stale preparation:unix:retrieval_ttl=1ns\nscenario:unix-w3c-stale:retrieval_ttl=1ns\nrecreate:post-Unix W3C stale recovery:unix:retrieval_ttl=0s\nscenario:basic:retrieval_ttl=0s'
   [[ "$(<"$observed")" == "$expected" ]] || {
     printf 'Unix stale failure recovery changed:\n%s\n' "$(<"$observed")" >&2
+    return 1
+  }
+}
+
+test_direct_recovery_failures_retain_pre_recovery_diagnostics() {
+  local -r primary_dir="$TEST_TMP_DIR/direct-recovery-primary-stale"
+  local -r delayed_dir="$TEST_TMP_DIR/direct-recovery-delayed"
+  local -r fault_dir="$TEST_TMP_DIR/direct-recovery-w3c-fault"
+  local -r late_attach_dir="$TEST_TMP_DIR/direct-recovery-late-attach"
+  local -r w3c_match_dir="$TEST_TMP_DIR/direct-recovery-w3c-match"
+  local result_dir=""
+  local control_status=0
+
+  for result_dir in \
+    "$primary_dir" "$delayed_dir" "$fault_dir" \
+    "$late_attach_dir" "$w3c_match_dir"; do
+    mkdir -p -- "$result_dir/phases/fault" "$result_dir/phases/recovery"
+    write_diagnostics_fixture \
+      "$result_dir/phases/fault/java-diagnostics.txt" 0 1 0 0 0 0
+    write_diagnostics_fixture \
+      "$result_dir/phases/recovery/java-diagnostics.txt" 1 0 0 1 0 0
+  done
+
+  (
+    RESULT_DIR="$primary_dir"
+    TRANSPORT=getsockopt
+    SELECTED_TRANSPORT=getsockopt
+    REMOTE_PARENT_TTL=30s
+    REMOTE_PARENT_RETRIEVAL_TTL=0s
+    SCENARIO_VARIANT=""
+    recreate_instrumented_stack() { :; }
+    run_scenario() {
+      case "$1" in
+        primary-w3c-stale)
+          record_last_java_diagnostics_phase fault
+          ;;
+        basic)
+          record_last_java_diagnostics_phase recovery || return $?
+          return 47
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+    }
+    if run_primary_w3c_stale_control; then
+      return 1
+    else
+      control_status=$?
+    fi
+    [[ "$control_status" == 47 ]] || return 1
+    jq -e '.sealed == true and .available == true and .phase == "fault"' \
+      "$RESULT_DIR/terminal-java-diagnostics.json" >/dev/null
+  ) || {
+    printf 'primary stale recovery failure retained post-recovery diagnostics\n' >&2
+    return 1
+  }
+
+  (
+    local -i recreate_calls=0
+    RESULT_DIR="$delayed_dir"
+    SCENARIO=all
+    TRANSPORT=getsockopt
+    SCENARIO_VARIANT=""
+    export OTEL_BSP_SCHEDULE_DELAY_VALUE=750
+    export OTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED_VALUE=false
+    run_delayed_otlp_suppression_sequence() {
+      record_last_java_diagnostics_phase fault
+    }
+    recreate_instrumented_stack() {
+      ((recreate_calls += 1))
+      if ((recreate_calls == 2)); then
+        record_last_java_diagnostics_phase recovery || return $?
+        return 43
+      fi
+    }
+    if run_delayed_otlp_suppression_control; then
+      return 1
+    else
+      control_status=$?
+    fi
+    [[ "$control_status" == 43 ]] || return 1
+    jq -e '.sealed == true and .available == true and .phase == "fault"' \
+      "$RESULT_DIR/terminal-java-diagnostics.json" >/dev/null
+  ) || {
+    printf 'delayed OTLP restoration failure retained post-recovery diagnostics\n' >&2
+    return 1
+  }
+
+  (
+    RESULT_DIR="$fault_dir"
+    TRANSPORT=unix
+    SELECTED_TRANSPORT=unix
+    REPEAT_COUNT=1
+    COMPOSE=(docker compose)
+    FAULT_BRIDGE_RUNNING=false
+    stop_obi_for_no_state_control() { :; }
+    run_bounded() { :; }
+    wait_for_log() { :; }
+    sleep() { :; }
+    scenario_request_count() {
+      printf '%s\n' "$FAULT_REQUEST_COUNT"
+    }
+    run_scenario() {
+      [[ "$1" == "w3c-fault" ]] || return 1
+      record_last_java_diagnostics_phase fault
+    }
+    capture_w3c_fault_bridge_log() {
+      local -r output="$1"
+
+      if [[ "$FAULT_MODE" == "alternating" ]]; then
+        printf '%s\n' \
+          'operation=take status=stale' \
+          'operation=take status=malformed' >"$output"
+      else
+        printf 'operation=take status=%s\n' "$FAULT_MODE" >"$output"
+      fi
+    }
+    stop_w3c_fault_bridge() {
+      FAULT_BRIDGE_RUNNING=false
+    }
+    recreate_instrumented_stack() {
+      record_last_java_diagnostics_phase recovery || return $?
+      return 41
+    }
+    if run_w3c_fault_control; then
+      return 1
+    else
+      control_status=$?
+    fi
+    [[ "$control_status" == 41 ]] || return 1
+    jq -e '.sealed == true and .available == true and .phase == "fault"' \
+      "$RESULT_DIR/terminal-java-diagnostics.json" >/dev/null
+  ) || {
+    printf 'W3C fault recovery failure retained post-recovery diagnostics\n' >&2
+    return 1
+  }
+
+  (
+    RESULT_DIR="$late_attach_dir"
+    COMPOSE=(test-compose)
+    SCENARIO_VARIANT=""
+    BRIDGE_RUNNING=false
+    date() { printf 'late-attach-cursor\n'; }
+    stop_obi_for_no_state_control() { :; }
+    run_bounded() { :; }
+    wait_for_log() { :; }
+    wait_for_http() { :; }
+    assert_runtime_contract() { :; }
+    assert_selected_transport() { :; }
+    wait_for_apache_instrumentation() { :; }
+    wait_for_apache_instrumentation_drain() { :; }
+    wait_for_java_duplicate_suppression() { :; }
+    run_scenario() {
+      case "$1" in
+        fail-open)
+          record_last_java_diagnostics_phase fault
+          ;;
+        w3c-only)
+          :
+          ;;
+        restart)
+          record_last_java_diagnostics_phase recovery || return $?
+          return 53
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+    }
+    if run_late_attach_control; then
+      return 1
+    else
+      control_status=$?
+    fi
+    [[ "$control_status" == 53 ]] || return 1
+    jq -e '.sealed == true and .available == true and .phase == "fault"' \
+      "$RESULT_DIR/terminal-java-diagnostics.json" >/dev/null
+  ) || {
+    printf 'late-attach recovery failure retained post-recovery diagnostics\n' >&2
+    return 1
+  }
+
+  (
+    local -i recreate_calls=0
+    RESULT_DIR="$w3c_match_dir"
+    TRANSPORT=getsockopt
+    SELECTED_TRANSPORT=getsockopt
+    SCENARIO=all
+    KEEP_RUNNING=false
+    BRIDGE_RUNNING=true
+    recreate_instrumented_stack() {
+      ((recreate_calls += 1))
+      if ((recreate_calls == 2)); then
+        record_last_java_diagnostics_phase recovery || return $?
+        return 59
+      fi
+      SELECTED_TRANSPORT="$3"
+    }
+    stop_obi_for_no_state_control() { :; }
+    run_scenario() {
+      [[ "$1" == "w3c-match" ]] || return 1
+      record_last_java_diagnostics_phase fault
+    }
+    if run_w3c_match_control; then
+      return 1
+    else
+      control_status=$?
+    fi
+    [[ "$control_status" == 59 ]] || return 1
+    jq -e '.sealed == true and .available == true and .phase == "fault"' \
+      "$RESULT_DIR/terminal-java-diagnostics.json" >/dev/null
+  ) || {
+    printf 'W3C match recovery failure retained post-recovery diagnostics\n' >&2
     return 1
   }
 }
@@ -3063,6 +3786,9 @@ test_w3c_match_uses_controlled_unix_fixture() {
     run_scenario() {
       printf 'scenario:%s:%s:%s:%s\n' "$1" "$2" "$3" "$4" >>"$observed"
     }
+    capture_terminal_java_diagnostics_recovery_boundary() { :; }
+    commit_terminal_java_diagnostics_recovery_boundary() { :; }
+    clear_terminal_java_diagnostics_recovery_boundary() { :; }
 
     run_w3c_match_control
   )
@@ -6002,6 +6728,9 @@ test_delayed_otlp_suppression_control_restores_schedule_delay() {
       [[ "$1" == "basic" && "$SCENARIO_VARIANT" == "delayed-otlp-suppression" ]] || return 1
       printf 'scenario\n' >>"$observed"
     }
+    capture_terminal_java_diagnostics_recovery_boundary() { :; }
+    commit_terminal_java_diagnostics_recovery_boundary() { :; }
+    clear_terminal_java_diagnostics_recovery_boundary() { :; }
 
     run_delayed_otlp_suppression_control
     [[ "$OTEL_BSP_SCHEDULE_DELAY_VALUE" == "750" &&
@@ -10830,14 +11559,18 @@ test_pressure_unix_already_consumed_diagnostics_are_exact() {
 
 test_java_diagnostics_header_is_exact_and_piggybacked() {
   local -r result_dir="$TEST_TMP_DIR/java-diagnostics-boundary"
+  local RESULT_DIR="$result_dir"
   local -r calls="$result_dir/curl.calls"
   local -r expected="$result_dir/expected.txt"
-  local -r output="$result_dir/baseline.txt"
+  local -r output="$result_dir/phases/fault-baseline-before/java-diagnostics.txt"
+  local -r redirected_result="$TEST_TMP_DIR/java-diagnostics-boundary-redirected"
+  local -r redirected_target="$TEST_TMP_DIR/java-diagnostics-boundary-outside"
+  local -r collision_output="$result_dir/phases/header-collision/java-diagnostics.txt"
   local headers=""
   local invalid_output=""
   local snapshot=""
 
-  mkdir -p -- "$result_dir"
+  mkdir -p -- "$result_dir" "${output%/*}"
   write_diagnostics_fixture "$expected" 1 0 0 1 0 0
   snapshot="$(<"$expected")"
   (
@@ -10897,38 +11630,80 @@ test_java_diagnostics_header_is_exact_and_piggybacked() {
 
   headers="$result_dir/headers.txt"
   printf 'HTTP/1.1 200 OK\r\n\r\n' >"$headers"
-  invalid_output="$result_dir/missing.txt"
+  invalid_output="$result_dir/phases/header-missing/java-diagnostics.txt"
+  mkdir -p -- "${invalid_output%/*}"
   if extract_java_diagnostics_header "$headers" "$invalid_output" >/dev/null 2>&1; then
     printf 'diagnostics baseline accepted a missing response header\n' >&2
     return 1
   fi
   printf 'X-OBI-Java-Diagnostics: %s\r\nX-OBI-Java-Diagnostics: %s\r\n' \
     "$snapshot" "$snapshot" >"$headers"
-  invalid_output="$result_dir/duplicate.txt"
+  invalid_output="$result_dir/phases/header-duplicate/java-diagnostics.txt"
+  mkdir -p -- "${invalid_output%/*}"
   if extract_java_diagnostics_header "$headers" "$invalid_output" >/dev/null 2>&1; then
     printf 'diagnostics baseline accepted duplicate response headers\n' >&2
     return 1
   fi
   printf 'X-OBI-Java-Diagnostics: unavailable\r\n' >"$headers"
-  invalid_output="$result_dir/unavailable.txt"
+  invalid_output="$result_dir/phases/header-unavailable/java-diagnostics.txt"
+  mkdir -p -- "${invalid_output%/*}"
   if extract_java_diagnostics_header "$headers" "$invalid_output" >/dev/null 2>&1; then
     printf 'diagnostics baseline accepted unavailable response diagnostics\n' >&2
     return 1
   fi
 
   printf 'X-OBI-Java-Diagnostics: %s\r\n' "$snapshot" >"$headers"
-  invalid_output="$result_dir/existing.txt"
+  invalid_output="$result_dir/phases/header-existing/java-diagnostics.txt"
+  mkdir -p -- "${invalid_output%/*}"
   printf 'sentinel\n' >"$invalid_output"
   if extract_java_diagnostics_header "$headers" "$invalid_output" >/dev/null 2>&1 ||
     [[ "$(<"$invalid_output")" != "sentinel" ]]; then
     printf 'diagnostics baseline overwrote an existing artifact\n' >&2
     return 1
   fi
-  invalid_output="$result_dir/symlink.txt"
+  invalid_output="$result_dir/phases/header-symlink/java-diagnostics.txt"
+  mkdir -p -- "${invalid_output%/*}"
   ln -s -- "$expected" "$invalid_output"
   if extract_java_diagnostics_header "$headers" "$invalid_output" >/dev/null 2>&1 ||
     [[ ! -L "$invalid_output" ]]; then
     printf 'diagnostics baseline followed or replaced a symlink artifact\n' >&2
+    return 1
+  fi
+
+  mkdir -p -- "${collision_output%/*}"
+  if (
+    local inject_collision=true
+    ln() {
+      local destination="${*: -1}"
+
+      if [[ "$destination" == "$collision_output" &&
+        "$inject_collision" == "true" ]]; then
+        inject_collision=false
+        printf 'concurrent-header-output\n' >"$destination" || return $?
+      fi
+      command ln "$@"
+    }
+    extract_java_diagnostics_header "$headers" "$collision_output"
+  ) >/dev/null 2>&1; then
+    printf 'diagnostics header extraction overwrote a concurrent output\n' >&2
+    return 1
+  fi
+  [[ "$(<"$collision_output")" == "concurrent-header-output" ]] || {
+    printf 'diagnostics header extraction changed concurrent output bytes\n' >&2
+    return 1
+  }
+
+  mkdir -p -- "$redirected_result" "$redirected_target/redirected"
+  ln -s -- "$redirected_target" "$redirected_result/phases"
+  printf 'X-OBI-Java-Diagnostics: %s\r\n' "$snapshot" >"$headers"
+  if (
+    RESULT_DIR="$redirected_result"
+    extract_java_diagnostics_header \
+      "$headers" \
+      "$redirected_result/phases/redirected/java-diagnostics.txt"
+  ) >/dev/null 2>&1 ||
+    [[ -e "$redirected_target/redirected/java-diagnostics.txt" ]]; then
+    printf 'diagnostics header extraction escaped a redirected phases root\n' >&2
     return 1
   fi
 }
@@ -11074,17 +11849,24 @@ test_pre_stop_diagnostics_failure_does_not_stop_obi() {
 }
 
 test_fault_diagnostics_result_is_single_sanitized_snapshot() {
-  local -r expected="$TEST_TMP_DIR/fault-result-expected.txt"
-  local -r result="$TEST_TMP_DIR/fault-result.json"
+  local -r result_dir="$TEST_TMP_DIR/fault-result"
+  local -r redirected_result="$TEST_TMP_DIR/fault-result-redirected"
+  local -r redirected_target="$TEST_TMP_DIR/fault-result-outside"
+  local -r collision_output="$result_dir/phases/fault-result-collision/java-diagnostics.txt"
+  local -r collision_target="$result_dir/fault-result-collision-target"
+  local -r expected="$result_dir/expected.txt"
+  local -r result="$result_dir/result.json"
+  local RESULT_DIR="$result_dir"
   local output=""
   local snapshot=""
   local malformed=""
 
+  mkdir -p -- "$result_dir/phases/fault-result-after"
   write_diagnostics_fixture "$expected" 0 1 1 0 0 0
   snapshot="$(<"$expected")"
   printf '{\n  "status": "passed",\n  "fault_diagnostics_after": "%s"\n}\n' \
     "$snapshot" >"$result"
-  output="$TEST_TMP_DIR/fault-result-valid.txt"
+  output="$result_dir/phases/fault-result-after/java-diagnostics.txt"
   extract_fault_diagnostics_after "$result" "$output"
   cmp -s -- "$expected" "$output" || {
     printf 'fault result did not preserve its terminal diagnostics snapshot\n' >&2
@@ -11092,45 +11874,92 @@ test_fault_diagnostics_result_is_single_sanitized_snapshot() {
   }
 
   printf '{\n  "status": "passed"\n}\n' >"$result"
-  output="$TEST_TMP_DIR/fault-result-missing.txt"
+  output="$result_dir/phases/fault-result-missing/java-diagnostics.txt"
+  mkdir -p -- "${output%/*}"
   if extract_fault_diagnostics_after "$result" "$output" >/dev/null 2>&1; then
     printf 'fault result accepted missing terminal diagnostics\n' >&2
     return 1
   fi
   printf '{\n  "fault_diagnostics_after": "%s",\n  "fault_diagnostics_after": "%s"\n}\n' \
     "$snapshot" "$snapshot" >"$result"
-  output="$TEST_TMP_DIR/fault-result-duplicate.txt"
+  output="$result_dir/phases/fault-result-duplicate/java-diagnostics.txt"
+  mkdir -p -- "${output%/*}"
   if extract_fault_diagnostics_after "$result" "$output" >/dev/null 2>&1; then
     printf 'fault result accepted duplicate terminal diagnostics\n' >&2
     return 1
   fi
   printf '{\n  "fault_diagnostics_after": "unavailable"\n}\n' >"$result"
-  output="$TEST_TMP_DIR/fault-result-unavailable.txt"
+  output="$result_dir/phases/fault-result-unavailable/java-diagnostics.txt"
+  mkdir -p -- "${output%/*}"
   if extract_fault_diagnostics_after "$result" "$output" >/dev/null 2>&1; then
     printf 'fault result accepted unavailable terminal diagnostics\n' >&2
     return 1
   fi
   malformed="${snapshot/cfg_on=0/cfg_on=00}"
   printf '{\n  "fault_diagnostics_after": "%s"\n}\n' "$malformed" >"$result"
-  output="$TEST_TMP_DIR/fault-result-malformed.txt"
+  output="$result_dir/phases/fault-result-malformed/java-diagnostics.txt"
+  mkdir -p -- "${output%/*}"
   if extract_fault_diagnostics_after "$result" "$output" >/dev/null 2>&1; then
     printf 'fault result accepted malformed terminal diagnostics\n' >&2
     return 1
   fi
+
+  printf '{\n  "status": "passed",\n  "fault_diagnostics_after": "%s"\n}\n' \
+    "$snapshot" >"$result"
+  mkdir -p -- "$redirected_result" "$redirected_target/redirected"
+  ln -s -- "$redirected_target" "$redirected_result/phases"
+  if (
+    RESULT_DIR="$redirected_result"
+    extract_fault_diagnostics_after \
+      "$result" \
+      "$redirected_result/phases/redirected/java-diagnostics.txt"
+  ) >/dev/null 2>&1 ||
+    [[ -e "$redirected_target/redirected/java-diagnostics.txt" ]]; then
+    printf 'terminal diagnostics extraction escaped a redirected phases root\n' >&2
+    return 1
+  fi
+
+  mkdir -p -- "${collision_output%/*}"
+  printf 'terminal-collision-target-unchanged\n' >"$collision_target"
+  if (
+    local inject_collision=true
+    ln() {
+      local destination="${*: -1}"
+
+      if [[ "$destination" == "$collision_output" &&
+        "$inject_collision" == "true" ]]; then
+        inject_collision=false
+        command ln -s -- "$collision_target" "$destination" || return $?
+      fi
+      command ln "$@"
+    }
+    extract_fault_diagnostics_after "$result" "$collision_output"
+  ) >/dev/null 2>&1; then
+    printf 'terminal diagnostics extraction overwrote a concurrent symlink\n' >&2
+    return 1
+  fi
+  [[ -L "$collision_output" &&
+    "$(<"$collision_target")" == "terminal-collision-target-unchanged" ]] || {
+    printf 'terminal diagnostics extraction changed a collision target\n' >&2
+    return 1
+  }
 }
 
 test_java_diagnostics_result_is_single_sanitized_snapshot() {
-  local -r expected="$TEST_TMP_DIR/java-result-expected.txt"
-  local -r result="$TEST_TMP_DIR/java-result.json"
+  local -r result_dir="$TEST_TMP_DIR/java-result"
+  local -r expected="$result_dir/expected.txt"
+  local -r result="$result_dir/result.json"
+  local RESULT_DIR="$result_dir"
   local output=""
   local snapshot=""
   local malformed=""
 
+  mkdir -p -- "$result_dir/phases/java-result-after"
   write_diagnostics_fixture "$expected" 0 1 0 0 0 0
   snapshot="$(<"$expected")"
   printf '{\n  "status": "passed",\n  "java_diagnostics_after": "%s"\n}\n' \
     "$snapshot" >"$result"
-  output="$TEST_TMP_DIR/java-result-valid.txt"
+  output="$result_dir/phases/java-result-after/java-diagnostics.txt"
   extract_java_diagnostics_after "$result" "$output"
   cmp -s -- "$expected" "$output" || {
     printf 'stale result did not preserve its terminal diagnostics snapshot\n' >&2
@@ -11138,33 +11967,38 @@ test_java_diagnostics_result_is_single_sanitized_snapshot() {
   }
 
   printf '{\n  "status": "passed"\n}\n' >"$result"
-  output="$TEST_TMP_DIR/java-result-missing.txt"
+  output="$result_dir/phases/java-result-missing/java-diagnostics.txt"
+  mkdir -p -- "${output%/*}"
   if extract_java_diagnostics_after "$result" "$output" >/dev/null 2>&1; then
     printf 'stale result accepted missing terminal diagnostics\n' >&2
     return 1
   fi
   printf '{\n  "java_diagnostics_after": "%s",\n  "java_diagnostics_after": "%s"\n}\n' \
     "$snapshot" "$snapshot" >"$result"
-  output="$TEST_TMP_DIR/java-result-duplicate.txt"
+  output="$result_dir/phases/java-result-duplicate/java-diagnostics.txt"
+  mkdir -p -- "${output%/*}"
   if extract_java_diagnostics_after "$result" "$output" >/dev/null 2>&1; then
     printf 'stale result accepted duplicate terminal diagnostics\n' >&2
     return 1
   fi
   printf '{\n  "java_diagnostics_after": "unavailable"\n}\n' >"$result"
-  output="$TEST_TMP_DIR/java-result-unavailable.txt"
+  output="$result_dir/phases/java-result-unavailable/java-diagnostics.txt"
+  mkdir -p -- "${output%/*}"
   if extract_java_diagnostics_after "$result" "$output" >/dev/null 2>&1; then
     printf 'stale result accepted unavailable terminal diagnostics\n' >&2
     return 1
   fi
   malformed="${snapshot/cfg_on=0/cfg_on=00}"
   printf '{\n  "java_diagnostics_after": "%s"\n}\n' "$malformed" >"$result"
-  output="$TEST_TMP_DIR/java-result-malformed.txt"
+  output="$result_dir/phases/java-result-malformed/java-diagnostics.txt"
+  mkdir -p -- "${output%/*}"
   if extract_java_diagnostics_after "$result" "$output" >/dev/null 2>&1; then
     printf 'stale result accepted malformed terminal diagnostics\n' >&2
     return 1
   fi
   printf '{\n  "java_diagnostics_after": "%s"\n}\n' "$snapshot" >"$result"
-  output="$TEST_TMP_DIR/java-result-symlink.txt"
+  output="$result_dir/phases/java-result-symlink/java-diagnostics.txt"
+  mkdir -p -- "${output%/*}"
   ln -s -- "$expected" "$output"
   if extract_java_diagnostics_after "$result" "$output" >/dev/null 2>&1; then
     printf 'stale result overwrote a diagnostics symlink\n' >&2
@@ -12814,6 +13648,7 @@ test_pipeline_dependencies_are_declared() {
 
   definition="$(declare -f check_dependencies)"
   [[ "$definition" == *" jq "* && "$definition" == *" mv "* && \
+    "$definition" == *" ln "* && "$definition" == *" realpath "* && \
     "$definition" == *" tee "* && "$definition" == *" tar "* && \
     "$definition" == *" head "* && "$definition" == *" readlink "* && \
     "$definition" == *" rmdir "* && "$definition" == *" stat "* ]] || {
@@ -17528,6 +18363,8 @@ test_cleanup_signal_status_matches_retained_evidence() {
   local -r group_cleanup_ready="$root/group-cleanup-ready"
   local -r holder_publication_result="$root/holder-publication-result"
   local -r holder_publication_calls="$root/holder-publication-calls"
+  local -r failed_holder_publication_result="$root/failed-holder-publication-result"
+  local -r failed_holder_publication_calls="$root/failed-holder-publication-calls"
   local -r publication_result="$root/publication-result"
   local -r publication_ready="$root/publication-ready"
   local -r publication_release="$root/publication-release"
@@ -17545,6 +18382,7 @@ test_cleanup_signal_status_matches_retained_evidence() {
     "$capture_result" \
     "$group_cleanup_result" \
     "$holder_publication_result" \
+    "$failed_holder_publication_result" \
     "$publication_result" \
     "$post_publication_result"
   if (
@@ -17846,6 +18684,47 @@ test_cleanup_signal_status_matches_retained_evidence() {
     .failure_stage == "project-guard-status"
   ' "$holder_publication_result/run-status.json" >/dev/null || {
     printf 'holder-status publication failure diverged from run evidence\n' >&2
+    return 1
+  }
+
+  if (
+    RESULT_DIR="$failed_holder_publication_result"
+    STACK_STARTED=false
+    PROJECT_GUARD_HELD=false
+    RUN_STATUS=failed
+    RUN_STAGE=complete
+    ACCEPTANCE_EVIDENCE=true
+    ACCEPTANCE_EVIDENCE_REASON=""
+    FAILURE_STAGE=scenario
+    FAILURE_LINE=41
+    FAILURE_STATUS=17
+    FAILURE_COMMAND=fixture
+    PROJECT_GUARD_STATUS_RELAY_PID=1
+    cleanup_security_processes() { :; }
+    capture_evidence() { :; }
+    cleanup_source_snapshot_work_directory() { :; }
+    release_project_guard() { :; }
+    publish_project_guard_holder_status_with_retries() {
+      printf '%s\n' "$1" >>"$failed_holder_publication_calls"
+      return 79
+    }
+    cleanup 17
+  ) >/dev/null 2>&1; then
+    printf 'permanent holder publication failure preserved an ambiguous exit\n' >&2
+    return 1
+  else
+    worker_status=$?
+  fi
+  [[ "$worker_status" == 1 &&
+    "$(<"$failed_holder_publication_calls")" == $'17\n1' ]] || {
+    printf 'failed holder status did not canonicalize to the relay fallback\n' >&2
+    return 1
+  }
+  jq -e '
+    .status == "failed" and .exit_status == 1 and
+    .failure_stage == "scenario"
+  ' "$failed_holder_publication_result/run-status.json" >/dev/null || {
+    printf 'permanent holder publication failure diverged from run evidence\n' >&2
     return 1
   }
 
@@ -18587,6 +19466,9 @@ test_late_attach_recycles_only_apache_after_readiness() {
     run_scenario() {
       printf 'scenario:%s:%s\n' "$1" "$SCENARIO_VARIANT" >>"$observed"
     }
+    capture_terminal_java_diagnostics_recovery_boundary() { :; }
+    commit_terminal_java_diagnostics_recovery_boundary() { :; }
+    clear_terminal_java_diagnostics_recovery_boundary() { :; }
 
     run_late_attach_control
   ) || {
@@ -20097,6 +20979,11 @@ test_assertion_failure_control_retains_failure_evidence() {
     mkdir -p -- "$RESULT_DIR" || exit 1
     run_scenario() {
       [[ "$1" == "basic" ]] || return 1
+      mkdir -p -- "$RESULT_DIR/phases/basic-after" || return 1
+      write_diagnostics_fixture \
+        "$RESULT_DIR/phases/basic-after/java-diagnostics.txt" \
+        1 0 0 1 0 0 || return 1
+      record_last_java_diagnostics_phase basic-after || return 1
       : >"$RESULT_DIR/basic-passed"
     }
 
@@ -20116,6 +21003,14 @@ test_assertion_failure_control_retains_failure_evidence() {
   grep -Fq '"expected_exit_status":2' "$result_dir/scenario-assertion-failure.json" || return 1
   grep -Fq '"failure_context":"failure-context.txt"' \
     "$result_dir/scenario-assertion-failure-status.json" || return 1
+  jq -e '
+    .java_bridge_diagnostics_reference ==
+      "terminal-java-diagnostics.json" and
+    .java_bridge_diagnostics.sealed == true and
+    .java_bridge_diagnostics.available == true and
+    .java_bridge_diagnostics.phase == "basic-after" and
+    .java_bridge_diagnostics.counters.t_valid == "1"
+  ' "$result_dir/scenario-assertion-failure-status.json" >/dev/null || return 1
   grep -Fq 'stage=deliberate-assertion-failure' "$result_dir/failure-context.txt" || return 1
   grep -Fq 'command=die:\ deliberate\ assertion\ failure\ requested' \
     "$result_dir/failure-context.txt" || return 1
@@ -21558,6 +22453,3004 @@ test_run_status_serializes_default_acceptance_reason() {
   }
 }
 
+test_run_status_publication_is_owned_and_atomic() {
+  local -r commit_dir="$TEST_TMP_DIR/run-status-owned-commit"
+  local -r partial_dir="$TEST_TMP_DIR/run-status-owned-partial"
+  local -r replacement_dir="$TEST_TMP_DIR/run-status-owned-replacement"
+  local -r mismatch_dir="$TEST_TMP_DIR/run-status-owned-mismatch"
+  local -r retry_dir="$TEST_TMP_DIR/run-status-owned-retry"
+  local -r collision_dir="$TEST_TMP_DIR/run-status-owned-collision"
+  local -r collision_target="$TEST_TMP_DIR/run-status-owned-collision-target"
+  local write_status=0
+
+  mkdir -p -- \
+    "$commit_dir" "$partial_dir" "$replacement_dir" "$mismatch_dir" \
+    "$retry_dir" "$collision_dir" "$collision_target"
+
+  (
+    RESULT_DIR="$commit_dir"
+    RUN_STATUS=failed
+    ACCEPTANCE_EVIDENCE=false
+    ACCEPTANCE_EVIDENCE_REASON=targeted-scenario
+    FAILURE_STAGE=fault
+    FAILURE_LINE=31
+    write_run_status 17 || return 1
+    [[ -f "$RUN_STATUS_PUBLICATION_HANDLE" &&
+      "$(stat -Lc '%h' -- "$RUN_STATUS_PUBLICATION_HANDLE")" == 2 &&
+      "$(stat -Lc '%h' -- "$RESULT_DIR/run-status.json")" == 2 ]] || return 1
+    commit_published_run_status || return 1
+    [[ -z "$RUN_STATUS_PUBLICATION_STATE" &&
+      -z "$RUN_STATUS_PUBLICATION_HANDLE" &&
+      -z "$RUN_STATUS_PUBLICATION_OUTPUT" &&
+      -z "$RUN_STATUS_PUBLISHED_IDENTITY" &&
+      -z "$RUN_STATUS_PUBLISHED_DIGEST" &&
+      -f "$RESULT_DIR/run-status.json" &&
+      "$(stat -Lc '%h' -- "$RESULT_DIR/run-status.json")" == 1 ]] || return 1
+  ) || {
+    printf 'run-status ownership handle did not commit exactly once\n' >&2
+    return 1
+  }
+
+  (
+    local fail_output_stat=true
+    RESULT_DIR="$partial_dir"
+    RUN_STATUS=failed
+    ACCEPTANCE_EVIDENCE=false
+    ACCEPTANCE_EVIDENCE_REASON=targeted-scenario
+    FAILURE_STAGE=fault
+    FAILURE_LINE=32
+    stat() {
+      local target="${*: -1}"
+
+      if [[ "$target" == "$RESULT_DIR/run-status.json" &&
+        "$fail_output_stat" == "true" ]]; then
+        fail_output_stat=false
+        return 47
+      fi
+      command stat "$@"
+    }
+    if write_run_status 17; then
+      return 1
+    else
+      write_status=$?
+    fi
+    [[ "$write_status" == 1 &&
+      -f "$RESULT_DIR/run-status.json" &&
+      -f "$RUN_STATUS_PUBLICATION_HANDLE" ]] || return 1
+    unset -f stat
+    remove_published_run_status || return 1
+    [[ ! -e "$RESULT_DIR/run-status.json" &&
+      ! -e "$RUN_STATUS_PUBLICATION_HANDLE" &&
+      -z "$RUN_STATUS_PUBLICATION_OUTPUT" &&
+      -z "$RUN_STATUS_PUBLISHED_IDENTITY" ]] || return 1
+  ) || {
+    printf 'partial run-status publication could not be removed by ownership\n' >&2
+    return 1
+  }
+
+  (
+    local handle=""
+    RESULT_DIR="$replacement_dir"
+    RUN_STATUS=failed
+    ACCEPTANCE_EVIDENCE=false
+    ACCEPTANCE_EVIDENCE_REASON=targeted-scenario
+    FAILURE_STAGE=fault
+    FAILURE_LINE=33
+    write_run_status 17 || return 1
+    handle="$RUN_STATUS_PUBLICATION_HANDLE"
+    command rm -f -- "$RESULT_DIR/run-status.json" || return 1
+    printf 'foreign-status\n' >"$RESULT_DIR/run-status.json" || return 1
+    if remove_published_run_status; then
+      return 1
+    fi
+    [[ "$(<"$RESULT_DIR/run-status.json")" == "foreign-status" &&
+      -f "$handle" ]] || return 1
+  ) || {
+    printf 'run-status ownership removed a replacement path\n' >&2
+    return 1
+  }
+
+  (
+    local original_result="$mismatch_dir/original"
+    local changed_result="$mismatch_dir/changed"
+    mkdir -p -- "$original_result" "$changed_result"
+    RESULT_DIR="$original_result"
+    RUN_STATUS=failed
+    ACCEPTANCE_EVIDENCE=false
+    ACCEPTANCE_EVIDENCE_REASON=targeted-scenario
+    FAILURE_STAGE=fault
+    FAILURE_LINE=34
+    write_run_status 17 || return 1
+    RESULT_DIR="$changed_result"
+    if remove_published_run_status; then
+      return 1
+    fi
+    [[ -f "$original_result/run-status.json" ]] || return 1
+    RESULT_DIR="$original_result"
+    commit_published_run_status || return 1
+  ) || {
+    printf 'run-status ownership token crossed result directories\n' >&2
+    return 1
+  }
+
+  (
+    RESULT_DIR="$retry_dir"
+    RUN_STATUS=failed
+    ACCEPTANCE_EVIDENCE=false
+    ACCEPTANCE_EVIDENCE_REASON=targeted-scenario
+    FAILURE_STAGE=fault
+    FAILURE_LINE=35
+    write_run_status 17 || return 1
+    remove_published_run_status || return 1
+    ln() {
+      local destination="${*: -1}"
+
+      if [[ "$destination" == "$RESULT_DIR/run-status.json" ]]; then
+        return 79
+      fi
+      command ln "$@"
+    }
+    if write_run_status 17; then
+      return 1
+    else
+      write_status=$?
+    fi
+    [[ "$write_status" == 79 &&
+      ! -e "$RESULT_DIR/run-status.json" &&
+      -z "$RUN_STATUS_PUBLICATION_HANDLE" &&
+      -z "$RUN_STATUS_PUBLICATION_OUTPUT" ]] || return 1
+  ) || {
+    printf 'failed run-status replacement link left owned residue\n' >&2
+    return 1
+  }
+
+  printf 'outside-status\n' >"$collision_target/status"
+  (
+    RESULT_DIR="$collision_dir"
+    RUN_STATUS=failed
+    ACCEPTANCE_EVIDENCE=false
+    ACCEPTANCE_EVIDENCE_REASON=targeted-scenario
+    FAILURE_STAGE=fault
+    FAILURE_LINE=36
+    ln() {
+      local destination="${*: -1}"
+
+      if [[ "$destination" == "$RESULT_DIR/run-status.json" ]]; then
+        command ln -s -- "$collision_target" "$destination" || return $?
+        return 1
+      fi
+      command ln "$@"
+    }
+    if write_run_status 17; then
+      return 1
+    fi
+    [[ -L "$RESULT_DIR/run-status.json" &&
+      "$(<"$collision_target/status")" == "outside-status" &&
+      -z "$RUN_STATUS_PUBLICATION_HANDLE" &&
+      -z "$RUN_STATUS_PUBLICATION_OUTPUT" ]]
+  ) || {
+    printf 'run-status publication followed a raced directory symlink\n' >&2
+    return 1
+  }
+}
+
+terminal_java_diagnostics_source_contract_is_safe() {
+  local -r runner_source="$1"
+
+  awk '
+    BEGIN {
+      required["restore_permanent_absence_stack"] = 1
+      required["restore_auto_unavailable_stack"] = 1
+      required["cleanup_restart_traffic"] = 1
+      required["restore_helper_attach_failure_stack"] = 1
+      required["restore_primary_w3c_fault_stack"] = 1
+      required["restore_primary_generation_mismatch_stack"] = 1
+      required["restore_unix_generation_mismatch_stack"] = 1
+      required["restore_primary_live_fd_security_stack"] = 1
+      outer_required["run_permanent_absence_control"] = 1
+      outer_required["run_auto_unavailable_control"] = 1
+      outer_required["run_helper_attach_failure_control"] = 1
+      outer_required["run_primary_w3c_fault_control"] = 1
+      outer_required["run_primary_generation_mismatch_control"] = 1
+      outer_required["run_unix_generation_mismatch_control"] = 1
+      outer_required["run_primary_live_fd_security_control"] = 1
+      outer_required["run_restart_during_traffic_control"] = 1
+      outer_arm_marker["run_permanent_absence_control"] = "  trap permanent_absence_exit EXIT"
+      outer_arm_marker["run_auto_unavailable_control"] = "  trap restore_auto_unavailable_stack EXIT"
+      outer_arm_marker["run_helper_attach_failure_control"] = "  trap restore_helper_attach_failure_stack EXIT"
+      outer_arm_marker["run_primary_w3c_fault_control"] = "  trap restore_primary_w3c_fault_stack EXIT"
+      outer_arm_marker["run_primary_generation_mismatch_control"] = "  trap restore_primary_generation_mismatch_stack EXIT"
+      outer_arm_marker["run_unix_generation_mismatch_control"] = "  trap restore_unix_generation_mismatch_stack EXIT"
+      outer_arm_marker["run_primary_live_fd_security_control"] = "  trap restore_primary_live_fd_security_stack EXIT"
+      outer_arm_marker["run_restart_during_traffic_control"] = "  trap cleanup_restart_traffic EXIT"
+      outer_success_marker["run_permanent_absence_control"] = "scenario-permanent-absence-status.json"
+      outer_success_marker["run_auto_unavailable_control"] = "scenario-auto-unavailable-status.json"
+      outer_success_marker["run_helper_attach_failure_control"] = "  SCENARIO_SEED=\"$original_seed\""
+      outer_success_marker["run_primary_w3c_fault_control"] = "  SCENARIO_VARIANT=\"primary-w3c-fault-recovery\""
+      outer_success_marker["run_primary_generation_mismatch_control"] = "scenario-primary-generation-mismatch-status.json"
+      outer_success_marker["run_unix_generation_mismatch_control"] = "scenario-unix-generation-mismatch-status.json"
+      outer_success_marker["run_primary_live_fd_security_control"] = "  run_primary_live_fd_security_recovery_scenario \"$original_variant\""
+      outer_success_marker["run_restart_during_traffic_control"] = "  SCENARIO_VARIANT=\"\""
+      outer_recovery_marker["run_permanent_absence_control"] = "  stop_permanent_absence_jvm || return $?"
+      outer_recovery_marker["run_auto_unavailable_control"] = "  restart_since=\"$(date -u"
+      outer_recovery_marker["run_helper_attach_failure_control"] = "  recover_helper_attach_failure_stack \\"
+      outer_recovery_marker["run_primary_w3c_fault_control"] = "post-primary W3C fault recovery"
+      outer_recovery_marker["run_primary_generation_mismatch_control"] = "post-primary generation mismatch recovery"
+      outer_recovery_marker["run_unix_generation_mismatch_control"] = "post-Unix generation mismatch recovery"
+      outer_recovery_marker["run_primary_live_fd_security_control"] = "post-primary live-descriptor security recovery"
+      outer_recovery_marker["run_restart_during_traffic_control"] = "  run_scenario restart"
+      recovery_expected_seals["delayed"] = 3
+      recovery_expected_seals["primary-stale"] = 3
+      recovery_expected_seals["unix-stale"] = 3
+      recovery_expected_seals["w3c-fault"] = 2
+      recovery_expected_seals["late-attach"] = 2
+      recovery_expected_seals["w3c-match"] = 2
+      recovery_requires_guard["delayed"] = 1
+      recovery_requires_guard["primary-stale"] = 1
+      recovery_requires_guard["unix-stale"] = 1
+    }
+    {
+      if ($0 == "record_last_java_diagnostics_reference() {") {
+        current_lock_wrapper = "record"
+        lock_wrapper_starts[current_lock_wrapper]++
+      } else if ($0 == "capture_terminal_java_diagnostics_recovery_boundary() {") {
+        current_lock_wrapper = "capture-boundary"
+        lock_wrapper_starts[current_lock_wrapper]++
+      } else if ($0 == "commit_terminal_java_diagnostics_recovery_boundary() {") {
+        current_lock_wrapper = "commit-boundary"
+        lock_wrapper_starts[current_lock_wrapper]++
+      } else if ($0 == "clear_terminal_java_diagnostics_recovery_boundary() {") {
+        current_lock_wrapper = "clear-boundary"
+        lock_wrapper_starts[current_lock_wrapper]++
+      } else if ($0 == "freeze_terminal_java_diagnostics() {") {
+        current_lock_wrapper = "freeze"
+        lock_wrapper_starts[current_lock_wrapper]++
+      } else if ($0 == "seal_terminal_java_diagnostics() {") {
+        current_lock_wrapper = "seal"
+        lock_wrapper_starts[current_lock_wrapper]++
+      }
+      if (current_lock_wrapper != "") {
+        if ($0 == "  freeze_terminal_java_diagnostics_unlocked || return $?") {
+          lock_wrapper_prefreezes[current_lock_wrapper]++
+          lock_wrapper_prefreeze[current_lock_wrapper] = NR
+        } else if ($0 == "  with_terminal_java_diagnostics_lock \\" ||
+                   (current_lock_wrapper == "seal" &&
+                    $0 == "    with_terminal_java_diagnostics_lock \\")) {
+          lock_wrapper_calls[current_lock_wrapper]++
+          if (lock_wrapper_calls[current_lock_wrapper] == 1) {
+            lock_wrapper_first_call[current_lock_wrapper] = NR
+          }
+          lock_wrapper_call[current_lock_wrapper] = NR
+        } else if ((current_lock_wrapper == "record" &&
+                    $0 == "    record_last_java_diagnostics_reference_unlocked \"$@\"") ||
+                   (current_lock_wrapper == "capture-boundary" &&
+                    $0 == "    capture_terminal_java_diagnostics_recovery_boundary_unlocked") ||
+                   (current_lock_wrapper == "commit-boundary" &&
+                    $0 == "    commit_terminal_java_diagnostics_recovery_boundary_unlocked") ||
+                   (current_lock_wrapper == "clear-boundary" &&
+                    $0 == "    clear_terminal_java_diagnostics_recovery_boundary_unlocked") ||
+                   (current_lock_wrapper == "freeze" &&
+                    $0 == "    terminal_java_diagnostics_transition_is_valid") ||
+                   (current_lock_wrapper == "seal" &&
+                    $0 == "    seal_terminal_java_diagnostics_from_recovery_state_unlocked")) {
+          lock_wrapper_targets[current_lock_wrapper]++
+          lock_wrapper_target[current_lock_wrapper] = NR
+        }
+        if ($0 == "}") {
+          current_lock_wrapper = ""
+        }
+      }
+      if ($0 == "with_terminal_java_diagnostics_lock() (") {
+        in_terminal_lock = 1
+        terminal_lock_starts++
+      }
+      if (in_terminal_lock) {
+        if (index($0, "stat -Lc '\''%d:%i:%h:%u:%a'\''") > 0) {
+          terminal_lock_stat_formats++
+        }
+        if ($0 == "    \"$path_identity\" == *\":1:$(id -u):600\" ]] || return 1") {
+          terminal_lock_owner_suffixes++
+        }
+        if (index($0, "%g") > 0 || index($0, "id -g") > 0) {
+          terminal_lock_gid_checks++
+        }
+        if ($0 == ")") {
+          in_terminal_lock = 0
+        }
+      }
+      if ($0 == "seal_terminal_java_diagnostics_unlocked() {") {
+        in_unlocked_seal = 1
+        unlocked_seal_starts++
+      }
+      if (in_unlocked_seal) {
+        if ($0 == "  freeze_terminal_java_diagnostics_unlocked || return $?") {
+          unlocked_seal_freezes++
+        } else if ($0 == "  freeze_terminal_java_diagnostics || return $?") {
+          unlocked_seal_public_freezes++
+        }
+        if ($0 == "}") {
+          in_unlocked_seal = 0
+        }
+      }
+      if ($0 == "seal_terminal_java_diagnostics_from_recovery_state_unlocked() {") {
+        in_recovery_state_seal = 1
+        recovery_state_seal_starts++
+      }
+      if (in_recovery_state_seal) {
+        if ($0 == "  transition_state=\"$(terminal_java_diagnostics_transition_state)\" || return $?") {
+          recovery_state_transition_reads++
+          recovery_state_transition_read = NR
+        } else if ($0 == "  if [[ \"$transition_state\" == \"committed\" ]]; then") {
+          recovery_state_commit_guards++
+          recovery_state_commit_guard = NR
+        } else if ($0 == "    terminal_java_diagnostics_recovery_commit_is_valid || return $?") {
+          recovery_state_committed_boundary_validators++
+        } else if ($0 == "      terminal_java_diagnostics_recovery_boundary_payload") {
+          recovery_state_boundary_captures++
+          recovery_state_boundary_capture = NR
+        } else if ($0 == "    seal_terminal_java_diagnostics_unlocked \"$recovery_boundary\"") {
+          recovery_state_boundary_seals++
+          recovery_state_boundary_seal = NR
+        } else if ($0 == "    seal_terminal_java_diagnostics_unlocked") {
+          recovery_state_live_seals++
+        } else if ($0 == "  seal_terminal_java_diagnostics_unlocked") {
+          recovery_state_live_seals++
+        }
+        if ($0 == "}") {
+          in_recovery_state_seal = 0
+        }
+      }
+      if (index($0, "TERMINAL_JAVA_DIAGNOSTICS_RECOVERY_BOUNDARY") > 0) {
+        legacy_dynamic_boundaries++
+      }
+      if ($0 == "capture_terminal_java_diagnostics_recovery_boundary_unlocked() {") {
+        in_boundary_capture = 1
+        boundary_capture_starts++
+      }
+      if (in_boundary_capture) {
+        if ($0 == "    ! -e \"$freeze\" && ! -L \"$freeze\" &&") {
+          boundary_capture_freeze_guards++
+        } else if ($0 == "    ! -e \"$boundary\" && ! -L \"$boundary\" ]] || return 1") {
+          boundary_capture_pending_guards++
+        }
+        if ($0 == "}") {
+          in_boundary_capture = 0
+        }
+      }
+      if ($0 == "commit_terminal_java_diagnostics_recovery_boundary_unlocked() {") {
+        in_boundary_commit = 1
+        boundary_commit_starts++
+      }
+      if (in_boundary_commit) {
+        if ($0 == "    ! -e \"$freeze\" && ! -L \"$freeze\" &&") {
+          boundary_commit_freeze_guards++
+        } else if ($0 == "  terminal_java_diagnostics_recovery_boundary_payload >/dev/null || return $?") {
+          boundary_commit_payload_validators++
+        }
+        if ($0 == "}") {
+          in_boundary_commit = 0
+        }
+      }
+      if ($0 == "terminal_java_diagnostics_recovery_commit_is_valid() {") {
+        in_recovery_commit_validator = 1
+        recovery_commit_validator_starts++
+      }
+      if (in_recovery_commit_validator) {
+        if ($0 == "  expected_boundary_digest=\"${BASH_REMATCH[1]}\"") {
+          recovery_commit_expected_digests++
+          recovery_commit_expected_digest = NR
+        } else if ($0 == "    boundary_digest=\"$(sha256sum \"$boundary\")\" || return $?") {
+          recovery_commit_digest_reads++
+          recovery_commit_digest_read = NR
+        } else if ($0 == "    [[ \"$boundary_digest\" == \"$expected_boundary_digest\" ]] || return 1") {
+          recovery_commit_digest_comparisons++
+          recovery_commit_digest_comparison = NR
+        }
+        if ($0 == "}") {
+          in_recovery_commit_validator = 0
+        }
+      }
+      if (in_boundary_commit &&
+          $0 == "    \"$boundary_digest\" >\"$candidate\" &&") {
+        recovery_commit_digest_publications++
+      }
+      if ($0 == "clear_terminal_java_diagnostics_recovery_boundary_unlocked() {") {
+        in_boundary_clear = 1
+        boundary_clear_starts++
+      }
+      if (in_boundary_clear) {
+        if ($0 == "    rm -f -- \"$boundary\" || return $?") {
+          boundary_clears++
+          boundary_clear = NR
+        } else if ($0 == "  rm -f -- \"$transition\" || return $?") {
+          commit_clears++
+          commit_clear = NR
+        }
+        if ($0 == "}") {
+          in_boundary_clear = 0
+        }
+      }
+      if ($0 == "    if ln -T -- \"$candidate\" \"$freeze\"; then" ||
+          $0 == "  if ln -T -- \"$candidate\" \"$freeze\"; then") {
+        if (in_boundary_commit) {
+          recovery_commit_no_follow_links++
+        } else {
+          freeze_no_follow_links++
+        }
+      } else if ($0 == "  if ln -T -- \"$candidate\" \"$terminal\"; then") {
+        terminal_no_follow_links++
+      } else if ($0 == "  if ln -T -- \"$candidate\" \"$boundary\"; then") {
+        recovery_boundary_no_follow_links++
+      } else if (!in_status &&
+                 $0 == "  if ln -T -- \"$candidate\" \"$output\"; then") {
+        extractor_no_follow_links++
+      } else if ($0 == "  for attempt in 1 2 3; do") {
+        freeze_retry_loops++
+      } else if ($0 == "  flock -x -w \"$TERMINAL_JAVA_DIAGNOSTICS_LOCK_TIMEOUT_SECONDS\" \\") {
+        bounded_lock_acquires++
+      }
+
+      for (name in required) {
+        if ($0 == "  " name "() {") {
+          current = name
+          starts[name]++
+        }
+      }
+      if (current != "") {
+        if ($0 == "    trap - EXIT") {
+          traps[current]++
+          trap_line[current] = NR
+        } else if ($0 == "    set +e") {
+          relaxed[current]++
+          relaxed_line[current] = NR
+        } else if ($0 == "    seal_terminal_java_diagnostics" ||
+                   (current == "cleanup_restart_traffic" &&
+                    $0 == "      seal_terminal_java_diagnostics")) {
+          seals[current]++
+          seal_line[current] = NR
+        } else if ($0 == "    terminal_diagnostics_status=$?" ||
+                   (current == "cleanup_restart_traffic" &&
+                    $0 == "      terminal_diagnostics_status=$?")) {
+          seal_statuses[current]++
+          seal_status_line[current] = NR
+        } else if ($0 == "    arm_permanent_absence_record_only_traps") {
+          arms[current]++
+          arm_line[current] = NR
+        } else if ($0 == "    if ((status != 0)); then") {
+          nonzero_guards[current]++
+          nonzero_guard_line[current] = NR
+        }
+
+        if (current == "restore_permanent_absence_stack" &&
+            index($0, "if [[ \"$absence_jvm_may_be_running\"") > 0) {
+          mutation[current]++
+          mutation_line[current] = NR
+        } else if ((current == "restore_auto_unavailable_stack" ||
+                    current == "restore_helper_attach_failure_stack" ||
+                    current == "restore_primary_w3c_fault_stack") &&
+                   index($0, "if [[ \"$restore_required\"") > 0) {
+          mutation[current]++
+          mutation_line[current] = NR
+        } else if (current == "cleanup_restart_traffic" &&
+                   index($0, "if [[ -n \"$scenario_pid\"") > 0) {
+          mutation[current]++
+          mutation_line[current] = NR
+        } else if (current == "restore_primary_generation_mismatch_stack" &&
+                   index($0, "if [[ \"$barrier_released\"") > 0) {
+          mutation[current]++
+          mutation_line[current] = NR
+        } else if (current == "restore_unix_generation_mismatch_stack" &&
+                   index($0, "if [[ \"$barrier_ready\"") > 0) {
+          mutation[current]++
+          mutation_line[current] = NR
+        } else if (current == "restore_primary_live_fd_security_stack" &&
+                   index($0, "if [[ -n \"$probe_candidate\"") > 0) {
+          mutation[current]++
+          mutation_line[current] = NR
+        }
+        if ($0 == "  }") {
+          current = ""
+        }
+      }
+
+      for (name in outer_required) {
+        if ($0 == name "() (") {
+          current_outer = name
+          outer_starts[name]++
+        }
+      }
+      if (current_outer != "") {
+        if ($0 == outer_arm_marker[current_outer]) {
+          outer_arms[current_outer]++
+          outer_arm[current_outer] = NR
+        } else if (index($0, outer_success_marker[current_outer]) > 0) {
+          outer_successes[current_outer]++
+          outer_success[current_outer] = NR
+        } else if ($0 == "  trap - EXIT") {
+          outer_disarms[current_outer]++
+          outer_disarm[current_outer] = NR
+        }
+        if ($0 == "  capture_terminal_java_diagnostics_recovery_boundary || return $?") {
+          outer_boundaries[current_outer]++
+          outer_boundary[current_outer] = NR
+        } else if (outer_boundaries[current_outer] == 1 &&
+                   index($0, outer_recovery_marker[current_outer]) > 0) {
+          outer_recoveries[current_outer]++
+          outer_recovery[current_outer] = NR
+        } else if ($0 == "  commit_terminal_java_diagnostics_recovery_boundary || return $?") {
+          outer_commits[current_outer]++
+          outer_commit[current_outer] = NR
+        } else if ($0 == "  clear_terminal_java_diagnostics_recovery_boundary || return $?") {
+          outer_clears[current_outer]++
+          outer_clear[current_outer] = NR
+        }
+        if ($0 == ")") {
+          current_outer = ""
+        }
+      }
+
+      if ($0 == "abort_w3c_fault_mode() {") {
+        in_abort = 1
+        abort_starts++
+      }
+      if (in_abort) {
+        if ($0 == "  if seal_terminal_java_diagnostics; then") {
+          abort_seals++
+          abort_seal = NR
+        } else if ($0 == "    terminal_diagnostics_status=$?") {
+          abort_statuses++
+          abort_status = NR
+        } else if (index($0, "if [[ \"$capture_log\"") > 0) {
+          abort_captures++
+          abort_capture = NR
+        } else if ($0 == "  if ! stop_w3c_fault_bridge; then") {
+          abort_stops++
+          abort_stop = NR
+        }
+        if ($0 == "}") {
+          in_abort = 0
+        }
+      }
+
+      if ($0 == "run_deliberate_assertion_failure_control() {") {
+        in_deliberate = 1
+        deliberate_starts++
+      }
+      if (in_deliberate) {
+        if ($0 == "  seal_terminal_java_diagnostics || return $?" ) {
+          deliberate_seals++
+          deliberate_seal = NR
+        } else if (index($0, "java_bridge_diagnostics=\"$(terminal_java_diagnostics_json)") > 0) {
+          deliberate_reads++
+          deliberate_read = NR
+        } else if (index($0, "die \"deliberate assertion failure requested\"") > 0) {
+          deliberate_dies++
+          deliberate_die = NR
+        }
+        if ($0 == "}") {
+          in_deliberate = 0
+        }
+      }
+
+      if ($0 == "capture_java_diagnostics() {") {
+        in_capture = 1
+        capture_starts++
+      }
+      if (in_capture) {
+        if (index($0, "if ! chmod ") > 0 || index($0, "! mv -fT") > 0 ||
+            index($0, "&& ! printf ") > 0) {
+          capture_negated_status++
+        }
+        if (index($0, "if curl --fail --silent --show-error") > 0) {
+          capture_curls++
+          capture_curl = NR
+        } else if (index($0, "head -c \"$((TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES + 1))\"") > 0) {
+          capture_heads++
+          capture_head = NR
+        } else if (index($0, "! bounded_evidence_file") > 0) {
+          capture_bounds++
+          capture_bound = NR
+        } else if (index($0, "! assert_sanitized_java_diagnostics \"$candidate\"") > 0) {
+          capture_validators++
+          capture_validator = NR
+        } else if (index($0, "mv -fT -- \"$candidate\" \"$output\"") > 0) {
+          capture_moves++
+          capture_move = NR
+        } else if ($0 == "  record_last_java_diagnostics_phase \"$phase\"") {
+          capture_records++
+          capture_record = NR
+        }
+        if ($0 == "}") {
+          in_capture = 0
+        }
+      }
+
+      if ($0 == "extract_java_diagnostics_header() {") {
+        in_header = 1
+        header_starts++
+      }
+      if (in_header) {
+        if ($0 == "  record_last_java_diagnostics_reference \\") {
+          header_records++
+          header_record = NR
+        }
+        if ($0 == "}") {
+          in_header = 0
+        }
+      }
+
+      if ($0 == "extract_terminal_diagnostics_after() {") {
+        in_terminal_extract = 1
+        terminal_extract_starts++
+      }
+      if (in_terminal_extract) {
+        if ($0 == "  record_last_java_diagnostics_reference \\") {
+          terminal_extract_records++
+          terminal_extract_record = NR
+        }
+        if ($0 == "}") {
+          in_terminal_extract = 0
+        }
+      }
+
+      if ($0 == "write_run_status() {") {
+        in_status = 1
+        status_starts++
+      }
+      if (in_status) {
+        if ($0 == "  seal_terminal_java_diagnostics || return $?") {
+          status_seals++
+          status_seal = NR
+        } else if (index($0, "if jq -n") > 0) {
+          status_writes++
+          status_write = NR
+        } else if ($0 == "  if ln -T -- \"$candidate\" \"$output\"; then") {
+          status_links++
+          status_link = NR
+        } else if ($0 == "  RUN_STATUS_PUBLICATION_HANDLE=\"$candidate\"") {
+          status_handle_sets++
+          status_handle_set = NR
+        } else if ($0 == "  RUN_STATUS_PUBLICATION_OUTPUT=\"$output\"") {
+          status_output_sets++
+          status_output_set = NR
+        } else if ($0 == "  RUN_STATUS_PUBLICATION_STATE=prepared") {
+          status_prepared_sets++
+          status_prepared_set = NR
+        } else if ($0 == "    RUN_STATUS_PUBLICATION_STATE=published") {
+          status_published_sets++
+          status_published_set = NR
+        } else if ($0 == "      -f \"$output\" && ! -L \"$output\" && \"$candidate\" -ef \"$output\" ]]; then") {
+          status_side_effect_guards++
+          status_side_effect_guard = NR
+        } else if ($0 == "      RUN_STATUS_PUBLICATION_STATE=published") {
+          status_side_effect_published_sets++
+          status_side_effect_published_set = NR
+        } else if ($0 == "  RUN_STATUS_PUBLICATION_STATE=validated") {
+          status_validated_sets++
+          status_validated_set = NR
+        } else if (index($0, "\"$output_identity\" == \"$candidate_identity\"") > 0) {
+          status_identity_checks++
+          status_identity_check = NR
+        }
+        if ($0 == "}") {
+          in_status = 0
+        }
+      }
+
+      if ($0 == "remove_published_run_status() {") {
+        in_status_remove = 1
+        status_remove_starts++
+      }
+      if (in_status_remove) {
+        if (index($0, "RUN_STATUS_PUBLICATION_HANDLE") > 0 &&
+            index($0, "$RESULT_DIR\"/.run-status.*") > 0) {
+          status_remove_handle_path_checks++
+        } else if ($0 == "    rm -f -- \"$output\" || return $?") {
+          status_remove_outputs++
+          status_remove_output = NR
+        } else if ($0 == "    rm -f -- \"$RUN_STATUS_PUBLICATION_HANDLE\" || return $?") {
+          status_remove_handles++
+          status_remove_handle = NR
+        }
+        if ($0 == "}") {
+          in_status_remove = 0
+        }
+      }
+
+      if ($0 == "remove_terminal_owned_run_status_for_rewrite() {") {
+        in_terminal_status_remove = 1
+        terminal_status_remove_starts++
+      }
+      if (in_terminal_status_remove) {
+        if ($0 == "    \"$RUN_STATUS_PUBLICATION_STATE\" =~ ^(published|validated)$ ]] || return 1") {
+          terminal_status_remove_state_guards++
+          terminal_status_remove_state_guard = NR
+        } else if ($0 == "  rm -f -- \"$output\" || return $?") {
+          terminal_status_remove_outputs++
+          terminal_status_remove_output = NR
+        } else if ($0 == "  rm -f -- \"$RUN_STATUS_PUBLICATION_HANDLE\" || return $?") {
+          terminal_status_remove_handles++
+          terminal_status_remove_handle = NR
+        } else if ($0 == "  clear_published_run_status_ownership") {
+          terminal_status_remove_clears++
+          terminal_status_remove_clear = NR
+        }
+        if ($0 == "}") {
+          in_terminal_status_remove = 0
+        }
+      }
+
+      if ($0 == "publish_owned_run_status() {") {
+        in_owned_status_publish = 1
+        owned_status_publish_starts++
+      }
+      if (in_owned_status_publish) {
+        if ($0 == "    remove_terminal_owned_run_status_for_rewrite || return \"$publication_status\"") {
+          owned_status_publish_terminal_removals++
+        }
+        if ($0 == "}") {
+          in_owned_status_publish = 0
+        }
+      }
+
+      if ($0 == "commit_published_run_status() {") {
+        in_status_commit = 1
+        status_commit_starts++
+      }
+      if (in_status_commit) {
+        if ($0 == "    \"$RUN_STATUS_PUBLICATION_STATE\" == validated &&") {
+          status_commit_validated_guards++
+          status_commit_validated_guard = NR
+        } else if ($0 == "  rm -f -- \"$RUN_STATUS_PUBLICATION_HANDLE\" || return $?") {
+          status_commit_handle_removals++
+          status_commit_handle_removal = NR
+        } else if ($0 == "  clear_published_run_status_ownership") {
+          status_commit_clears++
+          status_commit_clear = NR
+        }
+        if ($0 == "}") {
+          in_status_commit = 0
+        }
+      }
+
+      if ($0 == "cleanup() {") {
+        in_cleanup = 1
+        cleanup_starts++
+      }
+      if (in_cleanup) {
+        if ($0 == "  if ((final_status != 0)) && \\") {
+          cleanup_terminal_guards++
+          cleanup_terminal_guard = NR
+        } else if (cleanup_terminal_guards == 1 &&
+                   $0 == "    if seal_terminal_java_diagnostics; then") {
+          cleanup_terminal_seals++
+          cleanup_terminal_seal = NR
+        } else if ($0 == "  cleanup_security_processes") {
+          cleanup_security_calls++
+          cleanup_security_call = NR
+        } else if ($0 == "    capture_evidence") {
+          cleanup_captures++
+          cleanup_capture = NR
+        } else if (index($0, "if safe_compose_down") > 0) {
+          cleanup_stops++
+          cleanup_stop = NR
+        } else if ($0 == "    if publish_owned_run_status \"$final_status\"; then") {
+          cleanup_status_publications++
+          cleanup_status_publication = NR
+        } else if ($0 == "    if publish_project_guard_holder_status_with_retries \"$final_status\"; then") {
+          cleanup_holder_publications++
+          cleanup_holder_publication = NR
+        } else if ($0 == "          remove_terminal_owned_run_status_for_rewrite; then") {
+          cleanup_terminal_status_rewrites++
+          cleanup_terminal_status_rewrite = NR
+        } else if ($0 == "    if commit_published_run_status; then") {
+          cleanup_status_commits++
+          cleanup_status_commit = NR
+        }
+        if ($0 == "}") {
+          in_cleanup = 0
+        }
+      }
+
+      if ($0 == "run_primary_security_control() {") {
+        in_primary_security = 1
+        primary_security_starts++
+      }
+      if (in_primary_security) {
+        if ($0 == "  capture_terminal_java_diagnostics_recovery_boundary || return $?") {
+          primary_security_boundaries++
+          primary_security_boundary = NR
+        } else if (index($0, "SCENARIO_VARIANT=\"security-primary-recovery\"") > 0) {
+          primary_security_recoveries++
+          primary_security_recovery = NR
+        } else if ($0 == "  commit_terminal_java_diagnostics_recovery_boundary || return $?") {
+          primary_security_commits++
+          primary_security_commit = NR
+        } else if ($0 == "  clear_terminal_java_diagnostics_recovery_boundary || return $?") {
+          primary_security_clears++
+          primary_security_clear = NR
+        } else if (index($0, "run_primary_live_fd_security_control") > 0) {
+          primary_security_nested_controls++
+          primary_security_nested_control = NR
+        }
+        if ($0 == "}") {
+          in_primary_security = 0
+        }
+      }
+
+      if ($0 == "run_unix_permissive_directory_control() {") {
+        in_permissive_security = 1
+        permissive_security_starts++
+      }
+      if (in_permissive_security) {
+        if ($0 == "  capture_terminal_java_diagnostics_recovery_boundary || return $?") {
+          permissive_security_boundaries++
+          permissive_security_boundary = NR
+        } else if (permissive_security_boundaries == 1 &&
+                   index($0, "${COMPOSE[@]}\" stop --timeout") > 0) {
+          permissive_security_recoveries++
+          permissive_security_recovery = NR
+        }
+        if ($0 == "}") {
+          in_permissive_security = 0
+        }
+      }
+
+      if ($0 == "run_unix_security_control() {") {
+        in_unix_security = 1
+        unix_security_starts++
+      }
+      if (in_unix_security) {
+        if ($0 == "  capture_terminal_java_diagnostics_recovery_boundary || return $?") {
+          unix_security_boundaries++
+          unix_security_boundary = NR
+        } else if (index($0, "post-replacement Unix bridge recovery") > 0) {
+          unix_security_endpoint_recoveries++
+          unix_security_endpoint_recovery = NR
+        } else if ($0 == "  commit_terminal_java_diagnostics_recovery_boundary || return $?") {
+          unix_security_commits++
+          unix_security_commit_line[unix_security_commits] = NR
+        } else if ($0 == "  clear_terminal_java_diagnostics_recovery_boundary || return $?") {
+          unix_security_clears++
+          unix_security_clear_line[unix_security_clears] = NR
+        } else if ($0 == "  run_unix_permissive_directory_control || return $?") {
+          unix_security_permissive_calls++
+          unix_security_permissive_call = NR
+        } else if (index($0, "SCENARIO_VARIANT=\"security-recovery\"") > 0) {
+          unix_security_final_recoveries++
+          unix_security_final_recovery = NR
+        }
+        if ($0 == "}") {
+          in_unix_security = 0
+        }
+      }
+
+      if ($0 == "run_delayed_otlp_suppression_control() {") {
+        current_recovery = "delayed"
+        recovery_starts[current_recovery]++
+      } else if ($0 == "run_primary_w3c_stale_control() {") {
+        current_recovery = "primary-stale"
+        recovery_starts[current_recovery]++
+      } else if ($0 == "run_unix_w3c_stale_control() {") {
+        current_recovery = "unix-stale"
+        recovery_starts[current_recovery]++
+      } else if ($0 == "run_w3c_fault_control() {") {
+        current_recovery = "w3c-fault"
+        recovery_starts[current_recovery]++
+      } else if ($0 == "run_late_attach_control() {") {
+        current_recovery = "late-attach"
+        recovery_starts[current_recovery]++
+      } else if ($0 == "run_w3c_match_control() {") {
+        current_recovery = "w3c-match"
+        recovery_starts[current_recovery]++
+      }
+      if (current_recovery != "") {
+        if ($0 == "  if ((control_status != 0)); then" &&
+            recovery_seals[current_recovery] == 0) {
+          recovery_guards[current_recovery]++
+          recovery_guard[current_recovery] = NR
+        } else if ($0 ~ /^ +if seal_terminal_java_diagnostics; then$/) {
+          recovery_seals[current_recovery]++
+          if (recovery_seals[current_recovery] == 1) {
+            recovery_first_seal[current_recovery] = NR
+          }
+          recovery_seal[current_recovery] = NR
+        } else if ($0 ~ /^ +terminal_diagnostics_status=\$\?$/) {
+          recovery_statuses[current_recovery]++
+          recovery_status[current_recovery] = NR
+        } else if ($0 ~ /^ +(if|elif) capture_terminal_java_diagnostics_recovery_boundary; then$/) {
+          recovery_boundaries[current_recovery]++
+          recovery_boundary[current_recovery] = NR
+        } else if ($0 ~ /^ +commit_terminal_java_diagnostics_recovery_boundary \|\| return \$\?$/) {
+          recovery_commits[current_recovery]++
+          recovery_commit[current_recovery] = NR
+        } else if ($0 ~ /^ +clear_terminal_java_diagnostics_recovery_boundary \|\| return \$\?$/) {
+          recovery_clears[current_recovery]++
+          recovery_clear[current_recovery] = NR
+        }
+        if ((current_recovery == "delayed" &&
+             index($0, "post-delayed-otlp suppression restoration") > 0) ||
+            (current_recovery == "primary-stale" &&
+             index($0, "post-primary W3C stale recovery") > 0) ||
+            (current_recovery == "unix-stale" &&
+             index($0, "post-Unix W3C stale recovery") > 0) ||
+            (current_recovery == "w3c-fault" &&
+             index($0, "post-fault bridge recovery") > 0) ||
+            (current_recovery == "late-attach" &&
+             index($0, "run_late_attach_recovery_sequence") > 0) ||
+            (current_recovery == "w3c-match" &&
+             index($0, "post-match bridge restoration") > 0)) {
+          recovery_mutations[current_recovery]++
+          recovery_mutation[current_recovery] = NR
+        }
+        if ($0 == "}") {
+          current_recovery = ""
+        }
+      }
+    }
+    END {
+      for (name in lock_wrapper_starts) {
+        if (lock_wrapper_starts[name] != 1) {
+          invalid = 1
+        }
+        if ((name == "record" || name == "capture-boundary" ||
+             name == "commit-boundary" || name == "clear-boundary") &&
+            (lock_wrapper_calls[name] != 1 || lock_wrapper_targets[name] != 1 ||
+             lock_wrapper_prefreezes[name] != 0 ||
+             !(lock_wrapper_call[name] < lock_wrapper_target[name]))) {
+          invalid = 1
+        }
+        if (name == "freeze" &&
+            (lock_wrapper_calls[name] != 1 || lock_wrapper_targets[name] != 1 ||
+             lock_wrapper_prefreezes[name] != 1 ||
+             !(lock_wrapper_prefreeze[name] < lock_wrapper_call[name] &&
+               lock_wrapper_call[name] < lock_wrapper_target[name]))) {
+          invalid = 1
+        }
+        if (name == "seal" &&
+            (lock_wrapper_calls[name] != 1 || lock_wrapper_targets[name] != 1 ||
+             lock_wrapper_prefreezes[name] != 1 ||
+             !(lock_wrapper_prefreeze[name] < lock_wrapper_call[name] &&
+               lock_wrapper_call[name] < lock_wrapper_target[name]))) {
+          invalid = 1
+        }
+      }
+      if (lock_wrapper_starts["record"] != 1 ||
+          lock_wrapper_starts["capture-boundary"] != 1 ||
+          lock_wrapper_starts["commit-boundary"] != 1 ||
+          lock_wrapper_starts["clear-boundary"] != 1 ||
+          lock_wrapper_starts["freeze"] != 1 ||
+          lock_wrapper_starts["seal"] != 1 ||
+          unlocked_seal_starts != 1 || unlocked_seal_freezes != 1 ||
+          unlocked_seal_public_freezes != 0 ||
+          recovery_state_seal_starts != 1 ||
+          recovery_state_transition_reads != 1 ||
+          recovery_state_commit_guards != 1 ||
+          recovery_state_committed_boundary_validators != 1 ||
+          recovery_state_boundary_captures != 1 ||
+          recovery_state_boundary_seals != 1 ||
+          recovery_state_live_seals != 3 ||
+          !(recovery_state_transition_read < recovery_state_commit_guard &&
+            recovery_state_commit_guard < recovery_state_boundary_capture &&
+            recovery_state_boundary_capture < recovery_state_boundary_seal) ||
+          legacy_dynamic_boundaries != 0 ||
+          boundary_capture_starts != 1 ||
+          boundary_capture_freeze_guards != 1 ||
+          boundary_capture_pending_guards != 1 ||
+          boundary_commit_starts != 1 ||
+          boundary_commit_freeze_guards != 1 ||
+          boundary_commit_payload_validators != 1 ||
+          recovery_commit_validator_starts != 1 ||
+          recovery_commit_expected_digests != 1 ||
+          recovery_commit_digest_reads != 1 ||
+          recovery_commit_digest_comparisons != 1 ||
+          recovery_commit_digest_publications != 1 ||
+          !(recovery_commit_expected_digest < recovery_commit_digest_read &&
+            recovery_commit_digest_read < recovery_commit_digest_comparison) ||
+          boundary_clear_starts != 1 || boundary_clears != 1 ||
+          commit_clears != 1 || !(boundary_clear < commit_clear) ||
+          freeze_no_follow_links != 1 || terminal_no_follow_links != 1 ||
+          recovery_boundary_no_follow_links != 1 ||
+          recovery_commit_no_follow_links != 1 ||
+          extractor_no_follow_links != 2 || freeze_retry_loops != 1 ||
+          bounded_lock_acquires != 1 || terminal_lock_starts != 1 ||
+          terminal_lock_stat_formats != 2 ||
+          terminal_lock_owner_suffixes != 1 || terminal_lock_gid_checks != 0) {
+        invalid = 1
+      }
+      for (name in required) {
+        if (starts[name] != 1 || traps[name] != 1 || relaxed[name] != 1 ||
+            seals[name] != 1 || seal_statuses[name] != 1 || mutation[name] != 1 ||
+            !(trap_line[name] < relaxed_line[name] &&
+              relaxed_line[name] < seal_line[name] &&
+              seal_line[name] < seal_status_line[name] &&
+              seal_status_line[name] < mutation_line[name])) {
+          invalid = 1
+        }
+      }
+      for (name in outer_required) {
+        if (outer_starts[name] != 1 || outer_arms[name] != 1 ||
+            outer_successes[name] != 1 || outer_disarms[name] != 1 ||
+            outer_boundaries[name] != 1 || outer_recoveries[name] != 1 ||
+            outer_commits[name] != 1 || outer_clears[name] != 1 ||
+            !(outer_arm[name] < outer_boundary[name] &&
+              outer_boundary[name] < outer_recovery[name] &&
+              outer_recovery[name] < outer_success[name] &&
+              outer_success[name] < outer_commit[name] &&
+              outer_commit[name] < outer_disarm[name] &&
+              outer_disarm[name] < outer_clear[name])) {
+          invalid = 1
+        }
+      }
+      if (arms["restore_permanent_absence_stack"] != 1 ||
+          !(relaxed_line["restore_permanent_absence_stack"] < arm_line["restore_permanent_absence_stack"] &&
+            arm_line["restore_permanent_absence_stack"] < seal_line["restore_permanent_absence_stack"])) {
+        invalid = 1
+      }
+      if (nonzero_guards["cleanup_restart_traffic"] != 1 ||
+          !(relaxed_line["cleanup_restart_traffic"] < nonzero_guard_line["cleanup_restart_traffic"] &&
+            nonzero_guard_line["cleanup_restart_traffic"] < seal_line["cleanup_restart_traffic"])) {
+        invalid = 1
+      }
+      if (abort_starts != 1 || abort_seals != 1 || abort_statuses != 1 ||
+          abort_captures != 1 ||
+          abort_stops != 1 ||
+          !(abort_seal < abort_status && abort_status < abort_capture &&
+            abort_capture < abort_stop)) {
+        invalid = 1
+      }
+      if (deliberate_starts != 1 || deliberate_seals != 1 ||
+          deliberate_reads != 1 || deliberate_dies != 1 ||
+          !(deliberate_seal < deliberate_read && deliberate_read < deliberate_die)) {
+        invalid = 1
+      }
+      if (capture_starts != 1 || capture_curls != 1 || capture_heads != 1 ||
+          capture_bounds != 1 || capture_validators != 1 || capture_moves != 1 ||
+          capture_records != 1 || capture_negated_status != 0 ||
+          !(capture_curl < capture_head && capture_head < capture_bound &&
+            capture_bound < capture_validator && capture_validator < capture_move &&
+            capture_move < capture_record)) {
+        invalid = 1
+      }
+      if (header_starts != 1 || header_records != 1 ||
+          terminal_extract_starts != 1 || terminal_extract_records != 1) {
+        invalid = 1
+      }
+      if (status_starts != 1 || status_seals != 1 || status_writes != 1 ||
+          status_links != 1 || status_handle_sets != 1 || status_output_sets != 1 ||
+          status_prepared_sets != 1 || status_published_sets != 1 ||
+          status_side_effect_guards != 1 ||
+          status_side_effect_published_sets != 1 ||
+          status_validated_sets != 1 ||
+          status_identity_checks != 1 ||
+          !(status_seal < status_write && status_write < status_handle_set &&
+            status_handle_set < status_output_set &&
+            status_output_set < status_prepared_set &&
+            status_prepared_set < status_link && status_link < status_published_set &&
+            status_published_set < status_side_effect_guard &&
+            status_side_effect_guard < status_side_effect_published_set &&
+            status_side_effect_published_set < status_identity_check &&
+            status_identity_check < status_validated_set)) {
+        invalid = 1
+      }
+      if (status_remove_starts != 1 || status_remove_handle_path_checks != 1 ||
+          status_remove_outputs != 1 || status_remove_handles != 1 ||
+          !(status_remove_output < status_remove_handle) ||
+          terminal_status_remove_starts != 1 ||
+          terminal_status_remove_state_guards != 1 ||
+          terminal_status_remove_outputs != 1 ||
+          terminal_status_remove_handles != 1 ||
+          terminal_status_remove_clears != 1 ||
+          !(terminal_status_remove_state_guard < terminal_status_remove_output &&
+            terminal_status_remove_output < terminal_status_remove_handle &&
+            terminal_status_remove_clear == terminal_status_remove_handle + 1) ||
+          owned_status_publish_starts != 1 ||
+          owned_status_publish_terminal_removals != 1 ||
+          status_commit_starts != 1 || status_commit_handle_removals != 1 ||
+          status_commit_clears != 1 || status_commit_validated_guards != 1 ||
+          !(status_commit_validated_guard < status_commit_handle_removal &&
+            status_commit_clear == status_commit_handle_removal + 1)) {
+        invalid = 1
+      }
+      if (cleanup_starts != 1 || cleanup_terminal_guards != 1 ||
+          cleanup_terminal_seals != 1 || cleanup_security_calls != 1 ||
+          cleanup_captures != 1 || cleanup_stops != 1 ||
+          cleanup_status_publications != 1 || cleanup_holder_publications != 1 ||
+          cleanup_terminal_status_rewrites != 1 || cleanup_status_commits != 1 ||
+          !(cleanup_terminal_guard < cleanup_terminal_seal &&
+            cleanup_terminal_seal < cleanup_security_call &&
+            cleanup_security_call < cleanup_capture &&
+            cleanup_capture < cleanup_stop &&
+            cleanup_stop < cleanup_status_publication &&
+            cleanup_status_publication < cleanup_holder_publication &&
+            cleanup_holder_publication < cleanup_terminal_status_rewrite &&
+            cleanup_terminal_status_rewrite < cleanup_status_commit)) {
+        invalid = 1
+      }
+      if (primary_security_starts != 1 || primary_security_boundaries != 1 ||
+          primary_security_recoveries != 1 || primary_security_commits != 1 ||
+          primary_security_clears != 1 || primary_security_nested_controls != 1 ||
+          !(primary_security_boundary < primary_security_recovery &&
+            primary_security_recovery < primary_security_commit &&
+            primary_security_commit < primary_security_clear &&
+            primary_security_clear < primary_security_nested_control)) {
+        invalid = 1
+      }
+      if (permissive_security_starts != 1 ||
+          permissive_security_boundaries != 1 ||
+          permissive_security_recoveries != 1 ||
+          !(permissive_security_boundary < permissive_security_recovery)) {
+        invalid = 1
+      }
+      if (unix_security_starts != 1 || unix_security_boundaries != 1 ||
+          unix_security_endpoint_recoveries != 1 ||
+          unix_security_commits != 2 || unix_security_clears != 2 ||
+          unix_security_permissive_calls != 1 ||
+          unix_security_final_recoveries != 1 ||
+          !(unix_security_boundary < unix_security_endpoint_recovery &&
+            unix_security_endpoint_recovery < unix_security_commit_line[1] &&
+            unix_security_commit_line[1] < unix_security_clear_line[1] &&
+            unix_security_clear_line[1] < unix_security_permissive_call &&
+            unix_security_permissive_call < unix_security_final_recovery &&
+            unix_security_final_recovery < unix_security_commit_line[2] &&
+            unix_security_commit_line[2] < unix_security_clear_line[2])) {
+        invalid = 1
+      }
+      for (name in recovery_starts) {
+        if (recovery_starts[name] != 1 ||
+            recovery_seals[name] != recovery_expected_seals[name] ||
+            recovery_statuses[name] != recovery_expected_seals[name] ||
+            recovery_boundaries[name] != 1 || recovery_commits[name] != 1 ||
+            recovery_clears[name] != 1 || recovery_mutations[name] != 1 ||
+            !(recovery_boundary[name] < recovery_mutation[name] &&
+              recovery_mutation[name] < recovery_seal[name] &&
+              recovery_seal[name] < recovery_status[name] &&
+              recovery_status[name] < recovery_commit[name] &&
+              recovery_commit[name] < recovery_clear[name])) {
+          invalid = 1
+        }
+        if (recovery_requires_guard[name] &&
+            (recovery_guards[name] != 1 ||
+             !(recovery_guard[name] < recovery_first_seal[name] &&
+               recovery_first_seal[name] < recovery_boundary[name]))) {
+          invalid = 1
+        }
+      }
+      if (recovery_starts["delayed"] != 1 ||
+          recovery_starts["primary-stale"] != 1 ||
+          recovery_starts["unix-stale"] != 1 ||
+          recovery_starts["w3c-fault"] != 1 ||
+          recovery_starts["late-attach"] != 1 ||
+          recovery_starts["w3c-match"] != 1) {
+        invalid = 1
+      }
+      if (invalid && ENVIRON["OBI_TERMINAL_DIAGNOSTICS_SOURCE_DEBUG"] == "1") {
+        for (name in required) {
+          printf "handler=%s start=%d trap=%d relaxed=%d seal=%d seal_status=%d mutation=%d\n", \
+            name, starts[name], traps[name], relaxed[name], seals[name], \
+            seal_statuses[name], mutation[name] \
+            > "/dev/stderr"
+        }
+        for (name in outer_required) {
+          printf "outer=%s start=%d arm=%d boundary=%d recovery=%d success=%d commit=%d disarm=%d clear=%d\n", name, \
+            outer_starts[name], outer_arms[name], outer_boundaries[name], \
+            outer_recoveries[name], outer_successes[name], outer_commits[name], \
+            outer_disarms[name], outer_clears[name] \
+            > "/dev/stderr"
+        }
+        for (name in lock_wrapper_starts) {
+          printf "lock=%s start=%d call=%d target=%d prefreeze=%d first=%d last=%d target_line=%d\n", \
+            name, lock_wrapper_starts[name], lock_wrapper_calls[name], \
+            lock_wrapper_targets[name], lock_wrapper_prefreezes[name], \
+            lock_wrapper_first_call[name], lock_wrapper_call[name], \
+            lock_wrapper_target[name] > "/dev/stderr"
+        }
+        printf "lock-core terminal=%d format=%d owner=%d gid=%d seal=%d/freeze%d/public%d links=%d/%d/%d/%d/%d retry=%d acquire=%d\n", \
+          terminal_lock_starts, terminal_lock_stat_formats, \
+          terminal_lock_owner_suffixes, terminal_lock_gid_checks, \
+          unlocked_seal_starts, unlocked_seal_freezes, \
+          unlocked_seal_public_freezes, freeze_no_follow_links, \
+          terminal_no_follow_links, recovery_boundary_no_follow_links, \
+          recovery_commit_no_follow_links, extractor_no_follow_links, \
+          freeze_retry_loops, bounded_lock_acquires > "/dev/stderr"
+        printf "recovery-state=%d read=%d guard=%d committed-valid=%d capture=%d boundary-seal=%d live-seal=%d legacy=%d helpers=%d/%d/%d capture-guards=%d/%d commit-guard=%d/validator=%d clear=%d/%d\n", \
+          recovery_state_seal_starts, recovery_state_transition_reads, \
+          recovery_state_commit_guards, recovery_state_committed_boundary_validators, \
+          recovery_state_boundary_captures, recovery_state_boundary_seals, \
+          recovery_state_live_seals, legacy_dynamic_boundaries, \
+          boundary_capture_starts, boundary_commit_starts, boundary_clear_starts, \
+          boundary_capture_freeze_guards, boundary_capture_pending_guards, \
+          boundary_commit_freeze_guards, boundary_commit_payload_validators, \
+          boundary_clears, commit_clears > "/dev/stderr"
+        printf "abort=%d/%d/%d/%d deliberate=%d/%d/%d/%d capture=%d/%d/%d/%d/%d/%d/%d status=%d/%d/%d/link%d/id%d cleanup=%d/%d/%d\n", \
+          abort_starts, abort_seals, abort_captures, abort_stops, \
+          deliberate_starts, deliberate_seals, deliberate_reads, deliberate_dies, \
+          capture_starts, capture_curls, capture_heads, capture_bounds, \
+          capture_validators, capture_moves, capture_records, \
+          status_starts, status_seals, status_writes, status_links, status_identity_checks, \
+          cleanup_starts, cleanup_captures, cleanup_stops > "/dev/stderr"
+        for (name in recovery_starts) {
+          printf "recovery=%s start=%d guard=%d seal=%d seal_status=%d boundary=%d mutation=%d commit=%d clear=%d lines=%d/%d/%d/%d/%d\n", \
+            name, recovery_starts[name], recovery_guards[name], \
+            recovery_seals[name], recovery_statuses[name], \
+            recovery_boundaries[name], recovery_mutations[name], \
+            recovery_commits[name], recovery_clears[name], \
+            recovery_boundary[name], recovery_mutation[name], \
+            recovery_seal[name], recovery_commit[name], recovery_clear[name] \
+            > "/dev/stderr"
+        }
+      }
+      exit invalid ? 1 : 0
+    }
+  ' <<<"$runner_source"
+}
+
+test_terminal_java_diagnostics_hooks_are_mutation_sensitive() {
+  local -r runner="$TEST_SCRIPT_DIR/../run.sh"
+  local runner_source=""
+  local mutation=""
+  local occurrence=""
+  local spec=""
+  local target=""
+  local -a recovery_handlers=(
+    restore_permanent_absence_stack
+    restore_auto_unavailable_stack
+    cleanup_restart_traffic
+    restore_helper_attach_failure_stack
+    restore_primary_w3c_fault_stack
+    restore_primary_generation_mismatch_stack
+    restore_unix_generation_mismatch_stack
+    restore_primary_live_fd_security_stack
+  )
+  local -a successful_wrappers=(
+    run_permanent_absence_control
+    run_auto_unavailable_control
+    run_helper_attach_failure_control
+    run_primary_w3c_fault_control
+    run_primary_generation_mismatch_control
+    run_unix_generation_mismatch_control
+    run_primary_live_fd_security_control
+    run_restart_during_traffic_control
+  )
+
+  runner_source="$(<"$runner")" || return 1
+  terminal_java_diagnostics_source_contract_is_safe "$runner_source" || {
+    printf 'terminal Java diagnostics source contract is incomplete\n' >&2
+    return 1
+  }
+
+  mutation="$(awk '
+    $0 == "cleanup() {" { inside = 1 }
+    inside && !changed &&
+      $0 == "    if seal_terminal_java_diagnostics; then" {
+      print "    if true; then"
+      changed = 1
+      next
+    }
+    { print }
+    inside && $0 == "}" { inside = 0 }
+    END { if (!changed) exit 1 }
+  ' <<<"$runner_source")" || return 1
+  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+    printf 'terminal diagnostics accepted cleanup recovery before sealing\n' >&2
+    return 1
+  fi
+
+  for spec in \
+    'run_primary_security_control|capture_terminal_java_diagnostics_recovery_boundary|1' \
+    'run_primary_security_control|commit_terminal_java_diagnostics_recovery_boundary|1' \
+    'run_primary_security_control|clear_terminal_java_diagnostics_recovery_boundary|1' \
+    'run_unix_permissive_directory_control|capture_terminal_java_diagnostics_recovery_boundary|1' \
+    'run_unix_security_control|capture_terminal_java_diagnostics_recovery_boundary|1' \
+    'run_unix_security_control|commit_terminal_java_diagnostics_recovery_boundary|1' \
+    'run_unix_security_control|commit_terminal_java_diagnostics_recovery_boundary|2' \
+    'run_unix_security_control|clear_terminal_java_diagnostics_recovery_boundary|1' \
+    'run_unix_security_control|clear_terminal_java_diagnostics_recovery_boundary|2'; do
+    IFS='|' read -r target hook occurrence <<<"$spec"
+    mutation="$(awk -v target="$target" -v hook="$hook" -v wanted="$occurrence" '
+      $0 == target "() {" { inside = 1 }
+      inside && index($0, hook) > 0 {
+        seen++
+        if (seen == wanted) {
+          sub(hook, "true")
+          changed++
+        }
+      }
+      { print }
+      inside && $0 == "}" { inside = 0 }
+      END { if (changed != 1) exit 1 }
+    ' <<<"$runner_source")" || return 1
+    if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+      printf 'terminal diagnostics accepted missing security hook %s #%s in %s\n' \
+        "$hook" "$occurrence" "$target" >&2
+      return 1
+    fi
+  done
+
+  mutation="$(awk '
+    $0 == "run_primary_security_control() {" { inside = 1 }
+    inside && !held &&
+      $0 == "  capture_terminal_java_diagnostics_recovery_boundary || return $?" {
+      held = 1
+      next
+    }
+    inside && held && !moved &&
+      index($0, "SCENARIO_VARIANT=\"security-primary-recovery\"") > 0 {
+      print
+      print "  capture_terminal_java_diagnostics_recovery_boundary || return $?"
+      moved = 1
+      next
+    }
+    { print }
+    inside && $0 == "}" { inside = 0 }
+    END { if (!held || !moved) exit 1 }
+  ' <<<"$runner_source")" || return 1
+  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+    printf 'terminal diagnostics accepted a post-recovery primary-security capture\n' >&2
+    return 1
+  fi
+
+  mutation="$(awk '
+    $0 == "run_unix_security_control() {" { inside = 1 }
+    inside && !held &&
+      $0 == "  capture_terminal_java_diagnostics_recovery_boundary || return $?" {
+      held = 1
+      next
+    }
+    inside && held && !moved &&
+      $0 == "  assert_selected_transport unix || return $?" {
+      print
+      print "  capture_terminal_java_diagnostics_recovery_boundary || return $?"
+      moved = 1
+      next
+    }
+    { print }
+    inside && $0 == "}" { inside = 0 }
+    END { if (!held || !moved) exit 1 }
+  ' <<<"$runner_source")" || return 1
+  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+    printf 'terminal diagnostics accepted a post-recovery Unix-security capture\n' >&2
+    return 1
+  fi
+
+  mutation="$(awk '
+    $0 == "run_unix_permissive_directory_control() {" { inside = 1 }
+    inside && !held &&
+      $0 == "  capture_terminal_java_diagnostics_recovery_boundary || return $?" {
+      held = 1
+      next
+    }
+    inside && held && !moved &&
+      $0 == "  UNIX_SECURITY_DIRECTORY_RELAXED=false" {
+      print
+      print "  capture_terminal_java_diagnostics_recovery_boundary || return $?"
+      moved = 1
+      next
+    }
+    { print }
+    inside && $0 == "}" { inside = 0 }
+    END { if (!held || !moved) exit 1 }
+  ' <<<"$runner_source")" || return 1
+  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+    printf 'terminal diagnostics accepted a post-restore permissive capture\n' >&2
+    return 1
+  fi
+
+  for target in \
+    record_last_java_diagnostics_reference \
+    capture_terminal_java_diagnostics_recovery_boundary \
+    commit_terminal_java_diagnostics_recovery_boundary \
+    clear_terminal_java_diagnostics_recovery_boundary \
+    freeze_terminal_java_diagnostics \
+    seal_terminal_java_diagnostics; do
+    mutation="$(awk -v target="$target" '
+      $0 == target "() {" { inside = 1 }
+      inside && !removed &&
+        $0 ~ /^  +with_terminal_java_diagnostics_lock \\$/ {
+        removed = 1
+        next
+      }
+      { print }
+      inside && $0 == "}" { inside = 0 }
+      END { if (!removed) exit 1 }
+    ' <<<"$runner_source")" || return 1
+    if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+      printf 'terminal diagnostics accepted an unlocked %s\n' "$target" >&2
+      return 1
+    fi
+  done
+
+  for target in \
+    freeze_terminal_java_diagnostics \
+    seal_terminal_java_diagnostics; do
+    mutation="$(awk -v target="$target" '
+      $0 == target "() {" { inside = 1 }
+      inside && !removed &&
+        $0 == "  freeze_terminal_java_diagnostics_unlocked || return $?" {
+        removed = 1
+        next
+      }
+      { print }
+      inside && $0 == "}" { inside = 0 }
+      END { if (!removed) exit 1 }
+    ' <<<"$runner_source")" || return 1
+    if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+      printf 'terminal diagnostics accepted a pre-lock freeze omission in %s\n' \
+        "$target" >&2
+      return 1
+    fi
+  done
+
+  mutation="$(awk '
+    $0 == "with_terminal_java_diagnostics_lock() (" { inside = 1 }
+    {
+      line = $0
+      if (inside && index(line, "stat -Lc") > 0 &&
+          index(line, "%d:%i:%h:%u:%a") > 0) {
+        sub(/%u:%a/, "%u:%g:%a", line)
+        changed++
+      }
+      if (inside && index(line, "$path_identity") > 0 &&
+          index(line, "$(id -u):600") > 0) {
+        sub(/\$\(id -u\):600/, "$(id -u):$(id -g):600", line)
+        changed++
+      }
+      print line
+    }
+    inside && $0 == ")" { inside = 0 }
+    END { if (changed != 3) exit 1 }
+  ' <<<"$runner_source")" || return 1
+  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+    printf 'terminal diagnostics accepted a primary-GID lock restriction\n' >&2
+    return 1
+  fi
+
+  for target in freeze terminal boundary output; do
+    mutation="$(awk -v target="\$$target" '
+      !changed && index($0,
+        "if ln -T -- \"$candidate\" \"" target "\"; then") > 0 {
+        sub(/ln -T --/, "ln --")
+        changed = 1
+      }
+      { print }
+      END { if (!changed) exit 1 }
+    ' <<<"$runner_source")" || return 1
+    if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+      printf 'terminal diagnostics accepted a directory-following %s link\n' \
+        "$target" >&2
+      return 1
+    fi
+  done
+
+  mutation="$(awk '
+    $0 == "commit_terminal_java_diagnostics_recovery_boundary_unlocked() {" {
+      inside = 1
+    }
+    inside && !changed &&
+      $0 == "  if ln -T -- \"$candidate\" \"$freeze\"; then" {
+      sub(/ln -T --/, "ln --")
+      changed = 1
+    }
+    { print }
+    inside && $0 == "}" { inside = 0 }
+    END { if (!changed) exit 1 }
+  ' <<<"$runner_source")" || return 1
+  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+    printf 'terminal diagnostics accepted a directory-following recovery commit\n' >&2
+    return 1
+  fi
+
+  mutation="$(awk '
+    $0 == "terminal_java_diagnostics_recovery_commit_is_valid() {" {
+      inside = 1
+    }
+    inside && !changed &&
+      $0 == "    [[ \"$boundary_digest\" == \"$expected_boundary_digest\" ]] || return 1" {
+      print "    [[ -n \"$expected_boundary_digest\" ]] || return 1"
+      changed = 1
+      next
+    }
+    { print }
+    inside && $0 == "}" { inside = 0 }
+    END { if (!changed) exit 1 }
+  ' <<<"$runner_source")" || return 1
+  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+    printf 'terminal diagnostics accepted an unbound recovery commit digest\n' >&2
+    return 1
+  fi
+
+  mutation="$(awk '
+    $0 == "commit_terminal_java_diagnostics_recovery_boundary_unlocked() {" {
+      inside = 1
+    }
+    inside && !changed &&
+      $0 == "    \"$boundary_digest\" >\"$candidate\" &&" {
+      print "    \"0000000000000000000000000000000000000000000000000000000000000000\" >\"$candidate\" &&"
+      changed = 1
+      next
+    }
+    { print }
+    inside && $0 == "}" { inside = 0 }
+    END { if (!changed) exit 1 }
+  ' <<<"$runner_source")" || return 1
+  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+    printf 'terminal diagnostics accepted a substituted recovery commit digest\n' >&2
+    return 1
+  fi
+
+  mutation="$(awk '
+    !changed && $0 == "  for attempt in 1 2 3; do" {
+      sub(/1 2 3/, "1")
+      changed = 1
+    }
+    { print }
+    END { if (!changed) exit 1 }
+  ' <<<"$runner_source")" || return 1
+  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+    printf 'terminal diagnostics accepted a single-attempt freeze publication\n' >&2
+    return 1
+  fi
+
+  for target in "${recovery_handlers[@]}"; do
+    mutation="$(awk -v target="$target" '
+      $0 == "  " target "() {" { inside = 1 }
+      inside && !removed &&
+        ($0 == "    seal_terminal_java_diagnostics" ||
+         $0 == "      seal_terminal_java_diagnostics") {
+        removed = 1
+        next
+      }
+      { print }
+      inside && $0 == "  }" { inside = 0 }
+      END { if (!removed) exit 1 }
+    ' <<<"$runner_source")" || return 1
+    if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+      printf 'terminal diagnostics accepted a missing %s seal\n' "$target" >&2
+      return 1
+    fi
+    mutation="$(awk -v target="$target" '
+      $0 == "  " target "() {" { inside = 1 }
+      inside && !removed && index($0, "terminal_diagnostics_status=$?") > 0 {
+        removed = 1
+        next
+      }
+      { print }
+      inside && $0 == "  }" { inside = 0 }
+      END { if (!removed) exit 1 }
+    ' <<<"$runner_source")" || return 1
+    if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+      printf 'terminal diagnostics accepted a missing %s seal status\n' \
+        "$target" >&2
+      return 1
+    fi
+  done
+
+  for target in "${successful_wrappers[@]}"; do
+    mutation="$(awk -v target="$target" '
+      $0 == target "() (" { inside = 1 }
+      inside && !removed && $0 == "  trap - EXIT" {
+        removed = 1
+        next
+      }
+      { print }
+      inside && $0 == ")" { inside = 0 }
+      END { if (!removed) exit 1 }
+    ' <<<"$runner_source")" || return 1
+    if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+      printf 'terminal diagnostics accepted an armed successful %s exit\n' \
+        "$target" >&2
+      return 1
+    fi
+    mutation="$(awk -v target="$target" '
+      {
+        lines[NR] = $0
+        if ($0 == target "() (") inside = 1
+        if (inside && $0 ~ /^  trap .* EXIT$/ && $0 != "  trap - EXIT") {
+          arm = NR
+          arms++
+        }
+        if (inside && $0 == "  trap - EXIT") {
+          disarm = NR
+          disarms++
+        }
+        if (inside && $0 == ")") inside = 0
+      }
+      END {
+        if (arms != 1 || disarms != 1 || !(arm < disarm)) exit 1
+        for (line = 1; line <= NR; line++) {
+          if (line != disarm) print lines[line]
+          if (line == arm) print "  trap - EXIT"
+        }
+      }
+    ' <<<"$runner_source")" || return 1
+    if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+      printf 'terminal diagnostics accepted an early %s trap disarm\n' \
+        "$target" >&2
+      return 1
+    fi
+    for hook in \
+      capture_terminal_java_diagnostics_recovery_boundary \
+      commit_terminal_java_diagnostics_recovery_boundary \
+      clear_terminal_java_diagnostics_recovery_boundary; do
+      mutation="$(awk -v target="$target" -v hook="$hook" '
+        $0 == target "() (" { inside = 1 }
+        inside && !removed && $0 == "  " hook " || return $?" {
+          removed = 1
+          next
+        }
+        { print }
+        inside && $0 == ")" { inside = 0 }
+        END { if (!removed) exit 1 }
+      ' <<<"$runner_source")" || return 1
+      if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+        printf 'terminal diagnostics accepted a missing %s hook in %s\n' \
+          "$hook" "$target" >&2
+        return 1
+      fi
+    done
+  done
+
+  mutation="$(awk '
+    $0 == "run_auto_unavailable_control() (" { inside = 1 }
+    inside && !held &&
+      $0 == "  capture_terminal_java_diagnostics_recovery_boundary || return $?" {
+      held = 1
+      next
+    }
+    inside && held && !moved && index($0, "restart_since=\"$(date -u") > 0 {
+      print
+      print "  capture_terminal_java_diagnostics_recovery_boundary || return $?"
+      moved = 1
+      next
+    }
+    { print }
+    inside && $0 == ")" { inside = 0 }
+    END { if (!held || !moved) exit 1 }
+  ' <<<"$runner_source")" || return 1
+  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+    printf 'terminal diagnostics accepted a post-mutation recovery capture\n' >&2
+    return 1
+  fi
+
+  mutation="$(awk '
+    $0 == "seal_terminal_java_diagnostics_from_recovery_state_unlocked() {" {
+      inside = 1
+    }
+    inside && !changed &&
+      $0 == "      terminal_java_diagnostics_recovery_boundary_payload" {
+      print "      printf '\''null\\n'\''"
+      changed = 1
+      next
+    }
+    { print }
+    inside && $0 == "}" { inside = 0 }
+    END { if (!changed) exit 1 }
+  ' <<<"$runner_source")" || return 1
+  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+    printf 'terminal diagnostics accepted pending-boundary substitution\n' >&2
+    return 1
+  fi
+
+  mutation="$(awk '
+    $0 == "seal_terminal_java_diagnostics_from_recovery_state_unlocked() {" {
+      inside = 1
+    }
+    inside && !changed &&
+      $0 == "    terminal_java_diagnostics_recovery_commit_is_valid || return $?" {
+      print "    terminal_java_diagnostics_transition_is_valid || return $?"
+      changed = 1
+      next
+    }
+    { print }
+    inside && $0 == "}" { inside = 0 }
+    END { if (!changed) exit 1 }
+  ' <<<"$runner_source")" || return 1
+  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+    printf 'terminal diagnostics accepted an unvalidated committed recovery state\n' >&2
+    return 1
+  fi
+
+  mutation="$(awk '
+    $0 == "commit_terminal_java_diagnostics_recovery_boundary_unlocked() {" {
+      inside = 1
+    }
+    inside && !removed &&
+      $0 == "    ! -e \"$freeze\" && ! -L \"$freeze\" &&" {
+      removed = 1
+      next
+    }
+    { print }
+    inside && $0 == "}" { inside = 0 }
+    END { if (!removed) exit 1 }
+  ' <<<"$runner_source")" || return 1
+  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+    printf 'terminal diagnostics accepted a commit without a freeze fence\n' >&2
+    return 1
+  fi
+
+  mutation="$(awk '
+    $0 == "clear_terminal_java_diagnostics_recovery_boundary_unlocked() {" {
+      inside = 1
+    }
+    {
+      lines[NR] = $0
+      if (inside && $0 == "    rm -f -- \"$boundary\" || return $?") {
+        boundary = NR
+      } else if (inside && $0 == "  rm -f -- \"$transition\" || return $?") {
+        transition = NR
+      }
+      if (inside && $0 == "}") inside = 0
+    }
+    END {
+      if (!boundary || !transition || !(boundary < transition)) exit 1
+      for (line = 1; line <= NR; line++) {
+        if (line == boundary) print lines[transition]
+        else if (line == transition) print lines[boundary]
+        else print lines[line]
+      }
+    }
+  ' <<<"$runner_source")" || return 1
+  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+    printf 'terminal diagnostics accepted commit-first recovery cleanup\n' >&2
+    return 1
+  fi
+
+  for marker in \
+    '  RUN_STATUS_PUBLICATION_HANDLE="$candidate"' \
+    '  RUN_STATUS_PUBLICATION_OUTPUT="$output"' \
+    '  RUN_STATUS_PUBLICATION_STATE=prepared' \
+    '    RUN_STATUS_PUBLICATION_STATE=published' \
+    '      -f "$output" && ! -L "$output" && "$candidate" -ef "$output" ]]; then' \
+    '      RUN_STATUS_PUBLICATION_STATE=published' \
+    '  RUN_STATUS_PUBLICATION_STATE=validated' \
+    '    "$RUN_STATUS_PUBLICATION_STATE" =~ ^(published|validated)$ ]] || return 1' \
+    '    remove_terminal_owned_run_status_for_rewrite || return "$publication_status"' \
+    '          remove_terminal_owned_run_status_for_rewrite; then' \
+    '    if publish_owned_run_status "$final_status"; then' \
+    '    if commit_published_run_status; then'; do
+    mutation="$(awk -v marker="$marker" '
+      !removed && $0 == marker {
+        removed = 1
+        next
+      }
+      { print }
+      END { if (!removed) exit 1 }
+    ' <<<"$runner_source")" || return 1
+    if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+      printf 'terminal diagnostics accepted a missing run-status ownership marker\n' >&2
+      return 1
+    fi
+  done
+
+  mutation="$(awk '
+    $0 == "write_run_status() {" { inside = 1 }
+    inside && !changed &&
+      $0 == "  if ln -T -- \"$candidate\" \"$output\"; then" {
+      sub(/ln -T --/, "ln --")
+      changed = 1
+    }
+    { print }
+    inside && $0 == "}" { inside = 0 }
+    END { if (!changed) exit 1 }
+  ' <<<"$runner_source")" || return 1
+  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+    printf 'terminal diagnostics accepted a directory-following run status\n' >&2
+    return 1
+  fi
+
+  mutation="$(awk '
+    $0 == "remove_published_run_status() {" { inside = 1 }
+    {
+      lines[NR] = $0
+      if (inside && $0 == "    rm -f -- \"$output\" || return $?") output = NR
+      if (inside && $0 == "    rm -f -- \"$RUN_STATUS_PUBLICATION_HANDLE\" || return $?") handle = NR
+      if (inside && $0 == "}") inside = 0
+    }
+    END {
+      if (!output || !handle || !(output < handle)) exit 1
+      for (line = 1; line <= NR; line++) {
+        if (line == output) print lines[handle]
+        else if (line == handle) print lines[output]
+        else print lines[line]
+      }
+    }
+  ' <<<"$runner_source")" || return 1
+  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+    printf 'terminal diagnostics accepted handle-first run-status removal\n' >&2
+    return 1
+  fi
+
+  mutation="$(awk '
+    $0 == "remove_terminal_owned_run_status_for_rewrite() {" { inside = 1 }
+    {
+      lines[NR] = $0
+      if (inside && $0 == "  rm -f -- \"$output\" || return $?") output = NR
+      if (inside && $0 == "  rm -f -- \"$RUN_STATUS_PUBLICATION_HANDLE\" || return $?") handle = NR
+      if (inside && $0 == "}") inside = 0
+    }
+    END {
+      if (!output || !handle || !(output < handle)) exit 1
+      for (line = 1; line <= NR; line++) {
+        if (line == output) print lines[handle]
+        else if (line == handle) print lines[output]
+        else print lines[line]
+      }
+    }
+  ' <<<"$runner_source")" || return 1
+  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+    printf 'terminal diagnostics accepted handle-first terminal status removal\n' >&2
+    return 1
+  fi
+
+  mutation="$(awk '
+    $0 == "  restore_auto_unavailable_stack() {" { inside = 1 }
+    inside && !held && $0 == "    seal_terminal_java_diagnostics" {
+      held = 1
+      next
+    }
+    inside && held && !moved && index($0, "recreate_instrumented_stack") > 0 {
+      print
+      print "    seal_terminal_java_diagnostics"
+      moved = 1
+      next
+    }
+    { print }
+    inside && $0 == "  }" { inside = 0 }
+    END { if (!held || !moved) exit 1 }
+  ' <<<"$runner_source")" || return 1
+  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+    printf 'terminal diagnostics accepted a post-recovery seal\n' >&2
+    return 1
+  fi
+
+  for target in \
+    abort_w3c_fault_mode \
+    run_deliberate_assertion_failure_control \
+    capture_java_diagnostics \
+    extract_java_diagnostics_header \
+    extract_terminal_diagnostics_after \
+    write_run_status; do
+    mutation="$(awk -v target="$target" '
+      $0 == target "() {" { inside = 1 }
+      inside && !removed &&
+        ($0 ~ /seal_terminal_java_diagnostics/ ||
+         $0 ~ /record_last_java_diagnostics_(phase|reference)/) {
+        removed = 1
+        next
+      }
+      { print }
+      inside && $0 == "}" { inside = 0 }
+      END { if (!removed) exit 1 }
+    ' <<<"$runner_source")" || return 1
+    if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+      printf 'terminal diagnostics accepted a missing %s hook\n' "$target" >&2
+      return 1
+    fi
+  done
+
+  for target in \
+    run_delayed_otlp_suppression_control \
+    run_primary_w3c_stale_control \
+    run_unix_w3c_stale_control \
+    run_w3c_fault_control \
+    run_late_attach_control \
+    run_w3c_match_control; do
+    mutation="$(awk -v target="$target" '
+      $0 == target "() {" { inside = 1 }
+      inside && !removed && $0 ~ /^ +if seal_terminal_java_diagnostics; then$/ {
+        removed = 1
+        next
+      }
+      { print }
+      inside && $0 == "}" { inside = 0 }
+      END { if (!removed) exit 1 }
+    ' <<<"$runner_source")" || return 1
+    if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+      printf 'terminal diagnostics accepted a missing %s pre-recovery seal\n' \
+        "$target" >&2
+      return 1
+    fi
+    mutation="$(awk -v target="$target" '
+      $0 == target "() {" { inside = 1 }
+      inside && !removed && index($0, "terminal_diagnostics_status=$?") > 0 {
+        removed = 1
+        next
+      }
+      { print }
+      inside && $0 == "}" { inside = 0 }
+      END { if (!removed) exit 1 }
+    ' <<<"$runner_source")" || return 1
+    if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+      printf 'terminal diagnostics accepted a missing %s seal status\n' \
+        "$target" >&2
+      return 1
+    fi
+    mutation="$(awk -v target="$target" '
+      $0 == target "() {" { inside = 1 }
+      inside && !changed &&
+        index($0, "capture_terminal_java_diagnostics_recovery_boundary") > 0 {
+        sub(/capture_terminal_java_diagnostics_recovery_boundary/, "true")
+        changed = 1
+      }
+      { print }
+      inside && $0 == "}" { inside = 0 }
+      END { if (!changed) exit 1 }
+    ' <<<"$runner_source")" || return 1
+    if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+      printf 'terminal diagnostics accepted a missing %s direct boundary\n' \
+        "$target" >&2
+      return 1
+    fi
+    for hook in \
+      commit_terminal_java_diagnostics_recovery_boundary \
+      clear_terminal_java_diagnostics_recovery_boundary; do
+      mutation="$(awk -v target="$target" -v hook="$hook" '
+        $0 == target "() {" { inside = 1 }
+        inside && !changed && index($0, hook " || return $?") > 0 {
+          sub(hook, "true")
+          changed = 1
+        }
+        { print }
+        inside && $0 == "}" { inside = 0 }
+        END { if (!changed) exit 1 }
+      ' <<<"$runner_source")" || return 1
+      if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+        printf 'terminal diagnostics accepted a missing %s in %s\n' \
+          "$hook" "$target" >&2
+        return 1
+      fi
+    done
+  done
+}
+
+test_terminal_java_diagnostics_capture_is_bounded_and_atomic() {
+  local -r valid_dir="$TEST_TMP_DIR/java-diagnostics-capture-valid"
+  local -r oversized_dir="$TEST_TMP_DIR/java-diagnostics-capture-oversized"
+  local -r unavailable_dir="$TEST_TMP_DIR/java-diagnostics-capture-unavailable"
+  local -r publication_failure_dir="$TEST_TMP_DIR/java-diagnostics-capture-publication-failure"
+  local -r redirected_dir="$TEST_TMP_DIR/java-diagnostics-capture-redirected"
+  local -r redirected_target="$TEST_TMP_DIR/java-diagnostics-capture-outside"
+  local -r fixture="$TEST_TMP_DIR/java-diagnostics-capture-fixture.txt"
+  local snapshot=""
+
+  write_diagnostics_fixture "$fixture" 0 1 0 0 0 0
+  snapshot="$(<"$fixture")" || return 1
+  mkdir -p -- \
+    "$valid_dir" "$oversized_dir" "$unavailable_dir" "$publication_failure_dir"
+  mkdir -p -- "$redirected_dir" "$redirected_target/redirected"
+
+  (
+    RESULT_DIR="$valid_dir"
+    CERT_DIR="$valid_dir/certs"
+    curl() {
+      printf '%s\n' "$snapshot"
+    }
+
+    capture_java_diagnostics valid || return 1
+    cmp -s -- \
+      "$fixture" \
+      "$RESULT_DIR/phases/valid/java-diagnostics.txt" || return 1
+    jq -e '
+      .available == true and
+      .sealed == false and
+      .phase == "valid" and
+      .reference == "phases/valid/java-diagnostics.txt"
+    ' "$RESULT_DIR/.last-valid-java-diagnostics.json" >/dev/null || return 1
+    [[ -f "$RESULT_DIR/phases/valid/java-diagnostics.stderr" &&
+      ! -s "$RESULT_DIR/phases/valid/java-diagnostics.stderr" ]] || return 1
+    ! find "$RESULT_DIR/phases/valid" -maxdepth 1 -type f \
+      -name '.java-diagnostics*' -print -quit | grep -q .
+  ) || {
+    printf 'valid Java diagnostics capture was not installed atomically\n' >&2
+    return 1
+  }
+
+  if (
+    RESULT_DIR="$oversized_dir"
+    CERT_DIR="$oversized_dir/certs"
+    curl() {
+      printf '%*s' "$((TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES + 1))" ''
+    }
+
+    capture_java_diagnostics oversized
+  ) >/dev/null 2>&1; then
+    printf 'oversized Java diagnostics capture was accepted\n' >&2
+    return 1
+  fi
+  [[ "$(<"$oversized_dir/phases/oversized/java-diagnostics.txt")" == \
+      "unavailable" &&
+    ! -e "$oversized_dir/.last-valid-java-diagnostics.json" ]] || {
+    printf 'oversized Java diagnostics capture was retained as valid\n' >&2
+    return 1
+  }
+
+  (
+    RESULT_DIR="$unavailable_dir"
+    CERT_DIR="$unavailable_dir/certs"
+    curl() {
+      return 22
+    }
+
+    capture_java_diagnostics unavailable || return 1
+    [[ "$(<"$RESULT_DIR/phases/unavailable/java-diagnostics.txt")" == \
+        "unavailable" &&
+      -f "$RESULT_DIR/phases/unavailable/java-diagnostics.stderr" &&
+      ! -e "$RESULT_DIR/.last-valid-java-diagnostics.json" ]]
+  ) || {
+    printf 'unavailable Java diagnostics capture was not explicit and bounded\n' >&2
+    return 1
+  }
+
+  (
+    local publication_status=0
+    RESULT_DIR="$publication_failure_dir"
+    CERT_DIR="$publication_failure_dir/certs"
+    curl() {
+      printf '%s\n' "$snapshot"
+    }
+    mv() {
+      local destination="${*: -1}"
+
+      if [[ "$destination" == */java-diagnostics.txt ]]; then
+        return 47
+      fi
+      command mv "$@"
+    }
+
+    set +e
+    capture_java_diagnostics publication-failure
+    publication_status=$?
+    set -e
+    [[ "$publication_status" == 47 &&
+      ! -e "$RESULT_DIR/phases/publication-failure/java-diagnostics.txt" &&
+      ! -e "$RESULT_DIR/.last-valid-java-diagnostics.json" ]] || return 1
+    ! find "$RESULT_DIR/phases/publication-failure" -maxdepth 1 -type f \
+      -name '.java-diagnostics*' -print -quit | grep -q .
+  ) || {
+    printf 'Java diagnostics publication failure returned success or residue\n' >&2
+    return 1
+  }
+
+  printf 'outside-sentinel\n' >"$redirected_target/sentinel"
+  write_diagnostics_fixture \
+    "$redirected_target/redirected/java-diagnostics.txt" 0 1 0 0 0 0
+  ln -s -- "$redirected_target" "$redirected_dir/phases"
+  if (
+    RESULT_DIR="$redirected_dir"
+    CERT_DIR="$redirected_dir/certs"
+    curl() {
+      printf '%s\n' "$snapshot"
+    }
+    capture_java_diagnostics redirected
+  ) >/dev/null 2>&1 ||
+    (
+      RESULT_DIR="$redirected_dir"
+      record_last_java_diagnostics_phase redirected
+    ) >/dev/null 2>&1; then
+    printf 'Java diagnostics followed a redirected phases root\n' >&2
+    return 1
+  fi
+  [[ "$(<"$redirected_target/sentinel")" == "outside-sentinel" &&
+    ! -e "$redirected_dir/.last-valid-java-diagnostics.json" ]] || {
+    printf 'redirected Java diagnostics changed external state\n' >&2
+    return 1
+  }
+}
+
+test_terminal_java_diagnostics_freeze_survives_failed_publication() {
+  local -r result_dir="$TEST_TMP_DIR/terminal-java-diagnostics-freeze"
+  local -r fault="$result_dir/phases/fault/java-diagnostics.txt"
+  local -r recovery="$result_dir/phases/recovery/java-diagnostics.txt"
+  local -r freeze_failure_dir="$TEST_TMP_DIR/terminal-java-diagnostics-freeze-link-failure"
+  local -r freeze_failure_fault="$freeze_failure_dir/phases/fault/java-diagnostics.txt"
+  local -r freeze_failure_recovery="$freeze_failure_dir/phases/recovery/java-diagnostics.txt"
+  local -r freeze_link_failed_marker="$freeze_failure_dir/freeze-link-failed"
+
+  mkdir -p -- "${fault%/*}" "${recovery%/*}"
+  write_diagnostics_fixture "$fault" 0 1 0 0 0 0
+  write_diagnostics_fixture "$recovery" 1 0 0 1 0 0
+  (
+    local seal_status=0
+    local fail_terminal_link=true
+    RESULT_DIR="$result_dir"
+    RUN_STATUS=failed
+    ACCEPTANCE_EVIDENCE=false
+    ACCEPTANCE_EVIDENCE_REASON=targeted-scenario
+    FAILURE_STAGE=fault
+    FAILURE_LINE=11
+    ln() {
+      local destination="${*: -1}"
+
+      if [[ "$destination" == "$RESULT_DIR/terminal-java-diagnostics.json" &&
+        "$fail_terminal_link" == "true" ]]; then
+        fail_terminal_link=false
+        return 47
+      fi
+      command ln "$@"
+    }
+
+    record_last_java_diagnostics_phase fault || return 1
+    set +e
+    seal_terminal_java_diagnostics
+    seal_status=$?
+    set -e
+    [[ "$seal_status" == 47 &&
+      -f "$RESULT_DIR/.terminal-java-diagnostics.freeze" &&
+      ! -e "$RESULT_DIR/terminal-java-diagnostics.json" ]] || return 1
+    if record_last_java_diagnostics_phase recovery; then
+      printf 'recovery diagnostics replaced a failed terminal seal\n' >&2
+      return 1
+    fi
+    unset -f ln
+    write_run_status 17 || return 1
+    jq -e '
+      .status == "failed" and
+      .exit_status == 17 and
+      .java_bridge_diagnostics.available == true and
+      .java_bridge_diagnostics.phase == "fault" and
+      .java_bridge_diagnostics.reference ==
+        "phases/fault/java-diagnostics.txt"
+    ' "$RESULT_DIR/run-status.json" >/dev/null
+  ) || {
+    printf 'failed terminal publication did not preserve the fault snapshot\n' >&2
+    return 1
+  }
+
+  mkdir -p -- "${freeze_failure_fault%/*}" "${freeze_failure_recovery%/*}"
+  write_diagnostics_fixture "$freeze_failure_fault" 0 1 0 0 0 0
+  write_diagnostics_fixture "$freeze_failure_recovery" 1 0 0 1 0 0
+  (
+    RESULT_DIR="$freeze_failure_dir"
+    RUN_STATUS=failed
+    ACCEPTANCE_EVIDENCE=false
+    ACCEPTANCE_EVIDENCE_REASON=targeted-scenario
+    FAILURE_STAGE="fault"
+    FAILURE_LINE=11
+    ln() {
+      local destination="${*: -1}"
+
+      if [[ "$destination" == "$RESULT_DIR/.terminal-java-diagnostics.freeze" &&
+        ! -e "$freeze_link_failed_marker" ]]; then
+        : >"$freeze_link_failed_marker" || return $?
+        return 47
+      fi
+      command ln "$@"
+    }
+
+    record_last_java_diagnostics_phase fault || return 1
+    seal_terminal_java_diagnostics || return 1
+    record_last_java_diagnostics_phase recovery || return 1
+    write_run_status 17 || return 1
+    [[ -f "$freeze_link_failed_marker" ]] || return 1
+    jq -e '
+      .status == "failed" and
+      .exit_status == 17 and
+      .java_bridge_diagnostics.available == true and
+      .java_bridge_diagnostics.phase == "fault" and
+      .java_bridge_diagnostics.reference ==
+        "phases/fault/java-diagnostics.txt"
+    ' "$RESULT_DIR/run-status.json" >/dev/null
+  ) || {
+    printf 'freeze-link failure allowed recovery diagnostics to replace the fault\n' >&2
+    return 1
+  }
+}
+
+test_terminal_java_diagnostics_consumes_one_validated_snapshot() {
+  local -r snapshot_dir="$TEST_TMP_DIR/terminal-java-diagnostics-single-consume"
+  local -r collision_dir="$TEST_TMP_DIR/terminal-java-diagnostics-no-clobber"
+  local -r freeze_symlink_dir="$TEST_TMP_DIR/terminal-java-diagnostics-freeze-symlink-race"
+  local -r terminal_symlink_dir="$TEST_TMP_DIR/terminal-java-diagnostics-terminal-symlink-race"
+  local -r symlink_target="$TEST_TMP_DIR/terminal-java-diagnostics-symlink-target"
+  local -r snapshot_file="$snapshot_dir/phases/fault/java-diagnostics.txt"
+  local original_snapshot=""
+
+  mkdir -p -- "${snapshot_file%/*}" "$collision_dir/phases/fault"
+  write_diagnostics_fixture "$snapshot_file" 0 1 0 0 0 0
+  original_snapshot="$(<"$snapshot_file")" || return 1
+  (
+    local replace_after_read=true
+    RESULT_DIR="$snapshot_dir"
+    mapfile() {
+      builtin mapfile "$@" || return $?
+      if [[ "$replace_after_read" == "true" ]]; then
+        replace_after_read=false
+        printf 'secret=unvalidated\n' >"$snapshot_file" || return $?
+      fi
+    }
+
+    record_last_java_diagnostics_phase fault || return 1
+    jq -e --arg expected "$original_snapshot" '
+      .snapshot == $expected and
+      .counters.t_stale == "1"
+    ' "$RESULT_DIR/.last-valid-java-diagnostics.json" >/dev/null || return 1
+    ! grep -Fq 'secret=unvalidated' \
+      "$RESULT_DIR/.last-valid-java-diagnostics.json"
+  ) || {
+    printf 'Java diagnostics consumed bytes different from those validated\n' >&2
+    return 1
+  }
+
+  write_diagnostics_fixture \
+    "$collision_dir/phases/fault/java-diagnostics.txt" 0 1 0 0 0 0
+  (
+    local inject_terminal=true
+    RESULT_DIR="$collision_dir"
+    ln() {
+      local destination="${*: -1}"
+
+      if [[ "$destination" == "$RESULT_DIR/terminal-java-diagnostics.json" &&
+        "$inject_terminal" == "true" ]]; then
+        inject_terminal=false
+        printf '%s\n' \
+          '{"schema":"obi-java-bridge-terminal-diagnostics-v1","sealed":true,"available":false,"reason":"no-valid-snapshot-before-terminal-boundary"}' \
+          >"$destination" || return $?
+        chmod 0644 -- "$destination" || return $?
+        return 1
+      fi
+      command ln "$@"
+    }
+
+    record_last_java_diagnostics_phase fault || return 1
+    seal_terminal_java_diagnostics || return 1
+    jq -e '
+      .sealed == true and
+      .available == false and
+      .reason == "no-valid-snapshot-before-terminal-boundary"
+    ' "$RESULT_DIR/terminal-java-diagnostics.json" >/dev/null
+  ) || {
+    printf 'terminal Java diagnostics overwrote a concurrent boundary\n' >&2
+    return 1
+  }
+
+  mkdir -p -- \
+    "$freeze_symlink_dir/phases/fault" \
+    "$terminal_symlink_dir/phases/fault" \
+    "$symlink_target/freeze" \
+    "$symlink_target/terminal"
+  write_diagnostics_fixture \
+    "$freeze_symlink_dir/phases/fault/java-diagnostics.txt" 0 1 0 0 0 0
+  (
+    local inject_freeze_symlink=true
+    RESULT_DIR="$freeze_symlink_dir"
+    ln() {
+      local destination="${*: -1}"
+
+      if [[ "$destination" == "$RESULT_DIR/.terminal-java-diagnostics.freeze" &&
+        "$inject_freeze_symlink" == "true" ]]; then
+        inject_freeze_symlink=false
+        command ln -s -- "$symlink_target/freeze" "$destination" || return $?
+      fi
+      command ln "$@"
+    }
+
+    record_last_java_diagnostics_phase fault || return 1
+    if seal_terminal_java_diagnostics >/dev/null 2>&1; then
+      return 1
+    fi
+    [[ -L "$RESULT_DIR/.terminal-java-diagnostics.freeze" ]] || return 1
+    ! find "$symlink_target/freeze" -mindepth 1 -print -quit | grep -q .
+  ) || {
+    printf 'freeze publication followed a raced directory symlink\n' >&2
+    return 1
+  }
+
+  write_diagnostics_fixture \
+    "$terminal_symlink_dir/phases/fault/java-diagnostics.txt" 0 1 0 0 0 0
+  (
+    local inject_terminal_symlink=true
+    RESULT_DIR="$terminal_symlink_dir"
+    ln() {
+      local destination="${*: -1}"
+
+      if [[ "$destination" == "$RESULT_DIR/terminal-java-diagnostics.json" &&
+        "$inject_terminal_symlink" == "true" ]]; then
+        inject_terminal_symlink=false
+        command ln -s -- "$symlink_target/terminal" "$destination" || return $?
+      fi
+      command ln "$@"
+    }
+
+    record_last_java_diagnostics_phase fault || return 1
+    if seal_terminal_java_diagnostics >/dev/null 2>&1; then
+      return 1
+    fi
+    [[ -L "$RESULT_DIR/terminal-java-diagnostics.json" ]] || return 1
+    ! find "$symlink_target/terminal" -mindepth 1 -print -quit | grep -q .
+  ) || {
+    printf 'terminal publication followed a raced directory symlink\n' >&2
+    return 1
+  }
+}
+
+test_terminal_java_diagnostics_serializes_record_and_seal() {
+  local -r result_dir="$TEST_TMP_DIR/terminal-java-diagnostics-serialized"
+  local -r timeout_dir="$TEST_TMP_DIR/terminal-java-diagnostics-lock-timeout"
+  local -r setgid_dir="$TEST_TMP_DIR/terminal-java-diagnostics-setgid-lock"
+  local -r record_at_move="$result_dir/record-at-move"
+  local -r release_record="$result_dir/release-record"
+  local -r seal_lock_attempted="$result_dir/seal-lock-attempted"
+  local -r freeze_link_attempted="$result_dir/freeze-link-attempted"
+  local -r fault="$result_dir/phases/fault/java-diagnostics.txt"
+  local -r recovery="$result_dir/phases/recovery/java-diagnostics.txt"
+  local -r timeout_fault="$timeout_dir/phases/fault/java-diagnostics.txt"
+  local -r timeout_recovery="$timeout_dir/phases/recovery/java-diagnostics.txt"
+  local -r timeout_attempted="$timeout_dir/lock-timeout-attempted"
+  local supplementary_gid=""
+
+  mkdir -p -- "${fault%/*}" "${recovery%/*}"
+  write_diagnostics_fixture "$fault" 0 1 0 0 0 0
+  write_diagnostics_fixture "$recovery" 1 0 0 1 0 0
+  (
+    local record_pid=""
+    local seal_pid=""
+    local attempt=0
+    RESULT_DIR="$result_dir"
+    record_last_java_diagnostics_phase fault || return 1
+    mv() {
+      local destination="${*: -1}"
+
+      if [[ "$destination" == "$RESULT_DIR/.last-valid-java-diagnostics.json" &&
+        "${DIAGNOSTIC_LOCK_ROLE:-}" == "record" ]]; then
+        : >"$record_at_move" || return $?
+        for ((attempt = 0; attempt < 500; attempt++)); do
+          [[ -e "$release_record" ]] && break
+          sleep 0.01
+        done
+        [[ -e "$release_record" ]] || return 1
+      fi
+      command mv "$@"
+    }
+    flock() {
+      if [[ "${DIAGNOSTIC_LOCK_ROLE:-}" == "seal" && "$1" == "-x" ]]; then
+        : >"$seal_lock_attempted" || return $?
+      fi
+      command flock "$@"
+    }
+    ln() {
+      local destination="${*: -1}"
+
+      if [[ "$destination" == "$RESULT_DIR/.terminal-java-diagnostics.freeze" ]]; then
+        : >"$freeze_link_attempted" || return $?
+      fi
+      command ln "$@"
+    }
+
+    DIAGNOSTIC_LOCK_ROLE=record \
+      record_last_java_diagnostics_phase recovery &
+    record_pid=$!
+    for ((attempt = 0; attempt < 500; attempt++)); do
+      [[ -e "$record_at_move" ]] && break
+      sleep 0.01
+    done
+    [[ -e "$record_at_move" ]] || return 1
+    DIAGNOSTIC_LOCK_ROLE=seal seal_terminal_java_diagnostics &
+    seal_pid=$!
+    for ((attempt = 0; attempt < 500; attempt++)); do
+      [[ -e "$seal_lock_attempted" ]] && break
+      sleep 0.01
+    done
+    [[ -e "$seal_lock_attempted" ]] || return 1
+    sleep 0.05
+    [[ -e "$freeze_link_attempted" &&
+      -f "$RESULT_DIR/.terminal-java-diagnostics.freeze" &&
+      ! -e "$RESULT_DIR/terminal-java-diagnostics.json" ]] || return 1
+    : >"$release_record" || return 1
+    wait "$record_pid" || return 1
+    wait "$seal_pid" || return 1
+    jq -e '
+      .sealed == true and
+      .available == true and
+      .phase == "recovery" and
+      .reference == "phases/recovery/java-diagnostics.txt"
+    ' "$RESULT_DIR/terminal-java-diagnostics.json" >/dev/null || return 1
+    jq -e '
+      .sealed == false and
+      .available == true and
+      .phase == "recovery"
+    ' "$RESULT_DIR/.last-valid-java-diagnostics.json" >/dev/null
+  ) || {
+    printf 'terminal diagnostics record/seal serialization was not atomic\n' >&2
+    return 1
+  }
+
+  mkdir -p -- "${timeout_fault%/*}" "${timeout_recovery%/*}"
+  write_diagnostics_fixture "$timeout_fault" 0 1 0 0 0 0
+  write_diagnostics_fixture "$timeout_recovery" 1 0 0 1 0 0
+  (
+    local seal_status=0
+    RESULT_DIR="$timeout_dir"
+    RUN_STATUS=failed
+    ACCEPTANCE_EVIDENCE=false
+    ACCEPTANCE_EVIDENCE_REASON=targeted-scenario
+    FAILURE_STAGE=fault
+    FAILURE_LINE=19
+    flock() {
+      if [[ "${DIAGNOSTIC_LOCK_ROLE:-}" == "seal-timeout" && "$1" == "-x" ]]; then
+        : >"$timeout_attempted" || return $?
+        return 75
+      fi
+      command flock "$@"
+    }
+
+    record_last_java_diagnostics_phase fault || return 1
+    DIAGNOSTIC_LOCK_ROLE=seal-timeout
+    if seal_terminal_java_diagnostics; then
+      return 1
+    else
+      seal_status=$?
+    fi
+    [[ "$seal_status" == "75" && -f "$timeout_attempted" &&
+      -f "$RESULT_DIR/.terminal-java-diagnostics.freeze" &&
+      ! -e "$RESULT_DIR/terminal-java-diagnostics.json" ]] || return 1
+    DIAGNOSTIC_LOCK_ROLE=recovery
+    if record_last_java_diagnostics_phase recovery; then
+      return 1
+    fi
+    DIAGNOSTIC_LOCK_ROLE=final
+    write_run_status 17 || return 1
+    jq -e '
+      .status == "failed" and
+      .exit_status == 17 and
+      .java_bridge_diagnostics.available == true and
+      .java_bridge_diagnostics.phase == "fault" and
+      .java_bridge_diagnostics.reference ==
+        "phases/fault/java-diagnostics.txt"
+    ' "$RESULT_DIR/run-status.json" >/dev/null
+  ) || {
+    printf 'terminal diagnostics lock timeout did not preserve the freeze boundary\n' >&2
+    return 1
+  }
+
+  supplementary_gid="$(
+    id -G | tr ' ' '\n' | awk -v primary="$(id -g)" '$1 != primary { print; exit }'
+  )" || return 1
+  if [[ -n "$supplementary_gid" ]]; then
+    mkdir -p -- "$setgid_dir"
+    chgrp "$supplementary_gid" "$setgid_dir" || return 1
+    chmod 2770 "$setgid_dir" || return 1
+    mkdir -p -- "$setgid_dir/phases/fault"
+    write_diagnostics_fixture \
+      "$setgid_dir/phases/fault/java-diagnostics.txt" 0 1 0 0 0 0
+    (
+      RESULT_DIR="$setgid_dir"
+      record_last_java_diagnostics_phase fault || return 1
+      [[ "$(stat -Lc '%g' -- "$RESULT_DIR/.terminal-java-diagnostics.lock")" == "$supplementary_gid" ]] ||
+        return 1
+      seal_terminal_java_diagnostics || return 1
+      terminal_java_diagnostics_json >/dev/null
+    ) || {
+      printf 'terminal diagnostics rejected a safe setgid result directory\n' >&2
+      return 1
+    }
+  fi
+}
+
+test_terminal_java_diagnostics_recovery_boundary_is_durable() {
+  local -r retry_dir="$TEST_TMP_DIR/terminal-java-diagnostics-recovery-retry"
+  local -r null_dir="$TEST_TMP_DIR/terminal-java-diagnostics-recovery-null"
+  local -r committed_dir="$TEST_TMP_DIR/terminal-java-diagnostics-recovery-committed"
+  local -r mismatched_commit_dir="$TEST_TMP_DIR/terminal-java-diagnostics-recovery-mismatched-commit"
+  local -r freeze_wins_dir="$TEST_TMP_DIR/terminal-java-diagnostics-recovery-freeze-wins"
+  local -r clear_boundary_dir="$TEST_TMP_DIR/terminal-java-diagnostics-recovery-clear-boundary"
+  local -r clear_commit_dir="$TEST_TMP_DIR/terminal-java-diagnostics-recovery-clear-commit"
+  local -r clear_success_dir="$TEST_TMP_DIR/terminal-java-diagnostics-recovery-clear-success"
+  local -r changed_dir="$TEST_TMP_DIR/terminal-java-diagnostics-recovery-changed"
+  local result_dir=""
+
+  for result_dir in \
+    "$retry_dir" "$null_dir" "$committed_dir" "$mismatched_commit_dir" \
+    "$freeze_wins_dir" \
+    "$clear_boundary_dir" "$clear_commit_dir" "$clear_success_dir" \
+    "$changed_dir"; do
+    mkdir -p -- \
+      "$result_dir/phases/fault" \
+      "$result_dir/phases/recovery" \
+      "$result_dir/phases/final"
+    write_diagnostics_fixture \
+      "$result_dir/phases/fault/java-diagnostics.txt" 0 1 0 0 0 0
+    write_diagnostics_fixture \
+      "$result_dir/phases/recovery/java-diagnostics.txt" 1 0 0 1 0 0
+    write_diagnostics_fixture \
+      "$result_dir/phases/final/java-diagnostics.txt" 0 0 1 0 1 0
+  done
+
+  (
+    local seal_status=0
+    RESULT_DIR="$retry_dir"
+    RUN_STATUS=failed
+    ACCEPTANCE_EVIDENCE=false
+    ACCEPTANCE_EVIDENCE_REASON=targeted-scenario
+    FAILURE_STAGE=fault
+    FAILURE_LINE=17
+    record_last_java_diagnostics_phase fault || return 1
+    capture_terminal_java_diagnostics_recovery_boundary || return 1
+    record_last_java_diagnostics_phase recovery || return 1
+    flock() {
+      if [[ "${DIAGNOSTIC_LOCK_ROLE:-}" == "first_seal" && "$1" == "-x" ]]; then
+        return 75
+      fi
+      command flock "$@"
+    }
+    DIAGNOSTIC_LOCK_ROLE=first_seal
+    if seal_terminal_java_diagnostics; then
+      return 1
+    else
+      seal_status=$?
+    fi
+    [[ "$seal_status" == 75 &&
+      -f "$RESULT_DIR/.terminal-java-diagnostics.freeze" &&
+      -f "$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary.json" &&
+      ! -e "$RESULT_DIR/terminal-java-diagnostics.json" ]] || return 1
+    unset -f flock
+    DIAGNOSTIC_LOCK_ROLE=retry
+    write_run_status 17 || return 1
+    jq -e '
+      .java_bridge_diagnostics.available == true and
+      .java_bridge_diagnostics.phase == "fault"
+    ' "$RESULT_DIR/run-status.json" >/dev/null
+  ) || {
+    printf 'failed seal retry did not preserve the durable fault boundary\n' >&2
+    return 1
+  }
+
+  (
+    local seal_status=0
+    RESULT_DIR="$null_dir"
+    RUN_STATUS=failed
+    ACCEPTANCE_EVIDENCE=false
+    ACCEPTANCE_EVIDENCE_REASON=targeted-scenario
+    FAILURE_STAGE=fault
+    FAILURE_LINE=18
+    capture_terminal_java_diagnostics_recovery_boundary || return 1
+    record_last_java_diagnostics_phase recovery || return 1
+    flock() {
+      if [[ "${DIAGNOSTIC_LOCK_ROLE:-}" == "first_seal" && "$1" == "-x" ]]; then
+        return 75
+      fi
+      command flock "$@"
+    }
+    DIAGNOSTIC_LOCK_ROLE=first_seal
+    if seal_terminal_java_diagnostics; then
+      return 1
+    else
+      seal_status=$?
+    fi
+    [[ "$seal_status" == 75 ]] || return 1
+    unset -f flock
+    DIAGNOSTIC_LOCK_ROLE=retry
+    write_run_status 17 || return 1
+    jq -e '
+      .java_bridge_diagnostics.available == false and
+      .java_bridge_diagnostics.reason ==
+        "no-valid-snapshot-before-terminal-boundary"
+    ' "$RESULT_DIR/run-status.json" >/dev/null
+  ) || {
+    printf 'explicit unavailable boundary became recovery diagnostics\n' >&2
+    return 1
+  }
+
+  (
+    RESULT_DIR="$committed_dir"
+    record_last_java_diagnostics_phase fault || return 1
+    capture_terminal_java_diagnostics_recovery_boundary || return 1
+    record_last_java_diagnostics_phase recovery || return 1
+    commit_terminal_java_diagnostics_recovery_boundary || return 1
+    freeze_terminal_java_diagnostics || return 1
+    seal_terminal_java_diagnostics || return 1
+    jq -e '
+      .available == true and .phase == "recovery"
+    ' "$RESULT_DIR/terminal-java-diagnostics.json" >/dev/null
+  ) || {
+    printf 'committed recovery did not win the terminal transition\n' >&2
+    return 1
+  }
+
+  (
+    RESULT_DIR="$mismatched_commit_dir"
+    record_last_java_diagnostics_phase fault || return 1
+    capture_terminal_java_diagnostics_recovery_boundary || return 1
+    record_last_java_diagnostics_phase recovery || return 1
+    commit_terminal_java_diagnostics_recovery_boundary || return 1
+    printf '%s\n' \
+      'terminal-java-diagnostics-recovery-committed-v1:0000000000000000000000000000000000000000000000000000000000000000' \
+      >"$RESULT_DIR/.terminal-java-diagnostics.freeze" || return 1
+    if seal_terminal_java_diagnostics; then
+      return 1
+    fi
+    [[ ! -e "$RESULT_DIR/terminal-java-diagnostics.json" ]]
+  ) || {
+    printf 'mismatched recovery commit digest reached terminal diagnostics\n' >&2
+    return 1
+  }
+
+  (
+    RESULT_DIR="$freeze_wins_dir"
+    record_last_java_diagnostics_phase fault || return 1
+    capture_terminal_java_diagnostics_recovery_boundary || return 1
+    record_last_java_diagnostics_phase recovery || return 1
+    freeze_terminal_java_diagnostics || return 1
+    if commit_terminal_java_diagnostics_recovery_boundary; then
+      return 1
+    fi
+    seal_terminal_java_diagnostics || return 1
+    jq -e '
+      .available == true and .phase == "fault"
+    ' "$RESULT_DIR/terminal-java-diagnostics.json" >/dev/null
+  ) || {
+    printf 'freeze did not win the recovery transition atomically\n' >&2
+    return 1
+  }
+
+  (
+    RESULT_DIR="$clear_boundary_dir"
+    record_last_java_diagnostics_phase fault || return 1
+    capture_terminal_java_diagnostics_recovery_boundary || return 1
+    record_last_java_diagnostics_phase recovery || return 1
+    commit_terminal_java_diagnostics_recovery_boundary || return 1
+    rm() {
+      local target="${*: -1}"
+
+      if [[ "$target" == "$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary.json" ]]; then
+        return 47
+      fi
+      command rm "$@"
+    }
+    if clear_terminal_java_diagnostics_recovery_boundary; then
+      return 1
+    fi
+    unset -f rm
+    [[ -f "$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary.json" &&
+      -f "$RESULT_DIR/.terminal-java-diagnostics.freeze" ]] || return 1
+    seal_terminal_java_diagnostics || return 1
+    jq -e '.available == true and .phase == "recovery"' \
+      "$RESULT_DIR/terminal-java-diagnostics.json" >/dev/null
+  ) || {
+    printf 'pending-clear failure exposed pre-recovery diagnostics\n' >&2
+    return 1
+  }
+
+  (
+    RESULT_DIR="$clear_commit_dir"
+    record_last_java_diagnostics_phase fault || return 1
+    capture_terminal_java_diagnostics_recovery_boundary || return 1
+    record_last_java_diagnostics_phase recovery || return 1
+    commit_terminal_java_diagnostics_recovery_boundary || return 1
+    rm() {
+      local target="${*: -1}"
+
+      if [[ "$target" == "$RESULT_DIR/.terminal-java-diagnostics.freeze" ]]; then
+        return 47
+      fi
+      command rm "$@"
+    }
+    if clear_terminal_java_diagnostics_recovery_boundary; then
+      return 1
+    fi
+    unset -f rm
+    [[ ! -e "$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary.json" &&
+      -f "$RESULT_DIR/.terminal-java-diagnostics.freeze" ]] || return 1
+    seal_terminal_java_diagnostics || return 1
+    jq -e '.available == true and .phase == "recovery"' \
+      "$RESULT_DIR/terminal-java-diagnostics.json" >/dev/null
+  ) || {
+    printf 'commit-clear failure exposed pre-recovery diagnostics\n' >&2
+    return 1
+  }
+
+  (
+    RESULT_DIR="$clear_success_dir"
+    record_last_java_diagnostics_phase fault || return 1
+    capture_terminal_java_diagnostics_recovery_boundary || return 1
+    record_last_java_diagnostics_phase recovery || return 1
+    commit_terminal_java_diagnostics_recovery_boundary || return 1
+    clear_terminal_java_diagnostics_recovery_boundary || return 1
+    record_last_java_diagnostics_phase final || return 1
+    seal_terminal_java_diagnostics || return 1
+    jq -e '.available == true and .phase == "final"' \
+      "$RESULT_DIR/terminal-java-diagnostics.json" >/dev/null
+  ) || {
+    printf 'successful recovery boundary cleanup blocked later diagnostics\n' >&2
+    return 1
+  }
+
+  (
+    RESULT_DIR="$changed_dir"
+    record_last_java_diagnostics_phase fault || return 1
+    capture_terminal_java_diagnostics_recovery_boundary || return 1
+    record_last_java_diagnostics_phase recovery || return 1
+    write_diagnostics_fixture \
+      "$RESULT_DIR/phases/fault/java-diagnostics.txt" 0 0 1 0 1 0
+    if seal_terminal_java_diagnostics >/dev/null 2>&1; then
+      return 1
+    fi
+    [[ ! -e "$RESULT_DIR/terminal-java-diagnostics.json" ]]
+  ) || {
+    printf 'changed recovery-boundary source was accepted\n' >&2
+    return 1
+  }
+}
+
+test_terminal_java_diagnostics_retains_last_valid_fault_boundary() {
+  local -r result_dir="$TEST_TMP_DIR/terminal-java-diagnostics"
+  local -r phase_a="$result_dir/phases/fault-a/java-diagnostics.txt"
+  local -r phase_b="$result_dir/phases/fault-b/java-diagnostics.txt"
+  local -r phase_c="$result_dir/phases/recovery-c/java-diagnostics.txt"
+  local snapshot_b=""
+
+  mkdir -p -- "${phase_a%/*}" "${phase_b%/*}" "${phase_c%/*}"
+  write_diagnostics_fixture "$phase_a" 0 0 0 0 0 0 missing 1
+  write_diagnostics_fixture "$phase_b" 0 1 0 0 0 0
+  write_diagnostics_fixture "$phase_c" 1 0 0 1 0 0
+  snapshot_b="$(<"$phase_b")" || return 1
+
+  (
+    RESULT_DIR="$result_dir"
+    RUN_STATUS=failed
+    ACCEPTANCE_EVIDENCE=false
+    ACCEPTANCE_EVIDENCE_REASON=targeted-scenario
+    FAILURE_STAGE="fault-control"
+    FAILURE_LINE=42
+
+    record_last_java_diagnostics_phase fault-a || return 1
+    record_last_java_diagnostics_phase fault-b || return 1
+    sed -i 's/cfg_on=0/cfg_on=00/' "$phase_c" || return 1
+    if record_last_java_diagnostics_phase recovery-c; then
+      printf 'malformed Java diagnostics replaced the last valid boundary\n' >&2
+      return 1
+    fi
+    seal_terminal_java_diagnostics || return 1
+    write_diagnostics_fixture "$phase_c" 1 0 0 1 0 0
+    record_last_java_diagnostics_phase recovery-c || return 1
+    write_run_status 17 || return 1
+
+    jq -e --arg snapshot "$snapshot_b" '
+      .status == "failed" and
+      .exit_status == 17 and
+      .java_bridge_diagnostics_reference ==
+        "terminal-java-diagnostics.json" and
+      .java_bridge_diagnostics.schema ==
+        "obi-java-bridge-terminal-diagnostics-v1" and
+      .java_bridge_diagnostics.sealed == true and
+      .java_bridge_diagnostics.available == true and
+      .java_bridge_diagnostics.phase == "fault-b" and
+      .java_bridge_diagnostics.reference ==
+        "phases/fault-b/java-diagnostics.txt" and
+      .java_bridge_diagnostics.snapshot == $snapshot and
+      .java_bridge_diagnostics.counters.t_stale == "1"
+    ' "$RESULT_DIR/run-status.json" >/dev/null || return 1
+    cmp -s \
+      <(jq -c '.java_bridge_diagnostics' "$RESULT_DIR/run-status.json") \
+      "$RESULT_DIR/terminal-java-diagnostics.json"
+  ) || {
+    printf 'terminal Java diagnostics did not preserve the fault boundary\n' >&2
+    return 1
+  }
+}
+
+test_terminal_java_diagnostics_is_bounded_and_fail_closed() {
+  local -r unavailable_dir="$TEST_TMP_DIR/terminal-java-diagnostics-unavailable"
+  local -r changed_dir="$TEST_TMP_DIR/terminal-java-diagnostics-changed"
+  local -r hardlink_dir="$TEST_TMP_DIR/terminal-java-diagnostics-hardlink"
+  local -r symlink_dir="$TEST_TMP_DIR/terminal-java-diagnostics-symlink"
+  local -r corrupt_terminal_dir="$TEST_TMP_DIR/terminal-java-diagnostics-corrupt-terminal"
+  local -r status_symlink_dir="$TEST_TMP_DIR/terminal-java-diagnostics-status-symlink"
+  local -r oversized_last_dir="$TEST_TMP_DIR/terminal-java-diagnostics-oversized-last"
+  local -r multiline_last_dir="$TEST_TMP_DIR/terminal-java-diagnostics-multiline-last"
+  local -r oversized_terminal_dir="$TEST_TMP_DIR/terminal-java-diagnostics-oversized-terminal"
+  local -r hardlink_last_dir="$TEST_TMP_DIR/terminal-java-diagnostics-hardlink-last"
+  local -r hardlink_terminal_dir="$TEST_TMP_DIR/terminal-java-diagnostics-hardlink-terminal"
+  local hostile_phase=""
+  local result_dir=""
+  local status=0
+
+  mkdir -p -- "$unavailable_dir"
+  (
+    RESULT_DIR="$unavailable_dir"
+    RUN_STATUS=failed
+    ACCEPTANCE_EVIDENCE=false
+    ACCEPTANCE_EVIDENCE_REASON=targeted-scenario
+    FAILURE_STAGE=startup
+    FAILURE_LINE=7
+    write_run_status 2
+    jq -e '
+      .java_bridge_diagnostics == {
+        schema: "obi-java-bridge-terminal-diagnostics-v1",
+        sealed: true,
+        available: false,
+        reason: "no-valid-snapshot-before-terminal-boundary"
+      }
+    ' "$RESULT_DIR/run-status.json" >/dev/null
+  ) || {
+    printf 'pre-JVM failure did not retain explicit unavailable diagnostics\n' >&2
+    return 1
+  }
+
+  mkdir -p -- "$changed_dir/phases/fault"
+  write_diagnostics_fixture \
+    "$changed_dir/phases/fault/java-diagnostics.txt" 0 1 0 0 0 0
+  set +e
+  (
+    RESULT_DIR="$changed_dir"
+    RUN_STATUS=failed
+    ACCEPTANCE_EVIDENCE=false
+    ACCEPTANCE_EVIDENCE_REASON=targeted-scenario
+    FAILURE_STAGE=fault
+    FAILURE_LINE=8
+    record_last_java_diagnostics_phase fault || exit 1
+    write_diagnostics_fixture \
+      "$RESULT_DIR/phases/fault/java-diagnostics.txt" 1 0 0 1 0 0
+    write_run_status 17
+  ) >/dev/null 2>&1
+  status=$?
+  set -e
+  if ((status == 0)) || [[ -e "$changed_dir/run-status.json" ]]; then
+    printf 'changed Java diagnostics target entered terminal status\n' >&2
+    return 1
+  fi
+
+  mkdir -p -- "$hardlink_dir/phases/fault"
+  write_diagnostics_fixture \
+    "$hardlink_dir/phases/fault/java-diagnostics.txt" 0 1 0 0 0 0
+  ln -- \
+    "$hardlink_dir/phases/fault/java-diagnostics.txt" \
+    "$hardlink_dir/diagnostics-hardlink"
+  if (
+    RESULT_DIR="$hardlink_dir"
+    record_last_java_diagnostics_phase fault
+  ); then
+    printf 'hard-linked Java diagnostics entered terminal status\n' >&2
+    return 1
+  fi
+
+  mkdir -p -- "$symlink_dir/phases/fault"
+  write_diagnostics_fixture "$symlink_dir/target" 0 1 0 0 0 0
+  ln -s -- "$symlink_dir/target" \
+    "$symlink_dir/phases/fault/java-diagnostics.txt"
+  if (
+    RESULT_DIR="$symlink_dir"
+    record_last_java_diagnostics_phase fault
+  ); then
+    printf 'symlinked Java diagnostics entered terminal status\n' >&2
+    return 1
+  fi
+
+  for hostile_phase in '../escape' 'quote"phase' $'line\nbreak' 'back\\slash'; do
+    if (
+      RESULT_DIR="$unavailable_dir"
+      record_last_java_diagnostics_phase "$hostile_phase"
+    ); then
+      printf 'hostile diagnostics phase was accepted: %q\n' "$hostile_phase" >&2
+      return 1
+    fi
+  done
+
+  mkdir -p -- "$corrupt_terminal_dir"
+  printf '%s\n' \
+    '{"schema":"obi-java-bridge-terminal-diagnostics-v1","sealed":true,"available":false,"reason":"no-valid-snapshot-before-terminal-boundary","unexpected":true}' \
+    >"$corrupt_terminal_dir/terminal-java-diagnostics.json"
+  set +e
+  (
+    RESULT_DIR="$corrupt_terminal_dir"
+    RUN_STATUS=failed
+    ACCEPTANCE_EVIDENCE=false
+    ACCEPTANCE_EVIDENCE_REASON=targeted-scenario
+    FAILURE_STAGE=fault
+    FAILURE_LINE=9
+    write_run_status 17
+  ) >/dev/null 2>&1
+  status=$?
+  set -e
+  if ((status == 0)) || [[ -e "$corrupt_terminal_dir/run-status.json" ]]; then
+    printf 'corrupt terminal Java diagnostics entered canonical status\n' >&2
+    return 1
+  fi
+
+  mkdir -p -- "$status_symlink_dir"
+  printf 'status-target-unchanged\n' >"$status_symlink_dir/target"
+  ln -s -- "$status_symlink_dir/target" "$status_symlink_dir/run-status.json"
+  set +e
+  (
+    RESULT_DIR="$status_symlink_dir"
+    RUN_STATUS=failed
+    ACCEPTANCE_EVIDENCE=false
+    ACCEPTANCE_EVIDENCE_REASON=targeted-scenario
+    FAILURE_STAGE=fault
+    FAILURE_LINE=10
+    write_run_status 17
+  ) >/dev/null 2>&1
+  status=$?
+  set -e
+  if ((status == 0)) ||
+    [[ "$(<"$status_symlink_dir/target")" != "status-target-unchanged" ]]; then
+    printf 'canonical run status followed or overwrote a symlink target\n' >&2
+    return 1
+  fi
+
+  for result_dir in "$oversized_last_dir" "$multiline_last_dir"; do
+    mkdir -p -- "$result_dir/phases/fault"
+    write_diagnostics_fixture \
+      "$result_dir/phases/fault/java-diagnostics.txt" 0 1 0 0 0 0
+    (
+      RESULT_DIR="$result_dir"
+      record_last_java_diagnostics_phase fault || return 1
+      if [[ "$RESULT_DIR" == "$oversized_last_dir" ]]; then
+        printf '%*s' "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES" '' \
+          >>"$RESULT_DIR/.last-valid-java-diagnostics.json" || return 1
+      else
+        printf '\n' >>"$RESULT_DIR/.last-valid-java-diagnostics.json" || return 1
+      fi
+      if seal_terminal_java_diagnostics; then
+        return 1
+      fi
+      [[ ! -e "$RESULT_DIR/terminal-java-diagnostics.json" ]]
+    ) || {
+      printf 'oversized or multiline last-valid diagnostics were sealed\n' >&2
+      return 1
+    }
+  done
+
+  mkdir -p -- "$oversized_terminal_dir/phases/fault"
+  write_diagnostics_fixture \
+    "$oversized_terminal_dir/phases/fault/java-diagnostics.txt" 0 1 0 0 0 0
+  (
+    RESULT_DIR="$oversized_terminal_dir"
+    RUN_STATUS=failed
+    ACCEPTANCE_EVIDENCE=false
+    ACCEPTANCE_EVIDENCE_REASON=targeted-scenario
+    FAILURE_STAGE=fault
+    FAILURE_LINE=12
+    record_last_java_diagnostics_phase fault || return 1
+    seal_terminal_java_diagnostics || return 1
+    printf '%*s' "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES" '' \
+      >>"$RESULT_DIR/terminal-java-diagnostics.json" || return 1
+    if write_run_status 17; then
+      return 1
+    fi
+    [[ ! -e "$RESULT_DIR/run-status.json" ]]
+  ) || {
+    printf 'oversized terminal diagnostics entered canonical status\n' >&2
+    return 1
+  }
+
+  mkdir -p -- "$hardlink_last_dir/phases/fault"
+  write_diagnostics_fixture \
+    "$hardlink_last_dir/phases/fault/java-diagnostics.txt" 0 1 0 0 0 0
+  (
+    RESULT_DIR="$hardlink_last_dir"
+    record_last_java_diagnostics_phase fault || return 1
+    ln -- "$RESULT_DIR/.last-valid-java-diagnostics.json" \
+      "$RESULT_DIR/last-hardlink" || return 1
+    ! seal_terminal_java_diagnostics
+  ) || {
+    printf 'hard-linked last-valid diagnostics were sealed\n' >&2
+    return 1
+  }
+
+  mkdir -p -- "$hardlink_terminal_dir/phases/fault"
+  write_diagnostics_fixture \
+    "$hardlink_terminal_dir/phases/fault/java-diagnostics.txt" 0 1 0 0 0 0
+  (
+    RESULT_DIR="$hardlink_terminal_dir"
+    RUN_STATUS=failed
+    ACCEPTANCE_EVIDENCE=false
+    ACCEPTANCE_EVIDENCE_REASON=targeted-scenario
+    FAILURE_STAGE=fault
+    FAILURE_LINE=13
+    record_last_java_diagnostics_phase fault || return 1
+    seal_terminal_java_diagnostics || return 1
+    ln -- "$RESULT_DIR/terminal-java-diagnostics.json" \
+      "$RESULT_DIR/terminal-hardlink" || return 1
+    if write_run_status 17; then
+      return 1
+    fi
+    [[ ! -e "$RESULT_DIR/run-status.json" ]]
+  ) || {
+    printf 'hard-linked terminal diagnostics entered canonical status\n' >&2
+    return 1
+  }
+}
+
 test_release_source_uses_one_version_for_extension() {
   local dry_run=""
 
@@ -22382,6 +26275,7 @@ test_demo_obi_lifecycle_timeouts_are_explicit() {
   startup_functions="$({
     declare -f start_stack
     declare -f run_late_attach_control
+    declare -f run_late_attach_recovery_sequence
     declare -f run_restart_during_traffic_control
     declare -f recreate_instrumented_stack
     declare -f run_unix_permissive_directory_control
@@ -26175,9 +30069,17 @@ main() {
   test_delayed_otlp_temporary_cleanup_preserves_failure
   test_cleanup_refuses_down_when_transport_invalidation_fails
   test_cleanup_failure_changes_successful_run_status
+  test_cleanup_promoted_failure_seals_before_recovery
   test_primary_fault_recovery_marker_forces_cleanup_with_keep
   test_primary_live_fd_recovery_marker_forces_cleanup_with_keep
   test_run_status_publication_failure_changes_successful_exit
+  test_run_status_commit_failure_preserves_authoritative_status
+  test_run_status_link_side_effect_failure_changes_successful_exit
+  test_run_status_link_side_effect_with_verifier_fault_cannot_leave_stale_status
+  test_run_status_post_link_verifier_failure_cannot_leave_stale_status
+  test_holder_failure_with_verifier_fault_cannot_leave_stale_status
+  test_project_guard_holder_retry_accepts_exact_side_effect
+  test_holder_atomic_side_effect_is_terminal_authority
   test_cleanup_only_invalidates_matching_project_evidence_before_down
   test_cleanup_only_selects_pid_reuse_compose_superset
   test_cleanup_only_refuses_untrusted_current_evidence_identity
@@ -26225,6 +30127,7 @@ main() {
   test_primary_w3c_stale_control_restores_the_normal_ttls
   test_unix_w3c_stale_control_restores_the_normal_ttls
   test_unix_w3c_stale_control_recovers_after_a_failed_stale_assertion
+  test_direct_recovery_failures_retain_pre_recovery_diagnostics
   test_w3c_stale_scenarios_use_in_band_diagnostics
   test_primary_w3c_fault_recreation_uses_the_overlay_only
   test_primary_w3c_fault_scenario_arms_after_the_baseline
@@ -26433,6 +30336,15 @@ main() {
   test_source_controls_and_bridge_export_use_private_work_directory
   test_clean_source_snapshot_uses_pinned_git_inputs
   test_run_status_serializes_default_acceptance_reason
+  test_run_status_publication_is_owned_and_atomic
+  test_terminal_java_diagnostics_hooks_are_mutation_sensitive
+  test_terminal_java_diagnostics_capture_is_bounded_and_atomic
+  test_terminal_java_diagnostics_freeze_survives_failed_publication
+  test_terminal_java_diagnostics_consumes_one_validated_snapshot
+  test_terminal_java_diagnostics_serializes_record_and_seal
+  test_terminal_java_diagnostics_recovery_boundary_is_durable
+  test_terminal_java_diagnostics_retains_last_valid_fault_boundary
+  test_terminal_java_diagnostics_is_bounded_and_fail_closed
   test_release_source_uses_one_version_for_extension
   test_java_build_uses_isolated_gradle_home
   test_demo_diagnostics_are_loopback_only

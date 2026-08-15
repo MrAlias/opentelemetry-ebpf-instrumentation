@@ -809,9 +809,10 @@ rollback, or process death, so the bridge does not leave a pinned cgroup
 program behind.
 
 Availability diagnostics identify the failed boundary without inferring
-support from a kernel version. The bounded stage and reason identify the
-boundary class; the warning message and error distinguish a bridge-wide shared
-prerequisite from the primary transport:
+support from a kernel version. The bounded warning message, stage, and reason
+distinguish a bridge-wide shared prerequisite from the primary transport. Raw
+kernel, verifier, filesystem, listener, and server errors are emitted only at
+debug level and must not be included in sanitized evidence:
 
 | Stage and reason | Operator check |
 | --- | --- |
@@ -852,6 +853,13 @@ so a batched update emits at most one record with its post-update count. Log
 messages match `OBI remote-parent diagnostics reason=<reason> count=<count>`;
 reasons are fixed lower-case identifiers of at most 30 characters, counts are
 at most nine decimal digits, and the complete message is at most 83 characters.
+The demo runner independently retains the last fixed-schema Java snapshot. It
+durably captures that validated boundary before fault-control recovery; if
+recovery fails, it seals the captured boundary in
+`terminal-java-diagnostics.json` and embeds it in `run-status.json`. Successful
+recovery commits and discards the pending boundary so the later terminal status
+can use the latest valid snapshot. Failures before the first valid JVM snapshot
+are represented by one explicit bounded unavailable record.
 
 `RemoteParentTransportDiagnosticsV1.snapshot()` separately exposes a fixed
 configuration-state snapshot as seven decimal fields:

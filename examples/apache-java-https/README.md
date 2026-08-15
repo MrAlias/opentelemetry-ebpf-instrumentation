@@ -609,7 +609,9 @@ and the terminal message `deliberate assertion failure requested`. Its retained
 result directory contains `scenario-basic.json`,
 `scenario-assertion-failure.json`, `scenario-assertion-failure-status.json`,
 `failure-context.txt`, and `run-status.json`. The two assertion-failure JSON
-files name the expected exit status and the failure-context path, while the
+files name the expected exit status, failure-context path, and sealed last
+valid fixed-schema Java bridge diagnostics. The same object is retained in
+`terminal-java-diagnostics.json` and embedded in `run-status.json`, while the
 standard files identify the exact shell stage, source line, and command. The
 control is deliberately excluded from `all` and never contributes acceptance
 evidence. Use `--keep` only if you want to inspect the stack before running the
@@ -789,7 +791,13 @@ failure stage, source line, exit status, and shell-escaped command in
 `failure-context.txt`; `run-status.json` repeats the stage, line, and
 acceptance-evidence eligibility reason for machine-readable triage, including
 failures that occur after the result directory exists but before
-`environment.txt` can be written.
+`environment.txt` can be written. It also embeds and references
+`terminal-java-diagnostics.json`. Before fault-control recovery, the runner
+durably captures the last validated fixed-schema boundary. If recovery fails,
+that captured boundary is sealed and embedded; successful recovery commits and
+discards it so the later terminal status can use the latest valid snapshot. A
+failure before the first valid JVM snapshot records an explicit bounded
+`available:false` object instead of inventing evidence.
 
 Every `scenario-*-status.json` produced by `run_scenario` names both phase
 directories and embeds each available fixed-schema Java diagnostics snapshot

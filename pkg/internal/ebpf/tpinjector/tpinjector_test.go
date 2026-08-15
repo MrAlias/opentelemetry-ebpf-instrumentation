@@ -914,6 +914,91 @@ func TestJavaRemoteParentAvailabilityReason(t *testing.T) {
 	}
 }
 
+func TestJavaRemoteParentAvailabilityWarningBoundsRawError(t *testing.T) {
+	const canary = "/private/tenant-42/bridge.sock"
+	var logs bytes.Buffer
+	tracer := &Tracer{
+		log: slog.New(slog.NewTextHandler(
+			&logs,
+			&slog.HandlerOptions{Level: slog.LevelDebug},
+		)),
+	}
+
+	reason := tracer.logJavaRemoteParentUnavailable(
+		"Java remote-parent fallback transport unavailable",
+		javaRemoteParentStageListen,
+		errors.New("listen unix "+canary+": permission denied"),
+	)
+	require.Equal(t, javabridge.StatusTransportError.String(), reason)
+
+	var warning string
+	var debug string
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		switch {
+		case strings.Contains(line, "level=WARN"):
+			require.Empty(t, warning)
+			warning = line
+		case strings.Contains(line, "level=DEBUG"):
+			require.Empty(t, debug)
+			debug = line
+		}
+	}
+	require.NotEmpty(t, warning)
+	require.NotEmpty(t, debug)
+	assert.Contains(t, warning, "stage=listen")
+	assert.Contains(t, warning, "reason=transport_error")
+	assert.NotContains(t, warning, "error=")
+	assert.NotContains(t, warning, canary)
+	assert.Contains(t, debug, "stage=listen")
+	assert.Contains(t, debug, "reason=transport_error")
+	assert.Contains(t, debug, "error=")
+	assert.Contains(t, debug, canary)
+}
+
+func TestJavaRemoteParentReadyInfoBoundsSocketPath(t *testing.T) {
+	const canary = "/private/tenant-42/bridge.sock"
+	cfg := obi.DefaultConfig
+	cfg.Java.RemoteParent.SocketPath = canary
+	reporter := &javaRemoteParentRecordingReporter{}
+	var logs bytes.Buffer
+	tracer := New(&cfg, reporter)
+	tracer.log = slog.New(slog.NewTextHandler(
+		&logs,
+		&slog.HandlerOptions{Level: slog.LevelDebug},
+	))
+
+	tracer.reportJavaRemoteParentReady(obi.JavaRemoteParentUnix)
+
+	var info string
+	var debug string
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		switch {
+		case strings.Contains(line, "level=INFO"):
+			require.Empty(t, info)
+			info = line
+		case strings.Contains(line, "level=DEBUG"):
+			require.Empty(t, debug)
+			debug = line
+		}
+	}
+	require.NotEmpty(t, info)
+	require.NotEmpty(t, debug)
+	assert.Contains(t, info, `msg="Java remote parent bridge ready"`)
+	assert.Contains(t, info, "transport=unix")
+	assert.NotContains(t, info, "socket_path=")
+	assert.NotContains(t, info, canary)
+	assert.Contains(t, debug, `msg="Java remote parent bridge ready details"`)
+	assert.Contains(t, debug, "transport=unix")
+	assert.Contains(t, debug, "socket_path=")
+	assert.Contains(t, debug, canary)
+	assert.Equal(t, []javaRemoteParentObservation{{
+		transport: "unix",
+		operation: javaRemoteParentAvailabilityOperation,
+		status:    javabridge.StatusValid.String(),
+		count:     1,
+	}}, reporter.observations)
+}
+
 func TestJavaRemoteParentAutoFallsBackOnPrimaryPermissionFailure(t *testing.T) {
 	originalGet := attachCgroupGetsockopt
 	originalSet := attachCgroupSetsockopt

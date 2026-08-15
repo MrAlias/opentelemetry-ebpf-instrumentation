@@ -16,6 +16,9 @@ MAX_JSON_SAFE_INTEGER="9007199254740991"
 MAX_UINT32_DECIMAL="4294967295"
 MAX_UINT64_DECIMAL="18446744073709551615"
 JAVA_DIAGNOSTIC_COUNTER_MAX="999999999"
+TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES=16384
+TERMINAL_JAVA_DIAGNOSTICS_MAX_LINES=1
+TERMINAL_JAVA_DIAGNOSTICS_LOCK_TIMEOUT_SECONDS=5
 BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS=35
 JAVA_PROVIDER_RETRY_SETTLE_SECONDS=2
 JAVA_DUPLICATE_SUPPRESSION_PRIME_INTERVAL_SECONDS=5
@@ -164,6 +167,9 @@ PRIMARY_FAULT_CONTROL_FILE="$PRIMARY_FAULT_CONTROL_DIRECTORY/java-remote-parent.
 readonly SCRIPT_DIR REPO_ROOT SCRIPT_NAME MAX_SHELL_INTEGER MAX_JSON_SAFE_INTEGER
 readonly MAX_UINT32_DECIMAL
 readonly MAX_UINT64_DECIMAL JAVA_DIAGNOSTIC_COUNTER_MAX
+readonly TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES
+readonly TERMINAL_JAVA_DIAGNOSTICS_MAX_LINES
+readonly TERMINAL_JAVA_DIAGNOSTICS_LOCK_TIMEOUT_SECONDS
 readonly BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS SCENARIO_RUN_TIMEOUT_SECONDS
 readonly PID_REUSE_CONTROLLER_TIMEOUT_SECONDS
 readonly PID_REUSE_CONTROLLER_INNER_TIMEOUT
@@ -322,6 +328,11 @@ FAULT_BRIDGE_RUNNING=false
 SELECTED_TRANSPORT=""
 CONTEXT_PROPAGATION="tcp"
 RUN_STATUS="failed"
+RUN_STATUS_PUBLISHED_DIGEST=""
+RUN_STATUS_PUBLISHED_IDENTITY=""
+RUN_STATUS_PUBLICATION_HANDLE=""
+RUN_STATUS_PUBLICATION_OUTPUT=""
+RUN_STATUS_PUBLICATION_STATE=""
 PRESSURE_ACTIVE=false
 PRESSURE_MAP_ID=""
 PRESSURE_MAP_MAX_ENTRIES=""
@@ -396,6 +407,7 @@ PROJECT_GUARD_LOADED_SUPERVISOR_START_TIME=""
 PROJECT_GUARD_LOADED_HOLDER_START_TIME=""
 PROJECT_GUARD_LOADED_HOLDER_STATUS=""
 PROJECT_GUARD_FORMATTED_HOLDER_STATUS=""
+PROJECT_GUARD_HOLDER_PUBLICATION_ATTEMPTED=false
 PROJECT_GUARD_SIGNAL_RESET_EXECUTABLE="$(type -P env)"
 PROJECT_DOCKER_SERVER_ID_SHA256=""
 CLEANUP_ENTRY_ACTIVE=""
@@ -834,7 +846,7 @@ sha256_file() {
 check_dependencies() {
   local -a missing=()
   local command_name=""
-  for command_name in awk cmp curl cut docker env find flock git grep head id install jq mktemp mv openssl readlink rmdir sed sha256sum sort stat tail tar tee timeout wc; do
+  for command_name in awk cmp curl cut docker env find flock git grep head id install jq ln mktemp mv openssl readlink realpath rmdir sed sha256sum sort stat tail tar tee timeout wc; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
       missing+=("$command_name")
     fi
@@ -1698,6 +1710,8 @@ publish_project_guard_holder_status() {
   local supervisor_acceptance_expected=""
   local status_payload=""
 
+  PROJECT_GUARD_HOLDER_PUBLICATION_ATTEMPTED=false
+
   format_project_guard_holder_status_payload \
     "$PROJECT_GUARD_STATUS_RELAY_PID" \
     "$PROJECT_GUARD_STATUS_RELAY_START_TIME" \
@@ -1719,6 +1733,9 @@ publish_project_guard_holder_status() {
   project_guard_supervisor_identity_matches \
     "$PROJECT_GUARD_STATUS_HOLDER_PID" \
     "$PROJECT_GUARD_STATUS_HOLDER_START_TIME" || return 1
+  [[ ! -e "$PROJECT_GUARD_CONTROL_DIR/holder-status" &&
+    ! -L "$PROJECT_GUARD_CONTROL_DIR/holder-status" ]] || return 1
+  PROJECT_GUARD_HOLDER_PUBLICATION_ATTEMPTED=true
   publish_project_guard_control_file \
     "$PROJECT_GUARD_CONTROL_DIR/holder-status" "$status_payload"
 }
@@ -1726,7 +1743,16 @@ publish_project_guard_holder_status() {
 publish_project_guard_holder_status_with_retries() {
   local -r exit_status="$1"
   local publication_status=1
+  local expected=""
   local -i attempt=0
+
+  format_project_guard_holder_status_payload \
+    "$PROJECT_GUARD_STATUS_RELAY_PID" \
+    "$PROJECT_GUARD_STATUS_RELAY_START_TIME" \
+    "$PROJECT_GUARD_STATUS_HOLDER_PID" \
+    "$PROJECT_GUARD_STATUS_HOLDER_START_TIME" \
+    "$exit_status" || return 1
+  expected="$PROJECT_GUARD_FORMATTED_HOLDER_STATUS"
 
   for ((attempt = 0; attempt < 3; attempt++)); do
     if publish_project_guard_holder_status "$exit_status"; then
@@ -1734,8 +1760,25 @@ publish_project_guard_holder_status_with_retries() {
     else
       publication_status=$?
     fi
-    [[ ! -e "$PROJECT_GUARD_CONTROL_DIR/holder-status" && \
-      ! -L "$PROJECT_GUARD_CONTROL_DIR/holder-status" ]] || break
+    if [[ "$PROJECT_GUARD_HOLDER_PUBLICATION_ATTEMPTED" == true &&
+      ( -e "$PROJECT_GUARD_CONTROL_DIR/holder-status" ||
+        -L "$PROJECT_GUARD_CONTROL_DIR/holder-status" ) ]]; then
+      # The immutable authority path was absent immediately before this
+      # worker's atomic publication attempt. Under the serialized cooperative
+      # guard protocol, its appearance is the terminal commit even if the
+      # publishing command or this optional diagnostic read reports an error.
+      project_guard_control_file_matches \
+        "$PROJECT_GUARD_CONTROL_DIR/holder-status" "$expected" || true
+      return 0
+    fi
+    if [[ -e "$PROJECT_GUARD_CONTROL_DIR/holder-status" || \
+      -L "$PROJECT_GUARD_CONTROL_DIR/holder-status" ]]; then
+      if project_guard_control_file_matches \
+        "$PROJECT_GUARD_CONTROL_DIR/holder-status" "$expected"; then
+        return 0
+      fi
+      break
+    fi
     sleep 0.01 || true
   done
   return "$((publication_status == 0 ? 1 : publication_status))"
@@ -2614,6 +2657,7 @@ cleanup() {
   local primary_fault_recovery_marker=""
   local primary_fault_recovery_stage=""
   local publication_succeeded=false
+  local holder_status_before=0
   CLEANUP_ENTRY_ACTIVE=true
   trap record_cleanup_hup HUP
   trap record_cleanup_int INT
@@ -2624,7 +2668,6 @@ cleanup() {
   if ((status != 0)) && [[ -z "$FAILURE_STAGE" ]]; then
     record_failure "$RUN_STAGE" 0 "$status" "exit"
   fi
-
   if [[ -n "${RESULT_DIR:-}" && -d "$RESULT_DIR" ]]; then
     for primary_fault_recovery_marker in \
       "$RESULT_DIR/primary-w3c-fault-recovery-required" \
@@ -2659,6 +2702,16 @@ cleanup() {
           "permanent-absence-recovery" 0 1 \
           "incomplete host-shared permanent-absence recovery"
       fi
+    fi
+  fi
+
+  if ((final_status != 0)) && \
+    [[ -n "${RESULT_DIR:-}" && -d "$RESULT_DIR" ]]; then
+    if seal_terminal_java_diagnostics; then
+      :
+    else
+      cleanup_status=$?
+      log_error "could not seal Java bridge diagnostics before cleanup recovery"
     fi
   fi
 
@@ -2792,28 +2845,38 @@ cleanup() {
     record_failure "signal" 0 "$final_status" "cleanup interrupted"
   fi
   if [[ -n "${RESULT_DIR:-}" && -d "$RESULT_DIR" ]]; then
-    if write_run_status "$final_status"; then
+    if publish_owned_run_status "$final_status"; then
       publication_succeeded=true
     else
       cleanup_status=$?
-      log_error "could not publish the final run status"
-      rm -f -- "$RESULT_DIR/run-status.json" || true
+      log_error "could not publish and commit the final run status"
       if ((final_status == 0)); then
         final_status="$cleanup_status"
         record_failure \
-          "evidence-publication" 0 "$cleanup_status" "write_run_status"
+          "evidence-publication" 0 "$cleanup_status" \
+          "publish_owned_run_status"
       fi
       publication_succeeded=false
-      if write_run_status "$final_status"; then
+      if [[ -n "$RUN_STATUS_PUBLISHED_IDENTITY" ||
+        -n "$RUN_STATUS_PUBLISHED_DIGEST" ||
+        -n "$RUN_STATUS_PUBLICATION_STATE" ]]; then
+        remove_published_run_status ||
+          log_error "refusing to remove an unverified partial run status"
+      fi
+      if [[ ! -e "$RESULT_DIR/run-status.json" &&
+        ! -L "$RESULT_DIR/run-status.json" ]] &&
+        publish_owned_run_status "$final_status"; then
         publication_succeeded=true
       else
         cleanup_status=$?
-        log_error "could not publish the failed final run status"
-        rm -f -- "$RESULT_DIR/run-status.json" || true
+        log_error "could not publish and commit the failed final run status"
+        if [[ -n "$RUN_STATUS_PUBLISHED_IDENTITY" ||
+          -n "$RUN_STATUS_PUBLISHED_DIGEST" ||
+          -n "$RUN_STATUS_PUBLICATION_STATE" ]]; then
+          remove_published_run_status ||
+            log_error "refusing to remove an unverified failed run status"
+        fi
       fi
-    fi
-    if [[ "$publication_succeeded" == "true" ]]; then
-      log_info "retained run evidence: $RESULT_DIR"
     fi
   fi
 
@@ -2822,18 +2885,35 @@ cleanup() {
       :
     else
       log_error "could not publish the guarded runner terminal status"
+      holder_status_before="$final_status"
       final_status=1
       if [[ -z "$FAILURE_STAGE" ]]; then
         record_failure \
           "project-guard-status" 0 "$final_status" \
-          "publish_project_guard_holder_status"
+          "publish_project_guard_holder_status: original_status=$holder_status_before"
       fi
-      if [[ -n "${RESULT_DIR:-}" && -d "$RESULT_DIR" ]]; then
-        rm -f -- "$RESULT_DIR/run-status.json" || true
-        write_run_status "$final_status" || \
-          rm -f -- "$RESULT_DIR/run-status.json" || true
+      if ((holder_status_before != final_status)) &&
+        [[ -n "${RESULT_DIR:-}" && -d "$RESULT_DIR" ]]; then
+        if [[ "$publication_succeeded" == true ]] &&
+          remove_terminal_owned_run_status_for_rewrite; then
+          publication_succeeded=false
+          if publish_owned_run_status "$final_status"; then
+            publication_succeeded=true
+          fi
+        else
+          log_error "refusing to replace an unverified published run status"
+          publication_succeeded=false
+        fi
       fi
       publish_project_guard_holder_status_with_retries "$final_status" || true
+    fi
+  fi
+
+  if [[ "$publication_succeeded" == "true" ]]; then
+    if commit_published_run_status; then
+      log_info "retained run evidence: $RESULT_DIR"
+    else
+      log_error "could not remove the private run-status ownership link"
     fi
   fi
 
@@ -9546,15 +9626,31 @@ run_scenario() {
 run_deliberate_assertion_failure_control() {
   local -r label="assertion-failure"
   local -r result="$RESULT_DIR/scenario-$label.json"
+  local java_bridge_diagnostics=""
 
   run_scenario basic || return $?
   RUN_STAGE="deliberate-assertion-failure"
+  seal_terminal_java_diagnostics || return $?
+  java_bridge_diagnostics="$(terminal_java_diagnostics_json)" || return $?
   if ! printf '{"status":"failed","scenario":"assertion-failure","reason":"deliberate assertion failure requested","expected_exit_status":2}\n' \
     >"$result"; then
     return 1
   fi
-  if ! printf '{"status":"failed","scenario":"assertion-failure","exit_status":2,"metric_status":0,"result":"%s","failure_context":"failure-context.txt"}\n' \
-    "$(basename -- "$result")" >"$RESULT_DIR/scenario-$label-status.json"; then
+  if ! jq -cn \
+    --arg result "$(basename -- "$result")" \
+    --arg java_bridge_diagnostics_reference 'terminal-java-diagnostics.json' \
+    --argjson java_bridge_diagnostics "$java_bridge_diagnostics" '
+      {
+        status: "failed",
+        scenario: "assertion-failure",
+        exit_status: 2,
+        metric_status: 0,
+        result: $result,
+        failure_context: "failure-context.txt",
+        java_bridge_diagnostics_reference: $java_bridge_diagnostics_reference,
+        java_bridge_diagnostics: $java_bridge_diagnostics
+      }
+    ' >"$RESULT_DIR/scenario-$label-status.json"; then
     return 1
   fi
   log_info "basic scenario passed; recording the requested deliberate assertion failure"
@@ -9602,34 +9698,12 @@ run_w3c_only_control() {
   run_scenario w3c-only
 }
 
-run_late_attach_control() {
-  local attach_since=""
+run_late_attach_recovery_sequence() {
+  local -r attach_since="$1"
   local apache_since=""
+  local scenario_status=0
 
-  stop_obi_for_no_state_control "late-attach" || return $?
-  export EXTENSION_ENABLED=true
-  export JAVA_TOOL_OPTIONS_VALUE="-javaagent:/otel/official-javaagent.jar"
-  export OTEL_JAVAAGENT_EXTENSIONS_VALUE="/otel/obi-otel-extension.jar"
-  export OTEL_PROPAGATORS_VALUE="obi,tracecontext,baggage"
-  log_info "recreating the JVM while OBI is absent"
-  run_bounded 120 \
-    "${COMPOSE[@]}" up --detach --force-recreate \
-      java-backend apache-proxy || return $?
-  wait_for_http \
-    "$APACHE_HTTPS_HEALTH_ENDPOINT" \
-    "OBI-absent HTTPS path" || return $?
-  wait_for_log \
-    java-backend \
-    "OBI remote-parent propagator enabled" \
-    "OBI-absent external extension" || return $?
-  assert_runtime_contract obi-absent || return $?
-
-  SCENARIO_VARIANT="obi-absent"
-  run_scenario fail-open
-  run_scenario w3c-only
-  SCENARIO_VARIANT=""
-
-  attach_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" || return $?
+  [[ -n "$attach_since" ]] || return 1
   log_info "starting OBI and requiring late helper attach without a JVM restart"
   run_bounded 120 \
     "${COMPOSE[@]}" up --detach \
@@ -9671,8 +9745,74 @@ run_late_attach_control() {
   wait_for_java_duplicate_suppression \
     "$RESULT_DIR/duplicate-suppression-late-attach-recovery.prom" || return $?
   SCENARIO_VARIANT="late-attach-recovery"
-  run_scenario restart
+  if run_scenario restart; then
+    SCENARIO_VARIANT=""
+  else
+    scenario_status=$?
+    SCENARIO_VARIANT=""
+    return "$scenario_status"
+  fi
+}
+
+run_late_attach_control() {
+  local attach_since=""
+  local recovery_boundary_status=0
+  local recovery_status=0
+  local terminal_diagnostics_status=0
+
+  stop_obi_for_no_state_control "late-attach" || return $?
+  export EXTENSION_ENABLED=true
+  export JAVA_TOOL_OPTIONS_VALUE="-javaagent:/otel/official-javaagent.jar"
+  export OTEL_JAVAAGENT_EXTENSIONS_VALUE="/otel/obi-otel-extension.jar"
+  export OTEL_PROPAGATORS_VALUE="obi,tracecontext,baggage"
+  log_info "recreating the JVM while OBI is absent"
+  run_bounded 120 \
+    "${COMPOSE[@]}" up --detach --force-recreate \
+      java-backend apache-proxy || return $?
+  wait_for_http \
+    "$APACHE_HTTPS_HEALTH_ENDPOINT" \
+    "OBI-absent HTTPS path" || return $?
+  wait_for_log \
+    java-backend \
+    "OBI remote-parent propagator enabled" \
+    "OBI-absent external extension" || return $?
+  assert_runtime_contract obi-absent || return $?
+
+  SCENARIO_VARIANT="obi-absent"
+  run_scenario fail-open
+  run_scenario w3c-only
   SCENARIO_VARIANT=""
+
+  attach_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" || return $?
+  if capture_terminal_java_diagnostics_recovery_boundary; then
+    :
+  else
+    recovery_boundary_status=$?
+    if seal_terminal_java_diagnostics; then
+      :
+    else
+      terminal_diagnostics_status=$?
+    fi
+  fi
+  if run_late_attach_recovery_sequence "$attach_since"; then
+    recovery_status=0
+  else
+    recovery_status=$?
+  fi
+  if ((recovery_boundary_status != 0)); then
+    return "$recovery_boundary_status"
+  fi
+  if ((recovery_status != 0)); then
+    if seal_terminal_java_diagnostics; then
+      :
+    else
+      terminal_diagnostics_status=$?
+    fi
+    return "$recovery_status"
+  fi
+  commit_terminal_java_diagnostics_recovery_boundary || return $?
+  clear_terminal_java_diagnostics_recovery_boundary || return $?
+  return "$terminal_diagnostics_status"
 }
 
 assert_compose_service_stopped() {
@@ -9891,10 +10031,13 @@ run_permanent_absence_control() (
   # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
   restore_permanent_absence_stack() {
     local -r status="${1:-$?}"
+    local terminal_diagnostics_status=0
 
-    arm_permanent_absence_record_only_traps
     trap - EXIT
     set +e
+    arm_permanent_absence_record_only_traps
+    seal_terminal_java_diagnostics
+    terminal_diagnostics_status=$?
     if [[ "$absence_jvm_may_be_running" == "true" ]]; then
       if stop_permanent_absence_jvm; then
         absence_jvm_may_be_running=false
@@ -9918,6 +10061,9 @@ run_permanent_absence_control() (
     fi
     if ((status == 0 && restore_status != 0)); then
       exit "$restore_status"
+    fi
+    if ((status == 0 && terminal_diagnostics_status != 0)); then
+      exit "$terminal_diagnostics_status"
     fi
     exit "$status"
   }
@@ -10035,6 +10181,7 @@ run_permanent_absence_control() (
   printf 'requests=completed-in-one-jvm\nobi=absent-at-final-checkpoint\n' \
     >>"$timeline" || return $?
 
+  capture_terminal_java_diagnostics_recovery_boundary || return $?
   stop_permanent_absence_jvm || return $?
   absence_jvm_may_be_running=false
   capture_bounded_permanent_absence_logs \
@@ -10047,7 +10194,9 @@ run_permanent_absence_control() (
   printf '{"status":"passed","scenario":"permanent-absence","obi_started_during_jvm_lifetime":false,"single_jvm_lifetime":true,"disabled_baseline_equivalent":true,"fail_open":"passed","w3c_precedence":"passed","diagnostics":"bounded","post_absence_recovery":"passed"}\n' \
     >"$RESULT_DIR/scenario-permanent-absence-status.json"
 
+  commit_terminal_java_diagnostics_recovery_boundary || return $?
   trap - EXIT
+  clear_terminal_java_diagnostics_recovery_boundary || return $?
 )
 
 run_auto_unavailable_control() (
@@ -10072,9 +10221,12 @@ run_auto_unavailable_control() (
   # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
   restore_auto_unavailable_stack() {
     local -r status="$?"
+    local terminal_diagnostics_status=0
 
     trap - EXIT
     set +e
+    seal_terminal_java_diagnostics
+    terminal_diagnostics_status=$?
     if [[ "$restore_required" == "true" ]]; then
       (
         set -Eeuo pipefail
@@ -10086,6 +10238,9 @@ run_auto_unavailable_control() (
     SCENARIO_VARIANT="$original_variant"
     if ((status == 0 && restore_status != 0)); then
       exit "$restore_status"
+    fi
+    if ((status == 0 && terminal_diagnostics_status != 0)); then
+      exit "$terminal_diagnostics_status"
     fi
     exit "$status"
   }
@@ -10134,6 +10289,7 @@ run_auto_unavailable_control() (
     "$identity_before" "$identity_fault" "auto-unavailable requests" || return $?
   assert_compose_service_stopped obi "auto-unavailable boundary" || return $?
 
+  capture_terminal_java_diagnostics_recovery_boundary || return $?
   restart_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" || return $?
   run_bounded 120 \
     "${COMPOSE[@]}" up --detach \
@@ -10168,7 +10324,9 @@ run_auto_unavailable_control() (
   printf '{"status":"passed","scenario":"auto-unavailable","requested_transport":"auto","attempted_transports":["getsockopt","unix"],"selected_transport":"none","disabled_baseline_equivalent":true,"fail_open":"passed","w3c_precedence":"passed","single_jvm_lifetime":true,"retry_storm":"absent","post_fault_recovery":"passed"}\n' \
     >"$RESULT_DIR/scenario-auto-unavailable-status.json"
 
+  commit_terminal_java_diagnostics_recovery_boundary || return $?
   trap - EXIT
+  clear_terminal_java_diagnostics_recovery_boundary || return $?
 )
 
 prepare_restart_control_directory() {
@@ -10290,13 +10448,23 @@ run_restart_during_traffic_control() (
   # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
   cleanup_restart_traffic() {
     local -r status="$?"
+    local terminal_diagnostics_status=0
+
     trap - EXIT
+    set +e
+    if ((status != 0)); then
+      seal_terminal_java_diagnostics
+      terminal_diagnostics_status=$?
+    fi
     if [[ -n "$scenario_pid" ]]; then
       if kill -0 "$scenario_pid" 2>/dev/null; then
         kill -TERM "$scenario_pid" 2>/dev/null || true
       fi
       wait "$scenario_pid" 2>/dev/null || true
       scenario_pid=""
+    fi
+    if ((status == 0 && terminal_diagnostics_status != 0)); then
+      exit "$terminal_diagnostics_status"
     fi
     exit "$status"
   }
@@ -10397,9 +10565,13 @@ run_restart_during_traffic_control() (
     "$(basename -- "$output")" \
     "$after_phase" >"$RESULT_DIR/scenario-$label-status.json" || return $?
 
+  capture_terminal_java_diagnostics_recovery_boundary || return $?
   SCENARIO_VARIANT="restart-recovery"
   run_scenario restart
   SCENARIO_VARIANT=""
+  commit_terminal_java_diagnostics_recovery_boundary || return $?
+  trap - EXIT
+  clear_terminal_java_diagnostics_recovery_boundary || return $?
 )
 
 run_extension_controls() {
@@ -10634,6 +10806,9 @@ run_delayed_otlp_suppression_control() {
   local java_retry_disabled_previous=""
   local java_retry_disabled_was_set=false
   local control_status=0
+  local recovery_boundary_status=0
+  local recovery_status=0
+  local terminal_diagnostics_status=0
 
   if [[ "$SCENARIO" == "all" ]]; then
     if [[ -v OTEL_BSP_SCHEDULE_DELAY_VALUE ]]; then
@@ -10661,6 +10836,13 @@ run_delayed_otlp_suppression_control() {
       control_status=$?
     fi
   fi
+  if ((control_status != 0)); then
+    if seal_terminal_java_diagnostics; then
+      :
+    else
+      terminal_diagnostics_status=$?
+    fi
+  fi
 
   if [[ "$SCENARIO" == "all" ]]; then
     if [[ "$schedule_delay_was_set" == "true" ]]; then
@@ -10679,8 +10861,38 @@ run_delayed_otlp_suppression_control() {
         tcp "post-delayed-otlp suppression recovery" || true
       return "$control_status"
     fi
-    recreate_instrumented_stack \
-      tcp "post-delayed-otlp suppression restoration" || return $?
+    if capture_terminal_java_diagnostics_recovery_boundary; then
+      :
+    else
+      recovery_boundary_status=$?
+      if seal_terminal_java_diagnostics; then
+        :
+      else
+        terminal_diagnostics_status=$?
+      fi
+    fi
+    if recreate_instrumented_stack \
+      tcp "post-delayed-otlp suppression restoration"; then
+      recovery_status=0
+    else
+      recovery_status=$?
+    fi
+    if ((recovery_boundary_status != 0)); then
+      return "$recovery_boundary_status"
+    fi
+    if ((recovery_status != 0)); then
+      if seal_terminal_java_diagnostics; then
+        :
+      else
+        terminal_diagnostics_status=$?
+      fi
+      return "$recovery_status"
+    fi
+    commit_terminal_java_diagnostics_recovery_boundary || return $?
+    clear_terminal_java_diagnostics_recovery_boundary || return $?
+  fi
+  if ((control_status == 0 && terminal_diagnostics_status != 0)); then
+    return "$terminal_diagnostics_status"
   fi
   return "$control_status"
 }
@@ -10907,9 +11119,12 @@ run_helper_attach_failure_control() (
   restore_helper_attach_failure_stack() {
     local -r status="$?"
     local restore_status=0
+    local terminal_diagnostics_status=0
 
     trap - EXIT
     set +e
+    seal_terminal_java_diagnostics
+    terminal_diagnostics_status=$?
     if [[ "$restore_required" == "true" ]]; then
       log_warn \
         "restoring the normal instrumented stack after helper attach failure control" || true
@@ -10928,6 +11143,9 @@ run_helper_attach_failure_control() (
     fi
     if ((status == 0 && restore_status != 0)); then
       exit "$restore_status"
+    fi
+    if ((status == 0 && terminal_diagnostics_status != 0)); then
+      exit "$terminal_diagnostics_status"
     fi
     exit "$status"
   }
@@ -11101,6 +11319,7 @@ run_helper_attach_failure_control() (
     log_error "helper attach failure diagnostics did not report unavailable"
     return 1
   }
+  capture_terminal_java_diagnostics_recovery_boundary || return $?
   recover_helper_attach_failure_stack \
     "$original_propagation" \
     "helper-attach-recovery" \
@@ -11134,7 +11353,9 @@ run_helper_attach_failure_control() (
   SCENARIO_VARIANT=""
   SCENARIO_SEED="$original_seed"
 
+  commit_terminal_java_diagnostics_recovery_boundary || return $?
   trap - EXIT
+  clear_terminal_java_diagnostics_recovery_boundary || return $?
   return 0
 )
 
@@ -11233,17 +11454,48 @@ stop_matching_bridge() {
 
 run_w3c_match_control() {
   local -r original_transport="$TRANSPORT"
+  local recovery_boundary_status=0
+  local recovery_status=0
+  local terminal_diagnostics_status=0
 
   if [[ "$SELECTED_TRANSPORT" != "unix" ]]; then
     recreate_instrumented_stack \
       "tcp" "matching W3C and OBI preparation" unix || return $?
   fi
   stop_obi_for_no_state_control "w3c-match" || return $?
-  run_scenario w3c-match true full matching
+  run_scenario w3c-match true full matching || return $?
   if [[ "$SCENARIO" == "all" || "$KEEP_RUNNING" == "true" ]]; then
-    recreate_instrumented_stack \
-      "tcp" "post-match bridge restoration" "$original_transport" || return $?
+    if capture_terminal_java_diagnostics_recovery_boundary; then
+      :
+    else
+      recovery_boundary_status=$?
+      if seal_terminal_java_diagnostics; then
+        :
+      else
+        terminal_diagnostics_status=$?
+      fi
+    fi
+    if recreate_instrumented_stack \
+      "tcp" "post-match bridge restoration" "$original_transport"; then
+      recovery_status=0
+    else
+      recovery_status=$?
+    fi
+    if ((recovery_boundary_status != 0)); then
+      return "$recovery_boundary_status"
+    fi
+    if ((recovery_status != 0)); then
+      if seal_terminal_java_diagnostics; then
+        :
+      else
+        terminal_diagnostics_status=$?
+      fi
+      return "$recovery_status"
+    fi
+    commit_terminal_java_diagnostics_recovery_boundary || return $?
+    clear_terminal_java_diagnostics_recovery_boundary || return $?
   fi
+  return "$terminal_diagnostics_status"
 }
 
 capture_w3c_fault_bridge_log() {
@@ -11278,6 +11530,13 @@ abort_w3c_fault_mode() {
   local -r fault_log="$2"
   local -r capture_log="$3"
   local cleanup_status=0
+  local terminal_diagnostics_status=0
+
+  if seal_terminal_java_diagnostics; then
+    :
+  else
+    terminal_diagnostics_status=$?
+  fi
 
   if [[ "$capture_log" == "true" ]] && \
     ! capture_w3c_fault_bridge_log "$fault_log"; then
@@ -11290,6 +11549,9 @@ abort_w3c_fault_mode() {
   if ((primary_status != 0)); then
     return "$primary_status"
   fi
+  if ((cleanup_status == 0 && terminal_diagnostics_status != 0)); then
+    return "$terminal_diagnostics_status"
+  fi
   return "$cleanup_status"
 }
 
@@ -11301,6 +11563,9 @@ run_w3c_fault_control() {
   local malformed=""
   local observed=""
   local control_status=0
+  local recovery_boundary_status=0
+  local recovery_status=0
+  local terminal_diagnostics_status=0
   local -a fault_modes=(
     alternating timeout disconnect overload truncated bad-magic bad-size
     version-mismatch zero-trace-id zero-span-id
@@ -11387,13 +11652,43 @@ run_w3c_fault_control() {
   FAULT_REQUEST_COUNT=2
   W3C_FAULT_DIAGNOSTICS_PREVIOUS=""
   export FAULT_MODE
-  recreate_instrumented_stack "tcp" "post-fault bridge recovery"
+  if capture_terminal_java_diagnostics_recovery_boundary; then
+    :
+  else
+    recovery_boundary_status=$?
+    if seal_terminal_java_diagnostics; then
+      :
+    else
+      terminal_diagnostics_status=$?
+    fi
+  fi
+  if recreate_instrumented_stack "tcp" "post-fault bridge recovery"; then
+    recovery_status=0
+  else
+    recovery_status=$?
+  fi
+  if ((recovery_boundary_status != 0)); then
+    return "$recovery_boundary_status"
+  fi
+  if ((recovery_status != 0)); then
+    if seal_terminal_java_diagnostics; then
+      :
+    else
+      terminal_diagnostics_status=$?
+    fi
+    return "$recovery_status"
+  fi
+  commit_terminal_java_diagnostics_recovery_boundary || return $?
+  clear_terminal_java_diagnostics_recovery_boundary || return $?
+  return "$terminal_diagnostics_status"
 }
 
 run_primary_w3c_stale_control() {
   local -r original_retrieval_ttl="$REMOTE_PARENT_RETRIEVAL_TTL"
   local control_status=0
+  local recovery_boundary_status=0
   local recovery_status=0
+  local terminal_diagnostics_status=0
 
   [[ "$TRANSPORT" == "getsockopt" && "$SELECTED_TRANSPORT" == "getsockopt" ]] || {
     log_error "the primary W3C stale control requires forced getsockopt transport"
@@ -11412,6 +11707,22 @@ run_primary_w3c_stale_control() {
   else
     control_status=$?
   fi
+  if ((control_status != 0)); then
+    if seal_terminal_java_diagnostics; then
+      :
+    else
+      terminal_diagnostics_status=$?
+    fi
+  elif capture_terminal_java_diagnostics_recovery_boundary; then
+    :
+  else
+    recovery_boundary_status=$?
+    if seal_terminal_java_diagnostics; then
+      :
+    else
+      terminal_diagnostics_status=$?
+    fi
+  fi
 
   REMOTE_PARENT_RETRIEVAL_TTL="$original_retrieval_ttl"
   export REMOTE_PARENT_RETRIEVAL_TTL
@@ -11428,13 +11739,28 @@ run_primary_w3c_stale_control() {
   if ((control_status != 0)); then
     return "$control_status"
   fi
-  return "$recovery_status"
+  if ((recovery_boundary_status != 0)); then
+    return "$recovery_boundary_status"
+  fi
+  if ((recovery_status != 0)); then
+    if seal_terminal_java_diagnostics; then
+      :
+    else
+      terminal_diagnostics_status=$?
+    fi
+    return "$recovery_status"
+  fi
+  commit_terminal_java_diagnostics_recovery_boundary || return $?
+  clear_terminal_java_diagnostics_recovery_boundary || return $?
+  return "$terminal_diagnostics_status"
 }
 
 run_unix_w3c_stale_control() {
   local -r original_retrieval_ttl="$REMOTE_PARENT_RETRIEVAL_TTL"
   local control_status=0
+  local recovery_boundary_status=0
   local recovery_status=0
+  local terminal_diagnostics_status=0
 
   [[ "$TRANSPORT" == "unix" && "$SELECTED_TRANSPORT" == "unix" ]] || {
     log_error "the Unix W3C stale control requires forced Unix transport"
@@ -11453,6 +11779,22 @@ run_unix_w3c_stale_control() {
   else
     control_status=$?
   fi
+  if ((control_status != 0)); then
+    if seal_terminal_java_diagnostics; then
+      :
+    else
+      terminal_diagnostics_status=$?
+    fi
+  elif capture_terminal_java_diagnostics_recovery_boundary; then
+    :
+  else
+    recovery_boundary_status=$?
+    if seal_terminal_java_diagnostics; then
+      :
+    else
+      terminal_diagnostics_status=$?
+    fi
+  fi
 
   REMOTE_PARENT_RETRIEVAL_TTL="$original_retrieval_ttl"
   export REMOTE_PARENT_RETRIEVAL_TTL
@@ -11469,7 +11811,20 @@ run_unix_w3c_stale_control() {
   if ((control_status != 0)); then
     return "$control_status"
   fi
-  return "$recovery_status"
+  if ((recovery_boundary_status != 0)); then
+    return "$recovery_boundary_status"
+  fi
+  if ((recovery_status != 0)); then
+    if seal_terminal_java_diagnostics; then
+      :
+    else
+      terminal_diagnostics_status=$?
+    fi
+    return "$recovery_status"
+  fi
+  commit_terminal_java_diagnostics_recovery_boundary || return $?
+  clear_terminal_java_diagnostics_recovery_boundary || return $?
+  return "$terminal_diagnostics_status"
 }
 
 primary_w3c_fault_expected_java_status() {
@@ -12186,9 +12541,12 @@ run_primary_w3c_fault_control() (
   restore_primary_w3c_fault_stack() {
     local -r status="$?"
     local restore_status=0
+    local terminal_diagnostics_status=0
 
     trap - EXIT
     set +e
+    seal_terminal_java_diagnostics
+    terminal_diagnostics_status=$?
     if [[ "$restore_required" == "true" ]]; then
       log_warn "restoring the normal instrumented stack after primary W3C fault control" || true
       (
@@ -12212,6 +12570,9 @@ run_primary_w3c_fault_control() (
     SCENARIO_VARIANT="$original_variant"
     if ((status == 0 && restore_status != 0)); then
       exit "$restore_status"
+    fi
+    if ((status == 0 && terminal_diagnostics_status != 0)); then
+      exit "$terminal_diagnostics_status"
     fi
     exit "$status"
   }
@@ -12242,6 +12603,7 @@ run_primary_w3c_fault_control() (
   done
   FAULT_MODE="alternating"
 
+  capture_terminal_java_diagnostics_recovery_boundary || return $?
   recreate_instrumented_stack \
     tcp "post-primary W3C fault recovery" getsockopt true false base || return $?
   assert_runtime_contract basic true || return $?
@@ -12252,7 +12614,9 @@ run_primary_w3c_fault_control() (
   run_scenario basic
   SCENARIO_VARIANT="$original_variant"
 
+  commit_terminal_java_diagnostics_recovery_boundary || return $?
   trap - EXIT
+  clear_terminal_java_diagnostics_recovery_boundary || return $?
 )
 
 run_primary_live_fd_security_recovery_scenario() {
@@ -12469,9 +12833,12 @@ run_primary_generation_mismatch_control() (
   # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
   restore_primary_generation_mismatch_stack() {
     local -r status="$?"
+    local terminal_diagnostics_status=0
 
     trap - EXIT
     set +e
+    seal_terminal_java_diagnostics
+    terminal_diagnostics_status=$?
     if [[ "$barrier_released" == "false" && -n "$descriptor" && -n "$java_container" ]]; then
       release_primary_live_fd_barrier \
         "$java_container" "$descriptor" \
@@ -12518,6 +12885,9 @@ run_primary_generation_mismatch_control() (
     SCENARIO_VARIANT="$original_variant"
     if ((status == 0 && restore_status != 0)); then
       exit "$restore_status"
+    fi
+    if ((status == 0 && terminal_diagnostics_status != 0)); then
+      exit "$terminal_diagnostics_status"
     fi
     exit "$status"
   }
@@ -12644,6 +13014,7 @@ run_primary_generation_mismatch_control() (
   assert_bridge_metric_delta \
     "$metric_delta" getsockopt 0 0 3 1 1 false 0 || return $?
 
+  capture_terminal_java_diagnostics_recovery_boundary || return $?
   recreate_instrumented_stack \
     tcp "post-primary generation mismatch recovery" getsockopt true false base || return $?
   assert_runtime_contract basic true || return $?
@@ -12659,7 +13030,9 @@ run_primary_generation_mismatch_control() (
     "$before_phase" "$after_phase" \
     >"$RESULT_DIR/scenario-primary-generation-mismatch-status.json"
 
+  commit_terminal_java_diagnostics_recovery_boundary || return $?
   trap - EXIT
+  clear_terminal_java_diagnostics_recovery_boundary || return $?
 )
 
 run_unix_generation_mismatch_control() (
@@ -12703,9 +13076,12 @@ run_unix_generation_mismatch_control() (
   # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
   restore_unix_generation_mismatch_stack() {
     local -r status="$?"
+    local terminal_diagnostics_status=0
 
     trap - EXIT
     set +e
+    seal_terminal_java_diagnostics
+    terminal_diagnostics_status=$?
     if [[ "$barrier_ready" == "true" && "$barrier_released" == "false" && \
       -n "$java_container" ]]; then
       release_unix_generation_barrier "$java_container" \
@@ -12753,6 +13129,9 @@ run_unix_generation_mismatch_control() (
     SCENARIO_VARIANT="$original_variant"
     if ((status == 0 && restore_status != 0)); then
       exit "$restore_status"
+    fi
+    if ((status == 0 && terminal_diagnostics_status != 0)); then
+      exit "$terminal_diagnostics_status"
     fi
     exit "$status"
   }
@@ -12870,6 +13249,7 @@ run_unix_generation_mismatch_control() (
   assert_bridge_metric_delta \
     "$metric_delta" unix 0 0 0 1 1 false 0 0 1 || return $?
 
+  capture_terminal_java_diagnostics_recovery_boundary || return $?
   recreate_instrumented_stack \
     tcp "post-Unix generation mismatch recovery" unix true false base || return $?
   assert_runtime_contract basic true || return $?
@@ -12886,7 +13266,9 @@ run_unix_generation_mismatch_control() (
     '{"status":"passed","scenario":"unix-generation-mismatch","transport":"unix","live_owner_mutation":"verified","barrier":"pre-send","bridge_timeout_ms":30000,"take_status":"already_consumed","wrong_parent_count":0,"w3c_precedence":"passed","exact_restore":"verified","post_fault_recovery":"passed","before_phase":"phases/unix-generation-mismatch-before","after_phase":"phases/unix-generation-mismatch-after"}' \
     >"$RESULT_DIR/scenario-unix-generation-mismatch-status.json"
 
+  commit_terminal_java_diagnostics_recovery_boundary || return $?
   trap - EXIT
+  clear_terminal_java_diagnostics_recovery_boundary || return $?
 )
 
 run_primary_live_fd_security_control() (
@@ -12922,9 +13304,12 @@ run_primary_live_fd_security_control() (
   # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
   restore_primary_live_fd_security_stack() {
     local -r status="$?"
+    local terminal_diagnostics_status=0
 
     trap - EXIT
     set +e
+    seal_terminal_java_diagnostics
+    terminal_diagnostics_status=$?
     if [[ -n "$probe_candidate" ]]; then
       rm -f -- "$probe_candidate" || true
       probe_candidate=""
@@ -12965,6 +13350,9 @@ run_primary_live_fd_security_control() (
     SCENARIO_VARIANT="$original_variant"
     if ((status == 0 && restore_status != 0)); then
       exit "$restore_status"
+    fi
+    if ((status == 0 && terminal_diagnostics_status != 0)); then
+      exit "$terminal_diagnostics_status"
     fi
     exit "$status"
   }
@@ -13201,6 +13589,7 @@ run_primary_live_fd_security_control() (
     return 1
   }
 
+  capture_terminal_java_diagnostics_recovery_boundary || return $?
   recreate_instrumented_stack \
     tcp "post-primary live-descriptor security recovery" getsockopt true false base || return $?
   assert_runtime_contract basic true || return $?
@@ -13215,17 +13604,27 @@ run_primary_live_fd_security_control() (
     "$after_phase" \
     >"$RESULT_DIR/scenario-primary-live-fd-security-status.json" || return $?
 
+  commit_terminal_java_diagnostics_recovery_boundary || return $?
   trap - EXIT
+  clear_terminal_java_diagnostics_recovery_boundary || return $?
 )
 
 extract_java_diagnostics_header() {
   local -r headers="$1"
   local -r output="$2"
+  local reference=""
+  local phase=""
+  local phase_dir=""
   local candidate=""
 
   [[ -f "$headers" && ! -L "$headers" && \
     ! -e "$output" && ! -L "$output" ]] || return 1
-  candidate="$(mktemp "$RESULT_DIR/.java-diagnostics-header.XXXXXX")" || return 1
+  reference="${output#"$RESULT_DIR/"}"
+  [[ "$reference" != "$output" ]] || return 1
+  phase="$(java_diagnostics_reference_phase "$reference")" || return 1
+  phase_dir="$RESULT_DIR/phases/$phase"
+  java_diagnostics_phase_directory_is_safe "$phase" || return 1
+  candidate="$(mktemp "$phase_dir/.java-diagnostics-header.XXXXXX")" || return 1
   if ! awk '
     {
       line = $0
@@ -13258,17 +13657,29 @@ extract_java_diagnostics_header() {
     rm -f -- "$candidate"
     return 1
   fi
-  if ! install -m 0644 "$candidate" "$output"; then
+  if ! chmod 0644 -- "$candidate" ||
+    ! java_diagnostics_phase_directory_is_safe "$phase" ||
+    [[ -e "$output" || -L "$output" ]]; then
     rm -f -- "$candidate"
     return 1
   fi
-  rm -f -- "$candidate"
+  if ln -T -- "$candidate" "$output"; then
+    rm -f -- "$candidate" || return 1
+  else
+    rm -f -- "$candidate" || true
+    return 1
+  fi
+  record_last_java_diagnostics_reference \
+    "$reference"
 }
 
 extract_terminal_diagnostics_after() {
   local -r input="$1"
   local -r output="$2"
   local -r field="$3"
+  local reference=""
+  local phase=""
+  local phase_dir=""
   local candidate=""
 
   case "$field" in
@@ -13277,7 +13688,12 @@ extract_terminal_diagnostics_after() {
   esac
   [[ -f "$input" && ! -L "$input" && \
     ! -e "$output" && ! -L "$output" ]] || return 1
-  candidate="$(mktemp "$RESULT_DIR/.terminal-diagnostics.XXXXXX")" || return 1
+  reference="${output#"$RESULT_DIR/"}"
+  [[ "$reference" != "$output" ]] || return 1
+  phase="$(java_diagnostics_reference_phase "$reference")" || return 1
+  phase_dir="$RESULT_DIR/phases/$phase"
+  java_diagnostics_phase_directory_is_safe "$phase" || return 1
+  candidate="$(mktemp "$phase_dir/.terminal-diagnostics.XXXXXX")" || return 1
   if ! awk -v field="$field" '
     index($0, "\"" field "\"") {
       matches++
@@ -13306,11 +13722,20 @@ extract_terminal_diagnostics_after() {
     rm -f -- "$candidate"
     return 1
   fi
-  if ! install -m 0644 "$candidate" "$output"; then
+  if ! chmod 0644 -- "$candidate" ||
+    ! java_diagnostics_phase_directory_is_safe "$phase" ||
+    [[ -e "$output" || -L "$output" ]]; then
     rm -f -- "$candidate"
     return 1
   fi
-  rm -f -- "$candidate"
+  if ln -T -- "$candidate" "$output"; then
+    rm -f -- "$candidate" || return 1
+  else
+    rm -f -- "$candidate" || true
+    return 1
+  fi
+  record_last_java_diagnostics_reference \
+    "$reference"
 }
 
 extract_fault_diagnostics_after() {
@@ -13321,14 +13746,74 @@ extract_java_diagnostics_after() {
   extract_terminal_diagnostics_after "$1" "$2" java_diagnostics_after
 }
 
-assert_sanitized_java_diagnostics() {
+read_bounded_single_line_regular_file() {
   local -r input="$1"
-  local snapshot=""
+  local -r maximum_bytes="$2"
+  local descriptor=""
+  local descriptor_path=""
+  local path_identity=""
+  local descriptor_identity=""
+  local links=""
+  local size=""
+  local digest=""
+  local reconstructed_digest=""
+  local -a lines=()
+  local LC_ALL=C
+
+  [[ "$maximum_bytes" =~ ^[1-9][0-9]*$ &&
+    -f "$input" && ! -L "$input" ]] || return 1
+  path_identity="$(stat -Lc '%d:%i' -- "$input")" || return 1
+  exec {descriptor}<"$input" || return $?
+  descriptor_path="/proc/self/fd/$descriptor"
+  if [[ ! -f "$descriptor_path" ]] ||
+    ! descriptor_identity="$(stat -Lc '%d:%i' -- "$descriptor_path")" ||
+    [[ -L "$input" ]] ||
+    [[ "$(stat -Lc '%d:%i' -- "$input")" != "$path_identity" ]] ||
+    [[ "$descriptor_identity" != "$path_identity" ]]; then
+    exec {descriptor}<&-
+    return 1
+  fi
+  links="$(stat -Lc '%h' -- "$descriptor_path")" || {
+    exec {descriptor}<&-
+    return 1
+  }
+  size="$(stat -Lc '%s' -- "$descriptor_path")" || {
+    exec {descriptor}<&-
+    return 1
+  }
+  if [[ "$links" != 1 ]] || ((size == 0 || size > maximum_bytes)); then
+    exec {descriptor}<&-
+    return 1
+  fi
+  digest="$(sha256sum "$descriptor_path")" || {
+    exec {descriptor}<&-
+    return 1
+  }
+  digest="${digest%% *}"
+  mapfile -t lines <"$descriptor_path" || {
+    exec {descriptor}<&-
+    return 1
+  }
+  exec {descriptor}<&-
+  (( ${#lines[@]} == 1 )) || return 1
+  if ((size == ${#lines[0]})); then
+    reconstructed_digest="$(printf '%s' "${lines[0]}" | sha256sum)" || return 1
+  elif ((size == ${#lines[0]} + 1)); then
+    reconstructed_digest="$(printf '%s\n' "${lines[0]}" | sha256sum)" || return 1
+  else
+    return 1
+  fi
+  reconstructed_digest="${reconstructed_digest%% *}"
+  [[ "$reconstructed_digest" == "$digest" ]] || return 1
+  printf '%s\n' "${lines[0]}"
+}
+
+assert_sanitized_java_diagnostics_snapshot() {
+  local -r snapshot="$1"
   local entry=""
   local name=""
   local value=""
   local -a entries=()
-  local -a snapshots=()
   local -a expected_names=(
     cfg_on cfg_off provider_ok provider_reject provider_ver extension_reg
     lookup_ready lookup_missing lookup_version lookup_error record_version
@@ -13345,13 +13830,6 @@ assert_sanitized_java_diagnostics() {
   local decoded=0
   local index=0
 
-  [[ -f "$input" && ! -L "$input" ]] || return 1
-  mapfile -t snapshots <"$input"
-  if (( ${#snapshots[@]} != 1 )); then
-    log_error "Java diagnostics did not contain exactly one snapshot"
-    return 1
-  fi
-  snapshot="${snapshots[0]}"
   IFS=',' read -r -a entries <<<"$snapshot"
   if (( ${#entries[@]} != ${#expected_names[@]} )); then
     log_error "Java diagnostics did not contain the exact fixed counter schema"
@@ -13377,18 +13855,70 @@ assert_sanitized_java_diagnostics() {
   done
 }
 
-java_diagnostics_phase_evidence_json() {
-  local -r phase="$1"
-  local -r reference="phases/$phase/java-diagnostics.txt"
-  local -r input="$RESULT_DIR/$reference"
+assert_sanitized_java_diagnostics() {
+  local -r input="$1"
   local snapshot=""
 
-  if [[ ! -e "$input" && ! -L "$input" ]]; then
-    printf 'null\n'
-    return 0
+  snapshot="$(read_bounded_single_line_regular_file \
+    "$input" "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES")" || {
+    log_error "Java diagnostics did not contain exactly one bounded snapshot"
+    return 1
+  }
+  assert_sanitized_java_diagnostics_snapshot "$snapshot"
+}
+
+java_diagnostics_phase_directory_is_safe() {
+  local -r phase="$1"
+  local -r phases_root="$RESULT_DIR/phases"
+  local -r phase_dir="$phases_root/$phase"
+  local result_physical=""
+
+  [[ "$phase" =~ ^[a-z0-9][a-z0-9-]{0,63}$ &&
+    -d "$RESULT_DIR" && ! -L "$RESULT_DIR" &&
+    -d "$phases_root" && ! -L "$phases_root" &&
+    -d "$phase_dir" && ! -L "$phase_dir" ]] || return 1
+  result_physical="$(realpath -e -- "$RESULT_DIR")" || return 1
+  [[ "$(realpath -e -- "$phases_root")" == "$result_physical/phases" &&
+    "$(realpath -e -- "$phase_dir")" == "$result_physical/phases/$phase" ]]
+}
+
+ensure_java_diagnostics_phase_directory() {
+  local -r phase="$1"
+  local -r phases_root="$RESULT_DIR/phases"
+  local -r phase_dir="$phases_root/$phase"
+
+  [[ "$phase" =~ ^[a-z0-9][a-z0-9-]{0,63}$ &&
+    -d "$RESULT_DIR" && ! -L "$RESULT_DIR" ]] || return 1
+  if [[ ! -e "$phases_root" && ! -L "$phases_root" ]]; then
+    mkdir -- "$phases_root" || return $?
   fi
-  assert_sanitized_java_diagnostics "$input" || return $?
-  snapshot="$(<"$input")" || return $?
+  [[ -d "$phases_root" && ! -L "$phases_root" ]] || return 1
+  if [[ ! -e "$phase_dir" && ! -L "$phase_dir" ]]; then
+    mkdir -- "$phase_dir" || return $?
+  fi
+  java_diagnostics_phase_directory_is_safe "$phase"
+}
+
+java_diagnostics_reference_phase() {
+  local -r reference="$1"
+
+  [[ "$reference" =~ ^phases/([a-z0-9][a-z0-9-]{0,63})/java-diagnostics\.txt$ ]] ||
+    return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+java_diagnostics_reference_evidence_json() {
+  local -r reference="$1"
+  local phase=""
+  local input=""
+  local snapshot=""
+
+  phase="$(java_diagnostics_reference_phase "$reference")" || return 1
+  input="$RESULT_DIR/$reference"
+  java_diagnostics_phase_directory_is_safe "$phase" || return 1
+  snapshot="$(read_bounded_single_line_regular_file \
+    "$input" "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES")" || return 1
+  assert_sanitized_java_diagnostics_snapshot "$snapshot" || return $?
   jq -cn \
     --arg reference "$reference" \
     --arg snapshot "$snapshot" '
@@ -13403,6 +13933,554 @@ java_diagnostics_phase_evidence_json() {
         )
       }
     '
+}
+
+java_diagnostics_phase_evidence_json() {
+  local -r phase="$1"
+  local -r reference="phases/$phase/java-diagnostics.txt"
+  local -r input="$RESULT_DIR/$reference"
+
+  if [[ ! -e "$input" && ! -L "$input" ]]; then
+    printf 'null\n'
+    return 0
+  fi
+  java_diagnostics_reference_evidence_json "$reference"
+}
+
+with_terminal_java_diagnostics_lock() (
+  local -r lock="$RESULT_DIR/.terminal-java-diagnostics.lock"
+  local lock_fd=""
+  local path_identity=""
+  local descriptor_identity=""
+  local lock_status=0
+  local command_status=0
+
+  [[ -d "$RESULT_DIR" && ! -L "$RESULT_DIR" &&
+    ! -L "$lock" && ( ! -e "$lock" || -f "$lock" ) ]] || return 1
+  umask 077
+  exec {lock_fd}>>"$lock" || return $?
+  path_identity="$(stat -Lc '%d:%i:%h:%u:%a' -- "$lock")" || return 1
+  descriptor_identity="$(stat -Lc '%d:%i:%h:%u:%a' -- "/proc/self/fd/$lock_fd")" ||
+    return 1
+  [[ ! -L "$lock" && "$path_identity" == "$descriptor_identity" &&
+    "$path_identity" == *":1:$(id -u):600" ]] || return 1
+  flock -x -w "$TERMINAL_JAVA_DIAGNOSTICS_LOCK_TIMEOUT_SECONDS" \
+    "$lock_fd" || return $?
+  if "$@"; then
+    command_status=0
+  else
+    command_status=$?
+  fi
+  if flock -u "$lock_fd"; then
+    :
+  else
+    lock_status=$?
+  fi
+  exec {lock_fd}>&-
+  if ((command_status != 0)); then
+    return "$command_status"
+  fi
+  return "$lock_status"
+)
+
+record_last_java_diagnostics_reference_unlocked() {
+  local -r reference="$1"
+  local -r last="$RESULT_DIR/.last-valid-java-diagnostics.json"
+  local -r terminal="$RESULT_DIR/terminal-java-diagnostics.json"
+  local -r freeze="$RESULT_DIR/.terminal-java-diagnostics.freeze"
+  local phase=""
+  local evidence=""
+  local payload=""
+  local candidate=""
+  local publication_status=0
+
+  [[ -d "$RESULT_DIR" && ! -L "$RESULT_DIR" ]] || return 1
+  if [[ -e "$terminal" || -L "$terminal" ]]; then
+    terminal_java_diagnostics_json >/dev/null
+    return $?
+  fi
+  if [[ -e "$freeze" || -L "$freeze" ]]; then
+    terminal_java_diagnostics_freeze_is_valid
+    return 1
+  fi
+  [[ ! -L "$last" && ( ! -e "$last" || -f "$last" ) ]] || return 1
+  phase="$(java_diagnostics_reference_phase "$reference")" || return 1
+  evidence="$(java_diagnostics_reference_evidence_json "$reference")" || return 1
+  payload="$(jq -cn \
+    --arg schema 'obi-java-bridge-terminal-diagnostics-v1' \
+    --arg phase "$phase" \
+    --argjson evidence "$evidence" '
+      $evidence + {
+        schema: $schema,
+        sealed: false,
+        available: true,
+        phase: $phase
+      }
+    ')" || return 1
+  candidate="$(mktemp "$RESULT_DIR/.last-valid-java-diagnostics.XXXXXX")" || return $?
+  if printf '%s\n' "$payload" >"$candidate" &&
+    chmod 0644 -- "$candidate"; then
+    :
+  else
+    rm -f -- "$candidate" || true
+    return 1
+  fi
+  if [[ -e "$terminal" || -L "$terminal" ]]; then
+    rm -f -- "$candidate" || true
+    terminal_java_diagnostics_json >/dev/null
+    return $?
+  fi
+  if [[ -e "$freeze" || -L "$freeze" ]]; then
+    rm -f -- "$candidate" || true
+    terminal_java_diagnostics_freeze_is_valid >/dev/null || return 1
+    return 1
+  fi
+  if mv -fT -- "$candidate" "$last"; then
+    return 0
+  fi
+  publication_status=$?
+  rm -f -- "$candidate" || true
+  return "$publication_status"
+}
+
+record_last_java_diagnostics_reference() {
+  with_terminal_java_diagnostics_lock \
+    record_last_java_diagnostics_reference_unlocked "$@"
+}
+
+record_last_java_diagnostics_phase() {
+  local -r phase="$1"
+
+  [[ "$phase" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || return 1
+  record_last_java_diagnostics_reference \
+    "phases/$phase/java-diagnostics.txt"
+}
+
+validate_last_java_diagnostics_payload() {
+  local -r payload="$1"
+  local reference=""
+  local phase=""
+  local expected=""
+
+  jq -e '
+    keys == [
+      "available", "counters", "phase", "reference", "schema", "sealed", "snapshot"
+    ] and
+    .schema == "obi-java-bridge-terminal-diagnostics-v1" and
+    .sealed == false and
+    .available == true and
+    (.phase | type == "string") and
+    (.reference | type == "string") and
+    (.snapshot | type == "string") and
+    (.counters | type == "object")
+  ' <<<"$payload" >/dev/null || return 1
+  reference="$(jq -er '.reference' <<<"$payload")" || return 1
+  phase="$(java_diagnostics_reference_phase "$reference")" || return 1
+  [[ "$(jq -er '.phase' <<<"$payload")" == "$phase" ]] || return 1
+  expected="$(java_diagnostics_reference_evidence_json "$reference")" || return 1
+  jq -e --argjson expected "$expected" '
+    .reference == $expected.reference and
+    .snapshot == $expected.snapshot and
+    .counters == $expected.counters
+  ' <<<"$payload" >/dev/null || return 1
+  printf '%s\n' "$payload"
+}
+
+validate_last_java_diagnostics_json() {
+  local -r input="$1"
+  local payload=""
+
+  payload="$(read_bounded_single_line_regular_file \
+    "$input" "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES")" || return 1
+  validate_last_java_diagnostics_payload "$payload"
+}
+
+terminal_java_diagnostics_recovery_boundary_payload() {
+  local -r boundary="$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary.json"
+  local envelope=""
+  local payload=""
+
+  envelope="$(read_bounded_single_line_regular_file \
+    "$boundary" "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES")" || return 1
+  jq -e '
+    keys == ["payload", "schema", "state"] and
+    .schema == "obi-java-bridge-terminal-diagnostics-recovery-v1" and
+    .state == "pending" and
+    (.payload == null or (.payload | type == "object"))
+  ' <<<"$envelope" >/dev/null || return 1
+  payload="$(jq -c '.payload' <<<"$envelope")" || return 1
+  if [[ "$payload" == "null" ]]; then
+    printf 'null\n'
+  else
+    validate_last_java_diagnostics_payload "$payload"
+  fi
+}
+
+terminal_java_diagnostics_recovery_commit_is_valid() {
+  local -r transition="$RESULT_DIR/.terminal-java-diagnostics.freeze"
+  local -r boundary="$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary.json"
+  local payload=""
+  local boundary_digest=""
+  local expected_boundary_digest=""
+
+  payload="$(read_bounded_single_line_regular_file "$transition" 160)" || return 1
+  [[ "$payload" =~ ^terminal-java-diagnostics-recovery-committed-v1:([0-9a-f]{64})$ ]] ||
+    return 1
+  expected_boundary_digest="${BASH_REMATCH[1]}"
+  if [[ -e "$boundary" || -L "$boundary" ]]; then
+    terminal_java_diagnostics_recovery_boundary_payload >/dev/null || return $?
+    boundary_digest="$(sha256sum "$boundary")" || return $?
+    boundary_digest="${boundary_digest%% *}"
+    [[ "$boundary_digest" == "$expected_boundary_digest" ]] || return 1
+  fi
+}
+
+terminal_java_diagnostics_transition_state() {
+  local -r transition="$RESULT_DIR/.terminal-java-diagnostics.freeze"
+  local payload=""
+
+  payload="$(read_bounded_single_line_regular_file "$transition" 160)" || return 1
+  if [[ "$payload" == "terminal-java-diagnostics-frozen-v1" ]]; then
+    printf 'frozen\n'
+  elif [[ "$payload" =~ ^terminal-java-diagnostics-recovery-committed-v1:[0-9a-f]{64}$ ]]; then
+    printf 'committed\n'
+  else
+    return 1
+  fi
+}
+
+terminal_java_diagnostics_transition_is_valid() {
+  terminal_java_diagnostics_transition_state >/dev/null
+}
+
+capture_terminal_java_diagnostics_recovery_boundary_unlocked() {
+  local -r terminal="$RESULT_DIR/terminal-java-diagnostics.json"
+  local -r freeze="$RESULT_DIR/.terminal-java-diagnostics.freeze"
+  local -r last="$RESULT_DIR/.last-valid-java-diagnostics.json"
+  local -r boundary="$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary.json"
+  local payload="null"
+  local envelope=""
+  local candidate=""
+  local publication_status=0
+
+  [[ -d "$RESULT_DIR" && ! -L "$RESULT_DIR" &&
+    ! -e "$terminal" && ! -L "$terminal" &&
+    ! -e "$freeze" && ! -L "$freeze" &&
+    ! -e "$boundary" && ! -L "$boundary" ]] || return 1
+  if [[ -e "$last" || -L "$last" ]]; then
+    payload="$(validate_last_java_diagnostics_json "$last")" || return 1
+  fi
+  envelope="$(jq -cn --argjson payload "$payload" '
+    {
+      schema: "obi-java-bridge-terminal-diagnostics-recovery-v1",
+      state: "pending",
+      payload: $payload
+    }
+  ')" || return 1
+  candidate="$(mktemp \
+    "$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary.XXXXXX")" ||
+    return $?
+  if printf '%s\n' "$envelope" >"$candidate" &&
+    chmod 0600 -- "$candidate"; then
+    :
+  else
+    publication_status=$?
+    rm -f -- "$candidate" || true
+    return "$publication_status"
+  fi
+  if ln -T -- "$candidate" "$boundary"; then
+    :
+  else
+    publication_status=$?
+    rm -f -- "$candidate" || true
+    return "$publication_status"
+  fi
+  if ! rm -f -- "$candidate"; then
+    return 1
+  fi
+  [[ "$(terminal_java_diagnostics_recovery_boundary_payload)" == "$payload" ]]
+}
+
+capture_terminal_java_diagnostics_recovery_boundary() {
+  with_terminal_java_diagnostics_lock \
+    capture_terminal_java_diagnostics_recovery_boundary_unlocked
+}
+
+commit_terminal_java_diagnostics_recovery_boundary_unlocked() {
+  local -r terminal="$RESULT_DIR/terminal-java-diagnostics.json"
+  local -r freeze="$RESULT_DIR/.terminal-java-diagnostics.freeze"
+  local -r boundary="$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary.json"
+  local candidate=""
+  local boundary_digest=""
+  local publication_status=0
+
+  [[ -d "$RESULT_DIR" && ! -L "$RESULT_DIR" &&
+    ! -e "$terminal" && ! -L "$terminal" &&
+    ! -e "$freeze" && ! -L "$freeze" &&
+    -e "$boundary" && ! -L "$boundary" ]] || return 1
+  terminal_java_diagnostics_recovery_boundary_payload >/dev/null || return $?
+  boundary_digest="$(sha256sum "$boundary")" || return $?
+  boundary_digest="${boundary_digest%% *}"
+  candidate="$(mktemp \
+    "$RESULT_DIR/.terminal-java-diagnostics-recovery-commit.XXXXXX")" ||
+    return $?
+  if printf 'terminal-java-diagnostics-recovery-committed-v1:%s\n' \
+    "$boundary_digest" >"$candidate" &&
+    chmod 0600 -- "$candidate"; then
+    :
+  else
+    publication_status=$?
+    rm -f -- "$candidate" || true
+    return "$publication_status"
+  fi
+  if ln -T -- "$candidate" "$freeze"; then
+    :
+  else
+    publication_status=$?
+    rm -f -- "$candidate" || true
+    if [[ -e "$freeze" || -L "$freeze" ]] &&
+      terminal_java_diagnostics_recovery_commit_is_valid; then
+      return 0
+    fi
+    return "$publication_status"
+  fi
+  if ! rm -f -- "$candidate"; then
+    return 1
+  fi
+  terminal_java_diagnostics_recovery_commit_is_valid
+}
+
+commit_terminal_java_diagnostics_recovery_boundary() {
+  with_terminal_java_diagnostics_lock \
+    commit_terminal_java_diagnostics_recovery_boundary_unlocked
+}
+
+clear_terminal_java_diagnostics_recovery_boundary_unlocked() {
+  local -r boundary="$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary.json"
+  local -r transition="$RESULT_DIR/.terminal-java-diagnostics.freeze"
+
+  [[ -d "$RESULT_DIR" && ! -L "$RESULT_DIR" &&
+    -e "$transition" && ! -L "$transition" ]] || return 1
+  terminal_java_diagnostics_recovery_commit_is_valid || return $?
+  if [[ -e "$boundary" || -L "$boundary" ]]; then
+    terminal_java_diagnostics_recovery_boundary_payload >/dev/null || return $?
+    rm -f -- "$boundary" || return $?
+  fi
+  rm -f -- "$transition" || return $?
+  [[ ! -e "$boundary" && ! -L "$boundary" &&
+    ! -e "$transition" && ! -L "$transition" ]]
+}
+
+clear_terminal_java_diagnostics_recovery_boundary() {
+  with_terminal_java_diagnostics_lock \
+    clear_terminal_java_diagnostics_recovery_boundary_unlocked
+}
+
+terminal_java_diagnostics_json() {
+  local -r terminal="$RESULT_DIR/terminal-java-diagnostics.json"
+  local payload=""
+  local reference=""
+  local phase=""
+  local expected=""
+
+  payload="$(read_bounded_single_line_regular_file \
+    "$terminal" "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES")" || return 1
+  if jq -e '
+    keys == ["available", "reason", "schema", "sealed"] and
+    .schema == "obi-java-bridge-terminal-diagnostics-v1" and
+    .sealed == true and
+    .available == false and
+    .reason == "no-valid-snapshot-before-terminal-boundary"
+  ' <<<"$payload" >/dev/null; then
+    printf '%s\n' "$payload"
+    return 0
+  fi
+  jq -e '
+    keys == [
+      "available", "counters", "phase", "reference", "schema", "sealed", "snapshot"
+    ] and
+    .schema == "obi-java-bridge-terminal-diagnostics-v1" and
+    .sealed == true and
+    .available == true and
+    (.phase | type == "string") and
+    (.reference | type == "string") and
+    (.snapshot | type == "string") and
+    (.counters | type == "object")
+  ' <<<"$payload" >/dev/null || return 1
+  reference="$(jq -er '.reference' <<<"$payload")" || return 1
+  phase="$(java_diagnostics_reference_phase "$reference")" || return 1
+  [[ "$(jq -er '.phase' <<<"$payload")" == "$phase" ]] || return 1
+  expected="$(java_diagnostics_reference_evidence_json "$reference")" || return 1
+  jq -e --argjson expected "$expected" '
+    .reference == $expected.reference and
+    .snapshot == $expected.snapshot and
+    .counters == $expected.counters
+  ' <<<"$payload" >/dev/null || return 1
+  printf '%s\n' "$payload"
+}
+
+terminal_java_diagnostics_freeze_is_valid() {
+  local -r freeze="$RESULT_DIR/.terminal-java-diagnostics.freeze"
+  local payload=""
+
+  payload="$(read_bounded_single_line_regular_file "$freeze" 64)" || return 1
+  [[ "$payload" == "terminal-java-diagnostics-frozen-v1" ]]
+}
+
+freeze_terminal_java_diagnostics_unlocked() {
+  local -r freeze="$RESULT_DIR/.terminal-java-diagnostics.freeze"
+  local candidate=""
+  local publication_status=0
+  local attempt=0
+
+  [[ -d "$RESULT_DIR" && ! -L "$RESULT_DIR" ]] || return 1
+  if [[ -e "$freeze" || -L "$freeze" ]]; then
+    terminal_java_diagnostics_transition_state >/dev/null
+    return $?
+  fi
+  candidate="$(mktemp "$RESULT_DIR/.terminal-java-diagnostics-freeze.XXXXXX")" ||
+    return $?
+  if printf '%s\n' 'terminal-java-diagnostics-frozen-v1' >"$candidate" &&
+    chmod 0600 -- "$candidate"; then
+    :
+  else
+    publication_status=$?
+    rm -f -- "$candidate" || true
+    return "$publication_status"
+  fi
+  for attempt in 1 2 3; do
+    if ln -T -- "$candidate" "$freeze"; then
+      if rm -f -- "$candidate"; then
+        terminal_java_diagnostics_freeze_is_valid
+        return $?
+      fi
+      return 1
+    fi
+    publication_status=$?
+    if [[ -e "$freeze" || -L "$freeze" ]] &&
+      terminal_java_diagnostics_transition_state >/dev/null; then
+      rm -f -- "$candidate" || true
+      return 0
+    fi
+    if [[ -e "$freeze" || -L "$freeze" ]]; then
+      rm -f -- "$candidate" || true
+      return "$publication_status"
+    fi
+  done
+  rm -f -- "$candidate" || true
+  return "$publication_status"
+}
+
+freeze_terminal_java_diagnostics() {
+  # Publish the freeze before waiting for the advisory lock. If an earlier
+  # record currently owns the lock, it is linearized before this boundary and
+  # the lock wait drains it. If the bounded wait fails, the durable freeze still
+  # prevents recovery from publishing a later snapshot as the failed boundary.
+  freeze_terminal_java_diagnostics_unlocked || return $?
+  with_terminal_java_diagnostics_lock \
+    terminal_java_diagnostics_transition_is_valid
+}
+
+seal_terminal_java_diagnostics_unlocked() {
+  local -r terminal="$RESULT_DIR/terminal-java-diagnostics.json"
+  local -r last="$RESULT_DIR/.last-valid-java-diagnostics.json"
+  local -r recovery_boundary="${1:-}"
+  local payload=""
+  local candidate=""
+  local publication_status=0
+
+  (($# <= 1)) || return 1
+  [[ -d "$RESULT_DIR" && ! -L "$RESULT_DIR" ]] || return 1
+  if [[ -e "$terminal" || -L "$terminal" ]]; then
+    terminal_java_diagnostics_json >/dev/null
+    return $?
+  fi
+  freeze_terminal_java_diagnostics_unlocked || return $?
+  if [[ -n "$recovery_boundary" && "$recovery_boundary" != "null" ]]; then
+    payload="$(validate_last_java_diagnostics_payload "$recovery_boundary")" ||
+      return 1
+    payload="$(jq -c '.sealed = true' <<<"$payload")" || return 1
+  elif [[ -n "$recovery_boundary" ]]; then
+    payload="$(jq -cn '
+      {
+        schema: "obi-java-bridge-terminal-diagnostics-v1",
+        sealed: true,
+        available: false,
+        reason: "no-valid-snapshot-before-terminal-boundary"
+      }
+    ')" || return 1
+  elif [[ -e "$last" || -L "$last" ]]; then
+    payload="$(validate_last_java_diagnostics_json "$last")" || return 1
+    payload="$(jq -c '.sealed = true' <<<"$payload")" || return 1
+  else
+    payload="$(jq -cn '
+      {
+        schema: "obi-java-bridge-terminal-diagnostics-v1",
+        sealed: true,
+        available: false,
+        reason: "no-valid-snapshot-before-terminal-boundary"
+      }
+    ')" || return 1
+  fi
+  candidate="$(mktemp "$RESULT_DIR/.terminal-java-diagnostics.XXXXXX")" || return $?
+  if printf '%s\n' "$payload" >"$candidate" &&
+    chmod 0644 -- "$candidate"; then
+    :
+  else
+    publication_status=$?
+    rm -f -- "$candidate" || true
+    return "$publication_status"
+  fi
+  if ln -T -- "$candidate" "$terminal"; then
+    if ! rm -f -- "$candidate"; then
+      return 1
+    fi
+    terminal_java_diagnostics_json >/dev/null
+    return $?
+  else
+    publication_status=$?
+    rm -f -- "$candidate" || true
+    if [[ -e "$terminal" || -L "$terminal" ]] &&
+      terminal_java_diagnostics_json >/dev/null; then
+      return 0
+    fi
+    return "$publication_status"
+  fi
+}
+
+seal_terminal_java_diagnostics_from_recovery_state_unlocked() {
+  local -r terminal="$RESULT_DIR/terminal-java-diagnostics.json"
+  local -r boundary="$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary.json"
+  local transition_state=""
+  local recovery_boundary=""
+
+  if [[ -e "$terminal" || -L "$terminal" ]]; then
+    seal_terminal_java_diagnostics_unlocked
+    return $?
+  fi
+  transition_state="$(terminal_java_diagnostics_transition_state)" || return $?
+  if [[ "$transition_state" == "committed" ]]; then
+    terminal_java_diagnostics_recovery_commit_is_valid || return $?
+    seal_terminal_java_diagnostics_unlocked
+    return $?
+  fi
+  if [[ -e "$boundary" || -L "$boundary" ]]; then
+    recovery_boundary="$(
+      terminal_java_diagnostics_recovery_boundary_payload
+    )" || return $?
+    seal_terminal_java_diagnostics_unlocked "$recovery_boundary"
+    return $?
+  fi
+  seal_terminal_java_diagnostics_unlocked
+}
+
+seal_terminal_java_diagnostics() {
+  # The freeze must survive a bounded lock-acquisition failure. Records check
+  # it both before validation and immediately before publication, while the
+  # lock orders any record that was already in flight ahead of this seal.
+  freeze_terminal_java_diagnostics_unlocked || return $?
+  with_terminal_java_diagnostics_lock \
+    seal_terminal_java_diagnostics_from_recovery_state_unlocked
 }
 
 background_process_is_running() {
@@ -14117,10 +15195,13 @@ run_primary_security_control() {
   assert_sanitized_java_diagnostics \
     "$RESULT_DIR/phases/security-primary-diagnostics-after/java-diagnostics.txt"
 
+  capture_terminal_java_diagnostics_recovery_boundary || return $?
   (
     SCENARIO_VARIANT="security-primary-recovery"
     run_scenario basic false
   )
+  commit_terminal_java_diagnostics_recovery_boundary || return $?
+  clear_terminal_java_diagnostics_recovery_boundary || return $?
   # Keep this as a simple command: a conditional call would suppress errexit
   # inside the nested fault-control subshell.
   run_primary_live_fd_security_control "$host_probe"
@@ -14194,6 +15275,7 @@ run_unix_permissive_directory_control() {
   run_bounded 15 "${COMPOSE[@]}" logs --no-color --since "$failure_since" \
     obi >"$obi_log" || return $?
 
+  capture_terminal_java_diagnostics_recovery_boundary || return $?
   run_bounded "$OBI_COMPOSE_COMMAND_TIMEOUT_SECONDS" \
     "${COMPOSE[@]}" stop --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" obi || \
     return $?
@@ -14706,6 +15788,7 @@ run_unix_security_control() {
     return 1
   }
 
+  capture_terminal_java_diagnostics_recovery_boundary || return $?
   wait_for_log \
     obi \
     "Java remote-parent fallback transport recovered" \
@@ -14747,6 +15830,8 @@ run_unix_security_control() {
     log_error "could not verify that security diagnostics excluded the probe payload canary"
     return "$canary_status"
   fi
+  commit_terminal_java_diagnostics_recovery_boundary || return $?
+  clear_terminal_java_diagnostics_recovery_boundary || return $?
 
   run_unix_permissive_directory_control || return $?
 
@@ -14761,6 +15846,8 @@ run_unix_security_control() {
     "$(basename -- "$RESULT_DIR/security-unix-same-cgroup-identity.txt")" \
     "$(basename -- "$endpoint_output")" \
     >"$RESULT_DIR/scenario-security-status.json"
+  commit_terminal_java_diagnostics_recovery_boundary || return $?
+  clear_terminal_java_diagnostics_recovery_boundary || return $?
 }
 
 record_unsupported_scenario() {
@@ -15373,15 +16460,87 @@ capture_phase_evidence() {
 capture_java_diagnostics() {
   local -r phase="$1"
   local -r phase_dir="$RESULT_DIR/phases/$phase"
+  local -r output="$phase_dir/java-diagnostics.txt"
+  local -r stderr_output="$phase_dir/java-diagnostics.stderr"
+  local candidate=""
+  local stderr_candidate=""
+  local size=""
+  local capture_status=0
+  local validation_status=0
+  local publish_unavailable=false
 
-  mkdir -p -- "$phase_dir"
-  if ! curl --fail --silent --show-error --max-time 5 \
+  ensure_java_diagnostics_phase_directory "$phase" || return $?
+  [[ ! -L "$output" && ( ! -e "$output" || -f "$output" ) &&
+    ! -L "$stderr_output" &&
+    ( ! -e "$stderr_output" || -f "$stderr_output" ) ]] || return 1
+  candidate="$(mktemp "$phase_dir/.java-diagnostics.XXXXXX")" || return $?
+  stderr_candidate="$(mktemp "$phase_dir/.java-diagnostics-stderr.XXXXXX")" || {
+    capture_status=$?
+    rm -f -- "$candidate" || true
+    return "$capture_status"
+  }
+  if curl --fail --silent --show-error --max-time 5 \
     --cacert "$CERT_DIR/ca.crt" \
     "https://127.0.0.1:18443/obi-diagnostics" \
-    >"$phase_dir/java-diagnostics.txt" \
-    2>"$phase_dir/java-diagnostics.stderr"; then
-    printf 'unavailable\n' >"$phase_dir/java-diagnostics.txt"
+    2>"$stderr_candidate" |
+    (
+      LC_ALL=C head -c "$((TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES + 1))" \
+        >"$candidate" || exit $?
+      cat >/dev/null
+    ); then
+    :
+  else
+    capture_status=$?
+    publish_unavailable=true
   fi
+  if chmod 0644 -- "$stderr_candidate" &&
+    mv -fT -- "$stderr_candidate" "$stderr_output"; then
+    :
+  else
+    validation_status=$?
+    rm -f -- "$candidate" "$stderr_candidate" || true
+    return "$validation_status"
+  fi
+  if ((capture_status == 0)); then
+    size="$(stat -c '%s' -- "$candidate")" || {
+      validation_status=$?
+      rm -f -- "$candidate" || true
+      return "$validation_status"
+    }
+    if ((size > TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES)) ||
+      ! bounded_evidence_file \
+        "$candidate" \
+        "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES" \
+        "$TERMINAL_JAVA_DIAGNOSTICS_MAX_LINES" ||
+      ! assert_sanitized_java_diagnostics "$candidate"; then
+      validation_status=1
+      publish_unavailable=true
+    fi
+  fi
+  if [[ "$publish_unavailable" == "true" ]]; then
+    if printf 'unavailable\n' >"$candidate"; then
+      :
+    else
+      validation_status=$?
+      rm -f -- "$candidate" || true
+      return "$validation_status"
+    fi
+  fi
+  if chmod 0644 -- "$candidate" &&
+    mv -fT -- "$candidate" "$output"; then
+    :
+  else
+    validation_status=$?
+    rm -f -- "$candidate" || true
+    return "$validation_status"
+  fi
+  if ((capture_status != 0)); then
+    return 0
+  fi
+  if ((validation_status != 0)); then
+    return "$validation_status"
+  fi
+  record_last_java_diagnostics_phase "$phase"
 }
 
 write_metrics_delta() {
@@ -16752,17 +17911,166 @@ capture_evidence() {
     "http://127.0.0.1:14318/snapshot" >"$RESULT_DIR/final-receiver-snapshot.json" 2>/dev/null || true
 }
 
+remove_published_run_status() {
+  local -r output="$RESULT_DIR/run-status.json"
+  local handle_identity=""
+  local handle_links=""
+  local output_identity=""
+  local output_links=""
+  local handle_present=false
+  local output_present=false
+
+  [[ -n "$RUN_STATUS_PUBLISHED_IDENTITY" &&
+    -n "$RUN_STATUS_PUBLISHED_DIGEST" &&
+    "$RUN_STATUS_PUBLICATION_OUTPUT" == "$output" &&
+    "$RUN_STATUS_PUBLICATION_HANDLE" == "$RESULT_DIR"/.run-status.* &&
+    "$RUN_STATUS_PUBLICATION_STATE" =~ ^(prepared|published|validated)$ ]] ||
+    return 1
+  if [[ -e "$RUN_STATUS_PUBLICATION_HANDLE" ||
+    -L "$RUN_STATUS_PUBLICATION_HANDLE" ]]; then
+    [[ -f "$RUN_STATUS_PUBLICATION_HANDLE" &&
+      ! -L "$RUN_STATUS_PUBLICATION_HANDLE" ]] || return 1
+    handle_present=true
+    handle_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+      "$RUN_STATUS_PUBLICATION_HANDLE")" || return 1
+    handle_links="$(stat -Lc '%h' -- "$RUN_STATUS_PUBLICATION_HANDLE")" || return 1
+    [[ "$handle_identity" == "$RUN_STATUS_PUBLISHED_IDENTITY" ]] || return 1
+  fi
+  if [[ -e "$output" || -L "$output" ]]; then
+    [[ -f "$output" && ! -L "$output" ]] || return 1
+    output_present=true
+    output_identity="$(stat -Lc '%d:%i:%u:%a' -- "$output")" || return 1
+    output_links="$(stat -Lc '%h' -- "$output")" || return 1
+    [[ "$output_identity" == "$RUN_STATUS_PUBLISHED_IDENTITY" ]] || return 1
+  fi
+  if [[ "$handle_present" == true && "$output_present" == true ]]; then
+    [[ "$handle_links" == 2 && "$output_links" == 2 ]] || return 1
+  elif [[ "$handle_present" == true ]]; then
+    [[ "$handle_links" == 1 ]] || return 1
+  else
+    return 1
+  fi
+  if [[ "$output_present" == true ]]; then
+    rm -f -- "$output" || return $?
+  fi
+  [[ ! -e "$output" && ! -L "$output" ]] || return 1
+  if [[ "$handle_present" == true ]]; then
+    [[ "$(stat -Lc '%h' -- "$RUN_STATUS_PUBLICATION_HANDLE")" == 1 ]] || return 1
+    rm -f -- "$RUN_STATUS_PUBLICATION_HANDLE" || return $?
+  fi
+  [[ ! -e "$RUN_STATUS_PUBLICATION_HANDLE" &&
+    ! -L "$RUN_STATUS_PUBLICATION_HANDLE" ]] || return 1
+  RUN_STATUS_PUBLISHED_IDENTITY=""
+  RUN_STATUS_PUBLISHED_DIGEST=""
+  RUN_STATUS_PUBLICATION_HANDLE=""
+  RUN_STATUS_PUBLICATION_OUTPUT=""
+  RUN_STATUS_PUBLICATION_STATE=""
+}
+
+commit_published_run_status() {
+  local -r output="$RESULT_DIR/run-status.json"
+  local handle_identity=""
+  local output_identity=""
+  local handle_digest=""
+  local output_digest=""
+
+  [[ -n "$RUN_STATUS_PUBLISHED_IDENTITY" &&
+    -n "$RUN_STATUS_PUBLISHED_DIGEST" &&
+    "$RUN_STATUS_PUBLICATION_STATE" == validated &&
+    "$RUN_STATUS_PUBLICATION_OUTPUT" == "$output" &&
+    "$RUN_STATUS_PUBLICATION_HANDLE" == "$RESULT_DIR"/.run-status.* &&
+    -f "$RUN_STATUS_PUBLICATION_HANDLE" &&
+    ! -L "$RUN_STATUS_PUBLICATION_HANDLE" &&
+    -f "$output" && ! -L "$output" ]] || return 1
+  handle_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$RUN_STATUS_PUBLICATION_HANDLE")" || return 1
+  output_identity="$(stat -Lc '%d:%i:%u:%a' -- "$output")" || return 1
+  handle_digest="$(sha256sum "$RUN_STATUS_PUBLICATION_HANDLE")" || return 1
+  handle_digest="${handle_digest%% *}"
+  output_digest="$(sha256sum "$output")" || return 1
+  output_digest="${output_digest%% *}"
+  [[ "$handle_identity" == "$RUN_STATUS_PUBLISHED_IDENTITY" &&
+    "$output_identity" == "$RUN_STATUS_PUBLISHED_IDENTITY" &&
+    "$(stat -Lc '%h' -- "$RUN_STATUS_PUBLICATION_HANDLE")" == 2 &&
+    "$(stat -Lc '%h' -- "$output")" == 2 &&
+    "$handle_digest" == "$RUN_STATUS_PUBLISHED_DIGEST" &&
+    "$output_digest" == "$RUN_STATUS_PUBLISHED_DIGEST" ]] || return 1
+  rm -f -- "$RUN_STATUS_PUBLICATION_HANDLE" || return $?
+  clear_published_run_status_ownership
+}
+
+clear_published_run_status_ownership() {
+  RUN_STATUS_PUBLISHED_IDENTITY=""
+  RUN_STATUS_PUBLISHED_DIGEST=""
+  RUN_STATUS_PUBLICATION_HANDLE=""
+  RUN_STATUS_PUBLICATION_OUTPUT=""
+  RUN_STATUS_PUBLICATION_STATE=""
+}
+
+remove_terminal_owned_run_status_for_rewrite() {
+  local -r output="$RESULT_DIR/run-status.json"
+
+  [[ -n "$RUN_STATUS_PUBLISHED_IDENTITY" &&
+    -n "$RUN_STATUS_PUBLISHED_DIGEST" &&
+    "$RUN_STATUS_PUBLICATION_OUTPUT" == "$output" &&
+    "$RUN_STATUS_PUBLICATION_HANDLE" == "$RESULT_DIR"/.run-status.* &&
+    "$RUN_STATUS_PUBLICATION_STATE" =~ ^(published|validated)$ ]] || return 1
+  # A successful hardlink publication binds both paths to the private handle.
+  # Terminal rewrites are serialized cooperative harness operations, so a
+  # later verifier fault must not strand a stale canonical status.
+  rm -f -- "$output" || return $?
+  rm -f -- "$RUN_STATUS_PUBLICATION_HANDLE" || return $?
+  clear_published_run_status_ownership
+}
+
+publish_owned_run_status() {
+  local -r exit_status="$1"
+  local publication_status=0
+
+  if write_run_status "$exit_status"; then
+    return 0
+  else
+    publication_status=$?
+  fi
+  if [[ "$RUN_STATUS_PUBLICATION_STATE" =~ ^(published|validated)$ ]]; then
+    remove_terminal_owned_run_status_for_rewrite || return "$publication_status"
+  elif [[ -n "$RUN_STATUS_PUBLISHED_IDENTITY" ||
+    -n "$RUN_STATUS_PUBLISHED_DIGEST" ||
+    -n "$RUN_STATUS_PUBLICATION_STATE" ]]; then
+    remove_published_run_status || return "$publication_status"
+  fi
+  return "$publication_status"
+}
+
 write_run_status() {
   local -r exit_status="$1"
+  local -r output="$RESULT_DIR/run-status.json"
   local failure_stage="${FAILURE_STAGE:-none}"
   local failure_line="${FAILURE_LINE:-0}"
   local -r acceptance_evidence_reason="${ACCEPTANCE_EVIDENCE_REASON:-none}"
   local status="failed"
+  local java_bridge_diagnostics=""
+  local candidate=""
+  local candidate_identity=""
+  local candidate_digest=""
+  local output_identity=""
+  local output_digest=""
+  local publication_status=0
 
   if ((exit_status == 0)) && [[ "$RUN_STATUS" == "passed" ]]; then
     status="passed"
   fi
-  jq -n \
+  seal_terminal_java_diagnostics || return $?
+  java_bridge_diagnostics="$(terminal_java_diagnostics_json)" || return $?
+  [[ -d "$RESULT_DIR" && ! -L "$RESULT_DIR" &&
+    ! -e "$output" && ! -L "$output" &&
+    -z "$RUN_STATUS_PUBLISHED_IDENTITY" &&
+    -z "$RUN_STATUS_PUBLISHED_DIGEST" &&
+    -z "$RUN_STATUS_PUBLICATION_HANDLE" &&
+    -z "$RUN_STATUS_PUBLICATION_OUTPUT" &&
+    -z "$RUN_STATUS_PUBLICATION_STATE" ]] || return 1
+  candidate="$(mktemp "$RESULT_DIR/.run-status.XXXXXX")" || return $?
+  if jq -n \
     --arg status "$status" \
     --argjson exit_status "$exit_status" \
     --argjson acceptance_evidence "$ACCEPTANCE_EVIDENCE" \
@@ -16770,6 +18078,8 @@ write_run_status() {
     --arg failure_stage "$failure_stage" \
     --argjson failure_line "$failure_line" \
     --arg evidence_directory "$RESULT_DIR" \
+    --arg java_bridge_diagnostics_reference 'terminal-java-diagnostics.json' \
+    --argjson java_bridge_diagnostics "$java_bridge_diagnostics" \
     '{
       status: $status,
       exit_status: $exit_status,
@@ -16777,8 +18087,63 @@ write_run_status() {
       acceptance_evidence_reason: $acceptance_evidence_reason,
       failure_stage: $failure_stage,
       failure_line: $failure_line,
-      evidence_directory: $evidence_directory
-    }' >"$RESULT_DIR/run-status.json"
+      evidence_directory: $evidence_directory,
+      java_bridge_diagnostics_reference: $java_bridge_diagnostics_reference,
+      java_bridge_diagnostics: $java_bridge_diagnostics
+    }' >"$candidate" && chmod 0644 -- "$candidate"; then
+    :
+  else
+    publication_status=$?
+    rm -f -- "$candidate" || true
+    return "$publication_status"
+  fi
+  candidate_identity="$(stat -Lc '%d:%i:%u:%a' -- "$candidate")" || {
+    publication_status=$?
+    rm -f -- "$candidate" || true
+    return "$publication_status"
+  }
+  candidate_digest="$(sha256sum "$candidate")" || {
+    publication_status=$?
+    rm -f -- "$candidate" || true
+    return "$publication_status"
+  }
+  candidate_digest="${candidate_digest%% *}"
+  RUN_STATUS_PUBLISHED_IDENTITY="$candidate_identity"
+  RUN_STATUS_PUBLISHED_DIGEST="$candidate_digest"
+  RUN_STATUS_PUBLICATION_HANDLE="$candidate"
+  RUN_STATUS_PUBLICATION_OUTPUT="$output"
+  RUN_STATUS_PUBLICATION_STATE=prepared
+  if ln -T -- "$candidate" "$output"; then
+    RUN_STATUS_PUBLICATION_STATE=published
+  else
+    publication_status=$?
+    if [[ -f "$candidate" && ! -L "$candidate" &&
+      -f "$output" && ! -L "$output" && "$candidate" -ef "$output" ]]; then
+      # The atomic link succeeded even though its wrapper reported an error.
+      # Preserve ownership so the terminal fast remover can safely prevent a
+      # stale status even when a later external verifier is unavailable.
+      RUN_STATUS_PUBLICATION_STATE=published
+    elif remove_published_run_status; then
+      :
+    elif [[ -f "$candidate" && ! -L "$candidate" &&
+      "$(stat -Lc '%d:%i:%u:%a:%h' -- "$candidate")" == "$candidate_identity:1" &&
+      "$(sha256sum "$candidate" | awk '{ print $1 }')" == "$candidate_digest" ]]; then
+      rm -f -- "$candidate" || true
+      clear_published_run_status_ownership
+    fi
+    return "$publication_status"
+  fi
+  output_identity="$(stat -Lc '%d:%i:%u:%a' -- "$output")" || return 1
+  output_digest="$(sha256sum "$output")" || return 1
+  output_digest="${output_digest%% *}"
+  [[ -f "$candidate" && ! -L "$candidate" &&
+    -f "$output" && ! -L "$output" &&
+    "$output_identity" == "$candidate_identity" &&
+    "$output_identity" == *":$(id -u):644" &&
+    "$(stat -Lc '%h' -- "$candidate")" == 2 &&
+    "$(stat -Lc '%h' -- "$output")" == 2 &&
+    "$output_digest" == "$candidate_digest" ]] || return 1
+  RUN_STATUS_PUBLICATION_STATE=validated
 }
 
 cleanup_only() {

@@ -10,6 +10,15 @@ VERIFICATION_TMP_PARENT="/tmp"
 readonly SCRIPT_NAME SCRIPT_DIR VERIFICATION_TMP_PARENT
 
 readonly EMPTY_SHA256='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+readonly MAX_UINT64_DECIMAL='18446744073709551615'
+readonly JAVA_DIAGNOSTIC_COUNTER_MAX=999999999
+readonly RUN_STATUS_MAX_BYTES=262144
+readonly TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES=16384
+readonly OBI_METRIC_PAIR_MAX_BYTES=131072
+readonly OBI_PROCESS_IDENTITY_MAX_BYTES=2048
+readonly OBI_METRIC_PAIR_MAX_SERIES=792
+readonly OBI_METRIC_SNAPSHOT_MAX_BYTES=8388608
+readonly OBI_METRIC_SNAPSHOT_MAX_LINES=20000
 
 BUNDLE_DIR=""
 BUNDLE_NAME=""
@@ -226,7 +235,7 @@ check_dependencies() {
   local -a missing=()
   local command_name=""
 
-  for command_name in chmod cmp find git jq mkdir mktemp rm sha256sum sort stat tar; do
+  for command_name in awk chmod cmp find git jq mkdir mktemp rm sha256sum sort stat tar; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
       missing+=("$command_name")
     fi
@@ -492,6 +501,31 @@ uses_historical_run_status_schema() {
   return 1
 }
 
+uses_pre_v2_run_status_schema() {
+  local -r evidence_id="$1"
+  local -r revision="$2"
+
+  # Keep this complete schema-transition allowlist independent from the older
+  # seven-bundle exceptions used by other provenance rules below.
+  case "$evidence_id:$revision" in
+    otel-getsockopt-tls12-c7209e43:c7209e4306694ed2f6fe4d2bb813d7b632915dd2|\
+    otel-getsockopt-tls13-74576ec6:74576ec657056dc3f63cb90f4c95f6f362a2dd39|\
+    otel-getsockopt-tls13-7482d908:7482d90807afd849575a8f8dda67e255daf0680d|\
+    otel-getsockopt-tls13-8282d2ed:8282d2ed9c3a3f6925902cd84f11f491bc4f4565|\
+    otel-getsockopt-tls13-94221a91:94221a9127553adb233a7560baa6f2a327c558b8|\
+    otel-getsockopt-tls13-b678ce1e:b678ce1e2415906d45df3bf0728e7ed9e92c52c9|\
+    otel-getsockopt-tls13-c9d14356:c9d14356ce5b1aadd72a2e21f4212971d7c32584|\
+    otel-getsockopt-tls13-e8db066a:e8db066ac36748f17d8debd9098e9d1ddba67067|\
+    otel-unix-tls12-acedb68a:acedb68a01e5e3a5205ca1a462c345ecb184e5e7|\
+    otel-unix-tls12-bd1c9327:bd1c932791791b910bba071e912de9455169c69d|\
+    otel-unix-tls13-6c4a2505:6c4a2505b6a6d4e89d3aedd9952097ad42ce1457|\
+    splunk-getsockopt-tls13-47237792:472377929106fa57c1575ab0942984d5d499b731)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 uses_legacy_environment_schema() {
   local -r evidence_id="$1"
   local -r revision="$2"
@@ -632,17 +666,744 @@ validate_clean_source_metadata() {
   fi
 }
 
-validate_json_provenance() {
+validate_bounded_regular_file() {
+  local -r relative_path="$1"
+  local -r maximum_bytes="$2"
+  local -r maximum_lines="${3:-0}"
+  local -r path="$BUNDLE_DIR/$relative_path"
+  local size=""
+  local line_count=""
+
+  is_safe_relative_path "$relative_path" || return 1
+  [[ "$maximum_bytes" =~ ^[1-9][0-9]*$ &&
+    "$maximum_lines" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  require_regular_file "$relative_path"
+  size="$(stat -Lc '%s' -- "$path")" || return 1
+  ((size > 0 && size <= maximum_bytes)) || return 1
+  if ((maximum_lines > 0)); then
+    line_count="$(awk 'END { print NR }' "$path")" || return 1
+    [[ "$line_count" =~ ^[0-9]+$ ]] || return 1
+    ((line_count > 0 && line_count <= maximum_lines)) || return 1
+  fi
+}
+
+validate_single_json_object() {
+  local -r relative_path="$1"
+  local -r maximum_bytes="$2"
+
+  validate_bounded_regular_file "$relative_path" "$maximum_bytes" || return 1
+  jq -e -s 'length == 1 and (.[0] | type == "object")' \
+    "$BUNDLE_DIR/$relative_path" >/dev/null
+}
+
+canonical_uint64_string() {
+  local -r value="$1"
+  local LC_ALL=C
+
+  [[ "$value" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  # Equal-width canonical decimal strings compare safely without arithmetic.
+  # shellcheck disable=SC2071
+  if (( ${#value} > ${#MAX_UINT64_DECIMAL} )) ||
+    { (( ${#value} == ${#MAX_UINT64_DECIMAL} )) &&
+      [[ "$value" > "$MAX_UINT64_DECIMAL" ]]; }; then
+    return 1
+  fi
+}
+
+uint64_string_compare() {
+  local -r left="$1"
+  local -r right="$2"
+  local -r output_name="$3"
+  local comparison_result=""
+  local LC_ALL=C
+
+  canonical_uint64_string "$left" || return 1
+  canonical_uint64_string "$right" || return 1
+  [[ "$output_name" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || return 1
+  # Equal-width canonical decimal strings compare safely without arithmetic.
+  # shellcheck disable=SC2071
+  if (( ${#left} < ${#right} )); then
+    comparison_result=-1
+  elif (( ${#left} > ${#right} )); then
+    comparison_result=1
+  elif [[ "$left" == "$right" ]]; then
+    comparison_result=0
+  elif [[ "$left" < "$right" ]]; then
+    comparison_result=-1
+  else
+    comparison_result=1
+  fi
+  printf -v "$output_name" '%s' "$comparison_result"
+}
+
+uint64_string_subtract() {
+  local -r minuend="$1"
+  local -r subtrahend="$2"
+  local -r output_name="$3"
+  local comparison=""
+  local result=""
+  local digit=""
+  local -i minuend_index=0
+  local -i subtrahend_index=0
+  local -i minuend_digit=0
+  local -i subtrahend_digit=0
+  local -i borrow=0
+  local -i difference=0
+
+  uint64_string_compare "$minuend" "$subtrahend" comparison || return 1
+  [[ "$comparison" != -1 && "$output_name" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] ||
+    return 1
+  minuend_index=$((${#minuend} - 1))
+  subtrahend_index=$((${#subtrahend} - 1))
+  while ((minuend_index >= 0)); do
+    minuend_digit=$((10#${minuend:minuend_index:1} - borrow))
+    subtrahend_digit=0
+    if ((subtrahend_index >= 0)); then
+      subtrahend_digit=$((10#${subtrahend:subtrahend_index:1}))
+    fi
+    if ((minuend_digit < subtrahend_digit)); then
+      minuend_digit=$((minuend_digit + 10))
+      borrow=1
+    else
+      borrow=0
+    fi
+    difference=$((minuend_digit - subtrahend_digit))
+    printf -v digit '%d' "$difference"
+    result="$digit$result"
+    minuend_index=$((minuend_index - 1))
+    subtrahend_index=$((subtrahend_index - 1))
+  done
+  ((borrow == 0)) || return 1
+  while (( ${#result} > 1 )) && [[ "$result" == 0* ]]; do
+    result="${result#0}"
+  done
+  canonical_uint64_string "$result" || return 1
+  printf -v "$output_name" '%s' "$result"
+}
+
+obi_metric_label_value_is_allowed() {
+  local -r kind="$1"
+  local -r value="$2"
+
+  case "$kind:$value" in
+    transport:tcp|transport:getsockopt|transport:unix|transport:disabled|\
+    operation:stage|operation:candidate|operation:handoff|operation:inject|\
+    operation:take|operation:discard|operation:negotiate|\
+    operation:availability|operation:cleanup|operation:evict|operation:report|\
+    status:unknown|status:valid|status:missing|status:stale|\
+    status:unsupported|status:malformed|status:version_mismatch|\
+    status:ambiguous|status:unauthorized|status:already_consumed|\
+    status:timeout|status:overload|status:transport_error|status:disabled|\
+    status:segmented|status:load_denied|status:permission_denied|\
+    status:verifier_rejected)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+parse_obi_metric_snapshot() {
+  local -r relative_path="$1"
+  local -r output="$2"
+  local -r input="$BUNDLE_DIR/$relative_path"
+  local line=""
+  local metric=""
+  local raw_value=""
+  local extra=""
+  local labels=""
+  local entry=""
+  local label_name=""
+  local label_value=""
+  local transport=""
+  local operation=""
+  local status=""
+  local error_type=""
+  local process_name=""
+  local key=""
+  local unsorted=""
+  local attach_value=0
+  local attach_present=false
+  local -a label_entries=()
+  declare -A seen_series=()
+  declare -A seen_labels=()
+
+  validate_bounded_regular_file \
+    "$relative_path" "$OBI_METRIC_SNAPSHOT_MAX_BYTES" \
+    "$OBI_METRIC_SNAPSHOT_MAX_LINES" || return 1
+  [[ ! -L "$output" ]] || return 1
+  unsorted="$(mktemp "$TMP_DIR/obi-metric-snapshot.XXXXXX")" || return $?
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" != *$'\r'* ]] || {
+      rm -f -- "$unsorted"
+      return 1
+    }
+    [[ -n "$line" && "$line" != \#* ]] || continue
+    metric=""
+    raw_value=""
+    extra=""
+    read -r metric raw_value extra <<<"$line"
+    if [[ "$metric" == obi_java_remote_parent_operations_total* ]]; then
+      [[ -z "$extra" &&
+        "$metric" == 'obi_java_remote_parent_operations_total{'*'}' ]] || {
+        rm -f -- "$unsorted"
+        return 1
+      }
+      labels="${metric#*\{}"
+      labels="${labels%\}}"
+      IFS=',' read -r -a label_entries <<<"$labels"
+      (( ${#label_entries[@]} == 3 )) || {
+        rm -f -- "$unsorted"
+        return 1
+      }
+      transport=""
+      operation=""
+      status=""
+      seen_labels=()
+      for entry in "${label_entries[@]}"; do
+        [[ "$entry" =~ ^(operation|status|transport)=\"([a-z_]+)\"$ ]] || {
+          rm -f -- "$unsorted"
+          return 1
+        }
+        label_name="${BASH_REMATCH[1]}"
+        label_value="${BASH_REMATCH[2]}"
+        [[ -z "${seen_labels[$label_name]:-}" ]] || {
+          rm -f -- "$unsorted"
+          return 1
+        }
+        seen_labels["$label_name"]=1
+        obi_metric_label_value_is_allowed "$label_name" "$label_value" || {
+          rm -f -- "$unsorted"
+          return 1
+        }
+        case "$label_name" in
+          transport) transport="$label_value" ;;
+          operation) operation="$label_value" ;;
+          status) status="$label_value" ;;
+        esac
+      done
+      [[ -n "$transport" && -n "$operation" && -n "$status" ]] || {
+        rm -f -- "$unsorted"
+        return 1
+      }
+      canonical_uint64_string "$raw_value" || {
+        rm -f -- "$unsorted"
+        return 1
+      }
+      key="$transport|$operation|$status"
+      [[ -z "${seen_series[$key]:-}" ]] || {
+        rm -f -- "$unsorted"
+        return 1
+      }
+      seen_series["$key"]=1
+      if (( ${#seen_series[@]} > OBI_METRIC_PAIR_MAX_SERIES )); then
+        rm -f -- "$unsorted"
+        return 1
+      fi
+      printf 'series\t%s\t%s\t%s\t%s\n' \
+        "$transport" "$operation" "$status" "$raw_value" >>"$unsorted" || {
+        rm -f -- "$unsorted"
+        return 1
+      }
+      continue
+    fi
+    if [[ "$metric" == obi_instrumentation_errors_total* &&
+      "$metric" == *'attaching_java_agent'* ]]; then
+      [[ -z "$extra" && "$metric" == 'obi_instrumentation_errors_total{'*'}' ]] || {
+        rm -f -- "$unsorted"
+        return 1
+      }
+      labels="${metric#*\{}"
+      labels="${labels%\}}"
+      IFS=',' read -r -a label_entries <<<"$labels"
+      (( ${#label_entries[@]} == 2 )) || {
+        rm -f -- "$unsorted"
+        return 1
+      }
+      error_type=""
+      process_name=""
+      seen_labels=()
+      for entry in "${label_entries[@]}"; do
+        [[ "$entry" =~ ^(error_type|process_name)=\"([a-z_]+)\"$ ]] || {
+          rm -f -- "$unsorted"
+          return 1
+        }
+        label_name="${BASH_REMATCH[1]}"
+        label_value="${BASH_REMATCH[2]}"
+        [[ -z "${seen_labels[$label_name]:-}" ]] || {
+          rm -f -- "$unsorted"
+          return 1
+        }
+        seen_labels["$label_name"]=1
+        case "$label_name" in
+          error_type) error_type="$label_value" ;;
+          process_name) process_name="$label_value" ;;
+        esac
+      done
+      [[ "$error_type" == attaching_java_agent ]] || continue
+      [[ "$process_name" == java ]] || continue
+      [[ "$attach_present" == false ]] || {
+        rm -f -- "$unsorted"
+        return 1
+      }
+      canonical_uint64_string "$raw_value" || {
+        rm -f -- "$unsorted"
+        return 1
+      }
+      attach_present=true
+      attach_value="$raw_value"
+    fi
+  done <"$input"
+  if LC_ALL=C sort -- "$unsorted" >"$output" &&
+    printf 'attach\t%s\t%s\n' "$attach_present" "$attach_value" >>"$output"; then
+    rm -f -- "$unsorted" || return 1
+    return 0
+  fi
+  rm -f -- "$unsorted" "$output" || true
+  return 1
+}
+
+validate_java_diagnostics_snapshot() {
+  local -r snapshot="$1"
+  local entry=""
+  local name=""
+  local value=""
+  local -i decoded=0
+  local -i index=0
+  local -a entries=()
+  local -a expected_names=(
+    cfg_on cfg_off provider_ok provider_reject provider_ver extension_reg
+    lookup_ready lookup_missing lookup_version lookup_error record_version
+    invoke_error discard_standard extract_fields extract_invalid extract_error
+    registration_ok registration_fail take_sampled take_unsampled tls_reads tls_bytes
+    framework_depth framework_cycle framework_late transport_missing
+    t_unknown d_unknown t_valid d_valid t_missing d_missing t_stale d_stale
+    t_unsupported d_unsupported t_malformed d_malformed
+    t_version_mismatch d_version_mismatch t_ambiguous d_ambiguous
+    t_unauthorized d_unauthorized t_already_consumed d_already_consumed
+    t_timeout d_timeout t_overload d_overload
+    t_transport_error d_transport_error t_disabled d_disabled
+  )
+
+  IFS=',' read -r -a entries <<<"$snapshot"
+  (( ${#entries[@]} == ${#expected_names[@]} )) || return 1
+  for entry in "${entries[@]}"; do
+    [[ "$entry" =~ ^[a-z_]+=(0|[1-9a-z][0-9a-z]*)$ ]] || return 1
+    name="${entry%%=*}"
+    value="${entry#*=}"
+    [[ "$name" == "${expected_names[$index]}" && ${#value} -le 6 ]] || return 1
+    decoded="$((36#$value))"
+    ((decoded < JAVA_DIAGNOSTIC_COUNTER_MAX)) || return 1
+    ((index += 1))
+  done
+}
+
+validate_terminal_java_diagnostics() {
+  local -r relative_path='terminal-java-diagnostics.json'
+  local -r input="$BUNDLE_DIR/$relative_path"
+  local reference=""
+  local phase=""
+  local snapshot=""
+  local diagnostics=""
+  local -a lines=()
+
+  validate_single_json_object \
+    "$relative_path" "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES" || return 1
+  jq -e '
+    keys == [
+      "available", "counters", "phase", "reference", "schema", "sealed", "snapshot"
+    ] and
+    .schema == "obi-java-bridge-terminal-diagnostics-v1" and
+    .sealed == true and
+    .available == true and
+    ([.phase, .reference, .snapshot] | all(.[]; type == "string")) and
+    (.counters | type == "object")
+  ' "$input" >/dev/null || return 1
+  reference="$(jq -er '.reference' "$input")" || return 1
+  phase="$(jq -er '.phase' "$input")" || return 1
+  [[ "$phase" =~ ^[a-z0-9][a-z0-9-]{0,63}$ &&
+    "$reference" == "phases/$phase/java-diagnostics.txt" ]] || return 1
+  validate_bounded_regular_file \
+    "$reference" "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES" 1 || return 1
+  mapfile -t lines <"$BUNDLE_DIR/$reference"
+  (( ${#lines[@]} == 1 )) || return 1
+  diagnostics="${lines[0]}"
+  validate_java_diagnostics_snapshot "$diagnostics" || return 1
+  snapshot="$(jq -er '.snapshot' "$input")" || return 1
+  [[ "$snapshot" == "$diagnostics" ]] || return 1
+  jq -e --arg snapshot "$snapshot" '
+    .counters == (
+      $snapshot
+      | split(",")
+      | map(split("=") | {(.[0]): .[1]})
+      | add
+    )
+  ' "$input" >/dev/null
+}
+
+validate_obi_process_identity_reference() {
+  local -r reference="$1"
+  local phase=""
+  local state=""
+  local container_id=""
+  local host_pid=""
+  local started_at=""
+  local finished_at=""
+  local exit_code=""
+  local metrics_reference=""
+  local metrics_sha256=""
+  local observed_sha256=""
+  local input=""
+
+  [[ "$reference" =~ ^phases/([a-z0-9][a-z0-9-]{0,63})/obi-identity\.json$ ]] ||
+    return 1
+  phase="${BASH_REMATCH[1]}"
+  validate_single_json_object "$reference" "$OBI_PROCESS_IDENTITY_MAX_BYTES" ||
+    return 1
+  input="$BUNDLE_DIR/$reference"
+  state="$(jq -er '.state' "$input")" || return 1
+  case "$state" in
+    running)
+      jq -e '
+        keys == [
+          "container_id", "host_pid", "metrics_reference", "metrics_sha256",
+          "schema", "started_at", "state"
+        ] and
+        .schema == "obi-process-identity-v1" and
+        .state == "running" and
+        ([.container_id, .host_pid, .metrics_reference, .metrics_sha256,
+          .started_at] | all(.[]; type == "string"))
+      ' "$input" >/dev/null || return 1
+      ;;
+    obi_stopped)
+      jq -e '
+        keys == [
+          "container_id", "exit_code", "finished_at", "host_pid", "schema",
+          "started_at", "state"
+        ] and
+        .schema == "obi-process-identity-v1" and
+        .state == "obi_stopped" and
+        ([.container_id, .exit_code, .finished_at, .host_pid, .started_at] |
+          all(.[]; type == "string"))
+      ' "$input" >/dev/null || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  container_id="$(jq -er '.container_id' "$input")" || return 1
+  host_pid="$(jq -er '.host_pid' "$input")" || return 1
+  started_at="$(jq -er '.started_at' "$input")" || return 1
+  [[ "$container_id" =~ ^[0-9a-f]{64}$ &&
+    "$started_at" =~ ^[0-9TZ:.-]{20,64}$ ]] || return 1
+  canonical_uint64_string "$host_pid" || return 1
+  if [[ "$state" == running ]]; then
+    [[ "$host_pid" != 0 ]] || return 1
+    metrics_reference="$(jq -er '.metrics_reference' "$input")" || return 1
+    metrics_sha256="$(jq -er '.metrics_sha256' "$input")" || return 1
+    [[ "$metrics_reference" == "phases/$phase/obi-metrics.prom" &&
+      "$metrics_sha256" =~ ^[0-9a-f]{64}$ ]] || return 1
+    validate_bounded_regular_file \
+      "$metrics_reference" "$OBI_METRIC_SNAPSHOT_MAX_BYTES" \
+      "$OBI_METRIC_SNAPSHOT_MAX_LINES" || return 1
+    observed_sha256="$(sha256sum "$BUNDLE_DIR/$metrics_reference")" || return 1
+    observed_sha256="${observed_sha256%% *}"
+    [[ "$observed_sha256" == "$metrics_sha256" ]] || return 1
+  else
+    finished_at="$(jq -er '.finished_at' "$input")" || return 1
+    exit_code="$(jq -er '.exit_code' "$input")" || return 1
+    [[ "$finished_at" =~ ^[0-9TZ:.-]{20,64}$ ]] || return 1
+    canonical_uint64_string "$exit_code" || return 1
+    [[ ! -e "$BUNDLE_DIR/phases/$phase/obi-metrics.prom" &&
+      ! -L "$BUNDLE_DIR/phases/$phase/obi-metrics.prom" ]] || return 1
+  fi
+}
+
+validate_obi_metric_pair() {
+  local -r pair_reference="$1"
+  local pair=""
+  local boundary=""
+  local continuity=""
+  local before_reference=""
+  local after_reference=""
+  local before_identity=""
+  local after_identity=""
+  local before_state=""
+  local after_state=""
+  local before_container_id=""
+  local after_container_id=""
+  local before_started_at=""
+  local after_started_at=""
+  local before_metrics_reference=""
+  local after_metrics_reference=""
+  local before_parsed=""
+  local after_parsed=""
+  local record_type=""
+  local first=""
+  local second=""
+  local third=""
+  local fourth=""
+  local key=""
+  local previous_key=""
+  local transport=""
+  local operation=""
+  local status=""
+  local before=""
+  local after=""
+  local delta=""
+  local expected_before=""
+  local expected_after=""
+  local expected_delta=""
+  local attach_before=""
+  local attach_after=""
+  local attach_delta=""
+  local attach_before_value=0
+  local attach_after_value=0
+  local attach_before_present=false
+  local attach_after_present=false
+  local series_count=""
+  local -i observed_series=0
+  local LC_ALL=C
+  declare -A before_values=()
+  declare -A after_values=()
+  declare -A union=()
+  declare -A pair_seen=()
+
+  [[ "$pair_reference" =~ ^obi-metric-pairs/([a-z0-9][a-z0-9-]{0,63})\.json$ ]] ||
+    return 1
+  boundary="${BASH_REMATCH[1]}"
+  validate_single_json_object "$pair_reference" "$OBI_METRIC_PAIR_MAX_BYTES" ||
+    return 1
+  pair="$BUNDLE_DIR/$pair_reference"
+  jq -e '
+    keys == [
+      "after", "before", "boundary", "continuity", "java_attach_errors",
+      "schema", "series"
+    ] and
+    .schema == "obi-java-remote-parent-metric-pair-v1" and
+    (.boundary | type == "string") and
+    (.continuity == "same_process" or .continuity == "process_replaced") and
+    (.before | keys == ["identity_reference", "state"]) and
+    (.after | keys == ["identity_reference", "state"]) and
+    .before.state == "running" and
+    (.after.state == "running" or .after.state == "obi_stopped") and
+    ([.before.identity_reference, .after.identity_reference] |
+      all(.[]; type == "string")) and
+    (.series | type == "array") and
+    all(.series[];
+      keys == ["after", "before", "delta", "operation", "status", "transport"] and
+      ([.transport, .operation, .status, .before] |
+        all(.[]; type == "string")) and
+      (.after == null or (.after | type == "string")) and
+      (.delta == null or (.delta | type == "string"))) and
+    (.java_attach_errors | keys == ["after", "before", "delta"]) and
+    (.java_attach_errors.before | type == "string") and
+    (.java_attach_errors.after == null or
+      (.java_attach_errors.after | type == "string")) and
+    (.java_attach_errors.delta == null or
+      (.java_attach_errors.delta | type == "string"))
+  ' "$pair" >/dev/null || return 1
+  [[ "$(jq -er '.boundary' "$pair")" == "$boundary" ]] || return 1
+  continuity="$(jq -er '.continuity' "$pair")" || return 1
+  before_reference="$(jq -er '.before.identity_reference' "$pair")" || return 1
+  after_reference="$(jq -er '.after.identity_reference' "$pair")" || return 1
+  [[ "$before_reference" != "$after_reference" ]] || return 1
+  before_state="$(jq -er '.before.state' "$pair")" || return 1
+  after_state="$(jq -er '.after.state' "$pair")" || return 1
+  validate_obi_process_identity_reference "$before_reference" || return 1
+  validate_obi_process_identity_reference "$after_reference" || return 1
+  before_identity="$BUNDLE_DIR/$before_reference"
+  after_identity="$BUNDLE_DIR/$after_reference"
+  [[ "$(jq -er '.state' "$before_identity")" == "$before_state" &&
+    "$(jq -er '.state' "$after_identity")" == "$after_state" ]] || return 1
+  before_container_id="$(jq -er '.container_id' "$before_identity")" || return 1
+  after_container_id="$(jq -er '.container_id' "$after_identity")" || return 1
+  before_started_at="$(jq -er '.started_at' "$before_identity")" || return 1
+  after_started_at="$(jq -er '.started_at' "$after_identity")" || return 1
+  if [[ "$after_state" == obi_stopped ]]; then
+    [[ "$continuity" == same_process &&
+      "$before_container_id" == "$after_container_id" &&
+      "$before_started_at" == "$after_started_at" ]] || return 1
+  elif [[ "$continuity" == same_process ]]; then
+    [[ "$before_container_id" == "$after_container_id" &&
+      "$before_started_at" == "$after_started_at" ]] || return 1
+  else
+    [[ "$before_container_id" != "$after_container_id" ||
+      "$before_started_at" != "$after_started_at" ]] || return 1
+  fi
+
+  before_metrics_reference="$(jq -er '.metrics_reference' "$before_identity")" ||
+    return 1
+  before_parsed="$(mktemp "$TMP_DIR/obi-metric-before.XXXXXX")" || return $?
+  after_parsed="$(mktemp "$TMP_DIR/obi-metric-after.XXXXXX")" || return $?
+  parse_obi_metric_snapshot "$before_metrics_reference" "$before_parsed" || return 1
+  if [[ "$after_state" == running ]]; then
+    after_metrics_reference="$(jq -er '.metrics_reference' "$after_identity")" ||
+      return 1
+    parse_obi_metric_snapshot "$after_metrics_reference" "$after_parsed" || return 1
+  else
+    : >"$after_parsed"
+    printf 'attach\tfalse\t0\n' >>"$after_parsed"
+  fi
+  while IFS=$'\t' read -r record_type first second third fourth; do
+    case "$record_type" in
+      series)
+        key="$first|$second|$third"
+        before_values["$key"]="$fourth"
+        union["$key"]=1
+        ;;
+      attach)
+        attach_before_present="$first"
+        attach_before_value="$second"
+        ;;
+      *) return 1 ;;
+    esac
+  done <"$before_parsed"
+  while IFS=$'\t' read -r record_type first second third fourth; do
+    case "$record_type" in
+      series)
+        key="$first|$second|$third"
+        after_values["$key"]="$fourth"
+        union["$key"]=1
+        ;;
+      attach)
+        attach_after_present="$first"
+        attach_after_value="$second"
+        ;;
+      *) return 1 ;;
+    esac
+  done <"$after_parsed"
+
+  series_count="$(jq -er '.series | length' "$pair")" || return 1
+  [[ "$series_count" =~ ^[0-9]+$ ]] || return 1
+  ((series_count <= OBI_METRIC_PAIR_MAX_SERIES &&
+    series_count == ${#union[@]})) || return 1
+  while IFS=$'\t' read -r transport operation status before after delta; do
+    ((observed_series += 1))
+    [[ -n "$transport" && -n "$operation" && -n "$status" ]] || return 1
+    obi_metric_label_value_is_allowed transport "$transport" || return 1
+    obi_metric_label_value_is_allowed operation "$operation" || return 1
+    obi_metric_label_value_is_allowed status "$status" || return 1
+    key="$transport|$operation|$status"
+    # Canonical allowlisted tuple keys are intentionally compared lexically.
+    # shellcheck disable=SC2071
+    [[ -z "$previous_key" || "$key" > "$previous_key" ]] || return 1
+    previous_key="$key"
+    [[ -n "${union[$key]:-}" && -z "${pair_seen[$key]:-}" ]] || return 1
+    pair_seen["$key"]=1
+    canonical_uint64_string "$before" || return 1
+    expected_before="${before_values[$key]:-0}"
+    [[ "$before" == "$expected_before" ]] || return 1
+    if [[ "$after_state" == obi_stopped ]]; then
+      [[ "$after" == __null__ && "$delta" == __null__ ]] || return 1
+    elif [[ "$continuity" == process_replaced ]]; then
+      canonical_uint64_string "$after" || return 1
+      expected_after="${after_values[$key]:-0}"
+      [[ "$after" == "$expected_after" && "$delta" == __null__ ]] || return 1
+    else
+      [[ -z "${before_values[$key]+present}" ||
+        -n "${after_values[$key]+present}" ]] || return 1
+      canonical_uint64_string "$after" || return 1
+      expected_after="${after_values[$key]:-0}"
+      [[ "$after" == "$expected_after" ]] || return 1
+      uint64_string_subtract "$expected_after" "$expected_before" expected_delta ||
+        return 1
+      [[ "$delta" == "$expected_delta" ]] || return 1
+    fi
+  done < <(jq -r '
+    .series[] |
+    [.transport, .operation, .status, .before,
+      (if .after == null then "__null__" else .after end),
+      (if .delta == null then "__null__" else .delta end)] | @tsv
+  ' "$pair")
+  ((observed_series == series_count)) || return 1
+
+  attach_before="$(jq -er '.java_attach_errors.before' "$pair")" || return 1
+  attach_after="$(jq -r '
+    .java_attach_errors.after |
+    if . == null then "__null__" elif type == "string" then . else error("invalid") end
+  ' "$pair")" || return 1
+  attach_delta="$(jq -r '
+    .java_attach_errors.delta |
+    if . == null then "__null__" elif type == "string" then . else error("invalid") end
+  ' "$pair")" || return 1
+  canonical_uint64_string "$attach_before" || return 1
+  [[ "$attach_before" == "$attach_before_value" ]] || return 1
+  if [[ "$after_state" == obi_stopped ]]; then
+    [[ "$attach_after" == __null__ && "$attach_delta" == __null__ ]] || return 1
+  elif [[ "$continuity" == process_replaced ]]; then
+    canonical_uint64_string "$attach_after" || return 1
+    [[ "$attach_after" == "$attach_after_value" &&
+      "$attach_delta" == __null__ ]] || return 1
+  else
+    [[ "$attach_before_present" != true || "$attach_after_present" == true ]] ||
+      return 1
+    canonical_uint64_string "$attach_after" || return 1
+    [[ "$attach_after" == "$attach_after_value" ]] || return 1
+    uint64_string_subtract \
+      "$attach_after_value" "$attach_before_value" expected_delta || return 1
+    [[ "$attach_delta" == "$expected_delta" ]] || return 1
+  fi
+  if ((series_count == 0)); then
+    [[ "$attach_before" != 0 ||
+      ( "$attach_after" != __null__ && "$attach_after" != 0 ) ]] || return 1
+  fi
+}
+
+validate_terminal_obi_metrics() {
+  local -r relative_path='terminal-obi-metrics.json'
+  local -r terminal="$BUNDLE_DIR/$relative_path"
+  local pair_reference=""
+  local boundary=""
+
+  validate_single_json_object "$relative_path" "$OBI_METRIC_PAIR_MAX_BYTES" ||
+    return 1
+  jq -e '
+    keys == ["available", "pair", "pair_reference", "schema", "sealed"] and
+    .schema == "obi-java-remote-parent-terminal-metrics-v1" and
+    .sealed == true and
+    .available == true and
+    (.pair_reference | type == "string") and
+    (.pair | type == "object")
+  ' "$terminal" >/dev/null || return 1
+  pair_reference="$(jq -er '.pair_reference' "$terminal")" || return 1
+  [[ "$pair_reference" =~ ^obi-metric-pairs/([a-z0-9][a-z0-9-]{0,63})\.json$ ]] ||
+    return 1
+  boundary="${BASH_REMATCH[1]}"
+  validate_obi_metric_pair "$pair_reference" || return 1
+  [[ "$(jq -er '.pair.boundary' "$terminal")" == "$boundary" ]] || return 1
+  jq -e -s '
+    length == 2 and
+    .[0].pair == .[1]
+  ' "$terminal" "$BUNDLE_DIR/$pair_reference" >/dev/null
+}
+
+validate_terminal_evidence_crosslinks() {
+  local -r java_terminal="$BUNDLE_DIR/terminal-java-diagnostics.json"
+  local -r obi_terminal="$BUNDLE_DIR/terminal-obi-metrics.json"
+  local java_phase=""
+  local java_reference=""
+  local after_reference=""
+  local after_phase=""
+
+  java_phase="$(jq -er '.phase' "$java_terminal")" || return 1
+  java_reference="$(jq -er '.reference' "$java_terminal")" || return 1
+  after_reference="$(jq -er '.pair.after.identity_reference' "$obi_terminal")" ||
+    return 1
+  [[ "$after_reference" =~ ^phases/([a-z0-9][a-z0-9-]{0,63})/obi-identity\.json$ ]] ||
+    return 1
+  after_phase="${BASH_REMATCH[1]}"
+  [[ "$java_phase" == "$after_phase" &&
+    "$java_reference" == "phases/$after_phase/java-diagnostics.txt" ]]
+}
+
+validate_pre_v2_run_status() {
   local -r evidence_id="$1"
-  local -r revision="$2"
-  local -r source_tree_sha256="$3"
-  local -r allow_historical_status_schema="$4"
+  local -r allow_historical_status_schema="$2"
 
   jq -e -s --arg evidence_id "$evidence_id" \
     --argjson allow_historical_status_schema "$allow_historical_status_schema" '
     length == 1 and
     (.[0] |
       type == "object" and
+      (has("schema") | not) and
       .status == "passed" and
       .exit_status == 0 and
       .acceptance_evidence == true and
@@ -656,9 +1417,89 @@ validate_json_provenance() {
       else
         .acceptance_evidence_reason == "none"
       end))
-  ' "$BUNDLE_DIR/run-status.json" >/dev/null || {
-    die "run status is not an eligible retained acceptance result"
+  ' "$BUNDLE_DIR/run-status.json" >/dev/null
+}
+
+validate_run_status_v2() {
+  local -r evidence_id="$1"
+
+  require_regular_file terminal-java-diagnostics.json
+  require_regular_file terminal-obi-metrics.json
+  validate_terminal_java_diagnostics || return 1
+  validate_terminal_obi_metrics || return 1
+  validate_terminal_evidence_crosslinks || return 1
+  jq -e -s --arg evidence_id "$evidence_id" '
+    length == 3 and
+    (.[0] |
+      type == "object" and
+      keys == [
+        "acceptance_evidence", "acceptance_evidence_reason", "evidence_id",
+        "exit_status", "failure_line", "failure_stage",
+        "java_bridge_diagnostics", "java_bridge_diagnostics_reference",
+        "obi_metric_evidence", "obi_metric_evidence_reference", "schema", "status"
+      ] and
+      .schema == "obi-apache-java-https-run-status-v2" and
+      .status == "passed" and
+      .exit_status == 0 and
+      .acceptance_evidence == true and
+      .acceptance_evidence_reason == "none" and
+      .failure_stage == "none" and
+      .failure_line == 0 and
+      .evidence_id == $evidence_id and
+      .java_bridge_diagnostics_reference == "terminal-java-diagnostics.json" and
+      .obi_metric_evidence_reference == "terminal-obi-metrics.json") and
+    .[0].java_bridge_diagnostics == .[1] and
+    .[0].obi_metric_evidence == .[2]
+  ' \
+    "$BUNDLE_DIR/run-status.json" \
+    "$BUNDLE_DIR/terminal-java-diagnostics.json" \
+    "$BUNDLE_DIR/terminal-obi-metrics.json" >/dev/null
+}
+
+validate_json_provenance() {
+  local -r evidence_id="$1"
+  local -r revision="$2"
+  local -r source_tree_sha256="$3"
+  local -r allow_historical_status_schema="$4"
+  local run_status_schema=""
+
+  validate_single_json_object run-status.json "$RUN_STATUS_MAX_BYTES" || {
+    die "run status is not one bounded JSON object"
   }
+  run_status_schema="$(jq -er -s '
+    if length != 1 or (.[0] | type) != "object" then
+      error("invalid run status")
+    elif .[0] | has("schema") then
+      if (.[0].schema | type) == "string" then
+        .[0].schema
+      else
+        error("invalid run-status schema")
+      end
+    else
+      "__pre_v2__"
+    end
+  ' "$BUNDLE_DIR/run-status.json")" || {
+    die "run status is malformed"
+  }
+  case "$run_status_schema" in
+    obi-apache-java-https-run-status-v2)
+      validate_run_status_v2 "$evidence_id" || {
+        die "run-status v2 evidence is malformed or inconsistent"
+      }
+      ;;
+    __pre_v2__)
+      uses_pre_v2_run_status_schema "$evidence_id" "$revision" || {
+        die "schema-less run status is not an allowlisted historical result"
+      }
+      validate_pre_v2_run_status \
+        "$evidence_id" "$allow_historical_status_schema" || {
+        die "historical run status is not an eligible retained acceptance result"
+      }
+      ;;
+    *)
+      die "run status uses an unsupported schema"
+      ;;
+  esac
   jq -e -s --arg evidence_id "$evidence_id" --arg revision "$revision" '
     length == 1 and
     (.[0] |
